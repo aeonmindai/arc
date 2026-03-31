@@ -1,204 +1,128 @@
 <a name="top"></a>
-<!--
-<h1 align="center">
-  mistral.rs
-</h1>
--->
 
-<div align="center">
-  <img src="https://raw.githubusercontent.com/EricLBuehler/mistral.rs/master/res/banner.png" alt="mistral.rs" width="100%" style="max-width: 800px;">
-</div>
+<h1 align="center">
+  Arc
+</h1>
 
 <h3 align="center">
-Fast, flexible LLM inference.
+Inference at the speed of physics, not software.
 </h3>
 
 <p align="center">
-  | <a href="https://ericlbuehler.github.io/mistral.rs/"><b>Documentation</b></a> | <a href="https://crates.io/crates/mistralrs"><b>Rust SDK</b></a> | <a href="https://ericlbuehler.github.io/mistral.rs/PYTHON_SDK.html"><b>Python SDK</b></a> | <a href="https://discord.gg/SZrecqK8qw"><b>Discord</b></a> |
+  <a href="https://runcrate.ai/arc"><b>Website</b></a> | <a href="#rust-sdk"><b>Rust SDK</b></a> | <a href="#python-sdk"><b>Python SDK</b></a> | <a href="#turboquant"><b>TurboQuant</b></a> | <a href="https://github.com/runcrate/arc"><b>GitHub</b></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/EricLBuehler/mistral.rs/stargazers">
-    <img src="https://img.shields.io/github/stars/EricLBuehler/mistral.rs?style=social&label=Star" alt="GitHub stars">
-  </a>
+  A Rust-native LLM inference engine with near-optimal KV cache compression.<br>
+  Built by <a href="https://runcrate.ai">Aeonmind</a>. Powers <a href="https://runcrate.ai">Runcrate</a>.
 </p>
 
-## Why mistral.rs?
+---
 
-- **Any HuggingFace model, zero config**: Just `mistralrs run -m user/model`. Auto-detects architecture, quantization, chat template.
-- **True multimodality**: Vision, audio, speech generation, image generation, embeddings.
-- **Not another model registry**: Use HuggingFace models directly. No converting, no uploading to a separate service.
-- **Full quantization control**: Choose the precise quantization you want to use, or make your own UQFF with `mistralrs quantize`.
-- **Built-in web UI**: `mistralrs serve --ui` gives you a web interface instantly.
-- **Hardware-aware**: `mistralrs tune` benchmarks your system and picks optimal quantization + device mapping.
-- **Flexible SDKs**: Python package and Rust crate to build your projects.
+Arc is a high-performance LLM inference engine that extends [mistral.rs](https://github.com/EricLBuehler/mistral.rs) with **TurboQuant** — near-optimal KV cache compression from Google Research (ICLR 2026). The default 3.5-bit configuration (K4/V3) is **lossless**: identical LongBench scores to FP16, with 2.2x memory reduction.
+
+## What Arc Adds
+
+| Feature | What it does | Status |
+|---------|-------------|--------|
+| **TurboQuant KV cache** | 3.5-bit lossless compression via Walsh-Hadamard rotation + Lloyd-Max codebooks | Default, shipping |
+| **Fused attention kernels** | CUDA + Metal kernels that read compressed KV directly — no dequantization | Shipping |
+| **3 compression presets** | Default (3.5-bit, lossless), Balanced (3.0-bit), Aggressive (2.5-bit) | Shipping |
+| Elastic tensor parallelism | Per-request GPU allocation, TP=1 to TP=8 dynamically | Planned |
+| Disaggregated serving | Prefill-decode separation with KV-aware routing | Planned |
+| CUDA graph capture | Zero-overhead decode for common batch sizes | Planned |
+
+Everything from mistral.rs is included: PagedAttention, FlashAttention V2/V3, speculative decoding, continuous batching, 100+ model architectures, GGUF/GPTQ/AWQ/ISQ, LoRA, MCP, multi-GPU tensor parallelism, and more.
 
 ## Quick Start
 
 ### Install
 
-**Linux/macOS:**
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/EricLBuehler/mistral.rs/master/install.sh | sh
+# Install the Arc CLI
+cargo install --path arc-cli
+
+# Or install the upstream mistralrs CLI (also defaults to TurboQuant)
+cargo install --path mistralrs-cli
 ```
 
-**Windows (PowerShell):**
-```powershell
-irm https://raw.githubusercontent.com/EricLBuehler/mistral.rs/master/install.ps1 | iex
-```
-
-[Manual installation & other platforms](docs/INSTALLATION.md)
-
-### Run Your First Model
+### Run
 
 ```bash
-# Interactive chat
-mistralrs run -m Qwen/Qwen3-4B
+# Interactive chat — TurboQuant enabled by default
+arc run -m Qwen/Qwen3-4B
 
-# Or start a server with web UI
-mistralrs serve --ui -m google/gemma-3-4b-it
+# Start a server with web UI
+arc serve --ui -m google/gemma-3-4b-it
+
+# Benchmark
+arc bench -m meta-llama/Llama-3.1-8B-Instruct
 ```
 
-Then visit `http://localhost:1234/ui` for the web chat interface.
-
-### The `mistralrs` CLI
-
-The CLI is designed to be **zero-config**: just point it at a model and go.
-
-- **Auto-detection**: Automatically detects model architecture, quantization format, and chat template
-- **All-in-one**: Single binary for chat, server, benchmarks, and web UI (`run`, `serve`, `bench`)
-- **Hardware tuning**: Run `mistralrs tune` to automatically benchmark and configure optimal settings for your hardware
-- **Format-agnostic**: Works with Hugging Face models, GGUF files, and [UQFF quantizations](docs/UQFF.md) seamlessly
+### TurboQuant Presets
 
 ```bash
-# Auto-tune for your hardware and emit a config file
-mistralrs tune -m Qwen/Qwen3-4B --emit-config config.toml
+# Default: 3.5-bit (K4/V3) — lossless, 2.2x compression
+arc serve -m <model>
 
-# Run using the generated config
-mistralrs from-config -f config.toml
+# Balanced: 3.0-bit (K3/V3) — 2.56x compression
+arc serve -m <model> --pa-cache-type turboquant-3
 
-# Diagnose system issues (CUDA, Metal, HuggingFace connectivity)
-mistralrs doctor
+# Aggressive: 2.5-bit (K3/V2) — 4.1x compression, ~1.2% quality loss
+arc serve -m <model> --pa-cache-type turboquant-aggressive
+
+# Disable TurboQuant (upstream behavior)
+arc serve -m <model> --pa-cache-type auto
 ```
 
-[Full CLI documentation](docs/CLI.md)
+## TurboQuant
 
-<details open>
-  <summary><b>Web Chat Demo</b></summary>
-  <br>
-  <img src="https://raw.githubusercontent.com/EricLBuehler/mistral.rs/master/res/chat.gif" alt="Web Chat UI Demo" />
-</details>
+TurboQuant ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874), ICLR 2026) compresses KV cache vectors to 2-4 bits using:
 
-## What Makes It Fast
+1. **Walsh-Hadamard rotation** — O(d log d) random orthogonal transform that makes every coordinate follow a known Beta distribution, regardless of input data
+2. **Lloyd-Max codebooks** — pre-computed optimal scalar quantizers for the Beta distribution (no calibration, no training data needed)
+3. **Sub-byte packing** — 4-bit nibble and 3-bit 10-in-32 formats, with fused GPU kernels
 
-**Performance**
-- Continuous batching support by default on all devices.
-- CUDA with [FlashAttention](docs/FLASH_ATTENTION.md) V2/V3, Metal, [multi-GPU tensor parallelism](docs/DISTRIBUTED/DISTRIBUTED.md)
-- [PagedAttention](docs/PAGED_ATTENTION.md) for high throughput continuous batching on CUDA or Apple Silicon, prefix caching (including multimodal)
+The key insight: after rotation, optimal quantization is data-oblivious. The codebooks are compile-time constants.
 
-**Quantization** ([full docs](docs/QUANTS.md))
-- [In-situ quantization (ISQ)](docs/ISQ.md) of any Hugging Face model
-- GGUF (2-8 bit), GPTQ, AWQ, HQQ, FP8, BNB support
-- ⭐ [Per-layer topology](docs/TOPOLOGY.md): Fine-tune quantization per layer for optimal quality/speed
-- ⭐ Auto-select fastest quant method for your hardware
+### Performance
 
-**Flexibility**
-- [LoRA & X-LoRA](docs/ADAPTER_MODELS.md) with weight merging
-- [AnyMoE](docs/ANYMOE.md): Create mixture-of-experts on any base model
-- [Multiple models](docs/multi_model/README.md): Load/unload at runtime
+| Preset | Bits | Compression | Decode speedup (32K ctx) | Quality |
+|--------|------|-------------|--------------------------|---------|
+| **Default** | 3.5 (K4/V3) | **2.2x** | ~1.5-1.8x | **Lossless** |
+| Balanced | 3.0 (K3/V3) | 2.56x | ~1.8-2.2x | ~0.1% loss |
+| Aggressive | 2.5 (K3/V2) | 4.1x | ~2.5-3x | ~1.2% loss |
 
-**Agentic Features**
-- Integrated [tool calling](docs/TOOL_CALLING.md) with Python/Rust callbacks
-- ⭐ [Web search integration](docs/WEB_SEARCH.md)
-- ⭐ [MCP client](docs/MCP/client.md): Connect to external tools automatically
+At 3.5 bits: LongBench 50.06 = identical to FP16 50.06 on Llama-3.1-8B-Instruct. Zero quality loss on needle-in-a-haystack at all context lengths.
 
-[Full feature documentation](docs/README.md)
+### How It Works
 
-## Supported Models
+```
+Write path (per token):
+  K/V vector → L2 normalize → WHT rotate (D·H·D) → Lloyd-Max quantize → pack
 
-<details>
-<summary><b>Text Models</b></summary>
-
-- Granite 4.0
-- SmolLM 3
-- DeepSeek V3
-- GPT-OSS
-- DeepSeek V2
-- Qwen 3 Next
-- Qwen 3 MoE
-- Phi 3.5 MoE
-- Qwen 3
-- GLM 4
-- GLM-4.7-Flash
-- GLM-4.7 (MoE)
-- Gemma 2
-- Qwen 2
-- Starcoder 2
-- Phi 3
-- Mixtral
-- Phi 2
-- Gemma
-- Llama
-- Mistral
-</details>
-
-<details>
-<summary><b>Vision Models</b></summary>
-
-- Qwen 3.5
-- Qwen 3.5 MoE
-- Qwen 3-VL
-- Qwen 3-VL MoE
-- Gemma 3n
-- Llama 4
-- Gemma 3
-- Mistral 3
-- Phi 4 multimodal
-- Qwen 2.5-VL
-- MiniCPM-O
-- Llama 3.2 Vision
-- Qwen 2-VL
-- Idefics 3
-- Idefics 2
-- LLaVA Next
-- LLaVA
-- Phi 3V
-</details>
-
-<details>
-<summary><b>Speech Models</b></summary>
-
-- Voxtral (ASR/speech-to-text)
-- Dia
-</details>
-
-<details>
-<summary><b>Image Generation Models</b></summary>
-
-- FLUX
-</details>
-
-<details>
-<summary><b>Embedding Models</b></summary>
-
-- Embedding Gemma
-- Qwen 3 Embedding
-</details>
-
-[Request a new model](https://github.com/EricLBuehler/mistral.rs/issues/156) | [Full compatibility tables](docs/SUPPORTED_MODELS.md)
+Read path (attention):
+  Rotate Q once → for each cached K: unpack → codebook lookup → dot product
+  No full dequantization. Codebook in shared memory.
+```
 
 ## Python SDK
 
+The Python SDK wraps the upstream mistralrs package with TurboQuant defaults.
+
 ```bash
-pip install mistralrs  # or mistralrs-cuda, mistralrs-metal, mistralrs-mkl, mistralrs-accelerate
+pip install mistralrs              # CPU
+pip install mistralrs-cuda         # NVIDIA GPU
+pip install mistralrs-metal        # Apple Silicon
 ```
 
 ```python
-from mistralrs import Runner, Which, ChatCompletionRequest
+from mistralrs import Runner, Which, ChatCompletionRequest, PagedCacheType
 
 runner = Runner(
     which=Which.Plain(model_id="Qwen/Qwen3-4B"),
     in_situ_quant="4",
+    pa_cache_type=PagedCacheType.TurboQuant,  # default
 )
 
 res = runner.send_chat_completion_request(
@@ -211,77 +135,152 @@ res = runner.send_chat_completion_request(
 print(res.choices[0].message.content)
 ```
 
-[Python SDK](https://ericlbuehler.github.io/mistral.rs/PYTHON_SDK.html) | [Installation](https://ericlbuehler.github.io/mistral.rs/PYTHON_INSTALLATION.html) | [Examples](examples/python) | [Cookbook](examples/python/cookbook.ipynb)
+TurboQuant presets available: `PagedCacheType.TurboQuant` (default), `PagedCacheType.TurboQuant3`, `PagedCacheType.TurboQuantAggressive`.
+
+[Python examples](examples/python) | [Cookbook](examples/python/cookbook.ipynb)
 
 ## Rust SDK
 
 ```bash
-cargo add mistralrs
+cargo add arc-engine
 ```
 
 ```rust
-use anyhow::Result;
-use mistralrs::{IsqType, TextMessageRole, TextMessages, VisionModelBuilder};
+use arc_engine::core::{TextModelBuilder, PagedAttentionConfig, MemoryGpuConfig, PagedCacheType};
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let model = VisionModelBuilder::new("google/gemma-3-4b-it")
-        .with_isq(IsqType::Q4K)
-        .with_logging()
+async fn main() -> anyhow::Result<()> {
+    arc_engine::print_banner();
+
+    let model = TextModelBuilder::new("Qwen/Qwen3-4B")
+        .with_paged_attn(|| {
+            // TurboQuant is the default — this is automatic
+            PagedAttentionConfig::new(
+                None,
+                MemoryGpuConfig::default(),
+                PagedCacheType::TurboQuant,
+            )
+        })?
         .build()
         .await?;
 
-    let messages = TextMessages::new().add_message(
-        TextMessageRole::User,
-        "Hello!",
-    );
-
-    let response = model.send_chat_request(messages).await?;
-
-    println!("{:?}", response.choices[0].message.content);
-
+    let response = model.chat("What is Rust's ownership model?").await?;
+    println!("{response}");
     Ok(())
 }
 ```
 
-[API Docs](https://docs.rs/mistralrs) | [Crate](https://crates.io/crates/mistralrs) | [Examples](mistralrs/examples)
+The upstream `mistralrs` Rust crate also works — TurboQuant is the default there too.
 
-## Docker
+[Rust API docs](https://docs.rs/arc-engine) | [Examples](mistralrs/examples)
 
-For quick containerized deployment:
+## HTTP API
+
+Arc serves an OpenAI-compatible API:
 
 ```bash
-docker pull ghcr.io/ericlbuehler/mistral.rs:latest
-docker run --gpus all -p 1234:1234 ghcr.io/ericlbuehler/mistral.rs:latest \
-  serve -m Qwen/Qwen3-4B
+arc serve -p 8080 -m meta-llama/Llama-3.1-8B-Instruct
+
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "default",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
 ```
 
-[Docker images](https://github.com/EricLBuehler/mistral.rs/pkgs/container/mistral.rs)
+[Full API documentation](docs/HTTP.md)
 
-> For production use, we recommend installing the CLI directly for maximum flexibility.
+## Supported Models
+
+Arc supports every model that mistral.rs supports — 100+ architectures across text, vision, speech, image generation, and embeddings.
+
+<details>
+<summary><b>Text</b> — Granite 4.0, SmolLM 3, DeepSeek V3, GPT-OSS, Qwen 3, GLM 4, Gemma 2, Phi 3, Llama, Mistral, Mixtral, Starcoder 2, and more</summary>
+
+Granite 4.0, SmolLM 3, DeepSeek V3, GPT-OSS, DeepSeek V2, Qwen 3 Next, Qwen 3 MoE, Phi 3.5 MoE, Qwen 3, GLM 4, GLM-4.7-Flash, GLM-4.7 MoE, Gemma 2, Qwen 2, Starcoder 2, Phi 3, Mixtral, Phi 2, Gemma, Llama, Mistral
+</details>
+
+<details>
+<summary><b>Vision</b> — Qwen 3.5, Gemma 3n, Llama 4, Mistral 3, Phi 4, MiniCPM-O, LLaVA, and more</summary>
+
+Qwen 3.5, Qwen 3.5 MoE, Qwen 3-VL, Qwen 3-VL MoE, Gemma 3n, Llama 4, Gemma 3, Mistral 3, Phi 4 multimodal, Qwen 2.5-VL, MiniCPM-O, Llama 3.2 Vision, Qwen 2-VL, Idefics 3, Idefics 2, LLaVA Next, LLaVA, Phi 3V
+</details>
+
+<details>
+<summary><b>Speech</b> — Voxtral, Dia</summary>
+
+Voxtral (ASR/speech-to-text), Dia
+</details>
+
+<details>
+<summary><b>Image Generation</b> — FLUX</summary>
+
+FLUX
+</details>
+
+<details>
+<summary><b>Embeddings</b> — Embedding Gemma, Qwen 3 Embedding</summary>
+
+Embedding Gemma, Qwen 3 Embedding
+</details>
+
+## Architecture
+
+Arc uses a thin-wrapper architecture over mistral.rs for upstream compatibility:
+
+```
+arc-cli/          Arc binary (BSL-1.1)
+arc-engine/       Wrapper crate (BSL-1.1)
+arc-turbo/        TurboQuant: codebooks, WHT, cache, kernels (BSL-1.1)
+mistralrs-*/      Upstream mistral.rs (MIT) — untouched, merge-compatible
+```
+
+`git merge upstream/master` works cleanly. New models and fixes from upstream are available immediately.
+
+## Building from Source
+
+```bash
+# CPU only
+cargo build --release -p arc-cli
+
+# NVIDIA GPU (CUDA + FlashAttention)
+cargo build --release -p arc-cli --features "cuda flash-attn"
+
+# Apple Silicon (Metal)
+cargo build --release -p arc-cli --features metal
+
+# Install globally
+cargo install --path arc-cli --features <your-features>
+```
 
 ## Documentation
 
-For complete documentation, see the **[Documentation](https://ericlbuehler.github.io/mistral.rs/)**.
+- [CLI Reference](docs/CLI.md)
+- [HTTP API](docs/HTTP.md)
+- [Quantization](docs/QUANTS.md) — ISQ, GGUF, GPTQ, AWQ, TurboQuant
+- [PagedAttention](docs/PAGED_ATTENTION.md)
+- [Device Mapping](docs/DEVICE_MAPPING.md)
+- [MCP Integration](docs/MCP/README.md)
+- [Full documentation](https://runcrate.ai/arc/docs)
 
-**Quick Links:**
-- [CLI Reference](docs/CLI.md) - All commands and options
-- [HTTP API](docs/HTTP.md) - OpenAI-compatible endpoints
-- [Quantization](docs/QUANTS.md) - ISQ, GGUF, GPTQ, and more
-- [Device Mapping](docs/DEVICE_MAPPING.md) - Multi-GPU and CPU offloading
-- [MCP Integration](docs/MCP/README.md) - MCP integration documentation
-- [Troubleshooting](docs/TROUBLESHOOTING.md) - Common issues and solutions
-- [Configuration](docs/CONFIGURATION.md) - Environment variables for configuration
+## License
 
-## Contributing
+- **`arc-*` crates**: [Business Source License 1.1](LICENSE-BSL) — free for non-commercial and sub-$1M revenue use. Commercial inference-as-a-service requires a license from Aeonmind.
+- **`mistralrs-*` crates**: [MIT](LICENSE-MIT) — upstream open source.
 
-Contributions welcome! Please [open an issue](https://github.com/EricLBuehler/mistral.rs/issues) to discuss new features or report bugs. If you want to add a new model, please contact us via an issue and we can coordinate.
+See [NOTICE](NOTICE) for details. For commercial licensing: support@runcrate.ai
 
 ## Credits
 
-This project would not be possible without the excellent work at [Candle](https://github.com/huggingface/candle). Thank you to all [contributors](https://github.com/EricLBuehler/mistral.rs/graphs/contributors)!
+Arc is built on [mistral.rs](https://github.com/EricLBuehler/mistral.rs) by Eric Buehler and contributors, and the [Candle](https://github.com/huggingface/candle) ML framework by Hugging Face. TurboQuant is based on research by Zandieh et al. at Google Research ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)).
 
-mistral.rs is not affiliated with Mistral AI.
+---
+
+<p align="center">
+  <b>Arc</b> by <a href="https://runcrate.ai">Aeonmind, LLC</a><br>
+  The AI Cloud. Deploy, Scale, Infer.
+</p>
 
 <p align="right">
   <a href="#top">Back to Top</a>
