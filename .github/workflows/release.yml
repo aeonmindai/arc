@@ -35,6 +35,7 @@ jobs:
             features: "cuda"
             artifact: arc
             cuda: true
+            cuda_compute_cap: "80"
 
           # Linux aarch64 CPU
           - os: ubuntu-22.04-arm
@@ -93,6 +94,8 @@ jobs:
           restore-keys: ${{ matrix.variant }}-cargo-
 
       - name: Build arc-cli (release)
+        env:
+          CUDA_COMPUTE_CAP: ${{ matrix.cuda_compute_cap || '' }}
         run: |
           if [ -n "${{ matrix.features }}" ]; then
             cargo build --release -p arc-cli --features "${{ matrix.features }}"
@@ -101,6 +104,8 @@ jobs:
           fi
 
       - name: Build mistralrs-cli (release)
+        env:
+          CUDA_COMPUTE_CAP: ${{ matrix.cuda_compute_cap || '' }}
         run: |
           if [ -n "${{ matrix.features }}" ]; then
             cargo build --release -p mistralrs-cli --features "${{ matrix.features }}"
