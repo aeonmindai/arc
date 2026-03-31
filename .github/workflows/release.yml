@@ -1,0 +1,160 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g., v0.7.1)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 CPU
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            variant: linux-x86_64-cpu
+            features: ""
+            artifact: arc
+
+          # Linux x86_64 CUDA (no flash-attn in CI — needs GPU headers)
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            variant: linux-x86_64-cuda
+            features: "cuda"
+            artifact: arc
+            cuda: true
+
+          # Linux aarch64 CPU
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            variant: linux-aarch64-cpu
+            features: ""
+            artifact: arc
+
+          # macOS Apple Silicon (Metal)
+          - os: macos-14
+            target: aarch64-apple-darwin
+            variant: macos-aarch64-metal
+            features: "metal"
+            artifact: arc
+
+          # macOS x86_64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            variant: macos-x86_64-cpu
+            features: ""
+            artifact: arc
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install CUDA toolkit
+        if: matrix.cuda
+        uses: Jimver/cuda-toolkit@v0.2.18
+        with:
+          cuda: '12.6.0'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart"]'
+
+      - name: Install Metal Toolchain
+        if: contains(matrix.features, 'metal')
+        run: |
+          # Metal toolchain should be available on macOS runners
+          # Verify it works
+          xcrun metal --version || xcodebuild -downloadComponent MetalToolchain
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.variant }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.variant }}-cargo-
+
+      - name: Build arc-cli (release)
+        run: |
+          if [ -n "${{ matrix.features }}" ]; then
+            cargo build --release -p arc-cli --features "${{ matrix.features }}"
+          else
+            cargo build --release -p arc-cli
+          fi
+
+      - name: Build mistralrs-cli (release)
+        run: |
+          if [ -n "${{ matrix.features }}" ]; then
+            cargo build --release -p mistralrs-cli --features "${{ matrix.features }}"
+          else
+            cargo build --release -p mistralrs-cli
+          fi
+
+      - name: Package binaries
+        run: |
+          mkdir -p dist
+          cp target/release/arc dist/ 2>/dev/null || cp target/${{ matrix.target }}/release/arc dist/
+          cp target/release/mistralrs dist/ 2>/dev/null || cp target/${{ matrix.target }}/release/mistralrs dist/
+          chmod +x dist/*
+          cd dist
+          tar -czf ../arc-${{ matrix.variant }}.tar.gz *
+          cd ..
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.event.release.tag_name }}
+          files: arc-${{ matrix.variant }}.tar.gz
+
+  # After all builds, update the release notes with install instructions
+  update-release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update release body
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.event.release.tag_name }}
+          append_body: true
+          body: |
+            ---
+            ## Install
+
+            **One-liner (auto-detects your platform):**
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/runcrate/arc/master/install.sh | sh
+            ```
+
+            **Direct downloads:**
+            | Platform | File |
+            |----------|------|
+            | Linux x86_64 (CPU) | `arc-linux-x86_64-cpu.tar.gz` |
+            | Linux x86_64 (CUDA) | `arc-linux-x86_64-cuda.tar.gz` |
+            | Linux aarch64 (CPU) | `arc-linux-aarch64-cpu.tar.gz` |
+            | macOS Apple Silicon (Metal) | `arc-macos-aarch64-metal.tar.gz` |
+            | macOS x86_64 | `arc-macos-x86_64-cpu.tar.gz` |
+
+            Each archive contains both `arc` and `mistralrs` binaries.
+            Extract and move to a directory in your PATH:
+            ```bash
+            tar -xzf arc-*.tar.gz
+            sudo mv arc /usr/local/bin/
+            ```
