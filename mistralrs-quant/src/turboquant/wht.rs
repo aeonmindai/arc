@@ -41,7 +41,10 @@ pub fn generate_signs(seed: u64, dim: usize) -> Vec<f32> {
 /// across log2(n) stages with doubling stride.
 pub fn fwht_inplace(data: &mut [f32]) {
     let n = data.len();
-    debug_assert!(n.is_power_of_two(), "WHT requires power-of-2 length, got {n}");
+    debug_assert!(
+        n.is_power_of_two(),
+        "WHT requires power-of-2 length, got {n}"
+    );
 
     let mut h = 1;
     while h < n {
@@ -149,7 +152,10 @@ pub fn dequantize_vector(
     codebook: &super::codebook::Codebook,
 ) -> Vec<f32> {
     // Step 1: Reconstruct from centroids
-    let mut data: Vec<f32> = indices.iter().map(|&idx| codebook.dequantize(idx)).collect();
+    let mut data: Vec<f32> = indices
+        .iter()
+        .map(|&idx| codebook.dequantize(idx))
+        .collect();
 
     // Step 2: Inverse rotation
     rotate_inverse(&mut data, signs);
@@ -175,10 +181,7 @@ mod tests {
         fwht_inplace(&mut data);
         fwht_inplace(&mut data);
         for (a, b) in data.iter().zip(original.iter()) {
-            assert!(
-                (a - b).abs() < 1e-5,
-                "FWHT not involutory: {a} vs {b}"
-            );
+            assert!((a - b).abs() < 1e-5, "FWHT not involutory: {a} vs {b}");
         }
     }
 
@@ -207,10 +210,7 @@ mod tests {
         rotate_inverse(&mut data, &signs);
 
         for (a, b) in data.iter().zip(original.iter()) {
-            assert!(
-                (a - b).abs() < 1e-4,
-                "Roundtrip failed: {a} vs {b}"
-            );
+            assert!((a - b).abs() < 1e-4, "Roundtrip failed: {a} vs {b}");
         }
     }
 

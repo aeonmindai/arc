@@ -300,7 +300,10 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     }
                     KvCache::TurboQuant(tq) => {
                         // Dequantize for cache cloning
-                        (tq.k.current_data().unwrap().unwrap(), tq.v.current_data().unwrap().unwrap())
+                        (
+                            tq.k.current_data().unwrap().unwrap(),
+                            tq.v.current_data().unwrap().unwrap(),
+                        )
                     }
                 }
             };
@@ -329,9 +332,10 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     KvCache::Rotating { k, v } => {
                         (k.all_data.clone().unwrap(), v.all_data.clone().unwrap())
                     }
-                    KvCache::TurboQuant(tq) => {
-                        (tq.k.current_data().unwrap().unwrap(), tq.v.current_data().unwrap().unwrap())
-                    }
+                    KvCache::TurboQuant(tq) => (
+                        tq.k.current_data().unwrap().unwrap(),
+                        tq.v.current_data().unwrap().unwrap(),
+                    ),
                 };
                 let offset = i * first_k.dims()[0];
                 batch_k.slice_set(&src_k, 0, offset).unwrap();
@@ -445,9 +449,10 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 KvCache::Rotating { k, v } => {
                     (k.all_data.clone().unwrap(), v.all_data.clone().unwrap())
                 }
-                KvCache::TurboQuant(tq) => {
-                    (tq.k.current_data().unwrap().unwrap(), tq.v.current_data().unwrap().unwrap())
-                }
+                KvCache::TurboQuant(tq) => (
+                    tq.k.current_data().unwrap().unwrap(),
+                    tq.v.current_data().unwrap().unwrap(),
+                ),
             };
 
             let k_caches = k_cache.chunk(seqs.len(), 0).unwrap();

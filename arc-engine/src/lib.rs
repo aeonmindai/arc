@@ -24,17 +24,23 @@ pub use arc_turbo as turbo;
 
 // Re-export commonly used types at the top level for convenience
 pub use mistralrs_core::{
+    MemoryGpuConfig,
     // Pipeline and model types
-    MistralRs, MistralRsBuilder,
+    MistralRs,
+    MistralRsBuilder,
+    ModelLoaderConfig,
     // Configuration
-    ModelSelected, ModelLoaderConfig,
-    PagedAttentionConfig, PagedCacheType, MemoryGpuConfig,
-    // Token sources
-    TokenSource,
+    ModelSelected,
+    PagedAttentionConfig,
+    PagedCacheType,
     // Request/response types
-    Request, Response, RequestMessage,
+    Request,
+    RequestMessage,
+    Response,
     // Sampling
     SamplingParams,
+    // Token sources
+    TokenSource,
 };
 
 /// Arc engine version.
@@ -46,7 +52,5 @@ pub fn print_banner() {
         "Arc inference engine v{} — TurboQuant-accelerated LLM serving",
         VERSION
     );
-    tracing::info!(
-        "Default KV cache: TurboQuant 3.5-bit (K4/V3, lossless)"
-    );
+    tracing::info!("Default KV cache: TurboQuant 3.5-bit (K4/V3, lossless)");
 }

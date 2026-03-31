@@ -14,10 +14,11 @@
 //! 4. Pack the quantized indices into sub-byte storage (4-bit nibble or
 //!    3-bit 10-in-32 packing).
 //!
-//! During attention, the query is rotated once and dot-producted directly
+//! During attention, the query is rotated once and the dot product is computed directly
 //! against codebook centroids looked up from the packed indices — no full
 //! dequantization needed.
 
+#[allow(clippy::excessive_precision)]
 pub mod codebook;
 pub mod wht;
 
@@ -30,10 +31,11 @@ use serde::{Deserialize, Serialize};
 /// Keys are more sensitive (they determine attention focus via softmax)
 /// and benefit from higher precision. Values are averaged by attention
 /// weights so errors cancel out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TurboQuantPreset {
     /// Default: 4-bit keys, 3-bit values (3.5 bits avg). Lossless quality.
     /// LongBench 50.06 = identical to FP16 50.06 on Llama-3.1-8B.
+    #[default]
     Default,
     /// Balanced: 3-bit keys, 3-bit values (3.0 bits avg). ~0.1% quality loss.
     Balanced,
@@ -73,12 +75,6 @@ impl TurboQuantPreset {
         let v_bytes = packed_size(head_dim, self.value_bits());
         let tq_bytes = (k_bytes + v_bytes + 4) as f32; // +4 for two fp16 norms
         fp16_bytes / tq_bytes
-    }
-}
-
-impl Default for TurboQuantPreset {
-    fn default() -> Self {
-        Self::Default
     }
 }
 
@@ -165,7 +161,7 @@ pub fn packed_size(dim: usize, bits: u32) -> usize {
 pub fn pack_indices(indices: &[u8], bits: u32, output: &mut [u8]) {
     match bits {
         4 => {
-            assert!(indices.len() % 2 == 0);
+            assert!(indices.len().is_multiple_of(2));
             for i in 0..indices.len() / 2 {
                 output[i] = (indices[2 * i] & 0xF) | ((indices[2 * i + 1] & 0xF) << 4);
             }
@@ -185,7 +181,7 @@ pub fn pack_indices(indices: &[u8], bits: u32, output: &mut [u8]) {
             }
         }
         2 => {
-            assert!(indices.len() % 4 == 0);
+            assert!(indices.len().is_multiple_of(4));
             for i in 0..indices.len() / 4 {
                 output[i] = ((indices[4 * i] & 0x3) << 6)
                     | ((indices[4 * i + 1] & 0x3) << 4)

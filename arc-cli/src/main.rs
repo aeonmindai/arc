@@ -16,7 +16,9 @@ use clap::{Parser, Subcommand};
 /// Built on mistral.rs. Defaults to TurboQuant 3.5-bit KV cache (lossless).
 #[derive(Parser)]
 #[command(name = "arc", version, about, long_about = None)]
-#[command(after_help = "Arc inference engine by Aeonmind, LLC\nhttps://runcrate.ai/arc\nPowered by mistral.rs + TurboQuant (ICLR 2026)")]
+#[command(
+    after_help = "Arc inference engine by Aeonmind, LLC\nhttps://runcrate.ai/arc\nPowered by mistral.rs + TurboQuant (ICLR 2026)"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

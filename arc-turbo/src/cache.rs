@@ -139,13 +139,11 @@ impl TurboQuantSingleCache {
         for b in 0..self.batch_size {
             for h in 0..self.num_heads {
                 for s in 0..seq_len {
-                    let offset =
-                        ((b * self.num_heads + h) * seq_len + s) * self.head_dim;
+                    let offset = ((b * self.num_heads + h) * seq_len + s) * self.head_dim;
                     let vector = &data[offset..offset + self.head_dim];
 
                     // Quantize using TurboQuant algorithm
-                    let (indices, norm) =
-                        wht::quantize_vector(vector, &self.signs, &self.codebook);
+                    let (indices, norm) = wht::quantize_vector(vector, &self.signs, &self.codebook);
 
                     // Pack indices
                     let mut packed = vec![0u8; bytes_per_head];
@@ -223,8 +221,7 @@ impl TurboQuantSingleCache {
             unpack_indices(packed, self.bits, self.head_dim, &mut indices);
 
             // Dequantize
-            let vector =
-                wht::dequantize_vector(&indices, norm, &self.signs, &self.codebook);
+            let vector = wht::dequantize_vector(&indices, norm, &self.signs, &self.codebook);
             all_data.extend_from_slice(&vector);
         }
 
@@ -265,7 +262,8 @@ impl TurboQuantSingleCache {
         }
         if len > self.total_seq_len {
             candle_core::bail!(
-                "TurboQuantCache: cannot set len {len} > current {}", self.total_seq_len
+                "TurboQuantCache: cannot set len {len} > current {}",
+                self.total_seq_len
             );
         }
         if len < self.total_seq_len {
