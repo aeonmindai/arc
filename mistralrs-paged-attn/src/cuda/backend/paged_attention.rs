@@ -651,3 +651,224 @@ pub fn reshape_and_cache(
         }
     }
 }
+
+/// TurboQuant: quantize K/V and store as U8 indices in paged cache blocks.
+///
+/// * `key` - [num_tokens, num_heads, head_size] FP16
+/// * `value` - [num_tokens, num_heads, head_size] FP16
+/// * `key_cache` - [num_blocks, num_kv_heads, head_size/16, block_size, 16] U8
+/// * `value_cache` - [num_blocks, num_kv_heads, head_size, block_size] U8
+/// * `k_norms` - [num_blocks, num_kv_heads, block_size] F16
+/// * `v_norms` - [num_blocks, num_kv_heads, block_size] F16
+#[allow(clippy::too_many_arguments)]
+pub fn turbo_reshape_and_cache(
+    key: &Tensor,
+    value: &Tensor,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    k_norms: &Tensor,
+    v_norms: &Tensor,
+    slot_mapping: &Tensor,
+) -> Result<()> {
+    let (k, k_l) = key.storage_and_layout();
+    let k = match &*k {
+        Storage::Cuda(k) => k,
+        _ => candle::bail!("key must be a cuda tensor"),
+    };
+    let (v, v_l) = value.storage_and_layout();
+    let v = match &*v {
+        Storage::Cuda(v) => v,
+        _ => candle::bail!("value must be a cuda tensor"),
+    };
+    let (kc, kc_l) = key_cache.storage_and_layout();
+    let kc = match &*kc {
+        Storage::Cuda(kc) => kc,
+        _ => candle::bail!("key_cache must be a cuda tensor"),
+    };
+    let (vc, vc_l) = value_cache.storage_and_layout();
+    let vc = match &*vc {
+        Storage::Cuda(vc) => vc,
+        _ => candle::bail!("value_cache must be a cuda tensor"),
+    };
+    let (kn, kn_l) = k_norms.storage_and_layout();
+    let kn = match &*kn {
+        Storage::Cuda(kn) => kn,
+        _ => candle::bail!("k_norms must be a cuda tensor"),
+    };
+    let (vn, vn_l) = v_norms.storage_and_layout();
+    let vn = match &*vn {
+        Storage::Cuda(vn) => vn,
+        _ => candle::bail!("v_norms must be a cuda tensor"),
+    };
+    let (s, s_l) = slot_mapping.storage_and_layout();
+    let s = match &*s {
+        Storage::Cuda(s) => s,
+        _ => candle::bail!("slot_mapping must be a cuda tensor"),
+    };
+
+    let dev = k.device();
+    let (num_tokens, num_heads, head_size) = k_l.shape().dims3()?;
+
+    let k_f16 = k.as_cuda_slice::<f16>()?;
+    let v_f16 = v.as_cuda_slice::<f16>()?;
+    let kc_u8 = kc.as_cuda_slice::<u8>()?;
+    let vc_u8 = vc.as_cuda_slice::<u8>()?;
+    let kn_f16 = kn.as_cuda_slice::<f16>()?;
+    let vn_f16 = vn.as_cuda_slice::<f16>()?;
+    let s_i64 = s.as_cuda_slice::<i64>()?;
+
+    let (k_ptr, _k_g) = k_f16.device_ptr(k_f16.stream());
+    let (v_ptr, _v_g) = v_f16.device_ptr(v_f16.stream());
+    let (kc_ptr, _kc_g) = kc_u8.device_ptr(kc_u8.stream());
+    let (vc_ptr, _vc_g) = vc_u8.device_ptr(vc_u8.stream());
+    let (kn_ptr, _kn_g) = kn_f16.device_ptr(kn_f16.stream());
+    let (vn_ptr, _vn_g) = vn_f16.device_ptr(vn_f16.stream());
+    let (s_ptr, _s_g) = s_i64.device_ptr(s_i64.stream());
+
+    let (_num_blocks, _num_kv_heads, _, block_size, _x) = kc_l.shape().dims5()?;
+
+    let key_stride = k_l.stride()[0] as c_int;
+    let value_stride = v_l.stride()[0] as c_int;
+    let kv_block_stride = kc_l.stride()[0] as c_int;
+    let kv_head_stride = kc_l.stride()[1] as c_int;
+    let norm_block_stride = kn_l.stride()[0] as c_int;
+    let norm_head_stride = kn_l.stride()[1] as c_int;
+
+    unsafe {
+        ffi::turbo_reshape_and_cache(
+            k_ptr as *const std::ffi::c_void,
+            v_ptr as *const std::ffi::c_void,
+            kc_ptr as *const std::ffi::c_void,
+            vc_ptr as *const std::ffi::c_void,
+            kn_ptr as *const std::ffi::c_void,
+            vn_ptr as *const std::ffi::c_void,
+            s_ptr as *const i64,
+            num_tokens as c_int,
+            num_heads as c_int,
+            head_size as c_int,
+            block_size as c_int,
+            key_stride,
+            value_stride,
+            kv_block_stride,
+            kv_head_stride,
+            norm_block_stride,
+            norm_head_stride,
+            dev.cuda_stream().cu_stream(),
+            0, // FP16
+        )
+    }
+    Ok(())
+}
+
+/// TurboQuant: paged attention over compressed U8 KV cache.
+#[allow(clippy::too_many_arguments)]
+pub fn turbo_paged_attention(
+    q: &Tensor,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    k_norms: &Tensor,
+    v_norms: &Tensor,
+    block_tables: &Tensor,
+    context_lens: &Tensor,
+    max_context_len: usize,
+    softmax_scale: f32,
+    softcapping: f32,
+    num_kv_heads: usize,
+) -> Result<Tensor> {
+    let (q_s, q_l) = q.storage_and_layout();
+    let q_s = match &*q_s {
+        Storage::Cuda(s) => s,
+        _ => candle::bail!("query must be a cuda tensor"),
+    };
+    let (kc, kc_l) = key_cache.storage_and_layout();
+    let kc = match &*kc {
+        Storage::Cuda(kc) => kc,
+        _ => candle::bail!("key_cache must be a cuda tensor"),
+    };
+    let (vc, vc_l) = value_cache.storage_and_layout();
+    let vc = match &*vc {
+        Storage::Cuda(vc) => vc,
+        _ => candle::bail!("value_cache must be a cuda tensor"),
+    };
+    let (kn, kn_l) = k_norms.storage_and_layout();
+    let kn = match &*kn {
+        Storage::Cuda(kn) => kn,
+        _ => candle::bail!("k_norms must be a cuda tensor"),
+    };
+    let (vn, vn_l) = v_norms.storage_and_layout();
+    let vn = match &*vn {
+        Storage::Cuda(vn) => vn,
+        _ => candle::bail!("v_norms must be a cuda tensor"),
+    };
+    let (bt, bt_l) = block_tables.storage_and_layout();
+    let bt = match &*bt {
+        Storage::Cuda(bt) => bt,
+        _ => candle::bail!("block_tables must be a cuda tensor"),
+    };
+    let (cl, cl_l) = context_lens.storage_and_layout();
+    let cl = match &*cl {
+        Storage::Cuda(cl) => cl,
+        _ => candle::bail!("context_lens must be a cuda tensor"),
+    };
+
+    let dev = q_s.device();
+    let (num_seqs, num_heads, head_size) = q_l.shape().dims3()?;
+    let max_num_blocks_per_seq = bt_l.shape().dims2()?.1;
+    let (_num_blocks, _num_kv_heads, _, block_size, _x) = kc_l.shape().dims5()?;
+
+    // Allocate output as F32 (the kernel outputs F32)
+    let out_shape = q_l.shape().clone();
+    let out = unsafe { dev.alloc::<f32>(out_shape.elem_count()) }?;
+
+    let (out_ptr, _out_g) = out.device_ptr(out.stream());
+    let (q_ptr, _q_g) = q_s.as_cuda_slice::<f16>()?.device_ptr(q_s.as_cuda_slice::<f16>()?.stream());
+    let (kc_ptr, _kc_g) = kc.as_cuda_slice::<u8>()?.device_ptr(kc.as_cuda_slice::<u8>()?.stream());
+    let (vc_ptr, _vc_g) = vc.as_cuda_slice::<u8>()?.device_ptr(vc.as_cuda_slice::<u8>()?.stream());
+    let (kn_ptr, _kn_g) = kn.as_cuda_slice::<f16>()?.device_ptr(kn.as_cuda_slice::<f16>()?.stream());
+    let (vn_ptr, _vn_g) = vn.as_cuda_slice::<f16>()?.device_ptr(vn.as_cuda_slice::<f16>()?.stream());
+    let (bt_ptr, _bt_g) = bt.as_cuda_slice::<u32>()?.device_ptr(bt.as_cuda_slice::<u32>()?.stream());
+    let (cl_ptr, _cl_g) = cl.as_cuda_slice::<u32>()?.device_ptr(cl.as_cuda_slice::<u32>()?.stream());
+
+    let q_stride = q_l.stride()[0] as c_int;
+    let kv_block_stride = kc_l.stride()[0] as c_int;
+    let kv_head_stride = kc_l.stride()[1] as c_int;
+    let norm_block_stride = kn_l.stride()[0] as c_int;
+    let norm_head_stride = kn_l.stride()[1] as c_int;
+
+    unsafe {
+        ffi::turbo_paged_attention_v1_f16(
+            out_ptr as *const std::ffi::c_void,
+            q_ptr as *const std::ffi::c_void,
+            kc_ptr as *const std::ffi::c_void,
+            vc_ptr as *const std::ffi::c_void,
+            kn_ptr as *const std::ffi::c_void,
+            vn_ptr as *const std::ffi::c_void,
+            num_kv_heads as c_int,
+            softmax_scale,
+            softcapping,
+            bt_ptr as *const u32,
+            cl_ptr as *const u32,
+            block_size as c_int,
+            max_context_len as c_int,
+            num_seqs as c_int,
+            num_heads as c_int,
+            head_size as c_int,
+            max_num_blocks_per_seq as c_int,
+            q_stride,
+            kv_block_stride,
+            kv_head_stride,
+            norm_block_stride,
+            norm_head_stride,
+            dev.cuda_stream().cu_stream(),
+        )
+    }
+
+    // Convert F32 output to F16 to match expected output dtype
+    let out_storage = candle::CudaStorage::wrap_cuda_slice(out, dev.clone());
+    let out_tensor = candle::Tensor::from_storage_no_op(
+        candle::Storage::Cuda(out_storage),
+        out_shape,
+        false,
+    )?;
+    out_tensor.to_dtype(q.dtype())
+}

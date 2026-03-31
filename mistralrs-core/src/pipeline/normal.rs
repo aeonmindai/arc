@@ -933,20 +933,6 @@ impl Loader for NormalLoader {
                 "Adapter parallel_models do not currently support PagedAttention, running without"
             );
             None
-        } else if paged_attn_config
-            .as_ref()
-            .is_some_and(|c| c.cache_type.is_turboquant())
-        {
-            let preset = paged_attn_config.as_ref().unwrap().cache_type.turboquant_preset().unwrap();
-            info!(
-                "TurboQuant KV cache compression active ({preset}). Running with paged attention + TurboQuant quantize/dequantize.",
-            );
-            // Keep paged attention enabled but override cache type to Auto
-            // so the paged cache uses standard F16 blocks.
-            // TurboQuant compression happens in the PagedAttention layer.
-            let mut config = paged_attn_config.unwrap();
-            config.cache_type = PagedCacheType::Auto;
-            Some(config)
         } else {
             paged_attn_config
         };
@@ -982,8 +968,28 @@ impl Loader for NormalLoader {
                 layer_devices.clone(),
             )?;
 
+            // Set TurboQuant norms globally for PagedAttention layers
+            {
+                let kv_cache = cache_engine.get_kv_cache();
+                let norms: Vec<(candle_core::Tensor, candle_core::Tensor)> = kv_cache
+                    .iter()
+                    .filter_map(|(_, _, kn, vn)| {
+                        match (kn, vn) {
+                            (Some(k), Some(v)) => Some((k.clone(), v.clone())),
+                            _ => None,
+                        }
+                    })
+                    .collect();
+                if !norms.is_empty() {
+                    crate::paged_attention::set_global_turbo_norms(norms);
+                } else {
+                    crate::paged_attention::clear_global_turbo_norms();
+                }
+            }
+
             (Some(cache_config), Some(cache_engine))
         } else {
+            crate::paged_attention::clear_global_turbo_norms();
             (None, None)
         };
 

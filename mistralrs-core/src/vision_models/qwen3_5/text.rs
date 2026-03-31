@@ -166,7 +166,7 @@ impl FullAttention {
         attention_mask: Option<&Tensor>,
         cos_sin: &(Tensor, Tensor),
         kv_cache: &mut KvCache,
-        metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
+        metadata: Option<((Tensor, Tensor, Option<Tensor>, Option<Tensor>), &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
@@ -228,7 +228,7 @@ impl FullAttention {
         // Standard attention
         let mut y = match &self.paged_attn {
             Some(paged_attn) => match metadata {
-                Some(((key_cache, value_cache), input_metadata)) => paged_attn.forward(
+                Some(((key_cache, value_cache, _, _), input_metadata)) => paged_attn.forward(
                     &q,
                     &k,
                     &v,
@@ -383,7 +383,7 @@ impl DecoderLayer {
         attention_mask: Option<&Tensor>,
         cos_sin: &(Tensor, Tensor),
         kv_cache: &mut KvCache,
-        metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
+        metadata: Option<((Tensor, Tensor, Option<Tensor>, Option<Tensor>), &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let attn = match &self.layer_impl {
@@ -663,7 +663,7 @@ impl Qwen3_5TextModel {
         position_ids: &Tensor,
         _seqlen_offsets: &[usize],
         context_lens: Vec<(usize, usize)>,
-        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        metadata: Option<(Vec<(Tensor, Tensor, Option<Tensor>, Option<Tensor>)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
         visual_pos_masks: Option<&Tensor>,
         deepstack_visual_embeds: Option<&[Tensor]>,

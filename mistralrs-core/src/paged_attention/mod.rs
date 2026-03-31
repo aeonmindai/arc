@@ -11,12 +11,37 @@ mod config;
 pub mod encoder_cache;
 /// KV Cache Manager: high-level block allocation, prefix cache lookups, per-request tracking.
 pub mod kv_cache_manager;
-mod layers;
+pub(crate) mod layers;
 mod scheduler;
 pub const _PAD_SLOT_ID: i64 = -1;
 
 pub use cache_engine::{CacheConfig, CacheEngine, PagedCacheType};
-use candle_core::{DType, Device};
+use candle_core::{DType, Device, Tensor};
+use std::sync::Mutex;
+
+// Global TurboQuant norms registry
+static TURBO_NORMS_GLOBAL: Mutex<Vec<(Tensor, Tensor)>> = Mutex::new(Vec::new());
+
+pub fn set_global_turbo_norms(norms: Vec<(Tensor, Tensor)>) {
+    *TURBO_NORMS_GLOBAL.lock().unwrap() = norms;
+}
+
+pub fn clear_global_turbo_norms() {
+    TURBO_NORMS_GLOBAL.lock().unwrap().clear();
+}
+
+pub(crate) fn get_global_turbo_norms(layer_idx: usize) -> Option<(Tensor, Tensor)> {
+    let norms = TURBO_NORMS_GLOBAL.lock().unwrap();
+    if layer_idx < norms.len() {
+        Some((norms[layer_idx].0.clone(), norms[layer_idx].1.clone()))
+    } else {
+        None
+    }
+}
+
+pub(crate) fn has_global_turbo_norms() -> bool {
+    !TURBO_NORMS_GLOBAL.lock().unwrap().is_empty()
+}
 pub use config::{KvCacheLayout, ModelConfigLike, ModelConfigMetadata};
 pub use kv_cache_manager::KVCacheManager;
 pub use layers::PagedAttention;

@@ -26,12 +26,10 @@ impl PagedCacheType {
     pub fn to_dtype(&self, act_dtype: DType) -> DType {
         match self {
             PagedCacheType::F8E4M3 => DType::F8E4M3,
-            // TurboQuant bypasses paged attention and uses the normal cache path
-            // with TurboQuantCache. This dtype is only used if paged attn is somehow
-            // still active, in which case fall through to act_dtype.
+            // TurboQuant stores quantized indices as U8 in paged cache blocks.
             PagedCacheType::TurboQuant
             | PagedCacheType::TurboQuant3
-            | PagedCacheType::TurboQuantAggressive => act_dtype,
+            | PagedCacheType::TurboQuantAggressive => DType::U8,
             PagedCacheType::Auto => act_dtype,
         }
     }
@@ -87,17 +85,13 @@ pub struct CacheConfig {
     pub cache_type: PagedCacheType,
 }
 
-/// KV cache storage. Standard is (key_cache, value_cache).
-/// TurboQuant adds norm tensors for the L2 norms stored alongside packed indices.
-pub type KVCache = (Tensor, Tensor);
-
-/// Optional TurboQuant norm tensors, stored per-layer alongside KVCache.
-pub type TurboQuantNorms = (Tensor, Tensor); // (k_norms, v_norms)
+/// KV cache storage per layer: (key_cache, value_cache, optional_k_norms, optional_v_norms).
+/// Standard paged attention: k_norms and v_norms are None.
+/// TurboQuant: k_norms and v_norms hold per-block per-head per-slot F16 norms.
+pub type KVCache = (Tensor, Tensor, Option<Tensor>, Option<Tensor>);
 
 pub struct CacheEngine {
     gpu_cache: Arc<Mutex<Vec<KVCache>>>,
-    /// Per-layer norm tensors for TurboQuant. None if not using TurboQuant.
-    turbo_norms: Option<Arc<Mutex<Vec<TurboQuantNorms>>>>,
 }
 
 impl CacheEngine {
@@ -108,16 +102,24 @@ impl CacheEngine {
         device: &Device,
         layer_devices: Vec<Option<Device>>,
     ) -> Result<Self> {
-        let is_turbo = cache_config.cache_type.is_turboquant();
         let cache_dtype = cache_config.cache_type.to_dtype(dtype);
+        let is_turbo = cache_config.cache_type.is_turboquant();
 
-        let turbo_norms = if is_turbo {
-            // Allocate F16 norm tensors for each layer
-            let mut norms = Vec::new();
-            for dev in layer_devices
+        let mut gpu_cache = Self::allocate_gpu_cache(
+            model_config,
+            cache_config,
+            cache_dtype,
+            device,
+            layer_devices.clone(),
+        )?;
+
+        // For TurboQuant, add norm tensors to each layer's cache entry
+        if is_turbo {
+            for (i, dev) in layer_devices
                 .iter()
                 .take(model_config.num_layers())
                 .map(|x| x.as_ref().unwrap_or(device))
+                .enumerate()
             {
                 let norm_shape = (
                     cache_config.num_gpu_blocks,
@@ -126,33 +128,18 @@ impl CacheEngine {
                 );
                 let k_norms = Tensor::zeros(norm_shape, DType::F16, dev)?;
                 let v_norms = Tensor::zeros(norm_shape, DType::F16, dev)?;
-                norms.push((k_norms, v_norms));
+                gpu_cache[i].2 = Some(k_norms);
+                gpu_cache[i].3 = Some(v_norms);
             }
-            Some(Arc::new(Mutex::new(norms)))
-        } else {
-            None
-        };
+        }
 
         Ok(Self {
-            gpu_cache: Arc::new(Mutex::new(Self::allocate_gpu_cache(
-                model_config,
-                cache_config,
-                cache_dtype,
-                device,
-                layer_devices,
-            )?)),
-            turbo_norms,
+            gpu_cache: Arc::new(Mutex::new(gpu_cache)),
         })
     }
 
     pub fn get_kv_cache(&self) -> MutexGuard<'_, Vec<KVCache>> {
         self.gpu_cache.lock().expect("KV cache mutex was poisoned")
-    }
-
-    pub fn get_turbo_norms(&self) -> Option<MutexGuard<'_, Vec<TurboQuantNorms>>> {
-        self.turbo_norms
-            .as_ref()
-            .map(|n| n.lock().expect("TurboQuant norms mutex was poisoned"))
     }
 
     fn allocate_gpu_cache(
@@ -170,7 +157,7 @@ impl CacheEngine {
             .take(model_config.num_layers())
             .map(|x| x.as_ref().unwrap_or(device))
         {
-            let (key_blocks, value_blocks) = match kv_cache_layout {
+            let (key_blocks, value_blocks, k_norms, v_norms) = match kv_cache_layout {
                 KvCacheLayout::Standard => {
                     let key_block_shape = Self::calculate_key_block_shape(
                         model_config,
@@ -274,7 +261,7 @@ impl CacheEngine {
                             )?
                         }
                     };
-                    (key_blocks, value_blocks)
+                    (key_blocks, value_blocks, None, None)
                 }
                 KvCacheLayout::Mla {
                     kv_lora_rank,
@@ -366,10 +353,10 @@ impl CacheEngine {
                             )?
                         }
                     };
-                    (key_blocks, value_blocks)
+                    (key_blocks, value_blocks, None, None)
                 }
             };
-            gpu_cache.push((key_blocks, value_blocks));
+            gpu_cache.push((key_blocks, value_blocks, k_norms, v_norms));
         }
         Ok(gpu_cache)
     }

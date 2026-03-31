@@ -1568,7 +1568,7 @@ impl VisionModel for TextModel {
         _context_lens: Vec<(usize, usize)>,
         _position_ids: Vec<usize>,
         _model_specific_args: Box<dyn std::any::Any>, // pixel attention mask, or image sizes, or anything else
-        _metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        _metadata: Option<(Vec<(Tensor, Tensor, Option<Tensor>, Option<Tensor>)>, &PagedAttentionInputMetadata)>,
         _flash_params: &FlashParams,
     ) -> candle_core::Result<Tensor> {
         unreachable!()

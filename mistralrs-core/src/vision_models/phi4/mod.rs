@@ -102,7 +102,7 @@ impl Attention {
         seqlen_offsets: &[usize],
         position_ids: &[usize],
         kv_cache: &mut KvCache,
-        metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
+        metadata: Option<((Tensor, Tensor, Option<Tensor>, Option<Tensor>), &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
@@ -149,7 +149,7 @@ impl Attention {
 
         let mut attn_output = match &self.paged_attn {
             Some(paged_attn) => match metadata {
-                Some(((key_cache, value_cache), input_metadata)) => paged_attn.forward(
+                Some(((key_cache, value_cache, _, _), input_metadata)) => paged_attn.forward(
                     &q,
                     &k.contiguous()?,
                     &v.contiguous()?,
@@ -314,7 +314,7 @@ impl DecoderLayer {
         seqlen_offsets: &[usize],
         position_ids: &[usize],
         kv_cache: &mut KvCache,
-        metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
+        metadata: Option<((Tensor, Tensor, Option<Tensor>, Option<Tensor>), &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let residual = xs;
@@ -482,7 +482,7 @@ impl Phi4MMModel {
         seqlen_offsets: &[usize],
         position_ids: &[usize],
         context_lens: Vec<(usize, usize)>,
-        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        metadata: Option<(Vec<(Tensor, Tensor, Option<Tensor>, Option<Tensor>)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
         image_hashes: &[u64],
     ) -> Result<Tensor> {
@@ -571,7 +571,7 @@ impl VisionModel for Phi4MMModel {
         context_lens: Vec<(usize, usize)>,
         position_ids: Vec<usize>,
         model_specific_args: Box<dyn Any>,
-        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        metadata: Option<(Vec<(Tensor, Tensor, Option<Tensor>, Option<Tensor>)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let Phi4MMVisionSpecificArgs {

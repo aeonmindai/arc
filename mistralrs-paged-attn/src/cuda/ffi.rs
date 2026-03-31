@@ -453,17 +453,17 @@ extern "C" {
         num_heads: c_int,
         head_size: c_int,
         block_size: c_int,
-        k_packed_bytes: c_int,
-        v_packed_bytes: c_int,
         key_stride: c_int,
         value_stride: c_int,
         kv_block_stride: c_int,
         kv_head_stride: c_int,
+        norm_block_stride: c_int,
+        norm_head_stride: c_int,
         stream: CUstream,
         dtype: u32,
     );
 
-    pub fn turbo_paged_attention_v1(
+    pub fn turbo_paged_attention_v1_f16(
         out: *const c_void,
         query: *const c_void,
         k_cache: *const c_void,
@@ -484,8 +484,8 @@ extern "C" {
         q_stride: c_int,
         kv_block_stride: c_int,
         kv_head_stride: c_int,
+        norm_block_stride: c_int,
+        norm_head_stride: c_int,
         stream: CUstream,
-        k_bits: c_int,
-        v_bits: c_int,
     );
 }
