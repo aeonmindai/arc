@@ -28,7 +28,7 @@ jobs:
             features: ""
             artifact: arc
 
-          # Linux x86_64 CUDA (no flash-attn in CI — needs GPU headers)
+          # Linux x86_64 CUDA (SM 80 baseline — runs on Ampere and newer)
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             variant: linux-x86_64-cuda
