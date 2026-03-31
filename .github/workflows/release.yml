@@ -121,9 +121,11 @@ jobs:
           key: ${{ matrix.variant }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ matrix.variant }}-cargo-
 
+      - name: Set CUDA compute capability
+        if: matrix.cuda_compute_cap
+        run: echo "CUDA_COMPUTE_CAP=${{ matrix.cuda_compute_cap }}" >> $GITHUB_ENV
+
       - name: Build arc-cli (release)
-        env:
-          CUDA_COMPUTE_CAP: ${{ matrix.cuda_compute_cap || '' }}
         run: |
           if [ -n "${{ matrix.features }}" ]; then
             cargo build --release -p arc-cli --features "${{ matrix.features }}"
@@ -132,8 +134,6 @@ jobs:
           fi
 
       - name: Build mistralrs-cli (release)
-        env:
-          CUDA_COMPUTE_CAP: ${{ matrix.cuda_compute_cap || '' }}
         run: |
           if [ -n "${{ matrix.features }}" ]; then
             cargo build --release -p mistralrs-cli --features "${{ matrix.features }}"
