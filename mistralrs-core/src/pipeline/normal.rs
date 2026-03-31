@@ -21,7 +21,9 @@ use crate::device_map::{self, DeviceMapper};
 use crate::distributed::{self, WorkerTransferData};
 use crate::kv_cache::{FullCacheManager, HybridCacheManager, NormalCacheManager};
 use crate::lora::Ordering;
-use crate::paged_attention::{calculate_cache_config, AttentionImplementation, CacheEngine};
+use crate::paged_attention::{
+    calculate_cache_config, AttentionImplementation, CacheEngine, PagedCacheType,
+};
 use crate::pipeline::chat_template::{calculate_eos_tokens, GenerationConfig};
 use crate::pipeline::isq::UqffFullSer;
 use crate::pipeline::loaders::auto_device_map;
@@ -937,11 +939,14 @@ impl Loader for NormalLoader {
         {
             let preset = paged_attn_config.as_ref().unwrap().cache_type.turboquant_preset().unwrap();
             info!(
-                "TurboQuant KV cache compression enabled ({preset}). Using eager attention with compressed normal cache.",
+                "TurboQuant KV cache compression active ({preset}). Running with paged attention + TurboQuant quantize/dequantize.",
             );
-            // Enable TurboQuant for NormalCache creation (head_dim=128 is the common default)
-            crate::kv_cache::set_turboquant_head_dim(128);
-            None
+            // Keep paged attention enabled but override cache type to Auto
+            // so the paged cache uses standard F16 blocks.
+            // TurboQuant compression happens in the PagedAttention layer.
+            let mut config = paged_attn_config.unwrap();
+            config.cache_type = PagedCacheType::Auto;
+            Some(config)
         } else {
             paged_attn_config
         };
