@@ -102,7 +102,7 @@ jobs:
         with:
           cuda: ${{ matrix.cuda_version || '12.6.0' }}
           method: 'network'
-          sub-packages: '["nvcc", "cudart", "nvrtc-dev", "cublas-dev", "curand-dev", "cusparse-dev", "cusolver-dev"]'
+          sub-packages: '["nvcc", "cudart-dev", "nvrtc-dev", "libraries-dev"]'
 
       - name: Install Metal Toolchain
         if: contains(matrix.features, 'metal')
