@@ -123,6 +123,10 @@ impl PrefixCacheManagerV2 {
                 KvCache::Rotating { k, .. } => {
                     k.all_data().as_ref().expect("No KV cache data").device()
                 }
+                KvCache::TurboQuant(_) => {
+                    // TurboQuant cache is CPU-resident for now
+                    &Device::Cpu
+                }
             };
 
             if !matches!(cache_device, Device::Cpu) {
@@ -146,6 +150,10 @@ impl PrefixCacheManagerV2 {
                 }
                 KvCache::Rotating { k, .. } => {
                     k.all_data().as_ref().expect("No KV cache data").device()
+                }
+                KvCache::TurboQuant(_) => {
+                    // TurboQuant cache is CPU-resident for now
+                    &Device::Cpu
                 }
             };
 

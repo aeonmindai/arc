@@ -79,7 +79,7 @@ impl Default for PagedAttentionMetaBuilder {
         Self {
             block_size: None,
             mem_gpu: MemoryGpuConfig::ContextSize(4096),
-            cache_type: PagedCacheType::Auto,
+            cache_type: PagedCacheType::TurboQuant,
         }
     }
 }
@@ -97,7 +97,7 @@ impl PagedAttentionMetaBuilder {
         self
     }
 
-    /// Set the paged cache data type. Defaults to `PagedCacheType::Auto`.
+    /// Set the paged cache data type. Defaults to `PagedCacheType::TurboQuant` (3.5-bit, lossless).
     pub fn with_paged_cache_type(mut self, cache_type: PagedCacheType) -> Self {
         self.cache_type = cache_type;
         self

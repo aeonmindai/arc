@@ -1,0 +1,20 @@
+[package]
+name = "arc-turbo"
+version.workspace = true
+edition.workspace = true
+description = "TurboQuant KV cache compression for the Arc inference engine"
+homepage = "https://runcrate.ai/arc"
+repository = "https://github.com/runcrate/arc"
+keywords = ["llm", "quantization", "turboquant", "kv-cache", "compression"]
+categories = ["science", "algorithms"]
+license = "BSL-1.1"
+rust-version.workspace = true
+
+[dependencies]
+mistralrs-quant = { path = "../mistralrs-quant" }
+candle-core.workspace = true
+
+[features]
+default = []
+cuda = ["mistralrs-quant/cuda"]
+metal = ["mistralrs-quant/metal"]

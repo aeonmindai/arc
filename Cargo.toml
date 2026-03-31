@@ -14,6 +14,10 @@ members = [
     "mistralrs-audio",
     "mistralrs-mcp",
     "mistralrs-macros",
+    # Arc additions
+    "arc-engine",
+    "arc-turbo",
+    "arc-cli",
 ]
 resolver = "2"
 

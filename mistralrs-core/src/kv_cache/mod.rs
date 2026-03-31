@@ -12,6 +12,7 @@ mod full_cache;
 mod hybrid_cache;
 mod rotating_cache;
 mod single_cache;
+pub mod turboquant_cache;
 
 pub use full_cache::{EitherCache, LayerCaches};
 pub use hybrid_cache::{
@@ -20,6 +21,7 @@ pub use hybrid_cache::{
 };
 pub use rotating_cache::RotatingCache;
 pub use single_cache::SingleCache;
+pub use turboquant_cache::TurboQuantCache;
 
 pub trait CacheManager<T: CacheManagerMixin + MetadataMixin + ?Sized> {
     fn clone_in_cache(
@@ -42,6 +44,7 @@ pub trait CacheManager<T: CacheManagerMixin + MetadataMixin + ?Sized> {
 pub enum KvCache {
     Normal { k: SingleCache, v: SingleCache },
     Rotating { k: RotatingCache, v: RotatingCache },
+    TurboQuant(TurboQuantCache),
 }
 
 impl KvCache {
@@ -57,10 +60,15 @@ impl KvCache {
         Self::Rotating { k, v }
     }
 
+    pub fn new_turboquant(config: &mistralrs_quant::turboquant::TurboQuantConfig) -> Self {
+        Self::TurboQuant(TurboQuantCache::new(config))
+    }
+
     pub fn k(&self) -> Result<Option<Tensor>> {
         match self {
             Self::Normal { k, .. } => k.current_data(),
             Self::Rotating { k, .. } => k.current_data(),
+            Self::TurboQuant(tq) => tq.k.current_data(),
         }
     }
 
@@ -68,12 +76,19 @@ impl KvCache {
         match self {
             Self::Normal { v, .. } => v.current_data(),
             Self::Rotating { v, .. } => v.current_data(),
+            Self::TurboQuant(tq) => tq.v.current_data(),
         }
     }
 
     pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
         let k = k.contiguous()?;
         let v = v.contiguous()?;
+        match self {
+            Self::TurboQuant(tq) => {
+                return tq.append(&k, &v);
+            }
+            _ => {}
+        }
         let (out_k, out_v) = match self {
             Self::Normal { k: kc, v: vc } => {
                 kc.append(&k)?;
@@ -85,6 +100,7 @@ impl KvCache {
                 let out_v = vc.append(&v)?;
                 (Some(out_k), Some(out_v))
             }
+            Self::TurboQuant(_) => unreachable!(),
         };
         let k = match out_k {
             None => {
@@ -92,6 +108,7 @@ impl KvCache {
                 match self {
                     Self::Normal { k, .. } => shape[k.dim] = 0,
                     Self::Rotating { k, .. } => shape[k.dim] = 0,
+                    Self::TurboQuant(_) => unreachable!(),
                 }
                 Tensor::zeros(shape, k.dtype(), k.device())?
             }
@@ -103,6 +120,7 @@ impl KvCache {
                 match self {
                     Self::Normal { v, .. } => shape[v.dim] = 0,
                     Self::Rotating { v, .. } => shape[v.dim] = 0,
+                    Self::TurboQuant(_) => unreachable!(),
                 }
                 Tensor::zeros(shape, v.dtype(), v.device())?
             }
@@ -115,6 +133,7 @@ impl KvCache {
         match self {
             Self::Normal { k, .. } => k.current_seq_len(),
             Self::Rotating { k, .. } => k.current_seq_len(),
+            Self::TurboQuant(tq) => tq.current_seq_len(),
         }
     }
 
@@ -127,6 +146,9 @@ impl KvCache {
             Self::Rotating { k, v } => {
                 k.reset();
                 v.reset();
+            }
+            Self::TurboQuant(tq) => {
+                tq.reset();
             }
         }
     }
@@ -144,6 +166,11 @@ impl KvCache {
                 v.set_len(len)?;
                 Ok(())
             }
+            Self::TurboQuant(tq) => {
+                tq.k.set_len(len)?;
+                tq.v.set_len(len)?;
+                Ok(())
+            }
         }
     }
 
@@ -157,6 +184,10 @@ impl KvCache {
             Self::Rotating { k, v } => {
                 k.try_set_len(len)?;
                 v.try_set_len(len)?;
+                Ok(())
+            }
+            Self::TurboQuant(_) => {
+                // TurboQuant doesn't support try_set_len yet
                 Ok(())
             }
         }
@@ -267,6 +298,10 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     KvCache::Rotating { k, v } => {
                         (k.all_data.clone().unwrap(), v.all_data.clone().unwrap())
                     }
+                    KvCache::TurboQuant(tq) => {
+                        // Dequantize for cache cloning
+                        (tq.k.current_data().unwrap().unwrap(), tq.v.current_data().unwrap().unwrap())
+                    }
                 }
             };
             // Build dims for batched cache
@@ -293,6 +328,9 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     }
                     KvCache::Rotating { k, v } => {
                         (k.all_data.clone().unwrap(), v.all_data.clone().unwrap())
+                    }
+                    KvCache::TurboQuant(tq) => {
+                        (tq.k.current_data().unwrap().unwrap(), tq.v.current_data().unwrap().unwrap())
                     }
                 };
                 let offset = i * first_k.dims()[0];
@@ -384,6 +422,9 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                         },
                     });
                 }
+                KvCache::TurboQuant(tq) => {
+                    caches.push(KvCache::TurboQuant(tq.clone()));
+                }
             }
         }
         *pipeline.cache().normal() = NormalCache(caches);
@@ -403,6 +444,9 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 }
                 KvCache::Rotating { k, v } => {
                     (k.all_data.clone().unwrap(), v.all_data.clone().unwrap())
+                }
+                KvCache::TurboQuant(tq) => {
+                    (tq.k.current_data().unwrap().unwrap(), tq.v.current_data().unwrap().unwrap())
                 }
             };
 
@@ -465,6 +509,10 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                                 capacity_seq_len: cache_v.capacity_seq_len,
                             },
                         });
+                    }
+                    KvCache::TurboQuant(tq) => {
+                        // Clone the TurboQuant cache as-is
+                        *seq_cache = Some(KvCache::TurboQuant(tq.clone()));
                     }
                 }
             }
@@ -581,6 +629,12 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                         },
                     };
                     *layer = cache;
+                }
+                KvCache::TurboQuant(tq) => {
+                    // Reset TurboQuant cache
+                    let mut new_tq = tq.clone();
+                    new_tq.reset();
+                    *layer = KvCache::TurboQuant(new_tq);
                 }
             }
         }

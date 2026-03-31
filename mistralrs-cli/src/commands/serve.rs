@@ -515,7 +515,7 @@ pub(crate) fn extract_paged_attn_settings(
         ModelType::Text { cache, .. } => cache,
         ModelType::Vision { cache, .. } => cache,
         ModelType::Embedding { cache, .. } => cache,
-        _ => return (None, None, None, None, None, PagedCacheType::Auto),
+        _ => return (None, None, None, None, None, PagedCacheType::TurboQuant),
     };
 
     cache.paged_attn.clone().into_builder_flags()

@@ -41,8 +41,9 @@ pub struct PagedAttentionOptions {
     #[arg(long = "pa-block-size")]
     pub block_size: Option<usize>,
 
-    /// KV cache quantization type
-    #[arg(long = "pa-cache-type", default_value = "auto", value_parser = parse_cache_type)]
+    /// KV cache quantization type: turboquant (K4/V3, 3.5-bit, lossless, default),
+    /// turboquant-3 (K3/V3), turboquant-aggressive (K3/V2), auto, f8e4m3
+    #[arg(long = "pa-cache-type", default_value = "turboquant", value_parser = parse_cache_type)]
     #[serde(default)]
     pub cache_type: PagedCacheType,
 }
@@ -55,7 +56,7 @@ impl Default for PagedAttentionOptions {
             memory_mb: None,
             memory_fraction: None,
             block_size: None,
-            cache_type: PagedCacheType::Auto,
+            cache_type: PagedCacheType::TurboQuant,
         }
     }
 }

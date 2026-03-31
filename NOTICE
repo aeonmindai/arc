@@ -1,0 +1,13 @@
+Arc Inference Engine
+Copyright (c) 2026 Aeonmind, LLC
+
+This repository contains code under two licenses:
+
+1. arc-engine/, arc-turbo/, arc-cli/ — Licensed under the Business Source
+   License 1.1 (LICENSE-BSL). See that file for terms.
+
+2. mistralrs-*/ and all other directories — Licensed under the MIT License
+   (LICENSE). Originally from https://github.com/EricLBuehler/mistral.rs
+
+The TurboQuant implementation, fused attention kernels, and Arc CLI are
+original works by Aeonmind and fall under the BSL license.

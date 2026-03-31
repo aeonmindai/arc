@@ -1,0 +1,41 @@
+[package]
+name = "arc-cli"
+version.workspace = true
+edition.workspace = true
+description = "Arc inference engine CLI — serve, run, bench LLMs with TurboQuant compression"
+homepage = "https://runcrate.ai/arc"
+repository = "https://github.com/runcrate/arc"
+keywords = ["llm", "inference", "turboquant", "ai", "serving"]
+categories = ["science", "command-line-utilities"]
+license = "BSL-1.1"
+rust-version.workspace = true
+default-run = "arc"
+
+[[bin]]
+name = "arc"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+arc-engine = { path = "../arc-engine" }
+mistralrs-core = { path = "../mistralrs-core" }
+mistralrs-server-core = { path = "../mistralrs-server-core" }
+mistralrs = { path = "../mistralrs" }
+candle-core.workspace = true
+
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[features]
+default = []
+cuda = ["mistralrs-core/cuda", "mistralrs-server-core/cuda", "arc-engine/cuda"]
+nccl = ["mistralrs-core/nccl", "mistralrs-server-core/nccl"]
+cudnn = ["mistralrs-core/cudnn", "mistralrs-server-core/cudnn", "arc-engine/cudnn"]
+flash-attn = ["cuda", "mistralrs-core/flash-attn", "mistralrs-server-core/flash-attn", "arc-engine/flash-attn"]
+flash-attn-v3 = ["cuda", "mistralrs-core/flash-attn-v3", "mistralrs-server-core/flash-attn-v3", "arc-engine/flash-attn-v3"]
+metal = ["mistralrs-core/metal", "mistralrs-server-core/metal", "arc-engine/metal"]

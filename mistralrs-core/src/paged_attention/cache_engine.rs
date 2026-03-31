@@ -11,16 +11,53 @@ use super::config::{KvCacheLayout, ModelConfigLike};
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "pyo3_macros", pyo3::pyclass(eq, eq_int))]
 pub enum PagedCacheType {
-    #[default]
     Auto,
     F8E4M3,
+    /// TurboQuant default: 4-bit keys, 3-bit values (3.5 bits avg). Lossless quality.
+    #[default]
+    TurboQuant,
+    /// TurboQuant balanced: 3-bit keys, 3-bit values (3.0 bits avg).
+    TurboQuant3,
+    /// TurboQuant aggressive: 3-bit keys, 2-bit values (2.5 bits avg).
+    TurboQuantAggressive,
 }
 
 impl PagedCacheType {
     pub fn to_dtype(&self, act_dtype: DType) -> DType {
         match self {
             PagedCacheType::F8E4M3 => DType::F8E4M3,
+            // TurboQuant stores packed indices, not a standard dtype.
+            // Return the activation dtype; the actual packing is handled separately.
+            PagedCacheType::TurboQuant
+            | PagedCacheType::TurboQuant3
+            | PagedCacheType::TurboQuantAggressive => act_dtype,
             PagedCacheType::Auto => act_dtype,
+        }
+    }
+
+    /// Whether this cache type uses TurboQuant compression.
+    pub fn is_turboquant(&self) -> bool {
+        matches!(
+            self,
+            PagedCacheType::TurboQuant
+                | PagedCacheType::TurboQuant3
+                | PagedCacheType::TurboQuantAggressive
+        )
+    }
+
+    /// Get the TurboQuant preset for this cache type, if applicable.
+    pub fn turboquant_preset(&self) -> Option<mistralrs_quant::turboquant::TurboQuantPreset> {
+        match self {
+            PagedCacheType::TurboQuant => {
+                Some(mistralrs_quant::turboquant::TurboQuantPreset::Default)
+            }
+            PagedCacheType::TurboQuant3 => {
+                Some(mistralrs_quant::turboquant::TurboQuantPreset::Balanced)
+            }
+            PagedCacheType::TurboQuantAggressive => {
+                Some(mistralrs_quant::turboquant::TurboQuantPreset::Aggressive)
+            }
+            _ => None,
         }
     }
 }
@@ -31,8 +68,12 @@ impl FromStr for PagedCacheType {
         match s {
             "auto" => Ok(Self::Auto),
             "f8e4m3" => Ok(Self::F8E4M3),
+            "turboquant" => Ok(Self::TurboQuant),
+            "turboquant-3" => Ok(Self::TurboQuant3),
+            "turboquant-aggressive" => Ok(Self::TurboQuantAggressive),
             other => Err(format!(
-                "Unexpected `PagedCacheType`, got `{other}` but expected `auto` and `f8e4m3`."
+                "Unexpected `PagedCacheType`, got `{other}` but expected one of: \
+                 `auto`, `f8e4m3`, `turboquant`, `turboquant-3`, `turboquant-aggressive`."
             )),
         }
     }

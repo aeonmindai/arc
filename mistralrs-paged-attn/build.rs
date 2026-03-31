@@ -12,6 +12,7 @@ fn main() -> Result<()> {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/cuda/pagedattention.cuh");
+    println!("cargo:rerun-if-changed=src/cuda/turbo_paged_attention.cuh");
     println!("cargo:rerun-if-changed=src/cuda/copy_blocks_kernel.cu");
     println!("cargo:rerun-if-changed=src/cuda/reshape_and_cache_kernel.cu");
     println!("cargo:rerun-if-changed=src/cuda/concat_and_cache_mla_kernel.cu");
@@ -99,12 +100,13 @@ fn main() -> Result<(), String> {
     // Declare expected cfg values for check-cfg lint
     println!("cargo::rustc-check-cfg=cfg(has_fp8)");
 
-    const METAL_SOURCES: [&str; 5] = [
+    const METAL_SOURCES: [&str; 6] = [
         "copy_blocks",
         "pagedattention",
         "reshape_and_cache",
         "kv_scale_update",
         "gather_kv_cache",
+        "turbo_paged_attention",
     ];
     for src in METAL_SOURCES {
         println!("cargo::rerun-if-changed=src/metal/kernels/{src}.metal");

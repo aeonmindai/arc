@@ -189,6 +189,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-cli"
+version = "0.7.1-alpha.1"
+dependencies = [
+ "anyhow",
+ "arc-engine",
+ "candle-core",
+ "clap",
+ "mistralrs",
+ "mistralrs-core",
+ "mistralrs-server-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "arc-engine"
+version = "0.7.1-alpha.1"
+dependencies = [
+ "arc-turbo",
+ "candle-core",
+ "mistralrs-core",
+ "mistralrs-quant",
+ "tracing",
+]
+
+[[package]]
+name = "arc-turbo"
+version = "0.7.1-alpha.1"
+dependencies = [
+ "candle-core",
+ "mistralrs-quant",
+]
+
+[[package]]
 name = "arg_enum_proc_macro"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

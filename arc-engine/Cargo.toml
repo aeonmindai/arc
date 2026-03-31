@@ -1,0 +1,26 @@
+[package]
+name = "arc-engine"
+version.workspace = true
+edition.workspace = true
+description = "Arc inference engine — high-performance LLM serving with TurboQuant compression"
+homepage = "https://runcrate.ai/arc"
+repository = "https://github.com/runcrate/arc"
+keywords = ["llm", "inference", "machine-learning", "ai", "turboquant"]
+categories = ["science", "api-bindings", "text-processing"]
+license = "BSL-1.1"
+rust-version.workspace = true
+
+[dependencies]
+mistralrs-core = { path = "../mistralrs-core" }
+mistralrs-quant = { path = "../mistralrs-quant" }
+arc-turbo = { path = "../arc-turbo" }
+candle-core.workspace = true
+tracing.workspace = true
+
+[features]
+default = []
+cuda = ["mistralrs-core/cuda", "mistralrs-quant/cuda"]
+metal = ["mistralrs-core/metal", "mistralrs-quant/metal"]
+flash-attn = ["mistralrs-core/flash-attn"]
+flash-attn-v3 = ["mistralrs-core/flash-attn-v3"]
+cudnn = ["mistralrs-core/cudnn"]
