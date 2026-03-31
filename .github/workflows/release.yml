@@ -173,7 +173,7 @@ jobs:
 
             **One-liner (auto-detects your platform):**
             ```bash
-            curl -fsSL https://raw.githubusercontent.com/runcrate/arc/master/install.sh | sh
+            curl -fsSL https://raw.githubusercontent.com/aeonmindai/arc/master/install.sh | sh
             ```
 
             **Direct downloads:**

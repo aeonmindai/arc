@@ -4,7 +4,7 @@ set -e
 # Arc Installation Script
 # Downloads prebuilt binaries or builds from source with hardware auto-detection.
 
-REPO="runcrate/arc"
+REPO="aeonmindai/arc"
 BINARY="arc"
 
 # Colors

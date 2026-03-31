@@ -9,7 +9,7 @@ Inference at the speed of physics, not software.
 </h3>
 
 <p align="center">
-  <a href="https://runcrate.ai/arc"><b>Website</b></a> | <a href="#rust-sdk"><b>Rust SDK</b></a> | <a href="#python-sdk"><b>Python SDK</b></a> | <a href="#turboquant"><b>TurboQuant</b></a> | <a href="https://github.com/runcrate/arc"><b>GitHub</b></a>
+  <a href="https://runcrate.ai/arc"><b>Website</b></a> | <a href="#rust-sdk"><b>Rust SDK</b></a> | <a href="#python-sdk"><b>Python SDK</b></a> | <a href="#turboquant"><b>TurboQuant</b></a> | <a href="https://github.com/aeonmindai/arc"><b>GitHub</b></a>
 </p>
 
 <p align="center">
@@ -40,7 +40,7 @@ Everything from mistral.rs is included: PagedAttention, FlashAttention V2/V3, sp
 
 **Linux/macOS (one-liner):**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/runcrate/arc/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/aeonmindai/arc/master/install.sh | sh
 ```
 
 Auto-detects CUDA, Metal, and FlashAttention. Downloads prebuilt binaries when available, builds from source otherwise.
