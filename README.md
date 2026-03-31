@@ -38,12 +38,18 @@ Everything from mistral.rs is included: PagedAttention, FlashAttention V2/V3, sp
 
 ### Install
 
+**Linux/macOS (one-liner):**
 ```bash
-# Install the Arc CLI
-cargo install --path arc-cli
+curl -fsSL https://raw.githubusercontent.com/runcrate/arc/master/install.sh | sh
+```
 
-# Or install the upstream mistralrs CLI (also defaults to TurboQuant)
-cargo install --path mistralrs-cli
+Auto-detects CUDA, Metal, and FlashAttention. Downloads prebuilt binaries when available, builds from source otherwise.
+
+**From source:**
+```bash
+cargo install --path arc-cli                              # CPU
+cargo install --path arc-cli --features metal             # Apple Silicon
+cargo install --path arc-cli --features "cuda flash-attn" # NVIDIA GPU
 ```
 
 ### Run
