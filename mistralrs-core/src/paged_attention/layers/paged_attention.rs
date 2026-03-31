@@ -1,6 +1,7 @@
 use candle_core::{DType, Device, Result, Tensor};
 #[allow(unused_imports)]
 use mistralrs_paged_attn::{kv_scale_update, paged_attention, reshape_and_cache};
+use mistralrs_quant::turboquant::{codebook, wht, TurboQuantConfig, TurboQuantPreset};
 
 const KV_SCALE_UPDATE_ITERATION: i32 = 128;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -11,11 +12,99 @@ use crate::{
     pipeline::text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
 };
 
+/// Quantize a K/V tensor from FP16/BF16 to U8 using TurboQuant.
+/// Input: [num_tokens, num_heads, head_size] in FP16/BF16
+/// Output: [num_tokens, num_heads, head_size] in U8 (one quantized index per element)
+///
+/// Each element becomes a codebook index (0-15 for 4-bit, 0-7 for 3-bit).
+/// The L2 norm per vector is NOT stored here — it's handled separately.
+fn turboquant_quantize_tensor(
+    tensor: &Tensor,
+    bits: u32,
+    signs: &[f32],
+) -> Result<Tensor> {
+    let shape = tensor.dims().to_vec(); // [num_tokens, num_heads, head_size]
+    let head_size = *shape.last().unwrap();
+    let data = tensor.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let cb = codebook::get_codebook(head_size, bits);
+    let num_vectors = data.len() / head_size;
+
+    let mut quantized = Vec::with_capacity(data.len());
+    for i in 0..num_vectors {
+        let offset = i * head_size;
+        let vector = &data[offset..offset + head_size];
+
+        // Compute norm
+        let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm < 1e-10 {
+            quantized.extend(std::iter::repeat_n(cb.quantize(0.0), head_size));
+            continue;
+        }
+
+        // Normalize
+        let mut rotated: Vec<f32> = vector.iter().map(|x| x / norm).collect();
+
+        // WHT rotation
+        wht::rotate_forward(&mut rotated, signs);
+
+        // Quantize each coordinate
+        for &val in &rotated {
+            quantized.push(cb.quantize(val));
+        }
+    }
+
+    Tensor::from_vec(quantized, shape.as_slice(), tensor.device())
+}
+
+/// Dequantize a U8 tensor back to F32 using TurboQuant codebooks.
+/// Needs the original norms to scale back.
+fn turboquant_dequantize_tensor(
+    quantized: &Tensor,
+    norms: &Tensor,
+    bits: u32,
+    signs: &[f32],
+    target_dtype: DType,
+) -> Result<Tensor> {
+    let shape = quantized.dims().to_vec();
+    let head_size = *shape.last().unwrap();
+    let indices = quantized.flatten_all()?.to_vec1::<u8>()?;
+    let norm_data = norms.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let cb = codebook::get_codebook(head_size, bits);
+    let num_vectors = indices.len() / head_size;
+
+    let mut output = Vec::with_capacity(indices.len());
+    for i in 0..num_vectors {
+        let offset = i * head_size;
+        let norm = norm_data[i];
+
+        // Reconstruct from codebook
+        let mut reconstructed: Vec<f32> = indices[offset..offset + head_size]
+            .iter()
+            .map(|&idx| cb.dequantize(idx))
+            .collect();
+
+        // Inverse rotation
+        wht::rotate_inverse(&mut reconstructed, signs);
+
+        // Scale by norm
+        for val in &mut reconstructed {
+            *val *= norm;
+        }
+        output.extend_from_slice(&reconstructed);
+    }
+
+    Tensor::from_vec(output, shape.as_slice(), quantized.device())?.to_dtype(target_dtype)
+}
+
 pub struct PagedAttention {
     alibi_slopes: Option<Tensor>,
     k_scale: Option<Tensor>,
     v_scale: Option<Tensor>,
     kv_updated_times: AtomicI32,
+    /// TurboQuant WHT signs (None if not using TurboQuant)
+    turbo_signs: Option<Vec<f32>>,
+    turbo_k_bits: u32,
+    turbo_v_bits: u32,
 }
 
 impl PagedAttention {
@@ -31,7 +120,23 @@ impl PagedAttention {
             k_scale: Some(Tensor::new(1f32, device)?),
             v_scale: Some(Tensor::new(1f32, device)?),
             kv_updated_times: AtomicI32::new(0),
+            turbo_signs: None,
+            turbo_k_bits: 4,
+            turbo_v_bits: 3,
         })
+    }
+
+    /// Enable TurboQuant compression for this attention layer.
+    pub fn with_turboquant(mut self, head_dim: usize, preset: TurboQuantPreset) -> Self {
+        self.turbo_signs = Some(wht::generate_signs(42, head_dim));
+        self.turbo_k_bits = preset.key_bits();
+        self.turbo_v_bits = preset.value_bits();
+        self
+    }
+
+    /// Check if this layer uses TurboQuant.
+    pub fn is_turboquant(&self) -> bool {
+        self.turbo_signs.is_some()
     }
 
     #[allow(clippy::too_many_arguments)]

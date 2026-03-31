@@ -26,8 +26,9 @@ impl PagedCacheType {
     pub fn to_dtype(&self, act_dtype: DType) -> DType {
         match self {
             PagedCacheType::F8E4M3 => DType::F8E4M3,
-            // TurboQuant stores packed indices, not a standard dtype.
-            // Return the activation dtype; the actual packing is handled separately.
+            // TurboQuant bypasses paged attention and uses the normal cache path
+            // with TurboQuantCache. This dtype is only used if paged attn is somehow
+            // still active, in which case fall through to act_dtype.
             PagedCacheType::TurboQuant
             | PagedCacheType::TurboQuant3
             | PagedCacheType::TurboQuantAggressive => act_dtype,
@@ -86,10 +87,17 @@ pub struct CacheConfig {
     pub cache_type: PagedCacheType,
 }
 
+/// KV cache storage. Standard is (key_cache, value_cache).
+/// TurboQuant adds norm tensors for the L2 norms stored alongside packed indices.
 pub type KVCache = (Tensor, Tensor);
+
+/// Optional TurboQuant norm tensors, stored per-layer alongside KVCache.
+pub type TurboQuantNorms = (Tensor, Tensor); // (k_norms, v_norms)
 
 pub struct CacheEngine {
     gpu_cache: Arc<Mutex<Vec<KVCache>>>,
+    /// Per-layer norm tensors for TurboQuant. None if not using TurboQuant.
+    turbo_norms: Option<Arc<Mutex<Vec<TurboQuantNorms>>>>,
 }
 
 impl CacheEngine {
@@ -100,22 +108,51 @@ impl CacheEngine {
         device: &Device,
         layer_devices: Vec<Option<Device>>,
     ) -> Result<Self> {
-        let dtype = cache_config.cache_type.to_dtype(dtype);
+        let is_turbo = cache_config.cache_type.is_turboquant();
+        let cache_dtype = cache_config.cache_type.to_dtype(dtype);
+
+        let turbo_norms = if is_turbo {
+            // Allocate F16 norm tensors for each layer
+            let mut norms = Vec::new();
+            for dev in layer_devices
+                .iter()
+                .take(model_config.num_layers())
+                .map(|x| x.as_ref().unwrap_or(device))
+            {
+                let norm_shape = (
+                    cache_config.num_gpu_blocks,
+                    model_config.num_kv_heads(),
+                    cache_config.block_size,
+                );
+                let k_norms = Tensor::zeros(norm_shape, DType::F16, dev)?;
+                let v_norms = Tensor::zeros(norm_shape, DType::F16, dev)?;
+                norms.push((k_norms, v_norms));
+            }
+            Some(Arc::new(Mutex::new(norms)))
+        } else {
+            None
+        };
+
         Ok(Self {
             gpu_cache: Arc::new(Mutex::new(Self::allocate_gpu_cache(
                 model_config,
                 cache_config,
-                dtype,
+                cache_dtype,
                 device,
                 layer_devices,
             )?)),
+            turbo_norms,
         })
     }
 
     pub fn get_kv_cache(&self) -> MutexGuard<'_, Vec<KVCache>> {
-        // Use blocking lock instead of busy-wait spin loop to avoid CPU waste
-        // and potential thread starvation issues
         self.gpu_cache.lock().expect("KV cache mutex was poisoned")
+    }
+
+    pub fn get_turbo_norms(&self) -> Option<MutexGuard<'_, Vec<TurboQuantNorms>>> {
+        self.turbo_norms
+            .as_ref()
+            .map(|n| n.lock().expect("TurboQuant norms mutex was poisoned"))
     }
 
     fn allocate_gpu_cache(

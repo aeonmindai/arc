@@ -931,6 +931,17 @@ impl Loader for NormalLoader {
                 "Adapter parallel_models do not currently support PagedAttention, running without"
             );
             None
+        } else if paged_attn_config
+            .as_ref()
+            .is_some_and(|c| c.cache_type.is_turboquant())
+        {
+            let preset = paged_attn_config.as_ref().unwrap().cache_type.turboquant_preset().unwrap();
+            info!(
+                "TurboQuant KV cache compression enabled ({preset}). Using eager attention with compressed normal cache.",
+            );
+            // Enable TurboQuant for NormalCache creation (head_dim=128 is the common default)
+            crate::kv_cache::set_turboquant_head_dim(128);
+            None
         } else {
             paged_attn_config
         };

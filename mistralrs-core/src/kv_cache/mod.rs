@@ -204,19 +204,37 @@ pub enum NormalCacheType {
     SlidingWindow { window: usize },
 }
 
+/// Global TurboQuant config. When set, NormalCache::new creates TurboQuant caches.
+static TURBOQUANT_HEAD_DIM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Enable TurboQuant for all new NormalCache instances.
+/// Set head_dim > 0 to enable, 0 to disable.
+pub fn set_turboquant_head_dim(head_dim: usize) {
+    TURBOQUANT_HEAD_DIM.store(head_dim, std::sync::atomic::Ordering::SeqCst);
+}
+
 impl NormalCache {
     /// The number of tokens to grow the cache by
     pub const CACHE_GROW_SIZE: usize = 512;
 
     pub fn new(len: usize, max_seq_len: usize) -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Self(vec![
-            KvCache::new_normal(
-                2,
-                max_seq_len,
-                Self::CACHE_GROW_SIZE
-            );
-            len
-        ])))
+        let head_dim = TURBOQUANT_HEAD_DIM.load(std::sync::atomic::Ordering::SeqCst);
+        if head_dim > 0 && (head_dim == 64 || head_dim == 128 || head_dim == 256) {
+            let config = mistralrs_quant::turboquant::TurboQuantConfig::new(head_dim);
+            Arc::new(Mutex::new(Self(vec![
+                KvCache::new_turboquant(&config);
+                len
+            ])))
+        } else {
+            Arc::new(Mutex::new(Self(vec![
+                KvCache::new_normal(
+                    2,
+                    max_seq_len,
+                    Self::CACHE_GROW_SIZE
+                );
+                len
+            ])))
+        }
     }
 
     pub fn new_sliding(
