@@ -28,14 +28,42 @@ jobs:
             features: ""
             artifact: arc
 
-          # Linux x86_64 CUDA (SM 80 baseline — runs on Ampere and newer)
+          # Linux x86_64 CUDA — Ampere (A100, A10G, RTX 30xx)
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            variant: linux-x86_64-cuda
+            variant: linux-x86_64-cuda-ampere
             features: "cuda"
             artifact: arc
             cuda: true
             cuda_compute_cap: "80"
+
+          # Linux x86_64 CUDA — Ada Lovelace (RTX 40xx, L4, L40)
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            variant: linux-x86_64-cuda-ada
+            features: "cuda"
+            artifact: arc
+            cuda: true
+            cuda_compute_cap: "89"
+
+          # Linux x86_64 CUDA — Hopper (H100, H200)
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            variant: linux-x86_64-cuda-hopper
+            features: "cuda"
+            artifact: arc
+            cuda: true
+            cuda_compute_cap: "90"
+
+          # Linux x86_64 CUDA — Blackwell (B200, B300, GB200)
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            variant: linux-x86_64-cuda-blackwell
+            features: "cuda"
+            artifact: arc
+            cuda: true
+            cuda_compute_cap: "100"
+            cuda_version: "12.8.0"
 
           # Linux aarch64 CPU
           - os: ubuntu-22.04-arm
@@ -72,7 +100,7 @@ jobs:
         if: matrix.cuda
         uses: Jimver/cuda-toolkit@v0.2.18
         with:
-          cuda: '12.6.0'
+          cuda: ${{ matrix.cuda_version || '12.6.0' }}
           method: 'network'
           sub-packages: '["nvcc", "cudart"]'
 
@@ -149,13 +177,16 @@ jobs:
             ```
 
             **Direct downloads:**
-            | Platform | File |
-            |----------|------|
-            | Linux x86_64 (CPU) | `arc-linux-x86_64-cpu.tar.gz` |
-            | Linux x86_64 (CUDA) | `arc-linux-x86_64-cuda.tar.gz` |
-            | Linux aarch64 (CPU) | `arc-linux-aarch64-cpu.tar.gz` |
-            | macOS Apple Silicon (Metal) | `arc-macos-aarch64-metal.tar.gz` |
-            | macOS x86_64 | `arc-macos-x86_64-cpu.tar.gz` |
+            | Platform | GPU | File |
+            |----------|-----|------|
+            | Linux x86_64 | CPU only | `arc-linux-x86_64-cpu.tar.gz` |
+            | Linux x86_64 | Ampere (A100, RTX 30xx) | `arc-linux-x86_64-cuda-ampere.tar.gz` |
+            | Linux x86_64 | Ada (RTX 40xx, L4, L40) | `arc-linux-x86_64-cuda-ada.tar.gz` |
+            | Linux x86_64 | Hopper (H100, H200) | `arc-linux-x86_64-cuda-hopper.tar.gz` |
+            | Linux x86_64 | Blackwell (B200, B300) | `arc-linux-x86_64-cuda-blackwell.tar.gz` |
+            | Linux aarch64 | CPU only | `arc-linux-aarch64-cpu.tar.gz` |
+            | macOS | Apple Silicon (Metal) | `arc-macos-aarch64-metal.tar.gz` |
+            | macOS | Intel | `arc-macos-x86_64-cpu.tar.gz` |
 
             Each archive contains both `arc` and `mistralrs` binaries.
             Extract and move to a directory in your PATH:

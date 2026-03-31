@@ -69,12 +69,25 @@ try_prebuilt() {
     arch="$2"
     cuda_cc="$3"
 
-    # Determine variant
+    # Determine variant — match GPU architecture to binary
     variant=""
     if [ "$os" = "macos" ]; then
         variant="${os}-${arch}-metal"
     elif [ -n "$cuda_cc" ]; then
-        variant="${os}-${arch}-cuda"
+        # Pick the right CUDA binary for this GPU
+        if [ "$cuda_cc" -ge 100 ] 2>/dev/null; then
+            variant="${os}-${arch}-cuda-blackwell"
+            info "Blackwell GPU detected (SM ${cuda_cc})"
+        elif [ "$cuda_cc" -ge 90 ] 2>/dev/null; then
+            variant="${os}-${arch}-cuda-hopper"
+            info "Hopper GPU detected (SM ${cuda_cc})"
+        elif [ "$cuda_cc" -ge 89 ] 2>/dev/null; then
+            variant="${os}-${arch}-cuda-ada"
+            info "Ada Lovelace GPU detected (SM ${cuda_cc})"
+        else
+            variant="${os}-${arch}-cuda-ampere"
+            info "Ampere GPU detected (SM ${cuda_cc})"
+        fi
     else
         variant="${os}-${arch}-cpu"
     fi
