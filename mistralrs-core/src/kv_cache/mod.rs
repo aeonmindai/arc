@@ -44,7 +44,7 @@ pub trait CacheManager<T: CacheManagerMixin + MetadataMixin + ?Sized> {
 pub enum KvCache {
     Normal { k: SingleCache, v: SingleCache },
     Rotating { k: RotatingCache, v: RotatingCache },
-    TurboQuant(TurboQuantCache),
+    TurboQuant(Box<TurboQuantCache>),
 }
 
 impl KvCache {
@@ -61,7 +61,7 @@ impl KvCache {
     }
 
     pub fn new_turboquant(config: &mistralrs_quant::turboquant::TurboQuantConfig) -> Self {
-        Self::TurboQuant(TurboQuantCache::new(config))
+        Self::TurboQuant(Box::new(TurboQuantCache::new(config)))
     }
 
     pub fn k(&self) -> Result<Option<Tensor>> {
@@ -83,11 +83,8 @@ impl KvCache {
     pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
         let k = k.contiguous()?;
         let v = v.contiguous()?;
-        match self {
-            Self::TurboQuant(tq) => {
-                return tq.append(&k, &v);
-            }
-            _ => {}
+        if let Self::TurboQuant(tq) = self {
+            return tq.append(&k, &v);
         }
         let (out_k, out_v) = match self {
             Self::Normal { k: kc, v: vc } => {
