@@ -129,13 +129,17 @@ try_prebuilt() {
     install_dir="${HOME}/.local/bin"
     mkdir -p "$install_dir"
 
-    if [ -f "${tmpdir}/arc" ]; then
-        mv "${tmpdir}/arc" "${install_dir}/arc"
-        chmod +x "${install_dir}/arc"
-    elif [ -f "${tmpdir}/mistralrs" ]; then
-        mv "${tmpdir}/mistralrs" "${install_dir}/arc"
-        chmod +x "${install_dir}/arc"
-    else
+    # Install both binaries
+    found=0
+    for bin in arc mistralrs; do
+        if [ -f "${tmpdir}/${bin}" ]; then
+            mv "${tmpdir}/${bin}" "${install_dir}/${bin}"
+            chmod +x "${install_dir}/${bin}"
+            found=1
+        fi
+    done
+
+    if [ "$found" = "0" ]; then
         warn "Binary not found in archive — will build from source"
         rm -rf "$tmpdir"
         return 1
