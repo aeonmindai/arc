@@ -292,7 +292,7 @@ pub fn mla_cache_forward(
     let mut key_cache = None;
     let mut value_cache = None;
     let mut input_metadata = None;
-    if let Some(((key_cache_tensor, value_cache_tensor), meta)) = metadata.as_ref() {
+    if let Some(((key_cache_tensor, value_cache_tensor, _, _), meta)) = metadata.as_ref() {
         key_cache = Some(key_cache_tensor);
         value_cache = Some(value_cache_tensor);
         input_metadata = Some(*meta);
@@ -326,7 +326,7 @@ pub fn mla_cache_forward(
     if !needs_prefix && attention_mask.is_some() {
         Sdpa.run_attention(q, k, v, attention_mask, Some(flash_params), sdpa_params)
     } else {
-        let ((key_cache, value_cache, _, _), input_metadata) =
+        let ((key_cache, value_cache), input_metadata) =
             match (key_cache, value_cache, input_metadata) {
                 (Some(k), Some(v), Some(m)) => ((k, v), m),
                 _ => {
