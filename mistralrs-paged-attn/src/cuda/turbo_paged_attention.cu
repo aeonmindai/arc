@@ -1,14 +1,8 @@
 /**
  * TurboQuant Paged Attention — Optimized CUDA Kernels
  *
- * Matches the parallelism structure of vLLM's paged_attention_kernel:
- * - Warps process blocks in parallel (not serial token loops)
- * - Vectorized packed reads (4x fewer bytes than FP16)
- * - Warp-level dot product reduction
- * - Parallel V aggregation across warps
- *
- * K cache: 4-bit nibble packed, 64 bytes/head (d=128)
- * V cache: 3-bit 10-in-32 packed, 52 bytes/head (d=128)
+ * 4-bit K (nibble packed), 3-bit V (10-in-32 packed)
+ * Warp-parallel structure matching vLLM paged attention.
  */
 
 #include <cuda_fp16.h>
@@ -18,537 +12,337 @@
 
 #include "turbo_paged_attention.cuh"
 
-#define TQ_WARP_SIZE 32
-#define TQ_MAX(a, b) ((a) > (b) ? (a) : (b))
-#define TQ_MIN(a, b) ((a) < (b) ? (a) : (b))
-#define TQ_DIVUP(a, b) (((a) + (b) - 1) / (b))
+#define TQ_WARP 32
+#define TQ_DIVUP(a,b) (((a)+(b)-1)/(b))
 
-// ============================================================================
-// Codebooks + Signs
-// ============================================================================
-
-static __constant__ float TQ_CB_4BIT[16] = {
-    -0.237664013127f, -0.180836062501f, -0.141805261760f, -0.110288414632f,
-    -0.082828489390f, -0.057772320256f, -0.034151583096f, -0.011302500645f,
-     0.011302500645f,  0.034151583096f,  0.057772320256f,  0.082828489390f,
-     0.110288414632f,  0.141805261760f,  0.180836062501f,  0.237664013127f,
+static __constant__ float CB4[16] = {
+    -0.237664013127f,-0.180836062501f,-0.141805261760f,-0.110288414632f,
+    -0.082828489390f,-0.057772320256f,-0.034151583096f,-0.011302500645f,
+     0.011302500645f, 0.034151583096f, 0.057772320256f, 0.082828489390f,
+     0.110288414632f, 0.141805261760f, 0.180836062501f, 0.237664013127f,
+};
+static __constant__ float BD4[17] = {
+    -1.0f,-0.209250037814f,-0.161320662130f,-0.126046838196f,
+    -0.096558452011f,-0.070300404823f,-0.045961951676f,-0.022727041871f,
+     0.0f, 0.022727041871f, 0.045961951676f, 0.070300404823f,
+     0.096558452011f, 0.126046838196f, 0.161320662130f, 0.209250037814f, 1.0f,
+};
+static __constant__ float CB3[8] = {
+    -0.188397319183f,-0.118139828402f,-0.066585638471f,-0.021604320011f,
+     0.021604320011f, 0.066585638471f, 0.118139828402f, 0.188397319183f,
+};
+static __constant__ float BD3[9] = {
+    -1.0f,-0.153268573792f,-0.092362733436f,-0.044094979241f,
+     0.0f, 0.044094979241f, 0.092362733436f, 0.153268573792f, 1.0f,
+};
+static __constant__ float SGN[128] = {
+    -1,-1, 1,-1, 1,-1,-1, 1,-1,-1, 1, 1,-1,-1,-1,-1,
+    -1, 1,-1,-1, 1, 1, 1, 1, 1, 1,-1,-1,-1, 1, 1,-1,
+    -1,-1, 1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1,-1,-1,-1,
+    -1,-1, 1,-1,-1,-1, 1,-1,-1,-1,-1,-1, 1,-1, 1, 1,
+    -1,-1,-1, 1,-1,-1, 1, 1,-1,-1,-1,-1, 1,-1, 1,-1,
+     1, 1, 1,-1, 1, 1, 1, 1, 1, 1, 1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1, 1, 1, 1,-1,-1,-1, 1, 1, 1,-1,-1,-1,
+    -1,-1,-1,-1, 1, 1,-1, 1, 1,-1,-1, 1, 1,-1, 1,-1,
 };
 
-static __constant__ float TQ_BD_4BIT[17] = {
-    -1.0f, -0.209250037814f, -0.161320662130f, -0.126046838196f,
-    -0.096558452011f, -0.070300404823f, -0.045961951676f, -0.022727041871f,
-     0.0f,  0.022727041871f,  0.045961951676f,  0.070300404823f,
-     0.096558452011f,  0.126046838196f,  0.161320662130f,  0.209250037814f, 1.0f,
-};
-
-static __constant__ float TQ_CB_3BIT[8] = {
-    -0.188397319183f, -0.118139828402f, -0.066585638471f, -0.021604320011f,
-     0.021604320011f,  0.066585638471f,  0.118139828402f,  0.188397319183f,
-};
-
-static __constant__ float TQ_BD_3BIT[9] = {
-    -1.0f, -0.153268573792f, -0.092362733436f, -0.044094979241f,
-     0.0f,  0.044094979241f,  0.092362733436f,  0.153268573792f, 1.0f,
-};
-
-static __constant__ float TQ_SIGNS[128] = {
-    -1, -1,  1, -1,  1, -1, -1,  1, -1, -1,  1,  1, -1, -1, -1, -1,
-    -1,  1, -1, -1,  1,  1,  1,  1,  1,  1, -1, -1, -1,  1,  1, -1,
-    -1, -1,  1, -1,  1, -1, -1, -1,  1, -1, -1, -1,  1, -1, -1, -1,
-    -1, -1,  1, -1, -1, -1,  1, -1, -1, -1, -1, -1,  1, -1,  1,  1,
-    -1, -1, -1,  1, -1, -1,  1,  1, -1, -1, -1, -1,  1, -1,  1, -1,
-     1,  1,  1, -1,  1,  1,  1,  1,  1,  1,  1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1,  1,  1,  1, -1, -1, -1,  1,  1,  1, -1, -1, -1,
-    -1, -1, -1, -1,  1,  1, -1,  1,  1, -1, -1,  1,  1, -1,  1, -1,
-};
-
-// ============================================================================
-// WHT + Quantize helpers
-// ============================================================================
-
-__device__ void tq_wht_128(float* data, int tid) {
+// WHT that works with any number of active threads (uses only __syncthreads)
+__device__ void wht128(float* d, int tid, int nthreads) {
     for (int h = 1; h < 128; h *= 2) {
         __syncthreads();
-        for (int idx = tid; idx < 64; idx += blockDim.x) {
-            int bs = (idx / h) * (h * 2);
-            int off = idx % h;
-            float a = data[bs + off];
-            float b = data[bs + off + h];
-            data[bs + off] = a + b;
-            data[bs + off + h] = a - b;
+        for (int i = tid; i < 64; i += nthreads) {
+            int bs = (i/h)*(h*2), off = i%h;
+            float a = d[bs+off], b = d[bs+off+h];
+            d[bs+off] = a+b; d[bs+off+h] = a-b;
         }
     }
     __syncthreads();
 }
 
-__device__ void tq_rotate(float* data, int tid) {
-    if (tid < 128) data[tid] *= TQ_SIGNS[tid];
+__device__ void rotate128(float* d, int tid, int nthreads) {
+    if (tid < 128) d[tid] *= SGN[tid];
     __syncthreads();
-    tq_wht_128(data, tid);
-    if (tid < 128) data[tid] *= 0.08838834764831845f;
+    wht128(d, tid, nthreads);
+    if (tid < 128) d[tid] *= 0.08838834764831845f;
     __syncthreads();
-    if (tid < 128) data[tid] *= TQ_SIGNS[tid];
+    if (tid < 128) d[tid] *= SGN[tid];
     __syncthreads();
 }
 
-__device__ uint8_t tq_q4(float x) {
-    if (x <= TQ_BD_4BIT[1]) return 0;
-    if (x >= TQ_BD_4BIT[16]) return 15;
-    int lo = 1, hi = 16;
-    while (lo < hi) { int m = (lo+hi)>>1; if (x < TQ_BD_4BIT[m]) hi = m; else lo = m+1; }
-    return (uint8_t)(lo - 1);
+__device__ uint8_t q4(float x) {
+    if (x<=BD4[1]) return 0; if (x>=BD4[16]) return 15;
+    int lo=1,hi=16; while(lo<hi){int m=(lo+hi)>>1;if(x<BD4[m])hi=m;else lo=m+1;} return lo-1;
 }
-
-__device__ uint8_t tq_q3(float x) {
-    if (x <= TQ_BD_3BIT[1]) return 0;
-    if (x >= TQ_BD_3BIT[8]) return 7;
-    int lo = 1, hi = 8;
-    while (lo < hi) { int m = (lo+hi)>>1; if (x < TQ_BD_3BIT[m]) hi = m; else lo = m+1; }
-    return (uint8_t)(lo - 1);
+__device__ uint8_t q3(float x) {
+    if (x<=BD3[1]) return 0; if (x>=BD3[8]) return 7;
+    int lo=1,hi=8; while(lo<hi){int m=(lo+hi)>>1;if(x<BD3[m])hi=m;else lo=m+1;} return lo-1;
 }
 
 // ============================================================================
-// reshape_and_cache kernels (same as before — packing is correct)
+// reshape_and_cache
 // ============================================================================
 
-__global__ void turbo_reshape_and_cache_k(
-    const __half* __restrict__ input, uint8_t* __restrict__ cache,
-    __half* __restrict__ norms, const int64_t* __restrict__ slot_mapping,
-    int num_heads, int head_size, int block_size, int input_stride,
-    int cache_block_stride, int cache_head_stride,
-    int norm_block_stride, int norm_head_stride
+__global__ void tq_cache_k(
+    const __half* in, uint8_t* cache, __half* norms, const int64_t* slots,
+    int nh, int hs, int bs, int in_stride, int cbs, int chs, int nbs, int nhs
 ) {
-    const int vec_idx = blockIdx.x;
-    const int tid = threadIdx.x;
-    const int token_idx = vec_idx / num_heads;
-    const int head_idx = vec_idx % num_heads;
-    const int64_t slot = slot_mapping[token_idx];
-    if (slot < 0) return;
-    const int bi = slot / block_size;
-    const int bo = slot % block_size;
-
-    __shared__ float smem[128];
-    __shared__ uint8_t idx[128];
-
-    if (tid < head_size)
-        smem[tid] = __half2float(input[token_idx * input_stride + head_idx * head_size + tid]);
+    int vid = blockIdx.x, tid = threadIdx.x;
+    int tok = vid/nh, head = vid%nh;
+    int64_t slot = slots[tok]; if (slot<0) return;
+    int bi = slot/bs, bo = slot%bs;
+    __shared__ float s[128]; __shared__ uint8_t ix[128];
+    if (tid<hs) s[tid] = __half2float(in[tok*in_stride+head*hs+tid]);
     __syncthreads();
-
     __shared__ float nb[128];
-    nb[tid] = (tid < head_size) ? smem[tid] * smem[tid] : 0.0f;
-    __syncthreads();
-    for (int s = 64; s > 0; s >>= 1) { if (tid < s) nb[tid] += nb[tid+s]; __syncthreads(); }
-    float norm = sqrtf(nb[0]);
-    if (tid == 0)
-        norms[bi * norm_block_stride + head_idx * norm_head_stride + bo] = __float2half(norm);
-    if (tid < head_size && norm > 1e-10f) smem[tid] /= norm;
-    __syncthreads();
-    tq_rotate(smem, tid);
-    if (tid < head_size) idx[tid] = tq_q4(smem[tid]);
-    __syncthreads();
-
-    // Nibble pack: thread tid packs pair (2*tid, 2*tid+1)
-    if (tid < head_size / 2) {
-        uint8_t packed = (idx[2*tid] & 0xF) | ((idx[2*tid+1] & 0xF) << 4);
-        int x = 16;
-        int byte_idx = tid;
-        int off = bi * cache_block_stride + head_idx * cache_head_stride +
-                  (byte_idx/x) * block_size * x + bo * x + (byte_idx%x);
-        cache[off] = packed;
+    nb[tid] = (tid<hs)?s[tid]*s[tid]:0.f; __syncthreads();
+    for(int r=64;r>0;r>>=1){if(tid<r)nb[tid]+=nb[tid+r];__syncthreads();}
+    float nm = sqrtf(nb[0]);
+    if(tid==0) norms[bi*nbs+head*nhs+bo]=__float2half(nm);
+    if(tid<hs&&nm>1e-10f)s[tid]/=nm; __syncthreads();
+    rotate128(s,tid,128);
+    if(tid<hs)ix[tid]=q4(s[tid]); __syncthreads();
+    if(tid<hs/2){
+        uint8_t p=(ix[2*tid]&0xF)|((ix[2*tid+1]&0xF)<<4);
+        int x=16,by=tid;
+        cache[bi*cbs+head*chs+(by/x)*bs*x+bo*x+(by%x)]=p;
     }
 }
 
-__global__ void turbo_reshape_and_cache_v(
-    const __half* __restrict__ input, uint8_t* __restrict__ cache,
-    __half* __restrict__ norms, const int64_t* __restrict__ slot_mapping,
-    int num_heads, int head_size, int block_size, int input_stride,
-    int v_block_stride, int v_head_stride,
-    int norm_block_stride, int norm_head_stride
+__global__ void tq_cache_v(
+    const __half* in, uint8_t* cache, __half* norms, const int64_t* slots,
+    int nh, int hs, int bs, int in_stride, int vbs, int vhs, int nbs, int nhs
 ) {
-    const int vec_idx = blockIdx.x;
-    const int tid = threadIdx.x;
-    const int token_idx = vec_idx / num_heads;
-    const int head_idx = vec_idx % num_heads;
-    const int64_t slot = slot_mapping[token_idx];
-    if (slot < 0) return;
-    const int bi = slot / block_size;
-    const int bo = slot % block_size;
-
-    __shared__ float smem[128];
-    __shared__ uint8_t idx[128];
-
-    if (tid < head_size)
-        smem[tid] = __half2float(input[token_idx * input_stride + head_idx * head_size + tid]);
+    int vid = blockIdx.x, tid = threadIdx.x;
+    int tok = vid/nh, head = vid%nh;
+    int64_t slot = slots[tok]; if (slot<0) return;
+    int bi = slot/bs, bo = slot%bs;
+    __shared__ float s[128]; __shared__ uint8_t ix[128];
+    if (tid<hs) s[tid] = __half2float(in[tok*in_stride+head*hs+tid]);
     __syncthreads();
-
     __shared__ float nb[128];
-    nb[tid] = (tid < head_size) ? smem[tid] * smem[tid] : 0.0f;
-    __syncthreads();
-    for (int s = 64; s > 0; s >>= 1) { if (tid < s) nb[tid] += nb[tid+s]; __syncthreads(); }
-    float norm = sqrtf(nb[0]);
-    if (tid == 0)
-        norms[bi * norm_block_stride + head_idx * norm_head_stride + bo] = __float2half(norm);
-    if (tid < head_size && norm > 1e-10f) smem[tid] /= norm;
-    __syncthreads();
-    tq_rotate(smem, tid);
-    if (tid < head_size) idx[tid] = tq_q3(smem[tid]);
-    __syncthreads();
-
-    const int n_groups = (head_size + 9) / 10;
-    if (tid < n_groups) {
-        int base = tid * 10;
-        uint32_t word = 0;
-        int cnt = min(10, head_size - base);
-        for (int j = 0; j < cnt; j++)
-            word |= ((uint32_t)idx[base+j] & 0x7) << (j * 3);
-        int bbase = bi * v_block_stride + head_idx * v_head_stride + tid * 4 * block_size + bo;
-        cache[bbase] = (uint8_t)(word);
-        cache[bbase + block_size] = (uint8_t)(word >> 8);
-        cache[bbase + 2*block_size] = (uint8_t)(word >> 16);
-        cache[bbase + 3*block_size] = (uint8_t)(word >> 24);
+    nb[tid] = (tid<hs)?s[tid]*s[tid]:0.f; __syncthreads();
+    for(int r=64;r>0;r>>=1){if(tid<r)nb[tid]+=nb[tid+r];__syncthreads();}
+    float nm = sqrtf(nb[0]);
+    if(tid==0) norms[bi*nbs+head*nhs+bo]=__float2half(nm);
+    if(tid<hs&&nm>1e-10f)s[tid]/=nm; __syncthreads();
+    rotate128(s,tid,128);
+    if(tid<hs)ix[tid]=q3(s[tid]); __syncthreads();
+    int ng=(hs+9)/10;
+    if(tid<ng){
+        int base=tid*10; uint32_t w=0;
+        int cnt=min(10,hs-base);
+        for(int j=0;j<cnt;j++) w|=((uint32_t)ix[base+j]&7)<<(j*3);
+        int bb=bi*vbs+head*vhs+tid*4*bs+bo;
+        cache[bb]=(uint8_t)w; cache[bb+bs]=(uint8_t)(w>>8);
+        cache[bb+2*bs]=(uint8_t)(w>>16); cache[bb+3*bs]=(uint8_t)(w>>24);
     }
 }
 
 extern "C" void turbo_reshape_and_cache(
     const void* key, const void* value,
-    void* key_cache, void* value_cache,
-    void* k_norms, void* v_norms,
-    const int64_t* slot_mapping,
-    int num_tokens, int num_heads, int head_size, int block_size,
-    int key_stride, int value_stride,
-    int kv_block_stride, int kv_head_stride,
-    int norm_block_stride, int norm_head_stride,
+    void* kc, void* vc, void* kn, void* vn,
+    const int64_t* slots,
+    int nt, int nh, int hs, int bs,
+    int ks, int vs, int kbs, int khs, int nbs, int nhs,
     cudaStream_t stream, uint32_t dtype
 ) {
-    if (head_size != 128) return;
-    int total = num_tokens * num_heads;
-    dim3 grid(total); dim3 block(128);
-
-    turbo_reshape_and_cache_k<<<grid, block, 0, stream>>>(
-        (const __half*)key, (uint8_t*)key_cache, (__half*)k_norms, slot_mapping,
-        num_heads, head_size, block_size, key_stride,
-        kv_block_stride, kv_head_stride, norm_block_stride, norm_head_stride);
-
-    int vpd = (head_size+9)/10*4;
-    int vbs = num_heads * vpd * block_size;
-    int vhs = vpd * block_size;
-
-    turbo_reshape_and_cache_v<<<grid, block, 0, stream>>>(
-        (const __half*)value, (uint8_t*)value_cache, (__half*)v_norms, slot_mapping,
-        num_heads, head_size, block_size, value_stride,
-        vbs, vhs, norm_block_stride, norm_head_stride);
+    if(hs!=128)return;
+    dim3 g(nt*nh),b(128);
+    tq_cache_k<<<g,b,0,stream>>>((const __half*)key,(uint8_t*)kc,(__half*)kn,slots,nh,hs,bs,ks,kbs,khs,nbs,nhs);
+    int vpd=(hs+9)/10*4; int vvbs=nh*vpd*bs; int vvhs=vpd*bs;
+    tq_cache_v<<<g,b,0,stream>>>((const __half*)value,(uint8_t*)vc,(__half*)vn,slots,nh,hs,bs,vs,vvbs,vvhs,nbs,nhs);
 }
 
 // ============================================================================
-// Optimized TurboQuant Paged Attention Kernel
+// Attention kernel — optimized, no __syncthreads in divergent paths
 //
-// Matches vLLM paged_attention_kernel parallelism:
-// - Grid: (num_heads, num_seqs, 1)
-// - Block: NUM_THREADS (128)
-// - NUM_WARPS = 4
-// - Each warp processes one cache block at a time (parallel across warps)
-// - Within each warp, all 32 threads collaborate on one token's dot product
-//   Each thread handles HEAD_SIZE/32 = 4 elements for Q·K
-// - V aggregation: each thread accumulates its own output dimensions
+// Structure:
+// 1. Load + rotate Q (all 128 threads, __syncthreads is safe)
+// 2. Q·K: each warp handles blocks, each lane does full dot product for one
+//    token per iteration (no __syncthreads needed — warp shuffles only)
+// 3. Softmax: all threads participate (safe __syncthreads)
+// 4. V accumulation: each thread accumulates 4 dims, warps process blocks
+// 5. Output: write accs to shared, rotate, write out (all threads participate)
 // ============================================================================
 
-template<int NUM_THREADS, int HEAD_SIZE, int BLOCK_SIZE>
-__global__ void turbo_attn_optimized(
+template<int BLOCK_SIZE>
+__global__ void tq_attn(
     float* __restrict__ out,
     const __half* __restrict__ query,
-    const uint8_t* __restrict__ k_cache,
-    const uint8_t* __restrict__ v_cache,
-    const __half* __restrict__ k_norms,
-    const __half* __restrict__ v_norms,
-    const uint32_t* __restrict__ block_tables,
-    const uint32_t* __restrict__ context_lens,
-    int num_kv_heads, int max_blocks_per_seq, int num_heads,
-    float scale,
-    int k_block_stride, int k_head_stride,
-    int v_block_stride, int v_head_stride,
-    int norm_block_stride, int norm_head_stride
+    const uint8_t* __restrict__ kc,
+    const uint8_t* __restrict__ vc,
+    const __half* __restrict__ kn,
+    const __half* __restrict__ vn,
+    const uint32_t* __restrict__ bt,
+    const uint32_t* __restrict__ cl,
+    int nkvh, int mbps, int nh, float scale,
+    int kbs, int khs, int vbs, int vhs, int nbs, int nhs
 ) {
-    constexpr int NUM_WARPS = NUM_THREADS / TQ_WARP_SIZE;
-    constexpr int ELEMS_PER_THREAD = HEAD_SIZE / TQ_WARP_SIZE; // 128/32 = 4
-    constexpr int K_BYTES_PER_THREAD = ELEMS_PER_THREAD / 2;   // 4/2 = 2 packed bytes
+    constexpr int HS = 128;
+    constexpr int NT = 128;
+    constexpr int NW = NT / TQ_WARP;
+    constexpr int EPT = HS / TQ_WARP; // 4 elements per thread for dot product
 
-    const int head_idx = blockIdx.x;
-    const int seq_idx = blockIdx.y;
-    const int thread_idx = threadIdx.x;
-    const int warp_idx = thread_idx / TQ_WARP_SIZE;
-    const int lane = thread_idx % TQ_WARP_SIZE;
+    const int hidx = blockIdx.x, sidx = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int warp = tid / TQ_WARP, lane = tid % TQ_WARP;
+    const uint32_t clen = cl[sidx];
+    if (clen == 0) return;
+    const int kvh = hidx / (nh / nkvh);
 
-    const uint32_t context_len = context_lens[seq_idx];
-    if (context_len == 0) return;
-
-    const int kv_head_idx = head_idx / (num_heads / num_kv_heads);
-
-    // Load Q and rotate into shared memory
-    __shared__ float q_rot[HEAD_SIZE];
-    if (thread_idx < HEAD_SIZE)
-        q_rot[thread_idx] = __half2float(query[seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE + thread_idx]);
+    // 1. Load + rotate Q
+    __shared__ float qr[HS];
+    if (tid < HS) qr[tid] = __half2float(query[sidx*nh*HS + hidx*HS + tid]);
     __syncthreads();
-    tq_rotate(q_rot, thread_idx);
+    rotate128(qr, tid, NT);
+    // After this: qr is rotated, all threads synced
 
-    // Shared memory for softmax logits
-    extern __shared__ char shared_mem[];
-    float* logits = reinterpret_cast<float*>(shared_mem);
-    __shared__ float red_smem[2 * NUM_WARPS];
+    // 2. Q·K — compute logits
+    extern __shared__ char shmem[];
+    float* logits = (float*)shmem;
+    // Initialize logits to 0
+    for (int i = tid; i < (int)clen; i += NT) logits[i] = 0.f;
+    __syncthreads();
 
     float qk_max = -FLT_MAX;
+    const uint32_t* sbt = bt + sidx * mbps;
+    const int nblocks = TQ_DIVUP(clen, BLOCK_SIZE);
 
-    const uint32_t* block_table = block_tables + seq_idx * max_blocks_per_seq;
-    const int num_context_blocks = TQ_DIVUP(context_len, BLOCK_SIZE);
+    // Each warp processes blocks in parallel.
+    // All 32 lanes collaborate on ONE token at a time.
+    // Each lane reads 2 packed bytes = 4 elements of the 128-dim K vector.
+    // Warp shuffle reduces the 32 partial sums into one dot product.
+    for (int bi = warp; bi < nblocks; bi += NW) {
+        int pb = sbt[bi];
+        int tib = min(BLOCK_SIZE, (int)clen - bi*BLOCK_SIZE);
 
-    // ===== Q·K PHASE =====
-    // Each warp handles one block at a time, cycling through blocks
-    for (int block_idx = warp_idx; block_idx < num_context_blocks; block_idx += NUM_WARPS) {
-        const int64_t physical_block = block_table[block_idx];
+        for (int t = 0; t < tib; t++) {
+            int tpos = bi * BLOCK_SIZE + t;
 
-        // Each lane in the warp handles one token in the block
-        for (int tok_offset = lane; tok_offset < BLOCK_SIZE; tok_offset += TQ_WARP_SIZE) {
-            const int token_idx = block_idx * BLOCK_SIZE + tok_offset;
-            if (token_idx >= (int)context_len) continue;
-
-            // Compute dot product: each thread loads ALL its K elements
-            // Thread lane handles elements [lane*4, lane*4+3] (4 elements from 2 packed bytes)
-            float qk = 0.0f;
-
+            // Each lane reads its 2 packed bytes (4 elements)
+            float qk = 0.f;
             #pragma unroll
-            for (int i = 0; i < K_BYTES_PER_THREAD; i++) {
-                int byte_idx = lane * K_BYTES_PER_THREAD + i; // 0..63
+            for (int e = 0; e < EPT/2; e++) {
+                int byidx = lane * (EPT/2) + e; // 0..63
                 int x = 16;
-                int k_off = physical_block * k_block_stride +
-                            kv_head_idx * k_head_stride +
-                            (byte_idx / x) * BLOCK_SIZE * x +
-                            tok_offset * x +
-                            (byte_idx % x);
-                uint8_t packed = k_cache[k_off];
-                uint8_t lo_idx = packed & 0xF;
-                uint8_t hi_idx = (packed >> 4) & 0xF;
-                int dim0 = byte_idx * 2;
-                int dim1 = byte_idx * 2 + 1;
-                qk += q_rot[dim0] * TQ_CB_4BIT[lo_idx];
-                qk += q_rot[dim1] * TQ_CB_4BIT[hi_idx];
+                int koff = pb*kbs + kvh*khs + (byidx/x)*BLOCK_SIZE*x + t*x + (byidx%x);
+                uint8_t pk = kc[koff];
+                int d0 = byidx*2, d1 = byidx*2+1;
+                qk += qr[d0] * CB4[pk & 0xF];
+                qk += qr[d1] * CB4[(pk>>4) & 0xF];
             }
 
-            // Warp reduction to sum partial dot products from all 32 lanes
+            // Warp reduction: sum 32 partial dot products
             #pragma unroll
-            for (int mask = TQ_WARP_SIZE / 2; mask > 0; mask >>= 1)
+            for (int mask = TQ_WARP/2; mask > 0; mask >>= 1)
                 qk += __shfl_xor_sync(0xffffffff, qk, mask);
 
-            // Apply norm and scale
-            float k_norm = __half2float(
-                k_norms[physical_block * norm_block_stride +
-                        kv_head_idx * norm_head_stride + tok_offset]);
-            qk = qk * k_norm * scale;
+            float knorm = __half2float(kn[pb*nbs + kvh*nhs + t]);
+            qk *= knorm * scale;
 
-            // Store logit (only lane 0 has the full sum, but after reduction all lanes have it)
-            const bool mask = token_idx >= (int)context_len;
-            logits[token_idx] = mask ? 0.f : qk;
-            qk_max = mask ? qk_max : fmaxf(qk_max, qk);
+            if (lane == 0) logits[tpos] = qk;
+            qk_max = fmaxf(qk_max, qk);
         }
     }
 
-    // ===== REDUCE QK_MAX =====
+    // Reduce qk_max across all threads
     #pragma unroll
-    for (int mask = TQ_WARP_SIZE / 2; mask >= 1; mask /= 2)
+    for (int mask = TQ_WARP/2; mask >= 1; mask /= 2)
         qk_max = fmaxf(qk_max, __shfl_xor_sync(0xffffffff, qk_max, mask));
-    if (lane == 0) red_smem[warp_idx] = qk_max;
+    __shared__ float red[8];
+    if (lane == 0) red[warp] = qk_max;
     __syncthreads();
-    qk_max = lane < NUM_WARPS ? red_smem[lane] : -FLT_MAX;
+    qk_max = (lane < NW) ? red[lane] : -FLT_MAX;
     #pragma unroll
-    for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2)
+    for (int mask = NW/2; mask >= 1; mask /= 2)
         qk_max = fmaxf(qk_max, __shfl_xor_sync(0xffffffff, qk_max, mask));
     qk_max = __shfl_sync(0xffffffff, qk_max, 0);
 
-    // ===== SOFTMAX =====
-    float exp_sum = 0.f;
-    for (int i = thread_idx; i < (int)context_len; i += NUM_THREADS) {
-        float val = __expf(logits[i] - qk_max);
-        logits[i] = val;
-        exp_sum += val;
+    // 3. Softmax
+    float esum = 0.f;
+    for (int i = tid; i < (int)clen; i += NT) {
+        float v = __expf(logits[i] - qk_max);
+        logits[i] = v;
+        esum += v;
     }
-    // Block-level reduction of exp_sum
     #pragma unroll
-    for (int mask = TQ_WARP_SIZE / 2; mask >= 1; mask /= 2)
-        exp_sum += __shfl_xor_sync(0xffffffff, exp_sum, mask);
-    if (lane == 0) red_smem[NUM_WARPS + warp_idx] = exp_sum;
+    for (int mask = TQ_WARP/2; mask >= 1; mask /= 2)
+        esum += __shfl_xor_sync(0xffffffff, esum, mask);
+    if (lane == 0) red[NW + warp] = esum;
     __syncthreads();
-    if (lane < NUM_WARPS) exp_sum = red_smem[NUM_WARPS + lane];
-    else exp_sum = 0.f;
+    esum = (lane < NW) ? red[NW + lane] : 0.f;
     #pragma unroll
-    for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2)
-        exp_sum += __shfl_xor_sync(0xffffffff, exp_sum, mask);
-    float inv_sum = __fdividef(1.f, __shfl_sync(0xffffffff, exp_sum, 0) + 1e-6f);
-
-    for (int i = thread_idx; i < (int)context_len; i += NUM_THREADS)
-        logits[i] *= inv_sum;
+    for (int mask = NW/2; mask >= 1; mask /= 2)
+        esum += __shfl_xor_sync(0xffffffff, esum, mask);
+    float inv = __fdividef(1.f, __shfl_sync(0xffffffff, esum, 0) + 1e-6f);
+    for (int i = tid; i < (int)clen; i += NT) logits[i] *= inv;
     __syncthreads();
 
-    // ===== V AGGREGATION =====
-    // Each thread accumulates ELEMS_PER_THREAD output dimensions (4 dims per thread)
-    // across all cached tokens.
-    float accs[ELEMS_PER_THREAD] = {0.f};
+    // 4. V accumulation
+    // Each thread accumulates EPT=4 output dimensions
+    // thread tid handles dims: for Q·K we used lane-based, for V we use tid-based
+    // tid handles dims [tid*EPT .. tid*EPT+3] (but tid goes 0..127, EPT=4 would be 512 dims)
+    // Actually: 128 threads, 128 dims, each thread handles 1 dim
+    // Simpler: each thread handles dim = tid (one dim per thread)
 
-    for (int block_idx = warp_idx; block_idx < num_context_blocks; block_idx += NUM_WARPS) {
-        const int64_t physical_block = block_table[block_idx];
-        const int tokens_in_block = TQ_MIN(BLOCK_SIZE, (int)context_len - block_idx * BLOCK_SIZE);
+    float acc = 0.f;
+    if (tid < HS) {
+        int dim = tid;
+        int group = dim / 10;
+        int pos = dim % 10;
 
-        for (int tok_offset = 0; tok_offset < tokens_in_block; tok_offset++) {
-            const int token_idx = block_idx * BLOCK_SIZE + tok_offset;
-            float weight = logits[token_idx];
-            if (weight < 1e-8f) continue;
+        for (int bi = 0; bi < nblocks; bi++) {
+            int pb = sbt[bi];
+            int tib = min(BLOCK_SIZE, (int)clen - bi*BLOCK_SIZE);
 
-            float v_norm = __half2float(
-                v_norms[physical_block * norm_block_stride +
-                        kv_head_idx * norm_head_stride + tok_offset]);
-            float wn = weight * v_norm;
+            for (int t = 0; t < tib; t++) {
+                float w = logits[bi*BLOCK_SIZE + t];
+                if (w < 1e-8f) continue;
 
-            // Each thread reads its V dimensions
-            // Thread lane handles dims [lane*4, lane*4+3]
-            // These 4 dims span across potentially 1-2 groups of the 10-in-32 packing
-            #pragma unroll
-            for (int e = 0; e < ELEMS_PER_THREAD; e++) {
-                int dim = lane * ELEMS_PER_THREAD + e;
-                int group = dim / 10;
-                int pos = dim % 10;
-
-                int bbase = physical_block * v_block_stride +
-                            kv_head_idx * v_head_stride +
-                            group * 4 * BLOCK_SIZE +
-                            tok_offset;
-                uint32_t word = (uint32_t)v_cache[bbase] |
-                               ((uint32_t)v_cache[bbase + BLOCK_SIZE] << 8) |
-                               ((uint32_t)v_cache[bbase + 2*BLOCK_SIZE] << 16) |
-                               ((uint32_t)v_cache[bbase + 3*BLOCK_SIZE] << 24);
-                uint8_t v_idx = (word >> (pos * 3)) & 0x7;
-                accs[e] += wn * TQ_CB_3BIT[v_idx];
+                int bb = pb*vbs + kvh*vhs + group*4*BLOCK_SIZE + t;
+                uint32_t word = (uint32_t)vc[bb] |
+                               ((uint32_t)vc[bb+BLOCK_SIZE]<<8) |
+                               ((uint32_t)vc[bb+2*BLOCK_SIZE]<<16) |
+                               ((uint32_t)vc[bb+3*BLOCK_SIZE]<<24);
+                uint8_t vi = (word>>(pos*3))&7;
+                float vnorm = __half2float(vn[pb*nbs+kvh*nhs+t]);
+                acc += w * CB3[vi] * vnorm;
             }
         }
     }
 
-    // ===== REDUCE V ACROSS WARPS =====
+    // 5. Inverse rotation + output
+    __shared__ float obuf[HS];
+    if (tid < HS) obuf[tid] = acc;
     __syncthreads();
-    float* out_smem = reinterpret_cast<float*>(shared_mem);
+    rotate128(obuf, tid, NT);
 
-    #pragma unroll
-    for (int i = NUM_WARPS; i > 1; i /= 2) {
-        int mid = i / 2;
-        if (warp_idx >= mid && warp_idx < i) {
-            float* dst = &out_smem[(warp_idx - mid) * HEAD_SIZE];
-            #pragma unroll
-            for (int e = 0; e < ELEMS_PER_THREAD; e++) {
-                int dim = lane * ELEMS_PER_THREAD + e;
-                if (dim < HEAD_SIZE) dst[dim] = accs[e];
-            }
-        }
-        __syncthreads();
-        if (warp_idx < mid) {
-            const float* src = &out_smem[warp_idx * HEAD_SIZE];
-            #pragma unroll
-            for (int e = 0; e < ELEMS_PER_THREAD; e++) {
-                int dim = lane * ELEMS_PER_THREAD + e;
-                if (dim < HEAD_SIZE) accs[e] += src[dim];
-            }
-        }
-        __syncthreads();
-    }
-
-    // ===== INVERSE WHT ROTATION ON OUTPUT =====
-    // Write accumulated V to shared memory, rotate, write to output
-    if (warp_idx == 0) {
-        __shared__ float out_buf[HEAD_SIZE];
-        #pragma unroll
-        for (int e = 0; e < ELEMS_PER_THREAD; e++) {
-            int dim = lane * ELEMS_PER_THREAD + e;
-            if (dim < HEAD_SIZE) out_buf[dim] = accs[e];
-        }
-        __syncthreads();
-        tq_rotate(out_buf, lane); // only 32 threads — need all 128
-        // Actually WHT needs 128 threads for the butterfly. Let's do it outside.
-    }
-
-    // Use all threads for WHT rotation
-    __shared__ float rot_buf[HEAD_SIZE];
-    if (warp_idx == 0) {
-        #pragma unroll
-        for (int e = 0; e < ELEMS_PER_THREAD; e++) {
-            int dim = lane * ELEMS_PER_THREAD + e;
-            if (dim < HEAD_SIZE) rot_buf[dim] = accs[e];
-        }
-    }
-    __syncthreads();
-    tq_rotate(rot_buf, thread_idx);
-
-    // Write output
-    if (warp_idx == 0) {
-        float* out_ptr = out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
-        #pragma unroll
-        for (int e = 0; e < ELEMS_PER_THREAD; e++) {
-            int dim = lane * ELEMS_PER_THREAD + e;
-            if (dim < HEAD_SIZE) out_ptr[dim] = rot_buf[dim];
-        }
-    }
+    if (tid < HS)
+        out[sidx*nh*HS + hidx*HS + tid] = obuf[tid];
 }
-
-// ============================================================================
-// Launch wrappers
-// ============================================================================
 
 extern "C" void turbo_paged_attention_v1_f16(
     void* out, const void* query,
-    const void* k_cache, const void* v_cache,
-    const void* k_norms, const void* v_norms,
-    int num_kv_heads, float scale, float softcapping,
-    const uint32_t* block_tables, const uint32_t* context_lens,
-    int block_size, int max_context_len,
-    int num_seqs, int num_heads, int head_size,
-    int max_num_blocks_per_seq, int q_stride,
-    int kv_block_stride, int kv_head_stride,
-    int norm_block_stride, int norm_head_stride,
-    cudaStream_t stream
+    const void* kc, const void* vc,
+    const void* kn, const void* vn,
+    int nkvh, float scale, float softcapping,
+    const uint32_t* bt, const uint32_t* cl,
+    int bs, int mcl, int ns, int nh, int hs,
+    int mbps, int qs, int kbs, int khs,
+    int nbs, int nhs, cudaStream_t stream
 ) {
-    if (head_size != 128) return;
+    if (hs != 128) return;
+    int vpd=(hs+9)/10*4;
+    int vvbs=nkvh*vpd*bs, vvhs=vpd*bs;
+    int padded = TQ_DIVUP(mcl,bs)*bs;
+    int smem = padded * sizeof(float);
+    // Ensure enough for output buffer too (128 floats = 512 bytes, always < logits)
+    dim3 grid(nh, ns, 1);
+    dim3 block(128);
 
-    int vpd = (head_size+9)/10*4;
-    int vbs = num_kv_heads * vpd * block_size;
-    int vhs = vpd * block_size;
-
-    constexpr int NUM_THREADS = 128;
-    constexpr int HEAD = 128;
-    int padded = TQ_DIVUP(max_context_len, block_size) * block_size;
-    int logits_size = padded * sizeof(float);
-    int outputs_size = (NUM_THREADS / TQ_WARP_SIZE / 2) * HEAD * sizeof(float);
-    int shared_mem = logits_size > outputs_size ? logits_size : outputs_size;
-
-    dim3 grid(num_heads, num_seqs, 1);
-    dim3 block(NUM_THREADS);
-
-    // Dispatch based on block_size
-    switch (block_size) {
-    case 8:
-        turbo_attn_optimized<NUM_THREADS, HEAD, 8><<<grid, block, shared_mem, stream>>>(
-            (float*)out, (const __half*)query, (const uint8_t*)k_cache, (const uint8_t*)v_cache,
-            (const __half*)k_norms, (const __half*)v_norms, block_tables, context_lens,
-            num_kv_heads, max_num_blocks_per_seq, num_heads, scale,
-            kv_block_stride, kv_head_stride, vbs, vhs, norm_block_stride, norm_head_stride);
-        break;
-    case 16:
-        turbo_attn_optimized<NUM_THREADS, HEAD, 16><<<grid, block, shared_mem, stream>>>(
-            (float*)out, (const __half*)query, (const uint8_t*)k_cache, (const uint8_t*)v_cache,
-            (const __half*)k_norms, (const __half*)v_norms, block_tables, context_lens,
-            num_kv_heads, max_num_blocks_per_seq, num_heads, scale,
-            kv_block_stride, kv_head_stride, vbs, vhs, norm_block_stride, norm_head_stride);
-        break;
-    case 32:
-        turbo_attn_optimized<NUM_THREADS, HEAD, 32><<<grid, block, shared_mem, stream>>>(
-            (float*)out, (const __half*)query, (const uint8_t*)k_cache, (const uint8_t*)v_cache,
-            (const __half*)k_norms, (const __half*)v_norms, block_tables, context_lens,
-            num_kv_heads, max_num_blocks_per_seq, num_heads, scale,
-            kv_block_stride, kv_head_stride, vbs, vhs, norm_block_stride, norm_head_stride);
-        break;
-    default:
-        break;
+    switch(bs){
+    case 8: tq_attn<8><<<grid,block,smem,stream>>>((float*)out,(const __half*)query,(const uint8_t*)kc,(const uint8_t*)vc,(const __half*)kn,(const __half*)vn,bt,cl,nkvh,mbps,nh,scale,kbs,khs,vvbs,vvhs,nbs,nhs); break;
+    case 16: tq_attn<16><<<grid,block,smem,stream>>>((float*)out,(const __half*)query,(const uint8_t*)kc,(const uint8_t*)vc,(const __half*)kn,(const __half*)vn,bt,cl,nkvh,mbps,nh,scale,kbs,khs,vvbs,vvhs,nbs,nhs); break;
+    case 32: tq_attn<32><<<grid,block,smem,stream>>>((float*)out,(const __half*)query,(const uint8_t*)kc,(const uint8_t*)vc,(const __half*)kn,(const __half*)vn,bt,cl,nkvh,mbps,nh,scale,kbs,khs,vvbs,vvhs,nbs,nhs); break;
     }
 }
