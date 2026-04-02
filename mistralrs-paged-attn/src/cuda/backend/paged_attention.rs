@@ -781,8 +781,8 @@ pub fn turbo_paged_attention(
     num_kv_heads: usize,
 ) -> Result<Tensor> {
     // Convert query to F16 if needed (kernel only supports FP16)
-    let q = q.to_dtype(candle::DType::F16)?;
     let original_dtype = q.dtype();
+    let q = q.to_dtype(candle::DType::F16)?;
     let (q_s, q_l) = q.storage_and_layout();
     let q_s = match &*q_s {
         Storage::Cuda(s) => s,
@@ -889,5 +889,5 @@ pub fn turbo_paged_attention(
         candle::op::BackpropOp::none(),
         false,
     );
-    out_tensor.to_dtype(q.dtype())
+    out_tensor.to_dtype(original_dtype)
 }
