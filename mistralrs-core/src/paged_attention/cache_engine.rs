@@ -163,9 +163,13 @@ impl CacheEngine {
                         model_config,
                         dtype,
                         cache_config.block_size,
+                        &cache_config.cache_type,
                     );
-                    let value_block_shape =
-                        Self::calculate_value_block_shape(model_config, cache_config.block_size);
+                    let value_block_shape = Self::calculate_value_block_shape(
+                        model_config,
+                        cache_config.block_size,
+                        &cache_config.cache_type,
+                    );
                     #[allow(unused)]
                     let key_blocks = if let Device::Metal(dev) = &device {
                         #[cfg(feature = "metal")]
@@ -365,25 +369,50 @@ impl CacheEngine {
         model_config: &dyn ModelConfigLike,
         dtype: DType,
         block_size: usize,
+        cache_type: &PagedCacheType,
     ) -> (usize, usize, usize, usize) {
-        let element_size = dtype.size_in_bytes();
-        let x = 16 / element_size;
-        (
-            model_config.num_kv_heads(),
-            model_config.k_head_dim() / x,
-            block_size,
-            x,
-        )
+        if cache_type.is_turboquant() {
+            // TurboQuant 4-bit packed: 2 values per byte = head_dim/2 bytes per head
+            // Store as (num_kv_heads, packed_bytes/16, block_size, 16) to keep 5D
+            let packed_bytes = model_config.k_head_dim() / 2; // 4-bit: 64 bytes for d=128
+            let x = 16usize;
+            (
+                model_config.num_kv_heads(),
+                packed_bytes / x, // 64/16 = 4
+                block_size,
+                x,
+            )
+        } else {
+            let element_size = dtype.size_in_bytes();
+            let x = 16 / element_size;
+            (
+                model_config.num_kv_heads(),
+                model_config.k_head_dim() / x,
+                block_size,
+                x,
+            )
+        }
     }
 
     fn calculate_value_block_shape(
         model_config: &dyn ModelConfigLike,
         block_size: usize,
+        cache_type: &PagedCacheType,
     ) -> (usize, usize, usize) {
-        (
-            model_config.num_kv_heads(),
-            model_config.v_head_dim(),
-            block_size,
-        )
+        if cache_type.is_turboquant() {
+            // TurboQuant 3-bit packed: 10 values per 4 bytes = ceil(head_dim/10)*4 bytes
+            let packed_bytes = (model_config.v_head_dim().div_ceil(10)) * 4; // 52 for d=128
+            (
+                model_config.num_kv_heads(),
+                packed_bytes,
+                block_size,
+            )
+        } else {
+            (
+                model_config.num_kv_heads(),
+                model_config.v_head_dim(),
+                block_size,
+            )
+        }
     }
 }
