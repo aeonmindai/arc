@@ -661,6 +661,7 @@ pub fn reshape_and_cache(
 /// * `k_norms` - [num_blocks, num_kv_heads, block_size] F16
 /// * `v_norms` - [num_blocks, num_kv_heads, block_size] F16
 #[allow(clippy::too_many_arguments)]
+#[allow(unused_variables)]
 pub fn turbo_reshape_and_cache(
     key: &Tensor,
     value: &Tensor,
@@ -762,6 +763,7 @@ pub fn turbo_reshape_and_cache(
 
 /// TurboQuant: paged attention over compressed U8 KV cache.
 #[allow(clippy::too_many_arguments)]
+#[allow(unused_variables)]
 pub fn turbo_paged_attention(
     q: &Tensor,
     key_cache: &Tensor,
@@ -865,10 +867,11 @@ pub fn turbo_paged_attention(
 
     // Convert F32 output to F16 to match expected output dtype
     let out_storage = candle::CudaStorage::wrap_cuda_slice(out, dev.clone());
-    let out_tensor = candle::Tensor::from_storage_no_op(
+    let out_tensor = candle::Tensor::from_storage(
         candle::Storage::Cuda(out_storage),
         out_shape,
+        candle::op::BackpropOp::none(),
         false,
-    )?;
+    );
     out_tensor.to_dtype(q.dtype())
 }

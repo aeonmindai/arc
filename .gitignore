@@ -9,3 +9,6 @@ mistralrs-web-chat/cache
 
 # mdbook output
 docs/book/
+
+# roro workspace
+.roro/
