@@ -1,14 +1,11 @@
 /**
  * TurboQuant Paged Attention CUDA Kernels
  *
- * Complete write + read path for TurboQuant compressed KV cache.
+ * Write: turbo_reshape_and_cache
+ *   FP16 K/V → normalize → WHT rotate → codebook quantize → store U8 + F16 norms
  *
- * Write (turbo_reshape_and_cache):
- *   FP16 K/V → normalize → WHT rotate → codebook quantize → store U8 indices + F16 norms
- *
- * Read (turbo_paged_attention_v1_f16):
- *   For each cached token: load U8 index → codebook lookup → dot with rotated Q
- *   No full dequantization. Codebook in shared memory.
+ * Read: turbo_paged_attention_v1_f16
+ *   For each cached token: load U8 → codebook lookup → dot with rotated Q
  */
 
 #include <cuda_fp16.h>
@@ -17,11 +14,10 @@
 #include <cmath>
 #include <cfloat>
 
-// Include the kernel definitions from the header
 #include "turbo_paged_attention.cuh"
 
 // ============================================================================
-// Codebook + Signs (must match turbo_wht.cu and Rust codebook.rs)
+// Codebook + Signs
 // ============================================================================
 
 static __constant__ float TQ_CB_4BIT[16] = {
@@ -113,59 +109,52 @@ __device__ uint8_t tq_quantize_3bit(float x) {
 }
 
 // ============================================================================
-// turbo_reshape_and_cache: Quantize FP16 K/V and store as U8 in paged cache
+// reshape_and_cache: Quantize and store
 // ============================================================================
 
-/**
- * Quantize one vector (K or V) and store as U8 indices.
- *
- * Grid:  (num_tokens * num_heads, 1, 1)
- * Block: (128, 1, 1)
- *
- * Each block handles one vector (one head of one token).
- *
- * key/value: [num_tokens, num_heads, head_size] in FP16
- * cache:     [num_blocks, num_heads, head_size/x, block_size, x] in U8
- * norms:     [num_blocks, num_heads, block_size] in FP16
- * slot_mapping: [num_tokens] -> slot index in cache
- */
+// K cache is 5D: [num_blocks, num_kv_heads, head_size/x, block_size, x]
+// V cache is 4D: [num_blocks, num_kv_heads, head_size, block_size]
+// For U8: x = 16, so K is [B, H, 8, BS, 16] and V is [B, H, 128, BS]
+// We use FLAT BYTE OFFSETS computed from strides.
+
 template<bool IS_KEY>
 __global__ void turbo_reshape_and_cache_kernel(
-    const __half* __restrict__ input,  // [num_tokens, num_heads, 128]
-    uint8_t* __restrict__ cache,       // [num_blocks, num_heads, 8, block_size, 16] for U8
-    __half* __restrict__ norms,        // [num_blocks, num_heads, block_size]
+    const __half* __restrict__ input,
+    uint8_t* __restrict__ cache,
+    __half* __restrict__ norms,
     const int64_t* __restrict__ slot_mapping,
     int num_heads,
     int head_size,
     int block_size,
-    int input_stride,                  // stride for token dim in input
-    int cache_block_stride,            // stride for block dim in cache
-    int cache_head_stride,             // stride for head dim in cache
-    int norm_block_stride,             // stride for block dim in norms
-    int norm_head_stride               // stride for head dim in norms
+    int input_stride,
+    // For K cache (5D): strides are [block_stride, head_stride, d0_stride, bs_stride, 1]
+    // For V cache (4D): strides are [block_stride, head_stride, dim_stride, 1]
+    // We receive the block and head strides. We compute inner offsets ourselves.
+    int cache_block_stride,
+    int cache_head_stride,
+    int norm_block_stride,
+    int norm_head_stride
 ) {
     const int vec_idx = blockIdx.x;
     const int tid = threadIdx.x;
-
     const int token_idx = vec_idx / num_heads;
     const int head_idx = vec_idx % num_heads;
 
-    // Check slot mapping
     const int64_t slot = slot_mapping[token_idx];
-    if (slot < 0) return; // PAD token
+    if (slot < 0) return;
 
     const int block_idx = slot / block_size;
     const int block_offset = slot % block_size;
 
     __shared__ float smem[128];
 
-    // Step 1: Load FP16 input to shared memory as F32
+    // Load input
     if (tid < head_size) {
         smem[tid] = __half2float(input[token_idx * input_stride + head_idx * head_size + tid]);
     }
     __syncthreads();
 
-    // Step 2: Compute L2 norm
+    // L2 norm
     __shared__ float norm_buf[128];
     norm_buf[tid] = (tid < head_size) ? smem[tid] * smem[tid] : 0.0f;
     __syncthreads();
@@ -175,47 +164,45 @@ __global__ void turbo_reshape_and_cache_kernel(
     }
     float norm = sqrtf(norm_buf[0]);
 
-    // Store norm
     if (tid == 0) {
         norms[block_idx * norm_block_stride + head_idx * norm_head_stride + block_offset] =
             __float2half(norm);
     }
 
-    // Step 3: Normalize
-    if (tid < head_size && norm > 1e-10f) {
-        smem[tid] /= norm;
-    }
+    // Normalize
+    if (tid < head_size && norm > 1e-10f) smem[tid] /= norm;
     __syncthreads();
 
-    // Step 4: WHT rotate (D·H·D)
+    // WHT rotate
     tq_rotate(smem, tid);
 
-    // Step 5: Quantize and store as U8
-    // Cache layout for U8: [num_blocks, num_heads, head_size/16, block_size, 16]
-    // Each element is one U8 index. We store one index per coordinate.
+    // Quantize and store
     if (tid < head_size) {
         uint8_t idx;
         if constexpr (IS_KEY) {
             idx = tq_quantize_4bit(smem[tid]);
+            // K cache 5D: [block, head, tid/16, block_offset, tid%16]
+            // offset = block*block_stride + head*head_stride + (tid/16)*block_size*16 + block_offset*16 + tid%16
+            int x = 16;
+            int offset = block_idx * cache_block_stride +
+                         head_idx * cache_head_stride +
+                         (tid / x) * block_size * x +
+                         block_offset * x +
+                         (tid % x);
+            cache[offset] = idx;
         } else {
             idx = tq_quantize_3bit(smem[tid]);
+            // V cache 4D: [block, head, tid, block_offset]
+            // offset = block*block_stride + head*head_stride + tid*block_size + block_offset
+            int offset = block_idx * cache_block_stride +
+                         head_idx * cache_head_stride +
+                         tid * block_size +
+                         block_offset;
+            cache[offset] = idx;
         }
-
-        // Compute cache offset: same layout as standard paged attention U8 cache
-        // [block_idx, head_idx, tid/16, block_offset, tid%16]
-        const int x = 16; // U8 element size = 1 byte, x = 16/1 = 16
-        int d0 = tid / x;
-        int d1 = tid % x;
-        int offset = block_idx * cache_block_stride +
-                     head_idx * cache_head_stride +
-                     d0 * block_size * x +
-                     block_offset * x +
-                     d1;
-        cache[offset] = idx;
     }
 }
 
-// Launch wrapper
 extern "C" void turbo_reshape_and_cache(
     const void* key,
     const void* value,
@@ -230,20 +217,20 @@ extern "C" void turbo_reshape_and_cache(
     int block_size,
     int key_stride,
     int value_stride,
-    int kv_block_stride,
-    int kv_head_stride,
+    int kv_block_stride,     // K cache block stride
+    int kv_head_stride,      // K cache head stride
     int norm_block_stride,
     int norm_head_stride,
     cudaStream_t stream,
-    uint32_t dtype  // 0=f16, 1=bf16
+    uint32_t dtype
 ) {
-    if (head_size != 128) return; // Only support head_size=128 for now
+    if (head_size != 128) return;
 
-    int total_vectors = num_tokens * num_heads;
-    dim3 grid(total_vectors);
+    int total = num_tokens * num_heads;
+    dim3 grid(total);
     dim3 block(128);
 
-    // Quantize keys (4-bit)
+    // K cache strides (5D)
     turbo_reshape_and_cache_kernel<true><<<grid, block, 0, stream>>>(
         reinterpret_cast<const __half*>(key),
         reinterpret_cast<uint8_t*>(key_cache),
@@ -255,7 +242,13 @@ extern "C" void turbo_reshape_and_cache(
         norm_block_stride, norm_head_stride
     );
 
-    // Quantize values (3-bit stored as U8 indices — one per coordinate)
+    // V cache strides (4D) - compute from shape
+    // V cache: [num_blocks, num_heads, head_size, block_size]
+    // v_block_stride = num_heads * head_size * block_size
+    // v_head_stride = head_size * block_size
+    int v_block_stride = num_heads * head_size * block_size;
+    int v_head_stride = head_size * block_size;
+
     turbo_reshape_and_cache_kernel<false><<<grid, block, 0, stream>>>(
         reinterpret_cast<const __half*>(value),
         reinterpret_cast<uint8_t*>(value_cache),
@@ -263,45 +256,33 @@ extern "C" void turbo_reshape_and_cache(
         slot_mapping,
         num_heads, head_size, block_size,
         value_stride,
-        kv_block_stride, kv_head_stride,
+        v_block_stride, v_head_stride,
         norm_block_stride, norm_head_stride
     );
 }
 
 // ============================================================================
-// turbo_paged_attention_v1: Attention over TurboQuant compressed KV cache
+// Attention kernel
 // ============================================================================
 
-/**
- * Decode attention over TurboQuant U8 cache.
- *
- * Grid:  (num_heads, num_seqs, 1)
- * Block: (128, 1, 1)  — one thread per head dimension
- *
- * For each cached token:
- *   - Load U8 index from K cache
- *   - Lookup codebook centroid
- *   - Dot product with rotated Q (in shared memory)
- *   - Scale by stored norm
- *
- * Then softmax + weighted V aggregation (dequantize V inline).
- */
 __global__ void turbo_attn_kernel_d128(
-    float* __restrict__ out,                    // [num_seqs, num_heads, 128]
-    const __half* __restrict__ query,           // [num_seqs, num_heads, 128]
-    const uint8_t* __restrict__ k_cache,        // [num_blocks, num_kv_heads, 8, block_size, 16]
-    const uint8_t* __restrict__ v_cache,        // [num_blocks, num_kv_heads, 128, block_size]
-    const __half* __restrict__ k_norms,         // [num_blocks, num_kv_heads, block_size]
-    const __half* __restrict__ v_norms,         // [num_blocks, num_kv_heads, block_size]
-    const uint32_t* __restrict__ block_tables,  // [num_seqs, max_blocks_per_seq]
-    const uint32_t* __restrict__ context_lens,  // [num_seqs]
+    float* __restrict__ out,
+    const __half* __restrict__ query,
+    const uint8_t* __restrict__ k_cache,
+    const uint8_t* __restrict__ v_cache,
+    const __half* __restrict__ k_norms,
+    const __half* __restrict__ v_norms,
+    const uint32_t* __restrict__ block_tables,
+    const uint32_t* __restrict__ context_lens,
     int num_kv_heads,
     int max_blocks_per_seq,
     int num_heads,
     int block_size,
     float scale,
-    int kv_block_stride,
-    int kv_head_stride,
+    int k_block_stride,     // K cache: stride per block
+    int k_head_stride,      // K cache: stride per head
+    int v_block_stride,     // V cache: stride per block (different from K!)
+    int v_head_stride,      // V cache: stride per head
     int norm_block_stride,
     int norm_head_stride
 ) {
@@ -313,7 +294,7 @@ __global__ void turbo_attn_kernel_d128(
 
     const int kv_head_idx = head_idx / (num_heads / num_kv_heads);
 
-    // Load and rotate query into shared memory
+    // Load and rotate query
     __shared__ float q_rot[128];
     if (tid < 128) {
         q_rot[tid] = __half2float(query[seq_idx * num_heads * 128 + head_idx * 128 + tid]);
@@ -321,8 +302,7 @@ __global__ void turbo_attn_kernel_d128(
     __syncthreads();
     tq_rotate(q_rot, tid);
 
-    // Compute Q·K scores for all cached tokens
-    // Use dynamic shared memory for logits
+    // Dynamic shared memory for logits
     extern __shared__ char smem_bytes[];
     float* logits = reinterpret_cast<float*>(smem_bytes);
 
@@ -338,30 +318,28 @@ __global__ void turbo_attn_kernel_d128(
         for (int t = 0; t < tokens_in_block; t++) {
             int token_pos = b * block_size + t;
 
-            // Each thread loads one K element (U8 index) and looks up codebook
+            // Read K: 5D layout [block, head, tid/16, t, tid%16]
             float k_val = 0.0f;
             if (tid < 128) {
                 int x = 16;
-                int d0 = tid / x;
-                int d1 = tid % x;
-                int k_offset = physical_block * kv_block_stride +
-                               kv_head_idx * kv_head_stride +
-                               d0 * block_size * x +
+                int k_offset = physical_block * k_block_stride +
+                               kv_head_idx * k_head_stride +
+                               (tid / x) * block_size * x +
                                t * x +
-                               d1;
+                               (tid % x);
                 uint8_t k_idx = k_cache[k_offset];
                 k_val = TQ_CB_4BIT[k_idx];
             }
 
-            // Dot product: q_rot · k_codebook (parallel reduction)
+            // Dot product: q_rot · k_codebook
             float partial = (tid < 128) ? q_rot[tid] * k_val : 0.0f;
 
-            // Warp reduction
+            // Full warp reduction (32 lanes)
             for (int mask = 16; mask > 0; mask >>= 1) {
                 partial += __shfl_xor_sync(0xffffffff, partial, mask);
             }
 
-            // Cross-warp reduction
+            // Cross-warp reduction (4 warps)
             __shared__ float warp_sums[4];
             if (tid % 32 == 0) warp_sums[tid / 32] = partial;
             __syncthreads();
@@ -408,6 +386,8 @@ __global__ void turbo_attn_kernel_d128(
     __syncthreads();
 
     // Weighted sum of V
+    // V cache 4D: [block, head, dim, slot_in_block]
+    // offset = block * v_block_stride + head * v_head_stride + dim * block_size + slot
     float acc = 0.0f;
     if (tid < 128) {
         for (int b = 0; b < num_blocks; b++) {
@@ -419,9 +399,8 @@ __global__ void turbo_attn_kernel_d128(
                 float weight = logits[token_pos];
                 if (weight < 1e-8f) continue;
 
-                // V cache: [num_blocks, num_kv_heads, head_size, block_size] in U8
-                int v_offset = physical_block * kv_block_stride +
-                               kv_head_idx * kv_head_stride +
+                int v_offset = physical_block * v_block_stride +
+                               kv_head_idx * v_head_stride +
                                tid * block_size +
                                t;
                 uint8_t v_idx = v_cache[v_offset];
@@ -434,7 +413,7 @@ __global__ void turbo_attn_kernel_d128(
         }
     }
 
-    // Inverse rotation and write output
+    // Inverse WHT rotation on output
     __shared__ float out_rot[128];
     if (tid < 128) out_rot[tid] = acc;
     __syncthreads();
@@ -472,6 +451,11 @@ extern "C" void turbo_paged_attention_v1_f16(
 ) {
     if (head_size != 128) return;
 
+    // Compute V cache strides from shape
+    // V cache: [num_blocks, num_kv_heads, head_size, block_size] = [B, H, 128, BS]
+    int v_block_stride = num_kv_heads * head_size * block_size;
+    int v_head_stride = head_size * block_size;
+
     int shared_mem = max_context_len * sizeof(float);
     dim3 grid(num_heads, num_seqs, 1);
     dim3 block(128);
@@ -490,8 +474,10 @@ extern "C" void turbo_paged_attention_v1_f16(
         num_heads,
         block_size,
         scale,
-        kv_block_stride,
-        kv_head_stride,
+        kv_block_stride,   // K block stride (from 5D cache)
+        kv_head_stride,    // K head stride
+        v_block_stride,    // V block stride (computed for 4D)
+        v_head_stride,     // V head stride
         norm_block_stride,
         norm_head_stride
     );
