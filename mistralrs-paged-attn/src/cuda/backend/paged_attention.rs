@@ -822,14 +822,13 @@ pub fn turbo_paged_attention(
     let out_shape = q_l.shape().clone();
     let out = unsafe { dev.alloc::<f32>(out_shape.elem_count()) }?;
 
-    let (out_ptr, _out_g) = out.device_ptr(out.stream());
-    let (q_ptr, _q_g) = q_s.as_cuda_slice::<f16>()?.device_ptr(q_s.as_cuda_slice::<f16>()?.stream());
-    let (kc_ptr, _kc_g) = kc.as_cuda_slice::<u8>()?.device_ptr(kc.as_cuda_slice::<u8>()?.stream());
-    let (vc_ptr, _vc_g) = vc.as_cuda_slice::<u8>()?.device_ptr(vc.as_cuda_slice::<u8>()?.stream());
-    let (kn_ptr, _kn_g) = kn.as_cuda_slice::<f16>()?.device_ptr(kn.as_cuda_slice::<f16>()?.stream());
-    let (vn_ptr, _vn_g) = vn.as_cuda_slice::<f16>()?.device_ptr(vn.as_cuda_slice::<f16>()?.stream());
-    let (bt_ptr, _bt_g) = bt.as_cuda_slice::<u32>()?.device_ptr(bt.as_cuda_slice::<u32>()?.stream());
-    let (cl_ptr, _cl_g) = cl.as_cuda_slice::<u32>()?.device_ptr(cl.as_cuda_slice::<u32>()?.stream());
+    let q_slice = q_s.as_cuda_slice::<f16>()?;
+    let kc_slice = kc.as_cuda_slice::<u8>()?;
+    let vc_slice = vc.as_cuda_slice::<u8>()?;
+    let kn_slice = kn.as_cuda_slice::<f16>()?;
+    let vn_slice = vn.as_cuda_slice::<f16>()?;
+    let bt_slice = bt.as_cuda_slice::<u32>()?;
+    let cl_slice = cl.as_cuda_slice::<u32>()?;
 
     let q_stride = q_l.stride()[0] as c_int;
     let kv_block_stride = kc_l.stride()[0] as c_int;
@@ -837,33 +836,44 @@ pub fn turbo_paged_attention(
     let norm_block_stride = kn_l.stride()[0] as c_int;
     let norm_head_stride = kn_l.stride()[1] as c_int;
 
-    unsafe {
-        ffi::turbo_paged_attention_v1_f16(
-            out_ptr as *const std::ffi::c_void,
-            q_ptr as *const std::ffi::c_void,
-            kc_ptr as *const std::ffi::c_void,
-            vc_ptr as *const std::ffi::c_void,
-            kn_ptr as *const std::ffi::c_void,
-            vn_ptr as *const std::ffi::c_void,
-            num_kv_heads as c_int,
-            softmax_scale,
-            softcapping,
-            bt_ptr as *const u32,
-            cl_ptr as *const u32,
-            block_size as c_int,
-            max_context_len as c_int,
-            num_seqs as c_int,
-            num_heads as c_int,
-            head_size as c_int,
-            max_num_blocks_per_seq as c_int,
-            q_stride,
-            kv_block_stride,
-            kv_head_stride,
-            norm_block_stride,
-            norm_head_stride,
-            dev.cuda_stream().cu_stream(),
-        )
-    }
+    {
+        let (out_ptr, _out_g) = out.device_ptr(out.stream());
+        let (q_ptr, _q_g) = q_slice.device_ptr(q_slice.stream());
+        let (kc_ptr, _kc_g) = kc_slice.device_ptr(kc_slice.stream());
+        let (vc_ptr, _vc_g) = vc_slice.device_ptr(vc_slice.stream());
+        let (kn_ptr, _kn_g) = kn_slice.device_ptr(kn_slice.stream());
+        let (vn_ptr, _vn_g) = vn_slice.device_ptr(vn_slice.stream());
+        let (bt_ptr, _bt_g) = bt_slice.device_ptr(bt_slice.stream());
+        let (cl_ptr, _cl_g) = cl_slice.device_ptr(cl_slice.stream());
+
+        unsafe {
+            ffi::turbo_paged_attention_v1_f16(
+                out_ptr as *const std::ffi::c_void,
+                q_ptr as *const std::ffi::c_void,
+                kc_ptr as *const std::ffi::c_void,
+                vc_ptr as *const std::ffi::c_void,
+                kn_ptr as *const std::ffi::c_void,
+                vn_ptr as *const std::ffi::c_void,
+                num_kv_heads as c_int,
+                softmax_scale,
+                softcapping,
+                bt_ptr as *const u32,
+                cl_ptr as *const u32,
+                block_size as c_int,
+                max_context_len as c_int,
+                num_seqs as c_int,
+                num_heads as c_int,
+                head_size as c_int,
+                max_num_blocks_per_seq as c_int,
+                q_stride,
+                kv_block_stride,
+                kv_head_stride,
+                norm_block_stride,
+                norm_head_stride,
+                dev.cuda_stream().cu_stream(),
+            )
+        }
+    } // guards dropped here, `out` is no longer borrowed
 
     // Convert F32 output to F16 to match expected output dtype
     let out_storage = candle::CudaStorage::wrap_cuda_slice(out, dev.clone());
