@@ -144,6 +144,30 @@ pub fn calculate_cache_config(
     let dtype = cache_type.to_dtype(dtype);
     let dtype_size = dtype.size_in_bytes();
 
+    // For TurboQuant, override the effective bytes-per-element to account for
+    // sub-byte packing. The block shapes are already packed (K: 64 bytes/head,
+    // V: 52 bytes/head for d=128), but mb_to_blocks uses dtype_size * elements
+    // which overcounts. We compute an effective dtype_size that gives the correct
+    // total bytes when multiplied by kv_cache_elements_per_token.
+    //
+    // Actual packed bytes per token = num_kv_heads * (k_packed + v_packed + 4 norms)
+    // kv_cache_elements_per_token = 2 * num_kv_heads * head_dim
+    // effective_dtype_size = actual_bytes / elements_per_token
+    //
+    // For head_dim=128: packed = 8*(64+52+4) = 960, elements = 2*8*128 = 2048
+    // effective = 960/2048 ≈ 0.47, but dtype_size is usize so we can't use fractions.
+    //
+    // Instead, directly compute num_gpu_blocks for TurboQuant.
+    let turboquant_bytes_per_token_per_layer = if cache_type.is_turboquant() {
+        let kv_heads = config.num_kv_heads();
+        let k_packed = config.k_head_dim() / 2; // 4-bit: 64 bytes
+        let v_packed = (config.v_head_dim().div_ceil(10)) * 4; // 3-bit: 52 bytes
+        let norms = 2 * 2; // 2 F16 norms = 4 bytes
+        Some(kv_heads * (k_packed + v_packed + norms))
+    } else {
+        None
+    };
+
     // For tensor parallelism, each device holds a fraction of the model weights. Approximate it like this.
     let num_devices = layer_devices.len().max(1);
     let model_weight_per_device_mb =
@@ -205,7 +229,14 @@ pub fn calculate_cache_config(
         }
     }
 
-    let num_gpu_blocks = mb_to_blocks!(mem_gpu * SIZE_IN_MB, dtype_size, block_size, config);
+    let num_gpu_blocks = if let Some(bytes_per_tok_per_layer) = turboquant_bytes_per_token_per_layer {
+        // TurboQuant: compute blocks from actual packed byte sizes
+        // total_bytes = num_blocks * block_size * num_layers * bytes_per_token_per_layer
+        // num_blocks = total_bytes / (block_size * num_layers * bytes_per_token_per_layer)
+        (mem_gpu * SIZE_IN_MB) / (block_size * config.num_layers() * bytes_per_tok_per_layer)
+    } else {
+        mb_to_blocks!(mem_gpu * SIZE_IN_MB, dtype_size, block_size, config)
+    };
     if num_gpu_blocks == 0 {
         anyhow::bail!("Num GPU blocks is 0. This means there is not enough memory. Either reduce the memory amount/utilization/context size or disable PagedAttention.");
     }
