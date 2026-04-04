@@ -618,6 +618,10 @@ impl Loader for EmbeddingLoader {
 
         let has_causal_attention = self.inner.has_causal_attention(&config)?;
         let max_seq_len = self.inner.model_config(&config)?.max_seq_len();
+
+        #[cfg(feature = "cuda")]
+        let _graph_device = model.device().clone();
+
         Ok(Arc::new(Mutex::new(EmbeddingPipeline {
             model,
             tokenizer: tokenizer.into(),
@@ -652,7 +656,7 @@ impl Loader for EmbeddingLoader {
                 has_causal_attention,
             }),
             #[cfg(feature = "cuda")]
-            cuda_graph_runner: arc_cuda_graph::try_init_graph_runner(model.device()),
+            cuda_graph_runner: arc_cuda_graph::try_init_graph_runner(&_graph_device),
         })))
     }
 

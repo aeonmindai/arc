@@ -303,6 +303,9 @@ impl Loader for SpeechLoader {
 
         let model = DiaPipeline::new(&cfg, vb, dac_vb)?;
 
+        #[cfg(feature = "cuda")]
+        let _graph_device = model.device().clone();
+
         Ok(Arc::new(Mutex::new(SpeechPipeline {
             model_id: self.model_id.clone(),
             model,
@@ -330,7 +333,7 @@ impl Loader for SpeechLoader {
                 .cfg
                 .unwrap_or_else(|| SpeechGenerationConfig::default(self.arch)),
             #[cfg(feature = "cuda")]
-            cuda_graph_runner: arc_cuda_graph::try_init_graph_runner(model.device()),
+            cuda_graph_runner: arc_cuda_graph::try_init_graph_runner(&_graph_device),
         })))
     }
 

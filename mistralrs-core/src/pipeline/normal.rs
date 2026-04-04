@@ -1006,6 +1006,9 @@ impl Loader for NormalLoader {
         let sliding_window = model.config().sliding_window;
         let model_metadata = Arc::new(model.config().clone());
 
+        #[cfg(feature = "cuda")]
+        let _graph_device = model.device().clone();
+
         Ok(Arc::new(Mutex::new(NormalPipeline {
             model,
             tokenizer: tokenizer.into(),
@@ -1046,7 +1049,7 @@ impl Loader for NormalLoader {
             imatrix: self.config.imatrix.clone(),
             mapper: pipeline_mapper,
             #[cfg(feature = "cuda")]
-            cuda_graph_runner: arc_cuda_graph::try_init_graph_runner(model.device()),
+            cuda_graph_runner: arc_cuda_graph::try_init_graph_runner(&_graph_device),
         })))
     }
 

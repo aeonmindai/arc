@@ -581,6 +581,23 @@ impl Loader for GGUFLoader {
         }
 
         let eos = calculate_eos_tokens(&chat_template, gen_conf, &tokenizer);
+
+        #[cfg(feature = "cuda")]
+        let _graph_device = {
+            let dev = match &model {
+                Model::Llama(ref m) => &m.device,
+                Model::Phi2(ref m) => &m.device,
+                Model::XLoraLlama(ref m) => &m.device,
+                Model::Phi3(ref m) => &m.device,
+                Model::XLoraPhi3(ref m) => &m.device,
+                Model::Starcoder2(ref m) => &m.device,
+                Model::Qwen(ref m) => &m.device,
+                Model::Qwen3(ref m) => &m.device,
+                Model::Qwen3MoE(ref m) => &m.device,
+            };
+            dev.clone()
+        };
+
         Ok(Arc::new(Mutex::new(GGUFPipeline {
             model,
             tokenizer: tokenizer.into(),
@@ -617,20 +634,7 @@ impl Loader for GGUFLoader {
             }),
             mapper: pipeline_mapper,
             #[cfg(feature = "cuda")]
-            cuda_graph_runner: {
-                let dev = match &model {
-                    Model::Llama(ref m) => &m.device,
-                    Model::Phi2(ref m) => &m.device,
-                    Model::XLoraLlama(ref m) => &m.device,
-                    Model::Phi3(ref m) => &m.device,
-                    Model::XLoraPhi3(ref m) => &m.device,
-                    Model::Starcoder2(ref m) => &m.device,
-                    Model::Qwen(ref m) => &m.device,
-                    Model::Qwen3(ref m) => &m.device,
-                    Model::Qwen3MoE(ref m) => &m.device,
-                };
-                arc_cuda_graph::try_init_graph_runner(dev)
-            },
+            cuda_graph_runner: arc_cuda_graph::try_init_graph_runner(&_graph_device),
         })))
     }
 

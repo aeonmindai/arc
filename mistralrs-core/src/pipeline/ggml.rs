@@ -370,6 +370,16 @@ impl Loader for GGMLLoader {
             Model::XLoraLlama(ref model) => model.cache.full().lock().len(),
         };
         let eos = calculate_eos_tokens(&chat_template, gen_conf, &tokenizer);
+
+        #[cfg(feature = "cuda")]
+        let _graph_device = {
+            let dev = match &model {
+                Model::Llama(ref m) => &m.device,
+                Model::XLoraLlama(ref m) => &m.device,
+            };
+            dev.clone()
+        };
+
         Ok(Arc::new(Mutex::new(GGMLPipeline {
             model,
             tokenizer: tokenizer.into(),
@@ -402,13 +412,7 @@ impl Loader for GGMLLoader {
                 },
             }),
             #[cfg(feature = "cuda")]
-            cuda_graph_runner: {
-                let dev = match &model {
-                    Model::Llama(ref m) => &m.device,
-                    Model::XLoraLlama(ref m) => &m.device,
-                };
-                arc_cuda_graph::try_init_graph_runner(dev)
-            },
+            cuda_graph_runner: arc_cuda_graph::try_init_graph_runner(&_graph_device),
         })))
     }
 

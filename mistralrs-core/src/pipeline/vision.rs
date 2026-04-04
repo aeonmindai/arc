@@ -872,6 +872,10 @@ impl Loader for VisionLoader {
         let eos = calculate_eos_tokens(&chat_template, gen_conf, &tokenizer);
         let sliding_window = model.config().sliding_window;
         let model_metadata = Arc::new(model.config().clone());
+
+        #[cfg(feature = "cuda")]
+        let _graph_device = model.device().clone();
+
         Ok(Arc::new(Mutex::new(VisionPipeline {
             model,
             tokenizer: tokenizer.into(),
@@ -907,7 +911,7 @@ impl Loader for VisionLoader {
             mapper: pipeline_mapper,
             imatrix: self.config.imatrix.clone(),
             #[cfg(feature = "cuda")]
-            cuda_graph_runner: arc_cuda_graph::try_init_graph_runner(model.device()),
+            cuda_graph_runner: arc_cuda_graph::try_init_graph_runner(&_graph_device),
         })))
     }
 

@@ -2173,7 +2173,6 @@ impl Module for QLinear {
     }
 }
 
-#[derive(Debug, Clone)]
 /// Thread-local GPU positions tensor for CUDA graph mode.
 /// When set, `RotaryEmbedding::forward()` uses GPU-side gather instead of
 /// CPU-side `narrow()`, making the forward pass graph-capture compatible.

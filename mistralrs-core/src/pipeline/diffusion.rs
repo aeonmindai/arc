@@ -229,6 +229,10 @@ impl Loader for DiffusionLoader {
         };
 
         let max_seq_len = model.max_seq_len();
+
+        #[cfg(feature = "cuda")]
+        let _graph_device = model.device().clone();
+
         Ok(Arc::new(Mutex::new(DiffusionPipeline {
             model,
             model_id: self.model_id.clone(),
@@ -253,7 +257,7 @@ impl Loader for DiffusionLoader {
             }),
             dummy_cache: EitherCache::Full(Cache::new(0, false)),
             #[cfg(feature = "cuda")]
-            cuda_graph_runner: arc_cuda_graph::try_init_graph_runner(model.device()),
+            cuda_graph_runner: arc_cuda_graph::try_init_graph_runner(&_graph_device),
         })))
     }
 
