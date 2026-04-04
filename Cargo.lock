@@ -207,6 +207,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-cuda-graph"
+version = "0.7.1-alpha.1"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "cudaforge",
+ "tracing",
+]
+
+[[package]]
 name = "arc-engine"
 version = "0.7.1-alpha.1"
 dependencies = [
@@ -3543,6 +3553,7 @@ dependencies = [
  "akin",
  "anyhow",
  "apodize",
+ "arc-cuda-graph",
  "arc-turbo",
  "as-any",
  "async-trait",

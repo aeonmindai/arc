@@ -38,6 +38,8 @@ pub struct DiffusionPipeline {
     model_id: String,
     metadata: Arc<GeneralMetadata>,
     dummy_cache: EitherCache,
+    #[cfg(feature = "cuda")]
+    cuda_graph_runner: Option<arc_cuda_graph::CudaGraphRunner>,
 }
 
 /// A loader for a vision (non-quantized) model.
@@ -250,6 +252,8 @@ impl Loader for DiffusionLoader {
                 },
             }),
             dummy_cache: EitherCache::Full(Cache::new(0, false)),
+            #[cfg(feature = "cuda")]
+            cuda_graph_runner: arc_cuda_graph::try_init_graph_runner(model.device()),
         })))
     }
 
@@ -354,6 +358,10 @@ impl Pipeline for DiffusionPipeline {
     }
     fn category(&self) -> ModelCategory {
         ModelCategory::Diffusion
+    }
+    #[cfg(feature = "cuda")]
+    fn cuda_graph_runner_mut(&mut self) -> Option<&mut arc_cuda_graph::CudaGraphRunner> {
+        self.cuda_graph_runner.as_mut()
     }
 }
 

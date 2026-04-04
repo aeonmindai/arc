@@ -85,6 +85,8 @@ pub struct NormalPipeline {
     config: String,
     imatrix: Option<PathBuf>,
     mapper: Box<dyn DeviceMapper + Send + Sync>,
+    #[cfg(feature = "cuda")]
+    cuda_graph_runner: Option<arc_cuda_graph::CudaGraphRunner>,
 }
 
 /// A loader for a "normal" (non-quantized) model.
@@ -1043,6 +1045,8 @@ impl Loader for NormalLoader {
             config,
             imatrix: self.config.imatrix.clone(),
             mapper: pipeline_mapper,
+            #[cfg(feature = "cuda")]
+            cuda_graph_runner: arc_cuda_graph::try_init_graph_runner(model.device()),
         })))
     }
 
@@ -1187,15 +1191,14 @@ impl Pipeline for NormalPipeline {
         let paged_attn_meta = match (&metadata.cache_engine, &paged_attn_meta) {
             (Some(cache_engine), Some(meta)) => Some((cache_engine, meta)),
             (Some(_), None) => {
-                // This can happen if Rust-side user code is wrong
                 candle_core::bail!("Forward step expected a PagedAttention input metadata. This was not provided, please ensure that the scheduler config is correctly configured for PagedAttention.")
             }
             (None, Some(_)) => {
-                // This should never happen but we handle it anyway
                 candle_core::bail!("Forward step got a PagedAttention input metadata but there is no cache engine. Please raise an issue.")
             }
             (None, None) => None,
         };
+
         let logits = match self.model.is_xlora() {
             false => {
                 let paged_attn_meta = paged_attn_meta
@@ -1242,6 +1245,10 @@ impl Pipeline for NormalPipeline {
     }
     fn category(&self) -> ModelCategory {
         ModelCategory::Text
+    }
+    #[cfg(feature = "cuda")]
+    fn cuda_graph_runner_mut(&mut self) -> Option<&mut arc_cuda_graph::CudaGraphRunner> {
+        self.cuda_graph_runner.as_mut()
     }
 }
 

@@ -18,6 +18,7 @@ members = [
     "arc-engine",
     "arc-turbo",
     "arc-cli",
+    "arc-cuda-graph",
 ]
 resolver = "2"
 

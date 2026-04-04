@@ -71,6 +71,8 @@ pub struct EmbeddingPipeline {
     mapper: Box<dyn DeviceMapper + Send + Sync>,
     modules: Vec<Box<dyn Module + Send + Sync>>,
     processor: Arc<dyn Processor + Send + Sync>,
+    #[cfg(feature = "cuda")]
+    cuda_graph_runner: Option<arc_cuda_graph::CudaGraphRunner>,
 }
 
 /// A loader for a vision (non-quantized) model.
@@ -649,6 +651,8 @@ impl Loader for EmbeddingLoader {
             processor: Arc::new(EmbeddingProcessor {
                 has_causal_attention,
             }),
+            #[cfg(feature = "cuda")]
+            cuda_graph_runner: arc_cuda_graph::try_init_graph_runner(model.device()),
         })))
     }
 
@@ -768,6 +772,10 @@ impl Pipeline for EmbeddingPipeline {
     }
     fn category(&self) -> ModelCategory {
         ModelCategory::Embedding
+    }
+    #[cfg(feature = "cuda")]
+    fn cuda_graph_runner_mut(&mut self) -> Option<&mut arc_cuda_graph::CudaGraphRunner> {
+        self.cuda_graph_runner.as_mut()
     }
 }
 

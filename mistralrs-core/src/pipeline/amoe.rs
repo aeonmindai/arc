@@ -47,6 +47,8 @@ pub struct AnyMoeLoader {
 pub struct AnyMoePipeline {
     target: Arc<tokio::sync::Mutex<dyn Pipeline>>,
     config: AnyMoeConfig,
+    #[cfg(feature = "cuda")]
+    cuda_graph_runner: Option<arc_cuda_graph::CudaGraphRunner>,
 }
 
 impl Loader for AnyMoeLoader {
@@ -159,7 +161,12 @@ impl AnyMoePipeline {
         layers: Vec<usize>,
         silent: bool,
     ) -> anyhow::Result<Self> {
-        let this = Self { target, config };
+        let this = Self {
+            target,
+            config,
+            #[cfg(feature = "cuda")]
+            cuda_graph_runner: None,
+        };
         info!("Loaded pretraining dataset of {} samples.", inputs.len());
         match this.amoe_pre_train(
             inputs,
@@ -271,6 +278,10 @@ impl Pipeline for AnyMoePipeline {
 
     fn category(&self) -> ModelCategory {
         get_mut_arcmutex!(self.target).category()
+    }
+    #[cfg(feature = "cuda")]
+    fn cuda_graph_runner_mut(&mut self) -> Option<&mut arc_cuda_graph::CudaGraphRunner> {
+        self.cuda_graph_runner.as_mut()
     }
 }
 

@@ -5,7 +5,7 @@
 </h1>
 
 <h3 align="center">
-Inference at the speed of physics, not software.
+Inference at the speed of physics.
 </h3>
 
 <p align="center">
@@ -19,7 +19,9 @@ Inference at the speed of physics, not software.
 
 ---
 
-Arc is a high-performance LLM inference engine that extends [mistral.rs](https://github.com/EricLBuehler/mistral.rs) with **TurboQuant** — near-optimal KV cache compression from Google Research (ICLR 2026). The default 3.5-bit configuration (K4/V3) is **lossless**: identical LongBench scores to FP16, with 2.2x memory reduction.
+Arc is a high-performance LLM inference engine targeting **120 tokens/second** on Qwen3-32B BF16 on a single B200 — 97% of theoretical HBM bandwidth utilization. Built on [mistral.rs](https://github.com/EricLBuehler/mistral.rs) with CUDA graph capture, fused kernels, and **TurboQuant** KV cache compression (ICLR 2026, lossless 4.27x context scaling).
+
+[Peak Inference Plan](docs/PEAK_INFERENCE.md) — the full technical roadmap to 120 tok/s.
 
 ## What Arc Adds
 
@@ -28,7 +30,9 @@ Arc is a high-performance LLM inference engine that extends [mistral.rs](https:/
 | **TurboQuant KV cache** | 4-bit K / 3-bit V sub-byte packing with WHT rotation + Lloyd-Max codebooks. 4.27x context on H100. | ✅ |
 | **Fused attention kernels** | CUDA kernels that read packed KV directly — codebook lookup in the attention inner loop | ✅ |
 | **3 compression presets** | Default (3.5-bit, lossless), Balanced (3.0-bit), Aggressive (2.5-bit) | ✅ |
-| CUDA graph capture | Zero-overhead decode for common batch sizes | Planned |
+| **GPU-autonomous decode** | Entire decode loop (forward + sampling + EOS check) runs on GPU without CPU involvement. CUDA 12.4 conditional graph nodes. | In progress |
+| **Fused GPU sampling** | Argmax, top-p, penalties — all on GPU inside the captured graph. No CPU round-trip per token. | Planned |
+| **Zero-copy token streaming** | GPU writes tokens to pinned host ring buffer. CPU streams to clients without synchronizing the decode loop. | Planned |
 | Elastic tensor parallelism | Per-request GPU allocation, TP=1 to TP=8 dynamically | Planned |
 | Disaggregated serving | Prefill-decode separation with KV-aware routing | Planned |
 

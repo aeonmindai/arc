@@ -156,6 +156,8 @@ pub struct SpeculativePipeline {
     gamma: usize,
     metadata: Arc<GeneralMetadata>,
     category: ModelCategory,
+    #[cfg(feature = "cuda")]
+    cuda_graph_runner: Option<arc_cuda_graph::CudaGraphRunner>,
 }
 
 #[derive(Copy, Clone)]
@@ -269,6 +271,8 @@ impl SpeculativePipeline {
             gamma: config.gamma,
             metadata,
             category,
+            #[cfg(feature = "cuda")]
+            cuda_graph_runner: None,
         })
     }
 }
@@ -949,6 +953,10 @@ impl Pipeline for SpeculativePipeline {
     }
     fn category(&self) -> ModelCategory {
         self.category.clone()
+    }
+    #[cfg(feature = "cuda")]
+    fn cuda_graph_runner_mut(&mut self) -> Option<&mut arc_cuda_graph::CudaGraphRunner> {
+        self.cuda_graph_runner.as_mut()
     }
 }
 

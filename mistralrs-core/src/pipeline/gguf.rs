@@ -83,6 +83,8 @@ pub struct GGUFPipeline {
     non_granular_state: Option<NonGranularState>,
     metadata: Arc<GeneralMetadata>,
     mapper: Box<dyn DeviceMapper + Send + Sync>,
+    #[cfg(feature = "cuda")]
+    cuda_graph_runner: Option<arc_cuda_graph::CudaGraphRunner>,
 }
 
 /// Loader for a GGUF model.
@@ -614,6 +616,21 @@ impl Loader for GGUFLoader {
                 },
             }),
             mapper: pipeline_mapper,
+            #[cfg(feature = "cuda")]
+            cuda_graph_runner: {
+                let dev = match &model {
+                    Model::Llama(ref m) => &m.device,
+                    Model::Phi2(ref m) => &m.device,
+                    Model::XLoraLlama(ref m) => &m.device,
+                    Model::Phi3(ref m) => &m.device,
+                    Model::XLoraPhi3(ref m) => &m.device,
+                    Model::Starcoder2(ref m) => &m.device,
+                    Model::Qwen(ref m) => &m.device,
+                    Model::Qwen3(ref m) => &m.device,
+                    Model::Qwen3MoE(ref m) => &m.device,
+                };
+                arc_cuda_graph::try_init_graph_runner(dev)
+            },
         })))
     }
 
@@ -825,6 +842,10 @@ impl Pipeline for GGUFPipeline {
     }
     fn category(&self) -> ModelCategory {
         ModelCategory::Text
+    }
+    #[cfg(feature = "cuda")]
+    fn cuda_graph_runner_mut(&mut self) -> Option<&mut arc_cuda_graph::CudaGraphRunner> {
+        self.cuda_graph_runner.as_mut()
     }
 }
 

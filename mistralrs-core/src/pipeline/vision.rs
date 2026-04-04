@@ -86,6 +86,8 @@ pub struct VisionPipeline {
     processor_filename: Option<PathBuf>,
     preprocessor_filename: Option<PathBuf>,
     imatrix: Option<PathBuf>,
+    #[cfg(feature = "cuda")]
+    cuda_graph_runner: Option<arc_cuda_graph::CudaGraphRunner>,
 }
 
 /// A loader for a vision (non-quantized) model.
@@ -904,6 +906,8 @@ impl Loader for VisionLoader {
             preprocessor_filename: paths.get_preprocessor_config().clone(),
             mapper: pipeline_mapper,
             imatrix: self.config.imatrix.clone(),
+            #[cfg(feature = "cuda")]
+            cuda_graph_runner: arc_cuda_graph::try_init_graph_runner(model.device()),
         })))
     }
 
@@ -1101,6 +1105,10 @@ impl Pipeline for VisionPipeline {
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
     )> {
         self.model.encoder_cache_counters()
+    }
+    #[cfg(feature = "cuda")]
+    fn cuda_graph_runner_mut(&mut self) -> Option<&mut arc_cuda_graph::CudaGraphRunner> {
+        self.cuda_graph_runner.as_mut()
     }
 }
 

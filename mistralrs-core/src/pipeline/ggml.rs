@@ -58,6 +58,8 @@ pub struct GGMLPipeline {
     model_id: String,
     non_granular_state: Option<NonGranularState>,
     metadata: Arc<GeneralMetadata>,
+    #[cfg(feature = "cuda")]
+    cuda_graph_runner: Option<arc_cuda_graph::CudaGraphRunner>,
 }
 
 /// A loader for a GGML model.
@@ -399,6 +401,14 @@ impl Loader for GGMLLoader {
                     output: vec![SupportedModality::Text],
                 },
             }),
+            #[cfg(feature = "cuda")]
+            cuda_graph_runner: {
+                let dev = match &model {
+                    Model::Llama(ref m) => &m.device,
+                    Model::XLoraLlama(ref m) => &m.device,
+                };
+                arc_cuda_graph::try_init_graph_runner(dev)
+            },
         })))
     }
 
@@ -572,6 +582,10 @@ impl Pipeline for GGMLPipeline {
     }
     fn category(&self) -> ModelCategory {
         ModelCategory::Text
+    }
+    #[cfg(feature = "cuda")]
+    fn cuda_graph_runner_mut(&mut self) -> Option<&mut arc_cuda_graph::CudaGraphRunner> {
+        self.cuda_graph_runner.as_mut()
     }
 }
 

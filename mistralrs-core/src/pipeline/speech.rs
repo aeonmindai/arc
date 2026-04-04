@@ -146,6 +146,8 @@ pub struct SpeechPipeline {
     metadata: Arc<GeneralMetadata>,
     dummy_cache: EitherCache,
     cfg: SpeechGenerationConfig,
+    #[cfg(feature = "cuda")]
+    cuda_graph_runner: Option<arc_cuda_graph::CudaGraphRunner>,
 }
 
 pub struct SpeechLoader {
@@ -327,6 +329,8 @@ impl Loader for SpeechLoader {
             cfg: self
                 .cfg
                 .unwrap_or_else(|| SpeechGenerationConfig::default(self.arch)),
+            #[cfg(feature = "cuda")]
+            cuda_graph_runner: arc_cuda_graph::try_init_graph_runner(model.device()),
         })))
     }
 
@@ -436,6 +440,10 @@ impl Pipeline for SpeechPipeline {
 
     fn category(&self) -> ModelCategory {
         ModelCategory::Speech
+    }
+    #[cfg(feature = "cuda")]
+    fn cuda_graph_runner_mut(&mut self) -> Option<&mut arc_cuda_graph::CudaGraphRunner> {
+        self.cuda_graph_runner.as_mut()
     }
 }
 

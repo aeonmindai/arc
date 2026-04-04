@@ -70,6 +70,7 @@ bytemuck_derive.workspace = true
 mistralrs-paged-attn = { workspace = true, optional = true }
 mistralrs-quant.workspace = true
 arc-turbo = { path = "../arc-turbo" }
+arc-cuda-graph = { path = "../arc-cuda-graph", optional = true, features = [] }
 uuid = { workspace = true, features = ["v4"] }
 utoipa = { workspace = true, optional = true }
 schemars.workspace = true
@@ -122,6 +123,8 @@ cuda = [
     "mistralrs-quant/cuda",
     "dep:mistralrs-paged-attn",
     "mistralrs-paged-attn/cuda",
+    "dep:arc-cuda-graph",
+    "arc-cuda-graph/cuda",
 ]
 cudnn = ["candle-core/cudnn"]
 metal = [

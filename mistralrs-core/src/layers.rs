@@ -2174,6 +2174,30 @@ impl Module for QLinear {
 }
 
 #[derive(Debug, Clone)]
+/// Thread-local GPU positions tensor for CUDA graph mode.
+/// When set, `RotaryEmbedding::forward()` uses GPU-side gather instead of
+/// CPU-side `narrow()`, making the forward pass graph-capture compatible.
+///
+/// Set this before calling the model's forward pass during graph capture.
+/// Clear it after capture completes.
+#[cfg(feature = "cuda")]
+std::thread_local! {
+    static GRAPH_MODE_POSITIONS: std::cell::RefCell<Option<Tensor>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Set GPU positions for graph-mode RoPE. Call before graph-captured forward pass.
+#[cfg(feature = "cuda")]
+pub fn set_graph_mode_positions(positions: Option<Tensor>) {
+    GRAPH_MODE_POSITIONS.with(|p| *p.borrow_mut() = positions);
+}
+
+/// Check if graph-mode positions are set.
+#[cfg(feature = "cuda")]
+pub fn has_graph_mode_positions() -> bool {
+    GRAPH_MODE_POSITIONS.with(|p| p.borrow().is_some())
+}
+
+#[derive(Debug, Clone)]
 pub struct RotaryEmbedding {
     cos: Tensor,
     sin: Tensor,
@@ -2255,6 +2279,46 @@ impl RotaryEmbedding {
         } else {
             candle_nn::rotary_emb::rope_i
         };
+
+        // CUDA graph mode: use GPU positions tensor for graph-capture-safe RoPE.
+        // The gather_rope kernel reads positions from GPU memory (stable address),
+        // enabling the WHILE loop to update positions between iterations.
+        #[cfg(feature = "cuda")]
+        if seq_len == 1 {
+            let use_graph_rope = GRAPH_MODE_POSITIONS.with(|p| p.borrow().is_some());
+            if use_graph_rope {
+                return GRAPH_MODE_POSITIONS.with(|p| {
+                    let p = p.borrow();
+                    let positions = p.as_ref().unwrap();
+                    // Gather cos/sin using GPU positions: index_select on dim 0
+                    // positions: [batch] i64 → index into cos/sin: [max_seq_len, rot_dim]
+                    let positions_i64 = positions.to_dtype(DType::U32)?;
+                    let cos = self.cos.index_select(&positions_i64, 0)?; // [batch, rot_dim]
+                    let sin = self.sin.index_select(&positions_i64, 0)?; // [batch, rot_dim]
+
+                    let q_embed = q.transpose(1, 2)?.flatten(0, 1)?; // [batch, heads, head_dim]
+                    let k_embed = k.transpose(1, 2)?.flatten(0, 1)?;
+                    mistralrs_quant::rotary::apply_rotary_inplace(
+                        &q_embed,
+                        &k_embed,
+                        &cos,
+                        &sin,
+                        self.is_gpt_neox,
+                    )?;
+                    let mut q = q_embed
+                        .reshape((b_sz, seq_len, qh, n_embd))?
+                        .transpose(1, 2)?;
+                    let mut k = k_embed
+                        .reshape((b_sz, seq_len, kh, n_embd))?
+                        .transpose(1, 2)?;
+                    if !(cfg!(feature = "flash-attn") || cfg!(feature = "flash-attn-v3")) {
+                        q = q.contiguous()?;
+                        k = k.contiguous()?;
+                    }
+                    Ok((q, k))
+                });
+            }
+        }
 
         if cfg!(feature = "cuda") && qh == kh {
             let (cos, sin) = if seqlen_offsets.len() == 1 {

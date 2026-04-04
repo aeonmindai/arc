@@ -436,6 +436,119 @@ pub trait Pipeline:
         return_raw_logits: bool,
     ) -> Result<ForwardInputsResult, candle_core::Error>;
 
+    /// Access the CUDA graph runner for decode acceleration.
+    /// Returns None by default. Pipelines on CUDA devices override this.
+    #[cfg(feature = "cuda")]
+    fn cuda_graph_runner_mut(&mut self) -> Option<&mut arc_cuda_graph::CudaGraphRunner> {
+        None
+    }
+
+    /// Access the autonomous decode runner for full GPU-autonomous generation.
+    /// Returns None by default. Initialized when autonomous decode is configured.
+    #[cfg(feature = "cuda")]
+    fn autonomous_runner_mut(&mut self) -> Option<&mut arc_cuda_graph::AutonomousDecodeRunner> {
+        None
+    }
+
+    /// Run a full autonomous decode loop (forward+sampling+step_update per iteration).
+    ///
+    /// This replaces the engine's step-by-step decode loop for sequences that can
+    /// be decoded entirely on GPU. Pre-allocated KV blocks must be set up before calling.
+    ///
+    /// Returns generated token IDs per sequence in the batch.
+    /// The ring buffer is polled for streaming output.
+    #[cfg(feature = "cuda")]
+    fn autonomous_decode(
+        &mut self,
+        _input_seqs: &mut [&mut crate::sequence::Sequence],
+    ) -> Result<Option<Vec<Vec<i32>>>, candle_core::Error> {
+        if let Some(runner) = self.autonomous_runner_mut() {
+            let tokens = runner.run_decode_loop()?;
+            Ok(Some(tokens))
+        } else {
+            Ok(None) // autonomous runner not available, fall back to step-by-step
+        }
+    }
+
+    /// Run forward_inputs, optionally wrapped in CUDA graph capture for decode steps.
+    /// For decode (!is_prompt): captures GPU kernels into a graph, then launches them as a batch.
+    /// For prompt: runs eagerly (variable sequence lengths don't benefit from graphs).
+    fn graph_wrapped_forward(
+        &mut self,
+        inputs: Box<dyn Any>,
+        is_prompt: bool,
+        return_raw_logits: bool,
+    ) -> Result<ForwardInputsResult, candle_core::Error> {
+        // CUDA graph path for decode steps
+        #[cfg(feature = "cuda")]
+        {
+            // Check if we should use graph capture (non-overlapping borrow)
+            let use_graph = if !is_prompt {
+                if let Some(runner) = self.cuda_graph_runner_mut() {
+                    if runner.tick_warmup() {
+                        false // still warming up
+                    } else if runner.is_enabled() {
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if use_graph {
+                // Set GPU positions for graph-mode RoPE.
+                // Extract seqlen_offsets from ModelInputs and create a GPU tensor.
+                use crate::layers::set_graph_mode_positions;
+
+                let positions_tensor = if let Some(model_inputs) = inputs.downcast_ref::<text_models_inputs_processor::ModelInputs>() {
+                    let offsets = &model_inputs.seqlen_offsets;
+                    let offsets_u32: Vec<u32> = offsets.iter().map(|&x| x as u32).collect();
+                    Tensor::from_vec(offsets_u32, offsets.len(), &self.device()).ok()
+                } else {
+                    None
+                };
+                set_graph_mode_positions(positions_tensor);
+
+                // 1. Begin capture (borrows self briefly for runner access)
+                if let Err(e) = self.cuda_graph_runner_mut().unwrap().begin_capture() {
+                    set_graph_mode_positions(None);
+                    tracing::debug!("CUDA graph begin_capture failed ({e}), running eagerly");
+                    return self.forward_inputs(inputs, return_raw_logits);
+                }
+
+                // 2. Run forward pass (self borrow — runner is NOT borrowed)
+                //    GPU kernels are captured, not executed.
+                let result = self.forward_inputs(inputs, return_raw_logits);
+
+                // 3. End capture and launch (borrows self briefly for runner access)
+                match &result {
+                    Ok(_) => {
+                        if let Err(e) = self.cuda_graph_runner_mut().unwrap().end_capture_and_launch() {
+                            set_graph_mode_positions(None);
+                            tracing::warn!("CUDA graph end_capture failed ({e}), result may be invalid");
+                            self.cuda_graph_runner_mut().unwrap().disable();
+                            return Err(e);
+                        }
+                    }
+                    Err(_) => {
+                        self.cuda_graph_runner_mut().unwrap().cancel_capture();
+                    }
+                }
+
+                // Clear graph-mode positions
+                set_graph_mode_positions(None);
+
+                return result;
+            }
+        }
+
+        self.forward_inputs(inputs, return_raw_logits)
+    }
+
     /// Returns the total of model execution time.
     #[allow(clippy::too_many_arguments)]
     async fn step(
@@ -729,7 +842,7 @@ pub trait Pipeline:
                     } = inputs.map_err(candle_core::Error::msg)?;
 
                     let start = Instant::now();
-                    let raw_logits = self.forward_inputs(inputs, return_raw_logits)?;
+                    let raw_logits = self.graph_wrapped_forward(inputs, is_prompt, return_raw_logits)?;
                     let end = Instant::now();
                     exec_duration += end.duration_since(start);
 
