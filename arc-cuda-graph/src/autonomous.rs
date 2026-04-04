@@ -80,7 +80,7 @@ impl AutonomousDecodeRunner {
         let Device::Cuda(cuda_dev) = device else {
             candle_core::bail!("Requires CUDA device");
         };
-        let stream = *cuda_dev.cuda_stream().cu_stream();
+        let stream = cuda_dev.cuda_stream().cu_stream();
 
         let input_buffers = DecodeInputBuffers::new(
             config.padded_batch_size, config.max_blocks_per_seq, device,
