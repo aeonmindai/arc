@@ -47,7 +47,7 @@ impl CudaGraphRunner {
         let Device::Cuda(cuda_dev) = device else {
             candle_core::bail!("CudaGraphRunner requires a CUDA device");
         };
-        let stream = unsafe { *cuda_dev.cu_stream() };
+        let stream = *cuda_dev.cuda_stream().cu_stream();
 
         Ok(Self {
             stream,

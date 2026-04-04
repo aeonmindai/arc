@@ -18,7 +18,7 @@ use candle_core::cuda::cudarc::driver::sys::CUstream;
 #[cfg(feature = "cuda")]
 use candle_core::cuda::cudarc::driver::DevicePtr;
 #[cfg(feature = "cuda")]
-use candle_core::{Device, Tensor};
+use candle_core::{Device, IndexOp, Tensor};
 
 #[cfg(feature = "cuda")]
 #[derive(Clone)]
@@ -58,14 +58,17 @@ unsafe impl Send for AutonomousDecodeRunner {}
 #[cfg(feature = "cuda")]
 unsafe impl Sync for AutonomousDecodeRunner {}
 
+/// Get raw GPU pointer from a Candle tensor as a usize (for casting to *mut/*const).
 #[cfg(feature = "cuda")]
-fn tensor_ptr(t: &Tensor) -> candle_core::Result<*mut std::ffi::c_void> {
+fn tensor_ptr(t: &Tensor) -> candle_core::Result<usize> {
+    let t = t.contiguous()?;
     let (storage, layout) = t.storage_and_layout();
-    let offset = layout.start_offset();
     match &*storage {
         candle_core::Storage::Cuda(cuda_storage) => {
-            let ptr = cuda_storage.as_cuda_slice::<u8>()?.device_ptr();
-            Ok((*ptr as usize + offset) as *mut std::ffi::c_void)
+            let slice = cuda_storage.as_cuda_slice::<u8>()?;
+            let (ptr, _guard) = slice.device_ptr(slice.stream());
+            let offset_bytes = layout.start_offset() * t.dtype().size_in_bytes();
+            Ok(ptr as usize + offset_bytes)
         }
         _ => candle_core::bail!("tensor_ptr requires CUDA tensor"),
     }
@@ -77,7 +80,7 @@ impl AutonomousDecodeRunner {
         let Device::Cuda(cuda_dev) = device else {
             candle_core::bail!("Requires CUDA device");
         };
-        let stream = unsafe { *cuda_dev.cu_stream() };
+        let stream = *cuda_dev.cuda_stream().cu_stream();
 
         let input_buffers = DecodeInputBuffers::new(
             config.padded_batch_size, config.max_blocks_per_seq, device,
@@ -304,10 +307,10 @@ impl AutonomousDecodeRunner {
     {
         // Forward pass
         let logits = forward_fn()?;
-        let logits_ptr = tensor_ptr(&logits)? as *const std::ffi::c_void;
+        let logits_ptr = tensor_ptr(&logits)? as *const _;
 
         // Sampling
-        let sampled_ptr = tensor_ptr(&self.decode_state.sampled_tokens)? as *mut i32;
+        let sampled_ptr = tensor_ptr(&self.decode_state.sampled_tokens)? as *mut _;
 
         unsafe {
             if self.config.greedy {
