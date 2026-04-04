@@ -513,28 +513,32 @@ pub trait Pipeline:
                 };
                 set_graph_mode_positions(positions_tensor);
 
-                // 1. Begin capture (borrows self briefly for runner access)
+                // 1. Begin capture
+                tracing::warn!("CUDA graph: attempting begin_capture for decode step");
                 if let Err(e) = self.cuda_graph_runner_mut().unwrap().begin_capture() {
                     set_graph_mode_positions(None);
-                    tracing::debug!("CUDA graph begin_capture failed ({e}), running eagerly");
+                    tracing::warn!("CUDA graph: begin_capture FAILED ({e}), falling back to eager");
                     return self.forward_inputs(inputs, return_raw_logits);
                 }
+                tracing::warn!("CUDA graph: begin_capture succeeded, running forward under capture");
 
-                // 2. Run forward pass (self borrow — runner is NOT borrowed)
-                //    GPU kernels are captured, not executed.
+                // 2. Run forward pass — GPU kernels captured, not executed
                 let result = self.forward_inputs(inputs, return_raw_logits);
 
-                // 3. End capture and launch (borrows self briefly for runner access)
+                // 3. End capture and launch
                 match &result {
                     Ok(_) => {
+                        tracing::warn!("CUDA graph: forward succeeded, calling end_capture_and_launch");
                         if let Err(e) = self.cuda_graph_runner_mut().unwrap().end_capture_and_launch() {
                             set_graph_mode_positions(None);
-                            tracing::warn!("CUDA graph end_capture failed ({e}), result may be invalid");
+                            tracing::warn!("CUDA graph: end_capture_and_launch FAILED ({e})");
                             self.cuda_graph_runner_mut().unwrap().disable();
                             return Err(e);
                         }
+                        tracing::warn!("CUDA graph: decode step completed via graph launch");
                     }
-                    Err(_) => {
+                    Err(ref e) => {
+                        tracing::warn!("CUDA graph: forward FAILED during capture ({e}), canceling");
                         self.cuda_graph_runner_mut().unwrap().cancel_capture();
                     }
                 }
