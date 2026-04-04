@@ -16,6 +16,8 @@ pub type CUgraphConditionalHandle = u64;
 pub const CUDA_SUCCESS: u32 = 0;
 #[cfg(feature = "cuda")]
 pub const CUDA_HOST_ALLOC_MAPPED: u32 = 0x02;
+#[cfg(feature = "cuda")]
+pub const CU_STREAM_NON_BLOCKING: u32 = 0x01;
 
 #[cfg(feature = "cuda")]
 #[repr(u32)]
@@ -150,8 +152,10 @@ extern "C" {
     ) -> u32;
 
     // ========================================================================
-    // Stream and memory
+    // Stream creation and management
     // ========================================================================
+    pub fn cuStreamCreate(stream: *mut CUstream, flags: u32) -> u32;
+    pub fn cuStreamDestroy_v2(stream: CUstream) -> u32;
     pub fn cudaStreamSynchronize(stream: CUstream) -> u32;
 
     pub fn cudaHostAlloc(

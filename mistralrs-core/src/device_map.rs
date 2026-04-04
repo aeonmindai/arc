@@ -651,7 +651,7 @@ pub fn get_all_similar_devices(base: &Device) -> Result<Vec<Device>> {
                     continue;
                 }
                 // Needs to be without a stream as PagedAttention doesn't like it otherwise.
-                if let Ok(dev) = Device::new_cuda(ord) {
+                if let Ok(dev) = Device::new_cuda_with_stream(ord) {
                     devices.push(dev);
                     ord += 1;
                 } else {

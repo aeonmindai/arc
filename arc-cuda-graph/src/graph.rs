@@ -1,14 +1,8 @@
 //! Model-agnostic CUDA graph capture and replay for decode steps.
 //!
-//! # How it works
-//!
-//! On every decode step:
-//! 1. `begin_capture()` — starts recording GPU kernels (not executed)
-//! 2. Run the normal forward pass — CPU code runs, GPU kernels are captured
-//! 3. `end_capture_and_launch()` — builds/updates graph, launches all kernels as one batch
-//!
-//! Total overhead: ~50-100μs vs 3-7ms of individual kernel launches.
-//! No model-specific code. Works with any Candle forward pass.
+//! Creates a dedicated non-blocking stream for graph capture.
+//! The legacy default stream (NULL/stream 0) does NOT support capture —
+//! that's what Candle uses by default via `CudaDevice::new()`.
 
 #[cfg(feature = "cuda")]
 use crate::ffi::*;
@@ -18,18 +12,17 @@ use candle_core::cuda::cudarc::driver::sys::CUstream;
 use candle_core::Device;
 
 /// Model-agnostic CUDA graph runner for decode acceleration.
-///
-/// The API is split into `begin_capture()` / `end_capture_and_launch()` to
-/// avoid holding a mutable borrow during the forward pass.
 #[cfg(feature = "cuda")]
 pub struct CudaGraphRunner {
-    stream: CUstream,
-    /// Cached graph executable (reused across steps via cuGraphExecUpdate)
+    /// The device's actual stream (where Candle runs kernels)
+    device_stream: CUstream,
+    /// Our dedicated non-blocking stream for graph capture
+    capture_stream: CUstream,
+    /// Whether we own capture_stream and need to destroy it
+    owns_capture_stream: bool,
     graph_exec: Option<CUgraphExec>,
     enabled: bool,
-    /// Warmup steps remaining before enabling capture
     warmup_remaining: u32,
-    /// Whether we're currently inside a capture
     capturing: bool,
 }
 
@@ -40,17 +33,35 @@ unsafe impl Sync for CudaGraphRunner {}
 
 #[cfg(feature = "cuda")]
 impl CudaGraphRunner {
-    /// Create a new graph runner.
-    ///
-    /// `warmup_steps`: eager decode steps before enabling graph capture (cuBLAS stabilization).
     pub fn new(device: &Device, warmup_steps: u32) -> candle_core::Result<Self> {
         let Device::Cuda(cuda_dev) = device else {
             candle_core::bail!("CudaGraphRunner requires a CUDA device");
         };
-        let stream = cuda_dev.cuda_stream().cu_stream();
+        let device_stream = cuda_dev.cuda_stream().cu_stream();
+
+        // Check if the device stream is the legacy NULL stream
+        let (capture_stream, owns) = if device_stream.is_null() {
+            // Legacy default stream — cannot be captured.
+            // Create a dedicated non-blocking stream for capture.
+            let mut new_stream: CUstream = std::ptr::null_mut();
+            let status = unsafe { cuStreamCreate(&mut new_stream, CU_STREAM_NON_BLOCKING) };
+            if status != CUDA_SUCCESS {
+                candle_core::bail!("cuStreamCreate for graph capture failed: CUDA error {status}");
+            }
+            tracing::info!(
+                "CUDA graph: device uses legacy NULL stream, created dedicated capture stream"
+            );
+            (new_stream, true)
+        } else {
+            // Device already has a non-default stream — use it directly
+            tracing::info!("CUDA graph: device has non-default stream, using it for capture");
+            (device_stream, false)
+        };
 
         Ok(Self {
-            stream,
+            device_stream,
+            capture_stream,
+            owns_capture_stream: owns,
             graph_exec: None,
             enabled: true,
             warmup_remaining: warmup_steps,
@@ -62,8 +73,6 @@ impl CudaGraphRunner {
         self.enabled && self.warmup_remaining == 0
     }
 
-    /// Check if still in warmup phase. Decrements warmup counter.
-    /// Returns true if we should run eagerly (warmup not done).
     pub fn tick_warmup(&mut self) -> bool {
         if self.warmup_remaining > 0 {
             self.warmup_remaining -= 1;
@@ -76,25 +85,55 @@ impl CudaGraphRunner {
         }
     }
 
-    /// Begin capturing GPU operations on the stream.
+    /// Begin capturing GPU operations.
     ///
-    /// After this call, all GPU kernel launches on the device stream are
-    /// recorded but NOT executed. Call `end_capture_and_launch()` after
-    /// the forward pass to build the graph and execute it.
+    /// IMPORTANT: This captures on our dedicated non-blocking stream.
+    /// Candle operations run on the device's default stream. For the capture
+    /// to work, we need the forward pass kernels to run on our capture stream.
+    /// This is achieved by having the engine synchronize the device stream
+    /// and then all subsequent operations go to our stream.
+    ///
+    /// However, since Candle internally uses the device stream for all ops,
+    /// we capture on the DEVICE stream if it supports it. If the device stream
+    /// is NULL (legacy), we need a different approach — see below.
     pub fn begin_capture(&mut self) -> candle_core::Result<()> {
         if self.capturing {
             candle_core::bail!("Already capturing — cannot nest captures");
         }
-        unsafe {
-            // Synchronize stream before capture — pending operations prevent capture
-            cudaStreamSynchronize(self.stream);
 
-            // Use RELAXED mode — allows operations on other streams during capture.
-            // THREAD_LOCAL mode can fail (error 900) if the stream wasn't created
-            // with capture-compatible flags.
+        // If we're using a dedicated capture stream (because device stream is NULL),
+        // we can't capture Candle operations since they go to the NULL stream.
+        // In this case, graph capture doesn't work with the default Candle setup.
+        // We need the device to use new_cuda_with_stream() instead.
+        if self.owns_capture_stream {
+            // The device uses the legacy NULL stream. Candle operations go there.
+            // Our capture stream is different — Candle won't launch kernels on it.
+            // We CANNOT capture Candle's forward pass on our stream.
+            //
+            // The fix must happen at the device level: use Device::new_cuda_with_stream()
+            // instead of Device::new_cuda(). This creates a real non-blocking stream
+            // that supports capture.
+            //
+            // For now, disable graph capture and log a clear message.
+            tracing::warn!(
+                "CUDA graph: device uses legacy NULL stream which cannot be captured. \
+                 To enable CUDA graphs, the device must be created with \
+                 Device::new_cuda_with_stream() instead of Device::new_cuda(). \
+                 Disabling graph capture."
+            );
+            self.enabled = false;
+            candle_core::bail!(
+                "CUDA graph capture requires a non-legacy stream. \
+                 Device must use new_cuda_with_stream()."
+            );
+        }
+
+        unsafe {
+            cudaStreamSynchronize(self.capture_stream);
+
             let status = cuStreamBeginCapture_v2(
-                self.stream,
-                CUstreamCaptureMode::RELAXED,
+                self.capture_stream,
+                CUstreamCaptureMode::THREAD_LOCAL,
             );
             if status != CUDA_SUCCESS {
                 self.enabled = false;
@@ -105,27 +144,21 @@ impl CudaGraphRunner {
         Ok(())
     }
 
-    /// End capture, update/instantiate the graph executable, and launch it.
-    ///
-    /// This must be called after `begin_capture()` and the forward pass.
-    /// All captured GPU kernels are executed as a single graph launch.
     pub fn end_capture_and_launch(&mut self) -> candle_core::Result<()> {
         if !self.capturing {
             candle_core::bail!("Not capturing — call begin_capture() first");
         }
         self.capturing = false;
 
-        // End capture → get graph template
         let mut graph: CUgraph = std::ptr::null_mut();
         unsafe {
-            let status = cuStreamEndCapture(self.stream, &mut graph);
+            let status = cuStreamEndCapture(self.capture_stream, &mut graph);
             if status != CUDA_SUCCESS {
                 self.enabled = false;
                 candle_core::bail!("cuStreamEndCapture failed: CUDA error {status}");
             }
         }
 
-        // Update existing graph exec or instantiate new one
         if let Some(exec) = self.graph_exec {
             let mut update_result = CUgraphExecUpdateResult::SUCCESS;
             let status = unsafe { cuGraphExecUpdate_v2(exec, graph, &mut update_result) };
@@ -133,16 +166,14 @@ impl CudaGraphRunner {
             if status != CUDA_SUCCESS
                 || update_result as u32 != CUgraphExecUpdateResult::SUCCESS as u32
             {
-                // Topology changed — full re-instantiate
                 tracing::debug!("CUDA graph: topology changed, re-instantiating");
                 unsafe { cuGraphExecDestroy(exec); }
                 self.graph_exec = None;
                 self.instantiate_and_launch(graph)?;
             } else {
                 unsafe { cuGraphDestroy(graph); }
-                // Launch with updated exec
                 unsafe {
-                    let status = cuGraphLaunch(exec, self.stream);
+                    let status = cuGraphLaunch(exec, self.capture_stream);
                     if status != CUDA_SUCCESS {
                         self.enabled = false;
                         candle_core::bail!("cuGraphLaunch failed: CUDA error {status}");
@@ -150,21 +181,18 @@ impl CudaGraphRunner {
                 }
             }
         } else {
-            // First capture — instantiate
             self.instantiate_and_launch(graph)?;
         }
 
         Ok(())
     }
 
-    /// Cancel an in-progress capture (e.g., if forward_inputs failed).
     pub fn cancel_capture(&mut self) {
         if self.capturing {
             self.capturing = false;
-            // End the capture to return stream to normal mode
             let mut graph: CUgraph = std::ptr::null_mut();
             unsafe {
-                let _ = cuStreamEndCapture(self.stream, &mut graph);
+                let _ = cuStreamEndCapture(self.capture_stream, &mut graph);
                 if !graph.is_null() {
                     cuGraphDestroy(graph);
                 }
@@ -176,11 +204,8 @@ impl CudaGraphRunner {
         let mut exec: CUgraphExec = std::ptr::null_mut();
         let status = unsafe {
             cuGraphInstantiate_v2(
-                &mut exec,
-                graph,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                0,
+                &mut exec, graph,
+                std::ptr::null_mut(), std::ptr::null_mut(), 0,
             )
         };
         unsafe { cuGraphDestroy(graph); }
@@ -190,12 +215,11 @@ impl CudaGraphRunner {
             candle_core::bail!("cuGraphInstantiate failed: CUDA error {status}");
         }
 
-        tracing::info!("CUDA graph: instantiated");
+        tracing::info!("CUDA graph: instantiated successfully");
         self.graph_exec = Some(exec);
 
-        // Launch
         unsafe {
-            let status = cuGraphLaunch(exec, self.stream);
+            let status = cuGraphLaunch(exec, self.capture_stream);
             if status != CUDA_SUCCESS {
                 self.enabled = false;
                 candle_core::bail!("cuGraphLaunch failed: CUDA error {status}");
@@ -216,6 +240,9 @@ impl Drop for CudaGraphRunner {
         self.cancel_capture();
         if let Some(exec) = self.graph_exec {
             unsafe { cuGraphExecDestroy(exec); }
+        }
+        if self.owns_capture_stream && !self.capture_stream.is_null() {
+            unsafe { cuStreamDestroy_v2(self.capture_stream); }
         }
     }
 }
