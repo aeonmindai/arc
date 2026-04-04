@@ -6,6 +6,7 @@
 .idea
 mistral.rs/
 mistralrs-web-chat/cache
+modal_docs/
 
 # mdbook output
 docs/book/

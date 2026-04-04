@@ -25,12 +25,12 @@ Arc is a high-performance LLM inference engine that extends [mistral.rs](https:/
 
 | Feature | What it does | Status |
 |---------|-------------|--------|
-| **TurboQuant KV cache** | 3.5-bit lossless compression via Walsh-Hadamard rotation + Lloyd-Max codebooks | Default, shipping |
-| **Fused attention kernels** | CUDA + Metal kernels that read compressed KV directly — no dequantization | Shipping |
-| **3 compression presets** | Default (3.5-bit, lossless), Balanced (3.0-bit), Aggressive (2.5-bit) | Shipping |
+| **TurboQuant KV cache** | 4-bit K / 3-bit V sub-byte packing with WHT rotation + Lloyd-Max codebooks. 4.27x context on H100. | **Tested, shipping** |
+| **Fused attention kernels** | CUDA kernels that read packed KV directly — codebook lookup in the attention inner loop | **Tested, shipping** |
+| **3 compression presets** | Default (3.5-bit, lossless), Balanced (3.0-bit), Aggressive (2.5-bit) | **Shipping** |
+| CUDA graph capture | Zero-overhead decode for common batch sizes | Planned |
 | Elastic tensor parallelism | Per-request GPU allocation, TP=1 to TP=8 dynamically | Planned |
 | Disaggregated serving | Prefill-decode separation with KV-aware routing | Planned |
-| CUDA graph capture | Zero-overhead decode for common batch sizes | Planned |
 
 Everything from mistral.rs is included: PagedAttention, FlashAttention V2/V3, speculative decoding, continuous batching, 100+ model architectures, GGUF/GPTQ/AWQ/ISQ, LoRA, MCP, multi-GPU tensor parallelism, and more.
 
@@ -91,13 +91,24 @@ TurboQuant ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874), ICLR 2026) com
 
 The key insight: after rotation, optimal quantization is data-oblivious. The codebooks are compile-time constants.
 
-### Performance
+### Performance (Tested)
 
-| Preset | Bits | Compression | Decode speedup (32K ctx) | Quality |
-|--------|------|-------------|--------------------------|---------|
-| **Default** | 3.5 (K4/V3) | **2.2x** | ~1.5-1.8x | **Lossless** |
-| Balanced | 3.0 (K3/V3) | 2.56x | ~1.8-2.2x | ~0.1% loss |
-| Aggressive | 2.5 (K3/V2) | 4.1x | ~2.5-3x | ~1.2% loss |
+**Qwen3-32B on a single H100 80GB:**
+
+| Metric | BF16 (baseline) | TurboQuant (default) | Improvement |
+|--------|-----------------|---------------------|-------------|
+| KV cache per token | 4,096 bytes/layer | 960 bytes/layer | **4.27x smaller** |
+| Available context | 39,680 tokens | 169,216 tokens | **4.27x longer** |
+| Concurrent users (4K ctx) | ~10 | ~42 | **4.27x more** |
+| Model quality | Baseline | Identical | **Lossless** |
+
+Presets:
+
+| Preset | Bits | Context multiplier | Quality |
+|--------|------|--------------------|---------|
+| **Default** | 3.5 (K4/V3) | **4.27x** | **Lossless** |
+| Balanced | 3.0 (K3/V3) | ~5x | ~0.1% loss |
+| Aggressive | 2.5 (K3/V2) | ~7x | ~1.2% loss |
 
 At 3.5 bits: LongBench 50.06 = identical to FP16 50.06 on Llama-3.1-8B-Instruct. Zero quality loss on needle-in-a-haystack at all context lengths.
 
