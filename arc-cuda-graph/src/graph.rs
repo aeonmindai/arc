@@ -89,9 +89,12 @@ impl CudaGraphRunner {
             // Synchronize stream before capture — pending operations prevent capture
             cudaStreamSynchronize(self.stream);
 
+            // Use RELAXED mode — allows operations on other streams during capture.
+            // THREAD_LOCAL mode can fail (error 900) if the stream wasn't created
+            // with capture-compatible flags.
             let status = cuStreamBeginCapture_v2(
                 self.stream,
-                CUstreamCaptureMode::THREAD_LOCAL,
+                CUstreamCaptureMode::RELAXED,
             );
             if status != CUDA_SUCCESS {
                 self.enabled = false;
