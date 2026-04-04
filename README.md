@@ -25,9 +25,9 @@ Arc is a high-performance LLM inference engine that extends [mistral.rs](https:/
 
 | Feature | What it does | Status |
 |---------|-------------|--------|
-| **TurboQuant KV cache** | 4-bit K / 3-bit V sub-byte packing with WHT rotation + Lloyd-Max codebooks. 4.27x context on H100. | **Shipping** |
-| **Fused attention kernels** | CUDA kernels that read packed KV directly — codebook lookup in the attention inner loop | **Shipping** |
-| **3 compression presets** | Default (3.5-bit, lossless), Balanced (3.0-bit), Aggressive (2.5-bit) | **Shipping** |
+| **TurboQuant KV cache** | 4-bit K / 3-bit V sub-byte packing with WHT rotation + Lloyd-Max codebooks. 4.27x context on H100. | ✅ |
+| **Fused attention kernels** | CUDA kernels that read packed KV directly — codebook lookup in the attention inner loop | ✅ |
+| **3 compression presets** | Default (3.5-bit, lossless), Balanced (3.0-bit), Aggressive (2.5-bit) | ✅ |
 | CUDA graph capture | Zero-overhead decode for common batch sizes | Planned |
 | Elastic tensor parallelism | Per-request GPU allocation, TP=1 to TP=8 dynamically | Planned |
 | Disaggregated serving | Prefill-decode separation with KV-aware routing | Planned |
