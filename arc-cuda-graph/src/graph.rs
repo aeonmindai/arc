@@ -86,6 +86,9 @@ impl CudaGraphRunner {
             candle_core::bail!("Already capturing — cannot nest captures");
         }
         unsafe {
+            // Synchronize stream before capture — pending operations prevent capture
+            cudaStreamSynchronize(self.stream);
+
             let status = cuStreamBeginCapture_v2(
                 self.stream,
                 CUstreamCaptureMode::THREAD_LOCAL,
