@@ -19,7 +19,7 @@ pub use buffers::{DecodeInputBuffers, DecodeState};
 #[cfg(feature = "cuda")]
 pub use autonomous::{AutonomousDecodeConfig, AutonomousDecodeRunner};
 #[cfg(feature = "cuda")]
-pub use weights::{ModelWeights, DecodeConfig, LayerWeights, WeightPtr, tensor_device_ptr};
+pub use weights::{ModelWeights, DecodeConfig, LayerWeights, WeightPtr, tensor_device_ptr, extract_model_weights, quant_method_ptr};
 #[cfg(feature = "cuda")]
 pub use decode_forward::{DecodeBuffers, CublasState, decode_forward};
 
