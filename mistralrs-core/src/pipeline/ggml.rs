@@ -377,7 +377,7 @@ impl Loader for GGMLLoader {
                 Model::Llama(ref m) => &m.device,
                 Model::XLoraLlama(ref m) => &m.device,
             };
-            dev.clone()
+            dev.with_capturable_stream().unwrap_or_else(|_| dev.clone())
         };
 
         Ok(Arc::new(Mutex::new(GGMLPipeline {

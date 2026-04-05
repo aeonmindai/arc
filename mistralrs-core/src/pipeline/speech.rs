@@ -304,7 +304,7 @@ impl Loader for SpeechLoader {
         let model = DiaPipeline::new(&cfg, vb, dac_vb)?;
 
         #[cfg(feature = "cuda")]
-        let _graph_device = model.device().clone();
+        let _graph_device = model.device().with_capturable_stream().unwrap_or_else(|_| model.device().clone());
 
         Ok(Arc::new(Mutex::new(SpeechPipeline {
             model_id: self.model_id.clone(),

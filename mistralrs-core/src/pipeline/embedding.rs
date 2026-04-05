@@ -620,7 +620,7 @@ impl Loader for EmbeddingLoader {
         let max_seq_len = self.inner.model_config(&config)?.max_seq_len();
 
         #[cfg(feature = "cuda")]
-        let _graph_device = model.device().clone();
+        let _graph_device = model.device().with_capturable_stream().unwrap_or_else(|_| model.device().clone());
 
         Ok(Arc::new(Mutex::new(EmbeddingPipeline {
             model,
