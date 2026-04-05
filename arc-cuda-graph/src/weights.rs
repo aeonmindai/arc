@@ -105,7 +105,7 @@ pub fn quant_method_ptr(qm: &dyn mistralrs_quant::QuantMethod) -> candle_core::R
 #[cfg(feature = "cuda")]
 pub fn extract_model_weights(
     layers: &[(&std::sync::Arc<dyn mistralrs_quant::QuantMethod>, Option<usize>)],
-    residuals: &[(String, Tensor)],
+    residuals: &[(String, candle_core::Tensor)],
     config: DecodeConfig,
 ) -> candle_core::Result<ModelWeights> {
     let num_layers = config.num_layers;

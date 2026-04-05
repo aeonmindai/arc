@@ -87,9 +87,11 @@ pub struct NormalPipeline {
     mapper: Box<dyn DeviceMapper + Send + Sync>,
     #[cfg(feature = "cuda")]
     cuda_graph_runner: Option<arc_cuda_graph::CudaGraphRunner>,
-    /// The capturable device clone — kept alive so its stream isn't destroyed.
     #[cfg(feature = "cuda")]
     _capturable_device: Option<Device>,
+    /// Extracted model weight pointers for the dedicated decode path.
+    #[cfg(feature = "cuda")]
+    decode_weights: Option<arc_cuda_graph::ModelWeights>,
 }
 
 /// A loader for a "normal" (non-quantized) model.
@@ -1009,10 +1011,42 @@ impl Loader for NormalLoader {
         let sliding_window = model.config().sliding_window;
         let model_metadata = Arc::new(model.config().clone());
 
-        // The device already uses NonBlocking stream (our candle fork).
-        // No need for with_capturable_stream() — it's capturable from the start.
         #[cfg(feature = "cuda")]
         let _graph_device = model.device().clone();
+
+        // Extract weight pointers for the dedicated decode path (model-agnostic).
+        #[cfg(feature = "cuda")]
+        let _decode_weights = {
+            let cfg = model.config();
+            let residuals = model.residual_tensors();
+            let (mut layers_mut, _) = model.get_layers();
+            // Convert mutable refs to shared refs for pointer extraction
+            let layers_ref: Vec<_> = layers_mut.iter()
+                .map(|(l, idx)| (l as &std::sync::Arc<dyn mistralrs_quant::QuantMethod>, *idx))
+                .collect();
+            let decode_config = arc_cuda_graph::DecodeConfig {
+                num_layers: cfg.num_layers,
+                hidden_size: cfg.hidden_size,
+                num_heads: cfg.num_attn_heads,
+                num_kv_heads: cfg.num_kv_heads,
+                head_dim: cfg.k_head_dim,
+                intermediate_size: 0, // Filled from residuals or config
+                vocab_size: 0,
+                rms_norm_eps: 1e-6,
+                rope_theta: 1e6,
+                has_qk_norm: false,
+            };
+            match arc_cuda_graph::extract_model_weights(&layers_ref, &residuals, decode_config) {
+                Ok(w) => {
+                    tracing::info!("Decode path: {} layers extracted", w.layers.len());
+                    Some(w)
+                }
+                Err(e) => {
+                    tracing::warn!("Decode path extraction failed: {e}");
+                    None
+                }
+            }
+        };
 
         Ok(Arc::new(Mutex::new(NormalPipeline {
             model,
@@ -1057,6 +1091,8 @@ impl Loader for NormalLoader {
             cuda_graph_runner: arc_cuda_graph::try_init_graph_runner(&_graph_device),
             #[cfg(feature = "cuda")]
             _capturable_device: Some(_graph_device),
+            #[cfg(feature = "cuda")]
+            decode_weights: _decode_weights,
         })))
     }
 
