@@ -1009,13 +1009,7 @@ fn init_device(force_cpu: bool, seed: Option<u64>) -> Result<candle_core::Device
     } else if mistralrs_core::distributed::use_nccl() {
         Device::Cpu
     } else {
-        // Use new_cuda_with_stream for CUDA graph capture compatibility.
-        // The legacy default stream (NULL) does not support cuStreamBeginCapture.
-        if candle_core::utils::cuda_is_available() {
-            Device::new_cuda_with_stream(0)?
-        } else {
-            Device::Cpu
-        }
+        Device::cuda_if_available(0)?
     };
 
     if let Some(seed) = seed {

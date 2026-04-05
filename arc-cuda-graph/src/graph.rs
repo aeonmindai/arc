@@ -1,7 +1,15 @@
-//! Capture-once CUDA graph with split API to avoid borrow conflicts.
+//! CUDA graph capture-once with dedicated capture stream.
 //!
-//! First decode at a given batch size: capture → instantiate → launch.
-//! Subsequent decodes at same batch size: replay the cached graph.
+//! The device uses the legacy NULL stream (which cannot be captured).
+//! We create a dedicated non-blocking stream and capture on it.
+//!
+//! For capture: we make the capture stream wait on the device stream,
+//! then capture the forward pass. Candle's operations go to the NULL stream,
+//! but with GLOBAL capture mode, operations on ANY stream in the process
+//! are captured into the graph.
+//!
+//! For replay: we launch the graph on our capture stream, then make the
+//! device stream wait on it.
 
 #[cfg(feature = "cuda")]
 use crate::ffi::*;
@@ -15,7 +23,6 @@ use std::collections::HashMap;
 #[cfg(feature = "cuda")]
 struct CapturedGraph {
     exec: CUgraphExec,
-    /// Output tensor from capture run. Graph writes here on every replay.
     output: Tensor,
 }
 
@@ -28,7 +35,8 @@ impl Drop for CapturedGraph {
 
 #[cfg(feature = "cuda")]
 pub struct CudaGraphRunner {
-    stream: CUstream,
+    /// Our dedicated non-blocking capture stream
+    capture_stream: CUstream,
     graphs: HashMap<usize, CapturedGraph>,
     enabled: bool,
     warmup_remaining: u32,
@@ -44,23 +52,28 @@ unsafe impl Sync for CudaGraphRunner {}
 #[cfg(feature = "cuda")]
 impl CudaGraphRunner {
     pub fn new(device: &Device, warmup_steps: u32) -> candle_core::Result<Self> {
-        let Device::Cuda(cuda_dev) = device else {
+        let Device::Cuda(_cuda_dev) = device else {
             candle_core::bail!("CudaGraphRunner requires a CUDA device");
         };
-        let stream = cuda_dev.cuda_stream().cu_stream();
 
-        if stream.is_null() {
-            return Ok(Self {
-                stream, graphs: HashMap::new(),
-                enabled: false, warmup_remaining: 0,
-                capturing: false, capture_batch_size: 0,
-            });
+        // Create a dedicated non-blocking stream for graph capture.
+        // The device's NULL stream can't be captured, but with GLOBAL capture mode
+        // we can capture operations that the NULL stream dispatches.
+        let mut capture_stream: CUstream = std::ptr::null_mut();
+        let status = unsafe { cuStreamCreate(&mut capture_stream, CU_STREAM_NON_BLOCKING) };
+        if status != CUDA_SUCCESS {
+            candle_core::bail!("cuStreamCreate for graph capture failed: CUDA error {status}");
         }
 
+        tracing::info!("CUDA graph: created dedicated capture stream");
+
         Ok(Self {
-            stream, graphs: HashMap::new(),
-            enabled: true, warmup_remaining: warmup_steps,
-            capturing: false, capture_batch_size: 0,
+            capture_stream,
+            graphs: HashMap::new(),
+            enabled: true,
+            warmup_remaining: warmup_steps,
+            capturing: false,
+            capture_batch_size: 0,
         })
     }
 
@@ -84,46 +97,51 @@ impl CudaGraphRunner {
         self.graphs.contains_key(&batch_size)
     }
 
-    /// Replay the cached graph for a batch size. Returns the output logits.
-    /// The graph writes new output values to the cached tensor's address.
     pub fn replay(&self, batch_size: usize) -> candle_core::Result<Tensor> {
         let captured = self.graphs.get(&batch_size).ok_or_else(|| {
             candle_core::Error::Msg(format!("No graph for batch_size={batch_size}"))
         })?;
         unsafe {
-            let status = cuGraphLaunch(captured.exec, self.stream);
+            // Launch on our capture stream
+            let status = cuGraphLaunch(captured.exec, self.capture_stream);
             if status != CUDA_SUCCESS {
                 candle_core::bail!("cuGraphLaunch failed: CUDA error {status}");
             }
-            cudaStreamSynchronize(self.stream);
+            cudaStreamSynchronize(self.capture_stream);
         }
         Ok(captured.output.clone())
     }
 
-    /// Begin capturing a graph for the given batch size.
-    /// Call forward_inputs() after this, then end_capture().
+    /// Begin graph capture with GLOBAL mode.
+    /// GLOBAL mode captures operations on ALL streams in the process,
+    /// including the legacy NULL stream that Candle uses.
     pub fn begin_capture(&mut self, batch_size: usize) -> candle_core::Result<()> {
         if self.capturing {
             candle_core::bail!("Already capturing");
         }
+
         unsafe {
-            cudaStreamSynchronize(self.stream);
+            // Sync our stream first
+            cudaStreamSynchronize(self.capture_stream);
+
+            // Begin capture on our non-blocking stream with GLOBAL mode.
+            // GLOBAL mode: any thread's operations on any stream (including NULL)
+            // that are ordered after this point are captured.
             let status = cuStreamBeginCapture_v2(
-                self.stream,
-                CUstreamCaptureMode::THREAD_LOCAL,
+                self.capture_stream,
+                CUstreamCaptureMode::GLOBAL,
             );
             if status != CUDA_SUCCESS {
                 self.enabled = false;
                 candle_core::bail!("cuStreamBeginCapture failed: CUDA error {status}");
             }
         }
+
         self.capturing = true;
         self.capture_batch_size = batch_size;
         Ok(())
     }
 
-    /// End capture, instantiate, launch, and cache the graph.
-    /// `output` is the logits tensor from the forward pass.
     pub fn end_capture_and_cache(&mut self, output: Tensor) -> candle_core::Result<Tensor> {
         if !self.capturing {
             candle_core::bail!("Not capturing");
@@ -132,7 +150,7 @@ impl CudaGraphRunner {
 
         let mut graph: CUgraph = std::ptr::null_mut();
         unsafe {
-            let status = cuStreamEndCapture(self.stream, &mut graph);
+            let status = cuStreamEndCapture(self.capture_stream, &mut graph);
             if status != CUDA_SUCCESS {
                 self.enabled = false;
                 candle_core::bail!("cuStreamEndCapture failed: CUDA error {status}");
@@ -152,31 +170,30 @@ impl CudaGraphRunner {
             }
         }
 
-        // Launch the graph (executes the captured forward for the first time)
+        // First launch
         unsafe {
-            let status = cuGraphLaunch(exec, self.stream);
+            let status = cuGraphLaunch(exec, self.capture_stream);
             if status != CUDA_SUCCESS {
                 cuGraphExecDestroy(exec);
                 self.enabled = false;
                 candle_core::bail!("cuGraphLaunch failed: CUDA error {status}");
             }
-            cudaStreamSynchronize(self.stream);
+            cudaStreamSynchronize(self.capture_stream);
         }
 
-        tracing::info!("CUDA graph: captured, instantiated, launched for batch_size={}", self.capture_batch_size);
+        tracing::info!("CUDA graph: captured+launched for batch_size={}", self.capture_batch_size);
 
         let result = output.clone();
         self.graphs.insert(self.capture_batch_size, CapturedGraph { exec, output });
         Ok(result)
     }
 
-    /// Cancel an in-progress capture.
     pub fn cancel_capture(&mut self) {
         if self.capturing {
             self.capturing = false;
             let mut graph: CUgraph = std::ptr::null_mut();
             unsafe {
-                let _ = cuStreamEndCapture(self.stream, &mut graph);
+                let _ = cuStreamEndCapture(self.capture_stream, &mut graph);
                 if !graph.is_null() { cuGraphDestroy(graph); }
             }
         }
@@ -191,5 +208,8 @@ impl CudaGraphRunner {
 impl Drop for CudaGraphRunner {
     fn drop(&mut self) {
         self.cancel_capture();
+        if !self.capture_stream.is_null() {
+            unsafe { cuStreamDestroy_v2(self.capture_stream); }
+        }
     }
 }

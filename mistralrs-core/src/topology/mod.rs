@@ -126,7 +126,7 @@ impl Topology {
                     let ord = val.as_str().parse::<usize>()?;
                     let device = device.split('[').collect::<Vec<_>>()[0];
                     match device {
-                        "cuda" => Device::new_cuda_with_stream(ord)?,
+                        "cuda" => Device::new_cuda(ord)?,
                         "metal" => Device::new_metal(ord)?,
                         _ => unreachable!(),
                     }

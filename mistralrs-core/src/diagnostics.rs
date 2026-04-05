@@ -143,7 +143,7 @@ fn collect_devices(sys: &System) -> Vec<DeviceInfo> {
     {
         let mut ord = 0;
         loop {
-            match Device::new_cuda_with_stream(ord) {
+            match Device::new_cuda(ord) {
                 Ok(dev) => {
                     let total = MemoryUsage.get_total_memory(&dev).ok().map(|v| v as u64);
                     let avail = MemoryUsage
