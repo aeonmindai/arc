@@ -1017,10 +1017,11 @@ impl Loader for NormalLoader {
         // Extract weight pointers for the dedicated decode path (model-agnostic).
         #[cfg(feature = "cuda")]
         let _decode_weights = {
-            let cfg = model.config();
+            let cfg = model.config().clone();
+            // Get residuals first (immutable borrow), then get_layers (mutable borrow)
             let residuals = model.residual_tensors();
-            let (mut layers_mut, _) = model.get_layers();
-            // Convert mutable refs to shared refs for pointer extraction
+            // get_layers requires &mut self — call after residuals is collected
+            let (layers_mut, _) = model.get_layers();
             let layers_ref: Vec<_> = layers_mut.iter()
                 .map(|(l, idx)| (l as &std::sync::Arc<dyn mistralrs_quant::QuantMethod>, *idx))
                 .collect();
@@ -1030,7 +1031,7 @@ impl Loader for NormalLoader {
                 num_heads: cfg.num_attn_heads,
                 num_kv_heads: cfg.num_kv_heads,
                 head_dim: cfg.k_head_dim,
-                intermediate_size: 0, // Filled from residuals or config
+                intermediate_size: 0,
                 vocab_size: 0,
                 rms_norm_eps: 1e-6,
                 rope_theta: 1e6,
