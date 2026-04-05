@@ -1009,7 +1009,11 @@ fn init_device(force_cpu: bool, seed: Option<u64>) -> Result<candle_core::Device
     } else if mistralrs_core::distributed::use_nccl() {
         Device::Cpu
     } else {
-        Device::cuda_if_available(0)?
+        if candle_core::utils::cuda_is_available() {
+            Device::new_cuda_with_stream(0)?
+        } else {
+            Device::Cpu
+        }
     };
 
     if let Some(seed) = seed {
