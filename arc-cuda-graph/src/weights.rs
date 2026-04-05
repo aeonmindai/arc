@@ -56,17 +56,47 @@ pub struct DecodeConfig {
     pub has_qk_norm: bool,
 }
 
-/// Extract raw u64 device pointer from a Candle tensor.
+/// Extract raw u64 device pointer from a Candle tensor (any dtype).
 #[cfg(feature = "cuda")]
 pub fn tensor_device_ptr(tensor: &Tensor) -> candle_core::Result<u64> {
     use candle_core::cuda::cudarc::driver::DevicePtr;
+    use candle_core::DType;
+
     let (storage, layout) = tensor.storage_and_layout();
+    let offset_bytes = layout.start_offset() * tensor.dtype().size_in_bytes();
+
     match &*storage {
         Storage::Cuda(cuda_storage) => {
-            let slice = cuda_storage.as_cuda_slice::<u8>()?;
-            let (base_ptr, _guard) = slice.device_ptr(slice.stream());
-            let offset = layout.start_offset() * tensor.dtype().size_in_bytes();
-            Ok(base_ptr + offset as u64)
+            // Match on dtype to get correctly-typed CudaSlice (cudarc requires type match)
+            let base_ptr: u64 = match tensor.dtype() {
+                DType::BF16 => {
+                    let s = cuda_storage.as_cuda_slice::<half::bf16>()?;
+                    let (p, _) = s.device_ptr(s.stream());
+                    p
+                }
+                DType::F16 => {
+                    let s = cuda_storage.as_cuda_slice::<half::f16>()?;
+                    let (p, _) = s.device_ptr(s.stream());
+                    p
+                }
+                DType::F32 => {
+                    let s = cuda_storage.as_cuda_slice::<f32>()?;
+                    let (p, _) = s.device_ptr(s.stream());
+                    p
+                }
+                DType::U32 => {
+                    let s = cuda_storage.as_cuda_slice::<u32>()?;
+                    let (p, _) = s.device_ptr(s.stream());
+                    p
+                }
+                DType::I64 => {
+                    let s = cuda_storage.as_cuda_slice::<i64>()?;
+                    let (p, _) = s.device_ptr(s.stream());
+                    p
+                }
+                dt => candle_core::bail!("tensor_device_ptr: unsupported dtype {dt:?}"),
+            };
+            Ok(base_ptr + offset_bytes as u64)
         }
         _ => candle_core::bail!("tensor_device_ptr requires CUDA tensor"),
     }
