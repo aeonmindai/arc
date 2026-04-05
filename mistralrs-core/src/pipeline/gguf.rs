@@ -598,7 +598,7 @@ impl Loader for GGUFLoader {
                 Model::Qwen3(ref m) => &m.device,
                 Model::Qwen3MoE(ref m) => &m.device,
             };
-            dev.with_capturable_stream().unwrap_or_else(|_| dev.clone())
+            dev.clone()
         };
 
         Ok(Arc::new(Mutex::new(GGUFPipeline {

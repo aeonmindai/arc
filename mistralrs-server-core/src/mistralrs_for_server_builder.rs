@@ -670,6 +670,10 @@ impl MistralRsForServerBuilder {
         )?;
         info!("Model loaded.");
 
+        // Synchronize the device stream to ensure all H2D weight copies are complete.
+        // With NonBlocking stream, copies are async and weights may not be on GPU yet.
+        device.synchronize()?;
+
         let scheduler_config = init_scheduler_config(&cache_config, &pipeline, self.max_seqs).await;
 
         let search_embedding_model =

@@ -1009,14 +1009,10 @@ impl Loader for NormalLoader {
         let sliding_window = model.config().sliding_window;
         let model_metadata = Arc::new(model.config().clone());
 
-        // Create a capturable device for CUDA graph support.
-        // Model loading happened on the NULL stream. with_capturable_stream() creates
-        // a new device with CU_STREAM_DEFAULT (non-NULL, capturable, legacy-sync safe).
+        // The device already uses NonBlocking stream (our candle fork).
+        // No need for with_capturable_stream() — it's capturable from the start.
         #[cfg(feature = "cuda")]
-        let _graph_device = model
-            .device()
-            .with_capturable_stream()
-            .unwrap_or_else(|_| model.device().clone());
+        let _graph_device = model.device().clone();
 
         Ok(Arc::new(Mutex::new(NormalPipeline {
             model,

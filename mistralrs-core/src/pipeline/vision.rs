@@ -877,7 +877,7 @@ impl Loader for VisionLoader {
         let model_metadata = Arc::new(model.config().clone());
 
         #[cfg(feature = "cuda")]
-        let _graph_device = model.device().with_capturable_stream().unwrap_or_else(|_| model.device().clone());
+        let _graph_device = model.device().clone();
 
         Ok(Arc::new(Mutex::new(VisionPipeline {
             model,
