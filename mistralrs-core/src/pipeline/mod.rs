@@ -420,6 +420,43 @@ pub(crate) struct FileListCache {
     files: Vec<String>,
 }
 
+/// Wrap a raw BF16 GPU pointer as a Candle Tensor (D2D copy + F32 cast).
+#[cfg(feature = "cuda")]
+fn wrap_bf16_logits(
+    ptr: u64,
+    batch_size: usize,
+    vocab_size: usize,
+    device: &Device,
+) -> candle_core::Result<Tensor> {
+    use candle_core::{DType, Shape};
+
+    let elem_count = batch_size * vocab_size;
+    let shape = Shape::from_dims(&[batch_size, vocab_size]);
+
+    let logits_bf16 = unsafe {
+        extern "C" {
+            fn cudaMemcpy(
+                dst: *mut std::ffi::c_void, src: *const std::ffi::c_void,
+                count: usize, kind: u32,
+            ) -> u32;
+        }
+        let fresh = Tensor::zeros(shape, DType::BF16, device)?;
+        let fresh_ptr = arc_cuda_graph::tensor_device_ptr(&fresh)?;
+        let status = cudaMemcpy(
+            fresh_ptr as *mut _,
+            ptr as *const _,
+            elem_count * 2, // BF16 = 2 bytes
+            3, // cudaMemcpyDeviceToDevice
+        );
+        if status != 0 {
+            candle_core::bail!("cudaMemcpy D2D for logits failed: {status}");
+        }
+        fresh
+    };
+
+    logits_bf16.to_dtype(DType::F32)
+}
+
 #[async_trait::async_trait]
 pub trait Pipeline:
     Send
@@ -639,56 +676,12 @@ pub trait Pipeline:
 
         // Wrap BF16 logits as a Candle Tensor
         let vocab_size = dedicated.weights.config.vocab_size;
-        let logits_tensor = match Self::wrap_bf16_logits(logits_ptr, batch_size, vocab_size, &device) {
+        let logits_tensor = match wrap_bf16_logits(logits_ptr, batch_size, vocab_size, &device) {
             Ok(t) => t,
             Err(e) => return Some(Err(e)),
         };
 
         Some(Ok(ForwardInputsResult::CausalGeneration { logits: logits_tensor }))
-    }
-
-    /// Wrap a raw BF16 GPU pointer as a Candle Tensor without copying.
-    #[cfg(feature = "cuda")]
-    fn wrap_bf16_logits(
-        ptr: u64,
-        batch_size: usize,
-        vocab_size: usize,
-        device: &Device,
-    ) -> candle_core::Result<Tensor> {
-        use candle_core::{DType, Shape};
-
-        // Create a BF16 tensor from the raw logits, then cast to F32 for sampling
-        let elem_count = batch_size * vocab_size;
-        let shape = Shape::from_dims(&[batch_size, vocab_size]);
-
-        // We need to wrap the existing GPU memory as a Candle Tensor.
-        // The logits buffer is owned by DedicatedDecodePath and persists across calls.
-        // We copy to a new tensor to avoid aliasing the pre-allocated buffer.
-        let logits_bf16 = unsafe {
-            extern "C" {
-                fn cudaMemcpy(
-                    dst: *mut std::ffi::c_void, src: *const std::ffi::c_void,
-                    count: usize, kind: u32,
-                ) -> u32;
-            }
-            // Allocate a fresh tensor on the same device
-            let fresh = Tensor::zeros(shape.clone(), DType::BF16, device)?;
-            let fresh_ptr = arc_cuda_graph::tensor_device_ptr(&fresh)?;
-            // D2D copy from the decode buffer to the fresh tensor
-            let status = cudaMemcpy(
-                fresh_ptr as *mut _,
-                ptr as *const _,
-                elem_count * 2, // BF16 = 2 bytes
-                3, // cudaMemcpyDeviceToDevice
-            );
-            if status != 0 {
-                candle_core::bail!("cudaMemcpy D2D for logits failed: {status}");
-            }
-            fresh
-        };
-
-        // Cast to F32 for sampling compatibility
-        logits_bf16.to_dtype(DType::F32)
     }
 
     /// Returns the total of model execution time.
