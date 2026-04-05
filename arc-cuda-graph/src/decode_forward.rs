@@ -206,15 +206,22 @@ unsafe fn gemm_bf16(
 
     let mut heuristic = [0u8; 80];
     let mut algo_count: i32 = 0;
-    cublasLtMatmulAlgoGetHeuristic(
+    let s = cublasLtMatmulAlgoGetHeuristic(
         cublas.handle, desc, a_layout, b_layout, c_layout, d_layout,
         pref, 1, &mut heuristic, &mut algo_count,
     );
+    if s != 0 || algo_count == 0 {
+        // Log once — this is critical
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::error!("cuBLASLt heuristic failed: status={s} algo_count={algo_count} m={m} n={n} k={k}");
+        }
+    }
 
     let alpha: f32 = 1.0;
     let beta: f32 = 0.0;
 
-    cublasLtMatmul(
+    let s = cublasLtMatmul(
         cublas.handle, desc,
         &alpha as *const _ as *const _,
         weight as *const _, a_layout,
@@ -227,6 +234,12 @@ unsafe fn gemm_bf16(
         cublas.workspace_size,
         stream,
     );
+    if s != 0 {
+        static LOGGED2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED2.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::error!("cuBLASLt matmul failed: status={s} m={m} n={n} k={k}");
+        }
+    }
 
     cublasLtMatmulPreferenceDestroy(pref);
     cublasLtMatrixLayoutDestroy(d_layout);
@@ -262,6 +275,9 @@ pub unsafe fn decode_forward(
     let _theta = cfg.rope_theta;
 
     // Step 0: Embedding lookup
+    if weights.embed_tokens == 0 {
+        tracing::error!("embed_tokens pointer is NULL!");
+    }
     launch_gather_embedding_bf16(
         weights.embed_tokens as *const _,
         buffers.token_ids as *const i32,
@@ -276,6 +292,19 @@ pub unsafe fn decode_forward(
 
     for layer_idx in 0..cfg.num_layers {
         let lw = &weights.layers[layer_idx];
+
+        // Diagnostic: check first layer weights
+        if layer_idx == 0 {
+            static LOGGED_W: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED_W.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!(
+                    "Layer 0 weights: norm={:#x} q={:#x} k={:#x} v={:#x} o={:#x} gate={:#x}",
+                    lw.input_layernorm, lw.q_proj.ptr, lw.k_proj.ptr, lw.v_proj.ptr,
+                    lw.o_proj.ptr, lw.gate_proj.ptr,
+                );
+                tracing::info!("embed={:#x} final_norm={:#x} lm_head={:#x}", weights.embed_tokens, weights.final_norm, weights.lm_head.ptr);
+            }
+        }
 
         // RMSNorm (input_layernorm)
         launch_fused_rmsnorm_residual_bf16(
