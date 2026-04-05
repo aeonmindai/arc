@@ -1,7 +1,16 @@
-//! Capture-once CUDA graph for decode steps.
+//! Capture-once CUDA graph with private memory pool for isolation.
 //!
-//! Uses the device's non-blocking stream (from Device::new_cuda_with_stream)
-//! for graph capture and replay.
+//! The private pool ensures graph-owned memory doesn't interfere with
+//! the rest of the application (PagedAttention KV cache, model weights, etc.).
+//!
+//! Sequence:
+//! 1. Save device's current memory pool
+//! 2. Create private pool, set RELEASE_THRESHOLD=UINT64_MAX (never release)
+//! 3. Install private pool as device default
+//! 4. cuStreamBeginCapture → forward pass → cuStreamEndCapture
+//! 5. Restore original pool
+//! 6. cuGraphInstantiate
+//! 7. On replay: cuGraphLaunch (graph uses its own pool addresses)
 
 #[cfg(feature = "cuda")]
 use crate::ffi::*;
@@ -16,23 +25,27 @@ use std::collections::HashMap;
 struct CapturedGraph {
     exec: CUgraphExec,
     output: Tensor,
+    /// Private memory pool for this graph's allocations
+    pool: CUmemoryPool,
 }
 
 #[cfg(feature = "cuda")]
 impl Drop for CapturedGraph {
     fn drop(&mut self) {
-        unsafe { cuGraphExecDestroy(self.exec); }
+        unsafe {
+            cuGraphExecDestroy(self.exec);
+            cuMemPoolDestroy(self.pool);
+        }
     }
 }
 
 #[cfg(feature = "cuda")]
 pub struct CudaGraphRunner {
     stream: CUstream,
+    device_ordinal: CUdevice,
     graphs: HashMap<usize, CapturedGraph>,
     enabled: bool,
     warmup_remaining: u32,
-    capturing: bool,
-    capture_batch_size: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -49,20 +62,24 @@ impl CudaGraphRunner {
         let stream = cuda_dev.cuda_stream().cu_stream();
 
         if stream.is_null() {
-            tracing::warn!("CUDA graph: NULL stream, capture disabled. Use new_cuda_with_stream().");
+            tracing::warn!("CUDA graph: NULL stream, capture disabled");
             return Ok(Self {
-                stream, graphs: HashMap::new(),
-                enabled: false, warmup_remaining: 0,
-                capturing: false, capture_batch_size: 0,
+                stream, device_ordinal: 0,
+                graphs: HashMap::new(), enabled: false, warmup_remaining: 0,
             });
         }
 
-        tracing::info!("CUDA graph: non-null stream, capture enabled");
+        // Get device ordinal from the stream's context
+        let ordinal = match device.location() {
+            candle_core::DeviceLocation::Cuda { gpu_id } => gpu_id as CUdevice,
+            _ => 0,
+        };
+
+        tracing::info!("CUDA graph: non-null stream on device {ordinal}, capture enabled");
 
         Ok(Self {
-            stream, graphs: HashMap::new(),
-            enabled: true, warmup_remaining: warmup_steps,
-            capturing: false, capture_batch_size: 0,
+            stream, device_ordinal: ordinal,
+            graphs: HashMap::new(), enabled: true, warmup_remaining: warmup_steps,
         })
     }
 
@@ -82,85 +99,157 @@ impl CudaGraphRunner {
         self.graphs.contains_key(&batch_size)
     }
 
+    /// Replay a previously captured graph. Returns the output tensor.
     pub fn replay(&self, batch_size: usize) -> candle_core::Result<Tensor> {
         let captured = self.graphs.get(&batch_size).ok_or_else(|| {
             candle_core::Error::Msg(format!("No graph for batch_size={batch_size}"))
         })?;
         unsafe {
-            let status = cuGraphLaunch(captured.exec, self.stream);
-            if status != CUDA_SUCCESS {
-                candle_core::bail!("cuGraphLaunch failed: {status}");
-            }
+            let s = cuGraphLaunch(captured.exec, self.stream);
+            if s != CUDA_SUCCESS { candle_core::bail!("cuGraphLaunch failed: {s}"); }
             cudaStreamSynchronize(self.stream);
         }
         Ok(captured.output.clone())
     }
 
-    pub fn begin_capture(&mut self, batch_size: usize) -> candle_core::Result<()> {
-        if self.capturing { candle_core::bail!("Already capturing"); }
-        unsafe {
-            cudaStreamSynchronize(self.stream);
-            let status = cuStreamBeginCapture_v2(self.stream, CUstreamCaptureMode::THREAD_LOCAL);
-            if status != CUDA_SUCCESS {
-                self.enabled = false;
-                candle_core::bail!("cuStreamBeginCapture failed: {status}");
-            }
+    /// Create a private memory pool for graph capture.
+    fn create_private_pool(&self) -> candle_core::Result<CUmemoryPool> {
+        let props = CUmemPoolProps {
+            alloc_type: CUmemAllocationType::PINNED,
+            handle_type: CUmemHandleType::NONE,
+            location: CUmemLocation {
+                loc_type: CUmemLocationType::DEVICE,
+                id: self.device_ordinal,
+            },
+            win32_security_attributes: std::ptr::null_mut(),
+            max_size: 0,
+            usage: 0,
+            reserved: [0u8; 54],
+        };
+
+        let mut pool: CUmemoryPool = std::ptr::null_mut();
+        let s = unsafe { cuMemPoolCreate(&mut pool, &props) };
+        if s != CUDA_SUCCESS {
+            candle_core::bail!("cuMemPoolCreate failed: {s}");
         }
-        self.capturing = true;
-        self.capture_batch_size = batch_size;
-        Ok(())
+
+        // Never release memory back to OS — keep addresses stable for replay
+        let mut threshold: u64 = u64::MAX;
+        let s = unsafe {
+            cuMemPoolSetAttribute(
+                pool,
+                CUmempoolAttribute::RELEASE_THRESHOLD,
+                &mut threshold as *mut u64 as *mut _,
+            )
+        };
+        if s != CUDA_SUCCESS {
+            unsafe { cuMemPoolDestroy(pool); }
+            candle_core::bail!("cuMemPoolSetAttribute(RELEASE_THRESHOLD) failed: {s}");
+        }
+
+        Ok(pool)
     }
 
-    pub fn end_capture_and_cache(&mut self, output: Tensor) -> candle_core::Result<Tensor> {
-        if !self.capturing { candle_core::bail!("Not capturing"); }
-        self.capturing = false;
+    /// Begin graph capture with a private memory pool.
+    /// Returns the pool and saved original pool for restoration.
+    pub fn begin_capture(&mut self, batch_size: usize) -> candle_core::Result<(CUmemoryPool, CUmemoryPool)> {
+        // Create private pool
+        let graph_pool = self.create_private_pool()?;
 
+        // Save original pool
+        let mut original_pool: CUmemoryPool = std::ptr::null_mut();
+        let s = unsafe { cuDeviceGetMemPool(&mut original_pool, self.device_ordinal) };
+        if s != CUDA_SUCCESS {
+            unsafe { cuMemPoolDestroy(graph_pool); }
+            candle_core::bail!("cuDeviceGetMemPool failed: {s}");
+        }
+
+        // Install private pool
+        let s = unsafe { cuDeviceSetMemPool(self.device_ordinal, graph_pool) };
+        if s != CUDA_SUCCESS {
+            unsafe { cuMemPoolDestroy(graph_pool); }
+            candle_core::bail!("cuDeviceSetMemPool (install) failed: {s}");
+        }
+
+        // Sync stream before capture
+        unsafe { cudaStreamSynchronize(self.stream); }
+
+        // Begin capture
+        let s = unsafe {
+            cuStreamBeginCapture_v2(self.stream, CUstreamCaptureMode::THREAD_LOCAL)
+        };
+        if s != CUDA_SUCCESS {
+            // Restore original pool before bailing
+            unsafe { cuDeviceSetMemPool(self.device_ordinal, original_pool); }
+            unsafe { cuMemPoolDestroy(graph_pool); }
+            self.enabled = false;
+            candle_core::bail!("cuStreamBeginCapture failed: {s}");
+        }
+
+        tracing::info!("CUDA graph: capture started for batch_size={batch_size} with private pool");
+        Ok((graph_pool, original_pool))
+    }
+
+    /// End capture, restore original pool, instantiate graph, cache it.
+    pub fn end_capture_and_cache(
+        &mut self,
+        batch_size: usize,
+        output: Tensor,
+        graph_pool: CUmemoryPool,
+        original_pool: CUmemoryPool,
+    ) -> candle_core::Result<Tensor> {
+        // End capture
         let mut graph: CUgraph = std::ptr::null_mut();
-        unsafe {
-            let status = cuStreamEndCapture(self.stream, &mut graph);
-            if status != CUDA_SUCCESS {
-                self.enabled = false;
-                candle_core::bail!("cuStreamEndCapture failed: {status}");
-            }
+        let s = unsafe { cuStreamEndCapture(self.stream, &mut graph) };
+
+        // ALWAYS restore original pool
+        unsafe { cuDeviceSetMemPool(self.device_ordinal, original_pool); }
+
+        if s != CUDA_SUCCESS {
+            unsafe { cuMemPoolDestroy(graph_pool); }
+            self.enabled = false;
+            candle_core::bail!("cuStreamEndCapture failed: {s}");
         }
 
+        // Instantiate
         let mut exec: CUgraphExec = std::ptr::null_mut();
-        unsafe {
-            let status = cuGraphInstantiate_v2(
-                &mut exec, graph, std::ptr::null_mut(), std::ptr::null_mut(), 0,
-            );
-            cuGraphDestroy(graph);
-            if status != CUDA_SUCCESS {
-                self.enabled = false;
-                candle_core::bail!("cuGraphInstantiate failed: {status}");
-            }
+        let s = unsafe {
+            cuGraphInstantiate_v2(
+                &mut exec, graph,
+                std::ptr::null_mut(), std::ptr::null_mut(), 0,
+            )
+        };
+        unsafe { cuGraphDestroy(graph); }
+        if s != CUDA_SUCCESS {
+            unsafe { cuMemPoolDestroy(graph_pool); }
+            self.enabled = false;
+            candle_core::bail!("cuGraphInstantiate failed: {s}");
         }
 
-        unsafe {
-            let status = cuGraphLaunch(exec, self.stream);
-            if status != CUDA_SUCCESS {
-                cuGraphExecDestroy(exec);
-                self.enabled = false;
-                candle_core::bail!("First cuGraphLaunch failed: {status}");
-            }
-            cudaStreamSynchronize(self.stream);
+        // First launch
+        let s = unsafe { cuGraphLaunch(exec, self.stream) };
+        if s != CUDA_SUCCESS {
+            unsafe { cuGraphExecDestroy(exec); cuMemPoolDestroy(graph_pool); }
+            self.enabled = false;
+            candle_core::bail!("First cuGraphLaunch failed: {s}");
         }
+        unsafe { cudaStreamSynchronize(self.stream); }
 
-        tracing::info!("CUDA graph: captured for batch_size={}", self.capture_batch_size);
+        tracing::info!("CUDA graph: captured + launched for batch_size={batch_size}");
 
         let result = output.clone();
-        self.graphs.insert(self.capture_batch_size, CapturedGraph { exec, output });
+        self.graphs.insert(batch_size, CapturedGraph { exec, output, pool: graph_pool });
         Ok(result)
     }
 
-    pub fn cancel_capture(&mut self) {
-        if self.capturing {
-            self.capturing = false;
-            let mut g: CUgraph = std::ptr::null_mut();
-            unsafe {
-                let _ = cuStreamEndCapture(self.stream, &mut g);
-                if !g.is_null() { cuGraphDestroy(g); }
-            }
+    /// Cancel an in-progress capture and restore the original pool.
+    pub fn cancel_capture(&self, graph_pool: CUmemoryPool, original_pool: CUmemoryPool) {
+        let mut graph: CUgraph = std::ptr::null_mut();
+        unsafe {
+            let _ = cuStreamEndCapture(self.stream, &mut graph);
+            if !graph.is_null() { cuGraphDestroy(graph); }
+            cuDeviceSetMemPool(self.device_ordinal, original_pool);
+            cuMemPoolDestroy(graph_pool);
         }
     }
 
@@ -169,5 +258,7 @@ impl CudaGraphRunner {
 
 #[cfg(feature = "cuda")]
 impl Drop for CudaGraphRunner {
-    fn drop(&mut self) { self.cancel_capture(); }
+    fn drop(&mut self) {
+        // CapturedGraph handles cleanup via its own Drop
+    }
 }

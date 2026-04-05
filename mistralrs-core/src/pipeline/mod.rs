@@ -504,14 +504,12 @@ pub trait Pipeline:
             };
 
             if use_graph {
-                // Set GPU positions for graph-mode RoPE
                 #[allow(unused_imports)]
                 use crate::layers::set_graph_mode_positions;
 
                 if already_captured {
                     // REPLAY: launch the cached graph
-                    let result = self.cuda_graph_runner_mut().unwrap().replay(batch_size);
-                    match result {
+                    match self.cuda_graph_runner_mut().unwrap().replay(batch_size) {
                         Ok(logits) => {
                             return Ok(ForwardInputsResult::CausalGeneration { logits });
                         }
@@ -521,7 +519,7 @@ pub trait Pipeline:
                         }
                     }
                 } else {
-                    // CAPTURE: first time for this batch size
+                    // CAPTURE: first time for this batch size, with private memory pool
                     let positions_tensor = inputs
                         .downcast_ref::<text_models_inputs_processor::ModelInputs>()
                         .and_then(|m| {
@@ -530,21 +528,27 @@ pub trait Pipeline:
                         });
                     set_graph_mode_positions(positions_tensor);
 
-                    // Begin capture
-                    if let Err(e) = self.cuda_graph_runner_mut().unwrap().begin_capture(batch_size) {
-                        set_graph_mode_positions(None);
-                        tracing::warn!("CUDA graph begin_capture failed ({e}), running eagerly");
-                        return self.forward_inputs(inputs, return_raw_logits);
-                    }
+                    // Begin capture (creates private pool, installs it, starts capture)
+                    let pools = self.cuda_graph_runner_mut().unwrap().begin_capture(batch_size);
+                    let (graph_pool, original_pool) = match pools {
+                        Ok(p) => p,
+                        Err(e) => {
+                            set_graph_mode_positions(None);
+                            tracing::warn!("CUDA graph begin_capture failed ({e}), running eagerly");
+                            return self.forward_inputs(inputs, return_raw_logits);
+                        }
+                    };
 
-                    // Run forward under capture (kernels recorded, not executed)
+                    // Run forward under capture (kernels recorded, not executed,
+                    // allocations go to the private pool)
                     let result = self.forward_inputs(inputs, return_raw_logits);
                     set_graph_mode_positions(None);
 
                     match result {
                         Ok(ForwardInputsResult::CausalGeneration { logits }) => {
-                            // End capture, instantiate, launch, cache
-                            match self.cuda_graph_runner_mut().unwrap().end_capture_and_cache(logits) {
+                            match self.cuda_graph_runner_mut().unwrap().end_capture_and_cache(
+                                batch_size, logits, graph_pool, original_pool,
+                            ) {
                                 Ok(logits) => {
                                     return Ok(ForwardInputsResult::CausalGeneration { logits });
                                 }
@@ -556,12 +560,13 @@ pub trait Pipeline:
                             }
                         }
                         Ok(other) => {
-                            // Non-causal result — cancel capture, return as-is
-                            self.cuda_graph_runner_mut().unwrap().cancel_capture();
+                            self.cuda_graph_runner_mut().unwrap()
+                                .cancel_capture(graph_pool, original_pool);
                             return Ok(other);
                         }
                         Err(e) => {
-                            self.cuda_graph_runner_mut().unwrap().cancel_capture();
+                            self.cuda_graph_runner_mut().unwrap()
+                                .cancel_capture(graph_pool, original_pool);
                             return Err(e);
                         }
                     }
