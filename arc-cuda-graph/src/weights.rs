@@ -96,6 +96,17 @@ pub fn tensor_device_ptr(tensor: &Tensor) -> candle_core::Result<u64> {
                     let (p, _) = s.device_ptr(s.stream());
                     p
                 }
+                DType::U8 => {
+                    let s = cuda_storage.as_cuda_slice::<u8>()?;
+                    let (p, _) = s.device_ptr(s.stream());
+                    p
+                }
+                DType::F8E4M3 => {
+                    // F8E4M3 is stored as u8 in cudarc
+                    let s = cuda_storage.as_cuda_slice::<u8>()?;
+                    let (p, _) = s.device_ptr(s.stream());
+                    p
+                }
                 dt => candle_core::bail!("tensor_device_ptr: unsupported dtype {dt:?}"),
             };
             Ok(base_ptr + offset_bytes as u64)

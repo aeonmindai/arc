@@ -556,6 +556,11 @@ pub trait Pipeline:
         let cache_config = metadata.cache_config.as_ref()?;
         let device = self.device();
 
+        // Dedicated path only supports BF16 cache — fall back for TurboQuant/FP8
+        if !matches!(cache_config.cache_type, crate::paged_attention::PagedCacheType::Auto) {
+            return None;
+        }
+
         // Get the dedicated decode path — need two-phase borrow to avoid holding &mut self
         // First check warmup/enabled without running
         {
