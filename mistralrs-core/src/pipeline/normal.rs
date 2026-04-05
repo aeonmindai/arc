@@ -1025,14 +1025,23 @@ impl Loader for NormalLoader {
             let layers_ref: Vec<_> = layers_mut.iter()
                 .map(|(l, idx)| (l as &std::sync::Arc<dyn mistralrs_quant::QuantMethod>, *idx))
                 .collect();
+            // Infer intermediate_size and vocab_size from weight shapes
+            let lm_head_w = layers_ref[0].0.dequantize_w().ok();
+            let vocab_size = lm_head_w.as_ref().map(|w| w.dims()[0]).unwrap_or(0);
+
+            // gate_proj is at index 1 + 4 (5th projection in first layer: q,k,v,o,gate)
+            let gate_idx = if layers_ref.len() > 5 { 5 } else { 0 };
+            let gate_w = layers_ref.get(gate_idx).and_then(|(l, _)| l.dequantize_w().ok());
+            let intermediate_size = gate_w.as_ref().map(|w| w.dims()[0]).unwrap_or(0);
+
             let decode_config = arc_cuda_graph::DecodeConfig {
                 num_layers: cfg.num_layers,
                 hidden_size: cfg.hidden_size,
                 num_heads: cfg.num_attn_heads,
                 num_kv_heads: cfg.num_kv_heads,
                 head_dim: cfg.k_head_dim,
-                intermediate_size: 0,
-                vocab_size: 0,
+                intermediate_size,
+                vocab_size,
                 rms_norm_eps: 1e-6,
                 rope_theta: 1e6,
                 has_qk_norm: false,
