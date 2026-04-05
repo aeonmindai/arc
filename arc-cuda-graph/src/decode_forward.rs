@@ -57,6 +57,8 @@ pub struct DecodeBuffers {
     pub k: u64,             // [batch, num_kv_heads * head_dim]
     pub v: u64,             // [batch, num_kv_heads * head_dim]
     pub attn_out: u64,      // [batch, num_heads * head_dim]
+    pub q_f16: u64,         // [batch, num_heads * head_dim] F16 (TurboQuant needs F16 Q)
+    pub attn_out_f32: u64,  // [batch, num_heads * head_dim] F32 (TurboQuant outputs F32)
     pub o_proj_out: u64,    // [batch, hidden_size]
     pub gate: u64,          // [batch, intermediate_size]
     pub up: u64,            // [batch, intermediate_size]
@@ -329,9 +331,14 @@ pub unsafe fn decode_forward(
                 stream,
                 1, // dtype = BF16 input
             );
-            // TurboQuant attention: dequant from U8 cache
+            // Cast Q from BF16 → F16 (TurboQuant kernel expects F16)
+            let q_size = (bs as usize * nh * hd) as i32;
+            launch_cast_bf16_to_f16(
+                buffers.q as *const _, buffers.q_f16 as *mut _, q_size, stream,
+            );
+            // TurboQuant attention: F16 Q + U8 cache → F32 output
             turbo_paged_attention_v1_f16(
-                buffers.attn_out as *const _, buffers.q as *const _,
+                buffers.attn_out_f32 as *const _, buffers.q_f16 as *const _,
                 lc.key_cache as *const _, lc.value_cache as *const _,
                 lc.k_norms as *const _, lc.v_norms as *const _,
                 nkv as i32, scale, 1.0,
@@ -343,6 +350,10 @@ pub unsafe fn decode_forward(
                 paged_attn.kv_block_stride, paged_attn.kv_head_stride,
                 paged_attn.norm_block_stride, paged_attn.norm_head_stride,
                 stream,
+            );
+            // Cast attention output F32 → BF16 for O projection
+            launch_cast_f32_to_bf16(
+                buffers.attn_out_f32 as *const _, buffers.attn_out as *mut _, q_size, stream,
             );
         } else {
             // Standard BF16 cache
@@ -549,6 +560,14 @@ extern "C" {
     fn launch_residual_add_bf16(
         a: *const std::ffi::c_void, b: *const std::ffi::c_void,
         output: *mut std::ffi::c_void,
+        size: i32, stream: CUstream,
+    );
+    fn launch_cast_bf16_to_f16(
+        input: *const std::ffi::c_void, output: *mut std::ffi::c_void,
+        size: i32, stream: CUstream,
+    );
+    fn launch_cast_f32_to_bf16(
+        input: *const std::ffi::c_void, output: *mut std::ffi::c_void,
         size: i32, stream: CUstream,
     );
 }

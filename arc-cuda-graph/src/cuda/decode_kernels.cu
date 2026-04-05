@@ -4,6 +4,7 @@
  */
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
 
@@ -191,5 +192,39 @@ extern "C" void launch_residual_add_bf16(
     residual_add_bf16_kernel<<<(size + 255) / 256, 256, 0, stream>>>(
         (const __nv_bfloat16*)a, (const __nv_bfloat16*)b,
         (__nv_bfloat16*)output, size
+    );
+}
+
+// ============================================================================
+// Dtype cast kernels (for TurboQuant which needs F16 Q and outputs F32)
+// ============================================================================
+
+__global__ void cast_bf16_to_f16_kernel(
+    const __nv_bfloat16* __restrict__ in, __half* __restrict__ out, int size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) out[idx] = __float2half(__bfloat162float(in[idx]));
+}
+
+extern "C" void launch_cast_bf16_to_f16(
+    const void* in, void* out, int size, cudaStream_t stream
+) {
+    cast_bf16_to_f16_kernel<<<(size + 255) / 256, 256, 0, stream>>>(
+        (const __nv_bfloat16*)in, (__half*)out, size
+    );
+}
+
+__global__ void cast_f32_to_bf16_kernel(
+    const float* __restrict__ in, __nv_bfloat16* __restrict__ out, int size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) out[idx] = __float2bfloat16(in[idx]);
+}
+
+extern "C" void launch_cast_f32_to_bf16(
+    const void* in, void* out, int size, cudaStream_t stream
+) {
+    cast_f32_to_bf16_kernel<<<(size + 255) / 256, 256, 0, stream>>>(
+        (const float*)in, (__nv_bfloat16*)out, size
     );
 }
