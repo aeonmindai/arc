@@ -64,7 +64,8 @@ pub struct DedicatedDecodePath {
 
     enabled: bool,
     warmup_remaining: u32,
-    eager_steps: u32, // Run a few steps eagerly before capture to ensure correctness
+    eager_steps: u32,
+    capture_failed: bool, // Stop retrying capture after failure
 }
 
 #[cfg(feature = "cuda")]
@@ -129,6 +130,7 @@ impl DedicatedDecodePath {
             enabled: true,
             warmup_remaining: 2,
             eager_steps: 0,
+            capture_failed: false,
         })
     }
 
@@ -362,7 +364,6 @@ impl DedicatedDecodePath {
             if let Some(exec) = self.graph_exec {
                 // REPLAY: all inputs staged, just launch
                 if batch_size != self.captured_batch_size {
-                    // Batch size changed — can't replay, fall back to eager
                     tracing::warn!("Batch size changed ({} → {}), running eager", self.captured_batch_size, batch_size);
                     decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
                 } else {
@@ -372,12 +373,14 @@ impl DedicatedDecodePath {
                         decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
                     }
                 }
+            } else if self.capture_failed {
+                // Capture previously failed — just run eager (still fast, no Candle overhead)
+                decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
             } else if self.eager_steps < 2 {
-                // EAGER: run a couple steps to validate before capturing
                 self.eager_steps += 1;
                 decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
                 if self.eager_steps == 2 {
-                    tracing::info!("Dedicated decode: eager warmup done, will capture next step");
+                    tracing::info!("Dedicated decode: eager warmup done, will attempt capture next step");
                 }
             } else {
                 // CAPTURE: record the forward pass into a CUDA graph
@@ -385,19 +388,18 @@ impl DedicatedDecodePath {
 
                 let s = cuStreamBeginCapture_v2(self.stream, CUstreamCaptureMode::THREAD_LOCAL);
                 if s != CUDA_SUCCESS {
-                    tracing::warn!("cuStreamBeginCapture failed ({s}), running eager");
-                    // Stream is NOT in capture mode, safe to run eagerly
+                    tracing::warn!("cuStreamBeginCapture failed ({s}), disabling capture");
+                    self.capture_failed = true;
                     decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
                 } else {
-                    // Record the forward pass (kernels are recorded, NOT executed)
                     decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
 
                     let mut graph: CUgraph = std::ptr::null_mut();
                     let s = cuStreamEndCapture(self.stream, &mut graph);
                     if s != CUDA_SUCCESS || graph.is_null() {
-                        tracing::warn!("cuStreamEndCapture failed ({s}), running eager");
+                        tracing::warn!("cuStreamEndCapture failed ({s}), disabling capture");
                         if !graph.is_null() { cuGraphDestroy(graph); }
-                        // Re-run eagerly since capture didn't execute
+                        self.capture_failed = true;
                         decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
                     } else {
                         let mut exec: CUgraphExec = std::ptr::null_mut();
@@ -408,14 +410,15 @@ impl DedicatedDecodePath {
                         cuGraphDestroy(graph);
 
                         if s != CUDA_SUCCESS || exec.is_null() {
-                            tracing::warn!("cuGraphInstantiate failed ({s}), running eager");
+                            tracing::warn!("cuGraphInstantiate failed ({s}), disabling capture");
+                            self.capture_failed = true;
                             decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
                         } else {
-                            // Launch the freshly captured graph
                             let s = cuGraphLaunch(exec, self.stream);
                             if s != CUDA_SUCCESS {
-                                tracing::warn!("First cuGraphLaunch failed ({s}), running eager");
+                                tracing::warn!("First cuGraphLaunch failed ({s}), disabling capture");
                                 cuGraphExecDestroy(exec);
+                                self.capture_failed = true;
                                 decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
                             } else {
                                 self.graph_exec = Some(exec);
