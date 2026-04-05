@@ -63,10 +63,8 @@ pub fn tensor_device_ptr(tensor: &Tensor) -> candle_core::Result<u64> {
     let (storage, layout) = tensor.storage_and_layout();
     match &*storage {
         Storage::Cuda(cuda_storage) => {
-            let dev = cuda_storage.device();
-            let stream = dev.cuda_stream();
             let slice = cuda_storage.as_cuda_slice::<u8>()?;
-            let (base_ptr, _guard) = slice.device_ptr(&stream);
+            let (base_ptr, _guard) = slice.device_ptr(slice.stream());
             let offset = layout.start_offset() * tensor.dtype().size_in_bytes();
             Ok(base_ptr + offset as u64)
         }
