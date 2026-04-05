@@ -240,7 +240,11 @@ impl DedicatedDecodePath {
         if self.staging_max_batch >= batch_size && self.staging_max_blocks_per_seq >= max_blocks_per_seq {
             return Ok(());
         }
-        // Free old staging if resizing
+        // Free old staging if resizing — also invalidates captured graph
+        if let Some(exec) = self.graph_exec.take() {
+            unsafe { cuGraphExecDestroy(exec); }
+            tracing::info!("Staging resize → graph invalidated");
+        }
         unsafe {
             if self.staging_block_tables != 0 { cudaFree(self.staging_block_tables); }
             if self.staging_context_lens != 0 { cudaFree(self.staging_context_lens); }
@@ -339,7 +343,11 @@ impl DedicatedDecodePath {
     ) -> candle_core::Result<u64> {
         let batch_size = token_ids.len();
         self.ensure_buffers(batch_size)?;
-        self.ensure_staging(batch_size, paged_attn.max_num_blocks_per_seq as usize)?;
+        // Pre-allocate staging for max possible blocks to avoid reallocation
+        // (which would invalidate captured graph pointers)
+        let max_possible_blocks = (self.weights.config.max_position_embeddings
+            / paged_attn.block_size.max(1) as usize).max(paged_attn.max_num_blocks_per_seq as usize);
+        self.ensure_staging(batch_size, max_possible_blocks)?;
         self.cache_kv_info(paged_attn);
 
         let buffers = self.buffers.as_ref().unwrap();
