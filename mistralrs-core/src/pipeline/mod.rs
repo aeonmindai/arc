@@ -506,16 +506,15 @@ pub trait Pipeline:
                             .iter().map(|&x| x as i32).collect();
 
                         if !token_ids.is_empty() {
-                            match dedicated.run_step(&token_ids, &positions) {
-                                Ok(_logits_ptr) => {
-                                    // TODO: wrap the logits pointer as a Candle tensor and return
-                                    // For now, fall through to Candle path
-                                    tracing::info!("Dedicated decode: step completed");
-                                }
-                                Err(e) => {
-                                    tracing::warn!("Dedicated decode failed ({e}), using Candle");
-                                }
-                            }
+                            // Dedicated decode path ready but logits wrapping not done yet.
+                            // TODO: run_step + wrap output as Candle Tensor + return
+                            // For now, log readiness and fall through to Candle.
+                            tracing::debug!(
+                                "Dedicated decode: ready (batch={}, intermediate={}, vocab={})",
+                                token_ids.len(),
+                                dedicated.weights.config.intermediate_size,
+                                dedicated.weights.config.vocab_size,
+                            );
                         }
                     }
                 }
