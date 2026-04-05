@@ -57,7 +57,9 @@ pub struct DecodeBuffers {
     pub k: u64,             // [batch, num_kv_heads * head_dim]
     pub v: u64,             // [batch, num_kv_heads * head_dim]
     pub attn_out: u64,      // [batch, num_heads * head_dim]
-    pub q_f16: u64,         // [batch, num_heads * head_dim] F16 (TurboQuant needs F16 Q)
+    pub q_f16: u64,         // [batch, num_heads * head_dim] F16 (TurboQuant needs F16)
+    pub k_f16: u64,         // [batch, num_kv_heads * head_dim] F16 (TurboQuant needs F16)
+    pub v_f16: u64,         // [batch, num_kv_heads * head_dim] F16 (TurboQuant needs F16)
     pub attn_out_f32: u64,  // [batch, num_heads * head_dim] F32 (TurboQuant outputs F32)
     pub o_proj_out: u64,    // [batch, hidden_size]
     pub gate: u64,          // [batch, intermediate_size]
@@ -318,9 +320,13 @@ pub unsafe fn decode_forward(
         let lc = &paged_attn.layer_caches[layer_idx];
 
         if paged_attn.is_turbo {
-            // TurboQuant: quantize K/V into U8 cache with per-token norms
+            // Cast K/V from BF16 → F16 (TurboQuant kernels expect F16 input)
+            let kv_size = (bs as usize * nkv * hd) as i32;
+            launch_cast_bf16_to_f16(buffers.k as *const _, buffers.k_f16 as *mut _, kv_size, stream);
+            launch_cast_bf16_to_f16(buffers.v as *const _, buffers.v_f16 as *mut _, kv_size, stream);
+            // TurboQuant: quantize F16 K/V into U8 cache with per-token norms
             turbo_reshape_and_cache(
-                buffers.k as *const _, buffers.v as *const _,
+                buffers.k_f16 as *const _, buffers.v_f16 as *const _,
                 lc.key_cache as *const _, lc.value_cache as *const _,
                 lc.k_norms as *const _, lc.v_norms as *const _,
                 paged_attn.slot_mappings as *const i64,
@@ -329,9 +335,9 @@ pub unsafe fn decode_forward(
                 paged_attn.kv_block_stride, paged_attn.kv_head_stride,
                 paged_attn.norm_block_stride, paged_attn.norm_head_stride,
                 stream,
-                1, // dtype = BF16 input
+                0, // dtype = F16 input (already cast)
             );
-            // Cast Q from BF16 → F16 (TurboQuant kernel expects F16)
+            // Cast Q from BF16 → F16 (TurboQuant attention expects F16)
             let q_size = (bs as usize * nh * hd) as i32;
             launch_cast_bf16_to_f16(
                 buffers.q as *const _, buffers.q_f16 as *mut _, q_size, stream,

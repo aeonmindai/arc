@@ -206,8 +206,10 @@ impl DedicatedDecodePath {
             k: alloc!(bs * cfg.num_kv_heads * cfg.head_dim * bf16),
             v: alloc!(bs * cfg.num_kv_heads * cfg.head_dim * bf16),
             attn_out: alloc!(bs * cfg.num_heads * cfg.head_dim * bf16),
-            q_f16: alloc!(bs * cfg.num_heads * cfg.head_dim * bf16), // F16 same size as BF16
-            attn_out_f32: alloc!(bs * cfg.num_heads * cfg.head_dim * 4), // F32 = 4 bytes
+            q_f16: alloc!(bs * cfg.num_heads * cfg.head_dim * bf16),
+            k_f16: alloc!(bs * cfg.num_kv_heads * cfg.head_dim * bf16),
+            v_f16: alloc!(bs * cfg.num_kv_heads * cfg.head_dim * bf16),
+            attn_out_f32: alloc!(bs * cfg.num_heads * cfg.head_dim * 4),
             o_proj_out: alloc!(bs * cfg.hidden_size * bf16),
             gate: alloc!(bs * cfg.intermediate_size * bf16),
             up: alloc!(bs * cfg.intermediate_size * bf16),
@@ -469,7 +471,8 @@ impl Drop for DedicatedDecodePath {
             if self.staging_slot_mappings != 0 { cudaFree(self.staging_slot_mappings); }
             if let Some(ref b) = self.buffers {
                 for ptr in [b.hidden_a, b.hidden_b, b.normed, b.residual,
-                    b.q, b.k, b.v, b.attn_out, b.q_f16, b.attn_out_f32,
+                    b.q, b.k, b.v, b.attn_out,
+                    b.q_f16, b.k_f16, b.v_f16, b.attn_out_f32,
                     b.o_proj_out,
                     b.gate, b.up, b.mlp_act, b.down_out, b.logits,
                     b.token_ids, b.positions] {
