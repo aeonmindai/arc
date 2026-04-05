@@ -382,9 +382,14 @@ impl DedicatedDecodePath {
                     }
                 }
             } else if self.capture_failed {
-                // Capture previously failed — just run eager (still fast, no Candle overhead)
+                // Eager mode — still fast (no Candle overhead, just kernel launch costs)
                 decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
-            } else if self.eager_steps < 2 {
+            } else if self.eager_steps < 1000000 {
+                // TODO: Graph capture disabled — max_context_len changes per step which
+                // causes the TurboQuant attention kernel's shared memory allocation to be
+                // wrong on replay. Need to either pad max_context_len to a fixed upper
+                // bound during capture, or use kernel node parameter updates.
+                // For now, eager mode gives us the full speed benefit of bypassing Candle.
                 self.eager_steps += 1;
                 decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
                 if self.eager_steps == 2 {
