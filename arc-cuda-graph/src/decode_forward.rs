@@ -18,23 +18,30 @@ use candle_core::cuda::cudarc::driver::sys::CUstream;
 #[cfg(feature = "cuda")]
 #[derive(Clone)]
 pub struct LayerKvCache {
-    pub key_cache: u64,   // [num_blocks, num_kv_heads, head_dim/x, block_size, x]
-    pub value_cache: u64, // [num_blocks, num_kv_heads, head_dim, block_size]
+    pub key_cache: u64,   // Standard: [num_blocks, num_kv_heads, head_dim/x, block_size, x]
+                          // TurboQuant: [num_blocks, num_kv_heads, packed_bytes, block_size] U8
+    pub value_cache: u64, // Standard: [num_blocks, num_kv_heads, head_dim, block_size]
+                          // TurboQuant: [num_blocks, num_kv_heads, packed_bytes, block_size] U8
+    pub k_norms: u64,     // TurboQuant only: [num_blocks, num_kv_heads, block_size] F16, 0 if standard
+    pub v_norms: u64,     // TurboQuant only: same shape, 0 if standard
 }
 
 /// All paged attention state needed for one decode step.
 #[cfg(feature = "cuda")]
 pub struct PagedAttentionState {
     pub layer_caches: Vec<LayerKvCache>,
-    pub block_tables: u64,     // [num_seqs, max_num_blocks_per_seq] i32
-    pub context_lens: u64,     // [num_seqs] i32
+    pub block_tables: u64,     // [num_seqs, max_num_blocks_per_seq] i32 (or u32 for turbo)
+    pub context_lens: u64,     // [num_seqs] i32 (or u32 for turbo)
     pub slot_mappings: u64,    // [num_tokens] i64
     pub block_size: i32,
     pub max_context_len: i32,
     pub max_num_blocks_per_seq: i32,
     pub kv_block_stride: i32,  // stride[0] of key_cache
     pub kv_head_stride: i32,   // stride[1] of key_cache
+    pub norm_block_stride: i32, // stride[0] of norms (TurboQuant, 0 if standard)
+    pub norm_head_stride: i32,  // stride[1] of norms (TurboQuant, 0 if standard)
     pub x: i32,                // 16 / sizeof(element) — interleave factor for key cache
+    pub is_turbo: bool,        // TurboQuant mode
 }
 
 /// Pre-allocated intermediate buffers for one decode step.
@@ -302,58 +309,67 @@ pub unsafe fn decode_forward(
             bs as i32, buffers.is_neox as i32, stream,
         );
 
-        // Store K/V into the paged KV cache
+        // Store K/V into the paged KV cache + run attention
         let kv_stride = (nkv * hd) as i32;
-        let lc = &paged_attn.layer_caches[layer_idx];
-        reshape_and_cache(
-            buffers.k as *const _,
-            buffers.v as *const _,
-            lc.key_cache as *const _,
-            lc.value_cache as *const _,
-            paged_attn.slot_mappings as *const i64,
-            bs as i32,        // num_tokens
-            nkv as i32,       // num_heads (kv heads)
-            hd as i32,        // head_size
-            paged_attn.block_size,
-            paged_attn.x,
-            kv_stride,        // key_stride
-            kv_stride,        // value_stride
-            stream,
-            1,                // dtype = BF16
-            1,                // cache_dtype = BF16
-            std::ptr::null(), // k_scale (no FP8)
-            std::ptr::null(), // v_scale
-        );
-
-        // Paged attention: read Q + KV cache → attn_out
         let q_stride = (nh * hd) as i32;
         let scale = 1.0f32 / (hd as f32).sqrt();
-        paged_attention_v1_bf16(
-            buffers.attn_out as *const _,
-            buffers.q as *const _,
-            lc.key_cache as *const _,
-            lc.value_cache as *const _,
-            std::ptr::null(),  // alibi_slopes
-            nkv as i32,
-            scale,
-            1.0,               // softcapping (1.0 = disabled)
-            paged_attn.block_tables as *const i32,
-            paged_attn.context_lens as *const i32,
-            paged_attn.block_size,
-            paged_attn.max_context_len,
-            bs as i32,         // num_seqs
-            nh as i32,         // num_heads
-            hd as i32,         // head_size
-            paged_attn.max_num_blocks_per_seq,
-            q_stride,
-            paged_attn.kv_block_stride,
-            paged_attn.kv_head_stride,
-            stream,
-            1,                 // cache_dtype = BF16
-            std::ptr::null(),  // k_scale
-            std::ptr::null(),  // v_scale
-            std::ptr::null(),  // sinks
-        );
+        let lc = &paged_attn.layer_caches[layer_idx];
+
+        if paged_attn.is_turbo {
+            // TurboQuant: quantize K/V into U8 cache with per-token norms
+            turbo_reshape_and_cache(
+                buffers.k as *const _, buffers.v as *const _,
+                lc.key_cache as *const _, lc.value_cache as *const _,
+                lc.k_norms as *const _, lc.v_norms as *const _,
+                paged_attn.slot_mappings as *const i64,
+                bs as i32, nkv as i32, hd as i32, paged_attn.block_size,
+                kv_stride, kv_stride,
+                paged_attn.kv_block_stride, paged_attn.kv_head_stride,
+                paged_attn.norm_block_stride, paged_attn.norm_head_stride,
+                stream,
+                1, // dtype = BF16 input
+            );
+            // TurboQuant attention: dequant from U8 cache
+            turbo_paged_attention_v1_f16(
+                buffers.attn_out as *const _, buffers.q as *const _,
+                lc.key_cache as *const _, lc.value_cache as *const _,
+                lc.k_norms as *const _, lc.v_norms as *const _,
+                nkv as i32, scale, 1.0,
+                paged_attn.block_tables as *const u32,
+                paged_attn.context_lens as *const u32,
+                paged_attn.block_size, paged_attn.max_context_len,
+                bs as i32, nh as i32, hd as i32, paged_attn.max_num_blocks_per_seq,
+                q_stride,
+                paged_attn.kv_block_stride, paged_attn.kv_head_stride,
+                paged_attn.norm_block_stride, paged_attn.norm_head_stride,
+                stream,
+            );
+        } else {
+            // Standard BF16 cache
+            reshape_and_cache(
+                buffers.k as *const _, buffers.v as *const _,
+                lc.key_cache as *const _, lc.value_cache as *const _,
+                paged_attn.slot_mappings as *const i64,
+                bs as i32, nkv as i32, hd as i32, paged_attn.block_size, paged_attn.x,
+                kv_stride, kv_stride,
+                stream, 1, 1, // dtype=BF16, cache_dtype=BF16
+                std::ptr::null(), std::ptr::null(),
+            );
+            paged_attention_v1_bf16(
+                buffers.attn_out as *const _, buffers.q as *const _,
+                lc.key_cache as *const _, lc.value_cache as *const _,
+                std::ptr::null(), // alibi_slopes
+                nkv as i32, scale, 1.0,
+                paged_attn.block_tables as *const i32,
+                paged_attn.context_lens as *const i32,
+                paged_attn.block_size, paged_attn.max_context_len,
+                bs as i32, nh as i32, hd as i32, paged_attn.max_num_blocks_per_seq,
+                q_stride,
+                paged_attn.kv_block_stride, paged_attn.kv_head_stride,
+                stream, 1, // cache_dtype=BF16
+                std::ptr::null(), std::ptr::null(), std::ptr::null(),
+            );
+        }
 
         // O projection
         gemm_bf16(cublas, stream, lw.o_proj.ptr, buffers.attn_out, buffers.o_proj_out,
@@ -457,6 +473,52 @@ extern "C" {
         k_scale: *const f32,
         v_scale: *const f32,
         sinks: *const f32,
+    );
+    fn turbo_reshape_and_cache(
+        key: *const std::ffi::c_void,
+        value: *const std::ffi::c_void,
+        key_cache: *const std::ffi::c_void,
+        value_cache: *const std::ffi::c_void,
+        k_norms: *const std::ffi::c_void,
+        v_norms: *const std::ffi::c_void,
+        slot_mapping: *const i64,
+        num_tokens: i32,
+        num_heads: i32,
+        head_size: i32,
+        block_size: i32,
+        key_stride: i32,
+        value_stride: i32,
+        kv_block_stride: i32,
+        kv_head_stride: i32,
+        norm_block_stride: i32,
+        norm_head_stride: i32,
+        stream: CUstream,
+        dtype: u32,
+    );
+    fn turbo_paged_attention_v1_f16(
+        out: *const std::ffi::c_void,
+        query: *const std::ffi::c_void,
+        k_cache: *const std::ffi::c_void,
+        v_cache: *const std::ffi::c_void,
+        k_norms: *const std::ffi::c_void,
+        v_norms: *const std::ffi::c_void,
+        num_kv_heads: i32,
+        scale: f32,
+        softcapping: f32,
+        block_tables: *const u32,
+        context_lens: *const u32,
+        block_size: i32,
+        max_context_len: i32,
+        num_seqs: i32,
+        num_heads: i32,
+        head_size: i32,
+        max_num_blocks_per_seq: i32,
+        q_stride: i32,
+        kv_block_stride: i32,
+        kv_head_stride: i32,
+        norm_block_stride: i32,
+        norm_head_stride: i32,
+        stream: CUstream,
     );
 }
 

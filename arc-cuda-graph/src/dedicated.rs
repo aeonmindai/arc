@@ -57,7 +57,10 @@ pub struct DedicatedDecodePath {
     cached_block_size: i32,
     cached_kv_block_stride: i32,
     cached_kv_head_stride: i32,
+    cached_norm_block_stride: i32,
+    cached_norm_head_stride: i32,
     cached_x: i32,
+    cached_is_turbo: bool,
 
     enabled: bool,
     warmup_remaining: u32,
@@ -119,7 +122,10 @@ impl DedicatedDecodePath {
             cached_block_size: 0,
             cached_kv_block_stride: 0,
             cached_kv_head_stride: 0,
+            cached_norm_block_stride: 0,
+            cached_norm_head_stride: 0,
             cached_x: 0,
+            cached_is_turbo: false,
             enabled: true,
             warmup_remaining: 2,
             eager_steps: 0,
@@ -293,7 +299,10 @@ impl DedicatedDecodePath {
             max_num_blocks_per_seq: self.staging_max_blocks_per_seq as i32,
             kv_block_stride: self.cached_kv_block_stride,
             kv_head_stride: self.cached_kv_head_stride,
+            norm_block_stride: self.cached_norm_block_stride,
+            norm_head_stride: self.cached_norm_head_stride,
             x: self.cached_x,
+            is_turbo: self.cached_is_turbo,
         }
     }
 
@@ -305,7 +314,10 @@ impl DedicatedDecodePath {
             self.cached_block_size = paged_attn.block_size;
             self.cached_kv_block_stride = paged_attn.kv_block_stride;
             self.cached_kv_head_stride = paged_attn.kv_head_stride;
+            self.cached_norm_block_stride = paged_attn.norm_block_stride;
+            self.cached_norm_head_stride = paged_attn.norm_head_stride;
             self.cached_x = paged_attn.x;
+            self.cached_is_turbo = paged_attn.is_turbo;
         }
     }
 

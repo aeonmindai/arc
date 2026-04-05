@@ -556,8 +556,9 @@ pub trait Pipeline:
         let cache_config = metadata.cache_config.as_ref()?;
         let device = self.device();
 
-        // Dedicated path only supports BF16 cache — fall back for TurboQuant/FP8
-        if !matches!(cache_config.cache_type, crate::paged_attention::PagedCacheType::Auto) {
+        let is_turbo = cache_config.cache_type.is_turboquant();
+        // FP8 cache not yet supported in dedicated path
+        if matches!(cache_config.cache_type, crate::paged_attention::PagedCacheType::F8E4M3) {
             return None;
         }
 
@@ -594,18 +595,24 @@ pub trait Pipeline:
         let num_layers = kv_cache.len();
 
         let mut layer_caches = Vec::with_capacity(num_layers);
-        for (key_cache, value_cache, _, _) in kv_cache.iter() {
+        for (key_cache, value_cache, k_norms_opt, v_norms_opt) in kv_cache.iter() {
             let kc_ptr = match arc_cuda_graph::tensor_device_ptr(key_cache) {
-                Ok(p) => p,
-                Err(e) => return Some(Err(e)),
+                Ok(p) => p, Err(e) => return Some(Err(e)),
             };
             let vc_ptr = match arc_cuda_graph::tensor_device_ptr(value_cache) {
-                Ok(p) => p,
-                Err(e) => return Some(Err(e)),
+                Ok(p) => p, Err(e) => return Some(Err(e)),
+            };
+            let kn_ptr = match k_norms_opt.as_ref().map(arc_cuda_graph::tensor_device_ptr) {
+                Some(Ok(p)) => p, Some(Err(e)) => return Some(Err(e)), None => 0,
+            };
+            let vn_ptr = match v_norms_opt.as_ref().map(arc_cuda_graph::tensor_device_ptr) {
+                Some(Ok(p)) => p, Some(Err(e)) => return Some(Err(e)), None => 0,
             };
             layer_caches.push(LayerKvCache {
                 key_cache: kc_ptr,
                 value_cache: vc_ptr,
+                k_norms: kn_ptr,
+                v_norms: vn_ptr,
             });
         }
 
@@ -637,22 +644,33 @@ pub trait Pipeline:
         };
 
         // Compute cache strides from key_cache shape
-        // key_cache: [num_blocks, num_kv_heads, head_dim/x, block_size, x]
         let kc_shape = kv_cache[0].0.dims();
         let block_size = cache_config.block_size as i32;
-        let (max_num_blocks_per_seq, kv_block_stride, kv_head_stride, x) = if kc_shape.len() == 5 {
-            let (_num_blocks, _num_kv_heads, head_dim_over_x, bs, x_val) =
-                (kc_shape[0], kc_shape[1], kc_shape[2], kc_shape[3], kc_shape[4]);
-            // Strides in elements (not bytes) — the paged attention kernel uses element strides
-            let kv_head_stride = (head_dim_over_x * bs * x_val) as i32;
-            let kv_block_stride = (kc_shape[1] * head_dim_over_x * bs * x_val) as i32;
-            let max_blocks = block_tables_tensor.map(|bt| {
-                if bt.dims().len() >= 2 { bt.dims()[1] } else { 1 }
-            }).unwrap_or(1);
-            (max_blocks as i32, kv_block_stride, kv_head_stride, x_val as i32)
+        let max_blocks = block_tables_tensor.map(|bt| {
+            if bt.dims().len() >= 2 { bt.dims()[1] } else { 1 }
+        }).unwrap_or(1) as i32;
+
+        let (kv_block_stride, kv_head_stride, x) = if kc_shape.len() == 5 {
+            // Standard: [num_blocks, num_kv_heads, head_dim/x, block_size, x]
+            let (d2, d3, d4) = (kc_shape[2], kc_shape[3], kc_shape[4]);
+            ((kc_shape[1] * d2 * d3 * d4) as i32, (d2 * d3 * d4) as i32, d4 as i32)
+        } else if kc_shape.len() == 4 {
+            // TurboQuant: [num_blocks, num_kv_heads, packed_bytes, block_size]
+            let (d2, d3) = (kc_shape[2], kc_shape[3]);
+            ((kc_shape[1] * d2 * d3) as i32, (d2 * d3) as i32, 1)
         } else {
-            return None; // Unexpected cache shape
+            return None;
         };
+
+        // Norm strides for TurboQuant: norms shape [num_blocks, num_kv_heads, block_size]
+        let (norm_block_stride, norm_head_stride) = if is_turbo {
+            if let Some(ref kn) = kv_cache[0].2 {
+                let ns = kn.dims();
+                if ns.len() == 3 {
+                    ((ns[1] * ns[2]) as i32, ns[2] as i32)
+                } else { (0, 0) }
+            } else { (0, 0) }
+        } else { (0, 0) };
 
         let max_context_len = paged_meta.max_context_len.unwrap_or(0) as i32;
 
@@ -663,10 +681,13 @@ pub trait Pipeline:
             slot_mappings: slot_mappings_ptr,
             block_size,
             max_context_len,
-            max_num_blocks_per_seq,
+            max_num_blocks_per_seq: max_blocks,
             kv_block_stride,
             kv_head_stride,
+            norm_block_stride,
+            norm_head_stride,
             x,
+            is_turbo,
         };
 
         // Drop the KV cache lock before running
