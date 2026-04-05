@@ -483,45 +483,212 @@ pub trait Pipeline:
     fn graph_wrapped_forward(
         &mut self,
         inputs: Box<dyn Any>,
-        is_prompt: bool,
+        _is_prompt: bool,
         return_raw_logits: bool,
     ) -> Result<ForwardInputsResult, candle_core::Error> {
         // Dedicated decode path: bypasses Candle, runs on non-blocking stream
         #[cfg(feature = "cuda")]
-        if !is_prompt && !return_raw_logits {
-            if let Some(dedicated) = self.dedicated_decode_mut() {
-                if dedicated.tick_warmup() {
-                    // Still warming up — fall through to Candle
-                } else if dedicated.is_enabled() {
-                    // Extract token IDs and positions from ModelInputs
-                    if let Some(model_inputs) = inputs.downcast_ref::<text_models_inputs_processor::ModelInputs>() {
-                        let token_ids: Vec<i32> = {
-                            // input_ids is [batch, 1] — extract the single token per sequence
-                            let ids = model_inputs.input_ids.flatten_all()
-                                .and_then(|t| t.to_vec1::<u32>())
-                                .unwrap_or_default();
-                            ids.into_iter().map(|x| x as i32).collect()
-                        };
-                        let positions: Vec<i32> = model_inputs.seqlen_offsets
-                            .iter().map(|&x| x as i32).collect();
-
-                        if !token_ids.is_empty() {
-                            // Dedicated decode path ready but logits wrapping not done yet.
-                            // TODO: run_step + wrap output as Candle Tensor + return
-                            // For now, log readiness and fall through to Candle.
-                            tracing::debug!(
-                                "Dedicated decode: ready (batch={}, intermediate={}, vocab={})",
-                                token_ids.len(),
-                                dedicated.weights.config.intermediate_size,
-                                dedicated.weights.config.vocab_size,
-                            );
-                        }
-                    }
-                }
+        if !_is_prompt && !return_raw_logits {
+            // Build paged attention state from ModelInputs + CacheEngine, then run dedicated path
+            let dedicated_result = self.try_dedicated_decode(&inputs);
+            if let Some(result) = dedicated_result {
+                return result;
             }
         }
 
         self.forward_inputs(inputs, return_raw_logits)
+    }
+
+    /// Attempt to run the dedicated decode path. Returns Some(result) if it ran,
+    /// None if we should fall through to Candle.
+    #[cfg(feature = "cuda")]
+    fn try_dedicated_decode(
+        &mut self,
+        inputs: &Box<dyn Any>,
+    ) -> Option<Result<ForwardInputsResult, candle_core::Error>> {
+        use arc_cuda_graph::{PagedAttentionState, LayerKvCache};
+        use candle_core::cuda::cudarc::driver::DevicePtr;
+
+        // Extract model inputs
+        let model_inputs = inputs.downcast_ref::<text_models_inputs_processor::ModelInputs>()?;
+        let paged_meta = model_inputs.paged_attn_meta.as_ref()?;
+
+        // Check dedicated path readiness
+        let metadata = self.get_metadata();
+        let cache_engine = metadata.cache_engine.as_ref()?;
+        let cache_config = metadata.cache_config.as_ref()?;
+        let device = self.device();
+
+        // Get the dedicated decode path — need two-phase borrow to avoid holding &mut self
+        // First check warmup/enabled without running
+        {
+            let dedicated = self.dedicated_decode_mut()?;
+            if dedicated.tick_warmup() {
+                return None; // Still warming up
+            }
+            if !dedicated.is_enabled() {
+                return None;
+            }
+        }
+
+        // Extract token IDs and positions
+        let token_ids: Vec<i32> = {
+            let ids = model_inputs.input_ids.flatten_all()
+                .and_then(|t| t.to_vec1::<u32>())
+                .unwrap_or_default();
+            ids.into_iter().map(|x| x as i32).collect()
+        };
+        let positions: Vec<i32> = model_inputs.seqlen_offsets
+            .iter().map(|&x| x as i32).collect();
+
+        if token_ids.is_empty() {
+            return None;
+        }
+
+        let batch_size = token_ids.len();
+
+        // Extract KV cache pointers from CacheEngine
+        let kv_cache = cache_engine.get_kv_cache();
+        let num_layers = kv_cache.len();
+
+        let mut layer_caches = Vec::with_capacity(num_layers);
+        for (key_cache, value_cache, _, _) in kv_cache.iter() {
+            let kc_ptr = match arc_cuda_graph::tensor_device_ptr(key_cache) {
+                Ok(p) => p,
+                Err(e) => return Some(Err(e)),
+            };
+            let vc_ptr = match arc_cuda_graph::tensor_device_ptr(value_cache) {
+                Ok(p) => p,
+                Err(e) => return Some(Err(e)),
+            };
+            layer_caches.push(LayerKvCache {
+                key_cache: kc_ptr,
+                value_cache: vc_ptr,
+            });
+        }
+
+        // Extract block_tables, context_lens, slot_mappings pointers
+        let dev_loc = candle_core::DeviceLocation::Cuda { gpu_id: 0 };
+
+        let block_tables_tensor = paged_meta.block_tables.as_ref()
+            .and_then(|bt| bt.get(&dev_loc));
+        let context_lens_tensor = paged_meta.context_lens.as_ref()
+            .and_then(|cl| cl.get(&dev_loc));
+        let slot_mappings_tensor = paged_meta.slot_mappings.get(&dev_loc);
+
+        let (block_tables_ptr, context_lens_ptr, slot_mappings_ptr) = match (
+            block_tables_tensor, context_lens_tensor, slot_mappings_tensor
+        ) {
+            (Some(bt), Some(cl), Some(sm)) => {
+                let bt_ptr = match arc_cuda_graph::tensor_device_ptr(bt) {
+                    Ok(p) => p, Err(e) => return Some(Err(e)),
+                };
+                let cl_ptr = match arc_cuda_graph::tensor_device_ptr(cl) {
+                    Ok(p) => p, Err(e) => return Some(Err(e)),
+                };
+                let sm_ptr = match arc_cuda_graph::tensor_device_ptr(sm) {
+                    Ok(p) => p, Err(e) => return Some(Err(e)),
+                };
+                (bt_ptr, cl_ptr, sm_ptr)
+            }
+            _ => return None, // No paged attention metadata — fall through
+        };
+
+        // Compute cache strides from key_cache shape
+        // key_cache: [num_blocks, num_kv_heads, head_dim/x, block_size, x]
+        let kc_shape = kv_cache[0].0.dims();
+        let block_size = cache_config.block_size as i32;
+        let (max_num_blocks_per_seq, kv_block_stride, kv_head_stride, x) = if kc_shape.len() == 5 {
+            let (_num_blocks, _num_kv_heads, head_dim_over_x, bs, x_val) =
+                (kc_shape[0], kc_shape[1], kc_shape[2], kc_shape[3], kc_shape[4]);
+            // Strides in elements (not bytes) — the paged attention kernel uses element strides
+            let kv_head_stride = (head_dim_over_x * bs * x_val) as i32;
+            let kv_block_stride = (kc_shape[1] * head_dim_over_x * bs * x_val) as i32;
+            let max_blocks = block_tables_tensor.map(|bt| {
+                if bt.dims().len() >= 2 { bt.dims()[1] } else { 1 }
+            }).unwrap_or(1);
+            (max_blocks as i32, kv_block_stride, kv_head_stride, x_val as i32)
+        } else {
+            return None; // Unexpected cache shape
+        };
+
+        let max_context_len = paged_meta.max_context_len.unwrap_or(0) as i32;
+
+        let paged_attn_state = PagedAttentionState {
+            layer_caches,
+            block_tables: block_tables_ptr,
+            context_lens: context_lens_ptr,
+            slot_mappings: slot_mappings_ptr,
+            block_size,
+            max_context_len,
+            max_num_blocks_per_seq,
+            kv_block_stride,
+            kv_head_stride,
+            x,
+        };
+
+        // Drop the KV cache lock before running
+        drop(kv_cache);
+
+        // Run the dedicated decode path
+        let dedicated = self.dedicated_decode_mut().unwrap();
+        let logits_ptr = match dedicated.run_step(&token_ids, &positions, &paged_attn_state) {
+            Ok(ptr) => ptr,
+            Err(e) => return Some(Err(e)),
+        };
+
+        // Wrap BF16 logits as a Candle Tensor
+        let vocab_size = dedicated.weights.config.vocab_size;
+        let logits_tensor = match Self::wrap_bf16_logits(logits_ptr, batch_size, vocab_size, &device) {
+            Ok(t) => t,
+            Err(e) => return Some(Err(e)),
+        };
+
+        Some(Ok(ForwardInputsResult::CausalGeneration { logits: logits_tensor }))
+    }
+
+    /// Wrap a raw BF16 GPU pointer as a Candle Tensor without copying.
+    #[cfg(feature = "cuda")]
+    fn wrap_bf16_logits(
+        ptr: u64,
+        batch_size: usize,
+        vocab_size: usize,
+        device: &Device,
+    ) -> candle_core::Result<Tensor> {
+        use candle_core::{DType, Shape};
+
+        // Create a BF16 tensor from the raw logits, then cast to F32 for sampling
+        let elem_count = batch_size * vocab_size;
+        let shape = Shape::from_dims(&[batch_size, vocab_size]);
+
+        // We need to wrap the existing GPU memory as a Candle Tensor.
+        // The logits buffer is owned by DedicatedDecodePath and persists across calls.
+        // We copy to a new tensor to avoid aliasing the pre-allocated buffer.
+        let logits_bf16 = unsafe {
+            extern "C" {
+                fn cudaMemcpy(
+                    dst: *mut std::ffi::c_void, src: *const std::ffi::c_void,
+                    count: usize, kind: u32,
+                ) -> u32;
+            }
+            // Allocate a fresh tensor on the same device
+            let fresh = Tensor::zeros(shape.clone(), DType::BF16, device)?;
+            let fresh_ptr = arc_cuda_graph::tensor_device_ptr(&fresh)?;
+            // D2D copy from the decode buffer to the fresh tensor
+            let status = cudaMemcpy(
+                fresh_ptr as *mut _,
+                ptr as *const _,
+                elem_count * 2, // BF16 = 2 bytes
+                3, // cudaMemcpyDeviceToDevice
+            );
+            if status != 0 {
+                candle_core::bail!("cudaMemcpy D2D for logits failed: {status}");
+            }
+            fresh
+        };
+
+        // Cast to F32 for sampling compatibility
+        logits_bf16.to_dtype(DType::F32)
     }
 
     /// Returns the total of model execution time.

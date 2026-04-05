@@ -1034,6 +1034,20 @@ impl Loader for NormalLoader {
             let gate_w = layers_ref.get(gate_idx).and_then(|(l, _)| l.dequantize_w().ok());
             let intermediate_size = gate_w.as_ref().map(|w| w.dims()[0]).unwrap_or(0);
 
+            // Read rms_norm_eps and rope_theta from the raw config JSON (model-agnostic)
+            let config_json: serde_json::Value = serde_json::from_str(&config).unwrap_or_default();
+            let rms_norm_eps = config_json.get("rms_norm_eps")
+                .or_else(|| config_json.get("layer_norm_epsilon"))
+                .or_else(|| config_json.get("layer_norm_eps"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1e-6) as f32;
+            let rope_theta = config_json.get("rope_theta")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(10000.0) as f32;
+            let has_qk_norm = config_json.get("qk_norm")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
             let decode_config = arc_cuda_graph::DecodeConfig {
                 num_layers: cfg.num_layers,
                 hidden_size: cfg.hidden_size,
@@ -1042,9 +1056,11 @@ impl Loader for NormalLoader {
                 head_dim: cfg.k_head_dim,
                 intermediate_size,
                 vocab_size,
-                rms_norm_eps: 1e-6,
-                rope_theta: 1e6,
-                has_qk_norm: false,
+                rms_norm_eps,
+                rope_theta,
+                has_qk_norm,
+                max_position_embeddings: max_seq_len,
+                is_gpt_neox: true, // GPT-NeoX style (half-split) — standard for all modern models
             };
             match arc_cuda_graph::extract_model_weights(&layers_ref, &residuals, decode_config) {
                 Ok(w) => {

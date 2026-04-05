@@ -14,6 +14,29 @@ use crate::weights::{DecodeConfig, ModelWeights};
 #[cfg(feature = "cuda")]
 use candle_core::cuda::cudarc::driver::sys::CUstream;
 
+/// Per-layer KV cache pointers for paged attention.
+#[cfg(feature = "cuda")]
+#[derive(Clone)]
+pub struct LayerKvCache {
+    pub key_cache: u64,   // [num_blocks, num_kv_heads, head_dim/x, block_size, x]
+    pub value_cache: u64, // [num_blocks, num_kv_heads, head_dim, block_size]
+}
+
+/// All paged attention state needed for one decode step.
+#[cfg(feature = "cuda")]
+pub struct PagedAttentionState {
+    pub layer_caches: Vec<LayerKvCache>,
+    pub block_tables: u64,     // [num_seqs, max_num_blocks_per_seq] i32
+    pub context_lens: u64,     // [num_seqs] i32
+    pub slot_mappings: u64,    // [num_tokens] i64
+    pub block_size: i32,
+    pub max_context_len: i32,
+    pub max_num_blocks_per_seq: i32,
+    pub kv_block_stride: i32,  // stride[0] of key_cache
+    pub kv_head_stride: i32,   // stride[1] of key_cache
+    pub x: i32,                // 16 / sizeof(element) — interleave factor for key cache
+}
+
 /// Pre-allocated intermediate buffers for one decode step.
 /// All at fixed GPU addresses — stable across graph replays.
 #[cfg(feature = "cuda")]
@@ -214,6 +237,7 @@ pub unsafe fn decode_forward(
     weights: &ModelWeights,
     buffers: &DecodeBuffers,
     cublas: &CublasState,
+    paged_attn: &PagedAttentionState,
     stream: CUstream,
 ) {
     let cfg = &weights.config;
@@ -224,7 +248,7 @@ pub unsafe fn decode_forward(
     let hd = cfg.head_dim;
     let inter = cfg.intermediate_size as u64;
     let eps = cfg.rms_norm_eps;
-    let theta = cfg.rope_theta;
+    let _theta = cfg.rope_theta;
 
     // Step 0: Embedding lookup
     launch_gather_embedding_bf16(
@@ -257,7 +281,7 @@ pub unsafe fn decode_forward(
         gemm_bf16(cublas, stream, lw.v_proj.ptr, buffers.normed, buffers.v,
             (nkv * hd) as u64, bs, hs);
 
-        // QK norm (Qwen3)
+        // QK norm (if model uses it)
         if let (Some(qn), Some(kn)) = (lw.q_norm, lw.k_norm) {
             launch_rmsnorm_head_bf16(
                 buffers.q as *const _, qn as *const _, buffers.q as *mut _,
@@ -278,16 +302,58 @@ pub unsafe fn decode_forward(
             bs as i32, buffers.is_neox as i32, stream,
         );
 
-        // Attention: attn_out = PagedAttention(q, k, v, cache)
-        // NOTE: Paged attention reads from the KV cache (pre-allocated by the engine).
-        // The attn kernel is called via the existing FFI from mistralrs-paged-attn.
-        // For the dedicated decode path, we need the attn kernel to read Q from
-        // buffers.q and write to buffers.attn_out. This requires wiring the existing
-        // paged_attention_v1 FFI with our buffer pointers.
-        //
-        // For now, attn_out = q (placeholder — real attention wiring needed).
-        // The GEMMs and other kernels are the main overhead; attention is already
-        // a single kernel call.
+        // Store K/V into the paged KV cache
+        let kv_stride = (nkv * hd) as i32;
+        let lc = &paged_attn.layer_caches[layer_idx];
+        reshape_and_cache(
+            buffers.k as *const _,
+            buffers.v as *const _,
+            lc.key_cache as *const _,
+            lc.value_cache as *const _,
+            paged_attn.slot_mappings as *const i64,
+            bs as i32,        // num_tokens
+            nkv as i32,       // num_heads (kv heads)
+            hd as i32,        // head_size
+            paged_attn.block_size,
+            paged_attn.x,
+            kv_stride,        // key_stride
+            kv_stride,        // value_stride
+            stream,
+            1,                // dtype = BF16
+            1,                // cache_dtype = BF16
+            std::ptr::null(), // k_scale (no FP8)
+            std::ptr::null(), // v_scale
+        );
+
+        // Paged attention: read Q + KV cache → attn_out
+        let q_stride = (nh * hd) as i32;
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        paged_attention_v1_bf16(
+            buffers.attn_out as *const _,
+            buffers.q as *const _,
+            lc.key_cache as *const _,
+            lc.value_cache as *const _,
+            std::ptr::null(),  // alibi_slopes
+            nkv as i32,
+            scale,
+            1.0,               // softcapping (1.0 = disabled)
+            paged_attn.block_tables as *const i32,
+            paged_attn.context_lens as *const i32,
+            paged_attn.block_size,
+            paged_attn.max_context_len,
+            bs as i32,         // num_seqs
+            nh as i32,         // num_heads
+            hd as i32,         // head_size
+            paged_attn.max_num_blocks_per_seq,
+            q_stride,
+            paged_attn.kv_block_stride,
+            paged_attn.kv_head_stride,
+            stream,
+            1,                 // cache_dtype = BF16
+            std::ptr::null(),  // k_scale
+            std::ptr::null(),  // v_scale
+            std::ptr::null(),  // sinks
+        );
 
         // O projection
         gemm_bf16(cublas, stream, lw.o_proj.ptr, buffers.attn_out, buffers.o_proj_out,
@@ -342,6 +408,56 @@ pub unsafe fn decode_forward(
     // LM head
     gemm_bf16(cublas, stream, weights.lm_head.ptr, buffers.normed, buffers.logits,
         cfg.vocab_size as u64, bs, hs);
+}
+
+// Paged attention FFI from mistralrs-paged-attn
+#[cfg(feature = "cuda")]
+extern "C" {
+    fn reshape_and_cache(
+        key: *const std::ffi::c_void,
+        value: *const std::ffi::c_void,
+        key_cache: *const std::ffi::c_void,
+        value_cache: *const std::ffi::c_void,
+        slot_mapping: *const i64,
+        num_tokens: i32,
+        num_heads: i32,
+        head_size: i32,
+        block_size: i32,
+        x: i32,
+        key_stride: i32,
+        value_stride: i32,
+        stream: CUstream,
+        dtype: u32,
+        cache_dtype: u32,
+        k_scale: *const f32,
+        v_scale: *const f32,
+    );
+    fn paged_attention_v1_bf16(
+        out: *const std::ffi::c_void,
+        query: *const std::ffi::c_void,
+        key_cache: *const std::ffi::c_void,
+        value_cache: *const std::ffi::c_void,
+        alibi_slopes: *const std::ffi::c_void,
+        num_kv_heads: i32,
+        scale: f32,
+        softcapping: f32,
+        block_tables: *const i32,
+        context_lens: *const i32,
+        block_size: i32,
+        max_context_len: i32,
+        num_seqs: i32,
+        num_heads: i32,
+        head_size: i32,
+        max_num_blocks_per_seq: i32,
+        q_stride: i32,
+        kv_block_stride: i32,
+        kv_head_stride: i32,
+        stream: CUstream,
+        cache_dtype: u32,
+        k_scale: *const f32,
+        v_scale: *const f32,
+        sinks: *const f32,
+    );
 }
 
 // Additional kernel FFI from decode_kernels.cu (reuse existing)

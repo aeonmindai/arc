@@ -54,6 +54,8 @@ pub struct DecodeConfig {
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub has_qk_norm: bool,
+    pub max_position_embeddings: usize,
+    pub is_gpt_neox: bool,
 }
 
 /// Extract raw u64 device pointer from a Candle tensor (any dtype).
