@@ -88,6 +88,9 @@ pub struct VisionPipeline {
     imatrix: Option<PathBuf>,
     #[cfg(feature = "cuda")]
     cuda_graph_runner: Option<arc_cuda_graph::CudaGraphRunner>,
+    /// The capturable device clone — kept alive so its stream isn't destroyed.
+    #[cfg(feature = "cuda")]
+    _capturable_device: Option<candle_core::Device>,
 }
 
 /// A loader for a vision (non-quantized) model.
@@ -912,6 +915,8 @@ impl Loader for VisionLoader {
             imatrix: self.config.imatrix.clone(),
             #[cfg(feature = "cuda")]
             cuda_graph_runner: arc_cuda_graph::try_init_graph_runner(&_graph_device),
+            #[cfg(feature = "cuda")]
+            _capturable_device: Some(_graph_device),
         })))
     }
 

@@ -40,6 +40,9 @@ pub struct DiffusionPipeline {
     dummy_cache: EitherCache,
     #[cfg(feature = "cuda")]
     cuda_graph_runner: Option<arc_cuda_graph::CudaGraphRunner>,
+    /// The capturable device clone — kept alive so its stream isn't destroyed.
+    #[cfg(feature = "cuda")]
+    _capturable_device: Option<candle_core::Device>,
 }
 
 /// A loader for a vision (non-quantized) model.
@@ -258,6 +261,8 @@ impl Loader for DiffusionLoader {
             dummy_cache: EitherCache::Full(Cache::new(0, false)),
             #[cfg(feature = "cuda")]
             cuda_graph_runner: arc_cuda_graph::try_init_graph_runner(&_graph_device),
+            #[cfg(feature = "cuda")]
+            _capturable_device: Some(_graph_device),
         })))
     }
 

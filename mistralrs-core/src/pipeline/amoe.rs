@@ -49,6 +49,8 @@ pub struct AnyMoePipeline {
     config: AnyMoeConfig,
     #[cfg(feature = "cuda")]
     cuda_graph_runner: Option<arc_cuda_graph::CudaGraphRunner>,
+    #[cfg(feature = "cuda")]
+    _capturable_device: Option<candle_core::Device>,
 }
 
 impl Loader for AnyMoeLoader {
@@ -166,6 +168,8 @@ impl AnyMoePipeline {
             config,
             #[cfg(feature = "cuda")]
             cuda_graph_runner: None,
+            #[cfg(feature = "cuda")]
+            _capturable_device: None,
         };
         info!("Loaded pretraining dataset of {} samples.", inputs.len());
         match this.amoe_pre_train(

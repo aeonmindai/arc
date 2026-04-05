@@ -148,6 +148,9 @@ pub struct SpeechPipeline {
     cfg: SpeechGenerationConfig,
     #[cfg(feature = "cuda")]
     cuda_graph_runner: Option<arc_cuda_graph::CudaGraphRunner>,
+    /// The capturable device clone — kept alive so its stream isn't destroyed.
+    #[cfg(feature = "cuda")]
+    _capturable_device: Option<candle_core::Device>,
 }
 
 pub struct SpeechLoader {
@@ -334,6 +337,8 @@ impl Loader for SpeechLoader {
                 .unwrap_or_else(|| SpeechGenerationConfig::default(self.arch)),
             #[cfg(feature = "cuda")]
             cuda_graph_runner: arc_cuda_graph::try_init_graph_runner(&_graph_device),
+            #[cfg(feature = "cuda")]
+            _capturable_device: Some(_graph_device),
         })))
     }
 

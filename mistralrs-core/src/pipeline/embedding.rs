@@ -73,6 +73,9 @@ pub struct EmbeddingPipeline {
     processor: Arc<dyn Processor + Send + Sync>,
     #[cfg(feature = "cuda")]
     cuda_graph_runner: Option<arc_cuda_graph::CudaGraphRunner>,
+    /// The capturable device clone — kept alive so its stream isn't destroyed.
+    #[cfg(feature = "cuda")]
+    _capturable_device: Option<candle_core::Device>,
 }
 
 /// A loader for a vision (non-quantized) model.
@@ -657,6 +660,8 @@ impl Loader for EmbeddingLoader {
             }),
             #[cfg(feature = "cuda")]
             cuda_graph_runner: arc_cuda_graph::try_init_graph_runner(&_graph_device),
+            #[cfg(feature = "cuda")]
+            _capturable_device: Some(_graph_device),
         })))
     }
 

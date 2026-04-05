@@ -158,6 +158,8 @@ pub struct SpeculativePipeline {
     category: ModelCategory,
     #[cfg(feature = "cuda")]
     cuda_graph_runner: Option<arc_cuda_graph::CudaGraphRunner>,
+    #[cfg(feature = "cuda")]
+    _capturable_device: Option<candle_core::Device>,
 }
 
 #[derive(Copy, Clone)]
@@ -273,6 +275,8 @@ impl SpeculativePipeline {
             category,
             #[cfg(feature = "cuda")]
             cuda_graph_runner: None,
+            #[cfg(feature = "cuda")]
+            _capturable_device: None,
         })
     }
 }

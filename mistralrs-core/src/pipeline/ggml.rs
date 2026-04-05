@@ -60,6 +60,9 @@ pub struct GGMLPipeline {
     metadata: Arc<GeneralMetadata>,
     #[cfg(feature = "cuda")]
     cuda_graph_runner: Option<arc_cuda_graph::CudaGraphRunner>,
+    /// The capturable device clone — kept alive so its stream isn't destroyed.
+    #[cfg(feature = "cuda")]
+    _capturable_device: Option<candle_core::Device>,
 }
 
 /// A loader for a GGML model.
@@ -413,6 +416,8 @@ impl Loader for GGMLLoader {
             }),
             #[cfg(feature = "cuda")]
             cuda_graph_runner: arc_cuda_graph::try_init_graph_runner(&_graph_device),
+            #[cfg(feature = "cuda")]
+            _capturable_device: Some(_graph_device),
         })))
     }
 
