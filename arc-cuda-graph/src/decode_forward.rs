@@ -142,7 +142,7 @@ extern "C" {
     ) -> u32;
 }
 
-// cuBLASLt constants
+// cuBLAS constants
 #[cfg(feature = "cuda")]
 const CUBLAS_COMPUTE_32F: u32 = 68;
 #[cfg(feature = "cuda")]
@@ -158,10 +158,32 @@ const CUBLAS_OP_N: i32 = 0;
 #[cfg(feature = "cuda")]
 const CUBLASLT_MATMUL_PREF_MAX_WORKSPACE: u32 = 1;
 
-/// Execute a BF16 GEMM: D = A^T * B
-/// A (weight): [M, K] row-major = [K, M] col-major → transA=T gives [M, K]
-/// B (input): [K, N] col-major (batch=N on last dim)
-/// D (output): [M, N] col-major
+// Legacy cuBLAS FFI (more reliable for small N)
+#[cfg(feature = "cuda")]
+extern "C" {
+    fn cublasCreate_v2(handle: *mut *mut std::ffi::c_void) -> u32;
+    fn cublasDestroy_v2(handle: *mut std::ffi::c_void) -> u32;
+    fn cublasSetStream_v2(handle: *mut std::ffi::c_void, stream: CUstream) -> u32;
+    fn cublasGemmEx(
+        handle: *mut std::ffi::c_void,
+        transa: i32, transb: i32,
+        m: i32, n: i32, k: i32,
+        alpha: *const std::ffi::c_void,
+        a: *const std::ffi::c_void, a_type: u32, lda: i32,
+        b: *const std::ffi::c_void, b_type: u32, ldb: i32,
+        beta: *const std::ffi::c_void,
+        c: *mut std::ffi::c_void, c_type: u32, ldc: i32,
+        compute_type: u32, algo: u32,
+    ) -> u32;
+}
+
+/// Execute a BF16 GEMM: C = A^T * B using cublasGemmEx
+/// A (weight): [M, K] row-major = [K, M] col-major → transA=T
+/// B (input): [K, N] col-major
+/// C (output): [M, N] col-major
+///
+/// Uses the legacy cuBLAS API which handles N=1 reliably (cuBLASLt returns
+/// CUBLAS_STATUS_NOT_SUPPORTED for small N with BF16 on Blackwell).
 #[cfg(feature = "cuda")]
 unsafe fn gemm_bf16(
     cublas: &CublasState,
@@ -173,80 +195,31 @@ unsafe fn gemm_bf16(
     n: u64,       // batch
     k: u64,       // in_dim
 ) {
-    let mut desc: *mut std::ffi::c_void = std::ptr::null_mut();
-    cublasLtMatmulDescCreate(&mut desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
-
-    let transa = CUBLAS_OP_T;
-    cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA,
-        &transa as *const _ as *const _, 4);
-    let transb = CUBLAS_OP_N;
-    cublasLtMatmulDescSetAttribute(desc, 1, // TRANSB
-        &transb as *const _ as *const _, 4);
-
-    // A: weight [M, K] row-major = [K, M] col-major, ld=K
-    let mut a_layout: *mut std::ffi::c_void = std::ptr::null_mut();
-    cublasLtMatrixLayoutCreate(&mut a_layout, CUDA_R_16BF, k, m, k as i64);
-
-    // B: input [K, N] col-major, ld=K
-    let mut b_layout: *mut std::ffi::c_void = std::ptr::null_mut();
-    cublasLtMatrixLayoutCreate(&mut b_layout, CUDA_R_16BF, k, n, k as i64);
-
-    // C/D: output [M, N] col-major, ld=M
-    let mut c_layout: *mut std::ffi::c_void = std::ptr::null_mut();
-    cublasLtMatrixLayoutCreate(&mut c_layout, CUDA_R_16BF, m, n, m as i64);
-    let mut d_layout: *mut std::ffi::c_void = std::ptr::null_mut();
-    cublasLtMatrixLayoutCreate(&mut d_layout, CUDA_R_16BF, m, n, m as i64);
-
-    // Algorithm selection
-    let mut pref: *mut std::ffi::c_void = std::ptr::null_mut();
-    cublasLtMatmulPreferenceCreate(&mut pref);
-    let ws = cublas.workspace_size;
-    cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE,
-        &ws as *const _ as *const _, std::mem::size_of::<usize>());
-
-    let mut heuristic = [0u8; 80];
-    let mut algo_count: i32 = 0;
-    let s = cublasLtMatmulAlgoGetHeuristic(
-        cublas.handle, desc, a_layout, b_layout, c_layout, d_layout,
-        pref, 1, &mut heuristic, &mut algo_count,
-    );
-    if s != 0 || algo_count == 0 {
-        // Log once — this is critical
-        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            tracing::error!("cuBLASLt heuristic failed: status={s} algo_count={algo_count} m={m} n={n} k={k}");
-        }
-    }
-
     let alpha: f32 = 1.0;
     let beta: f32 = 0.0;
 
-    let s = cublasLtMatmul(
-        cublas.handle, desc,
+    // A: weight [M, K] row-major = [K, M] col-major, ld=K, transA=T → [M, K]
+    // B: input [K, N] col-major, ld=K, transB=N
+    // C: output [M, N] col-major, ld=M
+    cublasSetStream_v2(cublas.handle, stream);
+    let s = cublasGemmEx(
+        cublas.handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        m as i32, n as i32, k as i32,
         &alpha as *const _ as *const _,
-        weight as *const _, a_layout,
-        input as *const _, b_layout,
+        weight as *const _, CUDA_R_16BF, k as i32, // A: [K, M] col-major, ld=K
+        input as *const _, CUDA_R_16BF, k as i32,  // B: [K, N] col-major, ld=K
         &beta as *const _ as *const _,
-        output as *const _, c_layout,
-        output as *mut _, d_layout,
-        heuristic.as_ptr() as *const _, // algo is first field
-        cublas.workspace as *mut _,
-        cublas.workspace_size,
-        stream,
+        output as *mut _, CUDA_R_16BF, m as i32,   // C: [M, N] col-major, ld=M
+        CUBLAS_COMPUTE_32F,
+        0, // CUBLAS_GEMM_DEFAULT
     );
     if s != 0 {
-        static LOGGED2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !LOGGED2.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            tracing::error!("cuBLASLt matmul failed: status={s} m={m} n={n} k={k}");
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::error!("cublasGemmEx failed: status={s} m={m} n={n} k={k}");
         }
     }
-
-    cublasLtMatmulPreferenceDestroy(pref);
-    cublasLtMatrixLayoutDestroy(d_layout);
-    cublasLtMatrixLayoutDestroy(c_layout);
-    cublasLtMatrixLayoutDestroy(b_layout);
-    cublasLtMatrixLayoutDestroy(a_layout);
-    cublasLtMatmulDescDestroy(desc);
 }
 
 /// Run the full decode forward pass for one step.

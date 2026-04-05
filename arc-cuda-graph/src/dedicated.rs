@@ -19,8 +19,8 @@ use candle_core::cuda::cudarc::driver::sys::CUstream;
 
 #[cfg(feature = "cuda")]
 extern "C" {
-    fn cublasLtCreate(handle: *mut *mut std::ffi::c_void) -> u32;
-    fn cublasLtDestroy(handle: *mut std::ffi::c_void) -> u32;
+    fn cublasCreate_v2(handle: *mut *mut std::ffi::c_void) -> u32;
+    fn cublasDestroy_v2(handle: *mut std::ffi::c_void) -> u32;
     fn cudaMalloc(ptr: *mut u64, size: usize) -> u32;
     fn cudaFree(ptr: u64) -> u32;
     fn cudaMemcpyAsync(
@@ -83,24 +83,20 @@ impl DedicatedDecodePath {
         }
 
         let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
-        let s = unsafe { cublasLtCreate(&mut handle) };
+        let s = unsafe { cublasCreate_v2(&mut handle) };
         if s != 0 {
             unsafe { cuStreamDestroy_v2(stream); }
-            candle_core::bail!("cublasLtCreate failed: {s}");
+            candle_core::bail!("cublasCreate failed: {s}");
         }
 
-        let workspace_size = 33_554_432usize;
-        let mut workspace_ptr: u64 = 0;
-        let s = unsafe { cudaMalloc(&mut workspace_ptr, workspace_size) };
-        if s != 0 {
-            unsafe { cublasLtDestroy(handle); cuStreamDestroy_v2(stream); }
-            candle_core::bail!("cudaMalloc workspace failed: {s}");
-        }
+        // cublasGemmEx manages its own workspace internally
+        let workspace_size = 0usize;
+        let workspace_ptr: u64 = 0;
 
         let (cos_table, sin_table) = Self::compute_rope_tables(&weights.config)?;
 
         tracing::info!(
-            "Dedicated decode path initialized (stream + cuBLASLt + 32MB workspace + RoPE[{}x{}])",
+            "Dedicated decode path initialized (stream + cuBLAS + RoPE[{}x{}])",
             weights.config.max_position_embeddings,
             weights.config.head_dim / 2,
         );
@@ -464,8 +460,8 @@ impl Drop for DedicatedDecodePath {
             if let Some(exec) = self.graph_exec {
                 cuGraphExecDestroy(exec);
             }
-            cublasLtDestroy(self.cublas.handle);
-            cudaFree(self.cublas.workspace);
+            cublasDestroy_v2(self.cublas.handle);
+            if self.cublas.workspace != 0 { cudaFree(self.cublas.workspace); }
             if self.cos_table != 0 { cudaFree(self.cos_table); }
             if self.sin_table != 0 { cudaFree(self.sin_table); }
             if self.staging_block_tables != 0 { cudaFree(self.staging_block_tables); }
