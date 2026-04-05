@@ -272,14 +272,16 @@ impl DedicatedDecodePath {
 
     /// Copy per-step paged attention data from caller's pointers to fixed staging buffers.
     /// D2D async on the dedicated stream — ordered before graph launch.
+    /// Uses the ACTUAL per-step sizes, not the staging capacity.
     unsafe fn stage_paged_attn(&self, paged_attn: &PagedAttentionState, batch_size: usize) {
-        // block_tables: [batch, max_blocks_per_seq] i32
+        let actual_blocks = paged_attn.max_num_blocks_per_seq as usize;
+        // block_tables: [batch, actual_blocks] i32/u32
         cudaMemcpyAsync(
             self.staging_block_tables as *mut _, paged_attn.block_tables as *const _,
-            batch_size * self.staging_max_blocks_per_seq * 4, 3, // D2D
+            batch_size * actual_blocks * 4, 3, // D2D
             self.stream,
         );
-        // context_lens: [batch] i32
+        // context_lens: [batch] i32/u32
         cudaMemcpyAsync(
             self.staging_context_lens as *mut _, paged_attn.context_lens as *const _,
             batch_size * 4, 3,
@@ -294,15 +296,16 @@ impl DedicatedDecodePath {
     }
 
     /// Build a PagedAttentionState pointing to fixed staging buffers + cached KV caches.
-    fn staged_paged_attn(&self, max_context_len: i32) -> PagedAttentionState {
+    /// Uses per-step values for max_context_len and max_num_blocks_per_seq.
+    fn staged_paged_attn(&self, paged_attn: &PagedAttentionState) -> PagedAttentionState {
         PagedAttentionState {
             layer_caches: self.cached_layer_caches.clone().unwrap_or_default(),
             block_tables: self.staging_block_tables,
             context_lens: self.staging_context_lens,
             slot_mappings: self.staging_slot_mappings,
             block_size: self.cached_block_size,
-            max_context_len,
-            max_num_blocks_per_seq: self.staging_max_blocks_per_seq as i32,
+            max_context_len: paged_attn.max_context_len, // REAL per-step value
+            max_num_blocks_per_seq: paged_attn.max_num_blocks_per_seq, // REAL per-step value
             kv_block_stride: self.cached_kv_block_stride,
             kv_head_stride: self.cached_kv_head_stride,
             norm_block_stride: self.cached_norm_block_stride,
@@ -345,10 +348,6 @@ impl DedicatedDecodePath {
 
         let buffers = self.buffers.as_ref().unwrap();
 
-        // Use a large max_context_len for the staged state so the captured graph
-        // handles any sequence length up to the model's limit.
-        let max_context_len = self.weights.config.max_position_embeddings as i32;
-
         unsafe {
             // Stage all changing inputs (NOT part of the graph — happens before capture/launch)
             cudaMemcpyAsync(
@@ -361,7 +360,10 @@ impl DedicatedDecodePath {
             );
             self.stage_paged_attn(paged_attn, batch_size);
 
-            let staged = self.staged_paged_attn(max_context_len);
+            // Use REAL per-step values for max_context_len and max_num_blocks_per_seq.
+            // These determine shared memory allocation in attention kernels — using
+            // max_position_embeddings would request 160KB+ smem and silently fail.
+            let staged = self.staged_paged_attn(paged_attn);
 
             if let Some(exec) = self.graph_exec {
                 // REPLAY: all inputs staged, just launch
