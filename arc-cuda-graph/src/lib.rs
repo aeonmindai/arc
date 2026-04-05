@@ -11,6 +11,7 @@ pub mod buffers;
 pub mod autonomous;
 pub mod weights;
 pub mod decode_forward;
+pub mod dedicated;
 
 #[cfg(feature = "cuda")]
 pub use graph::CudaGraphRunner;
@@ -22,6 +23,8 @@ pub use autonomous::{AutonomousDecodeConfig, AutonomousDecodeRunner};
 pub use weights::{ModelWeights, DecodeConfig, LayerWeights, WeightPtr, tensor_device_ptr, extract_model_weights, quant_method_ptr};
 #[cfg(feature = "cuda")]
 pub use decode_forward::{DecodeBuffers, CublasState, decode_forward};
+#[cfg(feature = "cuda")]
+pub use dedicated::DedicatedDecodePath;
 
 /// Try to create a CUDA graph runner for the given device.
 #[cfg(feature = "cuda")]

@@ -89,9 +89,9 @@ pub struct NormalPipeline {
     cuda_graph_runner: Option<arc_cuda_graph::CudaGraphRunner>,
     #[cfg(feature = "cuda")]
     _capturable_device: Option<Device>,
-    /// Extracted model weight pointers for the dedicated decode path.
+    /// Dedicated decode path — bypasses Candle, runs on its own non-blocking stream.
     #[cfg(feature = "cuda")]
-    decode_weights: Option<arc_cuda_graph::ModelWeights>,
+    dedicated_decode: Option<arc_cuda_graph::DedicatedDecodePath>,
 }
 
 /// A loader for a "normal" (non-quantized) model.
@@ -1093,7 +1093,15 @@ impl Loader for NormalLoader {
             #[cfg(feature = "cuda")]
             _capturable_device: Some(_graph_device),
             #[cfg(feature = "cuda")]
-            decode_weights: _decode_weights,
+            dedicated_decode: _decode_weights.and_then(|w| {
+                match arc_cuda_graph::DedicatedDecodePath::new(w) {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        tracing::warn!("Dedicated decode path init failed: {e}");
+                        None
+                    }
+                }
+            }),
         })))
     }
 
@@ -1296,6 +1304,10 @@ impl Pipeline for NormalPipeline {
     #[cfg(feature = "cuda")]
     fn cuda_graph_runner_mut(&mut self) -> Option<&mut arc_cuda_graph::CudaGraphRunner> {
         self.cuda_graph_runner.as_mut()
+    }
+    #[cfg(feature = "cuda")]
+    fn dedicated_decode_mut(&mut self) -> Option<&mut arc_cuda_graph::DedicatedDecodePath> {
+        self.dedicated_decode.as_mut()
     }
 }
 

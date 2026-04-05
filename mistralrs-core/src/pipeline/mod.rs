@@ -444,9 +444,14 @@ pub trait Pipeline:
     }
 
     /// Access the autonomous decode runner for full GPU-autonomous generation.
-    /// Returns None by default. Initialized when autonomous decode is configured.
     #[cfg(feature = "cuda")]
     fn autonomous_runner_mut(&mut self) -> Option<&mut arc_cuda_graph::AutonomousDecodeRunner> {
+        None
+    }
+
+    /// Access the dedicated decode path (bypasses Candle, runs on non-blocking stream).
+    #[cfg(feature = "cuda")]
+    fn dedicated_decode_mut(&mut self) -> Option<&mut arc_cuda_graph::DedicatedDecodePath> {
         None
     }
 
@@ -481,93 +486,36 @@ pub trait Pipeline:
         is_prompt: bool,
         return_raw_logits: bool,
     ) -> Result<ForwardInputsResult, candle_core::Error> {
+        // Dedicated decode path: bypasses Candle, runs on non-blocking stream
         #[cfg(feature = "cuda")]
         if !is_prompt && !return_raw_logits {
-            // Check graph runner state (non-overlapping borrow)
-            let (use_graph, batch_size, already_captured) = {
-                if let Some(runner) = self.cuda_graph_runner_mut() {
-                    if runner.tick_warmup() {
-                        (false, 0, false)
-                    } else if runner.is_enabled() {
-                        let bs = inputs
-                            .downcast_ref::<text_models_inputs_processor::ModelInputs>()
-                            .map(|m| m.seqlen_offsets.len())
-                            .unwrap_or(0);
-                        let has = runner.has_graph(bs);
-                        (bs > 0, bs, has)
-                    } else {
-                        (false, 0, false)
-                    }
-                } else {
-                    (false, 0, false)
-                }
-            };
+            if let Some(dedicated) = self.dedicated_decode_mut() {
+                if dedicated.tick_warmup() {
+                    // Still warming up — fall through to Candle
+                } else if dedicated.is_enabled() {
+                    // Extract token IDs and positions from ModelInputs
+                    if let Some(model_inputs) = inputs.downcast_ref::<text_models_inputs_processor::ModelInputs>() {
+                        let token_ids: Vec<i32> = {
+                            // input_ids is [batch, 1] — extract the single token per sequence
+                            let ids = model_inputs.input_ids.flatten_all()
+                                .and_then(|t| t.to_vec1::<u32>())
+                                .unwrap_or_default();
+                            ids.into_iter().map(|x| x as i32).collect()
+                        };
+                        let positions: Vec<i32> = model_inputs.seqlen_offsets
+                            .iter().map(|&x| x as i32).collect();
 
-            if use_graph {
-                #[allow(unused_imports)]
-                use crate::layers::set_graph_mode_positions;
-
-                if already_captured {
-                    // REPLAY: launch the cached graph
-                    match self.cuda_graph_runner_mut().unwrap().replay(batch_size) {
-                        Ok(logits) => {
-                            return Ok(ForwardInputsResult::CausalGeneration { logits });
-                        }
-                        Err(e) => {
-                            tracing::warn!("CUDA graph replay failed ({e}), running eagerly");
-                            self.cuda_graph_runner_mut().unwrap().disable();
-                        }
-                    }
-                } else {
-                    // CAPTURE: first time for this batch size, with private memory pool
-                    let positions_tensor = inputs
-                        .downcast_ref::<text_models_inputs_processor::ModelInputs>()
-                        .and_then(|m| {
-                            let offsets: Vec<u32> = m.seqlen_offsets.iter().map(|&x| x as u32).collect();
-                            Tensor::from_vec(offsets, m.seqlen_offsets.len(), &self.device()).ok()
-                        });
-                    set_graph_mode_positions(positions_tensor);
-
-                    // Begin capture (creates private pool, installs it, starts capture)
-                    let pools = self.cuda_graph_runner_mut().unwrap().begin_capture(batch_size);
-                    let (graph_pool, original_pool) = match pools {
-                        Ok(p) => p,
-                        Err(e) => {
-                            set_graph_mode_positions(None);
-                            tracing::warn!("CUDA graph begin_capture failed ({e}), running eagerly");
-                            return self.forward_inputs(inputs, return_raw_logits);
-                        }
-                    };
-
-                    // Run forward under capture (kernels recorded, not executed,
-                    // allocations go to the private pool)
-                    let result = self.forward_inputs(inputs, return_raw_logits);
-                    set_graph_mode_positions(None);
-
-                    match result {
-                        Ok(ForwardInputsResult::CausalGeneration { logits }) => {
-                            match self.cuda_graph_runner_mut().unwrap().end_capture_and_cache(
-                                batch_size, logits, graph_pool, original_pool,
-                            ) {
-                                Ok(logits) => {
-                                    return Ok(ForwardInputsResult::CausalGeneration { logits });
+                        if !token_ids.is_empty() {
+                            match dedicated.run_step(&token_ids, &positions) {
+                                Ok(_logits_ptr) => {
+                                    // TODO: wrap the logits pointer as a Candle tensor and return
+                                    // For now, fall through to Candle path
+                                    tracing::info!("Dedicated decode: step completed");
                                 }
                                 Err(e) => {
-                                    tracing::warn!("CUDA graph end_capture failed ({e})");
-                                    self.cuda_graph_runner_mut().unwrap().disable();
-                                    candle_core::bail!("CUDA graph capture failed: {e}");
+                                    tracing::warn!("Dedicated decode failed ({e}), using Candle");
                                 }
                             }
-                        }
-                        Ok(other) => {
-                            self.cuda_graph_runner_mut().unwrap()
-                                .cancel_capture(graph_pool, original_pool);
-                            return Ok(other);
-                        }
-                        Err(e) => {
-                            self.cuda_graph_runner_mut().unwrap()
-                                .cancel_capture(graph_pool, original_pool);
-                            return Err(e);
                         }
                     }
                 }
