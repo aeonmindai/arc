@@ -11,6 +11,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/cuda/gather_rope.cu");
     println!("cargo:rerun-if-changed=src/cuda/sampling.cu");
     println!("cargo:rerun-if-changed=src/cuda/decode_loop.cu");
+    println!("cargo:rerun-if-changed=src/cuda/decode_kernels.cu");
 
     let mut builder = cudaforge::KernelBuilder::new()
         .source_glob("src/cuda/*.cu")
