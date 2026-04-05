@@ -41,6 +41,42 @@ pub enum CUgraphExecUpdateResult {
     ERROR_TOPOLOGY_CHANGED = 2,
 }
 
+// Conditional node types (CUDA 12.4+)
+#[cfg(feature = "cuda")]
+#[repr(u32)]
+#[allow(non_camel_case_types, dead_code)]
+pub enum CUgraphConditionalNodeType {
+    IF = 0,
+    WHILE = 1,
+}
+
+#[cfg(feature = "cuda")]
+#[repr(u32)]
+#[allow(non_camel_case_types, dead_code)]
+pub enum CudaGraphNodeType {
+    Kernel = 0, Memcpy = 1, Memset = 2, Host = 3, Graph = 4, Empty = 5,
+    WaitEvent = 6, EventRecord = 7, ExtSemSignal = 8, ExtSemWait = 9,
+    MemAlloc = 10, MemFree = 11, BatchMemOp = 12, Conditional = 13,
+}
+
+#[cfg(feature = "cuda")]
+#[repr(C)]
+pub struct CudaConditionalNodeParams {
+    pub handle: CUgraphConditionalHandle,
+    pub cond_type: CUgraphConditionalNodeType,
+    pub size: u32,
+    pub body_graph_out: *mut CUgraph,
+}
+
+#[cfg(feature = "cuda")]
+#[repr(C)]
+pub struct CudaGraphNodeParams {
+    pub node_type: CudaGraphNodeType,
+    pub _reserved0: [u32; 3],
+    pub conditional: CudaConditionalNodeParams,
+    pub _pad: [u8; 3968],
+}
+
 // Memory pool types
 #[cfg(feature = "cuda")]
 #[repr(u32)]
@@ -96,7 +132,8 @@ pub struct CUmemPoolProps {
 
 #[cfg(feature = "cuda")]
 extern "C" {
-    // ========== Graph capture ==========
+    // ========== Graph lifecycle ==========
+    pub fn cuGraphCreate(graph: *mut CUgraph, flags: u32) -> u32;
     pub fn cuStreamBeginCapture_v2(stream: CUstream, mode: CUstreamCaptureMode) -> u32;
     pub fn cuStreamEndCapture(stream: CUstream, graph: *mut CUgraph) -> u32;
     pub fn cuGraphInstantiate_v2(
@@ -119,6 +156,18 @@ extern "C" {
     pub fn cuStreamCreate(stream: *mut CUstream, flags: u32) -> u32;
     pub fn cuStreamDestroy_v2(stream: CUstream) -> u32;
     pub fn cudaStreamSynchronize(stream: CUstream) -> u32;
+
+    // ========== Conditional nodes (CUDA 12.4+) ==========
+    pub fn cudaGraphConditionalHandleCreate(
+        handle: *mut CUgraphConditionalHandle, graph: CUgraph,
+        default_value: u32, flags: u32,
+    ) -> u32;
+    pub fn cudaGraphSetConditional(handle: CUgraphConditionalHandle, value: u32) -> u32;
+    pub fn cudaGraphAddNode(
+        graph: CUgraph, node_out: *mut CUgraphNode,
+        dependencies: *const CUgraphNode, num_dependencies: usize,
+        params: *mut CudaGraphNodeParams,
+    ) -> u32;
 
     // ========== Pinned host memory ==========
     pub fn cudaHostAlloc(ptr: *mut *mut std::ffi::c_void, size: usize, flags: u32) -> u32;
