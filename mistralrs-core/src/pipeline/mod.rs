@@ -470,83 +470,102 @@ pub trait Pipeline:
         }
     }
 
-    /// Run forward_inputs, optionally wrapped in CUDA graph capture for decode steps.
-    /// For decode (!is_prompt): captures GPU kernels into a graph, then launches them as a batch.
-    /// For prompt: runs eagerly (variable sequence lengths don't benefit from graphs).
+    /// Run forward_inputs, with CUDA graph capture-once + replay for decode steps.
+    ///
+    /// First decode at a given batch size: capture the forward pass into a graph.
+    /// Subsequent decodes at the same batch size: replay the cached graph.
+    /// Prompts always run eagerly.
     fn graph_wrapped_forward(
         &mut self,
         inputs: Box<dyn Any>,
         is_prompt: bool,
         return_raw_logits: bool,
     ) -> Result<ForwardInputsResult, candle_core::Error> {
-        // CUDA graph path for decode steps
         #[cfg(feature = "cuda")]
-        {
-            // Check if we should use graph capture (non-overlapping borrow)
-            let use_graph = if !is_prompt {
+        if !is_prompt && !return_raw_logits {
+            // Check graph runner state (non-overlapping borrow)
+            let (use_graph, batch_size, already_captured) = {
                 if let Some(runner) = self.cuda_graph_runner_mut() {
                     if runner.tick_warmup() {
-                        false // still warming up
+                        (false, 0, false)
                     } else if runner.is_enabled() {
-                        true
+                        let bs = inputs
+                            .downcast_ref::<text_models_inputs_processor::ModelInputs>()
+                            .map(|m| m.seqlen_offsets.len())
+                            .unwrap_or(0);
+                        let has = runner.has_graph(bs);
+                        (bs > 0, bs, has)
                     } else {
-                        false
+                        (false, 0, false)
                     }
                 } else {
-                    false
+                    (false, 0, false)
                 }
-            } else {
-                false
             };
 
             if use_graph {
-                // Set GPU positions for graph-mode RoPE.
-                // Extract seqlen_offsets from ModelInputs and create a GPU tensor.
+                // Set GPU positions for graph-mode RoPE
+                #[allow(unused_imports)]
                 use crate::layers::set_graph_mode_positions;
 
-                let positions_tensor = if let Some(model_inputs) = inputs.downcast_ref::<text_models_inputs_processor::ModelInputs>() {
-                    let offsets = &model_inputs.seqlen_offsets;
-                    let offsets_u32: Vec<u32> = offsets.iter().map(|&x| x as u32).collect();
-                    Tensor::from_vec(offsets_u32, offsets.len(), &self.device()).ok()
-                } else {
-                    None
-                };
-                set_graph_mode_positions(positions_tensor);
-
-                // 1. Begin capture
-                tracing::warn!("CUDA graph: attempting begin_capture for decode step");
-                if let Err(e) = self.cuda_graph_runner_mut().unwrap().begin_capture() {
-                    set_graph_mode_positions(None);
-                    tracing::warn!("CUDA graph: begin_capture FAILED ({e}), falling back to eager");
-                    return self.forward_inputs(inputs, return_raw_logits);
-                }
-                tracing::warn!("CUDA graph: begin_capture succeeded, running forward under capture");
-
-                // 2. Run forward pass — GPU kernels captured, not executed
-                let result = self.forward_inputs(inputs, return_raw_logits);
-
-                // 3. End capture and launch
-                match &result {
-                    Ok(_) => {
-                        tracing::warn!("CUDA graph: forward succeeded, calling end_capture_and_launch");
-                        if let Err(e) = self.cuda_graph_runner_mut().unwrap().end_capture_and_launch() {
-                            set_graph_mode_positions(None);
-                            tracing::warn!("CUDA graph: end_capture_and_launch FAILED ({e})");
+                if already_captured {
+                    // REPLAY: launch the cached graph
+                    let result = self.cuda_graph_runner_mut().unwrap().replay(batch_size);
+                    match result {
+                        Ok(logits) => {
+                            return Ok(ForwardInputsResult::CausalGeneration { logits });
+                        }
+                        Err(e) => {
+                            tracing::warn!("CUDA graph replay failed ({e}), running eagerly");
                             self.cuda_graph_runner_mut().unwrap().disable();
+                        }
+                    }
+                } else {
+                    // CAPTURE: first time for this batch size
+                    let positions_tensor = inputs
+                        .downcast_ref::<text_models_inputs_processor::ModelInputs>()
+                        .and_then(|m| {
+                            let offsets: Vec<u32> = m.seqlen_offsets.iter().map(|&x| x as u32).collect();
+                            Tensor::from_vec(offsets, m.seqlen_offsets.len(), &self.device()).ok()
+                        });
+                    set_graph_mode_positions(positions_tensor);
+
+                    // Begin capture
+                    if let Err(e) = self.cuda_graph_runner_mut().unwrap().begin_capture(batch_size) {
+                        set_graph_mode_positions(None);
+                        tracing::warn!("CUDA graph begin_capture failed ({e}), running eagerly");
+                        return self.forward_inputs(inputs, return_raw_logits);
+                    }
+
+                    // Run forward under capture (kernels recorded, not executed)
+                    let result = self.forward_inputs(inputs, return_raw_logits);
+                    set_graph_mode_positions(None);
+
+                    match result {
+                        Ok(ForwardInputsResult::CausalGeneration { logits }) => {
+                            // End capture, instantiate, launch, cache
+                            match self.cuda_graph_runner_mut().unwrap().end_capture_and_cache(logits) {
+                                Ok(logits) => {
+                                    return Ok(ForwardInputsResult::CausalGeneration { logits });
+                                }
+                                Err(e) => {
+                                    tracing::warn!("CUDA graph end_capture failed ({e})");
+                                    self.cuda_graph_runner_mut().unwrap().disable();
+                                    candle_core::bail!("CUDA graph capture failed: {e}");
+                                }
+                            }
+                        }
+                        Ok(other) => {
+                            // Non-causal result — cancel capture, return as-is
+                            self.cuda_graph_runner_mut().unwrap().cancel_capture();
+                            return Ok(other);
+                        }
+                        Err(e) => {
+                            self.cuda_graph_runner_mut().unwrap().cancel_capture();
                             return Err(e);
                         }
-                        tracing::warn!("CUDA graph: decode step completed via graph launch");
-                    }
-                    Err(ref e) => {
-                        tracing::warn!("CUDA graph: forward FAILED during capture ({e}), canceling");
-                        self.cuda_graph_runner_mut().unwrap().cancel_capture();
                     }
                 }
-
-                // Clear graph-mode positions
-                set_graph_mode_positions(None);
-
-                return result;
             }
         }
 
