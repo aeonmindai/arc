@@ -198,7 +198,10 @@ unsafe fn gemm_bf16(
     let alpha: f32 = 1.0;
     let beta: f32 = 0.0;
 
-    // Stream + workspace set once at init (not per-GEMM — SetStream is not capturable)
+    // A: weight [M, K] row-major = [K, M] col-major, ld=K, transA=T → [M, K]
+    // B: input [K, N] col-major, ld=K, transB=N
+    // C: output [M, N] col-major, ld=M
+    cublasSetStream_v2(cublas.handle, stream);
     let s = cublasGemmEx(
         cublas.handle,
         CUBLAS_OP_T, CUBLAS_OP_N,

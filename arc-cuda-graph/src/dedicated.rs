@@ -89,24 +89,9 @@ impl DedicatedDecodePath {
             candle_core::bail!("cublasCreate failed: {s}");
         }
 
-        // Pre-allocate workspace and set stream ONCE (required for graph capture).
-        // cublasSetWorkspace tells cuBLAS to use this buffer instead of allocating
-        // internally, which is what makes cublasGemmEx capture-compatible.
-        let workspace_size = 33_554_432usize; // 32MB
-        let mut workspace_ptr: u64 = 0;
-        let s = unsafe { cudaMalloc(&mut workspace_ptr, workspace_size) };
-        if s != 0 {
-            unsafe { cublasDestroy_v2(handle); cuStreamDestroy_v2(stream); }
-            candle_core::bail!("cudaMalloc workspace failed: {s}");
-        }
-        unsafe {
-            extern "C" {
-                fn cublasSetStream_v2(h: *mut std::ffi::c_void, s: CUstream) -> u32;
-                fn cublasSetWorkspace_v2(h: *mut std::ffi::c_void, w: *mut std::ffi::c_void, sz: usize) -> u32;
-            }
-            cublasSetStream_v2(handle, stream);
-            cublasSetWorkspace_v2(handle, workspace_ptr as *mut _, workspace_size);
-        }
+        // cublasGemmEx manages its own workspace internally
+        let workspace_size = 0usize;
+        let workspace_ptr: u64 = 0;
 
         let (cos_table, sin_table) = Self::compute_rope_tables(&weights.config)?;
 
@@ -208,8 +193,6 @@ impl DedicatedDecodePath {
             }};
         }
 
-        // GEMM input/output buffers use padded N for cuBLASLt compatibility.
-        // Custom kernels use real batch_size (bs).
         let buffers = DecodeBuffers {
             hidden_a: alloc!(bs * cfg.hidden_size * bf16),
             hidden_b: alloc!(bs * cfg.hidden_size * bf16),
@@ -312,37 +295,8 @@ impl DedicatedDecodePath {
         );
     }
 
-    /// Max context length for graph capture — queried from hardware, not hardcoded.
-    /// TurboQuant attention allocates `ceil(mcl/block_size)*block_size*4` bytes smem.
-    /// Non-turbo has no smem constraint.
-    fn graph_max_context_len(&self) -> i32 {
-        if self.cached_is_turbo {
-            let mut smem_limit: i32 = 0;
-            unsafe {
-                extern "C" {
-                    fn cudaDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> u32;
-                }
-                // cudaDevAttrMaxSharedMemoryPerBlockOptin = 97
-                let s = cudaDeviceGetAttribute(&mut smem_limit, 97, 0);
-                if s != 0 || smem_limit <= 0 {
-                    // Fallback: cudaDevAttrMaxSharedMemoryPerBlock = 8
-                    cudaDeviceGetAttribute(&mut smem_limit, 8, 0);
-                }
-                if smem_limit <= 0 { smem_limit = 49152; } // absolute fallback 48KB
-            }
-            let block_size = self.cached_block_size.max(1) as i32;
-            let max_tokens = smem_limit / 4; // sizeof(float)
-            (max_tokens / block_size) * block_size // align down to block_size
-        } else {
-            self.weights.config.max_position_embeddings as i32
-        }
-    }
-
-    /// Build a PagedAttentionState pointing to fixed staging buffers.
-    /// Uses FIXED max_context_len so the captured graph works for any context length
-    /// up to GRAPH_MAX_CONTEXT_LEN. The kernel's per-sequence loop is bounded by
-    /// context_lens[seq_idx] from the staging buffer, so a larger max just means
-    /// more shared memory allocated (not more work).
+    /// Build a PagedAttentionState pointing to fixed staging buffers + cached KV caches.
+    /// Uses per-step values for max_context_len and max_num_blocks_per_seq.
     fn staged_paged_attn(&self, paged_attn: &PagedAttentionState) -> PagedAttentionState {
         PagedAttentionState {
             layer_caches: self.cached_layer_caches.clone().unwrap_or_default(),
@@ -350,9 +304,8 @@ impl DedicatedDecodePath {
             context_lens: self.staging_context_lens,
             slot_mappings: self.staging_slot_mappings,
             block_size: self.cached_block_size,
-            // Fixed for graph capture — actual work bounded by context_lens[] staging buffer
-            max_context_len: self.graph_max_context_len(),
-            max_num_blocks_per_seq: self.staging_max_blocks_per_seq as i32,
+            max_context_len: paged_attn.max_context_len, // REAL per-step value
+            max_num_blocks_per_seq: paged_attn.max_num_blocks_per_seq, // REAL per-step value
             kv_block_stride: self.cached_kv_block_stride,
             kv_head_stride: self.cached_kv_head_stride,
             norm_block_stride: self.cached_norm_block_stride,
@@ -411,13 +364,15 @@ impl DedicatedDecodePath {
             );
             self.stage_paged_attn(paged_attn, batch_size);
 
+            // Use REAL per-step values for max_context_len and max_num_blocks_per_seq.
+            // These determine shared memory allocation in attention kernels — using
+            // max_position_embeddings would request 160KB+ smem and silently fail.
             let staged = self.staged_paged_attn(paged_attn);
-            // Check if context exceeds the graph's fixed smem-safe limit
-            let context_too_large = paged_attn.max_context_len > self.graph_max_context_len();
 
             if let Some(exec) = self.graph_exec {
-                if context_too_large || batch_size != self.captured_batch_size {
-                    // Can't replay — context or batch changed beyond graph's fixed params
+                // REPLAY: all inputs staged, just launch
+                if batch_size != self.captured_batch_size {
+                    tracing::warn!("Batch size changed ({} → {}), running eager", self.captured_batch_size, batch_size);
                     decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
                 } else {
                     let s = cuGraphLaunch(exec, self.stream);
@@ -429,7 +384,12 @@ impl DedicatedDecodePath {
             } else if self.capture_failed {
                 // Eager mode — still fast (no Candle overhead, just kernel launch costs)
                 decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
-            } else if self.eager_steps < 2 {
+            } else if self.eager_steps < 1000000 {
+                // TODO: Graph capture disabled — max_context_len changes per step which
+                // causes the TurboQuant attention kernel's shared memory allocation to be
+                // wrong on replay. Need to either pad max_context_len to a fixed upper
+                // bound during capture, or use kernel node parameter updates.
+                // For now, eager mode gives us the full speed benefit of bypassing Candle.
                 self.eager_steps += 1;
                 decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
                 if self.eager_steps == 2 {
