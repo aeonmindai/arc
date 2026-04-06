@@ -80,146 +80,35 @@ pub struct DecodeBuffers {
     pub batch_size: usize,
 }
 
-/// cuBLASLt handle and workspace for the decode path.
-#[cfg(feature = "cuda")]
-pub struct CublasState {
-    pub handle: *mut std::ffi::c_void, // cublasLtHandle_t
-    pub workspace: u64,
-    pub workspace_size: usize,
-}
-
-// cuBLASLt FFI
+// Custom GEMV FFI — replaces cuBLAS entirely. Graph-capture compatible.
 #[cfg(feature = "cuda")]
 extern "C" {
-    fn cublasLtCreate(handle: *mut *mut std::ffi::c_void) -> u32;
-    fn cublasLtDestroy(handle: *mut std::ffi::c_void) -> u32;
-    fn cublasLtMatmul(
-        handle: *const std::ffi::c_void,
-        desc: *const std::ffi::c_void,
-        alpha: *const std::ffi::c_void,
-        a: *const std::ffi::c_void,
-        a_layout: *const std::ffi::c_void,
-        b: *const std::ffi::c_void,
-        b_layout: *const std::ffi::c_void,
-        beta: *const std::ffi::c_void,
-        c: *const std::ffi::c_void,
-        c_layout: *const std::ffi::c_void,
-        d: *mut std::ffi::c_void,
-        d_layout: *const std::ffi::c_void,
-        algo: *const std::ffi::c_void,
-        workspace: *mut std::ffi::c_void,
-        workspace_size: usize,
+    fn launch_gemv_bf16(
+        weight: *const std::ffi::c_void, // [M, K] row-major BF16
+        input: *const std::ffi::c_void,  // [K] BF16
+        output: *mut std::ffi::c_void,   // [M] BF16
+        m: i32, k: i32,
         stream: CUstream,
-    ) -> u32;
-    fn cublasLtMatmulDescCreate(desc: *mut *mut std::ffi::c_void, compute: u32, scale: u32) -> u32;
-    fn cublasLtMatmulDescDestroy(desc: *mut std::ffi::c_void) -> u32;
-    fn cublasLtMatmulDescSetAttribute(
-        desc: *const std::ffi::c_void, attr: u32,
-        buf: *const std::ffi::c_void, size: usize,
-    ) -> u32;
-    fn cublasLtMatrixLayoutCreate(
-        layout: *mut *mut std::ffi::c_void,
-        dtype: u32, rows: u64, cols: u64, ld: i64,
-    ) -> u32;
-    fn cublasLtMatrixLayoutDestroy(layout: *mut std::ffi::c_void) -> u32;
-    fn cublasLtMatmulPreferenceCreate(pref: *mut *mut std::ffi::c_void) -> u32;
-    fn cublasLtMatmulPreferenceDestroy(pref: *mut std::ffi::c_void) -> u32;
-    fn cublasLtMatmulPreferenceSetAttribute(
-        pref: *const std::ffi::c_void, attr: u32,
-        buf: *const std::ffi::c_void, size: usize,
-    ) -> u32;
-    fn cublasLtMatmulAlgoGetHeuristic(
-        handle: *const std::ffi::c_void,
-        desc: *const std::ffi::c_void,
-        a: *const std::ffi::c_void,
-        b: *const std::ffi::c_void,
-        c: *const std::ffi::c_void,
-        d: *const std::ffi::c_void,
-        pref: *const std::ffi::c_void,
-        count: i32,
-        results: *mut [u8; 80], // cublasLtMatmulHeuristicResult_t is ~80 bytes
-        found: *mut i32,
-    ) -> u32;
-}
-
-// cuBLAS constants
-#[cfg(feature = "cuda")]
-const CUBLAS_COMPUTE_32F: u32 = 68;
-#[cfg(feature = "cuda")]
-const CUDA_R_32F: u32 = 0;
-#[cfg(feature = "cuda")]
-const CUDA_R_16BF: u32 = 14;
-#[cfg(feature = "cuda")]
-const CUBLASLT_MATMUL_DESC_TRANSA: u32 = 0;
-#[cfg(feature = "cuda")]
-const CUBLAS_OP_T: i32 = 1;
-#[cfg(feature = "cuda")]
-const CUBLAS_OP_N: i32 = 0;
-#[cfg(feature = "cuda")]
-const CUBLASLT_MATMUL_PREF_MAX_WORKSPACE: u32 = 1;
-
-// Legacy cuBLAS FFI (more reliable for small N)
-#[cfg(feature = "cuda")]
-extern "C" {
-    fn cublasCreate_v2(handle: *mut *mut std::ffi::c_void) -> u32;
-    fn cublasDestroy_v2(handle: *mut std::ffi::c_void) -> u32;
-    fn cublasSetStream_v2(handle: *mut std::ffi::c_void, stream: CUstream) -> u32;
-    fn cublasGemmEx(
-        handle: *mut std::ffi::c_void,
-        transa: i32, transb: i32,
-        m: i32, n: i32, k: i32,
-        alpha: *const std::ffi::c_void,
-        a: *const std::ffi::c_void, a_type: u32, lda: i32,
-        b: *const std::ffi::c_void, b_type: u32, ldb: i32,
-        beta: *const std::ffi::c_void,
-        c: *mut std::ffi::c_void, c_type: u32, ldc: i32,
-        compute_type: u32, algo: u32,
-    ) -> u32;
-}
-
-/// Execute a BF16 GEMM: C = A^T * B using cublasGemmEx
-/// A (weight): [M, K] row-major = [K, M] col-major → transA=T
-/// B (input): [K, N] col-major
-/// C (output): [M, N] col-major
-///
-/// Uses the legacy cuBLAS API which handles N=1 reliably (cuBLASLt returns
-/// CUBLAS_STATUS_NOT_SUPPORTED for small N with BF16 on Blackwell).
-#[cfg(feature = "cuda")]
-unsafe fn gemm_bf16(
-    cublas: &CublasState,
-    stream: CUstream,
-    weight: u64,  // [out_dim, in_dim] row-major
-    input: u64,   // [in_dim, batch] col-major = [batch, in_dim] row-major
-    output: u64,  // [out_dim, batch] col-major = [batch, out_dim] row-major
-    m: u64,       // out_dim
-    n: u64,       // batch
-    k: u64,       // in_dim
-) {
-    let alpha: f32 = 1.0;
-    let beta: f32 = 0.0;
-
-    // A: weight [M, K] row-major = [K, M] col-major, ld=K, transA=T → [M, K]
-    // B: input [K, N] col-major, ld=K, transB=N
-    // C: output [M, N] col-major, ld=M
-    cublasSetStream_v2(cublas.handle, stream);
-    let s = cublasGemmEx(
-        cublas.handle,
-        CUBLAS_OP_T, CUBLAS_OP_N,
-        m as i32, n as i32, k as i32,
-        &alpha as *const _ as *const _,
-        weight as *const _, CUDA_R_16BF, k as i32, // A: [K, M] col-major, ld=K
-        input as *const _, CUDA_R_16BF, k as i32,  // B: [K, N] col-major, ld=K
-        &beta as *const _ as *const _,
-        output as *mut _, CUDA_R_16BF, m as i32,   // C: [M, N] col-major, ld=M
-        CUBLAS_COMPUTE_32F,
-        0, // CUBLAS_GEMM_DEFAULT
     );
-    if s != 0 {
-        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            tracing::error!("cublasGemmEx failed: status={s} m={m} n={n} k={k}");
-        }
-    }
+}
+
+/// Execute BF16 GEMV: output = weight^T * input (custom kernel, no cuBLAS).
+/// weight: [out_dim, in_dim] row-major BF16
+/// input: [in_dim] BF16
+/// output: [out_dim] BF16
+#[cfg(feature = "cuda")]
+unsafe fn gemv_bf16(
+    stream: CUstream,
+    weight: u64,
+    input: u64,
+    output: u64,
+    m: usize, // out_dim
+    k: usize, // in_dim
+) {
+    launch_gemv_bf16(
+        weight as *const _, input as *const _, output as *mut _,
+        m as i32, k as i32, stream,
+    );
 }
 
 /// Run the full decode forward pass for one step.
@@ -233,13 +122,13 @@ unsafe fn gemm_bf16(
 pub unsafe fn decode_forward(
     weights: &ModelWeights,
     buffers: &DecodeBuffers,
-    cublas: &CublasState,
     paged_attn: &PagedAttentionState,
     stream: CUstream,
 ) {
     let cfg = &weights.config;
     let bs = buffers.batch_size as u64;
     let hs = cfg.hidden_size as u64;
+    let hs_usize = cfg.hidden_size;
     let nh = cfg.num_heads;
     let nkv = cfg.num_kv_heads;
     let hd = cfg.head_dim;
@@ -286,13 +175,10 @@ pub unsafe fn decode_forward(
             hs as i32, bs as i32, eps, stream,
         );
 
-        // QKV projections
-        gemm_bf16(cublas, stream, lw.q_proj.ptr, buffers.normed, buffers.q,
-            (nh * hd) as u64, bs, hs);
-        gemm_bf16(cublas, stream, lw.k_proj.ptr, buffers.normed, buffers.k,
-            (nkv * hd) as u64, bs, hs);
-        gemm_bf16(cublas, stream, lw.v_proj.ptr, buffers.normed, buffers.v,
-            (nkv * hd) as u64, bs, hs);
+        // QKV projections (custom GEMV — no cuBLAS, graph-capturable)
+        gemv_bf16(stream, lw.q_proj.ptr, buffers.normed, buffers.q, nh * hd, hs_usize);
+        gemv_bf16(stream, lw.k_proj.ptr, buffers.normed, buffers.k, nkv * hd, hs_usize);
+        gemv_bf16(stream, lw.v_proj.ptr, buffers.normed, buffers.v, nkv * hd, hs_usize);
 
         // QK norm (if model uses it)
         if let (Some(qn), Some(kn)) = (lw.q_norm, lw.k_norm) {
@@ -322,13 +208,9 @@ pub unsafe fn decode_forward(
         let lc = &paged_attn.layer_caches[layer_idx];
 
         if paged_attn.is_turbo {
-            // Cast K/V from BF16 → F16 (TurboQuant kernels expect F16 input)
-            let kv_size = (bs as usize * nkv * hd) as i32;
-            launch_cast_bf16_to_f16(buffers.k as *const _, buffers.k_f16 as *mut _, kv_size, stream);
-            launch_cast_bf16_to_f16(buffers.v as *const _, buffers.v_f16 as *mut _, kv_size, stream);
-            // TurboQuant: quantize F16 K/V into U8 cache with per-token norms
+            // BF16 K/V directly — turbo kernel converts internally via dtype dispatch
             turbo_reshape_and_cache(
-                buffers.k_f16 as *const _, buffers.v_f16 as *const _,
+                buffers.k as *const _, buffers.v as *const _,
                 lc.key_cache as *const _, lc.value_cache as *const _,
                 lc.k_norms as *const _, lc.v_norms as *const _,
                 paged_attn.slot_mappings as *const i64,
@@ -337,16 +219,12 @@ pub unsafe fn decode_forward(
                 paged_attn.kv_block_stride, paged_attn.kv_head_stride,
                 paged_attn.norm_block_stride, paged_attn.norm_head_stride,
                 stream,
-                0, // dtype = F16 input (already cast)
+                1, // dtype=BF16
             );
-            // Cast Q from BF16 → F16 (TurboQuant attention expects F16)
+            // BF16 Q directly — turbo attention converts internally
             let q_size = (bs as usize * nh * hd) as i32;
-            launch_cast_bf16_to_f16(
-                buffers.q as *const _, buffers.q_f16 as *mut _, q_size, stream,
-            );
-            // TurboQuant attention: F16 Q + U8 cache → F32 output
-            turbo_paged_attention_v1_f16(
-                buffers.attn_out_f32 as *const _, buffers.q_f16 as *const _,
+            turbo_paged_attention_v1(
+                buffers.attn_out_f32 as *const _, buffers.q as *const _,
                 lc.key_cache as *const _, lc.value_cache as *const _,
                 lc.k_norms as *const _, lc.v_norms as *const _,
                 nkv as i32, scale, 1.0,
@@ -357,7 +235,7 @@ pub unsafe fn decode_forward(
                 q_stride,
                 paged_attn.kv_block_stride, paged_attn.kv_head_stride,
                 paged_attn.norm_block_stride, paged_attn.norm_head_stride,
-                stream,
+                stream, 1, // dtype=BF16
             );
             // Cast attention output F32 → BF16 for O projection
             launch_cast_f32_to_bf16(
@@ -391,8 +269,8 @@ pub unsafe fn decode_forward(
         }
 
         // O projection
-        gemm_bf16(cublas, stream, lw.o_proj.ptr, buffers.attn_out, buffers.o_proj_out,
-            hs, bs, (nh * hd) as u64);
+        gemv_bf16(stream, lw.o_proj.ptr, buffers.attn_out, buffers.o_proj_out,
+            hs_usize, nh * hd);
 
         // Residual add
         launch_residual_add_bf16(
@@ -409,18 +287,18 @@ pub unsafe fn decode_forward(
         );
 
         // MLP: gate + up + silu_mul + down
-        gemm_bf16(cublas, stream, lw.gate_proj.ptr, buffers.normed, buffers.gate,
-            inter, bs, hs);
-        gemm_bf16(cublas, stream, lw.up_proj.ptr, buffers.normed, buffers.up,
-            inter, bs, hs);
+        gemv_bf16(stream, lw.gate_proj.ptr, buffers.normed, buffers.gate,
+            cfg.intermediate_size, hs_usize);
+        gemv_bf16(stream, lw.up_proj.ptr, buffers.normed, buffers.up,
+            cfg.intermediate_size, hs_usize);
 
         launch_fused_silu_mul_bf16(
             buffers.gate as *const _, buffers.up as *const _,
             buffers.mlp_act as *mut _, (bs * inter) as i32, stream,
         );
 
-        gemm_bf16(cublas, stream, lw.down_proj.ptr, buffers.mlp_act, buffers.down_out,
-            hs, bs, inter);
+        gemv_bf16(stream, lw.down_proj.ptr, buffers.mlp_act, buffers.down_out,
+            hs_usize, cfg.intermediate_size);
 
         // Residual add
         launch_residual_add_bf16(
@@ -441,8 +319,8 @@ pub unsafe fn decode_forward(
     );
 
     // LM head
-    gemm_bf16(cublas, stream, weights.lm_head.ptr, buffers.normed, buffers.logits,
-        cfg.vocab_size as u64, bs, hs);
+    gemv_bf16(stream, weights.lm_head.ptr, buffers.normed, buffers.logits,
+        cfg.vocab_size, hs_usize);
 }
 
 // Paged attention FFI from mistralrs-paged-attn
@@ -514,7 +392,8 @@ extern "C" {
         stream: CUstream,
         dtype: u32,
     );
-    fn turbo_paged_attention_v1_f16(
+    // Dtype-generic TurboQuant attention (dispatches BF16/F16 internally)
+    fn turbo_paged_attention_v1(
         out: *const std::ffi::c_void,
         query: *const std::ffi::c_void,
         k_cache: *const std::ffi::c_void,
@@ -538,6 +417,7 @@ extern "C" {
         norm_block_stride: i32,
         norm_head_stride: i32,
         stream: CUstream,
+        dtype: u32, // 0=F16, 1=BF16
     );
 }
 

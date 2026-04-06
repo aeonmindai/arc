@@ -6,9 +6,13 @@
  */
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cstdint>
 #include <cmath>
 #include <cfloat>
+
+__device__ __forceinline__ float to_f(__half x) { return __half2float(x); }
+__device__ __forceinline__ float to_f(__nv_bfloat16 x) { return __bfloat162float(x); }
 
 #include "turbo_paged_attention.cuh"
 
@@ -82,8 +86,9 @@ __device__ uint8_t q3(float x) {
 // reshape_and_cache
 // ============================================================================
 
+template<typename T>
 __global__ void tq_cache_k(
-    const __half* in, uint8_t* cache, __half* norms, const int64_t* slots,
+    const T* in, uint8_t* cache, __half* norms, const int64_t* slots,
     int nh, int hs, int bs, int in_stride, int cbs, int chs, int nbs, int nhs
 ) {
     int vid = blockIdx.x, tid = threadIdx.x;
@@ -91,7 +96,7 @@ __global__ void tq_cache_k(
     int64_t slot = slots[tok]; if (slot<0) return;
     int bi = slot/bs, bo = slot%bs;
     __shared__ float s[128]; __shared__ uint8_t ix[128];
-    if (tid<hs) s[tid] = __half2float(in[tok*in_stride+head*hs+tid]);
+    if (tid<hs) s[tid] = to_f(in[tok*in_stride+head*hs+tid]);
     __syncthreads();
     __shared__ float nb[128];
     nb[tid] = (tid<hs)?s[tid]*s[tid]:0.f; __syncthreads();
@@ -108,8 +113,9 @@ __global__ void tq_cache_k(
     }
 }
 
+template<typename T>
 __global__ void tq_cache_v(
-    const __half* in, uint8_t* cache, __half* norms, const int64_t* slots,
+    const T* in, uint8_t* cache, __half* norms, const int64_t* slots,
     int nh, int hs, int bs, int in_stride, int vbs, int vhs, int nbs, int nhs
 ) {
     int vid = blockIdx.x, tid = threadIdx.x;
@@ -117,7 +123,7 @@ __global__ void tq_cache_v(
     int64_t slot = slots[tok]; if (slot<0) return;
     int bi = slot/bs, bo = slot%bs;
     __shared__ float s[128]; __shared__ uint8_t ix[128];
-    if (tid<hs) s[tid] = __half2float(in[tok*in_stride+head*hs+tid]);
+    if (tid<hs) s[tid] = to_f(in[tok*in_stride+head*hs+tid]);
     __syncthreads();
     __shared__ float nb[128];
     nb[tid] = (tid<hs)?s[tid]*s[tid]:0.f; __syncthreads();
@@ -148,9 +154,14 @@ extern "C" void turbo_reshape_and_cache(
 ) {
     if(hs!=128)return;
     dim3 g(nt*nh),b(128);
-    tq_cache_k<<<g,b,0,stream>>>((const __half*)key,(uint8_t*)kc,(__half*)kn,slots,nh,hs,bs,ks,kbs,khs,nbs,nhs);
     int vpd=(hs+9)/10*4; int vvbs=nh*vpd*bs; int vvhs=vpd*bs;
-    tq_cache_v<<<g,b,0,stream>>>((const __half*)value,(uint8_t*)vc,(__half*)vn,slots,nh,hs,bs,vs,vvbs,vvhs,nbs,nhs);
+    if (dtype == 1) { // BF16
+        tq_cache_k<<<g,b,0,stream>>>((const __nv_bfloat16*)key,(uint8_t*)kc,(__half*)kn,slots,nh,hs,bs,ks,kbs,khs,nbs,nhs);
+        tq_cache_v<<<g,b,0,stream>>>((const __nv_bfloat16*)value,(uint8_t*)vc,(__half*)vn,slots,nh,hs,bs,vs,vvbs,vvhs,nbs,nhs);
+    } else { // F16
+        tq_cache_k<<<g,b,0,stream>>>((const __half*)key,(uint8_t*)kc,(__half*)kn,slots,nh,hs,bs,ks,kbs,khs,nbs,nhs);
+        tq_cache_v<<<g,b,0,stream>>>((const __half*)value,(uint8_t*)vc,(__half*)vn,slots,nh,hs,bs,vs,vvbs,vvhs,nbs,nhs);
+    }
 }
 
 // ============================================================================
@@ -165,10 +176,10 @@ extern "C" void turbo_reshape_and_cache(
 // 5. Output: write accs to shared, rotate, write out (all threads participate)
 // ============================================================================
 
-template<int BLOCK_SIZE>
+template<int BLOCK_SIZE, typename QT>
 __global__ void tq_attn(
     float* __restrict__ out,
-    const __half* __restrict__ query,
+    const QT* __restrict__ query,
     const uint8_t* __restrict__ kc,
     const uint8_t* __restrict__ vc,
     const __half* __restrict__ kn,
@@ -192,7 +203,7 @@ __global__ void tq_attn(
 
     // 1. Load + rotate Q
     __shared__ float qr[HS];
-    if (tid < HS) qr[tid] = __half2float(query[sidx*nh*HS + hidx*HS + tid]);
+    if (tid < HS) qr[tid] = to_f(query[sidx*nh*HS + hidx*HS + tid]);
     __syncthreads();
     rotate128(qr, tid, NT);
     // After this: qr is rotated, all threads synced
@@ -345,4 +356,35 @@ extern "C" void turbo_paged_attention_v1_f16(
     case 16: tq_attn<16><<<grid,block,smem,stream>>>((float*)out,(const __half*)query,(const uint8_t*)kc,(const uint8_t*)vc,(const __half*)kn,(const __half*)vn,bt,cl,nkvh,mbps,nh,scale,kbs,khs,vvbs,vvhs,nbs,nhs); break;
     case 32: tq_attn<32><<<grid,block,smem,stream>>>((float*)out,(const __half*)query,(const uint8_t*)kc,(const uint8_t*)vc,(const __half*)kn,(const __half*)vn,bt,cl,nkvh,mbps,nh,scale,kbs,khs,vvbs,vvhs,nbs,nhs); break;
     }
+}
+
+// Dtype-generic entry point for the dedicated decode path
+// dtype: 0=F16, 1=BF16
+extern "C" void turbo_paged_attention_v1(
+    void* out, const void* query,
+    const void* kc, const void* vc,
+    const void* kn, const void* vn,
+    int nkvh, float scale, float softcapping,
+    const uint32_t* bt, const uint32_t* cl,
+    int bs, int mcl, int ns, int nh, int hs,
+    int mbps, int qs, int kbs, int khs,
+    int nbs, int nhs, cudaStream_t stream, uint32_t dtype
+) {
+    if (hs != 128) return;
+    int vpd=(hs+9)/10*4;
+    int vvbs=nkvh*vpd*bs, vvhs=vpd*bs;
+    int padded = TQ_DIVUP(mcl,bs)*bs;
+    int smem = padded * sizeof(float);
+    dim3 grid(nh, ns, 1);
+    dim3 block(128);
+
+    #define TQ_LAUNCH(QT) \
+        switch(bs){ \
+        case 8: tq_attn<8><<<grid,block,smem,stream>>>((float*)out,(const QT*)query,(const uint8_t*)kc,(const uint8_t*)vc,(const __half*)kn,(const __half*)vn,bt,cl,nkvh,mbps,nh,scale,kbs,khs,vvbs,vvhs,nbs,nhs); break; \
+        case 16: tq_attn<16><<<grid,block,smem,stream>>>((float*)out,(const QT*)query,(const uint8_t*)kc,(const uint8_t*)vc,(const __half*)kn,(const __half*)vn,bt,cl,nkvh,mbps,nh,scale,kbs,khs,vvbs,vvhs,nbs,nhs); break; \
+        case 32: tq_attn<32><<<grid,block,smem,stream>>>((float*)out,(const QT*)query,(const uint8_t*)kc,(const uint8_t*)vc,(const __half*)kn,(const __half*)vn,bt,cl,nkvh,mbps,nh,scale,kbs,khs,vvbs,vvhs,nbs,nhs); break; \
+        }
+    if (dtype == 1) { TQ_LAUNCH(__nv_bfloat16); }
+    else { TQ_LAUNCH(__half); }
+    #undef TQ_LAUNCH
 }

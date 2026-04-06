@@ -2,7 +2,7 @@
 //!
 //! Dedicated decode path that bypasses Candle entirely.
 //! Model loads normally through Candle (NULL stream).
-//! Decode runs on a non-blocking stream with cuBLASLt + custom kernels.
+//! Decode runs on a non-blocking stream with custom GEMV + CUDA kernels.
 //! Capturable by CUDA graphs.
 
 pub mod ffi;
@@ -22,7 +22,7 @@ pub use autonomous::{AutonomousDecodeConfig, AutonomousDecodeRunner};
 #[cfg(feature = "cuda")]
 pub use weights::{ModelWeights, DecodeConfig, LayerWeights, WeightPtr, tensor_device_ptr, extract_model_weights, quant_method_ptr};
 #[cfg(feature = "cuda")]
-pub use decode_forward::{DecodeBuffers, CublasState, PagedAttentionState, LayerKvCache, decode_forward};
+pub use decode_forward::{DecodeBuffers, PagedAttentionState, LayerKvCache, decode_forward};
 #[cfg(feature = "cuda")]
 pub use dedicated::DedicatedDecodePath;
 
