@@ -89,8 +89,24 @@ impl DedicatedDecodePath {
             candle_core::bail!("cublasCreate failed: {s}");
         }
 
-        let workspace_size = 0usize;
-        let workspace_ptr: u64 = 0;
+        // Pre-allocate workspace and set stream ONCE (required for graph capture).
+        // cublasSetWorkspace tells cuBLAS to use this buffer instead of allocating
+        // internally, which is what makes cublasGemmEx capture-compatible.
+        let workspace_size = 33_554_432usize; // 32MB
+        let mut workspace_ptr: u64 = 0;
+        let s = unsafe { cudaMalloc(&mut workspace_ptr, workspace_size) };
+        if s != 0 {
+            unsafe { cublasDestroy_v2(handle); cuStreamDestroy_v2(stream); }
+            candle_core::bail!("cudaMalloc workspace failed: {s}");
+        }
+        unsafe {
+            extern "C" {
+                fn cublasSetStream_v2(h: *mut std::ffi::c_void, s: CUstream) -> u32;
+                fn cublasSetWorkspace_v2(h: *mut std::ffi::c_void, w: *mut std::ffi::c_void, sz: usize) -> u32;
+            }
+            cublasSetStream_v2(handle, stream);
+            cublasSetWorkspace_v2(handle, workspace_ptr as *mut _, workspace_size);
+        }
 
         let (cos_table, sin_table) = Self::compute_rope_tables(&weights.config)?;
 
@@ -296,14 +312,27 @@ impl DedicatedDecodePath {
         );
     }
 
-    /// Max context length for graph capture, computed from shared memory limits.
-    /// TurboQuant attention allocates `ceil(mcl/bs)*bs * sizeof(float)` smem.
-    /// Default per-block smem limit is 48KB → 48*1024/4 = 12288 tokens.
-    /// For non-turbo, no smem constraint — use max_position_embeddings directly.
+    /// Max context length for graph capture — queried from hardware, not hardcoded.
+    /// TurboQuant attention allocates `ceil(mcl/block_size)*block_size*4` bytes smem.
+    /// Non-turbo has no smem constraint.
     fn graph_max_context_len(&self) -> i32 {
         if self.cached_is_turbo {
-            // 48KB smem limit / 4 bytes per float = 12288 tokens max
-            12288
+            let mut smem_limit: i32 = 0;
+            unsafe {
+                extern "C" {
+                    fn cudaDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> u32;
+                }
+                // cudaDevAttrMaxSharedMemoryPerBlockOptin = 97
+                let s = cudaDeviceGetAttribute(&mut smem_limit, 97, 0);
+                if s != 0 || smem_limit <= 0 {
+                    // Fallback: cudaDevAttrMaxSharedMemoryPerBlock = 8
+                    cudaDeviceGetAttribute(&mut smem_limit, 8, 0);
+                }
+                if smem_limit <= 0 { smem_limit = 49152; } // absolute fallback 48KB
+            }
+            let block_size = self.cached_block_size.max(1) as i32;
+            let max_tokens = smem_limit / 4; // sizeof(float)
+            (max_tokens / block_size) * block_size // align down to block_size
         } else {
             self.weights.config.max_position_embeddings as i32
         }
@@ -382,10 +411,9 @@ impl DedicatedDecodePath {
             );
             self.stage_paged_attn(paged_attn, batch_size);
 
-            // Use real per-step max_context_len (graph capture is disabled)
-            let mut staged = self.staged_paged_attn(paged_attn);
-            staged.max_context_len = paged_attn.max_context_len;
-            let context_too_large = false;
+            let staged = self.staged_paged_attn(paged_attn);
+            // Check if context exceeds the graph's fixed smem-safe limit
+            let context_too_large = paged_attn.max_context_len > self.graph_max_context_len();
 
             if let Some(exec) = self.graph_exec {
                 if context_too_large || batch_size != self.captured_batch_size {
@@ -401,10 +429,7 @@ impl DedicatedDecodePath {
             } else if self.capture_failed {
                 // Eager mode — still fast (no Candle overhead, just kernel launch costs)
                 decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
-            } else if self.eager_steps < 1000000 {
-                // Graph capture disabled: cublasGemmEx returns INTERNAL_ERROR (14) during
-                // stream capture on CUDA 12.8 + B200, even with pre-set workspace/stream.
-                // Eager mode bypasses Candle entirely — 50+ tok/s with TurboQuant.
+            } else if self.eager_steps < 2 {
                 self.eager_steps += 1;
                 decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
                 if self.eager_steps == 2 {

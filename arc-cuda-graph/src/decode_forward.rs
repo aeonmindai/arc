@@ -105,7 +105,7 @@ unsafe fn gemm_bf16(
     let alpha: f32 = 1.0;
     let beta: f32 = 0.0;
 
-    cublasSetStream_v2(cublas.handle, stream);
+    // Stream set once at init via DedicatedDecodePath — NOT per-GEMM (not capturable)
     let s = cublasGemmEx(
         cublas.handle,
         1, 0, // CUBLAS_OP_T, CUBLAS_OP_N
