@@ -1,14 +1,9 @@
 /**
- * High-bandwidth BF16 GEMV for the dedicated decode path.
+ * BF16 GEMV — optimized for maximum SM occupancy on Blackwell.
  *
- * output[m] = sum_k(weight[m][k] * input[k])
- *
- * Key optimization: 2 rows per warp. Each warp maintains 2 accumulators
- * and issues 2 independent weight loads per iteration. This doubles the
- * number of outstanding HBM requests per warp, saturating more memory
- * channels and pushing bandwidth utilization from ~47% to 70%+.
- *
- * No cuBLAS — fully graph-capture compatible.
+ * 4 warps/block (128 threads), 4 rows/block, up to 16 blocks per SM.
+ * High warp count per SM hides HBM latency through warp switching.
+ * __ldg for read-only texture cache. No cuBLAS — graph-capture compatible.
  */
 
 #include <cuda_bf16.h>
@@ -16,12 +11,12 @@
 #include <cstdint>
 
 #define GEMV_WARP 32
-#define GEMV_WARPS 8
-#define GEMV_ROWS_PER_WARP 4                // each warp handles 4 rows
-#define GEMV_ROWS (GEMV_WARPS * GEMV_ROWS_PER_WARP) // 32 rows per block
-#define GEMV_BLOCK (GEMV_WARP * GEMV_WARPS) // 256 threads
+#define GEMV_WARPS 4
+#define GEMV_ROWS GEMV_WARPS  // 1 row per warp, 4 rows per block
+#define GEMV_BLOCK (GEMV_WARP * GEMV_WARPS) // 128 threads
 
-__global__ __launch_bounds__(256, 4)
+// Allow up to 16 blocks per SM for maximum occupancy
+__global__ __launch_bounds__(128, 16)
 void gemv_bf16_kernel(
     const __nv_bfloat16* __restrict__ weight,
     const __nv_bfloat16* __restrict__ input,
@@ -29,60 +24,38 @@ void gemv_bf16_kernel(
     int M, int K
 ) {
     const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
-    const int base_row = blockIdx.x * GEMV_ROWS + warp * GEMV_ROWS_PER_WARP;
-    if (base_row >= M) return;
+    const int row = blockIdx.x * GEMV_ROWS + (threadIdx.x >> 5);
+    if (row >= M) return;
 
-    // 4 row pointers — handle M not divisible by 4
-    const int r0 = base_row, r1 = base_row+1, r2 = base_row+2, r3 = base_row+3;
-    const __nv_bfloat16* w0 = weight + (int64_t)r0 * K;
-    const __nv_bfloat16* w1 = (r1<M) ? weight + (int64_t)r1 * K : w0;
-    const __nv_bfloat16* w2 = (r2<M) ? weight + (int64_t)r2 * K : w0;
-    const __nv_bfloat16* w3 = (r3<M) ? weight + (int64_t)r3 * K : w0;
+    const __nv_bfloat16* w = weight + (int64_t)row * K;
+    float acc = 0.0f;
 
-    float a0=0, a1=0, a2=0, a3=0;
     const int K8 = K >> 3;
+    const uint4* wv = (const uint4*)w;
     const uint4* iv = (const uint4*)input;
 
     for (int i = lane; i < K8; i += GEMV_WARP) {
+        uint4 a = __ldg(wv + i);
         uint4 b = __ldg(iv + i);
-        uint4 v0 = __ldg((const uint4*)w0 + i);
-        uint4 v1 = __ldg((const uint4*)w1 + i);
-        uint4 v2 = __ldg((const uint4*)w2 + i);
-        uint4 v3 = __ldg((const uint4*)w3 + i);
+        const __nv_bfloat16* ap = (const __nv_bfloat16*)&a;
         const __nv_bfloat16* bp = (const __nv_bfloat16*)&b;
-
-        #define DOT8(acc, v) { \
-            const __nv_bfloat16* p = (const __nv_bfloat16*)&v; \
-            acc += __bfloat162float(p[0])*__bfloat162float(bp[0]) \
-                 + __bfloat162float(p[1])*__bfloat162float(bp[1]) \
-                 + __bfloat162float(p[2])*__bfloat162float(bp[2]) \
-                 + __bfloat162float(p[3])*__bfloat162float(bp[3]) \
-                 + __bfloat162float(p[4])*__bfloat162float(bp[4]) \
-                 + __bfloat162float(p[5])*__bfloat162float(bp[5]) \
-                 + __bfloat162float(p[6])*__bfloat162float(bp[6]) \
-                 + __bfloat162float(p[7])*__bfloat162float(bp[7]); \
-        }
-        DOT8(a0, v0); DOT8(a1, v1); DOT8(a2, v2); DOT8(a3, v3);
-        #undef DOT8
+        acc += __bfloat162float(ap[0]) * __bfloat162float(bp[0])
+             + __bfloat162float(ap[1]) * __bfloat162float(bp[1])
+             + __bfloat162float(ap[2]) * __bfloat162float(bp[2])
+             + __bfloat162float(ap[3]) * __bfloat162float(bp[3])
+             + __bfloat162float(ap[4]) * __bfloat162float(bp[4])
+             + __bfloat162float(ap[5]) * __bfloat162float(bp[5])
+             + __bfloat162float(ap[6]) * __bfloat162float(bp[6])
+             + __bfloat162float(ap[7]) * __bfloat162float(bp[7]);
     }
 
-    // Reduce all 4 accumulators
-    #define WARP_REDUCE(x) \
-        x += __shfl_down_sync(0xFFFFFFFF, x, 16); \
-        x += __shfl_down_sync(0xFFFFFFFF, x, 8);  \
-        x += __shfl_down_sync(0xFFFFFFFF, x, 4);  \
-        x += __shfl_down_sync(0xFFFFFFFF, x, 2);  \
-        x += __shfl_down_sync(0xFFFFFFFF, x, 1);
-    WARP_REDUCE(a0); WARP_REDUCE(a1); WARP_REDUCE(a2); WARP_REDUCE(a3);
-    #undef WARP_REDUCE
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 16);
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 8);
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 4);
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 2);
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 1);
 
-    if (lane == 0) {
-        output[r0] = __float2bfloat16(a0);
-        if (r1<M) output[r1] = __float2bfloat16(a1);
-        if (r2<M) output[r2] = __float2bfloat16(a2);
-        if (r3<M) output[r3] = __float2bfloat16(a3);
-    }
+    if (lane == 0) output[row] = __float2bfloat16(acc);
 }
 
 extern "C" void arc_launch_gemv_bf16(
