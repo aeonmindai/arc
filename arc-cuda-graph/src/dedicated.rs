@@ -89,19 +89,8 @@ impl DedicatedDecodePath {
             candle_core::bail!("cublasCreate failed: {s}");
         }
 
-        // Pre-allocate workspace + set stream (both must happen BEFORE capture)
-        let workspace_size = 33_554_432usize;
-        let mut workspace_ptr: u64 = 0;
-        let s = unsafe { cudaMalloc(&mut workspace_ptr, workspace_size) };
-        if s != 0 {
-            unsafe { cublasDestroy_v2(handle); cuStreamDestroy_v2(stream); }
-            candle_core::bail!("cudaMalloc workspace failed: {s}");
-        }
-        unsafe {
-            use crate::decode_forward::{cublasSetStream_v2, cublasSetWorkspace_v2};
-            cublasSetStream_v2(handle, stream);
-            cublasSetWorkspace_v2(handle, workspace_ptr as *mut _, workspace_size);
-        }
+        let workspace_size = 0usize;
+        let workspace_ptr: u64 = 0;
 
         let (cos_table, sin_table) = Self::compute_rope_tables(&weights.config)?;
 

@@ -102,10 +102,10 @@ unsafe fn gemm_bf16(
     n: u64,       // batch
     k: u64,       // in_dim
 ) {
-    // F32 alpha/beta — matches Candle's cudarc usage (CUBLAS_COMPUTE_32F takes f32 scale)
     let alpha: f32 = 1.0;
     let beta: f32 = 0.0;
 
+    cublasSetStream_v2(cublas.handle, stream);
     let s = cublasGemmEx(
         cublas.handle,
         1, 0, // CUBLAS_OP_T, CUBLAS_OP_N
