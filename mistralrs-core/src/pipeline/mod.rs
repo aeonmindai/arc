@@ -688,6 +688,12 @@ pub trait Pipeline:
             norm_head_stride,
             x,
             is_turbo,
+            activation_dtype: match metadata.activation_dtype {
+                DType::F16 => 0,
+                DType::BF16 => 1,
+                DType::F32 => 2,
+                _ => 1, // default BF16
+            },
         };
 
         // Drop the KV cache lock before running

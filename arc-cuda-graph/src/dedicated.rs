@@ -61,6 +61,7 @@ pub struct DedicatedDecodePath {
     cached_norm_head_stride: i32,
     cached_x: i32,
     cached_is_turbo: bool,
+    cached_activation_dtype: u32,
 
     enabled: bool,
     warmup_remaining: u32,
@@ -138,6 +139,7 @@ impl DedicatedDecodePath {
             cached_norm_head_stride: 0,
             cached_x: 0,
             cached_is_turbo: false,
+            cached_activation_dtype: 1, // default BF16, overwritten on first step
             enabled: true,
             warmup_remaining: 2,
             eager_steps: 0,
@@ -359,6 +361,7 @@ impl DedicatedDecodePath {
             norm_head_stride: self.cached_norm_head_stride,
             x: self.cached_x,
             is_turbo: self.cached_is_turbo,
+            activation_dtype: self.cached_activation_dtype,
         }
     }
 
@@ -374,6 +377,7 @@ impl DedicatedDecodePath {
             self.cached_norm_head_stride = paged_attn.norm_head_stride;
             self.cached_x = paged_attn.x;
             self.cached_is_turbo = paged_attn.is_turbo;
+            self.cached_activation_dtype = paged_attn.activation_dtype;
         }
     }
 
