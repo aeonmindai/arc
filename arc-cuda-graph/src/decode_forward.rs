@@ -137,9 +137,6 @@ pub unsafe fn decode_forward(
     let _theta = cfg.rope_theta;
 
     // Step 0: Embedding lookup
-    if weights.embed_tokens == 0 {
-        tracing::error!("embed_tokens pointer is NULL!");
-    }
     launch_gather_embedding_bf16(
         weights.embed_tokens as *const _,
         buffers.token_ids as *const i32,
@@ -154,19 +151,6 @@ pub unsafe fn decode_forward(
 
     for layer_idx in 0..cfg.num_layers {
         let lw = &weights.layers[layer_idx];
-
-        // Diagnostic: check first layer weights
-        if layer_idx == 0 {
-            static LOGGED_W: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !LOGGED_W.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                tracing::info!(
-                    "Layer 0 weights: norm={:#x} q={:#x} k={:#x} v={:#x} o={:#x} gate={:#x}",
-                    lw.input_layernorm, lw.q_proj.ptr, lw.k_proj.ptr, lw.v_proj.ptr,
-                    lw.o_proj.ptr, lw.gate_proj.ptr,
-                );
-                tracing::info!("embed={:#x} final_norm={:#x} lm_head={:#x}", weights.embed_tokens, weights.final_norm, weights.lm_head.ptr);
-            }
-        }
 
         // RMSNorm (input_layernorm)
         launch_fused_rmsnorm_residual_bf16(
