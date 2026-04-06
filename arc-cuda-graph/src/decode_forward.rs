@@ -83,7 +83,7 @@ pub struct DecodeBuffers {
 // Custom GEMV FFI — replaces cuBLAS entirely. Graph-capture compatible.
 #[cfg(feature = "cuda")]
 extern "C" {
-    fn launch_gemv_bf16(
+    fn arc_launch_gemv_bf16(
         weight: *const std::ffi::c_void, // [M, K] row-major BF16
         input: *const std::ffi::c_void,  // [K] BF16
         output: *mut std::ffi::c_void,   // [M] BF16
@@ -105,7 +105,7 @@ unsafe fn gemv_bf16(
     m: usize, // out_dim
     k: usize, // in_dim
 ) {
-    launch_gemv_bf16(
+    arc_launch_gemv_bf16(
         weight as *const _, input as *const _, output as *mut _,
         m as i32, k as i32, stream,
     );

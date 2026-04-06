@@ -74,7 +74,7 @@ __global__ void gemv_bf16_kernel(
     }
 }
 
-extern "C" void launch_gemv_bf16(
+extern "C" void arc_launch_gemv_bf16(
     const void* weight, // [M, K] row-major BF16
     const void* input,  // [K] BF16
     void* output,       // [M] BF16
