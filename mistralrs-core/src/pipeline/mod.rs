@@ -703,24 +703,7 @@ pub trait Pipeline:
         // Wrap BF16 logits as a Candle Tensor
         let vocab_size = dedicated.weights.config.vocab_size;
         let logits_tensor = match wrap_bf16_logits(logits_ptr, batch_size, vocab_size, &device) {
-            Ok(t) => {
-                // Diagnostic: log top-5 logit values and argmax for first 3 steps
-                if let Ok(flat) = t.flatten_all() {
-                    if let Ok(vals) = flat.to_vec1::<f32>() {
-                        let (max_idx, max_val) = vals.iter().enumerate()
-                            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                            .unwrap_or((0, &0.0));
-                        let min_val = vals.iter().cloned().fold(f32::INFINITY, f32::min);
-                        let mean_val: f32 = vals.iter().sum::<f32>() / vals.len() as f32;
-                        let nonzero = vals.iter().filter(|v| v.abs() > 1e-10).count();
-                        tracing::info!(
-                            "Dedicated logits: argmax={max_idx} max={max_val:.4} min={min_val:.4} mean={mean_val:.6} nonzero={nonzero}/{}",
-                            vals.len()
-                        );
-                    }
-                }
-                t
-            }
+            Ok(t) => t,
             Err(e) => return Some(Err(e)),
         };
 
