@@ -306,17 +306,12 @@ impl DedicatedDecodePath {
             block_size: self.cached_block_size,
             max_context_len: {
                 // Fixed for graph capture. TurboQuant smem = ceil(mcl/bs)*bs*4.
-                // Query GPU smem limit to compute safe max.
+                // Default dynamic smem limit is 48KB. Use 40KB (10240 tokens) to leave
+                // headroom for the kernel's static shared memory (qr[128], nb[128], etc).
                 if self.cached_is_turbo {
-                    let mut smem: i32 = 0;
-                    unsafe {
-                        extern "C" { fn cudaDeviceGetAttribute(v: *mut i32, a: i32, d: i32) -> u32; }
-                        let s = cudaDeviceGetAttribute(&mut smem, 97, 0); // MaxSharedMemoryPerBlockOptin
-                        if s != 0 || smem <= 0 { cudaDeviceGetAttribute(&mut smem, 8, 0); }
-                        if smem <= 0 { smem = 49152; }
-                    }
                     let bs = self.cached_block_size.max(1);
-                    (smem / 4 / bs) * bs // aligned to block_size
+                    let max_tokens = 40960 / 4; // 40KB / sizeof(float) = 10240
+                    (max_tokens / bs) * bs // aligned to block_size
                 } else {
                     self.weights.config.max_position_embeddings as i32
                 }
