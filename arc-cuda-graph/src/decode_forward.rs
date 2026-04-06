@@ -200,17 +200,20 @@ unsafe fn gemm_bf16(
 
     // NOTE: cublasSetStream_v2 must be called BEFORE capture begins, not here.
     // The caller (DedicatedDecodePath::run_step) sets the stream once before capture.
+    //
+    // Use CUBLAS_GEMM_DEFAULT_TENSOR_OP (99) to enable tensor cores.
+    // CUBLAS_COMPUTE_32F_FAST_16BF (74) for BF16 tensor core paths on Hopper/Blackwell.
     let s = cublasGemmEx(
         cublas.handle,
         CUBLAS_OP_T, CUBLAS_OP_N,
         m as i32, n as i32, k as i32,
         &alpha as *const _ as *const _,
-        weight as *const _, CUDA_R_16BF, k as i32, // A: [K, M] col-major, ld=K
-        input as *const _, CUDA_R_16BF, k as i32,  // B: [K, N] col-major, ld=K
+        weight as *const _, CUDA_R_16BF, k as i32,
+        input as *const _, CUDA_R_16BF, k as i32,
         &beta as *const _ as *const _,
-        output as *mut _, CUDA_R_16BF, m as i32,   // C: [M, N] col-major, ld=M
-        CUBLAS_COMPUTE_32F,
-        0, // CUBLAS_GEMM_DEFAULT
+        output as *mut _, CUDA_R_16BF, m as i32,
+        74, // CUBLAS_COMPUTE_32F_FAST_16BF
+        99, // CUBLAS_GEMM_DEFAULT_TENSOR_OP
     );
     if s != 0 {
         static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

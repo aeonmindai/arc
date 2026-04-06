@@ -22,6 +22,9 @@ extern "C" {
     fn cublasCreate_v2(handle: *mut *mut std::ffi::c_void) -> u32;
     fn cublasDestroy_v2(handle: *mut std::ffi::c_void) -> u32;
     fn cublasSetStream_v2(handle: *mut std::ffi::c_void, stream: CUstream) -> u32;
+    fn cublasSetMathMode(handle: *mut std::ffi::c_void, mode: u32) -> u32;
+    // Pre-allocate cuBLAS workspace to make subsequent calls capture-compatible
+    fn cublasSetWorkspace_v2(handle: *mut std::ffi::c_void, workspace: *mut std::ffi::c_void, size: usize) -> u32;
     fn cudaMalloc(ptr: *mut u64, size: usize) -> u32;
     fn cudaFree(ptr: u64) -> u32;
     fn cudaMemcpyAsync(
@@ -90,9 +93,19 @@ impl DedicatedDecodePath {
             candle_core::bail!("cublasCreate failed: {s}");
         }
 
-        // cublasGemmEx manages its own workspace internally
-        let workspace_size = 0usize;
-        let workspace_ptr: u64 = 0;
+        // Pre-allocate cuBLAS workspace to prevent internal allocation during capture
+        let workspace_size = 33_554_432usize; // 32MB
+        let mut workspace_ptr: u64 = 0;
+        let s = unsafe { cudaMalloc(&mut workspace_ptr, workspace_size) };
+        if s != 0 {
+            unsafe { cublasDestroy_v2(handle); cuStreamDestroy_v2(stream); }
+            candle_core::bail!("cudaMalloc workspace failed: {s}");
+        }
+        // Set tensor core math mode + pre-allocated workspace
+        unsafe {
+            cublasSetMathMode(handle, 1); // CUBLAS_TENSOR_OP_MATH
+            cublasSetWorkspace_v2(handle, workspace_ptr as *mut _, workspace_size);
+        }
 
         let (cos_table, sin_table) = Self::compute_rope_tables(&weights.config)?;
 
