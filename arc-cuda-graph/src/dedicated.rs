@@ -304,8 +304,24 @@ impl DedicatedDecodePath {
             context_lens: self.staging_context_lens,
             slot_mappings: self.staging_slot_mappings,
             block_size: self.cached_block_size,
-            max_context_len: paged_attn.max_context_len, // REAL per-step value
-            max_num_blocks_per_seq: paged_attn.max_num_blocks_per_seq, // REAL per-step value
+            max_context_len: {
+                // Fixed for graph capture. TurboQuant smem = ceil(mcl/bs)*bs*4.
+                // Query GPU smem limit to compute safe max.
+                if self.cached_is_turbo {
+                    let mut smem: i32 = 0;
+                    unsafe {
+                        extern "C" { fn cudaDeviceGetAttribute(v: *mut i32, a: i32, d: i32) -> u32; }
+                        let s = cudaDeviceGetAttribute(&mut smem, 97, 0); // MaxSharedMemoryPerBlockOptin
+                        if s != 0 || smem <= 0 { cudaDeviceGetAttribute(&mut smem, 8, 0); }
+                        if smem <= 0 { smem = 49152; }
+                    }
+                    let bs = self.cached_block_size.max(1);
+                    (smem / 4 / bs) * bs // aligned to block_size
+                } else {
+                    self.weights.config.max_position_embeddings as i32
+                }
+            },
+            max_num_blocks_per_seq: self.staging_max_blocks_per_seq as i32,
             kv_block_stride: self.cached_kv_block_stride,
             kv_head_stride: self.cached_kv_head_stride,
             norm_block_stride: self.cached_norm_block_stride,
@@ -384,12 +400,7 @@ impl DedicatedDecodePath {
             } else if self.capture_failed {
                 // Eager mode — still fast (no Candle overhead, just kernel launch costs)
                 decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
-            } else if self.eager_steps < 1000000 {
-                // TODO: Graph capture disabled — max_context_len changes per step which
-                // causes the TurboQuant attention kernel's shared memory allocation to be
-                // wrong on replay. Need to either pad max_context_len to a fixed upper
-                // bound during capture, or use kernel node parameter updates.
-                // For now, eager mode gives us the full speed benefit of bypassing Candle.
+            } else if self.eager_steps < 2 {
                 self.eager_steps += 1;
                 decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
                 if self.eager_steps == 2 {
