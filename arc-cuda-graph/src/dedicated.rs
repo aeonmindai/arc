@@ -382,15 +382,10 @@ impl DedicatedDecodePath {
             );
             self.stage_paged_attn(paged_attn, batch_size);
 
-            let context_too_large = paged_attn.max_context_len > self.graph_max_context_len();
-            let staged = if context_too_large {
-                // Override with real value — can't use graph for this step
-                let mut s = self.staged_paged_attn(paged_attn);
-                s.max_context_len = paged_attn.max_context_len;
-                s
-            } else {
-                self.staged_paged_attn(paged_attn)
-            };
+            // Use real per-step max_context_len (graph capture is disabled)
+            let mut staged = self.staged_paged_attn(paged_attn);
+            staged.max_context_len = paged_attn.max_context_len;
+            let context_too_large = false;
 
             if let Some(exec) = self.graph_exec {
                 if context_too_large || batch_size != self.captured_batch_size {
