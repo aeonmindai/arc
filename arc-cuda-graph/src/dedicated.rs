@@ -387,7 +387,7 @@ impl DedicatedDecodePath {
                 decode_forward(&self.weights, buffers, &staged, self.stream);
             } else if self.eager_steps < 2 {
                 // Profile on first eager step
-                if self.eager_steps == 0 {
+                if self.eager_steps == 1 {
                     crate::decode_forward::profile_forward(&self.weights, buffers, &staged, self.stream);
                 }
                 self.eager_steps += 1;
