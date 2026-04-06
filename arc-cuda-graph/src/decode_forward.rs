@@ -41,8 +41,7 @@ pub struct PagedAttentionState {
     pub norm_block_stride: i32, // stride[0] of norms (TurboQuant, 0 if standard)
     pub norm_head_stride: i32,  // stride[1] of norms (TurboQuant, 0 if standard)
     pub x: i32,                // 16 / sizeof(element) — interleave factor for key cache
-    pub is_turbo: bool,
-    pub activation_dtype: u32,  // 0=F16, 1=BF16, 2=F32 — passed to turbo kernels
+    pub is_turbo: bool,        // TurboQuant mode
 }
 
 /// Pre-allocated intermediate buffers for one decode step.
@@ -199,7 +198,7 @@ unsafe fn gemm_bf16(
     let alpha: f32 = 1.0;
     let beta: f32 = 0.0;
 
-    // Stream set once at init — not per-GEMM (SetStream is not capturable)
+    // Stream + workspace set once at init (not per-GEMM — SetStream is not capturable)
     let s = cublasGemmEx(
         cublas.handle,
         CUBLAS_OP_T, CUBLAS_OP_N,
@@ -210,7 +209,7 @@ unsafe fn gemm_bf16(
         &beta as *const _ as *const _,
         output as *mut _, CUDA_R_16BF, m as i32,   // C: [M, N] col-major, ld=M
         CUBLAS_COMPUTE_32F,
-        99, // CUBLAS_GEMM_DEFAULT_TENSOR_OP
+        0, // CUBLAS_GEMM_DEFAULT
     );
     if s != 0 {
         static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -320,9 +319,13 @@ pub unsafe fn decode_forward(
         let lc = &paged_attn.layer_caches[layer_idx];
 
         if paged_attn.is_turbo {
-            // BF16 K/V directly to TurboQuant cache (kernel converts internally)
+            // Cast K/V from BF16 → F16 (TurboQuant kernels expect F16 input)
+            let kv_size = (bs as usize * nkv * hd) as i32;
+            launch_cast_bf16_to_f16(buffers.k as *const _, buffers.k_f16 as *mut _, kv_size, stream);
+            launch_cast_bf16_to_f16(buffers.v as *const _, buffers.v_f16 as *mut _, kv_size, stream);
+            // TurboQuant: quantize F16 K/V into U8 cache with per-token norms
             turbo_reshape_and_cache(
-                buffers.k as *const _, buffers.v as *const _,
+                buffers.k_f16 as *const _, buffers.v_f16 as *const _,
                 lc.key_cache as *const _, lc.value_cache as *const _,
                 lc.k_norms as *const _, lc.v_norms as *const _,
                 paged_attn.slot_mappings as *const i64,
@@ -331,12 +334,16 @@ pub unsafe fn decode_forward(
                 paged_attn.kv_block_stride, paged_attn.kv_head_stride,
                 paged_attn.norm_block_stride, paged_attn.norm_head_stride,
                 stream,
-                paged_attn.activation_dtype,
+                0, // dtype = F16 input (already cast)
             );
-            // BF16 Q directly to TurboQuant attention (kernel converts internally)
+            // Cast Q from BF16 → F16 (TurboQuant attention expects F16)
             let q_size = (bs as usize * nh * hd) as i32;
-            turbo_paged_attention_v1(
-                buffers.attn_out_f32 as *const _, buffers.q as *const _,
+            launch_cast_bf16_to_f16(
+                buffers.q as *const _, buffers.q_f16 as *mut _, q_size, stream,
+            );
+            // TurboQuant attention: F16 Q + U8 cache → F32 output
+            turbo_paged_attention_v1_f16(
+                buffers.attn_out_f32 as *const _, buffers.q_f16 as *const _,
                 lc.key_cache as *const _, lc.value_cache as *const _,
                 lc.k_norms as *const _, lc.v_norms as *const _,
                 nkv as i32, scale, 1.0,
@@ -348,7 +355,6 @@ pub unsafe fn decode_forward(
                 paged_attn.kv_block_stride, paged_attn.kv_head_stride,
                 paged_attn.norm_block_stride, paged_attn.norm_head_stride,
                 stream,
-                paged_attn.activation_dtype,
             );
             // Cast attention output F32 → BF16 for O projection
             launch_cast_f32_to_bf16(
@@ -505,7 +511,7 @@ extern "C" {
         stream: CUstream,
         dtype: u32,
     );
-    fn turbo_paged_attention_v1(
+    fn turbo_paged_attention_v1_f16(
         out: *const std::ffi::c_void,
         query: *const std::ffi::c_void,
         k_cache: *const std::ffi::c_void,
@@ -529,7 +535,6 @@ extern "C" {
         norm_block_stride: i32,
         norm_head_stride: i32,
         stream: CUstream,
-        dtype: u32, // 0=F16, 1=BF16
     );
 }
 
