@@ -19,12 +19,8 @@ use candle_core::cuda::cudarc::driver::sys::CUstream;
 
 #[cfg(feature = "cuda")]
 extern "C" {
-    fn cublasCreate_v2(handle: *mut *mut std::ffi::c_void) -> u32;
-    fn cublasDestroy_v2(handle: *mut std::ffi::c_void) -> u32;
-    fn cublasSetStream_v2(handle: *mut std::ffi::c_void, stream: CUstream) -> u32;
-    fn cublasSetMathMode(handle: *mut std::ffi::c_void, mode: u32) -> u32;
-    // Pre-allocate cuBLAS workspace to make subsequent calls capture-compatible
-    fn cublasSetWorkspace_v2(handle: *mut std::ffi::c_void, workspace: *mut std::ffi::c_void, size: usize) -> u32;
+    fn cublasLtCreate(handle: *mut *mut std::ffi::c_void) -> u32;
+    fn cublasLtDestroy(handle: *mut std::ffi::c_void) -> u32;
     fn cudaMalloc(ptr: *mut u64, size: usize) -> u32;
     fn cudaFree(ptr: u64) -> u32;
     fn cudaMemcpyAsync(
@@ -87,24 +83,19 @@ impl DedicatedDecodePath {
         }
 
         let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
-        let s = unsafe { cublasCreate_v2(&mut handle) };
+        let s = unsafe { cublasLtCreate(&mut handle) };
         if s != 0 {
             unsafe { cuStreamDestroy_v2(stream); }
-            candle_core::bail!("cublasCreate failed: {s}");
+            candle_core::bail!("cublasLtCreate failed: {s}");
         }
 
-        // Pre-allocate cuBLAS workspace to prevent internal allocation during capture
-        let workspace_size = 33_554_432usize; // 32MB
+        // cuBLASLt workspace (32MB for Hopper+)
+        let workspace_size = 33_554_432usize;
         let mut workspace_ptr: u64 = 0;
         let s = unsafe { cudaMalloc(&mut workspace_ptr, workspace_size) };
         if s != 0 {
-            unsafe { cublasDestroy_v2(handle); cuStreamDestroy_v2(stream); }
+            unsafe { cublasLtDestroy(handle); cuStreamDestroy_v2(stream); }
             candle_core::bail!("cudaMalloc workspace failed: {s}");
-        }
-        // Set tensor core math mode + pre-allocated workspace
-        unsafe {
-            cublasSetMathMode(handle, 1); // CUBLAS_TENSOR_OP_MATH
-            cublasSetWorkspace_v2(handle, workspace_ptr as *mut _, workspace_size);
         }
 
         let (cos_table, sin_table) = Self::compute_rope_tables(&weights.config)?;
@@ -194,9 +185,12 @@ impl DedicatedDecodePath {
             return Ok(());
         }
 
+        use crate::decode_forward::GEMM_PAD_N;
+
         let cfg = &self.weights.config;
         let bf16 = 2usize;
         let bs = batch_size;
+        let pn = GEMM_PAD_N as usize; // Padded batch for GEMM buffers
 
         macro_rules! alloc {
             ($size:expr) => {{
@@ -207,25 +201,27 @@ impl DedicatedDecodePath {
             }};
         }
 
+        // GEMM input/output buffers use padded N for cuBLASLt compatibility.
+        // Custom kernels use real batch_size (bs).
         let buffers = DecodeBuffers {
-            hidden_a: alloc!(bs * cfg.hidden_size * bf16),
-            hidden_b: alloc!(bs * cfg.hidden_size * bf16),
-            normed: alloc!(bs * cfg.hidden_size * bf16),
-            residual: alloc!(bs * cfg.hidden_size * bf16),
-            q: alloc!(bs * cfg.num_heads * cfg.head_dim * bf16),
-            k: alloc!(bs * cfg.num_kv_heads * cfg.head_dim * bf16),
-            v: alloc!(bs * cfg.num_kv_heads * cfg.head_dim * bf16),
-            attn_out: alloc!(bs * cfg.num_heads * cfg.head_dim * bf16),
-            q_f16: alloc!(bs * cfg.num_heads * cfg.head_dim * bf16),
-            k_f16: alloc!(bs * cfg.num_kv_heads * cfg.head_dim * bf16),
-            v_f16: alloc!(bs * cfg.num_kv_heads * cfg.head_dim * bf16),
-            attn_out_f32: alloc!(bs * cfg.num_heads * cfg.head_dim * 4),
-            o_proj_out: alloc!(bs * cfg.hidden_size * bf16),
-            gate: alloc!(bs * cfg.intermediate_size * bf16),
-            up: alloc!(bs * cfg.intermediate_size * bf16),
-            mlp_act: alloc!(bs * cfg.intermediate_size * bf16),
-            down_out: alloc!(bs * cfg.hidden_size * bf16),
-            logits: alloc!(bs * cfg.vocab_size * bf16),
+            hidden_a: alloc!(pn * cfg.hidden_size * bf16),
+            hidden_b: alloc!(pn * cfg.hidden_size * bf16),
+            normed: alloc!(pn * cfg.hidden_size * bf16),
+            residual: alloc!(pn * cfg.hidden_size * bf16),
+            q: alloc!(pn * cfg.num_heads * cfg.head_dim * bf16),
+            k: alloc!(pn * cfg.num_kv_heads * cfg.head_dim * bf16),
+            v: alloc!(pn * cfg.num_kv_heads * cfg.head_dim * bf16),
+            attn_out: alloc!(pn * cfg.num_heads * cfg.head_dim * bf16),
+            q_f16: alloc!(pn * cfg.num_heads * cfg.head_dim * bf16),
+            k_f16: alloc!(pn * cfg.num_kv_heads * cfg.head_dim * bf16),
+            v_f16: alloc!(pn * cfg.num_kv_heads * cfg.head_dim * bf16),
+            attn_out_f32: alloc!(pn * cfg.num_heads * cfg.head_dim * 4),
+            o_proj_out: alloc!(pn * cfg.hidden_size * bf16),
+            gate: alloc!(pn * cfg.intermediate_size * bf16),
+            up: alloc!(pn * cfg.intermediate_size * bf16),
+            mlp_act: alloc!(pn * cfg.intermediate_size * bf16),
+            down_out: alloc!(pn * cfg.hidden_size * bf16),
+            logits: alloc!(pn * cfg.vocab_size * bf16),
             token_ids: alloc!(bs * 4),
             positions: alloc!(bs * 4),
             cos_table: self.cos_table,
@@ -384,9 +380,6 @@ impl DedicatedDecodePath {
         let buffers = self.buffers.as_ref().unwrap();
 
         unsafe {
-            // Set cuBLAS stream once (must be BEFORE capture — not capturable)
-            cublasSetStream_v2(self.cublas.handle, self.stream);
-
             // Stage all changing inputs (NOT part of the graph — happens before capture/launch)
             cudaMemcpyAsync(
                 buffers.token_ids as *mut _, token_ids.as_ptr() as *const _,
@@ -506,7 +499,7 @@ impl Drop for DedicatedDecodePath {
             if let Some(exec) = self.graph_exec {
                 cuGraphExecDestroy(exec);
             }
-            cublasDestroy_v2(self.cublas.handle);
+            cublasLtDestroy(self.cublas.handle);
             if self.cublas.workspace != 0 { cudaFree(self.cublas.workspace); }
             if self.cos_table != 0 { cudaFree(self.cos_table); }
             if self.sin_table != 0 { cudaFree(self.sin_table); }
