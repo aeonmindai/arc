@@ -9,7 +9,7 @@
 //!   Step 3+ (replay):  Copy inputs → cuGraphLaunch (all compute replayed from fixed addresses)
 
 #[cfg(feature = "cuda")]
-use crate::decode_forward::{CublasState, DecodeBuffers, LayerKvCache, PagedAttentionState, decode_forward};
+use crate::decode_forward::{DecodeBuffers, LayerKvCache, PagedAttentionState, decode_forward};
 #[cfg(feature = "cuda")]
 use crate::ffi::*;
 #[cfg(feature = "cuda")]
@@ -19,8 +19,6 @@ use candle_core::cuda::cudarc::driver::sys::CUstream;
 
 #[cfg(feature = "cuda")]
 extern "C" {
-    fn cublasCreate_v2(handle: *mut *mut std::ffi::c_void) -> u32;
-    fn cublasDestroy_v2(handle: *mut std::ffi::c_void) -> u32;
     fn cudaMalloc(ptr: *mut u64, size: usize) -> u32;
     fn cudaFree(ptr: u64) -> u32;
     fn cudaMemcpyAsync(
@@ -35,7 +33,6 @@ extern "C" {
 pub struct DedicatedDecodePath {
     pub weights: ModelWeights,
     stream: CUstream,
-    cublas: CublasState,
     buffers: Option<DecodeBuffers>,
     cos_table: u64,
     sin_table: u64,
@@ -82,16 +79,6 @@ impl DedicatedDecodePath {
             candle_core::bail!("Failed to create decode stream: {s}");
         }
 
-        let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
-        let s = unsafe { cublasCreate_v2(&mut handle) };
-        if s != 0 {
-            unsafe { cuStreamDestroy_v2(stream); }
-            candle_core::bail!("cublasCreate failed: {s}");
-        }
-
-        // cublasGemmEx manages its own workspace internally
-        let workspace_size = 0usize;
-        let workspace_ptr: u64 = 0;
 
         let (cos_table, sin_table) = Self::compute_rope_tables(&weights.config)?;
 
@@ -104,7 +91,6 @@ impl DedicatedDecodePath {
         Ok(Self {
             weights,
             stream,
-            cublas: CublasState { handle, workspace: workspace_ptr, workspace_size },
             buffers: None,
             cos_table,
             sin_table,
@@ -202,9 +188,6 @@ impl DedicatedDecodePath {
             k: alloc!(bs * cfg.num_kv_heads * cfg.head_dim * bf16),
             v: alloc!(bs * cfg.num_kv_heads * cfg.head_dim * bf16),
             attn_out: alloc!(bs * cfg.num_heads * cfg.head_dim * bf16),
-            q_f16: alloc!(bs * cfg.num_heads * cfg.head_dim * bf16),
-            k_f16: alloc!(bs * cfg.num_kv_heads * cfg.head_dim * bf16),
-            v_f16: alloc!(bs * cfg.num_kv_heads * cfg.head_dim * bf16),
             attn_out_f32: alloc!(bs * cfg.num_heads * cfg.head_dim * 4),
             o_proj_out: alloc!(bs * cfg.hidden_size * bf16),
             gate: alloc!(bs * cfg.intermediate_size * bf16),
@@ -384,20 +367,20 @@ impl DedicatedDecodePath {
                 // REPLAY: all inputs staged, just launch
                 if batch_size != self.captured_batch_size {
                     tracing::warn!("Batch size changed ({} → {}), running eager", self.captured_batch_size, batch_size);
-                    decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
+                    decode_forward(&self.weights, buffers, &staged, self.stream);
                 } else {
                     let s = cuGraphLaunch(exec, self.stream);
                     if s != CUDA_SUCCESS {
                         tracing::warn!("cuGraphLaunch failed ({s}), falling back to eager");
-                        decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
+                        decode_forward(&self.weights, buffers, &staged, self.stream);
                     }
                 }
             } else if self.capture_failed {
                 // Eager mode — still fast (no Candle overhead, just kernel launch costs)
-                decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
+                decode_forward(&self.weights, buffers, &staged, self.stream);
             } else if self.eager_steps < 2 {
                 self.eager_steps += 1;
-                decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
+                decode_forward(&self.weights, buffers, &staged, self.stream);
                 if self.eager_steps == 2 {
                     tracing::info!("Dedicated decode: eager warmup done, will attempt capture next step");
                 }
@@ -409,9 +392,9 @@ impl DedicatedDecodePath {
                 if s != CUDA_SUCCESS {
                     tracing::warn!("cuStreamBeginCapture failed ({s}), disabling capture");
                     self.capture_failed = true;
-                    decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
+                    decode_forward(&self.weights, buffers, &staged, self.stream);
                 } else {
-                    decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
+                    decode_forward(&self.weights, buffers, &staged, self.stream);
 
                     let mut graph: CUgraph = std::ptr::null_mut();
                     let s = cuStreamEndCapture(self.stream, &mut graph);
@@ -419,7 +402,7 @@ impl DedicatedDecodePath {
                         tracing::warn!("cuStreamEndCapture failed ({s}), disabling capture");
                         if !graph.is_null() { cuGraphDestroy(graph); }
                         self.capture_failed = true;
-                        decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
+                        decode_forward(&self.weights, buffers, &staged, self.stream);
                     } else {
                         let mut exec: CUgraphExec = std::ptr::null_mut();
                         let s = cuGraphInstantiate_v2(
@@ -431,14 +414,14 @@ impl DedicatedDecodePath {
                         if s != CUDA_SUCCESS || exec.is_null() {
                             tracing::warn!("cuGraphInstantiate failed ({s}), disabling capture");
                             self.capture_failed = true;
-                            decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
+                            decode_forward(&self.weights, buffers, &staged, self.stream);
                         } else {
                             let s = cuGraphLaunch(exec, self.stream);
                             if s != CUDA_SUCCESS {
                                 tracing::warn!("First cuGraphLaunch failed ({s}), disabling capture");
                                 cuGraphExecDestroy(exec);
                                 self.capture_failed = true;
-                                decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
+                                decode_forward(&self.weights, buffers, &staged, self.stream);
                             } else {
                                 self.graph_exec = Some(exec);
                                 self.captured_batch_size = batch_size;
@@ -479,8 +462,6 @@ impl Drop for DedicatedDecodePath {
             if let Some(exec) = self.graph_exec {
                 cuGraphExecDestroy(exec);
             }
-            cublasDestroy_v2(self.cublas.handle);
-            if self.cublas.workspace != 0 { cudaFree(self.cublas.workspace); }
             if self.cos_table != 0 { cudaFree(self.cos_table); }
             if self.sin_table != 0 { cudaFree(self.sin_table); }
             if self.staging_block_tables != 0 { cudaFree(self.staging_block_tables); }
@@ -489,7 +470,7 @@ impl Drop for DedicatedDecodePath {
             if let Some(ref b) = self.buffers {
                 for ptr in [b.hidden_a, b.hidden_b, b.normed, b.residual,
                     b.q, b.k, b.v, b.attn_out,
-                    b.q_f16, b.k_f16, b.v_f16, b.attn_out_f32,
+                    b.attn_out_f32,
                     b.o_proj_out,
                     b.gate, b.up, b.mlp_act, b.down_out, b.logits,
                     b.token_ids, b.positions] {
