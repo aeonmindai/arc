@@ -210,7 +210,7 @@ unsafe fn gemm_bf16(
         &beta as *const _ as *const _,
         output as *mut _, CUDA_R_16BF, m as i32,   // C: [M, N] col-major, ld=M
         CUBLAS_COMPUTE_32F,
-        0, // CUBLAS_GEMM_DEFAULT
+        99, // CUBLAS_GEMM_DEFAULT_TENSOR_OP
     );
     if s != 0 {
         static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

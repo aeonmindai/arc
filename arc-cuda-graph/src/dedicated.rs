@@ -433,7 +433,7 @@ impl DedicatedDecodePath {
             } else if self.capture_failed {
                 // Eager mode — still fast (no Candle overhead, just kernel launch costs)
                 decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
-            } else if self.eager_steps < 2 {
+            } else if self.eager_steps < 1000000 {
                 self.eager_steps += 1;
                 decode_forward(&self.weights, buffers, &self.cublas, &staged, self.stream);
                 if self.eager_steps == 2 {
