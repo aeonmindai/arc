@@ -16,9 +16,9 @@
 #include <cstdint>
 
 #define GEMV_WARP 32
-#define GEMV_WARPS 8                        // warps per block
-#define GEMV_ROWS_PER_WARP 2                // each warp handles 2 rows
-#define GEMV_ROWS (GEMV_WARPS * GEMV_ROWS_PER_WARP) // 16 rows per block
+#define GEMV_WARPS 8
+#define GEMV_ROWS_PER_WARP 4                // each warp handles 4 rows
+#define GEMV_ROWS (GEMV_WARPS * GEMV_ROWS_PER_WARP) // 32 rows per block
 #define GEMV_BLOCK (GEMV_WARP * GEMV_WARPS) // 256 threads
 
 __global__ __launch_bounds__(256, 4)
@@ -31,68 +31,57 @@ void gemv_bf16_kernel(
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int base_row = blockIdx.x * GEMV_ROWS + warp * GEMV_ROWS_PER_WARP;
+    if (base_row >= M) return;
 
-    const int row0 = base_row;
-    const int row1 = base_row + 1;
-    const bool valid0 = row0 < M;
-    const bool valid1 = row1 < M;
-    if (!valid0) return;
+    // 4 row pointers — handle M not divisible by 4
+    const int r0 = base_row, r1 = base_row+1, r2 = base_row+2, r3 = base_row+3;
+    const __nv_bfloat16* w0 = weight + (int64_t)r0 * K;
+    const __nv_bfloat16* w1 = (r1<M) ? weight + (int64_t)r1 * K : w0;
+    const __nv_bfloat16* w2 = (r2<M) ? weight + (int64_t)r2 * K : w0;
+    const __nv_bfloat16* w3 = (r3<M) ? weight + (int64_t)r3 * K : w0;
 
-    const __nv_bfloat16* w0 = weight + (int64_t)row0 * K;
-    const __nv_bfloat16* w1 = valid1 ? (weight + (int64_t)row1 * K) : w0;
-
-    float acc0 = 0.0f, acc1 = 0.0f;
-
+    float a0=0, a1=0, a2=0, a3=0;
     const int K8 = K >> 3;
     const uint4* iv = (const uint4*)input;
-    const uint4* wv0 = (const uint4*)w0;
-    const uint4* wv1 = (const uint4*)w1;
 
     for (int i = lane; i < K8; i += GEMV_WARP) {
-        // 1 input load (cached after first access)
         uint4 b = __ldg(iv + i);
-        // 2 weight loads from different rows — doubles HBM pressure
-        uint4 a0 = __ldg(wv0 + i);
-        uint4 a1 = __ldg(wv1 + i);
-
+        uint4 v0 = __ldg((const uint4*)w0 + i);
+        uint4 v1 = __ldg((const uint4*)w1 + i);
+        uint4 v2 = __ldg((const uint4*)w2 + i);
+        uint4 v3 = __ldg((const uint4*)w3 + i);
         const __nv_bfloat16* bp = (const __nv_bfloat16*)&b;
-        const __nv_bfloat16* ap0 = (const __nv_bfloat16*)&a0;
-        const __nv_bfloat16* ap1 = (const __nv_bfloat16*)&a1;
 
-        acc0 += __bfloat162float(ap0[0]) * __bfloat162float(bp[0])
-              + __bfloat162float(ap0[1]) * __bfloat162float(bp[1])
-              + __bfloat162float(ap0[2]) * __bfloat162float(bp[2])
-              + __bfloat162float(ap0[3]) * __bfloat162float(bp[3])
-              + __bfloat162float(ap0[4]) * __bfloat162float(bp[4])
-              + __bfloat162float(ap0[5]) * __bfloat162float(bp[5])
-              + __bfloat162float(ap0[6]) * __bfloat162float(bp[6])
-              + __bfloat162float(ap0[7]) * __bfloat162float(bp[7]);
-
-        acc1 += __bfloat162float(ap1[0]) * __bfloat162float(bp[0])
-              + __bfloat162float(ap1[1]) * __bfloat162float(bp[1])
-              + __bfloat162float(ap1[2]) * __bfloat162float(bp[2])
-              + __bfloat162float(ap1[3]) * __bfloat162float(bp[3])
-              + __bfloat162float(ap1[4]) * __bfloat162float(bp[4])
-              + __bfloat162float(ap1[5]) * __bfloat162float(bp[5])
-              + __bfloat162float(ap1[6]) * __bfloat162float(bp[6])
-              + __bfloat162float(ap1[7]) * __bfloat162float(bp[7]);
+        #define DOT8(acc, v) { \
+            const __nv_bfloat16* p = (const __nv_bfloat16*)&v; \
+            acc += __bfloat162float(p[0])*__bfloat162float(bp[0]) \
+                 + __bfloat162float(p[1])*__bfloat162float(bp[1]) \
+                 + __bfloat162float(p[2])*__bfloat162float(bp[2]) \
+                 + __bfloat162float(p[3])*__bfloat162float(bp[3]) \
+                 + __bfloat162float(p[4])*__bfloat162float(bp[4]) \
+                 + __bfloat162float(p[5])*__bfloat162float(bp[5]) \
+                 + __bfloat162float(p[6])*__bfloat162float(bp[6]) \
+                 + __bfloat162float(p[7])*__bfloat162float(bp[7]); \
+        }
+        DOT8(a0, v0); DOT8(a1, v1); DOT8(a2, v2); DOT8(a3, v3);
+        #undef DOT8
     }
 
-    // Warp reduce both accumulators
-    acc0 += __shfl_down_sync(0xFFFFFFFF, acc0, 16);
-    acc1 += __shfl_down_sync(0xFFFFFFFF, acc1, 16);
-    acc0 += __shfl_down_sync(0xFFFFFFFF, acc0, 8);
-    acc1 += __shfl_down_sync(0xFFFFFFFF, acc1, 8);
-    acc0 += __shfl_down_sync(0xFFFFFFFF, acc0, 4);
-    acc1 += __shfl_down_sync(0xFFFFFFFF, acc1, 4);
-    acc0 += __shfl_down_sync(0xFFFFFFFF, acc0, 2);
-    acc1 += __shfl_down_sync(0xFFFFFFFF, acc1, 2);
-    acc0 += __shfl_down_sync(0xFFFFFFFF, acc0, 1);
-    acc1 += __shfl_down_sync(0xFFFFFFFF, acc1, 1);
+    // Reduce all 4 accumulators
+    #define WARP_REDUCE(x) \
+        x += __shfl_down_sync(0xFFFFFFFF, x, 16); \
+        x += __shfl_down_sync(0xFFFFFFFF, x, 8);  \
+        x += __shfl_down_sync(0xFFFFFFFF, x, 4);  \
+        x += __shfl_down_sync(0xFFFFFFFF, x, 2);  \
+        x += __shfl_down_sync(0xFFFFFFFF, x, 1);
+    WARP_REDUCE(a0); WARP_REDUCE(a1); WARP_REDUCE(a2); WARP_REDUCE(a3);
+    #undef WARP_REDUCE
 
     if (lane == 0) {
-        output[row0] = __float2bfloat16(acc0);
-        if (valid1) output[row1] = __float2bfloat16(acc1);
+        output[r0] = __float2bfloat16(a0);
+        if (r1<M) output[r1] = __float2bfloat16(a1);
+        if (r2<M) output[r2] = __float2bfloat16(a2);
+        if (r3<M) output[r3] = __float2bfloat16(a3);
     }
 }
 
