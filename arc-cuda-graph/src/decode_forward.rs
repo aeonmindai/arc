@@ -80,140 +80,68 @@ pub struct CublasState {
     pub workspace_size: usize,
 }
 
-// cuBLASLt FFI
-#[cfg(feature = "cuda")]
-extern "C" {
-    fn cublasLtCreate(handle: *mut *mut std::ffi::c_void) -> u32;
-    fn cublasLtDestroy(handle: *mut std::ffi::c_void) -> u32;
-    fn cublasLtMatmul(
-        handle: *const std::ffi::c_void,
-        desc: *const std::ffi::c_void,
-        alpha: *const std::ffi::c_void,
-        a: *const std::ffi::c_void, a_layout: *const std::ffi::c_void,
-        b: *const std::ffi::c_void, b_layout: *const std::ffi::c_void,
-        beta: *const std::ffi::c_void,
-        c: *const std::ffi::c_void, c_layout: *const std::ffi::c_void,
-        d: *mut std::ffi::c_void, d_layout: *const std::ffi::c_void,
-        algo: *const std::ffi::c_void,
-        workspace: *mut std::ffi::c_void, workspace_size: usize,
-        stream: CUstream,
-    ) -> u32;
-    fn cublasLtMatmulDescCreate(desc: *mut *mut std::ffi::c_void, compute: u32, scale: u32) -> u32;
-    fn cublasLtMatmulDescDestroy(desc: *mut std::ffi::c_void) -> u32;
-    fn cublasLtMatmulDescSetAttribute(
-        desc: *const std::ffi::c_void, attr: u32,
-        buf: *const std::ffi::c_void, size: usize,
-    ) -> u32;
-    fn cublasLtMatrixLayoutCreate(
-        layout: *mut *mut std::ffi::c_void,
-        dtype: u32, rows: u64, cols: u64, ld: i64,
-    ) -> u32;
-    fn cublasLtMatrixLayoutDestroy(layout: *mut std::ffi::c_void) -> u32;
-    fn cublasLtMatmulPreferenceCreate(pref: *mut *mut std::ffi::c_void) -> u32;
-    fn cublasLtMatmulPreferenceDestroy(pref: *mut std::ffi::c_void) -> u32;
-    fn cublasLtMatmulPreferenceSetAttribute(
-        pref: *const std::ffi::c_void, attr: u32,
-        buf: *const std::ffi::c_void, size: usize,
-    ) -> u32;
-    fn cublasLtMatmulAlgoGetHeuristic(
-        handle: *const std::ffi::c_void,
-        desc: *const std::ffi::c_void,
-        a: *const std::ffi::c_void, b: *const std::ffi::c_void,
-        c: *const std::ffi::c_void, d: *const std::ffi::c_void,
-        pref: *const std::ffi::c_void,
-        count: i32, results: *mut [u8; 80], found: *mut i32,
-    ) -> u32;
-}
-
-// cuBLASLt constants
+// cuBLAS constants
 #[cfg(feature = "cuda")]
 const CUBLAS_COMPUTE_32F: u32 = 68;
 #[cfg(feature = "cuda")]
-const CUDA_R_32F: u32 = 0;
-#[cfg(feature = "cuda")]
 const CUDA_R_16BF: u32 = 14;
 
-/// Minimum N for cuBLASLt (padded from actual batch size).
-/// cuBLASLt returns NOT_SUPPORTED for N=1 with BF16 on Blackwell.
-/// N=8 is the smallest that reliably works and is still bandwidth-bound.
-#[cfg(feature = "cuda")]
-pub const GEMM_PAD_N: u64 = 8;
-
-/// Execute a BF16 GEMM: D = A^T * B using cuBLASLt (graph-capture compatible).
+/// Execute a BF16 GEMM: C = A^T * B using cublasGemmEx.
 ///
-/// Pads N to GEMM_PAD_N if needed. Input buffer must have room for padded N
-/// (pre-allocated by DedicatedDecodePath). Only the first actual_n rows of
-/// output are meaningful.
+/// Same API Candle uses. Works for N=1 on B200.
+/// For graph capture: cublasSetStream + cublasSetWorkspace must be called
+/// BEFORE capture begins. The GEMM itself is capture-compatible.
 #[cfg(feature = "cuda")]
 unsafe fn gemm_bf16(
     cublas: &CublasState,
     stream: CUstream,
     weight: u64,  // [out_dim, in_dim] row-major
-    input: u64,   // [in_dim, padded_n] col-major
-    output: u64,  // [out_dim, padded_n] col-major
+    input: u64,   // [in_dim, batch] col-major
+    output: u64,  // [out_dim, batch] col-major
     m: u64,       // out_dim
-    n: u64,       // padded batch (>= GEMM_PAD_N)
+    n: u64,       // batch
     k: u64,       // in_dim
 ) {
-    let mut desc: *mut std::ffi::c_void = std::ptr::null_mut();
-    cublasLtMatmulDescCreate(&mut desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    // BF16 alpha/beta — matches Candle's cudarc usage
+    let alpha: u16 = 0x3F80; // bf16 representation of 1.0
+    let beta: u16 = 0x0000;  // bf16 representation of 0.0
 
-    let transa: i32 = 1; // CUBLAS_OP_T
-    cublasLtMatmulDescSetAttribute(desc, 0, &transa as *const _ as *const _, 4);
-    let transb: i32 = 0; // CUBLAS_OP_N
-    cublasLtMatmulDescSetAttribute(desc, 1, &transb as *const _ as *const _, 4);
-
-    let mut a_layout: *mut std::ffi::c_void = std::ptr::null_mut();
-    cublasLtMatrixLayoutCreate(&mut a_layout, CUDA_R_16BF, k, m, k as i64);
-
-    let mut b_layout: *mut std::ffi::c_void = std::ptr::null_mut();
-    cublasLtMatrixLayoutCreate(&mut b_layout, CUDA_R_16BF, k, n, k as i64);
-
-    let mut c_layout: *mut std::ffi::c_void = std::ptr::null_mut();
-    cublasLtMatrixLayoutCreate(&mut c_layout, CUDA_R_16BF, m, n, m as i64);
-    let mut d_layout: *mut std::ffi::c_void = std::ptr::null_mut();
-    cublasLtMatrixLayoutCreate(&mut d_layout, CUDA_R_16BF, m, n, m as i64);
-
-    let mut pref: *mut std::ffi::c_void = std::ptr::null_mut();
-    cublasLtMatmulPreferenceCreate(&mut pref);
-    let ws = cublas.workspace_size;
-    cublasLtMatmulPreferenceSetAttribute(pref, 1, &ws as *const _ as *const _, std::mem::size_of::<usize>());
-
-    let mut heuristic = [0u8; 80];
-    let mut algo_count: i32 = 0;
-    let s = cublasLtMatmulAlgoGetHeuristic(
-        cublas.handle, desc, a_layout, b_layout, c_layout, d_layout,
-        pref, 1, &mut heuristic, &mut algo_count,
+    let s = cublasGemmEx(
+        cublas.handle,
+        1, 0, // CUBLAS_OP_T, CUBLAS_OP_N
+        m as i32, n as i32, k as i32,
+        &alpha as *const _ as *const _,
+        weight as *const _, CUDA_R_16BF, k as i32,
+        input as *const _, CUDA_R_16BF, k as i32,
+        &beta as *const _ as *const _,
+        output as *mut _, CUDA_R_16BF, m as i32,
+        CUBLAS_COMPUTE_32F,
+        0, // CUBLAS_GEMM_DEFAULT
     );
-    if s != 0 || algo_count == 0 {
+    if s != 0 {
         static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            tracing::error!("cuBLASLt heuristic: status={s} count={algo_count} m={m} n={n} k={k}");
+            tracing::error!("cublasGemmEx failed: status={s} m={m} n={n} k={k}");
         }
     }
+}
 
-    let alpha: f32 = 1.0;
-    let beta: f32 = 0.0;
-
-    cublasLtMatmul(
-        cublas.handle, desc,
-        &alpha as *const _ as *const _,
-        weight as *const _, a_layout,
-        input as *const _, b_layout,
-        &beta as *const _ as *const _,
-        output as *const _, c_layout,
-        output as *mut _, d_layout,
-        heuristic.as_ptr() as *const _,
-        cublas.workspace as *mut _, cublas.workspace_size,
-        stream,
-    );
-
-    cublasLtMatmulPreferenceDestroy(pref);
-    cublasLtMatrixLayoutDestroy(d_layout);
-    cublasLtMatrixLayoutDestroy(c_layout);
-    cublasLtMatrixLayoutDestroy(b_layout);
-    cublasLtMatrixLayoutDestroy(a_layout);
-    cublasLtMatmulDescDestroy(desc);
+// Legacy cuBLAS FFI
+#[cfg(feature = "cuda")]
+extern "C" {
+    pub fn cublasSetStream_v2(handle: *mut std::ffi::c_void, stream: CUstream) -> u32;
+    pub fn cublasSetWorkspace_v2(handle: *mut std::ffi::c_void, workspace: *mut std::ffi::c_void, size: usize) -> u32;
+    fn cublasGemmEx(
+        handle: *mut std::ffi::c_void,
+        transa: i32, transb: i32,
+        m: i32, n: i32, k: i32,
+        alpha: *const std::ffi::c_void,
+        a: *const std::ffi::c_void, a_type: u32, lda: i32,
+        b: *const std::ffi::c_void, b_type: u32, ldb: i32,
+        beta: *const std::ffi::c_void,
+        c: *mut std::ffi::c_void, c_type: u32, ldc: i32,
+        compute_type: u32, algo: u32,
+    ) -> u32;
 }
 
 // Paged attention FFI from mistralrs-paged-attn
@@ -320,7 +248,6 @@ pub unsafe fn decode_forward(
 ) {
     let cfg = &weights.config;
     let bs = buffers.batch_size as u64;
-    let pn = GEMM_PAD_N; // Padded N for GEMMs
     let hs = cfg.hidden_size as u64;
     let nh = cfg.num_heads;
     let nkv = cfg.num_kv_heads;
@@ -351,11 +278,11 @@ pub unsafe fn decode_forward(
 
         // QKV GEMMs (padded N for cuBLASLt)
         gemm_bf16(cublas, stream, lw.q_proj.ptr, buffers.normed, buffers.q,
-            (nh * hd) as u64, pn, hs);
+            (nh * hd) as u64, bs, hs);
         gemm_bf16(cublas, stream, lw.k_proj.ptr, buffers.normed, buffers.k,
-            (nkv * hd) as u64, pn, hs);
+            (nkv * hd) as u64, bs, hs);
         gemm_bf16(cublas, stream, lw.v_proj.ptr, buffers.normed, buffers.v,
-            (nkv * hd) as u64, pn, hs);
+            (nkv * hd) as u64, bs, hs);
 
         // QK norm (if model uses it) — uses real batch_size
         if let (Some(qn), Some(kn)) = (lw.q_norm, lw.k_norm) {
@@ -442,7 +369,7 @@ pub unsafe fn decode_forward(
 
         // O projection (padded N)
         gemm_bf16(cublas, stream, lw.o_proj.ptr, buffers.attn_out, buffers.o_proj_out,
-            hs, pn, (nh * hd) as u64);
+            hs, bs, (nh * hd) as u64);
 
         // Residual add (real batch_size)
         launch_residual_add_bf16(
@@ -460,9 +387,9 @@ pub unsafe fn decode_forward(
 
         // MLP GEMMs (padded N)
         gemm_bf16(cublas, stream, lw.gate_proj.ptr, buffers.normed, buffers.gate,
-            inter, pn, hs);
+            inter, bs, hs);
         gemm_bf16(cublas, stream, lw.up_proj.ptr, buffers.normed, buffers.up,
-            inter, pn, hs);
+            inter, bs, hs);
 
         launch_fused_silu_mul_bf16(
             buffers.gate as *const _, buffers.up as *const _,
@@ -470,7 +397,7 @@ pub unsafe fn decode_forward(
         );
 
         gemm_bf16(cublas, stream, lw.down_proj.ptr, buffers.mlp_act, buffers.down_out,
-            hs, pn, inter);
+            hs, bs, inter);
 
         // Residual add (real batch_size)
         launch_residual_add_bf16(
@@ -491,5 +418,5 @@ pub unsafe fn decode_forward(
 
     // LM head (padded N)
     gemm_bf16(cublas, stream, weights.lm_head.ptr, buffers.normed, buffers.logits,
-        cfg.vocab_size as u64, pn, hs);
+        cfg.vocab_size as u64, bs, hs);
 }
