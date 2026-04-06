@@ -1,9 +1,13 @@
 /**
- * BF16 GEMV — optimized for maximum SM occupancy on Blackwell.
+ * BF16 GEMV kernel for the dedicated decode path.
  *
- * 4 warps/block (128 threads), 4 rows/block, up to 16 blocks per SM.
- * High warp count per SM hides HBM latency through warp switching.
- * __ldg for read-only texture cache. No cuBLAS — graph-capture compatible.
+ * output[m] = sum_k(weight[m][k] * input[k])
+ * weight: [M, K] row-major BF16
+ * input:  [K] BF16
+ * output: [M] BF16
+ *
+ * 8 warps per block, 1 row per warp. __ldg for read-only cache.
+ * No cuBLAS — fully graph-capture compatible.
  */
 
 #include <cuda_bf16.h>
@@ -11,12 +15,10 @@
 #include <cstdint>
 
 #define GEMV_WARP 32
-#define GEMV_WARPS 4
-#define GEMV_ROWS GEMV_WARPS  // 1 row per warp, 4 rows per block
-#define GEMV_BLOCK (GEMV_WARP * GEMV_WARPS) // 128 threads
+#define GEMV_ROWS 8
+#define GEMV_BLOCK (GEMV_WARP * GEMV_ROWS)
 
-// Allow up to 16 blocks per SM for maximum occupancy
-__global__ __launch_bounds__(128, 16)
+__global__ __launch_bounds__(256, 4)
 void gemv_bf16_kernel(
     const __nv_bfloat16* __restrict__ weight,
     const __nv_bfloat16* __restrict__ input,

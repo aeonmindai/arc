@@ -288,13 +288,20 @@ impl DedicatedDecodePath {
             slot_mappings: self.staging_slot_mappings,
             block_size: self.cached_block_size,
             max_context_len: {
-                // Fixed for graph capture. TurboQuant smem = ceil(mcl/bs)*bs*4.
-                // Default dynamic smem limit is 48KB. Use 40KB (10240 tokens) to leave
-                // headroom for the kernel's static shared memory (qr[128], nb[128], etc).
                 if self.cached_is_turbo {
+                    // Query actual GPU smem limit, subtract 2KB for static shared vars
+                    let mut smem: i32 = 0;
+                    unsafe {
+                        extern "C" { fn cudaDeviceGetAttribute(v: *mut i32, a: i32, d: i32) -> u32; }
+                        // Try opt-in limit first (attr 97), fallback to default (attr 8)
+                        if cudaDeviceGetAttribute(&mut smem, 97, 0) != 0 || smem <= 0 {
+                            cudaDeviceGetAttribute(&mut smem, 8, 0);
+                        }
+                        if smem <= 0 { smem = 49152; }
+                    }
+                    let usable = (smem - 2048).max(16384); // leave 2KB headroom
                     let bs = self.cached_block_size.max(1);
-                    let max_tokens = 40960 / 4; // 40KB / sizeof(float) = 10240
-                    (max_tokens / bs) * bs // aligned to block_size
+                    ((usable / 4) / bs) * bs
                 } else {
                     self.weights.config.max_position_embeddings as i32
                 }
@@ -379,6 +386,10 @@ impl DedicatedDecodePath {
                 // Eager mode — still fast (no Candle overhead, just kernel launch costs)
                 decode_forward(&self.weights, buffers, &staged, self.stream);
             } else if self.eager_steps < 2 {
+                // Profile on first eager step
+                if self.eager_steps == 0 {
+                    crate::decode_forward::profile_forward(&self.weights, buffers, &staged, self.stream);
+                }
                 self.eager_steps += 1;
                 decode_forward(&self.weights, buffers, &staged, self.stream);
                 if self.eager_steps == 2 {
