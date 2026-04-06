@@ -21,6 +21,7 @@ use candle_core::cuda::cudarc::driver::sys::CUstream;
 extern "C" {
     fn cublasCreate_v2(handle: *mut *mut std::ffi::c_void) -> u32;
     fn cublasDestroy_v2(handle: *mut std::ffi::c_void) -> u32;
+    fn cublasSetStream_v2(handle: *mut std::ffi::c_void, stream: CUstream) -> u32;
     fn cudaMalloc(ptr: *mut u64, size: usize) -> u32;
     fn cudaFree(ptr: u64) -> u32;
     fn cudaMemcpyAsync(
@@ -370,6 +371,9 @@ impl DedicatedDecodePath {
         let buffers = self.buffers.as_ref().unwrap();
 
         unsafe {
+            // Set cuBLAS stream once (must be BEFORE capture — not capturable)
+            cublasSetStream_v2(self.cublas.handle, self.stream);
+
             // Stage all changing inputs (NOT part of the graph — happens before capture/launch)
             cudaMemcpyAsync(
                 buffers.token_ids as *mut _, token_ids.as_ptr() as *const _,
