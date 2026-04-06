@@ -137,7 +137,7 @@ const CUDA_R_16BF: u32 = 14;
 /// cuBLASLt returns NOT_SUPPORTED for N=1 with BF16 on Blackwell.
 /// N=8 is the smallest that reliably works and is still bandwidth-bound.
 #[cfg(feature = "cuda")]
-const GEMM_PAD_N: u64 = 8;
+pub const GEMM_PAD_N: u64 = 8;
 
 /// Execute a BF16 GEMM: D = A^T * B using cuBLASLt (graph-capture compatible).
 ///
