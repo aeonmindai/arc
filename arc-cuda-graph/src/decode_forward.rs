@@ -285,20 +285,12 @@ pub unsafe fn decode_forward(
         let k_ptr = buffers.qkv + (nh * hd * 2) as u64;      // BF16 = 2 bytes
         let v_ptr = k_ptr + (nkv * hd * 2) as u64;
 
-        // Fused: Q norm + K norm + RoPE in one kernel
-        let (qn_ptr, kn_ptr) = match (lw.q_norm, lw.k_norm) {
-            (Some(q), Some(k)) => (q as *const std::ffi::c_void, k as *const std::ffi::c_void),
-            _ => (std::ptr::null(), std::ptr::null()),
-        };
-        arc_launch_qknorm_rope_bf16(
-            q_ptr as *mut _, k_ptr as *mut _,
-            qn_ptr, kn_ptr,
-            buffers.cos_table as *const _, buffers.sin_table as *const _,
-            buffers.positions as *const i32,
-            nh as i32, nkv as i32, hd as i32,
-            bs as i32, buffers.is_neox as i32, eps,
-            stream,
-        );
+        // Q/K norm (separate) then RoPE — bisecting fused kernel
+        if let (Some(qn), Some(kn)) = (lw.q_norm, lw.k_norm) {
+            launch_rmsnorm_head_bf16(q_ptr as *const _, qn as *const _, q_ptr as *mut _, hd as i32, (bs as usize * nh) as i32, eps, stream);
+            launch_rmsnorm_head_bf16(k_ptr as *const _, kn as *const _, k_ptr as *mut _, hd as i32, (bs as usize * nkv) as i32, eps, stream);
+        }
+        launch_gather_rope_decode_bf16(q_ptr as *mut _, k_ptr as *mut _, buffers.cos_table as *const _, buffers.sin_table as *const _, buffers.positions as *const i32, nh as i32, nkv as i32, hd as i32, hd as i32, (hd/2) as i32, bs as i32, buffers.is_neox as i32, stream);
 
         // Store K/V into the paged KV cache + run attention
         let kv_stride = (nkv * hd) as i32;
