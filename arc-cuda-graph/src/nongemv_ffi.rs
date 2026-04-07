@@ -6,13 +6,15 @@
 
 use std::ffi::c_void;
 
-// Force the linker to pull in mistralrs-paged-attn's static lib so the
-// turbo_*_clocked symbols defined in turbo_paged_attention.cu are available
-// to the gemv_bench binary. Without this attribute, cargo's build.rs link
-// directives don't propagate from a dep's static lib to a binary in a
-// different package.
-#[link(name = "mistralrspagedattention", kind = "static")]
-extern "C" {}
+// Force the linker to pull in mistralrs-paged-attn's static CUDA lib so the
+// turbo_*_clocked symbols defined in turbo_paged_attention.cu are findable
+// from the gemv_bench binary. Reference a public function from the dep so
+// cargo includes its rlib + static lib in the link line. Never called.
+#[allow(dead_code)]
+#[doc(hidden)]
+pub fn __force_link_paged_attn() -> *const () {
+    mistralrs_paged_attn::turbo_reshape_and_cache as *const ()
+}
 
 extern "C" {
     // arc-cuda-graph kernels
