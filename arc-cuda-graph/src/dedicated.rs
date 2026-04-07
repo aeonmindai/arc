@@ -331,14 +331,12 @@ impl DedicatedDecodePath {
             block_size: self.cached_block_size,
             max_context_len: {
                 if self.cached_is_turbo {
-                    // Query actual GPU smem limit, subtract 2KB for static shared vars
+                    // Query DEFAULT per-block smem limit (not opt-in — we don't call cudaFuncSetAttribute)
                     let mut smem: i32 = 0;
                     unsafe {
                         extern "C" { fn cudaDeviceGetAttribute(v: *mut i32, a: i32, d: i32) -> u32; }
-                        // Try opt-in limit first (attr 97), fallback to default (attr 8)
-                        if cudaDeviceGetAttribute(&mut smem, 97, 0) != 0 || smem <= 0 {
-                            cudaDeviceGetAttribute(&mut smem, 8, 0);
-                        }
+                        // attr 8 = cudaDevAttrMaxSharedMemoryPerBlock (default, not opt-in)
+                        cudaDeviceGetAttribute(&mut smem, 8, 0);
                         if smem <= 0 { smem = 49152; }
                     }
                     let usable = (smem - 2048).max(16384); // leave 2KB headroom
