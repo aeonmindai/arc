@@ -94,27 +94,6 @@ extern "C" {
         output: *mut std::ffi::c_void,
         m: i32, k: i32, stream: CUstream,
     );
-    // Fused RMSNorm + GEMV (eliminates separate norm kernel + L2 round-trip)
-    fn arc_launch_rmsnorm_gemv_bf16(
-        input: *const std::ffi::c_void,
-        norm_weight: *const std::ffi::c_void,
-        weight: *const std::ffi::c_void,
-        output: *mut std::ffi::c_void,
-        m: i32, k: i32, eps: f32, stream: CUstream,
-    );
-    // Fused Q norm + K norm + RoPE (q_norm_w/k_norm_w nullable for non-qknorm models)
-    fn arc_launch_qknorm_rope_bf16(
-        q: *mut std::ffi::c_void,
-        k: *mut std::ffi::c_void,
-        q_norm_w: *const std::ffi::c_void,
-        k_norm_w: *const std::ffi::c_void,
-        cos_table: *const std::ffi::c_void,
-        sin_table: *const std::ffi::c_void,
-        positions: *const i32,
-        num_heads: i32, num_kv_heads: i32, head_dim: i32,
-        batch_size: i32, is_neox: i32, eps: f32,
-        stream: CUstream,
-    );
 }
 
 /// BF16 GEMV: output[0..m] = weight[m,k] * input[0..k]. Graph-capturable.
@@ -268,24 +247,52 @@ pub unsafe fn decode_forward(
 
     let mut h_in = buffers.hidden_a;
     let mut h_out = buffers.hidden_b;
+    let mut deferred_residual: u64 = 0; // 0 = no deferred add, else = pointer to add
 
     for layer_idx in 0..cfg.num_layers {
         let lw = &weights.layers[layer_idx];
 
-        // RMSNorm + QKV GEMV (separate) — fusion regressed perf due to redundant per-block reduction
-        launch_fused_rmsnorm_residual_bf16(h_in as *const _, std::ptr::null(), lw.input_layernorm as *const _, buffers.normed as *mut _, std::ptr::null_mut(), hs_z as i32, bs as i32, eps, stream);
-        gemv(stream, lw.qkv_fused, buffers.normed, buffers.qkv, lw.qkv_rows, hs_z);
+        // RMSNorm (input_layernorm) — fuses deferred residual from previous layer if any
+        let residual_ptr = if deferred_residual != 0 { deferred_residual as *const _ } else { std::ptr::null() };
+        let residual_out_ptr = if deferred_residual != 0 { buffers.residual as *mut _ } else { std::ptr::null_mut() };
+        launch_fused_rmsnorm_residual_bf16(
+            h_in as *const _, residual_ptr, lw.input_layernorm as *const _,
+            buffers.normed as *mut _, residual_out_ptr,
+            hs as i32, bs as i32, eps, stream,
+        );
+        // After fusion: residual buffer holds (h_in + deferred_residual). Use it as h_in for residual chain.
+        if deferred_residual != 0 {
+            h_in = buffers.residual;
+        }
+
+        // Fused QKV GEMV: 1 launch instead of 3, better bandwidth for small K/V
+        gemv(stream, lw.qkv_fused, buffers.normed, buffers.qkv,
+            lw.qkv_rows, hs_z);
         // Split output via pointer offsets (zero-copy)
         let q_ptr = buffers.qkv;
         let k_ptr = buffers.qkv + (nh * hd * 2) as u64;      // BF16 = 2 bytes
         let v_ptr = k_ptr + (nkv * hd * 2) as u64;
 
-        // Q/K norm (separate) then RoPE — bisecting fused kernel
+        // QK norm (if model uses it)
         if let (Some(qn), Some(kn)) = (lw.q_norm, lw.k_norm) {
-            launch_rmsnorm_head_bf16(q_ptr as *const _, qn as *const _, q_ptr as *mut _, hd as i32, (bs as usize * nh) as i32, eps, stream);
-            launch_rmsnorm_head_bf16(k_ptr as *const _, kn as *const _, k_ptr as *mut _, hd as i32, (bs as usize * nkv) as i32, eps, stream);
+            launch_rmsnorm_head_bf16(
+                q_ptr as *const _, qn as *const _, q_ptr as *mut _,
+                hd as i32, (bs as usize * nh) as i32, eps, stream,
+            );
+            launch_rmsnorm_head_bf16(
+                k_ptr as *const _, kn as *const _, k_ptr as *mut _,
+                hd as i32, (bs as usize * nkv) as i32, eps, stream,
+            );
         }
-        launch_gather_rope_decode_bf16(q_ptr as *mut _, k_ptr as *mut _, buffers.cos_table as *const _, buffers.sin_table as *const _, buffers.positions as *const i32, nh as i32, nkv as i32, hd as i32, hd as i32, (hd/2) as i32, bs as i32, buffers.is_neox as i32, stream);
+
+        // RoPE
+        launch_gather_rope_decode_bf16(
+            q_ptr as *mut _, k_ptr as *mut _,
+            buffers.cos_table as *const _, buffers.sin_table as *const _,
+            buffers.positions as *const i32,
+            nh as i32, nkv as i32, hd as i32, hd as i32, (hd / 2) as i32,
+            bs as i32, buffers.is_neox as i32, stream,
+        );
 
         // Store K/V into the paged KV cache + run attention
         let kv_stride = (nkv * hd) as i32;
@@ -356,20 +363,16 @@ pub unsafe fn decode_forward(
         gemv(stream, lw.o_proj.ptr, buffers.attn_out, buffers.o_proj_out,
             hs_z, nh * hd);
 
-        // Residual add
-        launch_residual_add_bf16(
-            h_in as *const _, buffers.o_proj_out as *const _,
-            buffers.residual as *mut _, (bs * hs) as i32, stream,
-        );
-
-        // Post-attention RMSNorm (separate — Up needs the normed buffer, fusion would
-        // require recomputing or a dual-gemv kernel)
+        // Fused: residual = h_in + o_proj_out, normed = rmsnorm(residual)
+        // Eliminates separate residual_add kernel (saves 1 launch per layer)
         launch_fused_rmsnorm_residual_bf16(
-            buffers.residual as *const _, std::ptr::null(),
+            h_in as *const _, buffers.o_proj_out as *const _,
             lw.post_attn_layernorm as *const _,
-            buffers.normed as *mut _, std::ptr::null_mut(),
+            buffers.normed as *mut _, buffers.residual as *mut _,
             hs as i32, bs as i32, eps, stream,
         );
+
+        // MLP: gate + up + silu_mul + down
         gemv(stream, lw.gate_proj.ptr, buffers.normed, buffers.gate,
             inter_z, hs_z);
         gemv(stream, lw.up_proj.ptr, buffers.normed, buffers.up,
@@ -383,19 +386,14 @@ pub unsafe fn decode_forward(
         gemv(stream, lw.down_proj.ptr, buffers.mlp_act, buffers.down_out,
             hs_z, inter_z);
 
-        // Residual add
-        launch_residual_add_bf16(
-            buffers.residual as *const _, buffers.down_out as *const _,
-            h_out as *mut _, (bs * hs) as i32, stream,
-        );
-
-        // Swap ping-pong
-        std::mem::swap(&mut h_in, &mut h_out);
+        // Defer residual add: next layer's input RMSNorm fuses (residual + down_out)
+        h_in = buffers.residual; // current residual (post-attention sum)
+        deferred_residual = buffers.down_out; // to be added by next norm
     }
 
-    // Final RMSNorm
+    // Final fused: normed = rmsnorm(h_in + down_out)
     launch_fused_rmsnorm_residual_bf16(
-        h_in as *const _, std::ptr::null(),
+        h_in as *const _, deferred_residual as *const _,
         weights.final_norm as *const _,
         buffers.normed as *mut _, std::ptr::null_mut(),
         hs as i32, bs as i32, eps, stream,
