@@ -63,6 +63,13 @@ pub struct DedicatedDecodePath {
     warmup_remaining: u32,
     eager_steps: u32,
     capture_failed: bool, // Stop retrying capture after failure
+    step_count: u64,
+    // Rolling sums for periodic granular timing report
+    sum_setup_us: f64,
+    sum_stage_us: f64,
+    sum_launch_us: f64,
+    sum_sync_us: f64,
+    sum_total_us: f64,
 }
 
 #[cfg(feature = "cuda")]
@@ -116,6 +123,12 @@ impl DedicatedDecodePath {
             warmup_remaining: 2,
             eager_steps: 0,
             capture_failed: false,
+            step_count: 0,
+            sum_setup_us: 0.0,
+            sum_stage_us: 0.0,
+            sum_launch_us: 0.0,
+            sum_sync_us: 0.0,
+            sum_total_us: 0.0,
         })
     }
 
@@ -382,6 +395,7 @@ impl DedicatedDecodePath {
         positions: &[i32],
         paged_attn: &PagedAttentionState,
     ) -> candle_core::Result<u64> {
+        let t_start = std::time::Instant::now();
         let batch_size = token_ids.len();
         self.ensure_buffers(batch_size)?;
         // Pre-allocate staging for max possible blocks to avoid reallocation
@@ -392,6 +406,7 @@ impl DedicatedDecodePath {
         self.cache_kv_info(paged_attn);
 
         let buffers = self.buffers.as_ref().unwrap();
+        let t_after_setup = std::time::Instant::now();
 
         unsafe {
             // Stage all changing inputs (NOT part of the graph — happens before capture/launch)
@@ -404,6 +419,7 @@ impl DedicatedDecodePath {
                 batch_size * 4, 1, self.stream,
             );
             self.stage_paged_attn(paged_attn, batch_size);
+            let t_after_stage = std::time::Instant::now();
 
             // Use REAL per-step values for max_context_len and max_num_blocks_per_seq.
             // These determine shared memory allocation in attention kernels — using
@@ -483,7 +499,38 @@ impl DedicatedDecodePath {
                 }
             }
 
+            let t_after_launch = std::time::Instant::now();
             cudaStreamSynchronize(self.stream);
+            let t_after_sync = std::time::Instant::now();
+
+            // Accumulate phase timings (skip first 4 steps for warmup/capture noise)
+            self.step_count += 1;
+            if self.step_count > 4 {
+                let setup_us = t_after_setup.duration_since(t_start).as_secs_f64() * 1e6;
+                let stage_us = t_after_stage.duration_since(t_after_setup).as_secs_f64() * 1e6;
+                let launch_us = t_after_launch.duration_since(t_after_stage).as_secs_f64() * 1e6;
+                let sync_us = t_after_sync.duration_since(t_after_launch).as_secs_f64() * 1e6;
+                let total_us = t_after_sync.duration_since(t_start).as_secs_f64() * 1e6;
+                self.sum_setup_us += setup_us;
+                self.sum_stage_us += stage_us;
+                self.sum_launch_us += launch_us;
+                self.sum_sync_us += sync_us;
+                self.sum_total_us += total_us;
+
+                let n = (self.step_count - 4) as f64;
+                if (self.step_count - 4) % 25 == 0 {
+                    tracing::info!(
+                        "RUN_STEP_us avg over {} steps: setup={:.1} stage={:.1} launch={:.1} sync={:.1} TOTAL={:.1} (=> {:.1} tok/s)",
+                        n as u64,
+                        self.sum_setup_us / n,
+                        self.sum_stage_us / n,
+                        self.sum_launch_us / n,
+                        self.sum_sync_us / n,
+                        self.sum_total_us / n,
+                        1e6 / (self.sum_total_us / n),
+                    );
+                }
+            }
         }
 
         Ok(buffers.logits_f32) // F32 directly from LM head GEMV — no cast needed
