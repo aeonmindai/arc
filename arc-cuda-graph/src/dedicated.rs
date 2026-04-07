@@ -72,7 +72,7 @@ unsafe impl Sync for DedicatedDecodePath {}
 
 #[cfg(feature = "cuda")]
 impl DedicatedDecodePath {
-    pub fn new(weights: ModelWeights) -> candle_core::Result<Self> {
+    pub fn new(mut weights: ModelWeights) -> candle_core::Result<Self> {
         let mut stream: CUstream = std::ptr::null_mut();
         let s = unsafe { cuStreamCreate(&mut stream, CU_STREAM_NON_BLOCKING) };
         if s != CUDA_SUCCESS {
@@ -82,8 +82,11 @@ impl DedicatedDecodePath {
 
         let (cos_table, sin_table) = Self::compute_rope_tables(&weights.config)?;
 
+        // Fuse QKV weights contiguously per layer (saves 2 kernel launches/layer)
+        Self::fuse_qkv(&mut weights)?;
+
         tracing::info!(
-            "Dedicated decode path initialized (stream + cuBLAS + RoPE[{}x{}])",
+            "Dedicated decode path initialized (stream + GEMV + RoPE[{}x{}])",
             weights.config.max_position_embeddings,
             weights.config.head_dim / 2,
         );
@@ -161,6 +164,43 @@ impl DedicatedDecodePath {
         Ok((cos_ptr, sin_ptr))
     }
 
+    /// Copy Q+K+V weights contiguously per layer for a single fused GEMV.
+    fn fuse_qkv(weights: &mut ModelWeights) -> candle_core::Result<()> {
+        extern "C" {
+            fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: u32) -> u32;
+        }
+        let bf16 = 2usize;
+        let k = weights.config.hidden_size;
+        let mut total_bytes = 0usize;
+
+        for lw in weights.layers.iter_mut() {
+            let qr = lw.q_proj.rows;
+            let kr = lw.k_proj.rows;
+            let vr = lw.v_proj.rows;
+            let total_rows = qr + kr + vr;
+            let total_size = total_rows * k * bf16;
+
+            let mut ptr: u64 = 0;
+            let s = unsafe { cudaMalloc(&mut ptr, total_size) };
+            if s != 0 { candle_core::bail!("cudaMalloc QKV fused failed: {s}"); }
+
+            unsafe {
+                let mut off = 0usize;
+                cudaMemcpy((ptr + off as u64) as *mut _, lw.q_proj.ptr as *const _, qr * k * bf16, 3);
+                off += qr * k * bf16;
+                cudaMemcpy((ptr + off as u64) as *mut _, lw.k_proj.ptr as *const _, kr * k * bf16, 3);
+                off += kr * k * bf16;
+                cudaMemcpy((ptr + off as u64) as *mut _, lw.v_proj.ptr as *const _, vr * k * bf16, 3);
+            }
+            lw.qkv_fused = ptr;
+            lw.qkv_rows = total_rows;
+            total_bytes += total_size;
+        }
+
+        tracing::info!("QKV fused: {} layers, {:.1} GB", weights.layers.len(), total_bytes as f64 / 1e9);
+        Ok(())
+    }
+
     fn ensure_buffers(&mut self, batch_size: usize) -> candle_core::Result<()> {
         if self.buffers.is_some() {
             return Ok(());
@@ -184,9 +224,10 @@ impl DedicatedDecodePath {
             hidden_b: alloc!(bs * cfg.hidden_size * bf16),
             normed: alloc!(bs * cfg.hidden_size * bf16),
             residual: alloc!(bs * cfg.hidden_size * bf16),
-            q: alloc!(bs * cfg.num_heads * cfg.head_dim * bf16),
-            k: alloc!(bs * cfg.num_kv_heads * cfg.head_dim * bf16),
-            v: alloc!(bs * cfg.num_kv_heads * cfg.head_dim * bf16),
+            qkv: alloc!(bs * (cfg.num_heads * cfg.head_dim + 2 * cfg.num_kv_heads * cfg.head_dim) * bf16),
+            q: 0, // set per-layer as alias into qkv
+            k: 0,
+            v: 0,
             attn_out: alloc!(bs * cfg.num_heads * cfg.head_dim * bf16),
             attn_out_f32: alloc!(bs * cfg.num_heads * cfg.head_dim * 4),
             o_proj_out: alloc!(bs * cfg.hidden_size * bf16),
@@ -195,6 +236,7 @@ impl DedicatedDecodePath {
             mlp_act: alloc!(bs * cfg.intermediate_size * bf16),
             down_out: alloc!(bs * cfg.hidden_size * bf16),
             logits: alloc!(bs * cfg.vocab_size * bf16),
+            logits_f32: alloc!(bs * cfg.vocab_size * 4), // F32 output from LM head
             token_ids: alloc!(bs * 4),
             positions: alloc!(bs * 4),
             cos_table: self.cos_table,
@@ -446,7 +488,7 @@ impl DedicatedDecodePath {
             cudaStreamSynchronize(self.stream);
         }
 
-        Ok(buffers.logits)
+        Ok(buffers.logits_f32) // F32 directly from LM head GEMV — no cast needed
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -475,15 +517,18 @@ impl Drop for DedicatedDecodePath {
             }
             if self.cos_table != 0 { cudaFree(self.cos_table); }
             if self.sin_table != 0 { cudaFree(self.sin_table); }
+            for lw in &self.weights.layers {
+                if lw.qkv_fused != 0 { cudaFree(lw.qkv_fused); }
+            }
             if self.staging_block_tables != 0 { cudaFree(self.staging_block_tables); }
             if self.staging_context_lens != 0 { cudaFree(self.staging_context_lens); }
             if self.staging_slot_mappings != 0 { cudaFree(self.staging_slot_mappings); }
             if let Some(ref b) = self.buffers {
                 for ptr in [b.hidden_a, b.hidden_b, b.normed, b.residual,
-                    b.q, b.k, b.v, b.attn_out,
+                    b.qkv, b.attn_out,
                     b.attn_out_f32,
                     b.o_proj_out,
-                    b.gate, b.up, b.mlp_act, b.down_out, b.logits,
+                    b.gate, b.up, b.mlp_act, b.down_out, b.logits, b.logits_f32,
                     b.token_ids, b.positions] {
                     if ptr != 0 { cudaFree(ptr); }
                 }

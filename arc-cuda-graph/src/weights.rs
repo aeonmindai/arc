@@ -29,6 +29,9 @@ pub struct LayerWeights {
     pub gate_proj: WeightPtr,
     pub up_proj: WeightPtr,
     pub down_proj: WeightPtr,
+    // Fused QKV: contiguous [q_rows + k_rows + v_rows, hidden] — set by DedicatedDecodePath
+    pub qkv_fused: u64,
+    pub qkv_rows: usize, // q_rows + k_rows + v_rows
 }
 
 #[cfg(feature = "cuda")]
@@ -174,6 +177,8 @@ pub fn extract_model_weights(
             gate_proj: quant_method_ptr(&**layers[base + 4].0)?,
             up_proj: quant_method_ptr(&**layers[base + 5].0)?,
             down_proj: quant_method_ptr(&**layers[base + 6].0)?,
+            qkv_fused: 0,
+            qkv_rows: 0,
         });
     }
 

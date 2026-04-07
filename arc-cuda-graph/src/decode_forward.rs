@@ -53,9 +53,10 @@ pub struct DecodeBuffers {
     pub hidden_b: u64,      // [batch, hidden_size] (ping-pong)
     pub normed: u64,        // [batch, hidden_size]
     pub residual: u64,      // [batch, hidden_size]
-    pub q: u64,             // [batch, num_heads * head_dim]
-    pub k: u64,             // [batch, num_kv_heads * head_dim]
-    pub v: u64,             // [batch, num_kv_heads * head_dim]
+    pub qkv: u64,           // [batch, q_dim + k_dim + v_dim] fused output
+    pub q: u64,             // alias into qkv (set at runtime)
+    pub k: u64,             // alias into qkv
+    pub v: u64,             // alias into qkv
     pub attn_out: u64,      // [batch, num_heads * head_dim]
     pub attn_out_f32: u64,  // [batch, num_heads * head_dim] F32 (TurboQuant outputs F32)
     pub o_proj_out: u64,    // [batch, hidden_size]
@@ -64,6 +65,7 @@ pub struct DecodeBuffers {
     pub mlp_act: u64,       // [batch, intermediate_size]
     pub down_out: u64,      // [batch, hidden_size]
     pub logits: u64,        // [batch, vocab_size] (BF16)
+    pub logits_f32: u64,    // [batch, vocab_size] (F32) — pre-allocated for output
 
     // Input buffers (updated before each step)
     pub token_ids: u64,     // [batch] i32
@@ -81,6 +83,12 @@ pub struct DecodeBuffers {
 #[cfg(feature = "cuda")]
 extern "C" {
     fn arc_launch_gemv_bf16(
+        weight: *const std::ffi::c_void,
+        input: *const std::ffi::c_void,
+        output: *mut std::ffi::c_void,
+        m: i32, k: i32, stream: CUstream,
+    );
+    fn arc_launch_gemv_bf16_f32out(
         weight: *const std::ffi::c_void,
         input: *const std::ffi::c_void,
         output: *mut std::ffi::c_void,
@@ -141,26 +149,27 @@ pub unsafe fn profile_forward(
 
         // Norm + QKV
         launch_fused_rmsnorm_residual_bf16(h_in as *const _, std::ptr::null(), lw.input_layernorm as *const _, buffers.normed as *mut _, std::ptr::null_mut(), hs as i32, bs as i32, eps, stream);
-        gemv(stream, lw.q_proj.ptr, buffers.normed, buffers.q, nh*hd, hs_z);
-        gemv(stream, lw.k_proj.ptr, buffers.normed, buffers.k, nkv*hd, hs_z);
-        gemv(stream, lw.v_proj.ptr, buffers.normed, buffers.v, nkv*hd, hs_z);
+        gemv(stream, lw.qkv_fused, buffers.normed, buffers.qkv, lw.qkv_rows, hs_z);
+        let q_ptr = buffers.qkv;
+        let k_ptr = buffers.qkv + (nh * hd * 2) as u64;
+        let v_ptr = k_ptr + (nkv * hd * 2) as u64;
         if let (Some(qn), Some(kn)) = (lw.q_norm, lw.k_norm) {
-            launch_rmsnorm_head_bf16(buffers.q as *const _, qn as *const _, buffers.q as *mut _, hd as i32, (bs as usize * nh) as i32, eps, stream);
-            launch_rmsnorm_head_bf16(buffers.k as *const _, kn as *const _, buffers.k as *mut _, hd as i32, (bs as usize * nkv) as i32, eps, stream);
+            launch_rmsnorm_head_bf16(q_ptr as *const _, qn as *const _, q_ptr as *mut _, hd as i32, (bs as usize * nh) as i32, eps, stream);
+            launch_rmsnorm_head_bf16(k_ptr as *const _, kn as *const _, k_ptr as *mut _, hd as i32, (bs as usize * nkv) as i32, eps, stream);
         }
-        launch_gather_rope_decode_bf16(buffers.q as *mut _, buffers.k as *mut _, buffers.cos_table as *const _, buffers.sin_table as *const _, buffers.positions as *const i32, nh as i32, nkv as i32, hd as i32, hd as i32, (hd/2) as i32, bs as i32, buffers.is_neox as i32, stream);
+        launch_gather_rope_decode_bf16(q_ptr as *mut _, k_ptr as *mut _, buffers.cos_table as *const _, buffers.sin_table as *const _, buffers.positions as *const i32, nh as i32, nkv as i32, hd as i32, hd as i32, (hd/2) as i32, bs as i32, buffers.is_neox as i32, stream);
         if layer_idx == 0 { rec!(e_qkv); }
 
         // Attention
         let kv_stride = (nkv * hd) as i32; let q_stride = (nh * hd) as i32; let scale = 1.0f32 / (hd as f32).sqrt();
         let lc = &paged_attn.layer_caches[layer_idx];
         if paged_attn.is_turbo {
-            turbo_reshape_and_cache(buffers.k as *const _, buffers.v as *const _, lc.key_cache as *const _, lc.value_cache as *const _, lc.k_norms as *const _, lc.v_norms as *const _, paged_attn.slot_mappings as *const i64, bs as i32, nkv as i32, hd as i32, paged_attn.block_size, kv_stride, kv_stride, paged_attn.kv_block_stride, paged_attn.kv_head_stride, paged_attn.norm_block_stride, paged_attn.norm_head_stride, stream, 1);
-            turbo_paged_attention_v1(buffers.attn_out_f32 as *const _, buffers.q as *const _, lc.key_cache as *const _, lc.value_cache as *const _, lc.k_norms as *const _, lc.v_norms as *const _, nkv as i32, scale, 1.0, paged_attn.block_tables as *const u32, paged_attn.context_lens as *const u32, paged_attn.block_size, paged_attn.max_context_len, bs as i32, nh as i32, hd as i32, paged_attn.max_num_blocks_per_seq, q_stride, paged_attn.kv_block_stride, paged_attn.kv_head_stride, paged_attn.norm_block_stride, paged_attn.norm_head_stride, stream, 1);
+            turbo_reshape_and_cache(k_ptr as *const _, v_ptr as *const _, lc.key_cache as *const _, lc.value_cache as *const _, lc.k_norms as *const _, lc.v_norms as *const _, paged_attn.slot_mappings as *const i64, bs as i32, nkv as i32, hd as i32, paged_attn.block_size, kv_stride, kv_stride, paged_attn.kv_block_stride, paged_attn.kv_head_stride, paged_attn.norm_block_stride, paged_attn.norm_head_stride, stream, 1);
+            turbo_paged_attention_v1(buffers.attn_out_f32 as *const _, q_ptr as *const _, lc.key_cache as *const _, lc.value_cache as *const _, lc.k_norms as *const _, lc.v_norms as *const _, nkv as i32, scale, 1.0, paged_attn.block_tables as *const u32, paged_attn.context_lens as *const u32, paged_attn.block_size, paged_attn.max_context_len, bs as i32, nh as i32, hd as i32, paged_attn.max_num_blocks_per_seq, q_stride, paged_attn.kv_block_stride, paged_attn.kv_head_stride, paged_attn.norm_block_stride, paged_attn.norm_head_stride, stream, 1);
             launch_cast_f32_to_bf16(buffers.attn_out_f32 as *const _, buffers.attn_out as *mut _, (bs as usize * nh * hd) as i32, stream);
         } else {
-            reshape_and_cache(buffers.k as *const _, buffers.v as *const _, lc.key_cache as *const _, lc.value_cache as *const _, paged_attn.slot_mappings as *const i64, bs as i32, nkv as i32, hd as i32, paged_attn.block_size, paged_attn.x, kv_stride, kv_stride, stream, 1, 1, std::ptr::null(), std::ptr::null());
-            paged_attention_v1_bf16(buffers.attn_out as *const _, buffers.q as *const _, lc.key_cache as *const _, lc.value_cache as *const _, std::ptr::null(), nkv as i32, scale, 1.0, paged_attn.block_tables as *const i32, paged_attn.context_lens as *const i32, paged_attn.block_size, paged_attn.max_context_len, bs as i32, nh as i32, hd as i32, paged_attn.max_num_blocks_per_seq, q_stride, paged_attn.kv_block_stride, paged_attn.kv_head_stride, stream, 1, std::ptr::null(), std::ptr::null(), std::ptr::null());
+            reshape_and_cache(k_ptr as *const _, v_ptr as *const _, lc.key_cache as *const _, lc.value_cache as *const _, paged_attn.slot_mappings as *const i64, bs as i32, nkv as i32, hd as i32, paged_attn.block_size, paged_attn.x, kv_stride, kv_stride, stream, 1, 1, std::ptr::null(), std::ptr::null());
+            paged_attention_v1_bf16(buffers.attn_out as *const _, q_ptr as *const _, lc.key_cache as *const _, lc.value_cache as *const _, std::ptr::null(), nkv as i32, scale, 1.0, paged_attn.block_tables as *const i32, paged_attn.context_lens as *const i32, paged_attn.block_size, paged_attn.max_context_len, bs as i32, nh as i32, hd as i32, paged_attn.max_num_blocks_per_seq, q_stride, paged_attn.kv_block_stride, paged_attn.kv_head_stride, stream, 1, std::ptr::null(), std::ptr::null(), std::ptr::null());
         }
         if layer_idx == 0 { rec!(e_attn); }
 
@@ -183,7 +192,7 @@ pub unsafe fn profile_forward(
 
     rec!(e_final);
     launch_fused_rmsnorm_residual_bf16(h_in as *const _, std::ptr::null(), weights.final_norm as *const _, buffers.normed as *mut _, std::ptr::null_mut(), hs as i32, bs as i32, eps, stream);
-    gemv(stream, weights.lm_head.ptr, buffers.normed, buffers.logits, cfg.vocab_size, hs_z);
+    arc_launch_gemv_bf16_f32out(weights.lm_head.ptr as *const _, buffers.normed as *const _, buffers.logits_f32 as *mut _, cfg.vocab_size as i32, hs_z as i32, stream);
     rec!(e_lmhead); rec!(e_end);
 
     let total = ms!(e_start, e_end);
@@ -249,29 +258,29 @@ pub unsafe fn decode_forward(
             hs as i32, bs as i32, eps, stream,
         );
 
-        // QKV projections
-        gemv(stream, lw.q_proj.ptr, buffers.normed, buffers.q,
-            nh * hd, hs_z);
-        gemv(stream, lw.k_proj.ptr, buffers.normed, buffers.k,
-            nkv * hd, hs_z);
-        gemv(stream, lw.v_proj.ptr, buffers.normed, buffers.v,
-            nkv * hd, hs_z);
+        // Fused QKV GEMV: 1 launch instead of 3, better bandwidth for small K/V
+        gemv(stream, lw.qkv_fused, buffers.normed, buffers.qkv,
+            lw.qkv_rows, hs_z);
+        // Split output via pointer offsets (zero-copy)
+        let q_ptr = buffers.qkv;
+        let k_ptr = buffers.qkv + (nh * hd * 2) as u64;      // BF16 = 2 bytes
+        let v_ptr = k_ptr + (nkv * hd * 2) as u64;
 
         // QK norm (if model uses it)
         if let (Some(qn), Some(kn)) = (lw.q_norm, lw.k_norm) {
             launch_rmsnorm_head_bf16(
-                buffers.q as *const _, qn as *const _, buffers.q as *mut _,
+                q_ptr as *const _, qn as *const _, q_ptr as *mut _,
                 hd as i32, (bs as usize * nh) as i32, eps, stream,
             );
             launch_rmsnorm_head_bf16(
-                buffers.k as *const _, kn as *const _, buffers.k as *mut _,
+                k_ptr as *const _, kn as *const _, k_ptr as *mut _,
                 hd as i32, (bs as usize * nkv) as i32, eps, stream,
             );
         }
 
         // RoPE
         launch_gather_rope_decode_bf16(
-            buffers.q as *mut _, buffers.k as *mut _,
+            q_ptr as *mut _, k_ptr as *mut _,
             buffers.cos_table as *const _, buffers.sin_table as *const _,
             buffers.positions as *const i32,
             nh as i32, nkv as i32, hd as i32, hd as i32, (hd / 2) as i32,
@@ -287,7 +296,7 @@ pub unsafe fn decode_forward(
         if paged_attn.is_turbo {
             // Native BF16 — turbo kernels handle conversion internally (dtype=1)
             turbo_reshape_and_cache(
-                buffers.k as *const _, buffers.v as *const _,
+                k_ptr as *const _, v_ptr as *const _,
                 lc.key_cache as *const _, lc.value_cache as *const _,
                 lc.k_norms as *const _, lc.v_norms as *const _,
                 paged_attn.slot_mappings as *const i64,
@@ -299,7 +308,7 @@ pub unsafe fn decode_forward(
             );
             let q_size = (bs as usize * nh * hd) as i32;
             turbo_paged_attention_v1(
-                buffers.attn_out_f32 as *const _, buffers.q as *const _,
+                buffers.attn_out_f32 as *const _, q_ptr as *const _,
                 lc.key_cache as *const _, lc.value_cache as *const _,
                 lc.k_norms as *const _, lc.v_norms as *const _,
                 nkv as i32, scale, 1.0,
@@ -319,7 +328,7 @@ pub unsafe fn decode_forward(
         } else {
             // Standard BF16 cache
             reshape_and_cache(
-                buffers.k as *const _, buffers.v as *const _,
+                k_ptr as *const _, v_ptr as *const _,
                 lc.key_cache as *const _, lc.value_cache as *const _,
                 paged_attn.slot_mappings as *const i64,
                 bs as i32, nkv as i32, hd as i32, paged_attn.block_size, paged_attn.x,
@@ -328,7 +337,7 @@ pub unsafe fn decode_forward(
                 std::ptr::null(), std::ptr::null(),
             );
             paged_attention_v1_bf16(
-                buffers.attn_out as *const _, buffers.q as *const _,
+                buffers.attn_out as *const _, q_ptr as *const _,
                 lc.key_cache as *const _, lc.value_cache as *const _,
                 std::ptr::null(), // alibi_slopes
                 nkv as i32, scale, 1.0,
@@ -393,9 +402,12 @@ pub unsafe fn decode_forward(
         hs as i32, bs as i32, eps, stream,
     );
 
-    // LM head
-    gemv(stream, weights.lm_head.ptr, buffers.normed, buffers.logits,
-        cfg.vocab_size, hs_z);
+    // LM head → outputs F32 directly (sampling needs F32, no cast needed)
+    arc_launch_gemv_bf16_f32out(
+        weights.lm_head.ptr as *const _, buffers.normed as *const _,
+        buffers.logits_f32 as *mut _,
+        cfg.vocab_size as i32, hs_z as i32, stream,
+    );
 }
 
 // Paged attention FFI from mistralrs-paged-attn

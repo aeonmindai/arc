@@ -420,9 +420,11 @@ pub(crate) struct FileListCache {
     files: Vec<String>,
 }
 
-/// Wrap a raw BF16 GPU pointer as a Candle Tensor (D2D copy + F32 cast).
+/// Wrap a pre-allocated F32 GPU logits buffer as a Candle Tensor.
+/// The buffer is owned by DedicatedDecodePath — we copy to a fresh tensor
+/// to avoid aliasing (Candle may hold the tensor across steps).
 #[cfg(feature = "cuda")]
-fn wrap_bf16_logits(
+fn wrap_f32_logits(
     ptr: u64,
     batch_size: usize,
     vocab_size: usize,
@@ -433,28 +435,19 @@ fn wrap_bf16_logits(
     let elem_count = batch_size * vocab_size;
     let shape = Shape::from_dims(&[batch_size, vocab_size]);
 
-    let logits_bf16 = unsafe {
+    unsafe {
         extern "C" {
             fn cudaMemcpy(
                 dst: *mut std::ffi::c_void, src: *const std::ffi::c_void,
                 count: usize, kind: u32,
             ) -> u32;
         }
-        let fresh = Tensor::zeros(shape, DType::BF16, device)?;
+        // Allocate F32 tensor and D2D copy (no BF16→F32 cast needed)
+        let fresh = Tensor::zeros(shape, DType::F32, device)?;
         let fresh_ptr = arc_cuda_graph::tensor_device_ptr(&fresh)?;
-        let status = cudaMemcpy(
-            fresh_ptr as *mut _,
-            ptr as *const _,
-            elem_count * 2, // BF16 = 2 bytes
-            3, // cudaMemcpyDeviceToDevice
-        );
-        if status != 0 {
-            candle_core::bail!("cudaMemcpy D2D for logits failed: {status}");
-        }
-        fresh
-    };
-
-    logits_bf16.to_dtype(DType::F32)
+        cudaMemcpy(fresh_ptr as *mut _, ptr as *const _, elem_count * 4, 3);
+        Ok(fresh)
+    }
 }
 
 #[async_trait::async_trait]
@@ -702,7 +695,7 @@ pub trait Pipeline:
 
         // Wrap BF16 logits as a Candle Tensor
         let vocab_size = dedicated.weights.config.vocab_size;
-        let logits_tensor = match wrap_bf16_logits(logits_ptr, batch_size, vocab_size, &device) {
+        let logits_tensor = match wrap_f32_logits(logits_ptr, batch_size, vocab_size, &device) {
             Ok(t) => t,
             Err(e) => return Some(Err(e)),
         };
