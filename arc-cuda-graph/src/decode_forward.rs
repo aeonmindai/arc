@@ -94,6 +94,27 @@ extern "C" {
         output: *mut std::ffi::c_void,
         m: i32, k: i32, stream: CUstream,
     );
+    // Fused RMSNorm + GEMV (eliminates separate norm kernel + L2 round-trip)
+    fn arc_launch_rmsnorm_gemv_bf16(
+        input: *const std::ffi::c_void,
+        norm_weight: *const std::ffi::c_void,
+        weight: *const std::ffi::c_void,
+        output: *mut std::ffi::c_void,
+        m: i32, k: i32, eps: f32, stream: CUstream,
+    );
+    // Fused Q norm + K norm + RoPE (q_norm_w/k_norm_w nullable for non-qknorm models)
+    fn arc_launch_qknorm_rope_bf16(
+        q: *mut std::ffi::c_void,
+        k: *mut std::ffi::c_void,
+        q_norm_w: *const std::ffi::c_void,
+        k_norm_w: *const std::ffi::c_void,
+        cos_table: *const std::ffi::c_void,
+        sin_table: *const std::ffi::c_void,
+        positions: *const i32,
+        num_heads: i32, num_kv_heads: i32, head_dim: i32,
+        batch_size: i32, is_neox: i32, eps: f32,
+        stream: CUstream,
+    );
 }
 
 /// BF16 GEMV: output[0..m] = weight[m,k] * input[0..k]. Graph-capturable.
@@ -251,40 +272,32 @@ pub unsafe fn decode_forward(
     for layer_idx in 0..cfg.num_layers {
         let lw = &weights.layers[layer_idx];
 
-        // RMSNorm (input_layernorm)
-        launch_fused_rmsnorm_residual_bf16(
-            h_in as *const _, std::ptr::null(), lw.input_layernorm as *const _,
-            buffers.normed as *mut _, std::ptr::null_mut(),
-            hs as i32, bs as i32, eps, stream,
+        // Fused: RMSNorm + QKV GEMV in one kernel (eliminates norm launch + L2 round-trip)
+        arc_launch_rmsnorm_gemv_bf16(
+            h_in as *const _,
+            lw.input_layernorm as *const _,
+            lw.qkv_fused as *const _,
+            buffers.qkv as *mut _,
+            lw.qkv_rows as i32, hs_z as i32, eps, stream,
         );
-
-        // Fused QKV GEMV: 1 launch instead of 3, better bandwidth for small K/V
-        gemv(stream, lw.qkv_fused, buffers.normed, buffers.qkv,
-            lw.qkv_rows, hs_z);
         // Split output via pointer offsets (zero-copy)
         let q_ptr = buffers.qkv;
         let k_ptr = buffers.qkv + (nh * hd * 2) as u64;      // BF16 = 2 bytes
         let v_ptr = k_ptr + (nkv * hd * 2) as u64;
 
-        // QK norm (if model uses it)
-        if let (Some(qn), Some(kn)) = (lw.q_norm, lw.k_norm) {
-            launch_rmsnorm_head_bf16(
-                q_ptr as *const _, qn as *const _, q_ptr as *mut _,
-                hd as i32, (bs as usize * nh) as i32, eps, stream,
-            );
-            launch_rmsnorm_head_bf16(
-                k_ptr as *const _, kn as *const _, k_ptr as *mut _,
-                hd as i32, (bs as usize * nkv) as i32, eps, stream,
-            );
-        }
-
-        // RoPE
-        launch_gather_rope_decode_bf16(
+        // Fused: Q norm + K norm + RoPE in one kernel
+        let (qn_ptr, kn_ptr) = match (lw.q_norm, lw.k_norm) {
+            (Some(q), Some(k)) => (q as *const std::ffi::c_void, k as *const std::ffi::c_void),
+            _ => (std::ptr::null(), std::ptr::null()),
+        };
+        arc_launch_qknorm_rope_bf16(
             q_ptr as *mut _, k_ptr as *mut _,
+            qn_ptr, kn_ptr,
             buffers.cos_table as *const _, buffers.sin_table as *const _,
             buffers.positions as *const i32,
-            nh as i32, nkv as i32, hd as i32, hd as i32, (hd / 2) as i32,
-            bs as i32, buffers.is_neox as i32, stream,
+            nh as i32, nkv as i32, hd as i32,
+            bs as i32, buffers.is_neox as i32, eps,
+            stream,
         );
 
         // Store K/V into the paged KV cache + run attention
@@ -362,15 +375,14 @@ pub unsafe fn decode_forward(
             buffers.residual as *mut _, (bs * hs) as i32, stream,
         );
 
-        // Post-attention RMSNorm
+        // Post-attention RMSNorm (separate — Up needs the normed buffer, fusion would
+        // require recomputing or a dual-gemv kernel)
         launch_fused_rmsnorm_residual_bf16(
             buffers.residual as *const _, std::ptr::null(),
             lw.post_attn_layernorm as *const _,
             buffers.normed as *mut _, std::ptr::null_mut(),
             hs as i32, bs as i32, eps, stream,
         );
-
-        // MLP: gate + up + silu_mul + down
         gemv(stream, lw.gate_proj.ptr, buffers.normed, buffers.gate,
             inter_z, hs_z);
         gemv(stream, lw.up_proj.ptr, buffers.normed, buffers.up,

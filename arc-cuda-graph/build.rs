@@ -13,6 +13,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/cuda/decode_loop.cu");
     println!("cargo:rerun-if-changed=src/cuda/decode_kernels.cu");
     println!("cargo:rerun-if-changed=src/cuda/gemv_bf16.cu");
+    println!("cargo:rerun-if-changed=src/cuda/fused_kernels.cu");
 
     let mut builder = cudaforge::KernelBuilder::new()
         .source_glob("src/cuda/*.cu")
