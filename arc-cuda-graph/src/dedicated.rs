@@ -389,6 +389,54 @@ impl DedicatedDecodePath {
     /// First few calls: run eagerly to verify correctness.
     /// Then: capture the forward pass into a CUDA graph.
     /// Subsequent calls: replay the graph (~10μs total).
+    /// Same as run_step but takes a GPU pointer to u32 token IDs instead of a CPU slice.
+    /// Avoids the D2H+H2D round-trip when the engine has the tokens already on GPU.
+    pub fn run_step_gpu_tokens(
+        &mut self,
+        token_ids_gpu: u64,
+        token_dtype_size: usize, // 4 = u32/i32
+        batch_size: usize,
+        positions: &[i32],
+        paged_attn: &PagedAttentionState,
+    ) -> candle_core::Result<u64> {
+        self.ensure_buffers(batch_size)?;
+        let max_possible_blocks = (self.weights.config.max_position_embeddings
+            / paged_attn.block_size.max(1) as usize).max(paged_attn.max_num_blocks_per_seq as usize);
+        self.ensure_staging(batch_size, max_possible_blocks)?;
+        self.cache_kv_info(paged_attn);
+
+        let buffers = self.buffers.as_ref().unwrap();
+
+        unsafe {
+            // D2D copy of token_ids (no host involvement). cudaMemcpyKind = 3 = DeviceToDevice.
+            cudaMemcpyAsync(
+                buffers.token_ids as *mut _, token_ids_gpu as *const _,
+                batch_size * token_dtype_size, 3, self.stream,
+            );
+            cudaMemcpyAsync(
+                buffers.positions as *mut _, positions.as_ptr() as *const _,
+                batch_size * 4, 1, self.stream,
+            );
+            self.stage_paged_attn(paged_attn, batch_size);
+            let staged = self.staged_paged_attn(paged_attn);
+
+            if let Some(exec) = self.graph_exec {
+                if batch_size != self.captured_batch_size {
+                    decode_forward(&self.weights, buffers, &staged, self.stream);
+                } else {
+                    let s = cuGraphLaunch(exec, self.stream);
+                    if s != CUDA_SUCCESS {
+                        decode_forward(&self.weights, buffers, &staged, self.stream);
+                    }
+                }
+            } else {
+                decode_forward(&self.weights, buffers, &staged, self.stream);
+            }
+            cudaStreamSynchronize(self.stream);
+        }
+        Ok(buffers.logits_f32)
+    }
+
     pub fn run_step(
         &mut self,
         token_ids: &[i32],
