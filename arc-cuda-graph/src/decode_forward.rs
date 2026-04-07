@@ -438,19 +438,19 @@ pub unsafe fn decode_forward(
             hs as i32, bs as i32, eps, stream,
         );
 
-        // MLP: gate + up GEMVs, then fused (silu*mul + down GEMV) — saves the
-        // standalone silu_mul kernel and the mlp_act buffer round-trip.
+        // MLP: gate + up + silu_mul + down (separate; the fused silu_mul-into-down
+        // attempt was reverted because it recomputes silu(gate[k]) per row, doing
+        // M× more compute than the dedicated silu_mul kernel).
         gemv(stream, lw.gate_proj.ptr, buffers.normed, buffers.gate,
             inter_z, hs_z);
         gemv(stream, lw.up_proj.ptr, buffers.normed, buffers.up,
             inter_z, hs_z);
-        arc_launch_gemv_bf16_silu_mul_down(
-            lw.down_proj.ptr as *const _,
-            buffers.gate as *const _,
-            buffers.up as *const _,
-            buffers.down_out as *mut _,
-            hs_z as i32, inter_z as i32, stream,
+        launch_fused_silu_mul_bf16(
+            buffers.gate as *const _, buffers.up as *const _,
+            buffers.mlp_act as *mut _, (bs * inter) as i32, stream,
         );
+        gemv(stream, lw.down_proj.ptr, buffers.mlp_act, buffers.down_out,
+            hs_z, inter_z);
 
         // Defer residual add: next layer's input RMSNorm fuses (residual + down_out)
         h_in = buffers.residual; // current residual (post-attention sum)
