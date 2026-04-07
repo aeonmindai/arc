@@ -86,7 +86,7 @@ void gemv_bf16_w4_kernel(
     }
 }
 
-__global__ __launch_bounds__(256, 4)
+__global__ __launch_bounds__(256, 6)
 void gemv_bf16_kernel(
     const __nv_bfloat16* __restrict__ weight,
     const __nv_bfloat16* __restrict__ input,
@@ -195,11 +195,11 @@ extern "C" void arc_launch_gemv_bf16(
     // For Qwen3-32B: down (M=5120, K=25600), oproj (M=K=5120), gate/up
     // (M=25600, K=5120), qkv (M=10240, K=5120). The wide kernel helps when
     // M/K ≤ ~1, hurts (more redundant launch overhead) when M >> K.
-    // Use the wide-row kernel for everything except very large M (LM head, vocab>=128k).
-    // Wide kernel has 4× more blocks and higher per-SM thread count via __launch_bounds(256,6),
-    // which improves bandwidth utilization across all model GEMV shapes.
-    // Original kernel still wins for M >> 50000 where its tighter inner loop dominates.
-    if (M < 50000) {
+    // Wide kernel wins for small M (down, oproj, qkv): more blocks, better SM occupancy.
+    // Original kernel wins for large M (gate, up, lm_head): more rows per block reduces
+    // cross-warp reduction overhead. Empirically (Qwen3-32B on B200): wide=45μs vs orig=46μs
+    // for down (M=5120), but wide=49μs vs orig=45μs for gate/up (M=25600).
+    if (M < 12000) {
         // 4× wide-row variant
         dim3 grid((M + 1) / 2);
         gemv_bf16_w4_kernel<<<grid, GEMV_BLOCK, 0, stream>>>(
