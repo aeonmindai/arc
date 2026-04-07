@@ -241,7 +241,7 @@ extern "C" void arc_launch_gemv_bf16_silu_mul_down(
     );
 }
 
-__global__ __launch_bounds__(256, 8)
+__global__ __launch_bounds__(256, 6)
 void gemv_bf16_kernel(
     const __nv_bfloat16* __restrict__ weight,
     const __nv_bfloat16* __restrict__ input,
