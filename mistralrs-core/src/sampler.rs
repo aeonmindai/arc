@@ -900,16 +900,49 @@ impl Sampler {
         sample_speculative: bool,
         multiple_sequences: bool,
     ) -> Result<Logprobs> {
-        // if cfg!(feature = "metal") && !multiple_sequences {
-        //     return self.sample_fast(
-        //         logits,
-        //         context,
-        //         return_logprobs,
-        //         self.top_k,
-        //         self.top_p,
-        //         self.min_p,
-        //     );
-        // }
+        // ── GPU fast path ────────────────────────────────────────────────────
+        // For the common request shape (no penalties, no logits processors,
+        // no logprobs, no speculative sampling) we can stay entirely on GPU
+        // and ship a single u32 token back. This skips the ~5.9 ms/token
+        // CPU pipeline (D2H 152K logits + softmax + topk/topp + multinomial).
+        let no_penalties = self.frequency_penalty.unwrap_or(0.0) == 0.0
+            && self.presence_penalty.unwrap_or(0.0) == 0.0
+            && self.repetition_penalty.unwrap_or(1.0) == 1.0
+            && self.dry_params.is_none();
+        let trivial = !sample_speculative
+            && !return_logprobs
+            && self.logits_processors.is_empty()
+            && no_penalties
+            && !logits.device().is_cpu();
+        if trivial {
+            // Greedy: single GPU argmax kernel + 4-byte D2H.
+            if self.temperature.is_none() {
+                let next_token = logits.argmax(D::Minus1)?.to_scalar::<u32>()?;
+                let bytes = if let Some(tok) = &self.tokenizer {
+                    Some(
+                        tok.decode(&[next_token], false)
+                            .map_err(|x| Error::Msg(x.to_string()))?,
+                    )
+                } else {
+                    None
+                };
+                return Ok(Logprobs {
+                    token: next_token,
+                    logprob: 0.0,
+                    top_logprobs: None,
+                    bytes,
+                });
+            }
+            // Temperature sampling: full nucleus sampling stays on GPU via sample_fast.
+            return self.sample_fast(
+                logits,
+                context,
+                return_logprobs,
+                self.top_k,
+                self.top_p,
+                self.min_p,
+            );
+        }
 
         let logits = logits.to_vec1()?;
         let mut logits = self.apply_penalties(logits, context)?;
