@@ -9,6 +9,7 @@ license = "BSL-1.1"
 [dependencies]
 candle-core.workspace = true
 mistralrs-quant.workspace = true
+mistralrs-paged-attn.workspace = true
 half.workspace = true
 tracing.workspace = true
 

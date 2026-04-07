@@ -93,6 +93,77 @@ extern "C" void launch_fused_rmsnorm_residual_bf16(
     );
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Clocked variant of fused_rmsnorm_residual: per-block stamps at:
+//   phase 0 = entry
+//   phase 1 = end of sum-of-squares pass
+//   phase 2 = end of cross-thread reduction
+//   phase 3 = end of normalize+write pass
+// ─────────────────────────────────────────────────────────────────────────────
+__global__ void fused_rmsnorm_residual_bf16_clocked_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ residual,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ output,
+    __nv_bfloat16* __restrict__ residual_out,
+    unsigned long long* __restrict__ clocks,
+    int hidden_size, float eps
+) {
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    extern __shared__ float smem[];
+
+    if (tid == 0) clocks[bid * 4 + 0] = clock64();
+
+    const __nv_bfloat16* x = input + bid * hidden_size;
+    const __nv_bfloat16* r = residual;
+
+    float sum_sq = 0.0f;
+    for (int i = tid; i < hidden_size; i += stride) {
+        float val = __bfloat162float(x[i]);
+        if (r) val += __bfloat162float(r[bid * hidden_size + i]);
+        sum_sq += val * val;
+    }
+    if (tid == 0) clocks[bid * 4 + 1] = clock64();
+
+    smem[tid] = sum_sq;
+    __syncthreads();
+    for (int s = stride / 2; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] += smem[tid + s];
+        __syncthreads();
+    }
+    float rms = rsqrtf(smem[0] / (float)hidden_size + eps);
+
+    if (tid == 0) clocks[bid * 4 + 2] = clock64();
+
+    __nv_bfloat16* o = output + bid * hidden_size;
+    for (int i = tid; i < hidden_size; i += stride) {
+        float val = __bfloat162float(x[i]);
+        if (r) val += __bfloat162float(r[bid * hidden_size + i]);
+        if (residual_out) residual_out[bid * hidden_size + i] = __float2bfloat16(val);
+        o[i] = __float2bfloat16(val * rms * __bfloat162float(weight[i]));
+    }
+
+    if (tid == 0) clocks[bid * 4 + 3] = clock64();
+}
+
+extern "C" void launch_fused_rmsnorm_residual_bf16_clocked(
+    const void* input, const void* residual, const void* weight,
+    void* output, void* residual_out, void* clocks,
+    int hidden_size, int batch_size, float eps, cudaStream_t stream
+) {
+    int threads = 256;
+    int smem = threads * sizeof(float);
+    fused_rmsnorm_residual_bf16_clocked_kernel<<<batch_size, threads, smem, stream>>>(
+        (const __nv_bfloat16*)input, (const __nv_bfloat16*)residual,
+        (const __nv_bfloat16*)weight,
+        (__nv_bfloat16*)output, (__nv_bfloat16*)residual_out,
+        (unsigned long long*)clocks,
+        hidden_size, eps
+    );
+}
+
 // ============================================================================
 // RMSNorm per head (for q_norm / k_norm)
 // ============================================================================
@@ -198,6 +269,74 @@ extern "C" void launch_rmsnorm_qk_pair_bf16(
     rmsnorm_qk_pair_bf16_kernel<<<total_heads, threads, smem, stream>>>(
         (const __nv_bfloat16*)q_in, (const __nv_bfloat16*)q_w, (__nv_bfloat16*)q_out,
         (const __nv_bfloat16*)k_in, (const __nv_bfloat16*)k_w, (__nv_bfloat16*)k_out,
+        head_dim, n_q_heads, eps
+    );
+}
+
+// Clocked variant — phases 0..3 same meaning as fused_rmsnorm_residual_clocked.
+__global__ void rmsnorm_qk_pair_bf16_clocked_kernel(
+    const __nv_bfloat16* __restrict__ q_in,
+    const __nv_bfloat16* __restrict__ q_w,
+    __nv_bfloat16* __restrict__ q_out,
+    const __nv_bfloat16* __restrict__ k_in,
+    const __nv_bfloat16* __restrict__ k_w,
+    __nv_bfloat16* __restrict__ k_out,
+    unsigned long long* __restrict__ clocks,
+    int head_dim, int n_q_heads, float eps
+) {
+    int head_idx = blockIdx.x;
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    extern __shared__ float smem[];
+
+    if (tid == 0) clocks[head_idx * 4 + 0] = clock64();
+
+    bool is_q = head_idx < n_q_heads;
+    int local = is_q ? head_idx : (head_idx - n_q_heads);
+    const __nv_bfloat16* in_buf  = is_q ? q_in  : k_in;
+    const __nv_bfloat16* w_buf   = is_q ? q_w   : k_w;
+    __nv_bfloat16* out_buf       = is_q ? q_out : k_out;
+    const __nv_bfloat16* x = in_buf + local * head_dim;
+    __nv_bfloat16* o = out_buf + local * head_dim;
+
+    float sum_sq = 0.0f;
+    for (int i = tid; i < head_dim; i += stride) {
+        float v = __bfloat162float(x[i]);
+        sum_sq += v * v;
+    }
+    if (tid == 0) clocks[head_idx * 4 + 1] = clock64();
+
+    smem[tid] = sum_sq;
+    __syncthreads();
+    for (int s = stride / 2; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] += smem[tid + s];
+        __syncthreads();
+    }
+    float rms = rsqrtf(smem[0] / (float)head_dim + eps);
+
+    if (tid == 0) clocks[head_idx * 4 + 2] = clock64();
+
+    for (int i = tid; i < head_dim; i += stride) {
+        o[i] = __float2bfloat16(__bfloat162float(x[i]) * rms * __bfloat162float(w_buf[i]));
+    }
+
+    if (tid == 0) clocks[head_idx * 4 + 3] = clock64();
+}
+
+extern "C" void launch_rmsnorm_qk_pair_bf16_clocked(
+    const void* q_in, const void* q_w, void* q_out,
+    const void* k_in, const void* k_w, void* k_out,
+    void* clocks,
+    int head_dim, int n_q_heads, int n_k_heads, float eps,
+    cudaStream_t stream
+) {
+    int total_heads = n_q_heads + n_k_heads;
+    int threads = (head_dim <= 128) ? 128 : 256;
+    int smem = threads * sizeof(float);
+    rmsnorm_qk_pair_bf16_clocked_kernel<<<total_heads, threads, smem, stream>>>(
+        (const __nv_bfloat16*)q_in, (const __nv_bfloat16*)q_w, (__nv_bfloat16*)q_out,
+        (const __nv_bfloat16*)k_in, (const __nv_bfloat16*)k_w, (__nv_bfloat16*)k_out,
+        (unsigned long long*)clocks,
         head_dim, n_q_heads, eps
     );
 }

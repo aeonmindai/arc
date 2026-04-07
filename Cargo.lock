@@ -203,6 +203,7 @@ dependencies = [
  "candle-core",
  "cudaforge",
  "half",
+ "mistralrs-paged-attn",
  "mistralrs-quant",
  "tracing",
 ]
