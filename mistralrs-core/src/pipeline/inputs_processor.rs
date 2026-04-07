@@ -897,6 +897,11 @@ pub mod text_models_inputs_processor {
     #[derive(Clone)]
     pub struct ModelInputs {
         pub input_ids: Tensor,
+        /// Decode-only side channel: the same `input_ids` data on the host.
+        /// Populated by `TextInputsProcessor` for completion (decode) calls so the
+        /// dedicated decode path can stage tokens to GPU on its own non-blocking
+        /// stream without forcing a D2H sync via `to_vec1::<u32>()`.
+        pub input_ids_cpu: Option<Vec<u32>>,
         pub input_ids_full: Option<Tensor>,
         pub seqlen_offsets: Vec<usize>,
         pub seqlen_offsets_full: Option<Vec<usize>>,
@@ -976,6 +981,7 @@ pub mod text_models_inputs_processor {
                 } = completion;
                 let inputs: Box<dyn Any> = Box::new(ModelInputs {
                     input_ids,
+                    input_ids_cpu: None,
                     input_ids_full: Some(input_ids_full),
                     seqlen_offsets,
                     seqlen_offsets_full: Some(seqlen_offsets_full),
@@ -1016,6 +1022,7 @@ pub mod text_models_inputs_processor {
                 } = metadata;
                 let inputs: Box<dyn Any> = Box::new(ModelInputs {
                     input_ids: input_ids.clone(),
+                    input_ids_cpu: None,
                     input_ids_full: Some(input_ids),
                     seqlen_offsets: seqlen_offsets.clone(),
                     seqlen_offsets_full: Some(seqlen_offsets),
@@ -1056,6 +1063,7 @@ pub mod text_models_inputs_processor {
                 } = metadata;
                 let inputs: Box<dyn Any> = Box::new(ModelInputs {
                     input_ids,
+                    input_ids_cpu: None,
                     input_ids_full: None,
                     seqlen_offsets,
                     seqlen_offsets_full: None,
@@ -1070,6 +1078,16 @@ pub mod text_models_inputs_processor {
                     seq_indices,
                 })
             } else {
+                // Decode (completion) path: collect the last token per sequence
+                // into a Vec<u32> so the dedicated decode path can stage to GPU
+                // without paying for a D2H sync via to_vec1::<u32>().
+                let decode_input_cpu: Vec<u32> = input_seqs
+                    .iter()
+                    .map(|seq| {
+                        let toks = seq.get_toks();
+                        *toks.last().unwrap_or(&0)
+                    })
+                    .collect();
                 let metadata = get_completion_input(
                     input_seqs
                         .iter()
@@ -1097,6 +1115,7 @@ pub mod text_models_inputs_processor {
                 } = metadata;
                 let inputs: Box<dyn Any> = Box::new(ModelInputs {
                     input_ids,
+                    input_ids_cpu: Some(decode_input_cpu),
                     input_ids_full: None,
                     seqlen_offsets,
                     seqlen_offsets_full: None,

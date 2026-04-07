@@ -568,19 +568,26 @@ pub trait Pipeline:
             }
         }
 
-        // Token IDs: avoid GPU→CPU sync by reading the GPU pointer directly.
-        // The dedicated path will D2D-copy from this pointer into its own staging buffer.
-        let token_ids_gpu = match arc_cuda_graph::tensor_device_ptr(&model_inputs.input_ids) {
-            Ok(p) => p, Err(e) => return Some(Err(e)),
+        // Token IDs: prefer the host-side Vec stashed by the input processor.
+        // It's the same data the input processor used to build `input_ids` on GPU,
+        // so we avoid a D2H sync (~1.7 ms/token) entirely.
+        let token_ids: Vec<i32> = if let Some(cpu) = model_inputs.input_ids_cpu.as_ref() {
+            cpu.iter().map(|&x| x as i32).collect()
+        } else {
+            // Fallback: pull from the GPU tensor (slow path).
+            let ids = model_inputs.input_ids.flatten_all()
+                .and_then(|t| t.to_vec1::<u32>())
+                .unwrap_or_default();
+            ids.into_iter().map(|x| x as i32).collect()
         };
-        let batch_size = model_inputs.input_ids.dims().iter().product::<usize>();
         let positions: Vec<i32> = model_inputs.seqlen_offsets
             .iter().map(|&x| x as i32).collect();
         let __dd_t1 = Instant::now();
 
-        if batch_size == 0 {
+        if token_ids.is_empty() {
             return None;
         }
+        let batch_size = token_ids.len();
 
         // Extract KV cache pointers from CacheEngine
         let kv_cache = cache_engine.get_kv_cache();
@@ -686,9 +693,9 @@ pub trait Pipeline:
         drop(kv_cache);
         let __dd_t2 = Instant::now();
 
-        // Run the dedicated decode path. Token-id dtype size = 4 (u32 / i32).
+        // Run the dedicated decode path with CPU-staged token IDs.
         let dedicated = self.dedicated_decode_mut().unwrap();
-        let logits_ptr = match dedicated.run_step_gpu_tokens(token_ids_gpu, 4, batch_size, &positions, &paged_attn_state) {
+        let logits_ptr = match dedicated.run_step(&token_ids, &positions, &paged_attn_state) {
             Ok(ptr) => ptr,
             Err(e) => return Some(Err(e)),
         };

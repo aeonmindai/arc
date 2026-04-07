@@ -170,6 +170,7 @@ impl InputsProcessor for LLaVAInputProcessor {
 
                     let text_models_inputs_processor::ModelInputs {
                         input_ids,
+                        input_ids_cpu: _,
                         input_ids_full: _,
                         seqlen_offsets,
                         seqlen_offsets_full: _,

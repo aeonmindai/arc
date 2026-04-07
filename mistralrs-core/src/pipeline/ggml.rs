@@ -548,6 +548,7 @@ impl Pipeline for GGMLPipeline {
     ) -> Result<ForwardInputsResult, candle_core::Error> {
         let ModelInputs {
             input_ids,
+            input_ids_cpu: _,
             input_ids_full,
             seqlen_offsets,
             seqlen_offsets_full,
