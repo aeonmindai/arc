@@ -66,6 +66,86 @@ void gemv_bf16_orig_tpl(
 }
 
 // Explicit variant launchers — bench harness compares these per shape.
+// Software-pipelined 1-warp-per-row variant: prefetches the next iteration's
+// uint4 pair while computing on the current. Hides HBM latency without
+// blowing register budget (32 threads/block × 16 blocks/SM = 512 active
+// threads/SM = 128 regs/thread budget, plenty for 2 prefetched uint4s).
+__global__ __launch_bounds__(32, 16)
+void gemv_bf16_pipe_kernel(
+    const __nv_bfloat16* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    int M, int K
+) {
+    int row = blockIdx.x;
+    if (row >= M) return;
+    int lane = threadIdx.x;
+
+    const __nv_bfloat16* w = weight + (int64_t)row * K;
+    const int K8 = K >> 3;
+    const uint4* wv = (const uint4*)w;
+    const uint4* iv = (const uint4*)input;
+
+    // Preload first iteration
+    uint4 a, b;
+    if (lane < K8) {
+        a = __ldg(wv + lane);
+        b = __ldg(iv + lane);
+    }
+
+    float acc = 0.0f;
+    for (int i = lane + 32; i < K8; i += 32) {
+        // Prefetch next
+        uint4 a_next = __ldg(wv + i);
+        uint4 b_next = __ldg(iv + i);
+        // Compute on current
+        const __nv_bfloat16* ap = (const __nv_bfloat16*)&a;
+        const __nv_bfloat16* bp = (const __nv_bfloat16*)&b;
+        acc += __bfloat162float(ap[0]) * __bfloat162float(bp[0])
+             + __bfloat162float(ap[1]) * __bfloat162float(bp[1])
+             + __bfloat162float(ap[2]) * __bfloat162float(bp[2])
+             + __bfloat162float(ap[3]) * __bfloat162float(bp[3])
+             + __bfloat162float(ap[4]) * __bfloat162float(bp[4])
+             + __bfloat162float(ap[5]) * __bfloat162float(bp[5])
+             + __bfloat162float(ap[6]) * __bfloat162float(bp[6])
+             + __bfloat162float(ap[7]) * __bfloat162float(bp[7]);
+        a = a_next; b = b_next;
+    }
+    // Final compute (last loaded pair)
+    if (lane < K8) {
+        const __nv_bfloat16* ap = (const __nv_bfloat16*)&a;
+        const __nv_bfloat16* bp = (const __nv_bfloat16*)&b;
+        acc += __bfloat162float(ap[0]) * __bfloat162float(bp[0])
+             + __bfloat162float(ap[1]) * __bfloat162float(bp[1])
+             + __bfloat162float(ap[2]) * __bfloat162float(bp[2])
+             + __bfloat162float(ap[3]) * __bfloat162float(bp[3])
+             + __bfloat162float(ap[4]) * __bfloat162float(bp[4])
+             + __bfloat162float(ap[5]) * __bfloat162float(bp[5])
+             + __bfloat162float(ap[6]) * __bfloat162float(bp[6])
+             + __bfloat162float(ap[7]) * __bfloat162float(bp[7]);
+    }
+
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 16);
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 8);
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 4);
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 2);
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 1);
+
+    if (lane == 0) output[row] = __float2bfloat16(acc);
+}
+
+extern "C" void arc_launch_gemv_orig_pipe(
+    const void* weight, const void* input, void* output,
+    int M, int K, cudaStream_t stream
+) {
+    dim3 grid(M);
+    gemv_bf16_pipe_kernel<<<grid, 32, 0, stream>>>(
+        (const __nv_bfloat16*)weight,
+        (const __nv_bfloat16*)input,
+        (__nv_bfloat16*)output, M, K
+    );
+}
+
 #define DEFINE_ORIG_VARIANT(R, B)                                                                  \
     extern "C" void arc_launch_gemv_orig_##R##x##B(                                                \
         const void* weight, const void* input, void* output,                                       \

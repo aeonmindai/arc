@@ -28,6 +28,7 @@ use arc_cuda_graph::gemv_ffi::{
     arc_launch_gemv_orig_2x32,
     arc_launch_gemv_orig_1x16,
     arc_launch_gemv_orig_1x32,
+    arc_launch_gemv_orig_pipe,
     arc_launch_gemv_orig_16x2,
     arc_launch_gemv_orig_16x3,
 };
@@ -355,6 +356,7 @@ fn main() {
                 ("orig 2x32", arc_launch_gemv_orig_2x32),
                 ("orig 1x16", arc_launch_gemv_orig_1x16),
                 ("orig 1x32", arc_launch_gemv_orig_1x32),
+                ("orig pipe", arc_launch_gemv_orig_pipe),
             ];
 
             let mut best_med = f32::MAX;
