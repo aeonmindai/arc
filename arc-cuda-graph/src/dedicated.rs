@@ -89,10 +89,11 @@ impl DedicatedDecodePath {
 
         let (cos_table, sin_table) = Self::compute_rope_tables(&weights.config)?;
 
-        // Fuse QKV weights contiguously per layer (saves 2 kernel launches/layer)
+        // Fuse QKV weights contiguously per layer (saves 2 kernel launches/layer).
+        // Gate+Up are not physically fused — they would duplicate weights in memory
+        // (often many GB extra). Instead the dual-weight GEMV kernel reads from
+        // both gate_proj and up_proj buffers in a single launch.
         Self::fuse_qkv(&mut weights)?;
-        // Note: Gate+Up cannot be physically fused (33 GB extra). The dual-weight
-        // GEMV kernel reads from both gate_proj and up_proj in one launch instead.
 
         tracing::info!(
             "Dedicated decode path initialized (stream + GEMV + RoPE[{}x{}])",
@@ -216,37 +217,6 @@ impl DedicatedDecodePath {
         Ok(())
     }
 
-    fn fuse_gate_up(weights: &mut ModelWeights) -> candle_core::Result<()> {
-        extern "C" {
-            fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: u32) -> u32;
-        }
-        let bf16 = 2usize;
-        let k = weights.config.hidden_size;
-        let mut total_bytes = 0usize;
-
-        for lw in weights.layers.iter_mut() {
-            let gr = lw.gate_proj.rows;
-            let ur = lw.up_proj.rows;
-            let total_rows = gr + ur;
-            let total_size = total_rows * k * bf16;
-
-            let mut ptr: u64 = 0;
-            let s = unsafe { cudaMalloc(&mut ptr, total_size) };
-            if s != 0 { candle_core::bail!("cudaMalloc Gate+Up fused failed: {s}"); }
-
-            unsafe {
-                cudaMemcpy(ptr as *mut _, lw.gate_proj.ptr as *const _, gr * k * bf16, 3);
-                cudaMemcpy((ptr + (gr * k * bf16) as u64) as *mut _, lw.up_proj.ptr as *const _, ur * k * bf16, 3);
-            }
-            lw.gate_up_fused = ptr;
-            lw.gate_up_rows = total_rows;
-            total_bytes += total_size;
-        }
-
-        tracing::info!("Gate+Up fused: {} layers, {:.1} GB", weights.layers.len(), total_bytes as f64 / 1e9);
-        Ok(())
-    }
-
     fn ensure_buffers(&mut self, batch_size: usize) -> candle_core::Result<()> {
         if self.buffers.is_some() {
             return Ok(());
@@ -289,6 +259,18 @@ impl DedicatedDecodePath {
             sin_table: self.sin_table,
             is_neox: self.weights.config.is_gpt_neox,
             batch_size: bs,
+            sm_count: {
+                // Query SM count from the active CUDA device. Used by GEMV
+                // dispatch to pick the wide vs original kernel without
+                // hardcoding any GPU-specific shape.
+                extern "C" {
+                    fn cudaDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> u32;
+                }
+                let mut n: i32 = 0;
+                // attr 16 = cudaDevAttrMultiProcessorCount.
+                unsafe { cudaDeviceGetAttribute(&mut n, 16, 0); }
+                if n <= 0 { 1 } else { n }
+            },
         };
 
         let total_mb = (bs * cfg.hidden_size * bf16 * 4
@@ -672,7 +654,6 @@ impl Drop for DedicatedDecodePath {
             if self.sin_table != 0 { cudaFree(self.sin_table); }
             for lw in &self.weights.layers {
                 if lw.qkv_fused != 0 { cudaFree(lw.qkv_fused); }
-                if lw.gate_up_fused != 0 { cudaFree(lw.gate_up_fused); }
             }
             if self.staging_block_tables != 0 { cudaFree(self.staging_block_tables); }
             if self.staging_context_lens != 0 { cudaFree(self.staging_context_lens); }

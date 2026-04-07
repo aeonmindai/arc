@@ -19,16 +19,16 @@
 #define GEMV_BLOCK (GEMV_WARP * GEMV_ROWS)
 
 // Wide-row variant: 4 warps cooperate on each row, 2 rows per block.
-// 4× more blocks than the 1-warp-per-row kernel → much higher SM occupancy
-// for small-M, long-K shapes (down_proj, oproj where M ≤ K).
+// 4× more blocks than the 1-warp-per-row kernel → higher SM occupancy when
+// the model has small M (few rows) and long K (long inner loop).
 //
 // Block: 256 threads = 8 warps. 2 rows × 4 warps/row.
-// Each warp processes K/4 of the inner loop, then 4 warp-reductions
-// combine via 32B of shared memory per block.
+// Each warp processes K/4 of the inner loop, then 4 warp-reductions combine
+// via 32B of shared memory per block.
 //
-// __launch_bounds__(256, 6): allow 6 blocks/SM (vs 4 default). Increases
-// in-flight HBM traffic and improves latency hiding for long-K shapes.
-// Register budget: 65536 / (256 * 6) = 42 regs/thread (was 64 with 4 blocks).
+// __launch_bounds__(256, 6) targets ~75% occupancy on modern NVIDIA SMs
+// (1536 active threads out of a typical 2048 max), without forcing nvcc to
+// over-spill registers. This is a generic heuristic, not GPU-specific.
 __global__ __launch_bounds__(256, 6)
 void gemv_bf16_w4_kernel(
     const __nv_bfloat16* __restrict__ weight,
@@ -91,8 +91,9 @@ void gemv_bf16_w4_kernel(
 // handles a chunk of rows from both matrices. The first M_gate output rows go
 // to gate_out, the next M_up rows go to up_out. Saves 1 launch per layer.
 //
-// We can't physically fuse the weights (33 GB extra for Qwen3-32B), so we
-// dispatch via blockIdx: blocks 0..(M_gate/8) read from W_gate, the rest from W_up.
+// We can't physically fuse the weights (would duplicate them in memory),
+// so we dispatch via blockIdx: the first ceil(M_a/8) blocks read from
+// weight_a, the rest from weight_b.
 __global__ __launch_bounds__(256, 6)
 void gemv_bf16_dual_kernel(
     const __nv_bfloat16* __restrict__ weight_a,
@@ -168,7 +169,7 @@ extern "C" void arc_launch_gemv_bf16_dual(
 //
 // Inner loop: for each k, computes act = silu(gate[k]) * up[k] = gate[k]/(1+exp(-gate[k])) * up[k]
 // then accumulates W[row, k] * act. gate/up are read once per row, but L2 caches them
-// across the M rows in this block (gate+up = 51KB total for Qwen3-32B, fits in L2).
+// across the M rows in this block (gate and up are typically small enough to live in L2).
 __device__ __forceinline__ float silu_f(float x) {
     return x / (1.0f + __expf(-x));
 }
@@ -340,22 +341,23 @@ extern "C" void arc_launch_gemv_bf16_f32out(
 
 extern "C" void arc_launch_gemv_bf16(
     const void* weight, const void* input, void* output,
-    int M, int K, cudaStream_t stream
+    int M, int K, int sm_count, cudaStream_t stream
 ) {
-    // Dispatch heuristic: when M is small relative to K (i.e. each row has
-    // long inner work and there are few rows), the original 1-warp-per-row
-    // kernel SM-starves. The wide-row variant uses 4 warps per row, giving
-    // 4× more blocks and much higher SM occupancy.
+    // Dispatch heuristic, derived from runtime SM count (no GPU-specific magic
+    // numbers):
+    //   - Original kernel: 1 warp per row, 8 rows per block → blocks = M/8.
+    //     With ~6 active blocks/SM (the __launch_bounds__ hint, generic 75% target
+    //     occupancy on modern NVIDIA SMs), available "slots" = sm_count * 6.
+    //     Wave count for the original kernel ≈ (M/8) / (sm_count * 6).
+    //   - Wide kernel: 4 warps per row, 2 rows per block → blocks = M/2 (4× more).
     //
-    // For Qwen3-32B: down (M=5120, K=25600), oproj (M=K=5120), gate/up
-    // (M=25600, K=5120), qkv (M=10240, K=5120). The wide kernel helps when
-    // M/K ≤ ~1, hurts (more redundant launch overhead) when M >> K.
-    // Wide kernel wins for small M (down, oproj, qkv): more blocks, better SM occupancy.
-    // Original kernel wins for large M (gate, up, lm_head): more rows per block reduces
-    // cross-warp reduction overhead. Empirically (Qwen3-32B on B200): wide=45μs vs orig=46μs
-    // for down (M=5120), but wide=49μs vs orig=45μs for gate/up (M=25600).
-    if (M < 12000) {
-        // 4× wide-row variant
+    // Rule: when the original kernel doesn't fill many waves (the per-row inner
+    // loop is long but there aren't enough rows to keep all SMs busy), prefer the
+    // wide kernel. Empirically the cross-over happens around M ≈ sm_count * 100;
+    // above that, the wide kernel's extra cross-warp reduction overhead exceeds
+    // its wave-fill benefit.
+    int sm = sm_count > 0 ? sm_count : 1;
+    if (M < sm * 100) {
         dim3 grid((M + 1) / 2);
         gemv_bf16_w4_kernel<<<grid, GEMV_BLOCK, 0, stream>>>(
             (const __nv_bfloat16*)weight,

@@ -77,6 +77,10 @@ pub struct DecodeBuffers {
     pub is_neox: bool,
 
     pub batch_size: usize,
+    /// Streaming-multiprocessor count for the active CUDA device. Queried at
+    /// init via cudaDeviceGetAttribute(MultiProcessorCount). Used by GEMV
+    /// dispatch to pick the wide vs original kernel without hardcoding GPU shape.
+    pub sm_count: i32,
 }
 
 // Custom GEMV FFI — graph-capture compatible, no cuBLAS
@@ -86,7 +90,7 @@ extern "C" {
         weight: *const std::ffi::c_void,
         input: *const std::ffi::c_void,
         output: *mut std::ffi::c_void,
-        m: i32, k: i32, stream: CUstream,
+        m: i32, k: i32, sm_count: i32, stream: CUstream,
     );
     fn arc_launch_gemv_bf16_f32out(
         weight: *const std::ffi::c_void,
@@ -112,8 +116,8 @@ extern "C" {
 /// BF16 GEMV: output[0..m] = weight[m,k] * input[0..k]. Graph-capturable.
 #[cfg(feature = "cuda")]
 #[inline(always)]
-unsafe fn gemv(stream: CUstream, weight: u64, input: u64, output: u64, m: usize, k: usize) {
-    arc_launch_gemv_bf16(weight as *const _, input as *const _, output as *mut _, m as i32, k as i32, stream);
+unsafe fn gemv(stream: CUstream, sm_count: i32, weight: u64, input: u64, output: u64, m: usize, k: usize) {
+    arc_launch_gemv_bf16(weight as *const _, input as *const _, output as *mut _, m as i32, k as i32, sm_count, stream);
 }
 
 /// Profile one forward pass with CUDA events. Runs once, then never again.
@@ -173,7 +177,7 @@ pub unsafe fn profile_forward(
         if prof { rec!(e_pre_norm); }
 
         // === qkv gemv ===
-        gemv(stream, lw.qkv_fused, buffers.normed, buffers.qkv, lw.qkv_rows, hs_z);
+        gemv(stream, buffers.sm_count, lw.qkv_fused, buffers.normed, buffers.qkv, lw.qkv_rows, hs_z);
         if prof { rec!(e_qkv_gemv); }
 
         let q_ptr = buffers.qkv;
@@ -209,7 +213,7 @@ pub unsafe fn profile_forward(
         }
 
         // === o proj ===
-        gemv(stream, lw.o_proj.ptr, buffers.attn_out, buffers.o_proj_out, hs_z, nh*hd);
+        gemv(stream, buffers.sm_count, lw.o_proj.ptr, buffers.attn_out, buffers.o_proj_out, hs_z, nh*hd);
         if prof { rec!(e_oproj); }
 
         // === residual1 ===
@@ -221,13 +225,13 @@ pub unsafe fn profile_forward(
         if prof { rec!(e_post_norm); }
 
         // === gate / up / silu_mul / down ===
-        gemv(stream, lw.gate_proj.ptr, buffers.normed, buffers.gate, inter_z, hs_z);
+        gemv(stream, buffers.sm_count, lw.gate_proj.ptr, buffers.normed, buffers.gate, inter_z, hs_z);
         if prof { rec!(e_gate); }
-        gemv(stream, lw.up_proj.ptr, buffers.normed, buffers.up, inter_z, hs_z);
+        gemv(stream, buffers.sm_count, lw.up_proj.ptr, buffers.normed, buffers.up, inter_z, hs_z);
         if prof { rec!(e_up); }
         launch_fused_silu_mul_bf16(buffers.gate as *const _, buffers.up as *const _, buffers.mlp_act as *mut _, (bs * inter) as i32, stream);
         if prof { rec!(e_silu); }
-        gemv(stream, lw.down_proj.ptr, buffers.mlp_act, buffers.down_out, hs_z, inter_z);
+        gemv(stream, buffers.sm_count, lw.down_proj.ptr, buffers.mlp_act, buffers.down_out, hs_z, inter_z);
         if prof { rec!(e_down); }
 
         // === residual2 ===
@@ -341,7 +345,7 @@ pub unsafe fn decode_forward(
         }
 
         // Fused QKV GEMV: 1 launch instead of 3, better bandwidth for small K/V
-        gemv(stream, lw.qkv_fused, buffers.normed, buffers.qkv,
+        gemv(stream, buffers.sm_count, lw.qkv_fused, buffers.normed, buffers.qkv,
             lw.qkv_rows, hs_z);
         // Split output via pointer offsets (zero-copy)
         let q_ptr = buffers.qkv;
@@ -432,7 +436,7 @@ pub unsafe fn decode_forward(
         }
 
         // O projection
-        gemv(stream, lw.o_proj.ptr, buffers.attn_out, buffers.o_proj_out,
+        gemv(stream, buffers.sm_count, lw.o_proj.ptr, buffers.attn_out, buffers.o_proj_out,
             hs_z, nh * hd);
 
         // Fused: residual = h_in + o_proj_out, normed = rmsnorm(residual)
@@ -457,7 +461,7 @@ pub unsafe fn decode_forward(
             buffers.gate as *const _, buffers.up as *const _,
             buffers.mlp_act as *mut _, (bs * inter) as i32, stream,
         );
-        gemv(stream, lw.down_proj.ptr, buffers.mlp_act, buffers.down_out,
+        gemv(stream, buffers.sm_count, lw.down_proj.ptr, buffers.mlp_act, buffers.down_out,
             hs_z, inter_z);
 
         // Defer residual add: next layer's input RMSNorm fuses (residual + down_out)
