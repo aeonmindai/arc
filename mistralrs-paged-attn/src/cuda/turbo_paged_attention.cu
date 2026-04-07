@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cmath>
 #include <cfloat>
+#include <type_traits>
 
 // Generic float conversion — works with __half OR __nv_bfloat16
 __device__ __forceinline__ float tq_to_f(__half x) { return __half2float(x); }
@@ -177,9 +178,11 @@ extern "C" void turbo_reshape_and_cache(
 // 5. Output: write accs to shared, rotate, write out (all threads participate)
 // ============================================================================
 
-template<int BLOCK_SIZE, typename QT>
+// OutT = float (default) or __nv_bfloat16 (saves a separate F32→BF16 cast kernel
+// in the dedicated decode path).
+template<int BLOCK_SIZE, typename QT, typename OutT = float>
 __global__ void tq_attn(
-    float* __restrict__ out,
+    OutT* __restrict__ out,
     const QT* __restrict__ query,
     const uint8_t* __restrict__ kc,
     const uint8_t* __restrict__ vc,
@@ -329,8 +332,18 @@ __global__ void tq_attn(
     __syncthreads();
     rotate128(obuf, tid, NT);
 
-    if (tid < HS)
-        out[sidx*nh*HS + hidx*HS + tid] = obuf[tid];
+    if (tid < HS) {
+        // Cast on store: float (no-op), __half, or __nv_bfloat16.
+        const int oi = sidx*nh*HS + hidx*HS + tid;
+        const float v = obuf[tid];
+        if constexpr (std::is_same<OutT, __nv_bfloat16>::value) {
+            out[oi] = __float2bfloat16(v);
+        } else if constexpr (std::is_same<OutT, __half>::value) {
+            out[oi] = __float2half(v);
+        } else {
+            out[oi] = v;
+        }
+    }
 }
 
 extern "C" void turbo_paged_attention_v1_f16(
@@ -379,11 +392,41 @@ extern "C" void turbo_paged_attention_v1(
     dim3 block(128);
     #define TQ_LAUNCH(QT) \
         switch(bs){ \
-        case 8: tq_attn<8><<<grid,block,smem,stream>>>((float*)out,(const QT*)query,(const uint8_t*)kc,(const uint8_t*)vc,(const __half*)kn,(const __half*)vn,bt,cl,nkvh,mbps,nh,scale,kbs,khs,vvbs,vvhs,nbs,nhs); break; \
-        case 16: tq_attn<16><<<grid,block,smem,stream>>>((float*)out,(const QT*)query,(const uint8_t*)kc,(const uint8_t*)vc,(const __half*)kn,(const __half*)vn,bt,cl,nkvh,mbps,nh,scale,kbs,khs,vvbs,vvhs,nbs,nhs); break; \
-        case 32: tq_attn<32><<<grid,block,smem,stream>>>((float*)out,(const QT*)query,(const uint8_t*)kc,(const uint8_t*)vc,(const __half*)kn,(const __half*)vn,bt,cl,nkvh,mbps,nh,scale,kbs,khs,vvbs,vvhs,nbs,nhs); break; \
+        case 8: tq_attn<8, QT><<<grid,block,smem,stream>>>((float*)out,(const QT*)query,(const uint8_t*)kc,(const uint8_t*)vc,(const __half*)kn,(const __half*)vn,bt,cl,nkvh,mbps,nh,scale,kbs,khs,vvbs,vvhs,nbs,nhs); break; \
+        case 16: tq_attn<16, QT><<<grid,block,smem,stream>>>((float*)out,(const QT*)query,(const uint8_t*)kc,(const uint8_t*)vc,(const __half*)kn,(const __half*)vn,bt,cl,nkvh,mbps,nh,scale,kbs,khs,vvbs,vvhs,nbs,nhs); break; \
+        case 32: tq_attn<32, QT><<<grid,block,smem,stream>>>((float*)out,(const QT*)query,(const uint8_t*)kc,(const uint8_t*)vc,(const __half*)kn,(const __half*)vn,bt,cl,nkvh,mbps,nh,scale,kbs,khs,vvbs,vvhs,nbs,nhs); break; \
         }
     if (dtype == 1) { TQ_LAUNCH(__nv_bfloat16); }
     else { TQ_LAUNCH(__half); }
     #undef TQ_LAUNCH
+}
+
+// BF16-output entry point: writes BF16 directly, eliminating the F32→BF16 cast
+// kernel that the dedicated decode path used to need after this attention call.
+extern "C" void turbo_paged_attention_v1_bf16out(
+    void* out_bf16, const void* query,
+    const void* kc, const void* vc,
+    const void* kn, const void* vn,
+    int nkvh, float scale, float softcapping,
+    const uint32_t* bt, const uint32_t* cl,
+    int bs, int mcl, int ns, int nh, int hs,
+    int mbps, int qs, int kbs, int khs,
+    int nbs, int nhs, cudaStream_t stream, uint32_t qdtype
+) {
+    if (hs != 128) return;
+    int vpd=(hs+9)/10*4;
+    int vvbs=nkvh*vpd*bs, vvhs=vpd*bs;
+    int padded = TQ_DIVUP(mcl,bs)*bs;
+    int smem = padded * sizeof(float);
+    dim3 grid(nh, ns, 1);
+    dim3 block(128);
+    #define TQ_LAUNCH_BF16OUT(QT) \
+        switch(bs){ \
+        case 8: tq_attn<8, QT, __nv_bfloat16><<<grid,block,smem,stream>>>((__nv_bfloat16*)out_bf16,(const QT*)query,(const uint8_t*)kc,(const uint8_t*)vc,(const __half*)kn,(const __half*)vn,bt,cl,nkvh,mbps,nh,scale,kbs,khs,vvbs,vvhs,nbs,nhs); break; \
+        case 16: tq_attn<16, QT, __nv_bfloat16><<<grid,block,smem,stream>>>((__nv_bfloat16*)out_bf16,(const QT*)query,(const uint8_t*)kc,(const uint8_t*)vc,(const __half*)kn,(const __half*)vn,bt,cl,nkvh,mbps,nh,scale,kbs,khs,vvbs,vvhs,nbs,nhs); break; \
+        case 32: tq_attn<32, QT, __nv_bfloat16><<<grid,block,smem,stream>>>((__nv_bfloat16*)out_bf16,(const QT*)query,(const uint8_t*)kc,(const uint8_t*)vc,(const __half*)kn,(const __half*)vn,bt,cl,nkvh,mbps,nh,scale,kbs,khs,vvbs,vvhs,nbs,nhs); break; \
+        }
+    if (qdtype == 1) { TQ_LAUNCH_BF16OUT(__nv_bfloat16); }
+    else { TQ_LAUNCH_BF16OUT(__half); }
+    #undef TQ_LAUNCH_BF16OUT
 }

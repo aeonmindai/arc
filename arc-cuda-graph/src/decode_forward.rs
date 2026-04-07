@@ -375,9 +375,10 @@ pub unsafe fn decode_forward(
                 paged_attn.norm_block_stride, paged_attn.norm_head_stride,
                 stream, 1, // dtype=BF16
             );
-            let q_size = (bs as usize * nh * hd) as i32;
-            turbo_paged_attention_v1(
-                buffers.attn_out_f32 as *const _, q_ptr as *const _,
+            // BF16-output variant: writes BF16 directly into buffers.attn_out,
+            // eliminating the separate F32→BF16 cast kernel.
+            turbo_paged_attention_v1_bf16out(
+                buffers.attn_out as *const _, q_ptr as *const _,
                 lc.key_cache as *const _, lc.value_cache as *const _,
                 lc.k_norms as *const _, lc.v_norms as *const _,
                 nkv as i32, scale, 1.0,
@@ -388,11 +389,7 @@ pub unsafe fn decode_forward(
                 q_stride,
                 paged_attn.kv_block_stride, paged_attn.kv_head_stride,
                 paged_attn.norm_block_stride, paged_attn.norm_head_stride,
-                stream, 1, // dtype=BF16
-            );
-            // F32→BF16 cast still needed (turbo attn outputs F32)
-            launch_cast_f32_to_bf16(
-                buffers.attn_out_f32 as *const _, buffers.attn_out as *mut _, q_size, stream,
+                stream, 1, // qdtype=BF16
             );
         } else {
             // Standard BF16 cache
@@ -563,6 +560,32 @@ extern "C" {
         norm_head_stride: i32,
         stream: CUstream,
         dtype: u32,
+    );
+    fn turbo_paged_attention_v1_bf16out(
+        out_bf16: *const std::ffi::c_void,
+        query: *const std::ffi::c_void,
+        k_cache: *const std::ffi::c_void,
+        v_cache: *const std::ffi::c_void,
+        k_norms: *const std::ffi::c_void,
+        v_norms: *const std::ffi::c_void,
+        num_kv_heads: i32,
+        scale: f32,
+        softcapping: f32,
+        block_tables: *const u32,
+        context_lens: *const u32,
+        block_size: i32,
+        max_context_len: i32,
+        num_seqs: i32,
+        num_heads: i32,
+        head_size: i32,
+        max_num_blocks_per_seq: i32,
+        q_stride: i32,
+        kv_block_stride: i32,
+        kv_head_stride: i32,
+        norm_block_stride: i32,
+        norm_head_stride: i32,
+        stream: CUstream,
+        qdtype: u32,
     );
 }
 
