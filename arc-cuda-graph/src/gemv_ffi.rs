@@ -60,4 +60,35 @@ extern "C" {
         k: i32,
         stream: *mut c_void,
     );
+
+    // Bench harness variants — same templated kernel, different rows-per-block
+    // and __launch_bounds__ second argument.
+    pub fn arc_launch_gemv_orig_8x4(
+        weight: *const c_void, input: *const c_void, output: *mut c_void,
+        m: i32, k: i32, stream: *mut c_void,
+    );
+    pub fn arc_launch_gemv_orig_8x6(
+        weight: *const c_void, input: *const c_void, output: *mut c_void,
+        m: i32, k: i32, stream: *mut c_void,
+    );
+    pub fn arc_launch_gemv_orig_8x8(
+        weight: *const c_void, input: *const c_void, output: *mut c_void,
+        m: i32, k: i32, stream: *mut c_void,
+    );
+    pub fn arc_launch_gemv_orig_4x8(
+        weight: *const c_void, input: *const c_void, output: *mut c_void,
+        m: i32, k: i32, stream: *mut c_void,
+    );
+    pub fn arc_launch_gemv_orig_4x12(
+        weight: *const c_void, input: *const c_void, output: *mut c_void,
+        m: i32, k: i32, stream: *mut c_void,
+    );
+    pub fn arc_launch_gemv_orig_16x2(
+        weight: *const c_void, input: *const c_void, output: *mut c_void,
+        m: i32, k: i32, stream: *mut c_void,
+    );
+    pub fn arc_launch_gemv_orig_16x3(
+        weight: *const c_void, input: *const c_void, output: *mut c_void,
+        m: i32, k: i32, stream: *mut c_void,
+    );
 }

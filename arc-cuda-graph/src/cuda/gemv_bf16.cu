@@ -18,6 +18,79 @@
 #define GEMV_ROWS 8
 #define GEMV_BLOCK (GEMV_WARP * GEMV_ROWS)
 
+// Templated 1-warp-per-row GEMV kernel. Lets us instantiate variants with
+// different rows-per-block and max-blocks-per-SM hints, all sharing the same
+// inner-loop body. Used by the bench harness to find the best variant per
+// shape and by the dispatcher in production.
+template<int ROWS_PER_BLOCK, int MAX_BLOCKS_PER_SM>
+__global__ __launch_bounds__(ROWS_PER_BLOCK * 32, MAX_BLOCKS_PER_SM)
+void gemv_bf16_orig_tpl(
+    const __nv_bfloat16* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    int M, int K
+) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= M) return;
+
+    const __nv_bfloat16* w = weight + (int64_t)row * K;
+    float acc = 0.0f;
+
+    const int K8 = K >> 3;
+    const uint4* wv = (const uint4*)w;
+    const uint4* iv = (const uint4*)input;
+
+    for (int i = lane; i < K8; i += 32) {
+        uint4 a = __ldg(wv + i);
+        uint4 b = __ldg(iv + i);
+        const __nv_bfloat16* ap = (const __nv_bfloat16*)&a;
+        const __nv_bfloat16* bp = (const __nv_bfloat16*)&b;
+        acc += __bfloat162float(ap[0]) * __bfloat162float(bp[0])
+             + __bfloat162float(ap[1]) * __bfloat162float(bp[1])
+             + __bfloat162float(ap[2]) * __bfloat162float(bp[2])
+             + __bfloat162float(ap[3]) * __bfloat162float(bp[3])
+             + __bfloat162float(ap[4]) * __bfloat162float(bp[4])
+             + __bfloat162float(ap[5]) * __bfloat162float(bp[5])
+             + __bfloat162float(ap[6]) * __bfloat162float(bp[6])
+             + __bfloat162float(ap[7]) * __bfloat162float(bp[7]);
+    }
+
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 16);
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 8);
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 4);
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 2);
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 1);
+
+    if (lane == 0) output[row] = __float2bfloat16(acc);
+}
+
+// Explicit variant launchers — bench harness compares these per shape.
+#define DEFINE_ORIG_VARIANT(R, B)                                                                  \
+    extern "C" void arc_launch_gemv_orig_##R##x##B(                                                \
+        const void* weight, const void* input, void* output,                                       \
+        int M, int K, cudaStream_t stream                                                          \
+    ) {                                                                                            \
+        dim3 grid((M + R - 1) / R);                                                                \
+        gemv_bf16_orig_tpl<R, B><<<grid, R*32, 0, stream>>>(                                       \
+            (const __nv_bfloat16*)weight, (const __nv_bfloat16*)input,                             \
+            (__nv_bfloat16*)output, M, K);                                                         \
+    }
+
+// 8 rows per block (256 threads)
+DEFINE_ORIG_VARIANT(8, 4)
+DEFINE_ORIG_VARIANT(8, 6)
+DEFINE_ORIG_VARIANT(8, 8)
+// 4 rows per block (128 threads) — better for small-M shapes that need more blocks
+DEFINE_ORIG_VARIANT(4, 8)
+DEFINE_ORIG_VARIANT(4, 12)
+// 16 rows per block (512 threads) — better for very large M
+DEFINE_ORIG_VARIANT(16, 2)
+DEFINE_ORIG_VARIANT(16, 3)
+
+#undef DEFINE_ORIG_VARIANT
+
+
 // Wide-row variant: 4 warps cooperate on each row, 2 rows per block.
 // 4× more blocks than the 1-warp-per-row kernel → higher SM occupancy when
 // the model has small M (few rows) and long K (long inner loop).
@@ -453,21 +526,33 @@ extern "C" void arc_launch_gemv_bf16(
     const void* weight, const void* input, void* output,
     int M, int K, int sm_count, cudaStream_t stream
 ) {
-    // Dispatch heuristic, derived from runtime SM count (no GPU-specific magic
-    // numbers):
-    //   - Original kernel: 1 warp per row, 8 rows per block → blocks = M/8.
-    //     With ~6 active blocks/SM (the __launch_bounds__ hint, generic 75% target
-    //     occupancy on modern NVIDIA SMs), available "slots" = sm_count * 6.
-    //     Wave count for the original kernel ≈ (M/8) / (sm_count * 6).
-    //   - Wide kernel: 4 warps per row, 2 rows per block → blocks = M/2 (4× more).
+    // Empirical dispatch from gemv_bench data:
     //
-    // Rule: when the original kernel doesn't fill many waves (the per-row inner
-    // loop is long but there aren't enough rows to keep all SMs busy), prefer the
-    // wide kernel. Empirically the cross-over happens around M ≈ sm_count * 100;
-    // above that, the wide kernel's extra cross-warp reduction overhead exceeds
-    // its wave-fill benefit.
-    int sm = sm_count > 0 ? sm_count : 1;
-    if (M < sm * 100) {
+    //   Wide kernel (4 warps per row, splits the inner loop):
+    //   - WINS when the inner loop is the dominant cost AND M is too small to
+    //     fill the SMs with the original kernel — i.e. K is large and M is small.
+    //     Example: down_proj (M=5120, K=25600) where the per-row inner loop is
+    //     ~99 iters and the original kernel only generates 640 blocks (< 1 wave).
+    //   - LOSES when M is moderate-to-large because the cross-warp reduction
+    //     overhead exceeds any wave-fill benefit. Example: gate/up (M=25600,
+    //     K=5120) — original at 5460 GB/s vs wide at ~5000 GB/s.
+    //   - LOSES when M is small AND K is small because both kernels are
+    //     overhead-bound and the wide variant pays for the cross-warp reduction
+    //     without amortizing it across enough work. Example: oproj (M=K=5120) —
+    //     original beats wide.
+    //
+    //   Rule: prefer the wide kernel only when K dominates over M. Specifically
+    //   when K > M and the original kernel would not fill at least ~3 waves of
+    //   8-row blocks (i.e. M/8 < sm_count * 18 = sm_count * 18). This catches
+    //   down_proj (K=5120, M=5120: K not much larger; falls through to original)
+    //   and only fires for the K >> M case.
+    (void)sm_count;
+    // Single empirical rule: prefer the wide kernel only when K is at least
+    // 4× larger than M (the inner loop dominates and the original kernel can't
+    // generate enough blocks to fill the SMs). For Qwen3-32B this fires only
+    // for down_proj (K=25600, M=5120). All other shapes use the original
+    // kernel which empirically wins on every other M/K combination tested.
+    if (K >= 4 * M) {
         dim3 grid((M + 1) / 2);
         gemv_bf16_w4_kernel<<<grid, GEMV_BLOCK, 0, stream>>>(
             (const __nv_bfloat16*)weight,

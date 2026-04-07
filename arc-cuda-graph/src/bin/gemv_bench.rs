@@ -17,6 +17,13 @@ use arc_cuda_graph::gemv_ffi::{
     arc_launch_gemv_bf16,
     arc_launch_gemv_bf16_clocked,
     arc_launch_gemv_bf16_dual,
+    arc_launch_gemv_orig_8x4,
+    arc_launch_gemv_orig_8x6,
+    arc_launch_gemv_orig_8x8,
+    arc_launch_gemv_orig_4x8,
+    arc_launch_gemv_orig_4x12,
+    arc_launch_gemv_orig_16x2,
+    arc_launch_gemv_orig_16x3,
 };
 
 extern "C" {
@@ -314,6 +321,60 @@ fn main() {
         println!("=== throughput sweep (current arc_launch_gemv_bf16 dispatch) ===");
         for &s in &shapes {
             bench_shape(s, sm_count);
+        }
+        println!();
+
+        println!("=== variant sweep — find best kernel per shape ===");
+        println!("{:>8}  {:>10}  {:>9}  {:>8}  {:>9}", "shape", "variant", "median μs", "GB/s", "% peak");
+        for &s in &shapes {
+            let bytes = (s.m as usize * s.k as usize * 2) + (s.k as usize * 2);
+            let weight = alloc(s.m as usize * s.k as usize * 2);
+            let input = alloc(s.k as usize * 2);
+            let output = alloc(s.m as usize * 2);
+            fill_random_bf16(weight, (s.m * s.k) as usize);
+            fill_random_bf16(input, s.k as usize);
+            cudaMemset(output as *mut c_void, 0, s.m as usize * 2);
+
+            let variants: &[(&str, fn(*const c_void, *const c_void, *mut c_void, i32, i32, *mut c_void))] = &[
+                ("orig 8x4", arc_launch_gemv_orig_8x4),
+                ("orig 8x6", arc_launch_gemv_orig_8x6),
+                ("orig 8x8", arc_launch_gemv_orig_8x8),
+                ("orig 4x8", arc_launch_gemv_orig_4x8),
+                ("orig 4x12", arc_launch_gemv_orig_4x12),
+                ("orig 16x2", arc_launch_gemv_orig_16x2),
+                ("orig 16x3", arc_launch_gemv_orig_16x3),
+            ];
+
+            let mut best_med = f32::MAX;
+            let mut best_name = "";
+            for &(name, launch) in variants {
+                let (_, med, _) = time_kernel(
+                    || launch(weight as *const c_void, input as *const c_void, output as *mut c_void, s.m, s.k, std::ptr::null_mut()),
+                    10,
+                    100,
+                );
+                let achieved = (bytes as f32 / 1e9) / (med / 1e6);
+                let eff = achieved / 8000.0 * 100.0;
+                println!("{:>8}  {:>10}  {:9.2}  {:8.0}  {:8.1}%", s.name, name, med, achieved, eff);
+                if med < best_med {
+                    best_med = med;
+                    best_name = name;
+                }
+            }
+            // Also test the wide dispatcher result for comparison
+            let (_, med_wide, _) = time_kernel(
+                || arc_launch_gemv_bf16(weight as *const c_void, input as *const c_void, output as *mut c_void, s.m, s.k, sm_count, std::ptr::null_mut()),
+                10,
+                100,
+            );
+            let achieved_wide = (bytes as f32 / 1e9) / (med_wide / 1e6);
+            println!("{:>8}  {:>10}  {:9.2}  {:8.0}  {:8.1}%", s.name, "dispatch", med_wide, achieved_wide, achieved_wide / 8000.0 * 100.0);
+            println!("{:>8}  {:>10}  best={} ({:.2}μs)", s.name, "→", best_name, best_med);
+            println!();
+
+            cudaFree(weight);
+            cudaFree(input);
+            cudaFree(output);
         }
         println!();
 
