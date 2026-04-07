@@ -51,6 +51,16 @@ extern "C" {
         stream: *mut c_void,
     );
 
+    pub fn arc_launch_gemv_bf16_dual_silu_mul(
+        weight_gate: *const c_void,
+        weight_up: *const c_void,
+        input: *const c_void,
+        output_mlp_act: *mut c_void,
+        m: i32,
+        k: i32,
+        stream: *mut c_void,
+    );
+
     pub fn arc_launch_gemv_bf16_clocked(
         weight: *const c_void,
         input: *const c_void,
