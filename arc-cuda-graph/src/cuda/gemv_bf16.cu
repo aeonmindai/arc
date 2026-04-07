@@ -86,6 +86,84 @@ void gemv_bf16_w4_kernel(
     }
 }
 
+// Fused silu(gate) * up * weight GEMV for the down projection. Eliminates the
+// separate silu_mul kernel and the mlp_act buffer round-trip.
+//
+// Inner loop: for each k, computes act = silu(gate[k]) * up[k] = gate[k]/(1+exp(-gate[k])) * up[k]
+// then accumulates W[row, k] * act. gate/up are read once per row, but L2 caches them
+// across the M rows in this block (gate+up = 51KB total for Qwen3-32B, fits in L2).
+__device__ __forceinline__ float silu_f(float x) {
+    return x / (1.0f + __expf(-x));
+}
+
+__global__ __launch_bounds__(256, 6)
+void gemv_bf16_w4_silu_mul_kernel(
+    const __nv_bfloat16* __restrict__ weight, // [M, K] = down_proj
+    const __nv_bfloat16* __restrict__ gate,   // [K]
+    const __nv_bfloat16* __restrict__ up,     // [K]
+    __nv_bfloat16* __restrict__ output,       // [M]
+    int M, int K
+) {
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;            // 0..7
+    const int row_in_block = warp >> 2;   // 0..1
+    const int warp_in_row = warp & 3;     // 0..3
+    const int row = blockIdx.x * 2 + row_in_block;
+    if (row >= M) return;
+
+    const __nv_bfloat16* w = weight + (int64_t)row * K;
+    float acc = 0.0f;
+
+    const int K8 = K >> 3;
+    const uint4* wv = (const uint4*)w;
+    const uint4* gv = (const uint4*)gate;
+    const uint4* uv = (const uint4*)up;
+
+    for (int i = warp_in_row * 32 + lane; i < K8; i += 128) {
+        uint4 a = __ldg(wv + i);
+        uint4 g = __ldg(gv + i);
+        uint4 u = __ldg(uv + i);
+        const __nv_bfloat16* ap = (const __nv_bfloat16*)&a;
+        const __nv_bfloat16* gp = (const __nv_bfloat16*)&g;
+        const __nv_bfloat16* up_p = (const __nv_bfloat16*)&u;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            float act = silu_f(__bfloat162float(gp[j])) * __bfloat162float(up_p[j]);
+            acc += __bfloat162float(ap[j]) * act;
+        }
+    }
+
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 16);
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 8);
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 4);
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 2);
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 1);
+
+    __shared__ float row_acc[2][4];
+    if (lane == 0) row_acc[row_in_block][warp_in_row] = acc;
+    __syncthreads();
+
+    if (warp_in_row == 0 && lane == 0) {
+        float total = row_acc[row_in_block][0] + row_acc[row_in_block][1]
+                    + row_acc[row_in_block][2] + row_acc[row_in_block][3];
+        output[row] = __float2bfloat16(total);
+    }
+}
+
+extern "C" void arc_launch_gemv_bf16_silu_mul_down(
+    const void* weight, const void* gate, const void* up, void* output,
+    int M, int K, cudaStream_t stream
+) {
+    dim3 grid((M + 1) / 2);
+    gemv_bf16_w4_silu_mul_kernel<<<grid, GEMV_BLOCK, 0, stream>>>(
+        (const __nv_bfloat16*)weight,
+        (const __nv_bfloat16*)gate,
+        (const __nv_bfloat16*)up,
+        (__nv_bfloat16*)output, M, K
+    );
+}
+
 __global__ __launch_bounds__(256, 6)
 void gemv_bf16_kernel(
     const __nv_bfloat16* __restrict__ weight,
