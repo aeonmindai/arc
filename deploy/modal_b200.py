@@ -22,7 +22,7 @@ arc_image = (
     })
     .run_commands(
         "git clone https://github.com/aeonmindai/arc.git /tmp/arc",
-        "cd /tmp/arc && git checkout 0a13f577c && git log --oneline -1 && echo BUILD_V79",
+        "cd /tmp/arc && git checkout a6066d3c6 && git log --oneline -1 && echo BUILD_V80",
         "cd /tmp/arc && cargo build --release -p mistralrs-cli --features 'cuda flash-attn'",
         # Build the standalone GEMV bench binary
         "cd /tmp/arc && cargo build --release -p arc-cuda-graph --features cuda --bin gemv_bench",
