@@ -538,6 +538,7 @@ pub trait Pipeline:
     ) -> Option<Result<ForwardInputsResult, candle_core::Error>> {
         use arc_cuda_graph::{PagedAttentionState, LayerKvCache};
         use candle_core::cuda::cudarc::driver::DevicePtr;
+        let __dd_t0 = Instant::now();
 
         // Extract model inputs
         let model_inputs = inputs.downcast_ref::<text_models_inputs_processor::ModelInputs>()?;
@@ -576,6 +577,7 @@ pub trait Pipeline:
         };
         let positions: Vec<i32> = model_inputs.seqlen_offsets
             .iter().map(|&x| x as i32).collect();
+        let __dd_t1 = Instant::now();
 
         if token_ids.is_empty() {
             return None;
@@ -685,6 +687,7 @@ pub trait Pipeline:
 
         // Drop the KV cache lock before running
         drop(kv_cache);
+        let __dd_t2 = Instant::now();
 
         // Run the dedicated decode path
         let dedicated = self.dedicated_decode_mut().unwrap();
@@ -692,6 +695,7 @@ pub trait Pipeline:
             Ok(ptr) => ptr,
             Err(e) => return Some(Err(e)),
         };
+        let __dd_t3 = Instant::now();
 
         // Wrap BF16 logits as a Candle Tensor
         let vocab_size = dedicated.weights.config.vocab_size;
@@ -699,6 +703,33 @@ pub trait Pipeline:
             Ok(t) => t,
             Err(e) => return Some(Err(e)),
         };
+        let __dd_t4 = Instant::now();
+
+        // Periodic per-phase timing
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            static SUM_INPUT: AtomicU64 = AtomicU64::new(0);
+            static SUM_META: AtomicU64 = AtomicU64::new(0);
+            static SUM_RUN: AtomicU64 = AtomicU64::new(0);
+            static SUM_WRAP: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+            SUM_INPUT.fetch_add(__dd_t1.duration_since(__dd_t0).as_micros() as u64, Ordering::Relaxed);
+            SUM_META.fetch_add(__dd_t2.duration_since(__dd_t1).as_micros() as u64, Ordering::Relaxed);
+            SUM_RUN.fetch_add(__dd_t3.duration_since(__dd_t2).as_micros() as u64, Ordering::Relaxed);
+            SUM_WRAP.fetch_add(__dd_t4.duration_since(__dd_t3).as_micros() as u64, Ordering::Relaxed);
+            if n > 4 && (n - 4) % 50 == 0 {
+                let nn = n as f64;
+                tracing::info!(
+                    "DD_PHASES_us avg n={}: input={:.0} meta={:.0} run={:.0} wrap={:.0}",
+                    n,
+                    SUM_INPUT.load(Ordering::Relaxed) as f64 / nn,
+                    SUM_META.load(Ordering::Relaxed) as f64 / nn,
+                    SUM_RUN.load(Ordering::Relaxed) as f64 / nn,
+                    SUM_WRAP.load(Ordering::Relaxed) as f64 / nn,
+                );
+            }
+        }
 
         Some(Ok(ForwardInputsResult::CausalGeneration { logits: logits_tensor }))
     }
