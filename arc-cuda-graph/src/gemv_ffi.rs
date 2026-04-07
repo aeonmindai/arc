@@ -83,6 +83,30 @@ extern "C" {
         weight: *const c_void, input: *const c_void, output: *mut c_void,
         m: i32, k: i32, stream: *mut c_void,
     );
+    pub fn arc_launch_gemv_orig_4x16(
+        weight: *const c_void, input: *const c_void, output: *mut c_void,
+        m: i32, k: i32, stream: *mut c_void,
+    );
+    pub fn arc_launch_gemv_orig_2x16(
+        weight: *const c_void, input: *const c_void, output: *mut c_void,
+        m: i32, k: i32, stream: *mut c_void,
+    );
+    pub fn arc_launch_gemv_orig_2x24(
+        weight: *const c_void, input: *const c_void, output: *mut c_void,
+        m: i32, k: i32, stream: *mut c_void,
+    );
+    pub fn arc_launch_gemv_orig_2x32(
+        weight: *const c_void, input: *const c_void, output: *mut c_void,
+        m: i32, k: i32, stream: *mut c_void,
+    );
+    pub fn arc_launch_gemv_orig_1x16(
+        weight: *const c_void, input: *const c_void, output: *mut c_void,
+        m: i32, k: i32, stream: *mut c_void,
+    );
+    pub fn arc_launch_gemv_orig_1x32(
+        weight: *const c_void, input: *const c_void, output: *mut c_void,
+        m: i32, k: i32, stream: *mut c_void,
+    );
     pub fn arc_launch_gemv_orig_16x2(
         weight: *const c_void, input: *const c_void, output: *mut c_void,
         m: i32, k: i32, stream: *mut c_void,

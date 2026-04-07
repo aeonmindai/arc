@@ -81,10 +81,18 @@ void gemv_bf16_orig_tpl(
 DEFINE_ORIG_VARIANT(8, 4)
 DEFINE_ORIG_VARIANT(8, 6)
 DEFINE_ORIG_VARIANT(8, 8)
-// 4 rows per block (128 threads) — better for small-M shapes that need more blocks
+// 4 rows per block (128 threads)
 DEFINE_ORIG_VARIANT(4, 8)
 DEFINE_ORIG_VARIANT(4, 12)
-// 16 rows per block (512 threads) — better for very large M
+DEFINE_ORIG_VARIANT(4, 16)
+// 2 rows per block (64 threads) — many small blocks for max wave fill
+DEFINE_ORIG_VARIANT(2, 16)
+DEFINE_ORIG_VARIANT(2, 24)
+DEFINE_ORIG_VARIANT(2, 32)
+// 1 row per block (32 threads) — extreme parallelism
+DEFINE_ORIG_VARIANT(1, 16)
+DEFINE_ORIG_VARIANT(1, 32)
+// 16 rows per block (512 threads)
 DEFINE_ORIG_VARIANT(16, 2)
 DEFINE_ORIG_VARIANT(16, 3)
 
@@ -165,9 +173,12 @@ void gemv_bf16_w4_kernel(
 // to gate_out, the next M_up rows go to up_out. Saves 1 launch per layer.
 //
 // We can't physically fuse the weights (would duplicate them in memory),
-// so we dispatch via blockIdx: the first ceil(M_a/8) blocks read from
-// weight_a, the rest from weight_b.
-__global__ __launch_bounds__(256, 6)
+// so we dispatch via blockIdx: the first ceil(M_a/4) blocks read from
+// weight_a, the rest from weight_b. Uses 4 rows / 128 threads / 8 blocks-per-SM
+// (the empirical optimum found by gemv_bench).
+#define DUAL_ROWS 4
+#define DUAL_BLOCK (DUAL_ROWS * 32)
+__global__ __launch_bounds__(DUAL_BLOCK, 8)
 void gemv_bf16_dual_kernel(
     const __nv_bfloat16* __restrict__ weight_a,
     const __nv_bfloat16* __restrict__ weight_b,
@@ -178,11 +189,10 @@ void gemv_bf16_dual_kernel(
 ) {
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
-    // First (M_a + 7) / 8 blocks handle weight_a, the rest handle weight_b.
-    const int blocks_a = (M_a + GEMV_ROWS - 1) / GEMV_ROWS;
+    const int blocks_a = (M_a + DUAL_ROWS - 1) / DUAL_ROWS;
     bool is_a = blockIdx.x < blocks_a;
     int local_block = is_a ? blockIdx.x : (blockIdx.x - blocks_a);
-    int row = local_block * GEMV_ROWS + warp;
+    int row = local_block * DUAL_ROWS + warp;
     int M_local = is_a ? M_a : M_b;
     if (row >= M_local) return;
 
@@ -226,10 +236,10 @@ extern "C" void arc_launch_gemv_bf16_dual(
     void* out_a, void* out_b,
     int M_a, int M_b, int K, cudaStream_t stream
 ) {
-    int blocks_a = (M_a + GEMV_ROWS - 1) / GEMV_ROWS;
-    int blocks_b = (M_b + GEMV_ROWS - 1) / GEMV_ROWS;
+    int blocks_a = (M_a + DUAL_ROWS - 1) / DUAL_ROWS;
+    int blocks_b = (M_b + DUAL_ROWS - 1) / DUAL_ROWS;
     dim3 grid(blocks_a + blocks_b);
-    gemv_bf16_dual_kernel<<<grid, GEMV_BLOCK, 0, stream>>>(
+    gemv_bf16_dual_kernel<<<grid, DUAL_BLOCK, 0, stream>>>(
         (const __nv_bfloat16*)weight_a, (const __nv_bfloat16*)weight_b,
         (const __nv_bfloat16*)input,
         (__nv_bfloat16*)out_a, (__nv_bfloat16*)out_b,
@@ -357,8 +367,11 @@ void gemv_bf16_kernel(
     if (lane == 0) output[row] = __float2bfloat16(acc);
 }
 
-// Same kernel but outputs F32 instead of BF16 (for LM head → sampling needs F32)
-__global__ __launch_bounds__(256, 4)
+// Same kernel but outputs F32 instead of BF16 (for LM head → sampling needs F32).
+// Uses the same 4-rows-per-block / 128-thread / 8-blocks-per-SM layout as the
+// production gemv_bf16_orig_tpl<4,8> winner.
+#define F32OUT_ROWS 4
+__global__ __launch_bounds__(F32OUT_ROWS * 32, 8)
 void gemv_bf16_f32out_kernel(
     const __nv_bfloat16* __restrict__ weight,
     const __nv_bfloat16* __restrict__ input,
@@ -366,7 +379,7 @@ void gemv_bf16_f32out_kernel(
     int M, int K
 ) {
     const int lane = threadIdx.x & 31;
-    const int row = blockIdx.x * GEMV_ROWS + (threadIdx.x >> 5);
+    const int row = blockIdx.x * F32OUT_ROWS + (threadIdx.x >> 5);
     if (row >= M) return;
 
     const __nv_bfloat16* w = weight + (int64_t)row * K;
@@ -404,8 +417,8 @@ extern "C" void arc_launch_gemv_bf16_f32out(
     const void* weight, const void* input, void* output,
     int M, int K, cudaStream_t stream
 ) {
-    dim3 grid((M + GEMV_ROWS - 1) / GEMV_ROWS);
-    gemv_bf16_f32out_kernel<<<grid, GEMV_BLOCK, 0, stream>>>(
+    dim3 grid((M + F32OUT_ROWS - 1) / F32OUT_ROWS);
+    gemv_bf16_f32out_kernel<<<grid, F32OUT_ROWS * 32, 0, stream>>>(
         (const __nv_bfloat16*)weight,
         (const __nv_bfloat16*)input,
         (float*)output, M, K
@@ -526,45 +539,16 @@ extern "C" void arc_launch_gemv_bf16(
     const void* weight, const void* input, void* output,
     int M, int K, int sm_count, cudaStream_t stream
 ) {
-    // Empirical dispatch from gemv_bench data:
-    //
-    //   Wide kernel (4 warps per row, splits the inner loop):
-    //   - WINS when the inner loop is the dominant cost AND M is too small to
-    //     fill the SMs with the original kernel — i.e. K is large and M is small.
-    //     Example: down_proj (M=5120, K=25600) where the per-row inner loop is
-    //     ~99 iters and the original kernel only generates 640 blocks (< 1 wave).
-    //   - LOSES when M is moderate-to-large because the cross-warp reduction
-    //     overhead exceeds any wave-fill benefit. Example: gate/up (M=25600,
-    //     K=5120) — original at 5460 GB/s vs wide at ~5000 GB/s.
-    //   - LOSES when M is small AND K is small because both kernels are
-    //     overhead-bound and the wide variant pays for the cross-warp reduction
-    //     without amortizing it across enough work. Example: oproj (M=K=5120) —
-    //     original beats wide.
-    //
-    //   Rule: prefer the wide kernel only when K dominates over M. Specifically
-    //   when K > M and the original kernel would not fill at least ~3 waves of
-    //   8-row blocks (i.e. M/8 < sm_count * 18 = sm_count * 18). This catches
-    //   down_proj (K=5120, M=5120: K not much larger; falls through to original)
-    //   and only fires for the K >> M case.
+    // Empirical winner across every shape tested by gemv_bench: 4 rows per
+    // block (128 threads), 8 blocks/SM. Smaller blocks → 2× more total blocks
+    // vs the previous 8-row default → much better wave fill on small-M shapes
+    // (oproj, qkv) while staying competitive on large-M shapes (gate, up,
+    // lm_head). Same per-warp inner loop work, just better SM scheduling.
     (void)sm_count;
-    // Single empirical rule: prefer the wide kernel only when K is at least
-    // 4× larger than M (the inner loop dominates and the original kernel can't
-    // generate enough blocks to fill the SMs). For Qwen3-32B this fires only
-    // for down_proj (K=25600, M=5120). All other shapes use the original
-    // kernel which empirically wins on every other M/K combination tested.
-    if (K >= 4 * M) {
-        dim3 grid((M + 1) / 2);
-        gemv_bf16_w4_kernel<<<grid, GEMV_BLOCK, 0, stream>>>(
-            (const __nv_bfloat16*)weight,
-            (const __nv_bfloat16*)input,
-            (__nv_bfloat16*)output, M, K
-        );
-    } else {
-        dim3 grid((M + GEMV_ROWS - 1) / GEMV_ROWS);
-        gemv_bf16_kernel<<<grid, GEMV_BLOCK, 0, stream>>>(
-            (const __nv_bfloat16*)weight,
-            (const __nv_bfloat16*)input,
-            (__nv_bfloat16*)output, M, K
-        );
-    }
+    dim3 grid((M + 3) / 4);
+    gemv_bf16_orig_tpl<4, 8><<<grid, 4 * 32, 0, stream>>>(
+        (const __nv_bfloat16*)weight,
+        (const __nv_bfloat16*)input,
+        (__nv_bfloat16*)output, M, K
+    );
 }

@@ -22,6 +22,12 @@ use arc_cuda_graph::gemv_ffi::{
     arc_launch_gemv_orig_8x8,
     arc_launch_gemv_orig_4x8,
     arc_launch_gemv_orig_4x12,
+    arc_launch_gemv_orig_4x16,
+    arc_launch_gemv_orig_2x16,
+    arc_launch_gemv_orig_2x24,
+    arc_launch_gemv_orig_2x32,
+    arc_launch_gemv_orig_1x16,
+    arc_launch_gemv_orig_1x32,
     arc_launch_gemv_orig_16x2,
     arc_launch_gemv_orig_16x3,
 };
@@ -336,13 +342,19 @@ fn main() {
             cudaMemset(output as *mut c_void, 0, s.m as usize * 2);
 
             let variants: &[(&str, unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, i32, i32, *mut c_void))] = &[
+                ("orig 16x2", arc_launch_gemv_orig_16x2),
+                ("orig 16x3", arc_launch_gemv_orig_16x3),
                 ("orig 8x4", arc_launch_gemv_orig_8x4),
                 ("orig 8x6", arc_launch_gemv_orig_8x6),
                 ("orig 8x8", arc_launch_gemv_orig_8x8),
                 ("orig 4x8", arc_launch_gemv_orig_4x8),
                 ("orig 4x12", arc_launch_gemv_orig_4x12),
-                ("orig 16x2", arc_launch_gemv_orig_16x2),
-                ("orig 16x3", arc_launch_gemv_orig_16x3),
+                ("orig 4x16", arc_launch_gemv_orig_4x16),
+                ("orig 2x16", arc_launch_gemv_orig_2x16),
+                ("orig 2x24", arc_launch_gemv_orig_2x24),
+                ("orig 2x32", arc_launch_gemv_orig_2x32),
+                ("orig 1x16", arc_launch_gemv_orig_1x16),
+                ("orig 1x32", arc_launch_gemv_orig_1x32),
             ];
 
             let mut best_med = f32::MAX;
