@@ -25,7 +25,11 @@
 // Block: 256 threads = 8 warps. 2 rows × 4 warps/row.
 // Each warp processes K/4 of the inner loop, then 4 warp-reductions
 // combine via 32B of shared memory per block.
-__global__ __launch_bounds__(256, 4)
+//
+// __launch_bounds__(256, 6): allow 6 blocks/SM (vs 4 default). Increases
+// in-flight HBM traffic and improves latency hiding for long-K shapes.
+// Register budget: 65536 / (256 * 6) = 42 regs/thread (was 64 with 4 blocks).
+__global__ __launch_bounds__(256, 6)
 void gemv_bf16_w4_kernel(
     const __nv_bfloat16* __restrict__ weight,
     const __nv_bfloat16* __restrict__ input,
