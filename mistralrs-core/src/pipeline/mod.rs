@@ -988,6 +988,8 @@ pub trait Pipeline:
                 let mut raw_out_logits = vec![vec![None; len_inputs]; input_seqs.len()];
                 let mut embedding_logits = vec![None; input_seqs.len()];
 
+                let __pa_t_step_start = Instant::now();
+                let mut __pa_t_fwd_us: f64 = 0.0;
                 let mut exec_duration = Duration::ZERO;
                 for (i, inputs) in inputs_iter.into_iter().enumerate() {
                     let InputProcessorOutput {
@@ -999,6 +1001,7 @@ pub trait Pipeline:
                     let raw_logits = self.graph_wrapped_forward(inputs, is_prompt, return_raw_logits)?;
                     let end = Instant::now();
                     exec_duration += end.duration_since(start);
+                    __pa_t_fwd_us += end.duration_since(start).as_secs_f64() * 1e6;
 
                     for (logit_idx, seq_idx) in seq_indices.into_iter().enumerate() {
                         if let ForwardInputsResult::RawLogits { logits } = &raw_logits {
@@ -1154,6 +1157,30 @@ pub trait Pipeline:
                 }
                 let end = Instant::now();
                 exec_duration += end.duration_since(start);
+                let __pa_t_sample_us = end.duration_since(start).as_secs_f64() * 1e6;
+                let __pa_t_total_us = __pa_t_step_start.elapsed().as_secs_f64() * 1e6;
+                {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static N: AtomicU64 = AtomicU64::new(0);
+                    static SUM_TOTAL: AtomicU64 = AtomicU64::new(0);
+                    static SUM_FWD: AtomicU64 = AtomicU64::new(0);
+                    static SUM_SAMPLE: AtomicU64 = AtomicU64::new(0);
+                    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+                    SUM_TOTAL.fetch_add(__pa_t_total_us as u64, Ordering::Relaxed);
+                    SUM_FWD.fetch_add(__pa_t_fwd_us as u64, Ordering::Relaxed);
+                    SUM_SAMPLE.fetch_add(__pa_t_sample_us as u64, Ordering::Relaxed);
+                    if n > 4 && (n - 4) % 25 == 0 {
+                        let nn = (n - 4) as f64;
+                        let total = SUM_TOTAL.load(Ordering::Relaxed) as f64 / nn;
+                        let fwd = SUM_FWD.load(Ordering::Relaxed) as f64 / nn;
+                        let samp = SUM_SAMPLE.load(Ordering::Relaxed) as f64 / nn;
+                        let other = total - fwd - samp;
+                        tracing::info!(
+                            "STEP_us avg over {} steps: TOTAL={:.0} fwd={:.0} sample={:.0} other={:.0} (=> {:.1} tok/s)",
+                            n - 4, total, fwd, samp, other, 1e6 / total
+                        );
+                    }
+                }
 
                 Ok(exec_duration)
             }
