@@ -335,7 +335,7 @@ fn main() {
             fill_random_bf16(input, s.k as usize);
             cudaMemset(output as *mut c_void, 0, s.m as usize * 2);
 
-            let variants: &[(&str, fn(*const c_void, *const c_void, *mut c_void, i32, i32, *mut c_void))] = &[
+            let variants: &[(&str, unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, i32, i32, *mut c_void))] = &[
                 ("orig 8x4", arc_launch_gemv_orig_8x4),
                 ("orig 8x6", arc_launch_gemv_orig_8x6),
                 ("orig 8x8", arc_launch_gemv_orig_8x8),
