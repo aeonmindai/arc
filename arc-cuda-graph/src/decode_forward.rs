@@ -438,15 +438,14 @@ pub unsafe fn decode_forward(
             hs as i32, bs as i32, eps, stream,
         );
 
-        // MLP: gate + up + silu_mul + down (separate; the fused silu_mul-into-down
-        // attempt was reverted because it recomputes silu(gate[k]) per row, doing
-        // M× more compute than the dedicated silu_mul kernel).
-        gemv(stream, lw.gate_proj.ptr, buffers.normed, buffers.gate,
-            inter_z, hs_z);
-        gemv(stream, lw.up_proj.ptr, buffers.normed, buffers.up,
-            inter_z, hs_z);
+        // MLP: fused gate+up GEMV (1 launch instead of 2), then silu_mul + down.
+        // Output layout: [gate (inter_z) | up (inter_z)] contiguous in buffers.gate.
+        gemv(stream, lw.gate_up_fused, buffers.normed, buffers.gate,
+            lw.gate_up_rows, hs_z);
+        let up_offset_bytes = (inter_z * 2) as u64; // bf16
+        let up_ptr = buffers.gate + up_offset_bytes;
         launch_fused_silu_mul_bf16(
-            buffers.gate as *const _, buffers.up as *const _,
+            buffers.gate as *const _, up_ptr as *const _,
             buffers.mlp_act as *mut _, (bs * inter) as i32, stream,
         );
         gemv(stream, lw.down_proj.ptr, buffers.mlp_act, buffers.down_out,

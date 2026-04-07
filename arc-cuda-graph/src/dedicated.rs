@@ -91,6 +91,8 @@ impl DedicatedDecodePath {
 
         // Fuse QKV weights contiguously per layer (saves 2 kernel launches/layer)
         Self::fuse_qkv(&mut weights)?;
+        // Fuse Gate+Up weights contiguously per layer (saves 1 kernel launch/layer)
+        Self::fuse_gate_up(&mut weights)?;
 
         tracing::info!(
             "Dedicated decode path initialized (stream + GEMV + RoPE[{}x{}])",
@@ -214,6 +216,37 @@ impl DedicatedDecodePath {
         Ok(())
     }
 
+    fn fuse_gate_up(weights: &mut ModelWeights) -> candle_core::Result<()> {
+        extern "C" {
+            fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: u32) -> u32;
+        }
+        let bf16 = 2usize;
+        let k = weights.config.hidden_size;
+        let mut total_bytes = 0usize;
+
+        for lw in weights.layers.iter_mut() {
+            let gr = lw.gate_proj.rows;
+            let ur = lw.up_proj.rows;
+            let total_rows = gr + ur;
+            let total_size = total_rows * k * bf16;
+
+            let mut ptr: u64 = 0;
+            let s = unsafe { cudaMalloc(&mut ptr, total_size) };
+            if s != 0 { candle_core::bail!("cudaMalloc Gate+Up fused failed: {s}"); }
+
+            unsafe {
+                cudaMemcpy(ptr as *mut _, lw.gate_proj.ptr as *const _, gr * k * bf16, 3);
+                cudaMemcpy((ptr + (gr * k * bf16) as u64) as *mut _, lw.up_proj.ptr as *const _, ur * k * bf16, 3);
+            }
+            lw.gate_up_fused = ptr;
+            lw.gate_up_rows = total_rows;
+            total_bytes += total_size;
+        }
+
+        tracing::info!("Gate+Up fused: {} layers, {:.1} GB", weights.layers.len(), total_bytes as f64 / 1e9);
+        Ok(())
+    }
+
     fn ensure_buffers(&mut self, batch_size: usize) -> candle_core::Result<()> {
         if self.buffers.is_some() {
             return Ok(());
@@ -232,7 +265,7 @@ impl DedicatedDecodePath {
             }};
         }
 
-        let buffers = DecodeBuffers {
+        let mut buffers = DecodeBuffers {
             hidden_a: alloc!(bs * cfg.hidden_size * bf16),
             hidden_b: alloc!(bs * cfg.hidden_size * bf16),
             normed: alloc!(bs * cfg.hidden_size * bf16),
@@ -244,8 +277,10 @@ impl DedicatedDecodePath {
             attn_out: alloc!(bs * cfg.num_heads * cfg.head_dim * bf16),
             attn_out_f32: alloc!(bs * cfg.num_heads * cfg.head_dim * 4),
             o_proj_out: alloc!(bs * cfg.hidden_size * bf16),
-            gate: alloc!(bs * cfg.intermediate_size * bf16),
-            up: alloc!(bs * cfg.intermediate_size * bf16),
+            // Allocate gate and up as a single contiguous buffer so the fused
+            // gate_up GEMV can write both halves with one launch.
+            gate: 0, // assigned below
+            up: 0,   // assigned below
             mlp_act: alloc!(bs * cfg.intermediate_size * bf16),
             down_out: alloc!(bs * cfg.hidden_size * bf16),
             logits: alloc!(bs * cfg.vocab_size * bf16),
@@ -257,6 +292,14 @@ impl DedicatedDecodePath {
             is_neox: self.weights.config.is_gpt_neox,
             batch_size: bs,
         };
+
+        // Allocate gate+up as one contiguous buffer (gate at offset 0, up at offset inter_z*bf16).
+        let gate_up_bytes = bs * cfg.intermediate_size * bf16 * 2;
+        let mut gate_up_ptr: u64 = 0;
+        let s = unsafe { cudaMalloc(&mut gate_up_ptr, gate_up_bytes) };
+        if s != 0 { candle_core::bail!("cudaMalloc gate_up buffer failed: {s}"); }
+        buffers.gate = gate_up_ptr;
+        buffers.up = gate_up_ptr + (bs * cfg.intermediate_size * bf16) as u64;
 
         let total_mb = (bs * cfg.hidden_size * bf16 * 4
             + bs * (cfg.num_heads + cfg.num_kv_heads * 2) * cfg.head_dim * bf16
@@ -639,16 +682,19 @@ impl Drop for DedicatedDecodePath {
             if self.sin_table != 0 { cudaFree(self.sin_table); }
             for lw in &self.weights.layers {
                 if lw.qkv_fused != 0 { cudaFree(lw.qkv_fused); }
+                if lw.gate_up_fused != 0 { cudaFree(lw.gate_up_fused); }
             }
             if self.staging_block_tables != 0 { cudaFree(self.staging_block_tables); }
             if self.staging_context_lens != 0 { cudaFree(self.staging_context_lens); }
             if self.staging_slot_mappings != 0 { cudaFree(self.staging_slot_mappings); }
             if let Some(ref b) = self.buffers {
+                // Note: b.up aliases into the same alloc as b.gate (gate_up contiguous), so
+                // only free b.gate and skip b.up.
                 for ptr in [b.hidden_a, b.hidden_b, b.normed, b.residual,
                     b.qkv, b.attn_out,
                     b.attn_out_f32,
                     b.o_proj_out,
-                    b.gate, b.up, b.mlp_act, b.down_out, b.logits, b.logits_f32,
+                    b.gate, b.mlp_act, b.down_out, b.logits, b.logits_f32,
                     b.token_ids, b.positions] {
                     if ptr != 0 { cudaFree(ptr); }
                 }
