@@ -86,6 +86,83 @@ void gemv_bf16_w4_kernel(
     }
 }
 
+// Dual-weight GEMV: computes gate_out[m] = sum(W_gate[m,k] * input[k]) and
+// up_out[m] = sum(W_up[m,k] * input[k]) in a single kernel launch. Each block
+// handles a chunk of rows from both matrices. The first M_gate output rows go
+// to gate_out, the next M_up rows go to up_out. Saves 1 launch per layer.
+//
+// We can't physically fuse the weights (33 GB extra for Qwen3-32B), so we
+// dispatch via blockIdx: blocks 0..(M_gate/8) read from W_gate, the rest from W_up.
+__global__ __launch_bounds__(256, 6)
+void gemv_bf16_dual_kernel(
+    const __nv_bfloat16* __restrict__ weight_a,
+    const __nv_bfloat16* __restrict__ weight_b,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ out_a,
+    __nv_bfloat16* __restrict__ out_b,
+    int M_a, int M_b, int K
+) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    // First (M_a + 7) / 8 blocks handle weight_a, the rest handle weight_b.
+    const int blocks_a = (M_a + GEMV_ROWS - 1) / GEMV_ROWS;
+    bool is_a = blockIdx.x < blocks_a;
+    int local_block = is_a ? blockIdx.x : (blockIdx.x - blocks_a);
+    int row = local_block * GEMV_ROWS + warp;
+    int M_local = is_a ? M_a : M_b;
+    if (row >= M_local) return;
+
+    const __nv_bfloat16* w_base = is_a ? weight_a : weight_b;
+    __nv_bfloat16* out = is_a ? out_a : out_b;
+
+    const __nv_bfloat16* w = w_base + (int64_t)row * K;
+    float acc = 0.0f;
+
+    const int K8 = K >> 3;
+    const uint4* wv = (const uint4*)w;
+    const uint4* iv = (const uint4*)input;
+
+    for (int i = lane; i < K8; i += GEMV_WARP) {
+        uint4 a = __ldg(wv + i);
+        uint4 b = __ldg(iv + i);
+        const __nv_bfloat16* ap = (const __nv_bfloat16*)&a;
+        const __nv_bfloat16* bp = (const __nv_bfloat16*)&b;
+        acc += __bfloat162float(ap[0]) * __bfloat162float(bp[0])
+             + __bfloat162float(ap[1]) * __bfloat162float(bp[1])
+             + __bfloat162float(ap[2]) * __bfloat162float(bp[2])
+             + __bfloat162float(ap[3]) * __bfloat162float(bp[3])
+             + __bfloat162float(ap[4]) * __bfloat162float(bp[4])
+             + __bfloat162float(ap[5]) * __bfloat162float(bp[5])
+             + __bfloat162float(ap[6]) * __bfloat162float(bp[6])
+             + __bfloat162float(ap[7]) * __bfloat162float(bp[7]);
+    }
+
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 16);
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 8);
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 4);
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 2);
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 1);
+
+    if (lane == 0) out[row] = __float2bfloat16(acc);
+}
+
+extern "C" void arc_launch_gemv_bf16_dual(
+    const void* weight_a, const void* weight_b,
+    const void* input,
+    void* out_a, void* out_b,
+    int M_a, int M_b, int K, cudaStream_t stream
+) {
+    int blocks_a = (M_a + GEMV_ROWS - 1) / GEMV_ROWS;
+    int blocks_b = (M_b + GEMV_ROWS - 1) / GEMV_ROWS;
+    dim3 grid(blocks_a + blocks_b);
+    gemv_bf16_dual_kernel<<<grid, GEMV_BLOCK, 0, stream>>>(
+        (const __nv_bfloat16*)weight_a, (const __nv_bfloat16*)weight_b,
+        (const __nv_bfloat16*)input,
+        (__nv_bfloat16*)out_a, (__nv_bfloat16*)out_b,
+        M_a, M_b, K
+    );
+}
+
 // Fused silu(gate) * up * weight GEMV for the down projection. Eliminates the
 // separate silu_mul kernel and the mlp_act buffer round-trip.
 //

@@ -91,8 +91,8 @@ impl DedicatedDecodePath {
 
         // Fuse QKV weights contiguously per layer (saves 2 kernel launches/layer)
         Self::fuse_qkv(&mut weights)?;
-        // Fuse Gate+Up weights contiguously per layer (saves 1 kernel launch/layer)
-        Self::fuse_gate_up(&mut weights)?;
+        // Note: Gate+Up cannot be physically fused (33 GB extra). The dual-weight
+        // GEMV kernel reads from both gate_proj and up_proj in one launch instead.
 
         tracing::info!(
             "Dedicated decode path initialized (stream + GEMV + RoPE[{}x{}])",
@@ -265,7 +265,7 @@ impl DedicatedDecodePath {
             }};
         }
 
-        let mut buffers = DecodeBuffers {
+        let buffers = DecodeBuffers {
             hidden_a: alloc!(bs * cfg.hidden_size * bf16),
             hidden_b: alloc!(bs * cfg.hidden_size * bf16),
             normed: alloc!(bs * cfg.hidden_size * bf16),
@@ -277,10 +277,8 @@ impl DedicatedDecodePath {
             attn_out: alloc!(bs * cfg.num_heads * cfg.head_dim * bf16),
             attn_out_f32: alloc!(bs * cfg.num_heads * cfg.head_dim * 4),
             o_proj_out: alloc!(bs * cfg.hidden_size * bf16),
-            // Allocate gate and up as a single contiguous buffer so the fused
-            // gate_up GEMV can write both halves with one launch.
-            gate: 0, // assigned below
-            up: 0,   // assigned below
+            gate: alloc!(bs * cfg.intermediate_size * bf16),
+            up: alloc!(bs * cfg.intermediate_size * bf16),
             mlp_act: alloc!(bs * cfg.intermediate_size * bf16),
             down_out: alloc!(bs * cfg.hidden_size * bf16),
             logits: alloc!(bs * cfg.vocab_size * bf16),
@@ -292,14 +290,6 @@ impl DedicatedDecodePath {
             is_neox: self.weights.config.is_gpt_neox,
             batch_size: bs,
         };
-
-        // Allocate gate+up as one contiguous buffer (gate at offset 0, up at offset inter_z*bf16).
-        let gate_up_bytes = bs * cfg.intermediate_size * bf16 * 2;
-        let mut gate_up_ptr: u64 = 0;
-        let s = unsafe { cudaMalloc(&mut gate_up_ptr, gate_up_bytes) };
-        if s != 0 { candle_core::bail!("cudaMalloc gate_up buffer failed: {s}"); }
-        buffers.gate = gate_up_ptr;
-        buffers.up = gate_up_ptr + (bs * cfg.intermediate_size * bf16) as u64;
 
         let total_mb = (bs * cfg.hidden_size * bf16 * 4
             + bs * (cfg.num_heads + cfg.num_kv_heads * 2) * cfg.head_dim * bf16
@@ -688,13 +678,11 @@ impl Drop for DedicatedDecodePath {
             if self.staging_context_lens != 0 { cudaFree(self.staging_context_lens); }
             if self.staging_slot_mappings != 0 { cudaFree(self.staging_slot_mappings); }
             if let Some(ref b) = self.buffers {
-                // Note: b.up aliases into the same alloc as b.gate (gate_up contiguous), so
-                // only free b.gate and skip b.up.
                 for ptr in [b.hidden_a, b.hidden_b, b.normed, b.residual,
                     b.qkv, b.attn_out,
                     b.attn_out_f32,
                     b.o_proj_out,
-                    b.gate, b.mlp_act, b.down_out, b.logits, b.logits_f32,
+                    b.gate, b.up, b.mlp_act, b.down_out, b.logits, b.logits_f32,
                     b.token_ids, b.positions] {
                     if ptr != 0 { cudaFree(ptr); }
                 }

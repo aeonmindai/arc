@@ -101,6 +101,12 @@ extern "C" {
         output: *mut std::ffi::c_void,
         m: i32, k: i32, stream: CUstream,
     );
+    fn arc_launch_gemv_bf16_dual(
+        weight_a: *const std::ffi::c_void, weight_b: *const std::ffi::c_void,
+        input: *const std::ffi::c_void,
+        out_a: *mut std::ffi::c_void, out_b: *mut std::ffi::c_void,
+        m_a: i32, m_b: i32, k: i32, stream: CUstream,
+    );
 }
 
 /// BF16 GEMV: output[0..m] = weight[m,k] * input[0..k]. Graph-capturable.
@@ -438,14 +444,17 @@ pub unsafe fn decode_forward(
             hs as i32, bs as i32, eps, stream,
         );
 
-        // MLP: fused gate+up GEMV (1 launch instead of 2), then silu_mul + down.
-        // Output layout: [gate (inter_z) | up (inter_z)] contiguous in buffers.gate.
-        gemv(stream, lw.gate_up_fused, buffers.normed, buffers.gate,
-            lw.gate_up_rows, hs_z);
-        let up_offset_bytes = (inter_z * 2) as u64; // bf16
-        let up_ptr = buffers.gate + up_offset_bytes;
+        // MLP: dual-weight GEMV computes gate and up in one launch (no weight
+        // duplication — reads from both gate_proj and up_proj buffers directly),
+        // then silu_mul + down.
+        arc_launch_gemv_bf16_dual(
+            lw.gate_proj.ptr as *const _, lw.up_proj.ptr as *const _,
+            buffers.normed as *const _,
+            buffers.gate as *mut _, buffers.up as *mut _,
+            inter_z as i32, inter_z as i32, hs_z as i32, stream,
+        );
         launch_fused_silu_mul_bf16(
-            buffers.gate as *const _, up_ptr as *const _,
+            buffers.gate as *const _, buffers.up as *const _,
             buffers.mlp_act as *mut _, (bs * inter) as i32, stream,
         );
         gemv(stream, lw.down_proj.ptr, buffers.mlp_act, buffers.down_out,
