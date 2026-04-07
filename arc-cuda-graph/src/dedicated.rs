@@ -394,21 +394,21 @@ impl DedicatedDecodePath {
     pub fn run_step_gpu_tokens(
         &mut self,
         token_ids_gpu: u64,
-        token_dtype_size: usize, // 4 = u32/i32
+        token_dtype_size: usize,
         batch_size: usize,
         positions: &[i32],
         paged_attn: &PagedAttentionState,
     ) -> candle_core::Result<u64> {
+        let t0 = std::time::Instant::now();
         self.ensure_buffers(batch_size)?;
         let max_possible_blocks = (self.weights.config.max_position_embeddings
             / paged_attn.block_size.max(1) as usize).max(paged_attn.max_num_blocks_per_seq as usize);
         self.ensure_staging(batch_size, max_possible_blocks)?;
         self.cache_kv_info(paged_attn);
-
         let buffers = self.buffers.as_ref().unwrap();
+        let t1 = std::time::Instant::now();
 
         unsafe {
-            // D2D copy of token_ids (no host involvement). cudaMemcpyKind = 3 = DeviceToDevice.
             cudaMemcpyAsync(
                 buffers.token_ids as *mut _, token_ids_gpu as *const _,
                 batch_size * token_dtype_size, 3, self.stream,
@@ -419,6 +419,7 @@ impl DedicatedDecodePath {
             );
             self.stage_paged_attn(paged_attn, batch_size);
             let staged = self.staged_paged_attn(paged_attn);
+            let t2 = std::time::Instant::now();
 
             if let Some(exec) = self.graph_exec {
                 if batch_size != self.captured_batch_size {
@@ -432,9 +433,30 @@ impl DedicatedDecodePath {
             } else {
                 decode_forward(&self.weights, buffers, &staged, self.stream);
             }
+            let t3 = std::time::Instant::now();
             cudaStreamSynchronize(self.stream);
+            let t4 = std::time::Instant::now();
+
+            self.step_count += 1;
+            if self.step_count > 4 {
+                self.sum_setup_us += t1.duration_since(t0).as_secs_f64() * 1e6;
+                self.sum_stage_us += t2.duration_since(t1).as_secs_f64() * 1e6;
+                self.sum_launch_us += t3.duration_since(t2).as_secs_f64() * 1e6;
+                self.sum_sync_us += t4.duration_since(t3).as_secs_f64() * 1e6;
+                self.sum_total_us += t4.duration_since(t0).as_secs_f64() * 1e6;
+                let n = (self.step_count - 4) as f64;
+                if (self.step_count - 4) % 50 == 0 {
+                    tracing::info!(
+                        "RS_GPU_us avg n={}: setup={:.0} stage={:.0} launch={:.0} sync={:.0} TOTAL={:.0}",
+                        self.step_count - 4,
+                        self.sum_setup_us / n, self.sum_stage_us / n,
+                        self.sum_launch_us / n, self.sum_sync_us / n,
+                        self.sum_total_us / n,
+                    );
+                }
+            }
         }
-        Ok(buffers.logits_f32)
+        Ok(self.buffers.as_ref().unwrap().logits_f32)
     }
 
     pub fn run_step(
