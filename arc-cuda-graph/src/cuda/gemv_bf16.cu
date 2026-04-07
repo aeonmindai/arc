@@ -195,10 +195,11 @@ extern "C" void arc_launch_gemv_bf16(
     // For Qwen3-32B: down (M=5120, K=25600), oproj (M=K=5120), gate/up
     // (M=25600, K=5120), qkv (M=10240, K=5120). The wide kernel helps when
     // M/K ≤ ~1, hurts (more redundant launch overhead) when M >> K.
-    // Wave count = (M / 8) / SM_count. With B200's 148 SMs and __launch_bounds(256,4)
-    // (so up to 4 blocks/SM = 592 active blocks), we want at least ~10 waves to amortize
-    // tail effects. M < ~12000 means original kernel has < 10 waves and wastes SMs.
-    if (M < 12000) {
+    // Use the wide-row kernel for everything except very large M (LM head, vocab>=128k).
+    // Wide kernel has 4× more blocks and higher per-SM thread count via __launch_bounds(256,6),
+    // which improves bandwidth utilization across all model GEMV shapes.
+    // Original kernel still wins for M >> 50000 where its tighter inner loop dominates.
+    if (M < 50000) {
         // 4× wide-row variant
         dim3 grid((M + 1) / 2);
         gemv_bf16_w4_kernel<<<grid, GEMV_BLOCK, 0, stream>>>(

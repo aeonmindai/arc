@@ -501,7 +501,7 @@ impl DedicatedDecodePath {
                 if batch_size != self.captured_batch_size {
                     tracing::warn!("Batch size changed ({} → {}), running eager", self.captured_batch_size, batch_size);
                     decode_forward(&self.weights, buffers, &staged, self.stream);
-                } else if self.step_count > 0 && self.step_count % 500 == 0 {
+                } else if self.step_count > 0 && self.step_count % 2000 == 0 {
                     // Periodic per-kernel profile so we can see steady-state hotspots.
                     // profile_forward is decode_forward with CUDA event timing — same compute,
                     // same KV-cache state advancement.
