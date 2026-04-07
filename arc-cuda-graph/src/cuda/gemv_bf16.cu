@@ -339,6 +339,116 @@ extern "C" void arc_launch_gemv_bf16_f32out(
     );
 }
 
+// =============================================================================
+// clock64()-instrumented GEMV variants for in-kernel cycle profiling.
+// We can't run nsight-compute on Modal (gVisor blocks profiling ioctls), so
+// we instrument the kernels ourselves: each warp records cycle counts at
+// strategic points (start, after first load, end of inner loop, end of
+// reduction) to a per-warp output buffer that the host reads back.
+//
+// This lets us answer:
+//   - Cycles per __ldg → memory latency (bandwidth-bound vs latency-bound)
+//   - Cycles per inner-loop iteration → compute vs memory ratio
+//   - Cycles in cross-warp reduction → reduction overhead
+//   - Cycles per row total → kernel efficiency
+// =============================================================================
+
+// One uint64 stamp per (block, warp, phase). 4 phases.
+//   phase 0: kernel entry
+//   phase 1: after first __ldg pair (memory latency probe)
+//   phase 2: end of inner loop
+//   phase 3: end of warp reduction (just before output write)
+__global__ __launch_bounds__(256, 6)
+void gemv_bf16_clocked_kernel(
+    const __nv_bfloat16* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    unsigned long long* __restrict__ clocks, // [num_blocks * 8 warps * 4 phases]
+    int M, int K
+) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * GEMV_ROWS + warp;
+    if (row >= M) return;
+
+    const int n_warps_per_block = GEMV_BLOCK / 32;
+    const int stamp_base = (blockIdx.x * n_warps_per_block + warp) * 4;
+
+    // Phase 0: kernel entry
+    if (lane == 0) clocks[stamp_base + 0] = clock64();
+
+    const __nv_bfloat16* w = weight + (int64_t)row * K;
+    float acc = 0.0f;
+
+    const int K8 = K >> 3;
+    const uint4* wv = (const uint4*)w;
+    const uint4* iv = (const uint4*)input;
+
+    // First iteration outside the loop so we can probe single-load latency.
+    if (lane < K8) {
+        uint4 a = __ldg(wv + lane);
+        uint4 b = __ldg(iv + lane);
+        if (lane == 0) clocks[stamp_base + 1] = clock64();
+        const __nv_bfloat16* ap = (const __nv_bfloat16*)&a;
+        const __nv_bfloat16* bp = (const __nv_bfloat16*)&b;
+        acc += __bfloat162float(ap[0]) * __bfloat162float(bp[0])
+             + __bfloat162float(ap[1]) * __bfloat162float(bp[1])
+             + __bfloat162float(ap[2]) * __bfloat162float(bp[2])
+             + __bfloat162float(ap[3]) * __bfloat162float(bp[3])
+             + __bfloat162float(ap[4]) * __bfloat162float(bp[4])
+             + __bfloat162float(ap[5]) * __bfloat162float(bp[5])
+             + __bfloat162float(ap[6]) * __bfloat162float(bp[6])
+             + __bfloat162float(ap[7]) * __bfloat162float(bp[7]);
+    } else if (lane == 0) {
+        clocks[stamp_base + 1] = clock64();
+    }
+
+    for (int i = lane + GEMV_WARP; i < K8; i += GEMV_WARP) {
+        uint4 a = __ldg(wv + i);
+        uint4 b = __ldg(iv + i);
+        const __nv_bfloat16* ap = (const __nv_bfloat16*)&a;
+        const __nv_bfloat16* bp = (const __nv_bfloat16*)&b;
+        acc += __bfloat162float(ap[0]) * __bfloat162float(bp[0])
+             + __bfloat162float(ap[1]) * __bfloat162float(bp[1])
+             + __bfloat162float(ap[2]) * __bfloat162float(bp[2])
+             + __bfloat162float(ap[3]) * __bfloat162float(bp[3])
+             + __bfloat162float(ap[4]) * __bfloat162float(bp[4])
+             + __bfloat162float(ap[5]) * __bfloat162float(bp[5])
+             + __bfloat162float(ap[6]) * __bfloat162float(bp[6])
+             + __bfloat162float(ap[7]) * __bfloat162float(bp[7]);
+    }
+
+    // Phase 2: end of inner loop
+    if (lane == 0) clocks[stamp_base + 2] = clock64();
+
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 16);
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 8);
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 4);
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 2);
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, 1);
+
+    // Phase 3: end of reduction
+    if (lane == 0) {
+        clocks[stamp_base + 3] = clock64();
+        output[row] = __float2bfloat16(acc);
+    }
+}
+
+extern "C" void arc_launch_gemv_bf16_clocked(
+    const void* weight, const void* input, void* output,
+    void* clocks_buffer,
+    int M, int K, cudaStream_t stream
+) {
+    dim3 grid((M + GEMV_ROWS - 1) / GEMV_ROWS);
+    gemv_bf16_clocked_kernel<<<grid, GEMV_BLOCK, 0, stream>>>(
+        (const __nv_bfloat16*)weight,
+        (const __nv_bfloat16*)input,
+        (__nv_bfloat16*)output,
+        (unsigned long long*)clocks_buffer,
+        M, K
+    );
+}
+
 extern "C" void arc_launch_gemv_bf16(
     const void* weight, const void* input, void* output,
     int M, int K, int sm_count, cudaStream_t stream

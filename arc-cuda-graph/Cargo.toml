@@ -18,3 +18,11 @@ anyhow.workspace = true
 
 [features]
 cuda = ["dep:cudaforge", "candle-core/cuda"]
+
+# Standalone GEMV bench harness — runs kernel variants on real-sized tensors
+# without loading the model. Lets us iterate kernel parameters in seconds
+# instead of waiting for a Modal redeploy.
+[[bin]]
+name = "gemv_bench"
+path = "src/bin/gemv_bench.rs"
+required-features = ["cuda"]
