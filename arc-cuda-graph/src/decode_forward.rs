@@ -272,14 +272,9 @@ pub unsafe fn decode_forward(
     for layer_idx in 0..cfg.num_layers {
         let lw = &weights.layers[layer_idx];
 
-        // Fused: RMSNorm + QKV GEMV in one kernel (eliminates norm launch + L2 round-trip)
-        arc_launch_rmsnorm_gemv_bf16(
-            h_in as *const _,
-            lw.input_layernorm as *const _,
-            lw.qkv_fused as *const _,
-            buffers.qkv as *mut _,
-            lw.qkv_rows as i32, hs_z as i32, eps, stream,
-        );
+        // RMSNorm + QKV GEMV (separate) — fusion regressed perf due to redundant per-block reduction
+        launch_fused_rmsnorm_residual_bf16(h_in as *const _, std::ptr::null(), lw.input_layernorm as *const _, buffers.normed as *mut _, std::ptr::null_mut(), hs_z as i32, bs as i32, eps, stream);
+        gemv(stream, lw.qkv_fused, buffers.normed, buffers.qkv, lw.qkv_rows, hs_z);
         // Split output via pointer offsets (zero-copy)
         let q_ptr = buffers.qkv;
         let k_ptr = buffers.qkv + (nh * hd * 2) as u64;      // BF16 = 2 bytes
