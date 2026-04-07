@@ -335,15 +335,15 @@ pub unsafe fn decode_forward(
         let k_ptr = buffers.qkv + (nh * hd * 2) as u64;      // BF16 = 2 bytes
         let v_ptr = k_ptr + (nkv * hd * 2) as u64;
 
-        // QK norm (if model uses it)
+        // QK norm (if model uses it) — fused into a single launch
         if let (Some(qn), Some(kn)) = (lw.q_norm, lw.k_norm) {
-            launch_rmsnorm_head_bf16(
+            launch_rmsnorm_qk_pair_bf16(
                 q_ptr as *const _, qn as *const _, q_ptr as *mut _,
-                hd as i32, (bs as usize * nh) as i32, eps, stream,
-            );
-            launch_rmsnorm_head_bf16(
                 k_ptr as *const _, kn as *const _, k_ptr as *mut _,
-                hd as i32, (bs as usize * nkv) as i32, eps, stream,
+                hd as i32,
+                (bs as usize * nh) as i32,
+                (bs as usize * nkv) as i32,
+                eps, stream,
             );
         }
 
@@ -607,6 +607,12 @@ extern "C" {
         input: *const std::ffi::c_void, weight: *const std::ffi::c_void,
         output: *mut std::ffi::c_void,
         head_dim: i32, total_heads: i32, eps: f32, stream: CUstream,
+    );
+    fn launch_rmsnorm_qk_pair_bf16(
+        q_in: *const std::ffi::c_void, q_w: *const std::ffi::c_void, q_out: *mut std::ffi::c_void,
+        k_in: *const std::ffi::c_void, k_w: *const std::ffi::c_void, k_out: *mut std::ffi::c_void,
+        head_dim: i32, n_q_heads: i32, n_k_heads: i32, eps: f32,
+        stream: CUstream,
     );
     fn launch_fused_silu_mul_bf16(
         gate: *const std::ffi::c_void, up: *const std::ffi::c_void,
