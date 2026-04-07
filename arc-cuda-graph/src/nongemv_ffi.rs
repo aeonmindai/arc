@@ -6,6 +6,14 @@
 
 use std::ffi::c_void;
 
+// Force the linker to pull in mistralrs-paged-attn's static lib so the
+// turbo_*_clocked symbols defined in turbo_paged_attention.cu are available
+// to the gemv_bench binary. Without this attribute, cargo's build.rs link
+// directives don't propagate from a dep's static lib to a binary in a
+// different package.
+#[link(name = "mistralrspagedattention", kind = "static")]
+extern "C" {}
+
 extern "C" {
     // arc-cuda-graph kernels
     pub fn launch_fused_rmsnorm_residual_bf16_clocked(
