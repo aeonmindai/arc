@@ -12,37 +12,12 @@
 
 use std::ffi::c_void;
 
-extern "C" {
-    fn arc_launch_gemv_bf16(
-        weight: *const c_void,
-        input: *const c_void,
-        output: *mut c_void,
-        m: i32,
-        k: i32,
-        sm_count: i32,
-        stream: *mut c_void,
-    );
-    fn arc_launch_gemv_bf16_clocked(
-        weight: *const c_void,
-        input: *const c_void,
-        output: *mut c_void,
-        clocks_buffer: *mut c_void,
-        m: i32,
-        k: i32,
-        stream: *mut c_void,
-    );
-    fn arc_launch_gemv_bf16_dual(
-        weight_a: *const c_void,
-        weight_b: *const c_void,
-        input: *const c_void,
-        out_a: *mut c_void,
-        out_b: *mut c_void,
-        m_a: i32,
-        m_b: i32,
-        k: i32,
-        stream: *mut c_void,
-    );
-}
+// Import via the library so cargo links the static GEMV lib for us.
+use arc_cuda_graph::gemv_ffi::{
+    arc_launch_gemv_bf16,
+    arc_launch_gemv_bf16_clocked,
+    arc_launch_gemv_bf16_dual,
+};
 
 extern "C" {
     fn cudaMalloc(ptr: *mut u64, size: usize) -> u32;

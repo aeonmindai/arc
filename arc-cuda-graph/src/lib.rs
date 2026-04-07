@@ -12,6 +12,7 @@ pub mod autonomous;
 pub mod weights;
 pub mod decode_forward;
 pub mod dedicated;
+pub mod gemv_ffi;
 
 #[cfg(feature = "cuda")]
 pub use graph::CudaGraphRunner;
