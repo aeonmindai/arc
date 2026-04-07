@@ -17,6 +17,7 @@ use arc_cuda_graph::gemv_ffi::{
     arc_launch_gemv_bf16,
     arc_launch_gemv_bf16_clocked,
     arc_launch_gemv_bf16_dual,
+    arc_launch_gemv_bf16_dual_silu_mul,
     arc_launch_gemv_orig_8x4,
     arc_launch_gemv_orig_8x6,
     arc_launch_gemv_orig_8x8,
@@ -398,8 +399,37 @@ fn main() {
             println!();
         }
 
-        // Bench dual gate+up across multiple shapes — production path
-        println!("=== dual gate+up GEMV (production path, current 1-row layout) ===");
+        // Bench the new dual+silu_mul fused kernel (production MLP path)
+        {
+            println!("=== dual gate+up + silu+mul fused GEMV (production MLP) ===");
+            let bytes_pair = (25600 * 5120 * 2 * 2) as usize;
+            let w_g = alloc(25600 * 5120 * 2);
+            let w_u = alloc(25600 * 5120 * 2);
+            let inp = alloc(5120 * 2);
+            let out = alloc(25600 * 2);
+            fill_random_bf16(w_g, 25600 * 5120);
+            fill_random_bf16(w_u, 25600 * 5120);
+            fill_random_bf16(inp, 5120);
+            cudaMemset(out as *mut c_void, 0, 25600 * 2);
+            let (p10, med, p90) = time_kernel(
+                || arc_launch_gemv_bf16_dual_silu_mul(
+                    w_g as *const c_void, w_u as *const c_void,
+                    inp as *const c_void,
+                    out as *mut c_void,
+                    25600, 5120, std::ptr::null_mut(),
+                ),
+                10, 100,
+            );
+            let achieved = (bytes_pair as f32 / 1e9) / (med / 1e6);
+            println!(
+                "  dual_silu_mul M=25600 K=5120  bytes=2×262.1MB  μs(p10/med/p90)={:6.1}/{:6.1}/{:6.1}  achieved={:5.0}GB/s  eff={:5.1}%",
+                p10, med, p90, achieved, achieved/8000.0*100.0,
+            );
+            cudaFree(w_g); cudaFree(w_u); cudaFree(inp); cudaFree(out);
+        }
+
+        // Bench dual gate+up across multiple shapes — comparison path
+        println!("=== dual gate+up GEMV (no silu_mul, for comparison) ===");
         let bytes = (25600 * 5120 * 2) as usize;
         let w_a = alloc(bytes);
         let w_b = alloc(bytes);

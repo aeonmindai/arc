@@ -690,15 +690,22 @@ extern "C" void arc_launch_gemv_bf16(
     const void* weight, const void* input, void* output,
     int M, int K, int sm_count, cudaStream_t stream
 ) {
-    // Empirical dispatch from gemv_bench:
-    //   - 1 row/block (32 threads, 16 blocks/SM): wins on every shape where M
-    //     is the dominant dimension (qkv, oproj, gate, up, lm_head). Maximum
-    //     wave fill — every row becomes its own block, no cross-warp reduction.
-    //   - 4 rows/block (128 threads, 8 blocks/SM): wins on shapes where K
-    //     dominates (long inner loop, few rows). Cross-warp redistribution
-    //     fills SMs that 1-row layout would underutilize. Best for down_proj.
+    // Empirical dispatch from gemv_bench v78 (variant sweep):
+    //
+    //   - 4 rows/block (128 threads, 8 blocks/SM): wins on small-M shapes
+    //     (where each row becomes the bottleneck). 4 warps per block consume
+    //     more bandwidth per cycle, which matters when there aren't enough
+    //     rows to keep all SMs busy. Wins for oproj (M=5120, 18% faster than
+    //     1-row), down (K dominates, also small M).
+    //   - 1 row/block (32 threads, 16 blocks/SM): wins on large-M shapes
+    //     (gate, up, lm_head, qkv). Maximum wave fill — every row becomes its
+    //     own block, no cross-warp reduction overhead.
+    //
+    //   Threshold M ~= 8192 derived empirically: for Qwen3-32B this routes
+    //   oproj/down → 4x8 and qkv/gate/up/lm_head → 1x16. Generic across model
+    //   sizes (small projection shapes use 4x8, big ones use 1x16).
     (void)sm_count;
-    if (K >= 4 * M) {
+    if (M < 8192) {
         dim3 grid((M + 3) / 4);
         gemv_bf16_orig_tpl<4, 8><<<grid, 4 * 32, 0, stream>>>(
             (const __nv_bfloat16*)weight,
