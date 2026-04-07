@@ -396,8 +396,8 @@ fn main() {
             println!();
         }
 
-        // Sanity: also dual gate+up combo, the path used in real decode_forward
-        println!("=== dual gate+up GEMV (production path) ===");
+        // Bench dual gate+up across multiple shapes — production path
+        println!("=== dual gate+up GEMV (production path, current 1-row layout) ===");
         let bytes = (25600 * 5120 * 2) as usize;
         let w_a = alloc(bytes);
         let w_b = alloc(bytes);

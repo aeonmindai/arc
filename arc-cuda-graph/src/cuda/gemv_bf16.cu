@@ -173,12 +173,12 @@ void gemv_bf16_w4_kernel(
 // to gate_out, the next M_up rows go to up_out. Saves 1 launch per layer.
 //
 // We can't physically fuse the weights (would duplicate them in memory),
-// so we dispatch via blockIdx: the first ceil(M_a/4) blocks read from
-// weight_a, the rest from weight_b. Uses 4 rows / 128 threads / 8 blocks-per-SM
-// (the empirical optimum found by gemv_bench).
-#define DUAL_ROWS 4
+// so we dispatch via blockIdx: the first M_a blocks read from weight_a, the
+// rest from weight_b. Uses 1 row / 32 threads / 16 blocks-per-SM (the
+// empirical optimum found by gemv_bench for large-M shapes like gate/up).
+#define DUAL_ROWS 1
 #define DUAL_BLOCK (DUAL_ROWS * 32)
-__global__ __launch_bounds__(DUAL_BLOCK, 8)
+__global__ __launch_bounds__(DUAL_BLOCK, 16)
 void gemv_bf16_dual_kernel(
     const __nv_bfloat16* __restrict__ weight_a,
     const __nv_bfloat16* __restrict__ weight_b,
@@ -368,10 +368,10 @@ void gemv_bf16_kernel(
 }
 
 // Same kernel but outputs F32 instead of BF16 (for LM head → sampling needs F32).
-// Uses the same 4-rows-per-block / 128-thread / 8-blocks-per-SM layout as the
-// production gemv_bf16_orig_tpl<4,8> winner.
-#define F32OUT_ROWS 4
-__global__ __launch_bounds__(F32OUT_ROWS * 32, 8)
+// Uses the same 1-row-per-block / 32-thread / 16-blocks-per-SM layout as the
+// production winner for large-M shapes.
+#define F32OUT_ROWS 1
+__global__ __launch_bounds__(F32OUT_ROWS * 32, 16)
 void gemv_bf16_f32out_kernel(
     const __nv_bfloat16* __restrict__ weight,
     const __nv_bfloat16* __restrict__ input,
@@ -539,16 +539,27 @@ extern "C" void arc_launch_gemv_bf16(
     const void* weight, const void* input, void* output,
     int M, int K, int sm_count, cudaStream_t stream
 ) {
-    // Empirical winner across every shape tested by gemv_bench: 4 rows per
-    // block (128 threads), 8 blocks/SM. Smaller blocks → 2× more total blocks
-    // vs the previous 8-row default → much better wave fill on small-M shapes
-    // (oproj, qkv) while staying competitive on large-M shapes (gate, up,
-    // lm_head). Same per-warp inner loop work, just better SM scheduling.
+    // Empirical dispatch from gemv_bench:
+    //   - 1 row/block (32 threads, 16 blocks/SM): wins on every shape where M
+    //     is the dominant dimension (qkv, oproj, gate, up, lm_head). Maximum
+    //     wave fill — every row becomes its own block, no cross-warp reduction.
+    //   - 4 rows/block (128 threads, 8 blocks/SM): wins on shapes where K
+    //     dominates (long inner loop, few rows). Cross-warp redistribution
+    //     fills SMs that 1-row layout would underutilize. Best for down_proj.
     (void)sm_count;
-    dim3 grid((M + 3) / 4);
-    gemv_bf16_orig_tpl<4, 8><<<grid, 4 * 32, 0, stream>>>(
-        (const __nv_bfloat16*)weight,
-        (const __nv_bfloat16*)input,
-        (__nv_bfloat16*)output, M, K
-    );
+    if (K >= 4 * M) {
+        dim3 grid((M + 3) / 4);
+        gemv_bf16_orig_tpl<4, 8><<<grid, 4 * 32, 0, stream>>>(
+            (const __nv_bfloat16*)weight,
+            (const __nv_bfloat16*)input,
+            (__nv_bfloat16*)output, M, K
+        );
+    } else {
+        dim3 grid(M);
+        gemv_bf16_orig_tpl<1, 16><<<grid, 32, 0, stream>>>(
+            (const __nv_bfloat16*)weight,
+            (const __nv_bfloat16*)input,
+            (__nv_bfloat16*)output, M, K
+        );
+    }
 }
