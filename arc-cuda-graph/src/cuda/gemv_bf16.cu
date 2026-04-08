@@ -336,10 +336,7 @@ extern "C" void arc_launch_gemv_bf16_dual(
 // the standalone silu_mul kernel and the gate/up buffer round-trips.
 __device__ __forceinline__ float silu_d(float x) { return x / (1.0f + __expf(-x)); }
 
-// 1 warp/block × 32 blocks/SM = 1024 active threads/SM = 50% occupancy
-// (was 16 blocks/SM = 25%). Helps hide HBM latency on the bandwidth-bound
-// dual GEMV by keeping more in-flight loads.
-__global__ __launch_bounds__(32, 32)
+__global__ __launch_bounds__(32, 16)
 void gemv_bf16_dual_silu_mul_kernel(
     const __nv_bfloat16* __restrict__ weight_gate,
     const __nv_bfloat16* __restrict__ weight_up,
@@ -394,6 +391,70 @@ extern "C" void arc_launch_gemv_bf16_dual_silu_mul(
 ) {
     dim3 grid(M);
     gemv_bf16_dual_silu_mul_kernel<<<grid, 32, 0, stream>>>(
+        (const __nv_bfloat16*)weight_gate, (const __nv_bfloat16*)weight_up,
+        (const __nv_bfloat16*)input,
+        (__nv_bfloat16*)output_mlp_act,
+        M, K
+    );
+}
+
+// Variant: 2 row pairs per block × 2 warps. Each warp handles its own row pair.
+// More work per block → better amortization of block scheduling overhead.
+__global__ __launch_bounds__(64, 16)
+void gemv_bf16_dual_silu_mul_2x16_kernel(
+    const __nv_bfloat16* __restrict__ weight_gate,
+    const __nv_bfloat16* __restrict__ weight_up,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output_mlp_act,
+    int M, int K
+) {
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int m = blockIdx.x * 2 + warp;
+    if (m >= M) return;
+
+    const int K8 = K >> 3;
+    const uint4* wg = (const uint4*)(weight_gate + (int64_t)m * K);
+    const uint4* wu = (const uint4*)(weight_up + (int64_t)m * K);
+    const uint4* iv = (const uint4*)input;
+
+    float gate_acc = 0.0f;
+    float up_acc = 0.0f;
+    for (int i = lane; i < K8; i += 32) {
+        uint4 g = __ldg(wg + i);
+        uint4 u = __ldg(wu + i);
+        uint4 x = __ldg(iv + i);
+        const __nv_bfloat16* gp = (const __nv_bfloat16*)&g;
+        const __nv_bfloat16* up_ = (const __nv_bfloat16*)&u;
+        const __nv_bfloat16* xp = (const __nv_bfloat16*)&x;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            float xv = __bfloat162float(xp[j]);
+            gate_acc += __bfloat162float(gp[j]) * xv;
+            up_acc   += __bfloat162float(up_[j]) * xv;
+        }
+    }
+
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        gate_acc += __shfl_down_sync(0xFFFFFFFF, gate_acc, o);
+        up_acc   += __shfl_down_sync(0xFFFFFFFF, up_acc,   o);
+    }
+
+    if (lane == 0) {
+        float result = silu_d(gate_acc) * up_acc;
+        output_mlp_act[m] = __float2bfloat16(result);
+    }
+}
+
+extern "C" void arc_launch_gemv_bf16_dual_silu_mul_2x16(
+    const void* weight_gate, const void* weight_up,
+    const void* input,
+    void* output_mlp_act,
+    int M, int K, cudaStream_t stream
+) {
+    dim3 grid((M + 1) / 2);
+    gemv_bf16_dual_silu_mul_2x16_kernel<<<grid, 64, 0, stream>>>(
         (const __nv_bfloat16*)weight_gate, (const __nv_bfloat16*)weight_up,
         (const __nv_bfloat16*)input,
         (__nv_bfloat16*)output_mlp_act,

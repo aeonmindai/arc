@@ -18,6 +18,7 @@ use arc_cuda_graph::gemv_ffi::{
     arc_launch_gemv_bf16_clocked,
     arc_launch_gemv_bf16_dual,
     arc_launch_gemv_bf16_dual_silu_mul,
+    arc_launch_gemv_bf16_dual_silu_mul_2x16,
     arc_launch_gemv_orig_8x4,
     arc_launch_gemv_orig_8x6,
     arc_launch_gemv_orig_8x8,
@@ -736,7 +737,22 @@ fn main() {
             );
             let achieved = (bytes_pair as f32 / 1e9) / (med / 1e6);
             println!(
-                "  dual_silu_mul M=25600 K=5120  bytes=2×262.1MB  μs(p10/med/p90)={:6.1}/{:6.1}/{:6.1}  achieved={:5.0}GB/s  eff={:5.1}%",
+                "  dual_silu_mul (1x16)   M=25600 K=5120  μs(p10/med/p90)={:6.1}/{:6.1}/{:6.1}  achieved={:5.0}GB/s  eff={:5.1}%",
+                p10, med, p90, achieved, achieved/8000.0*100.0,
+            );
+
+            let (p10, med, p90) = time_kernel(
+                || arc_launch_gemv_bf16_dual_silu_mul_2x16(
+                    w_g as *const c_void, w_u as *const c_void,
+                    inp as *const c_void,
+                    out as *mut c_void,
+                    25600, 5120, std::ptr::null_mut(),
+                ),
+                10, 100,
+            );
+            let achieved = (bytes_pair as f32 / 1e9) / (med / 1e6);
+            println!(
+                "  dual_silu_mul (2x16)   M=25600 K=5120  μs(p10/med/p90)={:6.1}/{:6.1}/{:6.1}  achieved={:5.0}GB/s  eff={:5.1}%",
                 p10, med, p90, achieved, achieved/8000.0*100.0,
             );
             cudaFree(w_g); cudaFree(w_u); cudaFree(inp); cudaFree(out);
