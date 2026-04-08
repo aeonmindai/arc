@@ -336,7 +336,10 @@ extern "C" void arc_launch_gemv_bf16_dual(
 // the standalone silu_mul kernel and the gate/up buffer round-trips.
 __device__ __forceinline__ float silu_d(float x) { return x / (1.0f + __expf(-x)); }
 
-__global__ __launch_bounds__(32, 16)
+// 1 warp/block × 32 blocks/SM = 1024 active threads/SM = 50% occupancy
+// (was 16 blocks/SM = 25%). Helps hide HBM latency on the bandwidth-bound
+// dual GEMV by keeping more in-flight loads.
+__global__ __launch_bounds__(32, 32)
 void gemv_bf16_dual_silu_mul_kernel(
     const __nv_bfloat16* __restrict__ weight_gate,
     const __nv_bfloat16* __restrict__ weight_up,
