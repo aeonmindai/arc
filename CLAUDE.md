@@ -141,3 +141,32 @@ Avoid returning TODOs.
 8. **Mistral `consolidated.safetensors` stores Q/K weights with interleaved head dimensions**: When loading from Mistral-native `consolidated.safetensors` (as opposed to HF-converted `model.safetensors`), the Q and K projection weights use an interleaved layout within each head: `[x0, x_{d/2}, x1, x_{d/2+1}, ...]` instead of the sequential HF layout `[x0, x1, ..., x_{d/2-1}, x_{d/2}, ...]`. This means you must use `is_gptx=false` (GPT-J/adjacent-pair style) for `RotaryEmbedding`, NOT `is_gptx=true` (GPT-NeoX/half-split style). Using the wrong RoPE style produces completely wrong attention outputs (cosine similarity ~0.02 with reference). To diagnose: compare a Q or K weight tensor between `consolidated.safetensors` and `model.safetensors` — if they differ (cosine ~0.02), apply the un-interleave: `reshape(n_heads, head_dim/2, 2, dim).permute(0,2,1,3)` and verify cosine ~1.0.
 
 9. **Causal Conv1d padding formula**: For causal convolution (left-pad only, no right-pad), the correct left padding is `effective_kernel_size - stride`, NOT `(kernel_size - 1) * dilation` (which is the total padding for non-causal). For example, with kernel_size=3, stride=2, dilation=1: left_pad = 3 - 2 = 1, not 2. Verify against the HF model's `VoxtralRealtimeCausalConv1d` or equivalent source.
+
+
+---
+
+# Aeonmind Working Principles
+
+These rules override default Claude Code behavior. They are non-negotiable.
+
+## 1. Your training data is stale.
+
+Knowledge cutoff is months or years behind current. API versions, library releases, deprecations, default settings, "best practices" — any of it may have changed since training. When working with anything time-sensitive (Stripe API versions, Next.js features, React patterns, Vercel products, AI SDK, library defaults), assume your baseline knowledge is wrong until verified against current docs or installed types. Confidence is not accuracy.
+
+## 2. Verify before crossing an external boundary.
+
+For any code that depends on the shape, behavior, or types of an external API, SDK, database schema, or third-party library — especially at a specific version — verify before writing code. One of:
+
+- Read the type definitions in `node_modules/<pkg>/`
+- Run a probe (`curl`, `SELECT`, console) to see the actual response shape
+- Quote the relevant doc snippet with source URL in your response
+
+Never write code based on what you remember the API looks like. If you skip this step and ship broken code, that's a rule violation, not an honest mistake.
+
+## 3. Surface ideas. Don't ship them silently. Don't stay silent.
+
+When you notice an improvement, refactor, fragile pattern, missing tracking, or better architecture while doing the assigned task, name it. Two lines max:
+
+> Noticed [X]. Worth a separate change?
+
+Don't silently implement it (violates "don't add features beyond what's asked"). Don't stay silent (loses information the user needs to prioritize).
