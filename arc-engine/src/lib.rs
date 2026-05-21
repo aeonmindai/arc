@@ -15,9 +15,13 @@
 
 // Arc-specific modules
 pub mod eagle3;
+pub mod expert_affinity;
+pub mod magicdec;
 pub mod moba;
 pub mod mtp;
 pub mod sage;
+pub mod sarathi;
+pub mod td_moe;
 pub mod turbo_sparse;
 pub mod yoco;
 
