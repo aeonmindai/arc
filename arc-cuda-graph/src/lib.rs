@@ -14,6 +14,10 @@ pub mod decode_forward;
 pub mod dedicated;
 pub mod gemv_ffi;
 pub mod nongemv_ffi;
+/// CPU reference sampler — bit-exact spec for the on-device GPU sampler.
+/// Tier A: this module + tests, runs without CUDA.
+/// Tier B: GPU sampler in autonomous.rs matches this output for the same RNG seed.
+pub mod sampling_cpu;
 
 #[cfg(feature = "cuda")]
 pub use graph::CudaGraphRunner;
