@@ -25,6 +25,9 @@ pub mod td_moe;
 pub mod turbo_sparse;
 pub mod yoco;
 
+#[cfg(test)]
+mod v2_stack_smoke;
+
 // Re-export the core engine
 pub use mistralrs_core as core;
 
