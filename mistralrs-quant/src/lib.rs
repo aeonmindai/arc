@@ -30,8 +30,10 @@ mod hqq;
 mod imatrix;
 mod lora;
 mod mxfp4;
+mod nvfp4;
 mod pending_layer;
 mod pertensor_fp8;
+mod qtip;
 pub mod rotary;
 pub mod safetensors;
 mod scalar_fp8;
@@ -73,8 +75,10 @@ pub use lora::{
     LoraAdapter, LoraConfig, StaticLoraConfig, MULTI_LORA_DELIMITER,
 };
 pub use mxfp4::MXFP4Layer;
+pub use nvfp4::NVFP4Layer;
 pub use pending_layer::PendingIsqLayer;
 pub use pertensor_fp8::PerTensorFP8Linear;
+pub use qtip::QtipLayer;
 pub use unquantized::UnquantLinear;
 pub use utils::flash_attn_sinks_metal;
 pub use utils::flash_attn_sinks_varlen_metal;
@@ -235,6 +239,8 @@ pub enum QuantizedConfig {
         group_size: usize,
     },
     MXFP4 {},
+    NVFP4 {},
+    Qtip {},
 }
 
 // Common fields for all variants
@@ -292,6 +298,12 @@ impl<'de> Deserialize<'de> for QuantizedConfig {
             Some(m) if m == "mxfp4" => {
                 Ok(QuantizedConfig::MXFP4 {  })
             }
+            Some(m) if m == "nvfp4" => {
+                Ok(QuantizedConfig::NVFP4 {  })
+            }
+            Some(m) if m == "qtip" => {
+                Ok(QuantizedConfig::Qtip {  })
+            }
             None => {
                 let bits = raw
                     .bits
@@ -303,7 +315,7 @@ impl<'de> Deserialize<'de> for QuantizedConfig {
             }
             Some(unknown_method) => {
                 Err(serde::de::Error::custom(format!(
-                    "Unknown quantization method: {unknown_method}. Expected one of: gptq, fp8, bitsandbytes, afq, or not specified"
+                    "Unknown quantization method: {unknown_method}. Expected one of: gptq, fp8, bitsandbytes, afq, mxfp4, nvfp4, qtip, or not specified"
                 )))
             },
         }
@@ -318,6 +330,8 @@ impl QuantizedConfig {
             Self::Bitsandbytes { .. } => "bitsandbytes",
             Self::Afq { .. } => "afq",
             Self::MXFP4 { .. } => "mxfp4",
+            Self::NVFP4 { .. } => "nvfp4",
+            Self::Qtip { .. } => "qtip",
         }
     }
 
@@ -333,6 +347,8 @@ impl QuantizedConfig {
             } => "8 bits".to_string(),
             Self::Afq { bits, .. } => format!("{bits} bits"),
             Self::MXFP4 {} => format!("{} bits", mxfp4::N_BITS),
+            Self::NVFP4 {} => format!("{} bits", nvfp4::N_BITS),
+            Self::Qtip {} => format!("{} bits", qtip::N_BITS),
         }
     }
 
@@ -356,6 +372,8 @@ impl QuantizedConfig {
                 bnb_4bit_quant_type: None,
             } => IsqType::Q4K.pack_factor(dtype),
             Self::MXFP4 {} => IsqType::Q4_0.pack_factor(dtype),
+            Self::NVFP4 {} => IsqType::Q4_0.pack_factor(dtype),
+            Self::Qtip {} => IsqType::Q2K.pack_factor(dtype),
         }
     }
 }
@@ -424,6 +442,19 @@ pub enum QuantMethodConfig {
         blocks: Tensor,
         scales: Tensor,
         bias: Option<Tensor>,
+    },
+    NVFP4 {
+        blocks: Tensor,
+        scales: Tensor,
+        tensor_scale: Tensor,
+        bias: Option<Tensor>,
+    },
+    Qtip {
+        blocks: Tensor,
+        row_scales: Tensor,
+        lut: Tensor,
+        bias: Option<Tensor>,
+        in_features: usize,
     },
 }
 
@@ -543,6 +574,8 @@ pub enum IsqType {
     AFQ2,
     F8Q8,
     MXFP4,
+    NVFP4,
+    QtipBitshift2,
 }
 
 /// Target bit width for automatic ISQ quantization.
@@ -635,6 +668,8 @@ impl std::fmt::Display for IsqType {
             Self::AFQ2 => write!(f, "afq2"),
             Self::F8Q8 => write!(f, "f8q8"),
             Self::MXFP4 => write!(f, "mxfp4"),
+            Self::NVFP4 => write!(f, "nvfp4"),
+            Self::QtipBitshift2 => write!(f, "qtip2"),
         }
     }
 }
@@ -677,6 +712,13 @@ impl IsqType {
             // MXFP4: 4 bits per value + 1 byte scale per 32 values
             // For BF16 (2 bytes): (2*32)/(16+1) ≈ 3.76 → 3
             Self::MXFP4 => 3,
+            // NVFP4: 4 bits per value + 1 byte scale per 16 values + tiny per-tensor scale
+            // (2 * 16 bytes) / (8 + 1 bytes) ≈ 3.56 → 3
+            Self::NVFP4 => 3,
+            // QTIP 2-bit: 2 bits per weight + tiny per-row fp32 scale + shared LUT
+            // For BF16 (2 bytes): (2*8)/(2) = 8 → use Q2K's factor as proxy
+            Self::QtipBitshift2 => (dtype.size_in_bytes() * GgmlDType::Q2K.block_size())
+                .div_ceil(GgmlDType::Q2K.type_size()),
         }
     }
 
@@ -690,7 +732,9 @@ impl IsqType {
             | IsqType::AFQ4
             | IsqType::AFQ6
             | IsqType::AFQ8
-            | IsqType::MXFP4 => {
+            | IsqType::MXFP4
+            | IsqType::NVFP4
+            | IsqType::QtipBitshift2 => {
                 // Use 1 because our HQQ quantizes on the GPU
                 Some(1.try_into().unwrap())
             }
@@ -785,6 +829,8 @@ pub enum QuantizedSerdeType {
     Afq = 4,
     F8Q8 = 5,
     Mxfp4 = 6,
+    Nvfp4 = 7,
+    Qtip = 8,
 }
 
 impl TryFrom<usize> for QuantizedSerdeType {
@@ -798,6 +844,8 @@ impl TryFrom<usize> for QuantizedSerdeType {
             4 => Ok(Self::Afq),
             5 => Ok(Self::F8Q8),
             6 => Ok(Self::Mxfp4),
+            7 => Ok(Self::Nvfp4),
+            8 => Ok(Self::Qtip),
             other => candle_core::bail!("QuantizedSerdeType {other} is invalid."),
         }
     }
@@ -1035,6 +1083,12 @@ pub fn linear_no_bias(
             QuantizedConfig::MXFP4 {} => {
                 MXFP4Layer::linear_b(in_dim, out_dim, quant_conf, false, vb)?
             }
+            QuantizedConfig::NVFP4 {} => {
+                NVFP4Layer::linear_b(in_dim, out_dim, quant_conf, false, vb)?
+            }
+            QuantizedConfig::Qtip {} => {
+                QtipLayer::linear_b(in_dim, out_dim, quant_conf, false, vb)?
+            }
         }
     } else {
         // Handle the case where the layer is dummy (no tensors)
@@ -1099,6 +1153,12 @@ pub fn linear(
             }
             QuantizedConfig::MXFP4 {} => {
                 MXFP4Layer::linear_b(in_dim, out_dim, quant_conf, true, vb)?
+            }
+            QuantizedConfig::NVFP4 {} => {
+                NVFP4Layer::linear_b(in_dim, out_dim, quant_conf, true, vb)?
+            }
+            QuantizedConfig::Qtip {} => {
+                QtipLayer::linear_b(in_dim, out_dim, quant_conf, true, vb)?
             }
         }
     } else {

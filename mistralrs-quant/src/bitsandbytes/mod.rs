@@ -214,7 +214,9 @@ impl QuantMethod for BnbLinear {
             | QuantMethodConfig::BlockwiseFP8 { .. }
             | QuantMethodConfig::PerTensorFP8 { .. }
             | QuantMethodConfig::Afq { .. }
-            | QuantMethodConfig::MXFP4 { .. } => unreachable!(),
+            | QuantMethodConfig::MXFP4 { .. }
+            | QuantMethodConfig::NVFP4 { .. }
+            | QuantMethodConfig::Qtip { .. } => unreachable!(),
             QuantMethodConfig::Bnb {
                 weight,
                 bias,

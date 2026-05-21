@@ -885,7 +885,9 @@ impl QuantMethod for HqqLayer {
             | QuantMethodConfig::BlockwiseFP8 { .. }
             | QuantMethodConfig::PerTensorFP8 { .. }
             | QuantMethodConfig::Afq { .. }
-            | QuantMethodConfig::MXFP4 { .. } => {
+            | QuantMethodConfig::MXFP4 { .. }
+            | QuantMethodConfig::NVFP4 { .. }
+            | QuantMethodConfig::Qtip { .. } => {
                 unreachable!()
             }
             QuantMethodConfig::Hqq {

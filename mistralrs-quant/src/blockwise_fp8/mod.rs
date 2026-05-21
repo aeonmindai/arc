@@ -44,7 +44,9 @@ impl QuantMethod for BlockwiseFP8Linear {
             | QuantMethodConfig::FP8 { .. }
             | QuantMethodConfig::PerTensorFP8 { .. }
             | QuantMethodConfig::Afq { .. }
-            | QuantMethodConfig::MXFP4 { .. } => unreachable!(),
+            | QuantMethodConfig::MXFP4 { .. }
+            | QuantMethodConfig::NVFP4 { .. }
+            | QuantMethodConfig::Qtip { .. } => unreachable!(),
             QuantMethodConfig::BlockwiseFP8 {
                 weight,
                 weight_scale_inv,
@@ -361,6 +363,24 @@ impl QuantMethod for BlockwiseFP8Linear {
                     .map(|b| b.to_device(&device))
                     .transpose()?;
                 crate::MXFP4Layer::quantize(&w, b, &device)
+            }
+            Some(IsqType::NVFP4) => {
+                let _acquired_quantize_guard = guard.acquire(&device);
+                if imatrix_weight.is_some() {
+                    candle_core::bail!("NVFP4 does not support imatrix.");
+                }
+
+                n_quantized.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let w = weight.to_device(&device)?;
+                let b = self
+                    .bias
+                    .as_ref()
+                    .map(|b| b.to_device(&device))
+                    .transpose()?;
+                crate::NVFP4Layer::quantize(&w, b, &device)
+            }
+            Some(IsqType::QtipBitshift2) => {
+                candle_core::bail!("QTIP ISQ from unquantized layer not yet supported; use a QTIP-quantized checkpoint instead.")
             }
             None => {
                 let _acquired_quantize_guard = guard.acquire(&device);

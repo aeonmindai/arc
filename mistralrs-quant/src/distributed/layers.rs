@@ -12,8 +12,8 @@ use crate::{
     should_apply_immediate_isq,
     utils::isq::{apply_immediate_isq, apply_immediate_isq_always},
     AfqLayer, BnbLinear, DistributedKind, DummyLayer, F8Q8Linear, FP8Linear, GgufMatMul, HqqLayer,
-    MXFP4Layer, QuantMethod, QuantMethodConfig, QuantizeOntoGuard, QuantizedConfig, QuantizedSerde,
-    QuantizedSerdeType, Shard, ShardedVarBuilder, UnquantLinear,
+    MXFP4Layer, NVFP4Layer, QtipLayer, QuantMethod, QuantMethodConfig, QuantizeOntoGuard, QuantizedConfig,
+    QuantizedSerde, QuantizedSerdeType, Shard, ShardedVarBuilder, UnquantLinear,
 };
 
 use super::{Comm, SumAllReduce};
@@ -105,6 +105,12 @@ impl RowParallelLayer {
                 }
                 QuantizedConfig::MXFP4 {} => {
                     MXFP4Layer::linear_b(in_dim, out_dim, quant_conf, bias, vb.clone())?
+                }
+                QuantizedConfig::NVFP4 {} => {
+                    NVFP4Layer::linear_b(in_dim, out_dim, quant_conf, bias, vb.clone())?
+                }
+                QuantizedConfig::Qtip {} => {
+                    QtipLayer::linear_b(in_dim, out_dim, quant_conf, bias, vb.clone())?
                 }
             }
         } else {
@@ -318,6 +324,8 @@ impl QuantizedSerde for RowParallelLayer {
             QuantizedSerdeType::Afq => AfqLayer::deserialize_ext_bias(data, device, guard)?,
             QuantizedSerdeType::F8Q8 => F8Q8Linear::deserialize_ext_bias(data, device, guard)?,
             QuantizedSerdeType::Mxfp4 => MXFP4Layer::deserialize_ext_bias(data, device, guard)?,
+            QuantizedSerdeType::Nvfp4 => NVFP4Layer::deserialize_ext_bias(data, device, guard)?,
+            QuantizedSerdeType::Qtip => QtipLayer::deserialize_ext_bias(data, device, guard)?,
         };
         Ok(Arc::new(Self {
             weight,
@@ -402,6 +410,12 @@ impl ColumnParallelLayer {
                 }
                 QuantizedConfig::MXFP4 {} => {
                     MXFP4Layer::linear_b(in_dim, out_dim, quant_conf, bias, vb.clone())?
+                }
+                QuantizedConfig::NVFP4 {} => {
+                    NVFP4Layer::linear_b(in_dim, out_dim, quant_conf, bias, vb.clone())?
+                }
+                QuantizedConfig::Qtip {} => {
+                    QtipLayer::linear_b(in_dim, out_dim, quant_conf, bias, vb.clone())?
                 }
             }
         } else {
@@ -646,6 +660,8 @@ impl QuantizedSerde for ColumnParallelLayer {
             QuantizedSerdeType::Afq => AfqLayer::deserialize_ext_bias(data, device, guard)?,
             QuantizedSerdeType::F8Q8 => F8Q8Linear::deserialize_ext_bias(data, device, guard)?,
             QuantizedSerdeType::Mxfp4 => MXFP4Layer::deserialize_ext_bias(data, device, guard)?,
+            QuantizedSerdeType::Nvfp4 => NVFP4Layer::deserialize_ext_bias(data, device, guard)?,
+            QuantizedSerdeType::Qtip => QtipLayer::deserialize_ext_bias(data, device, guard)?,
         };
         Ok(Arc::new(Self { weight, bias }))
     }
@@ -719,6 +735,12 @@ impl ReplicatedLayer {
                 }
                 QuantizedConfig::MXFP4 {} => {
                     MXFP4Layer::linear_b(in_dim, out_dim, quant_conf, bias, vb.clone())?
+                }
+                QuantizedConfig::NVFP4 {} => {
+                    NVFP4Layer::linear_b(in_dim, out_dim, quant_conf, bias, vb.clone())?
+                }
+                QuantizedConfig::Qtip {} => {
+                    QtipLayer::linear_b(in_dim, out_dim, quant_conf, bias, vb.clone())?
                 }
             }
         } else {
@@ -802,6 +824,12 @@ impl ReplicatedLayer {
                 }
                 QuantizedConfig::MXFP4 {} => {
                     MXFP4Layer::linear_b(in_dim, out_dim, quant_conf, bias, vb.clone())?
+                }
+                QuantizedConfig::NVFP4 {} => {
+                    NVFP4Layer::linear_b(in_dim, out_dim, quant_conf, bias, vb.clone())?
+                }
+                QuantizedConfig::Qtip {} => {
+                    QtipLayer::linear_b(in_dim, out_dim, quant_conf, bias, vb.clone())?
                 }
             }
         } else {
@@ -935,6 +963,8 @@ impl QuantizedSerde for ReplicatedLayer {
             QuantizedSerdeType::Afq => AfqLayer::deserialize(data, device, comm, guard)?,
             QuantizedSerdeType::F8Q8 => F8Q8Linear::deserialize(data, device, comm, guard)?,
             QuantizedSerdeType::Mxfp4 => MXFP4Layer::deserialize(data, device, comm, guard)?,
+            QuantizedSerdeType::Nvfp4 => NVFP4Layer::deserialize(data, device, comm, guard)?,
+            QuantizedSerdeType::Qtip => QtipLayer::deserialize(data, device, comm, guard)?,
         };
         Ok(Arc::new(Self(deserialized)))
     }
@@ -1291,7 +1321,7 @@ impl PackedExperts {
                     (vec![gate_proj], vec![up_proj], vec![down_proj])
                 }
                 _ => candle_core::bail!(
-                    "PackedExperts with quantization config only allows AFQ, FP8, or MXFP4 quantization"
+                    "PackedExperts with quantization config only allows AFQ, FP8, or MXFP4 quantization (NVFP4 packed-expert path is pending)"
                 ),
             }
         } else if !vb.contains_tensor("gate_up_proj") {
