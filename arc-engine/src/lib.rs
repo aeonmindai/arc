@@ -13,6 +13,14 @@
 //! All upstream mistral.rs features are available: PagedAttention, FlashAttention,
 //! speculative decoding, continuous batching, GGUF/GPTQ/AWQ/ISQ, LoRA, and more.
 
+// Arc-specific modules
+pub mod eagle3;
+pub mod moba;
+pub mod mtp;
+pub mod sage;
+pub mod turbo_sparse;
+pub mod yoco;
+
 // Re-export the core engine
 pub use mistralrs_core as core;
 

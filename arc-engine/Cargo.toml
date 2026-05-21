@@ -15,6 +15,7 @@ mistralrs-core = { path = "../mistralrs-core" }
 mistralrs-quant = { path = "../mistralrs-quant" }
 arc-turbo = { path = "../arc-turbo" }
 candle-core.workspace = true
+candle-nn.workspace = true
 tracing.workspace = true
 
 [features]

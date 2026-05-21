@@ -56,7 +56,7 @@ use indicatif::{MultiProgress, ParallelProgressIterator, ProgressBar, ProgressSt
 use itertools::Itertools;
 use mistralrs_quant::{
     AfqLayer, CollectedImatrixData, ColumnParallelLayer, DistributedKind, F8Q8Linear, FP8Linear,
-    GgufMatMul, HqqLayer, IsqBits, IsqType, MXFP4Layer, QuantMethod, QuantizeOntoGuard,
+    GgufMatMul, HqqLayer, IsqBits, IsqType, MXFP4Layer, NVFP4Layer, QtipLayer, QuantMethod, QuantizeOntoGuard,
     QuantizedSerde, QuantizedSerdeType, ReplicatedLayer, RowParallelLayer, UnquantLinear,
 };
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
@@ -1102,6 +1102,18 @@ pub trait IsqModel {
                                         &comm,
                                         guard.clone(),
                                     )?,
+                                    QuantizedSerdeType::Nvfp4 => NVFP4Layer::deserialize(
+                                        Cow::from(artifact),
+                                        &devices[i],
+                                        &comm,
+                                        guard.clone(),
+                                    )?,
+                                    QuantizedSerdeType::Qtip => QtipLayer::deserialize(
+                                        Cow::from(artifact),
+                                        &devices[i],
+                                        &comm,
+                                        guard.clone(),
+                                    )?,
                                 }
                             }
                         };
@@ -1182,6 +1194,18 @@ pub trait IsqModel {
                                         guard.clone(),
                                     )?,
                                     QuantizedSerdeType::Mxfp4 => MXFP4Layer::deserialize(
+                                        Cow::from(artifact),
+                                        &devices[i],
+                                        &comm,
+                                        guard.clone(),
+                                    )?,
+                                    QuantizedSerdeType::Nvfp4 => NVFP4Layer::deserialize(
+                                        Cow::from(artifact),
+                                        &devices[i],
+                                        &comm,
+                                        guard.clone(),
+                                    )?,
+                                    QuantizedSerdeType::Qtip => QtipLayer::deserialize(
                                         Cow::from(artifact),
                                         &devices[i],
                                         &comm,

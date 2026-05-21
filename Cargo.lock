@@ -214,6 +214,7 @@ version = "0.7.1-alpha.1"
 dependencies = [
  "arc-turbo",
  "candle-core",
+ "candle-nn",
  "mistralrs-core",
  "mistralrs-quant",
  "tracing",

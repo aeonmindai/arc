@@ -2585,6 +2585,13 @@ pub enum Activation {
     #[serde(alias = "gelu_pytorch_tanh")]
     GeluPytorchTanh,
     QuickGelu,
+    /// dReLU activation from Turbo Sparse (Song et al., SJTU-IPADS 2024).
+    /// `dReLU(x) = ReLU(gate) * ReLU(up)` where the input tensor is `[..., 2H]`
+    /// concatenated as `[gate, up]` along the last dim. Drop-in for SwiGLU on
+    /// MoE FFN paths to push activation sparsity from ~75% to ~95%, with quality
+    /// matching or exceeding SwiGLU after fine-tune.
+    /// See: `research/01_weight_compression/moe_lrd_low_rank_decomposition_2024.pdf`
+    DRelu,
 }
 
 impl Module for Activation {
@@ -2606,6 +2613,19 @@ impl Module for Activation {
             &Self::LeakyRelu(negative_slope) => candle_nn::ops::leaky_relu(xs, negative_slope),
             Self::GeluPytorchTanh => xs.gelu(),
             Self::QuickGelu => xs * candle_nn::ops::sigmoid(&(xs * 1.702f64)?),
+            Self::DRelu => {
+                // Split last dim into (gate, up); ReLU each; multiply.
+                let last = xs.dim(candle_core::D::Minus1)?;
+                if last % 2 != 0 {
+                    candle_core::bail!(
+                        "DRelu requires last dim to be even (concat of gate||up), got {last}"
+                    );
+                }
+                let half = last / 2;
+                let gate = xs.narrow(candle_core::D::Minus1, 0, half)?;
+                let up = xs.narrow(candle_core::D::Minus1, half, half)?;
+                gate.relu()?.mul(&up.relu()?)
+            }
         }
     }
 }
@@ -2630,6 +2650,7 @@ impl TryInto<candle_nn::Activation> for Activation {
             Self::LeakyRelu(x) => Ok(candle_nn::Activation::LeakyRelu(x)),
             Self::GeluPytorchTanh => Ok(candle_nn::Activation::GeluPytorchTanh),
             Self::QuickGelu => candle_core::bail!("No mapping to candle_nn for QuickGelu"),
+            Self::DRelu => candle_core::bail!("No mapping to candle_nn for DRelu (Arc-specific)"),
         }
     }
 }
