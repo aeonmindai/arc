@@ -515,10 +515,16 @@ struct Attention {
     /// Shape: `[n_heads]` (broadcast to `[1, n_heads, 1, 1]` at use). Added to
     /// attention logits for the sink token. `None` if the checkpoint does not
     /// publish this tensor (e.g. synthetic test weights, V3 fallback).
+    /// Also mirrored into `SdpaParams.sinks` (broadcast-shaped) for the SDPA
+    /// backend to consume. This raw copy is retained for ISQ / debug paths.
+    #[allow(dead_code)]
     attn_sink: Option<Tensor>,
     /// V4 Lightning Indexer (RUN-167 integration). Only constructed on CSA
     /// layers (`compress_ratio == Csa`). HCA layers do not have an indexer.
     /// Wired in via Agent 4's `dsv4_indexer.rs` module when present.
+    /// Currently loaded but unused in forward (waiting on Agent 11's
+    /// `dsv4_attention_kernels` module to consume it via csa_attention).
+    #[allow(dead_code)]
     indexer: Option<super::dsv4_indexer::V4Indexer>,
 }
 
@@ -816,6 +822,10 @@ impl Attention {
     /// V4-specific KV compression — apply this layer's K/V compressors to a
     /// pair of full-sequence tensors. Standard layers pass through.
     /// Input shapes: `[B, H, T, head_dim]`. Output: `[B, H, T/ratio, head_dim]`.
+    ///
+    /// This is the LEGACY tensor-level API used by unit tests. Real V4
+    /// inference calls `compress_step_from_xs` which uses the learned
+    /// `wkv_gate(xs)` path per SGLang `compressor.py:366-392`.
     pub fn compress_kv(&self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
         match (self.compress_ratio, &self.compressor_k, &self.compressor_v) {
             (CompressRatio::Standard, _, _) => Ok((k.clone(), v.clone())),
@@ -828,6 +838,77 @@ impl Attention {
                 "V4 layer dispatched to {:?} but compressors are absent",
                 ratio
             ),
+        }
+    }
+
+    /// V4 compress-step — per the SGLang `Compressor` forward path
+    /// (compressor.py:366-392). Operates on the layer input `xs` (not on K/V)
+    /// to produce a compressed K and V representation suitable for caching.
+    ///
+    /// Inputs:
+    ///   - `xs`: `[B, T, hidden]` — layer input.
+    ///   - `k_raw`, `v_raw`: `[B, H, T, head_dim]` — uncompressed K/V for this
+    ///     step. Used only when the loaded compressor is the synthetic
+    ///     `uniform` fallback (no `wkv_gate`).
+    ///
+    /// Output: `(k_c, v_c)` of shape `[B, H, T/ratio, head_dim]`.
+    ///
+    /// Tier A: V4 has a single learned compressor per layer (shared by K/V).
+    /// We project from `xs` once via `forward_from_xs`, get `[B, T/ratio,
+    /// head_dim]`, then broadcast across the head dim to match the [B, H,
+    /// T/ratio, head_dim] layout the downstream SDPA expects. In production
+    /// (Phase 2 fused kernel), separate K and V projections happen inside the
+    /// kernel; here we mirror the same compressed-shape contract.
+    fn compress_step_from_xs(
+        &self,
+        xs: &Tensor,
+        k_raw: &Tensor,
+        v_raw: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let Some(comp) = self.compressor_k.as_ref() else {
+            candle_core::bail!(
+                "V4 compress_step_from_xs called on layer without a compressor"
+            );
+        };
+
+        // Detect uniform fallback by inspecting `hidden_size` (uniform sets it
+        // to 1). Real compressors have hidden_size == cfg.hidden_size, so
+        // `forward_from_xs` works directly.
+        let use_real_path = comp.hidden_size > 1;
+
+        let (b, _, t, _) = k_raw.dims4()?;
+        let ratio = self.compress_ratio.ratio();
+        let t_c = t / ratio;
+
+        if use_real_path {
+            // Real V4 path: project from xs via wkv_gate. Produces
+            // [B, T_c, head_dim]. Broadcast to [B, H, T_c, head_dim] —
+            // since V4 uses MQA (n_kv_heads == 1, see deepseek_v4.py:214),
+            // the single compressed K is the same for all attention heads.
+            let k_compressed = comp.forward_from_xs(xs)?; // [B, T_c, head_dim]
+            let n_heads = k_raw.dim(1)?;
+            let k_c = k_compressed
+                .unsqueeze(1)? // [B, 1, T_c, head_dim]
+                .expand((b, n_heads, t_c, comp.head_dim))?
+                .contiguous()?;
+            // V4 uses ONE compressor for both K and V (MQA, n_kv_heads=1).
+            // We reuse the same projection for V; downstream attention treats
+            // them identically. This matches the SGLang fused kernel which
+            // writes a single compressed entry per (token-block, head).
+            let v_c = k_c.clone();
+            Ok((k_c, v_c))
+        } else {
+            // Uniform fallback: average raw K/V over `ratio` consecutive tokens.
+            // Matches the legacy `V4Compressor::uniform` test semantics.
+            let k_c = comp.forward(k_raw)?;
+            let v_c = self
+                .compressor_v
+                .as_ref()
+                .ok_or_else(|| candle_core::Error::Msg(
+                    "V4 uniform fallback requires compressor_v".into(),
+                ))?
+                .forward(v_raw)?;
+            Ok((k_c, v_c))
         }
     }
 
@@ -880,6 +961,28 @@ impl Attention {
             q_nope.device(),
             &metadata,
         );
+
+        // V4 PagedAttention compress dispatch note (RUN-167, Task D):
+        //
+        // SGLang's V4 design uses TWO separate physical caches per compress
+        // layer:
+        //   1. Full kv cache (used by SWA branch + MLA over ckv)
+        //   2. Compressed kv_score_buffer (used by the compress-branch main
+        //      attention)
+        //
+        // The MLA decode path and PagedAttention path in this implementation
+        // both operate on cache #1 (full ckv). They are unchanged on compress
+        // layers — the compress-branch dispatch happens in the plain-SDPA
+        // path below (where we have direct control over the cache contents
+        // and can use the dual-branch blend per V4 paper §3.2).
+        //
+        // Tier B work (rental + Phase 2 kernels): plumb a second
+        // PagedAttention slot for the compressed buffer so the MLA-decode and
+        // PA paths can also dispatch through the compress branch, with cache
+        // block sizes tuned for T/ratio entries per compress layer. For now,
+        // PA on compress layers uses the same full-ckv cache as standard
+        // layers — functional but allocates more memory than the optimal V4
+        // layout.
 
         let mut attn_out = if use_mla_decode {
             mla_decode_forward(
@@ -999,17 +1102,25 @@ impl Attention {
                         }
                     },
                     None => {
-                        (k, v) = kv_cache.append(&k, &v)?;
-
-                        // V4 hybrid attention dispatch (plain SDPA path only).
-                        // For compress layers (Csa/Hca), V4 combines two branches:
-                        //   1. Main:  attention over compressed K/V (per CompressRatio)
-                        //   2. Local: sliding-window attention over original K/V
-                        // Then blends 0.5/0.5 (V4 paper §3.2 default; rental can
-                        // replace with the learned mixing weight).
+                        // V4 cache-before-compress fix (Task A.1, RUN-164):
+                        // For COMPRESS LAYERS (Csa/Hca):
+                        //   - Compress (k, v) BEFORE appending to the cache.
+                        //   - This means the cache stores T/ratio compressed
+                        //     entries per layer, not full K/V.
+                        //   - The SWA branch then uses the CURRENT-STEP raw
+                        //     (k, v) only (Tier A simplification; full V4
+                        //     SWA across cache history requires a second
+                        //     auxiliary cache, deferred to Tier B).
                         //
-                        // Standard layers run the original V3 MLA path unchanged.
+                        // For STANDARD LAYERS: cache full K/V as before.
+                        //
+                        // Cite SGLang `deepseek_v4.py:485-495` (the compressor
+                        // writes to a SEPARATE `kv_score_buffer` distinct from
+                        // the main K/V cache). Our single-cache design folds
+                        // these two physical buffers into one logical buffer
+                        // whose layout depends on `compress_ratio`.
                         if self.compress_ratio == CompressRatio::Standard {
+                            (k, v) = kv_cache.append(&k, &v)?;
                             Sdpa.run_attention(
                                 &q,
                                 &k,
@@ -1019,37 +1130,82 @@ impl Attention {
                                 &self.sdpa_params,
                             )?
                         } else {
-                            let t_k = k.dim(2)?;
+                            // Compress layer. Compute the compressed K/V for
+                            // the CURRENT step (only when seq_len is divisible
+                            // by ratio — typically prefill). On decode (T=1),
+                            // we cannot produce a new compressed entry, so we
+                            // skip the cache update and read the cache as-is.
                             let ratio = self.compress_ratio.ratio();
-
-                            // Compute compressed-branch output (only if T is divisible)
-                            let main_out = if t_k % ratio == 0 && t_k >= ratio {
-                                match self.compress_kv(&k, &v) {
-                                    Ok((k_c, v_c)) => {
-                                        // Compressed-branch SDPA (no mask — sized for full T).
-                                        let params_c = SdpaParams {
-                                            n_kv_groups: self.sdpa_params.n_kv_groups,
-                                            softcap: self.sdpa_params.softcap,
-                                            softmax_scale: self.sdpa_params.softmax_scale,
-                                            sliding_window: None,
-                                            sinks: None,
-                                        };
-                                        Some(Sdpa.run_attention(
-                                            &q,
-                                            &k_c,
-                                            &v_c,
-                                            None,
-                                            Some(flash_params),
-                                            &params_c,
-                                        )?)
+                            let raw_k_step = k.clone();
+                            let raw_v_step = v.clone();
+                            let new_compressed = if seq_len % ratio == 0 && seq_len >= ratio {
+                                match self.compress_step_from_xs(xs, &k, &v) {
+                                    Ok(out) => Some(out),
+                                    Err(e) => {
+                                        tracing::trace!(
+                                            "V4 compress layer {}: compress_step_from_xs failed \
+                                             ({e}); skipping cache update",
+                                            self.compress_ratio.ratio()
+                                        );
+                                        None
                                     }
-                                    Err(_) => None,
                                 }
                             } else {
                                 None
                             };
+                            if let Some((k_c, v_c)) = new_compressed {
+                                // Append compressed entries to the cache.
+                                (k, v) = kv_cache.append(&k_c, &v_c)?;
+                            } else {
+                                // No new entries this step — pull current
+                                // cache contents (may be empty on first decode).
+                                let cached_k = kv_cache.k()?;
+                                let cached_v = kv_cache.v()?;
+                                if let (Some(ck), Some(cv)) = (cached_k, cached_v) {
+                                    k = ck;
+                                    v = cv;
+                                } else {
+                                    // First call with no divisible compression
+                                    // happened — fall back to using raw K/V
+                                    // (degraded but functional).
+                                    k = raw_k_step.clone();
+                                    v = raw_v_step.clone();
+                                }
+                            }
 
-                            // Sliding-window local branch over original K/V
+                            // Compressed-branch attention.
+                            // Tier A: dense SDPA over compressed K/V.
+                            // Once Agent 11 (dsv4_attention_kernels) lands, this
+                            // dispatches to csa_attention / hca_attention using
+                            // the indexer's top-k indices when present.
+                            let params_c = SdpaParams {
+                                n_kv_groups: self.sdpa_params.n_kv_groups,
+                                softcap: self.sdpa_params.softcap,
+                                softmax_scale: self.sdpa_params.softmax_scale,
+                                sliding_window: None,
+                                sinks: self.sdpa_params.sinks.clone(),
+                            };
+                            // TODO: when dsv4_attention_kernels module lands,
+                            // gate on `self.compress_ratio` + `self.indexer`:
+                            //   - Csa + Some(indexer): csa_attention(q, k, v, idx)
+                            //   - Hca:                 hca_attention(q, k, v)
+                            // For now, dense SDPA over compressed K/V.
+                            let main_out = Sdpa.run_attention(
+                                &q,
+                                &k,
+                                &v,
+                                None, // compressed K is shorter; no causal mask matches
+                                Some(flash_params),
+                                &params_c,
+                            )?;
+
+                            // SWA local branch.
+                            // Tier A: operates over the CURRENT STEP's raw K/V
+                            // only (no cross-step history). Real V4 SWA over
+                            // the full uncompressed history requires a second
+                            // physical cache, which is deferred to Tier B.
+                            // See task description (D) and SGLang
+                            // `deepseek_v4.py:486-490` (multi-stream cache write).
                             let params_swa = SdpaParams {
                                 n_kv_groups: self.sdpa_params.n_kv_groups,
                                 softcap: self.sdpa_params.softcap,
@@ -1059,19 +1215,18 @@ impl Attention {
                             };
                             let swa_out = Sdpa.run_attention(
                                 &q,
-                                &k,
-                                &v,
+                                &raw_k_step,
+                                &raw_v_step,
                                 attention_mask,
                                 Some(flash_params),
                                 &params_swa,
                             )?;
 
                             // Blend (0.5 main + 0.5 SWA per V4 paper default).
-                            // Fall through to SWA-only if compression failed.
-                            match main_out {
-                                Some(main) => ((&main * 0.5)? + (&swa_out * 0.5)?)?,
-                                None => swa_out,
-                            }
+                            // Real V4 uses a per-head learned blend tensor;
+                            // when Agent 11's hybrid_attention lands, this is
+                            // replaced with `hybrid_attention(main_out, swa_out, blend)`.
+                            ((&main_out * 0.5)? + (&swa_out * 0.5)?)?
                         }
                     }
                 }
@@ -1342,6 +1497,12 @@ struct DecoderLayer {
     post_attention_layernorm: RmsNorm,
     attn: Attention,
     moe_or_mlp: MoeOrMlp,
+    /// V4 mHC (Manifold-Constrained Hyper-Connections) parameters. Loaded if
+    /// the checkpoint publishes `hc_attn_fn`, `hc_attn_base`, `hc_attn_scale`,
+    /// `hc_ffn_fn`, `hc_ffn_base`, `hc_ffn_scale`. Replaces the standard
+    /// residual with a learned per-layer mixing per SGLang
+    /// `deepseek_v4.py:696-700`.
+    mhc_params: Option<super::dsv4_mhc::V4MHCLayerParams>,
 }
 
 impl DecoderLayer {
@@ -1414,11 +1575,18 @@ impl DecoderLayer {
             )?)
         };
 
+        // V4 mHC (Agent 5 integration, RUN-168). Loaded if checkpoint
+        // publishes the six hc_* tensors per layer. Probed against the
+        // layer-root vb (mapped to device).
+        let mhc_vb = mapper.set_device(layer_idx, vb.clone(), false);
+        let mhc_params = super::dsv4_mhc::V4MHCLayerParams::try_load(cfg, &mhc_vb, layer_idx);
+
         Ok(Self {
             input_layernorm,
             post_attention_layernorm,
             attn,
             moe_or_mlp,
+            mhc_params,
         })
     }
 
@@ -1432,21 +1600,32 @@ impl DecoderLayer {
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let residual = xs;
-        let xs = self.input_layernorm.forward(xs)?;
-        let xs = self.attn.forward(
-            &xs,
+        let xs_norm = self.input_layernorm.forward(xs)?;
+        let attn_out = self.attn.forward(
+            &xs_norm,
             attention_mask,
             seqlen_offsets,
             kv_cache,
             metadata,
             flash_params,
         )?;
-        let xs = (xs + residual)?;
-        let residual = &xs;
-        let xs = self
+        // V4 mHC mix_attn replaces the standard residual when params loaded
+        // (RUN-168, SGLang `deepseek_v4.py:696-700`).
+        let xs = if let Some(mhc) = &self.mhc_params {
+            mhc.mix_attn(residual, &attn_out)?
+        } else {
+            (attn_out + residual)?
+        };
+        let residual2 = &xs;
+        let ffn_out = self
             .moe_or_mlp
             .forward(&xs.apply(&self.post_attention_layernorm)?)?;
-        residual + xs
+        // V4 mHC mix_ffn similarly replaces the FFN residual when loaded.
+        if let Some(mhc) = &self.mhc_params {
+            mhc.mix_ffn(residual2, &ffn_out)
+        } else {
+            residual2 + ffn_out
+        }
     }
 }
 
@@ -1478,10 +1657,10 @@ pub struct DeepSeekV4 {
     /// V4 MTP head (loaded if `mtp.layers.0.*` tensors present in checkpoint).
     /// `None` for non-MTP checkpoints; `Some` enables MTP-aware decoding.
     mtp_head: Option<MtpHead>,
-    /// V4 mHC global head parameters (loaded if present in checkpoint).
-    mhc_head_fn: Option<Tensor>,
-    mhc_head_base: Option<Tensor>,
-    mhc_head_scale: Option<Tensor>,
+    /// V4 mHC global head (loaded if checkpoint publishes the head-level
+    /// `hc_head_fn`, `hc_head_base`, `hc_head_scale`). Per Agent 5's module;
+    /// `forward` is invoked between the final RMSNorm and the lm_head.
+    mhc_head: Option<super::dsv4_mhc::V4MHCHead>,
 }
 
 impl DeepSeekV4 {
@@ -1498,9 +1677,9 @@ impl DeepSeekV4 {
     }
 
     /// Returns true if mHC (Manifold-Constrained Hyper-Connections) global
-    /// parameters were loaded.
+    /// head parameters were loaded.
     pub fn has_mhc(&self) -> bool {
-        self.mhc_head_fn.is_some()
+        self.mhc_head.is_some()
     }
 }
 
@@ -1557,25 +1736,70 @@ impl DeepSeekV4 {
             mapper.set_nm_device(vb_m.pp("norm"), false),
         )?;
 
-        let mut ropes = HashMap::new();
-        let rope_cfg = DeepSeekV2RopeConfig {
+        // V4 dual RoPE (RUN-165, SGLang `deepseek_v4.py:220`):
+        //   - Standard layers (compress_ratio == 0) use `cfg.rope_theta`
+        //   - Compress layers (compress_ratio in {4, 128}) use `cfg.compress_rope_theta`
+        //     (default 40000.0)
+        // Both maps are keyed by device location for multi-GPU support.
+        let mut rope_standard: HashMap<_, Arc<DeepSeekV2RotaryEmbedding>> = HashMap::new();
+        let mut rope_compress: HashMap<_, Arc<DeepSeekV2RotaryEmbedding>> = HashMap::new();
+        let rope_cfg_standard = DeepSeekV2RopeConfig {
             rope_scaling: cfg.rope_scaling.clone(),
             max_position_embeddings: cfg.max_position_embeddings,
             rope_theta: cfg.rope_theta,
             qk_rope_head_dim: cfg.qk_rope_head_dim,
         };
+        let rope_cfg_compress = DeepSeekV2RopeConfig {
+            rope_scaling: cfg.rope_scaling.clone(),
+            max_position_embeddings: cfg.max_position_embeddings,
+            rope_theta: cfg.compress_rope_theta,
+            qk_rope_head_dim: cfg.qk_rope_head_dim,
+        };
+        // Determine which devices we need RoPEs on, and which kinds.
+        let mut need_standard_devices: std::collections::HashSet<_> =
+            std::collections::HashSet::new();
+        let mut need_compress_devices: std::collections::HashSet<_> =
+            std::collections::HashSet::new();
         for i in 0..cfg.num_hidden_layers {
             let device = mapper
                 .device_for(i, false)
                 .unwrap_or(&normal_loading_metadata.real_device);
-            ropes.insert(
-                device.location(),
-                Arc::new(DeepSeekV2RotaryEmbedding::new(
-                    &rope_cfg,
-                    vb.dtype(),
-                    device,
-                )?),
-            );
+            let loc = device.location();
+            match cfg.layer_compress_ratio(i) {
+                0 => {
+                    need_standard_devices.insert(loc.clone());
+                }
+                _ => {
+                    need_compress_devices.insert(loc.clone());
+                }
+            }
+        }
+        // Build the RoPEs. Use any device matching the location for construction.
+        for i in 0..cfg.num_hidden_layers {
+            let device = mapper
+                .device_for(i, false)
+                .unwrap_or(&normal_loading_metadata.real_device);
+            let loc = device.location();
+            if need_standard_devices.contains(&loc) && !rope_standard.contains_key(&loc) {
+                rope_standard.insert(
+                    loc.clone(),
+                    Arc::new(DeepSeekV2RotaryEmbedding::new(
+                        &rope_cfg_standard,
+                        vb.dtype(),
+                        device,
+                    )?),
+                );
+            }
+            if need_compress_devices.contains(&loc) && !rope_compress.contains_key(&loc) {
+                rope_compress.insert(
+                    loc.clone(),
+                    Arc::new(DeepSeekV2RotaryEmbedding::new(
+                        &rope_cfg_compress,
+                        vb.dtype(),
+                        device,
+                    )?),
+                );
+            }
         }
 
         let vb_l = vb_m.pp("layers");
@@ -1588,10 +1812,19 @@ impl DeepSeekV4 {
             let device = mapper
                 .device_for(layer_idx, false)
                 .unwrap_or(&normal_loading_metadata.real_device);
-            let rotary_emb = ropes
-                .get(&device.location())
-                .expect("No RoPE for device location!")
-                .clone();
+            // Pick the right RoPE based on this layer's compress ratio.
+            let layer_ratio = cfg.layer_compress_ratio(layer_idx);
+            let rotary_emb = if layer_ratio == 0 {
+                rope_standard
+                    .get(&device.location())
+                    .expect("No standard RoPE for device location!")
+                    .clone()
+            } else {
+                rope_compress
+                    .get(&device.location())
+                    .expect("No compress RoPE for device location!")
+                    .clone()
+            };
             let paged_attn = match &attention_mechanism {
                 AttentionImplementation::Eager => None,
                 AttentionImplementation::PagedAttention => Some(
@@ -1678,18 +1911,11 @@ impl DeepSeekV4 {
                     _ => None,
                 }
             },
-            // mHC global parameters (replace standard residual in V4).
-            // Shapes per SGLang: hc_head_fn [hc_mult, hc_dim] where
-            // hc_dim = hc_mult * hidden_size. For V4 Flash, hc_mult is typically
-            // small (e.g., 4). We probe with a permissive shape; rental can
-            // tighten once real V4 checkpoint sizes are confirmed.
-            // mHC tensors: probed via try-load. Use 1-element shape as a
-            // permissive default — real V4 shapes (hc_mult * hidden_size) are
-            // confirmed at rental time. If the tensor isn't in safetensors,
-            // these stay None and the forward path uses standard residual.
-            mhc_head_fn: None,
-            mhc_head_base: None,
-            mhc_head_scale: None,
+            // V4 mHC global head — loaded if checkpoint publishes
+            // `hc_head_fn`, `hc_head_base`, `hc_head_scale` at the model
+            // root (per SGLang `deepseek_v4.py` head wiring). Agent 5's
+            // module owns the try_load + forward semantics.
+            mhc_head: super::dsv4_mhc::V4MHCHead::try_load(cfg, &vb_m),
         })
     }
 
@@ -1736,6 +1962,12 @@ impl DeepSeekV4 {
         }
         let xs = xs.to_device(&self.device)?;
         let xs = xs.apply(&self.norm)?;
+        // V4 mHC head — applied between norm and lm_head when loaded (Agent 5).
+        let xs = if let Some(mhc) = &self.mhc_head {
+            mhc.forward(&xs)?
+        } else {
+            xs
+        };
         let xs = extract_logits(&xs, context_lens)?;
         self.lm_head.forward_autocast(&xs)
     }
@@ -2109,5 +2341,56 @@ mod tests {
         assert_eq!(cfg.layer_compress_ratio(2), 128);
         assert_eq!(cfg.layer_compress_ratio(3), 0);
         assert_eq!(cfg.layer_compress_ratio(99), 0); // out of bounds
+    }
+
+    /// V4Compressor::uniform initialises `coff` correctly per overlap rule
+    /// (CSA: ratio=4 → coff=2; HCA: ratio=128 → coff=1).
+    #[test]
+    fn v4_compressor_uniform_coff_matches_overlap_rule() -> Result<()> {
+        let device = Device::Cpu;
+        let comp_csa = V4Compressor::uniform(4, 8, &device)?;
+        assert_eq!(comp_csa.coff, 2, "CSA (ratio=4) → coff=2 (overlap=true)");
+        let comp_hca = V4Compressor::uniform(128, 8, &device)?;
+        assert_eq!(comp_hca.coff, 1, "HCA (ratio=128) → coff=1 (overlap=false)");
+        Ok(())
+    }
+
+    /// V4Compressor::uniform hidden_size flag distinguishes synthetic fallback
+    /// from real-checkpoint compressor (used by Attention.compress_step_from_xs).
+    #[test]
+    fn v4_compressor_uniform_signals_synthetic_via_hidden_size() -> Result<()> {
+        let device = Device::Cpu;
+        let comp = V4Compressor::uniform(4, 8, &device)?;
+        assert_eq!(
+            comp.hidden_size, 1,
+            "uniform fallback uses hidden_size=1 to flag synthetic init"
+        );
+        Ok(())
+    }
+
+    /// V4Compressor::forward (averaging path) is idempotent for all-ones.
+    /// Verifies the averaging math is correct: T tokens of value v average
+    /// to a single compressed entry of value v (mean preserves all-ones).
+    #[test]
+    fn v4_compressor_uniform_averaging_preserves_mean() -> Result<()> {
+        let device = Device::Cpu;
+        let comp = V4Compressor::uniform(4, 4, &device)?;
+        // 16 tokens of constant value 2.5 -> 4 compressed entries also 2.5
+        let input = (Tensor::ones((1, 2, 16, 4), DType::F32, &device)? * 2.5)?;
+        let out = comp.forward(&input)?;
+        let v: Vec<f32> = out.flatten_all()?.to_vec1()?;
+        for x in &v {
+            assert!(
+                (*x - 2.5).abs() < 1e-5,
+                "averaging should preserve mean (2.5), got {x}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Config default for compress_rope_theta matches V4 paper (40000.0).
+    #[test]
+    fn v4_compress_rope_theta_default_is_40000() {
+        assert_eq!(default_compress_rope_theta(), 40000.0);
     }
 }
