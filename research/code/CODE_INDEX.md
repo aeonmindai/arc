@@ -12,6 +12,85 @@
 
 That script re-clones every repo into `../arc-research-code/`. The symlinks then resolve automatically.
 
+---
+
+## Frontier model coverage in cloned reference engines (SGLang + vLLM)
+
+Critical insight: **the model loaders and attention backends for our four target families already exist** as production Python code in SGLang and vLLM. Arc's job is to port these to Rust, not invent them. SGLang is the canonical V4 reference; vLLM lags on V4 but has full coverage of the others.
+
+### DeepSeek V4 Pro / V4 Flash (1.6T / 284B; CSA + HCA attention; 1M context)
+
+| Concern | SGLang path | vLLM path |
+|---|---|---|
+| Main loader | `code/06_foundation/sglang/python/sglang/srt/models/deepseek_v4.py` (1,816 lines, extends `deepseek_v2.py`) | ❌ not yet (only test fixture `tests/models/test_deepseek_v4_mega_moe.py`) |
+| MTP / NextN | `code/06_foundation/sglang/python/sglang/srt/models/deepseek_v4_nextn.py` (280 lines) | `code/06_foundation/vllm/vllm/model_executor/models/deepseek_mtp.py` |
+| **CSA + HCA attention backend** | `code/06_foundation/sglang/python/sglang/srt/layers/attention/dsv4/` (10 files): `compressor.py` + `compressor_v2.py` (CSA K compression), `indexer.py` (top-k select), `metadata.py` + `metadata_kernel.py`, `quant_k_cache.py`, **`tilelang_kernel.py`** (the actual attention kernel) | — |
+| V3-style NSA / DSA sibling | `code/06_foundation/sglang/python/sglang/srt/layers/attention/dsa/` (8 files) | — |
+| Top-level dispatch | `code/06_foundation/sglang/python/sglang/srt/layers/attention/deepseek_v4_backend.py` + `_backend_hip_radix.py` for AMD | — |
+| Config schema | `code/06_foundation/sglang/python/sglang/srt/configs/deepseek_v4.py` (43 layers, 256+1 experts, kv_lora_rank=512, qk_nope_head_dim=448, index_topk=512) | — |
+| Original DeepSeek inference | `code/03_per_token_speed/deepseek_v3_nsa/inference/model.py` (V3 only; V4 weights load via SGLang) | — |
+
+### Kimi K2.5 / K2.6 (1T / 32B active; MLA; 256K context; MoonViT vision)
+
+| Concern | SGLang path | vLLM path |
+|---|---|---|
+| Main loader (text) | `code/06_foundation/sglang/python/sglang/srt/models/kimi_k25.py` (859 lines, **extends `DeepseekV3ForCausalLM`**) | `code/06_foundation/vllm/vllm/model_executor/models/kimi_k25.py` |
+| EAGLE-3 speculative head | `code/06_foundation/sglang/python/sglang/srt/models/kimi_k25_eagle3.py` | — |
+| Vision tower (MoonViT) | `code/06_foundation/sglang/python/sglang/srt/models/kimi_vl.py` + `kimi_vl_moonvit.py` | — |
+| Linear-attn variant | `code/06_foundation/sglang/python/sglang/srt/models/kimi_linear.py` | `code/06_foundation/vllm/vllm/model_executor/models/kimi_linear.py` |
+| Audio | — | `code/06_foundation/vllm/vllm/model_executor/models/kimi_audio.py` |
+| Config schema | `code/06_foundation/sglang/python/sglang/srt/configs/kimi_k25.py` | — |
+| MoBA reference paper code | `code/03_per_token_speed/moba/moba/moba_efficient.py` (Moonshot research; **NOT used by K2.6 production — K2.6 uses MLA**) | — |
+
+**Important:** K2.5 inherits `DeepseekV3ForCausalLM` directly. Arc's existing `mistralrs-core/src/models/deepseek3.rs` is ~90% of what K2.5/K2.6 needs — just add Kimi-specific config + tokenizer + MoonViT for vision.
+
+### GLM 5.0 / 5.1 (754B / 40B active; DSA attention; 200K context)
+
+**SGLang serves GLM-5 via `GlmMoeDsaForCausalLM`** (a subclass of `DeepseekV2ForCausalLM`) inside `glm4_moe.py`. No separate `glm5.py` file is needed — GLM-5 reuses the GLM-4-MoE codepath with DSA attention.
+
+| Concern | SGLang path | vLLM path |
+|---|---|---|
+| Main loader — covers **GLM-4.5, GLM-4.6, GLM-4.7, GLM-5.0, GLM-5.1** | `code/06_foundation/sglang/python/sglang/srt/models/glm4_moe.py` (1,499 lines). Two entry classes: `Glm4MoeForCausalLM` (plain GLM-4 MoE) and **`GlmMoeDsaForCausalLM` extends `DeepseekV2ForCausalLM` (the GLM-5 path)**. | `code/06_foundation/vllm/vllm/model_executor/models/glm4_moe.py` |
+| Lite variant | `code/06_foundation/sglang/python/sglang/srt/models/glm4_moe_lite.py` (792 lines) | `code/06_foundation/vllm/vllm/model_executor/models/glm4_moe_lite.py` |
+| MTP / NextN | `code/06_foundation/sglang/python/sglang/srt/models/glm4_moe_nextn.py` (168 lines) | `code/06_foundation/vllm/vllm/model_executor/models/glm4_moe_mtp.py` + `glm4_moe_lite_mtp.py` |
+| Vision (GLM-4V MoE) | `code/06_foundation/sglang/python/sglang/srt/models/glm4v.py` (820 lines) + `glm4v_moe.py` (285 lines) | `code/06_foundation/vllm/vllm/model_executor/models/glm4v.py` + `glm4_1v.py` |
+| OCR | `code/06_foundation/sglang/python/sglang/srt/models/glm_ocr.py` + `glm_ocr_nextn.py` | `code/06_foundation/vllm/vllm/model_executor/models/glm_ocr.py` + `glm_ocr_mtp.py` |
+| ASR | `code/06_foundation/sglang/python/sglang/srt/models/glmasr.py` | `code/06_foundation/vllm/vllm/model_executor/models/glmasr.py` |
+| Function calling | `code/06_foundation/sglang/python/sglang/srt/function_call/glm47_moe_detector.py` (handles GLM-4.7 + GLM-5) | — |
+| Top-k routing for GLM-5 | In `code/06_foundation/sglang/python/sglang/srt/models/deepseek_v2.py:549` — uses grouped-noaux-tc top-k (same as V3/V3.2/GLM-4-MoE-Lite) | — |
+
+**Important:** Arc can serve GLM-5.0 and GLM-5.1 through a single `glm_moe.rs` loader that handles GLM-4.5/4.6/4.7/5.0/5.1 — same code path with different config. The architecture is stable across the line; per Zhipu's pattern, version bumps come from post-training.
+
+### Attention backends registered in SGLang (21 total)
+
+Located at `code/06_foundation/sglang/python/sglang/srt/layers/attention/`:
+
+| Backend | What it is | When to use |
+|---|---|---|
+| `flashinfer` | FlashInfer GEMM + paged KV | Default GPU path for most models |
+| `trtllm_mla` / `cutlass_mla` / `flashmla` | MLA-specific attention | DeepSeek V2/V3, Kimi K2.x, GLM-5 |
+| `dsa` | DeepSeek Sparse Attention (V3-style NSA) | V3, V3.2, **GLM-5** |
+| `dsv4` | **V4's CSA + HCA hybrid attention** | DeepSeek V4 Pro/Flash |
+| `nsa` | Generic NSA path | Any NSA-trained model |
+| `fa3` / `fa4` | FlashAttention 3 / 4 | Generic SDPA |
+| `triton` / `torch_native` / `flex_attention` | Software fallbacks | Reference / CPU |
+| `aiter` | AMD ROCm path | AMD GPUs |
+| `wave`, `ascend`, `intel_amx`, `intel_xpu`, `trtllm_mha` | Vendor-specific paths | Non-NVIDIA hardware |
+| `tokenspeed_mla`, `dual_chunk_flash_attn` | Specialized variants | — |
+
+Backend registry: `code/06_foundation/sglang/python/sglang/srt/layers/attention/attention_registry.py` (uses `@register_attention_backend(name)` decorator).
+
+### Arc → SGLang porting map for new model loaders
+
+| Arc work | SGLang reference to port from | Estimated effort |
+|---|---|---|
+| `mistralrs-core/src/models/deepseek4.rs` | `sglang/python/sglang/srt/models/deepseek_v4.py` | 2 weeks |
+| `mistralrs-core/src/models/kimi_k2.rs` | `sglang/python/sglang/srt/models/kimi_k25.py` | 1 week (90% reuse from `deepseek3.rs`) |
+| `mistralrs-core/src/models/glm_moe.rs` (covers GLM-4.5+, GLM-5.x) | `sglang/python/sglang/srt/models/glm4_moe.py` | 1.5 weeks |
+| `mistralrs-quant/src/dsv4/` (CSA + HCA) | `sglang/python/sglang/srt/layers/attention/dsv4/*.py` | 2-3 weeks (TileLang kernel → port to Triton/CUDA or emit CPU reference for Tier A) |
+
+---
+
 ## Domain 1: Weight compression (`01_weight_compression/`)
 
 | Technique | Paper PDF | Code repo | Status |
