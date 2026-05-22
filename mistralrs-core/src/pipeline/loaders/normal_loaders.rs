@@ -3160,6 +3160,19 @@ impl NormalModelLoader for DeepSeekV4Loader {
         attention_mechanism: AttentionImplementation,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
         let cfg: crate::models::deepseek4::DeepSeekV4Config = serde_json::from_str(config)?;
+        // V4 publishes FP8 block scales under `<weight>.scale`; Arc's
+        // BlockwiseFP8Linear expects HF-convention `<weight>.weight_scale_inv`.
+        // Attach a transparent rename layer so the loader can use the HF
+        // path regardless of which naming the on-disk checkpoint uses.
+        // Audit §0 P0 #5 + SGLang `remap_weight_name_to_dpsk_hf_format`
+        // (deepseek_v4.py:1413).
+        //
+        // The wrapper is no-op for HF-style checkpoints (the original name
+        // exists directly), so this is safe to apply unconditionally.
+        let vb = mistralrs_quant::attach_rename_rules(
+            vb,
+            mistralrs_quant::v4_scale_rename_rules(),
+        );
         Ok(Box::new(models::deepseek4::DeepSeekV4::new(
             &cfg,
             vb,

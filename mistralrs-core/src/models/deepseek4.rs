@@ -59,9 +59,12 @@
 //!   does drafting via `MtpDecodeKit` and only needs `embed_tokens/
 //!   lm_head/h_proj/e_proj`).
 //! - FP8 native-to-HF tensor name remap (`*.scale → *.weight_scale_inv`).
-//!   The `BlockwiseFP8Linear` loader expects HF-style names; V4 native
-//!   checkpoints need a renaming layer at the safetensors backend.
-//!   Tracked as follow-up in audit §8 item 22.
+//!   Handled by [`mistralrs_quant::attach_rename_rules`] called from
+//!   [`crate::pipeline::loaders::normal_loaders::DeepSeekV4Loader::load`]
+//!   before this constructor runs. The wrapper is transparent for HF-format
+//!   checkpoints (direct lookups still work) and intercepts only missing
+//!   `weight_scale_inv` paths to redirect to V4-native `.scale`. Audit §0
+//!   P0 #5 + audit §8 item 5.
 //! - 4-D residual stack threading for mHC (`[B, T, hc_mult, hidden]`).
 //!   Layer params are loaded; the model carries 3-D residual today (hc_mult
 //!   collapsed to 1, mathematically equivalent to standard residual).

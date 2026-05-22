@@ -30,6 +30,7 @@ mod hqq;
 mod imatrix;
 mod lora;
 mod mxfp4;
+pub mod name_remap;
 mod nvfp4;
 mod pending_layer;
 mod pertensor_fp8;
@@ -44,8 +45,9 @@ mod vector_fp8;
 
 use gptq::gptq_linear;
 use lora::merge_lora_weights;
+pub use name_remap::{v4_scale_rename_rules, RenameRule, RenamingBackend};
 use regex::Regex;
-pub use safetensors::{Shard, ShardedSafeTensors, ShardedVarBuilder};
+pub use safetensors::{attach_rename_rules, Shard, ShardedSafeTensors, ShardedVarBuilder};
 
 pub use afq::{AfqBits, AfqGroupSize, AfqLayer};
 pub use bitsandbytes::{BnbLinear, BnbQuantParams, BnbQuantType};

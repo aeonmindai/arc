@@ -391,6 +391,30 @@ impl ShardedSafeTensors {
     }
 }
 
+/// Builder helper for the V4 loader: takes an existing
+/// [`ShardedVarBuilder`] and returns a new one that transparently rewrites
+/// tensor lookups according to the supplied rules.
+///
+/// Used by the V4 loader to make HF-convention `.weight_scale_inv` lookups
+/// resolve to V4-native `.scale` tensors when present. The wrapper is
+/// transparent: if the requested tensor name already exists, it's used as-is;
+/// only when it's missing does a rule fire.
+///
+/// Works for any inner backend variant — sharded mmap, hashmap, or already
+/// wrapped — because it dispatches through the `ShardedVarBuilder`'s public
+/// `get_*` / `contains_tensor` API.
+pub fn attach_rename_rules(
+    vb: ShardedVarBuilder,
+    rules: Vec<crate::name_remap::RenameRule>,
+) -> ShardedVarBuilder {
+    let dtype = vb.dtype();
+    let device = vb.device().clone();
+    let backend: Box<dyn SimpleBackend + 'static> = Box::new(
+        crate::name_remap::VarBuilderRenameWrapper::new(vb, Arc::new(rules)),
+    );
+    VarBuilderArgs::new_with_args(ShardedSafeTensors::SimpleBackend(backend), dtype, &device)
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Shard {
     Simple {
