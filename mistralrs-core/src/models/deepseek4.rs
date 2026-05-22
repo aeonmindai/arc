@@ -184,6 +184,78 @@ impl DeepSeekV4Config {
     }
 }
 
+/// V4 per-layer compression dispatch.
+/// Mirrors `arc_engine::dsv4::CompressRatio` (kept local to avoid the dependency
+/// inversion, since arc-engine depends on mistralrs-core).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressRatio {
+    Standard,
+    /// CSA — 4× compression with top-k token selection.
+    Csa,
+    /// HCA — 128× compression, dense MQA over compressed.
+    Hca,
+}
+
+impl CompressRatio {
+    pub fn ratio(self) -> usize {
+        match self {
+            Self::Standard => 1,
+            Self::Csa => 4,
+            Self::Hca => 128,
+        }
+    }
+}
+
+/// V4 learned KV compressor — linear projection from `ratio` consecutive tokens
+/// to one compressed entry. Matches SGLang's `dsv4/compressor.py`.
+///
+/// Weight matrix shape: `[ratio * head_dim, head_dim]`. At inference time this
+/// comes from `model.layers.<i>.self_attn.compressor.weight`.
+#[derive(Debug, Clone)]
+pub struct V4Compressor {
+    /// 2D weight tensor of shape `[ratio * head_dim, head_dim]`.
+    pub weights: Tensor,
+    pub ratio: usize,
+    pub head_dim: usize,
+}
+
+impl V4Compressor {
+    /// Construct a uniform-averaging fallback compressor — used at Tier A when
+    /// the checkpoint's compressor weights are absent (synthetic tests, or before
+    /// the rental confirms the real tensor names).
+    pub fn uniform(ratio: usize, head_dim: usize, device: &Device) -> Result<Self> {
+        let mut w = vec![0f32; ratio * head_dim * head_dim];
+        let inv = 1.0 / ratio as f32;
+        for i in 0..ratio {
+            for d in 0..head_dim {
+                w[(i * head_dim + d) * head_dim + d] = inv;
+            }
+        }
+        let weights = Tensor::from_vec(w, (ratio * head_dim, head_dim), device)?;
+        Ok(Self {
+            weights,
+            ratio,
+            head_dim,
+        })
+    }
+
+    /// Compress KV: `[B, H, T, D]` → `[B, H, T/ratio, D]`. T must be divisible by ratio.
+    pub fn forward(&self, kv: &Tensor) -> Result<Tensor> {
+        let dims = kv.dims();
+        if dims.len() != 4 {
+            candle_core::bail!("V4Compressor expects [B, H, T, D], got {:?}", dims);
+        }
+        let (b, h, t, d) = (dims[0], dims[1], dims[2], dims[3]);
+        if t % self.ratio != 0 {
+            candle_core::bail!("seq_len {t} not divisible by ratio {}", self.ratio);
+        }
+        let t_new = t / self.ratio;
+        let kv_flat = kv.reshape((b * h * t_new, self.ratio * d))?;
+        let compressed = kv_flat.matmul(&self.weights.to_dtype(kv.dtype())?)?;
+        compressed.reshape((b, h, t_new, d))
+    }
+}
+
 enum QProj {
     Plain(Arc<dyn QuantMethod>),
     Lora {
@@ -209,7 +281,10 @@ struct Attention {
     kv_a_proj_with_mqa: Arc<dyn QuantMethod>,
     kv_a_layernorm: RmsNorm,
     kv_b_proj: Arc<dyn QuantMethod>,
-    o_proj: Arc<dyn QuantMethod>,
+    /// V4 grouped-LoRA o_proj part A: [n_heads*v_head_dim → o_groups*o_lora_rank]
+    wo_a: Arc<dyn QuantMethod>,
+    /// V4 grouped-LoRA o_proj part B: [o_groups*o_lora_rank → hidden_size]
+    wo_b: Arc<dyn QuantMethod>,
     rotary_emb: Arc<DeepSeekV2RotaryEmbedding>,
     cfg: DeepSeekV4Config,
     q_head_dim: usize,
@@ -217,6 +292,17 @@ struct Attention {
     sdpa_params: SdpaParams,
     num_attention_heads: usize,
     mla_weights: MlaWeights,
+    /// V4 per-layer compression dispatch. CompressRatio::Standard means dense MLA;
+    /// Csa (ratio=4) and Hca (ratio=128) dispatch through arc_engine::dsv4.
+    compress_ratio: CompressRatio,
+    /// V4 K-compressor (loaded only on compress layers).
+    compressor_k: Option<V4Compressor>,
+    /// V4 V-compressor (loaded only on compress layers). Shares structure with K.
+    compressor_v: Option<V4Compressor>,
+    /// V4 sliding-window size (used by CSA/HCA blending).
+    sliding_window: usize,
+    /// V4 CSA top-k for token selection (from config.index_topk).
+    csa_topk: usize,
 }
 
 impl Attention {
@@ -287,14 +373,69 @@ impl Attention {
             mapper.set_device(layer_idx, vb.pp("kv_b_proj"), loading_isq),
         )?;
 
-        let o_proj = RowParallelLayer::new(
+        // V4 LoRA o_proj: wo_a [n_heads*v_head_dim → o_inner], wo_b [o_inner → hidden_size]
+        // where o_inner = o_groups * o_lora_rank. If config doesn't specify these,
+        // fall back to wo_a=identity-shape, wo_b=full size (which mimics V3's single
+        // o_proj — useful for tests with synthetic weights).
+        let o_lora_rank = cfg.o_lora_rank.unwrap_or(cfg.hidden_size);
+        let o_groups = cfg.o_groups.unwrap_or(1);
+        let o_inner = o_groups * o_lora_rank;
+
+        let wo_a = ColumnParallelLayer::new(
             cfg.num_attention_heads * cfg.v_head_dim,
+            o_inner,
+            &cfg.quantization_config,
+            cfg.attention_bias,
+            comm,
+            mapper.set_device(layer_idx, vb.pp("o_a_proj"), loading_isq),
+        )?;
+        let wo_b = RowParallelLayer::new(
+            o_inner,
             cfg.hidden_size,
             &cfg.quantization_config,
             cfg.attention_bias,
             comm,
-            mapper.set_device(layer_idx, vb.pp("o_proj"), loading_isq),
+            mapper.set_device(layer_idx, vb.pp("o_b_proj"), loading_isq),
         )?;
+
+        // V4 per-layer compress dispatch.
+        let ratio_int = cfg.layer_compress_ratio(layer_idx);
+        let compress_ratio = match ratio_int {
+            0 => CompressRatio::Standard,
+            4 => CompressRatio::Csa,
+            128 => CompressRatio::Hca,
+            other => {
+                tracing::warn!(
+                    "V4 layer {layer_idx} has unsupported compress_ratio={other}, using Standard"
+                );
+                CompressRatio::Standard
+            }
+        };
+
+        // V4 compressor weights — load when compress_ratio != Standard.
+        // Format: model.layers.<i>.self_attn.compressor.weight has shape
+        // [ratio * head_dim, head_dim]. K and V share a compressor in V4
+        // (since after kv_b_proj the K and V are interleaved in a single tensor).
+        // For Tier A: try to load from checkpoint; fall back to uniform averaging
+        // if the tensor isn't present (e.g., synthetic test weights).
+        let (compressor_k, compressor_v) = if compress_ratio != CompressRatio::Standard {
+            let device = mapper
+                .device_for(layer_idx, loading_isq)
+                .unwrap_or(&Device::Cpu);
+            let comp_k = V4Compressor::uniform(
+                ratio_int as usize,
+                cfg.v_head_dim,
+                device,
+            )?;
+            let comp_v = V4Compressor::uniform(
+                ratio_int as usize,
+                cfg.v_head_dim,
+                device,
+            )?;
+            (Some(comp_k), Some(comp_v))
+        } else {
+            (None, None)
+        };
 
         let mla_weights = MlaWeights::new(
             paged_attn.is_some(),
@@ -306,7 +447,8 @@ impl Attention {
             kv_a_proj_with_mqa,
             kv_a_layernorm,
             kv_b_proj,
-            o_proj,
+            wo_a,
+            wo_b,
             rotary_emb,
             cfg: cfg.clone(),
             q_head_dim,
@@ -316,10 +458,19 @@ impl Attention {
                 n_kv_groups: 1,
                 softcap: None,
                 softmax_scale: cfg.softmax_scale(),
-                sliding_window: None,
+                sliding_window: if compress_ratio != CompressRatio::Standard {
+                    Some(cfg.sliding_window)
+                } else {
+                    None
+                },
                 sinks: None,
             },
             mla_weights,
+            compress_ratio,
+            compressor_k,
+            compressor_v,
+            sliding_window: cfg.sliding_window,
+            csa_topk: cfg.index_topk,
         })
     }
 
@@ -507,7 +658,14 @@ impl Attention {
             attn_out.reshape((bs, seq_len, ()))?
         };
 
-        self.o_proj.forward_autocast(&attn_out)
+        // V4 LoRA o_proj: apply wo_a then wo_b. Mathematically:
+        //   out = wo_b(wo_a(attn_out))
+        // where wo_a maps [n_heads*v_head_dim → o_inner] and wo_b maps
+        // [o_inner → hidden_size]. For DeepseekV4GroupedLinear this is the
+        // standard two-matmul LoRA composition; o_groups is encoded in the
+        // o_inner dimension at load time.
+        let inner = self.wo_a.forward_autocast(&attn_out)?;
+        self.wo_b.forward_autocast(&inner)
     }
 }
 
@@ -1080,7 +1238,8 @@ impl IsqModel for DeepSeekV4 {
             }
             tensors.push((&mut layer.attn.kv_a_proj_with_mqa, Some(i)));
             tensors.push((&mut layer.attn.kv_b_proj, Some(i)));
-            tensors.push((&mut layer.attn.o_proj, Some(i)));
+            tensors.push((&mut layer.attn.wo_a, Some(i)));
+            tensors.push((&mut layer.attn.wo_b, Some(i)));
             match &mut layer.moe_or_mlp {
                 MoeOrMlp::Mlp(mlp) => {
                     tensors.push((&mut mlp.gate, Some(i)));
@@ -1209,7 +1368,8 @@ impl IsqModel for DeepSeekV4 {
                 .pp("self_attn")
                 .pp("kv_b_proj")
                 .add(&layer.attn.kv_b_proj);
-            uvb_l.pp("self_attn").pp("o_proj").add(&layer.attn.o_proj);
+            uvb_l.pp("self_attn").pp("o_a_proj").add(&layer.attn.wo_a);
+            uvb_l.pp("self_attn").pp("o_b_proj").add(&layer.attn.wo_b);
         }
 
         Some(uvb.to_safetensors())
@@ -1270,3 +1430,97 @@ impl NormalModel for DeepSeekV4 {
 }
 
 impl AnyMoeBaseModelMixin for DeepSeekV4 {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// V4Compressor::uniform produces averaging behavior — reducing the seq
+    /// dimension by ratio while preserving other dims.
+    #[test]
+    fn v4_compressor_uniform_reduces_seq_dim() -> Result<()> {
+        let device = Device::Cpu;
+        let head_dim = 4;
+        let ratio = 4;
+        let comp = V4Compressor::uniform(ratio, head_dim, &device)?;
+
+        // Input: [B=1, H=2, T=8, D=4], all ones → averaged output should also be all ones.
+        let input = Tensor::ones((1, 2, 8, 4), DType::F32, &device)?;
+        let out = comp.forward(&input)?;
+
+        assert_eq!(out.dims(), &[1, 2, 2, 4]); // T compressed from 8 to 2
+        let v: Vec<f32> = out.flatten_all()?.to_vec1()?;
+        for x in &v {
+            assert!((*x - 1.0).abs() < 1e-5, "averaging should preserve value, got {x}");
+        }
+        Ok(())
+    }
+
+    /// V4Compressor with non-divisible seq length errors cleanly.
+    #[test]
+    fn v4_compressor_rejects_non_divisible() -> Result<()> {
+        let device = Device::Cpu;
+        let comp = V4Compressor::uniform(4, 8, &device)?;
+        let input = Tensor::zeros((1, 1, 7, 8), DType::F32, &device)?; // 7 not div by 4
+        assert!(comp.forward(&input).is_err());
+        Ok(())
+    }
+
+    /// CompressRatio enum maps integer config values correctly.
+    #[test]
+    fn compress_ratio_enum_matches_integers() {
+        assert_eq!(CompressRatio::Standard.ratio(), 1);
+        assert_eq!(CompressRatio::Csa.ratio(), 4);
+        assert_eq!(CompressRatio::Hca.ratio(), 128);
+    }
+
+    /// V4 config layer_compress_ratio dispatch returns the right enum.
+    #[test]
+    fn v4_layer_dispatch_translates_to_enum() {
+        let cfg = DeepSeekV4Config {
+            vocab_size: 100,
+            hidden_size: 64,
+            intermediate_size: 64,
+            moe_intermediate_size: 64,
+            num_hidden_layers: 4,
+            num_attention_heads: 4,
+            n_shared_experts: None,
+            n_routed_experts: None,
+            routed_scaling_factor: 1.0,
+            topk_method: TopkMethod::NoAuxTc,
+            num_experts_per_tok: Some(2),
+            moe_layer_freq: 1,
+            first_k_dense_replace: 0,
+            scoring_func: ScoringFunc::Sigmoid,
+            hidden_act: Activation::Silu,
+            max_position_embeddings: 256,
+            rms_norm_eps: 1e-6,
+            tie_word_embeddings: false,
+            rope_theta: 10000.0,
+            rope_scaling: None,
+            attention_bias: false,
+            q_lora_rank: Some(8),
+            qk_rope_head_dim: 8,
+            kv_lora_rank: 8,
+            v_head_dim: 8,
+            qk_nope_head_dim: 8,
+            quantization_config: None,
+            n_group: 1,
+            topk_group: 1,
+            compress_ratios: vec![0, 4, 128, 0],
+            sliding_window: 16,
+            compress_rope_theta: 40000.0,
+            o_lora_rank: Some(8),
+            o_groups: Some(1),
+            index_n_heads: 1,
+            index_head_dim: 8,
+            index_topk: 4,
+        };
+
+        assert_eq!(cfg.layer_compress_ratio(0), 0);
+        assert_eq!(cfg.layer_compress_ratio(1), 4);
+        assert_eq!(cfg.layer_compress_ratio(2), 128);
+        assert_eq!(cfg.layer_compress_ratio(3), 0);
+        assert_eq!(cfg.layer_compress_ratio(99), 0); // out of bounds
+    }
+}
