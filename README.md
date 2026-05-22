@@ -30,8 +30,18 @@ Arc is a high-performance LLM inference engine targeting **120 tokens/second** o
 | **TurboQuant KV cache** | 4-bit K / 3-bit V sub-byte packing with WHT rotation + Lloyd-Max codebooks. 4.27x context on H100. | ✅ |
 | **Fused attention kernels** | CUDA kernels that read packed KV directly — codebook lookup in the attention inner loop | ✅ |
 | **3 compression presets** | Default (3.5-bit, lossless), Balanced (3.0-bit), Aggressive (2.5-bit) | ✅ |
+| **DeepSeek V4** | Full native model implementation — hybrid compressed/sliding-window attention, MTP heads, LoRA o_proj, V4Compressor, auto-detects native vs HF tensor format | ✅ |
+| **Frontier model support** | Kimi K2, GLM-5, DeepSeek V4 — config parsing, dispatcher integration, weight schema validation | ✅ |
+| **NVFP4 quantization** | NVIDIA FP4 format — software dequant path with Tier A tests | ✅ |
+| **QTIP quantization** | Viterbi-decoded lattice quantization with codebook lookup | ✅ |
+| **TD-MoE** | Tucker-decomposed MoE with Walsh-Hadamard whitening transform | ✅ |
+| **EAGLE-3 speculative decoding** | Next-gen draft model with weight schema validation | ✅ |
+| **MagicDec** | Speculative decoding with draft-model KV sharing | ✅ |
+| **Sarathi chunked prefill** | Efficient prefill scheduling to reduce decode-phase bubbles | ✅ |
+| **Expert affinity routing** | Workload-aware expert placement for MoE models | ✅ |
+| **Weight schema validation** | Offline validator catches V3-vs-V4 tensor mismatches before loading | ✅ |
 | **GPU-autonomous decode** | Entire decode loop (forward + sampling + EOS check) runs on GPU without CPU involvement. CUDA 12.4 conditional graph nodes. | In progress |
-| **Fused GPU sampling** | Argmax, top-p, penalties — all on GPU inside the captured graph. No CPU round-trip per token. | Planned |
+| **CUDA graph sampling** | CPU reference sampler (argmax, top-p, penalties) — GPU kernel port next | In progress |
 | **Zero-copy token streaming** | GPU writes tokens to pinned host ring buffer. CPU streams to clients without synchronizing the decode loop. | Planned |
 | Elastic tensor parallelism | Per-request GPU allocation, TP=1 to TP=8 dynamically | Planned |
 | Disaggregated serving | Prefill-decode separation with KV-aware routing | Planned |
@@ -217,9 +227,9 @@ curl http://localhost:8080/v1/chat/completions \
 Arc supports every model that mistral.rs supports — 100+ architectures across text, vision, speech, image generation, and embeddings.
 
 <details>
-<summary><b>Text</b> — Granite 4.0, SmolLM 3, DeepSeek V3, GPT-OSS, Qwen 3, GLM 4, Gemma 2, Phi 3, Llama, Mistral, Mixtral, Starcoder 2, and more</summary>
+<summary><b>Text</b> — DeepSeek V4, Kimi K2, GLM-5, Granite 4.0, SmolLM 3, DeepSeek V3, GPT-OSS, Qwen 3, GLM 4, Gemma 2, Phi 3, Llama, Mistral, Mixtral, Starcoder 2, and more</summary>
 
-Granite 4.0, SmolLM 3, DeepSeek V3, GPT-OSS, DeepSeek V2, Qwen 3 Next, Qwen 3 MoE, Phi 3.5 MoE, Qwen 3, GLM 4, GLM-4.7-Flash, GLM-4.7 MoE, Gemma 2, Qwen 2, Starcoder 2, Phi 3, Mixtral, Phi 2, Gemma, Llama, Mistral
+DeepSeek V4, Kimi K2, GLM-5, Granite 4.0, SmolLM 3, DeepSeek V3, GPT-OSS, DeepSeek V2, Qwen 3 Next, Qwen 3 MoE, Phi 3.5 MoE, Qwen 3, GLM 4, GLM-4.7-Flash, GLM-4.7 MoE, Gemma 2, Qwen 2, Starcoder 2, Phi 3, Mixtral, Phi 2, Gemma, Llama, Mistral
 </details>
 
 <details>
@@ -252,12 +262,59 @@ Arc uses a thin-wrapper architecture over mistral.rs for upstream compatibility:
 
 ```
 arc-cli/          Arc binary (BSL-1.1)
-arc-engine/       Wrapper crate (BSL-1.1)
+arc-engine/       Engine crate — model dispatchers, scheduling, speculative decoding (BSL-1.1)
+arc-cuda-graph/   CUDA graph capture, GPU sampling, autonomous decode (BSL-1.1)
 arc-turbo/        TurboQuant: codebooks, WHT, cache, kernels (BSL-1.1)
+arc-tools/        Operational tooling — rental preflight, weight validation (BSL-1.1)
 mistralrs-*/      Upstream mistral.rs (MIT) — untouched, merge-compatible
 ```
 
 `git merge upstream/master` works cleanly. New models and fixes from upstream are available immediately.
+
+### arc-engine modules
+
+| Module | Purpose |
+|--------|---------|
+| `deepseek_v4` | DeepSeek V4 config, dispatcher, hybrid attention |
+| `kimi_k2` | Kimi K2 (Moonshot) model support |
+| `glm_moe` | GLM-5 MoE architecture |
+| `eagle3` | EAGLE-3 speculative decoding |
+| `magicdec` | MagicDec draft-model KV sharing |
+| `sarathi` | Chunked prefill scheduling |
+| `td_moe` | Tucker-decomposed MoE + WHT whitening |
+| `expert_affinity` | Workload-aware expert placement |
+| `mtp` | Multi-Token Prediction heads |
+| `weight_schema` | Offline tensor layout validation (V3/V4/K2/GLM-5) |
+| `moba` | Mixture-of-Block Attention |
+| `sage` | SAGE attention (approximate KV retrieval) |
+| `yoco` | You Only Cache Once — decoder-decoder KV sharing |
+| `turbo_sparse` | Activation sparsity for MoE acceleration |
+
+## Quantization
+
+Arc supports all upstream quantization methods plus new formats:
+
+| Method | Source | Status |
+|--------|--------|--------|
+| **TurboQuant** | Arc | ✅ Default KV cache compression |
+| **NVFP4** | Arc | ✅ NVIDIA FP4 weight quantization |
+| **QTIP** | Arc | ✅ Viterbi-decoded lattice quantization |
+| ISQ | Upstream | ✅ In-situ quantization (2-8 bit) |
+| GGUF | Upstream | ✅ llama.cpp compatible |
+| GPTQ | Upstream | ✅ |
+| AWQ | Upstream | ✅ |
+
+## Operational Tooling
+
+```bash
+# Validate model weights before loading (catches V3-vs-V4 tensor mismatches)
+arc validate -m deepseek-ai/DeepSeek-V4
+
+# Rental day-1 preflight check (GPU drivers, NCCL, disk, VRAM)
+./arc-tools/preflight.sh
+```
+
+The weight schema validator runs offline against safetensors index files, catching format mismatches (native vs HF layout, missing MTP heads, wrong o_proj structure) before committing to a multi-hour download.
 
 ## Building from Source
 
@@ -279,10 +336,11 @@ cargo install --path arc-cli --features <your-features>
 
 - [CLI Reference](docs/CLI.md)
 - [HTTP API](docs/HTTP.md)
-- [Quantization](docs/QUANTS.md) — ISQ, GGUF, GPTQ, AWQ, TurboQuant
+- [Quantization](docs/QUANTS.md) — ISQ, GGUF, GPTQ, AWQ, TurboQuant, NVFP4, QTIP
 - [PagedAttention](docs/PAGED_ATTENTION.md)
 - [Device Mapping](docs/DEVICE_MAPPING.md)
 - [MCP Integration](docs/MCP/README.md)
+- [Rental Playbook](arc-tools/RENTAL_PLAYBOOK.md) — GPU rental day-1 operations guide
 - [Full documentation](https://runcrate.ai/arc/docs)
 
 ## License
