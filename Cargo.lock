@@ -217,6 +217,8 @@ dependencies = [
  "candle-nn",
  "mistralrs-core",
  "mistralrs-quant",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 

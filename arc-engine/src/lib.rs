@@ -14,8 +14,12 @@
 //! speculative decoding, continuous batching, GGUF/GPTQ/AWQ/ISQ, LoRA, and more.
 
 // Arc-specific modules
+pub mod deepseek_v4;
+pub mod dsv4;
 pub mod eagle3;
 pub mod expert_affinity;
+pub mod glm_moe;
+pub mod kimi_k2;
 pub mod magicdec;
 pub mod moba;
 pub mod mtp;
