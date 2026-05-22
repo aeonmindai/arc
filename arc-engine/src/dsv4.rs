@@ -94,63 +94,95 @@ impl Default for Dsv4Config {
     }
 }
 
-/// Learned KV compressor — reduces the sequence dim by `ratio` via a per-group
-/// linear projection.
+/// Learned KV compressor — reduces the sequence dim by `ratio` via a linear
+/// projection that takes `ratio` consecutive token KVs as a flat vector and
+/// produces a single compressed entry.
 ///
 /// Input: K tensor of shape `[batch, heads, seq, head_dim]` where seq must be
 /// divisible by ratio.
 /// Output: compressed K of shape `[batch, heads, seq / ratio, head_dim]`.
 ///
-/// Mathematically: each group of `ratio` consecutive tokens is reduced to a single
-/// compressed entry. The simplest learned reduction is a weighted sum:
-///   c_t = sum_{i=0..ratio} w_i * K_{t*ratio + i}
-/// where w_i are learned per-position weights of shape `[ratio]`.
+/// Mathematically (matches SGLang's `dsv4/compressor.py`):
+///   c_t[d_out] = sum_{i=0..ratio} sum_{d_in=0..head_dim} W[i*head_dim + d_in, d_out] * K[t*ratio+i, d_in]
 ///
-/// More expressive variants (per the V4 paper) use a small MLP or attention-style
-/// reduction; for Tier A we use the linear weighted-sum form, which matches the
-/// math the compressor weights in the checkpoint represent at the simplest setting.
+/// The compressor weight is a `[ratio * head_dim, head_dim]` linear layer. The
+/// `Compressor::uniform()` constructor produces a weight matrix that recovers
+/// simple averaging behavior for use in tests when no checkpoint weights exist.
 #[derive(Debug, Clone)]
 pub struct Compressor {
-    /// Per-position weights of shape `[ratio]`. At inference time, these come from
-    /// the checkpoint; for tests we initialize uniformly.
+    /// 2D weight matrix of shape `[ratio * head_dim, head_dim]` — a linear
+    /// projection from concatenated grouped input to compressed output. At
+    /// inference time, these come from the checkpoint
+    /// (`model.layers.<i>.self_attn.compressor.weight`).
     pub weights: Tensor,
+    /// Compression ratio (4 for CSA, 128 for HCA).
     pub ratio: usize,
+    /// Head dimension (the last axis of the input K/V).
+    pub head_dim: usize,
 }
 
 impl Compressor {
-    /// Create a compressor with uniform weights (1/ratio each). Used for tests
-    /// and as a fallback when checkpoint weights aren't available yet.
-    pub fn uniform(ratio: usize, device: &Device) -> Result<Self> {
-        let w = vec![1.0f32 / ratio as f32; ratio];
-        let weights = Tensor::from_vec(w, (ratio,), device)?;
-        Ok(Self { weights, ratio })
+    /// Create a compressor with weights that recover the simple averaging
+    /// behavior (uniform 1/ratio across grouped tokens). Used for tests and as
+    /// a fallback before checkpoint weights are loaded.
+    ///
+    /// The weight matrix is `[ratio * head_dim, head_dim]` where block `i` (of
+    /// shape `[head_dim, head_dim]`) is `(1/ratio) * I` — i.e., averaging the
+    /// d-th input dim of each grouped token to produce the d-th output dim.
+    pub fn uniform(ratio: usize, head_dim: usize, device: &Device) -> Result<Self> {
+        let mut w = vec![0f32; ratio * head_dim * head_dim];
+        let inv = 1.0 / ratio as f32;
+        // For each of `ratio` input blocks, place `inv * I_{head_dim}` along the
+        // diagonal of the [head_dim, head_dim] slice.
+        for i in 0..ratio {
+            for d in 0..head_dim {
+                let row = i * head_dim + d;
+                let col = d;
+                w[row * head_dim + col] = inv;
+            }
+        }
+        let weights = Tensor::from_vec(w, (ratio * head_dim, head_dim), device)?;
+        Ok(Self {
+            weights,
+            ratio,
+            head_dim,
+        })
     }
 
-    /// Create with explicit weights of shape `[ratio]`.
-    pub fn from_weights(weights: Tensor, ratio: usize) -> Result<Self> {
+    /// Create with explicit weights of shape `[ratio * head_dim, head_dim]`.
+    pub fn from_weights(weights: Tensor, ratio: usize, head_dim: usize) -> Result<Self> {
         let dims = weights.dims();
-        if dims != [ratio] {
+        if dims != [ratio * head_dim, head_dim] {
             candle_core::bail!(
-                "Compressor weights must be shape [{ratio}], got {:?}",
+                "Compressor weights must be shape [{}, {}], got {:?}",
+                ratio * head_dim,
+                head_dim,
                 dims
             );
         }
-        Ok(Self { weights, ratio })
+        Ok(Self {
+            weights,
+            ratio,
+            head_dim,
+        })
     }
 
     /// Compress a KV tensor along the sequence dimension.
     ///
-    /// Input: `[B, H, T, D]` where T % ratio == 0.
+    /// Input: `[B, H, T, D]` where T % ratio == 0 and D == self.head_dim.
     /// Output: `[B, H, T/ratio, D]`.
     pub fn forward(&self, kv: &Tensor) -> Result<Tensor> {
         let dims = kv.dims();
         if dims.len() != 4 {
-            candle_core::bail!(
-                "Compressor expects [B, H, T, D], got shape {:?}",
-                dims
-            );
+            candle_core::bail!("Compressor expects [B, H, T, D], got shape {:?}", dims);
         }
         let (b, h, t, d) = (dims[0], dims[1], dims[2], dims[3]);
+        if d != self.head_dim {
+            candle_core::bail!(
+                "Compressor head_dim mismatch: configured {}, input has {d}",
+                self.head_dim
+            );
+        }
         if t % self.ratio != 0 {
             candle_core::bail!(
                 "seq_len {t} not divisible by compress ratio {}",
@@ -159,14 +191,12 @@ impl Compressor {
         }
         let t_new = t / self.ratio;
 
-        // Reshape kv to [B, H, T_new, ratio, D] then contract over `ratio` with weights.
-        let kv_grouped = kv.reshape((b, h, t_new, self.ratio, d))?;
-        // weights: [ratio] → broadcast to [B, H, T_new, ratio, D] via unsqueeze
-        let w = self.weights.reshape((1, 1, 1, self.ratio, 1))?;
-        let w_broadcast = w.broadcast_as(kv_grouped.shape())?;
-        let weighted = (kv_grouped * w_broadcast)?;
-        // Sum over the `ratio` dim → [B, H, T_new, D]
-        weighted.sum(3)
+        // Reshape: [B, H, T, D] → [B*H*T/r, r*D] (flatten each group to a 2D matrix)
+        let kv_flat = kv.reshape((b * h * t_new, self.ratio * d))?;
+        // Matmul: [B*H*T/r, r*D] @ [r*D, D] → [B*H*T/r, D]
+        let compressed = kv_flat.matmul(&self.weights)?;
+        // Reshape back: [B*H*T/r, D] → [B, H, T/r, D]
+        compressed.reshape((b, h, t_new, d))
     }
 }
 
@@ -482,7 +512,7 @@ mod tests {
         let data: Vec<f32> = (0..(b * h * t * d)).map(|i| (i as f32) * 0.01).collect();
         let kv = Tensor::from_vec(data, (b, h, t, d), &device)?;
 
-        let compressor = Compressor::uniform(4, &device)?;
+        let compressor = Compressor::uniform(4, 16, &device)?;
         let out = compressor.forward(&kv)?;
         assert_eq!(out.dims(), &[b, h, t / 4, d]);
         Ok(())
@@ -500,7 +530,7 @@ mod tests {
             data.push(i as f32 + 0.5);
         }
         let kv = Tensor::from_vec(data, (1, 1, 8, 2), &device)?;
-        let compressor = Compressor::uniform(4, &device)?;
+        let compressor = Compressor::uniform(4, 2, &device)?;
         let out = compressor.forward(&kv)?;
         let v: Vec<f32> = out.flatten_all()?.to_vec1()?;
         // First group avg: tokens 0..3 → mean of (0,1,2,3) = 1.5; (0.5, 1.5, 2.5, 3.5) = 2.0
@@ -556,8 +586,8 @@ mod tests {
         let k = mk(0.2, t)?;
         let v = mk(0.3, t)?;
 
-        let comp_k = Compressor::uniform(4, &device)?;
-        let comp_v = Compressor::uniform(4, &device)?;
+        let comp_k = Compressor::uniform(4, 8, &device)?;
+        let comp_v = Compressor::uniform(4, 8, &device)?;
         let out = csa_attention(&q, &k, &v, &comp_k, &comp_v, 2)?;
         assert_eq!(out.dims(), &[b, h, nq, d]);
         // No NaNs / infinities
@@ -585,8 +615,8 @@ mod tests {
         let k = mk(0.15, t)?;
         let v = mk(0.25, t)?;
 
-        let comp_k = Compressor::uniform(128, &device)?;
-        let comp_v = Compressor::uniform(128, &device)?;
+        let comp_k = Compressor::uniform(128, 8, &device)?;
+        let comp_v = Compressor::uniform(128, 8, &device)?;
         let out = hca_attention(&q, &k, &v, &comp_k, &comp_v)?;
         assert_eq!(out.dims(), &[b, h, 4, d]);
         let data: Vec<f32> = out.flatten_all()?.to_vec1()?;
@@ -654,7 +684,7 @@ mod tests {
         let weights = candle_nn::ops::softmax_last_dim(&scaled)?;
         let expected = weights.matmul(&v)?;
 
-        let comp = Compressor::uniform(4, &device)?;
+        let comp = Compressor::uniform(4, 4, &device)?;
         let cfg = Dsv4Config {
             compress_ratio: CompressRatio::Standard,
             csa_topk: 2,
@@ -666,6 +696,72 @@ mod tests {
         let actual_v: Vec<f32> = actual.flatten_all()?.to_vec1()?;
         for (e, a) in expected_v.iter().zip(actual_v.iter()) {
             assert!((e - a).abs() < 1e-5, "{} ≠ {}", e, a);
+        }
+        Ok(())
+    }
+
+    /// With random 2D learned weights, the compressor output is a deterministic
+    /// matmul of the grouped input — exercises the full learned path, not just
+    /// the uniform shortcut.
+    #[test]
+    fn learned_compressor_matches_manual_matmul() -> Result<()> {
+        let device = Device::Cpu;
+        let ratio = 4;
+        let head_dim = 8;
+        let b = 1;
+        let h = 1;
+        let t = 16;
+
+        // Build pseudo-random learned weights deterministically.
+        let mut w_data = Vec::with_capacity(ratio * head_dim * head_dim);
+        for i in 0..(ratio * head_dim * head_dim) {
+            w_data.push(((i as f32) * 0.013).sin() * 0.5);
+        }
+        let w = Tensor::from_vec(w_data.clone(), (ratio * head_dim, head_dim), &device)?;
+        let comp = Compressor::from_weights(w, ratio, head_dim)?;
+
+        // Build a deterministic input.
+        let kv_data: Vec<f32> = (0..(b * h * t * head_dim))
+            .map(|i| ((i as f32) * 0.027).cos())
+            .collect();
+        let kv = Tensor::from_vec(kv_data.clone(), (b, h, t, head_dim), &device)?;
+
+        let out = comp.forward(&kv)?;
+        assert_eq!(out.dims(), &[b, h, t / ratio, head_dim]);
+
+        // Manual reference: flatten groups, matmul, reshape.
+        let t_new = t / ratio;
+        let mut expected = vec![0f32; b * h * t_new * head_dim];
+        for bi in 0..b {
+            for hi in 0..h {
+                for ti in 0..t_new {
+                    for d_out in 0..head_dim {
+                        let mut acc = 0f32;
+                        for i in 0..ratio {
+                            for d_in in 0..head_dim {
+                                let in_idx = bi * (h * t * head_dim)
+                                    + hi * (t * head_dim)
+                                    + (ti * ratio + i) * head_dim
+                                    + d_in;
+                                let w_idx = (i * head_dim + d_in) * head_dim + d_out;
+                                acc += kv_data[in_idx] * w_data[w_idx];
+                            }
+                        }
+                        expected[bi * (h * t_new * head_dim)
+                            + hi * (t_new * head_dim)
+                            + ti * head_dim
+                            + d_out] = acc;
+                    }
+                }
+            }
+        }
+
+        let out_data: Vec<f32> = out.flatten_all()?.to_vec1()?;
+        for (e, a) in expected.iter().zip(out_data.iter()) {
+            assert!(
+                (e - a).abs() < 1e-4,
+                "Compressor output {a} ≠ manual matmul reference {e}"
+            );
         }
         Ok(())
     }
@@ -686,7 +782,7 @@ mod tests {
         let device = Device::Cpu;
         let data = vec![0f32; 1 * 1 * 7 * 4]; // T=7, ratio=4 → misaligned
         let kv = Tensor::from_vec(data, (1, 1, 7, 4), &device).unwrap();
-        let compressor = Compressor::uniform(4, &device).unwrap();
+        let compressor = Compressor::uniform(4, 4, &device).unwrap();
         assert!(compressor.forward(&kv).is_err());
     }
 
@@ -709,7 +805,7 @@ mod tests {
         let q = mk(0.1, nq)?;
         let k = mk(0.2, t)?;
         let v = mk(0.3, t)?;
-        let comp = Compressor::uniform(4, &device)?;
+        let comp = Compressor::uniform(4, 8, &device)?;
         let out = csa_attention(&q, &k, &v, &comp, &comp, 16)?;
         assert_eq!(out.dims(), &[b, h, nq, d]);
         let data: Vec<f32> = out.flatten_all()?.to_vec1()?;

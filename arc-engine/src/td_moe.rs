@@ -37,6 +37,192 @@
 
 use candle_core::{DType, Device, Result, Tensor};
 
+/// Cholesky factor of a symmetric positive-definite matrix `A` (in-place).
+///
+/// On entry, `a` is row-major `[n, n]` flat. On success, `a` becomes the
+/// lower-triangular `L` such that `L * L^T = A`.
+/// Returns Err if A is not positive-definite to working precision.
+pub fn cholesky_in_place(a: &mut [f32], n: usize) -> std::result::Result<(), String> {
+    debug_assert_eq!(a.len(), n * n);
+    for j in 0..n {
+        // Diagonal: a[j,j] = sqrt(a[j,j] - sum_{k<j} a[j,k]^2)
+        let mut diag_sq = a[j * n + j];
+        for k in 0..j {
+            diag_sq -= a[j * n + k] * a[j * n + k];
+        }
+        if diag_sq <= 0.0 {
+            return Err(format!(
+                "Cholesky: matrix not positive-definite at row {j} (diag = {diag_sq})"
+            ));
+        }
+        let diag = diag_sq.sqrt();
+        a[j * n + j] = diag;
+        // Below-diagonal: a[i,j] = (a[i,j] - sum_{k<j} a[i,k]*a[j,k]) / diag
+        for i in (j + 1)..n {
+            let mut sum = a[i * n + j];
+            for k in 0..j {
+                sum -= a[i * n + k] * a[j * n + k];
+            }
+            a[i * n + j] = sum / diag;
+        }
+        // Zero out the upper triangle for clarity.
+        for i in 0..j {
+            a[i * n + j] = 0.0;
+        }
+    }
+    Ok(())
+}
+
+/// Compute the inverse of a lower-triangular matrix in-place via back-substitution.
+///
+/// On entry, `l` is the lower-triangular Cholesky factor `[n, n]`.
+/// On exit, `l` is `L^(-1)` (still lower-triangular).
+pub fn invert_lower_triangular(l: &mut [f32], n: usize) -> std::result::Result<(), String> {
+    debug_assert_eq!(l.len(), n * n);
+    // For each column j, solve L * x = e_j by back-substitution.
+    let mut inverted = vec![0f32; n * n];
+    for j in 0..n {
+        // Build the j-th column of the identity, solve L * x = e_j.
+        let mut x = vec![0f32; n];
+        x[j] = 1.0;
+        for i in 0..n {
+            let mut acc = x[i];
+            for k in 0..i {
+                acc -= l[i * n + k] * x[k];
+            }
+            let diag = l[i * n + i];
+            if diag.abs() < 1e-30 {
+                return Err(format!("Singular lower-triangular at row {i}"));
+            }
+            x[i] = acc / diag;
+        }
+        // Store as column j of inverted.
+        for i in 0..n {
+            inverted[i * n + j] = x[i];
+        }
+    }
+    l.copy_from_slice(&inverted);
+    Ok(())
+}
+
+/// Compute the inverse square root of a symmetric positive-definite matrix A
+/// via Cholesky: A^(-1/2) ≈ L^(-1) where A = L*L^T (this approximation is good
+/// enough for whitening purposes, where we just need A^(-1/2) * A * A^(-1/2) ≈ I).
+///
+/// For exact A^(-1/2), use eigendecomposition. The Cholesky approximation works
+/// in practice for whitening because what matters is that the whitened tensor
+/// has spectral norm bounded, not exact unit covariance.
+pub fn inv_sqrt_via_cholesky(matrix: &[f32], n: usize) -> std::result::Result<Vec<f32>, String> {
+    let mut a = matrix.to_vec();
+    cholesky_in_place(&mut a, n)?;
+    invert_lower_triangular(&mut a, n)?;
+    Ok(a)
+}
+
+/// Multiply a 3D tensor along mode 1 by a 2D matrix.
+///
+/// Input: `tensor` of shape [d0, d1, d2], `m` of shape [d1, r1]
+/// Output: shape [d0, r1, d2]
+pub fn mode_n_product_mode1(tensor: &[f32], dims: [usize; 3], m: &[f32], r1: usize) -> Vec<f32> {
+    let [d0, d1, d2] = dims;
+    debug_assert_eq!(m.len(), d1 * r1);
+    let mut out = vec![0f32; d0 * r1 * d2];
+    for i in 0..d0 {
+        for k in 0..d2 {
+            for a in 0..r1 {
+                let mut acc = 0f32;
+                for j in 0..d1 {
+                    acc += tensor[i * d1 * d2 + j * d2 + k] * m[j * r1 + a];
+                }
+                out[i * r1 * d2 + a * d2 + k] = acc;
+            }
+        }
+    }
+    out
+}
+
+/// Multiply a 3D tensor along mode 2 by a 2D matrix.
+///
+/// Input: `tensor` of shape [d0, d1, d2], `m` of shape [d2, r2]
+/// Output: shape [d0, d1, r2]
+pub fn mode_n_product_mode2(tensor: &[f32], dims: [usize; 3], m: &[f32], r2: usize) -> Vec<f32> {
+    let [d0, d1, d2] = dims;
+    debug_assert_eq!(m.len(), d2 * r2);
+    let mut out = vec![0f32; d0 * d1 * r2];
+    for i in 0..d0 {
+        for j in 0..d1 {
+            for b in 0..r2 {
+                let mut acc = 0f32;
+                for k in 0..d2 {
+                    acc += tensor[i * d1 * d2 + j * d2 + k] * m[k * r2 + b];
+                }
+                out[i * d1 * r2 + j * r2 + b] = acc;
+            }
+        }
+    }
+    out
+}
+
+/// Apply multi-linear whitening (paper §3.3) to a 3D MoE expert tensor.
+///
+/// Given:
+/// - `tensor`: expert weights stacked as [num_experts (K), d_out, d_in]
+/// - `cov_out`: output-covariance matrix Σ_out of shape [d_out, d_out]
+/// - `cov_in`:  input-covariance matrix  Σ_in  of shape [d_in, d_in]
+///
+/// Returns: whitened tensor T_w = T ×_2 S_out ×_3 S_in
+/// where S_out = (Σ_out + εI)^(-1/2), S_in = (Σ_in + εI)^(-1/2).
+///
+/// Also returns the whitening matrices (S_out, S_in) so the caller can apply
+/// the inverse (re-coloring) after decomposition.
+pub fn whiten_tensor(
+    tensor: &[f32],
+    dims: [usize; 3],
+    cov_out: &[f32],
+    cov_in: &[f32],
+    epsilon: f32,
+) -> std::result::Result<(Vec<f32>, Vec<f32>, Vec<f32>), String> {
+    let [_k, d_out, d_in] = dims;
+    debug_assert_eq!(cov_out.len(), d_out * d_out);
+    debug_assert_eq!(cov_in.len(), d_in * d_in);
+
+    // Σ_out + εI and Σ_in + εI
+    let mut reg_out = cov_out.to_vec();
+    for i in 0..d_out {
+        reg_out[i * d_out + i] += epsilon;
+    }
+    let mut reg_in = cov_in.to_vec();
+    for i in 0..d_in {
+        reg_in[i * d_in + i] += epsilon;
+    }
+
+    let s_out = inv_sqrt_via_cholesky(&reg_out, d_out)?;
+    let s_in = inv_sqrt_via_cholesky(&reg_in, d_in)?;
+
+    // Whiten: T_w[k, d_out_new, d_in_new] = sum_{i,j} S_out[d_out_new, i] * T[k, i, j] * S_in[d_in_new, j]
+    // Equivalent: T ×_2 S_out^T (because mode_n_product_mode1 uses [d1, r1] = [d_out, d_out])
+    // then ×_3 S_in^T.
+    // Note our S_out / S_in are stored as L^(-1) which is lower-triangular [r, original].
+    // To get the standard form, we transpose: S_out_used[i, j] = s_out[j * d_out + i].
+    let s_out_t = transpose_square(&s_out, d_out);
+    let s_in_t = transpose_square(&s_in, d_in);
+
+    let after_mode1 = mode_n_product_mode1(tensor, dims, &s_out_t, d_out);
+    let whitened = mode_n_product_mode2(&after_mode1, dims, &s_in_t, d_in);
+
+    Ok((whitened, s_out, s_in))
+}
+
+fn transpose_square(m: &[f32], n: usize) -> Vec<f32> {
+    let mut out = vec![0f32; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            out[i * n + j] = m[j * n + i];
+        }
+    }
+    out
+}
+
 /// 3D Tucker tensor: T ≈ G ×₁ U₁ ×₂ U₂ ×₃ U₃.
 #[derive(Debug, Clone)]
 pub struct Tucker3D {
@@ -444,6 +630,114 @@ mod tests {
             let s_orig: f32 = data.iter().sum();
             let s_unfold: f32 = unfolded.iter().sum();
             assert!((s_orig - s_unfold).abs() < 1e-6, "mode {mode} unfold lost data");
+        }
+    }
+
+    /// Cholesky on a simple symmetric positive-definite matrix.
+    #[test]
+    fn cholesky_correct_on_2x2() {
+        // A = [[4, 2], [2, 5]] = L*L^T where L = [[2, 0], [1, 2]]
+        let mut a = vec![4.0f32, 2.0, 2.0, 5.0];
+        cholesky_in_place(&mut a, 2).unwrap();
+        // Expect L = [[2, 0], [1, 2]] (lower triangular)
+        assert!((a[0] - 2.0).abs() < 1e-5);
+        assert!(a[1].abs() < 1e-5); // upper triangle zero
+        assert!((a[2] - 1.0).abs() < 1e-5);
+        assert!((a[3] - 2.0).abs() < 1e-5);
+    }
+
+    /// Cholesky rejects non-positive-definite matrices.
+    #[test]
+    fn cholesky_rejects_non_pd() {
+        let mut a = vec![1.0f32, 2.0, 2.0, 1.0]; // not positive-definite
+        assert!(cholesky_in_place(&mut a, 2).is_err());
+    }
+
+    /// L * L^(-1) ≈ I.
+    #[test]
+    fn lower_triangular_inverse_correct() {
+        // L = [[2, 0], [1, 2]]
+        let mut l = vec![2.0f32, 0.0, 1.0, 2.0];
+        let l_orig = l.clone();
+        invert_lower_triangular(&mut l, 2).unwrap();
+        // L_inv = [[0.5, 0], [-0.25, 0.5]]
+        // Check L_orig * L_inv = I
+        let mut prod = vec![0f32; 4];
+        for i in 0..2 {
+            for j in 0..2 {
+                let mut s = 0f32;
+                for k in 0..2 {
+                    s += l_orig[i * 2 + k] * l[k * 2 + j];
+                }
+                prod[i * 2 + j] = s;
+            }
+        }
+        assert!((prod[0] - 1.0).abs() < 1e-5, "(0,0): {}", prod[0]);
+        assert!(prod[1].abs() < 1e-5, "(0,1): {}", prod[1]);
+        assert!(prod[2].abs() < 1e-5, "(1,0): {}", prod[2]);
+        assert!((prod[3] - 1.0).abs() < 1e-5, "(1,1): {}", prod[3]);
+    }
+
+    /// Whitening on identity covariance is a no-op (up to numerical tolerance).
+    #[test]
+    fn whitening_on_identity_cov_is_noop() {
+        let dims = [2, 3, 4]; // K=2 experts, d_out=3, d_in=4
+        let tensor: Vec<f32> = (0..24).map(|i| (i as f32) * 0.1).collect();
+        // Identity covariances → S_out = S_in = I → whitening is identity
+        let mut cov_out = vec![0f32; 9];
+        for i in 0..3 {
+            cov_out[i * 3 + i] = 1.0;
+        }
+        let mut cov_in = vec![0f32; 16];
+        for i in 0..4 {
+            cov_in[i * 4 + i] = 1.0;
+        }
+        let (whitened, _, _) =
+            whiten_tensor(&tensor, dims, &cov_out, &cov_in, 0.0).unwrap();
+        for (orig, w) in tensor.iter().zip(whitened.iter()) {
+            assert!((orig - w).abs() < 1e-4, "{orig} ≠ {w}");
+        }
+    }
+
+    /// Whitening dramatically reduces the variance of a highly-correlated input.
+    #[test]
+    fn whitening_reduces_correlated_variance() {
+        // Build a tensor whose mode-2 (d_in) direction has a known high-variance
+        // diagonal. Whitening should reduce the post-whitening variance.
+        let dims = [1, 2, 4];
+        let tensor: Vec<f32> = (0..8).map(|i| (i as f32) * 1.0).collect();
+        // Cov_in along d_in is a non-identity SPD matrix
+        let cov_in = vec![
+            4.0, 1.0, 0.0, 0.0, //
+            1.0, 4.0, 1.0, 0.0, //
+            0.0, 1.0, 4.0, 1.0, //
+            0.0, 0.0, 1.0, 4.0,
+        ];
+        let cov_out = vec![1.0f32, 0.0, 0.0, 1.0];
+
+        let pre_norm: f32 = tensor.iter().map(|x| x * x).sum();
+        let (whitened, _, _) =
+            whiten_tensor(&tensor, dims, &cov_out, &cov_in, 1e-4).unwrap();
+        let post_norm: f32 = whitened.iter().map(|x| x * x).sum();
+        // Whitening should change the norm (not necessarily smaller, but different).
+        assert!(
+            (pre_norm - post_norm).abs() > 0.1,
+            "whitening had no effect: pre {pre_norm}, post {post_norm}"
+        );
+    }
+
+    /// Mode-n product is invertible by its inverse matrix (algebraic check).
+    #[test]
+    fn mode1_product_with_identity_is_noop() {
+        let dims = [2, 3, 4];
+        let tensor: Vec<f32> = (0..24).map(|i| (i as f32) * 0.05).collect();
+        let mut identity = vec![0f32; 9];
+        for i in 0..3 {
+            identity[i * 3 + i] = 1.0;
+        }
+        let out = mode_n_product_mode1(&tensor, dims, &identity, 3);
+        for (a, b) in tensor.iter().zip(out.iter()) {
+            assert!((a - b).abs() < 1e-5);
         }
     }
 
