@@ -236,6 +236,13 @@ impl NormalLoaderBuilder {
             Some(NormalLoaderType::Phi3_5MoE) => Box::new(Phi3_5MoELoader),
             Some(NormalLoaderType::DeepSeekV2) => Box::new(DeepSeekV2Loader),
             Some(NormalLoaderType::DeepSeekV3) => Box::new(DeepSeekV3Loader),
+            // V4, KimiK2 (text-side = DeepSeek V3), and GLM-5 DSA all dispatch
+            // through V3-derived loaders at Tier A. Per-architecture quirks
+            // (V4's CSA/HCA, GLM-5's DSA backend) are wired in via the attention
+            // dispatcher when the model graph is constructed.
+            Some(NormalLoaderType::DeepSeekV4) => Box::new(DeepSeekV3Loader),
+            Some(NormalLoaderType::KimiK2) => Box::new(DeepSeekV3Loader),
+            Some(NormalLoaderType::GLM5MoeDsa) => Box::new(GLM4MoeLoader),
             Some(NormalLoaderType::Qwen3) => Box::new(Qwen3Loader),
             Some(NormalLoaderType::GLM4) => Box::new(GLM4Loader),
             Some(NormalLoaderType::GLM4MoeLite) => Box::new(GLM4MoeLiteLoader),

@@ -167,6 +167,21 @@ pub enum NormalLoaderType {
     DeepSeekV2,
     #[serde(rename = "deepseekv3")]
     DeepSeekV3,
+    /// DeepSeek V4 (Pro + Flash). Architecturally a superset of V3:
+    /// inherits MLA + MoE, adds per-layer CSA/HCA hybrid attention.
+    /// At Tier A, dispatched to the V3 loader (compresses to dense MLA);
+    /// the V4-specific CSA/HCA attention path lives in `arc-engine::dsv4`
+    /// and is wired in via `Sdpa::Dsv4` when compress_ratios is non-empty.
+    #[serde(rename = "deepseekv4")]
+    DeepSeekV4,
+    /// Kimi K2.5 / K2.6. Text-side architecture is DeepSeek V3 (per Moonshot's
+    /// implementation in SGLang: `kimi_k25.py` extends `DeepseekV3ForCausalLM`).
+    #[serde(rename = "kimi_k2")]
+    KimiK2,
+    /// GLM-5.0 / 5.1 with DSA (V3-NSA-style) attention. SGLang serves this via
+    /// `GlmMoeDsaForCausalLM` which extends `DeepseekV2ForCausalLM`.
+    #[serde(rename = "glm5moedsa")]
+    GLM5MoeDsa,
     #[serde(rename = "qwen3")]
     Qwen3,
     #[serde(rename = "glm4")]
@@ -203,6 +218,15 @@ impl NormalLoaderType {
             "PhiMoEForCausalLM" => Ok(Self::Phi3_5MoE),
             "DeepseekV2ForCausalLM" => Ok(Self::DeepSeekV2),
             "DeepseekV3ForCausalLM" => Ok(Self::DeepSeekV3),
+            // V4 Pro and V4 Flash both use this architecture name
+            "DeepseekV4ForCausalLM" => Ok(Self::DeepSeekV4),
+            // Kimi K2.5 / K2.6 (text + multimodal both register the same generation class)
+            "KimiK25ForConditionalGeneration" => Ok(Self::KimiK2),
+            "KimiK2ForCausalLM" => Ok(Self::KimiK2),
+            "KimiK26ForCausalLM" => Ok(Self::KimiK2),
+            "KimiK26VLForConditionalGeneration" => Ok(Self::KimiK2),
+            // GLM-5: SGLang's GlmMoeDsaForCausalLM
+            "GlmMoeDsaForCausalLM" => Ok(Self::GLM5MoeDsa),
             "Qwen3ForCausalLM" => Ok(Self::Qwen3),
             "Glm4ForCausalLM" => Ok(Self::GLM4),
             "Glm4MoeLiteForCausalLM" => Ok(Self::GLM4MoeLite),
@@ -235,6 +259,9 @@ impl FromStr for NormalLoaderType {
             "phi3.5moe" => Ok(Self::Phi3_5MoE),
             "deepseekv2" => Ok(Self::DeepSeekV2),
             "deepseekv3" => Ok(Self::DeepSeekV3),
+            "deepseekv4" => Ok(Self::DeepSeekV4),
+            "kimi_k2" | "kimi_k25" | "kimi_k26" => Ok(Self::KimiK2),
+            "glm5moedsa" | "glm5" => Ok(Self::GLM5MoeDsa),
             "qwen3" => Ok(Self::Qwen3),
             "glm4" => Ok(Self::GLM4),
             "glm4moelite" => Ok(Self::GLM4MoeLite),
@@ -244,7 +271,7 @@ impl FromStr for NormalLoaderType {
             "granitemoehybrid" => Ok(Self::GraniteMoeHybrid),
             "gpt_oss" => Ok(Self::GptOss),
             "qwen3next" => Ok(Self::Qwen3Next),
-            a => Err(format!("Unknown architecture `{a}`. Possible architectures: `mistral`, `gemma`, `mixtral`, `llama`, `phi2`, `phi3`, `qwen2`, `gemma2`, `starcoder2`, `phi3.5moe`, `deepseekv2`, `deepseekv3`, `qwen3`, `glm4`, `glm4moelite`, `glm4moe`, `qwen3moe`, `smollm3`, `granitemoehybrid`, `gpt_oss`, `qwen3next`.")),
+            a => Err(format!("Unknown architecture `{a}`. Possible architectures: `mistral`, `gemma`, `mixtral`, `llama`, `phi2`, `phi3`, `qwen2`, `gemma2`, `starcoder2`, `phi3.5moe`, `deepseekv2`, `deepseekv3`, `deepseekv4`, `kimi_k2`, `glm5moedsa`, `qwen3`, `glm4`, `glm4moelite`, `glm4moe`, `qwen3moe`, `smollm3`, `granitemoehybrid`, `gpt_oss`, `qwen3next`.")),
         }
     }
 }
@@ -264,6 +291,9 @@ impl Display for NormalLoaderType {
             Self::Starcoder2 => write!(f, "starcoder2"),
             Self::DeepSeekV2 => write!(f, "deepseekv2"),
             Self::DeepSeekV3 => write!(f, "deepseekv3"),
+            Self::DeepSeekV4 => write!(f, "deepseekv4"),
+            Self::KimiK2 => write!(f, "kimi_k2"),
+            Self::GLM5MoeDsa => write!(f, "glm5moedsa"),
             Self::Qwen3 => write!(f, "qwen3"),
             Self::GLM4 => write!(f, "glm4"),
             Self::GLM4MoeLite => write!(f, "glm4moelite"),
@@ -321,6 +351,21 @@ impl AutoNormalLoader {
             NormalLoaderType::Phi3_5MoE => Ok(Box::new(Phi3_5MoELoader)),
             NormalLoaderType::DeepSeekV2 => Ok(Box::new(DeepSeekV2Loader)),
             NormalLoaderType::DeepSeekV3 => Ok(Box::new(DeepSeekV3Loader)),
+            // V4 Pro/Flash: Tier A dispatches to V3 loader. V4 config is a superset
+            // of V3's; serde silently ignores the V4-only fields (compress_ratios,
+            // index_topk, index_n_heads). This loads V4 weights using V3's dense
+            // MLA — quality preserved but without CSA/HCA acceleration. The
+            // CSA/HCA-aware loader is RUN-145 Tier B work.
+            NormalLoaderType::DeepSeekV4 => Ok(Box::new(DeepSeekV3Loader)),
+            // Kimi K2.5/K2.6 text architecture IS DeepSeek V3 (per SGLang's
+            // kimi_k25.py line 39: `from sglang.srt.models.deepseek_v2 import
+            // DeepseekV3ForCausalLM`). Direct alias.
+            NormalLoaderType::KimiK2 => Ok(Box::new(DeepSeekV3Loader)),
+            // GLM-5 (DSA variant) extends DeepSeek V2/V3-style MLA + DSA attention.
+            // SGLang: `class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM)`.
+            // Tier A: dispatch to GLM4Moe loader (uses standard attention).
+            // Tier B: V3 path with DSA awareness.
+            NormalLoaderType::GLM5MoeDsa => Ok(Box::new(GLM4MoeLoader)),
             NormalLoaderType::Qwen3 => Ok(Box::new(Qwen3Loader)),
             NormalLoaderType::GLM4 => Ok(Box::new(GLM4Loader)),
             NormalLoaderType::GLM4MoeLite => Ok(Box::new(GLM4MoeLiteLoader)),
@@ -5104,3 +5149,93 @@ impl DeviceMappedModelLoader for Qwen3NextLoader {
         Ok(Box::new(cfg))
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispatcher_recognizes_v4_architectures() {
+        assert!(matches!(
+            NormalLoaderType::from_causal_lm_name("DeepseekV4ForCausalLM").unwrap(),
+            NormalLoaderType::DeepSeekV4
+        ));
+    }
+
+    #[test]
+    fn dispatcher_recognizes_kimi_k2_family() {
+        let variants = [
+            "KimiK25ForConditionalGeneration",
+            "KimiK2ForCausalLM",
+            "KimiK26ForCausalLM",
+            "KimiK26VLForConditionalGeneration",
+        ];
+        for v in &variants {
+            let tp = NormalLoaderType::from_causal_lm_name(v).unwrap_or_else(
+                |_| panic!("{v} should map to KimiK2"),
+            );
+            assert!(matches!(tp, NormalLoaderType::KimiK2));
+        }
+    }
+
+    #[test]
+    fn dispatcher_recognizes_glm5_dsa() {
+        assert!(matches!(
+            NormalLoaderType::from_causal_lm_name("GlmMoeDsaForCausalLM").unwrap(),
+            NormalLoaderType::GLM5MoeDsa
+        ));
+    }
+
+    #[test]
+    fn dispatcher_from_str_recognizes_new_arches() {
+        assert!(matches!(
+            "deepseekv4".parse::<NormalLoaderType>().unwrap(),
+            NormalLoaderType::DeepSeekV4
+        ));
+        for s in &["kimi_k2", "kimi_k25", "kimi_k26"] {
+            assert!(matches!(
+                s.parse::<NormalLoaderType>().unwrap(),
+                NormalLoaderType::KimiK2
+            ));
+        }
+        for s in &["glm5moedsa", "glm5"] {
+            assert!(matches!(
+                s.parse::<NormalLoaderType>().unwrap(),
+                NormalLoaderType::GLM5MoeDsa
+            ));
+        }
+    }
+
+    #[test]
+    fn display_round_trips_new_arches() {
+        let cases = [
+            (NormalLoaderType::DeepSeekV4, "deepseekv4"),
+            (NormalLoaderType::KimiK2, "kimi_k2"),
+            (NormalLoaderType::GLM5MoeDsa, "glm5moedsa"),
+        ];
+        for (tp, s) in &cases {
+            assert_eq!(&format!("{tp}"), s);
+        }
+    }
+
+    #[test]
+    fn auto_loader_dispatches_v4_config_without_crash() {
+        let cfg = r#"{"architectures": ["DeepseekV4ForCausalLM"]}"#;
+        // The loader should be constructible without panicking
+        AutoNormalLoader::get_loader(cfg).expect("V4 dispatch should succeed");
+    }
+
+    #[test]
+    fn auto_loader_dispatches_kimi_config_without_crash() {
+        let cfg = r#"{"architectures": ["KimiK25ForConditionalGeneration"]}"#;
+        AutoNormalLoader::get_loader(cfg).expect("Kimi K2 dispatch should succeed");
+    }
+
+    #[test]
+    fn auto_loader_dispatches_glm5_config_without_crash() {
+        let cfg = r#"{"architectures": ["GlmMoeDsaForCausalLM"]}"#;
+        AutoNormalLoader::get_loader(cfg).expect("GLM-5 DSA dispatch should succeed");
+    }
+}
+
