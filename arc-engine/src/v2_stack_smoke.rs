@@ -14,6 +14,184 @@
 mod tests {
     use candle_core::{DType, Device, Result, Tensor};
 
+    /// Sanity: every targeted frontier model family parses through Arc's
+    /// architecture-detection layer without panicking, picking the right
+    /// model-family loader. This is the "model loads cleanly" smoke test.
+    #[test]
+    fn all_frontier_model_configs_dispatch_correctly() {
+        use crate::deepseek_v4::{is_v4_config, DeepSeekV4Config};
+        use crate::glm_moe::{is_glm_moe_config, GlmMoeConfig, GlmVariant};
+        use crate::kimi_k2::{is_kimi_k2_config, KimiK2Config};
+
+        // DeepSeek V4 Flash (small variant)
+        let v4_flash = r#"{
+            "architectures": ["DeepseekV4ForCausalLM"],
+            "model_type": "deepseek_v4",
+            "num_hidden_layers": 27,
+            "hidden_size": 2048,
+            "n_routed_experts": 128,
+            "compress_ratios": [0, 4, 4, 128, 4, 4, 128, 4, 4, 128, 4, 4, 128, 4, 4, 128, 4, 4, 128, 4, 4, 128, 4, 4, 128, 4, 4]
+        }"#;
+        assert!(is_v4_config(v4_flash));
+        let cfg = DeepSeekV4Config::from_json(v4_flash).unwrap();
+        let (std, csa, hca) = cfg.compress_ratio_layer_counts();
+        assert_eq!(std + csa + hca, 27);
+
+        // DeepSeek V4 Pro (full scale)
+        let v4_pro = r#"{
+            "architectures": ["DeepseekV4ForCausalLM"],
+            "model_type": "deepseek_v4",
+            "num_hidden_layers": 43,
+            "hidden_size": 4096,
+            "n_routed_experts": 256,
+            "kv_lora_rank": 512,
+            "qk_nope_head_dim": 448,
+            "qk_rope_head_dim": 64,
+            "max_position_embeddings": 1048576
+        }"#;
+        assert!(is_v4_config(v4_pro));
+        let cfg = DeepSeekV4Config::from_json(v4_pro).unwrap();
+        assert_eq!(cfg.num_hidden_layers, 43);
+        assert_eq!(cfg.q_head_dim(), 512);
+        assert_eq!(cfg.max_position_embeddings, 1_048_576);
+
+        // Kimi K2.5
+        let k25 = r#"{
+            "architectures": ["KimiK25ForConditionalGeneration"],
+            "model_type": "kimi_k25",
+            "text_config": {
+                "vocab_size": 160000,
+                "num_hidden_layers": 61,
+                "hidden_size": 7168,
+                "n_routed_experts": 384,
+                "num_experts_per_tok": 8,
+                "max_position_embeddings": 262144
+            }
+        }"#;
+        assert!(is_kimi_k2_config(k25));
+        let cfg = KimiK2Config::from_json(k25).unwrap();
+        assert_eq!(cfg.text_config.vocab_size, 160_000);
+        assert_eq!(cfg.text_config.n_routed_experts, 384);
+        assert!(cfg.is_kimi_architecture());
+        assert!(!cfg.has_vision());
+
+        // Kimi K2.6 with vision tower
+        let k26_vl = r#"{
+            "architectures": ["KimiK26VLForConditionalGeneration"],
+            "model_type": "kimi_k26",
+            "text_config": {
+                "vocab_size": 160000,
+                "num_hidden_layers": 61,
+                "hidden_size": 7168,
+                "n_routed_experts": 384,
+                "num_experts_per_tok": 8
+            },
+            "vision_config": {
+                "patch_size": 14,
+                "num_attention_heads": 16,
+                "num_hidden_layers": 27,
+                "hidden_size": 1152,
+                "intermediate_size": 4304
+            }
+        }"#;
+        assert!(is_kimi_k2_config(k26_vl));
+        let cfg = KimiK2Config::from_json(k26_vl).unwrap();
+        assert!(cfg.has_vision());
+        let vis = cfg.vision_config.as_ref().unwrap();
+        assert_eq!(vis.num_hidden_layers, 27);
+
+        // GLM-4.5 (plain GLM-4 MoE)
+        let glm45 = r#"{
+            "architectures": ["Glm4MoeForCausalLM"],
+            "model_type": "glm4_moe",
+            "num_hidden_layers": 46,
+            "hidden_size": 4096,
+            "n_routed_experts": 128,
+            "num_experts_per_tok": 8,
+            "max_position_embeddings": 131072
+        }"#;
+        assert!(is_glm_moe_config(glm45));
+        let cfg = GlmMoeConfig::from_json(glm45).unwrap();
+        assert_eq!(cfg.variant(), GlmVariant::Glm4Moe);
+
+        // GLM-5.1 (DSA variant)
+        let glm51 = r#"{
+            "architectures": ["GlmMoeDsaForCausalLM"],
+            "model_type": "glm5",
+            "vocab_size": 151552,
+            "num_hidden_layers": 80,
+            "hidden_size": 5120,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 8,
+            "n_routed_experts": 256,
+            "num_experts_per_tok": 8,
+            "max_position_embeddings": 200000,
+            "max_output_length": 131072,
+            "kv_lora_rank": 512,
+            "qk_nope_head_dim": 128,
+            "qk_rope_head_dim": 64,
+            "v_head_dim": 128
+        }"#;
+        assert!(is_glm_moe_config(glm51));
+        let cfg = GlmMoeConfig::from_json(glm51).unwrap();
+        assert_eq!(cfg.variant(), GlmVariant::Glm5MoeDsa);
+        assert_eq!(cfg.num_attention_heads, 64);
+        assert_eq!(cfg.kv_lora_rank, Some(512));
+    }
+
+    /// Mutual exclusion check: each frontier config dispatches to exactly one
+    /// model family, never multiple. Prevents ambiguous routing at load time.
+    #[test]
+    fn architecture_dispatch_is_mutually_exclusive() {
+        use crate::deepseek_v4::is_v4_config;
+        use crate::glm_moe::is_glm_moe_config;
+        use crate::kimi_k2::is_kimi_k2_config;
+
+        let configs = vec![
+            ("V4", r#"{"architectures": ["DeepseekV4ForCausalLM"]}"#),
+            ("Kimi", r#"{"architectures": ["KimiK25ForConditionalGeneration"]}"#),
+            ("GLM", r#"{"architectures": ["Glm4MoeForCausalLM"]}"#),
+            ("GLM5", r#"{"architectures": ["GlmMoeDsaForCausalLM"]}"#),
+            ("Llama", r#"{"architectures": ["LlamaForCausalLM"]}"#),
+            ("Qwen", r#"{"architectures": ["Qwen3ForCausalLM"]}"#),
+            ("V3", r#"{"architectures": ["DeepseekV3ForCausalLM"]}"#),
+        ];
+        for (name, json) in &configs {
+            let v4 = is_v4_config(json);
+            let kimi = is_kimi_k2_config(json);
+            let glm = is_glm_moe_config(json);
+            let count = v4 as u8 + kimi as u8 + glm as u8;
+            assert!(
+                count <= 1,
+                "Config '{name}' matched multiple architectures: v4={v4}, kimi={kimi}, glm={glm}"
+            );
+        }
+    }
+
+    /// Malformed / empty configs must error cleanly, not panic.
+    /// This is the "no crash" guarantee at the loader boundary.
+    #[test]
+    fn malformed_configs_error_cleanly() {
+        use crate::deepseek_v4::DeepSeekV4Config;
+        use crate::glm_moe::GlmMoeConfig;
+        use crate::kimi_k2::KimiK2Config;
+
+        // Completely empty — should still parse via defaults (no crash)
+        assert!(DeepSeekV4Config::from_json("{}").is_ok());
+        assert!(KimiK2Config::from_json("{}").is_ok());
+        assert!(GlmMoeConfig::from_json("{}").is_ok());
+
+        // Malformed JSON → error (not crash)
+        assert!(DeepSeekV4Config::from_json("not json").is_err());
+        assert!(KimiK2Config::from_json("not json").is_err());
+        assert!(GlmMoeConfig::from_json("not json").is_err());
+
+        // Wrong field types → error (not crash)
+        let bad_types = r#"{"num_hidden_layers": "forty-three"}"#;
+        assert!(DeepSeekV4Config::from_json(bad_types).is_err());
+    }
+
+
     /// Tiny FFN with NVFP4 weights and dReLU activation. Verifies the full
     /// pipeline composes without panic and produces finite values.
     #[test]

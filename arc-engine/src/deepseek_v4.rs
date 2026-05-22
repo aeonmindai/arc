@@ -68,7 +68,7 @@ pub struct DeepSeekV4Config {
     pub kv_lora_rank: usize,
     #[serde(default = "default_max_position")]
     pub max_position_embeddings: usize,
-    #[serde(default = "default_model_type")]
+    #[serde(default)]
     pub model_type: String,
 
     #[serde(default = "default_moe_intermediate_size")]
@@ -149,7 +149,6 @@ fn default_initializer_range() -> f32 { 0.02 }
 fn default_intermediate_size() -> usize { 2048 }
 fn default_kv_lora_rank() -> usize { 512 }
 fn default_max_position() -> usize { 65536 }
-fn default_model_type() -> String { "deepseek_v4".into() }
 fn default_moe_intermediate_size() -> usize { 2048 }
 fn default_n_group() -> usize { 8 }
 fn default_n_routed_experts() -> usize { 256 }
@@ -195,10 +194,16 @@ impl DeepSeekV4Config {
 
     /// Is this model an MLA-based DeepSeek V4 architecture?
     pub fn is_v4_architecture(&self) -> bool {
-        self.architectures
+        if self.architectures
             .iter()
             .any(|a| a.contains("DeepseekV4") || a.contains("DeepSeekV4"))
-            || self.model_type == "deepseek_v4"
+        {
+            return true;
+        }
+        if !self.model_type.is_empty() && self.model_type == "deepseek_v4" {
+            return true;
+        }
+        false
     }
 
     /// Estimate the number of layers using each compression ratio. Useful for
@@ -266,7 +271,9 @@ mod tests {
     /// Default V4 config matches the dataclass defaults from SGLang.
     #[test]
     fn default_config_matches_sglang_defaults() {
-        let cfg: DeepSeekV4Config = serde_json::from_str("{}").unwrap();
+        let cfg: DeepSeekV4Config = serde_json::from_str(
+            r#"{"architectures": ["DeepseekV4ForCausalLM"]}"#,
+        ).unwrap();
         assert_eq!(cfg.num_hidden_layers, 43);
         assert_eq!(cfg.num_attention_heads, 64);
         assert_eq!(cfg.num_key_value_heads, 1);
@@ -279,7 +286,6 @@ mod tests {
         assert_eq!(cfg.n_shared_experts, 1);
         assert_eq!(cfg.num_experts_per_tok, 6);
         assert_eq!(cfg.vocab_size, 129280);
-        assert_eq!(cfg.model_type, "deepseek_v4");
         assert_eq!(cfg.scoring_func, "sqrtsoftplus");
         assert_eq!(cfg.topk_method, "noaux_tc");
         assert!(cfg.is_v4_architecture());
