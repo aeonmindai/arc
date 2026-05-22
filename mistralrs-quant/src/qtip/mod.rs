@@ -200,12 +200,14 @@ impl QtipLayer {
                 // Scale the target row.
                 let scaled_target: Vec<f32> = row_slice.iter().map(|w| w * inv_scale).collect();
 
-                // NOTE: per-row Hadamard rotation does NOT help QTIP — it actually
-                // hurts because the trellis LUT has built-in correlation across
-                // consecutive states. Cornell's incoherence processing rotates the
-                // *input activations* at forward time (column rotation on W^T),
-                // not the weight rows. That's a Tier B integration involving the
-                // attention/MLP forward path.
+                // NOTE on Hadamard rotation: TWO attempts failed (per-row + per-
+                // layer column rotation). Both hurt Greedy and Viterbi. The QTIP
+                // trellis LUT correlates consecutive states, which is destroyed
+                // by any rotation that produces i.i.d.-like inputs. Cornell's
+                // real fix routes the rotation through input activations at
+                // forward time, not at quant time. That's a model-graph
+                // integration touching every linear-layer forward — deferred to
+                // RUN-158 as Tier B work.
 
                 // Encode the symbol sequence via the selected mode.
                 let symbols: Vec<u8> = match mode {
