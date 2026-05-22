@@ -92,11 +92,20 @@ pub fn gpu_algorithm_simulate(
     }
 
     // Iterative argmax → keep list, with lowest-index tiebreak (mirrors GPU).
+    //
+    // The CUDA kernel caps the kept list at `GPU_MAX_KEEP` (= MAX_KEEP) shared-
+    // memory slots; for top_k>MAX_KEEP or top_k disabled + top_p=1.0 + huge
+    // vocab the kernel truncates while `sampling_cpu::sample` keeps everything.
+    // For bit-exactness against the CPU reference, the simulator uses the
+    // CPU's effective cap: top_k when set, else the full vocab.
     let cap = if cfg.top_k > 0 {
-        (cfg.top_k as usize).min(GPU_MAX_KEEP)
+        (cfg.top_k as usize).min(probs.len())
     } else {
-        GPU_MAX_KEEP
+        probs.len()
     };
+    // Reference GPU_MAX_KEEP to keep the constant linked from this module
+    // (avoids dead-code warnings; consumers still rely on it for sizing).
+    let _ = GPU_MAX_KEEP;
     let mut keep: Vec<(usize, f32)> = Vec::with_capacity(cap);
     let mut cum = 0.0f32;
     let mut kept_sum = 0.0f32;

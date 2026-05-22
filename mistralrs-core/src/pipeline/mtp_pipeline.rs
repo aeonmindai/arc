@@ -39,7 +39,7 @@ use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 
-use candle_core::{Device, Result, Tensor};
+use candle_core::{Device, IndexOp, Result, Tensor};
 use candle_nn::{Embedding, Module};
 use rand_isaac::Isaac64Rng;
 use tokenizers::Tokenizer;

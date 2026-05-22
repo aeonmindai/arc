@@ -209,7 +209,12 @@ impl V4MHCLayerParams {
         let rsqrt = (sq_mean + self.rt.rms_norm_eps)?.recip()?.sqrt()?; // [N, 1]
 
         // mixes = (x_flat @ fn^T) * rsqrt  →  [N, mix_hc]
-        let mixes_raw = x_flat.matmul(&hc_fn.t()?)?;
+        // Defensively cast weight tensors to F32 — try_load already produces F32,
+        // but hand-constructed callers (tests, external integrators) may not.
+        let hc_fn_f32 = hc_fn.to_dtype(DType::F32)?;
+        let hc_scale_f32 = hc_scale.to_dtype(DType::F32)?;
+        let hc_base_f32 = hc_base.to_dtype(DType::F32)?;
+        let mixes_raw = x_flat.matmul(&hc_fn_f32.t()?)?;
         let mixes = mixes_raw.broadcast_mul(&rsqrt)?;
 
         // Slot indices in `mixes`:
@@ -223,12 +228,12 @@ impl V4MHCLayerParams {
             .reshape((n, hc, hc))?;
 
         // hc_scale is [3]; hc_base is [mix_hc] split into three blocks.
-        let s_pre = hc_scale.narrow(0, 0, 1)?;
-        let s_post = hc_scale.narrow(0, 1, 1)?;
-        let s_comb = hc_scale.narrow(0, 2, 1)?;
-        let b_pre = hc_base.narrow(0, 0, hc)?;
-        let b_post = hc_base.narrow(0, hc, hc)?;
-        let b_comb = hc_base.narrow(0, 2 * hc, hc * hc)?.reshape((hc, hc))?;
+        let s_pre = hc_scale_f32.narrow(0, 0, 1)?;
+        let s_post = hc_scale_f32.narrow(0, 1, 1)?;
+        let s_comb = hc_scale_f32.narrow(0, 2, 1)?;
+        let b_pre = hc_base_f32.narrow(0, 0, hc)?;
+        let b_post = hc_base_f32.narrow(0, hc, hc)?;
+        let b_comb = hc_base_f32.narrow(0, 2 * hc, hc * hc)?.reshape((hc, hc))?;
 
         // pre  = sigmoid(pre_block  * s_pre  + b_pre) + eps
         let pre = candle_nn::ops::sigmoid(
@@ -484,13 +489,18 @@ impl V4MHCHead {
         let rsqrt = (sq_mean + self.rt.rms_norm_eps)?.recip()?.sqrt()?;
 
         // mixes = (x_flat @ hc_head_fn^T) * rsqrt → [N, hc_mult]
-        let mixes_raw = x_flat.matmul(&self.hc_head_fn.t()?)?;
+        // Defensively cast weight tensors to F32 — try_load already produces F32,
+        // but hand-constructed callers (tests, external integrators) may not.
+        let head_fn_f32 = self.hc_head_fn.to_dtype(DType::F32)?;
+        let head_scale_f32 = self.hc_head_scale.to_dtype(DType::F32)?;
+        let head_base_f32 = self.hc_head_base.to_dtype(DType::F32)?;
+        let mixes_raw = x_flat.matmul(&head_fn_f32.t()?)?;
         let mixes = mixes_raw.broadcast_mul(&rsqrt)?;
 
         // weights = sigmoid(mixes * scale + base) + hc_eps   → [N, hc_mult]
         let scaled = mixes
-            .broadcast_mul(&self.hc_head_scale)?
-            .broadcast_add(&self.hc_head_base)?;
+            .broadcast_mul(&head_scale_f32)?
+            .broadcast_add(&head_base_f32)?;
         let weights = candle_nn::ops::sigmoid(&scaled)?;
         let weights = (weights + self.rt.hc_eps)?;
 
@@ -712,8 +722,18 @@ mod tests {
         // (+ eps) and column-normalize. With uniform input, the result stays
         // very close to uniform but eps perturbs it slightly. Use a generous
         // tolerance.
+        //
+        // NOTE: attn_out is [N, hidden]; the output is [N, hc_mult, hidden] where
+        // each branch k is `attn_out + mean(residual over branches)`. We must
+        // broadcast attn_out across the hc_mult axis to get matching shapes.
         let mean_resid = residual.mean(1)?; // [N, hidden]
-        let expected = (&attn_out + mean_resid.unsqueeze(1)?.broadcast_as((n, hc_mult, hidden))?)?;
+        let attn_broadcast = attn_out
+            .unsqueeze(1)?
+            .broadcast_as((n, hc_mult, hidden))?; // [N, hc_mult, hidden]
+        let mean_broadcast = mean_resid
+            .unsqueeze(1)?
+            .broadcast_as((n, hc_mult, hidden))?; // [N, hc_mult, hidden]
+        let expected = (attn_broadcast + mean_broadcast)?;
 
         let out_v: Vec<f32> = out.flatten_all()?.to_vec1()?;
         let exp_v: Vec<f32> = expected.flatten_all()?.to_vec1()?;
