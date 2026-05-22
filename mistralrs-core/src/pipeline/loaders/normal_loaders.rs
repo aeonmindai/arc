@@ -5237,5 +5237,159 @@ mod tests {
         let cfg = r#"{"architectures": ["GlmMoeDsaForCausalLM"]}"#;
         AutoNormalLoader::get_loader(cfg).expect("GLM-5 DSA dispatch should succeed");
     }
+
+    /// Realistic V4 Flash config: parse through V3's config struct AND through
+    /// the AutoNormalLoader dispatcher. Verifies V4's qk_nope_head_dim=448,
+    /// v_head_dim=512 etc. survive the V3 parser without loss.
+    #[test]
+    fn realistic_v4_config_parses_through_v3_struct() {
+        let cfg = r#"{
+            "architectures": ["DeepseekV4ForCausalLM"],
+            "vocab_size": 129280,
+            "hidden_size": 7168,
+            "intermediate_size": 18432,
+            "moe_intermediate_size": 2048,
+            "num_hidden_layers": 27,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 1,
+            "n_routed_experts": 256,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 8,
+            "moe_layer_freq": 1,
+            "first_k_dense_replace": 3,
+            "max_position_embeddings": 65536,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0,
+            "attention_bias": false,
+            "q_lora_rank": 1536,
+            "qk_nope_head_dim": 448,
+            "qk_rope_head_dim": 64,
+            "kv_lora_rank": 512,
+            "v_head_dim": 512,
+            "n_group": 8,
+            "topk_group": 4,
+            "topk_method": "noaux_tc",
+            "scoring_func": "sigmoid",
+            "routed_scaling_factor": 2.5,
+            "compress_ratios": [0, 4, 4, 128, 4, 4, 128, 4, 4, 128, 4, 4, 128, 4, 4, 128, 4, 4, 128, 4, 4, 128, 4, 4, 128, 4, 0],
+            "window_size": 128,
+            "compress_rope_theta": 40000,
+            "index_n_heads": 64,
+            "index_head_dim": 128,
+            "index_topk": 512,
+            "o_lora_rank": 1024,
+            "o_groups": 8
+        }"#;
+
+        // Dispatcher should construct a working loader
+        let _loader = AutoNormalLoader::get_loader(cfg)
+            .expect("V4 Flash realistic config should dispatch through AutoLoader");
+
+        // V3 parser should swallow V4's superset config without error
+        let v3_cfg: crate::models::deepseek3::DeepSeekV3Config =
+            serde_json::from_str(cfg).expect("V4 config should parse via V3 struct");
+
+        // Critical V4-specific shapes survive the V3 deserializer
+        assert_eq!(v3_cfg.qk_nope_head_dim, 448);
+        assert_eq!(v3_cfg.v_head_dim, 512);
+        assert_eq!(v3_cfg.kv_lora_rank, 512);
+        assert_eq!(v3_cfg.q_lora_rank, Some(1536));
+        assert_eq!(v3_cfg.num_hidden_layers, 27);
+        assert_eq!(v3_cfg.num_attention_heads, 64);
+        assert_eq!(v3_cfg.n_routed_experts, Some(256));
+        assert_eq!(v3_cfg.first_k_dense_replace, 3);
+    }
+
+    /// Realistic K2.5 / K2.6 config (text-side): V3 with K2-specific vocab,
+    /// expert count, etc. Verifies V3 deserializer accepts K2-shaped JSON.
+    #[test]
+    fn realistic_k2_config_parses_through_v3_struct() {
+        let cfg = r#"{
+            "architectures": ["KimiK25ForConditionalGeneration"],
+            "vocab_size": 160000,
+            "hidden_size": 7168,
+            "intermediate_size": 18432,
+            "moe_intermediate_size": 2048,
+            "num_hidden_layers": 61,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 1,
+            "n_routed_experts": 384,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 8,
+            "moe_layer_freq": 1,
+            "first_k_dense_replace": 1,
+            "max_position_embeddings": 262144,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 50000.0,
+            "attention_bias": false,
+            "q_lora_rank": 1536,
+            "qk_nope_head_dim": 128,
+            "qk_rope_head_dim": 64,
+            "kv_lora_rank": 512,
+            "v_head_dim": 128,
+            "n_group": 8,
+            "topk_group": 4,
+            "topk_method": "noaux_tc",
+            "scoring_func": "sigmoid",
+            "routed_scaling_factor": 2.5
+        }"#;
+
+        let _loader = AutoNormalLoader::get_loader(cfg)
+            .expect("K2 config should dispatch through AutoLoader");
+
+        let v3_cfg: crate::models::deepseek3::DeepSeekV3Config =
+            serde_json::from_str(cfg).expect("K2 config should parse via V3 struct");
+
+        assert_eq!(v3_cfg.vocab_size, 160000);
+        assert_eq!(v3_cfg.n_routed_experts, Some(384));
+        assert_eq!(v3_cfg.num_hidden_layers, 61);
+        assert_eq!(v3_cfg.max_position_embeddings, 262144);
+    }
+
+    /// Realistic GLM-5 DSA config: V3 with `index_topk` for DSA top-k indexing.
+    #[test]
+    fn realistic_glm5_config_parses_through_v3_struct() {
+        let cfg = r#"{
+            "architectures": ["GlmMoeDsaForCausalLM"],
+            "vocab_size": 151552,
+            "hidden_size": 7168,
+            "intermediate_size": 18432,
+            "moe_intermediate_size": 2048,
+            "num_hidden_layers": 92,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 1,
+            "n_routed_experts": 256,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 8,
+            "moe_layer_freq": 1,
+            "first_k_dense_replace": 3,
+            "max_position_embeddings": 131072,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0,
+            "attention_bias": false,
+            "q_lora_rank": 1536,
+            "qk_nope_head_dim": 128,
+            "qk_rope_head_dim": 64,
+            "kv_lora_rank": 512,
+            "v_head_dim": 128,
+            "n_group": 8,
+            "topk_group": 4,
+            "topk_method": "noaux_tc",
+            "scoring_func": "sigmoid",
+            "routed_scaling_factor": 2.5,
+            "index_n_heads": 64,
+            "index_head_dim": 128,
+            "index_topk": 512
+        }"#;
+
+        let _loader = AutoNormalLoader::get_loader(cfg)
+            .expect("GLM-5 DSA config should dispatch through AutoLoader");
+
+        let v3_cfg: crate::models::deepseek3::DeepSeekV3Config =
+            serde_json::from_str(cfg).expect("GLM-5 config should parse via V3 struct");
+
+        assert_eq!(v3_cfg.vocab_size, 151552);
+        assert_eq!(v3_cfg.num_hidden_layers, 92);
+    }
 }
 
