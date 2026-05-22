@@ -10,7 +10,7 @@ use super::{
     IsqPipelineMixin, MetadataMixin, ModelCategory, PreProcessingMixin,
 };
 use super::{
-    AutoNormalLoader, DeepSeekV2Loader, DeepSeekV3Loader, GLM4Loader, GLM4MoeLiteLoader,
+    AutoNormalLoader, DeepSeekV2Loader, DeepSeekV3Loader, DeepSeekV4Loader, GLM4Loader, GLM4MoeLiteLoader,
     GLM4MoeLoader, Gemma2Loader, GemmaLoader, GptOssLoader, GraniteMoeHybridLoader, LlamaLoader,
     MistralLoader, MixtralLoader, NormalLoaderType, Phi2Loader, Phi3Loader, Phi3_5MoELoader,
     Qwen2Loader, Qwen3Loader, Qwen3MoELoader, Qwen3NextLoader, SmolLm3Loader, Starcoder2Loader,
@@ -240,7 +240,7 @@ impl NormalLoaderBuilder {
             // through V3-derived loaders at Tier A. Per-architecture quirks
             // (V4's CSA/HCA, GLM-5's DSA backend) are wired in via the attention
             // dispatcher when the model graph is constructed.
-            Some(NormalLoaderType::DeepSeekV4) => Box::new(DeepSeekV3Loader),
+            Some(NormalLoaderType::DeepSeekV4) => Box::new(DeepSeekV4Loader),
             Some(NormalLoaderType::KimiK2) => Box::new(DeepSeekV3Loader),
             Some(NormalLoaderType::GLM5MoeDsa) => Box::new(GLM4MoeLoader),
             Some(NormalLoaderType::Qwen3) => Box::new(Qwen3Loader),

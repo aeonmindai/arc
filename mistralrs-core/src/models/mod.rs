@@ -27,3 +27,4 @@ pub(crate) mod qwen3_moe;
 pub(crate) mod qwen3_next;
 pub(crate) mod smollm3;
 pub(crate) mod starcoder2;
+pub(crate) mod deepseek4;

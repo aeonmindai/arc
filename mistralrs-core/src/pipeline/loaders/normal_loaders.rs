@@ -351,12 +351,11 @@ impl AutoNormalLoader {
             NormalLoaderType::Phi3_5MoE => Ok(Box::new(Phi3_5MoELoader)),
             NormalLoaderType::DeepSeekV2 => Ok(Box::new(DeepSeekV2Loader)),
             NormalLoaderType::DeepSeekV3 => Ok(Box::new(DeepSeekV3Loader)),
-            // V4 Pro/Flash: Tier A dispatches to V3 loader. V4 config is a superset
-            // of V3's; serde silently ignores the V4-only fields (compress_ratios,
-            // index_topk, index_n_heads). This loads V4 weights using V3's dense
-            // MLA — quality preserved but without CSA/HCA acceleration. The
-            // CSA/HCA-aware loader is RUN-145 Tier B work.
-            NormalLoaderType::DeepSeekV4 => Ok(Box::new(DeepSeekV3Loader)),
+            // V4 routes to the dedicated DeepSeekV4Loader (mistralrs-core/src/models/deepseek4.rs).
+            // At Tier A, the V4 loader's forward path delegates to V3-class dense MLA
+            // (still loads V4-shaped weights but doesn't dispatch CSA/HCA/MTP).
+            // CSA/HCA + MTP wiring is RUN-155/156 (rental cycle).
+            NormalLoaderType::DeepSeekV4 => Ok(Box::new(DeepSeekV4Loader)),
             // Kimi K2.5/K2.6 text architecture IS DeepSeek V3 (per SGLang's
             // kimi_k25.py line 39: `from sglang.srt.models.deepseek_v2 import
             // DeepseekV3ForCausalLM`). Direct alias.
@@ -3128,6 +3127,236 @@ impl DeviceMappedModelLoader for DeepSeekV3Loader {
     }
 }
 
+/// [`NormalLoader`] for a DeepSeek V4 model (Pro or Flash).
+///
+/// V4 has a distinct tensor layout from V3 (per
+/// `research/code/06_foundation/sglang/python/sglang/srt/models/deepseek_v4.py`).
+/// This loader reuses V3's MLA forward path at Tier A (V3-quality dense MLA);
+/// real V4 perf wins from CSA/HCA/MTP/mHC require CUDA TileLang kernels
+/// and are scheduled for the B200 rental cycle (RUN-155, RUN-156).
+///
+/// [`NormalLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.NormalLoader.html
+pub struct DeepSeekV4Loader;
+
+impl NormalModelLoader for DeepSeekV4Loader {
+    fn load(
+        &self,
+        config: &str,
+        vb: ShardedVarBuilder,
+        normal_loading_metadata: NormalLoadingMetadata,
+        attention_mechanism: AttentionImplementation,
+    ) -> Result<Box<dyn NormalModel + Send + Sync>> {
+        let cfg: crate::models::deepseek4::DeepSeekV4Config = serde_json::from_str(config)?;
+        Ok(Box::new(models::deepseek4::DeepSeekV4::new(
+            &cfg,
+            vb,
+            self.is_gptx(config)?,
+            normal_loading_metadata,
+            attention_mechanism,
+        )?))
+    }
+    fn load_xlora(
+        &self,
+        _config: &str,
+        _vb: ShardedVarBuilder,
+        _lora_config: &[((String, String), LoraConfig)],
+        _xlora_config: Option<XLoraConfig>,
+        _xlora_ordering: Ordering,
+        _normal_loading_metadata: NormalLoadingMetadata,
+        _preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
+    ) -> Result<Box<dyn NormalModel + Send + Sync>> {
+        anyhow::bail!("V4 xlora is not supported")
+    }
+    fn is_gptx(&self, _: &str) -> Result<bool> {
+        Ok(true)
+    }
+    fn get_config_repr(&self, config: &str) -> Result<Box<dyn Debug>> {
+        let cfg: crate::models::deepseek4::DeepSeekV4Config = serde_json::from_str(config)?;
+        Ok(Box::new(cfg))
+    }
+}
+
+impl IsqModelLoader for DeepSeekV4Loader {
+    fn isq_layer_regexes(&self, config: &str) -> Result<Vec<Regex>> {
+        // V4 tensor regexes match the HF-mapped names (same paths as V3 since we
+        // delegate to V3's MLA structure at the loader level).
+        let mut data = vec![
+            Regex::new(r"lm_head\.(weight|bias)$")?,
+            // V4 attention: q_a/q_b (LoRA), kv_a/kv_b (still MLA-LoRA at this scaffolding tier), o_a/o_b (V4 LoRA)
+            Regex::new(r"layers\.(\d+)\.self_attn\.q_a_proj\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.self_attn\.q_b_proj\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.self_attn\.kv_a_proj_with_mqa\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.self_attn\.kv_b_proj\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.self_attn\.o_a_proj\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.self_attn\.o_b_proj\.(weight|bias)$")?,
+        ];
+        let cfg: crate::models::deepseek4::DeepSeekV4Config = serde_json::from_str(config)?;
+        for layer_idx in 0..cfg.num_hidden_layers {
+            if let Some(n_routed_experts) = cfg.n_routed_experts.filter(|_| {
+                layer_idx >= cfg.first_k_dense_replace && layer_idx % cfg.moe_layer_freq == 0
+            }) {
+                for i in 0..n_routed_experts {
+                    data.extend(vec![
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.experts\.{i}\.gate_proj\.(weight|bias)$"
+                        ))?,
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.experts\.{i}\.up_proj\.(weight|bias)$"
+                        ))?,
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.experts\.{i}\.down_proj\.(weight|bias)$"
+                        ))?,
+                    ]);
+                }
+            }
+        }
+        Ok(data)
+    }
+    fn immediate_isq_predicates(&self, config: &str) -> Result<Vec<Regex>> {
+        self.isq_layer_regexes(config)
+    }
+    fn isq_layer_regexes_moqe(&self, config: &str) -> Result<Vec<Regex>> {
+        self.isq_layer_regexes(config)
+    }
+    fn immediate_isq_predicates_moqe(&self, config: &str) -> Result<Vec<Regex>> {
+        self.isq_layer_regexes(config)
+    }
+}
+
+impl DeviceMappedModelLoader for DeepSeekV4Loader {
+    fn mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        let AutoDeviceMapParams::Text {
+            max_seq_len,
+            max_batch_size,
+        } = params
+        else {
+            anyhow::bail!("Expected text AutoDeviceMapParams for V4")
+        };
+        let cfg: crate::models::deepseek4::DeepSeekV4Config = serde_json::from_str(config)?;
+        Ok(max_batch_size * cfg.num_attention_heads * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2))
+    }
+    fn non_mapped_max_act_size_elems(
+        &self,
+        _config: &str,
+        _params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+    fn non_mapped_size_in_bytes(
+        &self,
+        config: &str,
+        dtype: DType,
+        weight_pack_factor: usize,
+        _matformer_config: Option<&MatformerSliceConfig>,
+    ) -> Result<usize> {
+        let cfg: crate::models::deepseek4::DeepSeekV4Config = serde_json::from_str(config)?;
+        let elems = {
+            let embed = cfg.hidden_size * cfg.vocab_size / weight_pack_factor;
+            let lm_head = if !cfg.tie_word_embeddings || weight_pack_factor != 1 {
+                cfg.hidden_size * cfg.vocab_size / weight_pack_factor
+            } else {
+                0
+            };
+            let norm = cfg.hidden_size;
+            embed + lm_head + norm
+        };
+        Ok(elems * dtype.size_in_bytes())
+    }
+    fn layer_sizes_in_bytes(
+        &self,
+        config: &str,
+        dtype: DType,
+        weight_pack_factor: usize,
+        _matformer_config: Option<&MatformerSliceConfig>,
+    ) -> Result<Vec<usize>> {
+        let cfg: crate::models::deepseek4::DeepSeekV4Config = serde_json::from_str(config)?;
+        let mut per_layer_elems = Vec::new();
+        for layer_idx in 0..cfg.num_hidden_layers {
+            let input_layernorm = cfg.hidden_size;
+            let post_attention_layernorm = cfg.hidden_size;
+            let q_proj = match cfg.q_lora_rank {
+                Some(lora_rank) => {
+                    let a = cfg.hidden_size * lora_rank;
+                    let norm = lora_rank;
+                    let b = (cfg.num_attention_heads * cfg.q_head_dim()) * lora_rank;
+                    a + norm + b
+                }
+                None => (cfg.num_attention_heads * cfg.q_head_dim()) * cfg.hidden_size,
+            };
+            // V4 fused kv: same shape as V3's stage-1 for compute purposes
+            let kv_proj = cfg.hidden_size * (cfg.kv_lora_rank + cfg.qk_rope_head_dim)
+                / weight_pack_factor;
+            let kv_norm = cfg.kv_lora_rank;
+            let kv_b_proj = cfg.kv_lora_rank
+                * cfg.num_attention_heads
+                * (cfg.q_head_dim() - cfg.qk_rope_head_dim + cfg.v_head_dim)
+                / weight_pack_factor;
+            // V4 grouped o_proj: o_a + o_b
+            let o_lora_rank = cfg.o_lora_rank.unwrap_or(cfg.hidden_size);
+            let o_groups = cfg.o_groups.unwrap_or(1);
+            let o_inner = o_groups * o_lora_rank;
+            let o_a = (cfg.num_attention_heads * cfg.v_head_dim) * o_inner / weight_pack_factor;
+            let o_b = o_inner * cfg.hidden_size / weight_pack_factor;
+
+            let moe_block = {
+                let mut sum = 0;
+                if let Some(n_routed_experts) = cfg.n_routed_experts.filter(|_| {
+                    layer_idx >= cfg.first_k_dense_replace && layer_idx % cfg.moe_layer_freq == 0
+                }) {
+                    let h = cfg.hidden_size;
+                    let i = cfg.moe_intermediate_size;
+                    let gate = h * i / weight_pack_factor * n_routed_experts;
+                    let up = h * i / weight_pack_factor * n_routed_experts;
+                    let down = i * h / weight_pack_factor * n_routed_experts;
+                    let shared = if let Some(ns) = cfg.n_shared_experts {
+                        let sg = h * (cfg.intermediate_size * ns) / weight_pack_factor;
+                        let su = h * (cfg.intermediate_size * ns) / weight_pack_factor;
+                        let sd = (cfg.intermediate_size * ns) * h / weight_pack_factor;
+                        sg + su + sd
+                    } else {
+                        0
+                    };
+                    sum += gate + up + down + shared + n_routed_experts * cfg.hidden_size;
+                } else {
+                    let h = cfg.hidden_size;
+                    let i = cfg.intermediate_size;
+                    sum += 3 * h * i / weight_pack_factor;
+                }
+                sum
+            };
+            per_layer_elems.push(
+                input_layernorm + post_attention_layernorm
+                    + q_proj + kv_norm + kv_proj + kv_b_proj
+                    + o_a + o_b + moe_block,
+            );
+        }
+        Ok(per_layer_elems.into_iter().map(|x| x * dtype.size_in_bytes()).collect())
+    }
+    fn num_layers(&self, config: &str) -> Result<usize> {
+        let cfg: crate::models::deepseek4::DeepSeekV4Config = serde_json::from_str(config)?;
+        Ok(cfg.num_hidden_layers)
+    }
+    fn model_config(&self, config: &str) -> Result<Box<dyn ModelConfigLike>> {
+        let cfg: crate::models::deepseek4::DeepSeekV4Config = serde_json::from_str(config)?;
+        let cfg = ModelConfigMetadata {
+            max_seq_len: cfg.max_position_embeddings,
+            num_layers: cfg.num_hidden_layers,
+            hidden_size: cfg.hidden_size,
+            num_kv_heads: 1, // V4 uses MQA
+            num_attn_heads: cfg.num_attention_heads,
+            sliding_window: Some(cfg.sliding_window),
+            k_head_dim: cfg.qk_rope_head_dim + cfg.qk_nope_head_dim,
+            v_head_dim: cfg.v_head_dim,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
+        };
+        Ok(Box::new(cfg))
+    }
+}
+
 /// [`NormalLoader`] for a Qwen 3 model.
 ///
 /// [`NormalLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.NormalLoader.html
@@ -5298,6 +5527,82 @@ mod tests {
         assert_eq!(v3_cfg.num_attention_heads, 64);
         assert_eq!(v3_cfg.n_routed_experts, Some(256));
         assert_eq!(v3_cfg.first_k_dense_replace, 3);
+    }
+
+    /// V4-specific config parses through the new DeepSeekV4Config (with V4 fields
+    /// like compress_ratios, o_lora_rank, sliding_window).
+    #[test]
+    fn v4_config_parses_through_v4_struct() {
+        let cfg = r#"{
+            "architectures": ["DeepseekV4ForCausalLM"],
+            "vocab_size": 129280,
+            "hidden_size": 4096,
+            "intermediate_size": 18432,
+            "moe_intermediate_size": 2048,
+            "num_hidden_layers": 43,
+            "num_attention_heads": 64,
+            "n_routed_experts": 256,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 6,
+            "first_k_dense_replace": 3,
+            "max_position_embeddings": 1048576,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0,
+            "q_lora_rank": 1536,
+            "qk_nope_head_dim": 448,
+            "qk_rope_head_dim": 64,
+            "kv_lora_rank": 512,
+            "v_head_dim": 512,
+            "n_group": 8,
+            "topk_group": 4,
+            "compress_ratios": [0, 4, 4, 128, 4, 4, 128, 4, 4, 128, 4, 4, 128, 4, 4, 128, 4, 4, 128, 4, 4, 128, 4, 4, 128, 4, 0],
+            "sliding_window": 128,
+            "compress_rope_theta": 40000.0,
+            "o_lora_rank": 1024,
+            "o_groups": 8,
+            "index_n_heads": 64,
+            "index_head_dim": 128,
+            "index_topk": 512
+        }"#;
+
+        let v4_cfg: crate::models::deepseek4::DeepSeekV4Config =
+            serde_json::from_str(cfg).expect("V4 config should parse via V4 struct");
+
+        // V4-specific fields preserved
+        assert_eq!(v4_cfg.compress_ratios.len(), 27);
+        assert_eq!(v4_cfg.compress_ratios[3], 128); // HCA layer
+        assert_eq!(v4_cfg.compress_ratios[4], 4);   // CSA layer
+        assert_eq!(v4_cfg.sliding_window, 128);
+        assert_eq!(v4_cfg.o_lora_rank, Some(1024));
+        assert_eq!(v4_cfg.o_groups, Some(8));
+        assert_eq!(v4_cfg.qk_nope_head_dim, 448);
+        assert_eq!(v4_cfg.v_head_dim, 512);
+
+        // Dispatcher constructs V4Loader (not V3Loader)
+        let _loader = AutoNormalLoader::get_loader(cfg)
+            .expect("V4 dispatch should succeed");
+    }
+
+    /// V4 per-layer compress_ratio lookup.
+    #[test]
+    fn v4_layer_compress_ratio_dispatch() {
+        let cfg_str = r#"{
+            "architectures": ["DeepseekV4ForCausalLM"],
+            "vocab_size": 129280, "hidden_size": 4096, "intermediate_size": 18432,
+            "moe_intermediate_size": 2048, "num_hidden_layers": 4, "num_attention_heads": 64,
+            "n_routed_experts": 256, "num_experts_per_tok": 6,
+            "max_position_embeddings": 65536, "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
+            "q_lora_rank": 1536, "qk_nope_head_dim": 448, "qk_rope_head_dim": 64,
+            "kv_lora_rank": 512, "v_head_dim": 512, "n_group": 8, "topk_group": 4,
+            "compress_ratios": [0, 4, 128, 0]
+        }"#;
+        let cfg: crate::models::deepseek4::DeepSeekV4Config = serde_json::from_str(cfg_str).unwrap();
+        assert_eq!(cfg.layer_compress_ratio(0), 0);   // standard MLA
+        assert_eq!(cfg.layer_compress_ratio(1), 4);   // CSA
+        assert_eq!(cfg.layer_compress_ratio(2), 128); // HCA
+        assert_eq!(cfg.layer_compress_ratio(3), 0);   // standard
+        // Out of bounds → standard
+        assert_eq!(cfg.layer_compress_ratio(99), 0);
     }
 
     /// Realistic K2.5 / K2.6 config (text-side): V3 with K2-specific vocab,
