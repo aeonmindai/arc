@@ -66,54 +66,132 @@ impl WeightValidation {
     }
 }
 
+/// O-projection layout: V3-style single matrix or V4's hypothetical LoRA decomposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OProjLayout {
+    /// Single `o_proj.weight` tensor (V3, Kimi K2, GLM-5 confirmed).
+    Single,
+    /// LoRA-decomposed `o_a_proj.weight` + `o_b_proj.weight` (V4 hypothesis based on
+    /// `o_lora_rank` config field; not yet confirmed against real V4 safetensors).
+    Lora,
+    /// Try Single first; fall back to Lora. Default for V4 until the real layout
+    /// is verified against published checkpoints.
+    Either,
+}
+
 /// Validate a safetensors weight-key list against the DeepSeek V4 schema.
 ///
-/// V4-specific tensors required:
-/// - `model.layers.<i>.self_attn.o_a_proj.weight` (LoRA-down for o_proj)
-/// - `model.layers.<i>.self_attn.o_b_proj.weight` (LoRA-up for o_proj)
-///
-/// V4 also has optional per-layer compressor tensors when `compress_ratios[i] != 0`:
-/// - `model.layers.<i>.self_attn.compressor.weight`
-///
-/// And MTP heads (V4 ships these):
-/// - `mtp.layers.<i>.*`
+/// **Note on o_proj layout uncertainty:** V4's actual safetensors naming
+/// convention isn't yet published in the SGLang reference. We default to
+/// `OProjLayout::Either` — accept either V3-style single `o_proj` or
+/// V4-style LoRA-decomposed `o_a_proj` + `o_b_proj`. The rental's first
+/// job is to download real V4 weights and detect which convention is used.
 pub fn validate_v4_weights<'a, I>(keys: I) -> WeightValidation
 where
     I: IntoIterator<Item = &'a str>,
 {
-    let key_set: HashSet<String> = keys.into_iter().map(String::from).collect();
-    validate_v4_against_keyset(&key_set)
+    validate_v4_weights_with_layout(keys, OProjLayout::Either)
 }
 
-fn validate_v4_against_keyset(keys: &HashSet<String>) -> WeightValidation {
+/// Validate V4 schema with an explicit o_proj layout assumption.
+pub fn validate_v4_weights_with_layout<'a, I>(
+    keys: I,
+    o_layout: OProjLayout,
+) -> WeightValidation
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let key_set: HashSet<String> = keys.into_iter().map(String::from).collect();
+    validate_v4_against_keyset(&key_set, o_layout)
+}
+
+fn validate_v4_against_keyset(keys: &HashSet<String>, o_layout: OProjLayout) -> WeightValidation {
     let num_layers = infer_num_layers(keys);
     let num_experts = infer_num_experts_at_layer(keys, /*layer=*/ 1);
 
-    // Required per-model tensors.
     let mut required: Vec<String> = vec![
         "model.embed_tokens.weight".into(),
         "model.norm.weight".into(),
         "lm_head.weight".into(),
     ];
 
-    // Per-layer V4 tensors.
     for i in 0..num_layers {
         required.extend([
             format!("model.layers.{i}.input_layernorm.weight"),
             format!("model.layers.{i}.post_attention_layernorm.weight"),
-            // MLA Q (LoRA): q_a_proj + q_b_proj
             format!("model.layers.{i}.self_attn.q_a_proj.weight"),
             format!("model.layers.{i}.self_attn.q_b_proj.weight"),
-            // MLA KV: kv_a_proj_with_mqa + kv_b_proj
             format!("model.layers.{i}.self_attn.kv_a_proj_with_mqa.weight"),
             format!("model.layers.{i}.self_attn.kv_b_proj.weight"),
-            // V4-specific: o_proj is LoRA-decomposed (o_a + o_b), NOT a single o_proj
-            format!("model.layers.{i}.self_attn.o_a_proj.weight"),
-            format!("model.layers.{i}.self_attn.o_b_proj.weight"),
         ]);
     }
 
-    classify(keys, required)
+    let mut found = Vec::new();
+    let mut missing = Vec::new();
+    for req in &required {
+        if keys.contains(req) {
+            found.push(req.clone());
+        } else {
+            missing.push(req.clone());
+        }
+    }
+
+    // o_proj — separately handled because of layout uncertainty.
+    for i in 0..num_layers {
+        let single = format!("model.layers.{i}.self_attn.o_proj.weight");
+        let a = format!("model.layers.{i}.self_attn.o_a_proj.weight");
+        let b = format!("model.layers.{i}.self_attn.o_b_proj.weight");
+
+        match o_layout {
+            OProjLayout::Single => {
+                if keys.contains(&single) {
+                    found.push(single);
+                } else {
+                    missing.push(single);
+                }
+            }
+            OProjLayout::Lora => {
+                if keys.contains(&a) {
+                    found.push(a);
+                } else {
+                    missing.push(a);
+                }
+                if keys.contains(&b) {
+                    found.push(b);
+                } else {
+                    missing.push(b);
+                }
+            }
+            OProjLayout::Either => {
+                if keys.contains(&single) {
+                    found.push(single);
+                } else if keys.contains(&a) && keys.contains(&b) {
+                    found.push(a);
+                    found.push(b);
+                } else {
+                    missing.push(format!(
+                        "model.layers.{i}.self_attn.o_proj.weight (OR o_a_proj + o_b_proj)"
+                    ));
+                }
+            }
+        }
+    }
+
+    let all_required: HashSet<String> = required.iter().cloned().collect();
+    let extra: Vec<String> = keys
+        .iter()
+        .filter(|k| !all_required.contains(k.as_str()) && !found.contains(k))
+        .cloned()
+        .collect();
+
+    WeightValidation {
+        will_load: missing.is_empty(),
+        found,
+        missing,
+        extra,
+        num_layers,
+        num_experts,
+    }
 }
 
 /// Validate against Kimi K2 (V3-derived) schema.
@@ -310,30 +388,55 @@ mod tests {
         assert!(v.will_load);
     }
 
-    /// **THIS IS THE TEST THAT CATCHES THE V3-LOADER-FOR-V4 BUG.**
-    /// V4 weights have `o_a_proj` + `o_b_proj`. A V3 loader expects `o_proj`.
-    /// The Kimi-K2 (V3-style) validator should reject V4 weights with a clear
-    /// "missing o_proj.weight" error per layer.
+    /// V3-style validator rejects V4-LoRA weights with clear errors.
     #[test]
-    fn v3_loader_rejects_v4_weights_with_clear_error() {
+    fn v3_loader_rejects_v4_lora_weights_with_clear_error() {
         let v4_keys = synthesize_v4_weight_keys(4, 8, false);
         let v = validate_kimi_k2_weights(v4_keys.iter().map(String::as_str));
-        assert!(!v.is_valid(), "V3 loader should fail on V4 weights");
-        // Should report each layer's missing o_proj.weight
+        assert!(!v.is_valid(), "V3 loader should fail on V4 (LoRA) weights");
         let missing_o_proj = v.missing.iter().filter(|m| m.ends_with(".self_attn.o_proj.weight")).count();
         assert_eq!(missing_o_proj, 4, "Expected 4 missing o_proj entries");
     }
 
-    /// Conversely, V4 validator should reject V3 weights (missing o_a/o_b).
+    /// V4 validator in strict Lora mode rejects V3 weights.
     #[test]
-    fn v4_loader_rejects_v3_weights_with_clear_error() {
+    fn v4_lora_mode_rejects_v3_weights() {
         let v3_keys = synthesize_kimi_k2_weight_keys(4, 8);
-        let v = validate_v4_weights(v3_keys.iter().map(String::as_str));
-        assert!(!v.is_valid(), "V4 loader should fail on V3 weights");
+        let v = validate_v4_weights_with_layout(
+            v3_keys.iter().map(String::as_str),
+            OProjLayout::Lora,
+        );
+        assert!(!v.is_valid());
         let missing_o_a = v.missing.iter().filter(|m| m.ends_with("o_a_proj.weight")).count();
         let missing_o_b = v.missing.iter().filter(|m| m.ends_with("o_b_proj.weight")).count();
         assert_eq!(missing_o_a, 4);
         assert_eq!(missing_o_b, 4);
+    }
+
+    /// V4 Either-mode accepts both V3 and V4 layouts gracefully (handles uncertainty).
+    #[test]
+    fn v4_either_mode_accepts_both_layouts() {
+        let v3_keys = synthesize_kimi_k2_weight_keys(4, 8);
+        let v3_via_either = validate_v4_weights_with_layout(
+            v3_keys.iter().map(String::as_str),
+            OProjLayout::Either,
+        );
+        assert!(v3_via_either.is_valid(), "Either should accept V3-style o_proj");
+
+        let v4_keys = synthesize_v4_weight_keys(4, 8, false);
+        let v4_via_either = validate_v4_weights_with_layout(
+            v4_keys.iter().map(String::as_str),
+            OProjLayout::Either,
+        );
+        assert!(v4_via_either.is_valid(), "Either should accept V4-style o_a/o_b");
+    }
+
+    /// Default validate_v4_weights uses Either (handles real-world uncertainty).
+    #[test]
+    fn default_v4_validator_uses_either() {
+        let v3_keys = synthesize_kimi_k2_weight_keys(4, 8);
+        let v = validate_v4_weights(v3_keys.iter().map(String::as_str));
+        assert!(v.is_valid(), "Default V4 validator should accept V3-shaped o_proj");
     }
 
     #[test]
@@ -375,8 +478,12 @@ mod tests {
 
     #[test]
     fn validation_report_is_informative() {
+        // Use Lora mode to force a failure on V3-style input.
         let keys = synthesize_kimi_k2_weight_keys(2, 4);
-        let v = validate_v4_weights(keys.iter().map(String::as_str));
+        let v = validate_v4_weights_with_layout(
+            keys.iter().map(String::as_str),
+            OProjLayout::Lora,
+        );
         let report = v.report();
         assert!(report.contains("FAIL"));
         assert!(report.contains("Missing"));
