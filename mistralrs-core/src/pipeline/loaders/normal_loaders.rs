@@ -3288,35 +3288,34 @@ impl DeviceMappedModelLoader for DeepSeekV4Loader {
     ) -> Result<Vec<usize>> {
         let cfg: crate::models::deepseek4::DeepSeekV4Config = serde_json::from_str(config)?;
         let mut per_layer_elems = Vec::new();
+        let head_dim = cfg.head_dim;
         for layer_idx in 0..cfg.num_hidden_layers {
             let input_layernorm = cfg.hidden_size;
             let post_attention_layernorm = cfg.hidden_size;
+            // V4 Q: LoRA (wq_a + q_norm + wq_b). Audit §0 + §2.
             let q_proj = match cfg.q_lora_rank {
                 Some(lora_rank) => {
                     let a = cfg.hidden_size * lora_rank;
                     let norm = lora_rank;
-                    let b = (cfg.num_attention_heads * cfg.q_head_dim()) * lora_rank;
+                    let b = (cfg.num_attention_heads * head_dim) * lora_rank;
                     a + norm + b
                 }
-                None => (cfg.num_attention_heads * cfg.q_head_dim()) * cfg.hidden_size,
+                None => (cfg.num_attention_heads * head_dim) * cfg.hidden_size,
             };
-            // V4 fused kv: same shape as V3's stage-1 for compute purposes
-            let kv_proj = cfg.hidden_size * (cfg.kv_lora_rank + cfg.qk_rope_head_dim)
-                / weight_pack_factor;
-            let kv_norm = cfg.kv_lora_rank;
-            let kv_b_proj = cfg.kv_lora_rank
-                * cfg.num_attention_heads
-                * (cfg.q_head_dim() - cfg.qk_rope_head_dim + cfg.v_head_dim)
-                / weight_pack_factor;
-            // V4 grouped o_proj: o_a + o_b
+            // V4 K/V: SINGLE fused wkv (hidden → head_dim). No LoRA-A/B split.
+            // Audit §0 + §5 lines 477-482. No `kv_b_proj` at all.
+            let wkv = cfg.hidden_size * head_dim / weight_pack_factor;
+            let kv_norm = head_dim;
+            // V4 grouped o_proj: wo_a + wo_b. Audit §0 + §2.
             let o_lora_rank = cfg.o_lora_rank.unwrap_or(cfg.hidden_size);
-            let o_groups = cfg.o_groups.unwrap_or(1);
+            let o_groups = cfg.o_groups.unwrap_or(1).max(1);
             let o_inner = o_groups * o_lora_rank;
-            let o_a = (cfg.num_attention_heads * cfg.v_head_dim) * o_inner / weight_pack_factor;
-            let o_b = o_inner * cfg.hidden_size / weight_pack_factor;
+            let wo_a_in = cfg.num_attention_heads * head_dim / o_groups;
+            let wo_a = wo_a_in * o_inner / weight_pack_factor;
+            let wo_b = o_inner * cfg.hidden_size / weight_pack_factor;
 
             let moe_block = {
-                let mut sum = 0;
+                let mut sum: usize = 0;
                 if let Some(n_routed_experts) = cfg.n_routed_experts.filter(|_| {
                     layer_idx >= cfg.first_k_dense_replace && layer_idx % cfg.moe_layer_freq == 0
                 }) {
@@ -3326,25 +3325,29 @@ impl DeviceMappedModelLoader for DeepSeekV4Loader {
                     let up = h * i / weight_pack_factor * n_routed_experts;
                     let down = i * h / weight_pack_factor * n_routed_experts;
                     let shared = if let Some(ns) = cfg.n_shared_experts {
-                        let sg = h * (cfg.intermediate_size * ns) / weight_pack_factor;
-                        let su = h * (cfg.intermediate_size * ns) / weight_pack_factor;
-                        let sd = (cfg.intermediate_size * ns) * h / weight_pack_factor;
+                        // V4 uses moe_intermediate_size * n_shared_experts
+                        // for the shared expert (audit §0 + V4 Flash config).
+                        let inter = cfg.moe_intermediate_size * ns;
+                        let sg = h * inter / weight_pack_factor;
+                        let su = h * inter / weight_pack_factor;
+                        let sd = inter * h / weight_pack_factor;
                         sg + su + sd
                     } else {
                         0
                     };
                     sum += gate + up + down + shared + n_routed_experts * cfg.hidden_size;
-                } else {
+                } else if let Some(i) = cfg.intermediate_size {
+                    // Dense MLP fallback (V3-style fixtures only;
+                    // unreachable for V4 Flash since first_k_dense_replace=0).
                     let h = cfg.hidden_size;
-                    let i = cfg.intermediate_size;
                     sum += 3 * h * i / weight_pack_factor;
                 }
                 sum
             };
             per_layer_elems.push(
                 input_layernorm + post_attention_layernorm
-                    + q_proj + kv_norm + kv_proj + kv_b_proj
-                    + o_a + o_b + moe_block,
+                    + q_proj + kv_norm + wkv
+                    + wo_a + wo_b + moe_block,
             );
         }
         Ok(per_layer_elems.into_iter().map(|x| x * dtype.size_in_bytes()).collect())
@@ -3359,11 +3362,14 @@ impl DeviceMappedModelLoader for DeepSeekV4Loader {
             max_seq_len: cfg.max_position_embeddings,
             num_layers: cfg.num_hidden_layers,
             hidden_size: cfg.hidden_size,
-            num_kv_heads: 1, // V4 uses MQA
+            // V4 MQA: 1 KV head. Audit §0 + §3.
+            num_kv_heads: cfg.num_key_value_heads.max(1),
             num_attn_heads: cfg.num_attention_heads,
             sliding_window: Some(cfg.sliding_window),
-            k_head_dim: cfg.qk_rope_head_dim + cfg.qk_nope_head_dim,
-            v_head_dim: cfg.v_head_dim,
+            // V4: single head_dim for both K and V (same fused wkv).
+            // Audit §3.
+            k_head_dim: cfg.head_dim,
+            v_head_dim: cfg.head_dim,
             kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
         Ok(Box::new(cfg))
@@ -5588,8 +5594,8 @@ mod tests {
         assert_eq!(v4_cfg.sliding_window, 128);
         assert_eq!(v4_cfg.o_lora_rank, Some(1024));
         assert_eq!(v4_cfg.o_groups, Some(8));
-        assert_eq!(v4_cfg.qk_nope_head_dim, 448);
-        assert_eq!(v4_cfg.v_head_dim, 512);
+        assert_eq!(v4_cfg.qk_nope_head_dim, Some(448));
+        assert_eq!(v4_cfg.v_head_dim, Some(512));
 
         // Dispatcher constructs V4Loader (not V3Loader)
         let _loader = AutoNormalLoader::get_loader(cfg)

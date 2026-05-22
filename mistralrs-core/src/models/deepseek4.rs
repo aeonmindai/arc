@@ -1,16 +1,70 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 //! DeepSeek V4 Pro / V4 Flash model loader.
 //!
-//! Scaffolding for V4 support. Currently delegates to V3's MLA forward path
-//! after V4 config translation. Real V4 perf wins (CSA, HCA, MTP, mHC) require
-//! TileLang CUDA kernels and are deferred to the B200 rental cycle.
+//! ## What this file is
 //!
-//! V4 tensor layout differences vs V3 are documented in
-//! `arc-engine/src/weight_schema.rs` (V4Format::Native vs Hf). The rental engineer
-//! will determine which format the live HF checkpoint uses + extend the
-//! Attention struct accordingly.
+//! V4 is **not** an MLA variant — it's a fundamentally different attention
+//! shape:
 //!
-//! Reference: `research/code/06_foundation/sglang/python/sglang/srt/models/deepseek_v4.py`
+//! - **Q**: LoRA (`q_a_proj` / `wq_a` → `q_norm` → `q_b_proj` / `wq_b`),
+//!   reshape to `[B, n_heads=64, T, head_dim=512]`.
+//! - **K/V**: a **single fused** `wkv` projection (`hidden=4096 → head_dim=512`)
+//!   that produces ONE MQA head per token. The kernel broadcasts that one
+//!   head across all 64 Q heads. There is NO `kv_a_proj_with_mqa`, NO
+//!   `kv_b_proj`, NO `kv_lora_rank`.
+//! - **RoPE**: applied **in place** to the last `qk_rope_head_dim=64` dims of
+//!   each Q head's 512-vector and of K's 512-vector. The first 448 ("nope")
+//!   dims of the same 512-vector are left untouched. No split/concat at the
+//!   tensor level (a candle-backed implementation does split+rotate+cat
+//!   under the hood; the SGLang `fused_norm_rope_inplace` does it in one
+//!   pass).
+//! - **o_proj**: grouped LoRA — `wo_a` (`n_heads*head_dim/n_groups →
+//!   n_groups*o_lora_rank`), then `wo_b` (`n_groups*o_lora_rank →
+//!   hidden_size`). With `n_groups=8`, `o_lora_rank=1024`:
+//!   `wo_a: [4096→8192]`, `wo_b: [8192→4096]`.
+//! - **All 43 layers are MoE** (`first_k_dense_replace=0`), top-6 routed +
+//!   1 shared, `scoring_func="sqrtsoftplus"`.
+//! - **mHC (Manifold-Constrained Hyper-Connections)** replaces standard
+//!   `x + sublayer(norm(x))` residual at every layer. See
+//!   [`super::dsv4_mhc::V4MHCLayerParams`].
+//! - **Sparse attention dispatch** per layer via `compress_ratios`:
+//!   - `0`  → standard MQA (layers 0, 1, 42 only)
+//!   - `4`  → CSA (compressor + C4 indexer top-k=512)
+//!   - `128` → HCA (compressor only, dense MQA over 128× compressed K)
+//! - **FP8 e4m3 + UE8M0 scales**, 128×128 weight blocks. Companion
+//!   `.scale` tensor per weight tensor (V4 native naming — HF rewrites
+//!   to `.weight_scale_inv`).
+//! - **MTP head**: full transformer decoder + 256-expert MoE wrapped with
+//!   `h_proj` / `e_proj` / `enorm` / `hnorm` / `norm` + its own
+//!   `hc_head_*` / `hc_attn_*` / `hc_ffn_*`.
+//!
+//! ## References
+//!
+//! - `/Users/jish/Documents/GitHub/arc/research/v4_audit.md` — the source of
+//!   truth for every V4 architectural decision in this file.
+//! - SGLang reference: `research/code/06_foundation/sglang/python/sglang/srt/
+//!   models/deepseek_v4.py` (MQALayer, DecoderLayer, weight remapping).
+//! - V4 Flash config.json: `/tmp/v4_flash_config.json`.
+//! - V4 Flash safetensors index: `/tmp/v4_flash_index.json`.
+//!
+//! ## Out of scope for this file
+//!
+//! Anything below P1 in the audit (`v4_audit.md §8`). In particular:
+//! - Fused CUDA kernels (`fused_norm_rope`, `c4`, `c128_online`) — vendored
+//!   into `mistralrs-quant/cuda_kernels/` by a follow-up agent.
+//! - `attn_sink` actually fed into the SDPA softmax — the tensor is loaded
+//!   and stored on `SdpaParams.sinks` (broadcastable shape), and the
+//!   sinks-aware kernel reads it when present.
+//! - MTP transformer-block forward (load-only here; `MtpSpeculativePipeline`
+//!   does drafting via `MtpDecodeKit` and only needs `embed_tokens/
+//!   lm_head/h_proj/e_proj`).
+//! - FP8 native-to-HF tensor name remap (`*.scale → *.weight_scale_inv`).
+//!   The `BlockwiseFP8Linear` loader expects HF-style names; V4 native
+//!   checkpoints need a renaming layer at the safetensors backend.
+//!   Tracked as follow-up in audit §8 item 22.
+//! - 4-D residual stack threading for mHC (`[B, T, hc_mult, hidden]`).
+//!   Layer params are loaded; the model carries 3-D residual today (hc_mult
+//!   collapsed to 1, mathematically equivalent to standard residual).
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -31,10 +85,6 @@ use crate::{
         DeepSeekV2RotaryEmbedding, Mlp, RmsNorm, Sdpa,
     },
     layers_masker::{masked_fill, PastKvLenCache},
-    mla::{
-        mla_cache_forward, mla_decode_forward, should_use_mla_cache, should_use_mla_decode,
-        MlaWeights,
-    },
     moe::{MoEExperts, MoEExpertsConfig},
     ops::{SplitOp, TopKLastDimOp, TopKOutput},
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
@@ -46,16 +96,28 @@ use crate::{
     serde_default_fn,
     utils::{progress::NiceProgressBar, unvarbuilder::UnVarBuilder},
 };
-serde_default_fn!(f64, routed_scaling_factor, 1.0);
-serde_default_fn!(TopkMethod, topk_method, TopkMethod::Greedy);
+
+use super::dsv4_mhc::V4MHCLayerParams;
+
+serde_default_fn!(f64, routed_scaling_factor, 1.5);
+serde_default_fn!(TopkMethod, topk_method, TopkMethod::NoAuxTc);
 serde_default_fn!(usize, moe_layer_freq, 1);
 serde_default_fn!(usize, first_k_dense_replace, 0);
-serde_default_fn!(ScoringFunc, scoring_func, ScoringFunc::Softmax);
+serde_default_fn!(ScoringFunc, scoring_func, ScoringFunc::SqrtSoftplus);
 serde_default_fn!(Activation, hidden_act, Activation::Silu);
 serde_default_fn!(bool, tie_word_embeddings, false);
+serde_default_fn!(usize, default_head_dim, 512);
+serde_default_fn!(usize, default_num_kv_heads, 1);
+serde_default_fn!(usize, default_num_hash_layers, 3);
+serde_default_fn!(usize, default_hc_mult, 4);
+serde_default_fn!(f32, default_hc_eps, 1.0e-6);
+serde_default_fn!(usize, default_hc_sinkhorn_iters, 20);
+serde_default_fn!(f32, default_swiglu_limit, 10.0);
+serde_default_fn!(usize, default_n_group, 1);
+serde_default_fn!(usize, default_topk_group, 1);
 
-#[derive(Deserialize, Clone, Debug)]
-enum TopkMethod {
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TopkMethod {
     #[serde(rename = "noaux_tc")]
     NoAuxTc,
     #[serde(rename = "greedy")]
@@ -64,35 +126,73 @@ enum TopkMethod {
     GroupLimitedGreedy,
 }
 
-#[derive(Deserialize, Clone, Debug)]
-enum ScoringFunc {
+/// V4 MoE gate scoring function.
+///
+/// V4 Flash defaults to `sqrtsoftplus(logit) = sqrt(softplus(logit))` per the
+/// V4 paper §4.1 ("Reduced-variance routing"). Audit §0 "scoring_func"
+/// + §5 lines 463-465.
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ScoringFunc {
     #[serde(rename = "softmax")]
     Softmax,
     #[serde(rename = "sigmoid")]
     Sigmoid,
+    /// V4-specific: `s = sqrt(softplus(logit))`.
+    #[serde(rename = "sqrtsoftplus")]
+    SqrtSoftplus,
 }
 
+/// V4 Flash config — matches the real `config.json` published at
+/// `https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash`.
+///
+/// **Notably absent vs V3**: `kv_lora_rank`, `v_head_dim`, `qk_nope_head_dim`,
+/// `intermediate_size`. **Newly present**: `head_dim`, `num_key_value_heads`,
+/// `num_hash_layers`, `hc_mult`, `hc_eps`, `hc_sinkhorn_iters`, `swiglu_limit`,
+/// `compress_ratios`, `compress_rope_theta`, `o_lora_rank`, `o_groups`,
+/// `index_*`. See `v4_audit.md §0 + §5`.
+///
+/// For backwards-compat with older test fixtures and SGLang's dataclass
+/// (which carries V3 defaults), `intermediate_size`, `kv_lora_rank`,
+/// `v_head_dim`, `qk_nope_head_dim`, `n_group`, `topk_group` are accepted as
+/// optional fields. They're **not used** on the V4 forward path — `head_dim`
+/// is the source of truth and `qk_nope_head_dim` is derived as
+/// `head_dim - qk_rope_head_dim`.
 #[derive(Deserialize, Clone, Debug)]
 pub struct DeepSeekV4Config {
     pub(crate) vocab_size: usize,
     pub(crate) hidden_size: usize,
-    pub(crate) intermediate_size: usize,
+    /// V4: 512. Source of truth for K/V head dim and Q head dim.
+    /// Audit §0 + §5 lines 456 ("MISSING `head_dim`").
+    #[serde(default = "default_head_dim")]
+    pub(crate) head_dim: usize,
+    /// V4: not used. Optional for tolerance of old configs. The dense MLP
+    /// is unreachable when `first_k_dense_replace=0` (default for V4).
+    #[serde(default)]
+    pub(crate) intermediate_size: Option<usize>,
     pub(crate) moe_intermediate_size: usize,
     pub(crate) num_hidden_layers: usize,
     pub(crate) num_attention_heads: usize,
+    /// V4: 1 (MQA — single KV head, broadcast across all Q heads at the
+    /// kernel). Audit §0 + §5 line 457.
+    #[serde(default = "default_num_kv_heads")]
+    pub(crate) num_key_value_heads: usize,
     pub(crate) n_shared_experts: Option<usize>,
     pub(crate) n_routed_experts: Option<usize>,
+    /// V4: 1.5. Audit §0 + §5 line 463.
     #[serde(default = "routed_scaling_factor")]
     pub(crate) routed_scaling_factor: f64,
+    /// V4: `noaux_tc`. Audit §0 (default in V4 Flash config).
     #[serde(default = "topk_method")]
-    topk_method: TopkMethod,
+    pub(crate) topk_method: TopkMethod,
     pub(crate) num_experts_per_tok: Option<usize>,
     #[serde(default = "moe_layer_freq")]
     pub(crate) moe_layer_freq: usize,
+    /// V4: 0 (every layer is MoE). Audit §0 + §5 line 448 ("OK").
     #[serde(default = "first_k_dense_replace")]
     pub(crate) first_k_dense_replace: usize,
+    /// V4: `sqrtsoftplus`. Audit §0 + §5 line 464.
     #[serde(default = "scoring_func")]
-    scoring_func: ScoringFunc,
+    pub(crate) scoring_func: ScoringFunc,
     #[serde(default = "hidden_act")]
     pub(crate) hidden_act: Activation,
     pub(crate) max_position_embeddings: usize,
@@ -103,50 +203,89 @@ pub struct DeepSeekV4Config {
     pub(crate) rope_scaling: Option<DeepSeekV2RopeScaling>,
     #[serde(default)]
     pub(crate) attention_bias: bool,
+    /// V4: 1024. Always present in V4 Flash. Optional only for V3-style
+    /// fixtures with a plain Q projection.
     pub(crate) q_lora_rank: Option<usize>,
+    /// V4: 64. RoPE is applied to the last `qk_rope_head_dim` dims of each
+    /// 512-dim head vector (Q and K both). Audit §3.
     pub(crate) qk_rope_head_dim: usize,
-    pub(crate) kv_lora_rank: usize,
-    pub(crate) v_head_dim: usize,
-    pub(crate) qk_nope_head_dim: usize,
+    /// V4: not in real config. Kept for parser tolerance of older fixtures.
+    /// Audit §5 line 451 ("`kv_lora_rank` — REMOVE").
+    #[serde(default)]
+    pub(crate) kv_lora_rank: Option<usize>,
+    /// V4: not in real config. Kept for parser tolerance. Audit §5 line 452.
+    #[serde(default)]
+    pub(crate) v_head_dim: Option<usize>,
+    /// V4: derived as `head_dim - qk_rope_head_dim = 512-64 = 448`. Stored
+    /// only for parser tolerance; the forward path uses
+    /// [`DeepSeekV4Config::qk_nope_head_dim()`] accessor instead.
+    /// Audit §5 line 453 ("`qk_nope_head_dim` — REMOVE").
+    #[serde(default)]
+    pub(crate) qk_nope_head_dim: Option<usize>,
     #[serde(alias = "quantization")]
     pub(crate) quantization_config: Option<QuantizedConfig>,
+    /// V4: not in real config. Default 1. Audit §5 line 457
+    /// ("`n_group` — Make optional, default 1").
+    #[serde(default = "default_n_group")]
     pub(crate) n_group: usize,
+    /// V4: not in real config. Default 1.
+    #[serde(default = "default_topk_group")]
     pub(crate) topk_group: usize,
 
-    // V4-specific fields (deserialized from config.json, used at load+forward)
-    /// Per-layer compression dispatch: 0 = standard MLA, 4 = CSA, 128 = HCA.
-    /// Length must equal num_hidden_layers in real V4 checkpoints.
+    // ----------------- V4-specific fields ---------------------------------
+    /// Per-layer compression dispatch: 0 = standard, 4 = CSA, 128 = HCA.
+    /// V4 Flash: 44 entries (`num_hidden_layers + 1` to cover the MTP
+    /// layer). Audit §1 + §0.
     #[serde(default)]
     pub(crate) compress_ratios: Vec<i32>,
-    /// Sliding-window attention size for V4 SWA branch (default 128 in V4 Flash).
+    /// Sliding-window attention size (V4: 128). Used inside the C4
+    /// indexer for local-window token selection. Audit §0 ("Sliding window
+    /// — OK").
     #[serde(default = "default_sliding_window")]
     pub(crate) sliding_window: usize,
-    /// Separate rope_theta for the compressed-attention path (V4 paper).
+    /// Separate RoPE base for compressed-attention layers (V4: 160000).
+    /// Compressed layers use this; standard layers (`compress_ratio == 0`)
+    /// use `rope_theta`. Audit §0 + §1 + SGLang `deepseek_v4.py:220`.
     #[serde(default = "default_compress_rope_theta")]
     pub(crate) compress_rope_theta: f32,
-    /// V4 grouped-linear o_proj: o_lora_rank per group (DeepseekV4GroupedLinear).
-    /// V4 Flash defaults: 1024.
+    /// Grouped o_proj LoRA: rank per group (V4: 1024). Audit §0 + §5.
     #[serde(default)]
     pub(crate) o_lora_rank: Option<usize>,
-    /// V4 grouped-linear o_proj: number of groups. V4 Flash defaults: 8.
+    /// Grouped o_proj LoRA: number of groups (V4: 8). Audit §0 + §5.
     #[serde(default)]
     pub(crate) o_groups: Option<usize>,
-    /// V4 Lightning Indexer: number of heads (default 64).
+    /// Lightning Indexer: number of indexer heads (V4: 64).
     #[serde(default = "default_index_n_heads")]
     pub(crate) index_n_heads: usize,
-    /// V4 Lightning Indexer: head dim (default 128).
+    /// Lightning Indexer: per-head dim (V4: 128).
     #[serde(default = "default_index_head_dim")]
     pub(crate) index_head_dim: usize,
-    /// V4 Lightning Indexer: top-k for CSA token selection (default 512).
+    /// Lightning Indexer: top-k tokens to retain on CSA layers (V4: 512).
     #[serde(default = "default_index_topk")]
     pub(crate) index_topk: usize,
+    /// Number of hash routing layers for MoE expert dispatch (V4: 3).
+    /// Audit §0 + §5 line 458.
+    #[serde(default = "default_num_hash_layers", alias = "n_hash_layers")]
+    pub(crate) num_hash_layers: usize,
+    /// mHC multiplier: parallel residual streams (V4: 4). Audit §0 + §5.
+    #[serde(default = "default_hc_mult")]
+    pub(crate) hc_mult: usize,
+    /// mHC additive epsilon (V4: 1e-6). Audit §0 + §5.
+    #[serde(default = "default_hc_eps")]
+    pub(crate) hc_eps: f32,
+    /// mHC sinkhorn iteration count (V4: 20). Audit §0 + §5.
+    #[serde(default = "default_hc_sinkhorn_iters")]
+    pub(crate) hc_sinkhorn_iters: usize,
+    /// SwiGLU clamp for MoE expert MLP (V4: 10.0). Audit §0 + §5 line 462.
+    #[serde(default = "default_swiglu_limit")]
+    pub(crate) swiglu_limit: f32,
 }
 
 fn default_sliding_window() -> usize {
     128
 }
 fn default_compress_rope_theta() -> f32 {
-    40000.0
+    160000.0
 }
 fn default_index_n_heads() -> usize {
     64
@@ -159,18 +298,40 @@ fn default_index_topk() -> usize {
 }
 
 impl DeepSeekV4Config {
-    /// Per-layer dispatch decision based on compress_ratios. Returns 0 for
-    /// standard (dense MLA), 4 for CSA, 128 for HCA. Returns 0 if out of bounds.
+    /// Returns the compress ratio for layer `layer_idx`, or 0 (standard) if
+    /// the index is out of bounds. Audit §1 layer-to-pattern mapping.
     pub fn layer_compress_ratio(&self, layer_idx: usize) -> i32 {
         self.compress_ratios.get(layer_idx).copied().unwrap_or(0)
     }
 
-    pub(crate) fn q_head_dim(&self) -> usize {
-        self.qk_rope_head_dim + self.qk_nope_head_dim
+    /// V4: the "nope" portion of each head vector — the first
+    /// `head_dim - qk_rope_head_dim` dims (no RoPE applied here). In V4
+    /// Flash this is `512 - 64 = 448`. Derived per audit §0
+    /// "`qk_nope_head_dim`" + §3.
+    ///
+    /// If the config carries an explicit `qk_nope_head_dim` (legacy/V3-
+    /// style), it's honored. Otherwise the derivation
+    /// `head_dim - qk_rope_head_dim` is used. Both yield the same answer
+    /// for real V4 Flash configs.
+    pub fn qk_nope_head_dim(&self) -> usize {
+        self.qk_nope_head_dim
+            .unwrap_or_else(|| self.head_dim.saturating_sub(self.qk_rope_head_dim))
+    }
+
+    /// V4: same as `head_dim`. Kept as a method for symmetry with V3
+    /// callers. Audit §3 (Q/K shape arithmetic).
+    pub fn q_head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    /// MQA broadcast factor: how many Q heads share each K head.
+    /// V4 Flash: 64 (Q) / 1 (K) = 64. Audit §3.
+    pub fn n_kv_groups(&self) -> usize {
+        self.num_attention_heads / self.num_key_value_heads.max(1)
     }
 
     fn softmax_scale(&self) -> f32 {
-        let mut softmax_scale = 1.0 / (self.q_head_dim() as f32).sqrt();
+        let mut softmax_scale = 1.0 / (self.head_dim as f32).sqrt();
         if let Some(DeepSeekV2RopeScaling::Yarn {
             mscale_all_dim,
             factor,
@@ -185,12 +346,10 @@ impl DeepSeekV4Config {
 }
 
 /// V4 per-layer compression dispatch.
-/// Mirrors `arc_engine::dsv4::CompressRatio` (kept local to avoid the dependency
-/// inversion, since arc-engine depends on mistralrs-core).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressRatio {
     Standard,
-    /// CSA — 4× compression with top-k token selection.
+    /// CSA — 4× compression with top-k token selection via indexer.
     Csa,
     /// HCA — 128× compression, dense MQA over compressed.
     Hca,
@@ -206,59 +365,41 @@ impl CompressRatio {
     }
 }
 
-/// V4 learned KV compressor — matches SGLang's `Compressor` (compressor.py:289-399).
+impl From<i32> for CompressRatio {
+    fn from(value: i32) -> Self {
+        match value {
+            0 => Self::Standard,
+            4 => Self::Csa,
+            128 => Self::Hca,
+            _ => Self::Standard,
+        }
+    }
+}
+
+/// V4 learned compressor — matches SGLang's `Compressor` at
+/// `research/code/06_foundation/sglang/python/sglang/srt/layers/attention/
+/// dsv4/compressor.py` lines 289-393. Loaded only on layers with
+/// `compress_ratio != 0` (CSA + HCA). Audit §0 + §1 Pattern B/C/D.
 ///
-/// Per SGLang reference (compressor.py:312-328):
-///   - `wkv_gate`: ReplicatedLinear with `hidden_size → 2 * coff * head_dim`,
-///     bf16, no bias, no quant. Operates on the layer input `x` (not on K/V).
-///   - `ape`: Parameter of shape `[ratio, coff * head_dim]` — absolute positional
-///     encoding bias added per-position-in-block.
-///   - `norm`: RMSNorm on the head_dim axis (per-head normalization).
-///   - `coff = 1 + (ratio == 4)` (overlap=true for CSA, false for HCA).
-///
-/// Forward math (conceptual, before fused norm + RoPE kernel):
-///   1. `wkv_out = wkv_gate(x)`  → `[T, 2 * coff * head_dim]`
-///   2. split into `gate` and `val`, each `[T, coff * head_dim]`
-///   3. `kv_score = sigmoid(gate) * val`  → `[T, coff * head_dim]`
-///   4. group along T into windows of `ratio` (with overlap for CSA),
-///      add `ape[pos_in_block]` per row, sum or concat across the group →
-///      `[T_c = T/ratio, coff * head_dim]`
-///   5. reshape to `[T_c * coff, head_dim]`, apply `norm`, sum out `coff` axis →
-///      `[T_c, head_dim]`
-///
-/// At Tier A (this file) we provide a pure-Rust path that produces the right
-/// shape (`[B, H, T_c, head_dim]`) and approximately the right math; the
-/// production fused kernel (TileLang) is wired in at Phase 2 per the rental plan.
-///
-/// For the `uniform` constructor (synthetic-test fallback): produces an averaging
-/// projection equivalent to a fixed identity-block wkv_gate output, so the
-/// invariants assumed by the existing unit tests still hold (seq_len reduces by
-/// `ratio`, all-ones in → all-ones out).
+/// Fields:
+/// - `wkv_gate`: `[hidden_size, 2 * coff * head_dim]`. Fused `gate || val`
+///   linear acting on the layer input `xs`. Unquantized (bf16) in SGLang.
+/// - `norm`: RMSNorm over `head_dim`.
+/// - `ape`: `[ratio, coff * head_dim]` absolute positional bias per
+///   block position.
+/// - `coff`: 2 for ratio=4 (CSA, overlap=true), 1 otherwise (HCA).
 #[derive(Debug, Clone)]
 pub struct V4Compressor {
-    /// `wkv_gate`: `[hidden_size, 2 * coff * head_dim]`. From SGLang
-    /// `compressor.py:318` (ReplicatedLinear, no bias, bf16, no quant).
-    /// Operates on the layer input `xs` (not on K/V).
     pub wkv_gate: Arc<dyn QuantMethod>,
-    /// RMSNorm over the `head_dim` axis (compressor.py:326).
     pub norm: RmsNorm,
-    /// Absolute positional encoding bias, shape `[ratio, coff * head_dim]`.
-    /// From `compressor.py:314`.
     pub ape: Tensor,
-    /// Group ratio (4 for CSA, 128 for HCA).
     pub ratio: usize,
-    /// Per-head dim (e.g. 128).
     pub head_dim: usize,
-    /// Overlap coefficient — 2 if ratio==4 (CSA, overlap=true), else 1.
-    /// From `compressor.py:312`.
     pub coff: usize,
-    /// Hidden size of the layer input (input dim of wkv_gate).
     pub hidden_size: usize,
 }
 
 impl V4Compressor {
-    /// Load a real V4 compressor from safetensors at `vb` (typically rooted at
-    /// `model.layers.<i>.self_attn.compressor`). Cites `compressor.py:289-328`.
     pub fn new(
         cfg: &DeepSeekV4Config,
         vb: ShardedVarBuilder,
@@ -268,8 +409,6 @@ impl V4Compressor {
         let overlap = ratio == 4;
         let coff = 1 + usize::from(overlap);
 
-        // wkv_gate: hidden_size → 2 * coff * head_dim (compressor.py:317-325).
-        // SGLang publishes this unquantized (`quant_config=None`).
         let wkv_gate = ReplicatedLayer::new(
             cfg.hidden_size,
             2 * coff * head_dim,
@@ -277,18 +416,13 @@ impl V4Compressor {
             false,
             vb.pp("wkv_gate"),
         )?;
-        // RMSNorm on head_dim (compressor.py:326).
         let norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("norm"))?;
 
-        // APE — shape [ratio, coff * head_dim] (compressor.py:314).
-        // V4 native publishes a bare parameter ("ape"); HF variant publishes
-        // "ape.weight". Probe both.
         let ape = if vb.contains_tensor("ape") {
             vb.get((ratio, coff * head_dim), "ape")?
         } else if vb.contains_tensor("ape.weight") {
             vb.get((ratio, coff * head_dim), "ape.weight")?
         } else {
-            // Synthetic-fallback: zeros (no positional contribution).
             Tensor::zeros((ratio, coff * head_dim), DType::F32, vb.device())?
         };
 
@@ -303,37 +437,19 @@ impl V4Compressor {
         })
     }
 
-    /// Construct a uniform-averaging fallback compressor — used at Tier A when
-    /// the checkpoint's compressor weights are absent (synthetic tests, or before
-    /// the rental confirms the real tensor names). Matches the prior behavior
-    /// of `V4Compressor::uniform` for backward-compat with unit tests.
-    ///
-    /// Synthesizes:
-    ///   - `wkv_gate.weight` = zero (so `wkv_gate(x) = 0`)
-    ///   - `norm.weight` = ones
-    ///   - `ape` = zeros
-    /// Then `forward_kv` uses an averaging projection path (no `xs` input)
-    /// instead of the learned-gate path.
+    /// Synthetic-fallback constructor — yields an "averaging-by-ratio"
+    /// compressor used only by unit tests when real V4 weights are absent.
+    /// All-ones in → all-ones out, seq_len divided by `ratio`.
     pub fn uniform(ratio: usize, head_dim: usize, device: &Device) -> Result<Self> {
         let overlap = ratio == 4;
         let coff = 1 + usize::from(overlap);
-        // Synthesize a non-functional wkv_gate (so we can construct the struct
-        // without a layer-builder); `forward_kv` does not use it, only
-        // `forward_from_xs` does. Use a tiny 1-d placeholder.
-        let placeholder_weight = Tensor::zeros((1, 1), DType::F32, device)?;
-        // Build a minimal QuantMethod wrapping a zero-weight linear. Since
-        // uniform is only used for tests that call `forward_kv`, the wkv_gate
-        // weight is never invoked — but we still need a valid QuantMethod.
         use mistralrs_quant::UnquantLinear;
-        let _ = placeholder_weight;
         let dummy: Arc<dyn QuantMethod> = Arc::new(UnquantLinear::new(
             mistralrs_quant::QuantMethodConfig::Unquantized(candle_nn::Linear::new(
                 Tensor::zeros((2 * coff * head_dim, 1), DType::F32, device)?,
                 None,
             )),
         )?);
-
-        // Norm weight = ones gives identity-RMSNorm-on-unit-variance behavior.
         let norm_weight = Tensor::ones(head_dim, DType::F32, device)?;
         let norm = RmsNorm::from_w(norm_weight, 1e-6)?;
         let ape = Tensor::zeros((ratio, coff * head_dim), DType::F32, device)?;
@@ -349,16 +465,8 @@ impl V4Compressor {
         })
     }
 
-    /// Tier-A KV compressor — operates directly on a `[B, H, T, D]` K or V tensor
-    /// to produce `[B, H, T/ratio, D]`. This is the legacy uniform-averaging
-    /// path used by tests and the synthetic-fallback. Real V4 inference uses
-    /// `forward_from_xs` instead.
-    ///
-    /// The semantic equivalent of the SGLang fused kernel (compress_forward) is
-    /// implemented in `forward_from_xs`. This path averages over `ratio`
-    /// consecutive entries per head, which matches the behavior the legacy
-    /// `V4Compressor::uniform` advertised (averaging produces all-ones for all-ones
-    /// input, so all existing unit tests still pass).
+    /// Legacy averaging path — averages `ratio` consecutive K or V entries.
+    /// Used by unit tests; not on the real V4 inference path.
     pub fn forward(&self, kv: &Tensor) -> Result<Tensor> {
         let dims = kv.dims();
         if dims.len() != 4 {
@@ -376,31 +484,15 @@ impl V4Compressor {
             );
         }
         let t_new = t / self.ratio;
-        // Reshape to [B, H, T_new, ratio, D] then mean over the ratio axis.
         let reshaped = kv.reshape((b, h, t_new, self.ratio, d))?;
-        let summed = reshaped.sum(3)?; // [B, H, T_new, D]
+        let summed = reshaped.sum(3)?;
         let inv = 1.0 / self.ratio as f64;
         summed.affine(inv, 0.0)
     }
 
-    /// Real V4 compressor forward path. Cites SGLang `compressor.py:366-392`
-    /// + `compress_forward` (jit_kernel/dsv4/compress_old.py:226-268).
-    ///
-    /// Inputs:
-    ///   - `xs`: `[B, T, hidden_size]` — layer input (same tensor that goes
-    ///     into Q/KV projections).
-    ///
-    /// Output:
-    ///   - `[B, T_c, head_dim]` where `T_c = T / ratio`. T must be divisible.
-    ///
-    /// Math (per the fused kernel, conceptually):
-    ///   1. `wkv = wkv_gate(xs)` → `[B, T, 2 * coff * head_dim]`
-    ///   2. split last axis into `(gate, val)`, each `[B, T, coff * head_dim]`
-    ///   3. `score = sigmoid(gate) * val`
-    ///   4. group along T into windows of size `ratio`; add `ape[pos_in_window]`
-    ///      to each row's slice; sum (or concat for overlap) across the window
-    ///   5. reshape to `[B * T_c * coff, head_dim]`, apply RMSNorm, sum out `coff`
-    ///   6. return as `[B, T_c, head_dim]`
+    /// Real V4 compressor forward, operating directly on the layer input.
+    /// Returns `[B, T_c, head_dim]` with `T_c = T / ratio`. SGLang
+    /// `compressor.py:366-392`.
     pub fn forward_from_xs(&self, xs: &Tensor) -> Result<Tensor> {
         let dims = xs.dims();
         if dims.len() != 3 {
@@ -419,39 +511,36 @@ impl V4Compressor {
         let t_c = t / self.ratio;
         let work_dtype = xs.dtype();
 
-        // 1+2+3. gate * val via wkv_gate + split.
-        let wkv = self.wkv_gate.forward_autocast(xs)?; // [B, T, 2 * coff * head_dim]
+        let wkv = self.wkv_gate.forward_autocast(xs)?;
         let split = wkv.split(
             &[self.coff * self.head_dim, self.coff * self.head_dim],
             D::Minus1,
         )?;
         let gate = split[0].clone();
         let val = split[1].clone();
-        let score = (candle_nn::ops::sigmoid(&gate)? * val)?; // [B, T, coff*head_dim]
+        let score = (candle_nn::ops::sigmoid(&gate)? * val)?;
 
-        // 4. Add APE per-position-in-window, then aggregate across the window.
-        // Reshape to [B, T_c, ratio, coff*head_dim], broadcast-add ape (shape
-        // [ratio, coff*head_dim]) along the ratio axis.
         let score_grouped = score.reshape((b, t_c, self.ratio, self.coff * self.head_dim))?;
         let ape = self
             .ape
             .to_dtype(work_dtype)?
             .reshape((1, 1, self.ratio, self.coff * self.head_dim))?;
         let score_grouped = score_grouped.broadcast_add(&ape)?;
-        // Aggregate the ratio axis by sum (matches the kernel's accumulation).
-        let aggregated = score_grouped.sum(2)?; // [B, T_c, coff*head_dim]
+        let aggregated = score_grouped.sum(2)?;
 
-        // 5. RMSNorm on head_dim axis, then sum out coff.
         let flat = aggregated.reshape((b * t_c * self.coff, self.head_dim))?;
         let normed = flat.apply(&self.norm)?;
         let collapsed = normed
             .reshape((b * t_c, self.coff, self.head_dim))?
-            .sum(1)?; // [B*T_c, head_dim]
+            .sum(1)?;
 
         collapsed.reshape((b, t_c, self.head_dim))
     }
 }
 
+/// Q projection — LoRA only (V4 Flash always sets `q_lora_rank=1024`).
+/// `QProj::Plain` is preserved for tolerance of legacy non-LoRA Q variants
+/// (synthetic tests, older V3-style fixtures).
 enum QProj {
     Plain(Arc<dyn QuantMethod>),
     Lora {
@@ -472,58 +561,57 @@ impl QProj {
     }
 }
 
+/// V4 Attention layer — MQA with fused KV projection.
+///
+/// Audit §0 + §2 (SGLang `MQALayer` lines 172-360). The fundamental
+/// shape per token is:
+///   - `q`:  `[B, n_heads=64, T, head_dim=512]`
+///   - `k`:  `[B, num_kv_heads=1, T, head_dim=512]` (broadcast at kernel)
+///   - `v`:  same tensor as `k` (V4 absorbs V into K — audit §3).
 struct Attention {
+    /// Q LoRA: `wq_a` (hidden → q_lora_rank) → `q_norm` (RMSNorm over
+    /// q_lora_rank) → `wq_b` (q_lora_rank → n_heads * head_dim).
+    /// Audit §2 (SGLang lines 197-199).
     q: QProj,
-    kv_a_proj_with_mqa: Arc<dyn QuantMethod>,
-    kv_a_layernorm: RmsNorm,
-    kv_b_proj: Arc<dyn QuantMethod>,
-    /// V4 grouped-LoRA o_proj part A: [n_heads*v_head_dim → o_groups*o_lora_rank]
+    /// **Single fused** K/V projection: `hidden → head_dim`. ONE MQA head.
+    /// Replaces V3's `kv_a_proj_with_mqa + kv_b_proj`. Audit §0 + §2
+    /// (SGLang line 200).
+    wkv: Arc<dyn QuantMethod>,
+    /// RMSNorm over `head_dim=512` (NOT `kv_lora_rank`). Audit §0 + §2
+    /// (SGLang line 201).
+    kv_norm: RmsNorm,
+    /// Grouped o_proj part A: `wo_a` shaped to project from
+    /// `n_heads * head_dim / n_groups` → `n_groups * o_lora_rank` per the
+    /// SGLang ColumnParallelLinear. Audit §0 + §2 (SGLang line 202).
     wo_a: Arc<dyn QuantMethod>,
-    /// V4 grouped-LoRA o_proj part B: [o_groups*o_lora_rank → hidden_size]
+    /// Grouped o_proj part B: `[n_groups * o_lora_rank, hidden_size]`.
+    /// Audit §0 + §2 (SGLang line 203).
     wo_b: Arc<dyn QuantMethod>,
-    /// RoPE for this layer. Standard layers use `rope_theta`; compress layers
-    /// use `compress_rope_theta` (RUN-165, SGLang `deepseek_v4.py:220`).
-    /// The caller (`DeepSeekV4::new`) picks the right one before constructing.
+    /// RoPE — either `rope_theta`-based (standard layers 0/1/42) or
+    /// `compress_rope_theta`-based (compress layers). Caller picks at
+    /// construction. Audit §0 + §8 P1 item 11.
     rotary_emb: Arc<DeepSeekV2RotaryEmbedding>,
     cfg: DeepSeekV4Config,
-    q_head_dim: usize,
     paged_attn: Option<PagedAttention>,
     sdpa_params: SdpaParams,
+    /// Per-TP-rank Q head count.
     num_attention_heads: usize,
-    mla_weights: MlaWeights,
-    /// V4 per-layer compression dispatch. CompressRatio::Standard means dense MLA;
-    /// Csa (ratio=4) and Hca (ratio=128) dispatch through V4-specific paths.
+    /// Per-TP-rank KV head count (V4: 1 with TP=1).
+    num_kv_heads: usize,
+    /// CompressRatio for this layer (audit §1).
     compress_ratio: CompressRatio,
-    /// V4 KV compressor (loaded only on compress layers). Operates on the layer
-    /// input `xs` to produce a compressed K representation. SGLang has a
-    /// single `compressor` per attention layer (shared by K/V), so we keep one.
-    /// We retain `compressor_v` for the legacy averaging tests; for real V4
-    /// inference both branches use the same `compressor_k` and downstream
-    /// kv_b_proj reshape is what separates K from V.
-    compressor_k: Option<V4Compressor>,
-    /// Legacy V-side compressor, kept for backward-compat with the existing
-    /// `compress_kv` API and unit tests. New code should rely on the single
-    /// `compressor_k` (which models the entire learned compressor unit
-    /// per SGLang's `Compressor` class).
-    compressor_v: Option<V4Compressor>,
-    /// V4 sliding-window size (used by CSA/HCA blending).
-    sliding_window: usize,
-    /// V4 CSA top-k for token selection (from config.index_topk).
+    /// V4 compressor (loaded only on CSA + HCA layers).
     #[allow(dead_code)]
-    csa_topk: usize,
-    /// V4 learned attention-sink parameter (RUN-166, SGLang `deepseek_v4.py:288`).
-    /// Shape: `[n_heads]` (broadcast to `[1, n_heads, 1, 1]` at use). Added to
-    /// attention logits for the sink token. `None` if the checkpoint does not
-    /// publish this tensor (e.g. synthetic test weights, V3 fallback).
-    /// Also mirrored into `SdpaParams.sinks` (broadcast-shaped) for the SDPA
-    /// backend to consume. This raw copy is retained for ISQ / debug paths.
+    compressor: Option<V4Compressor>,
+    /// V4 sliding-window size (used by CSA blending; audit §0).
+    #[allow(dead_code)]
+    sliding_window: usize,
+    /// V4 attn_sink — learned `[n_heads]` parameter, an extra softmax
+    /// column. Audit §0 + §2 (SGLang line 204 + 288).
     #[allow(dead_code)]
     attn_sink: Option<Tensor>,
-    /// V4 Lightning Indexer (RUN-167 integration). Only constructed on CSA
-    /// layers (`compress_ratio == Csa`). HCA layers do not have an indexer.
-    /// Wired in via Agent 4's `dsv4_indexer.rs` module when present.
-    /// Currently loaded but unused in forward (waiting on Agent 11's
-    /// `dsv4_attention_kernels` module to consume it via csa_attention).
+    /// V4 Lightning Indexer — only on CSA layers (compress_ratio == 4).
+    /// Audit §0 + §2 (SGLang line 195).
     #[allow(dead_code)]
     indexer: Option<super::dsv4_indexer::V4Indexer>,
 }
@@ -540,17 +628,32 @@ impl Attention {
         paged_attn: Option<PagedAttention>,
         comm: &Arc<mistralrs_quant::Comm>,
     ) -> Result<Self> {
-        let q_head_dim = cfg.q_head_dim();
+        let head_dim = cfg.head_dim;
+        let num_kv_heads = cfg.num_key_value_heads.max(1);
+
+        // ---- Q projection (LoRA only; V3 plain-Q kept for synth tests) ----
+        // Audit §0 + §2 (SGLang lines 197-199, 313). Auto-detect V4 native
+        // (`wq_a/wq_b`) vs HF (`q_a_proj/q_b_proj`).
         let q = match cfg.q_lora_rank {
             Some(lora_rank) => {
+                let q_a_name = if vb.contains_tensor("wq_a.weight") {
+                    "wq_a"
+                } else {
+                    "q_a_proj"
+                };
+                let q_b_name = if vb.contains_tensor("wq_b.weight") {
+                    "wq_b"
+                } else {
+                    "q_b_proj"
+                };
                 let a = ReplicatedLayer::new(
                     cfg.hidden_size,
                     lora_rank,
                     &cfg.quantization_config,
                     cfg.attention_bias,
-                    mapper.set_device(layer_idx, vb.pp("q_a_proj"), loading_isq),
+                    mapper.set_device(layer_idx, vb.pp(q_a_name), loading_isq),
                 )?;
-                // V4 uses `q_norm`; V3 uses `q_a_layernorm`. Auto-detect.
+                // V4 native: `q_norm`. HF: `q_a_layernorm`.
                 let q_norm_name = if vb.contains_tensor("q_norm.weight") {
                     "q_norm"
                 } else {
@@ -563,17 +666,17 @@ impl Attention {
                 )?;
                 let b = ColumnParallelLayer::new(
                     lora_rank,
-                    cfg.num_attention_heads * q_head_dim,
+                    cfg.num_attention_heads * head_dim,
                     &cfg.quantization_config,
                     false,
                     comm,
-                    mapper.set_device(layer_idx, vb.pp("q_b_proj"), loading_isq),
+                    mapper.set_device(layer_idx, vb.pp(q_b_name), loading_isq),
                 )?;
                 QProj::Lora { a, norm, b }
             }
             None => QProj::Plain(ColumnParallelLayer::new(
                 cfg.hidden_size,
-                cfg.num_attention_heads * q_head_dim,
+                cfg.num_attention_heads * head_dim,
                 &cfg.quantization_config,
                 false,
                 comm,
@@ -581,70 +684,71 @@ impl Attention {
             )?),
         };
 
-        // V4 publishes the LoRA-A KV projection at `kv_proj` (per HF transformers
-        // V4 model doc: tensor names include `q_a_proj, q_b_proj, kv_proj,
-        // o_a_proj, o_b_proj`). V3 used `kv_a_proj_with_mqa`. We probe which
-        // name is actually present in the safetensors index and route accordingly.
-        let kv_a_proj_name = if vb.contains_tensor("kv_proj.weight") {
+        // ---- Fused K/V projection (SINGLE wkv: hidden → head_dim) ----
+        // V4 native: `wkv` (SGLang line 200). HF-style legacy: `kv_proj`
+        // or `kv_a_proj_with_mqa` (V3 fallback). Audit §0 + §5 lines 477-482.
+        let wkv_name = if vb.contains_tensor("wkv.weight") {
+            "wkv"
+        } else if vb.contains_tensor("kv_proj.weight") {
             "kv_proj"
         } else {
-            // V3-style fallback. Also used for synthetic test weights and any
-            // V4 republish that follows V3 naming.
+            // V3-style legacy. Used by synthetic tests and any older V4
+            // republish that flattens the fused projection.
             "kv_a_proj_with_mqa"
         };
-        let kv_a_proj_with_mqa = ReplicatedLayer::new(
+        let wkv = ReplicatedLayer::new(
             cfg.hidden_size,
-            cfg.kv_lora_rank + cfg.qk_rope_head_dim,
+            head_dim,
             &cfg.quantization_config,
             cfg.attention_bias,
-            mapper.set_device(layer_idx, vb.pp(kv_a_proj_name), loading_isq),
+            mapper.set_device(layer_idx, vb.pp(wkv_name), loading_isq),
         )?;
 
-        // V4 typically uses `kv_norm` for the post-projection norm; V3 used
-        // `kv_a_layernorm`. Same auto-detection.
+        // ---- KV norm over head_dim (not kv_lora_rank) ----
+        // V4 native: `kv_norm` (SGLang line 201). HF: `kv_a_layernorm`.
+        // Audit §5 lines 471-475.
         let kv_norm_name = if vb.contains_tensor("kv_norm.weight") {
             "kv_norm"
         } else {
             "kv_a_layernorm"
         };
-        let kv_a_layernorm = RmsNorm::new(
-            cfg.kv_lora_rank,
+        let kv_norm = RmsNorm::new(
+            head_dim,
             cfg.rms_norm_eps,
             mapper.set_device(layer_idx, vb.pp(kv_norm_name), false),
         )?;
-        let kv_b_proj = ColumnParallelLayer::new(
-            cfg.kv_lora_rank,
-            cfg.num_attention_heads * (q_head_dim - cfg.qk_rope_head_dim + cfg.v_head_dim),
-            &cfg.quantization_config,
-            false,
-            comm,
-            mapper.set_device(layer_idx, vb.pp("kv_b_proj"), loading_isq),
-        )?;
 
-        // V4 o_proj — handle three published variants:
-        //   1. V4 with grouped LoRA: `o_a_proj` + `o_b_proj`
-        //      (DeepseekV4GroupedLinear, when o_lora_rank/o_groups set)
-        //   2. V3-style single `o_proj` (for synthetic test weights and any
-        //      V4 republish that flattens the grouped linear)
-        //
-        // Detection: check which tensor exists in the safetensors index.
-        let has_lora_o = vb.contains_tensor("o_a_proj.weight")
-            && vb.contains_tensor("o_b_proj.weight");
-        let has_single_o = vb.contains_tensor("o_proj.weight");
-
+        // ---- Grouped o_proj LoRA (wo_a + wo_b) ----
+        // Audit §0 + §5 line 484 + SGLang lines 202-203.
+        //   wo_a: in=n_heads*head_dim/n_groups, out=n_groups*o_lora_rank
+        //   wo_b: in=n_groups*o_lora_rank, out=hidden_size
         let o_lora_rank = cfg.o_lora_rank.unwrap_or(cfg.hidden_size);
         let o_groups = cfg.o_groups.unwrap_or(1);
         let o_inner = o_groups * o_lora_rank;
 
+        // Auto-detect V4 native (`wo_a/wo_b`) vs HF (`o_a_proj/o_b_proj`).
+        let has_native_o =
+            vb.contains_tensor("wo_a.weight") || vb.contains_tensor("wo_b.weight");
+        let has_lora_o = has_native_o
+            || (vb.contains_tensor("o_a_proj.weight") && vb.contains_tensor("o_b_proj.weight"));
+        let has_single_o = vb.contains_tensor("o_proj.weight");
+
+        let (wo_a_name, wo_b_name) = if has_native_o {
+            ("wo_a", "wo_b")
+        } else {
+            ("o_a_proj", "o_b_proj")
+        };
+
         let (wo_a, wo_b) = if has_lora_o || !has_single_o {
-            // V4-style LoRA o_proj (preferred + default for unknown checkpoints)
+            // V4 grouped LoRA path.
+            let wo_a_in = cfg.num_attention_heads * head_dim / o_groups.max(1);
             let wo_a = ColumnParallelLayer::new(
-                cfg.num_attention_heads * cfg.v_head_dim,
+                wo_a_in,
                 o_inner,
                 &cfg.quantization_config,
                 cfg.attention_bias,
                 comm,
-                mapper.set_device(layer_idx, vb.pp("o_a_proj"), loading_isq),
+                mapper.set_device(layer_idx, vb.pp(wo_a_name), loading_isq),
             )?;
             let wo_b = RowParallelLayer::new(
                 o_inner,
@@ -652,22 +756,22 @@ impl Attention {
                 &cfg.quantization_config,
                 cfg.attention_bias,
                 comm,
-                mapper.set_device(layer_idx, vb.pp("o_b_proj"), loading_isq),
+                mapper.set_device(layer_idx, vb.pp(wo_b_name), loading_isq),
             )?;
             (wo_a, wo_b)
         } else {
-            // V3-style single o_proj (variant). Synthesize a passthrough wo_a
-            // (identity-shape) and use the loaded single tensor as wo_b.
+            // V3-style single o_proj fallback (synth tests). Synthesize a
+            // passthrough wo_a.
             let wo_a = ColumnParallelLayer::new(
-                cfg.num_attention_heads * cfg.v_head_dim,
-                cfg.num_attention_heads * cfg.v_head_dim, // identity dim
+                cfg.num_attention_heads * head_dim,
+                cfg.num_attention_heads * head_dim,
                 &cfg.quantization_config,
                 false,
                 comm,
-                mapper.set_device(layer_idx, vb.pp("o_a_proj"), loading_isq),
+                mapper.set_device(layer_idx, vb.pp(wo_a_name), loading_isq),
             )?;
             let wo_b = RowParallelLayer::new(
-                cfg.num_attention_heads * cfg.v_head_dim,
+                cfg.num_attention_heads * head_dim,
                 cfg.hidden_size,
                 &cfg.quantization_config,
                 cfg.attention_bias,
@@ -677,57 +781,33 @@ impl Attention {
             (wo_a, wo_b)
         };
 
-        // V4 per-layer compress dispatch.
+        // ---- Per-layer compress dispatch (audit §1) ----
         let ratio_int = cfg.layer_compress_ratio(layer_idx);
-        let compress_ratio = match ratio_int {
-            0 => CompressRatio::Standard,
-            4 => CompressRatio::Csa,
-            128 => CompressRatio::Hca,
-            other => {
-                tracing::warn!(
-                    "V4 layer {layer_idx} has unsupported compress_ratio={other}, using Standard"
-                );
-                CompressRatio::Standard
-            }
-        };
+        let compress_ratio = CompressRatio::from(ratio_int);
 
-        // V4 compressor weights — load when compress_ratio != Standard.
-        // Per SGLang (deepseek_v4.py:263-276) only compress layers have a
-        // `compressor` sub-module. Tensor names: `compressor.wkv_gate.weight`,
-        // `compressor.norm.weight`, `compressor.ape`.
-        //
-        // For real V4 checkpoints we call V4Compressor::new which loads from
-        // safetensors. For synthetic-test weights (or any checkpoint that lacks
-        // these tensors), we fall back to V4Compressor::uniform — which keeps
-        // the existing unit tests' averaging semantics intact.
-        let (compressor_k, compressor_v) = if compress_ratio != CompressRatio::Standard {
+        // ---- V4 compressor (CSA + HCA layers only) ----
+        let compressor = if compress_ratio != CompressRatio::Standard {
             let device = mapper
                 .device_for(layer_idx, loading_isq)
                 .unwrap_or(&Device::Cpu);
             let comp_vb = mapper.set_device(layer_idx, vb.pp("compressor"), loading_isq);
-            // Probe: does the checkpoint publish a real compressor?
-            // SGLang publishes `wkv_gate.weight` as the canonical signal.
-            let has_real_compressor = comp_vb.contains_tensor("wkv_gate.weight");
+            let has_real_compressor = comp_vb.contains_tensor("wkv_gate.weight")
+                || comp_vb.contains_tensor("wkv.weight");
             let comp = if has_real_compressor {
-                V4Compressor::new(cfg, comp_vb, ratio_int as usize, cfg.v_head_dim)?
+                V4Compressor::new(cfg, comp_vb, ratio_int as usize, head_dim)?
             } else {
-                V4Compressor::uniform(ratio_int as usize, cfg.v_head_dim, device)?
+                V4Compressor::uniform(ratio_int as usize, head_dim, device)?
             };
-            // Per SGLang there is ONE compressor unit per layer (not separate
-            // K and V). For backward compat with `compress_kv` we expose it
-            // through both `compressor_k` and `compressor_v` (clones share Arcs).
-            (Some(comp.clone()), Some(comp))
+            Some(comp)
         } else {
-            (None, None)
+            None
         };
 
-        // V4 attn_sink — learned `[n_heads]` parameter added to attention logits
-        // for the sink token (SGLang `deepseek_v4.py:288`). Only loaded if
-        // present in the checkpoint; absence is fine for V3-style fallback
-        // and synthetic tests.
+        // ---- attn_sink: learned [n_heads] fp32 parameter ----
+        // Audit §0 + §2 (SGLang line 288). One scalar per head added as an
+        // extra softmax column for the sink token. Optional — synth
+        // weights may omit.
         let attn_sink = if vb.contains_tensor("attn_sink") {
-            // Per SGLang: `nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))`.
-            // Loaded as-is in fp32; broadcast to [1, n_heads, 1, 1] at use.
             Some(
                 mapper
                     .set_device(layer_idx, vb.clone(), false)
@@ -742,12 +822,9 @@ impl Attention {
             None
         };
 
-        // V4 Lightning Indexer (RUN-167) — only CSA layers have one. HCA layers
-        // do not, per SGLang `deepseek_v4.py:277-286`.
+        // ---- Lightning Indexer (CSA layers only) ----
+        // Audit §0 + §1 Pattern B/D. HCA layers don't have an indexer.
         let indexer = if compress_ratio == CompressRatio::Csa {
-            // Probe whether the checkpoint actually publishes indexer tensors.
-            // If absent (synthetic tests / pre-rental builds), skip — the
-            // forward path will fall back to dense attention over compressed K.
             let idx_vb = mapper.set_device(layer_idx, vb.pp("indexer"), loading_isq);
             if idx_vb.contains_tensor("wq_b.weight") {
                 let device = mapper
@@ -770,35 +847,33 @@ impl Attention {
             None
         };
 
-        let mla_weights = MlaWeights::new(
-            paged_attn.is_some(),
-            mapper.device_for(layer_idx, loading_isq),
-        );
-
-        // SdpaParams.sinks holds the broadcastable form of attn_sink if loaded.
-        // SGLang broadcasts shape [n_heads] -> [1, n_heads, 1, 1] in the attn
-        // backend (sinks_attn dispatch). We do the reshape here once at load
-        // time so the forward path is allocation-free.
+        // Pre-shape sinks for SDPA: [n_heads] → [1, n_heads, 1, 1].
         let sinks_for_sdpa = if let Some(ref s) = attn_sink {
             Some(s.reshape((1, cfg.num_attention_heads, 1, 1))?)
         } else {
             None
         };
 
+        let world_size = comm.world_size();
+        let num_attention_heads = (cfg.num_attention_heads / world_size).max(1);
+        let num_kv_heads_tp = (num_kv_heads / world_size).max(1);
+        // MQA broadcast factor: how many Q heads share one KV head.
+        // Audit §3.
+        let n_kv_groups = (num_attention_heads / num_kv_heads_tp).max(1);
+
         Ok(Self {
             q,
-            kv_a_proj_with_mqa,
-            kv_a_layernorm,
-            kv_b_proj,
+            wkv,
+            kv_norm,
             wo_a,
             wo_b,
             rotary_emb,
             cfg: cfg.clone(),
-            q_head_dim,
             paged_attn,
-            num_attention_heads: cfg.num_attention_heads / comm.world_size(),
+            num_attention_heads,
+            num_kv_heads: num_kv_heads_tp,
             sdpa_params: SdpaParams {
-                n_kv_groups: 1,
+                n_kv_groups,
                 softcap: None,
                 softmax_scale: cfg.softmax_scale(),
                 sliding_window: if compress_ratio != CompressRatio::Standard {
@@ -808,113 +883,43 @@ impl Attention {
                 },
                 sinks: sinks_for_sdpa,
             },
-            mla_weights,
             compress_ratio,
-            compressor_k,
-            compressor_v,
+            compressor,
             sliding_window: cfg.sliding_window,
-            csa_topk: cfg.index_topk,
             attn_sink,
             indexer,
         })
     }
 
-    /// V4-specific KV compression — apply this layer's K/V compressors to a
-    /// pair of full-sequence tensors. Standard layers pass through.
-    /// Input shapes: `[B, H, T, head_dim]`. Output: `[B, H, T/ratio, head_dim]`.
-    ///
-    /// This is the LEGACY tensor-level API used by unit tests. Real V4
-    /// inference calls `compress_step_from_xs` which uses the learned
-    /// `wkv_gate(xs)` path per SGLang `compressor.py:366-392`.
-    pub fn compress_kv(&self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
-        match (self.compress_ratio, &self.compressor_k, &self.compressor_v) {
-            (CompressRatio::Standard, _, _) => Ok((k.clone(), v.clone())),
-            (_, Some(comp_k), Some(comp_v)) => {
-                let k_c = comp_k.forward(k)?;
-                let v_c = comp_v.forward(v)?;
-                Ok((k_c, v_c))
-            }
-            (ratio, _, _) => candle_core::bail!(
-                "V4 layer dispatched to {:?} but compressors are absent",
-                ratio
-            ),
-        }
-    }
-
-    /// V4 compress-step — per the SGLang `Compressor` forward path
-    /// (compressor.py:366-392). Operates on the layer input `xs` (not on K/V)
-    /// to produce a compressed K and V representation suitable for caching.
-    ///
-    /// Inputs:
-    ///   - `xs`: `[B, T, hidden]` — layer input.
-    ///   - `k_raw`, `v_raw`: `[B, H, T, head_dim]` — uncompressed K/V for this
-    ///     step. Used only when the loaded compressor is the synthetic
-    ///     `uniform` fallback (no `wkv_gate`).
-    ///
-    /// Output: `(k_c, v_c)` of shape `[B, H, T/ratio, head_dim]`.
-    ///
-    /// Tier A: V4 has a single learned compressor per layer (shared by K/V).
-    /// We project from `xs` once via `forward_from_xs`, get `[B, T/ratio,
-    /// head_dim]`, then broadcast across the head dim to match the [B, H,
-    /// T/ratio, head_dim] layout the downstream SDPA expects. In production
-    /// (Phase 2 fused kernel), separate K and V projections happen inside the
-    /// kernel; here we mirror the same compressed-shape contract.
-    fn compress_step_from_xs(
+    /// Apply RoPE in-place to the last `qk_rope_head_dim` dims of each
+    /// Q-head and K-head's `head_dim`-vector. The first
+    /// `qk_nope_head_dim` dims are left untouched. Audit §0 + §3.
+    fn apply_rope_inplace(
         &self,
-        xs: &Tensor,
-        k_raw: &Tensor,
-        v_raw: &Tensor,
+        q: &Tensor,
+        k: &Tensor,
+        seqlen_offsets: &[usize],
     ) -> Result<(Tensor, Tensor)> {
-        let Some(comp) = self.compressor_k.as_ref() else {
-            candle_core::bail!(
-                "V4 compress_step_from_xs called on layer without a compressor"
-            );
-        };
+        let qk_nope = self.cfg.qk_nope_head_dim();
+        let qk_rope = self.cfg.qk_rope_head_dim;
+        let head_dim = self.cfg.head_dim;
+        debug_assert_eq!(qk_nope + qk_rope, head_dim);
 
-        // Detect uniform fallback by inspecting `hidden_size` (uniform sets it
-        // to 1). Real compressors have hidden_size == cfg.hidden_size, so
-        // `forward_from_xs` works directly.
-        let use_real_path = comp.hidden_size > 1;
+        // Split-rotate-recombine. Candle-backed equivalent of SGLang's
+        // `fused_norm_rope_inplace`. Audit §0 + §8 P0 item 8.
+        let q_split = q.split(&[qk_nope, qk_rope], D::Minus1)?;
+        let q_nope = q_split[0].clone();
+        let mut q_pe = q_split[1].clone();
 
-        let (b, _, t, _) = k_raw.dims4()?;
-        let ratio = self.compress_ratio.ratio();
-        let t_c = t / ratio;
+        let k_split = k.split(&[qk_nope, qk_rope], D::Minus1)?;
+        let k_nope = k_split[0].clone();
+        let mut k_pe = k_split[1].clone();
 
-        if use_real_path {
-            // Real V4 path: project from xs via wkv_gate. Produces
-            // [B, T_c, head_dim]. Broadcast to [B, H, T_c, head_dim] —
-            // since V4 uses MQA (n_kv_heads == 1, see deepseek_v4.py:214),
-            // the single compressed K is the same for all attention heads.
-            let k_compressed = comp.forward_from_xs(xs)?; // [B, T_c, head_dim]
-            let n_heads = k_raw.dim(1)?;
-            let k_c = k_compressed
-                .unsqueeze(1)? // [B, 1, T_c, head_dim]
-                .expand((b, n_heads, t_c, comp.head_dim))?
-                .contiguous()?;
-            // V4 uses ONE compressor for both K and V (MQA, n_kv_heads=1).
-            // We reuse the same projection for V; downstream attention treats
-            // them identically. This matches the SGLang fused kernel which
-            // writes a single compressed entry per (token-block, head).
-            let v_c = k_c.clone();
-            Ok((k_c, v_c))
-        } else {
-            // Uniform fallback: average raw K/V over `ratio` consecutive tokens.
-            // Matches the legacy `V4Compressor::uniform` test semantics.
-            let k_c = comp.forward(k_raw)?;
-            let v_c = self
-                .compressor_v
-                .as_ref()
-                .ok_or_else(|| candle_core::Error::Msg(
-                    "V4 uniform fallback requires compressor_v".into(),
-                ))?
-                .forward(v_raw)?;
-            Ok((k_c, v_c))
-        }
-    }
+        (q_pe, k_pe) = self.rotary_emb.forward(&q_pe, &k_pe, seqlen_offsets)?;
 
-    /// Reports the CompressRatio of this attention layer.
-    pub fn compress_ratio(&self) -> CompressRatio {
-        self.compress_ratio
+        let q_out = Tensor::cat(&[&q_nope, &q_pe], D::Minus1)?.contiguous()?;
+        let k_out = Tensor::cat(&[&k_nope, &k_pe], D::Minus1)?.contiguous()?;
+        Ok((q_out, k_out))
     }
 
     fn forward(
@@ -923,333 +928,118 @@ impl Attention {
         attention_mask: Option<&Tensor>,
         seqlen_offsets: &[usize],
         kv_cache: &mut KvCache,
-        metadata: Option<((Tensor, Tensor, Option<Tensor>, Option<Tensor>), &PagedAttentionInputMetadata)>,
+        metadata: Option<(
+            (Tensor, Tensor, Option<Tensor>, Option<Tensor>),
+            &PagedAttentionInputMetadata,
+        )>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let (bs, seq_len, _) = xs.dims3()?;
+        let head_dim = self.cfg.head_dim;
 
-        let mut q = self.q.forward(xs)?;
-        q = q
-            .reshape((bs, seq_len, self.num_attention_heads, self.q_head_dim))?
-            .transpose(1, 2)?;
-        let q_split = q.split(
-            &[self.cfg.qk_nope_head_dim, self.cfg.qk_rope_head_dim],
-            D::Minus1,
-        )?;
-        let q_nope = q_split[0].clone();
-        let mut q_pe = q_split[1].clone();
-
-        let mut compressed_kv = self.kv_a_proj_with_mqa.forward_autocast(xs)?;
-        let ckv_split = compressed_kv.split(
-            &[self.cfg.kv_lora_rank, self.cfg.qk_rope_head_dim],
-            D::Minus1,
-        )?;
-        compressed_kv = ckv_split[0].clone();
-        let mut k_pe = ckv_split[1].clone();
-        k_pe = k_pe
-            .reshape((bs, seq_len, 1, self.cfg.qk_rope_head_dim))?
-            .transpose(1, 2)?;
-
-        let ckv = self.kv_a_layernorm.forward(&compressed_kv)?;
-
-        (q_pe, k_pe) = self.rotary_emb.forward(&q_pe, &k_pe, seqlen_offsets)?;
-
-        let use_mla_decode = should_use_mla_decode(
-            attention_mask,
-            seq_len,
-            self.paged_attn.is_some(),
-            q_nope.device(),
-            &metadata,
-        );
-
-        // V4 PagedAttention compress dispatch note (RUN-167, Task D):
-        //
-        // SGLang's V4 design uses TWO separate physical caches per compress
-        // layer:
-        //   1. Full kv cache (used by SWA branch + MLA over ckv)
-        //   2. Compressed kv_score_buffer (used by the compress-branch main
-        //      attention)
-        //
-        // The MLA decode path and PagedAttention path in this implementation
-        // both operate on cache #1 (full ckv). They are unchanged on compress
-        // layers — the compress-branch dispatch happens in the plain-SDPA
-        // path below (where we have direct control over the cache contents
-        // and can use the dual-branch blend per V4 paper §3.2).
-        //
-        // Tier B work (rental + Phase 2 kernels): plumb a second
-        // PagedAttention slot for the compressed buffer so the MLA-decode and
-        // PA paths can also dispatch through the compress branch, with cache
-        // block sizes tuned for T/ratio entries per compress layer. For now,
-        // PA on compress layers uses the same full-ckv cache as standard
-        // layers — functional but allocates more memory than the optimal V4
-        // layout.
-
-        let mut attn_out = if use_mla_decode {
-            mla_decode_forward(
-                &q_nope,
-                &q_pe,
-                &ckv,
-                &k_pe,
-                &metadata,
-                &self.mla_weights,
-                self.kv_b_proj.as_ref(),
-                &self.sdpa_params,
-                self.num_attention_heads,
-                self.cfg.kv_lora_rank,
-                self.cfg.qk_rope_head_dim,
-                self.cfg.qk_nope_head_dim,
-                self.cfg.v_head_dim,
-                bs,
-                seq_len,
-            )?
-        } else {
-            let mut kv = self.kv_b_proj.forward_autocast(&ckv)?;
-            kv = kv
-                .reshape((
-                    bs,
-                    seq_len,
-                    self.num_attention_heads,
-                    self.cfg.qk_nope_head_dim + self.cfg.v_head_dim,
-                ))?
-                .transpose(1, 2)?;
-
-            let kv_split =
-                kv.split(&[self.cfg.qk_nope_head_dim, self.cfg.v_head_dim], D::Minus1)?;
-            let k_nope = kv_split[0].clone();
-            let mut v = kv_split[1].clone();
-
-            let q = Tensor::cat(&[&q_nope, &q_pe], D::Minus1)?.contiguous()?;
-            let mut k = Tensor::cat(
-                &[&k_nope, &k_pe.repeat((1, self.num_attention_heads, 1, 1))?],
-                D::Minus1,
-            )?
+        // 1. Q projection (LoRA). [B, T, hidden] → [B, T, n_heads*head_dim]
+        //    → reshape to [B, n_heads, T, head_dim]. Audit §3.
+        let q = self.q.forward(xs)?;
+        let q = q
+            .reshape((bs, seq_len, self.num_attention_heads, head_dim))?
+            .transpose(1, 2)?
             .contiguous()?;
 
-            let use_mla_cache = should_use_mla_cache(self.paged_attn.is_some(), q.device());
+        // 2. K/V projection: single fused wkv. [B, T, hidden] → [B, T,
+        //    head_dim] → kv_norm → reshape to [B, num_kv_heads=1, T,
+        //    head_dim]. Audit §0 + §3.
+        let kv_raw = self.wkv.forward_autocast(xs)?;
+        let kv_normed = self.kv_norm.forward(&kv_raw)?;
+        let k = kv_normed
+            .reshape((bs, seq_len, self.num_kv_heads, head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
 
-            if use_mla_cache {
-                mla_cache_forward(
+        // 3. RoPE applied in-place to the last qk_rope_head_dim dims of
+        //    each Q-head and K-head's head_dim-vector. Audit §0 + §3.
+        let (q, k) = self.apply_rope_inplace(&q, &k, seqlen_offsets)?;
+
+        // 4. V4: K and V come from the same wkv tensor. The kernel treats
+        //    the wkv output as both K (for scores) and V (for weighted
+        //    sum). This is the MLA "absorb V into K" trick at scale.
+        //    Audit §3 ("absorbed the MLA split into a single fused output").
+        let v = k.clone();
+
+        // 5. Attention. All compress_ratio paths currently route through
+        //    SDPA with `n_kv_groups` broadcast. The CSA top-k indexer and
+        //    HCA dense-over-compressed fast paths are tracked in audit §8
+        //    P0 item 9 (follow-up agent vendoring the c4/c128_online
+        //    kernels). The fundamental shape (q: [B, 64, T, 512],
+        //    k: [B, 1, T, 512] → broadcast at kernel) is correct for all
+        //    three dispatch modes; only the K-cache layout differs across
+        //    modes, and that's a kernel-side concern.
+        let mut attn_out = match &self.paged_attn {
+            Some(paged_attn) => match metadata {
+                Some(((key_cache, value_cache, _, _), input_metadata)) => paged_attn.forward(
                     &q,
                     &k,
                     &v,
-                    &ckv,
-                    &k_pe,
                     attention_mask,
-                    seqlen_offsets,
-                    &metadata,
-                    flash_params,
-                    self.kv_b_proj.as_ref(),
+                    Some(key_cache),
+                    Some(value_cache),
+                    input_metadata,
                     &self.sdpa_params,
-                    self.num_attention_heads,
-                    self.cfg.kv_lora_rank,
-                    self.cfg.qk_rope_head_dim,
-                    self.cfg.qk_nope_head_dim,
-                    self.cfg.v_head_dim,
-                    bs,
-                    seq_len,
-                )?
-            } else {
-                match &self.paged_attn {
-                    Some(paged_attn) => match metadata {
-                        Some(((key_cache, value_cache, _, _), input_metadata)) => {
-                            let v = v
-                                .pad_with_zeros(
-                                    D::Minus1,
-                                    0,
-                                    self.q_head_dim - self.cfg.v_head_dim,
-                                )?
-                                .contiguous()?;
-                            paged_attn
-                                .forward(
-                                    &q,
-                                    &k,
-                                    &v,
-                                    attention_mask,
-                                    Some(key_cache),
-                                    Some(value_cache),
-                                    input_metadata,
-                                    &self.sdpa_params,
-                                    Some(flash_params),
-                                )?
-                                .narrow(D::Minus1, 0, self.cfg.v_head_dim)?
-                        }
-                        None => {
-                            // If we don't have metadata, we are most likely generating an imatrix so we don't want to populate that.
-                            // Generating the dummy metadata with the assumption that we are not generating text (only processing prompts).
-                            let input_metadata = PagedAttentionInputMetadata::dummy(q.device())?;
-                            // Sanity check.
-                            assert!(attention_mask.is_some());
-                            let v = v
-                                .pad_with_zeros(
-                                    D::Minus1,
-                                    0,
-                                    self.q_head_dim - self.cfg.v_head_dim,
-                                )?
-                                .contiguous()?;
-                            paged_attn
-                                .forward(
-                                    &q,
-                                    &k,
-                                    &v,
-                                    attention_mask,
-                                    None,
-                                    None,
-                                    &input_metadata,
-                                    &self.sdpa_params,
-                                    Some(flash_params),
-                                )?
-                                .narrow(D::Minus1, 0, self.cfg.v_head_dim)?
-                        }
-                    },
-                    None => {
-                        // V4 cache-before-compress fix (Task A.1, RUN-164):
-                        // For COMPRESS LAYERS (Csa/Hca):
-                        //   - Compress (k, v) BEFORE appending to the cache.
-                        //   - This means the cache stores T/ratio compressed
-                        //     entries per layer, not full K/V.
-                        //   - The SWA branch then uses the CURRENT-STEP raw
-                        //     (k, v) only (Tier A simplification; full V4
-                        //     SWA across cache history requires a second
-                        //     auxiliary cache, deferred to Tier B).
-                        //
-                        // For STANDARD LAYERS: cache full K/V as before.
-                        //
-                        // Cite SGLang `deepseek_v4.py:485-495` (the compressor
-                        // writes to a SEPARATE `kv_score_buffer` distinct from
-                        // the main K/V cache). Our single-cache design folds
-                        // these two physical buffers into one logical buffer
-                        // whose layout depends on `compress_ratio`.
-                        if self.compress_ratio == CompressRatio::Standard {
-                            (k, v) = kv_cache.append(&k, &v)?;
-                            Sdpa.run_attention(
-                                &q,
-                                &k,
-                                &v,
-                                attention_mask,
-                                Some(flash_params),
-                                &self.sdpa_params,
-                            )?
-                        } else {
-                            // Compress layer. Compute the compressed K/V for
-                            // the CURRENT step (only when seq_len is divisible
-                            // by ratio — typically prefill). On decode (T=1),
-                            // we cannot produce a new compressed entry, so we
-                            // skip the cache update and read the cache as-is.
-                            let ratio = self.compress_ratio.ratio();
-                            let raw_k_step = k.clone();
-                            let raw_v_step = v.clone();
-                            let new_compressed = if seq_len % ratio == 0 && seq_len >= ratio {
-                                match self.compress_step_from_xs(xs, &k, &v) {
-                                    Ok(out) => Some(out),
-                                    Err(e) => {
-                                        tracing::trace!(
-                                            "V4 compress layer {}: compress_step_from_xs failed \
-                                             ({e}); skipping cache update",
-                                            self.compress_ratio.ratio()
-                                        );
-                                        None
-                                    }
-                                }
-                            } else {
-                                None
-                            };
-                            if let Some((k_c, v_c)) = new_compressed {
-                                // Append compressed entries to the cache.
-                                (k, v) = kv_cache.append(&k_c, &v_c)?;
-                            } else {
-                                // No new entries this step — pull current
-                                // cache contents (may be empty on first decode).
-                                let cached_k = kv_cache.k()?;
-                                let cached_v = kv_cache.v()?;
-                                if let (Some(ck), Some(cv)) = (cached_k, cached_v) {
-                                    k = ck;
-                                    v = cv;
-                                } else {
-                                    // First call with no divisible compression
-                                    // happened — fall back to using raw K/V
-                                    // (degraded but functional).
-                                    k = raw_k_step.clone();
-                                    v = raw_v_step.clone();
-                                }
-                            }
-
-                            // Compressed-branch attention.
-                            // Tier A: dense SDPA over compressed K/V.
-                            // Once Agent 11 (dsv4_attention_kernels) lands, this
-                            // dispatches to csa_attention / hca_attention using
-                            // the indexer's top-k indices when present.
-                            let params_c = SdpaParams {
-                                n_kv_groups: self.sdpa_params.n_kv_groups,
-                                softcap: self.sdpa_params.softcap,
-                                softmax_scale: self.sdpa_params.softmax_scale,
-                                sliding_window: None,
-                                sinks: self.sdpa_params.sinks.clone(),
-                            };
-                            // TODO: when dsv4_attention_kernels module lands,
-                            // gate on `self.compress_ratio` + `self.indexer`:
-                            //   - Csa + Some(indexer): csa_attention(q, k, v, idx)
-                            //   - Hca:                 hca_attention(q, k, v)
-                            // For now, dense SDPA over compressed K/V.
-                            let main_out = Sdpa.run_attention(
-                                &q,
-                                &k,
-                                &v,
-                                None, // compressed K is shorter; no causal mask matches
-                                Some(flash_params),
-                                &params_c,
-                            )?;
-
-                            // SWA local branch.
-                            // Tier A: operates over the CURRENT STEP's raw K/V
-                            // only (no cross-step history). Real V4 SWA over
-                            // the full uncompressed history requires a second
-                            // physical cache, which is deferred to Tier B.
-                            // See task description (D) and SGLang
-                            // `deepseek_v4.py:486-490` (multi-stream cache write).
-                            let params_swa = SdpaParams {
-                                n_kv_groups: self.sdpa_params.n_kv_groups,
-                                softcap: self.sdpa_params.softcap,
-                                softmax_scale: self.sdpa_params.softmax_scale,
-                                sliding_window: Some(self.sliding_window),
-                                sinks: None,
-                            };
-                            let swa_out = Sdpa.run_attention(
-                                &q,
-                                &raw_k_step,
-                                &raw_v_step,
-                                attention_mask,
-                                Some(flash_params),
-                                &params_swa,
-                            )?;
-
-                            // Blend (0.5 main + 0.5 SWA per V4 paper default).
-                            // Real V4 uses a per-head learned blend tensor;
-                            // when Agent 11's hybrid_attention lands, this is
-                            // replaced with `hybrid_attention(main_out, swa_out, blend)`.
-                            ((&main_out * 0.5)? + (&swa_out * 0.5)?)?
-                        }
-                    }
+                    Some(flash_params),
+                )?,
+                None => {
+                    let input_metadata = PagedAttentionInputMetadata::dummy(q.device())?;
+                    assert!(attention_mask.is_some());
+                    paged_attn.forward(
+                        &q,
+                        &k,
+                        &v,
+                        attention_mask,
+                        None,
+                        None,
+                        &input_metadata,
+                        &self.sdpa_params,
+                        Some(flash_params),
+                    )?
                 }
+            },
+            None => {
+                let (k_cached, v_cached) = kv_cache.append(&k, &v)?;
+                Sdpa.run_attention(
+                    &q,
+                    &k_cached,
+                    &v_cached,
+                    attention_mask,
+                    Some(flash_params),
+                    &self.sdpa_params,
+                )?
             }
         };
 
+        // 6. Inverse RoPE on attention output's last 64 dims is implicit
+        //    here because K and V come from the same source post-RoPE: the
+        //    rotation on V cancels with the rotation on K at attention
+        //    time. SGLang's explicit `inverse=True` rope call (audit §2,
+        //    lines 619-625) applies only when K and V are stored
+        //    separately in the FlashMLA-style paged cache. Tracked in
+        //    audit §8 P1 item 13.
+
+        // 7. Reshape attention output → flatten heads → grouped o_proj
+        //    LoRA. attn_out shape: [B, n_heads, T, head_dim].
+        //    Audit §8 P1 item 12 — per-group einsum vs flat matmul.
         attn_out = if attention_mask.is_some() {
             attn_out.transpose(1, 2)?.reshape((bs, seq_len, ()))?
         } else {
             attn_out.reshape((bs, seq_len, ()))?
         };
 
-        // V4 LoRA o_proj: apply wo_a then wo_b. Mathematically:
-        //   out = wo_b(wo_a(attn_out))
-        // where wo_a maps [n_heads*v_head_dim → o_inner] and wo_b maps
-        // [o_inner → hidden_size]. For DeepseekV4GroupedLinear this is the
-        // standard two-matmul LoRA composition; o_groups is encoded in the
-        // o_inner dimension at load time.
         let inner = self.wo_a.forward_autocast(&attn_out)?;
         self.wo_b.forward_autocast(&inner)
     }
 }
 
+/// V4 MoE gate. Inherits V3's NoAuxTc / Greedy / GroupLimitedGreedy dispatch
+/// and adds support for `ScoringFunc::SqrtSoftplus` (V4 default — audit §0
+/// + §5).
 struct MoeGate {
     weight: Tensor,
     cfg: DeepSeekV4Config,
@@ -1259,12 +1049,24 @@ struct MoeGate {
 }
 
 impl MoeGate {
-    fn new(cfg: &DeepSeekV4Config, vb: ShardedVarBuilder, n_routed_experts: usize) -> Result<Self> {
+    fn new(
+        cfg: &DeepSeekV4Config,
+        vb: ShardedVarBuilder,
+        n_routed_experts: usize,
+    ) -> Result<Self> {
         let weight = vb.get((n_routed_experts, cfg.hidden_size), "weight")?;
+        // V4 native publishes the noaux_tc bias as `gate.bias`; HF as
+        // `gate.e_score_correction_bias`. Audit §2 (SGLang line 361
+        // remap rule).
         let e_score_correction_bias = if matches!(cfg.topk_method, TopkMethod::NoAuxTc) {
+            let name = if vb.contains_tensor("bias") {
+                "bias"
+            } else {
+                "e_score_correction_bias"
+            };
             Some(vb.get_with_hints_dtype(
                 n_routed_experts,
-                "e_score_correction_bias",
+                name,
                 Default::default(),
                 DType::F32,
             )?)
@@ -1274,16 +1076,14 @@ impl MoeGate {
         Ok(Self {
             weight,
             cfg: cfg.clone(),
-            top_k: cfg.num_experts_per_tok.unwrap(),
+            top_k: cfg.num_experts_per_tok.unwrap_or(6),
             n_routed_experts,
             e_score_correction_bias,
         })
     }
 
-    /// (topk_idx, topk_weight)
     fn forward(&self, xs: &Tensor) -> Result<(Tensor, Tensor)> {
         let (bs, seq_len, h) = xs.dims3()?;
-        // Compute gating score
         let xs = xs.reshape(((), h))?;
         let logits = xs
             .to_dtype(DType::F32)?
@@ -1291,9 +1091,17 @@ impl MoeGate {
         let scores = match self.cfg.scoring_func {
             ScoringFunc::Softmax => candle_nn::ops::softmax_last_dim(&logits)?,
             ScoringFunc::Sigmoid => candle_nn::ops::sigmoid(&logits)?,
+            // V4: sqrt(softplus(x)). Stable formulation:
+            // softplus(x) = max(x, 0) + log(1 + exp(-|x|)).
+            // Audit §8 P1 item 14.
+            ScoringFunc::SqrtSoftplus => {
+                let max0 = logits.maximum(&logits.zeros_like()?)?;
+                let abs = logits.abs()?;
+                let softplus = (max0 + ((abs.neg()?.exp()? + 1.0)?.log()?))?;
+                softplus.sqrt()?
+            }
         };
 
-        // Select top-k experts
         let (mut topk_weight, topk_idx) = match self.cfg.topk_method {
             TopkMethod::Greedy => {
                 let TopKOutput { values, indices } = scores.topk_unsorted(self.top_k)?;
@@ -1306,53 +1114,49 @@ impl MoeGate {
                 let scores_for_choice = scores
                     .reshape((bs * seq_len, ()))?
                     .broadcast_add(&e_score_correction_bias.unsqueeze(0)?)?;
-                // (n, n_group)
-                let group_scores = scores_for_choice
-                    .reshape((bs * seq_len, self.cfg.n_group, ()))?
-                    .topk(2)?
-                    .values
-                    .sum(D::Minus1)?;
-                // (n, topk_group)
-                let group_idx = group_scores.topk(self.cfg.topk_group)?.indices;
-                // (n, n_group)
-                let mut group_mask = group_scores.zeros_like()?;
-                // (n, n_group)
-                group_mask = group_mask.scatter_add(
-                    &group_idx,
-                    &group_idx.ones_like()?.to_dtype(group_mask.dtype())?,
-                    1,
-                )?;
-                // (n, e)
-                let score_mask = group_mask
-                    .unsqueeze(D::Minus1)?
-                    .expand((
-                        bs * seq_len,
-                        self.cfg.n_group,
-                        self.n_routed_experts / self.cfg.n_group,
-                    ))?
-                    .reshape((bs * seq_len, ()))?;
-                // (n, e)
-                // Invert the mask
-                let tmp_scores = scores_for_choice.broadcast_mul(&score_mask)?;
-                let topk_idx = tmp_scores.topk(self.top_k)?.indices;
-                (scores.gather(&topk_idx, 1)?, topk_idx)
+                // V4 Flash config does NOT publish `n_group` (audit §5 +
+                // /tmp/v4_flash_config.json). When n_group==1 the grouping
+                // degenerates; fall back to a flat top-k over all experts.
+                if self.cfg.n_group > 1 {
+                    let group_scores = scores_for_choice
+                        .reshape((bs * seq_len, self.cfg.n_group, ()))?
+                        .topk(2)?
+                        .values
+                        .sum(D::Minus1)?;
+                    let group_idx = group_scores.topk(self.cfg.topk_group)?.indices;
+                    let mut group_mask = group_scores.zeros_like()?;
+                    group_mask = group_mask.scatter_add(
+                        &group_idx,
+                        &group_idx.ones_like()?.to_dtype(group_mask.dtype())?,
+                        1,
+                    )?;
+                    let score_mask = group_mask
+                        .unsqueeze(D::Minus1)?
+                        .expand((
+                            bs * seq_len,
+                            self.cfg.n_group,
+                            self.n_routed_experts / self.cfg.n_group,
+                        ))?
+                        .reshape((bs * seq_len, ()))?;
+                    let tmp_scores = scores_for_choice.broadcast_mul(&score_mask)?;
+                    let topk_idx = tmp_scores.topk(self.top_k)?.indices;
+                    (scores.gather(&topk_idx, 1)?, topk_idx)
+                } else {
+                    let topk_idx = scores_for_choice.topk(self.top_k)?.indices;
+                    (scores.gather(&topk_idx, 1)?, topk_idx)
+                }
             }
             TopkMethod::GroupLimitedGreedy => {
-                // (n, n_group)
                 let group_scores = scores
                     .reshape((bs * seq_len, self.cfg.n_group, ()))?
                     .max(D::Minus1)?;
-                // (n, topk_group)
                 let group_idx = group_scores.topk_unsorted(self.cfg.topk_group)?.indices;
-                // (n, n_group)
                 let mut group_mask = group_scores.zeros_like()?;
-                // (n, n_group)
                 group_mask = group_mask.scatter_add(
                     &group_idx,
                     &group_idx.ones_like()?.to_dtype(group_mask.dtype())?,
                     1,
                 )?;
-                // (n, e)
                 let score_mask = group_mask
                     .unsqueeze(D::Minus1)?
                     .expand((
@@ -1361,22 +1165,21 @@ impl MoeGate {
                         self.n_routed_experts / self.cfg.n_group,
                     ))?
                     .reshape((bs * seq_len, ()))?;
-                // (n, e)
-                // Invert the mask
                 let tmp_scores = masked_fill(&score_mask, &(1. - &score_mask.ne(0.)?)?, 0.)?;
                 let TopKOutput { values, indices } = tmp_scores.topk_unsorted(self.top_k)?;
                 (values, indices)
             }
         };
 
-        if matches!(self.cfg.scoring_func, ScoringFunc::Sigmoid) {
-            let denmoninator = (topk_weight.sum_keepdim(D::Minus1)? + 1e-20)?;
-            topk_weight = topk_weight.broadcast_div(&denmoninator)?;
+        if matches!(
+            self.cfg.scoring_func,
+            ScoringFunc::Sigmoid | ScoringFunc::SqrtSoftplus
+        ) {
+            let denominator = (topk_weight.sum_keepdim(D::Minus1)? + 1e-20)?;
+            topk_weight = topk_weight.broadcast_div(&denominator)?;
         }
 
-        // Must multiply the scaling factor
         topk_weight = (topk_weight * self.cfg.routed_scaling_factor)?;
-
         Ok((topk_idx, topk_weight))
     }
 }
@@ -1407,12 +1210,11 @@ impl Moe {
 
         let moe_cfg = MoEExpertsConfig {
             num_experts: n_routed_experts,
-            num_experts_per_tok: cfg.num_experts_per_tok.unwrap(),
+            num_experts_per_tok: cfg.num_experts_per_tok.unwrap_or(6),
             hidden_size: cfg.hidden_size,
             moe_intermediate_size: cfg.moe_intermediate_size,
         };
 
-        // Use the optimized MoEExperts with automatic backend selection
         let experts = MoEExperts::new(
             &moe_cfg,
             mapper.set_device(layer_idx, vb.clone(), loading_isq),
@@ -1452,14 +1254,10 @@ impl Moe {
         let identity = xs.clone();
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
 
-        // Get routing weights from gate
         let (topk_idx, topk_weight) = self.gate.forward(xs)?;
-
-        // Forward through routed experts using optimized MoEExperts
         let mut y = self.experts.forward(xs, topk_weight, &topk_idx)?;
         y = y.reshape((b_size, seq_len, hidden_dim))?;
 
-        // Add shared expert output
         if let Some(ref shared_experts) = self.shared_experts {
             y = (y + shared_experts.forward(&identity)?)?;
         }
@@ -1480,6 +1278,8 @@ impl Moe {
 
 enum MoeOrMlp {
     Moe(Box<Moe>),
+    /// Used only when `cfg.first_k_dense_replace > 0` (V3-style fixtures).
+    /// V4 Flash sets it to 0 — every layer is MoE. Audit §0 + §5 line 448.
     Mlp(Mlp),
 }
 
@@ -1497,12 +1297,10 @@ struct DecoderLayer {
     post_attention_layernorm: RmsNorm,
     attn: Attention,
     moe_or_mlp: MoeOrMlp,
-    /// V4 mHC (Manifold-Constrained Hyper-Connections) parameters. Loaded if
-    /// the checkpoint publishes `hc_attn_fn`, `hc_attn_base`, `hc_attn_scale`,
-    /// `hc_ffn_fn`, `hc_ffn_base`, `hc_ffn_scale`. Replaces the standard
-    /// residual with a learned per-layer mixing per SGLang
-    /// `deepseek_v4.py:696-700`.
-    mhc_params: Option<super::dsv4_mhc::V4MHCLayerParams>,
+    /// V4 mHC layer-side parameters (loaded if present in checkpoint).
+    /// Audit §0 + §2 ("DecoderLayer forward — mHC replaces residuals").
+    #[allow(dead_code)]
+    mhc: Option<V4MHCLayerParams>,
 }
 
 impl DecoderLayer {
@@ -1518,16 +1316,21 @@ impl DecoderLayer {
         comm: &Arc<mistralrs_quant::Comm>,
         real_device: Device,
     ) -> Result<Self> {
-        // V4 native uses `attn.*`, `attn_norm`, `ffn_norm`. HF format uses
-        // `self_attn.*`, `input_layernorm`, `post_attention_layernorm`.
-        // Auto-detect via tensor presence.
+        // V4 native: `attn`, `ffn`, `attn_norm`, `ffn_norm`.
+        // HF:        `self_attn`, `mlp`, `input_layernorm`,
+        //            `post_attention_layernorm`.
         let uses_native_layer = vb.contains_tensor("attn.wq_a.weight")
             || vb.contains_tensor("attn.wkv.weight")
             || vb.contains_tensor("attn_norm.weight");
         let (attn_subpath, input_ln_path, post_ln_path, mlp_subpath) = if uses_native_layer {
             ("attn", "attn_norm", "ffn_norm", "ffn")
         } else {
-            ("self_attn", "input_layernorm", "post_attention_layernorm", "mlp")
+            (
+                "self_attn",
+                "input_layernorm",
+                "post_attention_layernorm",
+                "mlp",
+            )
         };
 
         let attn = Attention::new(
@@ -1550,8 +1353,14 @@ impl DecoderLayer {
             cfg.rms_norm_eps,
             mapper.set_device(layer_idx, vb.pp(post_ln_path), false),
         )?;
+
+        // V4: ALL 43 layers are MoE (`first_k_dense_replace=0`). The dense
+        // MLP branch is reachable only if a config explicitly sets a
+        // non-zero `first_k_dense_replace` AND provides `intermediate_size`.
+        // Audit §0 + §5 line 448.
         let moe_or_mlp = if let Some(n_routed_experts) = cfg.n_routed_experts.filter(|_| {
-            layer_idx >= cfg.first_k_dense_replace && layer_idx.is_multiple_of(cfg.moe_layer_freq)
+            layer_idx >= cfg.first_k_dense_replace
+                && layer_idx.is_multiple_of(cfg.moe_layer_freq)
         }) {
             MoeOrMlp::Moe(Box::new(Moe::new(
                 cfg,
@@ -1564,29 +1373,32 @@ impl DecoderLayer {
                 comm,
                 real_device,
             )?))
-        } else {
+        } else if let Some(intermediate_size) = cfg.intermediate_size {
             MoeOrMlp::Mlp(Mlp::new(
                 mapper.set_device(layer_idx, vb.pp(mlp_subpath), loading_isq),
                 cfg.hidden_size,
-                cfg.intermediate_size,
+                intermediate_size,
                 &cfg.quantization_config,
                 cfg.hidden_act,
                 comm,
             )?)
+        } else {
+            candle_core::bail!(
+                "DeepSeekV4 layer {layer_idx} has neither MoE config nor intermediate_size — \
+                 invalid V4 config"
+            );
         };
 
-        // V4 mHC (Agent 5 integration, RUN-168). Loaded if checkpoint
-        // publishes the six hc_* tensors per layer. Probed against the
-        // layer-root vb (mapped to device).
-        let mhc_vb = mapper.set_device(layer_idx, vb.clone(), false);
-        let mhc_params = super::dsv4_mhc::V4MHCLayerParams::try_load(cfg, &mhc_vb, layer_idx);
+        // mHC layer params (loaded at the LAYER root, i.e. `vb` itself).
+        // Audit §0 + dsv4_mhc.rs.
+        let mhc = V4MHCLayerParams::try_load(cfg, &vb, layer_idx);
 
         Ok(Self {
             input_layernorm,
             post_attention_layernorm,
             attn,
             moe_or_mlp,
-            mhc_params,
+            mhc,
         })
     }
 
@@ -1596,51 +1408,57 @@ impl DecoderLayer {
         attention_mask: Option<&Tensor>,
         seqlen_offsets: &[usize],
         kv_cache: &mut KvCache,
-        metadata: Option<((Tensor, Tensor, Option<Tensor>, Option<Tensor>), &PagedAttentionInputMetadata)>,
+        metadata: Option<(
+            (Tensor, Tensor, Option<Tensor>, Option<Tensor>),
+            &PagedAttentionInputMetadata,
+        )>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
+        // V4 mHC residual mixing.
+        //
+        // When mHC is loaded, the per-layer round-trip is:
+        //   y, post, comb = hc_pre(residual_4D, hc_attn_fn, scale, base)
+        //   y = norm(y); branch = attn(y);  residual = hc_post(branch, ...)
+        //   <repeat for the ffn block>
+        //
+        // The full math requires a 4-D residual `[B, T, hc_mult, hidden]`
+        // threaded end-to-end through the model. Today the residual is 3-D
+        // `[B, T, hidden]`. With `hc_mult=1` the mHC math degenerates to
+        // standard `x + sublayer(norm(x))`. mHC weights are loaded and
+        // available via `self.mhc`; threading 4-D residuals is tracked in
+        // audit §0 + §8 P0 item 6 as a follow-up.
+
         let residual = xs;
-        let xs_norm = self.input_layernorm.forward(xs)?;
-        let attn_out = self.attn.forward(
-            &xs_norm,
+        let xs = self.input_layernorm.forward(xs)?;
+        let xs = self.attn.forward(
+            &xs,
             attention_mask,
             seqlen_offsets,
             kv_cache,
             metadata,
             flash_params,
         )?;
-        // V4 mHC mix_attn replaces the standard residual when params loaded
-        // (RUN-168, SGLang `deepseek_v4.py:696-700`).
-        let xs = if let Some(mhc) = &self.mhc_params {
-            mhc.mix_attn(residual, &attn_out)?
-        } else {
-            (attn_out + residual)?
-        };
-        let residual2 = &xs;
-        let ffn_out = self
+        let xs = (xs + residual)?;
+        let residual = &xs;
+        let xs = self
             .moe_or_mlp
             .forward(&xs.apply(&self.post_attention_layernorm)?)?;
-        // V4 mHC mix_ffn similarly replaces the FFN residual when loaded.
-        if let Some(mhc) = &self.mhc_params {
-            mhc.mix_ffn(residual2, &ffn_out)
-        } else {
-            residual2 + ffn_out
-        }
+        residual + xs
     }
 }
 
-/// V4 MTP head — single transformer layer that predicts next-token given the
-/// previous-step hidden state + current-token embedding.
+/// V4 MTP head.
 ///
-/// Per V4 paper + SGLang `deepseek_v4_nextn.py`:
-///   `mtp_logits = head(norm(h_proj(prev_hidden) + e_proj(cur_emb) + transformer(...)))`
+/// V4 Flash actually ships a full transformer decoder layer + 256-expert
+/// MoE block at `mtp.0.*`. We load the two projection layers `h_proj` and
+/// `e_proj` — the only tensors `MtpDecodeKit` consumes for the Tier A
+/// drafting in `pipeline/mtp_pipeline.rs::MtpDecodeKit::step`.
 ///
-/// At Tier A we LOAD the head weights but don't yet integrate into decode
-/// (RUN-156 does the SpeculativePipeline wiring).
+/// The remaining MTP weights (full attn + ffn + hc_*) are loaded lazily by
+/// the MTP-pipeline follow-up agent that turns MTP into a real transformer
+/// step. Audit §0 + §2 ("MTP module").
 pub struct MtpHead {
-    /// Projects the previous-step hidden state. Shape: `[hidden, hidden]`.
     pub h_proj: Arc<dyn QuantMethod>,
-    /// Projects the next-token embedding. Shape: `[hidden, hidden]`.
     pub e_proj: Arc<dyn QuantMethod>,
 }
 
@@ -1654,30 +1472,26 @@ pub struct DeepSeekV4 {
     max_seq_len: usize,
     cfg: ModelConfigMetadata,
     mapper: Box<dyn DeviceMapper + Send + Sync>,
-    /// V4 MTP head (loaded if `mtp.layers.0.*` tensors present in checkpoint).
-    /// `None` for non-MTP checkpoints; `Some` enables MTP-aware decoding.
+    /// V4 MTP head — loaded if `mtp.0.h_proj` (V4 native) or
+    /// `mtp.layers.0.h_proj` (HF) tensors present.
     mtp_head: Option<MtpHead>,
-    /// V4 mHC global head (loaded if checkpoint publishes the head-level
-    /// `hc_head_fn`, `hc_head_base`, `hc_head_scale`). Per Agent 5's module;
-    /// `forward` is invoked between the final RMSNorm and the lm_head.
+    /// V4 global mHC head — applied just before lm_head when present and
+    /// when the residual stream is 4-D. Audit §0 + §2.
+    #[allow(dead_code)]
     mhc_head: Option<super::dsv4_mhc::V4MHCHead>,
 }
 
 impl DeepSeekV4 {
-    /// Returns true if an MTP head was loaded from the checkpoint.
-    /// The SpeculativePipeline can query this to opt into MTP-based decoding.
+    /// True if an MTP head was loaded from the checkpoint.
     pub fn has_mtp(&self) -> bool {
         self.mtp_head.is_some()
     }
 
-    /// Reference to the MTP head, if loaded. Returns None for non-MTP
-    /// checkpoints (or when V4 weights without mtp.layers.0 are loaded).
     pub fn mtp_head(&self) -> Option<&MtpHead> {
         self.mtp_head.as_ref()
     }
 
-    /// Returns true if mHC (Manifold-Constrained Hyper-Connections) global
-    /// head parameters were loaded.
+    /// True if mHC global parameters were loaded.
     pub fn has_mhc(&self) -> bool {
         self.mhc_head.is_some()
     }
@@ -1693,8 +1507,8 @@ impl DeepSeekV4 {
     ) -> Result<Self> {
         let mapper = normal_loading_metadata.mapper;
 
-        // V4 native publishes globals as `embed.weight`, `norm.weight`, `head.weight`
-        // (per SGLang's remap function at deepseek_v4.py:1365). HF format uses
+        // V4 native publishes globals as `embed.weight`, `norm.weight`,
+        // `head.weight` (audit §1). HF format uses
         // `model.embed_tokens.weight`, `model.norm.weight`, `lm_head.weight`.
         let uses_native = vb.contains_tensor("embed.weight")
             && !vb.contains_tensor("model.embed_tokens.weight");
@@ -1717,7 +1531,10 @@ impl DeepSeekV4 {
                 cfg.vocab_size,
                 &cfg.quantization_config,
                 false,
-                mapper.set_nm_device(lm_head_vb.pp(lm_head_path), normal_loading_metadata.loading_isq),
+                mapper.set_nm_device(
+                    lm_head_vb.pp(lm_head_path),
+                    normal_loading_metadata.loading_isq,
+                ),
             )?
         } else {
             ReplicatedLayer::from_linear(candle_nn::Linear::new(
@@ -1731,16 +1548,12 @@ impl DeepSeekV4 {
         let norm = RmsNorm::new(
             cfg.hidden_size,
             cfg.rms_norm_eps,
-            // V4 native and HF both use "norm" as the per-vb_m sub-path
-            // (native: vb.pp("norm"), HF: vb.pp("model").pp("norm"))
             mapper.set_nm_device(vb_m.pp("norm"), false),
         )?;
 
-        // V4 dual RoPE (RUN-165, SGLang `deepseek_v4.py:220`):
-        //   - Standard layers (compress_ratio == 0) use `cfg.rope_theta`
-        //   - Compress layers (compress_ratio in {4, 128}) use `cfg.compress_rope_theta`
-        //     (default 40000.0)
-        // Both maps are keyed by device location for multi-GPU support.
+        // ---- Dual RoPE (standard + compress) ----
+        // Audit §0 + §8 P1 item 11. Standard layers use `rope_theta`
+        // (10000); compress layers use `compress_rope_theta` (160000).
         let mut rope_standard: HashMap<_, Arc<DeepSeekV2RotaryEmbedding>> = HashMap::new();
         let mut rope_compress: HashMap<_, Arc<DeepSeekV2RotaryEmbedding>> = HashMap::new();
         let rope_cfg_standard = DeepSeekV2RopeConfig {
@@ -1755,7 +1568,6 @@ impl DeepSeekV4 {
             rope_theta: cfg.compress_rope_theta,
             qk_rope_head_dim: cfg.qk_rope_head_dim,
         };
-        // Determine which devices we need RoPEs on, and which kinds.
         let mut need_standard_devices: std::collections::HashSet<_> =
             std::collections::HashSet::new();
         let mut need_compress_devices: std::collections::HashSet<_> =
@@ -1774,7 +1586,6 @@ impl DeepSeekV4 {
                 }
             }
         }
-        // Build the RoPEs. Use any device matching the location for construction.
         for i in 0..cfg.num_hidden_layers {
             let device = mapper
                 .device_for(i, false)
@@ -1812,7 +1623,6 @@ impl DeepSeekV4 {
             let device = mapper
                 .device_for(layer_idx, false)
                 .unwrap_or(&normal_loading_metadata.real_device);
-            // Pick the right RoPE based on this layer's compress ratio.
             let layer_ratio = cfg.layer_compress_ratio(layer_idx);
             let rotary_emb = if layer_ratio == 0 {
                 rope_standard
@@ -1828,7 +1638,7 @@ impl DeepSeekV4 {
             let paged_attn = match &attention_mechanism {
                 AttentionImplementation::Eager => None,
                 AttentionImplementation::PagedAttention => Some(
-                    PagedAttention::new(cfg.v_head_dim, device, None)
+                    PagedAttention::new(cfg.head_dim, device, None)
                         .expect("Failed to create PagedAttention"),
                 ),
             };
@@ -1846,6 +1656,44 @@ impl DeepSeekV4 {
             )
         })?;
 
+        // ---- MTP head ----
+        // Audit §0 + §2 + §5 lines 506-511. Probe both V4 native
+        // (`mtp.0.*`) and HF (`mtp.layers.0.*`) paths.
+        let mtp_head = {
+            let mtp_native_vb = vb.pp("mtp").pp("0");
+            let mtp_hf_vb = vb.pp("mtp").pp("layers").pp("0");
+            let mtp_vb = if mtp_native_vb.contains_tensor("h_proj.weight") {
+                Some(mtp_native_vb)
+            } else if mtp_hf_vb.contains_tensor("h_proj.weight") {
+                Some(mtp_hf_vb)
+            } else {
+                None
+            };
+
+            if let Some(mtp_vb) = mtp_vb {
+                let try_load = |sub: &str| -> Result<Arc<dyn QuantMethod>> {
+                    ReplicatedLayer::new(
+                        cfg.hidden_size,
+                        cfg.hidden_size,
+                        &cfg.quantization_config,
+                        false,
+                        mtp_vb.pp(sub),
+                    )
+                };
+                match (try_load("h_proj"), try_load("e_proj")) {
+                    (Ok(h_proj), Ok(e_proj)) => Some(MtpHead { h_proj, e_proj }),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        };
+
+        // ---- Global mHC head ----
+        // V4 publishes `hc_head_fn`, `hc_head_base`, `hc_head_scale` at the
+        // model root. Audit §1 ("Top-level tensors").
+        let mhc_head = super::dsv4_mhc::V4MHCHead::try_load(cfg, &vb_m);
+
         Ok(Self {
             lm_head,
             embed_tokens,
@@ -1861,61 +1709,28 @@ impl DeepSeekV4 {
                 max_seq_len: cfg.max_position_embeddings,
                 num_layers: cfg.num_hidden_layers,
                 hidden_size: cfg.hidden_size,
-                num_kv_heads: (cfg.num_attention_heads / mapper.get_comm_for(0)?.world_size())
-                    .max(1),
-                num_attn_heads: (cfg.num_attention_heads / mapper.get_comm_for(0)?.world_size())
-                    .max(1),
+                // V4 MQA: 1 KV head (broadcast across 64 Q heads at the
+                // kernel). Audit §0 + §3.
+                num_kv_heads: cfg.num_key_value_heads.max(1),
+                num_attn_heads: (cfg.num_attention_heads
+                    / mapper.get_comm_for(0)?.world_size())
+                .max(1),
                 sliding_window: None,
-                k_head_dim: cfg.q_head_dim(),
-                v_head_dim: if matches!(
-                    attention_mechanism,
-                    AttentionImplementation::PagedAttention
-                ) {
-                    cfg.q_head_dim()
-                } else {
-                    cfg.v_head_dim
-                },
+                // V4: single 512-dim head for K and V (same fused wkv
+                // vector). Audit §3.
+                k_head_dim: cfg.head_dim,
+                v_head_dim: cfg.head_dim,
+                // V4 is NOT MLA. The KV cache is a flat per-page tensor of
+                // shape `[n_kv_heads=1, head_dim=512]`. Audit §5
+                // lines 521-523.
                 #[cfg(all(feature = "cuda", target_family = "unix"))]
-                kv_cache_layout: if matches!(
-                    attention_mechanism,
-                    AttentionImplementation::PagedAttention
-                ) {
-                    crate::paged_attention::KvCacheLayout::Mla {
-                        kv_lora_rank: cfg.kv_lora_rank,
-                        kpe_head_dim: cfg.qk_rope_head_dim,
-                    }
-                } else {
-                    crate::paged_attention::KvCacheLayout::Standard
-                },
+                kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
                 #[cfg(not(all(feature = "cuda", target_family = "unix")))]
                 kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
             },
             mapper,
-            // V4 MTP head — actually LOAD the weights if present in safetensors.
-            // h_proj projects the previous-step hidden state, e_proj projects
-            // the current-token embedding. Both are [hidden, hidden] linears.
-            // Used by SpeculativePipeline (RUN-156) for MTP draft decoding.
-            mtp_head: {
-                let mtp_vb = vb.pp("mtp").pp("layers").pp("0");
-                let try_load = |sub: &str| -> Result<Arc<dyn QuantMethod>> {
-                    ReplicatedLayer::new(
-                        cfg.hidden_size,
-                        cfg.hidden_size,
-                        &cfg.quantization_config,
-                        false,
-                        mtp_vb.pp(sub),
-                    )
-                };
-                match (try_load("h_proj"), try_load("e_proj")) {
-                    (Ok(h_proj), Ok(e_proj)) => Some(MtpHead { h_proj, e_proj }),
-                    _ => None,
-                }
-            },
-            // V4 mHC global head — loaded if checkpoint publishes
-            // `hc_head_fn`, `hc_head_base`, `hc_head_scale` at the model
-            // root (per SGLang `deepseek_v4.py` head wiring). Agent 5's
-            // module owns the try_load + forward semantics.
-            mhc_head: super::dsv4_mhc::V4MHCHead::try_load(cfg, &vb_m),
+            mtp_head,
+            mhc_head,
         })
     }
 
@@ -1925,7 +1740,10 @@ impl DeepSeekV4 {
         input_ids: &Tensor,
         seqlen_offsets: &[usize],
         context_lens: Vec<(usize, usize)>,
-        metadata: Option<(Vec<(Tensor, Tensor, Option<Tensor>, Option<Tensor>)>, &PagedAttentionInputMetadata)>,
+        metadata: Option<(
+            Vec<(Tensor, Tensor, Option<Tensor>, Option<Tensor>)>,
+            &PagedAttentionInputMetadata,
+        )>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let mut xs = self.embed_tokens.forward(input_ids)?;
@@ -1939,7 +1757,6 @@ impl DeepSeekV4 {
             xs.dtype(),
             self.cfg.num_attn_heads,
         )?;
-        // PagedAttention prompt chunking
         let attention_mask = attention_mask.filter(|_| {
             metadata
                 .as_ref()
@@ -1962,13 +1779,12 @@ impl DeepSeekV4 {
         }
         let xs = xs.to_device(&self.device)?;
         let xs = xs.apply(&self.norm)?;
-        // V4 mHC head — applied between norm and lm_head when loaded (Agent 5).
-        let xs = if let Some(mhc) = &self.mhc_head {
-            mhc.forward(&xs)?
-        } else {
-            xs
-        };
         let xs = extract_logits(&xs, context_lens)?;
+
+        // The global mHC head is applied only when the residual stream is
+        // 4-D (hc_mult-stacked). Today the residual stream is 3-D; the
+        // 4-D upgrade is tracked at audit §8 P0 item 6.
+
         self.lm_head.forward_autocast(&xs)
     }
 }
@@ -1992,8 +1808,8 @@ impl IsqModel for DeepSeekV4 {
                     tensors.push((b, Some(i)));
                 }
             }
-            tensors.push((&mut layer.attn.kv_a_proj_with_mqa, Some(i)));
-            tensors.push((&mut layer.attn.kv_b_proj, Some(i)));
+            // V4: ONE fused wkv (audit §0 + §5 lines 477-481).
+            tensors.push((&mut layer.attn.wkv, Some(i)));
             tensors.push((&mut layer.attn.wo_a, Some(i)));
             tensors.push((&mut layer.attn.wo_b, Some(i)));
             match &mut layer.moe_or_mlp {
@@ -2009,7 +1825,6 @@ impl IsqModel for DeepSeekV4 {
                 }
             }
         }
-        // V4 MTP head — ISQ-eligible (it's two large Linear layers).
         if let Some(mtp) = &mut self.mtp_head {
             tensors.push((&mut mtp.h_proj, None));
             tensors.push((&mut mtp.e_proj, None));
@@ -2055,11 +1870,13 @@ impl IsqModel for DeepSeekV4 {
             uvb_l
                 .pp("post_attention_layernorm")
                 .add(&layer.post_attention_layernorm);
-
+            // V4: `kv_norm` operates on head_dim. Emit at the HF-style
+            // path `self_attn.kv_a_layernorm` for ISQ round-trip
+            // compatibility.
             uvb_l
                 .pp("self_attn")
                 .pp("kv_a_layernorm")
-                .add(&layer.attn.kv_a_layernorm);
+                .add(&layer.attn.kv_norm);
 
             match &layer.moe_or_mlp {
                 MoeOrMlp::Moe(moe) => {
@@ -2095,11 +1912,10 @@ impl IsqModel for DeepSeekV4 {
             uvb_l
                 .pp("post_attention_layernorm")
                 .add(&layer.post_attention_layernorm);
-
             uvb_l
                 .pp("self_attn")
                 .pp("kv_a_layernorm")
-                .add(&layer.attn.kv_a_layernorm);
+                .add(&layer.attn.kv_norm);
 
             match &layer.moe_or_mlp {
                 MoeOrMlp::Moe(moe) => {
@@ -2121,14 +1937,9 @@ impl IsqModel for DeepSeekV4 {
                     uvb_l.pp("self_attn").pp("q_b_proj").add(b);
                 }
             }
-            uvb_l
-                .pp("self_attn")
-                .pp("kv_a_proj_with_mqa")
-                .add(&layer.attn.kv_a_proj_with_mqa);
-            uvb_l
-                .pp("self_attn")
-                .pp("kv_b_proj")
-                .add(&layer.attn.kv_b_proj);
+            // V4: emit at the HF-style fused path `kv_proj` (no longer an
+            // a/b split). Audit §5.
+            uvb_l.pp("self_attn").pp("kv_proj").add(&layer.attn.wkv);
             uvb_l.pp("self_attn").pp("o_a_proj").add(&layer.attn.wo_a);
             uvb_l.pp("self_attn").pp("o_b_proj").add(&layer.attn.wo_b);
         }
@@ -2144,7 +1955,10 @@ impl NormalModel for DeepSeekV4 {
         seqlen_offsets: &[usize],
         context_lens: Vec<(usize, usize)>,
         _position_ids: Vec<usize>,
-        metadata: Option<(Vec<(Tensor, Tensor, Option<Tensor>, Option<Tensor>)>, &PagedAttentionInputMetadata)>,
+        metadata: Option<(
+            Vec<(Tensor, Tensor, Option<Tensor>, Option<Tensor>)>,
+            &PagedAttentionInputMetadata,
+        )>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         self.forward(
@@ -2196,8 +2010,132 @@ impl AnyMoeBaseModelMixin for DeepSeekV4 {}
 mod tests {
     use super::*;
 
-    /// V4Compressor::uniform produces averaging behavior — reducing the seq
-    /// dimension by ratio while preserving other dims.
+    /// Real V4 Flash config.json (slimmed) parses cleanly through the
+    /// rewritten DeepSeekV4Config. Audit §0.
+    #[test]
+    fn v4_flash_real_config_parses() {
+        let cfg_json = r#"{
+            "architectures": ["DeepseekV4ForCausalLM"],
+            "vocab_size": 129280,
+            "hidden_size": 4096,
+            "moe_intermediate_size": 2048,
+            "num_hidden_layers": 43,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 1,
+            "n_routed_experts": 256,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 6,
+            "first_k_dense_replace": 0,
+            "max_position_embeddings": 1048576,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000,
+            "q_lora_rank": 1024,
+            "qk_rope_head_dim": 64,
+            "head_dim": 512,
+            "compress_ratios": [0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 0],
+            "sliding_window": 128,
+            "compress_rope_theta": 160000,
+            "o_lora_rank": 1024,
+            "o_groups": 8,
+            "index_n_heads": 64,
+            "index_head_dim": 128,
+            "index_topk": 512,
+            "num_hash_layers": 3,
+            "hc_mult": 4,
+            "hc_eps": 1e-6,
+            "hc_sinkhorn_iters": 20,
+            "swiglu_limit": 10.0,
+            "routed_scaling_factor": 1.5,
+            "scoring_func": "sqrtsoftplus",
+            "topk_method": "noaux_tc"
+        }"#;
+
+        let cfg: DeepSeekV4Config = serde_json::from_str(cfg_json).expect("V4 config parses");
+        // Derived qk_nope_head_dim = head_dim - qk_rope_head_dim
+        assert_eq!(cfg.qk_nope_head_dim(), 448);
+        assert_eq!(cfg.head_dim, 512);
+        assert_eq!(cfg.num_key_value_heads, 1);
+        assert_eq!(cfg.q_lora_rank, Some(1024));
+        assert_eq!(cfg.qk_rope_head_dim, 64);
+        assert_eq!(cfg.hc_mult, 4);
+        assert_eq!(cfg.num_hash_layers, 3);
+        assert_eq!(cfg.swiglu_limit, 10.0);
+        assert!(matches!(cfg.scoring_func, ScoringFunc::SqrtSoftplus));
+        assert!(matches!(cfg.topk_method, TopkMethod::NoAuxTc));
+        assert_eq!(cfg.routed_scaling_factor, 1.5);
+        // MQA broadcast factor
+        assert_eq!(cfg.n_kv_groups(), 64);
+        // Compress ratios cover all 43 layers + the MTP slot
+        assert_eq!(cfg.compress_ratios.len(), 44);
+        // Layer 0/1 = standard, 2 = CSA, 3 = HCA, 43 = standard (MTP).
+        assert_eq!(cfg.layer_compress_ratio(0), 0);
+        assert_eq!(cfg.layer_compress_ratio(1), 0);
+        assert_eq!(cfg.layer_compress_ratio(2), 4);
+        assert_eq!(cfg.layer_compress_ratio(3), 128);
+        assert_eq!(cfg.layer_compress_ratio(43), 0);
+        // Out of bounds → 0
+        assert_eq!(cfg.layer_compress_ratio(99), 0);
+    }
+
+    /// Backwards-compat: a V3-style fixture (with `kv_lora_rank`,
+    /// `v_head_dim`, `qk_nope_head_dim`, `intermediate_size`) still parses,
+    /// since those fields are now Optional. Audit §5 "Make optional".
+    #[test]
+    fn v3_style_v4_config_still_parses() {
+        let cfg_json = r#"{
+            "vocab_size": 32,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "moe_intermediate_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "n_routed_experts": null,
+            "num_experts_per_tok": null,
+            "max_position_embeddings": 64,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0,
+            "q_lora_rank": 8,
+            "qk_rope_head_dim": 8,
+            "qk_nope_head_dim": 16,
+            "kv_lora_rank": 16,
+            "v_head_dim": 16,
+            "head_dim": 24,
+            "compress_ratios": [0, 0]
+        }"#;
+        let cfg: DeepSeekV4Config = serde_json::from_str(cfg_json).expect("legacy parses");
+        // Explicit qk_nope_head_dim is honored when present.
+        assert_eq!(cfg.qk_nope_head_dim(), 16);
+        assert_eq!(cfg.head_dim, 24);
+        assert_eq!(cfg.kv_lora_rank, Some(16));
+        assert_eq!(cfg.v_head_dim, Some(16));
+        // Defaults when V4 fields absent
+        assert_eq!(cfg.hc_mult, 4);
+        assert_eq!(cfg.num_key_value_heads, 1);
+    }
+
+    /// Config without explicit qk_nope_head_dim derives it from
+    /// `head_dim - qk_rope_head_dim`. Audit §0.
+    #[test]
+    fn qk_nope_head_dim_derives_from_head_dim() {
+        let cfg_json = r#"{
+            "vocab_size": 16,
+            "hidden_size": 16,
+            "moe_intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "max_position_embeddings": 16,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0,
+            "qk_rope_head_dim": 4,
+            "head_dim": 16
+        }"#;
+        let cfg: DeepSeekV4Config = serde_json::from_str(cfg_json).unwrap();
+        assert_eq!(cfg.qk_nope_head_dim(), 12); // 16 - 4
+        assert_eq!(cfg.head_dim, 16);
+        assert_eq!(cfg.q_head_dim(), 16);
+    }
+
+    /// V4Compressor::uniform produces averaging behavior.
     #[test]
     fn v4_compressor_uniform_reduces_seq_dim() -> Result<()> {
         let device = Device::Cpu;
@@ -2205,14 +2143,13 @@ mod tests {
         let ratio = 4;
         let comp = V4Compressor::uniform(ratio, head_dim, &device)?;
 
-        // Input: [B=1, H=2, T=8, D=4], all ones → averaged output should also be all ones.
         let input = Tensor::ones((1, 2, 8, 4), DType::F32, &device)?;
         let out = comp.forward(&input)?;
 
-        assert_eq!(out.dims(), &[1, 2, 2, 4]); // T compressed from 8 to 2
+        assert_eq!(out.dims(), &[1, 2, 2, 4]);
         let v: Vec<f32> = out.flatten_all()?.to_vec1()?;
         for x in &v {
-            assert!((*x - 1.0).abs() < 1e-5, "averaging should preserve value, got {x}");
+            assert!((*x - 1.0).abs() < 1e-5);
         }
         Ok(())
     }
@@ -2222,7 +2159,7 @@ mod tests {
     fn v4_compressor_rejects_non_divisible() -> Result<()> {
         let device = Device::Cpu;
         let comp = V4Compressor::uniform(4, 8, &device)?;
-        let input = Tensor::zeros((1, 1, 7, 8), DType::F32, &device)?; // 7 not div by 4
+        let input = Tensor::zeros((1, 1, 7, 8), DType::F32, &device)?;
         assert!(comp.forward(&input).is_err());
         Ok(())
     }
@@ -2233,27 +2170,13 @@ mod tests {
         assert_eq!(CompressRatio::Standard.ratio(), 1);
         assert_eq!(CompressRatio::Csa.ratio(), 4);
         assert_eq!(CompressRatio::Hca.ratio(), 128);
+        assert_eq!(CompressRatio::from(0), CompressRatio::Standard);
+        assert_eq!(CompressRatio::from(4), CompressRatio::Csa);
+        assert_eq!(CompressRatio::from(128), CompressRatio::Hca);
+        assert_eq!(CompressRatio::from(7), CompressRatio::Standard);
     }
 
-    /// compress_kv with Standard ratio passes through unchanged.
-    #[test]
-    fn compress_kv_passthrough_standard() -> Result<()> {
-        // Build a synthetic Attention with Standard mode by constructing
-        // Compressor=None. Use the public method.
-        // Since we can't easily construct Attention without all V4 plumbing,
-        // we test the V4Compressor directly here and verify the Attention
-        // method's logic via the (CompressRatio::Standard, _, _) match arm.
-        let device = Device::Cpu;
-        let k = Tensor::ones((1, 2, 8, 4), DType::F32, &device)?;
-        let v = Tensor::ones((1, 2, 8, 4), DType::F32, &device)?;
-        // Standard mode shouldn't error and shouldn't change shape.
-        // (Direct construction tested via the compressor's forward in other tests.)
-        assert_eq!(k.dims(), &[1, 2, 8, 4]);
-        assert_eq!(v.dims(), &[1, 2, 8, 4]);
-        Ok(())
-    }
-
-    /// compress_kv via V4Compressor on CSA-ratio (4×) reduces the seq dim 4×.
+    /// CSA-ratio (4×) reduces the seq dim 4×.
     #[test]
     fn compress_kv_csa_reduces_4x() -> Result<()> {
         let device = Device::Cpu;
@@ -2267,7 +2190,7 @@ mod tests {
         Ok(())
     }
 
-    /// compress_kv via V4Compressor on HCA-ratio (128×) reduces by 128×.
+    /// HCA-ratio (128×) reduces the seq dim 128×.
     #[test]
     fn compress_kv_hca_reduces_128x() -> Result<()> {
         let device = Device::Cpu;
@@ -2278,13 +2201,12 @@ mod tests {
         Ok(())
     }
 
-    /// Compressed K and V shapes are well-formed across multiple ratios.
+    /// Compress ratios produce valid shapes across multiple ratios.
     #[test]
     fn compress_kv_multiple_ratios_produce_valid_shapes() -> Result<()> {
         let device = Device::Cpu;
         for ratio in &[4, 128] {
             let comp = V4Compressor::uniform(*ratio, 16, &device)?;
-            // T = 128 * ratio is divisible by both 4 and 128
             let t = 128 * ratio;
             let input = Tensor::ones((1, 4, t, 16), DType::F32, &device)?;
             let out = comp.forward(&input)?;
@@ -2293,104 +2215,16 @@ mod tests {
         Ok(())
     }
 
-    /// V4 config layer_compress_ratio dispatch returns the right enum.
+    /// Config default for compress_rope_theta matches V4 Flash (160000).
+    /// Audit §0 + §1 Pattern A/B/C ("compress_rope_theta = 160000").
     #[test]
-    fn v4_layer_dispatch_translates_to_enum() {
-        let cfg = DeepSeekV4Config {
-            vocab_size: 100,
-            hidden_size: 64,
-            intermediate_size: 64,
-            moe_intermediate_size: 64,
-            num_hidden_layers: 4,
-            num_attention_heads: 4,
-            n_shared_experts: None,
-            n_routed_experts: None,
-            routed_scaling_factor: 1.0,
-            topk_method: TopkMethod::NoAuxTc,
-            num_experts_per_tok: Some(2),
-            moe_layer_freq: 1,
-            first_k_dense_replace: 0,
-            scoring_func: ScoringFunc::Sigmoid,
-            hidden_act: Activation::Silu,
-            max_position_embeddings: 256,
-            rms_norm_eps: 1e-6,
-            tie_word_embeddings: false,
-            rope_theta: 10000.0,
-            rope_scaling: None,
-            attention_bias: false,
-            q_lora_rank: Some(8),
-            qk_rope_head_dim: 8,
-            kv_lora_rank: 8,
-            v_head_dim: 8,
-            qk_nope_head_dim: 8,
-            quantization_config: None,
-            n_group: 1,
-            topk_group: 1,
-            compress_ratios: vec![0, 4, 128, 0],
-            sliding_window: 16,
-            compress_rope_theta: 40000.0,
-            o_lora_rank: Some(8),
-            o_groups: Some(1),
-            index_n_heads: 1,
-            index_head_dim: 8,
-            index_topk: 4,
-        };
-
-        assert_eq!(cfg.layer_compress_ratio(0), 0);
-        assert_eq!(cfg.layer_compress_ratio(1), 4);
-        assert_eq!(cfg.layer_compress_ratio(2), 128);
-        assert_eq!(cfg.layer_compress_ratio(3), 0);
-        assert_eq!(cfg.layer_compress_ratio(99), 0); // out of bounds
+    fn v4_compress_rope_theta_default_is_160000() {
+        assert_eq!(default_compress_rope_theta(), 160000.0);
     }
 
-    /// V4Compressor::uniform initialises `coff` correctly per overlap rule
-    /// (CSA: ratio=4 → coff=2; HCA: ratio=128 → coff=1).
+    /// V4 Flash's sliding_window default matches the audit (128).
     #[test]
-    fn v4_compressor_uniform_coff_matches_overlap_rule() -> Result<()> {
-        let device = Device::Cpu;
-        let comp_csa = V4Compressor::uniform(4, 8, &device)?;
-        assert_eq!(comp_csa.coff, 2, "CSA (ratio=4) → coff=2 (overlap=true)");
-        let comp_hca = V4Compressor::uniform(128, 8, &device)?;
-        assert_eq!(comp_hca.coff, 1, "HCA (ratio=128) → coff=1 (overlap=false)");
-        Ok(())
-    }
-
-    /// V4Compressor::uniform hidden_size flag distinguishes synthetic fallback
-    /// from real-checkpoint compressor (used by Attention.compress_step_from_xs).
-    #[test]
-    fn v4_compressor_uniform_signals_synthetic_via_hidden_size() -> Result<()> {
-        let device = Device::Cpu;
-        let comp = V4Compressor::uniform(4, 8, &device)?;
-        assert_eq!(
-            comp.hidden_size, 1,
-            "uniform fallback uses hidden_size=1 to flag synthetic init"
-        );
-        Ok(())
-    }
-
-    /// V4Compressor::forward (averaging path) is idempotent for all-ones.
-    /// Verifies the averaging math is correct: T tokens of value v average
-    /// to a single compressed entry of value v (mean preserves all-ones).
-    #[test]
-    fn v4_compressor_uniform_averaging_preserves_mean() -> Result<()> {
-        let device = Device::Cpu;
-        let comp = V4Compressor::uniform(4, 4, &device)?;
-        // 16 tokens of constant value 2.5 -> 4 compressed entries also 2.5
-        let input = (Tensor::ones((1, 2, 16, 4), DType::F32, &device)? * 2.5)?;
-        let out = comp.forward(&input)?;
-        let v: Vec<f32> = out.flatten_all()?.to_vec1()?;
-        for x in &v {
-            assert!(
-                (*x - 2.5).abs() < 1e-5,
-                "averaging should preserve mean (2.5), got {x}"
-            );
-        }
-        Ok(())
-    }
-
-    /// Config default for compress_rope_theta matches V4 paper (40000.0).
-    #[test]
-    fn v4_compress_rope_theta_default_is_40000() {
-        assert_eq!(default_compress_rope_theta(), 40000.0);
+    fn v4_sliding_window_default_is_128() {
+        assert_eq!(default_sliding_window(), 128);
     }
 }
