@@ -131,6 +131,49 @@ impl MtpDecodeKit {
 
         Ok((mtp_logits, fused))
     }
+
+    /// Run one MTP draft chain (Tier A: greedy).
+    ///
+    /// Loops up to `min(depth, max_tokens)` iterations. Each iteration:
+    /// 1. Calls [`Self::step`] to produce `mtp_logits` and the updated `fused`
+    ///    hidden state.
+    /// 2. Greedy-argmax over `mtp_logits` to pick the next token.
+    /// 3. Feeds the new token (and `fused` as `prev_hidden`) back into the
+    ///    next iteration.
+    ///
+    /// Returns the list of proposed token IDs (length is exactly
+    /// `min(depth, max_tokens)`).
+    pub fn propose_chain(
+        &self,
+        last_hidden: &Tensor,
+        last_token_id: u32,
+        depth: usize,
+        max_tokens: usize,
+    ) -> Result<Vec<u32>> {
+        let n = depth.min(max_tokens);
+        let mut tokens = Vec::with_capacity(n);
+        if n == 0 {
+            return Ok(tokens);
+        }
+        let device = last_hidden.device();
+        let mut prev_hidden = last_hidden.clone();
+        let mut tok = last_token_id;
+        for _ in 0..n {
+            let tok_tensor = Tensor::from_vec(vec![tok], (1,), device)?;
+            let (mtp_logits, fused) = self.step(&prev_hidden, &tok_tensor)?;
+            // Greedy argmax. Squeeze the batch dim if present.
+            let logits = if mtp_logits.rank() == 2 {
+                mtp_logits.i(0)?
+            } else {
+                mtp_logits
+            };
+            let next_id = argmax_token(&logits)?;
+            tokens.push(next_id);
+            prev_hidden = fused;
+            tok = next_id;
+        }
+        Ok(tokens)
+    }
 }
 
 /// MTP-accelerated decode pipeline.
@@ -283,26 +326,8 @@ impl MtpSpeculativePipeline {
         last_token_id: u32,
         max_tokens: usize,
     ) -> Result<Vec<u32>> {
-        let device = last_hidden.device();
-        let depth = self.depth.min(max_tokens);
-        let mut tokens = Vec::with_capacity(depth);
-        let mut prev_hidden = last_hidden.clone();
-        let mut tok = last_token_id;
-        for _ in 0..depth {
-            let tok_tensor = Tensor::from_vec(vec![tok], (1,), device)?;
-            let (mtp_logits, fused) = self.kit.step(&prev_hidden, &tok_tensor)?;
-            // Greedy argmax. Squeeze the batch dim if present.
-            let logits = if mtp_logits.rank() == 2 {
-                mtp_logits.i(0)?
-            } else {
-                mtp_logits
-            };
-            let next_id = argmax_token(&logits)?;
-            tokens.push(next_id);
-            prev_hidden = fused;
-            tok = next_id;
-        }
-        Ok(tokens)
+        self.kit
+            .propose_chain(last_hidden, last_token_id, self.depth, max_tokens)
     }
 
     /// Record acceptance counters from a verify result.
@@ -313,8 +338,6 @@ impl MtpSpeculativePipeline {
             .fetch_add(accepted, std::sync::atomic::Ordering::Relaxed);
     }
 }
-
-use candle_core::IndexOp;
 
 /// Verification result against the target model's correct next tokens.
 ///
@@ -546,44 +569,84 @@ impl MistralRsBuilder {
 mod tests {
     use super::*;
     use candle_core::{DType, Device};
-    use mistralrs_quant::{DummyLayer, QuantMethodConfig};
+    use candle_nn::Linear;
+    use mistralrs_quant::{QuantMethodConfig, UnquantLinear};
 
-    fn make_dummy_kit(hidden: usize, vocab: usize, device: &Device) -> MtpDecodeKit {
-        // Build dummy embed: identity-ish via a real tensor of zeros so the
-        // embedding `forward` works mechanically.
-        let emb_w = Tensor::zeros((vocab, hidden), DType::F32, device).unwrap();
+    /// Wrap a `Linear` (real candle layer) as an `Arc<dyn QuantMethod>` so
+    /// `forward_autocast` works without panicking. Used to build a real-weights
+    /// `MtpDecodeKit` for tests.
+    fn wrap_linear(weight: Tensor) -> Arc<dyn QuantMethod> {
+        let layer = <UnquantLinear as QuantMethod>::new(QuantMethodConfig::Unquantized(
+            Linear::new(weight, None),
+        ))
+        .expect("UnquantLinear::new with Unquantized config must succeed");
+        Arc::new(layer)
+    }
+
+    /// Build a working `MtpDecodeKit` for tests using `UnquantLinear` projections.
+    /// `h_proj` and `e_proj` use the identity matrix `[hidden, hidden]`, so the
+    /// fused output equals `prev_hidden + embed(token)`. `lm_head` is a random
+    /// (well, deterministic-zero) `[vocab, hidden]` matrix so logit shape is
+    /// `[B, vocab]` as in the real model.
+    fn make_test_kit(hidden: usize, vocab: usize, device: &Device) -> Result<MtpDecodeKit> {
+        // Embedding table: each row i is the one-hot vector e_i (truncated to
+        // `hidden` dims if vocab > hidden, padded with zeros otherwise). Using
+        // a deterministic pattern lets `propose_chain` produce predictable
+        // outputs in tests.
+        let mut emb_data = vec![0f32; vocab * hidden];
+        for i in 0..vocab {
+            let j = i % hidden;
+            emb_data[i * hidden + j] = 1.0;
+        }
+        let emb_w = Tensor::from_vec(emb_data, (vocab, hidden), device)?;
         let embed_tokens = Embedding::new(emb_w, hidden);
 
-        // QuantMethod that does nothing — passes input through unchanged.
-        // Used for projections in tests so we can verify wiring without
-        // depending on real quant kernels.
-        let dummy = || -> Arc<dyn QuantMethod> {
-            Arc::new(<DummyLayer as QuantMethod>::new(QuantMethodConfig::Dummy).unwrap())
-        };
-        MtpDecodeKit {
-            embed_tokens,
-            lm_head: dummy(),
-            h_proj: dummy(),
-            e_proj: dummy(),
+        // Identity for projections — keeps semantics clean and lets the test
+        // assert on the fused output structurally.
+        let mut id_data = vec![0f32; hidden * hidden];
+        for i in 0..hidden {
+            id_data[i * hidden + i] = 1.0;
         }
+        let h_w = Tensor::from_vec(id_data.clone(), (hidden, hidden), device)?;
+        let e_w = Tensor::from_vec(id_data, (hidden, hidden), device)?;
+
+        // lm_head: deterministic [vocab, hidden] matrix. We use a "diagonal +
+        // ramp" pattern so different fused hidden states produce different
+        // argmax tokens — useful for the depth/cap tests.
+        let mut lm_data = vec![0f32; vocab * hidden];
+        for v in 0..vocab {
+            for h in 0..hidden {
+                // Each vocab row weights hidden dim h by a small offset so
+                // changing the fused state changes the argmax.
+                lm_data[v * hidden + h] = if v % hidden == h { 1.0 } else { 0.0 };
+            }
+        }
+        let lm_w = Tensor::from_vec(lm_data, (vocab, hidden), device)?;
+
+        Ok(MtpDecodeKit {
+            embed_tokens,
+            lm_head: wrap_linear(lm_w),
+            h_proj: wrap_linear(h_w),
+            e_proj: wrap_linear(e_w),
+        })
     }
 
     /// `MtpDecodeKit::step` produces tensors of the expected shape.
-    /// With DummyLayer projections (passthrough), and zero embed weights,
-    /// the output should be `[B, hidden]` for the fused state.
+    /// `fused` is `[B, hidden]`, `mtp_logits` is `[B, vocab]` (matching the
+    /// real model's lm_head output).
     #[test]
     fn mtp_decode_kit_step_shape() -> Result<()> {
         let device = Device::Cpu;
         let hidden = 16;
         let vocab = 32;
-        let kit = make_dummy_kit(hidden, vocab, &device);
+        let kit = make_test_kit(hidden, vocab, &device)?;
 
         let prev_hidden = Tensor::ones((1, hidden), DType::F32, &device)?;
         let last_token = Tensor::from_vec(vec![0u32], (1,), &device)?;
         let (mtp_logits, fused) = kit.step(&prev_hidden, &last_token)?;
         assert_eq!(fused.dims(), &[1, hidden]);
-        // lm_head dummy passthrough — output shape matches input.
-        assert_eq!(mtp_logits.dims(), &[1, hidden]);
+        // Real lm_head projects [B, hidden] -> [B, vocab].
+        assert_eq!(mtp_logits.dims(), &[1, vocab]);
         Ok(())
     }
 
@@ -597,25 +660,25 @@ mod tests {
         Ok(())
     }
 
-    /// propose_chain returns depth tokens (with greedy argmax over dummy projections).
+    /// `MtpDecodeKit::propose_chain` returns exactly `depth` tokens when
+    /// `depth <= max_tokens`.
     #[test]
     fn propose_chain_returns_depth_tokens() -> Result<()> {
-        // We can't easily construct a full target Pipeline in unit tests,
-        // so we just check the proposal logic end-to-end using only the kit.
         let device = Device::Cpu;
         let hidden = 4;
-        let vocab = 4;
-        let kit = make_dummy_kit(hidden, vocab, &device);
+        let vocab = 8;
+        let kit = make_test_kit(hidden, vocab, &device)?;
 
-        let prev_hidden = Tensor::from_vec(
-            vec![0.0f32, 1.0, 2.0, 3.0],
-            (1, hidden),
-            &device,
-        )?;
-        let last_token = Tensor::from_vec(vec![0u32], (1,), &device)?;
-        let (mtp_logits, _fused) = kit.step(&prev_hidden, &last_token)?;
-        let logits_flat = mtp_logits.i(0)?;
-        let _ = argmax_token(&logits_flat)?; // should produce a valid index
+        let prev_hidden =
+            Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0], (1, hidden), &device)?;
+        let depth = 3;
+        let max_tokens = 16;
+        let tokens = kit.propose_chain(&prev_hidden, 0, depth, max_tokens)?;
+        assert_eq!(tokens.len(), depth, "should return exactly depth tokens");
+        // All proposed token ids should be within vocab range.
+        for t in &tokens {
+            assert!((*t as usize) < vocab, "token {} out of vocab {}", t, vocab);
+        }
         Ok(())
     }
 
@@ -634,7 +697,7 @@ mod tests {
     #[test]
     fn mtp_decode_kit_debug_does_not_panic() {
         let device = Device::Cpu;
-        let kit = make_dummy_kit(8, 16, &device);
+        let kit = make_test_kit(8, 16, &device).expect("kit construction");
         let _ = format!("{:?}", kit);
     }
 
@@ -673,22 +736,32 @@ mod tests {
         assert_eq!(r.commit_len(), 1);
     }
 
-    /// `MtpSpeculativePipeline::propose_chain` with depth=0 caller honors the
-    /// max_tokens cap and returns no tokens.
+    /// `propose_chain` truncates to `max_tokens` when it is below `depth`.
+    /// Also covers `max_tokens == 0` (returns empty) and the equal case.
     #[test]
     fn propose_chain_respects_max_tokens_cap() -> Result<()> {
-        // Build a kit + a fake "pipeline" via Option to avoid full Pipeline setup.
-        // We test propose_chain by going through the kit directly.
         let device = Device::Cpu;
-        let kit = make_dummy_kit(4, 4, &device);
-        // Manually exercise the chain loop with depth=0 logic:
-        let depth_zero = 0_usize.min(5);
-        assert_eq!(depth_zero, 0);
-        // Sanity: kit.step produces well-formed output even for a single call.
-        let prev_hidden = Tensor::zeros((1, 4), DType::F32, &device)?;
-        let last_token = Tensor::from_vec(vec![0u32], (1,), &device)?;
-        let (logits, _fused) = kit.step(&prev_hidden, &last_token)?;
-        assert_eq!(logits.dims(), &[1, 4]);
+        let hidden = 4;
+        let vocab = 8;
+        let kit = make_test_kit(hidden, vocab, &device)?;
+        let prev_hidden = Tensor::zeros((1, hidden), DType::F32, &device)?;
+
+        // depth=5, max_tokens=2 → exactly 2 tokens.
+        let tokens = kit.propose_chain(&prev_hidden, 0, 5, 2)?;
+        assert_eq!(tokens.len(), 2, "cap should clip chain length to max_tokens");
+
+        // depth=4, max_tokens=4 → exactly 4 (equality holds).
+        let tokens = kit.propose_chain(&prev_hidden, 0, 4, 4)?;
+        assert_eq!(tokens.len(), 4);
+
+        // max_tokens=0 → empty chain regardless of depth.
+        let tokens = kit.propose_chain(&prev_hidden, 0, 8, 0)?;
+        assert!(tokens.is_empty(), "max_tokens=0 must return no tokens");
+
+        // depth=0 → empty chain regardless of max_tokens.
+        let tokens = kit.propose_chain(&prev_hidden, 0, 0, 8)?;
+        assert!(tokens.is_empty(), "depth=0 must return no tokens");
+
         Ok(())
     }
 }
