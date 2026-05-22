@@ -662,45 +662,78 @@ impl Attention {
                     None => {
                         (k, v) = kv_cache.append(&k, &v)?;
 
-                        // V4 CSA/HCA compress dispatch (plain SDPA path only).
-                        // For compress layers, reduce K and V along the seq dim
-                        // by the compressor before attention. Standard layers
-                        // pass through unchanged.
+                        // V4 hybrid attention dispatch (plain SDPA path only).
+                        // For compress layers (Csa/Hca), V4 combines two branches:
+                        //   1. Main:  attention over compressed K/V (per CompressRatio)
+                        //   2. Local: sliding-window attention over original K/V
+                        // Then blends 0.5/0.5 (V4 paper §3.2 default; rental can
+                        // replace with the learned mixing weight).
                         //
-                        // The compressor requires the K seq dim to be divisible
-                        // by the ratio — if not (short prompts), we fall through
-                        // to dense attention to preserve correctness.
-                        let (k_attn, v_attn, mask_attn) = if self.compress_ratio
-                            != CompressRatio::Standard
-                        {
+                        // Standard layers run the original V3 MLA path unchanged.
+                        if self.compress_ratio == CompressRatio::Standard {
+                            Sdpa.run_attention(
+                                &q,
+                                &k,
+                                &v,
+                                attention_mask,
+                                Some(flash_params),
+                                &self.sdpa_params,
+                            )?
+                        } else {
                             let t_k = k.dim(2)?;
                             let ratio = self.compress_ratio.ratio();
-                            if t_k % ratio == 0 && t_k >= ratio {
+
+                            // Compute compressed-branch output (only if T is divisible)
+                            let main_out = if t_k % ratio == 0 && t_k >= ratio {
                                 match self.compress_kv(&k, &v) {
                                     Ok((k_c, v_c)) => {
-                                        // Compressed K/V have shorter T_k. The attention
-                                        // mask (if present) was sized for full T_k and
-                                        // is no longer applicable to compressed entries
-                                        // — drop it for the compressed branch (Tier A).
-                                        (k_c, v_c, None)
+                                        // Compressed-branch SDPA (no mask — sized for full T).
+                                        let params_c = SdpaParams {
+                                            n_kv_groups: self.sdpa_params.n_kv_groups,
+                                            softcap: self.sdpa_params.softcap,
+                                            softmax_scale: self.sdpa_params.softmax_scale,
+                                            sliding_window: None,
+                                            sinks: None,
+                                        };
+                                        Some(Sdpa.run_attention(
+                                            &q,
+                                            &k_c,
+                                            &v_c,
+                                            None,
+                                            Some(flash_params),
+                                            &params_c,
+                                        )?)
                                     }
-                                    Err(_) => (k.clone(), v.clone(), attention_mask),
+                                    Err(_) => None,
                                 }
                             } else {
-                                (k.clone(), v.clone(), attention_mask)
-                            }
-                        } else {
-                            (k.clone(), v.clone(), attention_mask)
-                        };
+                                None
+                            };
 
-                        Sdpa.run_attention(
-                            &q,
-                            &k_attn,
-                            &v_attn,
-                            mask_attn,
-                            Some(flash_params),
-                            &self.sdpa_params,
-                        )?
+                            // Sliding-window local branch over original K/V
+                            let params_swa = SdpaParams {
+                                n_kv_groups: self.sdpa_params.n_kv_groups,
+                                softcap: self.sdpa_params.softcap,
+                                softmax_scale: self.sdpa_params.softmax_scale,
+                                sliding_window: Some(self.sliding_window),
+                                sinks: None,
+                            };
+                            let swa_out = Sdpa.run_attention(
+                                &q,
+                                &k,
+                                &v,
+                                attention_mask,
+                                Some(flash_params),
+                                &params_swa,
+                            )?;
+
+                            // Blend (0.5 main + 0.5 SWA per V4 paper default).
+                            // Fall through to SWA-only if compression failed.
+                            match main_out {
+                                Some(main) => ((&main * 0.5)? + (&swa_out * 0.5)?)?,
+                                None => swa_out,
+                            }
+                        }
                     }
                 }
             }
