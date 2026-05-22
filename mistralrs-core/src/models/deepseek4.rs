@@ -327,10 +327,16 @@ impl Attention {
                     cfg.attention_bias,
                     mapper.set_device(layer_idx, vb.pp("q_a_proj"), loading_isq),
                 )?;
+                // V4 uses `q_norm`; V3 uses `q_a_layernorm`. Auto-detect.
+                let q_norm_name = if vb.contains_tensor("q_norm.weight") {
+                    "q_norm"
+                } else {
+                    "q_a_layernorm"
+                };
                 let norm = RmsNorm::new(
                     lora_rank,
                     cfg.rms_norm_eps,
-                    mapper.set_device(layer_idx, vb.pp("q_a_layernorm"), false),
+                    mapper.set_device(layer_idx, vb.pp(q_norm_name), false),
                 )?;
                 let b = ColumnParallelLayer::new(
                     lora_rank,
@@ -352,17 +358,36 @@ impl Attention {
             )?),
         };
 
+        // V4 publishes the LoRA-A KV projection at `kv_proj` (per HF transformers
+        // V4 model doc: tensor names include `q_a_proj, q_b_proj, kv_proj,
+        // o_a_proj, o_b_proj`). V3 used `kv_a_proj_with_mqa`. We probe which
+        // name is actually present in the safetensors index and route accordingly.
+        let kv_a_proj_name = if vb.contains_tensor("kv_proj.weight") {
+            "kv_proj"
+        } else {
+            // V3-style fallback. Also used for synthetic test weights and any
+            // V4 republish that follows V3 naming.
+            "kv_a_proj_with_mqa"
+        };
         let kv_a_proj_with_mqa = ReplicatedLayer::new(
             cfg.hidden_size,
             cfg.kv_lora_rank + cfg.qk_rope_head_dim,
             &cfg.quantization_config,
             cfg.attention_bias,
-            mapper.set_device(layer_idx, vb.pp("kv_a_proj_with_mqa"), loading_isq),
+            mapper.set_device(layer_idx, vb.pp(kv_a_proj_name), loading_isq),
         )?;
+
+        // V4 typically uses `kv_norm` for the post-projection norm; V3 used
+        // `kv_a_layernorm`. Same auto-detection.
+        let kv_norm_name = if vb.contains_tensor("kv_norm.weight") {
+            "kv_norm"
+        } else {
+            "kv_a_layernorm"
+        };
         let kv_a_layernorm = RmsNorm::new(
             cfg.kv_lora_rank,
             cfg.rms_norm_eps,
-            mapper.set_device(layer_idx, vb.pp("kv_a_layernorm"), false),
+            mapper.set_device(layer_idx, vb.pp(kv_norm_name), false),
         )?;
         let kv_b_proj = ColumnParallelLayer::new(
             cfg.kv_lora_rank,
@@ -373,30 +398,61 @@ impl Attention {
             mapper.set_device(layer_idx, vb.pp("kv_b_proj"), loading_isq),
         )?;
 
-        // V4 LoRA o_proj: wo_a [n_heads*v_head_dim → o_inner], wo_b [o_inner → hidden_size]
-        // where o_inner = o_groups * o_lora_rank. If config doesn't specify these,
-        // fall back to wo_a=identity-shape, wo_b=full size (which mimics V3's single
-        // o_proj — useful for tests with synthetic weights).
+        // V4 o_proj — handle three published variants:
+        //   1. V4 with grouped LoRA: `o_a_proj` + `o_b_proj`
+        //      (DeepseekV4GroupedLinear, when o_lora_rank/o_groups set)
+        //   2. V3-style single `o_proj` (for synthetic test weights and any
+        //      V4 republish that flattens the grouped linear)
+        //
+        // Detection: check which tensor exists in the safetensors index.
+        let has_lora_o = vb.contains_tensor("o_a_proj.weight")
+            && vb.contains_tensor("o_b_proj.weight");
+        let has_single_o = vb.contains_tensor("o_proj.weight");
+
         let o_lora_rank = cfg.o_lora_rank.unwrap_or(cfg.hidden_size);
         let o_groups = cfg.o_groups.unwrap_or(1);
         let o_inner = o_groups * o_lora_rank;
 
-        let wo_a = ColumnParallelLayer::new(
-            cfg.num_attention_heads * cfg.v_head_dim,
-            o_inner,
-            &cfg.quantization_config,
-            cfg.attention_bias,
-            comm,
-            mapper.set_device(layer_idx, vb.pp("o_a_proj"), loading_isq),
-        )?;
-        let wo_b = RowParallelLayer::new(
-            o_inner,
-            cfg.hidden_size,
-            &cfg.quantization_config,
-            cfg.attention_bias,
-            comm,
-            mapper.set_device(layer_idx, vb.pp("o_b_proj"), loading_isq),
-        )?;
+        let (wo_a, wo_b) = if has_lora_o || !has_single_o {
+            // V4-style LoRA o_proj (preferred + default for unknown checkpoints)
+            let wo_a = ColumnParallelLayer::new(
+                cfg.num_attention_heads * cfg.v_head_dim,
+                o_inner,
+                &cfg.quantization_config,
+                cfg.attention_bias,
+                comm,
+                mapper.set_device(layer_idx, vb.pp("o_a_proj"), loading_isq),
+            )?;
+            let wo_b = RowParallelLayer::new(
+                o_inner,
+                cfg.hidden_size,
+                &cfg.quantization_config,
+                cfg.attention_bias,
+                comm,
+                mapper.set_device(layer_idx, vb.pp("o_b_proj"), loading_isq),
+            )?;
+            (wo_a, wo_b)
+        } else {
+            // V3-style single o_proj (variant). Synthesize a passthrough wo_a
+            // (identity-shape) and use the loaded single tensor as wo_b.
+            let wo_a = ColumnParallelLayer::new(
+                cfg.num_attention_heads * cfg.v_head_dim,
+                cfg.num_attention_heads * cfg.v_head_dim, // identity dim
+                &cfg.quantization_config,
+                false,
+                comm,
+                mapper.set_device(layer_idx, vb.pp("o_a_proj"), loading_isq),
+            )?;
+            let wo_b = RowParallelLayer::new(
+                cfg.num_attention_heads * cfg.v_head_dim,
+                cfg.hidden_size,
+                &cfg.quantization_config,
+                cfg.attention_bias,
+                comm,
+                mapper.set_device(layer_idx, vb.pp("o_proj"), loading_isq),
+            )?;
+            (wo_a, wo_b)
+        };
 
         // V4 per-layer compress dispatch.
         let ratio_int = cfg.layer_compress_ratio(layer_idx);
@@ -1018,10 +1074,22 @@ impl DecoderLayer {
         comm: &Arc<mistralrs_quant::Comm>,
         real_device: Device,
     ) -> Result<Self> {
+        // V4 native uses `attn.*`, `attn_norm`, `ffn_norm`. HF format uses
+        // `self_attn.*`, `input_layernorm`, `post_attention_layernorm`.
+        // Auto-detect via tensor presence.
+        let uses_native_layer = vb.contains_tensor("attn.wq_a.weight")
+            || vb.contains_tensor("attn.wkv.weight")
+            || vb.contains_tensor("attn_norm.weight");
+        let (attn_subpath, input_ln_path, post_ln_path, mlp_subpath) = if uses_native_layer {
+            ("attn", "attn_norm", "ffn_norm", "ffn")
+        } else {
+            ("self_attn", "input_layernorm", "post_attention_layernorm", "mlp")
+        };
+
         let attn = Attention::new(
             rotary_emb,
             cfg,
-            vb.pp("self_attn"),
+            vb.pp(attn_subpath),
             mapper,
             layer_idx,
             loading_isq,
@@ -1031,19 +1099,19 @@ impl DecoderLayer {
         let input_layernorm = RmsNorm::new(
             cfg.hidden_size,
             cfg.rms_norm_eps,
-            mapper.set_device(layer_idx, vb.pp("input_layernorm"), false),
+            mapper.set_device(layer_idx, vb.pp(input_ln_path), false),
         )?;
         let post_attention_layernorm = RmsNorm::new(
             cfg.hidden_size,
             cfg.rms_norm_eps,
-            mapper.set_device(layer_idx, vb.pp("post_attention_layernorm"), false),
+            mapper.set_device(layer_idx, vb.pp(post_ln_path), false),
         )?;
         let moe_or_mlp = if let Some(n_routed_experts) = cfg.n_routed_experts.filter(|_| {
             layer_idx >= cfg.first_k_dense_replace && layer_idx.is_multiple_of(cfg.moe_layer_freq)
         }) {
             MoeOrMlp::Moe(Box::new(Moe::new(
                 cfg,
-                vb.pp("mlp"),
+                vb.pp(mlp_subpath),
                 mapper,
                 layer_idx,
                 loading_isq,
@@ -1054,7 +1122,7 @@ impl DecoderLayer {
             )?))
         } else {
             MoeOrMlp::Mlp(Mlp::new(
-                mapper.set_device(layer_idx, vb.pp("mlp"), loading_isq),
+                mapper.set_device(layer_idx, vb.pp(mlp_subpath), loading_isq),
                 cfg.hidden_size,
                 cfg.intermediate_size,
                 &cfg.quantization_config,
@@ -1161,14 +1229,24 @@ impl DeepSeekV4 {
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
     ) -> Result<Self> {
-        let vb_m = vb.pp("model");
-
         let mapper = normal_loading_metadata.mapper;
+
+        // V4 native publishes globals as `embed.weight`, `norm.weight`, `head.weight`
+        // (per SGLang's remap function at deepseek_v4.py:1365). HF format uses
+        // `model.embed_tokens.weight`, `model.norm.weight`, `lm_head.weight`.
+        let uses_native = vb.contains_tensor("embed.weight")
+            && !vb.contains_tensor("model.embed_tokens.weight");
+
+        let (vb_m, embed_path, lm_head_vb, lm_head_path) = if uses_native {
+            (vb.clone(), "embed", vb.clone(), "head")
+        } else {
+            (vb.pp("model"), "embed_tokens", vb.clone(), "lm_head")
+        };
 
         let embed_tokens = embedding(
             cfg.vocab_size,
             cfg.hidden_size,
-            mapper.set_nm_device(vb_m.pp("embed_tokens"), false),
+            mapper.set_nm_device(vb_m.pp(embed_path), false),
             &cfg.quantization_config,
         )?;
         let lm_head = if !cfg.tie_word_embeddings {
@@ -1177,7 +1255,7 @@ impl DeepSeekV4 {
                 cfg.vocab_size,
                 &cfg.quantization_config,
                 false,
-                mapper.set_nm_device(vb.pp("lm_head"), normal_loading_metadata.loading_isq),
+                mapper.set_nm_device(lm_head_vb.pp(lm_head_path), normal_loading_metadata.loading_isq),
             )?
         } else {
             ReplicatedLayer::from_linear(candle_nn::Linear::new(
@@ -1191,6 +1269,8 @@ impl DeepSeekV4 {
         let norm = RmsNorm::new(
             cfg.hidden_size,
             cfg.rms_norm_eps,
+            // V4 native and HF both use "norm" as the per-vb_m sub-path
+            // (native: vb.pp("norm"), HF: vb.pp("model").pp("norm"))
             mapper.set_nm_device(vb_m.pp("norm"), false),
         )?;
 
