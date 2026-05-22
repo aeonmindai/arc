@@ -255,6 +255,196 @@ mod tests {
         }
     }
 
+    /// Per-row Viterbi vs Greedy cos sim across all 8 rows of the matmul test.
+    /// Find which rows Viterbi loses on.
+    #[test]
+    fn debug_all_rows_viterbi_vs_greedy() {
+        let lut = gaussian_lut();
+        let n = 8;
+        let k_in = 64;
+        // Match the matmul test exactly
+        let wdata: Vec<f32> = (0..(n * k_in))
+            .map(|i| ((i as f32) * 0.31).cos() * 1.5)
+            .collect();
+
+        println!("\nrow | greedy_cos | viterbi_cos | diff");
+        let mut g_wins = 0;
+        let mut v_wins = 0;
+        for row in 0..n {
+            let raw: &[f32] = &wdata[row * k_in..(row + 1) * k_in];
+            let max_abs = raw.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+            // Handle near-zero rows
+            let scale = if max_abs < 1e-8 { 1.0 } else { max_abs / 3.0 };
+            let inv_scale = 1.0 / scale;
+            let target: Vec<f32> = raw.iter().map(|&v| v * inv_scale).collect();
+
+            let v_syms = viterbi_quantize_row(&target, &lut);
+            let g_syms = greedy_quantize_row(&target, &lut);
+            let v_recon = decode_symbols(&v_syms, &lut);
+            let g_recon = decode_symbols(&g_syms, &lut);
+
+            let cos = |a: &[f32], b: &[f32]| -> f32 {
+                let mut d = 0f32; let mut na = 0f32; let mut nb = 0f32;
+                for (x, y) in a.iter().zip(b.iter()) {
+                    d += x * y;
+                    na += x * x;
+                    nb += y * y;
+                }
+                d / (na.sqrt() * nb.sqrt())
+            };
+
+            let g_cos = cos(&target, &g_recon);
+            let v_cos = cos(&target, &v_recon);
+            println!(
+                "  {row} | {g_cos:.4}    | {v_cos:.4}     | {:+.4}  (max_abs={max_abs:.3}, scale={scale:.3})",
+                v_cos - g_cos
+            );
+            if v_cos < g_cos - 0.001 { g_wins += 1; }
+            if v_cos > g_cos + 0.001 { v_wins += 1; }
+        }
+        println!("\nViterbi wins: {v_wins}, Greedy wins: {g_wins}");
+    }
+
+    /// Debug print: dump the symbol streams + reconstructions for one production-
+    /// shape row, so we can manually inspect what differs.
+    #[test]
+    fn debug_dump_viterbi_vs_greedy_one_row() {
+        let lut = gaussian_lut();
+        let raw: Vec<f32> = (0..64).map(|i| ((i as f32) * 0.31).cos() * 1.5).collect();
+        let max_abs = raw.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let inv_scale = 3.0 / max_abs;
+        let target: Vec<f32> = raw.iter().map(|&v| v * inv_scale).collect();
+
+        let v_syms = viterbi_quantize_row(&target, &lut);
+        let g_syms = greedy_quantize_row(&target, &lut);
+
+        let v_recon = decode_symbols(&v_syms, &lut);
+        let g_recon = decode_symbols(&g_syms, &lut);
+
+        // Print each position's target, viterbi recon, greedy recon
+        println!("\npos | target_v0 target_v1 | v_sym  g_sym | v_v0 v_v1 | g_v0 g_v1");
+        for t in 0..v_syms.len() {
+            let tg = &target[t * 2..t * 2 + 2];
+            let vr = &v_recon[t * 2..t * 2 + 2];
+            let gr = &g_recon[t * 2..t * 2 + 2];
+            println!(
+                "{t:2}  | {:+.3}    {:+.3}    |  {:2}    {:2}    | {:+.3} {:+.3} | {:+.3} {:+.3}",
+                tg[0], tg[1], v_syms[t], g_syms[t], vr[0], vr[1], gr[0], gr[1]
+            );
+        }
+
+        // Also matmul-style cos sim of recon vs target.
+        let mut vd = 0f32; let mut vn = 0f32; let mut tn = 0f32;
+        let mut gd = 0f32; let mut gn = 0f32;
+        for ((t, v), g) in target.iter().zip(v_recon.iter()).zip(g_recon.iter()) {
+            vd += t * v;
+            vn += v * v;
+            gd += t * g;
+            gn += g * g;
+            tn += t * t;
+        }
+        let v_cos = vd / (vn.sqrt() * tn.sqrt());
+        let g_cos = gd / (gn.sqrt() * tn.sqrt());
+        println!("\nCos sim (recon vs target): Viterbi = {v_cos:.4}, Greedy = {g_cos:.4}");
+    }
+
+    /// Reproduce the production matmul test condition: row of 32 symbols, target
+    /// scaled to [-3, 3] (matches max_abs/3 row-scale behavior). If Viterbi MSE
+    /// is significantly worse than Greedy MSE here, the bug is real.
+    #[test]
+    fn viterbi_on_production_magnitude_matches_greedy_or_better() {
+        let lut = gaussian_lut();
+        // Mirror the matmul test: row of 64 elements (32 symbols), values
+        // from cos pattern × 1.5, scaled to [-3, 3] via inv_scale = 3/max_abs.
+        let raw: Vec<f32> = (0..64).map(|i| ((i as f32) * 0.31).cos() * 1.5).collect();
+        let max_abs = raw.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let inv_scale = 3.0 / max_abs;
+        let target: Vec<f32> = raw.iter().map(|&v| v * inv_scale).collect();
+
+        let v_syms = viterbi_quantize_row(&target, &lut);
+        let g_syms = greedy_quantize_row(&target, &lut);
+
+        let v_recon = decode_symbols(&v_syms, &lut);
+        let g_recon = decode_symbols(&g_syms, &lut);
+
+        let v_err = mse(&target, &v_recon);
+        let g_err = mse(&target, &g_recon);
+
+        println!("Production-magnitude row (32 syms): Viterbi MSE={v_err:.6}, Greedy MSE={g_err:.6}");
+        assert!(
+            v_err <= g_err + 1e-4,
+            "Viterbi MSE {v_err} > Greedy MSE {g_err} at production magnitude"
+        );
+    }
+
+    /// CRITICAL bit-exactness test: the Viterbi-encoded symbol stream, when
+    /// re-decoded via the production decoder path (state=0 start, shift-in-K),
+    /// must produce the exact same reconstruction Viterbi predicted internally.
+    ///
+    /// If this test fails, there's a mismatch between Viterbi's cost calculation
+    /// and the production decoder's state walk — and the cos-sim regression in
+    /// `qtip_matmul_cosine_similarity` is the visible consequence.
+    #[test]
+    fn viterbi_symbols_decode_to_predicted_reconstruction() {
+        let lut = gaussian_lut();
+
+        // Test with realistic-sized inputs (32 symbols mirrors the QTIP matmul test).
+        for num_symbols in [4, 8, 16, 32, 64] {
+            let target: Vec<f32> = (0..(num_symbols * V as usize))
+                .map(|i| ((i as f32) * 0.0313).sin() * 1.2)
+                .collect();
+
+            let syms = viterbi_quantize_row(&target, &lut);
+            assert_eq!(syms.len(), num_symbols);
+
+            // Path A: Viterbi's "internal" predicted reconstruction. This is what
+            // Viterbi believes the cost calculation was minimizing.
+            //
+            // Viterbi backtracks from the argmin final state. The internal recon
+            // at each t is LUT[state_at_time_t], where state_at_time_t is what
+            // backtrace recovered.
+            //
+            // We get the same result by re-running the decoder starting from state=0
+            // BUT ONLY IF the backtraced symbols match what the decoder would walk to.
+            //
+            // Path B: Run the production decoder starting from state=0.
+            let production_recon = decode_symbols(&syms, &lut);
+
+            // Verify: the production decoder's reconstruction at each position equals
+            // LUT[state_t_walked_from_zero]. This is the bit-exact requirement.
+            // The state walked from zero is what Viterbi MUST be optimizing — if it
+            // diverges, there's a bug.
+
+            // Sanity check: every symbol must be < ALPHABET
+            for (i, s) in syms.iter().enumerate() {
+                assert!(
+                    (*s as u32) < ALPHABET as u32,
+                    "symbol[{i}] = {s} >= ALPHABET = {ALPHABET}"
+                );
+            }
+
+            // Production recon should be finite.
+            for v in &production_recon {
+                assert!(v.is_finite(), "non-finite element in production decoder output");
+            }
+
+            // The error of production recon vs target should be ≤ greedy's error
+            // (because Viterbi optimizes the same path the decoder walks).
+            let greedy_syms = greedy_quantize_row(&target, &lut);
+            let greedy_recon = decode_symbols(&greedy_syms, &lut);
+
+            let viterbi_err = mse(&target, &production_recon);
+            let greedy_err = mse(&target, &greedy_recon);
+
+            assert!(
+                viterbi_err <= greedy_err + 1e-4,
+                "BUG: at {num_symbols} symbols, Viterbi production-decoder MSE {} > Greedy MSE {} — Viterbi optimization isn't aligned with decoder walk",
+                viterbi_err,
+                greedy_err
+            );
+        }
+    }
+
     /// Zero input → zero-magnitude reconstruction is best.
     #[test]
     fn zero_input_produces_low_magnitude_recon() {

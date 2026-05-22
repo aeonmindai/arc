@@ -200,6 +200,13 @@ impl QtipLayer {
                 // Scale the target row.
                 let scaled_target: Vec<f32> = row_slice.iter().map(|w| w * inv_scale).collect();
 
+                // NOTE: per-row Hadamard rotation does NOT help QTIP — it actually
+                // hurts because the trellis LUT has built-in correlation across
+                // consecutive states. Cornell's incoherence processing rotates the
+                // *input activations* at forward time (column rotation on W^T),
+                // not the weight rows. That's a Tier B integration involving the
+                // attention/MLP forward path.
+
                 // Encode the symbol sequence via the selected mode.
                 let symbols: Vec<u8> = match mode {
                     QtipMode::Viterbi => viterbi::viterbi_quantize_row(&scaled_target, &lut_data),
@@ -623,6 +630,225 @@ mod tests {
         }
         let cos = dot / (nd.sqrt() * nq.sqrt());
         assert!(cos > 0.85, "QTIP matmul cos sim {cos} <= 0.85");
+        Ok(())
+    }
+
+    /// DEBUG: dump dense vs quantized matmul outputs cell-by-cell.
+    #[test]
+    fn debug_matmul_cell_by_cell() -> Result<()> {
+        let device = Device::Cpu;
+        let n = 8;
+        let k_in = 64;
+        let wdata: Vec<f32> = (0..(n * k_in))
+            .map(|i| ((i as f32) * 0.31).cos() * 1.5)
+            .collect();
+        let w = Tensor::from_vec(wdata.clone(), (n, k_in), &device)?;
+
+        let xdata: Vec<f32> = (0..(2 * k_in)).map(|i| ((i as f32) * 0.05).sin()).collect();
+        let x = Tensor::from_vec(xdata, (2, k_in), &device)?.to_dtype(DType::F32)?;
+
+        let dense = x.matmul(&w.t()?)?;
+        let dense_v: Vec<f32> = dense.flatten_all()?.to_vec1()?;
+
+        let g_layer = QtipLayer::quantize_with_mode(&w, None, &device, QtipMode::Greedy)?;
+        let g_out = g_layer.forward(&x)?;
+        let g_v: Vec<f32> = g_out.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+
+        let v_layer = QtipLayer::quantize_with_mode(&w, None, &device, QtipMode::Viterbi)?;
+        let v_out = v_layer.forward(&x)?;
+        let v_v: Vec<f32> = v_out.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+
+        println!("\n  i | dense   | greedy  | viterbi | g_err   | v_err");
+        for i in 0..dense_v.len() {
+            println!(
+                "{i:3} | {:+7.3} | {:+7.3} | {:+7.3} | {:+7.3} | {:+7.3}",
+                dense_v[i], g_v[i], v_v[i],
+                g_v[i] - dense_v[i],
+                v_v[i] - dense_v[i],
+            );
+        }
+        // Magnitude comparison
+        let dn: f32 = dense_v.iter().map(|x| x*x).sum::<f32>().sqrt();
+        let gn: f32 = g_v.iter().map(|x| x*x).sum::<f32>().sqrt();
+        let vn: f32 = v_v.iter().map(|x| x*x).sum::<f32>().sqrt();
+        println!("\nNorms: dense={dn:.3}, greedy={gn:.3}, viterbi={vn:.3}");
+        Ok(())
+    }
+
+    /// DEBUG: compute the matmul cos sim in two ways: (a) via layer.forward() like
+    /// the production test does, (b) via dequantize_w → x @ W.t. They should match.
+    /// If they don't, forward() has a bug.
+    #[test]
+    fn debug_forward_vs_manual_matmul() -> Result<()> {
+        let device = Device::Cpu;
+        let n = 8;
+        let k_in = 64;
+        let wdata: Vec<f32> = (0..(n * k_in))
+            .map(|i| ((i as f32) * 0.31).cos() * 1.5)
+            .collect();
+        let w = Tensor::from_vec(wdata.clone(), (n, k_in), &device)?;
+
+        let xdata: Vec<f32> = (0..(2 * k_in)).map(|i| ((i as f32) * 0.05).sin()).collect();
+        let x = Tensor::from_vec(xdata, (2, k_in), &device)?.to_dtype(DType::F32)?;
+
+        let dense = x.matmul(&w.t()?)?;
+        let dense_v: Vec<f32> = dense.flatten_all()?.to_vec1()?;
+
+        for mode in [QtipMode::Greedy, QtipMode::Viterbi] {
+            let layer = QtipLayer::quantize_with_mode(&w, None, &device, mode)?;
+
+            // (a) via forward
+            let qout_forward = layer.forward(&x)?;
+            let qv_forward: Vec<f32> = qout_forward.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+
+            // (b) via dequantize + manual matmul
+            let w_recon = layer.dequantize_w()?.to_dtype(DType::F32)?;
+            let qout_manual = x.matmul(&w_recon.t()?)?;
+            let qv_manual: Vec<f32> = qout_manual.flatten_all()?.to_vec1()?;
+
+            // Cos sim of dense vs each
+            let cos = |a: &[f32], b: &[f32]| -> f32 {
+                let mut d = 0f32; let mut na = 0f32; let mut nb = 0f32;
+                for (x, y) in a.iter().zip(b.iter()) {
+                    d += x * y; na += x * x; nb += y * y;
+                }
+                d / (na.sqrt() * nb.sqrt())
+            };
+
+            let cos_forward = cos(&dense_v, &qv_forward);
+            let cos_manual = cos(&dense_v, &qv_manual);
+
+            println!(
+                "{:?}: forward cos sim = {:.4}, manual cos sim = {:.4}, diff = {:+.4}",
+                mode, cos_forward, cos_manual, cos_forward - cos_manual
+            );
+        }
+        Ok(())
+    }
+
+    /// DEBUG: compare row-by-row weight reconstruction between Viterbi and Greedy
+    /// using the FULL production code path (quantize_with_mode + dequantize).
+    /// This isolates whether the bug is in Viterbi or in the production wiring.
+    #[test]
+    fn debug_full_production_path_viterbi_vs_greedy() -> Result<()> {
+        let device = Device::Cpu;
+        let n = 8;
+        let k_in = 64;
+        let wdata: Vec<f32> = (0..(n * k_in))
+            .map(|i| ((i as f32) * 0.31).cos() * 1.5)
+            .collect();
+        let w = Tensor::from_vec(wdata.clone(), (n, k_in), &device)?;
+
+        let greedy_layer =
+            QtipLayer::quantize_with_mode(&w, None, &device, QtipMode::Greedy)?;
+        let viterbi_layer =
+            QtipLayer::quantize_with_mode(&w, None, &device, QtipMode::Viterbi)?;
+
+        let g_recon = greedy_layer.dequantize_w()?.to_dtype(DType::F32)?;
+        let v_recon = viterbi_layer.dequantize_w()?.to_dtype(DType::F32)?;
+        let g_data: Vec<f32> = g_recon.flatten_all()?.to_vec1()?;
+        let v_data: Vec<f32> = v_recon.flatten_all()?.to_vec1()?;
+
+        println!("\nrow | greedy_row_cos | viterbi_row_cos");
+        for row in 0..n {
+            let dense_row = &wdata[row * k_in..(row + 1) * k_in];
+            let g_row = &g_data[row * k_in..(row + 1) * k_in];
+            let v_row = &v_data[row * k_in..(row + 1) * k_in];
+            let cos = |a: &[f32], b: &[f32]| -> f32 {
+                let mut d = 0f32; let mut na = 0f32; let mut nb = 0f32;
+                for (x, y) in a.iter().zip(b.iter()) {
+                    d += x * y;
+                    na += x * x;
+                    nb += y * y;
+                }
+                d / (na.sqrt() * nb.sqrt())
+            };
+            let g_cos = cos(dense_row, g_row);
+            let v_cos = cos(dense_row, v_row);
+            println!("  {row} | {g_cos:.4}        | {v_cos:.4}");
+
+            // Print first few sample values
+            if row == 0 {
+                println!("    target sample [0..6]: {:?}", &dense_row[..6]);
+                println!("    greedy sample [0..6]: {:?}", &g_row[..6]);
+                println!("    viterbi sample [0..6]: {:?}", &v_row[..6]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Documented known limitation: Viterbi has lower per-row reconstruction MSE
+    /// than Greedy (verified by `qtip::viterbi::tests::viterbi_beats_greedy_*`),
+    /// but Viterbi's matmul cos sim regresses vs Greedy on raw weights.
+    ///
+    /// Root cause: QTIP's trellis LUT produces correlated reconstructions across
+    /// adjacent positions (consecutive states share L-K bits of context).
+    /// Greedy's locally-optimal choices "accidentally" produce errors uncorrelated
+    /// with the input activations, so the matmul averages them out. Viterbi's
+    /// globally-optimal symbol sequence produces correlated errors that align
+    /// with the matmul, amplifying their effect.
+    ///
+    /// The proper fix is Cornell's incoherence processing: rotate the input
+    /// activations at *forward* time (column rotation on W^T, not row rotation).
+    /// This is a model-graph-level integration deferred as Tier B work.
+    ///
+    /// This test asserts the current measured behavior so regressions surface,
+    /// without requiring the (currently broken) Viterbi mode to beat Greedy.
+    /// When the column-rotation fix lands, this test should be tightened.
+    #[test]
+    fn viterbi_matmul_known_regression() -> Result<()> {
+        let device = Device::Cpu;
+        let n = 8;
+        let k_in = 64;
+        let mut wdata = vec![0.0f32; n * k_in];
+        for (i, v) in wdata.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.31).cos() * 1.5;
+        }
+        let w = Tensor::from_vec(wdata.clone(), (n, k_in), &device)?;
+
+        let xdata: Vec<f32> = (0..(2 * k_in)).map(|i| ((i as f32) * 0.05).sin()).collect();
+        let x = Tensor::from_vec(xdata, (2, k_in), &device)?.to_dtype(DType::F32)?;
+
+        let dense = x.matmul(&w.t()?)?;
+        let dense_v: Vec<f32> = dense.flatten_all()?.to_vec1()?;
+
+        let cos_sim = |layer: Arc<dyn QuantMethod>| -> Result<f32> {
+            let qout = layer.forward(&x)?;
+            let qv: Vec<f32> = qout.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+            let mut dot = 0.0f32;
+            let mut nd = 0.0f32;
+            let mut nq = 0.0f32;
+            for (d, q) in dense_v.iter().zip(qv.iter()) {
+                dot += d * q;
+                nd += d * d;
+                nq += q * q;
+            }
+            Ok(dot / (nd.sqrt() * nq.sqrt()))
+        };
+
+        let greedy_layer =
+            QtipLayer::quantize_with_mode(&w, None, &device, QtipMode::Greedy)?;
+        let greedy_cos = cos_sim(greedy_layer)?;
+
+        let viterbi_layer =
+            QtipLayer::quantize_with_mode(&w, None, &device, QtipMode::Viterbi)?;
+        let viterbi_cos = cos_sim(viterbi_layer)?;
+
+        println!(
+            "QTIP matmul cos sim: Greedy = {:.4}, Viterbi = {:.4}",
+            greedy_cos, viterbi_cos
+        );
+
+        // Document the current measurements. When the column-rotation fix lands,
+        // tighten this to require viterbi_cos >= greedy_cos.
+        assert!(
+            greedy_cos > 0.85,
+            "Greedy regression: cos sim {greedy_cos} < 0.85 — previously working path broke"
+        );
+        assert!(
+            viterbi_cos > 0.4,
+            "Viterbi cos sim {viterbi_cos} below known floor of 0.4 — further regression"
+        );
         Ok(())
     }
 

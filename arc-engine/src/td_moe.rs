@@ -223,6 +223,130 @@ fn transpose_square(m: &[f32], n: usize) -> Vec<f32> {
     out
 }
 
+/// Tucker decomposition output with associated whitening matrices, so the caller
+/// can re-color the decomposed tensor back into the original space.
+///
+/// The pipeline is:
+///   1. tensor (in original space)
+///   2. whitened = whiten_tensor(tensor, cov_out, cov_in, eps)
+///   3. tucker = tucker_decompose(whitened, ranks)
+///   4. (later) reconstruction_whitened = tucker_reconstruct(tucker)
+///   5. (later) reconstruction = recolor(reconstruction_whitened, s_out, s_in)
+///
+/// Step 5 needs the inverse of the whitening: T = S_out_inv ×_2 T_w ×_3 S_in_inv.
+/// We store s_out and s_in (the whitening matrices) so the caller can invert them
+/// via cholesky_solve or, equivalently, multiply by Σ^(1/2).
+///
+/// For the simplest re-coloring path, we store the original covariance matrices
+/// alongside (which act as the inverse whitening operators).
+#[derive(Debug, Clone)]
+pub struct WhitenedTucker {
+    pub tucker: Tucker3D,
+    /// Output-mode whitening matrix S_out used to whiten. Same shape as cov_out.
+    pub s_out: Vec<f32>,
+    /// Input-mode whitening matrix S_in used to whiten. Same shape as cov_in.
+    pub s_in: Vec<f32>,
+    /// Original output dimension covariance, for re-coloring.
+    pub cov_out: Vec<f32>,
+    /// Original input dimension covariance, for re-coloring.
+    pub cov_in: Vec<f32>,
+    /// Epsilon used during whitening (for numerical stability).
+    pub epsilon: f32,
+}
+
+/// Tucker decomposition with multi-linear whitening (paper §3.3 lossless recipe).
+///
+/// This is the "lossless 20%" path: whitening conditions the tensor so that the
+/// subsequent Tucker SVD captures more of the signal, reducing reconstruction
+/// error vs basic Tucker.
+///
+/// `cov_out` and `cov_in` come from a calibration set's input + output gradient
+/// covariance (the paper recommends 256 samples). For test purposes, identity
+/// covariances reduce this to basic Tucker.
+pub fn tucker_decompose_with_whitening(
+    tensor: &Tensor,
+    ranks: [usize; 3],
+    cov_out: &[f32],
+    cov_in: &[f32],
+    epsilon: f32,
+) -> Result<WhitenedTucker> {
+    let dims = tensor.dims();
+    if dims.len() != 3 {
+        candle_core::bail!(
+            "tucker_decompose_with_whitening expects rank-3 tensor, got {:?}",
+            dims
+        );
+    }
+    let (d1, d2, d3) = (dims[0], dims[1], dims[2]);
+
+    let t_f32 = tensor.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
+    let data: Vec<f32> = t_f32.flatten_all()?.to_vec1()?;
+
+    let (whitened_data, s_out, s_in) =
+        whiten_tensor(&data, [d1, d2, d3], cov_out, cov_in, epsilon)
+            .map_err(|e| candle_core::Error::Msg(e))?;
+
+    let whitened = Tensor::from_vec(whitened_data, (d1, d2, d3), &Device::Cpu)?;
+    let tucker = tucker_decompose(&whitened, ranks)?;
+
+    Ok(WhitenedTucker {
+        tucker,
+        s_out,
+        s_in,
+        cov_out: cov_out.to_vec(),
+        cov_in: cov_in.to_vec(),
+        epsilon,
+    })
+}
+
+/// Reconstruct the original-space tensor from a `WhitenedTucker`.
+///
+/// Pipeline:
+///   1. Reconstruct whitened tensor from Tucker factors
+///   2. Re-color: T = T_w ×_2 Σ_out^(1/2) ×_3 Σ_in^(1/2)
+///      (approximated via Σ_out and Σ_in themselves, since S * Σ * S^T ≈ I means
+///       Σ acts approximately as the inverse of S in the whitened space)
+pub fn whitened_tucker_reconstruct(wt: &WhitenedTucker) -> Result<Tensor> {
+    // First reconstruct in whitened space.
+    let recon_whitened = tucker_reconstruct(&wt.tucker)?;
+    let dims = recon_whitened.dims();
+    let d1 = dims[0];
+    let d2 = dims[1];
+    let d3 = dims[2];
+
+    let data: Vec<f32> = recon_whitened.flatten_all()?.to_vec1()?;
+
+    // Re-color by multiplying with the (sqrt) covariance matrices.
+    // For the Cholesky-based whitening we used, S = L^(-1) where L*L^T = Σ.
+    // The inverse of S is L. We could store L, but a simpler approximation:
+    // multiplying T_w by Σ (= L L^T) approximates the un-whitening for
+    // moderately conditioned matrices.
+    //
+    // For the rigorous reconstruction, we'd compute L = Σ^(1/2) via Cholesky
+    // of the regularized Σ.
+    use crate::td_moe::{cholesky_in_place, mode_n_product_mode1, mode_n_product_mode2};
+
+    let mut l_out = wt.cov_out.clone();
+    for i in 0..d2 {
+        l_out[i * d2 + i] += wt.epsilon;
+    }
+    cholesky_in_place(&mut l_out, d2)
+        .map_err(|e| candle_core::Error::Msg(format!("recolor cholesky out: {e}")))?;
+
+    let mut l_in = wt.cov_in.clone();
+    for i in 0..d3 {
+        l_in[i * d3 + i] += wt.epsilon;
+    }
+    cholesky_in_place(&mut l_in, d3)
+        .map_err(|e| candle_core::Error::Msg(format!("recolor cholesky in: {e}")))?;
+
+    // Apply T ×_2 L_out then ×_3 L_in to recolor.
+    let after_mode1 = mode_n_product_mode1(&data, [d1, d2, d3], &l_out, d2);
+    let recolored = mode_n_product_mode2(&after_mode1, [d1, d2, d3], &l_in, d3);
+
+    Tensor::from_vec(recolored, (d1, d2, d3), &Device::Cpu)
+}
+
 /// 3D Tucker tensor: T ≈ G ×₁ U₁ ×₂ U₂ ×₃ U₃.
 #[derive(Debug, Clone)]
 pub struct Tucker3D {
@@ -724,6 +848,79 @@ mod tests {
             (pre_norm - post_norm).abs() > 0.1,
             "whitening had no effect: pre {pre_norm}, post {post_norm}"
         );
+    }
+
+    /// Whitened Tucker pipeline runs end-to-end and produces a reconstruction
+    /// in the original space (re-coloring works).
+    #[test]
+    fn whitened_tucker_full_pipeline_runs() -> Result<()> {
+        let device = Device::Cpu;
+        let dims = [2, 4, 6]; // small for fast test
+        let n = dims[0] * dims[1] * dims[2];
+        let data: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.07).sin()).collect();
+        let tensor = Tensor::from_vec(data.clone(), (dims[0], dims[1], dims[2]), &device)?;
+
+        // Use identity covariances → whitening is a no-op, but the full pipeline
+        // exercises all the code.
+        let mut cov_out = vec![0f32; dims[1] * dims[1]];
+        for i in 0..dims[1] {
+            cov_out[i * dims[1] + i] = 1.0;
+        }
+        let mut cov_in = vec![0f32; dims[2] * dims[2]];
+        for i in 0..dims[2] {
+            cov_in[i * dims[2] + i] = 1.0;
+        }
+
+        let wt = tucker_decompose_with_whitening(&tensor, [2, 4, 6], &cov_out, &cov_in, 1e-6)?;
+        // At full rank, reconstruction should be near-exact.
+        let recon = whitened_tucker_reconstruct(&wt)?;
+        let recon_data: Vec<f32> = recon.flatten_all()?.to_vec1()?;
+
+        // With identity covariance + small epsilon, the recoloring multiplies by
+        // sqrt(I + εI) ≈ I, so reconstruction is close to the whitened tensor
+        // which is close to the original.
+        let mut max_err = 0f32;
+        for (o, r) in data.iter().zip(recon_data.iter()) {
+            max_err = max_err.max((o - r).abs());
+        }
+        // Identity covariance with small eps gives a tiny scale offset; allow up to 0.5
+        assert!(max_err < 0.5, "max err {max_err} unreasonably large");
+        Ok(())
+    }
+
+    /// Whitened Tucker with non-trivial covariance produces a valid reconstruction
+    /// (the math runs without crash and outputs finite values).
+    #[test]
+    fn whitened_tucker_with_real_covariance_is_finite() -> Result<()> {
+        let device = Device::Cpu;
+        let dims = [3, 4, 5];
+        let n = dims[0] * dims[1] * dims[2];
+        let data: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.137).cos() * 0.5).collect();
+        let tensor = Tensor::from_vec(data, (dims[0], dims[1], dims[2]), &device)?;
+
+        // Non-identity SPD covariances.
+        let cov_out = vec![
+            2.0f32, 0.5, 0.1, 0.0, //
+            0.5, 2.0, 0.5, 0.1, //
+            0.1, 0.5, 2.0, 0.5, //
+            0.0, 0.1, 0.5, 2.0,
+        ];
+        let cov_in = vec![
+            3.0f32, 0.5, 0.0, 0.0, 0.0, //
+            0.5, 3.0, 0.5, 0.0, 0.0, //
+            0.0, 0.5, 3.0, 0.5, 0.0, //
+            0.0, 0.0, 0.5, 3.0, 0.5, //
+            0.0, 0.0, 0.0, 0.5, 3.0,
+        ];
+
+        let wt =
+            tucker_decompose_with_whitening(&tensor, [3, 4, 5], &cov_out, &cov_in, 1e-3)?;
+        let recon = whitened_tucker_reconstruct(&wt)?;
+        let v: Vec<f32> = recon.flatten_all()?.to_vec1()?;
+        for x in &v {
+            assert!(x.is_finite(), "non-finite reconstruction element {x}");
+        }
+        Ok(())
     }
 
     /// Mode-n product is invertible by its inverse matrix (algebraic check).
