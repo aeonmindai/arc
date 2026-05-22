@@ -27,6 +27,7 @@ pub mod sage;
 pub mod sarathi;
 pub mod td_moe;
 pub mod turbo_sparse;
+pub mod weight_schema;
 pub mod yoco;
 
 #[cfg(test)]
