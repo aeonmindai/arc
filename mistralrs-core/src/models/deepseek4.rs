@@ -1099,6 +1099,21 @@ impl DecoderLayer {
     }
 }
 
+/// V4 MTP head — single transformer layer that predicts next-token given the
+/// previous-step hidden state + current-token embedding.
+///
+/// Per V4 paper + SGLang `deepseek_v4_nextn.py`:
+///   `mtp_logits = head(norm(h_proj(prev_hidden) + e_proj(cur_emb) + transformer(...)))`
+///
+/// At Tier A we LOAD the head weights but don't yet integrate into decode
+/// (RUN-156 does the SpeculativePipeline wiring).
+pub struct MtpHead {
+    /// Projects the previous-step hidden state. Shape: `[hidden, hidden]`.
+    pub h_proj: Arc<dyn QuantMethod>,
+    /// Projects the next-token embedding. Shape: `[hidden, hidden]`.
+    pub e_proj: Arc<dyn QuantMethod>,
+}
+
 pub struct DeepSeekV4 {
     lm_head: Arc<dyn QuantMethod>,
     embed_tokens: Embedding,
@@ -1109,23 +1124,26 @@ pub struct DeepSeekV4 {
     max_seq_len: usize,
     cfg: ModelConfigMetadata,
     mapper: Box<dyn DeviceMapper + Send + Sync>,
-    /// V4-specific: tracks whether the loaded checkpoint had MTP heads
-    /// (mtp.layers.0.h_proj + e_proj). Used by the SpeculativePipeline
-    /// to opt into MTP-based speculative decoding when available.
-    /// `None` if no MTP heads were detected at load time.
-    mtp_present: bool,
+    /// V4 MTP head (loaded if `mtp.layers.0.*` tensors present in checkpoint).
+    /// `None` for non-MTP checkpoints; `Some` enables MTP-aware decoding.
+    mtp_head: Option<MtpHead>,
     /// V4 mHC global head parameters (loaded if present in checkpoint).
-    /// Used at the final lm_head application — replaces standard residual.
     mhc_head_fn: Option<Tensor>,
     mhc_head_base: Option<Tensor>,
     mhc_head_scale: Option<Tensor>,
 }
 
 impl DeepSeekV4 {
-    /// Returns true if MTP heads were loaded from the checkpoint. The
-    /// SpeculativePipeline can query this to opt into MTP-based decoding.
+    /// Returns true if an MTP head was loaded from the checkpoint.
+    /// The SpeculativePipeline can query this to opt into MTP-based decoding.
     pub fn has_mtp(&self) -> bool {
-        self.mtp_present
+        self.mtp_head.is_some()
+    }
+
+    /// Reference to the MTP head, if loaded. Returns None for non-MTP
+    /// checkpoints (or when V4 weights without mtp.layers.0 are loaded).
+    pub fn mtp_head(&self) -> Option<&MtpHead> {
+        self.mtp_head.as_ref()
     }
 
     /// Returns true if mHC (Manifold-Constrained Hyper-Connections) global
@@ -1277,22 +1295,25 @@ impl DeepSeekV4 {
                 kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
             },
             mapper,
-            // MTP head detection — try to load mtp.layers.0.h_proj and e_proj
-            // weights from the checkpoint. V4 always ships these; absence
-            // means we have either a non-MTP variant or a partial checkpoint.
-            mtp_present: {
-                let h_path = vb.pp("mtp").pp("layers").pp("0").pp("h_proj");
-                let e_path = vb.pp("mtp").pp("layers").pp("0").pp("e_proj");
-                // The vb.get() will succeed if the tensor exists in the
-                // safetensors index. We use the larger dim (hidden_size) as
-                // the expected shape and tolerate fallback dtypes.
-                let h_ok = h_path
-                    .get((cfg.hidden_size, cfg.hidden_size), "weight")
-                    .is_ok();
-                let e_ok = e_path
-                    .get((cfg.hidden_size, cfg.hidden_size), "weight")
-                    .is_ok();
-                h_ok && e_ok
+            // V4 MTP head — actually LOAD the weights if present in safetensors.
+            // h_proj projects the previous-step hidden state, e_proj projects
+            // the current-token embedding. Both are [hidden, hidden] linears.
+            // Used by SpeculativePipeline (RUN-156) for MTP draft decoding.
+            mtp_head: {
+                let mtp_vb = vb.pp("mtp").pp("layers").pp("0");
+                let try_load = |sub: &str| -> Result<Arc<dyn QuantMethod>> {
+                    ReplicatedLayer::new(
+                        cfg.hidden_size,
+                        cfg.hidden_size,
+                        &cfg.quantization_config,
+                        false,
+                        mtp_vb.pp(sub),
+                    )
+                };
+                match (try_load("h_proj"), try_load("e_proj")) {
+                    (Ok(h_proj), Ok(e_proj)) => Some(MtpHead { h_proj, e_proj }),
+                    _ => None,
+                }
             },
             // mHC global parameters (replace standard residual in V4).
             // Shapes per SGLang: hc_head_fn [hc_mult, hc_dim] where
@@ -1392,6 +1413,11 @@ impl IsqModel for DeepSeekV4 {
                     }
                 }
             }
+        }
+        // V4 MTP head — ISQ-eligible (it's two large Linear layers).
+        if let Some(mtp) = &mut self.mtp_head {
+            tensors.push((&mut mtp.h_proj, None));
+            tensors.push((&mut mtp.e_proj, None));
         }
         (tensors, &*self.mapper)
     }
