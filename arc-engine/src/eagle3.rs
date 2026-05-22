@@ -89,6 +89,100 @@ pub fn huggingface_head_for_target(target_hf_id: &str) -> Option<&'static str> {
     }
 }
 
+/// Expected EAGLE-3 draft-head safetensors weight name patterns.
+///
+/// Per `research/code/03_per_token_speed/eagle/eagle/model/cnets.py`, the draft
+/// is a Llama-style transformer with a few EAGLE-specific projections. Weight
+/// names follow:
+///   - `embed_tokens.weight` (embedding)
+///   - `layers.<i>.self_attn.{q,k,v,o}_proj.weight` (attention)
+///   - `layers.<i>.mlp.{gate,up,down}_proj.weight` (FFN)
+///   - `layers.<i>.{input,post_attention}_layernorm.weight`
+///   - `norm.weight` (final RMSNorm)
+///   - `lm_head.weight` (vocab projection)
+///   - `fc.weight` (EAGLE-specific: projects 2× hidden_state to hidden_state)
+pub fn expected_eagle3_weight_patterns() -> Vec<&'static str> {
+    vec![
+        "embed_tokens.weight",
+        "norm.weight",
+        "lm_head.weight",
+        // EAGLE-specific fusion projection (concatenates target hidden + token embed)
+        "fc.weight",
+        // Per-layer (at least layer 0 must exist)
+        "layers.0.self_attn.q_proj.weight",
+        "layers.0.self_attn.k_proj.weight",
+        "layers.0.self_attn.v_proj.weight",
+        "layers.0.self_attn.o_proj.weight",
+        "layers.0.mlp.gate_proj.weight",
+        "layers.0.mlp.up_proj.weight",
+        "layers.0.mlp.down_proj.weight",
+        "layers.0.input_layernorm.weight",
+        "layers.0.post_attention_layernorm.weight",
+    ]
+}
+
+/// Validation result for a safetensors weight index against the EAGLE-3 schema.
+#[derive(Debug, Clone)]
+pub struct Eagle3WeightValidation {
+    /// Required weight patterns that were found in the index.
+    pub found: Vec<String>,
+    /// Required patterns that were NOT found — loading will fail without these.
+    pub missing: Vec<String>,
+    /// Number of transformer layers detected.
+    pub num_layers: usize,
+}
+
+impl Eagle3WeightValidation {
+    pub fn is_valid(&self) -> bool {
+        self.missing.is_empty()
+    }
+}
+
+/// Validate that a list of safetensors weight keys contains all the tensors
+/// required to instantiate an EAGLE-3 draft model.
+///
+/// `keys`: weight tensor names from `model.safetensors.index.json` or similar.
+pub fn validate_eagle3_weights<'a, I>(keys: I) -> Eagle3WeightValidation
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let key_set: std::collections::HashSet<String> =
+        keys.into_iter().map(String::from).collect();
+    let expected = expected_eagle3_weight_patterns();
+
+    let mut found = Vec::new();
+    let mut missing = Vec::new();
+    for pat in &expected {
+        if key_set.contains(*pat) {
+            found.push(pat.to_string());
+        } else {
+            missing.push(pat.to_string());
+        }
+    }
+
+    // Count layers by scanning for `layers.<N>.input_layernorm.weight`.
+    let mut num_layers = 0;
+    for key in &key_set {
+        if let Some(rest) = key.strip_prefix("layers.") {
+            if let Some(layer_end) = rest.find('.') {
+                if rest[layer_end..].starts_with(".input_layernorm.weight") {
+                    if let Ok(idx) = rest[..layer_end].parse::<usize>() {
+                        if idx + 1 > num_layers {
+                            num_layers = idx + 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Eagle3WeightValidation {
+        found,
+        missing,
+        num_layers,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +231,77 @@ mod tests {
         let head = Eagle3DraftHead::new(cfg, "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B".into());
         assert_eq!(head.cfg, cfg);
         assert_eq!(head.hf_repo, "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B");
+    }
+
+    #[test]
+    fn validation_passes_with_complete_one_layer_head() {
+        let keys = vec![
+            "embed_tokens.weight",
+            "norm.weight",
+            "lm_head.weight",
+            "fc.weight",
+            "layers.0.self_attn.q_proj.weight",
+            "layers.0.self_attn.k_proj.weight",
+            "layers.0.self_attn.v_proj.weight",
+            "layers.0.self_attn.o_proj.weight",
+            "layers.0.mlp.gate_proj.weight",
+            "layers.0.mlp.up_proj.weight",
+            "layers.0.mlp.down_proj.weight",
+            "layers.0.input_layernorm.weight",
+            "layers.0.post_attention_layernorm.weight",
+        ];
+        let v = validate_eagle3_weights(keys.iter().copied());
+        assert!(v.is_valid(), "missing: {:?}", v.missing);
+        assert_eq!(v.num_layers, 1);
+    }
+
+    #[test]
+    fn validation_detects_layer_count_correctly() {
+        let mut keys = vec![
+            "embed_tokens.weight".to_string(),
+            "norm.weight".to_string(),
+            "lm_head.weight".to_string(),
+            "fc.weight".to_string(),
+        ];
+        for i in 0..4 {
+            for suffix in &[
+                "self_attn.q_proj.weight",
+                "self_attn.k_proj.weight",
+                "self_attn.v_proj.weight",
+                "self_attn.o_proj.weight",
+                "mlp.gate_proj.weight",
+                "mlp.up_proj.weight",
+                "mlp.down_proj.weight",
+                "input_layernorm.weight",
+                "post_attention_layernorm.weight",
+            ] {
+                keys.push(format!("layers.{i}.{suffix}"));
+            }
+        }
+        let v = validate_eagle3_weights(keys.iter().map(String::as_str));
+        assert!(v.is_valid());
+        assert_eq!(v.num_layers, 4);
+    }
+
+    #[test]
+    fn validation_reports_missing_weights() {
+        let keys = vec![
+            "embed_tokens.weight",
+            "norm.weight",
+            // missing lm_head, fc, and all layer weights
+        ];
+        let v = validate_eagle3_weights(keys.iter().copied());
+        assert!(!v.is_valid());
+        assert!(v.missing.iter().any(|m| m.contains("lm_head")));
+        assert!(v.missing.iter().any(|m| m.contains("fc.weight")));
+        assert!(v.missing.iter().any(|m| m.contains("layers.0")));
+    }
+
+    #[test]
+    fn validation_handles_empty_input() {
+        let v = validate_eagle3_weights(Vec::<&str>::new());
+        assert!(!v.is_valid());
+        assert_eq!(v.num_layers, 0);
+        assert!(v.missing.len() >= 4); // at least the four global tensors
     }
 }
