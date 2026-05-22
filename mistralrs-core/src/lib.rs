@@ -104,22 +104,26 @@ pub use mistralrs_mcp::{
     McpClient, McpClientConfig, McpServerConfig, McpServerSource, McpToolInfo,
 };
 pub use mistralrs_quant::{IsqBits, IsqType, MULTI_LORA_DELIMITER};
-pub use paged_attention::{MemoryGpuConfig, PagedAttentionConfig, PagedCacheType};
+pub use paged_attention::{AttentionImplementation, MemoryGpuConfig, PagedAttentionConfig, PagedCacheType};
 pub use pipeline::hf::{hf_home_dir, hf_hub_cache_dir, hf_token_path};
+pub use pipeline::post_load_hooks::{register_post_load_hook, PostLoadHook};
 pub use pipeline::{
     chat_template::ChatTemplate, expand_isq_value, parse_isq_value, AdapterPaths, AnyMoeLoader,
-    AnyMoePipeline, AutoDeviceMapParams, AutoLoader, AutoLoaderBuilder, DiffusionGenerationParams,
-    DiffusionLoader, DiffusionLoaderBuilder, DiffusionLoaderType, EmbeddingLoader,
-    EmbeddingLoaderBuilder, EmbeddingLoaderType, EmbeddingModelPaths, EmbeddingSpecificConfig,
-    GGMLLoader, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoader, GGUFLoaderBuilder,
-    GGUFSpecificConfig, GemmaLoader, Idefics2Loader, IsqOrganization, LLaVALoader, LLaVANextLoader,
-    LlamaLoader, Loader, LocalModelPaths, LoraAdapterPaths, MistralLoader, MixtralLoader,
-    Modalities, ModelKind, ModelPaths, MultimodalPromptPrefixer, NormalLoader, NormalLoaderBuilder,
-    NormalLoaderType, NormalSpecificConfig, Phi2Loader, Phi3Loader, Phi3VLoader, Qwen2Loader,
+    AnyMoePipeline, AutoDeviceMapParams, AutoLoader, AutoLoaderBuilder, DeepSeekV4Loader,
+    DiffusionGenerationParams, DiffusionLoader, DiffusionLoaderBuilder, DiffusionLoaderType,
+    EmbeddingLoader, EmbeddingLoaderBuilder, EmbeddingLoaderType, EmbeddingModelPaths,
+    EmbeddingSpecificConfig, GGMLLoader, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoader,
+    GGUFLoaderBuilder, GGUFSpecificConfig, GemmaLoader, Idefics2Loader, IsqOrganization,
+    LLaVALoader, LLaVANextLoader, LlamaLoader, Loader, LocalModelPaths, LoraAdapterPaths,
+    MistralLoader, MixtralLoader, Modalities, ModelKind, ModelPaths, MultimodalPromptPrefixer,
+    NormalLoader, NormalLoaderBuilder, NormalLoaderType, NormalLoadingMetadata, NormalModel,
+    NormalModelLoader, NormalSpecificConfig, Phi2Loader, Phi3Loader, Phi3VLoader, Qwen2Loader,
     SpeculativeConfig, SpeculativeLoader, SpeculativePipeline, SpeechLoader, SpeechPipeline,
     Starcoder2Loader, SupportedModality, TokenSource, VisionLoader, VisionLoaderBuilder,
     VisionLoaderType, VisionSpecificConfig, UQFF_MULTI_FILE_DELIMITER,
 };
+/// `FlashParams` is needed by integration tests that call `NormalModel::forward` directly.
+pub use pipeline::text_models_inputs_processor::FlashParams as TextFlashParams;
 pub use request::{
     ApproximateUserLocation, Constraint, DetokenizationRequest, ImageGenerationResponseFormat,
     LlguidanceGrammar, MessageContent, NormalRequest, ReasoningEffort, Request, RequestMessage,

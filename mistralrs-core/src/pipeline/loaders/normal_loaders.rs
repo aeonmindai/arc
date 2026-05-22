@@ -70,6 +70,19 @@ pub trait NormalModel: IsqModel + AnyMoeBaseModelMixin {
     fn cache_mut(&mut self) -> &mut EitherCache;
     fn max_seq_len(&self) -> usize;
     fn config(&self) -> &ModelConfigMetadata;
+
+    /// Return the components needed to run MTP speculative drafting.
+    ///
+    /// Default: `None` — model does not have an MTP head. Models that do
+    /// (currently only DeepSeekV4 with `mtp.layers.0.*` tensors) override
+    /// this to expose their `embed_tokens`, `lm_head`, and `h_proj`/`e_proj`
+    /// projections so a [`crate::pipeline::MtpSpeculativePipeline`] can be
+    /// constructed.
+    fn mtp_decode_kit(
+        &self,
+    ) -> Option<crate::pipeline::mtp_pipeline::MtpDecodeKit> {
+        None
+    }
 }
 
 /// Metadata for loading a model with ISQ or device mapping.

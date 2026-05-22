@@ -48,6 +48,13 @@ fn main() -> Result<(), String> {
     println!("cargo::rustc-check-cfg=cfg(has_vector_fp8_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_mxfp4_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_mxfp4_wmma_kernels)");
+    // SageAttention SM89/SM90/SM100 INT8 + FP8 kernels (vendored from
+    // SageAttention upstream). When the compiled GPU compute cap is high
+    // enough, the kernels are linked in; otherwise the Rust side falls back
+    // to the software path.
+    println!("cargo::rustc-check-cfg=cfg(has_sage_sm89_kernels)");
+    println!("cargo::rustc-check-cfg=cfg(has_sage_sm90_kernels)");
+    println!("cargo::rustc-check-cfg=cfg(has_sage_sm100_kernels)");
 
     #[cfg(feature = "cuda")]
     {
@@ -55,6 +62,22 @@ fn main() -> Result<(), String> {
         const CUDA_NVCC_FLAGS: Option<&'static str> = option_env!("CUDA_NVCC_FLAGS");
 
         println!("cargo:rerun-if-changed=build.rs");
+        // SageAttention kernel sources — recompile if any change.
+        println!("cargo:rerun-if-changed=src/sage_cuda/kernels/sm89_qk_int8_sv_f8_attn.cu");
+        println!("cargo:rerun-if-changed=src/sage_cuda/kernels/sage_quant.cu");
+        println!("cargo:rerun-if-changed=src/sage_cuda/kernels/sage_dispatch.cuh");
+        println!("cargo:rerun-if-changed=src/sage_cuda/kernels/sage_utils.cuh");
+        println!("cargo:rerun-if-changed=src/sage_cuda/kernels/attn_utils.cuh");
+        println!("cargo:rerun-if-changed=src/sage_cuda/kernels/qk_int_sv_f8_cuda_sm89.cuh");
+        println!("cargo:rerun-if-changed=src/sage_cuda/kernels/fused_kernels.cuh");
+        println!("cargo:rerun-if-changed=src/sage_cuda/kernels/cp_async.cuh");
+        println!("cargo:rerun-if-changed=src/sage_cuda/kernels/math.cuh");
+        println!("cargo:rerun-if-changed=src/sage_cuda/kernels/mma.cuh");
+        println!("cargo:rerun-if-changed=src/sage_cuda/kernels/wgmma.cuh");
+        println!("cargo:rerun-if-changed=src/sage_cuda/kernels/permuted_smem.cuh");
+        println!("cargo:rerun-if-changed=src/sage_cuda/kernels/numeric_conversion.cuh");
+        println!("cargo:rerun-if-changed=src/sage_cuda/kernels/reduction_utils.cuh");
+
         let build_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
         let mut builder = cudaforge::KernelBuilder::new()
@@ -76,6 +99,9 @@ fn main() -> Result<(), String> {
         let compute_cap = builder.get_compute_cap().unwrap_or(80);
         // ======== Handle optional kernel compilation via rustc-cfg flags
         let cc_over_80 = compute_cap >= 80;
+        let cc_over_89 = compute_cap >= 89;
+        let cc_over_90 = compute_cap >= 90;
+        let cc_over_100 = compute_cap >= 100;
 
         if cc_over_80 {
             println!("cargo:rustc-cfg=has_marlin_kernels");
@@ -85,14 +111,34 @@ fn main() -> Result<(), String> {
             // WMMA tensor core MXFP4 kernel (FP16/BF16 WMMA requires SM >= 80)
             println!("cargo:rustc-cfg=has_mxfp4_wmma_kernels");
         }
+        // SageAttention compile-time gating. The SM89 path needs FP8 MMA
+        // instructions, which require SM >= 8.9 (Ada / L4 / RTX 4090) at
+        // minimum. Lower SMs would still link, but the kernel would refuse to
+        // run, so we gate on compile target.
+        if cc_over_89 {
+            println!("cargo:rustc-cfg=has_sage_sm89_kernels");
+        }
+        if cc_over_90 {
+            println!("cargo:rustc-cfg=has_sage_sm90_kernels");
+        }
+        if cc_over_100 {
+            println!("cargo:rustc-cfg=has_sage_sm100_kernels");
+        }
         // MXFP4 is always enabled with CUDA (uses LUT-based dequantization)
         println!("cargo:rustc-cfg=has_mxfp4_kernels");
 
-        let excluded_files = if cc_over_80 {
+        // Exclude SageAttention sources from the main builder; they need
+        // different SM targets (SM89/SM90/SM100) and a separate include path.
+        let mut excluded_files = if cc_over_80 {
             vec!["dummy_*.cu", "*_dummy.cu"]
         } else {
             vec!["marlin_*.cu", "*_fp8.cu", "*_fp8_gemm.cu", "*_wmma.cu"]
         };
+        // sage_*.cu / sm89_*.cu live under src/sage_cuda/kernels/ and are
+        // already outside the kernels/*/*.cu glob; the explicit exclude here
+        // is defense-in-depth in case the glob is broadened later.
+        excluded_files.push("sm89_*.cu");
+        excluded_files.push("sage_*.cu");
         builder = builder.exclude(&excluded_files);
 
         // https://github.com/EricLBuehler/mistral.rs/issues/286

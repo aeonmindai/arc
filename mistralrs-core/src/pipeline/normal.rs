@@ -939,6 +939,11 @@ impl Loader for NormalLoader {
             )?;
         }
 
+        // Run any registered post-load hooks (e.g. Arc's TD-MoE compressor).
+        // Hooks are no-ops when nothing has been registered.
+        crate::pipeline::post_load_hooks::run_post_load_hooks(&mut *model)
+            .map_err(|e| candle_core::Error::Msg(format!("post-load hook failed: {e}")))?;
+
         let paged_attn_config = if matches!(
             self.kind,
             ModelKind::Adapter {

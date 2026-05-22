@@ -19,6 +19,19 @@ pub mod nongemv_ffi;
 /// Tier B: GPU sampler in autonomous.rs matches this output for the same RNG seed.
 pub mod sampling_cpu;
 
+/// CUDA-backed sampler. The kernel in `cuda/sampling_kernel.cu` matches
+/// `sampling_cpu` bit-for-bit for any input with unique probabilities.
+/// See module docs for the documented tied-probability divergence. The
+/// module compiles host-only on CPU builds (kernel call sites and the
+/// `CudaSampler` struct are CUDA-gated within the module) so we can
+/// unit-test the algorithm without a GPU.
+pub mod sampling_cuda;
+
+pub use sampling_cuda::{gpu_algorithm_simulate, SamplingParams, GPU_MAX_KEEP};
+
+#[cfg(feature = "cuda")]
+pub use sampling_cuda::CudaSampler;
+
 #[cfg(feature = "cuda")]
 pub use graph::CudaGraphRunner;
 #[cfg(feature = "cuda")]

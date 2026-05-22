@@ -206,53 +206,249 @@ impl CompressRatio {
     }
 }
 
-/// V4 learned KV compressor — linear projection from `ratio` consecutive tokens
-/// to one compressed entry. Matches SGLang's `dsv4/compressor.py`.
+/// V4 learned KV compressor — matches SGLang's `Compressor` (compressor.py:289-399).
 ///
-/// Weight matrix shape: `[ratio * head_dim, head_dim]`. At inference time this
-/// comes from `model.layers.<i>.self_attn.compressor.weight`.
+/// Per SGLang reference (compressor.py:312-328):
+///   - `wkv_gate`: ReplicatedLinear with `hidden_size → 2 * coff * head_dim`,
+///     bf16, no bias, no quant. Operates on the layer input `x` (not on K/V).
+///   - `ape`: Parameter of shape `[ratio, coff * head_dim]` — absolute positional
+///     encoding bias added per-position-in-block.
+///   - `norm`: RMSNorm on the head_dim axis (per-head normalization).
+///   - `coff = 1 + (ratio == 4)` (overlap=true for CSA, false for HCA).
+///
+/// Forward math (conceptual, before fused norm + RoPE kernel):
+///   1. `wkv_out = wkv_gate(x)`  → `[T, 2 * coff * head_dim]`
+///   2. split into `gate` and `val`, each `[T, coff * head_dim]`
+///   3. `kv_score = sigmoid(gate) * val`  → `[T, coff * head_dim]`
+///   4. group along T into windows of `ratio` (with overlap for CSA),
+///      add `ape[pos_in_block]` per row, sum or concat across the group →
+///      `[T_c = T/ratio, coff * head_dim]`
+///   5. reshape to `[T_c * coff, head_dim]`, apply `norm`, sum out `coff` axis →
+///      `[T_c, head_dim]`
+///
+/// At Tier A (this file) we provide a pure-Rust path that produces the right
+/// shape (`[B, H, T_c, head_dim]`) and approximately the right math; the
+/// production fused kernel (TileLang) is wired in at Phase 2 per the rental plan.
+///
+/// For the `uniform` constructor (synthetic-test fallback): produces an averaging
+/// projection equivalent to a fixed identity-block wkv_gate output, so the
+/// invariants assumed by the existing unit tests still hold (seq_len reduces by
+/// `ratio`, all-ones in → all-ones out).
 #[derive(Debug, Clone)]
 pub struct V4Compressor {
-    /// 2D weight tensor of shape `[ratio * head_dim, head_dim]`.
-    pub weights: Tensor,
+    /// `wkv_gate`: `[hidden_size, 2 * coff * head_dim]`. From SGLang
+    /// `compressor.py:318` (ReplicatedLinear, no bias, bf16, no quant).
+    /// Operates on the layer input `xs` (not on K/V).
+    pub wkv_gate: Arc<dyn QuantMethod>,
+    /// RMSNorm over the `head_dim` axis (compressor.py:326).
+    pub norm: RmsNorm,
+    /// Absolute positional encoding bias, shape `[ratio, coff * head_dim]`.
+    /// From `compressor.py:314`.
+    pub ape: Tensor,
+    /// Group ratio (4 for CSA, 128 for HCA).
     pub ratio: usize,
+    /// Per-head dim (e.g. 128).
     pub head_dim: usize,
+    /// Overlap coefficient — 2 if ratio==4 (CSA, overlap=true), else 1.
+    /// From `compressor.py:312`.
+    pub coff: usize,
+    /// Hidden size of the layer input (input dim of wkv_gate).
+    pub hidden_size: usize,
 }
 
 impl V4Compressor {
-    /// Construct a uniform-averaging fallback compressor — used at Tier A when
-    /// the checkpoint's compressor weights are absent (synthetic tests, or before
-    /// the rental confirms the real tensor names).
-    pub fn uniform(ratio: usize, head_dim: usize, device: &Device) -> Result<Self> {
-        let mut w = vec![0f32; ratio * head_dim * head_dim];
-        let inv = 1.0 / ratio as f32;
-        for i in 0..ratio {
-            for d in 0..head_dim {
-                w[(i * head_dim + d) * head_dim + d] = inv;
-            }
-        }
-        let weights = Tensor::from_vec(w, (ratio * head_dim, head_dim), device)?;
+    /// Load a real V4 compressor from safetensors at `vb` (typically rooted at
+    /// `model.layers.<i>.self_attn.compressor`). Cites `compressor.py:289-328`.
+    pub fn new(
+        cfg: &DeepSeekV4Config,
+        vb: ShardedVarBuilder,
+        ratio: usize,
+        head_dim: usize,
+    ) -> Result<Self> {
+        let overlap = ratio == 4;
+        let coff = 1 + usize::from(overlap);
+
+        // wkv_gate: hidden_size → 2 * coff * head_dim (compressor.py:317-325).
+        // SGLang publishes this unquantized (`quant_config=None`).
+        let wkv_gate = ReplicatedLayer::new(
+            cfg.hidden_size,
+            2 * coff * head_dim,
+            &None,
+            false,
+            vb.pp("wkv_gate"),
+        )?;
+        // RMSNorm on head_dim (compressor.py:326).
+        let norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("norm"))?;
+
+        // APE — shape [ratio, coff * head_dim] (compressor.py:314).
+        // V4 native publishes a bare parameter ("ape"); HF variant publishes
+        // "ape.weight". Probe both.
+        let ape = if vb.contains_tensor("ape") {
+            vb.get((ratio, coff * head_dim), "ape")?
+        } else if vb.contains_tensor("ape.weight") {
+            vb.get((ratio, coff * head_dim), "ape.weight")?
+        } else {
+            // Synthetic-fallback: zeros (no positional contribution).
+            Tensor::zeros((ratio, coff * head_dim), DType::F32, vb.device())?
+        };
+
         Ok(Self {
-            weights,
+            wkv_gate,
+            norm,
+            ape,
             ratio,
             head_dim,
+            coff,
+            hidden_size: cfg.hidden_size,
         })
     }
 
-    /// Compress KV: `[B, H, T, D]` → `[B, H, T/ratio, D]`. T must be divisible by ratio.
+    /// Construct a uniform-averaging fallback compressor — used at Tier A when
+    /// the checkpoint's compressor weights are absent (synthetic tests, or before
+    /// the rental confirms the real tensor names). Matches the prior behavior
+    /// of `V4Compressor::uniform` for backward-compat with unit tests.
+    ///
+    /// Synthesizes:
+    ///   - `wkv_gate.weight` = zero (so `wkv_gate(x) = 0`)
+    ///   - `norm.weight` = ones
+    ///   - `ape` = zeros
+    /// Then `forward_kv` uses an averaging projection path (no `xs` input)
+    /// instead of the learned-gate path.
+    pub fn uniform(ratio: usize, head_dim: usize, device: &Device) -> Result<Self> {
+        let overlap = ratio == 4;
+        let coff = 1 + usize::from(overlap);
+        // Synthesize a non-functional wkv_gate (so we can construct the struct
+        // without a layer-builder); `forward_kv` does not use it, only
+        // `forward_from_xs` does. Use a tiny 1-d placeholder.
+        let placeholder_weight = Tensor::zeros((1, 1), DType::F32, device)?;
+        // Build a minimal QuantMethod wrapping a zero-weight linear. Since
+        // uniform is only used for tests that call `forward_kv`, the wkv_gate
+        // weight is never invoked — but we still need a valid QuantMethod.
+        use mistralrs_quant::UnquantLinear;
+        let _ = placeholder_weight;
+        let dummy: Arc<dyn QuantMethod> = Arc::new(UnquantLinear::new(
+            mistralrs_quant::QuantMethodConfig::Unquantized(candle_nn::Linear::new(
+                Tensor::zeros((2 * coff * head_dim, 1), DType::F32, device)?,
+                None,
+            )),
+        )?);
+
+        // Norm weight = ones gives identity-RMSNorm-on-unit-variance behavior.
+        let norm_weight = Tensor::ones(head_dim, DType::F32, device)?;
+        let norm = RmsNorm::from_w(norm_weight, 1e-6)?;
+        let ape = Tensor::zeros((ratio, coff * head_dim), DType::F32, device)?;
+
+        Ok(Self {
+            wkv_gate: dummy,
+            norm,
+            ape,
+            ratio,
+            head_dim,
+            coff,
+            hidden_size: 1,
+        })
+    }
+
+    /// Tier-A KV compressor — operates directly on a `[B, H, T, D]` K or V tensor
+    /// to produce `[B, H, T/ratio, D]`. This is the legacy uniform-averaging
+    /// path used by tests and the synthetic-fallback. Real V4 inference uses
+    /// `forward_from_xs` instead.
+    ///
+    /// The semantic equivalent of the SGLang fused kernel (compress_forward) is
+    /// implemented in `forward_from_xs`. This path averages over `ratio`
+    /// consecutive entries per head, which matches the behavior the legacy
+    /// `V4Compressor::uniform` advertised (averaging produces all-ones for all-ones
+    /// input, so all existing unit tests still pass).
     pub fn forward(&self, kv: &Tensor) -> Result<Tensor> {
         let dims = kv.dims();
         if dims.len() != 4 {
-            candle_core::bail!("V4Compressor expects [B, H, T, D], got {:?}", dims);
+            candle_core::bail!("V4Compressor::forward expects [B, H, T, D], got {:?}", dims);
         }
         let (b, h, t, d) = (dims[0], dims[1], dims[2], dims[3]);
         if t % self.ratio != 0 {
             candle_core::bail!("seq_len {t} not divisible by ratio {}", self.ratio);
         }
+        if d != self.head_dim {
+            candle_core::bail!(
+                "V4Compressor::forward: head_dim mismatch {} vs configured {}",
+                d,
+                self.head_dim
+            );
+        }
         let t_new = t / self.ratio;
-        let kv_flat = kv.reshape((b * h * t_new, self.ratio * d))?;
-        let compressed = kv_flat.matmul(&self.weights.to_dtype(kv.dtype())?)?;
-        compressed.reshape((b, h, t_new, d))
+        // Reshape to [B, H, T_new, ratio, D] then mean over the ratio axis.
+        let reshaped = kv.reshape((b, h, t_new, self.ratio, d))?;
+        let summed = reshaped.sum(3)?; // [B, H, T_new, D]
+        let inv = 1.0 / self.ratio as f64;
+        summed.affine(inv, 0.0)
+    }
+
+    /// Real V4 compressor forward path. Cites SGLang `compressor.py:366-392`
+    /// + `compress_forward` (jit_kernel/dsv4/compress_old.py:226-268).
+    ///
+    /// Inputs:
+    ///   - `xs`: `[B, T, hidden_size]` — layer input (same tensor that goes
+    ///     into Q/KV projections).
+    ///
+    /// Output:
+    ///   - `[B, T_c, head_dim]` where `T_c = T / ratio`. T must be divisible.
+    ///
+    /// Math (per the fused kernel, conceptually):
+    ///   1. `wkv = wkv_gate(xs)` → `[B, T, 2 * coff * head_dim]`
+    ///   2. split last axis into `(gate, val)`, each `[B, T, coff * head_dim]`
+    ///   3. `score = sigmoid(gate) * val`
+    ///   4. group along T into windows of size `ratio`; add `ape[pos_in_window]`
+    ///      to each row's slice; sum (or concat for overlap) across the window
+    ///   5. reshape to `[B * T_c * coff, head_dim]`, apply RMSNorm, sum out `coff`
+    ///   6. return as `[B, T_c, head_dim]`
+    pub fn forward_from_xs(&self, xs: &Tensor) -> Result<Tensor> {
+        let dims = xs.dims();
+        if dims.len() != 3 {
+            candle_core::bail!(
+                "V4Compressor::forward_from_xs expects [B, T, hidden], got {:?}",
+                dims
+            );
+        }
+        let (b, t, _hid) = (dims[0], dims[1], dims[2]);
+        if t % self.ratio != 0 {
+            candle_core::bail!(
+                "V4Compressor: seq_len {t} not divisible by ratio {}",
+                self.ratio
+            );
+        }
+        let t_c = t / self.ratio;
+        let work_dtype = xs.dtype();
+
+        // 1+2+3. gate * val via wkv_gate + split.
+        let wkv = self.wkv_gate.forward_autocast(xs)?; // [B, T, 2 * coff * head_dim]
+        let split = wkv.split(
+            &[self.coff * self.head_dim, self.coff * self.head_dim],
+            D::Minus1,
+        )?;
+        let gate = split[0].clone();
+        let val = split[1].clone();
+        let score = (candle_nn::ops::sigmoid(&gate)? * val)?; // [B, T, coff*head_dim]
+
+        // 4. Add APE per-position-in-window, then aggregate across the window.
+        // Reshape to [B, T_c, ratio, coff*head_dim], broadcast-add ape (shape
+        // [ratio, coff*head_dim]) along the ratio axis.
+        let score_grouped = score.reshape((b, t_c, self.ratio, self.coff * self.head_dim))?;
+        let ape = self
+            .ape
+            .to_dtype(work_dtype)?
+            .reshape((1, 1, self.ratio, self.coff * self.head_dim))?;
+        let score_grouped = score_grouped.broadcast_add(&ape)?;
+        // Aggregate the ratio axis by sum (matches the kernel's accumulation).
+        let aggregated = score_grouped.sum(2)?; // [B, T_c, coff*head_dim]
+
+        // 5. RMSNorm on head_dim axis, then sum out coff.
+        let flat = aggregated.reshape((b * t_c * self.coff, self.head_dim))?;
+        let normed = flat.apply(&self.norm)?;
+        let collapsed = normed
+            .reshape((b * t_c, self.coff, self.head_dim))?
+            .sum(1)?; // [B*T_c, head_dim]
+
+        collapsed.reshape((b, t_c, self.head_dim))
     }
 }
 
@@ -285,6 +481,9 @@ struct Attention {
     wo_a: Arc<dyn QuantMethod>,
     /// V4 grouped-LoRA o_proj part B: [o_groups*o_lora_rank → hidden_size]
     wo_b: Arc<dyn QuantMethod>,
+    /// RoPE for this layer. Standard layers use `rope_theta`; compress layers
+    /// use `compress_rope_theta` (RUN-165, SGLang `deepseek_v4.py:220`).
+    /// The caller (`DeepSeekV4::new`) picks the right one before constructing.
     rotary_emb: Arc<DeepSeekV2RotaryEmbedding>,
     cfg: DeepSeekV4Config,
     q_head_dim: usize,
@@ -293,16 +492,34 @@ struct Attention {
     num_attention_heads: usize,
     mla_weights: MlaWeights,
     /// V4 per-layer compression dispatch. CompressRatio::Standard means dense MLA;
-    /// Csa (ratio=4) and Hca (ratio=128) dispatch through arc_engine::dsv4.
+    /// Csa (ratio=4) and Hca (ratio=128) dispatch through V4-specific paths.
     compress_ratio: CompressRatio,
-    /// V4 K-compressor (loaded only on compress layers).
+    /// V4 KV compressor (loaded only on compress layers). Operates on the layer
+    /// input `xs` to produce a compressed K representation. SGLang has a
+    /// single `compressor` per attention layer (shared by K/V), so we keep one.
+    /// We retain `compressor_v` for the legacy averaging tests; for real V4
+    /// inference both branches use the same `compressor_k` and downstream
+    /// kv_b_proj reshape is what separates K from V.
     compressor_k: Option<V4Compressor>,
-    /// V4 V-compressor (loaded only on compress layers). Shares structure with K.
+    /// Legacy V-side compressor, kept for backward-compat with the existing
+    /// `compress_kv` API and unit tests. New code should rely on the single
+    /// `compressor_k` (which models the entire learned compressor unit
+    /// per SGLang's `Compressor` class).
     compressor_v: Option<V4Compressor>,
     /// V4 sliding-window size (used by CSA/HCA blending).
     sliding_window: usize,
     /// V4 CSA top-k for token selection (from config.index_topk).
+    #[allow(dead_code)]
     csa_topk: usize,
+    /// V4 learned attention-sink parameter (RUN-166, SGLang `deepseek_v4.py:288`).
+    /// Shape: `[n_heads]` (broadcast to `[1, n_heads, 1, 1]` at use). Added to
+    /// attention logits for the sink token. `None` if the checkpoint does not
+    /// publish this tensor (e.g. synthetic test weights, V3 fallback).
+    attn_sink: Option<Tensor>,
+    /// V4 Lightning Indexer (RUN-167 integration). Only constructed on CSA
+    /// layers (`compress_ratio == Csa`). HCA layers do not have an indexer.
+    /// Wired in via Agent 4's `dsv4_indexer.rs` module when present.
+    indexer: Option<super::dsv4_indexer::V4Indexer>,
 }
 
 impl Attention {
@@ -469,34 +686,98 @@ impl Attention {
         };
 
         // V4 compressor weights — load when compress_ratio != Standard.
-        // Format: model.layers.<i>.self_attn.compressor.weight has shape
-        // [ratio * head_dim, head_dim]. K and V share a compressor in V4
-        // (since after kv_b_proj the K and V are interleaved in a single tensor).
-        // For Tier A: try to load from checkpoint; fall back to uniform averaging
-        // if the tensor isn't present (e.g., synthetic test weights).
+        // Per SGLang (deepseek_v4.py:263-276) only compress layers have a
+        // `compressor` sub-module. Tensor names: `compressor.wkv_gate.weight`,
+        // `compressor.norm.weight`, `compressor.ape`.
+        //
+        // For real V4 checkpoints we call V4Compressor::new which loads from
+        // safetensors. For synthetic-test weights (or any checkpoint that lacks
+        // these tensors), we fall back to V4Compressor::uniform — which keeps
+        // the existing unit tests' averaging semantics intact.
         let (compressor_k, compressor_v) = if compress_ratio != CompressRatio::Standard {
             let device = mapper
                 .device_for(layer_idx, loading_isq)
                 .unwrap_or(&Device::Cpu);
-            let comp_k = V4Compressor::uniform(
-                ratio_int as usize,
-                cfg.v_head_dim,
-                device,
-            )?;
-            let comp_v = V4Compressor::uniform(
-                ratio_int as usize,
-                cfg.v_head_dim,
-                device,
-            )?;
-            (Some(comp_k), Some(comp_v))
+            let comp_vb = mapper.set_device(layer_idx, vb.pp("compressor"), loading_isq);
+            // Probe: does the checkpoint publish a real compressor?
+            // SGLang publishes `wkv_gate.weight` as the canonical signal.
+            let has_real_compressor = comp_vb.contains_tensor("wkv_gate.weight");
+            let comp = if has_real_compressor {
+                V4Compressor::new(cfg, comp_vb, ratio_int as usize, cfg.v_head_dim)?
+            } else {
+                V4Compressor::uniform(ratio_int as usize, cfg.v_head_dim, device)?
+            };
+            // Per SGLang there is ONE compressor unit per layer (not separate
+            // K and V). For backward compat with `compress_kv` we expose it
+            // through both `compressor_k` and `compressor_v` (clones share Arcs).
+            (Some(comp.clone()), Some(comp))
         } else {
             (None, None)
+        };
+
+        // V4 attn_sink — learned `[n_heads]` parameter added to attention logits
+        // for the sink token (SGLang `deepseek_v4.py:288`). Only loaded if
+        // present in the checkpoint; absence is fine for V3-style fallback
+        // and synthetic tests.
+        let attn_sink = if vb.contains_tensor("attn_sink") {
+            // Per SGLang: `nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))`.
+            // Loaded as-is in fp32; broadcast to [1, n_heads, 1, 1] at use.
+            Some(
+                mapper
+                    .set_device(layer_idx, vb.clone(), false)
+                    .get_with_hints_dtype(
+                        cfg.num_attention_heads,
+                        "attn_sink",
+                        Default::default(),
+                        DType::F32,
+                    )?,
+            )
+        } else {
+            None
+        };
+
+        // V4 Lightning Indexer (RUN-167) — only CSA layers have one. HCA layers
+        // do not, per SGLang `deepseek_v4.py:277-286`.
+        let indexer = if compress_ratio == CompressRatio::Csa {
+            // Probe whether the checkpoint actually publishes indexer tensors.
+            // If absent (synthetic tests / pre-rental builds), skip — the
+            // forward path will fall back to dense attention over compressed K.
+            let idx_vb = mapper.set_device(layer_idx, vb.pp("indexer"), loading_isq);
+            if idx_vb.contains_tensor("wq_b.weight") {
+                let device = mapper
+                    .device_for(layer_idx, loading_isq)
+                    .unwrap_or(&Device::Cpu);
+                match super::dsv4_indexer::V4Indexer::new(cfg, idx_vb, device, loading_isq) {
+                    Ok(idx) => Some(idx),
+                    Err(e) => {
+                        tracing::warn!(
+                            "V4 CSA layer {layer_idx}: indexer load failed ({e}), \
+                             falling back to dense-over-compressed"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
         };
 
         let mla_weights = MlaWeights::new(
             paged_attn.is_some(),
             mapper.device_for(layer_idx, loading_isq),
         );
+
+        // SdpaParams.sinks holds the broadcastable form of attn_sink if loaded.
+        // SGLang broadcasts shape [n_heads] -> [1, n_heads, 1, 1] in the attn
+        // backend (sinks_attn dispatch). We do the reshape here once at load
+        // time so the forward path is allocation-free.
+        let sinks_for_sdpa = if let Some(ref s) = attn_sink {
+            Some(s.reshape((1, cfg.num_attention_heads, 1, 1))?)
+        } else {
+            None
+        };
 
         Ok(Self {
             q,
@@ -519,7 +800,7 @@ impl Attention {
                 } else {
                     None
                 },
-                sinks: None,
+                sinks: sinks_for_sdpa,
             },
             mla_weights,
             compress_ratio,
@@ -527,6 +808,8 @@ impl Attention {
             compressor_v,
             sliding_window: cfg.sliding_window,
             csa_topk: cfg.index_topk,
+            attn_sink,
+            indexer,
         })
     }
 

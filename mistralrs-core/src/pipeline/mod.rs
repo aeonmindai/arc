@@ -13,6 +13,8 @@ mod loaders;
 mod macros;
 mod normal;
 mod paths;
+pub mod post_load_hooks;
+mod mtp_pipeline;
 mod processing;
 mod response;
 mod sampling;
@@ -39,6 +41,7 @@ pub(crate) use isq::IsqModelLoader;
 pub use isq::{
     expand_isq_value, parse_isq_value, IsqModel, IsqOrganization, UQFF_MULTI_FILE_DELIMITER,
 };
+pub use post_load_hooks::{register_post_load_hook, PostLoadHook};
 use llguidance::toktrie::TokEnv;
 pub use loaders::{
     AdapterKind, AutoDeviceMapParams, AutoEmbeddingLoader, AutoNormalLoader, AutoVisionLoader,
@@ -1235,6 +1238,14 @@ pub trait Pipeline:
 
     /// Return encoder cache hit/miss counters (hits, misses) if this pipeline has an encoder cache.
     fn encoder_cache_counters(&self) -> Option<(Arc<AtomicUsize>, Arc<AtomicUsize>)> {
+        None
+    }
+
+    /// Return the components needed to construct an [`mtp_pipeline::MtpSpeculativePipeline`]
+    /// over this pipeline. Default: `None` (no MTP support).
+    ///
+    /// `NormalPipeline` overrides to delegate to its underlying [`NormalModel`].
+    fn mtp_decode_kit(&self) -> Option<mtp_pipeline::MtpDecodeKit> {
         None
     }
 }

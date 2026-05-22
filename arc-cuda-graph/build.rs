@@ -10,6 +10,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/cuda/gather_rope.cu");
     println!("cargo:rerun-if-changed=src/cuda/sampling.cu");
+    println!("cargo:rerun-if-changed=src/cuda/sampling_kernel.cu");
     println!("cargo:rerun-if-changed=src/cuda/decode_loop.cu");
     println!("cargo:rerun-if-changed=src/cuda/decode_kernels.cu");
     println!("cargo:rerun-if-changed=src/cuda/gemv_bf16.cu");
