@@ -41,6 +41,7 @@
 //! - Tests demonstrate: smaller reconstruction error than greedy; deterministic
 //!   for fixed input; matches reference on small handcrafted cases.
 
+#[allow(unused_imports)]
 use super::{ALPHABET, K, LUT_SIZE, STATE_MASK, V};
 
 /// Predecessors of state `s` in the trellis: 2^K states sharing low (L-K) bits.

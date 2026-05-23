@@ -457,6 +457,11 @@ pub enum QuantMethodConfig {
         lut: Tensor,
         bias: Option<Tensor>,
         in_features: usize,
+        /// Hadamard incoherence rotation signs [in_features], ±1.0. `None`
+        /// when the layer was quantized without rotation (back-compat).
+        rotation_signs: Option<Tensor>,
+        /// Block size for the block-diagonal Hadamard rotation. 0 disables.
+        rotation_block: usize,
     },
 }
 
