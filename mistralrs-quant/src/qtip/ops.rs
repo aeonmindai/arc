@@ -99,7 +99,7 @@ impl CustomOp3 for QtipDequantize {
         lut_l: &Layout,
     ) -> Result<(candle_core::CudaStorage, Shape)> {
         use crate::{qtip::ffi, utils::slice_ptr};
-        use candle_core::{backend::BackendStorage, CudaStorage};
+        use candle_core::CudaStorage;
 
         if !ffi::HAVE_QTIP_KERNELS {
             candle_core::bail!("QTIP CUDA kernel not compiled");
