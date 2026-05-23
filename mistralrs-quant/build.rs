@@ -46,6 +46,7 @@ fn main() -> Result<(), String> {
     println!("cargo::rustc-check-cfg=cfg(has_blockwise_fp8_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_scalar_fp8_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_vector_fp8_kernels)");
+    println!("cargo::rustc-check-cfg=cfg(has_qtip_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_mxfp4_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_mxfp4_wmma_kernels)");
     // SageAttention SM89/SM90/SM100 INT8 + FP8 kernels (vendored from
@@ -108,6 +109,8 @@ fn main() -> Result<(), String> {
             println!("cargo:rustc-cfg=has_blockwise_fp8_kernels");
             println!("cargo:rustc-cfg=has_scalar_fp8_kernels");
             println!("cargo:rustc-cfg=has_vector_fp8_kernels");
+            // QTIP CUDA dequantize + activation rotation (uses __nv_bfloat16 ops).
+            println!("cargo:rustc-cfg=has_qtip_kernels");
             // WMMA tensor core MXFP4 kernel (FP16/BF16 WMMA requires SM >= 80)
             println!("cargo:rustc-cfg=has_mxfp4_wmma_kernels");
         }
