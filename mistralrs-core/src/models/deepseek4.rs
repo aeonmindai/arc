@@ -85,7 +85,7 @@ use crate::{
     device_map::{DeviceMappedMask, DeviceMapper},
     layers::{
         embedding, Activation, CausalMasker, DeepSeekV2RopeConfig, DeepSeekV2RopeScaling,
-        DeepSeekV2RotaryEmbedding, Mlp, RmsNorm, Sdpa,
+        DeepSeekV2RotaryEmbedding, Mlp, RmsNorm,
     },
     layers_masker::{masked_fill, PastKvLenCache},
     moe::{MoEExperts, MoEExpertsConfig},
@@ -654,16 +654,19 @@ struct Attention {
     num_attention_heads: usize,
     /// Per-TP-rank KV head count (V4: 1 with TP=1).
     num_kv_heads: usize,
-    /// CompressRatio for this layer (audit §1).
+    /// CompressRatio for this layer (audit §1). Used by the dispatch in
+    /// [`super::dsv4_attention::dsv4_attention`] (RUN-155).
     compress_ratio: CompressRatio,
-    /// V4 compressor (loaded only on CSA + HCA layers).
-    #[allow(dead_code)]
+    /// V4 compressor (loaded only on CSA + HCA layers). Consumed by the
+    /// V4 hybrid attention dispatch (RUN-155).
     compressor: Option<V4Compressor>,
-    /// V4 sliding-window size (used by CSA blending; audit §0).
-    #[allow(dead_code)]
+    /// V4 sliding-window size (used by CSA + HCA blending; audit §0).
     sliding_window: usize,
     /// V4 attn_sink — learned `[n_heads]` parameter, an extra softmax
-    /// column. Audit §0 + §2 (SGLang line 204 + 288).
+    /// column. Stored here for residual_tensors() / IsqModel tracking;
+    /// the active forward path threads the same value into
+    /// `sdpa_params.sinks` so SDPA picks it up automatically. Audit §0 +
+    /// §2 (SGLang line 204 + 288).
     #[allow(dead_code)]
     attn_sink: Option<Tensor>,
     /// V4 Lightning Indexer — only on CSA layers (compress_ratio == 4).
@@ -1024,16 +1027,28 @@ impl Attention {
         //    Audit §3 ("absorbed the MLA split into a single fused output").
         let v = k.clone();
 
-        // 5. Attention. All compress_ratio paths currently route through
-        //    SDPA with `n_kv_groups` broadcast. The CSA top-k indexer and
-        //    HCA dense-over-compressed fast paths are tracked in audit §8
-        //    P0 item 9 (follow-up agent vendoring the c4/c128_online
-        //    kernels). The fundamental shape (q: [B, 64, T, 512],
-        //    k: [B, 1, T, 512] → broadcast at kernel) is correct for all
-        //    three dispatch modes; only the K-cache layout differs across
-        //    modes, and that's a kernel-side concern.
+        // 5. Attention dispatch (RUN-155).
+        //
+        // All three dispatch paths (PagedAttention with metadata, dummy PA,
+        // plain SDPA) route through the V4-correct hybrid attention. For
+        // `compress_ratio == Standard` this is plain SDPA — unchanged from
+        // V3 behavior. For CSA / HCA layers we run the main compressed
+        // branch + sliding-window local branch blend (paper §3.2 default
+        // 0.5/0.5; learned scalar deferred to rental cycle — audit §0).
+        //
+        // The PagedAttention path with metadata holds onto the existing
+        // `paged_attn.forward` flow for Standard layers because the K-cache
+        // layout differs at the kernel level; for CSA / HCA layers under PA
+        // we fall back to the dispatch fn over the live K/V tensors so the
+        // forward still produces V4-correct output, accepting that paging
+        // metadata is dropped for the compressed branch. The PA-native
+        // compress kernels are tracked by RUN-167 (audit §8 P0 item 9).
+        let dsv4_cfg = super::dsv4_attention::Dsv4AttentionConfig {
+            compress_ratio: self.compress_ratio,
+            sliding_window: self.sliding_window,
+        };
         let mut attn_out = match &self.paged_attn {
-            Some(paged_attn) => match metadata {
+            Some(paged_attn) if self.compress_ratio == CompressRatio::Standard => match metadata {
                 Some(((key_cache, value_cache, _, _), input_metadata)) => paged_attn.forward(
                     &q,
                     &k,
@@ -1061,15 +1076,34 @@ impl Attention {
                     )?
                 }
             },
+            Some(_paged_attn) => {
+                // CSA / HCA under PagedAttention: bypass paged kernel for
+                // the compressed branch (kernel-side support is RUN-167).
+                // The kv_cache append still happens here so the next decode
+                // step sees the full sequence.
+                let (k_full, v_full) = kv_cache.append(&k, &v)?;
+                super::dsv4_attention::dsv4_attention(
+                    &q,
+                    &k_full,
+                    &v_full,
+                    attention_mask,
+                    flash_params,
+                    self.compressor.as_ref(),
+                    &self.sdpa_params,
+                    dsv4_cfg,
+                )?
+            }
             None => {
                 let (k_cached, v_cached) = kv_cache.append(&k, &v)?;
-                Sdpa.run_attention(
+                super::dsv4_attention::dsv4_attention(
                     &q,
                     &k_cached,
                     &v_cached,
                     attention_mask,
-                    Some(flash_params),
+                    flash_params,
+                    self.compressor.as_ref(),
                     &self.sdpa_params,
+                    dsv4_cfg,
                 )?
             }
         };
