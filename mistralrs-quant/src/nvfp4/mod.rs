@@ -30,12 +30,16 @@ use std::{
 };
 
 use byteorder::{LittleEndian, ReadBytesExt};
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{quantized::GgmlDType, DType, Device, Result, Tensor};
+use candle_nn::Linear;
 
 use crate::{
+    generate_isq, generate_isq_imatrix,
+    hqq::{ISQ_HQQ_DEFAULT_OPT_STEPS, ISQ_HQQ_GROUP_SIZE},
     utils::{deserialize_tensor, serialize_tensor, version_is_compatible, UQFF_VERSION},
+    AfqBits, AfqGroupSize, AfqLayer, FP8Linear, GgufMatMul, HqqAxis, HqqBits, HqqConfig, HqqLayer,
     IsqType, QuantMethod, QuantMethodConfig, QuantizeOntoGuard, QuantizedConfig, QuantizedSerde,
-    QuantizedSerdeType, ShardedVarBuilder,
+    QuantizedSerdeType, ShardedVarBuilder, UnquantLinear,
 };
 
 /// NVFP4 block size: 16 FP4 values per FP8 scale.
@@ -481,13 +485,182 @@ impl QuantMethod for NVFP4Layer {
 
     fn apply_isq(
         self: Arc<Self>,
-        _dtype: Option<IsqType>,
-        _device: Device,
-        _n_quantized: &AtomicUsize,
-        _imatrix_weight: Option<Vec<f32>>,
-        _guard: QuantizeOntoGuard,
+        dtype: Option<IsqType>,
+        device: Device,
+        n_quantized: &AtomicUsize,
+        imatrix_weight: Option<Vec<f32>>,
+        guard: QuantizeOntoGuard,
     ) -> Result<Arc<dyn QuantMethod>> {
-        candle_core::bail!("NVFP4Layer does not support ISQ re-quantization")
+        // Dequantize FP4 -> BF16 once; all ISQ targets re-quantize from this.
+        let weight = self.dequantize_weights()?;
+        match dtype {
+            Some(IsqType::HQQ4 | IsqType::HQQ8) => {
+                let _acquired_quantize_guard = guard.acquire(&device);
+                if imatrix_weight.is_some() {
+                    candle_core::bail!("HQQ does not support imatrix.");
+                }
+
+                n_quantized.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let bits = match dtype.unwrap() {
+                    IsqType::HQQ8 => HqqBits::Eight,
+                    IsqType::HQQ4 => HqqBits::Four,
+                    _ => unreachable!(),
+                };
+                let cfg = HqqConfig {
+                    bits,
+                    group_size: ISQ_HQQ_GROUP_SIZE.try_into()?,
+                    axis: HqqAxis::Zero,
+                    optimization_steps: ISQ_HQQ_DEFAULT_OPT_STEPS,
+                    round_zeros: false,
+                    channel_wise: true,
+                };
+                let res = HqqLayer::quantize(&weight.to_device(&device)?, &device, cfg)?;
+                if let Some(bias) = &self.bias {
+                    let bias = bias
+                        .to_device(&device)?
+                        .to_dtype(res.dtype_and_device().0)?;
+                    Ok(Arc::new(res.with_bias(bias)))
+                } else {
+                    Ok(Arc::new(res))
+                }
+            }
+            Some(IsqType::AFQ2 | IsqType::AFQ3 | IsqType::AFQ4 | IsqType::AFQ6 | IsqType::AFQ8) => {
+                let _acquired_quantize_guard = guard.acquire(&device);
+                if imatrix_weight.is_some() {
+                    candle_core::bail!("AFQ does not support imatrix.");
+                }
+
+                n_quantized.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let bits = match dtype.unwrap() {
+                    IsqType::AFQ8 => AfqBits::Eight,
+                    IsqType::AFQ6 => AfqBits::Six,
+                    IsqType::AFQ4 => AfqBits::Four,
+                    IsqType::AFQ3 => AfqBits::Three,
+                    IsqType::AFQ2 => AfqBits::Two,
+                    _ => unreachable!(),
+                };
+
+                Ok(Arc::new(AfqLayer::new(QuantMethodConfig::Afq {
+                    weight: weight.to_device(&device)?,
+                    bias: self.bias.as_ref().map(|b| b.to_device(&device).unwrap()),
+                    bits,
+                    group_size: AfqGroupSize::default(),
+                })?))
+            }
+            Some(
+                IsqType::Q2K
+                | IsqType::Q3K
+                | IsqType::Q4K
+                | IsqType::Q4_0
+                | IsqType::Q4_1
+                | IsqType::Q5K
+                | IsqType::Q5_0
+                | IsqType::Q5_1
+                | IsqType::Q6K
+                | IsqType::Q8K
+                | IsqType::Q8_0
+                | IsqType::Q8_1,
+            ) => {
+                let dtype: GgmlDType = dtype.unwrap().try_into()?;
+                let res = if let Some(imatrix_weight) = imatrix_weight {
+                    generate_isq_imatrix!(weight, imatrix_weight, device, dtype, n_quantized, guard)
+                } else {
+                    generate_isq!(weight, device, dtype, n_quantized, guard)
+                };
+                Ok(Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                    q_weight: res,
+                    b: self
+                        .bias
+                        .as_ref()
+                        .map(|b| b.to_dtype(DType::F32).unwrap().to_device(&device).unwrap()),
+                })?))
+            }
+            Some(IsqType::F8E4M3) => {
+                let _acquired_quantize_guard = guard.acquire(&device);
+                if imatrix_weight.is_some() {
+                    candle_core::bail!("F8E4M3 does not support imatrix.");
+                }
+
+                let w = weight.to_device(&device)?;
+                let b = if let Some(b) = &self.bias {
+                    Some(b.to_device(&device)?)
+                } else {
+                    None
+                };
+                Ok(Arc::new(FP8Linear::new(QuantMethodConfig::FP8 {
+                    lin: Linear::new(w, b),
+                    dtype: DType::F8E4M3,
+                })?))
+            }
+            Some(IsqType::F8Q8) => {
+                let _acquired_quantize_guard = guard.acquire(&device);
+                if imatrix_weight.is_some() {
+                    candle_core::bail!("F8Q8 does not support imatrix.");
+                }
+
+                let w = weight.to_device(&device)?;
+                let b = if let Some(b) = &self.bias {
+                    Some(b.to_device(&device)?)
+                } else {
+                    None
+                };
+                Ok(Arc::new(crate::F8Q8Linear::from_weight(&w, b)?))
+            }
+            Some(IsqType::MXFP4) => {
+                let _acquired_quantize_guard = guard.acquire(&device);
+                if imatrix_weight.is_some() {
+                    candle_core::bail!("MXFP4 does not support imatrix.");
+                }
+
+                n_quantized.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let w = weight.to_device(&device)?;
+                let b = self
+                    .bias
+                    .as_ref()
+                    .map(|b| b.to_device(&device))
+                    .transpose()?;
+                crate::MXFP4Layer::quantize(&w, b, &device)
+            }
+            Some(IsqType::NVFP4) => {
+                // Re-quantizing FP4 -> FP4 is a no-op for residency; just pass through.
+                let _acquired_quantize_guard = guard.acquire(&device);
+                if imatrix_weight.is_some() {
+                    candle_core::bail!("NVFP4 does not support imatrix.");
+                }
+                Ok(self)
+            }
+            Some(IsqType::QtipBitshift2) => {
+                let _acquired_quantize_guard = guard.acquire(&device);
+                if imatrix_weight.is_some() {
+                    candle_core::bail!("QTIP does not support imatrix.");
+                }
+                n_quantized.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let bias = self
+                    .bias
+                    .as_ref()
+                    .map(|b| b.to_device(&device))
+                    .transpose()?;
+                crate::QtipLayer::quantize_with_mode(
+                    &weight.to_device(&device)?,
+                    bias,
+                    &device,
+                    crate::QtipMode::Viterbi,
+                )
+            }
+            None => {
+                let _acquired_quantize_guard = guard.acquire(&device);
+                // Ignore imatrix altogether
+                let w = weight.to_device(&device)?;
+                let b = if let Some(b) = &self.bias {
+                    Some(b.to_device(&device)?)
+                } else {
+                    None
+                };
+                Ok(Arc::new(UnquantLinear::new(
+                    QuantMethodConfig::Unquantized(Linear::new(w, b)),
+                )?))
+            }
+        }
     }
 }
 
