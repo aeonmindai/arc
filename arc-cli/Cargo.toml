@@ -37,6 +37,7 @@ indexmap.workspace = true
 # crossterm 0.28 — we re-export `ratatui::crossterm` in the bench module so
 # the workspace's crossterm 0.29 (used by rustyline) doesn't conflict.
 ratatui = "0.29"
+either = "1"
 
 [features]
 default = []
