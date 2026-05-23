@@ -7,7 +7,7 @@ homepage = "https://runcrate.ai/arc"
 repository = "https://github.com/aeonmindai/arc"
 keywords = ["llm", "quantization", "turboquant", "kv-cache", "compression"]
 categories = ["science", "algorithms"]
-license = "BSL-1.1"
+license = "Apache-2.0"
 rust-version.workspace = true
 
 [dependencies]

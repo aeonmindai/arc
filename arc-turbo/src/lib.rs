@@ -15,6 +15,6 @@
 // Re-export algorithm primitives from mistralrs-quant
 pub use mistralrs_quant::turboquant::*;
 
-// Arc's TurboQuant cache (BSL licensed)
+// Arc's TurboQuant cache (Apache-2.0 licensed)
 pub mod cache;
 pub use cache::{TurboQuantCache, TurboQuantSingleCache};

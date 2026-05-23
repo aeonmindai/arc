@@ -261,11 +261,11 @@ Embedding Gemma, Qwen 3 Embedding
 Arc uses a thin-wrapper architecture over mistral.rs for upstream compatibility:
 
 ```
-arc-cli/          Arc binary (BSL-1.1)
-arc-engine/       Engine crate — model dispatchers, scheduling, speculative decoding (BSL-1.1)
-arc-cuda-graph/   CUDA graph capture, GPU sampling, autonomous decode (BSL-1.1)
-arc-turbo/        TurboQuant: codebooks, WHT, cache, kernels (BSL-1.1)
-arc-tools/        Operational tooling — rental preflight, weight validation (BSL-1.1)
+arc-cli/          Arc binary (Apache-2.0)
+arc-engine/       Engine crate — model dispatchers, scheduling, speculative decoding (Apache-2.0)
+arc-cuda-graph/   CUDA graph capture, GPU sampling, autonomous decode (Apache-2.0)
+arc-turbo/        TurboQuant: codebooks, WHT, cache, kernels (Apache-2.0)
+arc-tools/        Operational tooling — rental preflight, weight validation (Apache-2.0)
 mistralrs-*/      Upstream mistral.rs (MIT) — untouched, merge-compatible
 ```
 
@@ -345,10 +345,10 @@ cargo install --path arc-cli --features <your-features>
 
 ## License
 
-- **`arc-*` crates**: [Business Source License 1.1](LICENSE-BSL) — free for non-commercial and sub-$1M revenue use. Commercial inference-as-a-service requires a license from Aeonmind.
+- **`arc-*` crates**: [Apache License 2.0](LICENSE-APACHE) — permissive, commercial and non-commercial use without restriction.
 - **`mistralrs-*` crates**: [MIT](LICENSE-MIT) — upstream open source.
 
-See [NOTICE](NOTICE) for details. For commercial licensing: support@runcrate.ai
+See [NOTICE](NOTICE) for attribution details.
 
 ## Credits
 

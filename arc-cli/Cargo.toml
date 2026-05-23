@@ -7,7 +7,7 @@ homepage = "https://runcrate.ai/arc"
 repository = "https://github.com/aeonmindai/arc"
 keywords = ["llm", "inference", "turboquant", "ai", "serving"]
 categories = ["science", "command-line-utilities"]
-license = "BSL-1.1"
+license = "Apache-2.0"
 rust-version.workspace = true
 default-run = "arc"
 
