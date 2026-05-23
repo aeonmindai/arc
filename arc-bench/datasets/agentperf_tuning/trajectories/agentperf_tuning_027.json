@@ -1,0 +1,67 @@
+{
+  "id": "agentperf_tuning_027",
+  "language": "java",
+  "source": {
+    "repo": "github.com/google/guava",
+    "license": "Apache-2.0",
+    "commit": "4d2f9c1"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "In UserService.findEmail(long id), refactor the nested if/else null checks into a single Optional chain.",
+      "input_tokens_est": 626
+    },
+    {
+      "role": "assistant",
+      "content": "Reading.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "src/main/java/com/acme/users/UserService.java"
+          }
+        }
+      ],
+      "input_tokens_est": 626,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "package com.acme.users;\nimport java.util.Optional;\n\npublic class UserService {\n    private final UserRepo repo;\n    public UserService(UserRepo r) { this.repo = r; }\n\n    public String findEmail(long id) {\n        User u = repo.find(id);\n        if (u != null) {\n            Profile p = u.profile();\n            if (p != null) {\n                String e = p.email();\n                if (e != null && !e.isBlank()) return e.toLowerCase();\n            }\n        }\n        return \"unknown\";\n    }\n}\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Refactoring.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "package com.acme.users;\nimport java.util.Optional;\n\npublic class UserService {\n    private final UserRepo repo;\n    public UserService(UserRepo r) { this.repo = r; }\n\n    public String findEmail(long id) {\n        return Optional.ofNullable(repo.find(id))\n                .map(User::profile)\n                .map(Profile::email)\n                .filter(e -> !e.isBlank())\n                .map(String::toLowerCase)\n                .orElse(\"unknown\");\n    }\n}\n",
+            "path": "src/main/java/com/acme/users/UserService.java"
+          }
+        }
+      ],
+      "input_tokens_est": 769,
+      "output_tokens_est": 33
+    },
+    {
+      "role": "tool",
+      "content": "wrote 414 bytes to src/main/java/com/acme/users/UserService.java",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "Single Optional chain; behavior identical.",
+      "input_tokens_est": 927,
+      "output_tokens_est": 11
+    }
+  ]
+}

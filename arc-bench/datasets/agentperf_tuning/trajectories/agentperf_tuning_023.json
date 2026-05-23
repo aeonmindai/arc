@@ -1,0 +1,47 @@
+{
+  "id": "agentperf_tuning_023",
+  "language": "cpp",
+  "source": {
+    "repo": "github.com/progschj/ThreadPool",
+    "license": "Zlib",
+    "commit": "9a42ec1"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Add a header-only ThreadPool in include/thread_pool.h. Constructor takes worker count; submit(F&& f) returns std::future<void>. Use std::jthread.",
+      "input_tokens_est": 637
+    },
+    {
+      "role": "assistant",
+      "content": "Writing.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "write_file",
+          "args": {
+            "contents": "#pragma once\n#include <condition_variable>\n#include <functional>\n#include <future>\n#include <memory>\n#include <mutex>\n#include <queue>\n#include <stop_token>\n#include <thread>\n#include <vector>\n\nclass ThreadPool {\npublic:\n    explicit ThreadPool(std::size_t n) {\n        workers_.reserve(n);\n        for (std::size_t i = 0; i < n; ++i) {\n            workers_.emplace_back([this](std::stop_token st) { worker(st); });\n        }\n    }\n    ~ThreadPool() {\n        for (auto& w : workers_) w.request_stop();\n        cv_.notify_all();\n    }\n    std::future<void> submit(std::function<void()> f) {\n        auto task = std::make_shared<std::packaged_task<void()>>(std::move(f));\n        auto fut = task->get_future();\n        {\n            std::lock_guard lk(mu_);\n            queue_.emplace([task] { (*task)(); });\n        }\n        cv_.notify_one();\n        return fut;\n    }\nprivate:\n    void worker(std::stop_token st) {\n        while (!st.stop_requested()) {\n            std::function<void()> job;\n            {\n                std::unique_lock lk(mu_);\n                cv_.wait(lk, [&] { return !queue_.empty() || st.stop_requested(); });\n                if (st.stop_requested() && queue_.empty()) return;\n                job = std::move(queue_.front());\n                queue_.pop();\n            }\n            job();\n        }\n    }\n    std::vector<std::jthread> workers_;\n    std::mutex mu_;\n    std::condition_variable cv_;\n    std::queue<std::function<void()>> queue_;\n};\n",
+            "path": "include/thread_pool.h"
+          }
+        }
+      ],
+      "input_tokens_est": 637,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "wrote 1408 bytes to include/thread_pool.h",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Header-only thread pool ready. Workers are std::jthread; the destructor requests stop and the condition variable wakes idle workers so they observe the stop token.",
+      "input_tokens_est": 1044,
+      "output_tokens_est": 41
+    }
+  ]
+}

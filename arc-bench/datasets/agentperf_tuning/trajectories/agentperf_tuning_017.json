@@ -1,0 +1,67 @@
+{
+  "id": "agentperf_tuning_017",
+  "language": "go",
+  "source": {
+    "repo": "github.com/grpc/grpc-go",
+    "license": "Apache-2.0",
+    "commit": "f3b8d22"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "fetchOrders in client.go takes a context but doesn't propagate a per-call timeout. Add a 3s deadline derived from the caller's context, and return the underlying error wrapped with %w.",
+      "input_tokens_est": 646
+    },
+    {
+      "role": "assistant",
+      "content": "Reading.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "client.go"
+          }
+        }
+      ],
+      "input_tokens_est": 646,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "package orders\n\nimport (\n\t\"context\"\n\t\"encoding/json\"\n\t\"net/http\"\n)\n\nfunc fetchOrders(ctx context.Context, url string) ([]Order, error) {\n\treq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)\n\tif err != nil { return nil, err }\n\tresp, err := http.DefaultClient.Do(req)\n\tif err != nil { return nil, err }\n\tdefer resp.Body.Close()\n\tvar out []Order\n\treturn out, json.NewDecoder(resp.Body).Decode(&out)\n}\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Adding context.WithTimeout.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "package orders\n\nimport (\n\t\"context\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"net/http\"\n\t\"time\"\n)\n\nfunc fetchOrders(ctx context.Context, url string) ([]Order, error) {\n\tctx, cancel := context.WithTimeout(ctx, 3*time.Second)\n\tdefer cancel()\n\treq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)\n\tif err != nil { return nil, fmt.Errorf(\"build request: %w\", err) }\n\tresp, err := http.DefaultClient.Do(req)\n\tif err != nil { return nil, fmt.Errorf(\"do request: %w\", err) }\n\tdefer resp.Body.Close()\n\tvar out []Order\n\tif err := json.NewDecoder(resp.Body).Decode(&out); err != nil {\n\t\treturn nil, fmt.Errorf(\"decode response: %w\", err)\n\t}\n\treturn out, nil\n}\n",
+            "path": "client.go"
+          }
+        }
+      ],
+      "input_tokens_est": 760,
+      "output_tokens_est": 37
+    },
+    {
+      "role": "tool",
+      "content": "wrote 614 bytes to client.go",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "fetchOrders now derives a 3s timeout from the caller's ctx and wraps every error with a descriptive %w.",
+      "input_tokens_est": 962,
+      "output_tokens_est": 26
+    }
+  ]
+}

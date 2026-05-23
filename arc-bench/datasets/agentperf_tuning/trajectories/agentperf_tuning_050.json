@@ -1,0 +1,67 @@
+{
+  "id": "agentperf_tuning_050",
+  "language": "csharp",
+  "source": {
+    "repo": "github.com/xunit/xunit",
+    "license": "Apache-2.0",
+    "commit": "2.9"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Convert StringReverseTests.cs from three Fact methods into a single xUnit Theory backed by InlineData.",
+      "input_tokens_est": 626
+    },
+    {
+      "role": "assistant",
+      "content": "Reading.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "tests/StringReverseTests.cs"
+          }
+        }
+      ],
+      "input_tokens_est": 626,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "using Xunit;\npublic class StringReverseTests {\n  [Fact] public void Empty()  { Assert.Equal(\"\", StringUtil.Reverse(\"\")); }\n  [Fact] public void Ascii()  { Assert.Equal(\"olleh\", StringUtil.Reverse(\"hello\")); }\n  [Fact] public void Accent() { Assert.Equal(\"olléh\", StringUtil.Reverse(\"héllo\")); }\n}\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Refactoring.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "using Xunit;\npublic class StringReverseTests {\n  [Theory]\n  [InlineData(\"\", \"\")]\n  [InlineData(\"hello\", \"olleh\")]\n  [InlineData(\"héllo\", \"olléh\")]\n  public void Reverse_examples(string input, string expected) {\n    Assert.Equal(expected, StringUtil.Reverse(input));\n  }\n}\n",
+            "path": "tests/StringReverseTests.cs"
+          }
+        }
+      ],
+      "input_tokens_est": 714,
+      "output_tokens_est": 33
+    },
+    {
+      "role": "tool",
+      "content": "wrote 308 bytes to tests/StringReverseTests.cs",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "Three facts collapsed into one Theory with three rows.",
+      "input_tokens_est": 818,
+      "output_tokens_est": 14
+    }
+  ]
+}

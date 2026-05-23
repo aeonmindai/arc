@@ -1,0 +1,29 @@
+[package]
+name = "arc-bench"
+version.workspace = true
+edition.workspace = true
+description = "Arc benchmark harness — AA-AgentPerf trajectory dataset and multi-turn replay engine"
+homepage = "https://runcrate.ai/arc"
+repository = "https://github.com/aeonmindai/arc"
+keywords = ["llm", "benchmark", "agentperf", "replay", "ai"]
+categories = ["science", "command-line-utilities"]
+license = "Apache-2.0"
+rust-version.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[[bin]]
+name = "generate-agentperf-tuning"
+path = "src/bin/generate_dataset.rs"
+doc = false

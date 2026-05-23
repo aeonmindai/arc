@@ -1,0 +1,67 @@
+{
+  "id": "agentperf_tuning_015",
+  "language": "typescript",
+  "source": {
+    "repo": "github.com/prisma/prisma",
+    "license": "Apache-2.0",
+    "commit": "f4e7c8a"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "In services/billing.ts, wrap chargeOrder and writeLedger in a Prisma interactive transaction with isolation level Serializable. Roll back on either failure.",
+      "input_tokens_est": 639
+    },
+    {
+      "role": "assistant",
+      "content": "Reading the service.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "services/billing.ts"
+          }
+        }
+      ],
+      "input_tokens_est": 639,
+      "output_tokens_est": 35
+    },
+    {
+      "role": "tool",
+      "content": "import { prisma } from \"../db\";\n\nexport async function chargeAndLedger(orderId: string, amountCents: number) {\n  await prisma.charge.create({ data: { orderId, amountCents } });\n  await prisma.ledger.create({ data: { orderId, amountCents, kind: \"charge\" } });\n}\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Wrapping in $transaction.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "import { Prisma } from \"@prisma/client\";\nimport { prisma } from \"../db\";\n\nexport async function chargeAndLedger(orderId: string, amountCents: number) {\n  return prisma.$transaction(\n    async (tx) => {\n      await tx.charge.create({ data: { orderId, amountCents } });\n      await tx.ledger.create({ data: { orderId, amountCents, kind: \"charge\" } });\n    },\n    { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }\n  );\n}\n",
+            "path": "services/billing.ts"
+          }
+        }
+      ],
+      "input_tokens_est": 719,
+      "output_tokens_est": 37
+    },
+    {
+      "role": "tool",
+      "content": "wrote 458 bytes to services/billing.ts",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "chargeAndLedger now runs in a single serializable interactive transaction; either insert failing rolls back the other.",
+      "input_tokens_est": 862,
+      "output_tokens_est": 30
+    }
+  ]
+}

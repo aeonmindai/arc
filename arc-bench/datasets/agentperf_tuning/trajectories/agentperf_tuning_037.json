@@ -1,0 +1,67 @@
+{
+  "id": "agentperf_tuning_037",
+  "language": "php",
+  "source": {
+    "repo": "github.com/sebastianbergmann/phpunit",
+    "license": "BSD-3-Clause",
+    "commit": "10.5"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Refactor StringReverseTest.php from three separate test methods into a single test method backed by a data provider.",
+      "input_tokens_est": 629
+    },
+    {
+      "role": "assistant",
+      "content": "Reading.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "tests/StringReverseTest.php"
+          }
+        }
+      ],
+      "input_tokens_est": 629,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "<?php\nuse PHPUnit\\Framework\\TestCase;\n\nclass StringReverseTest extends TestCase {\n    public function testEmpty()  { $this->assertSame('', str_reverse_unicode('')); }\n    public function testAscii()  { $this->assertSame('olleh', str_reverse_unicode('hello')); }\n    public function testAccent() { $this->assertSame('olléh', str_reverse_unicode('héllo')); }\n}\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Refactoring.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "<?php\nuse PHPUnit\\Framework\\Attributes\\DataProvider;\nuse PHPUnit\\Framework\\TestCase;\n\nclass StringReverseTest extends TestCase {\n    public static function cases(): array {\n        return [\n            'empty'   => ['', ''],\n            'ascii'   => ['hello', 'olleh'],\n            'accent'  => ['héllo', 'olléh'],\n        ];\n    }\n\n    #[DataProvider('cases')]\n    public function testReverse(string $in, string $want): void {\n        $this->assertSame($want, str_reverse_unicode($in));\n    }\n}\n",
+            "path": "tests/StringReverseTest.php"
+          }
+        }
+      ],
+      "input_tokens_est": 733,
+      "output_tokens_est": 33
+    },
+    {
+      "role": "tool",
+      "content": "wrote 524 bytes to tests/StringReverseTest.php",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "Three tests collapsed into one data-driven test using PHPUnit 10's attribute syntax.",
+      "input_tokens_est": 893,
+      "output_tokens_est": 21
+    }
+  ]
+}

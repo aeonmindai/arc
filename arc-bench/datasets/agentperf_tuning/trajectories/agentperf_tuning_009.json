@@ -1,0 +1,67 @@
+{
+  "id": "agentperf_tuning_009",
+  "language": "python",
+  "source": {
+    "repo": "github.com/sqlalchemy/sqlalchemy",
+    "license": "MIT",
+    "commit": "1a4b0c6"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Add a SQLAlchemy context-manager `db_session` in db.py that yields a Session, commits on success, and rolls back on exception. Use the existing engine.",
+      "input_tokens_est": 638
+    },
+    {
+      "role": "assistant",
+      "content": "Reading the file.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "db.py"
+          }
+        }
+      ],
+      "input_tokens_est": 638,
+      "output_tokens_est": 35
+    },
+    {
+      "role": "tool",
+      "content": "from sqlalchemy import create_engine\nfrom sqlalchemy.orm import sessionmaker, DeclarativeBase\n\nengine = create_engine(\"sqlite:///app.db\", future=True)\nSessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)\n\nclass Base(DeclarativeBase):\n    pass\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Adding the contextmanager.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "from contextlib import contextmanager\nfrom typing import Iterator\nfrom sqlalchemy import create_engine\nfrom sqlalchemy.orm import sessionmaker, DeclarativeBase, Session\n\nengine = create_engine(\"sqlite:///app.db\", future=True)\nSessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)\n\nclass Base(DeclarativeBase):\n    pass\n\n@contextmanager\ndef db_session() -> Iterator[Session]:\n    session: Session = SessionLocal()\n    try:\n        yield session\n        session.commit()\n    except Exception:\n        session.rollback()\n        raise\n    finally:\n        session.close()\n",
+            "path": "db.py"
+          }
+        }
+      ],
+      "input_tokens_est": 718,
+      "output_tokens_est": 37
+    },
+    {
+      "role": "tool",
+      "content": "wrote 596 bytes to db.py",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "Done. Use as `with db_session() as s: s.add(obj)` — commit on success, rollback on exception, always close.",
+      "input_tokens_est": 898,
+      "output_tokens_est": 27
+    }
+  ]
+}

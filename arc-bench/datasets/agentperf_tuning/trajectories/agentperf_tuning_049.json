@@ -1,0 +1,87 @@
+{
+  "id": "agentperf_tuning_049",
+  "language": "csharp",
+  "source": {
+    "repo": "github.com/dotnet/efcore",
+    "license": "MIT",
+    "commit": "8.0"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Add a `LastLoginAt` DateTime? column to the User entity and produce an EF Core migration named AddUserLastLoginAt.",
+      "input_tokens_est": 629
+    },
+    {
+      "role": "assistant",
+      "content": "Reading the entity.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "Models/User.cs"
+          }
+        }
+      ],
+      "input_tokens_est": 629,
+      "output_tokens_est": 35
+    },
+    {
+      "role": "tool",
+      "content": "namespace Acme.Models;\npublic class User {\n    public long Id { get; set; }\n    public string Email { get; set; } = \"\";\n}\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Updating the entity.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "namespace Acme.Models;\npublic class User {\n    public long Id { get; set; }\n    public string Email { get; set; } = \"\";\n    public DateTime? LastLoginAt { get; set; }\n}\n",
+            "path": "Models/User.cs"
+          }
+        }
+      ],
+      "input_tokens_est": 673,
+      "output_tokens_est": 35
+    },
+    {
+      "role": "tool",
+      "content": "wrote 198 bytes to Models/User.cs",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "Generating the migration.",
+      "tool_calls": [
+        {
+          "id": "call_003",
+          "name": "run_shell",
+          "args": {
+            "cmd": "dotnet ef migrations add AddUserLastLoginAt"
+          }
+        }
+      ],
+      "input_tokens_est": 742,
+      "output_tokens_est": 37
+    },
+    {
+      "role": "tool",
+      "content": "Build succeeded.\nDone. To undo this action, use 'ef migrations remove'\n",
+      "tool_call_id": "call_003"
+    },
+    {
+      "role": "assistant",
+      "content": "Migration generated under Migrations/. Apply with `dotnet ef database update`.",
+      "input_tokens_est": 782,
+      "output_tokens_est": 20
+    }
+  ]
+}

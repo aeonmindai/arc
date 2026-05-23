@@ -1,0 +1,67 @@
+{
+  "id": "agentperf_tuning_018",
+  "language": "go",
+  "source": {
+    "repo": "github.com/golang/sync",
+    "license": "BSD-3-Clause",
+    "commit": "8a2f4b9"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "In ingest/parallel.go we iterate sources sequentially. Use golang.org/x/sync/errgroup to fan out one goroutine per source, return the first error, and cancel siblings via the group's context.",
+      "input_tokens_est": 648
+    },
+    {
+      "role": "assistant",
+      "content": "Reading.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "ingest/parallel.go"
+          }
+        }
+      ],
+      "input_tokens_est": 648,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "package ingest\n\nimport \"context\"\n\nfunc ingestAll(ctx context.Context, sources []string, fetch func(context.Context, string) error) error {\n\tfor _, s := range sources {\n\t\tif err := fetch(ctx, s); err != nil { return err }\n\t}\n\treturn nil\n}\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Switching to errgroup.WithContext.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "package ingest\n\nimport (\n\t\"context\"\n\n\t\"golang.org/x/sync/errgroup\"\n)\n\nfunc ingestAll(ctx context.Context, sources []string, fetch func(context.Context, string) error) error {\n\tg, gctx := errgroup.WithContext(ctx)\n\tfor _, s := range sources {\n\t\ts := s\n\t\tg.Go(func() error { return fetch(gctx, s) })\n\t}\n\treturn g.Wait()\n}\n",
+            "path": "ingest/parallel.go"
+          }
+        }
+      ],
+      "input_tokens_est": 719,
+      "output_tokens_est": 39
+    },
+    {
+      "role": "tool",
+      "content": "wrote 348 bytes to ingest/parallel.go",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "Sources now fan out concurrently; the group context cancels siblings as soon as one fetch errors.",
+      "input_tokens_est": 838,
+      "output_tokens_est": 25
+    }
+  ]
+}

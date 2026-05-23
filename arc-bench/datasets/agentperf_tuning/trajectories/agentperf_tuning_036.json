@@ -1,0 +1,47 @@
+{
+  "id": "agentperf_tuning_036",
+  "language": "php",
+  "source": {
+    "repo": "github.com/symfony/symfony",
+    "license": "MIT",
+    "commit": "7.x"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Create a Symfony console command `app:purge-expired` that deletes Token rows where expires_at < now(). Use EntityManagerInterface DI.",
+      "input_tokens_est": 634
+    },
+    {
+      "role": "assistant",
+      "content": "Writing.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "write_file",
+          "args": {
+            "contents": "<?php\nnamespace App\\Command;\n\nuse App\\Entity\\Token;\nuse Doctrine\\ORM\\EntityManagerInterface;\nuse Symfony\\Component\\Console\\Attribute\\AsCommand;\nuse Symfony\\Component\\Console\\Command\\Command;\nuse Symfony\\Component\\Console\\Input\\InputInterface;\nuse Symfony\\Component\\Console\\Output\\OutputInterface;\n\n#[AsCommand(name: 'app:purge-expired', description: 'Delete expired tokens')]\nfinal class PurgeExpiredCommand extends Command {\n    public function __construct(private EntityManagerInterface $em) { parent::__construct(); }\n\n    protected function execute(InputInterface $input, OutputInterface $output): int {\n        $deleted = $this->em->createQuery(\n            'DELETE FROM ' . Token::class . ' t WHERE t.expiresAt < :now'\n        )->setParameter('now', new \\DateTimeImmutable())->execute();\n        $output->writeln(sprintf('Deleted %d tokens', $deleted));\n        return Command::SUCCESS;\n    }\n}\n",
+            "path": "src/Command/PurgeExpiredCommand.php"
+          }
+        }
+      ],
+      "input_tokens_est": 634,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "wrote 1030 bytes to src/Command/PurgeExpiredCommand.php",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Command registered via `#[AsCommand]`. Run with `bin/console app:purge-expired`.",
+      "input_tokens_est": 903,
+      "output_tokens_est": 20
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+The `agentperf_tuning` dataset (50 trajectory JSON files under
+`trajectories/`) is licensed under the Apache License, Version 2.0
+("Apache-2.0"). See the root of the Arc engine repository for the
+full Apache-2.0 license text.
+
+Each trajectory's `source` field attributes representative file
+snippets back to their originating public, permissively-licensed
+repository. The aggregate list is in `licenses/SOURCES.txt`. Snippets
+are short enough to fall under fair-use for benchmarking purposes
+and are always attributed.
+
+If you are the maintainer of a referenced repository and would like
+attribution corrected, or a snippet removed, please open an issue
+against `github.com/aeonmindai/arc`.

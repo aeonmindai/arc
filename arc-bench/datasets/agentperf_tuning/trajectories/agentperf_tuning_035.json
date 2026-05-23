@@ -1,0 +1,67 @@
+{
+  "id": "agentperf_tuning_035",
+  "language": "php",
+  "source": {
+    "repo": "github.com/laravel/framework",
+    "license": "MIT",
+    "commit": "11.x"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Add a local scope `published` to the Article Eloquent model that filters `published_at` <= now() AND `status` = 'published'.",
+      "input_tokens_est": 631
+    },
+    {
+      "role": "assistant",
+      "content": "Reading.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "app/Models/Article.php"
+          }
+        }
+      ],
+      "input_tokens_est": 631,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\n\nclass Article extends Model {\n    protected $fillable = ['title', 'body', 'status', 'published_at'];\n}\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Writing.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Builder;\nuse Illuminate\\Database\\Eloquent\\Model;\n\nclass Article extends Model {\n    protected $fillable = ['title', 'body', 'status', 'published_at'];\n\n    public function scopePublished(Builder $query): Builder {\n        return $query->where('status', 'published')\n                     ->where('published_at', '<=', now());\n    }\n}\n",
+            "path": "app/Models/Article.php"
+          }
+        }
+      ],
+      "input_tokens_est": 687,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "wrote 410 bytes to app/Models/Article.php",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "Use as `Article::published()->get()`.",
+      "input_tokens_est": 817,
+      "output_tokens_est": 10
+    }
+  ]
+}

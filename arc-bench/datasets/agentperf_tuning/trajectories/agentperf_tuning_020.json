@@ -1,0 +1,67 @@
+{
+  "id": "agentperf_tuning_020",
+  "language": "go",
+  "source": {
+    "repo": "github.com/stretchr/testify",
+    "license": "MIT",
+    "commit": "1f2c8e0"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Convert the existing tests in str_test.go into a table-driven form using t.Run subtests. Keep behavior identical.",
+      "input_tokens_est": 629
+    },
+    {
+      "role": "assistant",
+      "content": "Reading.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "str_test.go"
+          }
+        }
+      ],
+      "input_tokens_est": 629,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "package strs\n\nimport \"testing\"\n\nfunc TestReverseEmpty(t *testing.T) {\n\tif got := Reverse(\"\"); got != \"\" { t.Fatalf(\"got %q\", got) }\n}\nfunc TestReverseHello(t *testing.T) {\n\tif got := Reverse(\"hello\"); got != \"olleh\" { t.Fatalf(\"got %q\", got) }\n}\nfunc TestReverseUnicode(t *testing.T) {\n\tif got := Reverse(\"héllo\"); got != \"olléh\" { t.Fatalf(\"got %q\", got) }\n}\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Converting.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "package strs\n\nimport \"testing\"\n\nfunc TestReverse(t *testing.T) {\n\tcases := []struct {\n\t\tname, in, want string\n\t}{\n\t\t{\"empty\", \"\", \"\"},\n\t\t{\"ascii\", \"hello\", \"olleh\"},\n\t\t{\"unicode\", \"héllo\", \"olléh\"},\n\t}\n\tfor _, tc := range cases {\n\t\ttc := tc\n\t\tt.Run(tc.name, func(t *testing.T) {\n\t\t\tif got := Reverse(tc.in); got != tc.want {\n\t\t\t\tt.Fatalf(\"Reverse(%q) = %q, want %q\", tc.in, got, tc.want)\n\t\t\t}\n\t\t})\n\t}\n}\n",
+            "path": "str_test.go"
+          }
+        }
+      ],
+      "input_tokens_est": 728,
+      "output_tokens_est": 33
+    },
+    {
+      "role": "tool",
+      "content": "wrote 484 bytes to str_test.go",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "Tests are now table-driven; each row gets its own subtest with a descriptive name.",
+      "input_tokens_est": 869,
+      "output_tokens_est": 21
+    }
+  ]
+}

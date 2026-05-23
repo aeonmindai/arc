@@ -1,0 +1,87 @@
+{
+  "id": "agentperf_tuning_047",
+  "language": "scala",
+  "source": {
+    "repo": "github.com/zio/zio",
+    "license": "Apache-2.0",
+    "commit": "2.x"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Wire a ZLayer for OrdersService backed by a Postgres ConnectionPool. Provide the live layer in Main.run.",
+      "input_tokens_est": 626
+    },
+    {
+      "role": "assistant",
+      "content": "Reading.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "src/main/scala/OrdersService.scala"
+          }
+        }
+      ],
+      "input_tokens_est": 626,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "import zio._\n\ntrait OrdersService { def list(): UIO[List[Order]] }\nfinal class LiveOrdersService(pool: ConnectionPool) extends OrdersService {\n  def list(): UIO[List[Order]] = ZIO.succeed(Nil)\n}\nobject OrdersService {\n  val live: ZLayer[ConnectionPool, Nothing, OrdersService] =\n    ZLayer.fromFunction(new LiveOrdersService(_))\n}\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Reading Main.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "read_file",
+          "args": {
+            "path": "src/main/scala/Main.scala"
+          }
+        }
+      ],
+      "input_tokens_est": 725,
+      "output_tokens_est": 34
+    },
+    {
+      "role": "tool",
+      "content": "import zio._\n\nobject Main extends ZIOAppDefault {\n  def run = ZIO.unit\n}\n",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "Wiring layers.",
+      "tool_calls": [
+        {
+          "id": "call_003",
+          "name": "write_file",
+          "args": {
+            "contents": "import zio._\n\nobject Main extends ZIOAppDefault {\n  val program = for {\n    svc    <- ZIO.service[OrdersService]\n    orders <- svc.list()\n    _      <- Console.printLine(s\"orders=${orders.size}\")\n  } yield ()\n\n  def run = program.provide(\n    ConnectionPool.live,\n    OrdersService.live\n  )\n}\n",
+            "path": "src/main/scala/Main.scala"
+          }
+        }
+      ],
+      "input_tokens_est": 757,
+      "output_tokens_est": 34
+    },
+    {
+      "role": "tool",
+      "content": "wrote 366 bytes to src/main/scala/Main.scala",
+      "tool_call_id": "call_003"
+    },
+    {
+      "role": "assistant",
+      "content": "Layers composed; Main now resolves OrdersService through ConnectionPool.live.",
+      "input_tokens_est": 864,
+      "output_tokens_est": 20
+    }
+  ]
+}

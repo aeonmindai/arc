@@ -1,0 +1,67 @@
+{
+  "id": "agentperf_tuning_038",
+  "language": "swift",
+  "source": {
+    "repo": "github.com/apple/swift",
+    "license": "Apache-2.0",
+    "commit": "swift-5.10"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Add a SwiftUI ProjectsListView in Views/ProjectsListView.swift that renders an [Project] from a @StateObject ProjectsViewModel with .listStyle(.insetGrouped). Pull-to-refresh should call viewModel.reload().",
+      "input_tokens_est": 652
+    },
+    {
+      "role": "assistant",
+      "content": "Reading the view model.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "ViewModels/ProjectsViewModel.swift"
+          }
+        }
+      ],
+      "input_tokens_est": 652,
+      "output_tokens_est": 36
+    },
+    {
+      "role": "tool",
+      "content": "import Foundation\n\n@MainActor\nfinal class ProjectsViewModel: ObservableObject {\n    @Published var projects: [Project] = []\n    func reload() async { /* fetch */ }\n}\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Writing the view.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "import SwiftUI\n\nstruct ProjectsListView: View {\n    @StateObject private var viewModel = ProjectsViewModel()\n\n    var body: some View {\n        List(viewModel.projects) { project in\n            NavigationLink(project.name) { ProjectDetailView(id: project.id) }\n        }\n        .listStyle(.insetGrouped)\n        .refreshable { await viewModel.reload() }\n        .task { await viewModel.reload() }\n        .navigationTitle(\"Projects\")\n    }\n}\n",
+            "path": "Views/ProjectsListView.swift"
+          }
+        }
+      ],
+      "input_tokens_est": 713,
+      "output_tokens_est": 35
+    },
+    {
+      "role": "tool",
+      "content": "wrote 478 bytes to Views/ProjectsListView.swift",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "View loads on appear via .task and supports pull-to-refresh through .refreshable.",
+      "input_tokens_est": 859,
+      "output_tokens_est": 21
+    }
+  ]
+}

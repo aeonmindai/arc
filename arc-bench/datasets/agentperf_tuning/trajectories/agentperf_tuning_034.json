@@ -1,0 +1,67 @@
+{
+  "id": "agentperf_tuning_034",
+  "language": "php",
+  "source": {
+    "repo": "github.com/laravel/laravel",
+    "license": "MIT",
+    "commit": "11.x"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Add a GET /healthz route in routes/api.php that returns ['status' => 'ok'] with response()->json. Use Route::get.",
+      "input_tokens_est": 629
+    },
+    {
+      "role": "assistant",
+      "content": "Reading routes/api.php.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "routes/api.php"
+          }
+        }
+      ],
+      "input_tokens_est": 629,
+      "output_tokens_est": 36
+    },
+    {
+      "role": "tool",
+      "content": "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\nRoute::middleware('auth:sanctum')->get('/user', function (Request $request) {\n    return $request->user();\n});\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Adding the route.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\nRoute::middleware('auth:sanctum')->get('/user', function (Request $request) {\n    return $request->user();\n});\n\nRoute::get('/healthz', fn () => response()->json(['status' => 'ok']));\n",
+            "path": "routes/api.php"
+          }
+        }
+      ],
+      "input_tokens_est": 682,
+      "output_tokens_est": 35
+    },
+    {
+      "role": "tool",
+      "content": "wrote 296 bytes to routes/api.php",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "Healthz route registered.",
+      "input_tokens_est": 766,
+      "output_tokens_est": 7
+    }
+  ]
+}

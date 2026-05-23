@@ -1,0 +1,67 @@
+{
+  "id": "agentperf_tuning_006",
+  "language": "python",
+  "source": {
+    "repo": "github.com/pandas-dev/pandas",
+    "license": "BSD-3-Clause",
+    "commit": "be4e0ea"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "I have orders.csv with columns (order_id, customer_id, amount, created_at). Write a function in analysis.py that returns a DataFrame indexed by customer_id, with total spend and order count. Use pandas groupby.",
+      "input_tokens_est": 653
+    },
+    {
+      "role": "assistant",
+      "content": "Let me see the existing analysis module first.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "analysis.py"
+          }
+        }
+      ],
+      "input_tokens_est": 653,
+      "output_tokens_est": 42
+    },
+    {
+      "role": "tool",
+      "content": "import pandas as pd\n\ndef load_orders(path: str) -> pd.DataFrame:\n    return pd.read_csv(path, parse_dates=[\"created_at\"])\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "I'll add `customer_summary` that does a groupby on customer_id and aggregates with named expressions.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "import pandas as pd\n\ndef load_orders(path: str) -> pd.DataFrame:\n    return pd.read_csv(path, parse_dates=[\"created_at\"])\n\n\ndef customer_summary(orders: pd.DataFrame) -> pd.DataFrame:\n    return (\n        orders.groupby(\"customer_id\")\n        .agg(total_spend=(\"amount\", \"sum\"), order_count=(\"order_id\", \"count\"))\n        .sort_values(\"total_spend\", ascending=False)\n    )\n",
+            "path": "analysis.py"
+          }
+        }
+      ],
+      "input_tokens_est": 703,
+      "output_tokens_est": 56
+    },
+    {
+      "role": "tool",
+      "content": "wrote 412 bytes to analysis.py",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "Done. `customer_summary` returns a DataFrame indexed by customer_id with `total_spend` and `order_count` columns sorted by spend descending.",
+      "input_tokens_est": 847,
+      "output_tokens_est": 35
+    }
+  ]
+}

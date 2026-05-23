@@ -177,6 +177,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-bench"
+version = "0.7.1-alpha.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "arc-cli"
 version = "0.7.1-alpha.1"
 dependencies = [

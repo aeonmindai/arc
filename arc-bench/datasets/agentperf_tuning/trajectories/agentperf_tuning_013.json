@@ -1,0 +1,47 @@
+{
+  "id": "agentperf_tuning_013",
+  "language": "typescript",
+  "source": {
+    "repo": "github.com/colinhacks/zod",
+    "license": "MIT",
+    "commit": "3f76a4e"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Add a Zod schema for CreateUser in schemas/user.ts. Email must be valid, age must be int>=18, role enum admin|editor|viewer. Export the inferred TS type.",
+      "input_tokens_est": 639
+    },
+    {
+      "role": "assistant",
+      "content": "Writing the schema.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "write_file",
+          "args": {
+            "contents": "import { z } from \"zod\";\n\nexport const CreateUserSchema = z.object({\n  email: z.string().email(),\n  age: z.number().int().gte(18),\n  role: z.enum([\"admin\", \"editor\", \"viewer\"]),\n});\n\nexport type CreateUser = z.infer<typeof CreateUserSchema>;\n",
+            "path": "schemas/user.ts"
+          }
+        }
+      ],
+      "input_tokens_est": 639,
+      "output_tokens_est": 35
+    },
+    {
+      "role": "tool",
+      "content": "wrote 268 bytes to schemas/user.ts",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Schema and inferred type exported.",
+      "input_tokens_est": 729,
+      "output_tokens_est": 9
+    }
+  ]
+}

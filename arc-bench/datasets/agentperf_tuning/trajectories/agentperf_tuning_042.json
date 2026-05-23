@@ -1,0 +1,67 @@
+{
+  "id": "agentperf_tuning_042",
+  "language": "kotlin",
+  "source": {
+    "repo": "github.com/Kotlin/kotlinx.coroutines",
+    "license": "Apache-2.0",
+    "commit": "1.8.x"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Refactor TickerService.observe(): Job into a kotlinx Flow<Int> that emits a count every second using `flow { while (true) { emit(...); delay(1000) } }`.",
+      "input_tokens_est": 638
+    },
+    {
+      "role": "assistant",
+      "content": "Reading.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "src/main/kotlin/com/acme/ticker/TickerService.kt"
+          }
+        }
+      ],
+      "input_tokens_est": 638,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "package com.acme.ticker\nimport kotlinx.coroutines.*\n\nclass TickerService(private val scope: CoroutineScope) {\n    fun observe(onTick: (Int) -> Unit): Job = scope.launch {\n        var i = 0\n        while (isActive) { onTick(i++); delay(1000) }\n    }\n}\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Writing.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "package com.acme.ticker\nimport kotlinx.coroutines.delay\nimport kotlinx.coroutines.flow.Flow\nimport kotlinx.coroutines.flow.flow\n\nclass TickerService {\n    fun observe(): Flow<Int> = flow {\n        var i = 0\n        while (true) {\n            emit(i)\n            i += 1\n            delay(1000)\n        }\n    }\n}\n",
+            "path": "src/main/kotlin/com/acme/ticker/TickerService.kt"
+          }
+        }
+      ],
+      "input_tokens_est": 720,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "wrote 386 bytes to src/main/kotlin/com/acme/ticker/TickerService.kt",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "Service now exposes a cold Flow; callers control lifecycle via collect/cancel.",
+      "input_tokens_est": 841,
+      "output_tokens_est": 20
+    }
+  ]
+}

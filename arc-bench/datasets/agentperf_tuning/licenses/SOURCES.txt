@@ -1,0 +1,78 @@
+Source repositories referenced by the `agentperf_tuning` dataset.
+Each trajectory's `source.repo`, `source.license`, and `source.commit`
+fields point into this list. All repositories are public and licensed
+under permissive terms (SPDX id listed). Quoted file snippets in
+trajectories fall under fair-use for benchmarking purposes and are
+always attributed.
+
+# Rust
+github.com/BurntSushi/ripgrep                 MIT
+github.com/tokio-rs/tokio                     MIT
+github.com/serde-rs/serde                     MIT          (parked)
+github.com/clap-rs/clap                       MIT
+github.com/tokio-rs/axum                      MIT
+github.com/jeromefroe/lru-rs                  MIT          (long)
+
+# Python
+github.com/pandas-dev/pandas                  BSD-3-Clause
+github.com/pallets/flask                      BSD-3-Clause (also long)
+github.com/psf/requests                       Apache-2.0
+github.com/sqlalchemy/sqlalchemy              MIT
+github.com/django/django                      BSD-3-Clause
+
+# TypeScript / JavaScript
+github.com/TanStack/query                     MIT
+github.com/vercel/next.js                     MIT          (parked + long)
+github.com/colinhacks/zod                     MIT
+github.com/expressjs/express                  MIT
+github.com/prisma/prisma                      Apache-2.0
+
+# Go
+github.com/golang/go                          BSD-3-Clause (also long)
+github.com/grpc/grpc-go                       Apache-2.0
+github.com/golang/sync                        BSD-3-Clause
+github.com/stretchr/testify                   MIT
+
+# C++
+github.com/abseil/abseil-cpp                  Apache-2.0
+github.com/google/googletest                  BSD-3-Clause
+github.com/progschj/ThreadPool                Zlib
+github.com/llvm/llvm-project                  Apache-2.0
+github.com/Kitware/CMake                      BSD-3-Clause
+
+# Java
+github.com/spring-projects/spring-boot        Apache-2.0   (parked + long)
+github.com/google/guava                       Apache-2.0
+github.com/openjdk/jdk                        GPL-2.0-with-classpath-exception
+github.com/junit-team/junit5                  EPL-2.0
+
+# Ruby
+github.com/rails/rails                        MIT
+github.com/rspec/rspec-rails                  MIT
+github.com/sidekiq/sidekiq                    LGPL-3.0
+
+# PHP
+github.com/laravel/laravel                    MIT
+github.com/laravel/framework                  MIT
+github.com/symfony/symfony                    MIT
+github.com/sebastianbergmann/phpunit          BSD-3-Clause
+
+# Swift
+github.com/apple/swift                        Apache-2.0
+github.com/Alamofire/Alamofire                MIT
+github.com/apple/swift-foundation             Apache-2.0
+
+# Kotlin
+github.com/Kotlin/kotlinx.coroutines          Apache-2.0
+github.com/ktorio/ktor                        Apache-2.0
+github.com/JetBrains/kotlin                   Apache-2.0
+
+# Scala
+github.com/typelevel/cats-effect              Apache-2.0
+github.com/playframework/playframework        Apache-2.0
+github.com/zio/zio                            Apache-2.0
+
+# C#
+github.com/dotnet/aspnetcore                  MIT
+github.com/dotnet/efcore                      MIT
+github.com/xunit/xunit                        Apache-2.0

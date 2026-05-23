@@ -1,0 +1,47 @@
+{
+  "id": "agentperf_tuning_031",
+  "language": "ruby",
+  "source": {
+    "repo": "github.com/rails/rails",
+    "license": "MIT",
+    "commit": "7-1-stable"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Create an ActiveJob `OrderReceiptJob` that takes an order id, loads the order, and calls OrderMailer.receipt(order).deliver_now. Configure :default queue.",
+      "input_tokens_est": 639
+    },
+    {
+      "role": "assistant",
+      "content": "Writing.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "write_file",
+          "args": {
+            "contents": "class OrderReceiptJob < ApplicationJob\n  queue_as :default\n\n  def perform(order_id)\n    order = Order.find(order_id)\n    OrderMailer.receipt(order).deliver_now\n  end\nend\n",
+            "path": "app/jobs/order_receipt_job.rb"
+          }
+        }
+      ],
+      "input_tokens_est": 639,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "wrote 178 bytes to app/jobs/order_receipt_job.rb",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Job added. Enqueue with `OrderReceiptJob.perform_later(order.id)`.",
+      "input_tokens_est": 713,
+      "output_tokens_est": 17
+    }
+  ]
+}

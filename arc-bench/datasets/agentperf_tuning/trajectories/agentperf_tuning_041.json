@@ -1,0 +1,87 @@
+{
+  "id": "agentperf_tuning_041",
+  "language": "swift",
+  "source": {
+    "repo": "github.com/apple/swift-foundation",
+    "license": "Apache-2.0",
+    "commit": "0.0.5"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "User struct uses default JSONDecoder. Switch to snake_case keys and ISO-8601 dates.",
+      "input_tokens_est": 621
+    },
+    {
+      "role": "assistant",
+      "content": "Reading.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "Models/User.swift"
+          }
+        }
+      ],
+      "input_tokens_est": 621,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "import Foundation\nstruct User: Codable {\n    let id: Int\n    let firstName: String\n    let createdAt: Date\n}\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Reading the decoder factory.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "read_file",
+          "args": {
+            "path": "Networking/Decoder.swift"
+          }
+        }
+      ],
+      "input_tokens_est": 660,
+      "output_tokens_est": 37
+    },
+    {
+      "role": "tool",
+      "content": "import Foundation\nenum DecoderFactory { static let json = JSONDecoder() }\n",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "Updating the factory.",
+      "tool_calls": [
+        {
+          "id": "call_003",
+          "name": "write_file",
+          "args": {
+            "contents": "import Foundation\nenum DecoderFactory {\n    static let json: JSONDecoder = {\n        let d = JSONDecoder()\n        d.keyDecodingStrategy = .convertFromSnakeCase\n        d.dateDecodingStrategy = .iso8601\n        return d\n    }()\n}\n",
+            "path": "Networking/Decoder.swift"
+          }
+        }
+      ],
+      "input_tokens_est": 696,
+      "output_tokens_est": 36
+    },
+    {
+      "role": "tool",
+      "content": "wrote 260 bytes to Networking/Decoder.swift",
+      "tool_call_id": "call_003"
+    },
+    {
+      "role": "assistant",
+      "content": "Decoder now converts snake_case keys to camelCase and parses ISO-8601 timestamps. User compiles as-is.",
+      "input_tokens_est": 787,
+      "output_tokens_est": 26
+    }
+  ]
+}

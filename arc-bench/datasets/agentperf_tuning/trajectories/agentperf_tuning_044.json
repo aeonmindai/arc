@@ -1,0 +1,67 @@
+{
+  "id": "agentperf_tuning_044",
+  "language": "kotlin",
+  "source": {
+    "repo": "github.com/JetBrains/kotlin",
+    "license": "Apache-2.0",
+    "commit": "1.9.20"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Refactor the User class in domain/User.kt from an explicit-equals/hashCode/toString form to an idiomatic Kotlin data class.",
+      "input_tokens_est": 631
+    },
+    {
+      "role": "assistant",
+      "content": "Reading.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "src/main/kotlin/com/acme/domain/User.kt"
+          }
+        }
+      ],
+      "input_tokens_est": 631,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "package com.acme.domain\n\nclass User(val id: Long, val name: String, val email: String) {\n    override fun equals(other: Any?): Boolean { /* manual */ return other is User && other.id == id }\n    override fun hashCode(): Int = id.hashCode()\n    override fun toString(): String = \"User($id, $name, $email)\"\n}\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Writing.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "package com.acme.domain\n\ndata class User(val id: Long, val name: String, val email: String)\n",
+            "path": "src/main/kotlin/com/acme/domain/User.kt"
+          }
+        }
+      ],
+      "input_tokens_est": 725,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "wrote 80 bytes to src/main/kotlin/com/acme/domain/User.kt",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "Note that the new equals/hashCode is structural (covers all three fields), unlike the previous id-only equality. Confirm that's what callers expect.",
+      "input_tokens_est": 783,
+      "output_tokens_est": 37
+    }
+  ]
+}

@@ -1,0 +1,67 @@
+{
+  "id": "agentperf_tuning_048",
+  "language": "csharp",
+  "source": {
+    "repo": "github.com/dotnet/aspnetcore",
+    "license": "MIT",
+    "commit": "8.0"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Add a Minimal API endpoint `GET /healthz` in Program.cs that returns Results.Ok(new { status = \"ok\" }).",
+      "input_tokens_est": 626
+    },
+    {
+      "role": "assistant",
+      "content": "Reading Program.cs.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "Program.cs"
+          }
+        }
+      ],
+      "input_tokens_est": 626,
+      "output_tokens_est": 35
+    },
+    {
+      "role": "tool",
+      "content": "var builder = WebApplication.CreateBuilder(args);\nvar app = builder.Build();\napp.MapGet(\"/\", () => \"Hello\");\napp.Run();\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Writing.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "var builder = WebApplication.CreateBuilder(args);\nvar app = builder.Build();\napp.MapGet(\"/\", () => \"Hello\");\napp.MapGet(\"/healthz\", () => Results.Ok(new { status = \"ok\" }));\napp.Run();\n",
+            "path": "Program.cs"
+          }
+        }
+      ],
+      "input_tokens_est": 668,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "wrote 220 bytes to Program.cs",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "Endpoint registered.",
+      "input_tokens_est": 738,
+      "output_tokens_est": 5
+    }
+  ]
+}

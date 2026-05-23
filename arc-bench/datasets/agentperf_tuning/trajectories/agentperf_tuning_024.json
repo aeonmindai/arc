@@ -1,0 +1,67 @@
+{
+  "id": "agentperf_tuning_024",
+  "language": "cpp",
+  "source": {
+    "repo": "github.com/llvm/llvm-project",
+    "license": "Apache-2.0",
+    "commit": "1b3c5e2"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Add a C++20 concept Hashable<T> and constrain MakeIndex<T> in include/index.h to require it.",
+      "input_tokens_est": 623
+    },
+    {
+      "role": "assistant",
+      "content": "Reading.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "include/index.h"
+          }
+        }
+      ],
+      "input_tokens_est": 623,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "#pragma once\n#include <unordered_set>\n\ntemplate <class T>\nstd::unordered_set<T> MakeIndex(const std::vector<T>& items) {\n    return std::unordered_set<T>(items.begin(), items.end());\n}\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Adding the concept.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "#pragma once\n#include <concepts>\n#include <functional>\n#include <unordered_set>\n#include <vector>\n\ntemplate <class T>\nconcept Hashable = requires(const T& v) {\n    { std::hash<T>{}(v) } -> std::convertible_to<std::size_t>;\n};\n\ntemplate <Hashable T>\nstd::unordered_set<T> MakeIndex(const std::vector<T>& items) {\n    return std::unordered_set<T>(items.begin(), items.end());\n}\n",
+            "path": "include/index.h"
+          }
+        }
+      ],
+      "input_tokens_est": 680,
+      "output_tokens_est": 35
+    },
+    {
+      "role": "tool",
+      "content": "wrote 426 bytes to include/index.h",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "MakeIndex now requires Hashable; the compiler will emit a precise diagnostic instead of a deep template error for non-hashable T.",
+      "input_tokens_est": 804,
+      "output_tokens_est": 33
+    }
+  ]
+}

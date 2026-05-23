@@ -1,0 +1,67 @@
+{
+  "id": "agentperf_tuning_011",
+  "language": "typescript",
+  "source": {
+    "repo": "github.com/TanStack/query",
+    "license": "MIT",
+    "commit": "6d4a8c1"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "In src/hooks/useProjects.ts switch the manual fetch to @tanstack/react-query. Return { projects, isLoading, error } and gate refetch behind a 30s staleTime.",
+      "input_tokens_est": 639
+    },
+    {
+      "role": "assistant",
+      "content": "Reading.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "src/hooks/useProjects.ts"
+          }
+        }
+      ],
+      "input_tokens_est": 639,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "import { useState, useEffect } from \"react\";\nimport type { Project } from \"../types\";\n\nexport function useProjects() {\n  const [projects, setProjects] = useState<Project[]>([]);\n  const [isLoading, setLoading] = useState(true);\n  const [error, setError] = useState<unknown>(null);\n\n  useEffect(() => {\n    fetch(\"/api/projects\")\n      .then((r) => r.json())\n      .then(setProjects)\n      .catch(setError)\n      .finally(() => setLoading(false));\n  }, []);\n\n  return { projects, isLoading, error };\n}\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Switching to useQuery.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "import { useQuery } from \"@tanstack/react-query\";\nimport type { Project } from \"../types\";\n\nasync function fetchProjects(): Promise<Project[]> {\n  const r = await fetch(\"/api/projects\");\n  if (!r.ok) {\n    throw new Error(`projects fetch failed: ${r.status}`);\n  }\n  return (await r.json()) as Project[];\n}\n\nexport function useProjects() {\n  const { data, isLoading, error } = useQuery({\n    queryKey: [\"projects\"],\n    queryFn: fetchProjects,\n    staleTime: 30_000,\n  });\n  return { projects: data ?? [], isLoading, error };\n}\n",
+            "path": "src/hooks/useProjects.ts"
+          }
+        }
+      ],
+      "input_tokens_est": 778,
+      "output_tokens_est": 36
+    },
+    {
+      "role": "tool",
+      "content": "wrote 552 bytes to src/hooks/useProjects.ts",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "useProjects now backed by react-query with a 30s staleTime; the return shape is preserved.",
+      "input_tokens_est": 947,
+      "output_tokens_est": 23
+    }
+  ]
+}

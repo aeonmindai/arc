@@ -1,0 +1,67 @@
+{
+  "id": "agentperf_tuning_040",
+  "language": "swift",
+  "source": {
+    "repo": "github.com/apple/swift",
+    "license": "Apache-2.0",
+    "commit": "swift-5.10"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Rewrite LocationStore.observe(_:) — currently a Combine AnyPublisher — to use an AsyncStream<Location>. Keep the same source (CoreLocation manager).",
+      "input_tokens_est": 637
+    },
+    {
+      "role": "assistant",
+      "content": "Reading.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "Stores/LocationStore.swift"
+          }
+        }
+      ],
+      "input_tokens_est": 637,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "import Combine\nimport CoreLocation\n\nfinal class LocationStore: NSObject, CLLocationManagerDelegate {\n    private let manager = CLLocationManager()\n    private let subject = PassthroughSubject<Location, Never>()\n    func observe() -> AnyPublisher<Location, Never> { subject.eraseToAnyPublisher() }\n    func locationManager(_ m: CLLocationManager, didUpdateLocations locs: [CLLocation]) {\n        guard let l = locs.last else { return }\n        subject.send(Location(lat: l.coordinate.latitude, lon: l.coordinate.longitude))\n    }\n}\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Rewriting with AsyncStream.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "import CoreLocation\n\nfinal class LocationStore: NSObject, CLLocationManagerDelegate {\n    private let manager = CLLocationManager()\n    private var continuation: AsyncStream<Location>.Continuation?\n\n    func observe() -> AsyncStream<Location> {\n        AsyncStream { cont in\n            self.continuation = cont\n            cont.onTermination = { @Sendable _ in self.continuation = nil }\n        }\n    }\n\n    func locationManager(_ m: CLLocationManager, didUpdateLocations locs: [CLLocation]) {\n        guard let l = locs.last else { return }\n        continuation?.yield(Location(lat: l.coordinate.latitude, lon: l.coordinate.longitude))\n    }\n}\n",
+            "path": "Stores/LocationStore.swift"
+          }
+        }
+      ],
+      "input_tokens_est": 784,
+      "output_tokens_est": 37
+    },
+    {
+      "role": "tool",
+      "content": "wrote 668 bytes to Stores/LocationStore.swift",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "Combine subject replaced with AsyncStream; consumers iterate `for await loc in store.observe()`.",
+      "input_tokens_est": 983,
+      "output_tokens_est": 24
+    }
+  ]
+}

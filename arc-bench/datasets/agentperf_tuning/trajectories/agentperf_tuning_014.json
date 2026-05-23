@@ -1,0 +1,88 @@
+{
+  "id": "agentperf_tuning_014",
+  "language": "typescript",
+  "source": {
+    "repo": "github.com/expressjs/express",
+    "license": "MIT",
+    "commit": "7c8b9a0"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Add an Express request-id middleware in middlewares/requestId.ts that pulls X-Request-Id from the header (or generates a UUID) and attaches it to req.id. Wire it before all routes in server.ts.",
+      "input_tokens_est": 649
+    },
+    {
+      "role": "assistant",
+      "content": "Reading server.ts to see the current middleware order.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "server.ts"
+          }
+        }
+      ],
+      "input_tokens_est": 649,
+      "output_tokens_est": 44
+    },
+    {
+      "role": "tool",
+      "content": "import express from \"express\";\nimport { router } from \"./router\";\n\nexport const app = express();\napp.use(express.json());\napp.use(router);\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Writing the middleware.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "import type { Request, Response, NextFunction } from \"express\";\nimport { randomUUID } from \"node:crypto\";\n\ndeclare module \"express-serve-static-core\" {\n  interface Request {\n    id?: string;\n  }\n}\n\nexport function requestId(req: Request, res: Response, next: NextFunction) {\n  const header = req.header(\"x-request-id\");\n  const id = header && header.length > 0 ? header : randomUUID();\n  req.id = id;\n  res.setHeader(\"x-request-id\", id);\n  next();\n}\n",
+            "path": "middlewares/requestId.ts"
+          }
+        }
+      ],
+      "input_tokens_est": 704,
+      "output_tokens_est": 36
+    },
+    {
+      "role": "tool",
+      "content": "wrote 514 bytes to middlewares/requestId.ts",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "Wiring it into server.ts.",
+      "tool_calls": [
+        {
+          "id": "call_003",
+          "name": "write_file",
+          "args": {
+            "contents": "import express from \"express\";\nimport { router } from \"./router\";\nimport { requestId } from \"./middlewares/requestId\";\n\nexport const app = express();\napp.use(requestId);\napp.use(express.json());\napp.use(router);\n",
+            "path": "server.ts"
+          }
+        }
+      ],
+      "input_tokens_est": 854,
+      "output_tokens_est": 37
+    },
+    {
+      "role": "tool",
+      "content": "wrote 250 bytes to server.ts",
+      "tool_call_id": "call_003"
+    },
+    {
+      "role": "assistant",
+      "content": "Middleware in place; every request now carries an id on req.id and is echoed in the response header.",
+      "input_tokens_est": 935,
+      "output_tokens_est": 25
+    }
+  ]
+}

@@ -1,0 +1,129 @@
+{
+  "id": "agentperf_tuning_054_long",
+  "language": "go",
+  "source": {
+    "repo": "github.com/golang/go",
+    "license": "BSD-3-Clause",
+    "commit": "5b9c89e"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Add two HTTP middlewares in pkg/middleware: WithRequestID and WithRecover. WithRequestID generates a UUID per request and attaches it to context + response header. WithRecover catches panics and returns 500. Wire both in cmd/server/main.go. Write table-driven tests for each.",
+      "input_tokens_est": 669
+    },
+    {
+      "role": "assistant",
+      "content": "Looking at the server entry.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "cmd/server/main.go"
+          }
+        }
+      ],
+      "input_tokens_est": 669,
+      "output_tokens_est": 37
+    },
+    {
+      "role": "tool",
+      "content": "package main\nimport (\"log\"; \"net/http\")\nfunc main() {\n\tmux := http.NewServeMux()\n\tmux.HandleFunc(\"/\", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(\"ok\")) })\n\tlog.Fatal(http.ListenAndServe(\":8080\", mux))\n}\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Writing the middleware package.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "package middleware\n\nimport (\n\t\"context\"\n\t\"log\"\n\t\"net/http\"\n\n\t\"github.com/google/uuid\"\n)\n\ntype ctxKey struct{}\n\nvar requestIDKey ctxKey\n\nfunc WithRequestID(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tid := r.Header.Get(\"X-Request-Id\")\n\t\tif id == \"\" { id = uuid.NewString() }\n\t\tw.Header().Set(\"X-Request-Id\", id)\n\t\tctx := context.WithValue(r.Context(), requestIDKey, id)\n\t\tnext.ServeHTTP(w, r.WithContext(ctx))\n\t})\n}\n\nfunc RequestID(ctx context.Context) string {\n\tif v, ok := ctx.Value(requestIDKey).(string); ok { return v }\n\treturn \"\"\n}\n\nfunc WithRecover(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tdefer func() {\n\t\t\tif rec := recover(); rec != nil {\n\t\t\t\tlog.Printf(\"panic in handler: %v\", rec)\n\t\t\t\thttp.Error(w, \"internal server error\", http.StatusInternalServerError)\n\t\t\t}\n\t\t}()\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n",
+            "path": "pkg/middleware/middleware.go"
+          }
+        }
+      ],
+      "input_tokens_est": 741,
+      "output_tokens_est": 38
+    },
+    {
+      "role": "tool",
+      "content": "wrote 974 bytes to pkg/middleware/middleware.go",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "Now the tests.",
+      "tool_calls": [
+        {
+          "id": "call_003",
+          "name": "write_file",
+          "args": {
+            "contents": "package middleware_test\n\nimport (\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"example.com/pkg/middleware\"\n)\n\nfunc TestWithRequestID(t *testing.T) {\n\tcases := []struct {\n\t\tname, header string\n\t\twant         string\n\t}{\n\t\t{\"forwarded\", \"abc-123\", \"abc-123\"},\n\t\t{\"generated\", \"\", \"\"},\n\t}\n\tfor _, tc := range cases {\n\t\ttc := tc\n\t\tt.Run(tc.name, func(t *testing.T) {\n\t\t\th := middleware.WithRequestID(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\t\t\tif got := middleware.RequestID(r.Context()); tc.want != \"\" && got != tc.want {\n\t\t\t\t\tt.Fatalf(\"got %q want %q\", got, tc.want)\n\t\t\t\t}\n\t\t\t}))\n\t\t\treq := httptest.NewRequest(\"GET\", \"/\", nil)\n\t\t\tif tc.header != \"\" { req.Header.Set(\"X-Request-Id\", tc.header) }\n\t\t\trec := httptest.NewRecorder()\n\t\t\th.ServeHTTP(rec, req)\n\t\t\tif rec.Header().Get(\"X-Request-Id\") == \"\" {\n\t\t\t\tt.Fatalf(\"expected response header to be set\")\n\t\t\t}\n\t\t})\n\t}\n}\n\nfunc TestWithRecover(t *testing.T) {\n\th := middleware.WithRecover(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic(\"boom\") }))\n\trec := httptest.NewRecorder()\n\th.ServeHTTP(rec, httptest.NewRequest(\"GET\", \"/\", nil))\n\tif rec.Code != http.StatusInternalServerError {\n\t\tt.Fatalf(\"want 500 got %d\", rec.Code)\n\t}\n}\n",
+            "path": "pkg/middleware/middleware_test.go"
+          }
+        }
+      ],
+      "input_tokens_est": 1036,
+      "output_tokens_est": 34
+    },
+    {
+      "role": "tool",
+      "content": "wrote 1138 bytes to pkg/middleware/middleware_test.go",
+      "tool_call_id": "call_003"
+    },
+    {
+      "role": "assistant",
+      "content": "Wiring the middlewares in main.",
+      "tool_calls": [
+        {
+          "id": "call_004",
+          "name": "write_file",
+          "args": {
+            "contents": "package main\n\nimport (\n\t\"log\"\n\t\"net/http\"\n\n\t\"example.com/pkg/middleware\"\n)\n\nfunc main() {\n\tmux := http.NewServeMux()\n\tmux.HandleFunc(\"/\", func(w http.ResponseWriter, r *http.Request) {\n\t\tw.Write([]byte(\"ok request_id=\" + middleware.RequestID(r.Context())))\n\t})\n\tvar h http.Handler = mux\n\th = middleware.WithRecover(h)\n\th = middleware.WithRequestID(h)\n\tlog.Fatal(http.ListenAndServe(\":8080\", h))\n}\n",
+            "path": "cmd/server/main.go"
+          }
+        }
+      ],
+      "input_tokens_est": 1414,
+      "output_tokens_est": 38
+    },
+    {
+      "role": "tool",
+      "content": "wrote 444 bytes to cmd/server/main.go",
+      "tool_call_id": "call_004"
+    },
+    {
+      "role": "assistant",
+      "content": "Running tests.",
+      "tool_calls": [
+        {
+          "id": "call_005",
+          "name": "run_shell",
+          "args": {
+            "cmd": "go test ./pkg/middleware/..."
+          }
+        }
+      ],
+      "input_tokens_est": 1554,
+      "output_tokens_est": 34
+    },
+    {
+      "role": "tool",
+      "content": "ok  \texample.com/pkg/middleware\t0.012s\n",
+      "tool_call_id": "call_005"
+    },
+    {
+      "role": "assistant",
+      "content": "Both middlewares wired and tested. Order of composition is important: WithRequestID is outermost so the recover middleware sees a context that already carries the id.",
+      "input_tokens_est": 1579,
+      "output_tokens_est": 42
+    }
+  ]
+}

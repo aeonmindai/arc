@@ -1,0 +1,67 @@
+{
+  "id": "agentperf_tuning_029",
+  "language": "java",
+  "source": {
+    "repo": "github.com/junit-team/junit5",
+    "license": "EPL-2.0",
+    "commit": "5e8f3c4"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Convert StringsTest.reverse_examples (three @Test methods) into a single @ParameterizedTest with @CsvSource.",
+      "input_tokens_est": 627
+    },
+    {
+      "role": "assistant",
+      "content": "Reading.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "src/test/java/com/acme/strings/StringsTest.java"
+          }
+        }
+      ],
+      "input_tokens_est": 627,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "package com.acme.strings;\nimport org.junit.jupiter.api.Test;\nimport static org.junit.jupiter.api.Assertions.assertEquals;\n\npublic class StringsTest {\n    @Test void reverse_empty() { assertEquals(\"\", Strings.reverse(\"\")); }\n    @Test void reverse_ascii() { assertEquals(\"olleh\", Strings.reverse(\"hello\")); }\n    @Test void reverse_unicode() { assertEquals(\"olléh\", Strings.reverse(\"héllo\")); }\n}\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Writing the parameterized version.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "package com.acme.strings;\nimport org.junit.jupiter.params.ParameterizedTest;\nimport org.junit.jupiter.params.provider.CsvSource;\nimport static org.junit.jupiter.api.Assertions.assertEquals;\n\npublic class StringsTest {\n    @ParameterizedTest(name = \"reverse({0}) = {1}\")\n    @CsvSource({\n        \"'', ''\",\n        \"hello, olleh\",\n        \"'héllo', 'olléh'\"\n    })\n    void reverse_examples(String in, String want) {\n        assertEquals(want, Strings.reverse(in));\n    }\n}\n",
+            "path": "src/test/java/com/acme/strings/StringsTest.java"
+          }
+        }
+      ],
+      "input_tokens_est": 745,
+      "output_tokens_est": 39
+    },
+    {
+      "role": "tool",
+      "content": "wrote 528 bytes to src/test/java/com/acme/strings/StringsTest.java",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "Three test methods collapsed into one parameterized test with three CSV rows.",
+      "input_tokens_est": 915,
+      "output_tokens_est": 20
+    }
+  ]
+}

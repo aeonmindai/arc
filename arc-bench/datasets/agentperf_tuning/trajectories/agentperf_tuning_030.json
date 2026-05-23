@@ -1,0 +1,88 @@
+{
+  "id": "agentperf_tuning_030",
+  "language": "ruby",
+  "source": {
+    "repo": "github.com/rails/rails",
+    "license": "MIT",
+    "commit": "7-1-stable"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Add a Rails scope `recent` to Order that returns orders created in the last 30 days, ordered by created_at desc. Add a unit test.",
+      "input_tokens_est": 633
+    },
+    {
+      "role": "assistant",
+      "content": "Reading the model.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "app/models/order.rb"
+          }
+        }
+      ],
+      "input_tokens_est": 633,
+      "output_tokens_est": 35
+    },
+    {
+      "role": "tool",
+      "content": "class Order < ApplicationRecord\n  belongs_to :customer\n  validates :total_cents, numericality: { greater_than_or_equal_to: 0 }\nend\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Writing.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "class Order < ApplicationRecord\n  belongs_to :customer\n  validates :total_cents, numericality: { greater_than_or_equal_to: 0 }\n\n  scope :recent, -> { where(created_at: 30.days.ago..).order(created_at: :desc) }\nend\n",
+            "path": "app/models/order.rb"
+          }
+        }
+      ],
+      "input_tokens_est": 680,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "wrote 252 bytes to app/models/order.rb",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "Adding the spec.",
+      "tool_calls": [
+        {
+          "id": "call_003",
+          "name": "write_file",
+          "args": {
+            "contents": "require \"rails_helper\"\n\nRSpec.describe Order, type: :model do\n  describe \".recent\" do\n    it \"returns orders from the last 30 days desc\" do\n      old   = create(:order, created_at: 40.days.ago)\n      mid   = create(:order, created_at: 10.days.ago)\n      fresh = create(:order, created_at: 1.day.ago)\n      expect(Order.recent.to_a).to eq([fresh, mid])\n      expect(Order.recent).not_to include(old)\n    end\n  end\nend\n",
+            "path": "spec/models/order_spec.rb"
+          }
+        }
+      ],
+      "input_tokens_est": 760,
+      "output_tokens_est": 34
+    },
+    {
+      "role": "tool",
+      "content": "wrote 416 bytes to spec/models/order_spec.rb",
+      "tool_call_id": "call_003"
+    },
+    {
+      "role": "assistant",
+      "content": "Scope and spec added.",
+      "input_tokens_est": 899,
+      "output_tokens_est": 6
+    }
+  ]
+}

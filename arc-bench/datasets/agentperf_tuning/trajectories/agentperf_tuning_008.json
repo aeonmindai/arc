@@ -1,0 +1,67 @@
+{
+  "id": "agentperf_tuning_008",
+  "language": "python",
+  "source": {
+    "repo": "github.com/psf/requests",
+    "license": "Apache-2.0",
+    "commit": "0e322af"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "In client.py we use requests directly. Refactor to use a Session with a urllib3 Retry adapter that retries 5 times on 429 and 5xx with exponential backoff.",
+      "input_tokens_est": 639
+    },
+    {
+      "role": "assistant",
+      "content": "Reading.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "client.py"
+          }
+        }
+      ],
+      "input_tokens_est": 639,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "import requests\n\nBASE = \"https://api.example.com\"\n\ndef get_user(user_id: int) -> dict:\n    r = requests.get(f\"{BASE}/users/{user_id}\", timeout=5)\n    r.raise_for_status()\n    return r.json()\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "I'll build a module-level session with a Retry mounted on https://. Retry uses backoff_factor for exponential growth.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "import requests\nfrom requests.adapters import HTTPAdapter\nfrom urllib3.util.retry import Retry\n\nBASE = \"https://api.example.com\"\n\n_RETRY = Retry(\n    total=5,\n    backoff_factor=0.5,\n    status_forcelist=(429, 500, 502, 503, 504),\n    allowed_methods=frozenset([\"GET\", \"HEAD\", \"OPTIONS\"]),\n    raise_on_status=False,\n)\n\n\ndef _session() -> requests.Session:\n    s = requests.Session()\n    s.mount(\"https://\", HTTPAdapter(max_retries=_RETRY))\n    s.mount(\"http://\", HTTPAdapter(max_retries=_RETRY))\n    return s\n\n\nSESSION = _session()\n\n\ndef get_user(user_id: int) -> dict:\n    r = SESSION.get(f\"{BASE}/users/{user_id}\", timeout=5)\n    r.raise_for_status()\n    return r.json()\n",
+            "path": "client.py"
+          }
+        }
+      ],
+      "input_tokens_est": 696,
+      "output_tokens_est": 60
+    },
+    {
+      "role": "tool",
+      "content": "wrote 730 bytes to client.py",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "Retry policy in place: 5 attempts, exponential backoff (0.5s base), retries on 429 and 5xx for idempotent methods.",
+      "input_tokens_est": 923,
+      "output_tokens_est": 29
+    }
+  ]
+}

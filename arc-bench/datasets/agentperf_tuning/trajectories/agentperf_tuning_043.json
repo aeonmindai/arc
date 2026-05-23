@@ -1,0 +1,67 @@
+{
+  "id": "agentperf_tuning_043",
+  "language": "kotlin",
+  "source": {
+    "repo": "github.com/ktorio/ktor",
+    "license": "Apache-2.0",
+    "commit": "2.3"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Add a Ktor route GET /healthz under module() that responds with HttpStatusCode.OK and a JSON {status: \"ok\"} using ContentNegotiation/JSON.",
+      "input_tokens_est": 635
+    },
+    {
+      "role": "assistant",
+      "content": "Reading.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "src/main/kotlin/com/acme/Application.kt"
+          }
+        }
+      ],
+      "input_tokens_est": 635,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "package com.acme\nimport io.ktor.server.application.*\nimport io.ktor.server.engine.*\nimport io.ktor.server.netty.*\nimport io.ktor.server.routing.*\n\nfun main() { embeddedServer(Netty, port = 8080) { module() }.start(wait = true) }\nfun Application.module() { routing { /* routes */ } }\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Writing.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "package com.acme\nimport io.ktor.http.*\nimport io.ktor.serialization.kotlinx.json.*\nimport io.ktor.server.application.*\nimport io.ktor.server.engine.*\nimport io.ktor.server.netty.*\nimport io.ktor.server.plugins.contentnegotiation.*\nimport io.ktor.server.response.*\nimport io.ktor.server.routing.*\nimport kotlinx.serialization.Serializable\n\n@Serializable data class Health(val status: String)\n\nfun main() { embeddedServer(Netty, port = 8080) { module() }.start(wait = true) }\n\nfun Application.module() {\n    install(ContentNegotiation) { json() }\n    routing {\n        get(\"/healthz\") { call.respond(HttpStatusCode.OK, Health(\"ok\")) }\n    }\n}\n",
+            "path": "src/main/kotlin/com/acme/Application.kt"
+          }
+        }
+      ],
+      "input_tokens_est": 722,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "wrote 762 bytes to src/main/kotlin/com/acme/Application.kt",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "Healthz wired through Ktor's ContentNegotiation/JSON plugin.",
+      "input_tokens_est": 924,
+      "output_tokens_est": 15
+    }
+  ]
+}

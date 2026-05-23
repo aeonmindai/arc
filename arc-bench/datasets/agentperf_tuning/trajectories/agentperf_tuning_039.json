@@ -1,0 +1,67 @@
+{
+  "id": "agentperf_tuning_039",
+  "language": "swift",
+  "source": {
+    "repo": "github.com/Alamofire/Alamofire",
+    "license": "MIT",
+    "commit": "5.9"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Refactor APIClient.fetchProjects from URLSession completion handlers to async/await using URLSession.shared.data(for:). Return [Project] or throw.",
+      "input_tokens_est": 637
+    },
+    {
+      "role": "assistant",
+      "content": "Reading.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "Services/APIClient.swift"
+          }
+        }
+      ],
+      "input_tokens_est": 637,
+      "output_tokens_est": 32
+    },
+    {
+      "role": "tool",
+      "content": "import Foundation\n\nfinal class APIClient {\n    func fetchProjects(completion: @escaping (Result<[Project], Error>) -> Void) {\n        let url = URL(string: \"https://api.example.com/projects\")!\n        URLSession.shared.dataTask(with: url) { data, _, err in\n            if let err = err { completion(.failure(err)); return }\n            guard let data = data else { completion(.failure(URLError(.badServerResponse))); return }\n            do {\n                let out = try JSONDecoder().decode([Project].self, from: data)\n                completion(.success(out))\n            } catch { completion(.failure(error)) }\n        }.resume()\n    }\n}\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Refactoring.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "import Foundation\n\nfinal class APIClient {\n    func fetchProjects() async throws -> [Project] {\n        let url = URL(string: \"https://api.example.com/projects\")!\n        let (data, response) = try await URLSession.shared.data(for: URLRequest(url: url))\n        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {\n            throw URLError(.badServerResponse)\n        }\n        return try JSONDecoder().decode([Project].self, from: data)\n    }\n}\n",
+            "path": "Services/APIClient.swift"
+          }
+        }
+      ],
+      "input_tokens_est": 811,
+      "output_tokens_est": 33
+    },
+    {
+      "role": "tool",
+      "content": "wrote 540 bytes to Services/APIClient.swift",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "Async version is half the lines and surfaces non-2xx as URLError; call sites need to migrate to `try await client.fetchProjects()`.",
+      "input_tokens_est": 964,
+      "output_tokens_est": 33
+    }
+  ]
+}

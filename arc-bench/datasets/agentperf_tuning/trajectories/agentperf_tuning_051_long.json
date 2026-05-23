@@ -1,0 +1,149 @@
+{
+  "id": "agentperf_tuning_051_long",
+  "language": "rust",
+  "source": {
+    "repo": "github.com/jeromefroe/lru-rs",
+    "license": "MIT",
+    "commit": "0.12"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Implement a fixed-capacity LRU cache in src/lru.rs with insert/get/len, eviction on overflow, and unit tests. Use std::collections::HashMap + a manually maintained doubly-linked list of keys.",
+      "input_tokens_est": 648
+    },
+    {
+      "role": "assistant",
+      "content": "Listing src/ to see what's there.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "list_dir",
+          "args": {
+            "path": "src"
+          }
+        }
+      ],
+      "input_tokens_est": 648,
+      "output_tokens_est": 39
+    },
+    {
+      "role": "tool",
+      "content": "lib.rs\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Reading lib.rs.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "read_file",
+          "args": {
+            "path": "src/lib.rs"
+          }
+        }
+      ],
+      "input_tokens_est": 664,
+      "output_tokens_est": 34
+    },
+    {
+      "role": "tool",
+      "content": "pub fn placeholder() {}\n",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "Writing the LRU module.",
+      "tool_calls": [
+        {
+          "id": "call_003",
+          "name": "write_file",
+          "args": {
+            "contents": "use std::collections::HashMap;\n\nstruct Node<K, V> { key: K, val: V, prev: Option<usize>, next: Option<usize> }\n\npub struct Lru<K, V> {\n    cap: usize,\n    nodes: Vec<Node<K, V>>,\n    free: Vec<usize>,\n    head: Option<usize>,\n    tail: Option<usize>,\n    map: HashMap<K, usize>,\n}\n\nimpl<K: std::hash::Hash + Eq + Clone, V> Lru<K, V> {\n    pub fn new(cap: usize) -> Self {\n        assert!(cap > 0, \"capacity must be > 0\");\n        Self { cap, nodes: Vec::with_capacity(cap), free: Vec::new(), head: None, tail: None, map: HashMap::with_capacity(cap) }\n    }\n    pub fn len(&self) -> usize { self.map.len() }\n    pub fn is_empty(&self) -> bool { self.len() == 0 }\n    pub fn get(&mut self, k: &K) -> Option<&V> {\n        let idx = *self.map.get(k)?;\n        self.unlink(idx);\n        self.push_front(idx);\n        Some(&self.nodes[idx].val)\n    }\n    pub fn insert(&mut self, k: K, v: V) {\n        if let Some(&idx) = self.map.get(&k) {\n            self.nodes[idx].val = v;\n            self.unlink(idx);\n            self.push_front(idx);\n            return;\n        }\n        if self.len() == self.cap { self.evict(); }\n        let idx = self.alloc(k.clone(), v);\n        self.push_front(idx);\n        self.map.insert(k, idx);\n    }\n    fn alloc(&mut self, key: K, val: V) -> usize {\n        let node = Node { key, val, prev: None, next: None };\n        if let Some(i) = self.free.pop() { self.nodes[i] = node; i }\n        else { self.nodes.push(node); self.nodes.len() - 1 }\n    }\n    fn unlink(&mut self, idx: usize) {\n        let prev = self.nodes[idx].prev;\n        let next = self.nodes[idx].next;\n        if let Some(p) = prev { self.nodes[p].next = next; } else { self.head = next; }\n        if let Some(n) = next { self.nodes[n].prev = prev; } else { self.tail = prev; }\n        self.nodes[idx].prev = None; self.nodes[idx].next = None;\n    }\n    fn push_front(&mut self, idx: usize) {\n        self.nodes[idx].prev = None;\n        self.nodes[idx].next = self.head;\n        if let Some(h) = self.head { self.nodes[h].prev = Some(idx); }\n        self.head = Some(idx);\n        if self.tail.is_none() { self.tail = Some(idx); }\n    }\n    fn evict(&mut self) {\n        let Some(t) = self.tail else { return };\n        self.unlink(t);\n        let key = self.nodes[t].key.clone();\n        self.map.remove(&key);\n        self.free.push(t);\n    }\n}\n",
+            "path": "src/lru.rs"
+          }
+        }
+      ],
+      "input_tokens_est": 681,
+      "output_tokens_est": 36
+    },
+    {
+      "role": "tool",
+      "content": "wrote 2238 bytes to src/lru.rs",
+      "tool_call_id": "call_003"
+    },
+    {
+      "role": "assistant",
+      "content": "Adding the module to lib.rs.",
+      "tool_calls": [
+        {
+          "id": "call_004",
+          "name": "write_file",
+          "args": {
+            "contents": "pub mod lru;\npub use lru::Lru;\n",
+            "path": "src/lib.rs"
+          }
+        }
+      ],
+      "input_tokens_est": 1309,
+      "output_tokens_est": 37
+    },
+    {
+      "role": "tool",
+      "content": "wrote 32 bytes to src/lib.rs",
+      "tool_call_id": "call_004"
+    },
+    {
+      "role": "assistant",
+      "content": "Now the tests file.",
+      "tool_calls": [
+        {
+          "id": "call_005",
+          "name": "write_file",
+          "args": {
+            "contents": "use demo::Lru;\n\n#[test]\nfn basic_insert_get() {\n    let mut c: Lru<&'static str, i32> = Lru::new(2);\n    c.insert(\"a\", 1);\n    c.insert(\"b\", 2);\n    assert_eq!(c.get(&\"a\"), Some(&1));\n    c.insert(\"c\", 3);\n    assert_eq!(c.get(&\"b\"), None); // b evicted (LRU)\n    assert_eq!(c.get(&\"a\"), Some(&1));\n    assert_eq!(c.get(&\"c\"), Some(&3));\n}\n\n#[test]\nfn update_does_not_grow() {\n    let mut c: Lru<&'static str, i32> = Lru::new(2);\n    c.insert(\"a\", 1);\n    c.insert(\"a\", 2);\n    assert_eq!(c.len(), 1);\n    assert_eq!(c.get(&\"a\"), Some(&2));\n}\n",
+            "path": "tests/lru_test.rs"
+          }
+        }
+      ],
+      "input_tokens_est": 1342,
+      "output_tokens_est": 35
+    },
+    {
+      "role": "tool",
+      "content": "wrote 530 bytes to tests/lru_test.rs",
+      "tool_call_id": "call_005"
+    },
+    {
+      "role": "assistant",
+      "content": "Running the tests.",
+      "tool_calls": [
+        {
+          "id": "call_006",
+          "name": "run_shell",
+          "args": {
+            "cmd": "cargo test --tests"
+          }
+        }
+      ],
+      "input_tokens_est": 1515,
+      "output_tokens_est": 35
+    },
+    {
+      "role": "tool",
+      "content": "running 2 tests\ntest basic_insert_get ... ok\ntest update_does_not_grow ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored\n",
+      "tool_call_id": "call_006"
+    },
+    {
+      "role": "assistant",
+      "content": "LRU cache shipped with O(1) get/insert and unit tests passing. Eviction strategy is true LRU and the freelist keeps memory usage bounded by capacity.",
+      "input_tokens_est": 1561,
+      "output_tokens_est": 38
+    }
+  ]
+}

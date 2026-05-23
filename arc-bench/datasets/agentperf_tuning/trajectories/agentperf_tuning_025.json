@@ -1,0 +1,67 @@
+{
+  "id": "agentperf_tuning_025",
+  "language": "cpp",
+  "source": {
+    "repo": "github.com/Kitware/CMake",
+    "license": "BSD-3-Clause",
+    "commit": "2c7e85a"
+  },
+  "generated_with": {
+    "model": "Qwen3-Coder-480B-A35B-Instruct",
+    "date": "2026-05-23"
+  },
+  "turns": [
+    {
+      "role": "user",
+      "content": "Add a CMake target `tests` that builds tests/unit_test.cpp, links GTest::gtest_main, and is registered with add_test for CTest.",
+      "input_tokens_est": 632
+    },
+    {
+      "role": "assistant",
+      "content": "Reading the current root CMakeLists.",
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "name": "read_file",
+          "args": {
+            "path": "CMakeLists.txt"
+          }
+        }
+      ],
+      "input_tokens_est": 632,
+      "output_tokens_est": 39
+    },
+    {
+      "role": "tool",
+      "content": "cmake_minimum_required(VERSION 3.20)\nproject(demo CXX)\nset(CMAKE_CXX_STANDARD 20)\n\nadd_library(demo_lib src/lib.cpp)\ntarget_include_directories(demo_lib PUBLIC include)\n",
+      "tool_call_id": "call_001"
+    },
+    {
+      "role": "assistant",
+      "content": "Appending the test target.",
+      "tool_calls": [
+        {
+          "id": "call_002",
+          "name": "write_file",
+          "args": {
+            "contents": "cmake_minimum_required(VERSION 3.20)\nproject(demo CXX)\nset(CMAKE_CXX_STANDARD 20)\n\nadd_library(demo_lib src/lib.cpp)\ntarget_include_directories(demo_lib PUBLIC include)\n\nenable_testing()\nfind_package(GTest CONFIG REQUIRED)\nadd_executable(tests tests/unit_test.cpp)\ntarget_link_libraries(tests PRIVATE demo_lib GTest::gtest_main)\nadd_test(NAME demo_tests COMMAND tests)\n",
+            "path": "CMakeLists.txt"
+          }
+        }
+      ],
+      "input_tokens_est": 692,
+      "output_tokens_est": 37
+    },
+    {
+      "role": "tool",
+      "content": "wrote 442 bytes to CMakeLists.txt",
+      "tool_call_id": "call_002"
+    },
+    {
+      "role": "assistant",
+      "content": "`tests` target is registered with CTest. Run `ctest --test-dir build` after configuring.",
+      "input_tokens_est": 814,
+      "output_tokens_est": 22
+    }
+  ]
+}
