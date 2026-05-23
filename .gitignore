@@ -14,3 +14,6 @@ docs/book/
 
 # roro workspace
 .roro/
+
+# Claude Code agent worktrees (transient, per-session)
+.claude/worktrees/
