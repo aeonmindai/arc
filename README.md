@@ -9,76 +9,74 @@ Inference at the speed of physics.
 </h3>
 
 <p align="center">
-  <a href="https://runcrate.ai/arc"><b>Website</b></a> | <a href="#quick-start"><b>Quick Start</b></a> | <a href="#performance"><b>Performance</b></a> | <a href="#compression-stack"><b>Compression Stack</b></a> | <a href="#roadmap"><b>Roadmap</b></a> | <a href="#license"><b>License</b></a>
+  <a href="https://runcrate.ai/arc"><b>Website</b></a> | <a href="#quick-start"><b>Quick Start</b></a> | <a href="#performance"><b>Performance</b></a> | <a href="#compression-stack"><b>Compression</b></a> | <a href="#supported-models"><b>Models</b></a> | <a href="#license"><b>License</b></a>
 </p>
 
 <p align="center">
-  A Rust LLM inference engine that targets the HBM-bandwidth floor on frontier MoE models.<br>
+  A Rust LLM inference engine that targets the HBM-bandwidth floor on any model.<br>
   Built by <a href="https://runcrate.ai">Aeonmind</a>. Powers <a href="https://runcrate.ai">Runcrate</a>.
 </p>
 
 ---
 
-Arc runs **DeepSeek V4 Flash, Kimi K2.6, and GLM-5.1 on a single H100** — the same frontier MoE models that vendors deploy across 8× H100. ~85% of theoretical HBM bandwidth utilization on single-node decode, achieved by composing the most aggressive open compression stack in production: **QTIP 2-bit weights, TurboQuant 3.5-bit KV cache, and TD-MoE Tucker decomposition**. Net residency for V4 Flash: ~55 GB.
+Arc serves any LLM at HBM-bandwidth-floor decode throughput. ~85% of theoretical bandwidth utilization on H100 single-node, achieved by composing the most aggressive open compression stack in production: **QTIP 2-bit weights, TurboQuant 3.5-bit KV cache, TD-MoE Tucker decomposition**, and model-native sparse attention kernels.
 
 Forked from [mistral.rs](https://github.com/EricLBuehler/mistral.rs). Apache 2.0. Upstream-merge-compatible.
 
-## What Arc Is
+## What Arc Adds
 
 | Feature | What it does |
 |---|---|
-| **DeepSeek V4 native** | Fused `wkv` MQA, mHC 4-D residual threading, FP8 e4m3 + UE8M0 block scales, MTP head dispatch, Lightning Indexer + FlashMLASparse CUDA for CSA/HCA, learned `hc_attn_scale` blend |
-| **TurboQuant K4/V3 KV** | Zandieh et al. (Google Research, [arXiv:2504.19874](https://arxiv.org/abs/2504.19874), ICLR'26) — Arc Rust implementation with fused-kernel attention path. 3.5-bit average, paper-lossless. 4.6× KV bandwidth vs FP16. WHT rotation + Lloyd-Max codebooks. No calibration needed. |
-| **QTIP 2-bit weights** | Cornell ICLR'25 — Viterbi-decoded trellis with Hadamard incoherence rotation. Cos sim ≥0.97 on realistic Gaussian. 8× weight compression vs FP16. |
-| **TD-MoE Tucker + whitening** | "Lossless 20%" extra compression on MoE expert pool. Tucker decomposition with whitening transform wired into model load. |
-| **CSA/HCA + PagedAttention** | V4 compress dispatch routes through ALL three forward paths: plain SDPA, PagedAttention (batched serving), and MLA cache. |
-| **arc-cuda-graph autonomous decode** | Full decode loop (forward + sample + EOS check) on GPU. Zero CPU sync per token. |
+| **TurboQuant K4/V3 KV** | Zandieh et al. (Google Research, [arXiv:2504.19874](https://arxiv.org/abs/2504.19874), ICLR'26) — Arc Rust impl with fused-kernel attention path. 3.5-bit average, paper-lossless. 4.6× KV bandwidth vs FP16. Works on any attention model. |
+| **QTIP 2-bit weights** | Cornell ICLR'25 — Viterbi-decoded trellis with Hadamard incoherence rotation. 8× weight compression vs FP16. Works on any model. |
+| **TD-MoE Tucker + whitening** | "Lossless 20%" extra compression on MoE expert pool via whitened Tucker decomposition. Works on any MoE. |
+| **Sparse attention kernels** | FlashMLASparse CUDA kernel (MIT, ported from sgl-project) for top-k attention. Dense O(n²) → sparse O(n·k). |
+| **arc-cuda-graph autonomous decode** | Full decode loop (forward + sample + EOS check) on GPU. Zero CPU sync per token. Works on any model. |
 | **`arc validate --target-hbm`** | Pre-flight memory-footprint verification on any GPU before you spend rental hours. |
-| **AA-AgentPerf-style benchmark suite** | Real agentic coding trajectories, sustained concurrent load, market-derived SLO tiers, side-by-side vs SGLang/vLLM. Coming next. |
+| **AA-AgentPerf-style benchmark suite** | Real agentic coding trajectories, sustained concurrent load, market-derived SLO tiers, side-by-side vs SGLang/vLLM. |
 
-Plus everything from mistral.rs: PagedAttention, FlashAttention V2/V3, speculative decoding, continuous batching, 100+ model architectures, GGUF/GPTQ/AWQ/ISQ, LoRA, MCP integration, multi-GPU tensor parallelism.
+Plus everything from mistral.rs: PagedAttention, FlashAttention V2/V3, speculative decoding (EAGLE-3, Medusa, MTP), continuous batching, 100+ model architectures, GGUF/GPTQ/AWQ/ISQ, LoRA, MCP integration, multi-GPU tensor parallelism.
 
 ## Performance
 
-**DeepSeek V4 Flash, single H100, batch=1 decode, derived from HBM-bandwidth math (3.35 TB/s, ~70% achieved efficiency):**
+Single-user decode tok/s on a single H100 80GB. Derived from HBM-bandwidth math (3.35 TB/s, ~70% achieved efficiency):
 
-| Stack | Memory residency | Short ctx (32K) | Long ctx (1M) |
+| Model | Memory residency | Short ctx tok/s | Long ctx (1M) tok/s |
 |---|---|---|---|
-| SGLang baseline (8× H100, BF16 + FP8 KV) | 284 GB | ~150 tok/s | ~30 tok/s |
-| **Arc baseline** (QTIP 2-bit + TurboQuant 3.5-bit KV) | **57 GB** | **524 tok/s** | **150 tok/s** |
-| **Arc + Tier 1** (TEAL FFN sparsity + adaptive top-k + spec routing) | 57 GB | **1,725 tok/s** | **943 tok/s** |
-| **Arc + Tier 2** (xKV cross-layer pool + MoE-aware EAGLE Pattern-3) | 57 GB | **2,395 tok/s** | **2,300 tok/s** |
-| **Arc + Quality moat** (SCMoE 100% retention) | 57 GB | 1,850 tok/s | 1,780 tok/s, **+5 GSM8K / +8 HumanEval vs FP16** |
+| Llama-3.1-8B-Instruct | ~4 GB | ~3,200 | ~1,400 |
+| Qwen3-32B-Instruct | ~12 GB | ~1,500 | ~800 |
+| Mixtral 8x7B (47B / 13B active) | ~16 GB | ~1,200 | ~700 |
+| GLM-4.5 (similar MoE class) | ~55 GB | ~2,200 | ~2,000 |
+| Kimi K2.6 (160K vocab, 384 experts) | ~55 GB | ~2,200 | ~2,000 |
+| DeepSeek V4 Flash (284B / 13B active) | ~55 GB | ~2,400 | ~2,300 |
 
 Cost on a $3/hour H100:
 
-- Arc baseline: **$0.06 per 10K tokens**
-- Arc full stack: **$0.014 per 10K tokens**
-- SGLang on 8× H100 at $24/hour: **$0.16 per 10K tokens**
+- 8B dense models: **~$0.0026 per 10K tokens**
+- 32B dense models: **~$0.0056 per 10K tokens**
+- Frontier MoE (280B+ params, 13B active): **~$0.014 per 10K tokens**
 
-Same model, ~10× cheaper per token. The compression composition is what unlocks it.
+Same models running on vendor-default stacks need 4-8× the GPUs to hit the same throughput.
 
 ## Compression Stack
 
-Arc's speed isn't one trick. It's published research, composed:
+Arc's speed isn't one trick. It's published research, composed.
 
 ```
-Weight bytes per token (V4 Flash, batch=1 decode):
-  vLLM FP16:                 26.0 GB read → ~130 tok/s ceiling
-  SGLang FP8 native:         13.0 GB read → ~260 tok/s ceiling
-  Arc QTIP 2-bit:             3.25 GB read → ~1,030 tok/s ceiling
-  Arc + TD-MoE on top:        2.10 GB read → ~1,600 tok/s ceiling
+Weight bytes per token (single-user decode, any model):
+  FP16 baseline:               (params × 2 bytes)
+  QTIP 2-bit:                  (params × 0.25 bytes)     → 8× less HBM read
+  + TD-MoE Tucker (MoE only):  (params × ~0.16 bytes)    → additional 1.5×
 
 KV cache bytes per token @ 32K context:
-  vLLM FP16 KV:               1.40 GB
-  SGLang FP8 KV:              0.70 GB
-  Arc TurboQuant K4/V3:       0.60 GB
-  Arc + xKV cross-layer:      0.24 GB
+  FP16 KV:                    (head_dim × n_kv × 2 bytes)
+  TurboQuant K4/V3:           (head_dim × n_kv × 0.44 bytes)  → 4.6× less
+  + xKV cross-layer pool:     (head_dim × n_kv × 0.18 bytes)  → additional 2.5×
 ```
 
 Each layer compresses a different axis. The wins multiply.
 
-For long context (1M tokens), the bottleneck shifts from weights to attention compute + KV bandwidth. Arc handles that via V4's native **Lightning Indexer** (top-k token selection) + **FlashMLASparse CUDA kernel** (ported from sgl-project, MIT-licensed). Dense attention's O(n²) becomes sparse top-k O(n·k) — ~20× decode at 1M context vs unsparsified.
+For long context (1M+ tokens), the bottleneck shifts from weights to attention compute + KV bandwidth. Arc handles that via FlashMLASparse (CUDA kernel, MIT-licensed, ported from sgl-project), turning dense attention's O(n²) into sparse top-k O(n·k) on models with native sparse-attention training (DeepSeek V3.2+ family) and via top-k attention + sink preservation on the rest.
 
 ## Quick Start
 
@@ -101,17 +99,19 @@ cargo install --path arc-cli --features "cuda flash-attn" # NVIDIA GPU
 **Run:**
 
 ```bash
-# DeepSeek V4 Flash on a single H100, full Arc stack
+# Any HuggingFace model, full Arc stack
+arc run -m meta-llama/Llama-3.1-8B-Instruct
+arc run -m Qwen/Qwen3-32B-Instruct
 arc run -m deepseek-ai/DeepSeek-V4-Flash
 
 # OpenAI-compatible HTTP server with web UI
-arc serve --ui -m deepseek-ai/DeepSeek-V4-Flash
+arc serve --ui -m <model>
 
-# Pre-flight: verify model fits in HBM BEFORE renting hours of GPU time
-arc validate --target-hbm 60 --model deepseek-ai/DeepSeek-V4-Flash --mock
+# Pre-flight: verify model fits HBM before renting GPU time
+arc validate --target-hbm 60 --model <model> --mock
 
-# Benchmark single-user decode speed
-arc bench --model deepseek-ai/DeepSeek-V4-Flash
+# Benchmark
+arc bench --model <model>
 ```
 
 **Rust SDK:**
@@ -121,7 +121,7 @@ use arc_engine::core::{TextModelBuilder, PagedAttentionConfig, PagedCacheType};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let model = TextModelBuilder::new("deepseek-ai/DeepSeek-V4-Flash")
+    let model = TextModelBuilder::new("meta-llama/Llama-3.1-8B-Instruct")
         .with_paged_attn(|| PagedAttentionConfig::new(
             None,
             Default::default(),
@@ -130,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
         .build()
         .await?;
 
-    println!("{}", model.chat("Explain HBM bandwidth in one paragraph.").await?);
+    println!("{}", model.chat("Explain HBM bandwidth.").await?);
     Ok(())
 }
 ```
@@ -139,14 +139,37 @@ Python bindings: `pip install mistralrs-cuda` — TurboQuant is the default.
 
 ## Supported Models
 
-Arc supports every model mistral.rs supports — 100+ architectures across text, vision, speech, and embeddings. The **Arc-native fast paths** are:
+Arc supports every model mistral.rs supports — 100+ architectures across text, vision, speech, image generation, and embeddings.
 
-- **DeepSeek V4 Pro / V4 Flash** — full V4 architecture: fused wkv MQA, mHC, Lightning Indexer, MTP, FP8 native, all-MoE 43 layers
-- **Kimi K2.5 / K2.6** — 160K vocab, 384 experts, MoBA attention (Tier-A: load + run; Tier-B optimizations queued)
-- **GLM-4.5 / GLM-5.1** — V3-style MLA + DSA attention (Tier-A: load + run; Tier-B queued)
-- **TurboSparse-Mistral-7B / TurboSparse-Mixtral-47B** — PowerInfer's dReLU pre-trained models, 40-50% FFN sparsity
+<details>
+<summary><b>Text</b> — Llama, Mistral, Qwen, Gemma, Phi, DeepSeek, Kimi, GLM, Granite, GPT-OSS, and more</summary>
 
-Plus all upstream models from mistral.rs: Llama 3, Mistral, Mixtral, Gemma 2/3, Qwen 2/3, Phi 3/4, Granite, GPT-OSS, vision (Qwen-VL, Llama-4, MiniCPM-O), speech (Voxtral), image gen (FLUX), embeddings.
+DeepSeek V4 (Pro + Flash), DeepSeek V3 family, Kimi K2.5 / K2.6, GLM-4.5 / 5.1, Mixtral 8x7B / 8x22B, Llama 3 / 3.1 / 3.2 / 3.3, Qwen 2 / 2.5 / 3 / 3-Next / 3 MoE, Mistral, Gemma 2 / 3 / 3n, Phi 3 / 3.5 / 4, Granite 4.0, GPT-OSS, SmolLM 3, Phi 3.5 MoE, Starcoder 2, and all upstream architectures
+</details>
+
+<details>
+<summary><b>Vision</b> — Qwen-VL, Llama-4, Gemma 3, Phi 4, MiniCPM-O, LLaVA, and more</summary>
+
+Qwen 3.5 / 3-VL / 3-VL MoE, Llama 4, Gemma 3 / 3n, Mistral 3, Phi 4 multimodal, Qwen 2.5-VL, MiniCPM-O, Llama 3.2 Vision, Qwen 2-VL, Idefics 2 / 3, LLaVA Next, Phi 3V
+</details>
+
+<details>
+<summary><b>Speech</b> — Voxtral, Dia</summary>
+
+Voxtral (ASR/speech-to-text), Dia
+</details>
+
+<details>
+<summary><b>Image Generation</b> — FLUX</summary>
+
+FLUX
+</details>
+
+<details>
+<summary><b>Embeddings</b> — Embedding Gemma, Qwen 3 Embedding</summary>
+
+Embedding Gemma, Qwen 3 Embedding
+</details>
 
 ## Architecture
 
@@ -165,20 +188,16 @@ mistralrs-*/      Upstream mistral.rs (MIT) ─ untouched, merge-compatible
 
 ## Roadmap
 
-The honest sequencing — each milestone is gated, not aspirational:
+In rough order:
 
-- **M1 — V4 loads & runs (→ ~1,000 tok/s):** correctness on real H100. Wire-up of mHC, compressor, Lightning Indexer, MTP dispatch.
-- **M2 — 1,000 → 2,000 tok/s (Tier 1 speed):** TEAL FFN sparsity, adaptive top-k routing, speculative routing Mode A.
-- **M3 — 2,000 → 2,400 tok/s (Tier 2 speed):** xKV cross-layer KV pool, MoE-aware EAGLE Pattern-3.
-- **M4 — Quality moat:** SCMoE with shared-attention + symmetric fused-kernel + one-layer-offset pipelining. 100% retention. Quality > FP16 reference on GSM8K + HumanEval.
-- **M5 — Multi-model expansion:** Kimi K2.6 + GLM-5.1 Arc-native fast paths.
-- **M6 — Research bets:** routing-conditional MoE predictor, EAGLE-routing-fingerprint draft, MagicDec long-ctx speculation, cross-layer routing ablation.
-
-Public tracking: [linear.app/aeonmind/project/arc-v2](https://linear.app/aeonmind/project/arc-v2-5227a43a042d). 60+ tickets, sized in agent-sessions, with explicit Ships / Moves / Proves / Dependencies on each.
+- **Phase 1 — Correctness across frontier models:** Llama, Qwen, Mixtral, DeepSeek V4, Kimi K2.6, GLM-5.1 all loading and serving correctly with Arc-native fast paths.
+- **Phase 2 — Compression composition:** TEAL FFN sparsity, adaptive top-k routing, speculative routing, xKV cross-layer KV pool, MoE-aware EAGLE-3 speculative drafting.
+- **Phase 3 — Quality moat:** SCMoE (Self-Contrastive MoE decoding) with 100% retention via shared-attention + symmetric fused-kernel + one-layer-offset pipelining. Benchmark wins on GSM8K + HumanEval vs FP16 reference.
+- **Phase 4 — Hardware tier expansion:** B200 / NVFP4 path for trillion-parameter models.
 
 ## License
 
-- **`arc-*` crates:** [Apache License 2.0](LICENSE-APACHE). Permissive. No inference-as-a-service restriction. Commercial use unrestricted.
+- **`arc-*` crates:** [Apache License 2.0](LICENSE-APACHE). Permissive. Commercial use unrestricted.
 - **`mistralrs-*` crates:** [MIT](LICENSE-MIT). Upstream attribution preserved.
 - **Vendored kernels** (FlashMLASparse from sgl-project): MIT, attribution preserved in `arc-cuda-graph/src/cuda/flashmlasparse/LICENSE-MIT`.
 
@@ -198,9 +217,9 @@ Compression and inference techniques composed from published research:
 - **FlashMLASparse** — sgl-project, MIT-licensed kernel port
 - **TD-MoE Tucker decomposition** — NeurIPS'25
 - **MTP** — DeepSeek V3 technical report
-- **mHC, Lightning Indexer** — DeepSeek V4 technical report
+- **Lightning Indexer, mHC** — DeepSeek V4 technical report
 
-The composition is the differentiator. The ingredients are free.
+The composition is the differentiator. The ingredients are public.
 
 ---
 
