@@ -244,7 +244,7 @@ impl QuantMethod for VectorFP8Linear {
                     &weight.to_device(&device)?,
                     bias,
                     &device,
-                    crate::QtipMode::Greedy,
+                    crate::QtipMode::Viterbi,
                 )
             }
             None => {
