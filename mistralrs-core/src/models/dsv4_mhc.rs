@@ -84,6 +84,56 @@ impl V4MHCRuntime {
             rms_norm_eps: cfg.rms_norm_eps,
         }
     }
+
+    /// Lift a 3-D residual `[B, T, hidden]` (the embedding output) into a
+    /// 4-D mHC residual `[B, T, hc_mult, hidden]` by replicating across the
+    /// `hc_mult` stream axis. This is the model-entry lift used at the top
+    /// of the decoder stack in [`DeepSeekV4::forward`].
+    ///
+    /// Algebraic identity: with zero-init mHC params, the 4-D stack is the
+    /// uniform broadcast of the 3-D input, so a `mean(4d, dim=2)` reduces
+    /// back to the original 3-D state. The actual learned mHC weights
+    /// drive the per-layer mix into asymmetric stream states.
+    pub fn lift_3d_to_4d(&self, xs: &Tensor) -> Result<Tensor> {
+        let dims = xs.dims();
+        if dims.len() != 3 {
+            candle_core::bail!(
+                "V4 mHC lift_3d_to_4d: expected rank-3 input [B, T, hidden], got {:?}",
+                dims
+            );
+        }
+        let (b, t, h) = (dims[0], dims[1], dims[2]);
+        xs.unsqueeze(2)?
+            .broadcast_as((b, t, self.hc_mult, h))?
+            .contiguous()
+    }
+
+    /// Collapse a 4-D mHC residual `[B, T, hc_mult, hidden]` back to 3-D
+    /// `[B, T, hidden]` by mean-reducing over the `hc_mult` stream axis.
+    ///
+    /// This is the *non-learned* fallback collapse — used when the global
+    /// mHC head (`hc_head_*` tensors) is absent from the checkpoint but
+    /// per-layer mHC params are present. The proper V4 collapse routes
+    /// through [`V4MHCHead::forward`], which applies a learned sigmoid
+    /// mixing across the `hc_mult` streams.
+    pub fn collapse_4d_to_3d(&self, xs_4d: &Tensor) -> Result<Tensor> {
+        let dims = xs_4d.dims();
+        if dims.len() != 4 {
+            candle_core::bail!(
+                "V4 mHC collapse_4d_to_3d: expected rank-4 input \
+                 [B, T, hc_mult, hidden], got {:?}",
+                dims
+            );
+        }
+        if dims[2] != self.hc_mult {
+            candle_core::bail!(
+                "V4 mHC collapse_4d_to_3d: stream axis dim {} != hc_mult={}",
+                dims[2],
+                self.hc_mult
+            );
+        }
+        xs_4d.mean(2)
+    }
 }
 
 /// mHC parameters and constants for a single decoder layer.
@@ -361,9 +411,70 @@ impl V4MHCLayerParams {
         self.hc_post(ffn_out, residual, &post, &comb)
     }
 
-    /// 3-D ↔ 4-D bridge for the attention block, used by `DecoderLayer::forward`
-    /// while the model carries a 3-D residual `[B, T, hidden]` and the full
-    /// 4-D `[B, T, hc_mult, hidden]` threading (RUN-164) has not landed.
+    /// 4-D attn-side pre-step. Mirrors the SGLang `DeepseekV4DecoderLayer`
+    /// attention block's `hc_pre` call (`hc_attn_*` weights). Returns the
+    /// 3-D `y` (the learned single-stream collapse fed into `input_layernorm`
+    /// + attention) along with `post` and `comb` (held for the matching
+    /// `attn_post` call).
+    ///
+    /// Used by [`DeepSeekV4::forward`] in the 4-D end-to-end residual
+    /// threading path (RUN-164).
+    ///
+    /// `residual_4d`: `[B, T, hc_mult, hidden]`
+    /// Returns `(y, post, comb)`:
+    /// - `y`:    `[B, T, hidden]`
+    /// - `post`: `[B, T, hc_mult]`
+    /// - `comb`: `[B, T, hc_mult, hc_mult]`
+    pub fn attn_pre(&self, residual_4d: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        self.hc_pre(
+            residual_4d,
+            &self.hc_attn_fn,
+            &self.hc_attn_scale,
+            &self.hc_attn_base,
+        )
+    }
+
+    /// 4-D FFN-side pre-step. Mirrors `attn_pre` but uses `hc_ffn_*` weights.
+    pub fn ffn_pre(&self, residual_4d: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        self.hc_pre(
+            residual_4d,
+            &self.hc_ffn_fn,
+            &self.hc_ffn_scale,
+            &self.hc_ffn_base,
+        )
+    }
+
+    /// 4-D post-step alias for [`hc_post`]. Exists for symmetry with
+    /// [`attn_pre`] / [`ffn_pre`] in the 4-D end-to-end flow; the same call
+    /// is used for both the attention-side and the FFN-side post-mix
+    /// because the `(post, comb)` tensors fed in already encode which
+    /// weights drove the pre-step.
+    pub fn mix_post_4d(
+        &self,
+        branch_out: &Tensor,
+        residual_4d: &Tensor,
+        post: &Tensor,
+        comb: &Tensor,
+    ) -> Result<Tensor> {
+        self.hc_post(branch_out, residual_4d, post, comb)
+    }
+
+    /// 3-D ↔ 4-D bridge for the attention block — **legacy / partial-V4
+    /// fallback only**.
+    ///
+    /// Originally RUN-169 used this bridge as the active residual-mix path
+    /// inside `DecoderLayer::forward` while the model still threaded a 3-D
+    /// residual `[B, T, hidden]` and the full 4-D `[B, T, hc_mult, hidden]`
+    /// threading (RUN-164) was not yet in place.
+    ///
+    /// RUN-164 lifts the residual stack to 4-D end-to-end through the entire
+    /// decoder stack; the active path now uses [`attn_pre`] + [`mix_post_4d`]
+    /// directly without the lift/collapse-per-layer overhead.
+    ///
+    /// This bridge is retained for partial-V4 checkpoints — i.e. cases where
+    /// per-layer `hc_attn_*` / `hc_ffn_*` tensors are present but the global
+    /// `hc_head_*` is absent. In that scenario the model-level forward keeps
+    /// a 3-D residual and per-layer mixing falls back to the bridge.
     ///
     /// Input/output:
     /// - `residual`: `[B, T, hidden]`
@@ -415,6 +526,8 @@ impl V4MHCLayerParams {
     }
 
     /// 3-D ↔ 4-D bridge for the FFN block (mirrors `mix_attn_3d_bridge`).
+    /// See [`mix_attn_3d_bridge`] for the legacy / partial-V4 fallback
+    /// usage note.
     pub fn mix_ffn_3d_bridge(&self, residual: &Tensor, ffn_out: &Tensor) -> Result<Tensor> {
         let dims = residual.dims();
         if dims.len() != 3 {
@@ -1094,6 +1207,432 @@ mod tests {
         assert!(params
             .mix_attn_3d_bridge(&residual_bad, &attn_out_bad)
             .is_err());
+        Ok(())
+    }
+
+    /// RUN-164: `lift_3d_to_4d` produces shape `[B, T, hc_mult, hidden]` with
+    /// the input replicated across the new `hc_mult` axis.
+    #[test]
+    fn lift_3d_to_4d_replicates_streams() -> Result<()> {
+        let dev = Device::Cpu;
+        let hidden = 4;
+        let hc_mult = 4;
+        let rt = V4MHCRuntime {
+            hc_mult,
+            hc_sinkhorn_iters: DEFAULT_HC_SINKHORN_ITERS,
+            hc_eps: DEFAULT_HC_EPS,
+            rms_norm_eps: 1e-6,
+        };
+
+        let b = 2;
+        let t = 3;
+        let xs = Tensor::from_vec(
+            (0..b * t * hidden).map(|i| i as f32).collect::<Vec<_>>(),
+            (b, t, hidden),
+            &dev,
+        )?;
+        let xs_4d = rt.lift_3d_to_4d(&xs)?;
+        assert_eq!(xs_4d.dims(), &[b, t, hc_mult, hidden]);
+
+        // Each stream slot k must equal the original 3-D input.
+        for k in 0..hc_mult {
+            let stream_k = xs_4d.narrow(2, k, 1)?.squeeze(2)?;
+            let xs_v: Vec<f32> = xs.flatten_all()?.to_vec1()?;
+            let k_v: Vec<f32> = stream_k.flatten_all()?.to_vec1()?;
+            assert_eq!(xs_v.len(), k_v.len());
+            for (a, b) in xs_v.iter().zip(k_v.iter()) {
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "stream {k} differs from input: {a} vs {b}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// RUN-164: `collapse_4d_to_3d` (mean reduction) is the inverse of
+    /// `lift_3d_to_4d` when no per-layer mixing has happened.
+    #[test]
+    fn collapse_4d_to_3d_inverse_of_lift() -> Result<()> {
+        let dev = Device::Cpu;
+        let hidden = 4;
+        let hc_mult = 4;
+        let rt = V4MHCRuntime {
+            hc_mult,
+            hc_sinkhorn_iters: DEFAULT_HC_SINKHORN_ITERS,
+            hc_eps: DEFAULT_HC_EPS,
+            rms_norm_eps: 1e-6,
+        };
+
+        let b = 1;
+        let t = 4;
+        let xs = Tensor::from_vec(
+            (0..b * t * hidden).map(|i| (i as f32) * 0.7).collect(),
+            (b, t, hidden),
+            &dev,
+        )?;
+        let xs_4d = rt.lift_3d_to_4d(&xs)?;
+        let xs_back = rt.collapse_4d_to_3d(&xs_4d)?;
+        assert_eq!(xs_back.dims(), xs.dims());
+        let xs_v: Vec<f32> = xs.flatten_all()?.to_vec1()?;
+        let back_v: Vec<f32> = xs_back.flatten_all()?.to_vec1()?;
+        for (a, b) in xs_v.iter().zip(back_v.iter()) {
+            assert!((a - b).abs() < 1e-5, "collapse(lift(xs)) != xs: {a} vs {b}");
+        }
+        Ok(())
+    }
+
+    /// RUN-164: `lift_3d_to_4d` rejects non-3-D input.
+    #[test]
+    fn lift_3d_to_4d_rejects_wrong_rank() -> Result<()> {
+        let dev = Device::Cpu;
+        let rt = V4MHCRuntime {
+            hc_mult: 4,
+            hc_sinkhorn_iters: DEFAULT_HC_SINKHORN_ITERS,
+            hc_eps: DEFAULT_HC_EPS,
+            rms_norm_eps: 1e-6,
+        };
+        // 2-D and 4-D should fail.
+        let bad_2d = Tensor::zeros((4, 8), DType::F32, &dev)?;
+        assert!(rt.lift_3d_to_4d(&bad_2d).is_err());
+        let bad_4d = Tensor::zeros((1, 2, 4, 8), DType::F32, &dev)?;
+        assert!(rt.lift_3d_to_4d(&bad_4d).is_err());
+        Ok(())
+    }
+
+    /// RUN-164: end-to-end 4-D residual threading through a synthetic
+    /// 2-layer decoder stack. Asserts:
+    /// (a) intermediate residual stays 4-D throughout all layers,
+    /// (b) only the final head-collapse step returns to 3-D,
+    /// (c) the resulting 3-D state has the right shape for `lm_head`.
+    ///
+    /// Uses identity-like "attention" and "FFN" callables (just a small
+    /// linear pass + residual broadcast) so the test focuses on the mHC
+    /// residual plumbing rather than the attention math.
+    #[test]
+    fn decoder_layer_threads_4d_residual_end_to_end() -> Result<()> {
+        let dev = Device::Cpu;
+        let hidden = 4;
+        let hc_mult = 4;
+        let mix_hc = (2 + hc_mult) * hc_mult;
+        let hc_dim = hc_mult * hidden;
+
+        // Build 2 layers worth of mHC params with a deterministic, small,
+        // non-zero pattern so the learned blend actually drives the path.
+        let make_params = |seed: f32| -> V4MHCLayerParams {
+            let hc_attn_fn = Tensor::from_vec(
+                (0..mix_hc * hc_dim)
+                    .map(|i| ((i as f32) * 0.013 + seed).sin() * 0.3)
+                    .collect::<Vec<_>>(),
+                (mix_hc, hc_dim),
+                &dev,
+            )
+            .unwrap();
+            let hc_attn_base = Tensor::from_vec(
+                (0..mix_hc)
+                    .map(|i| ((i as f32) * 0.21 + seed).cos() * 0.1)
+                    .collect::<Vec<_>>(),
+                mix_hc,
+                &dev,
+            )
+            .unwrap();
+            let hc_attn_scale = Tensor::from_vec(
+                vec![1.0f32 + seed * 0.1, -0.5 + seed * 0.05, 0.7 - seed * 0.03],
+                3,
+                &dev,
+            )
+            .unwrap();
+            make_layer_params(hidden, hc_mult, hc_attn_fn, hc_attn_base, hc_attn_scale)
+        };
+        let layer0_params = make_params(0.0);
+        let layer1_params = make_params(1.0);
+        let layers = [&layer0_params, &layer1_params];
+
+        // Head params: identity-ish fn so we can reduce 4-D back to 3-D.
+        let head_fn = {
+            // [hc_mult, hc_dim] — for each output channel k, take stream k
+            // hidden_size-wide slice. So fn[k, k*hidden..(k+1)*hidden] = 1
+            // and zero elsewhere; this means `mixes[n, k] = sum(x[n, k, :])`.
+            let mut v = vec![0.0f32; hc_mult * hc_dim];
+            for k in 0..hc_mult {
+                for h in 0..hidden {
+                    v[k * hc_dim + k * hidden + h] = 1.0;
+                }
+            }
+            Tensor::from_vec(v, (hc_mult, hc_dim), &dev)?
+        };
+        let head_base = Tensor::zeros(hc_mult, DType::F32, &dev)?;
+        let head_scale = Tensor::ones(1, DType::F32, &dev)?;
+        let head = V4MHCHead {
+            hc_head_fn: head_fn,
+            hc_head_base: head_base,
+            hc_head_scale: head_scale,
+            hc_mult,
+            hidden_size: hidden,
+            rt: layer0_params.rt,
+        };
+
+        // Synthetic input embedding: [B, T, hidden].
+        let b = 2;
+        let t = 3;
+        let xs_3d = Tensor::from_vec(
+            (0..b * t * hidden)
+                .map(|i| ((i as f32) * 0.071).sin() * 1.1)
+                .collect::<Vec<_>>(),
+            (b, t, hidden),
+            &dev,
+        )?;
+
+        // Model-entry lift.
+        let mut xs_4d = layer0_params.rt.lift_3d_to_4d(&xs_3d)?;
+        assert_eq!(xs_4d.dims(), &[b, t, hc_mult, hidden]);
+
+        // Per-layer 4-D forward: thread the residual through each layer's
+        // attn-side and ffn-side mHC mix.
+        for (layer_idx, p) in layers.iter().enumerate() {
+            // === ATTN BLOCK ===
+            let residual_attn = xs_4d.clone();
+            let (y_attn, post_attn, comb_attn) = p.attn_pre(&residual_attn)?;
+            assert_eq!(y_attn.dims(), &[b, t, hidden], "layer {layer_idx} attn y");
+            assert_eq!(
+                post_attn.dims(),
+                &[b, t, hc_mult],
+                "layer {layer_idx} attn post"
+            );
+            assert_eq!(
+                comb_attn.dims(),
+                &[b, t, hc_mult, hc_mult],
+                "layer {layer_idx} attn comb"
+            );
+
+            // Fake "attention output" = y_attn * 0.1 + small offset. The
+            // exact shape (`[B, T, hidden]`) is what real attention returns.
+            let two = Tensor::new(0.1f32, &dev)?;
+            let attn_out = y_attn.broadcast_mul(&two)?;
+            assert_eq!(attn_out.dims(), &[b, t, hidden]);
+
+            xs_4d = p.mix_post_4d(&attn_out, &residual_attn, &post_attn, &comb_attn)?;
+            assert_eq!(
+                xs_4d.dims(),
+                &[b, t, hc_mult, hidden],
+                "layer {layer_idx} attn post xs_4d"
+            );
+
+            // === FFN BLOCK ===
+            let residual_ffn = xs_4d.clone();
+            let (y_ffn, post_ffn, comb_ffn) = p.ffn_pre(&residual_ffn)?;
+            assert_eq!(y_ffn.dims(), &[b, t, hidden], "layer {layer_idx} ffn y");
+
+            // Fake "FFN output" = y_ffn * (-0.05).
+            let two = Tensor::new(-0.05f32, &dev)?;
+            let ffn_out = y_ffn.broadcast_mul(&two)?;
+            assert_eq!(ffn_out.dims(), &[b, t, hidden]);
+
+            xs_4d = p.mix_post_4d(&ffn_out, &residual_ffn, &post_ffn, &comb_ffn)?;
+            assert_eq!(
+                xs_4d.dims(),
+                &[b, t, hc_mult, hidden],
+                "layer {layer_idx} ffn post xs_4d"
+            );
+        }
+
+        // Model-exit collapse via the global mHC head.
+        let xs_out = head.forward(&xs_4d)?;
+        assert_eq!(xs_out.dims(), &[b, t, hidden]);
+
+        // All-finite sanity (no NaN/Inf from sinkhorn instability under
+        // the test scales).
+        let out_v: Vec<f32> = xs_out.flatten_all()?.to_vec1()?;
+        for v in &out_v {
+            assert!(v.is_finite(), "non-finite value {v} in xs_out");
+        }
+        Ok(())
+    }
+
+    /// RUN-164: same input through the 3-D bridge (legacy path) vs the 4-D
+    /// end-to-end path produces DIFFERENT outputs — they are not the same
+    /// algorithm, even though both apply the same per-layer mHC params.
+    /// The 4-D path keeps streams asymmetric layer-to-layer; the bridge
+    /// resets them via the mean-collapse at every layer boundary.
+    #[test]
+    fn mhc_4d_path_differs_from_3d_bridge() -> Result<()> {
+        let dev = Device::Cpu;
+        let hidden = 4;
+        let hc_mult = 4;
+        let mix_hc = (2 + hc_mult) * hc_mult;
+        let hc_dim = hc_mult * hidden;
+
+        // Non-zero mHC params — necessary for the 4-D path to actually
+        // differ from the bridge. With zero params both paths reduce to the
+        // standard residual identity.
+        let hc_attn_fn = Tensor::from_vec(
+            (0..mix_hc * hc_dim)
+                .map(|i| ((i as f32) * 0.041).sin() * 0.4)
+                .collect::<Vec<_>>(),
+            (mix_hc, hc_dim),
+            &dev,
+        )?;
+        let hc_attn_base = Tensor::from_vec(
+            (0..mix_hc)
+                .map(|i| ((i as f32) * 0.13).cos() * 0.15)
+                .collect::<Vec<_>>(),
+            mix_hc,
+            &dev,
+        )?;
+        let hc_attn_scale = Tensor::from_vec(vec![1.5f32, -1.0, 0.75], 3, &dev)?;
+        let params = make_layer_params(hidden, hc_mult, hc_attn_fn, hc_attn_base, hc_attn_scale);
+
+        let b = 2;
+        let t = 3;
+        let xs = Tensor::from_vec(
+            (0..b * t * hidden)
+                .map(|i| ((i as f32) * 0.071).sin() * 1.3)
+                .collect::<Vec<_>>(),
+            (b, t, hidden),
+            &dev,
+        )?;
+        let attn_out = Tensor::from_vec(
+            (0..b * t * hidden)
+                .map(|i| ((i as f32) * 0.059).cos() * 0.7)
+                .collect::<Vec<_>>(),
+            (b, t, hidden),
+            &dev,
+        )?;
+
+        // --- 3-D bridge path: a single attn-side mix.
+        let bridged = params.mix_attn_3d_bridge(&xs, &attn_out)?;
+        assert_eq!(bridged.dims(), &[b, t, hidden]);
+
+        // --- 4-D path: lift, attn_pre, attn_post (no FFN; the bridge above
+        // only mixes attn).
+        let xs_4d = params.rt.lift_3d_to_4d(&xs)?;
+        let (_y, post, comb) = params.attn_pre(&xs_4d)?;
+        let mixed_4d = params.mix_post_4d(&attn_out, &xs_4d, &post, &comb)?;
+        assert_eq!(mixed_4d.dims(), &[b, t, hc_mult, hidden]);
+        // Collapse via mean — *without* the learned head, so we isolate the
+        // contribution of the layer's mHC pre/post path.
+        let collapsed = params.rt.collapse_4d_to_3d(&mixed_4d)?;
+        assert_eq!(collapsed.dims(), &[b, t, hidden]);
+
+        // The bridge mean-collapses inside `mix_attn_3d_bridge`, after the
+        // 4-D mix. The 4-D-then-mean path here does the same operation but
+        // with the input residual lifted from the same 3-D source — so
+        // when only ONE attn mix is applied the two should be IDENTICAL
+        // (since lift+attn_pre+attn_post+mean == mix_attn_3d_bridge by
+        // construction). Pin this algebraic identity so future refactors
+        // don't accidentally diverge them.
+        let br_v: Vec<f32> = bridged.flatten_all()?.to_vec1()?;
+        let co_v: Vec<f32> = collapsed.flatten_all()?.to_vec1()?;
+        assert_eq!(br_v.len(), co_v.len());
+        let mut max_err = 0f32;
+        for (a, b) in br_v.iter().zip(co_v.iter()) {
+            max_err = max_err.max((a - b).abs());
+        }
+        assert!(
+            max_err < 1e-4,
+            "1-layer 4D+collapse should match 3-D bridge exactly: max_err={max_err}"
+        );
+
+        // Now do a SECOND attn mix on the previous output. The 4-D path
+        // threads the 4-D residual without re-broadcasting (streams stay
+        // asymmetric); the bridge collapses to 3-D after layer 1 and
+        // re-broadcasts before layer 2.
+        let attn_out2 = Tensor::from_vec(
+            (0..b * t * hidden)
+                .map(|i| ((i as f32) * 0.087).sin() * 0.5)
+                .collect::<Vec<_>>(),
+            (b, t, hidden),
+            &dev,
+        )?;
+        // 4-D path: continue from mixed_4d, do not re-broadcast.
+        let (_y2, post2, comb2) = params.attn_pre(&mixed_4d)?;
+        let mixed_4d_2 = params.mix_post_4d(&attn_out2, &mixed_4d, &post2, &comb2)?;
+        let collapsed_2 = params.rt.collapse_4d_to_3d(&mixed_4d_2)?;
+
+        // Bridge path: bridge from `bridged` (the 3-D residual after the
+        // first mix), which lifts again with broadcast.
+        let bridged_2 = params.mix_attn_3d_bridge(&bridged, &attn_out2)?;
+
+        // After 2 layers the paths MUST diverge.
+        let br2_v: Vec<f32> = bridged_2.flatten_all()?.to_vec1()?;
+        let co2_v: Vec<f32> = collapsed_2.flatten_all()?.to_vec1()?;
+        let diff_count = br2_v
+            .iter()
+            .zip(co2_v.iter())
+            .filter(|(a, b)| (*a - *b).abs() > 1e-3)
+            .count();
+        assert!(
+            diff_count >= br2_v.len() / 2,
+            "after 2-layer mix, 4-D path and 3-D bridge should diverge for at least \
+             half of elements; only {} / {} differ.",
+            diff_count,
+            br2_v.len()
+        );
+
+        // And both must remain finite.
+        for v in br2_v.iter().chain(co2_v.iter()) {
+            assert!(v.is_finite(), "non-finite value {v}");
+        }
+        Ok(())
+    }
+
+    /// RUN-164: with zero `hc_attn_*` / `hc_ffn_*` params, the 4-D path
+    /// reduces to the identity "mean(residual) + branch_out" pattern at
+    /// every stream slot, mirroring the standard residual identity that
+    /// the 3-D bridge zero-params test pins. After mean-collapse the
+    /// 4-D path produces `attn_out + residual` (within sinkhorn-on-zeros
+    /// + hc_eps slack).
+    #[test]
+    fn mhc_4d_zero_params_identity() -> Result<()> {
+        let dev = Device::Cpu;
+        let hidden = 4;
+        let hc_mult = 4;
+        let mix_hc = (2 + hc_mult) * hc_mult;
+        let hc_dim = hc_mult * hidden;
+        let params = make_layer_params(
+            hidden,
+            hc_mult,
+            Tensor::zeros((mix_hc, hc_dim), DType::F32, &dev)?,
+            Tensor::zeros(mix_hc, DType::F32, &dev)?,
+            Tensor::zeros(3, DType::F32, &dev)?,
+        );
+
+        let b = 2;
+        let t = 3;
+        let xs = Tensor::from_vec(
+            (0..b * t * hidden)
+                .map(|i| ((i as f32) * 0.071).sin() * 1.3)
+                .collect::<Vec<_>>(),
+            (b, t, hidden),
+            &dev,
+        )?;
+        let attn_out = Tensor::from_vec(
+            (0..b * t * hidden)
+                .map(|i| ((i as f32) * 0.059).cos() * 0.7)
+                .collect::<Vec<_>>(),
+            (b, t, hidden),
+            &dev,
+        )?;
+
+        // 4-D path: lift → attn_pre → mix_post_4d → collapse(mean).
+        let xs_4d = params.rt.lift_3d_to_4d(&xs)?;
+        let (_y, post, comb) = params.attn_pre(&xs_4d)?;
+        let mixed_4d = params.mix_post_4d(&attn_out, &xs_4d, &post, &comb)?;
+        let collapsed = params.rt.collapse_4d_to_3d(&mixed_4d)?;
+
+        // Expected = attn_out + xs (standard residual).
+        let baseline = (&attn_out + &xs)?;
+        let co_v: Vec<f32> = collapsed.flatten_all()?.to_vec1()?;
+        let bl_v: Vec<f32> = baseline.flatten_all()?.to_vec1()?;
+        let mut max_err = 0f32;
+        for (a, b) in co_v.iter().zip(bl_v.iter()) {
+            max_err = max_err.max((a - b).abs());
+        }
+        // sinkhorn-on-zeros + hc_eps slack, same tolerance as bridge.
+        assert!(
+            max_err < 0.05,
+            "4-D zero-params path diverged from standard residual: max_err={max_err}"
+        );
         Ok(())
     }
 }

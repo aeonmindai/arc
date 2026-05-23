@@ -65,9 +65,22 @@
 //!   checkpoints (direct lookups still work) and intercepts only missing
 //!   `weight_scale_inv` paths to redirect to V4-native `.scale`. Audit §0
 //!   P0 #5 + audit §8 item 5.
-//! - 4-D residual stack threading for mHC (`[B, T, hc_mult, hidden]`).
-//!   Layer params are loaded; the model carries 3-D residual today (hc_mult
-//!   collapsed to 1, mathematically equivalent to standard residual).
+//! ## RUN-164: 4-D mHC residual threading
+//!
+//! When the V4 global mHC head (`hc_head_*`) is loaded AND every layer has
+//! its per-layer mHC params loaded, the model takes the 4-D end-to-end
+//! residual threading path:
+//!   1. The embedding output `[B, T, hidden]` is lifted to
+//!      `[B, T, hc_mult, hidden]` once at the model entry.
+//!   2. Each `DecoderLayer::forward_4d` threads the 4-D state through its
+//!      attention + FFN blocks via `hc_pre` (learned per-token stream
+//!      collapse) + `hc_post` (re-expand new branch output into streams).
+//!   3. The 4-D state is collapsed back to 3-D via the learned
+//!      `V4MHCHead::forward` exactly once before `norm` + `lm_head`.
+//!
+//! The legacy 3-D path (`DecoderLayer::forward` + 3-D bridge from RUN-169)
+//! is retained for partial-V4 checkpoints (per-layer mHC present but
+//! `hc_head_*` absent) and for V3-style fixtures / synth tests.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -1553,22 +1566,18 @@ impl DecoderLayer {
         )>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
-        // V4 mHC residual mixing.
+        // V4 3-D residual fallback path (legacy / partial-V4 checkpoints).
         //
-        // When `self.mhc` is loaded, the attn block uses the 3-D ↔ 4-D
-        // bridge in `V4MHCLayerParams::mix_attn_3d_bridge`, which exercises
-        // the learned `hc_attn_scale` / `hc_attn_fn` / `hc_attn_base` weights
-        // to blend the attention output with the residual (RUN-169).
+        // This path runs when `DeepSeekV4::forward` keeps the residual as
+        // 3-D, i.e. when the global `mhc_head` is absent from the
+        // checkpoint. The full 4-D end-to-end threading (RUN-164) is the
+        // active path for real V4 checkpoints; it uses `forward_4d` below.
         //
-        // The full 4-D residual `[B, T, hc_mult, hidden]` threading (audit
-        // §0 + §8 P0 item 6, tracked as RUN-164) is not yet in place; the
-        // bridge replicates the 3-D residual across the `hc_mult` stream
-        // axis and mean-reduces back. With zero-init mHC params this is
-        // bit-identical to the standard residual `xs + residual`; with the
-        // real learned weights it diverges (which is the RUN-169 fix —
-        // the previously hardcoded 0.5/0.5 hybrid blend, then the silent
-        // `xs + residual` fall-through, are both replaced by the learned
-        // mix here).
+        // When `self.mhc` is loaded (per-layer mHC tensors present), the
+        // attn-side and ffn-side residual mixes use the 3-D ↔ 4-D bridge
+        // (`mix_attn_3d_bridge` / `mix_ffn_3d_bridge`) which exercises the
+        // learned `hc_attn_*` / `hc_ffn_*` weights but pays the cost of
+        // re-broadcasting + mean-collapsing the 4-D streams once per layer.
         //
         // When `self.mhc` is absent (e.g. legacy V3-style fixtures or
         // synthesised tests without the `hc_attn_*` tensors) we fall back
@@ -1598,6 +1607,77 @@ impl DecoderLayer {
             Some(mhc) => mhc.mix_ffn_3d_bridge(residual, &ffn_out),
             None => residual + ffn_out,
         }
+    }
+
+    /// V4 4-D residual end-to-end forward (RUN-164).
+    ///
+    /// Takes a `[B, T, hc_mult, hidden]` mHC residual stack and threads it
+    /// through this layer's attention + FFN blocks without collapsing back
+    /// to 3-D. The math mirrors SGLang's `DeepseekV4DecoderLayer.forward`
+    /// exactly (audit §3 lines 266-287 / `deepseek_v4.py:910-1001`):
+    ///
+    /// ```text
+    /// residual_4d = xs_4d
+    /// y_3d, post, comb = hc_pre(xs_4d, hc_attn_fn, hc_attn_scale, hc_attn_base)
+    /// y_normed = input_layernorm(y_3d)
+    /// attn_out = self_attn(y_normed)
+    /// xs_4d = hc_post(attn_out, residual_4d, post, comb)
+    ///
+    /// residual_4d = xs_4d
+    /// y_3d, post, comb = hc_pre(xs_4d, hc_ffn_fn, hc_ffn_scale, hc_ffn_base)
+    /// y_normed = post_attention_layernorm(y_3d)
+    /// ffn_out = mlp(y_normed)
+    /// xs_4d = hc_post(ffn_out, residual_4d, post, comb)
+    /// ```
+    ///
+    /// **Pre-condition**: `self.mhc` MUST be `Some`. The active 4-D path is
+    /// only taken when `mhc_head.is_some()` at the model level, which in
+    /// turn is gated by V4 checkpoint detection — every real V4 layer has
+    /// its mHC tensors. If you reach this function with `self.mhc == None`,
+    /// it's a bug in the model-level dispatch; we bail rather than silently
+    /// fall back.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_4d(
+        &self,
+        xs_4d: &Tensor,
+        attention_mask: Option<&Tensor>,
+        seqlen_offsets: &[usize],
+        kv_cache: &mut KvCache,
+        metadata: Option<(
+            (Tensor, Tensor, Option<Tensor>, Option<Tensor>),
+            &PagedAttentionInputMetadata,
+        )>,
+        flash_params: &FlashParams,
+    ) -> Result<Tensor> {
+        let mhc = self.mhc.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg(
+                "DecoderLayer::forward_4d called on a layer without loaded `hc_attn_*` / \
+                 `hc_ffn_*` tensors. The 4-D end-to-end path requires per-layer mHC weights; \
+                 callers must dispatch to `forward` (3-D fallback) when `self.mhc` is None."
+                    .to_string(),
+            )
+        })?;
+
+        // === ATTN BLOCK ===
+        let residual_attn = xs_4d;
+        let (y_attn, post_attn, comb_attn) = mhc.attn_pre(residual_attn)?;
+        let y_attn_normed = self.input_layernorm.forward(&y_attn)?;
+        let attn_out = self.attn.forward(
+            &y_attn_normed,
+            attention_mask,
+            seqlen_offsets,
+            kv_cache,
+            metadata,
+            flash_params,
+        )?;
+        let xs_4d = mhc.mix_post_4d(&attn_out, residual_attn, &post_attn, &comb_attn)?;
+
+        // === FFN BLOCK ===
+        let residual_ffn = &xs_4d;
+        let (y_ffn, post_ffn, comb_ffn) = mhc.ffn_pre(residual_ffn)?;
+        let y_ffn_normed = self.post_attention_layernorm.forward(&y_ffn)?;
+        let ffn_out = self.moe_or_mlp.forward(&y_ffn_normed)?;
+        mhc.mix_post_4d(&ffn_out, residual_ffn, &post_ffn, &comb_ffn)
     }
 }
 
@@ -1629,9 +1709,11 @@ pub struct DeepSeekV4 {
     /// V4 MTP head — loaded if `mtp.0.h_proj` (V4 native) or
     /// `mtp.layers.0.h_proj` (HF) tensors present.
     mtp_head: Option<MtpHead>,
-    /// V4 global mHC head — applied just before lm_head when present and
-    /// when the residual stream is 4-D. Audit §0 + §2.
-    #[allow(dead_code)]
+    /// V4 global mHC head — applied just before `norm` + `lm_head` to
+    /// collapse the 4-D `[B, T, hc_mult, hidden]` residual stack back to
+    /// `[B, T, hidden]` via the learned sigmoid-mixed sum across streams.
+    /// When `None`, the model takes the 3-D fallback path (RUN-169 bridge
+    /// or standard residual). Audit §0 + §2.
     mhc_head: Option<super::dsv4_mhc::V4MHCHead>,
 }
 
@@ -1911,7 +1993,7 @@ impl DeepSeekV4 {
         )>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
-        let mut xs = self.embed_tokens.forward(input_ids)?;
+        let xs_embed = self.embed_tokens.forward(input_ids)?;
         let cache = &mut self.cache.normal().0;
         let attention_mask = CausalMasker.make_causal_mask_matrix(
             input_ids,
@@ -1919,7 +2001,7 @@ impl DeepSeekV4 {
                 .as_ref()
                 .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
                 .unwrap_or(cache as &dyn PastKvLenCache),
-            xs.dtype(),
+            xs_embed.dtype(),
             self.cfg.num_attn_heads,
         )?;
         let attention_mask = attention_mask.filter(|_| {
@@ -1929,26 +2011,67 @@ impl DeepSeekV4 {
                 .unwrap_or(true)
         });
         let attention_mask = DeviceMappedMask::new(attention_mask, &*self.mapper)?;
-        for (i, layer) in self.layers.iter().enumerate() {
-            xs = self.mapper.map(xs, i)?;
-            xs = layer.forward(
-                &xs,
-                attention_mask.as_ref().map(|m| m.get(xs.device())),
-                seqlen_offsets,
-                &mut cache[i],
-                metadata
-                    .as_ref()
-                    .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
-                flash_params,
-            )?;
-        }
-        let xs = xs.to_device(&self.device)?;
+
+        // RUN-164: 4-D mHC residual threading end-to-end.
+        //
+        // Active path when the global mHC head (`hc_head_*`) is loaded AND
+        // every layer has its per-layer mHC params loaded — i.e. a real V4
+        // checkpoint. In that case:
+        //   1. Lift `[B, T, hidden]` → `[B, T, hc_mult, hidden]` at the
+        //      embedding output (replicate across the new stream axis).
+        //   2. Each layer calls `forward_4d`, which threads the 4-D
+        //      residual through attention + FFN using `hc_pre` + `hc_post`
+        //      without collapsing back to 3-D.
+        //   3. Collapse `[B, T, hc_mult, hidden]` → `[B, T, hidden]` via
+        //      the learned `V4MHCHead::forward` (sigmoid-mixed sum across
+        //      streams) just before `norm` + `lm_head`.
+        //
+        // Legacy 3-D path is taken when `mhc_head` is None OR any layer is
+        // missing its `mhc` (partial-V4 / V3-style fixtures): the layer's
+        // `forward` (3-D bridge per RUN-169) is called and the global head
+        // is bypassed.
+        let use_4d_mhc = self.mhc_head.is_some() && self.layers.iter().all(|l| l.mhc.is_some());
+
+        let xs = if use_4d_mhc {
+            // Lift to 4-D via the head's runtime (carries hc_mult).
+            let mhc_head = self.mhc_head.as_ref().unwrap();
+            let mut xs_4d = mhc_head.rt.lift_3d_to_4d(&xs_embed)?;
+            for (i, layer) in self.layers.iter().enumerate() {
+                xs_4d = self.mapper.map(xs_4d, i)?;
+                xs_4d = layer.forward_4d(
+                    &xs_4d,
+                    attention_mask.as_ref().map(|m| m.get(xs_4d.device())),
+                    seqlen_offsets,
+                    &mut cache[i],
+                    metadata
+                        .as_ref()
+                        .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
+                    flash_params,
+                )?;
+            }
+            let xs_4d = xs_4d.to_device(&self.device)?;
+            // Collapse via the learned global mHC head: 4-D → 3-D.
+            mhc_head.forward(&xs_4d)?
+        } else {
+            let mut xs = xs_embed;
+            for (i, layer) in self.layers.iter().enumerate() {
+                xs = self.mapper.map(xs, i)?;
+                xs = layer.forward(
+                    &xs,
+                    attention_mask.as_ref().map(|m| m.get(xs.device())),
+                    seqlen_offsets,
+                    &mut cache[i],
+                    metadata
+                        .as_ref()
+                        .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
+                    flash_params,
+                )?;
+            }
+            xs.to_device(&self.device)?
+        };
+
         let xs = xs.apply(&self.norm)?;
         let xs = extract_logits(&xs, context_lens)?;
-
-        // The global mHC head is applied only when the residual stream is
-        // 4-D (hc_mult-stacked). Today the residual stream is 3-D; the
-        // 4-D upgrade is tracked at audit §8 P0 item 6.
 
         self.lm_head.forward_autocast(&xs)
     }
