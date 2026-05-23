@@ -62,9 +62,12 @@ struct SamplingParams {
     int32_t eos_token_id;     // -1 = disabled; only used by host glue
 };
 
-// Max number of kept tokens accumulated in shared memory before the CDF walk.
-// Larger than typical top-p needs (~50). For top_k <= 256 we never exceed.
-__device__ constexpr int MAX_KEEP = 256;
+// The kept-token list is held in global memory (the `keep_scratch` buffer
+// passed by the host wrapper) so that its capacity scales with vocab — the
+// previous `MAX_KEEP = 256` shared-memory cap silently truncated large-vocab
+// samplers (e.g., Kimi K2.6 / 160K vocab) when `top_k <= 0` left `top_p`
+// alone to walk the full sorted distribution. See `sampling_cuda::CudaSampler`
+// for the buffer allocation (`vocab * 8` bytes per batch row: i32 idx + f32 p).
 
 // Block-wide argmax reduction with lowest-index tiebreak.
 // Each thread brings a (val, idx); thread 0 receives the global argmax.
@@ -199,6 +202,8 @@ __global__ void arc_sample_kernel(
     uint64_t* __restrict__ rng_state,            // [batch]
     int32_t* __restrict__ token_ids,             // [batch]
     float* __restrict__ probs_scratch,           // [batch, vocab] writeable scratch
+    int32_t* __restrict__ keep_idx_scratch,      // [batch, vocab] kept-token indices
+    float* __restrict__ keep_p_scratch,          // [batch, vocab] kept-token probs
     int vocab,
     SamplingParams cfg
 ) {
@@ -207,13 +212,17 @@ __global__ void arc_sample_kernel(
     const T* row = logits + (int64_t)bid * vocab;
     const uint32_t* fcnt = freq_counts ? (freq_counts + (int64_t)bid * vocab) : nullptr;
     float* probs = probs_scratch + (int64_t)bid * vocab;
+    // Per-row keep list lives in global memory: capacity = full vocab so the
+    // sampler never truncates when `top_k <= 0` leaves only `top_p` to bound
+    // the kept set. Only thread 0 writes/reads it (one entry per Phase 4
+    // iteration; sequential CDF walk in Phase 5) — global-memory latency
+    // is amortized against the per-iteration argmax over `vocab` elements.
+    int*   keep_idx = keep_idx_scratch + (int64_t)bid * vocab;
+    float* keep_p   = keep_p_scratch   + (int64_t)bid * vocab;
 
     extern __shared__ char smem[];
     float* s_vals = reinterpret_cast<float*>(smem);
     int*   s_idxs = reinterpret_cast<int*>(s_vals + BLOCK);
-    // Reuse smem past the reduction buffers for kept (idx, p) entries.
-    int*   keep_idx = reinterpret_cast<int*>(s_idxs + BLOCK);
-    float* keep_p   = reinterpret_cast<float*>(keep_idx + MAX_KEEP);
 
     // --- Phase 1: apply penalties, temperature, find max, write penalized logits to probs[]. ---
     // We keep the post-penalty / post-temperature logits in probs[] (which we then
@@ -256,9 +265,11 @@ __global__ void arc_sample_kernel(
     __syncthreads();
 
     // --- Phase 4: iteratively pull argmax until top_p / top_k satisfied. ---
-    // Effective cap on kept count.
-    int cap = MAX_KEEP;
-    if (cfg.top_k > 0 && cfg.top_k < cap) cap = cfg.top_k;
+    // Effective cap on kept count: `top_k` when set, else the full vocab.
+    // This matches `sampling_cpu::sample`, which sorts the entire distribution
+    // and truncates only via `top_p` / `top_k`. Earlier revisions clamped to
+    // `MAX_KEEP=256` and silently truncated large-vocab + diffuse `top_p`.
+    int cap = (cfg.top_k > 0 && cfg.top_k < vocab) ? cfg.top_k : vocab;
 
     __shared__ int kept_n;
     __shared__ float cum;
@@ -363,6 +374,8 @@ void arc_launch_sampler_f32(
     uint64_t* rng_state,
     int32_t* token_ids,
     float* probs_scratch,
+    int32_t* keep_idx_scratch,
+    float* keep_p_scratch,
     int vocab,
     int batch,
     arc_sampler::SamplingParams cfg,
@@ -376,21 +389,22 @@ void arc_launch_sampler_f32(
         return;
     }
     int block = pick_block(vocab);
-    size_t base = static_cast<size_t>(block) * (sizeof(float) + sizeof(int));
-    size_t keep = static_cast<size_t>(arc_sampler::MAX_KEEP) * (sizeof(int) + sizeof(float));
-    size_t smem = base + keep;
+    size_t smem = static_cast<size_t>(block) * (sizeof(float) + sizeof(int));
     switch (block) {
         case 256:
             arc_sampler::arc_sample_kernel<float, 256><<<batch, 256, smem, stream>>>(
-                logits, freq_counts, rng_state, token_ids, probs_scratch, vocab, cfg);
+                logits, freq_counts, rng_state, token_ids, probs_scratch,
+                keep_idx_scratch, keep_p_scratch, vocab, cfg);
             break;
         case 128:
             arc_sampler::arc_sample_kernel<float, 128><<<batch, 128, smem, stream>>>(
-                logits, freq_counts, rng_state, token_ids, probs_scratch, vocab, cfg);
+                logits, freq_counts, rng_state, token_ids, probs_scratch,
+                keep_idx_scratch, keep_p_scratch, vocab, cfg);
             break;
         default:
             arc_sampler::arc_sample_kernel<float, 64><<<batch, 64, smem, stream>>>(
-                logits, freq_counts, rng_state, token_ids, probs_scratch, vocab, cfg);
+                logits, freq_counts, rng_state, token_ids, probs_scratch,
+                keep_idx_scratch, keep_p_scratch, vocab, cfg);
             break;
     }
 }
@@ -401,6 +415,8 @@ void arc_launch_sampler_bf16(
     uint64_t* rng_state,
     int32_t* token_ids,
     float* probs_scratch,
+    int32_t* keep_idx_scratch,
+    float* keep_p_scratch,
     int vocab,
     int batch,
     arc_sampler::SamplingParams cfg,
@@ -415,24 +431,25 @@ void arc_launch_sampler_bf16(
         return;
     }
     int block = pick_block(vocab);
-    size_t base = static_cast<size_t>(block) * (sizeof(float) + sizeof(int));
-    size_t keep = static_cast<size_t>(arc_sampler::MAX_KEEP) * (sizeof(int) + sizeof(float));
-    size_t smem = base + keep;
+    size_t smem = static_cast<size_t>(block) * (sizeof(float) + sizeof(int));
     switch (block) {
         case 256:
             arc_sampler::arc_sample_kernel<bf16, 256><<<batch, 256, smem, stream>>>(
                 reinterpret_cast<const bf16*>(logits), freq_counts, rng_state,
-                token_ids, probs_scratch, vocab, cfg);
+                token_ids, probs_scratch, keep_idx_scratch, keep_p_scratch,
+                vocab, cfg);
             break;
         case 128:
             arc_sampler::arc_sample_kernel<bf16, 128><<<batch, 128, smem, stream>>>(
                 reinterpret_cast<const bf16*>(logits), freq_counts, rng_state,
-                token_ids, probs_scratch, vocab, cfg);
+                token_ids, probs_scratch, keep_idx_scratch, keep_p_scratch,
+                vocab, cfg);
             break;
         default:
             arc_sampler::arc_sample_kernel<bf16, 64><<<batch, 64, smem, stream>>>(
                 reinterpret_cast<const bf16*>(logits), freq_counts, rng_state,
-                token_ids, probs_scratch, vocab, cfg);
+                token_ids, probs_scratch, keep_idx_scratch, keep_p_scratch,
+                vocab, cfg);
             break;
     }
 }
@@ -443,6 +460,8 @@ void arc_launch_sampler_f16(
     uint64_t* rng_state,
     int32_t* token_ids,
     float* probs_scratch,
+    int32_t* keep_idx_scratch,
+    float* keep_p_scratch,
     int vocab,
     int batch,
     arc_sampler::SamplingParams cfg,
@@ -457,24 +476,25 @@ void arc_launch_sampler_f16(
         return;
     }
     int block = pick_block(vocab);
-    size_t base = static_cast<size_t>(block) * (sizeof(float) + sizeof(int));
-    size_t keep = static_cast<size_t>(arc_sampler::MAX_KEEP) * (sizeof(int) + sizeof(float));
-    size_t smem = base + keep;
+    size_t smem = static_cast<size_t>(block) * (sizeof(float) + sizeof(int));
     switch (block) {
         case 256:
             arc_sampler::arc_sample_kernel<f16, 256><<<batch, 256, smem, stream>>>(
                 reinterpret_cast<const f16*>(logits), freq_counts, rng_state,
-                token_ids, probs_scratch, vocab, cfg);
+                token_ids, probs_scratch, keep_idx_scratch, keep_p_scratch,
+                vocab, cfg);
             break;
         case 128:
             arc_sampler::arc_sample_kernel<f16, 128><<<batch, 128, smem, stream>>>(
                 reinterpret_cast<const f16*>(logits), freq_counts, rng_state,
-                token_ids, probs_scratch, vocab, cfg);
+                token_ids, probs_scratch, keep_idx_scratch, keep_p_scratch,
+                vocab, cfg);
             break;
         default:
             arc_sampler::arc_sample_kernel<f16, 64><<<batch, 64, smem, stream>>>(
                 reinterpret_cast<const f16*>(logits), freq_counts, rng_state,
-                token_ids, probs_scratch, vocab, cfg);
+                token_ids, probs_scratch, keep_idx_scratch, keep_p_scratch,
+                vocab, cfg);
             break;
     }
 }

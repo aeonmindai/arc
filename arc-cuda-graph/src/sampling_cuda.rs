@@ -49,9 +49,14 @@ pub struct SamplingParams {
     pub eos_token_id: i32,
 }
 
-/// Maximum kept tokens used by the GPU iterative-argmax loop. Must match
-/// `MAX_KEEP` in `cuda/sampling_kernel.cu`.
-pub const GPU_MAX_KEEP: usize = 256;
+/// Historical cap on the GPU kept-token list. The kernel previously held the
+/// kept (idx, p) pairs in shared memory and clamped the kept count to 256,
+/// which silently truncated large-vocab samplers when `top_k <= 0` left
+/// `top_p` alone to walk a diffuse distribution. The kernel now stores the
+/// keep list in global memory at full-vocab capacity (see `keep_scratch` on
+/// `CudaSampler`), so there is no runtime cap. The constant remains for
+/// back-compat with consumers that reference it.
+pub const GPU_MAX_KEEP: usize = usize::MAX;
 
 /// Host-side simulator of the exact algorithm `cuda/sampling_kernel.cu`
 /// implements. Used by the test suite to verify the GPU algorithm produces
@@ -93,18 +98,18 @@ pub fn gpu_algorithm_simulate(
 
     // Iterative argmax → keep list, with lowest-index tiebreak (mirrors GPU).
     //
-    // The CUDA kernel caps the kept list at `GPU_MAX_KEEP` (= MAX_KEEP) shared-
-    // memory slots; for top_k>MAX_KEEP or top_k disabled + top_p=1.0 + huge
-    // vocab the kernel truncates while `sampling_cpu::sample` keeps everything.
-    // For bit-exactness against the CPU reference, the simulator uses the
-    // CPU's effective cap: top_k when set, else the full vocab.
+    // The kernel stores the keep list in global memory at full-vocab capacity,
+    // so its effective cap matches the CPU reference: `top_k` when set, else
+    // the full vocab. This was previously clamped to 256 in shared memory,
+    // which silently truncated large-vocab samplers (RUN-170).
     let cap = if cfg.top_k > 0 {
         (cfg.top_k as usize).min(probs.len())
     } else {
         probs.len()
     };
     // Reference GPU_MAX_KEEP to keep the constant linked from this module
-    // (avoids dead-code warnings; consumers still rely on it for sizing).
+    // (avoids dead-code warnings; the constant is now a historical marker
+    // documenting the previous cap).
     let _ = GPU_MAX_KEEP;
     let mut keep: Vec<(usize, f32)> = Vec::with_capacity(cap);
     let mut cum = 0.0f32;
@@ -136,8 +141,7 @@ pub fn gpu_algorithm_simulate(
     *rng_state = rng_state
         .wrapping_mul(0x9E3779B97F4A7C15)
         .wrapping_add(0xDEADBEEFC0DECAFE);
-    let mixed = (*rng_state ^ (*rng_state >> 30))
-        .wrapping_mul(0xBF58476D1CE4E5B9);
+    let mixed = (*rng_state ^ (*rng_state >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
     let u = ((mixed >> 33) as u32) as f32 / (1u64 << 31) as f32;
     let target = u * kept_sum;
 
@@ -173,6 +177,8 @@ extern "C" {
         rng_state: *mut u64,
         token_ids: *mut i32,
         probs_scratch: *mut f32,
+        keep_idx_scratch: *mut i32,
+        keep_p_scratch: *mut f32,
         vocab: i32,
         batch: i32,
         cfg: SamplingParams,
@@ -185,6 +191,8 @@ extern "C" {
         rng_state: *mut u64,
         token_ids: *mut i32,
         probs_scratch: *mut f32,
+        keep_idx_scratch: *mut i32,
+        keep_p_scratch: *mut f32,
         vocab: i32,
         batch: i32,
         cfg: SamplingParams,
@@ -197,6 +205,8 @@ extern "C" {
         rng_state: *mut u64,
         token_ids: *mut i32,
         probs_scratch: *mut f32,
+        keep_idx_scratch: *mut i32,
+        keep_p_scratch: *mut f32,
         vocab: i32,
         batch: i32,
         cfg: SamplingParams,
@@ -239,6 +249,13 @@ pub struct CudaSampler {
     rng_state: Tensor,
     /// f32[batch, vocab] — softmax scratch, reused across calls.
     probs_scratch: Tensor,
+    /// i32[batch, vocab] — global-memory keep-list indices, written by the
+    /// kernel's Phase 4 (one entry per kept token). Sized to full vocab so
+    /// `top_k <= 0 + top_p < 1.0` cannot truncate. See RUN-170.
+    keep_idx_scratch: Tensor,
+    /// f32[batch, vocab] — global-memory keep-list probabilities, paired
+    /// with `keep_idx_scratch` row-wise.
+    keep_p_scratch: Tensor,
 }
 
 #[cfg(feature = "cuda")]
@@ -277,6 +294,14 @@ impl CudaSampler {
         let rng_state = Tensor::from_vec(bytes, (batch * 8,), device)?;
 
         let probs_scratch = Tensor::zeros((batch, vocab), DType::F32, device)?;
+        // Keep-list scratch (RUN-170): one entry per token, sized to full vocab
+        // so the kernel's iterative-argmax loop can never truncate. The keep
+        // arrays are only written/read by thread 0 of each block, so global
+        // memory latency is fully amortized by the parallel argmax phases.
+        // We allocate an I32 buffer directly via `from_vec` because Candle's
+        // `Tensor::zeros` on I32 may not be supported across all backends.
+        let keep_idx_scratch = Tensor::from_vec(vec![0i32; batch * vocab], (batch, vocab), device)?;
+        let keep_p_scratch = Tensor::zeros((batch, vocab), DType::F32, device)?;
 
         Ok(Self {
             device: device.clone(),
@@ -286,6 +311,8 @@ impl CudaSampler {
             dtype,
             rng_state,
             probs_scratch,
+            keep_idx_scratch,
+            keep_p_scratch,
         })
     }
 
@@ -327,11 +354,7 @@ impl CudaSampler {
         }
         if let Some(fc) = freq_counts {
             if fc.dtype() != DType::U32 || fc.dims() != [self.batch, self.vocab] {
-                candle_core::bail!(
-                    "freq_counts must be U32 [{},{}]",
-                    self.batch,
-                    self.vocab
-                );
+                candle_core::bail!("freq_counts must be U32 [{},{}]", self.batch, self.vocab);
             }
         }
 
@@ -339,6 +362,8 @@ impl CudaSampler {
         let token_ptr = cuda_tensor_ptr(token_ids)? as *mut i32;
         let rng_ptr = cuda_tensor_ptr(&self.rng_state)? as *mut u64;
         let probs_ptr = cuda_tensor_ptr(&self.probs_scratch)? as *mut f32;
+        let keep_idx_ptr = cuda_tensor_ptr(&self.keep_idx_scratch)? as *mut i32;
+        let keep_p_ptr = cuda_tensor_ptr(&self.keep_p_scratch)? as *mut f32;
         let freq_ptr = match freq_counts {
             Some(t) => cuda_tensor_ptr(t)? as *const u32,
             None => std::ptr::null(),
@@ -356,6 +381,8 @@ impl CudaSampler {
                     rng_ptr,
                     token_ptr,
                     probs_ptr,
+                    keep_idx_ptr,
+                    keep_p_ptr,
                     v_i,
                     b_i,
                     params,
@@ -367,6 +394,8 @@ impl CudaSampler {
                     rng_ptr,
                     token_ptr,
                     probs_ptr,
+                    keep_idx_ptr,
+                    keep_p_ptr,
                     v_i,
                     b_i,
                     params,
@@ -378,6 +407,8 @@ impl CudaSampler {
                     rng_ptr,
                     token_ptr,
                     probs_ptr,
+                    keep_idx_ptr,
+                    keep_p_ptr,
                     v_i,
                     b_i,
                     params,
@@ -519,7 +550,9 @@ mod tests {
             let mut lcg: u64 = 0xDEADBEEFCAFE;
             let logits_base: Vec<f32> = (0..vocab)
                 .map(|i| {
-                    lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    lcg = lcg
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
                     let bits = (lcg >> 32) as u32;
                     // Map to [-4, 4) — diverse range, no exact ties.
                     let f = (bits as f32 / u32::MAX as f32) * 8.0 - 4.0;
@@ -548,6 +581,150 @@ mod tests {
                 assert_eq!(cpu_s, gpu_s, "RNG state diverged");
             }
         }
+    }
+
+    /// RUN-170 regression: large-vocab + `top_k <= 0` + `top_p < 1.0` must not
+    /// truncate. The kernel previously held the keep list in a fixed
+    /// shared-memory buffer of 256 entries, silently dropping mass once 256
+    /// tokens had been accumulated. After the fix the keep list is global-
+    /// memory backed and grows up to full vocab; the GPU simulator (which
+    /// mirrors the kernel's algorithm) must agree with the CPU reference for
+    /// vocabularies in the 128K range used by Kimi K2.6 / GLM / V4 Flash.
+    #[test]
+    fn gpu_simulator_matches_cpu_at_128k_vocab_top_k_disabled() {
+        // 128K is realistic for current frontier OSS models; 257 is the
+        // smallest vocab that exceeds the historical MAX_KEEP=256 cap, so
+        // we include it as an extra cheap sanity check.
+        for vocab in [257usize, 128 * 1024] {
+            // Deterministic LCG-generated logits with a 1e-6 stagger so no
+            // probabilities tie exactly (the kernel and CPU disagree on
+            // ordering of tied probabilities — documented in module docs).
+            let mut lcg: u64 = 0x0BADC0FFEEC0DE15u64.wrapping_add(vocab as u64);
+            let logits_base: Vec<f32> = (0..vocab)
+                .map(|i| {
+                    lcg = lcg
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let bits = (lcg >> 32) as u32;
+                    // Map to [-6, 6) — diffuse enough that top_p=0.95 keeps
+                    // significantly more than 256 candidates at vocab=128K.
+                    let f = (bits as f32 / u32::MAX as f32) * 12.0 - 6.0;
+                    f + (i as f32) * 1e-6
+                })
+                .collect();
+            let counts = vec![0u32; vocab];
+
+            // Two configs that previously trigggered silent truncation:
+            //   1. top_k disabled + top_p=0.95 (the "natural" diffuse case)
+            //   2. top_k disabled + top_p=1.0  (full distribution sampling)
+            let configs = [
+                SamplingConfig {
+                    temperature: 1.0,
+                    top_p: 0.95,
+                    top_k: -1,
+                    frequency_penalty: 0.0,
+                    presence_penalty: 0.0,
+                    greedy: false,
+                    eos_token_id: -1,
+                },
+                SamplingConfig {
+                    temperature: 1.0,
+                    top_p: 1.0,
+                    top_k: -1,
+                    frequency_penalty: 0.0,
+                    presence_penalty: 0.0,
+                    greedy: false,
+                    eos_token_id: -1,
+                },
+            ];
+
+            for (ci, cfg) in configs.iter().enumerate() {
+                let seed = 0xFEEDFACEu64 ^ ((vocab as u64) << 16) ^ (ci as u64);
+                let mut cpu_l = logits_base.clone();
+                let mut gpu_l = logits_base.clone();
+                let mut cpu_s = seed;
+                let mut gpu_s = seed;
+                let cpu_tok = crate::sampling_cpu::sample(&mut cpu_l, &counts, *cfg, &mut cpu_s);
+                let gpu_tok = gpu_algorithm_simulate(&mut gpu_l, &counts, *cfg, &mut gpu_s);
+                assert_eq!(
+                    cpu_tok, gpu_tok,
+                    "RUN-170: large-vocab disagreement at vocab={vocab} cfg_idx={ci}: \
+                     cpu={cpu_tok} gpu={gpu_tok}"
+                );
+                assert_eq!(cpu_s, gpu_s, "RNG state diverged at vocab={vocab}");
+            }
+        }
+    }
+
+    /// RUN-170 regression: verify the kernel cap formula
+    /// `cap = (top_k > 0 && top_k < vocab) ? top_k : vocab` actually keeps
+    /// more than 256 candidates for a top_p=0.999 cut on a diffuse 4096-vocab
+    /// distribution. (The 256 cap would have stopped the keep loop early; the
+    /// simulator counts kept entries as a proxy for the kernel's behavior.)
+    #[test]
+    fn gpu_simulator_keep_set_exceeds_old_max_keep_when_warranted() {
+        // Vocab large enough that we expect significantly more than 256 kept
+        // tokens for a near-1 top_p on a roughly-uniform distribution.
+        let vocab = 4096usize;
+        // Near-uniform logits → softmax ≈ 1/vocab per token → ~95% of
+        // tokens needed to cross top_p=0.95.
+        let logits: Vec<f32> = (0..vocab).map(|i| (i as f32) * 1e-6).collect();
+        let counts = vec![0u32; vocab];
+        let cfg = SamplingConfig {
+            temperature: 1.0,
+            top_p: 0.95,
+            top_k: -1,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            greedy: false,
+            eos_token_id: -1,
+        };
+        let mut cpu_l = logits.clone();
+        let mut gpu_l = logits.clone();
+        let mut cpu_s = 0xC0FFEEu64;
+        let mut gpu_s = 0xC0FFEEu64;
+        let cpu_tok = crate::sampling_cpu::sample(&mut cpu_l, &counts, cfg, &mut cpu_s);
+        let gpu_tok = gpu_algorithm_simulate(&mut gpu_l, &counts, cfg, &mut gpu_s);
+        assert_eq!(
+            cpu_tok, gpu_tok,
+            "GPU simulator must match CPU on near-uniform diffuse top_p"
+        );
+
+        // Sanity: confirm the cap *would* select more than 256 candidates.
+        // Count how many candidates the simulator-equivalent loop keeps by
+        // running a manual version that exposes the kept-set size.
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut probs: Vec<f32> = logits.iter().map(|&l| (l - max).exp()).collect();
+        let sum: f32 = probs.iter().sum();
+        for p in probs.iter_mut() {
+            *p /= sum;
+        }
+        let mut cum = 0.0f32;
+        let mut kept = 0usize;
+        loop {
+            let mut best_val = -f32::INFINITY;
+            let mut best_idx: i32 = -1;
+            for (i, &v) in probs.iter().enumerate() {
+                if v > best_val || (v == best_val && (best_idx == -1 || (i as i32) < best_idx)) {
+                    best_val = v;
+                    best_idx = i as i32;
+                }
+            }
+            if best_idx < 0 || best_val <= 0.0 {
+                break;
+            }
+            probs[best_idx as usize] = f32::NEG_INFINITY;
+            cum += best_val;
+            kept += 1;
+            if cum >= cfg.top_p || kept >= vocab {
+                break;
+            }
+        }
+        assert!(
+            kept > 256,
+            "RUN-170 test setup invalid: top_p=0.95 over uniform 4096-vocab \
+             should keep > 256 tokens, got {kept}"
+        );
     }
 
     /// Empty-distribution fallback: when all logits are -inf, both samplers
