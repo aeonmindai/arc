@@ -109,18 +109,19 @@ pub use pipeline::hf::{hf_home_dir, hf_hub_cache_dir, hf_token_path};
 pub use pipeline::post_load_hooks::{register_post_load_hook, PostLoadHook};
 pub use pipeline::{
     chat_template::ChatTemplate, expand_isq_value, parse_isq_value, AdapterPaths, AnyMoeLoader,
-    AnyMoePipeline, AutoDeviceMapParams, AutoLoader, AutoLoaderBuilder, DeepSeekV4Loader,
-    DiffusionGenerationParams, DiffusionLoader, DiffusionLoaderBuilder, DiffusionLoaderType,
-    EmbeddingLoader, EmbeddingLoaderBuilder, EmbeddingLoaderType, EmbeddingModelPaths,
-    EmbeddingSpecificConfig, GGMLLoader, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoader,
-    GGUFLoaderBuilder, GGUFSpecificConfig, GemmaLoader, Idefics2Loader, IsqModel, IsqOrganization,
-    LLaVALoader, LLaVANextLoader, LlamaLoader, Loader, LocalModelPaths, LoraAdapterPaths,
-    MistralLoader, MixtralLoader, Modalities, ModelKind, ModelPaths, MultimodalPromptPrefixer,
-    NormalLoader, NormalLoaderBuilder, NormalLoaderType, NormalLoadingMetadata, NormalModel,
-    NormalModelLoader, NormalSpecificConfig, Phi2Loader, Phi3Loader, Phi3VLoader, Qwen2Loader,
-    SpeculativeConfig, SpeculativeLoader, SpeculativePipeline, SpeechLoader, SpeechPipeline,
-    Starcoder2Loader, SupportedModality, TokenSource, VisionLoader, VisionLoaderBuilder,
-    VisionLoaderType, VisionSpecificConfig, UQFF_MULTI_FILE_DELIMITER,
+    AnyMoePipeline, AutoDeviceMapParams, AutoLoader, AutoLoaderBuilder, AutoNormalLoader,
+    DeepSeekV3Loader, DeepSeekV4Loader, DiffusionGenerationParams, DiffusionLoader,
+    DiffusionLoaderBuilder, DiffusionLoaderType, EmbeddingLoader, EmbeddingLoaderBuilder,
+    EmbeddingLoaderType, EmbeddingModelPaths, EmbeddingSpecificConfig, GGMLLoader,
+    GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoader, GGUFLoaderBuilder, GGUFSpecificConfig,
+    GLM4MoeLoader, GemmaLoader, Idefics2Loader, IsqModel, IsqOrganization, LLaVALoader,
+    LLaVANextLoader, LlamaLoader, Loader, LocalModelPaths, LoraAdapterPaths, MistralLoader,
+    MixtralLoader, Modalities, ModelKind, ModelPaths, MultimodalPromptPrefixer, NormalLoader,
+    NormalLoaderBuilder, NormalLoaderType, NormalLoadingMetadata, NormalModel, NormalModelLoader,
+    NormalSpecificConfig, Phi2Loader, Phi3Loader, Phi3VLoader, Qwen2Loader, SpeculativeConfig,
+    SpeculativeLoader, SpeculativePipeline, SpeechLoader, SpeechPipeline, Starcoder2Loader,
+    SupportedModality, TokenSource, VisionLoader, VisionLoaderBuilder, VisionLoaderType,
+    VisionSpecificConfig, UQFF_MULTI_FILE_DELIMITER,
 };
 /// `FlashParams` is needed by integration tests that call `NormalModel::forward` directly.
 pub use pipeline::text_models_inputs_processor::FlashParams as TextFlashParams;
