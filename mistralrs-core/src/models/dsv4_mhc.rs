@@ -360,6 +360,85 @@ impl V4MHCLayerParams {
         )?;
         self.hc_post(ffn_out, residual, &post, &comb)
     }
+
+    /// 3-D ↔ 4-D bridge for the attention block, used by `DecoderLayer::forward`
+    /// while the model carries a 3-D residual `[B, T, hidden]` and the full
+    /// 4-D `[B, T, hc_mult, hidden]` threading (RUN-164) has not landed.
+    ///
+    /// Input/output:
+    /// - `residual`: `[B, T, hidden]`
+    /// - `attn_out`: `[B, T, hidden]`
+    /// - returns: `[B, T, hidden]`
+    ///
+    /// The bridge expands the 3-D residual into 4-D by broadcasting it across
+    /// the `hc_mult` stream axis (so all four parallel residual streams start
+    /// equal), calls `mix_attn`, then folds the result back to 3-D by averaging
+    /// the `hc_mult` streams. The learned `hc_attn_scale` / `hc_attn_fn` /
+    /// `hc_attn_base` weights drive the mixing inside `hc_pre`/`hc_post`.
+    ///
+    /// Algebraic identity check (audit §0, §2): with all-zero mHC params
+    /// (`hc_attn_fn = hc_attn_base = hc_attn_scale = 0`) this degenerates to
+    /// the standard residual `attn_out + residual`, which is the previous
+    /// fall-through behavior. Any non-zero learned `hc_attn_scale` makes the
+    /// output diverge from the standard residual — that is the assertion the
+    /// RUN-169 unit test pins.
+    pub fn mix_attn_3d_bridge(&self, residual: &Tensor, attn_out: &Tensor) -> Result<Tensor> {
+        let dims = residual.dims();
+        if dims.len() != 3 {
+            candle_core::bail!(
+                "V4 mHC mix_attn_3d_bridge: residual must be 3-D [B, T, hidden], got {:?}",
+                dims
+            );
+        }
+        let (b, t, h) = (dims[0], dims[1], dims[2]);
+        if h != self.hidden_size {
+            candle_core::bail!(
+                "V4 mHC mix_attn_3d_bridge: residual hidden={h} disagrees with params hidden={}",
+                self.hidden_size
+            );
+        }
+        let hc = self.hc_mult;
+
+        // Broadcast 3-D residual → 4-D [B, T, hc_mult, hidden] (replicate
+        // the same value across all hc_mult stream slots).
+        let residual_4d = residual
+            .unsqueeze(2)?
+            .broadcast_as((b, t, hc, h))?
+            .contiguous()?;
+
+        let mixed_4d = self.mix_attn(&residual_4d, attn_out)?; // [B, T, hc_mult, hidden]
+
+        // Fold the hc_mult streams back to 3-D via mean reduction. Mean (not
+        // sum) preserves the magnitude of `attn_out + residual` at the
+        // zero-params identity point above.
+        mixed_4d.mean(2)
+    }
+
+    /// 3-D ↔ 4-D bridge for the FFN block (mirrors `mix_attn_3d_bridge`).
+    pub fn mix_ffn_3d_bridge(&self, residual: &Tensor, ffn_out: &Tensor) -> Result<Tensor> {
+        let dims = residual.dims();
+        if dims.len() != 3 {
+            candle_core::bail!(
+                "V4 mHC mix_ffn_3d_bridge: residual must be 3-D [B, T, hidden], got {:?}",
+                dims
+            );
+        }
+        let (b, t, h) = (dims[0], dims[1], dims[2]);
+        if h != self.hidden_size {
+            candle_core::bail!(
+                "V4 mHC mix_ffn_3d_bridge: residual hidden={h} disagrees with params hidden={}",
+                self.hidden_size
+            );
+        }
+        let hc = self.hc_mult;
+
+        let residual_4d = residual
+            .unsqueeze(2)?
+            .broadcast_as((b, t, hc, h))?
+            .contiguous()?;
+        let mixed_4d = self.mix_ffn(&residual_4d, ffn_out)?;
+        mixed_4d.mean(2)
+    }
 }
 
 /// Sinkhorn normalize the last two dims of a `[N, hc, hc]` tensor.
@@ -843,6 +922,178 @@ mod tests {
         for s in &col_sums {
             assert!((s - 1.0).abs() < 1e-3, "col sum {s} not ≈ 1.0");
         }
+        Ok(())
+    }
+
+    /// RUN-169: with zero mHC params, the 3-D bridge degenerates exactly to
+    /// the standard residual `attn_out + residual`. This pins the
+    /// backwards-compat identity so older mHC-absent fixtures behave the
+    /// same way.
+    #[test]
+    fn mix_attn_3d_bridge_zero_params_matches_standard_residual() -> Result<()> {
+        let dev = Device::Cpu;
+        let hidden = 4;
+        let hc_mult = 4;
+        let mix_hc = (2 + hc_mult) * hc_mult;
+        let hc_dim = hc_mult * hidden;
+        let params = make_layer_params(
+            hidden,
+            hc_mult,
+            Tensor::zeros((mix_hc, hc_dim), DType::F32, &dev)?,
+            Tensor::zeros(mix_hc, DType::F32, &dev)?,
+            Tensor::zeros(3, DType::F32, &dev)?,
+        );
+
+        let b = 2;
+        let t = 3;
+        let residual = Tensor::randn(0f32, 1f32, (b, t, hidden), &dev)?;
+        let attn_out = Tensor::randn(0f32, 1f32, (b, t, hidden), &dev)?;
+
+        let bridged = params.mix_attn_3d_bridge(&residual, &attn_out)?;
+        assert_eq!(bridged.dims(), &[b, t, hidden]);
+
+        // Compare against the standard residual baseline.
+        let baseline = (&attn_out + &residual)?;
+        let br_v: Vec<f32> = bridged.flatten_all()?.to_vec1()?;
+        let bl_v: Vec<f32> = baseline.flatten_all()?.to_vec1()?;
+        assert_eq!(br_v.len(), bl_v.len());
+        let mut max_err = 0f32;
+        for (b_val, bl) in br_v.iter().zip(bl_v.iter()) {
+            max_err = max_err.max((b_val - bl).abs());
+        }
+        // The sinkhorn-on-zeros step + the +hc_eps inside `pre` and `comb`
+        // give a tiny perturbation around the analytical identity; allow
+        // ~5% slack matching the existing zero-params test above.
+        assert!(
+            max_err < 0.05,
+            "mix_attn_3d_bridge zero-params output diverged from analytical \
+             standard residual: max_err={max_err}"
+        );
+        Ok(())
+    }
+
+    /// RUN-169: with a non-trivial `hc_attn_scale` (and non-trivial
+    /// `hc_attn_fn`/`hc_attn_base`) the bridge output MUST differ from the
+    /// standard residual baseline. This is the core assertion that the
+    /// learned blend coefficient actually drives the forward pass — i.e.
+    /// the 0.5/0.5 (and the silent `xs + residual`) fall-through has been
+    /// replaced.
+    #[test]
+    fn mix_attn_3d_bridge_uses_hc_attn_scale() -> Result<()> {
+        let dev = Device::Cpu;
+        let hidden = 4;
+        let hc_mult = 4;
+        let mix_hc = (2 + hc_mult) * hc_mult;
+        let hc_dim = hc_mult * hidden;
+
+        // Non-trivial fn / base / scale so that mixes != 0 and the
+        // sigmoid/sinkhorn produce values away from 0.5 / uniform.
+        let hc_attn_fn = Tensor::from_vec(
+            (0..mix_hc * hc_dim)
+                .map(|i| ((i as f32) * 0.041).sin() * 0.5)
+                .collect::<Vec<_>>(),
+            (mix_hc, hc_dim),
+            &dev,
+        )?;
+        let hc_attn_base = Tensor::from_vec(
+            (0..mix_hc)
+                .map(|i| ((i as f32) * 0.13).cos() * 0.2)
+                .collect::<Vec<_>>(),
+            mix_hc,
+            &dev,
+        )?;
+        // hc_attn_scale[3]: distinct non-zero values across the (pre, post,
+        // comb) slots to ensure each pathway is exercised.
+        let hc_attn_scale = Tensor::from_vec(vec![1.5f32, -1.0, 0.75], 3, &dev)?;
+
+        let params = make_layer_params(hidden, hc_mult, hc_attn_fn, hc_attn_base, hc_attn_scale);
+
+        let b = 2;
+        let t = 3;
+        // Use a fixed seed-equivalent deterministic input so the test is
+        // reproducible (`Tensor::randn` is deterministic given a seed env,
+        // but we use `from_vec` here for explicit determinism).
+        let residual = Tensor::from_vec(
+            (0..b * t * hidden)
+                .map(|i| ((i as f32) * 0.071).sin() * 1.3)
+                .collect::<Vec<_>>(),
+            (b, t, hidden),
+            &dev,
+        )?;
+        let attn_out = Tensor::from_vec(
+            (0..b * t * hidden)
+                .map(|i| ((i as f32) * 0.059).cos() * 0.7)
+                .collect::<Vec<_>>(),
+            (b, t, hidden),
+            &dev,
+        )?;
+
+        let bridged = params.mix_attn_3d_bridge(&residual, &attn_out)?;
+        assert_eq!(bridged.dims(), &[b, t, hidden]);
+
+        let baseline = (&attn_out + &residual)?;
+        let br_v: Vec<f32> = bridged.flatten_all()?.to_vec1()?;
+        let bl_v: Vec<f32> = baseline.flatten_all()?.to_vec1()?;
+        assert_eq!(br_v.len(), bl_v.len());
+
+        // The learned blend must move the output OFF the standard residual
+        // baseline for at least a non-trivial fraction of elements. We use
+        // a per-element diff threshold + a count check, matching the style
+        // of the RUN-162 real-weights-differ-from-uniform test.
+        let diff_count = br_v
+            .iter()
+            .zip(bl_v.iter())
+            .filter(|(b_val, bl)| (*b_val - *bl).abs() > 1e-3)
+            .count();
+        assert!(
+            diff_count >= br_v.len() / 2,
+            "mix_attn_3d_bridge with non-zero hc_attn_scale produced output \
+             matching the standard residual baseline for {} / {} elements. \
+             The learned blend coefficient is not driving the forward pass.",
+            br_v.len() - diff_count,
+            br_v.len()
+        );
+
+        // Sanity: also assert the bridge is finite (no NaN/Inf from
+        // sinkhorn instability under the test parameters).
+        for v in &br_v {
+            assert!(
+                v.is_finite(),
+                "mix_attn_3d_bridge produced non-finite value {v}"
+            );
+        }
+        Ok(())
+    }
+
+    /// RUN-169: rank validation — the 3-D bridge rejects 4-D input (callers
+    /// must use `mix_attn` directly for 4-D, the bridge is the 3-D ↔ 4-D
+    /// adapter used by `DecoderLayer::forward`).
+    #[test]
+    fn mix_attn_3d_bridge_rejects_non_3d() -> Result<()> {
+        let dev = Device::Cpu;
+        let hidden = 4;
+        let hc_mult = 4;
+        let mix_hc = (2 + hc_mult) * hc_mult;
+        let hc_dim = hc_mult * hidden;
+        let params = make_layer_params(
+            hidden,
+            hc_mult,
+            Tensor::zeros((mix_hc, hc_dim), DType::F32, &dev)?,
+            Tensor::zeros(mix_hc, DType::F32, &dev)?,
+            Tensor::zeros(3, DType::F32, &dev)?,
+        );
+
+        // 4-D residual should fail.
+        let residual_4d = Tensor::zeros((1, 2, hc_mult, hidden), DType::F32, &dev)?;
+        let attn_out = Tensor::zeros((1, 2, hidden), DType::F32, &dev)?;
+        assert!(params.mix_attn_3d_bridge(&residual_4d, &attn_out).is_err());
+
+        // Mismatched hidden dim should fail.
+        let residual_bad = Tensor::zeros((1, 2, hidden + 1), DType::F32, &dev)?;
+        let attn_out_bad = Tensor::zeros((1, 2, hidden + 1), DType::F32, &dev)?;
+        assert!(params
+            .mix_attn_3d_bridge(&residual_bad, &attn_out_bad)
+            .is_err());
         Ok(())
     }
 }

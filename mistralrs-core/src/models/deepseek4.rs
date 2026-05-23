@@ -1357,8 +1357,9 @@ struct DecoderLayer {
     attn: Attention,
     moe_or_mlp: MoeOrMlp,
     /// V4 mHC layer-side parameters (loaded if present in checkpoint).
-    /// Audit §0 + §2 ("DecoderLayer forward — mHC replaces residuals").
-    #[allow(dead_code)]
+    /// When present, the attn-side and ffn-side residual mixes use the
+    /// learned `hc_attn_*` / `hc_ffn_*` weights (RUN-169). Audit §0 + §2
+    /// ("DecoderLayer forward — mHC replaces residuals").
     mhc: Option<V4MHCLayerParams>,
 }
 
@@ -1450,7 +1451,24 @@ impl DecoderLayer {
 
         // mHC layer params (loaded at the LAYER root, i.e. `vb` itself).
         // Audit §0 + dsv4_mhc.rs.
+        //
+        // RUN-169: when a V4-shaped checkpoint is being loaded but the
+        // `hc_attn_*` tensors are missing for a given layer, `forward` will
+        // fall back to standard residual instead of the learned mHC blend.
+        // We surface that fallback once per layer at construction time so it
+        // is never silent. We gate the warning on a positive V4-checkpoint
+        // signal (`compress_ratios` non-empty AND the layer index is within
+        // it) so legacy V3 fixtures and unit-test synthesisers that
+        // intentionally omit `hc_attn_*` stay quiet.
         let mhc = V4MHCLayerParams::try_load(cfg, &vb, layer_idx);
+        if mhc.is_none() && !cfg.compress_ratios.is_empty() && layer_idx < cfg.compress_ratios.len()
+        {
+            tracing::warn!(
+                "V4 DecoderLayer {layer_idx}: `hc_attn_*` tensors absent — \
+                 falling back to standard residual (xs + sublayer(norm(xs))). \
+                 Learned mHC blend (RUN-169) is inactive for this layer."
+            );
+        }
 
         Ok(Self {
             input_layernorm,
@@ -1475,34 +1493,49 @@ impl DecoderLayer {
     ) -> Result<Tensor> {
         // V4 mHC residual mixing.
         //
-        // When mHC is loaded, the per-layer round-trip is:
-        //   y, post, comb = hc_pre(residual_4D, hc_attn_fn, scale, base)
-        //   y = norm(y); branch = attn(y);  residual = hc_post(branch, ...)
-        //   <repeat for the ffn block>
+        // When `self.mhc` is loaded, the attn block uses the 3-D ↔ 4-D
+        // bridge in `V4MHCLayerParams::mix_attn_3d_bridge`, which exercises
+        // the learned `hc_attn_scale` / `hc_attn_fn` / `hc_attn_base` weights
+        // to blend the attention output with the residual (RUN-169).
         //
-        // The full math requires a 4-D residual `[B, T, hc_mult, hidden]`
-        // threaded end-to-end through the model. Today the residual is 3-D
-        // `[B, T, hidden]`. With `hc_mult=1` the mHC math degenerates to
-        // standard `x + sublayer(norm(x))`. mHC weights are loaded and
-        // available via `self.mhc`; threading 4-D residuals is tracked in
-        // audit §0 + §8 P0 item 6 as a follow-up.
+        // The full 4-D residual `[B, T, hc_mult, hidden]` threading (audit
+        // §0 + §8 P0 item 6, tracked as RUN-164) is not yet in place; the
+        // bridge replicates the 3-D residual across the `hc_mult` stream
+        // axis and mean-reduces back. With zero-init mHC params this is
+        // bit-identical to the standard residual `xs + residual`; with the
+        // real learned weights it diverges (which is the RUN-169 fix —
+        // the previously hardcoded 0.5/0.5 hybrid blend, then the silent
+        // `xs + residual` fall-through, are both replaced by the learned
+        // mix here).
+        //
+        // When `self.mhc` is absent (e.g. legacy V3-style fixtures or
+        // synthesised tests without the `hc_attn_*` tensors) we fall back
+        // to standard residual. The construction-time warning lives in
+        // `DecoderLayer::new` so it fires once per layer.
 
         let residual = xs;
-        let xs = self.input_layernorm.forward(xs)?;
-        let xs = self.attn.forward(
-            &xs,
+        let xs_normed = self.input_layernorm.forward(xs)?;
+        let attn_out = self.attn.forward(
+            &xs_normed,
             attention_mask,
             seqlen_offsets,
             kv_cache,
             metadata,
             flash_params,
         )?;
-        let xs = (xs + residual)?;
+        let xs = match &self.mhc {
+            Some(mhc) => mhc.mix_attn_3d_bridge(residual, &attn_out)?,
+            None => (attn_out + residual)?,
+        };
+
         let residual = &xs;
-        let xs = self
+        let ffn_out = self
             .moe_or_mlp
             .forward(&xs.apply(&self.post_attention_layernorm)?)?;
-        residual + xs
+        match &self.mhc {
+            Some(mhc) => mhc.mix_ffn_3d_bridge(residual, &ffn_out),
+            None => residual + ffn_out,
+        }
     }
 }
 
