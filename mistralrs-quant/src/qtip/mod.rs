@@ -62,6 +62,9 @@ pub use viterbi::viterbi_quantize_row;
 #[cfg(feature = "cuda")]
 pub(crate) mod ffi;
 
+pub(crate) mod ops;
+pub use ops::qtip_dequantize_bf16;
+
 /// Default seed for the QTIP Hadamard incoherence rotation.
 ///
 /// QTIP (Cornell ICLR'25) requires that quantize-time and inference-time agree
@@ -154,7 +157,7 @@ pub const K: u32 = 4;
 /// Reproduction vector dimension per state.
 pub const V: u32 = 2;
 /// State mask: (1 << L) - 1.
-const STATE_MASK: u32 = (1u32 << L) - 1;
+pub(crate) const STATE_MASK: u32 = (1u32 << L) - 1;
 /// LUT size: 2^L entries × V values per entry.
 const LUT_SIZE: usize = 1 << L;
 /// Symbol alphabet size: 2^K.
@@ -520,9 +523,20 @@ impl QtipLayer {
     }
 
     pub fn dequantize_weights(&self) -> Result<Tensor> {
-        let out = self.dequantize_weights_f32()?;
         let n = self.row_scales.dim(0)?;
         let k_in = self.in_features;
+
+        // Fast path: when rotation is disabled (Greedy-mode checkpoints) we
+        // can stay on whatever device the tensors live on — the CustomOp3
+        // has both CPU and CUDA implementations and avoids the host
+        // round-trip the legacy path requires.
+        if self.rotation_block < 2 {
+            return qtip_dequantize_bf16(&self.blocks, &self.row_scales, &self.lut, n, k_in);
+        }
+
+        // Rotation-enabled (Viterbi) checkpoints fall back to the CPU
+        // trellis + CPU rotation path until the GPU rotation kernel lands.
+        let out = self.dequantize_weights_f32()?;
         Tensor::from_vec(out, (n, k_in), &Device::Cpu)?
             .to_device(self.blocks.device())?
             .to_dtype(DType::BF16)
