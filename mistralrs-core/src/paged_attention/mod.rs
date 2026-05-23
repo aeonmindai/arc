@@ -42,6 +42,84 @@ pub(crate) fn get_global_turbo_norms(layer_idx: usize) -> Option<(Tensor, Tensor
 pub(crate) fn has_global_turbo_norms() -> bool {
     !TURBO_NORMS_GLOBAL.lock().unwrap().is_empty()
 }
+
+/// Build a `[batch + 1]` cumulative-K/V-length tensor from per-sequence
+/// context lengths. The kernel-level `gather_kv_cache` consumes exactly this
+/// layout. Returns a `u32` tensor with `cu[0] == 0` and
+/// `cu[i+1] == cu[i] + context_lens[i]`.
+///
+/// Used by [`crate::paged_attention::PagedAttention::cache_write_and_gather`]
+/// (RUN-167) to bridge the V4 CSA/HCA dispatch into the existing kv-gather
+/// plumbing when no prefix-cache `cu_seqlens_kv` is present. Lives outside
+/// the cuda/metal-gated `layers::paged_attention` module so its semantics
+/// can be unit-tested on a CPU build.
+#[allow(dead_code)] // only consumed from the cuda/metal-gated cache_write_and_gather
+pub(crate) fn build_cu_seqlens_kv_from_context_lens(
+    context_lens: &Tensor,
+) -> candle_core::Result<Tensor> {
+    let lens_u32 = match context_lens.dtype() {
+        DType::U32 => context_lens.clone(),
+        _ => context_lens.to_dtype(DType::U32)?,
+    };
+    let batch = lens_u32.dim(0)?;
+    // Prepend a single 0 and run cumsum. Avoiding `from_vec` / `arange` on
+    // device per CLAUDE.md hot-loop guidance: we keep this off the per-token
+    // path and reuse the `context_lens` device.
+    let zero = Tensor::zeros(1, DType::U32, lens_u32.device())?;
+    let padded = Tensor::cat(&[&zero, &lens_u32], 0)?;
+    // cumsum on u32 isn't always supported on every backend; promote to f32,
+    // cumsum, demote.
+    let cu_f32 = padded.to_dtype(DType::F32)?.cumsum(0)?;
+    let cu = cu_f32.to_dtype(DType::U32)?;
+    debug_assert_eq!(cu.dim(0)?, batch + 1);
+    Ok(cu)
+}
+
+#[cfg(test)]
+mod cu_seqlens_tests {
+    use super::*;
+
+    /// `build_cu_seqlens_kv_from_context_lens` matches the canonical
+    /// "prepend 0 then cumsum" semantics that `gather_kv_cache` expects.
+    /// Without this conversion the V4 CSA/HCA + PA path would gather garbage
+    /// (RUN-167).
+    #[test]
+    fn cu_seqlens_kv_from_context_lens_matches_cumsum() -> candle_core::Result<()> {
+        let device = Device::Cpu;
+        // batch = 3, lens = [4, 7, 2] → expected cu = [0, 4, 11, 13].
+        let lens = Tensor::from_vec(vec![4u32, 7, 2], 3, &device)?;
+        let cu = build_cu_seqlens_kv_from_context_lens(&lens)?;
+        assert_eq!(cu.dim(0)?, 4);
+        let got: Vec<u32> = cu.to_vec1()?;
+        assert_eq!(got, vec![0u32, 4, 11, 13]);
+        Ok(())
+    }
+
+    /// Accepts non-u32 dtypes by upcasting first. The PA scheduler historically
+    /// used both u32 and i32 for context_lens across devices.
+    #[test]
+    fn cu_seqlens_kv_from_context_lens_accepts_non_u32() -> candle_core::Result<()> {
+        let device = Device::Cpu;
+        let lens = Tensor::from_vec(vec![1i64, 2, 3], 3, &device)?;
+        let cu = build_cu_seqlens_kv_from_context_lens(&lens)?;
+        let got: Vec<u32> = cu.to_vec1()?;
+        assert_eq!(got, vec![0u32, 1, 3, 6]);
+        Ok(())
+    }
+
+    /// Empty batch returns a single `[0]` element — matches what
+    /// `gather_kv_cache` expects for a no-op call.
+    #[test]
+    fn cu_seqlens_kv_from_context_lens_empty_batch() -> candle_core::Result<()> {
+        let device = Device::Cpu;
+        let lens = Tensor::zeros(0, DType::U32, &device)?;
+        let cu = build_cu_seqlens_kv_from_context_lens(&lens)?;
+        assert_eq!(cu.dim(0)?, 1);
+        let got: Vec<u32> = cu.to_vec1()?;
+        assert_eq!(got, vec![0u32]);
+        Ok(())
+    }
+}
 pub use config::{KvCacheLayout, ModelConfigLike, ModelConfigMetadata};
 pub use kv_cache_manager::KVCacheManager;
 pub use layers::PagedAttention;

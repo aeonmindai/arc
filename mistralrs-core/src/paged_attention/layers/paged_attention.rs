@@ -5,6 +5,8 @@ use mistralrs_paged_attn::{kv_scale_update, paged_attention, reshape_and_cache};
 const KV_SCALE_UPDATE_ITERATION: i32 = 128;
 use std::sync::atomic::{AtomicI32, Ordering};
 
+#[allow(unused_imports)] // consumed by cache_write_and_gather (cuda+metal); silence on no-cuda+no-metal builds where the layer is stubbed.
+use crate::paged_attention::build_cu_seqlens_kv_from_context_lens;
 use crate::{
     attention::SdpaParams,
     layers::Sdpa,
@@ -356,5 +358,253 @@ impl PagedAttention {
         )?;
 
         Ok(res)
+    }
+
+    /// Write `key`/`value` to the paged cache and gather the full (cached +
+    /// new) K/V back as a single dense `[1, num_kv_heads, N_total, head_dim]`
+    /// pair. Used by V4 CSA/HCA layers (RUN-167) where the compress kernel
+    /// has to see a materialised full sequence — the paged decode kernel
+    /// can't be reused because the per-token compressor weights only apply
+    /// to the dense layout.
+    ///
+    /// Returns `(k_full, v_full)`. Both tensors live on the same device as
+    /// the cache and share `out_dtype` (typically the query dtype).
+    ///
+    /// # Caveats
+    /// * Requires `key_cache` and `value_cache` to be live (non-stub) —
+    ///   callers are expected to gate on this; the dummy/imatrix path (where
+    ///   both caches are absent) is not handled by this method.
+    /// * Computes `cu_seqlens_kv` from `input_metadata.context_lens` when
+    ///   `cu_seqlens_kv` isn't already populated by the prefix-cache path,
+    ///   so this works for both prefill and decode under PagedAttention.
+    /// * The packed gather output has `B = 1` after `unsqueeze`. With the
+    ///   PagedAttention scheduler running batch_size > 1, the gathered
+    ///   tensor is varlen-packed (`N_total = sum_i(seqlen_i)`). The current
+    ///   V4 deployment target (single-stream rental serving) keeps batch_size
+    ///   == 1, so the downstream `dsv4_attention` call works as-is. Multi-
+    ///   tenant batching with CSA/HCA needs a per-seq slice + dispatch loop
+    ///   (audit §8 P0 item 9, deferred).
+    /// * CUDA-only because `reshape_and_cache` and `gather_kv_cache` are
+    ///   CUDA kernels. Metal has equivalents; the no-cuda/no-metal stub
+    ///   bails with a clear error.
+    #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
+    pub fn cache_write_and_gather(
+        &self,
+        key: &Tensor,
+        value: &Tensor,
+        key_cache: &mut Tensor,
+        value_cache: &mut Tensor,
+        input_metadata: &PagedAttentionInputMetadata,
+        out_dtype: DType,
+    ) -> Result<(Tensor, Tensor)> {
+        #[cfg(all(feature = "cuda", target_family = "unix"))]
+        {
+            let device = key.device();
+
+            // 1) Resolve metadata tensors for this device.
+            let slot_mapping_full = input_metadata
+                .slot_mappings
+                .get(&device.location())
+                .expect("PagedAttention::cache_write_and_gather: slot_mappings missing for device");
+            let dims = slot_mapping_full.dims();
+            let slot_mapping_owned;
+            let slot_mapping: &Tensor = if dims.len() > 1 {
+                slot_mapping_owned = slot_mapping_full.flatten(0, dims.len())?;
+                &slot_mapping_owned
+            } else {
+                slot_mapping_full
+            };
+
+            // Prefer the unwindowed block tables / context lens — the V4
+            // compress branch always wants the full context (the
+            // sliding-window local branch happens inside `dsv4_attention`
+            // after gather, over the gathered K/V).
+            let block_tables = input_metadata
+                .full_block_tables
+                .as_ref()
+                .or(input_metadata.block_tables.as_ref())
+                .expect(
+                    "PagedAttention::cache_write_and_gather: block_tables missing on metadata",
+                )
+                .get(&device.location())
+                .expect(
+                    "PagedAttention::cache_write_and_gather: block_tables missing for device",
+                );
+            let context_lens = input_metadata
+                .full_context_lens
+                .as_ref()
+                .or(input_metadata.context_lens.as_ref())
+                .expect(
+                    "PagedAttention::cache_write_and_gather: context_lens missing on metadata",
+                )
+                .get(&device.location())
+                .expect(
+                    "PagedAttention::cache_write_and_gather: context_lens missing for device",
+                );
+
+            // 2) Reshape new K/V to the cache-write layout `[N_new, H, D]`.
+            //    `key` arrives as `[B, H, T_new, D]` from the caller.
+            let (_b, key_value_heads, _t_new, head_size) = key.shape().dims4()?;
+            let k_flat = key
+                .transpose(1, 2)?
+                .reshape(((), key_value_heads, head_size))?;
+            let v_flat = value
+                .transpose(1, 2)?
+                .reshape(((), key_value_heads, head_size))?;
+
+            // 3) Write new tokens into the paged cache. TurboQuant uses
+            //    quantised norms; everything else uses the standard
+            //    reshape_and_cache kernel.
+            let turbo_norms = self.get_turbo_norms();
+            if self.is_turboquant() {
+                mistralrs_paged_attn::turbo_reshape_and_cache(
+                    &k_flat,
+                    &v_flat,
+                    key_cache,
+                    value_cache,
+                    &turbo_norms
+                        .as_ref()
+                        .expect("TurboQuant norms missing for layer")
+                        .0,
+                    &turbo_norms.as_ref().unwrap().1,
+                    slot_mapping,
+                )?;
+            } else {
+                reshape_and_cache(
+                    &k_flat,
+                    &v_flat,
+                    self.k_scale.as_ref(),
+                    self.v_scale.as_ref(),
+                    key_cache,
+                    value_cache,
+                    slot_mapping,
+                )?;
+            }
+
+            // 4) Build cu_seqlens_kv. Prefer the prefix-cache version when
+            //    present (it already accounts for cached + new); otherwise
+            //    derive from context_lens.
+            let cu_kv_owned;
+            let cu_kv: &Tensor = if let Some(map) = input_metadata.cu_seqlens_kv.as_ref() {
+                map.get(&device.location()).expect(
+                    "PagedAttention::cache_write_and_gather: cu_seqlens_kv missing for device",
+                )
+            } else {
+                cu_kv_owned = build_cu_seqlens_kv_from_context_lens(context_lens)?;
+                &cu_kv_owned
+            };
+
+            // 5) Gather the full sequence. Returns `[N_total, H, D]` — we
+            //    lift to `[1, H, N_total, D]` to match the dsv4_attention
+            //    shape contract.
+            let (k_gathered, v_gathered) = mistralrs_paged_attn::gather_kv_cache(
+                key_cache,
+                value_cache,
+                self.k_scale.as_ref(),
+                self.v_scale.as_ref(),
+                block_tables,
+                cu_kv,
+                out_dtype,
+            )?;
+            let k_4d = k_gathered.unsqueeze(0)?.transpose(1, 2)?.contiguous()?;
+            let v_4d = v_gathered.unsqueeze(0)?.transpose(1, 2)?.contiguous()?;
+            Ok((k_4d, v_4d))
+        }
+        #[cfg(not(all(feature = "cuda", target_family = "unix")))]
+        {
+            // Metal still has reshape_and_cache + gather; route through the
+            // same primitives. On builds with neither cuda nor metal, the
+            // PagedAttention layer isn't built either, so this branch is
+            // unreachable in practice.
+            #[cfg(feature = "metal")]
+            {
+                let device = key.device();
+                let slot_mapping_full = input_metadata
+                    .slot_mappings
+                    .get(&device.location())
+                    .expect(
+                        "PagedAttention::cache_write_and_gather: slot_mappings missing for device",
+                    );
+                let dims = slot_mapping_full.dims();
+                let slot_mapping_owned;
+                let slot_mapping: &Tensor = if dims.len() > 1 {
+                    slot_mapping_owned = slot_mapping_full.flatten(0, dims.len())?;
+                    &slot_mapping_owned
+                } else {
+                    slot_mapping_full
+                };
+
+                let block_tables = input_metadata
+                    .full_block_tables
+                    .as_ref()
+                    .or(input_metadata.block_tables.as_ref())
+                    .expect(
+                        "PagedAttention::cache_write_and_gather: block_tables missing on metadata",
+                    )
+                    .get(&device.location())
+                    .expect(
+                        "PagedAttention::cache_write_and_gather: block_tables missing for device",
+                    );
+                let context_lens = input_metadata
+                    .full_context_lens
+                    .as_ref()
+                    .or(input_metadata.context_lens.as_ref())
+                    .expect(
+                        "PagedAttention::cache_write_and_gather: context_lens missing on metadata",
+                    )
+                    .get(&device.location())
+                    .expect(
+                        "PagedAttention::cache_write_and_gather: context_lens missing for device",
+                    );
+
+                let (_b, key_value_heads, _t_new, head_size) = key.shape().dims4()?;
+                let k_flat = key
+                    .transpose(1, 2)?
+                    .reshape(((), key_value_heads, head_size))?;
+                let v_flat = value
+                    .transpose(1, 2)?
+                    .reshape(((), key_value_heads, head_size))?;
+
+                reshape_and_cache(
+                    &k_flat,
+                    &v_flat,
+                    self.k_scale.as_ref(),
+                    self.v_scale.as_ref(),
+                    key_cache,
+                    value_cache,
+                    slot_mapping,
+                )?;
+
+                let cu_kv_owned;
+                let cu_kv: &Tensor = if let Some(map) = input_metadata.cu_seqlens_kv.as_ref() {
+                    map.get(&device.location()).expect(
+                        "PagedAttention::cache_write_and_gather: cu_seqlens_kv missing for device",
+                    )
+                } else {
+                    cu_kv_owned = build_cu_seqlens_kv_from_context_lens(context_lens)?;
+                    &cu_kv_owned
+                };
+
+                let (k_gathered, v_gathered) = mistralrs_paged_attn::gather_kv_cache(
+                    key_cache,
+                    value_cache,
+                    self.k_scale.as_ref(),
+                    self.v_scale.as_ref(),
+                    block_tables,
+                    cu_kv,
+                    out_dtype,
+                )?;
+                let k_4d = k_gathered.unsqueeze(0)?.transpose(1, 2)?.contiguous()?;
+                let v_4d = v_gathered.unsqueeze(0)?.transpose(1, 2)?.contiguous()?;
+                return Ok((k_4d, v_4d));
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                let _ = (key, value, key_cache, value_cache, input_metadata, out_dtype);
+                candle_core::bail!(
+                    "PagedAttention::cache_write_and_gather requires CUDA or Metal"
+                );
+            }
+        }
     }
 }
