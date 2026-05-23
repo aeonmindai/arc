@@ -1,0 +1,187 @@
+{
+  "model": "deepseek-ai/DeepSeek-V4-Flash",
+  "vendor_name": "mock",
+  "suite": "agentperf",
+  "mode": "mock",
+  "schedule": {
+    "tier": {
+      "tier": 2,
+      "min_p25_output_speed_tok_per_s": 60.0,
+      "max_p95_ttft_seconds": 2.0
+    },
+    "max_users_explored": 64,
+    "max_users_cap": 256,
+    "saturation_users": 47,
+    "phases": [
+      {
+        "phase_index": 1,
+        "concurrent_users": 1,
+        "kind": "ramp",
+        "steady_state_samples": 667837,
+        "evaluation": {
+          "p25_output_speed_tok_per_s": 118.81188122487993,
+          "p95_ttft_seconds": 1.167,
+          "p25_pass": true,
+          "p95_pass": true,
+          "overall_pass": true
+        },
+        "duration_seconds": 0.640260833
+      },
+      {
+        "phase_index": 2,
+        "concurrent_users": 2,
+        "kind": "ramp",
+        "steady_state_samples": 482290,
+        "evaluation": {
+          "p25_output_speed_tok_per_s": 117.6470588235294,
+          "p95_ttft_seconds": 1.185,
+          "p25_pass": true,
+          "p95_pass": true,
+          "overall_pass": true
+        },
+        "duration_seconds": 0.624869
+      },
+      {
+        "phase_index": 3,
+        "concurrent_users": 4,
+        "kind": "ramp",
+        "steady_state_samples": 1080331,
+        "evaluation": {
+          "p25_output_speed_tok_per_s": 115.38461541928625,
+          "p95_ttft_seconds": 1.22,
+          "p25_pass": true,
+          "p95_pass": true,
+          "overall_pass": true
+        },
+        "duration_seconds": 0.701581791
+      },
+      {
+        "phase_index": 4,
+        "concurrent_users": 8,
+        "kind": "ramp",
+        "steady_state_samples": 1303342,
+        "evaluation": {
+          "p25_output_speed_tok_per_s": 111.11111111111111,
+          "p95_ttft_seconds": 1.292,
+          "p25_pass": true,
+          "p95_pass": true,
+          "overall_pass": true
+        },
+        "duration_seconds": 0.708850542
+      },
+      {
+        "phase_index": 5,
+        "concurrent_users": 16,
+        "kind": "ramp",
+        "steady_state_samples": 907241,
+        "evaluation": {
+          "p25_output_speed_tok_per_s": 103.44827588993758,
+          "p95_ttft_seconds": 1.436,
+          "p25_pass": true,
+          "p95_pass": true,
+          "overall_pass": true
+        },
+        "duration_seconds": 0.65984175
+      },
+      {
+        "phase_index": 6,
+        "concurrent_users": 32,
+        "kind": "ramp",
+        "steady_state_samples": 793171,
+        "evaluation": {
+          "p25_output_speed_tok_per_s": 90.90909090909092,
+          "p95_ttft_seconds": 1.725,
+          "p25_pass": true,
+          "p95_pass": true,
+          "overall_pass": true
+        },
+        "duration_seconds": 0.651521709
+      },
+      {
+        "phase_index": 7,
+        "concurrent_users": 64,
+        "kind": "ramp",
+        "steady_state_samples": 665174,
+        "evaluation": {
+          "p25_output_speed_tok_per_s": 73.17073172125967,
+          "p95_ttft_seconds": 2.298,
+          "p25_pass": true,
+          "p95_pass": false,
+          "overall_pass": false
+        },
+        "duration_seconds": 0.635972458
+      },
+      {
+        "phase_index": 8,
+        "concurrent_users": 48,
+        "kind": "bisect",
+        "steady_state_samples": 723055,
+        "evaluation": {
+          "p25_output_speed_tok_per_s": 81.08108106396092,
+          "p95_ttft_seconds": 2.01,
+          "p25_pass": true,
+          "p95_pass": false,
+          "overall_pass": false
+        },
+        "duration_seconds": 0.645800958
+      },
+      {
+        "phase_index": 9,
+        "concurrent_users": 40,
+        "kind": "bisect",
+        "steady_state_samples": 759361,
+        "evaluation": {
+          "p25_output_speed_tok_per_s": 85.71428573341836,
+          "p95_ttft_seconds": 1.8679999999999999,
+          "p25_pass": true,
+          "p95_pass": true,
+          "overall_pass": true
+        },
+        "duration_seconds": 0.646920583
+      },
+      {
+        "phase_index": 10,
+        "concurrent_users": 44,
+        "kind": "bisect",
+        "steady_state_samples": 716901,
+        "evaluation": {
+          "p25_output_speed_tok_per_s": 83.33333333333333,
+          "p95_ttft_seconds": 1.938,
+          "p25_pass": true,
+          "p95_pass": true,
+          "overall_pass": true
+        },
+        "duration_seconds": 0.648559584
+      },
+      {
+        "phase_index": 11,
+        "concurrent_users": 46,
+        "kind": "bisect",
+        "steady_state_samples": 774224,
+        "evaluation": {
+          "p25_output_speed_tok_per_s": 82.19178083951023,
+          "p95_ttft_seconds": 1.976,
+          "p25_pass": true,
+          "p95_pass": true,
+          "overall_pass": true
+        },
+        "duration_seconds": 0.648267416
+      },
+      {
+        "phase_index": 12,
+        "concurrent_users": 47,
+        "kind": "bisect",
+        "steady_state_samples": 752828,
+        "evaluation": {
+          "p25_output_speed_tok_per_s": 81.63265306122449,
+          "p95_ttft_seconds": 1.992,
+          "p25_pass": true,
+          "p95_pass": true,
+          "overall_pass": true
+        },
+        "duration_seconds": 0.647759125
+      }
+    ],
+    "total_wall_seconds": 7.860347583
+  }
+}

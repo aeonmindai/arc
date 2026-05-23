@@ -11,11 +11,13 @@
 //!   arc validate --target-hbm 60 -m <model_id>       # HBM footprint check (RUN-191)
 //!   arc serve --pa-cache-type auto                   # Disable TurboQuant, use upstream defaults
 
+mod bench;
 mod validate;
 
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Arc — A high-performance LLM inference engine with TurboQuant compression.
 ///
@@ -43,10 +45,51 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Benchmark a model
+    /// Benchmark a model.
+    ///
+    /// Two suites:
+    ///
+    /// 1. AA-AgentPerf (default) — TUI dashboard + exponential-ramp +
+    ///    binary-search to the largest concurrent-user K that passes the
+    ///    SLO tier. Mirrors Artificial Analysis's AgentPerf methodology.
+    ///    Add `--mock` to exercise the full code path without a GPU.
+    ///
+    /// 2. Legacy — pass `--suite simple` and any trailing args; they are
+    ///    forwarded verbatim to the upstream `mistralrs bench` subprocess.
     Bench {
+        /// Suite to run: agentperf (default) or simple.
+        #[arg(long, default_value = "agentperf")]
+        suite: String,
+        /// HuggingFace model id.
+        #[arg(short = 'm', long, default_value = "deepseek-ai/DeepSeek-V4-Flash")]
+        model: String,
+        /// SLO tier (1=strictest, 4=loosest). See `bench::slo` for defaults.
+        #[arg(long, default_value_t = 2)]
+        slo_tier: u8,
+        /// Use the offline mock vendor — no GPU required.
+        #[arg(long)]
+        mock: bool,
+        /// Cap on concurrent users explored by the scheduler.
+        #[arg(long, default_value_t = 256)]
+        max_users: u32,
+        /// Output path (extension `.json` / `.md` selects which artefact;
+        /// no extension writes both).
+        #[arg(long, default_value = "tests/results/agentperf.json")]
+        output: PathBuf,
+        /// Warmup seconds per phase (the steady-state window uses the same
+        /// length). Override for fast integration tests.
+        #[arg(long, default_value_t = 30.0)]
+        warmup_seconds: f64,
+        /// Steady-state seconds per phase. Defaults to `warmup_seconds`.
+        #[arg(long)]
+        steady_state_seconds: Option<f64>,
+        /// Skip the TUI even on a TTY. Streams phase events to stderr instead.
+        #[arg(long)]
+        headless: bool,
+        /// (legacy `--suite simple`) Pass-through args forwarded to
+        /// `mistralrs bench`. Ignored by agentperf.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        legacy_args: Vec<String>,
     },
     /// Pre-flight validation: check a model against Arc's expected schema
     /// (tensor names *or* HBM footprint).
@@ -112,7 +155,53 @@ fn main() {
     let (subcmd, args) = match cli.command {
         Commands::Serve { args } => ("serve", args),
         Commands::Run { args } => ("run", args),
-        Commands::Bench { args } => ("bench", args),
+        Commands::Bench {
+            suite,
+            model,
+            slo_tier,
+            mock,
+            max_users,
+            output,
+            warmup_seconds,
+            steady_state_seconds,
+            headless,
+            legacy_args,
+        } => {
+            let parsed = match bench::Suite::parse(&suite) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("ERROR: {e}");
+                    std::process::exit(2);
+                }
+            };
+            // For `--suite simple`, fall through to the old `mistralrs bench` shell-out.
+            if parsed == bench::Suite::Simple {
+                ("bench", legacy_args)
+            } else {
+                let warmup = Duration::from_secs_f64(warmup_seconds.max(0.001));
+                let steady = Duration::from_secs_f64(
+                    steady_state_seconds.unwrap_or(warmup_seconds).max(0.001),
+                );
+                let opts = bench::BenchOptions {
+                    suite: parsed,
+                    model,
+                    slo_tier,
+                    mock,
+                    max_users,
+                    output,
+                    warmup,
+                    steady_state: steady,
+                    headless,
+                };
+                match bench::run(opts) {
+                    Ok(code) => std::process::exit(code),
+                    Err(e) => {
+                        eprintln!("ERROR: {e:?}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+        }
         Commands::Validate {
             index,
             arch,
