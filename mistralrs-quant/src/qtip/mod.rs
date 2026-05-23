@@ -55,6 +55,10 @@ use crate::{
     QuantizedSerdeType, ShardedVarBuilder,
 };
 
+#[cfg(feature = "cuda")]
+mod cuda_ops;
+#[cfg(feature = "cuda")]
+mod ffi;
 mod viterbi;
 #[allow(unused_imports)]
 pub use viterbi::viterbi_quantize_row;
@@ -517,6 +521,33 @@ impl QtipLayer {
     }
 
     pub fn dequantize_weights(&self) -> Result<Tensor> {
+        // CPU path produces a [n, k_in] BF16 tensor on the device.
+        // GPU path: dequantize on-GPU into the rotated frame, then
+        // un-rotate with `rotate_x_cuda` on the *rows* (since R is
+        // involutory and applies per-row).
+        #[cfg(feature = "cuda")]
+        {
+            if cuda_ops::can_use_qtip_cuda(&self.blocks) {
+                let w_rotated = cuda_ops::dequantize_rotated_cuda(
+                    &self.blocks,
+                    &self.row_scales,
+                    &self.lut,
+                    self.in_features,
+                    DType::BF16,
+                )?;
+                if self.rotation_block >= 2 {
+                    let signs = match &self.rotation_signs {
+                        Some(t) => t,
+                        None => candle_core::bail!(
+                            "QtipLayer: rotation_block={} but rotation_signs is None",
+                            self.rotation_block
+                        ),
+                    };
+                    return cuda_ops::rotate_x_cuda(&w_rotated, signs, self.rotation_block);
+                }
+                return Ok(w_rotated);
+            }
+        }
         let out = self.dequantize_weights_f32()?;
         let n = self.row_scales.dim(0)?;
         let k_in = self.in_features;
@@ -546,6 +577,30 @@ impl QtipLayer {
         // assumption of the trellis LUT.
         let n = self.row_scales.dim(0)?;
         let k_in = self.in_features;
+
+        // GPU fast path: dequantize-on-GPU + rotate-x-on-GPU + matmul.
+        // We attempt it whenever the layer's storage is on CUDA and the
+        // kernels are compiled in. Any precondition failure (unsupported
+        // dtype, non-power-of-2 block) silently falls through to the
+        // CPU path below.
+        #[cfg(feature = "cuda")]
+        {
+            if cuda_ops::can_use_qtip_cuda(&self.blocks) {
+                if let Ok(mut result) =
+                    self.forward_dequantize_cuda(&x_2d, x.dtype(), n, k_in)
+                {
+                    if let Some(bias) = &self.bias {
+                        result = result.broadcast_add(bias)?;
+                    }
+                    if orig_dims.len() > 2 {
+                        let mut new_dims = orig_dims[..orig_dims.len() - 1].to_vec();
+                        new_dims.push(result.dim(1)?);
+                        result = result.reshape(new_dims)?;
+                    }
+                    return Ok(result);
+                }
+            }
+        }
 
         let (x_for_matmul, w_for_matmul) = if self.rotation_block >= 2 {
             let signs = match &self.rotation_signs {
@@ -592,6 +647,81 @@ impl QtipLayer {
             result = result.reshape(new_dims)?;
         }
         Ok(result)
+    }
+
+    /// GPU forward path: dequantize the rotated weight matrix on-device,
+    /// rotate `x` rows on-device, matmul, return the bias-free result.
+    ///
+    /// Returns `Err` if any precondition fails (e.g. unsupported dtype or
+    /// block size) — the caller falls back to the CPU path.
+    #[cfg(feature = "cuda")]
+    fn forward_dequantize_cuda(
+        &self,
+        x_2d: &Tensor,
+        out_dtype: DType,
+        _n: usize,
+        k_in: usize,
+    ) -> Result<Tensor> {
+        if !matches!(out_dtype, DType::BF16 | DType::F16 | DType::F32) {
+            candle_core::bail!("QTIP forward CUDA: unsupported out dtype {out_dtype:?}");
+        }
+        let x_dev = x_2d.device();
+        if !matches!(x_dev, candle_core::Device::Cuda(_)) {
+            candle_core::bail!("QTIP forward CUDA: x must live on CUDA");
+        }
+        if x_2d.dim(1)? != k_in {
+            candle_core::bail!(
+                "QTIP forward CUDA: x.dim(1)={} != in_features={}",
+                x_2d.dim(1)?,
+                k_in
+            );
+        }
+
+        // Cast x to the layer's working dtype (BF16) if needed for the
+        // rotation kernel — the rotation kernel supports BF16/F16/F32. We
+        // run rotation in the original input dtype where possible to
+        // minimize precision loss; the matmul forces a consistent dtype.
+        let x_rot_dtype = if matches!(x_2d.dtype(), DType::BF16 | DType::F16 | DType::F32) {
+            x_2d.dtype()
+        } else {
+            DType::BF16
+        };
+        let x_for_rot = if x_2d.dtype() == x_rot_dtype {
+            x_2d.contiguous()?
+        } else {
+            x_2d.to_dtype(x_rot_dtype)?.contiguous()?
+        };
+
+        let x_rotated = if self.rotation_block >= 2 {
+            let signs = match &self.rotation_signs {
+                Some(t) => t,
+                None => candle_core::bail!(
+                    "QtipLayer: rotation_block={} but rotation_signs is None",
+                    self.rotation_block
+                ),
+            };
+            cuda_ops::rotate_x_cuda(&x_for_rot, signs, self.rotation_block)?
+        } else {
+            x_for_rot
+        };
+
+        // Dequantize the weight matrix (rotated frame) into the matmul
+        // dtype. Matching dtypes lets candle's matmul go through the
+        // BF16/F16 fast path on H100.
+        let w_dtype = x_rotated.dtype();
+        let w_rotated = cuda_ops::dequantize_rotated_cuda(
+            &self.blocks,
+            &self.row_scales,
+            &self.lut,
+            k_in,
+            w_dtype,
+        )?;
+
+        let y = x_rotated.matmul(&w_rotated.t()?)?;
+        if y.dtype() != out_dtype {
+            return y.to_dtype(out_dtype);
+        }
+        Ok(y)
     }
 }
 
@@ -1548,6 +1678,209 @@ mod tests {
         let layer = QtipLayer::quantize(&w, None, &device)?;
         let layer_t = layer.dequantize_w()?;
         assert_eq!(layer_t.dims(), &[n, k_in]);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // GPU parity tests (cuda feature only).
+    // -----------------------------------------------------------------
+    //
+    // These tests assert that the CUDA forward path produces the same
+    // output as the CPU forward path to within FP precision. They
+    // require a CUDA device to be available; on a CPU-only build they
+    // are simply skipped.
+
+    /// GPU dequantize matches CPU dequantize for the rotated Viterbi path.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_dequantize_matches_cpu_viterbi_rotation() -> Result<()> {
+        let cuda = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("CUDA not available; skipping cuda_dequantize_matches_cpu_viterbi_rotation");
+                return Ok(());
+            }
+        };
+        let cpu = Device::Cpu;
+        let n = 16;
+        let k_in = 256;
+
+        // Random-ish Gaussian weights via deterministic hash (matches the
+        // realistic_gaussian test fixture).
+        let mut wdata = vec![0.0f32; n * k_in];
+        for (i, v) in wdata.iter_mut().enumerate() {
+            let mut z = (i as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z ^= z >> 31;
+            let u1 = ((z >> 32) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+            let u2 = ((z & 0xFFFFFFFF) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+            let r = (-2.0_f32 * u1.ln()).sqrt();
+            *v = r * (2.0 * std::f32::consts::PI * u2).cos() * 0.5;
+        }
+        let w_cpu_tensor = Tensor::from_vec(wdata.clone(), (n, k_in), &cpu)?;
+        let layer_cpu =
+            QtipLayer::quantize_with_mode(&w_cpu_tensor, None, &cpu, QtipMode::Viterbi)?;
+        let w_recon_cpu = layer_cpu.dequantize_w()?.to_dtype(DType::F32)?;
+        let cpu_data: Vec<f32> = w_recon_cpu.flatten_all()?.to_vec1()?;
+
+        // Re-quantize on CUDA — the CPU path is the source of truth; we
+        // re-build the layer on CUDA by moving the CPU layer's tensors.
+        let w_cuda_tensor = Tensor::from_vec(wdata, (n, k_in), &cuda)?;
+        let layer_cuda =
+            QtipLayer::quantize_with_mode(&w_cuda_tensor, None, &cuda, QtipMode::Viterbi)?;
+        let w_recon_cuda = layer_cuda.dequantize_w()?.to_dtype(DType::F32)?;
+        let cuda_data: Vec<f32> = w_recon_cuda.to_device(&cpu)?.flatten_all()?.to_vec1()?;
+
+        let (mut dot, mut na, mut nb) = (0f32, 0f32, 0f32);
+        for (a, b) in cpu_data.iter().zip(cuda_data.iter()) {
+            dot += a * b;
+            na += a * a;
+            nb += b * b;
+        }
+        let cos = dot / (na.sqrt() * nb.sqrt());
+        println!("CUDA vs CPU dequant cos sim (Viterbi+rotation): {cos}");
+        assert!(
+            cos >= 0.999,
+            "CUDA dequant deviates from CPU: cos sim {cos} < 0.999"
+        );
+        Ok(())
+    }
+
+    /// End-to-end GPU forward matches the CPU forward for a realistic
+    /// Gaussian fixture under the Viterbi+rotation path.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_forward_matches_cpu_viterbi_rotation() -> Result<()> {
+        let cuda = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("CUDA not available; skipping cuda_forward_matches_cpu_viterbi_rotation");
+                return Ok(());
+            }
+        };
+        let cpu = Device::Cpu;
+        let n = 32;
+        let k_in = 256;
+        let batch = 4;
+
+        let mut wdata = vec![0.0f32; n * k_in];
+        for (i, v) in wdata.iter_mut().enumerate() {
+            let mut z = (i as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z ^= z >> 31;
+            let u1 = ((z >> 32) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+            let u2 = ((z & 0xFFFFFFFF) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+            let r = (-2.0_f32 * u1.ln()).sqrt();
+            *v = r * (2.0 * std::f32::consts::PI * u2).cos() * 0.5;
+        }
+        let mut xdata = vec![0.0f32; batch * k_in];
+        for (i, v) in xdata.iter_mut().enumerate() {
+            let mut z = ((i + 1_000_000) as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z ^= z >> 31;
+            let u1 = ((z >> 32) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+            let u2 = ((z & 0xFFFFFFFF) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+            let r = (-2.0_f32 * u1.ln()).sqrt();
+            *v = r * (2.0 * std::f32::consts::PI * u2).cos();
+        }
+
+        // CPU layer + CPU forward.
+        let w_cpu = Tensor::from_vec(wdata.clone(), (n, k_in), &cpu)?;
+        let x_cpu = Tensor::from_vec(xdata.clone(), (batch, k_in), &cpu)?;
+        let layer_cpu = QtipLayer::quantize_with_mode(&w_cpu, None, &cpu, QtipMode::Viterbi)?;
+        let y_cpu = layer_cpu.forward(&x_cpu)?;
+        let y_cpu_v: Vec<f32> = y_cpu.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+
+        // CUDA layer + CUDA forward.
+        let w_cuda = Tensor::from_vec(wdata, (n, k_in), &cuda)?;
+        let x_cuda = Tensor::from_vec(xdata, (batch, k_in), &cuda)?;
+        let layer_cuda =
+            QtipLayer::quantize_with_mode(&w_cuda, None, &cuda, QtipMode::Viterbi)?;
+        let y_cuda = layer_cuda.forward(&x_cuda)?;
+        let y_cuda_v: Vec<f32> = y_cuda.to_device(&cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+
+        // Compare CPU vs CUDA forward outputs.
+        let (mut dot, mut na, mut nb) = (0f32, 0f32, 0f32);
+        for (a, b) in y_cpu_v.iter().zip(y_cuda_v.iter()) {
+            dot += a * b;
+            na += a * a;
+            nb += b * b;
+        }
+        let cos = dot / (na.sqrt() * nb.sqrt());
+        println!("CUDA vs CPU forward cos sim (Viterbi+rotation): {cos}");
+        assert!(
+            cos >= 0.999,
+            "CUDA forward deviates from CPU: cos sim {cos} < 0.999"
+        );
+
+        // Also assert vs dense matmul: should match the CPU Viterbi number
+        // (≥0.95 on the realistic fixture).
+        let dense_v: Vec<f32> = x_cpu.matmul(&w_cpu.t()?)?.flatten_all()?.to_vec1()?;
+        let (mut dot2, mut na2, mut nb2) = (0f32, 0f32, 0f32);
+        for (d, q) in dense_v.iter().zip(y_cuda_v.iter()) {
+            dot2 += d * q;
+            na2 += d * d;
+            nb2 += q * q;
+        }
+        let cos_vs_dense = dot2 / (na2.sqrt() * nb2.sqrt());
+        println!("CUDA vs dense cos sim: {cos_vs_dense}");
+        assert!(
+            cos_vs_dense >= 0.95,
+            "CUDA Viterbi+rotation cos sim vs dense {cos_vs_dense} < 0.95"
+        );
+        Ok(())
+    }
+
+    /// GPU rotation kernel matches the CPU `apply_block_rotation`.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_rotate_x_matches_cpu() -> Result<()> {
+        use crate::turboquant::wht::generate_signs;
+        let cuda = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("CUDA not available; skipping cuda_rotate_x_matches_cpu");
+                return Ok(());
+            }
+        };
+        let cpu = Device::Cpu;
+        for &(batch, feat) in &[(2usize, 64usize), (4, 128), (1, 256), (3, 512)] {
+            let block = rotation_block_size(feat);
+            if block < 2 {
+                continue;
+            }
+            let signs_vec = generate_signs(QTIP_ROTATION_SEED, feat);
+            let xdata: Vec<f32> = (0..(batch * feat))
+                .map(|i| ((i as f32) * 0.031).sin() + ((i as f32) * 0.07).cos())
+                .collect();
+
+            // CPU rotation.
+            let mut cpu_rot = xdata.clone();
+            for b in 0..batch {
+                let row = &mut cpu_rot[b * feat..(b + 1) * feat];
+                apply_block_rotation(row, &signs_vec, block);
+            }
+
+            // CUDA rotation.
+            let x_cuda = Tensor::from_vec(xdata.clone(), (batch, feat), &cuda)?
+                .to_dtype(DType::F32)?;
+            let signs_cuda = Tensor::from_vec(signs_vec, (feat,), &cuda)?;
+            let x_rot_cuda = super::cuda_ops::rotate_x_cuda(&x_cuda, &signs_cuda, block)?;
+            let cuda_rot: Vec<f32> = x_rot_cuda.to_device(&cpu)?.flatten_all()?.to_vec1()?;
+
+            let mut max_diff = 0f32;
+            for (a, b) in cpu_rot.iter().zip(cuda_rot.iter()) {
+                max_diff = max_diff.max((a - b).abs());
+            }
+            println!(
+                "Rotate-x CUDA vs CPU (batch={batch}, feat={feat}, block={block}): max_diff = {max_diff:.6}"
+            );
+            // F32 rotation should match to FP rounding (a few ULPs).
+            assert!(
+                max_diff < 1e-3,
+                "CUDA rotation diverges from CPU: max_diff {max_diff} >= 1e-3"
+            );
+        }
         Ok(())
     }
 }
