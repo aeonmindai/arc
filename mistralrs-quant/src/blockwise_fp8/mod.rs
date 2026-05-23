@@ -394,7 +394,7 @@ impl QuantMethod for BlockwiseFP8Linear {
                     &weight.to_device(&device)?,
                     bias,
                     &device,
-                    crate::QtipMode::Viterbi,
+                    crate::QtipMode::Greedy,
                 )
             }
             None => {

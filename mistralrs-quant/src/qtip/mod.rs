@@ -59,6 +59,9 @@ mod viterbi;
 #[allow(unused_imports)]
 pub use viterbi::viterbi_quantize_row;
 
+#[cfg(feature = "cuda")]
+pub(crate) mod ffi;
+
 /// Default seed for the QTIP Hadamard incoherence rotation.
 ///
 /// QTIP (Cornell ICLR'25) requires that quantize-time and inference-time agree

@@ -48,6 +48,7 @@ fn main() -> Result<(), String> {
     println!("cargo::rustc-check-cfg=cfg(has_vector_fp8_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_mxfp4_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_mxfp4_wmma_kernels)");
+    println!("cargo::rustc-check-cfg=cfg(has_qtip_kernels)");
     // SageAttention SM89/SM90/SM100 INT8 + FP8 kernels (vendored from
     // SageAttention upstream). When the compiled GPU compute cap is high
     // enough, the kernels are linked in; otherwise the Rust side falls back
@@ -110,6 +111,8 @@ fn main() -> Result<(), String> {
             println!("cargo:rustc-cfg=has_vector_fp8_kernels");
             // WMMA tensor core MXFP4 kernel (FP16/BF16 WMMA requires SM >= 80)
             println!("cargo:rustc-cfg=has_mxfp4_wmma_kernels");
+            // QTIP 2-bit trellis decode kernel (V=2 / K=4 / L=16 format).
+            println!("cargo:rustc-cfg=has_qtip_kernels");
         }
         // SageAttention compile-time gating. The SM89 path needs FP8 MMA
         // instructions, which require SM >= 8.9 (Ada / L4 / RTX 4090) at
