@@ -14,9 +14,14 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/cuda/decode_loop.cu");
     println!("cargo:rerun-if-changed=src/cuda/decode_kernels.cu");
     println!("cargo:rerun-if-changed=src/cuda/gemv_bf16.cu");
+    // RUN-163: FlashMLASparse — vendored from sgl-project (MIT). See
+    // src/cuda/flashmlasparse/LICENSE-MIT for attribution.
+    println!("cargo:rerun-if-changed=src/cuda/flashmlasparse/indexer_score.cu");
+    println!("cargo:rerun-if-changed=src/cuda/flashmlasparse/topk_radix.cu");
 
     let mut builder = cudaforge::KernelBuilder::new()
         .source_glob("src/cuda/*.cu")
+        .source_glob("src/cuda/flashmlasparse/*.cu")
         .arg("-std=c++17")
         .arg("-O3")
         .arg("-U__CUDA_NO_HALF_OPERATORS__")

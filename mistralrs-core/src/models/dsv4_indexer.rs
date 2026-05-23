@@ -319,26 +319,59 @@ impl V4Indexer {
             .reshape((b, h_k, t_c, self.head_dim))?
             .contiguous()?;
 
-        // --- 3. Dot-product scores: q @ k^T ----------------------------
+        // --- 3+4+5. Score + scale + top-k -------------------------------
+        // CUDA fast path (RUN-163): when running on a CUDA device with a
+        // supported (topk, head_dim) combo, dispatch to the vendored
+        // FlashMLASparse kernels for fused score + radix top-k. The pure
+        // Rust path below remains the spec / reference and is also taken
+        // on CPU / non-CUDA devices and for unsupported shapes.
+        //
+        // Per-head scale: weights_proj(xs) → [B, T_q, n_heads]
+        //                                  → [B, n_heads, T_q]
+        let per_head_scale_3d = self
+            .weights_proj
+            .forward_autocast(xs)? // [B, T_q, n_heads]
+            .transpose(1, 2)? // [B, n_heads, T_q]
+            .contiguous()?;
+
+        #[cfg(feature = "cuda")]
+        {
+            if matches!(q.device(), candle_core::Device::Cuda(_))
+                && q.dtype() == candle_core::DType::BF16
+                && arc_cuda_graph::flashmlasparse::SUPPORTED_TOPK
+                    .contains(&self.topk.min(t_c))
+            {
+                // Ensure all three inputs are BF16 contiguous on the same device.
+                let q_bf16 = q.to_dtype(candle_core::DType::BF16)?.contiguous()?;
+                let k_bf16 = indexer_k
+                    .to_dtype(candle_core::DType::BF16)?
+                    .contiguous()?;
+                let s_bf16 = per_head_scale_3d
+                    .to_dtype(candle_core::DType::BF16)?
+                    .contiguous()?;
+                let topk = self.topk.min(t_c);
+                let out = arc_cuda_graph::flashmlasparse::score_and_topk_bf16(
+                    &q_bf16, &k_bf16, &s_bf16, topk,
+                )?;
+                // Output dtype matches Candle's `topk_unsorted` (U32).
+                return Ok(out);
+            }
+        }
+
+        // --- Pure-Rust reference path ----------------------------------
         // q:        [B, n_heads, T_q, head_dim]
         // k^T:      [B, n_heads, head_dim, T_c]
         // scores:   [B, n_heads, T_q, T_c]
         let k_t = indexer_k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
         let scores = q.matmul(&k_t)?;
 
-        // --- 4. Per-head scaling from weights_proj(x) ------------------
-        // weights_proj: [B, T_q, hidden] → [B, T_q, n_heads]
-        //                              → [B, n_heads, T_q, 1] (for broadcast)
-        let per_head_scale = self
-            .weights_proj
-            .forward_autocast(xs)? // [B, T_q, n_heads]
-            .transpose(1, 2)? // [B, n_heads, T_q]
+        // Per-head scale: [B, n_heads, T_q] → [B, n_heads, T_q, 1] for broadcast.
+        let per_head_scale = per_head_scale_3d
             .unsqueeze(D::Minus1)? // [B, n_heads, T_q, 1]
             .contiguous()?;
         let scaled = scores.broadcast_mul(&per_head_scale.to_dtype(scores.dtype())?)?;
 
-        // --- 5. Top-k along T_c (last dim) -----------------------------
-        // Returns indices into [0, T_c).
+        // Top-k along T_c (last dim). Returns indices into [0, T_c).
         let scaled = scaled.contiguous()?;
         let k = self.topk.min(t_c);
         let TopKOutput { indices, .. } = scaled.topk_unsorted(k)?;
@@ -573,6 +606,251 @@ mod tests {
             .flatten_all()?
             .to_vec1()?;
         assert_eq!(out_a, out_b, "indexer must be deterministic across re-runs");
+        Ok(())
+    }
+
+    /// Agreement test (RUN-163): the V4Indexer's Candle forward path must
+    /// agree with a hand-rolled per-(B, H, T_q) score+top-k baseline that
+    /// mirrors what the CUDA FlashMLASparse kernels compute. This locks in
+    /// the spec the CUDA kernels are compared against on a GPU host.
+    ///
+    /// We construct an indexer with ape=0 + RMSNorm weight=1 so the inner
+    /// compressor reduces to a pure sigmoid(gate)*kv + sum-over-coff
+    /// transformation. Then we replicate that transformation in pure Rust
+    /// and verify the top-k indices match.
+    #[test]
+    fn v4_indexer_agrees_with_cpu_reference() -> Result<()> {
+        let device = Device::Cpu;
+        // small but realistic shape: 1 batch, 2 query tokens, 3 heads,
+        // head_dim=8, ratio=4, t_full=16 → T_c=4; topk=3.
+        let cfg = synth_cfg(/*hidden*/ 16, /*q_lora*/ 16, /*n_heads*/ 3, /*head_dim*/ 8, /*topk*/ 3);
+        // Use a fixed-seed deterministic tensor map (the same one used by
+        // the other tests). Real-checkpoint values would differ but the
+        // agreement check is shape/structure-agnostic.
+        let tensors = make_indexer_tensors(&cfg, 4, 2, &device);
+
+        // Snapshot the actual weight tensors so the reference uses identical
+        // values (the `make_indexer_tensors` uses randn so values differ run
+        // to run if we re-call it — capture the ones we use).
+        let wq_b_w = tensors["wq_b.weight"].clone();
+        let weights_proj_w = tensors["weights_proj.weight"].clone();
+        let ape = tensors["compressor.ape"].clone();
+        let norm_w = tensors["compressor.norm.weight"].clone();
+        let wgate_w = tensors["compressor.wgate.weight"].clone();
+        let wkv_w = tensors["compressor.wkv.weight"].clone();
+
+        let vb = vb_from_map(tensors, DType::F32, &device);
+        let indexer = V4Indexer::new(&cfg, vb, &device, false)?;
+
+        let b = 1usize;
+        let t_q = 2usize;
+        let t_full = 16usize;
+        let t_c = t_full / 4;
+        let topk = cfg.index_topk;
+
+        // Inputs: small distinct values via arange so no two scores tie.
+        let q_a = Tensor::arange(0u32, (b * t_q * cfg.q_lora_rank.unwrap()) as u32, &device)?
+            .reshape((b, t_q, cfg.q_lora_rank.unwrap()))?
+            .to_dtype(DType::F32)?
+            .affine(0.013, -0.5)?; // diversify
+        let k_full = Tensor::arange(
+            0u32,
+            (b * cfg.index_n_heads * t_full * cfg.index_head_dim) as u32,
+            &device,
+        )?
+        .reshape((b, cfg.index_n_heads, t_full, cfg.index_head_dim))?
+        .to_dtype(DType::F32)?
+        .affine(0.007, -0.25)?;
+        let xs = Tensor::arange(0u32, (b * t_q * cfg.hidden_size) as u32, &device)?
+            .reshape((b, t_q, cfg.hidden_size))?
+            .to_dtype(DType::F32)?
+            .affine(0.011, -0.3)?;
+
+        // ---- Candle forward (the path under test) ----
+        let got: Vec<u32> = indexer
+            .forward(&q_a, &k_full, &xs)?
+            .flatten_all()?
+            .to_vec1()?;
+
+        // ---- Hand-rolled CPU reference (mirror of the candle path) ----
+        // 1. q = wq_b @ q_a, reshape, transpose → [B, H, T_q, D]
+        let n_heads = cfg.index_n_heads;
+        let head_dim = cfg.index_head_dim;
+        let q_lora = cfg.q_lora_rank.unwrap();
+        let hidden = cfg.hidden_size;
+        let ratio = 4usize;
+        let coff = 2usize;
+
+        let q_a_v: Vec<f32> = q_a.flatten_all()?.to_vec1()?;
+        let xs_v: Vec<f32> = xs.flatten_all()?.to_vec1()?;
+        let k_full_v: Vec<f32> = k_full.flatten_all()?.to_vec1()?;
+        let wq_b_v: Vec<f32> = wq_b_w.flatten_all()?.to_vec1()?;
+        let weights_proj_v: Vec<f32> = weights_proj_w.flatten_all()?.to_vec1()?;
+        let ape_v: Vec<f32> = ape.flatten_all()?.to_vec1()?;
+        let norm_w_v: Vec<f32> = norm_w.flatten_all()?.to_vec1()?;
+        let wgate_v: Vec<f32> = wgate_w.flatten_all()?.to_vec1()?;
+        let wkv_v: Vec<f32> = wkv_w.flatten_all()?.to_vec1()?;
+
+        // Linear: out[i] = sum_k(w[i,k] * in[k])
+        let lin = |w: &[f32], in_dim: usize, out_dim: usize, x: &[f32]| -> Vec<f32> {
+            let mut out = vec![0.0f32; x.len() / in_dim * out_dim];
+            let rows = x.len() / in_dim;
+            for r in 0..rows {
+                for o in 0..out_dim {
+                    let mut acc = 0.0f32;
+                    for k in 0..in_dim {
+                        acc += w[o * in_dim + k] * x[r * in_dim + k];
+                    }
+                    out[r * out_dim + o] = acc;
+                }
+            }
+            out
+        };
+
+        // 1. indexer_q = wq_b(q_a) → [B*T_q, n_heads*head_dim]
+        let q_flat = lin(&wq_b_v, q_lora, n_heads * head_dim, &q_a_v);
+        // Reshape to [B, H, T_q, D] in pure-vec layout: source has
+        // [B, T_q, n_heads, head_dim], target needs [B, H, T_q, D].
+        let mut q_bhqd = vec![0.0f32; b * n_heads * t_q * head_dim];
+        for bi in 0..b {
+            for ti in 0..t_q {
+                for h in 0..n_heads {
+                    for d in 0..head_dim {
+                        let src = ((bi * t_q + ti) * n_heads + h) * head_dim + d;
+                        let dst = ((bi * n_heads + h) * t_q + ti) * head_dim + d;
+                        q_bhqd[dst] = q_flat[src];
+                    }
+                }
+            }
+        }
+
+        // 2. Inner compressor on K. Group K [B,H,T_full,D] → [B*H*T_c, ratio*D]
+        let mut k_grouped = vec![0.0f32; b * n_heads * t_c * (ratio * head_dim)];
+        for bi in 0..b {
+            for h in 0..n_heads {
+                for ci in 0..t_c {
+                    for ri in 0..ratio {
+                        for d in 0..head_dim {
+                            let src = ((bi * n_heads + h) * t_full + ci * ratio + ri) * head_dim + d;
+                            let dst = ((bi * n_heads + h) * t_c + ci) * (ratio * head_dim)
+                                + ri * head_dim
+                                + d;
+                            k_grouped[dst] = k_full_v[src];
+                        }
+                    }
+                }
+            }
+        }
+
+        // Linear projections wgate, wkv → [B*H*T_c, coff*head_dim]
+        let gate_out = lin(&wgate_v, ratio * head_dim, coff * head_dim, &k_grouped);
+        let kv_out = lin(&wkv_v, ratio * head_dim, coff * head_dim, &k_grouped);
+        // sigmoid(gate) * kv
+        let mut gated: Vec<f32> = gate_out
+            .iter()
+            .zip(kv_out.iter())
+            .map(|(&g, &v)| (1.0 / (1.0 + (-g).exp())) * v)
+            .collect();
+        // ape bias: sum over ratio axis to get [coff*head_dim], broadcast
+        // add across all rows.
+        let mut ape_bias = vec![0.0f32; coff * head_dim];
+        for ri in 0..ratio {
+            for d in 0..(coff * head_dim) {
+                ape_bias[d] += ape_v[ri * (coff * head_dim) + d];
+            }
+        }
+        let n_rows_gated = b * n_heads * t_c;
+        for r in 0..n_rows_gated {
+            for d in 0..(coff * head_dim) {
+                gated[r * (coff * head_dim) + d] += ape_bias[d];
+            }
+        }
+
+        // Reshape gated [B*H*T_c, coff*head_dim] → [(B*H*T_c)*coff, head_dim],
+        // apply RMSNorm per row, then sum over coff to get [B*H*T_c, head_dim].
+        let rms_eps = cfg.rms_norm_eps as f32;
+        let mut normed = vec![0.0f32; n_rows_gated * coff * head_dim];
+        for r in 0..(n_rows_gated * coff) {
+            // RMSNorm: x * weight / sqrt(mean(x^2) + eps)
+            let base = r * head_dim;
+            let mut sumsq = 0.0f32;
+            for d in 0..head_dim {
+                sumsq += gated[base + d].powi(2);
+            }
+            let scale = 1.0 / (sumsq / head_dim as f32 + rms_eps).sqrt();
+            for d in 0..head_dim {
+                normed[base + d] = gated[base + d] * scale * norm_w_v[d];
+            }
+        }
+        // Sum over coff → indexer_k [B, H, T_c, head_dim]
+        let mut indexer_k = vec![0.0f32; n_rows_gated * head_dim];
+        for r in 0..n_rows_gated {
+            for c in 0..coff {
+                for d in 0..head_dim {
+                    indexer_k[r * head_dim + d] += normed[(r * coff + c) * head_dim + d];
+                }
+            }
+        }
+
+        // 3. weights_proj(xs) → [B, T_q, n_heads] → [B, H, T_q]
+        let wp_flat = lin(&weights_proj_v, hidden, n_heads, &xs_v);
+        let mut scale = vec![0.0f32; b * n_heads * t_q];
+        for bi in 0..b {
+            for ti in 0..t_q {
+                for h in 0..n_heads {
+                    let src = (bi * t_q + ti) * n_heads + h;
+                    let dst = (bi * n_heads + h) * t_q + ti;
+                    scale[dst] = wp_flat[src];
+                }
+            }
+        }
+
+        // 4. Per-(B, H, T_q) scoring + top-k. Use the same lowest-index
+        // tiebreak as both V4Indexer::forward (candle's topk_unsorted) and
+        // the FlashMLASparse CPU reference.
+        let k_top = topk.min(t_c);
+        let mut expected = vec![0u32; b * n_heads * t_q * k_top];
+        for bi in 0..b {
+            for h in 0..n_heads {
+                for ti in 0..t_q {
+                    let s = scale[(bi * n_heads + h) * t_q + ti];
+                    let q_base = ((bi * n_heads + h) * t_q + ti) * head_dim;
+                    let mut scored: Vec<(usize, f32)> = (0..t_c)
+                        .map(|ci| {
+                            let k_base = ((bi * n_heads + h) * t_c + ci) * head_dim;
+                            let mut acc = 0.0f32;
+                            for d in 0..head_dim {
+                                acc += q_bhqd[q_base + d] * indexer_k[k_base + d];
+                            }
+                            (ci, acc * s)
+                        })
+                        .collect();
+                    scored.sort_by(|a, b| {
+                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                            .then(a.0.cmp(&b.0))
+                    });
+                    let out_base = ((bi * n_heads + h) * t_q + ti) * k_top;
+                    for i in 0..k_top {
+                        expected[out_base + i] = scored[i].0 as u32;
+                    }
+                }
+            }
+        }
+
+        // Candle's topk_unsorted returns indices in arbitrary order (no
+        // guarantee of sort). The flashmlasparse spec also produces an
+        // unsorted set. Compare as sets per (B, H, T_q) row.
+        for row in 0..(b * n_heads * t_q) {
+            let mut g: Vec<u32> = got[row * k_top..(row + 1) * k_top].to_vec();
+            let mut e: Vec<u32> = expected[row * k_top..(row + 1) * k_top].to_vec();
+            g.sort_unstable();
+            e.sort_unstable();
+            assert_eq!(
+                g, e,
+                "row {row}: V4Indexer candle path disagreed with CPU reference; \
+                 got={g:?} expected={e:?}"
+            );
+        }
         Ok(())
     }
 }

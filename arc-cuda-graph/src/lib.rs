@@ -14,6 +14,15 @@ pub mod decode_forward;
 pub mod dedicated;
 pub mod gemv_ffi;
 pub mod nongemv_ffi;
+
+/// FlashMLASparse — V4 Lightning Indexer scoring + radix top-k.
+///
+/// Vendored from MIT-licensed sgl-project/FlashMLA and sgl-project/sglang
+/// (see `src/cuda/flashmlasparse/LICENSE-MIT`). Provides a CPU reference
+/// (always available) and a CUDA dispatch (under `feature="cuda"`).
+pub mod flashmlasparse;
+#[cfg(feature = "cuda")]
+pub mod flashmlasparse_ffi;
 /// CPU reference sampler — bit-exact spec for the on-device GPU sampler.
 /// Tier A: this module + tests, runs without CUDA.
 /// Tier B: GPU sampler in autonomous.rs matches this output for the same RNG seed.

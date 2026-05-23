@@ -1,0 +1,45 @@
+FlashMLASparse vendored kernel — MIT license attribution
+=========================================================
+
+This directory contains CUDA kernels for the DeepSeek V4 Lightning Indexer,
+adapted from two MIT-licensed upstream sources:
+
+1. sgl-project/FlashMLA  (https://github.com/sgl-project/FlashMLA)
+   Copyright (c) 2025 DeepSeek
+   File-level sources used: csrc/sm90/decode/sparse_fp8/* (algorithm shape),
+   csrc/api/sparse_decode.h (API surface inspiration).
+
+2. sgl-project/sglang   (https://github.com/sgl-project/sglang)
+   Copyright (c) 2025 SGLang contributors
+   File-level sources used:
+     - python/sglang/jit_kernel/csrc/deepseek_v4/topk_v1.cuh
+       (radix-256 two-stage top-k selection — basis for topk_radix.cu)
+     - python/sglang/srt/layers/attention/dsv4/tilelang_kernel.py
+       (fp8_paged_mqa_logits scoring algorithm — basis for indexer_score.cu;
+        we use the BF16 dense variant; FP8 paged variant is rental-day-2 work)
+
+The Arc-specific modifications and the BF16/F32 dense rewrite are:
+   Copyright (c) 2026 Arc / Runcrate
+
+All files in this directory carry MIT license headers and may be redistributed
+under the MIT license terms.
+
+------------------------------ MIT License ----------------------------
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
