@@ -403,6 +403,29 @@ pub struct V4Compressor {
 }
 
 impl V4Compressor {
+    /// Auto-detect whether a checkpoint slice carries real compressor
+    /// weights. Two layouts are supported (audit §0 + §1 Pattern B/C/D
+    /// + §5 line 371 "Compressor wkv_gate fusion"):
+    ///
+    /// 1. **V4 native (post-fusion)**: a single `wkv_gate.weight` tensor of
+    ///    shape `[2*coff*head_dim, hidden_size]`. This is what SGLang
+    ///    produces after `load_weights → cache_compressor_weight` (which
+    ///    pre-concats `wkv || wgate`); it's also the shape Arc's synthetic
+    ///    test fixtures use.
+    /// 2. **V4 native (pre-fusion)**: two separate tensors
+    ///    `wkv.weight` and `wgate.weight`, each `[coff*head_dim,
+    ///    hidden_size]`, exactly as published in the V4 Flash safetensors
+    ///    index. The constructor concats `[kv, wgate]` along dim 0 to
+    ///    reconstruct the fused linear in-place.
+    ///
+    /// Returns `true` when either layout is present. Callers that get
+    /// `false` should fall back to [`V4Compressor::uniform`] to avoid
+    /// silently dropping into a `DummyLayer` on the forward path.
+    pub fn has_weights(vb: &ShardedVarBuilder) -> bool {
+        vb.contains_tensor("wkv_gate.weight")
+            || (vb.contains_tensor("wkv.weight") && vb.contains_tensor("wgate.weight"))
+    }
+
     pub fn new(
         cfg: &DeepSeekV4Config,
         vb: ShardedVarBuilder,
@@ -412,13 +435,43 @@ impl V4Compressor {
         let overlap = ratio == 4;
         let coff = 1 + usize::from(overlap);
 
-        let wkv_gate = ReplicatedLayer::new(
-            cfg.hidden_size,
-            2 * coff * head_dim,
-            &None,
-            false,
-            vb.pp("wkv_gate"),
-        )?;
+        // Two valid layouts. Both produce the same final `wkv_gate`
+        // ReplicatedLayer with shape `[2*coff*head_dim, hidden_size]`.
+        // See `V4Compressor::has_weights` for the audit references.
+        let wkv_gate = if vb.contains_tensor("wkv_gate.weight") {
+            // Pre-fused: load through the standard ReplicatedLayer path so
+            // ISQ / quantization config still applies if present.
+            ReplicatedLayer::new(
+                cfg.hidden_size,
+                2 * coff * head_dim,
+                &None,
+                false,
+                vb.pp("wkv_gate"),
+            )?
+        } else if vb.contains_tensor("wkv.weight") && vb.contains_tensor("wgate.weight") {
+            // V4-native dual tensors. SGLang's `cache_compressor_weight`
+            // (deepseek_v4.py:1632-1663) does the exact same concat at
+            // load time: `wkv_gate.weight = torch.cat([wkv, wgate], dim=0)`.
+            // PyTorch Linear stores `[out, in]`, so dim 0 == output channel,
+            // and the concat order is wkv-first then wgate (matches the
+            // `split([coff*head_dim, coff*head_dim], dim=-1)` decode in
+            // [`V4Compressor::forward_from_xs`]).
+            let row = coff * head_dim;
+            let wkv_w = vb.get((row, cfg.hidden_size), "wkv.weight")?;
+            let wgate_w = vb.get((row, cfg.hidden_size), "wgate.weight")?;
+            let fused = Tensor::cat(&[&wkv_w, &wgate_w], 0)?;
+            ReplicatedLayer::from_linear(candle_nn::Linear::new(fused, None))?
+        } else {
+            // Caller is expected to have gated this case via
+            // `V4Compressor::has_weights` — surface a clear error if not.
+            candle_core::bail!(
+                "V4Compressor::new: neither `wkv_gate.weight` nor (`wkv.weight` + \
+                 `wgate.weight`) present in checkpoint. Call \
+                 `V4Compressor::has_weights(&vb)` first and fall back to \
+                 `V4Compressor::uniform` when it returns false."
+            );
+        };
+
         let norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("norm"))?;
 
         let ape = if vb.contains_tensor("ape") {
@@ -789,14 +842,17 @@ impl Attention {
         let compress_ratio = CompressRatio::from(ratio_int);
 
         // ---- V4 compressor (CSA + HCA layers only) ----
+        // Auto-detect dispatch: `V4Compressor::has_weights` accepts either
+        // the post-fused `wkv_gate.weight` layout (synth / SGLang-cached)
+        // or the V4-native pre-fused dual `wkv.weight` + `wgate.weight`
+        // layout. Anything else falls back to the uniform-averaging stub so
+        // old checkpoints continue to load. Audit §0 + §1 Pattern B/C/D.
         let compressor = if compress_ratio != CompressRatio::Standard {
             let device = mapper
                 .device_for(layer_idx, loading_isq)
                 .unwrap_or(&Device::Cpu);
             let comp_vb = mapper.set_device(layer_idx, vb.pp("compressor"), loading_isq);
-            let has_real_compressor = comp_vb.contains_tensor("wkv_gate.weight")
-                || comp_vb.contains_tensor("wkv.weight");
-            let comp = if has_real_compressor {
+            let comp = if V4Compressor::has_weights(&comp_vb) {
                 V4Compressor::new(cfg, comp_vb, ratio_int as usize, head_dim)?
             } else {
                 V4Compressor::uniform(ratio_int as usize, head_dim, device)?
@@ -2229,5 +2285,329 @@ mod tests {
     #[test]
     fn v4_sliding_window_default_is_128() {
         assert_eq!(default_sliding_window(), 128);
+    }
+
+    // ===== V4Compressor real-weight loading (RUN-162) =====
+    //
+    // The following tests cover the compress-layer weight loader that
+    // replaces the uniform-averaging fallback. They use a
+    // `HashMap<String, Tensor>` backing a `ShardedVarBuilder`, mirroring
+    // the pattern in `dsv4_indexer::tests`, so the loader is exercised
+    // without requiring the real V4 Flash safetensors.
+
+    /// Minimal V4 config sufficient to drive `V4Compressor::new`. Only
+    /// `hidden_size` and `rms_norm_eps` are touched by the constructor;
+    /// the rest are filled with defaults / synth values.
+    fn compressor_test_cfg(hidden_size: usize) -> DeepSeekV4Config {
+        let json = serde_json::json!({
+            "vocab_size": 32,
+            "hidden_size": hidden_size,
+            "moe_intermediate_size": 64,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "n_shared_experts": null,
+            "n_routed_experts": null,
+            "num_experts_per_tok": null,
+            "max_position_embeddings": 128,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0,
+            "qk_rope_head_dim": 4,
+            "head_dim": 8,
+            "compress_ratios": [4, 128],
+        });
+        serde_json::from_value(json).expect("compressor test cfg deserializes")
+    }
+
+    /// Build a `ShardedVarBuilder` from a HashMap. Same helper as
+    /// `dsv4_indexer::tests::vb_from_map`; reproduced here so this file
+    /// doesn't grow a `pub` test-only API on the indexer module.
+    fn vb_from_map(
+        map: std::collections::HashMap<String, Tensor>,
+        dtype: DType,
+        dev: &Device,
+    ) -> ShardedVarBuilder {
+        let backend: Box<dyn candle_nn::var_builder::SimpleBackend> = Box::new(map);
+        mistralrs_quant::ShardedSafeTensors::wrap(backend, dtype, dev.clone())
+    }
+
+    /// Populate the four V4-native compressor tensors (`wkv`, `wgate`,
+    /// `norm`, `ape`) with reproducible non-zero values. Returns a HashMap
+    /// that can be wrapped by `vb_from_map` and handed to
+    /// `V4Compressor::new`. The seed determines the values via a simple
+    /// LCG so two calls with different seeds produce different tensors.
+    fn make_compressor_dual_tensors(
+        hidden_size: usize,
+        head_dim: usize,
+        ratio: usize,
+        coff: usize,
+        seed: u32,
+        device: &Device,
+    ) -> std::collections::HashMap<String, Tensor> {
+        let mut m = std::collections::HashMap::new();
+        let row = coff * head_dim;
+        // Deterministic non-zero pattern: idx * 0.01 + seed-derived offset.
+        // Use Tensor::from_vec to avoid pulling rand into deps.
+        let make = |rows: usize, cols: usize, off: f32| -> Tensor {
+            let mut v = Vec::with_capacity(rows * cols);
+            for i in 0..(rows * cols) {
+                v.push(((i as f32) * 0.013 + off).sin() * 0.1);
+            }
+            Tensor::from_vec(v, (rows, cols), device).unwrap()
+        };
+        m.insert("wkv.weight".to_string(), make(row, hidden_size, seed as f32 * 0.07));
+        m.insert(
+            "wgate.weight".to_string(),
+            make(row, hidden_size, seed as f32 * 0.11 + 0.5),
+        );
+        m.insert(
+            "norm.weight".to_string(),
+            Tensor::ones(head_dim, DType::F32, device).unwrap(),
+        );
+        // ape: small non-zero to influence forward distinctly.
+        m.insert(
+            "ape".to_string(),
+            (Tensor::ones((ratio, coff * head_dim), DType::F32, device).unwrap() * 0.05f64)
+                .unwrap(),
+        );
+        m
+    }
+
+    /// `V4Compressor::has_weights` correctly identifies the three valid
+    /// layouts: V4-native dual (wkv + wgate), pre-fused (wkv_gate), and
+    /// absent.
+    #[test]
+    fn v4_compressor_has_weights_detects_layouts() -> Result<()> {
+        let device = Device::Cpu;
+        let head_dim = 8;
+        let coff = 2; // ratio=4 → overlap=true
+
+        // Dual layout
+        let dual_map = make_compressor_dual_tensors(16, head_dim, 4, coff, 1, &device);
+        let dual_vb = vb_from_map(dual_map, DType::F32, &device);
+        assert!(
+            V4Compressor::has_weights(&dual_vb),
+            "dual (wkv + wgate) layout should be detected"
+        );
+
+        // Pre-fused layout
+        let mut fused_map: std::collections::HashMap<String, Tensor> =
+            std::collections::HashMap::new();
+        fused_map.insert(
+            "wkv_gate.weight".to_string(),
+            Tensor::zeros((2 * coff * head_dim, 16), DType::F32, &device)?,
+        );
+        let fused_vb = vb_from_map(fused_map, DType::F32, &device);
+        assert!(
+            V4Compressor::has_weights(&fused_vb),
+            "pre-fused (wkv_gate) layout should be detected"
+        );
+
+        // Missing both → false
+        let empty_vb = vb_from_map(std::collections::HashMap::new(), DType::F32, &device);
+        assert!(
+            !V4Compressor::has_weights(&empty_vb),
+            "empty checkpoint should not be detected as having compressor weights"
+        );
+
+        // Partial (only wkv, no wgate) → false (would silently produce a
+        // DummyLayer otherwise; this is the bug the auto-detect prevents).
+        let mut partial_map: std::collections::HashMap<String, Tensor> =
+            std::collections::HashMap::new();
+        partial_map.insert(
+            "wkv.weight".to_string(),
+            Tensor::zeros((coff * head_dim, 16), DType::F32, &device)?,
+        );
+        let partial_vb = vb_from_map(partial_map, DType::F32, &device);
+        assert!(
+            !V4Compressor::has_weights(&partial_vb),
+            "wkv.weight alone (without wgate.weight) should not be accepted"
+        );
+
+        Ok(())
+    }
+
+    /// HCA layer (ratio=128, coff=1): loading `wkv.weight` +
+    /// `wgate.weight` produces a compressor whose `forward_from_xs`
+    /// output has the right shape and is **not** zero — i.e. the loaded
+    /// weights actually drive the math. Audit §0 + §1 Pattern C.
+    #[test]
+    fn v4_compressor_loads_dual_tensors_hca() -> Result<()> {
+        let device = Device::Cpu;
+        let hidden_size = 16;
+        let head_dim = 8;
+        let ratio = 128;
+        let coff = 1; // ratio != 4 → overlap=false
+
+        let cfg = compressor_test_cfg(hidden_size);
+        let map = make_compressor_dual_tensors(hidden_size, head_dim, ratio, coff, 7, &device);
+        let vb = vb_from_map(map, DType::F32, &device);
+        let comp = V4Compressor::new(&cfg, vb, ratio, head_dim)?;
+
+        assert_eq!(comp.ratio, ratio);
+        assert_eq!(comp.head_dim, head_dim);
+        assert_eq!(comp.coff, coff);
+
+        // Run forward on a small input. seq_len = 256 = 2 × ratio.
+        let b = 1;
+        let t = 256;
+        let xs = Tensor::ones((b, t, hidden_size), DType::F32, &device)?;
+        let out = comp.forward_from_xs(&xs)?;
+
+        // Expected output shape: [B, T/ratio, head_dim].
+        assert_eq!(out.dims(), &[b, t / ratio, head_dim]);
+
+        // Non-trivial output: the loaded wkv + wgate weights are non-zero
+        // and ape is 0.05, so the post-sigmoid * val * (1 + ape) sum is
+        // strictly non-zero. Check via max absolute value.
+        let flat: Vec<f32> = out.flatten_all()?.to_vec1()?;
+        let max_abs = flat.iter().fold(0.0f32, |a, b| a.max(b.abs()));
+        assert!(
+            max_abs > 1e-6,
+            "real-weight forward_from_xs produced an all-zero output; \
+             weights were not applied. max_abs={max_abs}"
+        );
+
+        Ok(())
+    }
+
+    /// CSA layer (ratio=4, coff=2): loading dual tensors with coff=2 fuses
+    /// to a wkv_gate of shape `[2*2*head_dim, hidden_size]` and produces
+    /// the right output shape.
+    #[test]
+    fn v4_compressor_loads_dual_tensors_csa() -> Result<()> {
+        let device = Device::Cpu;
+        let hidden_size = 16;
+        let head_dim = 8;
+        let ratio = 4;
+        let coff = 2; // ratio == 4 → overlap=true
+
+        let cfg = compressor_test_cfg(hidden_size);
+        let map = make_compressor_dual_tensors(hidden_size, head_dim, ratio, coff, 3, &device);
+        let vb = vb_from_map(map, DType::F32, &device);
+        let comp = V4Compressor::new(&cfg, vb, ratio, head_dim)?;
+        assert_eq!(comp.coff, 2);
+
+        let b = 2;
+        let t = 16; // T_c = 4
+        let xs = Tensor::ones((b, t, hidden_size), DType::F32, &device)?;
+        let out = comp.forward_from_xs(&xs)?;
+        assert_eq!(out.dims(), &[b, t / ratio, head_dim]);
+        Ok(())
+    }
+
+    /// Loaded V4Compressor output differs from the uniform-fallback path.
+    /// This is the core RUN-162 assertion: real weights produce a real
+    /// (non-uniform-averaging) output. We compare `forward_from_xs` on a
+    /// real-weight compressor against the `forward` (averaging) path on a
+    /// uniform-fallback compressor — same input, two different code paths,
+    /// outputs must not match.
+    #[test]
+    fn v4_compressor_real_weights_differ_from_uniform_fallback() -> Result<()> {
+        let device = Device::Cpu;
+        let hidden_size = 16;
+        let head_dim = 8;
+        let ratio = 128;
+        let coff = 1;
+
+        // Real-weight compressor via dual tensors.
+        let cfg = compressor_test_cfg(hidden_size);
+        let map = make_compressor_dual_tensors(hidden_size, head_dim, ratio, coff, 11, &device);
+        let vb = vb_from_map(map, DType::F32, &device);
+        let real = V4Compressor::new(&cfg, vb, ratio, head_dim)?;
+
+        // Uniform-fallback compressor (the path that was previously used).
+        let uniform = V4Compressor::uniform(ratio, head_dim, &device)?;
+
+        // Run both compressors. The real path uses forward_from_xs on
+        // `[B, T, hidden]`. The uniform path uses the legacy 4-D forward
+        // on `[B, H, T, D]` (its forward_from_xs is unusable because its
+        // dummy wkv_gate has shape [_, 1]). The OUTPUT shapes match
+        // (`[B, T/ratio, head_dim]` for real vs `[B, H, T/ratio, head_dim]`
+        // collapsed), and the OUTPUT VALUES must differ to prove the
+        // fallback was replaced.
+        let b = 1;
+        let t = 256;
+        let xs = Tensor::ones((b, t, hidden_size), DType::F32, &device)?;
+        let real_out = real.forward_from_xs(&xs)?;
+        let real_vec: Vec<f32> = real_out.flatten_all()?.to_vec1()?;
+
+        // Uniform fallback's averaging path on all-ones input yields all
+        // ones; the dummy wkv_gate is never invoked here.
+        let kv_4d = Tensor::ones((b, 1, t, head_dim), DType::F32, &device)?;
+        let uniform_out = uniform.forward(&kv_4d)?;
+        let uniform_vec: Vec<f32> = uniform_out.flatten_all()?.to_vec1()?;
+
+        // Real output must NOT equal the uniform all-ones output. Allow a
+        // generous tolerance: if even one element differs by > 1e-3, the
+        // path is genuinely different.
+        assert_eq!(real_vec.len(), uniform_vec.len());
+        let diff_count = real_vec
+            .iter()
+            .zip(uniform_vec.iter())
+            .filter(|(r, u)| (*r - *u).abs() > 1e-3)
+            .count();
+        assert!(
+            diff_count > 0,
+            "real-weight compressor produced output identical to uniform fallback \
+             ({} elements). Loaded weights had no effect on the forward pass.",
+            real_vec.len()
+        );
+
+        Ok(())
+    }
+
+    /// Pre-fused `wkv_gate.weight` layout still loads (backwards-compat
+    /// with SGLang's cached-fusion path and Arc's own synthetic
+    /// `wkv_gate`-named fixtures).
+    #[test]
+    fn v4_compressor_loads_prefused_wkv_gate() -> Result<()> {
+        let device = Device::Cpu;
+        let hidden_size = 16;
+        let head_dim = 8;
+        let ratio = 128;
+        let coff = 1;
+
+        let cfg = compressor_test_cfg(hidden_size);
+        let mut map: std::collections::HashMap<String, Tensor> =
+            std::collections::HashMap::new();
+        // Non-zero fused weight: [2*coff*head_dim, hidden_size].
+        let mut v: Vec<f32> = Vec::with_capacity(2 * coff * head_dim * hidden_size);
+        for i in 0..(2 * coff * head_dim * hidden_size) {
+            v.push(((i as f32) * 0.017).sin() * 0.1);
+        }
+        map.insert(
+            "wkv_gate.weight".to_string(),
+            Tensor::from_vec(v, (2 * coff * head_dim, hidden_size), &device)?,
+        );
+        map.insert(
+            "norm.weight".to_string(),
+            Tensor::ones(head_dim, DType::F32, &device)?,
+        );
+        // No ape → zeros fallback inside V4Compressor::new.
+
+        let vb = vb_from_map(map, DType::F32, &device);
+        let comp = V4Compressor::new(&cfg, vb, ratio, head_dim)?;
+
+        let b = 1;
+        let t = 256;
+        let xs = Tensor::ones((b, t, hidden_size), DType::F32, &device)?;
+        let out = comp.forward_from_xs(&xs)?;
+        assert_eq!(out.dims(), &[b, t / ratio, head_dim]);
+        Ok(())
+    }
+
+    /// `V4Compressor::new` returns an Err (rather than silently producing
+    /// a DummyLayer) when neither layout is present in the checkpoint.
+    /// Callers must gate via `has_weights` and fall back to `uniform`.
+    #[test]
+    fn v4_compressor_new_errors_without_weights() {
+        let device = Device::Cpu;
+        let cfg = compressor_test_cfg(16);
+        let vb = vb_from_map(std::collections::HashMap::new(), DType::F32, &device);
+        let res = V4Compressor::new(&cfg, vb, 128, 8);
+        assert!(
+            res.is_err(),
+            "V4Compressor::new without wkv_gate/wkv+wgate should Err"
+        );
     }
 }
