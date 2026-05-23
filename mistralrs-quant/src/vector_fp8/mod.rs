@@ -230,7 +230,22 @@ impl QuantMethod for VectorFP8Linear {
                 crate::NVFP4Layer::quantize(&w, b, &device)
             }
             Some(IsqType::QtipBitshift2) => {
-                candle_core::bail!("QTIP ISQ from unquantized layer not yet supported; use a QTIP-quantized checkpoint instead.")
+                let _acquired_quantize_guard = guard.acquire(&device);
+                if imatrix_weight.is_some() {
+                    candle_core::bail!("QTIP does not support imatrix.");
+                }
+                n_quantized.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let bias = self
+                    .bias
+                    .as_ref()
+                    .map(|b| b.to_device(&device))
+                    .transpose()?;
+                crate::QtipLayer::quantize_with_mode(
+                    &weight.to_device(&device)?,
+                    bias,
+                    &device,
+                    crate::QtipMode::Viterbi,
+                )
             }
             None => {
                 let _acquired_quantize_guard = guard.acquire(&device);
