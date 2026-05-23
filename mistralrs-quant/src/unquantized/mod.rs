@@ -381,7 +381,7 @@ impl QuantMethod for UnquantLinear {
                     &self.w.to_device(&device)?,
                     bias,
                     &device,
-                    crate::QtipMode::Greedy,
+                    crate::QtipMode::Viterbi,
                 )
             }
             Some(IsqType::F8Q8) => {
