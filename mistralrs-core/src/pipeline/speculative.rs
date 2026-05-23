@@ -16,6 +16,7 @@ use crate::{
     get_mut_arcmutex,
     kv_cache::{CacheManager, HybridCacheManager, NormalCacheManager, RecurrentStateSnapshot},
     layers_masker::PastKvLenCache,
+    pipeline::mtp_pipeline::MtpSpeculativePipeline,
     pipeline::sampling::{
         finish_or_add_toks_to_seq, sample_sequence, sample_target_sequence_speculative,
     },
@@ -65,6 +66,20 @@ impl Loader for SpeculativeLoader {
             in_situ_quant,
             paged_attn_config,
         )?;
+
+        // MTP dispatch (RUN-156): if the target ships a native MTP head, use
+        // the single-model MTP speculative path instead of loading a separate
+        // draft model. This is the V4 path — saves draft-model memory + load
+        // time and matches the V4 paper's published recipe.
+        if let Some(pipe) = try_make_mtp_pipeline(target.clone(), self.config.gamma) {
+            tracing::info!(
+                target: "mtp_speculative",
+                "Speculative loader: target advertises MTP head; using MtpSpeculativePipeline (depth={})",
+                self.config.gamma
+            );
+            return Ok(Arc::new(tokio::sync::Mutex::new(pipe)));
+        }
+
         let draft = self.draft.load_model_from_hf(
             revision,
             token_source,
@@ -104,6 +119,17 @@ impl Loader for SpeculativeLoader {
             in_situ_quant,
             paged_attn_config,
         )?;
+
+        // MTP dispatch — same rationale as `load_model_from_hf` above.
+        if let Some(pipe) = try_make_mtp_pipeline(target.clone(), self.config.gamma) {
+            tracing::info!(
+                target: "mtp_speculative",
+                "Speculative loader: target advertises MTP head; using MtpSpeculativePipeline (depth={})",
+                self.config.gamma
+            );
+            return Ok(Arc::new(tokio::sync::Mutex::new(pipe)));
+        }
+
         let draft = self.draft.load_model_from_path(
             paths,
             dtype,
@@ -965,3 +991,22 @@ impl Pipeline for SpeculativePipeline {
 }
 
 impl AnyMoePipelineMixin for SpeculativePipeline {}
+
+/// Try to construct an [`MtpSpeculativePipeline`] from the given target.
+/// Returns `None` if:
+///   - `gamma == 0` (no speculative tokens requested), or
+///   - the target does not expose a [`super::mtp_pipeline::MtpDecodeKit`]
+///     (i.e., it is not a DeepSeek-V4 / non-MTP checkpoint).
+fn try_make_mtp_pipeline(
+    target: Arc<tokio::sync::Mutex<dyn Pipeline + Send + Sync>>,
+    gamma: usize,
+) -> Option<MtpSpeculativePipeline> {
+    if gamma == 0 {
+        return None;
+    }
+    // Re-cast `Arc<Mutex<dyn Pipeline + Send + Sync>>` to the looser
+    // `Arc<Mutex<dyn Pipeline>>` that `MtpSpeculativePipeline::try_new`
+    // expects. The bounds are compatible at the trait-object level.
+    let target_loose: Arc<tokio::sync::Mutex<dyn Pipeline>> = target;
+    MtpSpeculativePipeline::try_new(target_loose, gamma)
+}

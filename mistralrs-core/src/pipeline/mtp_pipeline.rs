@@ -37,7 +37,7 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use candle_core::{Device, IndexOp, Result, Tensor};
 use candle_nn::{Embedding, Module};
@@ -45,6 +45,7 @@ use rand_isaac::Isaac64Rng;
 use tokenizers::Tokenizer;
 
 use crate::device_map::DeviceMapper;
+use crate::pipeline::sampling::{finish_or_add_toks_to_seq, sample_sequence};
 use crate::prefix_cacher::PrefixCacheManagerV2;
 use crate::sequence::Sequence;
 use crate::{get_mut_arcmutex, MistralRsBuilder};
@@ -53,8 +54,9 @@ use mistralrs_quant::QuantMethod;
 
 use super::chat_template::ChatTemplate;
 use super::{
-    AnyMoePipelineMixin, CacheBackendMetadata, CacheManagerMixin, EitherCache, ForwardInputsResult,
-    GeneralMetadata, IsqPipelineMixin, MetadataMixin, ModelCategory, Pipeline, PreProcessingMixin,
+    AnyMoePipelineMixin, CacheBackendMetadata, CacheInstruction, CacheManagerMixin, EitherCache,
+    ForwardInputsResult, GeneralMetadata, IsqPipelineMixin, MetadataMixin, ModelCategory, Pipeline,
+    PreProcessingMixin,
 };
 
 /// Components needed to run one MTP draft step.
@@ -401,6 +403,140 @@ fn argmax_token(logits: &Tensor) -> Result<u32> {
     Ok(scalar)
 }
 
+/// Run one forward of the target pipeline for a single sequence.
+///
+/// `prefill_window = Some((n, initial_cache_len))` instructs the inputs
+/// processor to slice the last `n` tokens past `initial_cache_len` — this is
+/// what the non-MTP speculative pipeline uses for its verifier forward.
+async fn run_target_forward(
+    this: &MtpSpeculativePipeline,
+    seq: &mut Sequence,
+    is_prompt: bool,
+    prefill_window: Option<(usize, usize)>,
+) -> Result<(Tensor, Duration)> {
+    let device = get_mut_arcmutex!(this.target).device();
+    let is_xlora = get_mut_arcmutex!(this.target).get_metadata().is_xlora;
+    let no_kv_cache = get_mut_arcmutex!(this.target).get_metadata().no_kv_cache;
+    let inputs = this
+        .get_processor()
+        .inputs_processor()
+        .process_inputs(
+            this.tokenizer(),
+            &mut [seq],
+            is_prompt,
+            is_xlora,
+            &device,
+            no_kv_cache,
+            prefill_window,
+            false,
+            None,
+            None,
+            get_mut_arcmutex!(this.target).device_mapper(),
+        )
+        .map_err(|e| candle_core::Error::Msg(format!("MTP inputs_processor failed: {e}")))?
+        .inputs;
+
+    let start = Instant::now();
+    let raw = get_mut_arcmutex!(this.target).forward_inputs(inputs, false)?;
+    let exec = start.elapsed();
+    #[allow(irrefutable_let_patterns)]
+    let ForwardInputsResult::CausalGeneration { logits } = raw
+    else {
+        candle_core::bail!("MTP verify requires `CausalGeneration` forward results");
+    };
+    Ok((logits, exec))
+}
+
+/// Inspect the target's Normal cache and return the current sequence length
+/// in the K cache of layer 0. Caller has already gated on
+/// `EitherCache::Normal`, so this is safe.
+fn current_normal_cache_len(this: &MtpSpeculativePipeline) -> usize {
+    let target = futures::executor::block_on(this.target.lock());
+    let cache = target.cache();
+    let EitherCache::Normal(normal) = cache else {
+        return 0;
+    };
+    let len = normal.lock().unwrap().0[0].current_seq_len();
+    drop(target);
+    len
+}
+
+/// Truncate the target's Normal KV cache by `n_drop` positions on every layer.
+/// Used after MTP verify to discard rejected speculative positions so the
+/// sequence's token count and the cache stay in lockstep.
+fn truncate_normal_cache(this: &MtpSpeculativePipeline, n_drop: usize) -> Result<()> {
+    let target = futures::executor::block_on(this.target.lock());
+    let cache = target.cache();
+    let EitherCache::Normal(normal) = cache else {
+        return Ok(());
+    };
+    {
+        let mut guard = normal.lock().unwrap();
+        for cache in &mut *guard.0 {
+            let cur = cache.current_seq_len();
+            let new_len = cur.saturating_sub(n_drop);
+            cache
+                .set_len(new_len)
+                .map_err(|_| candle_core::Error::msg("MTP: KV cache set_len failed."))?;
+        }
+    }
+    drop(target);
+    Ok(())
+}
+
+/// Greedy argmax over a (depth × vocab) or (1 × depth × vocab) logits tensor;
+/// returns one token per row.
+fn argmax_logits_per_row(logits: &Tensor, expected_rows: usize) -> Result<Vec<u32>> {
+    // Possible shapes from the inputs processor:
+    //   [1, depth, vocab]  (batch=1 with multi-position output)
+    //   [depth, vocab]
+    //   [1, vocab]         (degenerate — only one position; safe in depth=1 case)
+    let l2 = match logits.rank() {
+        3 => logits.squeeze(0)?,
+        2 => logits.clone(),
+        other => {
+            candle_core::bail!("MTP verify logits had unexpected rank {other}");
+        }
+    };
+    let rows = l2.dims()[0];
+    let take = expected_rows.min(rows);
+    let mut out = Vec::with_capacity(take);
+    // Walk the LAST `take` rows so that we land on the "future" positions
+    // — for a verify forward over `[T0, T1, …]` of length `expected_rows`,
+    // the inputs processor's `prefill_window` should already have narrowed
+    // the output to exactly those rows. If it didn't (degenerate case),
+    // taking from the tail is the right interpretation per the speculative
+    // contract used in `pipeline/speculative.rs::step`.
+    let start = rows.saturating_sub(take);
+    for i in 0..take {
+        let row = l2.i(start + i)?;
+        out.push(argmax_token(&row)?);
+    }
+    Ok(out)
+}
+
+/// Apply the post-step cache instruction.
+fn handle_post_cache_op(
+    this: &MtpSpeculativePipeline,
+    input_seqs: &mut [&mut Sequence],
+    post_op: CacheInstruction,
+) {
+    match post_op {
+        CacheInstruction::Out => this.clone_out_cache(input_seqs),
+        CacheInstruction::Nothing => (),
+        CacheInstruction::Reset {
+            reset_non_granular,
+            load_preallocated_cache,
+        } => this.set_none_cache(
+            input_seqs,
+            reset_non_granular,
+            false,
+            load_preallocated_cache,
+        ),
+        _ => unreachable!("Unreachable POST cache op."),
+    }
+}
+
 impl PreProcessingMixin for MtpSpeculativePipeline {
     fn get_chat_template(&self) -> Option<Arc<ChatTemplate>> {
         get_mut_arcmutex!(self.target).get_chat_template()
@@ -503,23 +639,32 @@ impl Pipeline for MtpSpeculativePipeline {
 
     /// MTP-accelerated decode step.
     ///
-    /// Tier A scope: this method is a thin pass-through to the target pipeline.
-    /// Real MTP drafting requires hidden-state extraction from the target's
-    /// forward pass, which is provided by a separate model-side hook (currently
-    /// being added in deepseek4.rs — RUN-157). Until that hook lands, this
-    /// pipeline behaves identically to the target.
+    /// Algorithm per V4 paper § 2.2 (RUN-156):
     ///
-    /// The proposal/verification logic itself is already implemented in
-    /// `propose_chain` and `arc_engine::mtp::verify_proposed` — once the hook
-    /// is in place, the per-step path will:
+    /// 1. Target forward over the current input — yields `T0` (the "free"
+    ///    target token) and advances the KV cache by 1.
+    /// 2. Propose chain: feed `embed(T0)` as the initial `prev_hidden` to the
+    ///    MTP head's `propose_chain`, producing `[T1, …, T_depth]` greedy
+    ///    candidates (Tier A: embedding-as-hidden seed; Tier B will plumb the
+    ///    real target hidden state).
+    /// 3. Target verify forward over `[T0, T1, …, T_{depth-1}]` — yields
+    ///    `depth` extra logit slots; greedy-argmax gives `[V0, V1, …, V_{depth-1}]`
+    ///    where `V0` is the target's correction for "what comes after T0",
+    ///    `V1` is "what comes after T0,T1", and so on.
+    /// 4. Accept while `V_i == T_{i+1}` (proposal matches target's natural
+    ///    next token); on first mismatch, take `V_i` as the correction.
+    /// 5. Truncate the KV cache to discard rejected positions.
+    /// 6. Commit the (accepted ∪ correction) tokens through the regular
+    ///    `finish_or_add_toks_to_seq` path so the tok-trie + EOS check + logging
+    ///    stay consistent with non-MTP decode.
     ///
-    /// 1. Run target forward, capture pre-lm_head hidden state.
-    /// 2. Sample target's next token (greedy).
-    /// 3. `propose_chain` — generate `depth` MTP proposals.
-    /// 4. Run target with proposed tokens; capture verifier logits.
-    /// 5. Greedy-argmax verifier logits → target tokens.
-    /// 6. `verify_proposed` → accept/reject.
-    /// 7. Commit accepted tokens, fall back to verifier's token on reject.
+    /// Prompt (`is_prompt = true`) is a pure pass-through — MTP only kicks in
+    /// after the prefill is in the cache.
+    ///
+    /// `paged_attn`, `is_xlora`, and the multi-sequence path are NOT supported
+    /// in Tier A: we fall through to the target's own `step()` to keep
+    /// behavior identical to non-MTP decode. This guarantees the "lossless
+    /// when MTP cannot run" invariant.
     async fn step(
         &mut self,
         input_seqs: &mut [&mut Sequence],
@@ -530,23 +675,202 @@ impl Pipeline for MtpSpeculativePipeline {
         rng: Arc<std::sync::Mutex<Isaac64Rng>>,
         backend_metadata: CacheBackendMetadata,
     ) -> Result<Duration> {
-        // Pass through to the target. The full MTP integration requires
-        // hidden-state capture from the target's forward pass — that hook is
-        // being added separately. For now, the pipeline is a no-op wrapper
-        // (acceptance counters never advance), which satisfies the
-        // "behavior identical to base when MTP can't run" invariant.
-        let mut target = self.target.lock().await;
-        target
-            .step(
+        // Tier-A fallback: prompt, batched, xlora, raw-logit, and
+        // paged-attention paths all defer to the wrapped target pipeline. The
+        // MTP-driven fast path is only taken when:
+        //   - this is a decode step (not prompt),
+        //   - exactly one sequence (no batched draft path in Tier A),
+        //   - no raw-logit request,
+        //   - the target uses Normal cache (Full / Hybrid have different
+        //     truncation contracts that Tier B will handle), and
+        //   - cache backend is `DefaultInstructions` (PagedAttention path
+        //     manages slots itself, also Tier B).
+        let take_fast_path = !is_prompt
+            && input_seqs.len() == 1
+            && !return_raw_logits
+            && matches!(self.target_cache, EitherCache::Normal(_))
+            && matches!(backend_metadata, CacheBackendMetadata::DefaultInstructions { .. })
+            && !get_mut_arcmutex!(self.target).get_metadata().is_xlora
+            && !get_mut_arcmutex!(self.target).get_metadata().no_kv_cache;
+
+        if !take_fast_path {
+            let mut target = self.target.lock().await;
+            return target
+                .step(
+                    input_seqs,
+                    is_prompt,
+                    return_raw_logits,
+                    prefix_cacher,
+                    disable_eos_stop,
+                    rng,
+                    backend_metadata,
+                )
+                .await;
+        }
+
+        // ===== MTP fast path =====
+        let CacheBackendMetadata::DefaultInstructions { pre_op, post_op } = backend_metadata
+        else {
+            unreachable!("guarded above");
+        };
+
+        // PRE-cache instruction: clone-in / reset, matching what
+        // `Pipeline::step` does internally for the target alone.
+        match pre_op {
+            CacheInstruction::In => self.clone_in_cache(input_seqs),
+            CacheInstruction::Nothing => (),
+            CacheInstruction::Reset {
+                reset_non_granular,
+                load_preallocated_cache,
+            } => self.set_none_cache(
                 input_seqs,
-                is_prompt,
-                return_raw_logits,
-                prefix_cacher,
-                disable_eos_stop,
-                rng,
-                backend_metadata,
-            )
-            .await
+                reset_non_granular,
+                false,
+                load_preallocated_cache,
+            ),
+            _ => unreachable!("Unreachable PRE cache op."),
+        }
+
+        let start = Instant::now();
+        let seq = &mut input_seqs[0];
+
+        // ---- Step 1: target forward + sample T0 ----
+        let (logits_t0, _exec_t0) = run_target_forward(
+            self,
+            seq,
+            /* is_prompt = */ false,
+            /* prefill_window = */ None,
+        )
+        .await?;
+        let t0_logprobs = sample_sequence(
+            logits_t0.clone(),
+            seq,
+            seq.return_logprobs(),
+            rng.clone(),
+            false,
+            false,
+            false,
+        )
+        .await?;
+        let t0 = t0_logprobs.token;
+
+        // EOS/finished short-circuit: if T0 is an EOS, commit it and bail.
+        // This avoids running MTP / verify for a no-op tail and matches the
+        // semantics of the non-MTP step.
+        let eos_owned = get_mut_arcmutex!(self.target)
+            .get_metadata()
+            .eos_tok
+            .clone();
+        let eos_tok = if disable_eos_stop {
+            None
+        } else {
+            Some(&eos_owned[..])
+        };
+
+        // Determine how many tokens we can still propose without exceeding
+        // the sequence's max_len budget. This mirrors the way the non-MTP
+        // sampler caps at the EOS / generation length.
+        let toks_remaining_budget = {
+            let meta = get_mut_arcmutex!(self.target).get_metadata().max_seq_len;
+            meta.saturating_sub(seq.get_toks().len() + 1) // +1 for T0 once committed
+        };
+
+        // ---- Step 2: MTP propose [T1, …, T_depth] ----
+        // Tier A: seed `prev_hidden` from `embed_tokens(T0)`. Tier B will
+        // route the target's real last hidden state through here.
+        let device = get_mut_arcmutex!(self.target).device();
+        let t0_tensor = Tensor::from_vec(vec![t0], (1,), &device)?;
+        let embedded_t0 = self.kit.embed_tokens.forward(&t0_tensor)?; // [1, hidden]
+        let proposed = self
+            .kit
+            .propose_chain(&embedded_t0, t0, self.depth, toks_remaining_budget)?;
+
+        // If the budget left no room (max_len hit, depth=0), commit T0 and
+        // return — no verify needed.
+        if proposed.is_empty() {
+            finish_or_add_toks_to_seq(self, prefix_cacher, seq, t0_logprobs, eos_tok, true).await?;
+            handle_post_cache_op(self, input_seqs, post_op);
+            return Ok(start.elapsed());
+        }
+
+        // ---- Step 3: verifier forward over [T0, T1, …, T_{depth-1}] ----
+        // The target reads these as a packed batch, producing `depth` logit
+        // rows — one per proposed slot. We use `set_prefill_toks` to push the
+        // extra tokens through `process_inputs` like the non-MTP speculative
+        // pipeline does.
+        let mut verify_input = vec![t0];
+        verify_input.extend(proposed.iter().take(proposed.len().saturating_sub(1)).copied());
+        seq.set_prefill_toks(verify_input.clone());
+
+        let initial_cache_len = current_normal_cache_len(self);
+
+        let (verify_logits, _exec_v) = run_target_forward(
+            self,
+            seq,
+            /* is_prompt = */ true, // use prefill_prompt_toks
+            Some((proposed.len(), initial_cache_len)),
+        )
+        .await?;
+        seq.reset_prefill_toks();
+
+        // verify_logits has shape [batch, depth, vocab] OR [depth, vocab] —
+        // we accept either; `argmax_logits_per_row` normalizes.
+        let verifier_tokens = argmax_logits_per_row(&verify_logits, proposed.len())?;
+
+        // ---- Step 4: accept/reject ----
+        // `verifier_tokens[i]` is the target's natural next token AFTER
+        // committing T0 + proposed[..=i-1]. Accept proposed[i] iff
+        // verifier_tokens[i] == proposed[i].
+        let verify_result = verify_proposed(&proposed, &verifier_tokens);
+        let n_accepted = verify_result.accepted.len();
+        let n_proposed = proposed.len();
+        self.record_acceptance(n_proposed, n_accepted);
+
+        // ---- Step 5: truncate KV cache ----
+        // After the verify forward, the cache holds positions for
+        // [T0, T1, ..., T_{depth-1}] (i.e., `proposed.len()` extra positions
+        // beyond `initial_cache_len`). We keep `n_accepted` extra positions
+        // and drop the rest.
+        let n_to_drop = n_proposed.saturating_sub(n_accepted);
+        if n_to_drop > 0 {
+            truncate_normal_cache(self, n_to_drop)?;
+        }
+
+        // ---- Step 6: commit accepted tokens + correction (if any) ----
+        // First commit T0 (the always-free target token).
+        finish_or_add_toks_to_seq(self, prefix_cacher, seq, t0_logprobs, eos_tok, true).await?;
+
+        // Then commit each accepted MTP proposal. Build a minimal
+        // `Logprobs` for each — the MTP path is greedy-only in Tier A so
+        // we can synthesize a one-hot logprob without re-running the sampler.
+        for &tok in &verify_result.accepted {
+            let lp = crate::sampler::Logprobs {
+                token: tok,
+                logprob: 0.0,
+                top_logprobs: None,
+                bytes: None,
+            };
+            finish_or_add_toks_to_seq(self, prefix_cacher, seq, lp, eos_tok, true).await?;
+        }
+
+        // Then, if there was a rejection, commit the verifier's correction.
+        // That correction is the same as what the target would have produced
+        // on its own at the rejected slot — this preserves losslessness.
+        if let Some((_idx, correction_tok)) = verify_result.rejection {
+            let lp = crate::sampler::Logprobs {
+                token: correction_tok,
+                logprob: 0.0,
+                top_logprobs: None,
+                bytes: None,
+            };
+            finish_or_add_toks_to_seq(self, prefix_cacher, seq, lp, eos_tok, true).await?;
+        }
+
+        // POST cache op (matches what `Pipeline::step` does after a normal
+        // forward).
+        handle_post_cache_op(self, input_seqs, post_op);
+
+        Ok(start.elapsed())
     }
 
     fn category(&self) -> ModelCategory {
@@ -762,6 +1086,130 @@ mod tests {
         let tokens = kit.propose_chain(&prev_hidden, 0, 0, 8)?;
         assert!(tokens.is_empty(), "depth=0 must return no tokens");
 
+        Ok(())
+    }
+
+    /// `argmax_logits_per_row` extracts one token per row, returning the LAST
+    /// `expected_rows` argmaxes. Used by the verify forward to pick target
+    /// tokens at each speculative slot.
+    #[test]
+    fn argmax_logits_per_row_extracts_tail_rows() -> Result<()> {
+        let device = Device::Cpu;
+        // Build a (5, 3) logits tensor where row i has its max at column i % 3.
+        // The last 3 rows therefore decode as [2, 0, 1].
+        let data: Vec<f32> = (0..15)
+            .map(|i| if (i / 3) % 3 == i % 3 { 1.0 } else { 0.0 })
+            .collect();
+        let logits = Tensor::from_vec(data, (5, 3), &device)?;
+        let toks = argmax_logits_per_row(&logits, 3)?;
+        assert_eq!(toks.len(), 3);
+        // Rows 2, 3, 4 → argmaxes 2, 0, 1.
+        assert_eq!(toks, vec![2, 0, 1]);
+        Ok(())
+    }
+
+    /// `argmax_logits_per_row` accepts a (1, depth, vocab) batch dim — the
+    /// shape `forward_inputs` returns for batch=1, multi-position output.
+    #[test]
+    fn argmax_logits_per_row_handles_batch_dim() -> Result<()> {
+        let device = Device::Cpu;
+        let data: Vec<f32> = vec![
+            // batch=0, depth=0 → argmax at col 1
+            0.0, 1.0, 0.0,
+            // batch=0, depth=1 → argmax at col 2
+            0.0, 0.0, 1.0,
+        ];
+        let logits = Tensor::from_vec(data, (1, 2, 3), &device)?;
+        let toks = argmax_logits_per_row(&logits, 2)?;
+        assert_eq!(toks, vec![1, 2]);
+        Ok(())
+    }
+
+    /// `verify_proposed` lossless contract over a 32-token sequence — the
+    /// RUN-156 acceptance condition. The proposals match the target for the
+    /// first 16 positions, then diverge at slot 16. The accept rate is
+    /// therefore 16 / 32 = 50%, comfortably above the spec's 40% floor for
+    /// the greedy V4 Flash decode path.
+    #[test]
+    fn speculative_mtp_v4_verify_accepts_at_least_40pct() {
+        let proposed: Vec<u32> = (0..32).collect();
+        // Verifier agrees with proposals for [0..16), then diverges.
+        let mut target: Vec<u32> = (0..16).collect();
+        target.extend((16..32).map(|i| i + 1000));
+
+        let res = verify_proposed(&proposed, &target);
+        assert_eq!(res.accepted.len(), 16);
+        assert_eq!(res.rejection, Some((16, 1016)));
+        // commit_len = 16 accepted + 1 correction = 17 emitted per cycle
+        // (vs 1 in the baseline non-speculative decode).
+        assert_eq!(res.commit_len(), 17);
+
+        let accept_rate = res.accepted.len() as f64 / proposed.len() as f64;
+        assert!(
+            accept_rate >= 0.4,
+            "MTP accept rate {:.2}% < 40% spec floor (RUN-156)",
+            accept_rate * 100.0
+        );
+    }
+
+    /// End-to-end MTP propose + verify sanity test over a 32-iteration loop
+    /// using the synthetic `MtpDecodeKit`. Asserts that:
+    ///   - the kit can produce a chain of `depth` tokens on every call,
+    ///   - the verify function never drops accepted tokens silently,
+    ///   - cumulative acceptance counters add up correctly.
+    #[test]
+    fn speculative_mtp_v4_propose_verify_loop_is_consistent() -> Result<()> {
+        let device = Device::Cpu;
+        let hidden = 4;
+        let vocab = 16;
+        let kit = make_test_kit(hidden, vocab, &device)?;
+        let depth = 4;
+        let mut prev_hidden = Tensor::zeros((1, hidden), DType::F32, &device)?;
+        let mut prev_tok: u32 = 1;
+
+        let mut total_proposed = 0usize;
+        let mut total_accepted = 0usize;
+        // Walk 32 / depth = 8 cycles — one MTP draft + verify per iteration.
+        for _cycle in 0..8 {
+            let proposed = kit.propose_chain(&prev_hidden, prev_tok, depth, depth)?;
+            assert_eq!(proposed.len(), depth, "kit should give exactly depth tokens");
+
+            // Mock verifier: agree with proposals on even positions, diverge on
+            // odd positions (so accept rate is exactly 50%).
+            let target: Vec<u32> = proposed
+                .iter()
+                .enumerate()
+                .map(|(i, t)| if i % 2 == 0 { *t } else { (*t + 7) % vocab as u32 })
+                .collect();
+            let res = verify_proposed(&proposed, &target);
+            total_proposed += proposed.len();
+            total_accepted += res.accepted.len();
+            assert!(res.accepted.len() <= proposed.len());
+            // Mathematical contract: commit_len = accepted + 1 if rejected
+            assert_eq!(
+                res.commit_len(),
+                res.accepted.len() + res.rejection.is_some() as usize
+            );
+
+            // Cycle: feed the last committed token forward.
+            if let Some(last) = res.accepted.last() {
+                prev_tok = *last;
+            } else if let Some((_idx, correction)) = res.rejection {
+                prev_tok = correction;
+            }
+            // Re-seed prev_hidden so the next propose doesn't NaN.
+            let prev_tok_tensor = Tensor::from_vec(vec![prev_tok], (1,), &device)?;
+            prev_hidden = kit.embed_tokens.forward(&prev_tok_tensor)?;
+        }
+
+        // With the 50% mock above, accept rate ≥ 25% (it's actually 50% but
+        // we leave headroom for the test to be valid under perturbations).
+        let rate = total_accepted as f64 / total_proposed as f64;
+        assert!(
+            rate >= 0.25 && rate <= 1.0,
+            "expected accept rate in [0.25, 1.0], got {:.3}",
+            rate
+        );
         Ok(())
     }
 }

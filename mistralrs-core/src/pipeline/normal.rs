@@ -1341,6 +1341,12 @@ impl Pipeline for NormalPipeline {
     fn category(&self) -> ModelCategory {
         ModelCategory::Text
     }
+    /// Forward to the underlying NormalModel — only V4 currently returns a
+    /// real kit; all other models return `None` and the engine falls back to
+    /// non-MTP decoding.
+    fn mtp_decode_kit(&self) -> Option<super::mtp_pipeline::MtpDecodeKit> {
+        self.model.mtp_decode_kit()
+    }
     #[cfg(feature = "cuda")]
     fn cuda_graph_runner_mut(&mut self) -> Option<&mut arc_cuda_graph::CudaGraphRunner> {
         self.cuda_graph_runner.as_mut()

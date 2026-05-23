@@ -1617,6 +1617,17 @@ impl DeepSeekV4 {
         self.mtp_head.as_ref()
     }
 
+    /// Shared input embedding (used as the MTP `e_emb` source). Cheap to
+    /// clone — `Embedding` only owns one Tensor handle.
+    pub fn embed_tokens(&self) -> &Embedding {
+        &self.embed_tokens
+    }
+
+    /// Shared output projection (used as the MTP head's `lm_head`).
+    pub fn lm_head(&self) -> &Arc<dyn QuantMethod> {
+        &self.lm_head
+    }
+
     /// True if mHC global parameters were loaded.
     pub fn has_mhc(&self) -> bool {
         self.mhc_head.is_some()
@@ -2127,6 +2138,20 @@ impl NormalModel for DeepSeekV4 {
     }
     fn config(&self) -> &ModelConfigMetadata {
         &self.cfg
+    }
+    /// Expose the MTP decode kit when the checkpoint shipped MTP tensors.
+    /// Used by [`crate::pipeline::MtpSpeculativePipeline`] to drive V4's
+    /// native single-step speculative draft.
+    fn mtp_decode_kit(
+        &self,
+    ) -> Option<crate::pipeline::mtp_pipeline::MtpDecodeKit> {
+        let head = self.mtp_head.as_ref()?;
+        Some(crate::pipeline::mtp_pipeline::MtpDecodeKit {
+            embed_tokens: self.embed_tokens.clone(),
+            lm_head: self.lm_head.clone(),
+            h_proj: head.h_proj.clone(),
+            e_proj: head.e_proj.clone(),
+        })
     }
 }
 

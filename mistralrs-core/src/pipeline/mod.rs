@@ -14,7 +14,7 @@ mod macros;
 mod normal;
 mod paths;
 pub mod post_load_hooks;
-mod mtp_pipeline;
+pub(crate) mod mtp_pipeline;
 mod processing;
 mod response;
 mod sampling;
