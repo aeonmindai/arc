@@ -778,6 +778,6 @@ mod tests {
         // After one call, state should equal the manually-computed `state` value.
         assert_eq!(s, state, "RNG state advanced differently in simulator");
         // And the draw value matches what would be derived from the same state.
-        assert!(cpu_u >= 0.0 && cpu_u < 1.0);
+        assert!((0.0..1.0).contains(&cpu_u));
     }
 }
