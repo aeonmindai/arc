@@ -192,13 +192,11 @@ pub(crate) fn rotate_x_cuda(x: &Tensor, signs: &Tensor, block_size: usize) -> Re
         _ => candle_core::bail!("QTIP rotate-x CUDA: x must live on CUDA"),
     };
 
-    // We need a writable destination buffer. Strategy: contiguous-clone `x`
-    // (which produces a fresh CUDA buffer via device-to-device memcpy
-    // inside candle), then launch the in-place kernel against that
-    // buffer's raw pointer. The clone takes us off the original storage so
-    // we are free to mutate.
+    // We need a writable destination buffer. Strategy: contiguous-clone the
+    // tensor, then CudaSlice::clone (which is a device-to-device memcpy in
+    // cudarc 0.19) the storage so we own a fresh buffer. The rotation
+    // kernel runs in-place on that owned buffer.
     let x_contig = x.contiguous()?;
-    let num_elements = batch * feat;
     let out_shape = candle_core::Shape::from_dims(&[batch, feat]);
 
     let (signs_storage, signs_layout) = signs.storage_and_layout();
@@ -211,21 +209,17 @@ pub(crate) fn rotate_x_cuda(x: &Tensor, signs: &Tensor, block_size: usize) -> Re
 
     macro_rules! rotate_dtype {
         ($T:ty, $launch:expr) => {{
-            // Allocate a destination buffer and memcpy_dtod from the
-            // contiguous source. Then launch the in-place rotation
-            // kernel against the destination.
-            let src_storage = {
+            // `CudaSlice::clone()` in cudarc 0.19 performs a device-to-device
+            // copy (see `try_clone → clone_dtod` impl). So cloning here gives
+            // us a fresh GPU buffer with the same contents as `x`, ready to
+            // be mutated in place by the rotation kernel.
+            let dst: candle_core::cuda::cudarc::driver::CudaSlice<$T> = {
                 let (s, _l) = x_contig.storage_and_layout();
                 match &*s {
                     Storage::Cuda(c) => c.as_cuda_slice::<$T>()?.clone(),
                     _ => candle_core::bail!("QTIP rotate-x CUDA: source must be CUDA"),
                 }
             };
-            // `clone()` on a CudaSlice in cudarc is a shallow alias, not a
-            // memcpy. We need a fresh allocation so the rotation doesn't
-            // mutate the original tensor's storage in-place.
-            let mut dst = unsafe { dev.alloc::<$T>(num_elements) }?;
-            dev.memcpy_dtod(&src_storage, &mut dst)?;
             let (dst_ptr, dst_guard) = slice_ptr(&dst, 0);
             unsafe {
                 $launch(
