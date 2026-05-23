@@ -1,0 +1,18 @@
+{
+  "model": "deepseek-ai/DeepSeek-V4-Flash",
+  "compression_stack": "qtip2+td-moe",
+  "target_gb": 60.0,
+  "measured": {
+    "total_gb": 57.982509111985564,
+    "weight_gb": 53.13195288181305,
+    "workspace_gb": 4.250556230545044,
+    "kv_estimate_gb": 0.599999999627471
+  },
+  "pass": true,
+  "mode": "mock",
+  "gpu": null,
+  "notes": [
+    "mock mode — numbers come from known_model_params() + bytes-per-param table, not real GPU",
+    "for ground truth, run without --mock on a CUDA-enabled host"
+  ]
+}

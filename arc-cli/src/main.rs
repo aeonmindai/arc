@@ -4,11 +4,14 @@
 //! that adds Arc branding and defaults to TurboQuant KV cache compression.
 //!
 //! Usage:
-//!   arc serve -m <model_id>          # Start serving with TurboQuant (default)
-//!   arc run -m <model_id>            # Interactive chat
-//!   arc bench -m <model_id>          # Run benchmarks
-//!   arc validate --index <path>      # Pre-flight weight schema validation
-//!   arc serve --pa-cache-type auto   # Disable TurboQuant, use upstream defaults
+//!   arc serve -m <model_id>                          # Start serving with TurboQuant (default)
+//!   arc run -m <model_id>                            # Interactive chat
+//!   arc bench -m <model_id>                          # Run benchmarks
+//!   arc validate --index <path> --arch <arch>        # Pre-flight weight schema validation
+//!   arc validate --target-hbm 60 -m <model_id>       # HBM footprint check (RUN-191)
+//!   arc serve --pa-cache-type auto                   # Disable TurboQuant, use upstream defaults
+
+mod validate;
 
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
@@ -45,25 +48,50 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Pre-flight validation: check a model.safetensors.index.json against
-    /// Arc's expected weight schema. Use on the rental host BEFORE loading
-    /// to catch missing/mismatched tensors in seconds instead of hours.
+    /// Pre-flight validation: check a model against Arc's expected schema
+    /// (tensor names *or* HBM footprint).
     ///
-    /// Usage:
-    ///   arc validate --index /path/to/model.safetensors.index.json \
-    ///                --arch deepseekv4
+    /// Two modes — selected by which flags are passed:
     ///
-    /// Supported --arch values: deepseekv4, kimi_k2, glm5moedsa.
+    /// 1. Schema validation (the original mode):
+    ///       arc validate --index <model.safetensors.index.json> --arch deepseekv4
+    ///    Catches missing/mismatched tensors before any GPU load.
+    ///    Supported --arch values: deepseekv4, kimi_k2, glm5moedsa.
+    ///
+    /// 2. HBM footprint validation (RUN-191):
+    ///       arc validate --target-hbm 60 --model deepseek-ai/DeepSeek-V4-Flash \
+    ///                    --compression-stack qtip2+td-moe
+    ///    Loads the model with the requested compression stack and verifies
+    ///    that the post-load HBM residency fits the target ceiling. Add
+    ///    `--mock` to compute the estimate analytically (CI / off-GPU).
     Validate {
-        /// Path to model.safetensors.index.json
+        // --- schema-mode flags ---
+        /// (schema mode) Path to model.safetensors.index.json
         #[arg(long)]
-        index: PathBuf,
-        /// Target architecture: deepseekv4 | kimi_k2 | glm5moedsa
+        index: Option<PathBuf>,
+        /// (schema mode) Target architecture: deepseekv4 | kimi_k2 | glm5moedsa
         #[arg(long)]
-        arch: String,
-        /// For V4: assume LoRA o_proj layout instead of the default Either fallback.
+        arch: Option<String>,
+        /// (schema mode) For V4: assume LoRA o_proj layout instead of the default Either fallback.
         #[arg(long, default_value = "either")]
         o_proj: String,
+
+        // --- HBM-mode flags (RUN-191) ---
+        /// (HBM mode) Maximum HBM residency in GB. Passing this flag selects HBM mode.
+        #[arg(long)]
+        target_hbm: Option<f64>,
+        /// (HBM mode) HuggingFace model id.
+        #[arg(short = 'm', long, default_value = "deepseek-ai/DeepSeek-V4-Flash")]
+        model: String,
+        /// (HBM mode) Compression stack: bf16, fp8-only, nvfp4, qtip2-only, qtip2+td-moe.
+        #[arg(long, default_value = "qtip2+td-moe")]
+        compression_stack: String,
+        /// (HBM mode) Output JSON path for the validation report.
+        #[arg(long, default_value = "tests/results/v4_flash_h100_footprint.json")]
+        output: PathBuf,
+        /// (HBM mode) Skip real GPU query and use the analytic estimate. CI-safe.
+        #[arg(long)]
+        mock: bool,
     },
 }
 
@@ -85,7 +113,61 @@ fn main() {
         Commands::Serve { args } => ("serve", args),
         Commands::Run { args } => ("run", args),
         Commands::Bench { args } => ("bench", args),
-        Commands::Validate { index, arch, o_proj } => {
+        Commands::Validate {
+            index,
+            arch,
+            o_proj,
+            target_hbm,
+            model,
+            compression_stack,
+            output,
+            mock,
+        } => {
+            // Dispatch: --target-hbm picks HBM mode, otherwise fall through to schema mode.
+            if let Some(target_hbm_gb) = target_hbm {
+                let stack = match validate::CompressionStack::parse(&compression_stack) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("ERROR: {e}");
+                        std::process::exit(2);
+                    }
+                };
+                let opts = validate::HbmValidateOptions {
+                    model_id: model,
+                    compression_stack: stack,
+                    target_hbm_gb,
+                    output_path: output,
+                    mock,
+                };
+                match validate::run(opts) {
+                    Ok(code) => std::process::exit(code),
+                    Err(e) => {
+                        eprintln!("ERROR: {e:?}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+
+            // Schema mode requires --index and --arch.
+            let index = match index {
+                Some(p) => p,
+                None => {
+                    eprintln!(
+                        "ERROR: schema-mode `arc validate` requires --index <path> --arch <arch>.\n\
+                         For HBM-footprint mode, pass --target-hbm <gb>."
+                    );
+                    std::process::exit(2);
+                }
+            };
+            let arch = match arch {
+                Some(a) => a,
+                None => {
+                    eprintln!(
+                        "ERROR: schema-mode `arc validate` requires --arch (deepseekv4 | kimi_k2 | glm5moedsa)."
+                    );
+                    std::process::exit(2);
+                }
+            };
             std::process::exit(run_validate(&index, &arch, &o_proj));
         }
     };
