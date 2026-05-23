@@ -36,19 +36,39 @@ report — JSON, deterministic schema, exit codes you can branch on.
 
 When invoked without `--mock` on a CUDA host:
 
-1. Bind to CUDA device 0.
+1. Bind to CUDA device 0 (override with `ARC_VALIDATE_DEVICE_INDEX=N`).
 2. Snapshot free HBM via `cudaMemGetInfo`.
-3. *(Pending: hand off to `MistralRsForServerBuilder::build()` with the
-   requested compression stack — currently a placeholder while RUN-191's
-   loader integration ships in a follow-up commit.)*
-4. Snapshot free HBM again.
+3. Hand off to `MistralRsForServerBuilder::build()` with the user's model id
+   and the requested compression stack (see "ISQ mapping" below). The
+   builder is driven on a one-off Tokio current-thread runtime so the
+   command stays sync. PagedAttention is disabled and `max_seqs=1` so the
+   load grabs roughly *just* the model weights, not a 90 %-of-HBM KV
+   reservation.
+4. Snapshot free HBM again — while still holding a strong reference to the
+   loaded `Arc<MistralRs>`, otherwise the allocations would have already
+   been freed.
 5. Compute breakdown: `used = before − after`, split into weight / workspace
-   / KV by subtracting the workspace + KV estimates.
-6. Write the JSON report and return 0 (pass) or 1 (fail).
+   / KV by subtracting the workspace estimate (KV is treated as zero on the
+   gpu path because paged-attn is off).
+6. Drop the runtime + builder (releases HBM) and write the JSON report.
+   Return 0 (pass) or 1 (fail).
 
 Requires building with `--features cuda`. Without the `cuda` feature, the
 command refuses to run (returns exit 2 with a clear message); pass
 `--mock` instead.
+
+#### ISQ mapping
+
+| Compression stack | ISQ string passed to mistralrs | Loader behavior |
+|---|---|---|
+| `bf16` | (none) | model loads at native dtype (BF16) |
+| `fp8-only` | `"fp8"` | in-situ quantization to F8E4M3 |
+| `nvfp4` | (none) | model is expected to be pre-quantized at rest |
+| `qtip2-only` | (none) | model's `config.json` carries `quant_method: "qtip"` |
+| `qtip2+td-moe` | (none) | same as `qtip2-only` + TD-MoE expert path |
+
+The `none` cases trust the on-disk quantization. Only `fp8-only` actively
+asks the loader to convert weights at load time.
 
 ### `--mock` mode
 
@@ -126,19 +146,28 @@ If the JSON `pass` is `false`, the rental verification gate should fail
 loudly — don't proceed to long benchmark runs until the residency story is
 clean.
 
-## Status: hardware-pending
+## Status
 
-The off-GPU portion (CLI wiring, JSON contract, mock-mode estimator, unit
-tests) is shipped. The on-GPU portion has two remaining sub-tasks:
+The script itself is **complete** — both the off-GPU (mock) and on-GPU
+(real-loader) paths are wired:
 
-1. **Loader wiring**: today the real-GPU code path snapshots free HBM
-   before/after a no-op; we need to wire in `MistralRsForServerBuilder` so
-   the actual V4 model is loaded between the snapshots. The mistralrs
-   loader path already exists (used by `arc bench`); the integration is
-   ~30 lines of plumbing.
-2. **Calibration**: run the command on real hardware against an
+- Mock path: shipped + unit-tested in `arc-cli/src/validate.rs`.
+- Real-GPU path: shipped — calls `MistralRsForServerBuilder::build()`
+  between HBM snapshots; gated behind the `cuda` feature so the no-CUDA
+  build still works.
+
+What remains is **hardware verification**, not implementation:
+
+1. **Calibration**: run the command on real hardware against an
    actually-deployed V4 Flash + `qtip2+td-moe` build. The known-good
    numbers from that run become the new floor for the mock estimator.
 
-Both are unblocked by a 1–3 hour H100 rental; this script ships ahead of
-that so the CI gate is green-eligible day-one.
+This is a 1–3 hour H100 rental, performed as part of the benchmark step,
+not as part of the script's development.
+
+## Environment variables
+
+| Variable | Default | Effect |
+|---|---|---|
+| `ARC_VALIDATE_DEVICE_INDEX` | `0` | CUDA device index to bind to (real-GPU mode only). |
+| `HUGGING_FACE_HUB_TOKEN` | — | Standard HF token used by the cache loader; required for gated models. |
