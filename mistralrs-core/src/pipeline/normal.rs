@@ -1133,15 +1133,6 @@ impl Loader for NormalLoader {
             _capturable_device: Some(_graph_device),
             #[cfg(feature = "cuda")]
             dedicated_decode: _decode_weights.and_then(|w| {
-                // Escape hatch: ARC_DISABLE_DEDICATED_DECODE=1 skips the
-                // autonomous decode path entirely. Use when DedicatedDecodePath::new
-                // segfaults inside libcuda during compute_rope_tables /
-                // fuse_qkv on certain driver+model combos (RUN-137 finding,
-                // rental day 1).
-                if std::env::var("ARC_DISABLE_DEDICATED_DECODE").is_ok() {
-                    tracing::info!("ARC_DISABLE_DEDICATED_DECODE set — skipping dedicated decode path");
-                    return None;
-                }
                 match arc_cuda_graph::DedicatedDecodePath::new(w) {
                     Ok(d) => Some(d),
                     Err(e) => {
