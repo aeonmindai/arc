@@ -28,7 +28,7 @@ Forked from [mistral.rs](https://github.com/EricLBuehler/mistral.rs). Apache 2.0
 | Feature | What it does |
 |---|---|
 | **DeepSeek V4 native** | Fused `wkv` MQA, mHC 4-D residual threading, FP8 e4m3 + UE8M0 block scales, MTP head dispatch, Lightning Indexer + FlashMLASparse CUDA for CSA/HCA, learned `hc_attn_scale` blend |
-| **TurboQuant K4/V3 KV** | Aeonmind ICLR'26 — 3.5-bit average, paper-lossless. 4.6× KV bandwidth vs FP16. WHT rotation + Lloyd-Max codebooks. No calibration needed. |
+| **TurboQuant K4/V3 KV** | Zandieh et al. (Google Research, [arXiv:2504.19874](https://arxiv.org/abs/2504.19874), ICLR'26) — Arc Rust implementation with fused-kernel attention path. 3.5-bit average, paper-lossless. 4.6× KV bandwidth vs FP16. WHT rotation + Lloyd-Max codebooks. No calibration needed. |
 | **QTIP 2-bit weights** | Cornell ICLR'25 — Viterbi-decoded trellis with Hadamard incoherence rotation. Cos sim ≥0.97 on realistic Gaussian. 8× weight compression vs FP16. |
 | **TD-MoE Tucker + whitening** | "Lossless 20%" extra compression on MoE expert pool. Tucker decomposition with whitening transform wired into model load. |
 | **CSA/HCA + PagedAttention** | V4 compress dispatch routes through ALL three forward paths: plain SDPA, PagedAttention (batched serving), and MLA cache. |
@@ -190,7 +190,7 @@ Built on [mistral.rs](https://github.com/EricLBuehler/mistral.rs) by Eric Buehle
 
 Compression and inference techniques composed from published research:
 
-- **TurboQuant** — Aeonmind, ICLR'26 ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874))
+- **TurboQuant** — Zandieh et al., Google Research, ICLR'26 ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)). Arc provides the Rust implementation and fused-kernel attention integration.
 - **QTIP** — Cornell-RelaxML, ICLR'25
 - **TEAL** — ICLR'25 Spotlight
 - **SCMoE** — Shi et al., NeurIPS'24 ([arXiv:2405.14507](https://arxiv.org/abs/2405.14507))
