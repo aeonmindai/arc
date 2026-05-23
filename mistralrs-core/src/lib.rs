@@ -93,7 +93,7 @@ pub use tuning::{
 
 pub use amoe::{AnyMoeConfig, AnyMoeExpertType};
 pub use device_map::{
-    DeviceLayerMapMetadata, DeviceMapMetadata, DeviceMapSetting, LayerDeviceMapper,
+    DeviceLayerMapMetadata, DeviceMapMetadata, DeviceMapSetting, DeviceMapper, LayerDeviceMapper,
 };
 pub use gguf::{GGUFArchitecture, GGUF_MULTI_FILE_DELIMITER};
 pub use mistralrs_audio::AudioInput;
@@ -113,7 +113,7 @@ pub use pipeline::{
     DiffusionGenerationParams, DiffusionLoader, DiffusionLoaderBuilder, DiffusionLoaderType,
     EmbeddingLoader, EmbeddingLoaderBuilder, EmbeddingLoaderType, EmbeddingModelPaths,
     EmbeddingSpecificConfig, GGMLLoader, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoader,
-    GGUFLoaderBuilder, GGUFSpecificConfig, GemmaLoader, Idefics2Loader, IsqOrganization,
+    GGUFLoaderBuilder, GGUFSpecificConfig, GemmaLoader, Idefics2Loader, IsqModel, IsqOrganization,
     LLaVALoader, LLaVANextLoader, LlamaLoader, Loader, LocalModelPaths, LoraAdapterPaths,
     MistralLoader, MixtralLoader, Modalities, ModelKind, ModelPaths, MultimodalPromptPrefixer,
     NormalLoader, NormalLoaderBuilder, NormalLoaderType, NormalLoadingMetadata, NormalModel,

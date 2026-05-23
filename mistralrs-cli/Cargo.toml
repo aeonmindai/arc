@@ -22,6 +22,7 @@ doc = false
 mistralrs-core = { workspace = true }
 mistralrs-server-core = { workspace = true }
 mistralrs = { workspace = true }
+arc-engine = { path = "../arc-engine" }
 candle-core = { workspace = true }
 
 clap = { workspace = true }
@@ -53,12 +54,12 @@ walkdir = { workspace = true }
 
 [features]
 default = []
-cuda = ["mistralrs-core/cuda", "mistralrs-server-core/cuda"]
+cuda = ["mistralrs-core/cuda", "mistralrs-server-core/cuda", "arc-engine/cuda"]
 nccl = ["mistralrs-core/nccl", "mistralrs-server-core/nccl"]
-cudnn = ["mistralrs-core/cudnn", "mistralrs-server-core/cudnn"]
-flash-attn = ["cuda", "mistralrs-core/flash-attn", "mistralrs-server-core/flash-attn"]
-flash-attn-v3 = ["cuda", "mistralrs-core/flash-attn-v3", "mistralrs-server-core/flash-attn-v3"]
+cudnn = ["mistralrs-core/cudnn", "mistralrs-server-core/cudnn", "arc-engine/cudnn"]
+flash-attn = ["cuda", "mistralrs-core/flash-attn", "mistralrs-server-core/flash-attn", "arc-engine/flash-attn"]
+flash-attn-v3 = ["cuda", "mistralrs-core/flash-attn-v3", "mistralrs-server-core/flash-attn-v3", "arc-engine/flash-attn-v3"]
 accelerate = ["mistralrs-core/accelerate", "mistralrs-server-core/accelerate"]
-metal = ["mistralrs-core/metal", "mistralrs-server-core/metal"]
+metal = ["mistralrs-core/metal", "mistralrs-server-core/metal", "arc-engine/metal"]
 mkl = ["mistralrs-core/mkl", "mistralrs-server-core/mkl"]
 ring = ["mistralrs-core/ring", "mistralrs-server-core/ring"]

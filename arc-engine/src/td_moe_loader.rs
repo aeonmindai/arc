@@ -49,6 +49,7 @@
 
 use std::sync::Arc;
 
+#[cfg_attr(not(test), allow(unused_imports))]
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::Linear;
 use mistralrs_core::IsqModel;
@@ -76,9 +77,7 @@ pub fn register_td_moe_hook() {
         return;
     };
     let calibration = parse_env_calibration().unwrap_or(256);
-    info!(
-        "Arc: registering TD-MoE post-load hook (rank={rank}, calibration={calibration})"
-    );
+    info!("Arc: registering TD-MoE post-load hook (rank={rank}, calibration={calibration})");
     mistralrs_core::register_post_load_hook(Box::new(move |model: &mut dyn IsqModel| {
         apply_td_moe_to_model(model, rank, calibration)
             .map_err(|e| anyhow::anyhow!("TD-MoE compression failed: {e}"))
@@ -93,9 +92,7 @@ fn parse_env_rank() -> Option<usize> {
     }
     let parsed: usize = raw.parse().ok()?;
     if parsed < 4 {
-        warn!(
-            "{ARC_TD_MOE_RANK_ENV}={raw}: rank must be >= 4 to activate TD-MoE; ignoring"
-        );
+        warn!("{ARC_TD_MOE_RANK_ENV}={raw}: rank must be >= 4 to activate TD-MoE; ignoring");
         return None;
     }
     Some(parsed)
@@ -128,9 +125,7 @@ pub fn apply_td_moe_to_model(
 
     let (layers, _mapper) = model.get_layers_moe_experts_only();
     let total_layers = layers.len();
-    info!(
-        "Arc TD-MoE: scanning {total_layers} candidate ISQ layers (target rank={rank})"
-    );
+    info!("Arc TD-MoE: scanning {total_layers} candidate ISQ layers (target rank={rank})");
 
     let mut compressed_layers = 0usize;
     let mut skipped_layers = 0usize;
@@ -178,18 +173,15 @@ pub fn apply_td_moe_to_model(
 
         let (original_device, original_dtype) = (weight.device().clone(), weight.dtype());
 
-        let wt = match tucker_decompose_with_whitening(
-            &weight, [r1, r2, r3], &cov_out, &cov_in, 1e-3,
-        ) {
-            Ok(w) => w,
-            Err(e) => {
-                warn!(
-                    "Arc TD-MoE: decomposition failed for [{k},{d_out},{d_in}] layer: {e}"
-                );
-                skipped_layers += 1;
-                continue;
-            }
-        };
+        let wt =
+            match tucker_decompose_with_whitening(&weight, [r1, r2, r3], &cov_out, &cov_in, 1e-3) {
+                Ok(w) => w,
+                Err(e) => {
+                    warn!("Arc TD-MoE: decomposition failed for [{k},{d_out},{d_in}] layer: {e}");
+                    skipped_layers += 1;
+                    continue;
+                }
+            };
 
         // Compression accounting (factored storage vs dense original).
         let orig_elems = (k * d_out * d_in) as u64;
@@ -202,9 +194,7 @@ pub fn apply_td_moe_to_model(
         let recon = match whitened_tucker_reconstruct(&wt) {
             Ok(r) => r,
             Err(e) => {
-                warn!(
-                    "Arc TD-MoE: reconstruct failed for [{k},{d_out},{d_in}] layer: {e}"
-                );
+                warn!("Arc TD-MoE: reconstruct failed for [{k},{d_out},{d_in}] layer: {e}");
                 skipped_layers += 1;
                 continue;
             }
@@ -231,7 +221,9 @@ pub fn apply_td_moe_to_model(
         }
 
         // Cast back to the device + dtype of the original weight.
-        let recon = recon.to_device(&original_device)?.to_dtype(original_dtype)?;
+        let recon = recon
+            .to_device(&original_device)?
+            .to_dtype(original_dtype)?;
 
         // Build a fresh UnquantLinear and swap it into the layer slot.
         let new_layer = <UnquantLinear as QuantMethod>::new(QuantMethodConfig::Unquantized(
@@ -297,11 +289,7 @@ mod tests {
     struct DummyMapper;
 
     impl DeviceMapper for DummyMapper {
-        fn map(
-            &self,
-            input: Tensor,
-            _layer: usize,
-        ) -> Result<Tensor> {
+        fn map(&self, input: Tensor, _layer: usize) -> Result<Tensor> {
             Ok(input)
         }
         fn set_nm_device<'a>(
@@ -325,11 +313,7 @@ mod tests {
         fn get_unique_devices(&self) -> Vec<Device> {
             vec![Device::Cpu]
         }
-        fn cast_nm_device(
-            &self,
-            x: &Tensor,
-            _loading_isq: bool,
-        ) -> Result<Tensor> {
+        fn cast_nm_device(&self, x: &Tensor, _loading_isq: bool) -> Result<Tensor> {
             Ok(x.clone())
         }
         fn get_min_dtype(&self, _: &dyn mistralrs_core::TryIntoDType) -> Result<DType> {
@@ -337,6 +321,15 @@ mod tests {
         }
         fn num_device_mapping_layers(&self) -> usize {
             1
+        }
+        fn get_comm_for(&self, _layer_idx: usize) -> Result<Arc<mistralrs_quant::Comm>> {
+            let id = mistralrs_quant::Id::new();
+            Ok(Arc::new(mistralrs_quant::Comm::from_device(
+                id,
+                &Device::Cpu,
+                0,
+                1,
+            )?))
         }
     }
 
@@ -372,8 +365,8 @@ mod tests {
 
     fn build_fake_model(weight: Tensor) -> FakeMoeModel {
         let linear = Linear::new(weight, None);
-        let layer = <UnquantLinear as QuantMethod>::new(QuantMethodConfig::Unquantized(linear))
-            .unwrap();
+        let layer =
+            <UnquantLinear as QuantMethod>::new(QuantMethodConfig::Unquantized(linear)).unwrap();
         FakeMoeModel {
             layer: Arc::new(layer) as Arc<dyn QuantMethod>,
             mapper: DummyMapper,
@@ -433,6 +426,50 @@ mod tests {
         let weight = random_expert_stack(2, 4, 4);
         let mut model = build_fake_model(weight);
         assert!(apply_td_moe_to_model(&mut model, 2, 8).is_err());
+    }
+
+    /// Whitened Tucker pipeline on a moderate BF16 expert stack at full rank
+    /// produces a reconstruction with cosine similarity ≥ 0.98 versus the
+    /// original — exercises the BF16 cast path through the loader hook.
+    ///
+    /// Matches the RUN-168 quality bar (large 3D expert tensor, BF16, cos sim
+    /// ≥ 0.98) using a moderate size that fits in unit-test budget. The
+    /// underlying decomposition is O(d^3), so [16, 64, 64] is the practical
+    /// upper bound for fast CI; the algorithm is dimension-agnostic.
+    #[test]
+    fn td_moe_bf16_pipeline_cos_sim_high() {
+        let k = 16;
+        let d_out = 64;
+        let d_in = 64;
+        let weight = random_expert_stack(k, d_out, d_in);
+        // Cast through BF16 to mimic the real V4 path (FP8/BF16 expert weights).
+        let weight_bf16 = weight.to_dtype(DType::BF16).unwrap();
+        let orig: Vec<f32> = weight_bf16
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        let mut model = build_fake_model(weight_bf16);
+        // Full-rank decomposition: cos sim should approach 1.0 minus BF16
+        // round-trip error. We require ≥ 0.98 as the task spec.
+        apply_td_moe_to_model(&mut model, d_out, 32).expect("apply succeeded");
+
+        let new_weight = model.layer.dequantize_w().unwrap();
+        let new_v: Vec<f32> = new_weight
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let cos = cosine(&orig, &new_v);
+        assert!(
+            cos >= 0.98,
+            "expected cos sim ≥ 0.98 after BF16 TD-MoE roundtrip, got {cos}"
+        );
     }
 
     fn cosine(a: &[f32], b: &[f32]) -> f32 {

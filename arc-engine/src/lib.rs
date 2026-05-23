@@ -26,6 +26,7 @@ pub mod mtp;
 pub mod sage;
 pub mod sarathi;
 pub mod td_moe;
+pub mod td_moe_loader;
 pub mod turbo_sparse;
 pub mod weight_schema;
 pub mod yoco;

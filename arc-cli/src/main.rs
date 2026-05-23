@@ -172,11 +172,18 @@ fn main() {
         }
     };
 
+    // Extract Arc-specific flags from `args` before forwarding to mistralrs.
+    // The subprocess reads these via env vars (ARC_TD_MOE_RANK, etc.) since
+    // mistralrs-cli doesn't natively know about them.
+    let (mut extracted_env, forwarded_args) = extract_arc_flags(args);
+
     // Build the command for the mistralrs binary
-    let status = std::process::Command::new("mistralrs")
-        .arg(subcmd)
-        .args(&args)
-        .status();
+    let mut command = std::process::Command::new("mistralrs");
+    command.arg(subcmd).args(&forwarded_args);
+    for (k, v) in extracted_env.drain() {
+        command.env(k, v);
+    }
+    let status = command.status();
 
     match status {
         Ok(s) => std::process::exit(s.code().unwrap_or(1)),
@@ -186,6 +193,58 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+/// Strip Arc-only flags (`--td-moe-rank N`, `--td-moe-calibration N`) from `args`
+/// and translate them into environment variables that the spawned `mistralrs`
+/// subprocess will pick up via `arc_engine::td_moe_loader::register_td_moe_hook`.
+///
+/// Returns `(env_vars_to_set, remaining_args_to_forward)`.
+fn extract_arc_flags(args: Vec<String>) -> (HashMap<String, String>, Vec<String>) {
+    let mut env_vars: HashMap<String, String> = HashMap::new();
+    let mut out: Vec<String> = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.as_str() {
+            "--td-moe-rank" => {
+                if let Some(val) = args.get(i + 1) {
+                    env_vars.insert("ARC_TD_MOE_RANK".into(), val.clone());
+                    i += 2;
+                    continue;
+                } else {
+                    eprintln!("ERROR: --td-moe-rank requires a value");
+                    std::process::exit(2);
+                }
+            }
+            "--td-moe-calibration" => {
+                if let Some(val) = args.get(i + 1) {
+                    env_vars.insert("ARC_TD_MOE_CALIBRATION".into(), val.clone());
+                    i += 2;
+                    continue;
+                } else {
+                    eprintln!("ERROR: --td-moe-calibration requires a value");
+                    std::process::exit(2);
+                }
+            }
+            _ => {
+                // Also support --flag=value form for the same Arc flags.
+                if let Some(rest) = arg.strip_prefix("--td-moe-rank=") {
+                    env_vars.insert("ARC_TD_MOE_RANK".into(), rest.to_string());
+                    i += 1;
+                    continue;
+                }
+                if let Some(rest) = arg.strip_prefix("--td-moe-calibration=") {
+                    env_vars.insert("ARC_TD_MOE_CALIBRATION".into(), rest.to_string());
+                    i += 1;
+                    continue;
+                }
+                out.push(arg.clone());
+                i += 1;
+            }
+        }
+    }
+    (env_vars, out)
 }
 
 /// Read a safetensors index, validate against the target architecture's schema,
@@ -224,7 +283,11 @@ fn run_validate(index_path: &PathBuf, arch: &str, o_proj_layout: &str) -> i32 {
 
     let keys: Vec<&str> = weight_map.keys().map(String::as_str).collect();
 
-    eprintln!("Arc preflight: validating {} tensors against `{}` schema", keys.len(), arch);
+    eprintln!(
+        "Arc preflight: validating {} tensors against `{}` schema",
+        keys.len(),
+        arch
+    );
     eprintln!();
 
     let validation = match arch {
@@ -239,7 +302,9 @@ fn run_validate(index_path: &PathBuf, arch: &str, o_proj_layout: &str) -> i32 {
         "kimi_k2" | "k2" => validate_kimi_k2_weights(keys.iter().copied()),
         "glm5moedsa" | "glm5" => validate_glm5_dsa_weights(keys.iter().copied()),
         other => {
-            eprintln!("ERROR: unknown --arch `{other}`. Supported: deepseekv4, kimi_k2, glm5moedsa");
+            eprintln!(
+                "ERROR: unknown --arch `{other}`. Supported: deepseekv4, kimi_k2, glm5moedsa"
+            );
             return 1;
         }
     };

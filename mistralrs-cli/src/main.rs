@@ -30,6 +30,12 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    // Arc: register the TD-MoE post-load hook. This is a no-op unless the
+    // ARC_TD_MOE_RANK env var is set (which arc-cli sets when the user
+    // passes --td-moe-rank N). When active, the hook compresses MoE expert
+    // weights via whitened Tucker decomposition after model load.
+    arc_engine::td_moe_loader::register_td_moe_hook();
+
     let cli = Cli::parse();
 
     match cli.command {

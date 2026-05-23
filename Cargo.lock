@@ -212,6 +212,7 @@ dependencies = [
 name = "arc-engine"
 version = "0.7.1-alpha.1"
 dependencies = [
+ "anyhow",
  "arc-turbo",
  "candle-core",
  "candle-nn",
@@ -3506,6 +3507,7 @@ name = "mistralrs-cli"
 version = "0.7.1-alpha.1"
 dependencies = [
  "anyhow",
+ "arc-engine",
  "axum",
  "candle-core",
  "chrono",
