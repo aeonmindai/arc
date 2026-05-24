@@ -189,20 +189,27 @@ impl QuantMethod for MXFP4Layer {
         imatrix_weight: Option<Vec<f32>>,
         guard: QuantizeOntoGuard,
     ) -> Result<Arc<dyn QuantMethod>> {
-        // 3D (per-expert) MXFP4 weights aren't supported as a single 2D matrix
-        // for the downstream ISQ targets below — bail clearly rather than
-        // silently producing a wrong-shape Linear.
-        if self.blocks.dims().len() != 2 {
+        // Dequantize FP4 -> BF16 once; all ISQ targets re-quantize from this.
+        // MXFP4 already supports 3-D `[E, N, K]` dequantize for per-expert
+        // packed weights; we mirror the NVFP4 branch and allow QTIP to
+        // consume the 3-D output, while bailing for other ISQ targets that
+        // would silently produce a wrong-shape Linear.
+        let weight = self.dequantize_weights()?;
+        let weight_is_3d = weight.dims().len() == 3;
+        if weight_is_3d
+            && !matches!(
+                dtype,
+                Some(IsqType::QtipBitshift2) | Some(IsqType::MXFP4) | None
+            )
+        {
             candle_core::bail!(
-                "MXFP4Layer::apply_isq only supports per-linear (2D) weights; \
-                 got blocks shape {:?}. Re-quantizing grouped (per-expert) MXFP4 \
-                 weights is not supported.",
-                self.blocks.dims()
+                "MXFP4Layer::apply_isq: re-quantizing a 3-D stacked-expert weight \
+                 (shape {:?}) is only supported for QTIP, MXFP4 (no-op), or \
+                 unquantized passthrough. Got {:?}.",
+                weight.dims(),
+                dtype
             );
         }
-
-        // Dequantize FP4 -> BF16 once; all ISQ targets re-quantize from this.
-        let weight = self.dequantize_weights()?;
         match dtype {
             Some(IsqType::HQQ4 | IsqType::HQQ8) => {
                 let _acquired_quantize_guard = guard.acquire(&device);
@@ -345,11 +352,24 @@ impl QuantMethod for MXFP4Layer {
                     candle_core::bail!("QTIP does not support imatrix.");
                 }
                 n_quantized.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let bias = self
-                    .bias
-                    .as_ref()
-                    .map(|b| b.to_device(&device))
-                    .transpose()?;
+                // 3-D stacked-expert MXFP4 → QTIP: V4 Flash MoE experts are
+                // bias-free, and the 3-D QTIP quantize path bails on a
+                // present bias. Match that contract here so the error point
+                // is the call site rather than the inner pipeline.
+                let bias = if weight_is_3d {
+                    if self.bias.is_some() {
+                        candle_core::bail!(
+                            "MXFP4 -> QTIP for a 3-D stacked-expert weight: bias \
+                             not supported"
+                        );
+                    }
+                    None
+                } else {
+                    self.bias
+                        .as_ref()
+                        .map(|b| b.to_device(&device))
+                        .transpose()?
+                };
                 crate::QtipLayer::quantize_with_mode(
                     &weight.to_device(&device)?,
                     bias,

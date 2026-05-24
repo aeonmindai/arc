@@ -285,7 +285,9 @@ mod tests {
             let g_recon = decode_symbols(&g_syms, &lut);
 
             let cos = |a: &[f32], b: &[f32]| -> f32 {
-                let mut d = 0f32; let mut na = 0f32; let mut nb = 0f32;
+                let mut d = 0f32;
+                let mut na = 0f32;
+                let mut nb = 0f32;
                 for (x, y) in a.iter().zip(b.iter()) {
                     d += x * y;
                     na += x * x;
@@ -300,8 +302,12 @@ mod tests {
                 "  {row} | {g_cos:.4}    | {v_cos:.4}     | {:+.4}  (max_abs={max_abs:.3}, scale={scale:.3})",
                 v_cos - g_cos
             );
-            if v_cos < g_cos - 0.001 { g_wins += 1; }
-            if v_cos > g_cos + 0.001 { v_wins += 1; }
+            if v_cos < g_cos - 0.001 {
+                g_wins += 1;
+            }
+            if v_cos > g_cos + 0.001 {
+                v_wins += 1;
+            }
         }
         println!("\nViterbi wins: {v_wins}, Greedy wins: {g_wins}");
     }
@@ -335,8 +341,11 @@ mod tests {
         }
 
         // Also matmul-style cos sim of recon vs target.
-        let mut vd = 0f32; let mut vn = 0f32; let mut tn = 0f32;
-        let mut gd = 0f32; let mut gn = 0f32;
+        let mut vd = 0f32;
+        let mut vn = 0f32;
+        let mut tn = 0f32;
+        let mut gd = 0f32;
+        let mut gn = 0f32;
         for ((t, v), g) in target.iter().zip(v_recon.iter()).zip(g_recon.iter()) {
             vd += t * v;
             vn += v * v;
@@ -371,7 +380,9 @@ mod tests {
         let v_err = mse(&target, &v_recon);
         let g_err = mse(&target, &g_recon);
 
-        println!("Production-magnitude row (32 syms): Viterbi MSE={v_err:.6}, Greedy MSE={g_err:.6}");
+        println!(
+            "Production-magnitude row (32 syms): Viterbi MSE={v_err:.6}, Greedy MSE={g_err:.6}"
+        );
         assert!(
             v_err <= g_err + 1e-4,
             "Viterbi MSE {v_err} > Greedy MSE {g_err} at production magnitude"
@@ -426,7 +437,10 @@ mod tests {
 
             // Production recon should be finite.
             for v in &production_recon {
-                assert!(v.is_finite(), "non-finite element in production decoder output");
+                assert!(
+                    v.is_finite(),
+                    "non-finite element in production decoder output"
+                );
             }
 
             // The error of production recon vs target should be ≤ greedy's error
@@ -456,7 +470,10 @@ mod tests {
         // Each reconstructed value should be smaller in magnitude than the LUT's max
         // (i.e., Viterbi picked Gaussian-near-zero entries, not the extremes).
         let max_recon = recon.iter().fold(0f32, |m, &v| m.max(v.abs()));
-        assert!(max_recon < 3.0, "Recon max {max_recon} too large for zero input");
+        assert!(
+            max_recon < 3.0,
+            "Recon max {max_recon} too large for zero input"
+        );
     }
 
     // --- helpers ---

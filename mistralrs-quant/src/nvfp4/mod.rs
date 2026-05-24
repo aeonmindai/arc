@@ -304,16 +304,24 @@ impl NVFP4Layer {
         Ok(val)
     }
 
-    /// CPU dequant: reconstruct the full [N, K] FP32 weight matrix from blocks+scales.
+    /// CPU dequant: reconstruct the full FP32 weight matrix from blocks+scales.
+    ///
+    /// Returns:
+    /// - `[N, K]` BF16 for 2-D blocks `[N, K/2]`.
+    /// - `[E, N, K]` BF16 for 3-D blocks `[E, N, K/2]` (V4 Flash MoE expert
+    ///   stacks). The expert dim is broadcast across the per-expert dequant
+    ///   loop so the per-tensor scale and FP8 block scales apply identically
+    ///   to every expert.
     pub fn dequantize_weights(&self) -> Result<Tensor> {
         let blocks_dims = self.blocks.dims();
-        if blocks_dims.len() != 2 {
-            candle_core::bail!(
-                "NVFP4 dequantize_weights expects [N, K/2] blocks, got {:?}",
+        let (num_experts, n, k_half) = match blocks_dims.len() {
+            2 => (1usize, blocks_dims[0], blocks_dims[1]),
+            3 => (blocks_dims[0], blocks_dims[1], blocks_dims[2]),
+            _ => candle_core::bail!(
+                "NVFP4 dequantize_weights expects [N, K/2] or [E, N, K/2] blocks, got {:?}",
                 blocks_dims
-            );
-        }
-        let (n, k_half) = (blocks_dims[0], blocks_dims[1]);
+            ),
+        };
         let k = k_half * 2;
         let num_blocks_per_row = k / NVFP4_BLOCK_SIZE;
 
@@ -323,31 +331,42 @@ impl NVFP4Layer {
         let scales_data: Vec<u8> = scales_cpu.flatten_all()?.to_vec1()?;
         let tensor_scale = self.tensor_scale_value()?;
 
-        let mut weights = vec![0f32; n * k];
+        let mut weights = vec![0f32; num_experts * n * k];
         let half_block = NVFP4_BLOCK_SIZE / 2;
 
-        for row in 0..n {
-            let blocks_row = row * k_half;
-            let scales_row = row * num_blocks_per_row;
-            let weights_row = row * k;
+        for expert in 0..num_experts {
+            let blocks_expert_base = expert * n * k_half;
+            let scales_expert_base = expert * n * num_blocks_per_row;
+            let weights_expert_base = expert * n * k;
 
-            for blk in 0..num_blocks_per_row {
-                let scale_byte = scales_data[scales_row + blk];
-                let block_scale = FP8_E4M3_LUT[scale_byte as usize] * tensor_scale;
-                let blk_bytes_start = blocks_row + blk * half_block;
-                let out_start = weights_row + blk * NVFP4_BLOCK_SIZE;
+            for row in 0..n {
+                let blocks_row = blocks_expert_base + row * k_half;
+                let scales_row = scales_expert_base + row * num_blocks_per_row;
+                let weights_row = weights_expert_base + row * k;
 
-                for byte_i in 0..half_block {
-                    let packed = blocks_data[blk_bytes_start + byte_i];
-                    let lo = dequant_fp4(packed & 0x0F);
-                    let hi = dequant_fp4((packed >> 4) & 0x0F);
-                    weights[out_start + byte_i * 2] = lo * block_scale;
-                    weights[out_start + byte_i * 2 + 1] = hi * block_scale;
+                for blk in 0..num_blocks_per_row {
+                    let scale_byte = scales_data[scales_row + blk];
+                    let block_scale = FP8_E4M3_LUT[scale_byte as usize] * tensor_scale;
+                    let blk_bytes_start = blocks_row + blk * half_block;
+                    let out_start = weights_row + blk * NVFP4_BLOCK_SIZE;
+
+                    for byte_i in 0..half_block {
+                        let packed = blocks_data[blk_bytes_start + byte_i];
+                        let lo = dequant_fp4(packed & 0x0F);
+                        let hi = dequant_fp4((packed >> 4) & 0x0F);
+                        weights[out_start + byte_i * 2] = lo * block_scale;
+                        weights[out_start + byte_i * 2 + 1] = hi * block_scale;
+                    }
                 }
             }
         }
 
-        Tensor::from_vec(weights, (n, k), &Device::Cpu)?
+        let shape: Vec<usize> = if blocks_dims.len() == 3 {
+            vec![num_experts, n, k]
+        } else {
+            vec![n, k]
+        };
+        Tensor::from_vec(weights, shape.as_slice(), &Device::Cpu)?
             .to_device(self.blocks.device())?
             .to_dtype(DType::BF16)
     }
@@ -492,7 +511,28 @@ impl QuantMethod for NVFP4Layer {
         guard: QuantizeOntoGuard,
     ) -> Result<Arc<dyn QuantMethod>> {
         // Dequantize FP4 -> BF16 once; all ISQ targets re-quantize from this.
+        // The result is 2-D `[N, K]` for a standard linear weight, or 3-D
+        // `[E, N, K]` for a V4 Flash-style MoE expert stack. Only ISQ targets
+        // that know about 3-D (currently: QTIP via `quantize_with_options_3d`,
+        // and the trivial NVFP4 pass-through) accept the 3-D shape; the rest
+        // bail with a clear error so callers know to stick with QTIP or load
+        // the stack as per-expert 2-D weights instead.
         let weight = self.dequantize_weights()?;
+        let weight_is_3d = weight.dims().len() == 3;
+        if weight_is_3d
+            && !matches!(
+                dtype,
+                Some(IsqType::QtipBitshift2) | Some(IsqType::NVFP4) | None
+            )
+        {
+            candle_core::bail!(
+                "NVFP4Layer::apply_isq: re-quantizing a 3-D stacked-expert weight \
+                 (shape {:?}) is only supported for QTIP, NVFP4 (no-op), or \
+                 unquantized passthrough. Got {:?}.",
+                weight.dims(),
+                dtype
+            );
+        }
         match dtype {
             Some(IsqType::HQQ4 | IsqType::HQQ8) => {
                 let _acquired_quantize_guard = guard.acquire(&device);
@@ -635,11 +675,26 @@ impl QuantMethod for NVFP4Layer {
                     candle_core::bail!("QTIP does not support imatrix.");
                 }
                 n_quantized.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let bias = self
-                    .bias
-                    .as_ref()
-                    .map(|b| b.to_device(&device))
-                    .transpose()?;
+                // 3-D stacked-expert NVFP4 layers don't carry bias for V4
+                // Flash MoE experts; the 3-D QTIP quantize path also bails
+                // if a bias is passed. The branch below preserves the 2-D
+                // bias for normal linears and drops it explicitly for the
+                // 3-D dispatch.
+                let bias = if weight_is_3d {
+                    if self.bias.is_some() {
+                        candle_core::bail!(
+                            "NVFP4 -> QTIP for a 3-D stacked-expert weight: bias \
+                             not supported (V4 Flash MoE experts are bias-free; \
+                             a present bias here would be silently dropped)"
+                        );
+                    }
+                    None
+                } else {
+                    self.bias
+                        .as_ref()
+                        .map(|b| b.to_device(&device))
+                        .transpose()?
+                };
                 crate::QtipLayer::quantize_with_mode(
                     &weight.to_device(&device)?,
                     bias,
@@ -665,6 +720,117 @@ impl QuantMethod for NVFP4Layer {
 }
 
 impl NVFP4Layer {
+    /// Test-only constructor: build a 3-D stacked NVFP4 layer from a 3-D
+    /// `[E, N, K]` weight by quantizing each expert's `[N, K]` slice via
+    /// `NVFP4Layer::quantize` and stacking the resulting blocks/scales. Used
+    /// by the NVFP4 -> QTIP 3-D round-trip test to simulate what a stacked
+    /// checkpoint loader would produce.
+    ///
+    /// Available `pub(crate)` because the QTIP tests live in
+    /// `crate::qtip::tests` and need to construct a 3-D NVFP4 fixture
+    /// without poking at private fields.
+    #[cfg(test)]
+    pub(crate) fn quantize_3d_for_test(weight: &Tensor, device: &Device) -> Result<Self> {
+        let dims = weight.dims3()?;
+        let (e, _n, _k) = (dims.0, dims.1, dims.2);
+        let mut blocks_e: Vec<Tensor> = Vec::with_capacity(e);
+        let mut scales_e: Vec<Tensor> = Vec::with_capacity(e);
+        let mut shared_tensor_scale: Option<Tensor> = None;
+        for expert_idx in 0..e {
+            let w_e = weight.narrow(0, expert_idx, 1)?.squeeze(0)?.contiguous()?;
+            let (blk, scl, ts) = Self::quantize_2d_typed(&w_e, device)?;
+            blocks_e.push(blk);
+            scales_e.push(scl);
+            if expert_idx == 0 {
+                shared_tensor_scale = Some(ts);
+            }
+        }
+        Ok(Self {
+            blocks: Tensor::stack(&blocks_e, 0)?,
+            scales: Tensor::stack(&scales_e, 0)?,
+            tensor_scale: shared_tensor_scale.unwrap(),
+            bias: None,
+        })
+    }
+
+    /// Typed 2-D quantize: returns `(blocks, scales, tensor_scale)` directly.
+    /// Mirrors the body of `NVFP4Layer::quantize` but returns the storage
+    /// tensors instead of wrapping in `Arc<dyn QuantMethod>`. Test-only
+    /// because production callers always want the wrapped trait object.
+    #[cfg(test)]
+    fn quantize_2d_typed(weight: &Tensor, device: &Device) -> Result<(Tensor, Tensor, Tensor)> {
+        let weight_f32 = weight.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
+        let dims = weight_f32.dims2()?;
+        let (n, k) = (dims.0, dims.1);
+        if k % NVFP4_BLOCK_SIZE != 0 {
+            candle_core::bail!(
+                "NVFP4 quantization requires K ({k}) divisible by block size ({NVFP4_BLOCK_SIZE})"
+            );
+        }
+        let weight_data: Vec<f32> = weight_f32.flatten_all()?.to_vec1()?;
+        let global_max = weight_data.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let tensor_scale_f32 = if global_max == 0.0 {
+            1.0
+        } else {
+            (global_max / (6.0 * 448.0 * 0.95)).max(1.0e-12)
+        };
+        let num_blocks_per_row = k / NVFP4_BLOCK_SIZE;
+        let k_half = k / 2;
+
+        use rayon::prelude::*;
+        let row_results: Vec<(Vec<u8>, Vec<u8>)> = (0..n)
+            .into_par_iter()
+            .map(|row| {
+                let row_offset = row * k;
+                let mut row_packed = vec![0u8; k_half];
+                let mut row_scales = vec![0u8; num_blocks_per_row];
+                for (blk, scale_byte) in row_scales.iter_mut().enumerate() {
+                    let blk_start = row_offset + blk * NVFP4_BLOCK_SIZE;
+                    let block = &weight_data[blk_start..blk_start + NVFP4_BLOCK_SIZE];
+                    let max_abs = block.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+                    let target_block_scale = if max_abs == 0.0 {
+                        0.0
+                    } else {
+                        max_abs / (6.0 * tensor_scale_f32)
+                    };
+                    *scale_byte = quantize_fp8_e4m3(target_block_scale);
+                    let actual_block_scale = FP8_E4M3_LUT[*scale_byte as usize];
+                    let inv = if actual_block_scale > 0.0 {
+                        1.0 / (actual_block_scale * tensor_scale_f32)
+                    } else {
+                        0.0
+                    };
+                    for (elem, &val) in block.iter().enumerate() {
+                        let nibble = quantize_to_fp4(val * inv);
+                        let k_idx = blk * NVFP4_BLOCK_SIZE + elem;
+                        let byte_idx = k_idx / 2;
+                        if k_idx.is_multiple_of(2) {
+                            row_packed[byte_idx] |= nibble;
+                        } else {
+                            row_packed[byte_idx] |= nibble << 4;
+                        }
+                    }
+                }
+                (row_packed, row_scales)
+            })
+            .collect();
+
+        let mut packed = Vec::with_capacity(n * k_half);
+        let mut scales = Vec::with_capacity(n * num_blocks_per_row);
+        for (row_packed, row_scales) in row_results {
+            packed.extend_from_slice(&row_packed);
+            scales.extend_from_slice(&row_scales);
+        }
+        let blocks = Tensor::from_vec(packed, (n, k_half), &Device::Cpu)?
+            .to_dtype(DType::U8)?
+            .to_device(device)?;
+        let scales = Tensor::from_vec(scales, (n, num_blocks_per_row), &Device::Cpu)?
+            .to_dtype(DType::U8)?
+            .to_device(device)?;
+        let tensor_scale = Tensor::new(tensor_scale_f32, device)?;
+        Ok((blocks, scales, tensor_scale))
+    }
+
     pub fn linear_b(
         in_dim: usize,
         out_dim: usize,
@@ -884,7 +1050,10 @@ mod tests {
 
         let layer = NVFP4Layer::quantize(&weight, None, &device)?;
         let dequant = layer.dequantize_w()?;
-        let dequant_f32 = dequant.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let dequant_f32 = dequant
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
 
         // Check that reconstruction is within reasonable bounds.
         // FP4 has 8 magnitudes per sign × per-block FP8 scale = ~5-7% per-element error

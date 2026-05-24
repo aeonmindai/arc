@@ -12,8 +12,8 @@ use crate::{
     should_apply_immediate_isq,
     utils::isq::{apply_immediate_isq, apply_immediate_isq_always},
     AfqLayer, BnbLinear, DistributedKind, DummyLayer, F8Q8Linear, FP8Linear, GgufMatMul, HqqLayer,
-    MXFP4Layer, NVFP4Layer, QtipLayer, QuantMethod, QuantMethodConfig, QuantizeOntoGuard, QuantizedConfig,
-    QuantizedSerde, QuantizedSerdeType, Shard, ShardedVarBuilder, UnquantLinear,
+    MXFP4Layer, NVFP4Layer, QtipLayer, QuantMethod, QuantMethodConfig, QuantizeOntoGuard,
+    QuantizedConfig, QuantizedSerde, QuantizedSerdeType, Shard, ShardedVarBuilder, UnquantLinear,
 };
 
 use super::{Comm, SumAllReduce};

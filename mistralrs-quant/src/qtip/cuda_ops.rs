@@ -86,12 +86,18 @@ pub(crate) fn dequantize_rotated_cuda(
         _ => candle_core::bail!("QTIP dequantize CUDA: lut must be CUDA storage"),
     };
 
-    let (blocks_ptr, _blocks_guard) =
-        slice_ptr(blocks_storage.as_cuda_slice::<u8>()?, blocks_layout.start_offset());
-    let (scales_ptr, _scales_guard) =
-        slice_ptr(scales_storage.as_cuda_slice::<f32>()?, scales_layout.start_offset());
-    let (lut_ptr, _lut_guard) =
-        slice_ptr(lut_storage.as_cuda_slice::<f32>()?, lut_layout.start_offset());
+    let (blocks_ptr, _blocks_guard) = slice_ptr(
+        blocks_storage.as_cuda_slice::<u8>()?,
+        blocks_layout.start_offset(),
+    );
+    let (scales_ptr, _scales_guard) = slice_ptr(
+        scales_storage.as_cuda_slice::<f32>()?,
+        scales_layout.start_offset(),
+    );
+    let (lut_ptr, _lut_guard) = slice_ptr(
+        lut_storage.as_cuda_slice::<f32>()?,
+        lut_layout.start_offset(),
+    );
 
     let num_weights = n_rows * in_features;
     let out_shape = candle_core::Shape::from_dims(&[n_rows, in_features]);
@@ -204,8 +210,10 @@ pub(crate) fn rotate_x_cuda(x: &Tensor, signs: &Tensor, block_size: usize) -> Re
         Storage::Cuda(s) => s,
         _ => candle_core::bail!("QTIP rotate-x CUDA: signs must be CUDA storage"),
     };
-    let (signs_ptr, _signs_guard) =
-        slice_ptr(signs_storage.as_cuda_slice::<f32>()?, signs_layout.start_offset());
+    let (signs_ptr, _signs_guard) = slice_ptr(
+        signs_storage.as_cuda_slice::<f32>()?,
+        signs_layout.start_offset(),
+    );
 
     macro_rules! rotate_dtype {
         ($T:ty, $launch:expr) => {{
@@ -282,9 +290,7 @@ pub(crate) fn rotate_weight_rows_cuda(
         candle_core::bail!("QTIP rotate-weight CUDA: kernels not compiled in");
     }
     if !matches!(block_size, 2 | 4 | 8 | 16 | 32 | 64 | 128) {
-        candle_core::bail!(
-            "QTIP rotate-weight CUDA: unsupported block size {block_size}"
-        );
+        candle_core::bail!("QTIP rotate-weight CUDA: unsupported block size {block_size}");
     }
     let (n_rows, k_in) = weight.dims2()?;
     if k_in % block_size != 0 {
@@ -330,8 +336,10 @@ pub(crate) fn rotate_weight_rows_cuda(
         Storage::Cuda(s) => s,
         _ => candle_core::bail!("QTIP rotate-weight CUDA: signs must be CUDA storage"),
     };
-    let (signs_ptr, _signs_guard) =
-        slice_ptr(signs_storage.as_cuda_slice::<f32>()?, signs_layout.start_offset());
+    let (signs_ptr, _signs_guard) = slice_ptr(
+        signs_storage.as_cuda_slice::<f32>()?,
+        signs_layout.start_offset(),
+    );
     let (dst_ptr, dst_guard) = slice_ptr(&dst, 0);
     unsafe {
         ffi::launch_qtip_rotate_weight_rows_f32(
@@ -376,8 +384,7 @@ fn compute_row_scales_cuda(weight: &Tensor) -> Result<Tensor> {
         Storage::Cuda(s) => s,
         _ => candle_core::bail!("QTIP row-scale CUDA: weight must be CUDA storage"),
     };
-    let (w_ptr, _w_guard) =
-        slice_ptr(w_storage.as_cuda_slice::<f32>()?, w_layout.start_offset());
+    let (w_ptr, _w_guard) = slice_ptr(w_storage.as_cuda_slice::<f32>()?, w_layout.start_offset());
 
     let scales_buf = dev.alloc_zeros::<f32>(n_rows)?;
     let (scales_ptr, scales_guard) = slice_ptr(&scales_buf, 0);
@@ -476,42 +483,40 @@ pub(crate) fn quantize_rows_cuda(
         };
         let (w_ptr, _w_guard) =
             slice_ptr(w_storage.as_cuda_slice::<f32>()?, w_layout.start_offset());
-        let (lut_ptr, _lut_guard) =
-            slice_ptr(lut_storage.as_cuda_slice::<f32>()?, lut_layout.start_offset());
+        let (lut_ptr, _lut_guard) = slice_ptr(
+            lut_storage.as_cuda_slice::<f32>()?,
+            lut_layout.start_offset(),
+        );
         let (rs_ptr, _rs_guard) =
             slice_ptr(rs_storage.as_cuda_slice::<f32>()?, rs_layout.start_offset());
         let (pkd_ptr, pkd_guard) = slice_ptr(&packed_buf, 0);
 
         match mode {
-            QtipMode::Greedy => {
-                unsafe {
-                    ffi::launch_qtip_quantize_rows_greedy_f32(
-                        w_ptr as *const _,
-                        lut_ptr as *const _,
-                        rs_ptr as *const _,
-                        pkd_ptr as *mut _,
-                        n_rows as i32,
-                        k_in as i32,
-                        num_symbols as i32,
-                        dev.cuda_stream().cu_stream(),
-                    );
-                }
-            }
+            QtipMode::Greedy => unsafe {
+                ffi::launch_qtip_quantize_rows_greedy_f32(
+                    w_ptr as *const _,
+                    lut_ptr as *const _,
+                    rs_ptr as *const _,
+                    pkd_ptr as *mut _,
+                    n_rows as i32,
+                    k_in as i32,
+                    num_symbols as i32,
+                    dev.cuda_stream().cu_stream(),
+                );
+            },
             QtipMode::Viterbi => {
                 // Allocate per-batch scratch. Backtrace dominates:
                 //   bt_bytes_per_row = num_symbols * 2^L
                 // Cap rows_in_flight so total <= VITERBI_MAX_SCRATCH_BYTES.
                 let bt_bytes_per_row = num_symbols * QTIP_LUT_SIZE;
-                let mut rows_in_flight =
-                    (VITERBI_MAX_SCRATCH_BYTES / bt_bytes_per_row).max(1);
+                let mut rows_in_flight = (VITERBI_MAX_SCRATCH_BYTES / bt_bytes_per_row).max(1);
                 if rows_in_flight > n_rows {
                     rows_in_flight = n_rows;
                 }
 
                 let cost_a = dev.alloc_zeros::<f32>(rows_in_flight * QTIP_LUT_SIZE)?;
                 let cost_b = dev.alloc_zeros::<f32>(rows_in_flight * QTIP_LUT_SIZE)?;
-                let backtrace =
-                    dev.alloc_zeros::<u8>(rows_in_flight * bt_bytes_per_row)?;
+                let backtrace = dev.alloc_zeros::<u8>(rows_in_flight * bt_bytes_per_row)?;
 
                 let (ca_ptr, ca_guard) = slice_ptr(&cost_a, 0);
                 let (cb_ptr, cb_guard) = slice_ptr(&cost_b, 0);
