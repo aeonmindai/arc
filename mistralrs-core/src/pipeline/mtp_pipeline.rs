@@ -889,6 +889,60 @@ impl MistralRsBuilder {
     pub fn __mtp_speculative_pipeline_marker() {}
 }
 
+/// Try to wrap a target pipeline with an MTP speculative pipeline driven by the
+/// model's own MTP head.
+///
+/// This is the public entry point used by the CLI / server builder. It is a
+/// pure no-op when `mtp_depth == 0`: the original `target` is returned
+/// unwrapped. When `mtp_depth > 0`:
+///
+/// - If the target advertises an [`MtpDecodeKit`] via [`Pipeline::mtp_decode_kit`],
+///   the target is wrapped in an [`MtpSpeculativePipeline`] and an `Arc<Mutex<dyn Pipeline>>`
+///   pointing at the wrapper is returned.
+/// - If the target does NOT advertise an MTP head, an `info!` warning is logged
+///   and the original `target` is returned unwrapped (lossless fallback).
+///
+/// The wrapper itself preserves greedy-decode equivalence with the bare target:
+/// MTP accept/reject is lossless by construction, so cos-sim against the
+/// non-MTP path is identical for the same prompt + same sampling seed.
+///
+/// # Arguments
+///
+/// - `target`: the loaded target pipeline (`Arc<Mutex<dyn Pipeline + Send + Sync>>`).
+/// - `mtp_depth`: number of MTP draft tokens per target forward (0 = disabled).
+///   Typical values: 2-4 for V4 Flash.
+pub fn try_wrap_pipeline_with_mtp(
+    target: Arc<tokio::sync::Mutex<dyn Pipeline + Send + Sync>>,
+    mtp_depth: usize,
+) -> Arc<tokio::sync::Mutex<dyn Pipeline + Send + Sync>> {
+    if mtp_depth == 0 {
+        return target;
+    }
+    // Loosen the trait bound to match `MtpSpeculativePipeline::try_new`'s
+    // expected `Arc<Mutex<dyn Pipeline>>` (Send + Sync are auto-traits so the
+    // coercion is sound).
+    let target_loose: Arc<tokio::sync::Mutex<dyn Pipeline>> = target.clone();
+    match MtpSpeculativePipeline::try_new(target_loose, mtp_depth) {
+        Some(wrapper) => {
+            tracing::info!(
+                target: "mtp_speculative",
+                "MTP speculative decode engaged (depth={}); target advertised an MTP head",
+                mtp_depth
+            );
+            Arc::new(tokio::sync::Mutex::new(wrapper))
+        }
+        None => {
+            tracing::warn!(
+                target: "mtp_speculative",
+                "MTP requested (depth={}) but the loaded model has no MTP head; \
+                 falling back to non-speculative decode",
+                mtp_depth
+            );
+            target
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1209,6 +1263,230 @@ mod tests {
             rate >= 0.25 && rate <= 1.0,
             "expected accept rate in [0.25, 1.0], got {:.3}",
             rate
+        );
+        Ok(())
+    }
+
+    // =====================================================================
+    // try_wrap_pipeline_with_mtp wiring tests (RUN-RFC #6).
+    //
+    // These tests cover the *CLI-facing helper* that wraps a freshly loaded
+    // pipeline in `MtpSpeculativePipeline` iff:
+    //   1. `mtp_depth > 0`, AND
+    //   2. the target advertises an `MtpDecodeKit` via `mtp_decode_kit()`.
+    //
+    // The stub pipeline below implements the minimum trait surface required
+    // for `MtpSpeculativePipeline::try_new` to either succeed or bail out
+    // cleanly — only `mtp_decode_kit`, `cache`, `get_metadata`, and
+    // `category` are reachable from `try_new`. The other Pipeline methods
+    // panic on call: they are not exercised by the wiring helper itself
+    // (the engine never runs `step()` in a unit-test context).
+    // =====================================================================
+
+    use crate::device_map::DeviceMapper;
+    use crate::pipeline::chat_template::ChatTemplate;
+    use crate::pipeline::loaders::ModelKind;
+    use crate::pipeline::{
+        AnyMoePipelineMixin, CacheBackendMetadata, CacheManagerMixin, ForwardInputsResult,
+        GeneralMetadata, IsqPipelineMixin, MetadataMixin, ModelCategory, Modalities, Pipeline,
+        PreProcessingMixin, Processor,
+    };
+    use crate::prefix_cacher::PrefixCacheManagerV2;
+    use crate::sequence::Sequence;
+    use candle_core::Device as CandleDevice;
+    use std::time::Duration;
+    use tokenizers::Tokenizer;
+
+    /// Minimal stub pipeline for testing `try_wrap_pipeline_with_mtp`.
+    ///
+    /// Only the methods that the wrapping helper reads are real; everything
+    /// else is `unreachable!()`. We rely on the fact that `try_new` only
+    /// touches `mtp_decode_kit()`, `cache()`, `get_metadata()`, and
+    /// `category()` — never the forward path.
+    struct StubPipeline {
+        kit: Option<MtpDecodeKit>,
+        cache: EitherCache,
+        metadata: Arc<GeneralMetadata>,
+    }
+
+    impl StubPipeline {
+        fn new(kit: Option<MtpDecodeKit>) -> Arc<tokio::sync::Mutex<dyn Pipeline + Send + Sync>> {
+            // Cache choice: Normal with a single layer is enough — try_new only
+            // calls cache().clone() on it.
+            let cache = EitherCache::Normal(crate::kv_cache::NormalCache::new(1, 32));
+            let metadata = Arc::new(GeneralMetadata {
+                max_seq_len: 32,
+                llg_factory: None,
+                no_kv_cache: false,
+                no_prefix_cache: false,
+                num_hidden_layers: 1,
+                eos_tok: vec![],
+                kind: ModelKind::Normal,
+                is_xlora: false,
+                activation_dtype: candle_core::DType::F32,
+                sliding_window: None,
+                cache_config: None,
+                cache_engine: None,
+                model_metadata: None,
+                modalities: Modalities {
+                    input: vec![],
+                    output: vec![],
+                },
+            });
+            Arc::new(tokio::sync::Mutex::new(StubPipeline {
+                kit,
+                cache,
+                metadata,
+            }))
+        }
+    }
+
+    impl PreProcessingMixin for StubPipeline {
+        fn get_chat_template(&self) -> Option<Arc<ChatTemplate>> {
+            None
+        }
+        fn get_input_processor_config(&self) -> Option<Arc<dyn Any>> {
+            None
+        }
+        fn get_processor(&self) -> Arc<dyn Processor> {
+            unreachable!("StubPipeline: get_processor not reachable from try_wrap_pipeline_with_mtp")
+        }
+    }
+    impl IsqPipelineMixin for StubPipeline {
+        fn re_isq_model(&mut self, _dtype: mistralrs_quant::IsqType) -> anyhow::Result<()> {
+            unreachable!("StubPipeline: re_isq_model not reachable from try_wrap_pipeline_with_mtp")
+        }
+    }
+    impl CacheManagerMixin for StubPipeline {
+        fn clone_in_cache(&self, _seqs: &mut [&mut Sequence]) {
+            unreachable!("StubPipeline: clone_in_cache not reachable")
+        }
+        fn clone_out_cache(&self, _seqs: &mut [&mut Sequence]) {
+            unreachable!("StubPipeline: clone_out_cache not reachable")
+        }
+        fn set_none_cache(
+            &self,
+            _seqs: &mut [&mut Sequence],
+            _reset_non_granular: bool,
+            _modify_draft_cache: bool,
+            _load_preallocated_cache: bool,
+        ) {
+            unreachable!("StubPipeline: set_none_cache not reachable")
+        }
+        fn cache(&self) -> &EitherCache {
+            &self.cache
+        }
+    }
+    impl MetadataMixin for StubPipeline {
+        fn device(&self) -> CandleDevice {
+            CandleDevice::Cpu
+        }
+        fn tokenizer(&self) -> Option<Arc<Tokenizer>> {
+            None
+        }
+        fn name(&self) -> String {
+            "StubPipeline".to_string()
+        }
+        fn reset_non_granular_state(&self) {}
+        fn get_metadata(&self) -> Arc<GeneralMetadata> {
+            self.metadata.clone()
+        }
+        fn device_mapper(&self) -> Option<&dyn DeviceMapper> {
+            None
+        }
+    }
+    impl AnyMoePipelineMixin for StubPipeline {}
+
+    #[async_trait::async_trait]
+    impl Pipeline for StubPipeline {
+        fn forward_inputs(
+            &mut self,
+            _inputs: Box<dyn Any>,
+            _return_raw_logits: bool,
+        ) -> Result<ForwardInputsResult> {
+            unreachable!("StubPipeline::forward_inputs is never called by the wiring tests")
+        }
+        async fn sample_causal_gen(
+            &self,
+            _seqs: &mut [&mut Sequence],
+            _logits: Vec<Tensor>,
+            _prefix_cacher: &mut PrefixCacheManagerV2,
+            _disable_eos_stop: bool,
+            _rng: Arc<std::sync::Mutex<rand_isaac::Isaac64Rng>>,
+        ) -> Result<()> {
+            unreachable!("StubPipeline::sample_causal_gen is never called by the wiring tests")
+        }
+        async fn step(
+            &mut self,
+            _input_seqs: &mut [&mut Sequence],
+            _is_prompt: bool,
+            _return_raw_logits: bool,
+            _prefix_cacher: &mut PrefixCacheManagerV2,
+            _disable_eos_stop: bool,
+            _rng: Arc<std::sync::Mutex<rand_isaac::Isaac64Rng>>,
+            _backend_metadata: CacheBackendMetadata,
+        ) -> Result<Duration> {
+            unreachable!("StubPipeline::step is never called by the wiring tests")
+        }
+        fn category(&self) -> ModelCategory {
+            ModelCategory::Text
+        }
+        fn mtp_decode_kit(&self) -> Option<MtpDecodeKit> {
+            self.kit.clone()
+        }
+    }
+
+    /// `try_wrap_pipeline_with_mtp` with `mtp_depth == 0` is a perfect no-op:
+    /// the returned Arc points at the exact same allocation as the input.
+    /// This is the "default-off, backward-compatible" contract from the spec.
+    #[test]
+    fn try_wrap_pipeline_with_mtp_depth_zero_is_noop() {
+        let target = StubPipeline::new(None);
+        let wrapped = try_wrap_pipeline_with_mtp(target.clone(), 0);
+        assert!(
+            Arc::ptr_eq(&target, &wrapped),
+            "depth=0 must return the exact same Arc — no wrapping allowed"
+        );
+    }
+
+    /// `try_wrap_pipeline_with_mtp` with `mtp_depth > 0` but a pipeline that
+    /// does NOT expose an MTP head (the default for every model except
+    /// DeepSeek V4) returns the original target unwrapped. This is the
+    /// "warn + fall back to non-speculative" contract from the spec — verified
+    /// here via `Arc::ptr_eq` since the helper hands back the same allocation.
+    #[test]
+    fn try_wrap_pipeline_with_mtp_no_kit_falls_back() {
+        let target = StubPipeline::new(None);
+        let wrapped = try_wrap_pipeline_with_mtp(target.clone(), 4);
+        assert!(
+            Arc::ptr_eq(&target, &wrapped),
+            "mtp_depth > 0 + no MTP head must fall back to the original target Arc"
+        );
+        // The helper also emits a `warn!` on this path; we can't easily
+        // capture tracing output in a unit test without dragging in the
+        // tracing-subscriber test machinery, but the structural contract
+        // (Arc identity) is what callers depend on.
+    }
+
+    /// `try_wrap_pipeline_with_mtp` with `mtp_depth > 0` AND a synthetic
+    /// `MtpDecodeKit` exposed by the target returns a *new* Arc whose pipeline
+    /// name reflects the wrapper. This is the "MTP engaged" contract.
+    #[test]
+    fn try_wrap_pipeline_with_mtp_engages_wrapper() -> Result<()> {
+        let device = Device::Cpu;
+        let kit = make_test_kit(/*hidden=*/ 8, /*vocab=*/ 16, &device)?;
+        let target = StubPipeline::new(Some(kit));
+        let wrapped = try_wrap_pipeline_with_mtp(target.clone(), 4);
+        assert!(
+            !Arc::ptr_eq(&target, &wrapped),
+            "wrapper must be a distinct Arc when MTP engages"
+        );
+        // Validate the wrapper's identity by inspecting its name — the impl
+        // formats `MTP-speculative(depth=…, target=…)` in MetadataMixin::name.
+        let name = futures::executor::block_on(wrapped.lock()).name();
+        assert!(
+            name.starts_with("MTP-speculative(depth=4"),
+            "wrapper name should advertise MTP-speculative with depth=4; got {name}"
         );
         Ok(())
     }

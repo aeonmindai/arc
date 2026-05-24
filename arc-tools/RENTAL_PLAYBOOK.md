@@ -111,6 +111,9 @@ huggingface-cli download deepseek-ai/DeepSeek-V4-Flash
 # First run — interactive
 arc run -m deepseek-ai/DeepSeek-V4-Flash --interactive
 
+# Engage MTP speculative decode (V4-only; ~1.8× lossless speedup at depth=4)
+arc run -m deepseek-ai/DeepSeek-V4-Flash --mtp-depth 4
+
 # OR serve OpenAI-compatible API
 arc serve -p 1234 -m deepseek-ai/DeepSeek-V4-Flash
 
@@ -122,7 +125,7 @@ arc bench -m deepseek-ai/DeepSeek-V4-Flash
 
 1. **Tensor mismatch errors:** the V4 loader currently routes through V3's loader. If V4 has any tensor that V3 doesn't expect (or vice versa), load will fail with a clear "expected shape X, got Y" message.
 2. **CSA/HCA dispatch absent:** V4 will run as dense MLA (V3-quality). Performance will be V3-class, not the headline V4 numbers. CUDA TileLang for CSA/HCA is the next-day rental work.
-3. **MTP heads ignored:** V4's `mtp.layers.*` tensors are loaded but not dispatched. The 1.8× MTP speedup is gated on speculative pipeline integration (RUN-156).
+3. **MTP heads dispatched via `--mtp-depth N` (RUN-156 / RUN-RFC #6):** V4 Flash ships with one MTP head. Pass `--mtp-depth 4` to engage `MtpSpeculativePipeline` — the engine wraps the target pipeline at construction time and drafts up to N tokens per target forward (acceptance ≈ 50% on greedy decode → ~1.5-1.8× wallclock speedup, lossless by construction). For non-V4 models the flag logs a warning and falls back to bare-target decode automatically.
 
 ## Hour 3: baseline numbers (30 minutes)
 

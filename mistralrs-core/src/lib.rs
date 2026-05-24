@@ -118,8 +118,9 @@ pub use pipeline::{
     LLaVANextLoader, LlamaLoader, Loader, LocalModelPaths, LoraAdapterPaths, MistralLoader,
     MixtralLoader, Modalities, ModelKind, ModelPaths, MultimodalPromptPrefixer, NormalLoader,
     NormalLoaderBuilder, NormalLoaderType, NormalLoadingMetadata, NormalModel, NormalModelLoader,
-    NormalSpecificConfig, Phi2Loader, Phi3Loader, Phi3VLoader, Qwen2Loader, SpeculativeConfig,
-    SpeculativeLoader, SpeculativePipeline, SpeechLoader, SpeechPipeline, Starcoder2Loader,
+    try_wrap_pipeline_with_mtp, MtpDecodeKit, MtpSpeculativePipeline, NormalSpecificConfig,
+    Phi2Loader, Phi3Loader, Phi3VLoader, Qwen2Loader, SpeculativeConfig, SpeculativeLoader,
+    SpeculativePipeline, SpeechLoader, SpeechPipeline, Starcoder2Loader,
     SupportedModality, TokenSource, VisionLoader, VisionLoaderBuilder, VisionLoaderType,
     VisionSpecificConfig, UQFF_MULTI_FILE_DELIMITER,
 };
