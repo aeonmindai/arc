@@ -1479,7 +1479,7 @@ impl Pipeline for NormalPipeline {
                 greedy,
             };
 
-            self.autonomous_runner = arc_cuda_graph::try_init_autonomous_runner(&device, config);
+            self.autonomous_runner = arc_cuda_graph::try_init_autonomous_runner(&device, config.clone());
             if self.autonomous_runner.is_none() {
                 tracing::warn!(
                     "autonomous_decode: try_init_autonomous_runner returned None; falling back"
