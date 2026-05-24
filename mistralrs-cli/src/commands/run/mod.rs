@@ -48,6 +48,7 @@ pub async fn run_interactive(
         .with_token_source(global.token_source)
         .with_interactive_mode(true)
         .with_prefix_cache_n(runtime.prefix_cache_n)
+        .with_mtp_depth(runtime.mtp_depth as usize)
         .set_paged_attn(paged_attn)
         .with_cpu(cpu)
         .with_enable_search(runtime.enable_search)

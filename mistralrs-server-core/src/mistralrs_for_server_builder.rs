@@ -6,10 +6,11 @@ use anyhow::{Context, Result};
 use candle_core::Device;
 use mistralrs_core::{
     get_auto_device_map_params, get_model_dtype, get_tgt_non_granular_index, paged_attn_supported,
-    parse_isq_value, AutoDeviceMapParams, DefaultSchedulerMethod, DeviceLayerMapMetadata,
-    DeviceMapMetadata, DeviceMapSetting, Loader, LoaderBuilder, McpClientConfig, MemoryGpuConfig,
-    MistralRsBuilder, ModelLoaderConfig, ModelSelected, PagedAttentionConfig, PagedCacheType,
-    SchedulerConfig, SearchCallback, SearchEmbeddingModel, TokenSource,
+    parse_isq_value, try_wrap_pipeline_with_mtp, AutoDeviceMapParams, DefaultSchedulerMethod,
+    DeviceLayerMapMetadata, DeviceMapMetadata, DeviceMapSetting, Loader, LoaderBuilder,
+    McpClientConfig, MemoryGpuConfig, MistralRsBuilder, ModelLoaderConfig, ModelSelected,
+    PagedAttentionConfig, PagedCacheType, SchedulerConfig, SearchCallback, SearchEmbeddingModel,
+    TokenSource,
 };
 use tracing::{info, warn};
 
@@ -109,6 +110,9 @@ pub mod defaults {
     pub const TOKEN_SOURCE: mistralrs_core::TokenSource = mistralrs_core::TokenSource::CacheToken;
     pub const SEARCH_CALLBACK: Option<Arc<mistralrs_core::SearchCallback>> = None;
     pub const PAGED_CACHE_TYPE: PagedCacheType = PagedCacheType::TurboQuant;
+    /// MTP speculative-decode depth. `0` disables MTP wrapping (default —
+    /// preserves backward compatibility for users not opting in).
+    pub const MTP_DEPTH: usize = 0;
 }
 
 /// A builder for creating a mistral.rs instance with configured options for the mistral.rs server.
@@ -237,6 +241,15 @@ pub struct MistralRsForServerBuilder {
 
     /// PagedAttention KV cache type
     paged_cache_type: PagedCacheType,
+
+    /// MTP speculative-decode depth.
+    ///
+    /// `0` = disabled (default; backward-compatible). When `> 0`, after loading
+    /// the target pipeline the engine will attempt to wrap it in an
+    /// [`mistralrs_core::MtpSpeculativePipeline`] driven by the model's own MTP
+    /// head (currently DeepSeek V4 only). Models without an MTP head log a
+    /// warning and fall back to non-speculative decode.
+    mtp_depth: usize,
 }
 
 impl Default for MistralRsForServerBuilder {
@@ -269,6 +282,7 @@ impl Default for MistralRsForServerBuilder {
             search_callback: defaults::SEARCH_CALLBACK,
             mcp_client_config: None,
             paged_cache_type: defaults::PAGED_CACHE_TYPE,
+            mtp_depth: defaults::MTP_DEPTH,
         }
     }
 }
@@ -569,6 +583,19 @@ impl MistralRsForServerBuilder {
         self
     }
 
+    /// Sets the MTP speculative-decode depth.
+    ///
+    /// `0` (default) disables MTP wrapping entirely. Values `1..=8` engage
+    /// [`mistralrs_core::MtpSpeculativePipeline`] when the loaded model exposes
+    /// an MTP head (currently DeepSeek V4 / V4 Flash). For models without an
+    /// MTP head, the engine logs a warning and falls back to the non-speculative
+    /// target pipeline — `cos_sim` against the bare target's greedy decode is
+    /// preserved by construction.
+    pub fn with_mtp_depth(mut self, mtp_depth: usize) -> Self {
+        self.mtp_depth = mtp_depth;
+        self
+    }
+
     /// Sets the MCP client configuration.
     pub fn with_mcp_config(mut self, mcp_config: McpClientConfig) -> Self {
         self.mcp_client_config = Some(mcp_config);
@@ -673,6 +700,14 @@ impl MistralRsForServerBuilder {
         // Synchronize the device stream to ensure all H2D weight copies are complete.
         // With NonBlocking stream, copies are async and weights may not be on GPU yet.
         device.synchronize()?;
+
+        // MTP speculative-decode wiring (RUN-156 / RUN-RFC #6).
+        //
+        // When `--mtp-depth N` is set, wrap the target pipeline in
+        // `MtpSpeculativePipeline` if the model advertises an MTP head. Models
+        // without an MTP head log a warning and continue with the bare target.
+        // The helper is a no-op when `mtp_depth == 0`.
+        let pipeline = try_wrap_pipeline_with_mtp(pipeline, self.mtp_depth);
 
         let scheduler_config = init_scheduler_config(&cache_config, &pipeline, self.max_seqs).await;
 
@@ -796,6 +831,9 @@ impl MistralRsForServerBuilder {
             isq,
             cache_config,
         )?;
+        // MTP wrap (multi-model first slot). See `build_single_model` for the
+        // full rationale. The helper is a no-op when `mtp_depth == 0`.
+        let pipeline = try_wrap_pipeline_with_mtp(pipeline, self.mtp_depth);
         let first_pipeline_name = pipeline.lock().await.name();
         let first_primary_id = first_model
             .alias
@@ -908,6 +946,11 @@ impl MistralRsForServerBuilder {
                 isq,
                 cache_config,
             )?;
+
+            // MTP wrap (multi-model additional slot). Each model in a
+            // multi-model config sees the same `mtp_depth`; models without an
+            // MTP head are left unwrapped and a warning is logged.
+            let pipeline = try_wrap_pipeline_with_mtp(pipeline, self.mtp_depth);
 
             // Use the pipeline's name() as the canonical ID, but allow an alias.
             let pipeline_name = pipeline.lock().await.name();

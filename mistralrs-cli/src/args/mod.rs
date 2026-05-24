@@ -427,6 +427,17 @@ pub struct RuntimeOptions {
     #[arg(long, requires = "enable_search")]
     #[serde(default)]
     pub search_embedding_model: Option<SearchEmbeddingModelArg>,
+
+    /// MTP speculative-decode depth (number of draft tokens per target forward).
+    ///
+    /// `0` (default): disabled — runs the target model without MTP.
+    /// `1..=8`: engages [`mistralrs_core::MtpSpeculativePipeline`] when the loaded
+    /// model exposes an MTP head (currently DeepSeek V4 / V4 Flash). For models
+    /// without an MTP head, a warning is logged and decode falls back to the
+    /// non-speculative target. Recommended starting value for V4 Flash: 4.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=8))]
+    #[serde(default)]
+    pub mtp_depth: u8,
 }
 
 /// Search embedding model options
@@ -484,6 +495,7 @@ impl Default for RuntimeOptions {
             jinja_explicit: None,
             enable_search: false,
             search_embedding_model: None,
+            mtp_depth: 0,
         }
     }
 }

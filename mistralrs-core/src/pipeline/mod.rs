@@ -14,7 +14,7 @@ mod macros;
 mod normal;
 mod paths;
 pub mod post_load_hooks;
-pub(crate) mod mtp_pipeline;
+pub mod mtp_pipeline;
 mod processing;
 mod response;
 mod sampling;
@@ -94,6 +94,9 @@ pub(crate) use processing::{
     apply_chat_template, BasicProcessor, MessagesAction, Processor, ProcessorCreator,
 };
 use rand_isaac::Isaac64Rng;
+pub use mtp_pipeline::{
+    try_wrap_pipeline_with_mtp, MtpDecodeKit, MtpSpeculativePipeline,
+};
 pub use speculative::{SpeculativeConfig, SpeculativeLoader, SpeculativePipeline};
 pub use speech::{SpeechLoader, SpeechPipeline};
 use std::any::Any;
