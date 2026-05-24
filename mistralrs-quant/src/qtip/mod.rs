@@ -369,25 +369,21 @@ impl QtipLayer {
             }
             return Self::quantize_with_options_3d(weight, device, mode, use_rotation);
         }
-        Ok(Arc::new(Self::quantize_2d(
-            weight,
-            bias,
-            device,
-            mode,
-            use_rotation,
-        )?))
+        let layer =
+            Self::quantize_with_options_concrete(weight, bias, device, mode, use_rotation)?;
+        Ok(Arc::new(layer))
     }
 
-    /// Internal 2-D quantize that returns a concrete `Self` instead of
-    /// `Arc<dyn QuantMethod>`. Used by `quantize_with_options_3d` to extract
-    /// the per-expert blocks/row_scales without a `dyn`-downcast (the
-    /// `QuantMethod` trait does not extend `Any`).
+    /// Concrete-typed 2-D quantize that returns a `QtipLayer` directly
+    /// instead of `Arc<dyn QuantMethod>`. Used by `quantize_with_options_3d`
+    /// and `stack_experts` to extract the per-expert blocks/row_scales
+    /// without a `dyn`-downcast (the `QuantMethod` trait does not extend
+    /// `Any`).
     ///
-    /// Also exposed `pub(crate)` because tests need to inspect typed fields
-    /// (`num_experts`, `blocks`, ...) without a downcast. Production code
-    /// should call `quantize_with_options` and treat the layer as a
-    /// `QuantMethod`.
-    pub(crate) fn quantize_2d(
+    /// Also used by tests to inspect typed fields (`num_experts`, `blocks`,
+    /// ...) and rotation state without a downcast. Production code should
+    /// call `quantize_with_options` and treat the layer as a `QuantMethod`.
+    pub fn quantize_with_options_concrete(
         weight: &Tensor,
         bias: Option<Tensor>,
         device: &Device,
@@ -703,9 +699,9 @@ impl QtipLayer {
         let packed_per_row = num_symbols_per_row / 2;
 
         // Quantize each expert slice into a single-expert 2-D QtipLayer. We
-        // call the typed `quantize_2d` so we can pluck blocks/row_scales
-        // directly without a `dyn QuantMethod` downcast (the trait doesn't
-        // extend `Any`).
+        // call the typed `quantize_with_options_concrete` so we can pluck
+        // blocks/row_scales directly without a `dyn QuantMethod` downcast
+        // (the trait doesn't extend `Any`).
         let mut blocks_slices: Vec<Tensor> = Vec::with_capacity(e);
         let mut scales_slices: Vec<Tensor> = Vec::with_capacity(e);
         let mut shared_lut: Option<Tensor> = None;
@@ -717,7 +713,8 @@ impl QtipLayer {
             // `narrow` returns a non-contiguous view in general; the inner
             // quantize call will `contiguous()` / dtype-cast as needed.
             let expert_w = weight.narrow(0, expert_idx, 1)?.squeeze(0)?;
-            let layer = Self::quantize_2d(&expert_w, None, device, mode, use_rotation)?;
+            let layer =
+                Self::quantize_with_options_concrete(&expert_w, None, device, mode, use_rotation)?;
 
             blocks_slices.push(layer.blocks.clone());
             scales_slices.push(layer.row_scales.clone());
@@ -984,7 +981,7 @@ impl QtipLayer {
 
     fn forward_dequantize(&self, x: &Tensor) -> Result<Tensor> {
         // 3-D stacked-expert layers cannot be matmul'd against a flat input —
-        // the caller must route through `gather_forward` (sister task #1)
+        // the caller must route through `gather_forward` (V4 MoE Fast backend)
         // which knows how to pick the right expert per token. Bail clearly
         // instead of producing garbage from a 0-th expert slice.
         if self.num_experts.is_some() {
@@ -993,6 +990,7 @@ impl QtipLayer {
                  use gather_forward(x, indices) instead"
             );
         }
+
         let orig_dims = x.dims().to_vec();
         let x_2d = if orig_dims.len() > 2 {
             let features = orig_dims[orig_dims.len() - 1];
@@ -1157,6 +1155,510 @@ impl QtipLayer {
         }
         Ok(y)
     }
+
+    /// GPU sparse-gather forward. See `QuantMethod::gather_forward` for the
+    /// contract. Returns `Err` on any precondition mismatch so the caller
+    /// can fall back to `gather_forward_cpu` for diagnostics.
+    ///
+    /// Implementation notes:
+    /// * The output dtype matches `a.dtype()` (typically BF16 in
+    ///   production V4 forward passes).
+    /// * We dequantize each unique expert with the existing
+    ///   `dequantize_rotated_cuda` helper that keeps weights in the rotated
+    ///   frame, then rotate `a` rows once and matmul. The rotated-frame
+    ///   matmul identity `(xR) · (WR)^T = x · W^T` keeps the result
+    ///   algebraically correct.
+    /// * We touch only the experts named in `indices` — never the full
+    ///   `E`-stack. This is the load-bearing constraint that distinguishes
+    ///   `gather_forward` from `dequantize_w` + dense matmul.
+    #[cfg(feature = "cuda")]
+    fn gather_forward_cuda(&self, a: &Tensor, indices: &Tensor) -> Result<Tensor> {
+        let (n_tokens, n_experts_per_tok, cols) = a.dims3()?;
+        let rows = self.rows_per_expert()?;
+        let num_experts = self.num_experts_count();
+
+        if self.num_experts.is_none() {
+            candle_core::bail!(
+                "QtipLayer::gather_forward_cuda: expected an expert-stacked (3-D) layer"
+            );
+        }
+
+        // 1. Pull indices to host and find unique expert IDs.
+        let idx_cpu: Vec<u32> = indices
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_dtype(DType::U32)?
+            .to_vec1()?;
+        let mut unique_ids: Vec<usize> =
+            idx_cpu.iter().map(|&v| v as usize).collect();
+        unique_ids.sort_unstable();
+        unique_ids.dedup();
+        for &e in &unique_ids {
+            if e >= num_experts {
+                candle_core::bail!(
+                    "QtipLayer::gather_forward_cuda: expert index {e} >= num_experts {num_experts}"
+                );
+            }
+        }
+
+        // 2. Rotate `a` once. Cast to the rotation kernel's preferred dtype
+        // when needed.
+        let out_dtype = a.dtype();
+        let a_flat = a.reshape((n_tokens * n_experts_per_tok, cols))?;
+        let a_for_rot = if matches!(a_flat.dtype(), DType::BF16 | DType::F16 | DType::F32) {
+            a_flat.contiguous()?
+        } else {
+            a_flat.to_dtype(DType::BF16)?.contiguous()?
+        };
+        let a_rotated = if self.rotation_block >= 2 {
+            let signs = match &self.rotation_signs {
+                Some(t) => t,
+                None => candle_core::bail!(
+                    "QtipLayer::gather_forward_cuda: rotation_block={} but rotation_signs is None",
+                    self.rotation_block
+                ),
+            };
+            cuda_ops::rotate_x_cuda(&a_for_rot, signs, self.rotation_block)?
+        } else {
+            a_for_rot
+        };
+        let a_rotated_dtype = a_rotated.dtype();
+
+        // 3. Dequantize each unique expert's weights (rotated frame).
+        //    Store keyed by expert ID for the scatter step.
+        let mut weight_cache: std::collections::HashMap<usize, Tensor> =
+            std::collections::HashMap::with_capacity(unique_ids.len());
+        for &e in &unique_ids {
+            let blocks_e = self.blocks_for_expert(e)?.contiguous()?;
+            let scales_e = self.scales_for_expert(e)?.contiguous()?;
+            let w_e = cuda_ops::dequantize_rotated_cuda(
+                &blocks_e,
+                &scales_e,
+                &self.lut,
+                self.in_features,
+                a_rotated_dtype,
+            )?;
+            weight_cache.insert(e, w_e);
+        }
+
+        // 4. Build a per-expert positions list. For each unique expert e,
+        //    collect the flat positions (0..n_tokens*n_experts_per_tok)
+        //    that route to e.
+        let total_pairs = n_tokens * n_experts_per_tok;
+        let mut positions_by_expert: std::collections::HashMap<usize, Vec<u32>> =
+            std::collections::HashMap::with_capacity(unique_ids.len());
+        for (flat, &e_u32) in idx_cpu.iter().enumerate() {
+            positions_by_expert
+                .entry(e_u32 as usize)
+                .or_insert_with(Vec::new)
+                .push(flat as u32);
+        }
+
+        // 5. Per-expert: gather a_rotated rows, matmul against W_e^T,
+        //    scatter into the output tensor.
+        //    Output layout: [n_tokens * n_experts_per_tok, rows].
+        let device = a.device();
+        // Pre-allocate an output buffer of zeros so we can fill via
+        // `index_add` / `slice_assign` style operations. We use
+        // `Tensor::zeros` then `index_add` for the scatter — this matches
+        // candle's supported ops and avoids hand-rolling kernels.
+        let mut out_flat = Tensor::zeros(
+            (total_pairs, rows),
+            a_rotated_dtype,
+            device,
+        )?;
+
+        for &e in &unique_ids {
+            let positions = positions_by_expert
+                .get(&e)
+                .expect("positions for expert should be populated");
+            let pos_tensor = Tensor::from_vec(
+                positions.clone(),
+                (positions.len(),),
+                device,
+            )?;
+
+            // Gather the rotated activation rows that routed to expert e:
+            //   a_e: [n_e, cols], same dtype as a_rotated.
+            let a_e = a_rotated.index_select(&pos_tensor, 0)?;
+
+            // Matmul: [n_e, cols] @ [cols, rows] = [n_e, rows].
+            // weight_cache[e] is [rows, cols]; transpose for the matmul.
+            let w_e = weight_cache.get(&e).expect("weight should be cached");
+            let y_e = a_e.matmul(&w_e.t()?)?;
+
+            // Scatter y_e back into out_flat at `positions`.
+            out_flat = out_flat.index_add(&pos_tensor, &y_e, 0)?;
+        }
+
+        let mut out = out_flat.reshape((n_tokens, n_experts_per_tok, rows))?;
+        if out.dtype() != out_dtype {
+            out = out.to_dtype(out_dtype)?;
+        }
+        if let Some(bias) = &self.bias {
+            out = out.broadcast_add(&bias.to_dtype(out.dtype())?)?;
+        }
+        Ok(out)
+    }
+}
+
+impl QtipLayer {
+    /// Construct an expert-stacked 3-D `QtipLayer` directly from its parts.
+    /// The blocks tensor must have rank 3, the row_scales rank 2. This is
+    /// the entry point used by the 3-D loader (#2 in the orchestrator
+    /// blocker list); tests that need to construct a 3-D layer go through
+    /// `stack_experts` which performs the rank promotion internally.
+    pub fn from_stacked_parts(
+        blocks: Tensor,
+        row_scales: Tensor,
+        lut: Tensor,
+        bias: Option<Tensor>,
+        in_features: usize,
+        rotation_signs: Option<Tensor>,
+        rotation_block: usize,
+    ) -> Result<QtipLayer> {
+        if blocks.dims().len() != 3 {
+            candle_core::bail!(
+                "QtipLayer::from_stacked_parts: blocks must be rank 3, got rank {}",
+                blocks.dims().len()
+            );
+        }
+        if row_scales.dims().len() != 2 {
+            candle_core::bail!(
+                "QtipLayer::from_stacked_parts: row_scales must be rank 2, got rank {}",
+                row_scales.dims().len()
+            );
+        }
+        if blocks.dim(0)? != row_scales.dim(0)? {
+            candle_core::bail!(
+                "QtipLayer::from_stacked_parts: expert dim mismatch (blocks={}, scales={})",
+                blocks.dim(0)?,
+                row_scales.dim(0)?
+            );
+        }
+        if blocks.dim(1)? != row_scales.dim(1)? {
+            candle_core::bail!(
+                "QtipLayer::from_stacked_parts: row dim mismatch (blocks={}, scales={})",
+                blocks.dim(1)?,
+                row_scales.dim(1)?
+            );
+        }
+        let e = blocks.dim(0)?;
+        Ok(QtipLayer {
+            blocks,
+            row_scales,
+            lut,
+            bias,
+            in_features,
+            num_experts: Some(e),
+            rotation_signs,
+            rotation_block,
+        })
+    }
+
+    /// Stack `per_expert_layers` into a single 3-D expert-stacked
+    /// `QtipLayer`. All layers must share the same `in_features`, row count,
+    /// `rotation_block`, and rotation signs (when present). The shared LUT
+    /// is taken from the first layer (LUTs are deterministic Gaussian and
+    /// identical across experts in the current Tier-A implementation).
+    ///
+    /// This is the path the 3-D loader / 3-D `quantize` helper produces
+    /// (#2 in the orchestrator blocker list). It also enables tests to
+    /// construct an expert-stacked layer from independent 2-D quantize
+    /// calls without going through the production loader.
+    pub fn stack_experts(per_expert_layers: Vec<QtipLayer>) -> Result<QtipLayer> {
+        if per_expert_layers.is_empty() {
+            candle_core::bail!("QtipLayer::stack_experts: empty input");
+        }
+        let head = &per_expert_layers[0];
+        let in_features = head.in_features;
+        let rotation_block = head.rotation_block;
+        let n_rows_head = head.row_scales.dim(0)?;
+
+        // Validate every layer has identical shape and rotation params.
+        for (i, layer) in per_expert_layers.iter().enumerate() {
+            if layer.in_features != in_features {
+                candle_core::bail!(
+                    "QtipLayer::stack_experts: layer {i} in_features={} != head {}",
+                    layer.in_features,
+                    in_features
+                );
+            }
+            if layer.row_scales.dim(0)? != n_rows_head {
+                candle_core::bail!(
+                    "QtipLayer::stack_experts: layer {i} n_rows={} != head {}",
+                    layer.row_scales.dim(0)?,
+                    n_rows_head
+                );
+            }
+            if layer.rotation_block != rotation_block {
+                candle_core::bail!(
+                    "QtipLayer::stack_experts: layer {i} rotation_block={} != head {}",
+                    layer.rotation_block,
+                    rotation_block
+                );
+            }
+            if layer.blocks.dims().len() != 2 || layer.row_scales.dims().len() != 1 {
+                candle_core::bail!(
+                    "QtipLayer::stack_experts: layer {i} must be 2-D (got blocks rank {}, scales rank {})",
+                    layer.blocks.dims().len(),
+                    layer.row_scales.dims().len()
+                );
+            }
+        }
+
+        let blocks_refs: Vec<&Tensor> =
+            per_expert_layers.iter().map(|l| &l.blocks).collect();
+        let scales_refs: Vec<&Tensor> =
+            per_expert_layers.iter().map(|l| &l.row_scales).collect();
+
+        let blocks = Tensor::stack(&blocks_refs, 0)?;
+        let row_scales = Tensor::stack(&scales_refs, 0)?;
+
+        // Pick a representative rotation signs / bias from the first layer.
+        // Loader / quantize-with-options is responsible for ensuring all
+        // experts share these; we already validated rotation_block above.
+        let e = per_expert_layers.len();
+        Ok(QtipLayer {
+            blocks,
+            row_scales,
+            lut: head.lut.clone(),
+            bias: head.bias.clone(),
+            in_features,
+            num_experts: Some(e),
+            rotation_signs: head.rotation_signs.clone(),
+            rotation_block,
+        })
+    }
+
+    /// Number of experts encoded in this layer. Returns 1 for a legacy 2-D
+    /// layer (`num_experts == None`) and `E` for an expert-stacked 3-D layer
+    /// (`num_experts == Some(E)`). The expert dimension only appears for MoE
+    /// gate/up/down projections that have been packed across experts by the
+    /// loader (see `MoEExperts` / `PackedExperts` paths).
+    ///
+    /// This is the internal helper used by `gather_forward` etc. The public
+    /// `num_experts() -> Option<usize>` accessor is the source-of-truth API.
+    fn num_experts_count(&self) -> usize {
+        self.num_experts.unwrap_or(1)
+    }
+
+    /// Number of output rows per expert. For a 2-D layer this is just
+    /// `row_scales.dim(0)`; for a 3-D layer it is `row_scales.dim(1)`.
+    fn rows_per_expert(&self) -> Result<usize> {
+        match self.num_experts {
+            None => self.row_scales.dim(0),
+            Some(_) => self.row_scales.dim(1),
+        }
+    }
+
+    /// Slice the per-expert 2-D `(N, packed_per_row)` view of `blocks` for
+    /// expert `e`. When the layer is 2-D this returns `blocks` directly.
+    fn blocks_for_expert(&self, e: usize) -> Result<Tensor> {
+        match self.num_experts {
+            None => {
+                if e != 0 {
+                    candle_core::bail!(
+                        "QtipLayer: requested expert {e} on a non-stacked (2-D) layer"
+                    );
+                }
+                Ok(self.blocks.clone())
+            }
+            Some(_) => {
+                // narrow + squeeze gives a contiguous `(N, packed_per_row)` view.
+                self.blocks.narrow(0, e, 1)?.squeeze(0)
+            }
+        }
+    }
+
+    /// Slice the per-expert 1-D `(N,)` view of `row_scales` for expert `e`.
+    fn scales_for_expert(&self, e: usize) -> Result<Tensor> {
+        match self.num_experts {
+            None => {
+                if e != 0 {
+                    candle_core::bail!(
+                        "QtipLayer: requested expert {e} on a non-stacked (2-D) layer"
+                    );
+                }
+                Ok(self.row_scales.clone())
+            }
+            Some(_) => self.row_scales.narrow(0, e, 1)?.squeeze(0),
+        }
+    }
+
+    /// Dequantize a single expert `e`'s weights into a `[rows, in_features]`
+    /// tensor in the *unrotated* (original) frame. Used by the CPU
+    /// `gather_forward` fallback when the GPU rotation kernel is unavailable.
+    #[allow(dead_code)]
+    fn dequantize_expert_weights_unrotated(&self, e: usize) -> Result<Tensor> {
+        let blocks_e = self.blocks_for_expert(e)?;
+        let scales_e = self.scales_for_expert(e)?;
+        let n = scales_e.dim(0)?;
+        let k_in = self.in_features;
+
+        let blocks_data: Vec<u8> = blocks_e
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1()?;
+        let scales_data: Vec<f32> = scales_e
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1()?;
+        let lut_data: Vec<f32> = self
+            .lut
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1()?;
+
+        let num_symbols_per_row = k_in / V as usize;
+        let packed_per_row = num_symbols_per_row / 2;
+
+        let mut out = vec![0f32; n * k_in];
+        for row in 0..n {
+            let scale = scales_data[row];
+            let mut state: u32 = 0;
+            let row_packed_base = row * packed_per_row;
+            let out_row_base = row * k_in;
+            for sym_idx in 0..num_symbols_per_row {
+                let byte = blocks_data[row_packed_base + sym_idx / 2];
+                let sym = if sym_idx.is_multiple_of(2) {
+                    byte & 0x0F
+                } else {
+                    (byte >> 4) & 0x0F
+                };
+                state = ((state << K) | sym as u32) & STATE_MASK;
+                let lut_off = (state as usize) * V as usize;
+                out[out_row_base + sym_idx * 2] = lut_data[lut_off] * scale;
+                out[out_row_base + sym_idx * 2 + 1] = lut_data[lut_off + 1] * scale;
+            }
+        }
+
+        // Undo the Hadamard rotation row-by-row if rotation is active so the
+        // matmul against the (unrotated) activation produces the algebraically
+        // correct result on the CPU fallback.
+        if self.rotation_block >= 2 {
+            let signs: Vec<f32> = match &self.rotation_signs {
+                Some(t) => t.to_device(&Device::Cpu)?.to_vec1::<f32>()?,
+                None => candle_core::bail!(
+                    "QtipLayer::dequantize_expert_weights_unrotated: rotation_block={} but rotation_signs is None",
+                    self.rotation_block
+                ),
+            };
+            for row in 0..n {
+                let row_slice = &mut out[row * k_in..(row + 1) * k_in];
+                apply_block_rotation(row_slice, &signs, self.rotation_block);
+            }
+        }
+
+        Tensor::from_vec(out, (n, k_in), &Device::Cpu)?
+            .to_device(self.blocks.device())?
+            .to_dtype(DType::BF16)
+    }
+
+    /// CPU sparse-gather forward (portable reference).
+    ///
+    /// Mirrors `gather_forward_cuda` step-for-step but uses
+    /// `dequantize_expert_weights_unrotated` (no GPU kernel) and host-side
+    /// matmul. Output dtype follows `a.dtype()`.
+    ///
+    /// Like the GPU path, it touches only the experts named in `indices` —
+    /// the dequantize is per-unique-expert, and the matmul batches all
+    /// (token, k) pairs that route to the same expert into one operation.
+    fn gather_forward_cpu(&self, a: &Tensor, indices: &Tensor) -> Result<Tensor> {
+        let (n_tokens, n_experts_per_tok, cols) = a.dims3()?;
+        let (i_tokens, i_k) = indices.dims2()?;
+        if i_tokens != n_tokens || i_k != n_experts_per_tok {
+            candle_core::bail!(
+                "QtipLayer::gather_forward: indices shape ({i_tokens}, {i_k}) doesn't match a shape ({n_tokens}, {n_experts_per_tok}, {cols})"
+            );
+        }
+        if cols != self.in_features {
+            candle_core::bail!(
+                "QtipLayer::gather_forward: a.dim(-1)={cols} != in_features={}",
+                self.in_features
+            );
+        }
+        let rows = self.rows_per_expert()?;
+        let num_experts = self.num_experts_count();
+
+        let idx_cpu: Vec<u32> = indices
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_dtype(DType::U32)?
+            .to_vec1()?;
+
+        // Track unique expert IDs so we only dequantize each one once even
+        // when several (token, k) pairs share the same expert (which is the
+        // common case for prefill — top-6 of 256 means many duplicates).
+        let mut unique_ids: Vec<usize> =
+            idx_cpu.iter().map(|&v| v as usize).collect();
+        unique_ids.sort_unstable();
+        unique_ids.dedup();
+        for &e in &unique_ids {
+            if e >= num_experts {
+                candle_core::bail!(
+                    "QtipLayer::gather_forward: expert index {e} >= num_experts {num_experts}"
+                );
+            }
+        }
+
+        // Per-expert dequantize. `dequantize_expert_weights_unrotated`
+        // already applies the inverse-rotation, so the resulting weight
+        // is in the **original** frame — we match it against the
+        // un-rotated activation.
+        let mut weight_cache: std::collections::HashMap<usize, Tensor> =
+            std::collections::HashMap::with_capacity(unique_ids.len());
+        for &e in &unique_ids {
+            let w_e = self
+                .dequantize_expert_weights_unrotated(e)?
+                .to_dtype(a.dtype())?;
+            weight_cache.insert(e, w_e);
+        }
+
+        // Build per-expert positions list.
+        let total_pairs = n_tokens * n_experts_per_tok;
+        let mut positions_by_expert: std::collections::HashMap<usize, Vec<u32>> =
+            std::collections::HashMap::with_capacity(unique_ids.len());
+        for (flat, &e_u32) in idx_cpu.iter().enumerate() {
+            positions_by_expert
+                .entry(e_u32 as usize)
+                .or_insert_with(Vec::new)
+                .push(flat as u32);
+        }
+
+        // a_flat: [n_tokens * n_experts_per_tok, cols]
+        let a_flat = a.reshape((n_tokens * n_experts_per_tok, cols))?;
+        let device = a.device();
+
+        // Output accumulator. We initialize to zeros and scatter-add the
+        // per-expert results, exactly mirroring the GPU code path's
+        // partitioning. Since the positions are disjoint across experts,
+        // each output row is written exactly once.
+        let mut out_flat = Tensor::zeros((total_pairs, rows), a.dtype(), device)?;
+
+        for &e in &unique_ids {
+            let positions = positions_by_expert
+                .get(&e)
+                .expect("positions for expert should be populated");
+            let pos_tensor = Tensor::from_vec(
+                positions.clone(),
+                (positions.len(),),
+                device,
+            )?;
+            let a_e = a_flat.index_select(&pos_tensor, 0)?;
+            let w_e = weight_cache.get(&e).expect("weight should be cached");
+            let y_e = a_e.matmul(&w_e.t()?)?;
+            out_flat = out_flat.index_add(&pos_tensor, &y_e, 0)?;
+        }
+
+        let mut out = out_flat.reshape((n_tokens, n_experts_per_tok, rows))?;
+        if let Some(bias) = &self.bias {
+            // bias shape: [rows]. QtipLayer doesn't carry per-expert bias —
+            // MoE projections in the V4 checkpoint are bias-free.
+            out = out.broadcast_add(&bias.to_dtype(out.dtype())?)?;
+        }
+        Ok(out)
+    }
 }
 
 impl QuantMethod for QtipLayer {
@@ -1196,6 +1698,90 @@ impl QuantMethod for QtipLayer {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         self.forward_dequantize(x)
+    }
+
+    /// Sparse-gather matmul for V4 MoE Fast backend.
+    ///
+    /// # Shapes (CUDA path)
+    /// * `a`       : `[n_tokens, n_experts_per_tok, in_features]`
+    /// * `indices` : `[n_tokens, n_experts_per_tok]` (U32)
+    /// * self      : expert-stacked layer where `blocks` is rank-3 with
+    ///               leading expert dim `E`; weight per expert is
+    ///               `(rows, in_features)`.
+    /// * output    : `[n_tokens, n_experts_per_tok, rows]`
+    ///
+    /// # Algorithm
+    /// 1. Read `indices` to host once (small — `(n_tokens, k)` U32; for V4
+    ///    decode with batch=1 and topk=6 this is 24 bytes total).
+    /// 2. Compute the **unique** set of expert IDs the router landed on
+    ///    this step. For top-6 of 256 in decode this is at most 6 experts;
+    ///    for prefill it converges to all 256 only at very long sequences.
+    /// 3. For each unique expert, dequantize its `(rows, in_features)`
+    ///    weight slab from the packed QTIP blocks. We touch only the
+    ///    selected experts' weights — this is the load-bearing
+    ///    requirement (dequantizing all 256 every step would defeat the
+    ///    point of an MoE).
+    /// 4. Rotate every row of `a` by the layer's Hadamard incoherence
+    ///    rotation. The rotation `R = block_diag(D·H·D)` is involutory and
+    ///    independent of expert ID, so we apply it once across all
+    ///    (token, k) pairs and reuse the rotated activations against every
+    ///    expert's *rotated-frame* weight.
+    /// 5. For each unique expert `e`, find the (token, k) positions that
+    ///    routed to `e`, gather those `a` rows into a contiguous
+    ///    `(n_e, in_features)` batch, matmul against `W_e^T` to produce
+    ///    `(n_e, rows)`, then scatter the rows back into the output at the
+    ///    matching positions.
+    ///
+    /// # Rotation invariant
+    /// QTIP stores `W` in the rotated frame: `W_stored = W · R`. The
+    /// algebraic identity that makes the rotation free is
+    /// `(x · R) · (W · R)^T = x · R · R^T · W^T = x · W^T` (since `R` is
+    /// orthogonal and involutory). We exploit it by leaving the
+    /// dequantized weight in the rotated frame and matching it with a
+    /// rotated activation — saves one rotation pass per expert.
+    fn gather_forward(&self, a: &Tensor, indices: &Tensor) -> Result<Tensor> {
+        if self.num_experts.is_none() {
+            // The contract is "expert-sparse dispatch" — a 2-D layer is a
+            // single-expert (i.e. non-MoE) layer and `gather_forward`
+            // doesn't make sense on it. Bail with a clear message rather
+            // than silently produce wrong output. Callers that hit this
+            // are using the wrong code path.
+            candle_core::bail!(
+                "QtipLayer::gather_forward requires an expert-stacked 3-D layer (got a 2-D layer with no expert dim)"
+            );
+        }
+
+        let (n_tokens, n_experts_per_tok, cols) = a.dims3()?;
+        let (i_tokens, i_k) = indices.dims2()?;
+        if i_tokens != n_tokens || i_k != n_experts_per_tok {
+            candle_core::bail!(
+                "QtipLayer::gather_forward: indices shape ({i_tokens}, {i_k}) doesn't match a shape ({n_tokens}, {n_experts_per_tok}, {cols})"
+            );
+        }
+        if cols != self.in_features {
+            candle_core::bail!(
+                "QtipLayer::gather_forward: a.dim(-1)={cols} != in_features={}",
+                self.in_features
+            );
+        }
+
+        // GPU fast path — only when storage lives on CUDA, the kernels were
+        // compiled in, and `a` is on CUDA in a dtype the dequantize +
+        // rotation kernels accept. Any precondition failure drops into the
+        // CPU reference path below.
+        #[cfg(feature = "cuda")]
+        {
+            if cuda_ops::can_use_qtip_cuda(&self.blocks)
+                && matches!(a.device(), candle_core::Device::Cuda(_))
+                && matches!(a.dtype(), DType::BF16 | DType::F16 | DType::F32)
+            {
+                if let Ok(out) = self.gather_forward_cuda(a, indices) {
+                    return Ok(out);
+                }
+            }
+        }
+
+        self.gather_forward_cpu(a, indices)
     }
 
     fn quantized_act_type(&self) -> Option<DType> {
@@ -2583,7 +3169,13 @@ mod tests {
         let mut shared_rotation_block: usize = 0;
         for expert_idx in 0..e {
             let expert_w = w.narrow(0, expert_idx, 1)?.squeeze(0)?;
-            let layer = QtipLayer::quantize_2d(&expert_w, None, &device, mode, use_rotation)?;
+            let layer = QtipLayer::quantize_with_options_concrete(
+                &expert_w,
+                None,
+                &device,
+                mode,
+                use_rotation,
+            )?;
             blocks_slices.push(layer.blocks.clone());
             scales_slices.push(layer.row_scales.clone());
             if expert_idx == 0 {
@@ -2764,6 +3356,383 @@ mod tests {
         // than direct QTIP; we set the bar at 0.80 to leave headroom for
         // small Box-Muller fixture rolls.
         assert!(cos >= 0.80, "NVFP4 -> QTIP 3-D cos sim {cos} < 0.80");
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // gather_forward unit tests (CPU + cuda-parity).
+    // -----------------------------------------------------------------
+    //
+    // These exercise the V4 MoE Fast backend dispatch path. The CPU
+    // reference path runs on any host (used as the cross-check for the
+    // GPU fast path) and the GPU parity test is gated on `cuda` so it
+    // only runs in CUDA-enabled CI.
+
+    /// Build a 3-D expert-stacked layer from per-expert Gaussian weights
+    /// and return both the layer + the dense reference weights tensor for
+    /// the CPU correctness check.
+    ///
+    /// Each expert has DIFFERENT weights — verifies the gather actually
+    /// selects per-token-per-k.
+    fn make_expert_stack(
+        num_experts: usize,
+        rows: usize,
+        in_features: usize,
+        device: &Device,
+        mode: QtipMode,
+    ) -> Result<(QtipLayer, Tensor)> {
+        // Per-expert random Gaussian (deterministic per-expert seed).
+        let mut weights_per_expert: Vec<Tensor> =
+            Vec::with_capacity(num_experts);
+        let mut concrete_layers: Vec<QtipLayer> = Vec::with_capacity(num_experts);
+        for e in 0..num_experts {
+            let mut wdata = vec![0.0f32; rows * in_features];
+            for (i, v) in wdata.iter_mut().enumerate() {
+                // Use distinct seed per expert so the weights aren't
+                // accidentally identical.
+                let seed = ((e + 1) as u64).wrapping_mul(0xDEAD_BEEF_F00D_CAFE)
+                    ^ ((i + 1) as u64).wrapping_mul(0x9E3779B97F4A7C15);
+                let mut z = seed;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+                z ^= z >> 31;
+                let u1 =
+                    ((z >> 32) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+                let u2 = ((z & 0xFFFFFFFF) as u32 as f32 + 1.0)
+                    / (u32::MAX as f32 + 2.0);
+                let r = (-2.0_f32 * u1.ln()).sqrt();
+                *v = r * (2.0 * std::f32::consts::PI * u2).cos() * 0.5;
+            }
+            let w_e =
+                Tensor::from_vec(wdata.clone(), (rows, in_features), device)?;
+            let layer_e =
+                QtipLayer::quantize_with_options_concrete(&w_e, None, device, mode, matches!(mode, QtipMode::Viterbi))?;
+            weights_per_expert.push(w_e);
+            concrete_layers.push(layer_e);
+        }
+        let stack = QtipLayer::stack_experts(concrete_layers)?;
+
+        // Reference: build the dense (num_experts, rows, in_features)
+        // tensor by stacking the original weights.
+        let refs: Vec<&Tensor> = weights_per_expert.iter().collect();
+        let weight_stack = Tensor::stack(&refs, 0)?;
+        Ok((stack, weight_stack))
+    }
+
+    /// Sanity check: `stack_experts` produces a layer whose `num_experts`
+    /// matches and whose `blocks` tensor has rank 3.
+    #[test]
+    fn qtip_stack_experts_shape() -> Result<()> {
+        let device = Device::Cpu;
+        let (stack, _refs) = make_expert_stack(4, 16, 64, &device, QtipMode::Greedy)?;
+        assert_eq!(stack.blocks.dims().len(), 3, "blocks must be rank 3");
+        assert_eq!(stack.row_scales.dims().len(), 2, "row_scales must be rank 2");
+        assert_eq!(stack.blocks.dim(0)?, 4, "expert dim wrong");
+        assert_eq!(stack.row_scales.dim(0)?, 4, "expert dim wrong");
+        assert_eq!(stack.in_features, 64);
+        Ok(())
+    }
+
+    /// CPU `gather_forward` matches the per-expert dense matmul.
+    /// Tolerance is wide because each gathered slot uses 2-bit QTIP
+    /// (Greedy mode → ~0.85 single-expert cos sim). With 4 experts and 2
+    /// k slots per token, the aggregate cos sim should still clear 0.80.
+    #[test]
+    fn qtip_gather_forward_cpu_matches_reference() -> Result<()> {
+        let device = Device::Cpu;
+        let num_experts = 4;
+        let rows = 16;
+        let in_features = 64;
+        let n_tokens = 3;
+        let n_experts_per_tok = 2;
+
+        let (stack, dense_w_stack) =
+            make_expert_stack(num_experts, rows, in_features, &device, QtipMode::Greedy)?;
+
+        // Build random activations.
+        let mut adata = vec![0.0f32; n_tokens * n_experts_per_tok * in_features];
+        for (i, v) in adata.iter_mut().enumerate() {
+            let mut z = ((i + 4711) as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z ^= z >> 31;
+            let u1 = ((z >> 32) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+            let u2 =
+                ((z & 0xFFFFFFFF) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+            let r = (-2.0_f32 * u1.ln()).sqrt();
+            *v = r * (2.0 * std::f32::consts::PI * u2).cos();
+        }
+        let a = Tensor::from_vec(
+            adata.clone(),
+            (n_tokens, n_experts_per_tok, in_features),
+            &device,
+        )?;
+
+        // Indices route to varying experts including duplicates per token.
+        let idx_data: Vec<u32> = vec![
+            0, 2, // tok 0 → experts 0, 2
+            1, 3, // tok 1 → experts 1, 3
+            2, 2, // tok 2 → expert 2 twice (duplicate path)
+        ];
+        let indices = Tensor::from_vec(
+            idx_data.clone(),
+            (n_tokens, n_experts_per_tok),
+            &device,
+        )?;
+
+        // Run the gather forward.
+        let out = stack.gather_forward(&a, &indices)?;
+        assert_eq!(out.dims(), &[n_tokens, n_experts_per_tok, rows]);
+
+        // Reference: per (tok, k), use the dense weights for the routed
+        // expert and matmul.
+        let dense_w: Vec<f32> =
+            dense_w_stack.flatten_all()?.to_vec1()?;
+        let mut ref_out = vec![0f32; n_tokens * n_experts_per_tok * rows];
+        for tok in 0..n_tokens {
+            for k in 0..n_experts_per_tok {
+                let e = idx_data[tok * n_experts_per_tok + k] as usize;
+                let a_row =
+                    &adata[(tok * n_experts_per_tok + k) * in_features
+                        ..(tok * n_experts_per_tok + k + 1) * in_features];
+                for r in 0..rows {
+                    let w_row = &dense_w[e * rows * in_features
+                        + r * in_features
+                        ..e * rows * in_features + (r + 1) * in_features];
+                    let mut s = 0f32;
+                    for c in 0..in_features {
+                        s += a_row[c] * w_row[c];
+                    }
+                    ref_out[(tok * n_experts_per_tok + k) * rows + r] = s;
+                }
+            }
+        }
+
+        let out_v: Vec<f32> = out.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let cos = {
+            let (mut d, mut na, mut nb) = (0f32, 0f32, 0f32);
+            for (x, y) in out_v.iter().zip(ref_out.iter()) {
+                d += x * y;
+                na += x * x;
+                nb += y * y;
+            }
+            d / (na.sqrt() * nb.sqrt())
+        };
+        println!(
+            "qtip_gather_forward_cpu_matches_reference: cos sim = {cos:.4}"
+        );
+        // Greedy QTIP at 2 bits typically lands at >0.85 cos sim for a
+        // single matmul; aggregated across 6 routed slots the cos sim is
+        // dominated by the lowest-quality slot but should still clear
+        // 0.80.
+        assert!(
+            cos >= 0.80,
+            "QTIP gather_forward CPU vs reference cos sim {cos} < 0.80"
+        );
+        Ok(())
+    }
+
+    /// `gather_forward` with Viterbi mode (rotation enabled) should track
+    /// the dense reference within 0.85 cos sim. The realistic Gaussian
+    /// fixture isn't large enough to push to the 0.95 number that the
+    /// dense forward test hits on `k_in=256`; here we use `k_in=128` for
+    /// build speed and accept 0.85.
+    #[test]
+    fn qtip_gather_forward_viterbi_with_rotation() -> Result<()> {
+        let device = Device::Cpu;
+        let num_experts = 3;
+        let rows = 16;
+        let in_features = 128;
+        let n_tokens = 2;
+        let n_experts_per_tok = 2;
+
+        let (stack, dense_w_stack) =
+            make_expert_stack(num_experts, rows, in_features, &device, QtipMode::Viterbi)?;
+        assert!(
+            stack.rotation_block >= 2,
+            "Viterbi mode should activate rotation (rotation_block={})",
+            stack.rotation_block
+        );
+
+        let mut adata = vec![0.0f32; n_tokens * n_experts_per_tok * in_features];
+        for (i, v) in adata.iter_mut().enumerate() {
+            let mut z =
+                ((i + 9001) as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z ^= z >> 31;
+            let u1 = ((z >> 32) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+            let u2 =
+                ((z & 0xFFFFFFFF) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+            let r = (-2.0_f32 * u1.ln()).sqrt();
+            *v = r * (2.0 * std::f32::consts::PI * u2).cos();
+        }
+        let a = Tensor::from_vec(
+            adata.clone(),
+            (n_tokens, n_experts_per_tok, in_features),
+            &device,
+        )?;
+        let idx_data: Vec<u32> = vec![0, 1, 1, 2];
+        let indices = Tensor::from_vec(
+            idx_data.clone(),
+            (n_tokens, n_experts_per_tok),
+            &device,
+        )?;
+        let out = stack.gather_forward(&a, &indices)?;
+
+        let dense_w: Vec<f32> = dense_w_stack.flatten_all()?.to_vec1()?;
+        let mut ref_out = vec![0f32; n_tokens * n_experts_per_tok * rows];
+        for tok in 0..n_tokens {
+            for k in 0..n_experts_per_tok {
+                let e = idx_data[tok * n_experts_per_tok + k] as usize;
+                let a_row =
+                    &adata[(tok * n_experts_per_tok + k) * in_features
+                        ..(tok * n_experts_per_tok + k + 1) * in_features];
+                for r in 0..rows {
+                    let w_row = &dense_w[e * rows * in_features
+                        + r * in_features
+                        ..e * rows * in_features + (r + 1) * in_features];
+                    let mut s = 0f32;
+                    for c in 0..in_features {
+                        s += a_row[c] * w_row[c];
+                    }
+                    ref_out[(tok * n_experts_per_tok + k) * rows + r] = s;
+                }
+            }
+        }
+
+        let out_v: Vec<f32> = out.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let cos = {
+            let (mut d, mut na, mut nb) = (0f32, 0f32, 0f32);
+            for (x, y) in out_v.iter().zip(ref_out.iter()) {
+                d += x * y;
+                na += x * x;
+                nb += y * y;
+            }
+            d / (na.sqrt() * nb.sqrt())
+        };
+        println!(
+            "qtip_gather_forward_viterbi_with_rotation: cos sim = {cos:.4}"
+        );
+        assert!(
+            cos >= 0.85,
+            "QTIP gather_forward Viterbi cos sim {cos} < 0.85"
+        );
+        Ok(())
+    }
+
+    /// Negative test: `gather_forward` on a 2-D (single-expert) layer
+    /// should bail with a clear error so callers don't silently get
+    /// wrong outputs.
+    #[test]
+    fn qtip_gather_forward_rejects_2d_layer() -> Result<()> {
+        let device = Device::Cpu;
+        let rows = 8;
+        let in_features = 64;
+        let wdata = vec![0.5f32; rows * in_features];
+        let w = Tensor::from_vec(wdata, (rows, in_features), &device)?;
+        let layer =
+            QtipLayer::quantize_with_options_concrete(&w, None, &device, QtipMode::Greedy, false)?;
+
+        let a = Tensor::zeros((1, 2, in_features), DType::F32, &device)?;
+        let idx = Tensor::from_vec(vec![0u32, 0u32], (1, 2), &device)?;
+        let res = layer.gather_forward(&a, &idx);
+        assert!(
+            res.is_err(),
+            "gather_forward on 2-D layer must bail (got {:?})",
+            res.as_ref().map(|t| t.dims())
+        );
+        let msg = format!("{}", res.unwrap_err());
+        assert!(
+            msg.contains("expert-stacked") || msg.contains("3-D"),
+            "Expected expert-stacked / 3-D error message, got: {msg}"
+        );
+        Ok(())
+    }
+
+    /// GPU parity test: build a 3-D layer on CUDA, run gather_forward on
+    /// CUDA, run the same gather_forward on CPU, and assert the two
+    /// agree within ≥0.999 cos sim. Skipped when CUDA is unavailable.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn qtip_gather_forward_cuda_matches_cpu() -> Result<()> {
+        let cuda = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("CUDA not available; skipping qtip_gather_forward_cuda_matches_cpu");
+                return Ok(());
+            }
+        };
+        let cpu = Device::Cpu;
+        let num_experts = 4;
+        let rows = 32;
+        let in_features = 128;
+        let n_tokens = 3;
+        let n_experts_per_tok = 2;
+
+        // Build the SAME random fixture on both devices by stacking weights
+        // generated from the same hash.
+        let (cpu_stack, _ref_w) =
+            make_expert_stack(num_experts, rows, in_features, &cpu, QtipMode::Viterbi)?;
+        let (cuda_stack, _ref_w_cuda) =
+            make_expert_stack(num_experts, rows, in_features, &cuda, QtipMode::Viterbi)?;
+
+        // Build the same activations on both devices.
+        let mut adata = vec![0.0f32; n_tokens * n_experts_per_tok * in_features];
+        for (i, v) in adata.iter_mut().enumerate() {
+            let mut z = ((i + 13_579) as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z ^= z >> 31;
+            let u1 = ((z >> 32) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+            let u2 = ((z & 0xFFFFFFFF) as u32 as f32 + 1.0)
+                / (u32::MAX as f32 + 2.0);
+            let r = (-2.0_f32 * u1.ln()).sqrt();
+            *v = r * (2.0 * std::f32::consts::PI * u2).cos();
+        }
+        let a_cpu = Tensor::from_vec(
+            adata.clone(),
+            (n_tokens, n_experts_per_tok, in_features),
+            &cpu,
+        )?;
+        let a_cuda = Tensor::from_vec(
+            adata.clone(),
+            (n_tokens, n_experts_per_tok, in_features),
+            &cuda,
+        )?
+        .to_dtype(DType::BF16)?;
+
+        let idx_data: Vec<u32> = vec![0, 1, 2, 3, 1, 1];
+        let idx_cpu = Tensor::from_vec(
+            idx_data.clone(),
+            (n_tokens, n_experts_per_tok),
+            &cpu,
+        )?;
+        let idx_cuda = Tensor::from_vec(
+            idx_data,
+            (n_tokens, n_experts_per_tok),
+            &cuda,
+        )?;
+
+        let y_cpu = cpu_stack.gather_forward(&a_cpu, &idx_cpu)?;
+        let y_cuda = cuda_stack.gather_forward(&a_cuda, &idx_cuda)?;
+
+        let y_cpu_v: Vec<f32> = y_cpu.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let y_cuda_v: Vec<f32> = y_cuda
+            .to_device(&cpu)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
+
+        let (mut d, mut na, mut nb) = (0f32, 0f32, 0f32);
+        for (x, y) in y_cpu_v.iter().zip(y_cuda_v.iter()) {
+            d += x * y;
+            na += x * x;
+            nb += y * y;
+        }
+        let cos = d / (na.sqrt() * nb.sqrt());
+        println!("qtip_gather_forward_cuda_matches_cpu: cos sim = {cos:.5}");
+        assert!(
+            cos >= 0.999,
+            "CUDA gather_forward deviates from CPU: cos sim {cos} < 0.999"
+        );
         Ok(())
     }
 }
