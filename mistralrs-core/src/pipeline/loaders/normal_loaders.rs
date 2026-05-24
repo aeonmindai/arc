@@ -2713,14 +2713,21 @@ impl DeviceMappedModelLoader for DeepSeekV2Loader {
             let input_layernorm = cfg.hidden_size;
             let post_attention_layernorm = cfg.hidden_size;
 
+            // wq_a / wq_b are matmul weights → divide by `weight_pack_factor`
+            // so ISQ-reduced sizes propagate into the auto-mapper budget.
+            // `q_a_layernorm` (length=lora_rank) is not quantized.
             let q_proj = match cfg.q_lora_rank {
                 Some(lora_rank) => {
-                    let a = cfg.hidden_size * lora_rank;
+                    let a = cfg.hidden_size * lora_rank / weight_pack_factor;
                     let norm = lora_rank;
-                    let b = (cfg.num_attention_heads * cfg.q_head_dim()) * lora_rank;
+                    let b = (cfg.num_attention_heads * cfg.q_head_dim()) * lora_rank
+                        / weight_pack_factor;
                     a + norm + b
                 }
-                None => (cfg.num_attention_heads * cfg.q_head_dim()) * cfg.hidden_size,
+                None => {
+                    (cfg.num_attention_heads * cfg.q_head_dim()) * cfg.hidden_size
+                        / weight_pack_factor
+                }
             };
             let kv_a_proj_with_mqa = cfg.hidden_size * (cfg.kv_lora_rank + cfg.qk_rope_head_dim)
                 / weight_pack_factor
@@ -3041,14 +3048,21 @@ impl DeviceMappedModelLoader for DeepSeekV3Loader {
             let input_layernorm = cfg.hidden_size;
             let post_attention_layernorm = cfg.hidden_size;
 
+            // wq_a / wq_b are matmul weights → divide by `weight_pack_factor`
+            // so ISQ-reduced sizes propagate into the auto-mapper budget.
+            // `q_a_layernorm` (length=lora_rank) is not quantized.
             let q_proj = match cfg.q_lora_rank {
                 Some(lora_rank) => {
-                    let a = cfg.hidden_size * lora_rank;
+                    let a = cfg.hidden_size * lora_rank / weight_pack_factor;
                     let norm = lora_rank;
-                    let b = (cfg.num_attention_heads * cfg.q_head_dim()) * lora_rank;
+                    let b = (cfg.num_attention_heads * cfg.q_head_dim()) * lora_rank
+                        / weight_pack_factor;
                     a + norm + b
                 }
-                None => (cfg.num_attention_heads * cfg.q_head_dim()) * cfg.hidden_size,
+                None => {
+                    (cfg.num_attention_heads * cfg.q_head_dim()) * cfg.hidden_size
+                        / weight_pack_factor
+                }
             };
             let kv_a_proj_with_mqa = cfg.hidden_size * (cfg.kv_lora_rank + cfg.qk_rope_head_dim)
                 / weight_pack_factor
@@ -3306,14 +3320,21 @@ impl DeviceMappedModelLoader for DeepSeekV4Loader {
             let input_layernorm = cfg.hidden_size;
             let post_attention_layernorm = cfg.hidden_size;
             // V4 Q: LoRA (wq_a + q_norm + wq_b). Audit §0 + §2.
+            // wq_a and wq_b are matmul weights — divide by `weight_pack_factor`
+            // so ISQ-quantized sizes don't get reported at full BF16. The
+            // `q_a_layernorm` (length=lora_rank) is *not* quantized and stays raw.
             let q_proj = match cfg.q_lora_rank {
                 Some(lora_rank) => {
-                    let a = cfg.hidden_size * lora_rank;
+                    let a = cfg.hidden_size * lora_rank / weight_pack_factor;
                     let norm = lora_rank;
-                    let b = (cfg.num_attention_heads * head_dim) * lora_rank;
+                    let b = (cfg.num_attention_heads * head_dim) * lora_rank
+                        / weight_pack_factor;
                     a + norm + b
                 }
-                None => (cfg.num_attention_heads * head_dim) * cfg.hidden_size,
+                None => {
+                    (cfg.num_attention_heads * head_dim) * cfg.hidden_size
+                        / weight_pack_factor
+                }
             };
             // V4 K/V: SINGLE fused wkv (hidden → head_dim). No LoRA-A/B split.
             // Audit §0 + §5 lines 477-482. No `kv_b_proj` at all.

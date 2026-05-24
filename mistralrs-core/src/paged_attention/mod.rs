@@ -316,7 +316,34 @@ pub fn calculate_cache_config(
         mb_to_blocks!(mem_gpu * SIZE_IN_MB, dtype_size, block_size, config)
     };
     if num_gpu_blocks == 0 {
-        anyhow::bail!("Num GPU blocks is 0. This means there is not enough memory. Either reduce the memory amount/utilization/context size or disable PagedAttention.");
+        // Surface the budget math so 0-block failures are debuggable instead of
+        // forcing the user to add `--pa-memory-mb` as a blind bypass.
+        let bytes_per_block = if let Some(b) = turboquant_bytes_per_token_per_layer {
+            block_size * config.num_layers() * b
+        } else {
+            block_size * config.num_layers() * dtype_size
+                * (config.num_kv_heads() * (config.k_head_dim() + config.v_head_dim()))
+        };
+        info!(
+            "PagedAttention budget: {} MB available, {} bytes per block ({} layers, kv_heads={}, k_dim={}, v_dim={}, block_size={}, dtype={:?}, model_weight_per_device_mb={})",
+            mem_gpu,
+            bytes_per_block,
+            config.num_layers(),
+            config.num_kv_heads(),
+            config.k_head_dim(),
+            config.v_head_dim(),
+            block_size,
+            dtype,
+            model_weight_per_device_mb,
+        );
+        anyhow::bail!(
+            "Num GPU blocks is 0 — auto-mapper reserved only {} MB for KV (need >= {} MB for at least one block of {} layers x {} bytes/tok/layer x {} tokens). The pre-ISQ size calc in the model loader is likely overcounting weights.",
+            mem_gpu,
+            bytes_per_block / SIZE_IN_MB + 1,
+            config.num_layers(),
+            turboquant_bytes_per_token_per_layer.unwrap_or(dtype_size * (config.num_kv_heads() * (config.k_head_dim() + config.v_head_dim()))),
+            block_size,
+        );
     }
 
     if !silent {

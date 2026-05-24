@@ -199,6 +199,7 @@ dependencies = [
  "async-trait",
  "candle-core",
  "clap",
+ "either",
  "indexmap 2.13.1",
  "mistralrs",
  "mistralrs-core",

@@ -246,9 +246,22 @@ pub fn get_device_layers(
                     let avail_bytes = MemoryUsage.get_memory_available(primary_dev)?;
                     let cap = device_cap(avail_bytes, primary_dev);
                     let act_overhead = non_mapped_max.max(mapped_max);
-                    let budget_mb = ((cap as f64 * f as f64) as usize)
-                        .saturating_sub(remaining + act_overhead)
-                        / (1024 * 1024);
+                    let budget_bytes = ((cap as f64 * f as f64) as usize)
+                        .saturating_sub(remaining + act_overhead);
+                    let budget_mb = budget_bytes / (1024 * 1024);
+                    info!(
+                        "Auto device-map KV budget: cap={} MB, fraction={}, model={} MB (post-ISQ via pack_factor), activations={} MB → budget={} MB",
+                        cap / (1024 * 1024),
+                        f,
+                        remaining / (1024 * 1024),
+                        act_overhead / (1024 * 1024),
+                        budget_mb,
+                    );
+                    if budget_mb == 0 {
+                        warn!(
+                            "Auto device-map computed 0 MB KV budget — the loader's layer_sizes_in_bytes is likely missing weight_pack_factor on one or more tensors (search `weight_pack_factor` in the model's loader impl)."
+                        );
+                    }
                     MemoryGpuConfig::MbAmount(budget_mb)
                 }
                 // ContextSize passes through to calculate_cache_config.
