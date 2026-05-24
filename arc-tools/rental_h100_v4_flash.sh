@@ -159,7 +159,7 @@ fi
 PROBE_MID_TOKS=$(grep -oE "Decode: [0-9]+ tokens, [0-9.]+ T/s" "$PROBE_MID_LOG" | tail -1 | grep -oE "[0-9.]+ T/s" | head -1 | awk '{print $1}')
 ok "probe-mid decode rate: ${PROBE_MID_TOKS:-N/A} tok/s"
 
-step "8/9 V4 Flash + every Arc moat engaged"
+step "8/9 V4 Flash + the Arc decode stack engaged"
 # Composed stack:
 #   * QTIP 2-bit Viterbi + Hadamard rotation — GPU quantize at load
 #   * Fused QTIP single-token gemv kernel — HBM-floor decode bandwidth
@@ -167,18 +167,25 @@ step "8/9 V4 Flash + every Arc moat engaged"
 #   * TurboQuant K4/V3 KV cache
 #   * mHC 4-D residual
 #   * Lightning Indexer + FlashMLASparse for V4 CSA/HCA dispatch
-#   * arc-cuda-graph DedicatedDecodePath (per-step bypass of Candle)
-#   * AutonomousDecodeRunner with on-GPU sampler — engages from decode-step 2
-#     onward (step 1 populates KV pointers, step 2+ replays captured graph,
-#     zero CPU sync per token)
+#   * arc-cuda-graph DedicatedDecodePath (per-token Candle bypass) — the ACTIVE
+#     CUDA-graph decode path (graph_wrapped_forward -> try_dedicated_decode)
 #   * NVFP4 3-D expert-stack ISQ → QTIP
 #   * QtipLayer::gather_forward (used when TD-MoE is OFF; with TD-MoE on, MoE
 #     goes through Tucker contraction)
 #   * MTP speculative decode at depth=4 — V4's MTP head proposes 4 tokens per
 #     target forward, ~2× throughput at typical acceptance rates
 #
-# No env-var bypass. No --paged-attn off. No Greedy fallback. Every claimed
-# moat is on in this command line.
+# No env-var bypass. No --paged-attn off. No Greedy fallback.
+#
+# NOT engaged by this run: AutonomousDecodeRunner (the fully on-GPU decode loop)
+# is plumbed into NormalPipeline but its CUDA graph capture is still deferred —
+# mistralrs-core/src/pipeline/normal.rs::autonomous_decode never calls
+# runner.capture(), so is_captured() stays false and the engine ALWAYS falls
+# back to step(). Decode here therefore runs through the DedicatedDecodePath
+# capture-once+replay path above (a per-token Candle bypass), NOT the
+# zero-CPU-sync autonomous loop. Do not report autonomous decode as engaged
+# from this run until the capture wiring lands (recorded in the result JSON's
+# "moats_plumbed_not_engaged" field below).
 DECODE_LOG=/tmp/v4_flash_bench.log
 printf 'Write exactly one paragraph (3-5 sentences) about HBM memory bandwidth and why it matters for LLM inference.\n\\quit\n' | \
   ARC_TD_MOE_RANK=${TD_MOE_RANK} \
@@ -218,11 +225,13 @@ cat > "$RESULT_FILE" <<JSON
     "TurboQuant K4/V3 KV cache",
     "mHC 4-D residual",
     "FlashMLASparse + Lightning Indexer (V4 CSA/HCA)",
-    "DedicatedDecodePath (per-step Candle bypass)",
-    "AutonomousDecodeRunner (graph capture + replay from decode-step 2)",
+    "DedicatedDecodePath (per-token Candle bypass)",
     "NVFP4 3-D expert-stack -> QTIP ISQ",
     "QtipLayer::gather_forward for MoE Fast backend",
     "MTP speculative decode (depth=4)"
+  ],
+  "moats_plumbed_not_engaged": [
+    "AutonomousDecodeRunner (on-GPU decode loop) — graph capture deferred in NormalPipeline::autonomous_decode (runner.capture() never called); engine falls back to step()+DedicatedDecodePath"
   ],
   "probe_mid_qwen7b_qtip_tok_per_s": "${PROBE_MID_TOKS:-N/A}",
   "tok_per_s_decode": $TOK_PER_S,
