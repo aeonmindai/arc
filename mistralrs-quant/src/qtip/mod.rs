@@ -395,18 +395,34 @@ impl QtipLayer {
         // this to <1 min. Try GPU first; any precondition failure (kernels
         // not compiled in, non-F32 dtype, non-CUDA target) silently falls
         // through to the existing CPU implementation below.
+        // GPU Viterbi quantize kernel is currently broken — on real H100
+        // hardware (driver 570, CUDA 12.8) the kernel hangs with 100% GPU
+        // util and no forward progress (verified on Qwen 7B intermediate dim
+        // 18944: 13.8 GB allocated, deadlocks indefinitely). The per-row
+        // backtrace tile + 256-thread cooperative reduction across 65536
+        // trellis states is likely either deadlocking on a sync or scheduled
+        // to take hours per weight matrix. Re-enable via env var only after
+        // the kernel is fixed and CPU↔GPU parity is validated on H100.
+        //
+        // For now, fall through to the CPU Viterbi path (slow at load:
+        // ~3.5 min on Qwen 7B, ~30 min on V4 Flash, all single-thread Rayon)
+        // — quality moat (Viterbi + Hadamard rotation) is preserved, decode
+        // path stays fully on GPU. Load-time CPU work is amortized over
+        // many tokens of decode so the per-token bandwidth picture is
+        // unchanged.
         #[cfg(feature = "cuda")]
+        if std::env::var("ARC_FORCE_GPU_QTIP_QUANTIZE").is_ok()
+            && matches!(device, Device::Cuda(_))
+            && ffi::HAVE_QTIP_KERNELS
         {
-            if matches!(device, Device::Cuda(_)) && ffi::HAVE_QTIP_KERNELS {
-                if let Some(layer) = Self::quantize_with_options_cuda(
-                    weight,
-                    bias.clone(),
-                    device,
-                    mode,
-                    use_rotation,
-                )? {
-                    return Ok(layer);
-                }
+            if let Some(layer) = Self::quantize_with_options_cuda(
+                weight,
+                bias.clone(),
+                device,
+                mode,
+                use_rotation,
+            )? {
+                return Ok(layer);
             }
         }
 

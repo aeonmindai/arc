@@ -106,7 +106,7 @@ if [ ! -d "$MODELS/Qwen2.5-7B-Instruct" ] || [ -z "$(ls -A "$MODELS/Qwen2.5-7B-I
   hf download "$PROBE_MID" --local-dir "$MODELS/Qwen2.5-7B-Instruct" 2>&1 | tail -3 || fail "probe-mid download"
 fi
 PROBE_MID_LOG=/tmp/probe_mid.log
-printf 'Complete this sentence: The capital of France is\n\\quit\n' | timeout 600 ./target/release/mistralrs run \
+printf 'Complete this sentence: The capital of France is\n\\quit\n' | timeout 1800 ./target/release/mistralrs run \
   --isq qtip2 \
   --pa-cache-type turboquant \
   --max-seq-len 1024 --max-seqs 1 \
