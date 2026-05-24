@@ -1431,7 +1431,16 @@ pub enum DeepSeekV2RopeScaling {
         original_max_position_embeddings: usize,
         beta_fast: f32,
         beta_slow: f32,
+        // `mscale` / `mscale_all_dim` are optional. DeepSeek V4 Flash ships with
+        // `type: "yarn"`, `original_max_position_embeddings`, `beta_fast`,
+        // `beta_slow`, `factor` only — without the two mscale fields, which
+        // means the HF reference defaults apply (`mscale = 1.0`,
+        // `mscale_all_dim = 1.0` → `yarn_get_mscale` ratio of 1.0, neutral).
+        // Serde `default = ...` keeps backward-compat with V2/V3 configs that
+        // *do* set these fields explicitly.
+        #[serde(default = "default_mscale")]
         mscale: f32,
+        #[serde(default = "default_mscale")]
         mscale_all_dim: f32,
         factor: f32,
         #[serde(rename = "type")]
@@ -1442,6 +1451,10 @@ pub enum DeepSeekV2RopeScaling {
         scaling_type: ScaledRopeType,
         factor: f64,
     },
+}
+
+fn default_mscale() -> f32 {
+    1.0
 }
 
 pub struct DeepSeekV2RopeConfig {
