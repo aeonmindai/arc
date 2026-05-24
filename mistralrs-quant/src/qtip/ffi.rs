@@ -118,4 +118,46 @@ extern "C" {
         row_offset: i32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
+
+    // ----- Fused decode + gemv kernels (single-token decode fast path) -----
+    //
+    // `x_rotated` MUST already be in the QTIP-rotated frame (caller applies
+    // `launch_qtip_rotate_x_*` first). The kernel reads packed bytes once,
+    // decodes them in registers, and accumulates `y[row] = sum W[row,k] * x[k]`
+    // — saves 2× HBM weight bandwidth vs dequantize-then-matmul.
+    pub(crate) fn launch_qtip_fused_gemv_v2_k4_l16_bf16(
+        d_packed: *const u8,
+        d_row_scales: *const f32,
+        d_lut: *const f32,
+        d_x_rotated: *const bf16,
+        d_y: *mut bf16,
+        n_rows: i32,
+        packed_per_row: i32,
+        num_symbols: i32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
+    pub(crate) fn launch_qtip_fused_gemv_v2_k4_l16_f16(
+        d_packed: *const u8,
+        d_row_scales: *const f32,
+        d_lut: *const f32,
+        d_x_rotated: *const f16,
+        d_y: *mut f16,
+        n_rows: i32,
+        packed_per_row: i32,
+        num_symbols: i32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
+    pub(crate) fn launch_qtip_fused_gemv_v2_k4_l16_f32(
+        d_packed: *const u8,
+        d_row_scales: *const f32,
+        d_lut: *const f32,
+        d_x_rotated: *const f32,
+        d_y: *mut f32,
+        n_rows: i32,
+        packed_per_row: i32,
+        num_symbols: i32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
 }

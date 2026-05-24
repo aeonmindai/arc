@@ -1084,6 +1084,16 @@ impl QtipLayer {
     /// GPU forward path: dequantize the rotated weight matrix on-device,
     /// rotate `x` rows on-device, matmul, return the bias-free result.
     ///
+    /// Single-token decode (`n_tokens == 1`) uses the fused decode-gemv
+    /// kernel which avoids materializing the BF16 weight matrix in HBM:
+    /// roughly 3× less weight-side bandwidth, lifting the per-token decode
+    /// ceiling on V4 Flash from ~330 tok/s (dequant+matmul) toward ~1 K tok/s.
+    ///
+    /// Multi-token forward (`n_tokens > 1`) keeps the dequantize+matmul
+    /// path — the cuBLAS GEMM amortizes the dequantize cost across all
+    /// tokens, and a fused decode-GEMM at high batch is a separate kernel
+    /// (TODO: gather-style flavor for MoE prefill).
+    ///
     /// Returns `Err` if any precondition fails (e.g. unsupported dtype or
     /// block size) — the caller falls back to the CPU path.
     #[cfg(feature = "cuda")]
@@ -1137,9 +1147,29 @@ impl QtipLayer {
             x_for_rot
         };
 
-        // Dequantize the weight matrix (rotated frame) into the matmul
-        // dtype. Matching dtypes lets candle's matmul go through the
-        // BF16/F16 fast path on H100.
+        // Single-token decode fast path: fused decode + gemv kernel.
+        // For a 1-token batch we save the HBM round-trip on the BF16
+        // dequantized weights. The output is [1, n_rows] which matches the
+        // shape the matmul path returns ([1, k_in] @ [k_in, n_rows] →
+        // [1, n_rows]).
+        let n_tokens = x_rotated.dim(0)?;
+        if n_tokens == 1 {
+            let y = cuda_ops::fused_gemv_cuda(
+                &self.blocks,
+                &self.row_scales,
+                &self.lut,
+                &x_rotated,
+                k_in,
+            )?;
+            if y.dtype() != out_dtype {
+                return y.to_dtype(out_dtype);
+            }
+            return Ok(y);
+        }
+
+        // Multi-token path: dequantize the weight matrix (rotated frame)
+        // into the matmul dtype. Matching dtypes lets candle's matmul go
+        // through the BF16/F16 fast path on H100.
         let w_dtype = x_rotated.dtype();
         let w_rotated = cuda_ops::dequantize_rotated_cuda(
             &self.blocks,
@@ -3732,6 +3762,162 @@ mod tests {
         assert!(
             cos >= 0.999,
             "CUDA gather_forward deviates from CPU: cos sim {cos} < 0.999"
+        );
+        Ok(())
+    }
+
+    /// Fused decode + gemv kernel must produce numerically-equivalent output
+    /// to the dequantize+matmul path. We compare cos sim against the
+    /// dequantize-then-matmul reference (NOT against dense) — both paths use
+    /// the same QTIP-reconstructed weight, so the fused kernel only changes
+    /// HOW the matmul is computed, not the operand values. Cos sim must be
+    /// ≥0.999 (allowing only for fmaf vs cuBLAS rounding differences).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_fused_gemv_matches_dequant_matmul() -> Result<()> {
+        let cuda = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("CUDA not available; skipping cuda_fused_gemv_matches_dequant_matmul");
+                return Ok(());
+            }
+        };
+        let cpu = Device::Cpu;
+
+        // Cover a few realistic shapes: small (test), medium (decoder
+        // hidden), and mismatched (intermediate / down_proj). All use
+        // K=4 V=2 L=16 packing.
+        for &(n, k_in) in &[
+            (32usize, 256usize),   // tiny
+            (128, 512),            // small attn-out
+            (256, 1024),           // mid
+            (1024, 4096),          // realistic LLM scale (decoder block)
+        ] {
+            // Random-ish Gaussian weights via deterministic hash.
+            let mut wdata = vec![0.0f32; n * k_in];
+            for (i, v) in wdata.iter_mut().enumerate() {
+                let mut z = (i as u64).wrapping_mul(0x9E3779B97F4A7C15);
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                z ^= z >> 31;
+                let u1 = ((z >> 32) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+                let u2 = ((z & 0xFFFFFFFF) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+                let r = (-2.0_f32 * u1.ln()).sqrt();
+                *v = r * (2.0 * std::f32::consts::PI * u2).cos() * 0.5;
+            }
+            let mut xdata = vec![0.0f32; k_in];
+            for (i, v) in xdata.iter_mut().enumerate() {
+                let mut z = ((i + 7_777_777) as u64).wrapping_mul(0x9E3779B97F4A7C15);
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                z ^= z >> 31;
+                let u1 = ((z >> 32) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+                let u2 = ((z & 0xFFFFFFFF) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+                let r = (-2.0_f32 * u1.ln()).sqrt();
+                *v = r * (2.0 * std::f32::consts::PI * u2).cos();
+            }
+
+            // Build the layer on CUDA (Viterbi + rotation, the production
+            // path for V4 Flash).
+            let w_cuda = Tensor::from_vec(wdata.clone(), (n, k_in), &cuda)?;
+            let layer = QtipLayer::quantize_with_mode(&w_cuda, None, &cuda, QtipMode::Viterbi)?;
+            // We need direct access to the QtipLayer struct (not the dyn
+            // QuantMethod) to call internal forward helpers — downcast the
+            // Arc by treating the trait pointer as &QtipLayer at known type.
+            //
+            // Cleanest approach: use the public `forward` (which dispatches
+            // to the fused path internally for n_tokens=1) and compare
+            // against a manually-constructed dequant+matmul.
+
+            // Single-token forward through the layer (triggers fused gemv).
+            let x_cuda_1tok = Tensor::from_vec(xdata.clone(), (1, k_in), &cuda)?
+                .to_dtype(DType::BF16)?;
+            let y_fused = layer.forward(&x_cuda_1tok)?;
+            let y_fused_v: Vec<f32> =
+                y_fused.to_device(&cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+
+            // Manual dequant+matmul reference: dequantize_w() returns the
+            // weight in the ORIGINAL (un-rotated) frame, so the matmul
+            // x @ W^T should be the algebraic equivalent of layer.forward.
+            let w_recon = layer.dequantize_w()?.to_dtype(DType::F32)?;
+            let x_f32 = Tensor::from_vec(xdata, (1, k_in), &cuda)?;
+            let y_ref = x_f32.matmul(&w_recon.t()?)?;
+            let y_ref_v: Vec<f32> = y_ref.to_device(&cpu)?.flatten_all()?.to_vec1()?;
+
+            // Compute cos sim.
+            let (mut dot, mut na, mut nb) = (0f32, 0f32, 0f32);
+            for (a, b) in y_fused_v.iter().zip(y_ref_v.iter()) {
+                dot += a * b;
+                na += a * a;
+                nb += b * b;
+            }
+            let cos = dot / (na.sqrt() * nb.sqrt());
+            println!(
+                "Fused gemv vs dequant+matmul cos sim (n={n}, k_in={k_in}): {cos}"
+            );
+            assert!(
+                cos >= 0.999,
+                "Fused gemv deviates from dequant+matmul: cos sim {cos} < 0.999 (n={n}, k_in={k_in})"
+            );
+        }
+        Ok(())
+    }
+
+    /// Fused gemv must match the dequant+matmul output for the rotation-disabled
+    /// path too (Greedy mode), to catch any state-warmup bug that only manifests
+    /// without rotation noise to mask it.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_fused_gemv_matches_dequant_matmul_no_rotation() -> Result<()> {
+        let cuda = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("CUDA not available; skipping cuda_fused_gemv_matches_dequant_matmul_no_rotation");
+                return Ok(());
+            }
+        };
+        let cpu = Device::Cpu;
+
+        let n = 256usize;
+        let k_in = 512usize;
+        let mut wdata = vec![0.0f32; n * k_in];
+        for (i, v) in wdata.iter_mut().enumerate() {
+            let mut z = (i as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z ^= z >> 31;
+            let u1 = ((z >> 32) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+            let u2 = ((z & 0xFFFFFFFF) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+            let r = (-2.0_f32 * u1.ln()).sqrt();
+            *v = r * (2.0 * std::f32::consts::PI * u2).cos() * 0.4;
+        }
+        let xdata: Vec<f32> = (0..k_in)
+            .map(|i| ((i as f32) * 0.013).sin() + ((i as f32) * 0.029).cos())
+            .collect();
+
+        // Greedy mode → rotation disabled by default.
+        let w_cuda = Tensor::from_vec(wdata, (n, k_in), &cuda)?;
+        let layer = QtipLayer::quantize_with_mode(&w_cuda, None, &cuda, QtipMode::Greedy)?;
+
+        let x_cuda_1tok = Tensor::from_vec(xdata.clone(), (1, k_in), &cuda)?
+            .to_dtype(DType::BF16)?;
+        let y_fused = layer.forward(&x_cuda_1tok)?;
+        let y_fused_v: Vec<f32> =
+            y_fused.to_device(&cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+
+        let w_recon = layer.dequantize_w()?.to_dtype(DType::F32)?;
+        let x_f32 = Tensor::from_vec(xdata, (1, k_in), &cuda)?;
+        let y_ref = x_f32.matmul(&w_recon.t()?)?;
+        let y_ref_v: Vec<f32> = y_ref.to_device(&cpu)?.flatten_all()?.to_vec1()?;
+
+        let (mut dot, mut na, mut nb) = (0f32, 0f32, 0f32);
+        for (a, b) in y_fused_v.iter().zip(y_ref_v.iter()) {
+            dot += a * b;
+            na += a * a;
+            nb += b * b;
+        }
+        let cos = dot / (na.sqrt() * nb.sqrt());
+        println!("Fused gemv vs dequant+matmul cos sim (Greedy, no rotation): {cos}");
+        assert!(
+            cos >= 0.999,
+            "Fused gemv deviates from dequant+matmul (Greedy): cos sim {cos} < 0.999"
         );
         Ok(())
     }
