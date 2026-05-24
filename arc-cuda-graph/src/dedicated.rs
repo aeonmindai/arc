@@ -80,12 +80,39 @@ unsafe impl Sync for DedicatedDecodePath {}
 #[cfg(feature = "cuda")]
 impl DedicatedDecodePath {
     pub fn new(mut weights: ModelWeights) -> candle_core::Result<Self> {
+        // Make sure the CUDA primary context is bound to *this* thread before
+        // we touch raw Driver/Runtime APIs (cuStreamCreate, cudaMalloc, ...).
+        //
+        // candle's cudarc wrapper binds the context per-thread inside every
+        // safe call. The pipeline-construction thread that gets us here has
+        // done plenty of CUDA work already, so the context is normally bound.
+        // We still bind defensively here because:
+        //
+        //   1. Pre-bind paranoia: any reordering of construction (e.g. moving
+        //      pipeline init off the main thread) would otherwise produce a
+        //      SEGV in `libcuda` MOVAPS on the first cudaMalloc — no error
+        //      code, just a fault, because the runtime lazy-init walks a
+        //      thread-local that hasn't been seeded.
+        //
+        //   2. Validating that we have a real device. If the model is
+        //      somehow on CPU, the anchors will be empty or non-CUDA — we
+        //      bail with a clear message rather than corrupting state.
+        Self::bind_context(&weights)?;
+
         let mut stream: CUstream = std::ptr::null_mut();
         let s = unsafe { cuStreamCreate(&mut stream, CU_STREAM_NON_BLOCKING) };
         if s != CUDA_SUCCESS {
-            candle_core::bail!("Failed to create decode stream: {s}");
+            candle_core::bail!(
+                "cuStreamCreate(NON_BLOCKING) failed: code={s} \
+                 (driver-level error — context may not be bound to this thread)"
+            );
         }
-
+        if stream.is_null() {
+            candle_core::bail!(
+                "cuStreamCreate returned CUDA_SUCCESS but stream is NULL — \
+                 driver returned a malformed handle, refusing to proceed"
+            );
+        }
 
         let (cos_table, sin_table) = Self::compute_rope_tables(&weights.config)?;
 
@@ -93,12 +120,57 @@ impl DedicatedDecodePath {
         // Gate+Up are not physically fused — they would duplicate weights in memory
         // (often many GB extra). Instead the dual-weight GEMV kernel reads from
         // both gate_proj and up_proj buffers in a single launch.
+        //
+        // SAFETY: q_proj/k_proj/v_proj device pointers are anchored by
+        // `weights.anchors` (see ModelWeights::anchors). Without those anchors
+        // the cudaMemcpy below would read from dangling memory and segfault
+        // inside libcuda's SSE memcpy fast path.
         Self::fuse_qkv(&mut weights)?;
 
+        // After QKV fusion the source Q/K/V buffers are no longer read by
+        // decode (only `qkv_fused` is). For ISQ-quantized models each of
+        // those was a fresh dequantized BF16 copy, so dropping them frees a
+        // meaningful chunk of VRAM (hidden * (heads + 2 * kv_heads) *
+        // head_dim * 2 bytes per layer). The remaining anchors keep
+        // O/gate/up/down/lm_head/residuals alive for the decode loop.
+        //
+        // SAFETY: we drop *after* `fuse_qkv` has completed and the
+        // cudaMemcpy stream has buffered the D2D copies. The destination is
+        // `qkv_fused` which owns its own cudaMalloc'd region, so the source
+        // buffers can be freed even if the copy is still in flight (CUDA
+        // guarantees the runtime tracks free ordering vs. queued work via
+        // stream synchronization). We also call cudaDeviceSynchronize() to
+        // be paranoid: any later kernel must observe the fused buffer
+        // populated, AND no in-flight async copies must outlive the source.
+        unsafe {
+            extern "C" { fn cudaDeviceSynchronize() -> u32; }
+            let s = cudaDeviceSynchronize();
+            if s != 0 {
+                candle_core::bail!(
+                    "cudaDeviceSynchronize after fuse_qkv failed: {s} — \
+                     refusing to drop Q/K/V anchors with uncertain copy ordering"
+                );
+            }
+        }
+
+        let qkv_dropped: usize = weights
+            .anchors
+            .layers
+            .iter_mut()
+            .map(|la| {
+                let n = la.qkv.len();
+                la.qkv.clear();
+                n
+            })
+            .sum();
+
         tracing::info!(
-            "Dedicated decode path initialized (stream + GEMV + RoPE[{}x{}])",
+            "Dedicated decode path initialized (stream + GEMV + RoPE[{}x{}], \
+             {} live anchors after dropping {} Q/K/V anchors)",
             weights.config.max_position_embeddings,
             weights.config.head_dim / 2,
+            weights.anchors.count(),
+            qkv_dropped,
         );
 
         Ok(Self {
@@ -133,6 +205,58 @@ impl DedicatedDecodePath {
             sum_sync_us: 0.0,
             sum_total_us: 0.0,
         })
+    }
+
+    /// Bind the CUDA primary context that owns the model weights to the
+    /// current thread. Required before *any* raw cu*/cuda* call we make
+    /// from `DedicatedDecodePath::new`, because we do not go through
+    /// cudarc's safe wrappers (which bind on every call).
+    ///
+    /// Returns `Err` if the model isn't on a CUDA device or has no anchors.
+    fn bind_context(weights: &ModelWeights) -> candle_core::Result<()> {
+        // Find any CUDA-backed Tensor in the anchors to recover the device.
+        // Prefer the lm_head anchor (set first); fall back to the first
+        // residual or per-layer anchor.
+        let anchor = weights
+            .anchors
+            .lm_head
+            .as_ref()
+            .or_else(|| weights.anchors.residuals.first())
+            .or_else(|| {
+                weights.anchors.layers.iter().find_map(|la| {
+                    la.qkv
+                        .first()
+                        .or(la.o.as_ref())
+                        .or(la.gate.as_ref())
+                        .or(la.up.as_ref())
+                        .or(la.down.as_ref())
+                })
+            })
+            .ok_or_else(|| {
+                candle_core::Error::Msg(
+                    "DedicatedDecodePath::new: ModelWeights has no anchors — \
+                     weight extraction is broken (dangling-pointer protection \
+                     missing)".to_string(),
+                )
+            })?;
+        let device = anchor.device();
+        match device {
+            candle_core::Device::Cuda(cuda_dev) => {
+                // cudarc's CudaStream::synchronize() calls bind_to_thread()
+                // internally before doing any work. It's the cheapest safe
+                // way to ensure the context is bound on this thread.
+                cuda_dev
+                    .cuda_stream()
+                    .synchronize()
+                    .map_err(|e| candle_core::Error::Msg(format!(
+                        "Failed to bind CUDA context to dedicated-decode thread: {e}"
+                    )))?;
+                Ok(())
+            }
+            other => candle_core::bail!(
+                "DedicatedDecodePath requires a CUDA model, got {other:?}"
+            ),
+        }
     }
 
     fn compute_rope_tables(cfg: &crate::weights::DecodeConfig) -> candle_core::Result<(u64, u64)> {
@@ -181,6 +305,17 @@ impl DedicatedDecodePath {
     }
 
     /// Copy Q+K+V weights contiguously per layer for a single fused GEMV.
+    ///
+    /// PRECONDITION: every `lw.{q,k,v}_proj.ptr` must point to a CUDA buffer
+    /// owned by an anchored Tensor in `weights.anchors`. If any pointer is
+    /// dangling (e.g. extracted from a temporary `dequantize_w()` Tensor
+    /// without holding a clone), the D2D cudaMemcpy below page-faults
+    /// inside libcuda — exactly the SEGV observed in driver 570 / CUDA 12.8
+    /// before this fix. The dangling-pointer path is *not* reported as a
+    /// cudaError — the page-table walk for the source pointer faults inside
+    /// the SSE memcpy fast path (`MOVAPS [rsi+0x10]`), killing the process.
+    /// Anchors in `weights.anchors` prevent that fault by keeping the
+    /// Arc<Storage> alive.
     fn fuse_qkv(weights: &mut ModelWeights) -> candle_core::Result<()> {
         extern "C" {
             fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: u32) -> u32;
@@ -189,24 +324,37 @@ impl DedicatedDecodePath {
         let k = weights.config.hidden_size;
         let mut total_bytes = 0usize;
 
-        for lw in weights.layers.iter_mut() {
+        for (li, lw) in weights.layers.iter_mut().enumerate() {
             let qr = lw.q_proj.rows;
             let kr = lw.k_proj.rows;
             let vr = lw.v_proj.rows;
             let total_rows = qr + kr + vr;
             let total_size = total_rows * k * bf16;
 
+            // Defensive: zero pointers would faulted in cudaMemcpy and
+            // produced exactly the SEGV signature we're guarding against.
+            if lw.q_proj.ptr == 0 || lw.k_proj.ptr == 0 || lw.v_proj.ptr == 0 {
+                candle_core::bail!(
+                    "fuse_qkv layer {li}: NULL Q/K/V pointer (q={:#x} k={:#x} v={:#x}) — \
+                     weight extraction returned a dangling/unfilled pointer",
+                    lw.q_proj.ptr, lw.k_proj.ptr, lw.v_proj.ptr,
+                );
+            }
+
             let mut ptr: u64 = 0;
             let s = unsafe { cudaMalloc(&mut ptr, total_size) };
-            if s != 0 { candle_core::bail!("cudaMalloc QKV fused failed: {s}"); }
+            if s != 0 { candle_core::bail!("cudaMalloc QKV fused (layer {li}, {total_size} bytes) failed: {s}"); }
 
             unsafe {
                 let mut off = 0usize;
-                cudaMemcpy((ptr + off as u64) as *mut _, lw.q_proj.ptr as *const _, qr * k * bf16, 3);
+                let s = cudaMemcpy((ptr + off as u64) as *mut _, lw.q_proj.ptr as *const _, qr * k * bf16, 3);
+                if s != 0 { candle_core::bail!("cudaMemcpy Q→fused (layer {li}) failed: {s}"); }
                 off += qr * k * bf16;
-                cudaMemcpy((ptr + off as u64) as *mut _, lw.k_proj.ptr as *const _, kr * k * bf16, 3);
+                let s = cudaMemcpy((ptr + off as u64) as *mut _, lw.k_proj.ptr as *const _, kr * k * bf16, 3);
+                if s != 0 { candle_core::bail!("cudaMemcpy K→fused (layer {li}) failed: {s}"); }
                 off += kr * k * bf16;
-                cudaMemcpy((ptr + off as u64) as *mut _, lw.v_proj.ptr as *const _, vr * k * bf16, 3);
+                let s = cudaMemcpy((ptr + off as u64) as *mut _, lw.v_proj.ptr as *const _, vr * k * bf16, 3);
+                if s != 0 { candle_core::bail!("cudaMemcpy V→fused (layer {li}) failed: {s}"); }
             }
             lw.qkv_fused = ptr;
             lw.qkv_rows = total_rows;
