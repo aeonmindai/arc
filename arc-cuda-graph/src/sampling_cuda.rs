@@ -614,7 +614,7 @@ mod tests {
                 .collect();
             let counts = vec![0u32; vocab];
 
-            // Two configs that previously trigggered silent truncation:
+            // Two configs that previously triggered silent truncation:
             //   1. top_k disabled + top_p=0.95 (the "natural" diffuse case)
             //   2. top_k disabled + top_p=1.0  (full distribution sampling)
             let configs = [
