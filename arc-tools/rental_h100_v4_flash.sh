@@ -12,7 +12,10 @@
 #   scp arc-tools/rental_h100_v4_flash.sh root@<box>:/tmp/ && ssh root@<box> bash /tmp/rental_h100_v4_flash.sh
 #
 # Exits non-zero on any failure with a clear marker line so an orchestrator
-# can grep `FAIL:` and diagnose without parsing the whole log.
+# can grep `FAIL:` and diagnose without parsing the whole log. On failure: fix
+# the cause and RE-RUN the same command — completed steps (installs, clone,
+# incremental cargo build, downloaded weights) are skipped. The FAIL: markers
+# map to concrete recovery actions in arc-tools/RENTAL_PLAYBOOK.md → "Recovery".
 
 set -uo pipefail
 
@@ -104,9 +107,14 @@ step "5/9 pull V4 Flash weights (148 GB FP4, ~75 shards). Idempotent — resumes
 export HF_HOME=${HF_HOME:-/ephemeral/hf_cache}
 export HF_HUB_DISABLE_TELEMETRY=1
 V4_DIR="$MODELS/DeepSeek-V4-Flash"
-if [ ! -f "$V4_DIR/model.safetensors.index.json" ]; then
-  hf download "$V4_MODEL" --local-dir "$V4_DIR" 2>&1 | tail -5 || fail "v4 flash download"
-fi
+# ALWAYS invoke hf download — it is idempotent and *resumes*: it re-checks every
+# shard against the local cache and only fetches what is missing or truncated.
+# Do NOT gate this on index.json existence. index.json lands early in the pull,
+# so a run preempted mid-download (the common case on a 148 GB / ~75-shard fetch)
+# would otherwise be skipped here, leaving truncated shards. arc validate (step 6)
+# checks the index *keyset* only, not shard bytes, so it would pass on a partial
+# tree and the failure would not surface until step 8 — after wasting probe time.
+hf download "$V4_MODEL" --local-dir "$V4_DIR" 2>&1 | tail -5 || fail "v4 flash download (re-run to resume — completed shards are skipped)"
 [ -f "$V4_DIR/model.safetensors.index.json" ] || fail "V4 index missing after download"
 ok "V4 Flash at $V4_DIR ($(du -sh "$V4_DIR" | awk '{print $1}'))"
 
@@ -115,9 +123,8 @@ step "6/9 arc validate — schema check against deepseekv4 arch"
 ok "schema OK"
 
 step "7a/9 probe-tiny: Qwen 2.5-0.5B BF16 (no ISQ) — dispatch smoke. Should produce text."
-if [ ! -f "$MODELS/Qwen2.5-0.5B-Instruct/model.safetensors" ]; then
-  hf download "$PROBE_TINY" --local-dir "$MODELS/Qwen2.5-0.5B-Instruct" 2>&1 | tail -3 || fail "probe-tiny download"
-fi
+# Idempotent + resumes; see the step-5 note on why we don't skip on a sentinel file.
+hf download "$PROBE_TINY" --local-dir "$MODELS/Qwen2.5-0.5B-Instruct" 2>&1 | tail -3 || fail "probe-tiny download (re-run to resume)"
 printf 'Say hello in 5 words.\n\\quit\n' | timeout 180 ./target/release/mistralrs run \
   --max-seq-len 512 --max-seqs 1 --paged-attn off \
   -m "$MODELS/Qwen2.5-0.5B-Instruct" -a qwen2 2>&1 | tail -8 | tee /tmp/probe_tiny.log
@@ -129,9 +136,8 @@ step "7b/9 probe-mid: Qwen 2.5-7B + ISQ qtip2 — proves QTIP integrated stack p
 # forward path that V4 Flash will use. If this produces garbled text but the
 # decode-rate is high, we know QTIP composition is lossy *before* burning
 # rental time on a 148 GB model.
-if [ ! -d "$MODELS/Qwen2.5-7B-Instruct" ] || [ -z "$(ls -A "$MODELS/Qwen2.5-7B-Instruct"/*.safetensors 2>/dev/null)" ]; then
-  hf download "$PROBE_MID" --local-dir "$MODELS/Qwen2.5-7B-Instruct" 2>&1 | tail -3 || fail "probe-mid download"
-fi
+# Idempotent + resumes; see the step-5 note on why we don't skip on a sentinel file.
+hf download "$PROBE_MID" --local-dir "$MODELS/Qwen2.5-7B-Instruct" 2>&1 | tail -3 || fail "probe-mid download (re-run to resume)"
 PROBE_MID_LOG=/tmp/probe_mid.log
 printf 'Complete this sentence: The capital of France is\n\\quit\n' | timeout 1800 ./target/release/mistralrs run \
   --isq qtip2 \
