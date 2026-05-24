@@ -1,0 +1,129 @@
+name: flash-attn compile check (no GPU)
+
+# WHY THIS EXISTS
+# ----------------
+# The companion gate cuda_compile_check.yaml compiles Arc's own CUDA kernels
+# (QTIP + arc-cuda-graph) with `--features cuda` only. The *rental* build, by
+# contrast, uses `--features "cuda flash-attn"` (rental_h100_v4_flash.sh step 4,
+# arc-tools/cuda_compile_check.sh). The `flash-attn` feature pulls in
+# candle-flash-attn (mistralrs-core/Cargo.toml: flash-attn = ["cuda",
+# "dep:candle-flash-attn"]), whose build.rs runs nvcc on the Flash-Attention v2
+# kernels. Until now that nvcc compile first happened on a *paid GPU box*, so a
+# flash-attn-specific compile error (cutlass/header drift, an unsupported arch,
+# an FFI signature change) would only surface after the rental was already
+# running — exactly the failure mode cuda_compile_check.yaml was created to kill,
+# but for the one feature it does not cover.
+#
+# Compiling flash-attn does NOT require a GPU — only nvcc + a target arch. We
+# build mistralrs-core as a LIBRARY (`--lib`): candle-flash-attn's build.rs runs
+# nvcc on every FA .cu file for the matrix arch, but no binary is produced, so
+# there is no final `-lcuda` driver link (absent on a GPU-less runner). Green
+# here => the rental's step-4 `--features "cuda flash-attn"` build will not fail
+# on a flash-attn *compile* error for the selected arch.
+#
+# SCOPE / HONESTY
+# ----------------
+# * COMPILATION ONLY. No GPU is present; no FA kernel executes. Runtime
+#   correctness of flash-attn on Hopper is validated by the model run on the
+#   rental (rental_h100_v4_flash.sh step 7b/8), not here.
+# * This does NOT perform the final binary link with the exact rental feature
+#   combo — that (`-lcuda` + ample RAM) is still only exercised on the build box
+#   by arc-tools/cuda_compile_check.sh with FEATURES="cuda flash-attn".
+# * Manual (workflow_dispatch) only: the flash-attn kernel compile is heavy
+#   (large nvcc instantiation set). Keeping it off the push path means it can
+#   never make the per-commit cuda gate slow or flaky; run it before a rental.
+
+on:
+  workflow_dispatch:
+    inputs:
+      compute_cap:
+        description: "Target compute capability (90 = H100/Hopper rental target, 80 = A100)"
+        required: false
+        default: "90"
+        type: choice
+        options:
+          - "90"
+          - "80"
+
+# Bound parallelism: candle-flash-attn spawns many nvcc instantiations and each
+# is memory-hungry. One codegen unit at a time trades wall-time for not OOMing.
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "1"
+  RAYON_NUM_THREADS: "2"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  flash-attn-compile:
+    name: nvcc flash-attn compile (sm_${{ github.event.inputs.compute_cap }})
+    runs-on: ubuntu-latest
+    # The FA kernel set can take a while on a hosted runner; give it room but
+    # cap it so a hang fails the gate instead of burning the 6h job ceiling.
+    timeout-minutes: 180
+    env:
+      CUDA_COMPUTE_CAP: ${{ github.event.inputs.compute_cap }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          # FA build dir + CUDA toolkit need headroom; reclaim ~20 GB from
+          # preinstalled toolchains we don't use.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
+
+      - name: Install CUDA toolkit (no driver, no GPU)
+        uses: Jimver/cuda-toolkit@v0.2.35
+        id: cuda-toolkit
+        with:
+          cuda: "12.4.1"
+          method: "local"
+          linux-local-args: '["--toolkit"]'
+
+      - name: CUDA + link-path setup
+        run: |
+          echo "CUDA_COMPUTE_CAP=$CUDA_COMPUTE_CAP"
+          which nvcc
+          nvcc --version
+          # Put the driver stub on the linker path so any transitive `-lcuda`
+          # resolves even though no GPU/driver is present.
+          CUDA_ROOT="${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
+          echo "LIBRARY_PATH=${CUDA_ROOT}/lib64/stubs:${CUDA_ROOT}/lib64:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=${CUDA_ROOT}/lib64/stubs:${CUDA_ROOT}/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libssl-dev pkg-config
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: flash-attn-cc${{ github.event.inputs.compute_cap }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            flash-attn-cc${{ github.event.inputs.compute_cap }}-
+
+      # ---- The gate. `flash-attn` implies `cuda`, so this runs nvcc on both the
+      #      candle-flash-attn FA kernels AND Arc's quant/cuda-graph kernels (via
+      #      the mistralrs-core dep tree). `--lib` keeps it a pure rlib build, so
+      #      no final `-lcuda` link is attempted — GPU-less-safe.
+      - name: Compile mistralrs-core with flash-attn (nvcc, no GPU)
+        run: cargo build -p mistralrs-core --lib --features flash-attn
+
+      - name: Result
+        run: |
+          echo "flash-attn kernels compiled for sm_${CUDA_COMPUTE_CAP}."
+          echo "The rental step-4 'cuda flash-attn' build will not fail on a"
+          echo "flash-attn COMPILE error for this arch. Runtime + final -lcuda"
+          echo "link are still validated on the box (cuda_compile_check.sh / rental)."

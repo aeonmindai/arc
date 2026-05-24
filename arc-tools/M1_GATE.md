@@ -90,7 +90,7 @@ hours.
 
 - [ ] `./arc-tools/preflight.sh` → `✓ ALL CHECKS PASSED` (CPU-only; compiles no CUDA)
 - [ ] `gh workflow run "CUDA compile check (no GPU)" -R aeonmindai/arc && gh run watch -R aeonmindai/arc` → green (sm_80 + sm_90 nvcc). `-R` required: dual-remote clones resolve `gh` to upstream otherwise.
-- [ ] (optional, closes the flash-attn gap for free) `CUDA_COMPUTE_CAP=90 FEATURES="cuda flash-attn" bash arc-tools/cuda_compile_check.sh`
+- [ ] closes the flash-attn gap for free (one-click): `gh workflow run "flash-attn compile check (no GPU)" -R aeonmindai/arc && gh run watch -R aeonmindai/arc` → green (sm_90 nvcc). On a borrowed nvcc box instead: `CUDA_COMPUTE_CAP=90 FEATURES="cuda flash-attn" bash arc-tools/cuda_compile_check.sh`.
 
 **On the box — gate steps:**
 
