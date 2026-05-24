@@ -291,13 +291,14 @@ pub fn get_device_layers(
                 other => other,
             };
 
+            let cache_type = paged_attn_config
+                .map(|cfg| cfg.cache_type)
+                .unwrap_or_default();
             let cache = calculate_cache_config(
                 effective_mem_gpu,
                 Some(cfg.block_size.unwrap_or(DEFAULT_PAGED_ATTENTION_BLOCK_SIZE)),
                 dtype,
-                paged_attn_config
-                    .map(|cfg| cfg.cache_type)
-                    .unwrap_or_default(),
+                cache_type,
                 &*model_cfg,
                 &devices[0],
                 &devices.iter().map(|d| Some(d.clone())).collect::<Vec<_>>(),
@@ -305,12 +306,52 @@ pub fn get_device_layers(
                 Some(total_model_size_in_bytes),
                 Some(max_seq_len * max_batch_size),
             )?;
-            let key_shape = calculate_key_block_shape(&*model_cfg, dtype, cache.block_size);
-            let key_sz =
-                cache.num_gpu_blocks * key_shape.0 * key_shape.1 * key_shape.2 * key_shape.3;
-            let val_shape = calculate_value_block_shape(&*model_cfg, cache.block_size);
-            let val_sz = cache.num_gpu_blocks * val_shape.0 * val_shape.1 * val_shape.2;
-            key_sz + val_sz
+            // For TurboQuant cache, the standard `calculate_*_block_shape`
+            // returns BF16-equivalent shapes which overcount actual HBM use
+            // by ~4×. That overcount cascades into the per-layer placement
+            // check (line ~398: `delta = sz + kv_cache_bytes`) and falsely
+            // rejects models that actually fit. Compute the true packed
+            // bytes per block when TurboQuant is active.
+            //
+            // Matches the K4/V3 formula in `calculate_cache_config`:
+            //   bytes_per_tok_per_layer = kv_heads * (k/2 + ceil(v/10)*4 + 4)
+            if cache_type.is_turboquant() {
+                let kv_heads = model_cfg.num_kv_heads();
+                let k_packed = model_cfg.k_head_dim() / 2;
+                let v_packed = (model_cfg.v_head_dim().div_ceil(10)) * 4;
+                let norms = 2 * 2;
+                let bytes_per_tok_per_layer = kv_heads * (k_packed + v_packed + norms);
+                // The placement loop treats `kv_cache_bytes` as per-layer
+                // (multiplies by num_layers when summing). For TurboQuant
+                // num_gpu_blocks is also per-layer. So per-layer KV bytes =
+                // num_gpu_blocks × block_size × bytes_per_tok_per_layer, and
+                // the caller's `kv_cache_elems * dtype.size_in_bytes()`
+                // wrapper would double-multiply by dtype_size. Return a
+                // pre-scaled `kv_cache_elems` such that ×dtype_size yields
+                // the correct packed bytes.
+                let packed_bytes_per_layer =
+                    cache.num_gpu_blocks * cache.block_size * bytes_per_tok_per_layer;
+                let elems = packed_bytes_per_layer / dtype.size_in_bytes().max(1);
+                info!(
+                    "Auto device-map TurboQuant per-layer KV: {} MB packed (vs BF16-equivalent {} MB)",
+                    packed_bytes_per_layer / (1024 * 1024),
+                    {
+                        let key_shape = calculate_key_block_shape(&*model_cfg, dtype, cache.block_size);
+                        let key_sz = cache.num_gpu_blocks * key_shape.0 * key_shape.1 * key_shape.2 * key_shape.3;
+                        let val_shape = calculate_value_block_shape(&*model_cfg, cache.block_size);
+                        let val_sz = cache.num_gpu_blocks * val_shape.0 * val_shape.1 * val_shape.2;
+                        (key_sz + val_sz) * dtype.size_in_bytes() / (1024 * 1024)
+                    },
+                );
+                elems
+            } else {
+                let key_shape = calculate_key_block_shape(&*model_cfg, dtype, cache.block_size);
+                let key_sz =
+                    cache.num_gpu_blocks * key_shape.0 * key_shape.1 * key_shape.2 * key_shape.3;
+                let val_shape = calculate_value_block_shape(&*model_cfg, cache.block_size);
+                let val_sz = cache.num_gpu_blocks * val_shape.0 * val_shape.1 * val_shape.2;
+                key_sz + val_sz
+            }
         }
         None => {
             let key_shape = [
