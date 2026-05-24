@@ -39,6 +39,26 @@ use crate::{
 
 use super::{AutoDeviceMapParams, DeviceMappedModelLoader};
 
+/// Read the active TD-MoE rank from the `ARC_TD_MOE_RANK` env var. Returns
+/// `None` if the env var is unset, empty, unparsable, or below the minimum
+/// `4`. Used by V4-family device-mapping accounting to switch MoE expert
+/// stacks between dense and factored-storage element counts. This mirrors
+/// the parsing logic in `arc-engine::td_moe_loader::parse_env_rank`; we
+/// duplicate it (rather than depend on `arc-engine` from `mistralrs-core`)
+/// because the latter is the dependency root.
+fn read_td_moe_rank() -> Option<usize> {
+    let raw = std::env::var("ARC_TD_MOE_RANK").ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let parsed: usize = raw.parse().ok()?;
+    if parsed < 4 {
+        return None;
+    }
+    Some(parsed)
+}
+
 pub trait NormalModel: IsqModel + AnyMoeBaseModelMixin {
     #[allow(clippy::too_many_arguments)]
     fn forward(
@@ -47,7 +67,10 @@ pub trait NormalModel: IsqModel + AnyMoeBaseModelMixin {
         seqlen_offsets: &[usize],
         context_lens: Vec<(usize, usize)>,
         position_ids: Vec<usize>,
-        metadata: Option<(Vec<(Tensor, Tensor, Option<Tensor>, Option<Tensor>)>, &PagedAttentionInputMetadata)>,
+        metadata: Option<(
+            Vec<(Tensor, Tensor, Option<Tensor>, Option<Tensor>)>,
+            &PagedAttentionInputMetadata,
+        )>,
         flash_params: &FlashParams,
     ) -> candle_core::Result<Tensor>;
     #[allow(clippy::too_many_arguments)]
@@ -78,9 +101,7 @@ pub trait NormalModel: IsqModel + AnyMoeBaseModelMixin {
     /// this to expose their `embed_tokens`, `lm_head`, and `h_proj`/`e_proj`
     /// projections so a [`crate::pipeline::MtpSpeculativePipeline`] can be
     /// constructed.
-    fn mtp_decode_kit(
-        &self,
-    ) -> Option<crate::pipeline::mtp_pipeline::MtpDecodeKit> {
+    fn mtp_decode_kit(&self) -> Option<crate::pipeline::mtp_pipeline::MtpDecodeKit> {
         None
     }
 }
@@ -3183,10 +3204,7 @@ impl NormalModelLoader for DeepSeekV4Loader {
         //
         // The wrapper is no-op for HF-style checkpoints (the original name
         // exists directly), so this is safe to apply unconditionally.
-        let vb = mistralrs_quant::attach_rename_rules(
-            vb,
-            mistralrs_quant::v4_scale_rename_rules(),
-        );
+        let vb = mistralrs_quant::attach_rename_rules(vb, mistralrs_quant::v4_scale_rename_rules());
         Ok(Box::new(models::deepseek4::DeepSeekV4::new(
             &cfg,
             vb,
@@ -3277,7 +3295,11 @@ impl DeviceMappedModelLoader for DeepSeekV4Loader {
             anyhow::bail!("Expected text AutoDeviceMapParams for V4")
         };
         let cfg: crate::models::deepseek4::DeepSeekV4Config = serde_json::from_str(config)?;
-        Ok(max_batch_size * cfg.num_attention_heads * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2))
+        Ok(
+            max_batch_size
+                * cfg.num_attention_heads
+                * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2),
+        )
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -3327,14 +3349,10 @@ impl DeviceMappedModelLoader for DeepSeekV4Loader {
                 Some(lora_rank) => {
                     let a = cfg.hidden_size * lora_rank / weight_pack_factor;
                     let norm = lora_rank;
-                    let b = (cfg.num_attention_heads * head_dim) * lora_rank
-                        / weight_pack_factor;
+                    let b = (cfg.num_attention_heads * head_dim) * lora_rank / weight_pack_factor;
                     a + norm + b
                 }
-                None => {
-                    (cfg.num_attention_heads * head_dim) * cfg.hidden_size
-                        / weight_pack_factor
-                }
+                None => (cfg.num_attention_heads * head_dim) * cfg.hidden_size / weight_pack_factor,
             };
             // V4 K/V: SINGLE fused wkv (hidden → head_dim). No LoRA-A/B split.
             // Audit §0 + §5 lines 477-482. No `kv_b_proj` at all.
@@ -3355,9 +3373,36 @@ impl DeviceMappedModelLoader for DeepSeekV4Loader {
                 }) {
                     let h = cfg.hidden_size;
                     let i = cfg.moe_intermediate_size;
-                    let gate = h * i / weight_pack_factor * n_routed_experts;
-                    let up = h * i / weight_pack_factor * n_routed_experts;
-                    let down = i * h / weight_pack_factor * n_routed_experts;
+                    // Routed expert stack accounting. When TD-MoE is active
+                    // (`ARC_TD_MOE_RANK` env var, value ≥ 4) the routed
+                    // experts are stored in Tucker-factored form instead of
+                    // dense, so the [E, d_out, d_in] cost collapses to
+                    // `r^3 + E*r + d_out*r + d_in*r`. We honour the rank to
+                    // produce an accurate device-mapping budget.
+                    let routed_elems = if let Some(rank) = read_td_moe_rank() {
+                        // Tucker ranks clamp to dim per axis.
+                        let r1 = rank.min(n_routed_experts);
+                        let r2_gate = rank.min(i);
+                        let r3_gate = rank.min(h);
+                        let r2_down = rank.min(h);
+                        let r3_down = rank.min(i);
+                        // gate + up share `[E, i, h]`; down is `[E, h, i]`.
+                        let gate_factored = r1 * r2_gate * r3_gate
+                            + n_routed_experts * r1
+                            + i * r2_gate
+                            + h * r3_gate;
+                        let up_factored = gate_factored;
+                        let down_factored = r1 * r2_down * r3_down
+                            + n_routed_experts * r1
+                            + h * r2_down
+                            + i * r3_down;
+                        gate_factored + up_factored + down_factored
+                    } else {
+                        let gate = h * i / weight_pack_factor * n_routed_experts;
+                        let up = h * i / weight_pack_factor * n_routed_experts;
+                        let down = i * h / weight_pack_factor * n_routed_experts;
+                        gate + up + down
+                    };
                     let shared = if let Some(ns) = cfg.n_shared_experts {
                         // V4 uses moe_intermediate_size * n_shared_experts
                         // for the shared expert (audit §0 + V4 Flash config).
@@ -3369,7 +3414,7 @@ impl DeviceMappedModelLoader for DeepSeekV4Loader {
                     } else {
                         0
                     };
-                    sum += gate + up + down + shared + n_routed_experts * cfg.hidden_size;
+                    sum += routed_elems + shared + n_routed_experts * cfg.hidden_size;
                 } else if let Some(i) = cfg.intermediate_size {
                     // Dense MLP fallback (V3-style fixtures only;
                     // unreachable for V4 Flash since first_k_dense_replace=0).
@@ -3379,12 +3424,20 @@ impl DeviceMappedModelLoader for DeepSeekV4Loader {
                 sum
             };
             per_layer_elems.push(
-                input_layernorm + post_attention_layernorm
-                    + q_proj + kv_norm + wkv
-                    + wo_a + wo_b + moe_block,
+                input_layernorm
+                    + post_attention_layernorm
+                    + q_proj
+                    + kv_norm
+                    + wkv
+                    + wo_a
+                    + wo_b
+                    + moe_block,
             );
         }
-        Ok(per_layer_elems.into_iter().map(|x| x * dtype.size_in_bytes()).collect())
+        Ok(per_layer_elems
+            .into_iter()
+            .map(|x| x * dtype.size_in_bytes())
+            .collect())
     }
     fn num_layers(&self, config: &str) -> Result<usize> {
         let cfg: crate::models::deepseek4::DeepSeekV4Config = serde_json::from_str(config)?;
@@ -5432,7 +5485,6 @@ impl DeviceMappedModelLoader for Qwen3NextLoader {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5454,9 +5506,8 @@ mod tests {
             "KimiK26VLForConditionalGeneration",
         ];
         for v in &variants {
-            let tp = NormalLoaderType::from_causal_lm_name(v).unwrap_or_else(
-                |_| panic!("{v} should map to KimiK2"),
-            );
+            let tp = NormalLoaderType::from_causal_lm_name(v)
+                .unwrap_or_else(|_| panic!("{v} should map to KimiK2"));
             assert!(matches!(tp, NormalLoaderType::KimiK2));
         }
     }
@@ -5624,7 +5675,7 @@ mod tests {
         // V4-specific fields preserved
         assert_eq!(v4_cfg.compress_ratios.len(), 27);
         assert_eq!(v4_cfg.compress_ratios[3], 128); // HCA layer
-        assert_eq!(v4_cfg.compress_ratios[4], 4);   // CSA layer
+        assert_eq!(v4_cfg.compress_ratios[4], 4); // CSA layer
         assert_eq!(v4_cfg.sliding_window, 128);
         assert_eq!(v4_cfg.o_lora_rank, Some(1024));
         assert_eq!(v4_cfg.o_groups, Some(8));
@@ -5632,8 +5683,7 @@ mod tests {
         assert_eq!(v4_cfg.v_head_dim, Some(512));
 
         // Dispatcher constructs V4Loader (not V3Loader)
-        let _loader = AutoNormalLoader::get_loader(cfg)
-            .expect("V4 dispatch should succeed");
+        let _loader = AutoNormalLoader::get_loader(cfg).expect("V4 dispatch should succeed");
     }
 
     /// V4 per-layer compress_ratio lookup.
@@ -5649,12 +5699,13 @@ mod tests {
             "kv_lora_rank": 512, "v_head_dim": 512, "n_group": 8, "topk_group": 4,
             "compress_ratios": [0, 4, 128, 0]
         }"#;
-        let cfg: crate::models::deepseek4::DeepSeekV4Config = serde_json::from_str(cfg_str).unwrap();
-        assert_eq!(cfg.layer_compress_ratio(0), 0);   // standard MLA
-        assert_eq!(cfg.layer_compress_ratio(1), 4);   // CSA
+        let cfg: crate::models::deepseek4::DeepSeekV4Config =
+            serde_json::from_str(cfg_str).unwrap();
+        assert_eq!(cfg.layer_compress_ratio(0), 0); // standard MLA
+        assert_eq!(cfg.layer_compress_ratio(1), 4); // CSA
         assert_eq!(cfg.layer_compress_ratio(2), 128); // HCA
-        assert_eq!(cfg.layer_compress_ratio(3), 0);   // standard
-        // Out of bounds → standard
+        assert_eq!(cfg.layer_compress_ratio(3), 0); // standard
+                                                    // Out of bounds → standard
         assert_eq!(cfg.layer_compress_ratio(99), 0);
     }
 
@@ -5750,4 +5801,3 @@ mod tests {
         assert_eq!(v3_cfg.num_hidden_layers, 92);
     }
 }
-

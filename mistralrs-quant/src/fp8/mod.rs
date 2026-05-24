@@ -47,7 +47,8 @@ impl QuantMethod for FP8Linear {
             | QuantMethodConfig::Afq { .. }
             | QuantMethodConfig::MXFP4 { .. }
             | QuantMethodConfig::NVFP4 { .. }
-            | QuantMethodConfig::Qtip { .. } => unreachable!(),
+            | QuantMethodConfig::Qtip { .. }
+            | QuantMethodConfig::TuckerFactored { .. } => unreachable!(),
             QuantMethodConfig::FP8 { lin, dtype } => {
                 let QuantizationResult {
                     qw,

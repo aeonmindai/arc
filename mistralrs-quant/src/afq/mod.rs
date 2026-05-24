@@ -109,7 +109,8 @@ impl QuantMethod for AfqLayer {
             | QuantMethodConfig::Unquantized(_)
             | QuantMethodConfig::MXFP4 { .. }
             | QuantMethodConfig::NVFP4 { .. }
-            | QuantMethodConfig::Qtip { .. } => unreachable!(),
+            | QuantMethodConfig::Qtip { .. }
+            | QuantMethodConfig::TuckerFactored { .. } => unreachable!(),
             QuantMethodConfig::Afq {
                 weight,
                 bias,

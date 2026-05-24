@@ -344,7 +344,8 @@ impl QuantMethod for GptqLayer {
             | QuantMethodConfig::Afq { .. }
             | QuantMethodConfig::MXFP4 { .. }
             | QuantMethodConfig::NVFP4 { .. }
-            | QuantMethodConfig::Qtip { .. } => {
+            | QuantMethodConfig::Qtip { .. }
+            | QuantMethodConfig::TuckerFactored { .. } => {
                 unreachable!()
             }
         }

@@ -60,7 +60,8 @@ impl QuantMethod for MXFP4Layer {
             | QuantMethodConfig::Unquantized(_)
             | QuantMethodConfig::Afq { .. }
             | QuantMethodConfig::NVFP4 { .. }
-            | QuantMethodConfig::Qtip { .. } => unreachable!(),
+            | QuantMethodConfig::Qtip { .. }
+            | QuantMethodConfig::TuckerFactored { .. } => unreachable!(),
             QuantMethodConfig::MXFP4 {
                 blocks,
                 scales,

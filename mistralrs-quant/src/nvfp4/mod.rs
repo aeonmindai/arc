@@ -444,7 +444,8 @@ impl QuantMethod for NVFP4Layer {
             | QuantMethodConfig::Unquantized(_)
             | QuantMethodConfig::Afq { .. }
             | QuantMethodConfig::MXFP4 { .. }
-            | QuantMethodConfig::Qtip { .. } => {
+            | QuantMethodConfig::Qtip { .. }
+            | QuantMethodConfig::TuckerFactored { .. } => {
                 candle_core::bail!("NVFP4Layer requires QuantMethodConfig::NVFP4")
             }
             QuantMethodConfig::NVFP4 {
@@ -884,7 +885,10 @@ mod tests {
 
         let layer = NVFP4Layer::quantize(&weight, None, &device)?;
         let dequant = layer.dequantize_w()?;
-        let dequant_f32 = dequant.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let dequant_f32 = dequant
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
 
         // Check that reconstruction is within reasonable bounds.
         // FP4 has 8 magnitudes per sign × per-block FP8 scale = ~5-7% per-element error
