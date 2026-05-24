@@ -183,7 +183,7 @@ if [[ -n "$MODEL" ]]; then
     elif [[ "$MODEL" == *"GLM-5"* ]] || [[ "$MODEL" == *"glm-5"* ]] || [[ "$MODEL" == *"glm5"* ]]; then
         ARCH="glm5moedsa"
     else
-        warn "Cannot auto-detect architecture from `$MODEL` — skip schema check"
+        warn "Cannot auto-detect architecture from '$MODEL' — skip schema check"
     fi
 
     if [[ -n "$ARCH" ]]; then

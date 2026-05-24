@@ -2,15 +2,42 @@
 
 Day-1 checklist for spinning up an Arc inference engine on rented Blackwell hardware.
 
-## Pre-rental check (5 minutes, free)
+## Pre-rental check (free — do BOTH before you pay for a box)
 
-On your local box, verify the offline test suite is green:
+Arc is developed on Apple Silicon, so the CUDA path is never compiled by a Mac
+build. Two independent **free** gates catch problems before the rental meter
+starts; run both.
+
+**1. Offline CPU suite (local, ~5 min)** — verifies the Rust logic + offline tests:
 
 ```bash
 ./arc-tools/preflight.sh
 ```
 
-Expected: `✓ ALL CHECKS PASSED` with ~200 tests across arc-engine, mistralrs-quant, arc-cuda-graph.
+Expected: `✓ ALL CHECKS PASSED` with ~250 tests across arc-engine, mistralrs-quant,
+arc-cuda-graph. **This compiles no CUDA code** — it is CPU-only, so a green
+preflight says nothing about whether the CUDA build will succeed.
+
+**2. Free CUDA compile gate (GitHub Actions, no GPU)** — cross-compiles the
+QTIP + arc-cuda-graph kernels for sm_80 **and** sm_90 with only `nvcc`:
+
+```bash
+gh workflow run "CUDA compile check (no GPU)" && gh run watch
+```
+
+Green means the rental's step-4 `cargo build --features cuda` will not fail on an
+Arc `cuda`-feature *compile* error. See **[CUDA_VALIDATION.md](CUDA_VALIDATION.md)**
+for the full three-gate story (CI → Colab → paid-box kernel runtime).
+
+> ⚠️ **flash-attn is not covered by the free gates.** Both free gates compile the
+> `cuda` feature only. The rental build — and `preflight.sh --cuda` in Hour 0
+> below — use `cuda flash-attn`, and the `flash-attn`-gated code is otherwise
+> first compiled on the rented box. To close that gap for free, run it on any box
+> with `nvcc` (a free Colab works; flash-attn just makes the build slower):
+>
+> ```bash
+> CUDA_COMPUTE_CAP=90 FEATURES="cuda flash-attn" bash arc-tools/cuda_compile_check.sh
+> ```
 
 ## Hour 0: rental host setup (60 minutes)
 
@@ -33,10 +60,12 @@ Expected: `✓ ALL CHECKS PASSED` with ~200 tests across arc-engine, mistralrs-q
    - `✓ nvidia driver 575.X`
    - `✓ GPU: NVIDIA B200`
    - `✓ core crates build clean`
-   - `✓ arc-engine: 123 tests`
-   - `✓ mistralrs-quant: 58 tests`
-   - `✓ arc-cuda-graph: 11 tests`
+   - `✓ arc-engine: ~136 tests`
+   - `✓ mistralrs-quant: ~87 tests`
+   - `✓ arc-cuda-graph: ~28 tests`
    - `✓ mistralrs-core builds with --features cuda`
+
+   (Counts grow as tests are added — the gate is `0 failed`, not an exact number.)
 
    **If CUDA build fails:** check `cargo build -p mistralrs-core --features cuda 2>&1` output. Common issues:
    - PTX target mismatch — set `CUDA_COMPUTE_CAP=100` for B200 (SM100)

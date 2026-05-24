@@ -17,9 +17,11 @@ name: CUDA compile check (no GPU)
 # nvidia-smi), so a GPU-less runner cross-compiles the kernels for the
 # rental's real arch (sm_80 = A100, sm_90 = H100/Hopper).
 #
-# Green here => the rental's step-4 build will not fail on an Arc CUDA *compile*
-# error for sm_80/sm_90. (It does not cover nvcc-version-specific differences if
-# the rental box ships a CUDA toolkit other than the 12.4 pinned below.)
+# Green here => the rental's step-4 build will not fail on an Arc `cuda`-feature
+# *compile* error for sm_80/sm_90. (It does NOT compile the `flash-attn` feature
+# or link the CLI binaries — that combo is covered by arc-tools/cuda_compile_check.sh
+# with FEATURES="cuda flash-attn"; and it does not cover nvcc-version-specific
+# differences if the rental box ships a CUDA toolkit other than the 12.4 pinned below.)
 #
 # SCOPE / HONESTY
 # ----------------

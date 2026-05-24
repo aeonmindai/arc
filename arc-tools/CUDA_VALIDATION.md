@@ -17,8 +17,8 @@ sm_90 = H100/Hopper).
 
 | Gate | Where | GPU? | Cost | Catches |
 |------|-------|------|------|---------|
-| 1. `cuda_compile_check.yaml` | GitHub Actions | No | Free, automatic | nvcc errors, FFI drift, feature-gated Rust compile errors — for sm_80 **and** sm_90 |
-| 2. `colab_cuda_build_check.ipynb` | Google Colab | nvcc only | Free, manual | Same as gate 1, second free path; also runtime tests **iff** Colab gives sm_80+ |
+| 1. `cuda_compile_check.yaml` | GitHub Actions | No | Free, automatic | nvcc errors, FFI drift, `cuda`-feature Rust compile errors in the **library** crates — for sm_80 **and** sm_90. Does **not** compile `flash-attn` or link the CLI binaries (see "flash-attn coverage" below). |
+| 2. `colab_cuda_build_check.ipynb` | Google Colab | nvcc only | Free, manual | Same as gate 1, plus it *links the CLI binaries* (`cuda_compile_check.sh` step 4, `FEATURES=cuda`); also runtime tests **iff** Colab gives sm_80+ |
 | 3. `cuda_compile_check.sh` (GPU mode) + rental step 4b | Rental / sm_80+ box | Yes | Paid box | Kernel **runtime**: parity, the prefix-grouped Viterbi quantize kernel actually running, no hang |
 
 ### What CANNOT be done for free, and why
@@ -29,6 +29,20 @@ sm_80+ device — the paid rental, or a Colab Pro A100. We do not pretend
 otherwise. Everything *compilable* is validated for free; only *execution* of
 the sm_80 kernels needs the paid box.
 
+### flash-attn coverage — not free by default
+The rental's step-4 build is `cargo build -p arc-cli -p mistralrs-cli --features
+"cuda flash-attn"`. Both free gates above compile the **`cuda` feature only** —
+gate 1 builds the library crates, gate 2 also links the CLI binaries, but neither
+turns on `flash-attn`. So a compile error gated specifically behind `flash-attn`
+(not `cuda`) is first seen on the paid box at step 4 (or in `preflight.sh --cuda`,
+which also runs on the rented host). To close that gap for free, run the full
+feature set on any box with `nvcc` — a free Colab works, flash-attn just makes
+the build slower (force sm_90 to avoid the sub-sm_80 `qtip_*.cu` footgun noted at
+the bottom of this doc):
+```bash
+CUDA_COMPUTE_CAP=90 FEATURES="cuda flash-attn" bash arc-tools/cuda_compile_check.sh
+```
+
 ## Pre-rental checklist (do this, then the rental only runs one command)
 
 1. **Watch GitHub Actions go green.** `cuda_compile_check.yaml` runs on every
@@ -38,7 +52,9 @@ the sm_80 kernels needs the paid box.
    gh workflow run "CUDA compile check (no GPU)"
    gh run watch
    ```
-   Green = the rental's step-4 build will not fail on Arc CUDA code.
+   Green = the rental's step-4 build will not fail on an Arc `cuda`-feature
+   *compile* error. It does **not** cover the `flash-attn` feature or the final
+   CLI-binary link — see "flash-attn coverage" above to close that gap for free.
 
 2. **(Optional) Colab second opinion.** Open
    `arc-tools/colab_cuda_build_check.ipynb` in Colab, set the commit, Run all.
