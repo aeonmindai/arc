@@ -72,4 +72,50 @@ extern "C" {
         block_size: i32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
+
+    // ----- Quantize-side kernels (RUN-quant-on-gpu): rotate weight rows,
+    // compute per-row scales, greedy + Viterbi DP quantizers. F32 only — the
+    // quantize path always converts the input weight to FP32 first.
+    pub(crate) fn launch_qtip_rotate_weight_rows_f32(
+        d_weight: *mut f32,
+        d_signs: *const f32,
+        n_rows: i32,
+        in_features: i32,
+        block_size: i32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
+    pub(crate) fn launch_qtip_compute_row_scales_f32(
+        d_weight: *const f32,
+        d_row_scales: *mut f32,
+        n_rows: i32,
+        in_features: i32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
+    pub(crate) fn launch_qtip_quantize_rows_greedy_f32(
+        d_weight: *const f32,
+        d_lut: *const f32,
+        d_row_scales: *const f32,
+        d_packed: *mut u8,
+        n_rows: i32,
+        in_features: i32,
+        num_symbols: i32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
+    pub(crate) fn launch_qtip_quantize_rows_viterbi_f32(
+        d_weight: *const f32,
+        d_lut: *const f32,
+        d_row_scales: *const f32,
+        d_packed: *mut u8,
+        d_cost_a: *mut f32,
+        d_cost_b: *mut f32,
+        d_backtrace: *mut u8,
+        n_rows: i32,
+        in_features: i32,
+        num_symbols: i32,
+        row_offset: i32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
 }
