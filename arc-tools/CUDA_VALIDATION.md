@@ -49,8 +49,10 @@ CUDA_COMPUTE_CAP=90 FEATURES="cuda flash-attn" bash arc-tools/cuda_compile_check
    push to `master` / PR that touches `*.cu`, `build.rs`, or the quant /
    cuda-graph / arc-engine crates. Trigger manually any time:
    ```bash
-   gh workflow run "CUDA compile check (no GPU)"
-   gh run watch
+   # -R is required in a clone with both origin (aeonmindai/arc) + upstream
+   # remotes — gh otherwise resolves to upstream and reports no such workflow.
+   gh workflow run "CUDA compile check (no GPU)" -R aeonmindai/arc
+   gh run watch -R aeonmindai/arc
    ```
    Green = the rental's step-4 build will not fail on an Arc `cuda`-feature
    *compile* error. It does **not** cover the `flash-attn` feature or the final

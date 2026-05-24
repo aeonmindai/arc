@@ -30,7 +30,10 @@ green preflight says nothing about whether the CUDA build will succeed.
 QTIP + arc-cuda-graph kernels for sm_80 **and** sm_90 with only `nvcc`:
 
 ```bash
-gh workflow run "CUDA compile check (no GPU)" && gh run watch
+# -R is REQUIRED: this clone has both `origin` (aeonmindai/arc) and `upstream`
+# (EricLBuehler/mistral.rs) remotes, and gh resolves to upstream when no default
+# is set — the bare command fails with "could not find any workflows named …".
+gh workflow run "CUDA compile check (no GPU)" -R aeonmindai/arc && gh run watch -R aeonmindai/arc
 ```
 
 Green means the rental's step-4 `cargo build --features cuda` will not fail on an

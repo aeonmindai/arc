@@ -89,7 +89,7 @@ hours.
 **Pre-rental (free — before you pay for a box):**
 
 - [ ] `./arc-tools/preflight.sh` → `✓ ALL CHECKS PASSED` (CPU-only; compiles no CUDA)
-- [ ] `gh workflow run "CUDA compile check (no GPU)" && gh run watch` → green (sm_80 + sm_90 nvcc)
+- [ ] `gh workflow run "CUDA compile check (no GPU)" -R aeonmindai/arc && gh run watch -R aeonmindai/arc` → green (sm_80 + sm_90 nvcc). `-R` required: dual-remote clones resolve `gh` to upstream otherwise.
 - [ ] (optional, closes the flash-attn gap for free) `CUDA_COMPUTE_CAP=90 FEATURES="cuda flash-attn" bash arc-tools/cuda_compile_check.sh`
 
 **On the box — gate steps:**
