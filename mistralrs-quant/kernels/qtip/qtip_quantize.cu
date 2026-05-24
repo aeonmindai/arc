@@ -234,40 +234,49 @@ __global__ void qtip_quantize_rows_greedy_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Viterbi quantize kernel.
+// Viterbi quantize kernel — prefix-grouped (PG) variant.
 // ---------------------------------------------------------------------------
 //
-// One CUDA block per row. Block has up to 1024 threads, each handling a
-// strided slice of the 2^L = 65536 states. Timesteps are sequential —
-// the block syncs after each timestep.
+// **The key observation that makes this fast on real H100 silicon.**
+//
+// The trellis transition is `predecessor(s, j) = (j << (L-K)) | (s >> K)`.
+// All 16 successor states {p*16 + k : k ∈ [0, 16)} that share a common
+// "prefix" p = s >> K have the IDENTICAL set of 16 predecessors —
+// {(j << 12) | p : j ∈ [0, 16)} — and therefore the IDENTICAL argmin j.
+//
+// So instead of doing a 16-way reduction per state (65,536 × 16 ops per
+// timestep), we do it once per prefix (4,096 × 16 ops) and reuse the result
+// for the 16 successors. This collapses a 9.9-GiOp/row workload to a
+// 0.6-GiOp/row one — roughly the difference between "5 min hang on
+// down_proj" and "well under one second."
 //
 // Memory layout (passed as kernel args, allocated by host):
 //   * cost_a, cost_b: [n_concurrent_rows, LUT_SIZE] f32 — current/previous
 //     cost tables, ping-ponged each timestep.
-//   * backtrace:      [n_concurrent_rows, T, LUT_SIZE] u8 — for each
-//     (timestep, state), the K-bit predecessor index `j` that gave the
-//     min cost. T = num_symbols (max we'll see in this batch).
+//   * backtrace:      [n_concurrent_rows, T, PREFIX_COUNT] u8 — for each
+//     (timestep, prefix), the K-bit predecessor j shared by all 16
+//     successor states of that prefix. PREFIX_COUNT = 1 << (L - K) = 4096,
+//     so backtrace is 16× smaller than the naive per-state version.
 //
-// Algorithm (mirrors CPU `viterbi_quantize_row` in `viterbi.rs`):
-//   * Init (t=0): cost[s] = decode_error(s, target_0) for s ∈ [0, ALPHABET);
-//                 cost[s] = +inf otherwise.
-//   * Forward (t=1..T-1): for each state s, cost'[s] = err(s, target_t) +
-//     min_{j∈[0,16)} cost[predecessor(s, j)]. Record best j in backtrace.
-//   * Backtrace: argmin over final cost. Walk back through backtrace to
-//     recover symbol sequence. Pack two symbols per byte.
+// Algorithm per timestep (block-wide):
+//   Phase A: For each prefix p, compute
+//     best_cost[p] = min_{j∈[0,16)} prev[(j << 12) | p]
+//     best_j   [p] = argmin j
+//   into shared memory (4,096 entries = 20 KiB total).
+//   Phase B: For each state s, curr[s] = err(s, target_t) + best_cost[s >> K].
+//   Phase C: Write best_j[p] for all p into backtrace[t][p].
 //
-// `predecessor(s, j) = (j << (L-K)) | (s >> K)`.
+// Backtrace correctness: walking back at time tt with current state s,
+// we look up j = bt[tt][s >> K] (same j for all 16 successors of that
+// prefix). predecessor = (j << 12) | (s >> K). Symbol at time tt is
+// (s & ALPHABET_MASK), exactly as in the CPU reference.
 //
 // One thread block per row; the block iterates over T timesteps.
 
-constexpr int VITERBI_THREADS = 256;
-constexpr int VITERBI_STATES_PER_THREAD = (1 << QTIP_L) / VITERBI_THREADS;  // 256 if 256 threads
-// `VITERBI_STATES_PER_THREAD * VITERBI_THREADS == LUT_SIZE` must hold.
-
-// Compute the trellis predecessor of state `s` with predecessor index `j`.
-__device__ __forceinline__ uint32_t predecessor(uint32_t s, uint32_t j) {
-    return (j << (QTIP_L - QTIP_K)) | (s >> QTIP_K);
-}
+constexpr int VITERBI_THREADS         = 256;
+constexpr uint32_t QTIP_PREFIX_BITS   = QTIP_L - QTIP_K;          // 12
+constexpr uint32_t QTIP_PREFIX_COUNT  = 1u << QTIP_PREFIX_BITS;   // 4096
+constexpr uint32_t QTIP_SUFFIX_COUNT  = 1u << QTIP_K;             // 16
 
 // Decode-error of state `s` against the V=2 target vector (already scaled).
 __device__ __forceinline__ float decode_err_fp(
@@ -288,7 +297,7 @@ __global__ void qtip_quantize_rows_viterbi_kernel(
     uint8_t*       __restrict__ packed,        // [n_rows, num_symbols / 2]
     float*         __restrict__ cost_a,        // scratch [BATCH, LUT_SIZE]
     float*         __restrict__ cost_b,        // scratch [BATCH, LUT_SIZE]
-    uint8_t*       __restrict__ backtrace,     // scratch [BATCH, T, LUT_SIZE]
+    uint8_t*       __restrict__ backtrace,     // scratch [BATCH, T, PREFIX_COUNT]
     int in_features,
     int num_symbols,
     int row_offset                              // global row index of grid block 0
@@ -303,26 +312,33 @@ __global__ void qtip_quantize_rows_viterbi_kernel(
     float* my_cost_a = cost_a + (size_t)local_row * QTIP_LUT_SIZE;
     float* my_cost_b = cost_b + (size_t)local_row * QTIP_LUT_SIZE;
     uint8_t* my_bt   = backtrace +
-                       (size_t)local_row * (size_t)num_symbols * QTIP_LUT_SIZE;
+                       (size_t)local_row * (size_t)num_symbols * QTIP_PREFIX_COUNT;
 
     float scale     = row_scales[row];
     float inv_scale = 1.0f / scale;
 
+    // Per-prefix tables in shared mem: 4096 × (f32 + u8) = 20 KiB. Plus the
+    // argmin reduction tile reused at the end (256 × (f32+u32) = 2 KiB). All
+    // well under H100's 48 KiB default per-block shared mem.
+    __shared__ float    s_best_cost[QTIP_PREFIX_COUNT];
+    __shared__ uint8_t  s_best_j   [QTIP_PREFIX_COUNT];
+
     // -------- Init t=0 --------
     // Only first ALPHABET states reachable; rest = +inf.
-    float t0 = my_row[0] * inv_scale;
-    float t1 = my_row[1] * inv_scale;
-    for (uint32_t i = tid; i < QTIP_LUT_SIZE; i += VITERBI_THREADS) {
-        if (i < QTIP_ALPHABET) {
-            my_cost_a[i] = decode_err_fp(lut, i, t0, t1);
-        } else {
-            my_cost_a[i] = INFINITY;
+    {
+        float t0 = my_row[0] * inv_scale;
+        float t1 = my_row[1] * inv_scale;
+        for (uint32_t i = tid; i < QTIP_LUT_SIZE; i += VITERBI_THREADS) {
+            if (i < QTIP_ALPHABET) {
+                my_cost_a[i] = decode_err_fp(lut, i, t0, t1);
+            } else {
+                my_cost_a[i] = INFINITY;
+            }
         }
     }
     __syncthreads();
 
     // -------- Forward pass t=1..T-1 --------
-    // prev = cost_a, curr = cost_b. Swap each timestep.
     float* prev = my_cost_a;
     float* curr = my_cost_b;
 
@@ -330,40 +346,51 @@ __global__ void qtip_quantize_rows_viterbi_kernel(
         float tt0 = my_row[t * 2 + 0] * inv_scale;
         float tt1 = my_row[t * 2 + 1] * inv_scale;
 
-        uint8_t* bt_t = my_bt + (size_t)t * QTIP_LUT_SIZE;
-
-        // Each thread handles a strided slice of states.
-        for (uint32_t s = tid; s < QTIP_LUT_SIZE; s += VITERBI_THREADS) {
-            float err = decode_err_fp(lut, s, tt0, tt1);
-
-            // Find min over 16 predecessors.
-            float    best_cost = INFINITY;
-            uint32_t best_j    = 0u;
+        // Phase A: per-prefix 16-way reduction (4096 prefixes, 16 j-values each).
+        // Reads prev[] randomly but coalesced within a warp (consecutive prefixes
+        // touch consecutive (j<<12)|p positions per j → 4-byte stride per thread).
+        for (uint32_t p = tid; p < QTIP_PREFIX_COUNT; p += VITERBI_THREADS) {
+            float    best = INFINITY;
+            uint32_t bj   = 0u;
             #pragma unroll
-            for (uint32_t j = 0; j < QTIP_ALPHABET; ++j) {
-                uint32_t p = predecessor(s, j);
-                float c = prev[p];
-                if (c < best_cost) {
-                    best_cost = c;
-                    best_j    = j;
+            for (uint32_t j = 0; j < QTIP_SUFFIX_COUNT; ++j) {
+                uint32_t pred = (j << QTIP_PREFIX_BITS) | p;
+                float c = prev[pred];
+                if (c < best) {
+                    best = c;
+                    bj   = j;
                 }
             }
-
-            curr[s] = err + best_cost;
-            bt_t[s] = (uint8_t)best_j;
+            s_best_cost[p] = best;
+            s_best_j   [p] = (uint8_t)bj;
         }
         __syncthreads();
 
-        // Swap.
+        // Phase B: per-state cost update (65536 states). Reads err from LUT,
+        // adds shared best_cost[prefix], writes curr[]. All consecutive in s.
+        for (uint32_t s = tid; s < QTIP_LUT_SIZE; s += VITERBI_THREADS) {
+            float err = decode_err_fp(lut, s, tt0, tt1);
+            uint32_t p = s >> QTIP_K;
+            curr[s] = err + s_best_cost[p];
+        }
+
+        // Phase C: emit per-prefix backtrace for this timestep.
+        uint8_t* bt_t = my_bt + (size_t)t * QTIP_PREFIX_COUNT;
+        for (uint32_t p = tid; p < QTIP_PREFIX_COUNT; p += VITERBI_THREADS) {
+            bt_t[p] = s_best_j[p];
+        }
+        __syncthreads();
+
+        // Per-thread pointer swap (deterministic, same across all threads).
         float* tmp = prev;
         prev = curr;
         curr = tmp;
     }
 
     // -------- Find argmin final state --------
-    // Use shared memory tile for the reduction.
-    __shared__ float s_best_cost[VITERBI_THREADS];
-    __shared__ uint32_t s_best_state[VITERBI_THREADS];
+    // Reuse the front of s_best_cost as the argmin reduction tile (256 entries
+    // out of 4096 already-allocated). Cast pointer; no extra shared mem needed.
+    __shared__ uint32_t s_argmin_state[VITERBI_THREADS];
 
     float    local_best_cost  = INFINITY;
     uint32_t local_best_state = 0u;
@@ -374,19 +401,18 @@ __global__ void qtip_quantize_rows_viterbi_kernel(
             local_best_state = s;
         }
     }
-    s_best_cost[tid]  = local_best_cost;
-    s_best_state[tid] = local_best_state;
+    s_best_cost   [tid] = local_best_cost;
+    s_argmin_state[tid] = local_best_state;
     __syncthreads();
 
-    // Tree reduction over the block.
     for (int stride = VITERBI_THREADS / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
             float other_cost     = s_best_cost[tid + stride];
-            uint32_t other_state = s_best_state[tid + stride];
+            uint32_t other_state = s_argmin_state[tid + stride];
             if (other_cost < s_best_cost[tid] ||
-                (other_cost == s_best_cost[tid] && other_state < s_best_state[tid])) {
-                s_best_cost[tid]  = other_cost;
-                s_best_state[tid] = other_state;
+                (other_cost == s_best_cost[tid] && other_state < s_argmin_state[tid])) {
+                s_best_cost   [tid] = other_cost;
+                s_argmin_state[tid] = other_state;
             }
         }
         __syncthreads();
@@ -394,57 +420,27 @@ __global__ void qtip_quantize_rows_viterbi_kernel(
 
     // -------- Backtrace + pack symbols (single-thread) --------
     if (tid == 0) {
-        uint32_t s = s_best_state[0];
-        // Walk back. The CPU code stores `symbols[t]` for t = 0..num_symbols-1.
-        // We need to pack two symbols per byte: low nibble = symbols[2b],
-        // high nibble = symbols[2b+1].
-        // Strategy: write into a per-row symbol buffer (in registers/local),
-        // then pack. To avoid 7k-element local arrays, we instead emit packed
-        // bytes inline: first build the symbol sequence by walking back from
-        // num_symbols-1 to 0, then pack.
-        //
-        // Easier: use the backtrace stride to walk symbols in reverse, store
-        // them into the packed array (we know packed_per_row = num_symbols/2).
-        // We need to write each symbol; but the byte we write to depends on
-        // whether it's the low or high nibble.
-        //
-        // We do this in TWO passes if needed, but the cleanest single-pass
-        // approach is: write each symbol to a temp byte location, OR'ing with
-        // 0 (for the low nibble) or 0 (high nibble we shift). Since we don't
-        // know the order of writes (reverse), we need each byte to be touched
-        // twice — once for its low symbol, once for its high.
-        //
-        // Implementation: zero-init the packed array first, then walk back
-        // and OR the symbols into place.
+        uint32_t s = s_argmin_state[0];
+        const uint32_t SYM_MASK = QTIP_ALPHABET - 1u;
 
-        // Zero packed bytes (single-thread is fine; range is small).
+        // Zero packed bytes first; we OR low/high nibbles into them as we walk.
         int packed_per_row = num_symbols / 2;
         for (int i = 0; i < packed_per_row; ++i) my_pkd[i] = 0u;
 
-        // Walk back from t = num_symbols-1 down to 0.
-        // The symbol at position t equals (s & ALPHABET_MASK) where s is the
-        // state AT time t.
-        const uint32_t SYM_MASK = QTIP_ALPHABET - 1u;
         int t = num_symbols - 1;
         uint8_t sym_t = (uint8_t)(s & SYM_MASK);
-        if ((t & 1) == 0) {
-            my_pkd[t / 2] |= sym_t;
-        } else {
-            my_pkd[t / 2] |= (sym_t << 4);
-        }
+        if ((t & 1) == 0) my_pkd[t / 2] |= sym_t;
+        else              my_pkd[t / 2] |= (sym_t << 4);
+
         for (int tt = num_symbols - 1; tt > 0; --tt) {
-            // Backtrace at time `tt` gives the predecessor `j` chosen when
-            // computing cost[tt][s] — that yields state at time `tt - 1`.
-            uint8_t* bt_tt = my_bt + (size_t)tt * QTIP_LUT_SIZE;
-            uint32_t j = (uint32_t)bt_tt[s];
-            uint32_t prev_s = predecessor(s, j);
+            uint8_t* bt_tt = my_bt + (size_t)tt * QTIP_PREFIX_COUNT;
+            uint32_t prefix = s >> QTIP_K;
+            uint32_t j      = (uint32_t)bt_tt[prefix];
+            uint32_t prev_s = (j << QTIP_PREFIX_BITS) | prefix;
             uint8_t  sym_prev = (uint8_t)(prev_s & SYM_MASK);
             int prev_t = tt - 1;
-            if ((prev_t & 1) == 0) {
-                my_pkd[prev_t / 2] |= sym_prev;
-            } else {
-                my_pkd[prev_t / 2] |= (sym_prev << 4);
-            }
+            if ((prev_t & 1) == 0) my_pkd[prev_t / 2] |= sym_prev;
+            else                   my_pkd[prev_t / 2] |= (sym_prev << 4);
             s = prev_s;
         }
     }

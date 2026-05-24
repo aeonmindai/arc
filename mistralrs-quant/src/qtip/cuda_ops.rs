@@ -568,14 +568,22 @@ fn compute_row_scales_cuda(weight: &Tensor) -> Result<Tensor> {
 }
 
 /// Maximum scratch budget (bytes) for the Viterbi backtrace buffer.
-/// Backtrace = (rows_in_flight * num_symbols * 2^L) bytes; we cap at this
-/// to avoid blowing past available HBM on multi-tenant boxes. ~6 GB leaves
-/// plenty of room for the model itself on H100 (80 GB) and even on the
-/// smaller A100 80GB / L40 48GB cards.
+/// Backtrace (prefix-grouped) = (rows_in_flight * num_symbols * 2^(L-K))
+/// bytes; we cap at this to avoid blowing past available HBM on multi-tenant
+/// boxes. ~6 GB leaves plenty of room for the model itself on H100 (80 GB)
+/// and even on the smaller A100 80GB / L40 48GB cards. With prefix-grouping,
+/// per-row backtrace is 16× smaller than naive per-state, so we fit far more
+/// rows in flight per launch.
 const VITERBI_MAX_SCRATCH_BYTES: usize = 6 * 1024 * 1024 * 1024;
 
 /// 2^L = 65536, the trellis state count. Matches `LUT_SIZE` in `mod.rs`.
 const QTIP_LUT_SIZE: usize = 1 << super::L;
+
+/// 2^(L-K) = 4096, the trellis prefix count. The prefix-grouped Viterbi
+/// kernel stores one backtrace entry per (timestep, prefix) — 16× smaller
+/// than the naive per-state version because all 16 successors of a given
+/// prefix share the same predecessor reduction.
+const QTIP_PREFIX_COUNT: usize = 1 << (super::L - super::K);
 
 /// One-shot quantize entry point. Returns `(packed_blocks, row_scales)`:
 /// * `packed_blocks` — `[n_rows, num_symbols / 2]` U8, two K=4 symbols per byte.
@@ -666,10 +674,13 @@ pub(crate) fn quantize_rows_cuda(
                 );
             },
             QtipMode::Viterbi => {
-                // Allocate per-batch scratch. Backtrace dominates:
-                //   bt_bytes_per_row = num_symbols * 2^L
+                // Allocate per-batch scratch. With prefix-grouped backtrace,
+                //   bt_bytes_per_row = num_symbols * 2^(L-K) = num_symbols * 4096
                 // Cap rows_in_flight so total <= VITERBI_MAX_SCRATCH_BYTES.
-                let bt_bytes_per_row = num_symbols * QTIP_LUT_SIZE;
+                // Example: Qwen 7B mlp.down_proj (in=18944 → num_symbols=9472)
+                // gives bt_bytes_per_row ≈ 38 MB → ~158 rows in flight in 6 GB,
+                // vs ~10 rows under the old per-state backtrace.
+                let bt_bytes_per_row = num_symbols * QTIP_PREFIX_COUNT;
                 let mut rows_in_flight = (VITERBI_MAX_SCRATCH_BYTES / bt_bytes_per_row).max(1);
                 if rows_in_flight > n_rows {
                     rows_in_flight = n_rows;

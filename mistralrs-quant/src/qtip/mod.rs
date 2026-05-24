@@ -392,37 +392,42 @@ impl QtipLayer {
     ) -> Result<Self> {
         // RUN-quant-on-gpu fast path. For 284B-parameter V4 Flash the CPU-only
         // Viterbi quantize took 30-90 min per load; the GPU path collapses
-        // this to <1 min. Try GPU first; any precondition failure (kernels
-        // not compiled in, non-F32 dtype, non-CUDA target) silently falls
-        // through to the existing CPU implementation below.
-        // GPU Viterbi quantize kernel is currently broken — on real H100
-        // hardware (driver 570, CUDA 12.8) the kernel hangs with 100% GPU
-        // util and no forward progress (verified on Qwen 7B intermediate dim
-        // 18944: 13.8 GB allocated, deadlocks indefinitely). The per-row
-        // backtrace tile + 256-thread cooperative reduction across 65536
-        // trellis states is likely either deadlocking on a sync or scheduled
-        // to take hours per weight matrix. Re-enable via env var only after
-        // the kernel is fixed and CPU↔GPU parity is validated on H100.
+        // this to <1 min. The GPU Viterbi kernel uses prefix-grouping — for
+        // each (timestep, prefix p ∈ [0, 2^(L-K))) it does one 16-way
+        // reduction, instead of 16 redundant reductions per state, because
+        // all 16 successors of a given prefix share the SAME predecessor
+        // argmin. This makes the kernel 16× faster AND uses 16× less
+        // backtrace memory, which is what made the previous per-state
+        // implementation hang on H100-scale layers (e.g. Qwen 7B
+        // mlp.down_proj with num_symbols=9472).
         //
-        // For now, fall through to the CPU Viterbi path (slow at load:
-        // ~3.5 min on Qwen 7B, ~30 min on V4 Flash, all single-thread Rayon)
-        // — quality moat (Viterbi + Hadamard rotation) is preserved, decode
-        // path stays fully on GPU. Load-time CPU work is amortized over
-        // many tokens of decode so the per-token bandwidth picture is
-        // unchanged.
+        // Hard rule: when CUDA is compiled in AND the tensor lives on CUDA,
+        // there is NO CPU fallback. If the GPU path bails, we surface the
+        // error to the caller; we do not silently quantize on CPU. Arc's
+        // moat is that weight quantize stays entirely on the device the
+        // model lives on.
         #[cfg(feature = "cuda")]
-        if std::env::var("ARC_FORCE_GPU_QTIP_QUANTIZE").is_ok()
-            && matches!(device, Device::Cuda(_))
-            && ffi::HAVE_QTIP_KERNELS
-        {
-            if let Some(layer) = Self::quantize_with_options_cuda(
+        if matches!(device, Device::Cuda(_)) {
+            if !ffi::HAVE_QTIP_KERNELS {
+                candle_core::bail!(
+                    "QTIP quantize: CUDA device but QTIP kernels not compiled in. \
+                     Rebuild mistralrs-quant with CUDA + has_qtip_kernels."
+                );
+            }
+            match Self::quantize_with_options_cuda(
                 weight,
                 bias.clone(),
                 device,
                 mode,
                 use_rotation,
             )? {
-                return Ok(layer);
+                Some(layer) => return Ok(layer),
+                None => candle_core::bail!(
+                    "QTIP quantize: GPU path returned None on a CUDA tensor. \
+                     CPU fallback is disabled on CUDA — fix the preconditions \
+                     (F32 dtype, contiguous layout, supported rotation block) \
+                     instead of forcing a CPU detour."
+                ),
             }
         }
 
