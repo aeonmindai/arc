@@ -9,11 +9,11 @@ Day-1 checklist for spinning up an Arc inference engine on rented Blackwell hard
 > correctness + baseline gate only; performance/quality/scale bars are later
 > milestones (M2–M5) and must **not** block declaring M1 done.
 
-## Pre-rental check (free — do BOTH before you pay for a box)
+## Pre-rental check (free — do all three before you pay for a box)
 
 Arc is developed on Apple Silicon, so the CUDA path is never compiled by a Mac
-build. Two independent **free** gates catch problems before the rental meter
-starts; run both.
+build. Three independent **free** gates catch problems before the rental meter
+starts; run all three.
 
 **1. Offline CPU suite (local, ~5 min)** — verifies the Rust logic + offline tests:
 
@@ -22,8 +22,9 @@ starts; run both.
 ```
 
 Expected: `✓ ALL CHECKS PASSED` with ~250 tests across arc-engine, mistralrs-quant,
-arc-cuda-graph. **This compiles no CUDA code** — it is CPU-only, so a green
-preflight says nothing about whether the CUDA build will succeed.
+arc-cuda-graph, **and arc-cli** (the arc-cli line includes the HBM-fit mock
+estimator — see gate 3). **This compiles no CUDA code** — it is CPU-only, so a
+green preflight says nothing about whether the CUDA build will succeed.
 
 **2. Free CUDA compile gate (GitHub Actions, no GPU)** — cross-compiles the
 QTIP + arc-cuda-graph kernels for sm_80 **and** sm_90 with only `nvcc`:
@@ -35,6 +36,29 @@ gh workflow run "CUDA compile check (no GPU)" && gh run watch
 Green means the rental's step-4 `cargo build --features cuda` will not fail on an
 Arc `cuda`-feature *compile* error. See **[CUDA_VALIDATION.md](CUDA_VALIDATION.md)**
 for the full three-gate story (CI → Colab → paid-box kernel runtime).
+
+**3. Free HBM-fit check (offline mock, no GPU)** — verifies the central launch
+claim ("V4 Flash fits in 60 GB on one H100 under qtip2+td-moe") *analytically*,
+before paying to measure it on real hardware. The `--mock` path runs offline (no
+HF download) and shares its pass/fail logic with the real-GPU path:
+
+```bash
+# arc-cli must be built first (preflight gate 1 already does this):
+cargo build --release -p arc-cli
+./target/release/arc validate \
+  --target-hbm 60 \
+  --model deepseek-ai/DeepSeek-V4-Flash \
+  --compression-stack qtip2+td-moe \
+  --mock
+# exit 0 = fits, 1 = exceeds target, 2 = bad invocation. See arc-tools/RENTAL_VALIDATE.md.
+```
+
+A non-zero exit means the residency story is wrong *on paper* — fix it before
+renting. (Gate 1 already asserts the same estimator via the arc-cli unit tests
+`mock_v4_flash_qtip2_passes_60gb_target` / `mock_v4_flash_bf16_fails_60gb_target`;
+this command additionally emits the JSON report a downstream CI gate can read.)
+The mock is conservative and *not* a hardware measurement — calibrate it against
+a real `--target-hbm` run on the rental (RENTAL_VALIDATE.md "Status").
 
 > ⚠️ **flash-attn is not covered by the free gates.** Both free gates compile the
 > `cuda` feature only. The rental build — and `preflight.sh --cuda` in Hour 0
@@ -70,7 +94,8 @@ for the full three-gate story (CI → Colab → paid-box kernel runtime).
    - `✓ arc-engine: ~136 tests`
    - `✓ mistralrs-quant: ~87 tests`
    - `✓ arc-cuda-graph: ~28 tests`
-   - `✓ mistralrs-core builds with --features cuda`
+   - `✓ arc-cli: ~42 tests (incl. HBM-fit mock estimator)`
+   - `✓ mistralrs-core builds with --features "cuda flash-attn"`
 
    (Counts grow as tests are added — the gate is `0 failed`, not an exact number.)
 

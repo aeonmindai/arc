@@ -141,7 +141,7 @@ fi
 echo
 
 # === Check 4: Test sweep (offline) ===
-step "Test sweep — arc-engine + mistralrs-quant + arc-cuda-graph"
+step "Test sweep — arc-engine + mistralrs-quant + arc-cuda-graph + arc-cli"
 TEST_OK=1
 for crate in arc-engine mistralrs-quant arc-cuda-graph; do
     RESULT=$(cargo test -p $crate --no-default-features --lib 2>&1 | grep "test result" | head -1)
@@ -153,6 +153,19 @@ for crate in arc-engine mistralrs-quant arc-cuda-graph; do
         TEST_OK=0
     fi
 done
+
+# arc-cli is a binary crate (no lib target) — test via --bins. This is the ONLY
+# free, offline guard on the "V4 Flash fits in 60 GB" launch claim: validate.rs
+# carries mock_v4_flash_qtip2_passes_60gb_target / mock_v4_flash_bf16_fails_60gb_target
+# / known_model_params_*. Without this step those run in no gate before the rental.
+RESULT=$(cargo test -p arc-cli --no-default-features --bins 2>&1 | grep "test result" | head -1)
+if [[ "$RESULT" == *"0 failed"* ]]; then
+    COUNT=$(echo "$RESULT" | awk '{print $4}')
+    ok "arc-cli: $COUNT tests (incl. HBM-fit mock estimator)"
+else
+    fail "arc-cli failed: $RESULT"
+    TEST_OK=0
+fi
 echo
 
 # === Check 5: CUDA build (if requested) ===
@@ -191,10 +204,22 @@ if [[ -n "$MODEL" ]]; then
         CACHE_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
         # Pattern: HF caches under hub/models--<org>--<name>/snapshots/<sha>/
         # Use huggingface_hub if available
-        if command -v huggingface-cli >/dev/null 2>&1; then
-            INDEX_PATH=$(huggingface-cli download "$MODEL" model.safetensors.index.json 2>/dev/null || true)
+        # Resolve the HF download CLI. Modern huggingface_hub ships `hf` (the
+        # rental script + playbook both use `hf download`); older installs only
+        # have the now-deprecated `huggingface-cli`. Prefer `hf`, fall back to
+        # the legacy verb — checking only `huggingface-cli` here silently skipped
+        # this schema gate on any box with a current huggingface_hub.
+        HF_CLI=""
+        if command -v hf >/dev/null 2>&1; then
+            HF_CLI="hf"
+        elif command -v huggingface-cli >/dev/null 2>&1; then
+            HF_CLI="huggingface-cli"
+        fi
+
+        if [[ -n "$HF_CLI" ]]; then
+            INDEX_PATH=$("$HF_CLI" download "$MODEL" model.safetensors.index.json 2>/dev/null || true)
             if [[ -n "$INDEX_PATH" && -f "$INDEX_PATH" ]]; then
-                ok "downloaded $INDEX_PATH"
+                ok "downloaded $INDEX_PATH (via $HF_CLI)"
 
                 # Run arc validate
                 if ./target/release/arc validate --index "$INDEX_PATH" --arch "$ARCH"; then
@@ -206,8 +231,8 @@ if [[ -n "$MODEL" ]]; then
                 warn "could not download index for $MODEL — check network / HF_TOKEN"
             fi
         else
-            warn "huggingface-cli not installed — skipping model index download"
-            warn "  install: pip install huggingface_hub"
+            warn "no HF download CLI found (neither hf nor huggingface-cli) — skipping model index download"
+            warn "  install: pip install -U huggingface_hub"
         fi
     fi
     echo
