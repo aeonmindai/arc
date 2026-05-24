@@ -231,6 +231,40 @@ identify the next pieces to ship."
 | Loads but produces garbage tokens | RoPE or MLA dispatch wrong | Compare layer-0 hidden states to PyTorch reference |
 | Loads but very slow | No CUDA dispatch — falling back to CPU | Verify `--features cuda` was set; check `nvidia-smi` for utilization |
 
+## Recovery — when `rental_h100_v4_flash.sh` fails
+
+The canonical script exits non-zero on the first failure and prints a single
+`FAIL: …` marker line (grep for it). **It is idempotent and resumable: fix the
+cause, then re-run the exact same command.** Already-completed work is skipped —
+the Rust/apt/pip installs are no-ops, the repo is re-synced with `git reset
+--hard`, `cargo build` is incremental, and `hf download` *resumes* a partial pull
+(it re-checks every shard, so a preempted 148 GB download continues instead of
+restarting). Nothing in the script deletes downloaded weights, so re-running
+after any failure — including a transient HF 503 — is always safe.
+
+Map the `FAIL:` marker to the fix:
+
+| `FAIL:` marker (step) | What it means | Concrete recovery |
+|---|---|---|
+| `nvidia-smi missing` (1) | not a GPU host / driver absent | Wrong box, or install the NVIDIA driver, then re-run. |
+| `nvcc not found …` (2) | CUDA toolkit not on PATH | Install CUDA 12.4+, or `export CUDA_HOME=/usr/local/cuda-12.x`, then re-run. |
+| `rust install` / `apt deps` / `pip hf_hub` (2) | bootstrap network/permission issue | Fix connectivity / run as root, then re-run. |
+| `clone` / `sync` (3) | git or network failure | Confirm `github.com/aeonmindai/arc` is reachable, then re-run. |
+| `cargo build` (4) | CUDA compile error | Read the 3-line tail. Most common: SM mismatch → `export CUDA_COMPUTE_CAP=90` (H100) / `100` (B200). See Hour 0 "If CUDA build fails". Re-run. |
+| `arc binary missing` / `mistralrs binary missing` (4) | build produced no binary | The build above actually failed — scroll up for the real compiler error. |
+| `QTIP GPU kernel smoke tests failed` / `did not actually run a kernel` / `skipped` (4b) | **kernel bug or unusable CUDA device** — the gate doing its job *before* the 148 GB download | Inspect `/tmp/qtip_gpu_smoke.log`. Parity < 0.999 or a hang ⇒ a **code defect, not an environment issue** — do not proceed; the rental is blocked on a QTIP kernel fix. "skipped" / no `cos sim` ⇒ `Device::new_cuda(0)` failed — the CUDA runtime can't see the GPU (check `nvidia-smi`, driver/toolkit version match). |
+| `v4 flash download` / `probe-* download` (5,7) | network drop mid-pull | Re-run — `hf download` resumes from where it stopped. If the step-1 `<230GB free` WARN fired, free disk space first. |
+| `arc validate` (6) | weight schema mismatch | See Hour 1 "Outcome B / Outcome C": update `weight_schema.rs` + `deepseek4.rs` to match the actual index keys, rebuild, re-run. |
+| `probe-tiny smoke produced no decode` (7a) | base dispatch broken | A core regression, not V4-specific. Re-run the 0.5B model alone with `RUST_LOG=debug` to find where decode stops. |
+| `probe-mid run failed` (7b) | QTIP / TurboQuant load or forward crash | Inspect `/tmp/probe_mid.log`. This crashed *before* V4 — fix the QTIP integrated path here, where iteration is cheap. (Incoherent-but-running text only WARNs and continues by design.) |
+| `v4 flash decode` (8) | V4 load or forward crash | Inspect `/tmp/v4_flash_bench.log`; cross-reference the "Common failure modes" table above (tensor not found, shape mismatch, garbage tokens, CPU fallback). |
+| `couldn't extract Decode T/s` (9) | ran but emitted no decode line | The decode didn't complete (timeout or crash near the end). Read the tail of `/tmp/v4_flash_bench.log`. |
+
+The two pre-download gates (step 4b smoke, step 6 validate) exist precisely so a
+build/kernel/schema problem costs ~1 minute here instead of failing after the
+148 GB download + ISQ. A `FAIL:` at 4b or 6 means **stop and fix code** — it is
+not something a re-run alone will clear.
+
 ## Decision points
 
 After hour 3 baseline:
