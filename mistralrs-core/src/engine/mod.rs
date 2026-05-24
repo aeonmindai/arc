@@ -692,31 +692,162 @@ impl Engine {
                                 // in which case we fall through to the
                                 // standard step-by-step decode path.
                                 #[cfg(feature = "cuda")]
-                                let _autonomous_handled = if !is_prompt && !return_raw_logits {
+                                let autonomous_handled = if !is_prompt && !return_raw_logits {
                                     let __auto_t0 = Instant::now();
-                                    match pipeline.autonomous_decode(&mut guards_mut) {
-                                        Ok(Some(_tokens_per_seq)) => {
-                                            // NOTE: the autonomous runner
-                                            // generates tokens on-GPU and
-                                            // returns them here. Wiring them
-                                            // back through the sampler /
-                                            // stop-token / streaming machinery
-                                            // requires per-token Logprobs
-                                            // synthesis that's not yet
-                                            // implemented — for now we log
-                                            // and fall back to step() so we
-                                            // never silently drop output.
-                                            // The capture-and-run path is
-                                            // currently gated by
-                                            // `AutonomousDecodeRunner::is_captured()`
-                                            // returning false until the
-                                            // forward closure is wired in a
-                                            // follow-up.
-                                            tracing::warn!(
-                                                "autonomous_decode returned tokens but per-seq response wiring is not yet complete ({:?}); falling back to step()",
-                                                __auto_t0.elapsed()
-                                            );
-                                            false
+                                    // Build AutonomousDecodeContext: per-seq
+                                    // last token, position, block_table, slot
+                                    // mapping. The runner uses these to
+                                    // prime its input buffers before launching
+                                    // the captured graph. Heap-allocations here
+                                    // are O(batch * max_blocks) — acceptable
+                                    // because we only run this when
+                                    // autonomous decode is otherwise viable.
+                                    let bs = guards_mut.len();
+                                    let max_blocks_per_seq = (pipeline.get_metadata().max_seq_len
+                                        + block_size - 1) / block_size;
+                                    let mut next_token_ids: Vec<i32> = Vec::with_capacity(bs);
+                                    let mut positions: Vec<i32> = Vec::with_capacity(bs);
+                                    let mut context_lens: Vec<i32> = Vec::with_capacity(bs);
+                                    let mut slot_mappings: Vec<i64> = Vec::with_capacity(bs);
+                                    let mut block_tables_flat: Vec<i32> =
+                                        Vec::with_capacity(bs * max_blocks_per_seq);
+                                    let mut ctx_build_ok = true;
+                                    {
+                                        let kv_mgr_arc = scheduler.kv_cache_manager().unwrap();
+                                        let kv_mgr = get_mut_arcmutex!(kv_mgr_arc);
+                                        for seq in guards_mut.iter() {
+                                            let toks = seq.get_toks();
+                                            if toks.is_empty() {
+                                                ctx_build_ok = false;
+                                                break;
+                                            }
+                                            let last_tok = *toks.last().unwrap() as i32;
+                                            let pos = (toks.len() - 1) as i32;
+                                            next_token_ids.push(last_tok);
+                                            positions.push(pos);
+                                            context_lens.push(toks.len() as i32);
+                                            let seq_id = *seq.id();
+                                            let bt = match kv_mgr.get_block_table(seq_id, max_blocks_per_seq) {
+                                                Some(v) => v,
+                                                None => { ctx_build_ok = false; break; }
+                                            };
+                                            block_tables_flat.extend_from_slice(&bt);
+                                            let slots = match kv_mgr.get_slot_mapping(seq_id, toks.len() - 1, 1) {
+                                                Some(v) => v,
+                                                None => { ctx_build_ok = false; break; }
+                                            };
+                                            if let Some(&s) = slots.first() {
+                                                slot_mappings.push(s);
+                                            } else {
+                                                ctx_build_ok = false;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if !ctx_build_ok {
+                                        tracing::debug!(
+                                            "autonomous_decode: failed to build per-seq context; falling back"
+                                        );
+                                        false
+                                    } else {
+                                    let ctx = crate::pipeline::AutonomousDecodeContext {
+                                        next_token_ids: &next_token_ids,
+                                        positions: &positions,
+                                        block_tables_flat: &block_tables_flat,
+                                        context_lens: &context_lens,
+                                        slot_mappings: &slot_mappings,
+                                        block_size,
+                                        max_blocks_per_seq,
+                                    };
+                                    match pipeline.autonomous_decode(&mut guards_mut, &ctx) {
+                                        Ok(Some(tokens_per_seq)) => {
+                                            // The autonomous runner generated
+                                            // tokens entirely on-GPU. Now we
+                                            // need to thread them through the
+                                            // normal add_token / stop-string /
+                                            // streaming machinery so callers
+                                            // see the output. We reuse
+                                            // `finish_or_add_toks_to_seq`
+                                            // (the same helper the sampling
+                                            // path uses post-CPU-sample) per
+                                            // token. Logprobs are zeroed —
+                                            // sampling happened on-GPU so we
+                                            // don't have the post-softmax
+                                            // distribution to reconstruct.
+                                            let metadata = pipeline.get_metadata();
+                                            let eos_tok_vec = if self.disable_eos_stop {
+                                                None
+                                            } else {
+                                                Some(metadata.eos_tok.clone())
+                                            };
+                                            let pipeline_ref: &dyn Pipeline = &*pipeline;
+                                            let mut prefix_cacher = get_mut_arcmutex!(self.prefix_cacher);
+                                            let mut synth_err: Option<candle_core::Error> = None;
+
+                                            // tokens_per_seq is indexed by the
+                                            // RUNNER's padded batch slot, NOT
+                                            // by guards_mut index. The
+                                            // pipeline-level
+                                            // `autonomous_decode` impl is
+                                            // responsible for returning one
+                                            // Vec per active sequence in the
+                                            // order matching guards_mut.
+                                            for (seq_idx, token_ids) in tokens_per_seq.iter().enumerate() {
+                                                if seq_idx >= guards_mut.len() { break; }
+                                                let seq = &mut guards_mut[seq_idx];
+                                                for &tok_id in token_ids {
+                                                    // Skip negative / sentinel ids the kernel may
+                                                    // have written for "no token this step" rows.
+                                                    if tok_id < 0 { continue; }
+                                                    let logprobs = crate::sampler::Logprobs {
+                                                        token: tok_id as u32,
+                                                        logprob: 0.0,
+                                                        bytes: None,
+                                                        top_logprobs: None,
+                                                    };
+                                                    if let Err(e) = crate::pipeline::sampling::finish_or_add_toks_to_seq(
+                                                        pipeline_ref,
+                                                        &mut prefix_cacher,
+                                                        seq,
+                                                        logprobs,
+                                                        eos_tok_vec.as_deref(),
+                                                        true,
+                                                    )
+                                                    .await
+                                                    {
+                                                        synth_err = Some(e);
+                                                        break;
+                                                    }
+                                                    // Stop early on EOS / stop-string / length —
+                                                    // finish_or_add_toks_to_seq sets seq state.
+                                                    if matches!(
+                                                        seq.getstate(),
+                                                        crate::sequence::SequenceState::Done(_)
+                                                    ) {
+                                                        break;
+                                                    }
+                                                }
+                                                if synth_err.is_some() { break; }
+                                            }
+                                            drop(prefix_cacher);
+
+                                            match synth_err {
+                                                Some(e) => {
+                                                    tracing::warn!(
+                                                        "autonomous_decode response synthesis failed after {:?}: {e}; falling back to step()",
+                                                        __auto_t0.elapsed()
+                                                    );
+                                                    false
+                                                }
+                                                None => {
+                                                    tracing::debug!(
+                                                        "autonomous_decode handled batch in {:?} ({} sequences)",
+                                                        __auto_t0.elapsed(),
+                                                        tokens_per_seq.len(),
+                                                    );
+                                                    true
+                                                }
+                                            }
                                         }
                                         Ok(None) => false,
                                         Err(e) => {
@@ -726,21 +857,35 @@ impl Engine {
                                             false
                                         }
                                     }
+                                    } // close else of !ctx_build_ok
                                 } else {
                                     false
                                 };
 
-                                pipeline
-                                    .step(
-                                        &mut guards_mut,
-                                        is_prompt,
-                                        return_raw_logits,
-                                        &mut *get_mut_arcmutex!(self.prefix_cacher),
-                                        self.disable_eos_stop,
-                                        rng.clone(),
-                                        CacheBackendMetadata::PagedAttention { metadata },
-                                    )
-                                    .await
+                                #[cfg(not(feature = "cuda"))]
+                                let autonomous_handled = false;
+
+                                if autonomous_handled {
+                                    // Autonomous path already advanced
+                                    // sequences and sent responses; skip the
+                                    // step-by-step path for this scheduled
+                                    // batch. Return zero duration since the
+                                    // GPU-only path's runtime is tracked
+                                    // separately via the runner's profiling.
+                                    Ok(Duration::ZERO)
+                                } else {
+                                    pipeline
+                                        .step(
+                                            &mut guards_mut,
+                                            is_prompt,
+                                            return_raw_logits,
+                                            &mut *get_mut_arcmutex!(self.prefix_cacher),
+                                            self.disable_eos_stop,
+                                            rng.clone(),
+                                            CacheBackendMetadata::PagedAttention { metadata },
+                                        )
+                                        .await
+                                }
                             }
                         };
 

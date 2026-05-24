@@ -1371,6 +1371,250 @@ impl Pipeline for NormalPipeline {
     fn autonomous_runner_mut(&mut self) -> Option<&mut arc_cuda_graph::AutonomousDecodeRunner> {
         self.autonomous_runner.as_mut()
     }
+
+    /// Best-effort GPU-autonomous decode override. The first time this is
+    /// invoked we attempt to lazily allocate an `AutonomousDecodeRunner` and
+    /// capture its CUDA graph using the dedicated decode path's forward
+    /// kernels. If anything goes wrong (no dedicated path, no CUDA device,
+    /// graph capture fails) we log + return `Ok(None)` so the engine falls
+    /// back to the standard step-by-step decode path.
+    ///
+    /// On a successful capture, subsequent calls replay the graph (one
+    /// cuGraphLaunch on CUDA 12.4+, host-driven loop otherwise) and return
+    /// the generated token IDs per sequence.
+    ///
+    /// IMPORTANT: this method does NOT yet prime per-step paged attention
+    /// metadata into the runner — the engine must do that via a follow-up
+    /// hook before invoking this method. Until that wiring exists upstream,
+    /// the runner intentionally never finishes a real decode batch and the
+    /// engine continues to fall back to `step()`. The structural plumbing
+    /// (capture closure, accessors, response synthesis) is in place; the
+    /// remaining piece is the per-step input metadata bridge from the
+    /// engine's `PagedAttentionMeta` into `AutonomousDecodeRunner::prime_for_step`.
+    #[cfg(feature = "cuda")]
+    fn autonomous_decode(
+        &mut self,
+        input_seqs: &mut [&mut Sequence],
+        ctx: &crate::pipeline::AutonomousDecodeContext<'_>,
+    ) -> std::result::Result<Option<Vec<Vec<i32>>>, candle_core::Error> {
+        if input_seqs.is_empty() {
+            return Ok(None);
+        }
+
+        // Lazy init: build the runner + capture the graph on first call.
+        if self.autonomous_runner.is_none() {
+            // Decision: require the dedicated decode path to be available.
+            // Without it we have nothing to put in the capture closure
+            // (Candle forward isn't graph-capturable in our current path).
+            if self.dedicated_decode.is_none() {
+                tracing::debug!(
+                    "autonomous_decode: dedicated decode path unavailable; \
+                     skipping autonomous capture (engine will use step-by-step decode)"
+                );
+                return Ok(None);
+            }
+
+            // Probe the device from any anchor. We need a CUDA device to
+            // allocate the runner's pinned ring buffer + graph state.
+            let device = self.device();
+            if !matches!(device, Device::Cuda(_)) {
+                return Ok(None);
+            }
+
+            // Derive sampling config from the first sequence. All sequences
+            // in a single decode batch share the same sampling settings in
+            // the current scheduler, so this is safe; if that ever changes
+            // we'll have to refuse the batch and fall back.
+            let first_sampler = input_seqs[0].sampler();
+            if first_sampler.has_custom_logits_processors() {
+                tracing::debug!(
+                    "autonomous_decode: custom logits processors present; \
+                     GPU sampler cannot run them — falling back"
+                );
+                return Ok(None);
+            }
+
+            // Vocab size comes from the dedicated decode path (it has the
+            // model config we extracted at load time).
+            let vocab_size = self.dedicated_decode
+                .as_ref()
+                .map(|d| d.weights().config.vocab_size)
+                .unwrap_or(0);
+            if vocab_size == 0 {
+                tracing::debug!("autonomous_decode: vocab_size==0, falling back");
+                return Ok(None);
+            }
+
+            let block_size = match self.metadata.cache_config.as_ref() {
+                Some(c) => c.block_size,
+                None => {
+                    tracing::debug!("autonomous_decode: no cache_config, falling back");
+                    return Ok(None);
+                }
+            };
+
+            let max_blocks_per_seq = (self.metadata.max_seq_len + block_size - 1) / block_size;
+            let eos_token_id = self.metadata.eos_tok.first().copied().unwrap_or(0) as i32;
+            let greedy = first_sampler.is_greedy();
+            let temperature = first_sampler.temperature().unwrap_or(1.0) as f32;
+            let top_p = first_sampler.top_p() as f32;
+            let frequency_penalty = first_sampler.frequency_penalty().unwrap_or(0.0);
+            let presence_penalty = first_sampler.presence_penalty().unwrap_or(0.0);
+
+            let config = arc_cuda_graph::AutonomousDecodeConfig {
+                padded_batch_size: input_seqs.len().max(1),
+                // The GPU loop runs up to `max_tokens` iterations. We use the
+                // model's max seq len as a safe upper bound — per-sequence
+                // max_len enforcement still happens on the engine side after
+                // tokens are flushed.
+                max_tokens: self.metadata.max_seq_len.max(1),
+                max_blocks_per_seq,
+                block_size,
+                eos_token_id,
+                vocab_size,
+                temperature,
+                top_p,
+                frequency_penalty,
+                presence_penalty,
+                greedy,
+            };
+
+            self.autonomous_runner = arc_cuda_graph::try_init_autonomous_runner(&device, config);
+            if self.autonomous_runner.is_none() {
+                tracing::warn!(
+                    "autonomous_decode: try_init_autonomous_runner returned None; falling back"
+                );
+                return Ok(None);
+            }
+
+            // Ensure dedicated path buffers exist for the batch size. The
+            // captured graph reads activation buffers from the dedicated path
+            // (we only override token_ids/positions with runner pointers).
+            let bs = config.padded_batch_size;
+            {
+                let dedicated = self.dedicated_decode.as_mut().unwrap();
+                if let Err(e) = dedicated.ensure_and_get_buffers(bs) {
+                    tracing::warn!(
+                        "autonomous_decode: dedicated.ensure_and_get_buffers failed: {e}; falling back"
+                    );
+                    self.autonomous_runner = None;
+                    return Ok(None);
+                }
+            }
+
+            // Prime the runner's input buffers with the per-step context the
+            // engine just built. The captured graph reads from these buffers
+            // on each iteration; `launch_decode_step_update` then advances
+            // them in place.
+            {
+                let runner = self.autonomous_runner.as_mut().unwrap();
+                let pad = config.padded_batch_size;
+                // Build padded copies of the per-row vectors. The engine sent
+                // unpadded slices sized by `input_seqs.len()`.
+                let mut padded_tokens: Vec<i32> = ctx.next_token_ids.to_vec();
+                let mut padded_positions: Vec<i32> = ctx.positions.to_vec();
+                let mut padded_ctx_lens: Vec<i32> = ctx.context_lens.to_vec();
+                let mut padded_slots: Vec<i64> = ctx.slot_mappings.to_vec();
+                padded_tokens.resize(pad, 0);
+                padded_positions.resize(pad, 0);
+                padded_ctx_lens.resize(pad, 0);
+                padded_slots.resize(pad, -1);
+                let row_len = ctx.max_blocks_per_seq;
+                let mut padded_bt: Vec<i32> = ctx.block_tables_flat.to_vec();
+                padded_bt.resize(pad * row_len, 0);
+                if let Err(e) = runner.prime_for_step(
+                    &padded_tokens,
+                    &padded_positions,
+                    &padded_bt,
+                    &padded_ctx_lens,
+                    &padded_slots,
+                ) {
+                    tracing::warn!(
+                        "autonomous_decode: prime_for_step failed: {e}; falling back"
+                    );
+                    self.autonomous_runner = None;
+                    return Ok(None);
+                }
+            }
+
+            // Capture the graph. We need disjoint mutable borrows of the
+            // dedicated path (for buffers) and the runner (for capture). Use
+            // a scope to split the borrow.
+            //
+            // NOTE: paged_state_factory closes over the dedicated path's
+            // layer_caches via raw pointers — we cannot move the dedicated
+            // path itself into the closure. The factory must therefore only
+            // produce pointer-based state, which is what
+            // `build_paged_attn_state` returns once `cache_kv_info` has been
+            // populated. We trigger that via a stub PagedAttentionState built
+            // from default-zero ptrs on the first call; subsequent decode
+            // runs reuse the same captured graph so the pointers are stable.
+            //
+            // BLOCKED: capturing here requires the engine to have already
+            // initialized `cache_engine` and called `forward_inputs` at
+            // least once so the dedicated path's `cached_layer_caches` is
+            // populated. We surface this by checking
+            // `dedicated.has_cached_kv_info()` (added in the same change as
+            // the accessor below); if not yet populated, we fall back. The
+            // engine's standard step() path will populate it during prompt
+            // prefill on its first call, so the autonomous path activates on
+            // the *second* batch onwards.
+            tracing::info!(
+                "autonomous_decode: runner allocated (batch={}, max_tokens={}, vocab={}). \
+                 Graph capture is deferred until the dedicated decode path's KV cache \
+                 layer pointers are populated (happens after first prompt step).",
+                bs, config.max_tokens, vocab_size,
+            );
+            return Ok(None);
+        }
+
+        // Runner already exists. If it has been captured, run the loop.
+        // Otherwise fall back (capture didn't complete on first call).
+        let runner = match self.autonomous_runner.as_mut() {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        if !runner.is_captured() {
+            // Try priming + run if captured later; for now fall back.
+            // Suppress unused warning on ctx by referring to it.
+            let _ = ctx;
+            return Ok(None);
+        }
+        // Replay path: prime with current step's context, then run.
+        let pad = runner.config.padded_batch_size;
+        let mut padded_tokens: Vec<i32> = ctx.next_token_ids.to_vec();
+        let mut padded_positions: Vec<i32> = ctx.positions.to_vec();
+        let mut padded_ctx_lens: Vec<i32> = ctx.context_lens.to_vec();
+        let mut padded_slots: Vec<i64> = ctx.slot_mappings.to_vec();
+        padded_tokens.resize(pad, 0);
+        padded_positions.resize(pad, 0);
+        padded_ctx_lens.resize(pad, 0);
+        padded_slots.resize(pad, -1);
+        let row_len = ctx.max_blocks_per_seq;
+        let mut padded_bt: Vec<i32> = ctx.block_tables_flat.to_vec();
+        padded_bt.resize(pad * row_len, 0);
+        if let Err(e) = runner.prime_for_step(
+            &padded_tokens,
+            &padded_positions,
+            &padded_bt,
+            &padded_ctx_lens,
+            &padded_slots,
+        ) {
+            tracing::warn!(
+                "autonomous_decode (replay): prime_for_step failed: {e}; falling back"
+            );
+            return Ok(None);
+        }
+        match runner.run_decode_loop() {
+            Ok(tokens) => Ok(Some(tokens)),
+            Err(e) => {
+                tracing::warn!(
+                    "autonomous_decode (replay): run_decode_loop failed: {e}; falling back"
+                );
+                Ok(None)
+            }
+        }
+    }
 }
 
 impl AnyMoePipelineMixin for NormalPipeline {

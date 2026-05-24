@@ -17,7 +17,7 @@ pub mod post_load_hooks;
 pub(crate) mod mtp_pipeline;
 mod processing;
 mod response;
-mod sampling;
+pub(crate) mod sampling;
 mod speculative;
 mod speech;
 mod vision;
@@ -167,6 +167,40 @@ impl GeneralMetadata {
     pub fn tok_env(&self) -> Option<TokEnv> {
         self.llg_factory.as_ref().map(|f| f.tok_env().clone())
     }
+}
+
+/// Per-batch context the engine passes to `Pipeline::autonomous_decode`.
+/// Carries the paged-attention metadata the runner needs to prime its
+/// on-GPU input buffers (`prime_for_step`). The engine reads from its
+/// scheduler's `kv_cache_manager` to build these vectors, so pipelines
+/// don't have to thread the scheduler through their state.
+///
+/// CUDA-gated because `AutonomousDecodeRunner` only exists under feature
+/// `cuda`. Lifetimes are shorter than the engine's outer step loop.
+#[cfg(feature = "cuda")]
+pub struct AutonomousDecodeContext<'a> {
+    /// One next-token id per sequence in the batch (the runner's
+    /// `prime_for_step` pads to `padded_batch_size` if needed).
+    pub next_token_ids: &'a [i32],
+    /// Per-sequence current decode position (== seq.len() - 1 for the
+    /// last token, or seq.len() if the next forward should produce token
+    /// at index seq.len() given normal append semantics).
+    pub positions: &'a [i32],
+    /// Per-sequence block tables flattened row-major.
+    /// Layout: `block_tables_flat[b * max_blocks + i]` = block id of i-th
+    /// physical block held by sequence b.
+    pub block_tables_flat: &'a [i32],
+    /// Per-sequence current context length (== seq.len()).
+    pub context_lens: &'a [i32],
+    /// Per-sequence slot index (= block_id * block_size + offset).
+    pub slot_mappings: &'a [i64],
+    /// Block size the kv cache manager is using; the runner cross-checks
+    /// this against its captured config and refuses if they differ.
+    pub block_size: usize,
+    /// Maximum number of blocks the runner's `block_tables` row holds.
+    /// Must match the runner's `max_blocks_per_seq` for the captured
+    /// graph; if it differs the runner refuses (host-side error, fallback).
+    pub max_blocks_per_seq: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -497,11 +531,18 @@ pub trait Pipeline:
     /// the autonomous runner is unavailable or its graph has not yet been
     /// captured (caller must fall back to step-by-step decode).
     ///
+    /// The `ctx` argument carries per-step inputs (block tables, slot
+    /// mappings, etc.) that the runner needs to prime its on-GPU input
+    /// buffers before each captured-graph launch. The default impl ignores
+    /// it; pipelines that wire autonomous decode use it to call
+    /// `AutonomousDecodeRunner::prime_for_step`.
+    ///
     /// The ring buffer is polled for streaming output.
     #[cfg(feature = "cuda")]
     fn autonomous_decode(
         &mut self,
         _input_seqs: &mut [&mut crate::sequence::Sequence],
+        _ctx: &crate::pipeline::AutonomousDecodeContext<'_>,
     ) -> Result<Option<Vec<Vec<i32>>>, candle_core::Error> {
         if let Some(runner) = self.autonomous_runner_mut() {
             // The graph capture is deferred: pipelines that wire autonomous
