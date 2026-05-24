@@ -242,24 +242,47 @@ pub fn get_device_layers(
                     // (e.g., unified memory systems, other GPU processes using VRAM).
                     // Cap the KV budget so model + activations + KV fits within
                     // the device capacity derived from *available* memory.
+                    //
+                    // Two-tier budget:
+                    //   - Target: user's requested `cap × f` minus model/activations.
+                    //     Binds for "normal" cases where the model is well under cap.
+                    //   - Floor (used only when the target saturates to ≤ 0): a
+                    //     hard CUDA-runtime safety reserve (~512 MB) subtracted
+                    //     from the absolute cap. This lets marginally-fitting
+                    //     models (e.g. V4 Flash at QTIP 2-bit on 80 GB H100,
+                    //     where the model alone is ~95% of cap) still get the
+                    //     physical headroom left over for KV instead of being
+                    //     spuriously refused. The `f` fraction continues to
+                    //     bind for everything that fits comfortably.
                     let primary_dev = &devices[0];
                     let avail_bytes = MemoryUsage.get_memory_available(primary_dev)?;
                     let cap = device_cap(avail_bytes, primary_dev);
                     let act_overhead = non_mapped_max.max(mapped_max);
-                    let budget_bytes = ((cap as f64 * f as f64) as usize)
-                        .saturating_sub(remaining + act_overhead);
+                    let used = remaining + act_overhead;
+                    let target_total = (cap as f64 * f as f64) as usize;
+                    const RUNTIME_SAFETY_BYTES: usize = 512 * 1024 * 1024;
+                    let absolute_max = cap.saturating_sub(RUNTIME_SAFETY_BYTES);
+                    let budget_bytes = if target_total > used {
+                        target_total - used
+                    } else if absolute_max > used {
+                        absolute_max - used
+                    } else {
+                        0
+                    };
                     let budget_mb = budget_bytes / (1024 * 1024);
                     info!(
-                        "Auto device-map KV budget: cap={} MB, fraction={}, model={} MB (post-ISQ via pack_factor), activations={} MB → budget={} MB",
+                        "Auto device-map KV budget: cap={} MB, fraction={}, model={} MB (post-ISQ via pack_factor), activations={} MB → target={} MB, floor={} MB → budget={} MB",
                         cap / (1024 * 1024),
                         f,
                         remaining / (1024 * 1024),
                         act_overhead / (1024 * 1024),
+                        target_total.saturating_sub(used) / (1024 * 1024),
+                        absolute_max.saturating_sub(used) / (1024 * 1024),
                         budget_mb,
                     );
                     if budget_mb == 0 {
                         warn!(
-                            "Auto device-map computed 0 MB KV budget — the loader's layer_sizes_in_bytes is likely missing weight_pack_factor on one or more tensors (search `weight_pack_factor` in the model's loader impl)."
+                            "Auto device-map computed 0 MB KV budget — model + activations exceed even the absolute cap minus runtime reserve. The model genuinely doesn't fit on this device with the configured ISQ."
                         );
                     }
                     MemoryGpuConfig::MbAmount(budget_mb)
