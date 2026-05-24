@@ -92,6 +92,11 @@ pub struct NormalPipeline {
     /// Dedicated decode path — bypasses Candle, runs on its own non-blocking stream.
     #[cfg(feature = "cuda")]
     dedicated_decode: Option<arc_cuda_graph::DedicatedDecodePath>,
+    /// Autonomous decode runner — runs the full decode loop on GPU (forward →
+    /// sample → step → check_done) with zero CPU sync per token. Allocated at
+    /// load time; graph capture is deferred until first decode call.
+    #[cfg(feature = "cuda")]
+    autonomous_runner: Option<arc_cuda_graph::AutonomousDecodeRunner>,
 }
 
 /// A loader for a "normal" (non-quantized) model.
@@ -1141,6 +1146,13 @@ impl Loader for NormalLoader {
                     }
                 }
             }),
+            // Autonomous runner is lazily initialized on first decode call. At
+            // load time we don't yet know batch_size / max_tokens / sampling
+            // params, and the AutonomousDecodeRunner pre-allocates buffers
+            // based on those. NormalPipeline::autonomous_decode performs the
+            // lazy init (and graph capture) once a real decode batch arrives.
+            #[cfg(feature = "cuda")]
+            autonomous_runner: None,
         })))
     }
 
@@ -1354,6 +1366,10 @@ impl Pipeline for NormalPipeline {
     #[cfg(feature = "cuda")]
     fn dedicated_decode_mut(&mut self) -> Option<&mut arc_cuda_graph::DedicatedDecodePath> {
         self.dedicated_decode.as_mut()
+    }
+    #[cfg(feature = "cuda")]
+    fn autonomous_runner_mut(&mut self) -> Option<&mut arc_cuda_graph::AutonomousDecodeRunner> {
+        self.autonomous_runner.as_mut()
     }
 }
 

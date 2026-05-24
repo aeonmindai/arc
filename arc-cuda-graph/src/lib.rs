@@ -68,3 +68,40 @@ pub fn try_init_graph_runner(device: &candle_core::Device) -> Option<CudaGraphRu
         }
     }
 }
+
+/// Try to create an autonomous decode runner (uncaptured) for the given device.
+///
+/// The returned runner has buffers + decode state allocated but its CUDA graph
+/// has NOT been captured. Capture happens lazily on the first decode call via
+/// `AutonomousDecodeRunner::capture(forward_fn)` once a real forward closure
+/// is available. Until then, the runner is a stub: `run_decode_loop()` will
+/// return an error and the caller MUST fall back to step-by-step decode.
+///
+/// Returns `None` (with a `warn` log) if the device is not CUDA or allocation
+/// fails. Callers should treat this as "autonomous decode unavailable" and
+/// continue with the standard step-by-step decode path — matching the
+/// fall-back contract of `try_init_graph_runner`.
+#[cfg(feature = "cuda")]
+pub fn try_init_autonomous_runner(
+    device: &candle_core::Device,
+    config: AutonomousDecodeConfig,
+) -> Option<AutonomousDecodeRunner> {
+    if !matches!(device, candle_core::Device::Cuda(_)) {
+        tracing::warn!(
+            "Autonomous decode runner unavailable: device is not CUDA"
+        );
+        return None;
+    }
+    match AutonomousDecodeRunner::new(config, device) {
+        Ok(runner) => {
+            tracing::info!(
+                "Autonomous decode runner allocated (graph capture deferred until first decode)"
+            );
+            Some(runner)
+        }
+        Err(e) => {
+            tracing::warn!("Autonomous decode runner unavailable: {e}");
+            None
+        }
+    }
+}

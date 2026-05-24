@@ -471,6 +471,9 @@ impl AutonomousDecodeRunner {
 
     pub fn uses_while_node(&self) -> bool { self.uses_while_node }
     pub fn ring_size(&self) -> usize { self.ring_size }
+    /// `true` once `capture()` has populated `graph_exec`. Callers should
+    /// gate `run_decode_loop()` on this — otherwise it returns an error.
+    pub fn is_captured(&self) -> bool { self.graph_exec.is_some() }
 }
 
 #[cfg(feature = "cuda")]
