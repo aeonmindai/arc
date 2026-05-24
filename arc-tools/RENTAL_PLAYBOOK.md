@@ -151,7 +151,7 @@ cargo build --release -p arc-cli -p mistralrs-cli --features "cuda flash-attn"
 # work from ./target/release/arc without this.)
 export PATH="$PWD/target/release:$PATH"
 
-# Download full weights (V4 Flash ≈ 100GB, V4 Pro ≈ 2TB)
+# Download full weights (V4 Flash ≈ 148 GB FP4 — matches rental_h100_v4_flash.sh; V4 Pro ≈ 2TB)
 hf download deepseek-ai/DeepSeek-V4-Flash   # legacy: huggingface-cli download ...
 
 # First run — interactive (interactive is the default mode of `run`; there is
@@ -185,24 +185,25 @@ run the canonical script — it builds, runs the QTIP GPU kernel smoke tests
 bash arc-tools/rental_h100_v4_flash.sh   # writes /ephemeral/arc-v4flash-bench.json
 ```
 
-For ad-hoc shape sweeps, use the real bench flags. `mistralrs bench` controls
-prompt/gen shape and concurrency (TurboQuant KV + `--isq qtip2` apply). Note the
-flag names: concurrency is `--max-seqs` (there is **no** `--batch-size`; device
-mapping uses `--max-batch-size`), and `--prompt-len`/`--gen-len`/`--max-seq-len`
-set the workload shape:
+For ad-hoc microbenchmarks, use `mistralrs bench`. It runs prefill and decode as
+**two separate single-sequence passes** — `--prompt-len` sizes the prefill,
+`--gen-len` sizes the decode (TurboQuant KV + `--isq qtip2` apply). It is **not**
+a concurrency benchmark: `mistralrs bench` always loads with `max_seqs = 1` and
+silently **ignores `--max-seqs`** (`with_max_seqs(1)` is hardcoded in
+`mistralrs-cli/src/commands/bench.rs`). For aggregate / multi-user throughput use
+`arc bench` (below) — that is the real concurrency path. There is **no**
+`--batch-size`; device mapping uses `--max-batch-size`. Always set `--max-seq-len`
+≥ `prompt-len + gen-len`, or the prefill request overflows the 4096-token default
+(`AutoDeviceMapParams::DEFAULT_MAX_SEQ_LEN`) and the run errors:
 
 ```bash
-# Single-user latency (fixed prompt/gen shape)
+# Single-user prefill + decode microbench
 mistralrs bench -m deepseek-ai/DeepSeek-V4-Flash -a deepseekv4 --isq qtip2 \
-  --prompt-len 4096 --gen-len 512 --max-seqs 1
+  --prompt-len 4096 --gen-len 512 --max-seq-len 4608
 
-# Aggregate throughput (concurrency sweep)
+# Long-context prefill (large prompt — note the matching --max-seq-len)
 mistralrs bench -m deepseek-ai/DeepSeek-V4-Flash -a deepseekv4 --isq qtip2 \
-  --prompt-len 4096 --gen-len 512 --max-seqs 64
-
-# Long-context (large prompt)
-mistralrs bench -m deepseek-ai/DeepSeek-V4-Flash -a deepseekv4 --isq qtip2 \
-  --prompt-len 131072 --gen-len 256 --max-seqs 1
+  --prompt-len 131072 --gen-len 256 --max-seq-len 131328
 ```
 
 For the SLO-tiered AA-AgentPerf ramp (binary-search to the max concurrent users
@@ -253,7 +254,7 @@ Map the `FAIL:` marker to the fix:
 | `cargo build` (4) | CUDA compile error | Read the 3-line tail. Most common: SM mismatch → `export CUDA_COMPUTE_CAP=90` (H100) / `100` (B200). See Hour 0 "If CUDA build fails". Re-run. |
 | `arc binary missing` / `mistralrs binary missing` (4) | build produced no binary | The build above actually failed — scroll up for the real compiler error. |
 | `QTIP GPU kernel smoke tests failed` / `did not actually run a kernel` / `skipped` (4b) | **kernel bug or unusable CUDA device** — the gate doing its job *before* the 148 GB download | Inspect `/tmp/qtip_gpu_smoke.log`. Parity < 0.999 or a hang ⇒ a **code defect, not an environment issue** — do not proceed; the rental is blocked on a QTIP kernel fix. "skipped" / no `cos sim` ⇒ `Device::new_cuda(0)` failed — the CUDA runtime can't see the GPU (check `nvidia-smi`, driver/toolkit version match). |
-| `v4 flash download` / `probe-* download` (5,7) | network drop mid-pull | Re-run — `hf download` resumes from where it stopped. If the step-1 `<230GB free` WARN fired, free disk space first. |
+| `v4 flash download` / `probe-* download` (5,7) | network drop, disk-full, or auth | **Network drop:** re-run — `hf download` resumes from where it stopped. **Disk:** if the step-1 `<230GB free` WARN fired, free space first. **403 / gated repo:** the script does not log in — `export HF_TOKEN=hf_…` (or run `hf auth login`) before re-running. |
 | `arc validate` (6) | weight schema mismatch | See Hour 1 "Outcome B / Outcome C": update `weight_schema.rs` + `deepseek4.rs` to match the actual index keys, rebuild, re-run. |
 | `probe-tiny smoke produced no decode` (7a) | base dispatch broken | A core regression, not V4-specific. Re-run the 0.5B model alone with `RUST_LOG=debug` to find where decode stops. |
 | `probe-mid run failed` (7b) | QTIP / TurboQuant load or forward crash | Inspect `/tmp/probe_mid.log`. This crashed *before* V4 — fix the QTIP integrated path here, where iteration is cheap. (Incoherent-but-running text only WARNs and continues by design.) |
