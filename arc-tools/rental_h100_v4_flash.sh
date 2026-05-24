@@ -91,18 +91,25 @@ ok "probe smoke produced decode output"
 
 step "8/9 V4 Flash + ISQ qtip2 (Viterbi) — full Arc stack engaged"
 # All Arc moats intact:
-#   * QTIP 2-bit Viterbi + Hadamard rotation (RUN-158)
-#   * TurboQuant K4/V3 KV (default PagedCacheType)
+#   * QTIP 2-bit Viterbi + Hadamard rotation (RUN-158) — GPU quantize at load (Agent F)
+#   * TurboQuant K4/V3 KV (--pa-cache-type turboquant, default)
 #   * mHC 4-D residual (RUN-164)
 #   * Lightning Indexer + FlashMLASparse (RUN-163)
-#   * arc-cuda-graph dedicated decode path (RUN-A SEGV fix)
+#   * arc-cuda-graph dedicated decode path (Agent A SEGV fix)
 #   * NVFP4 → QTIP apply_isq (Agent C wiring)
 #   * QTIP CUDA forward kernel with rotation (Agent D)
 # No env-var bypass, no --paged-attn off, no Greedy fallback.
+#
+# `--pa-memory-mb 30000` overrides the auto KV budget that otherwise computes
+# `0 GPU blocks` because it sizes the model pre-ISQ (BF16 ~148 GB > 80 GB HBM
+# even though ISQ shrinks to ~37 GB at load). 30 GB for paged KV + ~37 GB for
+# QTIP weights + ~10 GB activations/workspaces fits comfortably in 80 GB.
 DECODE_LOG=/tmp/v4_flash_bench.log
-printf 'Hello world. Respond with exactly one paragraph about HBM bandwidth.\n\\quit\n' | \
+printf 'Write exactly one paragraph (3-5 sentences) about HBM memory bandwidth and why it matters for LLM inference.\n\\quit\n' | \
   timeout 3600 ./target/release/mistralrs run \
     --isq qtip2 \
+    --pa-memory-mb 30000 \
+    --pa-cache-type turboquant \
     --max-seq-len 4096 --max-seqs 1 \
     -m "$V4_DIR" -a deepseekv4 \
     2>&1 | tee "$DECODE_LOG" || fail "v4 flash decode (full log: $DECODE_LOG)"
