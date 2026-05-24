@@ -38,6 +38,7 @@ mod qtip;
 pub mod rotary;
 pub mod safetensors;
 mod scalar_fp8;
+pub mod td_moe_factored;
 pub mod turboquant;
 mod unquantized;
 mod utils;
@@ -81,6 +82,7 @@ pub use nvfp4::NVFP4Layer;
 pub use pending_layer::PendingIsqLayer;
 pub use pertensor_fp8::PerTensorFP8Linear;
 pub use qtip::{QtipLayer, QtipMode};
+pub use td_moe_factored::TuckerFactoredLayer;
 pub use unquantized::UnquantLinear;
 pub use utils::flash_attn_sinks_metal;
 pub use utils::flash_attn_sinks_varlen_metal;
@@ -462,6 +464,22 @@ pub enum QuantMethodConfig {
         rotation_signs: Option<Tensor>,
         /// Block size for the block-diagonal Hadamard rotation. 0 disables.
         rotation_block: usize,
+    },
+    /// TD-MoE Tucker decomposition kept in factored form (paper §3.3 storage
+    /// path). Stores `G ×₁ U₁ ×₂ U₂ ×₃ U₃` for MoE expert stacks of shape
+    /// `[K, d_out, d_in]`. See `td_moe_factored::TuckerFactoredLayer`.
+    TuckerFactored {
+        /// Core `[r1, r2, r3]`.
+        g_core: Tensor,
+        /// Expert factor `[num_experts, r1]`.
+        u1: Tensor,
+        /// Output factor `[d_out, r2]` (with re-coloring absorbed).
+        u2: Tensor,
+        /// Input factor `[d_in, r3]` (with re-coloring absorbed).
+        u3: Tensor,
+        /// Storage / compute dtype. Inputs are auto-cast in
+        /// `forward_autocast` / `gather_forward_autocast`.
+        target_dtype: DType,
     },
 }
 

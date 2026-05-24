@@ -463,7 +463,8 @@ impl QuantMethod for NVFP4Layer {
             | QuantMethodConfig::Unquantized(_)
             | QuantMethodConfig::Afq { .. }
             | QuantMethodConfig::MXFP4 { .. }
-            | QuantMethodConfig::Qtip { .. } => {
+            | QuantMethodConfig::Qtip { .. }
+            | QuantMethodConfig::TuckerFactored { .. } => {
                 candle_core::bail!("NVFP4Layer requires QuantMethodConfig::NVFP4")
             }
             QuantMethodConfig::NVFP4 {
