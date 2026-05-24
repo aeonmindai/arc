@@ -157,6 +157,167 @@ pub(crate) fn dequantize_rotated_cuda(
     Ok(Tensor::from((Storage::Cuda(res), out_shape)))
 }
 
+/// Single-token fused decode + gemv. Replaces the dequantize+matmul forward
+/// path for the n_tokens=1 case. Reads the QTIP-packed bytes once, decodes
+/// them in registers, accumulates the matvec `y = W @ x_rotated^T`.
+///
+/// Bandwidth comparison vs `dequantize_rotated_cuda` + `matmul`:
+///   * dequant: reads ~0.25 byte/weight (packed) + writes 2 byte/weight (BF16)
+///   * matmul:  reads 2 byte/weight (BF16) again + ~0 for x (broadcast)
+///   * total:   ~4.25 byte/weight of HBM traffic on the weights
+///   * fused:   ~0.25 byte/weight only → roughly 17× less HBM weight traffic.
+///
+/// Caller MUST pass `x_rotated` (already through `rotate_x_cuda`). The kernel
+/// does no rotation. `x_rotated` is a `[1, k_in]` 1-token batch — we slice the
+/// row, so any contiguous `[..., k_in]` shape is fine as long as the layout
+/// gives a contiguous row.
+///
+/// Returns a `[1, n_rows]` tensor (one logit per output row, single token).
+pub(crate) fn fused_gemv_cuda(
+    blocks: &Tensor,
+    row_scales: &Tensor,
+    lut: &Tensor,
+    x_rotated: &Tensor,
+    in_features: usize,
+) -> Result<Tensor> {
+    let n_rows = row_scales.dim(0)?;
+    let packed_per_row = blocks.dim(1)?;
+    let num_symbols = in_features / super::V as usize;
+
+    if blocks.dtype() != DType::U8 {
+        candle_core::bail!("QTIP fused gemv CUDA: blocks dtype must be U8");
+    }
+    if row_scales.dtype() != DType::F32 {
+        candle_core::bail!("QTIP fused gemv CUDA: row_scales dtype must be F32");
+    }
+    if lut.dtype() != DType::F32 {
+        candle_core::bail!("QTIP fused gemv CUDA: lut dtype must be F32");
+    }
+    if !blocks.layout().is_contiguous()
+        || !row_scales.layout().is_contiguous()
+        || !lut.layout().is_contiguous()
+    {
+        candle_core::bail!("QTIP fused gemv CUDA: blocks/scales/lut must be contiguous");
+    }
+
+    // x_rotated must be a single-row contiguous tensor with `in_features` cols.
+    let x_2d = match x_rotated.dims() {
+        [k] if *k == in_features => x_rotated.unsqueeze(0)?,
+        [b, k] if *b == 1 && *k == in_features => x_rotated.clone(),
+        other => candle_core::bail!(
+            "QTIP fused gemv CUDA: x_rotated must be [k_in] or [1, k_in]; got {other:?} (k_in={in_features})"
+        ),
+    };
+    let x_2d = x_2d.contiguous()?;
+
+    let dev = match blocks.device() {
+        candle_core::Device::Cuda(d) => d.clone(),
+        _ => candle_core::bail!("QTIP fused gemv CUDA: blocks must live on CUDA"),
+    };
+    if !matches!(x_2d.device(), candle_core::Device::Cuda(_)) {
+        candle_core::bail!("QTIP fused gemv CUDA: x_rotated must live on CUDA");
+    }
+
+    let out_shape = candle_core::Shape::from_dims(&[1, n_rows]);
+
+    let (blocks_storage, blocks_layout) = blocks.storage_and_layout();
+    let blocks_storage = match &*blocks_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("QTIP fused gemv CUDA: blocks storage must be CUDA"),
+    };
+    let (scales_storage, scales_layout) = row_scales.storage_and_layout();
+    let scales_storage = match &*scales_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("QTIP fused gemv CUDA: scales storage must be CUDA"),
+    };
+    let (lut_storage, lut_layout) = lut.storage_and_layout();
+    let lut_storage = match &*lut_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("QTIP fused gemv CUDA: lut storage must be CUDA"),
+    };
+    let (x_storage, x_layout) = x_2d.storage_and_layout();
+    let x_storage = match &*x_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("QTIP fused gemv CUDA: x storage must be CUDA"),
+    };
+
+    let (blocks_ptr, _blocks_guard) =
+        slice_ptr(blocks_storage.as_cuda_slice::<u8>()?, blocks_layout.start_offset());
+    let (scales_ptr, _scales_guard) =
+        slice_ptr(scales_storage.as_cuda_slice::<f32>()?, scales_layout.start_offset());
+    let (lut_ptr, _lut_guard) =
+        slice_ptr(lut_storage.as_cuda_slice::<f32>()?, lut_layout.start_offset());
+
+    let res = match x_2d.dtype() {
+        DType::BF16 => {
+            let (x_ptr, _x_guard) =
+                slice_ptr(x_storage.as_cuda_slice::<bf16>()?, x_layout.start_offset());
+            let out_buf = dev.alloc_zeros::<bf16>(n_rows)?;
+            let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
+            unsafe {
+                ffi::launch_qtip_fused_gemv_v2_k4_l16_bf16(
+                    blocks_ptr as *const _,
+                    scales_ptr as *const _,
+                    lut_ptr as *const _,
+                    x_ptr as *const _,
+                    out_ptr as *mut _,
+                    n_rows as i32,
+                    packed_per_row as i32,
+                    num_symbols as i32,
+                    dev.cuda_stream().cu_stream(),
+                );
+            }
+            drop(out_guard);
+            CudaStorage::wrap_cuda_slice(out_buf, dev.clone())
+        }
+        DType::F16 => {
+            let (x_ptr, _x_guard) =
+                slice_ptr(x_storage.as_cuda_slice::<f16>()?, x_layout.start_offset());
+            let out_buf = dev.alloc_zeros::<f16>(n_rows)?;
+            let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
+            unsafe {
+                ffi::launch_qtip_fused_gemv_v2_k4_l16_f16(
+                    blocks_ptr as *const _,
+                    scales_ptr as *const _,
+                    lut_ptr as *const _,
+                    x_ptr as *const _,
+                    out_ptr as *mut _,
+                    n_rows as i32,
+                    packed_per_row as i32,
+                    num_symbols as i32,
+                    dev.cuda_stream().cu_stream(),
+                );
+            }
+            drop(out_guard);
+            CudaStorage::wrap_cuda_slice(out_buf, dev.clone())
+        }
+        DType::F32 => {
+            let (x_ptr, _x_guard) =
+                slice_ptr(x_storage.as_cuda_slice::<f32>()?, x_layout.start_offset());
+            let out_buf = dev.alloc_zeros::<f32>(n_rows)?;
+            let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
+            unsafe {
+                ffi::launch_qtip_fused_gemv_v2_k4_l16_f32(
+                    blocks_ptr as *const _,
+                    scales_ptr as *const _,
+                    lut_ptr as *const _,
+                    x_ptr as *const _,
+                    out_ptr as *mut _,
+                    n_rows as i32,
+                    packed_per_row as i32,
+                    num_symbols as i32,
+                    dev.cuda_stream().cu_stream(),
+                );
+            }
+            drop(out_guard);
+            CudaStorage::wrap_cuda_slice(out_buf, dev.clone())
+        }
+        other => candle_core::bail!("QTIP fused gemv CUDA: unsupported x dtype {other:?}"),
+    };
+
+    Ok(Tensor::from((Storage::Cuda(res), out_shape)))
+}
+
 /// Apply the block-diagonal D·H·D rotation to each row of `x` on the GPU,
 /// returning a fresh tensor with the rotated values. `block_size` must be
 /// one of `{2, 4, 8, 16, 32, 64, 128}`.
