@@ -103,7 +103,7 @@ grep -q "cos sim" /tmp/qtip_gpu_smoke.log || fail "QTIP GPU smoke tests did not 
 grep -q "CUDA not available; skipping" /tmp/qtip_gpu_smoke.log && fail "QTIP GPU smoke tests skipped — Device::new_cuda(0) failed on this box"
 ok "QTIP GPU kernels validated on real hardware (parity >= 0.999)"
 
-step "5/9 pull V4 Flash weights (148 GB FP4, ~75 shards). Idempotent — resumes."
+step "5/9 pull V4 Flash weights (~148 GB on disk, FP8-class, ~75 shards; provisional). Idempotent — resumes."
 export HF_HOME=${HF_HOME:-/ephemeral/hf_cache}
 export HF_HUB_DISABLE_TELEMETRY=1
 V4_DIR="$MODELS/DeepSeek-V4-Flash"

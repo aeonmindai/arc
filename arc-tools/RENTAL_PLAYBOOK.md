@@ -179,7 +179,12 @@ cargo build --release -p arc-cli -p mistralrs-cli --features "cuda flash-attn"
 # work from ./target/release/arc without this.)
 export PATH="$PWD/target/release:$PATH"
 
-# Download full weights (V4 Flash ≈ 148 GB FP4 — matches rental_h100_v4_flash.sh; V4 Pro ≈ 2TB)
+# Download full weights. Sizes are PROVISIONAL estimates for an as-yet-unreleased
+# checkpoint: V4 Flash ≈ 148 GB on disk (FP8-class — ~140B params × ~1 byte/param,
+# matching DeepSeek-native FP8 releases). NVFP4/QTIP is the *on-device* ISQ target
+# (arc-cli/src/validate.rs), NOT the on-disk format — do not read "FP4" into the
+# download size. V4 Pro ≈ 2 TB. The rental reserves ≥230 GB regardless, so the
+# exact figure does not gate the run.
 hf download deepseek-ai/DeepSeek-V4-Flash   # legacy: huggingface-cli download ...
 
 # First run — interactive (interactive is the default mode of `run`; there is
