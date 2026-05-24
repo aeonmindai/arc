@@ -679,6 +679,57 @@ impl Engine {
                                     "All sequences must either return raw logits, or not."
                                 );
 
+                                // Autonomous decode fast path: when the
+                                // pipeline has an autonomous runner with a
+                                // captured graph, the full decode loop
+                                // (forward → sample → step → check_done)
+                                // runs entirely on the GPU. We only attempt
+                                // it for decode batches (not prompts) and
+                                // when raw logits are not requested.
+                                //
+                                // The trait method returns `Ok(None)` if the
+                                // runner is unavailable or not yet captured,
+                                // in which case we fall through to the
+                                // standard step-by-step decode path.
+                                #[cfg(feature = "cuda")]
+                                let _autonomous_handled = if !is_prompt && !return_raw_logits {
+                                    let __auto_t0 = Instant::now();
+                                    match pipeline.autonomous_decode(&mut guards_mut) {
+                                        Ok(Some(_tokens_per_seq)) => {
+                                            // NOTE: the autonomous runner
+                                            // generates tokens on-GPU and
+                                            // returns them here. Wiring them
+                                            // back through the sampler /
+                                            // stop-token / streaming machinery
+                                            // requires per-token Logprobs
+                                            // synthesis that's not yet
+                                            // implemented — for now we log
+                                            // and fall back to step() so we
+                                            // never silently drop output.
+                                            // The capture-and-run path is
+                                            // currently gated by
+                                            // `AutonomousDecodeRunner::is_captured()`
+                                            // returning false until the
+                                            // forward closure is wired in a
+                                            // follow-up.
+                                            tracing::warn!(
+                                                "autonomous_decode returned tokens but per-seq response wiring is not yet complete ({:?}); falling back to step()",
+                                                __auto_t0.elapsed()
+                                            );
+                                            false
+                                        }
+                                        Ok(None) => false,
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "autonomous_decode error, falling back to step(): {e}"
+                                            );
+                                            false
+                                        }
+                                    }
+                                } else {
+                                    false
+                                };
+
                                 pipeline
                                     .step(
                                         &mut guards_mut,

@@ -493,7 +493,10 @@ pub trait Pipeline:
     /// This replaces the engine's step-by-step decode loop for sequences that can
     /// be decoded entirely on GPU. Pre-allocated KV blocks must be set up before calling.
     ///
-    /// Returns generated token IDs per sequence in the batch.
+    /// Returns generated token IDs per sequence in the batch, or `Ok(None)` if
+    /// the autonomous runner is unavailable or its graph has not yet been
+    /// captured (caller must fall back to step-by-step decode).
+    ///
     /// The ring buffer is polled for streaming output.
     #[cfg(feature = "cuda")]
     fn autonomous_decode(
@@ -501,6 +504,13 @@ pub trait Pipeline:
         _input_seqs: &mut [&mut crate::sequence::Sequence],
     ) -> Result<Option<Vec<Vec<i32>>>, candle_core::Error> {
         if let Some(runner) = self.autonomous_runner_mut() {
+            // The graph capture is deferred: pipelines that wire autonomous
+            // decode must call `runner.capture(&forward_fn)` once the first
+            // real decode batch arrives. Until that happens, gracefully
+            // fall back to the step-by-step path.
+            if !runner.is_captured() {
+                return Ok(None);
+            }
             let tokens = runner.run_decode_loop()?;
             Ok(Some(tokens))
         } else {
