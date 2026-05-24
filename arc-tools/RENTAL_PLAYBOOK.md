@@ -2,6 +2,13 @@
 
 Day-1 checklist for spinning up an Arc inference engine on rented Blackwell hardware.
 
+> **What this rental is for:** closing milestone **M1**. The crisp pass/fail
+> definition — acceptance criteria, required deliverables, and a copy-paste
+> go/no-go checklist — lives in **[M1_GATE.md](M1_GATE.md)**. This playbook is
+> the hour-by-hour *how*; M1_GATE.md is the *done/not-done* authority. M1 is a
+> correctness + baseline gate only; performance/quality/scale bars are later
+> milestones (M2–M5) and must **not** block declaring M1 done.
+
 ## Pre-rental check (free — do BOTH before you pay for a box)
 
 Arc is developed on Apple Silicon, so the CUDA path is never compiled by a Mac
@@ -249,13 +256,31 @@ After hour 3 baseline:
 
 **Total: $700-1100 for "Arc v2 ships with V4 support."**
 
-## When to call it done
+## When is M1 done? (read this before declaring the rental a success)
 
-Arc v2 launch is shipped when:
-- V4 Flash + V4 Pro load correctly through Arc
-- Single-user @ 1M context ≥ 30 tok/s (current V3-quality estimate ≈ 5-10, after CSA/HCA ≈ 50-100)
-- Aggregate throughput ≥ 50% of SGLang's number on identical hardware
-- Quality drift from BF16 < 2% on standard benchmarks
-- No crashes for 1-hour sustained run with 50 concurrent users
+**M1 — the gate this rental closes — is done when the four acceptance criteria
+in [M1_GATE.md](M1_GATE.md) hold and its deliverables are committed:** V4 Flash
+decodes coherent text through all three forward paths, the numerical
+stack-composition test passes, and a baseline `tok_per_s_decode` + TTFT are
+captured. That is it. **M1 is a correctness + baseline gate — none of the
+performance, quality, vendor-parity, or sustained-load bars below gate M1.**
 
-After that, customer pilot starts.
+The bullets that used to live here described the **Arc v2 *launch*** bar, which
+is a much later target (its pieces are M2–M5 gates, not M1). They are kept below
+for context, but do not let them leak into the M1 go/no-go — an operator who
+waits for SGLang parity or 50-user sustained runs before closing M1 is blocking
+on the wrong milestone.
+
+### Arc v2 launch bar (NOT M1 — later milestones)
+
+Arc v2 launch ships when (each maps to a downstream milestone; see M1_GATE.md
+"Done / not-done boundary"):
+- V4 Flash + V4 Pro load correctly through Arc  *(V4 Pro is a future milestone — M1 is V4 Flash only)*
+- Single-user @ 1M context ≥ 30 tok/s  *(M3 — long-context decode no longer collapses)*
+- Aggregate throughput ≥ 50% of SGLang's number on identical hardware  *(M5 — vendor parity / serving at scale; `arc bench` vendor-parity is not yet wired)*
+- Quality drift from BF16 < 2% on standard benchmarks  *(M2 ≤1% on GSM8K/HumanEval; M4 beats FP16)*
+- No crashes for 1-hour sustained run with 50 concurrent users  *(M5 — serving at scale)*
+
+After M1 closes, the speed ladder (M2 → M3), quality moat (M4), and serving-at-
+scale work (M5) graduate to ship-gates of their own. Customer pilot starts after
+the v2 launch bar above, not after M1.
