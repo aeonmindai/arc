@@ -73,6 +73,33 @@ cargo build --release -p arc-cli -p mistralrs-cli --features "cuda flash-attn" 2
 [ -x ./target/release/mistralrs ] || fail "mistralrs binary missing"
 ok "binaries built"
 
+step "4b/9 QTIP GPU kernel smoke tests — run BEFORE the 148 GB download"
+# The QTIP CUDA kernels (prefix-grouped Viterbi quantize, fused gemv, dequant,
+# rotate, gather) are developed on a Mac and never execute until a GPU box.
+# These parity tests build a QTIP layer on CUDA and assert the GPU output
+# matches the CPU reference (cos sim >= 0.999). cuda_quantize_matches_cpu_*
+# exercises the quantize kernel that previously hung on H100-scale layers —
+# catching a hang/crash here costs ~1 min instead of failing after a 148 GB
+# download + 30 min of ISQ on the full V4 Flash model.
+# Hard rule reminder: on a CUDA device the QTIP quantize path has NO CPU
+# fallback (see mistralrs-quant/src/qtip/mod.rs); if a kernel is broken it
+# MUST surface here, not silently detour to CPU.
+cargo test --release -p mistralrs-quant --features cuda -- --nocapture --test-threads=1 \
+    cuda_quantize_matches_cpu_dequantize_cos_sim \
+    cuda_dequantize_matches_cpu_viterbi_rotation \
+    cuda_forward_matches_cpu_viterbi_rotation \
+    cuda_rotate_x_matches_cpu \
+    cuda_fused_gemv_matches_dequant_matmul \
+    cuda_fused_gemv_matches_dequant_matmul_no_rotation \
+    qtip_gather_forward_cuda_matches_cpu \
+    2>&1 | tee /tmp/qtip_gpu_smoke.log || fail "QTIP GPU kernel smoke tests failed (log: /tmp/qtip_gpu_smoke.log)"
+# Guard against the tests silently skipping: each test prints "CUDA not
+# available; skipping" and returns Ok if Device::new_cuda(0) fails, which still
+# yields "test result: ok". Require the actual parity output and reject the skip.
+grep -q "cos sim" /tmp/qtip_gpu_smoke.log || fail "QTIP GPU smoke tests did not actually run a kernel (no 'cos sim' output) — CUDA device not usable"
+grep -q "CUDA not available; skipping" /tmp/qtip_gpu_smoke.log && fail "QTIP GPU smoke tests skipped — Device::new_cuda(0) failed on this box"
+ok "QTIP GPU kernels validated on real hardware (parity >= 0.999)"
+
 step "5/9 pull V4 Flash weights (148 GB FP4, ~75 shards). Idempotent — resumes."
 export HF_HOME=${HF_HOME:-/ephemeral/hf_cache}
 export HF_HUB_DISABLE_TELEMETRY=1

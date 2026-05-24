@@ -1,0 +1,161 @@
+name: CUDA compile check (no GPU)
+
+# WHY THIS EXISTS
+# ----------------
+# Arc is developed on Apple Silicon (Metal/CPU). The CUDA kernels — QTIP
+# (mistralrs-quant/kernels/qtip/*.cu) and the arc-cuda-graph decode/gemv/
+# FlashMLASparse kernels — are NEVER compiled by a Mac build. Historically
+# the first time nvcc ever saw them was `cargo build --features cuda` on a
+# *paid GPU rental* (arc-tools/rental_h100_v4_flash.sh, step 4). An nvcc
+# syntax error, an FFI signature drift between ffi.rs and a .cu file, or a
+# feature-gated Rust compile error therefore surfaced only after the box was
+# already running — which sent work back to the Mac, where the CUDA error
+# can't be reproduced.
+#
+# Compiling CUDA does NOT require a GPU — only the toolkit (nvcc). cudaforge
+# reads CUDA_COMPUTE_CAP first (compute_cap.rs detect order: env var ->
+# nvidia-smi), so a GPU-less runner cross-compiles the kernels for the
+# rental's real arch (sm_80 = A100, sm_90 = H100/Hopper).
+#
+# Green here => the rental's step-4 build will not fail on an Arc CUDA *compile*
+# error for sm_80/sm_90. (It does not cover nvcc-version-specific differences if
+# the rental box ships a CUDA toolkit other than the 12.4 pinned below.)
+#
+# SCOPE / HONESTY
+# ----------------
+# * COMPILATION ONLY. No GPU is present, so no kernel executes. Runtime
+#   correctness (the prefix-grouped Viterbi quantize kernel actually running
+#   on Hopper, numerical parity, no kernel hang) is validated by the qtip
+#   `#[cfg(feature="cuda")]` parity tests, which run on the rental — see
+#   arc-tools/rental_h100_v4_flash.sh step 4b and arc-tools/cuda_compile_check.sh.
+# * We build the Arc *library* crates with `--features cuda`. Lib builds run
+#   nvcc on every Arc .cu file but do NOT perform the final `-lcuda` link
+#   (arc-cuda-graph/build.rs links the driver lib, which is absent on a
+#   GPU-less runner — only a stub exists). The full binary link with the
+#   exact rental feature combo (`cuda flash-attn`) is validated on the build
+#   box by arc-tools/cuda_compile_check.sh, where the driver + ample RAM exist.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "**/*.cu"
+      - "**/*.cuh"
+      - "**/build.rs"
+      - "mistralrs-quant/**"
+      - "arc-cuda-graph/**"
+      - "arc-engine/**"
+      - ".github/workflows/cuda_compile_check.yaml"
+  pull_request:
+    branches: [master]
+    paths:
+      - "**/*.cu"
+      - "**/*.cuh"
+      - "**/build.rs"
+      - "mistralrs-quant/**"
+      - "arc-cuda-graph/**"
+      - "arc-engine/**"
+      - ".github/workflows/cuda_compile_check.yaml"
+  workflow_dispatch:
+
+# Bound codegen parallelism so a large CUDA lib build fits a small hosted
+# runner (2 vCPU / 7 GB on private repos). A flaky/OOMing gate is worse than
+# none.
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "2"
+  RAYON_NUM_THREADS: "2"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  cuda-compile:
+    name: nvcc compile (sm_${{ matrix.compute_cap }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 80 = A100, 90 = H100/Hopper (the V4 Flash rental target).
+        compute_cap: ["80", "90"]
+    env:
+      CUDA_COMPUTE_CAP: ${{ matrix.compute_cap }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          # The CUDA toolkit (~7 GB installed) + the cuda target dir need
+          # headroom; reclaim ~20 GB from preinstalled toolchains we don't use.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
+
+      - name: Install CUDA toolkit (no driver, no GPU)
+        uses: Jimver/cuda-toolkit@v0.2.35
+        id: cuda-toolkit
+        with:
+          cuda: "12.4.1"
+          # 'local' + --toolkit is the canonical GPU-less CI install: the full
+          # toolkit (nvcc, cudart, curand, cublas, driver *stub*) minus the GPU
+          # driver and samples.
+          method: "local"
+          linux-local-args: '["--toolkit"]'
+
+      - name: CUDA + link-path setup
+        run: |
+          echo "CUDA_COMPUTE_CAP=$CUDA_COMPUTE_CAP"
+          which nvcc
+          nvcc --version
+          # Defensive: put the driver stub on the linker path so any
+          # transitive `-lcuda` resolves even though no GPU/driver is present.
+          CUDA_ROOT="${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
+          echo "LIBRARY_PATH=${CUDA_ROOT}/lib64/stubs:${CUDA_ROOT}/lib64:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=${CUDA_ROOT}/lib64/stubs:${CUDA_ROOT}/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libssl-dev pkg-config
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cuda-cc${{ matrix.compute_cap }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cuda-cc${{ matrix.compute_cap }}-
+
+      # ---- The gate. Each `cargo build` here runs nvcc on the Arc .cu files
+      #      for the matrix arch. These are LIBRARY builds (no final -lcuda
+      #      link), so they are GPU-less-safe. A failure is a failure the
+      #      rental would have hit on step 4.
+
+      # `--lib` keeps these pure rlib builds: build.rs still runs nvcc on every
+      # Arc .cu file, but no binary is produced, so there is no final `-lcuda`
+      # link (arc-cuda-graph ships a `gemv_bench` bin gated on `cuda` that would
+      # otherwise link the driver lib, absent on a GPU-less runner).
+      - name: Compile QTIP CUDA kernels (mistralrs-quant)
+        run: cargo build -p mistralrs-quant --lib --features cuda
+
+      - name: Compile arc-cuda-graph CUDA kernels
+        run: cargo build -p arc-cuda-graph --lib --features cuda
+
+      - name: Compile arc-engine cuda (transitively quant + cuda-graph + core + paged-attn)
+        run: cargo build -p arc-engine --lib --features cuda
+
+      - name: Compile-check CUDA-gated tests (no run — no GPU)
+        run: |
+          # `--no-run` compiles the #[cfg(feature="cuda")] qtip parity tests
+          # (cuda_quantize_matches_cpu_dequantize_cos_sim, cuda_fused_gemv_*,
+          # qtip_gather_forward_cuda_matches_cpu, ...) so FFI/signature drift
+          # in test code is caught too. They EXECUTE only on a real GPU
+          # (rental step 4b).
+          cargo test --no-run -p mistralrs-quant --features cuda
