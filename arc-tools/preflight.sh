@@ -158,8 +158,12 @@ echo
 # === Check 5: CUDA build (if requested) ===
 if [[ $WITH_CUDA -eq 1 ]]; then
     step "CUDA build of mistralrs-core"
-    if cargo build -p mistralrs-core --features "cuda flash-attn cudnn" --release 2>&1 | tail -3; then
-        ok "mistralrs-core builds with --features cuda"
+    # Match the rental build feature set exactly (rental_h100_v4_flash.sh step 4
+    # uses "cuda flash-attn" — NO cudnn, which is not installed by default on
+    # rental hosts). Building with cudnn here throws a false-negative failure on
+    # a box that has no cuDNN even though the real rental build would succeed.
+    if cargo build -p mistralrs-core --features "cuda flash-attn" --release 2>&1 | tail -3; then
+        ok "mistralrs-core builds with --features \"cuda flash-attn\""
     else
         fail "CUDA build failed — see cargo output above"
     fi

@@ -48,11 +48,12 @@ Expected: `✓ ALL CHECKS PASSED` with ~200 tests across arc-engine, mistralrs-q
 For each target model, download the safetensors index (NOT the weights yet — index is ~1 MB):
 
 ```bash
-# Install HF CLI if needed
-pip install huggingface_hub
+# Install HF CLI if needed (provides the `hf` entrypoint; the rental script
+# uses `hf download`. On older huggingface_hub the verb is `huggingface-cli`.)
+pip install -U huggingface_hub
 
 # Authenticate
-huggingface-cli login
+hf auth login   # legacy: huggingface-cli login
 
 # Validate V4 Flash
 ./arc-tools/preflight.sh --cuda --model deepseek-ai/DeepSeek-V4-Flash
@@ -94,7 +95,7 @@ This means V4 uses neither single nor LoRA o_proj — some other naming conventi
    ```bash
    python -c "import json; d = json.load(open('model.safetensors.index.json')); print([k for k in d['weight_map'] if 'o_' in k][:10])"
    ```
-2. Whatever the naming convention turns out to be, update `arc-engine/src/weight_schema.rs::validate_v4_against_keyset` and `mistralrs-core/src/models/deepseek3.rs::Attention::new` to match.
+2. Whatever the naming convention turns out to be, update `arc-engine/src/weight_schema.rs::validate_v4_against_keyset` and `mistralrs-core/src/models/deepseek4.rs::Attention::new` to match.
 3. Rebuild + re-validate.
 
 ### Outcome C: Missing q_a/q_b_proj or kv_a/kv_b_proj
@@ -105,65 +106,90 @@ This would mean V4 doesn't use MLA-LoRA decomposition, which would be surprising
 Once preflight is green for the target model:
 
 ```bash
-# Download full weights (V4 Flash ≈ 100GB, V4 Pro ≈ 2TB)
-huggingface-cli download deepseek-ai/DeepSeek-V4-Flash
+# Build the release binaries with CUDA (same features the rental script uses).
+cargo build --release -p arc-cli -p mistralrs-cli --features "cuda flash-attn"
 
-# First run — interactive
-arc run -m deepseek-ai/DeepSeek-V4-Flash --interactive
+# Put them on PATH for this shell. `arc run`/`arc serve` exec the `mistralrs`
+# binary by name, so it MUST be resolvable — otherwise they fail with
+# "Failed to execute mistralrs". (`arc validate`/`arc bench` run in-process and
+# work from ./target/release/arc without this.)
+export PATH="$PWD/target/release:$PATH"
+
+# Download full weights (V4 Flash ≈ 100GB, V4 Pro ≈ 2TB)
+hf download deepseek-ai/DeepSeek-V4-Flash   # legacy: huggingface-cli download ...
+
+# First run — interactive (interactive is the default mode of `run`; there is
+# no --interactive flag).
+arc run -m deepseek-ai/DeepSeek-V4-Flash -a deepseekv4
 
 # Engage MTP speculative decode (V4-only; ~1.8× lossless speedup at depth=4)
-arc run -m deepseek-ai/DeepSeek-V4-Flash --mtp-depth 4
+arc run -m deepseek-ai/DeepSeek-V4-Flash -a deepseekv4 --mtp-depth 4
 
 # OR serve OpenAI-compatible API
-arc serve -p 1234 -m deepseek-ai/DeepSeek-V4-Flash
+arc serve -p 1234 -m deepseek-ai/DeepSeek-V4-Flash -a deepseekv4
 
-# OR run benchmarks
+# OR run the AA-AgentPerf benchmark (in-process; needs the cuda build above)
 arc bench -m deepseek-ai/DeepSeek-V4-Flash
 ```
 
 **What to expect on first load:**
 
-1. **Tensor mismatch errors:** the V4 loader currently routes through V3's loader. If V4 has any tensor that V3 doesn't expect (or vice versa), load will fail with a clear "expected shape X, got Y" message.
-2. **CSA/HCA dispatch absent:** V4 will run as dense MLA (V3-quality). Performance will be V3-class, not the headline V4 numbers. CUDA TileLang for CSA/HCA is the next-day rental work.
-3. **MTP heads dispatched via `--mtp-depth N` (RUN-156 / RUN-RFC #6):** V4 Flash ships with one MTP head. Pass `--mtp-depth 4` to engage `MtpSpeculativePipeline` — the engine wraps the target pipeline at construction time and drafts up to N tokens per target forward (acceptance ≈ 50% on greedy decode → ~1.5-1.8× wallclock speedup, lossless by construction). For non-V4 models the flag logs a warning and falls back to bare-target decode automatically.
+1. **Tensor mismatch errors:** V4 has its own loader (`-a deepseekv4` → `DeepSeekV4Loader`). `arc validate --index <index.json> --arch deepseekv4` (step above) checks the schema offline first; if a tensor is missing/mismatched at load it fails with a clear "expected shape X, got Y" message.
+2. **CSA/HCA, mHC, indexer/FlashMLASparse are implemented** (RUN-138 / RUN-164 / RUN-163, all Done) and engaged by the `deepseekv4` path — they are **not** absent. This rental is their first end-to-end *hardware* validation: confirm coherent text + per-layer parity first, then chase tok/s. Do not assume correctness from a green compile.
+3. **MTP heads dispatched via `--mtp-depth N` (RUN-156 / RUN-121):** V4 Flash ships with one MTP head. Pass `--mtp-depth 4` to engage `MtpSpeculativePipeline` — the engine wraps the target pipeline at construction time and drafts up to N tokens per target forward (acceptance ≈ 50% on greedy decode → ~1.5-1.8× wallclock speedup, lossless by construction). For non-V4 models the flag logs a warning and falls back to bare-target decode automatically.
 
 ## Hour 3: baseline numbers (30 minutes)
 
-Run benchmarks at multiple settings:
+**Authoritative one-shot:** for the full composed-stack number (QTIP 2-bit +
+TurboQuant KV + TD-MoE + MTP + mHC + CSA/HCA, no opt-outs) on a fresh H100,
+run the canonical script — it builds, runs the QTIP GPU kernel smoke tests
+*before* the weight download, then benches V4 Flash end to end:
 
 ```bash
-# Single-user latency
-arc bench -m deepseek-ai/DeepSeek-V4-Flash --batch-size 1 --max-seq-len 32768
-
-# Aggregate throughput
-arc bench -m deepseek-ai/DeepSeek-V4-Flash --batch-size 64 --max-seq-len 4096
-
-# Long-context (V4's strength)
-arc bench -m deepseek-ai/DeepSeek-V4-Flash --batch-size 1 --max-seq-len 524288
+bash arc-tools/rental_h100_v4_flash.sh   # writes /ephemeral/arc-v4flash-bench.json
 ```
 
-**Expected baseline (Arc-as-V3, no CSA/HCA):**
-- Single-user @ 32K: ~50-70 tok/s on 4× B200
-- Aggregate @ 4K × 64 batch: ~3000-5000 tok/s
-- Long-context @ 512K: ~5-10 tok/s (dense MLA is slow at this scale)
+For ad-hoc shape sweeps, use the real bench flags. `mistralrs bench` controls
+prompt/gen shape and concurrency (TurboQuant KV + `--isq qtip2` apply). Note the
+flag names: concurrency is `--max-seqs` (there is **no** `--batch-size`; device
+mapping uses `--max-batch-size`), and `--prompt-len`/`--gen-len`/`--max-seq-len`
+set the workload shape:
 
-**After CSA/HCA wiring (rental cycle 2):**
-- Single-user @ 32K: ~150-200 tok/s
-- Long-context @ 512K: ~50-100 tok/s (CSA's 73% FLOP reduction kicks in)
+```bash
+# Single-user latency (fixed prompt/gen shape)
+mistralrs bench -m deepseek-ai/DeepSeek-V4-Flash -a deepseekv4 --isq qtip2 \
+  --prompt-len 4096 --gen-len 512 --max-seqs 1
 
-**vs SGLang baseline on same hardware:**
-- Single-user: SGLang is 2-5× faster today (mature CUDA kernels)
-- Aggregate: SGLang is 1.5-2× faster
-- Long-context: SGLang has CSA/HCA already; ours is dense — they win.
+# Aggregate throughput (concurrency sweep)
+mistralrs bench -m deepseek-ai/DeepSeek-V4-Flash -a deepseekv4 --isq qtip2 \
+  --prompt-len 4096 --gen-len 512 --max-seqs 64
 
-This is the moment when "rent and watch numbers" becomes "rent and identify next pieces to ship."
+# Long-context (large prompt)
+mistralrs bench -m deepseek-ai/DeepSeek-V4-Flash -a deepseekv4 --isq qtip2 \
+  --prompt-len 131072 --gen-len 256 --max-seqs 1
+```
+
+For the SLO-tiered AA-AgentPerf ramp (binary-search to the max concurrent users
+that pass a tier), use `arc bench` (its real flags are `--slo-tier`,
+`--max-users`, `--headless`, `--mock`):
+
+```bash
+arc bench -m deepseek-ai/DeepSeek-V4-Flash --slo-tier 2 --max-users 64 --headless
+```
+
+**Baselining note:** M1's gate is *coherent end-to-end decode at ~1,000 tok/s
+on V4 Flash*, not headline long-context numbers. Capture the script's
+`tok_per_s_decode` and TTFT as the day-1 baseline; treat vendor-parity
+(SGLang/vLLM) comparison as post-rental / M2 (`arc bench` vendor-parity is not
+yet wired). This is the moment "rent and watch numbers" becomes "rent and
+identify the next pieces to ship."
 
 ## Common failure modes
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `cargo build --features cuda` fails with PTX error | SM target mismatch | `export CUDA_COMPUTE_CAP=100` (B200) or `90` (H100) |
-| "Tensor X not found in safetensors" | V4 layout mismatch | Update weight_schema + deepseek3.rs Attention struct |
+| "Tensor X not found in safetensors" | V4 layout mismatch | Update weight_schema + deepseek4.rs Attention struct |
 | "Shape mismatch: expected [N, 128], got [N, 448]" | qk_nope_head_dim hardcoded somewhere | Find + fix the hardcode (should use config) |
 | `arc validate` says OK but `arc run` crashes | Issue is downstream of name validation (compute kernel, dtype, etc.) | Run with `RUST_LOG=debug` to find the layer where it crashes |
 | Loads but produces garbage tokens | RoPE or MLA dispatch wrong | Compare layer-0 hidden states to PyTorch reference |
