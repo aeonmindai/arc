@@ -372,11 +372,7 @@ impl QuantMethod for UnquantLinear {
                     candle_core::bail!("QTIP does not support imatrix.");
                 }
                 n_quantized.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let bias = self
-                    .b
-                    .as_ref()
-                    .map(|b| b.to_device(&device))
-                    .transpose()?;
+                let bias = self.b.as_ref().map(|b| b.to_device(&device)).transpose()?;
                 crate::QtipLayer::quantize_with_mode(
                     &self.w.to_device(&device)?,
                     bias,

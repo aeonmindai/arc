@@ -1164,9 +1164,7 @@ pub fn linear(
             QuantizedConfig::NVFP4 {} => {
                 NVFP4Layer::linear_b(in_dim, out_dim, quant_conf, true, vb)?
             }
-            QuantizedConfig::Qtip {} => {
-                QtipLayer::linear_b(in_dim, out_dim, quant_conf, true, vb)?
-            }
+            QuantizedConfig::Qtip {} => QtipLayer::linear_b(in_dim, out_dim, quant_conf, true, vb)?,
         }
     } else {
         // Handle the case where the layer is dummy (no tensors)
