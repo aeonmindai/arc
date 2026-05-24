@@ -789,6 +789,45 @@ impl DedicatedDecodePath {
             false
         }
     }
+
+    /// Shared accessor for the model weights. Used by AutonomousDecodeRunner
+    /// wiring (it needs the same `ModelWeights` to call `decode_forward`).
+    pub fn weights(&self) -> &crate::weights::ModelWeights {
+        &self.weights
+    }
+
+    /// Ensure activation buffers are allocated for the given batch size, then
+    /// return an immutable reference. The autonomous capture closure needs
+    /// stable pointers, so the buffers must already exist before capture.
+    pub fn ensure_and_get_buffers(
+        &mut self,
+        batch_size: usize,
+    ) -> candle_core::Result<&crate::decode_forward::DecodeBuffers> {
+        self.ensure_buffers(batch_size)?;
+        Ok(self.buffers.as_ref().expect("ensure_buffers populates buffers"))
+    }
+
+    /// Build a staged `PagedAttentionState` from the dedicated path's cached
+    /// KV info + the current step's paged attention state. Pointers come from
+    /// staging buffers — stable across captures provided staging hasn't been
+    /// resized.
+    pub fn build_paged_attn_state(
+        &mut self,
+        paged_attn: &crate::decode_forward::PagedAttentionState,
+        batch_size: usize,
+    ) -> candle_core::Result<crate::decode_forward::PagedAttentionState> {
+        let max_possible_blocks = (self.weights.config.max_position_embeddings
+            / paged_attn.block_size.max(1) as usize)
+            .max(paged_attn.max_num_blocks_per_seq as usize);
+        self.ensure_staging(batch_size, max_possible_blocks)?;
+        self.cache_kv_info(paged_attn);
+        // SAFETY: stage_paged_attn launches D2D memcpys on the dedicated path's
+        // own stream — these are NOT captured into the autonomous graph because
+        // we run them outside the capture region. Inside capture, the runner's
+        // own input_buffers are used.
+        unsafe { self.stage_paged_attn(paged_attn, batch_size); }
+        Ok(self.staged_paged_attn(paged_attn))
+    }
 }
 
 #[cfg(feature = "cuda")]

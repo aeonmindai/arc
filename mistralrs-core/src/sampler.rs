@@ -316,6 +316,43 @@ impl Sampler {
         })
     }
 
+    /// Effective temperature. `None` means greedy (temperature was <1e-7).
+    pub fn temperature(&self) -> Option<f64> {
+        self.temperature
+    }
+
+    /// Effective top_p (0.0..=1.0). Values >=1.0 mean no top_p filtering.
+    pub fn top_p(&self) -> f64 {
+        self.top_p
+    }
+
+    /// Effective top_k. Values <=0 mean no top_k filtering.
+    pub fn top_k(&self) -> i64 {
+        self.top_k
+    }
+
+    /// Frequency penalty (None means disabled).
+    pub fn frequency_penalty(&self) -> Option<f32> {
+        self.frequency_penalty
+    }
+
+    /// Presence penalty (None means disabled).
+    pub fn presence_penalty(&self) -> Option<f32> {
+        self.presence_penalty
+    }
+
+    /// True if this sampler is effectively greedy (no temperature → argmax).
+    pub fn is_greedy(&self) -> bool {
+        self.temperature.is_none()
+    }
+
+    /// True if any logits_processors are registered. The autonomous-decode
+    /// GPU sampler cannot apply custom CPU-side processors, so callers
+    /// should refuse autonomous fast-path when this returns true.
+    pub fn has_custom_logits_processors(&self) -> bool {
+        !self.logits_processors.is_empty()
+    }
+
     fn get_top_logprobs(&self, probs: &[f32]) -> Result<Vec<TopLogprob>> {
         let k = self.top_n_logprobs.min(probs.len());
         if k == 0 {
@@ -1073,5 +1110,55 @@ mod tests {
         assert_eq!(res.token, 1023);
         assert_eq!(res.top_logprobs, None);
         assert_eq!(res.logprob, 1023f64.log(10.) as f32)
+    }
+
+    /// Sampler accessors used by the GPU-autonomous decode runner expose the
+    /// effective sampling config so the GPU sampler kernel can be configured
+    /// to match. Verifying greedy + temperature + top_p + penalties round-trip.
+    #[test]
+    fn accessors_for_autonomous_decode() {
+        use super::Sampler;
+        let s_greedy = Sampler::new(
+            None, /* temperature = greedy */
+            0,    // top_n_logprobs
+            None, // tokenizer
+            None, // freq_penalty
+            None, // pres_penalty
+            None, // rep_penalty
+            None, // dry
+            -1,   // top_k disabled
+            1.0,  // top_p disabled (>=1.0)
+            0.0,  // min_p
+            vec![],
+        )
+        .unwrap();
+        assert!(s_greedy.is_greedy());
+        assert_eq!(s_greedy.temperature(), None);
+        assert_eq!(s_greedy.top_p(), 1.0);
+        assert_eq!(s_greedy.top_k(), -1);
+        assert_eq!(s_greedy.frequency_penalty(), None);
+        assert_eq!(s_greedy.presence_penalty(), None);
+        assert!(!s_greedy.has_custom_logits_processors());
+
+        let s_topp = Sampler::new(
+            Some(0.7),
+            0,
+            None,
+            Some(0.1),
+            Some(0.2),
+            None,
+            None,
+            40,
+            0.95,
+            0.0,
+            vec![],
+        )
+        .unwrap();
+        assert!(!s_topp.is_greedy());
+        assert_eq!(s_topp.temperature(), Some(0.7));
+        assert_eq!(s_topp.top_p(), 0.95);
+        assert_eq!(s_topp.top_k(), 40);
+        assert_eq!(s_topp.frequency_penalty(), Some(0.1));
+        assert_eq!(s_topp.presence_penalty(), Some(0.2));
     }
 }
