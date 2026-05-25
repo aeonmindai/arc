@@ -30,6 +30,16 @@ TurboQuant + TD-MoE. That claim has to be backed by a measurement and a
 report that downstream CI / runbooks can read. This command produces that
 report — JSON, deterministic schema, exit codes you can branch on.
 
+> **⚠️ The mock result is only as good as the param count — which is disputed.**
+> `--mock` reads `known_model_params()` = **140B** for V4 Flash → ~58 GB total
+> (fits). But README:51 / the QTIP impl comments / research (`CODE_INDEX.md`)
+> say **284B**, and `validate.rs` is the low outlier on V4 Pro too (680B vs
+> 1.6T). The estimator is linear in params,
+> so at 284B the same stack is **~116 GB total — OOMs an 80 GB H100 by ~36 GB.**
+> **Do not treat the 60 GB fit as settled until Neo pins the real count and you've
+> re-run this against the actual checkpoint** (drop `--mock` on the box). If 284B
+> is real, single-H100 M1 needs 2×H100 or a more aggressive target.
+
 ## Modes
 
 ### Real-GPU mode (default)
