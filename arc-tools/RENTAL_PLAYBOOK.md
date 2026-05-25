@@ -191,8 +191,10 @@ export PATH="$PWD/target/release:$PATH"
 hf download deepseek-ai/DeepSeek-V4-Flash   # legacy: huggingface-cli download ...
 
 # First run — interactive (interactive is the default mode of `run`; there is
-# no --interactive flag). --isq qtip2 is MANDATORY: V4 Flash is ~140B params
-# (~280 GB at bf16) and will OOM a single 80 GB H100 without QTIP 2-bit ISQ.
+# no --interactive flag). --isq qtip2 is MANDATORY: V4 Flash is a
+# multi-hundred-billion-param MoE (hundreds of GB at bf16) and will OOM a single
+# 80 GB H100 without QTIP 2-bit ISQ. (Param count disputed in-repo: 140B in
+# validate.rs vs 284B in README/QTIP comments — Neo to reconcile; OOM holds either way.)
 arc run -m deepseek-ai/DeepSeek-V4-Flash -a deepseekv4 --isq qtip2 --pa-cache-type turboquant
 
 # Engage MTP speculative decode (V4-only; ~1.8× lossless speedup at depth=4)
