@@ -26,10 +26,25 @@ upstream and the red is dominated by **upstream-derived files**, not Arc code:
   `dsv4.rs`/`td_moe.rs`/`sage.rs`) without flipping the gate. Greening the gate
   requires the CI-scope change (2(b)) below, not a code reformat. Hence:
   deferred, by decision, not by oversight.
-- **Clippy `--workspace`:** lints span `arc-bench` (Arc) and
-  `mistralrs-quant/src/qtip/*` + `distributed/layers.rs` (Arc-authored QTIP work),
-  possibly also upstream. Fixing only the Arc subset will not flip the
-  `--workspace -D warnings` gate green.
+- **Clippy `--workspace --tests --examples -D warnings`:** exact lint inventory
+  from CI run `26373440253` (Clippy job `77629534163`, 2026-05-24), split by what
+  is safe to touch:
+  - **Safe to auto-fix (non-numerical) — `arc-bench`:** `manual_div_ceil` (×3),
+    `should_implement_trait` (a `from_str` at `replay.rs:120` — rename or `#[allow]`),
+    `doc_lazy_continuation`, `doc_overindented_list_items`, `derivable_impls`,
+    `unwrap_or_default`, `useless_conversion`, `manual_checked_ops`. These are
+    harness code; `clippy --fix -p arc-bench` + a `cargo test -p arc-bench` guard
+    is low-risk.
+  - **DO NOT `--fix` — `mistralrs-quant/src/qtip/*` (Viterbi/scales hot paths):**
+    `needless_range_loop` (loop var `s` indexing `prev_cost`; loop var `row`
+    indexing `scales_data`), `unnecessary_cast` (`usize`→`usize`),
+    `manual_is_multiple_of`. Their parity is **sm_80+-GPU-only-validated** — rewriting
+    the indexing is exactly the risk the rental can't catch offline. **Suppress with
+    a targeted `#[allow(clippy::needless_range_loop)]` etc. on the specific fns
+    (an attribute is behavior-preserving — NOT a logic rewrite), never `--fix`.**
+  - Net: fixing only `arc-bench` will **not** flip the `--workspace -D warnings`
+    gate (the qtip errors remain); greening needs the qtip `#[allow]`s too, plus
+    any upstream lints. Hence the gate is post-rental, by decision.
 - **Typos:** pervasive **false positives** in upstream/binary code (`"BA"`,
   `"UE"`, `"nd"`, `"writeable"`, `"mis"`, `"fied"`). Green = `.typos.toml`
   ignore-list bloat. (The one real Arc typo, `trigggered`, is already fixed.)
@@ -46,9 +61,15 @@ with the GPU parity test as the guard.
 ## Exact follow-up (when someone wants green CI, post-rental)
 
 ```bash
-# 1. Arc-only clippy (does NOT fight upstream; verify with CPU tests after):
-cargo clippy -p arc-bench -p arc-engine -p arc-cuda-graph -p arc-cli --tests --fix
-cargo test -p mistralrs-quant -p arc-engine   # guard the qtip/* rewrites
+# 1a. SAFE auto-fix — non-numerical harness/CLI crates only:
+cargo clippy -p arc-bench -p arc-cli --tests --fix
+# 1b. Numerical crates — do NOT --fix. Add targeted #[allow(...)] on the flagged
+#     fns instead (attributes are behavior-preserving; the rewrites are not):
+#       mistralrs-quant/src/qtip/{viterbi,mod}.rs : needless_range_loop,
+#         unnecessary_cast, manual_is_multiple_of  (Viterbi/scales hot loops)
+#       arc-engine, arc-cuda-graph : inspect each lint; #[allow] any in a
+#         numerical loop, --fix only the trivially-safe ones.
+cargo test -p mistralrs-quant -p arc-engine -p arc-cuda-graph  # guard, every time
 
 # 2. fmt — decide policy first (fork tradeoff). Either:
 #    (a) accept upstream divergence:  cargo fmt --all
