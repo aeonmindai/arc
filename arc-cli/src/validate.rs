@@ -134,14 +134,27 @@ pub struct HbmValidateOptions {
 ///   3. New models get added here as we onboard them
 ///
 /// Returns (total_param_count, active_param_count_per_token, has_moe).
+///
+/// ⚠️ DISPUTED — these V4 figures are *estimates*, not confirmed specs, and they
+/// CONFLICT with other places in this repo. V4 Flash here is 140B, but README:51,
+/// the QTIP impl comments (mistralrs-quant/src/qtip/{cuda_ops,mod}.rs) and
+/// research/code/CODE_INDEX.md all say **284B / 13B active**; V4 Pro here is 680B
+/// vs **1.6T** in ARC_V2.md + CODE_INDEX. This function is the single source the
+/// `--target-hbm` HBM-fit estimate is computed from, and the estimate is linear in
+/// total params: at 140B V4 Flash mocks to ~58 GB (fits one 80 GB H100); at 284B
+/// it's ~116 GB (OOMs by ~36 GB → needs 2×H100). **Before any rental, pin the real
+/// V4 Flash count and reconcile all sites — do not trust the 60 GB fit until then.**
+/// (The unit test below pins 140B, so changing this will fail loudly — intended.)
 pub fn known_model_params(model_id: &str) -> Option<(u64, u64, bool)> {
     let normalised = model_id.to_ascii_lowercase();
     if normalised.contains("deepseek-v4-flash") || normalised.contains("deepseekv4-flash") {
         // V4 Flash: 27 layers, 128 experts, 6 active = ~140B total, ~14B active.
         // Numbers calibrated from V3-Flash analog scaled to V4 config.
+        // ⚠️ DISPUTED vs 284B/13B elsewhere — see fn doc-comment above.
         Some((140_000_000_000, 14_000_000_000, true))
     } else if normalised.contains("deepseek-v4-pro") || normalised.contains("deepseekv4-pro") {
         // V4 Pro: 43 layers, 256 experts, 6 active = ~680B total, ~37B active.
+        // ⚠️ DISPUTED vs 1.6T elsewhere (ARC_V2.md, CODE_INDEX.md).
         Some((680_000_000_000, 37_000_000_000, true))
     } else if normalised.contains("kimi-k2") {
         // K2-class: 61 layers, 384 experts. ~1.1T total, ~30B active.
