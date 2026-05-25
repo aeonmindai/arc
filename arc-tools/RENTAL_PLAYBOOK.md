@@ -333,6 +333,16 @@ stack-composition test passes, and a baseline `tok_per_s_decode` + TTFT are
 captured. That is it. **M1 is a correctness + baseline gate — none of the
 performance, quality, vendor-parity, or sustained-load bars below gate M1.**
 
+> **Criterion 2 needs a SECOND V4 run — budget for it.** `rental_h100_v4_flash.sh`
+> step 8 runs the V4 decode with the default `--paged-attn auto`, which covers
+> branch A (standard layers, paged kernel) **and** branch B (CSA/HCA layers →
+> `dsv4_attention`, RUN-167). It does **not** touch branch C (the non-paged
+> MLA-cache path), so a single script run does **not** satisfy criterion 2. Do
+> one more V4 run with `--paged-attn off` (branch C → `dsv4_attention` for every
+> layer) per the exact two-run procedure in [M1_GATE.md](M1_GATE.md) criterion 2.
+> Cost: that second run is a **full V4 load + ISQ (~30 min)** on top of the
+> resident weights — it is the gate, so plan the hours, don't skip it.
+
 The bullets that used to live here described the **Arc v2 *launch*** bar, which
 is a much later target (its pieces are M2–M5 gates, not M1). They are kept below
 for context, but do not let them leak into the M1 go/no-go — an operator who

@@ -28,9 +28,22 @@ hold on one real H100 (or H200) run:**
 3. **Numerical stack-composition test passes.** QTIP-2bit weights + TurboQuant
    KV + TD-MoE whitening + speculative MTP compose without numerical drift:
    per-layer cosine similarity vs the reference ≥ 0.95, and greedy decode
-   reproduces the unquantized baseline's first 100 tokens. (This is RUN-151,
-   already **Done** offline on small models; on the rental it re-runs against
-   the real V4 stack.)
+   reproduces the unquantized baseline's first 100 tokens.
+
+   > **What the offline test (RUN-151) actually clears — read this before
+   > claiming criterion 3 met.** The offline proxy is
+   > `arc-engine/tests/numerical_stack_composition.rs::arc_compression_stack_composes_within_drift_budget`.
+   > It composes the same stack (QTIP 2-bit Viterbi + TD-MoE Tucker +
+   > TurboQuant K4/V3) on a **synthetic 128-dim / 2-layer** model and asserts a
+   > deliberately **weaker** bar: per-layer cos-sim ≥ **0.85**, final-logits ≥
+   > **0.80**, and **20 teacher-forced** (not greedy) decode steps ≥ **0.75**.
+   > It uses teacher-forced tokens on purpose — argmax is near-uniform-noisy on
+   > random init, so a greedy-match bar is meaningless at that scale. So the
+   > offline test proves the stack **composes without NaN/drift blow-up**; it
+   > does **not** pre-clear the ≥ 0.95 / first-100-greedy bar above. **That bar
+   > is measured fresh on the real V4 weights on the rental — no offline test
+   > clears it for you.** Run the proxy pre-rental (it must stay green), then
+   > measure the real bar on the box.
 4. **Baseline decode number captured.** The day-1 playbook records a baseline
    `tok_per_s_decode` (target order-of-magnitude **~1,000 tok/s** on V4 Flash)
    plus TTFT. The *number itself is not a pass/fail threshold* — capturing a
@@ -45,10 +58,15 @@ M1 is not "done" until these exist in the tree, produced from the rental run:
 
 | Deliverable | Path | Produced by | Linear |
 |---|---|---|---|
-| Day-1 rental report | `arc-tools/RENTAL_DAY1.md` | operator, hand-written from the run | RUN-161 |
+| Day-1 rental report | `arc-tools/RENTAL_DAY1.md` | `cp arc-tools/RENTAL_DAY1.template.md arc-tools/RENTAL_DAY1.md` then fill from the run | RUN-161 |
 | One-shot bench JSON | `/ephemeral/arc-v4flash-bench.json` | `arc-tools/rental_h100_v4_flash.sh` | RUN-161 |
-| Structured findings report | `tests/results/validation_<date>.md` | operator, one row per technique + P0/P1/P2 | RUN-136 |
+| Structured findings report | `tests/results/validation_<date>.md` | `cp tests/results/validation_TEMPLATE.md tests/results/validation_$(date +%Y%m%d).md` then fill one row per technique + P0/P1/P2 | RUN-136 |
 | HBM footprint report | `tests/results/v4_flash_h100_footprint.json` | `arc validate --target-hbm` | RUN-191 (Done) |
+
+> **Templates exist so the operator fills blanks, not structure, on a paid box.**
+> `arc-tools/RENTAL_DAY1.template.md` and `tests/results/validation_TEMPLATE.md`
+> carry every required field + the exact commands. Copy (don't edit-in-place)
+> them to the real deliverable paths above.
 
 `RENTAL_DAY1.md` must contain: the `nvidia-smi` topology, the
 `preflight.sh --cuda` log tail, weight-download timing, and the `arc bench`
@@ -103,8 +121,11 @@ hours.
 **Gate evaluation (the four acceptance criteria):**
 
 - [ ] **Criterion 1** — V4 Flash decodes a coherent paragraph (`arc run -m deepseek-ai/DeepSeek-V4-Flash -a deepseekv4`)
-- [ ] **Criterion 2** — all three forward paths (SDPA / PagedAttention / MLA-cache) covered in `validation_<date>.md` and each routes through the V4 compress dispatch
-- [ ] **Criterion 3** — numerical stack-composition test passes on the real stack (cos-sim ≥ 0.95 per layer; first-100-token greedy match)
+- [ ] **Criterion 2** — all three forward paths covered in `validation_<date>.md`. The dispatch (`mistralrs-core/src/models/deepseek4.rs:1068-1150`) has exactly three outer branches, selected by `--paged-attn` × per-layer `compress_ratio`. **Two runs cover all three:**
+  - `mistralrs run … -a deepseekv4 --isq qtip2 --paged-attn off` → branch C (`None` → `dsv4_attention`): every layer goes through the V4 compress dispatch (its Standard/CSA/HCA sub-paths). Covers the plain-SDPA-via-compress and MLA-cache paths.
+  - `mistralrs run … -a deepseekv4 --isq qtip2 --paged-attn auto --pa-cache-type turboquant` → standard layers hit branch A (plain paged kernel), compressed (CSA/HCA) layers hit branch B (`cache_write_and_gather` → `dsv4_attention`, RUN-167). Covers the PagedAttention-routes-through-compress path.
+  - Branch B requires the model to actually have CSA/HCA layers — confirm from `config.json` `compress_ratios` (values 4/128 present, not all 0). Real V4 Flash has them by design; if a run shows only `compress_ratio=0` layers, branch B is never reached and criterion 2 is **not** met.
+- [ ] **Criterion 3** — numerical stack-composition passes on the real stack (cos-sim ≥ 0.95 per layer; first-100-token greedy match). Offline proxy (weaker bar, synthetic — see criterion 3 above) is already run by `preflight.sh`; to see the numbers: `cargo test -p arc-engine --test numerical_stack_composition arc_compression_stack_composes_within_drift_budget -- --nocapture`
 - [ ] **Criterion 4** — `tok_per_s_decode` + TTFT captured in the bench JSON and `RENTAL_DAY1.md`
 
 **Deliverables committed:**
