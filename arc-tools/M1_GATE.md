@@ -36,7 +36,8 @@ hold on one real H100 (or H200) run:**
    > It composes the same stack (QTIP 2-bit Viterbi + TD-MoE Tucker +
    > TurboQuant K4/V3) on a **synthetic 128-dim / 2-layer** model and asserts a
    > deliberately **weaker** bar: per-layer cos-sim ≥ **0.85**, final-logits ≥
-   > **0.80**, and **20 teacher-forced** (not greedy) decode steps ≥ **0.75**.
+   > **0.80**, and a **20-token teacher-forced** (not greedy) decode trajectory
+   > whose min per-step logit cos-sim ≥ **0.75** (19 step-to-step comparisons).
    > It uses teacher-forced tokens on purpose — argmax is near-uniform-noisy on
    > random init, so a greedy-match bar is meaningless at that scale. So the
    > offline test proves the stack **composes without NaN/drift blow-up**; it

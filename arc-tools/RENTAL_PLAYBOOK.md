@@ -1,6 +1,9 @@
-# Arc B200 rental playbook
+# Arc H100 / B200 rental playbook
 
-Day-1 checklist for spinning up an Arc inference engine on rented Blackwell hardware.
+Day-1 checklist for spinning up an Arc inference engine on a rented GPU. **M1
+targets a single H100 (or H200)** — that is what `rental_h100_v4_flash.sh` and
+the [M1_GATE.md](M1_GATE.md) acceptance bar assume; the B200 figures below (cost,
+HBM headroom) are the Blackwell alternative, not a different gate.
 
 > **What this rental is for:** closing milestone **M1**. The crisp pass/fail
 > definition — acceptance criteria, required deliverables, and a copy-paste
@@ -217,6 +220,13 @@ run the canonical script — it builds, runs the QTIP GPU kernel smoke tests
 ```bash
 bash arc-tools/rental_h100_v4_flash.sh   # writes /ephemeral/arc-v4flash-bench.json
 ```
+
+> **This single run does NOT close criterion 2.** The script's V4 decode uses
+> the default `--paged-attn auto` (covers branches A+B). Criterion 2 also needs
+> branch C — do **one more** V4 run with `--paged-attn off` right here, before
+> moving on, per [M1_GATE.md](M1_GATE.md) criterion 2. Budget the extra ~30 min
+> (full V4 load + ISQ). Record both runs' coherence + the `compress_ratios`
+> histogram in `tests/results/validation_<date>.md`.
 
 For ad-hoc microbenchmarks, use `mistralrs bench`. It runs prefill and decode as
 **two separate single-sequence passes** — `--prompt-len` sizes the prefill,
