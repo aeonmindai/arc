@@ -121,7 +121,7 @@ hours.
 
 **Gate evaluation (the four acceptance criteria):**
 
-- [ ] **Criterion 1** — V4 Flash decodes a coherent paragraph (`arc run -m deepseek-ai/DeepSeek-V4-Flash -a deepseekv4`)
+- [ ] **Criterion 1** — V4 Flash decodes a coherent paragraph (`arc run -m deepseek-ai/DeepSeek-V4-Flash -a deepseekv4 --isq qtip2 --pa-cache-type turboquant`). `--isq qtip2` is mandatory — V4 Flash (~140B) is ~280 GB at bf16 and OOMs one 80 GB H100 without it.
 - [ ] **Criterion 2** — all three forward paths covered in `validation_<date>.md`. The dispatch (`mistralrs-core/src/models/deepseek4.rs:1068-1150`) has exactly three outer branches, selected by `--paged-attn` × per-layer `compress_ratio`. **Two runs cover all three:**
   - `mistralrs run … -a deepseekv4 --isq qtip2 --paged-attn off` → branch C (`None` → `dsv4_attention`): every layer goes through the V4 compress dispatch (its Standard/CSA/HCA sub-paths). Covers the plain-SDPA-via-compress and MLA-cache paths.
   - `mistralrs run … -a deepseekv4 --isq qtip2 --paged-attn auto --pa-cache-type turboquant` → standard layers hit branch A (plain paged kernel), compressed (CSA/HCA) layers hit branch B (`cache_write_and_gather` → `dsv4_attention`, RUN-167). Covers the PagedAttention-routes-through-compress path.

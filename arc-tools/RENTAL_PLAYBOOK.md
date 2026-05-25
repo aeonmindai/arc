@@ -191,14 +191,15 @@ export PATH="$PWD/target/release:$PATH"
 hf download deepseek-ai/DeepSeek-V4-Flash   # legacy: huggingface-cli download ...
 
 # First run — interactive (interactive is the default mode of `run`; there is
-# no --interactive flag).
-arc run -m deepseek-ai/DeepSeek-V4-Flash -a deepseekv4
+# no --interactive flag). --isq qtip2 is MANDATORY: V4 Flash is ~140B params
+# (~280 GB at bf16) and will OOM a single 80 GB H100 without QTIP 2-bit ISQ.
+arc run -m deepseek-ai/DeepSeek-V4-Flash -a deepseekv4 --isq qtip2 --pa-cache-type turboquant
 
 # Engage MTP speculative decode (V4-only; ~1.8× lossless speedup at depth=4)
-arc run -m deepseek-ai/DeepSeek-V4-Flash -a deepseekv4 --mtp-depth 4
+arc run -m deepseek-ai/DeepSeek-V4-Flash -a deepseekv4 --isq qtip2 --pa-cache-type turboquant --mtp-depth 4
 
-# OR serve OpenAI-compatible API
-arc serve -p 1234 -m deepseek-ai/DeepSeek-V4-Flash -a deepseekv4
+# OR serve OpenAI-compatible API (same --isq requirement to fit one H100)
+arc serve -p 1234 -m deepseek-ai/DeepSeek-V4-Flash -a deepseekv4 --isq qtip2 --pa-cache-type turboquant
 
 # OR run the AA-AgentPerf benchmark (in-process; needs the cuda build above)
 arc bench -m deepseek-ai/DeepSeek-V4-Flash
