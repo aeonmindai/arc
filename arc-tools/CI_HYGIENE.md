@@ -16,7 +16,16 @@ upstream and the red is dominated by **upstream-derived files**, not Arc code:
   model/core files (`qwen2.rs`, `llama.rs`, `mistral.rs`, `llava/*`, `phi4`,
   `smollm3`, …). `cargo fmt --all` reformats all 91 → a large merge-conflict
   surface on every future upstream sync. This is rustfmt-version drift, not Arc
-  sloppiness.
+  sloppiness. **Verified 2026-05-25** (`cargo fmt --all -- --check`, unique
+  files): 137 total = 46 Arc-authored (`arc-bench` 16, `arc-engine` 14,
+  `arc-cuda-graph` 11, `arc-cli` 5) + 91 upstream (`mistralrs-quant` 2, other
+  `mistralrs-*` 89). **Reformatting only the 46 Arc files does NOT turn the
+  `fmt --all -- --check` job green** — the 91 upstream files keep it red — so a
+  pre-rental Arc-only reformat buys churn (and merge-conflict risk against the
+  in-flight worktree agents + the numerically-sensitive `arc-engine`
+  `dsv4.rs`/`td_moe.rs`/`sage.rs`) without flipping the gate. Greening the gate
+  requires the CI-scope change (2(b)) below, not a code reformat. Hence:
+  deferred, by decision, not by oversight.
 - **Clippy `--workspace`:** lints span `arc-bench` (Arc) and
   `mistralrs-quant/src/qtip/*` + `distributed/layers.rs` (Arc-authored QTIP work),
   possibly also upstream. Fixing only the Arc subset will not flip the
