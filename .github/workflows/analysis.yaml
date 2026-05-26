@@ -2,6 +2,16 @@ name: Analysis
 on:
   pull_request_target
 
+# The `comment` job posts/updates a PR comment via the Issues API, which
+# requires write access. `pull_request_target` runs with the base repo's
+# token, but the org/repo default is read-only, so grant the minimum needed
+# scopes explicitly. Checkout stays on the base ref (the default for
+# `pull_request_target`) — we never run untrusted PR code with this token.
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
 jobs:
   comment:
     runs-on: ubuntu-latest
