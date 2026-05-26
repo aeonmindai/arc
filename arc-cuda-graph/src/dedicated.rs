@@ -9,7 +9,7 @@
 //!   Step 3+ (replay):  Copy inputs → cuGraphLaunch (all compute replayed from fixed addresses)
 
 #[cfg(feature = "cuda")]
-use crate::decode_forward::{DecodeBuffers, LayerKvCache, PagedAttentionState, decode_forward};
+use crate::decode_forward::{decode_forward, DecodeBuffers, LayerKvCache, PagedAttentionState};
 #[cfg(feature = "cuda")]
 use crate::ffi::*;
 #[cfg(feature = "cuda")]
@@ -22,8 +22,11 @@ extern "C" {
     fn cudaMalloc(ptr: *mut u64, size: usize) -> u32;
     fn cudaFree(ptr: u64) -> u32;
     fn cudaMemcpyAsync(
-        dst: *mut std::ffi::c_void, src: *const std::ffi::c_void,
-        count: usize, kind: u32, stream: CUstream,
+        dst: *mut std::ffi::c_void,
+        src: *const std::ffi::c_void,
+        count: usize,
+        kind: u32,
+        stream: CUstream,
     ) -> u32;
 }
 
@@ -42,9 +45,9 @@ pub struct DedicatedDecodePath {
     captured_batch_size: usize,
 
     // Staging buffers for paged attention metadata (fixed GPU addresses for graph replay)
-    staging_block_tables: u64,      // [max_batch, max_blocks_per_seq] i32
-    staging_context_lens: u64,      // [max_batch] i32
-    staging_slot_mappings: u64,     // [max_batch] i64
+    staging_block_tables: u64,  // [max_batch, max_blocks_per_seq] i32
+    staging_context_lens: u64,  // [max_batch] i32
+    staging_slot_mappings: u64, // [max_batch] i64
     staging_max_blocks_per_seq: usize,
     staging_max_batch: usize,
 
@@ -143,7 +146,9 @@ impl DedicatedDecodePath {
         // be paranoid: any later kernel must observe the fused buffer
         // populated, AND no in-flight async copies must outlive the source.
         unsafe {
-            extern "C" { fn cudaDeviceSynchronize() -> u32; }
+            extern "C" {
+                fn cudaDeviceSynchronize() -> u32;
+            }
             let s = cudaDeviceSynchronize();
             if s != 0 {
                 candle_core::bail!(
@@ -236,7 +241,8 @@ impl DedicatedDecodePath {
                 candle_core::Error::Msg(
                     "DedicatedDecodePath::new: ModelWeights has no anchors — \
                      weight extraction is broken (dangling-pointer protection \
-                     missing)".to_string(),
+                     missing)"
+                        .to_string(),
                 )
             })?;
         let device = anchor.device();
@@ -245,17 +251,14 @@ impl DedicatedDecodePath {
                 // cudarc's CudaStream::synchronize() calls bind_to_thread()
                 // internally before doing any work. It's the cheapest safe
                 // way to ensure the context is bound on this thread.
-                cuda_dev
-                    .cuda_stream()
-                    .synchronize()
-                    .map_err(|e| candle_core::Error::Msg(format!(
+                cuda_dev.cuda_stream().synchronize().map_err(|e| {
+                    candle_core::Error::Msg(format!(
                         "Failed to bind CUDA context to dedicated-decode thread: {e}"
-                    )))?;
+                    ))
+                })?;
                 Ok(())
             }
-            other => candle_core::bail!(
-                "DedicatedDecodePath requires a CUDA model, got {other:?}"
-            ),
+            other => candle_core::bail!("DedicatedDecodePath requires a CUDA model, got {other:?}"),
         }
     }
 
@@ -288,17 +291,40 @@ impl DedicatedDecodePath {
 
         unsafe {
             let s = cudaMalloc(&mut cos_ptr, table_bytes);
-            if s != 0 { candle_core::bail!("cudaMalloc cos_table failed: {s}"); }
+            if s != 0 {
+                candle_core::bail!("cudaMalloc cos_table failed: {s}");
+            }
             let s = cudaMalloc(&mut sin_ptr, table_bytes);
-            if s != 0 { candle_core::bail!("cudaMalloc sin_table failed: {s}"); }
+            if s != 0 {
+                candle_core::bail!("cudaMalloc sin_table failed: {s}");
+            }
 
             extern "C" {
-                fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: u32) -> u32;
+                fn cudaMemcpy(
+                    dst: *mut std::ffi::c_void,
+                    src: *const std::ffi::c_void,
+                    count: usize,
+                    kind: u32,
+                ) -> u32;
             }
-            let s = cudaMemcpy(cos_ptr as *mut _, cos_bf16.as_ptr() as *const _, table_bytes, 1);
-            if s != 0 { candle_core::bail!("cudaMemcpy cos_table failed: {s}"); }
-            let s = cudaMemcpy(sin_ptr as *mut _, sin_bf16.as_ptr() as *const _, table_bytes, 1);
-            if s != 0 { candle_core::bail!("cudaMemcpy sin_table failed: {s}"); }
+            let s = cudaMemcpy(
+                cos_ptr as *mut _,
+                cos_bf16.as_ptr() as *const _,
+                table_bytes,
+                1,
+            );
+            if s != 0 {
+                candle_core::bail!("cudaMemcpy cos_table failed: {s}");
+            }
+            let s = cudaMemcpy(
+                sin_ptr as *mut _,
+                sin_bf16.as_ptr() as *const _,
+                table_bytes,
+                1,
+            );
+            if s != 0 {
+                candle_core::bail!("cudaMemcpy sin_table failed: {s}");
+            }
         }
 
         Ok((cos_ptr, sin_ptr))
@@ -318,7 +344,12 @@ impl DedicatedDecodePath {
     /// Arc<Storage> alive.
     fn fuse_qkv(weights: &mut ModelWeights) -> candle_core::Result<()> {
         extern "C" {
-            fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: u32) -> u32;
+            fn cudaMemcpy(
+                dst: *mut std::ffi::c_void,
+                src: *const std::ffi::c_void,
+                count: usize,
+                kind: u32,
+            ) -> u32;
         }
         let bf16 = 2usize;
         let k = weights.config.hidden_size;
@@ -337,31 +368,62 @@ impl DedicatedDecodePath {
                 candle_core::bail!(
                     "fuse_qkv layer {li}: NULL Q/K/V pointer (q={:#x} k={:#x} v={:#x}) — \
                      weight extraction returned a dangling/unfilled pointer",
-                    lw.q_proj.ptr, lw.k_proj.ptr, lw.v_proj.ptr,
+                    lw.q_proj.ptr,
+                    lw.k_proj.ptr,
+                    lw.v_proj.ptr,
                 );
             }
 
             let mut ptr: u64 = 0;
             let s = unsafe { cudaMalloc(&mut ptr, total_size) };
-            if s != 0 { candle_core::bail!("cudaMalloc QKV fused (layer {li}, {total_size} bytes) failed: {s}"); }
+            if s != 0 {
+                candle_core::bail!(
+                    "cudaMalloc QKV fused (layer {li}, {total_size} bytes) failed: {s}"
+                );
+            }
 
             unsafe {
                 let mut off = 0usize;
-                let s = cudaMemcpy((ptr + off as u64) as *mut _, lw.q_proj.ptr as *const _, qr * k * bf16, 3);
-                if s != 0 { candle_core::bail!("cudaMemcpy Q→fused (layer {li}) failed: {s}"); }
+                let s = cudaMemcpy(
+                    (ptr + off as u64) as *mut _,
+                    lw.q_proj.ptr as *const _,
+                    qr * k * bf16,
+                    3,
+                );
+                if s != 0 {
+                    candle_core::bail!("cudaMemcpy Q→fused (layer {li}) failed: {s}");
+                }
                 off += qr * k * bf16;
-                let s = cudaMemcpy((ptr + off as u64) as *mut _, lw.k_proj.ptr as *const _, kr * k * bf16, 3);
-                if s != 0 { candle_core::bail!("cudaMemcpy K→fused (layer {li}) failed: {s}"); }
+                let s = cudaMemcpy(
+                    (ptr + off as u64) as *mut _,
+                    lw.k_proj.ptr as *const _,
+                    kr * k * bf16,
+                    3,
+                );
+                if s != 0 {
+                    candle_core::bail!("cudaMemcpy K→fused (layer {li}) failed: {s}");
+                }
                 off += kr * k * bf16;
-                let s = cudaMemcpy((ptr + off as u64) as *mut _, lw.v_proj.ptr as *const _, vr * k * bf16, 3);
-                if s != 0 { candle_core::bail!("cudaMemcpy V→fused (layer {li}) failed: {s}"); }
+                let s = cudaMemcpy(
+                    (ptr + off as u64) as *mut _,
+                    lw.v_proj.ptr as *const _,
+                    vr * k * bf16,
+                    3,
+                );
+                if s != 0 {
+                    candle_core::bail!("cudaMemcpy V→fused (layer {li}) failed: {s}");
+                }
             }
             lw.qkv_fused = ptr;
             lw.qkv_rows = total_rows;
             total_bytes += total_size;
         }
 
-        tracing::info!("QKV fused: {} layers, {:.1} GB", weights.layers.len(), total_bytes as f64 / 1e9);
+        tracing::info!(
+            "QKV fused: {} layers, {:.1} GB",
+            weights.layers.len(),
+            total_bytes as f64 / 1e9
+        );
         Ok(())
     }
 
@@ -378,7 +440,9 @@ impl DedicatedDecodePath {
             ($size:expr) => {{
                 let mut ptr: u64 = 0;
                 let s = unsafe { cudaMalloc(&mut ptr, $size) };
-                if s != 0 { candle_core::bail!("cudaMalloc failed for decode buffer: {s}"); }
+                if s != 0 {
+                    candle_core::bail!("cudaMalloc failed for decode buffer: {s}");
+                }
                 ptr
             }};
         }
@@ -388,7 +452,9 @@ impl DedicatedDecodePath {
             hidden_b: alloc!(bs * cfg.hidden_size * bf16),
             normed: alloc!(bs * cfg.hidden_size * bf16),
             residual: alloc!(bs * cfg.hidden_size * bf16),
-            qkv: alloc!(bs * (cfg.num_heads * cfg.head_dim + 2 * cfg.num_kv_heads * cfg.head_dim) * bf16),
+            qkv: alloc!(
+                bs * (cfg.num_heads * cfg.head_dim + 2 * cfg.num_kv_heads * cfg.head_dim) * bf16
+            ),
             q: 0, // set per-layer as alias into qkv
             k: 0,
             v: 0,
@@ -416,8 +482,14 @@ impl DedicatedDecodePath {
                 }
                 let mut n: i32 = 0;
                 // attr 16 = cudaDevAttrMultiProcessorCount.
-                unsafe { cudaDeviceGetAttribute(&mut n, 16, 0); }
-                if n <= 0 { 1 } else { n }
+                unsafe {
+                    cudaDeviceGetAttribute(&mut n, 16, 0);
+                }
+                if n <= 0 {
+                    1
+                } else {
+                    n
+                }
             },
         };
 
@@ -427,8 +499,8 @@ impl DedicatedDecodePath {
             + bs * cfg.hidden_size * bf16
             + bs * cfg.intermediate_size * bf16 * 3
             + bs * cfg.hidden_size * bf16
-            + bs * cfg.vocab_size * bf16
-        ) / 1_048_576;
+            + bs * cfg.vocab_size * bf16)
+            / 1_048_576;
 
         tracing::info!("Decode buffers allocated: ~{total_mb} MB for batch_size={bs}");
         self.buffers = Some(buffers);
@@ -437,37 +509,59 @@ impl DedicatedDecodePath {
 
     /// Allocate staging buffers for paged attention metadata.
     /// These are at fixed GPU addresses so the captured graph can replay.
-    fn ensure_staging(&mut self, batch_size: usize, max_blocks_per_seq: usize) -> candle_core::Result<()> {
-        if self.staging_max_batch >= batch_size && self.staging_max_blocks_per_seq >= max_blocks_per_seq {
+    fn ensure_staging(
+        &mut self,
+        batch_size: usize,
+        max_blocks_per_seq: usize,
+    ) -> candle_core::Result<()> {
+        if self.staging_max_batch >= batch_size
+            && self.staging_max_blocks_per_seq >= max_blocks_per_seq
+        {
             return Ok(());
         }
         // Free old staging if resizing — also invalidates captured graph
         if let Some(exec) = self.graph_exec.take() {
-            unsafe { cuGraphExecDestroy(exec); }
+            unsafe {
+                cuGraphExecDestroy(exec);
+            }
             tracing::info!("Staging resize → graph invalidated");
         }
         unsafe {
-            if self.staging_block_tables != 0 { cudaFree(self.staging_block_tables); }
-            if self.staging_context_lens != 0 { cudaFree(self.staging_context_lens); }
-            if self.staging_slot_mappings != 0 { cudaFree(self.staging_slot_mappings); }
+            if self.staging_block_tables != 0 {
+                cudaFree(self.staging_block_tables);
+            }
+            if self.staging_context_lens != 0 {
+                cudaFree(self.staging_context_lens);
+            }
+            if self.staging_slot_mappings != 0 {
+                cudaFree(self.staging_slot_mappings);
+            }
         }
         let mut bt: u64 = 0;
         let mut cl: u64 = 0;
         let mut sm: u64 = 0;
         unsafe {
             let s = cudaMalloc(&mut bt, batch_size * max_blocks_per_seq * 4); // i32
-            if s != 0 { candle_core::bail!("cudaMalloc staging_block_tables failed: {s}"); }
+            if s != 0 {
+                candle_core::bail!("cudaMalloc staging_block_tables failed: {s}");
+            }
             let s = cudaMalloc(&mut cl, batch_size * 4); // i32
-            if s != 0 { candle_core::bail!("cudaMalloc staging_context_lens failed: {s}"); }
+            if s != 0 {
+                candle_core::bail!("cudaMalloc staging_context_lens failed: {s}");
+            }
             let s = cudaMalloc(&mut sm, batch_size * 8); // i64
-            if s != 0 { candle_core::bail!("cudaMalloc staging_slot_mappings failed: {s}"); }
+            if s != 0 {
+                candle_core::bail!("cudaMalloc staging_slot_mappings failed: {s}");
+            }
         }
         self.staging_block_tables = bt;
         self.staging_context_lens = cl;
         self.staging_slot_mappings = sm;
         self.staging_max_batch = batch_size;
         self.staging_max_blocks_per_seq = max_blocks_per_seq;
-        tracing::info!("Staging buffers allocated: batch={batch_size}, max_blocks={max_blocks_per_seq}");
+        tracing::info!(
+            "Staging buffers allocated: batch={batch_size}, max_blocks={max_blocks_per_seq}"
+        );
         Ok(())
     }
 
@@ -478,20 +572,26 @@ impl DedicatedDecodePath {
         let actual_blocks = paged_attn.max_num_blocks_per_seq as usize;
         // block_tables: [batch, actual_blocks] i32/u32
         cudaMemcpyAsync(
-            self.staging_block_tables as *mut _, paged_attn.block_tables as *const _,
-            batch_size * actual_blocks * 4, 3, // D2D
+            self.staging_block_tables as *mut _,
+            paged_attn.block_tables as *const _,
+            batch_size * actual_blocks * 4,
+            3, // D2D
             self.stream,
         );
         // context_lens: [batch] i32/u32
         cudaMemcpyAsync(
-            self.staging_context_lens as *mut _, paged_attn.context_lens as *const _,
-            batch_size * 4, 3,
+            self.staging_context_lens as *mut _,
+            paged_attn.context_lens as *const _,
+            batch_size * 4,
+            3,
             self.stream,
         );
         // slot_mappings: [batch] i64
         cudaMemcpyAsync(
-            self.staging_slot_mappings as *mut _, paged_attn.slot_mappings as *const _,
-            batch_size * 8, 3,
+            self.staging_slot_mappings as *mut _,
+            paged_attn.slot_mappings as *const _,
+            batch_size * 8,
+            3,
             self.stream,
         );
     }
@@ -510,10 +610,14 @@ impl DedicatedDecodePath {
                     // Query DEFAULT per-block smem limit (not opt-in — we don't call cudaFuncSetAttribute)
                     let mut smem: i32 = 0;
                     unsafe {
-                        extern "C" { fn cudaDeviceGetAttribute(v: *mut i32, a: i32, d: i32) -> u32; }
+                        extern "C" {
+                            fn cudaDeviceGetAttribute(v: *mut i32, a: i32, d: i32) -> u32;
+                        }
                         // attr 8 = cudaDevAttrMaxSharedMemoryPerBlock (default, not opt-in)
                         cudaDeviceGetAttribute(&mut smem, 8, 0);
-                        if smem <= 0 { smem = 49152; }
+                        if smem <= 0 {
+                            smem = 49152;
+                        }
                     }
                     let usable = (smem - 2048).max(16384); // leave 2KB headroom
                     let bs = self.cached_block_size.max(1);
@@ -565,7 +669,8 @@ impl DedicatedDecodePath {
         let t0 = std::time::Instant::now();
         self.ensure_buffers(batch_size)?;
         let max_possible_blocks = (self.weights.config.max_position_embeddings
-            / paged_attn.block_size.max(1) as usize).max(paged_attn.max_num_blocks_per_seq as usize);
+            / paged_attn.block_size.max(1) as usize)
+            .max(paged_attn.max_num_blocks_per_seq as usize);
         self.ensure_staging(batch_size, max_possible_blocks)?;
         self.cache_kv_info(paged_attn);
         let buffers = self.buffers.as_ref().unwrap();
@@ -573,12 +678,18 @@ impl DedicatedDecodePath {
 
         unsafe {
             cudaMemcpyAsync(
-                buffers.token_ids as *mut _, token_ids_gpu as *const _,
-                batch_size * token_dtype_size, 3, self.stream,
+                buffers.token_ids as *mut _,
+                token_ids_gpu as *const _,
+                batch_size * token_dtype_size,
+                3,
+                self.stream,
             );
             cudaMemcpyAsync(
-                buffers.positions as *mut _, positions.as_ptr() as *const _,
-                batch_size * 4, 1, self.stream,
+                buffers.positions as *mut _,
+                positions.as_ptr() as *const _,
+                batch_size * 4,
+                1,
+                self.stream,
             );
             self.stage_paged_attn(paged_attn, batch_size);
             let staged = self.staged_paged_attn(paged_attn);
@@ -634,7 +745,8 @@ impl DedicatedDecodePath {
         // Pre-allocate staging for max possible blocks to avoid reallocation
         // (which would invalidate captured graph pointers)
         let max_possible_blocks = (self.weights.config.max_position_embeddings
-            / paged_attn.block_size.max(1) as usize).max(paged_attn.max_num_blocks_per_seq as usize);
+            / paged_attn.block_size.max(1) as usize)
+            .max(paged_attn.max_num_blocks_per_seq as usize);
         self.ensure_staging(batch_size, max_possible_blocks)?;
         self.cache_kv_info(paged_attn);
 
@@ -644,12 +756,18 @@ impl DedicatedDecodePath {
         unsafe {
             // Stage all changing inputs (NOT part of the graph — happens before capture/launch)
             cudaMemcpyAsync(
-                buffers.token_ids as *mut _, token_ids.as_ptr() as *const _,
-                batch_size * 4, 1, self.stream,
+                buffers.token_ids as *mut _,
+                token_ids.as_ptr() as *const _,
+                batch_size * 4,
+                1,
+                self.stream,
             );
             cudaMemcpyAsync(
-                buffers.positions as *mut _, positions.as_ptr() as *const _,
-                batch_size * 4, 1, self.stream,
+                buffers.positions as *mut _,
+                positions.as_ptr() as *const _,
+                batch_size * 4,
+                1,
+                self.stream,
             );
             self.stage_paged_attn(paged_attn, batch_size);
             let t_after_stage = std::time::Instant::now();
@@ -662,13 +780,22 @@ impl DedicatedDecodePath {
             if let Some(exec) = self.graph_exec {
                 // REPLAY: all inputs staged, just launch
                 if batch_size != self.captured_batch_size {
-                    tracing::warn!("Batch size changed ({} → {}), running eager", self.captured_batch_size, batch_size);
+                    tracing::warn!(
+                        "Batch size changed ({} → {}), running eager",
+                        self.captured_batch_size,
+                        batch_size
+                    );
                     decode_forward(&self.weights, buffers, &staged, self.stream);
                 } else if self.step_count > 0 && self.step_count % 5000 == 0 {
                     // Periodic per-kernel profile so we can see steady-state hotspots.
                     // profile_forward is decode_forward with CUDA event timing — same compute,
                     // same KV-cache state advancement.
-                    crate::decode_forward::profile_forward(&self.weights, buffers, &staged, self.stream);
+                    crate::decode_forward::profile_forward(
+                        &self.weights,
+                        buffers,
+                        &staged,
+                        self.stream,
+                    );
                 } else {
                     let s = cuGraphLaunch(exec, self.stream);
                     if s != CUDA_SUCCESS {
@@ -682,12 +809,19 @@ impl DedicatedDecodePath {
             } else if self.eager_steps < 2 {
                 // Profile on first eager step
                 if self.eager_steps == 1 {
-                    crate::decode_forward::profile_forward(&self.weights, buffers, &staged, self.stream);
+                    crate::decode_forward::profile_forward(
+                        &self.weights,
+                        buffers,
+                        &staged,
+                        self.stream,
+                    );
                 }
                 self.eager_steps += 1;
                 decode_forward(&self.weights, buffers, &staged, self.stream);
                 if self.eager_steps == 2 {
-                    tracing::info!("Dedicated decode: eager warmup done, will attempt capture next step");
+                    tracing::info!(
+                        "Dedicated decode: eager warmup done, will attempt capture next step"
+                    );
                 }
             } else {
                 // CAPTURE: record the forward pass into a CUDA graph
@@ -705,14 +839,19 @@ impl DedicatedDecodePath {
                     let s = cuStreamEndCapture(self.stream, &mut graph);
                     if s != CUDA_SUCCESS || graph.is_null() {
                         tracing::warn!("cuStreamEndCapture failed ({s}), disabling capture");
-                        if !graph.is_null() { cuGraphDestroy(graph); }
+                        if !graph.is_null() {
+                            cuGraphDestroy(graph);
+                        }
                         self.capture_failed = true;
                         decode_forward(&self.weights, buffers, &staged, self.stream);
                     } else {
                         let mut exec: CUgraphExec = std::ptr::null_mut();
                         let s = cuGraphInstantiate_v2(
-                            &mut exec, graph,
-                            std::ptr::null_mut(), std::ptr::null_mut(), 0,
+                            &mut exec,
+                            graph,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            0,
                         );
                         cuGraphDestroy(graph);
 
@@ -723,14 +862,18 @@ impl DedicatedDecodePath {
                         } else {
                             let s = cuGraphLaunch(exec, self.stream);
                             if s != CUDA_SUCCESS {
-                                tracing::warn!("First cuGraphLaunch failed ({s}), disabling capture");
+                                tracing::warn!(
+                                    "First cuGraphLaunch failed ({s}), disabling capture"
+                                );
                                 cuGraphExecDestroy(exec);
                                 self.capture_failed = true;
                                 decode_forward(&self.weights, buffers, &staged, self.stream);
                             } else {
                                 self.graph_exec = Some(exec);
                                 self.captured_batch_size = batch_size;
-                                tracing::info!("CUDA graph captured and launched for batch_size={batch_size}");
+                                tracing::info!(
+                                    "CUDA graph captured and launched for batch_size={batch_size}"
+                                );
                             }
                         }
                     }
@@ -804,7 +947,10 @@ impl DedicatedDecodePath {
         batch_size: usize,
     ) -> candle_core::Result<&crate::decode_forward::DecodeBuffers> {
         self.ensure_buffers(batch_size)?;
-        Ok(self.buffers.as_ref().expect("ensure_buffers populates buffers"))
+        Ok(self
+            .buffers
+            .as_ref()
+            .expect("ensure_buffers populates buffers"))
     }
 
     /// Build a staged `PagedAttentionState` from the dedicated path's cached
@@ -825,7 +971,9 @@ impl DedicatedDecodePath {
         // own stream — these are NOT captured into the autonomous graph because
         // we run them outside the capture region. Inside capture, the runner's
         // own input_buffers are used.
-        unsafe { self.stage_paged_attn(paged_attn, batch_size); }
+        unsafe {
+            self.stage_paged_attn(paged_attn, batch_size);
+        }
         Ok(self.staged_paged_attn(paged_attn))
     }
 }
@@ -837,22 +985,48 @@ impl Drop for DedicatedDecodePath {
             if let Some(exec) = self.graph_exec {
                 cuGraphExecDestroy(exec);
             }
-            if self.cos_table != 0 { cudaFree(self.cos_table); }
-            if self.sin_table != 0 { cudaFree(self.sin_table); }
-            for lw in &self.weights.layers {
-                if lw.qkv_fused != 0 { cudaFree(lw.qkv_fused); }
+            if self.cos_table != 0 {
+                cudaFree(self.cos_table);
             }
-            if self.staging_block_tables != 0 { cudaFree(self.staging_block_tables); }
-            if self.staging_context_lens != 0 { cudaFree(self.staging_context_lens); }
-            if self.staging_slot_mappings != 0 { cudaFree(self.staging_slot_mappings); }
+            if self.sin_table != 0 {
+                cudaFree(self.sin_table);
+            }
+            for lw in &self.weights.layers {
+                if lw.qkv_fused != 0 {
+                    cudaFree(lw.qkv_fused);
+                }
+            }
+            if self.staging_block_tables != 0 {
+                cudaFree(self.staging_block_tables);
+            }
+            if self.staging_context_lens != 0 {
+                cudaFree(self.staging_context_lens);
+            }
+            if self.staging_slot_mappings != 0 {
+                cudaFree(self.staging_slot_mappings);
+            }
             if let Some(ref b) = self.buffers {
-                for ptr in [b.hidden_a, b.hidden_b, b.normed, b.residual,
-                    b.qkv, b.attn_out,
+                for ptr in [
+                    b.hidden_a,
+                    b.hidden_b,
+                    b.normed,
+                    b.residual,
+                    b.qkv,
+                    b.attn_out,
                     b.attn_out_f32,
                     b.o_proj_out,
-                    b.gate, b.up, b.mlp_act, b.down_out, b.logits, b.logits_f32,
-                    b.token_ids, b.positions] {
-                    if ptr != 0 { cudaFree(ptr); }
+                    b.gate,
+                    b.up,
+                    b.mlp_act,
+                    b.down_out,
+                    b.logits,
+                    b.logits_f32,
+                    b.token_ids,
+                    b.positions,
+                ] {
+                    if ptr != 0 {
+                        cudaFree(ptr);
+                    }
                 }
             }
             cuStreamDestroy_v2(self.stream);

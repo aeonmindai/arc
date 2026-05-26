@@ -32,7 +32,10 @@ impl SamplingConfig {
             return Err(format!("top_p must be in [0,1], got {}", self.top_p));
         }
         if self.top_k != -1 && self.top_k < 1 {
-            return Err(format!("top_k must be -1 (disabled) or >= 1, got {}", self.top_k));
+            return Err(format!(
+                "top_k must be -1 (disabled) or >= 1, got {}",
+                self.top_k
+            ));
         }
         if !self.frequency_penalty.is_finite() || !self.presence_penalty.is_finite() {
             return Err("penalty values must be finite".into());
@@ -58,11 +61,7 @@ impl SamplingConfig {
 /// history. Matches HuggingFace's `RepetitionPenaltyLogitsProcessor`.
 ///
 /// `frequency_counts[t]` = number of times token t has been generated so far.
-pub fn apply_penalties(
-    logits: &mut [f32],
-    frequency_counts: &[u32],
-    cfg: SamplingConfig,
-) {
+pub fn apply_penalties(logits: &mut [f32], frequency_counts: &[u32], cfg: SamplingConfig) {
     debug_assert_eq!(logits.len(), frequency_counts.len());
     for (tok, &count) in frequency_counts.iter().enumerate() {
         if count == 0 {
@@ -129,9 +128,7 @@ pub fn sample(
 
     // Sort descending and apply top-p truncation.
     let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
-    indexed.sort_unstable_by(|a, b| {
-        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut keep: Vec<(usize, f32)> = Vec::with_capacity(indexed.len());
     let mut cum = 0.0f32;
@@ -156,8 +153,7 @@ pub fn sample(
     *rng_state = rng_state
         .wrapping_mul(0x9E3779B97F4A7C15)
         .wrapping_add(0xDEADBEEFC0DECAFE);
-    let mixed = (*rng_state ^ (*rng_state >> 30))
-        .wrapping_mul(0xBF58476D1CE4E5B9);
+    let mixed = (*rng_state ^ (*rng_state >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
     let u = ((mixed >> 33) as u32) as f32 / (1u64 << 31) as f32;
     let target = u * kept_sum;
 

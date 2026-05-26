@@ -37,7 +37,11 @@ fn covers_all_twelve_languages() {
     .into_iter()
     .collect();
     let actual: BTreeSet<&str> = per_lang.keys().map(|k| k.as_str()).collect();
-    assert_eq!(actual, expected, "missing or extra language: {:?}", per_lang);
+    assert_eq!(
+        actual, expected,
+        "missing or extra language: {:?}",
+        per_lang
+    );
     for (lang, count) in &per_lang {
         assert!(
             *count >= 3 && *count <= 5,

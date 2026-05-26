@@ -146,8 +146,7 @@ pub fn validate_eagle3_weights<'a, I>(keys: I) -> Eagle3WeightValidation
 where
     I: IntoIterator<Item = &'a str>,
 {
-    let key_set: std::collections::HashSet<String> =
-        keys.into_iter().map(String::from).collect();
+    let key_set: std::collections::HashSet<String> = keys.into_iter().map(String::from).collect();
     let expected = expected_eagle3_weight_patterns();
 
     let mut found = Vec::new();
@@ -216,7 +215,10 @@ mod tests {
 
     #[test]
     fn auto_detect_returns_none_for_unknown_target() {
-        assert_eq!(huggingface_head_for_target("my-org/Unsupported-Model-7B"), None);
+        assert_eq!(
+            huggingface_head_for_target("my-org/Unsupported-Model-7B"),
+            None
+        );
         // Plain Llama-2 has no community EAGLE-3 head (only EAGLE-1)
         assert_eq!(huggingface_head_for_target("meta-llama/Llama-2-7B"), None);
     }
@@ -285,7 +287,7 @@ mod tests {
 
     #[test]
     fn validation_reports_missing_weights() {
-        let keys = vec![
+        let keys = [
             "embed_tokens.weight",
             "norm.weight",
             // missing lm_head, fc, and all layer weights

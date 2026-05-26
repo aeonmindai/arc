@@ -200,7 +200,10 @@ pub fn typescript_long() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_002", "wrote 414 bytes to app/projects/[id]/page.tsx"));
+    turns.push(tool(
+        "call_002",
+        "wrote 414 bytes to app/projects/[id]/page.tsx",
+    ));
     turns.push(assistant_call(
         "Adding the loading skeleton.",
         "call_003",
@@ -211,7 +214,10 @@ pub fn typescript_long() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_003", "wrote 290 bytes to app/projects/[id]/loading.tsx"));
+    turns.push(tool(
+        "call_003",
+        "wrote 290 bytes to app/projects/[id]/loading.tsx",
+    ));
     turns.push(assistant_call(
         "Deleting the old pages-router file.",
         "call_004",
@@ -277,7 +283,10 @@ pub fn go_long() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_002", "wrote 974 bytes to pkg/middleware/middleware.go"));
+    turns.push(tool(
+        "call_002",
+        "wrote 974 bytes to pkg/middleware/middleware.go",
+    ));
     turns.push(assistant_call(
         "Now the tests.",
         "call_003",
@@ -288,7 +297,10 @@ pub fn go_long() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_003", "wrote 1138 bytes to pkg/middleware/middleware_test.go"));
+    turns.push(tool(
+        "call_003",
+        "wrote 1138 bytes to pkg/middleware/middleware_test.go",
+    ));
     turns.push(assistant_call(
         "Wiring the middlewares in main.",
         "call_004",
@@ -399,10 +411,7 @@ pub fn java_long() -> Trajectory {
         json!({"cmd":"./mvnw test -Dtest=OrdersControllerTest -q"}),
         &turns,
     ));
-    turns.push(tool(
-        "call_006",
-        "[INFO] BUILD SUCCESS\n",
-    ));
+    turns.push(tool("call_006", "[INFO] BUILD SUCCESS\n"));
     turns.push(assistant_text(
         "Paginated endpoint shipped with a controller test. Add a json:date deserializer if the Instant payload field name in OrderDTO needs a custom format.",
         &turns,
@@ -411,7 +420,11 @@ pub fn java_long() -> Trajectory {
     assemble(
         "agentperf_tuning_055_long",
         "java",
-        src("github.com/spring-projects/spring-boot", "Apache-2.0", "9c7a234"),
+        src(
+            "github.com/spring-projects/spring-boot",
+            "Apache-2.0",
+            "9c7a234",
+        ),
         turns,
     )
 }

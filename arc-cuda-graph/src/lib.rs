@@ -5,15 +5,15 @@
 //! Decode runs on a non-blocking stream with cuBLASLt + custom kernels.
 //! Capturable by CUDA graphs.
 
-pub mod ffi;
-pub mod graph;
-pub mod buffers;
 pub mod autonomous;
-pub mod weights;
+pub mod buffers;
 pub mod decode_forward;
 pub mod dedicated;
+pub mod ffi;
 pub mod gemv_ffi;
+pub mod graph;
 pub mod nongemv_ffi;
+pub mod weights;
 
 /// FlashMLASparse — V4 Lightning Indexer scoring + radix top-k.
 ///
@@ -42,17 +42,20 @@ pub use sampling_cuda::{gpu_algorithm_simulate, SamplingParams, GPU_MAX_KEEP};
 pub use sampling_cuda::CudaSampler;
 
 #[cfg(feature = "cuda")]
-pub use graph::CudaGraphRunner;
+pub use autonomous::{AutonomousDecodeConfig, AutonomousDecodeRunner};
 #[cfg(feature = "cuda")]
 pub use buffers::{DecodeInputBuffers, DecodeState};
 #[cfg(feature = "cuda")]
-pub use autonomous::{AutonomousDecodeConfig, AutonomousDecodeRunner};
-#[cfg(feature = "cuda")]
-pub use weights::{ModelWeights, DecodeConfig, LayerWeights, WeightPtr, WeightAnchors, LayerAnchors, tensor_device_ptr, extract_model_weights, quant_method_ptr};
-#[cfg(feature = "cuda")]
-pub use decode_forward::{DecodeBuffers, PagedAttentionState, LayerKvCache, decode_forward};
+pub use decode_forward::{decode_forward, DecodeBuffers, LayerKvCache, PagedAttentionState};
 #[cfg(feature = "cuda")]
 pub use dedicated::DedicatedDecodePath;
+#[cfg(feature = "cuda")]
+pub use graph::CudaGraphRunner;
+#[cfg(feature = "cuda")]
+pub use weights::{
+    extract_model_weights, quant_method_ptr, tensor_device_ptr, DecodeConfig, LayerAnchors,
+    LayerWeights, ModelWeights, WeightAnchors, WeightPtr,
+};
 
 /// Try to create a CUDA graph runner for the given device.
 #[cfg(feature = "cuda")]
@@ -87,9 +90,7 @@ pub fn try_init_autonomous_runner(
     config: AutonomousDecodeConfig,
 ) -> Option<AutonomousDecodeRunner> {
     if !matches!(device, candle_core::Device::Cuda(_)) {
-        tracing::warn!(
-            "Autonomous decode runner unavailable: device is not CUDA"
-        );
+        tracing::warn!("Autonomous decode runner unavailable: device is not CUDA");
         return None;
     }
     match AutonomousDecodeRunner::new(config, device) {

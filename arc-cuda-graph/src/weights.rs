@@ -219,7 +219,10 @@ pub fn quant_method_ptr(
 ///   model.layers.N.self_attn.q_norm.weight (optional), etc.
 #[cfg(feature = "cuda")]
 pub fn extract_model_weights(
-    layers: &[(&std::sync::Arc<dyn mistralrs_quant::QuantMethod>, Option<usize>)],
+    layers: &[(
+        &std::sync::Arc<dyn mistralrs_quant::QuantMethod>,
+        Option<usize>,
+    )],
     residuals: &[(String, candle_core::Tensor)],
     config: DecodeConfig,
 ) -> candle_core::Result<ModelWeights> {
@@ -282,7 +285,9 @@ pub fn extract_model_weights(
 
         if name.ends_with("embed_tokens.weight") {
             embed_tokens = ptr;
-        } else if name == "model.norm.weight" || name.ends_with(".norm.weight") && !name.contains("layers") {
+        } else if name == "model.norm.weight"
+            || name.ends_with(".norm.weight") && !name.contains("layers")
+        {
             final_norm = ptr;
         } else if name.contains("input_layernorm.weight") {
             // Extract layer index: model.layers.N.input_layernorm.weight
@@ -343,7 +348,7 @@ fn extract_layer_idx(name: &str) -> Option<usize> {
 /// This test runs without the cuda feature because it uses CPU tensors.
 #[cfg(test)]
 mod cpu_anchor_tests {
-    use candle_core::{Device, Tensor, DType, Storage};
+    use candle_core::{DType, Device, Storage, Tensor};
 
     fn storage_addr(t: &Tensor) -> usize {
         let (storage, _) = t.storage_and_layout();
@@ -384,7 +389,8 @@ mod cpu_anchor_tests {
             // the storage alive.
         }
         assert_eq!(
-            original_addr, storage_addr(&anchor),
+            original_addr,
+            storage_addr(&anchor),
             "Anchored Tensor must keep storage alive after the original drops"
         );
         // Touch the storage to prove it's still readable.
@@ -425,8 +431,7 @@ mod tests {
         where
             F: Fn(
                 &dyn mistralrs_quant::QuantMethod,
-            )
-                -> candle_core::Result<(super::WeightPtr, candle_core::Tensor)>,
+            ) -> candle_core::Result<(super::WeightPtr, candle_core::Tensor)>,
         {
         }
         _signature_check(super::quant_method_ptr);

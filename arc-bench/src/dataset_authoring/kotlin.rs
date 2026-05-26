@@ -38,7 +38,10 @@ fn kt_042_coroutine_flow() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_002", "wrote 386 bytes to src/main/kotlin/com/acme/ticker/TickerService.kt"));
+    turns.push(tool(
+        "call_002",
+        "wrote 386 bytes to src/main/kotlin/com/acme/ticker/TickerService.kt",
+    ));
     turns.push(assistant_text(
         "Service now exposes a cold Flow; callers control lifecycle via collect/cancel.",
         &turns,
@@ -47,7 +50,11 @@ fn kt_042_coroutine_flow() -> Trajectory {
     assemble(
         "agentperf_tuning_042",
         "kotlin",
-        src("github.com/Kotlin/kotlinx.coroutines", "Apache-2.0", "1.8.x"),
+        src(
+            "github.com/Kotlin/kotlinx.coroutines",
+            "Apache-2.0",
+            "1.8.x",
+        ),
         turns,
     )
 }
@@ -78,7 +85,10 @@ fn kt_043_ktor_route() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_002", "wrote 762 bytes to src/main/kotlin/com/acme/Application.kt"));
+    turns.push(tool(
+        "call_002",
+        "wrote 762 bytes to src/main/kotlin/com/acme/Application.kt",
+    ));
     turns.push(assistant_text(
         "Healthz wired through Ktor's ContentNegotiation/JSON plugin.",
         &turns,
@@ -118,7 +128,10 @@ fn kt_044_data_class() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_002", "wrote 80 bytes to src/main/kotlin/com/acme/domain/User.kt"));
+    turns.push(tool(
+        "call_002",
+        "wrote 80 bytes to src/main/kotlin/com/acme/domain/User.kt",
+    ));
     turns.push(assistant_text(
         "Note that the new equals/hashCode is structural (covers all three fields), unlike the previous id-only equality. Confirm that's what callers expect.",
         &turns,

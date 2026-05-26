@@ -39,7 +39,10 @@ fn sw_038_swiftui_list() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_002", "wrote 478 bytes to Views/ProjectsListView.swift"));
+    turns.push(tool(
+        "call_002",
+        "wrote 478 bytes to Views/ProjectsListView.swift",
+    ));
     turns.push(assistant_text(
         "View loads on appear via .task and supports pull-to-refresh through .refreshable.",
         &turns,
@@ -79,7 +82,10 @@ fn sw_039_async_url() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_002", "wrote 540 bytes to Services/APIClient.swift"));
+    turns.push(tool(
+        "call_002",
+        "wrote 540 bytes to Services/APIClient.swift",
+    ));
     turns.push(assistant_text(
         "Async version is half the lines and surfaces non-2xx as URLError; call sites need to migrate to `try await client.fetchProjects()`.",
         &turns,
@@ -119,7 +125,10 @@ fn sw_040_combine_to_async() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_002", "wrote 668 bytes to Stores/LocationStore.swift"));
+    turns.push(tool(
+        "call_002",
+        "wrote 668 bytes to Stores/LocationStore.swift",
+    ));
     turns.push(assistant_text(
         "Combine subject replaced with AsyncStream; consumers iterate `for await loc in store.observe()`.",
         &turns,
@@ -170,7 +179,10 @@ fn sw_041_codable_strategy() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_003", "wrote 260 bytes to Networking/Decoder.swift"));
+    turns.push(tool(
+        "call_003",
+        "wrote 260 bytes to Networking/Decoder.swift",
+    ));
     turns.push(assistant_text(
         "Decoder now converts snake_case keys to camelCase and parses ISO-8601 timestamps. User compiles as-is.",
         &turns,

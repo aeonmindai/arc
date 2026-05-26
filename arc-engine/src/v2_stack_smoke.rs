@@ -1,3 +1,5 @@
+// Identity ops in the synthetic-weight index math are intentional for clarity.
+#![allow(clippy::identity_op)]
 //! v2 stack-composition smoke test.
 //!
 //! Exercises the full Arc v2 path on a tiny synthetic model:
@@ -149,7 +151,10 @@ mod tests {
 
         let configs = vec![
             ("V4", r#"{"architectures": ["DeepseekV4ForCausalLM"]}"#),
-            ("Kimi", r#"{"architectures": ["KimiK25ForConditionalGeneration"]}"#),
+            (
+                "Kimi",
+                r#"{"architectures": ["KimiK25ForConditionalGeneration"]}"#,
+            ),
             ("GLM", r#"{"architectures": ["Glm4MoeForCausalLM"]}"#),
             ("GLM5", r#"{"architectures": ["GlmMoeDsaForCausalLM"]}"#),
             ("Llama", r#"{"architectures": ["LlamaForCausalLM"]}"#),
@@ -190,7 +195,6 @@ mod tests {
         let bad_types = r#"{"num_hidden_layers": "forty-three"}"#;
         assert!(DeepSeekV4Config::from_json(bad_types).is_err());
     }
-
 
     /// Tiny FFN with NVFP4 weights and dReLU activation. Verifies the full
     /// pipeline composes without panic and produces finite values.
@@ -320,9 +324,18 @@ mod tests {
 
         // Now group the decoders by expert affinity (simulate they all hit expert 5)
         let reqs = vec![
-            PendingRequest { user_id: 1, expert_ids: vec![5, 0] },
-            PendingRequest { user_id: 2, expert_ids: vec![5, 7] },
-            PendingRequest { user_id: 3, expert_ids: vec![5, 0] },
+            PendingRequest {
+                user_id: 1,
+                expert_ids: vec![5, 0],
+            },
+            PendingRequest {
+                user_id: 2,
+                expert_ids: vec![5, 7],
+            },
+            PendingRequest {
+                user_id: 3,
+                expert_ids: vec![5, 0],
+            },
         ];
         let buckets = group_by_expert(&reqs, AffinityConfig { num_experts: 8 });
         // All 3 hit expert 5: bucket[5] = [1, 2, 3]

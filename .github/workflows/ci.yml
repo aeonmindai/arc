@@ -77,10 +77,15 @@ jobs:
           toolchain: stable
           override: true
       - run: rustup component add rustfmt
+      # Arc is a fork of EricLBuehler/mistral.rs. Formatting is checked only on
+      # Arc-authored crates so the fork stops inheriting upstream rustfmt drift
+      # (mass-reformatting the ~90 upstream mistralrs-* files would create a
+      # large merge-conflict surface on every upstream sync). See
+      # arc-tools/CI_HYGIENE.md.
       - uses: actions-rs/cargo@v1
         with:
           command: fmt
-          args: --all -- --check
+          args: -p arc-bench -p arc-engine -p arc-cuda-graph -p arc-cli -- --check
 
   clippy:
     name: Clippy
@@ -93,10 +98,16 @@ jobs:
           toolchain: stable
           override: true
       - run: rustup component add clippy
+      # Scoped to Arc-authored crates with `--no-deps` so the fork is not gated
+      # on upstream mistralrs-* lint debt (e.g. ~140 `type_complexity` and
+      # pedantic-cast findings across the upstream model files, latent until
+      # now). `--no-deps` lints only the listed packages, not their workspace
+      # dependencies. Arc code inside mistralrs-core (dsv4/turboquant) is kept
+      # clean directly. See arc-tools/CI_HYGIENE.md.
       - uses: actions-rs/cargo@v1
         with:
           command: clippy
-          args: --workspace --tests --examples -- -D warnings
+          args: --no-deps -p arc-bench -p arc-engine -p arc-cuda-graph -p arc-cli -p mistralrs-quant --tests --examples -- -D warnings
 
   docs:
     name: Docs

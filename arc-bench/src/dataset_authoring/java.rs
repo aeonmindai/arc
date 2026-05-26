@@ -52,7 +52,11 @@ fn java_026_spring_controller() -> Trajectory {
     assemble(
         "agentperf_tuning_026",
         "java",
-        src("github.com/spring-projects/spring-boot", "Apache-2.0", "9c7a234"),
+        src(
+            "github.com/spring-projects/spring-boot",
+            "Apache-2.0",
+            "9c7a234",
+        ),
         turns,
     )
 }
@@ -138,7 +142,11 @@ fn java_028_stream_collect() -> Trajectory {
     assemble(
         "agentperf_tuning_028",
         "java",
-        src("github.com/openjdk/jdk", "GPL-2.0-with-classpath-exception", "21+35"),
+        src(
+            "github.com/openjdk/jdk",
+            "GPL-2.0-with-classpath-exception",
+            "21+35",
+        ),
         turns,
     )
 }

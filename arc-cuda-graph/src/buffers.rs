@@ -6,11 +6,11 @@ use candle_core::{DType, Device, Tensor};
 /// Pre-allocated decode input buffers at fixed GPU addresses.
 #[cfg(feature = "cuda")]
 pub struct DecodeInputBuffers {
-    pub input_ids: Tensor,      // [padded_bs, 1] u32
-    pub positions: Tensor,      // [padded_bs] u32
-    pub block_tables: Tensor,   // [padded_bs, max_blocks] u32
-    pub context_lens: Tensor,   // [padded_bs] u32
-    pub slot_mappings: Tensor,  // [padded_bs] i64
+    pub input_ids: Tensor,     // [padded_bs, 1] u32
+    pub positions: Tensor,     // [padded_bs] u32
+    pub block_tables: Tensor,  // [padded_bs, max_blocks] u32
+    pub context_lens: Tensor,  // [padded_bs] u32
+    pub slot_mappings: Tensor, // [padded_bs] i64
 }
 
 #[cfg(feature = "cuda")]
@@ -33,21 +33,17 @@ impl DecodeInputBuffers {
 /// GPU-side decode state that persists across WHILE loop iterations.
 #[cfg(feature = "cuda")]
 pub struct DecodeState {
-    pub sampled_tokens: Tensor,   // [padded_bs] i64
-    pub n_generated: Tensor,      // [padded_bs] i64
-    pub output_tokens: Tensor,    // [padded_bs, max_tokens] i64
-    pub finished: Tensor,         // [padded_bs] i64
-    pub loop_condition: Tensor,   // [1] i64
+    pub sampled_tokens: Tensor, // [padded_bs] i64
+    pub n_generated: Tensor,    // [padded_bs] i64
+    pub output_tokens: Tensor,  // [padded_bs, max_tokens] i64
+    pub finished: Tensor,       // [padded_bs] i64
+    pub loop_condition: Tensor, // [1] i64
     pub max_tokens: usize,
 }
 
 #[cfg(feature = "cuda")]
 impl DecodeState {
-    pub fn new(
-        padded_bs: usize,
-        max_tokens: usize,
-        device: &Device,
-    ) -> candle_core::Result<Self> {
+    pub fn new(padded_bs: usize, max_tokens: usize, device: &Device) -> candle_core::Result<Self> {
         Ok(Self {
             sampled_tokens: Tensor::zeros(padded_bs, DType::I64, device)?,
             n_generated: Tensor::zeros(padded_bs, DType::I64, device)?,

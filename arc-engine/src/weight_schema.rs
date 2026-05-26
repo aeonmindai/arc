@@ -94,10 +94,7 @@ where
 }
 
 /// Validate V4 schema with an explicit o_proj layout assumption.
-pub fn validate_v4_weights_with_layout<'a, I>(
-    keys: I,
-    o_layout: OProjLayout,
-) -> WeightValidation
+pub fn validate_v4_weights_with_layout<'a, I>(keys: I, o_layout: OProjLayout) -> WeightValidation
 where
     I: IntoIterator<Item = &'a str>,
 {
@@ -123,8 +120,12 @@ pub enum V4Format {
 
 /// Auto-detect V4 safetensors format by inspecting key prefixes.
 pub fn detect_v4_format(keys: &HashSet<String>) -> V4Format {
-    let has_native = keys.iter().any(|k| k.starts_with("layers.") && k.contains(".attn."));
-    let has_hf = keys.iter().any(|k| k.starts_with("model.layers.") && k.contains(".self_attn."));
+    let has_native = keys
+        .iter()
+        .any(|k| k.starts_with("layers.") && k.contains(".attn."));
+    let has_hf = keys
+        .iter()
+        .any(|k| k.starts_with("model.layers.") && k.contains(".self_attn."));
 
     // Native wins if both detected (SGLang's authoritative format).
     if has_native {
@@ -171,6 +172,7 @@ impl V4LayerTensors {
             },
         }
     }
+    #[allow(dead_code)] // convenience accessor over all schema keys; not yet used
     fn all(&self) -> Vec<&str> {
         vec![
             &self.norm_in,
@@ -588,7 +590,9 @@ pub fn synthesize_kimi_k2_weight_keys(num_layers: usize, num_experts: usize) -> 
         keys.push(format!("model.layers.{i}.post_attention_layernorm.weight"));
         keys.push(format!("model.layers.{i}.self_attn.q_a_proj.weight"));
         keys.push(format!("model.layers.{i}.self_attn.q_b_proj.weight"));
-        keys.push(format!("model.layers.{i}.self_attn.kv_a_proj_with_mqa.weight"));
+        keys.push(format!(
+            "model.layers.{i}.self_attn.kv_a_proj_with_mqa.weight"
+        ));
         keys.push(format!("model.layers.{i}.self_attn.kv_b_proj.weight"));
         keys.push(format!("model.layers.{i}.self_attn.o_proj.weight"));
         for e in 0..num_experts {
@@ -619,12 +623,22 @@ mod tests {
     /// V4 native format uses `layers.X.attn.wq_a` not `model.layers.X.self_attn.q_a_proj`.
     #[test]
     fn v3_loader_rejects_v4_weights_with_clear_error() {
-        let v4_keys = synthesize_v4_weight_keys(4, 8, false);  // Native format
+        let v4_keys = synthesize_v4_weight_keys(4, 8, false); // Native format
         let v = validate_kimi_k2_weights(v4_keys.iter().map(String::as_str));
-        assert!(!v.is_valid(), "V3 (HF-format) loader should fail on V4 (native-format) weights");
+        assert!(
+            !v.is_valid(),
+            "V3 (HF-format) loader should fail on V4 (native-format) weights"
+        );
         // V3 expects model.embed_tokens.weight — V4 native has embed.weight
-        let missing_embed = v.missing.iter().filter(|m| m.contains("embed_tokens")).count();
-        assert_eq!(missing_embed, 1, "Expected V3 loader to fail finding HF-style embed_tokens");
+        let missing_embed = v
+            .missing
+            .iter()
+            .filter(|m| m.contains("embed_tokens"))
+            .count();
+        assert_eq!(
+            missing_embed, 1,
+            "Expected V3 loader to fail finding HF-style embed_tokens"
+        );
     }
 
     /// V4 validator rejects V3-style weights (missing kv_proj, missing o_a/o_b).
@@ -632,10 +646,25 @@ mod tests {
     fn v4_loader_rejects_v3_weights_with_clear_error() {
         let v3_keys = synthesize_kimi_k2_weight_keys(4, 8);
         let v = validate_v4_weights(v3_keys.iter().map(String::as_str));
-        assert!(!v.is_valid(), "V4 validator should fail on V3-style weights");
-        let missing_kv_proj = v.missing.iter().filter(|m| m.ends_with(".self_attn.kv_proj.weight")).count();
-        let missing_o_a = v.missing.iter().filter(|m| m.ends_with(".self_attn.o_a_proj.weight")).count();
-        let missing_o_b = v.missing.iter().filter(|m| m.ends_with(".self_attn.o_b_proj.weight")).count();
+        assert!(
+            !v.is_valid(),
+            "V4 validator should fail on V3-style weights"
+        );
+        let missing_kv_proj = v
+            .missing
+            .iter()
+            .filter(|m| m.ends_with(".self_attn.kv_proj.weight"))
+            .count();
+        let missing_o_a = v
+            .missing
+            .iter()
+            .filter(|m| m.ends_with(".self_attn.o_a_proj.weight"))
+            .count();
+        let missing_o_b = v
+            .missing
+            .iter()
+            .filter(|m| m.ends_with(".self_attn.o_b_proj.weight"))
+            .count();
         assert_eq!(missing_kv_proj, 4, "Expected 4 missing kv_proj entries");
         assert_eq!(missing_o_a, 4, "Expected 4 missing o_a_proj entries");
         assert_eq!(missing_o_b, 4, "Expected 4 missing o_b_proj entries");
@@ -657,11 +686,19 @@ mod tests {
     fn v4_indexer_tensor_names_correct_native() {
         let names = v4_indexer_tensors_for_layer(3, V4Format::Native);
         assert!(names.iter().any(|n| n.contains("indexer.compressor.ape")));
-        assert!(names.iter().any(|n| n.contains("indexer.compressor.norm.weight")));
-        assert!(names.iter().any(|n| n.contains("indexer.compressor.wgate.weight")));
-        assert!(names.iter().any(|n| n.contains("indexer.compressor.wkv.weight")));
+        assert!(names
+            .iter()
+            .any(|n| n.contains("indexer.compressor.norm.weight")));
+        assert!(names
+            .iter()
+            .any(|n| n.contains("indexer.compressor.wgate.weight")));
+        assert!(names
+            .iter()
+            .any(|n| n.contains("indexer.compressor.wkv.weight")));
         assert!(names.iter().any(|n| n.contains("indexer.wq_b.weight")));
-        assert!(names.iter().any(|n| n.contains("indexer.weights_proj.weight")));
+        assert!(names
+            .iter()
+            .any(|n| n.contains("indexer.weights_proj.weight")));
     }
 
     /// V4 MTP tensor names (native format).
@@ -695,7 +732,11 @@ mod tests {
     fn synthesized_v4_native_validates() {
         let keys = synthesize_v4_weight_keys_with_format(4, 8, true, V4Format::Native);
         let v = validate_v4_weights(keys.iter().map(String::as_str));
-        assert!(v.is_valid(), "Native V4 should validate. Missing: {:?}", v.missing);
+        assert!(
+            v.is_valid(),
+            "Native V4 should validate. Missing: {:?}",
+            v.missing
+        );
         assert_eq!(v.num_layers, 4);
     }
 
@@ -704,7 +745,11 @@ mod tests {
     fn synthesized_v4_hf_validates() {
         let keys = synthesize_v4_weight_keys_with_format(4, 8, false, V4Format::Hf);
         let v = validate_v4_weights(keys.iter().map(String::as_str));
-        assert!(v.is_valid(), "HF V4 should validate. Missing: {:?}", v.missing);
+        assert!(
+            v.is_valid(),
+            "HF V4 should validate. Missing: {:?}",
+            v.missing
+        );
         assert_eq!(v.num_layers, 4);
     }
 
@@ -749,10 +794,7 @@ mod tests {
     fn validation_report_is_informative() {
         // Use Lora mode to force a failure on V3-style input.
         let keys = synthesize_kimi_k2_weight_keys(2, 4);
-        let v = validate_v4_weights_with_layout(
-            keys.iter().map(String::as_str),
-            OProjLayout::Lora,
-        );
+        let v = validate_v4_weights_with_layout(keys.iter().map(String::as_str), OProjLayout::Lora);
         let report = v.report();
         assert!(report.contains("FAIL"));
         assert!(report.contains("Missing"));

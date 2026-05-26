@@ -1408,7 +1408,7 @@ impl PackedExperts {
             let mut us = Vec::new();
             let mut ds = Vec::new();
             for ((mut gate_proj, mut up_proj), mut down_proj) in
-                gc.into_iter().zip(uc.into_iter()).zip(dc.into_iter())
+                gc.into_iter().zip(uc).zip(dc)
             {
                 gate_proj = gate_proj.squeeze(0)?;
                 up_proj = up_proj.squeeze(0)?;
@@ -2004,9 +2004,8 @@ pub fn compute_n_kv_groups(
     } else {
         1
     };
-    if kv_replicate != 0 {
-        (num_attention_heads / total_num_kv_heads) / kv_replicate
-    } else {
-        num_attention_heads / total_num_kv_heads
-    }
+    // `kv_replicate` is already `>= 1` by construction; `.max(1)` keeps the
+    // divide-by-zero guard while avoiding the manual `if != 0` checked-division
+    // pattern (behavior-identical: dividing by 1 yields the unreplicated count).
+    (num_attention_heads / total_num_kv_heads) / kv_replicate.max(1)
 }

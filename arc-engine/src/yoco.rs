@@ -111,7 +111,9 @@ mod tests {
         assert_eq!(layout.num_layers, 32);
         // First 16 self, last 16 cross
         for i in 0..16 {
-            assert!(matches!(layout.roles[i], LayerRole::SelfDecoder { stored_at } if stored_at == i));
+            assert!(
+                matches!(layout.roles[i], LayerRole::SelfDecoder { stored_at } if stored_at == i)
+            );
         }
         for i in 16..32 {
             assert!(
@@ -152,7 +154,9 @@ mod tests {
         assert_eq!(layout.num_cache_slots(), 32);
         assert!((layout.savings_ratio() - 1.0).abs() < 1e-9);
         for i in 0..32 {
-            assert!(matches!(layout.roles[i], LayerRole::SelfDecoder { stored_at } if stored_at == i));
+            assert!(
+                matches!(layout.roles[i], LayerRole::SelfDecoder { stored_at } if stored_at == i)
+            );
         }
     }
 
@@ -161,8 +165,17 @@ mod tests {
         // 9 layers → 4 self, 5 cross all reading from layer 3
         let layout = YocoLayout::default_split(9);
         assert_eq!(layout.num_cache_slots(), 4);
-        assert!(matches!(layout.roles[3], LayerRole::SelfDecoder { stored_at: 3 }));
-        assert!(matches!(layout.roles[4], LayerRole::CrossDecoder { reads_from: 3 }));
-        assert!(matches!(layout.roles[8], LayerRole::CrossDecoder { reads_from: 3 }));
+        assert!(matches!(
+            layout.roles[3],
+            LayerRole::SelfDecoder { stored_at: 3 }
+        ));
+        assert!(matches!(
+            layout.roles[4],
+            LayerRole::CrossDecoder { reads_from: 3 }
+        ));
+        assert!(matches!(
+            layout.roles[8],
+            LayerRole::CrossDecoder { reads_from: 3 }
+        ));
     }
 }

@@ -82,6 +82,12 @@ fn decode_error(lut: &[f32], s: u32, target: &[f32]) -> f32 {
 ///
 /// Returns a Vec<u8> of length `num_symbols` containing one K-bit symbol per
 /// position (packed into u8, low K bits of each).
+//
+// The index-based loops over `prev_cost` and the explicit `ALPHABET` casts are
+// deliberate in this Viterbi/scales hot path — its numerical parity is only
+// validated on an sm_80+ GPU, so we suppress the style lints rather than rewrite
+// the indexing (see arc-tools/CI_HYGIENE.md).
+#[allow(clippy::needless_range_loop, clippy::unnecessary_cast)]
 pub fn viterbi_quantize_row(target_row: &[f32], lut: &[f32]) -> Vec<u8> {
     let num_symbols = target_row.len() / V as usize;
     assert!(

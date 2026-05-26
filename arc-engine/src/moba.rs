@@ -1,3 +1,6 @@
+// The block-mask index loop is intentional in this routing path; suppress the
+// lint rather than rewrite the indexing (see arc-tools/CI_HYGIENE.md).
+#![allow(clippy::needless_range_loop)]
 //! MoBA (Mixture of Block Attention) routing — Moonshot / Kimi K2 family.
 //!
 //! Paper: `research/12_long_context/moba_mixture_of_block_attention.pdf`
@@ -63,9 +66,7 @@ pub fn route_to_blocks(
         let row = &router_logits[q * num_blocks..(q + 1) * num_blocks];
         let mut indexed: Vec<(usize, f32)> = row.iter().copied().enumerate().collect();
         // Partial sort by descending score.
-        indexed.sort_unstable_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let _ = Reverse(0); // silence import lint
         out.push(indexed.iter().take(top_k).map(|(i, _)| *i).collect());
     }

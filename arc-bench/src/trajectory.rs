@@ -115,12 +115,14 @@ impl Trajectory {
         Ok(trajectory)
     }
 
+    // Inherent `from_str` mirrors `from_path`; keeping the name (rather than a
+    // `FromStr` impl) preserves the call sites and the parallel API surface.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self, ParseError> {
-        let trajectory: Trajectory =
-            serde_json::from_str(s).map_err(|e| ParseError::Json {
-                path: "<inline>".to_string(),
-                source: e,
-            })?;
+        let trajectory: Trajectory = serde_json::from_str(s).map_err(|e| ParseError::Json {
+            path: "<inline>".to_string(),
+            source: e,
+        })?;
         trajectory.validate()?;
         Ok(trajectory)
     }
@@ -161,17 +163,14 @@ impl Trajectory {
             return Err(bail("language must not be empty".to_string()));
         }
         if self.turns.is_empty() {
-            return Err(bail("trajectory must contain at least one turn".to_string()));
+            return Err(bail(
+                "trajectory must contain at least one turn".to_string(),
+            ));
         }
-        let first_non_system = self
-            .turns
-            .iter()
-            .find(|t| !matches!(t.role, Role::System));
+        let first_non_system = self.turns.iter().find(|t| !matches!(t.role, Role::System));
         if let Some(turn) = first_non_system {
             if !matches!(turn.role, Role::User) {
-                return Err(bail(
-                    "first non-system turn must be `user`".to_string(),
-                ));
+                return Err(bail("first non-system turn must be `user`".to_string()));
             }
         }
 
@@ -195,9 +194,7 @@ impl Trajectory {
                 }
                 Role::Tool => {
                     let id = turn.tool_call_id.as_deref().ok_or_else(|| {
-                        bail(format!(
-                            "turn {idx}: tool turn missing tool_call_id"
-                        ))
+                        bail(format!("turn {idx}: tool turn missing tool_call_id"))
                     })?;
                     if !known_tool_call_ids.iter().any(|k| k == id) {
                         return Err(bail(format!(

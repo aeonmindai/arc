@@ -184,7 +184,9 @@ fn run_with_runtime(
                             kind,
                             ..
                         } => {
-                            eprintln!("[bench] phase #{phase_index} kind={kind} K={concurrent_users}");
+                            eprintln!(
+                                "[bench] phase #{phase_index} kind={kind} K={concurrent_users}"
+                            );
                         }
                         Event::PhaseFinished { record } => {
                             eprintln!(
@@ -245,10 +247,16 @@ fn run_with_runtime(
         );
         match report.saturation_users {
             Some(k) => {
-                eprintln!("  saturation:      K={k} (largest concurrent users passing tier {})", tier.tier);
+                eprintln!(
+                    "  saturation:      K={k} (largest concurrent users passing tier {})",
+                    tier.tier
+                );
             }
             None => {
-                eprintln!("  saturation:      FAIL — even K=1 did not pass tier {}", tier.tier);
+                eprintln!(
+                    "  saturation:      FAIL — even K=1 did not pass tier {}",
+                    tier.tier
+                );
             }
         }
         eprintln!("  reports written:");
@@ -256,7 +264,11 @@ fn run_with_runtime(
             eprintln!("    {}", p.display());
         }
 
-        let exit = if report.saturation_users.is_some() { 0 } else { 1 };
+        let exit = if report.saturation_users.is_some() {
+            0
+        } else {
+            1
+        };
         anyhow::Ok(exit)
     })?;
 
@@ -287,8 +299,8 @@ mod tests {
     /// windows so the whole thing runs in < 5 s.
     #[test]
     fn mock_end_to_end_produces_json_and_md() {
-        let stem = std::env::temp_dir()
-            .join(format!("arc-bench-integration-{}", std::process::id()));
+        let stem =
+            std::env::temp_dir().join(format!("arc-bench-integration-{}", std::process::id()));
         let json_path = stem.with_extension("json");
         let md_path = stem.with_extension("md");
         let _ = std::fs::remove_file(&json_path);
@@ -310,14 +322,25 @@ mod tests {
             exit == 0 || exit == 1,
             "exit must be 0 (pass) or 1 (no saturation), got {exit}"
         );
-        assert!(json_path.exists(), "JSON report missing at {}", json_path.display());
-        assert!(md_path.exists(), "markdown report missing at {}", md_path.display());
+        assert!(
+            json_path.exists(),
+            "JSON report missing at {}",
+            json_path.display()
+        );
+        assert!(
+            md_path.exists(),
+            "markdown report missing at {}",
+            md_path.display()
+        );
 
         let parsed: report::BenchReport =
             serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
         assert_eq!(parsed.mode, "mock");
         assert_eq!(parsed.suite, "agentperf");
-        assert!(!parsed.schedule.phases.is_empty(), "must have at least one phase");
+        assert!(
+            !parsed.schedule.phases.is_empty(),
+            "must have at least one phase"
+        );
 
         // Cleanup.
         let _ = std::fs::remove_file(json_path);

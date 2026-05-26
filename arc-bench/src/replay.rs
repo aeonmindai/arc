@@ -66,10 +66,7 @@ impl ChatMessage {
         }
     }
 
-    pub fn assistant_with_tools(
-        content: impl Into<String>,
-        tool_calls: Vec<ToolCall>,
-    ) -> Self {
+    pub fn assistant_with_tools(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
         Self {
             role: Role::Assistant,
             content: content.into(),
@@ -125,10 +122,7 @@ impl ReplayResult {
     }
 
     pub fn total_output_tokens(&self) -> u64 {
-        self.turns
-            .iter()
-            .map(|t| t.output_tokens as u64)
-            .sum()
+        self.turns.iter().map(|t| t.output_tokens as u64).sum()
     }
 }
 
@@ -140,10 +134,7 @@ pub struct TrajectoryReplayer<V: Vendor> {
 
 impl<V: Vendor> TrajectoryReplayer<V> {
     pub fn new(trajectory: Trajectory, vendor: V) -> Self {
-        Self {
-            trajectory,
-            vendor,
-        }
+        Self { trajectory, vendor }
     }
 
     pub fn trajectory(&self) -> &Trajectory {
@@ -171,8 +162,7 @@ impl<V: Vendor> TrajectoryReplayer<V> {
                 }
                 Role::Assistant => {
                     let mut diagnostics = Vec::new();
-                    let prompt_chars: usize =
-                        history.iter().map(|m| m.content.len()).sum();
+                    let prompt_chars: usize = history.iter().map(|m| m.content.len()).sum();
                     let vendor_response = self.vendor.complete(&history).await?;
 
                     if !turn.tool_calls.is_empty() && vendor_response.tool_calls.is_empty() {
@@ -214,10 +204,7 @@ impl<V: Vendor> TrajectoryReplayer<V> {
 
                     while i < turns.len() && matches!(turns[i].role, Role::Tool) {
                         let tool_turn = &turns[i];
-                        let call_id = tool_turn
-                            .tool_call_id
-                            .clone()
-                            .unwrap_or_default();
+                        let call_id = tool_turn.tool_call_id.clone().unwrap_or_default();
                         history.push(ChatMessage::tool(call_id, tool_turn.content.clone()));
                         i += 1;
                     }
@@ -259,10 +246,7 @@ mod tests {
 
     #[async_trait]
     impl Vendor for MockVendor {
-        async fn complete(
-            &self,
-            messages: &[ChatMessage],
-        ) -> anyhow::Result<VendorResponse> {
+        async fn complete(&self, messages: &[ChatMessage]) -> anyhow::Result<VendorResponse> {
             self.observed_histories
                 .lock()
                 .unwrap()
@@ -408,13 +392,10 @@ mod tests {
         ]);
         let replayer = TrajectoryReplayer::new(simple_trajectory(), vendor);
         let result = replayer.run().await.unwrap();
-        assert!(result.turns[0]
-            .diagnostics
-            .iter()
-            .any(|d| matches!(
-                d,
-                ReplayDiagnostic::UnexpectedToolCall { call_id, .. } if call_id == "c99"
-            )));
+        assert!(result.turns[0].diagnostics.iter().any(|d| matches!(
+            d,
+            ReplayDiagnostic::UnexpectedToolCall { call_id, .. } if call_id == "c99"
+        )));
     }
 
     #[tokio::test]

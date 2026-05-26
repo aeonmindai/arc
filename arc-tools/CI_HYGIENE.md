@@ -47,7 +47,8 @@ upstream and the red is dominated by **upstream-derived files**, not Arc code:
     any upstream lints. Hence the gate is post-rental, by decision.
 - **Typos:** pervasive **false positives** in upstream/binary code (`"BA"`,
   `"UE"`, `"nd"`, `"writeable"`, `"mis"`, `"fied"`). Green = `.typos.toml`
-  ignore-list bloat. (The one real Arc typo, `trigggered`, is already fixed.)
+  ignore-list bloat. (The one real Arc typo — a misspelled `triggered` — is
+  already fixed.)
 
 ## Do NOT auto-fix the QTIP hot loops before the rental
 

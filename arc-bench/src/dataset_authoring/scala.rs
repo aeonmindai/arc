@@ -49,7 +49,10 @@ fn sc_045_cats_effect_resource() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_003", "wrote 348 bytes to src/main/scala/HttpServer.scala"));
+    turns.push(tool(
+        "call_003",
+        "wrote 348 bytes to src/main/scala/HttpServer.scala",
+    ));
     turns.push(assistant_call(
         "Updating App.scala to consume the Resource.",
         "call_004",
@@ -60,7 +63,10 @@ fn sc_045_cats_effect_resource() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_004", "wrote 156 bytes to src/main/scala/App.scala"));
+    turns.push(tool(
+        "call_004",
+        "wrote 156 bytes to src/main/scala/App.scala",
+    ));
     turns.push(assistant_text(
         "Server is now Resource-managed; cancelling the IO releases the binding via Ember's shutdown.",
         &turns,
@@ -111,7 +117,10 @@ fn sc_046_play_action() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_003", "wrote 564 bytes to app/controllers/HomeController.scala"));
+    turns.push(tool(
+        "call_003",
+        "wrote 564 bytes to app/controllers/HomeController.scala",
+    ));
     turns.push(assistant_text(
         "Route Play config needs `POST /api/users controllers.HomeController.createUser` added to conf/routes.",
         &turns,
@@ -120,7 +129,11 @@ fn sc_046_play_action() -> Trajectory {
     assemble(
         "agentperf_tuning_046",
         "scala",
-        src("github.com/playframework/playframework", "Apache-2.0", "3.0"),
+        src(
+            "github.com/playframework/playframework",
+            "Apache-2.0",
+            "3.0",
+        ),
         turns,
     )
 }
@@ -162,7 +175,10 @@ fn sc_047_zio_layer() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_003", "wrote 366 bytes to src/main/scala/Main.scala"));
+    turns.push(tool(
+        "call_003",
+        "wrote 366 bytes to src/main/scala/Main.scala",
+    ));
     turns.push(assistant_text(
         "Layers composed; Main now resolves OrdersService through ConnectionPool.live.",
         &turns,

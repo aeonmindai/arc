@@ -1,4 +1,7 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+// WIP V4 indexer module: the Phase-1 reference `forward` and some config fields
+// are not yet wired into the active dispatch path. See arc-tools/CI_HYGIENE.md.
+#![allow(dead_code)]
 //! DeepSeek V4 Lightning Indexer (`C4Indexer`).
 //!
 //! Pure-Rust port of SGLang's
@@ -50,7 +53,6 @@
 use std::sync::Arc;
 
 use candle_core::{DType, Device, Result, Tensor, D};
-use candle_nn::Module;
 use mistralrs_quant::{QuantMethod, ReplicatedLayer, ShardedVarBuilder};
 
 use crate::{

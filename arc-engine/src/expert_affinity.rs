@@ -97,10 +97,7 @@ mod tests {
 
     #[test]
     fn single_user_routes_to_each_top_k_expert() {
-        let buckets = group_by_expert(
-            &[req(1, vec![2, 5])],
-            AffinityConfig { num_experts: 8 },
-        );
+        let buckets = group_by_expert(&[req(1, vec![2, 5])], AffinityConfig { num_experts: 8 });
         assert_eq!(buckets.len(), 2);
         assert_eq!(buckets[&2], vec![1]);
         assert_eq!(buckets[&5], vec![1]);
@@ -117,10 +114,7 @@ mod tests {
 
     #[test]
     fn out_of_range_expert_is_ignored() {
-        let buckets = group_by_expert(
-            &[req(1, vec![999])],
-            AffinityConfig { num_experts: 8 },
-        );
+        let buckets = group_by_expert(&[req(1, vec![999])], AffinityConfig { num_experts: 8 });
         assert!(buckets.is_empty());
     }
 

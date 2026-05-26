@@ -137,38 +137,102 @@ pub struct DeepSeekV4Config {
 }
 
 // --- defaults (mirror SGLang's dataclass defaults) ---
-fn default_architectures() -> Vec<String> { vec!["DeepseekV4ForCausalLM".into()] }
-fn default_eos() -> u32 { 1 }
-fn one_usize() -> usize { 1 }
-fn default_hidden_act() -> String { "silu".into() }
-fn default_hidden_size() -> usize { 4096 }
-fn default_index_head_dim() -> usize { 128 }
-fn default_index_n_heads() -> usize { 64 }
-fn default_index_topk() -> usize { 512 }
-fn default_initializer_range() -> f32 { 0.02 }
-fn default_intermediate_size() -> usize { 2048 }
-fn default_kv_lora_rank() -> usize { 512 }
-fn default_max_position() -> usize { 65536 }
-fn default_moe_intermediate_size() -> usize { 2048 }
-fn default_n_group() -> usize { 8 }
-fn default_n_routed_experts() -> usize { 256 }
-fn default_true() -> bool { true }
-fn default_num_attention_heads() -> usize { 64 }
-fn default_num_experts_per_tok() -> usize { 6 }
-fn default_num_hidden_layers() -> usize { 43 }
-fn default_q_lora_rank() -> usize { 1024 }
-fn default_qk_nope_head_dim() -> usize { 448 }
-fn default_qk_rope_head_dim() -> usize { 64 }
-fn default_rms_norm_eps() -> f64 { 1e-6 }
-fn default_rope_theta() -> f32 { 10000.0 }
-fn default_routed_scaling_factor() -> f32 { 1.5 }
-fn default_scoring_func() -> String { "sqrtsoftplus".into() }
-fn default_topk_group() -> usize { 8 }
-fn default_topk_method() -> String { "noaux_tc".into() }
-fn default_v_head_dim() -> usize { 512 }
-fn default_vocab_size() -> usize { 129280 }
-fn default_window_size() -> usize { 128 }
-fn default_compress_rope_theta() -> u32 { 40000 }
+fn default_architectures() -> Vec<String> {
+    vec!["DeepseekV4ForCausalLM".into()]
+}
+fn default_eos() -> u32 {
+    1
+}
+fn one_usize() -> usize {
+    1
+}
+fn default_hidden_act() -> String {
+    "silu".into()
+}
+fn default_hidden_size() -> usize {
+    4096
+}
+fn default_index_head_dim() -> usize {
+    128
+}
+fn default_index_n_heads() -> usize {
+    64
+}
+fn default_index_topk() -> usize {
+    512
+}
+fn default_initializer_range() -> f32 {
+    0.02
+}
+fn default_intermediate_size() -> usize {
+    2048
+}
+fn default_kv_lora_rank() -> usize {
+    512
+}
+fn default_max_position() -> usize {
+    65536
+}
+fn default_moe_intermediate_size() -> usize {
+    2048
+}
+fn default_n_group() -> usize {
+    8
+}
+fn default_n_routed_experts() -> usize {
+    256
+}
+fn default_true() -> bool {
+    true
+}
+fn default_num_attention_heads() -> usize {
+    64
+}
+fn default_num_experts_per_tok() -> usize {
+    6
+}
+fn default_num_hidden_layers() -> usize {
+    43
+}
+fn default_q_lora_rank() -> usize {
+    1024
+}
+fn default_qk_nope_head_dim() -> usize {
+    448
+}
+fn default_qk_rope_head_dim() -> usize {
+    64
+}
+fn default_rms_norm_eps() -> f64 {
+    1e-6
+}
+fn default_rope_theta() -> f32 {
+    10000.0
+}
+fn default_routed_scaling_factor() -> f32 {
+    1.5
+}
+fn default_scoring_func() -> String {
+    "sqrtsoftplus".into()
+}
+fn default_topk_group() -> usize {
+    8
+}
+fn default_topk_method() -> String {
+    "noaux_tc".into()
+}
+fn default_v_head_dim() -> usize {
+    512
+}
+fn default_vocab_size() -> usize {
+    129280
+}
+fn default_window_size() -> usize {
+    128
+}
+fn default_compress_rope_theta() -> u32 {
+    40000
+}
 
 impl DeepSeekV4Config {
     /// Parse from a HuggingFace `config.json` string.
@@ -194,7 +258,8 @@ impl DeepSeekV4Config {
 
     /// Is this model an MLA-based DeepSeek V4 architecture?
     pub fn is_v4_architecture(&self) -> bool {
-        if self.architectures
+        if self
+            .architectures
             .iter()
             .any(|a| a.contains("DeepseekV4") || a.contains("DeepSeekV4"))
         {
@@ -271,9 +336,8 @@ mod tests {
     /// Default V4 config matches the dataclass defaults from SGLang.
     #[test]
     fn default_config_matches_sglang_defaults() {
-        let cfg: DeepSeekV4Config = serde_json::from_str(
-            r#"{"architectures": ["DeepseekV4ForCausalLM"]}"#,
-        ).unwrap();
+        let cfg: DeepSeekV4Config =
+            serde_json::from_str(r#"{"architectures": ["DeepseekV4ForCausalLM"]}"#).unwrap();
         assert_eq!(cfg.num_hidden_layers, 43);
         assert_eq!(cfg.num_attention_heads, 64);
         assert_eq!(cfg.num_key_value_heads, 1);
@@ -347,7 +411,8 @@ mod tests {
         let v4_json = r#"{"architectures": ["DeepseekV4ForCausalLM"]}"#;
         assert!(is_v4_config(v4_json));
 
-        let v3_json = r#"{"architectures": ["DeepseekV3ForCausalLM"], "model_type": "deepseek_v3"}"#;
+        let v3_json =
+            r#"{"architectures": ["DeepseekV3ForCausalLM"], "model_type": "deepseek_v3"}"#;
         assert!(!is_v4_config(v3_json));
     }
 

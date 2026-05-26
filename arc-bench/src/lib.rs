@@ -27,9 +27,7 @@ pub use replay::{
     ChatMessage, ReplayDiagnostic, ReplayResult, TrajectoryReplayer, TurnResult, Vendor,
     VendorResponse,
 };
-pub use trajectory::{
-    GeneratedWith, ParseError, Role, Source, ToolCall, Trajectory, Turn,
-};
+pub use trajectory::{GeneratedWith, ParseError, Role, Source, ToolCall, Trajectory, Turn};
 
 /// Canonical path of the bundled tuning dataset relative to the crate
 /// root.

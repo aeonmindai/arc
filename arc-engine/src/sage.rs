@@ -1,3 +1,6 @@
+// Identity ops in the INT8 block-quant math are intentional for shape/scale
+// clarity; suppress the lint rather than rewrite this numerical path.
+#![allow(clippy::identity_op)]
 //! SageAttention: per-block INT8 quantization of the attention computation.
 //!
 //! Paper:    `research/16_underexploited/sage_attention_int8.pdf` + `sage_attention_2.pdf`
@@ -55,10 +58,7 @@ impl Default for Sm100QuantConfig {
 /// The per-block-per-channel layout matches `quant_per_block.py` (lines 18–34 in
 /// the reference; each scale captures the magnitude of one 64-token window for
 /// one channel, giving fine-grained dynamic range).
-pub fn per_block_quantize_i8(
-    tensor: &Tensor,
-    cfg: Sm100QuantConfig,
-) -> Result<(Tensor, Tensor)> {
+pub fn per_block_quantize_i8(tensor: &Tensor, cfg: Sm100QuantConfig) -> Result<(Tensor, Tensor)> {
     let dims = tensor.dims();
     if dims.len() != 4 {
         candle_core::bail!(
@@ -98,13 +98,10 @@ pub fn per_block_quantize_i8(
                             max_abs = v;
                         }
                     }
-                    let scale = if max_abs == 0.0 {
-                        1.0
-                    } else {
-                        max_abs / 127.0
-                    };
+                    let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
                     let inv = 1.0 / scale;
-                    scales[bi * (h * num_blocks * d) + hi * (num_blocks * d) + blk * d + di] = scale;
+                    scales[bi * (h * num_blocks * d) + hi * (num_blocks * d) + blk * d + di] =
+                        scale;
 
                     // Quantize each element in the block.
                     for si in 0..cfg.block_size {
@@ -134,7 +131,10 @@ pub fn per_block_dequantize_i8(
 ) -> Result<Tensor> {
     let q_dims = q.dims();
     if q_dims.len() != 4 {
-        candle_core::bail!("per_block_dequantize_i8 expects [B,H,S,D], got {:?}", q_dims);
+        candle_core::bail!(
+            "per_block_dequantize_i8 expects [B,H,S,D], got {:?}",
+            q_dims
+        );
     }
     let (b, h, s, d) = (q_dims[0], q_dims[1], q_dims[2], q_dims[3]);
     let num_blocks = s / cfg.block_size;
@@ -167,8 +167,7 @@ pub fn per_block_dequantize_i8(
         }
     }
 
-    Tensor::from_vec(out, (b, h, s, d), &Device::Cpu)?
-        .to_device(q.device())
+    Tensor::from_vec(out, (b, h, s, d), &Device::Cpu)?.to_device(q.device())
 }
 
 /// Reference SageAttention: per-block-quantize Q/K/V then matmul.

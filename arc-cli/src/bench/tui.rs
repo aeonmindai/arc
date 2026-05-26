@@ -74,7 +74,10 @@ struct TuiState {
 impl TuiState {
     fn apply(&mut self, ev: Event) {
         match ev {
-            Event::Started { tier, total_max_users } => {
+            Event::Started {
+                tier,
+                total_max_users,
+            } => {
                 self.tier = Some(tier);
                 self.max_users_cap = total_max_users;
                 self.bench_start = Some(Instant::now());
@@ -170,9 +173,11 @@ pub async fn run_tui(
     vendor_name: &str,
     mut rx: broadcast::Receiver<Event>,
 ) -> Result<()> {
-    let mut state = TuiState::default();
-    state.model = model.to_string();
-    state.vendor = vendor_name.to_string();
+    let mut state = TuiState {
+        model: model.to_string(),
+        vendor: vendor_name.to_string(),
+        ..Default::default()
+    };
 
     let mut guard = TerminalGuard::new()?;
 
@@ -223,14 +228,12 @@ pub async fn run_tui(
 /// One-shot draw — pure layout + render. Kept reasonably small so it
 /// re-runs every 150 ms without sweating.
 fn draw(f: &mut ratatui::Frame<'_>, s: &TuiState) {
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            " arc bench: agentperf ",
-            Style::default()
-                .add_modifier(Modifier::BOLD)
-                .fg(Color::Cyan),
-        ));
+    let outer = Block::default().borders(Borders::ALL).title(Span::styled(
+        " arc bench: agentperf ",
+        Style::default()
+            .add_modifier(Modifier::BOLD)
+            .fg(Color::Cyan),
+    ));
     let area = f.area();
     f.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
@@ -272,24 +275,22 @@ fn draw_header(f: &mut ratatui::Frame<'_>, area: Rect, s: &TuiState) {
             Span::raw(format!("    Max users cap: {}", s.max_users_cap)),
         ]),
     ];
-    f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: true }),
-        area,
-    );
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
 }
 
 fn draw_phase(f: &mut ratatui::Frame<'_>, area: Rect, s: &TuiState) {
-    let bench_elapsed = s
-        .bench_start
-        .map(|t| t.elapsed())
-        .unwrap_or(Duration::ZERO);
+    let bench_elapsed = s.bench_start.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
     let phase_total = s.current_phase_warmup + s.current_phase_steady_state;
     let phase_remaining = phase_total.saturating_sub(s.elapsed_in_phase);
 
     let phase_label = if s.current_phase_index == 0 {
         "warming up...".to_string()
     } else {
-        let stage = if s.in_warmup { "warmup" } else { "steady-state" };
+        let stage = if s.in_warmup {
+            "warmup"
+        } else {
+            "steady-state"
+        };
         format!(
             "Phase: {} #{}  ({stage})    Concurrent users: {}",
             s.current_phase_kind, s.current_phase_index, s.current_phase_users
@@ -315,9 +316,7 @@ fn pass_label(pass: bool) -> Span<'static> {
     } else {
         Span::styled(
             "  [SLO fail]",
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )
     }
 }
@@ -345,9 +344,7 @@ fn render_metric_row(
     );
     // overwrite middle with gauge
     let gauge = Gauge::default()
-        .gauge_style(
-            Style::default().fg(if pass { Color::Green } else { Color::Red }),
-        )
+        .gauge_style(Style::default().fg(if pass { Color::Green } else { Color::Red }))
         .ratio(ratio_for_gauge.clamp(0.0, 1.0));
     f.render_widget(gauge, chunks[1]);
     f.render_widget(Paragraph::new(Line::from(pass_label(pass))), chunks[2]);
@@ -374,8 +371,8 @@ fn draw_gauges(f: &mut ratatui::Frame<'_>, area: Rect, s: &TuiState) {
 
     // P25 output speed — ratio relative to tier floor (clamp at 2x = 1.0).
     let speed_pass = s.running_p25_speed >= tier.min_p25_output_speed_tok_per_s;
-    let speed_ratio = (s.running_p25_speed / (tier.min_p25_output_speed_tok_per_s * 2.0))
-        .clamp(0.0, 1.0);
+    let speed_ratio =
+        (s.running_p25_speed / (tier.min_p25_output_speed_tok_per_s * 2.0)).clamp(0.0, 1.0);
     render_metric_row(
         f,
         rows[0],
