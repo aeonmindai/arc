@@ -50,7 +50,10 @@ fn rb_030_rails_scope() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_003", "wrote 416 bytes to spec/models/order_spec.rb"));
+    turns.push(tool(
+        "call_003",
+        "wrote 416 bytes to spec/models/order_spec.rb",
+    ));
     turns.push(assistant_text("Scope and spec added.", &turns));
 
     assemble(
@@ -76,7 +79,10 @@ fn rb_031_active_job() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_001", "wrote 178 bytes to app/jobs/order_receipt_job.rb"));
+    turns.push(tool(
+        "call_001",
+        "wrote 178 bytes to app/jobs/order_receipt_job.rb",
+    ));
     turns.push(assistant_text(
         "Job added. Enqueue with `OrderReceiptJob.perform_later(order.id)`.",
         &turns,
@@ -116,7 +122,10 @@ fn rb_032_rspec_shared() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_002", "wrote 296 bytes to spec/support/authenticated.rb"));
+    turns.push(tool(
+        "call_002",
+        "wrote 296 bytes to spec/support/authenticated.rb",
+    ));
     turns.push(assistant_call(
         "Rewriting the users spec.",
         "call_003",
@@ -127,7 +136,10 @@ fn rb_032_rspec_shared() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_003", "wrote 236 bytes to spec/requests/users_controller_spec.rb"));
+    turns.push(tool(
+        "call_003",
+        "wrote 236 bytes to spec/requests/users_controller_spec.rb",
+    ));
     turns.push(assistant_text(
         "Spec now includes the shared context; do the same in orders_controller_spec.rb.",
         &turns,
@@ -167,7 +179,10 @@ fn rb_033_sidekiq_retry() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_002", "wrote 366 bytes to app/jobs/billing_job.rb"));
+    turns.push(tool(
+        "call_002",
+        "wrote 366 bytes to app/jobs/billing_job.rb",
+    ));
     turns.push(assistant_text(
         "BillingJob retries up to 5 times with exponential backoff scoped to Net::OpenTimeout.",
         &turns,

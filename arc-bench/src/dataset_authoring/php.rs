@@ -76,7 +76,10 @@ fn php_035_eloquent_scope() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_002", "wrote 410 bytes to app/Models/Article.php"));
+    turns.push(tool(
+        "call_002",
+        "wrote 410 bytes to app/Models/Article.php",
+    ));
     turns.push(assistant_text(
         "Use as `Article::published()->get()`.",
         &turns,
@@ -105,7 +108,10 @@ fn php_036_symfony_command() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_001", "wrote 1030 bytes to src/Command/PurgeExpiredCommand.php"));
+    turns.push(tool(
+        "call_001",
+        "wrote 1030 bytes to src/Command/PurgeExpiredCommand.php",
+    ));
     turns.push(assistant_text(
         "Command registered via `#[AsCommand]`. Run with `bin/console app:purge-expired`.",
         &turns,
@@ -145,7 +151,10 @@ fn php_037_phpunit_data_provider() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_002", "wrote 524 bytes to tests/StringReverseTest.php"));
+    turns.push(tool(
+        "call_002",
+        "wrote 524 bytes to tests/StringReverseTest.php",
+    ));
     turns.push(assistant_text(
         "Three tests collapsed into one data-driven test using PHPUnit 10's attribute syntax.",
         &turns,
@@ -154,7 +163,11 @@ fn php_037_phpunit_data_provider() -> Trajectory {
     assemble(
         "agentperf_tuning_037",
         "php",
-        src("github.com/sebastianbergmann/phpunit", "BSD-3-Clause", "10.5"),
+        src(
+            "github.com/sebastianbergmann/phpunit",
+            "BSD-3-Clause",
+            "10.5",
+        ),
         turns,
     )
 }

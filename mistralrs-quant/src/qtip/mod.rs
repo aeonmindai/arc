@@ -88,11 +88,11 @@ const QTIP_ROTATION_MAX_BLOCK: usize = 128;
 /// `QTIP_ROTATION_MAX_BLOCK`. Returns 0 if `in_features` is odd (rotation
 /// disabled — should not happen for real LLMs but kept defensive).
 fn rotation_block_size(in_features: usize) -> usize {
-    if in_features == 0 || in_features % 2 != 0 {
+    if in_features == 0 || !in_features.is_multiple_of(2) {
         return 0;
     }
     let mut block = 1usize;
-    while block * 2 <= QTIP_ROTATION_MAX_BLOCK && in_features % (block * 2) == 0 {
+    while block * 2 <= QTIP_ROTATION_MAX_BLOCK && in_features.is_multiple_of(block * 2) {
         block *= 2;
     }
     block
@@ -240,6 +240,7 @@ fn box_muller(u1: f32, u2: f32) -> (f32, f32) {
 ///   2. Dequantize using the **shared** `lut` and (if present) **shared**
 ///      `rotation_signs` + `rotation_block`.
 ///   3. Rotate `x[token, slot, :]` by the shared rotation, then matmul.
+///
 /// Bias is currently not used in the 3-D path (V4 Flash MoE experts are
 /// bias-free); when present in 2-D mode it is `[N]`.
 #[derive(Debug)]
@@ -282,25 +283,21 @@ pub struct QtipLayer {
 }
 
 /// Quantization mode for QTIP.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum QtipMode {
     /// Fast but suboptimal: at each position, pick the locally-best symbol given the current state.
     /// ~5-10× faster than Viterbi at calibration time, with ~3× higher reconstruction error.
+    ///
+    /// Default kept as Greedy because most existing callers (and any
+    /// pre-RUN-158 quantized checkpoints) expect the no-rotation format.
+    /// RUN-158 wires Viterbi + Hadamard incoherence rotation into the
+    /// forward path and shows ≥0.95 matmul cos sim; callers that want the
+    /// Cornell-quality numbers should opt in via `quantize_with_mode`.
+    #[default]
     Greedy,
     /// Globally optimal symbol sequence via dynamic-programming search over the trellis.
     /// Matches Cornell's paper numbers; slower at calibration time but quantization is one-shot.
     Viterbi,
-}
-
-impl Default for QtipMode {
-    fn default() -> Self {
-        // Default kept as Greedy because most existing callers (and any
-        // pre-RUN-158 quantized checkpoints) expect the no-rotation format.
-        // RUN-158 wires Viterbi + Hadamard incoherence rotation into the
-        // forward path and shows ≥0.95 matmul cos sim; callers that want the
-        // Cornell-quality numbers should opt in via `quantize_with_mode`.
-        QtipMode::Greedy
-    }
 }
 
 impl QtipLayer {
@@ -433,7 +430,7 @@ impl QtipLayer {
 
         let weight_f32 = weight.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
         let (n, k_in) = weight_f32.dims2()?;
-        if (k_in as u32) % V != 0 {
+        if !(k_in as u32).is_multiple_of(V) {
             candle_core::bail!("QTIP quantize: in_features ({k_in}) must be divisible by V ({V})");
         }
         let num_symbols_per_row = k_in / V as usize;
@@ -611,7 +608,7 @@ impl QtipLayer {
             Ok((n, k)) => (n, k),
             Err(_) => return Ok(None),
         };
-        if (k_in as u32) % V != 0 {
+        if !(k_in as u32).is_multiple_of(V) {
             return Ok(None);
         }
         let num_symbols_per_row = k_in / V as usize;
@@ -706,7 +703,7 @@ impl QtipLayer {
         if e == 0 || n == 0 || k_in == 0 {
             candle_core::bail!("QTIP 3-D quantize: zero-sized expert stack ({e}, {n}, {k_in})");
         }
-        if (k_in as u32) % V != 0 {
+        if !(k_in as u32).is_multiple_of(V) {
             candle_core::bail!(
                 "QTIP 3-D quantize: in_features ({k_in}) must be divisible by V ({V})"
             );
@@ -783,6 +780,9 @@ impl QtipLayer {
     /// disabled, this is also the original frame. Internal helper for the
     /// fused matmul forward path — saves a redundant rotate-then-unrotate when
     /// the input has already been rotated.
+    // Index-based loop over `scales_data` is intentional in this dequant hot
+    // path (GPU-validated numerical parity); see arc-tools/CI_HYGIENE.md.
+    #[allow(clippy::needless_range_loop)]
     fn dequantize_weights_rotated_f32(&self) -> Result<Vec<f32>> {
         let blocks_cpu = self.blocks.to_device(&Device::Cpu)?;
         let scales_cpu = self.row_scales.to_device(&Device::Cpu)?;
@@ -918,6 +918,7 @@ impl QtipLayer {
     /// `blocks_e: [N, packed_K]` U8 and `scales_e: [N]` F32 must already be
     /// contiguous on the layer's device. Returns BF16 `[N, K_in]` in the
     /// original (unrotated) frame.
+    #[allow(clippy::needless_range_loop)] // scales_data index loop, GPU-validated hot path
     fn dequantize_single_expert(
         &self,
         blocks_e: &Tensor,
@@ -1301,7 +1302,7 @@ impl QtipLayer {
         for (flat, &e_u32) in idx_cpu.iter().enumerate() {
             positions_by_expert
                 .entry(e_u32 as usize)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(flat as u32);
         }
 
@@ -1541,6 +1542,7 @@ impl QtipLayer {
     /// tensor in the *unrotated* (original) frame. Used by the CPU
     /// `gather_forward` fallback when the GPU rotation kernel is unavailable.
     #[allow(dead_code)]
+    #[allow(clippy::needless_range_loop)] // scales_data index loop, GPU-validated hot path
     fn dequantize_expert_weights_unrotated(&self, e: usize) -> Result<Tensor> {
         let blocks_e = self.blocks_for_expert(e)?;
         let scales_e = self.scales_for_expert(e)?;
@@ -1673,7 +1675,7 @@ impl QtipLayer {
         for (flat, &e_u32) in idx_cpu.iter().enumerate() {
             positions_by_expert
                 .entry(e_u32 as usize)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(flat as u32);
         }
 
@@ -1757,8 +1759,8 @@ impl QuantMethod for QtipLayer {
     /// * `a`       : `[n_tokens, n_experts_per_tok, in_features]`
     /// * `indices` : `[n_tokens, n_experts_per_tok]` (U32)
     /// * self      : expert-stacked layer where `blocks` is rank-3 with
-    ///               leading expert dim `E`; weight per expert is
-    ///               `(rows, in_features)`.
+    ///   leading expert dim `E`; weight per expert is
+    ///   `(rows, in_features)`.
     /// * output    : `[n_tokens, n_experts_per_tok, rows]`
     ///
     /// # Algorithm

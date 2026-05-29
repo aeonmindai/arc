@@ -1,3 +1,6 @@
+// CLI help/usage doc comments intentionally indent command examples under list
+// items; keep that layout rather than reflow it to satisfy the doc-list lints.
+#![allow(clippy::doc_overindented_list_items, clippy::doc_lazy_continuation)]
 //! Arc inference engine CLI.
 //!
 //! This is the `arc` binary — a thin wrapper around the mistral.rs CLI
@@ -384,7 +387,7 @@ fn run_validate(index_path: &PathBuf, arch: &str, o_proj_layout: &str) -> i32 {
             let layout = match o_proj_layout {
                 "single" => OProjLayout::Single,
                 "lora" => OProjLayout::Lora,
-                "either" | _ => OProjLayout::Either,
+                _ => OProjLayout::Either,
             };
             validate_v4_weights_with_layout(keys.iter().copied(), layout)
         }

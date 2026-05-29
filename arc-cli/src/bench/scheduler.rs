@@ -184,9 +184,9 @@ impl Scheduler {
             phase_index += 1;
             let record = self.run_phase(phase_index, k, "ramp").await?;
             let pass = record.evaluation.overall_pass;
-            let _ = self
-                .events
-                .send(Event::PhaseFinished { record: record.clone() });
+            let _ = self.events.send(Event::PhaseFinished {
+                record: record.clone(),
+            });
             phases.push(record);
 
             if pass {
@@ -216,9 +216,9 @@ impl Scheduler {
                 phase_index += 1;
                 let record = self.run_phase(phase_index, mid, "bisect").await?;
                 let pass = record.evaluation.overall_pass;
-                let _ = self
-                    .events
-                    .send(Event::PhaseFinished { record: record.clone() });
+                let _ = self.events.send(Event::PhaseFinished {
+                    record: record.clone(),
+                });
                 phases.push(record);
                 if pass {
                     lo = mid;
@@ -229,11 +229,7 @@ impl Scheduler {
             last_pass = Some(lo);
         }
 
-        let max_explored = phases
-            .iter()
-            .map(|p| p.concurrent_users)
-            .max()
-            .unwrap_or(0);
+        let max_explored = phases.iter().map(|p| p.concurrent_users).max().unwrap_or(0);
 
         let report = ScheduleReport {
             tier: self.tier,
@@ -252,12 +248,7 @@ impl Scheduler {
     }
 
     /// Run one phase at concurrency K: warmup window + steady-state window.
-    async fn run_phase(
-        &self,
-        phase_index: u32,
-        k: u32,
-        kind: &str,
-    ) -> Result<PhaseRecord> {
+    async fn run_phase(&self, phase_index: u32, k: u32, kind: &str) -> Result<PhaseRecord> {
         let warmup = self.cfg.warmup;
         let steady = self.cfg.steady_state;
 
@@ -567,6 +558,6 @@ mod tests {
         assert!(calls < 100, "should not blow up on noisy SLO ({calls})");
         // Saturation should be in a reasonable neighbourhood of the
         // true crossover.
-        assert!(s >= 32 && s <= 64, "noisy result out of band: {s}");
+        assert!((32..=64).contains(&s), "noisy result out of band: {s}");
     }
 }

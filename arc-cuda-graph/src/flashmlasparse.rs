@@ -51,9 +51,12 @@ pub const SUPPORTED_TOPK: &[usize] = &[64, 128, 256, 512, 1024];
 ///   scores[b, h, q, c] = sum_d(q[b,h,q,d] * k[b,h,c,d]) * scale[b,h,q]
 ///   top_k(scores, dim=-1) → indices
 pub fn cpu_reference(
-    q: &[f32], q_dims: (usize, usize, usize, usize),
-    k: &[f32], k_dims: (usize, usize, usize, usize),
-    per_head_scale: &[f32], scale_dims: (usize, usize, usize),
+    q: &[f32],
+    q_dims: (usize, usize, usize, usize),
+    k: &[f32],
+    k_dims: (usize, usize, usize, usize),
+    per_head_scale: &[f32],
+    scale_dims: (usize, usize, usize),
     topk: usize,
 ) -> Vec<u32> {
     let (b, h_q, t_q, d_q) = q_dims;
@@ -97,7 +100,8 @@ pub fn cpu_reference(
                 // kernel's behaviour.
                 let mut idx: Vec<usize> = (0..t_c).collect();
                 idx.sort_by(|&a, &b_i| {
-                    scores[b_i].partial_cmp(&scores[a])
+                    scores[b_i]
+                        .partial_cmp(&scores[a])
                         .unwrap_or(std::cmp::Ordering::Equal)
                         .then(a.cmp(&b_i))
                 });
@@ -125,7 +129,7 @@ pub fn validate_dispatch(topk: usize, head_dim: usize) -> std::result::Result<()
             topk, SUPPORTED_TOPK
         ));
     }
-    if head_dim != 64 && head_dim != 128 && (head_dim == 0 || head_dim % 8 != 0) {
+    if head_dim != 64 && head_dim != 128 && (head_dim == 0 || !head_dim.is_multiple_of(8)) {
         return Err(format!(
             "FlashMLASparse: head_dim={} must be a positive multiple of 8 (typical: 128)",
             head_dim
@@ -144,8 +148,8 @@ pub use cuda_impl::*;
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use super::*;
-    use candle_core::cuda::cudarc::driver::DevicePtr;
     use candle_core::cuda::cudarc::driver::sys::CUstream;
+    use candle_core::cuda::cudarc::driver::DevicePtr;
     use std::ffi::c_void;
 
     /// Convert a CUDA Candle tensor into a raw device pointer (byte-offset
@@ -201,21 +205,24 @@ mod cuda_impl {
         if q_dims.len() != 4 || q.dtype() != DType::BF16 {
             candle_core::bail!(
                 "FlashMLASparse: q must be BF16 [B, H, T_q, D]; got dtype={:?} dims={:?}",
-                q.dtype(), q_dims
+                q.dtype(),
+                q_dims
             );
         }
         let k_dims = k.dims();
         if k_dims.len() != 4 || k.dtype() != DType::BF16 {
             candle_core::bail!(
                 "FlashMLASparse: k must be BF16 [B, H, T_c, D]; got dtype={:?} dims={:?}",
-                k.dtype(), k_dims
+                k.dtype(),
+                k_dims
             );
         }
         let s_dims = per_head_scale.dims();
         if s_dims.len() != 3 || per_head_scale.dtype() != DType::BF16 {
             candle_core::bail!(
                 "FlashMLASparse: per_head_scale must be BF16 [B, H, T_q]; got dtype={:?} dims={:?}",
-                per_head_scale.dtype(), s_dims
+                per_head_scale.dtype(),
+                s_dims
             );
         }
         let (b, h, t_q, d) = (q_dims[0], q_dims[1], q_dims[2], q_dims[3]);
@@ -223,13 +230,17 @@ mod cuda_impl {
         if b_k != b || h_k != h || d_k != d {
             candle_core::bail!(
                 "FlashMLASparse: q/k batch/head/dim mismatch: q={:?} k={:?}",
-                q_dims, k_dims
+                q_dims,
+                k_dims
             );
         }
         if s_dims[0] != b || s_dims[1] != h || s_dims[2] != t_q {
             candle_core::bail!(
                 "FlashMLASparse: per_head_scale dims {:?} != [{},{},{}]",
-                s_dims, b, h, t_q
+                s_dims,
+                b,
+                h,
+                t_q
             );
         }
 
@@ -314,7 +325,8 @@ mod cuda_impl {
         }
         let (b, h, t_q, d) = (q_dims[0], q_dims[1], q_dims[2], q_dims[3]);
         let (b_k, h_k, t_c, d_k) = (k_dims[0], k_dims[1], k_dims[2], k_dims[3]);
-        if b_k != b || h_k != h || d_k != d || s_dims[0] != b || s_dims[1] != h || s_dims[2] != t_q {
+        if b_k != b || h_k != h || d_k != d || s_dims[0] != b || s_dims[1] != h || s_dims[2] != t_q
+        {
             candle_core::bail!("score_and_topk_f32: shape mismatch");
         }
         validate_dispatch(topk, d).map_err(candle_core::Error::msg)?;
@@ -338,13 +350,24 @@ mod cuda_impl {
 
         unsafe {
             crate::flashmlasparse_ffi::arc_flashmlasparse_score_f32(
-                q_ptr, k_ptr, s_ptr, sc_ptr,
-                b as i32, h as i32, t_q as i32, t_c as i32, d as i32,
+                q_ptr,
+                k_ptr,
+                s_ptr,
+                sc_ptr,
+                b as i32,
+                h as i32,
+                t_q as i32,
+                t_c as i32,
+                d as i32,
                 stream as *mut c_void,
             );
             crate::flashmlasparse_ffi::arc_flashmlasparse_topk(
-                sc_ptr as *const c_void, sl_ptr, out_ptr,
-                n_rows, topk as i32, t_c as i64,
+                sc_ptr as *const c_void,
+                sl_ptr,
+                out_ptr,
+                n_rows,
+                topk as i32,
+                t_c as i64,
                 stream as *mut c_void,
             );
         }
@@ -375,7 +398,9 @@ mod tests {
         // Deterministic logits via a small LCG so we never hit a tie.
         let mut state: u64 = 0xDEAD_BEEF_CAFE_F00D;
         let mut rand = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((state >> 33) as u32 as f32 / u32::MAX as f32) * 4.0 - 2.0
         };
         let q: Vec<f32> = (0..b * h * t_q * d).map(|_| rand()).collect();
@@ -384,9 +409,12 @@ mod tests {
         let scale: Vec<f32> = (0..b * h * t_q).map(|i| 0.5 + (i as f32) * 0.01).collect();
 
         let indices = cpu_reference(
-            &q, (b, h, t_q, d),
-            &k, (b, h, t_c, d),
-            &scale, (b, h, t_q),
+            &q,
+            (b, h, t_q, d),
+            &k,
+            (b, h, t_c, d),
+            &scale,
+            (b, h, t_q),
             topk,
         );
         assert_eq!(indices.len(), b * h * t_q * topk);
@@ -408,13 +436,15 @@ mod tests {
                         })
                         .collect();
                     scored.sort_by(|a, b| {
-                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                        b.1.partial_cmp(&a.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
                             .then(a.0.cmp(&b.0))
                     });
                     let out_base = ((bi * h + hi) * t_q + qi) * topk;
                     for i in 0..topk {
                         assert_eq!(
-                            indices[out_base + i], scored[i].0 as u32,
+                            indices[out_base + i],
+                            scored[i].0 as u32,
                             "mismatch at bi={bi} hi={hi} qi={qi} i={i}"
                         );
                     }
@@ -436,9 +466,12 @@ mod tests {
         let k = vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
         let scale = vec![1.0f32];
         let out = cpu_reference(
-            &q, (b, h, t_q, d),
-            &k, (b, h, t_c, d),
-            &scale, (b, h, t_q),
+            &q,
+            (b, h, t_q, d),
+            &k,
+            (b, h, t_c, d),
+            &scale,
+            (b, h, t_q),
             topk,
         );
         // Scores: c0=1.0*1+2.0*0=1.0, c1=1.0*0+2.0*1=2.0, c2=1.0*1+2.0*1=3.0
@@ -461,11 +494,29 @@ mod tests {
         let d = 4;
         let topk = 3;
         let q: Vec<f32> = (0..b * h * t_q * d).map(|i| (i as f32) * 0.123).collect();
-        let k: Vec<f32> = (0..b * h * t_c * d).map(|i| (i as f32) * 0.077 - 1.0).collect();
+        let k: Vec<f32> = (0..b * h * t_c * d)
+            .map(|i| (i as f32) * 0.077 - 1.0)
+            .collect();
         let scale: Vec<f32> = (0..b * h * t_q).map(|i| 1.0 + (i as f32) * 0.1).collect();
 
-        let a = cpu_reference(&q, (b, h, t_q, d), &k, (b, h, t_c, d), &scale, (b, h, t_q), topk);
-        let b_ = cpu_reference(&q, (b, h, t_q, d), &k, (b, h, t_c, d), &scale, (b, h, t_q), topk);
+        let a = cpu_reference(
+            &q,
+            (b, h, t_q, d),
+            &k,
+            (b, h, t_c, d),
+            &scale,
+            (b, h, t_q),
+            topk,
+        );
+        let b_ = cpu_reference(
+            &q,
+            (b, h, t_q, d),
+            &k,
+            (b, h, t_c, d),
+            &scale,
+            (b, h, t_q),
+            topk,
+        );
         assert_eq!(a, b_);
     }
 
@@ -482,9 +533,9 @@ mod tests {
     /// validate_dispatch rejects unaligned head_dim.
     #[test]
     fn validate_dispatch_rejects_bad_head_dim() {
-        assert!(validate_dispatch(512, 7).is_err());  // not multiple of 8
-        assert!(validate_dispatch(512, 0).is_err());  // zero
-        // 128 and 64 are explicitly supported template instantiations.
+        assert!(validate_dispatch(512, 7).is_err()); // not multiple of 8
+        assert!(validate_dispatch(512, 0).is_err()); // zero
+                                                     // 128 and 64 are explicitly supported template instantiations.
         assert!(validate_dispatch(512, 128).is_ok());
         assert!(validate_dispatch(512, 64).is_ok());
         // Other multiples of 8 are accepted via the generic fallback path.
@@ -508,7 +559,15 @@ mod tests {
             }
         }
         let scale = vec![1.0f32];
-        let out = cpu_reference(&q, (b, h, t_q, d), &k, (b, h, t_c, d), &scale, (b, h, t_q), topk);
+        let out = cpu_reference(
+            &q,
+            (b, h, t_q, d),
+            &k,
+            (b, h, t_c, d),
+            &scale,
+            (b, h, t_q),
+            topk,
+        );
         assert_eq!(out.len(), topk);
         for &idx in &out {
             assert!((idx as usize) < t_c, "index {idx} out of range [0, {t_c})");

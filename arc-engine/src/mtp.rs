@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn detect_no_mtp_in_plain_model() {
-        let keys = vec![
+        let keys = [
             "model.embed_tokens.weight",
             "model.layers.0.self_attn.q_proj.weight",
             "model.layers.0.mlp.gate_proj.weight",
@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn detect_mtp_layers_finds_depths() {
-        let keys = vec![
+        let keys = [
             "model.embed_tokens.weight",
             "mtp.layers.0.embed.weight",
             "mtp.layers.0.transformer.q_proj.weight",
@@ -201,7 +201,7 @@ mod tests {
 
     #[test]
     fn detect_mtp_ignores_malformed_keys() {
-        let keys = vec![
+        let keys = [
             "mtp.layers.abc.embed.weight", // non-numeric depth
             "mtp.weight",                  // no depth
             "model.mtp.layers.0.weight",   // not at root

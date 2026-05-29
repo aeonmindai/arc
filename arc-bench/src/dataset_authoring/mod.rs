@@ -54,7 +54,7 @@ pub fn all_tuning_trajectories() -> Vec<Trajectory> {
 /// Helper: estimate tokens for a string at the AA-AgentPerf
 /// `~chars/4` rate, rounded up to the nearest token.
 pub(crate) fn est_tokens(s: &str) -> u32 {
-    ((s.chars().count() + 3) / 4) as u32
+    s.chars().count().div_ceil(4) as u32
 }
 
 /// Helper: estimate the input-token count visible to the assistant
@@ -71,16 +71,11 @@ pub(crate) fn est_input_tokens_prior(turns: &[Turn]) -> u32 {
             chars += c.args.to_string().len();
         }
     }
-    600 + ((chars + 3) / 4) as u32
+    600 + chars.div_ceil(4) as u32
 }
 
 /// Convenience constructor used by every language submodule.
-pub(crate) fn assemble(
-    id: &str,
-    language: &str,
-    source: Source,
-    turns: Vec<Turn>,
-) -> Trajectory {
+pub(crate) fn assemble(id: &str, language: &str, source: Source, turns: Vec<Turn>) -> Trajectory {
     Trajectory {
         id: id.to_string(),
         language: language.to_string(),
@@ -129,11 +124,7 @@ pub(crate) fn assistant_call(
 
 /// Build an assistant turn with multiple tool calls.
 #[allow(dead_code)]
-pub(crate) fn assistant_calls(
-    chat: &str,
-    calls: Vec<ToolCall>,
-    prior: &[Turn],
-) -> Turn {
+pub(crate) fn assistant_calls(chat: &str, calls: Vec<ToolCall>, prior: &[Turn]) -> Turn {
     let call_chars: usize = calls
         .iter()
         .map(|c| c.name.len() + c.args.to_string().len())
@@ -144,7 +135,7 @@ pub(crate) fn assistant_calls(
         tool_calls: calls,
         tool_call_id: None,
         input_tokens_est: Some(est_input_tokens_prior(prior)),
-        output_tokens_est: Some(est_tokens(chat) + 30 + ((call_chars + 3) / 4) as u32),
+        output_tokens_est: Some(est_tokens(chat) + 30 + call_chars.div_ceil(4) as u32),
     }
 }
 

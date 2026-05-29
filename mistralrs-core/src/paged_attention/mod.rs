@@ -30,6 +30,7 @@ pub fn clear_global_turbo_norms() {
     TURBO_NORMS_GLOBAL.lock().unwrap().clear();
 }
 
+#[allow(dead_code)] // TurboQuant norm accessor; not yet wired into the active path
 pub(crate) fn get_global_turbo_norms(layer_idx: usize) -> Option<(Tensor, Tensor)> {
     let norms = TURBO_NORMS_GLOBAL.lock().unwrap();
     if layer_idx < norms.len() {
@@ -39,6 +40,7 @@ pub(crate) fn get_global_turbo_norms(layer_idx: usize) -> Option<(Tensor, Tensor
     }
 }
 
+#[allow(dead_code)] // TurboQuant norm presence check; not yet wired into the active path
 pub(crate) fn has_global_turbo_norms() -> bool {
     !TURBO_NORMS_GLOBAL.lock().unwrap().is_empty()
 }

@@ -209,6 +209,7 @@ static TURBOQUANT_HEAD_DIM: std::sync::atomic::AtomicUsize = std::sync::atomic::
 
 /// Enable TurboQuant for all new NormalCache instances.
 /// Set head_dim > 0 to enable, 0 to disable.
+#[allow(dead_code)] // TurboQuant config setter; not yet wired into the active path
 pub fn set_turboquant_head_dim(head_dim: usize) {
     TURBOQUANT_HEAD_DIM.store(head_dim, std::sync::atomic::Ordering::SeqCst);
 }

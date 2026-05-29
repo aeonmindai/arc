@@ -131,7 +131,10 @@ fn cpp_023_thread_pool() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_001", "wrote 1408 bytes to include/thread_pool.h"));
+    turns.push(tool(
+        "call_001",
+        "wrote 1408 bytes to include/thread_pool.h",
+    ));
     turns.push(assistant_text(
         "Header-only thread pool ready. Workers are std::jthread; the destructor requests stop and the condition variable wakes idle workers so they observe the stop token.",
         &turns,

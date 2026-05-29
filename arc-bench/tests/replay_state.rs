@@ -25,10 +25,7 @@ impl ScriptedVendor {
 
 #[async_trait]
 impl Vendor for ScriptedVendor {
-    async fn complete(
-        &self,
-        messages: &[ChatMessage],
-    ) -> anyhow::Result<VendorResponse> {
+    async fn complete(&self, messages: &[ChatMessage]) -> anyhow::Result<VendorResponse> {
         self.observed.lock().unwrap().push(messages.to_vec());
         Ok(self
             .responses
@@ -67,7 +64,8 @@ async fn end_to_end_replay_on_committed_trajectory() {
             // Tweak ids on calls so we keep them in lockstep; the
             // recorded turn already has them so just clone.
             // (Mock just echoes back the recorded calls.)
-            for c in &mut calls { /* no-op */
+            for c in &mut calls {
+                /* no-op */
                 let _ = c;
             }
             canned_responses.push(canned(&turn.content, calls));
@@ -89,7 +87,11 @@ async fn end_to_end_replay_on_committed_trajectory() {
     // Every recorded turn should carry zero diagnostics because the
     // mock perfectly echoes the recorded output.
     for tr in &result.turns {
-        assert!(tr.diagnostics.is_empty(), "unexpected diagnostics: {:?}", tr.diagnostics);
+        assert!(
+            tr.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            tr.diagnostics
+        );
     }
     // Sanity: aggregate metrics non-zero.
     let total = result.total_output_tokens();

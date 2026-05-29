@@ -1,3 +1,6 @@
+// The flow doc-comment uses a nested list layout flagged by the doc lint; keep
+// it as written.
+#![allow(clippy::doc_overindented_list_items)]
 //! TD-MoE pipeline call-site: post-load compression of MoE expert weights.
 //!
 //! # Flow

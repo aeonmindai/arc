@@ -1,4 +1,13 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+// WIP V4 mHC module: a helper (`collapse_4d_to_3d`) and config field are not
+// yet wired in, and the port keeps the reference doc-comment layout. Keep these
+// dead-code/doc lints quiet here (CI does not gate mistralrs-core; see
+// arc-tools/CI_HYGIENE.md).
+#![allow(
+    dead_code,
+    clippy::doc_overindented_list_items,
+    clippy::doc_lazy_continuation
+)]
 //! DeepSeek V4 mHC (Manifold-Constrained Hyper-Connections).
 //!
 //! Pure-Rust port of SGLang's mHC pre/post split-sinkhorn mixing.

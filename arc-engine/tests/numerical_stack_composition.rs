@@ -1,3 +1,6 @@
+// Test harness: a multi-arg builder, complex synthetic-weight tuples, and
+// `&mut Vec` scratch buffers are intentional fixtures here.
+#![allow(clippy::too_many_arguments, clippy::type_complexity, clippy::ptr_arg)]
 //! RUN-151: End-to-end numerical stack-composition test (M1 gate).
 //!
 //! ## What this gates
@@ -206,9 +209,9 @@ struct LayerWeights {
     mlp_up: Option<Tensor>,
     mlp_down: Option<Tensor>,
     // For layer 1 (MoE):
-    moe_router: Option<Tensor>,           // [n_experts, hidden]
-    moe_experts_gate_up: Option<Tensor>,  // [n_experts, 2*intermediate, hidden] — stacked
-    moe_experts_down: Option<Tensor>,     // [n_experts, hidden, intermediate]
+    moe_router: Option<Tensor>,          // [n_experts, hidden]
+    moe_experts_gate_up: Option<Tensor>, // [n_experts, 2*intermediate, hidden] — stacked
+    moe_experts_down: Option<Tensor>,    // [n_experts, hidden, intermediate]
 }
 
 struct ModelWeights {
@@ -235,18 +238,10 @@ fn build_model_weights(dev: &Device) -> Result<ModelWeights> {
         // Xavier-style init: stddev = 1/sqrt(fan_in). This keeps post-matmul
         // activations at unit variance for unit-variance inputs.
         let lin_scale = 1.0 / (HIDDEN_SIZE as f32).sqrt();
-        let q_proj = gaussian_tensor(
-            &[HIDDEN_SIZE, HIDDEN_SIZE], lin_scale, base + 11, dev,
-        )?;
-        let k_proj = gaussian_tensor(
-            &[HIDDEN_SIZE, HIDDEN_SIZE], lin_scale, base + 12, dev,
-        )?;
-        let v_proj = gaussian_tensor(
-            &[HIDDEN_SIZE, HIDDEN_SIZE], lin_scale, base + 13, dev,
-        )?;
-        let o_proj = gaussian_tensor(
-            &[HIDDEN_SIZE, HIDDEN_SIZE], lin_scale, base + 14, dev,
-        )?;
+        let q_proj = gaussian_tensor(&[HIDDEN_SIZE, HIDDEN_SIZE], lin_scale, base + 11, dev)?;
+        let k_proj = gaussian_tensor(&[HIDDEN_SIZE, HIDDEN_SIZE], lin_scale, base + 12, dev)?;
+        let v_proj = gaussian_tensor(&[HIDDEN_SIZE, HIDDEN_SIZE], lin_scale, base + 13, dev)?;
+        let o_proj = gaussian_tensor(&[HIDDEN_SIZE, HIDDEN_SIZE], lin_scale, base + 14, dev)?;
         // Use ones for layernorm gains so we don't conflate norm-scale with
         // matmul quantization noise.
         let pre_attn_norm = Tensor::ones(HIDDEN_SIZE, DType::F32, dev)?;
@@ -254,18 +249,10 @@ fn build_model_weights(dev: &Device) -> Result<ModelWeights> {
 
         if i == 0 {
             // Dense MLP layer.
-            let mlp_gate = gaussian_tensor(
-                &[INTERMEDIATE_SIZE, HIDDEN_SIZE],
-                lin_scale,
-                base + 21,
-                dev,
-            )?;
-            let mlp_up = gaussian_tensor(
-                &[INTERMEDIATE_SIZE, HIDDEN_SIZE],
-                lin_scale,
-                base + 22,
-                dev,
-            )?;
+            let mlp_gate =
+                gaussian_tensor(&[INTERMEDIATE_SIZE, HIDDEN_SIZE], lin_scale, base + 21, dev)?;
+            let mlp_up =
+                gaussian_tensor(&[INTERMEDIATE_SIZE, HIDDEN_SIZE], lin_scale, base + 22, dev)?;
             let mlp_down = gaussian_tensor(
                 &[HIDDEN_SIZE, INTERMEDIATE_SIZE],
                 1.0 / (INTERMEDIATE_SIZE as f32).sqrt(),
@@ -288,12 +275,8 @@ fn build_model_weights(dev: &Device) -> Result<ModelWeights> {
             });
         } else {
             // MoE layer with 4 experts, top-2.
-            let moe_router = gaussian_tensor(
-                &[NUM_EXPERTS, HIDDEN_SIZE],
-                lin_scale,
-                base + 31,
-                dev,
-            )?;
+            let moe_router =
+                gaussian_tensor(&[NUM_EXPERTS, HIDDEN_SIZE], lin_scale, base + 31, dev)?;
             // Stacked gate_up_proj: [n_experts, 2*intermediate, hidden]
             let moe_gate_up = gaussian_tensor(
                 &[NUM_EXPERTS, 2 * EXPERT_INTERMEDIATE, HIDDEN_SIZE],
@@ -452,11 +435,7 @@ fn attention_block(
     Ok((out, k_full, v_full))
 }
 
-fn turboquant_roundtrip_kv(
-    kv: &Tensor,
-    signs: &[f32],
-    cb: &Codebook,
-) -> Result<Tensor> {
+fn turboquant_roundtrip_kv(kv: &Tensor, signs: &[f32], cb: &Codebook) -> Result<Tensor> {
     // kv: [B, H, T, head_dim]. Round-trip each [head_dim] vector through
     // TurboQuant {quantize, dequantize}. This mirrors production: each
     // per-token-per-head KV vector is compressed independently.
@@ -525,14 +504,8 @@ fn moe_forward(x: &Tensor, w: &LayerWeights) -> Result<Tensor> {
     let inter = EXPERT_INTERMEDIATE;
     let normed_flat = normed.reshape((b * t, HIDDEN_SIZE))?;
     let normed_data: Vec<f32> = normed_flat.flatten_all()?.to_vec1()?;
-    let gate_up_data: Vec<f32> = gate_up_w
-        .to_dtype(DType::F32)?
-        .flatten_all()?
-        .to_vec1()?;
-    let down_data: Vec<f32> = down_w
-        .to_dtype(DType::F32)?
-        .flatten_all()?
-        .to_vec1()?;
+    let gate_up_data: Vec<f32> = gate_up_w.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+    let down_data: Vec<f32> = down_w.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
 
     let mut out = vec![0f32; b * t * HIDDEN_SIZE];
 
@@ -613,38 +586,13 @@ struct QtipModel {
 fn quantize_model(model: &ModelWeights, dev: &Device) -> Result<QtipModel> {
     let mut layers = Vec::with_capacity(model.layers.len());
     for (i, w) in model.layers.iter().enumerate() {
-        let q_proj = QtipLayer::quantize_with_mode(
-            &w.q_proj,
-            None,
-            dev,
-            QtipMode::Viterbi,
-        )?;
-        let k_proj = QtipLayer::quantize_with_mode(
-            &w.k_proj,
-            None,
-            dev,
-            QtipMode::Viterbi,
-        )?;
-        let v_proj = QtipLayer::quantize_with_mode(
-            &w.v_proj,
-            None,
-            dev,
-            QtipMode::Viterbi,
-        )?;
-        let o_proj = QtipLayer::quantize_with_mode(
-            &w.o_proj,
-            None,
-            dev,
-            QtipMode::Viterbi,
-        )?;
+        let q_proj = QtipLayer::quantize_with_mode(&w.q_proj, None, dev, QtipMode::Viterbi)?;
+        let k_proj = QtipLayer::quantize_with_mode(&w.k_proj, None, dev, QtipMode::Viterbi)?;
+        let v_proj = QtipLayer::quantize_with_mode(&w.v_proj, None, dev, QtipMode::Viterbi)?;
+        let o_proj = QtipLayer::quantize_with_mode(&w.o_proj, None, dev, QtipMode::Viterbi)?;
 
         let (mlp_gate, mlp_up, mlp_down) = if let Some(g) = &w.mlp_gate {
-            let mg = QtipLayer::quantize_with_mode(
-                g,
-                None,
-                dev,
-                QtipMode::Viterbi,
-            )?;
+            let mg = QtipLayer::quantize_with_mode(g, None, dev, QtipMode::Viterbi)?;
             let mu = QtipLayer::quantize_with_mode(
                 w.mlp_up.as_ref().unwrap(),
                 None,
@@ -662,56 +610,54 @@ fn quantize_model(model: &ModelWeights, dev: &Device) -> Result<QtipModel> {
             (None, None, None)
         };
 
-        let (moe_router, gate_up_tucker, down_tucker) =
-            if let Some(rt) = &w.moe_router {
-                let router = rt.clone();
-                // TD-MoE: Tucker-decompose then reconstruct (lossy round trip).
-                // For gate_up [n_experts, 2*inter, hidden]: rank=[K, ~ρ*2*inter, ~ρ*hidden].
-                //
-                // ρ choice: arc-engine's current `tucker_decompose` is the Tier-A
-                // unwhitened HOSVD; per the paper's own Tier-A test
-                // (arc-engine/src/td_moe.rs::low_rank_tensor_compresses_well), it
-                // achieves only "cos > 0.3" at ρ=0.5 on random data because
-                // power-iteration SVD converges suboptimally compared to LAPACK
-                // + whitening (Tier B, deferred to RUN-136/137). For the M1
-                // composition gate we choose ρ=0.9 to keep Tucker noise
-                // bounded relative to QTIP noise; this is a stress test of the
-                // **composition**, not a benchmark of TD-MoE compression — the
-                // benchmark belongs in `td_moe.rs::tests`.
-                let gu = w.moe_experts_gate_up.as_ref().unwrap();
-                let dn = w.moe_experts_down.as_ref().unwrap();
-                let (k, two_i, h) = gu.dims3()?;
-                let rho = 0.9_f32;
-                let r1 = k; // full rank on expert axis (only 4 experts)
-                let r2 = ((two_i as f32) * rho).round() as usize;
-                let r3 = ((h as f32) * rho).round() as usize;
-                let r2 = r2.max(1).min(two_i);
-                let r3 = r3.max(1).min(h);
-                let gu_tucker: Tucker3D = tucker_decompose(gu, [r1, r2, r3])
-                    .expect("Tucker(gate_up) failed");
-                let gu_recon = tucker_reconstruct(&gu_tucker)
-                    .expect("Tucker reconstruct(gate_up) failed");
+        let (moe_router, gate_up_tucker, down_tucker) = if let Some(rt) = &w.moe_router {
+            let router = rt.clone();
+            // TD-MoE: Tucker-decompose then reconstruct (lossy round trip).
+            // For gate_up [n_experts, 2*inter, hidden]: rank=[K, ~ρ*2*inter, ~ρ*hidden].
+            //
+            // ρ choice: arc-engine's current `tucker_decompose` is the Tier-A
+            // unwhitened HOSVD; per the paper's own Tier-A test
+            // (arc-engine/src/td_moe.rs::low_rank_tensor_compresses_well), it
+            // achieves only "cos > 0.3" at ρ=0.5 on random data because
+            // power-iteration SVD converges suboptimally compared to LAPACK
+            // + whitening (Tier B, deferred to RUN-136/137). For the M1
+            // composition gate we choose ρ=0.9 to keep Tucker noise
+            // bounded relative to QTIP noise; this is a stress test of the
+            // **composition**, not a benchmark of TD-MoE compression — the
+            // benchmark belongs in `td_moe.rs::tests`.
+            let gu = w.moe_experts_gate_up.as_ref().unwrap();
+            let dn = w.moe_experts_down.as_ref().unwrap();
+            let (k, two_i, h) = gu.dims3()?;
+            let rho = 0.9_f32;
+            let r1 = k; // full rank on expert axis (only 4 experts)
+            let r2 = ((two_i as f32) * rho).round() as usize;
+            let r3 = ((h as f32) * rho).round() as usize;
+            let r2 = r2.max(1).min(two_i);
+            let r3 = r3.max(1).min(h);
+            let gu_tucker: Tucker3D =
+                tucker_decompose(gu, [r1, r2, r3]).expect("Tucker(gate_up) failed");
+            let gu_recon =
+                tucker_reconstruct(&gu_tucker).expect("Tucker reconstruct(gate_up) failed");
 
-                let (k_d, h_d, i_d) = dn.dims3()?;
-                let r1d = k_d;
-                let r2d = ((h_d as f32) * rho).round() as usize;
-                let r3d = ((i_d as f32) * rho).round() as usize;
-                let r2d = r2d.max(1).min(h_d);
-                let r3d = r3d.max(1).min(i_d);
-                let dn_tucker: Tucker3D = tucker_decompose(dn, [r1d, r2d, r3d])
-                    .expect("Tucker(down) failed");
-                let dn_recon = tucker_reconstruct(&dn_tucker)
-                    .expect("Tucker reconstruct(down) failed");
+            let (k_d, h_d, i_d) = dn.dims3()?;
+            let r1d = k_d;
+            let r2d = ((h_d as f32) * rho).round() as usize;
+            let r3d = ((i_d as f32) * rho).round() as usize;
+            let r2d = r2d.max(1).min(h_d);
+            let r3d = r3d.max(1).min(i_d);
+            let dn_tucker: Tucker3D =
+                tucker_decompose(dn, [r1d, r2d, r3d]).expect("Tucker(down) failed");
+            let dn_recon = tucker_reconstruct(&dn_tucker).expect("Tucker reconstruct(down) failed");
 
-                println!(
-                    "  layer {i}: TD-MoE Tucker ρ={rho:.1} ranks gate_up={r1}/{r2}/{r3} \
+            println!(
+                "  layer {i}: TD-MoE Tucker ρ={rho:.1} ranks gate_up={r1}/{r2}/{r3} \
                      (orig {k}/{two_i}/{h}), down={r1d}/{r2d}/{r3d} (orig {k_d}/{h_d}/{i_d})"
-                );
+            );
 
-                (Some(router), Some(gu_recon), Some(dn_recon))
-            } else {
-                (None, None, None)
-            };
+            (Some(router), Some(gu_recon), Some(dn_recon))
+        } else {
+            (None, None, None)
+        };
 
         layers.push(QtipLayerWeights {
             pre_attn_norm: w.pre_attn_norm.clone(),
@@ -788,14 +734,8 @@ fn moe_forward_compressed(x: &Tensor, w: &QtipLayerWeights) -> Result<Tensor> {
     let inter = EXPERT_INTERMEDIATE;
     let normed_flat = normed.reshape((b * t, HIDDEN_SIZE))?;
     let normed_data: Vec<f32> = normed_flat.flatten_all()?.to_vec1()?;
-    let gate_up_data: Vec<f32> = gate_up_w
-        .to_dtype(DType::F32)?
-        .flatten_all()?
-        .to_vec1()?;
-    let down_data: Vec<f32> = down_w
-        .to_dtype(DType::F32)?
-        .flatten_all()?
-        .to_vec1()?;
+    let gate_up_data: Vec<f32> = gate_up_w.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+    let down_data: Vec<f32> = down_w.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
 
     let mut out = vec![0f32; b * t * HIDDEN_SIZE];
     for tok in 0..(b * t) {
@@ -976,8 +916,16 @@ fn decode_step_reference(
 
     for (i, w) in model.layers.iter().enumerate() {
         let (ck, cv) = caches[i].clone();
-        let (attn_out, new_k, new_v) =
-            attention_block(&x, w, Some(&ck), Some(&cv), false, &[], &dummy_cb(), &dummy_cb())?;
+        let (attn_out, new_k, new_v) = attention_block(
+            &x,
+            w,
+            Some(&ck),
+            Some(&cv),
+            false,
+            &[],
+            &dummy_cb(),
+            &dummy_cb(),
+        )?;
         caches[i] = (new_k, new_v);
         let x1 = (x + attn_out)?;
         let ffn_out = if i == 0 {
@@ -1062,14 +1010,8 @@ fn check_finite(t: &Tensor, label: &str) -> Result<()> {
     let v: Vec<f32> = t.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
     let nan = v.iter().filter(|x| x.is_nan()).count();
     let inf = v.iter().filter(|x| x.is_infinite()).count();
-    assert_eq!(
-        nan, 0,
-        "{label}: contains {nan} NaN(s)"
-    );
-    assert_eq!(
-        inf, 0,
-        "{label}: contains {inf} Inf(s)"
-    );
+    assert_eq!(nan, 0, "{label}: contains {nan} NaN(s)");
+    assert_eq!(inf, 0, "{label}: contains {inf} Inf(s)");
     Ok(())
 }
 
@@ -1081,10 +1023,12 @@ fn check_finite(t: &Tensor, label: &str) -> Result<()> {
 fn arc_compression_stack_composes_within_drift_budget() -> Result<()> {
     let dev = Device::Cpu;
     println!("\n[RUN-151] Arc compression stack composition test");
-    println!("  Path B (synthetic small transformer): \
+    println!(
+        "  Path B (synthetic small transformer): \
         vocab={VOCAB_SIZE}, hidden={HIDDEN_SIZE}, layers={NUM_LAYERS}, \
         heads={NUM_HEADS}x{HEAD_DIM}, intermediate={INTERMEDIATE_SIZE}, \
-        n_experts={NUM_EXPERTS} top-{TOP_K}");
+        n_experts={NUM_EXPERTS} top-{TOP_K}"
+    );
 
     // ---- Build reference (unquantized) model. ----
     let model = build_model_weights(&dev)?;
@@ -1109,15 +1053,16 @@ fn arc_compression_stack_composes_within_drift_budget() -> Result<()> {
     // ---- Input: prefill 8 tokens. ----
     // Use a deterministic input token pattern.
     let input_ids = Tensor::from_vec(
-        (0..SEQ_LEN as u32).map(|i| i % VOCAB_SIZE as u32).collect::<Vec<_>>(),
+        (0..SEQ_LEN as u32)
+            .map(|i| i % VOCAB_SIZE as u32)
+            .collect::<Vec<_>>(),
         &[1usize, SEQ_LEN],
         &dev,
     )?;
 
     // ---- Reference forward. ----
     println!("\n  Running reference (unquantized) prefill ...");
-    let (ref_logits, ref_per_layer, mut ref_caches) =
-        forward_reference(&model, &input_ids)?;
+    let (ref_logits, ref_per_layer, mut ref_caches) = forward_reference(&model, &input_ids)?;
 
     // ---- Compressed forward. ----
     println!("  Running compressed (QTIP + TurboQuant + TD-MoE) prefill ...");
@@ -1198,8 +1143,7 @@ fn arc_compression_stack_composes_within_drift_budget() -> Result<()> {
         .iter()
         .cloned()
         .fold(f32::INFINITY, f32::min);
-    let avg_decode_cs = per_step_cos_sims.iter().sum::<f32>()
-        / per_step_cos_sims.len() as f32;
+    let avg_decode_cs = per_step_cos_sims.iter().sum::<f32>() / per_step_cos_sims.len() as f32;
     println!("    teacher-forced tokens (from reference): {decoded:?}");
     println!(
         "    per-step decode logits cos_sim: min={min_decode_cs:.4}, avg={avg_decode_cs:.4}, all={per_step_cos_sims:?}"
@@ -1276,12 +1220,7 @@ fn qtip_2bit_viterbi_single_layer_sanity() -> Result<()> {
     let x = gaussian_tensor(&[4, HIDDEN_SIZE], 1.0, 6789, &dev)?;
 
     let dense = x.matmul(&w.t()?)?;
-    let q = QtipLayer::quantize_with_mode(
-        &w,
-        None,
-        &dev,
-        QtipMode::Viterbi,
-    )?;
+    let q = QtipLayer::quantize_with_mode(&w, None, &dev, QtipMode::Viterbi)?;
     let qout = q.forward(&x)?;
     let cs = cosine_sim(&dense, &qout)?;
     println!("[RUN-151 sanity] QTIP Viterbi single-layer matmul cos_sim = {cs:.4}");
@@ -1313,8 +1252,10 @@ fn tucker_decomp_reconstruct_sanity() -> Result<()> {
     let tucker = tucker_decompose(&w, ranks).expect("Tucker failed");
     let w_recon = tucker_reconstruct(&tucker).expect("reconstruct failed");
     let cs = cosine_sim(&w, &w_recon)?;
-    println!("[RUN-151 sanity] TD-MoE Tucker [{:?} → {:?}] reconstruct cos_sim = {cs:.4}",
-        dims, ranks);
+    println!(
+        "[RUN-151 sanity] TD-MoE Tucker [{:?} → {:?}] reconstruct cos_sim = {cs:.4}",
+        dims, ranks
+    );
     assert!(
         cs >= 0.90,
         "Tucker reconstruction cos_sim {cs:.4} < 0.90 at ρ=0.9 — TD-MoE math may be broken"

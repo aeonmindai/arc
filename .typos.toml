@@ -39,6 +39,33 @@ extend-ignore-re = [
 "layrnorm" = "layrnorm"
 "wht" = "wht"
 "WHT" = "WHT"
+# Arc domain terms, algorithm/library names, and numerical-code variable names
+# flagged as typos but intentional. Allow-listed (not renamed) to avoid
+# semantic breakage in hot numerical paths and to keep model/research naming.
+#   nd/clen/tpos  : loop/accumulator + sequence-length variables (Rust + CUDA)
+#   suh/svh       : EXL3 trellis tensor names
+#   ue            : UE8M0 FP8 scale format (DeepSeek V4)
+#   ba            : MoBA (Mixture of Block Attention)
+#   fied          : "ReLU-fied" weights
+#   mis           : "mis-route"
+#   maddness/hass : Maddness, HASS (algorithm names)
+#   ist           : IST-DASLab (research org)
+#   ratatui       : the Ratatui TUI crate
+#   writeable     : valid alternate spelling used in kernel comments
+"nd" = "nd"
+"clen" = "clen"
+"tpos" = "tpos"
+"suh" = "suh"
+"svh" = "svh"
+"fied" = "fied"
+"mis" = "mis"
+"writeable" = "writeable"
+"maddness" = "maddness"
+"hass" = "hass"
+"ist" = "ist"
+"ue" = "ue"
+"ba" = "ba"
+"ratatui" = "ratatui"
 
 [type.rust.extend-identifiers]
 "arange" = "arange"

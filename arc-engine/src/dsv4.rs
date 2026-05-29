@@ -1,3 +1,7 @@
+// Index-based attention loops, identity ops in test shape literals, and the
+// parenthesized blended return are intentional in this GPU-parity-sensitive
+// path; suppress the style lints rather than rewrite it (arc-tools/CI_HYGIENE.md).
+#![allow(clippy::needless_range_loop, clippy::identity_op, unused_parens)]
 //! DeepSeek V4 hybrid attention: CSA (Compressed Sparse Attention) + HCA (Heavily
 //! Compressed Attention) + sliding-window local branch.
 //!
@@ -67,9 +71,7 @@ impl CompressRatio {
             0 => Ok(CompressRatio::Standard),
             4 => Ok(CompressRatio::Csa),
             128 => Ok(CompressRatio::Hca),
-            other => candle_core::bail!(
-                "V4 compress_ratio must be 0, 4, or 128; got {other}"
-            ),
+            other => candle_core::bail!("V4 compress_ratio must be 0, 4, or 128; got {other}"),
         }
     }
 }
@@ -184,10 +186,7 @@ impl Compressor {
             );
         }
         if t % self.ratio != 0 {
-            candle_core::bail!(
-                "seq_len {t} not divisible by compress ratio {}",
-                self.ratio
-            );
+            candle_core::bail!("seq_len {t} not divisible by compress ratio {}", self.ratio);
         }
         let t_new = t / self.ratio;
 
@@ -211,11 +210,7 @@ impl Compressor {
 ///   per query (in descending score order).
 ///
 /// Score = dot product of q · compressed_k.
-pub fn top_k_select_indices(
-    q: &Tensor,
-    compressed_k: &Tensor,
-    top_k: usize,
-) -> Result<Tensor> {
+pub fn top_k_select_indices(q: &Tensor, compressed_k: &Tensor, top_k: usize) -> Result<Tensor> {
     let q_dims = q.dims();
     let k_dims = compressed_k.dims();
     if q_dims.len() != 4 || k_dims.len() != 4 {
@@ -256,8 +251,7 @@ pub fn top_k_select_indices(
         }
     }
 
-    Tensor::from_vec(indices_out, (b, h, t_q, top_k), &Device::Cpu)?
-        .to_device(q.device())
+    Tensor::from_vec(indices_out, (b, h, t_q, top_k), &Device::Cpu)?.to_device(q.device())
 }
 
 /// CSA: compress K + V by 4×, select top-k compressed entries per query, run
@@ -292,15 +286,18 @@ pub fn csa_attention(
     // Per-query attention: q[b,h,t_q,:] vs selected_k[b,h,t_q,:,:] → top_k logits.
     // We compute as element-wise multiplication + sum since each query attends to
     // a different subset of K entries.
-    let q_data: Vec<f32> = q.to_dtype(DType::F32)?
+    let q_data: Vec<f32> = q
+        .to_dtype(DType::F32)?
         .to_device(&Device::Cpu)?
         .flatten_all()?
         .to_vec1()?;
-    let k_sel_data: Vec<f32> = k_selected.to_dtype(DType::F32)?
+    let k_sel_data: Vec<f32> = k_selected
+        .to_dtype(DType::F32)?
         .to_device(&Device::Cpu)?
         .flatten_all()?
         .to_vec1()?;
-    let v_sel_data: Vec<f32> = v_selected.to_dtype(DType::F32)?
+    let v_sel_data: Vec<f32> = v_selected
+        .to_dtype(DType::F32)?
         .to_device(&Device::Cpu)?
         .flatten_all()?
         .to_vec1()?;
@@ -329,11 +326,14 @@ pub fn csa_attention(
                 // Softmax over scores.
                 let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 let mut sum_exp = 0f32;
-                let mut exp_scores = scores.iter().map(|&s| {
-                    let e = (s - max_s).exp();
-                    sum_exp += e;
-                    e
-                }).collect::<Vec<_>>();
+                let mut exp_scores = scores
+                    .iter()
+                    .map(|&s| {
+                        let e = (s - max_s).exp();
+                        sum_exp += e;
+                        e
+                    })
+                    .collect::<Vec<_>>();
                 if sum_exp > 0.0 {
                     for s in exp_scores.iter_mut() {
                         *s /= sum_exp;
@@ -357,8 +357,7 @@ pub fn csa_attention(
         }
     }
 
-    Tensor::from_vec(out, (b, h, t_q, d), &Device::Cpu)?
-        .to_device(q.device())
+    Tensor::from_vec(out, (b, h, t_q, d), &Device::Cpu)?.to_device(q.device())
 }
 
 /// HCA: compress K + V by 128×, run dense attention over the compressed sequence.
@@ -430,9 +429,7 @@ pub fn dsv4_attention(
             let weights = candle_nn::ops::softmax_last_dim(&scaled)?;
             weights.matmul(v)?
         }
-        CompressRatio::Csa => {
-            csa_attention(q, k, v, compressor_k, compressor_v, cfg.csa_topk)?
-        }
+        CompressRatio::Csa => csa_attention(q, k, v, compressor_k, compressor_v, cfg.csa_topk)?,
         CompressRatio::Hca => hca_attention(q, k, v, compressor_k, compressor_v)?,
     };
 
@@ -460,12 +457,8 @@ fn gather_selected_entries(
     top_k: usize,
     d: usize,
 ) -> Result<Tensor> {
-    let compressed_cpu = compressed
-        .to_dtype(DType::F32)?
-        .to_device(&Device::Cpu)?;
-    let indices_cpu = indices
-        .to_dtype(DType::U32)?
-        .to_device(&Device::Cpu)?;
+    let compressed_cpu = compressed.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
+    let indices_cpu = indices.to_dtype(DType::U32)?.to_device(&Device::Cpu)?;
     let comp_data: Vec<f32> = compressed_cpu.flatten_all()?.to_vec1()?;
     let idx_data: Vec<u32> = indices_cpu.flatten_all()?.to_vec1()?;
     let t_c = compressed.dim(2)?;
@@ -475,10 +468,9 @@ fn gather_selected_entries(
         for hi in 0..h {
             for qi in 0..t_q {
                 for ki in 0..top_k {
-                    let sel_idx = idx_data[bi * (h * t_q * top_k)
-                        + hi * (t_q * top_k)
-                        + qi * top_k
-                        + ki] as usize;
+                    let sel_idx = idx_data
+                        [bi * (h * t_q * top_k) + hi * (t_q * top_k) + qi * top_k + ki]
+                        as usize;
                     debug_assert!(sel_idx < t_c, "indexer produced out-of-range index");
                     for di in 0..d {
                         let in_idx = bi * (h * t_c * d) + hi * (t_c * d) + sel_idx * d + di;
@@ -493,8 +485,7 @@ fn gather_selected_entries(
             }
         }
     }
-    Tensor::from_vec(out, (b, h, t_q, top_k, d), &Device::Cpu)?
-        .to_device(compressed.device())
+    Tensor::from_vec(out, (b, h, t_q, top_k, d), &Device::Cpu)?.to_device(compressed.device())
 }
 
 #[cfg(test)]
@@ -655,7 +646,11 @@ mod tests {
         // Result should be close to (token 9's value) since the softmax is sharply
         // peaked on the highest dim-0 score (token 9 = 90/sqrt(4) before scaling).
         // Within the window of [7, 8, 9], the weighted sum strongly favors 9.
-        assert!(v_data[0] > 8.5, "expected near token 9 (val=9), got {}", v_data[0]);
+        assert!(
+            v_data[0] > 8.5,
+            "expected near token 9 (val=9), got {}",
+            v_data[0]
+        );
         Ok(())
     }
 

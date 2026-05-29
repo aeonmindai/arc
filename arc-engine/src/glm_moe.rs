@@ -115,25 +115,63 @@ pub struct GlmMoeConfig {
     pub max_output_length: Option<usize>,
 }
 
-fn default_vocab_size() -> usize { 151_552 }
-fn default_hidden_size() -> usize { 4096 }
-fn default_intermediate_size() -> usize { 13_440 }
-fn default_moe_intermediate_size() -> usize { 1536 }
-fn default_num_hidden_layers() -> usize { 46 }
-fn default_num_attention_heads() -> usize { 64 }
-fn default_num_key_value_heads() -> usize { 8 }
-fn default_n_routed_experts() -> usize { 128 }
-fn default_n_shared_experts() -> usize { 1 }
-fn default_num_experts_per_tok() -> usize { 8 }
-fn default_max_position() -> usize { 200_000 }
-fn default_rope_theta() -> f32 { 10_000.0 }
-fn default_rms_norm_eps() -> f64 { 1e-5 }
-fn default_hidden_act() -> String { "silu".into() }
-fn default_topk_method() -> String { "noaux_tc".into() }
-fn default_n_group() -> usize { 8 }
-fn default_topk_group() -> usize { 4 }
-fn default_true() -> bool { true }
-fn default_routed_scaling_factor() -> f32 { 1.0 }
+fn default_vocab_size() -> usize {
+    151_552
+}
+fn default_hidden_size() -> usize {
+    4096
+}
+fn default_intermediate_size() -> usize {
+    13_440
+}
+fn default_moe_intermediate_size() -> usize {
+    1536
+}
+fn default_num_hidden_layers() -> usize {
+    46
+}
+fn default_num_attention_heads() -> usize {
+    64
+}
+fn default_num_key_value_heads() -> usize {
+    8
+}
+fn default_n_routed_experts() -> usize {
+    128
+}
+fn default_n_shared_experts() -> usize {
+    1
+}
+fn default_num_experts_per_tok() -> usize {
+    8
+}
+fn default_max_position() -> usize {
+    200_000
+}
+fn default_rope_theta() -> f32 {
+    10_000.0
+}
+fn default_rms_norm_eps() -> f64 {
+    1e-5
+}
+fn default_hidden_act() -> String {
+    "silu".into()
+}
+fn default_topk_method() -> String {
+    "noaux_tc".into()
+}
+fn default_n_group() -> usize {
+    8
+}
+fn default_topk_group() -> usize {
+    4
+}
+fn default_true() -> bool {
+    true
+}
+fn default_routed_scaling_factor() -> f32 {
+    1.0
+}
 
 impl GlmMoeConfig {
     pub fn from_json(json: &str) -> std::result::Result<Self, serde_json::Error> {
@@ -171,7 +209,11 @@ impl GlmMoeConfig {
     }
 
     pub fn is_glm_moe_architecture(&self) -> bool {
-        if self.architectures.iter().any(|a| a.to_lowercase().contains("glm")) {
+        if self
+            .architectures
+            .iter()
+            .any(|a| a.to_lowercase().contains("glm"))
+        {
             return true;
         }
         if !self.model_type.is_empty() && self.model_type.to_lowercase().contains("glm") {
@@ -209,9 +251,8 @@ mod tests {
     fn default_config_parses() {
         // Defaults to plain Glm4Moe variant when no architectures or model_type
         // explicitly mark it as something else.
-        let cfg: GlmMoeConfig = serde_json::from_str(
-            r#"{"architectures": ["Glm4MoeForCausalLM"]}"#,
-        ).unwrap();
+        let cfg: GlmMoeConfig =
+            serde_json::from_str(r#"{"architectures": ["Glm4MoeForCausalLM"]}"#).unwrap();
         assert_eq!(cfg.variant(), GlmVariant::Glm4Moe);
         assert_eq!(cfg.n_routed_experts, 128);
         assert_eq!(cfg.num_attention_heads, 64);
@@ -308,11 +349,19 @@ mod tests {
 
     #[test]
     fn architecture_dispatch_distinguishes_glm_from_llama() {
-        assert!(is_glm_moe_config(r#"{"architectures": ["Glm4MoeForCausalLM"]}"#));
-        assert!(is_glm_moe_config(r#"{"architectures": ["GlmMoeDsaForCausalLM"]}"#));
+        assert!(is_glm_moe_config(
+            r#"{"architectures": ["Glm4MoeForCausalLM"]}"#
+        ));
+        assert!(is_glm_moe_config(
+            r#"{"architectures": ["GlmMoeDsaForCausalLM"]}"#
+        ));
         assert!(is_glm_moe_config(r#"{"model_type": "glm4"}"#));
-        assert!(!is_glm_moe_config(r#"{"architectures": ["LlamaForCausalLM"]}"#));
-        assert!(!is_glm_moe_config(r#"{"architectures": ["DeepseekV4ForCausalLM"]}"#));
+        assert!(!is_glm_moe_config(
+            r#"{"architectures": ["LlamaForCausalLM"]}"#
+        ));
+        assert!(!is_glm_moe_config(
+            r#"{"architectures": ["DeepseekV4ForCausalLM"]}"#
+        ));
     }
 
     #[test]

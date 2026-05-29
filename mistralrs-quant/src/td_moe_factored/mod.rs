@@ -221,12 +221,12 @@ impl TuckerFactoredLayer {
     ///
     /// Inputs:
     ///   - `a`        : per-token activation. Two shapes supported:
-    ///                  * CUDA path  : `[num_tokens, 1, d_in]`
-    ///                  * Metal path : `[b_size, seq_len, 1, 1, d_in]`
+    ///     * CUDA path  : `[num_tokens, 1, d_in]`
+    ///     * Metal path : `[b_size, seq_len, 1, 1, d_in]`
     ///   - `indices`  : selected expert indices per token, dtype U32. Matching
-    ///                  ranks for the two paths above:
-    ///                  * CUDA path  : `[num_tokens, num_experts_per_tok]`
-    ///                  * Metal path : `[b_size, seq_len, num_experts_per_tok]`
+    ///     ranks for the two paths above:
+    ///     * CUDA path  : `[num_tokens, num_experts_per_tok]`
+    ///     * Metal path : `[b_size, seq_len, num_experts_per_tok]`
     ///
     /// Output: per-token, per-expert output activation `[..., num_experts_per_tok, d_out]`
     /// (the moe forward stitches these via the routing-weight reduction.)
@@ -335,9 +335,9 @@ impl TuckerFactoredLayer {
         //   CUDA path : [num_tokens, num_experts_per_tok, d_out]
         //   Metal path: [b_size, seq_len, num_experts_per_tok, d_out]
         let d_out = self.d_out();
-        let result = match a.dims() {
-            &[num_tokens, 1, _] => y.reshape((num_tokens, num_per_tok, d_out))?,
-            &[b_size, seq_len, 1, 1, _] => y.reshape((b_size, seq_len, num_per_tok, d_out))?,
+        let result = match *a.dims() {
+            [num_tokens, 1, _] => y.reshape((num_tokens, num_per_tok, d_out))?,
+            [b_size, seq_len, 1, 1, _] => y.reshape((b_size, seq_len, num_per_tok, d_out))?,
             _ => unreachable!("input shape validated above"),
         };
 

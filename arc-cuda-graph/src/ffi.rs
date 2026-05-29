@@ -54,9 +54,20 @@ pub enum CUgraphConditionalNodeType {
 #[repr(u32)]
 #[allow(non_camel_case_types, dead_code)]
 pub enum CudaGraphNodeType {
-    Kernel = 0, Memcpy = 1, Memset = 2, Host = 3, Graph = 4, Empty = 5,
-    WaitEvent = 6, EventRecord = 7, ExtSemSignal = 8, ExtSemWait = 9,
-    MemAlloc = 10, MemFree = 11, BatchMemOp = 12, Conditional = 13,
+    Kernel = 0,
+    Memcpy = 1,
+    Memset = 2,
+    Host = 3,
+    Graph = 4,
+    Empty = 5,
+    WaitEvent = 6,
+    EventRecord = 7,
+    ExtSemSignal = 8,
+    ExtSemWait = 9,
+    MemAlloc = 10,
+    MemFree = 11,
+    BatchMemOp = 12,
+    Conditional = 13,
 }
 
 #[cfg(feature = "cuda")]
@@ -137,8 +148,11 @@ extern "C" {
     pub fn cuStreamBeginCapture_v2(stream: CUstream, mode: CUstreamCaptureMode) -> u32;
     pub fn cuStreamEndCapture(stream: CUstream, graph: *mut CUgraph) -> u32;
     pub fn cuGraphInstantiate_v2(
-        exec: *mut CUgraphExec, graph: CUgraph,
-        error_node: *mut CUgraphNode, log_buffer: *mut u8, buffer_size: usize,
+        exec: *mut CUgraphExec,
+        graph: CUgraph,
+        error_node: *mut CUgraphNode,
+        log_buffer: *mut u8,
+        buffer_size: usize,
     ) -> u32;
     pub fn cuGraphLaunch(exec: CUgraphExec, stream: CUstream) -> u32;
     pub fn cuGraphExecDestroy(exec: CUgraphExec) -> u32;
@@ -147,7 +161,11 @@ extern "C" {
     // ========== Memory pools ==========
     pub fn cuMemPoolCreate(pool: *mut CUmemoryPool, props: *const CUmemPoolProps) -> u32;
     pub fn cuMemPoolDestroy(pool: CUmemoryPool) -> u32;
-    pub fn cuMemPoolSetAttribute(pool: CUmemoryPool, attr: CUmempoolAttribute, value: *mut std::ffi::c_void) -> u32;
+    pub fn cuMemPoolSetAttribute(
+        pool: CUmemoryPool,
+        attr: CUmempoolAttribute,
+        value: *mut std::ffi::c_void,
+    ) -> u32;
     pub fn cuDeviceGetMemPool(pool: *mut CUmemoryPool, dev: CUdevice) -> u32;
     pub fn cuDeviceSetMemPool(dev: CUdevice, pool: CUmemoryPool) -> u32;
     pub fn cuDeviceGetDefaultMemPool(pool: *mut CUmemoryPool, dev: CUdevice) -> u32;
@@ -159,13 +177,17 @@ extern "C" {
 
     // ========== Conditional nodes (CUDA 12.4+) ==========
     pub fn cudaGraphConditionalHandleCreate(
-        handle: *mut CUgraphConditionalHandle, graph: CUgraph,
-        default_value: u32, flags: u32,
+        handle: *mut CUgraphConditionalHandle,
+        graph: CUgraph,
+        default_value: u32,
+        flags: u32,
     ) -> u32;
     pub fn cudaGraphSetConditional(handle: CUgraphConditionalHandle, value: u32) -> u32;
     pub fn cudaGraphAddNode(
-        graph: CUgraph, node_out: *mut CUgraphNode,
-        dependencies: *const CUgraphNode, num_dependencies: usize,
+        graph: CUgraph,
+        node_out: *mut CUgraphNode,
+        dependencies: *const CUgraphNode,
+        num_dependencies: usize,
         params: *mut CudaGraphNodeParams,
     ) -> u32;
 
@@ -175,44 +197,97 @@ extern "C" {
 
     // ========== Decode kernels ==========
     pub fn launch_gather_rope_decode_bf16(
-        q: *mut std::ffi::c_void, k: *mut std::ffi::c_void,
-        cos_table: *const std::ffi::c_void, sin_table: *const std::ffi::c_void,
-        positions: *const i32, num_heads: i32, num_kv_heads: i32, head_dim: i32,
-        rot_dim: i32, cos_stride: i32, batch_size: i32, is_neox: i32, stream: CUstream,
+        q: *mut std::ffi::c_void,
+        k: *mut std::ffi::c_void,
+        cos_table: *const std::ffi::c_void,
+        sin_table: *const std::ffi::c_void,
+        positions: *const i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rot_dim: i32,
+        cos_stride: i32,
+        batch_size: i32,
+        is_neox: i32,
+        stream: CUstream,
     );
     pub fn launch_gather_rope_decode_f16(
-        q: *mut std::ffi::c_void, k: *mut std::ffi::c_void,
-        cos_table: *const std::ffi::c_void, sin_table: *const std::ffi::c_void,
-        positions: *const i32, num_heads: i32, num_kv_heads: i32, head_dim: i32,
-        rot_dim: i32, cos_stride: i32, batch_size: i32, is_neox: i32, stream: CUstream,
+        q: *mut std::ffi::c_void,
+        k: *mut std::ffi::c_void,
+        cos_table: *const std::ffi::c_void,
+        sin_table: *const std::ffi::c_void,
+        positions: *const i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rot_dim: i32,
+        cos_stride: i32,
+        batch_size: i32,
+        is_neox: i32,
+        stream: CUstream,
     );
     pub fn launch_fused_argmax_bf16(
-        logits: *const std::ffi::c_void, token_ids: *mut i32, log_probs: *mut f32,
-        vocab_size: i32, batch_size: i32, stream: CUstream,
+        logits: *const std::ffi::c_void,
+        token_ids: *mut i32,
+        log_probs: *mut f32,
+        vocab_size: i32,
+        batch_size: i32,
+        stream: CUstream,
     );
     pub fn launch_fused_top_p_bf16(
-        logits: *const std::ffi::c_void, token_ids: *mut i32,
-        temperature: f32, top_p: f32, vocab_size: i32, batch_size: i32,
-        rng_seed: u64, rng_offset: u64, stream: CUstream,
+        logits: *const std::ffi::c_void,
+        token_ids: *mut i32,
+        temperature: f32,
+        top_p: f32,
+        vocab_size: i32,
+        batch_size: i32,
+        rng_seed: u64,
+        rng_offset: u64,
+        stream: CUstream,
     );
     pub fn launch_apply_penalties(
-        logits: *mut std::ffi::c_void, generated_tokens: *const i32, n_generated: *const i32,
-        frequency_penalty: f32, presence_penalty: f32,
-        vocab_size: i32, max_tokens: i32, batch_size: i32, stream: CUstream,
+        logits: *mut std::ffi::c_void,
+        generated_tokens: *const i32,
+        n_generated: *const i32,
+        frequency_penalty: f32,
+        presence_penalty: f32,
+        vocab_size: i32,
+        max_tokens: i32,
+        batch_size: i32,
+        stream: CUstream,
     );
     pub fn launch_decode_step_update(
-        sampled_tokens: *const i32, input_ids: *mut i32, positions: *mut i32,
-        context_lens: *mut i32, slot_mappings: *mut i64, block_tables: *const i32,
-        n_generated: *mut i32, output_tokens: *mut i32, finished: *mut i32,
-        ring_buffer: *mut i32, ring_write_head: *mut i32,
-        eos_token_id: i32, max_tokens: i32, block_size: i32, max_blocks_per_seq: i32,
-        ring_size: i32, loop_condition: *mut i32, batch_size: i32, stream: CUstream,
+        sampled_tokens: *const i32,
+        input_ids: *mut i32,
+        positions: *mut i32,
+        context_lens: *mut i32,
+        slot_mappings: *mut i64,
+        block_tables: *const i32,
+        n_generated: *mut i32,
+        output_tokens: *mut i32,
+        finished: *mut i32,
+        ring_buffer: *mut i32,
+        ring_write_head: *mut i32,
+        eos_token_id: i32,
+        max_tokens: i32,
+        block_size: i32,
+        max_blocks_per_seq: i32,
+        ring_size: i32,
+        loop_condition: *mut i32,
+        batch_size: i32,
+        stream: CUstream,
     );
     pub fn launch_check_all_done(
-        finished: *const i32, loop_condition: *mut i32, batch_size: i32, stream: CUstream,
+        finished: *const i32,
+        loop_condition: *mut i32,
+        batch_size: i32,
+        stream: CUstream,
     );
     pub fn launch_check_all_done_conditional(
-        finished: *const i32, batch_size: i32, cond_handle: CUgraphConditionalHandle, stream: CUstream,
+        finished: *const i32,
+        batch_size: i32,
+        cond_handle: CUgraphConditionalHandle,
+        stream: CUstream,
     );
     pub fn arc_has_graph_conditional() -> i32;
 }

@@ -40,7 +40,10 @@ fn ts_011_react_usequery() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_002", "wrote 552 bytes to src/hooks/useProjects.ts"));
+    turns.push(tool(
+        "call_002",
+        "wrote 552 bytes to src/hooks/useProjects.ts",
+    ));
     turns.push(assistant_text(
         "useProjects now backed by react-query with a 30s staleTime; the return shape is preserved.",
         &turns,
@@ -49,11 +52,7 @@ fn ts_011_react_usequery() -> Trajectory {
     assemble(
         "agentperf_tuning_011",
         "typescript",
-        src(
-            "github.com/TanStack/query",
-            "MIT",
-            "6d4a8c1",
-        ),
+        src("github.com/TanStack/query", "MIT", "6d4a8c1"),
         turns,
     )
 }
@@ -85,7 +84,10 @@ fn ts_012_nextjs_route_handler() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_002", "wrote 180 bytes to app/api/healthz/route.ts"));
+    turns.push(tool(
+        "call_002",
+        "wrote 180 bytes to app/api/healthz/route.ts",
+    ));
     turns.push(assistant_text(
         "GET /api/healthz now returns {ok, ts} dynamically (no cache).",
         &turns,
@@ -115,10 +117,7 @@ fn ts_013_zod_schema() -> Trajectory {
         &turns,
     ));
     turns.push(tool("call_001", "wrote 268 bytes to schemas/user.ts"));
-    turns.push(assistant_text(
-        "Schema and inferred type exported.",
-        &turns,
-    ));
+    turns.push(assistant_text("Schema and inferred type exported.", &turns));
 
     assemble(
         "agentperf_tuning_013",
@@ -154,7 +153,10 @@ fn ts_014_express_middleware() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_002", "wrote 514 bytes to middlewares/requestId.ts"));
+    turns.push(tool(
+        "call_002",
+        "wrote 514 bytes to middlewares/requestId.ts",
+    ));
     turns.push(assistant_call(
         "Wiring it into server.ts.",
         "call_003",

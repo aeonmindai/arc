@@ -26,8 +26,10 @@ use candle_core::{Device, IndexOp, Tensor};
 #[cfg(feature = "cuda")]
 extern "C" {
     fn launch_cast_f32_to_bf16(
-        input: *const std::ffi::c_void, output: *mut std::ffi::c_void,
-        size: i32, stream: CUstream,
+        input: *const std::ffi::c_void,
+        output: *mut std::ffi::c_void,
+        size: i32,
+        stream: CUstream,
     );
 }
 
@@ -133,12 +135,9 @@ impl AutonomousDecodeRunner {
         };
         let stream = cuda_dev.cuda_stream().cu_stream();
 
-        let input_buffers = DecodeInputBuffers::new(
-            config.padded_batch_size, config.max_blocks_per_seq, device,
-        )?;
-        let decode_state = DecodeState::new(
-            config.padded_batch_size, config.max_tokens, device,
-        )?;
+        let input_buffers =
+            DecodeInputBuffers::new(config.padded_batch_size, config.max_blocks_per_seq, device)?;
+        let decode_state = DecodeState::new(config.padded_batch_size, config.max_tokens, device)?;
         let logits_buf = Tensor::zeros(
             (config.padded_batch_size, config.vocab_size),
             candle_core::DType::BF16,
@@ -151,20 +150,36 @@ impl AutonomousDecodeRunner {
         let mut ring_write_head_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
 
         unsafe {
-            let s = cudaHostAlloc(&mut ring_buffer_ptr, batch * ring_size * 4, CUDA_HOST_ALLOC_MAPPED);
-            if s != 0 { candle_core::bail!("cudaHostAlloc ring buffer failed: {s}"); }
+            let s = cudaHostAlloc(
+                &mut ring_buffer_ptr,
+                batch * ring_size * 4,
+                CUDA_HOST_ALLOC_MAPPED,
+            );
+            if s != 0 {
+                candle_core::bail!("cudaHostAlloc ring buffer failed: {s}");
+            }
             let s = cudaHostAlloc(&mut ring_write_head_ptr, batch * 4, CUDA_HOST_ALLOC_MAPPED);
-            if s != 0 { cudaFreeHost(ring_buffer_ptr); candle_core::bail!("cudaHostAlloc ring head failed: {s}"); }
+            if s != 0 {
+                cudaFreeHost(ring_buffer_ptr);
+                candle_core::bail!("cudaHostAlloc ring head failed: {s}");
+            }
             std::ptr::write_bytes(ring_buffer_ptr as *mut u8, 0, batch * ring_size * 4);
             std::ptr::write_bytes(ring_write_head_ptr as *mut u8, 0, batch * 4);
         }
 
         Ok(Self {
-            config, device: device.clone(), stream,
-            input_buffers, decode_state, logits_buf,
+            config,
+            device: device.clone(),
+            stream,
+            input_buffers,
+            decode_state,
+            logits_buf,
             ring_buffer_ptr: ring_buffer_ptr as *mut i32,
             ring_write_head_ptr: ring_write_head_ptr as *mut i32,
-            ring_size, graph_exec: None, uses_while_node: false, rng_offset: 0,
+            ring_size,
+            graph_exec: None,
+            uses_while_node: false,
+            rng_offset: 0,
         })
     }
 
@@ -254,12 +269,7 @@ impl AutonomousDecodeRunner {
             // `weights` is borrowed by `capture_via_decode_forward` and stored
             // in `weights_ptr`; the closure is dropped before this fn returns.
             unsafe {
-                crate::decode_forward::decode_forward(
-                    &*weights_ptr,
-                    &buffers,
-                    &paged,
-                    stream,
-                );
+                crate::decode_forward::decode_forward(&*weights_ptr, &buffers, &paged, stream);
                 // Cast F32 logits → BF16 into the runner's pre-allocated
                 // logits_buf so the sampling kernels (which only support BF16)
                 // can consume them.
@@ -287,14 +297,21 @@ impl AutonomousDecodeRunner {
         let bs = self.config.padded_batch_size as i32;
         let vocab = self.config.vocab_size as i32;
 
-        tracing::info!("Capturing autonomous decode graph: batch={}, max_tokens={}",
-            self.config.padded_batch_size, self.config.max_tokens);
+        tracing::info!(
+            "Capturing autonomous decode graph: batch={}, max_tokens={}",
+            self.config.padded_batch_size,
+            self.config.max_tokens
+        );
 
         // Warmup cuBLAS
         let _ = forward_fn()?;
-        unsafe { cudaStreamSynchronize(self.stream); }
+        unsafe {
+            cudaStreamSynchronize(self.stream);
+        }
         let _ = forward_fn()?;
-        unsafe { cudaStreamSynchronize(self.stream); }
+        unsafe {
+            cudaStreamSynchronize(self.stream);
+        }
 
         // Check if WHILE conditional nodes are available
         let has_conditional = unsafe { arc_has_graph_conditional() } == 1;
@@ -305,12 +322,20 @@ impl AutonomousDecodeRunner {
             self.capture_body_graph(forward_fn, bs, vocab)?;
         }
 
-        tracing::info!("Autonomous decode graph captured (while_node={})", self.uses_while_node);
+        tracing::info!(
+            "Autonomous decode graph captured (while_node={})",
+            self.uses_while_node
+        );
         Ok(())
     }
 
     /// CUDA 12.4+ path: create outer graph with WHILE conditional node.
-    fn capture_while_graph<F>(&mut self, forward_fn: &F, bs: i32, vocab: i32) -> candle_core::Result<()>
+    fn capture_while_graph<F>(
+        &mut self,
+        forward_fn: &F,
+        bs: i32,
+        vocab: i32,
+    ) -> candle_core::Result<()>
     where
         F: Fn() -> candle_core::Result<Tensor>,
     {
@@ -323,11 +348,12 @@ impl AutonomousDecodeRunner {
 
         // 2. Create conditional handle (WHILE, default_value=1 = loop)
         let mut cond_handle: CUgraphConditionalHandle = 0;
-        let status = unsafe {
-            cudaGraphConditionalHandleCreate(&mut cond_handle, outer_graph, 1, 0)
-        };
+        let status =
+            unsafe { cudaGraphConditionalHandleCreate(&mut cond_handle, outer_graph, 1, 0) };
         if status != CUDA_SUCCESS {
-            unsafe { cuGraphDestroy(outer_graph); }
+            unsafe {
+                cuGraphDestroy(outer_graph);
+            }
             tracing::warn!("cudaGraphConditionalHandleCreate failed ({status}), falling back to host-driven loop");
             return self.capture_body_graph(forward_fn, bs, vocab);
         }
@@ -353,7 +379,9 @@ impl AutonomousDecodeRunner {
             )
         };
         if status != CUDA_SUCCESS {
-            unsafe { cuGraphDestroy(outer_graph); }
+            unsafe {
+                cuGraphDestroy(outer_graph);
+            }
             tracing::warn!("cudaGraphAddNode (conditional) failed ({status}), falling back");
             return self.capture_body_graph(forward_fn, bs, vocab);
         }
@@ -397,17 +425,24 @@ impl AutonomousDecodeRunner {
         // For now: instantiate the outer graph. If the body graph was
         // properly populated by the conditional node setup, it works.
         // If not, we destroy and fall back.
-        unsafe { cuGraphDestroy(captured_body); }
+        unsafe {
+            cuGraphDestroy(captured_body);
+        }
 
         // 5. Instantiate outer graph
         let mut exec: CUgraphExec = std::ptr::null_mut();
         let status = unsafe {
             cuGraphInstantiate_v2(
-                &mut exec, outer_graph,
-                std::ptr::null_mut(), std::ptr::null_mut(), 0,
+                &mut exec,
+                outer_graph,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
             )
         };
-        unsafe { cuGraphDestroy(outer_graph); }
+        unsafe {
+            cuGraphDestroy(outer_graph);
+        }
 
         if status != CUDA_SUCCESS {
             tracing::warn!("WHILE graph instantiate failed ({status}), falling back");
@@ -420,7 +455,12 @@ impl AutonomousDecodeRunner {
     }
 
     /// Fallback path: capture body graph only (host launches per step).
-    fn capture_body_graph<F>(&mut self, forward_fn: &F, bs: i32, vocab: i32) -> candle_core::Result<()>
+    fn capture_body_graph<F>(
+        &mut self,
+        forward_fn: &F,
+        bs: i32,
+        vocab: i32,
+    ) -> candle_core::Result<()>
     where
         F: Fn() -> candle_core::Result<Tensor>,
     {
@@ -444,10 +484,16 @@ impl AutonomousDecodeRunner {
         let mut exec: CUgraphExec = std::ptr::null_mut();
         let status = unsafe {
             cuGraphInstantiate_v2(
-                &mut exec, graph, std::ptr::null_mut(), std::ptr::null_mut(), 0,
+                &mut exec,
+                graph,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
             )
         };
-        unsafe { cuGraphDestroy(graph); }
+        unsafe {
+            cuGraphDestroy(graph);
+        }
         if status != CUDA_SUCCESS {
             candle_core::bail!("cuGraphInstantiate (body) failed: {status}");
         }
@@ -479,8 +525,12 @@ impl AutonomousDecodeRunner {
         unsafe {
             if self.config.greedy {
                 launch_fused_argmax_bf16(
-                    logits_ptr, sampled_ptr, std::ptr::null_mut(),
-                    vocab, bs, self.stream,
+                    logits_ptr,
+                    sampled_ptr,
+                    std::ptr::null_mut(),
+                    vocab,
+                    bs,
+                    self.stream,
                 );
             } else {
                 if self.config.frequency_penalty != 0.0 || self.config.presence_penalty != 0.0 {
@@ -488,14 +538,24 @@ impl AutonomousDecodeRunner {
                         logits_ptr as *mut _,
                         tensor_ptr(&self.decode_state.output_tokens)? as *const i32,
                         tensor_ptr(&self.decode_state.n_generated)? as *const i32,
-                        self.config.frequency_penalty, self.config.presence_penalty,
-                        vocab, self.config.max_tokens as i32, bs, self.stream,
+                        self.config.frequency_penalty,
+                        self.config.presence_penalty,
+                        vocab,
+                        self.config.max_tokens as i32,
+                        bs,
+                        self.stream,
                     );
                 }
                 launch_fused_top_p_bf16(
-                    logits_ptr, sampled_ptr,
-                    self.config.temperature, self.config.top_p,
-                    vocab, bs, 42, self.rng_offset, self.stream,
+                    logits_ptr,
+                    sampled_ptr,
+                    self.config.temperature,
+                    self.config.top_p,
+                    vocab,
+                    bs,
+                    42,
+                    self.rng_offset,
+                    self.stream,
                 );
             }
 
@@ -510,12 +570,16 @@ impl AutonomousDecodeRunner {
                 tensor_ptr(&self.decode_state.n_generated)? as *mut i32,
                 tensor_ptr(&self.decode_state.output_tokens)? as *mut i32,
                 tensor_ptr(&self.decode_state.finished)? as *mut i32,
-                self.ring_buffer_ptr, self.ring_write_head_ptr,
-                self.config.eos_token_id, self.config.max_tokens as i32,
-                self.config.block_size as i32, self.config.max_blocks_per_seq as i32,
+                self.ring_buffer_ptr,
+                self.ring_write_head_ptr,
+                self.config.eos_token_id,
+                self.config.max_tokens as i32,
+                self.config.block_size as i32,
+                self.config.max_blocks_per_seq as i32,
                 self.ring_size as i32,
                 tensor_ptr(&self.decode_state.loop_condition)? as *mut i32,
-                bs, self.stream,
+                bs,
+                self.stream,
             );
 
             // Check done
@@ -524,7 +588,9 @@ impl AutonomousDecodeRunner {
                     // CUDA 12.4+: set conditional handle from device code
                     launch_check_all_done_conditional(
                         tensor_ptr(&self.decode_state.finished)? as *const i32,
-                        bs, handle, self.stream,
+                        bs,
+                        handle,
+                        self.stream,
                     );
                 }
                 None => {
@@ -532,7 +598,8 @@ impl AutonomousDecodeRunner {
                     launch_check_all_done(
                         tensor_ptr(&self.decode_state.finished)? as *const i32,
                         tensor_ptr(&self.decode_state.loop_condition)? as *mut i32,
-                        bs, self.stream,
+                        bs,
+                        self.stream,
                     );
                 }
             }
@@ -551,9 +618,14 @@ impl AutonomousDecodeRunner {
         })?;
 
         // Reset state
-        self.decode_state.reset(&self.device, self.config.padded_batch_size)?;
+        self.decode_state
+            .reset(&self.device, self.config.padded_batch_size)?;
         unsafe {
-            std::ptr::write_bytes(self.ring_write_head_ptr as *mut u8, 0, self.config.padded_batch_size * 4);
+            std::ptr::write_bytes(
+                self.ring_write_head_ptr as *mut u8,
+                0,
+                self.config.padded_batch_size * 4,
+            );
         }
         self.rng_offset += 1;
 
@@ -581,12 +653,17 @@ impl AutonomousDecodeRunner {
                     cudaStreamSynchronize(self.stream);
                 }
                 let cond = self.decode_state.loop_condition.to_vec1::<i64>()?;
-                if cond[0] == 0 { break; }
+                if cond[0] == 0 {
+                    break;
+                }
             }
         }
 
         // Read output tokens
-        let output = self.decode_state.output_tokens.to_dtype(candle_core::DType::I64)?;
+        let output = self
+            .decode_state
+            .output_tokens
+            .to_dtype(candle_core::DType::I64)?;
         let n_gen = self.decode_state.n_generated.to_vec1::<i64>()?;
         let mut results = Vec::new();
         for b in 0..self.config.padded_batch_size {
@@ -608,9 +685,8 @@ impl AutonomousDecodeRunner {
         }
         let mut results = Vec::new();
         for b in 0..self.config.padded_batch_size {
-            let write_head = unsafe {
-                std::ptr::read_volatile(self.ring_write_head_ptr.add(b))
-            } as usize;
+            let write_head =
+                unsafe { std::ptr::read_volatile(self.ring_write_head_ptr.add(b)) } as usize;
             let last = last_read[b];
             if write_head > last {
                 let mut tokens = Vec::with_capacity(write_head - last);
@@ -628,16 +704,24 @@ impl AutonomousDecodeRunner {
     pub fn wait_complete(&self) -> candle_core::Result<()> {
         unsafe {
             let s = cudaStreamSynchronize(self.stream);
-            if s != CUDA_SUCCESS { candle_core::bail!("cudaStreamSynchronize failed: {s}"); }
+            if s != CUDA_SUCCESS {
+                candle_core::bail!("cudaStreamSynchronize failed: {s}");
+            }
         }
         Ok(())
     }
 
-    pub fn uses_while_node(&self) -> bool { self.uses_while_node }
-    pub fn ring_size(&self) -> usize { self.ring_size }
+    pub fn uses_while_node(&self) -> bool {
+        self.uses_while_node
+    }
+    pub fn ring_size(&self) -> usize {
+        self.ring_size
+    }
     /// `true` once `capture()` has populated `graph_exec`. Callers should
     /// gate `run_decode_loop()` on this — otherwise it returns an error.
-    pub fn is_captured(&self) -> bool { self.graph_exec.is_some() }
+    pub fn is_captured(&self) -> bool {
+        self.graph_exec.is_some()
+    }
 
     /// Prime the runner's input buffers from CPU vectors before launching
     /// the captured graph. Each vector must have length `padded_batch_size`
@@ -694,12 +778,7 @@ impl AutonomousDecodeRunner {
             );
             // positions: U32 [bs]; reinterpreted as i32.
             let dst_pos = tensor_ptr(&self.input_buffers.positions)? as *mut std::ffi::c_void;
-            cudaMemcpyAsync_h2d(
-                dst_pos,
-                positions.as_ptr() as *const _,
-                bs * 4,
-                stream,
-            );
+            cudaMemcpyAsync_h2d(dst_pos, positions.as_ptr() as *const _, bs * 4, stream);
             // block_tables: U32 [bs, max_blocks]; reinterpreted as i32.
             let dst_bt = tensor_ptr(&self.input_buffers.block_tables)? as *mut std::ffi::c_void;
             cudaMemcpyAsync_h2d(
@@ -710,20 +789,10 @@ impl AutonomousDecodeRunner {
             );
             // context_lens: U32 [bs]
             let dst_cl = tensor_ptr(&self.input_buffers.context_lens)? as *mut std::ffi::c_void;
-            cudaMemcpyAsync_h2d(
-                dst_cl,
-                context_lens.as_ptr() as *const _,
-                bs * 4,
-                stream,
-            );
+            cudaMemcpyAsync_h2d(dst_cl, context_lens.as_ptr() as *const _, bs * 4, stream);
             // slot_mappings: I64 [bs]
             let dst_sm = tensor_ptr(&self.input_buffers.slot_mappings)? as *mut std::ffi::c_void;
-            cudaMemcpyAsync_h2d(
-                dst_sm,
-                slot_mappings.as_ptr() as *const _,
-                bs * 8,
-                stream,
-            );
+            cudaMemcpyAsync_h2d(dst_sm, slot_mappings.as_ptr() as *const _, bs * 8, stream);
         }
         Ok(())
     }
@@ -731,7 +800,9 @@ impl AutonomousDecodeRunner {
     /// Raw stream handle used by capture + replay. Useful for callers that
     /// want to launch staging memcpys on the same stream so they're captured
     /// into the graph body.
-    pub fn stream_handle(&self) -> CUstream { self.stream }
+    pub fn stream_handle(&self) -> CUstream {
+        self.stream
+    }
 
     /// Raw GPU pointer to the BF16 logits buffer that capture closures should
     /// fill before returning. Stable for the lifetime of the runner.
@@ -772,8 +843,20 @@ impl AutonomousDecodeRunner {
 #[cfg(feature = "cuda")]
 impl Drop for AutonomousDecodeRunner {
     fn drop(&mut self) {
-        if let Some(exec) = self.graph_exec { unsafe { cuGraphExecDestroy(exec); } }
-        if !self.ring_buffer_ptr.is_null() { unsafe { cudaFreeHost(self.ring_buffer_ptr as *mut _); } }
-        if !self.ring_write_head_ptr.is_null() { unsafe { cudaFreeHost(self.ring_write_head_ptr as *mut _); } }
+        if let Some(exec) = self.graph_exec {
+            unsafe {
+                cuGraphExecDestroy(exec);
+            }
+        }
+        if !self.ring_buffer_ptr.is_null() {
+            unsafe {
+                cudaFreeHost(self.ring_buffer_ptr as *mut _);
+            }
+        }
+        if !self.ring_write_head_ptr.is_null() {
+            unsafe {
+                cudaFreeHost(self.ring_write_head_ptr as *mut _);
+            }
+        }
     }
 }

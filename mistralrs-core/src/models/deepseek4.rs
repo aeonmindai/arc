@@ -1,4 +1,9 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+// V4 Flash/Pro is WIP: MTP/mHC scaffolding (extra methods/fields) is wired up
+// incrementally, and the dense model signatures are intentionally verbose. Keep
+// these style/dead-code lints quiet here rather than churn this numerically
+// sensitive file; CI does not gate mistralrs-core (see arc-tools/CI_HYGIENE.md).
+#![allow(dead_code, clippy::type_complexity, clippy::clone_on_copy)]
 //! DeepSeek V4 Pro / V4 Flash model loader.
 //!
 //! ## What this file is

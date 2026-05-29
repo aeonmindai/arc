@@ -126,7 +126,10 @@ fn cs_050_xunit_theory() -> Trajectory {
         }),
         &turns,
     ));
-    turns.push(tool("call_002", "wrote 308 bytes to tests/StringReverseTests.cs"));
+    turns.push(tool(
+        "call_002",
+        "wrote 308 bytes to tests/StringReverseTests.cs",
+    ));
     turns.push(assistant_text(
         "Three facts collapsed into one Theory with three rows.",
         &turns,

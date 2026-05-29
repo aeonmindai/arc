@@ -47,20 +47,25 @@ ok "nvcc: $(nvcc --version | grep -i release | sed 's/^ *//')"
 
 # --- compute capability: env wins; else detect from GPU; else default 90 ---
 GPU_PRESENT=no
+GPU_CC=0
 if command -v nvidia-smi >/dev/null && nvidia-smi -L >/dev/null 2>&1; then
   GPU_PRESENT=yes
+  # Actual device compute capability (75=T4, 80=A100, 90=H100). Tracked
+  # SEPARATELY from the CUDA_COMPUTE_CAP *compile target*, which may be forced
+  # higher than the device — e.g. cross-compiling for sm_90 on a T4.
+  GPU_CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')
+  GPU_CC=${GPU_CC:-0}
 fi
 if [ -z "${CUDA_COMPUTE_CAP:-}" ]; then
-  if [ "$GPU_PRESENT" = yes ]; then
-    CC_RAW=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')
-    CUDA_COMPUTE_CAP=${CC_RAW:-90}
+  if [ "$GPU_PRESENT" = yes ] && [ "$GPU_CC" -gt 0 ] 2>/dev/null; then
+    CUDA_COMPUTE_CAP=$GPU_CC
   else
-    # No GPU: compile for Hopper, the V4 Flash rental target.
+    # No GPU (or undetectable cap): compile for Hopper, the V4 Flash rental target.
     CUDA_COMPUTE_CAP=90
   fi
 fi
 export CUDA_COMPUTE_CAP
-ok "CUDA_COMPUTE_CAP=$CUDA_COMPUTE_CAP (gpu_present=$GPU_PRESENT)"
+ok "CUDA_COMPUTE_CAP=$CUDA_COMPUTE_CAP (gpu_present=$GPU_PRESENT, device_cc=$GPU_CC)"
 if [ "$CUDA_COMPUTE_CAP" -lt 80 ] 2>/dev/null; then
   echo "WARN: QTIP kernels require sm_80+ (has_qtip_kernels gate in mistralrs-quant/build.rs)."
   echo "      Compiling for sm_${CUDA_COMPUTE_CAP} will NOT enable the QTIP path."
@@ -89,7 +94,12 @@ SHOULD_RUN=no
 case "$RUN_GPU_TESTS" in
   yes) SHOULD_RUN=yes ;;
   no)  SHOULD_RUN=no ;;
-  auto) [ "$GPU_PRESENT" = yes ] && [ "$CUDA_COMPUTE_CAP" -ge 80 ] 2>/dev/null && SHOULD_RUN=yes ;;
+  # Gate on the ACTUAL device cap, not the compile target. Code built for a
+  # newer arch than the GPU fails to load with CUDA_ERROR_INVALID_PTX (e.g.
+  # sm_90 binaries on an sm_75 T4), and QTIP itself needs sm_80+. So auto-run
+  # only when the device is sm_80+ AND can execute what we compiled (target <= device).
+  auto) [ "$GPU_PRESENT" = yes ] && [ "$GPU_CC" -ge 80 ] 2>/dev/null \
+        && [ "$CUDA_COMPUTE_CAP" -le "$GPU_CC" ] 2>/dev/null && SHOULD_RUN=yes ;;
 esac
 if [ "$SHOULD_RUN" = yes ]; then
   # These tests build a QTIP layer on CUDA and assert GPU output matches the
@@ -112,9 +122,11 @@ if [ "$SHOULD_RUN" = yes ]; then
   grep -q "CUDA not available; skipping" /tmp/qtip_gpu_smoke.log && fail "QTIP GPU smoke tests skipped — Device::new_cuda(0) failed on this box"
   ok "QTIP GPU kernels run correctly on this device (parity >= 0.999)"
 else
-  echo "SKIP: GPU smoke tests not run (gpu_present=$GPU_PRESENT, cc=$CUDA_COMPUTE_CAP, mode=$RUN_GPU_TESTS)."
+  echo "SKIP: GPU smoke tests not run (gpu_present=$GPU_PRESENT, device_cc=$GPU_CC, compiled_for=$CUDA_COMPUTE_CAP, mode=$RUN_GPU_TESTS)."
   echo "      Compile gate passed. Runtime kernel validation requires an sm_80+ GPU"
-  echo "      (free Colab/Kaggle T4 is sm_75 and cannot run the QTIP kernels)."
+  echo "      whose arch can run the compiled kernels — a free Colab/Kaggle T4 is sm_75,"
+  echo "      and cross-compiling for sm_90 on it stays compile-only (you cannot run"
+  echo "      sm_90 binaries on sm_75)."
 fi
 
 echo

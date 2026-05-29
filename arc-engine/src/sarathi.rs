@@ -120,10 +120,7 @@ impl ChunkedPrefillScheduler {
 
         while budget >= 1 && !self.prefill_queue.is_empty() {
             let mut head = self.prefill_queue.pop_front().unwrap();
-            let take = head
-                .remaining_tokens
-                .min(self.cfg.chunk_size)
-                .min(budget);
+            let take = head.remaining_tokens.min(self.cfg.chunk_size).min(budget);
             if take == 0 {
                 break;
             }
@@ -183,9 +180,21 @@ mod tests {
         assert_eq!(
             chunks,
             vec![
-                PrefillChunk { user_id: 7, start: 0, end: 512 },
-                PrefillChunk { user_id: 7, start: 512, end: 1024 },
-                PrefillChunk { user_id: 7, start: 1024, end: 1500 },
+                PrefillChunk {
+                    user_id: 7,
+                    start: 0,
+                    end: 512
+                },
+                PrefillChunk {
+                    user_id: 7,
+                    start: 512,
+                    end: 1024
+                },
+                PrefillChunk {
+                    user_id: 7,
+                    start: 1024,
+                    end: 1500
+                },
             ]
         );
     }

@@ -64,8 +64,11 @@ impl CudaGraphRunner {
         if stream.is_null() {
             tracing::warn!("CUDA graph: NULL stream, capture disabled");
             return Ok(Self {
-                stream, device_ordinal: 0,
-                graphs: HashMap::new(), enabled: false, warmup_remaining: 0,
+                stream,
+                device_ordinal: 0,
+                graphs: HashMap::new(),
+                enabled: false,
+                warmup_remaining: 0,
             });
         }
 
@@ -78,12 +81,17 @@ impl CudaGraphRunner {
         tracing::info!("CUDA graph: non-null stream on device {ordinal}, capture enabled");
 
         Ok(Self {
-            stream, device_ordinal: ordinal,
-            graphs: HashMap::new(), enabled: true, warmup_remaining: warmup_steps,
+            stream,
+            device_ordinal: ordinal,
+            graphs: HashMap::new(),
+            enabled: true,
+            warmup_remaining: warmup_steps,
         })
     }
 
-    pub fn is_enabled(&self) -> bool { self.enabled && self.warmup_remaining == 0 }
+    pub fn is_enabled(&self) -> bool {
+        self.enabled && self.warmup_remaining == 0
+    }
 
     pub fn tick_warmup(&mut self) -> bool {
         if self.warmup_remaining > 0 {
@@ -92,7 +100,9 @@ impl CudaGraphRunner {
                 tracing::info!("CUDA graph: warmup done");
             }
             true
-        } else { false }
+        } else {
+            false
+        }
     }
 
     pub fn has_graph(&self, batch_size: usize) -> bool {
@@ -106,7 +116,9 @@ impl CudaGraphRunner {
         })?;
         unsafe {
             let s = cuGraphLaunch(captured.exec, self.stream);
-            if s != CUDA_SUCCESS { candle_core::bail!("cuGraphLaunch failed: {s}"); }
+            if s != CUDA_SUCCESS {
+                candle_core::bail!("cuGraphLaunch failed: {s}");
+            }
             cudaStreamSynchronize(self.stream);
         }
         Ok(captured.output.clone())
@@ -143,7 +155,9 @@ impl CudaGraphRunner {
             )
         };
         if s != CUDA_SUCCESS {
-            unsafe { cuMemPoolDestroy(pool); }
+            unsafe {
+                cuMemPoolDestroy(pool);
+            }
             candle_core::bail!("cuMemPoolSetAttribute(RELEASE_THRESHOLD) failed: {s}");
         }
 
@@ -152,7 +166,10 @@ impl CudaGraphRunner {
 
     /// Begin graph capture with a private memory pool.
     /// Returns the pool and saved original pool for restoration.
-    pub fn begin_capture(&mut self, batch_size: usize) -> candle_core::Result<(CUmemoryPool, CUmemoryPool)> {
+    pub fn begin_capture(
+        &mut self,
+        batch_size: usize,
+    ) -> candle_core::Result<(CUmemoryPool, CUmemoryPool)> {
         // Create private pool
         let graph_pool = self.create_private_pool()?;
 
@@ -160,28 +177,36 @@ impl CudaGraphRunner {
         let mut original_pool: CUmemoryPool = std::ptr::null_mut();
         let s = unsafe { cuDeviceGetMemPool(&mut original_pool, self.device_ordinal) };
         if s != CUDA_SUCCESS {
-            unsafe { cuMemPoolDestroy(graph_pool); }
+            unsafe {
+                cuMemPoolDestroy(graph_pool);
+            }
             candle_core::bail!("cuDeviceGetMemPool failed: {s}");
         }
 
         // Install private pool
         let s = unsafe { cuDeviceSetMemPool(self.device_ordinal, graph_pool) };
         if s != CUDA_SUCCESS {
-            unsafe { cuMemPoolDestroy(graph_pool); }
+            unsafe {
+                cuMemPoolDestroy(graph_pool);
+            }
             candle_core::bail!("cuDeviceSetMemPool (install) failed: {s}");
         }
 
         // Sync stream before capture
-        unsafe { cudaStreamSynchronize(self.stream); }
+        unsafe {
+            cudaStreamSynchronize(self.stream);
+        }
 
         // Begin capture
-        let s = unsafe {
-            cuStreamBeginCapture_v2(self.stream, CUstreamCaptureMode::THREAD_LOCAL)
-        };
+        let s = unsafe { cuStreamBeginCapture_v2(self.stream, CUstreamCaptureMode::THREAD_LOCAL) };
         if s != CUDA_SUCCESS {
             // Restore original pool before bailing
-            unsafe { cuDeviceSetMemPool(self.device_ordinal, original_pool); }
-            unsafe { cuMemPoolDestroy(graph_pool); }
+            unsafe {
+                cuDeviceSetMemPool(self.device_ordinal, original_pool);
+            }
+            unsafe {
+                cuMemPoolDestroy(graph_pool);
+            }
             self.enabled = false;
             candle_core::bail!("cuStreamBeginCapture failed: {s}");
         }
@@ -203,10 +228,14 @@ impl CudaGraphRunner {
         let s = unsafe { cuStreamEndCapture(self.stream, &mut graph) };
 
         // ALWAYS restore original pool
-        unsafe { cuDeviceSetMemPool(self.device_ordinal, original_pool); }
+        unsafe {
+            cuDeviceSetMemPool(self.device_ordinal, original_pool);
+        }
 
         if s != CUDA_SUCCESS {
-            unsafe { cuMemPoolDestroy(graph_pool); }
+            unsafe {
+                cuMemPoolDestroy(graph_pool);
+            }
             self.enabled = false;
             candle_core::bail!("cuStreamEndCapture failed: {s}");
         }
@@ -215,13 +244,20 @@ impl CudaGraphRunner {
         let mut exec: CUgraphExec = std::ptr::null_mut();
         let s = unsafe {
             cuGraphInstantiate_v2(
-                &mut exec, graph,
-                std::ptr::null_mut(), std::ptr::null_mut(), 0,
+                &mut exec,
+                graph,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
             )
         };
-        unsafe { cuGraphDestroy(graph); }
+        unsafe {
+            cuGraphDestroy(graph);
+        }
         if s != CUDA_SUCCESS {
-            unsafe { cuMemPoolDestroy(graph_pool); }
+            unsafe {
+                cuMemPoolDestroy(graph_pool);
+            }
             self.enabled = false;
             candle_core::bail!("cuGraphInstantiate failed: {s}");
         }
@@ -229,16 +265,28 @@ impl CudaGraphRunner {
         // First launch
         let s = unsafe { cuGraphLaunch(exec, self.stream) };
         if s != CUDA_SUCCESS {
-            unsafe { cuGraphExecDestroy(exec); cuMemPoolDestroy(graph_pool); }
+            unsafe {
+                cuGraphExecDestroy(exec);
+                cuMemPoolDestroy(graph_pool);
+            }
             self.enabled = false;
             candle_core::bail!("First cuGraphLaunch failed: {s}");
         }
-        unsafe { cudaStreamSynchronize(self.stream); }
+        unsafe {
+            cudaStreamSynchronize(self.stream);
+        }
 
         tracing::info!("CUDA graph: captured + launched for batch_size={batch_size}");
 
         let result = output.clone();
-        self.graphs.insert(batch_size, CapturedGraph { exec, output, pool: graph_pool });
+        self.graphs.insert(
+            batch_size,
+            CapturedGraph {
+                exec,
+                output,
+                pool: graph_pool,
+            },
+        );
         Ok(result)
     }
 
@@ -247,13 +295,17 @@ impl CudaGraphRunner {
         let mut graph: CUgraph = std::ptr::null_mut();
         unsafe {
             let _ = cuStreamEndCapture(self.stream, &mut graph);
-            if !graph.is_null() { cuGraphDestroy(graph); }
+            if !graph.is_null() {
+                cuGraphDestroy(graph);
+            }
             cuDeviceSetMemPool(self.device_ordinal, original_pool);
             cuMemPoolDestroy(graph_pool);
         }
     }
 
-    pub fn disable(&mut self) { self.enabled = false; }
+    pub fn disable(&mut self) {
+        self.enabled = false;
+    }
 }
 
 #[cfg(feature = "cuda")]

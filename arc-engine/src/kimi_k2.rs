@@ -136,35 +136,83 @@ pub struct KimiK2VisionConfig {
     pub intermediate_size: usize,
 }
 
-fn default_media_placeholder() -> u32 { 163605 }
-fn default_ignore_index() -> i32 { -100 }
+fn default_media_placeholder() -> u32 {
+    163605
+}
+fn default_ignore_index() -> i32 {
+    -100
+}
 
 // K2.6 text defaults — 1T params, 32B active, 61 layers
-fn default_vocab_size() -> usize { 160_000 }
-fn default_hidden_size() -> usize { 7168 }
-fn default_intermediate_size() -> usize { 18_432 }
-fn default_moe_intermediate_size() -> usize { 2048 }
-fn default_num_hidden_layers() -> usize { 61 }
-fn default_num_attention_heads() -> usize { 64 }
-fn default_num_key_value_heads() -> usize { 1 } // MLA-style heavy GQA
+fn default_vocab_size() -> usize {
+    160_000
+}
+fn default_hidden_size() -> usize {
+    7168
+}
+fn default_intermediate_size() -> usize {
+    18_432
+}
+fn default_moe_intermediate_size() -> usize {
+    2048
+}
+fn default_num_hidden_layers() -> usize {
+    61
+}
+fn default_num_attention_heads() -> usize {
+    64
+}
+fn default_num_key_value_heads() -> usize {
+    1
+} // MLA-style heavy GQA
 
-fn default_n_routed_experts() -> usize { 384 }
-fn default_n_shared_experts() -> usize { 1 }
-fn default_num_experts_per_tok() -> usize { 8 }
+fn default_n_routed_experts() -> usize {
+    384
+}
+fn default_n_shared_experts() -> usize {
+    1
+}
+fn default_num_experts_per_tok() -> usize {
+    8
+}
 
-fn default_kv_lora_rank() -> usize { 512 }
-fn default_q_lora_rank() -> usize { 1536 }
-fn default_qk_nope_head_dim() -> usize { 128 }
-fn default_qk_rope_head_dim() -> usize { 64 }
-fn default_v_head_dim() -> usize { 128 }
+fn default_kv_lora_rank() -> usize {
+    512
+}
+fn default_q_lora_rank() -> usize {
+    1536
+}
+fn default_qk_nope_head_dim() -> usize {
+    128
+}
+fn default_qk_rope_head_dim() -> usize {
+    64
+}
+fn default_v_head_dim() -> usize {
+    128
+}
 
-fn default_max_position() -> usize { 262_144 } // 256K
-fn default_rope_theta() -> f32 { 50_000.0 }
-fn default_rms_norm_eps() -> f64 { 1e-6 }
-fn default_hidden_act() -> String { "silu".into() }
-fn default_topk_method() -> String { "noaux_tc".into() }
-fn default_n_group() -> usize { 8 }
-fn default_topk_group() -> usize { 4 }
+fn default_max_position() -> usize {
+    262_144
+} // 256K
+fn default_rope_theta() -> f32 {
+    50_000.0
+}
+fn default_rms_norm_eps() -> f64 {
+    1e-6
+}
+fn default_hidden_act() -> String {
+    "silu".into()
+}
+fn default_topk_method() -> String {
+    "noaux_tc".into()
+}
+fn default_n_group() -> usize {
+    8
+}
+fn default_topk_group() -> usize {
+    4
+}
 
 impl KimiK2Config {
     pub fn from_json(json: &str) -> std::result::Result<Self, serde_json::Error> {
@@ -172,7 +220,11 @@ impl KimiK2Config {
     }
 
     pub fn is_kimi_architecture(&self) -> bool {
-        if self.architectures.iter().any(|a| a.to_lowercase().contains("kimi")) {
+        if self
+            .architectures
+            .iter()
+            .any(|a| a.to_lowercase().contains("kimi"))
+        {
             return true;
         }
         if !self.model_type.is_empty() && self.model_type.to_lowercase().contains("kimi") {
@@ -214,9 +266,9 @@ mod tests {
     fn default_config_uses_k26_sizing() {
         // With minimal JSON, defaults apply but architecture is NOT auto-detected
         // (architectures + model_type are empty by default — caller must set them).
-        let cfg: KimiK2Config = serde_json::from_str(
-            r#"{"architectures": ["KimiK25ForConditionalGeneration"]}"#,
-        ).unwrap();
+        let cfg: KimiK2Config =
+            serde_json::from_str(r#"{"architectures": ["KimiK25ForConditionalGeneration"]}"#)
+                .unwrap();
         assert_eq!(cfg.text_config.num_hidden_layers, 61);
         assert_eq!(cfg.text_config.hidden_size, 7168);
         assert_eq!(cfg.text_config.num_attention_heads, 64);
@@ -271,11 +323,19 @@ mod tests {
 
     #[test]
     fn architecture_dispatch_recognizes_kimi() {
-        assert!(is_kimi_k2_config(r#"{"architectures": ["KimiK25ForConditionalGeneration"]}"#));
+        assert!(is_kimi_k2_config(
+            r#"{"architectures": ["KimiK25ForConditionalGeneration"]}"#
+        ));
         assert!(is_kimi_k2_config(r#"{"model_type": "kimi_k25"}"#));
-        assert!(is_kimi_k2_config(r#"{"architectures": ["KimiK2ForCausalLM"]}"#));
-        assert!(!is_kimi_k2_config(r#"{"architectures": ["DeepseekV3ForCausalLM"]}"#));
-        assert!(!is_kimi_k2_config(r#"{"architectures": ["LlamaForCausalLM"]}"#));
+        assert!(is_kimi_k2_config(
+            r#"{"architectures": ["KimiK2ForCausalLM"]}"#
+        ));
+        assert!(!is_kimi_k2_config(
+            r#"{"architectures": ["DeepseekV3ForCausalLM"]}"#
+        ));
+        assert!(!is_kimi_k2_config(
+            r#"{"architectures": ["LlamaForCausalLM"]}"#
+        ));
     }
 
     #[test]

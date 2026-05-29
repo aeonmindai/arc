@@ -231,10 +231,7 @@ pub mod in_process {
     }
 
     impl InProcessVendor {
-        pub async fn new(
-            model_id: &str,
-            isq: Option<String>,
-        ) -> Result<Self> {
+        pub async fn new(model_id: &str, isq: Option<String>) -> Result<Self> {
             use candle_core::Device;
             use mistralrs_core::{AutoDeviceMapParams, ModelDType, ModelSelected, TokenSource};
             use mistralrs_server_core::mistralrs_for_server_builder::MistralRsForServerBuilder;
@@ -369,9 +366,7 @@ pub mod in_process {
                         output_tokens += chunk
                             .choices
                             .iter()
-                            .map(|c| {
-                                !c.delta.content.as_deref().unwrap_or("").is_empty() as u32
-                            })
+                            .map(|c| !c.delta.content.as_deref().unwrap_or("").is_empty() as u32)
                             .sum::<u32>();
                     }
                     Response::Done(done) => {

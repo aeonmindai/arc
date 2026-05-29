@@ -74,7 +74,10 @@ pub fn write_reports(report: &BenchReport, path: &Path) -> Result<Vec<PathBuf>> 
 /// SLO summary, then a phase table.
 pub fn render_markdown(report: &BenchReport) -> String {
     let mut s = String::new();
-    s.push_str(&format!("# arc bench — {} ({})\n\n", report.suite, report.mode));
+    s.push_str(&format!(
+        "# arc bench — {} ({})\n\n",
+        report.suite, report.mode
+    ));
     s.push_str(&format!("- **Model**: `{}`\n", report.model));
     s.push_str(&format!("- **Vendor**: `{}`\n", report.vendor_name));
     s.push_str(&format!(
@@ -92,9 +95,7 @@ pub fn render_markdown(report: &BenchReport) -> String {
             "- **Saturation point**: **{k} concurrent users** (largest K passing tier {})\n",
             report.schedule.tier.tier
         )),
-        None => s.push_str(
-            "- **Saturation point**: FAIL — even K=1 did not pass the SLO\n",
-        ),
+        None => s.push_str("- **Saturation point**: FAIL — even K=1 did not pass the SLO\n"),
     }
     s.push_str(&format!(
         "- **Total wall time**: {:.1} s\n\n",
@@ -104,7 +105,11 @@ pub fn render_markdown(report: &BenchReport) -> String {
     s.push_str("| # | K | kind | P25 out tok/s | P95 TTFT (s) | samples | dur (s) | pass |\n");
     s.push_str("|---|---|------|---------------|--------------|---------|---------|------|\n");
     for p in &report.schedule.phases {
-        let pass = if p.evaluation.overall_pass { "PASS" } else { "FAIL" };
+        let pass = if p.evaluation.overall_pass {
+            "PASS"
+        } else {
+            "FAIL"
+        };
         s.push_str(&format!(
             "| {} | {} | {} | {:.1} | {:.2} | {} | {:.1} | {pass} |\n",
             p.phase_index,
@@ -196,12 +201,18 @@ mod tests {
         let r = synth_report();
         let paths = write_reports(&r, &stem).unwrap();
         assert_eq!(paths.len(), 2);
-        let json_path = paths.iter().find(|p| p.extension().unwrap() == "json").unwrap();
+        let json_path = paths
+            .iter()
+            .find(|p| p.extension().unwrap() == "json")
+            .unwrap();
         let parsed: BenchReport =
             serde_json::from_str(&std::fs::read_to_string(json_path).unwrap()).unwrap();
         assert_eq!(parsed.model, r.model);
         assert_eq!(parsed.schedule.tier.tier, r.schedule.tier.tier);
-        assert_eq!(parsed.schedule.saturation_users, r.schedule.saturation_users);
+        assert_eq!(
+            parsed.schedule.saturation_users,
+            r.schedule.saturation_users
+        );
         // Cleanup.
         for p in paths {
             let _ = std::fs::remove_file(p);
