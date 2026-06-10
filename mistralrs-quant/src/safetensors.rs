@@ -124,6 +124,10 @@ fn convert(
             convert_with_cast_::<u16, u32, _>(view, device, conv)
         }
         (st::Dtype::U32, _) => convert_::<u32>(view, device),
+        (st::Dtype::I8, _) => {
+            let conv = |x: i8| Ok(i32::from(x));
+            convert_with_cast_::<i8, i32, _>(view, device, conv)
+        }
         (st::Dtype::I16, _) => convert_::<i16>(view, device),
         (st::Dtype::I32, _) => convert_::<i32>(view, device),
         (st::Dtype::I64, _) => convert_::<i64>(view, device),
