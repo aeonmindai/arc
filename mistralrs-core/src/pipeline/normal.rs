@@ -949,6 +949,13 @@ impl Loader for NormalLoader {
         crate::pipeline::post_load_hooks::run_post_load_hooks(&mut *model)
             .map_err(|e| candle_core::Error::Msg(format!("post-load hook failed: {e}")))?;
 
+        // After ISQ, the CUDA driver's default memory pool may be holding large
+        // amounts of freed memory (e.g. temporary BF16 tensors from INT4 dequant →
+        // QTIP quantize). Trim the pool so that `cuMemGetInfo` reports accurate
+        // free VRAM for the PagedAttention KV-cache budget below.
+        #[cfg(feature = "cuda")]
+        crate::trim_cuda_memory_pools();
+
         let paged_attn_config = if matches!(
             self.kind,
             ModelKind::Adapter {

@@ -1192,98 +1192,216 @@ impl PackedExperts {
                             );
                         }
                     } else {
-                        // Per-expert format: load each expert individually
+                        // Per-expert format: load each expert individually.
+                        // Detect INT4-packed-as-I8 (e.g. DeepSeek V4 Flash routed experts)
+                        // vs standard FP8 E4M3 by probing the first expert's weight shape.
+                        let probe_vb = vb.pp(0);
+                        let is_int4_packed = probe_vb
+                            .get_with_hints_dtype(
+                                (intermediate_size, hidden_size / 2),
+                                "gate_proj.weight",
+                                Default::default(),
+                                candle_core::DType::I32, // I8 on disk → I32 via convert()
+                            )
+                            .is_ok();
+
                         let mut gs = Vec::new();
                         let mut us = Vec::new();
                         let mut ds = Vec::new();
 
-                        for i in 0..num_local_experts {
-                            let expert_vb = vb.pp(i);
+                        if is_int4_packed {
+                            // INT4-packed-as-I8 path: each byte holds 2 signed INT4 values,
+                            // columns are half the logical width. Dequant to BF16 with
+                            // block scales, then wrap as UnquantLinear for ISQ.
+                            use crate::blockwise_fp8::mx_int4_blockwise_dequantize;
 
-                            // Load FP8 weights and scales for each projection
-                            let gate_fp8 = expert_vb.get_with_hints_dtype(
-                                (intermediate_size, hidden_size),
-                                "gate_proj.weight",
-                                Default::default(),
-                                candle_core::DType::F8E4M3,
-                            )?;
-                            let gate_scale = expert_vb.get_with_hints_dtype(
-                                (
-                                    intermediate_size.div_ceil(weight_block_size[0]),
-                                    hidden_size.div_ceil(weight_block_size[1]),
-                                ),
-                                "gate_proj.weight_scale_inv",
-                                Default::default(),
-                                candle_core::DType::F32,
-                            )?;
-
-                            let up_fp8 = expert_vb.get_with_hints_dtype(
-                                (intermediate_size, hidden_size),
-                                "up_proj.weight",
-                                Default::default(),
-                                candle_core::DType::F8E4M3,
-                            )?;
-                            let up_scale = expert_vb.get_with_hints_dtype(
-                                (
-                                    intermediate_size.div_ceil(weight_block_size[0]),
-                                    hidden_size.div_ceil(weight_block_size[1]),
-                                ),
-                                "up_proj.weight_scale_inv",
-                                Default::default(),
-                                candle_core::DType::F32,
-                            )?;
-
-                            let down_fp8 = expert_vb.get_with_hints_dtype(
-                                (hidden_size, intermediate_size),
-                                "down_proj.weight",
-                                Default::default(),
-                                candle_core::DType::F8E4M3,
-                            )?;
-                            let down_scale = expert_vb.get_with_hints_dtype(
-                                (
-                                    hidden_size.div_ceil(weight_block_size[0]),
-                                    intermediate_size.div_ceil(weight_block_size[1]),
-                                ),
-                                "down_proj.weight_scale_inv",
-                                Default::default(),
-                                candle_core::DType::F32,
-                            )?;
-
-                            // Create BlockwiseFP8Linear for each projection
-                            use crate::blockwise_fp8::BlockwiseFP8Linear;
-                            use crate::QuantMethodConfig;
-
-                            let gate_layer: Arc<dyn QuantMethod> = Arc::new(
-                                BlockwiseFP8Linear::new(QuantMethodConfig::BlockwiseFP8 {
-                                    weight: gate_fp8,
-                                    weight_scale_inv: gate_scale,
-                                    bias: None,
-                                    dequant_dtype: vb.dtype(),
-                                    weight_block_size: weight_block_size.clone(),
-                                })?,
-                            );
-                            let up_layer: Arc<dyn QuantMethod> = Arc::new(BlockwiseFP8Linear::new(
-                                QuantMethodConfig::BlockwiseFP8 {
-                                    weight: up_fp8,
-                                    weight_scale_inv: up_scale,
-                                    bias: None,
-                                    dequant_dtype: vb.dtype(),
-                                    weight_block_size: weight_block_size.clone(),
-                                },
-                            )?);
-                            let down_layer: Arc<dyn QuantMethod> = Arc::new(
-                                BlockwiseFP8Linear::new(QuantMethodConfig::BlockwiseFP8 {
-                                    weight: down_fp8,
-                                    weight_scale_inv: down_scale,
-                                    bias: None,
-                                    dequant_dtype: vb.dtype(),
-                                    weight_block_size: weight_block_size.clone(),
-                                })?,
+                            tracing::info!(
+                                "Detected INT4-packed MoE expert weights, dequantizing to BF16"
                             );
 
-                            gs.push(gate_layer);
-                            us.push(up_layer);
-                            ds.push(down_layer);
+                            for i in 0..num_local_experts {
+                                let expert_vb = vb.pp(i);
+
+                                // gate_proj (w1): [intermediate_size, hidden_size/2] packed
+                                let gate_packed = expert_vb.get_with_hints_dtype(
+                                    (intermediate_size, hidden_size / 2),
+                                    "gate_proj.weight",
+                                    Default::default(),
+                                    candle_core::DType::I32,
+                                )?;
+                                let gate_scale = expert_vb.get_with_hints_dtype(
+                                    (
+                                        intermediate_size.div_ceil(weight_block_size[0]),
+                                        hidden_size.div_ceil(weight_block_size[1]),
+                                    ),
+                                    "gate_proj.weight_scale_inv",
+                                    Default::default(),
+                                    candle_core::DType::F32,
+                                )?;
+
+                                // up_proj (w3): [intermediate_size, hidden_size/2] packed
+                                let up_packed = expert_vb.get_with_hints_dtype(
+                                    (intermediate_size, hidden_size / 2),
+                                    "up_proj.weight",
+                                    Default::default(),
+                                    candle_core::DType::I32,
+                                )?;
+                                let up_scale = expert_vb.get_with_hints_dtype(
+                                    (
+                                        intermediate_size.div_ceil(weight_block_size[0]),
+                                        hidden_size.div_ceil(weight_block_size[1]),
+                                    ),
+                                    "up_proj.weight_scale_inv",
+                                    Default::default(),
+                                    candle_core::DType::F32,
+                                )?;
+
+                                // down_proj (w2): [hidden_size, intermediate_size/2] packed
+                                let down_packed = expert_vb.get_with_hints_dtype(
+                                    (hidden_size, intermediate_size / 2),
+                                    "down_proj.weight",
+                                    Default::default(),
+                                    candle_core::DType::I32,
+                                )?;
+                                let down_scale = expert_vb.get_with_hints_dtype(
+                                    (
+                                        hidden_size.div_ceil(weight_block_size[0]),
+                                        intermediate_size.div_ceil(weight_block_size[1]),
+                                    ),
+                                    "down_proj.weight_scale_inv",
+                                    Default::default(),
+                                    candle_core::DType::F32,
+                                )?;
+
+                                // Dequant INT4-packed → BF16
+                                let gate_bf16 = mx_int4_blockwise_dequantize(
+                                    &gate_packed,
+                                    &gate_scale,
+                                    weight_block_size.clone(),
+                                    candle_core::DType::BF16,
+                                )?;
+                                let up_bf16 = mx_int4_blockwise_dequantize(
+                                    &up_packed,
+                                    &up_scale,
+                                    weight_block_size.clone(),
+                                    candle_core::DType::BF16,
+                                )?;
+                                let down_bf16 = mx_int4_blockwise_dequantize(
+                                    &down_packed,
+                                    &down_scale,
+                                    weight_block_size.clone(),
+                                    candle_core::DType::BF16,
+                                )?;
+
+                                // Wrap as UnquantLinear — ISQ/QTIP will requantize later
+                                let gate_layer: Arc<dyn QuantMethod> = Arc::new(
+                                    UnquantLinear::new(QuantMethodConfig::Unquantized(
+                                        Linear::new(gate_bf16, None),
+                                    ))?,
+                                );
+                                let up_layer: Arc<dyn QuantMethod> = Arc::new(
+                                    UnquantLinear::new(QuantMethodConfig::Unquantized(
+                                        Linear::new(up_bf16, None),
+                                    ))?,
+                                );
+                                let down_layer: Arc<dyn QuantMethod> = Arc::new(
+                                    UnquantLinear::new(QuantMethodConfig::Unquantized(
+                                        Linear::new(down_bf16, None),
+                                    ))?,
+                                );
+
+                                gs.push(gate_layer);
+                                us.push(up_layer);
+                                ds.push(down_layer);
+                            }
+                        } else {
+                            // Standard FP8 E4M3 per-expert path
+                            for i in 0..num_local_experts {
+                                let expert_vb = vb.pp(i);
+
+                                let gate_fp8 = expert_vb.get_with_hints_dtype(
+                                    (intermediate_size, hidden_size),
+                                    "gate_proj.weight",
+                                    Default::default(),
+                                    candle_core::DType::F8E4M3,
+                                )?;
+                                let gate_scale = expert_vb.get_with_hints_dtype(
+                                    (
+                                        intermediate_size.div_ceil(weight_block_size[0]),
+                                        hidden_size.div_ceil(weight_block_size[1]),
+                                    ),
+                                    "gate_proj.weight_scale_inv",
+                                    Default::default(),
+                                    candle_core::DType::F32,
+                                )?;
+
+                                let up_fp8 = expert_vb.get_with_hints_dtype(
+                                    (intermediate_size, hidden_size),
+                                    "up_proj.weight",
+                                    Default::default(),
+                                    candle_core::DType::F8E4M3,
+                                )?;
+                                let up_scale = expert_vb.get_with_hints_dtype(
+                                    (
+                                        intermediate_size.div_ceil(weight_block_size[0]),
+                                        hidden_size.div_ceil(weight_block_size[1]),
+                                    ),
+                                    "up_proj.weight_scale_inv",
+                                    Default::default(),
+                                    candle_core::DType::F32,
+                                )?;
+
+                                let down_fp8 = expert_vb.get_with_hints_dtype(
+                                    (hidden_size, intermediate_size),
+                                    "down_proj.weight",
+                                    Default::default(),
+                                    candle_core::DType::F8E4M3,
+                                )?;
+                                let down_scale = expert_vb.get_with_hints_dtype(
+                                    (
+                                        hidden_size.div_ceil(weight_block_size[0]),
+                                        intermediate_size.div_ceil(weight_block_size[1]),
+                                    ),
+                                    "down_proj.weight_scale_inv",
+                                    Default::default(),
+                                    candle_core::DType::F32,
+                                )?;
+
+                                use crate::blockwise_fp8::BlockwiseFP8Linear;
+
+                                let gate_layer: Arc<dyn QuantMethod> = Arc::new(
+                                    BlockwiseFP8Linear::new(QuantMethodConfig::BlockwiseFP8 {
+                                        weight: gate_fp8,
+                                        weight_scale_inv: gate_scale,
+                                        bias: None,
+                                        dequant_dtype: vb.dtype(),
+                                        weight_block_size: weight_block_size.clone(),
+                                    })?,
+                                );
+                                let up_layer: Arc<dyn QuantMethod> =
+                                    Arc::new(BlockwiseFP8Linear::new(
+                                        QuantMethodConfig::BlockwiseFP8 {
+                                            weight: up_fp8,
+                                            weight_scale_inv: up_scale,
+                                            bias: None,
+                                            dequant_dtype: vb.dtype(),
+                                            weight_block_size: weight_block_size.clone(),
+                                        },
+                                    )?);
+                                let down_layer: Arc<dyn QuantMethod> = Arc::new(
+                                    BlockwiseFP8Linear::new(QuantMethodConfig::BlockwiseFP8 {
+                                        weight: down_fp8,
+                                        weight_scale_inv: down_scale,
+                                        bias: None,
+                                        dequant_dtype: vb.dtype(),
+                                        weight_block_size: weight_block_size.clone(),
+                                    })?,
+                                );
+
+                                gs.push(gate_layer);
+                                us.push(up_layer);
+                                ds.push(down_layer);
+                            }
                         }
 
                         (gs, us, ds)
@@ -1799,8 +1917,9 @@ impl FusedExperts {
 
             (fused_gate_proj, fused_up_proj, fused_down_proj)
         } else if matches!(&quantization_config, Some(QuantizedConfig::Fp8 { .. })) {
-            // Per-expert format with FP8 quantization
-            // Keep weights as FP8 using BlockwiseFP8 to leverage native FP8 GEMM in gather_forward
+            // Per-expert format with FP8 quantization config.
+            // The actual on-disk format may be FP8 E4M3 or INT4-packed-as-I8
+            // (e.g. DeepSeek V4 Flash routed experts). Detect by probing shape.
             let weight_block_size = match quantization_config {
                 Some(QuantizedConfig::Fp8 { weight_block_size }) => weight_block_size.clone(),
                 _ => unreachable!(),
@@ -1817,90 +1936,267 @@ impl FusedExperts {
                 );
             }
 
-            let mut gate_fp8_vec = Vec::new();
-            let mut gate_scale_vec = Vec::new();
-            let mut up_fp8_vec = Vec::new();
-            let mut up_scale_vec = Vec::new();
-            let mut down_fp8_vec = Vec::new();
-            let mut down_scale_vec = Vec::new();
-
-            for i in 0..num_experts {
-                let expert_vb = experts_vb.pp(i);
-
-                // Load FP8 weights and scales for each projection
-                let gate_fp8 = expert_vb.get_with_hints_dtype(
-                    (moe_intermediate_size, hidden_size),
+            // Detect INT4-packed-as-I8 by probing expert 0's gate_proj at half-column shape.
+            // INT4 packs 2 values per byte, so columns are halved on disk.
+            let probe_vb = experts_vb.pp(0);
+            let is_int4_packed = probe_vb
+                .get_with_hints_dtype(
+                    (moe_intermediate_size, hidden_size / 2),
                     "gate_proj.weight",
                     Default::default(),
-                    candle_core::DType::F8E4M3,
-                )?;
-                let gate_scale = expert_vb.get_with_hints_dtype(
-                    (
-                        moe_intermediate_size.div_ceil(weight_block_size[0]),
-                        hidden_size.div_ceil(weight_block_size[1]),
-                    ),
+                    candle_core::DType::I32, // I8 on disk → I32 via convert()
+                )
+                .is_ok();
+
+            if is_int4_packed {
+                // INT4-packed-as-I8 path: each byte holds 2 signed INT4 values,
+                // columns are half the logical width. Dequant to BF16 with
+                // block scales, then stack and wrap as UnquantLinear for ISQ.
+                use crate::blockwise_fp8::mx_int4_blockwise_dequantize;
+
+                // Derive the actual INT4 block size from the scale tensor shape.
+                // The config's weight_block_size ([128,128]) is for FP8 attention,
+                // not INT4 experts. V4 Flash INT4 scales are [rows, unpacked_cols/block_w]
+                // with block_h=1 (per-row), block_w=32.
+                // gate_proj: weight=[intermediate, hidden/2], scale=[intermediate, hidden/block_w]
+                // So: block_h = intermediate / scale_rows, block_w = hidden / scale_cols
+                let probe_scale = probe_vb.get_with_hints_dtype(
+                    (moe_intermediate_size, hidden_size / 2), // dummy shape, will fail
                     "gate_proj.weight_scale_inv",
                     Default::default(),
                     candle_core::DType::F32,
-                )?;
+                );
+                // If the shape hint fails, try loading without a specific shape.
+                // We know the scale exists (rename worked), so try common shapes.
+                let gate_scale_shape = if let Ok(ref t) = probe_scale {
+                    (t.dim(0)?, t.dim(1)?)
+                } else {
+                    // Try the actual on-disk shape: [intermediate_size, hidden_size/32]
+                    let t = probe_vb.get_with_hints_dtype(
+                        (moe_intermediate_size, hidden_size / 32),
+                        "gate_proj.weight_scale_inv",
+                        Default::default(),
+                        candle_core::DType::F32,
+                    )?;
+                    (t.dim(0)?, t.dim(1)?)
+                };
+                let int4_block_size = vec![
+                    moe_intermediate_size / gate_scale_shape.0,  // block_h
+                    hidden_size / gate_scale_shape.1,            // block_w
+                ];
+                // down_proj has different dimensions: [hidden, intermediate/2]
+                let down_scale_rows = hidden_size / int4_block_size[0];
+                let down_scale_cols = moe_intermediate_size / int4_block_size[1];
 
-                let up_fp8 = expert_vb.get_with_hints_dtype(
-                    (moe_intermediate_size, hidden_size),
-                    "up_proj.weight",
-                    Default::default(),
-                    candle_core::DType::F8E4M3,
-                )?;
-                let up_scale = expert_vb.get_with_hints_dtype(
-                    (
-                        moe_intermediate_size.div_ceil(weight_block_size[0]),
-                        hidden_size.div_ceil(weight_block_size[1]),
-                    ),
-                    "up_proj.weight_scale_inv",
-                    Default::default(),
-                    candle_core::DType::F32,
-                )?;
+                tracing::info!(
+                    "Detected INT4-packed MoE expert weights, block_size={:?}, dequantizing to BF16",
+                    int4_block_size
+                );
 
-                let down_fp8 = expert_vb.get_with_hints_dtype(
-                    (hidden_size, moe_intermediate_size),
-                    "down_proj.weight",
-                    Default::default(),
-                    candle_core::DType::F8E4M3,
-                )?;
-                let down_scale = expert_vb.get_with_hints_dtype(
-                    (
-                        hidden_size.div_ceil(weight_block_size[0]),
-                        moe_intermediate_size.div_ceil(weight_block_size[1]),
-                    ),
-                    "down_proj.weight_scale_inv",
-                    Default::default(),
-                    candle_core::DType::F32,
-                )?;
+                // When immediate ISQ is active, load on CPU for quantization.
+                let load_experts_vb =
+                    if crate::get_immediate_isq().is_some() && !experts_vb.device().is_cpu() {
+                        experts_vb.clone().set_device(Device::Cpu)
+                    } else {
+                        experts_vb.clone()
+                    };
 
-                gate_fp8_vec.push(gate_fp8);
-                gate_scale_vec.push(gate_scale);
-                up_fp8_vec.push(up_fp8);
-                up_scale_vec.push(up_scale);
-                down_fp8_vec.push(down_fp8);
-                down_scale_vec.push(down_scale);
+                let mut gate_proj_vec = Vec::new();
+                let mut up_proj_vec = Vec::new();
+                let mut down_proj_vec = Vec::new();
+
+                for i in 0..num_experts {
+                    let expert_vb = load_experts_vb.pp(i);
+
+                    // gate_proj (w1): [intermediate_size, hidden_size/2] packed
+                    let gate_packed = expert_vb.get_with_hints_dtype(
+                        (moe_intermediate_size, hidden_size / 2),
+                        "gate_proj.weight",
+                        Default::default(),
+                        candle_core::DType::I32,
+                    )?;
+                    let gate_scale = expert_vb.get_with_hints_dtype(
+                        gate_scale_shape,
+                        "gate_proj.weight_scale_inv",
+                        Default::default(),
+                        candle_core::DType::F32,
+                    )?;
+
+                    // up_proj (w3): same shape as gate_proj
+                    let up_packed = expert_vb.get_with_hints_dtype(
+                        (moe_intermediate_size, hidden_size / 2),
+                        "up_proj.weight",
+                        Default::default(),
+                        candle_core::DType::I32,
+                    )?;
+                    let up_scale = expert_vb.get_with_hints_dtype(
+                        gate_scale_shape,
+                        "up_proj.weight_scale_inv",
+                        Default::default(),
+                        candle_core::DType::F32,
+                    )?;
+
+                    // down_proj (w2): [hidden_size, intermediate_size/2] packed
+                    let down_packed = expert_vb.get_with_hints_dtype(
+                        (hidden_size, moe_intermediate_size / 2),
+                        "down_proj.weight",
+                        Default::default(),
+                        candle_core::DType::I32,
+                    )?;
+                    let down_scale = expert_vb.get_with_hints_dtype(
+                        (down_scale_rows, down_scale_cols),
+                        "down_proj.weight_scale_inv",
+                        Default::default(),
+                        candle_core::DType::F32,
+                    )?;
+
+                    // Dequant INT4-packed → BF16
+                    let gate_bf16 = mx_int4_blockwise_dequantize(
+                        &gate_packed,
+                        &gate_scale,
+                        int4_block_size.clone(),
+                        candle_core::DType::BF16,
+                    )?;
+                    let up_bf16 = mx_int4_blockwise_dequantize(
+                        &up_packed,
+                        &up_scale,
+                        int4_block_size.clone(),
+                        candle_core::DType::BF16,
+                    )?;
+                    let down_bf16 = mx_int4_blockwise_dequantize(
+                        &down_packed,
+                        &down_scale,
+                        int4_block_size.clone(),
+                        candle_core::DType::BF16,
+                    )?;
+
+                    gate_proj_vec.push(gate_bf16);
+                    up_proj_vec.push(up_bf16);
+                    down_proj_vec.push(down_bf16);
+                }
+
+                // Stack into [num_experts, N, K] and wrap as UnquantLinear
+                let target_device = experts_vb.device().clone();
+                let fused_gate_proj: Arc<dyn QuantMethod> =
+                    Arc::new(UnquantLinear::new(QuantMethodConfig::Unquantized(
+                        Linear::new(Tensor::stack(&gate_proj_vec, 0)?, None),
+                    ))?);
+                let fused_up_proj: Arc<dyn QuantMethod> =
+                    Arc::new(UnquantLinear::new(QuantMethodConfig::Unquantized(
+                        Linear::new(Tensor::stack(&up_proj_vec, 0)?, None),
+                    ))?);
+                let fused_down_proj: Arc<dyn QuantMethod> =
+                    Arc::new(UnquantLinear::new(QuantMethodConfig::Unquantized(
+                        Linear::new(Tensor::stack(&down_proj_vec, 0)?, None),
+                    ))?);
+                // Run ISQ synchronously to avoid OOM: each layer's BF16 experts
+                // (~13GB) must be quantized before the next layer loads.
+                // apply_immediate_isq_always uses a pool that defers quantization,
+                // causing BF16 tensors to accumulate faster than ISQ can process.
+                if let Some(crate::ImmediateIsqParams {
+                    guard,
+                    ty: Some(isq_ty),
+                    ..
+                }) = crate::get_immediate_isq()
+                {
+                    let n = std::sync::atomic::AtomicUsize::new(0);
+                    let fused_gate_proj =
+                        fused_gate_proj.apply_isq(Some(isq_ty), target_device.clone(), &n, None, guard.clone())?;
+                    let fused_up_proj =
+                        fused_up_proj.apply_isq(Some(isq_ty), target_device.clone(), &n, None, guard.clone())?;
+                    let fused_down_proj =
+                        fused_down_proj.apply_isq(Some(isq_ty), target_device.clone(), &n, None, guard)?;
+                    (fused_gate_proj, fused_up_proj, fused_down_proj)
+                } else {
+                    (fused_gate_proj, fused_up_proj, fused_down_proj)
+                }
+            } else {
+                // Standard FP8 E4M3 path
+                let mut gate_fp8_vec = Vec::new();
+                let mut gate_scale_vec = Vec::new();
+                let mut up_fp8_vec = Vec::new();
+                let mut up_scale_vec = Vec::new();
+                let mut down_fp8_vec = Vec::new();
+                let mut down_scale_vec = Vec::new();
+
+                for i in 0..num_experts {
+                    let expert_vb = experts_vb.pp(i);
+
+                    // Load FP8 weights and scales for each projection
+                    let gate_fp8 = expert_vb.get_with_hints_dtype(
+                        (moe_intermediate_size, hidden_size),
+                        "gate_proj.weight",
+                        Default::default(),
+                        candle_core::DType::F8E4M3,
+                    )?;
+                    let gate_scale = expert_vb.get_with_hints_dtype(
+                        (
+                            moe_intermediate_size.div_ceil(weight_block_size[0]),
+                            hidden_size.div_ceil(weight_block_size[1]),
+                        ),
+                        "gate_proj.weight_scale_inv",
+                        Default::default(),
+                        candle_core::DType::F32,
+                    )?;
+
+                    let up_fp8 = expert_vb.get_with_hints_dtype(
+                        (moe_intermediate_size, hidden_size),
+                        "up_proj.weight",
+                        Default::default(),
+                        candle_core::DType::F8E4M3,
+                    )?;
+                    let up_scale = expert_vb.get_with_hints_dtype(
+                        (
+                            moe_intermediate_size.div_ceil(weight_block_size[0]),
+                            hidden_size.div_ceil(weight_block_size[1]),
+                        ),
+                        "up_proj.weight_scale_inv",
+                        Default::default(),
+                        candle_core::DType::F32,
+                    )?;
+
+                    let down_fp8 = expert_vb.get_with_hints_dtype(
+                        (hidden_size, moe_intermediate_size),
+                        "down_proj.weight",
+                        Default::default(),
+                        candle_core::DType::F8E4M3,
+                    )?;
+                    let down_scale = expert_vb.get_with_hints_dtype(
+                        (
+                            hidden_size.div_ceil(weight_block_size[0]),
+                            moe_intermediate_size.div_ceil(weight_block_size[1]),
+                        ),
+                        "down_proj.weight_scale_inv",
+                        Default::default(),
+                        candle_core::DType::F32,
+                    )?;
+
+                    gate_fp8_vec.push(gate_fp8);
+                    gate_scale_vec.push(gate_scale);
+                    up_fp8_vec.push(up_fp8);
+                    up_scale_vec.push(up_scale);
+                    down_fp8_vec.push(down_fp8);
+                    down_scale_vec.push(down_scale);
+                }
+
+                // Stack into [num_experts, N, K]
+                let gate_fp8 = Tensor::stack(&gate_fp8_vec, 0)?;
+                let gate_scale = Tensor::stack(&gate_scale_vec, 0)?;
+                let up_fp8 = Tensor::stack(&up_fp8_vec, 0)?;
+                let up_scale = Tensor::stack(&up_scale_vec, 0)?;
+                let down_fp8 = Tensor::stack(&down_fp8_vec, 0)?;
+                let down_scale = Tensor::stack(&down_scale_vec, 0)?;
+
+                // Create BlockwiseFP8Linear for each projection
+                let fused_gate_proj =
+                    blockwise_fp8_moe(gate_fp8, gate_scale, weight_block_size.clone(), vb.dtype())?;
+                let fused_up_proj =
+                    blockwise_fp8_moe(up_fp8, up_scale, weight_block_size.clone(), vb.dtype())?;
+                let fused_down_proj =
+                    blockwise_fp8_moe(down_fp8, down_scale, weight_block_size, vb.dtype())?;
+
+                (fused_gate_proj, fused_up_proj, fused_down_proj)
             }
-
-            // Stack into [num_experts, N, K]
-            let gate_fp8 = Tensor::stack(&gate_fp8_vec, 0)?;
-            let gate_scale = Tensor::stack(&gate_scale_vec, 0)?;
-            let up_fp8 = Tensor::stack(&up_fp8_vec, 0)?;
-            let up_scale = Tensor::stack(&up_scale_vec, 0)?;
-            let down_fp8 = Tensor::stack(&down_fp8_vec, 0)?;
-            let down_scale = Tensor::stack(&down_scale_vec, 0)?;
-
-            // Create BlockwiseFP8Linear for each projection
-            let fused_gate_proj =
-                blockwise_fp8_moe(gate_fp8, gate_scale, weight_block_size.clone(), vb.dtype())?;
-            let fused_up_proj =
-                blockwise_fp8_moe(up_fp8, up_scale, weight_block_size.clone(), vb.dtype())?;
-            let fused_down_proj =
-                blockwise_fp8_moe(down_fp8, down_scale, weight_block_size, vb.dtype())?;
-
-            (fused_gate_proj, fused_up_proj, fused_down_proj)
         } else if !experts_vb.pp("0").contains_tensor("gate_proj.weight") {
             // Handle the case where the layer is dummy (no tensors) during UQFF loading.
             // Deserialize will handle it.

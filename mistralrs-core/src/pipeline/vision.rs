@@ -843,6 +843,10 @@ impl Loader for VisionLoader {
             )?;
         }
 
+        // Trim CUDA memory pools so `cuMemGetInfo` reflects actual free VRAM.
+        #[cfg(feature = "cuda")]
+        crate::trim_cuda_memory_pools();
+
         let (cache_config, cache_engine) = if let Some(paged_attn_config) = paged_attn_config {
             anyhow::ensure!(
                 !matches!(self.kind, ModelKind::Adapter { .. }),

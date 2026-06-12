@@ -178,6 +178,7 @@ impl V4MHCLayerParams {
         cfg: &DeepSeekV4Config,
         vb: &ShardedVarBuilder,
         _layer_idx: usize,
+        real_device: &candle_core::Device,
     ) -> Option<Self> {
         let rt = V4MHCRuntime::from_cfg(cfg);
         let hc_mult = rt.hc_mult;
@@ -198,7 +199,8 @@ impl V4MHCLayerParams {
         }
 
         let load = |name: &str, shape: &[usize]| -> Result<Tensor> {
-            vb.get_with_hints_dtype(shape, name, Default::default(), DType::F32)
+            vb.get_with_hints_dtype(shape, name, Default::default(), DType::F32)?
+                .to_device(real_device)
         };
 
         // Any load failure → None (e.g., shape mismatch).
@@ -628,7 +630,11 @@ pub struct V4MHCHead {
 impl V4MHCHead {
     /// Try to load the final mHC head from `vb` (assumed at model root for
     /// V4 NextN, i.e. `model.`). Returns `None` if any tensor is missing.
-    pub fn try_load(cfg: &DeepSeekV4Config, vb: &ShardedVarBuilder) -> Option<Self> {
+    pub fn try_load(
+        cfg: &DeepSeekV4Config,
+        vb: &ShardedVarBuilder,
+        real_device: &candle_core::Device,
+    ) -> Option<Self> {
         let rt = V4MHCRuntime::from_cfg(cfg);
         let hc_mult = rt.hc_mult;
         let hc_dim = hc_mult * cfg.hidden_size;
@@ -639,7 +645,8 @@ impl V4MHCHead {
         }
 
         let load = |name: &str, shape: &[usize]| -> Result<Tensor> {
-            vb.get_with_hints_dtype(shape, name, Default::default(), DType::F32)
+            vb.get_with_hints_dtype(shape, name, Default::default(), DType::F32)?
+                .to_device(real_device)
         };
 
         let hc_head_fn = load("hc_head_fn", &[hc_mult, hc_dim]).ok()?;
@@ -770,8 +777,8 @@ mod tests {
     fn try_load_returns_none_when_absent() -> Result<()> {
         let cfg = dummy_cfg(8);
         let vb = vb_from(HashMap::new(), Device::Cpu);
-        assert!(V4MHCLayerParams::try_load(&cfg, &vb, 0).is_none());
-        assert!(V4MHCHead::try_load(&cfg, &vb).is_none());
+        assert!(V4MHCLayerParams::try_load(&cfg, &vb, 0, &Device::Cpu).is_none());
+        assert!(V4MHCHead::try_load(&cfg, &vb, &Device::Cpu).is_none());
         Ok(())
     }
 
@@ -811,7 +818,7 @@ mod tests {
             Tensor::zeros(3, DType::F32, &dev)?,
         );
         let vb = vb_from(tensors, dev);
-        let params = V4MHCLayerParams::try_load(&cfg, &vb, 0)
+        let params = V4MHCLayerParams::try_load(&cfg, &vb, 0, &dev)
             .expect("layer params should load");
         assert_eq!(params.mix_hc, mix_hc);
         assert_eq!(params.hc_mult, hc_mult);

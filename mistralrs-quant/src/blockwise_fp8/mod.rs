@@ -4,7 +4,7 @@ use candle_core::{quantized::GgmlDType, DType, Device, Result, Tensor};
 use candle_nn::Linear;
 
 mod ops;
-pub use ops::{fp8_blockwise_dequantize, fp8_blockwise_quantize};
+pub use ops::{fp8_blockwise_dequantize, fp8_blockwise_quantize, mx_int4_blockwise_dequantize};
 #[cfg(feature = "cuda")]
 #[allow(unused_imports)]
 pub(crate) use ops::{fp8_blockwise_matmul, fp8_indexed_moe_gemm};

@@ -449,6 +449,7 @@ impl V4Compressor {
         vb: ShardedVarBuilder,
         ratio: usize,
         head_dim: usize,
+        real_device: &Device,
     ) -> Result<Self> {
         let overlap = ratio == 4;
         let coff = 1 + usize::from(overlap);
@@ -490,14 +491,17 @@ impl V4Compressor {
             );
         };
 
+        // Load norm and ape on the real device (not the ISQ CPU device)
+        // to avoid device mismatch at inference time.
         let norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("norm"))?;
+        let norm = RmsNorm::from_w(norm.weight().to_device(real_device)?, cfg.rms_norm_eps)?;
 
         let ape = if vb.contains_tensor("ape") {
-            vb.get((ratio, coff * head_dim), "ape")?
+            vb.get((ratio, coff * head_dim), "ape")?.to_device(real_device)?
         } else if vb.contains_tensor("ape.weight") {
-            vb.get((ratio, coff * head_dim), "ape.weight")?
+            vb.get((ratio, coff * head_dim), "ape.weight")?.to_device(real_device)?
         } else {
-            Tensor::zeros((ratio, coff * head_dim), DType::F32, vb.device())?
+            Tensor::zeros((ratio, coff * head_dim), DType::F32, real_device)?
         };
 
         Ok(Self {
@@ -869,14 +873,16 @@ impl Attention {
         // layout. Anything else falls back to the uniform-averaging stub so
         // old checkpoints continue to load. Audit §0 + §1 Pattern B/C/D.
         let compressor = if compress_ratio != CompressRatio::Standard {
-            let device = mapper
-                .device_for(layer_idx, loading_isq)
+            // Use the real GPU device (loading_isq=false) for non-quantized
+            // tensors (ape, norm) to avoid device mismatch at inference time.
+            let real_device = mapper
+                .device_for(layer_idx, false)
                 .unwrap_or(&Device::Cpu);
             let comp_vb = mapper.set_device(layer_idx, vb.pp("compressor"), loading_isq);
             let comp = if V4Compressor::has_weights(&comp_vb) {
-                V4Compressor::new(cfg, comp_vb, ratio_int as usize, head_dim)?
+                V4Compressor::new(cfg, comp_vb, ratio_int as usize, head_dim, real_device)?
             } else {
-                V4Compressor::uniform(ratio_int as usize, head_dim, device)?
+                V4Compressor::uniform(ratio_int as usize, head_dim, real_device)?
             };
             Some(comp)
         } else {
@@ -1164,14 +1170,51 @@ impl Attention {
 
         // 7. Reshape attention output → flatten heads → grouped o_proj
         //    LoRA. attn_out shape: [B, n_heads, T, head_dim].
-        //    Audit §8 P1 item 12 — per-group einsum vs flat matmul.
+        //    Audit §8 P1 item 12 — per-group einsum("tgd,grd->tgr").
         attn_out = if attention_mask.is_some() {
             attn_out.transpose(1, 2)?.reshape((bs, seq_len, ()))?
         } else {
             attn_out.reshape((bs, seq_len, ()))?
         };
 
-        let inner = self.wo_a.forward_autocast(&attn_out)?;
+        let o_groups = self.cfg.o_groups.unwrap_or(1);
+        let inner = if o_groups > 1 {
+            // Grouped o_proj LoRA: each of `o_groups` head-groups gets its
+            // own slice of wo_a.  wo_a weight is (G*R, D) where G=o_groups,
+            // R=o_lora_rank, D=n_heads*head_dim/G.
+            //
+            // einsum("tgd,grd->tgr", attn_grouped, wo_a_grouped)
+            //   = bmm(attn_grouped.permute(1,0,2), wo_a_grouped.transpose(1,2))
+            let n = attn_out.dim(candle_core::D::Minus1)?;
+            let per_group = n / o_groups;
+            let tokens = bs * seq_len;
+
+            // (bs*seq_len, G, D)
+            let attn_grouped = attn_out.reshape((tokens, o_groups, per_group))?;
+
+            // Dequantize wo_a weight: (G*R, D) → (G, R, D).
+            // Temporary ~67MB per layer, freed after this forward call.
+            let wo_a_w = self.wo_a.dequantize_w()?;
+            let o_lora_rank = wo_a_w.dim(0)? / o_groups;
+            let wo_a_grouped = wo_a_w.reshape((o_groups, o_lora_rank, per_group))?;
+
+            // wo_a_grouped shape: (G, R, D)
+            let o_lora_rank = wo_a_grouped.dim(1)?;
+
+            // bmm: (G, tokens, D) @ (G, D, R) → (G, tokens, R)
+            let attn_perm = attn_grouped.permute((1, 0, 2))?.contiguous()?;
+            let wo_a_t = wo_a_grouped.permute((0, 2, 1))?.contiguous()?;
+            let inner_perm = attn_perm.matmul(&wo_a_t)?;
+
+            // (G, tokens, R) → (tokens, G*R)
+            inner_perm
+                .permute((1, 0, 2))?
+                .contiguous()?
+                .reshape((tokens, o_groups * o_lora_rank))?
+                .reshape((bs, seq_len, o_groups * o_lora_rank))?
+        } else {
+            self.wo_a.forward_autocast(&attn_out)?
+        };
         self.wo_b.forward_autocast(&inner)
     }
 }
@@ -1199,16 +1242,22 @@ impl MoeGate {
         // remap rule).
         let e_score_correction_bias = if matches!(cfg.topk_method, TopkMethod::NoAuxTc) {
             let name = if vb.contains_tensor("bias") {
-                "bias"
+                Some("bias")
+            } else if vb.contains_tensor("e_score_correction_bias") {
+                Some("e_score_correction_bias")
             } else {
-                "e_score_correction_bias"
+                // V4 Flash uses TD-MoE (tid2eid) routing — no correction bias.
+                None
             };
-            Some(vb.get_with_hints_dtype(
-                n_routed_experts,
-                name,
-                Default::default(),
-                DType::F32,
-            )?)
+            name.map(|n| {
+                vb.get_with_hints_dtype(
+                    n_routed_experts,
+                    n,
+                    Default::default(),
+                    DType::F32,
+                )
+            })
+            .transpose()?
         } else {
             None
         };
@@ -1247,12 +1296,13 @@ impl MoeGate {
                 (values, indices)
             }
             TopkMethod::NoAuxTc => {
-                let Some(e_score_correction_bias) = &self.e_score_correction_bias else {
-                    candle_core::bail!("Expected e_score_correction_bias")
+                let scores_flat = scores.reshape((bs * seq_len, ()))?;
+                let scores_for_choice = if let Some(bias) = &self.e_score_correction_bias {
+                    scores_flat.broadcast_add(&bias.unsqueeze(0)?)?
+                } else {
+                    // V4 Flash: no correction bias (TD-MoE routing), use raw scores.
+                    scores_flat
                 };
-                let scores_for_choice = scores
-                    .reshape((bs * seq_len, ()))?
-                    .broadcast_add(&e_score_correction_bias.unsqueeze(0)?)?;
                 // V4 Flash config does NOT publish `n_group` (audit §5 +
                 // /tmp/v4_flash_config.json). When n_group==1 the grouping
                 // degenerates; fall back to a flat top-k over all experts.
@@ -1498,6 +1548,7 @@ impl DecoderLayer {
         // MLP branch is reachable only if a config explicitly sets a
         // non-zero `first_k_dense_replace` AND provides `intermediate_size`.
         // Audit §0 + §5 line 448.
+        let mhc_device = real_device.clone();
         let moe_or_mlp = if let Some(n_routed_experts) = cfg.n_routed_experts.filter(|_| {
             layer_idx >= cfg.first_k_dense_replace
                 && layer_idx.is_multiple_of(cfg.moe_layer_freq)
@@ -1540,7 +1591,7 @@ impl DecoderLayer {
         // signal (`compress_ratios` non-empty AND the layer index is within
         // it) so legacy V3 fixtures and unit-test synthesisers that
         // intentionally omit `hc_attn_*` stay quiet.
-        let mhc = V4MHCLayerParams::try_load(cfg, &vb, layer_idx);
+        let mhc = V4MHCLayerParams::try_load(cfg, &vb, layer_idx, &mhc_device);
         if mhc.is_none() && !cfg.compress_ratios.is_empty() && layer_idx < cfg.compress_ratios.len()
         {
             tracing::warn!(
@@ -1944,7 +1995,11 @@ impl DeepSeekV4 {
         // ---- Global mHC head ----
         // V4 publishes `hc_head_fn`, `hc_head_base`, `hc_head_scale` at the
         // model root. Audit §1 ("Top-level tensors").
-        let mhc_head = super::dsv4_mhc::V4MHCHead::try_load(cfg, &vb_m);
+        let mhc_head = super::dsv4_mhc::V4MHCHead::try_load(
+            cfg,
+            &vb_m,
+            &normal_loading_metadata.real_device,
+        );
 
         Ok(Self {
             lm_head,
@@ -2105,6 +2160,10 @@ impl IsqModel for DeepSeekV4 {
             tensors.push((&mut layer.attn.wkv, Some(i)));
             tensors.push((&mut layer.attn.wo_a, Some(i)));
             tensors.push((&mut layer.attn.wo_b, Some(i)));
+            // V4 compressor wkv_gate — must be included so ISQ moves it to GPU.
+            if let Some(comp) = &mut layer.attn.compressor {
+                tensors.push((&mut comp.wkv_gate, Some(i)));
+            }
             match &mut layer.moe_or_mlp {
                 MoeOrMlp::Mlp(mlp) => {
                     tensors.push((&mut mlp.gate, Some(i)));
@@ -2134,6 +2193,22 @@ impl IsqModel for DeepSeekV4 {
         let mut tensors = Vec::new();
         tensors.push((&mut self.lm_head, None));
         for (i, layer) in self.layers.iter_mut().enumerate() {
+            // Include attention weights so they get moved to GPU even in MoeExpertsOnly mode.
+            match &mut layer.attn.q {
+                QProj::Plain(q) => {
+                    tensors.push((q, Some(i)));
+                }
+                QProj::Lora { a, norm: _, b } => {
+                    tensors.push((a, Some(i)));
+                    tensors.push((b, Some(i)));
+                }
+            }
+            tensors.push((&mut layer.attn.wkv, Some(i)));
+            tensors.push((&mut layer.attn.wo_a, Some(i)));
+            tensors.push((&mut layer.attn.wo_b, Some(i)));
+            if let Some(comp) = &mut layer.attn.compressor {
+                tensors.push((&mut comp.wkv_gate, Some(i)));
+            }
             match &mut layer.moe_or_mlp {
                 MoeOrMlp::Mlp(mlp) => {
                     tensors.push((&mut mlp.gate, Some(i)));
@@ -2146,6 +2221,10 @@ impl IsqModel for DeepSeekV4 {
                     }
                 }
             }
+        }
+        if let Some(mtp) = &mut self.mtp_head {
+            tensors.push((&mut mtp.h_proj, None));
+            tensors.push((&mut mtp.e_proj, None));
         }
         (tensors, &*self.mapper)
     }
@@ -2187,6 +2266,27 @@ impl IsqModel for DeepSeekV4 {
                     uvb_l.pp("self_attn").pp("q_a_layernorm").add(norm);
                 }
             }
+
+            if let Some(comp) = &layer.attn.compressor {
+                let uvb_c = uvb_l.pp("self_attn").pp("compressor");
+                uvb_c.add(&comp.norm);
+                uvb_c.add_tensor("ape", comp.ape.clone());
+            }
+
+            if let Some(mhc) = &layer.mhc {
+                uvb_l.add_tensor("hc_attn_fn", mhc.hc_attn_fn.clone());
+                uvb_l.add_tensor("hc_attn_base", mhc.hc_attn_base.clone());
+                uvb_l.add_tensor("hc_attn_scale", mhc.hc_attn_scale.clone());
+                uvb_l.add_tensor("hc_ffn_fn", mhc.hc_ffn_fn.clone());
+                uvb_l.add_tensor("hc_ffn_base", mhc.hc_ffn_base.clone());
+                uvb_l.add_tensor("hc_ffn_scale", mhc.hc_ffn_scale.clone());
+            }
+        }
+
+        if let Some(mhc_head) = &self.mhc_head {
+            uvb_m.add_tensor("hc_head_fn", mhc_head.hc_head_fn.clone());
+            uvb_m.add_tensor("hc_head_base", mhc_head.hc_head_base.clone());
+            uvb_m.add_tensor("hc_head_scale", mhc_head.hc_head_scale.clone());
         }
 
         uvb.to_safetensors()
@@ -2235,6 +2335,27 @@ impl IsqModel for DeepSeekV4 {
             uvb_l.pp("self_attn").pp("kv_proj").add(&layer.attn.wkv);
             uvb_l.pp("self_attn").pp("o_a_proj").add(&layer.attn.wo_a);
             uvb_l.pp("self_attn").pp("o_b_proj").add(&layer.attn.wo_b);
+
+            if let Some(comp) = &layer.attn.compressor {
+                let uvb_c = uvb_l.pp("self_attn").pp("compressor");
+                uvb_c.add(&comp.norm);
+                uvb_c.add_tensor("ape", comp.ape.clone());
+            }
+
+            if let Some(mhc) = &layer.mhc {
+                uvb_l.add_tensor("hc_attn_fn", mhc.hc_attn_fn.clone());
+                uvb_l.add_tensor("hc_attn_base", mhc.hc_attn_base.clone());
+                uvb_l.add_tensor("hc_attn_scale", mhc.hc_attn_scale.clone());
+                uvb_l.add_tensor("hc_ffn_fn", mhc.hc_ffn_fn.clone());
+                uvb_l.add_tensor("hc_ffn_base", mhc.hc_ffn_base.clone());
+                uvb_l.add_tensor("hc_ffn_scale", mhc.hc_ffn_scale.clone());
+            }
+        }
+
+        if let Some(mhc_head) = &self.mhc_head {
+            uvb_m.add_tensor("hc_head_fn", mhc_head.hc_head_fn.clone());
+            uvb_m.add_tensor("hc_head_base", mhc_head.hc_head_base.clone());
+            uvb_m.add_tensor("hc_head_scale", mhc_head.hc_head_scale.clone());
         }
 
         Some(uvb.to_safetensors())
@@ -2689,7 +2810,7 @@ mod tests {
         let cfg = compressor_test_cfg(hidden_size);
         let map = make_compressor_dual_tensors(hidden_size, head_dim, ratio, coff, 7, &device);
         let vb = vb_from_map(map, DType::F32, &device);
-        let comp = V4Compressor::new(&cfg, vb, ratio, head_dim)?;
+        let comp = V4Compressor::new(&cfg, vb, ratio, head_dim, &device)?;
 
         assert_eq!(comp.ratio, ratio);
         assert_eq!(comp.head_dim, head_dim);
@@ -2732,7 +2853,7 @@ mod tests {
         let cfg = compressor_test_cfg(hidden_size);
         let map = make_compressor_dual_tensors(hidden_size, head_dim, ratio, coff, 3, &device);
         let vb = vb_from_map(map, DType::F32, &device);
-        let comp = V4Compressor::new(&cfg, vb, ratio, head_dim)?;
+        let comp = V4Compressor::new(&cfg, vb, ratio, head_dim, &device)?;
         assert_eq!(comp.coff, 2);
 
         let b = 2;
@@ -2761,7 +2882,7 @@ mod tests {
         let cfg = compressor_test_cfg(hidden_size);
         let map = make_compressor_dual_tensors(hidden_size, head_dim, ratio, coff, 11, &device);
         let vb = vb_from_map(map, DType::F32, &device);
-        let real = V4Compressor::new(&cfg, vb, ratio, head_dim)?;
+        let real = V4Compressor::new(&cfg, vb, ratio, head_dim, &device)?;
 
         // Uniform-fallback compressor (the path that was previously used).
         let uniform = V4Compressor::uniform(ratio, head_dim, &device)?;
@@ -2834,7 +2955,7 @@ mod tests {
         // No ape → zeros fallback inside V4Compressor::new.
 
         let vb = vb_from_map(map, DType::F32, &device);
-        let comp = V4Compressor::new(&cfg, vb, ratio, head_dim)?;
+        let comp = V4Compressor::new(&cfg, vb, ratio, head_dim, &device)?;
 
         let b = 1;
         let t = 256;
@@ -2852,7 +2973,7 @@ mod tests {
         let device = Device::Cpu;
         let cfg = compressor_test_cfg(16);
         let vb = vb_from_map(std::collections::HashMap::new(), DType::F32, &device);
-        let res = V4Compressor::new(&cfg, vb, 128, 8);
+        let res = V4Compressor::new(&cfg, vb, 128, 8, &device);
         assert!(
             res.is_err(),
             "V4Compressor::new without wkv_gate/wkv+wgate should Err"

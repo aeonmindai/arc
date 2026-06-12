@@ -53,7 +53,8 @@ pub use safetensors::{attach_rename_rules, Shard, ShardedSafeTensors, ShardedVar
 pub use afq::{AfqBits, AfqGroupSize, AfqLayer};
 pub use bitsandbytes::{BnbLinear, BnbQuantParams, BnbQuantType};
 pub use blockwise_fp8::{
-    blockwise_fp8_moe, fp8_blockwise_dequantize, fp8_blockwise_quantize, BlockwiseFP8Linear,
+    blockwise_fp8_moe, fp8_blockwise_dequantize, fp8_blockwise_quantize,
+    mx_int4_blockwise_dequantize, BlockwiseFP8Linear,
 };
 pub use distributed::{
     layers::{
