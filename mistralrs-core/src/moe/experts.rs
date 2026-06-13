@@ -23,6 +23,11 @@ pub struct MoEExpertsConfig {
     pub num_experts_per_tok: usize,
     pub hidden_size: usize,
     pub moe_intermediate_size: usize,
+    /// SwiGLU clamp limit (DeepSeek V4: 10.0). When `Some`, the gate and up
+    /// projections are clamped to `[-limit, limit]` before the activation.
+    /// V4 was trained with this clamp; without it, experts whose activations
+    /// exceed the limit explode (RUN-161). `None` = unclamped (other models).
+    pub swiglu_limit: Option<f32>,
 }
 
 /// Backend selection for MoE experts
@@ -94,6 +99,7 @@ pub struct MoEExperts {
     backend: MoEExpertsBackendImpl,
     act: Activation,
     num_experts_per_tok: usize,
+    swiglu_limit: Option<f32>,
     all_reduce: SumAllReduce,
     world_size: usize,
 }
@@ -180,6 +186,7 @@ impl MoEExperts {
             backend: backend_impl,
             act,
             num_experts_per_tok: cfg.num_experts_per_tok,
+            swiglu_limit: cfg.swiglu_limit,
             all_reduce: SumAllReduce::new(comm),
             world_size: comm.world_size(),
         })
@@ -491,17 +498,40 @@ impl MoEExperts {
         let xs_flat = xs.reshape((num_tokens, hidden_dim))?;
 
         let ys = if xs.device().is_cuda() {
-            // CUDA path: use indexed_moe_forward compatible shapes
-            let xs = xs_flat.reshape((num_tokens, 1, hidden_dim))?;
+            // CUDA path: use indexed_moe_forward compatible shapes.
+            // FP8 gather_forward accepts (num_tokens, 1, hidden_dim) and broadcasts
+            // internally, but QTIP requires the second dim to match num_experts_per_tok.
+            // Expand to (num_tokens, num_experts_per_tok, hidden_dim) for compatibility.
+            let xs = xs_flat
+                .unsqueeze(1)?
+                .expand((num_tokens, self.num_experts_per_tok, hidden_dim))?
+                .contiguous()?;
             let gate = weights
                 .fused_gate_proj
                 .gather_forward_autocast(&xs, topk_ids)?;
             let up = weights
                 .fused_up_proj
                 .gather_forward_autocast(&xs, topk_ids)?;
-            weights
+            crate::models::deepseek4::v4_stat_dbg(&gate, "exp.gate");
+            crate::models::deepseek4::v4_stat_dbg(&up, "exp.up");
+            // V4 clamped SwiGLU: clamp gate/up to [-limit, limit] before the
+            // activation. The model was trained with this clamp; without it,
+            // experts whose activations exceed the limit explode (RUN-161).
+            let (gate, up) = if let Some(limit) = self.swiglu_limit {
+                let limit = limit as f64;
+                (gate.clamp(-limit, limit)?, up.clamp(-limit, limit)?)
+            } else {
+                (gate, up)
+            };
+            let act_gate = gate.apply(&self.act)?;
+            crate::models::deepseek4::v4_stat_dbg(&act_gate, "exp.act_gate");
+            let prod = (up * act_gate)?;
+            crate::models::deepseek4::v4_stat_dbg(&prod, "exp.prod");
+            let down = weights
                 .fused_down_proj
-                .gather_forward_autocast(&(up * gate.apply(&self.act)?)?, topk_ids)?
+                .gather_forward_autocast(&prod, topk_ids)?;
+            crate::models::deepseek4::v4_stat_dbg(&down, "exp.down");
+            down
         } else {
             // Metal path: use broadcast gather shapes
             let xs = xs.reshape((b_size, seq_len, 1, 1, hidden_dim))?;

@@ -96,6 +96,7 @@ pub fn dsv4_attention(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
+    xs: &Tensor,
     attention_mask: Option<&Tensor>,
     flash_params: &FlashParams,
     compressor: Option<&V4Compressor>,
@@ -116,26 +117,47 @@ pub fn dsv4_attention(
     };
 
     let ratio = cfg.compress_ratio.ratio();
-    let t_k = k.dim(2)?;
+    // The real V4 compressor (`forward_from_xs`) projects the layer input
+    // `xs` ([B, T, hidden]) into compressed K/V — it operates on the hidden
+    // states, NOT the post-projection K tensor. So divisibility is governed
+    // by the number of *input* tokens being compressed this call.
+    let t_xs = xs.dim(1)?;
 
-    // ---- Short-prompt safety: T_k must be divisible by the ratio. ---------
-    // For synthetic tests with seq=4 and ratio=4 we'd otherwise crash inside
-    // `V4Compressor::forward`. Falling back to plain SDPA here is mathematically
-    // the only thing that makes sense: there's no compressed sequence to attend
-    // to. Audit §1: "Tier A compress branch is conditional on T_k % ratio == 0".
-    if t_k % ratio != 0 {
+    // ---- Short-prompt / decode safety: T_xs must be divisible by ratio. ---
+    // `forward_from_xs` groups `ratio` consecutive tokens into one compressed
+    // entry, so it requires `T_xs % ratio == 0`. This is false for:
+    //   * synthetic short prompts (seq=4, ratio=128),
+    //   * single-token decode steps (T_xs=1),
+    //   * prefill chunks whose length isn't a multiple of the ratio.
+    // In all of these the only correct thing is dense attention over the full
+    // (gathered) K/V — which is exactly what the caller passes as `k`/`v`.
+    // Correct, just not yet compressed; the compressed-KV decode cache
+    // (Tier-B) is the follow-up that restores the speed path. Audit §1.
+    // R2: `xs` is the compressor-input *history*. Compress the largest
+    // prefix that is a multiple of `ratio`; the remaining <ratio recent
+    // tokens are covered by the local sliding-window branch. If the history
+    // is shorter than one ratio block there's nothing to compress yet.
+    let t_trunc = (t_xs / ratio) * ratio;
+    if t_trunc == 0 {
         return Sdpa.run_attention(q, k, v, attention_mask, Some(flash_params), sdpa_params);
     }
 
-    // ---- Main branch: dense SDPA over compressed K/V. ---------------------
-    // The compressed sequence has length T_c = T_k / ratio. Mask is dropped
-    // (incompatible with the re-indexed seq dim — audit §1 Pattern B/C/D).
-    let k_compressed = compressor.forward(k)?;
-    let v_compressed = compressor.forward(v)?;
+    // ---- Main branch: dense SDPA over the *real* compressed K/V. ----------
+    // `forward_from_xs` returns `[B, T_c, head_dim]` with `T_c = T_xs / ratio`.
+    // V4 fuses V into K (MQA absorb — the caller sets `v = k`), so the single
+    // compressed tensor serves as both compressed K and compressed V. Add the
+    // KV-head axis (`num_kv_heads = 1`) for SDPA; the mask is dropped because
+    // the compressed sequence is re-indexed. Audit §1 Pattern B/C/D.
+    let xs_trunc = if t_trunc == t_xs {
+        xs.clone()
+    } else {
+        xs.narrow(1, 0, t_trunc)?
+    };
+    let kv_compressed = compressor.forward_from_xs(&xs_trunc)?.unsqueeze(1)?;
     let main_branch = Sdpa.run_attention(
         q,
-        &k_compressed,
-        &v_compressed,
+        &kv_compressed,
+        &kv_compressed,
         None, // mask incompatible with compressed dim
         Some(flash_params),
         sdpa_params,
@@ -236,7 +258,10 @@ mod tests {
             compress_ratio: CompressRatio::Standard,
             sliding_window: 4,
         };
-        let actual = dsv4_attention(&q, &k, &v, None, &flash, None, &sdpa, cfg)?;
+        // Standard dispatch returns early before the compressor; xs is unused
+        // but must be supplied to satisfy the signature.
+        let xs = Tensor::zeros((b, t, 1), DType::F32, &device)?;
+        let actual = dsv4_attention(&q, &k, &v, &xs, None, &flash, None, &sdpa, cfg)?;
 
         let e: Vec<f32> = expected.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
         let a: Vec<f32> = actual.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
@@ -271,7 +296,10 @@ mod tests {
             compress_ratio: CompressRatio::Csa,
             sliding_window: 2,
         };
-        let actual = dsv4_attention(&q, &k, &v, None, &flash, Some(&compressor), &sdpa, cfg)?;
+        // T_xs=3 is not divisible by ratio 4 → dense-SDPA fallback, matching
+        // `expected`. xs hidden dim is irrelevant on the fallback path.
+        let xs = Tensor::zeros((b, t, 1), DType::F32, &device)?;
+        let actual = dsv4_attention(&q, &k, &v, &xs, None, &flash, Some(&compressor), &sdpa, cfg)?;
 
         // Same shape, finite values, equal to fallback.
         assert_eq!(expected.dims(), actual.dims());
@@ -309,7 +337,10 @@ mod tests {
             sliding_window: 4,
         };
 
-        let out = dsv4_attention(&q, &k, &v, None, &flash, Some(&compressor), &sdpa, cfg)?;
+        // T_xs=16 divisible by ratio 4 → real compressed branch via
+        // forward_from_xs. Uniform compressor expects hidden dim 1.
+        let xs = Tensor::zeros((b, t, 1), DType::F32, &device)?;
+        let out = dsv4_attention(&q, &k, &v, &xs, None, &flash, Some(&compressor), &sdpa, cfg)?;
         assert_eq!(out.dims(), &[b, h, 4, d]);
         let data: Vec<f32> = out.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
         assert!(data.iter().all(|x| x.is_finite()));
@@ -340,7 +371,9 @@ mod tests {
             sliding_window: 8,
         };
 
-        let out = dsv4_attention(&q, &k, &v, None, &flash, Some(&compressor), &sdpa, cfg)?;
+        // T_xs=128 divisible by ratio 128 → real compressed branch (T_c=1).
+        let xs = Tensor::zeros((b, 128, 1), DType::F32, &device)?;
+        let out = dsv4_attention(&q, &k, &v, &xs, None, &flash, Some(&compressor), &sdpa, cfg)?;
         assert_eq!(out.dims(), &[b, h, 2, d]);
         let data: Vec<f32> = out.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
         assert!(data.iter().all(|x| x.is_finite()));
@@ -364,7 +397,9 @@ mod tests {
             compress_ratio: CompressRatio::Csa,
             sliding_window: 4,
         };
-        let actual = dsv4_attention(&q, &k, &v, None, &flash, None, &sdpa, cfg)?;
+        // Missing compressor → dense-SDPA fallback before xs is used.
+        let xs = Tensor::zeros((b, t, 1), DType::F32, &device)?;
+        let actual = dsv4_attention(&q, &k, &v, &xs, None, &flash, None, &sdpa, cfg)?;
         let e: Vec<f32> = expected.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
         let a: Vec<f32> = actual.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
         for (ev, av) in e.iter().zip(a.iter()) {

@@ -2032,15 +2032,12 @@ impl QuantizedSerde for QtipLayer {
         self.serialize_with_bias(self.bias.clone())
     }
     fn serialize_with_bias(&self, bias: Option<Tensor>) -> Result<Cow<'_, [u8]>> {
-        // The UQFF QTIP layout is 2-D only. 3-D stacked layers are produced
-        // by ISQ-at-load and are not currently round-tripped through UQFF —
-        // saving one would require a new format version. Bail clearly so a
-        // future serialize() of a 3-D layer doesn't silently truncate.
-        if self.num_experts.is_some() {
-            candle_core::bail!(
-                "QtipLayer::serialize: UQFF does not yet support 3-D stacked-expert layers"
-            );
-        }
+        // 3-D stacked-expert layers serialize fine: `serialize_tensor` writes
+        // each tensor's shape+data regardless of rank, so the only thing that
+        // distinguishes a 3-D layer is `blocks` being rank-3 (leading expert
+        // dim E). `deserialize_ext_bias` recovers `num_experts` from that
+        // rank, so no UQFF format/version change is needed and 2-D payloads
+        // are unaffected. (Enables V4 MoE expert stacks to round-trip.)
         let mut buffer = Vec::new();
         buffer.extend(&UQFF_VERSION.to_le_bytes());
         buffer.push(QuantizedSerdeType::Qtip as u8);
@@ -2129,6 +2126,17 @@ impl QuantizedSerde for QtipLayer {
             Err(_) => (None, 0usize),
         };
 
+        // Recover 2-D vs 3-D (stacked-expert) layout from the rank of
+        // `blocks`: rank-3 carries a leading expert dim E. Lets a
+        // UQFF-serialized MoE expert stack round-trip with no format change
+        // (2-D layers keep rank-2 blocks -> None). Computed before the struct
+        // literal so `blocks` isn't used after being moved in.
+        let num_experts = if blocks.rank() == 3 {
+            Some(blocks.dim(0)?)
+        } else {
+            None
+        };
+
         Ok((
             Arc::new(Self {
                 blocks,
@@ -2136,9 +2144,7 @@ impl QuantizedSerde for QtipLayer {
                 lut,
                 bias,
                 in_features,
-                // UQFF deserialize is 2-D only; 3-D stacks are reconstructed
-                // by re-running `quantize_with_options_3d` from a 3-D source.
-                num_experts: None,
+                num_experts,
                 rotation_signs,
                 rotation_block,
             }),

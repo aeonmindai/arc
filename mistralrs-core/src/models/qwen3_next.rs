@@ -494,6 +494,7 @@ impl SparseMoeBlock {
         )?;
 
         let moe_cfg = MoEExpertsConfig {
+            swiglu_limit: None,
             num_experts: cfg.num_experts,
             num_experts_per_tok: cfg.num_experts_per_tok,
             hidden_size: cfg.hidden_size,

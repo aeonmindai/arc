@@ -1041,8 +1041,17 @@ impl Loader for NormalLoader {
         let _graph_device = model.device().clone();
 
         // Extract weight pointers for the dedicated decode path (model-agnostic).
+        // This copies/extracts decode weights into separate buffers; for very
+        // large models that barely fit VRAM (e.g. V4 236B @ qtip2 ~66GB on an
+        // 80GB H100) the extraction OOMs and its failed allocations get cached
+        // by the CUDA allocator, fragmenting VRAM and hanging the first forward.
+        // It's a decode *speed* optimization only — gate it off via
+        // ARC_NO_DEDICATED_DECODE=1 to reclaim that headroom. Default unchanged.
         #[cfg(feature = "cuda")]
-        let _decode_weights = {
+        let _decode_weights = if std::env::var_os("ARC_NO_DEDICATED_DECODE").is_some() {
+            tracing::info!("Dedicated decode path extraction skipped (ARC_NO_DEDICATED_DECODE set).");
+            None
+        } else {
             let cfg = model.config().clone();
             // Get residuals first (immutable borrow), then get_layers (mutable borrow)
             let residuals = model.residual_tensors();

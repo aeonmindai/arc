@@ -383,12 +383,19 @@ impl QuantMethod for UnquantLinear {
                 } else {
                     crate::QtipMode::Viterbi
                 };
-                crate::QtipLayer::quantize_with_mode(
-                    &self.w.to_device(&device)?,
-                    bias,
-                    &device,
-                    mode,
-                )
+                // For 3D MoE expert stacks ([E, N, K], e.g. [256, 2048, 4096]),
+                // keep the full weight on its current device (CPU during ISQ
+                // load) and let `quantize_with_options_3d` stream one expert at a
+                // time onto `device`. Pre-moving the whole stack to GPU allocates
+                // ~4GB of transient BF16 and OOMs the final layers on a single
+                // 80GB H100 (the per-expert GPU transient is only ~33MB). 2D
+                // weights are small, so move them up front as before. (RUN-161)
+                let w_for_quant = if self.w.dims().len() == 3 {
+                    self.w.clone()
+                } else {
+                    self.w.to_device(&device)?
+                };
+                crate::QtipLayer::quantize_with_mode(&w_for_quant, bias, &device, mode)
             }
             Some(IsqType::F8Q8) => {
                 let _acquired_quantize_guard = guard.acquire(&device);

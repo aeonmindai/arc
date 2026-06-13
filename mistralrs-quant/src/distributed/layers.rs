@@ -2089,6 +2089,12 @@ impl FusedExperts {
                     Arc::new(UnquantLinear::new(QuantMethodConfig::Unquantized(
                         Linear::new(Tensor::stack(&down_proj_vec, 0)?, None),
                     ))?);
+                // Reclaim cached CUDA pool memory from prior layers before
+                // moving this layer's ~4GB stacked BF16 experts to the GPU for
+                // qtip2 quantization. Without this, freed BF16 from earlier
+                // layers lingers in the driver's async pool and the last-layer
+                // transient OOMs on a single 80GB H100 (RUN-161).
+                crate::utils::isq::trim_cuda_pools_after_isq();
                 // Run ISQ synchronously to avoid OOM: each layer's BF16 experts
                 // (~13GB) must be quantized before the next layer loads.
                 // apply_immediate_isq_always uses a pool that defers quantization,
@@ -2106,6 +2112,10 @@ impl FusedExperts {
                         fused_up_proj.apply_isq(Some(isq_ty), target_device.clone(), &n, None, guard.clone())?;
                     let fused_down_proj =
                         fused_down_proj.apply_isq(Some(isq_ty), target_device.clone(), &n, None, guard)?;
+                    // Return the freed BF16 expert quant transient to the OS
+                    // before the next layer's dequant, so cached blocks don't
+                    // accumulate in the CUDA pool and OOM near the final layers.
+                    crate::utils::isq::trim_cuda_pools_after_isq();
                     (fused_gate_proj, fused_up_proj, fused_down_proj)
                 } else {
                     (fused_gate_proj, fused_up_proj, fused_down_proj)

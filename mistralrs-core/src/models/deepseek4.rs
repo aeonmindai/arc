@@ -479,7 +479,20 @@ impl V4Compressor {
             let wkv_w = vb.get((row, cfg.hidden_size), "wkv.weight")?;
             let wgate_w = vb.get((row, cfg.hidden_size), "wgate.weight")?;
             let fused = Tensor::cat(&[&wkv_w, &wgate_w], 0)?;
-            ReplicatedLayer::from_linear(candle_nn::Linear::new(fused, None))?
+            // Keep the tiny [2*coff*head_dim, hidden] compressor weight in BF16
+            // (unquantized) rather than ISQ-quantizing it. Quantizing saves
+            // ~nothing (~4MB/layer) but its qtip quant transient OOMs on the
+            // memory-tight tail layers of a single-H100 load (runs at ~78GB
+            // resident with <2GB free). The async pool swallows that OOM,
+            // silently breaking the compressor -> prefill (which uses the
+            // compressor for seqlen>=ratio) then OOMs/fails. Decode and
+            // sub-ratio-token prompts use the dense fallback and never touch it,
+            // which masked the bug. See RUN-161.
+            Arc::new(mistralrs_quant::UnquantLinear::new(
+                mistralrs_quant::QuantMethodConfig::Unquantized(candle_nn::Linear::new(
+                    fused, None,
+                )),
+            )?) as Arc<dyn QuantMethod>
         } else {
             // Caller is expected to have gated this case via
             // `V4Compressor::has_weights` — surface a clear error if not.
@@ -695,6 +708,12 @@ struct Attention {
     /// Audit §0 + §2 (SGLang line 195).
     #[allow(dead_code)]
     indexer: Option<super::dsv4_indexer::V4Indexer>,
+    /// R2: per-layer history of the compressor input `xs` (post-layernorm
+    /// attention input) so the compressed branch sees compressed *history*
+    /// during decode, not just the current token. CSA/HCA only, interior-
+    /// mutable, reset at sequence start (seqlen_offset==0). Single-sequence
+    /// (non-paged) correctness; paged/multi-seq is the follow-up.
+    xs_history: Option<std::sync::Mutex<crate::kv_cache::SingleCache>>,
 }
 
 impl Attention {
@@ -974,6 +993,15 @@ impl Attention {
             sliding_window: cfg.sliding_window,
             attn_sink,
             indexer,
+            xs_history: if compress_ratio != CompressRatio::Standard {
+                Some(std::sync::Mutex::new(crate::kv_cache::SingleCache::new(
+                    1,
+                    cfg.max_position_embeddings,
+                    256,
+                )))
+            } else {
+                None
+            },
         })
     }
 
@@ -1023,9 +1051,27 @@ impl Attention {
         let (bs, seq_len, _) = xs.dims3()?;
         let head_dim = self.cfg.head_dim;
 
+        v4_nan_dbg(xs, "attn.in");
+
+        // R2: the compressor (forward_from_xs) must see the *history* of the
+        // attention input during decode, not just the current token. Keep a
+        // per-layer history of `xs` and feed the full history to the
+        // compressed branch; the q/k/v projections below still use the
+        // current `xs`. Reset at sequence start (all seqlen_offsets == 0).
+        let xs_for_compressor = if let Some(hist) = &self.xs_history {
+            let mut h = hist.lock().unwrap();
+            if seqlen_offsets.iter().all(|&o| o == 0) {
+                h.reset();
+            }
+            h.append(&xs.contiguous()?)?;
+            h.current_data()?.expect("xs_history present after append")
+        } else {
+            xs.clone()
+        };
         // 1. Q projection (LoRA). [B, T, hidden] → [B, T, n_heads*head_dim]
         //    → reshape to [B, n_heads, T, head_dim]. Audit §3.
         let q = self.q.forward(xs)?;
+        v4_nan_dbg(&q, "attn.q_proj");
         let q = q
             .reshape((bs, seq_len, self.num_attention_heads, head_dim))?
             .transpose(1, 2)?
@@ -1035,7 +1081,9 @@ impl Attention {
         //    head_dim] → kv_norm → reshape to [B, num_kv_heads=1, T,
         //    head_dim]. Audit §0 + §3.
         let kv_raw = self.wkv.forward_autocast(xs)?;
+        v4_nan_dbg(&kv_raw, "attn.wkv");
         let kv_normed = self.kv_norm.forward(&kv_raw)?;
+        v4_nan_dbg(&kv_normed, "attn.kv_norm");
         let k = kv_normed
             .reshape((bs, seq_len, self.num_kv_heads, head_dim))?
             .transpose(1, 2)?
@@ -1044,6 +1092,8 @@ impl Attention {
         // 3. RoPE applied in-place to the last qk_rope_head_dim dims of
         //    each Q-head and K-head's head_dim-vector. Audit §0 + §3.
         let (q, k) = self.apply_rope_inplace(&q, &k, seqlen_offsets)?;
+        v4_nan_dbg(&q, "attn.q_rope");
+        v4_nan_dbg(&k, "attn.k_rope");
 
         // 4. V4: K and V come from the same wkv tensor. The kernel treats
         //    the wkv output as both K (for scores) and V (for weighted
@@ -1122,6 +1172,7 @@ impl Attention {
                         &q,
                         &k_full,
                         &v_full,
+                        &xs_for_compressor,
                         attention_mask,
                         flash_params,
                         self.compressor.as_ref(),
@@ -1137,6 +1188,7 @@ impl Attention {
                         &q,
                         &k,
                         &v,
+                        &xs_for_compressor,
                         attention_mask,
                         flash_params,
                         self.compressor.as_ref(),
@@ -1151,6 +1203,7 @@ impl Attention {
                     &q,
                     &k_cached,
                     &v_cached,
+                    &xs_for_compressor,
                     attention_mask,
                     flash_params,
                     self.compressor.as_ref(),
@@ -1171,6 +1224,7 @@ impl Attention {
         // 7. Reshape attention output → flatten heads → grouped o_proj
         //    LoRA. attn_out shape: [B, n_heads, T, head_dim].
         //    Audit §8 P1 item 12 — per-group einsum("tgd,grd->tgr").
+        v4_nan_dbg(&attn_out, "attn.sdpa_out");
         attn_out = if attention_mask.is_some() {
             attn_out.transpose(1, 2)?.reshape((bs, seq_len, ()))?
         } else {
@@ -1215,7 +1269,10 @@ impl Attention {
         } else {
             self.wo_a.forward_autocast(&attn_out)?
         };
-        self.wo_b.forward_autocast(&inner)
+        v4_nan_dbg(&inner, "attn.wo_a");
+        let out = self.wo_b.forward_autocast(&inner)?;
+        v4_nan_dbg(&out, "attn.wo_b");
+        Ok(out)
     }
 }
 
@@ -1398,6 +1455,9 @@ impl Moe {
             .unwrap_or(real_device);
 
         let moe_cfg = MoEExpertsConfig {
+            // V4: apply the trained SwiGLU clamp (swiglu_limit, default 10.0) in
+            // the routed experts. Without it the experts explode (RUN-161).
+            swiglu_limit: Some(cfg.swiglu_limit),
             num_experts: n_routed_experts,
             num_experts_per_tok: cfg.num_experts_per_tok.unwrap_or(6),
             hidden_size: cfg.hidden_size,
@@ -1444,12 +1504,17 @@ impl Moe {
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
 
         let (topk_idx, topk_weight) = self.gate.forward(xs)?;
+        v4_stat_dbg(&topk_weight, "moe.topk_w");
         let mut y = self.experts.forward(xs, topk_weight, &topk_idx)?;
         y = y.reshape((b_size, seq_len, hidden_dim))?;
+        v4_stat_dbg(&y, "moe.routed");
 
         if let Some(ref shared_experts) = self.shared_experts {
-            y = (y + shared_experts.forward(&identity)?)?;
+            let shared_out = shared_experts.forward(&identity)?;
+            v4_stat_dbg(&shared_out, "moe.shared");
+            y = (y + shared_out)?;
         }
+        v4_stat_dbg(&y, "moe.out");
 
         Ok(y)
     }
@@ -1478,6 +1543,69 @@ impl MoeOrMlp {
             Self::Mlp(mlp) => mlp.forward(xs),
             Self::Moe(moe) => moe.forward(xs),
         }
+    }
+}
+
+/// Debug-only NaN/Inf localizer. Enabled by setting `V4_NAN_DEBUG=1`.
+/// Logs (to stderr) the first stage in the forward pass that produces a
+/// non-finite value, with shape and the finite value range for context.
+/// No-op (single env lookup) when the var is unset.
+pub(crate) fn v4_nan_dbg(t: &Tensor, tag: &str) {
+    // Also emit magnitude stats under V4_STATS so the existing per-sub-op
+    // probes double as a collapse/explosion localizer (RUN-161).
+    v4_stat_dbg(t, tag);
+    if std::env::var_os("V4_NAN_DEBUG").is_none() {
+        return;
+    }
+    match t
+        .to_dtype(DType::F32)
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_vec1::<f32>())
+    {
+        Ok(v) => {
+            let n = v.len();
+            let nans = v.iter().filter(|x| x.is_nan()).count();
+            let infs = v.iter().filter(|x| x.is_infinite()).count();
+            if nans > 0 || infs > 0 {
+                let fmin = v.iter().copied().filter(|x| x.is_finite()).fold(f32::MAX, f32::min);
+                let fmax = v.iter().copied().filter(|x| x.is_finite()).fold(f32::MIN, f32::max);
+                let shape = t.dims().to_vec();
+                eprintln!(
+                    "V4_NAN_DEBUG [{tag}] shape={shape:?} nans={nans} infs={infs}/{n} finite_range=[{fmin:.4},{fmax:.4}]"
+                );
+            }
+        }
+        Err(e) => eprintln!("V4_NAN_DEBUG [{tag}] check failed: {e}"),
+    }
+}
+
+/// Debug-only magnitude logger. Enabled by setting `V4_STATS=1`. Unlike
+/// `v4_nan_dbg`, this always logs (abs-mean / std / range), so it can localize
+/// a representation collapse (values -> ~0 or constant) that produces a flat
+/// logit distribution. Used to bisect which layer/op collapses the hidden state.
+pub(crate) fn v4_stat_dbg(t: &Tensor, tag: &str) {
+    if std::env::var_os("V4_STATS").is_none() {
+        return;
+    }
+    match t
+        .to_dtype(DType::F32)
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_vec1::<f32>())
+    {
+        Ok(v) => {
+            let n = v.len().max(1) as f32;
+            let naninf = v.iter().filter(|x| !x.is_finite()).count();
+            let mean = v.iter().sum::<f32>() / n;
+            let absmean = v.iter().map(|x| x.abs()).sum::<f32>() / n;
+            let var = v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n;
+            let fmin = v.iter().copied().filter(|x| x.is_finite()).fold(f32::MAX, f32::min);
+            let fmax = v.iter().copied().filter(|x| x.is_finite()).fold(f32::MIN, f32::max);
+            eprintln!(
+                "V4_STATS [{tag}] absmean={absmean:.6} std={:.6} range=[{fmin:.4},{fmax:.4}] nan/inf={naninf}",
+                var.sqrt()
+            );
+        }
+        Err(e) => eprintln!("V4_STATS [{tag}] failed: {e}"),
     }
 }
 
@@ -1704,7 +1832,10 @@ impl DecoderLayer {
             &PagedAttentionInputMetadata,
         )>,
         flash_params: &FlashParams,
+        layer_idx: usize,
     ) -> Result<Tensor> {
+        let li = layer_idx;
+        v4_nan_dbg(xs_4d, &format!("L{li}.input_4d"));
         let mhc = self.mhc.as_ref().ok_or_else(|| {
             candle_core::Error::Msg(
                 "DecoderLayer::forward_4d called on a layer without loaded `hc_attn_*` / \
@@ -1717,7 +1848,11 @@ impl DecoderLayer {
         // === ATTN BLOCK ===
         let residual_attn = xs_4d;
         let (y_attn, post_attn, comb_attn) = mhc.attn_pre(residual_attn)?;
+        v4_nan_dbg(&y_attn, &format!("L{li}.attn_pre.y"));
+        v4_nan_dbg(&post_attn, &format!("L{li}.attn_pre.post"));
+        v4_nan_dbg(&comb_attn, &format!("L{li}.attn_pre.comb"));
         let y_attn_normed = self.input_layernorm.forward(&y_attn)?;
+        v4_nan_dbg(&y_attn_normed, &format!("L{li}.input_layernorm"));
         let attn_out = self.attn.forward(
             &y_attn_normed,
             attention_mask,
@@ -1726,14 +1861,21 @@ impl DecoderLayer {
             metadata,
             flash_params,
         )?;
+        v4_nan_dbg(&attn_out, &format!("L{li}.attn_out"));
         let xs_4d = mhc.mix_post_4d(&attn_out, residual_attn, &post_attn, &comb_attn)?;
+        v4_nan_dbg(&xs_4d, &format!("L{li}.mix_post_attn"));
 
         // === FFN BLOCK ===
         let residual_ffn = &xs_4d;
         let (y_ffn, post_ffn, comb_ffn) = mhc.ffn_pre(residual_ffn)?;
+        v4_nan_dbg(&y_ffn, &format!("L{li}.ffn_pre.y"));
         let y_ffn_normed = self.post_attention_layernorm.forward(&y_ffn)?;
+        v4_nan_dbg(&y_ffn_normed, &format!("L{li}.post_attention_layernorm"));
         let ffn_out = self.moe_or_mlp.forward(&y_ffn_normed)?;
-        mhc.mix_post_4d(&ffn_out, residual_ffn, &post_ffn, &comb_ffn)
+        v4_nan_dbg(&ffn_out, &format!("L{li}.ffn_out"));
+        let out = mhc.mix_post_4d(&ffn_out, residual_ffn, &post_ffn, &comb_ffn)?;
+        v4_nan_dbg(&out, &format!("L{li}.mix_post_ffn"));
+        Ok(out)
     }
 }
 
@@ -2095,7 +2237,11 @@ impl DeepSeekV4 {
         let xs = if use_4d_mhc {
             // Lift to 4-D via the head's runtime (carries hc_mult).
             let mhc_head = self.mhc_head.as_ref().unwrap();
+            v4_nan_dbg(&xs_embed, "embed");
+            v4_stat_dbg(&xs_embed, "embed");
             let mut xs_4d = mhc_head.rt.lift_3d_to_4d(&xs_embed)?;
+            v4_nan_dbg(&xs_4d, "lift_3d_to_4d");
+            v4_stat_dbg(&xs_4d, "lift_3d_to_4d");
             for (i, layer) in self.layers.iter().enumerate() {
                 xs_4d = self.mapper.map(xs_4d, i)?;
                 xs_4d = layer.forward_4d(
@@ -2107,11 +2253,15 @@ impl DeepSeekV4 {
                         .as_ref()
                         .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
                     flash_params,
+                    i,
                 )?;
+                v4_stat_dbg(&xs_4d, &format!("L{i}"));
             }
             let xs_4d = xs_4d.to_device(&self.device)?;
             // Collapse via the learned global mHC head: 4-D → 3-D.
-            mhc_head.forward(&xs_4d)?
+            let collapsed = mhc_head.forward(&xs_4d)?;
+            v4_stat_dbg(&collapsed, "after_mhc_head");
+            collapsed
         } else {
             let mut xs = xs_embed;
             for (i, layer) in self.layers.iter().enumerate() {
@@ -2130,10 +2280,14 @@ impl DeepSeekV4 {
             xs.to_device(&self.device)?
         };
 
+        v4_stat_dbg(&xs, "before_norm");
         let xs = xs.apply(&self.norm)?;
+        v4_stat_dbg(&xs, "after_norm");
         let xs = extract_logits(&xs, context_lens)?;
 
-        self.lm_head.forward_autocast(&xs)
+        let logits = self.lm_head.forward_autocast(&xs)?;
+        v4_stat_dbg(&logits, "logits");
+        Ok(logits)
     }
 }
 
@@ -3068,11 +3222,14 @@ mod tests {
             sliding_window: 4,
         };
 
-        // Compress dispatch.
+        // Compress dispatch. T_xs = t_k (divisible by ratio) drives the real
+        // forward_from_xs compressed branch; uniform compressor hidden dim 1.
+        let xs = Tensor::zeros((1, t_k, 1), DType::F32, &device)?;
         let out = dsv4_attention(
             &q,
             &k,
             &v,
+            &xs,
             None,
             &flash_params,
             Some(&compressor),
@@ -3171,10 +3328,13 @@ mod tests {
             sliding_window: 8,
         };
 
+        // T_xs = t_k (divisible by ratio 128) → real forward_from_xs branch.
+        let xs = Tensor::zeros((1, t_k, 1), DType::F32, &device)?;
         let out = dsv4_attention(
             &q,
             &k,
             &v,
+            &xs,
             None,
             &flash_params,
             Some(&compressor),
@@ -3249,10 +3409,13 @@ mod tests {
         // Pass `Some(&compressor)` to be paranoid — Standard layers should
         // never invoke it. Compare bytewise against plain Sdpa.
         let compressor = V4Compressor::uniform(4, d, &device)?;
+        // Standard dispatch returns before the compressor; xs is unused.
+        let xs = Tensor::zeros((b, t, 1), DType::F32, &device)?;
         let out = dsv4_attention(
             &q,
             &k,
             &v,
+            &xs,
             None,
             &flash_params,
             Some(&compressor),
