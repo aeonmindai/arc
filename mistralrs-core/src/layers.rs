@@ -1643,6 +1643,42 @@ impl DeepSeekV2RotaryEmbedding {
             Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
         }
     }
+
+    /// Apply the INVERSE rotation (conjugate: cos, -sin) to the last `rope_dim`
+    /// dims of `x`, shaped `[B, H, T, head_dim]`. Used to de-rotate the V4 MLA
+    /// attention output, whose value dims carry the key's RoPE (reference
+    /// inference/model.py:534 `apply_rotary_emb(o[..., -rd:], freqs_cis, True)`).
+    /// RUN-161.
+    pub fn forward_inverse_tail(
+        &self,
+        x: &Tensor,
+        rope_dim: usize,
+        seqlen_offsets: &[usize],
+    ) -> Result<Tensor> {
+        let (_b, _h, seq_len, head_dim) = x.dims4()?;
+        let nope = head_dim - rope_dim;
+        let x_nope = x.narrow(3, 0, nope)?;
+        let rotated = if seqlen_offsets.len() == 1 {
+            let cos = self.cos.narrow(0, seqlen_offsets[0], seq_len)?;
+            let sin = self.sin.narrow(0, seqlen_offsets[0], seq_len)?.neg()?;
+            let x_pe = x.narrow(3, nope, rope_dim)?.contiguous()?;
+            candle_nn::rotary_emb::rope_i(&x_pe, &cos, &sin)?
+        } else {
+            let mut outs = Vec::new();
+            for (i, offset) in seqlen_offsets.iter().enumerate() {
+                let cos = self.cos.narrow(0, *offset, seq_len)?;
+                let sin = self.sin.narrow(0, *offset, seq_len)?.neg()?;
+                let x_pe = x
+                    .i(i)?
+                    .unsqueeze(0)?
+                    .narrow(3, nope, rope_dim)?
+                    .contiguous()?;
+                outs.push(candle_nn::rotary_emb::rope_i(&x_pe, &cos, &sin)?);
+            }
+            Tensor::cat(&outs, 0)?
+        };
+        Tensor::cat(&[&x_nope, &rotated], 3)?.contiguous()
+    }
 }
 
 #[derive(Debug, Clone)]

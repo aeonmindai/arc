@@ -392,8 +392,16 @@ impl Loader for NormalLoader {
                         let ser_artifacts = unsafe {
                             candle_core::safetensors::MmapedSafetensors::multi(serialized)?
                         };
-                        let mut total_pack_factors = 0;
-                        let total_tensors = ser_artifacts.tensors().len();
+                        // Size-weighted average pack factor. A plain count
+                        // average is dragged toward 1 by the many tiny
+                        // unquantized tensors (norms, router, mHC params,
+                        // pack_factor=1), which over-sizes an expert-dominated
+                        // model (e.g. V4 Flash) ~1.6x and spuriously offloads
+                        // layers to CPU. Weight each tensor's pack_factor by its
+                        // quantized byte size so the large QTIP tensors dominate.
+                        // (RUN-161)
+                        let mut weighted_pack = 0usize;
+                        let mut total_len = 0usize;
                         for (_, artifact) in ser_artifacts.tensors() {
                             let artifact = artifact.data();
                             // NOTE(EricLBuehler): isq type is ALWAYS byte 4 (5th) of the tensor.
@@ -418,11 +426,14 @@ impl Loader for NormalLoader {
                                 QuantizedSerdeType::Mxfp4 => IsqType::MXFP4.pack_factor(dtype),
                                 QuantizedSerdeType::Nvfp4 => IsqType::NVFP4.pack_factor(dtype),
                                 QuantizedSerdeType::Qtip => IsqType::QtipBitshift2.pack_factor(dtype),
+                                QuantizedSerdeType::TdMoeTucker => 1,
                             };
-                            total_pack_factors += pack_factor;
+                            let len = artifact.len();
+                            weighted_pack += len * pack_factor;
+                            total_len += len;
                         }
 
-                        total_pack_factors / total_tensors
+                        (weighted_pack / total_len.max(1)).max(1)
                     };
 
                     let layer_sizes_in_bytes = self.inner.layer_sizes_in_bytes(
@@ -603,6 +614,12 @@ impl Loader for NormalLoader {
         loading_isq |= topology_requires_post_quant;
         loading_isq |= self.config.from_uqff.is_some();
 
+        // RUN-161: signal UQFF loading to the per-expert MoE constructor so it
+        // builds DummyLayer placeholders (filled by the UQFF deserializer)
+        // instead of re-dequantizing+re-quantizing the base experts. Set every
+        // load (self-resetting) on the construction thread.
+        mistralrs_quant::set_loading_from_uqff(self.config.from_uqff.is_some());
+
         if self.config.imatrix.is_some() && self.config.calibration_file.is_some() {
             anyhow::bail!(
                 "`imatrix` and `calibration_file` were both specified, this is not allowed."
@@ -621,6 +638,15 @@ impl Loader for NormalLoader {
             } else {
                 device.clone()
             }
+        } else if self.config.from_uqff.is_some() {
+            // RUN-161: from-UQFF loads the ISQ layers (experts/attention) via
+            // deserialize directly onto their mapped (GPU) device, and the base
+            // expert weights are NOT loaded as BF16 (DummyLayer placeholders), so
+            // there is no OOM risk. Load to the primary device so non-ISQ weights
+            // (embeddings, norms, lm_head, compressor) land on GPU instead of
+            // being stranded on CPU -> "Expected CUDA storage" at forward time.
+            // Per-layer mapper.set_device still overrides for any CPU-mapped layer.
+            device.clone()
         } else {
             Device::Cpu
         };
@@ -891,6 +917,13 @@ impl Loader for NormalLoader {
         let should_serialize = self.config.write_uqff.is_some();
         let should_quantize_pass = loading_isq;
 
+        // When a post-load hook (e.g. TD-MoE Tucker factorization) will modify
+        // the quantized layers, defer the UQFF write until *after* the hook so
+        // the written file reflects the final (factored) model rather than the
+        // intermediate QTIP one. (RUN-161)
+        let defer_uqff_for_hooks = self.config.write_uqff.is_some()
+            && crate::pipeline::post_load_hooks::has_registered_hooks();
+
         if (should_quantize_pass || should_serialize) && self.config.from_uqff.is_none() {
             let imatrix_source = if should_quantize_pass {
                 match (
@@ -922,7 +955,11 @@ impl Loader for NormalLoader {
                 imatrix_source,
                 self.config.organization,
                 should_quantize_pass,
-                self.config.write_uqff.as_ref(),
+                if defer_uqff_for_hooks {
+                    None
+                } else {
+                    self.config.write_uqff.as_ref()
+                },
                 UqffFullSer {
                     tokenizer: &tokenizer,
                     template_filename: paths.get_template_filename(),
@@ -948,6 +985,35 @@ impl Loader for NormalLoader {
         // Hooks are no-ops when nothing has been registered.
         crate::pipeline::post_load_hooks::run_post_load_hooks(&mut *model)
             .map_err(|e| candle_core::Error::Msg(format!("post-load hook failed: {e}")))?;
+
+        // Deferred UQFF write: the post-load hook (TD-MoE) has now replaced the
+        // expert layers with their factored form, so serialize the final model.
+        // Serialize-only pass — no further quantization. (RUN-161)
+        if defer_uqff_for_hooks {
+            info!("Serializing post-hook (TD-MoE) model to UQFF.");
+            let multi_progress = Arc::new(new_multi_progress());
+            model.quantize(
+                None,
+                model.device().clone(),
+                self.config.topology.as_ref(),
+                silent,
+                None,
+                self.config.organization,
+                false,
+                self.config.write_uqff.as_ref(),
+                UqffFullSer {
+                    tokenizer: &tokenizer,
+                    template_filename: paths.get_template_filename(),
+                    generation_config: paths.get_gen_conf_filename(),
+                    config: config.clone(),
+                    processor_filename: &None,
+                    preprocessor_filename: &None,
+                    modules: None,
+                    module_paths: None,
+                },
+                multi_progress,
+            )?;
+        }
 
         // After ISQ, the CUDA driver's default memory pool may be holding large
         // amounts of freed memory (e.g. temporary BF16 tensors from INT4 dequant →

@@ -326,6 +326,9 @@ impl QuantizedSerde for RowParallelLayer {
             QuantizedSerdeType::Mxfp4 => MXFP4Layer::deserialize_ext_bias(data, device, guard)?,
             QuantizedSerdeType::Nvfp4 => NVFP4Layer::deserialize_ext_bias(data, device, guard)?,
             QuantizedSerdeType::Qtip => QtipLayer::deserialize_ext_bias(data, device, guard)?,
+            QuantizedSerdeType::TdMoeTucker => candle_core::bail!(
+                "TD-MoE Tucker layers deserialize directly, not via a distributed wrapper"
+            ),
         };
         Ok(Arc::new(Self {
             weight,
@@ -662,6 +665,9 @@ impl QuantizedSerde for ColumnParallelLayer {
             QuantizedSerdeType::Mxfp4 => MXFP4Layer::deserialize_ext_bias(data, device, guard)?,
             QuantizedSerdeType::Nvfp4 => NVFP4Layer::deserialize_ext_bias(data, device, guard)?,
             QuantizedSerdeType::Qtip => QtipLayer::deserialize_ext_bias(data, device, guard)?,
+            QuantizedSerdeType::TdMoeTucker => candle_core::bail!(
+                "TD-MoE Tucker layers deserialize directly, not via a distributed wrapper"
+            ),
         };
         Ok(Arc::new(Self { weight, bias }))
     }
@@ -965,6 +971,9 @@ impl QuantizedSerde for ReplicatedLayer {
             QuantizedSerdeType::Mxfp4 => MXFP4Layer::deserialize(data, device, comm, guard)?,
             QuantizedSerdeType::Nvfp4 => NVFP4Layer::deserialize(data, device, comm, guard)?,
             QuantizedSerdeType::Qtip => QtipLayer::deserialize(data, device, comm, guard)?,
+            QuantizedSerdeType::TdMoeTucker => {
+                crate::TuckerFactoredLayer::deserialize(data, device, comm, guard)?
+            }
         };
         Ok(Arc::new(Self(deserialized)))
     }
@@ -1916,10 +1925,17 @@ impl FusedExperts {
             fused_down_proj = apply_immediate_isq_always(fused_down_proj, &target_device)?;
 
             (fused_gate_proj, fused_up_proj, fused_down_proj)
-        } else if matches!(&quantization_config, Some(QuantizedConfig::Fp8 { .. })) {
+        } else if matches!(&quantization_config, Some(QuantizedConfig::Fp8 { .. }))
+            && experts_vb.pp("0").contains_tensor("gate_proj.weight")
+            && !crate::loading_from_uqff()
+        {
             // Per-expert format with FP8 quantization config.
             // The actual on-disk format may be FP8 E4M3 or INT4-packed-as-I8
             // (e.g. DeepSeek V4 Flash routed experts). Detect by probing shape.
+            // RUN-161: the `contains_tensor` guard makes from-uqff (which filters
+            // the base expert tensors out of the varbuilder) fall through to the
+            // DummyLayer path below instead of re-loading+dequantizing the base
+            // INT4 experts (~100s/layer) that the UQFF already holds.
             let weight_block_size = match quantization_config {
                 Some(QuantizedConfig::Fp8 { weight_block_size }) => weight_block_size.clone(),
                 _ => unreachable!(),
@@ -2070,6 +2086,27 @@ impl FusedExperts {
                         candle_core::DType::BF16,
                     )?;
 
+                    // RUN-161 bisect probe: log expert-0's dequantized BF16 gate
+                    // stats per layer (V4_STATS=1). If layer-2+ is already
+                    // all-positive/inflated here -> INT4 dequant bug; if balanced
+                    // here but bad at inference -> qtip bug.
+                    if i == 0 && std::env::var_os("V4_STATS").is_some() {
+                        if let Ok(v) = gate_bf16
+                            .to_dtype(candle_core::DType::F32)
+                            .and_then(|t| t.flatten_all())
+                            .and_then(|t| t.to_vec1::<f32>())
+                        {
+                            let n = v.len().max(1) as f32;
+                            let mean = v.iter().sum::<f32>() / n;
+                            let am = v.iter().map(|x| x.abs()).sum::<f32>() / n;
+                            let mn = v.iter().cloned().fold(f32::MAX, f32::min);
+                            let mx = v.iter().cloned().fold(f32::MIN, f32::max);
+                            eprintln!(
+                                "V4_DEQUANT [e0 gate_bf16] absmean={am:.5} mean={mean:+.5} range=[{mn:.4},{mx:.4}]"
+                            );
+                        }
+                    }
+
                     gate_proj_vec.push(gate_bf16);
                     up_proj_vec.push(up_bf16);
                     down_proj_vec.push(down_bf16);
@@ -2207,9 +2244,13 @@ impl FusedExperts {
 
                 (fused_gate_proj, fused_up_proj, fused_down_proj)
             }
-        } else if !experts_vb.pp("0").contains_tensor("gate_proj.weight") {
+        } else if crate::loading_from_uqff()
+            || !experts_vb.pp("0").contains_tensor("gate_proj.weight")
+        {
             // Handle the case where the layer is dummy (no tensors) during UQFF loading.
-            // Deserialize will handle it.
+            // Deserialize will handle it. RUN-161: `loading_from_uqff()` forces this
+            // path even when the base expert tensors are still present in the vb (the
+            // UQFF holds the pre-quantized experts, so skip the base dequant+quant).
             let fused_gate_proj: Arc<dyn QuantMethod> =
                 Arc::new(DummyLayer::new(QuantMethodConfig::Dummy)?);
             let fused_up_proj: Arc<dyn QuantMethod> =

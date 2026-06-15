@@ -3228,6 +3228,14 @@ impl NormalModelLoader for DeepSeekV4Loader {
     fn is_gptx(&self, _: &str) -> Result<bool> {
         Ok(true)
     }
+    fn supports_paged_attention(&self, _config: &str) -> Result<bool> {
+        // V4 MLA uses head_dim=512, which exceeds the PagedAttention kernel's
+        // supported head sizes (64/80/96/112/128/192/256). Paged attention
+        // therefore cannot run V4 — report unsupported so the pipeline
+        // auto-selects the non-paged SDPA path instead of crashing at runtime
+        // with "`head_size` must be one of ...". (RUN-161)
+        Ok(false)
+    }
     fn get_config_repr(&self, config: &str) -> Result<Box<dyn Debug>> {
         let cfg: crate::models::deepseek4::DeepSeekV4Config = serde_json::from_str(config)?;
         Ok(Box::new(cfg))

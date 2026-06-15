@@ -303,11 +303,14 @@ impl V4MHCLayerParams {
         let pre = (pre + self.rt.hc_eps)?;
 
         // post = 2 * sigmoid(post_block * s_post + b_post)
+        // NOTE: use affine() for the scalar *2 rather than a device-scalar
+        // Tensor::new(2f32, device) — the latter is a per-call CPU->GPU sync
+        // (CLAUDE.md pitfall #5) that breaks CUDA-graph capture of the decode
+        // forward. affine folds the constant into the kernel, no allocation.
         let post_sig = candle_nn::ops::sigmoid(
             &(post_block.broadcast_mul(&s_post)?.broadcast_add(&b_post)?),
         )?;
-        let two = Tensor::new(2f32, post_sig.device())?;
-        let post = post_sig.broadcast_mul(&two)?;
+        let post = post_sig.affine(2.0, 0.0)?;
 
         // comb = sinkhorn_normalize(comb_block * s_comb + b_comb)
         let comb_pre = comb_block

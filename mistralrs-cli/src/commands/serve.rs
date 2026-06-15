@@ -171,7 +171,10 @@ pub(crate) fn convert_to_model_selected(model_type: &ModelType) -> Result<ModelS
                     .as_ref()
                     .map(|p| p.to_string_lossy().to_string()),
                 organization: quantization.isq_organization,
-                write_uqff: None,
+                // RUN-161: allow writing a UQFF from `serve` via env so one
+                // load can both serve and snapshot the quantized weights for
+                // fast --from-uqff reloads. (serve normally hardcodes None.)
+                write_uqff: std::env::var_os("ARC_WRITE_UQFF").map(std::path::PathBuf::from),
                 from_uqff: quantization.from_uqff.clone(),
                 imatrix: quantization.imatrix.clone(),
                 calibration_file: quantization.calibration_file.clone(),

@@ -116,6 +116,20 @@ pub fn dsv4_attention(
         return Sdpa.run_attention(q, k, v, attention_mask, Some(flash_params), sdpa_params);
     };
 
+    // ---- Short context (<= sliding_window): dense over all tokens. --------
+    // The reference (inference/model.py sparse_attn) attends to the union of
+    // window + compressed tokens; when the whole context fits the sliding
+    // window there is nothing to compress and every token is in-window, so the
+    // correct attention is plain dense SDPA. This is the path taken by every
+    // short-context decode step; the 0.5/0.5 compressed+local blend below only
+    // applies once the context exceeds the window. Without this, decode (>=ratio
+    // history) hit the blend and collapsed to repeated newlines even though
+    // prefill (<ratio history -> dense fallback) was correct. (RUN-161)
+    let t_k = k.dim(2)?;
+    if t_k <= cfg.sliding_window {
+        return Sdpa.run_attention(q, k, v, attention_mask, Some(flash_params), sdpa_params);
+    }
+
     let ratio = cfg.compress_ratio.ratio();
     // The real V4 compressor (`forward_from_xs`) projects the layer input
     // `xs` ([B, T, hidden]) into compressed K/V — it operates on the hidden

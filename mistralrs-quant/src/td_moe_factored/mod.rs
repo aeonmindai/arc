@@ -29,13 +29,17 @@
 
 use std::{
     borrow::Cow,
+    io::Cursor,
     sync::{atomic::AtomicUsize, Arc},
 };
 
+use byteorder::{LittleEndian, ReadBytesExt};
 use candle_core::{DType, Device, Result, Tensor};
 
 use crate::{
+    utils::{deserialize_tensor, serialize_tensor, version_is_compatible, UQFF_VERSION},
     DistributedKind, IsqType, QuantMethod, QuantMethodConfig, QuantizeOntoGuard, QuantizedSerde,
+    QuantizedSerdeType,
 };
 
 /// Tucker decomposition core + factor matrices, kept in factored form for
@@ -467,12 +471,50 @@ impl QuantizedSerde for TuckerFactoredLayer {
         "td-moe-tucker-factored"
     }
     fn isq_serde_supported(&self) -> bool {
-        false
+        true
     }
     fn serialize(&self) -> Result<Cow<'_, [u8]>> {
-        // UQFF persistence for factored Tucker is out of scope here; the layer
-        // is reconstructed at every model load via the TD-MoE post-load hook.
-        candle_core::bail!("TuckerFactoredLayer does not yet support UQFF serialization")
+        // Persist the four Tucker factors so the (expensive, CPU) decomposition
+        // can be skipped on subsequent `--from-uqff` loads. `serialize_tensor`
+        // already encodes each tensor's dtype+shape, so the layer's compute
+        // dtype is recovered from `g_core` on deserialize. (RUN-161)
+        let mut buffer = Vec::new();
+        buffer.extend(&UQFF_VERSION.to_le_bytes());
+        buffer.push(QuantizedSerdeType::TdMoeTucker as u8);
+        serialize_tensor(&mut buffer, &self.g_core)?;
+        serialize_tensor(&mut buffer, &self.u1)?;
+        serialize_tensor(&mut buffer, &self.u2)?;
+        serialize_tensor(&mut buffer, &self.u3)?;
+        Ok(Cow::from(buffer))
+    }
+    fn deserialize(
+        data: Cow<[u8]>,
+        device: &Device,
+        _comm: &Arc<crate::Comm>,
+        guard: QuantizeOntoGuard,
+    ) -> Result<Arc<dyn QuantMethod>>
+    where
+        Self: Sized,
+    {
+        let mut buffer = Cursor::new(data.to_vec());
+        let version = buffer.read_u32::<LittleEndian>()?;
+        version_is_compatible(version)?;
+        let isq_type = buffer.read_u8()? as usize;
+        if isq_type != QuantizedSerdeType::TdMoeTucker as usize {
+            candle_core::bail!(
+                "ISQ type ({isq_type}) doesn't match expected TD-MoE Tucker type {}",
+                QuantizedSerdeType::TdMoeTucker as usize
+            );
+        }
+        let _acquired = guard.acquire(device);
+        let g_core = deserialize_tensor(&mut buffer, device)?;
+        let u1 = deserialize_tensor(&mut buffer, device)?;
+        let u2 = deserialize_tensor(&mut buffer, device)?;
+        let u3 = deserialize_tensor(&mut buffer, device)?;
+        let dtype = g_core.dtype();
+        Ok(Arc::new(TuckerFactoredLayer::from_factors(
+            g_core, u1, u2, u3, dtype,
+        )?))
     }
 }
 

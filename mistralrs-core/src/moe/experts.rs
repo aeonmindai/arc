@@ -514,18 +514,24 @@ impl MoEExperts {
                 .gather_forward_autocast(&xs, topk_ids)?;
             crate::models::deepseek4::v4_stat_dbg(&gate, "exp.gate");
             crate::models::deepseek4::v4_stat_dbg(&up, "exp.up");
-            // V4 clamped SwiGLU: clamp gate/up to [-limit, limit] before the
-            // activation. The model was trained with this clamp; without it,
-            // experts whose activations exceed the limit explode (RUN-161).
+            // V4 clamped SwiGLU, computed in F32 for stability — matches
+            // reference inference/model.py:596-606: gate=w1(x).float(),
+            // up=w3(x).float(); up clamped to [-limit, limit] but gate clamped
+            // ONLY on the max side; silu(gate)*up in f32, then back to the model
+            // dtype for the down projection. (Previously both clamped both-sided
+            // and computed in bf16.) RUN-161.
+            let out_dtype = gate.dtype();
+            let gate = gate.to_dtype(candle_core::DType::F32)?;
+            let up = up.to_dtype(candle_core::DType::F32)?;
             let (gate, up) = if let Some(limit) = self.swiglu_limit {
                 let limit = limit as f64;
-                (gate.clamp(-limit, limit)?, up.clamp(-limit, limit)?)
+                (gate.clamp(-1e30, limit)?, up.clamp(-limit, limit)?)
             } else {
                 (gate, up)
             };
             let act_gate = gate.apply(&self.act)?;
             crate::models::deepseek4::v4_stat_dbg(&act_gate, "exp.act_gate");
-            let prod = (up * act_gate)?;
+            let prod = (up * act_gate)?.to_dtype(out_dtype)?;
             crate::models::deepseek4::v4_stat_dbg(&prod, "exp.prod");
             let down = weights
                 .fused_down_proj

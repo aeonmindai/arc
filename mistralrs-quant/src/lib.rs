@@ -82,7 +82,7 @@ pub use mxfp4::MXFP4Layer;
 pub use nvfp4::NVFP4Layer;
 pub use pending_layer::PendingIsqLayer;
 pub use pertensor_fp8::PerTensorFP8Linear;
-pub use qtip::{QtipLayer, QtipMode};
+pub use qtip::{QtipLayer, QtipMode, QtipPackedView};
 pub use td_moe_factored::TuckerFactoredLayer;
 pub use unquantized::UnquantLinear;
 pub use utils::flash_attn_sinks_metal;
@@ -127,6 +127,20 @@ pub struct ImmediateIsqMatch {
 
 thread_local! {
     static ENGINE_IMMEDIATE_ISQ: std::cell::RefCell<Option<ImmediateIsqParams>> = const { std::cell::RefCell::new(None) } ;
+    static LOADING_FROM_UQFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Mark whether the current load is deserializing from a UQFF file. When true,
+/// the per-expert MoE constructor builds DummyLayer placeholders instead of
+/// re-loading + dequantizing + re-quantizing the base experts (~100s/layer) that
+/// the UQFF already holds; the UQFF deserializer then fills the placeholders.
+/// Self-resetting: every load sets it to its own `from_uqff` state. (RUN-161)
+pub fn set_loading_from_uqff(v: bool) {
+    LOADING_FROM_UQFF.with(|c| c.set(v));
+}
+
+pub fn loading_from_uqff() -> bool {
+    LOADING_FROM_UQFF.with(|c| c.get())
 }
 
 pub fn set_immediate_isq(isq: Option<IsqType>, predicates: Vec<Regex>) {
@@ -741,10 +755,13 @@ impl IsqType {
             // NVFP4: 4 bits per value + 1 byte scale per 16 values + tiny per-tensor scale
             // (2 * 16 bytes) / (8 + 1 bytes) ≈ 3.56 → 3
             Self::NVFP4 => 3,
-            // QTIP 2-bit: 2 bits per weight + tiny per-row fp32 scale + shared LUT
-            // For BF16 (2 bytes): (2*8)/(2) = 8 → use Q2K's factor as proxy
-            Self::QtipBitshift2 => (dtype.size_in_bytes() * GgmlDType::Q2K.block_size())
-                .div_ceil(GgmlDType::Q2K.type_size()),
+            // QTIP 2-bit: 2 bits per weight + tiny per-row fp32 scale + shared LUT.
+            // True factor vs an N-bit dtype = (8*size_in_bytes)/2 = size_in_bytes*4
+            // (e.g. BF16 -> 8). The old Q2K proxy (~2.6 bits/wt) returned 7, a ~14%
+            // overcount that spuriously offloads V4 Flash layers to CPU at its
+            // 95%-of-80GB fit. The per-row scale + shared LUT overhead is
+            // negligible vs the 2-bit blocks. (RUN-161)
+            Self::QtipBitshift2 => dtype.size_in_bytes() * 4,
         }
     }
 
@@ -759,10 +776,21 @@ impl IsqType {
             | IsqType::AFQ6
             | IsqType::AFQ8
             | IsqType::MXFP4
-            | IsqType::NVFP4
-            | IsqType::QtipBitshift2 => {
+            | IsqType::NVFP4 => {
                 // Use 1 because our HQQ quantizes on the GPU
                 Some(1.try_into().unwrap())
+            }
+            IsqType::QtipBitshift2 => {
+                // QTIP quantizes on the CPU (per-row trellis search), not the
+                // GPU. Greedy is fast enough single-threaded; Viterbi is ~10x
+                // heavier and must use all cores or a full requantize takes
+                // hours. The per-tensor build is sequential, so the per-row
+                // par_iter is memory-safe at full width. (RUN-161)
+                if std::env::var_os("ARC_QTIP_EXPERT_VITERBI").is_some() {
+                    None
+                } else {
+                    Some(1.try_into().unwrap())
+                }
             }
             IsqType::F8E4M3 | IsqType::F8Q8 => None,
             IsqType::Q2K
@@ -857,6 +885,7 @@ pub enum QuantizedSerdeType {
     Mxfp4 = 6,
     Nvfp4 = 7,
     Qtip = 8,
+    TdMoeTucker = 9,
 }
 
 impl TryFrom<usize> for QuantizedSerdeType {
@@ -872,6 +901,7 @@ impl TryFrom<usize> for QuantizedSerdeType {
             6 => Ok(Self::Mxfp4),
             7 => Ok(Self::Nvfp4),
             8 => Ok(Self::Qtip),
+            9 => Ok(Self::TdMoeTucker),
             other => candle_core::bail!("QuantizedSerdeType {other} is invalid."),
         }
     }
@@ -1039,6 +1069,13 @@ pub trait QuantMethod: Send + Sync + Debug + QuantizedSerde {
     ) -> Result<Arc<dyn QuantMethod>>;
 
     fn unquant_weight_bias(&self) -> Option<(Tensor, Option<Tensor>)> {
+        None
+    }
+
+    /// Borrowed view of QTIP packed trellis weights, for custom decode paths
+    /// (e.g. `arc-cuda-graph`) that read the raw 2-bit bytes instead of
+    /// dequantizing to a dense BF16 weight. Returns `None` for non-QTIP methods.
+    fn qtip_packed(&self) -> Option<crate::qtip::QtipPackedView<'_>> {
         None
     }
 

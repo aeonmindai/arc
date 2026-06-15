@@ -160,4 +160,55 @@ extern "C" {
         num_symbols: i32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
+
+    // ----- On-device MoE gather + fused decode + gemv (capturable decode) -----
+    //
+    // Reads each pair's expert id from `d_indices` ON-DEVICE (no host sync),
+    // offsets into the 3-D stacked-expert `d_packed`/`d_row_scales`, and writes
+    // `d_y[pair, row] = sum_k W_expert[row,k] * x[pair,k]`. `d_x_rotated` must
+    // already be in the QTIP-rotated frame. n_pairs = n_tokens * top_k.
+    pub(crate) fn launch_qtip_gather_gemv_v2_k4_l16_bf16(
+        d_packed: *const u8,
+        d_row_scales: *const f32,
+        d_lut: *const f32,
+        d_x_rotated: *const bf16,
+        d_indices: *const u32,
+        d_y: *mut bf16,
+        n_rows: i32,
+        packed_per_row: i32,
+        num_symbols: i32,
+        n_pairs: i32,
+        num_experts: i32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
+    pub(crate) fn launch_qtip_gather_gemv_v2_k4_l16_f16(
+        d_packed: *const u8,
+        d_row_scales: *const f32,
+        d_lut: *const f32,
+        d_x_rotated: *const f16,
+        d_indices: *const u32,
+        d_y: *mut f16,
+        n_rows: i32,
+        packed_per_row: i32,
+        num_symbols: i32,
+        n_pairs: i32,
+        num_experts: i32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
+    pub(crate) fn launch_qtip_gather_gemv_v2_k4_l16_f32(
+        d_packed: *const u8,
+        d_row_scales: *const f32,
+        d_lut: *const f32,
+        d_x_rotated: *const f32,
+        d_indices: *const u32,
+        d_y: *mut f32,
+        n_rows: i32,
+        packed_per_row: i32,
+        num_symbols: i32,
+        n_pairs: i32,
+        num_experts: i32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
 }

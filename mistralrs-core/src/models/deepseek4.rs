@@ -352,17 +352,14 @@ impl DeepSeekV4Config {
     }
 
     fn softmax_scale(&self) -> f32 {
-        let mut softmax_scale = 1.0 / (self.head_dim as f32).sqrt();
-        if let Some(DeepSeekV2RopeScaling::Yarn {
-            mscale_all_dim,
-            factor,
-            ..
-        }) = self.rope_scaling
-        {
-            let mscale = DeepSeekV2RotaryEmbedding::yarn_get_mscale(factor, mscale_all_dim);
-            softmax_scale = softmax_scale * mscale * mscale;
-        }
-        softmax_scale
+        // V4 uses a PURE head_dim^-0.5 attention scale with NO YaRN mscale.
+        // Reference inference/model.py:464 is `self.softmax_scale = head_dim ** -0.5`
+        // and precompute_freqs_cis applies no mscale to the rope magnitudes
+        // (torch.polar(ones, freqs)). The previous `* mscale * mscale` (~1.63x for
+        // factor=16) over-scaled the attention logits -> softmax too sharp ->
+        // over-peaked attention -> degraded generation quality. V2/V3 used mscale
+        // here, but V4 does not. (RUN-161)
+        1.0 / (self.head_dim as f32).sqrt()
     }
 }
 
@@ -1076,6 +1073,21 @@ impl Attention {
             .reshape((bs, seq_len, self.num_attention_heads, head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
+        // V4: per-head RMS-normalize Q over head_dim before RoPE. Reference
+        // inference/model.py:498 `q *= rsqrt(q.square().mean(-1)+eps)`. This is
+        // SEPARATE from q_norm (which normalizes q_lora_rank inside self.q).
+        // Missing it leaves Q ~30x too small -> near-uniform attention scores
+        // -> the model cannot attend -> word-salad output (RUN-161).
+        let q = {
+            let inv_rms = q
+                .sqr()?
+                .mean_keepdim(candle_core::D::Minus1)?
+                .affine(1.0, self.cfg.rms_norm_eps)?
+                .recip()?
+                .sqrt()?;
+            q.broadcast_mul(&inv_rms)?
+        };
+        v4_stat_dbg(&q, "attn.q_normed");
 
         // 2. K/V projection: single fused wkv. [B, T, hidden] → [B, T,
         //    head_dim] → kv_norm → reshape to [B, num_kv_heads=1, T,
@@ -1095,11 +1107,24 @@ impl Attention {
         v4_nan_dbg(&q, "attn.q_rope");
         v4_nan_dbg(&k, "attn.k_rope");
 
+        // V4 QAT: FP8-simulate the non-rope dims of K (reference model.py:506
+        // `act_quant(kv[..., :-rd], 64, ..., inplace=True)`). The model was
+        // trained with the KV non-rope dims round-tripped through block-wise
+        // FP8; feeding full BF16 is out-of-distribution. V=K so v inherits it.
+        let k = act_quant_kv_nope(&k, self.cfg.qk_rope_head_dim)?;
+        v4_stat_dbg(&k, "attn.k_actquant");
+
         // 4. V4: K and V come from the same wkv tensor. The kernel treats
         //    the wkv output as both K (for scores) and V (for weighted
         //    sum). This is the MLA "absorb V into K" trick at scale.
         //    Audit §3 ("absorbed the MLA split into a single fused output").
-        let v = k.clone();
+        //
+        // Use copy() not clone(): clone() shares the storage Arc<RwLock>, so k
+        // and v alias the same storage. PagedAttention's reshape_and_cache is an
+        // in-place op that write-locks and read-locks that storage -> RwLock
+        // self-deadlock (the dummy-run hang). copy() gives v its own storage.
+        // Cheap here: MQA means 1 KV head. (RUN-161)
+        let v = k.copy()?;
 
         // 5. Attention dispatch (RUN-155 + RUN-167).
         //
@@ -1225,11 +1250,33 @@ impl Attention {
         //    LoRA. attn_out shape: [B, n_heads, T, head_dim].
         //    Audit §8 P1 item 12 — per-group einsum("tgd,grd->tgr").
         v4_nan_dbg(&attn_out, "attn.sdpa_out");
-        attn_out = if attention_mask.is_some() {
-            attn_out.transpose(1, 2)?.reshape((bs, seq_len, ()))?
+        // Normalize to [B, H, T, head_dim]. Three input layouts reach here:
+        //   * PagedAttention (Standard layers) returns 3-D [B*T, H, head_dim].
+        //   * SDPA prefill (mask present) is already 4-D [B, H, T, head_dim].
+        //   * SDPA decode (no mask) comes back 4-D [B, T, H, head_dim].
+        // Without the 3-D case, paged decode transposes [B*T,H,D] -> [.,D,H] and
+        // hits forward_inverse_tail with a rank-3 tensor -> "unexpected rank,
+        // expected: 4, got: 3". (RUN-161)
+        let attn_out_bhtd = if attn_out.rank() == 3 {
+            let (_bt, h, hd) = attn_out.dims3()?;
+            attn_out.reshape((bs, seq_len, h, hd))?.transpose(1, 2)?
+        } else if attention_mask.is_some() {
+            attn_out.clone()
         } else {
-            attn_out.reshape((bs, seq_len, ()))?
+            attn_out.transpose(1, 2)?
         };
+        // V4: inverse-RoPE the last qk_rope_head_dim dims of the attention
+        // output. V=K carries the key's RoPE on those dims, so the output must
+        // be de-rotated (reference inference/model.py:534). Missing this leaves
+        // the value content wrongly position-rotated -> attention output is
+        // corrupted on rope dims -> incoherent generation (RUN-161).
+        let attn_out_bhtd = self.rotary_emb.forward_inverse_tail(
+            &attn_out_bhtd,
+            self.cfg.qk_rope_head_dim,
+            seqlen_offsets,
+        )?;
+        // -> [B, T, H*head_dim]
+        attn_out = attn_out_bhtd.transpose(1, 2)?.reshape((bs, seq_len, ()))?;
 
         let o_groups = self.cfg.o_groups.unwrap_or(1);
         let inner = if o_groups > 1 {
@@ -1434,6 +1481,7 @@ struct Moe {
     experts: MoEExperts,
     shared_experts: Option<Mlp>,
     gate: MoeGate,
+    layer_idx: usize,
 }
 
 impl Moe {
@@ -1496,15 +1544,38 @@ impl Moe {
             experts,
             shared_experts,
             gate,
+            layer_idx,
         })
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        // Tier-B TD-MoE probe: dump the real expert-input activations for a few
+        // representative layers so we can measure activation-aware low-rank
+        // error offline. Enable with ARC_CAPTURE_MOE_INPUT=<dir>. Overwrites on
+        // each call, so send the calibration prompt last and the file holds the
+        // real-data activations (not the warmup dummy run). (RUN-161)
+        if let Some(dir) = std::env::var_os("ARC_CAPTURE_MOE_INPUT") {
+            if matches!(self.layer_idx, 2 | 20 | 40) {
+                if let Ok(x_cpu) = xs
+                    .to_dtype(DType::F32)
+                    .and_then(|t| t.to_device(&Device::Cpu))
+                {
+                    let path = format!(
+                        "{}/moe_input_L{}.safetensors",
+                        dir.to_string_lossy(),
+                        self.layer_idx
+                    );
+                    let _ = x_cpu.save_safetensors("x", &path);
+                }
+            }
+        }
         let identity = xs.clone();
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
 
+        v4_stat_dbg(xs, "moe.input");
         let (topk_idx, topk_weight) = self.gate.forward(xs)?;
         v4_stat_dbg(&topk_weight, "moe.topk_w");
+        v4_stat_dbg(&topk_idx, "moe.topk_idx");
         let mut y = self.experts.forward(xs, topk_weight, &topk_idx)?;
         y = y.reshape((b_size, seq_len, hidden_dim))?;
         v4_stat_dbg(&y, "moe.routed");
@@ -1544,6 +1615,55 @@ impl MoeOrMlp {
             Self::Moe(moe) => moe.forward(xs),
         }
     }
+}
+
+/// V4 QAT: block-wise (64) FP8 round-trip on the non-rope dims of K, matching
+/// reference inference/model.py:506 `act_quant(kv[..., :-rd], 64, ..., inplace=True)`.
+/// Per 64-element block: scale = amax/448 (E4M3 max), quantize to F8E4M3, dequant
+/// back. Rope dims (last `rope_dim`) untouched. Computed in F32 (ref does FP32
+/// internally). (RUN-161)
+fn act_quant_kv_nope(k: &Tensor, rope_dim: usize) -> Result<Tensor> {
+    let head_dim = k.dim(D::Minus1)?;
+    let nope = head_dim - rope_dim;
+    const BLOCK: usize = 64;
+    if nope == 0 || nope % BLOCK != 0 {
+        return Ok(k.clone());
+    }
+    let k_nope = k.narrow(D::Minus1, 0, nope)?;
+    let k_rope = k.narrow(D::Minus1, nope, rope_dim)?;
+    let orig_dims = k_nope.dims().to_vec();
+    let mut blk = orig_dims.clone();
+    let last = blk.len() - 1;
+    blk[last] = nope / BLOCK;
+    blk.push(BLOCK);
+    let kb = k_nope.to_dtype(DType::F32)?.reshape(blk)?;
+    let amax = kb.abs()?.max_keepdim(D::Minus1)?;
+    let scale = (amax / 448.0)?.affine(1.0, 1e-12)?;
+    let scaled = kb.broadcast_div(&scale)?;
+    // candle's F8E4M3 cast has no CUDA kernel ("named symbol not found"), so the
+    // exact round-trip runs on CPU — but that forces a GPU<->CPU sync every
+    // attention layer (43 syncs/token), serializing decode. ARC_GPU_ACT_QUANT=1
+    // does an on-GPU E4M3 round-trip instead (round-to-nearest, 3 mantissa bits,
+    // exp range [-6,8], max 448) — removes the sync at a sub-ULP-of-FP8
+    // approximation the FP8-trained model tolerates. (RUN-161 throughput)
+    let dev = scaled.device().clone();
+    let rt = if std::env::var_os("ARC_GPU_ACT_QUANT").is_some() {
+        let ln2 = std::f64::consts::LN_2;
+        let x = scaled.clamp(-448f32, 448f32)?;
+        let ax = x.abs()?.clamp(1e-30f32, 1e30f32)?;
+        let e = ax.log()?.affine(1.0 / ln2, 0.0)?.floor()?.clamp(-6f32, 8f32)?; // floor(log2|x|)
+        let step = e.affine(ln2, -3.0 * ln2)?.exp()?; // 2^(e-3)
+        x.broadcast_div(&step)?.round()?.broadcast_mul(&step)?
+    } else {
+        scaled
+            .to_device(&candle_core::Device::Cpu)?
+            .to_dtype(DType::F8E4M3)?
+            .to_dtype(DType::F32)?
+            .to_device(&dev)?
+    };
+    let q = rt.broadcast_mul(&scale)?;
+    let k_nope_q = q.reshape(orig_dims)?.to_dtype(k.dtype())?;
+    Tensor::cat(&[&k_nope_q, &k_rope], D::Minus1)?.contiguous()
 }
 
 /// Debug-only NaN/Inf localizer. Enabled by setting `V4_NAN_DEBUG=1`.

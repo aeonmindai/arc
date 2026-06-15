@@ -319,12 +319,14 @@ pub fn fp8_blockwise_dequantize(
     )
 }
 
-// ── MX INT4 (packed-as-I8) blockwise dequantization ──────────────────────────
+// ── MXFP4 (E2M1, packed-as-I8) blockwise dequantization ──────────────────────
 //
-// DeepSeek V4 Flash stores routed-expert MoE weights as INT4 packed into I8:
-//   - Each I8 byte holds 2 signed 4-bit values (range [-8, 7]).
-//     Low nibble  = byte & 0x0F  (sign-extended)
-//     High nibble = (byte >> 4)  (already sign-extended by arithmetic shift of i8)
+// DeepSeek V4 Flash stores routed-expert MoE weights as MXFP4 (OCP microscaling
+// float4, E2M1) packed into I8, with an F8E8M0 block scale:
+//   - Each I8 byte holds 2 sign-magnitude FP4 values. Per nibble: MSB = sign,
+//     low 3 bits = E2M1 magnitude code -> {0,.5,1,1.5,2,3,4,6}.
+//     Low nibble  = byte & 0x0F ; High nibble = (byte >> 4) & 0x0F.
+//     (These are NOT two's-complement linear INT4 -- see decode note below.)
 //   - Weight shape on disk: [rows, cols/2]  (half the logical column count)
 //   - Scale shape: [rows/block_size[0], cols/block_size[1]]  (cols = unpacked count)
 //   - Scales are F32 (after F8E8M0 → F32 decode at load time).
@@ -376,16 +378,23 @@ impl MxInt4BlockwiseDequantize {
                         let byte_col = x / 2;
                         let byte = packed[y * packed_l.stride()[0] + byte_col] as i8;
 
-                        let int4_val: i8 = if x % 2 == 0 {
-                            // Low nibble: extract and sign-extend from 4 bits
-                            let lo = byte & 0x0F;
-                            if lo & 0x08 != 0 { lo | -16i8 } else { lo }
-                        } else {
-                            // High nibble: arithmetic right shift preserves sign
-                            byte >> 4
-                        };
-
-                        let dequant_val = (int4_val as f32) * s;
+                        // MXFP4 (E2M1) sign-magnitude decode. The 4-bit element
+                        // is float4 E2M1: MSB = sign, low 3 bits = E2M1 magnitude
+                        // code mapping to {0,.5,1,1.5,2,3,4,6}. It is NOT
+                        // two's-complement linear INT4 -- decoding it as such
+                        // injects a per-code DC bias (signed-nibble mean ~-1.05 ->
+                        // weight mean ~-0.015 -> row-sum ~-61), which amplifies the
+                        // expert input's DC offset into an all-positive gate/up
+                        // shift that explodes the MoE at the first compressed layer
+                        // (RUN-161). The on-disk histogram is periodic with period
+                        // 8 (count(n) ~= count(n+8)) -- the sign-magnitude
+                        // signature -- and the magnitude counts are non-monotonic,
+                        // matching E2M1's non-uniform levels.
+                        const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+                        let ub = byte as u8;
+                        let nib: u8 = if x % 2 == 0 { ub & 0x0F } else { ub >> 4 };
+                        let sign = if nib & 0x08 != 0 { -1.0f32 } else { 1.0f32 };
+                        let dequant_val = sign * E2M1[(nib & 0x07) as usize] * s;
 
                         // SAFETY: each thread writes to independent output positions
                         unsafe {

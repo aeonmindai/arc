@@ -375,10 +375,13 @@ impl QuantMethod for UnquantLinear {
                 n_quantized.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let bias = self.b.as_ref().map(|b| b.to_device(&device)).transpose()?;
                 // 3D weights are MoE expert stacks (e.g. [256, 2048, 4096]).
-                // Use Greedy mode: 5-10× faster than Viterbi, and the precision
-                // gap is negligible when source weights are already low-bit
-                // (INT4 → BF16 → 2-bit).
-                let mode = if self.w.dims().len() == 3 {
+                // Greedy is 5-10x faster than Viterbi, but the precision gap is
+                // NOT negligible: measured matmul cos vs FP4 is greedy=0.887 vs
+                // viterbi=0.962 (3x less error) on real V4 experts. Set
+                // ARC_QTIP_EXPERT_VITERBI=1 to quantize experts with Viterbi +
+                // Hadamard rotation (gather_forward applies the rotation). (RUN-161)
+                let expert_viterbi = std::env::var_os("ARC_QTIP_EXPERT_VITERBI").is_some();
+                let mode = if self.w.dims().len() == 3 && !expert_viterbi {
                     crate::QtipMode::Greedy
                 } else {
                     crate::QtipMode::Viterbi
