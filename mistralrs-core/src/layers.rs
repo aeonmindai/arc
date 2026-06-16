@@ -2239,10 +2239,54 @@ pub fn set_graph_mode_positions(positions: Option<Tensor>) {
     GRAPH_MODE_POSITIONS.with(|p| *p.borrow_mut() = positions);
 }
 
+/// Thread-local additive length mask for graph-mode fixed-capacity attention:
+/// `[*, sliding_window]`, 0 for valid (<= current position) slots and a large
+/// negative for the unwritten tail. Device-computed from the position so it's
+/// replay-safe. Unset -> the fixed-capacity attention runs without masking
+/// (finite but not yet correct; used to validate capture-launch). (RUN-161)
+#[cfg(feature = "cuda")]
+std::thread_local! {
+    static GRAPH_MODE_MASK: std::cell::RefCell<Option<Tensor>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "cuda")]
+pub fn set_graph_mode_mask(mask: Option<Tensor>) {
+    GRAPH_MODE_MASK.with(|m| *m.borrow_mut() = mask);
+}
+
+#[cfg(feature = "cuda")]
+pub fn graph_mode_mask() -> Option<Tensor> {
+    GRAPH_MODE_MASK.with(|m| m.borrow().clone())
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn set_graph_mode_mask(_mask: Option<Tensor>) {}
+#[cfg(not(feature = "cuda"))]
+pub fn graph_mode_mask() -> Option<Tensor> {
+    None
+}
+
 /// Check if graph-mode positions are set.
 #[cfg(feature = "cuda")]
 pub fn has_graph_mode_positions() -> bool {
     GRAPH_MODE_POSITIONS.with(|p| p.borrow().is_some())
+}
+
+/// Get the graph-mode positions tensor (device [B]). Used as the RoPE position,
+/// the KV-write slot, and the attention length mask source. (RUN-161)
+#[cfg(feature = "cuda")]
+pub fn graph_mode_positions() -> Option<Tensor> {
+    GRAPH_MODE_POSITIONS.with(|p| p.borrow().clone())
+}
+
+/// Non-cuda stubs so call sites compile without the cuda feature.
+#[cfg(not(feature = "cuda"))]
+pub fn has_graph_mode_positions() -> bool {
+    false
+}
+#[cfg(not(feature = "cuda"))]
+pub fn graph_mode_positions() -> Option<Tensor> {
+    None
 }
 
 #[derive(Debug, Clone)]

@@ -84,12 +84,16 @@ rotary_embedding(void *query,     // [num_tokens, num_heads, head_size]
                  int32_t num_heads, int32_t num_kv_heads, int64_t query_stride,
                  int64_t key_stride,
 
+                 void *stream_ptr, // cudaStream_t: candle's stream so the launch
+                                   // is recorded into a CUDA graph captured on
+                                   // that stream. Null => legacy default stream.
+
                  uint32_t dtype // 0 => f16; 1 => bf16; 2 => f32
 ) {
 
   dim3 grid(num_tokens);
   dim3 block(std::min(num_heads * rot_dim, 512));
-  const cudaStream_t stream = 0;
+  const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
   const bool is_neox_bool = is_neox;
 
   if (is_neox_bool) {

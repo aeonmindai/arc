@@ -28,6 +28,7 @@ mod gguf;
 mod gptq;
 mod hqq;
 mod imatrix;
+pub mod kvwrite;
 mod lora;
 mod mxfp4;
 pub mod name_remap;

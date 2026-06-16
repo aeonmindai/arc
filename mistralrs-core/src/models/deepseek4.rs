@@ -1222,6 +1222,36 @@ impl Attention {
                     )?
                 }
             },
+            // RUN-161 2c: CUDA-graph-capturable decode. When graph-mode device
+            // positions are set, write the new K/V at the device slot and read a
+            // FIXED `sliding_window`-wide window so every decode step is
+            // shape-identical (the caching allocator hits, the graph replays).
+            // C == sliding_window forces dsv4_attention's dense SDPA path. The
+            // unwritten tail slots are masked via the graph-mode length mask.
+            None if crate::layers::has_graph_mode_positions() && seq_len == 1 => {
+                let position = crate::layers::graph_mode_positions()
+                    .ok_or_else(|| candle_core::Error::Msg("graph positions unset".into()))?
+                    .to_dtype(candle_core::DType::U32)?;
+                let cap = self.sliding_window.max(1);
+                let (k_full, v_full) = kv_cache.append_graph(&k, &v, &position, cap)?;
+                // Use ONLY the fixed-width graph mask (matches the C-wide K).
+                // The eager `attention_mask` is kv_len-wide (growing) and would
+                // both mismatch the fixed window and break shape-constancy.
+                // None here => attends over zero-padding (finite, not yet
+                // correct) until set_graph_mode_mask is wired.
+                let gmask = crate::layers::graph_mode_mask();
+                super::dsv4_attention::dsv4_attention(
+                    &q,
+                    &k_full,
+                    &v_full,
+                    &xs_for_compressor,
+                    gmask.as_ref(),
+                    flash_params,
+                    self.compressor.as_ref(),
+                    &self.sdpa_params,
+                    dsv4_cfg,
+                )?
+            }
             None => {
                 let (k_cached, v_cached) = kv_cache.append(&k, &v)?;
                 super::dsv4_attention::dsv4_attention(

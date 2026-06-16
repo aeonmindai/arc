@@ -1983,9 +1983,14 @@ impl QuantMethod for QtipLayer {
                     .unwrap_or(8);
                 let ondevice_disabled = std::env::var("ARC_NO_QTIP_ONDEVICE_MOE").is_ok();
                 if !ondevice_disabled && n_tokens <= ondevice_max_tokens {
-                    if let Ok(out) = self.gather_forward_cuda_ondevice(a, indices) {
-                        return Ok(out);
-                    }
+                    // Decode regime: on-device ONLY, propagate its error. The
+                    // host fallback (`gather_forward_cuda`) does a `to_vec1` D2H
+                    // read of `indices` which, under CUDA-graph capture, is
+                    // recorded-not-executed -> returns garbage indices ->
+                    // out-of-bounds expert-weight read -> MMU fault. So we must
+                    // never silently fall back to it in the capturable path.
+                    // (RUN-161)
+                    return self.gather_forward_cuda_ondevice(a, indices);
                 }
                 if let Ok(out) = self.gather_forward_cuda(a, indices) {
                     return Ok(out);

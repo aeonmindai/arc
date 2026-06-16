@@ -72,6 +72,60 @@ impl SingleCache {
         Ok(())
     }
 
+    /// CUDA-graph-capturable append (RUN-161 Step 2c).
+    ///
+    /// Pre-grows `all_data` to the fixed `capacity_seq_len` on first use (no
+    /// realloc thereafter -> stable address for replay), then writes `src`
+    /// ([B,H,1,D]) at the device-held sequence slot `position` ([B] U32) via
+    /// the in-place `write_kv_inplace` kernel (launched on candle's stream, so
+    /// it records into a captured graph). Returns the FULL fixed-capacity
+    /// buffer `[B,H,capacity,D]`; the caller masks slots beyond the current
+    /// length using the same device position (so attention shape is constant
+    /// across decode steps and the graph can replay).
+    ///
+    /// Unlike `append`, this does NOT advance `current_seq_len`: under graph
+    /// replay the host position is meaningless; the device `position` is the
+    /// source of truth for both the write slot and the read mask.
+    ///
+    /// `read_capacity` is the FIXED window the caller attends over (V4 uses
+    /// `sliding_window`). The returned `[B,H,read_capacity,D]` view is a
+    /// constant-offset narrow, so the attention shape is identical every decode
+    /// step -> the caching allocator hits and the graph replays. Slots beyond
+    /// the current length are stale/zero and must be masked by the caller.
+    pub fn append_graph(
+        &mut self,
+        src: &Tensor,
+        position: &Tensor,
+        read_capacity: usize,
+    ) -> Result<Tensor> {
+        if self.dim != 2 {
+            candle_core::bail!(
+                "append_graph requires seq dim == 2 (got {}); V4 MQA cache is [B,H,T,D]",
+                self.dim
+            );
+        }
+        let seq_len = src.dim(self.dim)?;
+        if seq_len != 1 {
+            candle_core::bail!("append_graph is decode-only (src seq len must be 1, got {seq_len})");
+        }
+        // Buffer must be at least `read_capacity` along the seq dim. Reuse the
+        // existing (eager-populated) all_data so past K/V is present; only
+        // allocate if absent.
+        let need = read_capacity.max(self.capacity_seq_len);
+        if self.all_data.is_none() {
+            let mut shape = src.dims().to_vec();
+            shape[self.dim] = need;
+            let ad = Tensor::zeros(shape, src.dtype(), src.device())?;
+            self.all_data = Some(ad);
+        }
+        let ad = self.all_data.as_ref().unwrap();
+        // Device-slot write of the new token; `write_kv_inplace` uses the
+        // buffer's real capacity from all_data's dims, so the slot is correct.
+        mistralrs_quant::kvwrite::write_kv_inplace(ad, src, position)?;
+        // Fixed-offset window -> constant shape for capture/replay.
+        ad.narrow(self.dim, 0, read_capacity)
+    }
+
     pub fn append(&mut self, src: &Tensor) -> Result<()> {
         let seq_len = src.dim(self.dim)?;
         // This doesn't seem very idiomatic but because the creation can fail, it's tricky to use

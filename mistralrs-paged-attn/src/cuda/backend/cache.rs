@@ -67,7 +67,7 @@ pub fn copy_blocks(
             unreachable!()
         };
 
-        let (key_ptr, value_ptr) = match (&key_storage.slice, &value_storage.slice) {
+        let (key_ptr, value_ptr) = match (&*key_storage.slice, &*value_storage.slice) {
             (CudaStorageSlice::BF16(slice_key), CudaStorageSlice::BF16(slice_value)) => {
                 let (ptr_key, _key_guard) = slice_ptr(slice_key, 0);
                 let (ptr_value, _value_guard) = slice_ptr(slice_value, 0);
@@ -194,7 +194,7 @@ pub unsafe fn swap_blocks(
             let Storage::Cuda(dst_storage) = &*dst_storage else {
                 unreachable!()
             };
-            let (src_ptr, dst_ptr) = match (&src_storage.slice, &dst_storage.slice) {
+            let (src_ptr, dst_ptr) = match (&*src_storage.slice, &*dst_storage.slice) {
                 (CudaStorageSlice::BF16(slice_src), CudaStorageSlice::BF16(slice_dst)) => {
                     let (ptr_src, _src_guard) = slice_ptr(slice_src, src_layout.start_offset());
                     let (ptr_dst, _dst_guard) = slice_ptr(slice_dst, dst_layout.start_offset());

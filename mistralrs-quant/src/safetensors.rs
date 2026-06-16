@@ -188,7 +188,7 @@ fn convert_dummy(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
                 _ => unreachable!(),
             };
             let storage = candle_core::cuda_backend::CudaStorage {
-                slice,
+                slice: std::mem::ManuallyDrop::new(slice),
                 device: device.clone(),
             };
             Storage::Cuda(storage)

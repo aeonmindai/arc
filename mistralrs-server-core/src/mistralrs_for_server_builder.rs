@@ -1055,9 +1055,17 @@ fn init_device(force_cpu: bool, seed: Option<u64>) -> Result<candle_core::Device
         Device::Cpu
     } else if mistralrs_core::distributed::use_nccl() {
         Device::Cpu
+    } else if std::env::var_os("ARC_CAPTURE_STREAM").is_some() {
+        // CUDA-graph capture (RUN-161 Step 2) needs candle to run on a
+        // non-default, *capturable* stream. Upstream candle's `new_cuda`
+        // (via `cuda_if_available`) binds the legacy default stream (NULL),
+        // which `cuStreamBeginCapture` rejects. `new_cuda_with_stream` uses
+        // `context.new_stream()` -> a real stream the graph runner can capture.
+        // Off by default: a stream device conflicts with PagedAttention's
+        // expectations (see device_map::get_all_similar_devices) and NCCL;
+        // V4 decode uses neither, so opt in explicitly for capture.
+        Device::new_cuda_with_stream(0)?
     } else {
-        // Device::new_cuda uses our Candle fork which creates a real (non-NULL) stream
-        // instead of the legacy default stream. This enables CUDA graph capture.
         Device::cuda_if_available(0)?
     };
 
