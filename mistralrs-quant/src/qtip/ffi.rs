@@ -119,6 +119,17 @@ extern "C" {
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
+    pub(crate) fn launch_qtip_refine_scales_f32(
+        d_weight: *const f32,
+        d_packed: *const u8,
+        d_lut: *const f32,
+        d_row_scales: *mut f32,
+        n_rows: i32,
+        in_features: i32,
+        num_symbols: i32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
     // ----- Fused decode + gemv kernels (single-token decode fast path) -----
     //
     // `x_rotated` MUST already be in the QTIP-rotated frame (caller applies

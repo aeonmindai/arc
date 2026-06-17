@@ -658,9 +658,13 @@ impl QtipLayer {
             return Ok(None);
         }
 
-        // Move weight to CUDA F32 (caller may have BF16/F16 storage —
-        // candle does the cast on-device when src is already on CUDA).
-        let weight_cuda_f32 = weight.to_dtype(DType::F32)?.to_device(device)?;
+        // Move weight to CUDA F32. Order matters: when the source is CPU BF16
+        // (the 3-D MoE bake path passes CPU expert slices), casting BEFORE the
+        // transfer does a slow CPU bf16->f32 widening of every element AND then
+        // ships 2x the bytes (f32). Move bf16 to the device FIRST, then cast on
+        // the GPU -> half the PCIe traffic + the cast runs on the GPU. The
+        // bf16->f32 widening is exact, so this is bit-identical. RUN-161.
+        let weight_cuda_f32 = weight.to_device(device)?.to_dtype(DType::F32)?;
 
         // Build LUT on host (tiny, ~512 KiB) and upload.
         let lut_data = gaussian_lut();

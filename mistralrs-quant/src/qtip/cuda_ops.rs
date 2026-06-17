@@ -769,6 +769,21 @@ fn compute_row_scales_cuda(weight: &Tensor) -> Result<Tensor> {
 /// rows in flight per launch.
 const VITERBI_MAX_SCRATCH_BYTES: usize = 6 * 1024 * 1024 * 1024;
 
+/// Scratch budget (bytes) for one Viterbi launch's rows-in-flight. The 6 GB
+/// default was tuned for an 80 GB H100; on a larger card (H200 143 GB) it
+/// starves the kernel to ~438 rows in flight, leaving the SMs idle through
+/// every launch tail. Override with `ARC_VITERBI_SCRATCH_GB` to raise the
+/// rows-in-flight (bit-identical: same per-row Viterbi, just more rows per
+/// launch and fewer serial launches). RUN-161.
+fn viterbi_scratch_bytes() -> usize {
+    std::env::var("ARC_VITERBI_SCRATCH_GB")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|g| *g > 0.0)
+        .map(|g| (g * (1u64 << 30) as f64) as usize)
+        .unwrap_or(VITERBI_MAX_SCRATCH_BYTES)
+}
+
 /// 2^L = 65536, the trellis state count. Matches `LUT_SIZE` in `mod.rs`.
 const QTIP_LUT_SIZE: usize = 1 << super::L;
 
@@ -873,8 +888,12 @@ pub(crate) fn quantize_rows_cuda(
                 // Example: Qwen 7B mlp.down_proj (in=18944 → num_symbols=9472)
                 // gives bt_bytes_per_row ≈ 38 MB → ~158 rows in flight in 6 GB,
                 // vs ~10 rows under the old per-state backtrace.
+                // Per-row scratch = backtrace + cost_a + cost_b (the two cost
+                // ping-pong tables are each LUT_SIZE f32). Budget covers all
+                // three so a raised cap can't silently OOM on the cost buffers.
                 let bt_bytes_per_row = num_symbols * QTIP_PREFIX_COUNT;
-                let mut rows_in_flight = (VITERBI_MAX_SCRATCH_BYTES / bt_bytes_per_row).max(1);
+                let per_row_bytes = bt_bytes_per_row + 2 * QTIP_LUT_SIZE * 4;
+                let mut rows_in_flight = (viterbi_scratch_bytes() / per_row_bytes).max(1);
                 if rows_in_flight > n_rows {
                     rows_in_flight = n_rows;
                 }
@@ -922,6 +941,49 @@ pub(crate) fn quantize_rows_cuda(
         }
 
         drop(pkd_guard);
+    }
+
+    // Least-squares scale refinement: replace the heuristic max/3 scale with
+    // the MSE-optimal scale for the fixed state sequence chosen above.
+    // s* = dot(w, lut_values) / dot(lut_values, lut_values)
+    {
+        let (w_storage, w_layout) = weight_contig.storage_and_layout();
+        let w_storage = match &*w_storage {
+            Storage::Cuda(s) => s,
+            _ => candle_core::bail!("QTIP refine scales: weight must be CUDA storage"),
+        };
+        let (lut_storage, lut_layout) = lut_contig.storage_and_layout();
+        let lut_storage = match &*lut_storage {
+            Storage::Cuda(s) => s,
+            _ => candle_core::bail!("QTIP refine scales: lut must be CUDA storage"),
+        };
+        let (rs_storage, rs_layout) = row_scales.storage_and_layout();
+        let rs_storage = match &*rs_storage {
+            Storage::Cuda(s) => s,
+            _ => candle_core::bail!("QTIP refine scales: row_scales must be CUDA storage"),
+        };
+        let (w_ptr, _wg) =
+            slice_ptr(w_storage.as_cuda_slice::<f32>()?, w_layout.start_offset());
+        let (lut_ptr, _lg) = slice_ptr(
+            lut_storage.as_cuda_slice::<f32>()?,
+            lut_layout.start_offset(),
+        );
+        let (rs_ptr, _rg) =
+            slice_ptr(rs_storage.as_cuda_slice::<f32>()?, rs_layout.start_offset());
+        let (pkd_ptr, _pg) = slice_ptr(&packed_buf, 0);
+
+        unsafe {
+            ffi::launch_qtip_refine_scales_f32(
+                w_ptr as *const _,
+                pkd_ptr as *const _,
+                lut_ptr as *const _,
+                rs_ptr as *mut _,
+                n_rows as i32,
+                k_in as i32,
+                num_symbols as i32,
+                dev.cuda_stream().cu_stream(),
+            );
+        }
     }
 
     let packed_storage = CudaStorage::wrap_cuda_slice(packed_buf, dev.clone());
