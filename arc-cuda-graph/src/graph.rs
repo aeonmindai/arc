@@ -27,6 +27,13 @@ struct CapturedGraph {
     output: Tensor,
     /// Private memory pool for this graph's allocations
     pool: CUmemoryPool,
+    /// GPU pointer + byte size of the input_ids tensor used during capture.
+    /// Before replay, copy new token IDs here via cudaMemcpyAsync.
+    input_ids_ptr: u64,
+    input_ids_bytes: usize,
+    /// GPU pointer + byte size of the seqlen_offsets tensor.
+    seqlen_offsets_ptr: u64,
+    seqlen_offsets_bytes: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -242,12 +249,17 @@ impl CudaGraphRunner {
     }
 
     /// End capture, restore original pool, instantiate graph, cache it.
+    /// `input_ids` and `seqlen_offsets` are the tensors used during capture —
+    /// their GPU addresses are stored so `replay_with_inputs` can stage new
+    /// values before each replay.
     pub fn end_capture_and_cache(
         &mut self,
         batch_size: usize,
         output: Tensor,
         graph_pool: CUmemoryPool,
         original_pool: CUmemoryPool,
+        input_ids: &Tensor,
+        seqlen_offsets: &Tensor,
     ) -> candle_core::Result<Tensor> {
         // End capture. NOTE: the private pool stays installed as the device
         // default through instantiate + the first launch. Graph memory nodes
@@ -351,12 +363,21 @@ impl CudaGraphRunner {
         tracing::info!("CUDA graph: captured + launched for batch_size={batch_size}");
 
         let result = output.clone();
+
+        // Extract GPU pointers from the input tensors used during capture.
+        let (ids_ptr, ids_bytes) = Self::tensor_gpu_ptr(input_ids)?;
+        let (off_ptr, off_bytes) = Self::tensor_gpu_ptr(seqlen_offsets)?;
+
         self.graphs.insert(
             batch_size,
             CapturedGraph {
                 exec,
                 output,
                 pool: graph_pool,
+                input_ids_ptr: ids_ptr,
+                input_ids_bytes: ids_bytes,
+                seqlen_offsets_ptr: off_ptr,
+                seqlen_offsets_bytes: off_bytes,
             },
         );
         Ok(result)
@@ -373,6 +394,87 @@ impl CudaGraphRunner {
             cuDeviceSetMemPool(self.device_ordinal, original_pool);
             cuMemPoolDestroy(graph_pool);
         }
+    }
+
+    /// Extract the raw GPU pointer and byte size from a CUDA tensor.
+    fn tensor_gpu_ptr(t: &Tensor) -> candle_core::Result<(u64, usize)> {
+        let (storage, layout) = t.storage_and_layout();
+        let cuda_storage = match &*storage {
+            candle_core::Storage::Cuda(s) => s,
+            _ => candle_core::bail!("tensor_gpu_ptr: not a CUDA tensor"),
+        };
+        let elem_count = t.elem_count();
+        let dtype_size = t.dtype().size_in_bytes();
+        let ptr = match t.dtype() {
+            candle_core::DType::U32 => {
+                let slice = cuda_storage.as_cuda_slice::<u32>()?;
+                *slice.device_ptr() as u64 + (layout.start_offset() * dtype_size) as u64
+            }
+            candle_core::DType::I64 => {
+                let slice = cuda_storage.as_cuda_slice::<i64>()?;
+                *slice.device_ptr() as u64 + (layout.start_offset() * dtype_size) as u64
+            }
+            candle_core::DType::F32 => {
+                let slice = cuda_storage.as_cuda_slice::<f32>()?;
+                *slice.device_ptr() as u64 + (layout.start_offset() * dtype_size) as u64
+            }
+            other => candle_core::bail!("tensor_gpu_ptr: unsupported dtype {other:?}"),
+        };
+        Ok((ptr, elem_count * dtype_size))
+    }
+
+    /// Replay with new inputs. Copies `new_input_ids` and `new_seqlen_offsets`
+    /// into the captured graph's fixed GPU addresses, then launches the graph.
+    pub fn replay_with_inputs(
+        &self,
+        batch_size: usize,
+        new_input_ids: &Tensor,
+        new_seqlen_offsets: &Tensor,
+    ) -> candle_core::Result<Tensor> {
+        let captured = self.graphs.get(&batch_size).ok_or_else(|| {
+            candle_core::Error::Msg(format!("No graph for batch_size={batch_size}"))
+        })?;
+
+        // Stage new inputs into the captured addresses.
+        let (new_ids_ptr, new_ids_bytes) = Self::tensor_gpu_ptr(new_input_ids)?;
+        if new_ids_bytes != captured.input_ids_bytes {
+            candle_core::bail!(
+                "replay_with_inputs: input_ids size mismatch ({} vs {})",
+                new_ids_bytes, captured.input_ids_bytes
+            );
+        }
+        let (new_off_ptr, new_off_bytes) = Self::tensor_gpu_ptr(new_seqlen_offsets)?;
+        if new_off_bytes != captured.seqlen_offsets_bytes {
+            candle_core::bail!(
+                "replay_with_inputs: seqlen_offsets size mismatch ({} vs {})",
+                new_off_bytes, captured.seqlen_offsets_bytes
+            );
+        }
+
+        unsafe {
+            // D2D copy: new input data → captured graph's fixed addresses
+            cudaMemcpyAsync(
+                captured.input_ids_ptr as *mut _,
+                new_ids_ptr as *const _,
+                new_ids_bytes,
+                3, // cudaMemcpyDeviceToDevice
+                self.stream,
+            );
+            cudaMemcpyAsync(
+                captured.seqlen_offsets_ptr as *mut _,
+                new_off_ptr as *const _,
+                new_off_bytes,
+                3,
+                self.stream,
+            );
+
+            let s = cuGraphLaunch(captured.exec, self.stream);
+            if s != CUDA_SUCCESS {
+                candle_core::bail!("cuGraphLaunch failed: {s}");
+            }
+            cudaStreamSynchronize(self.stream);
+        }
+        Ok(captured.output.clone())
     }
 
     pub fn disable(&mut self) {

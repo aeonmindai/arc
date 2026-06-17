@@ -1510,7 +1510,7 @@ impl Pipeline for NormalPipeline {
                                                     "ARC capture: V4 forward RECORDED (bs={bs}); instantiating + launching"
                                                 );
                                                 match runner
-                                                    .end_capture_and_cache(bs, output, gp, op)
+                                                    .end_capture_and_cache(bs, output, gp, op, &input_ids, &seqlen_offsets)
                                                 {
                                                     Ok(out) => {
                                                         tracing::info!(
@@ -1548,16 +1548,19 @@ impl Pipeline for NormalPipeline {
                                 cap_result
                             } else if runner.has_graph(bs) {
                                 let t = std::time::Instant::now();
-                                match runner.replay(bs) {
-                                    Ok(_) => tracing::info!(
-                                        "ARC capture: REPLAY latency = {:?} (output discarded; correctness pending 2b/2c)",
-                                        t.elapsed()
-                                    ),
+                                match runner.replay_with_inputs(bs, &input_ids, &seqlen_offsets) {
+                                    Ok(out) => {
+                                        tracing::info!(
+                                            "ARC capture: REPLAY latency = {:?}",
+                                            t.elapsed()
+                                        );
+                                        Some(out)
+                                    }
                                     Err(e) => {
-                                        tracing::warn!("ARC capture: replay failed: {e}")
+                                        tracing::warn!("ARC capture: replay failed: {e}");
+                                        None
                                     }
                                 }
-                                None
                             } else {
                                 None
                             };
