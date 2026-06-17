@@ -56,15 +56,15 @@ def chat(question, max_tokens=30):
     return resp["choices"][0]["message"]["content"]
 
 
-def completion(prompt, max_tokens=10):
-    """Fallback: use /v1/completions (no chat template needed)."""
+def completion(prompt, max_tokens=30):
+    """Use DeepSeek V4 chat tokens via completion API."""
+    formatted = f"<｜begin▁of▁sentence｜><｜User｜>{prompt}<｜end▁of▁sentence｜><｜Assistant｜>"
     body = json.dumps({
         "model": "deepseek-ai/DeepSeek-V4-Flash",
-        "prompt": prompt,
+        "prompt": formatted,
         "max_tokens": max_tokens,
         "temperature": 0,
-        "repetition_penalty": 1.1,
-        "stop": ["\n\n", "\n"],
+        "stop": ["<｜end▁of▁sentence｜>"],
     }).encode()
     r = urllib.request.Request(
         f"{BASE_URL}/completions", data=body,
@@ -75,10 +75,7 @@ def completion(prompt, max_tokens=10):
 
 # Auto-detect: try chat first, fall back to completion
 def gen(question):
-    try:
-        return chat(question)
-    except Exception:
-        return completion(f"Question: {question}\nAnswer:")
+    return completion(question)
 
 
 def run(name, items):
