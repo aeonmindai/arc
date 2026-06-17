@@ -3246,7 +3246,11 @@ impl IsqModelLoader for DeepSeekV4Loader {
     fn isq_layer_regexes(&self, config: &str) -> Result<Vec<Regex>> {
         // V4 tensor regexes match the HF-mapped names (same paths as V3 since we
         // delegate to V3's MLA structure at the loader level).
-        let mut data = vec![Regex::new(r"lm_head\.(weight|bias)$")?];
+        // RUN-161: lm_head excluded from ISQ — quantizing the logit projection
+        // to 2-bit corrupts EOS probabilities and breaks chat/instruction-following
+        // (model outputs 1-2 tokens then EOS). Keeping lm_head at native precision
+        // costs ~1GB but preserves the output distribution.
+        let mut data = vec![];
         // RUN-161: 2-bit attention is OPT-IN via ARC_QUANT_ATTENTION; default keeps
         // attention at its native FP8 (coherent). The V4 checkpoint names the
         // projections `attn.{wq_a,wq_b,wkv,wo_a,wo_b}` (NOT the HF `self_attn.q_a_proj`
