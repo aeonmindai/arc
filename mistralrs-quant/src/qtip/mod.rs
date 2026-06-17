@@ -788,23 +788,48 @@ impl QtipLayer {
         let quant_device = device.clone();
         let move_back = matches!(quant_device, Device::Cuda(_)) && matches!(device, Device::Cpu);
 
-        for expert_idx in 0..e {
-            let expert_w = weight.narrow(0, expert_idx, 1)?.squeeze(0)?;
+        // RUN-161 expert-batching: the per-expert loop used to stream ONE expert
+        // at a time -> 256 CPU<->GPU blocking round-trips/projection, which
+        // dominate the bake (the GPU kernel itself is <1s). Quantize experts in
+        // BATCHES instead: narrow B experts [B,N,K], reshape to 2-D rows
+        // [B*N, K] (per-row rotation/scale/Viterbi is identical to the
+        // single-expert path), quantize in ONE call, reshape the packed result
+        // back to [B,N,packed]. Cuts host round-trips from E to E/B.
+        // B is memory-bounded: B*N*K*4 (F32 weight) + ~6GB Viterbi scratch must
+        // fit free VRAM during the bake. Default 16; tune via ARC_QTIP_EXPERT_BATCH.
+        let batch = std::env::var("ARC_QTIP_EXPERT_BATCH")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(16)
+            .clamp(1, e);
+
+        let mut expert_idx = 0usize;
+        while expert_idx < e {
+            let this_b = batch.min(e - expert_idx);
+            // [this_b, N, K] -> [this_b*N, K] (CPU reshape; concrete moves to GPU).
+            let chunk = weight.narrow(0, expert_idx, this_b)?;
+            let rows_2d = chunk.reshape((this_b * n, k_in))?;
             let layer = Self::quantize_with_options_concrete(
-                &expert_w,
+                &rows_2d,
                 None,
                 &quant_device,
                 mode,
                 use_rotation,
             )?;
 
-            if move_back {
-                blocks_slices.push(layer.blocks.to_device(device)?);
-                scales_slices.push(layer.row_scales.to_device(device)?);
+            // blocks [this_b*N, packed] -> [this_b, N, packed]; scales [this_b*N] -> [this_b, N].
+            let blk = if move_back {
+                layer.blocks.to_device(device)?
             } else {
-                blocks_slices.push(layer.blocks.clone());
-                scales_slices.push(layer.row_scales.clone());
-            }
+                layer.blocks.clone()
+            };
+            let scl = if move_back {
+                layer.row_scales.to_device(device)?
+            } else {
+                layer.row_scales.clone()
+            };
+            blocks_slices.push(blk.reshape((this_b, n, packed_per_row))?);
+            scales_slices.push(scl.reshape((this_b, n))?);
 
             if expert_idx == 0 {
                 shared_lut = Some(if move_back {
@@ -821,11 +846,12 @@ impl QtipLayer {
                 debug_assert_eq!(layer.lut.dims(), shared_lut.as_ref().unwrap().dims());
                 debug_assert_eq!(layer.rotation_block, shared_rotation_block);
             }
+            expert_idx += this_b;
         }
 
-        // Stack into 3-D layout: [E, N, packed_K] and [E, N].
-        let blocks_3d = Tensor::stack(&blocks_slices, 0)?;
-        let row_scales_2d = Tensor::stack(&scales_slices, 0)?;
+        // Concatenate per-batch [b_i, N, packed_K] chunks into [E, N, packed_K].
+        let blocks_3d = Tensor::cat(&blocks_slices, 0)?;
+        let row_scales_2d = Tensor::cat(&scales_slices, 0)?;
         debug_assert_eq!(blocks_3d.dims(), &[e, n, packed_per_row]);
         debug_assert_eq!(row_scales_2d.dims(), &[e, n]);
 

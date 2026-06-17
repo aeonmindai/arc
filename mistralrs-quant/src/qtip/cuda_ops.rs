@@ -879,9 +879,13 @@ pub(crate) fn quantize_rows_cuda(
                     rows_in_flight = n_rows;
                 }
 
-                let cost_a = dev.alloc_zeros::<f32>(rows_in_flight * QTIP_LUT_SIZE)?;
-                let cost_b = dev.alloc_zeros::<f32>(rows_in_flight * QTIP_LUT_SIZE)?;
-                let backtrace = dev.alloc_zeros::<u8>(rows_in_flight * bt_bytes_per_row)?;
+                // RUN-161: uninit alloc (not alloc_zeros) — the kernel fully
+                // writes cost_a at t=0, cost_b in Phase B, and backtrace in
+                // Phase C before any read, so zeroing GBs of scratch every
+                // matrix call is pure wasted bandwidth.
+                let cost_a = unsafe { dev.alloc::<f32>(rows_in_flight * QTIP_LUT_SIZE)? };
+                let cost_b = unsafe { dev.alloc::<f32>(rows_in_flight * QTIP_LUT_SIZE)? };
+                let backtrace = unsafe { dev.alloc::<u8>(rows_in_flight * bt_bytes_per_row)? };
 
                 let (ca_ptr, ca_guard) = slice_ptr(&cost_a, 0);
                 let (cb_ptr, cb_guard) = slice_ptr(&cost_b, 0);
