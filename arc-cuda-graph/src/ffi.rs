@@ -154,6 +154,11 @@ extern "C" {
         log_buffer: *mut u8,
         buffer_size: usize,
     ) -> u32;
+    // RUN-161 2b: instantiate with flags. AUTO_FREE_ON_LAUNCH (=1) frees any
+    // graph-owned memory allocations at the start of each launch, so a graph
+    // that contains memory-alloc nodes can be RE-launched (replayed). Without
+    // it, the 2nd cuGraphLaunch returns CUDA_ERROR_INVALID_VALUE (=1).
+    pub fn cuGraphInstantiateWithFlags(exec: *mut CUgraphExec, graph: CUgraph, flags: u64) -> u32;
     pub fn cuGraphLaunch(exec: CUgraphExec, stream: CUstream) -> u32;
     pub fn cuGraphExecDestroy(exec: CUgraphExec) -> u32;
     pub fn cuGraphDestroy(graph: CUgraph) -> u32;

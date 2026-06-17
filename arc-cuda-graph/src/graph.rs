@@ -269,15 +269,17 @@ impl CudaGraphRunner {
             candle_core::bail!("cuStreamEndCapture failed: {s}");
         }
 
-        // Instantiate (private pool still installed).
+        // Instantiate (private pool still installed). RUN-161 2b:
+        // AUTO_FREE_ON_LAUNCH (=1) so a graph with memory-alloc nodes can be
+        // RE-launched (replayed) -- otherwise the 2nd launch fails with
+        // INVALID_VALUE. Harmless if the graph has no alloc nodes.
+        const CU_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH: u64 = 1;
         let mut exec: CUgraphExec = std::ptr::null_mut();
         let s = unsafe {
-            cuGraphInstantiate_v2(
+            cuGraphInstantiateWithFlags(
                 &mut exec,
                 graph,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                0,
+                CU_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
             )
         };
         unsafe {
@@ -309,6 +311,26 @@ impl CudaGraphRunner {
         // the CUDA context and the process dies later with no diagnostic.
         // cudaError: 700 = illegalAddress, 719 = launchFailure, 1 = invalidValue.
         let sync = unsafe { cudaStreamSynchronize(self.stream) };
+        // RUN-161 diagnostic: measure the TRUE clean graph replay latency here,
+        // while the captured input tensors are still alive (no stale-input
+        // fault). 10 back-to-back launch+sync, report the best. Compare to the
+        // eager forward time to decide if the forward is dispatch- or
+        // kernel-bound (i.e. whether the graph can actually speed it up).
+        if sync == CUDA_SUCCESS {
+            let mut best = std::time::Duration::from_secs(3600);
+            for _ in 0..10 {
+                let t = std::time::Instant::now();
+                let ls = unsafe { cuGraphLaunch(exec, self.stream) };
+                unsafe { cudaStreamSynchronize(self.stream) };
+                if ls == CUDA_SUCCESS {
+                    let e = t.elapsed();
+                    if e < best {
+                        best = e;
+                    }
+                }
+            }
+            tracing::info!("ARC capture: CLEAN graph-launch best-of-10 = {best:?}");
+        }
         // Restore the original pool now that the graph's memory is materialized.
         // Subsequent replays reuse the already-allocated graph memory, so the
         // device default pool no longer needs to be the private one.

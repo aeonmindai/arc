@@ -3248,13 +3248,20 @@ impl IsqModelLoader for DeepSeekV4Loader {
         // delegate to V3's MLA structure at the loader level).
         let mut data = vec![
             Regex::new(r"lm_head\.(weight|bias)$")?,
-            // V4 attention: q_a/q_b (LoRA), kv_a/kv_b (still MLA-LoRA at this scaffolding tier), o_a/o_b (V4 LoRA)
-            Regex::new(r"layers\.(\d+)\.self_attn\.q_a_proj\.(weight|bias)$")?,
-            Regex::new(r"layers\.(\d+)\.self_attn\.q_b_proj\.(weight|bias)$")?,
-            Regex::new(r"layers\.(\d+)\.self_attn\.kv_a_proj_with_mqa\.(weight|bias)$")?,
-            Regex::new(r"layers\.(\d+)\.self_attn\.kv_b_proj\.(weight|bias)$")?,
-            Regex::new(r"layers\.(\d+)\.self_attn\.o_a_proj\.(weight|bias)$")?,
-            Regex::new(r"layers\.(\d+)\.self_attn\.o_b_proj\.(weight|bias)$")?,
+            // V4 attention. RUN-161 Phase D fix: the native checkpoint names the
+            // projections `attn.{wq_a,wq_b,wkv,wo_a,wo_b}` (NOT the HF
+            // `self_attn.q_a_proj` names), so the old HF-only regexes NEVER matched
+            // -> attention silently stayed FP8 despite `--isq qtip2`. Match native +
+            // HF + both `attn`/`self_attn` prefixes so qtip2 actually quantizes the
+            // attention projections to 2-bit (cuts bytes/token ~7.5GB -> ~3.4GB).
+            // q_norm/kv_norm/attn_sink are intentionally excluded (tiny + sensitive).
+            Regex::new(r"layers\.(\d+)\.(self_)?attn\.(wq_a|q_a_proj)\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.(self_)?attn\.(wq_b|q_b_proj)\.(weight|bias)$")?,
+            Regex::new(
+                r"layers\.(\d+)\.(self_)?attn\.(wkv|wkv_a|kv_a_proj_with_mqa|kv_b_proj)\.(weight|bias)$",
+            )?,
+            Regex::new(r"layers\.(\d+)\.(self_)?attn\.(wo_a|o_a_proj)\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.(self_)?attn\.(wo_b|o_b_proj)\.(weight|bias)$")?,
         ];
         let cfg: crate::models::deepseek4::DeepSeekV4Config = serde_json::from_str(config)?;
         for layer_idx in 0..cfg.num_hidden_layers {

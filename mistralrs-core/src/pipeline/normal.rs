@@ -1453,6 +1453,7 @@ impl Pipeline for NormalPipeline {
                                 if let candle_core::Device::Cuda(cd) = self.device() {
                                     cd.set_capture_mode(true);
                                 }
+                                let t_eager = std::time::Instant::now();
                                 let out = self.model.forward(
                                     &input_ids,
                                     &seqlen_offsets,
@@ -1460,6 +1461,11 @@ impl Pipeline for NormalPipeline {
                                     position_ids.clone(),
                                     paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
                                     &flash_meta,
+                                );
+                                let _ = self.device().synchronize();
+                                tracing::info!(
+                                    "ARC capture: EAGER forward (sync'd) = {:?}",
+                                    t_eager.elapsed()
                                 );
                                 if let candle_core::Device::Cuda(cd) = self.device() {
                                     cd.set_capture_mode(false);
