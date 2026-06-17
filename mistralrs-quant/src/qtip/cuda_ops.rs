@@ -943,10 +943,10 @@ pub(crate) fn quantize_rows_cuda(
         drop(pkd_guard);
     }
 
-    // Least-squares scale refinement: replace the heuristic max/3 scale with
-    // the MSE-optimal scale for the fixed state sequence chosen above.
-    // s* = dot(w, lut_values) / dot(lut_values, lut_values)
-    {
+    // Least-squares scale refinement: s* = dot(w, lut_values) / dot(lut_values, lut_values).
+    // BUG: produces cos=0.628 at full-size N=2048 (kernel replay issue under
+    // investigation). Gated behind ARC_QTIP_REFINE_SCALES=1 until fixed.
+    if std::env::var("ARC_QTIP_REFINE_SCALES").as_deref() == Ok("1") {
         let (w_storage, w_layout) = weight_contig.storage_and_layout();
         let w_storage = match &*w_storage {
             Storage::Cuda(s) => s,
