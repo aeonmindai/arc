@@ -3246,23 +3246,27 @@ impl IsqModelLoader for DeepSeekV4Loader {
     fn isq_layer_regexes(&self, config: &str) -> Result<Vec<Regex>> {
         // V4 tensor regexes match the HF-mapped names (same paths as V3 since we
         // delegate to V3's MLA structure at the loader level).
-        let mut data = vec![
-            Regex::new(r"lm_head\.(weight|bias)$")?,
-            // V4 attention. RUN-161 Phase D fix: the native checkpoint names the
-            // projections `attn.{wq_a,wq_b,wkv,wo_a,wo_b}` (NOT the HF
-            // `self_attn.q_a_proj` names), so the old HF-only regexes NEVER matched
-            // -> attention silently stayed FP8 despite `--isq qtip2`. Match native +
-            // HF + both `attn`/`self_attn` prefixes so qtip2 actually quantizes the
-            // attention projections to 2-bit (cuts bytes/token ~7.5GB -> ~3.4GB).
-            // q_norm/kv_norm/attn_sink are intentionally excluded (tiny + sensitive).
-            Regex::new(r"layers\.(\d+)\.(self_)?attn\.(wq_a|q_a_proj)\.(weight|bias)$")?,
-            Regex::new(r"layers\.(\d+)\.(self_)?attn\.(wq_b|q_b_proj)\.(weight|bias)$")?,
-            Regex::new(
-                r"layers\.(\d+)\.(self_)?attn\.(wkv|wkv_a|kv_a_proj_with_mqa|kv_b_proj)\.(weight|bias)$",
-            )?,
-            Regex::new(r"layers\.(\d+)\.(self_)?attn\.(wo_a|o_a_proj)\.(weight|bias)$")?,
-            Regex::new(r"layers\.(\d+)\.(self_)?attn\.(wo_b|o_b_proj)\.(weight|bias)$")?,
-        ];
+        let mut data = vec![Regex::new(r"lm_head\.(weight|bias)$")?];
+        // RUN-161: 2-bit attention is OPT-IN via ARC_QUANT_ATTENTION; default keeps
+        // attention at its native FP8 (coherent). The V4 checkpoint names the
+        // projections `attn.{wq_a,wq_b,wkv,wo_a,wo_b}` (NOT the HF `self_attn.q_a_proj`
+        // names), so these regexes match native + HF + both `attn`/`self_attn`
+        // prefixes. MEASURED (2026-06-17, H200): quantizing attention to 2-bit gave
+        // NO throughput gain (MLA is low-rank -> tiny byte fraction; the fp8_matmul
+        // cost is kernel inefficiency, not bytes) and broke coherence (garbage out).
+        // Re-enable only AFTER Phase D makes the forward memory-bound (and with
+        // Viterbi + calibration for quality). q_norm/kv_norm/attn_sink excluded.
+        if std::env::var_os("ARC_QUANT_ATTENTION").is_some() {
+            data.extend([
+                Regex::new(r"layers\.(\d+)\.(self_)?attn\.(wq_a|q_a_proj)\.(weight|bias)$")?,
+                Regex::new(r"layers\.(\d+)\.(self_)?attn\.(wq_b|q_b_proj)\.(weight|bias)$")?,
+                Regex::new(
+                    r"layers\.(\d+)\.(self_)?attn\.(wkv|wkv_a|kv_a_proj_with_mqa|kv_b_proj)\.(weight|bias)$",
+                )?,
+                Regex::new(r"layers\.(\d+)\.(self_)?attn\.(wo_a|o_a_proj)\.(weight|bias)$")?,
+                Regex::new(r"layers\.(\d+)\.(self_)?attn\.(wo_b|o_b_proj)\.(weight|bias)$")?,
+            ]);
+        }
         let cfg: crate::models::deepseek4::DeepSeekV4Config = serde_json::from_str(config)?;
         for layer_idx in 0..cfg.num_hidden_layers {
             if let Some(n_routed_experts) = cfg.n_routed_experts.filter(|_| {
