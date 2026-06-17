@@ -1228,100 +1228,54 @@ impl PackedExperts {
                                 "Detected INT4-packed MoE expert weights, dequantizing to BF16"
                             );
 
-                            for i in 0..num_local_experts {
-                                let expert_vb = vb.pp(i);
+                            // RUN-161: parallel INT4→BF16 dequant across experts.
+                            use rayon::prelude::*;
+                            let experts_dequant: Vec<candle_core::Result<(Arc<dyn QuantMethod>, Arc<dyn QuantMethod>, Arc<dyn QuantMethod>)>> =
+                                (0..num_local_experts)
+                                    .into_par_iter()
+                                    .map(|i| {
+                                        let expert_vb = vb.pp(i);
 
-                                // gate_proj (w1): [intermediate_size, hidden_size/2] packed
-                                let gate_packed = expert_vb.get_with_hints_dtype(
-                                    (intermediate_size, hidden_size / 2),
-                                    "gate_proj.weight",
-                                    Default::default(),
-                                    candle_core::DType::I32,
-                                )?;
-                                let gate_scale = expert_vb.get_with_hints_dtype(
-                                    (
-                                        intermediate_size.div_ceil(weight_block_size[0]),
-                                        hidden_size.div_ceil(weight_block_size[1]),
-                                    ),
-                                    "gate_proj.weight_scale_inv",
-                                    Default::default(),
-                                    candle_core::DType::F32,
-                                )?;
+                                        let gate_packed = expert_vb.get_with_hints_dtype(
+                                            (intermediate_size, hidden_size / 2),
+                                            "gate_proj.weight", Default::default(), candle_core::DType::I32,
+                                        )?;
+                                        let gate_scale = expert_vb.get_with_hints_dtype(
+                                            (intermediate_size.div_ceil(weight_block_size[0]), hidden_size.div_ceil(weight_block_size[1])),
+                                            "gate_proj.weight_scale_inv", Default::default(), candle_core::DType::F32,
+                                        )?;
+                                        let up_packed = expert_vb.get_with_hints_dtype(
+                                            (intermediate_size, hidden_size / 2),
+                                            "up_proj.weight", Default::default(), candle_core::DType::I32,
+                                        )?;
+                                        let up_scale = expert_vb.get_with_hints_dtype(
+                                            (intermediate_size.div_ceil(weight_block_size[0]), hidden_size.div_ceil(weight_block_size[1])),
+                                            "up_proj.weight_scale_inv", Default::default(), candle_core::DType::F32,
+                                        )?;
+                                        let down_packed = expert_vb.get_with_hints_dtype(
+                                            (hidden_size, intermediate_size / 2),
+                                            "down_proj.weight", Default::default(), candle_core::DType::I32,
+                                        )?;
+                                        let down_scale = expert_vb.get_with_hints_dtype(
+                                            (hidden_size.div_ceil(weight_block_size[0]), intermediate_size.div_ceil(weight_block_size[1])),
+                                            "down_proj.weight_scale_inv", Default::default(), candle_core::DType::F32,
+                                        )?;
 
-                                // up_proj (w3): [intermediate_size, hidden_size/2] packed
-                                let up_packed = expert_vb.get_with_hints_dtype(
-                                    (intermediate_size, hidden_size / 2),
-                                    "up_proj.weight",
-                                    Default::default(),
-                                    candle_core::DType::I32,
-                                )?;
-                                let up_scale = expert_vb.get_with_hints_dtype(
-                                    (
-                                        intermediate_size.div_ceil(weight_block_size[0]),
-                                        hidden_size.div_ceil(weight_block_size[1]),
-                                    ),
-                                    "up_proj.weight_scale_inv",
-                                    Default::default(),
-                                    candle_core::DType::F32,
-                                )?;
+                                        let gate_bf16 = mx_int4_blockwise_dequantize(&gate_packed, &gate_scale, weight_block_size.clone(), candle_core::DType::BF16)?;
+                                        let up_bf16 = mx_int4_blockwise_dequantize(&up_packed, &up_scale, weight_block_size.clone(), candle_core::DType::BF16)?;
+                                        let down_bf16 = mx_int4_blockwise_dequantize(&down_packed, &down_scale, weight_block_size.clone(), candle_core::DType::BF16)?;
 
-                                // down_proj (w2): [hidden_size, intermediate_size/2] packed
-                                let down_packed = expert_vb.get_with_hints_dtype(
-                                    (hidden_size, intermediate_size / 2),
-                                    "down_proj.weight",
-                                    Default::default(),
-                                    candle_core::DType::I32,
-                                )?;
-                                let down_scale = expert_vb.get_with_hints_dtype(
-                                    (
-                                        hidden_size.div_ceil(weight_block_size[0]),
-                                        intermediate_size.div_ceil(weight_block_size[1]),
-                                    ),
-                                    "down_proj.weight_scale_inv",
-                                    Default::default(),
-                                    candle_core::DType::F32,
-                                )?;
-
-                                // Dequant INT4-packed → BF16
-                                let gate_bf16 = mx_int4_blockwise_dequantize(
-                                    &gate_packed,
-                                    &gate_scale,
-                                    weight_block_size.clone(),
-                                    candle_core::DType::BF16,
-                                )?;
-                                let up_bf16 = mx_int4_blockwise_dequantize(
-                                    &up_packed,
-                                    &up_scale,
-                                    weight_block_size.clone(),
-                                    candle_core::DType::BF16,
-                                )?;
-                                let down_bf16 = mx_int4_blockwise_dequantize(
-                                    &down_packed,
-                                    &down_scale,
-                                    weight_block_size.clone(),
-                                    candle_core::DType::BF16,
-                                )?;
-
-                                // Wrap as UnquantLinear — ISQ/QTIP will requantize later
-                                let gate_layer: Arc<dyn QuantMethod> = Arc::new(
-                                    UnquantLinear::new(QuantMethodConfig::Unquantized(
-                                        Linear::new(gate_bf16, None),
-                                    ))?,
-                                );
-                                let up_layer: Arc<dyn QuantMethod> = Arc::new(
-                                    UnquantLinear::new(QuantMethodConfig::Unquantized(
-                                        Linear::new(up_bf16, None),
-                                    ))?,
-                                );
-                                let down_layer: Arc<dyn QuantMethod> = Arc::new(
-                                    UnquantLinear::new(QuantMethodConfig::Unquantized(
-                                        Linear::new(down_bf16, None),
-                                    ))?,
-                                );
-
-                                gs.push(gate_layer);
-                                us.push(up_layer);
-                                ds.push(down_layer);
+                                        let g: Arc<dyn QuantMethod> = Arc::new(UnquantLinear::new(QuantMethodConfig::Unquantized(Linear::new(gate_bf16, None)))?);
+                                        let u: Arc<dyn QuantMethod> = Arc::new(UnquantLinear::new(QuantMethodConfig::Unquantized(Linear::new(up_bf16, None)))?);
+                                        let d: Arc<dyn QuantMethod> = Arc::new(UnquantLinear::new(QuantMethodConfig::Unquantized(Linear::new(down_bf16, None)))?);
+                                        Ok((g, u, d))
+                                    })
+                                    .collect();
+                            for result in experts_dequant {
+                                let (g, u, d) = result?;
+                                gs.push(g);
+                                us.push(u);
+                                ds.push(d);
                             }
                         } else {
                             // Standard FP8 E4M3 per-expert path
@@ -2017,99 +1971,76 @@ impl FusedExperts {
                         experts_vb.clone()
                     };
 
-                let mut gate_proj_vec = Vec::new();
-                let mut up_proj_vec = Vec::new();
-                let mut down_proj_vec = Vec::new();
+                // RUN-161: parallel INT4→BF16 dequant across experts.
+                // Each expert's load (mmap read) + dequant is independent and
+                // CPU-bound. Parallelizing with rayon cuts the ~40s/layer serial
+                // bottleneck to ~40s/num_threads.
+                use rayon::prelude::*;
+                let experts_dequant: Vec<candle_core::Result<(Tensor, Tensor, Tensor)>> =
+                    (0..num_experts)
+                        .into_par_iter()
+                        .map(|i| {
+                            let expert_vb = load_experts_vb.pp(i);
 
-                for i in 0..num_experts {
-                    let expert_vb = load_experts_vb.pp(i);
+                            let gate_packed = expert_vb.get_with_hints_dtype(
+                                (moe_intermediate_size, hidden_size / 2),
+                                "gate_proj.weight",
+                                Default::default(),
+                                candle_core::DType::I32,
+                            )?;
+                            let gate_scale = expert_vb.get_with_hints_dtype(
+                                gate_scale_shape,
+                                "gate_proj.weight_scale_inv",
+                                Default::default(),
+                                candle_core::DType::F32,
+                            )?;
+                            let up_packed = expert_vb.get_with_hints_dtype(
+                                (moe_intermediate_size, hidden_size / 2),
+                                "up_proj.weight",
+                                Default::default(),
+                                candle_core::DType::I32,
+                            )?;
+                            let up_scale = expert_vb.get_with_hints_dtype(
+                                gate_scale_shape,
+                                "up_proj.weight_scale_inv",
+                                Default::default(),
+                                candle_core::DType::F32,
+                            )?;
+                            let down_packed = expert_vb.get_with_hints_dtype(
+                                (hidden_size, moe_intermediate_size / 2),
+                                "down_proj.weight",
+                                Default::default(),
+                                candle_core::DType::I32,
+                            )?;
+                            let down_scale = expert_vb.get_with_hints_dtype(
+                                (down_scale_rows, down_scale_cols),
+                                "down_proj.weight_scale_inv",
+                                Default::default(),
+                                candle_core::DType::F32,
+                            )?;
 
-                    // gate_proj (w1): [intermediate_size, hidden_size/2] packed
-                    let gate_packed = expert_vb.get_with_hints_dtype(
-                        (moe_intermediate_size, hidden_size / 2),
-                        "gate_proj.weight",
-                        Default::default(),
-                        candle_core::DType::I32,
-                    )?;
-                    let gate_scale = expert_vb.get_with_hints_dtype(
-                        gate_scale_shape,
-                        "gate_proj.weight_scale_inv",
-                        Default::default(),
-                        candle_core::DType::F32,
-                    )?;
+                            let gate_bf16 = mx_int4_blockwise_dequantize(
+                                &gate_packed, &gate_scale, int4_block_size.clone(), candle_core::DType::BF16,
+                            )?;
+                            let up_bf16 = mx_int4_blockwise_dequantize(
+                                &up_packed, &up_scale, int4_block_size.clone(), candle_core::DType::BF16,
+                            )?;
+                            let down_bf16 = mx_int4_blockwise_dequantize(
+                                &down_packed, &down_scale, int4_block_size.clone(), candle_core::DType::BF16,
+                            )?;
 
-                    // up_proj (w3): same shape as gate_proj
-                    let up_packed = expert_vb.get_with_hints_dtype(
-                        (moe_intermediate_size, hidden_size / 2),
-                        "up_proj.weight",
-                        Default::default(),
-                        candle_core::DType::I32,
-                    )?;
-                    let up_scale = expert_vb.get_with_hints_dtype(
-                        gate_scale_shape,
-                        "up_proj.weight_scale_inv",
-                        Default::default(),
-                        candle_core::DType::F32,
-                    )?;
+                            Ok((gate_bf16, up_bf16, down_bf16))
+                        })
+                        .collect();
 
-                    // down_proj (w2): [hidden_size, intermediate_size/2] packed
-                    let down_packed = expert_vb.get_with_hints_dtype(
-                        (hidden_size, moe_intermediate_size / 2),
-                        "down_proj.weight",
-                        Default::default(),
-                        candle_core::DType::I32,
-                    )?;
-                    let down_scale = expert_vb.get_with_hints_dtype(
-                        (down_scale_rows, down_scale_cols),
-                        "down_proj.weight_scale_inv",
-                        Default::default(),
-                        candle_core::DType::F32,
-                    )?;
-
-                    // Dequant INT4-packed → BF16
-                    let gate_bf16 = mx_int4_blockwise_dequantize(
-                        &gate_packed,
-                        &gate_scale,
-                        int4_block_size.clone(),
-                        candle_core::DType::BF16,
-                    )?;
-                    let up_bf16 = mx_int4_blockwise_dequantize(
-                        &up_packed,
-                        &up_scale,
-                        int4_block_size.clone(),
-                        candle_core::DType::BF16,
-                    )?;
-                    let down_bf16 = mx_int4_blockwise_dequantize(
-                        &down_packed,
-                        &down_scale,
-                        int4_block_size.clone(),
-                        candle_core::DType::BF16,
-                    )?;
-
-                    // RUN-161 bisect probe: log expert-0's dequantized BF16 gate
-                    // stats per layer (V4_STATS=1). If layer-2+ is already
-                    // all-positive/inflated here -> INT4 dequant bug; if balanced
-                    // here but bad at inference -> qtip bug.
-                    if i == 0 && std::env::var_os("V4_STATS").is_some() {
-                        if let Ok(v) = gate_bf16
-                            .to_dtype(candle_core::DType::F32)
-                            .and_then(|t| t.flatten_all())
-                            .and_then(|t| t.to_vec1::<f32>())
-                        {
-                            let n = v.len().max(1) as f32;
-                            let mean = v.iter().sum::<f32>() / n;
-                            let am = v.iter().map(|x| x.abs()).sum::<f32>() / n;
-                            let mn = v.iter().cloned().fold(f32::MAX, f32::min);
-                            let mx = v.iter().cloned().fold(f32::MIN, f32::max);
-                            eprintln!(
-                                "V4_DEQUANT [e0 gate_bf16] absmean={am:.5} mean={mean:+.5} range=[{mn:.4},{mx:.4}]"
-                            );
-                        }
-                    }
-
-                    gate_proj_vec.push(gate_bf16);
-                    up_proj_vec.push(up_bf16);
-                    down_proj_vec.push(down_bf16);
+                let mut gate_proj_vec = Vec::with_capacity(num_experts);
+                let mut up_proj_vec = Vec::with_capacity(num_experts);
+                let mut down_proj_vec = Vec::with_capacity(num_experts);
+                for result in experts_dequant {
+                    let (gate, up, down) = result?;
+                    gate_proj_vec.push(gate);
+                    up_proj_vec.push(up);
+                    down_proj_vec.push(down);
                 }
 
                 // Stack into [num_experts, N, K] and wrap as UnquantLinear
