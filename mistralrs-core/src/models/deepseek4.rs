@@ -675,6 +675,12 @@ struct Attention {
     /// Grouped o_proj part B: `[n_groups * o_lora_rank, hidden_size]`.
     /// Audit §0 + §2 (SGLang line 203).
     wo_b: Arc<dyn QuantMethod>,
+    /// RUN-161 throughput: cache of the dequantized + permuted grouped `wo_a`
+    /// weight `(G, D, R)`. The grouped o_proj used to call `wo_a.dequantize_w()`
+    /// (~67MB materialize) + a `.contiguous()` permute (another ~67MB) EVERY
+    /// forward — for a constant weight. Profiled at ~69ms/token (27% of decode,
+    /// the single biggest cost). Built once on first forward, reused after.
+    wo_a_t_cache: std::sync::RwLock<Option<Tensor>>,
     /// RoPE — either `rope_theta`-based (standard layers 0/1/42) or
     /// `compress_rope_theta`-based (compress layers). Caller picks at
     /// construction. Audit §0 + §8 P1 item 11.
@@ -999,6 +1005,7 @@ impl Attention {
             } else {
                 None
             },
+            wo_a_t_cache: std::sync::RwLock::new(None),
         })
     }
 
@@ -1325,18 +1332,27 @@ impl Attention {
             // (bs*seq_len, G, D)
             let attn_grouped = attn_out.reshape((tokens, o_groups, per_group))?;
 
-            // Dequantize wo_a weight: (G*R, D) → (G, R, D).
-            // Temporary ~67MB per layer, freed after this forward call.
-            let wo_a_w = self.wo_a.dequantize_w()?;
-            let o_lora_rank = wo_a_w.dim(0)? / o_groups;
-            let wo_a_grouped = wo_a_w.reshape((o_groups, o_lora_rank, per_group))?;
-
-            // wo_a_grouped shape: (G, R, D)
-            let o_lora_rank = wo_a_grouped.dim(1)?;
+            // RUN-161: cached dequantized+permuted wo_a as (G, D, R). The weight
+            // is constant — dequantizing + permuting it every forward was ~69ms/
+            // token (27% of decode). Build once, reuse.
+            let wo_a_t = {
+                let cached = self.wo_a_t_cache.read().unwrap();
+                if let Some(t) = cached.as_ref() {
+                    t.clone()
+                } else {
+                    drop(cached);
+                    let wo_a_w = self.wo_a.dequantize_w()?; // (G*R, D)
+                    let o_lora_rank = wo_a_w.dim(0)? / o_groups;
+                    let wo_a_grouped = wo_a_w.reshape((o_groups, o_lora_rank, per_group))?; // (G, R, D)
+                    let t = wo_a_grouped.permute((0, 2, 1))?.contiguous()?; // (G, D, R)
+                    *self.wo_a_t_cache.write().unwrap() = Some(t.clone());
+                    t
+                }
+            };
+            let o_lora_rank = wo_a_t.dim(2)?; // R
 
             // bmm: (G, tokens, D) @ (G, D, R) → (G, tokens, R)
             let attn_perm = attn_grouped.permute((1, 0, 2))?.contiguous()?;
-            let wo_a_t = wo_a_grouped.permute((0, 2, 1))?.contiguous()?;
             let inner_perm = attn_perm.matmul(&wo_a_t)?;
 
             // (G, tokens, R) → (tokens, G*R)
