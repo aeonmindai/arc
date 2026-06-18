@@ -1696,6 +1696,43 @@ fn act_quant_kv_nope(k: &Tensor, rope_dim: usize) -> Result<Tensor> {
     Tensor::cat(&[&k_nope_q, &k_rope], D::Minus1)?.contiguous()
 }
 
+/// RUN-161 decode profiler. Enabled by `ARC_TIME_DECODE=1`. Accumulates
+/// per-component GPU time (sync'd) across all layers of one forward, logged +
+/// reset each call. Sync per component => accurate attribution (kills overlap,
+/// but decode is launch-bound so there's little overlap to lose). The split
+/// tells us which component to fuse next for the throughput cut.
+pub(crate) static DECODE_NS: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+pub(crate) const DECODE_NAMES: [&str; 6] = [
+    "mhc_attn_pre", "mla_attn", "mix_post_attn", "mhc_ffn_pre", "moe", "mix_post_ffn",
+];
+
+#[inline]
+pub(crate) fn timed<T>(
+    idx: usize,
+    dev: &candle_core::Device,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if std::env::var_os("ARC_TIME_DECODE").is_none() {
+        return f();
+    }
+    let _ = dev.synchronize();
+    let t0 = std::time::Instant::now();
+    let r = f()?;
+    let _ = dev.synchronize();
+    DECODE_NS[idx].fetch_add(
+        t0.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    Ok(r)
+}
+
 /// Debug-only NaN/Inf localizer. Enabled by setting `V4_NAN_DEBUG=1`.
 /// Logs (to stderr) the first stage in the forward pass that produces a
 /// non-finite value, with shape and the finite value range for context.
@@ -1995,35 +2032,43 @@ impl DecoderLayer {
             )
         })?;
 
+        let tdev = xs_4d.device().clone();
+
         // === ATTN BLOCK ===
         let residual_attn = xs_4d;
-        let (y_attn, post_attn, comb_attn) = mhc.attn_pre(residual_attn)?;
+        let (y_attn, post_attn, comb_attn) = timed(0, &tdev, || mhc.attn_pre(residual_attn))?;
         v4_nan_dbg(&y_attn, &format!("L{li}.attn_pre.y"));
         v4_nan_dbg(&post_attn, &format!("L{li}.attn_pre.post"));
         v4_nan_dbg(&comb_attn, &format!("L{li}.attn_pre.comb"));
         let y_attn_normed = self.input_layernorm.forward(&y_attn)?;
         v4_nan_dbg(&y_attn_normed, &format!("L{li}.input_layernorm"));
-        let attn_out = self.attn.forward(
-            &y_attn_normed,
-            attention_mask,
-            seqlen_offsets,
-            kv_cache,
-            metadata,
-            flash_params,
-        )?;
+        let attn_out = timed(1, &tdev, || {
+            self.attn.forward(
+                &y_attn_normed,
+                attention_mask,
+                seqlen_offsets,
+                kv_cache,
+                metadata,
+                flash_params,
+            )
+        })?;
         v4_nan_dbg(&attn_out, &format!("L{li}.attn_out"));
-        let xs_4d = mhc.mix_post_4d(&attn_out, residual_attn, &post_attn, &comb_attn)?;
+        let xs_4d = timed(2, &tdev, || {
+            mhc.mix_post_4d(&attn_out, residual_attn, &post_attn, &comb_attn)
+        })?;
         v4_nan_dbg(&xs_4d, &format!("L{li}.mix_post_attn"));
 
         // === FFN BLOCK ===
         let residual_ffn = &xs_4d;
-        let (y_ffn, post_ffn, comb_ffn) = mhc.ffn_pre(residual_ffn)?;
+        let (y_ffn, post_ffn, comb_ffn) = timed(3, &tdev, || mhc.ffn_pre(residual_ffn))?;
         v4_nan_dbg(&y_ffn, &format!("L{li}.ffn_pre.y"));
         let y_ffn_normed = self.post_attention_layernorm.forward(&y_ffn)?;
         v4_nan_dbg(&y_ffn_normed, &format!("L{li}.post_attention_layernorm"));
-        let ffn_out = self.moe_or_mlp.forward(&y_ffn_normed)?;
+        let ffn_out = timed(4, &tdev, || self.moe_or_mlp.forward(&y_ffn_normed))?;
         v4_nan_dbg(&ffn_out, &format!("L{li}.ffn_out"));
-        let out = mhc.mix_post_4d(&ffn_out, residual_ffn, &post_ffn, &comb_ffn)?;
+        let out = timed(5, &tdev, || {
+            mhc.mix_post_4d(&ffn_out, residual_ffn, &post_ffn, &comb_ffn)
+        })?;
         v4_nan_dbg(&out, &format!("L{li}.mix_post_ffn"));
         Ok(out)
     }
@@ -2406,6 +2451,31 @@ impl DeepSeekV4 {
                     i,
                 )?;
                 v4_stat_dbg(&xs_4d, &format!("L{i}"));
+            }
+            if std::env::var_os("ARC_TIME_DECODE").is_some() {
+                use std::sync::atomic::Ordering;
+                let total: u64 = DECODE_NS.iter().map(|a| a.load(Ordering::Relaxed)).sum();
+                let parts: Vec<String> = DECODE_NAMES
+                    .iter()
+                    .zip(DECODE_NS.iter())
+                    .map(|(n, a)| {
+                        let ns = a.load(Ordering::Relaxed);
+                        format!(
+                            "{}={:.2}ms({:.0}%)",
+                            n,
+                            ns as f64 / 1e6,
+                            100.0 * ns as f64 / total.max(1) as f64
+                        )
+                    })
+                    .collect();
+                tracing::info!(
+                    "ARC_TIME_DECODE forward_total={:.2}ms | {}",
+                    total as f64 / 1e6,
+                    parts.join(" ")
+                );
+                for a in DECODE_NS.iter() {
+                    a.store(0, Ordering::Relaxed);
+                }
             }
             let xs_4d = xs_4d.to_device(&self.device)?;
             // Collapse via the learned global mHC head: 4-D → 3-D.
