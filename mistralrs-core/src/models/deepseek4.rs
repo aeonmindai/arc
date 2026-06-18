@@ -1047,6 +1047,7 @@ impl Attention {
     ) -> Result<Tensor> {
         let (bs, seq_len, _) = xs.dims3()?;
         let head_dim = self.cfg.head_dim;
+        let mdev = xs.device().clone();
 
         v4_nan_dbg(xs, "attn.in");
 
@@ -1067,7 +1068,7 @@ impl Attention {
         };
         // 1. Q projection (LoRA). [B, T, hidden] → [B, T, n_heads*head_dim]
         //    → reshape to [B, n_heads, T, head_dim]. Audit §3.
-        let q = self.q.forward(xs)?;
+        let q = timed_mla(0, &mdev, || self.q.forward(xs))?;
         v4_nan_dbg(&q, "attn.q_proj");
         let q = q
             .reshape((bs, seq_len, self.num_attention_heads, head_dim))?
@@ -1092,7 +1093,7 @@ impl Attention {
         // 2. K/V projection: single fused wkv. [B, T, hidden] → [B, T,
         //    head_dim] → kv_norm → reshape to [B, num_kv_heads=1, T,
         //    head_dim]. Audit §0 + §3.
-        let kv_raw = self.wkv.forward_autocast(xs)?;
+        let kv_raw = timed_mla(1, &mdev, || self.wkv.forward_autocast(xs))?;
         v4_nan_dbg(&kv_raw, "attn.wkv");
         let kv_normed = self.kv_norm.forward(&kv_raw)?;
         v4_nan_dbg(&kv_normed, "attn.kv_norm");
@@ -1309,6 +1310,7 @@ impl Attention {
         attn_out = attn_out_bhtd.transpose(1, 2)?.reshape((bs, seq_len, ()))?;
 
         let o_groups = self.cfg.o_groups.unwrap_or(1);
+        let out = timed_mla(2, &mdev, || {
         let inner = if o_groups > 1 {
             // Grouped o_proj LoRA: each of `o_groups` head-groups gets its
             // own slice of wo_a.  wo_a weight is (G*R, D) where G=o_groups,
@@ -1349,6 +1351,8 @@ impl Attention {
         v4_nan_dbg(&inner, "attn.wo_a");
         let out = self.wo_b.forward_autocast(&inner)?;
         v4_nan_dbg(&out, "attn.wo_b");
+        Ok(out)
+        })?;
         Ok(out)
     }
 }
@@ -1712,6 +1716,34 @@ pub(crate) static DECODE_NS: [std::sync::atomic::AtomicU64; 6] = [
 pub(crate) const DECODE_NAMES: [&str; 6] = [
     "mhc_attn_pre", "mla_attn", "mix_post_attn", "mhc_ffn_pre", "moe", "mix_post_ffn",
 ];
+
+/// MLA sub-component timers (Phase 1: pin the 50%). SDPA = mla_attn - these 3.
+pub(crate) static MLA_NS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+pub(crate) const MLA_NAMES: [&str; 3] = ["q_proj", "kv_proj_rope", "invrope_oproj"];
+
+#[inline]
+pub(crate) fn timed_mla<T>(
+    idx: usize,
+    dev: &candle_core::Device,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if std::env::var_os("ARC_TIME_DECODE").is_none() {
+        return f();
+    }
+    let _ = dev.synchronize();
+    let t0 = std::time::Instant::now();
+    let r = f()?;
+    let _ = dev.synchronize();
+    MLA_NS[idx].fetch_add(
+        t0.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    Ok(r)
+}
 
 #[inline]
 pub(crate) fn timed<T>(
@@ -2468,12 +2500,21 @@ impl DeepSeekV4 {
                         )
                     })
                     .collect();
+                let mla_parts: Vec<String> = MLA_NAMES
+                    .iter()
+                    .zip(MLA_NS.iter())
+                    .map(|(n, a)| format!("{}={:.2}ms", n, a.load(Ordering::Relaxed) as f64 / 1e6))
+                    .collect();
                 tracing::info!(
-                    "ARC_TIME_DECODE forward_total={:.2}ms | {}",
+                    "ARC_TIME_DECODE forward_total={:.2}ms | {} || MLA[{}] (sdpa=mla_attn-these)",
                     total as f64 / 1e6,
-                    parts.join(" ")
+                    parts.join(" "),
+                    mla_parts.join(" ")
                 );
                 for a in DECODE_NS.iter() {
+                    a.store(0, Ordering::Relaxed);
+                }
+                for a in MLA_NS.iter() {
                     a.store(0, Ordering::Relaxed);
                 }
             }
