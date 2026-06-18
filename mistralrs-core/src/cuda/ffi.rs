@@ -362,4 +362,13 @@ extern "C" {
         dtype: i32,
         stream: i64,
     );
+    pub(crate) fn sinkhorn_normalize_f32(
+        in_: *const c_void,
+        out: *mut c_void,
+        n: i32,
+        hc: i32,
+        iters: i32,
+        eps: f32,
+        stream: i64,
+    );
 }

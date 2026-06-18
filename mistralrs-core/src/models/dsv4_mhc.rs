@@ -578,6 +578,21 @@ impl V4MHCLayerParams {
 /// 3. Divide by column sums (with eps in denominator).
 /// 4. Repeat (row→col) `sinkhorn_iters - 1` more times.
 fn sinkhorn_normalize(comb: &Tensor, sinkhorn_iters: usize, eps: f64) -> Result<Tensor> {
+    // RUN-161 throughput: fused single-launch CUDA kernel replaces the ~123-op
+    // candle chain below (the dominant decode cost — ~13k launch-bound
+    // micro-kernels/token across 43 layers). Opt-in via ARC_FUSED_SINKHORN=1
+    // until bit-identical-validated on H100; falls back to the candle path
+    // otherwise (non-CUDA, gate off, or any error).
+    if std::env::var_os("ARC_FUSED_SINKHORN").is_some()
+        && matches!(comb.device(), candle_core::Device::Cuda(_))
+        && comb.dtype() == DType::F32
+    {
+        if let Ok(out) = crate::cuda::sinkhorn::sinkhorn_normalize_cuda(comb, sinkhorn_iters, eps) {
+            return Ok(out);
+        }
+        // fall through to candle path on any error
+    }
+
     // Stable softmax along last dim (rows).
     let row_max = comb.max_keepdim(D::Minus1)?; // [N, hc, 1]
     let shifted = comb.broadcast_sub(&row_max)?;
