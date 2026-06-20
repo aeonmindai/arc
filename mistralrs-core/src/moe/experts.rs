@@ -47,6 +47,13 @@ impl MoEExpertsBackend {
         loading_isq: bool,
         quantization_config: &Option<QuantizedConfig>,
     ) -> Self {
+        // RUN-161 collapse isolation: force the reference-correct per-expert
+        // loop (Slow) to test whether the CUDA gather kernel is mis-dispatching
+        // experts (collapse). If output stays collapsed under Slow, the bug is
+        // in the shared dequant/quant, not the gather kernel.
+        if std::env::var_os("ARC_MOE_SLOW").is_some() {
+            return Self::Slow;
+        }
         let has_immediate_isq = mistralrs_quant::get_immediate_isq().is_some();
         let use_fast = device.is_metal()
             || (device.is_cuda()
@@ -514,6 +521,14 @@ impl MoEExperts {
                 .gather_forward_autocast(&xs, topk_ids)?;
             crate::models::deepseek4::v4_stat_dbg(&gate, "exp.gate");
             crate::models::deepseek4::v4_stat_dbg(&up, "exp.up");
+            // RUN-161 collapse localization: cross-token cosine at each expert
+            // projection. xs is [num_tokens, top_k, hidden] (expanded); gate/up
+            // are [num_tokens, top_k, inter]. pos_dim=0 = tokens. These print
+            // immediately before the matching `L{li}.moe_routed` line, so align
+            // by proximity in the log.
+            crate::models::deepseek4::v4_collapse_dbg(&xs, "exp.in", 0);
+            crate::models::deepseek4::v4_collapse_dbg(&gate, "exp.gate", 0);
+            crate::models::deepseek4::v4_collapse_dbg(&up, "exp.up", 0);
             // V4 clamped SwiGLU, computed in F32 for stability — matches
             // reference inference/model.py:596-606: gate=w1(x).float(),
             // up=w3(x).float(); up clamped to [-limit, limit] but gate clamped
@@ -537,6 +552,8 @@ impl MoEExperts {
                 .fused_down_proj
                 .gather_forward_autocast(&prod, topk_ids)?;
             crate::models::deepseek4::v4_stat_dbg(&down, "exp.down");
+            crate::models::deepseek4::v4_collapse_dbg(&prod, "exp.prod", 0);
+            crate::models::deepseek4::v4_collapse_dbg(&down, "exp.down", 0);
             down
         } else {
             // Metal path: use broadcast gather shapes

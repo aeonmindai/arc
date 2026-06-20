@@ -252,6 +252,116 @@ afq_quantize_kernel(const T *__restrict__ w, uint32_t *__restrict__ w_q,
   }
 }
 
+// Specialized quantization kernel for 3-bit (non-power-of-2).
+// 8 values packed into 24 bits, written into a u32 bitstream (LSB-first),
+// byte-identical to the CPU reference (afq::ops::cpu_backend::afq_quantize_op).
+// One warp per group; group_size*3 is always a whole number of u32 words
+// (32*3=96, 64*3=192, 128*3=384), so groups never share a word.
+template <typename T, int group_size>
+__global__ void
+afq_quantize_3bit_kernel(const T *__restrict__ w, uint32_t *__restrict__ w_q,
+                         T *__restrict__ scales, T *__restrict__ biases,
+                         int rows, int cols) {
+  constexpr uint32_t max_q = 7u; // (1<<3)-1
+  const int packed_cols = cols * 3 / 32;
+  const int groups_per_row = cols / group_size;
+
+  int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / AFQ_WARP_SIZE;
+  int lane = threadIdx.x % AFQ_WARP_SIZE;
+
+  int total_groups = rows * groups_per_row;
+  if (warp_id >= total_groups)
+    return;
+
+  int row = warp_id / groups_per_row;
+  int group_idx = warp_id % groups_per_row;
+  int group_start = group_idx * group_size;
+
+  const T *row_w = w + row * cols;
+
+  // Compute group min/max via warp reduction (matches CPU reference exactly).
+  float local_min = FLT_MAX;
+  float local_max = -FLT_MAX;
+  for (int i = lane; i < group_size; i += AFQ_WARP_SIZE) {
+    int col = group_start + i;
+    if (col < cols) {
+      float val;
+      if constexpr (std::is_same_v<T, float>) {
+        val = row_w[col];
+      } else if constexpr (std::is_same_v<T, __half>) {
+        val = __half2float(row_w[col]);
+      }
+#if __CUDA_ARCH__ >= 800
+      else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+        val = __bfloat162float(row_w[col]);
+      }
+#endif
+      local_min = fminf(local_min, val);
+      local_max = fmaxf(local_max, val);
+    }
+  }
+  float group_min = warp_reduce_min(local_min);
+  float group_max = warp_reduce_max(local_max);
+  group_min = __shfl_sync(0xffffffff, group_min, 0);
+  group_max = __shfl_sync(0xffffffff, group_max, 0);
+
+  // CPU-identical scale/bias: scale = (range<1e-12) ? 1.0 : range/levels.
+  float range = group_max - group_min;
+  float scale = (fabsf(range) < 1e-12f) ? 1.0f : (range / (float)max_q);
+  float bias = group_min;
+
+  if (lane == 0) {
+    if constexpr (std::is_same_v<T, float>) {
+      scales[row * groups_per_row + group_idx] = scale;
+      biases[row * groups_per_row + group_idx] = bias;
+    } else if constexpr (std::is_same_v<T, __half>) {
+      scales[row * groups_per_row + group_idx] = __float2half(scale);
+      biases[row * groups_per_row + group_idx] = __float2half(bias);
+    }
+#if __CUDA_ARCH__ >= 800
+    else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+      scales[row * groups_per_row + group_idx] = __float2bfloat16(scale);
+      biases[row * groups_per_row + group_idx] = __float2bfloat16(bias);
+    }
+#endif
+  }
+
+  const int row_base = row * packed_cols;
+
+  for (int i = lane; i < group_size; i += AFQ_WARP_SIZE) {
+    int col = group_start + i;
+    if (col >= cols)
+      continue;
+
+    float val;
+    if constexpr (std::is_same_v<T, float>) {
+      val = row_w[col];
+    } else if constexpr (std::is_same_v<T, __half>) {
+      val = __half2float(row_w[col]);
+    }
+#if __CUDA_ARCH__ >= 800
+    else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+      val = __bfloat162float(row_w[col]);
+    }
+#endif
+
+    // IEEE division (not reciprocal-multiply) to be bit-identical to the
+    // CPU reference's (w - bias) / scale. This is a one-time bake; the
+    // negligible division cost buys byte-for-byte reproducibility.
+    float q_float = roundf((val - bias) / scale);
+    uint32_t q = (uint32_t)min(max((int)q_float, 0), (int)max_q);
+
+    // LSB-first bitstream packing into the u32 row (matches CPU reference).
+    int bit_off = col * 3;
+    int word_id = bit_off / 32;
+    int shift = bit_off % 32;
+    atomicOr(&w_q[row_base + word_id], q << shift);
+    if (shift + 3 > 32) {
+      atomicOr(&w_q[row_base + word_id + 1], q >> (32 - shift));
+    }
+  }
+}
+
 // ============================================================================
 // Extern "C" Launch Functions - Dequantize
 // ============================================================================
@@ -398,6 +508,30 @@ DEFINE_QUANT_LAUNCHER(8, 32, __nv_bfloat16, bf16)
 DEFINE_QUANT_LAUNCHER(8, 64, __nv_bfloat16, bf16)
 DEFINE_QUANT_LAUNCHER(8, 128, __nv_bfloat16, bf16)
 
-// Note: 3-bit and 6-bit quantization kernels require special byte packing
-// and are more complex. For now, these are handled by the CPU fallback
-// or can be added later with specialized kernels.
+// 3-bit quantize launchers (LSB-first bitstream packing; one warp per group)
+#define DEFINE_QUANT_3BIT_LAUNCHER(gs, dtype, dtype_name)                      \
+  extern "C" void afq_quantize_3bit_gs##gs##_##dtype_name(                     \
+      const dtype *w, uint32_t *w_q, dtype *scales, dtype *biases, int rows,   \
+      int cols) {                                                              \
+    int groups_per_row = cols / gs;                                            \
+    int total_groups = rows * groups_per_row;                                  \
+    int threads = total_groups * AFQ_WARP_SIZE;                                \
+    int blocks = cdiv(threads, AFQ_BLOCK_SIZE);                                \
+    int packed_cols = cols * 3 / 32;                                           \
+    cudaMemset(w_q, 0, (size_t)rows * packed_cols * sizeof(uint32_t));         \
+    afq_quantize_3bit_kernel<dtype, gs>                                        \
+        <<<blocks, AFQ_BLOCK_SIZE>>>(w, w_q, scales, biases, rows, cols);      \
+  }
+
+DEFINE_QUANT_3BIT_LAUNCHER(32, float, f32)
+DEFINE_QUANT_3BIT_LAUNCHER(64, float, f32)
+DEFINE_QUANT_3BIT_LAUNCHER(128, float, f32)
+DEFINE_QUANT_3BIT_LAUNCHER(32, __half, f16)
+DEFINE_QUANT_3BIT_LAUNCHER(64, __half, f16)
+DEFINE_QUANT_3BIT_LAUNCHER(128, __half, f16)
+DEFINE_QUANT_3BIT_LAUNCHER(32, __nv_bfloat16, bf16)
+DEFINE_QUANT_3BIT_LAUNCHER(64, __nv_bfloat16, bf16)
+DEFINE_QUANT_3BIT_LAUNCHER(128, __nv_bfloat16, bf16)
+
+// Note: 6-bit quantization kernel requires special byte packing and is still
+// handled by the CPU fallback; can be added later with a specialized kernel.

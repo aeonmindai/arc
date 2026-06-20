@@ -956,7 +956,12 @@ impl Attention {
         };
 
         // Pre-shape sinks for SDPA: [n_heads] → [1, n_heads, 1, 1].
-        let sinks_for_sdpa = if let Some(ref s) = attn_sink {
+        // RUN-161 ablation: ARC_DISABLE_SINK=1 drops the attention sink to test
+        // whether sink-mass domination (head_dim=512 falls into the unfused
+        // softmax_with_sinks path on every layer) is collapsing attention output.
+        let sinks_for_sdpa = if std::env::var_os("ARC_DISABLE_SINK").is_some() {
+            None
+        } else if let Some(ref s) = attn_sink {
             Some(s.reshape((1, cfg.num_attention_heads, 1, 1))?)
         } else {
             None
@@ -1382,6 +1387,14 @@ struct MoeGate {
     top_k: usize,
     n_routed_experts: usize,
     e_score_correction_bias: Option<Tensor>,
+    /// Hash-routing table for layers `< num_hash_layers` (V4: first 3). Shape
+    /// `[vocab_size, top_k]` (I64). For these layers the reference `Gate`
+    /// (inference/model.py) selects experts by a fixed token-id lookup
+    /// `indices = tid2eid[input_ids]` instead of score top-k; routing weights
+    /// still come from the (unbiased) gate scores at those indices. `None` for
+    /// score-routed layers (which carry `gate.bias` instead). Audit §0 + §5
+    /// line 458.
+    tid2eid: Option<Tensor>,
 }
 
 impl MoeGate {
@@ -1389,8 +1402,24 @@ impl MoeGate {
         cfg: &DeepSeekV4Config,
         vb: ShardedVarBuilder,
         n_routed_experts: usize,
+        layer_idx: usize,
     ) -> Result<Self> {
         let weight = vb.get((n_routed_experts, cfg.hidden_size), "weight")?;
+        let top_k = cfg.num_experts_per_tok.unwrap_or(6);
+        // Hash routing: layers `< num_hash_layers` ship a fixed token-id ->
+        // expert table (`gate.tid2eid`, [vocab_size, top_k]) and NO bias. Load
+        // it so `forward` can dispatch hash vs. score routing per layer.
+        // Reference: inference/model.py `Gate.hash = layer_id < n_hash_layers`.
+        let tid2eid = if layer_idx < cfg.num_hash_layers {
+            Some(vb.get_with_hints_dtype(
+                (cfg.vocab_size, top_k),
+                "tid2eid",
+                Default::default(),
+                DType::I64,
+            )?)
+        } else {
+            None
+        };
         // V4 native publishes the noaux_tc bias as `gate.bias`; HF as
         // `gate.e_score_correction_bias`. Audit §2 (SGLang line 361
         // remap rule).
@@ -1415,16 +1444,41 @@ impl MoeGate {
         } else {
             None
         };
+        // RUN-161 diagnostic: confirm whether the noaux_tc selection bias is
+        // actually loaded for score-routed layers. If it is None on a
+        // score-routed layer (layer_idx >= num_hash_layers), expert selection
+        // ignores the trained bias and picks the wrong top-k → collapse.
+        if std::env::var_os("ARC_COLLAPSE").is_some() {
+            match &e_score_correction_bias {
+                Some(b) => {
+                    let stats = b
+                        .to_dtype(DType::F32)
+                        .and_then(|t| t.abs())
+                        .and_then(|t| t.mean_all())
+                        .and_then(|t| t.to_scalar::<f32>());
+                    eprintln!(
+                        "ARC_ROUTEBIAS [L{layer_idx}] gate.bias LOADED absmean={:?} hash={}",
+                        stats,
+                        layer_idx < cfg.num_hash_layers
+                    );
+                }
+                None => eprintln!(
+                    "ARC_ROUTEBIAS [L{layer_idx}] gate.bias = NONE hash={}",
+                    layer_idx < cfg.num_hash_layers
+                ),
+            }
+        }
         Ok(Self {
             weight,
             cfg: cfg.clone(),
-            top_k: cfg.num_experts_per_tok.unwrap_or(6),
+            top_k,
             n_routed_experts,
             e_score_correction_bias,
+            tid2eid,
         })
     }
 
-    fn forward(&self, xs: &Tensor) -> Result<(Tensor, Tensor)> {
+    fn forward(&self, xs: &Tensor, input_ids: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
         let (bs, seq_len, h) = xs.dims3()?;
         let xs = xs.reshape(((), h))?;
         let logits = xs
@@ -1444,7 +1498,32 @@ impl MoeGate {
             }
         };
 
-        let (mut topk_weight, topk_idx) = match self.cfg.topk_method {
+        let (mut topk_weight, topk_idx) = if let Some(tid2eid) = &self.tid2eid {
+            // Hash routing (layers < num_hash_layers): experts are a fixed
+            // per-token lookup, NOT score top-k. Reference Gate.forward:
+            //   indices = tid2eid[input_ids]
+            //   weights = original_scores.gather(1, indices)
+            // `scores` here is the (unbiased) sqrtsoftplus output, matching the
+            // reference's `original_scores`. input_ids[B*T] aligns row-wise with
+            // xs.reshape((B*T, h)) (both row-major over B then T).
+            let input_ids = input_ids.ok_or_else(|| {
+                candle_core::Error::Msg(
+                    "DeepSeek-V4 hash-routing MoE layer requires input_ids; \
+                     caller did not thread token ids to the gate."
+                        .to_string(),
+                )
+            })?;
+            let ids = input_ids
+                .reshape(((),))?
+                .to_dtype(DType::U32)?
+                .to_device(tid2eid.device())?;
+            // [B*T, top_k] expert indices (cast to U32 to match the score path /
+            // downstream expert gather).
+            let topk_idx = tid2eid.index_select(&ids, 0)?.to_dtype(DType::U32)?;
+            let topk_weight = scores.gather(&topk_idx, 1)?;
+            (topk_weight, topk_idx)
+        } else {
+            match self.cfg.topk_method {
             TopkMethod::Greedy => {
                 let TopKOutput { values, indices } = scores.topk_unsorted(self.top_k)?;
                 (values, indices)
@@ -1512,6 +1591,7 @@ impl MoeGate {
                 let TopKOutput { values, indices } = tmp_scores.topk_unsorted(self.top_k)?;
                 (values, indices)
             }
+            }
         };
 
         if matches!(
@@ -1523,6 +1603,41 @@ impl MoeGate {
         }
 
         topk_weight = (topk_weight * self.cfg.routed_scaling_factor)?;
+
+        // RUN-161 diagnostic: are the selected top-k routing weights peaked or
+        // near-uniform? Near-uniform weights average 6 redundant experts and
+        // amplify their shared common-mode (collapse). Log the spread of the
+        // raw gate logits at the selected experts, and the final weight spread.
+        if std::env::var_os("ARC_COLLAPSE").is_some() {
+            if let Ok(topk_logits) = logits.gather(&topk_idx, 1) {
+                v4_stat_dbg(&topk_logits, "gate.topk_logits");
+            }
+            v4_stat_dbg(&topk_weight, "gate.topk_weight");
+        }
+
+        // RUN-161 fix-test: replace the near-uniform normalized-sqrtsoftplus
+        // weights with a softmax over the selected experts' RAW logits (peaked
+        // routing). If this restores coherence, the routing-weight uniformity is
+        // the collapse root cause.
+        if std::env::var_os("ARC_SOFTMAX_ROUTE").is_some() {
+            if let Ok(topk_logits) = logits.gather(&topk_idx, 1) {
+                let sm = candle_nn::ops::softmax_last_dim(&topk_logits)?;
+                topk_weight =
+                    (sm.to_dtype(topk_weight.dtype())? * self.cfg.routed_scaling_factor)?;
+            }
+        }
+
+        // RUN-161 diagnostic: collapse is driven by the routed-expert weighted
+        // sum at deep layers. ARC_ROUTE_TOP1 keeps only the single
+        // largest-weight expert per token (zeroes the rest) to test whether the
+        // near-uniform top-6 averaging of redundant deep-layer experts is the
+        // common-mode source.
+        if std::env::var_os("ARC_ROUTE_TOP1").is_some() {
+            let max = topk_weight.max_keepdim(D::Minus1)?;
+            let diff = topk_weight.broadcast_sub(&max)?;
+            let mask = diff.ge(&diff.zeros_like()?)?.to_dtype(topk_weight.dtype())?;
+            topk_weight = (topk_weight * mask)?;
+        }
         Ok((topk_idx, topk_weight))
     }
 }
@@ -1589,6 +1704,7 @@ impl Moe {
             cfg,
             mapper.set_device(layer_idx, vb.pp("gate"), false),
             n_routed_experts,
+            layer_idx,
         )?;
         Ok(Self {
             experts,
@@ -1598,7 +1714,7 @@ impl Moe {
         })
     }
 
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor, input_ids: Option<&Tensor>) -> Result<Tensor> {
         // Tier-B TD-MoE probe: dump the real expert-input activations for a few
         // representative layers so we can measure activation-aware low-rank
         // error offline. Enable with ARC_CAPTURE_MOE_INPUT=<dir>. Overwrites on
@@ -1623,16 +1739,36 @@ impl Moe {
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
 
         v4_stat_dbg(xs, "moe.input");
-        let (topk_idx, topk_weight) = self.gate.forward(xs)?;
+        let (topk_idx, topk_weight) = self.gate.forward(xs, input_ids)?;
         v4_stat_dbg(&topk_weight, "moe.topk_w");
         v4_stat_dbg(&topk_idx, "moe.topk_idx");
+        // RUN-161 diagnostic: dump the actual per-token selected expert IDs at a
+        // few layers (hash L1, score-onset L7, deep L14) to see whether the 5
+        // prompt tokens route to the SAME experts (routing collapse) or stay
+        // diverse. If score-routed layers over-concentrate vs the hash layers,
+        // the selection bias / scoring is wrong.
+        if std::env::var_os("ARC_COLLAPSE").is_some()
+            && matches!(self.layer_idx, 1 | 4 | 7 | 14 | 20)
+        {
+            if let Ok(v) = topk_idx.to_dtype(DType::U32).and_then(|t| t.to_vec2::<u32>()) {
+                eprintln!("ARC_TOPKID [L{}] {:?}", self.layer_idx, v);
+            }
+        }
         let mut y = self.experts.forward(xs, topk_weight, &topk_idx)?;
         y = y.reshape((b_size, seq_len, hidden_dim))?;
         v4_stat_dbg(&y, "moe.routed");
+        let li = self.layer_idx;
+        v4_collapse_dbg(&y, &format!("L{li}.moe_routed"), 1);
+        v4_collapse_dbg(
+            &topk_idx.to_dtype(DType::F32).unwrap_or_else(|_| topk_idx.clone()),
+            &format!("L{li}.moe_topk_idx"),
+            0,
+        );
 
         if let Some(ref shared_experts) = self.shared_experts {
             let shared_out = shared_experts.forward(&identity)?;
             v4_stat_dbg(&shared_out, "moe.shared");
+            v4_collapse_dbg(&shared_out, &format!("L{li}.moe_shared"), 1);
             y = (y + shared_out)?;
         }
         v4_stat_dbg(&y, "moe.out");
@@ -1659,10 +1795,11 @@ enum MoeOrMlp {
 }
 
 impl MoeOrMlp {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor, input_ids: Option<&Tensor>) -> Result<Tensor> {
         match self {
+            // Dense MLP layers (V4 Flash has none) ignore input_ids.
             Self::Mlp(mlp) => mlp.forward(xs),
-            Self::Moe(moe) => moe.forward(xs),
+            Self::Moe(moe) => moe.forward(xs, input_ids),
         }
     }
 }
@@ -1844,6 +1981,58 @@ pub(crate) fn v4_stat_dbg(t: &Tensor, tag: &str) {
     }
 }
 
+/// Cross-position similarity probe (RUN-161 context-collapse localizer).
+/// Enabled with `ARC_COLLAPSE=1`. Collapses every axis except `pos_dim` into a
+/// per-position feature vector, then reports the mean off-diagonal cosine
+/// between positions and cos(first,last). A value trending to ~1.0 means the
+/// positions have stopped differentiating (context collapse) — pinpointing the
+/// exact layer/op where contextual mixing dies, which whole-tensor std cannot.
+pub(crate) fn v4_collapse_dbg(t: &Tensor, tag: &str, pos_dim: usize) {
+    if std::env::var_os("ARC_COLLAPSE").is_none() {
+        return;
+    }
+    let run = || -> Result<()> {
+        let t = t.to_dtype(DType::F32)?;
+        let dims = t.dims().to_vec();
+        if pos_dim >= dims.len() {
+            return Ok(());
+        }
+        let tlen = dims[pos_dim];
+        if tlen < 2 {
+            return Ok(()); // single-token (decode) step: nothing to compare
+        }
+        // Move pos to front, flatten the rest into a feature vector per position.
+        let mut perm: Vec<usize> = vec![pos_dim];
+        perm.extend((0..dims.len()).filter(|&d| d != pos_dim));
+        let tp = t.permute(perm)?.contiguous()?;
+        let f = tp.elem_count() / tlen;
+        let m = tp.reshape((tlen, f))?;
+        let norm = (m.sqr()?.sum_keepdim(1)?.sqrt()? + 1e-8)?;
+        let mn = m.broadcast_div(&norm)?;
+        let cos = mn.matmul(&mn.t()?)?; // [T, T]
+        let cosv: Vec<f32> = cos.flatten_all()?.to_vec1()?;
+        let mut s = 0f32;
+        let mut c = 0usize;
+        for i in 0..tlen {
+            for j in 0..tlen {
+                if i != j {
+                    s += cosv[i * tlen + j];
+                    c += 1;
+                }
+            }
+        }
+        let mean_off = s / (c.max(1) as f32);
+        let first_last = cosv[tlen - 1]; // cos(pos0, posLast)
+        eprintln!(
+            "ARC_COLLAPSE [{tag}] T={tlen} mean_offdiag_cos={mean_off:.5} cos(first,last)={first_last:.5}"
+        );
+        Ok(())
+    };
+    if let Err(e) = run() {
+        eprintln!("ARC_COLLAPSE [{tag}] failed: {e}");
+    }
+}
+
 struct DecoderLayer {
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
@@ -1984,6 +2173,7 @@ impl DecoderLayer {
             &PagedAttentionInputMetadata,
         )>,
         flash_params: &FlashParams,
+        input_ids: Option<&Tensor>,
     ) -> Result<Tensor> {
         // V4 3-D residual fallback path (legacy / partial-V4 checkpoints).
         //
@@ -2021,7 +2211,7 @@ impl DecoderLayer {
         let residual = &xs;
         let ffn_out = self
             .moe_or_mlp
-            .forward(&xs.apply(&self.post_attention_layernorm)?)?;
+            .forward(&xs.apply(&self.post_attention_layernorm)?, input_ids)?;
         match &self.mhc {
             Some(mhc) => mhc.mix_ffn_3d_bridge(residual, &ffn_out),
             None => residual + ffn_out,
@@ -2068,6 +2258,7 @@ impl DecoderLayer {
         )>,
         flash_params: &FlashParams,
         layer_idx: usize,
+        input_ids: Option<&Tensor>,
     ) -> Result<Tensor> {
         let li = layer_idx;
         v4_nan_dbg(xs_4d, &format!("L{li}.input_4d"));
@@ -2086,6 +2277,7 @@ impl DecoderLayer {
         let residual_attn = xs_4d;
         let (y_attn, post_attn, comb_attn) = timed(0, &tdev, || mhc.attn_pre(residual_attn))?;
         v4_nan_dbg(&y_attn, &format!("L{li}.attn_pre.y"));
+        v4_collapse_dbg(&y_attn, &format!("L{li}.y_attn"), 1);
         v4_nan_dbg(&post_attn, &format!("L{li}.attn_pre.post"));
         v4_nan_dbg(&comb_attn, &format!("L{li}.attn_pre.comb"));
         let y_attn_normed = self.input_layernorm.forward(&y_attn)?;
@@ -2101,23 +2293,28 @@ impl DecoderLayer {
             )
         })?;
         v4_nan_dbg(&attn_out, &format!("L{li}.attn_out"));
+        v4_collapse_dbg(&attn_out, &format!("L{li}.attn_out"), 1);
         let xs_4d = timed(2, &tdev, || {
             mhc.mix_post_4d(&attn_out, residual_attn, &post_attn, &comb_attn)
         })?;
         v4_nan_dbg(&xs_4d, &format!("L{li}.mix_post_attn"));
+        v4_collapse_dbg(&xs_4d, &format!("L{li}.mix_post_attn"), 1);
 
         // === FFN BLOCK ===
         let residual_ffn = &xs_4d;
         let (y_ffn, post_ffn, comb_ffn) = timed(3, &tdev, || mhc.ffn_pre(residual_ffn))?;
         v4_nan_dbg(&y_ffn, &format!("L{li}.ffn_pre.y"));
+        v4_collapse_dbg(&y_ffn, &format!("L{li}.y_ffn"), 1);
         let y_ffn_normed = self.post_attention_layernorm.forward(&y_ffn)?;
         v4_nan_dbg(&y_ffn_normed, &format!("L{li}.post_attention_layernorm"));
-        let ffn_out = timed(4, &tdev, || self.moe_or_mlp.forward(&y_ffn_normed))?;
+        let ffn_out = timed(4, &tdev, || self.moe_or_mlp.forward(&y_ffn_normed, input_ids))?;
         v4_nan_dbg(&ffn_out, &format!("L{li}.ffn_out"));
+        v4_collapse_dbg(&ffn_out, &format!("L{li}.ffn_out"), 1);
         let out = timed(5, &tdev, || {
             mhc.mix_post_4d(&ffn_out, residual_ffn, &post_ffn, &comb_ffn)
         })?;
         v4_nan_dbg(&out, &format!("L{li}.mix_post_ffn"));
+        v4_collapse_dbg(&out, &format!("L{li}.residual"), 1);
         Ok(out)
     }
 }
@@ -2245,7 +2442,15 @@ impl DeepSeekV4 {
         let mut rope_standard: HashMap<_, Arc<DeepSeekV2RotaryEmbedding>> = HashMap::new();
         let mut rope_compress: HashMap<_, Arc<DeepSeekV2RotaryEmbedding>> = HashMap::new();
         let rope_cfg_standard = DeepSeekV2RopeConfig {
-            rope_scaling: cfg.rope_scaling.clone(),
+            // RUN-161 ablation: the reference disables YARN on standard layers
+            // (`original_seq_len, rope_theta = 0, args.rope_theta`); arc applies
+            // it. ARC_DISABLE_YARN_STD=1 matches the reference to test whether
+            // YARN-on-standard contributes to the context collapse.
+            rope_scaling: if std::env::var_os("ARC_DISABLE_YARN_STD").is_some() {
+                None
+            } else {
+                cfg.rope_scaling.clone()
+            },
             max_position_embeddings: cfg.max_position_embeddings,
             rope_theta: cfg.rope_theta,
             qk_rope_head_dim: cfg.qk_rope_head_dim,
@@ -2497,6 +2702,7 @@ impl DeepSeekV4 {
                         .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
                     flash_params,
                     i,
+                    Some(input_ids),
                 )?;
                 v4_stat_dbg(&xs_4d, &format!("L{i}"));
             }
@@ -2552,6 +2758,7 @@ impl DeepSeekV4 {
                         .as_ref()
                         .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
                     flash_params,
+                    Some(input_ids),
                 )?;
             }
             xs.to_device(&self.device)?
