@@ -81,6 +81,45 @@ __device__ __forceinline__ float2 gg_load2(const __nv_bfloat16* p) {
     return __bfloat1622float2(__ldg(reinterpret_cast<const __nv_bfloat162*>(p)));
 }
 
+// ---------------------------------------------------------------------------
+// RUN-161: COMPUTED QTIP CODEBOOK (the "trellis is not instruction-bound" fix).
+//
+// Each 16-bit trellis state decodes to V=2 Gaussian reproduction values. The
+// host bakes these with gaussian_lut() (mod.rs:174): splitmix64(state) -> two
+// uniforms -> Box-Muller. That is a PURE FUNCTION of `state`, so we evaluate it
+// inline in registers instead of gathering from the 512 KB global LUT.
+//
+// Why this is THE lever: at L=16 the LUT is 2^16 * V * 4 = 512 KB, which does
+// NOT fit in 48 KB shared memory, so the prior "stage LUT to shared" path was
+// dead and every per-symbol weight lookup was a dependent, data-scattered
+// GLOBAL load. ncu attributed the kernel's stall to long_scoreboard (global
+// LOAD latency on exactly this gather). Computing the code in-register removes
+// that load entirely: ~a dozen integer/FP ops (cache- and bandwidth-free) per
+// weight, which is the QTIP-paper computed-code decode that reaches a large
+// fraction of HBM peak at M=1.
+//
+// Bit-faithfulness: mirrors the host math exactly (same constants, same
+// operation order). Transcendentals (logf/sincosf) differ from the host libm
+// by <~1e-4 ULP-scale, far below quantization error — decode stays numerically
+// equivalent to the baked LUT it replaces.
+__device__ __forceinline__ float2 qtip_decode_state(uint32_t state) {
+    unsigned long long z = (unsigned long long)state * 0x9E3779B97F4A7C15ULL;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    z ^= z >> 31;
+    const uint32_t hi = (uint32_t)(z >> 32);
+    const uint32_t lo = (uint32_t)(z & 0xFFFFFFFFu);
+    // Host denom = (u32::MAX as f32 + 2.0) == 2^32 exactly in f32.
+    const float denom = 4294967296.0f;
+    const float u1 = ((float)hi + 1.0f) / denom;
+    const float u2 = ((float)lo + 1.0f) / denom;
+    const float r = sqrtf(-2.0f * logf(u1));
+    const float theta = (2.0f * 3.14159265358979323846f) * u2;
+    float s, c;
+    sincosf(theta, &s, &c);
+    return make_float2(r * c, r * s);  // (g0, g1) == (lut[2*state], lut[2*state+1])
+}
+
 // One block per (output row, pair). Reads the pair's expert id on-device,
 // offsets into that expert's packed rows / scales, and accumulates
 // y[pair, row] = sum_k W_expert[row,k] * x[pair,k].
@@ -253,9 +292,11 @@ qtip_gather_gemv_warp_kernel(
     //     collapses long_scoreboard. The global weight bytes are read exactly
     //     once instead of ~1.5x (warm-up) and fully coalesced.
     constexpr int ROWS_PER_BLOCK = WARPS_PER_BLOCK * ROWS_PER_WARP;
+    // RUN-161: shared memory now holds ONLY the staged packed weight bytes. The
+    // codebook is computed in-register (qtip_decode_state), so the former
+    // 512 KB global LUT and its dead shared-staging are gone entirely.
     extern __shared__ float s_mem[];
-    constexpr int LUT_FLOATS = (1 << QTIP_L) * QTIP_V;
-    constexpr bool USE_SHARED_LUT = (LUT_FLOATS * (int)sizeof(float)) <= (48 * 1024);
+    (void)lut;  // codebook now computed in-register; param kept for ABI stability
 
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -266,19 +307,8 @@ qtip_gather_gemv_warp_kernel(
     const uint32_t expert = __ldg(indices + pair);
     const bool invalid = expert >= (uint32_t)num_experts;
 
-    // ---- stage LUT ----
-    const float2* s_lut2;
-    if (USE_SHARED_LUT) {
-        for (int i = threadIdx.x; i < LUT_FLOATS; i += WARPS_PER_BLOCK * 32) {
-            s_mem[i] = __ldg(lut + i);  // s_mem front aliased as float LUT
-        }
-        s_lut2 = reinterpret_cast<const float2*>(s_mem);
-    } else {
-        s_lut2 = reinterpret_cast<const float2*>(lut);
-    }
-
     // ---- stage packed weight rows (coalesced bulk copy) ----
-    uint8_t* s_packed = reinterpret_cast<uint8_t*>(s_mem + (USE_SHARED_LUT ? LUT_FLOATS : 0));
+    uint8_t* s_packed = reinterpret_cast<uint8_t*>(s_mem);
     if (stage_packed && !invalid) {
         const int n_block_rows = min(ROWS_PER_BLOCK, n_rows - row0_block);
         const long total = (long)n_block_rows * packed_per_row;
@@ -288,7 +318,7 @@ qtip_gather_gemv_warp_kernel(
             s_packed[i] = __ldg(g + i);
         }
     }
-    if (USE_SHARED_LUT || (stage_packed && !invalid)) __syncthreads();
+    if (stage_packed && !invalid) __syncthreads();
 
     const int row0 = row0_block + warp * ROWS_PER_WARP;
     if (invalid) {
@@ -358,7 +388,7 @@ qtip_gather_gemv_warp_kernel(
                 const uint8_t b = row_packed[s >> 1];
                 const uint32_t sym = (s & 1) ? ((b >> 4) & 0x0F) : (b & 0x0F);
                 state = ((state << QTIP_K) | sym) & QTIP_STATE_MASK;
-                const float2 w = s_lut2[state];
+                const float2 w = qtip_decode_state(state);
                 a = fmaf(w.x * scale, xg[j].x, a);
                 a = fmaf(w.y * scale, xg[j].y, a);
             }
@@ -399,11 +429,11 @@ void launch_qtip_gather_gemv_v2_k4_l16_bf16(
     constexpr int WARPS_PER_BLOCK = 8;
     constexpr int ROWS_PER_WARP = 2;   // register-blocking: rows/warp (x reused)
     constexpr int ROWS_PER_BLOCK = WARPS_PER_BLOCK * ROWS_PER_WARP;
-    constexpr size_t LUT_BYTES = (size_t(1) << QTIP_L) * QTIP_V * sizeof(float);
-    const size_t lut_smem    = (LUT_BYTES <= 48 * 1024) ? LUT_BYTES : 0;          // shared LUT only when it fits
+    // RUN-161: codebook is computed in-register, so shared memory only ever
+    // stages the packed weight bytes (no LUT term anymore).
     const size_t packed_smem = (size_t)ROWS_PER_BLOCK * packed_per_row;
-    const bool   stage_packed = (lut_smem + packed_smem) <= 48 * 1024;            // stage weights when LUT+packed fit
-    const size_t SHMEM = stage_packed ? (lut_smem + packed_smem) : lut_smem;
+    const bool   stage_packed = packed_smem <= 48 * 1024;                         // stage weights into shared when they fit
+    const size_t SHMEM = stage_packed ? packed_smem : 0;
     dim3 grid((n_rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, n_pairs, 1);
     qtip_gather_gemv_warp_kernel<__nv_bfloat16, WARPS_PER_BLOCK, ROWS_PER_WARP>
         <<<grid, WARPS_PER_BLOCK * 32, SHMEM, stream>>>(
@@ -428,11 +458,11 @@ void launch_qtip_gather_gemv_v2_k4_l16_f16(
     constexpr int WARPS_PER_BLOCK = 8;
     constexpr int ROWS_PER_WARP = 2;   // register-blocking: rows/warp (x reused)
     constexpr int ROWS_PER_BLOCK = WARPS_PER_BLOCK * ROWS_PER_WARP;
-    constexpr size_t LUT_BYTES = (size_t(1) << QTIP_L) * QTIP_V * sizeof(float);
-    const size_t lut_smem    = (LUT_BYTES <= 48 * 1024) ? LUT_BYTES : 0;          // shared LUT only when it fits
+    // RUN-161: codebook is computed in-register, so shared memory only ever
+    // stages the packed weight bytes (no LUT term anymore).
     const size_t packed_smem = (size_t)ROWS_PER_BLOCK * packed_per_row;
-    const bool   stage_packed = (lut_smem + packed_smem) <= 48 * 1024;            // stage weights when LUT+packed fit
-    const size_t SHMEM = stage_packed ? (lut_smem + packed_smem) : lut_smem;
+    const bool   stage_packed = packed_smem <= 48 * 1024;                         // stage weights into shared when they fit
+    const size_t SHMEM = stage_packed ? packed_smem : 0;
     dim3 grid((n_rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, n_pairs, 1);
     qtip_gather_gemv_warp_kernel<__half, WARPS_PER_BLOCK, ROWS_PER_WARP>
         <<<grid, WARPS_PER_BLOCK * 32, SHMEM, stream>>>(
@@ -457,11 +487,11 @@ void launch_qtip_gather_gemv_v2_k4_l16_f32(
     constexpr int WARPS_PER_BLOCK = 8;
     constexpr int ROWS_PER_WARP = 2;   // register-blocking: rows/warp (x reused)
     constexpr int ROWS_PER_BLOCK = WARPS_PER_BLOCK * ROWS_PER_WARP;
-    constexpr size_t LUT_BYTES = (size_t(1) << QTIP_L) * QTIP_V * sizeof(float);
-    const size_t lut_smem    = (LUT_BYTES <= 48 * 1024) ? LUT_BYTES : 0;          // shared LUT only when it fits
+    // RUN-161: codebook is computed in-register, so shared memory only ever
+    // stages the packed weight bytes (no LUT term anymore).
     const size_t packed_smem = (size_t)ROWS_PER_BLOCK * packed_per_row;
-    const bool   stage_packed = (lut_smem + packed_smem) <= 48 * 1024;            // stage weights when LUT+packed fit
-    const size_t SHMEM = stage_packed ? (lut_smem + packed_smem) : lut_smem;
+    const bool   stage_packed = packed_smem <= 48 * 1024;                         // stage weights into shared when they fit
+    const size_t SHMEM = stage_packed ? packed_smem : 0;
     dim3 grid((n_rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, n_pairs, 1);
     qtip_gather_gemv_warp_kernel<float, WARPS_PER_BLOCK, ROWS_PER_WARP>
         <<<grid, WARPS_PER_BLOCK * 32, SHMEM, stream>>>(

@@ -122,28 +122,47 @@ pub fn viterbi_quantize_row(target_row: &[f32], lut: &[f32]) -> Vec<u8> {
     }
     // States with high bits set remain at +inf.
 
+    // Group-min optimization (RUN-161 — "faster Viterbi"): all 2^K states `s`
+    // that share the same high-bit group `g = (s >> K)` have the IDENTICAL
+    // predecessor set `{ (j << (L-K)) | g : j in 0..2^K }`, because
+    // `predecessor(s, j)` depends on `s` only through `(s >> K)`. So the
+    // min-over-predecessors is constant within a group: compute it once per group
+    // (2^(L-K) = 4096 groups) instead of re-scanning 16 predecessors for every
+    // one of the 2^L = 65536 states. This collapses the inner work per timestep
+    // from 2^L·2^K to 2^L + 2^(L-K)·2^K (≈ 4x fewer ops) and is BIT-IDENTICAL to
+    // the naive scan (same j-scan order 0..2^K, same strict-`<` tie-break → same
+    // argmin), so the baked symbol stream is byte-for-byte unchanged.
+    const NUM_GROUPS: usize = 1 << (super::L - K); // 2^(L-K) = 4096
+    let mut group_cost = vec![inf; NUM_GROUPS];
+    let mut group_j = vec![0u8; NUM_GROUPS];
+
     // Forward pass: t = 1, 2, ..., num_symbols - 1
     for t in 1..num_symbols {
         let target_t = &target_row[t * V as usize..(t + 1) * V as usize];
         let mut bt_t = vec![0u8; LUT_SIZE];
 
-        for s in 0..LUT_SIZE {
-            let err = decode_error(lut, s as u32, target_t);
-
-            // Find min over 16 predecessors.
+        // Phase 1: per-group min over the 16 shared predecessors (4096 groups).
+        for g in 0..NUM_GROUPS {
             let mut best_cost = inf;
             let mut best_j: u8 = 0;
             for j in 0..ALPHABET as u32 {
-                let p = predecessor(s as u32, j);
+                // predecessor(s, j) for ANY s with (s >> K) == g.
+                let p = (j << (super::L - K)) | g as u32;
                 let c = prev_cost[p as usize];
                 if c < best_cost {
                     best_cost = c;
                     best_j = j as u8;
                 }
             }
+            group_cost[g] = best_cost;
+            group_j[g] = best_j;
+        }
 
-            curr_cost[s] = err + best_cost;
-            bt_t[s] = best_j;
+        // Phase 2: per-state cost = local decode error + the group's predecessor min.
+        for s in 0..LUT_SIZE {
+            let g = s >> K; // high (L-K) bits select the predecessor group
+            curr_cost[s] = decode_error(lut, s as u32, target_t) + group_cost[g];
+            bt_t[s] = group_j[g];
         }
 
         backtrace.push(bt_t);
@@ -482,7 +501,101 @@ mod tests {
         );
     }
 
+    /// REGRESSION GUARD for the group-min optimization (RUN-161): the optimized
+    /// `viterbi_quantize_row` must return a BYTE-IDENTICAL symbol stream to the
+    /// naive O(T·2^L·2^K) reference, across many shapes and input distributions.
+    /// If this ever fails, the "faster Viterbi" is no longer bit-identical and the
+    /// bake quality has silently changed.
+    #[test]
+    fn optimized_matches_naive_reference_bit_for_bit() {
+        let lut = gaussian_lut();
+        for num_symbols in [1usize, 2, 3, 7, 16, 33, 64, 128] {
+            for variant in 0..4u32 {
+                let target: Vec<f32> = (0..(num_symbols * V as usize))
+                    .map(|i| {
+                        let x = i as f32;
+                        match variant {
+                            0 => (x * 0.0313).sin() * 1.2,
+                            1 => (x * 0.31).cos() * 1.5,
+                            2 => ((x * 0.7).sin() + (x * 0.013).cos()) * 0.9,
+                            // include exact ties / zeros to stress tie-breaking
+                            _ => ((i % 5) as f32 - 2.0) * 0.5,
+                        }
+                    })
+                    .collect();
+
+                let opt = viterbi_quantize_row(&target, &lut);
+                let naive = viterbi_quantize_row_naive(&target, &lut);
+                assert_eq!(
+                    opt, naive,
+                    "group-min Viterbi diverged from naive at num_symbols={num_symbols}, variant={variant}"
+                );
+            }
+        }
+    }
+
     // --- helpers ---
+
+    /// Naive O(T·2^L·2^K) Viterbi — the pre-optimization reference, kept ONLY to
+    /// prove the group-min version is bit-identical. Mirrors the original inner
+    /// loop exactly (per-state scan of all 16 predecessors, strict-`<` tie-break).
+    #[allow(clippy::needless_range_loop, clippy::unnecessary_cast)]
+    fn viterbi_quantize_row_naive(target_row: &[f32], lut: &[f32]) -> Vec<u8> {
+        let num_symbols = target_row.len() / V as usize;
+        assert!(num_symbols > 0);
+        let inf = f32::INFINITY;
+        let mut prev_cost = vec![inf; LUT_SIZE];
+        let mut curr_cost = vec![inf; LUT_SIZE];
+        let mut backtrace: Vec<Vec<u8>> = Vec::with_capacity(num_symbols);
+
+        let target_first = &target_row[..V as usize];
+        for s in 0..ALPHABET as usize {
+            prev_cost[s] = decode_error(lut, s as u32, target_first);
+        }
+
+        for t in 1..num_symbols {
+            let target_t = &target_row[t * V as usize..(t + 1) * V as usize];
+            let mut bt_t = vec![0u8; LUT_SIZE];
+            for s in 0..LUT_SIZE {
+                let err = decode_error(lut, s as u32, target_t);
+                let mut best_cost = inf;
+                let mut best_j: u8 = 0;
+                for j in 0..ALPHABET as u32 {
+                    let p = predecessor(s as u32, j);
+                    let c = prev_cost[p as usize];
+                    if c < best_cost {
+                        best_cost = c;
+                        best_j = j as u8;
+                    }
+                }
+                curr_cost[s] = err + best_cost;
+                bt_t[s] = best_j;
+            }
+            backtrace.push(bt_t);
+            std::mem::swap(&mut prev_cost, &mut curr_cost);
+        }
+
+        let mut best_final = 0u32;
+        let mut best_final_cost = inf;
+        for s in 0..LUT_SIZE {
+            if prev_cost[s] < best_final_cost {
+                best_final_cost = prev_cost[s];
+                best_final = s as u32;
+            }
+        }
+
+        let mut symbols = vec![0u8; num_symbols];
+        let mut s = best_final;
+        symbols[num_symbols - 1] = symbol_of(s) as u8;
+        for t in (1..num_symbols).rev() {
+            let bt_t = &backtrace[t - 1];
+            let j = bt_t[s as usize] as u32;
+            let prev_s = predecessor(s, j);
+            symbols[t - 1] = symbol_of(prev_s) as u8;
+            s = prev_s;
+        }
+        symbols
+    }
 
     fn greedy_quantize_row(target: &[f32], lut: &[f32]) -> Vec<u8> {
         let num_symbols = target.len() / V as usize;
