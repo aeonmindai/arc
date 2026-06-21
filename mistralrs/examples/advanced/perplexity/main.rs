@@ -8,9 +8,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use either::Either;
 use mistralrs::{
-    cross_entropy_loss, parse_isq_value, Constraint, DType, Device, MistralRs, ModelBuilder,
-    NormalRequest, Request, ResponseOk, SamplingParams, Tensor,
+    cross_entropy_loss, parse_isq_value, Constraint, DType, Device, MistralRs, NormalLoaderType,
+    NormalRequest, Request, ResponseOk, SamplingParams, Tensor, TextModelBuilder,
 };
+use std::str::FromStr;
 use tokio::sync::mpsc::channel;
 
 /// Calculate perplexity of a model. By default, this uses the Llama 3.1 8B model.
@@ -32,6 +33,22 @@ struct Args {
     /// Generate and utilize an imatrix to enhance GGUF quantizations.
     #[arg(short, long)]
     calibration_file: Option<PathBuf>,
+
+    /// Force a specific model architecture / loader type (e.g. `deepseekv4`).
+    /// Otherwise it is auto-detected from the model's config.json.
+    #[arg(short, long)]
+    arch: Option<String>,
+
+    /// Path to the first `.uqff` shard to load pre-quantized weights from
+    /// (e.g. `/root/v4-0.uqff`). Remaining shards are auto-discovered.
+    #[arg(short, long)]
+    uqff: Option<PathBuf>,
+
+    /// Tokens per perplexity chunk (default 1024). Set below a model's sliding
+    /// window (e.g. 64) to isolate short-context behavior from long-context
+    /// sparse-attention paths.
+    #[arg(long, default_value_t = 1024)]
+    chunk_size: usize,
 }
 
 async fn process_chunk(runner: &MistralRs, chunk: Vec<u32>) -> anyhow::Result<(Tensor, Vec<u32>)> {
@@ -85,13 +102,23 @@ async fn main() -> Result<()> {
         None
     };
 
-    let prompt_chunksize = 1024;
-    let mut model_builder = ModelBuilder::new(&args.model_id).with_logging();
+    let prompt_chunksize = args.chunk_size;
+    let mut model_builder = TextModelBuilder::new(&args.model_id).with_logging();
     if let Some(quant) = quant {
         model_builder = model_builder.with_isq(quant);
     }
     if let Some(calibration_file) = &args.calibration_file {
         model_builder = model_builder.with_calibration_file(calibration_file.clone());
+    }
+    if let Some(arch) = &args.arch {
+        let loader_type = NormalLoaderType::from_str(arch).map_err(anyhow::Error::msg)?;
+        model_builder = model_builder.with_loader_type(loader_type);
+    }
+    if let Some(uqff) = &args.uqff {
+        #[allow(deprecated)]
+        {
+            model_builder = model_builder.from_uqff(vec![uqff.clone()]);
+        }
     }
 
     let model = model_builder.build().await?;

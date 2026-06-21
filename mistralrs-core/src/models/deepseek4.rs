@@ -579,8 +579,30 @@ impl V4Compressor {
     }
 
     /// Real V4 compressor forward, operating directly on the layer input.
-    /// Returns `[B, T_c, head_dim]` with `T_c = T / ratio`. SGLang
-    /// `compressor.py:366-392`.
+    ///
+    /// Faithful port of the model's own reference `Compressor.forward`
+    /// (prefill / `start_pos == 0` path) in `inference/model.py`. Returns the
+    /// **pre-RoPE** compressed KV `[B, T_c, head_dim]` with `T_c = T / ratio`.
+    /// Compress-θ RoPE on the last `qk_rope_head_dim` dims (at the strided
+    /// compressed positions `[0, ratio, 2*ratio, …]`) is applied by the caller,
+    /// which owns the rotary embedding.
+    ///
+    /// Algorithm (reference lines ~316-380):
+    ///   - `wkv_gate(x)` → split into `value = wkv(x)` and `score = wgate(x)`
+    ///     (the loader concatenates `cat([wkv, wgate], dim=0)`, so `split[0]`
+    ///     is the value and `split[1]` is the score).
+    ///   - group `ratio` consecutive tokens; `score += ape`.
+    ///   - **overlap** (ratio == 4): re-window each entry over `2*ratio` tokens
+    ///     spanning the previous + current group (`overlap_transform`).
+    ///   - pool the value by a **softmax over the group axis**:
+    ///     `pooled = (value * softmax(score)).sum(group)`.
+    ///   - RMSNorm over `head_dim`.
+    ///
+    /// The previous implementation was wrong on every one of these steps
+    /// (value/score swapped, `sigmoid(gate)*val` instead of the value, a plain
+    /// sum instead of a softmax-weighted pool, no overlap, a bogus `coff`
+    /// collapse) — which corrupted the compressed (distant-context) KV on all
+    /// CSA/HCA layers and produced the long-context collapse. RUN-161.
     pub fn forward_from_xs(&self, xs: &Tensor) -> Result<Tensor> {
         let dims = xs.dims();
         if dims.len() != 3 {
@@ -597,32 +619,76 @@ impl V4Compressor {
             );
         }
         let t_c = t / self.ratio;
-        let work_dtype = xs.dtype();
+        let out_dtype = xs.dtype();
+        let dev = xs.device();
+        let d = self.head_dim;
+        let cd = self.coff * self.head_dim;
 
-        let wkv = self.wkv_gate.forward_autocast(xs)?;
-        let split = wkv.split(
-            &[self.coff * self.head_dim, self.coff * self.head_dim],
-            D::Minus1,
-        )?;
-        let gate = split[0].clone();
-        let val = split[1].clone();
-        let score = (candle_nn::ops::sigmoid(&gate)? * val)?;
-
-        let score_grouped = score.reshape((b, t_c, self.ratio, self.coff * self.head_dim))?;
+        // Compression runs in fp32 (reference: `x = x.float()`).
+        let fused = self.wkv_gate.forward_autocast(xs)?.to_dtype(DType::F32)?;
+        let split = fused.split(&[cd, cd], D::Minus1)?;
+        let value = split[0].reshape((b, t_c, self.ratio, cd))?; // wkv
+        let score = split[1].reshape((b, t_c, self.ratio, cd))?; // wgate
         let ape = self
             .ape
-            .to_dtype(work_dtype)?
-            .reshape((1, 1, self.ratio, self.coff * self.head_dim))?;
-        let score_grouped = score_grouped.broadcast_add(&ape)?;
-        let aggregated = score_grouped.sum(2)?;
+            .to_dtype(DType::F32)?
+            .reshape((1, 1, self.ratio, cd))?;
+        let score = score.broadcast_add(&ape)?;
 
-        let flat = aggregated.reshape((b * t_c * self.coff, self.head_dim))?;
+        // Overlap (ratio == 4, coff == 2): re-window over 2*ratio neighbouring
+        // tokens. The channel splits into [overlap-half (first d) | normal-half
+        // (second d)]. Non-overlap layers keep the plain `ratio` group.
+        let (value, score) = if self.coff == 2 {
+            (
+                Self::overlap_transform(&value, 0.0, b, t_c, self.ratio, d, dev)?,
+                Self::overlap_transform(&score, f64::NEG_INFINITY, b, t_c, self.ratio, d, dev)?,
+            )
+        } else {
+            (value, score)
+        };
+
+        // Softmax-weighted pool over the group axis (dim 2).
+        let weights = candle_nn::ops::softmax(&score, 2)?;
+        let pooled = (value * weights)?.sum(2)?; // [b, t_c, d]
+
+        // Cast back to model dtype, then RMSNorm over head_dim.
+        let pooled = pooled.to_dtype(out_dtype)?;
+        let flat = pooled.reshape((b * t_c, d))?;
         let normed = flat.apply(&self.norm)?;
-        let collapsed = normed
-            .reshape((b * t_c, self.coff, self.head_dim))?
-            .sum(1)?;
+        normed.reshape((b, t_c, d))
+    }
 
-        collapsed.reshape((b, t_c, self.head_dim))
+    /// Overlapping-window transform for the ratio-4 compressor (reference
+    /// `Compressor.overlap_transform`). Maps a grouped tensor
+    /// `[b, t_c, ratio, 2*d]` → `[b, t_c, 2*ratio, d]`: the last `ratio` slots
+    /// take the current group's normal-half (channels `d..2d`), the first
+    /// `ratio` slots take the **previous** group's overlap-half (channels
+    /// `0..d`). The first group has no predecessor, so its leading `ratio`
+    /// slots are filled with `fill` (`0` for values, `-inf` for scores so the
+    /// softmax ignores them).
+    #[allow(clippy::too_many_arguments)]
+    fn overlap_transform(
+        grouped: &Tensor,
+        fill: f64,
+        b: usize,
+        t_c: usize,
+        ratio: usize,
+        d: usize,
+        dev: &Device,
+    ) -> Result<Tensor> {
+        // Current group's normal-half → last `ratio` slots (all groups).
+        let normal = grouped.narrow(D::Minus1, d, d)?.contiguous()?; // [b, t_c, ratio, d]
+        // Current group's overlap-half (channels 0..d), shifted forward one
+        // group so it lands in the *next* group's first `ratio` slots.
+        let overlap = grouped.narrow(D::Minus1, 0, d)?; // [b, t_c, ratio, d]
+        let pad = Tensor::full(fill, (b, 1, ratio, d), dev)?.to_dtype(grouped.dtype())?;
+        let prev = if t_c > 1 {
+            let shifted = overlap.narrow(1, 0, t_c - 1)?; // groups 0..t_c-2
+            Tensor::cat(&[&pad, &shifted.contiguous()?], 1)?
+        } else {
+            pad
+        };
+        Tensor::cat(&[&prev, &normal], 2)
     }
 }
 
@@ -686,6 +752,9 @@ struct Attention {
     /// construction. Audit §0 + §8 P1 item 11.
     rotary_emb: Arc<DeepSeekV2RotaryEmbedding>,
     cfg: DeepSeekV4Config,
+    /// RUN-161 decode-bug localization: this layer's index, used only to gate
+    /// the `V4_TRACE` per-op tensor dumps to a single layer (see `v4_trace_dump`).
+    dbg_layer_idx: usize,
     paged_attn: Option<PagedAttention>,
     sdpa_params: SdpaParams,
     /// Per-TP-rank Q head count.
@@ -982,6 +1051,7 @@ impl Attention {
             wo_b,
             rotary_emb,
             cfg: cfg.clone(),
+            dbg_layer_idx: layer_idx,
             paged_attn,
             num_attention_heads,
             num_kv_heads: num_kv_heads_tp,
@@ -1045,6 +1115,53 @@ impl Attention {
         Ok((q_out, k_out))
     }
 
+    /// Compute the compressed (distant-context) KV for a CSA/HCA layer from the
+    /// compressor-input history, with compress-θ RoPE applied at the strided
+    /// compressed positions. Returns `[B, 1, T_c, head_dim]`, or `None` when:
+    ///   * this is a Standard layer / no compressor loaded, or
+    ///   * the history is shorter than one `ratio` block (`T_c == 0`) — in which
+    ///     case the sliding-window branch alone covers the whole context.
+    ///
+    /// The largest `ratio`-multiple prefix of the history is compressed; the
+    /// remaining `< ratio` recent tokens are covered by the raw sliding-window
+    /// branch in [`super::dsv4_attention::dsv4_attention`]. Reference
+    /// `inference/model.py` `Attention.forward` (the `kv_compress` path).
+    fn compressed_kv(&self, xs_hist: &Tensor) -> Result<Option<Tensor>> {
+        if self.compress_ratio == CompressRatio::Standard {
+            return Ok(None);
+        }
+        let Some(compressor) = self.compressor.as_ref() else {
+            return Ok(None);
+        };
+        let ratio = self.compress_ratio.ratio();
+        let t_xs = xs_hist.dim(1)?;
+        let t_trunc = (t_xs / ratio) * ratio;
+        if t_trunc == 0 {
+            return Ok(None);
+        }
+        let xs_trunc = if t_trunc == t_xs {
+            xs_hist.clone()
+        } else {
+            xs_hist.narrow(1, 0, t_trunc)?
+        };
+        // [B, T_c, head_dim] (pre-RoPE) → [B, 1, T_c, head_dim].
+        let comp = compressor.forward_from_xs(&xs_trunc)?.unsqueeze(1)?;
+        let t_c = comp.dim(2)?;
+        // Compressed entry j sits at absolute position j*ratio. Apply the
+        // layer's (compress-θ) RoPE to the last qk_rope_head_dim dims there.
+        // NOTE: builds a small arange each call (a host/device sync); fine on
+        // the correctness-first dense path — the long-context sparse-gather
+        // kernel is the place to precompute this.
+        let dev = comp.device();
+        let positions = (Tensor::arange(0u32, t_c as u32, dev)?.to_dtype(DType::F32)?
+            * (ratio as f64))?
+        .to_dtype(DType::U32)?;
+        let comp =
+            self.rotary_emb
+                .forward_at_positions(&comp, self.cfg.qk_rope_head_dim, &positions)?;
+        Ok(Some(comp))
+    }
+
     fn forward(
         &self,
         xs: &Tensor,
@@ -1062,6 +1179,14 @@ impl Attention {
         let mdev = xs.device().clone();
 
         v4_nan_dbg(xs, "attn.in");
+        v4_trace_dump(self.dbg_layer_idx, xs, "00_xs_in");
+        // The position values are THE crux of the decode bug: dump them so the
+        // diff can compare the offset decode used (row N) vs prefill (0..N).
+        v4_trace_text(
+            self.dbg_layer_idx,
+            "00_meta",
+            &format!("seq_len={seq_len}\nseqlen_offsets={seqlen_offsets:?}\n"),
+        );
 
         // R2: the compressor (forward_from_xs) must see the *history* of the
         // attention input during decode, not just the current token. Keep a
@@ -1101,6 +1226,7 @@ impl Attention {
             q.broadcast_mul(&inv_rms)?
         };
         v4_stat_dbg(&q, "attn.q_normed");
+        v4_trace_dump(self.dbg_layer_idx, &q, "10_q_normed");
 
         // 2. K/V projection: single fused wkv. [B, T, hidden] → [B, T,
         //    head_dim] → kv_norm → reshape to [B, num_kv_heads=1, T,
@@ -1119,6 +1245,8 @@ impl Attention {
         let (q, k) = self.apply_rope_inplace(&q, &k, seqlen_offsets)?;
         v4_nan_dbg(&q, "attn.q_rope");
         v4_nan_dbg(&k, "attn.k_rope");
+        v4_trace_dump(self.dbg_layer_idx, &q, "20_q_rope");
+        v4_trace_dump(self.dbg_layer_idx, &k, "21_k_rope");
 
         // V4 QAT: FP8-simulate the non-rope dims of K (reference model.py:506
         // `act_quant(kv[..., :-rd], 64, ..., inplace=True)`). The model was
@@ -1126,6 +1254,7 @@ impl Attention {
         // FP8; feeding full BF16 is out-of-distribution. V=K so v inherits it.
         let k = act_quant_kv_nope(&k, self.cfg.qk_rope_head_dim)?;
         v4_stat_dbg(&k, "attn.k_actquant");
+        v4_trace_dump(self.dbg_layer_idx, &k, "30_k_actquant");
 
         // 4. V4: K and V come from the same wkv tensor. The kernel treats
         //    the wkv output as both K (for scores) and V (for weighted
@@ -1164,6 +1293,12 @@ impl Attention {
             compress_ratio: self.compress_ratio,
             sliding_window: self.sliding_window,
         };
+        // Faithful V4: the compressed (distant-context) KV, with compress-θ
+        // RoPE at the strided compressed positions. `dsv4_attention` runs a
+        // single softmax over the union [raw sliding-window KV ++ compressed
+        // KV] + attn_sink. `None` on Standard layers / short history (the
+        // window alone covers the context). RUN-161.
+        let compressed_kv = self.compressed_kv(&xs_for_compressor)?;
         let mut attn_out = match &self.paged_attn {
             Some(paged_attn) if self.compress_ratio == CompressRatio::Standard => match metadata {
                 Some(((key_cache, value_cache, _, _), input_metadata)) => paged_attn.forward(
@@ -1210,10 +1345,9 @@ impl Attention {
                         &q,
                         &k_full,
                         &v_full,
-                        &xs_for_compressor,
+                        compressed_kv.as_ref(),
                         attention_mask,
                         flash_params,
-                        self.compressor.as_ref(),
                         &self.sdpa_params,
                         dsv4_cfg,
                     )?
@@ -1226,10 +1360,9 @@ impl Attention {
                         &q,
                         &k,
                         &v,
-                        &xs_for_compressor,
+                        compressed_kv.as_ref(),
                         attention_mask,
                         flash_params,
-                        self.compressor.as_ref(),
                         &self.sdpa_params,
                         dsv4_cfg,
                     )?
@@ -1257,24 +1390,28 @@ impl Attention {
                     &q,
                     &k_full,
                     &v_full,
-                    &xs_for_compressor,
+                    compressed_kv.as_ref(),
                     gmask.as_ref(),
                     flash_params,
-                    self.compressor.as_ref(),
                     &self.sdpa_params,
                     dsv4_cfg,
                 )?
             }
             None => {
                 let (k_cached, v_cached) = kv_cache.append(&k, &v)?;
+                // Cache read-back: in decode this is prefill's K (0..N-1) + the
+                // new token's K. Diff vs prefill's freshly-computed K splits a
+                // cache-storage bug (old rows differ) from a new-token position
+                // bug (only the last row differs).
+                v4_trace_dump(self.dbg_layer_idx, &k_cached, "40_k_cached");
+                v4_trace_dump(self.dbg_layer_idx, &v_cached, "41_v_cached");
                 super::dsv4_attention::dsv4_attention(
                     &q,
                     &k_cached,
                     &v_cached,
-                    &xs_for_compressor,
+                    compressed_kv.as_ref(),
                     attention_mask,
                     flash_params,
-                    self.compressor.as_ref(),
                     &self.sdpa_params,
                     dsv4_cfg,
                 )?
@@ -1293,31 +1430,39 @@ impl Attention {
         //    LoRA. attn_out shape: [B, n_heads, T, head_dim].
         //    Audit §8 P1 item 12 — per-group einsum("tgd,grd->tgr").
         v4_nan_dbg(&attn_out, "attn.sdpa_out");
-        // Normalize to [B, H, T, head_dim]. Three input layouts reach here:
+        // Normalize to [B, H, T, head_dim]. Two input layouts reach here:
         //   * PagedAttention (Standard layers) returns 3-D [B*T, H, head_dim].
-        //   * SDPA prefill (mask present) is already 4-D [B, H, T, head_dim].
-        //   * SDPA decode (no mask) comes back 4-D [B, T, H, head_dim].
+        //   * SDPA (`Sdpa::run_attention`) returns 4-D [B, H, T, head_dim] in
+        //     BOTH prefill (mask) and decode (no-mask) — every backend
+        //     normalizes to [B, H, T, D] (cuBLASLt reshapes to it; flash/metal
+        //     transpose to it). The previous code transposed the no-mask decode
+        //     output assuming [B, T, H, D]; at seq_len=1 that turned the correct
+        //     [B, H, 1, D] into [B, 1, H, D], scrambling the head/dim order fed
+        //     to o_proj and collapsing every decode step (RUN-161 decode bug).
         // Without the 3-D case, paged decode transposes [B*T,H,D] -> [.,D,H] and
         // hits forward_inverse_tail with a rank-3 tensor -> "unexpected rank,
         // expected: 4, got: 3". (RUN-161)
         let attn_out_bhtd = if attn_out.rank() == 3 {
             let (_bt, h, hd) = attn_out.dims3()?;
             attn_out.reshape((bs, seq_len, h, hd))?.transpose(1, 2)?
-        } else if attention_mask.is_some() {
-            attn_out.clone()
         } else {
-            attn_out.transpose(1, 2)?
+            attn_out.clone()
         };
         // V4: inverse-RoPE the last qk_rope_head_dim dims of the attention
         // output. V=K carries the key's RoPE on those dims, so the output must
         // be de-rotated (reference inference/model.py:534). Missing this leaves
         // the value content wrongly position-rotated -> attention output is
         // corrupted on rope dims -> incoherent generation (RUN-161).
+        // Normalized [B,H,T,D] SDPA output BEFORE the position-dependent inverse
+        // RoPE — diffing this vs 60_after_invtail isolates whether the bug is the
+        // attention kernel itself or the inverse-tail de-rotation.
+        v4_trace_dump(self.dbg_layer_idx, &attn_out_bhtd, "55_sdpa_bhtd");
         let attn_out_bhtd = self.rotary_emb.forward_inverse_tail(
             &attn_out_bhtd,
             self.cfg.qk_rope_head_dim,
             seqlen_offsets,
         )?;
+        v4_trace_dump(self.dbg_layer_idx, &attn_out_bhtd, "60_after_invtail");
         // -> [B, T, H*head_dim]
         attn_out = attn_out_bhtd.transpose(1, 2)?.reshape((bs, seq_len, ()))?;
 
@@ -1374,6 +1519,7 @@ impl Attention {
         v4_nan_dbg(&out, "attn.wo_b");
         Ok(out)
         })?;
+        v4_trace_dump(self.dbg_layer_idx, &out, "70_o_out");
         Ok(out)
     }
 }
@@ -2030,6 +2176,52 @@ pub(crate) fn v4_collapse_dbg(t: &Tensor, tag: &str, pos_dim: usize) {
     };
     if let Err(e) = run() {
         eprintln!("ARC_COLLAPSE [{tag}] failed: {e}");
+    }
+}
+
+/// Debug-only per-op tensor dumper for tandem prefill-vs-decode differential
+/// tracing (RUN-161 decode bug). Enabled by `V4_TRACE=<dir>`. Writes each tagged
+/// tensor to `<dir>/L<layer>.<tag>.npy` (f32). Run prefill and decode into two
+/// different dirs, then diff op-by-op: the FIRST op whose cosine drops below 1.0
+/// is the bug. Gated to a single layer (`V4_TRACE_LAYER`, default 0) to stay
+/// tiny and avoid per-layer overwrite. Position alignment is done in the Python
+/// diff (prefill keeps row N, decode keeps row 0). No-op when unset.
+pub(crate) fn v4_trace_want_layer() -> Option<usize> {
+    if std::env::var_os("V4_TRACE").is_none() {
+        return None;
+    }
+    Some(
+        std::env::var("V4_TRACE_LAYER")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+    )
+}
+
+pub(crate) fn v4_trace_dump(layer: usize, t: &Tensor, tag: &str) {
+    if v4_trace_want_layer() != Some(layer) {
+        return;
+    }
+    let dir = match std::env::var("V4_TRACE") {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let path = format!("{dir}/L{layer}.{tag}.npy");
+    if let Err(e) = t
+        .to_dtype(DType::F32)
+        .and_then(|t| t.contiguous())
+        .and_then(|t| t.write_npy(&path))
+    {
+        eprintln!("V4_TRACE [{tag}] write failed: {e}");
+    }
+}
+
+pub(crate) fn v4_trace_text(layer: usize, tag: &str, text: &str) {
+    if v4_trace_want_layer() != Some(layer) {
+        return;
+    }
+    if let Ok(dir) = std::env::var("V4_TRACE") {
+        let _ = std::fs::write(format!("{dir}/L{layer}.{tag}.txt"), text);
     }
 }
 
@@ -3686,7 +3878,6 @@ mod tests {
         )?;
         let v = k.clone();
 
-        let compressor = V4Compressor::uniform(4, head_dim, &device)?;
         let sdpa_params = SdpaParams {
             n_kv_groups: 1,
             softcap: None,
@@ -3706,17 +3897,23 @@ mod tests {
             sliding_window: 4,
         };
 
-        // Compress dispatch. T_xs = t_k (divisible by ratio) drives the real
-        // forward_from_xs compressed branch; uniform compressor hidden dim 1.
-        let xs = Tensor::zeros((1, t_k, 1), DType::F32, &device)?;
+        // Compressed KV (precomputed by `Attention::compressed_kv` in the real
+        // path): T_c = t_k / ratio = 4 entries, shape [B, 1, T_c, D].
+        let t_c = t_k / 4;
+        let comp = Tensor::from_vec(
+            (0..(n_kv_heads * t_c * head_dim))
+                .map(|i| ((i as f32) * 0.09).sin())
+                .collect::<Vec<f32>>(),
+            (1, n_kv_heads, t_c, head_dim),
+            &device,
+        )?;
         let out = dsv4_attention(
             &q,
             &k,
             &v,
-            &xs,
+            Some(&comp),
             None,
             &flash_params,
-            Some(&compressor),
             &sdpa_params,
             cfg,
         )?;
@@ -3792,7 +3989,6 @@ mod tests {
         )?;
         let v = k.clone();
 
-        let compressor = V4Compressor::uniform(128, head_dim, &device)?;
         let sdpa_params = SdpaParams {
             n_kv_groups: 1,
             softcap: None,
@@ -3812,16 +4008,22 @@ mod tests {
             sliding_window: 8,
         };
 
-        // T_xs = t_k (divisible by ratio 128) → real forward_from_xs branch.
-        let xs = Tensor::zeros((1, t_k, 1), DType::F32, &device)?;
+        // Compressed KV: T_c = t_k / ratio = 1 entry, shape [B, 1, T_c, D].
+        let t_c = t_k / 128;
+        let comp = Tensor::from_vec(
+            (0..(n_kv_heads * t_c * head_dim))
+                .map(|i| ((i as f32) * 0.03).cos())
+                .collect::<Vec<f32>>(),
+            (1, n_kv_heads, t_c, head_dim),
+            &device,
+        )?;
         let out = dsv4_attention(
             &q,
             &k,
             &v,
-            &xs,
+            Some(&comp),
             None,
             &flash_params,
-            Some(&compressor),
             &sdpa_params,
             cfg,
         )?;
@@ -3890,19 +4092,17 @@ mod tests {
             sliding_window: 4,
         };
 
-        // Pass `Some(&compressor)` to be paranoid — Standard layers should
-        // never invoke it. Compare bytewise against plain Sdpa.
-        let compressor = V4Compressor::uniform(4, d, &device)?;
-        // Standard dispatch returns before the compressor; xs is unused.
-        let xs = Tensor::zeros((b, t, 1), DType::F32, &device)?;
+        // Standard layers must bypass the compressed branch entirely: even if a
+        // caller (paranoically) supplied compressed KV, the Standard dispatch
+        // returns plain SDPA before touching it. Pass `None` here — the real
+        // `Attention::compressed_kv` returns `None` for Standard layers anyway.
         let out = dsv4_attention(
             &q,
             &k,
             &v,
-            &xs,
+            None,
             None,
             &flash_params,
-            Some(&compressor),
             &sdpa_params,
             cfg,
         )?;

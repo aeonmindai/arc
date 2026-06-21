@@ -1679,6 +1679,37 @@ impl DeepSeekV2RotaryEmbedding {
         };
         Tensor::cat(&[&x_nope, &rotated], 3)?.contiguous()
     }
+
+    /// Apply RoPE (adjacent-pair / `rope_i`) to the last `rope_dim` dims of `x`
+    /// at the given absolute `positions`, rather than a contiguous range.
+    ///
+    /// `x`: `[B, H, T, head_dim]`; `positions`: `[T]` (`u32`), one absolute
+    /// position per time step. Only the last `rope_dim` dims are rotated; the
+    /// leading `head_dim - rope_dim` (NoPE) dims are returned unchanged.
+    ///
+    /// Used by the V4 compressor: a compressed entry `j` sits at the strided
+    /// absolute position `j * ratio`, so the standard contiguous `forward` /
+    /// `forward_inverse_tail` (which `narrow`s a window of the cos/sin table)
+    /// cannot express it. Reference `inference/model.py` Compressor.forward:
+    /// `apply_rotary_emb(kv[..., -rd:], self.freqs_cis[:cutoff:ratio])`.
+    pub fn forward_at_positions(
+        &self,
+        x: &Tensor,
+        rope_dim: usize,
+        positions: &Tensor,
+    ) -> Result<Tensor> {
+        let (_b, _h, seq_len, head_dim) = x.dims4()?;
+        debug_assert_eq!(positions.dim(0)?, seq_len);
+        let nope = head_dim - rope_dim;
+        let x_nope = x.narrow(D::Minus1, 0, nope)?;
+        let x_pe = x.narrow(D::Minus1, nope, rope_dim)?.contiguous()?;
+        // Gather the cos/sin rows for the requested positions: [T, rope_dim/2].
+        let positions = positions.to_dtype(DType::U32)?;
+        let cos = self.cos.index_select(&positions, 0)?;
+        let sin = self.sin.index_select(&positions, 0)?;
+        let rotated = candle_nn::rotary_emb::rope_i(&x_pe, &cos, &sin)?;
+        Tensor::cat(&[&x_nope, &rotated], D::Minus1)?.contiguous()
+    }
 }
 
 #[derive(Debug, Clone)]

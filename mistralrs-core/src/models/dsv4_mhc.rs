@@ -835,7 +835,7 @@ mod tests {
             "hc_ffn_scale".to_string(),
             Tensor::zeros(3, DType::F32, &dev)?,
         );
-        let vb = vb_from(tensors, dev);
+        let vb = vb_from(tensors, dev.clone());
         let params = V4MHCLayerParams::try_load(&cfg, &vb, 0, &dev)
             .expect("layer params should load");
         assert_eq!(params.mix_hc, mix_hc);

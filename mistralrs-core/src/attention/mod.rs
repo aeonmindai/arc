@@ -12,6 +12,22 @@ pub(crate) use backends::{flash_attn, maybe_synchronize, naive_sdpa, sinks_attn}
 /// Chunk size for attention computation to avoid OOM on long sequences
 pub(crate) const ATTENTION_CHUNK_SIZE: usize = 1024;
 
+/// RUN-161 decode-bug bisection: when `ARC_FORCE_NAIVE_SDPA=1`, the CUDA
+/// no-flash path skips the cuBLASLt batch-matmul attention and uses
+/// `naive_sdpa` instead. cuBLASLt at M=1 (single-query decode step) on the
+/// V4 head_dim=512 shape is the prime suspect for the decode collapse; this
+/// gate lets us A/B it at runtime with no rebuild between tests.
+fn force_naive_sdpa() -> bool {
+    use std::sync::OnceLock;
+    static FORCE: OnceLock<bool> = OnceLock::new();
+    *FORCE.get_or_init(|| {
+        matches!(
+            std::env::var("ARC_FORCE_NAIVE_SDPA").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
 /// Generic chunked attention computation that can be used by different backends
 pub(crate) fn chunked_attention<F>(
     q: &Tensor,
@@ -225,7 +241,8 @@ impl Sdpa {
 
         // TODO: bench?
         #[allow(unused)]
-        if let (Device::Cuda(_), Some(cublaslt)) = (
+        if let (false, Device::Cuda(_), Some(cublaslt)) = (
+            force_naive_sdpa(),
             q.device(),
             mistralrs_quant::cublaslt::CUBLASLT_CONTROLLER.get_for_device(q.device()),
         ) {
