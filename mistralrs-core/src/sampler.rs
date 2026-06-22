@@ -952,7 +952,8 @@ impl Sampler {
             && no_penalties
             && !logits.device().is_cpu();
         if trivial {
-            // Greedy: single GPU argmax kernel + 4-byte D2H.
+            // Greedy: single GPU argmax kernel + 4-byte D2H. Never sorts, so
+            // always safe regardless of vocab size.
             if self.temperature.is_none() {
                 let next_token = logits.argmax(D::Minus1)?.to_scalar::<u32>()?;
                 let bytes = if let Some(tok) = &self.tokenizer {
@@ -970,15 +971,36 @@ impl Sampler {
                     bytes,
                 });
             }
-            // Temperature sampling: full nucleus sampling stays on GPU via sample_fast.
-            return self.sample_fast(
-                logits,
-                context,
-                return_logprobs,
-                self.top_k,
-                self.top_p,
-                self.min_p,
-            );
+            // Temperature sampling: full nucleus sampling stays on GPU via
+            // sample_fast. BUT the top-k / top-p branches there call
+            // `fast_sort_asc`, which on CUDA dispatches candle's arg_sort kernel.
+            // That kernel requests `next_power_of_2(vocab) * 4` bytes of shared
+            // memory per block; for large vocabularies (e.g. DeepSeek-V4's
+            // ~129K) this is ~1 MB, far over the 48 KB/block hardware limit, and
+            // the launch fails with CUDA_ERROR_INVALID_VALUE. Only stay on the
+            // GPU sort path when a sort is either not needed (top_k<=0 and
+            // top_p>=1) or small enough to fit; otherwise fall through to the
+            // correct CPU sampling path below (it pays a D2H of the logits, but
+            // only when top-k/top-p is actually requested — the common
+            // top_p=1.0/top_k=0 request still stays on GPU).
+            let needs_sort = self.top_k > 0 || (self.top_p > 0.0 && self.top_p < 1.0);
+            let sort_fits = || -> bool {
+                match logits.dim(D::Minus1) {
+                    Ok(vocab) => vocab.next_power_of_two().saturating_mul(4) <= 48 * 1024,
+                    Err(_) => false,
+                }
+            };
+            if !needs_sort || sort_fits() {
+                return self.sample_fast(
+                    logits,
+                    context,
+                    return_logprobs,
+                    self.top_k,
+                    self.top_p,
+                    self.min_p,
+                );
+            }
+            // else: fall through to the CPU sampling path (correct on any vocab).
         }
 
         let logits = logits.to_vec1()?;
