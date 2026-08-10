@@ -1298,7 +1298,16 @@ impl Attention {
         // single softmax over the union [raw sliding-window KV ++ compressed
         // KV] + attn_sink. `None` on Standard layers / short history (the
         // window alone covers the context). RUN-161.
-        let compressed_kv = self.compressed_kv(&xs_for_compressor)?;
+        //
+        // RUN-161 #27 ablation: ARC_V4_WINDOW_ONLY=1 forces the compressed
+        // branch off so attention degenerates to pure sliding-window. Used to
+        // isolate whether long-ctx sustained-generation degradation lives in
+        // the compressed branch (coherent window-only ⇒ yes) vs elsewhere.
+        let compressed_kv = if std::env::var_os("ARC_V4_WINDOW_ONLY").is_some() {
+            None
+        } else {
+            self.compressed_kv(&xs_for_compressor)?
+        };
         let mut attn_out = match &self.paged_attn {
             Some(paged_attn) if self.compress_ratio == CompressRatio::Standard => match metadata {
                 Some(((key_cache, value_cache, _, _), input_metadata)) => paged_attn.forward(
@@ -3655,9 +3664,9 @@ mod tests {
         // Expected output shape: [B, T/ratio, head_dim].
         assert_eq!(out.dims(), &[b, t / ratio, head_dim]);
 
-        // Non-trivial output: the loaded wkv + wgate weights are non-zero
-        // and ape is 0.05, so the post-sigmoid * val * (1 + ape) sum is
-        // strictly non-zero. Check via max absolute value.
+        // Non-trivial output: the loaded wkv + wgate weights are non-zero, so
+        // the softmax-pooled (value × softmax(score + ape)) sum is strictly
+        // non-zero. Check via max absolute value.
         let flat: Vec<f32> = out.flatten_all()?.to_vec1()?;
         let max_abs = flat.iter().fold(0.0f32, |a, b| a.max(b.abs()));
         assert!(
@@ -3691,6 +3700,203 @@ mod tests {
         let xs = Tensor::ones((b, t, hidden_size), DType::F32, &device)?;
         let out = comp.forward_from_xs(&xs)?;
         assert_eq!(out.dims(), &[b, t / ratio, head_dim]);
+        Ok(())
+    }
+
+    /// Differential oracle for the RUN-161 #24 compressor-math fix.
+    ///
+    /// Pins the EXACT pooling semantics of `forward_from_xs` against an
+    /// INDEPENDENT scalar re-derivation of the model's reference algorithm
+    /// (inference/model.py `Compressor.forward`):
+    ///   value = fused[..., :cd]  (wkv),  score = fused[..., cd:]  (wgate)
+    ///   score += ape
+    ///   overlap_transform (coff==2): previous group's overlap-half (channels
+    ///     0..d) → first `ratio` slots (fill 0 / -inf for group 0); current
+    ///     group's normal-half (channels d..2d) → last `ratio` slots
+    ///   weights = softmax(score, over the slot axis)        [per channel]
+    ///   pooled  = sum(value * weights, over the slot axis)
+    ///   out     = RMSNorm(pooled)  over head_dim
+    ///
+    /// A regression to the pre-fix math (value/score swapped, a sigmoid gate,
+    /// a plain sum instead of softmax-pool, or a missing overlap window) moves
+    /// the output well outside the 1e-4 tolerance and trips this test on the
+    /// CPU — no GPU required. Uses the pre-fused F32 `wkv_gate.weight` layout so
+    /// the linear stays F32 (the dual-tensor path stores it in BF16), making the
+    /// comparison tight.
+    #[test]
+    fn v4_compressor_forward_matches_scalar_reference() -> Result<()> {
+        // Independent scalar reference. Returns [b, t_c, d] row-major.
+        #[allow(clippy::too_many_arguments)]
+        fn scalar_reference(
+            fused: &[f32], // [b, t, 2*cd] row-major, cd = coff*head_dim
+            ape: &[f32],   // [ratio, cd] row-major
+            b: usize,
+            t: usize,
+            ratio: usize,
+            coff: usize,
+            head_dim: usize,
+            eps: f32,
+        ) -> Vec<f32> {
+            let d = head_dim;
+            let cd = coff * head_dim;
+            let two_cd = 2 * cd;
+            let t_c = t / ratio;
+            let n_slots = coff * ratio; // overlap (coff==2) doubles the slot count
+            let mut out = vec![0f32; b * t_c * d];
+            // Row offset of group `grp`, slot `r` within the fused [b,t,2cd] buffer.
+            let row_base = |bi: usize, grp: usize, r: usize| (bi * t + grp * ratio + r) * two_cd;
+            for bi in 0..b {
+                for g in 0..t_c {
+                    let mut slot_val = vec![0f32; n_slots * d];
+                    let mut slot_score = vec![0f32; n_slots * d];
+                    if coff == 2 {
+                        // First `ratio` slots: previous group's overlap-half
+                        // (value channels 0..d, score channels 0..d).
+                        for r in 0..ratio {
+                            for c in 0..d {
+                                if g > 0 {
+                                    let base = row_base(bi, g - 1, r);
+                                    slot_val[r * d + c] = fused[base + c];
+                                    slot_score[r * d + c] = fused[base + cd + c] + ape[r * cd + c];
+                                } else {
+                                    slot_val[r * d + c] = 0.0;
+                                    slot_score[r * d + c] = f32::NEG_INFINITY;
+                                }
+                            }
+                        }
+                        // Last `ratio` slots: current group's normal-half
+                        // (value channels d..2d, score channels d..2d).
+                        for r in 0..ratio {
+                            let slot = ratio + r;
+                            let base = row_base(bi, g, r);
+                            for c in 0..d {
+                                slot_val[slot * d + c] = fused[base + d + c];
+                                slot_score[slot * d + c] =
+                                    fused[base + cd + d + c] + ape[r * cd + d + c];
+                            }
+                        }
+                    } else {
+                        // No overlap: `ratio` slots, full cd == d channels.
+                        for r in 0..ratio {
+                            let base = row_base(bi, g, r);
+                            for c in 0..d {
+                                slot_val[r * d + c] = fused[base + c];
+                                slot_score[r * d + c] = fused[base + cd + c] + ape[r * cd + c];
+                            }
+                        }
+                    }
+                    // Softmax-pool per channel over the slot axis.
+                    let mut pooled = vec![0f32; d];
+                    for c in 0..d {
+                        let mut maxs = f32::NEG_INFINITY;
+                        for s in 0..n_slots {
+                            maxs = maxs.max(slot_score[s * d + c]);
+                        }
+                        let mut denom = 0f32;
+                        for s in 0..n_slots {
+                            denom += (slot_score[s * d + c] - maxs).exp();
+                        }
+                        let mut acc = 0f32;
+                        for s in 0..n_slots {
+                            let w = (slot_score[s * d + c] - maxs).exp() / denom;
+                            acc += slot_val[s * d + c] * w;
+                        }
+                        pooled[c] = acc;
+                    }
+                    // RMSNorm over head_dim (norm.weight == 1).
+                    let mut ms = 0f32;
+                    for c in 0..d {
+                        ms += pooled[c] * pooled[c];
+                    }
+                    ms /= d as f32;
+                    let inv = 1.0 / (ms + eps).sqrt();
+                    for c in 0..d {
+                        out[(bi * t_c + g) * d + c] = pooled[c] * inv;
+                    }
+                }
+            }
+            out
+        }
+
+        let device = Device::Cpu;
+        let eps = 1e-6f32;
+
+        // CSA overlap path (ratio=4 → coff=2) and HCA non-overlap (coff=1).
+        for &(ratio, t) in &[(4usize, 8usize), (2usize, 6usize)] {
+            let coff = if ratio == 4 { 2 } else { 1 };
+            let hidden_size = 6;
+            let head_dim = 3;
+            let cd = coff * head_dim;
+            let b = 2;
+            let t_c = t / ratio;
+
+            let cfg = compressor_test_cfg(hidden_size);
+
+            // Deterministic F32 weights via the pre-fused layout (stays F32).
+            let wcount = 2 * cd * hidden_size;
+            let mut wv = Vec::with_capacity(wcount);
+            for i in 0..wcount {
+                wv.push(((i as f32) * 0.021 + ratio as f32).sin() * 0.2);
+            }
+            let w = Tensor::from_vec(wv, (2 * cd, hidden_size), &device)?;
+
+            let acount = ratio * cd;
+            let mut av = Vec::with_capacity(acount);
+            for i in 0..acount {
+                av.push(((i as f32) * 0.037).cos() * 0.1);
+            }
+            let ape = Tensor::from_vec(av.clone(), (ratio, cd), &device)?;
+
+            let mut map: std::collections::HashMap<String, Tensor> =
+                std::collections::HashMap::new();
+            map.insert("wkv_gate.weight".to_string(), w.clone());
+            map.insert(
+                "norm.weight".to_string(),
+                Tensor::ones(head_dim, DType::F32, &device)?,
+            );
+            map.insert("ape".to_string(), ape);
+            let vb = vb_from_map(map, DType::F32, &device);
+            let comp = V4Compressor::new(&cfg, vb, ratio, head_dim, &device)?;
+            assert_eq!(comp.coff, coff);
+
+            // Deterministic varied input so the softmax weights are non-uniform.
+            let xcount = b * t * hidden_size;
+            let mut xv = Vec::with_capacity(xcount);
+            for i in 0..xcount {
+                xv.push(((i as f32) * 0.013).sin() * 0.5 + 0.1);
+            }
+            let xs = Tensor::from_vec(xv, (b, t, hidden_size), &device)?;
+
+            // Production path.
+            let out = comp.forward_from_xs(&xs)?;
+            assert_eq!(out.dims(), &[b, t_c, head_dim]);
+            let prod: Vec<f32> = out.flatten_all()?.to_vec1()?;
+
+            // Independent reference: fused via plain F32 matmul, scalar pooling.
+            let fused_t = xs.reshape((b * t, hidden_size))?.matmul(&w.t()?)?;
+            let fused: Vec<f32> = fused_t.flatten_all()?.to_vec1()?;
+            let reference = scalar_reference(&fused, &av, b, t, ratio, coff, head_dim, eps);
+
+            assert_eq!(prod.len(), reference.len());
+            let mut max_abs = 0f32;
+            let (mut dot, mut np, mut nr) = (0f64, 0f64, 0f64);
+            for (p, r) in prod.iter().zip(reference.iter()) {
+                max_abs = max_abs.max((p - r).abs());
+                dot += (*p as f64) * (*r as f64);
+                np += (*p as f64) * (*p as f64);
+                nr += (*r as f64) * (*r as f64);
+            }
+            let cos = dot / (np.sqrt() * nr.sqrt() + 1e-12);
+            // cos is the strong discriminator (a pre-fix regression — swapped
+            // value/score, sigmoid gate, plain-sum, or missing overlap — drops
+            // it far below 0.9999). max_abs guards magnitude; the ~4e-4 floor is
+            // forward_autocast dtype rounding vs the pure-F32 reference matmul.
+            assert!(
+                max_abs < 2e-3 && cos > 0.9999,
+                "compressor forward diverged from scalar reference \
+                 (ratio={ratio}, coff={coff}): max_abs={max_abs}, cos={cos}"
+            );
+        }
         Ok(())
     }
 

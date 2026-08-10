@@ -17,3 +17,10 @@ docs/book/
 
 # Claude Code agent worktrees (transient, per-session)
 .claude/worktrees/
+
+# Personal interview prep — never push
+interview.md
+
+# Python bytecode cache
+__pycache__/
+*.pyc

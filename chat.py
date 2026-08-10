@@ -31,6 +31,7 @@ share a global compressor buffer and corrupt each other. Also run the server wit
 `--prefix-cache-n 0` so xs_history resets each request (see project memory).
 """
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -43,7 +44,8 @@ from encoding_dsv4 import (
     bos_token,
 )
 
-BASE = "http://localhost:1234"
+# Point at a remote box with: BASE_URL=http://<box-ip>:1234 python3 chat.py
+BASE = os.environ.get("BASE_URL", "http://localhost:1234")
 URL = f"{BASE}/v1/completions"
 MODEL = "default"
 
@@ -51,9 +53,19 @@ MODEL = "default"
 # another. Flip to False only if you observe a doubled bos in server logs.
 ADD_BOS = True
 
-# Official sampling defaults (model card + generation_config.json).
+# Sampling: temperature follows the model card / generation_config.json (1.0).
+# top_p is tightened to 0.95 (the official default is 1.0 = no truncation).
+# RATIONALE (measured on H200, RUN-161 2-bit qtip2, 2026-06-24): 2-bit quant
+# slightly flattens the logit tail, so at top_p=1.0 the model occasionally samples
+# a derailing tail token (e.g. the <｜User｜> role token) and falls into a
+# repetition loop ("UserUserUser…", "Red green blue…" ×N) that never emits EOS.
+# top_p=0.95 nucleus truncation removes exactly that tail → 6/6 short-answer
+# prompts return clean, correct, EOS-terminated replies (vs 2/6 looping at 1.0).
+# This is principled nucleus sampling for quantized weights, NOT a repetition
+# penalty. EOS itself is healthy (eos_token_id=1; "hello" stops at 10 tok). The
+# official 1.0/1.0 defaults assume full-precision weights.
 TEMPERATURE = 1.0
-TOP_P = 1.0
+TOP_P = 0.95
 MAX_TOKENS = 60
 
 # A system prompt is REQUIRED in practice. A bare `<bos><｜User｜>...<｜Assistant｜>`

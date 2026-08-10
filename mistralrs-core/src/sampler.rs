@@ -1183,4 +1183,69 @@ mod tests {
         assert_eq!(s_topp.frequency_penalty(), Some(0.1));
         assert_eq!(s_topp.presence_penalty(), Some(0.2));
     }
+
+    /// Production regression test for the chat repetition-loop fix.
+    ///
+    /// DeepSeek-V4-Flash at 2-bit can emit the correct token and then loop it
+    /// forever instead of emitting EOS (e.g. "400.400.400..."). The serve-time
+    /// loop-breaker is the frequency / presence / repetition penalty, applied on
+    /// the CPU sampling path — which is the only path on a CPU device, and the
+    /// path the CUDA arg_sort fix routes penalized requests to on GPU as well.
+    ///
+    /// This pins that a token a greedy decode would repeat forever is demoted
+    /// below an alternative once any one of the three penalties is applied (the
+    /// loop is broken), and that without a penalty the loop persists. Greedy
+    /// (temperature = None) makes selection a deterministic argmax over the
+    /// penalized logits, so the assertions are exact and RNG-independent.
+    #[test]
+    fn penalties_break_repetition_loop() {
+        use super::Sampler;
+        use candle_core::{Device, Tensor};
+        use rand::SeedableRng;
+        use rand_isaac::Isaac64Rng;
+        use std::sync::{Arc, Mutex};
+
+        // vocab = 6; token 3 is the degeneration attractor (highest logit) and
+        // token 1 is the runner-up. A greedy decode always re-selects token 3.
+        let raw = vec![0.5f32, 4.0, 0.5, 5.0, 0.5, 0.5];
+        let device = Device::Cpu;
+        // Context in which token 3 has already been emitted repeatedly (the loop).
+        let context: Vec<u32> = vec![3, 3, 3, 3];
+        let rng = || Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(0)));
+        let logits = || Tensor::from_vec(raw.clone(), 6, &device).unwrap();
+
+        let mk = |freq, pres, rep| {
+            // Greedy (None temp), top_k/top_p/min_p disabled: argmax over penalized logits.
+            Sampler::new(None, 0, None, freq, pres, rep, None, -1, 1.0, 0.0, vec![]).unwrap()
+        };
+        let sample = |s: &Sampler| s.sample(logits(), &context, false, rng(), false, false).unwrap().token;
+
+        // No penalty: the loop continues — greedy re-selects the attractor.
+        assert_eq!(
+            sample(&mk(None, None, None)),
+            3,
+            "without a penalty the degenerate token should win"
+        );
+
+        // Repetition penalty 2.0: logit[3]=5.0>0 -> /2.0 = 2.5 < logit[1]=4.0.
+        assert_eq!(
+            sample(&mk(None, None, Some(2.0))),
+            1,
+            "repetition_penalty must break the loop"
+        );
+
+        // Frequency penalty 1.0: logit[3] -= count(4)*1.0 = 1.0 < logit[1]=4.0.
+        assert_eq!(
+            sample(&mk(Some(1.0), None, None)),
+            1,
+            "frequency_penalty must break the loop"
+        );
+
+        // Presence penalty 2.0: logit[3] -= 2.0 (count>0) = 3.0 < logit[1]=4.0.
+        assert_eq!(
+            sample(&mk(None, Some(2.0), None)),
+            1,
+            "presence_penalty must break the loop"
+        );
+    }
 }
