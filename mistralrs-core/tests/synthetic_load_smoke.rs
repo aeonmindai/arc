@@ -311,6 +311,19 @@ mod v4 {
                 format!("{l}.mlp.gate.weight"),
                 z(&[NUM_ROUTED_EXPERTS, HIDDEN_SIZE])?,
             );
+            // TD-MoE hash-routing table (RUN-161): layers < num_hash_layers
+            // (default 3 — with NUM_LAYERS=2 every layer hash-routes) require
+            // `gate.tid2eid`, a fixed token-id -> expert-id map of shape
+            // [vocab_size, top_k], dtype I64. All-zeros routes every token to
+            // expert 0, which is fine for a load/forward smoke.
+            inserter(
+                format!("{l}.mlp.gate.tid2eid"),
+                Tensor::zeros(
+                    &[VOCAB_SIZE, NUM_EXPERTS_PER_TOK],
+                    DType::I64,
+                    device,
+                )?,
+            );
             // PackedExperts (Slow backend on CPU, unquantized) reads STACKED
             // `gate_up_proj` (one tensor for both gate+up, dim 2 doubled) and
             // `down_proj`. Shapes per `mistralrs-quant::PackedExperts::new` in
