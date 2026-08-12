@@ -16,18 +16,13 @@ pub fn sinkhorn_normalize_cuda(
     let comb = comb.contiguous()?;
     let (n, hc, hc2) = comb.dims3()?;
     if hc != hc2 {
-        candle::bail!(
-            "sinkhorn_normalize_cuda: last two dims must be square, got [{n}, {hc}, {hc2}]"
-        );
+        candle::bail!("sinkhorn_normalize_cuda: last two dims must be square, got [{n}, {hc}, {hc2}]");
     }
     if hc > 16 {
         candle::bail!("sinkhorn_normalize_cuda: hc={hc} exceeds SINKHORN_MAX_HC=16");
     }
     if comb.dtype() != candle_core::DType::F32 {
-        candle::bail!(
-            "sinkhorn_normalize_cuda: input must be F32, got {:?}",
-            comb.dtype()
-        );
+        candle::bail!("sinkhorn_normalize_cuda: input must be F32, got {:?}", comb.dtype());
     }
 
     let dev = comb.device().as_cuda_device()?;

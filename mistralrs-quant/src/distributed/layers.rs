@@ -1489,7 +1489,9 @@ impl PackedExperts {
             let mut gs = Vec::new();
             let mut us = Vec::new();
             let mut ds = Vec::new();
-            for ((mut gate_proj, mut up_proj), mut down_proj) in gc.into_iter().zip(uc).zip(dc) {
+            for ((mut gate_proj, mut up_proj), mut down_proj) in
+                gc.into_iter().zip(uc).zip(dc)
+            {
                 gate_proj = gate_proj.squeeze(0)?;
                 up_proj = up_proj.squeeze(0)?;
                 down_proj = down_proj.squeeze(0)?;
@@ -1950,8 +1952,8 @@ impl FusedExperts {
                     (t.dim(0)?, t.dim(1)?)
                 };
                 let int4_block_size = vec![
-                    moe_intermediate_size / gate_scale_shape.0, // block_h
-                    hidden_size / gate_scale_shape.1,           // block_w
+                    moe_intermediate_size / gate_scale_shape.0,  // block_h
+                    hidden_size / gate_scale_shape.1,            // block_w
                 ];
                 // down_proj has different dimensions: [hidden, intermediate/2]
                 let down_scale_rows = hidden_size / int4_block_size[0];
@@ -1975,71 +1977,62 @@ impl FusedExperts {
                 // CPU-bound. Parallelizing with rayon cuts the ~40s/layer serial
                 // bottleneck to ~40s/num_threads.
                 use rayon::prelude::*;
-                let experts_dequant: Vec<candle_core::Result<(Tensor, Tensor, Tensor)>> = (0
-                    ..num_experts)
-                    .into_par_iter()
-                    .map(|i| {
-                        let expert_vb = load_experts_vb.pp(i);
+                let experts_dequant: Vec<candle_core::Result<(Tensor, Tensor, Tensor)>> =
+                    (0..num_experts)
+                        .into_par_iter()
+                        .map(|i| {
+                            let expert_vb = load_experts_vb.pp(i);
 
-                        let gate_packed = expert_vb.get_with_hints_dtype(
-                            (moe_intermediate_size, hidden_size / 2),
-                            "gate_proj.weight",
-                            Default::default(),
-                            candle_core::DType::I32,
-                        )?;
-                        let gate_scale = expert_vb.get_with_hints_dtype(
-                            gate_scale_shape,
-                            "gate_proj.weight_scale_inv",
-                            Default::default(),
-                            candle_core::DType::F32,
-                        )?;
-                        let up_packed = expert_vb.get_with_hints_dtype(
-                            (moe_intermediate_size, hidden_size / 2),
-                            "up_proj.weight",
-                            Default::default(),
-                            candle_core::DType::I32,
-                        )?;
-                        let up_scale = expert_vb.get_with_hints_dtype(
-                            gate_scale_shape,
-                            "up_proj.weight_scale_inv",
-                            Default::default(),
-                            candle_core::DType::F32,
-                        )?;
-                        let down_packed = expert_vb.get_with_hints_dtype(
-                            (hidden_size, moe_intermediate_size / 2),
-                            "down_proj.weight",
-                            Default::default(),
-                            candle_core::DType::I32,
-                        )?;
-                        let down_scale = expert_vb.get_with_hints_dtype(
-                            (down_scale_rows, down_scale_cols),
-                            "down_proj.weight_scale_inv",
-                            Default::default(),
-                            candle_core::DType::F32,
-                        )?;
+                            let gate_packed = expert_vb.get_with_hints_dtype(
+                                (moe_intermediate_size, hidden_size / 2),
+                                "gate_proj.weight",
+                                Default::default(),
+                                candle_core::DType::I32,
+                            )?;
+                            let gate_scale = expert_vb.get_with_hints_dtype(
+                                gate_scale_shape,
+                                "gate_proj.weight_scale_inv",
+                                Default::default(),
+                                candle_core::DType::F32,
+                            )?;
+                            let up_packed = expert_vb.get_with_hints_dtype(
+                                (moe_intermediate_size, hidden_size / 2),
+                                "up_proj.weight",
+                                Default::default(),
+                                candle_core::DType::I32,
+                            )?;
+                            let up_scale = expert_vb.get_with_hints_dtype(
+                                gate_scale_shape,
+                                "up_proj.weight_scale_inv",
+                                Default::default(),
+                                candle_core::DType::F32,
+                            )?;
+                            let down_packed = expert_vb.get_with_hints_dtype(
+                                (hidden_size, moe_intermediate_size / 2),
+                                "down_proj.weight",
+                                Default::default(),
+                                candle_core::DType::I32,
+                            )?;
+                            let down_scale = expert_vb.get_with_hints_dtype(
+                                (down_scale_rows, down_scale_cols),
+                                "down_proj.weight_scale_inv",
+                                Default::default(),
+                                candle_core::DType::F32,
+                            )?;
 
-                        let gate_bf16 = mx_int4_blockwise_dequantize(
-                            &gate_packed,
-                            &gate_scale,
-                            int4_block_size.clone(),
-                            candle_core::DType::BF16,
-                        )?;
-                        let up_bf16 = mx_int4_blockwise_dequantize(
-                            &up_packed,
-                            &up_scale,
-                            int4_block_size.clone(),
-                            candle_core::DType::BF16,
-                        )?;
-                        let down_bf16 = mx_int4_blockwise_dequantize(
-                            &down_packed,
-                            &down_scale,
-                            int4_block_size.clone(),
-                            candle_core::DType::BF16,
-                        )?;
+                            let gate_bf16 = mx_int4_blockwise_dequantize(
+                                &gate_packed, &gate_scale, int4_block_size.clone(), candle_core::DType::BF16,
+                            )?;
+                            let up_bf16 = mx_int4_blockwise_dequantize(
+                                &up_packed, &up_scale, int4_block_size.clone(), candle_core::DType::BF16,
+                            )?;
+                            let down_bf16 = mx_int4_blockwise_dequantize(
+                                &down_packed, &down_scale, int4_block_size.clone(), candle_core::DType::BF16,
+                            )?;
 
-                        Ok((gate_bf16, up_bf16, down_bf16))
-                    })
-                    .collect();
+                            Ok((gate_bf16, up_bf16, down_bf16))
+                        })
+                        .collect();
 
                 let mut gate_proj_vec = Vec::with_capacity(num_experts);
                 let mut up_proj_vec = Vec::with_capacity(num_experts);
@@ -2082,27 +2075,12 @@ impl FusedExperts {
                 }) = crate::get_immediate_isq()
                 {
                     let n = std::sync::atomic::AtomicUsize::new(0);
-                    let fused_gate_proj = fused_gate_proj.apply_isq(
-                        Some(isq_ty),
-                        target_device.clone(),
-                        &n,
-                        None,
-                        guard.clone(),
-                    )?;
-                    let fused_up_proj = fused_up_proj.apply_isq(
-                        Some(isq_ty),
-                        target_device.clone(),
-                        &n,
-                        None,
-                        guard.clone(),
-                    )?;
-                    let fused_down_proj = fused_down_proj.apply_isq(
-                        Some(isq_ty),
-                        target_device.clone(),
-                        &n,
-                        None,
-                        guard,
-                    )?;
+                    let fused_gate_proj =
+                        fused_gate_proj.apply_isq(Some(isq_ty), target_device.clone(), &n, None, guard.clone())?;
+                    let fused_up_proj =
+                        fused_up_proj.apply_isq(Some(isq_ty), target_device.clone(), &n, None, guard.clone())?;
+                    let fused_down_proj =
+                        fused_down_proj.apply_isq(Some(isq_ty), target_device.clone(), &n, None, guard)?;
                     // Return the freed BF16 expert quant transient to the OS
                     // before the next layer's dequant, so cached blocks don't
                     // accumulate in the CUDA pool and OOM near the final layers.

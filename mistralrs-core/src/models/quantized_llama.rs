@@ -144,10 +144,7 @@ impl LayerWeights {
         mask: Option<&Tensor>,
         start_offsets: &[usize],
         kv_cache: &mut KvCache,
-        metadata: Option<(
-            (Tensor, Tensor, Option<Tensor>, Option<Tensor>),
-            &PagedAttentionInputMetadata,
-        )>,
+        metadata: Option<((Tensor, Tensor, Option<Tensor>, Option<Tensor>), &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
 
@@ -666,10 +663,7 @@ impl ModelWeights {
         x: &Tensor,
         start_offsets: &[usize],
         context_lens: Vec<(usize, usize)>,
-        metadata: Option<(
-            Vec<(Tensor, Tensor, Option<Tensor>, Option<Tensor>)>,
-            &PagedAttentionInputMetadata,
-        )>,
+        metadata: Option<(Vec<(Tensor, Tensor, Option<Tensor>, Option<Tensor>)>, &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
         let mut layer_in = self.tok_embeddings.forward(x)?;
         let cache = &mut self.cache.normal().0;

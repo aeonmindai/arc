@@ -408,7 +408,8 @@ impl QtipLayer {
             }
             return Self::quantize_with_options_3d(weight, device, mode, use_rotation);
         }
-        let layer = Self::quantize_with_options_concrete(weight, bias, device, mode, use_rotation)?;
+        let layer =
+            Self::quantize_with_options_concrete(weight, bias, device, mode, use_rotation)?;
         Ok(Arc::new(layer))
     }
 
@@ -1409,7 +1410,8 @@ impl QtipLayer {
             .flatten_all()?
             .to_dtype(DType::U32)?
             .to_vec1()?;
-        let mut unique_ids: Vec<usize> = idx_cpu.iter().map(|&v| v as usize).collect();
+        let mut unique_ids: Vec<usize> =
+            idx_cpu.iter().map(|&v| v as usize).collect();
         unique_ids.sort_unstable();
         unique_ids.dedup();
         for &e in &unique_ids {
@@ -1481,13 +1483,21 @@ impl QtipLayer {
         // `index_add` / `slice_assign` style operations. We use
         // `Tensor::zeros` then `index_add` for the scatter — this matches
         // candle's supported ops and avoids hand-rolling kernels.
-        let mut out_flat = Tensor::zeros((total_pairs, rows), a_rotated_dtype, device)?;
+        let mut out_flat = Tensor::zeros(
+            (total_pairs, rows),
+            a_rotated_dtype,
+            device,
+        )?;
 
         for &e in &unique_ids {
             let positions = positions_by_expert
                 .get(&e)
                 .expect("positions for expert should be populated");
-            let pos_tensor = Tensor::from_vec(positions.clone(), (positions.len(),), device)?;
+            let pos_tensor = Tensor::from_vec(
+                positions.clone(),
+                (positions.len(),),
+                device,
+            )?;
 
             // Gather the rotated activation rows that routed to expert e:
             //   a_e: [n_e, cols], same dtype as a_rotated.
@@ -1618,8 +1628,10 @@ impl QtipLayer {
             }
         }
 
-        let blocks_refs: Vec<&Tensor> = per_expert_layers.iter().map(|l| &l.blocks).collect();
-        let scales_refs: Vec<&Tensor> = per_expert_layers.iter().map(|l| &l.row_scales).collect();
+        let blocks_refs: Vec<&Tensor> =
+            per_expert_layers.iter().map(|l| &l.blocks).collect();
+        let scales_refs: Vec<&Tensor> =
+            per_expert_layers.iter().map(|l| &l.row_scales).collect();
 
         let blocks = Tensor::stack(&blocks_refs, 0)?;
         let row_scales = Tensor::stack(&scales_refs, 0)?;
@@ -1706,9 +1718,19 @@ impl QtipLayer {
         let n = scales_e.dim(0)?;
         let k_in = self.in_features;
 
-        let blocks_data: Vec<u8> = blocks_e.to_device(&Device::Cpu)?.flatten_all()?.to_vec1()?;
-        let scales_data: Vec<f32> = scales_e.to_device(&Device::Cpu)?.flatten_all()?.to_vec1()?;
-        let lut_data: Vec<f32> = self.lut.to_device(&Device::Cpu)?.flatten_all()?.to_vec1()?;
+        let blocks_data: Vec<u8> = blocks_e
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1()?;
+        let scales_data: Vec<f32> = scales_e
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1()?;
+        let lut_data: Vec<f32> = self
+            .lut
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1()?;
 
         let num_symbols_per_row = k_in / V as usize;
         let packed_per_row = num_symbols_per_row / 2;
@@ -1790,7 +1812,8 @@ impl QtipLayer {
         // Track unique expert IDs so we only dequantize each one once even
         // when several (token, k) pairs share the same expert (which is the
         // common case for prefill — top-6 of 256 means many duplicates).
-        let mut unique_ids: Vec<usize> = idx_cpu.iter().map(|&v| v as usize).collect();
+        let mut unique_ids: Vec<usize> =
+            idx_cpu.iter().map(|&v| v as usize).collect();
         unique_ids.sort_unstable();
         unique_ids.dedup();
         for &e in &unique_ids {
@@ -1839,7 +1862,11 @@ impl QtipLayer {
             let positions = positions_by_expert
                 .get(&e)
                 .expect("positions for expert should be populated");
-            let pos_tensor = Tensor::from_vec(positions.clone(), (positions.len(),), device)?;
+            let pos_tensor = Tensor::from_vec(
+                positions.clone(),
+                (positions.len(),),
+                device,
+            )?;
             let a_e = a_flat.index_select(&pos_tensor, 0)?;
             let w_e = weight_cache.get(&e).expect("weight should be cached");
             let y_e = a_e.matmul(&w_e.t()?)?;
@@ -3608,7 +3635,8 @@ mod tests {
         mode: QtipMode,
     ) -> Result<(QtipLayer, Tensor)> {
         // Per-expert random Gaussian (deterministic per-expert seed).
-        let mut weights_per_expert: Vec<Tensor> = Vec::with_capacity(num_experts);
+        let mut weights_per_expert: Vec<Tensor> =
+            Vec::with_capacity(num_experts);
         let mut concrete_layers: Vec<QtipLayer> = Vec::with_capacity(num_experts);
         for e in 0..num_experts {
             let mut wdata = vec![0.0f32; rows * in_features];
@@ -3621,19 +3649,17 @@ mod tests {
                 z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
                 z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
                 z ^= z >> 31;
-                let u1 = ((z >> 32) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
-                let u2 = ((z & 0xFFFFFFFF) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+                let u1 =
+                    ((z >> 32) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+                let u2 = ((z & 0xFFFFFFFF) as u32 as f32 + 1.0)
+                    / (u32::MAX as f32 + 2.0);
                 let r = (-2.0_f32 * u1.ln()).sqrt();
                 *v = r * (2.0 * std::f32::consts::PI * u2).cos() * 0.5;
             }
-            let w_e = Tensor::from_vec(wdata.clone(), (rows, in_features), device)?;
-            let layer_e = QtipLayer::quantize_with_options_concrete(
-                &w_e,
-                None,
-                device,
-                mode,
-                matches!(mode, QtipMode::Viterbi),
-            )?;
+            let w_e =
+                Tensor::from_vec(wdata.clone(), (rows, in_features), device)?;
+            let layer_e =
+                QtipLayer::quantize_with_options_concrete(&w_e, None, device, mode, matches!(mode, QtipMode::Viterbi))?;
             weights_per_expert.push(w_e);
             concrete_layers.push(layer_e);
         }
@@ -3653,11 +3679,7 @@ mod tests {
         let device = Device::Cpu;
         let (stack, _refs) = make_expert_stack(4, 16, 64, &device, QtipMode::Greedy)?;
         assert_eq!(stack.blocks.dims().len(), 3, "blocks must be rank 3");
-        assert_eq!(
-            stack.row_scales.dims().len(),
-            2,
-            "row_scales must be rank 2"
-        );
+        assert_eq!(stack.row_scales.dims().len(), 2, "row_scales must be rank 2");
         assert_eq!(stack.blocks.dim(0)?, 4, "expert dim wrong");
         assert_eq!(stack.row_scales.dim(0)?, 4, "expert dim wrong");
         assert_eq!(stack.in_features, 64);
@@ -3687,7 +3709,8 @@ mod tests {
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
             z ^= z >> 31;
             let u1 = ((z >> 32) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
-            let u2 = ((z & 0xFFFFFFFF) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+            let u2 =
+                ((z & 0xFFFFFFFF) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
             let r = (-2.0_f32 * u1.ln()).sqrt();
             *v = r * (2.0 * std::f32::consts::PI * u2).cos();
         }
@@ -3703,7 +3726,11 @@ mod tests {
             1, 3, // tok 1 → experts 1, 3
             2, 2, // tok 2 → expert 2 twice (duplicate path)
         ];
-        let indices = Tensor::from_vec(idx_data.clone(), (n_tokens, n_experts_per_tok), &device)?;
+        let indices = Tensor::from_vec(
+            idx_data.clone(),
+            (n_tokens, n_experts_per_tok),
+            &device,
+        )?;
 
         // Run the gather forward.
         let out = stack.gather_forward(&a, &indices)?;
@@ -3711,15 +3738,18 @@ mod tests {
 
         // Reference: per (tok, k), use the dense weights for the routed
         // expert and matmul.
-        let dense_w: Vec<f32> = dense_w_stack.flatten_all()?.to_vec1()?;
+        let dense_w: Vec<f32> =
+            dense_w_stack.flatten_all()?.to_vec1()?;
         let mut ref_out = vec![0f32; n_tokens * n_experts_per_tok * rows];
         for tok in 0..n_tokens {
             for k in 0..n_experts_per_tok {
                 let e = idx_data[tok * n_experts_per_tok + k] as usize;
-                let a_row = &adata[(tok * n_experts_per_tok + k) * in_features
-                    ..(tok * n_experts_per_tok + k + 1) * in_features];
+                let a_row =
+                    &adata[(tok * n_experts_per_tok + k) * in_features
+                        ..(tok * n_experts_per_tok + k + 1) * in_features];
                 for r in 0..rows {
-                    let w_row = &dense_w[e * rows * in_features + r * in_features
+                    let w_row = &dense_w[e * rows * in_features
+                        + r * in_features
                         ..e * rows * in_features + (r + 1) * in_features];
                     let mut s = 0f32;
                     for c in 0..in_features {
@@ -3740,7 +3770,9 @@ mod tests {
             }
             d / (na.sqrt() * nb.sqrt())
         };
-        println!("qtip_gather_forward_cpu_matches_reference: cos sim = {cos:.4}");
+        println!(
+            "qtip_gather_forward_cpu_matches_reference: cos sim = {cos:.4}"
+        );
         // Greedy QTIP at 2 bits typically lands at >0.85 cos sim for a
         // single matmul; aggregated across 6 routed slots the cos sim is
         // dominated by the lowest-quality slot but should still clear
@@ -3776,11 +3808,13 @@ mod tests {
 
         let mut adata = vec![0.0f32; n_tokens * n_experts_per_tok * in_features];
         for (i, v) in adata.iter_mut().enumerate() {
-            let mut z = ((i + 9001) as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            let mut z =
+                ((i + 9001) as u64).wrapping_mul(0x9E3779B97F4A7C15);
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
             z ^= z >> 31;
             let u1 = ((z >> 32) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
-            let u2 = ((z & 0xFFFFFFFF) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+            let u2 =
+                ((z & 0xFFFFFFFF) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
             let r = (-2.0_f32 * u1.ln()).sqrt();
             *v = r * (2.0 * std::f32::consts::PI * u2).cos();
         }
@@ -3790,7 +3824,11 @@ mod tests {
             &device,
         )?;
         let idx_data: Vec<u32> = vec![0, 1, 1, 2];
-        let indices = Tensor::from_vec(idx_data.clone(), (n_tokens, n_experts_per_tok), &device)?;
+        let indices = Tensor::from_vec(
+            idx_data.clone(),
+            (n_tokens, n_experts_per_tok),
+            &device,
+        )?;
         let out = stack.gather_forward(&a, &indices)?;
 
         let dense_w: Vec<f32> = dense_w_stack.flatten_all()?.to_vec1()?;
@@ -3798,10 +3836,12 @@ mod tests {
         for tok in 0..n_tokens {
             for k in 0..n_experts_per_tok {
                 let e = idx_data[tok * n_experts_per_tok + k] as usize;
-                let a_row = &adata[(tok * n_experts_per_tok + k) * in_features
-                    ..(tok * n_experts_per_tok + k + 1) * in_features];
+                let a_row =
+                    &adata[(tok * n_experts_per_tok + k) * in_features
+                        ..(tok * n_experts_per_tok + k + 1) * in_features];
                 for r in 0..rows {
-                    let w_row = &dense_w[e * rows * in_features + r * in_features
+                    let w_row = &dense_w[e * rows * in_features
+                        + r * in_features
                         ..e * rows * in_features + (r + 1) * in_features];
                     let mut s = 0f32;
                     for c in 0..in_features {
@@ -3822,7 +3862,9 @@ mod tests {
             }
             d / (na.sqrt() * nb.sqrt())
         };
-        println!("qtip_gather_forward_viterbi_with_rotation: cos sim = {cos:.4}");
+        println!(
+            "qtip_gather_forward_viterbi_with_rotation: cos sim = {cos:.4}"
+        );
         assert!(
             cos >= 0.85,
             "QTIP gather_forward Viterbi cos sim {cos} < 0.85"
@@ -3893,7 +3935,8 @@ mod tests {
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
             z ^= z >> 31;
             let u1 = ((z >> 32) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
-            let u2 = ((z & 0xFFFFFFFF) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+            let u2 = ((z & 0xFFFFFFFF) as u32 as f32 + 1.0)
+                / (u32::MAX as f32 + 2.0);
             let r = (-2.0_f32 * u1.ln()).sqrt();
             *v = r * (2.0 * std::f32::consts::PI * u2).cos();
         }
@@ -3910,8 +3953,16 @@ mod tests {
         .to_dtype(DType::BF16)?;
 
         let idx_data: Vec<u32> = vec![0, 1, 2, 3, 1, 1];
-        let idx_cpu = Tensor::from_vec(idx_data.clone(), (n_tokens, n_experts_per_tok), &cpu)?;
-        let idx_cuda = Tensor::from_vec(idx_data, (n_tokens, n_experts_per_tok), &cuda)?;
+        let idx_cpu = Tensor::from_vec(
+            idx_data.clone(),
+            (n_tokens, n_experts_per_tok),
+            &cpu,
+        )?;
+        let idx_cuda = Tensor::from_vec(
+            idx_data,
+            (n_tokens, n_experts_per_tok),
+            &cuda,
+        )?;
 
         let y_cpu = cpu_stack.gather_forward(&a_cpu, &idx_cpu)?;
         let y_cuda = cuda_stack.gather_forward(&a_cuda, &idx_cuda)?;
@@ -3960,10 +4011,10 @@ mod tests {
         // hidden), and mismatched (intermediate / down_proj). All use
         // K=4 V=2 L=16 packing.
         for &(n, k_in) in &[
-            (32usize, 256usize), // tiny
-            (128, 512),          // small attn-out
-            (256, 1024),         // mid
-            (1024, 4096),        // realistic LLM scale (decoder block)
+            (32usize, 256usize),   // tiny
+            (128, 512),            // small attn-out
+            (256, 1024),           // mid
+            (1024, 4096),          // realistic LLM scale (decoder block)
         ] {
             // Random-ish Gaussian weights via deterministic hash.
             let mut wdata = vec![0.0f32; n * k_in];
@@ -4000,14 +4051,11 @@ mod tests {
             // against a manually-constructed dequant+matmul.
 
             // Single-token forward through the layer (triggers fused gemv).
-            let x_cuda_1tok =
-                Tensor::from_vec(xdata.clone(), (1, k_in), &cuda)?.to_dtype(DType::BF16)?;
+            let x_cuda_1tok = Tensor::from_vec(xdata.clone(), (1, k_in), &cuda)?
+                .to_dtype(DType::BF16)?;
             let y_fused = layer.forward(&x_cuda_1tok)?;
-            let y_fused_v: Vec<f32> = y_fused
-                .to_device(&cpu)?
-                .to_dtype(DType::F32)?
-                .flatten_all()?
-                .to_vec1()?;
+            let y_fused_v: Vec<f32> =
+                y_fused.to_device(&cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
 
             // Manual dequant+matmul reference: dequantize_w() returns the
             // weight in the ORIGINAL (un-rotated) frame, so the matmul
@@ -4025,7 +4073,9 @@ mod tests {
                 nb += b * b;
             }
             let cos = dot / (na.sqrt() * nb.sqrt());
-            println!("Fused gemv vs dequant+matmul cos sim (n={n}, k_in={k_in}): {cos}");
+            println!(
+                "Fused gemv vs dequant+matmul cos sim (n={n}, k_in={k_in}): {cos}"
+            );
             assert!(
                 cos >= 0.999,
                 "Fused gemv deviates from dequant+matmul: cos sim {cos} < 0.999 (n={n}, k_in={k_in})"
@@ -4069,14 +4119,11 @@ mod tests {
         let w_cuda = Tensor::from_vec(wdata, (n, k_in), &cuda)?;
         let layer = QtipLayer::quantize_with_mode(&w_cuda, None, &cuda, QtipMode::Greedy)?;
 
-        let x_cuda_1tok =
-            Tensor::from_vec(xdata.clone(), (1, k_in), &cuda)?.to_dtype(DType::BF16)?;
+        let x_cuda_1tok = Tensor::from_vec(xdata.clone(), (1, k_in), &cuda)?
+            .to_dtype(DType::BF16)?;
         let y_fused = layer.forward(&x_cuda_1tok)?;
-        let y_fused_v: Vec<f32> = y_fused
-            .to_device(&cpu)?
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1()?;
+        let y_fused_v: Vec<f32> =
+            y_fused.to_device(&cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
 
         let w_recon = layer.dequantize_w()?.to_dtype(DType::F32)?;
         let x_f32 = Tensor::from_vec(xdata, (1, k_in), &cuda)?;

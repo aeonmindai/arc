@@ -309,8 +309,7 @@ pub fn calculate_cache_config(
         }
     }
 
-    let num_gpu_blocks = if let Some(bytes_per_tok_per_layer) = turboquant_bytes_per_token_per_layer
-    {
+    let num_gpu_blocks = if let Some(bytes_per_tok_per_layer) = turboquant_bytes_per_token_per_layer {
         // TurboQuant: compute blocks from actual packed byte sizes
         // total_bytes = num_blocks * block_size * num_layers * bytes_per_token_per_layer
         // num_blocks = total_bytes / (block_size * num_layers * bytes_per_token_per_layer)
@@ -324,9 +323,7 @@ pub fn calculate_cache_config(
         let bytes_per_block = if let Some(b) = turboquant_bytes_per_token_per_layer {
             block_size * config.num_layers() * b
         } else {
-            block_size
-                * config.num_layers()
-                * dtype_size
+            block_size * config.num_layers() * dtype_size
                 * (config.num_kv_heads() * (config.k_head_dim() + config.v_head_dim()))
         };
         info!(

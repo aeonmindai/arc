@@ -209,7 +209,10 @@ impl MtpSpeculativePipeline {
     /// pipeline directly).
     ///
     /// Returns `None` if the target pipeline doesn't expose an MTP head.
-    pub fn try_new(target: Arc<tokio::sync::Mutex<dyn Pipeline>>, depth: usize) -> Option<Self> {
+    pub fn try_new(
+        target: Arc<tokio::sync::Mutex<dyn Pipeline>>,
+        depth: usize,
+    ) -> Option<Self> {
         if depth == 0 {
             return None;
         }
@@ -686,10 +689,7 @@ impl Pipeline for MtpSpeculativePipeline {
             && input_seqs.len() == 1
             && !return_raw_logits
             && matches!(self.target_cache, EitherCache::Normal(_))
-            && matches!(
-                backend_metadata,
-                CacheBackendMetadata::DefaultInstructions { .. }
-            )
+            && matches!(backend_metadata, CacheBackendMetadata::DefaultInstructions { .. })
             && !get_mut_arcmutex!(self.target).get_metadata().is_xlora
             && !get_mut_arcmutex!(self.target).get_metadata().no_kv_cache;
 
@@ -709,7 +709,8 @@ impl Pipeline for MtpSpeculativePipeline {
         }
 
         // ===== MTP fast path =====
-        let CacheBackendMetadata::DefaultInstructions { pre_op, post_op } = backend_metadata else {
+        let CacheBackendMetadata::DefaultInstructions { pre_op, post_op } = backend_metadata
+        else {
             unreachable!("guarded above");
         };
 
@@ -735,7 +736,10 @@ impl Pipeline for MtpSpeculativePipeline {
 
         // ---- Step 1: target forward + sample T0 ----
         let (logits_t0, _exec_t0) = run_target_forward(
-            self, seq, /* is_prompt = */ false, /* prefill_window = */ None,
+            self,
+            seq,
+            /* is_prompt = */ false,
+            /* prefill_window = */ None,
         )
         .await?;
         let t0_logprobs = sample_sequence(
@@ -777,9 +781,9 @@ impl Pipeline for MtpSpeculativePipeline {
         let device = get_mut_arcmutex!(self.target).device();
         let t0_tensor = Tensor::from_vec(vec![t0], (1,), &device)?;
         let embedded_t0 = self.kit.embed_tokens.forward(&t0_tensor)?; // [1, hidden]
-        let proposed =
-            self.kit
-                .propose_chain(&embedded_t0, t0, self.depth, toks_remaining_budget)?;
+        let proposed = self
+            .kit
+            .propose_chain(&embedded_t0, t0, self.depth, toks_remaining_budget)?;
 
         // If the budget left no room (max_len hit, depth=0), commit T0 and
         // return — no verify needed.
@@ -795,12 +799,7 @@ impl Pipeline for MtpSpeculativePipeline {
         // extra tokens through `process_inputs` like the non-MTP speculative
         // pipeline does.
         let mut verify_input = vec![t0];
-        verify_input.extend(
-            proposed
-                .iter()
-                .take(proposed.len().saturating_sub(1))
-                .copied(),
-        );
+        verify_input.extend(proposed.iter().take(proposed.len().saturating_sub(1)).copied());
         seq.set_prefill_toks(verify_input.clone());
 
         let initial_cache_len = current_normal_cache_len(self);
@@ -1048,7 +1047,8 @@ mod tests {
         let vocab = 8;
         let kit = make_test_kit(hidden, vocab, &device)?;
 
-        let prev_hidden = Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0], (1, hidden), &device)?;
+        let prev_hidden =
+            Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0], (1, hidden), &device)?;
         let depth = 3;
         let max_tokens = 16;
         let tokens = kit.propose_chain(&prev_hidden, 0, depth, max_tokens)?;
@@ -1126,11 +1126,7 @@ mod tests {
 
         // depth=5, max_tokens=2 → exactly 2 tokens.
         let tokens = kit.propose_chain(&prev_hidden, 0, 5, 2)?;
-        assert_eq!(
-            tokens.len(),
-            2,
-            "cap should clip chain length to max_tokens"
-        );
+        assert_eq!(tokens.len(), 2, "cap should clip chain length to max_tokens");
 
         // depth=4, max_tokens=4 → exactly 4 (equality holds).
         let tokens = kit.propose_chain(&prev_hidden, 0, 4, 4)?;
@@ -1173,7 +1169,8 @@ mod tests {
         let device = Device::Cpu;
         let data: Vec<f32> = vec![
             // batch=0, depth=0 → argmax at col 1
-            0.0, 1.0, 0.0, // batch=0, depth=1 → argmax at col 2
+            0.0, 1.0, 0.0,
+            // batch=0, depth=1 → argmax at col 2
             0.0, 0.0, 1.0,
         ];
         let logits = Tensor::from_vec(data, (1, 2, 3), &device)?;
@@ -1229,24 +1226,14 @@ mod tests {
         // Walk 32 / depth = 8 cycles — one MTP draft + verify per iteration.
         for _cycle in 0..8 {
             let proposed = kit.propose_chain(&prev_hidden, prev_tok, depth, depth)?;
-            assert_eq!(
-                proposed.len(),
-                depth,
-                "kit should give exactly depth tokens"
-            );
+            assert_eq!(proposed.len(), depth, "kit should give exactly depth tokens");
 
             // Mock verifier: agree with proposals on even positions, diverge on
             // odd positions (so accept rate is exactly 50%).
             let target: Vec<u32> = proposed
                 .iter()
                 .enumerate()
-                .map(|(i, t)| {
-                    if i % 2 == 0 {
-                        *t
-                    } else {
-                        (*t + 7) % vocab as u32
-                    }
-                })
+                .map(|(i, t)| if i % 2 == 0 { *t } else { (*t + 7) % vocab as u32 })
                 .collect();
             let res = verify_proposed(&proposed, &target);
             total_proposed += proposed.len();
@@ -1301,7 +1288,7 @@ mod tests {
     use crate::pipeline::loaders::ModelKind;
     use crate::pipeline::{
         AnyMoePipelineMixin, CacheBackendMetadata, CacheManagerMixin, ForwardInputsResult,
-        GeneralMetadata, IsqPipelineMixin, MetadataMixin, Modalities, ModelCategory, Pipeline,
+        GeneralMetadata, IsqPipelineMixin, MetadataMixin, ModelCategory, Modalities, Pipeline,
         PreProcessingMixin, Processor,
     };
     use crate::prefix_cacher::PrefixCacheManagerV2;
@@ -1362,9 +1349,7 @@ mod tests {
             None
         }
         fn get_processor(&self) -> Arc<dyn Processor> {
-            unreachable!(
-                "StubPipeline: get_processor not reachable from try_wrap_pipeline_with_mtp"
-            )
+            unreachable!("StubPipeline: get_processor not reachable from try_wrap_pipeline_with_mtp")
         }
     }
     impl IsqPipelineMixin for StubPipeline {

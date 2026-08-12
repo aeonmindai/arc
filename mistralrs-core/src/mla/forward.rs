@@ -43,10 +43,7 @@ pub fn should_use_mla_decode(
     seq_len: usize,
     paged_attn_enabled: bool,
     device: &Device,
-    metadata: &Option<(
-        (Tensor, Tensor, Option<Tensor>, Option<Tensor>),
-        &PagedAttentionInputMetadata,
-    )>,
+    metadata: &Option<((Tensor, Tensor, Option<Tensor>, Option<Tensor>), &PagedAttentionInputMetadata)>,
 ) -> bool {
     !is_mla_disabled()
         && attention_mask.is_none()
@@ -65,10 +62,7 @@ pub fn should_use_mla_decode(
     _seq_len: usize,
     _paged_attn_enabled: bool,
     _device: &Device,
-    _metadata: &Option<(
-        (Tensor, Tensor, Option<Tensor>, Option<Tensor>),
-        &PagedAttentionInputMetadata,
-    )>,
+    _metadata: &Option<((Tensor, Tensor, Option<Tensor>, Option<Tensor>), &PagedAttentionInputMetadata)>,
 ) -> bool {
     false
 }
@@ -116,10 +110,7 @@ pub fn mla_decode_forward(
     q_pe: &Tensor,
     ckv: &Tensor,
     k_pe: &Tensor,
-    metadata: &Option<(
-        (Tensor, Tensor, Option<Tensor>, Option<Tensor>),
-        &PagedAttentionInputMetadata,
-    )>,
+    metadata: &Option<((Tensor, Tensor, Option<Tensor>, Option<Tensor>), &PagedAttentionInputMetadata)>,
     mla_weights: &MlaWeights,
     kv_b_proj: &dyn mistralrs_quant::QuantMethod,
     sdpa_params: &SdpaParams,
@@ -238,10 +229,7 @@ pub fn mla_decode_forward(
     _q_pe: &Tensor,
     _ckv: &Tensor,
     _k_pe: &Tensor,
-    _metadata: &Option<(
-        (Tensor, Tensor, Option<Tensor>, Option<Tensor>),
-        &PagedAttentionInputMetadata,
-    )>,
+    _metadata: &Option<((Tensor, Tensor, Option<Tensor>, Option<Tensor>), &PagedAttentionInputMetadata)>,
     _mla_weights: &MlaWeights,
     _kv_b_proj: &dyn mistralrs_quant::QuantMethod,
     _sdpa_params: &SdpaParams,
@@ -289,10 +277,7 @@ pub fn mla_cache_forward(
     k_pe: &Tensor,
     attention_mask: Option<&Tensor>,
     seqlen_offsets: &[usize],
-    metadata: &Option<(
-        (Tensor, Tensor, Option<Tensor>, Option<Tensor>),
-        &PagedAttentionInputMetadata,
-    )>,
+    metadata: &Option<((Tensor, Tensor, Option<Tensor>, Option<Tensor>), &PagedAttentionInputMetadata)>,
     flash_params: &FlashParams,
     kv_b_proj: &dyn mistralrs_quant::QuantMethod,
     sdpa_params: &SdpaParams,
@@ -567,10 +552,7 @@ pub fn mla_cache_forward(
     _k_pe: &Tensor,
     _attention_mask: Option<&Tensor>,
     _seqlen_offsets: &[usize],
-    _metadata: &Option<(
-        (Tensor, Tensor, Option<Tensor>, Option<Tensor>),
-        &PagedAttentionInputMetadata,
-    )>,
+    _metadata: &Option<((Tensor, Tensor, Option<Tensor>, Option<Tensor>), &PagedAttentionInputMetadata)>,
     _flash_params: &FlashParams,
     _kv_b_proj: &dyn mistralrs_quant::QuantMethod,
     _sdpa_params: &SdpaParams,

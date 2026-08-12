@@ -56,9 +56,9 @@ use indicatif::{MultiProgress, ParallelProgressIterator, ProgressBar, ProgressSt
 use itertools::Itertools;
 use mistralrs_quant::{
     AfqLayer, CollectedImatrixData, ColumnParallelLayer, DistributedKind, F8Q8Linear, FP8Linear,
-    GgufMatMul, HqqLayer, IsqBits, IsqType, MXFP4Layer, NVFP4Layer, QtipLayer, QuantMethod,
-    QuantizeOntoGuard, QuantizedSerde, QuantizedSerdeType, ReplicatedLayer, RowParallelLayer,
-    TuckerFactoredLayer, UnquantLinear,
+    GgufMatMul, HqqLayer, IsqBits, IsqType, MXFP4Layer, NVFP4Layer, QtipLayer, QuantMethod, QuantizeOntoGuard,
+    QuantizedSerde, QuantizedSerdeType, ReplicatedLayer, RowParallelLayer, TuckerFactoredLayer,
+    UnquantLinear,
 };
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use regex::Regex;

@@ -1218,11 +1218,7 @@ mod tests {
             // Greedy (None temp), top_k/top_p/min_p disabled: argmax over penalized logits.
             Sampler::new(None, 0, None, freq, pres, rep, None, -1, 1.0, 0.0, vec![]).unwrap()
         };
-        let sample = |s: &Sampler| {
-            s.sample(logits(), &context, false, rng(), false, false)
-                .unwrap()
-                .token
-        };
+        let sample = |s: &Sampler| s.sample(logits(), &context, false, rng(), false, false).unwrap().token;
 
         // No penalty: the loop continues — greedy re-selects the attractor.
         assert_eq!(

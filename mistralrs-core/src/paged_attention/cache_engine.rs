@@ -402,7 +402,11 @@ impl CacheEngine {
         if cache_type.is_turboquant() {
             // TurboQuant 3-bit packed: 10 values per 4 bytes = ceil(head_dim/10)*4 bytes
             let packed_bytes = (model_config.v_head_dim().div_ceil(10)) * 4; // 52 for d=128
-            (model_config.num_kv_heads(), packed_bytes, block_size)
+            (
+                model_config.num_kv_heads(),
+                packed_bytes,
+                block_size,
+            )
         } else {
             (
                 model_config.num_kv_heads(),

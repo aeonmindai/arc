@@ -11,10 +11,10 @@ mod isq;
 pub(crate) mod llg;
 mod loaders;
 mod macros;
-pub mod mtp_pipeline;
 mod normal;
 mod paths;
 pub mod post_load_hooks;
+pub mod mtp_pipeline;
 mod processing;
 mod response;
 pub(crate) mod sampling;
@@ -41,25 +41,25 @@ pub(crate) use isq::IsqModelLoader;
 pub use isq::{
     expand_isq_value, parse_isq_value, IsqModel, IsqOrganization, UQFF_MULTI_FILE_DELIMITER,
 };
+pub use post_load_hooks::{register_post_load_hook, PostLoadHook};
 use llguidance::toktrie::TokEnv;
 pub use loaders::{
     AdapterKind, AutoDeviceMapParams, AutoEmbeddingLoader, AutoNormalLoader, AutoVisionLoader,
-    DeepSeekV2Loader, DeepSeekV3Loader, DeepSeekV4Loader, DeviceMappedModelLoader,
-    DiffusionLoaderType, DiffusionModel, DiffusionModelLoader, EmbeddingGemmaLoader,
-    EmbeddingLoaderType, EmbeddingModel, EmbeddingModelLoader, EmbeddingModelPaths,
-    EmbeddingModule, EmbeddingModulePaths, EmbeddingModuleType, FluxLoader, GLM4Loader,
-    GLM4MoeLiteLoader, GLM4MoeLoader, Gemma2Loader, Gemma3Loader, Gemma3nLoader, GemmaLoader,
-    GptOssLoader, GraniteMoeHybridLoader, Idefics2Loader, Idefics3Loader, LLaVALoader,
-    LLaVANextLoader, LlamaLoader, Loader, LocalModelPaths, MiniCpmOLoader, Mistral3Loader,
-    MistralLoader, MixtralLoader, ModelKind, ModelPaths, NormalLoaderType, NormalLoadingMetadata,
-    NormalModel, NormalModelLoader, Phi2Loader, Phi3Loader, Phi3VLoader, Phi3_5MoELoader,
-    Phi4MMLoader, PrettyName, QuantizationKind, Qwen2Loader, Qwen2VLLoader, Qwen2_5VLLoader,
+    DeepSeekV2Loader, DeepSeekV3Loader, DeepSeekV4Loader, DeviceMappedModelLoader, DiffusionLoaderType,
+    DiffusionModel, DiffusionModelLoader, EmbeddingGemmaLoader, EmbeddingLoaderType,
+    EmbeddingModel, EmbeddingModelLoader, EmbeddingModelPaths, EmbeddingModule,
+    EmbeddingModulePaths, EmbeddingModuleType, FluxLoader, GLM4Loader, GLM4MoeLiteLoader,
+    GLM4MoeLoader, Gemma2Loader, Gemma3Loader, Gemma3nLoader, GemmaLoader, GptOssLoader,
+    GraniteMoeHybridLoader, Idefics2Loader, Idefics3Loader, LLaVALoader, LLaVANextLoader,
+    LlamaLoader, Loader, LocalModelPaths, MiniCpmOLoader, Mistral3Loader, MistralLoader,
+    MixtralLoader, ModelKind, ModelPaths, NormalLoaderType, NormalLoadingMetadata, NormalModel,
+    NormalModelLoader, Phi2Loader, Phi3Loader, Phi3VLoader, Phi3_5MoELoader, Phi4MMLoader,
+    PrettyName, QuantizationKind, Qwen2Loader, Qwen2VLLoader, Qwen2_5VLLoader,
     Qwen3EmbeddingLoader, Qwen3Loader, Qwen3MoELoader, Qwen3NextLoader, Qwen3VLLoader,
     Qwen3VLMoELoader, Qwen3_5Loader, Qwen3_5MoeLoader, SmolLm3Loader, Starcoder2Loader,
     TokenSource, VLlama4Loader, VLlamaLoader, VisionLoaderType, VisionModel, VisionModelLoader,
     VoxtralLoader,
 };
-pub use post_load_hooks::{register_post_load_hook, PostLoadHook};
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn get_device_layers_for_loader(
     loader: &dyn loaders::DeviceMappedModelLoader,
@@ -87,7 +87,6 @@ pub(crate) fn get_device_layers_for_loader(
     )
 }
 use mistralrs_quant::IsqType;
-pub use mtp_pipeline::{try_wrap_pipeline_with_mtp, MtpDecodeKit, MtpSpeculativePipeline};
 pub use normal::{NormalLoader, NormalLoaderBuilder, NormalSpecificConfig};
 pub(crate) use paths::{get_chat_template, get_model_paths, get_xlora_paths};
 pub use paths::{AdapterPaths, LoraAdapterPaths};
@@ -95,6 +94,9 @@ pub(crate) use processing::{
     apply_chat_template, BasicProcessor, MessagesAction, Processor, ProcessorCreator,
 };
 use rand_isaac::Isaac64Rng;
+pub use mtp_pipeline::{
+    try_wrap_pipeline_with_mtp, MtpDecodeKit, MtpSpeculativePipeline,
+};
 pub use speculative::{SpeculativeConfig, SpeculativeLoader, SpeculativePipeline};
 pub use speech::{SpeechLoader, SpeechPipeline};
 use std::any::Any;
@@ -476,10 +478,8 @@ fn wrap_f32_logits(
     unsafe {
         extern "C" {
             fn cudaMemcpy(
-                dst: *mut std::ffi::c_void,
-                src: *const std::ffi::c_void,
-                count: usize,
-                kind: u32,
+                dst: *mut std::ffi::c_void, src: *const std::ffi::c_void,
+                count: usize, kind: u32,
             ) -> u32;
         }
         // Allocate F32 tensor and D2D copy (no BF16→F32 cast needed)
@@ -593,7 +593,7 @@ pub trait Pipeline:
         &mut self,
         inputs: &Box<dyn Any>,
     ) -> Option<Result<ForwardInputsResult, candle_core::Error>> {
-        use arc_cuda_graph::{LayerKvCache, PagedAttentionState};
+        use arc_cuda_graph::{PagedAttentionState, LayerKvCache};
         use candle_core::cuda::cudarc::driver::DevicePtr;
         let __dd_t0 = Instant::now();
 
@@ -609,10 +609,7 @@ pub trait Pipeline:
 
         let is_turbo = cache_config.cache_type.is_turboquant();
         // FP8 cache not yet supported in dedicated path
-        if matches!(
-            cache_config.cache_type,
-            crate::paged_attention::PagedCacheType::F8E4M3
-        ) {
+        if matches!(cache_config.cache_type, crate::paged_attention::PagedCacheType::F8E4M3) {
             return None;
         }
 
@@ -635,18 +632,13 @@ pub trait Pipeline:
             cpu.iter().map(|&x| x as i32).collect()
         } else {
             // Fallback: pull from the GPU tensor (slow path).
-            let ids = model_inputs
-                .input_ids
-                .flatten_all()
+            let ids = model_inputs.input_ids.flatten_all()
                 .and_then(|t| t.to_vec1::<u32>())
                 .unwrap_or_default();
             ids.into_iter().map(|x| x as i32).collect()
         };
-        let positions: Vec<i32> = model_inputs
-            .seqlen_offsets
-            .iter()
-            .map(|&x| x as i32)
-            .collect();
+        let positions: Vec<i32> = model_inputs.seqlen_offsets
+            .iter().map(|&x| x as i32).collect();
         let __dd_t1 = Instant::now();
 
         if token_ids.is_empty() {
@@ -661,22 +653,16 @@ pub trait Pipeline:
         let mut layer_caches = Vec::with_capacity(num_layers);
         for (key_cache, value_cache, k_norms_opt, v_norms_opt) in kv_cache.iter() {
             let kc_ptr = match arc_cuda_graph::tensor_device_ptr(key_cache) {
-                Ok(p) => p,
-                Err(e) => return Some(Err(e)),
+                Ok(p) => p, Err(e) => return Some(Err(e)),
             };
             let vc_ptr = match arc_cuda_graph::tensor_device_ptr(value_cache) {
-                Ok(p) => p,
-                Err(e) => return Some(Err(e)),
+                Ok(p) => p, Err(e) => return Some(Err(e)),
             };
             let kn_ptr = match k_norms_opt.as_ref().map(arc_cuda_graph::tensor_device_ptr) {
-                Some(Ok(p)) => p,
-                Some(Err(e)) => return Some(Err(e)),
-                None => 0,
+                Some(Ok(p)) => p, Some(Err(e)) => return Some(Err(e)), None => 0,
             };
             let vn_ptr = match v_norms_opt.as_ref().map(arc_cuda_graph::tensor_device_ptr) {
-                Some(Ok(p)) => p,
-                Some(Err(e)) => return Some(Err(e)),
-                None => 0,
+                Some(Ok(p)) => p, Some(Err(e)) => return Some(Err(e)), None => 0,
             };
             layer_caches.push(LayerKvCache {
                 key_cache: kc_ptr,
@@ -689,33 +675,24 @@ pub trait Pipeline:
         // Extract block_tables, context_lens, slot_mappings pointers
         let dev_loc = candle_core::DeviceLocation::Cuda { gpu_id: 0 };
 
-        let block_tables_tensor = paged_meta
-            .block_tables
-            .as_ref()
+        let block_tables_tensor = paged_meta.block_tables.as_ref()
             .and_then(|bt| bt.get(&dev_loc));
-        let context_lens_tensor = paged_meta
-            .context_lens
-            .as_ref()
+        let context_lens_tensor = paged_meta.context_lens.as_ref()
             .and_then(|cl| cl.get(&dev_loc));
         let slot_mappings_tensor = paged_meta.slot_mappings.get(&dev_loc);
 
         let (block_tables_ptr, context_lens_ptr, slot_mappings_ptr) = match (
-            block_tables_tensor,
-            context_lens_tensor,
-            slot_mappings_tensor,
+            block_tables_tensor, context_lens_tensor, slot_mappings_tensor
         ) {
             (Some(bt), Some(cl), Some(sm)) => {
                 let bt_ptr = match arc_cuda_graph::tensor_device_ptr(bt) {
-                    Ok(p) => p,
-                    Err(e) => return Some(Err(e)),
+                    Ok(p) => p, Err(e) => return Some(Err(e)),
                 };
                 let cl_ptr = match arc_cuda_graph::tensor_device_ptr(cl) {
-                    Ok(p) => p,
-                    Err(e) => return Some(Err(e)),
+                    Ok(p) => p, Err(e) => return Some(Err(e)),
                 };
                 let sm_ptr = match arc_cuda_graph::tensor_device_ptr(sm) {
-                    Ok(p) => p,
-                    Err(e) => return Some(Err(e)),
+                    Ok(p) => p, Err(e) => return Some(Err(e)),
                 };
                 (bt_ptr, cl_ptr, sm_ptr)
             }
@@ -725,24 +702,14 @@ pub trait Pipeline:
         // Compute cache strides from key_cache shape
         let kc_shape = kv_cache[0].0.dims();
         let block_size = cache_config.block_size as i32;
-        let max_blocks = block_tables_tensor
-            .map(|bt| {
-                if bt.dims().len() >= 2 {
-                    bt.dims()[1]
-                } else {
-                    1
-                }
-            })
-            .unwrap_or(1) as i32;
+        let max_blocks = block_tables_tensor.map(|bt| {
+            if bt.dims().len() >= 2 { bt.dims()[1] } else { 1 }
+        }).unwrap_or(1) as i32;
 
         let (kv_block_stride, kv_head_stride, x) = if kc_shape.len() == 5 {
             // Standard: [num_blocks, num_kv_heads, head_dim/x, block_size, x]
             let (d2, d3, d4) = (kc_shape[2], kc_shape[3], kc_shape[4]);
-            (
-                (kc_shape[1] * d2 * d3 * d4) as i32,
-                (d2 * d3 * d4) as i32,
-                d4 as i32,
-            )
+            ((kc_shape[1] * d2 * d3 * d4) as i32, (d2 * d3 * d4) as i32, d4 as i32)
         } else if kc_shape.len() == 4 {
             // TurboQuant: [num_blocks, num_kv_heads, packed_bytes, block_size]
             let (d2, d3) = (kc_shape[2], kc_shape[3]);
@@ -757,15 +724,9 @@ pub trait Pipeline:
                 let ns = kn.dims();
                 if ns.len() == 3 {
                     ((ns[1] * ns[2]) as i32, ns[2] as i32)
-                } else {
-                    (0, 0)
-                }
-            } else {
-                (0, 0)
-            }
-        } else {
-            (0, 0)
-        };
+                } else { (0, 0) }
+            } else { (0, 0) }
+        } else { (0, 0) };
 
         let max_context_len = paged_meta.max_context_len.unwrap_or(0) as i32;
 
@@ -814,22 +775,10 @@ pub trait Pipeline:
             static SUM_RUN: AtomicU64 = AtomicU64::new(0);
             static SUM_WRAP: AtomicU64 = AtomicU64::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-            SUM_INPUT.fetch_add(
-                __dd_t1.duration_since(__dd_t0).as_micros() as u64,
-                Ordering::Relaxed,
-            );
-            SUM_META.fetch_add(
-                __dd_t2.duration_since(__dd_t1).as_micros() as u64,
-                Ordering::Relaxed,
-            );
-            SUM_RUN.fetch_add(
-                __dd_t3.duration_since(__dd_t2).as_micros() as u64,
-                Ordering::Relaxed,
-            );
-            SUM_WRAP.fetch_add(
-                __dd_t4.duration_since(__dd_t3).as_micros() as u64,
-                Ordering::Relaxed,
-            );
+            SUM_INPUT.fetch_add(__dd_t1.duration_since(__dd_t0).as_micros() as u64, Ordering::Relaxed);
+            SUM_META.fetch_add(__dd_t2.duration_since(__dd_t1).as_micros() as u64, Ordering::Relaxed);
+            SUM_RUN.fetch_add(__dd_t3.duration_since(__dd_t2).as_micros() as u64, Ordering::Relaxed);
+            SUM_WRAP.fetch_add(__dd_t4.duration_since(__dd_t3).as_micros() as u64, Ordering::Relaxed);
             if n > 4 && (n - 4) % 50 == 0 {
                 let nn = n as f64;
                 tracing::info!(
@@ -843,9 +792,7 @@ pub trait Pipeline:
             }
         }
 
-        Some(Ok(ForwardInputsResult::CausalGeneration {
-            logits: logits_tensor,
-        }))
+        Some(Ok(ForwardInputsResult::CausalGeneration { logits: logits_tensor }))
     }
 
     /// Returns the total of model execution time.
@@ -1143,8 +1090,7 @@ pub trait Pipeline:
                     } = inputs.map_err(candle_core::Error::msg)?;
 
                     let start = Instant::now();
-                    let raw_logits =
-                        self.graph_wrapped_forward(inputs, is_prompt, return_raw_logits)?;
+                    let raw_logits = self.graph_wrapped_forward(inputs, is_prompt, return_raw_logits)?;
                     let end = Instant::now();
                     exec_duration += end.duration_since(start);
                     __pa_t_fwd_us += end.duration_since(start).as_secs_f64() * 1e6;

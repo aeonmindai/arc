@@ -398,7 +398,8 @@ impl MxInt4BlockwiseDequantize {
 
                         // SAFETY: each thread writes to independent output positions
                         unsafe {
-                            *res_ptr.wrapping_add(y * cols + x) = T::from_f64(dequant_val as f64);
+                            *res_ptr.wrapping_add(y * cols + x) =
+                                T::from_f64(dequant_val as f64);
                         }
                     }
                 }
@@ -422,10 +423,7 @@ impl CustomOp2 for MxInt4BlockwiseDequantize {
         packed_l: &candle_core::Layout,
     ) -> candle_core::Result<(candle_core::CpuStorage, candle_core::Shape)> {
         let CpuStorage::I32(packed) = packed_s else {
-            candle_core::bail!(
-                "MX INT4 dequant expects I32 (sign-extended I8) packed weights, got {:?}",
-                packed_s
-            );
+            candle_core::bail!("MX INT4 dequant expects I32 (sign-extended I8) packed weights, got {:?}", packed_s);
         };
         let CpuStorage::F32(scale) = scale_s else {
             candle_core::bail!("MX INT4 dequant expects F32 scales, got {:?}", scale_s);
@@ -453,9 +451,7 @@ impl CustomOp2 for MxInt4BlockwiseDequantize {
                 out_shape,
             )),
             DType::BF16 => Ok((
-                CpuStorage::BF16(
-                    self.dispatch_dequant_blockwise(packed, scale, packed_l, scale_l)?,
-                ),
+                CpuStorage::BF16(self.dispatch_dequant_blockwise(packed, scale, packed_l, scale_l)?),
                 out_shape,
             )),
             DType::F16 => Ok((

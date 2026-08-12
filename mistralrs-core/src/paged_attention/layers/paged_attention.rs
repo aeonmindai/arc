@@ -5,8 +5,7 @@ use mistralrs_paged_attn::{kv_scale_update, paged_attention, reshape_and_cache};
 const KV_SCALE_UPDATE_ITERATION: i32 = 128;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-#[allow(unused_imports)]
-// consumed by cache_write_and_gather (cuda+metal); silence on no-cuda+no-metal builds where the layer is stubbed.
+#[allow(unused_imports)] // consumed by cache_write_and_gather (cuda+metal); silence on no-cuda+no-metal builds where the layer is stubbed.
 use crate::paged_attention::build_cu_seqlens_kv_from_context_lens;
 use crate::{
     attention::SdpaParams,
@@ -424,16 +423,24 @@ impl PagedAttention {
                 .full_block_tables
                 .as_ref()
                 .or(input_metadata.block_tables.as_ref())
-                .expect("PagedAttention::cache_write_and_gather: block_tables missing on metadata")
+                .expect(
+                    "PagedAttention::cache_write_and_gather: block_tables missing on metadata",
+                )
                 .get(&device.location())
-                .expect("PagedAttention::cache_write_and_gather: block_tables missing for device");
+                .expect(
+                    "PagedAttention::cache_write_and_gather: block_tables missing for device",
+                );
             let context_lens = input_metadata
                 .full_context_lens
                 .as_ref()
                 .or(input_metadata.context_lens.as_ref())
-                .expect("PagedAttention::cache_write_and_gather: context_lens missing on metadata")
+                .expect(
+                    "PagedAttention::cache_write_and_gather: context_lens missing on metadata",
+                )
                 .get(&device.location())
-                .expect("PagedAttention::cache_write_and_gather: context_lens missing for device");
+                .expect(
+                    "PagedAttention::cache_write_and_gather: context_lens missing for device",
+                );
 
             // 2) Reshape new K/V to the cache-write layout `[N_new, H, D]`.
             //    `key` arrives as `[B, H, T_new, D]` from the caller.
@@ -512,8 +519,10 @@ impl PagedAttention {
             #[cfg(feature = "metal")]
             {
                 let device = key.device();
-                let slot_mapping_full =
-                    input_metadata.slot_mappings.get(&device.location()).expect(
+                let slot_mapping_full = input_metadata
+                    .slot_mappings
+                    .get(&device.location())
+                    .expect(
                         "PagedAttention::cache_write_and_gather: slot_mappings missing for device",
                     );
                 let dims = slot_mapping_full.dims();
@@ -591,15 +600,10 @@ impl PagedAttention {
             }
             #[cfg(not(feature = "metal"))]
             {
-                let _ = (
-                    key,
-                    value,
-                    key_cache,
-                    value_cache,
-                    input_metadata,
-                    out_dtype,
+                let _ = (key, value, key_cache, value_cache, input_metadata, out_dtype);
+                candle_core::bail!(
+                    "PagedAttention::cache_write_and_gather requires CUDA or Metal"
                 );
-                candle_core::bail!("PagedAttention::cache_write_and_gather requires CUDA or Metal");
             }
         }
     }

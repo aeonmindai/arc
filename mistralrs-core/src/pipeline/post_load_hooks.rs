@@ -44,11 +44,7 @@ pub fn register_post_load_hook(hook: PostLoadHook) {
 pub(crate) fn has_registered_hooks() -> bool {
     HOOKS
         .get()
-        .map(|l| {
-            !l.lock()
-                .expect("post-load hook registry poisoned")
-                .is_empty()
-        })
+        .map(|l| !l.lock().expect("post-load hook registry poisoned").is_empty())
         .unwrap_or(false)
 }
 
@@ -60,7 +56,9 @@ pub(crate) fn run_post_load_hooks(model: &mut dyn IsqModel) -> anyhow::Result<()
     let guard = lock.lock().expect("post-load hook registry poisoned");
     for (idx, hook) in guard.iter().enumerate() {
         if let Err(e) = hook(model) {
-            return Err(anyhow::anyhow!("post-load hook #{idx} failed: {e}"));
+            return Err(anyhow::anyhow!(
+                "post-load hook #{idx} failed: {e}"
+            ));
         }
     }
     Ok(())

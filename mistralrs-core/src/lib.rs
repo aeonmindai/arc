@@ -104,30 +104,28 @@ pub use mistralrs_mcp::{
     McpClient, McpClientConfig, McpServerConfig, McpServerSource, McpToolInfo,
 };
 pub use mistralrs_quant::{IsqBits, IsqType, MULTI_LORA_DELIMITER};
-pub use paged_attention::{
-    AttentionImplementation, MemoryGpuConfig, PagedAttentionConfig, PagedCacheType,
-};
+pub use paged_attention::{AttentionImplementation, MemoryGpuConfig, PagedAttentionConfig, PagedCacheType};
 pub use pipeline::hf::{hf_home_dir, hf_hub_cache_dir, hf_token_path};
 pub use pipeline::post_load_hooks::{register_post_load_hook, PostLoadHook};
+pub use pipeline::{
+    chat_template::ChatTemplate, expand_isq_value, parse_isq_value, AdapterPaths, AnyMoeLoader,
+    AnyMoePipeline, AutoDeviceMapParams, AutoLoader, AutoLoaderBuilder, AutoNormalLoader,
+    DeepSeekV3Loader, DeepSeekV4Loader, DiffusionGenerationParams, DiffusionLoader,
+    DiffusionLoaderBuilder, DiffusionLoaderType, EmbeddingLoader, EmbeddingLoaderBuilder,
+    EmbeddingLoaderType, EmbeddingModelPaths, EmbeddingSpecificConfig, GGMLLoader,
+    GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoader, GGUFLoaderBuilder, GGUFSpecificConfig,
+    GLM4MoeLoader, GemmaLoader, Idefics2Loader, IsqModel, IsqOrganization, LLaVALoader,
+    LLaVANextLoader, LlamaLoader, Loader, LocalModelPaths, LoraAdapterPaths, MistralLoader,
+    MixtralLoader, Modalities, ModelKind, ModelPaths, MultimodalPromptPrefixer, NormalLoader,
+    NormalLoaderBuilder, NormalLoaderType, NormalLoadingMetadata, NormalModel, NormalModelLoader,
+    try_wrap_pipeline_with_mtp, MtpDecodeKit, MtpSpeculativePipeline, NormalSpecificConfig,
+    Phi2Loader, Phi3Loader, Phi3VLoader, Qwen2Loader, SpeculativeConfig, SpeculativeLoader,
+    SpeculativePipeline, SpeechLoader, SpeechPipeline, Starcoder2Loader,
+    SupportedModality, TokenSource, VisionLoader, VisionLoaderBuilder, VisionLoaderType,
+    VisionSpecificConfig, UQFF_MULTI_FILE_DELIMITER,
+};
 /// `FlashParams` is needed by integration tests that call `NormalModel::forward` directly.
 pub use pipeline::text_models_inputs_processor::FlashParams as TextFlashParams;
-pub use pipeline::{
-    chat_template::ChatTemplate, expand_isq_value, parse_isq_value, try_wrap_pipeline_with_mtp,
-    AdapterPaths, AnyMoeLoader, AnyMoePipeline, AutoDeviceMapParams, AutoLoader, AutoLoaderBuilder,
-    AutoNormalLoader, DeepSeekV3Loader, DeepSeekV4Loader, DiffusionGenerationParams,
-    DiffusionLoader, DiffusionLoaderBuilder, DiffusionLoaderType, EmbeddingLoader,
-    EmbeddingLoaderBuilder, EmbeddingLoaderType, EmbeddingModelPaths, EmbeddingSpecificConfig,
-    GGMLLoader, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoader, GGUFLoaderBuilder,
-    GGUFSpecificConfig, GLM4MoeLoader, GemmaLoader, Idefics2Loader, IsqModel, IsqOrganization,
-    LLaVALoader, LLaVANextLoader, LlamaLoader, Loader, LocalModelPaths, LoraAdapterPaths,
-    MistralLoader, MixtralLoader, Modalities, ModelKind, ModelPaths, MtpDecodeKit,
-    MtpSpeculativePipeline, MultimodalPromptPrefixer, NormalLoader, NormalLoaderBuilder,
-    NormalLoaderType, NormalLoadingMetadata, NormalModel, NormalModelLoader, NormalSpecificConfig,
-    Phi2Loader, Phi3Loader, Phi3VLoader, Qwen2Loader, SpeculativeConfig, SpeculativeLoader,
-    SpeculativePipeline, SpeechLoader, SpeechPipeline, Starcoder2Loader, SupportedModality,
-    TokenSource, VisionLoader, VisionLoaderBuilder, VisionLoaderType, VisionSpecificConfig,
-    UQFF_MULTI_FILE_DELIMITER,
-};
 pub use request::{
     ApproximateUserLocation, Constraint, DetokenizationRequest, ImageGenerationResponseFormat,
     LlguidanceGrammar, MessageContent, NormalRequest, ReasoningEffort, Request, RequestMessage,
@@ -146,9 +144,9 @@ use toml_selector::{TomlLoaderArgs, TomlSelector};
 pub use tools::{ToolCallResponse, ToolCallType, ToolCallbacks, ToolChoice};
 pub use topology::{LayerTopology, Topology};
 pub use utils::debug::initialize_logging;
+pub use utils::memory_usage::MemoryUsage;
 #[cfg(feature = "cuda")]
 pub use utils::memory_usage::trim_cuda_memory_pools;
-pub use utils::memory_usage::MemoryUsage;
 pub use utils::normal::{ModelDType, TryIntoDType};
 pub use utils::{paged_attn_supported, using_flash_attn};
 

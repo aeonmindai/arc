@@ -40,10 +40,7 @@ mod cuda {
             );
         }
         if positions.dtype() != DType::U32 {
-            candle_core::bail!(
-                "kv-write: positions must be U32 (got {:?})",
-                positions.dtype()
-            );
+            candle_core::bail!("kv-write: positions must be U32 (got {:?})", positions.dtype());
         }
         if !all_data.is_contiguous() || !src.is_contiguous() {
             candle_core::bail!("kv-write: all_data and src must be contiguous");
@@ -65,9 +62,12 @@ mod cuda {
             _ => candle_core::bail!("kv-write: positions must be CUDA storage"),
         };
 
-        let (ad_ptr, _ad_guard) = slice_ptr(ad_s.as_cuda_slice::<T>()?, ad_l.start_offset());
-        let (src_ptr, _src_guard) = slice_ptr(src_s.as_cuda_slice::<T>()?, src_l.start_offset());
-        let (pos_ptr, _pos_guard) = slice_ptr(pos_s.as_cuda_slice::<u32>()?, pos_l.start_offset());
+        let (ad_ptr, _ad_guard) =
+            slice_ptr(ad_s.as_cuda_slice::<T>()?, ad_l.start_offset());
+        let (src_ptr, _src_guard) =
+            slice_ptr(src_s.as_cuda_slice::<T>()?, src_l.start_offset());
+        let (pos_ptr, _pos_guard) =
+            slice_ptr(pos_s.as_cuda_slice::<u32>()?, pos_l.start_offset());
 
         unsafe {
             super::ffi::kvcache_write(

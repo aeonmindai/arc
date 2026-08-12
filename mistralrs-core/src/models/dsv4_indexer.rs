@@ -115,11 +115,11 @@ impl V4Indexer {
         let n_heads = cfg.index_n_heads;
         let head_dim = cfg.index_head_dim;
         let topk = cfg.index_topk;
-        let q_lora_rank = cfg.q_lora_rank.ok_or_else(|| {
-            candle_core::Error::Msg(
+        let q_lora_rank = cfg
+            .q_lora_rank
+            .ok_or_else(|| candle_core::Error::Msg(
                 "V4Indexer requires DeepSeekV4Config.q_lora_rank to be set".into(),
-            )
-        })?;
+            ))?;
 
         // CSA always uses ratio=4 with overlap=true → coff=2.
         let ratio = 4usize;
@@ -218,23 +218,21 @@ impl V4Indexer {
     pub fn forward(&self, q_a: &Tensor, k_full: &Tensor, xs: &Tensor) -> Result<Tensor> {
         let q_dims = q_a.dims();
         if q_dims.len() != 3 {
-            candle_core::bail!(
-                "V4Indexer.q_a expected [B, T_q, q_lora_rank], got {:?}",
-                q_dims
-            );
+            candle_core::bail!("V4Indexer.q_a expected [B, T_q, q_lora_rank], got {:?}", q_dims);
         }
         let (b, t_q, _q_rank) = (q_dims[0], q_dims[1], q_dims[2]);
 
         let k_dims = k_full.dims();
         if k_dims.len() != 4 {
-            candle_core::bail!(
-                "V4Indexer.k_full expected [B, H, T_full, D], got {:?}",
-                k_dims
-            );
+            candle_core::bail!("V4Indexer.k_full expected [B, H, T_full, D], got {:?}", k_dims);
         }
         let (b_k, h_k, t_full, d_k) = (k_dims[0], k_dims[1], k_dims[2], k_dims[3]);
         if b_k != b {
-            candle_core::bail!("V4Indexer: q_a batch {} != k_full batch {}", b, b_k);
+            candle_core::bail!(
+                "V4Indexer: q_a batch {} != k_full batch {}",
+                b,
+                b_k
+            );
         }
         if h_k != self.n_heads {
             candle_core::bail!(
@@ -300,7 +298,10 @@ impl V4Indexer {
         // kernel will reproduce SGLang's per-position-in-group ape
         // ordering. The bias shape [coff*head_dim] matches gated's last
         // dim and broadcasts correctly across all grouped rows.
-        let ape_bias = self.inner_ape.to_dtype(work_dtype)?.sum(0)?; // [coff*head_dim]
+        let ape_bias = self
+            .inner_ape
+            .to_dtype(work_dtype)?
+            .sum(0)?; // [coff*head_dim]
         let gated = gated.broadcast_add(&ape_bias)?;
 
         // Reshape to expose `head_dim` for RMSNorm. SGLang's compressor
@@ -315,10 +316,10 @@ impl V4Indexer {
         // the `coff` overlap dimension by sum (matches SGLang's overlap
         // handling: the two halves are summed at the kernel level when
         // computing scores; see `compress_forward` triton kernel).
-        let normed = normed
-            .reshape((total_groups, self.coff, self.head_dim))?
-            .sum(1)?;
-        let indexer_k = normed.reshape((b, h_k, t_c, self.head_dim))?.contiguous()?;
+        let normed = normed.reshape((total_groups, self.coff, self.head_dim))?.sum(1)?;
+        let indexer_k = normed
+            .reshape((b, h_k, t_c, self.head_dim))?
+            .contiguous()?;
 
         // --- 3+4+5. Score + scale + top-k -------------------------------
         // CUDA fast path (RUN-163): when running on a CUDA device with a
@@ -339,11 +340,14 @@ impl V4Indexer {
         {
             if matches!(q.device(), candle_core::Device::Cuda(_))
                 && q.dtype() == candle_core::DType::BF16
-                && arc_cuda_graph::flashmlasparse::SUPPORTED_TOPK.contains(&self.topk.min(t_c))
+                && arc_cuda_graph::flashmlasparse::SUPPORTED_TOPK
+                    .contains(&self.topk.min(t_c))
             {
                 // Ensure all three inputs are BF16 contiguous on the same device.
                 let q_bf16 = q.to_dtype(candle_core::DType::BF16)?.contiguous()?;
-                let k_bf16 = indexer_k.to_dtype(candle_core::DType::BF16)?.contiguous()?;
+                let k_bf16 = indexer_k
+                    .to_dtype(candle_core::DType::BF16)?
+                    .contiguous()?;
                 let s_bf16 = per_head_scale_3d
                     .to_dtype(candle_core::DType::BF16)?
                     .contiguous()?;
@@ -450,10 +454,7 @@ mod tests {
             Tensor::randn(
                 0.0f32,
                 0.02,
-                (
-                    cfg.index_n_heads * cfg.index_head_dim,
-                    cfg.q_lora_rank.unwrap(),
-                ),
+                (cfg.index_n_heads * cfg.index_head_dim, cfg.q_lora_rank.unwrap()),
                 device,
             )
             .unwrap()
@@ -511,10 +512,7 @@ mod tests {
     #[test]
     fn v4_indexer_forward_shape() -> Result<()> {
         let device = Device::Cpu;
-        let cfg = synth_cfg(
-            /*hidden*/ 32, /*q_lora*/ 24, /*n_heads*/ 4, /*head_dim*/ 8,
-            /*topk*/ 6,
-        );
+        let cfg = synth_cfg(/*hidden*/ 32, /*q_lora*/ 24, /*n_heads*/ 4, /*head_dim*/ 8, /*topk*/ 6);
         let tensors = make_indexer_tensors(&cfg, 4, 2, &device);
         let vb = vb_from_map(tensors, DType::F32, &device);
         let indexer = V4Indexer::new(&cfg, vb, &device, false)?;
@@ -566,7 +564,10 @@ mod tests {
         // Flatten to Vec<u32> for in-range check.
         let flat: Vec<u32> = out.flatten_all()?.to_vec1()?;
         for idx in &flat {
-            assert!(*idx < t_c, "index {idx} out of range; T_c = {t_c}");
+            assert!(
+                *idx < t_c,
+                "index {idx} out of range; T_c = {t_c}"
+            );
         }
         Ok(())
     }
@@ -624,10 +625,7 @@ mod tests {
         let device = Device::Cpu;
         // small but realistic shape: 1 batch, 2 query tokens, 3 heads,
         // head_dim=8, ratio=4, t_full=16 → T_c=4; topk=3.
-        let cfg = synth_cfg(
-            /*hidden*/ 16, /*q_lora*/ 16, /*n_heads*/ 3, /*head_dim*/ 8,
-            /*topk*/ 3,
-        );
+        let cfg = synth_cfg(/*hidden*/ 16, /*q_lora*/ 16, /*n_heads*/ 3, /*head_dim*/ 8, /*topk*/ 3);
         // Use a fixed-seed deterministic tensor map (the same one used by
         // the other tests). Real-checkpoint values would differ but the
         // agreement check is shape/structure-agnostic.
@@ -735,8 +733,7 @@ mod tests {
                 for ci in 0..t_c {
                     for ri in 0..ratio {
                         for d in 0..head_dim {
-                            let src =
-                                ((bi * n_heads + h) * t_full + ci * ratio + ri) * head_dim + d;
+                            let src = ((bi * n_heads + h) * t_full + ci * ratio + ri) * head_dim + d;
                             let dst = ((bi * n_heads + h) * t_c + ci) * (ratio * head_dim)
                                 + ri * head_dim
                                 + d;
@@ -831,8 +828,7 @@ mod tests {
                         })
                         .collect();
                     scored.sort_by(|a, b| {
-                        b.1.partial_cmp(&a.1)
-                            .unwrap_or(std::cmp::Ordering::Equal)
+                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
                             .then(a.0.cmp(&b.0))
                     });
                     let out_base = ((bi * n_heads + h) * t_q + ti) * k_top;
