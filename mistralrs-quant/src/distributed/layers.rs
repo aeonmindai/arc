@@ -1230,6 +1230,7 @@ impl PackedExperts {
 
                             // RUN-161: parallel INT4→BF16 dequant across experts.
                             use rayon::prelude::*;
+                            #[allow(clippy::type_complexity)]
                             let experts_dequant: Vec<candle_core::Result<(Arc<dyn QuantMethod>, Arc<dyn QuantMethod>, Arc<dyn QuantMethod>)>> =
                                 (0..num_local_experts)
                                     .into_par_iter()

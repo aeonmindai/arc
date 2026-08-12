@@ -38,7 +38,7 @@ fn run(
 
     // Pre-grown caches: kernel-written vs slice_set oracle. Same zeros init.
     let kernel_cache = Tensor::zeros((b, h, c, d), dtype, &dev)?;
-    let mut oracle_cache = Tensor::zeros((b, h, c, d), dtype, &dev)?;
+    let oracle_cache = Tensor::zeros((b, h, c, d), dtype, &dev)?;
 
     for step in 0..n_steps {
         // New token K/V for this step: [B, H, 1, D].
