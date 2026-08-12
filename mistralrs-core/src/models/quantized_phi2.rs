@@ -79,7 +79,10 @@ impl LayerWeights {
         mask: Option<&Tensor>,
         seqlen_offsets: &[usize],
         kv_cache: &mut KvCache,
-        metadata: Option<((Tensor, Tensor, Option<Tensor>, Option<Tensor>), &PagedAttentionInputMetadata)>,
+        metadata: Option<(
+            (Tensor, Tensor, Option<Tensor>, Option<Tensor>),
+            &PagedAttentionInputMetadata,
+        )>,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
         let qkv = self
@@ -348,7 +351,10 @@ impl ModelWeights {
         input_ids: &Tensor,
         seqlen_offsets: &[usize],
         context_lens: Vec<(usize, usize)>,
-        metadata: Option<(Vec<(Tensor, Tensor, Option<Tensor>, Option<Tensor>)>, &PagedAttentionInputMetadata)>,
+        metadata: Option<(
+            Vec<(Tensor, Tensor, Option<Tensor>, Option<Tensor>)>,
+            &PagedAttentionInputMetadata,
+        )>,
     ) -> Result<Tensor> {
         let mut xs = self.tok_embeddings.forward(input_ids)?;
         let cache = &mut self.cache.normal().0;

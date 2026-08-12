@@ -106,7 +106,9 @@ impl SingleCache {
         }
         let seq_len = src.dim(self.dim)?;
         if seq_len != 1 {
-            candle_core::bail!("append_graph is decode-only (src seq len must be 1, got {seq_len})");
+            candle_core::bail!(
+                "append_graph is decode-only (src seq len must be 1, got {seq_len})"
+            );
         }
         // Buffer must be at least `read_capacity` along the seq dim. Reuse the
         // existing (eager-populated) all_data so past K/V is present; only

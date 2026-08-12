@@ -115,8 +115,8 @@ pub fn dsv4_attention(
             let bp = Tensor::arange(0u32, t_c as u32, dev)?
                 .to_dtype(DType::F32)?
                 .reshape((1, t_c))?;
-            let thr = ((&qp + 1.0)? / ratio as f64)?.floor()?; // [t_q, 1]
-            let comp_valid = bp.broadcast_lt(&thr)?; // [t_q, t_c] (u8)
+            let threshold = ((&qp + 1.0)? / ratio as f64)?.floor()?; // [t_q, 1]
+            let comp_valid = bp.broadcast_lt(&threshold)?; // [t_q, t_c] (u8)
             let valid = Tensor::cat(&[&raw_valid, &comp_valid], 1)?;
             let k_cat = Tensor::cat(&[k, comp], 2)?.contiguous()?;
             let v_cat = Tensor::cat(&[v, comp], 2)?.contiguous()?;
@@ -133,7 +133,14 @@ pub fn dsv4_attention(
         .where_cond(&zeros, &neg_inf)?
         .reshape((1, 1, t_q, n_keys))?;
 
-    Sdpa.run_attention(q, &k_cat, &v_cat, Some(&mask), Some(flash_params), sdpa_params)
+    Sdpa.run_attention(
+        q,
+        &k_cat,
+        &v_cat,
+        Some(&mask),
+        Some(flash_params),
+        sdpa_params,
+    )
 }
 
 #[cfg(test)]

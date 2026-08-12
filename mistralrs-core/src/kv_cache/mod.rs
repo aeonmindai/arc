@@ -98,7 +98,9 @@ impl KvCache {
                 let out_v = vc.append_graph(&v, position, read_capacity)?;
                 Ok((out_k, out_v))
             }
-            _ => candle_core::bail!("append_graph: only the Normal KV cache supports graph capture"),
+            _ => {
+                candle_core::bail!("append_graph: only the Normal KV cache supports graph capture")
+            }
         }
     }
 

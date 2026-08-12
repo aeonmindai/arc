@@ -193,7 +193,10 @@ impl Attention {
         attention_mask: Option<&Tensor>,
         cos_sin: &(Tensor, Tensor),
         kv_cache: &mut KvCache,
-        metadata: Option<((Tensor, Tensor, Option<Tensor>, Option<Tensor>), &PagedAttentionInputMetadata)>,
+        metadata: Option<(
+            (Tensor, Tensor, Option<Tensor>, Option<Tensor>),
+            &PagedAttentionInputMetadata,
+        )>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
@@ -359,7 +362,10 @@ impl DecoderLayer {
         attention_mask: Option<&Tensor>,
         cos_sin: &(Tensor, Tensor),
         kv_cache: &mut KvCache,
-        metadata: Option<((Tensor, Tensor, Option<Tensor>, Option<Tensor>), &PagedAttentionInputMetadata)>,
+        metadata: Option<(
+            (Tensor, Tensor, Option<Tensor>, Option<Tensor>),
+            &PagedAttentionInputMetadata,
+        )>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let residual = xs;
@@ -525,7 +531,10 @@ impl Qwen3VLTextModel {
         attention_mask: Option<&Tensor>,
         position_ids: &Tensor,
         context_lens: Vec<(usize, usize)>,
-        metadata: Option<(Vec<(Tensor, Tensor, Option<Tensor>, Option<Tensor>)>, &PagedAttentionInputMetadata)>,
+        metadata: Option<(
+            Vec<(Tensor, Tensor, Option<Tensor>, Option<Tensor>)>,
+            &PagedAttentionInputMetadata,
+        )>,
         flash_params: &FlashParams,
         visual_pos_masks: Option<&Tensor>,
         deepstack_visual_embeds: Option<&[Tensor]>,

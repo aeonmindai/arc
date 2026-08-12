@@ -38,7 +38,13 @@ fn bytes_per_expert(s: &Shape) -> f64 {
     s.n as f64 * s.k as f64 * 0.25 + s.n as f64 * 4.0
 }
 
-fn time_call(dev: &Device, layer: &std::sync::Arc<dyn mistralrs_quant::QuantMethod>, a: &Tensor, idx_sets: &[Tensor], iters: usize) -> candle_core::Result<f64> {
+fn time_call(
+    dev: &Device,
+    layer: &std::sync::Arc<dyn mistralrs_quant::QuantMethod>,
+    a: &Tensor,
+    idx_sets: &[Tensor],
+    iters: usize,
+) -> candle_core::Result<f64> {
     for r in 0..8 {
         let _ = layer.gather_forward(a, &idx_sets[r % idx_sets.len()])?;
     }
@@ -57,7 +63,13 @@ fn run_shape(dev: &Device, s: &Shape, e: usize, iters: usize) -> candle_core::Re
     std::env::remove_var("ARC_NO_QTIP_ONDEVICE_MOE");
 
     let bpe = bytes_per_expert(s);
-    println!("[{}] N={} K={}  (bytes/expert={:.2} MB)", s.name, s.n, s.k, bpe / 1e6);
+    println!(
+        "[{}] N={} K={}  (bytes/expert={:.2} MB)",
+        s.name,
+        s.n,
+        s.k,
+        bpe / 1e6
+    );
 
     let batches = [1usize, 2, 4, 8];
     let mut pts: Vec<(f64, f64)> = vec![]; // (pairs, secs)
@@ -67,7 +79,9 @@ fn run_shape(dev: &Device, s: &Shape, e: usize, iters: usize) -> candle_core::Re
         let n_rot = 16usize;
         let mut idx_sets = Vec::with_capacity(n_rot);
         for r in 0..n_rot {
-            let idx: Vec<u32> = (0..n_pairs).map(|i| (((r * n_pairs) + i) % e) as u32).collect();
+            let idx: Vec<u32> = (0..n_pairs)
+                .map(|i| (((r * n_pairs) + i) % e) as u32)
+                .collect();
             idx_sets.push(Tensor::from_vec(idx, (b, TOPK), dev)?);
         }
         let a = Tensor::randn(0f32, 1f32, (b, TOPK, s.k), dev)?.to_dtype(DType::BF16)?;
@@ -76,7 +90,11 @@ fn run_shape(dev: &Device, s: &Shape, e: usize, iters: usize) -> candle_core::Re
         let bw = bytes / secs;
         println!(
             "  b={:<2} pairs={:<3} | {:>8.1} us/call | {:>7.0} GB/s | {:>5.1}% peak",
-            b, n_pairs, secs * 1e6, bw / 1e9, bw / H200_PEAK * 100.0
+            b,
+            n_pairs,
+            secs * 1e6,
+            bw / 1e9,
+            bw / H200_PEAK * 100.0
         );
         pts.push((n_pairs as f64, secs));
     }
@@ -101,10 +119,22 @@ fn run_shape(dev: &Device, s: &Shape, e: usize, iters: usize) -> candle_core::Re
 
 fn main() -> candle_core::Result<()> {
     let dev = Device::new_cuda(0)?;
-    println!("=== QTIP 2-bit gather-GEMV decode bandwidth (H200 peak {:.1} TB/s, topk={}) ===\n", H200_PEAK / 1e12, TOPK);
+    println!(
+        "=== QTIP 2-bit gather-GEMV decode bandwidth (H200 peak {:.1} TB/s, topk={}) ===\n",
+        H200_PEAK / 1e12,
+        TOPK
+    );
     let shapes = [
-        Shape { name: "gate", n: 2048, k: 4096 },
-        Shape { name: "down", n: 4096, k: 2048 },
+        Shape {
+            name: "gate",
+            n: 2048,
+            k: 4096,
+        },
+        Shape {
+            name: "down",
+            n: 4096,
+            k: 2048,
+        },
     ];
     for s in &shapes {
         run_shape(&dev, s, 64, 300)?;

@@ -150,7 +150,10 @@ impl CausalSelfAttention {
         attention_mask: &Option<Tensor>,
         seqlen_offsets: &[usize],
         kv_cache: &mut KvCache,
-        metadata: Option<((Tensor, Tensor, Option<Tensor>, Option<Tensor>), &PagedAttentionInputMetadata)>,
+        metadata: Option<(
+            (Tensor, Tensor, Option<Tensor>, Option<Tensor>),
+            &PagedAttentionInputMetadata,
+        )>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
@@ -484,7 +487,10 @@ impl Block {
         chunked_mask: &Option<Tensor>,
         seqlen_offsets: &[usize],
         kv_cache: &mut KvCache,
-        metadata: Option<((Tensor, Tensor, Option<Tensor>, Option<Tensor>), &PagedAttentionInputMetadata)>,
+        metadata: Option<(
+            (Tensor, Tensor, Option<Tensor>, Option<Tensor>),
+            &PagedAttentionInputMetadata,
+        )>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let residual = x;
@@ -670,7 +676,10 @@ impl TextModel {
         input_embeds: Tensor,
         seqlen_offsets: &[usize],
         context_lens: Vec<(usize, usize)>,
-        metadata: Option<(Vec<(Tensor, Tensor, Option<Tensor>, Option<Tensor>)>, &PagedAttentionInputMetadata)>,
+        metadata: Option<(
+            Vec<(Tensor, Tensor, Option<Tensor>, Option<Tensor>)>,
+            &PagedAttentionInputMetadata,
+        )>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let mut x = input_embeds;
@@ -798,7 +807,10 @@ impl NormalModel for TextModel {
         _seqlen_offsets: &[usize],
         _context_lens: Vec<(usize, usize)>,
         _position_ids: Vec<usize>,
-        _metadata: Option<(Vec<(Tensor, Tensor, Option<Tensor>, Option<Tensor>)>, &PagedAttentionInputMetadata)>,
+        _metadata: Option<(
+            Vec<(Tensor, Tensor, Option<Tensor>, Option<Tensor>)>,
+            &PagedAttentionInputMetadata,
+        )>,
         _flash_params: &FlashParams,
     ) -> Result<Tensor> {
         unreachable!()

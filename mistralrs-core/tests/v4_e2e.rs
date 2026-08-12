@@ -88,10 +88,7 @@ mod test_device_mapper {
                 varbuilder.set_device(self.nm_device.clone())
             }
         }
-        fn get_min_dtype(
-            &self,
-            dtype: &dyn mistralrs_core::TryIntoDType,
-        ) -> Result<DType> {
+        fn get_min_dtype(&self, dtype: &dyn mistralrs_core::TryIntoDType) -> Result<DType> {
             dtype
                 .try_into_dtype(&[&self.nm_device])
                 .map_err(candle_core::Error::msg)
@@ -215,20 +212,14 @@ fn build_synthetic_v4_weights(device: &Device) -> CandleResult<HashMap<String, T
         );
         tensors.insert(
             format!("{l}.self_attn.q_b_proj.weight"),
-            zeros(
-                &[NUM_ATTN_HEADS * q_head_dim(), Q_LORA_RANK],
-                device,
-            )?,
+            zeros(&[NUM_ATTN_HEADS * q_head_dim(), Q_LORA_RANK], device)?,
         );
 
         // V3-style fallback for the LoRA-A KV projection. deepseek4.rs probes
         // `kv_proj` first (V4 HF native), falls back to `kv_a_proj_with_mqa`.
         tensors.insert(
             format!("{l}.self_attn.kv_a_proj_with_mqa.weight"),
-            zeros(
-                &[KV_LORA_RANK + QK_ROPE_HEAD_DIM, HIDDEN_SIZE],
-                device,
-            )?,
+            zeros(&[KV_LORA_RANK + QK_ROPE_HEAD_DIM, HIDDEN_SIZE], device)?,
         );
         tensors.insert(
             format!("{l}.self_attn.kv_a_layernorm.weight"),
@@ -527,7 +518,11 @@ fn v4_synthetic_load_and_forward_is_finite_and_deterministic() {
         .expect("V4 forward #2 failed on synthetic CPU weights");
 
     // Same shape.
-    assert_eq!(out1.dims(), out2.dims(), "Determinism failure: shape diverged");
+    assert_eq!(
+        out1.dims(),
+        out2.dims(),
+        "Determinism failure: shape diverged"
+    );
 
     // Same values (allow tight FP tolerance for any nondeterministic CPU ops).
     let flat2: Vec<f32> = out2

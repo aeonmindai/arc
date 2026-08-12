@@ -297,9 +297,8 @@ impl V4MHCLayerParams {
         let b_comb = hc_base_f32.narrow(0, 2 * hc, hc * hc)?.reshape((hc, hc))?;
 
         // pre  = sigmoid(pre_block  * s_pre  + b_pre) + eps
-        let pre = candle_nn::ops::sigmoid(
-            &(pre_block.broadcast_mul(&s_pre)?.broadcast_add(&b_pre)?),
-        )?;
+        let pre =
+            candle_nn::ops::sigmoid(&(pre_block.broadcast_mul(&s_pre)?.broadcast_add(&b_pre)?))?;
         let pre = (pre + self.rt.hc_eps)?;
 
         // post = 2 * sigmoid(post_block * s_post + b_post)
@@ -307,15 +306,12 @@ impl V4MHCLayerParams {
         // Tensor::new(2f32, device) — the latter is a per-call CPU->GPU sync
         // (CLAUDE.md pitfall #5) that breaks CUDA-graph capture of the decode
         // forward. affine folds the constant into the kernel, no allocation.
-        let post_sig = candle_nn::ops::sigmoid(
-            &(post_block.broadcast_mul(&s_post)?.broadcast_add(&b_post)?),
-        )?;
+        let post_sig =
+            candle_nn::ops::sigmoid(&(post_block.broadcast_mul(&s_post)?.broadcast_add(&b_post)?))?;
         let post = post_sig.affine(2.0, 0.0)?;
 
         // comb = sinkhorn_normalize(comb_block * s_comb + b_comb)
-        let comb_pre = comb_block
-            .broadcast_mul(&s_comb)?
-            .broadcast_add(&b_comb)?; // [N, hc, hc]
+        let comb_pre = comb_block.broadcast_mul(&s_comb)?.broadcast_add(&b_comb)?; // [N, hc, hc]
         let comb = sinkhorn_normalize(&comb_pre, self.rt.hc_sinkhorn_iters, self.rt.hc_eps)?;
 
         // y = sum_i pre[..., i, None] * x[..., i, :]  →  [N, hidden]
@@ -370,9 +366,7 @@ impl V4MHCLayerParams {
         };
 
         let x_n = x.reshape((n, h))?.to_dtype(DType::F32)?;
-        let residual_n = residual
-            .reshape((n, hc, h))?
-            .to_dtype(DType::F32)?;
+        let residual_n = residual.reshape((n, hc, h))?.to_dtype(DType::F32)?;
         let post_n = post.reshape((n, hc))?.to_dtype(DType::F32)?;
         let comb_n = comb.reshape((n, hc, hc))?.to_dtype(DType::F32)?;
 
@@ -695,10 +689,7 @@ impl V4MHCHead {
         let (n, leading_dims): (usize, Vec<usize>) = match dims.len() {
             3 => (dims[0], vec![dims[0]]),
             4 => (dims[0] * dims[1], vec![dims[0], dims[1]]),
-            _ => candle_core::bail!(
-                "V4 mHC head: expected rank 3 or 4, got {:?}",
-                dims
-            ),
+            _ => candle_core::bail!("V4 mHC head: expected rank 3 or 4, got {:?}", dims),
         };
         if dims[dims.len() - 2] != hc || *dims.last().unwrap() != h {
             candle_core::bail!(
@@ -731,10 +722,7 @@ impl V4MHCHead {
         let weights = (weights + self.rt.hc_eps)?;
 
         // y = sum_i weights[..., i, None] * x[..., i, :]  →  [N, hidden]
-        let y = weights
-            .unsqueeze(D::Minus1)?
-            .broadcast_mul(&x)?
-            .sum(1)?;
+        let y = weights.unsqueeze(D::Minus1)?.broadcast_mul(&x)?.sum(1)?;
 
         let mut out_shape = leading_dims;
         out_shape.push(h);
@@ -785,7 +773,10 @@ mod tests {
         serde_json::from_value(json).unwrap()
     }
 
-    fn vb_from(tensors: HashMap<String, Tensor>, device: Device) -> mistralrs_quant::ShardedVarBuilder {
+    fn vb_from(
+        tensors: HashMap<String, Tensor>,
+        device: Device,
+    ) -> mistralrs_quant::ShardedVarBuilder {
         let backend: Box<dyn SimpleBackend + 'static> = Box::new(tensors);
         ShardedSafeTensors::wrap(backend, DType::F32, device)
     }
@@ -836,8 +827,8 @@ mod tests {
             Tensor::zeros(3, DType::F32, &dev)?,
         );
         let vb = vb_from(tensors, dev.clone());
-        let params = V4MHCLayerParams::try_load(&cfg, &vb, 0, &dev)
-            .expect("layer params should load");
+        let params =
+            V4MHCLayerParams::try_load(&cfg, &vb, 0, &dev).expect("layer params should load");
         assert_eq!(params.mix_hc, mix_hc);
         assert_eq!(params.hc_mult, hc_mult);
         assert_eq!(params.hidden_size, hidden);
@@ -953,9 +944,7 @@ mod tests {
         // each branch k is `attn_out + mean(residual over branches)`. We must
         // broadcast attn_out across the hc_mult axis to get matching shapes.
         let mean_resid = residual.mean(1)?; // [N, hidden]
-        let attn_broadcast = attn_out
-            .unsqueeze(1)?
-            .broadcast_as((n, hc_mult, hidden))?; // [N, hc_mult, hidden]
+        let attn_broadcast = attn_out.unsqueeze(1)?.broadcast_as((n, hc_mult, hidden))?; // [N, hc_mult, hidden]
         let mean_broadcast = mean_resid
             .unsqueeze(1)?
             .broadcast_as((n, hc_mult, hidden))?; // [N, hc_mult, hidden]

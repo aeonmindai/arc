@@ -48,7 +48,10 @@ fn main() -> candle_core::Result<()> {
     //    accounted for and the deferred pass grows free to the full count)
     let eager = run(&x)?;
     dev.synchronize()?;
-    let eager_v = eager.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    let eager_v = eager
+        .flatten_all()?
+        .to_dtype(DType::F32)?
+        .to_vec1::<f32>()?;
     println!("eager out[0..3]={:?}", &eager_v[0..3.min(eager_v.len())]);
     // 3) deferred-free pass (no-op when ARC_NO_DEFERRED_FREE)
     cd.set_capture_mode(true);
@@ -70,7 +73,10 @@ fn main() -> candle_core::Result<()> {
     let captured = runner.end_capture_and_cache(1, out, gp, op)?;
     cd.set_capture_mode(false);
     dev.synchronize()?;
-    let cap_v = captured.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    let cap_v = captured
+        .flatten_all()?
+        .to_dtype(DType::F32)?
+        .to_vec1::<f32>()?;
     let maxdiff = eager_v
         .iter()
         .zip(cap_v.iter())

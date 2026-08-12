@@ -1,5 +1,9 @@
 pub(crate) mod deepseek2;
 pub(crate) mod deepseek3;
+pub(crate) mod deepseek4;
+pub(crate) mod dsv4_attention;
+pub(crate) mod dsv4_indexer;
+pub(crate) mod dsv4_mhc;
 pub(crate) mod gdn;
 pub(crate) mod gemma;
 pub(crate) mod gemma2;
@@ -27,7 +31,3 @@ pub(crate) mod qwen3_moe;
 pub(crate) mod qwen3_next;
 pub(crate) mod smollm3;
 pub(crate) mod starcoder2;
-pub(crate) mod deepseek4;
-pub(crate) mod dsv4_attention;
-pub(crate) mod dsv4_indexer;
-pub(crate) mod dsv4_mhc;

@@ -18,9 +18,26 @@ use mistralrs_quant::{QtipLayer, QtipMode};
 fn cos(a: &Tensor, b: &Tensor) -> f64 {
     let a = a.flatten_all().unwrap().to_dtype(DType::F32).unwrap();
     let b = b.flatten_all().unwrap().to_dtype(DType::F32).unwrap();
-    let dot = (&a * &b).unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap() as f64;
-    let na = (&a * &a).unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap().sqrt() as f64;
-    let nb = (&b * &b).unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap().sqrt() as f64;
+    let dot = (&a * &b)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .to_scalar::<f32>()
+        .unwrap() as f64;
+    let na = (&a * &a)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .to_scalar::<f32>()
+        .unwrap()
+        .sqrt() as f64;
+    let nb = (&b * &b)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .to_scalar::<f32>()
+        .unwrap()
+        .sqrt() as f64;
     dot / (na * nb + 1e-12)
 }
 
@@ -37,9 +54,14 @@ fn dense_ref(a: &Tensor, w: &Tensor, indices: &Tensor) -> candle_core::Result<Te
     y.reshape((n_tokens, topk, n))
 }
 
-fn run(mode: QtipMode, e: usize, n: usize, k: usize, n_tokens: usize, topk: usize)
-    -> candle_core::Result<()>
-{
+fn run(
+    mode: QtipMode,
+    e: usize,
+    n: usize,
+    k: usize,
+    n_tokens: usize,
+    topk: usize,
+) -> candle_core::Result<()> {
     let dev = Device::new_cuda(0)?;
     let w_full = Tensor::randn(0f32, 0.02f32, (e, n, k), &dev)?; // original full precision
     let w_bf16 = w_full.to_dtype(DType::BF16)?;
@@ -52,8 +74,8 @@ fn run(mode: QtipMode, e: usize, n: usize, k: usize, n_tokens: usize, topk: usiz
 
     // Dense references (plain candle, no QTIP gather code):
     let w_deq = layer.dequantize_w()?.to_device(&dev)?; // quantized->dense, unrotated
-    let ref_deq = dense_ref(&a, &w_deq, &indices)?;       // a @ dequant(W)^T
-    let ref_full = dense_ref(&a, &w_full, &indices)?;     // a @ W_original^T
+    let ref_deq = dense_ref(&a, &w_deq, &indices)?; // a @ dequant(W)^T
+    let ref_full = dense_ref(&a, &w_full, &indices)?; // a @ W_original^T
 
     std::env::remove_var("ARC_NO_QTIP_ONDEVICE_MOE");
     let y_ondevice = layer.gather_forward(&a, &indices)?;
@@ -66,7 +88,11 @@ fn run(mode: QtipMode, e: usize, n: usize, k: usize, n_tokens: usize, topk: usiz
     let ondev_vs_host = cos(&y_ondevice, &y_host);
     let host_vs_full = cos(&y_host, &ref_full);
 
-    let modestr = if use_rotation { "Viterbi(rot)" } else { "Greedy(norot)" };
+    let modestr = if use_rotation {
+        "Viterbi(rot)"
+    } else {
+        "Greedy(norot)"
+    };
     println!(
         "{modestr:14} E={e:<3} N={n:<5} K={k:<5} tok={n_tokens} topk={topk} | host_vs_deq={host_vs_deq:.6} ondev_vs_deq={ondev_vs_deq:.6} ondev_vs_host={ondev_vs_host:.6} | host_vs_full={host_vs_full:.4}"
     );
@@ -80,6 +106,6 @@ fn main() -> candle_core::Result<()> {
     run(QtipMode::Greedy, 16, 512, 1024, 1, 6)?;
     run(QtipMode::Viterbi, 8, 256, 512, 1, 6)?;
     run(QtipMode::Viterbi, 32, 2048, 4096, 1, 6)?; // V4-Flash expert shape
-    run(QtipMode::Greedy, 8, 256, 512, 4, 6)?;     // small-batch (MTP draft)
+    run(QtipMode::Greedy, 8, 256, 512, 4, 6)?; // small-batch (MTP draft)
     Ok(())
 }

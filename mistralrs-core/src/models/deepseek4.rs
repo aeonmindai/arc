@@ -507,9 +507,11 @@ impl V4Compressor {
         let norm = RmsNorm::from_w(norm.weight().to_device(real_device)?, cfg.rms_norm_eps)?;
 
         let ape = if vb.contains_tensor("ape") {
-            vb.get((ratio, coff * head_dim), "ape")?.to_device(real_device)?
+            vb.get((ratio, coff * head_dim), "ape")?
+                .to_device(real_device)?
         } else if vb.contains_tensor("ape.weight") {
-            vb.get((ratio, coff * head_dim), "ape.weight")?.to_device(real_device)?
+            vb.get((ratio, coff * head_dim), "ape.weight")?
+                .to_device(real_device)?
         } else {
             Tensor::zeros((ratio, coff * head_dim), DType::F32, real_device)?
         };
@@ -678,8 +680,8 @@ impl V4Compressor {
     ) -> Result<Tensor> {
         // Current group's normal-half → last `ratio` slots (all groups).
         let normal = grouped.narrow(D::Minus1, d, d)?.contiguous()?; // [b, t_c, ratio, d]
-        // Current group's overlap-half (channels 0..d), shifted forward one
-        // group so it lands in the *next* group's first `ratio` slots.
+                                                                     // Current group's overlap-half (channels 0..d), shifted forward one
+                                                                     // group so it lands in the *next* group's first `ratio` slots.
         let overlap = grouped.narrow(D::Minus1, 0, d)?; // [b, t_c, ratio, d]
         let pad = Tensor::full(fill, (b, 1, ratio, d), dev)?.to_dtype(grouped.dtype())?;
         let prev = if t_c > 1 {
@@ -899,8 +901,7 @@ impl Attention {
         let o_inner = o_groups * o_lora_rank;
 
         // Auto-detect V4 native (`wo_a/wo_b`) vs HF (`o_a_proj/o_b_proj`).
-        let has_native_o =
-            vb.contains_tensor("wo_a.weight") || vb.contains_tensor("wo_b.weight");
+        let has_native_o = vb.contains_tensor("wo_a.weight") || vb.contains_tensor("wo_b.weight");
         let has_lora_o = has_native_o
             || (vb.contains_tensor("o_a_proj.weight") && vb.contains_tensor("o_b_proj.weight"));
         let has_single_o = vb.contains_tensor("o_proj.weight");
@@ -966,9 +967,7 @@ impl Attention {
         let compressor = if compress_ratio != CompressRatio::Standard {
             // Use the real GPU device (loading_isq=false) for non-quantized
             // tensors (ape, norm) to avoid device mismatch at inference time.
-            let real_device = mapper
-                .device_for(layer_idx, false)
-                .unwrap_or(&Device::Cpu);
+            let real_device = mapper.device_for(layer_idx, false).unwrap_or(&Device::Cpu);
             let comp_vb = mapper.set_device(layer_idx, vb.pp("compressor"), loading_isq);
             let comp = if V4Compressor::has_weights(&comp_vb) {
                 V4Compressor::new(cfg, comp_vb, ratio_int as usize, head_dim, real_device)?
@@ -1155,7 +1154,7 @@ impl Attention {
         let dev = comp.device();
         let positions = (Tensor::arange(0u32, t_c as u32, dev)?.to_dtype(DType::F32)?
             * (ratio as f64))?
-        .to_dtype(DType::U32)?;
+            .to_dtype(DType::U32)?;
         let comp =
             self.rotary_emb
                 .forward_at_positions(&comp, self.cfg.qk_rope_head_dim, &positions)?;
@@ -1477,56 +1476,56 @@ impl Attention {
 
         let o_groups = self.cfg.o_groups.unwrap_or(1);
         let out = timed_mla(2, &mdev, || {
-        let inner = if o_groups > 1 {
-            // Grouped o_proj LoRA: each of `o_groups` head-groups gets its
-            // own slice of wo_a.  wo_a weight is (G*R, D) where G=o_groups,
-            // R=o_lora_rank, D=n_heads*head_dim/G.
-            //
-            // einsum("tgd,grd->tgr", attn_grouped, wo_a_grouped)
-            //   = bmm(attn_grouped.permute(1,0,2), wo_a_grouped.transpose(1,2))
-            let n = attn_out.dim(candle_core::D::Minus1)?;
-            let per_group = n / o_groups;
-            let tokens = bs * seq_len;
+            let inner = if o_groups > 1 {
+                // Grouped o_proj LoRA: each of `o_groups` head-groups gets its
+                // own slice of wo_a.  wo_a weight is (G*R, D) where G=o_groups,
+                // R=o_lora_rank, D=n_heads*head_dim/G.
+                //
+                // einsum("tgd,grd->tgr", attn_grouped, wo_a_grouped)
+                //   = bmm(attn_grouped.permute(1,0,2), wo_a_grouped.transpose(1,2))
+                let n = attn_out.dim(candle_core::D::Minus1)?;
+                let per_group = n / o_groups;
+                let tokens = bs * seq_len;
 
-            // (bs*seq_len, G, D)
-            let attn_grouped = attn_out.reshape((tokens, o_groups, per_group))?;
+                // (bs*seq_len, G, D)
+                let attn_grouped = attn_out.reshape((tokens, o_groups, per_group))?;
 
-            // RUN-161: cached dequantized+permuted wo_a as (G, D, R). The weight
-            // is constant — dequantizing + permuting it every forward was ~69ms/
-            // token (27% of decode). Build once, reuse.
-            let wo_a_t = {
-                let cached = self.wo_a_t_cache.read().unwrap();
-                if let Some(t) = cached.as_ref() {
-                    t.clone()
-                } else {
-                    drop(cached);
-                    let wo_a_w = self.wo_a.dequantize_w()?; // (G*R, D)
-                    let o_lora_rank = wo_a_w.dim(0)? / o_groups;
-                    let wo_a_grouped = wo_a_w.reshape((o_groups, o_lora_rank, per_group))?; // (G, R, D)
-                    let t = wo_a_grouped.permute((0, 2, 1))?.contiguous()?; // (G, D, R)
-                    *self.wo_a_t_cache.write().unwrap() = Some(t.clone());
-                    t
-                }
+                // RUN-161: cached dequantized+permuted wo_a as (G, D, R). The weight
+                // is constant — dequantizing + permuting it every forward was ~69ms/
+                // token (27% of decode). Build once, reuse.
+                let wo_a_t = {
+                    let cached = self.wo_a_t_cache.read().unwrap();
+                    if let Some(t) = cached.as_ref() {
+                        t.clone()
+                    } else {
+                        drop(cached);
+                        let wo_a_w = self.wo_a.dequantize_w()?; // (G*R, D)
+                        let o_lora_rank = wo_a_w.dim(0)? / o_groups;
+                        let wo_a_grouped = wo_a_w.reshape((o_groups, o_lora_rank, per_group))?; // (G, R, D)
+                        let t = wo_a_grouped.permute((0, 2, 1))?.contiguous()?; // (G, D, R)
+                        *self.wo_a_t_cache.write().unwrap() = Some(t.clone());
+                        t
+                    }
+                };
+                let o_lora_rank = wo_a_t.dim(2)?; // R
+
+                // bmm: (G, tokens, D) @ (G, D, R) → (G, tokens, R)
+                let attn_perm = attn_grouped.permute((1, 0, 2))?.contiguous()?;
+                let inner_perm = attn_perm.matmul(&wo_a_t)?;
+
+                // (G, tokens, R) → (tokens, G*R)
+                inner_perm
+                    .permute((1, 0, 2))?
+                    .contiguous()?
+                    .reshape((tokens, o_groups * o_lora_rank))?
+                    .reshape((bs, seq_len, o_groups * o_lora_rank))?
+            } else {
+                self.wo_a.forward_autocast(&attn_out)?
             };
-            let o_lora_rank = wo_a_t.dim(2)?; // R
-
-            // bmm: (G, tokens, D) @ (G, D, R) → (G, tokens, R)
-            let attn_perm = attn_grouped.permute((1, 0, 2))?.contiguous()?;
-            let inner_perm = attn_perm.matmul(&wo_a_t)?;
-
-            // (G, tokens, R) → (tokens, G*R)
-            inner_perm
-                .permute((1, 0, 2))?
-                .contiguous()?
-                .reshape((tokens, o_groups * o_lora_rank))?
-                .reshape((bs, seq_len, o_groups * o_lora_rank))?
-        } else {
-            self.wo_a.forward_autocast(&attn_out)?
-        };
-        v4_nan_dbg(&inner, "attn.wo_a");
-        let out = self.wo_b.forward_autocast(&inner)?;
-        v4_nan_dbg(&out, "attn.wo_b");
-        Ok(out)
+            v4_nan_dbg(&inner, "attn.wo_a");
+            let out = self.wo_b.forward_autocast(&inner)?;
+            v4_nan_dbg(&out, "attn.wo_b");
+            Ok(out)
         })?;
         v4_trace_dump(self.dbg_layer_idx, &out, "70_o_out");
         Ok(out)
@@ -1588,12 +1587,7 @@ impl MoeGate {
                 None
             };
             name.map(|n| {
-                vb.get_with_hints_dtype(
-                    n_routed_experts,
-                    n,
-                    Default::default(),
-                    DType::F32,
-                )
+                vb.get_with_hints_dtype(n_routed_experts, n, Default::default(), DType::F32)
             })
             .transpose()?
         } else {
@@ -1679,28 +1673,55 @@ impl MoeGate {
             (topk_weight, topk_idx)
         } else {
             match self.cfg.topk_method {
-            TopkMethod::Greedy => {
-                let TopKOutput { values, indices } = scores.topk_unsorted(self.top_k)?;
-                (values, indices)
-            }
-            TopkMethod::NoAuxTc => {
-                let scores_flat = scores.reshape((bs * seq_len, ()))?;
-                let scores_for_choice = if let Some(bias) = &self.e_score_correction_bias {
-                    scores_flat.broadcast_add(&bias.unsqueeze(0)?)?
-                } else {
-                    // V4 Flash: no correction bias (TD-MoE routing), use raw scores.
-                    scores_flat
-                };
-                // V4 Flash config does NOT publish `n_group` (audit §5 +
-                // /tmp/v4_flash_config.json). When n_group==1 the grouping
-                // degenerates; fall back to a flat top-k over all experts.
-                if self.cfg.n_group > 1 {
-                    let group_scores = scores_for_choice
+                TopkMethod::Greedy => {
+                    let TopKOutput { values, indices } = scores.topk_unsorted(self.top_k)?;
+                    (values, indices)
+                }
+                TopkMethod::NoAuxTc => {
+                    let scores_flat = scores.reshape((bs * seq_len, ()))?;
+                    let scores_for_choice = if let Some(bias) = &self.e_score_correction_bias {
+                        scores_flat.broadcast_add(&bias.unsqueeze(0)?)?
+                    } else {
+                        // V4 Flash: no correction bias (TD-MoE routing), use raw scores.
+                        scores_flat
+                    };
+                    // V4 Flash config does NOT publish `n_group` (audit §5 +
+                    // /tmp/v4_flash_config.json). When n_group==1 the grouping
+                    // degenerates; fall back to a flat top-k over all experts.
+                    if self.cfg.n_group > 1 {
+                        let group_scores = scores_for_choice
+                            .reshape((bs * seq_len, self.cfg.n_group, ()))?
+                            .topk(2)?
+                            .values
+                            .sum(D::Minus1)?;
+                        let group_idx = group_scores.topk(self.cfg.topk_group)?.indices;
+                        let mut group_mask = group_scores.zeros_like()?;
+                        group_mask = group_mask.scatter_add(
+                            &group_idx,
+                            &group_idx.ones_like()?.to_dtype(group_mask.dtype())?,
+                            1,
+                        )?;
+                        let score_mask = group_mask
+                            .unsqueeze(D::Minus1)?
+                            .expand((
+                                bs * seq_len,
+                                self.cfg.n_group,
+                                self.n_routed_experts / self.cfg.n_group,
+                            ))?
+                            .reshape((bs * seq_len, ()))?;
+                        let tmp_scores = scores_for_choice.broadcast_mul(&score_mask)?;
+                        let topk_idx = tmp_scores.topk(self.top_k)?.indices;
+                        (scores.gather(&topk_idx, 1)?, topk_idx)
+                    } else {
+                        let topk_idx = scores_for_choice.topk(self.top_k)?.indices;
+                        (scores.gather(&topk_idx, 1)?, topk_idx)
+                    }
+                }
+                TopkMethod::GroupLimitedGreedy => {
+                    let group_scores = scores
                         .reshape((bs * seq_len, self.cfg.n_group, ()))?
-                        .topk(2)?
-                        .values
-                        .sum(D::Minus1)?;
-                    let group_idx = group_scores.topk(self.cfg.topk_group)?.indices;
+                        .max(D::Minus1)?;
+                    let group_idx = group_scores.topk_unsorted(self.cfg.topk_group)?.indices;
                     let mut group_mask = group_scores.zeros_like()?;
                     group_mask = group_mask.scatter_add(
                         &group_idx,
@@ -1715,37 +1736,10 @@ impl MoeGate {
                             self.n_routed_experts / self.cfg.n_group,
                         ))?
                         .reshape((bs * seq_len, ()))?;
-                    let tmp_scores = scores_for_choice.broadcast_mul(&score_mask)?;
-                    let topk_idx = tmp_scores.topk(self.top_k)?.indices;
-                    (scores.gather(&topk_idx, 1)?, topk_idx)
-                } else {
-                    let topk_idx = scores_for_choice.topk(self.top_k)?.indices;
-                    (scores.gather(&topk_idx, 1)?, topk_idx)
+                    let tmp_scores = masked_fill(&score_mask, &(1. - &score_mask.ne(0.)?)?, 0.)?;
+                    let TopKOutput { values, indices } = tmp_scores.topk_unsorted(self.top_k)?;
+                    (values, indices)
                 }
-            }
-            TopkMethod::GroupLimitedGreedy => {
-                let group_scores = scores
-                    .reshape((bs * seq_len, self.cfg.n_group, ()))?
-                    .max(D::Minus1)?;
-                let group_idx = group_scores.topk_unsorted(self.cfg.topk_group)?.indices;
-                let mut group_mask = group_scores.zeros_like()?;
-                group_mask = group_mask.scatter_add(
-                    &group_idx,
-                    &group_idx.ones_like()?.to_dtype(group_mask.dtype())?,
-                    1,
-                )?;
-                let score_mask = group_mask
-                    .unsqueeze(D::Minus1)?
-                    .expand((
-                        bs * seq_len,
-                        self.cfg.n_group,
-                        self.n_routed_experts / self.cfg.n_group,
-                    ))?
-                    .reshape((bs * seq_len, ()))?;
-                let tmp_scores = masked_fill(&score_mask, &(1. - &score_mask.ne(0.)?)?, 0.)?;
-                let TopKOutput { values, indices } = tmp_scores.topk_unsorted(self.top_k)?;
-                (values, indices)
-            }
             }
         };
 
@@ -1777,8 +1771,7 @@ impl MoeGate {
         if std::env::var_os("ARC_SOFTMAX_ROUTE").is_some() {
             if let Ok(topk_logits) = logits.gather(&topk_idx, 1) {
                 let sm = candle_nn::ops::softmax_last_dim(&topk_logits)?;
-                topk_weight =
-                    (sm.to_dtype(topk_weight.dtype())? * self.cfg.routed_scaling_factor)?;
+                topk_weight = (sm.to_dtype(topk_weight.dtype())? * self.cfg.routed_scaling_factor)?;
             }
         }
 
@@ -1790,7 +1783,9 @@ impl MoeGate {
         if std::env::var_os("ARC_ROUTE_TOP1").is_some() {
             let max = topk_weight.max_keepdim(D::Minus1)?;
             let diff = topk_weight.broadcast_sub(&max)?;
-            let mask = diff.ge(&diff.zeros_like()?)?.to_dtype(topk_weight.dtype())?;
+            let mask = diff
+                .ge(&diff.zeros_like()?)?
+                .to_dtype(topk_weight.dtype())?;
             topk_weight = (topk_weight * mask)?;
         }
         Ok((topk_idx, topk_weight))
@@ -1905,7 +1900,10 @@ impl Moe {
         if std::env::var_os("ARC_COLLAPSE").is_some()
             && matches!(self.layer_idx, 1 | 4 | 7 | 14 | 20)
         {
-            if let Ok(v) = topk_idx.to_dtype(DType::U32).and_then(|t| t.to_vec2::<u32>()) {
+            if let Ok(v) = topk_idx
+                .to_dtype(DType::U32)
+                .and_then(|t| t.to_vec2::<u32>())
+            {
                 eprintln!("ARC_TOPKID [L{}] {:?}", self.layer_idx, v);
             }
         }
@@ -1915,7 +1913,9 @@ impl Moe {
         let li = self.layer_idx;
         v4_collapse_dbg(&y, &format!("L{li}.moe_routed"), 1);
         v4_collapse_dbg(
-            &topk_idx.to_dtype(DType::F32).unwrap_or_else(|_| topk_idx.clone()),
+            &topk_idx
+                .to_dtype(DType::F32)
+                .unwrap_or_else(|_| topk_idx.clone()),
             &format!("L{li}.moe_topk_idx"),
             0,
         );
@@ -1993,7 +1993,11 @@ fn act_quant_kv_nope(k: &Tensor, rope_dim: usize) -> Result<Tensor> {
         let ln2 = std::f64::consts::LN_2;
         let x = scaled.clamp(-448f32, 448f32)?;
         let ax = x.abs()?.clamp(1e-30f32, 1e30f32)?;
-        let e = ax.log()?.affine(1.0 / ln2, 0.0)?.floor()?.clamp(-6f32, 8f32)?; // floor(log2|x|)
+        let e = ax
+            .log()?
+            .affine(1.0 / ln2, 0.0)?
+            .floor()?
+            .clamp(-6f32, 8f32)?; // floor(log2|x|)
         let step = e.affine(ln2, -3.0 * ln2)?.exp()?; // 2^(e-3)
         x.broadcast_div(&step)?.round()?.broadcast_mul(&step)?
     } else {
@@ -2022,7 +2026,12 @@ pub(crate) static DECODE_NS: [std::sync::atomic::AtomicU64; 6] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 pub(crate) const DECODE_NAMES: [&str; 6] = [
-    "mhc_attn_pre", "mla_attn", "mix_post_attn", "mhc_ffn_pre", "moe", "mix_post_ffn",
+    "mhc_attn_pre",
+    "mla_attn",
+    "mix_post_attn",
+    "mhc_ffn_pre",
+    "moe",
+    "mix_post_ffn",
 ];
 
 /// MLA sub-component timers (Phase 1: pin the 50%). SDPA = mla_attn - these 3.
@@ -2094,8 +2103,16 @@ pub(crate) fn v4_nan_dbg(t: &Tensor, tag: &str) {
             let nans = v.iter().filter(|x| x.is_nan()).count();
             let infs = v.iter().filter(|x| x.is_infinite()).count();
             if nans > 0 || infs > 0 {
-                let fmin = v.iter().copied().filter(|x| x.is_finite()).fold(f32::MAX, f32::min);
-                let fmax = v.iter().copied().filter(|x| x.is_finite()).fold(f32::MIN, f32::max);
+                let fmin = v
+                    .iter()
+                    .copied()
+                    .filter(|x| x.is_finite())
+                    .fold(f32::MAX, f32::min);
+                let fmax = v
+                    .iter()
+                    .copied()
+                    .filter(|x| x.is_finite())
+                    .fold(f32::MIN, f32::max);
                 let shape = t.dims().to_vec();
                 eprintln!(
                     "V4_NAN_DEBUG [{tag}] shape={shape:?} nans={nans} infs={infs}/{n} finite_range=[{fmin:.4},{fmax:.4}]"
@@ -2125,8 +2142,16 @@ pub(crate) fn v4_stat_dbg(t: &Tensor, tag: &str) {
             let mean = v.iter().sum::<f32>() / n;
             let absmean = v.iter().map(|x| x.abs()).sum::<f32>() / n;
             let var = v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n;
-            let fmin = v.iter().copied().filter(|x| x.is_finite()).fold(f32::MAX, f32::min);
-            let fmax = v.iter().copied().filter(|x| x.is_finite()).fold(f32::MIN, f32::max);
+            let fmin = v
+                .iter()
+                .copied()
+                .filter(|x| x.is_finite())
+                .fold(f32::MAX, f32::min);
+            let fmax = v
+                .iter()
+                .copied()
+                .filter(|x| x.is_finite())
+                .fold(f32::MIN, f32::max);
             eprintln!(
                 "V4_STATS [{tag}] absmean={absmean:.6} std={:.6} range=[{fmin:.4},{fmax:.4}] nan/inf={naninf}",
                 var.sqrt()
@@ -2303,8 +2328,7 @@ impl DecoderLayer {
         // Audit §0 + §5 line 448.
         let mhc_device = real_device.clone();
         let moe_or_mlp = if let Some(n_routed_experts) = cfg.n_routed_experts.filter(|_| {
-            layer_idx >= cfg.first_k_dense_replace
-                && layer_idx.is_multiple_of(cfg.moe_layer_freq)
+            layer_idx >= cfg.first_k_dense_replace && layer_idx.is_multiple_of(cfg.moe_layer_freq)
         }) {
             MoeOrMlp::Moe(Box::new(Moe::new(
                 cfg,
@@ -2508,7 +2532,9 @@ impl DecoderLayer {
         v4_collapse_dbg(&y_ffn, &format!("L{li}.y_ffn"), 1);
         let y_ffn_normed = self.post_attention_layernorm.forward(&y_ffn)?;
         v4_nan_dbg(&y_ffn_normed, &format!("L{li}.post_attention_layernorm"));
-        let ffn_out = timed(4, &tdev, || self.moe_or_mlp.forward(&y_ffn_normed, input_ids))?;
+        let ffn_out = timed(4, &tdev, || {
+            self.moe_or_mlp.forward(&y_ffn_normed, input_ids)
+        })?;
         v4_nan_dbg(&ffn_out, &format!("L{li}.ffn_out"));
         v4_collapse_dbg(&ffn_out, &format!("L{li}.ffn_out"), 1);
         let out = timed(5, &tdev, || {
@@ -2596,8 +2622,8 @@ impl DeepSeekV4 {
         // V4 native publishes globals as `embed.weight`, `norm.weight`,
         // `head.weight` (audit §1). HF format uses
         // `model.embed_tokens.weight`, `model.norm.weight`, `lm_head.weight`.
-        let uses_native = vb.contains_tensor("embed.weight")
-            && !vb.contains_tensor("model.embed_tokens.weight");
+        let uses_native =
+            vb.contains_tensor("embed.weight") && !vb.contains_tensor("model.embed_tokens.weight");
 
         let (vb_m, embed_path, lm_head_vb, lm_head_path) = if uses_native {
             (vb.clone(), "embed", vb.clone(), "head")
@@ -2786,11 +2812,8 @@ impl DeepSeekV4 {
         // ---- Global mHC head ----
         // V4 publishes `hc_head_fn`, `hc_head_base`, `hc_head_scale` at the
         // model root. Audit §1 ("Top-level tensors").
-        let mhc_head = super::dsv4_mhc::V4MHCHead::try_load(
-            cfg,
-            &vb_m,
-            &normal_loading_metadata.real_device,
-        );
+        let mhc_head =
+            super::dsv4_mhc::V4MHCHead::try_load(cfg, &vb_m, &normal_loading_metadata.real_device);
 
         Ok(Self {
             lm_head,
@@ -2810,9 +2833,8 @@ impl DeepSeekV4 {
                 // V4 MQA: 1 KV head (broadcast across 64 Q heads at the
                 // kernel). Audit §0 + §3.
                 num_kv_heads: cfg.num_key_value_heads.max(1),
-                num_attn_heads: (cfg.num_attention_heads
-                    / mapper.get_comm_for(0)?.world_size())
-                .max(1),
+                num_attn_heads: (cfg.num_attention_heads / mapper.get_comm_for(0)?.world_size())
+                    .max(1),
                 sliding_window: None,
                 // V4: single 512-dim head for K and V (same fused wkv
                 // vector). Audit §3.
@@ -3258,9 +3280,7 @@ impl NormalModel for DeepSeekV4 {
     /// Expose the MTP decode kit when the checkpoint shipped MTP tensors.
     /// Used by [`crate::pipeline::MtpSpeculativePipeline`] to drive V4's
     /// native single-step speculative draft.
-    fn mtp_decode_kit(
-        &self,
-    ) -> Option<crate::pipeline::mtp_pipeline::MtpDecodeKit> {
+    fn mtp_decode_kit(&self) -> Option<crate::pipeline::mtp_pipeline::MtpDecodeKit> {
         let head = self.mtp_head.as_ref()?;
         Some(crate::pipeline::mtp_pipeline::MtpDecodeKit {
             embed_tokens: self.embed_tokens.clone(),
@@ -3562,7 +3582,10 @@ mod tests {
             }
             Tensor::from_vec(v, (rows, cols), device).unwrap()
         };
-        m.insert("wkv.weight".to_string(), make(row, hidden_size, seed as f32 * 0.07));
+        m.insert(
+            "wkv.weight".to_string(),
+            make(row, hidden_size, seed as f32 * 0.07),
+        );
         m.insert(
             "wgate.weight".to_string(),
             make(row, hidden_size, seed as f32 * 0.11 + 0.5),
@@ -3840,9 +3863,9 @@ mod tests {
             }
             let w = Tensor::from_vec(wv, (2 * cd, hidden_size), &device)?;
 
-            let acount = ratio * cd;
-            let mut av = Vec::with_capacity(acount);
-            for i in 0..acount {
+            let a_count = ratio * cd;
+            let mut av = Vec::with_capacity(a_count);
+            for i in 0..a_count {
                 av.push(((i as f32) * 0.037).cos() * 0.1);
             }
             let ape = Tensor::from_vec(av.clone(), (ratio, cd), &device)?;
@@ -3973,8 +3996,7 @@ mod tests {
         let coff = 1;
 
         let cfg = compressor_test_cfg(hidden_size);
-        let mut map: std::collections::HashMap<String, Tensor> =
-            std::collections::HashMap::new();
+        let mut map: std::collections::HashMap<String, Tensor> = std::collections::HashMap::new();
         // Non-zero fused weight: [2*coff*head_dim, hidden_size].
         let mut v: Vec<f32> = Vec::with_capacity(2 * coff * head_dim * hidden_size);
         for i in 0..(2 * coff * head_dim * hidden_size) {
@@ -4054,9 +4076,9 @@ mod tests {
     /// call.
     #[test]
     fn paged_attn_compress_dispatch_routes_csa_through_compressor() -> Result<()> {
-        use crate::models::dsv4_attention::{dsv4_attention, Dsv4AttentionConfig};
         use crate::attention::SdpaParams;
         use crate::layers::Sdpa;
+        use crate::models::dsv4_attention::{dsv4_attention, Dsv4AttentionConfig};
         use crate::pipeline::text_models_inputs_processor::FlashParams;
 
         let device = Device::Cpu;
@@ -4167,9 +4189,9 @@ mod tests {
     /// SDPA). Mirrors the PagedAttention post-gather path under HCA layers.
     #[test]
     fn paged_attn_compress_dispatch_routes_hca_through_compressor() -> Result<()> {
-        use crate::models::dsv4_attention::{dsv4_attention, Dsv4AttentionConfig};
         use crate::attention::SdpaParams;
         use crate::layers::Sdpa;
+        use crate::models::dsv4_attention::{dsv4_attention, Dsv4AttentionConfig};
         use crate::pipeline::text_models_inputs_processor::FlashParams;
 
         let device = Device::Cpu;
@@ -4256,9 +4278,9 @@ mod tests {
     /// accidentally going through the compress branch.
     #[test]
     fn paged_attn_compress_dispatch_skips_compressor_for_standard_layers() -> Result<()> {
-        use crate::models::dsv4_attention::{dsv4_attention, Dsv4AttentionConfig};
         use crate::attention::SdpaParams;
         use crate::layers::Sdpa;
+        use crate::models::dsv4_attention::{dsv4_attention, Dsv4AttentionConfig};
         use crate::pipeline::text_models_inputs_processor::FlashParams;
 
         let device = Device::Cpu;
@@ -4302,16 +4324,7 @@ mod tests {
         // caller (paranoically) supplied compressed KV, the Standard dispatch
         // returns plain SDPA before touching it. Pass `None` here — the real
         // `Attention::compressed_kv` returns `None` for Standard layers anyway.
-        let out = dsv4_attention(
-            &q,
-            &k,
-            &v,
-            None,
-            None,
-            &flash_params,
-            &sdpa_params,
-            cfg,
-        )?;
+        let out = dsv4_attention(&q, &k, &v, None, None, &flash_params, &sdpa_params, cfg)?;
         let sdpa_dense = Sdpa.run_attention(&q, &k, &v, None, Some(&flash_params), &sdpa_params)?;
         let a: Vec<f32> = out.flatten_all()?.to_vec1()?;
         let b: Vec<f32> = sdpa_dense.flatten_all()?.to_vec1()?;

@@ -247,12 +247,18 @@ pub(crate) fn fused_gemv_cuda(
         _ => candle_core::bail!("QTIP fused gemv CUDA: x storage must be CUDA"),
     };
 
-    let (blocks_ptr, _blocks_guard) =
-        slice_ptr(blocks_storage.as_cuda_slice::<u8>()?, blocks_layout.start_offset());
-    let (scales_ptr, _scales_guard) =
-        slice_ptr(scales_storage.as_cuda_slice::<f32>()?, scales_layout.start_offset());
-    let (lut_ptr, _lut_guard) =
-        slice_ptr(lut_storage.as_cuda_slice::<f32>()?, lut_layout.start_offset());
+    let (blocks_ptr, _blocks_guard) = slice_ptr(
+        blocks_storage.as_cuda_slice::<u8>()?,
+        blocks_layout.start_offset(),
+    );
+    let (scales_ptr, _scales_guard) = slice_ptr(
+        scales_storage.as_cuda_slice::<f32>()?,
+        scales_layout.start_offset(),
+    );
+    let (lut_ptr, _lut_guard) = slice_ptr(
+        lut_storage.as_cuda_slice::<f32>()?,
+        lut_layout.start_offset(),
+    );
 
     let res = match x_2d.dtype() {
         DType::BF16 => {
@@ -382,9 +388,7 @@ pub(crate) fn gather_gemv_cuda(
     }
     let idx_pairs = indices.elem_count();
     if idx_pairs != n_pairs {
-        candle_core::bail!(
-            "QTIP gather gemv CUDA: indices len {idx_pairs} != n_pairs {n_pairs}"
-        );
+        candle_core::bail!("QTIP gather gemv CUDA: indices len {idx_pairs} != n_pairs {n_pairs}");
     }
     let x_2d = x_rotated.contiguous()?;
     let indices = indices.flatten_all()?.contiguous()?;
@@ -427,14 +431,22 @@ pub(crate) fn gather_gemv_cuda(
         _ => candle_core::bail!("QTIP gather gemv CUDA: indices storage must be CUDA"),
     };
 
-    let (blocks_ptr, _blocks_guard) =
-        slice_ptr(blocks_storage.as_cuda_slice::<u8>()?, blocks_layout.start_offset());
-    let (scales_ptr, _scales_guard) =
-        slice_ptr(scales_storage.as_cuda_slice::<f32>()?, scales_layout.start_offset());
-    let (lut_ptr, _lut_guard) =
-        slice_ptr(lut_storage.as_cuda_slice::<f32>()?, lut_layout.start_offset());
-    let (idx_ptr, _idx_guard) =
-        slice_ptr(idx_storage.as_cuda_slice::<u32>()?, idx_layout.start_offset());
+    let (blocks_ptr, _blocks_guard) = slice_ptr(
+        blocks_storage.as_cuda_slice::<u8>()?,
+        blocks_layout.start_offset(),
+    );
+    let (scales_ptr, _scales_guard) = slice_ptr(
+        scales_storage.as_cuda_slice::<f32>()?,
+        scales_layout.start_offset(),
+    );
+    let (lut_ptr, _lut_guard) = slice_ptr(
+        lut_storage.as_cuda_slice::<f32>()?,
+        lut_layout.start_offset(),
+    );
+    let (idx_ptr, _idx_guard) = slice_ptr(
+        idx_storage.as_cuda_slice::<u32>()?,
+        idx_layout.start_offset(),
+    );
 
     let n_out = n_pairs * n_rows;
 
@@ -962,14 +974,12 @@ pub(crate) fn quantize_rows_cuda(
             Storage::Cuda(s) => s,
             _ => candle_core::bail!("QTIP refine scales: row_scales must be CUDA storage"),
         };
-        let (w_ptr, _wg) =
-            slice_ptr(w_storage.as_cuda_slice::<f32>()?, w_layout.start_offset());
+        let (w_ptr, _wg) = slice_ptr(w_storage.as_cuda_slice::<f32>()?, w_layout.start_offset());
         let (lut_ptr, _lg) = slice_ptr(
             lut_storage.as_cuda_slice::<f32>()?,
             lut_layout.start_offset(),
         );
-        let (rs_ptr, _rg) =
-            slice_ptr(rs_storage.as_cuda_slice::<f32>()?, rs_layout.start_offset());
+        let (rs_ptr, _rg) = slice_ptr(rs_storage.as_cuda_slice::<f32>()?, rs_layout.start_offset());
         let (pkd_ptr, _pg) = slice_ptr(&packed_buf, 0);
 
         unsafe {

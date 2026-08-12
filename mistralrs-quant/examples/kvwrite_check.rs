@@ -26,7 +26,14 @@ fn max_abs_diff(a: &Tensor, b: &Tensor) -> f64 {
         .unwrap() as f64
 }
 
-fn run(dtype: DType, b: usize, h: usize, c: usize, d: usize, n_steps: usize) -> candle_core::Result<()> {
+fn run(
+    dtype: DType,
+    b: usize,
+    h: usize,
+    c: usize,
+    d: usize,
+    n_steps: usize,
+) -> candle_core::Result<()> {
     let dev = Device::new_cuda(0)?;
 
     // Pre-grown caches: kernel-written vs slice_set oracle. Same zeros init.
@@ -52,7 +59,13 @@ fn run(dtype: DType, b: usize, h: usize, c: usize, d: usize, n_steps: usize) -> 
     let diff = max_abs_diff(&kernel_cache, &oracle_cache);
     println!(
         "[{dtype:?}] B={b} H={h} C={c} D={d} steps={n_steps}: max_abs_diff = {diff:.3e}  {}",
-        if diff == 0.0 { "EXACT ✓" } else if diff < 1e-3 { "close ✓" } else { "MISMATCH ✗" }
+        if diff == 0.0 {
+            "EXACT ✓"
+        } else if diff < 1e-3 {
+            "close ✓"
+        } else {
+            "MISMATCH ✗"
+        }
     );
     Ok(())
 }

@@ -766,7 +766,10 @@ impl VisionModel for VoxtralModel {
         context_lens: Vec<(usize, usize)>,
         _position_ids: Vec<usize>,
         model_specific_args: Box<dyn Any>,
-        _metadata: Option<(Vec<(Tensor, Tensor, Option<Tensor>, Option<Tensor>)>, &PagedAttentionInputMetadata)>,
+        _metadata: Option<(
+            Vec<(Tensor, Tensor, Option<Tensor>, Option<Tensor>)>,
+            &PagedAttentionInputMetadata,
+        )>,
         flash_params: &FlashParams,
     ) -> candle_core::Result<Tensor> {
         let args = model_specific_args

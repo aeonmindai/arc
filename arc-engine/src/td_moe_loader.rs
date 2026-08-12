@@ -230,8 +230,7 @@ pub fn apply_td_moe_to_model(
                 };
 
                 let orig_elems = (k * d_out * d_in) as u64;
-                let stored_elems =
-                    (r1 * r2 * r3 + k * r1 + d_out * r2 + d_in * r3) as u64;
+                let stored_elems = (r1 * r2 * r3 + k * r1 + d_out * r2 + d_in * r3) as u64;
 
                 // Pre-multiply the re-colouring Cholesky factors into U2/U3 (see
                 // the loader docstring for the algebra).
