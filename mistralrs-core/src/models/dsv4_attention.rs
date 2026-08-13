@@ -405,10 +405,22 @@ mod tests {
     /// `window` keys `[t_k - window, t_k - 1]` — verified by comparing against
     /// SDPA over the narrowed K/V at cache lengths crossing the window
     /// boundary (the 128→129 hardware transition, scaled down). An off-by-one
-    /// in the window slice fails the equality at every post-window length.
+    /// in the window slice fails the equality at every post-window length
+    /// (asserted by the shifted-window negative control below).
     /// Runs with (zero) sinks on both sides, matching deployment where
     /// `attn_sink` is always present — and required here: the no-sink CPU
     /// flash path NaNs on rows with a masked prefix (see the HCA test note).
+    ///
+    /// Tolerance: the dispatch decode now runs the absorbed single-GEMM path
+    /// while the reference narrows K/V through `sinks_attn_cpu`'s repeat_kv
+    /// GEMM — identical real-number math, but `MatMul`'s CPU path rounds
+    /// through F16 and the two GEMM batchings tile (and therefore round)
+    /// differently per arch/machine. CI observed exactly-1-F16-ulp diffs
+    /// (e.g. 0.46826172 vs 0.46801758 on x86) where this host shows 0, so
+    /// the bound is the documented CPU-MatMul F16 noise floor (~1e-3, same
+    /// as `union_decode_matches_scalar_reference`), not f32 eps. The window
+    /// semantics themselves are shape-level (which keys participate), which
+    /// the negative control pins far above this floor.
     #[test]
     fn standard_decode_window_boundary_exact() -> Result<()> {
         let device = Device::Cpu;
@@ -436,10 +448,33 @@ mod tests {
 
             let e: Vec<f32> = expected.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
             let a: Vec<f32> = actual.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+            const TOL: f32 = 1.5e-3;
             for (ev, av) in e.iter().zip(a.iter()) {
                 assert!(
-                    (ev - av).abs() < 1e-5,
+                    (ev - av).abs() < TOL,
                     "t_k={t_k}: {ev} != {av} (window slice off)"
+                );
+            }
+
+            // Negative control (teeth for the F16-floor tolerance): a
+            // window slice off by one — the last `window - 1` keys instead
+            // of the last `window` — must sit far above TOL. Only
+            // meaningful once the window is a strict subset of the cache.
+            if t_k > window {
+                let k_shift = k.narrow(2, t_k - (n_vis - 1), n_vis - 1)?;
+                let v_shift = v.narrow(2, t_k - (n_vis - 1), n_vis - 1)?;
+                let shifted =
+                    Sdpa.run_attention(&q, &k_shift, &v_shift, None, Some(&flash), &sdpa)?;
+                let s: Vec<f32> = shifted.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+                let max_diff = s
+                    .iter()
+                    .zip(a.iter())
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    max_diff > 3.0 * TOL,
+                    "t_k={t_k}: off-by-one window is indistinguishable at TOL \
+                     (max_diff={max_diff}); test has no teeth"
                 );
             }
         }
@@ -650,6 +685,16 @@ mod tests {
     /// per-head sinks, a mask with -inf holes, v != k on purpose (the
     /// absorbed path must not assume V aliases K), across batch sizes and
     /// cache lengths.
+    ///
+    /// Tolerance: `MatMul`'s CPU path rounds through F16, and the two GEMM
+    /// batchings ([B*H,1,D] repeat_kv vs [B,H,D] head-folded) tile — and
+    /// therefore round — differently per arch/machine. CI observed
+    /// exactly-1-F16-ulp diffs (e.g. -0.10424805 vs -0.10418701 on x86,
+    /// ulp(0.1)=6.1e-5) where this host shows 0, so the bound is the
+    /// documented CPU-MatMul F16 noise floor (~1e-3; see
+    /// `union_decode_matches_scalar_reference`), not f32 eps. Any real
+    /// semantic divergence (wrong mask column, missing sink, head
+    /// scrambling) moves outputs by orders of magnitude more.
     #[test]
     fn absorbed_decode_matches_repeat_kv_reference() -> Result<()> {
         let device = Device::Cpu;
@@ -689,7 +734,7 @@ mod tests {
                 let a: Vec<f32> = actual.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
                 for (ev, av) in e.iter().zip(a.iter()) {
                     assert!(
-                        (ev - av).abs() < 1e-5,
+                        (ev - av).abs() < 1.5e-3,
                         "b={b} t_k={t_k}: absorbed {av} != naive {ev}"
                     );
                 }
