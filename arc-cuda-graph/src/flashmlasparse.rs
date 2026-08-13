@@ -374,6 +374,66 @@ mod cuda_impl {
 
         Ok(out)
     }
+
+    /// Plain radix top-k over the rows of an F32 matrix — no scoring step.
+    ///
+    /// Selects, per row, the indices of the `topk` largest values of
+    /// `scores[row, 0..len]` using the multi-pass radix-256 select kernel
+    /// (global-memory streaming: no shared-memory length limit, unlike
+    /// candle's arg_sort). Used by the big-vocab sampler path in
+    /// `mistralrs-core` (top-k/top-p over ~129K-vocab logits).
+    ///
+    /// Inputs:
+    /// - `scores`: `[n_rows, len]` F32 on a CUDA device.
+    /// - `topk`: must be in [`SUPPORTED_TOPK`].
+    ///
+    /// Output: `[n_rows, topk]` U32 indices into `[0, len)`, **unsorted**
+    /// within each row. Rows with `len <= topk` are identity-filled and
+    /// padded with `u32::MAX` (the kernel's -1 sentinel).
+    pub fn radix_topk_rows_f32(scores: &Tensor, topk: usize) -> Result<Tensor> {
+        let dims = scores.dims();
+        if dims.len() != 2 || scores.dtype() != DType::F32 {
+            candle_core::bail!(
+                "radix_topk_rows_f32: scores must be F32 [n_rows, len]; got dtype={:?} dims={:?}",
+                scores.dtype(),
+                dims
+            );
+        }
+        if !SUPPORTED_TOPK.contains(&topk) {
+            candle_core::bail!(
+                "radix_topk_rows_f32: topk={topk} unsupported. Supported: {SUPPORTED_TOPK:?}"
+            );
+        }
+        let (n_rows, len) = (dims[0], dims[1]);
+        let device = scores.device().clone();
+        let stream = cuda_stream(&device)?;
+
+        let scores_c = scores.contiguous()?;
+        // Every row has the same valid length in the dense case. (The
+        // Tensor::from_vec H2D is one tiny transfer per call; callers invoke
+        // this once per sampled token, not inside a model forward.)
+        let seq_lens_vec: Vec<i32> = vec![len as i32; n_rows];
+        let seq_lens = Tensor::from_vec(seq_lens_vec, (n_rows,), &device)?;
+        let out = Tensor::zeros((n_rows, topk), DType::U32, &device)?;
+
+        let sc_ptr = cuda_tensor_ptr(&scores_c)? as *const c_void;
+        let sl_ptr = cuda_tensor_ptr(&seq_lens)? as *const c_void;
+        let out_ptr = cuda_tensor_ptr(&out)? as *mut c_void;
+
+        unsafe {
+            crate::flashmlasparse_ffi::arc_flashmlasparse_topk(
+                sc_ptr,
+                sl_ptr,
+                out_ptr,
+                n_rows as i32,
+                topk as i32,
+                len as i64,
+                stream as *mut c_void,
+            );
+        }
+
+        Ok(out)
+    }
 }
 
 // ===========================================================================

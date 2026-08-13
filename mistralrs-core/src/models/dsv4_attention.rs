@@ -60,11 +60,82 @@
 //! as-is.
 
 use candle_core::{DType, Result, Tensor};
+use mistralrs_quant::MatMul;
 
 use super::deepseek4::CompressRatio;
 use crate::attention::SdpaParams;
 use crate::layers::Sdpa;
 use crate::pipeline::text_models_inputs_processor::FlashParams;
+
+/// Kill-switch for the absorbed-MLA decode path (`ARC_V4_NO_ABSORBED_DECODE=1`
+/// restores the pre-fix `Sdpa.run_attention` repeat_kv expansion for on-GPU
+/// A/B triage, mirroring `ARC_FORCE_NAIVE_SDPA`).
+fn absorbed_decode_disabled() -> bool {
+    use std::sync::OnceLock;
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        matches!(
+            std::env::var("ARC_V4_NO_ABSORBED_DECODE").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
+/// Absorbed-MLA decode: single-token (`t_q == 1`), single-KV-head attention
+/// computed directly in the shared latent space.
+///
+/// V4's *weights* are already absorbed — the fused `wkv` projection means the
+/// 512-d MQA KV head IS the latent (V = K; there is no `W_UK`/`W_UV` left to
+/// fold, unlike V2/V3's `kv_b_proj`). What was still naive is the *runtime*:
+/// `Sdpa.run_attention` → `sinks_attn` has no fused kernel at head_dim=512
+/// (flash-sinks supports only {64..256}), so it falls to the unfused path and
+/// `repeat_kv`-expands K and V to all `n_heads` — materializing
+/// `2 * n_heads * T_k * head_dim` elements per layer per decode step just to
+/// feed a batched GEMM 64 identical copies of K.
+///
+/// Here the heads are folded into the GEMM M-dimension instead, so K/V are
+/// each read exactly once (`q_latent · kv_latent^T`):
+///
+/// ```text
+/// scores = (Q  [B, 1, H, D]) @ (K^T [B, 1, D, T]) -> [B, 1, H, T]
+///          softmax_with_sinks over [B, H, 1, T] (per-head sink + mask)
+/// out    = (W  [B, 1, H, T]) @ (V   [B, 1, T, D]) -> [B, 1, H, D]
+/// ```
+///
+/// This is a mathematical identity with the repeat_kv path — the same dot
+/// products in the same order — so outputs match near-exactly (pinned by
+/// `absorbed_decode_matches_repeat_kv_reference` below and by every decode
+/// test in this module, all of which now route through this path).
+fn absorbed_mqa_decode(
+    q: &Tensor,    // [B, H, 1, D]
+    k: &Tensor,    // [B, 1, T_k, D]
+    v: &Tensor,    // [B, 1, T_k, D]
+    mask: &Tensor, // additive, broadcastable over [B, H, 1, T_k]
+    sdpa_params: &SdpaParams,
+) -> Result<Tensor> {
+    let (b, h, t_q, d) = q.dims4()?;
+    debug_assert_eq!(t_q, 1);
+    let t_k = k.dim(2)?;
+    let sinks = sdpa_params
+        .sinks
+        .as_ref()
+        .expect("absorbed_mqa_decode requires sinks (caller-gated)");
+
+    // [B, H, 1, D] -> [B, 1, H, D]: at t_q == 1 this is a pure reshape of the
+    // same contiguous buffer (no data movement).
+    let q_lat = q.contiguous()?.reshape((b, 1, h * t_q, d))?;
+    let att = MatMul.matmul_affine_mul(&q_lat, &k.t()?, sdpa_params.softmax_scale.into())?;
+    // Per-head layout for the sinks softmax; contiguous, so reshape is free.
+    let att = att.reshape((b, h, t_q, t_k))?;
+    // Same sink pre-shaping as `sinks_attn_cpu`: [1, H, 1, 1] F32 -> [H] in
+    // the logits dtype.
+    let sinks = sinks.flatten_all()?.to_dtype(att.dtype())?;
+    let att = mistralrs_quant::softmax_with_sinks(&att, &sinks, Some(mask))?;
+    let att = att.to_dtype(v.dtype())?;
+    // Weighted sum in the latent space: [B, 1, H, T] @ [B, 1, T, D].
+    let out = MatMul.matmul(&att.reshape((b, 1, h * t_q, t_k))?, v)?;
+    out.reshape((b, h, t_q, d))
+}
 
 /// Per-call configuration for V4 hybrid attention.
 #[derive(Debug, Clone, Copy)]
@@ -159,6 +230,17 @@ pub fn dsv4_attention(
     let mask = valid
         .where_cond(&zeros, &neg_inf)?
         .reshape((1, 1, t_q, n_keys))?;
+
+    // ---- Absorbed-MLA decode (stage-2 perf) -------------------------------
+    // Single-token decode with one KV head and sinks present (the deployment
+    // configuration on every V4 layer) computes attention directly in the
+    // latent space — no per-head K/V materialization (see
+    // `absorbed_mqa_decode`). The sinks gate keeps no-sink callers (synthetic
+    // fixtures) on the flash-attn-capable Sdpa dispatch unchanged.
+    if t_q == 1 && k_cat.dim(1)? == 1 && sdpa_params.sinks.is_some() && !absorbed_decode_disabled()
+    {
+        return absorbed_mqa_decode(q, &k_cat, &v_cat, &mask, sdpa_params);
+    }
 
     Sdpa.run_attention(
         q,
@@ -323,10 +405,22 @@ mod tests {
     /// `window` keys `[t_k - window, t_k - 1]` — verified by comparing against
     /// SDPA over the narrowed K/V at cache lengths crossing the window
     /// boundary (the 128→129 hardware transition, scaled down). An off-by-one
-    /// in the window slice fails the equality at every post-window length.
+    /// in the window slice fails the equality at every post-window length
+    /// (asserted by the shifted-window negative control below).
     /// Runs with (zero) sinks on both sides, matching deployment where
     /// `attn_sink` is always present — and required here: the no-sink CPU
     /// flash path NaNs on rows with a masked prefix (see the HCA test note).
+    ///
+    /// Tolerance: the dispatch decode now runs the absorbed single-GEMM path
+    /// while the reference narrows K/V through `sinks_attn_cpu`'s repeat_kv
+    /// GEMM — identical real-number math, but `MatMul`'s CPU path rounds
+    /// through F16 and the two GEMM batchings tile (and therefore round)
+    /// differently per arch/machine. CI observed exactly-1-F16-ulp diffs
+    /// (e.g. 0.46826172 vs 0.46801758 on x86) where this host shows 0, so
+    /// the bound is the documented CPU-MatMul F16 noise floor (~1e-3, same
+    /// as `union_decode_matches_scalar_reference`), not f32 eps. The window
+    /// semantics themselves are shape-level (which keys participate), which
+    /// the negative control pins far above this floor.
     #[test]
     fn standard_decode_window_boundary_exact() -> Result<()> {
         let device = Device::Cpu;
@@ -354,10 +448,33 @@ mod tests {
 
             let e: Vec<f32> = expected.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
             let a: Vec<f32> = actual.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+            const TOL: f32 = 1.5e-3;
             for (ev, av) in e.iter().zip(a.iter()) {
                 assert!(
-                    (ev - av).abs() < 1e-5,
+                    (ev - av).abs() < TOL,
                     "t_k={t_k}: {ev} != {av} (window slice off)"
+                );
+            }
+
+            // Negative control (teeth for the F16-floor tolerance): a
+            // window slice off by one — the last `window - 1` keys instead
+            // of the last `window` — must sit far above TOL. Only
+            // meaningful once the window is a strict subset of the cache.
+            if t_k > window {
+                let k_shift = k.narrow(2, t_k - (n_vis - 1), n_vis - 1)?;
+                let v_shift = v.narrow(2, t_k - (n_vis - 1), n_vis - 1)?;
+                let shifted =
+                    Sdpa.run_attention(&q, &k_shift, &v_shift, None, Some(&flash), &sdpa)?;
+                let s: Vec<f32> = shifted.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+                let max_diff = s
+                    .iter()
+                    .zip(a.iter())
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    max_diff > 3.0 * TOL,
+                    "t_k={t_k}: off-by-one window is indistinguishable at TOL \
+                     (max_diff={max_diff}); test has no teeth"
                 );
             }
         }
@@ -557,6 +674,72 @@ mod tests {
         assert_eq!(out.dims(), &[b, h, t_q, d]);
         let data: Vec<f32> = out.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
         assert!(data.iter().all(|x| x.is_finite()));
+        Ok(())
+    }
+
+    /// The absorbed decode is a mathematical identity with the naive
+    /// repeat_kv expansion: same dot products, same order, only the GEMM
+    /// batching differs. Compare `absorbed_mqa_decode` against
+    /// `Sdpa.run_attention` (which with sinks routes through
+    /// `sinks_attn_cpu`'s repeat_kv path) on identical inputs — nonzero
+    /// per-head sinks, a mask with -inf holes, v != k on purpose (the
+    /// absorbed path must not assume V aliases K), across batch sizes and
+    /// cache lengths.
+    ///
+    /// Tolerance: `MatMul`'s CPU path rounds through F16, and the two GEMM
+    /// batchings ([B*H,1,D] repeat_kv vs [B,H,D] head-folded) tile — and
+    /// therefore round — differently per arch/machine. CI observed
+    /// exactly-1-F16-ulp diffs (e.g. -0.10424805 vs -0.10418701 on x86,
+    /// ulp(0.1)=6.1e-5) where this host shows 0, so the bound is the
+    /// documented CPU-MatMul F16 noise floor (~1e-3; see
+    /// `union_decode_matches_scalar_reference`), not f32 eps. Any real
+    /// semantic divergence (wrong mask column, missing sink, head
+    /// scrambling) moves outputs by orders of magnitude more.
+    #[test]
+    fn absorbed_decode_matches_repeat_kv_reference() -> Result<()> {
+        let device = Device::Cpu;
+        let (h, d) = (4, 16);
+        for b in [1usize, 2] {
+            for t_k in [1usize, 5, 33, 128] {
+                let q = mk(b, h, 1, d, 0.03, &device)?;
+                let k = mk(b, 1, t_k, d, 0.11, &device)?;
+                let v = mk(b, 1, t_k, d, 0.17, &device)?;
+
+                let sinks_data: Vec<f32> = (0..h).map(|i| 0.2 + 0.3 * i as f32).collect();
+                let sinks = Tensor::from_vec(sinks_data, (1, h, 1, 1), &device)?;
+                let sdpa = SdpaParams {
+                    n_kv_groups: h,
+                    softcap: None,
+                    softmax_scale: 1.0 / (d as f32).sqrt(),
+                    sliding_window: None,
+                    sinks: Some(sinks),
+                };
+
+                // Additive mask with some fully-masked columns (never the
+                // diagonal/last key, so no all-masked row).
+                let mut mask_data = vec![0f32; t_k];
+                for (j, mval) in mask_data.iter_mut().enumerate() {
+                    if j % 3 == 1 && j + 1 != t_k {
+                        *mval = f32::NEG_INFINITY;
+                    }
+                }
+                let mask = Tensor::from_vec(mask_data, (1, 1, 1, t_k), &device)?;
+
+                let flash = empty_flash_params();
+                let expected = Sdpa.run_attention(&q, &k, &v, Some(&mask), Some(&flash), &sdpa)?;
+                let actual = absorbed_mqa_decode(&q, &k, &v, &mask, &sdpa)?;
+                assert_eq!(actual.dims(), &[b, h, 1, d]);
+
+                let e: Vec<f32> = expected.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+                let a: Vec<f32> = actual.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+                for (ev, av) in e.iter().zip(a.iter()) {
+                    assert!(
+                        (ev - av).abs() < 1.5e-3,
+                        "b={b} t_k={t_k}: absorbed {av} != naive {ev}"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
