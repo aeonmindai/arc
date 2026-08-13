@@ -10,8 +10,15 @@ fn main() {
         println!("cargo:rerun-if-changed=build.rs");
         let build_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
+        // sinkhorn.cu is EXCLUDED from this fast-math builder and compiled
+        // separately below: it must be bit-identical to candle-kernels (which
+        // build with plain -O3, no fast math), and --use_fast_math rewrites
+        // expf -> __expf and IEEE division -> approximate reciprocals. The
+        // kernel source carries an `#error` guard against being re-globbed
+        // under fast math. See mistralrs-core/src/cuda/sinkhorn.cu.
         let mut builder = cudaforge::KernelBuilder::new()
             .source_glob("src/cuda/*.cu")
+            .exclude(&["sinkhorn.cu"])
             .out_dir(&build_dir)
             .arg("-std=c++17")
             .arg("-O3")
@@ -55,6 +62,39 @@ fn main() {
             .expect("Build mistral-core failed!");
         println!("cargo:rustc-link-search={}", build_dir.display());
         println!("cargo:rustc-link-lib=mistralrscuda");
+
+        // Dedicated IEEE (no fast math) builder for sinkhorn.cu — bit-identity
+        // with candle-kernels requires accurate expf + div.rn.f32; --fmad=false
+        // additionally forbids FMA contraction so rounding matches candle's
+        // unfused op chain exactly. Own subdirectory so its build cache never
+        // mixes with the fast-math builder's.
+        let sinkhorn_dir = build_dir.join("sinkhorn_ieee");
+        let mut sinkhorn_builder = cudaforge::KernelBuilder::new()
+            .source_files(vec!["src/cuda/sinkhorn.cu"])
+            .out_dir(&sinkhorn_dir)
+            .arg("-std=c++17")
+            .arg("-O3")
+            .arg("--expt-relaxed-constexpr")
+            .arg("--expt-extended-lambda")
+            .arg("--fmad=false")
+            .arg("--verbose")
+            .arg("--compiler-options")
+            .arg("-fPIC");
+        if let Some(cuda_nvcc_flags_env) = CUDA_NVCC_FLAGS {
+            sinkhorn_builder = sinkhorn_builder.arg("--compiler-options");
+            sinkhorn_builder = sinkhorn_builder.arg(cuda_nvcc_flags_env);
+        }
+        let sinkhorn_out = if target.contains("msvc") {
+            sinkhorn_dir.join("mistralrssinkhornieee.lib")
+        } else {
+            sinkhorn_dir.join("libmistralrssinkhornieee.a")
+        };
+        sinkhorn_builder
+            .build_lib(sinkhorn_out)
+            .expect("Build sinkhorn IEEE kernel failed!");
+        println!("cargo:rustc-link-search={}", sinkhorn_dir.display());
+        println!("cargo:rustc-link-lib=mistralrssinkhornieee");
+
         println!("cargo:rustc-link-lib=dylib=cudart");
 
         if target.contains("msvc") {

@@ -577,12 +577,22 @@ impl V4MHCLayerParams {
 /// 2. Divide by row sums (and add eps).
 /// 3. Divide by column sums (with eps in denominator).
 /// 4. Repeat (row→col) `sinkhorn_iters - 1` more times.
-fn sinkhorn_normalize(comb: &Tensor, sinkhorn_iters: usize, eps: f64) -> Result<Tensor> {
+pub(crate) fn sinkhorn_normalize(comb: &Tensor, sinkhorn_iters: usize, eps: f64) -> Result<Tensor> {
     // RUN-161 throughput: fused single-launch CUDA kernel replaces the ~123-op
     // candle chain below (the dominant decode cost — ~13k launch-bound
     // micro-kernels/token across 43 layers). Opt-in via ARC_FUSED_SINKHORN=1
-    // until bit-identical-validated on H100; falls back to the candle path
+    // until bit-identical-validated on GPU; falls back to the candle path
     // otherwise (non-CUDA, gate off, or any error).
+    //
+    // Bit-identity status: the first kernel FAILED the 2026-08-13 H200 A/B
+    // (ppl 58.85084 vs 58.88946, 4/6 greedy divergences) — sequential
+    // reductions + --use_fast_math compilation did not match this candle
+    // chain's rounding. Fixed by construction in cuda/sinkhorn.cu (candle
+    // fast_sum/fast_max pairwise-tree order, unfused IEEE _rn arithmetic,
+    // dedicated no-fast-math build); see the contract comment there and the
+    // bitwise replica tests in cuda/sinkhorn.rs. Gate stays opt-in until the
+    // fixed kernel passes the on-GPU A/B (arc-tools/quality:
+    // run_sinkhorn_ab.py + run_ppl.sh --sinkhorn-ab).
     if std::env::var_os("ARC_FUSED_SINKHORN").is_some()
         && matches!(comb.device(), candle_core::Device::Cuda(_))
         && comb.dtype() == DType::F32
