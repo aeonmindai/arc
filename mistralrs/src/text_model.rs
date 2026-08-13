@@ -72,6 +72,7 @@ pub struct PagedAttentionMetaBuilder {
     block_size: Option<usize>,
     mem_gpu: MemoryGpuConfig,
     cache_type: PagedCacheType,
+    cache_type_explicit: bool,
 }
 
 impl Default for PagedAttentionMetaBuilder {
@@ -80,6 +81,7 @@ impl Default for PagedAttentionMetaBuilder {
             block_size: None,
             mem_gpu: MemoryGpuConfig::ContextSize(4096),
             cache_type: PagedCacheType::TurboQuant,
+            cache_type_explicit: false,
         }
     }
 }
@@ -98,14 +100,24 @@ impl PagedAttentionMetaBuilder {
     }
 
     /// Set the paged cache data type. Defaults to `PagedCacheType::TurboQuant` (3.5-bit, lossless).
+    ///
+    /// Calling this marks the cache type as an explicit choice: a model the
+    /// type cannot support will hard-error at load time instead of
+    /// auto-falling back to `PagedCacheType::Auto`.
     pub fn with_paged_cache_type(mut self, cache_type: PagedCacheType) -> Self {
         self.cache_type = cache_type;
+        self.cache_type_explicit = true;
         self
     }
 
     /// Build the [`PagedAttentionConfig`]. Returns an error if the configuration is invalid.
     pub fn build(self) -> anyhow::Result<PagedAttentionConfig> {
-        PagedAttentionConfig::new(self.block_size, self.mem_gpu, self.cache_type)
+        let config = PagedAttentionConfig::new(self.block_size, self.mem_gpu, self.cache_type)?;
+        Ok(if self.cache_type_explicit {
+            config.with_explicit_cache_type()
+        } else {
+            config
+        })
     }
 }
 

@@ -21,9 +21,7 @@ use crate::device_map::{self, DeviceMapper};
 use crate::distributed::{self, WorkerTransferData};
 use crate::kv_cache::{FullCacheManager, HybridCacheManager, NormalCacheManager};
 use crate::lora::Ordering;
-use crate::paged_attention::{
-    calculate_cache_config, AttentionImplementation, CacheEngine, PagedCacheType,
-};
+use crate::paged_attention::{calculate_cache_config, AttentionImplementation, CacheEngine};
 use crate::pipeline::chat_template::{calculate_eos_tokens, GenerationConfig};
 use crate::pipeline::isq::UqffFullSer;
 use crate::pipeline::loaders::auto_device_map;
@@ -1042,6 +1040,7 @@ impl Loader for NormalLoader {
                 paged_attn_config.block_size,
                 dtype,
                 paged_attn_config.cache_type,
+                paged_attn_config.cache_type_explicit,
                 model.config(),
                 &device,
                 &pipeline_mapper

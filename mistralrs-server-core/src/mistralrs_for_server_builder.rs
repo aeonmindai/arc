@@ -242,6 +242,12 @@ pub struct MistralRsForServerBuilder {
     /// PagedAttention KV cache type
     paged_cache_type: PagedCacheType,
 
+    /// Whether `paged_cache_type` was explicitly chosen (via
+    /// [`Self::with_paged_attn_cache_type`]) rather than left at the default.
+    /// Explicit choices hard-error on unsupported models instead of
+    /// auto-falling back to the unquantized cache.
+    paged_cache_type_explicit: bool,
+
     /// MTP speculative-decode depth.
     ///
     /// `0` = disabled (default; backward-compatible). When `> 0`, after loading
@@ -282,6 +288,7 @@ impl Default for MistralRsForServerBuilder {
             search_callback: defaults::SEARCH_CALLBACK,
             mcp_client_config: None,
             paged_cache_type: defaults::PAGED_CACHE_TYPE,
+            paged_cache_type_explicit: false,
             mtp_depth: defaults::MTP_DEPTH,
         }
     }
@@ -539,9 +546,24 @@ impl MistralRsForServerBuilder {
         self
     }
 
-    /// Sets the block size for PagedAttention.
+    /// Sets the PagedAttention KV cache type. Calling this marks the cache
+    /// type as an explicit user choice: a model the type cannot support will
+    /// hard-error instead of auto-falling back to the unquantized cache.
     pub fn with_paged_attn_cache_type(mut self, cache_type: PagedCacheType) -> Self {
         self.paged_cache_type = cache_type;
+        self.paged_cache_type_explicit = true;
+        self
+    }
+
+    /// Sets the PagedAttention KV cache type if provided. `None` keeps the
+    /// default (TurboQuant, with auto-fallback for unsupported models).
+    pub fn with_paged_attn_cache_type_optional(
+        mut self,
+        cache_type: Option<PagedCacheType>,
+    ) -> Self {
+        if let Some(cache_type) = cache_type {
+            self = self.with_paged_attn_cache_type(cache_type);
+        }
         self
     }
 
@@ -660,6 +682,7 @@ impl MistralRsForServerBuilder {
             self.paged_attn_gpu_mem_usage,
             self.paged_ctxt_len,
             self.paged_cache_type,
+            self.paged_cache_type_explicit,
             !paged_attn,
         )?;
 
@@ -808,6 +831,7 @@ impl MistralRsForServerBuilder {
             self.paged_attn_gpu_mem_usage,
             self.paged_ctxt_len,
             self.paged_cache_type,
+            self.paged_cache_type_explicit,
             !paged_attn,
         )?;
 
@@ -1156,9 +1180,10 @@ fn init_cache_config(
     paged_attn_gpu_mem_usage: Option<f32>,
     paged_ctxt_len: Option<usize>,
     cache_type: PagedCacheType,
+    cache_type_explicit: bool,
     no_paged_attn: bool,
 ) -> Result<Option<PagedAttentionConfig>> {
-    match (
+    let config = match (
         paged_attn_block_size,
         paged_attn_gpu_mem,
         paged_attn_gpu_mem_usage,
@@ -1166,52 +1191,59 @@ fn init_cache_config(
         paged_attn_supported(),
         no_paged_attn,
     ) {
-        (block_size, None, None, None, true, false) => Ok(Some(PagedAttentionConfig::new(
+        (block_size, None, None, None, true, false) => Some(PagedAttentionConfig::new(
             block_size,
             MemoryGpuConfig::Utilization(0.9),
             cache_type,
-        )?)),
-        (block_size, None, None, Some(ctxt), true, false) => Ok(Some(PagedAttentionConfig::new(
+        )?),
+        (block_size, None, None, Some(ctxt), true, false) => Some(PagedAttentionConfig::new(
             block_size,
             MemoryGpuConfig::ContextSize(ctxt),
             cache_type,
-        )?)),
-        (block_size, None, Some(f), None, true, false) => Ok(Some(PagedAttentionConfig::new(
+        )?),
+        (block_size, None, Some(f), None, true, false) => Some(PagedAttentionConfig::new(
             block_size,
             MemoryGpuConfig::Utilization(f),
             cache_type,
-        )?)),
-        (block_size, Some(m), None, None, true, false) => Ok(Some(PagedAttentionConfig::new(
+        )?),
+        (block_size, Some(m), None, None, true, false) => Some(PagedAttentionConfig::new(
             block_size,
             MemoryGpuConfig::MbAmount(m),
             cache_type,
-        )?)),
+        )?),
         (block_size, Some(_m), Some(f), None, true, false) => {
             info!("Both memory size, and usage were specified, defaulting to the usage value.");
-            Ok(Some(PagedAttentionConfig::new(
+            Some(PagedAttentionConfig::new(
                 block_size,
                 MemoryGpuConfig::Utilization(f),
                 cache_type,
-            )?))
+            )?)
         }
         (block_size, Some(_m), None, Some(ctxt), true, false) => {
             info!("All memory size and ctxt len, defaulting to the context len value.");
-            Ok(Some(PagedAttentionConfig::new(
+            Some(PagedAttentionConfig::new(
                 block_size,
                 MemoryGpuConfig::ContextSize(ctxt),
                 cache_type,
-            )?))
+            )?)
         }
         (block_size, None, Some(f), Some(_ctxt), true, false) => {
             info!("Both ctxt len and usage were specified, defaulting to the usage value.");
-            Ok(Some(PagedAttentionConfig::new(
+            Some(PagedAttentionConfig::new(
                 block_size,
                 MemoryGpuConfig::Utilization(f),
                 cache_type,
-            )?))
+            )?)
         }
-        (_, _, _, _, _, _) => Ok(None),
-    }
+        (_, _, _, _, _, _) => None,
+    };
+    Ok(config.map(|c| {
+        if cache_type_explicit {
+            c.with_explicit_cache_type()
+        } else {
+            c
+        }
+    }))
 }
 
 /// Initializes the scheduler configuration based on cache settings and pipeline metadata.

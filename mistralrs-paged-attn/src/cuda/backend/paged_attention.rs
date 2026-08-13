@@ -712,6 +712,12 @@ pub fn turbo_reshape_and_cache(
 
     let dev = k.device();
     let (num_tokens, num_heads, head_size) = k_l.shape().dims3()?;
+    if head_size != 128 {
+        candle::bail!(
+            "turbo_reshape_and_cache only supports head_size=128 (got {head_size}); \
+             the TurboQuant kernel would exit without writing anything"
+        );
+    }
 
     let k_f16 = k.as_cuda_slice::<f16>()?;
     let v_f16 = v.as_cuda_slice::<f16>()?;
@@ -821,6 +827,12 @@ pub fn turbo_paged_attention(
 
     let dev = q_s.device();
     let (num_seqs, num_heads, head_size) = q_l.shape().dims3()?;
+    if head_size != 128 {
+        candle::bail!(
+            "turbo_paged_attention only supports head_size=128 (got {head_size}); \
+             the kernel would exit early and return an uninitialized output buffer"
+        );
+    }
     let max_num_blocks_per_seq = bt_l.shape().dims2()?.1;
     let (_num_blocks, _num_kv_heads, _, block_size, _x) = kc_l.shape().dims5()?;
 

@@ -42,10 +42,13 @@ pub struct PagedAttentionOptions {
     pub block_size: Option<usize>,
 
     /// KV cache quantization type: turboquant (K4/V3, 3.5-bit, lossless, default),
-    /// turboquant-3 (K3/V3), turboquant-aggressive (K3/V2), auto, f8e4m3
-    #[arg(long = "pa-cache-type", default_value = "turboquant", value_parser = parse_cache_type)]
+    /// turboquant-3 (K3/V3), turboquant-aggressive (K3/V2), auto, f8e4m3.
+    /// If unset, defaults to turboquant with auto-fallback to `auto` for
+    /// models TurboQuant cannot support; setting it explicitly makes an
+    /// unsupported model a hard error instead.
+    #[arg(long = "pa-cache-type", value_parser = parse_cache_type)]
     #[serde(default)]
-    pub cache_type: PagedCacheType,
+    pub cache_type: Option<PagedCacheType>,
 }
 
 impl Default for PagedAttentionOptions {
@@ -56,7 +59,7 @@ impl Default for PagedAttentionOptions {
             memory_mb: None,
             memory_fraction: None,
             block_size: None,
-            cache_type: PagedCacheType::TurboQuant,
+            cache_type: None,
         }
     }
 }
@@ -100,10 +103,10 @@ fn parse_cache_type(s: &str) -> Result<PagedCacheType, String> {
 
 /// PagedAttention builder flags type alias
 pub type PagedAttnBuilderFlags = (
-    Option<bool>,   // paged_attn enable flag
-    Option<usize>,  // gpu_mem (MBs)
-    Option<f32>,    // gpu_mem_usage (fraction)
-    Option<usize>,  // context_len
-    Option<usize>,  // block_size
-    PagedCacheType, // cache_type
+    Option<bool>,           // paged_attn enable flag
+    Option<usize>,          // gpu_mem (MBs)
+    Option<f32>,            // gpu_mem_usage (fraction)
+    Option<usize>,          // context_len
+    Option<usize>,          // block_size
+    Option<PagedCacheType>, // cache_type (None = TurboQuant default with auto-fallback)
 );

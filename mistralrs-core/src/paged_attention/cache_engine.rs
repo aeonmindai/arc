@@ -1,12 +1,17 @@
 use std::{
     str::FromStr,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, Once},
 };
 
 use candle_core::{DType, Device, Result, Tensor};
 use serde::{Deserialize, Serialize};
 
 use super::config::{KvCacheLayout, ModelConfigLike};
+
+/// Head dimension the TurboQuant CUDA kernels are specialized for. The packed
+/// K4/V3 block layout and every `turbo_*` kernel assume exactly this head
+/// size; the kernels exit early (`if (hs != 128) return;`) for anything else.
+pub const TURBOQUANT_HEAD_DIM: usize = 128;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "pyo3_macros", pyo3::pyclass(eq, eq_int))]
@@ -42,6 +47,72 @@ impl PagedCacheType {
                 | PagedCacheType::TurboQuant3
                 | PagedCacheType::TurboQuantAggressive
         )
+    }
+
+    /// Whether prefix caching can be used with this cache type. TurboQuant
+    /// blocks are packed U8; `gather_kv_cache` cannot dequantize them yet, so
+    /// a prefix-cache hit would fail at runtime.
+    pub fn supports_prefix_cache(&self) -> bool {
+        !self.is_turboquant()
+    }
+
+    /// Whether the TurboQuant kernels support this model's KV geometry.
+    fn turboquant_supports_model(config: &dyn ModelConfigLike) -> bool {
+        matches!(config.kv_cache_layout(), KvCacheLayout::Standard)
+            && config.k_head_dim() == TURBOQUANT_HEAD_DIM
+            && config.v_head_dim() == TURBOQUANT_HEAD_DIM
+    }
+
+    /// Resolve this cache type against the target model's KV geometry.
+    ///
+    /// The TurboQuant kernels only support the standard KV layout with
+    /// `head_dim == 128`:
+    /// * any other head size makes the `turbo_paged_attention.cu` kernels exit
+    ///   early with their (uninitialized) F32 output buffer untouched —
+    ///   silent garbage;
+    /// * MLA-layout models (DeepSeek V2/V3, GLM4-MoE-lite) write through
+    ///   `concat_and_cache_mla`, which bails on a packed U8 cache at runtime.
+    ///
+    /// For the ambient default (`TurboQuant` the user never asked for), fall
+    /// back to [`PagedCacheType::Auto`] with a single warning. If the user
+    /// explicitly chose a TurboQuant type (`explicitly_requested`, or one of
+    /// the non-default `TurboQuant3`/`TurboQuantAggressive` presets, which are
+    /// never a default anywhere), error instead so the mismatch cannot be
+    /// missed.
+    pub fn resolve_for_model(
+        self,
+        config: &dyn ModelConfigLike,
+        explicitly_requested: bool,
+    ) -> anyhow::Result<Self> {
+        if !self.is_turboquant() || Self::turboquant_supports_model(config) {
+            return Ok(self);
+        }
+        let reason = match config.kv_cache_layout() {
+            KvCacheLayout::Mla { .. } => {
+                "the model uses an MLA KV cache layout, which TurboQuant does not support"
+                    .to_string()
+            }
+            KvCacheLayout::Standard => format!(
+                "the model has head_dim k={}/v={}, but the TurboQuant kernels only support head_dim={TURBOQUANT_HEAD_DIM}",
+                config.k_head_dim(),
+                config.v_head_dim(),
+            ),
+        };
+        let forced = explicitly_requested || !matches!(self, PagedCacheType::TurboQuant);
+        if forced {
+            anyhow::bail!(
+                "PagedAttention cache type {self:?} was explicitly requested, but {reason}. \
+                 Use `--pa-cache-type auto` or `--pa-cache-type f8e4m3` for this model."
+            );
+        }
+        static FALLBACK_WARNING: Once = Once::new();
+        FALLBACK_WARNING.call_once(|| {
+            tracing::warn!(
+                "Default PagedAttention cache type {self:?} is unsupported here: {reason}. \
+                 Falling back to the unquantized KV cache (`auto`)."
+            );
+        });
+        Ok(PagedCacheType::Auto)
     }
 
     /// Get the TurboQuant preset for this cache type, if applicable.
@@ -402,11 +473,7 @@ impl CacheEngine {
         if cache_type.is_turboquant() {
             // TurboQuant 3-bit packed: 10 values per 4 bytes = ceil(head_dim/10)*4 bytes
             let packed_bytes = (model_config.v_head_dim().div_ceil(10)) * 4; // 52 for d=128
-            (
-                model_config.num_kv_heads(),
-                packed_bytes,
-                block_size,
-            )
+            (model_config.num_kv_heads(), packed_bytes, block_size)
         } else {
             (
                 model_config.num_kv_heads(),
@@ -414,5 +481,153 @@ impl CacheEngine {
                 block_size,
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_type_tests {
+    use super::super::config::ModelConfigMetadata;
+    use super::*;
+
+    fn meta(k_head_dim: usize, v_head_dim: usize, layout: KvCacheLayout) -> ModelConfigMetadata {
+        ModelConfigMetadata {
+            max_seq_len: 4096,
+            num_layers: 2,
+            hidden_size: 512,
+            num_kv_heads: 2,
+            num_attn_heads: 4,
+            sliding_window: None,
+            k_head_dim,
+            v_head_dim,
+            kv_cache_layout: layout,
+        }
+    }
+
+    const TURBO_TYPES: [PagedCacheType; 3] = [
+        PagedCacheType::TurboQuant,
+        PagedCacheType::TurboQuant3,
+        PagedCacheType::TurboQuantAggressive,
+    ];
+
+    /// Supported geometry (standard layout, head_dim 128): every TurboQuant
+    /// preset resolves to itself, explicit or not.
+    #[test]
+    fn turboquant_stays_on_supported_geometry() {
+        let cfg = meta(128, 128, KvCacheLayout::Standard);
+        for t in TURBO_TYPES {
+            for explicit in [false, true] {
+                assert_eq!(t.resolve_for_model(&cfg, explicit).unwrap(), t);
+            }
+        }
+    }
+
+    /// The default TurboQuant type falls back to Auto (instead of producing
+    /// silent garbage from the head_dim-128-only kernels) for other head dims.
+    #[test]
+    fn default_turboquant_falls_back_on_unsupported_head_dim() {
+        for head_dim in [64, 96, 192, 256] {
+            let cfg = meta(head_dim, head_dim, KvCacheLayout::Standard);
+            assert_eq!(
+                PagedCacheType::TurboQuant
+                    .resolve_for_model(&cfg, false)
+                    .unwrap(),
+                PagedCacheType::Auto,
+                "head_dim={head_dim} must fall back"
+            );
+        }
+        // Mixed k/v head dims must also fall back.
+        let cfg = meta(128, 64, KvCacheLayout::Standard);
+        assert_eq!(
+            PagedCacheType::TurboQuant
+                .resolve_for_model(&cfg, false)
+                .unwrap(),
+            PagedCacheType::Auto
+        );
+    }
+
+    /// MLA-layout models (deepseek2/3, glm4_moe_lite) get a U8 MLA cache that
+    /// `concat_and_cache_mla` rejects at runtime; the default falls back.
+    #[test]
+    fn default_turboquant_falls_back_on_mla_layout() {
+        let cfg = meta(
+            192,
+            192,
+            KvCacheLayout::Mla {
+                kv_lora_rank: 512,
+                kpe_head_dim: 64,
+            },
+        );
+        assert_eq!(
+            PagedCacheType::TurboQuant
+                .resolve_for_model(&cfg, false)
+                .unwrap(),
+            PagedCacheType::Auto
+        );
+    }
+
+    /// An explicitly requested TurboQuant type must hard-error on unsupported
+    /// models rather than silently switching caches.
+    #[test]
+    fn explicit_turboquant_errors_on_unsupported_model() {
+        let cfg = meta(64, 64, KvCacheLayout::Standard);
+        for t in TURBO_TYPES {
+            let err = t.resolve_for_model(&cfg, true).unwrap_err();
+            assert!(
+                err.to_string().contains("explicitly requested"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    /// TurboQuant3/TurboQuantAggressive are never a default anywhere, so they
+    /// count as explicit even when the caller could not plumb the flag.
+    #[test]
+    fn non_default_turbo_presets_are_treated_as_explicit() {
+        let cfg = meta(
+            192,
+            192,
+            KvCacheLayout::Mla {
+                kv_lora_rank: 512,
+                kpe_head_dim: 64,
+            },
+        );
+        for t in [
+            PagedCacheType::TurboQuant3,
+            PagedCacheType::TurboQuantAggressive,
+        ] {
+            assert!(t.resolve_for_model(&cfg, false).is_err());
+        }
+    }
+
+    /// Non-TurboQuant types are never touched, whatever the geometry.
+    #[test]
+    fn non_turbo_types_pass_through() {
+        let mla = meta(
+            192,
+            192,
+            KvCacheLayout::Mla {
+                kv_lora_rank: 512,
+                kpe_head_dim: 64,
+            },
+        );
+        let small = meta(64, 64, KvCacheLayout::Standard);
+        for t in [PagedCacheType::Auto, PagedCacheType::F8E4M3] {
+            for cfg in [&mla, &small] {
+                for explicit in [false, true] {
+                    assert_eq!(t.resolve_for_model(cfg, explicit).unwrap(), t);
+                }
+            }
+        }
+    }
+
+    /// Prefix caching is unsupported on packed TurboQuant caches (a prefix
+    /// hit would fail in `gather_kv_cache`), and supported everywhere else.
+    #[test]
+    fn prefix_cache_support_matches_cache_type() {
+        for t in TURBO_TYPES {
+            assert!(!t.supports_prefix_cache());
+        }
+        assert!(PagedCacheType::Auto.supports_prefix_cache());
+        assert!(PagedCacheType::F8E4M3.supports_prefix_cache());
     }
 }
