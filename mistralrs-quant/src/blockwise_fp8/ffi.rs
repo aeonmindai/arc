@@ -113,6 +113,36 @@ extern "C" {
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
+    // FP8 GEMV kernels (dedicated decode path, M <= 4). Warp-per-row,
+    // dequant-in-registers with per-block scales, f32 accumulate.
+    pub(crate) fn launch_fp8_gemv_f16(
+        input: *const f16,
+        weight: *const F8E4M3,
+        weight_scale: *const f32,
+        output: *mut f16,
+        m: i32,
+        n: i32,
+        k: i32,
+        scale_row_stride: i32,
+        block_size_y: i32,
+        block_size_x: i32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
+    pub(crate) fn launch_fp8_gemv_bf16(
+        input: *const bf16,
+        weight: *const F8E4M3,
+        weight_scale: *const f32,
+        output: *mut bf16,
+        m: i32,
+        n: i32,
+        k: i32,
+        scale_row_stride: i32,
+        block_size_y: i32,
+        block_size_x: i32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
     // FP8 Indexed MoE GEMM kernels (for gather_forward method)
     pub(crate) fn launch_fp8_indexed_moe_gemm_f16(
         input: *const f16,

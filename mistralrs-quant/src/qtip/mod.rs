@@ -77,6 +77,48 @@ pub use viterbi::viterbi_quantize_row;
 /// needing to ship the sign vector in older formats (the seed alone is enough).
 const QTIP_ROTATION_SEED: u64 = 0xA3C1_7B0F_5F2E_1D4D;
 
+/// Decode-shaped-workload threshold. Matches the default of
+/// `ARC_QTIP_ONDEVICE_MOE_MAX_TOKENS`: at or below this many tokens the
+/// fused on-device gather/GEMV kernels are the intended path and no
+/// dequantized weight tensor should ever be written to global memory.
+pub(crate) const DECODE_REGIME_MAX_TOKENS: usize = 8;
+
+/// Opt-in decode-path diagnostic (`ARC_WARN_DEQUANT_MATERIALIZE=1`).
+///
+/// Fires when a dequantize-materializing fallback engages for a
+/// decode-shaped workload (`n_tokens <= DECODE_REGIME_MAX_TOKENS`). On the
+/// intended decode path the fused gather/GEMV kernels
+/// (`gather_gemv_cuda` / `fused_gemv_cuda` and their bitshift siblings)
+/// never materialize dequantized weights to HBM; if this warning fires, a
+/// precondition (env override, unsupported dtype, non-CUDA storage, kernel
+/// not compiled in) knocked the layer off the fused path and decode is
+/// paying the full dequantize bandwidth — the `qtip_dequantize` line in the
+/// nsys profile. Warns once per call-site context to avoid flooding
+/// per-token logs.
+pub(crate) fn warn_dequant_materialize_at_decode(n_tokens: usize, context: &'static str) {
+    use std::collections::HashSet;
+    use std::sync::{LazyLock, Mutex};
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("ARC_WARN_DEQUANT_MATERIALIZE").is_ok_and(|v| v != "0"));
+    if !*ENABLED || n_tokens > DECODE_REGIME_MAX_TOKENS {
+        return;
+    }
+    static SEEN: LazyLock<Mutex<HashSet<&'static str>>> =
+        LazyLock::new(|| Mutex::new(HashSet::new()));
+    let first_hit = SEEN
+        .lock()
+        .map(|mut seen| seen.insert(context))
+        .unwrap_or(false);
+    if first_hit {
+        tracing::warn!(
+            "ARC_WARN_DEQUANT_MATERIALIZE: {context} engaged at decode shape \
+             (n_tokens={n_tokens}); dequantized weights are being materialized \
+             instead of using the fused gather/GEMV kernels. \
+             (warning once per call site)"
+        );
+    }
+}
+
 /// Maximum block size for the block-diagonal Hadamard rotation.
 ///
 /// Real LLM linear layers have `in_features` that is not always a power of 2
@@ -1199,6 +1241,13 @@ impl QtipLayer {
             }
         }
 
+        // Materializing fallback: full weight dequantize + matmul. At decode
+        // shapes the fused GEMV above should have handled this.
+        warn_dequant_materialize_at_decode(
+            x_2d.dim(0)?,
+            "QtipLayer::forward_dequantize fallback (full dequantize+matmul)",
+        );
+
         let (x_for_matmul, w_for_matmul) = if self.rotation_block >= 2 {
             let signs = match &self.rotation_signs {
                 Some(t) => t.to_device(&Device::Cpu)?.to_vec1::<f32>()?,
@@ -2029,12 +2078,20 @@ impl QuantMethod for QtipLayer {
                     // (RUN-161)
                     return self.gather_forward_cuda_ondevice(a, indices);
                 }
+                // Reaching here with a decode-shaped n_tokens means the
+                // on-device fused path was disabled — the per-expert
+                // dequantize below materializes weights to HBM.
+                warn_dequant_materialize_at_decode(
+                    n_tokens,
+                    "QtipLayer::gather_forward_cuda (per-expert dequantize+matmul)",
+                );
                 if let Ok(out) = self.gather_forward_cuda(a, indices) {
                     return Ok(out);
                 }
             }
         }
 
+        warn_dequant_materialize_at_decode(n_tokens, "QtipLayer::gather_forward_cpu");
         self.gather_forward_cpu(a, indices)
     }
 
