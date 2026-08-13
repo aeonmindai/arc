@@ -60,6 +60,8 @@ pub mod bitshift;
 mod cuda_ops;
 #[cfg(feature = "cuda")]
 mod ffi;
+#[cfg(test)]
+mod bake_quality_tests;
 mod viterbi;
 pub use bitshift::{Qtip2bLayer, QTIP2B_MCG_MULT};
 #[allow(unused_imports)]
@@ -342,6 +344,26 @@ pub enum QtipMode {
     /// Globally optimal symbol sequence via dynamic-programming search over the trellis.
     /// Matches Cornell's paper numbers; slower at calibration time but quantization is one-shot.
     Viterbi,
+}
+
+impl QtipMode {
+    /// The mode the production ISQ path (`--isq qtip2`) uses for 3-D MoE
+    /// expert stacks. This is THE bake-quality decision point: Greedy also
+    /// disables the Hadamard incoherence rotation (`quantize_with_mode`), so
+    /// this choice controls search quality AND incoherence processing for
+    /// essentially all of a MoE model's weight mass.
+    ///
+    /// Current default: Greedy unless `ARC_QTIP_EXPERT_VITERBI=1` — measured
+    /// matmul cos on real V4 experts: greedy=0.887 vs viterbi=0.962, and PPL
+    /// qtip2=58.85 vs q2k=22.50 (H200, 2026-08-13) traces directly to this
+    /// default. See `bake_quality_tests::bake_quality_regression_default_expert_path`.
+    pub fn default_expert_mode() -> Self {
+        if std::env::var_os("ARC_QTIP_EXPERT_VITERBI").is_some() {
+            QtipMode::Viterbi
+        } else {
+            QtipMode::Greedy
+        }
+    }
 }
 
 impl QtipLayer {
