@@ -3291,6 +3291,27 @@ impl IsqModelLoader for DeepSeekV4Loader {
                 }
             }
         }
+        // Full MTP decoder block (loaded when `--mtp-depth > 0`): its routed
+        // experts get the SAME expert-only ISQ treatment as the main layers
+        // (~3GB FP8 → ~800MB at qtip2). Both the V4-native (`mtp.0.ffn.*`)
+        // and HF (`mtp.layers.0.mlp.*`) paths are covered. Norms
+        // (hnorm/enorm/norm/attn_norm/ffn_norm/q_norm/kv_norm) and the
+        // router gate are deliberately NOT matched, mirroring the main model.
+        if let Some(n_routed_experts) = cfg.n_routed_experts {
+            for i in 0..n_routed_experts {
+                data.extend(vec![
+                    Regex::new(&format!(
+                        r"mtp\.(layers\.)?\d+\.(mlp|ffn)\.experts\.{i}\.gate_proj\.(weight|bias)$"
+                    ))?,
+                    Regex::new(&format!(
+                        r"mtp\.(layers\.)?\d+\.(mlp|ffn)\.experts\.{i}\.up_proj\.(weight|bias)$"
+                    ))?,
+                    Regex::new(&format!(
+                        r"mtp\.(layers\.)?\d+\.(mlp|ffn)\.experts\.{i}\.down_proj\.(weight|bias)$"
+                    ))?,
+                ]);
+            }
+        }
         Ok(data)
     }
     fn immediate_isq_predicates(&self, config: &str) -> Result<Vec<Regex>> {

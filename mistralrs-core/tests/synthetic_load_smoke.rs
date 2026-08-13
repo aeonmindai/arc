@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use candle_core::{DType, Device, Result as CandleResult, Tensor};
+use candle_core::{DType, Device, Module, Result as CandleResult, Tensor};
 use indicatif::MultiProgress;
 
 use mistralrs_core::{
@@ -238,119 +238,157 @@ mod v4 {
     /// auto-detection (`deepseek4.rs:762-770`) accepts this fallback path.
     pub fn synthetic_v4_weights(device: &Device) -> CandleResult<HashMap<String, Tensor>> {
         let mut t = HashMap::new();
-        let inserter = &mut |name: String, tensor: Tensor| {
-            t.insert(name, tensor);
-        };
         let z = |s: &[usize]| zeros(s, device);
         let o = |s: &[usize]| ones(s, device);
 
         // ---------- globals (HF naming) ----------
-        inserter(
+        t.insert(
             "model.embed_tokens.weight".to_string(),
             o(&[VOCAB_SIZE, HIDDEN_SIZE])?,
         );
-        inserter("model.norm.weight".to_string(), o(&[HIDDEN_SIZE])?);
-        inserter("lm_head.weight".to_string(), z(&[VOCAB_SIZE, HIDDEN_SIZE])?);
+        t.insert("model.norm.weight".to_string(), o(&[HIDDEN_SIZE])?);
+        t.insert("lm_head.weight".to_string(), z(&[VOCAB_SIZE, HIDDEN_SIZE])?);
 
         for i in 0..NUM_LAYERS {
-            let l = format!("model.layers.{i}");
-
-            // layer norms (ones — keeps the residual stream non-zero)
-            inserter(format!("{l}.input_layernorm.weight"), o(&[HIDDEN_SIZE])?);
-            inserter(
-                format!("{l}.post_attention_layernorm.weight"),
-                o(&[HIDDEN_SIZE])?,
-            );
-
-            // Q LoRA: q_a_proj + q_a_layernorm + q_b_proj
-            // (loader probes V4-native `wq_a`/`q_norm` first; with no such
-            // tensors it falls back to HF `q_a_proj`/`q_a_layernorm`.)
-            inserter(
-                format!("{l}.self_attn.q_a_proj.weight"),
-                z(&[Q_LORA_RANK, HIDDEN_SIZE])?,
-            );
-            inserter(
-                format!("{l}.self_attn.q_a_layernorm.weight"),
-                o(&[Q_LORA_RANK])?,
-            );
-            inserter(
-                format!("{l}.self_attn.q_b_proj.weight"),
-                z(&[NUM_ATTN_HEADS * HEAD_DIM, Q_LORA_RANK])?,
-            );
-
-            // V4 fused wkv (HF-legacy naming `kv_a_proj_with_mqa`): output dim
-            // = head_dim (a SINGLE MQA head — V4 absorbs V into K). The V4
-            // loader's auto-detection (`deepseek4.rs:762-770`) accepts this
-            // V3-style fallback for synthetic / older checkpoints.
-            inserter(
-                format!("{l}.self_attn.kv_a_proj_with_mqa.weight"),
-                z(&[HEAD_DIM, HIDDEN_SIZE])?,
-            );
-            // kv_norm over head_dim (HF-legacy naming `kv_a_layernorm`).
-            inserter(
-                format!("{l}.self_attn.kv_a_layernorm.weight"),
-                o(&[HEAD_DIM])?,
-            );
-
-            // Grouped o_proj LoRA (HF naming `o_a_proj`/`o_b_proj`).
-            // wo_a in = num_heads*head_dim/o_groups; wo_a out = o_groups*o_lora_rank.
-            let wo_a_in = NUM_ATTN_HEADS * HEAD_DIM / O_GROUPS.max(1);
-            let o_inner = O_GROUPS * O_LORA_RANK;
-            inserter(
-                format!("{l}.self_attn.o_a_proj.weight"),
-                z(&[o_inner, wo_a_in])?,
-            );
-            inserter(
-                format!("{l}.self_attn.o_b_proj.weight"),
-                z(&[HIDDEN_SIZE, o_inner])?,
-            );
-
-            // ---- MoE block: every layer is MoE (first_k_dense_replace=0) ----
-            // gate.weight: [n_routed_experts, hidden]
-            inserter(
-                format!("{l}.mlp.gate.weight"),
-                z(&[NUM_ROUTED_EXPERTS, HIDDEN_SIZE])?,
-            );
-            // TD-MoE hash-routing table (RUN-161): layers < num_hash_layers
-            // (default 3 — with NUM_LAYERS=2 every layer hash-routes) require
-            // `gate.tid2eid`, a fixed token-id -> expert-id map of shape
-            // [vocab_size, top_k], dtype I64. All-zeros routes every token to
-            // expert 0, which is fine for a load/forward smoke.
-            inserter(
-                format!("{l}.mlp.gate.tid2eid"),
-                Tensor::zeros(
-                    &[VOCAB_SIZE, NUM_EXPERTS_PER_TOK],
-                    DType::I64,
-                    device,
-                )?,
-            );
-            // PackedExperts (Slow backend on CPU, unquantized) reads STACKED
-            // `gate_up_proj` (one tensor for both gate+up, dim 2 doubled) and
-            // `down_proj`. Shapes per `mistralrs-quant::PackedExperts::new` in
-            // `mistralrs-quant/src/distributed/layers.rs:1377`.
-            inserter(
-                format!("{l}.mlp.experts.gate_up_proj"),
-                z(&[NUM_ROUTED_EXPERTS, HIDDEN_SIZE, 2 * MOE_INTERMEDIATE_SIZE])?,
-            );
-            inserter(
-                format!("{l}.mlp.experts.down_proj"),
-                z(&[NUM_ROUTED_EXPERTS, MOE_INTERMEDIATE_SIZE, HIDDEN_SIZE])?,
-            );
-            // Shared experts (Mlp::new — `gate_proj`/`up_proj`/`down_proj`).
-            let shared_inter = MOE_INTERMEDIATE_SIZE * NUM_SHARED_EXPERTS;
-            inserter(
-                format!("{l}.mlp.shared_experts.gate_proj.weight"),
-                z(&[shared_inter, HIDDEN_SIZE])?,
-            );
-            inserter(
-                format!("{l}.mlp.shared_experts.up_proj.weight"),
-                z(&[shared_inter, HIDDEN_SIZE])?,
-            );
-            inserter(
-                format!("{l}.mlp.shared_experts.down_proj.weight"),
-                z(&[HIDDEN_SIZE, shared_inter])?,
-            );
+            insert_v4_decoder_layer_tensors(&mut t, &format!("model.layers.{i}"), device)?;
         }
+        Ok(t)
+    }
+
+    /// Synthesise one full V4 decoder layer (attention + MoE) at `prefix`.
+    /// Shared between the main `model.layers.{i}` stack and the MTP block at
+    /// `mtp.layers.0` — the MTP block IS a V4 decoder layer (audit §2 "MTP
+    /// module"), so the tensor contract is identical by construction.
+    pub fn insert_v4_decoder_layer_tensors(
+        t: &mut HashMap<String, Tensor>,
+        prefix: &str,
+        device: &Device,
+    ) -> CandleResult<()> {
+        let l = prefix;
+        let z = |s: &[usize]| zeros(s, device);
+        let o = |s: &[usize]| ones(s, device);
+
+        // layer norms (ones — keeps the residual stream non-zero)
+        t.insert(format!("{l}.input_layernorm.weight"), o(&[HIDDEN_SIZE])?);
+        t.insert(
+            format!("{l}.post_attention_layernorm.weight"),
+            o(&[HIDDEN_SIZE])?,
+        );
+
+        // Q LoRA: q_a_proj + q_a_layernorm + q_b_proj
+        // (loader probes V4-native `wq_a`/`q_norm` first; with no such
+        // tensors it falls back to HF `q_a_proj`/`q_a_layernorm`.)
+        t.insert(
+            format!("{l}.self_attn.q_a_proj.weight"),
+            z(&[Q_LORA_RANK, HIDDEN_SIZE])?,
+        );
+        t.insert(
+            format!("{l}.self_attn.q_a_layernorm.weight"),
+            o(&[Q_LORA_RANK])?,
+        );
+        t.insert(
+            format!("{l}.self_attn.q_b_proj.weight"),
+            z(&[NUM_ATTN_HEADS * HEAD_DIM, Q_LORA_RANK])?,
+        );
+
+        // V4 fused wkv (HF-legacy naming `kv_a_proj_with_mqa`): output dim
+        // = head_dim (a SINGLE MQA head — V4 absorbs V into K). The V4
+        // loader's auto-detection (`deepseek4.rs:762-770`) accepts this
+        // V3-style fallback for synthetic / older checkpoints.
+        t.insert(
+            format!("{l}.self_attn.kv_a_proj_with_mqa.weight"),
+            z(&[HEAD_DIM, HIDDEN_SIZE])?,
+        );
+        // kv_norm over head_dim (HF-legacy naming `kv_a_layernorm`).
+        t.insert(
+            format!("{l}.self_attn.kv_a_layernorm.weight"),
+            o(&[HEAD_DIM])?,
+        );
+
+        // Grouped o_proj LoRA (HF naming `o_a_proj`/`o_b_proj`).
+        // wo_a in = num_heads*head_dim/o_groups; wo_a out = o_groups*o_lora_rank.
+        let wo_a_in = NUM_ATTN_HEADS * HEAD_DIM / O_GROUPS.max(1);
+        let o_inner = O_GROUPS * O_LORA_RANK;
+        t.insert(
+            format!("{l}.self_attn.o_a_proj.weight"),
+            z(&[o_inner, wo_a_in])?,
+        );
+        t.insert(
+            format!("{l}.self_attn.o_b_proj.weight"),
+            z(&[HIDDEN_SIZE, o_inner])?,
+        );
+
+        // ---- MoE block: every layer is MoE (first_k_dense_replace=0) ----
+        // gate.weight: [n_routed_experts, hidden]
+        t.insert(
+            format!("{l}.mlp.gate.weight"),
+            z(&[NUM_ROUTED_EXPERTS, HIDDEN_SIZE])?,
+        );
+        // TD-MoE hash-routing table (RUN-161): layers < num_hash_layers
+        // (default 3 — with NUM_LAYERS=2 every layer hash-routes, and so
+        // does the MTP block at virtual layer index 2) require
+        // `gate.tid2eid`, a fixed token-id -> expert-id map of shape
+        // [vocab_size, top_k], dtype I64. All-zeros routes every token to
+        // expert 0, which is fine for a load/forward smoke.
+        t.insert(
+            format!("{l}.mlp.gate.tid2eid"),
+            Tensor::zeros(&[VOCAB_SIZE, NUM_EXPERTS_PER_TOK], DType::I64, device)?,
+        );
+        // PackedExperts (Slow backend on CPU, unquantized) reads STACKED
+        // `gate_up_proj` (one tensor for both gate+up, dim 2 doubled) and
+        // `down_proj`. Shapes per `mistralrs-quant::PackedExperts::new` in
+        // `mistralrs-quant/src/distributed/layers.rs:1377`.
+        t.insert(
+            format!("{l}.mlp.experts.gate_up_proj"),
+            z(&[NUM_ROUTED_EXPERTS, HIDDEN_SIZE, 2 * MOE_INTERMEDIATE_SIZE])?,
+        );
+        t.insert(
+            format!("{l}.mlp.experts.down_proj"),
+            z(&[NUM_ROUTED_EXPERTS, MOE_INTERMEDIATE_SIZE, HIDDEN_SIZE])?,
+        );
+        // Shared experts (Mlp::new — `gate_proj`/`up_proj`/`down_proj`).
+        let shared_inter = MOE_INTERMEDIATE_SIZE * NUM_SHARED_EXPERTS;
+        t.insert(
+            format!("{l}.mlp.shared_experts.gate_proj.weight"),
+            z(&[shared_inter, HIDDEN_SIZE])?,
+        );
+        t.insert(
+            format!("{l}.mlp.shared_experts.up_proj.weight"),
+            z(&[shared_inter, HIDDEN_SIZE])?,
+        );
+        t.insert(
+            format!("{l}.mlp.shared_experts.down_proj.weight"),
+            z(&[HIDDEN_SIZE, shared_inter])?,
+        );
+        Ok(())
+    }
+
+    /// The V4 fixture plus the FULL `mtp.layers.0.*` module: the light
+    /// `h_proj`/`e_proj` heads, the `hnorm`/`enorm`/`norm` wrapper norms, and
+    /// a complete decoder layer (attention + MoE) — the tensor set the real
+    /// V4 Flash checkpoint ships at `mtp.0.*` per `research/v4_audit.md` §2
+    /// ("MTP module"), in HF naming.
+    pub fn synthetic_v4_weights_with_mtp(device: &Device) -> CandleResult<HashMap<String, Tensor>> {
+        let mut t = synthetic_v4_weights(device)?;
+        let l = "mtp.layers.0";
+        let z = |s: &[usize]| zeros(s, device);
+        let o = |s: &[usize]| ones(s, device);
+
+        // Light heads (always loaded when present).
+        t.insert(
+            format!("{l}.h_proj.weight"),
+            z(&[HIDDEN_SIZE, HIDDEN_SIZE])?,
+        );
+        t.insert(
+            format!("{l}.e_proj.weight"),
+            z(&[HIDDEN_SIZE, HIDDEN_SIZE])?,
+        );
+        // Wrapper norms for the full block.
+        t.insert(format!("{l}.hnorm.weight"), o(&[HIDDEN_SIZE])?);
+        t.insert(format!("{l}.enorm.weight"), o(&[HIDDEN_SIZE])?);
+        t.insert(format!("{l}.norm.weight"), o(&[HIDDEN_SIZE])?);
+        // The full decoder layer (attention + MoE) at the MTP root.
+        insert_v4_decoder_layer_tensors(&mut t, l, device)?;
         Ok(t)
     }
 
@@ -450,6 +488,101 @@ fn v4_flash_synthetic_load_smoke() {
     let logits2 =
         run_forward_smoke(model.as_ref(), &input_ids).expect("V4 second forward must succeed");
     assert_eq!(logits.dims(), logits2.dims(), "V4 shape drifted on rerun");
+}
+
+/// Full MTP block load + draft-chain smoke (feat/mtp-full-block).
+///
+/// The real V4 Flash checkpoint ships a FULL decoder layer (attention +
+/// 256-expert MoE) at `mtp.0.*` alongside `h_proj`/`e_proj`/`hnorm`/`enorm`/
+/// `norm` (audit §2 "MTP module"). This test synthesises that tensor set (HF
+/// naming, `mtp.layers.0.*`) and asserts:
+///   1. With `mtp_load_depth == 0` (the default) the block is NOT loaded —
+///      the ~3GB module must never cost memory when MTP is off — while the
+///      light heads still are (kit exists, `has_full_block() == false`).
+///   2. With `mtp_load_depth > 0` the block loads, and a depth-2 draft chain
+///      flows through the real transformer step (embedding combine → decoder
+///      layer with per-chain KV cache → norm → lm_head) producing in-vocab
+///      tokens.
+#[test]
+fn v4_flash_mtp_full_block_load_smoke() {
+    let device = Device::Cpu;
+    let config = v4::config_json();
+
+    // ---- Gate check: depth 0 → heads-only, no block. ----
+    mistralrs_core::set_mtp_load_depth(0);
+    let tensors = v4::synthetic_v4_weights_with_mtp(&device)
+        .expect("V4+MTP synthetic tensor construction must not fail");
+    let vb = wrap_as_vb(tensors, &device);
+    let model = DeepSeekV4Loader
+        .load(
+            &config,
+            vb,
+            make_metadata(&device),
+            AttentionImplementation::Eager,
+        )
+        .expect("V4 load with MTP tensors present + depth=0 must succeed");
+    let kit = model
+        .mtp_decode_kit()
+        .expect("mtp.layers.0.h_proj present -> the light MTP kit must exist");
+    assert!(
+        !kit.has_full_block(),
+        "mtp_load_depth == 0 must NOT load the full MTP block (memory gate)"
+    );
+
+    // ---- Full-block path: depth > 0 loads the decoder block. ----
+    mistralrs_core::set_mtp_load_depth(2);
+    let tensors = v4::synthetic_v4_weights_with_mtp(&device)
+        .expect("V4+MTP synthetic tensor construction must not fail");
+    let vb = wrap_as_vb(tensors, &device);
+    let model = DeepSeekV4Loader
+        .load(
+            &config,
+            vb,
+            make_metadata(&device),
+            AttentionImplementation::Eager,
+        )
+        .expect(
+            "V4 load with the full mtp.layers.0.* module must succeed. A \
+             missing-tensor error here means the MtpBlock loader drifted from \
+             the audit §2 MTP schema (or the fixture is stale).",
+        );
+    // Reset the process-wide gate before any assertion can panic, so a
+    // failure here can't leak depth>0 into concurrently-running tests.
+    mistralrs_core::set_mtp_load_depth(0);
+
+    let kit = model
+        .mtp_decode_kit()
+        .expect("MTP kit must exist when mtp tensors are present");
+    assert!(
+        kit.has_full_block(),
+        "mtp_load_depth > 0 + full mtp.layers.0.* tensors must load the block"
+    );
+
+    // Draft a 2-token chain through the real block: seed hidden state from
+    // the embedding of token 1 (the pipeline's Tier-A seeding), positions
+    // starting at 0 (empty target cache in this synthetic setting).
+    let seed_tok = Tensor::from_vec(vec![1u32], (1,), &device).unwrap();
+    let seed_hidden = kit
+        .embed_tokens
+        .forward(&seed_tok)
+        .expect("embedding the seed token must succeed");
+    let toks = kit
+        .propose_chain(
+            &seed_hidden,
+            1,
+            /*depth=*/ 2,
+            /*max_tokens=*/ 8,
+            /*start_pos=*/ 0,
+        )
+        .expect("MTP full-block draft chain must not error");
+    assert_eq!(toks.len(), 2, "depth-2 chain must yield exactly 2 tokens");
+    for t in &toks {
+        assert!(
+            (*t as usize) < v4::VOCAB_SIZE,
+            "draft token {t} out of vocab range {}",
+            v4::VOCAB_SIZE
+        );
+    }
 }
 
 // ===========================================================================

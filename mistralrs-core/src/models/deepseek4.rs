@@ -60,9 +60,12 @@
 //! - `attn_sink` actually fed into the SDPA softmax — the tensor is loaded
 //!   and stored on `SdpaParams.sinks` (broadcastable shape), and the
 //!   sinks-aware kernel reads it when present.
-//! - MTP transformer-block forward (load-only here; `MtpSpeculativePipeline`
-//!   does drafting via `MtpDecodeKit` and only needs `embed_tokens/
-//!   lm_head/h_proj/e_proj`).
+//! - MTP drafting itself (`MtpSpeculativePipeline` drives it via
+//!   `MtpDecodeKit`). This file loads the light `h_proj`/`e_proj` heads
+//!   always, and the FULL `mtp.0.*` decoder block ([`MtpBlock`]: attention
+//!   + 256-expert MoE + hnorm/enorm/norm) when `--mtp-depth > 0` was
+//!   declared before load — plus the block's single-token forward that the
+//!   draft chain calls.
 //! - FP8 native-to-HF tensor name remap (`*.scale → *.weight_scale_inv`).
 //!   Handled by [`mistralrs_quant::attach_rename_rules`] called from
 //!   [`crate::pipeline::loaders::normal_loaders::DeepSeekV4Loader::load`]
@@ -2520,19 +2523,291 @@ impl DecoderLayer {
     }
 }
 
+/// Device-mapper adapter that pins every per-layer call to a fixed layer
+/// index. The MTP block lives at virtual layer `num_hidden_layers` (43 for
+/// V4 Flash) — an index the real mapper's `mappings` table does not cover
+/// (it would panic). Pinning to the LAST mapped layer co-locates the MTP
+/// block with the final decoder layer + lm_head, which is where the draft
+/// path's inputs (last hidden state, embeddings) already are.
+#[derive(Debug)]
+struct PinnedLayerMapper<'a> {
+    inner: &'a dyn DeviceMapper,
+    pin: usize,
+}
+
+impl DeviceMapper for PinnedLayerMapper<'_> {
+    fn map(&self, input: Tensor, _: usize) -> Result<Tensor> {
+        self.inner.map(input, self.pin)
+    }
+    fn set_device(
+        &self,
+        _: usize,
+        varbuilder: ShardedVarBuilder,
+        loading_isq: bool,
+    ) -> ShardedVarBuilder {
+        self.inner.set_device(self.pin, varbuilder, loading_isq)
+    }
+    fn device_for(&self, _: usize, loading_isq: bool) -> Option<&Device> {
+        self.inner.device_for(self.pin, loading_isq)
+    }
+    fn get_unique_devices(&self) -> Vec<Device> {
+        self.inner.get_unique_devices()
+    }
+    fn cast_nm_device(&self, x: &Tensor, loading_isq: bool) -> Result<Tensor> {
+        self.inner.cast_nm_device(x, loading_isq)
+    }
+    fn set_nm_device(&self, varbuilder: ShardedVarBuilder, loading_isq: bool) -> ShardedVarBuilder {
+        self.inner.set_nm_device(varbuilder, loading_isq)
+    }
+    fn num_device_mapping_layers(&self) -> usize {
+        self.inner.num_device_mapping_layers()
+    }
+    fn get_comm_for(&self, _: usize) -> Result<Arc<mistralrs_quant::Comm>> {
+        self.inner.get_comm_for(self.pin)
+    }
+    fn get_min_dtype(&self, dtype: &dyn crate::TryIntoDType) -> Result<DType> {
+        self.inner.get_min_dtype(dtype)
+    }
+}
+
+/// V4 MTP transformer block — the FULL decoder layer the checkpoint ships at
+/// `mtp.0.*` (native) / `mtp.layers.0.*` (HF): V4-shape attention (LoRA Q +
+/// fused wkv + grouped o_proj) + the complete 256-expert MoE, wrapped with
+/// the `hnorm`/`enorm` input norms and the `norm` head norm. Audit §0 + §2
+/// ("MTP module") + `deepseek_v4_nextn.py:50-201`.
+///
+/// Loaded only when `--mtp-depth > 0`
+/// ([`crate::pipeline::mtp_pipeline::set_mtp_load_depth`]) — ~3GB at FP8 —
+/// and consumed by `MtpDecodeKit` in `pipeline/mtp_pipeline.rs`, where the
+/// draft chain runs `h/e combine → decoder layer → norm → lm_head`.
+pub struct MtpBlock {
+    /// RMSNorm over the previous-step hidden state (`mtp.0.hnorm`).
+    hnorm: RmsNorm,
+    /// RMSNorm over the current-token embedding (`mtp.0.enorm`).
+    enorm: RmsNorm,
+    /// Final RMSNorm before the shared lm_head (`mtp.0.norm` — SGLang's
+    /// `shared_head.norm`).
+    out_norm: RmsNorm,
+    /// The full V4 decoder layer (attention + MoE + optional per-layer mHC).
+    /// `compress_ratio` is Standard per `COMPRESS_RATIO_NEXTN_LAYER = 0`.
+    layer: DecoderLayer,
+    /// Empty (non-varlen) flash params for the single-token draft steps.
+    flash_params: FlashParams,
+    /// Device the block's weights live on (for input hand-off).
+    device: Device,
+    max_seq_len: usize,
+}
+
+impl MtpBlock {
+    /// Try to load the full MTP decoder block from `vb` (positioned at
+    /// `mtp.0` / `mtp.layers.0`). Returns `Ok(None)` when the checkpoint
+    /// only ships the light `h_proj`/`e_proj` heads (older exports) — the
+    /// caller then keeps the Tier-A projection-only draft path.
+    fn try_new(
+        cfg: &DeepSeekV4Config,
+        vb: ShardedVarBuilder,
+        mapper: &dyn DeviceMapper,
+        loading_isq: bool,
+        real_device: &Device,
+    ) -> Result<Option<Self>> {
+        // Presence probe: the block requires its wrapper norms plus a decoder
+        // layer (native `attn_norm` / HF `input_layernorm` naming).
+        let has_decoder =
+            vb.contains_tensor("attn_norm.weight") || vb.contains_tensor("input_layernorm.weight");
+        let has_wrappers = vb.contains_tensor("hnorm.weight")
+            && vb.contains_tensor("enorm.weight")
+            && vb.contains_tensor("norm.weight");
+        if !has_decoder || !has_wrappers {
+            return Ok(None);
+        }
+
+        // The MTP block is a VIRTUAL extra layer: config decisions (compress
+        // ratio, hash-vs-score routing) use index `num_hidden_layers`; device
+        // decisions pin to the last real layer (see `PinnedLayerMapper`).
+        let layer_idx = cfg.num_hidden_layers;
+        let pinned = PinnedLayerMapper {
+            inner: mapper,
+            pin: cfg.num_hidden_layers.saturating_sub(1),
+        };
+        let device = pinned
+            .device_for(layer_idx, false)
+            .cloned()
+            .unwrap_or_else(|| real_device.clone());
+
+        // MTP attention is standard MQA (`COMPRESS_RATIO_NEXTN_LAYER = 0`,
+        // audit §2) → standard-θ RoPE, same YARN handling as the main
+        // standard layers (see the rope construction in `DeepSeekV4::new`).
+        let rope_cfg = DeepSeekV2RopeConfig {
+            rope_scaling: if std::env::var_os("ARC_DISABLE_YARN_STD").is_some() {
+                None
+            } else {
+                cfg.rope_scaling.clone()
+            },
+            max_position_embeddings: cfg.max_position_embeddings,
+            rope_theta: cfg.rope_theta,
+            qk_rope_head_dim: cfg.qk_rope_head_dim,
+        };
+        let rotary_emb = Arc::new(DeepSeekV2RotaryEmbedding::new(
+            &rope_cfg,
+            vb.dtype(),
+            &device,
+        )?);
+        let comm = pinned.get_comm_for(layer_idx)?;
+
+        let layer = DecoderLayer::new(
+            rotary_emb,
+            cfg,
+            vb.clone(),
+            &pinned,
+            layer_idx,
+            loading_isq,
+            // The MTP chain keeps its own in-process `KvCache`; the engine's
+            // PagedAttention never manages MTP slots.
+            None,
+            &comm,
+            device.clone(),
+        )?;
+
+        let hnorm = RmsNorm::new(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            pinned.set_device(layer_idx, vb.pp("hnorm"), false),
+        )?;
+        let enorm = RmsNorm::new(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            pinned.set_device(layer_idx, vb.pp("enorm"), false),
+        )?;
+        let out_norm = RmsNorm::new(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            pinned.set_device(layer_idx, vb.pp("norm"), false),
+        )?;
+
+        Ok(Some(Self {
+            hnorm,
+            enorm,
+            out_norm,
+            layer,
+            flash_params: FlashParams {
+                max_q: 0,
+                max_k: 0,
+                cumulative_seqlens_q: HashMap::new(),
+                cumulative_seqlens_k: HashMap::new(),
+                causal: true,
+            },
+            device,
+            max_seq_len: cfg.max_position_embeddings,
+        }))
+    }
+
+    /// Fresh per-draft-chain KV cache (dim 2 = the sequence axis, matching
+    /// `NormalCache::new`). One chain never sees another chain's (possibly
+    /// rejected) draft tokens.
+    pub fn new_chain_cache(&self) -> KvCache {
+        KvCache::new_normal(2, self.max_seq_len, 16)
+    }
+
+    /// `hnorm` over the previous-step hidden state.
+    pub fn norm_h(&self, h: &Tensor) -> Result<Tensor> {
+        self.hnorm.forward(&h.to_device(&self.device)?)
+    }
+
+    /// `enorm` over the current-token embedding.
+    pub fn norm_e(&self, e: &Tensor) -> Result<Tensor> {
+        self.enorm.forward(&e.to_device(&self.device)?)
+    }
+
+    /// Final `norm` (SGLang `shared_head.norm`) before the shared lm_head.
+    pub fn norm_out(&self, xs: &Tensor) -> Result<Tensor> {
+        self.out_norm.forward(xs)
+    }
+
+    /// Run the combined `h_proj + e_proj` state through the real MTP decoder
+    /// layer for ONE draft token.
+    ///
+    /// * `fused`: `[B, 1, hidden]` — `h_proj(hnorm(h)) + e_proj(enorm(e))`.
+    /// * `pos`: absolute sequence position of this draft token (RoPE).
+    /// * `cache`: the per-chain KV cache from [`Self::new_chain_cache`];
+    ///   draft token `i` attends over draft tokens `0..=i` of its chain.
+    /// * `input_ids`: `[B, 1]` current token ids — required by the
+    ///   hash-routed (`tid2eid`) MoE gate; ignored by score-routed gates.
+    ///
+    /// Returns the decoder output `[B, 1, hidden]` (pre-`norm`; the caller
+    /// applies [`Self::norm_out`] before lm_head and feeds THIS tensor
+    /// forward as the next step's hidden state, matching the reference).
+    ///
+    /// Uses the 3-D decoder path: when the checkpoint ships the per-layer
+    /// mHC tensors, `DecoderLayer::forward` applies the learned
+    /// `hc_attn_*`/`hc_ffn_*` blend via the 3-D bridge (RUN-169); otherwise
+    /// it falls back to standard residuals.
+    pub fn forward_step(
+        &self,
+        fused: &Tensor,
+        pos: usize,
+        cache: &mut KvCache,
+        input_ids: &Tensor,
+    ) -> Result<Tensor> {
+        let in_device = fused.device().clone();
+        let xs = fused.to_device(&self.device)?;
+        let ids = input_ids.to_device(&self.device)?;
+        let seqlen_offsets = [pos];
+        let out = self.layer.forward(
+            &xs,
+            // Single-token step: attends over the whole chain cache, no mask.
+            None,
+            &seqlen_offsets,
+            cache,
+            None,
+            &self.flash_params,
+            Some(&ids),
+        )?;
+        out.to_device(&in_device)
+    }
+
+    /// ISQ handles for the block's quantizable projections: attention
+    /// (wq_a/wq_b or plain q, wkv, wo_a, wo_b) + the MoE experts (routed +
+    /// shared). Norms (`hnorm`/`enorm`/`norm`/`attn_norm`/`ffn_norm`/
+    /// `q_norm`/`kv_norm`) and the router gate are excluded, matching the
+    /// main model's `get_layers`.
+    fn isq_layers(&mut self) -> Vec<&mut Arc<dyn QuantMethod>> {
+        let mut tensors = Vec::new();
+        match &mut self.layer.attn.q {
+            QProj::Plain(q) => tensors.push(q),
+            QProj::Lora { a, norm: _, b } => {
+                tensors.push(a);
+                tensors.push(b);
+            }
+        }
+        tensors.push(&mut self.layer.attn.wkv);
+        tensors.push(&mut self.layer.attn.wo_a);
+        tensors.push(&mut self.layer.attn.wo_b);
+        match &mut self.layer.moe_or_mlp {
+            MoeOrMlp::Mlp(mlp) => {
+                tensors.push(&mut mlp.gate);
+                tensors.push(&mut mlp.up);
+                tensors.push(&mut mlp.down);
+            }
+            MoeOrMlp::Moe(moe) => tensors.extend(moe.get_isq_layers()),
+        }
+        tensors
+    }
+}
+
 /// V4 MTP head.
 ///
-/// V4 Flash actually ships a full transformer decoder layer + 256-expert
-/// MoE block at `mtp.0.*`. We load the two projection layers `h_proj` and
-/// `e_proj` — the only tensors `MtpDecodeKit` consumes for the Tier A
-/// drafting in `pipeline/mtp_pipeline.rs::MtpDecodeKit::step`.
-///
-/// The remaining MTP weights (full attn + ffn + hc_*) are loaded lazily by
-/// the MTP-pipeline follow-up agent that turns MTP into a real transformer
-/// step. Audit §0 + §2 ("MTP module").
+/// V4 Flash ships a full transformer decoder layer + 256-expert MoE block
+/// at `mtp.0.*`. The two projection layers `h_proj` and `e_proj` are always
+/// loaded when present (cheap: 2 × `[hidden, hidden]`); the full decoder
+/// block ([`MtpBlock`]) is loaded ONLY when `--mtp-depth > 0` was declared
+/// before load (memory: ~3GB FP8 / ~800MB after qtip2 ISQ). Audit §0 + §2
+/// ("MTP module").
 pub struct MtpHead {
     pub h_proj: Arc<dyn QuantMethod>,
     pub e_proj: Arc<dyn QuantMethod>,
+    /// Full MTP decoder block (attention + MoE + hnorm/enorm/norm).
+    /// `None` for heads-only loads (older exports or `--mtp-depth 0`).
+    pub block: Option<Arc<MtpBlock>>,
 }
 
 pub struct DeepSeekV4 {
@@ -2775,7 +3050,51 @@ impl DeepSeekV4 {
                     )
                 };
                 match (try_load("h_proj"), try_load("e_proj")) {
-                    (Ok(h_proj), Ok(e_proj)) => Some(MtpHead { h_proj, e_proj }),
+                    (Ok(h_proj), Ok(e_proj)) => {
+                        // Full MTP decoder block — gated on `--mtp-depth > 0`
+                        // (declared via `set_mtp_load_depth` before load).
+                        // Memory is precious: the block is ~3GB at FP8, so it
+                        // is skipped entirely when MTP drafting is disabled.
+                        let block = if crate::pipeline::mtp_pipeline::mtp_load_depth() > 0 {
+                            match MtpBlock::try_new(
+                                cfg,
+                                mtp_vb.clone(),
+                                &*mapper,
+                                normal_loading_metadata.loading_isq,
+                                &normal_loading_metadata.real_device,
+                            ) {
+                                Ok(Some(block)) => {
+                                    tracing::info!(
+                                        "V4 MTP: full decoder block loaded (attention + MoE); \
+                                         draft chain will run through the real transformer step"
+                                    );
+                                    Some(Arc::new(block))
+                                }
+                                Ok(None) => {
+                                    tracing::warn!(
+                                        "V4 MTP: --mtp-depth > 0 but the checkpoint only ships \
+                                         h_proj/e_proj (no mtp decoder tensors); falling back to \
+                                         Tier-A projection-only drafting (~50% acceptance)"
+                                    );
+                                    None
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "V4 MTP: full decoder block load failed ({e}); falling \
+                                         back to Tier-A projection-only drafting"
+                                    );
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        Some(MtpHead {
+                            h_proj,
+                            e_proj,
+                            block,
+                        })
+                    }
                     _ => None,
                 }
             } else {
@@ -3019,6 +3338,23 @@ impl IsqModel for DeepSeekV4 {
         if let Some(mtp) = &mut self.mtp_head {
             tensors.push((&mut mtp.h_proj, None));
             tensors.push((&mut mtp.e_proj, None));
+            // Full MTP block: same ISQ treatment as a regular layer (experts
+            // + attention projections; norms/router excluded inside
+            // `isq_layers`). The Arc is unique until `mtp_decode_kit()` is
+            // first called, which happens only after ISQ.
+            if let Some(block) = &mut mtp.block {
+                match Arc::get_mut(block) {
+                    Some(block) => {
+                        for t in block.isq_layers() {
+                            tensors.push((t, None));
+                        }
+                    }
+                    None => tracing::warn!(
+                        "V4 MTP block is shared (decode kit already handed out); \
+                         skipping its tensors for this ISQ pass"
+                    ),
+                }
+            }
         }
         (tensors, &*self.mapper)
     }
@@ -3064,6 +3400,19 @@ impl IsqModel for DeepSeekV4 {
         if let Some(mtp) = &mut self.mtp_head {
             tensors.push((&mut mtp.h_proj, None));
             tensors.push((&mut mtp.e_proj, None));
+            if let Some(block) = &mut mtp.block {
+                match Arc::get_mut(block) {
+                    Some(block) => {
+                        for t in block.isq_layers() {
+                            tensors.push((t, None));
+                        }
+                    }
+                    None => tracing::warn!(
+                        "V4 MTP block is shared (decode kit already handed out); \
+                         skipping its tensors for this ISQ pass"
+                    ),
+                }
+            }
         }
         (tensors, &*self.mapper)
     }
@@ -3258,15 +3607,14 @@ impl NormalModel for DeepSeekV4 {
     /// Expose the MTP decode kit when the checkpoint shipped MTP tensors.
     /// Used by [`crate::pipeline::MtpSpeculativePipeline`] to drive V4's
     /// native single-step speculative draft.
-    fn mtp_decode_kit(
-        &self,
-    ) -> Option<crate::pipeline::mtp_pipeline::MtpDecodeKit> {
+    fn mtp_decode_kit(&self) -> Option<crate::pipeline::mtp_pipeline::MtpDecodeKit> {
         let head = self.mtp_head.as_ref()?;
         Some(crate::pipeline::mtp_pipeline::MtpDecodeKit {
             embed_tokens: self.embed_tokens.clone(),
             lm_head: self.lm_head.clone(),
             h_proj: head.h_proj.clone(),
             e_proj: head.e_proj.clone(),
+            block: head.block.clone(),
         })
     }
 }
