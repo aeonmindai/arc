@@ -54,9 +54,11 @@
 //! Unlike the LUT rung there is **no codebook tensor**: only the 4-byte MCG
 //! multiplier is persisted (forward-compatible with future retuned
 //! constants). UQFF tag: [`QuantizedSerdeType::Qtip2b`]. 2-D vs 3-D
-//! (stacked-expert) layout is recovered from the rank of `blocks`, exactly
-//! like the LUT rung on master (PR #3's 3-D serialization work is kept
-//! parallel until it merges).
+//! (stacked-expert) layout is recovered from the self-describing rank of
+//! `blocks` — the same mechanism the LUT rung uses (UQFF v0.2.1, PR #3):
+//! rank-3 `blocks [E, N, packed_K]` / `row_scales [E, N]` share the 2-D
+//! field order with no extra header bytes, and 3-D stacks are bias-free by
+//! contract.
 //!
 //! ## Scope shipped here
 //!
@@ -1310,6 +1312,112 @@ impl QuantMethod for Qtip2bLayer {
     }
 }
 
+impl Qtip2bLayer {
+    /// Concrete-typed UQFF deserialize that returns a `Qtip2bLayer` (plus
+    /// the optional bias tensor) instead of `Arc<dyn QuantMethod>`. Shared
+    /// body of `deserialize` / `deserialize_ext_bias`; also usable by tests
+    /// to inspect typed fields without a `dyn`-downcast.
+    ///
+    /// Handles both storage modes:
+    /// - 2-D: `blocks [N, packed_K]`, `row_scales [N]` → `num_experts: None`
+    /// - 3-D: `blocks [E, N, packed_K]`, `row_scales [E, N]` →
+    ///   `num_experts: Some(E)`
+    ///
+    /// The mode is inferred from the self-describing tensor shapes (UQFF
+    /// tensor payloads carry rank + dims), so no extra header bytes are
+    /// needed — the same mechanism as the LUT rung's `deserialize_concrete`
+    /// (UQFF v0.2.1). Each tensor is deserialized in one shot (single host
+    /// buffer → single device upload) — no per-expert round-trips at load.
+    fn deserialize_concrete(
+        data: Cow<[u8]>,
+        device: &Device,
+        guard: QuantizeOntoGuard,
+    ) -> Result<(Self, Option<Tensor>)> {
+        let mut buffer = Cursor::new(data);
+
+        let version = buffer.read_u32::<LittleEndian>()?;
+        if let Err(e) = version_is_compatible(version) {
+            return Err(candle_core::Error::wrap(e));
+        }
+        let isq_type = buffer.read_u8()? as usize;
+        if isq_type != QuantizedSerdeType::Qtip2b as usize {
+            candle_core::bail!(
+                "ISQ type ({isq_type}) doesn't match expected QTIP2B type {}",
+                QuantizedSerdeType::Qtip2b as usize
+            );
+        }
+        let has_bias = buffer.read_u8()? != 0;
+        let in_features = buffer.read_u32::<LittleEndian>()? as usize;
+        let mcg_mult = buffer.read_u32::<LittleEndian>()?;
+
+        let _acquired_load_guard = guard.acquire(device);
+        let blocks = deserialize_tensor(&mut buffer, device)?;
+        let row_scales = deserialize_tensor(&mut buffer, device)?;
+
+        let num_experts = match blocks.dims().len() {
+            2 => None,
+            3 => {
+                let e = blocks.dim(0)?;
+                if row_scales.dims().len() != 2
+                    || row_scales.dim(0)? != e
+                    || row_scales.dim(1)? != blocks.dim(1)?
+                {
+                    candle_core::bail!(
+                        "Qtip2bLayer: 3-D blocks {:?} require row_scales [E, N]; got {:?}",
+                        blocks.dims(),
+                        row_scales.dims()
+                    );
+                }
+                if has_bias {
+                    // The serializer refuses to attach a bias to a 3-D
+                    // stack, so this indicates a corrupt payload.
+                    candle_core::bail!("Qtip2bLayer: 3-D stacked-expert payloads are bias-free");
+                }
+                Some(e)
+            }
+            other => {
+                candle_core::bail!(
+                    "Qtip2bLayer: blocks tensor must be rank 2 or 3, got rank {other}"
+                )
+            }
+        };
+
+        let bias = if has_bias {
+            Some(deserialize_tensor(&mut buffer, device)?)
+        } else {
+            None
+        };
+        let ext_bias = bias.clone();
+
+        let (rotation_signs, rotation_block) = match buffer.read_u8() {
+            Ok(0) => (None, 0usize),
+            Ok(1) => {
+                let block = buffer.read_u32::<LittleEndian>()? as usize;
+                let signs = deserialize_tensor(&mut buffer, device)?;
+                (Some(signs), block)
+            }
+            Ok(other) => candle_core::bail!(
+                "Qtip2bLayer: unexpected rotation-flag byte {other} (expected 0 or 1)"
+            ),
+            Err(_) => (None, 0usize),
+        };
+
+        Ok((
+            Self {
+                blocks,
+                row_scales,
+                bias,
+                in_features,
+                num_experts,
+                rotation_signs,
+                rotation_block,
+                mcg_mult,
+            },
+            ext_bias,
+        ))
+    }
+}
+
 impl QuantizedSerde for Qtip2bLayer {
     fn name(&self) -> &'static str {
         "qtip2b-layer"
@@ -1322,8 +1430,18 @@ impl QuantizedSerde for Qtip2bLayer {
     }
     fn serialize_with_bias(&self, bias: Option<Tensor>) -> Result<Cow<'_, [u8]>> {
         // No codebook tensor is persisted — only the 4-byte MCG multiplier.
-        // 3-D stacked-expert layers serialize by rank (blocks rank-3 carries
-        // the expert dim), the same scheme as the LUT rung on master.
+        // 2-D and 3-D stacked-expert layers share one field order: UQFF
+        // tensor payloads are self-describing (rank + dims), so the 3-D
+        // `blocks [E, N, packed_K]` / `row_scales [E, N]` round-trip through
+        // the same `serialize_tensor` calls as the 2-D layout — the same
+        // scheme as the LUT rung (PR #3). The deserializer infers the expert
+        // mode from the blocks rank — see `deserialize_concrete`.
+        if self.num_experts.is_some() && bias.is_some() {
+            // 3-D MoE stacks are bias-free (`quantize_with_options_3d` never
+            // attaches one); refuse rather than silently attach a single [N]
+            // bias vector to E experts.
+            candle_core::bail!("Qtip2bLayer::serialize: 3-D stacked-expert layers are bias-free");
+        }
         let mut buffer = Vec::new();
         buffer.extend(&UQFF_VERSION.to_le_bytes());
         buffer.push(QuantizedSerdeType::Qtip2b as u8);
@@ -1354,8 +1472,8 @@ impl QuantizedSerde for Qtip2bLayer {
     where
         Self: Sized,
     {
-        let (layer, _) = Self::deserialize_ext_bias(data, device, guard)?;
-        Ok(layer)
+        let (layer, _) = Self::deserialize_concrete(data, device, guard)?;
+        Ok(Arc::new(layer))
     }
     fn deserialize_ext_bias(
         data: Cow<[u8]>,
@@ -1365,65 +1483,8 @@ impl QuantizedSerde for Qtip2bLayer {
     where
         Self: Sized,
     {
-        let mut buffer = Cursor::new(data.to_vec());
-
-        let version = buffer.read_u32::<LittleEndian>()?;
-        if let Err(e) = version_is_compatible(version) {
-            return Err(candle_core::Error::wrap(e));
-        }
-        let isq_type = buffer.read_u8()? as usize;
-        if isq_type != QuantizedSerdeType::Qtip2b as usize {
-            candle_core::bail!(
-                "ISQ type ({isq_type}) doesn't match expected QTIP2B type {}",
-                QuantizedSerdeType::Qtip2b as usize
-            );
-        }
-        let has_bias = buffer.read_u8()? != 0;
-        let in_features = buffer.read_u32::<LittleEndian>()? as usize;
-        let mcg_mult = buffer.read_u32::<LittleEndian>()?;
-
-        let _acquired_load_guard = guard.acquire(device);
-        let blocks = deserialize_tensor(&mut buffer, device)?;
-        let row_scales = deserialize_tensor(&mut buffer, device)?;
-        let bias = if has_bias {
-            Some(deserialize_tensor(&mut buffer, device)?)
-        } else {
-            None
-        };
-        let ext_bias = bias.clone();
-
-        let (rotation_signs, rotation_block) = match buffer.read_u8() {
-            Ok(0) => (None, 0usize),
-            Ok(1) => {
-                let block = buffer.read_u32::<LittleEndian>()? as usize;
-                let signs = deserialize_tensor(&mut buffer, device)?;
-                (Some(signs), block)
-            }
-            Ok(other) => candle_core::bail!(
-                "Qtip2bLayer: unexpected rotation-flag byte {other} (expected 0 or 1)"
-            ),
-            Err(_) => (None, 0usize),
-        };
-
-        let num_experts = if blocks.rank() == 3 {
-            Some(blocks.dim(0)?)
-        } else {
-            None
-        };
-
-        Ok((
-            Arc::new(Self {
-                blocks,
-                row_scales,
-                bias,
-                in_features,
-                num_experts,
-                rotation_signs,
-                rotation_block,
-                mcg_mult,
-            }),
-            ext_bias,
-        ))
+        let (layer, ext_bias) = Self::deserialize_concrete(data, device, guard)?;
+        Ok((Arc::new(layer), ext_bias))
     }
 }
 
@@ -2107,7 +2168,8 @@ mod tests {
         Ok(())
     }
 
-    /// UQFF round-trip for a 3-D expert stack (rank-recovered num_experts).
+    /// UQFF round-trip for a 3-D expert stack (rank-recovered num_experts,
+    /// PR #3's self-describing mechanism shared with the LUT rung).
     #[test]
     fn uqff_roundtrip_3d() -> Result<()> {
         let device = Device::Cpu;
@@ -2116,7 +2178,29 @@ mod tests {
         let layer_dyn =
             Qtip2bLayer::quantize_with_options_3d(&w3, &device, QtipMode::Viterbi, true)?;
 
+        // 3-D stacks are bias-free by contract: the serializer must refuse
+        // to attach a bias rather than silently share one [N] vector across
+        // E experts (mirrors the LUT rung's guard).
+        let fake_bias = Tensor::zeros((n,), DType::F32, &device)?;
+        assert!(
+            layer_dyn.serialize_with_bias(Some(fake_bias)).is_err(),
+            "serialize_with_bias must refuse a bias on a 3-D expert stack"
+        );
+
         let payload = layer_dyn.serialize()?;
+
+        // Typed deserialize: expert mode + metadata must be recovered from
+        // the self-describing tensor ranks alone.
+        let (typed, typed_bias) = Qtip2bLayer::deserialize_concrete(
+            Cow::Borrowed(&payload),
+            &device,
+            QuantizeOntoGuard::new(),
+        )?;
+        assert_eq!(typed.num_experts, Some(e));
+        assert_eq!(typed.blocks.dims(), &[e, n, k_in / SYMS_PER_BYTE]);
+        assert_eq!(typed.row_scales.dims(), &[e, n]);
+        assert!(typed_bias.is_none());
+
         let guard = QuantizeOntoGuard::new();
         let (restored, _) = Qtip2bLayer::deserialize_ext_bias(payload, &device, guard)?;
 
