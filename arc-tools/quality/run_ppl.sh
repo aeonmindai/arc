@@ -67,7 +67,12 @@ run_rung() { # $1 rung-name, $2 corpus file, remaining args appended
 if [ "${1:-}" = "--sinkhorn-ab" ]; then
   [ -f "$MINI_FILE" ] || fail "$MINI_FILE missing — run fetch_data.sh"
   echo ":::::: sinkhorn bit-identity: qtip2 on mini corpus, gate OFF then ON ::::::"
-  env -u ARC_FUSED_SINKHORN "$BIN" -m "$MODEL_DIR" -a deepseekv4 -f "$MINI_FILE" -u "$UQFF0" --chunk-size 1024 2>&1 | tee "$RES/ppl_sink_off.log"
+  # SINK_DUMP_OFF=<path>: also dump per-token logprobs from the gate-OFF run
+  # (default path = bake A's logprob stream for the twin-seed ensemble step —
+  # rides for free on this run instead of a separate ppl pass).
+  DUMPARGS=""
+  [ -n "${SINK_DUMP_OFF:-}" ] && DUMPARGS="--dump-logprobs $SINK_DUMP_OFF"
+  env -u ARC_FUSED_SINKHORN "$BIN" -m "$MODEL_DIR" -a deepseekv4 -f "$MINI_FILE" -u "$UQFF0" --chunk-size 1024 $DUMPARGS 2>&1 | tee "$RES/ppl_sink_off.log"
   ARC_FUSED_SINKHORN=1     "$BIN" -m "$MODEL_DIR" -a deepseekv4 -f "$MINI_FILE" -u "$UQFF0" --chunk-size 1024 2>&1 | tee "$RES/ppl_sink_on.log"
   python3 "$HERE/parse_ppl.py" "$RES/ppl_sink_off.log" sink_off "$RES/ppl_sink_off.json" || fail "gate-off run failed"
   python3 "$HERE/parse_ppl.py" "$RES/ppl_sink_on.log"  sink_on  "$RES/ppl_sink_on.json"  || fail "gate-on run failed"

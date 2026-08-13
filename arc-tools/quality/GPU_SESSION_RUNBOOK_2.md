@@ -1,10 +1,11 @@
 # GPU SESSION 2 RUNBOOK — Viterbi re-bake, quality table v2, PR revalidations
 
 **Target:** one Runcrate H200 (141GB HBM, ≥24 cores, ≥720GB disk; session-1 box
-was NY, $4.92/hr, 720GB — enough: 149GB model + ~70GB UQFF + build).
-**Budget: ~6 GPU-hours ≈ $30**, hard trip-wires below. Every step has command,
-expected wall time, expected output, and an **ABORT IF** rule. A driver (human
-or agent) executes it mechanically top to bottom.
+was NY, $4.92/hr, 720GB — enough: 149GB model + 2×~70GB UQFF + build).
+**Budget: ~7 GPU-hours ≈ $35** full scope (~6h before the twin-seed ensemble
+addition), hard trip-wires below. Every step has command, expected wall time,
+expected output, and an **ABORT IF** rule. A driver (human or agent) executes
+it mechanically top to bottom.
 
 **Branch model:** the box runs **`master`** with the `session2-runbook` branch
 merged on top (harness + MTP acceptance telemetry + fixed boot script). This
@@ -20,7 +21,10 @@ OPEN** — step 0 verifies and tells you what to skip if any isn't.
 `ppl_qtip2_c1024.json`, `ppl_qtip2_c64.json` (rebaked weights),
 `ppl_sink_verdict.json` + `sinkhorn_verdict.json` + `speed_fused_sinkhorn.json`,
 `speed_mtp_depth2.json` (+`_depth4`), `mtp_acceptance.txt`,
-`qtip2b_parity.txt`, `qtip_gemv_bw.txt`, plus `bake2.log` head/tail.
+`qtip2b_parity.txt`, `qtip_gemv_bw.txt`, twin-seed ensemble inputs
+`lp_bakeA.ndjson` + `lp_bakeB.ndjson` + `ppl_qtip2_seedB_mini.log`
+(ensemble_ppl.json is computed OFFLINE post-teardown), plus `bake2.log` and
+`bakeB.log` head/tail.
 
 **Session-1 baseline (compare column — memory/mission/gpu-run1-results/results/):**
 
@@ -65,17 +69,22 @@ OPEN** — step 0 verifies and tells you what to skip if any isn't.
 | 6 | **GSM8K n=100 @1024-cap** (∥ qtip2b parity tests, #6) | 90-105m | 4:20 |
 | 7 | **Long-context 3-config matrix (#7 reval)** | 40m | 5:00 |
 | 8 | Server DOWN → qtip gemv microbench LUT vs bitshift (#6) | 10m | 5:10 |
-| 9 | PPL mini ladder, qtip2 rungs only (`SKIP_Q2K=1`) | 35m | 5:45 |
-| 10 | **Sinkhorn A/B revalidation (#8)**, both halves | 35m | 6:20 |
-| 11 | **MTP acceptance (#5)**, depth 2 (4 only if ahead) | 20m | 6:40 |
-| 12 | Pull results + **DELETE INSTANCE** | 15m | 6:55 |
+| 8b | **Twin-seed bake B** (`ARC_QTIP_ROTATION_SEED=161`) | 35m | 5:45 |
+| 9 | PPL ladder, qtip2 rungs only (`SKIP_Q2K=1`) | 35m | 6:20 |
+| 9b | **Twin-seed dump B** (mini corpus, bake-B UQFF) | 12m | 6:32 |
+| 10 | **Sinkhorn A/B revalidation (#8)**, both halves (dump A rides free) | 35m | 7:07 |
+| 11 | **MTP acceptance (#5)**, depth 2 (4 only if ahead) | 20m | 7:27 |
+| 12 | Pull results + **DELETE INSTANCE** | 15m | 7:42 |
+| 12b | Twin-seed ensemble analysis — OFFLINE, box already gone | $0 | — |
 
-**Budget trip-wires** (cumulative from instance creation): at **5:30** before
-step 10 starts → set `SKIP_C64=1` in step 9 and drop MTP depth-4; at **6:00** →
-drop MTP entirely; at **6:30** → jump straight to step 12; **7:00 = hard
-teardown** no matter what is mid-flight. A torn-down box with partial results
-beats a complete run that overruns. Time cuts drop, in order: MTP depth-4 →
-qtip2_c64 rung → MTP entirely → gemv microbench. Never cut step 12.
+**Budget trip-wires** (cumulative from instance creation): at **6:00** before
+step 9 finishes → set `SKIP_C64=1`; at **6:45** → drop MTP depth-4; at
+**7:00** → drop MTP entirely; at **7:45 = hard teardown** no matter what is
+mid-flight. A torn-down box with partial results beats a complete run that
+overruns. Time cuts drop, in order: MTP depth-4 → qtip2_c64 rung → MTP
+entirely → gemv microbench → twin-seed (9b first — bake B is sunk cost, but
+without dump B the ensemble can't be computed, so cutting 9b cuts 8b's value
+too). Never cut step 12.
 
 ---
 
@@ -355,7 +364,35 @@ git checkout -- mistralrs-quant/examples/qtip_gemv_bw.rs          # leave tree c
 - Patch fails to apply / build fails (e.g. #6 changed after authoring) →
   skip, note it, move on. 10 minutes max, no debugging.
 
-## Step 9 — PPL mini ladder, rebaked qtip2 (35m; server DOWN) — OBJECTIVE 2
+## Step 8b — Twin-seed bake B (35m; server DOWN) — ENSEMBLE EXPERIMENT
+
+First-ever data point on twin-seed ensembling: a SECOND qtip2 bake identical
+to step 3 except for the Hadamard rotation seed
+(`ARC_QTIP_ROTATION_SEED=161`, vs default `0xA3C1_7B0F_5F2E_1D4D`). Decode is
+seed-independent — the sign vector is STORED in the UQFF and every
+forward/gather path reads the stored signs — so bake B is self-consistent and
+its quantization error pattern is decorrelated from bake A's.
+
+```bash
+cd $ARC
+df -h / | tail -1        # need ~70GB free for the second UQFF
+nohup env ARC_QTIP_ROTATION_SEED=161 ./target/release/mistralrs quantize text \
+  -m "$V4_DIR" -a deepseekv4 --isq qtip2 -o "$V4_DIR/uqff_b/" \
+  > /root/logs/bakeB.log 2>&1 & disown
+tail -f /root/logs/bakeB.log
+grep "rotation seed overridden" /root/logs/bakeB.log   # MUST appear: seed=0xa1
+grep "Applying ISQ on" /root/logs/bakeB.log            # >1 threads, same as step 3
+export UQFF_B=$(ls "$V4_DIR"/uqff_b/qtip2*.uqff | sort | head -1)
+```
+
+- Expected: same size/shape as bake A (~65-80GB), similar wall time to step 3.
+  The `QTIP rotation seed overridden: ARC_QTIP_ROTATION_SEED=0xa1` info line
+  proves the override engaged.
+- **ABORT-IF-cheap:** no seed-override line, bake fails, or exceeds 45m →
+  kill it, `rm -rf "$V4_DIR/uqff_b"`, skip 9b, continue with step 9. Max 10
+  minutes of looking at logs — this is a bonus experiment, not the session.
+
+## Step 9 — PPL ladder, rebaked qtip2 (35m; server DOWN) — OBJECTIVE 2
 
 ```bash
 MODEL_DIR="$V4_DIR" UQFF0="$UQFF0" SKIP_Q2K=1 bash $Q/run_ppl.sh
@@ -368,15 +405,36 @@ MODEL_DIR="$V4_DIR" UQFF0="$UQFF0" SKIP_Q2K=1 bash $Q/run_ppl.sh
   the gap. 30-45 = partial win (record; Hessian-aware costs are the known
   next lever). Still ~55+ = fix didn't engage or didn't help — cross-check the
   step-3 thread count in bake2.log.
-- **ABORT IF** qtip2_c1024 > 50 → skip c64 rung, go to step 10 (its identity
-  halves don't need good ppl).
+- **ABORT IF** qtip2_c1024 > 50 → skip c64 rung, go to step 9b (identity and
+  ensemble runs don't need good absolute ppl).
+
+## Step 9b — Twin-seed dump B (12m; server DOWN) — ENSEMBLE EXPERIMENT
+
+Bake-B logprobs on the SAME mini corpus + chunking the step-10 gate-off run
+uses (that run doubles as dump A):
+
+```bash
+cd $ARC
+./target/release/examples/perplexity -m "$V4_DIR" -a deepseekv4 \
+  -f $Q/data/wiki.test_mini.raw -u "$UQFF_B" --chunk-size 1024 \
+  --dump-logprobs $Q/results/lp_bakeB.ndjson 2>&1 | tee $Q/results/ppl_qtip2_seedB_mini.log
+```
+
+- Expected: `Dumped per-token logprobs to ...` + a Final perplexity close to
+  bake A's mini-corpus number (same config, different seed).
+- Also a free data point: bake-B ppl vs bake-A ppl = seed sensitivity of the
+  Viterbi bake itself.
+- **ABORT-IF-cheap:** any failure → skip (ensemble needs both dumps), ≤10m.
 
 ## Step 10 — Sinkhorn A/B revalidation post-#8 (35m) — OBJECTIVE 5
 
-Half 1 — bit-identity through the perplexity binary (server still down):
+Half 1 — bit-identity through the perplexity binary (server still down).
+`SINK_DUMP_OFF` makes the gate-OFF run double as the ensemble's bake-A dump —
+no extra ppl pass needed:
 
 ```bash
-MODEL_DIR="$V4_DIR" UQFF0="$UQFF0" bash $Q/run_ppl.sh --sinkhorn-ab
+MODEL_DIR="$V4_DIR" UQFF0="$UQFF0" SINK_DUMP_OFF=$Q/results/lp_bakeA.ndjson \
+  bash $Q/run_ppl.sh --sinkhorn-ab
 # PASS = "SINKHORN-PPL-IDENTITY: PASS (bit-identical per-chunk ppl)"
 ```
 
@@ -443,6 +501,8 @@ pkill -f "mistralrs serve"
 # on the box
 grep "Applying ISQ on" /root/logs/bake2.log > $Q/results/bake2_threads.txt
 (head -30 /root/logs/bake2.log; echo ...; tail -10 /root/logs/bake2.log) > $Q/results/bake2_log_excerpt.txt
+[ -f /root/logs/bakeB.log ] && grep -E "Applying ISQ on|rotation seed overridden" \
+  /root/logs/bakeB.log > $Q/results/bakeB_log_excerpt.txt
 cd $Q && tar czf /root/quality2_results.tgz results/ && ls -lh /root/quality2_results.tgz
 # from your machine
 scp root@<IP>:/root/quality2_results.tgz .
@@ -454,6 +514,26 @@ Then **DELETE the Runcrate instance** (DELETE, not stop — stopped boxes bill
 disk). Verify via list_instances that it is gone. On EVERY resume of the
 driving session: run list_instances; if the box exists and the session is
 done/stalled, delete immediately.
+
+## Step 12b — Twin-seed ensemble analysis (OFFLINE, $0) — ENSEMBLE EXPERIMENT
+
+On your machine, from the extracted tarball (box is already deleted):
+
+```bash
+python3 arc-tools/quality/ensemble_ppl.py results/lp_bakeA.ndjson results/lp_bakeB.ndjson
+```
+
+- Reports `ppl_A`, `ppl_B`, `ppl_ensemble` (probability-averaged:
+  `logp_ens = logaddexp(logp_A, logp_B) − ln 2`), per-chunk table, and
+  agreement stats (Pearson r of per-token logprobs, mean |Δlogp|, per-chunk
+  A-vs-B spread = the bias-vs-variance decomposition signal).
+- **SUCCESS SIGNAL: `ppl_ensemble` ≥3% below `min(ppl_A, ppl_B)`** — the
+  first-ever evidence of decorrelated-error cancellation between twin-seed
+  bakes on real weights (exit code 0 = success). High A/B spread + gain =
+  variance-dominated quant error (more seeds keep helping); low spread + no
+  gain = bias-dominated (seed averaging exhausted).
+- The script hard-fails on token-stream mismatch between the dumps (different
+  corpus/chunking) — if that fires, the two ppl runs weren't run as written.
 
 ---
 
@@ -473,5 +553,8 @@ done/stalled, delete immediately.
 | MTP telemetry | `ARC_MTP_LOG_ACCEPTANCE=1` → `MTP acceptance rate: ...` per 64 proposed | session2-runbook commit, `mtp_pipeline.rs record_acceptance` |
 | qtip2b parity tests | `cargo test -p mistralrs-quant --release --features cuda qtip::bitshift::tests::cuda_` (4 tests) | PR #6 diff, `qtip/bitshift.rs` `mod tests` |
 | gemv microbench | patch `arc-tools/quality/patches/qtip_gemv_bw_bitshift.patch`, compile-verified against master+#6 | `mistralrs-quant/examples/qtip_gemv_bw.rs` |
-| Harness new knobs | `run_longctx.py --label/--force` (anti-clobber), `run_sinkhorn_ab.py` free labels + derived verdict path, `run_ppl.sh SKIP_Q2K/SKIP_C64` | this branch |
+| Harness new knobs | `run_longctx.py --label/--force` (anti-clobber), `run_sinkhorn_ab.py` free labels + derived verdict path, `run_ppl.sh SKIP_Q2K/SKIP_C64/SINK_DUMP_OFF` | this branch |
 | Boot script | honors `ARC_BRANCH` (default master) + driver/toolkit gate | this branch, `arc-tools/boot_run161_h200.sh` |
+| Rotation seed override | `ARC_QTIP_ROTATION_SEED=<u64|0xhex>` (quantize-time only; decode reads STORED signs — verified: all forward/gather paths use `self.rotation_signs`, UQFF serializes them); logs `QTIP rotation seed overridden` | this branch, `mistralrs-quant/src/qtip/mod.rs rotation_seed()` |
+| Logprob dump | `perplexity ... --dump-logprobs <path>` → NDJSON per chunk (target-token logprobs) | this branch, `mistralrs/examples/advanced/perplexity/main.rs` |
+| Ensemble analysis | `ensemble_ppl.py <A.ndjson> <B.ndjson>` — offline, stdlib-only; validated on synthetic decorrelated-noise fixtures (gain x1.13, mismatch guard fires) | this branch, `arc-tools/quality/ensemble_ppl.py` |
