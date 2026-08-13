@@ -62,8 +62,10 @@ pub mod bitshift;
 mod cuda_ops;
 #[cfg(feature = "cuda")]
 mod ffi;
+pub mod grouped;
 mod viterbi;
 pub use bitshift::{Qtip2bLayer, QTIP2B_MCG_MULT};
+pub use grouped::{ExpertBpwTable, TrellisBpw};
 #[allow(unused_imports)]
 pub use viterbi::viterbi_quantize_row;
 

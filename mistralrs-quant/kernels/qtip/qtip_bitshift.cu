@@ -54,58 +54,10 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+// Shared 3INST decode + dtype helpers (also used by qtip_grouped_gemm.cu).
+#include "qtip2b_common.cuh"
+
 namespace {
-
-constexpr uint32_t Q2B_K            = 2;
-constexpr uint32_t Q2B_L            = 16;
-constexpr uint32_t Q2B_STATE_MASK   = (1u << Q2B_L) - 1u;
-constexpr uint32_t Q2B_ALPHABET     = 1u << Q2B_K;             // 4
-constexpr uint32_t Q2B_NSTATES      = 1u << Q2B_L;             // 65536
-constexpr uint32_t Q2B_WARMUP_SYMS  = Q2B_L / Q2B_K;           // 8
-constexpr uint32_t Q2B_MASK         = 0x8FFF8FFFu;
-constexpr uint32_t Q2B_XOR          = 0x3B603B60u;
-
-// ---------------------------------------------------------------------------
-// The computed codebook. IMAD + LOP3 + 2x H2F + FADD, all in registers.
-// ---------------------------------------------------------------------------
-__device__ __forceinline__ float q2b_decode(uint32_t state, uint32_t mult) {
-    uint32_t x = state * mult;                    // wrapping 32-bit multiply
-    uint32_t m = (x & Q2B_MASK) ^ Q2B_XOR;        // single LOP3 on sm_80+
-    float hi = __half2float(__ushort_as_half((unsigned short)(m >> 16)));
-    float lo = __half2float(__ushort_as_half((unsigned short)(m & 0xFFFFu)));
-    return hi + lo;
-}
-
-// 2-bit symbol `t` of a packed row (4 symbols/byte, LSB-first).
-__device__ __forceinline__ uint32_t q2b_sym(const uint8_t* __restrict__ packed, int t) {
-    return ((uint32_t)packed[t >> 2] >> ((t & 3) * 2)) & 0x3u;
-}
-
-template <typename T>
-__device__ __forceinline__ T q2b_from_f32(float v);
-template <>
-__device__ __forceinline__ float q2b_from_f32<float>(float v) { return v; }
-template <>
-__device__ __forceinline__ __half q2b_from_f32<__half>(float v) { return __float2half_rn(v); }
-template <>
-__device__ __forceinline__ __nv_bfloat16 q2b_from_f32<__nv_bfloat16>(float v) { return __float2bfloat16(v); }
-
-template <typename T>
-__device__ __forceinline__ float q2b_to_f32(T v);
-template <>
-__device__ __forceinline__ float q2b_to_f32<float>(float v) { return v; }
-template <>
-__device__ __forceinline__ float q2b_to_f32<__half>(__half v) { return __half2float(v); }
-template <>
-__device__ __forceinline__ float q2b_to_f32<__nv_bfloat16>(__nv_bfloat16 v) { return __bfloat162float(v); }
-
-__device__ __forceinline__ float q2b_warp_reduce_sum(float v) {
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        v += __shfl_xor_sync(0xFFFFFFFFu, v, off);
-    }
-    return v;
-}
 
 // ---------------------------------------------------------------------------
 // 1) Dequantize kernel: one thread per row (trellis walk is sequential).
