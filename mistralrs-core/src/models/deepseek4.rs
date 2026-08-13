@@ -2810,6 +2810,11 @@ pub struct DeepSeekV4 {
     /// When `None`, the model takes the 3-D fallback path (RUN-169 bridge
     /// or standard residual). Audit §0 + §2.
     mhc_head: Option<super::dsv4_mhc::V4MHCHead>,
+    /// Full parsed config, kept so the MTP decoder block can be re-loaded
+    /// from the source checkpoint when a UQFF artifact (baked without
+    /// `--mtp-depth`) does not cover it. See
+    /// `IsqModel::load_mtp_block_from_source`.
+    cfg_full: DeepSeekV4Config,
 }
 
 impl DeepSeekV4 {
@@ -2836,6 +2841,53 @@ impl DeepSeekV4 {
     /// True if mHC global parameters were loaded.
     pub fn has_mhc(&self) -> bool {
         self.mhc_head.is_some()
+    }
+
+    /// Emit the OPTIONAL MTP decoder block's non-ISQ tensors (wrapper norms,
+    /// decoder-layer norms, router gate) at the HF path `mtp.layers.0.*` so a
+    /// UQFF full serialization can reconstruct the block. The block's
+    /// quantizable projections are ISQ tensors (serialized as `mtp.<j>` UQFF
+    /// artifacts) and `h_proj`/`e_proj` are main ISQ tensors — neither
+    /// belongs here. No-op when the block was not loaded.
+    fn add_mtp_block_residuals(&self, uvb: &UnVarBuilder) {
+        let Some(mtp) = &self.mtp_head else { return };
+        let Some(block) = &mtp.block else { return };
+
+        let uvb_b = uvb.pp("mtp").pp("layers").pp("0");
+        uvb_b.pp("hnorm").add(&block.hnorm);
+        uvb_b.pp("enorm").add(&block.enorm);
+        uvb_b.pp("norm").add(&block.out_norm);
+
+        let layer = &block.layer;
+        uvb_b.pp("input_layernorm").add(&layer.input_layernorm);
+        uvb_b
+            .pp("post_attention_layernorm")
+            .add(&layer.post_attention_layernorm);
+        uvb_b
+            .pp("self_attn")
+            .pp("kv_a_layernorm")
+            .add(&layer.attn.kv_norm);
+        if let QProj::Lora { a: _, norm, b: _ } = &layer.attn.q {
+            uvb_b.pp("self_attn").pp("q_a_layernorm").add(norm);
+        }
+        if let MoeOrMlp::Moe(moe) = &layer.moe_or_mlp {
+            let uvb_g = uvb_b.pp("mlp").pp("gate");
+            uvb_g.add_tensor("weight", moe.gate.weight.clone());
+            if let Some(tid2eid) = &moe.gate.tid2eid {
+                uvb_g.add_tensor("tid2eid", tid2eid.clone());
+            }
+            if let Some(bias) = &moe.gate.e_score_correction_bias {
+                uvb_g.add_tensor("e_score_correction_bias", bias.clone());
+            }
+        }
+        if let Some(mhc) = &layer.mhc {
+            uvb_b.add_tensor("hc_attn_fn", mhc.hc_attn_fn.clone());
+            uvb_b.add_tensor("hc_attn_base", mhc.hc_attn_base.clone());
+            uvb_b.add_tensor("hc_attn_scale", mhc.hc_attn_scale.clone());
+            uvb_b.add_tensor("hc_ffn_fn", mhc.hc_ffn_fn.clone());
+            uvb_b.add_tensor("hc_ffn_base", mhc.hc_ffn_base.clone());
+            uvb_b.add_tensor("hc_ffn_scale", mhc.hc_ffn_scale.clone());
+        }
     }
 }
 
@@ -3036,7 +3088,12 @@ impl DeepSeekV4 {
                         // (declared via `set_mtp_load_depth` before load).
                         // Memory is precious: the block is ~3GB at FP8, so it
                         // is skipped entirely when MTP drafting is disabled.
-                        let block = if crate::pipeline::mtp_pipeline::mtp_load_depth() > 0 {
+                        // Exception: a UQFF bake (`set_mtp_uqff_bake`)
+                        // force-loads the block so its tensors are quantized
+                        // and included in the artifact under `mtp.<j>` names.
+                        let block = if crate::pipeline::mtp_pipeline::mtp_load_depth() > 0
+                            || crate::pipeline::mtp_pipeline::mtp_uqff_bake()
+                        {
                             match MtpBlock::try_new(
                                 cfg,
                                 mtp_vb.clone(),
@@ -3129,6 +3186,7 @@ impl DeepSeekV4 {
             mapper,
             mtp_head,
             mhc_head,
+            cfg_full: cfg.clone(),
         })
     }
 
@@ -3458,6 +3516,8 @@ impl IsqModel for DeepSeekV4 {
             uvb_m.add_tensor("hc_head_scale", mhc_head.hc_head_scale.clone());
         }
 
+        self.add_mtp_block_residuals(&uvb);
+
         uvb.to_safetensors()
     }
 
@@ -3527,7 +3587,91 @@ impl IsqModel for DeepSeekV4 {
             uvb_m.add_tensor("hc_head_scale", mhc_head.hc_head_scale.clone());
         }
 
+        self.add_mtp_block_residuals(&uvb);
+
         Some(uvb.to_safetensors())
+    }
+
+    fn mtp_isq_tail_len(&mut self) -> usize {
+        // Mirrors the tail appended by `get_layers` /
+        // `get_layers_moe_experts_only`: the MTP decoder block's ISQ layers
+        // (registered only when the Arc is still unique — the same condition
+        // under which get_layers pushes them).
+        self.mtp_head.as_mut().map_or(0, |mtp| {
+            mtp.block.as_mut().map_or(0, |block| {
+                Arc::get_mut(block).map_or(0, |block| block.isq_layers().len())
+            })
+        })
+    }
+
+    fn load_mtp_block_from_source(
+        &mut self,
+        source: &crate::pipeline::UqffSourceWeights<'_>,
+    ) -> candle_core::Result<bool> {
+        // Only applicable when a block was requested (constructed as
+        // DummyLayers under the from-UQFF load) but the artifact did not
+        // cover it.
+        if !self
+            .mtp_head
+            .as_ref()
+            .is_some_and(|mtp| mtp.block.is_some())
+        {
+            return Ok(false);
+        }
+
+        tracing::info!(
+            "V4 MTP: the UQFF artifact has no MTP decoder block tensors (baked without \
+             `--mtp-depth`); loading the block UNQUANTIZED (~3GB at BF16/FP8) from the \
+             source checkpoint instead. Re-bake with the current `quantize` to embed the \
+             quantized block (~800MB) in the artifact."
+        );
+
+        let vb = crate::utils::varbuilder_utils::from_mmaped_safetensors(
+            source.weight_files.to_vec(),
+            Vec::new(),
+            Some(source.dtype),
+            &self.device,
+            vec![None],
+            true,
+            // No dummy regexes: this reload wants REAL weights.
+            None,
+            |_| true,
+            Arc::new(|_| crate::utils::varbuilder_utils::DeviceForLoadTensor::Base),
+        )?;
+        // Same FP8 scale-name normalization the V4 loader applies.
+        let vb = mistralrs_quant::attach_rename_rules(vb, mistralrs_quant::v4_scale_rename_rules());
+
+        let mtp_native_vb = vb.pp("mtp").pp("0");
+        let mtp_hf_vb = vb.pp("mtp").pp("layers").pp("0");
+        let mtp_vb = if mtp_native_vb.contains_tensor("h_proj.weight") {
+            mtp_native_vb
+        } else if mtp_hf_vb.contains_tensor("h_proj.weight") {
+            mtp_hf_vb
+        } else {
+            tracing::warn!(
+                "V4 MTP: source weights carry no `mtp.*` tensors; cannot reload the MTP \
+                 decoder block (full-serialization UQFF without MTP residuals?)"
+            );
+            return Ok(false);
+        };
+
+        // The per-expert MoE constructor consults the thread-local
+        // `loading_from_uqff` flag and would emit DummyLayers again; clear it
+        // for the duration of this real-weight reload.
+        let prev_uqff_flag = mistralrs_quant::loading_from_uqff();
+        mistralrs_quant::set_loading_from_uqff(false);
+        let block = MtpBlock::try_new(&self.cfg_full, mtp_vb, &*self.mapper, false, &self.device);
+        mistralrs_quant::set_loading_from_uqff(prev_uqff_flag);
+
+        match block? {
+            Some(block) => {
+                if let Some(mtp) = self.mtp_head.as_mut() {
+                    mtp.block = Some(Arc::new(block));
+                }
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 }
 

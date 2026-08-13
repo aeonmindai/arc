@@ -620,6 +620,8 @@ impl Loader for EmbeddingLoader {
                 self.config.topology.as_ref(),
                 silent,
                 from_uqff,
+                // Embedding models have no optional MTP tail; no source fallback.
+                None,
             )?;
         }
 

@@ -123,12 +123,13 @@ pub use pipeline::{
     LLaVANextLoader, LlamaLoader, Loader, LocalModelPaths, LoraAdapterPaths, MistralLoader,
     MixtralLoader, Modalities, ModelKind, ModelPaths, MultimodalPromptPrefixer, NormalLoader,
     NormalLoaderBuilder, NormalLoaderType, NormalLoadingMetadata, NormalModel, NormalModelLoader,
-    mtp_load_depth, set_mtp_load_depth, try_wrap_pipeline_with_mtp, MtpDecodeKit,
-    MtpSpeculativePipeline, NormalSpecificConfig,
+    mtp_load_depth, mtp_uqff_bake, set_mtp_load_depth, set_mtp_uqff_bake,
+    try_wrap_pipeline_with_mtp, MtpDecodeKit, MtpSpeculativePipeline, NormalSpecificConfig,
     Phi2Loader, Phi3Loader, Phi3VLoader, Qwen2Loader, SpeculativeConfig, SpeculativeLoader,
     SpeculativePipeline, SpeechLoader, SpeechPipeline, Starcoder2Loader,
-    SupportedModality, TokenSource, VisionLoader, VisionLoaderBuilder, VisionLoaderType,
-    VisionSpecificConfig, UQFF_MULTI_FILE_DELIMITER,
+    SupportedModality, TokenSource, UqffFullSer, UqffSourceWeights, VisionLoader,
+    VisionLoaderBuilder, VisionLoaderType, VisionSpecificConfig, UQFF_MTP_TENSOR_PREFIX,
+    UQFF_MULTI_FILE_DELIMITER,
 };
 /// `FlashParams` is needed by integration tests that call `NormalModel::forward` directly.
 pub use pipeline::text_models_inputs_processor::FlashParams as TextFlashParams;

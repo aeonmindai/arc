@@ -93,6 +93,27 @@ pub fn mtp_load_depth() -> usize {
     MTP_LOAD_DEPTH.load(Ordering::Relaxed)
 }
 
+/// UQFF-bake override for MTP loading: when a `--write-uqff` bake is running,
+/// the V4 loader loads the full MTP decoder block even if `--mtp-depth 0`, so
+/// the block's ISQ tensors are quantized and included in the artifact
+/// (~800MB at 2-bit). Without this, a bake made without `--mtp-depth` produces
+/// a UQFF that cannot serve `--mtp-depth > 0` without falling back to the
+/// source checkpoint. Same process-wide-atomic channel as
+/// [`set_mtp_load_depth`]; set fresh on every load in
+/// `NormalLoader::load_model_from_path`.
+static MTP_UQFF_BAKE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Declare (before model load) that this load is a UQFF bake, forcing the V4
+/// MTP decoder block to load so it gets serialized into the artifact.
+pub fn set_mtp_uqff_bake(bake: bool) {
+    MTP_UQFF_BAKE.store(bake, Ordering::Relaxed);
+}
+
+/// True when the current load should force-load the MTP block for a UQFF bake.
+pub fn mtp_uqff_bake() -> bool {
+    MTP_UQFF_BAKE.load(Ordering::Relaxed)
+}
+
 /// Components needed to run one MTP draft step.
 ///
 /// All fields are Arc/Clone-cheap handles into the target model's

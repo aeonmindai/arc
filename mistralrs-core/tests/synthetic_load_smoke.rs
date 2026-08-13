@@ -36,10 +36,22 @@ use indicatif::MultiProgress;
 
 use mistralrs_core::{
     AttentionImplementation, DeepSeekV3Loader, DeepSeekV4Loader, DeviceMapper, GLM4MoeLoader,
-    NormalLoaderType, NormalLoadingMetadata, NormalModel, NormalModelLoader,
-    TextFlashParams as FlashParams,
+    IsqOrganization, NormalLoaderType, NormalLoadingMetadata, NormalModel, NormalModelLoader,
+    TextFlashParams as FlashParams, UqffFullSer, UqffSourceWeights, UQFF_MTP_TENSOR_PREFIX,
 };
 use mistralrs_quant::{safetensors::ShardedSafeTensors, ShardedVarBuilder};
+
+/// The MTP load-depth / UQFF-bake gates are process-wide atomics
+/// (`set_mtp_load_depth` / `set_mtp_uqff_bake`); tests that flip them must
+/// not interleave with each other. Poison-tolerant so one panicked test
+/// cannot wedge the rest.
+static MTP_GATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn mtp_gate_guard() -> std::sync::MutexGuard<'static, ()> {
+    MTP_GATE_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
 
 // ---------------------------------------------------------------------------
 // Shared test plumbing: a CPU-only `DeviceMapper` (the production
@@ -505,6 +517,7 @@ fn v4_flash_synthetic_load_smoke() {
 ///      tokens.
 #[test]
 fn v4_flash_mtp_full_block_load_smoke() {
+    let _gate = mtp_gate_guard();
     let device = Device::Cpu;
     let config = v4::config_json();
 
@@ -583,6 +596,280 @@ fn v4_flash_mtp_full_block_load_smoke() {
             v4::VOCAB_SIZE
         );
     }
+}
+
+// ===========================================================================
+// V4 UQFF ↔ MTP ARTIFACT COVERAGE
+// ===========================================================================
+//
+// GPU session 2 crash: a UQFF baked WITHOUT `--mtp-depth` and then served
+// WITH `--mtp-depth 2` died with `DummyLayer not replaced at index 522` —
+// the MTP decoder block registers trailing ISQ layers that the artifact
+// never covered. Two-sided fix under test here:
+//   1. WRITE: a bake force-loads the MTP block when the checkpoint ships it
+//      (`set_mtp_uqff_bake`, set by the loader whenever `--write-uqff` is
+//      given) and serializes its layers under `mtp.<j>` names, so the same
+//      artifact also stays loadable at `--mtp-depth 0` (entries skipped).
+//   2. READ: serving an OLD artifact (no `mtp.*` entries) with the block
+//      requested reloads the block UNQUANTIZED from the source checkpoint
+//      instead of dying.
+
+mod uqff {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// Fresh per-test scratch dir under the system temp dir.
+    pub fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("arc-uqff-smoke-{tag}-{}", std::process::id()));
+        // Stale leftovers from a previous run would confuse shard reads.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
+        dir
+    }
+
+    /// Serialize the model's ISQ tensors (no additional quantization — the
+    /// synthetic weights stay unquantized) to `<dir>/model-0.uqff` via the
+    /// REAL `IsqModel::quantize` write path, and return the shard path.
+    pub fn bake(model: &mut (dyn NormalModel + Send + Sync), dir: &Path) -> PathBuf {
+        let tokenizer = tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default());
+        let uqff_target = dir.join("model.uqff");
+        model
+            .quantize(
+                None,
+                Device::Cpu,
+                None,
+                /*silent=*/ true,
+                None,
+                IsqOrganization::Default,
+                /*apply_quantization=*/ false,
+                Some(&uqff_target),
+                UqffFullSer {
+                    tokenizer: &tokenizer,
+                    template_filename: &None,
+                    modules: None,
+                    module_paths: None,
+                    generation_config: None,
+                    config: v4::config_json(),
+                    processor_filename: &None,
+                    preprocessor_filename: &None,
+                },
+                Arc::new(MultiProgress::new()),
+            )
+            .expect("UQFF serialization of the synthetic V4 model must succeed");
+        let shard = dir.join("model-0.uqff");
+        assert!(shard.exists(), "expected a single UQFF shard at {shard:?}");
+        shard
+    }
+
+    /// Tensor names inside a UQFF shard.
+    pub fn artifact_names(shard: &Path) -> Vec<String> {
+        let st = unsafe {
+            candle_core::safetensors::MmapedSafetensors::new(shard).expect("UQFF shard must mmap")
+        };
+        st.tensors().into_iter().map(|(name, _)| name).collect()
+    }
+
+    /// Drive the actual V4 loader over an in-memory synthetic tensor set.
+    pub fn load_v4(tensors: HashMap<String, Tensor>) -> Box<dyn NormalModel + Send + Sync> {
+        let device = Device::Cpu;
+        let vb = wrap_as_vb(tensors, &device);
+        DeepSeekV4Loader
+            .load(
+                &v4::config_json(),
+                vb,
+                make_metadata(&device),
+                AttentionImplementation::Eager,
+            )
+            .expect("V4 load on synthetic weights must succeed")
+    }
+}
+
+/// WRITE side: `set_mtp_uqff_bake(true)` force-loads the MTP block at depth
+/// 0, its layers serialize under `mtp.<j>` names, the main-model names are
+/// UNCHANGED vs a block-less bake, and the artifact roundtrips both with
+/// (`--mtp-depth 2`) and without (`--mtp-depth 0`) the block.
+#[test]
+fn v4_uqff_bake_includes_mtp_and_roundtrips() {
+    let _gate = mtp_gate_guard();
+    let device = Device::Cpu;
+
+    // ---- Bake WITHOUT the MTP block (depth 0, bake flag off). ----
+    mistralrs_core::set_mtp_load_depth(0);
+    mistralrs_core::set_mtp_uqff_bake(false);
+    let dir_plain = uqff::scratch_dir("bake-plain");
+    let mut model = uqff::load_v4(v4::synthetic_v4_weights_with_mtp(&device).unwrap());
+    let shard_plain = uqff::bake(model.as_mut(), &dir_plain);
+    drop(model);
+    let plain_names = uqff::artifact_names(&shard_plain);
+    assert!(
+        plain_names.iter().all(|n| n.parse::<usize>().is_ok()),
+        "depth-0 bake must contain only positional-index names, got {plain_names:?}"
+    );
+    let n_main = plain_names.len();
+
+    // ---- Bake with the production `--write-uqff` gate: the block force-
+    // loads even at depth 0 and serializes under `mtp.<j>` names. ----
+    mistralrs_core::set_mtp_uqff_bake(true);
+    let dir_mtp = uqff::scratch_dir("bake-mtp");
+    let mut model = uqff::load_v4(v4::synthetic_v4_weights_with_mtp(&device).unwrap());
+    // Reset the process-wide gate before any assertion can panic.
+    mistralrs_core::set_mtp_uqff_bake(false);
+    assert!(
+        model
+            .mtp_decode_kit()
+            .expect("MTP kit must exist")
+            .has_full_block(),
+        "set_mtp_uqff_bake(true) must force-load the MTP decoder block at depth 0"
+    );
+    let shard_mtp = uqff::bake(model.as_mut(), &dir_mtp);
+    drop(model);
+    let mtp_names = uqff::artifact_names(&shard_mtp);
+    let numeric = mtp_names
+        .iter()
+        .filter(|n| n.parse::<usize>().is_ok())
+        .count();
+    let mtp_tail = mtp_names
+        .iter()
+        .filter(|n| n.starts_with(UQFF_MTP_TENSOR_PREFIX))
+        .count();
+    assert_eq!(
+        numeric + mtp_tail,
+        mtp_names.len(),
+        "unexpected artifact names: {mtp_names:?}"
+    );
+    assert_eq!(
+        numeric, n_main,
+        "main-model artifact names must be identical with and without the MTP block"
+    );
+    assert!(
+        mtp_tail > 0,
+        "an MTP bake must include mtp.<j> tensors, got {mtp_names:?}"
+    );
+
+    // ---- Serve the MTP-baked artifact WITH the block (`--mtp-depth 2`). ----
+    mistralrs_core::set_mtp_load_depth(2);
+    let mut model = uqff::load_v4(v4::synthetic_v4_weights_with_mtp(&device).unwrap());
+    mistralrs_core::set_mtp_load_depth(0);
+    model
+        .load_from_artifacts(Device::Cpu, None, true, &[shard_mtp.clone()], None)
+        .expect("depth>0 serve of an MTP-baked artifact must load cleanly");
+    assert!(model.mtp_decode_kit().unwrap().has_full_block());
+    let input_ids = Tensor::from_vec(vec![0u32, 1], &[1usize, 2], &device).unwrap();
+    let logits = run_forward_smoke(model.as_ref(), &input_ids)
+        .expect("V4 forward after UQFF roundtrip must not error");
+    assert_finite(&logits, "V4 UQFF roundtrip (depth 2)");
+    drop(model);
+
+    // ---- Serve the SAME artifact WITHOUT the block (`--mtp-depth 0`): the
+    // mtp.* entries must be skipped, not fatal. This is the index-collision
+    // hazard that the `mtp.<j>` naming exists to prevent. ----
+    let mut model = uqff::load_v4(v4::synthetic_v4_weights_with_mtp(&device).unwrap());
+    model
+        .load_from_artifacts(Device::Cpu, None, true, &[shard_mtp.clone()], None)
+        .expect("depth-0 serve of an MTP-baked artifact must skip mtp.* entries");
+    assert!(!model.mtp_decode_kit().unwrap().has_full_block());
+
+    let _ = std::fs::remove_dir_all(&dir_plain);
+    let _ = std::fs::remove_dir_all(&dir_mtp);
+}
+
+/// READ side: an artifact with NO `mtp.*` coverage (baked without
+/// `--mtp-depth` — the session-2 shape) served with the block requested must
+/// reload the block unquantized from the source checkpoint; without a source
+/// it must surface the DummyLayer error rather than panic.
+#[test]
+fn v4_uqff_missing_mtp_falls_back_to_source_checkpoint() {
+    let _gate = mtp_gate_guard();
+    let device = Device::Cpu;
+    let dir = uqff::scratch_dir("mtp-fallback");
+
+    // Source checkpoint on disk: the FULL fixture, every mtp tensor present.
+    let full = v4::synthetic_v4_weights_with_mtp(&device).unwrap();
+    let source_path = dir.join("source.safetensors");
+    candle_core::safetensors::save(&full, &source_path).expect("source fixture must serialize");
+
+    // ---- Bake WITHOUT the MTP block: the session-2 artifact shape. ----
+    mistralrs_core::set_mtp_load_depth(0);
+    mistralrs_core::set_mtp_uqff_bake(false);
+    let mut bake_model = uqff::load_v4(full.clone());
+    let shard = uqff::bake(bake_model.as_mut(), &dir);
+    drop(bake_model);
+    assert!(
+        uqff::artifact_names(&shard)
+            .iter()
+            .all(|n| !n.starts_with(UQFF_MTP_TENSOR_PREFIX)),
+        "depth-0 bake must not contain mtp.* tensors"
+    );
+
+    // Serve-side fixture: the block's Q-LoRA projection tensors are ABSENT,
+    // so the quant constructors emit DummyLayers — exactly how the
+    // production from-UQFF load builds ISQ-matched layers (make_dummy
+    // regexes drop the tensors). The norms stay present so the block's
+    // structure probes still pass.
+    let dummy_fixture = || {
+        let mut t = full.clone();
+        t.remove("mtp.layers.0.self_attn.q_a_proj.weight")
+            .expect("fixture must carry the MTP q_a_proj");
+        t.remove("mtp.layers.0.self_attn.q_b_proj.weight")
+            .expect("fixture must carry the MTP q_b_proj");
+        t
+    };
+
+    // ---- Negative control: no source fallback -> the session-2 failure,
+    // surfaced as an error (not a panic). ----
+    mistralrs_core::set_mtp_load_depth(2);
+    let mut model = uqff::load_v4(dummy_fixture());
+    mistralrs_core::set_mtp_load_depth(0);
+    let err = model
+        .load_from_artifacts(Device::Cpu, None, true, &[shard.clone()], None)
+        .expect_err("missing MTP artifacts without a source fallback must error");
+    assert!(
+        err.to_string().contains("DummyLayer not replaced"),
+        "unexpected error: {err}"
+    );
+    drop(model);
+
+    // ---- The fix: with source weights the block reloads unquantized. ----
+    mistralrs_core::set_mtp_load_depth(2);
+    let mut model = uqff::load_v4(dummy_fixture());
+    mistralrs_core::set_mtp_load_depth(0);
+    let source_files = vec![source_path.clone()];
+    model
+        .load_from_artifacts(
+            Device::Cpu,
+            None,
+            true,
+            &[shard.clone()],
+            Some(UqffSourceWeights {
+                weight_files: &source_files,
+                dtype: DType::F32,
+            }),
+        )
+        .expect("missing MTP artifacts + source fallback must load cleanly");
+    let kit = model.mtp_decode_kit().expect("MTP kit must exist");
+    assert!(
+        kit.has_full_block(),
+        "the source fallback must produce a REAL MTP block"
+    );
+
+    // The reloaded block must actually draft.
+    let seed_tok = Tensor::from_vec(vec![1u32], (1,), &device).unwrap();
+    let seed_hidden = kit
+        .embed_tokens
+        .forward(&seed_tok)
+        .expect("embedding the seed token must succeed");
+    let toks = kit
+        .propose_chain(
+            &seed_hidden,
+            1,
+            /*depth=*/ 2,
+            /*max_tokens=*/ 8,
+            0,
+        )
+        .expect("draft chain through the source-reloaded block must not error");
+    assert_eq!(toks.len(), 2, "depth-2 chain must yield exactly 2 tokens");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ===========================================================================

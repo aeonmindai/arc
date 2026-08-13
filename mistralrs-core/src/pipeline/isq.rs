@@ -57,9 +57,8 @@ use itertools::Itertools;
 use mistralrs_quant::{
     AfqLayer, CollectedImatrixData, ColumnParallelLayer, DistributedKind, F8Q8Linear, FP8Linear,
     GgufMatMul, HqqLayer, IsqBits, IsqType, MXFP4Layer, NVFP4Layer, Qtip2bLayer, QtipLayer,
-    QuantMethod, QuantizeOntoGuard,
-    QuantizedSerde, QuantizedSerdeType, ReplicatedLayer, RowParallelLayer, TuckerFactoredLayer,
-    UnquantLinear,
+    QuantMethod, QuantizeOntoGuard, QuantizedSerde, QuantizedSerdeType, ReplicatedLayer,
+    RowParallelLayer, TuckerFactoredLayer, UnquantLinear,
 };
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use regex::Regex;
@@ -73,6 +72,16 @@ use crate::{
 };
 
 pub(crate) const UQFF_RESIDUAL_SAFETENSORS: &str = "residual.safetensors";
+/// UQFF tensor-name prefix for the optional MTP decoder block's ISQ layers.
+///
+/// Main-model ISQ layers are serialized under their positional `get_layers()`
+/// index (`"0"`, `"1"`, ...). The V4 MTP decoder block is OPTIONAL (gated by
+/// `--mtp-depth`), so its trailing layers are serialized as `"mtp.0"`,
+/// `"mtp.1"`, ... instead. This keeps one artifact loadable both with and
+/// without the block: a depth-0 serve skips `mtp.*` entries, and a depth>0
+/// serve maps them onto the trailing MTP layers regardless of how many main
+/// layers exist.
+pub const UQFF_MTP_TENSOR_PREFIX: &str = "mtp.";
 // 10 GB max per file
 #[cfg(target_pointer_width = "64")]
 const MAX_UQFF_SIZE_BYTES: usize = 10 * 1024 * 1024 * 1024;
@@ -287,6 +296,19 @@ pub enum ImatrixDataSource<'a> {
     Collected,
 }
 
+/// Source-checkpoint weights handed to [`IsqModel::load_from_artifacts`] so a
+/// model whose optional MTP decoder block is NOT covered by the UQFF artifact
+/// (baked without `--mtp-depth`) can load the block unquantized (BF16/FP8)
+/// from the original safetensors instead of panicking on leftover
+/// `DummyLayer`s.
+#[derive(Debug, Clone, Copy)]
+pub struct UqffSourceWeights<'a> {
+    /// The source model's `.safetensors` shard paths.
+    pub weight_files: &'a [PathBuf],
+    /// The dtype the model was loaded with (cast target for the reload).
+    pub dtype: candle_core::DType,
+}
+
 pub trait IsqModel {
     /// Corresponds to `IsqOrganization::Default`
     #[allow(clippy::type_complexity)]
@@ -382,6 +404,29 @@ pub trait IsqModel {
     fn imatrix_names(&self) -> candle_core::Result<Vec<Option<String>>> {
         // TODO: make this required.
         candle_core::bail!("This model does not support quantizing with an imatrix.");
+    }
+
+    /// Number of TRAILING entries of `get_layers()` that belong to the
+    /// model's optional MTP decoder block (loaded only under `--mtp-depth > 0`
+    /// or a UQFF bake). These are serialized under
+    /// [`UQFF_MTP_TENSOR_PREFIX`]-prefixed names instead of positional
+    /// indices, so one artifact serves both with and without the block.
+    /// `0` (the default) means the model has no optional MTP tail.
+    fn mtp_isq_tail_len(&mut self) -> usize {
+        0
+    }
+
+    /// UQFF fallback: called by [`Self::load_from_artifacts`] when the
+    /// artifact does not cover the model's MTP decoder block (it was baked
+    /// without `--mtp-depth`) but the block was requested for this load.
+    /// Implementations reload the block UNQUANTIZED from the source
+    /// checkpoint and return `Ok(true)`; the default declines, preserving
+    /// the hard `DummyLayer not replaced` error.
+    fn load_mtp_block_from_source(
+        &mut self,
+        _source: &UqffSourceWeights<'_>,
+    ) -> candle_core::Result<bool> {
+        Ok(false)
     }
 
     /// Residual tensors for generating a UQFF file. Counterpart to [`get_layers`].
@@ -490,12 +535,27 @@ pub trait IsqModel {
                     None
                 };
 
+            // Must be computed before `get_layers` takes its `&mut self`
+            // borrows. Both layer organizations append the same MTP tail.
+            let mtp_tail = self.mtp_isq_tail_len();
+
             let (mut tensors, mapper) = match organization {
                 IsqOrganization::Default => self.get_layers(),
                 IsqOrganization::MoeExpertsOnly => self.get_layers_moe_experts_only(),
             };
 
             let total_tensors = tensors.len();
+            // ISQ layers `0..main_len` are the always-present model; layers
+            // `main_len..` are the optional MTP decoder block, serialized
+            // under `mtp.<j>` names (see UQFF_MTP_TENSOR_PREFIX).
+            let main_len = total_tensors.saturating_sub(mtp_tail);
+            let artifact_tensor_name = move |i: usize| {
+                if i < main_len {
+                    i.to_string()
+                } else {
+                    format!("{UQFF_MTP_TENSOR_PREFIX}{}", i - main_len)
+                }
+            };
 
             if apply_quantization {
                 let imatrix_to_weight: Vec<Option<Vec<f32>>> =
@@ -706,7 +766,7 @@ pub trait IsqModel {
                                 bar.inc(1);
                             }
                             Ok((
-                                i.to_string(),
+                                artifact_tensor_name(i),
                                 match layer.serialize()? {
                                     Cow::Borrowed(_) => unreachable!(),
                                     Cow::Owned(owned) => owned,
@@ -732,7 +792,7 @@ pub trait IsqModel {
                                 .filter(|(_, (layer, _))| layer.isq_serde_supported())
                                 .map(|(i, (layer, _))| {
                                     Ok((
-                                        i.to_string(),
+                                        artifact_tensor_name(i),
                                         match layer.serialize()? {
                                             Cow::Borrowed(_) => unreachable!(),
                                             Cow::Owned(owned) => owned,
@@ -748,7 +808,7 @@ pub trait IsqModel {
                                 .filter(|(_, (layer, _))| layer.isq_serde_supported())
                                 .map(|(i, (layer, _))| {
                                     Ok((
-                                        i.to_string(),
+                                        artifact_tensor_name(i),
                                         match layer.serialize()? {
                                             Cow::Borrowed(_) => unreachable!(),
                                             Cow::Owned(owned) => owned,
@@ -970,9 +1030,13 @@ pub trait IsqModel {
         topology: Option<&Topology>,
         silent: bool,
         artifacts: &[PathBuf],
+        source_weights: Option<UqffSourceWeights<'_>>,
     ) -> candle_core::Result<()> {
+        // Must be computed before `get_layers` takes its `&mut self` borrows.
+        let mtp_tail = self.mtp_isq_tail_len();
         let (tensors, mapper) = self.get_layers();
         let total_tensors = tensors.len();
+        let main_len = total_tensors.saturating_sub(mtp_tail);
 
         let layers = topology.map(|x| {
             x.layers
@@ -1009,17 +1073,44 @@ pub trait IsqModel {
 
         let artifacts = unsafe { candle_core::safetensors::MmapedSafetensors::multi(artifacts)? };
 
-        let artifact_isqs = artifacts
-            .tensors()
-            .into_iter()
-            .map(|(name, tensor)| {
-                (
-                    name.parse::<usize>()
-                        .expect("Name should be parseable as usize"),
-                    tensor,
-                )
-            })
-            .collect::<HashMap<_, _>>();
+        // Artifact names are positional `get_layers()` indices for the main
+        // model, plus `mtp.<j>`-prefixed names for the OPTIONAL MTP decoder
+        // block tail (see UQFF_MTP_TENSOR_PREFIX). Map `mtp.<j>` onto the
+        // trailing MTP layers when the block is loaded; skip them when it is
+        // not (`--mtp-depth 0` serve of an MTP-baked artifact).
+        let mut artifact_isqs = HashMap::new();
+        let mut skipped_mtp_artifacts = 0usize;
+        for (name, tensor) in artifacts.tensors() {
+            if let Some(j) = name.strip_prefix(UQFF_MTP_TENSOR_PREFIX) {
+                let j = j.parse::<usize>().map_err(|_| {
+                    candle_core::Error::msg(format!(
+                        "UQFF artifact tensor name `{name}` is not `{UQFF_MTP_TENSOR_PREFIX}<index>`"
+                    ))
+                })?;
+                if mtp_tail == 0 {
+                    skipped_mtp_artifacts += 1;
+                    continue;
+                }
+                if j >= mtp_tail {
+                    candle_core::bail!(
+                        "UQFF artifact MTP tensor `{name}` is out of range: the loaded MTP block has {mtp_tail} ISQ layers"
+                    );
+                }
+                artifact_isqs.insert(main_len + j, tensor);
+            } else {
+                let i = name.parse::<usize>().map_err(|_| {
+                    candle_core::Error::msg(format!(
+                        "UQFF artifact tensor name `{name}` is not a positional index"
+                    ))
+                })?;
+                artifact_isqs.insert(i, tensor);
+            }
+        }
+        if skipped_mtp_artifacts > 0 {
+            info!(
+                "UQFF artifact contains {skipped_mtp_artifacts} MTP decoder block tensors but the MTP block is not loaded (`--mtp-depth 0`); skipping them."
+            );
+        }
 
         // Artifacts only exist for `isq_serde_supported()` layers. Non-serde
         // layers (norms, BF16 compressor, etc.) keep their constructed values
@@ -1274,11 +1365,44 @@ pub trait IsqModel {
                 .collect::<candle_core::Result<Vec<_>>>()?;
         }
 
-        // Verify no DummyLayers remain after deserialization
+        // Verify no DummyLayers remain after deserialization. One legitimate
+        // gap exists: an artifact baked WITHOUT `--mtp-depth` has no MTP
+        // decoder block tensors, so a `--mtp-depth > 0` serve leaves the
+        // trailing MTP layers as DummyLayers. In that case, reload the block
+        // unquantized from the source checkpoint instead of dying.
         {
-            let (check_tensors, _) = self.get_layers();
-            for (i, (tensor, layer_num)) in check_tensors.iter().enumerate() {
-                if tensor.name() == "dummy" {
+            let still_dummy = {
+                let (check_tensors, _) = self.get_layers();
+                check_tensors
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (tensor, _))| tensor.name() == "dummy")
+                    .map(|(i, (_, layer_num))| (i, *layer_num))
+                    .collect::<Vec<_>>()
+            };
+            if !still_dummy.is_empty() {
+                let only_mtp_tail = mtp_tail > 0 && still_dummy.iter().all(|(i, _)| *i >= main_len);
+                let repaired = if only_mtp_tail {
+                    if let Some(source) = &source_weights {
+                        self.load_mtp_block_from_source(source)?
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if repaired {
+                    // The reloaded block must have replaced every dummy.
+                    let (check_tensors, _) = self.get_layers();
+                    for (i, (tensor, layer_num)) in check_tensors.iter().enumerate() {
+                        if tensor.name() == "dummy" {
+                            candle_core::bail!(
+                                "DummyLayer not replaced at index {i}, layer {layer_num:?} after MTP source-checkpoint fallback"
+                            );
+                        }
+                    }
+                } else {
+                    let (i, layer_num) = still_dummy[0];
                     candle_core::bail!(
                         "DummyLayer not replaced at index {i}, layer {layer_num:?} after load_from_artifacts"
                     );
