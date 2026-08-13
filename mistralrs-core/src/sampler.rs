@@ -260,6 +260,14 @@ fn partial_sort_top_k(probs: &mut [f32], k: usize, zero_rest: bool) -> Vec<(u32,
     idx_probs
 }
 
+/// Kernel dispatch sizes for the GPU radix top-k sampler path. Must mirror
+/// `arc_cuda_graph::flashmlasparse::SUPPORTED_TOPK` (kept as a local const so
+/// the candidate-truncation logic and its CPU-parity tests build without the
+/// `cuda` feature; the CUDA wrapper re-validates and errors — triggering the
+/// CPU fallback — if the tables ever diverge).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const GPU_RADIX_TOPK_SIZES: &[usize] = &[64, 128, 256, 512, 1024];
+
 /// Find the index of the maximum element in a slice. O(n) scan.
 #[inline]
 fn argmax_f32(values: &[f32]) -> u32 {
@@ -603,6 +611,185 @@ impl Sampler {
             bytes,
         })
     }
+    /// Truncate a candidate set (token id, full-softmax prob) to the kept
+    /// sampling distribution, replicating `sample_top_kp_min_p`'s semantics
+    /// exactly: top-k first, then top-p (descending cumsum, the crossing
+    /// element kept), then min-p — with min-p skipped whenever top_p is
+    /// outside (0, 1), mirroring that function's early-return structure.
+    ///
+    /// `candidates` must contain the top `candidates.len()` tokens of the
+    /// full distribution (any order). Returns `None` when exactness cannot
+    /// be guaranteed: a pure-top-p request (top_k <= 0) whose nucleus is not
+    /// fully contained in the candidate set (candidate mass < top_p). With
+    /// top_k > 0 containment is structural since the caller selects
+    /// `k_sel >= top_k` candidates.
+    ///
+    /// Returned pairs are sorted descending by probability.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    fn truncate_topk_candidates(&self, mut candidates: Vec<(u32, f32)>) -> Option<Vec<(u32, f32)>> {
+        // Descending by prob; ascending-index tiebreak for determinism.
+        candidates.sort_unstable_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+
+        // Top-k truncation (candidates are a superset: k_sel >= top_k).
+        if self.top_k > 0 && (self.top_k as usize) < candidates.len() {
+            candidates.truncate(self.top_k as usize);
+        }
+
+        let top_p = self.top_p as f32;
+        let min_p = self.min_p as f32;
+
+        if top_p > 0.0 && top_p < 1.0 {
+            if self.top_k <= 0 {
+                let mass: f32 = candidates.iter().map(|(_, p)| *p).sum();
+                if mass < top_p {
+                    return None;
+                }
+            }
+            // CPU-path top-p: walk descending, keep while cumsum < top_p (so
+            // the element that crosses the threshold is kept), drop the rest.
+            let mut cumsum = 0.0f32;
+            candidates.retain(|(_, p)| {
+                if cumsum >= top_p {
+                    false
+                } else {
+                    cumsum += *p;
+                    true
+                }
+            });
+            // CPU-path min-p (`min_p_threshold >= prob` is dropped). Only
+            // reached when top_p is in (0, 1) — `sample_top_kp_min_p`
+            // returns before min-p otherwise.
+            if min_p > 0.0 && min_p < 1.0 {
+                let max_p = candidates.first().map(|(_, p)| *p).unwrap_or(0.0);
+                let threshold = max_p * min_p;
+                candidates.retain(|(_, p)| *p > threshold);
+            }
+        }
+
+        Some(candidates)
+    }
+
+    /// Multinomial-sample from a truncated candidate set produced by
+    /// [`Self::truncate_topk_candidates`].
+    ///
+    /// The kept pairs are re-ordered by ascending token id before building
+    /// the `WeightedIndex`, so the f32 cumulative-weight sequence is
+    /// identical to the CPU path's full-vocab `WeightedIndex` (zeroed-out
+    /// tokens contribute exactly nothing to f32 partial sums) — the same rng
+    /// state therefore yields the same token as `sample_top_kp_min_p`.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    fn sample_from_topk_candidates(
+        &self,
+        candidates: Vec<(u32, f32)>,
+        rng: Arc<Mutex<Isaac64Rng>>,
+    ) -> Result<Option<Logprobs>> {
+        let Some(mut kept) = self.truncate_topk_candidates(candidates) else {
+            return Ok(None);
+        };
+        if kept.is_empty() {
+            return Ok(None);
+        }
+
+        kept.sort_unstable_by_key(|(token, _)| *token);
+        let weights: Vec<f32> = kept.iter().map(|(_, p)| *p).collect();
+        let distr = WeightedIndex::new(&weights).map_err(Error::wrap)?;
+        let choice = {
+            let mut mut_ref_rng = &mut *rng.lock().expect("could not lock rng mutex");
+            distr.sample(&mut mut_ref_rng)
+        };
+        let (token, prob) = kept[choice];
+        let logprob = prob.log(10.0);
+
+        let bytes = if let Some(tokenizer) = &self.tokenizer {
+            Some(
+                tokenizer
+                    .decode(&[token], false)
+                    .map_err(|x| Error::Msg(x.to_string()))?,
+            )
+        } else {
+            None
+        };
+
+        Ok(Some(Logprobs {
+            token,
+            logprob,
+            top_logprobs: None,
+            bytes,
+        }))
+    }
+
+    /// GPU radix-select sampling for vocabularies too large for candle's
+    /// shared-memory arg_sort (the fallback introduced in 947a9c2fc).
+    /// Instead of D2H-ing the whole ~129K-logit tensor and sorting it on the
+    /// CPU, select the top `k_sel` candidate tokens on-GPU with the
+    /// flashmlasparse radix top-k kernel (multi-pass radix-256 select over
+    /// global memory — no shared-memory vocab limit), then run the exact CPU
+    /// truncation semantics on the tiny candidate set (<= 1024 entries,
+    /// ~8 KB D2H instead of ~516 KB + a full-vocab sort).
+    ///
+    /// Returns Ok(None) when this path cannot guarantee exactness — top_k
+    /// above the kernel cap, or a pure-top-p request whose nucleus is not
+    /// contained in the selected candidates — and the caller falls back to
+    /// the CPU path.
+    #[cfg(feature = "cuda")]
+    fn sample_fast_topk_gpu(
+        &self,
+        logits: &Tensor,
+        rng: Arc<Mutex<Isaac64Rng>>,
+    ) -> Result<Option<Logprobs>> {
+        let vocab = logits.dim(D::Minus1)?;
+        let max_k = *GPU_RADIX_TOPK_SIZES.last().unwrap();
+        let k_needed = if self.top_k > 0 {
+            self.top_k as usize
+        } else {
+            max_k
+        };
+        // Round up to the kernel's dispatch table (top-k truncation happens
+        // exactly on the candidate set). `vocab <= k_sel` never occurs on
+        // this path (the small-vocab sort already fits in shared memory) but
+        // is excluded anyway so the kernel's identity-fill mode stays out of
+        // scope.
+        if k_needed > max_k || vocab <= max_k {
+            return Ok(None);
+        }
+        let Some(k_sel) = GPU_RADIX_TOPK_SIZES
+            .iter()
+            .copied()
+            .find(|&s| s >= k_needed)
+        else {
+            return Ok(None);
+        };
+
+        let logits_f32 = logits.to_dtype(DType::F32)?;
+        let probs =
+            candle_nn::ops::softmax_last_dim(&(&logits_f32 / self.temperature.unwrap_or(1.))?)?;
+        // Select on the raw logits, not the probs: softmax (with positive
+        // temperature) is monotonic so the top-k set is identical, but
+        // post-softmax values cluster near 0.0 and would collapse into a
+        // single bucket of the kernel's coarse fp16 radix pass; logits are
+        // well-spread.
+        let indices = arc_cuda_graph::flashmlasparse::radix_topk_rows_f32(
+            &logits_f32.reshape((1, vocab))?,
+            k_sel,
+        )?
+        .reshape((k_sel,))?;
+        let values = probs.gather(&indices, D::Minus1)?;
+
+        let token_ids = indices.to_vec1::<u32>()?;
+        let token_probs = values.to_vec1::<f32>()?;
+        let candidates: Vec<(u32, f32)> = token_ids
+            .into_iter()
+            .zip(token_probs)
+            .filter(|(token, _)| *token != u32::MAX)
+            .collect();
+
+        self.sample_from_topk_candidates(candidates, rng)
+    }
+
     fn sample_speculative_top_kp_min_p(
         &self,
         logits: Tensor,
@@ -1000,6 +1187,21 @@ impl Sampler {
                     self.min_p,
                 );
             }
+            // Big-vocab GPU path: radix-select the top candidate tokens
+            // on-GPU (no shared-memory limit) and finish with the exact CPU
+            // truncation + multinomial semantics on <= 1024 candidates. Falls
+            // through to the full CPU path when exactness cannot be
+            // guaranteed (Ok(None)) or on any GPU error.
+            #[cfg(feature = "cuda")]
+            if logits.device().is_cuda() {
+                match self.sample_fast_topk_gpu(&logits, rng.clone()) {
+                    Ok(Some(result)) => return Ok(result),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!("GPU radix top-k sampling failed; falling back to CPU: {e}");
+                    }
+                }
+            }
             // else: fall through to the CPU sampling path (correct on any vocab).
         }
 
@@ -1218,7 +1420,11 @@ mod tests {
             // Greedy (None temp), top_k/top_p/min_p disabled: argmax over penalized logits.
             Sampler::new(None, 0, None, freq, pres, rep, None, -1, 1.0, 0.0, vec![]).unwrap()
         };
-        let sample = |s: &Sampler| s.sample(logits(), &context, false, rng(), false, false).unwrap().token;
+        let sample = |s: &Sampler| {
+            s.sample(logits(), &context, false, rng(), false, false)
+                .unwrap()
+                .token
+        };
 
         // No penalty: the loop continues — greedy re-selects the attractor.
         assert_eq!(
@@ -1246,6 +1452,216 @@ mod tests {
             sample(&mk(None, Some(2.0), None)),
             1,
             "presence_penalty must break the loop"
+        );
+    }
+}
+
+/// CPU-parity tests for the GPU radix top-k sampling path.
+///
+/// The GPU path is: radix-select the top `k_sel` tokens on-GPU, then run
+/// `truncate_topk_candidates` + `sample_from_topk_candidates` on the selected
+/// set. These tests drive that exact downstream logic with a CPU reference
+/// selection (descending sort, take `k_sel` — the spec for the radix kernel)
+/// and pin it against the CPU sampling path (`sample_top_kp_min_p`) at the
+/// distribution level: same kept token set, same probabilities, and — because
+/// the kept weights are re-ordered by token id — the same drawn token for the
+/// same rng seed.
+#[cfg(test)]
+mod topk_parity_tests {
+    use super::*;
+    use rand::SeedableRng;
+
+    const VOCAB: usize = 4096;
+    const TEMPERATURE: f64 = 0.7;
+
+    /// Deterministic peaked logits in [-6, 6] (tie-free in practice), spread
+    /// wide enough that the top-1024 tokens carry >0.99 of the softmax mass
+    /// (so pure-top-p nucleus containment holds, as it does for trained-LLM
+    /// distributions).
+    fn peaked_logits(seed: u64) -> Vec<f32> {
+        let mut state: u64 = seed ^ 0xDEAD_BEEF_CAFE_F00D;
+        (0..VOCAB)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 32) as u32 as f32 / u32::MAX as f32) * 12.0 - 6.0
+            })
+            .collect()
+    }
+
+    /// Full-vocab softmax probabilities exactly as `Sampler::sample`'s CPU
+    /// path computes them (tensor division + `softmax_last_dim`).
+    fn softmax_probs(logits: &[f32]) -> Vec<f32> {
+        let t = Tensor::from_vec(logits.to_vec(), logits.len(), &Device::Cpu).unwrap();
+        let t = (t / TEMPERATURE).unwrap();
+        candle_nn::ops::softmax_last_dim(&t)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    /// CPU reference for the radix kernel: top `k_sel` (token, prob) pairs by
+    /// descending probability (ascending-token tiebreak).
+    fn reference_topk_candidates(probs: &[f32], k_sel: usize) -> Vec<(u32, f32)> {
+        let mut pairs: Vec<(u32, f32)> = probs
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i as u32, *p))
+            .collect();
+        pairs.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        pairs.truncate(k_sel.min(pairs.len()));
+        pairs
+    }
+
+    fn make_sampler(top_k: i64, top_p: f64, min_p: f64) -> Sampler {
+        Sampler::new(
+            Some(TEMPERATURE),
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            top_k,
+            top_p,
+            min_p,
+            vec![],
+        )
+        .unwrap()
+    }
+
+    /// Mirror of `sample_fast_topk_gpu`'s candidate-count selection.
+    fn k_sel_for(top_k: i64) -> usize {
+        let max_k = *GPU_RADIX_TOPK_SIZES.last().unwrap();
+        let k_needed = if top_k > 0 { top_k as usize } else { max_k };
+        GPU_RADIX_TOPK_SIZES
+            .iter()
+            .copied()
+            .find(|&s| s >= k_needed)
+            .unwrap()
+    }
+
+    const CASES: &[(i64, f64, f64)] = &[
+        (40, 1.0, 0.0),    // pure top-k
+        (200, 0.9, 0.0),   // top-k + top-p
+        (0, 0.9, 0.0),     // pure top-p (nucleus containment via peaked logits)
+        (100, 0.95, 0.05), // top-k + top-p + min-p
+        (64, 0.3, 0.0),    // aggressive top-p
+        (50, 0.0, 0.2),    // top_p out of (0,1): CPU skips top-p AND min-p
+    ];
+
+    /// Same kept set + same probabilities as the CPU path's in-place zeroing.
+    #[test]
+    fn candidate_truncation_matches_cpu_zeroing() {
+        for seed in [1u64, 2, 3] {
+            let probs = softmax_probs(&peaked_logits(seed));
+            for &(top_k, top_p, min_p) in CASES {
+                let sampler = make_sampler(top_k, top_p, min_p);
+
+                // CPU path: sample_top_kp_min_p zeroes everything it drops.
+                let mut cpu_probs = probs.clone();
+                let rng = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(seed)));
+                sampler
+                    .sample_top_kp_min_p(
+                        &mut cpu_probs,
+                        top_k,
+                        top_p as f32,
+                        min_p as f32,
+                        false,
+                        rng,
+                    )
+                    .unwrap();
+                let mut cpu_kept: Vec<(u32, f32)> = cpu_probs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| **p != 0.0)
+                    .map(|(i, p)| (i as u32, *p))
+                    .collect();
+                cpu_kept.sort_unstable_by_key(|(t, _)| *t);
+
+                // Candidate path with the CPU reference selection.
+                let candidates = reference_topk_candidates(&probs, k_sel_for(top_k));
+                let mut kept = sampler
+                    .truncate_topk_candidates(candidates)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "seed={seed} case=({top_k},{top_p},{min_p}): guard unexpectedly failed"
+                        )
+                    });
+                kept.sort_unstable_by_key(|(t, _)| *t);
+
+                assert_eq!(
+                    kept, cpu_kept,
+                    "seed={seed} case=({top_k},{top_p},{min_p}): kept set/probs diverge"
+                );
+            }
+        }
+    }
+
+    /// Same rng seed => same sampled token + logprob as the CPU path.
+    #[test]
+    fn candidate_sampling_matches_cpu_token() {
+        for seed in [7u64, 8, 9] {
+            let probs = softmax_probs(&peaked_logits(seed));
+            for &(top_k, top_p, min_p) in CASES {
+                let sampler = make_sampler(top_k, top_p, min_p);
+
+                let rng_cpu = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(seed * 31 + 1)));
+                let mut cpu_probs = probs.clone();
+                let expected = sampler
+                    .sample_top_kp_min_p(
+                        &mut cpu_probs,
+                        top_k,
+                        top_p as f32,
+                        min_p as f32,
+                        false,
+                        rng_cpu,
+                    )
+                    .unwrap();
+
+                let rng_gpu = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(seed * 31 + 1)));
+                let candidates = reference_topk_candidates(&probs, k_sel_for(top_k));
+                let actual = sampler
+                    .sample_from_topk_candidates(candidates, rng_gpu)
+                    .unwrap()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "seed={seed} case=({top_k},{top_p},{min_p}): guard unexpectedly failed"
+                        )
+                    });
+
+                assert_eq!(
+                    actual.token, expected.token,
+                    "seed={seed} case=({top_k},{top_p},{min_p}): token diverges"
+                );
+                assert!(
+                    (actual.logprob - expected.logprob).abs() < 1e-6,
+                    "seed={seed} case=({top_k},{top_p},{min_p}): logprob {} != {}",
+                    actual.logprob,
+                    expected.logprob
+                );
+            }
+        }
+    }
+
+    /// Pure-top-p whose nucleus exceeds the candidate budget must refuse
+    /// (return None) rather than truncate the distribution: near-uniform
+    /// logits over 4096 tokens put ~25% of the mass in the top 1024, well
+    /// under top_p=0.9.
+    #[test]
+    fn pure_topp_fat_nucleus_falls_back() {
+        let logits: Vec<f32> = (0..VOCAB).map(|i| (i % 17) as f32 * 1e-3).collect();
+        let probs = softmax_probs(&logits);
+        let sampler = make_sampler(0, 0.9, 0.0);
+        let candidates = reference_topk_candidates(&probs, k_sel_for(0));
+        assert!(
+            sampler.truncate_topk_candidates(candidates).is_none(),
+            "fat nucleus must trigger the CPU fallback, not silent truncation"
         );
     }
 }
