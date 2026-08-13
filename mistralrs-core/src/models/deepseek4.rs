@@ -1275,11 +1275,18 @@ impl Attention {
         //
         // V4 has two cache backends — a plain in-process `KvCache` (the
         // None paged_attn arm) and the engine-level `PagedAttention` (the
-        // Some paged_attn arm). For each, `compress_ratio == Standard`
-        // routes through dense MLA-style SDPA / paged kernel exactly as in
-        // V3, and `compress_ratio == Csa | Hca` routes through the V4
-        // hybrid `dsv4_attention` dispatch (compressor.forward over the
-        // full K/V + sliding-window local branch, blended 0.5/0.5).
+        // Some paged_attn arm). EVERY layer routes through the V4
+        // `dsv4_attention` dispatch: `Standard` layers are sliding-window +
+        // attn_sink (the reference SWA-onlys ratio-0 layers — SGLang
+        // `deepseek_v4_backend.py` attends ratio-0 with `swa_page_indices`
+        // only; vLLM `swa_only = compress_ratio <= 1`), and `Csa | Hca`
+        // layers add the compressed (distant-context) branch in the same
+        // single softmax. The previous wiring sent Standard layers through
+        // dense causal SDPA / the dense paged kernel, which fed the
+        // window-trained layers 0/1/42 unseen relative distances and
+        // collapsed generation once the context crossed the 128-token
+        // window (the long-ctx repetition failure; window-only ablation
+        // unaffected because these layers are not gated by it).
         //
         // RUN-167 fixes the PagedAttention + CSA/HCA combination: the
         // previous wiring (`kv_cache.append`, then dsv4_attention) wrote
@@ -1312,38 +1319,12 @@ impl Attention {
             self.compressed_kv(&xs_for_compressor)?
         };
         let mut attn_out = match &self.paged_attn {
-            Some(paged_attn) if self.compress_ratio == CompressRatio::Standard => match metadata {
-                Some(((key_cache, value_cache, _, _), input_metadata)) => paged_attn.forward(
-                    &q,
-                    &k,
-                    &v,
-                    attention_mask,
-                    Some(key_cache),
-                    Some(value_cache),
-                    input_metadata,
-                    &self.sdpa_params,
-                    Some(flash_params),
-                )?,
-                None => {
-                    let input_metadata = PagedAttentionInputMetadata::dummy(q.device())?;
-                    assert!(attention_mask.is_some());
-                    paged_attn.forward(
-                        &q,
-                        &k,
-                        &v,
-                        attention_mask,
-                        None,
-                        None,
-                        &input_metadata,
-                        &self.sdpa_params,
-                        Some(flash_params),
-                    )?
-                }
-            },
             Some(paged_attn) => match metadata {
-                // CSA / HCA + PagedAttention: write to paged cache, gather
-                // the full context, then run the V4 compress dispatch over
-                // the gathered K/V. RUN-167.
+                // PagedAttention (all compress ratios): write to paged
+                // cache, gather the full context, then run the V4 dispatch
+                // over the gathered K/V. RUN-167. Standard layers also go
+                // through `dsv4_attention` — they need the sliding-window
+                // mask, which the dense paged kernel cannot apply.
                 Some(((mut key_cache, mut value_cache, _, _), input_metadata)) => {
                     let (k_full, v_full) = paged_attn.cache_write_and_gather(
                         &k,
@@ -4598,10 +4579,11 @@ mod tests {
         Ok(())
     }
 
-    /// Standard layers (compress_ratio == 0) under both dispatch arms are
-    /// expected to bypass the compressor entirely and route through plain
-    /// SDPA. This test guards against the inverse failure: a Standard layer
-    /// accidentally going through the compress branch.
+    /// Standard layers (compress_ratio == 0) must bypass the compressed
+    /// branch entirely — they are sliding-window + sink only (the reference
+    /// SWA-onlys ratio-0 layers; see `dsv4_attention` module docs). This test
+    /// guards against the inverse failure: a Standard layer accidentally
+    /// attending over compressed KV.
     #[test]
     fn paged_attn_compress_dispatch_skips_compressor_for_standard_layers() -> Result<()> {
         use crate::models::dsv4_attention::{dsv4_attention, Dsv4AttentionConfig};
@@ -4646,29 +4628,50 @@ mod tests {
             sliding_window: 4,
         };
 
-        // Standard layers must bypass the compressed branch entirely: even if a
-        // caller (paranoically) supplied compressed KV, the Standard dispatch
-        // returns plain SDPA before touching it. Pass `None` here — the real
-        // `Attention::compressed_kv` returns `None` for Standard layers anyway.
-        let out = dsv4_attention(
+        // Standard layers must bypass the compressed branch entirely: even if
+        // a caller (paranoically) supplies compressed KV, the Standard
+        // dispatch drops it before the union — the output must be identical
+        // to the no-compressed-KV call. (The real `Attention::compressed_kv`
+        // returns `None` for Standard layers anyway.)
+        let out = dsv4_attention(&q, &k, &v, None, None, &flash_params, &sdpa_params, cfg)?;
+        let stray_comp = Tensor::from_vec(
+            (0..(b * h * 2 * d))
+                .map(|i| (i as f32) * 0.02)
+                .collect::<Vec<f32>>(),
+            (b, h, 2, d),
+            &device,
+        )?;
+        let out_with_stray = dsv4_attention(
             &q,
             &k,
             &v,
-            None,
+            Some(&stray_comp),
             None,
             &flash_params,
             &sdpa_params,
             cfg,
         )?;
-        let sdpa_dense = Sdpa.run_attention(&q, &k, &v, None, Some(&flash_params), &sdpa_params)?;
         let a: Vec<f32> = out.flatten_all()?.to_vec1()?;
-        let b: Vec<f32> = sdpa_dense.flatten_all()?.to_vec1()?;
+        let b: Vec<f32> = out_with_stray.flatten_all()?.to_vec1()?;
         for (av, bv) in a.iter().zip(b.iter()) {
             assert!(
                 (av - bv).abs() < 1e-6,
-                "Standard layer diverged from plain SDPA: {av} vs {bv}"
+                "Standard layer attended over stray compressed KV: {av} vs {bv}"
             );
         }
+        // And the windowed semantics hold: with window == 4 < t == 8 the
+        // output must NOT equal dense (unwindowed) SDPA.
+        let sdpa_dense = Sdpa.run_attention(&q, &k, &v, None, Some(&flash_params), &sdpa_params)?;
+        let dn: Vec<f32> = sdpa_dense.flatten_all()?.to_vec1()?;
+        let max_diff = a
+            .iter()
+            .zip(dn.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "Standard layer output matches dense SDPA — sliding window not applied"
+        );
         Ok(())
     }
 }
