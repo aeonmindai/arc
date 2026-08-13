@@ -304,6 +304,7 @@ pub mod in_process {
                 top_k: Some(1),
                 top_p: None,
                 min_p: None,
+                top_nsigma: None,
                 top_n_logprobs: 0,
                 frequency_penalty: None,
                 presence_penalty: None,
@@ -313,6 +314,8 @@ pub mod in_process {
                 logits_bias: None,
                 n_choices: 1,
                 dry_params: None,
+                early_stop_confidence: None,
+                reasoning_budget: None,
             };
 
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Response>(32);

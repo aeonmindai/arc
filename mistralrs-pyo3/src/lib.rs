@@ -1232,6 +1232,10 @@ impl Runner {
                     logits_bias: request.logit_bias.clone(),
                     n_choices: request.n_choices,
                     min_p: request.min_p,
+                    // Arc Boost params are not yet exposed through the Python SDK.
+                    top_nsigma: None,
+                    early_stop_confidence: None,
+                    reasoning_budget: None,
                     dry_params,
                 },
                 response: tx,
@@ -1426,6 +1430,10 @@ impl Runner {
                     logits_bias: request.logit_bias.clone(),
                     n_choices: request.n_choices,
                     min_p: request.min_p,
+                    // Arc Boost params are not yet exposed through the Python SDK.
+                    top_nsigma: None,
+                    early_stop_confidence: None,
+                    reasoning_budget: None,
                     dry_params,
                 },
                 response: tx,
@@ -1966,6 +1974,10 @@ impl Runner {
                     logits_bias: request.logit_bias.clone(),
                     n_choices: request.n_choices,
                     min_p: request.min_p,
+                    // Arc Boost params are not yet exposed through the Python SDK.
+                    top_nsigma: None,
+                    early_stop_confidence: None,
+                    reasoning_budget: None,
                     dry_params,
                 },
                 response: tx,
@@ -2069,6 +2081,10 @@ impl Runner {
                     logits_bias: request.logit_bias.clone(),
                     n_choices: request.n_choices,
                     min_p: request.min_p,
+                    // Arc Boost params are not yet exposed through the Python SDK.
+                    top_nsigma: None,
+                    early_stop_confidence: None,
+                    reasoning_budget: None,
                     dry_params,
                 },
                 response: tx,

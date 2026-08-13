@@ -33,6 +33,12 @@ pub struct SamplingParams {
     pub top_k: Option<usize>,
     pub top_p: Option<f64>,
     pub min_p: Option<f64>,
+    /// Top-nσ sampling (Tang et al. 2024, arXiv:2411.07641): keep only tokens
+    /// whose logit is within `n * std_dev` of the maximum logit. Applied on the
+    /// raw pre-temperature logits, which makes the kept set provably invariant
+    /// to temperature (dividing logits by `T` scales max-gap and σ equally).
+    /// `n -> 0` reduces to greedy; larger `n` admits more of the tail.
+    pub top_nsigma: Option<f32>,
     pub top_n_logprobs: usize,
     pub frequency_penalty: Option<f32>,
     pub presence_penalty: Option<f32>,
@@ -42,6 +48,22 @@ pub struct SamplingParams {
     pub logits_bias: Option<HashMap<u32, f32>>,
     pub n_choices: usize,
     pub dry_params: Option<DrySamplingParams>,
+    /// Arc Boost (DeepConf-low, simplified): cull this request's sibling vote
+    /// chains whose lowest-group confidence falls below `best / frac` in log
+    /// space, where `best` is the best sibling chain's lowest-group confidence.
+    /// Only meaningful with `n_choices > 1`; see `crate::arc_boost`.
+    pub early_stop_confidence: Option<f32>,
+    /// Arc Boost budget policy: cap "thinking" tokens at this many generated
+    /// tokens. Where a `<think>` structure is active and the chat template's
+    /// end-think token is known, the cap is graceful: the end-think token is
+    /// injected so the model wraps up and still emits a final answer.
+    /// Otherwise this degrades to a hard `max_len`-style cap.
+    ///
+    /// Empirical basis (Arc GPU session 1, GSM8K n=50): easy-math accuracy
+    /// saturates by ~256 thinking tokens, and hard truncation (640-token cap,
+    /// 33/50 truncated) accounted for roughly half of the observed GSM8K loss
+    /// — hence graceful wrap-up instead of hard truncation.
+    pub reasoning_budget: Option<usize>,
 }
 
 impl SamplingParams {
@@ -55,6 +77,7 @@ impl SamplingParams {
             top_k: Some(1),
             top_p: None,
             min_p: None,
+            top_nsigma: None,
             top_n_logprobs: 0,
             frequency_penalty: None,
             presence_penalty: None,
@@ -64,6 +87,8 @@ impl SamplingParams {
             logits_bias: None,
             n_choices: 1,
             dry_params: None,
+            early_stop_confidence: None,
+            reasoning_budget: None,
         }
     }
 }
@@ -192,6 +217,7 @@ pub struct Sampler {
     top_k: i64,
     top_p: f64,
     min_p: f64,
+    top_nsigma: Option<f32>,
     logits_processors: Vec<Arc<dyn CustomLogitsProcessor>>,
     /// Cached Gumbel noise tensor to avoid reallocating it.
     gumbel_cache: Arc<Mutex<Option<Tensor>>>,
@@ -292,6 +318,7 @@ impl Sampler {
         top_k: i64,
         top_p: f64,
         min_p: f64,
+        top_nsigma: Option<f32>,
         logits_processors: Vec<Arc<dyn CustomLogitsProcessor>>,
     ) -> anyhow::Result<Self> {
         let temperature = if temperature.is_none_or(|v| v < 1e-7) {
@@ -299,6 +326,8 @@ impl Sampler {
         } else {
             temperature
         };
+        // Negative n is meaningless (it would filter out even the argmax).
+        let top_nsigma = top_nsigma.filter(|n| *n >= 0.0 && n.is_finite());
         let dry_params = if let Some(ref tokenizer) = tokenizer {
             dry_params.map(|params| DrySamplingParamsInner::from(params, tokenizer))
         } else {
@@ -319,6 +348,7 @@ impl Sampler {
             top_k,
             top_p,
             min_p,
+            top_nsigma,
             logits_processors,
             gumbel_cache: Arc::new(Mutex::new(None)),
         })
@@ -337,6 +367,13 @@ impl Sampler {
     /// Effective top_k. Values <=0 mean no top_k filtering.
     pub fn top_k(&self) -> i64 {
         self.top_k
+    }
+
+    /// Top-nσ threshold (None means disabled). The autonomous-decode GPU
+    /// sampler does not implement this filter, so callers should refuse the
+    /// autonomous fast-path when this returns Some.
+    pub fn top_nsigma(&self) -> Option<f32> {
+        self.top_nsigma
     }
 
     /// Frequency penalty (None means disabled).
@@ -1110,6 +1147,43 @@ impl Sampler {
         Ok(())
     }
 
+    /// Top-nσ filtering (Tang et al. 2024, arXiv:2411.07641): mask (to -inf)
+    /// every logit below `max - n * σ`, where σ is the standard deviation of
+    /// the logits. Runs entirely as device tensor ops (no D2H sync).
+    ///
+    /// Applied on the raw pre-temperature, pre-penalty logits: since dividing
+    /// the logits by a temperature `T` scales both `max - logit` gaps and σ by
+    /// exactly `1/T`, the kept set is provably temperature-invariant. `n = 0`
+    /// keeps only the argmax (and exact ties); the argmax itself always
+    /// survives the filter for any `n >= 0`.
+    ///
+    /// Statistics are computed over finite entries only, so logits already
+    /// masked to -inf (e.g. by constraint biasing) neither poison σ nor get
+    /// resurrected.
+    fn apply_top_nsigma(&self, logits: &Tensor, nsigma: f32) -> Result<Tensor> {
+        let logits_f32 = logits.to_dtype(DType::F32)?;
+        let zeros = logits_f32.zeros_like()?;
+        // Finite entries: anything >= f32::MIN (excludes -inf and NaN).
+        let finite_mask = logits_f32.ge(f32::MIN as f64)?;
+        let count = finite_mask.to_dtype(DType::F32)?.sum_all()?.unsqueeze(0)?;
+        let safe = finite_mask.where_cond(&logits_f32, &zeros)?;
+        let mean = safe.sum_all()?.unsqueeze(0)?.broadcast_div(&count)?;
+        // Zero the masked entries *after* subtracting the mean (select, not
+        // multiply, so -inf never produces NaN), then square.
+        let centered = finite_mask.where_cond(&safe.broadcast_sub(&mean)?, &zeros)?;
+        let std = centered
+            .sqr()?
+            .sum_all()?
+            .unsqueeze(0)?
+            .broadcast_div(&count)?
+            .sqrt()?;
+        let max = logits_f32.max(D::Minus1)?.unsqueeze(0)?;
+        let threshold = max.broadcast_sub(&(std * nsigma as f64)?)?;
+        let keep = logits_f32.broadcast_ge(&threshold)?;
+        let neg_inf = (zeros + f64::NEG_INFINITY)?;
+        keep.where_cond(&logits_f32, &neg_inf)
+    }
+
     #[allow(unused)]
     /// Sample the provided tokens.
     ///
@@ -1124,6 +1198,12 @@ impl Sampler {
         sample_speculative: bool,
         multiple_sequences: bool,
     ) -> Result<Logprobs> {
+        // Top-nσ runs first, on the raw logits, so every downstream path
+        // (GPU fast path, GPU radix top-k, CPU) sees the filtered set.
+        let logits = match self.top_nsigma {
+            Some(nsigma) => self.apply_top_nsigma(&logits, nsigma)?,
+            None => logits,
+        };
         // ── GPU fast path ────────────────────────────────────────────────────
         // For the common request shape (no penalties, no logits processors,
         // no logprobs, no speculative sampling) we can stay entirely on GPU
@@ -1276,6 +1356,7 @@ mod tests {
             32,
             0.1,
             0.05,
+            None,
             vec![],
         )
         .unwrap();
@@ -1316,6 +1397,7 @@ mod tests {
             32,
             0.1,
             0.05,
+            None,
             vec![],
         )
         .unwrap();
@@ -1353,6 +1435,7 @@ mod tests {
             -1,   // top_k disabled
             1.0,  // top_p disabled (>=1.0)
             0.0,  // min_p
+            None, // top_nsigma
             vec![],
         )
         .unwrap();
@@ -1375,6 +1458,7 @@ mod tests {
             40,
             0.95,
             0.0,
+            None,
             vec![],
         )
         .unwrap();
@@ -1384,6 +1468,124 @@ mod tests {
         assert_eq!(s_topp.top_k(), 40);
         assert_eq!(s_topp.frequency_penalty(), Some(0.1));
         assert_eq!(s_topp.presence_penalty(), Some(0.2));
+        assert_eq!(s_topp.top_nsigma(), None);
+    }
+
+    /// Build a sampler with only temperature + top-nσ active (no top-k/p/min-p,
+    /// no penalties) so the CPU multinomial path samples the full filtered set.
+    #[cfg(test)]
+    fn make_nsigma_sampler(temperature: f64, top_nsigma: Option<f32>) -> super::Sampler {
+        super::Sampler::new(
+            Some(temperature),
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            -1,
+            1.0,
+            0.0,
+            top_nsigma,
+            vec![],
+        )
+        .unwrap()
+    }
+
+    /// Top-nσ with n = 0 keeps only the argmax: sampling is exactly greedy at
+    /// any temperature (the n→0 limit of the filter).
+    #[test]
+    fn top_nsigma_zero_is_greedy_at_any_temperature() {
+        use candle_core::{Device, Tensor};
+        use rand::SeedableRng;
+        use rand_isaac::Isaac64Rng;
+        use std::sync::{Arc, Mutex};
+
+        let raw = vec![10.0f32, 9.8, 9.6, 0.0, 0.2, 0.1];
+        for temperature in [0.5, 1.0, 4.0] {
+            let sampler = make_nsigma_sampler(temperature, Some(0.0));
+            let rng = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(7)));
+            for _ in 0..50 {
+                let logits = Tensor::from_vec(raw.clone(), 6, &Device::Cpu).unwrap();
+                let res = sampler
+                    .sample(logits, &[0], false, rng.clone(), false, false)
+                    .unwrap();
+                assert_eq!(res.token, 0, "n=0 must be greedy at T={temperature}");
+            }
+        }
+    }
+
+    /// The kept set {i : logit_i >= max - n*sigma} is computed on the raw
+    /// logits, so it is invariant to temperature: at every temperature the
+    /// observed support equals the analytic kept set and never includes a
+    /// filtered token.
+    #[test]
+    fn top_nsigma_kept_set_is_temperature_invariant() {
+        use candle_core::{Device, Tensor};
+        use rand::SeedableRng;
+        use rand_isaac::Isaac64Rng;
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+
+        let raw = vec![10.0f32, 9.8, 9.6, 0.0, 0.2, 0.1];
+        let nsigma = 1.0f32;
+
+        // Analytic kept set from the same statistics the filter uses.
+        let mean = raw.iter().sum::<f32>() / raw.len() as f32;
+        let var = raw.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / raw.len() as f32;
+        let threshold = raw.iter().cloned().fold(f32::MIN, f32::max) - nsigma * var.sqrt();
+        let expected: HashSet<u32> = raw
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| **l >= threshold)
+            .map(|(i, _)| i as u32)
+            .collect();
+        assert_eq!(expected, HashSet::from([0, 1, 2]), "test fixture sanity");
+
+        for temperature in [0.5, 1.0, 2.0, 5.0] {
+            let sampler = make_nsigma_sampler(temperature, Some(nsigma));
+            let rng = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(42)));
+            let mut support = HashSet::new();
+            for _ in 0..300 {
+                let logits = Tensor::from_vec(raw.clone(), 6, &Device::Cpu).unwrap();
+                let res = sampler
+                    .sample(logits, &[0], false, rng.clone(), false, false)
+                    .unwrap();
+                support.insert(res.token);
+            }
+            assert_eq!(
+                support, expected,
+                "support at T={temperature} must equal the analytic kept set"
+            );
+        }
+    }
+
+    /// A huge n keeps every token, so sampling is bit-identical (same rng
+    /// stream) to a sampler with top-nσ disabled: distribution sanity.
+    #[test]
+    fn top_nsigma_large_n_is_a_no_op() {
+        use candle_core::{Device, Tensor};
+        use rand::SeedableRng;
+        use rand_isaac::Isaac64Rng;
+        use std::sync::{Arc, Mutex};
+
+        let raw = vec![2.0f32, 1.5, 1.0, 0.5, 0.0, -0.5];
+        let with = make_nsigma_sampler(1.0, Some(1000.0));
+        let without = make_nsigma_sampler(1.0, None);
+
+        let draw = |s: &super::Sampler| -> Vec<u32> {
+            let rng = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(1234)));
+            (0..50)
+                .map(|_| {
+                    let logits = Tensor::from_vec(raw.clone(), 6, &Device::Cpu).unwrap();
+                    s.sample(logits, &[0], false, rng.clone(), false, false)
+                        .unwrap()
+                        .token
+                })
+                .collect()
+        };
+
+        assert_eq!(draw(&with), draw(&without));
     }
 
     /// Production regression test for the chat repetition-loop fix.
@@ -1418,7 +1620,21 @@ mod tests {
 
         let mk = |freq, pres, rep| {
             // Greedy (None temp), top_k/top_p/min_p disabled: argmax over penalized logits.
-            Sampler::new(None, 0, None, freq, pres, rep, None, -1, 1.0, 0.0, vec![]).unwrap()
+            Sampler::new(
+                None,
+                0,
+                None,
+                freq,
+                pres,
+                rep,
+                None,
+                -1,
+                1.0,
+                0.0,
+                None,
+                vec![],
+            )
+            .unwrap()
         };
         let sample = |s: &Sampler| {
             s.sample(logits(), &context, false, rng(), false, false)
@@ -1530,6 +1746,7 @@ mod topk_parity_tests {
             top_k,
             top_p,
             min_p,
+            None,
             vec![],
         )
         .unwrap()

@@ -587,6 +587,10 @@ pub struct ChatCompletionRequest {
     pub grammar: Option<Grammar>,
     #[schema(example = json!(Option::None::<f64>))]
     pub min_p: Option<f64>,
+    /// Top-nσ sampling (temperature-invariant): keep only tokens whose logit
+    /// is within `n * std_dev` of the maximum logit.
+    #[schema(example = json!(Option::None::<f32>))]
+    pub top_nsigma: Option<f32>,
     #[schema(example = json!(Option::None::<f32>))]
     pub dry_multiplier: Option<f32>,
     #[schema(example = json!(Option::None::<f32>))]
@@ -604,6 +608,36 @@ pub struct ChatCompletionRequest {
     #[schema(example = json!(Option::None::<bool>))]
     #[serde(default)]
     pub truncate_sequence: Option<bool>,
+
+    // Arc Boost (non-streaming only): confidence-weighted adaptive voting.
+    /// Sample this many chains for the request and return the voted winner as
+    /// `choices[0]` (with all candidates + tally in the response's `vote`
+    /// field). The chains share one sequence group, so the engine decodes
+    /// them in the same forward-pass batch. Mutually exclusive with `stream`.
+    #[schema(example = json!(Option::None::<usize>))]
+    #[serde(default)]
+    pub n_votes: Option<usize>,
+    /// Vote aggregation: "majority" or "confidence_weighted" (default).
+    #[schema(example = json!(Option::None::<String>))]
+    #[serde(default)]
+    pub vote_mode: Option<String>,
+    /// Custom answer-extraction regex for voting (last match wins; capture
+    /// group 1 if present). Defaults to `\boxed{...}` / last-number.
+    #[schema(example = json!(Option::None::<String>))]
+    #[serde(default)]
+    pub answer_regex: Option<String>,
+    /// DeepConf-low early termination: cull a vote chain when its lowest
+    /// group confidence falls below `best_chain_confidence / frac` (log
+    /// space). Meaningful values are in (0, 1); larger is more aggressive.
+    #[schema(example = json!(Option::None::<f32>))]
+    #[serde(default)]
+    pub early_stop_confidence: Option<f32>,
+    /// Arc Boost budget policy: cap thinking tokens; where a `<think>`
+    /// structure is active and the end-think token is known, the cap
+    /// gracefully injects `</think>` instead of truncating.
+    #[schema(example = json!(Option::None::<usize>))]
+    #[serde(default)]
+    pub reasoning_budget: Option<usize>,
 }
 
 /// Function for ChatCompletionRequest.messages Schema generation to handle `Either`
@@ -707,6 +741,11 @@ pub struct CompletionRequest {
     pub grammar: Option<Grammar>,
     #[schema(example = json!(Option::None::<f64>))]
     pub min_p: Option<f64>,
+    /// Top-nσ sampling (temperature-invariant): keep only tokens whose logit
+    /// is within `n * std_dev` of the maximum logit.
+    #[schema(example = json!(Option::None::<f32>))]
+    #[serde(default)]
+    pub top_nsigma: Option<f32>,
     #[schema(example = json!(Option::None::<f32>))]
     pub repetition_penalty: Option<f32>,
     #[schema(example = json!(Option::None::<f32>))]

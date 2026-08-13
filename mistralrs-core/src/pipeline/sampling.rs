@@ -66,6 +66,13 @@ pub(crate) async fn finish_or_add_toks_to_seq(
         }
     };
 
+    // Arc Boost: DeepConf-low early termination of low-confidence vote chains.
+    if is_done.is_none() {
+        if let Some(reason) = seq.check_confidence_early_stop() {
+            is_done = Some(reason);
+        }
+    }
+
     // Handle streaming requests
     if seq.get_mut_group().is_streaming {
         let mut tool_use_still_possible = false;
@@ -275,6 +282,7 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                 | crate::sequence::StopReason::Eos
                 | crate::sequence::StopReason::StopTok(_)
                 | crate::sequence::StopReason::Canceled
+                | crate::sequence::StopReason::LowConfidence
                 | crate::sequence::StopReason::ToolCalls => {
                     String::from_utf8_lossy(seq.completion_bytes())
                         .trim_start()
@@ -356,6 +364,8 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                         reasoning_content,
                     },
                     logprobs: logprobs.map(|l| crate::Logprobs { content: Some(l) }),
+                    confidence: seq.confidence().mean(),
+                    lowest_group_confidence: seq.confidence().lowest_group(),
                 };
                 seq.add_choice_to_group(choice);
             } else {
@@ -394,6 +404,7 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                             system_fingerprint: crate::SYSTEM_FINGERPRINT.to_string(),
                             object: "chat.completion".to_string(),
                             usage: group.get_usage(),
+                            vote: None,
                         },
                         seq.responder(),
                     )
@@ -454,6 +465,9 @@ pub async fn sample_and_add_toks(
 
     for (sampled, seq) in std::iter::zip(sampled_vec, seqs.iter_mut()) {
         let next_token = crate::handle_seq_error_stateaware_ok!(sampled, seq);
+        // Arc Boost budget policy: graceful end-think injection on budget hit.
+        // Applies to the normal decode path only (not speculative decoding).
+        let next_token = seq.apply_reasoning_budget(next_token);
 
         let metadata = this.get_metadata();
         let eos_tok = if disable_eos_stop {

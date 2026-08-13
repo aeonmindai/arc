@@ -392,7 +392,7 @@ impl Engine {
         let sampler = Sampler::new(
             Some(request.sampling_params.temperature.unwrap_or(1.0)),
             request.sampling_params.top_n_logprobs,
-            tokenizer,
+            tokenizer.clone(),
             request.sampling_params.frequency_penalty,
             request.sampling_params.presence_penalty,
             request.sampling_params.repetition_penalty,
@@ -400,6 +400,7 @@ impl Engine {
             topk,
             topp,
             minp,
+            request.sampling_params.top_nsigma,
             request.logits_processors.unwrap_or_default(),
         );
         let sampler = handle_seq_error!(sampler, request.response);
@@ -592,6 +593,28 @@ impl Engine {
                         // Enable think tag mode if the chat template uses <think> tags
                         seq.enable_think_tag_mode();
                     }
+                }
+            }
+
+            // Arc Boost: DeepConf-low early termination for sibling vote chains.
+            if let Some(frac) = request.sampling_params.early_stop_confidence {
+                seq.set_early_stop_confidence(frac);
+            }
+
+            // Arc Boost budget policy: graceful wrap-up where a think-tag
+            // structure is detected and the end-think token is known from the
+            // vocabulary; otherwise degrade to a hard max_len-style cap.
+            if let Some(budget) = request.sampling_params.reasoning_budget {
+                let end_tok = if seq.is_think_tag_mode() {
+                    tokenizer
+                        .as_ref()
+                        .and_then(|t| t.token_to_id(crate::think_tags::THINK_CLOSE_TAG))
+                } else {
+                    None
+                };
+                match end_tok {
+                    Some(id) => seq.set_reasoning_budget_injection(budget, id),
+                    None => seq.set_max_len(budget),
                 }
             }
 

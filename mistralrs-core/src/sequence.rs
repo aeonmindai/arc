@@ -1,4 +1,5 @@
 use crate::{
+    arc_boost::ConfidenceTracker,
     get_mut_arcmutex, get_mut_group,
     harmony::HarmonyContext,
     paged_attention::block_hash::MultiModalFeature,
@@ -42,6 +43,10 @@ pub enum StopReason {
     GeneratedImage,
     GeneratedSpeech,
     ToolCalls,
+    /// Arc Boost: the chain was culled by DeepConf-low confidence-based early
+    /// termination (its lowest-group confidence fell too far below the best
+    /// sibling vote chain's).
+    LowConfidence,
 }
 
 impl Display for StopReason {
@@ -54,6 +59,7 @@ impl Display for StopReason {
             StopReason::GeneratedImage => write!(f, "generated_image"),
             StopReason::GeneratedSpeech => write!(f, "generated_speech"),
             StopReason::ToolCalls => write!(f, "tool_calls"),
+            StopReason::LowConfidence => write!(f, "low_confidence"),
         }
     }
 }
@@ -476,6 +482,25 @@ pub struct Sequence {
 
     // Think tag parsing context (for models using <think>...</think> tags)
     think_tag_context: Option<ThinkTagContext>,
+
+    // Arc Boost: rolling confidence telemetry (DeepConf signal)
+    confidence: ConfidenceTracker,
+    // Arc Boost: DeepConf-low early-stop fraction for sibling vote chains
+    early_stop_confidence: Option<f32>,
+    // Arc Boost: graceful reasoning-budget injection state
+    reasoning_budget: Option<ReasoningBudget>,
+}
+
+/// Arc Boost budget policy state for the graceful (injection) path: when the
+/// sequence hits `budget` generated tokens while still inside a `<think>`
+/// block, the chat template's end-think token is injected in place of the
+/// sampled token so the model wraps up its reasoning and still produces a
+/// final answer. (The non-injectable cases are handled at request-add time by
+/// tightening `max_len` instead.)
+struct ReasoningBudget {
+    budget: usize,
+    end_think_tok: u32,
+    injected: bool,
 }
 
 impl Sequence {
@@ -578,6 +603,9 @@ impl Sequence {
             step_start_instant: None,
             harmony_context: None,
             think_tag_context: None,
+            confidence: ConfidenceTracker::new(),
+            early_stop_confidence: None,
+            reasoning_budget: None,
         }
     }
 
@@ -839,9 +867,90 @@ impl Sequence {
         }
 
         self.cumulative_logprob += tok.logprob;
+        self.confidence.push(tok.logprob);
         self.tokens.push(tok.token);
         self.logprobs.push(tok);
         self.reset_prefill_toks();
+    }
+
+    // === Arc Boost: confidence telemetry, early stop, reasoning budget ===
+
+    /// Rolling confidence telemetry for this sequence (DeepConf signal).
+    pub fn confidence(&self) -> &ConfidenceTracker {
+        &self.confidence
+    }
+
+    /// Enable DeepConf-low early termination for this sequence with the given
+    /// tolerance fraction (see [`crate::arc_boost::should_early_stop`]).
+    pub fn set_early_stop_confidence(&mut self, frac: f32) {
+        self.early_stop_confidence = Some(frac);
+    }
+
+    /// Enable the graceful reasoning-budget path: at `budget` generated
+    /// tokens, if still inside a `<think>` block, inject `end_think_tok`.
+    pub fn set_reasoning_budget_injection(&mut self, budget: usize, end_think_tok: u32) {
+        self.reasoning_budget = Some(ReasoningBudget {
+            budget,
+            end_think_tok,
+            injected: false,
+        });
+    }
+
+    /// Arc Boost budget policy: possibly replace the sampled token with the
+    /// end-think token. Called once per decode step, before the token is
+    /// committed. No-op unless a budget was configured, the budget is
+    /// exhausted, and the sequence is still inside a `<think>` block. Fires at
+    /// most once per sequence. The injected `Logprobs` carries `logprob = 0.0`
+    /// (a forced token, not a sampled one).
+    pub(crate) fn apply_reasoning_budget(&mut self, tok: Logprobs) -> Logprobs {
+        let in_think = self
+            .think_tag_context
+            .as_ref()
+            .is_some_and(|c| c.is_in_think_block());
+        let generated = self.tokens.len().saturating_sub(self.prompt_len);
+        let Some(rb) = self.reasoning_budget.as_mut() else {
+            return tok;
+        };
+        if rb.injected || !in_think || generated < rb.budget {
+            return tok;
+        }
+        rb.injected = true;
+        if tok.token == rb.end_think_tok {
+            // The model closed the block on its own at the boundary.
+            return tok;
+        }
+        Logprobs {
+            token: rb.end_think_tok,
+            logprob: 0.0,
+            bytes: Some(crate::think_tags::THINK_CLOSE_TAG.to_string()),
+            top_logprobs: None,
+        }
+    }
+
+    /// DeepConf-low early termination check (simplified; see
+    /// [`crate::arc_boost`]). Updates the group's best observed
+    /// lowest-group-confidence and returns `Some(StopReason::LowConfidence)`
+    /// when this chain has fallen too far below the best sibling chain.
+    pub fn check_confidence_early_stop(&self) -> Option<StopReason> {
+        let frac = self.early_stop_confidence?;
+        if !self.confidence.warmup_complete() {
+            return None;
+        }
+        let chain = self.confidence.lowest_group()?;
+        let best = {
+            let mut group = get_mut_group!(self);
+            let best = match group.best_confidence {
+                Some(b) => b.max(chain),
+                None => chain,
+            };
+            group.best_confidence = Some(best);
+            best
+        };
+        if crate::arc_boost::should_early_stop(chain, best, frac) {
+            Some(StopReason::LowConfidence)
+        } else {
+            None
+        }
     }
 
     pub fn responder(&self) -> Sender<Response> {
@@ -1311,6 +1420,9 @@ pub struct SequenceGroup {
     pub completion_streaming_chunks: Vec<CompletionChunkChoice>,
     pub is_streaming: bool,
     pub is_chat: bool,
+    /// Arc Boost: best lowest-group confidence observed across the sibling
+    /// vote chains of this group (DeepConf-low reference point).
+    pub best_confidence: Option<f32>,
 }
 
 impl SequenceGroup {
@@ -1338,6 +1450,7 @@ impl SequenceGroup {
             is_streaming,
             is_chat,
             best_of,
+            best_confidence: None,
         }
     }
 
@@ -1532,5 +1645,166 @@ impl SequenceGroup {
             sender.send(Response::CompletionDone(response)).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sampler::Logprobs;
+
+    /// Minimal Sequence construction (mirrors `pipeline::amoe::new_dummy_seq`):
+    /// no model, no engine — just the per-sequence state machine, which is
+    /// exactly what the Arc Boost mechanics live in.
+    fn dummy_seq(
+        prompt: &str,
+        group: Arc<Mutex<SequenceGroup>>,
+        response_index: usize,
+    ) -> Sequence {
+        let (dummy_sender, _rx) = tokio::sync::mpsc::channel(1);
+        let dummy_sampler = Sampler::new(
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            -1,
+            0.0,
+            0.0,
+            None,
+            vec![],
+        )
+        .unwrap();
+        Sequence::new_waiting(
+            vec![1, 2, 3],
+            prompt.to_string(),
+            0,
+            0,
+            1,
+            dummy_sender,
+            dummy_sampler,
+            vec![],
+            vec![],
+            None,
+            false,
+            false,
+            group,
+            response_index,
+            0,
+            SequenceRecognizer::None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            SeqStepType::PromptAndDecode,
+            None,
+            None,
+            None,
+            false,
+            vec![],
+        )
+    }
+
+    fn lp(token: u32, logprob: f32) -> Logprobs {
+        Logprobs {
+            token,
+            logprob,
+            bytes: Some("a".to_string()),
+            top_logprobs: None,
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn feed(seq: &mut Sequence, n: usize, logprob: f32) {
+        for i in 0..n {
+            seq.add_token(lp(100 + i as u32, logprob), b"a".to_vec(), &None);
+        }
+    }
+
+    #[test]
+    fn reasoning_budget_injects_end_think_once() {
+        let group = Arc::new(Mutex::new(SequenceGroup::new(1, false, true, None)));
+        // Prompt ends with <think>: the template hardcoded the opening tag, so
+        // generation starts inside the think block.
+        let mut seq = dummy_seq("solve it <think>", group, 0);
+        seq.enable_think_tag_mode();
+        assert!(seq.is_think_tag_mode());
+        const END_THINK: u32 = 999;
+        seq.set_reasoning_budget_injection(3, END_THINK);
+
+        // Under budget: sampled tokens pass through untouched.
+        feed(&mut seq, 2, -0.1);
+        let out = seq.apply_reasoning_budget(lp(5, -0.1));
+        assert_eq!(out.token, 5);
+        seq.add_token(out, b"a".to_vec(), &None);
+
+        // Budget hit (3 generated tokens) while still inside <think>:
+        // the sampled token is replaced by the end-think token.
+        let out = seq.apply_reasoning_budget(lp(6, -0.1));
+        assert_eq!(out.token, END_THINK);
+        assert_eq!(out.bytes.as_deref(), Some("</think>"));
+        seq.add_token(out.clone(), b"</think>".to_vec(), &None);
+
+        // Injection fires at most once; subsequent tokens pass through.
+        let out = seq.apply_reasoning_budget(lp(7, -0.1));
+        assert_eq!(out.token, 7);
+    }
+
+    #[test]
+    fn reasoning_budget_noop_outside_think_block() {
+        let group = Arc::new(Mutex::new(SequenceGroup::new(1, false, true, None)));
+        // Prompt does NOT end with <think> and the model never opens a think
+        // block: the budget only caps *thinking* tokens, so nothing happens.
+        let mut seq = dummy_seq("solve it", group, 0);
+        seq.enable_think_tag_mode();
+        seq.set_reasoning_budget_injection(2, 999);
+        feed(&mut seq, 5, -0.1);
+        let out = seq.apply_reasoning_budget(lp(5, -0.1));
+        assert_eq!(out.token, 5);
+    }
+
+    /// Two sibling vote chains sharing one SequenceGroup (exactly what
+    /// `n_votes: 2` fans out to): the confident chain sets the group's best
+    /// confidence; the weak chain is culled by DeepConf-low.
+    #[test]
+    fn sibling_chain_early_stop_via_shared_group() {
+        let group = Arc::new(Mutex::new(SequenceGroup::new(2, false, true, None)));
+        let mut strong = dummy_seq("q", group.clone(), 0);
+        let mut weak = dummy_seq("q", group.clone(), 1);
+        strong.set_early_stop_confidence(0.5);
+        weak.set_early_stop_confidence(0.5);
+
+        // Before warmup (2 * 64 tokens) nothing is culled.
+        feed(&mut strong, 64, -0.05);
+        feed(&mut weak, 64, -1.0);
+        assert_eq!(strong.check_confidence_early_stop(), None);
+        assert_eq!(weak.check_confidence_early_stop(), None);
+
+        // Complete warmup.
+        feed(&mut strong, 64, -0.05);
+        feed(&mut weak, 64, -1.0);
+
+        // The strong chain reports first and becomes the group's best
+        // (-0.05); it is never culled by its own threshold.
+        assert_eq!(strong.check_confidence_early_stop(), None);
+        let best = group.try_lock().unwrap().best_confidence.unwrap();
+        assert!((best - (-0.05)).abs() < 1e-5, "best = {best}");
+
+        // The weak chain (-1.0) is far below best/frac = -0.1: culled.
+        assert_eq!(
+            weak.check_confidence_early_stop(),
+            Some(StopReason::LowConfidence)
+        );
+
+        // And the telemetry the Choice will carry:
+        let mean = weak.confidence().mean().unwrap();
+        let lowest = weak.confidence().lowest_group().unwrap();
+        assert!((mean - (-1.0)).abs() < 1e-5, "mean = {mean}");
+        assert!((lowest - (-1.0)).abs() < 1e-5, "lowest = {lowest}");
     }
 }

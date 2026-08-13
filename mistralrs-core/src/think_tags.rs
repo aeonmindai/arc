@@ -16,8 +16,8 @@
 //! - Multiple `<think>` blocks are concatenated
 //! - At EOS, treat unclosed `<think>` content as reasoning
 
-const THINK_OPEN_TAG: &str = "<think>";
-const THINK_CLOSE_TAG: &str = "</think>";
+pub const THINK_OPEN_TAG: &str = "<think>";
+pub const THINK_CLOSE_TAG: &str = "</think>";
 
 /// Context for tracking `<think>...</think>` tag parsing state within a sequence.
 ///

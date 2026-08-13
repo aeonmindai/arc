@@ -147,6 +147,8 @@ macro_rules! handle_pipeline_forward_error {
                                 reasoning_content: None,
                             },
                             logprobs: None,
+                            confidence: None,
+                            lowest_group_confidence: None,
                         };
                         seq.add_choice_to_group(choice);
                     } else {
@@ -172,6 +174,7 @@ macro_rules! handle_pipeline_forward_error {
                             system_fingerprint: SYSTEM_FINGERPRINT.to_string(),
                             object: "chat.completion".to_string(),
                             usage: group.get_usage(),
+                            vote: None,
                         };
 
                         seq.responder()

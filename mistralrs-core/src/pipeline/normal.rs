@@ -1702,6 +1702,13 @@ impl Pipeline for NormalPipeline {
                 );
                 return Ok(None);
             }
+            if first_sampler.top_nsigma().is_some() {
+                tracing::debug!(
+                    "autonomous_decode: top_nsigma set; \
+                     GPU sampler does not implement it — falling back"
+                );
+                return Ok(None);
+            }
 
             // Vocab size comes from the dedicated decode path (it has the
             // model config we extracted at load time).

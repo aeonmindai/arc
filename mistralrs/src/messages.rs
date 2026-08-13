@@ -722,6 +722,13 @@ impl RequestBuilder {
         self
     }
 
+    /// Top-nσ sampling (temperature-invariant): keep only tokens whose logit is
+    /// within `n * std_dev` of the maximum logit.
+    pub fn set_sampler_top_nsigma(mut self, top_nsigma: f32) -> Self {
+        self.sampling_params.top_nsigma = Some(top_nsigma);
+        self
+    }
+
     /// Return the top-n log-probabilities per token position.
     pub fn set_sampler_topn_logprobs(mut self, top_n_logprobs: usize) -> Self {
         self.sampling_params.top_n_logprobs = top_n_logprobs;
