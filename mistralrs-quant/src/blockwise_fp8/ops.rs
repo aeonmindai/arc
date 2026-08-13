@@ -398,8 +398,7 @@ impl MxInt4BlockwiseDequantize {
 
                         // SAFETY: each thread writes to independent output positions
                         unsafe {
-                            *res_ptr.wrapping_add(y * cols + x) =
-                                T::from_f64(dequant_val as f64);
+                            *res_ptr.wrapping_add(y * cols + x) = T::from_f64(dequant_val as f64);
                         }
                     }
                 }
@@ -423,7 +422,10 @@ impl CustomOp2 for MxInt4BlockwiseDequantize {
         packed_l: &candle_core::Layout,
     ) -> candle_core::Result<(candle_core::CpuStorage, candle_core::Shape)> {
         let CpuStorage::I32(packed) = packed_s else {
-            candle_core::bail!("MX INT4 dequant expects I32 (sign-extended I8) packed weights, got {:?}", packed_s);
+            candle_core::bail!(
+                "MX INT4 dequant expects I32 (sign-extended I8) packed weights, got {:?}",
+                packed_s
+            );
         };
         let CpuStorage::F32(scale) = scale_s else {
             candle_core::bail!("MX INT4 dequant expects F32 scales, got {:?}", scale_s);
@@ -451,7 +453,9 @@ impl CustomOp2 for MxInt4BlockwiseDequantize {
                 out_shape,
             )),
             DType::BF16 => Ok((
-                CpuStorage::BF16(self.dispatch_dequant_blockwise(packed, scale, packed_l, scale_l)?),
+                CpuStorage::BF16(
+                    self.dispatch_dequant_blockwise(packed, scale, packed_l, scale_l)?,
+                ),
                 out_shape,
             )),
             DType::F16 => Ok((
@@ -900,18 +904,59 @@ pub fn fp8_blockwise_quantize(
     }
 }
 
+/// Decode-path dispatch threshold for the blockwise-FP8 GEMV kernel.
+///
+/// `M <= this` routes to the warp-per-row GEMV instead of the tiled GEMM
+/// (which at M == 1 wastes 31/32 of every 32x32 tile). Defaults to 4;
+/// `ARC_FP8_GEMV_MAX_M=<n>` overrides, `ARC_NO_FP8_GEMV` disables (0).
+/// Read once (LazyLock) so the decode hot loop never touches the env.
+#[cfg(feature = "cuda")]
+fn fp8_gemv_max_m() -> usize {
+    use std::sync::LazyLock;
+    static MAX_M: LazyLock<usize> = LazyLock::new(|| {
+        if std::env::var("ARC_NO_FP8_GEMV").is_ok() {
+            return 0;
+        }
+        std::env::var("ARC_FP8_GEMV_MAX_M")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4)
+    });
+    *MAX_M
+}
+
 /// FP8 blockwise matmul.
 /// Computes output = input @ weight.T where weight is FP8 blockwise quantized.
 /// - input: [M, K] in fp16/bf16
 /// - weight: [N, K] in FP8 with blockwise scales
 /// - scales: [N/block_y, K/block_x] in f32
 /// - output: [M, N] in fp16/bf16
+///
+/// Dispatch: `M <= fp8_gemv_max_m()` (default 4, decode regime) routes to a
+/// dedicated warp-per-row GEMV kernel that dequantizes FP8 blocks in
+/// registers; larger `M` keeps the tiled GEMM.
 #[cfg(feature = "cuda")]
 pub fn fp8_blockwise_matmul(
     input: &Tensor,
     weight: &Tensor,
     scales: &Tensor,
     weight_block_size: &[usize],
+) -> Result<Tensor> {
+    fp8_blockwise_matmul_impl(input, weight, scales, weight_block_size, None)
+}
+
+/// Internal worker for [`fp8_blockwise_matmul`] with an explicit kernel
+/// override for tests: `force_gemv = Some(true)` forces the GEMV kernel,
+/// `Some(false)` forces the tiled GEMM, `None` uses the M-based dispatch.
+/// The GEMV alignment preconditions (`K % 4 == 0`, `block_size_x % 4 == 0`)
+/// are always enforced regardless of the override.
+#[cfg(feature = "cuda")]
+fn fp8_blockwise_matmul_impl(
+    input: &Tensor,
+    weight: &Tensor,
+    scales: &Tensor,
+    weight_block_size: &[usize],
+    force_gemv: Option<bool>,
 ) -> Result<Tensor> {
     use candle_core::{CudaStorage, Device, Storage};
     use half::{bf16, f16};
@@ -961,6 +1006,12 @@ pub fn fp8_blockwise_matmul(
     let block_size_x = weight_block_size[1] as i32;
     let scale_row_stride = scales.dim(1)? as i32;
 
+    // Decode-regime GEMV dispatch. The alignment preconditions guarantee the
+    // kernel's 32-bit vectorized FP8 loads and that a 4-wide K-group never
+    // straddles a scale block; shapes that fail them keep the tiled GEMM.
+    let gemv_aligned = k % 4 == 0 && block_size_x % 4 == 0;
+    let use_gemv = force_gemv.unwrap_or_else(|| (m as usize) <= fp8_gemv_max_m()) && gemv_aligned;
+
     let input_l = input.layout();
     let weight_l = weight.layout();
     let scales_l = scales.layout();
@@ -994,21 +1045,39 @@ pub fn fp8_blockwise_matmul(
                 let (output_ptr, _output_guard) = slice_ptr(&output, 0);
                 let (input_ptr, _input_guard) = slice_ptr(input_s, input_l.start_offset());
 
-                unsafe {
-                    ffi::launch_fp8_matmul_f16(
-                        input_ptr as *const _,
-                        weight_ptr as *const _,
-                        scales_ptr as *const _,
-                        output_ptr as *mut _,
-                        m,
-                        n,
-                        k,
-                        scale_row_stride,
-                        block_size_y,
-                        block_size_x,
-                        dev.cuda_stream().cu_stream(),
-                    )
-                };
+                if use_gemv {
+                    unsafe {
+                        ffi::launch_fp8_gemv_f16(
+                            input_ptr as *const _,
+                            weight_ptr as *const _,
+                            scales_ptr as *const _,
+                            output_ptr as *mut _,
+                            m,
+                            n,
+                            k,
+                            scale_row_stride,
+                            block_size_y,
+                            block_size_x,
+                            dev.cuda_stream().cu_stream(),
+                        )
+                    };
+                } else {
+                    unsafe {
+                        ffi::launch_fp8_matmul_f16(
+                            input_ptr as *const _,
+                            weight_ptr as *const _,
+                            scales_ptr as *const _,
+                            output_ptr as *mut _,
+                            m,
+                            n,
+                            k,
+                            scale_row_stride,
+                            block_size_y,
+                            block_size_x,
+                            dev.cuda_stream().cu_stream(),
+                        )
+                    };
+                }
             }
 
             let output_storage = CudaStorage::wrap_cuda_slice(output, dev.clone());
@@ -1029,21 +1098,39 @@ pub fn fp8_blockwise_matmul(
                 let (output_ptr, _output_guard) = slice_ptr(&output, 0);
                 let (input_ptr, _input_guard) = slice_ptr(input_s, input_l.start_offset());
 
-                unsafe {
-                    ffi::launch_fp8_matmul_bf16(
-                        input_ptr as *const _,
-                        weight_ptr as *const _,
-                        scales_ptr as *const _,
-                        output_ptr as *mut _,
-                        m,
-                        n,
-                        k,
-                        scale_row_stride,
-                        block_size_y,
-                        block_size_x,
-                        dev.cuda_stream().cu_stream(),
-                    )
-                };
+                if use_gemv {
+                    unsafe {
+                        ffi::launch_fp8_gemv_bf16(
+                            input_ptr as *const _,
+                            weight_ptr as *const _,
+                            scales_ptr as *const _,
+                            output_ptr as *mut _,
+                            m,
+                            n,
+                            k,
+                            scale_row_stride,
+                            block_size_y,
+                            block_size_x,
+                            dev.cuda_stream().cu_stream(),
+                        )
+                    };
+                } else {
+                    unsafe {
+                        ffi::launch_fp8_matmul_bf16(
+                            input_ptr as *const _,
+                            weight_ptr as *const _,
+                            scales_ptr as *const _,
+                            output_ptr as *mut _,
+                            m,
+                            n,
+                            k,
+                            scale_row_stride,
+                            block_size_y,
+                            block_size_x,
+                            dev.cuda_stream().cu_stream(),
+                        )
+                    };
+                }
             }
 
             let output_storage = CudaStorage::wrap_cuda_slice(output, dev.clone());
@@ -1548,6 +1635,146 @@ mod tests {
         // TODO: will be adding real blockwise fp8 gemm shortly ;)
         assert_eq!((32, 7168), truth.dims2()?);
 
+        Ok(())
+    }
+
+    /// Build a random blockwise-FP8 weight + scales pair on `dev` and return
+    /// `(weight_fp8, scales)`. Shared by the GEMV parity tests.
+    #[cfg(feature = "cuda")]
+    fn make_fp8_weight(
+        dev: &Device,
+        n: usize,
+        k: usize,
+        block: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
+        let w_f32 = Tensor::randn(0f32, 1f32, (n, k), dev)?;
+        ops::fp8_blockwise_quantize(&w_f32, block.to_vec())
+    }
+
+    /// Max elementwise deviation |a - b| / max(|b|, 1) between two flattened
+    /// outputs.
+    #[cfg(feature = "cuda")]
+    fn max_rel_err(a: &Tensor, b: &Tensor) -> Result<f32> {
+        let a: Vec<f32> = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let b: Vec<f32> = b.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        assert_eq!(a.len(), b.len());
+        let mut max_err = 0f32;
+        for (x, y) in a.iter().zip(b.iter()) {
+            let err = (x - y).abs() / y.abs().max(1.0);
+            max_err = max_err.max(err);
+        }
+        Ok(max_err)
+    }
+
+    /// GEMV kernel (M=1 decode shape) must match both the tiled GEMM kernel
+    /// and the dequantize+matmul reference within FP8 tolerance.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_fp8_gemv_matches_gemm_m1() -> Result<()> {
+        let dev = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("CUDA not available; skipping test_fp8_gemv_matches_gemm_m1");
+                return Ok(());
+            }
+        };
+        let (n, k) = (512, 1024);
+        let block = vec![128usize, 128usize];
+        let (weight, scales) = make_fp8_weight(&dev, n, k, &block)?;
+
+        let x = Tensor::randn(0f32, 1f32, (1, k), &dev)?.to_dtype(DType::BF16)?;
+
+        let gemv = ops::fp8_blockwise_matmul_impl(&x, &weight, &scales, &block, Some(true))?;
+        let gemm = ops::fp8_blockwise_matmul_impl(&x, &weight, &scales, &block, Some(false))?;
+        assert_eq!(gemv.dims2()?, (1, n));
+
+        // GEMV vs tiled GEMM: same dequant math, different accumulation
+        // order + BF16 rounding of the output.
+        let err_kernels = max_rel_err(&gemv, &gemm)?;
+        assert!(
+            err_kernels < 1e-2,
+            "GEMV vs GEMM max rel err {err_kernels} exceeds 1e-2"
+        );
+
+        // GEMV vs dequantize + matmul reference.
+        let w_dq = ops::fp8_blockwise_dequantize(&weight, &scales, block.clone(), DType::BF16)?;
+        let truth = Linear::new(w_dq, None).forward(&x)?;
+        let err_ref = max_rel_err(&gemv, &truth)?;
+        assert!(
+            err_ref < 1e-2,
+            "GEMV vs dequant reference max rel err {err_ref} exceeds 1e-2"
+        );
+
+        // The default dispatch must route M=1 to the GEMV automatically.
+        let auto = ops::fp8_blockwise_matmul(&x, &weight, &scales, &block)?;
+        let err_auto = max_rel_err(&auto, &gemv)?;
+        assert!(
+            err_auto < 1e-2,
+            "auto dispatch (M=1) vs forced GEMV max rel err {err_auto} exceeds 1e-2"
+        );
+
+        Ok(())
+    }
+
+    /// Small-batch shapes (M = 2..4, grid.y > 1) and a remainder-loop K
+    /// (K % 128 != 0 but K % 4 == 0) must also match the tiled GEMM.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_fp8_gemv_matches_gemm_small_m() -> Result<()> {
+        let dev = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("CUDA not available; skipping test_fp8_gemv_matches_gemm_small_m");
+                return Ok(());
+            }
+        };
+        let block = vec![128usize, 128usize];
+        for (m, n, k) in [(2usize, 384usize, 512usize), (4, 256, 324)] {
+            let (weight, scales) = make_fp8_weight(&dev, n, k, &block)?;
+            let x = Tensor::randn(0f32, 1f32, (m, k), &dev)?.to_dtype(DType::BF16)?;
+
+            let gemv = ops::fp8_blockwise_matmul_impl(&x, &weight, &scales, &block, Some(true))?;
+            let gemm = ops::fp8_blockwise_matmul_impl(&x, &weight, &scales, &block, Some(false))?;
+            assert_eq!(gemv.dims2()?, (m, n));
+
+            let err = max_rel_err(&gemv, &gemm)?;
+            assert!(
+                err < 1e-2,
+                "GEMV vs GEMM (m={m}, n={n}, k={k}) max rel err {err} exceeds 1e-2"
+            );
+        }
+        Ok(())
+    }
+
+    /// The GEMV kernel must be deterministic: identical inputs produce
+    /// bitwise-identical outputs across runs (fixed reduction order, no
+    /// atomics).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_fp8_gemv_deterministic() -> Result<()> {
+        let dev = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("CUDA not available; skipping test_fp8_gemv_deterministic");
+                return Ok(());
+            }
+        };
+        let (n, k) = (512, 1024);
+        let block = vec![128usize, 128usize];
+        let (weight, scales) = make_fp8_weight(&dev, n, k, &block)?;
+        let x = Tensor::randn(0f32, 1f32, (1, k), &dev)?.to_dtype(DType::BF16)?;
+
+        let first: Vec<bf16> =
+            ops::fp8_blockwise_matmul_impl(&x, &weight, &scales, &block, Some(true))?
+                .flatten_all()?
+                .to_vec1()?;
+        for run in 1..3 {
+            let again: Vec<bf16> =
+                ops::fp8_blockwise_matmul_impl(&x, &weight, &scales, &block, Some(true))?
+                    .flatten_all()?
+                    .to_vec1()?;
+            assert_eq!(first, again, "GEMV output diverged on run {run}");
+        }
         Ok(())
     }
 }

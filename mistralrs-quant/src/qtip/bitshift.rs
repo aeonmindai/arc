@@ -894,6 +894,12 @@ impl Qtip2bLayer {
         }
 
         // CPU path — rotated-frame matmul identity `(xR)·(WR)^T = x·W^T`.
+        // This materializes the full dequantized weight; at decode shapes the
+        // fused GEMV above should have handled this.
+        super::warn_dequant_materialize_at_decode(
+            x_2d.dim(0)?,
+            "Qtip2bLayer::forward_dequantize fallback (full dequantize+matmul)",
+        );
         let (x_for_matmul, w_for_matmul) = if self.rotation_block >= 2 {
             let signs = self.rotation_signs_cpu()?;
             let x_cpu = x_2d.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
@@ -1442,6 +1448,7 @@ impl QuantMethod for Qtip2bLayer {
             }
         }
 
+        super::warn_dequant_materialize_at_decode(n_tokens, "Qtip2bLayer::gather_forward_cpu");
         self.gather_forward_cpu(a, indices)
     }
 

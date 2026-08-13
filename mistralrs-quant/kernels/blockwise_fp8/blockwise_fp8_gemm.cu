@@ -124,6 +124,114 @@ __global__ void fp8_matmul_tiled(const T *__restrict__ input,
 }
 
 // ============================================================================
+// FP8 GEMV kernel (dedicated decode path, M <= 4)
+//
+// The tiled GEMM above is built for prefill: at M == 1 it launches a full
+// 32x32 tile grid where 31/32 of every block's threads do no useful work.
+// This kernel is the decode sibling: one warp per output row, FP8 blocks
+// dequantized in registers (per-block scales via __ldg), f32 accumulate,
+// warp-shuffle reduction, half/bf16 out. Structure adapted from the BF16
+// GEMV suite in arc-cuda-graph/src/cuda/gemv_bf16.cu (warp-per-row +
+// __launch_bounds__ variants) with the FP8 block-scale inner loop from
+// fp8_moe_gemm below.
+//
+// Preconditions (enforced by the Rust dispatcher in blockwise_fp8/ops.rs):
+//   * K % 4 == 0            (32-bit vectorized FP8 loads, row alignment)
+//   * block_size_x % 4 == 0 (a 4-wide group never straddles a scale block)
+// ============================================================================
+
+template <typename T, int ROWS_PER_BLOCK, int MAX_BLOCKS_PER_SM>
+__global__ __launch_bounds__(ROWS_PER_BLOCK * 32, MAX_BLOCKS_PER_SM) void fp8_gemv_warp(
+    const T *__restrict__ input,               // [M, K]
+    const __nv_fp8_e4m3 *__restrict__ weight,  // [N, K] row-major
+    const float *__restrict__ weight_scale,    // [ceil(N/bs_y), ceil(K/bs_x)]
+    T *__restrict__ output,                    // [M, N]
+    int M, int N, int K, int scale_row_stride, int block_size_y,
+    int block_size_x) {
+  const int lane = threadIdx.x & 31;
+  const int n = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
+  const int m = blockIdx.y;
+  if (n >= N || m >= M)
+    return;
+
+  const __nv_fp8_e4m3 *w_row = weight + (size_t)n * K;
+  const T *in_row = input + (size_t)m * K;
+
+  // Scale row is constant for this output row.
+  const int scale_row_offset = (n / block_size_y) * scale_row_stride;
+
+  float acc = 0.0f;
+
+  // Main loop: each lane loads 4 FP8 weights (one 32-bit load) and 4 input
+  // values per iteration; the warp covers 128 K-elements per iteration.
+  const int K_aligned = (K / 128) * 128;
+  for (int k_base = 0; k_base < K_aligned; k_base += 128) {
+    const int k = k_base + lane * 4;
+
+    const uint32_t w4 = __ldg(reinterpret_cast<const uint32_t *>(&w_row[k]));
+
+    float i0, i1, i2, i3;
+    if constexpr (std::is_same_v<T, half>) {
+      const half2 h01 = __ldg(reinterpret_cast<const half2 *>(&in_row[k]));
+      const half2 h23 = __ldg(reinterpret_cast<const half2 *>(&in_row[k + 2]));
+      i0 = __half2float(h01.x);
+      i1 = __half2float(h01.y);
+      i2 = __half2float(h23.x);
+      i3 = __half2float(h23.y);
+    } else {
+      const __nv_bfloat162 b01 =
+          __ldg(reinterpret_cast<const __nv_bfloat162 *>(&in_row[k]));
+      const __nv_bfloat162 b23 =
+          __ldg(reinterpret_cast<const __nv_bfloat162 *>(&in_row[k + 2]));
+      i0 = __bfloat162float(b01.x);
+      i1 = __bfloat162float(b01.y);
+      i2 = __bfloat162float(b23.x);
+      i3 = __bfloat162float(b23.y);
+    }
+
+    __nv_fp8_e4m3 w0, w1, w2, w3;
+    w0.__x = (w4 >> 0) & 0xFF;
+    w1.__x = (w4 >> 8) & 0xFF;
+    w2.__x = (w4 >> 16) & 0xFF;
+    w3.__x = (w4 >> 24) & 0xFF;
+
+    const float scale =
+        __ldg(&weight_scale[scale_row_offset + k / block_size_x]);
+    acc += scale * (i0 * fp8_to_float(w0) + i1 * fp8_to_float(w1) +
+                    i2 * fp8_to_float(w2) + i3 * fp8_to_float(w3));
+  }
+
+  // Scalar remainder (K not a multiple of 128; still K % 4 == 0).
+  for (int k = K_aligned + lane; k < K; k += 32) {
+    float in_val;
+    if constexpr (std::is_same_v<T, half>) {
+      in_val = __half2float(__ldg(&in_row[k]));
+    } else {
+      in_val = __bfloat162float(__ldg(&in_row[k]));
+    }
+    __nv_fp8_e4m3 w;
+    w.__x = __ldg(reinterpret_cast<const uint8_t *>(&w_row[k]));
+    const float scale =
+        __ldg(&weight_scale[scale_row_offset + k / block_size_x]);
+    acc += scale * in_val * fp8_to_float(w);
+  }
+
+// Warp reduction using shuffle.
+#pragma unroll
+  for (int offset = 16; offset > 0; offset /= 2) {
+    acc += __shfl_down_sync(0xffffffff, acc, offset);
+  }
+
+  if (lane == 0) {
+    if constexpr (std::is_same_v<T, half>) {
+      output[(size_t)m * N + n] = __float2half(acc);
+    } else {
+      output[(size_t)m * N + n] = __float2bfloat16(acc);
+    }
+  }
+}
+
+// ============================================================================
 // FP8 MoE GEMM - Warp-parallel kernel with vectorized loads
 // Each warp (32 threads) computes one output element collaboratively
 // ============================================================================
@@ -298,6 +406,53 @@ launch_fp8_matmul_bf16(const __nv_bfloat16 *input, const __nv_fp8_e4m3 *weight,
                                    scale_row_stride, block_size_y,
                                    block_size_x);
   CUDA_CHECK(cudaGetLastError());
+}
+
+// Warp-per-row GEMV launcher for the decode regime (M <= 4). Row-grouping
+// mirrors the empirical dispatch of the BF16 GEMV suite (gemv_bf16.cu):
+// small-N projection shapes win with 4 warps/block (more bandwidth per
+// block when there aren't enough rows to fill every SM), large-N shapes win
+// with 1 warp/block (maximum wave fill). grid.y indexes the input row.
+template <typename T>
+static void launch_fp8_gemv_impl(const T *input, const __nv_fp8_e4m3 *weight,
+                                 const float *weight_scale, T *output, int M,
+                                 int N, int K, int scale_row_stride,
+                                 int block_size_y, int block_size_x,
+                                 cudaStream_t stream) {
+  if (N < 8192) {
+    dim3 grid(CEILDIV(N, 4), M);
+    fp8_gemm::fp8_gemv_warp<T, 4, 8><<<grid, 4 * 32, 0, stream>>>(
+        input, weight, weight_scale, output, M, N, K, scale_row_stride,
+        block_size_y, block_size_x);
+  } else {
+    dim3 grid(N, M);
+    fp8_gemm::fp8_gemv_warp<T, 1, 16><<<grid, 32, 0, stream>>>(
+        input, weight, weight_scale, output, M, N, K, scale_row_stride,
+        block_size_y, block_size_x);
+  }
+  CUDA_CHECK(cudaGetLastError());
+}
+
+extern "C" void launch_fp8_gemv_f16(const __half *input,
+                                    const __nv_fp8_e4m3 *weight,
+                                    const float *weight_scale, __half *output,
+                                    int M, int N, int K, int scale_row_stride,
+                                    int block_size_y, int block_size_x,
+                                    cudaStream_t stream) {
+  launch_fp8_gemv_impl<half>(input, weight, weight_scale, output, M, N, K,
+                             scale_row_stride, block_size_y, block_size_x,
+                             stream);
+}
+
+extern "C" void launch_fp8_gemv_bf16(const __nv_bfloat16 *input,
+                                     const __nv_fp8_e4m3 *weight,
+                                     const float *weight_scale,
+                                     __nv_bfloat16 *output, int M, int N, int K,
+                                     int scale_row_stride, int block_size_y,
+                                     int block_size_x, cudaStream_t stream) {
+  launch_fp8_gemv_impl<__nv_bfloat16>(input, weight, weight_scale, output, M, N,
+                                      K, scale_row_stride, block_size_y,
+                                      block_size_x, stream);
 }
 
 extern "C" void launch_fp8_indexed_moe_gemm_f16(

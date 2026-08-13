@@ -38,6 +38,26 @@ extern "C" void launch_fp8_matmul_bf16(const __nv_bfloat16 *input,
                   "capability >= 8.0)\n");
 }
 
+extern "C" void launch_fp8_gemv_f16(const __half *input,
+                                    const void *weight, // __nv_fp8_e4m3*
+                                    const float *weight_scale, __half *output,
+                                    int M, int N, int K, int scale_row_stride,
+                                    int block_size_y, int block_size_x,
+                                    cudaStream_t stream) {
+  fprintf(stderr, "FP8 GEMV not supported on this GPU (requires compute "
+                  "capability >= 8.0)\n");
+}
+
+extern "C" void launch_fp8_gemv_bf16(const __nv_bfloat16 *input,
+                                     const void *weight, // __nv_fp8_e4m3*
+                                     const float *weight_scale,
+                                     __nv_bfloat16 *output, int M, int N, int K,
+                                     int scale_row_stride, int block_size_y,
+                                     int block_size_x, cudaStream_t stream) {
+  fprintf(stderr, "FP8 GEMV not supported on this GPU (requires compute "
+                  "capability >= 8.0)\n");
+}
+
 extern "C" void launch_fp8_indexed_moe_gemm_f16(
     const __half *input,
     const void *weights, // __nv_fp8_e4m3*
