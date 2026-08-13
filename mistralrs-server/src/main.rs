@@ -361,7 +361,7 @@ async fn main() -> Result<()> {
                 .with_seed_optional(args.seed)
                 .with_log_optional(args.log)
                 .with_mcp_config_optional(mcp_config)
-                .with_paged_attn_cache_type(args.cache_type.unwrap_or_default());
+                .with_paged_attn_cache_type_optional(args.cache_type);
 
             // Add models to builder
             for config in model_configs {
@@ -402,7 +402,7 @@ async fn main() -> Result<()> {
                 .with_paged_ctxt_len_optional(args.paged_ctxt_len)
                 .with_paged_attn_block_size_optional(args.paged_attn_block_size)
                 .with_mcp_config_optional(mcp_config)
-                .with_paged_attn_cache_type(args.cache_type.unwrap_or_default());
+                .with_paged_attn_cache_type_optional(args.cache_type);
 
             if let Some(model) = args.search_embedding_model {
                 builder = builder.with_search_embedding_model(model);

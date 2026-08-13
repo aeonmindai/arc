@@ -877,6 +877,13 @@ impl Runner {
             }
             (_, _, _, _, _, _) => None,
         };
+        // An explicitly passed cache type hard-errors (rather than silently
+        // falling back) when the model cannot support it.
+        let cache_config = if pa_cache_type.is_some() {
+            cache_config.map(PagedAttentionConfig::with_explicit_cache_type)
+        } else {
+            cache_config
+        };
 
         let pipeline = loader
             .load_model_from_hf(

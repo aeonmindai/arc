@@ -122,6 +122,74 @@ mod cu_seqlens_tests {
         Ok(())
     }
 }
+#[cfg(test)]
+mod cache_config_tests {
+    use super::*;
+    use candle_core::Device;
+
+    fn small_head_dim_model() -> ModelConfigMetadata {
+        ModelConfigMetadata {
+            max_seq_len: 4096,
+            num_layers: 2,
+            hidden_size: 512,
+            num_kv_heads: 2,
+            num_attn_heads: 4,
+            sliding_window: None,
+            k_head_dim: 64,
+            v_head_dim: 64,
+            kv_cache_layout: KvCacheLayout::Standard,
+        }
+    }
+
+    /// A defaulted TurboQuant cache type on a head_dim-64 model must fall back
+    /// to `Auto` at cache-config construction time — the returned config (used
+    /// for both sizing and `CacheEngine` allocation) carries the resolved type.
+    #[test]
+    fn calculate_cache_config_falls_back_for_unsupported_turboquant() -> anyhow::Result<()> {
+        let device = Device::Cpu;
+        let cfg = calculate_cache_config(
+            MemoryGpuConfig::MbAmount(64),
+            Some(32),
+            DType::F16,
+            PagedCacheType::TurboQuant,
+            false,
+            &small_head_dim_model(),
+            &device,
+            &[Some(device.clone())],
+            true,
+            None,
+            None,
+        )?;
+        assert_eq!(cfg.cache_type, PagedCacheType::Auto);
+        assert!(cfg.num_gpu_blocks > 0);
+        Ok(())
+    }
+
+    /// The same geometry with an explicitly forced TurboQuant type must error.
+    #[test]
+    fn calculate_cache_config_errors_for_forced_turboquant() {
+        let device = Device::Cpu;
+        let err = calculate_cache_config(
+            MemoryGpuConfig::MbAmount(64),
+            Some(32),
+            DType::F16,
+            PagedCacheType::TurboQuant,
+            true,
+            &small_head_dim_model(),
+            &device,
+            &[Some(device.clone())],
+            true,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("explicitly requested"),
+            "unexpected error: {err}"
+        );
+    }
+}
+
 pub use config::{KvCacheLayout, ModelConfigLike, ModelConfigMetadata};
 pub use kv_cache_manager::KVCacheManager;
 pub use layers::PagedAttention;
@@ -140,6 +208,10 @@ pub struct PagedAttentionConfig {
     pub(crate) block_size: Option<usize>,
     pub(crate) mem_gpu: MemoryGpuConfig,
     pub(crate) cache_type: PagedCacheType,
+    /// Whether `cache_type` was explicitly chosen by the user (as opposed to
+    /// the ambient TurboQuant default). Explicit choices hard-error instead
+    /// of auto-falling back when the model cannot support them.
+    pub(crate) cache_type_explicit: bool,
 }
 
 impl PagedAttentionConfig {
@@ -152,7 +224,16 @@ impl PagedAttentionConfig {
             block_size,
             mem_gpu,
             cache_type,
+            cache_type_explicit: false,
         })
+    }
+
+    /// Mark `cache_type` as an explicit user choice: a model the type cannot
+    /// support then becomes a hard error instead of an auto-fallback to
+    /// [`PagedCacheType::Auto`].
+    pub fn with_explicit_cache_type(mut self) -> Self {
+        self.cache_type_explicit = true;
+        self
     }
 }
 
@@ -210,6 +291,7 @@ pub fn calculate_cache_config(
     block_size: Option<usize>,
     dtype: DType,
     cache_type: PagedCacheType,
+    cache_type_explicit: bool,
     config: &dyn ModelConfigLike,
     device: &Device,
     layer_devices: &[Option<Device>],
@@ -221,6 +303,10 @@ pub fn calculate_cache_config(
     if !SUPPORTED_BLOCK_SIZE.contains(&block_size) {
         anyhow::bail!("Block size must be in {SUPPORTED_BLOCK_SIZE:?}, got {block_size}");
     }
+    // TurboQuant only supports standard-layout models with head_dim == 128;
+    // resolve to a supported cache type (or error, if the user explicitly
+    // forced TurboQuant) before any sizing or allocation happens.
+    let cache_type = cache_type.resolve_for_model(config, cache_type_explicit)?;
     let dtype = cache_type.to_dtype(dtype);
     let dtype_size = dtype.size_in_bytes();
 
@@ -309,7 +395,8 @@ pub fn calculate_cache_config(
         }
     }
 
-    let num_gpu_blocks = if let Some(bytes_per_tok_per_layer) = turboquant_bytes_per_token_per_layer {
+    let num_gpu_blocks = if let Some(bytes_per_tok_per_layer) = turboquant_bytes_per_token_per_layer
+    {
         // TurboQuant: compute blocks from actual packed byte sizes
         // total_bytes = num_blocks * block_size * num_layers * bytes_per_token_per_layer
         // num_blocks = total_bytes / (block_size * num_layers * bytes_per_token_per_layer)
@@ -323,7 +410,9 @@ pub fn calculate_cache_config(
         let bytes_per_block = if let Some(b) = turboquant_bytes_per_token_per_layer {
             block_size * config.num_layers() * b
         } else {
-            block_size * config.num_layers() * dtype_size
+            block_size
+                * config.num_layers()
+                * dtype_size
                 * (config.num_kv_heads() * (config.k_head_dim() + config.v_head_dim()))
         };
         info!(

@@ -3,9 +3,7 @@
 use anyhow::{Context, Result};
 use tracing::info;
 
-use mistralrs_core::{
-    initialize_logging, DiffusionLoaderType, ModelSelected, PagedCacheType, SpeechLoaderType,
-};
+use mistralrs_core::{initialize_logging, DiffusionLoaderType, ModelSelected, SpeechLoaderType};
 use mistralrs_server_core::{
     mistralrs_for_server_builder::MistralRsForServerBuilder,
     mistralrs_server_router_builder::MistralRsServerRouterBuilder,
@@ -77,7 +75,7 @@ pub async fn run_server(
         .with_paged_attn_gpu_mem_usage_optional(paged_attn_gpu_mem_usage)
         .with_paged_ctxt_len_optional(paged_ctxt_len)
         .with_paged_attn_block_size_optional(paged_attn_block_size)
-        .with_paged_attn_cache_type(paged_cache_type);
+        .with_paged_attn_cache_type_optional(paged_cache_type);
 
     if let Some(model) = runtime.search_embedding_model {
         builder = builder.with_search_embedding_model(model.into());
@@ -519,7 +517,7 @@ pub(crate) fn extract_paged_attn_settings(
         ModelType::Text { cache, .. } => cache,
         ModelType::Vision { cache, .. } => cache,
         ModelType::Embedding { cache, .. } => cache,
-        _ => return (None, None, None, None, None, PagedCacheType::TurboQuant),
+        _ => return (None, None, None, None, None, None),
     };
 
     cache.paged_attn.clone().into_builder_flags()

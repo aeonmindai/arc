@@ -72,7 +72,7 @@ pub async fn run_interactive(
         .with_paged_attn_gpu_mem_usage_optional(paged_attn_gpu_mem_usage)
         .with_paged_ctxt_len_optional(paged_ctxt_len)
         .with_paged_attn_block_size_optional(paged_attn_block_size)
-        .with_paged_attn_cache_type(paged_cache_type);
+        .with_paged_attn_cache_type_optional(paged_cache_type);
 
     if let Some(model) = runtime.search_embedding_model {
         builder = builder.with_search_embedding_model(model.into());

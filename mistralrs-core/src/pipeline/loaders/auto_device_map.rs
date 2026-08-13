@@ -291,14 +291,12 @@ pub fn get_device_layers(
                 other => other,
             };
 
-            let cache_type = paged_attn_config
-                .map(|cfg| cfg.cache_type)
-                .unwrap_or_default();
             let cache = calculate_cache_config(
                 effective_mem_gpu,
                 Some(cfg.block_size.unwrap_or(DEFAULT_PAGED_ATTENTION_BLOCK_SIZE)),
                 dtype,
-                cache_type,
+                cfg.cache_type,
+                cfg.cache_type_explicit,
                 &*model_cfg,
                 &devices[0],
                 &devices.iter().map(|d| Some(d.clone())).collect::<Vec<_>>(),
@@ -315,7 +313,11 @@ pub fn get_device_layers(
             //
             // Matches the K4/V3 formula in `calculate_cache_config`:
             //   bytes_per_tok_per_layer = kv_heads * (k/2 + ceil(v/10)*4 + 4)
-            if cache_type.is_turboquant() {
+            //
+            // Use the *resolved* type from the returned config: if TurboQuant
+            // fell back to `Auto` (unsupported head_dim/MLA layout), sizing
+            // must follow the unquantized shapes below.
+            if cache.cache_type.is_turboquant() {
                 let kv_heads = model_cfg.num_kv_heads();
                 let k_packed = model_cfg.k_head_dim() / 2;
                 let v_packed = (model_cfg.v_head_dim().div_ceil(10)) * 4;
