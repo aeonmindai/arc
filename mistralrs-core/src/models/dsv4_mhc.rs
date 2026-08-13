@@ -580,20 +580,26 @@ impl V4MHCLayerParams {
 pub(crate) fn sinkhorn_normalize(comb: &Tensor, sinkhorn_iters: usize, eps: f64) -> Result<Tensor> {
     // RUN-161 throughput: fused single-launch CUDA kernel replaces the ~123-op
     // candle chain below (the dominant decode cost — ~13k launch-bound
-    // micro-kernels/token across 43 layers). Opt-in via ARC_FUSED_SINKHORN=1
-    // until bit-identical-validated on GPU; falls back to the candle path
-    // otherwise (non-CUDA, gate off, or any error).
+    // micro-kernels/token across 43 layers). Default-ON; opt out with
+    // ARC_NO_FUSED_SINKHORN=1. Falls back to the candle path otherwise
+    // (non-CUDA, non-F32, opted out, or any kernel error — silent
+    // fall-through).
     //
-    // Bit-identity status: the first kernel FAILED the 2026-08-13 H200 A/B
-    // (ppl 58.85084 vs 58.88946, 4/6 greedy divergences) — sequential
-    // reductions + --use_fast_math compilation did not match this candle
-    // chain's rounding. Fixed by construction in cuda/sinkhorn.cu (candle
-    // fast_sum/fast_max pairwise-tree order, unfused IEEE _rn arithmetic,
-    // dedicated no-fast-math build); see the contract comment there and the
-    // bitwise replica tests in cuda/sinkhorn.rs. Gate stays opt-in until the
-    // fixed kernel passes the on-GPU A/B (arc-tools/quality:
-    // run_sinkhorn_ab.py + run_ppl.sh --sinkhorn-ab).
-    if std::env::var_os("ARC_FUSED_SINKHORN").is_some()
+    // Bit-identity status: VALIDATED on H200, 2026-08-13 (GPU session 2).
+    // Both halves of the flip-the-default criteria passed:
+    //   - run_ppl.sh --sinkhorn-ab: per-chunk ppl bit-identical on vs off
+    //     (7.7113123 / 12.602792 / 16.043064 both ways; ppl_sink_verdict.json
+    //     bit_identical=true).
+    //   - run_sinkhorn_ab.py: greedy 128-token outputs token-identical on
+    //     6/6 prompts, 0 mismatches (sinkhorn_verdict.json).
+    // History: the first kernel FAILED the earlier H200 A/B (ppl 58.85084 vs
+    // 58.88946, 4/6 greedy divergences) — sequential reductions +
+    // --use_fast_math compilation did not match this candle chain's rounding.
+    // Fixed by construction in cuda/sinkhorn.cu (candle fast_sum/fast_max
+    // pairwise-tree order, unfused IEEE _rn arithmetic, dedicated
+    // no-fast-math build); see the contract comment there and the bitwise
+    // replica tests in cuda/sinkhorn.rs.
+    if std::env::var_os("ARC_NO_FUSED_SINKHORN").is_none()
         && matches!(comb.device(), candle_core::Device::Cuda(_))
         && comb.dtype() == DType::F32
     {

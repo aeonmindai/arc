@@ -39,7 +39,8 @@ use image::DynamicImage;
 pub use inputs_processor::InputProcessorOutput;
 pub(crate) use isq::IsqModelLoader;
 pub use isq::{
-    expand_isq_value, parse_isq_value, IsqModel, IsqOrganization, UQFF_MULTI_FILE_DELIMITER,
+    expand_isq_value, parse_isq_value, IsqModel, IsqOrganization, UqffFullSer, UqffSourceWeights,
+    UQFF_MTP_TENSOR_PREFIX, UQFF_MULTI_FILE_DELIMITER,
 };
 pub use post_load_hooks::{register_post_load_hook, PostLoadHook};
 use llguidance::toktrie::TokEnv;
@@ -95,8 +96,8 @@ pub(crate) use processing::{
 };
 use rand_isaac::Isaac64Rng;
 pub use mtp_pipeline::{
-    mtp_load_depth, set_mtp_load_depth, try_wrap_pipeline_with_mtp, MtpDecodeKit,
-    MtpSpeculativePipeline,
+    mtp_load_depth, mtp_uqff_bake, set_mtp_load_depth, set_mtp_uqff_bake,
+    try_wrap_pipeline_with_mtp, MtpDecodeKit, MtpSpeculativePipeline,
 };
 pub use speculative::{SpeculativeConfig, SpeculativeLoader, SpeculativePipeline};
 pub use speech::{SpeechLoader, SpeechPipeline};

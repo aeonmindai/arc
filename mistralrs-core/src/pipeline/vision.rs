@@ -844,6 +844,8 @@ impl Loader for VisionLoader {
                 self.config.topology.as_ref(),
                 silent,
                 from_uqff,
+                // Vision models have no optional MTP tail; no source fallback.
+                None,
             )?;
         }
 

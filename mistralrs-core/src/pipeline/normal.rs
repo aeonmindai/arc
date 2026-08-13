@@ -23,7 +23,7 @@ use crate::kv_cache::{FullCacheManager, HybridCacheManager, NormalCacheManager};
 use crate::lora::Ordering;
 use crate::paged_attention::{calculate_cache_config, AttentionImplementation, CacheEngine};
 use crate::pipeline::chat_template::{calculate_eos_tokens, GenerationConfig};
-use crate::pipeline::isq::UqffFullSer;
+use crate::pipeline::isq::{UqffFullSer, UqffSourceWeights};
 use crate::pipeline::loaders::auto_device_map;
 use crate::pipeline::loaders::QuantizationConfigShim;
 use crate::pipeline::sampling::sample_and_add_toks;
@@ -619,6 +619,16 @@ impl Loader for NormalLoader {
         // load (self-resetting) on the construction thread.
         mistralrs_quant::set_loading_from_uqff(self.config.from_uqff.is_some());
 
+        // UQFF bake: force-load the V4 MTP decoder block (even without
+        // `--mtp-depth`) so its tensors are quantized and included in the
+        // artifact (~800MB at 2-bit) under `mtp.<j>` names. Without this, a
+        // bake made without `--mtp-depth` yields a UQFF that a
+        // `--mtp-depth > 0` serve can only satisfy by falling back to the
+        // source checkpoint. Set every load (self-resetting).
+        crate::pipeline::mtp_pipeline::set_mtp_uqff_bake(
+            self.config.write_uqff.is_some() && self.config.from_uqff.is_none(),
+        );
+
         if self.config.imatrix.is_some() && self.config.calibration_file.is_some() {
             anyhow::bail!(
                 "`imatrix` and `calibration_file` were both specified, this is not allowed."
@@ -977,6 +987,14 @@ impl Loader for NormalLoader {
                 self.config.topology.as_ref(),
                 silent,
                 from_uqff,
+                // Source checkpoint fallback: if the artifact was baked
+                // without `--mtp-depth`, the V4 MTP decoder block is loaded
+                // unquantized from these weights instead of panicking on
+                // leftover DummyLayers.
+                Some(UqffSourceWeights {
+                    weight_files: paths.get_weight_filenames(),
+                    dtype,
+                }),
             )?;
         }
 
