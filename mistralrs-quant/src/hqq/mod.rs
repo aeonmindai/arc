@@ -95,7 +95,7 @@ macro_rules! dequant_for_dtype {
             drop(out_guard);
 
             let storage = CudaStorage {
-                slice: CudaStorageSlice::$dtype(out),
+                slice: std::mem::ManuallyDrop::new(CudaStorageSlice::$dtype(out)),
                 device: $dev.clone(),
             };
             let storage = Storage::Cuda(storage);

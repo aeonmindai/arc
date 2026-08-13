@@ -952,7 +952,8 @@ impl Sampler {
             && no_penalties
             && !logits.device().is_cpu();
         if trivial {
-            // Greedy: single GPU argmax kernel + 4-byte D2H.
+            // Greedy: single GPU argmax kernel + 4-byte D2H. Never sorts, so
+            // always safe regardless of vocab size.
             if self.temperature.is_none() {
                 let next_token = logits.argmax(D::Minus1)?.to_scalar::<u32>()?;
                 let bytes = if let Some(tok) = &self.tokenizer {
@@ -970,15 +971,36 @@ impl Sampler {
                     bytes,
                 });
             }
-            // Temperature sampling: full nucleus sampling stays on GPU via sample_fast.
-            return self.sample_fast(
-                logits,
-                context,
-                return_logprobs,
-                self.top_k,
-                self.top_p,
-                self.min_p,
-            );
+            // Temperature sampling: full nucleus sampling stays on GPU via
+            // sample_fast. BUT the top-k / top-p branches there call
+            // `fast_sort_asc`, which on CUDA dispatches candle's arg_sort kernel.
+            // That kernel requests `next_power_of_2(vocab) * 4` bytes of shared
+            // memory per block; for large vocabularies (e.g. DeepSeek-V4's
+            // ~129K) this is ~1 MB, far over the 48 KB/block hardware limit, and
+            // the launch fails with CUDA_ERROR_INVALID_VALUE. Only stay on the
+            // GPU sort path when a sort is either not needed (top_k<=0 and
+            // top_p>=1) or small enough to fit; otherwise fall through to the
+            // correct CPU sampling path below (it pays a D2H of the logits, but
+            // only when top-k/top-p is actually requested — the common
+            // top_p=1.0/top_k=0 request still stays on GPU).
+            let needs_sort = self.top_k > 0 || (self.top_p > 0.0 && self.top_p < 1.0);
+            let sort_fits = || -> bool {
+                match logits.dim(D::Minus1) {
+                    Ok(vocab) => vocab.next_power_of_two().saturating_mul(4) <= 48 * 1024,
+                    Err(_) => false,
+                }
+            };
+            if !needs_sort || sort_fits() {
+                return self.sample_fast(
+                    logits,
+                    context,
+                    return_logprobs,
+                    self.top_k,
+                    self.top_p,
+                    self.min_p,
+                );
+            }
+            // else: fall through to the CPU sampling path (correct on any vocab).
         }
 
         let logits = logits.to_vec1()?;
@@ -1160,5 +1182,70 @@ mod tests {
         assert_eq!(s_topp.top_k(), 40);
         assert_eq!(s_topp.frequency_penalty(), Some(0.1));
         assert_eq!(s_topp.presence_penalty(), Some(0.2));
+    }
+
+    /// Production regression test for the chat repetition-loop fix.
+    ///
+    /// DeepSeek-V4-Flash at 2-bit can emit the correct token and then loop it
+    /// forever instead of emitting EOS (e.g. "400.400.400..."). The serve-time
+    /// loop-breaker is the frequency / presence / repetition penalty, applied on
+    /// the CPU sampling path — which is the only path on a CPU device, and the
+    /// path the CUDA arg_sort fix routes penalized requests to on GPU as well.
+    ///
+    /// This pins that a token a greedy decode would repeat forever is demoted
+    /// below an alternative once any one of the three penalties is applied (the
+    /// loop is broken), and that without a penalty the loop persists. Greedy
+    /// (temperature = None) makes selection a deterministic argmax over the
+    /// penalized logits, so the assertions are exact and RNG-independent.
+    #[test]
+    fn penalties_break_repetition_loop() {
+        use super::Sampler;
+        use candle_core::{Device, Tensor};
+        use rand::SeedableRng;
+        use rand_isaac::Isaac64Rng;
+        use std::sync::{Arc, Mutex};
+
+        // vocab = 6; token 3 is the degeneration attractor (highest logit) and
+        // token 1 is the runner-up. A greedy decode always re-selects token 3.
+        let raw = vec![0.5f32, 4.0, 0.5, 5.0, 0.5, 0.5];
+        let device = Device::Cpu;
+        // Context in which token 3 has already been emitted repeatedly (the loop).
+        let context: Vec<u32> = vec![3, 3, 3, 3];
+        let rng = || Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(0)));
+        let logits = || Tensor::from_vec(raw.clone(), 6, &device).unwrap();
+
+        let mk = |freq, pres, rep| {
+            // Greedy (None temp), top_k/top_p/min_p disabled: argmax over penalized logits.
+            Sampler::new(None, 0, None, freq, pres, rep, None, -1, 1.0, 0.0, vec![]).unwrap()
+        };
+        let sample = |s: &Sampler| s.sample(logits(), &context, false, rng(), false, false).unwrap().token;
+
+        // No penalty: the loop continues — greedy re-selects the attractor.
+        assert_eq!(
+            sample(&mk(None, None, None)),
+            3,
+            "without a penalty the degenerate token should win"
+        );
+
+        // Repetition penalty 2.0: logit[3]=5.0>0 -> /2.0 = 2.5 < logit[1]=4.0.
+        assert_eq!(
+            sample(&mk(None, None, Some(2.0))),
+            1,
+            "repetition_penalty must break the loop"
+        );
+
+        // Frequency penalty 1.0: logit[3] -= count(4)*1.0 = 1.0 < logit[1]=4.0.
+        assert_eq!(
+            sample(&mk(Some(1.0), None, None)),
+            1,
+            "frequency_penalty must break the loop"
+        );
+
+        // Presence penalty 2.0: logit[3] -= 2.0 (count>0) = 3.0 < logit[1]=4.0.
+        assert_eq!(
+            sample(&mk(None, Some(2.0), None)),
+            1,
+            "presence_penalty must break the loop"
+        );
     }
 }

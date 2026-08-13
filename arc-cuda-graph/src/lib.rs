@@ -60,7 +60,9 @@ pub use weights::{
 /// Try to create a CUDA graph runner for the given device.
 #[cfg(feature = "cuda")]
 pub fn try_init_graph_runner(device: &candle_core::Device) -> Option<CudaGraphRunner> {
-    match CudaGraphRunner::new(device, 2) {
+    // 4 eager warmup decode steps: with the candle caching allocator on, these
+    // populate the cache so the captured forward is allocation-free (RUN-161).
+    match CudaGraphRunner::new(device, 4) {
         Ok(runner) => {
             tracing::info!("CUDA graph runner initialized");
             Some(runner)

@@ -46,6 +46,13 @@ pub struct CudaGraphRunner {
     graphs: HashMap<usize, CapturedGraph>,
     enabled: bool,
     warmup_remaining: u32,
+    /// RUN-161: the deferred-free warmup pass has run. After the eager warmups
+    /// (which only fill the alloc cache to peak-live), exactly one forward must
+    /// run with the device in capture mode so the cache grows to the FULL
+    /// per-forward allocation count (every alloc distinct, frees deferred).
+    /// Generic: the caller toggles the device's capture mode; the runner just
+    /// tracks that the pass is owed. See `try_take_deferred_pass`.
+    deferred_pass_done: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -69,6 +76,7 @@ impl CudaGraphRunner {
                 graphs: HashMap::new(),
                 enabled: false,
                 warmup_remaining: 0,
+                deferred_pass_done: false,
             });
         }
 
@@ -86,11 +94,26 @@ impl CudaGraphRunner {
             graphs: HashMap::new(),
             enabled: true,
             warmup_remaining: warmup_steps,
+            deferred_pass_done: false,
         })
     }
 
     pub fn is_enabled(&self) -> bool {
         self.enabled && self.warmup_remaining == 0
+    }
+
+    /// Returns `true` exactly once, after warmup completes and before the graph
+    /// is captured: the caller should then run ONE forward with the device's
+    /// caching allocator in capture mode (`set_capture_mode(true)` ... forward
+    /// ... `set_capture_mode(false)`) to grow the free pool to the full
+    /// per-forward allocation count. Generic across models.
+    pub fn try_take_deferred_pass(&mut self) -> bool {
+        if self.enabled && self.warmup_remaining == 0 && !self.deferred_pass_done {
+            self.deferred_pass_done = true;
+            true
+        } else {
+            false
+        }
     }
 
     pub fn tick_warmup(&mut self) -> bool {
@@ -198,7 +221,10 @@ impl CudaGraphRunner {
         }
 
         // Begin capture
-        let s = unsafe { cuStreamBeginCapture_v2(self.stream, CUstreamCaptureMode::THREAD_LOCAL) };
+        // RELAXED tolerates cross-stream dependencies that candle's allocator
+        // and helper streams create (THREAD_LOCAL rejects them with
+        // CUDA_ERROR_STREAM_CAPTURE_ISOLATION). (RUN-161)
+        let s = unsafe { cuStreamBeginCapture_v2(self.stream, CUstreamCaptureMode::RELAXED) };
         if s != CUDA_SUCCESS {
             // Restore original pool before bailing
             unsafe {
@@ -223,32 +249,37 @@ impl CudaGraphRunner {
         graph_pool: CUmemoryPool,
         original_pool: CUmemoryPool,
     ) -> candle_core::Result<Tensor> {
-        // End capture
+        // End capture. NOTE: the private pool stays installed as the device
+        // default through instantiate + the first launch. Graph memory nodes
+        // (candle's intermediate allocs recorded during capture) bind to the
+        // pool active at instantiate, and the stream-ordered allocator backs
+        // the capture-time virtual addresses at the first launch. Restoring the
+        // original pool BEFORE that (the previous behavior) made the graph
+        // allocate from the wrong pool -> the kernels' baked addresses were
+        // never backed -> MMU read fault (Xid 31) on launch. Restore only AFTER
+        // the first launch has materialized the graph's memory.
         let mut graph: CUgraph = std::ptr::null_mut();
         let s = unsafe { cuStreamEndCapture(self.stream, &mut graph) };
-
-        // ALWAYS restore original pool
-        unsafe {
-            cuDeviceSetMemPool(self.device_ordinal, original_pool);
-        }
-
         if s != CUDA_SUCCESS {
             unsafe {
+                cuDeviceSetMemPool(self.device_ordinal, original_pool);
                 cuMemPoolDestroy(graph_pool);
             }
             self.enabled = false;
             candle_core::bail!("cuStreamEndCapture failed: {s}");
         }
 
-        // Instantiate
+        // Instantiate (private pool still installed). RUN-161 2b:
+        // AUTO_FREE_ON_LAUNCH (=1) so a graph with memory-alloc nodes can be
+        // RE-launched (replayed) -- otherwise the 2nd launch fails with
+        // INVALID_VALUE. Harmless if the graph has no alloc nodes.
+        const CU_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH: u64 = 1;
         let mut exec: CUgraphExec = std::ptr::null_mut();
         let s = unsafe {
-            cuGraphInstantiate_v2(
+            cuGraphInstantiateWithFlags(
                 &mut exec,
                 graph,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                0,
+                CU_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
             )
         };
         unsafe {
@@ -256,24 +287,65 @@ impl CudaGraphRunner {
         }
         if s != CUDA_SUCCESS {
             unsafe {
+                cuDeviceSetMemPool(self.device_ordinal, original_pool);
                 cuMemPoolDestroy(graph_pool);
             }
             self.enabled = false;
             candle_core::bail!("cuGraphInstantiate failed: {s}");
         }
 
-        // First launch
+        // First launch (private pool still installed -> graph memory is
+        // allocated/backed here at the capture-time addresses).
         let s = unsafe { cuGraphLaunch(exec, self.stream) };
         if s != CUDA_SUCCESS {
             unsafe {
+                cuDeviceSetMemPool(self.device_ordinal, original_pool);
                 cuGraphExecDestroy(exec);
                 cuMemPoolDestroy(graph_pool);
             }
             self.enabled = false;
             candle_core::bail!("First cuGraphLaunch failed: {s}");
         }
+        // Check the sync: an illegal access during graph EXECUTION surfaces
+        // here (async), not at launch. Without this check it silently poisons
+        // the CUDA context and the process dies later with no diagnostic.
+        // cudaError: 700 = illegalAddress, 719 = launchFailure, 1 = invalidValue.
+        let sync = unsafe { cudaStreamSynchronize(self.stream) };
+        // RUN-161 diagnostic: measure the TRUE clean graph replay latency here,
+        // while the captured input tensors are still alive (no stale-input
+        // fault). 10 back-to-back launch+sync, report the best. Compare to the
+        // eager forward time to decide if the forward is dispatch- or
+        // kernel-bound (i.e. whether the graph can actually speed it up).
+        if sync == CUDA_SUCCESS {
+            let mut best = std::time::Duration::from_secs(3600);
+            for _ in 0..10 {
+                let t = std::time::Instant::now();
+                let ls = unsafe { cuGraphLaunch(exec, self.stream) };
+                unsafe { cudaStreamSynchronize(self.stream) };
+                if ls == CUDA_SUCCESS {
+                    let e = t.elapsed();
+                    if e < best {
+                        best = e;
+                    }
+                }
+            }
+            tracing::info!("ARC capture: CLEAN graph-launch best-of-10 = {best:?}");
+        }
+        // Restore the original pool now that the graph's memory is materialized.
+        // Subsequent replays reuse the already-allocated graph memory, so the
+        // device default pool no longer needs to be the private one.
         unsafe {
-            cudaStreamSynchronize(self.stream);
+            cuDeviceSetMemPool(self.device_ordinal, original_pool);
+        }
+        if sync != CUDA_SUCCESS {
+            unsafe {
+                cuGraphExecDestroy(exec);
+                cuMemPoolDestroy(graph_pool);
+            }
+            self.enabled = false;
+            candle_core::bail!(
+                "Graph first-launch sync failed (async fault during graph execution): cudaError {sync}"
+            );
         }
 
         tracing::info!("CUDA graph: captured + launched for batch_size={batch_size}");

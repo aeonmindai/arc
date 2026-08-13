@@ -282,6 +282,48 @@ pub struct QtipLayer {
     rotation_block: usize,
 }
 
+/// Borrowed, dequantization-free view of a [`QtipLayer`]'s packed trellis
+/// weights. Used by custom decode paths (e.g. `arc-cuda-graph`) that feed the
+/// raw 2-bit bytes straight into `fused_gemv_cuda` / a fused gather-gemv kernel
+/// instead of materializing a dense BF16 weight — the memory blow-up the
+/// dedicated decode path must avoid for V4 Flash. All fields borrow the live
+/// layer and must not outlive it.
+pub struct QtipPackedView<'a> {
+    /// Packed K-bit symbols, U8. 2-D `[N, packed_K]` or 3-D `[E, N, packed_K]`.
+    pub blocks: &'a Tensor,
+    /// Per-row scales, F32. 2-D `[N]` or 3-D `[E, N]`.
+    pub row_scales: &'a Tensor,
+    /// Shared Gaussian trellis LUT, `[2^L, V]` F32.
+    pub lut: &'a Tensor,
+    /// Optional bias `[N]` (2-D mode only; 3-D expert stacks are bias-free).
+    pub bias: Option<&'a Tensor>,
+    /// Input feature dim K.
+    pub in_features: usize,
+    /// `Some(E)` for stacked experts (3-D), `None` for a plain 2-D linear.
+    pub num_experts: Option<usize>,
+    /// Hadamard rotation signs `[in_features]` F32 (+/-1) when rotation is on.
+    pub rotation_signs: Option<&'a Tensor>,
+    /// Hadamard block size; 0 when rotation is disabled (the Greedy path).
+    pub rotation_block: usize,
+}
+
+impl QtipLayer {
+    /// Borrow this layer's packed trellis weights without dequantizing. The
+    /// returned [`QtipPackedView`] aliases the live tensors; do not outlive it.
+    pub fn packed_view(&self) -> QtipPackedView<'_> {
+        QtipPackedView {
+            blocks: &self.blocks,
+            row_scales: &self.row_scales,
+            lut: &self.lut,
+            bias: self.bias.as_ref(),
+            in_features: self.in_features,
+            num_experts: self.num_experts,
+            rotation_signs: self.rotation_signs.as_ref(),
+            rotation_block: self.rotation_block,
+        }
+    }
+}
+
 /// Quantization mode for QTIP.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum QtipMode {
@@ -616,9 +658,13 @@ impl QtipLayer {
             return Ok(None);
         }
 
-        // Move weight to CUDA F32 (caller may have BF16/F16 storage —
-        // candle does the cast on-device when src is already on CUDA).
-        let weight_cuda_f32 = weight.to_dtype(DType::F32)?.to_device(device)?;
+        // Move weight to CUDA F32. Order matters: when the source is CPU BF16
+        // (the 3-D MoE bake path passes CPU expert slices), casting BEFORE the
+        // transfer does a slow CPU bf16->f32 widening of every element AND then
+        // ships 2x the bytes (f32). Move bf16 to the device FIRST, then cast on
+        // the GPU -> half the PCIe traffic + the cast runs on the GPU. The
+        // bf16->f32 widening is exact, so this is bit-identical. RUN-161.
+        let weight_cuda_f32 = weight.to_device(device)?.to_dtype(DType::F32)?;
 
         // Build LUT on host (tiny, ~512 KiB) and upload.
         let lut_data = gaussian_lut();
@@ -726,34 +772,90 @@ impl QtipLayer {
         let mut shared_rotation_signs: Option<Tensor> = None;
         let mut shared_rotation_block: usize = 0;
 
-        for expert_idx in 0..e {
-            // Slice the 3-D weight to a single expert's [N, K] matrix.
-            // `narrow` returns a non-contiguous view in general; the inner
-            // quantize call will `contiguous()` / dtype-cast as needed.
-            let expert_w = weight.narrow(0, expert_idx, 1)?.squeeze(0)?;
-            let layer =
-                Self::quantize_with_options_concrete(&expert_w, None, device, mode, use_rotation)?;
+        // Per-expert streaming. The full stack is kept on CPU (caller passes
+        // device=CPU for the 3-D experts to avoid the ~4GB dense BF16 transient
+        // that OOMs the single-H100 tail). But the CPU Viterbi quantize is
+        // single-threaded and takes hours for a full requantize, while the
+        // compiled GPU Viterbi kernel finishes in seconds. So when CUDA + the
+        // QTIP kernels are available, quantize each expert on the GPU:
+        // `quantize_with_options_cuda` moves one expert at a time (CPU BF16 ->
+        // GPU F32, ~33MB transient + reused scratch), and we move the small
+        // packed result back to `device` (CPU) for stacking — matching the
+        // original output layout exactly. (RUN-161)
+        #[cfg(feature = "cuda")]
+        let quant_device = if ffi::HAVE_QTIP_KERNELS && matches!(device, Device::Cpu) {
+            candle_core::Device::cuda_if_available(0).unwrap_or_else(|_| device.clone())
+        } else {
+            device.clone()
+        };
+        #[cfg(not(feature = "cuda"))]
+        let quant_device = device.clone();
+        let move_back = matches!(quant_device, Device::Cuda(_)) && matches!(device, Device::Cpu);
 
-            blocks_slices.push(layer.blocks.clone());
-            scales_slices.push(layer.row_scales.clone());
+        // RUN-161 expert-batching: the per-expert loop used to stream ONE expert
+        // at a time -> 256 CPU<->GPU blocking round-trips/projection, which
+        // dominate the bake (the GPU kernel itself is <1s). Quantize experts in
+        // BATCHES instead: narrow B experts [B,N,K], reshape to 2-D rows
+        // [B*N, K] (per-row rotation/scale/Viterbi is identical to the
+        // single-expert path), quantize in ONE call, reshape the packed result
+        // back to [B,N,packed]. Cuts host round-trips from E to E/B.
+        // B is memory-bounded: B*N*K*4 (F32 weight) + ~6GB Viterbi scratch must
+        // fit free VRAM during the bake. Default 16; tune via ARC_QTIP_EXPERT_BATCH.
+        let batch = std::env::var("ARC_QTIP_EXPERT_BATCH")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(16)
+            .clamp(1, e);
 
-            // Capture shared tensors from the first expert; assert shape
-            // match on the rest. The LUT is deterministic per (K, V, L) and
-            // rotation signs are deterministic per (QTIP_ROTATION_SEED,
-            // K_in), so identity-by-shape is sufficient.
+        let mut expert_idx = 0usize;
+        while expert_idx < e {
+            let this_b = batch.min(e - expert_idx);
+            // [this_b, N, K] -> [this_b*N, K] (CPU reshape; concrete moves to GPU).
+            let chunk = weight.narrow(0, expert_idx, this_b)?;
+            let rows_2d = chunk.reshape((this_b * n, k_in))?;
+            let layer = Self::quantize_with_options_concrete(
+                &rows_2d,
+                None,
+                &quant_device,
+                mode,
+                use_rotation,
+            )?;
+
+            // blocks [this_b*N, packed] -> [this_b, N, packed]; scales [this_b*N] -> [this_b, N].
+            let blk = if move_back {
+                layer.blocks.to_device(device)?
+            } else {
+                layer.blocks.clone()
+            };
+            let scl = if move_back {
+                layer.row_scales.to_device(device)?
+            } else {
+                layer.row_scales.clone()
+            };
+            blocks_slices.push(blk.reshape((this_b, n, packed_per_row))?);
+            scales_slices.push(scl.reshape((this_b, n))?);
+
             if expert_idx == 0 {
-                shared_lut = Some(layer.lut);
-                shared_rotation_signs = layer.rotation_signs;
+                shared_lut = Some(if move_back {
+                    layer.lut.to_device(device)?
+                } else {
+                    layer.lut.clone()
+                });
+                shared_rotation_signs = match layer.rotation_signs.clone() {
+                    Some(s) if move_back => Some(s.to_device(device)?),
+                    other => other,
+                };
                 shared_rotation_block = layer.rotation_block;
             } else {
                 debug_assert_eq!(layer.lut.dims(), shared_lut.as_ref().unwrap().dims());
                 debug_assert_eq!(layer.rotation_block, shared_rotation_block);
             }
+            expert_idx += this_b;
         }
 
-        // Stack into 3-D layout: [E, N, packed_K] and [E, N].
-        let blocks_3d = Tensor::stack(&blocks_slices, 0)?;
-        let row_scales_2d = Tensor::stack(&scales_slices, 0)?;
+        // Concatenate per-batch [b_i, N, packed_K] chunks into [E, N, packed_K].
+        let blocks_3d = Tensor::cat(&blocks_slices, 0)?;
+        let row_scales_2d = Tensor::cat(&scales_slices, 0)?;
         debug_assert_eq!(blocks_3d.dims(), &[e, n, packed_per_row]);
         debug_assert_eq!(row_scales_2d.dims(), &[e, n]);
 
@@ -859,16 +961,24 @@ impl QtipLayer {
             let n = self.row_scales.dim(1)?;
             let k_in = self.in_features;
             let mut expert_tensors: Vec<Tensor> = Vec::with_capacity(e);
+            // Build the dense [E, N, K] stack on CPU. It is multi-GB and OOMs
+            // the GPU when the model is already resident (the TD-MoE decompose
+            // path, which is the only caller of the 3-D dequant). Moving each
+            // expert's blocks/scales to CPU forces `dequantize_single_expert`'s
+            // CPU fallback, so no large GPU tensor is ever allocated. The
+            // Tucker decomposition runs on CPU anyway. (RUN-161)
             for expert_idx in 0..e {
                 let blocks_e = self
                     .blocks
                     .narrow(0, expert_idx, 1)?
                     .squeeze(0)?
+                    .to_device(&Device::Cpu)?
                     .contiguous()?;
                 let scales_e = self
                     .row_scales
                     .narrow(0, expert_idx, 1)?
                     .squeeze(0)?
+                    .to_device(&Device::Cpu)?
                     .contiguous()?;
                 let expert_w = self.dequantize_single_expert(&blocks_e, &scales_e, n, k_in)?;
                 expert_tensors.push(expert_w);
@@ -1223,6 +1333,65 @@ impl QtipLayer {
     /// * We touch only the experts named in `indices` — never the full
     ///   `E`-stack. This is the load-bearing constraint that distinguishes
     ///   `gather_forward` from `dequantize_w` + dense matmul.
+    /// On-device (sync-free) sibling of `gather_forward_cuda` for the small-
+    /// batch DECODE regime. Reads each `(token, slot)` pair's expert id on the
+    /// GPU via the gather-gemv kernel, so it never pulls `indices` to the host
+    /// — making the MoE dispatch CUDA-graph capturable. One independent trellis
+    /// gemv per pair (no cross-token expert reuse), optimal for decode but not
+    /// prefill. Rotation handling mirrors `gather_forward_cuda` exactly so the
+    /// rotated-frame matmul identity `(xR)·(WR)^T = x·W^T` holds.
+    #[cfg(feature = "cuda")]
+    fn gather_forward_cuda_ondevice(&self, a: &Tensor, indices: &Tensor) -> Result<Tensor> {
+        let (n_tokens, n_experts_per_tok, cols) = a.dims3()?;
+        let rows = self.rows_per_expert()?;
+
+        if self.num_experts.is_none() {
+            candle_core::bail!(
+                "QtipLayer::gather_forward_cuda_ondevice: expected an expert-stacked (3-D) layer"
+            );
+        }
+
+        let out_dtype = a.dtype();
+        let n_pairs = n_tokens * n_experts_per_tok;
+        let a_flat = a.reshape((n_pairs, cols))?;
+        let a_for_rot = if matches!(a_flat.dtype(), DType::BF16 | DType::F16 | DType::F32) {
+            a_flat.contiguous()?
+        } else {
+            a_flat.to_dtype(DType::BF16)?.contiguous()?
+        };
+
+        // Rotate once (rotated-frame identity), matching gather_forward_cuda.
+        let a_rotated = if self.rotation_block >= 2 {
+            let signs = match &self.rotation_signs {
+                Some(t) => t,
+                None => candle_core::bail!(
+                    "QtipLayer::gather_forward_cuda_ondevice: rotation_block={} but rotation_signs is None",
+                    self.rotation_block
+                ),
+            };
+            cuda_ops::rotate_x_cuda(&a_for_rot, signs, self.rotation_block)?
+        } else {
+            a_for_rot
+        };
+
+        // Indices stay on-device — just normalize to U32 + contiguous.
+        let idx_u32 = indices.flatten_all()?.to_dtype(DType::U32)?.contiguous()?;
+
+        // [n_pairs, rows] -> [n_tokens, n_experts_per_tok, rows]
+        let out_flat = cuda_ops::gather_gemv_cuda(
+            &self.blocks,
+            &self.row_scales,
+            &self.lut,
+            &a_rotated,
+            &idx_u32,
+            self.in_features,
+        )?;
+        let out = out_flat
+            .reshape((n_tokens, n_experts_per_tok, rows))?
+            .to_dtype(out_dtype)?;
+        Ok(out)
+    }
+
     #[cfg(feature = "cuda")]
     fn gather_forward_cuda(&self, a: &Tensor, indices: &Tensor) -> Result<Tensor> {
         let (n_tokens, n_experts_per_tok, cols) = a.dims3()?;
@@ -1749,6 +1918,10 @@ impl QuantMethod for QtipLayer {
         self.dequantize_weights()
     }
 
+    fn qtip_packed(&self) -> Option<QtipPackedView<'_>> {
+        Some(self.packed_view())
+    }
+
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         self.forward_dequantize(x)
     }
@@ -1828,6 +2001,27 @@ impl QuantMethod for QtipLayer {
                 && matches!(a.device(), candle_core::Device::Cuda(_))
                 && matches!(a.dtype(), DType::BF16 | DType::F16 | DType::F32)
             {
+                // On-device (sync-free) path for the DECODE regime: reads the
+                // routing indices on-GPU so the MoE dispatch is CUDA-graph
+                // capturable. The existing `gather_forward_cuda` pulls indices
+                // to the host (a capture-aborting sync), so it stays the
+                // PREFILL path (better expert reuse across many tokens) and the
+                // fallback. Additive — existing behavior is preserved.
+                let ondevice_max_tokens = std::env::var("ARC_QTIP_ONDEVICE_MOE_MAX_TOKENS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(8);
+                let ondevice_disabled = std::env::var("ARC_NO_QTIP_ONDEVICE_MOE").is_ok();
+                if !ondevice_disabled && n_tokens <= ondevice_max_tokens {
+                    // Decode regime: on-device ONLY, propagate its error. The
+                    // host fallback (`gather_forward_cuda`) does a `to_vec1` D2H
+                    // read of `indices` which, under CUDA-graph capture, is
+                    // recorded-not-executed -> returns garbage indices ->
+                    // out-of-bounds expert-weight read -> MMU fault. So we must
+                    // never silently fall back to it in the capturable path.
+                    // (RUN-161)
+                    return self.gather_forward_cuda_ondevice(a, indices);
+                }
                 if let Ok(out) = self.gather_forward_cuda(a, indices) {
                     return Ok(out);
                 }
@@ -2032,15 +2226,12 @@ impl QuantizedSerde for QtipLayer {
         self.serialize_with_bias(self.bias.clone())
     }
     fn serialize_with_bias(&self, bias: Option<Tensor>) -> Result<Cow<'_, [u8]>> {
-        // The UQFF QTIP layout is 2-D only. 3-D stacked layers are produced
-        // by ISQ-at-load and are not currently round-tripped through UQFF —
-        // saving one would require a new format version. Bail clearly so a
-        // future serialize() of a 3-D layer doesn't silently truncate.
-        if self.num_experts.is_some() {
-            candle_core::bail!(
-                "QtipLayer::serialize: UQFF does not yet support 3-D stacked-expert layers"
-            );
-        }
+        // 3-D stacked-expert layers serialize fine: `serialize_tensor` writes
+        // each tensor's shape+data regardless of rank, so the only thing that
+        // distinguishes a 3-D layer is `blocks` being rank-3 (leading expert
+        // dim E). `deserialize_ext_bias` recovers `num_experts` from that
+        // rank, so no UQFF format/version change is needed and 2-D payloads
+        // are unaffected. (Enables V4 MoE expert stacks to round-trip.)
         let mut buffer = Vec::new();
         buffer.extend(&UQFF_VERSION.to_le_bytes());
         buffer.push(QuantizedSerdeType::Qtip as u8);
@@ -2129,6 +2320,17 @@ impl QuantizedSerde for QtipLayer {
             Err(_) => (None, 0usize),
         };
 
+        // Recover 2-D vs 3-D (stacked-expert) layout from the rank of
+        // `blocks`: rank-3 carries a leading expert dim E. Lets a
+        // UQFF-serialized MoE expert stack round-trip with no format change
+        // (2-D layers keep rank-2 blocks -> None). Computed before the struct
+        // literal so `blocks` isn't used after being moved in.
+        let num_experts = if blocks.rank() == 3 {
+            Some(blocks.dim(0)?)
+        } else {
+            None
+        };
+
         Ok((
             Arc::new(Self {
                 blocks,
@@ -2136,9 +2338,7 @@ impl QuantizedSerde for QtipLayer {
                 lut,
                 bias,
                 in_features,
-                // UQFF deserialize is 2-D only; 3-D stacks are reconstructed
-                // by re-running `quantize_with_options_3d` from a 3-D source.
-                num_experts: None,
+                num_experts,
                 rotation_signs,
                 rotation_block,
             }),

@@ -95,7 +95,20 @@ impl RenameRule {
 /// the SGLang `remap_weight_name_to_dpsk_hf_format` cases at lines 346, 347,
 /// 358, 366.
 pub fn v4_scale_rename_rules() -> Vec<RenameRule> {
-    vec![RenameRule::new(".weight_scale_inv", ".scale")]
+    vec![
+        RenameRule::new(".weight_scale_inv", ".scale"),
+        // HF convention → V4 native expert projection names.
+        // HF uses gate_proj/up_proj/down_proj; V4 uses w1/w3/w2.
+        RenameRule::new(".gate_proj.", ".w1."),
+        RenameRule::new(".up_proj.", ".w3."),
+        RenameRule::new(".down_proj.", ".w2."),
+        // Composite rules: rename rules don't chain, so we need combined
+        // entries for expert scale tensors (code asks for e.g.
+        // `gate_proj.weight_scale_inv`, disk has `w1.scale`).
+        RenameRule::new(".gate_proj.weight_scale_inv", ".w1.scale"),
+        RenameRule::new(".up_proj.weight_scale_inv", ".w3.scale"),
+        RenameRule::new(".down_proj.weight_scale_inv", ".w2.scale"),
+    ]
 }
 
 /// Backend that wraps another `SimpleBackend` and applies rename rules

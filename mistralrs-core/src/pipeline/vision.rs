@@ -378,6 +378,7 @@ impl Loader for VisionLoader {
                                 QuantizedSerdeType::Mxfp4 => IsqType::MXFP4.pack_factor(dtype),
                                 QuantizedSerdeType::Nvfp4 => IsqType::NVFP4.pack_factor(dtype),
                                 QuantizedSerdeType::Qtip => IsqType::QtipBitshift2.pack_factor(dtype),
+                                QuantizedSerdeType::TdMoeTucker => 1,
                             };
                             total_pack_factors += pack_factor;
                         }
@@ -842,6 +843,10 @@ impl Loader for VisionLoader {
                 from_uqff,
             )?;
         }
+
+        // Trim CUDA memory pools so `cuMemGetInfo` reflects actual free VRAM.
+        #[cfg(feature = "cuda")]
+        crate::trim_cuda_memory_pools();
 
         let (cache_config, cache_engine) = if let Some(paged_attn_config) = paged_attn_config {
             anyhow::ensure!(

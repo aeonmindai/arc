@@ -589,6 +589,137 @@ mod metal_tests {
 }
 
 // ============================================================
+//   CUDA 3-bit quantize kernel: bit-identical proof + bake bench
+//   (RUN-161: production GPU bake, no UQFF/CPU fallback)
+// ============================================================
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_afq3_tests {
+    use candle_core::{DType, Device, Result, Tensor, D};
+    use std::time::Instant;
+
+    use super::{afq_dequantize_op, afq_quantize_op};
+    use crate::{AfqBits, AfqGroupSize};
+
+    fn cos(a: &Tensor, b: &Tensor) -> Result<f32> {
+        let a = a.flatten_all()?.to_dtype(DType::F32)?;
+        let b = b.flatten_all()?.to_dtype(DType::F32)?;
+        let dot = (&a * &b)?.sum_all()?.to_scalar::<f32>()?;
+        let na = (&a * &a)?.sum_all()?.to_scalar::<f32>()?.sqrt();
+        let nb = (&b * &b)?.sum_all()?.to_scalar::<f32>()?.sqrt();
+        Ok(dot / (na * nb + 1e-12))
+    }
+
+    // Realistic weight-like BF16 tensor on CUDA: Gaussian body + heavy tails.
+    fn make_weight(rows: usize, cols: usize, dev: &Device) -> Result<Tensor> {
+        let body = Tensor::randn(0f32, 0.02f32, (rows, cols), dev)?;
+        // sparse large outliers (the part 3-bit affine struggles with)
+        let tails = Tensor::randn(0f32, 0.20f32, (rows, cols), dev)?;
+        let mask = tails.abs()?.ge(0.55f32)?.to_dtype(DType::F32)?;
+        (body + (tails * mask)?)?.to_dtype(DType::BF16)
+    }
+
+    /// Prove the GPU 3-bit quantize kernel is byte-for-byte identical to the
+    /// trusted CPU reference, and that round-trip quality matches.
+    #[test]
+    fn afq3_gpu_bit_identical_to_cpu() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        let gs = AfqGroupSize::Med; // group_size = 64
+        let bits = AfqBits::Three;
+
+        // Real V4-Flash expert shapes (+ a small one), last dim divisible by 64.
+        let shapes = [(2048usize, 7168usize), (7168, 2048), (512, 4096)];
+
+        for (rows, cols) in shapes {
+            let w_gpu = make_weight(rows, cols, &dev)?;
+            let w_cpu = w_gpu.to_device(&Device::Cpu)?;
+
+            // GPU path (new kernel) vs CPU reference path.
+            let (wq_g, s_g, b_g) = afq_quantize_op(&w_gpu, gs, bits)?;
+            let (wq_c, s_c, b_c) = afq_quantize_op(&w_cpu, gs, bits)?;
+
+            // --- bit-identical check on packed codes (u32) ---
+            let wq_g_v = wq_g.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u32>()?;
+            let wq_c_v = wq_c.flatten_all()?.to_vec1::<u32>()?;
+            assert_eq!(wq_g_v.len(), wq_c_v.len(), "packed length mismatch");
+            let mism = wq_g_v
+                .iter()
+                .zip(wq_c_v.iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            let total = wq_g_v.len();
+
+            // scales / biases identical?
+            let sg = s_g.to_device(&Device::Cpu)?.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+            let sc = s_c.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+            let s_mism = sg.iter().zip(sc.iter()).filter(|(a, b)| (*a - *b).abs() > 1e-6).count();
+            let bg = b_g.to_device(&Device::Cpu)?.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+            let bc = b_c.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+            let b_mism = bg.iter().zip(bc.iter()).filter(|(a, b)| (*a - *b).abs() > 1e-6).count();
+
+            // --- round-trip quality ---
+            let dq_g = afq_dequantize_op(&wq_g, &s_g, &b_g, gs, bits)?.to_device(&Device::Cpu)?;
+            let dq_c = afq_dequantize_op(&wq_c, &s_c, &b_c, gs, bits)?;
+            let cos_orig_g = cos(&w_cpu, &dq_g)?;
+            let cos_orig_c = cos(&w_cpu, &dq_c)?;
+            let cos_gc = cos(&dq_g, &dq_c)?;
+
+            println!(
+                "[{rows}x{cols}] packed_mism={mism}/{total} scale_mism={s_mism} bias_mism={b_mism} \
+                 cos(orig,gpu)={cos_orig_g:.6} cos(orig,cpu)={cos_orig_c:.6} cos(gpu,cpu)={cos_gc:.6}"
+            );
+
+            assert_eq!(mism, 0, "GPU packing not bit-identical to CPU ({mism}/{total})");
+            assert_eq!(s_mism, 0, "scales differ");
+            assert_eq!(b_mism, 0, "biases differ");
+            assert!(cos_gc > 0.99999, "gpu/cpu dequant cos too low: {cos_gc}");
+        }
+        Ok(())
+    }
+
+    /// Measure GPU 3-bit quantize throughput and extrapolate the full-model bake
+    /// time (the production SLA is 5-7 min, all on GPU, no UQFF).
+    #[test]
+    fn afq3_gpu_bake_throughput() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        let gs = AfqGroupSize::Med;
+        let bits = AfqBits::Three;
+
+        // One routed expert = 3 matrices (gate, up, down).
+        let (rows, cols) = (2048usize, 7168usize); // gate/up shape
+        let w = make_weight(rows, cols, &dev)?;
+        let elems = (rows * cols) as f64;
+
+        // warmup
+        for _ in 0..3 {
+            let _ = afq_quantize_op(&w, gs, bits)?;
+        }
+        dev.synchronize()?;
+
+        let iters = 20;
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let _ = afq_quantize_op(&w, gs, bits)?;
+        }
+        dev.synchronize()?;
+        let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        let gelem_s = elems / (us * 1e-6) / 1e9;
+
+        // V4-Flash: 43 layers, 256 routed experts, 3 matrices each (+shared).
+        // Active routed-expert weight volume ~= 256*43*3 matrices of this scale.
+        let n_matrices = 256.0 * 43.0 * 3.0;
+        let full_elems = n_matrices * elems;
+        let est_full_s = full_elems / (gelem_s * 1e9);
+
+        println!(
+            "[bake] {rows}x{cols} per-quantize {us:.1} us  ({gelem_s:.2} Gelem/s)  \
+             -> all-routed-experts ({n_matrices:.0} mats, {:.1}B params) est {est_full_s:.1} s",
+            full_elems / 1e9
+        );
+        Ok(())
+    }
+}
+
+// ============================================================
 //                    Portable CPU back‑end
 // ============================================================
 mod cpu_backend {
@@ -799,8 +930,9 @@ mod cuda_backend {
         if bits == 40 {
             candle_core::bail!("mxfp4 quantization is not supported on CUDA backend");
         }
-        if bits == 3 || bits == 6 {
-            // Non-power-of-2 bit widths fall back to CPU for quantization
+        if bits == 6 {
+            // 6-bit still falls back to CPU for quantization (no GPU kernel yet).
+            // 3-bit has a dedicated GPU kernel (handled in the dispatch below).
             return super::cpu_backend::afq_quantize_op(w, group_size, bits);
         }
 
@@ -911,6 +1043,30 @@ mod cuda_backend {
                             cols as i32,
                         ),
                         (8, 128) => ffi::afq_quantize_8bit_gs128_f16(
+                            w_ptr as *const f16,
+                            wq_ptr as *mut u32,
+                            s_ptr as *mut f16,
+                            b_ptr as *mut f16,
+                            rows as i32,
+                            cols as i32,
+                        ),
+                        (3, 32) => ffi::afq_quantize_3bit_gs32_f16(
+                            w_ptr as *const f16,
+                            wq_ptr as *mut u32,
+                            s_ptr as *mut f16,
+                            b_ptr as *mut f16,
+                            rows as i32,
+                            cols as i32,
+                        ),
+                        (3, 64) => ffi::afq_quantize_3bit_gs64_f16(
+                            w_ptr as *const f16,
+                            wq_ptr as *mut u32,
+                            s_ptr as *mut f16,
+                            b_ptr as *mut f16,
+                            rows as i32,
+                            cols as i32,
+                        ),
+                        (3, 128) => ffi::afq_quantize_3bit_gs128_f16(
                             w_ptr as *const f16,
                             wq_ptr as *mut u32,
                             s_ptr as *mut f16,
@@ -1036,6 +1192,30 @@ mod cuda_backend {
                             rows as i32,
                             cols as i32,
                         ),
+                        (3, 32) => ffi::afq_quantize_3bit_gs32_f32(
+                            w_ptr as *const f32,
+                            wq_ptr as *mut u32,
+                            s_ptr as *mut f32,
+                            b_ptr as *mut f32,
+                            rows as i32,
+                            cols as i32,
+                        ),
+                        (3, 64) => ffi::afq_quantize_3bit_gs64_f32(
+                            w_ptr as *const f32,
+                            wq_ptr as *mut u32,
+                            s_ptr as *mut f32,
+                            b_ptr as *mut f32,
+                            rows as i32,
+                            cols as i32,
+                        ),
+                        (3, 128) => ffi::afq_quantize_3bit_gs128_f32(
+                            w_ptr as *const f32,
+                            wq_ptr as *mut u32,
+                            s_ptr as *mut f32,
+                            b_ptr as *mut f32,
+                            rows as i32,
+                            cols as i32,
+                        ),
                         _ => candle_core::bail!(
                             "Unsupported bits/group_size combination: {bits}/{group_size}"
                         ),
@@ -1149,6 +1329,30 @@ mod cuda_backend {
                             cols as i32,
                         ),
                         (8, 128) => ffi::afq_quantize_8bit_gs128_bf16(
+                            w_ptr as *const bf16,
+                            wq_ptr as *mut u32,
+                            s_ptr as *mut bf16,
+                            b_ptr as *mut bf16,
+                            rows as i32,
+                            cols as i32,
+                        ),
+                        (3, 32) => ffi::afq_quantize_3bit_gs32_bf16(
+                            w_ptr as *const bf16,
+                            wq_ptr as *mut u32,
+                            s_ptr as *mut bf16,
+                            b_ptr as *mut bf16,
+                            rows as i32,
+                            cols as i32,
+                        ),
+                        (3, 64) => ffi::afq_quantize_3bit_gs64_bf16(
+                            w_ptr as *const bf16,
+                            wq_ptr as *mut u32,
+                            s_ptr as *mut bf16,
+                            b_ptr as *mut bf16,
+                            rows as i32,
+                            cols as i32,
+                        ),
+                        (3, 128) => ffi::afq_quantize_3bit_gs128_bf16(
                             w_ptr as *const bf16,
                             wq_ptr as *mut u32,
                             s_ptr as *mut bf16,
@@ -1696,15 +1900,60 @@ mod cuda_backend {
             candle_core::bail!("mxfp4 matmul is not supported on CUDA backend");
         }
 
-        // For indexed matmul, fall back to dequantize + matmul for now
-        if _lhs_indices.is_some() || _rhs_indices.is_some() {
-            let w_dequant =
-                afq_dequantize_op(w, scales, biases, group_size, bits)?.to_dtype(x.dtype())?;
-            return if transpose {
-                x.broadcast_matmul(&w_dequant.t()?)
+        // Indexed (MoE gather) matmul. RUN-161: the previous implementation
+        // dequantized the FULL stacked expert weight `w` ([E, N, K]) and did a
+        // plain `broadcast_matmul`, which (a) ignored the per-token expert
+        // indices entirely (every token got the same dense-over-all-experts
+        // result) and (b) is shape-incompatible — x is [..., J, K] with batch
+        // [.., J] while w batch is [E], so candle errors with a
+        // `broadcast_matmul` shape mismatch like `lhs:[T] rhs:[E]`. Both made
+        // AFQ MoE on CUDA produce garbage / crash.
+        //
+        // Correct semantics (matches the Metal `call_afq_qmm` indexed path and
+        // the doc on `QuantMethod::gather_forward_autocast`): `x` is
+        // (.., J, K), `rhs_indices` is (.., J) selecting an expert along w's
+        // dim 0, and out[.., j, :] = x[.., j, :] @ W[idx[.., j]] (^T when
+        // transposed). We gather the selected experts in the QUANTIZED domain
+        // first (cheap), then dequantize only the P=prod(idx) selected rows and
+        // run a batched matmul — unfused but correct (throughput is a separate
+        // task, see memory v4flash_3bit_affine_verdict).
+        if _rhs_indices.is_some() || _lhs_indices.is_some() {
+            if _lhs_indices.is_some() {
+                candle_core::bail!(
+                    "AFQ CUDA indexed matmul does not support lhs_indices (only \
+                     rhs/expert indices are used by MoE gather)."
+                );
+            }
+            let rhs_indices = _rhs_indices.unwrap();
+            let idx = rhs_indices.to_dtype(DType::U32)?.flatten_all()?.contiguous()?;
+            let p = idx.dims1()?;
+            let k = x.dim(D::Minus1)?;
+            // Every row of x (all dims but the last) maps to exactly one index.
+            let p_x = x.elem_count() / k;
+            if p_x != p {
+                candle_core::bail!(
+                    "AFQ indexed matmul: x rows ({p_x}) must equal index count ({p}); \
+                     x.dims={:?} idx.dims={:?}",
+                    x.dims(),
+                    rhs_indices.dims()
+                );
+            }
+            // Gather quantized expert rows, then dequantize only those.
+            let w_sel = w.index_select(&idx, 0)?;
+            let s_sel = scales.index_select(&idx, 0)?;
+            let b_sel = biases.index_select(&idx, 0)?;
+            let w_deq = afq_dequantize_op(&w_sel, &s_sel, &b_sel, group_size, bits)?
+                .to_dtype(x.dtype())?;
+            let x_flat = x.reshape((p, 1, k))?.contiguous()?;
+            let prod = if transpose {
+                x_flat.matmul(&w_deq.transpose(D::Minus1, D::Minus2)?.contiguous()?)?
             } else {
-                x.broadcast_matmul(&w_dequant)
+                x_flat.matmul(&w_deq.contiguous()?)?
             };
+            let n = prod.dim(D::Minus1)?;
+            let mut out_shape = rhs_indices.dims().to_vec();
+            out_shape.push(n);
+            return prod.reshape(out_shape);
         }
 
         if !transpose {

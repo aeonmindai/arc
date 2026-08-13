@@ -23,6 +23,11 @@ pub struct MoEExpertsConfig {
     pub num_experts_per_tok: usize,
     pub hidden_size: usize,
     pub moe_intermediate_size: usize,
+    /// SwiGLU clamp limit (DeepSeek V4: 10.0). When `Some`, the gate and up
+    /// projections are clamped to `[-limit, limit]` before the activation.
+    /// V4 was trained with this clamp; without it, experts whose activations
+    /// exceed the limit explode (RUN-161). `None` = unclamped (other models).
+    pub swiglu_limit: Option<f32>,
 }
 
 /// Backend selection for MoE experts
@@ -42,6 +47,13 @@ impl MoEExpertsBackend {
         loading_isq: bool,
         quantization_config: &Option<QuantizedConfig>,
     ) -> Self {
+        // RUN-161 collapse isolation: force the reference-correct per-expert
+        // loop (Slow) to test whether the CUDA gather kernel is mis-dispatching
+        // experts (collapse). If output stays collapsed under Slow, the bug is
+        // in the shared dequant/quant, not the gather kernel.
+        if std::env::var_os("ARC_MOE_SLOW").is_some() {
+            return Self::Slow;
+        }
         let has_immediate_isq = mistralrs_quant::get_immediate_isq().is_some();
         let use_fast = device.is_metal()
             || (device.is_cuda()
@@ -94,6 +106,7 @@ pub struct MoEExperts {
     backend: MoEExpertsBackendImpl,
     act: Activation,
     num_experts_per_tok: usize,
+    swiglu_limit: Option<f32>,
     all_reduce: SumAllReduce,
     world_size: usize,
 }
@@ -180,6 +193,7 @@ impl MoEExperts {
             backend: backend_impl,
             act,
             num_experts_per_tok: cfg.num_experts_per_tok,
+            swiglu_limit: cfg.swiglu_limit,
             all_reduce: SumAllReduce::new(comm),
             world_size: comm.world_size(),
         })
@@ -491,17 +505,56 @@ impl MoEExperts {
         let xs_flat = xs.reshape((num_tokens, hidden_dim))?;
 
         let ys = if xs.device().is_cuda() {
-            // CUDA path: use indexed_moe_forward compatible shapes
-            let xs = xs_flat.reshape((num_tokens, 1, hidden_dim))?;
+            // CUDA path: use indexed_moe_forward compatible shapes.
+            // FP8 gather_forward accepts (num_tokens, 1, hidden_dim) and broadcasts
+            // internally, but QTIP requires the second dim to match num_experts_per_tok.
+            // Expand to (num_tokens, num_experts_per_tok, hidden_dim) for compatibility.
+            let xs = xs_flat
+                .unsqueeze(1)?
+                .expand((num_tokens, self.num_experts_per_tok, hidden_dim))?
+                .contiguous()?;
             let gate = weights
                 .fused_gate_proj
                 .gather_forward_autocast(&xs, topk_ids)?;
             let up = weights
                 .fused_up_proj
                 .gather_forward_autocast(&xs, topk_ids)?;
-            weights
+            crate::models::deepseek4::v4_stat_dbg(&gate, "exp.gate");
+            crate::models::deepseek4::v4_stat_dbg(&up, "exp.up");
+            // RUN-161 collapse localization: cross-token cosine at each expert
+            // projection. xs is [num_tokens, top_k, hidden] (expanded); gate/up
+            // are [num_tokens, top_k, inter]. pos_dim=0 = tokens. These print
+            // immediately before the matching `L{li}.moe_routed` line, so align
+            // by proximity in the log.
+            crate::models::deepseek4::v4_collapse_dbg(&xs, "exp.in", 0);
+            crate::models::deepseek4::v4_collapse_dbg(&gate, "exp.gate", 0);
+            crate::models::deepseek4::v4_collapse_dbg(&up, "exp.up", 0);
+            // V4 clamped SwiGLU, computed in F32 for stability — matches
+            // reference inference/model.py:596-606: gate=w1(x).float(),
+            // up=w3(x).float(); up clamped to [-limit, limit] but gate clamped
+            // ONLY on the max side; silu(gate)*up in f32, then back to the model
+            // dtype for the down projection. (Previously both clamped both-sided
+            // and computed in bf16.) RUN-161.
+            let out_dtype = gate.dtype();
+            let gate = gate.to_dtype(candle_core::DType::F32)?;
+            let up = up.to_dtype(candle_core::DType::F32)?;
+            let (gate, up) = if let Some(limit) = self.swiglu_limit {
+                let limit = limit as f64;
+                (gate.clamp(-1e30, limit)?, up.clamp(-limit, limit)?)
+            } else {
+                (gate, up)
+            };
+            let act_gate = gate.apply(&self.act)?;
+            crate::models::deepseek4::v4_stat_dbg(&act_gate, "exp.act_gate");
+            let prod = (up * act_gate)?.to_dtype(out_dtype)?;
+            crate::models::deepseek4::v4_stat_dbg(&prod, "exp.prod");
+            let down = weights
                 .fused_down_proj
-                .gather_forward_autocast(&(up * gate.apply(&self.act)?)?, topk_ids)?
+                .gather_forward_autocast(&prod, topk_ids)?;
+            crate::models::deepseek4::v4_stat_dbg(&down, "exp.down");
+            crate::models::deepseek4::v4_collapse_dbg(&prod, "exp.prod", 0);
+            crate::models::deepseek4::v4_collapse_dbg(&down, "exp.down", 0);
+            down
         } else {
             // Metal path: use broadcast gather shapes
             let xs = xs.reshape((b_size, seq_len, 1, 1, hidden_dim))?;

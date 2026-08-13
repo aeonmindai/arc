@@ -126,161 +126,196 @@ pub fn apply_td_moe_to_model(
         candle_core::bail!("TD-MoE rank {rank} too small (need >= 4)");
     }
 
-    let (layers, _mapper) = model.get_layers_moe_experts_only();
+    let (layers, mapper) = model.get_layers_moe_experts_only();
     let total_layers = layers.len();
     info!("Arc TD-MoE: scanning {total_layers} candidate ISQ layers (target rank={rank})");
 
-    let mut compressed_layers = 0usize;
-    let mut skipped_layers = 0usize;
-    let mut total_orig_elems: u64 = 0;
-    let mut total_compressed_elems: u64 = 0;
-    let mut total_recon_err_l2: f64 = 0.0;
-    let mut total_recon_norm_l2: f64 = 0.0;
+    // The per-expert reconstruction-error diagnostic reconstructs the full dense
+    // weight and walks every element on CPU single-threaded -- pure diagnostic
+    // cost that dominated the decompose wall-time (~1 core for >1h on V4). Off by
+    // default; opt in with ARC_TD_MOE_DIAG=1 to get the rel-L2 number. (RUN-161)
+    let emit_diag = std::env::var("ARC_TD_MOE_DIAG")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
+    // Resolve each expert's home GPU device up front (the device mapper is not
+    // shared into the parallel workers).
+    let devices: Vec<Device> = layers
+        .iter()
+        .map(|(_, layer_idx)| {
+            mapper
+                .device_for(layer_idx.unwrap_or(0), false)
+                .cloned()
+                .unwrap_or(Device::Cpu)
+        })
+        .collect();
 
-    for (layer_arc, _layer_idx) in layers {
-        // Pull the dense weight out of the quant method.
-        let weight = match layer_arc.dequantize_w() {
-            Ok(w) => w,
-            Err(e) => {
-                warn!("Arc TD-MoE: skip layer (dequantize failed: {e})");
-                skipped_layers += 1;
-                continue;
-            }
-        };
-
-        let dims = weight.dims();
-        if dims.len() != 3 {
-            // 2-D linears (lm_head, gate, router) — TD-MoE only targets the
-            // stacked expert tensors.
-            skipped_layers += 1;
-            continue;
-        }
-
-        let (k, d_out, d_in) = (dims[0], dims[1], dims[2]);
-        if k < 2 || d_out < 4 || d_in < 4 {
-            // Too small to make sense.
-            skipped_layers += 1;
-            continue;
-        }
-
-        // Tier A: identity covariance (random / unbiased calibration).
-        // Whitening becomes a no-op and the pipeline reduces to plain Tucker,
-        // which is the minimum viable Tier A behaviour.
-        let cov_out = identity_matrix(d_out);
-        let cov_in = identity_matrix(d_in);
-
-        // Clamp ranks to fit this tensor.
-        let r1 = rank.min(k);
-        let r2 = rank.min(d_out);
-        let r3 = rank.min(d_in);
-
-        let (original_device, original_dtype) = (weight.device().clone(), weight.dtype());
-
-        let wt =
-            match tucker_decompose_with_whitening(&weight, [r1, r2, r3], &cov_out, &cov_in, 1e-3) {
-                Ok(w) => w,
-                Err(e) => {
-                    warn!("Arc TD-MoE: decomposition failed for [{k},{d_out},{d_in}] layer: {e}");
-                    skipped_layers += 1;
-                    continue;
-                }
-            };
-
-        // Compression accounting (factored storage vs dense original).
-        let orig_elems = (k * d_out * d_in) as u64;
-        let core_elems = (r1 * r2 * r3) as u64;
-        let factor_elems = (k * r1 + d_out * r2 + d_in * r3) as u64;
-        let stored_elems = core_elems + factor_elems;
-        total_orig_elems += orig_elems;
-        total_compressed_elems += stored_elems;
-
-        // Build the factored layer. We pre-multiply the re-coloring Cholesky
-        // factors `L_out` (mode-2) and `L_in` (mode-3) into U2 and U3 so the
-        // factored layer's reconstruction is identical to the original
-        // `whitened_tucker_reconstruct` output, but stores only the Tucker
-        // form on the device.
-        //
-        // Math: `whitened_tucker_reconstruct` produces
-        //         W[k, do, di] = sum_{i, j} T_w[k, i, j] · L_out[i, do] · L_in[j, di]
-        //       with T_w = G ×₁ U₁ ×₂ U₂ ×₃ U₃. Substituting and re-grouping:
-        //         W[k, do, di] = sum_{a,b,c} G[a,b,c] · U1[k,a]
-        //                        · (Σ_i L_out[i, do] · U2[i, b])
-        //                        · (Σ_j L_in[j,  di] · U3[j, c])
-        //       i.e. the pre-multiplied factors are
-        //         U2_pm = L_out^T @ U2   ([d_out, r2])
-        //         U3_pm = L_in^T  @ U3   ([d_in,  r3])
-        let l_out = match cholesky_from_cov(&wt.cov_out, d_out, wt.epsilon) {
-            Some(l) => l,
-            None => {
-                warn!(
-                    "Arc TD-MoE: Cholesky of L_out failed for [{k},{d_out},{d_in}] layer; \
-                     skipping factored conversion"
-                );
-                skipped_layers += 1;
-                continue;
-            }
-        };
-        let l_in = match cholesky_from_cov(&wt.cov_in, d_in, wt.epsilon) {
-            Some(l) => l,
-            None => {
-                warn!(
-                    "Arc TD-MoE: Cholesky of L_in failed for [{k},{d_out},{d_in}] layer; \
-                     skipping factored conversion"
-                );
-                skipped_layers += 1;
-                continue;
-            }
-        };
-
-        let factored = match build_factored_layer(
-            &wt.tucker.core,
-            &wt.tucker.factors[0],
-            &wt.tucker.factors[1],
-            &wt.tucker.factors[2],
-            &l_out,
-            &l_in,
-            d_out,
-            d_in,
-            &original_device,
-            original_dtype,
-        ) {
-            Ok(layer) => layer,
-            Err(e) => {
-                warn!(
-                    "Arc TD-MoE: factored-layer build failed for [{k},{d_out},{d_in}] layer: {e}"
-                );
-                skipped_layers += 1;
-                continue;
-            }
-        };
-
-        // Reconstruction error diagnostics: compare the factored layer's dense
-        // dequantize against the original weight. This is the same quantity
-        // the prior reconstruct-in-place path tracked.
-        if let (Ok(orig_v), Ok(recon_v)) = (
-            weight
-                .to_dtype(DType::F32)
-                .and_then(|t| t.to_device(&Device::Cpu))
-                .and_then(|t| t.flatten_all())
-                .and_then(|t| t.to_vec1::<f32>()),
-            factored
-                .dequantize_w()
-                .and_then(|t| t.to_dtype(DType::F32))
-                .and_then(|t| t.to_device(&Device::Cpu))
-                .and_then(|t| t.flatten_all())
-                .and_then(|t| t.to_vec1::<f32>()),
-        ) {
-            for (o, r) in orig_v.iter().zip(recon_v.iter()) {
-                let d = (*o - *r) as f64;
-                total_recon_err_l2 += d * d;
-                total_recon_norm_l2 += (*o as f64).powi(2);
-            }
-        }
-
-        *layer_arc = Arc::new(factored) as Arc<dyn QuantMethod>;
-
-        compressed_layers += 1;
+    struct LayerStat {
+        compressed: bool,
+        orig: u64,
+        comp: u64,
+        err: f64,
+        norm: f64,
     }
+    let skipped = || LayerStat {
+        compressed: false,
+        orig: 0,
+        comp: 0,
+        err: 0.0,
+        norm: 0.0,
+    };
+
+    // The dense dequant + Tucker SVD is pure CPU and runs ~7 cpu-min per expert
+    // on candle's CPU matmul, so the loop is decompose-bound. Parallelise across
+    // experts. Bounded (default 8) because each worker holds a multi-GB dense
+    // expert in host RAM and touches CUDA (dequant D2H + factored H2D); override
+    // with ARC_TD_MOE_THREADS. (RUN-161)
+    let n_threads = std::env::var("ARC_TD_MOE_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(8);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(n_threads)
+        .build()
+        .map_err(|e| candle_core::Error::Msg(format!("TD-MoE rayon pool: {e}")))?;
+    info!("Arc TD-MoE: decomposing experts with {n_threads} worker thread(s)");
+
+    let done = std::sync::atomic::AtomicUsize::new(0);
+
+    let stats: Vec<LayerStat> = pool.install(|| {
+        use rayon::prelude::*;
+        layers
+            .into_par_iter()
+            .zip(devices)
+            .map(|((layer_arc, _layer_idx), gpu_device)| {
+                let layer_t0 = std::time::Instant::now();
+                // Pull the dense weight out of the quant method (lands on CPU).
+                let weight = match layer_arc.dequantize_w() {
+                    Ok(w) => w,
+                    Err(e) => {
+                        warn!("Arc TD-MoE: skip layer (dequantize failed: {e})");
+                        return skipped();
+                    }
+                };
+                let dims = weight.dims();
+                if dims.len() != 3 {
+                    // 2-D linears (lm_head, gate, router) are not expert stacks.
+                    return skipped();
+                }
+                let (k, d_out, d_in) = (dims[0], dims[1], dims[2]);
+                if k < 2 || d_out < 4 || d_in < 4 {
+                    return skipped();
+                }
+
+                // Tier A: identity covariance (whitening reduces to plain Tucker).
+                let cov_out = identity_matrix(d_out);
+                let cov_in = identity_matrix(d_in);
+                let r1 = rank.min(k);
+                let r2 = rank.min(d_out);
+                let r3 = rank.min(d_in);
+                let (original_device, original_dtype) = (gpu_device.clone(), weight.dtype());
+
+                let wt = match tucker_decompose_with_whitening(
+                    &weight,
+                    [r1, r2, r3],
+                    &cov_out,
+                    &cov_in,
+                    1e-3,
+                ) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        warn!("Arc TD-MoE: decomposition failed [{k},{d_out},{d_in}]: {e}");
+                        return skipped();
+                    }
+                };
+
+                let orig_elems = (k * d_out * d_in) as u64;
+                let stored_elems = (r1 * r2 * r3 + k * r1 + d_out * r2 + d_in * r3) as u64;
+
+                // Pre-multiply the re-colouring Cholesky factors into U2/U3 (see
+                // the loader docstring for the algebra).
+                let l_out = match cholesky_from_cov(&wt.cov_out, d_out, wt.epsilon) {
+                    Some(l) => l,
+                    None => {
+                        warn!("Arc TD-MoE: Cholesky L_out failed [{k},{d_out},{d_in}]; skipping");
+                        return skipped();
+                    }
+                };
+                let l_in = match cholesky_from_cov(&wt.cov_in, d_in, wt.epsilon) {
+                    Some(l) => l,
+                    None => {
+                        warn!("Arc TD-MoE: Cholesky L_in failed [{k},{d_out},{d_in}]; skipping");
+                        return skipped();
+                    }
+                };
+
+                let factored = match build_factored_layer(
+                    &wt.tucker.core,
+                    &wt.tucker.factors[0],
+                    &wt.tucker.factors[1],
+                    &wt.tucker.factors[2],
+                    &l_out,
+                    &l_in,
+                    d_out,
+                    d_in,
+                    &original_device,
+                    original_dtype,
+                ) {
+                    Ok(layer) => layer,
+                    Err(e) => {
+                        warn!("Arc TD-MoE: factored build failed [{k},{d_out},{d_in}]: {e}");
+                        return skipped();
+                    }
+                };
+
+                // Optional reconstruction-error diagnostic (heavy; gated).
+                let (mut err, mut norm) = (0.0f64, 0.0f64);
+                if emit_diag {
+                    if let (Ok(orig_v), Ok(recon_v)) = (
+                        weight
+                            .to_dtype(DType::F32)
+                            .and_then(|t| t.to_device(&Device::Cpu))
+                            .and_then(|t| t.flatten_all())
+                            .and_then(|t| t.to_vec1::<f32>()),
+                        factored
+                            .dequantize_w()
+                            .and_then(|t| t.to_dtype(DType::F32))
+                            .and_then(|t| t.to_device(&Device::Cpu))
+                            .and_then(|t| t.flatten_all())
+                            .and_then(|t| t.to_vec1::<f32>()),
+                    ) {
+                        for (o, r) in orig_v.iter().zip(recon_v.iter()) {
+                            let d = (*o - *r) as f64;
+                            err += d * d;
+                            norm += (*o as f64).powi(2);
+                        }
+                    }
+                }
+
+                *layer_arc = Arc::new(factored) as Arc<dyn QuantMethod>;
+                let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                info!(
+                    "Arc TD-MoE: [{n}] compressed expert stack [{k},{d_out},{d_in}] \
+                     -> rank [{r1},{r2},{r3}] in {:.1}s",
+                    layer_t0.elapsed().as_secs_f32()
+                );
+                LayerStat {
+                    compressed: true,
+                    orig: orig_elems,
+                    comp: stored_elems,
+                    err,
+                    norm,
+                }
+            })
+            .collect()
+    });
+
+    let compressed_layers = stats.iter().filter(|s| s.compressed).count();
+    let skipped_layers = stats.len() - compressed_layers;
+    let total_orig_elems: u64 = stats.iter().map(|s| s.orig).sum();
+    let total_compressed_elems: u64 = stats.iter().map(|s| s.comp).sum();
+    let total_recon_err_l2: f64 = stats.iter().map(|s| s.err).sum();
+    let total_recon_norm_l2: f64 = stats.iter().map(|s| s.norm).sum();
 
     if compressed_layers == 0 {
         warn!(

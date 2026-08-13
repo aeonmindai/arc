@@ -3,6 +3,42 @@ use sysinfo::System;
 
 pub struct MemoryUsage;
 
+/// Release cached CUDA memory back to the OS.
+///
+/// cudarc (and the CUDA driver since 11.2) retains freed device memory in a
+/// per-device pool for fast reuse.  `nvidia-smi` / `cuMemGetInfo` report pool-
+/// held memory as "used", which means the PagedAttention KV-cache budget sees
+/// nearly zero free VRAM even when the live tensors are much smaller than the
+/// peak allocation that occurred during ISQ.
+///
+/// Calling this after ISQ completes trims every default pool to zero, returning
+/// all cached memory to the OS so that `cuMemGetInfo` reflects the *actual*
+/// free VRAM.
+#[cfg(feature = "cuda")]
+pub fn trim_cuda_memory_pools() {
+    use candle_core::cuda::cudarc::driver::sys;
+    use tracing::info;
+
+    let mut count: std::ffi::c_int = 0;
+    let rc = unsafe { sys::cuDeviceGetCount(&mut count) };
+    if rc != sys::CUresult::CUDA_SUCCESS || count <= 0 {
+        return;
+    }
+    let num_devices = count as usize;
+
+    for ordinal in 0..num_devices {
+        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+        let rc = unsafe { sys::cuDeviceGetDefaultMemPool(&mut pool, ordinal as i32) };
+        if rc != sys::CUresult::CUDA_SUCCESS || pool.is_null() {
+            continue;
+        }
+        let rc = unsafe { sys::cuMemPoolTrimTo(pool, 0) };
+        if rc == sys::CUresult::CUDA_SUCCESS {
+            info!("Trimmed CUDA memory pool on device {ordinal}");
+        }
+    }
+}
+
 /// Returns the memory fraction to use for integrated CUDA GPUs.
 /// Defaults to 0.75, configurable via MISTRALRS_IGPU_MEMORY_FRACTION.
 #[cfg(feature = "cuda")]

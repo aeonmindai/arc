@@ -38,6 +38,16 @@ pub fn register_post_load_hook(hook: PostLoadHook) {
     guard.push(hook);
 }
 
+/// Whether any post-load hook is registered. Used to defer UQFF serialization
+/// until *after* the hooks run, so the written UQFF reflects the post-hook model
+/// (e.g. TD-MoE Tucker-factored experts rather than the pre-hook QTIP ones).
+pub(crate) fn has_registered_hooks() -> bool {
+    HOOKS
+        .get()
+        .map(|l| !l.lock().expect("post-load hook registry poisoned").is_empty())
+        .unwrap_or(false)
+}
+
 /// Invoke every registered post-load hook in order. Aborts on the first error.
 ///
 /// Called by the normal-model loader after ISQ quantization completes.

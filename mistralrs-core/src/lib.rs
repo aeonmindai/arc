@@ -145,6 +145,8 @@ pub use tools::{ToolCallResponse, ToolCallType, ToolCallbacks, ToolChoice};
 pub use topology::{LayerTopology, Topology};
 pub use utils::debug::initialize_logging;
 pub use utils::memory_usage::MemoryUsage;
+#[cfg(feature = "cuda")]
+pub use utils::memory_usage::trim_cuda_memory_pools;
 pub use utils::normal::{ModelDType, TryIntoDType};
 pub use utils::{paged_attn_supported, using_flash_attn};
 

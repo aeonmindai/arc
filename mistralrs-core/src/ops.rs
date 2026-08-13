@@ -43,7 +43,7 @@ fn cuda_topk(input: &Tensor, k: usize) -> Result<TopKOutput> {
     let dev = storage.device();
     let stream = dev.cuda_stream().cu_stream() as i64;
 
-    let (src_ptr, _src_guard) = match &storage.slice {
+    let (src_ptr, _src_guard) = match &*storage.slice {
         CudaStorageSlice::BF16(inp) => inp.device_ptr(inp.stream()),
         CudaStorageSlice::F16(inp) => inp.device_ptr(inp.stream()),
         CudaStorageSlice::F32(inp) => inp.device_ptr(inp.stream()),
@@ -76,11 +76,11 @@ fn cuda_topk(input: &Tensor, k: usize) -> Result<TopKOutput> {
             drop(indices_guard);
 
             let values_storage = candle_core::cuda_backend::CudaStorage {
-                slice: CudaStorageSlice::BF16(values_dst),
+                slice: std::mem::ManuallyDrop::new(CudaStorageSlice::BF16(values_dst)),
                 device: dev.clone(),
             };
             let indices_storage = candle_core::cuda_backend::CudaStorage {
-                slice: CudaStorageSlice::U32(indices_dst),
+                slice: std::mem::ManuallyDrop::new(CudaStorageSlice::U32(indices_dst)),
                 device: dev.clone(),
             };
 
@@ -114,11 +114,11 @@ fn cuda_topk(input: &Tensor, k: usize) -> Result<TopKOutput> {
             drop(indices_guard);
 
             let values_storage = candle_core::cuda_backend::CudaStorage {
-                slice: CudaStorageSlice::F16(values_dst),
+                slice: std::mem::ManuallyDrop::new(CudaStorageSlice::F16(values_dst)),
                 device: dev.clone(),
             };
             let indices_storage = candle_core::cuda_backend::CudaStorage {
-                slice: CudaStorageSlice::U32(indices_dst),
+                slice: std::mem::ManuallyDrop::new(CudaStorageSlice::U32(indices_dst)),
                 device: dev.clone(),
             };
 
@@ -152,11 +152,11 @@ fn cuda_topk(input: &Tensor, k: usize) -> Result<TopKOutput> {
             drop(indices_guard);
 
             let values_storage = candle_core::cuda_backend::CudaStorage {
-                slice: CudaStorageSlice::F32(values_dst),
+                slice: std::mem::ManuallyDrop::new(CudaStorageSlice::F32(values_dst)),
                 device: dev.clone(),
             };
             let indices_storage = candle_core::cuda_backend::CudaStorage {
-                slice: CudaStorageSlice::U32(indices_dst),
+                slice: std::mem::ManuallyDrop::new(CudaStorageSlice::U32(indices_dst)),
                 device: dev.clone(),
             };
 
@@ -218,7 +218,7 @@ pub fn cuda_topk_softmax(input: &Tensor, k: usize) -> Result<TopKOutput> {
     let dev = storage.device();
     let stream = dev.cuda_stream().cu_stream() as i64;
 
-    let (src_ptr, _src_guard) = match &storage.slice {
+    let (src_ptr, _src_guard) = match &*storage.slice {
         CudaStorageSlice::BF16(inp) => inp.device_ptr(inp.stream()),
         CudaStorageSlice::F16(inp) => inp.device_ptr(inp.stream()),
         CudaStorageSlice::F32(inp) => inp.device_ptr(inp.stream()),
@@ -250,11 +250,11 @@ pub fn cuda_topk_softmax(input: &Tensor, k: usize) -> Result<TopKOutput> {
             drop(indices_guard);
 
             let weights_storage = candle_core::cuda_backend::CudaStorage {
-                slice: CudaStorageSlice::BF16(weights_dst),
+                slice: std::mem::ManuallyDrop::new(CudaStorageSlice::BF16(weights_dst)),
                 device: dev.clone(),
             };
             let indices_storage = candle_core::cuda_backend::CudaStorage {
-                slice: CudaStorageSlice::U32(indices_dst),
+                slice: std::mem::ManuallyDrop::new(CudaStorageSlice::U32(indices_dst)),
                 device: dev.clone(),
             };
 
@@ -289,11 +289,11 @@ pub fn cuda_topk_softmax(input: &Tensor, k: usize) -> Result<TopKOutput> {
             drop(indices_guard);
 
             let weights_storage = candle_core::cuda_backend::CudaStorage {
-                slice: CudaStorageSlice::F16(weights_dst),
+                slice: std::mem::ManuallyDrop::new(CudaStorageSlice::F16(weights_dst)),
                 device: dev.clone(),
             };
             let indices_storage = candle_core::cuda_backend::CudaStorage {
-                slice: CudaStorageSlice::U32(indices_dst),
+                slice: std::mem::ManuallyDrop::new(CudaStorageSlice::U32(indices_dst)),
                 device: dev.clone(),
             };
 
@@ -328,11 +328,11 @@ pub fn cuda_topk_softmax(input: &Tensor, k: usize) -> Result<TopKOutput> {
             drop(indices_guard);
 
             let weights_storage = candle_core::cuda_backend::CudaStorage {
-                slice: CudaStorageSlice::F32(weights_dst),
+                slice: std::mem::ManuallyDrop::new(CudaStorageSlice::F32(weights_dst)),
                 device: dev.clone(),
             };
             let indices_storage = candle_core::cuda_backend::CudaStorage {
-                slice: CudaStorageSlice::U32(indices_dst),
+                slice: std::mem::ManuallyDrop::new(CudaStorageSlice::U32(indices_dst)),
                 device: dev.clone(),
             };
 
@@ -397,7 +397,7 @@ impl candle_core::CustomOp1 for ArgSort {
 
         use std::ffi::c_void;
 
-        let (src, _src_guard) = match &storage.slice {
+        let (src, _src_guard) = match &*storage.slice {
             CudaStorageSlice::U8(inp) => inp.device_ptr(inp.stream()),
             CudaStorageSlice::U32(inp) => inp.device_ptr(inp.stream()),
             CudaStorageSlice::I64(inp) => inp.device_ptr(inp.stream()),
@@ -466,7 +466,7 @@ impl candle_core::CustomOp1 for ArgSort {
         }
         drop(dst_guard);
         let dst_ret = candle_core::cuda_backend::CudaStorage {
-            slice: CudaStorageSlice::U32(dst),
+            slice: std::mem::ManuallyDrop::new(CudaStorageSlice::U32(dst)),
             device: dev.clone(),
         };
         Ok((dst_ret, layout.shape().clone()))

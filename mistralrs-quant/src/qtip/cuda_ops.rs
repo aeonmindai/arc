@@ -324,6 +324,199 @@ pub(crate) fn fused_gemv_cuda(
     Ok(Tensor::from((Storage::Cuda(res), out_shape)))
 }
 
+/// On-device MoE gather + fused decode + gemv (CUDA-graph-capturable decode).
+///
+/// The capturable sibling of `fused_gemv_cuda` for stacked experts. Reads each
+/// `(token, slot)` pair's expert id from `indices` **on-device** and runs the
+/// trellis gemv against that expert's packed rows — so the MoE dispatch stays
+/// on the stream with NO device->host sync (unlike `gather_forward_cuda`, which
+/// pulls indices to the host). Intended for the small-`n_pairs` decode regime
+/// (`n_pairs = n_tokens * top_k`); prefill keeps the grouped host path.
+///
+/// Shapes:
+///   * `blocks`     : `[E, n_rows, packed_per_row]` U8 (3-D stacked experts)
+///   * `row_scales` : `[E, n_rows]` F32
+///   * `lut`        : `[2^L * V]` F32
+///   * `x_rotated`  : `[n_pairs, in_features]` (ALREADY rotated)
+///   * `indices`    : `[n_pairs]` U32 (expert id per pair)
+/// Returns `[n_pairs, n_rows]` (same dtype as `x_rotated`).
+pub(crate) fn gather_gemv_cuda(
+    blocks: &Tensor,
+    row_scales: &Tensor,
+    lut: &Tensor,
+    x_rotated: &Tensor,
+    indices: &Tensor,
+    in_features: usize,
+) -> Result<Tensor> {
+    // 3-D stacked layout: [E, n_rows, packed_per_row] / [E, n_rows].
+    let num_experts = blocks.dim(0)?;
+    let n_rows = row_scales.dim(1)?;
+    let packed_per_row = blocks.dim(2)?;
+    let num_symbols = in_features / super::V as usize;
+
+    if blocks.dtype() != DType::U8 {
+        candle_core::bail!("QTIP gather gemv CUDA: blocks dtype must be U8");
+    }
+    if row_scales.dtype() != DType::F32 {
+        candle_core::bail!("QTIP gather gemv CUDA: row_scales dtype must be F32");
+    }
+    if lut.dtype() != DType::F32 {
+        candle_core::bail!("QTIP gather gemv CUDA: lut dtype must be F32");
+    }
+    if indices.dtype() != DType::U32 {
+        candle_core::bail!("QTIP gather gemv CUDA: indices dtype must be U32");
+    }
+    if !blocks.layout().is_contiguous()
+        || !row_scales.layout().is_contiguous()
+        || !lut.layout().is_contiguous()
+    {
+        candle_core::bail!("QTIP gather gemv CUDA: blocks/scales/lut must be contiguous");
+    }
+
+    // x_rotated: [n_pairs, in_features]; indices: [n_pairs].
+    let (n_pairs, x_cols) = x_rotated.dims2()?;
+    if x_cols != in_features {
+        candle_core::bail!(
+            "QTIP gather gemv CUDA: x_rotated cols {x_cols} != in_features {in_features}"
+        );
+    }
+    let idx_pairs = indices.elem_count();
+    if idx_pairs != n_pairs {
+        candle_core::bail!(
+            "QTIP gather gemv CUDA: indices len {idx_pairs} != n_pairs {n_pairs}"
+        );
+    }
+    let x_2d = x_rotated.contiguous()?;
+    let indices = indices.flatten_all()?.contiguous()?;
+
+    let dev = match blocks.device() {
+        candle_core::Device::Cuda(d) => d.clone(),
+        _ => candle_core::bail!("QTIP gather gemv CUDA: blocks must live on CUDA"),
+    };
+    if !matches!(x_2d.device(), candle_core::Device::Cuda(_))
+        || !matches!(indices.device(), candle_core::Device::Cuda(_))
+    {
+        candle_core::bail!("QTIP gather gemv CUDA: x_rotated and indices must live on CUDA");
+    }
+
+    let out_shape = candle_core::Shape::from_dims(&[n_pairs, n_rows]);
+
+    let (blocks_storage, blocks_layout) = blocks.storage_and_layout();
+    let blocks_storage = match &*blocks_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("QTIP gather gemv CUDA: blocks storage must be CUDA"),
+    };
+    let (scales_storage, scales_layout) = row_scales.storage_and_layout();
+    let scales_storage = match &*scales_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("QTIP gather gemv CUDA: scales storage must be CUDA"),
+    };
+    let (lut_storage, lut_layout) = lut.storage_and_layout();
+    let lut_storage = match &*lut_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("QTIP gather gemv CUDA: lut storage must be CUDA"),
+    };
+    let (x_storage, x_layout) = x_2d.storage_and_layout();
+    let x_storage = match &*x_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("QTIP gather gemv CUDA: x storage must be CUDA"),
+    };
+    let (idx_storage, idx_layout) = indices.storage_and_layout();
+    let idx_storage = match &*idx_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("QTIP gather gemv CUDA: indices storage must be CUDA"),
+    };
+
+    let (blocks_ptr, _blocks_guard) =
+        slice_ptr(blocks_storage.as_cuda_slice::<u8>()?, blocks_layout.start_offset());
+    let (scales_ptr, _scales_guard) =
+        slice_ptr(scales_storage.as_cuda_slice::<f32>()?, scales_layout.start_offset());
+    let (lut_ptr, _lut_guard) =
+        slice_ptr(lut_storage.as_cuda_slice::<f32>()?, lut_layout.start_offset());
+    let (idx_ptr, _idx_guard) =
+        slice_ptr(idx_storage.as_cuda_slice::<u32>()?, idx_layout.start_offset());
+
+    let n_out = n_pairs * n_rows;
+
+    let res = match x_2d.dtype() {
+        DType::BF16 => {
+            let (x_ptr, _x_guard) =
+                slice_ptr(x_storage.as_cuda_slice::<bf16>()?, x_layout.start_offset());
+            let out_buf = dev.alloc_zeros::<bf16>(n_out)?;
+            let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
+            unsafe {
+                ffi::launch_qtip_gather_gemv_v2_k4_l16_bf16(
+                    blocks_ptr as *const _,
+                    scales_ptr as *const _,
+                    lut_ptr as *const _,
+                    x_ptr as *const _,
+                    idx_ptr as *const _,
+                    out_ptr as *mut _,
+                    n_rows as i32,
+                    packed_per_row as i32,
+                    num_symbols as i32,
+                    n_pairs as i32,
+                    num_experts as i32,
+                    dev.cuda_stream().cu_stream(),
+                );
+            }
+            drop(out_guard);
+            CudaStorage::wrap_cuda_slice(out_buf, dev.clone())
+        }
+        DType::F16 => {
+            let (x_ptr, _x_guard) =
+                slice_ptr(x_storage.as_cuda_slice::<f16>()?, x_layout.start_offset());
+            let out_buf = dev.alloc_zeros::<f16>(n_out)?;
+            let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
+            unsafe {
+                ffi::launch_qtip_gather_gemv_v2_k4_l16_f16(
+                    blocks_ptr as *const _,
+                    scales_ptr as *const _,
+                    lut_ptr as *const _,
+                    x_ptr as *const _,
+                    idx_ptr as *const _,
+                    out_ptr as *mut _,
+                    n_rows as i32,
+                    packed_per_row as i32,
+                    num_symbols as i32,
+                    n_pairs as i32,
+                    num_experts as i32,
+                    dev.cuda_stream().cu_stream(),
+                );
+            }
+            drop(out_guard);
+            CudaStorage::wrap_cuda_slice(out_buf, dev.clone())
+        }
+        DType::F32 => {
+            let (x_ptr, _x_guard) =
+                slice_ptr(x_storage.as_cuda_slice::<f32>()?, x_layout.start_offset());
+            let out_buf = dev.alloc_zeros::<f32>(n_out)?;
+            let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
+            unsafe {
+                ffi::launch_qtip_gather_gemv_v2_k4_l16_f32(
+                    blocks_ptr as *const _,
+                    scales_ptr as *const _,
+                    lut_ptr as *const _,
+                    x_ptr as *const _,
+                    idx_ptr as *const _,
+                    out_ptr as *mut _,
+                    n_rows as i32,
+                    packed_per_row as i32,
+                    num_symbols as i32,
+                    n_pairs as i32,
+                    num_experts as i32,
+                    dev.cuda_stream().cu_stream(),
+                );
+            }
+            drop(out_guard);
+            CudaStorage::wrap_cuda_slice(out_buf, dev.clone())
+        }
+        other => candle_core::bail!("QTIP gather gemv CUDA: unsupported x dtype {other:?}"),
+    };
+
+    Ok(Tensor::from((Storage::Cuda(res), out_shape)))
+}
+
 /// Apply the block-diagonal D·H·D rotation to each row of `x` on the GPU,
 /// returning a fresh tensor with the rotated values. `block_size` must be
 /// one of `{2, 4, 8, 16, 32, 64, 128}`.
@@ -576,6 +769,21 @@ fn compute_row_scales_cuda(weight: &Tensor) -> Result<Tensor> {
 /// rows in flight per launch.
 const VITERBI_MAX_SCRATCH_BYTES: usize = 6 * 1024 * 1024 * 1024;
 
+/// Scratch budget (bytes) for one Viterbi launch's rows-in-flight. The 6 GB
+/// default was tuned for an 80 GB H100; on a larger card (H200 143 GB) it
+/// starves the kernel to ~438 rows in flight, leaving the SMs idle through
+/// every launch tail. Override with `ARC_VITERBI_SCRATCH_GB` to raise the
+/// rows-in-flight (bit-identical: same per-row Viterbi, just more rows per
+/// launch and fewer serial launches). RUN-161.
+fn viterbi_scratch_bytes() -> usize {
+    std::env::var("ARC_VITERBI_SCRATCH_GB")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|g| *g > 0.0)
+        .map(|g| (g * (1u64 << 30) as f64) as usize)
+        .unwrap_or(VITERBI_MAX_SCRATCH_BYTES)
+}
+
 /// 2^L = 65536, the trellis state count. Matches `LUT_SIZE` in `mod.rs`.
 const QTIP_LUT_SIZE: usize = 1 << super::L;
 
@@ -680,15 +888,23 @@ pub(crate) fn quantize_rows_cuda(
                 // Example: Qwen 7B mlp.down_proj (in=18944 → num_symbols=9472)
                 // gives bt_bytes_per_row ≈ 38 MB → ~158 rows in flight in 6 GB,
                 // vs ~10 rows under the old per-state backtrace.
+                // Per-row scratch = backtrace + cost_a + cost_b (the two cost
+                // ping-pong tables are each LUT_SIZE f32). Budget covers all
+                // three so a raised cap can't silently OOM on the cost buffers.
                 let bt_bytes_per_row = num_symbols * QTIP_PREFIX_COUNT;
-                let mut rows_in_flight = (VITERBI_MAX_SCRATCH_BYTES / bt_bytes_per_row).max(1);
+                let per_row_bytes = bt_bytes_per_row + 2 * QTIP_LUT_SIZE * 4;
+                let mut rows_in_flight = (viterbi_scratch_bytes() / per_row_bytes).max(1);
                 if rows_in_flight > n_rows {
                     rows_in_flight = n_rows;
                 }
 
-                let cost_a = dev.alloc_zeros::<f32>(rows_in_flight * QTIP_LUT_SIZE)?;
-                let cost_b = dev.alloc_zeros::<f32>(rows_in_flight * QTIP_LUT_SIZE)?;
-                let backtrace = dev.alloc_zeros::<u8>(rows_in_flight * bt_bytes_per_row)?;
+                // RUN-161: uninit alloc (not alloc_zeros) — the kernel fully
+                // writes cost_a at t=0, cost_b in Phase B, and backtrace in
+                // Phase C before any read, so zeroing GBs of scratch every
+                // matrix call is pure wasted bandwidth.
+                let cost_a = unsafe { dev.alloc::<f32>(rows_in_flight * QTIP_LUT_SIZE)? };
+                let cost_b = unsafe { dev.alloc::<f32>(rows_in_flight * QTIP_LUT_SIZE)? };
+                let backtrace = unsafe { dev.alloc::<u8>(rows_in_flight * bt_bytes_per_row)? };
 
                 let (ca_ptr, ca_guard) = slice_ptr(&cost_a, 0);
                 let (cb_ptr, cb_guard) = slice_ptr(&cost_b, 0);
@@ -725,6 +941,49 @@ pub(crate) fn quantize_rows_cuda(
         }
 
         drop(pkd_guard);
+    }
+
+    // Least-squares scale refinement: s* = dot(w, lut_values) / dot(lut_values, lut_values).
+    // BUG: produces cos=0.628 at full-size N=2048 (kernel replay issue under
+    // investigation). Gated behind ARC_QTIP_REFINE_SCALES=1 until fixed.
+    if std::env::var("ARC_QTIP_REFINE_SCALES").as_deref() == Ok("1") {
+        let (w_storage, w_layout) = weight_contig.storage_and_layout();
+        let w_storage = match &*w_storage {
+            Storage::Cuda(s) => s,
+            _ => candle_core::bail!("QTIP refine scales: weight must be CUDA storage"),
+        };
+        let (lut_storage, lut_layout) = lut_contig.storage_and_layout();
+        let lut_storage = match &*lut_storage {
+            Storage::Cuda(s) => s,
+            _ => candle_core::bail!("QTIP refine scales: lut must be CUDA storage"),
+        };
+        let (rs_storage, rs_layout) = row_scales.storage_and_layout();
+        let rs_storage = match &*rs_storage {
+            Storage::Cuda(s) => s,
+            _ => candle_core::bail!("QTIP refine scales: row_scales must be CUDA storage"),
+        };
+        let (w_ptr, _wg) =
+            slice_ptr(w_storage.as_cuda_slice::<f32>()?, w_layout.start_offset());
+        let (lut_ptr, _lg) = slice_ptr(
+            lut_storage.as_cuda_slice::<f32>()?,
+            lut_layout.start_offset(),
+        );
+        let (rs_ptr, _rg) =
+            slice_ptr(rs_storage.as_cuda_slice::<f32>()?, rs_layout.start_offset());
+        let (pkd_ptr, _pg) = slice_ptr(&packed_buf, 0);
+
+        unsafe {
+            ffi::launch_qtip_refine_scales_f32(
+                w_ptr as *const _,
+                pkd_ptr as *const _,
+                lut_ptr as *const _,
+                rs_ptr as *mut _,
+                n_rows as i32,
+                k_in as i32,
+                num_symbols as i32,
+                dev.cuda_stream().cu_stream(),
+            );
+        }
     }
 
     let packed_storage = CudaStorage::wrap_cuda_slice(packed_buf, dev.clone());

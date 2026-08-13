@@ -124,6 +124,10 @@ fn convert(
             convert_with_cast_::<u16, u32, _>(view, device, conv)
         }
         (st::Dtype::U32, _) => convert_::<u32>(view, device),
+        (st::Dtype::I8, _) => {
+            let conv = |x: i8| Ok(i32::from(x));
+            convert_with_cast_::<i8, i32, _>(view, device, conv)
+        }
         (st::Dtype::I16, _) => convert_::<i16>(view, device),
         (st::Dtype::I32, _) => convert_::<i32>(view, device),
         (st::Dtype::I64, _) => convert_::<i64>(view, device),
@@ -132,13 +136,15 @@ fn convert(
         (st::Dtype::F32, _) => convert_::<f32>(view, device),
         (st::Dtype::F64, _) => convert_::<f64>(view, device),
         (st::Dtype::F8_E4M3, _) => convert_::<F8E4M3>(view, device),
+        (st::Dtype::F8_E8M0, _) => {
+            // E8M0: 8-bit exponent, no mantissa. Value = 2^(byte - 127).
+            // Placing the byte in the IEEE-754 exponent field gives exactly that.
+            let conv = |x: u8| Ok(f32::from_bits((x as u32) << 23));
+            convert_with_cast_::<u8, f32, _>(view, device, conv)
+        }
         (st::Dtype::F6_E2M3, _)
         | (st::Dtype::F6_E3M2, _)
-        | (st::Dtype::F4, _)
-        | (st::Dtype::F8_E8M0, _) => {
-            // For dummy types, we need to handle loading by creating a dummy tensor
-            // Since these types don't have actual data representation, we'll create
-            // a tensor that indicates it's a dummy type
+        | (st::Dtype::F4, _) => {
             convert_dummy(view, device)
         }
         (dtype, _) => Err(Error::UnsupportedSafeTensorDtype(dtype)),
@@ -152,7 +158,6 @@ fn convert_dummy(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
         st::Dtype::F6_E2M3 => (DType::F6E2M3, "F6_E2M3 (MX6)"),
         st::Dtype::F6_E3M2 => (DType::F6E3M2, "F6_E3M2 (MX6)"),
         st::Dtype::F4 => (DType::F4, "F4 (MX4)"),
-        st::Dtype::F8_E8M0 => (DType::F8E8M0, "F8_E8M0"),
         _ => unreachable!("convert_dummy called with non-dummy dtype"),
     };
 
@@ -167,7 +172,6 @@ fn convert_dummy(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
                 DType::F6E2M3 => candle_core::cpu_backend::CpuStorage::F6E2M3(data.to_vec()),
                 DType::F6E3M2 => candle_core::cpu_backend::CpuStorage::F6E3M2(data.to_vec()),
                 DType::F4 => candle_core::cpu_backend::CpuStorage::F4(data.to_vec()),
-                DType::F8E8M0 => candle_core::cpu_backend::CpuStorage::F8E8M0(data.to_vec()),
                 _ => unreachable!(),
             };
             Storage::Cpu(cpu_storage)
@@ -181,11 +185,10 @@ fn convert_dummy(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
                 DType::F6E2M3 => candle_core::cuda_backend::CudaStorageSlice::F6E2M3(slice),
                 DType::F6E3M2 => candle_core::cuda_backend::CudaStorageSlice::F6E3M2(slice),
                 DType::F4 => candle_core::cuda_backend::CudaStorageSlice::F4(slice),
-                DType::F8E8M0 => candle_core::cuda_backend::CudaStorageSlice::F8E8M0(slice),
                 _ => unreachable!(),
             };
             let storage = candle_core::cuda_backend::CudaStorage {
-                slice,
+                slice: std::mem::ManuallyDrop::new(slice),
                 device: device.clone(),
             };
             Storage::Cuda(storage)

@@ -352,17 +352,14 @@ impl DeepSeekV4Config {
     }
 
     fn softmax_scale(&self) -> f32 {
-        let mut softmax_scale = 1.0 / (self.head_dim as f32).sqrt();
-        if let Some(DeepSeekV2RopeScaling::Yarn {
-            mscale_all_dim,
-            factor,
-            ..
-        }) = self.rope_scaling
-        {
-            let mscale = DeepSeekV2RotaryEmbedding::yarn_get_mscale(factor, mscale_all_dim);
-            softmax_scale = softmax_scale * mscale * mscale;
-        }
-        softmax_scale
+        // V4 uses a PURE head_dim^-0.5 attention scale with NO YaRN mscale.
+        // Reference inference/model.py:464 is `self.softmax_scale = head_dim ** -0.5`
+        // and precompute_freqs_cis applies no mscale to the rope magnitudes
+        // (torch.polar(ones, freqs)). The previous `* mscale * mscale` (~1.63x for
+        // factor=16) over-scaled the attention logits -> softmax too sharp ->
+        // over-peaked attention -> degraded generation quality. V2/V3 used mscale
+        // here, but V4 does not. (RUN-161)
+        1.0 / (self.head_dim as f32).sqrt()
     }
 }
 
@@ -449,6 +446,7 @@ impl V4Compressor {
         vb: ShardedVarBuilder,
         ratio: usize,
         head_dim: usize,
+        real_device: &Device,
     ) -> Result<Self> {
         let overlap = ratio == 4;
         let coff = 1 + usize::from(overlap);
@@ -478,7 +476,20 @@ impl V4Compressor {
             let wkv_w = vb.get((row, cfg.hidden_size), "wkv.weight")?;
             let wgate_w = vb.get((row, cfg.hidden_size), "wgate.weight")?;
             let fused = Tensor::cat(&[&wkv_w, &wgate_w], 0)?;
-            ReplicatedLayer::from_linear(candle_nn::Linear::new(fused, None))?
+            // Keep the tiny [2*coff*head_dim, hidden] compressor weight in BF16
+            // (unquantized) rather than ISQ-quantizing it. Quantizing saves
+            // ~nothing (~4MB/layer) but its qtip quant transient OOMs on the
+            // memory-tight tail layers of a single-H100 load (runs at ~78GB
+            // resident with <2GB free). The async pool swallows that OOM,
+            // silently breaking the compressor -> prefill (which uses the
+            // compressor for seqlen>=ratio) then OOMs/fails. Decode and
+            // sub-ratio-token prompts use the dense fallback and never touch it,
+            // which masked the bug. See RUN-161.
+            Arc::new(mistralrs_quant::UnquantLinear::new(
+                mistralrs_quant::QuantMethodConfig::Unquantized(candle_nn::Linear::new(
+                    fused, None,
+                )),
+            )?) as Arc<dyn QuantMethod>
         } else {
             // Caller is expected to have gated this case via
             // `V4Compressor::has_weights` — surface a clear error if not.
@@ -490,14 +501,17 @@ impl V4Compressor {
             );
         };
 
+        // Load norm and ape on the real device (not the ISQ CPU device)
+        // to avoid device mismatch at inference time.
         let norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("norm"))?;
+        let norm = RmsNorm::from_w(norm.weight().to_device(real_device)?, cfg.rms_norm_eps)?;
 
         let ape = if vb.contains_tensor("ape") {
-            vb.get((ratio, coff * head_dim), "ape")?
+            vb.get((ratio, coff * head_dim), "ape")?.to_device(real_device)?
         } else if vb.contains_tensor("ape.weight") {
-            vb.get((ratio, coff * head_dim), "ape.weight")?
+            vb.get((ratio, coff * head_dim), "ape.weight")?.to_device(real_device)?
         } else {
-            Tensor::zeros((ratio, coff * head_dim), DType::F32, vb.device())?
+            Tensor::zeros((ratio, coff * head_dim), DType::F32, real_device)?
         };
 
         Ok(Self {
@@ -565,8 +579,30 @@ impl V4Compressor {
     }
 
     /// Real V4 compressor forward, operating directly on the layer input.
-    /// Returns `[B, T_c, head_dim]` with `T_c = T / ratio`. SGLang
-    /// `compressor.py:366-392`.
+    ///
+    /// Faithful port of the model's own reference `Compressor.forward`
+    /// (prefill / `start_pos == 0` path) in `inference/model.py`. Returns the
+    /// **pre-RoPE** compressed KV `[B, T_c, head_dim]` with `T_c = T / ratio`.
+    /// Compress-θ RoPE on the last `qk_rope_head_dim` dims (at the strided
+    /// compressed positions `[0, ratio, 2*ratio, …]`) is applied by the caller,
+    /// which owns the rotary embedding.
+    ///
+    /// Algorithm (reference lines ~316-380):
+    ///   - `wkv_gate(x)` → split into `value = wkv(x)` and `score = wgate(x)`
+    ///     (the loader concatenates `cat([wkv, wgate], dim=0)`, so `split[0]`
+    ///     is the value and `split[1]` is the score).
+    ///   - group `ratio` consecutive tokens; `score += ape`.
+    ///   - **overlap** (ratio == 4): re-window each entry over `2*ratio` tokens
+    ///     spanning the previous + current group (`overlap_transform`).
+    ///   - pool the value by a **softmax over the group axis**:
+    ///     `pooled = (value * softmax(score)).sum(group)`.
+    ///   - RMSNorm over `head_dim`.
+    ///
+    /// The previous implementation was wrong on every one of these steps
+    /// (value/score swapped, `sigmoid(gate)*val` instead of the value, a plain
+    /// sum instead of a softmax-weighted pool, no overlap, a bogus `coff`
+    /// collapse) — which corrupted the compressed (distant-context) KV on all
+    /// CSA/HCA layers and produced the long-context collapse. RUN-161.
     pub fn forward_from_xs(&self, xs: &Tensor) -> Result<Tensor> {
         let dims = xs.dims();
         if dims.len() != 3 {
@@ -583,32 +619,76 @@ impl V4Compressor {
             );
         }
         let t_c = t / self.ratio;
-        let work_dtype = xs.dtype();
+        let out_dtype = xs.dtype();
+        let dev = xs.device();
+        let d = self.head_dim;
+        let cd = self.coff * self.head_dim;
 
-        let wkv = self.wkv_gate.forward_autocast(xs)?;
-        let split = wkv.split(
-            &[self.coff * self.head_dim, self.coff * self.head_dim],
-            D::Minus1,
-        )?;
-        let gate = split[0].clone();
-        let val = split[1].clone();
-        let score = (candle_nn::ops::sigmoid(&gate)? * val)?;
-
-        let score_grouped = score.reshape((b, t_c, self.ratio, self.coff * self.head_dim))?;
+        // Compression runs in fp32 (reference: `x = x.float()`).
+        let fused = self.wkv_gate.forward_autocast(xs)?.to_dtype(DType::F32)?;
+        let split = fused.split(&[cd, cd], D::Minus1)?;
+        let value = split[0].reshape((b, t_c, self.ratio, cd))?; // wkv
+        let score = split[1].reshape((b, t_c, self.ratio, cd))?; // wgate
         let ape = self
             .ape
-            .to_dtype(work_dtype)?
-            .reshape((1, 1, self.ratio, self.coff * self.head_dim))?;
-        let score_grouped = score_grouped.broadcast_add(&ape)?;
-        let aggregated = score_grouped.sum(2)?;
+            .to_dtype(DType::F32)?
+            .reshape((1, 1, self.ratio, cd))?;
+        let score = score.broadcast_add(&ape)?;
 
-        let flat = aggregated.reshape((b * t_c * self.coff, self.head_dim))?;
+        // Overlap (ratio == 4, coff == 2): re-window over 2*ratio neighbouring
+        // tokens. The channel splits into [overlap-half (first d) | normal-half
+        // (second d)]. Non-overlap layers keep the plain `ratio` group.
+        let (value, score) = if self.coff == 2 {
+            (
+                Self::overlap_transform(&value, 0.0, b, t_c, self.ratio, d, dev)?,
+                Self::overlap_transform(&score, f64::NEG_INFINITY, b, t_c, self.ratio, d, dev)?,
+            )
+        } else {
+            (value, score)
+        };
+
+        // Softmax-weighted pool over the group axis (dim 2).
+        let weights = candle_nn::ops::softmax(&score, 2)?;
+        let pooled = (value * weights)?.sum(2)?; // [b, t_c, d]
+
+        // Cast back to model dtype, then RMSNorm over head_dim.
+        let pooled = pooled.to_dtype(out_dtype)?;
+        let flat = pooled.reshape((b * t_c, d))?;
         let normed = flat.apply(&self.norm)?;
-        let collapsed = normed
-            .reshape((b * t_c, self.coff, self.head_dim))?
-            .sum(1)?;
+        normed.reshape((b, t_c, d))
+    }
 
-        collapsed.reshape((b, t_c, self.head_dim))
+    /// Overlapping-window transform for the ratio-4 compressor (reference
+    /// `Compressor.overlap_transform`). Maps a grouped tensor
+    /// `[b, t_c, ratio, 2*d]` → `[b, t_c, 2*ratio, d]`: the last `ratio` slots
+    /// take the current group's normal-half (channels `d..2d`), the first
+    /// `ratio` slots take the **previous** group's overlap-half (channels
+    /// `0..d`). The first group has no predecessor, so its leading `ratio`
+    /// slots are filled with `fill` (`0` for values, `-inf` for scores so the
+    /// softmax ignores them).
+    #[allow(clippy::too_many_arguments)]
+    fn overlap_transform(
+        grouped: &Tensor,
+        fill: f64,
+        b: usize,
+        t_c: usize,
+        ratio: usize,
+        d: usize,
+        dev: &Device,
+    ) -> Result<Tensor> {
+        // Current group's normal-half → last `ratio` slots (all groups).
+        let normal = grouped.narrow(D::Minus1, d, d)?.contiguous()?; // [b, t_c, ratio, d]
+        // Current group's overlap-half (channels 0..d), shifted forward one
+        // group so it lands in the *next* group's first `ratio` slots.
+        let overlap = grouped.narrow(D::Minus1, 0, d)?; // [b, t_c, ratio, d]
+        let pad = Tensor::full(fill, (b, 1, ratio, d), dev)?.to_dtype(grouped.dtype())?;
+        let prev = if t_c > 1 {
+            let shifted = overlap.narrow(1, 0, t_c - 1)?; // groups 0..t_c-2
+            Tensor::cat(&[&pad, &shifted.contiguous()?], 1)?
+        } else {
+            pad
+        };
+        Tensor::cat(&[&prev, &normal], 2)
     }
 }
 
@@ -661,11 +741,20 @@ struct Attention {
     /// Grouped o_proj part B: `[n_groups * o_lora_rank, hidden_size]`.
     /// Audit §0 + §2 (SGLang line 203).
     wo_b: Arc<dyn QuantMethod>,
+    /// RUN-161 throughput: cache of the dequantized + permuted grouped `wo_a`
+    /// weight `(G, D, R)`. The grouped o_proj used to call `wo_a.dequantize_w()`
+    /// (~67MB materialize) + a `.contiguous()` permute (another ~67MB) EVERY
+    /// forward — for a constant weight. Profiled at ~69ms/token (27% of decode,
+    /// the single biggest cost). Built once on first forward, reused after.
+    wo_a_t_cache: std::sync::RwLock<Option<Tensor>>,
     /// RoPE — either `rope_theta`-based (standard layers 0/1/42) or
     /// `compress_rope_theta`-based (compress layers). Caller picks at
     /// construction. Audit §0 + §8 P1 item 11.
     rotary_emb: Arc<DeepSeekV2RotaryEmbedding>,
     cfg: DeepSeekV4Config,
+    /// RUN-161 decode-bug localization: this layer's index, used only to gate
+    /// the `V4_TRACE` per-op tensor dumps to a single layer (see `v4_trace_dump`).
+    dbg_layer_idx: usize,
     paged_attn: Option<PagedAttention>,
     sdpa_params: SdpaParams,
     /// Per-TP-rank Q head count.
@@ -691,6 +780,12 @@ struct Attention {
     /// Audit §0 + §2 (SGLang line 195).
     #[allow(dead_code)]
     indexer: Option<super::dsv4_indexer::V4Indexer>,
+    /// R2: per-layer history of the compressor input `xs` (post-layernorm
+    /// attention input) so the compressed branch sees compressed *history*
+    /// during decode, not just the current token. CSA/HCA only, interior-
+    /// mutable, reset at sequence start (seqlen_offset==0). Single-sequence
+    /// (non-paged) correctness; paged/multi-seq is the follow-up.
+    xs_history: Option<std::sync::Mutex<crate::kv_cache::SingleCache>>,
 }
 
 impl Attention {
@@ -869,14 +964,16 @@ impl Attention {
         // layout. Anything else falls back to the uniform-averaging stub so
         // old checkpoints continue to load. Audit §0 + §1 Pattern B/C/D.
         let compressor = if compress_ratio != CompressRatio::Standard {
-            let device = mapper
-                .device_for(layer_idx, loading_isq)
+            // Use the real GPU device (loading_isq=false) for non-quantized
+            // tensors (ape, norm) to avoid device mismatch at inference time.
+            let real_device = mapper
+                .device_for(layer_idx, false)
                 .unwrap_or(&Device::Cpu);
             let comp_vb = mapper.set_device(layer_idx, vb.pp("compressor"), loading_isq);
             let comp = if V4Compressor::has_weights(&comp_vb) {
-                V4Compressor::new(cfg, comp_vb, ratio_int as usize, head_dim)?
+                V4Compressor::new(cfg, comp_vb, ratio_int as usize, head_dim, real_device)?
             } else {
-                V4Compressor::uniform(ratio_int as usize, head_dim, device)?
+                V4Compressor::uniform(ratio_int as usize, head_dim, real_device)?
             };
             Some(comp)
         } else {
@@ -928,7 +1025,12 @@ impl Attention {
         };
 
         // Pre-shape sinks for SDPA: [n_heads] → [1, n_heads, 1, 1].
-        let sinks_for_sdpa = if let Some(ref s) = attn_sink {
+        // RUN-161 ablation: ARC_DISABLE_SINK=1 drops the attention sink to test
+        // whether sink-mass domination (head_dim=512 falls into the unfused
+        // softmax_with_sinks path on every layer) is collapsing attention output.
+        let sinks_for_sdpa = if std::env::var_os("ARC_DISABLE_SINK").is_some() {
+            None
+        } else if let Some(ref s) = attn_sink {
             Some(s.reshape((1, cfg.num_attention_heads, 1, 1))?)
         } else {
             None
@@ -949,6 +1051,7 @@ impl Attention {
             wo_b,
             rotary_emb,
             cfg: cfg.clone(),
+            dbg_layer_idx: layer_idx,
             paged_attn,
             num_attention_heads,
             num_kv_heads: num_kv_heads_tp,
@@ -968,6 +1071,16 @@ impl Attention {
             sliding_window: cfg.sliding_window,
             attn_sink,
             indexer,
+            xs_history: if compress_ratio != CompressRatio::Standard {
+                Some(std::sync::Mutex::new(crate::kv_cache::SingleCache::new(
+                    1,
+                    cfg.max_position_embeddings,
+                    256,
+                )))
+            } else {
+                None
+            },
+            wo_a_t_cache: std::sync::RwLock::new(None),
         })
     }
 
@@ -1002,6 +1115,53 @@ impl Attention {
         Ok((q_out, k_out))
     }
 
+    /// Compute the compressed (distant-context) KV for a CSA/HCA layer from the
+    /// compressor-input history, with compress-θ RoPE applied at the strided
+    /// compressed positions. Returns `[B, 1, T_c, head_dim]`, or `None` when:
+    ///   * this is a Standard layer / no compressor loaded, or
+    ///   * the history is shorter than one `ratio` block (`T_c == 0`) — in which
+    ///     case the sliding-window branch alone covers the whole context.
+    ///
+    /// The largest `ratio`-multiple prefix of the history is compressed; the
+    /// remaining `< ratio` recent tokens are covered by the raw sliding-window
+    /// branch in [`super::dsv4_attention::dsv4_attention`]. Reference
+    /// `inference/model.py` `Attention.forward` (the `kv_compress` path).
+    fn compressed_kv(&self, xs_hist: &Tensor) -> Result<Option<Tensor>> {
+        if self.compress_ratio == CompressRatio::Standard {
+            return Ok(None);
+        }
+        let Some(compressor) = self.compressor.as_ref() else {
+            return Ok(None);
+        };
+        let ratio = self.compress_ratio.ratio();
+        let t_xs = xs_hist.dim(1)?;
+        let t_trunc = (t_xs / ratio) * ratio;
+        if t_trunc == 0 {
+            return Ok(None);
+        }
+        let xs_trunc = if t_trunc == t_xs {
+            xs_hist.clone()
+        } else {
+            xs_hist.narrow(1, 0, t_trunc)?
+        };
+        // [B, T_c, head_dim] (pre-RoPE) → [B, 1, T_c, head_dim].
+        let comp = compressor.forward_from_xs(&xs_trunc)?.unsqueeze(1)?;
+        let t_c = comp.dim(2)?;
+        // Compressed entry j sits at absolute position j*ratio. Apply the
+        // layer's (compress-θ) RoPE to the last qk_rope_head_dim dims there.
+        // NOTE: builds a small arange each call (a host/device sync); fine on
+        // the correctness-first dense path — the long-context sparse-gather
+        // kernel is the place to precompute this.
+        let dev = comp.device();
+        let positions = (Tensor::arange(0u32, t_c as u32, dev)?.to_dtype(DType::F32)?
+            * (ratio as f64))?
+        .to_dtype(DType::U32)?;
+        let comp =
+            self.rotary_emb
+                .forward_at_positions(&comp, self.cfg.qk_rope_head_dim, &positions)?;
+        Ok(Some(comp))
+    }
+
     fn forward(
         &self,
         xs: &Tensor,
@@ -1016,20 +1176,65 @@ impl Attention {
     ) -> Result<Tensor> {
         let (bs, seq_len, _) = xs.dims3()?;
         let head_dim = self.cfg.head_dim;
+        let mdev = xs.device().clone();
 
+        v4_nan_dbg(xs, "attn.in");
+        v4_trace_dump(self.dbg_layer_idx, xs, "00_xs_in");
+        // The position values are THE crux of the decode bug: dump them so the
+        // diff can compare the offset decode used (row N) vs prefill (0..N).
+        v4_trace_text(
+            self.dbg_layer_idx,
+            "00_meta",
+            &format!("seq_len={seq_len}\nseqlen_offsets={seqlen_offsets:?}\n"),
+        );
+
+        // R2: the compressor (forward_from_xs) must see the *history* of the
+        // attention input during decode, not just the current token. Keep a
+        // per-layer history of `xs` and feed the full history to the
+        // compressed branch; the q/k/v projections below still use the
+        // current `xs`. Reset at sequence start (all seqlen_offsets == 0).
+        let xs_for_compressor = if let Some(hist) = &self.xs_history {
+            let mut h = hist.lock().unwrap();
+            if seqlen_offsets.iter().all(|&o| o == 0) {
+                h.reset();
+            }
+            h.append(&xs.contiguous()?)?;
+            h.current_data()?.expect("xs_history present after append")
+        } else {
+            xs.clone()
+        };
         // 1. Q projection (LoRA). [B, T, hidden] → [B, T, n_heads*head_dim]
         //    → reshape to [B, n_heads, T, head_dim]. Audit §3.
-        let q = self.q.forward(xs)?;
+        let q = timed_mla(0, &mdev, || self.q.forward(xs))?;
+        v4_nan_dbg(&q, "attn.q_proj");
         let q = q
             .reshape((bs, seq_len, self.num_attention_heads, head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
+        // V4: per-head RMS-normalize Q over head_dim before RoPE. Reference
+        // inference/model.py:498 `q *= rsqrt(q.square().mean(-1)+eps)`. This is
+        // SEPARATE from q_norm (which normalizes q_lora_rank inside self.q).
+        // Missing it leaves Q ~30x too small -> near-uniform attention scores
+        // -> the model cannot attend -> word-salad output (RUN-161).
+        let q = {
+            let inv_rms = q
+                .sqr()?
+                .mean_keepdim(candle_core::D::Minus1)?
+                .affine(1.0, self.cfg.rms_norm_eps)?
+                .recip()?
+                .sqrt()?;
+            q.broadcast_mul(&inv_rms)?
+        };
+        v4_stat_dbg(&q, "attn.q_normed");
+        v4_trace_dump(self.dbg_layer_idx, &q, "10_q_normed");
 
         // 2. K/V projection: single fused wkv. [B, T, hidden] → [B, T,
         //    head_dim] → kv_norm → reshape to [B, num_kv_heads=1, T,
         //    head_dim]. Audit §0 + §3.
-        let kv_raw = self.wkv.forward_autocast(xs)?;
+        let kv_raw = timed_mla(1, &mdev, || self.wkv.forward_autocast(xs))?;
+        v4_nan_dbg(&kv_raw, "attn.wkv");
         let kv_normed = self.kv_norm.forward(&kv_raw)?;
+        v4_nan_dbg(&kv_normed, "attn.kv_norm");
         let k = kv_normed
             .reshape((bs, seq_len, self.num_kv_heads, head_dim))?
             .transpose(1, 2)?
@@ -1038,12 +1243,30 @@ impl Attention {
         // 3. RoPE applied in-place to the last qk_rope_head_dim dims of
         //    each Q-head and K-head's head_dim-vector. Audit §0 + §3.
         let (q, k) = self.apply_rope_inplace(&q, &k, seqlen_offsets)?;
+        v4_nan_dbg(&q, "attn.q_rope");
+        v4_nan_dbg(&k, "attn.k_rope");
+        v4_trace_dump(self.dbg_layer_idx, &q, "20_q_rope");
+        v4_trace_dump(self.dbg_layer_idx, &k, "21_k_rope");
+
+        // V4 QAT: FP8-simulate the non-rope dims of K (reference model.py:506
+        // `act_quant(kv[..., :-rd], 64, ..., inplace=True)`). The model was
+        // trained with the KV non-rope dims round-tripped through block-wise
+        // FP8; feeding full BF16 is out-of-distribution. V=K so v inherits it.
+        let k = act_quant_kv_nope(&k, self.cfg.qk_rope_head_dim)?;
+        v4_stat_dbg(&k, "attn.k_actquant");
+        v4_trace_dump(self.dbg_layer_idx, &k, "30_k_actquant");
 
         // 4. V4: K and V come from the same wkv tensor. The kernel treats
         //    the wkv output as both K (for scores) and V (for weighted
         //    sum). This is the MLA "absorb V into K" trick at scale.
         //    Audit §3 ("absorbed the MLA split into a single fused output").
-        let v = k.clone();
+        //
+        // Use copy() not clone(): clone() shares the storage Arc<RwLock>, so k
+        // and v alias the same storage. PagedAttention's reshape_and_cache is an
+        // in-place op that write-locks and read-locks that storage -> RwLock
+        // self-deadlock (the dummy-run hang). copy() gives v its own storage.
+        // Cheap here: MQA means 1 KV head. (RUN-161)
+        let v = k.copy()?;
 
         // 5. Attention dispatch (RUN-155 + RUN-167).
         //
@@ -1069,6 +1292,21 @@ impl Attention {
         let dsv4_cfg = super::dsv4_attention::Dsv4AttentionConfig {
             compress_ratio: self.compress_ratio,
             sliding_window: self.sliding_window,
+        };
+        // Faithful V4: the compressed (distant-context) KV, with compress-θ
+        // RoPE at the strided compressed positions. `dsv4_attention` runs a
+        // single softmax over the union [raw sliding-window KV ++ compressed
+        // KV] + attn_sink. `None` on Standard layers / short history (the
+        // window alone covers the context). RUN-161.
+        //
+        // RUN-161 #27 ablation: ARC_V4_WINDOW_ONLY=1 forces the compressed
+        // branch off so attention degenerates to pure sliding-window. Used to
+        // isolate whether long-ctx sustained-generation degradation lives in
+        // the compressed branch (coherent window-only ⇒ yes) vs elsewhere.
+        let compressed_kv = if std::env::var_os("ARC_V4_WINDOW_ONLY").is_some() {
+            None
+        } else {
+            self.compressed_kv(&xs_for_compressor)?
         };
         let mut attn_out = match &self.paged_attn {
             Some(paged_attn) if self.compress_ratio == CompressRatio::Standard => match metadata {
@@ -1116,9 +1354,9 @@ impl Attention {
                         &q,
                         &k_full,
                         &v_full,
+                        compressed_kv.as_ref(),
                         attention_mask,
                         flash_params,
-                        self.compressor.as_ref(),
                         &self.sdpa_params,
                         dsv4_cfg,
                     )?
@@ -1131,23 +1369,58 @@ impl Attention {
                         &q,
                         &k,
                         &v,
+                        compressed_kv.as_ref(),
                         attention_mask,
                         flash_params,
-                        self.compressor.as_ref(),
                         &self.sdpa_params,
                         dsv4_cfg,
                     )?
                 }
             },
+            // RUN-161 2c: CUDA-graph-capturable decode. When graph-mode device
+            // positions are set, write the new K/V at the device slot and read a
+            // FIXED `sliding_window`-wide window so every decode step is
+            // shape-identical (the caching allocator hits, the graph replays).
+            // C == sliding_window forces dsv4_attention's dense SDPA path. The
+            // unwritten tail slots are masked via the graph-mode length mask.
+            None if crate::layers::has_graph_mode_positions() && seq_len == 1 => {
+                let position = crate::layers::graph_mode_positions()
+                    .ok_or_else(|| candle_core::Error::Msg("graph positions unset".into()))?
+                    .to_dtype(candle_core::DType::U32)?;
+                let cap = self.sliding_window.max(1);
+                let (k_full, v_full) = kv_cache.append_graph(&k, &v, &position, cap)?;
+                // Use ONLY the fixed-width graph mask (matches the C-wide K).
+                // The eager `attention_mask` is kv_len-wide (growing) and would
+                // both mismatch the fixed window and break shape-constancy.
+                // None here => attends over zero-padding (finite, not yet
+                // correct) until set_graph_mode_mask is wired.
+                let gmask = crate::layers::graph_mode_mask();
+                super::dsv4_attention::dsv4_attention(
+                    &q,
+                    &k_full,
+                    &v_full,
+                    compressed_kv.as_ref(),
+                    gmask.as_ref(),
+                    flash_params,
+                    &self.sdpa_params,
+                    dsv4_cfg,
+                )?
+            }
             None => {
                 let (k_cached, v_cached) = kv_cache.append(&k, &v)?;
+                // Cache read-back: in decode this is prefill's K (0..N-1) + the
+                // new token's K. Diff vs prefill's freshly-computed K splits a
+                // cache-storage bug (old rows differ) from a new-token position
+                // bug (only the last row differs).
+                v4_trace_dump(self.dbg_layer_idx, &k_cached, "40_k_cached");
+                v4_trace_dump(self.dbg_layer_idx, &v_cached, "41_v_cached");
                 super::dsv4_attention::dsv4_attention(
                     &q,
                     &k_cached,
                     &v_cached,
+                    compressed_kv.as_ref(),
                     attention_mask,
                     flash_params,
-                    self.compressor.as_ref(),
                     &self.sdpa_params,
                     dsv4_cfg,
                 )?
@@ -1164,15 +1437,99 @@ impl Attention {
 
         // 7. Reshape attention output → flatten heads → grouped o_proj
         //    LoRA. attn_out shape: [B, n_heads, T, head_dim].
-        //    Audit §8 P1 item 12 — per-group einsum vs flat matmul.
-        attn_out = if attention_mask.is_some() {
-            attn_out.transpose(1, 2)?.reshape((bs, seq_len, ()))?
+        //    Audit §8 P1 item 12 — per-group einsum("tgd,grd->tgr").
+        v4_nan_dbg(&attn_out, "attn.sdpa_out");
+        // Normalize to [B, H, T, head_dim]. Two input layouts reach here:
+        //   * PagedAttention (Standard layers) returns 3-D [B*T, H, head_dim].
+        //   * SDPA (`Sdpa::run_attention`) returns 4-D [B, H, T, head_dim] in
+        //     BOTH prefill (mask) and decode (no-mask) — every backend
+        //     normalizes to [B, H, T, D] (cuBLASLt reshapes to it; flash/metal
+        //     transpose to it). The previous code transposed the no-mask decode
+        //     output assuming [B, T, H, D]; at seq_len=1 that turned the correct
+        //     [B, H, 1, D] into [B, 1, H, D], scrambling the head/dim order fed
+        //     to o_proj and collapsing every decode step (RUN-161 decode bug).
+        // Without the 3-D case, paged decode transposes [B*T,H,D] -> [.,D,H] and
+        // hits forward_inverse_tail with a rank-3 tensor -> "unexpected rank,
+        // expected: 4, got: 3". (RUN-161)
+        let attn_out_bhtd = if attn_out.rank() == 3 {
+            let (_bt, h, hd) = attn_out.dims3()?;
+            attn_out.reshape((bs, seq_len, h, hd))?.transpose(1, 2)?
         } else {
-            attn_out.reshape((bs, seq_len, ()))?
+            attn_out.clone()
         };
+        // V4: inverse-RoPE the last qk_rope_head_dim dims of the attention
+        // output. V=K carries the key's RoPE on those dims, so the output must
+        // be de-rotated (reference inference/model.py:534). Missing this leaves
+        // the value content wrongly position-rotated -> attention output is
+        // corrupted on rope dims -> incoherent generation (RUN-161).
+        // Normalized [B,H,T,D] SDPA output BEFORE the position-dependent inverse
+        // RoPE — diffing this vs 60_after_invtail isolates whether the bug is the
+        // attention kernel itself or the inverse-tail de-rotation.
+        v4_trace_dump(self.dbg_layer_idx, &attn_out_bhtd, "55_sdpa_bhtd");
+        let attn_out_bhtd = self.rotary_emb.forward_inverse_tail(
+            &attn_out_bhtd,
+            self.cfg.qk_rope_head_dim,
+            seqlen_offsets,
+        )?;
+        v4_trace_dump(self.dbg_layer_idx, &attn_out_bhtd, "60_after_invtail");
+        // -> [B, T, H*head_dim]
+        attn_out = attn_out_bhtd.transpose(1, 2)?.reshape((bs, seq_len, ()))?;
 
-        let inner = self.wo_a.forward_autocast(&attn_out)?;
-        self.wo_b.forward_autocast(&inner)
+        let o_groups = self.cfg.o_groups.unwrap_or(1);
+        let out = timed_mla(2, &mdev, || {
+        let inner = if o_groups > 1 {
+            // Grouped o_proj LoRA: each of `o_groups` head-groups gets its
+            // own slice of wo_a.  wo_a weight is (G*R, D) where G=o_groups,
+            // R=o_lora_rank, D=n_heads*head_dim/G.
+            //
+            // einsum("tgd,grd->tgr", attn_grouped, wo_a_grouped)
+            //   = bmm(attn_grouped.permute(1,0,2), wo_a_grouped.transpose(1,2))
+            let n = attn_out.dim(candle_core::D::Minus1)?;
+            let per_group = n / o_groups;
+            let tokens = bs * seq_len;
+
+            // (bs*seq_len, G, D)
+            let attn_grouped = attn_out.reshape((tokens, o_groups, per_group))?;
+
+            // RUN-161: cached dequantized+permuted wo_a as (G, D, R). The weight
+            // is constant — dequantizing + permuting it every forward was ~69ms/
+            // token (27% of decode). Build once, reuse.
+            let wo_a_t = {
+                let cached = self.wo_a_t_cache.read().unwrap();
+                if let Some(t) = cached.as_ref() {
+                    t.clone()
+                } else {
+                    drop(cached);
+                    let wo_a_w = self.wo_a.dequantize_w()?; // (G*R, D)
+                    let o_lora_rank = wo_a_w.dim(0)? / o_groups;
+                    let wo_a_grouped = wo_a_w.reshape((o_groups, o_lora_rank, per_group))?; // (G, R, D)
+                    let t = wo_a_grouped.permute((0, 2, 1))?.contiguous()?; // (G, D, R)
+                    *self.wo_a_t_cache.write().unwrap() = Some(t.clone());
+                    t
+                }
+            };
+            let o_lora_rank = wo_a_t.dim(2)?; // R
+
+            // bmm: (G, tokens, D) @ (G, D, R) → (G, tokens, R)
+            let attn_perm = attn_grouped.permute((1, 0, 2))?.contiguous()?;
+            let inner_perm = attn_perm.matmul(&wo_a_t)?;
+
+            // (G, tokens, R) → (tokens, G*R)
+            inner_perm
+                .permute((1, 0, 2))?
+                .contiguous()?
+                .reshape((tokens, o_groups * o_lora_rank))?
+                .reshape((bs, seq_len, o_groups * o_lora_rank))?
+        } else {
+            self.wo_a.forward_autocast(&attn_out)?
+        };
+        v4_nan_dbg(&inner, "attn.wo_a");
+        let out = self.wo_b.forward_autocast(&inner)?;
+        v4_nan_dbg(&out, "attn.wo_b");
+        Ok(out)
+        })?;
+        v4_trace_dump(self.dbg_layer_idx, &out, "70_o_out");
+        Ok(out)
     }
 }
 
@@ -1185,6 +1542,14 @@ struct MoeGate {
     top_k: usize,
     n_routed_experts: usize,
     e_score_correction_bias: Option<Tensor>,
+    /// Hash-routing table for layers `< num_hash_layers` (V4: first 3). Shape
+    /// `[vocab_size, top_k]` (I64). For these layers the reference `Gate`
+    /// (inference/model.py) selects experts by a fixed token-id lookup
+    /// `indices = tid2eid[input_ids]` instead of score top-k; routing weights
+    /// still come from the (unbiased) gate scores at those indices. `None` for
+    /// score-routed layers (which carry `gate.bias` instead). Audit §0 + §5
+    /// line 458.
+    tid2eid: Option<Tensor>,
 }
 
 impl MoeGate {
@@ -1192,36 +1557,83 @@ impl MoeGate {
         cfg: &DeepSeekV4Config,
         vb: ShardedVarBuilder,
         n_routed_experts: usize,
+        layer_idx: usize,
     ) -> Result<Self> {
         let weight = vb.get((n_routed_experts, cfg.hidden_size), "weight")?;
+        let top_k = cfg.num_experts_per_tok.unwrap_or(6);
+        // Hash routing: layers `< num_hash_layers` ship a fixed token-id ->
+        // expert table (`gate.tid2eid`, [vocab_size, top_k]) and NO bias. Load
+        // it so `forward` can dispatch hash vs. score routing per layer.
+        // Reference: inference/model.py `Gate.hash = layer_id < n_hash_layers`.
+        let tid2eid = if layer_idx < cfg.num_hash_layers {
+            Some(vb.get_with_hints_dtype(
+                (cfg.vocab_size, top_k),
+                "tid2eid",
+                Default::default(),
+                DType::I64,
+            )?)
+        } else {
+            None
+        };
         // V4 native publishes the noaux_tc bias as `gate.bias`; HF as
         // `gate.e_score_correction_bias`. Audit §2 (SGLang line 361
         // remap rule).
         let e_score_correction_bias = if matches!(cfg.topk_method, TopkMethod::NoAuxTc) {
             let name = if vb.contains_tensor("bias") {
-                "bias"
+                Some("bias")
+            } else if vb.contains_tensor("e_score_correction_bias") {
+                Some("e_score_correction_bias")
             } else {
-                "e_score_correction_bias"
+                // V4 Flash uses TD-MoE (tid2eid) routing — no correction bias.
+                None
             };
-            Some(vb.get_with_hints_dtype(
-                n_routed_experts,
-                name,
-                Default::default(),
-                DType::F32,
-            )?)
+            name.map(|n| {
+                vb.get_with_hints_dtype(
+                    n_routed_experts,
+                    n,
+                    Default::default(),
+                    DType::F32,
+                )
+            })
+            .transpose()?
         } else {
             None
         };
+        // RUN-161 diagnostic: confirm whether the noaux_tc selection bias is
+        // actually loaded for score-routed layers. If it is None on a
+        // score-routed layer (layer_idx >= num_hash_layers), expert selection
+        // ignores the trained bias and picks the wrong top-k → collapse.
+        if std::env::var_os("ARC_COLLAPSE").is_some() {
+            match &e_score_correction_bias {
+                Some(b) => {
+                    let stats = b
+                        .to_dtype(DType::F32)
+                        .and_then(|t| t.abs())
+                        .and_then(|t| t.mean_all())
+                        .and_then(|t| t.to_scalar::<f32>());
+                    eprintln!(
+                        "ARC_ROUTEBIAS [L{layer_idx}] gate.bias LOADED absmean={:?} hash={}",
+                        stats,
+                        layer_idx < cfg.num_hash_layers
+                    );
+                }
+                None => eprintln!(
+                    "ARC_ROUTEBIAS [L{layer_idx}] gate.bias = NONE hash={}",
+                    layer_idx < cfg.num_hash_layers
+                ),
+            }
+        }
         Ok(Self {
             weight,
             cfg: cfg.clone(),
-            top_k: cfg.num_experts_per_tok.unwrap_or(6),
+            top_k,
             n_routed_experts,
             e_score_correction_bias,
+            tid2eid,
         })
     }
 
-    fn forward(&self, xs: &Tensor) -> Result<(Tensor, Tensor)> {
+    fn forward(&self, xs: &Tensor, input_ids: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
         let (bs, seq_len, h) = xs.dims3()?;
         let xs = xs.reshape(((), h))?;
         let logits = xs
@@ -1241,18 +1653,44 @@ impl MoeGate {
             }
         };
 
-        let (mut topk_weight, topk_idx) = match self.cfg.topk_method {
+        let (mut topk_weight, topk_idx) = if let Some(tid2eid) = &self.tid2eid {
+            // Hash routing (layers < num_hash_layers): experts are a fixed
+            // per-token lookup, NOT score top-k. Reference Gate.forward:
+            //   indices = tid2eid[input_ids]
+            //   weights = original_scores.gather(1, indices)
+            // `scores` here is the (unbiased) sqrtsoftplus output, matching the
+            // reference's `original_scores`. input_ids[B*T] aligns row-wise with
+            // xs.reshape((B*T, h)) (both row-major over B then T).
+            let input_ids = input_ids.ok_or_else(|| {
+                candle_core::Error::Msg(
+                    "DeepSeek-V4 hash-routing MoE layer requires input_ids; \
+                     caller did not thread token ids to the gate."
+                        .to_string(),
+                )
+            })?;
+            let ids = input_ids
+                .reshape(((),))?
+                .to_dtype(DType::U32)?
+                .to_device(tid2eid.device())?;
+            // [B*T, top_k] expert indices (cast to U32 to match the score path /
+            // downstream expert gather).
+            let topk_idx = tid2eid.index_select(&ids, 0)?.to_dtype(DType::U32)?;
+            let topk_weight = scores.gather(&topk_idx, 1)?;
+            (topk_weight, topk_idx)
+        } else {
+            match self.cfg.topk_method {
             TopkMethod::Greedy => {
                 let TopKOutput { values, indices } = scores.topk_unsorted(self.top_k)?;
                 (values, indices)
             }
             TopkMethod::NoAuxTc => {
-                let Some(e_score_correction_bias) = &self.e_score_correction_bias else {
-                    candle_core::bail!("Expected e_score_correction_bias")
+                let scores_flat = scores.reshape((bs * seq_len, ()))?;
+                let scores_for_choice = if let Some(bias) = &self.e_score_correction_bias {
+                    scores_flat.broadcast_add(&bias.unsqueeze(0)?)?
+                } else {
+                    // V4 Flash: no correction bias (TD-MoE routing), use raw scores.
+                    scores_flat
                 };
-                let scores_for_choice = scores
-                    .reshape((bs * seq_len, ()))?
-                    .broadcast_add(&e_score_correction_bias.unsqueeze(0)?)?;
                 // V4 Flash config does NOT publish `n_group` (audit §5 +
                 // /tmp/v4_flash_config.json). When n_group==1 the grouping
                 // degenerates; fall back to a flat top-k over all experts.
@@ -1308,6 +1746,7 @@ impl MoeGate {
                 let TopKOutput { values, indices } = tmp_scores.topk_unsorted(self.top_k)?;
                 (values, indices)
             }
+            }
         };
 
         if matches!(
@@ -1319,6 +1758,41 @@ impl MoeGate {
         }
 
         topk_weight = (topk_weight * self.cfg.routed_scaling_factor)?;
+
+        // RUN-161 diagnostic: are the selected top-k routing weights peaked or
+        // near-uniform? Near-uniform weights average 6 redundant experts and
+        // amplify their shared common-mode (collapse). Log the spread of the
+        // raw gate logits at the selected experts, and the final weight spread.
+        if std::env::var_os("ARC_COLLAPSE").is_some() {
+            if let Ok(topk_logits) = logits.gather(&topk_idx, 1) {
+                v4_stat_dbg(&topk_logits, "gate.topk_logits");
+            }
+            v4_stat_dbg(&topk_weight, "gate.topk_weight");
+        }
+
+        // RUN-161 fix-test: replace the near-uniform normalized-sqrtsoftplus
+        // weights with a softmax over the selected experts' RAW logits (peaked
+        // routing). If this restores coherence, the routing-weight uniformity is
+        // the collapse root cause.
+        if std::env::var_os("ARC_SOFTMAX_ROUTE").is_some() {
+            if let Ok(topk_logits) = logits.gather(&topk_idx, 1) {
+                let sm = candle_nn::ops::softmax_last_dim(&topk_logits)?;
+                topk_weight =
+                    (sm.to_dtype(topk_weight.dtype())? * self.cfg.routed_scaling_factor)?;
+            }
+        }
+
+        // RUN-161 diagnostic: collapse is driven by the routed-expert weighted
+        // sum at deep layers. ARC_ROUTE_TOP1 keeps only the single
+        // largest-weight expert per token (zeroes the rest) to test whether the
+        // near-uniform top-6 averaging of redundant deep-layer experts is the
+        // common-mode source.
+        if std::env::var_os("ARC_ROUTE_TOP1").is_some() {
+            let max = topk_weight.max_keepdim(D::Minus1)?;
+            let diff = topk_weight.broadcast_sub(&max)?;
+            let mask = diff.ge(&diff.zeros_like()?)?.to_dtype(topk_weight.dtype())?;
+            topk_weight = (topk_weight * mask)?;
+        }
         Ok((topk_idx, topk_weight))
     }
 }
@@ -1327,6 +1801,7 @@ struct Moe {
     experts: MoEExperts,
     shared_experts: Option<Mlp>,
     gate: MoeGate,
+    layer_idx: usize,
 }
 
 impl Moe {
@@ -1348,6 +1823,9 @@ impl Moe {
             .unwrap_or(real_device);
 
         let moe_cfg = MoEExpertsConfig {
+            // V4: apply the trained SwiGLU clamp (swiglu_limit, default 10.0) in
+            // the routed experts. Without it the experts explode (RUN-161).
+            swiglu_limit: Some(cfg.swiglu_limit),
             num_experts: n_routed_experts,
             num_experts_per_tok: cfg.num_experts_per_tok.unwrap_or(6),
             hidden_size: cfg.hidden_size,
@@ -1381,25 +1859,74 @@ impl Moe {
             cfg,
             mapper.set_device(layer_idx, vb.pp("gate"), false),
             n_routed_experts,
+            layer_idx,
         )?;
         Ok(Self {
             experts,
             shared_experts,
             gate,
+            layer_idx,
         })
     }
 
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor, input_ids: Option<&Tensor>) -> Result<Tensor> {
+        // Tier-B TD-MoE probe: dump the real expert-input activations for a few
+        // representative layers so we can measure activation-aware low-rank
+        // error offline. Enable with ARC_CAPTURE_MOE_INPUT=<dir>. Overwrites on
+        // each call, so send the calibration prompt last and the file holds the
+        // real-data activations (not the warmup dummy run). (RUN-161)
+        if let Some(dir) = std::env::var_os("ARC_CAPTURE_MOE_INPUT") {
+            if matches!(self.layer_idx, 2 | 20 | 40) {
+                if let Ok(x_cpu) = xs
+                    .to_dtype(DType::F32)
+                    .and_then(|t| t.to_device(&Device::Cpu))
+                {
+                    let path = format!(
+                        "{}/moe_input_L{}.safetensors",
+                        dir.to_string_lossy(),
+                        self.layer_idx
+                    );
+                    let _ = x_cpu.save_safetensors("x", &path);
+                }
+            }
+        }
         let identity = xs.clone();
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
 
-        let (topk_idx, topk_weight) = self.gate.forward(xs)?;
+        v4_stat_dbg(xs, "moe.input");
+        let (topk_idx, topk_weight) = self.gate.forward(xs, input_ids)?;
+        v4_stat_dbg(&topk_weight, "moe.topk_w");
+        v4_stat_dbg(&topk_idx, "moe.topk_idx");
+        // RUN-161 diagnostic: dump the actual per-token selected expert IDs at a
+        // few layers (hash L1, score-onset L7, deep L14) to see whether the 5
+        // prompt tokens route to the SAME experts (routing collapse) or stay
+        // diverse. If score-routed layers over-concentrate vs the hash layers,
+        // the selection bias / scoring is wrong.
+        if std::env::var_os("ARC_COLLAPSE").is_some()
+            && matches!(self.layer_idx, 1 | 4 | 7 | 14 | 20)
+        {
+            if let Ok(v) = topk_idx.to_dtype(DType::U32).and_then(|t| t.to_vec2::<u32>()) {
+                eprintln!("ARC_TOPKID [L{}] {:?}", self.layer_idx, v);
+            }
+        }
         let mut y = self.experts.forward(xs, topk_weight, &topk_idx)?;
         y = y.reshape((b_size, seq_len, hidden_dim))?;
+        v4_stat_dbg(&y, "moe.routed");
+        let li = self.layer_idx;
+        v4_collapse_dbg(&y, &format!("L{li}.moe_routed"), 1);
+        v4_collapse_dbg(
+            &topk_idx.to_dtype(DType::F32).unwrap_or_else(|_| topk_idx.clone()),
+            &format!("L{li}.moe_topk_idx"),
+            0,
+        );
 
         if let Some(ref shared_experts) = self.shared_experts {
-            y = (y + shared_experts.forward(&identity)?)?;
+            let shared_out = shared_experts.forward(&identity)?;
+            v4_stat_dbg(&shared_out, "moe.shared");
+            v4_collapse_dbg(&shared_out, &format!("L{li}.moe_shared"), 1);
+            y = (y + shared_out)?;
         }
+        v4_stat_dbg(&y, "moe.out");
 
         Ok(y)
     }
@@ -1423,11 +1950,287 @@ enum MoeOrMlp {
 }
 
 impl MoeOrMlp {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor, input_ids: Option<&Tensor>) -> Result<Tensor> {
         match self {
+            // Dense MLP layers (V4 Flash has none) ignore input_ids.
             Self::Mlp(mlp) => mlp.forward(xs),
-            Self::Moe(moe) => moe.forward(xs),
+            Self::Moe(moe) => moe.forward(xs, input_ids),
         }
+    }
+}
+
+/// V4 QAT: block-wise (64) FP8 round-trip on the non-rope dims of K, matching
+/// reference inference/model.py:506 `act_quant(kv[..., :-rd], 64, ..., inplace=True)`.
+/// Per 64-element block: scale = amax/448 (E4M3 max), quantize to F8E4M3, dequant
+/// back. Rope dims (last `rope_dim`) untouched. Computed in F32 (ref does FP32
+/// internally). (RUN-161)
+fn act_quant_kv_nope(k: &Tensor, rope_dim: usize) -> Result<Tensor> {
+    let head_dim = k.dim(D::Minus1)?;
+    let nope = head_dim - rope_dim;
+    const BLOCK: usize = 64;
+    if nope == 0 || nope % BLOCK != 0 {
+        return Ok(k.clone());
+    }
+    let k_nope = k.narrow(D::Minus1, 0, nope)?;
+    let k_rope = k.narrow(D::Minus1, nope, rope_dim)?;
+    let orig_dims = k_nope.dims().to_vec();
+    let mut blk = orig_dims.clone();
+    let last = blk.len() - 1;
+    blk[last] = nope / BLOCK;
+    blk.push(BLOCK);
+    let kb = k_nope.to_dtype(DType::F32)?.reshape(blk)?;
+    let amax = kb.abs()?.max_keepdim(D::Minus1)?;
+    let scale = (amax / 448.0)?.affine(1.0, 1e-12)?;
+    let scaled = kb.broadcast_div(&scale)?;
+    // candle's F8E4M3 cast has no CUDA kernel ("named symbol not found"), so the
+    // exact round-trip runs on CPU — but that forces a GPU<->CPU sync every
+    // attention layer (43 syncs/token), serializing decode. ARC_GPU_ACT_QUANT=1
+    // does an on-GPU E4M3 round-trip instead (round-to-nearest, 3 mantissa bits,
+    // exp range [-6,8], max 448) — removes the sync at a sub-ULP-of-FP8
+    // approximation the FP8-trained model tolerates. (RUN-161 throughput)
+    let dev = scaled.device().clone();
+    let rt = if std::env::var_os("ARC_GPU_ACT_QUANT").is_some() {
+        let ln2 = std::f64::consts::LN_2;
+        let x = scaled.clamp(-448f32, 448f32)?;
+        let ax = x.abs()?.clamp(1e-30f32, 1e30f32)?;
+        let e = ax.log()?.affine(1.0 / ln2, 0.0)?.floor()?.clamp(-6f32, 8f32)?; // floor(log2|x|)
+        let step = e.affine(ln2, -3.0 * ln2)?.exp()?; // 2^(e-3)
+        x.broadcast_div(&step)?.round()?.broadcast_mul(&step)?
+    } else {
+        scaled
+            .to_device(&candle_core::Device::Cpu)?
+            .to_dtype(DType::F8E4M3)?
+            .to_dtype(DType::F32)?
+            .to_device(&dev)?
+    };
+    let q = rt.broadcast_mul(&scale)?;
+    let k_nope_q = q.reshape(orig_dims)?.to_dtype(k.dtype())?;
+    Tensor::cat(&[&k_nope_q, &k_rope], D::Minus1)?.contiguous()
+}
+
+/// RUN-161 decode profiler. Enabled by `ARC_TIME_DECODE=1`. Accumulates
+/// per-component GPU time (sync'd) across all layers of one forward, logged +
+/// reset each call. Sync per component => accurate attribution (kills overlap,
+/// but decode is launch-bound so there's little overlap to lose). The split
+/// tells us which component to fuse next for the throughput cut.
+pub(crate) static DECODE_NS: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+pub(crate) const DECODE_NAMES: [&str; 6] = [
+    "mhc_attn_pre", "mla_attn", "mix_post_attn", "mhc_ffn_pre", "moe", "mix_post_ffn",
+];
+
+/// MLA sub-component timers (Phase 1: pin the 50%). SDPA = mla_attn - these 3.
+pub(crate) static MLA_NS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+pub(crate) const MLA_NAMES: [&str; 3] = ["q_proj", "kv_proj_rope", "invrope_oproj"];
+
+#[inline]
+pub(crate) fn timed_mla<T>(
+    idx: usize,
+    dev: &candle_core::Device,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if std::env::var_os("ARC_TIME_DECODE").is_none() {
+        return f();
+    }
+    let _ = dev.synchronize();
+    let t0 = std::time::Instant::now();
+    let r = f()?;
+    let _ = dev.synchronize();
+    MLA_NS[idx].fetch_add(
+        t0.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    Ok(r)
+}
+
+#[inline]
+pub(crate) fn timed<T>(
+    idx: usize,
+    dev: &candle_core::Device,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if std::env::var_os("ARC_TIME_DECODE").is_none() {
+        return f();
+    }
+    let _ = dev.synchronize();
+    let t0 = std::time::Instant::now();
+    let r = f()?;
+    let _ = dev.synchronize();
+    DECODE_NS[idx].fetch_add(
+        t0.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    Ok(r)
+}
+
+/// Debug-only NaN/Inf localizer. Enabled by setting `V4_NAN_DEBUG=1`.
+/// Logs (to stderr) the first stage in the forward pass that produces a
+/// non-finite value, with shape and the finite value range for context.
+/// No-op (single env lookup) when the var is unset.
+pub(crate) fn v4_nan_dbg(t: &Tensor, tag: &str) {
+    // Also emit magnitude stats under V4_STATS so the existing per-sub-op
+    // probes double as a collapse/explosion localizer (RUN-161).
+    v4_stat_dbg(t, tag);
+    if std::env::var_os("V4_NAN_DEBUG").is_none() {
+        return;
+    }
+    match t
+        .to_dtype(DType::F32)
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_vec1::<f32>())
+    {
+        Ok(v) => {
+            let n = v.len();
+            let nans = v.iter().filter(|x| x.is_nan()).count();
+            let infs = v.iter().filter(|x| x.is_infinite()).count();
+            if nans > 0 || infs > 0 {
+                let fmin = v.iter().copied().filter(|x| x.is_finite()).fold(f32::MAX, f32::min);
+                let fmax = v.iter().copied().filter(|x| x.is_finite()).fold(f32::MIN, f32::max);
+                let shape = t.dims().to_vec();
+                eprintln!(
+                    "V4_NAN_DEBUG [{tag}] shape={shape:?} nans={nans} infs={infs}/{n} finite_range=[{fmin:.4},{fmax:.4}]"
+                );
+            }
+        }
+        Err(e) => eprintln!("V4_NAN_DEBUG [{tag}] check failed: {e}"),
+    }
+}
+
+/// Debug-only magnitude logger. Enabled by setting `V4_STATS=1`. Unlike
+/// `v4_nan_dbg`, this always logs (abs-mean / std / range), so it can localize
+/// a representation collapse (values -> ~0 or constant) that produces a flat
+/// logit distribution. Used to bisect which layer/op collapses the hidden state.
+pub(crate) fn v4_stat_dbg(t: &Tensor, tag: &str) {
+    if std::env::var_os("V4_STATS").is_none() {
+        return;
+    }
+    match t
+        .to_dtype(DType::F32)
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_vec1::<f32>())
+    {
+        Ok(v) => {
+            let n = v.len().max(1) as f32;
+            let naninf = v.iter().filter(|x| !x.is_finite()).count();
+            let mean = v.iter().sum::<f32>() / n;
+            let absmean = v.iter().map(|x| x.abs()).sum::<f32>() / n;
+            let var = v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n;
+            let fmin = v.iter().copied().filter(|x| x.is_finite()).fold(f32::MAX, f32::min);
+            let fmax = v.iter().copied().filter(|x| x.is_finite()).fold(f32::MIN, f32::max);
+            eprintln!(
+                "V4_STATS [{tag}] absmean={absmean:.6} std={:.6} range=[{fmin:.4},{fmax:.4}] nan/inf={naninf}",
+                var.sqrt()
+            );
+        }
+        Err(e) => eprintln!("V4_STATS [{tag}] failed: {e}"),
+    }
+}
+
+/// Cross-position similarity probe (RUN-161 context-collapse localizer).
+/// Enabled with `ARC_COLLAPSE=1`. Collapses every axis except `pos_dim` into a
+/// per-position feature vector, then reports the mean off-diagonal cosine
+/// between positions and cos(first,last). A value trending to ~1.0 means the
+/// positions have stopped differentiating (context collapse) — pinpointing the
+/// exact layer/op where contextual mixing dies, which whole-tensor std cannot.
+pub(crate) fn v4_collapse_dbg(t: &Tensor, tag: &str, pos_dim: usize) {
+    if std::env::var_os("ARC_COLLAPSE").is_none() {
+        return;
+    }
+    let run = || -> Result<()> {
+        let t = t.to_dtype(DType::F32)?;
+        let dims = t.dims().to_vec();
+        if pos_dim >= dims.len() {
+            return Ok(());
+        }
+        let tlen = dims[pos_dim];
+        if tlen < 2 {
+            return Ok(()); // single-token (decode) step: nothing to compare
+        }
+        // Move pos to front, flatten the rest into a feature vector per position.
+        let mut perm: Vec<usize> = vec![pos_dim];
+        perm.extend((0..dims.len()).filter(|&d| d != pos_dim));
+        let tp = t.permute(perm)?.contiguous()?;
+        let f = tp.elem_count() / tlen;
+        let m = tp.reshape((tlen, f))?;
+        let norm = (m.sqr()?.sum_keepdim(1)?.sqrt()? + 1e-8)?;
+        let mn = m.broadcast_div(&norm)?;
+        let cos = mn.matmul(&mn.t()?)?; // [T, T]
+        let cosv: Vec<f32> = cos.flatten_all()?.to_vec1()?;
+        let mut s = 0f32;
+        let mut c = 0usize;
+        for i in 0..tlen {
+            for j in 0..tlen {
+                if i != j {
+                    s += cosv[i * tlen + j];
+                    c += 1;
+                }
+            }
+        }
+        let mean_off = s / (c.max(1) as f32);
+        let first_last = cosv[tlen - 1]; // cos(pos0, posLast)
+        eprintln!(
+            "ARC_COLLAPSE [{tag}] T={tlen} mean_offdiag_cos={mean_off:.5} cos(first,last)={first_last:.5}"
+        );
+        Ok(())
+    };
+    if let Err(e) = run() {
+        eprintln!("ARC_COLLAPSE [{tag}] failed: {e}");
+    }
+}
+
+/// Debug-only per-op tensor dumper for tandem prefill-vs-decode differential
+/// tracing (RUN-161 decode bug). Enabled by `V4_TRACE=<dir>`. Writes each tagged
+/// tensor to `<dir>/L<layer>.<tag>.npy` (f32). Run prefill and decode into two
+/// different dirs, then diff op-by-op: the FIRST op whose cosine drops below 1.0
+/// is the bug. Gated to a single layer (`V4_TRACE_LAYER`, default 0) to stay
+/// tiny and avoid per-layer overwrite. Position alignment is done in the Python
+/// diff (prefill keeps row N, decode keeps row 0). No-op when unset.
+pub(crate) fn v4_trace_want_layer() -> Option<usize> {
+    if std::env::var_os("V4_TRACE").is_none() {
+        return None;
+    }
+    Some(
+        std::env::var("V4_TRACE_LAYER")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+    )
+}
+
+pub(crate) fn v4_trace_dump(layer: usize, t: &Tensor, tag: &str) {
+    if v4_trace_want_layer() != Some(layer) {
+        return;
+    }
+    let dir = match std::env::var("V4_TRACE") {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let path = format!("{dir}/L{layer}.{tag}.npy");
+    if let Err(e) = t
+        .to_dtype(DType::F32)
+        .and_then(|t| t.contiguous())
+        .and_then(|t| t.write_npy(&path))
+    {
+        eprintln!("V4_TRACE [{tag}] write failed: {e}");
+    }
+}
+
+pub(crate) fn v4_trace_text(layer: usize, tag: &str, text: &str) {
+    if v4_trace_want_layer() != Some(layer) {
+        return;
+    }
+    if let Ok(dir) = std::env::var("V4_TRACE") {
+        let _ = std::fs::write(format!("{dir}/L{layer}.{tag}.txt"), text);
     }
 }
 
@@ -1498,6 +2301,7 @@ impl DecoderLayer {
         // MLP branch is reachable only if a config explicitly sets a
         // non-zero `first_k_dense_replace` AND provides `intermediate_size`.
         // Audit §0 + §5 line 448.
+        let mhc_device = real_device.clone();
         let moe_or_mlp = if let Some(n_routed_experts) = cfg.n_routed_experts.filter(|_| {
             layer_idx >= cfg.first_k_dense_replace
                 && layer_idx.is_multiple_of(cfg.moe_layer_freq)
@@ -1540,7 +2344,7 @@ impl DecoderLayer {
         // signal (`compress_ratios` non-empty AND the layer index is within
         // it) so legacy V3 fixtures and unit-test synthesisers that
         // intentionally omit `hc_attn_*` stay quiet.
-        let mhc = V4MHCLayerParams::try_load(cfg, &vb, layer_idx);
+        let mhc = V4MHCLayerParams::try_load(cfg, &vb, layer_idx, &mhc_device);
         if mhc.is_none() && !cfg.compress_ratios.is_empty() && layer_idx < cfg.compress_ratios.len()
         {
             tracing::warn!(
@@ -1570,6 +2374,7 @@ impl DecoderLayer {
             &PagedAttentionInputMetadata,
         )>,
         flash_params: &FlashParams,
+        input_ids: Option<&Tensor>,
     ) -> Result<Tensor> {
         // V4 3-D residual fallback path (legacy / partial-V4 checkpoints).
         //
@@ -1607,7 +2412,7 @@ impl DecoderLayer {
         let residual = &xs;
         let ffn_out = self
             .moe_or_mlp
-            .forward(&xs.apply(&self.post_attention_layernorm)?)?;
+            .forward(&xs.apply(&self.post_attention_layernorm)?, input_ids)?;
         match &self.mhc {
             Some(mhc) => mhc.mix_ffn_3d_bridge(residual, &ffn_out),
             None => residual + ffn_out,
@@ -1653,7 +2458,11 @@ impl DecoderLayer {
             &PagedAttentionInputMetadata,
         )>,
         flash_params: &FlashParams,
+        layer_idx: usize,
+        input_ids: Option<&Tensor>,
     ) -> Result<Tensor> {
+        let li = layer_idx;
+        v4_nan_dbg(xs_4d, &format!("L{li}.input_4d"));
         let mhc = self.mhc.as_ref().ok_or_else(|| {
             candle_core::Error::Msg(
                 "DecoderLayer::forward_4d called on a layer without loaded `hc_attn_*` / \
@@ -1663,26 +2472,51 @@ impl DecoderLayer {
             )
         })?;
 
+        let tdev = xs_4d.device().clone();
+
         // === ATTN BLOCK ===
         let residual_attn = xs_4d;
-        let (y_attn, post_attn, comb_attn) = mhc.attn_pre(residual_attn)?;
+        let (y_attn, post_attn, comb_attn) = timed(0, &tdev, || mhc.attn_pre(residual_attn))?;
+        v4_nan_dbg(&y_attn, &format!("L{li}.attn_pre.y"));
+        v4_collapse_dbg(&y_attn, &format!("L{li}.y_attn"), 1);
+        v4_nan_dbg(&post_attn, &format!("L{li}.attn_pre.post"));
+        v4_nan_dbg(&comb_attn, &format!("L{li}.attn_pre.comb"));
         let y_attn_normed = self.input_layernorm.forward(&y_attn)?;
-        let attn_out = self.attn.forward(
-            &y_attn_normed,
-            attention_mask,
-            seqlen_offsets,
-            kv_cache,
-            metadata,
-            flash_params,
-        )?;
-        let xs_4d = mhc.mix_post_4d(&attn_out, residual_attn, &post_attn, &comb_attn)?;
+        v4_nan_dbg(&y_attn_normed, &format!("L{li}.input_layernorm"));
+        let attn_out = timed(1, &tdev, || {
+            self.attn.forward(
+                &y_attn_normed,
+                attention_mask,
+                seqlen_offsets,
+                kv_cache,
+                metadata,
+                flash_params,
+            )
+        })?;
+        v4_nan_dbg(&attn_out, &format!("L{li}.attn_out"));
+        v4_collapse_dbg(&attn_out, &format!("L{li}.attn_out"), 1);
+        let xs_4d = timed(2, &tdev, || {
+            mhc.mix_post_4d(&attn_out, residual_attn, &post_attn, &comb_attn)
+        })?;
+        v4_nan_dbg(&xs_4d, &format!("L{li}.mix_post_attn"));
+        v4_collapse_dbg(&xs_4d, &format!("L{li}.mix_post_attn"), 1);
 
         // === FFN BLOCK ===
         let residual_ffn = &xs_4d;
-        let (y_ffn, post_ffn, comb_ffn) = mhc.ffn_pre(residual_ffn)?;
+        let (y_ffn, post_ffn, comb_ffn) = timed(3, &tdev, || mhc.ffn_pre(residual_ffn))?;
+        v4_nan_dbg(&y_ffn, &format!("L{li}.ffn_pre.y"));
+        v4_collapse_dbg(&y_ffn, &format!("L{li}.y_ffn"), 1);
         let y_ffn_normed = self.post_attention_layernorm.forward(&y_ffn)?;
-        let ffn_out = self.moe_or_mlp.forward(&y_ffn_normed)?;
-        mhc.mix_post_4d(&ffn_out, residual_ffn, &post_ffn, &comb_ffn)
+        v4_nan_dbg(&y_ffn_normed, &format!("L{li}.post_attention_layernorm"));
+        let ffn_out = timed(4, &tdev, || self.moe_or_mlp.forward(&y_ffn_normed, input_ids))?;
+        v4_nan_dbg(&ffn_out, &format!("L{li}.ffn_out"));
+        v4_collapse_dbg(&ffn_out, &format!("L{li}.ffn_out"), 1);
+        let out = timed(5, &tdev, || {
+            mhc.mix_post_4d(&ffn_out, residual_ffn, &post_ffn, &comb_ffn)
+        })?;
+        v4_nan_dbg(&out, &format!("L{li}.mix_post_ffn"));
+        v4_collapse_dbg(&out, &format!("L{li}.residual"), 1);
+        Ok(out)
     }
 }
 
@@ -1809,7 +2643,15 @@ impl DeepSeekV4 {
         let mut rope_standard: HashMap<_, Arc<DeepSeekV2RotaryEmbedding>> = HashMap::new();
         let mut rope_compress: HashMap<_, Arc<DeepSeekV2RotaryEmbedding>> = HashMap::new();
         let rope_cfg_standard = DeepSeekV2RopeConfig {
-            rope_scaling: cfg.rope_scaling.clone(),
+            // RUN-161 ablation: the reference disables YARN on standard layers
+            // (`original_seq_len, rope_theta = 0, args.rope_theta`); arc applies
+            // it. ARC_DISABLE_YARN_STD=1 matches the reference to test whether
+            // YARN-on-standard contributes to the context collapse.
+            rope_scaling: if std::env::var_os("ARC_DISABLE_YARN_STD").is_some() {
+                None
+            } else {
+                cfg.rope_scaling.clone()
+            },
             max_position_embeddings: cfg.max_position_embeddings,
             rope_theta: cfg.rope_theta,
             qk_rope_head_dim: cfg.qk_rope_head_dim,
@@ -1944,7 +2786,11 @@ impl DeepSeekV4 {
         // ---- Global mHC head ----
         // V4 publishes `hc_head_fn`, `hc_head_base`, `hc_head_scale` at the
         // model root. Audit §1 ("Top-level tensors").
-        let mhc_head = super::dsv4_mhc::V4MHCHead::try_load(cfg, &vb_m);
+        let mhc_head = super::dsv4_mhc::V4MHCHead::try_load(
+            cfg,
+            &vb_m,
+            &normal_loading_metadata.real_device,
+        );
 
         Ok(Self {
             lm_head,
@@ -2040,7 +2886,11 @@ impl DeepSeekV4 {
         let xs = if use_4d_mhc {
             // Lift to 4-D via the head's runtime (carries hc_mult).
             let mhc_head = self.mhc_head.as_ref().unwrap();
+            v4_nan_dbg(&xs_embed, "embed");
+            v4_stat_dbg(&xs_embed, "embed");
             let mut xs_4d = mhc_head.rt.lift_3d_to_4d(&xs_embed)?;
+            v4_nan_dbg(&xs_4d, "lift_3d_to_4d");
+            v4_stat_dbg(&xs_4d, "lift_3d_to_4d");
             for (i, layer) in self.layers.iter().enumerate() {
                 xs_4d = self.mapper.map(xs_4d, i)?;
                 xs_4d = layer.forward_4d(
@@ -2052,11 +2902,50 @@ impl DeepSeekV4 {
                         .as_ref()
                         .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
                     flash_params,
+                    i,
+                    Some(input_ids),
                 )?;
+                v4_stat_dbg(&xs_4d, &format!("L{i}"));
+            }
+            if std::env::var_os("ARC_TIME_DECODE").is_some() {
+                use std::sync::atomic::Ordering;
+                let total: u64 = DECODE_NS.iter().map(|a| a.load(Ordering::Relaxed)).sum();
+                let parts: Vec<String> = DECODE_NAMES
+                    .iter()
+                    .zip(DECODE_NS.iter())
+                    .map(|(n, a)| {
+                        let ns = a.load(Ordering::Relaxed);
+                        format!(
+                            "{}={:.2}ms({:.0}%)",
+                            n,
+                            ns as f64 / 1e6,
+                            100.0 * ns as f64 / total.max(1) as f64
+                        )
+                    })
+                    .collect();
+                let mla_parts: Vec<String> = MLA_NAMES
+                    .iter()
+                    .zip(MLA_NS.iter())
+                    .map(|(n, a)| format!("{}={:.2}ms", n, a.load(Ordering::Relaxed) as f64 / 1e6))
+                    .collect();
+                tracing::info!(
+                    "ARC_TIME_DECODE forward_total={:.2}ms | {} || MLA[{}] (sdpa=mla_attn-these)",
+                    total as f64 / 1e6,
+                    parts.join(" "),
+                    mla_parts.join(" ")
+                );
+                for a in DECODE_NS.iter() {
+                    a.store(0, Ordering::Relaxed);
+                }
+                for a in MLA_NS.iter() {
+                    a.store(0, Ordering::Relaxed);
+                }
             }
             let xs_4d = xs_4d.to_device(&self.device)?;
             // Collapse via the learned global mHC head: 4-D → 3-D.
-            mhc_head.forward(&xs_4d)?
+            let collapsed = mhc_head.forward(&xs_4d)?;
+            v4_stat_dbg(&collapsed, "after_mhc_head");
+            collapsed
         } else {
             let mut xs = xs_embed;
             for (i, layer) in self.layers.iter().enumerate() {
@@ -2070,15 +2959,20 @@ impl DeepSeekV4 {
                         .as_ref()
                         .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
                     flash_params,
+                    Some(input_ids),
                 )?;
             }
             xs.to_device(&self.device)?
         };
 
+        v4_stat_dbg(&xs, "before_norm");
         let xs = xs.apply(&self.norm)?;
+        v4_stat_dbg(&xs, "after_norm");
         let xs = extract_logits(&xs, context_lens)?;
 
-        self.lm_head.forward_autocast(&xs)
+        let logits = self.lm_head.forward_autocast(&xs)?;
+        v4_stat_dbg(&logits, "logits");
+        Ok(logits)
     }
 }
 
@@ -2105,6 +2999,10 @@ impl IsqModel for DeepSeekV4 {
             tensors.push((&mut layer.attn.wkv, Some(i)));
             tensors.push((&mut layer.attn.wo_a, Some(i)));
             tensors.push((&mut layer.attn.wo_b, Some(i)));
+            // V4 compressor wkv_gate — must be included so ISQ moves it to GPU.
+            if let Some(comp) = &mut layer.attn.compressor {
+                tensors.push((&mut comp.wkv_gate, Some(i)));
+            }
             match &mut layer.moe_or_mlp {
                 MoeOrMlp::Mlp(mlp) => {
                     tensors.push((&mut mlp.gate, Some(i)));
@@ -2134,6 +3032,22 @@ impl IsqModel for DeepSeekV4 {
         let mut tensors = Vec::new();
         tensors.push((&mut self.lm_head, None));
         for (i, layer) in self.layers.iter_mut().enumerate() {
+            // Include attention weights so they get moved to GPU even in MoeExpertsOnly mode.
+            match &mut layer.attn.q {
+                QProj::Plain(q) => {
+                    tensors.push((q, Some(i)));
+                }
+                QProj::Lora { a, norm: _, b } => {
+                    tensors.push((a, Some(i)));
+                    tensors.push((b, Some(i)));
+                }
+            }
+            tensors.push((&mut layer.attn.wkv, Some(i)));
+            tensors.push((&mut layer.attn.wo_a, Some(i)));
+            tensors.push((&mut layer.attn.wo_b, Some(i)));
+            if let Some(comp) = &mut layer.attn.compressor {
+                tensors.push((&mut comp.wkv_gate, Some(i)));
+            }
             match &mut layer.moe_or_mlp {
                 MoeOrMlp::Mlp(mlp) => {
                     tensors.push((&mut mlp.gate, Some(i)));
@@ -2146,6 +3060,10 @@ impl IsqModel for DeepSeekV4 {
                     }
                 }
             }
+        }
+        if let Some(mtp) = &mut self.mtp_head {
+            tensors.push((&mut mtp.h_proj, None));
+            tensors.push((&mut mtp.e_proj, None));
         }
         (tensors, &*self.mapper)
     }
@@ -2187,6 +3105,27 @@ impl IsqModel for DeepSeekV4 {
                     uvb_l.pp("self_attn").pp("q_a_layernorm").add(norm);
                 }
             }
+
+            if let Some(comp) = &layer.attn.compressor {
+                let uvb_c = uvb_l.pp("self_attn").pp("compressor");
+                uvb_c.add(&comp.norm);
+                uvb_c.add_tensor("ape", comp.ape.clone());
+            }
+
+            if let Some(mhc) = &layer.mhc {
+                uvb_l.add_tensor("hc_attn_fn", mhc.hc_attn_fn.clone());
+                uvb_l.add_tensor("hc_attn_base", mhc.hc_attn_base.clone());
+                uvb_l.add_tensor("hc_attn_scale", mhc.hc_attn_scale.clone());
+                uvb_l.add_tensor("hc_ffn_fn", mhc.hc_ffn_fn.clone());
+                uvb_l.add_tensor("hc_ffn_base", mhc.hc_ffn_base.clone());
+                uvb_l.add_tensor("hc_ffn_scale", mhc.hc_ffn_scale.clone());
+            }
+        }
+
+        if let Some(mhc_head) = &self.mhc_head {
+            uvb_m.add_tensor("hc_head_fn", mhc_head.hc_head_fn.clone());
+            uvb_m.add_tensor("hc_head_base", mhc_head.hc_head_base.clone());
+            uvb_m.add_tensor("hc_head_scale", mhc_head.hc_head_scale.clone());
         }
 
         uvb.to_safetensors()
@@ -2235,6 +3174,27 @@ impl IsqModel for DeepSeekV4 {
             uvb_l.pp("self_attn").pp("kv_proj").add(&layer.attn.wkv);
             uvb_l.pp("self_attn").pp("o_a_proj").add(&layer.attn.wo_a);
             uvb_l.pp("self_attn").pp("o_b_proj").add(&layer.attn.wo_b);
+
+            if let Some(comp) = &layer.attn.compressor {
+                let uvb_c = uvb_l.pp("self_attn").pp("compressor");
+                uvb_c.add(&comp.norm);
+                uvb_c.add_tensor("ape", comp.ape.clone());
+            }
+
+            if let Some(mhc) = &layer.mhc {
+                uvb_l.add_tensor("hc_attn_fn", mhc.hc_attn_fn.clone());
+                uvb_l.add_tensor("hc_attn_base", mhc.hc_attn_base.clone());
+                uvb_l.add_tensor("hc_attn_scale", mhc.hc_attn_scale.clone());
+                uvb_l.add_tensor("hc_ffn_fn", mhc.hc_ffn_fn.clone());
+                uvb_l.add_tensor("hc_ffn_base", mhc.hc_ffn_base.clone());
+                uvb_l.add_tensor("hc_ffn_scale", mhc.hc_ffn_scale.clone());
+            }
+        }
+
+        if let Some(mhc_head) = &self.mhc_head {
+            uvb_m.add_tensor("hc_head_fn", mhc_head.hc_head_fn.clone());
+            uvb_m.add_tensor("hc_head_base", mhc_head.hc_head_base.clone());
+            uvb_m.add_tensor("hc_head_scale", mhc_head.hc_head_scale.clone());
         }
 
         Some(uvb.to_safetensors())
@@ -2689,7 +3649,7 @@ mod tests {
         let cfg = compressor_test_cfg(hidden_size);
         let map = make_compressor_dual_tensors(hidden_size, head_dim, ratio, coff, 7, &device);
         let vb = vb_from_map(map, DType::F32, &device);
-        let comp = V4Compressor::new(&cfg, vb, ratio, head_dim)?;
+        let comp = V4Compressor::new(&cfg, vb, ratio, head_dim, &device)?;
 
         assert_eq!(comp.ratio, ratio);
         assert_eq!(comp.head_dim, head_dim);
@@ -2704,9 +3664,9 @@ mod tests {
         // Expected output shape: [B, T/ratio, head_dim].
         assert_eq!(out.dims(), &[b, t / ratio, head_dim]);
 
-        // Non-trivial output: the loaded wkv + wgate weights are non-zero
-        // and ape is 0.05, so the post-sigmoid * val * (1 + ape) sum is
-        // strictly non-zero. Check via max absolute value.
+        // Non-trivial output: the loaded wkv + wgate weights are non-zero, so
+        // the softmax-pooled (value × softmax(score + ape)) sum is strictly
+        // non-zero. Check via max absolute value.
         let flat: Vec<f32> = out.flatten_all()?.to_vec1()?;
         let max_abs = flat.iter().fold(0.0f32, |a, b| a.max(b.abs()));
         assert!(
@@ -2732,7 +3692,7 @@ mod tests {
         let cfg = compressor_test_cfg(hidden_size);
         let map = make_compressor_dual_tensors(hidden_size, head_dim, ratio, coff, 3, &device);
         let vb = vb_from_map(map, DType::F32, &device);
-        let comp = V4Compressor::new(&cfg, vb, ratio, head_dim)?;
+        let comp = V4Compressor::new(&cfg, vb, ratio, head_dim, &device)?;
         assert_eq!(comp.coff, 2);
 
         let b = 2;
@@ -2740,6 +3700,203 @@ mod tests {
         let xs = Tensor::ones((b, t, hidden_size), DType::F32, &device)?;
         let out = comp.forward_from_xs(&xs)?;
         assert_eq!(out.dims(), &[b, t / ratio, head_dim]);
+        Ok(())
+    }
+
+    /// Differential oracle for the RUN-161 #24 compressor-math fix.
+    ///
+    /// Pins the EXACT pooling semantics of `forward_from_xs` against an
+    /// INDEPENDENT scalar re-derivation of the model's reference algorithm
+    /// (inference/model.py `Compressor.forward`):
+    ///   value = fused[..., :cd]  (wkv),  score = fused[..., cd:]  (wgate)
+    ///   score += ape
+    ///   overlap_transform (coff==2): previous group's overlap-half (channels
+    ///     0..d) → first `ratio` slots (fill 0 / -inf for group 0); current
+    ///     group's normal-half (channels d..2d) → last `ratio` slots
+    ///   weights = softmax(score, over the slot axis)        [per channel]
+    ///   pooled  = sum(value * weights, over the slot axis)
+    ///   out     = RMSNorm(pooled)  over head_dim
+    ///
+    /// A regression to the pre-fix math (value/score swapped, a sigmoid gate,
+    /// a plain sum instead of softmax-pool, or a missing overlap window) moves
+    /// the output well outside the 1e-4 tolerance and trips this test on the
+    /// CPU — no GPU required. Uses the pre-fused F32 `wkv_gate.weight` layout so
+    /// the linear stays F32 (the dual-tensor path stores it in BF16), making the
+    /// comparison tight.
+    #[test]
+    fn v4_compressor_forward_matches_scalar_reference() -> Result<()> {
+        // Independent scalar reference. Returns [b, t_c, d] row-major.
+        #[allow(clippy::too_many_arguments)]
+        fn scalar_reference(
+            fused: &[f32], // [b, t, 2*cd] row-major, cd = coff*head_dim
+            ape: &[f32],   // [ratio, cd] row-major
+            b: usize,
+            t: usize,
+            ratio: usize,
+            coff: usize,
+            head_dim: usize,
+            eps: f32,
+        ) -> Vec<f32> {
+            let d = head_dim;
+            let cd = coff * head_dim;
+            let two_cd = 2 * cd;
+            let t_c = t / ratio;
+            let n_slots = coff * ratio; // overlap (coff==2) doubles the slot count
+            let mut out = vec![0f32; b * t_c * d];
+            // Row offset of group `grp`, slot `r` within the fused [b,t,2cd] buffer.
+            let row_base = |bi: usize, grp: usize, r: usize| (bi * t + grp * ratio + r) * two_cd;
+            for bi in 0..b {
+                for g in 0..t_c {
+                    let mut slot_val = vec![0f32; n_slots * d];
+                    let mut slot_score = vec![0f32; n_slots * d];
+                    if coff == 2 {
+                        // First `ratio` slots: previous group's overlap-half
+                        // (value channels 0..d, score channels 0..d).
+                        for r in 0..ratio {
+                            for c in 0..d {
+                                if g > 0 {
+                                    let base = row_base(bi, g - 1, r);
+                                    slot_val[r * d + c] = fused[base + c];
+                                    slot_score[r * d + c] = fused[base + cd + c] + ape[r * cd + c];
+                                } else {
+                                    slot_val[r * d + c] = 0.0;
+                                    slot_score[r * d + c] = f32::NEG_INFINITY;
+                                }
+                            }
+                        }
+                        // Last `ratio` slots: current group's normal-half
+                        // (value channels d..2d, score channels d..2d).
+                        for r in 0..ratio {
+                            let slot = ratio + r;
+                            let base = row_base(bi, g, r);
+                            for c in 0..d {
+                                slot_val[slot * d + c] = fused[base + d + c];
+                                slot_score[slot * d + c] =
+                                    fused[base + cd + d + c] + ape[r * cd + d + c];
+                            }
+                        }
+                    } else {
+                        // No overlap: `ratio` slots, full cd == d channels.
+                        for r in 0..ratio {
+                            let base = row_base(bi, g, r);
+                            for c in 0..d {
+                                slot_val[r * d + c] = fused[base + c];
+                                slot_score[r * d + c] = fused[base + cd + c] + ape[r * cd + c];
+                            }
+                        }
+                    }
+                    // Softmax-pool per channel over the slot axis.
+                    let mut pooled = vec![0f32; d];
+                    for c in 0..d {
+                        let mut maxs = f32::NEG_INFINITY;
+                        for s in 0..n_slots {
+                            maxs = maxs.max(slot_score[s * d + c]);
+                        }
+                        let mut denom = 0f32;
+                        for s in 0..n_slots {
+                            denom += (slot_score[s * d + c] - maxs).exp();
+                        }
+                        let mut acc = 0f32;
+                        for s in 0..n_slots {
+                            let w = (slot_score[s * d + c] - maxs).exp() / denom;
+                            acc += slot_val[s * d + c] * w;
+                        }
+                        pooled[c] = acc;
+                    }
+                    // RMSNorm over head_dim (norm.weight == 1).
+                    let mut ms = 0f32;
+                    for c in 0..d {
+                        ms += pooled[c] * pooled[c];
+                    }
+                    ms /= d as f32;
+                    let inv = 1.0 / (ms + eps).sqrt();
+                    for c in 0..d {
+                        out[(bi * t_c + g) * d + c] = pooled[c] * inv;
+                    }
+                }
+            }
+            out
+        }
+
+        let device = Device::Cpu;
+        let eps = 1e-6f32;
+
+        // CSA overlap path (ratio=4 → coff=2) and HCA non-overlap (coff=1).
+        for &(ratio, t) in &[(4usize, 8usize), (2usize, 6usize)] {
+            let coff = if ratio == 4 { 2 } else { 1 };
+            let hidden_size = 6;
+            let head_dim = 3;
+            let cd = coff * head_dim;
+            let b = 2;
+            let t_c = t / ratio;
+
+            let cfg = compressor_test_cfg(hidden_size);
+
+            // Deterministic F32 weights via the pre-fused layout (stays F32).
+            let wcount = 2 * cd * hidden_size;
+            let mut wv = Vec::with_capacity(wcount);
+            for i in 0..wcount {
+                wv.push(((i as f32) * 0.021 + ratio as f32).sin() * 0.2);
+            }
+            let w = Tensor::from_vec(wv, (2 * cd, hidden_size), &device)?;
+
+            let a_count = ratio * cd;
+            let mut av = Vec::with_capacity(a_count);
+            for i in 0..a_count {
+                av.push(((i as f32) * 0.037).cos() * 0.1);
+            }
+            let ape = Tensor::from_vec(av.clone(), (ratio, cd), &device)?;
+
+            let mut map: std::collections::HashMap<String, Tensor> =
+                std::collections::HashMap::new();
+            map.insert("wkv_gate.weight".to_string(), w.clone());
+            map.insert(
+                "norm.weight".to_string(),
+                Tensor::ones(head_dim, DType::F32, &device)?,
+            );
+            map.insert("ape".to_string(), ape);
+            let vb = vb_from_map(map, DType::F32, &device);
+            let comp = V4Compressor::new(&cfg, vb, ratio, head_dim, &device)?;
+            assert_eq!(comp.coff, coff);
+
+            // Deterministic varied input so the softmax weights are non-uniform.
+            let xcount = b * t * hidden_size;
+            let mut xv = Vec::with_capacity(xcount);
+            for i in 0..xcount {
+                xv.push(((i as f32) * 0.013).sin() * 0.5 + 0.1);
+            }
+            let xs = Tensor::from_vec(xv, (b, t, hidden_size), &device)?;
+
+            // Production path.
+            let out = comp.forward_from_xs(&xs)?;
+            assert_eq!(out.dims(), &[b, t_c, head_dim]);
+            let prod: Vec<f32> = out.flatten_all()?.to_vec1()?;
+
+            // Independent reference: fused via plain F32 matmul, scalar pooling.
+            let fused_t = xs.reshape((b * t, hidden_size))?.matmul(&w.t()?)?;
+            let fused: Vec<f32> = fused_t.flatten_all()?.to_vec1()?;
+            let reference = scalar_reference(&fused, &av, b, t, ratio, coff, head_dim, eps);
+
+            assert_eq!(prod.len(), reference.len());
+            let mut max_abs = 0f32;
+            let (mut dot, mut np, mut nr) = (0f64, 0f64, 0f64);
+            for (p, r) in prod.iter().zip(reference.iter()) {
+                max_abs = max_abs.max((p - r).abs());
+                dot += (*p as f64) * (*r as f64);
+                np += (*p as f64) * (*p as f64);
+                nr += (*r as f64) * (*r as f64);
+            }
+            let cos = dot / (np.sqrt() * nr.sqrt() + 1e-12);
+            // cos is the strong discriminator (a pre-fix regression — swapped
+            // value/score, sigmoid gate, plain-sum, or missing overlap — drops
+            // it far below 0.9999). max_abs guards magnitude; the ~4e-4 floor is
+            // forward_autocast dtype rounding vs the pure-F32 reference matmul.
+            assert!(
+                max_abs < 2e-3 && cos > 0.9999,
+                "compressor forward diverged from scalar reference \
+                 (ratio={ratio}, coff={coff}): max_abs={max_abs}, cos={cos}"
+            );
+        }
         Ok(())
     }
 
@@ -2761,7 +3918,7 @@ mod tests {
         let cfg = compressor_test_cfg(hidden_size);
         let map = make_compressor_dual_tensors(hidden_size, head_dim, ratio, coff, 11, &device);
         let vb = vb_from_map(map, DType::F32, &device);
-        let real = V4Compressor::new(&cfg, vb, ratio, head_dim)?;
+        let real = V4Compressor::new(&cfg, vb, ratio, head_dim, &device)?;
 
         // Uniform-fallback compressor (the path that was previously used).
         let uniform = V4Compressor::uniform(ratio, head_dim, &device)?;
@@ -2834,7 +3991,7 @@ mod tests {
         // No ape → zeros fallback inside V4Compressor::new.
 
         let vb = vb_from_map(map, DType::F32, &device);
-        let comp = V4Compressor::new(&cfg, vb, ratio, head_dim)?;
+        let comp = V4Compressor::new(&cfg, vb, ratio, head_dim, &device)?;
 
         let b = 1;
         let t = 256;
@@ -2852,7 +4009,7 @@ mod tests {
         let device = Device::Cpu;
         let cfg = compressor_test_cfg(16);
         let vb = vb_from_map(std::collections::HashMap::new(), DType::F32, &device);
-        let res = V4Compressor::new(&cfg, vb, 128, 8);
+        let res = V4Compressor::new(&cfg, vb, 128, 8, &device);
         assert!(
             res.is_err(),
             "V4Compressor::new without wkv_gate/wkv+wgate should Err"
@@ -2927,7 +4084,6 @@ mod tests {
         )?;
         let v = k.clone();
 
-        let compressor = V4Compressor::uniform(4, head_dim, &device)?;
         let sdpa_params = SdpaParams {
             n_kv_groups: 1,
             softcap: None,
@@ -2947,14 +4103,23 @@ mod tests {
             sliding_window: 4,
         };
 
-        // Compress dispatch.
+        // Compressed KV (precomputed by `Attention::compressed_kv` in the real
+        // path): T_c = t_k / ratio = 4 entries, shape [B, 1, T_c, D].
+        let t_c = t_k / 4;
+        let comp = Tensor::from_vec(
+            (0..(n_kv_heads * t_c * head_dim))
+                .map(|i| ((i as f32) * 0.09).sin())
+                .collect::<Vec<f32>>(),
+            (1, n_kv_heads, t_c, head_dim),
+            &device,
+        )?;
         let out = dsv4_attention(
             &q,
             &k,
             &v,
+            Some(&comp),
             None,
             &flash_params,
-            Some(&compressor),
             &sdpa_params,
             cfg,
         )?;
@@ -3030,7 +4195,6 @@ mod tests {
         )?;
         let v = k.clone();
 
-        let compressor = V4Compressor::uniform(128, head_dim, &device)?;
         let sdpa_params = SdpaParams {
             n_kv_groups: 1,
             softcap: None,
@@ -3050,13 +4214,22 @@ mod tests {
             sliding_window: 8,
         };
 
+        // Compressed KV: T_c = t_k / ratio = 1 entry, shape [B, 1, T_c, D].
+        let t_c = t_k / 128;
+        let comp = Tensor::from_vec(
+            (0..(n_kv_heads * t_c * head_dim))
+                .map(|i| ((i as f32) * 0.03).cos())
+                .collect::<Vec<f32>>(),
+            (1, n_kv_heads, t_c, head_dim),
+            &device,
+        )?;
         let out = dsv4_attention(
             &q,
             &k,
             &v,
+            Some(&comp),
             None,
             &flash_params,
-            Some(&compressor),
             &sdpa_params,
             cfg,
         )?;
@@ -3125,16 +4298,17 @@ mod tests {
             sliding_window: 4,
         };
 
-        // Pass `Some(&compressor)` to be paranoid — Standard layers should
-        // never invoke it. Compare bytewise against plain Sdpa.
-        let compressor = V4Compressor::uniform(4, d, &device)?;
+        // Standard layers must bypass the compressed branch entirely: even if a
+        // caller (paranoically) supplied compressed KV, the Standard dispatch
+        // returns plain SDPA before touching it. Pass `None` here — the real
+        // `Attention::compressed_kv` returns `None` for Standard layers anyway.
         let out = dsv4_attention(
             &q,
             &k,
             &v,
             None,
+            None,
             &flash_params,
-            Some(&compressor),
             &sdpa_params,
             cfg,
         )?;

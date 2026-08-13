@@ -284,7 +284,7 @@ impl GptqLayer {
         drop(c_guard);
 
         let storage = CudaStorage {
-            slice: CudaStorageSlice::F16(c),
+            slice: std::mem::ManuallyDrop::new(CudaStorageSlice::F16(c)),
             device: dev.clone(),
         };
         let storage = Storage::Cuda(storage);

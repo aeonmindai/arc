@@ -60,8 +60,15 @@ fn sinks_attn_regular(
     sdpa_params: &SdpaParams,
     window_size: usize,
 ) -> Result<Tensor> {
+    // R1: the CUDA/Metal flash-sinks kernels only support head_dim in
+    // {64,80,96,112,128,192,256}. V4 uses head_dim=512, which falls through
+    // to the unfused matmul + softmax_with_sinks path below (GPU-capable via
+    // SoftmaxWithSinks::cuda_fwd, same math as the old "cpu" fallback).
+    let hd = q.dim(candle_core::D::Minus1)?;
+    let flash_sinks_ok = matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256);
+
     #[cfg(feature = "cuda")]
-    if q.device().is_cuda() {
+    if q.device().is_cuda() && flash_sinks_ok {
         return mistralrs_paged_attn::flash_attn_sinks(
             q,
             k,
@@ -73,7 +80,7 @@ fn sinks_attn_regular(
     }
 
     #[cfg(feature = "metal")]
-    if q.device().is_metal() {
+    if q.device().is_metal() && flash_sinks_ok {
         return mistralrs_quant::flash_attn_sinks_metal(
             q,
             k,
@@ -116,8 +123,12 @@ fn sinks_attn_varlen(
     let cu_seqlens_q = &flash_params.cumulative_seqlens_q[&device.location()];
     let cu_seqlens_k = &flash_params.cumulative_seqlens_k[&device.location()];
 
+    // R1: head_dim guard (see sinks_attn_regular).
+    let hd = q.dim(candle_core::D::Minus1)?;
+    let flash_sinks_ok = matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256);
+
     #[cfg(feature = "cuda")]
-    if device.is_cuda() {
+    if device.is_cuda() && flash_sinks_ok {
         return mistralrs_paged_attn::flash_attn_sinks_varlen(
             q,
             &k_packed,
@@ -131,7 +142,7 @@ fn sinks_attn_varlen(
     }
 
     #[cfg(feature = "metal")]
-    if device.is_metal() {
+    if device.is_metal() && flash_sinks_ok {
         return mistralrs_quant::flash_attn_sinks_varlen_metal(
             q,
             &k_packed,
@@ -171,7 +182,13 @@ fn sinks_attn_cpu(
     let v = repeat_kv(v.clone(), sdpa_params.n_kv_groups)?;
 
     let att = MatMul.matmul_affine_mul(q, &k.t()?, sdpa_params.softmax_scale.into())?;
-    let att = mistralrs_quant::softmax_with_sinks(&att, sinks, mask)?;
+    // R1: `softmax_with_sinks` expects sinks shaped [num_heads] AND matching the
+    // logits dtype. V4 pre-shapes sinks as [1, n_heads, 1, 1] in F32 (for the
+    // flash kernel), so flatten + cast to the logits dtype here. Then cast the
+    // softmax result back to V's dtype before the value matmul.
+    let sinks = sinks.flatten_all()?.to_dtype(att.dtype())?;
+    let att = mistralrs_quant::softmax_with_sinks(&att, &sinks, mask)?;
+    let att = att.to_dtype(v.dtype())?;
     MatMul.matmul(&att, &v)
 }
 

@@ -17,6 +17,8 @@ extern "C" {
         query_stride: c_long,
         key_stride: c_long,
 
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+
         dtype: u32,
     );
 }

@@ -24,6 +24,13 @@ mod cuda {
             candle_core::bail!("apply-rotary expects all tensors to have the same dtype");
         }
 
+        // Launch on candle's stream (not the legacy default stream) so the
+        // kernel is recorded into a CUDA graph captured on that stream. (RUN-161)
+        let dev = match query.device() {
+            candle_core::Device::Cuda(d) => d.clone(),
+            _ => candle_core::bail!("apply-rotary expects a cuda tensor"),
+        };
+
         let internal_type = match dtype {
             DType::F16 => 0,
             DType::BF16 => 1,
@@ -127,6 +134,7 @@ mod cuda {
                 num_kv_heads as c_int,
                 query_stride as c_long,
                 key_stride as c_long,
+                dev.cuda_stream().cu_stream(),
                 internal_type,
             )
         }

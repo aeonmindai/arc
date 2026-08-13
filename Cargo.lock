@@ -235,6 +235,7 @@ dependencies = [
  "candle-nn",
  "mistralrs-core",
  "mistralrs-quant",
+ "rayon",
  "serde",
  "serde_json",
  "tracing",
@@ -679,7 +680,7 @@ checksum = "ade8366b8bd5ba243f0a58f036cc0ca8a2f069cff1a2351ef1cac6b083e16fc0"
 [[package]]
 name = "candle-core"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+source = "git+https://github.com/aeonmindai/candle.git?branch=run-161-cuda-graph-capture#d2d1d0774e536192f12dc5f4c52ce3271ad92c80"
 dependencies = [
  "accelerate-src",
  "byteorder",
@@ -710,7 +711,7 @@ dependencies = [
 [[package]]
 name = "candle-flash-attn"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+source = "git+https://github.com/aeonmindai/candle.git?branch=run-161-cuda-graph-capture#d2d1d0774e536192f12dc5f4c52ce3271ad92c80"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -721,7 +722,7 @@ dependencies = [
 [[package]]
 name = "candle-flash-attn-v3"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+source = "git+https://github.com/aeonmindai/candle.git?branch=run-161-cuda-graph-capture#d2d1d0774e536192f12dc5f4c52ce3271ad92c80"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -734,7 +735,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+source = "git+https://github.com/aeonmindai/candle.git?branch=run-161-cuda-graph-capture#d2d1d0774e536192f12dc5f4c52ce3271ad92c80"
 dependencies = [
  "cudaforge",
 ]
@@ -742,7 +743,7 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+source = "git+https://github.com/aeonmindai/candle.git?branch=run-161-cuda-graph-capture#d2d1d0774e536192f12dc5f4c52ce3271ad92c80"
 dependencies = [
  "half",
  "objc2",
@@ -756,7 +757,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+source = "git+https://github.com/aeonmindai/candle.git?branch=run-161-cuda-graph-capture#d2d1d0774e536192f12dc5f4c52ce3271ad92c80"
 dependencies = [
  "accelerate-src",
  "candle-core",
@@ -775,7 +776,7 @@ dependencies = [
 [[package]]
 name = "candle-ug"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+source = "git+https://github.com/aeonmindai/candle.git?branch=run-161-cuda-graph-capture#d2d1d0774e536192f12dc5f4c52ce3271ad92c80"
 dependencies = [
  "ug",
  "ug-cuda",

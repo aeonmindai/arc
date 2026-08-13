@@ -319,6 +319,173 @@ pub fn fp8_blockwise_dequantize(
     )
 }
 
+// ── MXFP4 (E2M1, packed-as-I8) blockwise dequantization ──────────────────────
+//
+// DeepSeek V4 Flash stores routed-expert MoE weights as MXFP4 (OCP microscaling
+// float4, E2M1) packed into I8, with an F8E8M0 block scale:
+//   - Each I8 byte holds 2 sign-magnitude FP4 values. Per nibble: MSB = sign,
+//     low 3 bits = E2M1 magnitude code -> {0,.5,1,1.5,2,3,4,6}.
+//     Low nibble  = byte & 0x0F ; High nibble = (byte >> 4) & 0x0F.
+//     (These are NOT two's-complement linear INT4 -- see decode note below.)
+//   - Weight shape on disk: [rows, cols/2]  (half the logical column count)
+//   - Scale shape: [rows/block_size[0], cols/block_size[1]]  (cols = unpacked count)
+//   - Scales are F32 (after F8E8M0 → F32 decode at load time).
+//
+// Output: BF16 (or F16/F32) tensor of shape [rows, cols].
+
+struct MxInt4BlockwiseDequantize {
+    weight_block_size: Vec<usize>,
+    out_ty: DType,
+}
+
+impl MxInt4BlockwiseDequantize {
+    /// Dequantize INT4-packed-as-I32 weights with F32 block scales.
+    ///
+    /// `packed` contains i32 values, each being a sign-extended i8 byte that
+    /// holds two INT4 values (low nibble and high nibble).
+    fn dispatch_dequant_blockwise<T: WithDType>(
+        &self,
+        packed: &[i32],
+        scale: &[f32],
+        packed_l: &candle_core::Layout,
+        scale_l: &candle_core::Layout,
+    ) -> candle_core::Result<Vec<T>> {
+        let rows = packed_l.dim(0)?;
+        let packed_cols = packed_l.dim(1)?;
+        let cols = packed_cols * 2; // unpacked column count
+
+        let block_h = self.weight_block_size[0];
+        let block_w = self.weight_block_size[1];
+        let grid_y = rows.div_ceil(block_h);
+        let grid_x = cols.div_ceil(block_w);
+
+        let res = vec![T::zero(); rows * cols];
+
+        (0..grid_y).into_par_iter().for_each(|by| {
+            (0..grid_x).into_par_iter().for_each(|bx| {
+                let res_ptr = res.as_ptr() as *mut T;
+                let s = scale[by * scale_l.stride()[0] + bx];
+
+                let start_y = by * block_h;
+                let end_y = (start_y + block_h).min(rows);
+                let start_x = bx * block_w;
+                let end_x = (start_x + block_w).min(cols);
+
+                for y in start_y..end_y {
+                    for x in start_x..end_x {
+                        // Each packed i32 at [y, x/2] is a sign-extended i8 byte
+                        // holding two INT4 values.
+                        let byte_col = x / 2;
+                        let byte = packed[y * packed_l.stride()[0] + byte_col] as i8;
+
+                        // MXFP4 (E2M1) sign-magnitude decode. The 4-bit element
+                        // is float4 E2M1: MSB = sign, low 3 bits = E2M1 magnitude
+                        // code mapping to {0,.5,1,1.5,2,3,4,6}. It is NOT
+                        // two's-complement linear INT4 -- decoding it as such
+                        // injects a per-code DC bias (signed-nibble mean ~-1.05 ->
+                        // weight mean ~-0.015 -> row-sum ~-61), which amplifies the
+                        // expert input's DC offset into an all-positive gate/up
+                        // shift that explodes the MoE at the first compressed layer
+                        // (RUN-161). The on-disk histogram is periodic with period
+                        // 8 (count(n) ~= count(n+8)) -- the sign-magnitude
+                        // signature -- and the magnitude counts are non-monotonic,
+                        // matching E2M1's non-uniform levels.
+                        const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+                        let ub = byte as u8;
+                        let nib: u8 = if x % 2 == 0 { ub & 0x0F } else { ub >> 4 };
+                        let sign = if nib & 0x08 != 0 { -1.0f32 } else { 1.0f32 };
+                        let dequant_val = sign * E2M1[(nib & 0x07) as usize] * s;
+
+                        // SAFETY: each thread writes to independent output positions
+                        unsafe {
+                            *res_ptr.wrapping_add(y * cols + x) =
+                                T::from_f64(dequant_val as f64);
+                        }
+                    }
+                }
+            });
+        });
+
+        Ok(res)
+    }
+}
+
+impl CustomOp2 for MxInt4BlockwiseDequantize {
+    fn name(&self) -> &'static str {
+        "mx-int4-blockwise-dequantize"
+    }
+
+    fn cpu_fwd(
+        &self,
+        scale_s: &candle_core::CpuStorage,
+        scale_l: &candle_core::Layout,
+        packed_s: &candle_core::CpuStorage,
+        packed_l: &candle_core::Layout,
+    ) -> candle_core::Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        let CpuStorage::I32(packed) = packed_s else {
+            candle_core::bail!("MX INT4 dequant expects I32 (sign-extended I8) packed weights, got {:?}", packed_s);
+        };
+        let CpuStorage::F32(scale) = scale_s else {
+            candle_core::bail!("MX INT4 dequant expects F32 scales, got {:?}", scale_s);
+        };
+        if packed_l.start_offset() != 0 || !packed_l.is_contiguous() {
+            candle_core::bail!("Expected packed weights to have start offset 0, contiguous");
+        }
+        if scale_l.start_offset() != 0 || !scale_l.is_contiguous() {
+            candle_core::bail!("Expected scales to have start offset 0, contiguous");
+        }
+        if packed_l.dims().len() != 2 {
+            candle_core::bail!("Expected packed weights to be rank 2");
+        }
+        if scale_l.dims().len() != 2 || self.weight_block_size.len() != 2 {
+            candle_core::bail!("Expected scales to be rank 2 and weight_block_size len 2");
+        }
+
+        let rows = packed_l.dim(0)?;
+        let cols = packed_l.dim(1)? * 2;
+        let out_shape = candle_core::Shape::from_dims(&[rows, cols]);
+
+        match self.out_ty {
+            DType::F32 => Ok((
+                CpuStorage::F32(self.dispatch_dequant_blockwise(packed, scale, packed_l, scale_l)?),
+                out_shape,
+            )),
+            DType::BF16 => Ok((
+                CpuStorage::BF16(self.dispatch_dequant_blockwise(packed, scale, packed_l, scale_l)?),
+                out_shape,
+            )),
+            DType::F16 => Ok((
+                CpuStorage::F16(self.dispatch_dequant_blockwise(packed, scale, packed_l, scale_l)?),
+                out_shape,
+            )),
+            other => candle_core::bail!("unexpected out type for MX INT4 dequant: {other:?}"),
+        }
+    }
+}
+
+/// MX INT4 blockwise dequantize.
+/// - `packed`: I32 tensor of shape [rows, cols/2]. Each i32 is a sign-extended i8 byte
+///   containing 2 signed INT4 values (low nibble + high nibble). This is how candle
+///   loads I8 safetensor data (I8 → I32 cast in `convert()`).
+/// - `scales`: F32 tensor of shape [rows/block_h, cols/block_w] (block scales, decoded from F8E8M0)
+/// - `weight_block_size`: [block_h, block_w] (typically [128, 128])
+/// - `out_ty`: output dtype (BF16, F16, or F32)
+/// - Returns: tensor of shape [rows, cols] with dequantized values
+pub fn mx_int4_blockwise_dequantize(
+    packed: &Tensor,
+    scales: &Tensor,
+    weight_block_size: Vec<usize>,
+    out_ty: DType,
+) -> Result<Tensor> {
+    scales.apply_op2_no_bwd(
+        packed,
+        &MxInt4BlockwiseDequantize {
+            weight_block_size,
+            out_ty,
+        },
+    )
+}
+
 #[allow(dead_code)]
 struct Fp8BlockwiseQuantize {
     weight_block_size: Vec<usize>,

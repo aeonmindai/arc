@@ -80,6 +80,28 @@ impl KvCache {
         }
     }
 
+    /// CUDA-graph-capturable KV append (RUN-161 2c). Writes the new K/V at the
+    /// device-held `position` slot and returns fixed `[B,H,read_capacity,D]`
+    /// windows (constant shape across decode steps). Normal (SingleCache) only.
+    pub fn append_graph(
+        &mut self,
+        k: &Tensor,
+        v: &Tensor,
+        position: &Tensor,
+        read_capacity: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
+        match self {
+            Self::Normal { k: kc, v: vc } => {
+                let out_k = kc.append_graph(&k, position, read_capacity)?;
+                let out_v = vc.append_graph(&v, position, read_capacity)?;
+                Ok((out_k, out_v))
+            }
+            _ => candle_core::bail!("append_graph: only the Normal KV cache supports graph capture"),
+        }
+    }
+
     pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
         let k = k.contiguous()?;
         let v = v.contiguous()?;

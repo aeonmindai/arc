@@ -392,8 +392,16 @@ impl Loader for NormalLoader {
                         let ser_artifacts = unsafe {
                             candle_core::safetensors::MmapedSafetensors::multi(serialized)?
                         };
-                        let mut total_pack_factors = 0;
-                        let total_tensors = ser_artifacts.tensors().len();
+                        // Size-weighted average pack factor. A plain count
+                        // average is dragged toward 1 by the many tiny
+                        // unquantized tensors (norms, router, mHC params,
+                        // pack_factor=1), which over-sizes an expert-dominated
+                        // model (e.g. V4 Flash) ~1.6x and spuriously offloads
+                        // layers to CPU. Weight each tensor's pack_factor by its
+                        // quantized byte size so the large QTIP tensors dominate.
+                        // (RUN-161)
+                        let mut weighted_pack = 0usize;
+                        let mut total_len = 0usize;
                         for (_, artifact) in ser_artifacts.tensors() {
                             let artifact = artifact.data();
                             // NOTE(EricLBuehler): isq type is ALWAYS byte 4 (5th) of the tensor.
@@ -418,11 +426,14 @@ impl Loader for NormalLoader {
                                 QuantizedSerdeType::Mxfp4 => IsqType::MXFP4.pack_factor(dtype),
                                 QuantizedSerdeType::Nvfp4 => IsqType::NVFP4.pack_factor(dtype),
                                 QuantizedSerdeType::Qtip => IsqType::QtipBitshift2.pack_factor(dtype),
+                                QuantizedSerdeType::TdMoeTucker => 1,
                             };
-                            total_pack_factors += pack_factor;
+                            let len = artifact.len();
+                            weighted_pack += len * pack_factor;
+                            total_len += len;
                         }
 
-                        total_pack_factors / total_tensors
+                        (weighted_pack / total_len.max(1)).max(1)
                     };
 
                     let layer_sizes_in_bytes = self.inner.layer_sizes_in_bytes(
@@ -603,6 +614,12 @@ impl Loader for NormalLoader {
         loading_isq |= topology_requires_post_quant;
         loading_isq |= self.config.from_uqff.is_some();
 
+        // RUN-161: signal UQFF loading to the per-expert MoE constructor so it
+        // builds DummyLayer placeholders (filled by the UQFF deserializer)
+        // instead of re-dequantizing+re-quantizing the base experts. Set every
+        // load (self-resetting) on the construction thread.
+        mistralrs_quant::set_loading_from_uqff(self.config.from_uqff.is_some());
+
         if self.config.imatrix.is_some() && self.config.calibration_file.is_some() {
             anyhow::bail!(
                 "`imatrix` and `calibration_file` were both specified, this is not allowed."
@@ -621,6 +638,15 @@ impl Loader for NormalLoader {
             } else {
                 device.clone()
             }
+        } else if self.config.from_uqff.is_some() {
+            // RUN-161: from-UQFF loads the ISQ layers (experts/attention) via
+            // deserialize directly onto their mapped (GPU) device, and the base
+            // expert weights are NOT loaded as BF16 (DummyLayer placeholders), so
+            // there is no OOM risk. Load to the primary device so non-ISQ weights
+            // (embeddings, norms, lm_head, compressor) land on GPU instead of
+            // being stranded on CPU -> "Expected CUDA storage" at forward time.
+            // Per-layer mapper.set_device still overrides for any CPU-mapped layer.
+            device.clone()
         } else {
             Device::Cpu
         };
@@ -891,6 +917,13 @@ impl Loader for NormalLoader {
         let should_serialize = self.config.write_uqff.is_some();
         let should_quantize_pass = loading_isq;
 
+        // When a post-load hook (e.g. TD-MoE Tucker factorization) will modify
+        // the quantized layers, defer the UQFF write until *after* the hook so
+        // the written file reflects the final (factored) model rather than the
+        // intermediate QTIP one. (RUN-161)
+        let defer_uqff_for_hooks = self.config.write_uqff.is_some()
+            && crate::pipeline::post_load_hooks::has_registered_hooks();
+
         if (should_quantize_pass || should_serialize) && self.config.from_uqff.is_none() {
             let imatrix_source = if should_quantize_pass {
                 match (
@@ -922,7 +955,11 @@ impl Loader for NormalLoader {
                 imatrix_source,
                 self.config.organization,
                 should_quantize_pass,
-                self.config.write_uqff.as_ref(),
+                if defer_uqff_for_hooks {
+                    None
+                } else {
+                    self.config.write_uqff.as_ref()
+                },
                 UqffFullSer {
                     tokenizer: &tokenizer,
                     template_filename: paths.get_template_filename(),
@@ -948,6 +985,42 @@ impl Loader for NormalLoader {
         // Hooks are no-ops when nothing has been registered.
         crate::pipeline::post_load_hooks::run_post_load_hooks(&mut *model)
             .map_err(|e| candle_core::Error::Msg(format!("post-load hook failed: {e}")))?;
+
+        // Deferred UQFF write: the post-load hook (TD-MoE) has now replaced the
+        // expert layers with their factored form, so serialize the final model.
+        // Serialize-only pass — no further quantization. (RUN-161)
+        if defer_uqff_for_hooks {
+            info!("Serializing post-hook (TD-MoE) model to UQFF.");
+            let multi_progress = Arc::new(new_multi_progress());
+            model.quantize(
+                None,
+                model.device().clone(),
+                self.config.topology.as_ref(),
+                silent,
+                None,
+                self.config.organization,
+                false,
+                self.config.write_uqff.as_ref(),
+                UqffFullSer {
+                    tokenizer: &tokenizer,
+                    template_filename: paths.get_template_filename(),
+                    generation_config: paths.get_gen_conf_filename(),
+                    config: config.clone(),
+                    processor_filename: &None,
+                    preprocessor_filename: &None,
+                    modules: None,
+                    module_paths: None,
+                },
+                multi_progress,
+            )?;
+        }
+
+        // After ISQ, the CUDA driver's default memory pool may be holding large
+        // amounts of freed memory (e.g. temporary BF16 tensors from INT4 dequant →
+        // QTIP quantize). Trim the pool so that `cuMemGetInfo` reports accurate
+        // free VRAM for the PagedAttention KV-cache budget below.
+        #[cfg(feature = "cuda")]
+        crate::trim_cuda_memory_pools();
 
         let paged_attn_config = if matches!(
             self.kind,
@@ -1034,8 +1107,17 @@ impl Loader for NormalLoader {
         let _graph_device = model.device().clone();
 
         // Extract weight pointers for the dedicated decode path (model-agnostic).
+        // This copies/extracts decode weights into separate buffers; for very
+        // large models that barely fit VRAM (e.g. V4 236B @ qtip2 ~66GB on an
+        // 80GB H100) the extraction OOMs and its failed allocations get cached
+        // by the CUDA allocator, fragmenting VRAM and hanging the first forward.
+        // It's a decode *speed* optimization only — gate it off via
+        // ARC_NO_DEDICATED_DECODE=1 to reclaim that headroom. Default unchanged.
         #[cfg(feature = "cuda")]
-        let _decode_weights = {
+        let _decode_weights = if std::env::var_os("ARC_NO_DEDICATED_DECODE").is_some() {
+            tracing::info!("Dedicated decode path extraction skipped (ARC_NO_DEDICATED_DECODE set).");
+            None
+        } else {
             let cfg = model.config().clone();
             // Get residuals first (immutable borrow), then get_layers (mutable borrow)
             let residuals = model.residual_tensors();
@@ -1312,14 +1394,201 @@ impl Pipeline for NormalPipeline {
                     .as_ref()
                     .map(|meta| (meta.0.get_kv_cache().clone(), meta.1.clone()));
 
-                self.model.forward(
-                    &input_ids,
-                    &seqlen_offsets,
-                    context_lens,
-                    position_ids,
-                    paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
-                    &flash_meta,
-                )?
+                // RUN-161 Step 2a: CUDA-graph capture probe for V4 decode.
+                // Gated by ARC_V4_CAPTURE_PROBE. Validates the premise that the
+                // whole V4 candle forward can be RECORDED into a CUDA graph on
+                // candle's stream (i.e. the stream is capturable and the forward
+                // is sync-free with ARC_GPU_ACT_QUANT=1 + on-device MoE).
+                //
+                // Capture records (does not execute); end_capture_and_cache
+                // instantiates + launches once -> a single correct forward, so
+                // the captured output is used as this step's logits. REPLAY
+                // output correctness needs static input buffers (2b) + a
+                // device-indexed KV write/read (2c); until then we only time a
+                // replay and discard it, using eager for the real logits.
+                #[cfg(feature = "cuda")]
+                {
+                    let probe = std::env::var_os("ARC_V4_CAPTURE_PROBE").is_some();
+                    let (bs, seq_len) = input_ids.dims2().unwrap_or((0, 0));
+                    // Enable the candle caching allocator for graph-capture
+                    // safety (RUN-161). Idempotent; gated so it's off during
+                    // model load and only active for decode. Warmup decode
+                    // forwards populate the cache before capture.
+                    if probe && seq_len == 1 && std::env::var_os("ARC_CANDLE_ALLOC_CACHE").is_some()
+                    {
+                        if let candle_core::Device::Cuda(cd) = self.device() {
+                            cd.set_alloc_cache_enabled(true);
+                        }
+                        // Set the graph-mode device position: drives RoPE +
+                        // the fixed-capacity KV write slot, and makes warmup
+                        // forwards take the shape-constant path so the cache
+                        // populates with capture-shape buffers. Fresh tensor
+                        // per step (eager, before capture) is fine for the
+                        // single-launch capture; replay needs a static buffer.
+                        let pos = seqlen_offsets.first().copied().unwrap_or(0) as u32;
+                        let nb = bs.max(1);
+                        let dev_for_pos = self.device();
+                        if let Ok(pt) = Tensor::from_vec(vec![pos; nb], (nb,), &dev_for_pos)
+                        {
+                            crate::layers::set_graph_mode_positions(Some(pt));
+                        }
+                    }
+                    let captured: Option<Tensor> =
+                        if probe && seq_len == 1 && self.cuda_graph_runner.is_some() {
+                            // Own the runner locally so `self.model.forward` is
+                            // free of the runner's borrow; restore before return.
+                            let mut runner = self.cuda_graph_runner.take().unwrap();
+                            let result = if runner.tick_warmup() {
+                                None
+                            } else if runner.is_enabled()
+                                && !runner.has_graph(bs)
+                                && runner.try_take_deferred_pass()
+                            {
+                                // RUN-161 deferred-free pass (generic): one eager
+                                // forward with the caching allocator in capture
+                                // mode so the free pool grows to the FULL
+                                // per-forward alloc count (eager warmups only
+                                // reach peak-live; capture needs every alloc
+                                // distinct). Output is this step's logits (eager).
+                                if let candle_core::Device::Cuda(cd) = self.device() {
+                                    cd.set_capture_mode(true);
+                                }
+                                let t_eager = std::time::Instant::now();
+                                let out = self.model.forward(
+                                    &input_ids,
+                                    &seqlen_offsets,
+                                    context_lens.clone(),
+                                    position_ids.clone(),
+                                    paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
+                                    &flash_meta,
+                                );
+                                let _ = self.device().synchronize();
+                                tracing::info!(
+                                    "ARC capture: EAGER forward (sync'd) = {:?}",
+                                    t_eager.elapsed()
+                                );
+                                if let candle_core::Device::Cuda(cd) = self.device() {
+                                    cd.set_capture_mode(false);
+                                }
+                                match out {
+                                    Ok(o) => {
+                                        tracing::info!(
+                                            "ARC capture: deferred-free warmup pass done (cache grown to full per-forward count)"
+                                        );
+                                        Some(o)
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "ARC capture: deferred pass forward errored: {e}; eager"
+                                        );
+                                        None
+                                    }
+                                }
+                            } else if runner.is_enabled() && !runner.has_graph(bs) {
+                                // CAPTURE: frees are deferred so every allocation
+                                // is a stable cache hit (no within-capture
+                                // aliasing, no unstable graph memory nodes).
+                                if let candle_core::Device::Cuda(cd) = self.device() {
+                                    cd.set_capture_mode(true);
+                                }
+                                let cl = context_lens.clone();
+                                let pid = position_ids.clone();
+                                let cap_result = match runner.begin_capture(bs) {
+                                    Ok((gp, op)) => {
+                                        match self.model.forward(
+                                            &input_ids,
+                                            &seqlen_offsets,
+                                            cl,
+                                            pid,
+                                            paged_attn_meta
+                                                .as_ref()
+                                                .map(|(a, b)| (a.clone(), b)),
+                                            &flash_meta,
+                                        ) {
+                                            Ok(output) => {
+                                                tracing::info!(
+                                                    "ARC capture: V4 forward RECORDED (bs={bs}); instantiating + launching"
+                                                );
+                                                match runner
+                                                    .end_capture_and_cache(bs, output, gp, op)
+                                                {
+                                                    Ok(out) => {
+                                                        tracing::info!(
+                                                            "ARC capture: graph CAPTURED + launched OK"
+                                                        );
+                                                        Some(out)
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            "ARC capture: instantiate/launch failed: {e}; eager"
+                                                        );
+                                                        None
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                runner.cancel_capture(gp, op);
+                                                tracing::warn!(
+                                                    "ARC capture: forward errored DURING capture (likely a host sync): {e}; eager"
+                                                );
+                                                None
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "ARC capture: begin_capture failed: {e}; eager"
+                                        );
+                                        None
+                                    }
+                                };
+                                if let candle_core::Device::Cuda(cd) = self.device() {
+                                    cd.set_capture_mode(false);
+                                }
+                                cap_result
+                            } else if runner.has_graph(bs) {
+                                let t = std::time::Instant::now();
+                                match runner.replay(bs) {
+                                    Ok(_) => tracing::info!(
+                                        "ARC capture: REPLAY latency = {:?} (output discarded; correctness pending 2b/2c)",
+                                        t.elapsed()
+                                    ),
+                                    Err(e) => {
+                                        tracing::warn!("ARC capture: replay failed: {e}")
+                                    }
+                                }
+                                None
+                            } else {
+                                None
+                            };
+                            self.cuda_graph_runner = Some(runner);
+                            result
+                        } else {
+                            None
+                        };
+                    match captured {
+                        Some(o) => o,
+                        None => self.model.forward(
+                            &input_ids,
+                            &seqlen_offsets,
+                            context_lens,
+                            position_ids,
+                            paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
+                            &flash_meta,
+                        )?,
+                    }
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    self.model.forward(
+                        &input_ids,
+                        &seqlen_offsets,
+                        context_lens,
+                        position_ids,
+                        paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
+                        &flash_meta,
+                    )?
+                }
             }
             true => self.model.xlora_forward(
                 &input_ids,

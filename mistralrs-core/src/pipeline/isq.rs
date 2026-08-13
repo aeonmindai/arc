@@ -57,7 +57,8 @@ use itertools::Itertools;
 use mistralrs_quant::{
     AfqLayer, CollectedImatrixData, ColumnParallelLayer, DistributedKind, F8Q8Linear, FP8Linear,
     GgufMatMul, HqqLayer, IsqBits, IsqType, MXFP4Layer, NVFP4Layer, QtipLayer, QuantMethod, QuantizeOntoGuard,
-    QuantizedSerde, QuantizedSerdeType, ReplicatedLayer, RowParallelLayer, UnquantLinear,
+    QuantizedSerde, QuantizedSerdeType, ReplicatedLayer, RowParallelLayer, TuckerFactoredLayer,
+    UnquantLinear,
 };
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use regex::Regex;
@@ -217,11 +218,20 @@ pub fn expand_uqff_shards(first_file: &str, available_files: &[String]) -> Vec<S
     let Some((prefix, _)) = parse_uqff_shard(first_file) else {
         return vec![first_file.to_string()];
     };
+    // `prefix` is the bare file stem (no directory). The input may be a LOCAL
+    // path whose shards are not in the HF repo listing, so probe the input's
+    // own directory on disk too, and return the full local path so the file
+    // loader picks the on-disk shard. (RUN-161)
+    let dir = std::path::Path::new(first_file).parent();
     let mut shards = Vec::new();
     for index in 0u64.. {
-        let candidate = format!("{prefix}-{index}.uqff");
-        if available_files.iter().any(|f| f == &candidate) {
-            shards.push(candidate);
+        let name = format!("{prefix}-{index}.uqff");
+        let local_path = dir.map(|d| d.join(&name));
+        let on_disk = local_path.as_ref().is_some_and(|p| p.exists());
+        if on_disk {
+            shards.push(local_path.unwrap().display().to_string());
+        } else if available_files.iter().any(|f| f == &name) {
+            shards.push(name);
         } else {
             break;
         }
@@ -1008,9 +1018,19 @@ pub trait IsqModel {
             })
             .collect::<HashMap<_, _>>();
 
-        if artifact_isqs.len() != total_tensors {
+        // Artifacts only exist for `isq_serde_supported()` layers. Non-serde
+        // layers (norms, BF16 compressor, etc.) keep their constructed values
+        // and have no artifact, so the file legitimately holds FEWER artifacts
+        // than the total ISQ-layer count. The deserialize loop below fills each
+        // layer by its original index and skips indices that have no artifact,
+        // so a subset is fine. Only bail on a true mismatch: more artifacts than
+        // layers, or an artifact index out of range. (RUN-161)
+        let max_artifact_idx = artifact_isqs.keys().copied().max();
+        if artifact_isqs.len() > total_tensors
+            || max_artifact_idx.is_some_and(|m| m >= total_tensors)
+        {
             candle_core::bail!(
-                "Number of artifacts ({}) does not match the number of ISQ layers ({total_tensors})",
+                "Number of artifacts ({}) is incompatible with the number of ISQ layers ({total_tensors})",
                 artifact_isqs.len(),
             );
         }
@@ -1116,6 +1136,14 @@ pub trait IsqModel {
                                         &comm,
                                         guard.clone(),
                                     )?,
+                                    QuantizedSerdeType::TdMoeTucker => {
+                                        TuckerFactoredLayer::deserialize(
+                                            Cow::from(artifact),
+                                            &devices[i],
+                                            &comm,
+                                            guard.clone(),
+                                        )?
+                                    }
                                 }
                             }
                         };
@@ -1213,6 +1241,14 @@ pub trait IsqModel {
                                         &comm,
                                         guard.clone(),
                                     )?,
+                                    QuantizedSerdeType::TdMoeTucker => {
+                                        TuckerFactoredLayer::deserialize(
+                                            Cow::from(artifact),
+                                            &devices[i],
+                                            &comm,
+                                            guard.clone(),
+                                        )?
+                                    }
                                 }
                             }
                         };

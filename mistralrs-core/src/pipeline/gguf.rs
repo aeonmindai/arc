@@ -502,6 +502,10 @@ impl Loader for GGUFLoader {
             _ => unreachable!(),
         };
 
+        // Trim CUDA memory pools so `cuMemGetInfo` reflects actual free VRAM.
+        #[cfg(feature = "cuda")]
+        crate::trim_cuda_memory_pools();
+
         let (cache_config, cache_engine) = if let Some(paged_attn_config) = paged_attn_config {
             let model_config: &dyn ModelConfigLike = &model_config_metadata;
             let cache_config = calculate_cache_config(

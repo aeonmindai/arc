@@ -23,30 +23,71 @@ pub fn apply_immediate_isq(
     if let Some(ImmediateIsqMatch { ty, device }) = crate::resolve_immediate_isq(&params, &prefix) {
         let device = device.unwrap_or_else(|| vb.device().clone());
 
-        if let Some(pool) = &params.pool {
+        // ARC_SYNC_ISQ forces inline (synchronous) quantization on the main
+        // thread instead of the lazy PendingIsqLayer/thread-pool path. The
+        // async path defers heavy quant (e.g. qtip2 stacked MoE experts) to
+        // the first forward touch; under memory pressure that OOMs, or the
+        // task errors on a pool thread that lacks the CUDA context and the
+        // layer is left stuck in the `Taken` state ("invalid transitional
+        // state"). Synchronous quant completes - and surfaces errors -
+        // deterministically at load, with bounded peak memory.
+        let force_sync = std::env::var_os("ARC_SYNC_ISQ").is_some();
+        if let Some(pool) = params.pool.as_ref().filter(|_| !force_sync) {
             // Parallel path: spawn quantization on thread pool
             let guard = params.guard.clone();
             let (tx, rx) = pending_layer::pending_isq_channel();
+            let prefix_dbg = prefix.clone();
             pool.spawn(move || {
                 let result =
                     layer
                         .clone()
                         .apply_isq(Some(ty), device, &AtomicUsize::new(0), None, guard);
+                if let Err(e) = &result {
+                    tracing::error!("immediate ISQ failed for {prefix_dbg}: {e}");
+                }
                 let _ = tx.send(result);
             });
             Ok(Arc::new(PendingIsqLayer::new(rx)))
         } else {
-            // Synchronous path (integrated GPU / Metal / single-thread)
-            layer.clone().apply_isq(
+            // Synchronous path (integrated GPU / Metal / single-thread / ARC_SYNC_ISQ)
+            let out = layer.clone().apply_isq(
                 Some(ty),
                 device,
                 &AtomicUsize::new(0),
                 None,
                 params.guard.clone(),
-            )
+            );
+            trim_cuda_pools_after_isq();
+            out
         }
     } else {
         Ok(layer)
+    }
+}
+
+/// Return freed CUDA pool memory to the OS between synchronous ISQ steps so
+/// that per-layer dequant transients (e.g. INT4 -> BF16 stacked MoE experts)
+/// do not accumulate in the driver's async mem pool and OOM the device near
+/// the final layers. Mirrors `mistralrs_core::trim_cuda_memory_pools`, but
+/// runs *during* ISQ rather than only after. Gated on `ARC_SYNC_ISQ` so the
+/// default async path's behavior is unchanged.
+pub(crate) fn trim_cuda_pools_after_isq() {
+    #[cfg(feature = "cuda")]
+    {
+        use candle_core::cuda::cudarc::driver::sys;
+        let mut count: std::ffi::c_int = 0;
+        let rc = unsafe { sys::cuDeviceGetCount(&mut count) };
+        if rc != sys::CUresult::CUDA_SUCCESS || count <= 0 {
+            return;
+        }
+        for ordinal in 0..count {
+            let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+            let rc = unsafe { sys::cuDeviceGetDefaultMemPool(&mut pool, ordinal) };
+            if rc != sys::CUresult::CUDA_SUCCESS || pool.is_null() {
+                continue;
+            }
+            unsafe { sys::cuMemPoolTrimTo(pool, 0) };
+        }
     }
 }
 
@@ -61,7 +102,9 @@ pub(crate) fn apply_immediate_isq_always(
         ..
     }) = get_immediate_isq()
     {
-        if let Some(pool) = &pool {
+        // See `apply_immediate_isq`: ARC_SYNC_ISQ forces inline quantization.
+        let force_sync = std::env::var_os("ARC_SYNC_ISQ").is_some();
+        if let Some(pool) = pool.as_ref().filter(|_| !force_sync) {
             let device = device.clone();
             let (tx, rx) = pending_layer::pending_isq_channel();
             pool.spawn(move || {
@@ -72,17 +115,22 @@ pub(crate) fn apply_immediate_isq_always(
                     None,
                     guard,
                 );
+                if let Err(e) = &result {
+                    tracing::error!("immediate ISQ (always) failed: {e}");
+                }
                 let _ = tx.send(result);
             });
             Ok(Arc::new(PendingIsqLayer::new(rx)))
         } else {
-            layer.clone().apply_isq(
+            let out = layer.clone().apply_isq(
                 Some(immediate_isq),
                 device.clone(),
                 &AtomicUsize::new(0),
                 None,
                 guard,
-            )
+            );
+            trim_cuda_pools_after_isq();
+            out
         }
     } else {
         Ok(layer)

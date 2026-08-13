@@ -1643,6 +1643,73 @@ impl DeepSeekV2RotaryEmbedding {
             Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
         }
     }
+
+    /// Apply the INVERSE rotation (conjugate: cos, -sin) to the last `rope_dim`
+    /// dims of `x`, shaped `[B, H, T, head_dim]`. Used to de-rotate the V4 MLA
+    /// attention output, whose value dims carry the key's RoPE (reference
+    /// inference/model.py:534 `apply_rotary_emb(o[..., -rd:], freqs_cis, True)`).
+    /// RUN-161.
+    pub fn forward_inverse_tail(
+        &self,
+        x: &Tensor,
+        rope_dim: usize,
+        seqlen_offsets: &[usize],
+    ) -> Result<Tensor> {
+        let (_b, _h, seq_len, head_dim) = x.dims4()?;
+        let nope = head_dim - rope_dim;
+        let x_nope = x.narrow(3, 0, nope)?;
+        let rotated = if seqlen_offsets.len() == 1 {
+            let cos = self.cos.narrow(0, seqlen_offsets[0], seq_len)?;
+            let sin = self.sin.narrow(0, seqlen_offsets[0], seq_len)?.neg()?;
+            let x_pe = x.narrow(3, nope, rope_dim)?.contiguous()?;
+            candle_nn::rotary_emb::rope_i(&x_pe, &cos, &sin)?
+        } else {
+            let mut outs = Vec::new();
+            for (i, offset) in seqlen_offsets.iter().enumerate() {
+                let cos = self.cos.narrow(0, *offset, seq_len)?;
+                let sin = self.sin.narrow(0, *offset, seq_len)?.neg()?;
+                let x_pe = x
+                    .i(i)?
+                    .unsqueeze(0)?
+                    .narrow(3, nope, rope_dim)?
+                    .contiguous()?;
+                outs.push(candle_nn::rotary_emb::rope_i(&x_pe, &cos, &sin)?);
+            }
+            Tensor::cat(&outs, 0)?
+        };
+        Tensor::cat(&[&x_nope, &rotated], 3)?.contiguous()
+    }
+
+    /// Apply RoPE (adjacent-pair / `rope_i`) to the last `rope_dim` dims of `x`
+    /// at the given absolute `positions`, rather than a contiguous range.
+    ///
+    /// `x`: `[B, H, T, head_dim]`; `positions`: `[T]` (`u32`), one absolute
+    /// position per time step. Only the last `rope_dim` dims are rotated; the
+    /// leading `head_dim - rope_dim` (NoPE) dims are returned unchanged.
+    ///
+    /// Used by the V4 compressor: a compressed entry `j` sits at the strided
+    /// absolute position `j * ratio`, so the standard contiguous `forward` /
+    /// `forward_inverse_tail` (which `narrow`s a window of the cos/sin table)
+    /// cannot express it. Reference `inference/model.py` Compressor.forward:
+    /// `apply_rotary_emb(kv[..., -rd:], self.freqs_cis[:cutoff:ratio])`.
+    pub fn forward_at_positions(
+        &self,
+        x: &Tensor,
+        rope_dim: usize,
+        positions: &Tensor,
+    ) -> Result<Tensor> {
+        let (_b, _h, seq_len, head_dim) = x.dims4()?;
+        debug_assert_eq!(positions.dim(0)?, seq_len);
+        let nope = head_dim - rope_dim;
+        let x_nope = x.narrow(D::Minus1, 0, nope)?;
+        let x_pe = x.narrow(D::Minus1, nope, rope_dim)?.contiguous()?;
+        // Gather the cos/sin rows for the requested positions: [T, rope_dim/2].
+        let positions = positions.to_dtype(DType::U32)?;
+        let cos = self.cos.index_select(&positions, 0)?;
+        let sin = self.sin.index_select(&positions, 0)?;
+        let rotated = candle_nn::rotary_emb::rope_i(&x_pe, &cos, &sin)?;
+        Tensor::cat(&[&x_nope, &rotated], D::Minus1)?.contiguous()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2203,10 +2270,54 @@ pub fn set_graph_mode_positions(positions: Option<Tensor>) {
     GRAPH_MODE_POSITIONS.with(|p| *p.borrow_mut() = positions);
 }
 
+/// Thread-local additive length mask for graph-mode fixed-capacity attention:
+/// `[*, sliding_window]`, 0 for valid (<= current position) slots and a large
+/// negative for the unwritten tail. Device-computed from the position so it's
+/// replay-safe. Unset -> the fixed-capacity attention runs without masking
+/// (finite but not yet correct; used to validate capture-launch). (RUN-161)
+#[cfg(feature = "cuda")]
+std::thread_local! {
+    static GRAPH_MODE_MASK: std::cell::RefCell<Option<Tensor>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "cuda")]
+pub fn set_graph_mode_mask(mask: Option<Tensor>) {
+    GRAPH_MODE_MASK.with(|m| *m.borrow_mut() = mask);
+}
+
+#[cfg(feature = "cuda")]
+pub fn graph_mode_mask() -> Option<Tensor> {
+    GRAPH_MODE_MASK.with(|m| m.borrow().clone())
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn set_graph_mode_mask(_mask: Option<Tensor>) {}
+#[cfg(not(feature = "cuda"))]
+pub fn graph_mode_mask() -> Option<Tensor> {
+    None
+}
+
 /// Check if graph-mode positions are set.
 #[cfg(feature = "cuda")]
 pub fn has_graph_mode_positions() -> bool {
     GRAPH_MODE_POSITIONS.with(|p| p.borrow().is_some())
+}
+
+/// Get the graph-mode positions tensor (device [B]). Used as the RoPE position,
+/// the KV-write slot, and the attention length mask source. (RUN-161)
+#[cfg(feature = "cuda")]
+pub fn graph_mode_positions() -> Option<Tensor> {
+    GRAPH_MODE_POSITIONS.with(|p| p.borrow().clone())
+}
+
+/// Non-cuda stubs so call sites compile without the cuda feature.
+#[cfg(not(feature = "cuda"))]
+pub fn has_graph_mode_positions() -> bool {
+    false
+}
+#[cfg(not(feature = "cuda"))]
+pub fn graph_mode_positions() -> Option<Tensor> {
+    None
 }
 
 #[derive(Debug, Clone)]

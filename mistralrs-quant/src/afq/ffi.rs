@@ -76,6 +76,21 @@ macro_rules! quant_kernel {
     };
 }
 
+macro_rules! quant_kernel_3bit {
+    ($gs:tt, $scalar:ty, $postfix:tt) => {
+        paste::paste! {
+            pub fn [< afq_quantize_3bit_gs $gs _ $postfix >](
+                w: *const $scalar,
+                w_q: *mut u32,
+                scales: *mut $scalar,
+                biases: *mut $scalar,
+                rows: i32,
+                cols: i32,
+            );
+        }
+    };
+}
+
 // ============================================================================
 // QMV (quantized matrix-vector) kernel bindings
 // ============================================================================
@@ -222,6 +237,17 @@ extern "C" {
     quant_kernel!(2, 32, bf16, bf16);
     quant_kernel!(2, 64, bf16, bf16);
     quant_kernel!(2, 128, bf16, bf16);
+
+    // --- Quantize: 3-bit ---
+    quant_kernel_3bit!(32, f32, f32);
+    quant_kernel_3bit!(64, f32, f32);
+    quant_kernel_3bit!(128, f32, f32);
+    quant_kernel_3bit!(32, f16, f16);
+    quant_kernel_3bit!(64, f16, f16);
+    quant_kernel_3bit!(128, f16, f16);
+    quant_kernel_3bit!(32, bf16, bf16);
+    quant_kernel_3bit!(64, bf16, bf16);
+    quant_kernel_3bit!(128, bf16, bf16);
 
     // --- Quantize: 4-bit ---
     quant_kernel!(4, 32, f32, f32);

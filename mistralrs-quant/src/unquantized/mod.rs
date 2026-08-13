@@ -374,12 +374,31 @@ impl QuantMethod for UnquantLinear {
                 }
                 n_quantized.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let bias = self.b.as_ref().map(|b| b.to_device(&device)).transpose()?;
-                crate::QtipLayer::quantize_with_mode(
-                    &self.w.to_device(&device)?,
-                    bias,
-                    &device,
-                    crate::QtipMode::Viterbi,
-                )
+                // 3D weights are MoE expert stacks (e.g. [256, 2048, 4096]).
+                // Greedy is 5-10x faster than Viterbi, but the precision gap is
+                // NOT negligible: measured matmul cos vs FP4 is greedy=0.887 vs
+                // viterbi=0.962 (3x less error) on real V4 experts. Set
+                // ARC_QTIP_EXPERT_VITERBI=1 to quantize experts with Viterbi +
+                // Hadamard rotation (gather_forward applies the rotation). (RUN-161)
+                let expert_viterbi = std::env::var_os("ARC_QTIP_EXPERT_VITERBI").is_some();
+                let mode = if self.w.dims().len() == 3 && !expert_viterbi {
+                    crate::QtipMode::Greedy
+                } else {
+                    crate::QtipMode::Viterbi
+                };
+                // For 3D MoE expert stacks ([E, N, K], e.g. [256, 2048, 4096]),
+                // keep the full weight on its current device (CPU during ISQ
+                // load) and let `quantize_with_options_3d` stream one expert at a
+                // time onto `device`. Pre-moving the whole stack to GPU allocates
+                // ~4GB of transient BF16 and OOMs the final layers on a single
+                // 80GB H100 (the per-expert GPU transient is only ~33MB). 2D
+                // weights are small, so move them up front as before. (RUN-161)
+                let w_for_quant = if self.w.dims().len() == 3 {
+                    self.w.clone()
+                } else {
+                    self.w.to_device(&device)?
+                };
+                crate::QtipLayer::quantize_with_mode(&w_for_quant, bias, &device, mode)
             }
             Some(IsqType::F8Q8) => {
                 let _acquired_quantize_guard = guard.acquire(&device);
