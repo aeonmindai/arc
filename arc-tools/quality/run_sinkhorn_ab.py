@@ -78,6 +78,15 @@ def compare(args):
             mismatches.append({"i": ia["i"], "first_divergence_char": k,
                                "a_tail": ia["text"][k:k + 80], "b_tail": ib["text"][k:k + 80]})
     identical = not mismatches
+    # Keep the historical filename for the canonical sinkhorn A/B; any other
+    # label pair (e.g. absorbed-decode identity) gets its own verdict file so
+    # reruns never clobber an earlier verdict (session-1 lesson).
+    if args.out:
+        verdict_path = args.out
+    elif (args.a, args.b) == ("baseline", "fused"):
+        verdict_path = os.path.join(qlib.RESULTS_DIR, "sinkhorn_verdict.json")
+    else:
+        verdict_path = os.path.join(qlib.RESULTS_DIR, f"ab_verdict_{args.a}_vs_{args.b}.json")
     verdict = {
         "meta": qlib.run_meta({"eval": "sinkhorn_compare", "a": args.a, "b": args.b}),
         "summary": {
@@ -92,9 +101,9 @@ def compare(args):
         },
         "mismatches": mismatches,
     }
-    qlib.write_json(os.path.join(qlib.RESULTS_DIR, "sinkhorn_verdict.json"), verdict)
-    print(f"SINKHORN-AB: token_identical={identical} "
-          f"({len(mismatches)} mismatching prompt(s) of {len(a['items'])})")
+    qlib.write_json(verdict_path, verdict)
+    print(f"SINKHORN-AB[{args.a} vs {args.b}]: token_identical={identical} "
+          f"({len(mismatches)} mismatching prompt(s) of {len(a['items'])}) -> {verdict_path}")
     sys.exit(0 if identical else 1)
 
 
@@ -102,11 +111,19 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("capture")
-    c.add_argument("--label", required=True, choices=["baseline", "fused"])
+    # Free-form label: besides the canonical baseline/fused sinkhorn pair, the
+    # same greedy-identity machinery drives other server A/Bs (session-2:
+    # absorbed vs no_absorbed decode).
+    c.add_argument("--label", required=True,
+                   help="capture tag -> sinkhorn_<label>.json (e.g. baseline, "
+                        "fused, absorbed, no_absorbed)")
     c.set_defaults(fn=capture)
     d = sub.add_parser("compare")
     d.add_argument("--a", default="baseline")
     d.add_argument("--b", default="fused")
+    d.add_argument("--out", default=None,
+                   help="verdict JSON path (default: sinkhorn_verdict.json for "
+                        "baseline/fused, ab_verdict_<a>_vs_<b>.json otherwise)")
     d.set_defaults(fn=compare)
     args = ap.parse_args()
     args.fn(args)

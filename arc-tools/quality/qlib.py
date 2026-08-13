@@ -177,7 +177,9 @@ def run_meta(extra=None):
             k: os.environ.get(k)
             for k in (
                 "ARC_FUSED_SINKHORN", "ARC_QUANT_ATTENTION", "ARC_V4_WINDOW_ONLY",
-                "ARC_FORCE_NAIVE_SDPA", "ARC_TIME_DECODE",
+                "ARC_FORCE_NAIVE_SDPA", "ARC_TIME_DECODE", "ARC_V4_STANDARD_DENSE",
+                "ARC_V4_NO_ABSORBED_DECODE", "ARC_QTIP_EXPERT_GREEDY",
+                "ARC_MTP_LOG_ACCEPTANCE",
             )
             if os.environ.get(k) is not None
         },

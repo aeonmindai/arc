@@ -91,8 +91,17 @@ fi
 # ---------------- the ladder ----------------
 C64_FILE="${C64_FILE:-$HERE/data/wiki.test_c64slice.raw}"
 run_rung qtip2_c1024 "$PPL_FILE" -u "$UQFF0" --chunk-size 1024
-run_rung qtip2_c64   "$C64_FILE" -u "$UQFF0" --chunk-size 64
-run_rung q2k_c1024   "$PPL_FILE" -i q2k --chunk-size 1024
+if [ "${SKIP_C64:-0}" = "1" ]; then
+  echo "SKIP: qtip2_c64 rung (SKIP_C64=1)"
+else
+  run_rung qtip2_c64   "$C64_FILE" -u "$UQFF0" --chunk-size 64
+fi
+if [ "${SKIP_Q2K:-0}" = "1" ]; then
+  echo "SKIP: q2k rung (SKIP_Q2K=1 — session 2 reuses session-1 stored q2k numbers:"
+  echo "      ppl_q2k_c1024 = 22.49594 over the same wiki.test_small corpus)"
+else
+  run_rung q2k_c1024   "$PPL_FILE" -i q2k --chunk-size 1024
+fi
 if [ "${RUN_Q3K:-0}" = "1" ]; then
   run_rung q3k_c1024 "$PPL_FILE" -i q3k --chunk-size 1024 || echo "WARN: q3k rung failed (expected fit risk on 141GB)"
 else

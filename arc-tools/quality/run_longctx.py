@@ -76,9 +76,23 @@ def probe(label, user_msg, want):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default=os.path.join(qlib.RESULTS_DIR, "longctx.json"))
+    ap.add_argument("--label", default=None,
+                    help="server-config tag; output becomes longctx_<label>.json "
+                         "(session-2 matrix: fixed / standard_dense / window_only). "
+                         "Prevents the session-1 clobber: distinct file per config.")
+    ap.add_argument("--out", default=None,
+                    help="explicit output path (overrides --label naming)")
+    ap.add_argument("--force", action="store_true",
+                    help="overwrite an existing output file instead of refusing")
     ap.add_argument("--deep", action="store_true", help="add a ~12K-token rung")
     args = ap.parse_args()
+
+    name = f"longctx_{args.label}.json" if args.label else "longctx.json"
+    out_path = args.out or os.path.join(qlib.RESULTS_DIR, name)
+    if os.path.exists(out_path) and not args.force:
+        print(f"FATAL: {out_path} already exists — pick a distinct --label/--out "
+              f"per server config (session-1 lesson) or pass --force.")
+        raise SystemExit(2)
 
     qlib.ensure_dirs()
     qlib.health_or_die()
@@ -104,6 +118,7 @@ def main():
     summary = {
         "meta": qlib.run_meta({
             "eval": "longctx", "sampling": "greedy",
+            "label": args.label,
             "validates": "337fd139a faithful compressor (ctx>128 engages compressed KV path)",
         }),
         "summary": {
@@ -113,10 +128,11 @@ def main():
         },
         "items": items,
     }
-    qlib.write_json(args.out, summary)
-    print(f"\nLONGCTX: coherence {coh_ok}/{len(coh)} (HARD gate) | "
+    qlib.write_json(out_path, summary)
+    print(f"\nLONGCTX[{args.label or 'default'}]: coherence {coh_ok}/{len(coh)} (HARD gate) | "
           f"needle {ndl_ok}/{len(ndl)} (soft) | "
-          f"compressor fix 337fd139a {'VALIDATED' if coh_ok == len(coh) else 'SUSPECT'}")
+          f"compressor fix 337fd139a {'VALIDATED' if coh_ok == len(coh) else 'SUSPECT'} | "
+          f"-> {out_path}")
     if coh_ok < len(coh):
         print("  -> failure triage: restart server with ARC_V4_WINDOW_ONLY=1 and re-run;"
               " if coherence recovers, the compressed branch is the culprit.")
