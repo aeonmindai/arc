@@ -806,15 +806,16 @@ impl IsqType {
                 Some(1.try_into().unwrap())
             }
             IsqType::QtipBitshift2 | IsqType::Qtip2b => {
-                // QTIP quantizes on the CPU (per-row trellis search), not the
-                // GPU. Greedy is fast enough single-threaded; Viterbi is ~10x
-                // heavier and must use all cores or a full requantize takes
-                // hours. The per-tensor build is sequential, so the per-row
-                // par_iter is memory-safe at full width. (RUN-161)
-                if std::env::var_os("ARC_QTIP_EXPERT_VITERBI").is_some() {
-                    None
-                } else {
-                    Some(1.try_into().unwrap())
+                // On a CPU-only build QTIP quantizes on the CPU (per-row
+                // trellis search). Greedy is fast enough single-threaded;
+                // Viterbi is ~10x heavier and must use all cores or a full
+                // requantize takes hours. The per-tensor build is sequential,
+                // so the per-row par_iter is memory-safe at full width.
+                // Keyed off the same decision point as the bake itself
+                // (wave3-G: Viterbi is now the expert default). (RUN-161)
+                match crate::QtipMode::default_expert_mode() {
+                    crate::QtipMode::Greedy => Some(1.try_into().unwrap()),
+                    crate::QtipMode::Viterbi => None,
                 }
             }
             IsqType::F8E4M3 | IsqType::F8Q8 => None,

@@ -381,9 +381,10 @@ impl QuantMethod for UnquantLinear {
                 // viterbi=0.962 (3x less error) on real V4 experts. Set
                 // ARC_QTIP_EXPERT_VITERBI=1 to quantize experts with Viterbi +
                 // Hadamard rotation (gather_forward applies the rotation). (RUN-161)
-                let expert_viterbi = std::env::var_os("ARC_QTIP_EXPERT_VITERBI").is_some();
-                let mode = if self.w.dims().len() == 3 && !expert_viterbi {
-                    crate::QtipMode::Greedy
+                let mode = if self.w.dims().len() == 3 {
+                    // Decision point shared with the bake-quality regression
+                    // test (qtip/bake_quality_tests.rs).
+                    crate::QtipMode::default_expert_mode()
                 } else {
                     crate::QtipMode::Viterbi
                 };
