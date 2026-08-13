@@ -6,7 +6,8 @@ use anyhow::{Context, Result};
 use candle_core::Device;
 use mistralrs_core::{
     get_auto_device_map_params, get_model_dtype, get_tgt_non_granular_index, paged_attn_supported,
-    parse_isq_value, try_wrap_pipeline_with_mtp, AutoDeviceMapParams, DefaultSchedulerMethod,
+    parse_isq_value, set_mtp_load_depth, try_wrap_pipeline_with_mtp, AutoDeviceMapParams,
+    DefaultSchedulerMethod,
     DeviceLayerMapMetadata, DeviceMapMetadata, DeviceMapSetting, Loader, LoaderBuilder,
     McpClientConfig, MemoryGpuConfig, MistralRsBuilder, ModelLoaderConfig, ModelSelected,
     PagedAttentionConfig, PagedCacheType, SchedulerConfig, SearchCallback, SearchEmbeddingModel,
@@ -708,6 +709,11 @@ impl MistralRsForServerBuilder {
             .map(|isq| parse_isq_value(isq, Some(&device)).map_err(|e| anyhow::anyhow!("{e}")))
             .transpose()?;
 
+        // Declare the MTP draft depth BEFORE load so the V4 loader knows
+        // whether to load the full `mtp.0.*` decoder block (~3GB at FP8;
+        // skipped entirely when `--mtp-depth 0`).
+        set_mtp_load_depth(self.mtp_depth);
+
         let pipeline: LoadedPipeline = loader.load_model_from_hf(
             None,
             self.token_source,
@@ -845,6 +851,9 @@ impl MistralRsForServerBuilder {
         let mut loaded_model_ids = Vec::new();
         let mut registered_ids = HashSet::new();
 
+        // Declare the MTP draft depth BEFORE load (see `build_single_model`).
+        set_mtp_load_depth(self.mtp_depth);
+
         let pipeline: LoadedPipeline = loader.load_model_from_hf(
             None,
             self.token_source.clone(),
@@ -959,6 +968,10 @@ impl MistralRsForServerBuilder {
                 .or(self.in_situ_quant.as_ref())
                 .map(|isq| parse_isq_value(isq, Some(&device)).map_err(|e| anyhow::anyhow!("{e}")))
                 .transpose()?;
+
+            // Declare the MTP draft depth BEFORE load (see
+            // `build_single_model`).
+            set_mtp_load_depth(self.mtp_depth);
 
             let pipeline: LoadedPipeline = loader.load_model_from_hf(
                 None,

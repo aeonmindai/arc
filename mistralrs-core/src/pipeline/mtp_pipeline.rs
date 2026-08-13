@@ -8,34 +8,42 @@
 //! semantics), yielding a lossless decode speedup of roughly
 //! `1 + (depth * acceptance_rate)`.
 //!
-//! # Architecture (Tier A — RUN-156)
+//! # Architecture (RUN-156 Tier A + full-block Tier B)
 //!
 //! Per the V4 paper and SGLang's `deepseek_v4_nextn.py`:
 //! ```text
 //! prev_hidden = target.forward(input_ids)[-1]   # [B, hidden]
 //! e_emb       = embed_tokens(last_token)         # [B, hidden]
+//! # Full-block path (checkpoint ships mtp.0.* decoder + --mtp-depth > 0):
+//! fused       = h_proj(hnorm(prev_hidden)) + e_proj(enorm(e_emb))
+//! hidden      = mtp_decoder_layer(fused)         # V4 attention + 256-expert MoE
+//! mtp_logits  = lm_head(norm(hidden))            # [B, vocab]
+//! # Tier-A fallback (older exports / --mtp-depth 0 at load):
 //! fused       = h_proj(prev_hidden) + e_proj(e_emb)
-//! # Tier A: skip MTP transformer block (just project to lm_head directly)
-//! # Tier B: fused = mtp_transformer(fused)  -- single SWA-only attention block
-//! mtp_logits  = lm_head(fused)                   # [B, vocab]
+//! mtp_logits  = lm_head(fused)
 //! draft_token = argmax(mtp_logits)
 //! ```
 //!
-//! When `depth > 1`, the just-projected `fused` becomes the next step's
-//! `prev_hidden`. The full proposed sequence is then verified.
+//! When `depth > 1`, the block output (or the projected `fused` on the
+//! Tier-A path) becomes the next step's `prev_hidden`. The full proposed
+//! sequence is then verified.
 //!
-//! # Tier A constraints (this module)
+//! # Constraints (this module)
 //!
 //! - **Greedy only**: argmax sampling for proposals. Stochastic temperature
-//!   sampling is Tier B (requires probability-comparison verification).
-//! - **No MTP transformer block**: the published V4 head has a single SWA
-//!   attention layer between h_proj/e_proj and lm_head. Tier A skips it.
-//!   For DeepSeek V4-flash this empirically still gives ~50% acceptance.
+//!   sampling requires probability-comparison verification (follow-up).
+//! - **MTP transformer block**: V4 ships a full decoder layer (attention +
+//!   MoE) at `mtp.0.*`. It is loaded only when `--mtp-depth > 0`
+//!   ([`set_mtp_load_depth`]) — ~3GB at FP8, ~800MB after qtip2 ISQ — and
+//!   drafts then flow through it (field reference: 80-90% second-token
+//!   acceptance vs ~50% for projection-only drafting). Heads-only
+//!   checkpoints keep the Tier-A path.
 //! - **Lossless guarantee**: accepted tokens always match what the target's
 //!   own greedy decode would produce. Rejected tokens trigger fallback to
 //!   the target's own next-token choice, no quality loss possible.
 
 use std::any::Any;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -43,6 +51,8 @@ use candle_core::{Device, IndexOp, Result, Tensor};
 use candle_nn::{Embedding, Module};
 use rand_isaac::Isaac64Rng;
 use tokenizers::Tokenizer;
+
+use crate::kv_cache::KvCache;
 
 use crate::device_map::DeviceMapper;
 use crate::pipeline::sampling::{finish_or_add_toks_to_seq, sample_sequence};
@@ -59,14 +69,41 @@ use super::{
     PreProcessingMixin,
 };
 
+/// Global MTP load-depth gate.
+///
+/// Set by the server/CLI builder (from `--mtp-depth`) BEFORE the model is
+/// loaded. The DeepSeek V4 loader reads it to decide whether to load the
+/// full MTP transformer block (~3GB at FP8) in addition to the light
+/// `h_proj`/`e_proj` heads. Zero (the default) keeps the old heads-only
+/// behavior — no extra memory is spent when MTP is disabled.
+///
+/// Mirrors the `mistralrs_quant::set_loading_from_uqff` pattern: loading is
+/// driven through macro-constructed metadata that does not carry runtime
+/// flags, so a process-wide atomic is the lowest-blast-radius channel.
+static MTP_LOAD_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+/// Declare the requested MTP draft depth before model load. `0` disables
+/// full-block loading (heads-only, the pre-Tier-B behavior).
+pub fn set_mtp_load_depth(depth: usize) {
+    MTP_LOAD_DEPTH.store(depth, Ordering::Relaxed);
+}
+
+/// The MTP draft depth declared via [`set_mtp_load_depth`] (0 = disabled).
+pub fn mtp_load_depth() -> usize {
+    MTP_LOAD_DEPTH.load(Ordering::Relaxed)
+}
+
 /// Components needed to run one MTP draft step.
 ///
-/// All four fields are Arc/Clone-cheap handles into the target model's
+/// All fields are Arc/Clone-cheap handles into the target model's
 /// existing tensors — no extra weight loading required. The target model
 /// returns this via [`crate::pipeline::loaders::NormalModel::mtp_decode_kit`].
 ///
 /// For DeepSeek V4: `embed_tokens` and `lm_head` are the same ones used by
-/// the main forward; `h_proj` and `e_proj` come from `mtp.layers.0.*`.
+/// the main forward; `h_proj` and `e_proj` come from `mtp.layers.0.*` /
+/// `mtp.0.*`; `block` is the checkpoint's full MTP decoder layer (attention
+/// + MoE + `hnorm`/`enorm`/`norm`), present only when `--mtp-depth > 0` was
+/// set at load time AND the checkpoint ships the block tensors.
 #[derive(Clone)]
 pub struct MtpDecodeKit {
     /// The model's input embedding layer (shared with the main forward).
@@ -79,6 +116,10 @@ pub struct MtpDecodeKit {
     pub h_proj: Arc<dyn QuantMethod>,
     /// Projects the current-token embedding. Shape: `[hidden, hidden]`.
     pub e_proj: Arc<dyn QuantMethod>,
+    /// The full MTP transformer block (Tier B). `None` for heads-only loads
+    /// (older exports, or `--mtp-depth 0`); drafting then falls back to the
+    /// Tier-A projection-only path.
+    pub(crate) block: Option<Arc<crate::models::deepseek4::MtpBlock>>,
 }
 
 impl std::fmt::Debug for MtpDecodeKit {
@@ -90,6 +131,11 @@ impl std::fmt::Debug for MtpDecodeKit {
 }
 
 impl MtpDecodeKit {
+    /// True when the full MTP transformer block was loaded (Tier B path).
+    pub fn has_full_block(&self) -> bool {
+        self.block.is_some()
+    }
+
     /// Run one MTP draft step.
     ///
     /// Given `prev_hidden` (the previous step's hidden state, shape `[B, hidden]`
@@ -134,14 +180,68 @@ impl MtpDecodeKit {
         Ok((mtp_logits, fused))
     }
 
-    /// Run one MTP draft chain (Tier A: greedy).
+    /// Run one MTP draft step through the full transformer block (Tier B).
+    ///
+    /// Mirrors SGLang's `DeepseekV4ModelNextN.forward` (audit §2 "MTP head"):
+    /// ```text
+    /// fused  = h_proj(hnorm(prev_hidden)) + e_proj(enorm(embed(token)))
+    /// hidden = decoder_layer(fused)          # V4 attention + MoE, own KV cache
+    /// logits = lm_head(norm(hidden))         # mtp.0.norm, shared lm_head
+    /// ```
+    /// `pos` is the absolute sequence position of the drafted token (used for
+    /// RoPE); `cache` is the per-chain KV cache so later draft tokens attend
+    /// over earlier ones. Returns `(logits [B, vocab], next_hidden [B, hidden])`
+    /// where `next_hidden` is the decoder output pre-`norm` (the reference
+    /// feeds the pre-head hidden state forward between spec steps).
+    fn step_full(
+        &self,
+        block: &crate::models::deepseek4::MtpBlock,
+        prev_hidden: &Tensor,
+        last_token: &Tensor,
+        pos: usize,
+        cache: &mut KvCache,
+    ) -> Result<(Tensor, Tensor)> {
+        let last_token = if last_token.rank() == 0 {
+            last_token.unsqueeze(0)?
+        } else {
+            last_token.clone()
+        };
+        let e_emb = self.embed_tokens.forward(&last_token)?;
+        let prev_hidden = if prev_hidden.rank() == 1 {
+            prev_hidden.unsqueeze(0)?
+        } else {
+            prev_hidden.clone()
+        };
+
+        // Reference semantics: the norms are applied BEFORE the projections
+        // (deepseek_v4_nextn.py: `h_proj(hnorm(h))` / `e_proj(enorm(emb))`).
+        let h_out = self.h_proj.forward_autocast(&block.norm_h(&prev_hidden)?)?;
+        let e_out = self.e_proj.forward_autocast(&block.norm_e(&e_emb)?)?;
+        let fused = (h_out + e_out)?; // [B, hidden]
+
+        let fused3 = fused.unsqueeze(1)?; // [B, 1, hidden]
+        let ids = last_token.unsqueeze(1)?; // [B, 1] (hash-routed MoE gate input)
+        let hidden = block.forward_step(&fused3, pos, cache, &ids)?; // [B, 1, hidden]
+
+        let normed = block.norm_out(&hidden)?;
+        let mtp_logits = self.lm_head.forward_autocast(&normed.squeeze(1)?)?;
+        Ok((mtp_logits, hidden.squeeze(1)?))
+    }
+
+    /// Run one MTP draft chain (greedy).
     ///
     /// Loops up to `min(depth, max_tokens)` iterations. Each iteration:
-    /// 1. Calls [`Self::step`] to produce `mtp_logits` and the updated `fused`
-    ///    hidden state.
+    /// 1. Runs one MTP step — through the full transformer block when the
+    ///    checkpoint shipped it (Tier B), else the Tier-A projection-only
+    ///    [`Self::step`] — producing `mtp_logits` and the next hidden state.
     /// 2. Greedy-argmax over `mtp_logits` to pick the next token.
-    /// 3. Feeds the new token (and `fused` as `prev_hidden`) back into the
-    ///    next iteration.
+    /// 3. Feeds the new token (and the hidden state) back into the next
+    ///    iteration.
+    ///
+    /// `start_pos` is the absolute sequence position of the FIRST drafted
+    /// token (i.e. the target's KV-cache length after the free token); the
+    /// full-block path uses it for RoPE and its per-chain KV cache. The
+    /// Tier-A path ignores it.
     ///
     /// Returns the list of proposed token IDs (length is exactly
     /// `min(depth, max_tokens)`).
@@ -151,6 +251,7 @@ impl MtpDecodeKit {
         last_token_id: u32,
         depth: usize,
         max_tokens: usize,
+        start_pos: usize,
     ) -> Result<Vec<u32>> {
         let n = depth.min(max_tokens);
         let mut tokens = Vec::with_capacity(n);
@@ -160,9 +261,18 @@ impl MtpDecodeKit {
         let device = last_hidden.device();
         let mut prev_hidden = last_hidden.clone();
         let mut tok = last_token_id;
-        for _ in 0..n {
+        // Per-chain KV cache for the full-block path: draft token i attends
+        // over draft tokens 0..i at their absolute positions. Fresh per chain
+        // — rejected drafts never pollute a later chain.
+        let mut chain_cache = self.block.as_ref().map(|b| b.new_chain_cache());
+        for i in 0..n {
             let tok_tensor = Tensor::from_vec(vec![tok], (1,), device)?;
-            let (mtp_logits, fused) = self.step(&prev_hidden, &tok_tensor)?;
+            let (mtp_logits, next_hidden) = match (&self.block, &mut chain_cache) {
+                (Some(block), Some(cache)) => {
+                    self.step_full(block, &prev_hidden, &tok_tensor, start_pos + i, cache)?
+                }
+                _ => self.step(&prev_hidden, &tok_tensor)?,
+            };
             // Greedy argmax. Squeeze the batch dim if present.
             let logits = if mtp_logits.rank() == 2 {
                 mtp_logits.i(0)?
@@ -171,7 +281,7 @@ impl MtpDecodeKit {
             };
             let next_id = argmax_token(&logits)?;
             tokens.push(next_id);
-            prev_hidden = fused;
+            prev_hidden = next_hidden;
             tok = next_id;
         }
         Ok(tokens)
@@ -316,20 +426,27 @@ impl MtpSpeculativePipeline {
         );
     }
 
-    /// Run one MTP draft chain (Tier A: greedy, depth ≤ self.depth).
+    /// Run one MTP draft chain (greedy, depth ≤ self.depth).
     ///
     /// Given the latest hidden state from the target forward and the just-emitted
     /// token, produces up to `self.depth` proposed tokens by chaining MTP steps.
     /// The chain stops early if it would exceed `max_tokens` (e.g., the EOS or
-    /// the requested generation length).
+    /// the requested generation length). `start_pos` is the absolute position
+    /// of the first drafted token (see [`MtpDecodeKit::propose_chain`]).
     pub fn propose_chain(
         &self,
         last_hidden: &Tensor,
         last_token_id: u32,
         max_tokens: usize,
+        start_pos: usize,
     ) -> Result<Vec<u32>> {
-        self.kit
-            .propose_chain(last_hidden, last_token_id, self.depth, max_tokens)
+        self.kit.propose_chain(
+            last_hidden,
+            last_token_id,
+            self.depth,
+            max_tokens,
+            start_pos,
+        )
     }
 
     /// Record acceptance counters from a verify result.
@@ -776,14 +893,22 @@ impl Pipeline for MtpSpeculativePipeline {
         };
 
         // ---- Step 2: MTP propose [T1, …, T_depth] ----
-        // Tier A: seed `prev_hidden` from `embed_tokens(T0)`. Tier B will
-        // route the target's real last hidden state through here.
+        // Seed `prev_hidden` from `embed_tokens(T0)`. (Plumbing the target's
+        // real last hidden state through `forward_inputs` is the remaining
+        // Tier-B follow-up.) When the full MTP block is loaded, the chain
+        // flows through the real decoder layer at the absolute positions
+        // starting at the current cache length (= T0's successor slot).
         let device = get_mut_arcmutex!(self.target).device();
         let t0_tensor = Tensor::from_vec(vec![t0], (1,), &device)?;
         let embedded_t0 = self.kit.embed_tokens.forward(&t0_tensor)?; // [1, hidden]
-        let proposed = self
-            .kit
-            .propose_chain(&embedded_t0, t0, self.depth, toks_remaining_budget)?;
+        let chain_start_pos = current_normal_cache_len(self);
+        let proposed = self.kit.propose_chain(
+            &embedded_t0,
+            t0,
+            self.depth,
+            toks_remaining_budget,
+            chain_start_pos,
+        )?;
 
         // If the budget left no room (max_len hit, depth=0), commit T0 and
         // return — no verify needed.
@@ -1006,6 +1131,7 @@ mod tests {
             lm_head: wrap_linear(lm_w),
             h_proj: wrap_linear(h_w),
             e_proj: wrap_linear(e_w),
+            block: None,
         })
     }
 
@@ -1047,11 +1173,10 @@ mod tests {
         let vocab = 8;
         let kit = make_test_kit(hidden, vocab, &device)?;
 
-        let prev_hidden =
-            Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0], (1, hidden), &device)?;
+        let prev_hidden = Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0], (1, hidden), &device)?;
         let depth = 3;
         let max_tokens = 16;
-        let tokens = kit.propose_chain(&prev_hidden, 0, depth, max_tokens)?;
+        let tokens = kit.propose_chain(&prev_hidden, 0, depth, max_tokens, 0)?;
         assert_eq!(tokens.len(), depth, "should return exactly depth tokens");
         // All proposed token ids should be within vocab range.
         for t in &tokens {
@@ -1125,19 +1250,23 @@ mod tests {
         let prev_hidden = Tensor::zeros((1, hidden), DType::F32, &device)?;
 
         // depth=5, max_tokens=2 → exactly 2 tokens.
-        let tokens = kit.propose_chain(&prev_hidden, 0, 5, 2)?;
-        assert_eq!(tokens.len(), 2, "cap should clip chain length to max_tokens");
+        let tokens = kit.propose_chain(&prev_hidden, 0, 5, 2, 0)?;
+        assert_eq!(
+            tokens.len(),
+            2,
+            "cap should clip chain length to max_tokens"
+        );
 
         // depth=4, max_tokens=4 → exactly 4 (equality holds).
-        let tokens = kit.propose_chain(&prev_hidden, 0, 4, 4)?;
+        let tokens = kit.propose_chain(&prev_hidden, 0, 4, 4, 0)?;
         assert_eq!(tokens.len(), 4);
 
         // max_tokens=0 → empty chain regardless of depth.
-        let tokens = kit.propose_chain(&prev_hidden, 0, 8, 0)?;
+        let tokens = kit.propose_chain(&prev_hidden, 0, 8, 0, 0)?;
         assert!(tokens.is_empty(), "max_tokens=0 must return no tokens");
 
         // depth=0 → empty chain regardless of max_tokens.
-        let tokens = kit.propose_chain(&prev_hidden, 0, 0, 8)?;
+        let tokens = kit.propose_chain(&prev_hidden, 0, 0, 8, 0)?;
         assert!(tokens.is_empty(), "depth=0 must return no tokens");
 
         Ok(())
@@ -1225,7 +1354,7 @@ mod tests {
         let mut total_accepted = 0usize;
         // Walk 32 / depth = 8 cycles — one MTP draft + verify per iteration.
         for _cycle in 0..8 {
-            let proposed = kit.propose_chain(&prev_hidden, prev_tok, depth, depth)?;
+            let proposed = kit.propose_chain(&prev_hidden, prev_tok, depth, depth, 0)?;
             assert_eq!(proposed.len(), depth, "kit should give exactly depth tokens");
 
             // Mock verifier: agree with proposals on even positions, diverge on
