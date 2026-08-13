@@ -230,7 +230,13 @@ fn decode_packed(packed: &[u8], num_symbols: usize, lut: &[f32]) -> Vec<f32> {
 /// from the packed nibbles and solve s* = ⟨w, c⟩ / ⟨c, c⟩ (f32 accumulation,
 /// like the kernel). Returns the refined scale, falling back to `heur` when
 /// the refined value is non-positive (pathological row).
-fn ls_refine_scale(w_rotated: &[f32], packed: &[u8], num_symbols: usize, lut: &[f32], heur: f32) -> f32 {
+fn ls_refine_scale(
+    w_rotated: &[f32],
+    packed: &[u8],
+    num_symbols: usize,
+    lut: &[f32],
+    heur: f32,
+) -> f32 {
     let mut state: u32 = 0;
     let mut dot_wl = 0f32;
     let mut dot_ll = 0f32;
@@ -283,9 +289,8 @@ fn quantize_matrix(w: &[f32], n: usize, k: usize, cfg: Cfg) -> Vec<f32> {
                     }
                 }
                 ScalePolicy::RmsMatchedLsRefine => {
-                    let rms =
-                        (rot.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / k as f64)
-                            .sqrt() as f32;
+                    let rms = (rot.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / k as f64)
+                        .sqrt() as f32;
                     if rms == 0.0 {
                         1.0
                     } else {
@@ -366,8 +371,11 @@ fn proxy_ppl_ratio(y_exact: &[f32], y_quant: &[f32], batch: usize, n: usize) -> 
         for b in 0..batch {
             let row = &y[b * n..(b + 1) * n];
             let m = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
-            let logsumexp =
-                m + row.iter().map(|&v| ((v as f64) - m).exp()).sum::<f64>().ln();
+            let logsumexp = m + row
+                .iter()
+                .map(|&v| ((v as f64) - m).exp())
+                .sum::<f64>()
+                .ln();
             total += logsumexp - y[b * n + labels[b]] as f64;
         }
         total / batch as f64
@@ -450,7 +458,10 @@ fn ls_refine_replay_matches_decoder_and_improves_mse() {
 
             // (b) The refined scale does not degrade reconstruction MSE.
             let refined = ls_refine_scale(&rot, &packed, num_symbols, &lut, scale);
-            assert!(refined > 0.0, "{name} row {row}: non-positive refined scale");
+            assert!(
+                refined > 0.0,
+                "{name} row {row}: non-positive refined scale"
+            );
             let mse = |s: f32| -> f64 {
                 rot.iter()
                     .zip(decoded.iter())
@@ -544,31 +555,59 @@ fn probe_bake_quality_ladder() {
     let configs: Vec<(&str, Cfg)> = vec![
         (
             "A prod-today  greedy rot=0   max/3    ",
-            Cfg { viterbi: false, rotation_block: 0, policy: ScalePolicy::MaxOver3 },
+            Cfg {
+                viterbi: false,
+                rotation_block: 0,
+                policy: ScalePolicy::MaxOver3,
+            },
         ),
         (
             "B greedy      rot=128 max/3           ",
-            Cfg { viterbi: false, rotation_block: 128, policy: ScalePolicy::MaxOver3 },
+            Cfg {
+                viterbi: false,
+                rotation_block: 128,
+                policy: ScalePolicy::MaxOver3,
+            },
         ),
         (
             "C viterbi     rot=0   max/3           ",
-            Cfg { viterbi: true, rotation_block: 0, policy: ScalePolicy::MaxOver3 },
+            Cfg {
+                viterbi: true,
+                rotation_block: 0,
+                policy: ScalePolicy::MaxOver3,
+            },
         ),
         (
             "D env-path    vit rot=128 max/3       ",
-            Cfg { viterbi: true, rotation_block: 128, policy: ScalePolicy::MaxOver3 },
+            Cfg {
+                viterbi: true,
+                rotation_block: 128,
+                policy: ScalePolicy::MaxOver3,
+            },
         ),
         (
             "E D+LSrefine  vit rot=128 max/3+LS    ",
-            Cfg { viterbi: true, rotation_block: 128, policy: ScalePolicy::MaxOver3LsRefine },
+            Cfg {
+                viterbi: true,
+                rotation_block: 128,
+                policy: ScalePolicy::MaxOver3LsRefine,
+            },
         ),
         (
             "F rms-scale   vit rot=128 rms+LS      ",
-            Cfg { viterbi: true, rotation_block: 128, policy: ScalePolicy::RmsMatchedLsRefine },
+            Cfg {
+                viterbi: true,
+                rotation_block: 128,
+                policy: ScalePolicy::RmsMatchedLsRefine,
+            },
         ),
         (
             "G full-Had    vit rot=2048 max/3+LS   ",
-            Cfg { viterbi: true, rotation_block: 2048, policy: ScalePolicy::MaxOver3LsRefine },
+            Cfg {
+                viterbi: true,
+                rotation_block: 2048,
+                policy: ScalePolicy::MaxOver3LsRefine,
+            },
         ),
     ];
 

@@ -55,13 +55,13 @@ use crate::{
     QuantizedSerdeType, ShardedVarBuilder,
 };
 
+#[cfg(test)]
+mod bake_quality_tests;
 pub mod bitshift;
 #[cfg(feature = "cuda")]
 mod cuda_ops;
 #[cfg(feature = "cuda")]
 mod ffi;
-#[cfg(test)]
-mod bake_quality_tests;
 mod viterbi;
 pub use bitshift::{Qtip2bLayer, QTIP2B_MCG_MULT};
 #[allow(unused_imports)]
@@ -353,15 +353,23 @@ impl QtipMode {
     /// this choice controls search quality AND incoherence processing for
     /// essentially all of a MoE model's weight mass.
     ///
-    /// Current default: Greedy unless `ARC_QTIP_EXPERT_VITERBI=1` — measured
-    /// matmul cos on real V4 experts: greedy=0.887 vs viterbi=0.962, and PPL
-    /// qtip2=58.85 vs q2k=22.50 (H200, 2026-08-13) traces directly to this
-    /// default. See `bake_quality_tests::bake_quality_regression_default_expert_path`.
+    /// Default: **Viterbi** (wave3-G fix). The previous Greedy default baked
+    /// every expert with greedy walk + NO rotation + max/3 scales and was the
+    /// root cause of PPL qtip2=58.85 vs q2k=22.50 (H200, 2026-08-13): on
+    /// realistic FP4-lattice heavy-tailed fixtures the greedy/no-rotation
+    /// path reaches matmul cos ≈0.68-0.80 vs ≥0.96 for Viterbi+rotation
+    /// (see `bake_quality_tests`). GPU Viterbi keeps the bake in the 7-20 min
+    /// budget (RUN-161 prefix-grouped kernel), so speed is no longer a reason
+    /// to default to Greedy.
+    ///
+    /// `ARC_QTIP_EXPERT_GREEDY=1` opts back into the fast low-quality bake
+    /// (smoke tests only). `ARC_QTIP_EXPERT_VITERBI` remains accepted as a
+    /// no-op for runbook compatibility.
     pub fn default_expert_mode() -> Self {
-        if std::env::var_os("ARC_QTIP_EXPERT_VITERBI").is_some() {
-            QtipMode::Viterbi
-        } else {
+        if std::env::var_os("ARC_QTIP_EXPERT_GREEDY").is_some() {
             QtipMode::Greedy
+        } else {
+            QtipMode::Viterbi
         }
     }
 }
