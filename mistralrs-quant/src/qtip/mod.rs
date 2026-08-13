@@ -71,6 +71,46 @@ pub use viterbi::viterbi_quantize_row;
 /// needing to ship the sign vector in older formats (the seed alone is enough).
 const QTIP_ROTATION_SEED: u64 = 0xA3C1_7B0F_5F2E_1D4D;
 
+/// The Hadamard rotation seed actually used at QUANTIZE time.
+///
+/// `ARC_QTIP_ROTATION_SEED=<u64>` (decimal, or hex with `0x` prefix) overrides
+/// the default. Decode correctness does not depend on this: the sign vector is
+/// serialized into the UQFF payload and every forward/gather path reads the
+/// STORED `rotation_signs`, never the seed. This makes independent twin-seed
+/// bakes possible (session-2 ensemble experiment): two bakes with different
+/// seeds have decorrelated rotation/quantization error on the same weights.
+fn rotation_seed() -> u64 {
+    match std::env::var("ARC_QTIP_ROTATION_SEED") {
+        Ok(s) => {
+            let s = s.trim();
+            let parsed = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                u64::from_str_radix(hex, 16)
+            } else {
+                s.parse::<u64>()
+            };
+            match parsed {
+                Ok(v) => {
+                    // Once-per-process notice so the bake log records the seed.
+                    use std::sync::Once;
+                    static LOGGED: Once = Once::new();
+                    LOGGED.call_once(|| {
+                        tracing::info!(
+                            "QTIP rotation seed overridden: ARC_QTIP_ROTATION_SEED={v:#x}"
+                        );
+                    });
+                    v
+                }
+                Err(e) => {
+                    panic!(
+                        "ARC_QTIP_ROTATION_SEED={s:?} is not a valid u64 (decimal or 0x-hex): {e}"
+                    )
+                }
+            }
+        }
+        Err(_) => QTIP_ROTATION_SEED,
+    }
+}
+
 /// Maximum block size for the block-diagonal Hadamard rotation.
 ///
 /// Real LLM linear layers have `in_features` that is not always a power of 2
@@ -497,7 +537,7 @@ impl QtipLayer {
         let (rotation_block, rotation_signs_vec) = if use_rotation {
             let block = rotation_block_size(k_in);
             if block >= 2 {
-                (block, generate_signs(QTIP_ROTATION_SEED, k_in))
+                (block, generate_signs(rotation_seed(), k_in))
             } else {
                 (0usize, Vec::new())
             }
@@ -674,7 +714,7 @@ impl QtipLayer {
         let (rotation_block, rotation_signs_vec) = if use_rotation {
             let block = rotation_block_size(k_in);
             if block >= 2 && matches!(block, 2 | 4 | 8 | 16 | 32 | 64 | 128) {
-                (block, generate_signs(QTIP_ROTATION_SEED, k_in))
+                (block, generate_signs(rotation_seed(), k_in))
             } else {
                 // Unsupported block size for the CUDA path; defer to CPU.
                 return Ok(None);
