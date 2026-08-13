@@ -1505,3 +1505,217 @@ pub(crate) fn quantize_rows_2b_cuda(
 
     Ok((packed, row_scales))
 }
+
+/// Trellis grouped GEMM over expert-sorted (token, slot) pairs — the
+/// batched-MoE prefill path (Arc Stage 4). Routes ON-DEVICE (histogram +
+/// scans/tile-map + grouped scatter, zero host syncs), then runs the
+/// persistent tensor-core kernel: cp.async-staged packed trellis tiles,
+/// in-register 3INST decode into BF16/F16 fragments, mma.sync m16n8k16.
+///
+/// Shapes:
+///   * `blocks`     : `[E, n_rows, packed_per_row]` U8 (3-D stacked experts)
+///   * `row_scales` : `[E, n_rows]` F32
+///   * `x_rotated`  : `[n_pairs, in_features]` BF16/F16 (ALREADY rotated)
+///   * `indices`    : `[n_pairs]` U32 (expert id per pair)
+/// Returns `[n_pairs, n_rows]` (same dtype as `x_rotated`). Pairs whose
+/// router id is out of range are dropped by routing; their output rows are
+/// zero (the kernel contract requires — and this wrapper provides — a
+/// zero-initialized output buffer).
+///
+/// Requires `in_features % GROUPED_TILE_K == 0` (the k-chunked cp.async
+/// pipeline; every production MoE hidden/intermediate size qualifies).
+/// Callers with other shapes use the per-pair gather GEMV or CPU paths.
+pub(crate) fn grouped_gemm_2b_cuda(
+    blocks: &Tensor,
+    row_scales: &Tensor,
+    mcg_mult: u32,
+    x_rotated: &Tensor,
+    indices: &Tensor,
+    in_features: usize,
+) -> Result<Tensor> {
+    use super::grouped::{grouped_max_m_tiles, GROUPED_TILE_K, GROUPED_TILE_M};
+
+    if !ffi::HAVE_QTIP_KERNELS {
+        candle_core::bail!("qtip2b grouped gemm CUDA: kernels not compiled in");
+    }
+    let num_experts = blocks.dim(0)?;
+    let n_rows = row_scales.dim(1)?;
+    let packed_per_row = blocks.dim(2)?;
+    let num_symbols = in_features; // V = 1
+
+    if blocks.dtype() != DType::U8 {
+        candle_core::bail!("qtip2b grouped gemm CUDA: blocks dtype must be U8");
+    }
+    if row_scales.dtype() != DType::F32 {
+        candle_core::bail!("qtip2b grouped gemm CUDA: row_scales dtype must be F32");
+    }
+    if indices.dtype() != DType::U32 {
+        candle_core::bail!("qtip2b grouped gemm CUDA: indices dtype must be U32");
+    }
+    if !blocks.layout().is_contiguous() || !row_scales.layout().is_contiguous() {
+        candle_core::bail!("qtip2b grouped gemm CUDA: blocks/scales must be contiguous");
+    }
+    if !num_symbols.is_multiple_of(GROUPED_TILE_K) {
+        candle_core::bail!(
+            "qtip2b grouped gemm CUDA: in_features {num_symbols} must be a multiple of {GROUPED_TILE_K}"
+        );
+    }
+
+    let (n_pairs, x_cols) = x_rotated.dims2()?;
+    if x_cols != in_features {
+        candle_core::bail!(
+            "qtip2b grouped gemm CUDA: x_rotated cols {x_cols} != in_features {in_features}"
+        );
+    }
+    let idx_pairs = indices.elem_count();
+    if idx_pairs != n_pairs {
+        candle_core::bail!(
+            "qtip2b grouped gemm CUDA: indices len {idx_pairs} != n_pairs {n_pairs}"
+        );
+    }
+    let out_dtype = x_rotated.dtype();
+    if !matches!(out_dtype, DType::BF16 | DType::F16) {
+        candle_core::bail!(
+            "qtip2b grouped gemm CUDA: 16-bit activations required (BF16/F16), got {out_dtype:?}"
+        );
+    }
+    if n_pairs == 0 {
+        return Tensor::zeros((0usize, n_rows), out_dtype, blocks.device());
+    }
+    // The kernel gathers activation rows and packed rows with 16-byte
+    // cp.async transfers; the freshly-allocated contiguous buffers below
+    // plus the `% GROUPED_TILE_K` gate satisfy its alignment contract.
+    let x_2d = x_rotated.contiguous()?;
+    let indices = indices.flatten_all()?.contiguous()?;
+
+    let dev = match blocks.device() {
+        candle_core::Device::Cuda(d) => d.clone(),
+        _ => candle_core::bail!("qtip2b grouped gemm CUDA: blocks must live on CUDA"),
+    };
+    if !matches!(x_2d.device(), candle_core::Device::Cuda(_))
+        || !matches!(indices.device(), candle_core::Device::Cuda(_))
+    {
+        candle_core::bail!("qtip2b grouped gemm CUDA: x_rotated and indices must live on CUDA");
+    }
+
+    let max_m_tiles = grouped_max_m_tiles(n_pairs, num_experts);
+
+    // Routing scratch. `counts` and `cursors` MUST be zeroed (histogram /
+    // scatter accumulate into them); the rest is written before being read.
+    // TUNING: fold these into one arena reused across layers and steps —
+    // eight small allocs per MoE matmul is launch-latency noise but not
+    // free.
+    let counts = dev.alloc_zeros::<u32>(num_experts)?;
+    let offsets = dev.alloc_zeros::<u32>(num_experts + 1)?;
+    let cursors = dev.alloc_zeros::<u32>(num_experts)?;
+    let tile_prefix = dev.alloc_zeros::<u32>(num_experts)?;
+    let tile_expert = dev.alloc_zeros::<u32>(max_m_tiles)?;
+    let tile_row_start = dev.alloc_zeros::<u32>(max_m_tiles)?;
+    let num_tiles = dev.alloc_zeros::<u32>(1)?;
+    let sorted_pairs = dev.alloc_zeros::<u32>(n_pairs)?;
+
+    let out_shape = candle_core::Shape::from_dims(&[n_pairs, n_rows]);
+
+    let (blocks_storage, blocks_layout) = blocks.storage_and_layout();
+    let blocks_storage = match &*blocks_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("qtip2b grouped gemm CUDA: blocks storage must be CUDA"),
+    };
+    let (scales_storage, scales_layout) = row_scales.storage_and_layout();
+    let scales_storage = match &*scales_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("qtip2b grouped gemm CUDA: scales storage must be CUDA"),
+    };
+    let (x_storage, x_layout) = x_2d.storage_and_layout();
+    let x_storage = match &*x_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("qtip2b grouped gemm CUDA: x storage must be CUDA"),
+    };
+    let (idx_storage, idx_layout) = indices.storage_and_layout();
+    let idx_storage = match &*idx_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("qtip2b grouped gemm CUDA: indices storage must be CUDA"),
+    };
+
+    let (blocks_ptr, _blocks_guard) = slice_ptr(
+        blocks_storage.as_cuda_slice::<u8>()?,
+        blocks_layout.start_offset(),
+    );
+    let (scales_ptr, _scales_guard) = slice_ptr(
+        scales_storage.as_cuda_slice::<f32>()?,
+        scales_layout.start_offset(),
+    );
+    let (idx_ptr, _idx_guard) = slice_ptr(
+        idx_storage.as_cuda_slice::<u32>()?,
+        idx_layout.start_offset(),
+    );
+
+    let (counts_ptr, _counts_guard) = slice_ptr(&counts, 0);
+    let (offsets_ptr, _offsets_guard) = slice_ptr(&offsets, 0);
+    let (cursors_ptr, _cursors_guard) = slice_ptr(&cursors, 0);
+    let (tp_ptr, _tp_guard) = slice_ptr(&tile_prefix, 0);
+    let (te_ptr, _te_guard) = slice_ptr(&tile_expert, 0);
+    let (trs_ptr, _trs_guard) = slice_ptr(&tile_row_start, 0);
+    let (nt_ptr, _nt_guard) = slice_ptr(&num_tiles, 0);
+    let (sp_ptr, _sp_guard) = slice_ptr(&sorted_pairs, 0);
+
+    // Route: histogram -> scans + ragged tile map -> grouped scatter. All
+    // on the stream; nothing comes back to the host.
+    unsafe {
+        ffi::launch_qtip2b_moe_route(
+            idx_ptr as *const _,
+            counts_ptr as *mut _,
+            offsets_ptr as *mut _,
+            cursors_ptr as *mut _,
+            tp_ptr as *mut _,
+            te_ptr as *mut _,
+            trs_ptr as *mut _,
+            nt_ptr as *mut _,
+            sp_ptr as *mut _,
+            n_pairs as i32,
+            num_experts as i32,
+            GROUPED_TILE_M as i32,
+            dev.cuda_stream().cu_stream(),
+        );
+    }
+
+    macro_rules! grouped_dtype {
+        ($T:ty, $launch:expr) => {{
+            let (x_ptr, _x_guard) =
+                slice_ptr(x_storage.as_cuda_slice::<$T>()?, x_layout.start_offset());
+            // alloc_zeros is part of the kernel contract: rows dropped by
+            // routing (out-of-range router ids) are never written.
+            let out_buf = dev.alloc_zeros::<$T>(n_pairs * n_rows)?;
+            let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
+            unsafe {
+                $launch(
+                    blocks_ptr as *const _,
+                    scales_ptr as *const _,
+                    x_ptr as *const _,
+                    sp_ptr as *const _,
+                    te_ptr as *const _,
+                    trs_ptr as *const _,
+                    offsets_ptr as *const _,
+                    nt_ptr as *const _,
+                    out_ptr as *mut _,
+                    n_rows as i32,
+                    packed_per_row as i32,
+                    num_symbols as i32,
+                    max_m_tiles as i32,
+                    mcg_mult,
+                    dev.cuda_stream().cu_stream(),
+                );
+            }
+            drop(out_guard);
+            CudaStorage::wrap_cuda_slice(out_buf, dev.clone())
+        }};
+    }
+
+    let res = match out_dtype {
+        DType::BF16 => grouped_dtype!(bf16, ffi::launch_qtip2b_grouped_gemm_bf16),
+        DType::F16 => grouped_dtype!(f16, ffi::launch_qtip2b_grouped_gemm_f16),
+        other => candle_core::bail!("qtip2b grouped gemm CUDA: unsupported x dtype {other:?}"),
+    };
+
+    Ok(Tensor::from((Storage::Cuda(res), out_shape)))
+}

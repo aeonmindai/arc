@@ -350,4 +350,69 @@ extern "C" {
         mult: u32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
+
+    // ----- Grouped GEMM (batched MoE prefill; kernels/qtip/qtip_grouped_gemm.cu) -----
+    //
+    // On-device routing (histogram + scans/tile-map + grouped scatter) for
+    // the trellis grouped GEMM. ZERO host syncs: `d_num_tiles` stays on the
+    // device and the GEMM grid is sized from the host-side upper bound
+    // `max_m_tiles = ceil(n_pairs / TILE_M) + num_experts`. `d_counts` and
+    // `d_cursors` must be zero-initialized.
+    pub(crate) fn launch_qtip2b_moe_route(
+        d_indices: *const u32,
+        d_counts: *mut u32,
+        d_offsets: *mut u32,
+        d_cursors: *mut u32,
+        d_tile_prefix: *mut u32,
+        d_tile_expert: *mut u32,
+        d_tile_row_start: *mut u32,
+        d_num_tiles: *mut u32,
+        d_sorted_pairs: *mut u32,
+        n_pairs: i32,
+        num_experts: i32,
+        tile_m: i32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
+    // W2A16 trellis grouped GEMM over expert-sorted (token, slot) pairs.
+    // `d_x_rotated` must already be in the QTIP-rotated frame; `d_y`
+    // ([n_pairs, n_rows]) must be zero-initialized (rows dropped by routing
+    // are never written). 16-bit activation dtypes only — the mma.sync
+    // pipeline is the point of this kernel; F32 callers use the fallback
+    // paths.
+    pub(crate) fn launch_qtip2b_grouped_gemm_bf16(
+        d_packed: *const u8,
+        d_row_scales: *const f32,
+        d_x_rotated: *const bf16,
+        d_sorted_pairs: *const u32,
+        d_tile_expert: *const u32,
+        d_tile_row_start: *const u32,
+        d_offsets: *const u32,
+        d_num_tiles: *const u32,
+        d_y: *mut bf16,
+        n_rows: i32,
+        packed_per_row: i32,
+        num_symbols: i32,
+        max_m_tiles: i32,
+        mult: u32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
+    pub(crate) fn launch_qtip2b_grouped_gemm_f16(
+        d_packed: *const u8,
+        d_row_scales: *const f32,
+        d_x_rotated: *const f16,
+        d_sorted_pairs: *const u32,
+        d_tile_expert: *const u32,
+        d_tile_row_start: *const u32,
+        d_offsets: *const u32,
+        d_num_tiles: *const u32,
+        d_y: *mut f16,
+        n_rows: i32,
+        packed_per_row: i32,
+        num_symbols: i32,
+        max_m_tiles: i32,
+        mult: u32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
 }

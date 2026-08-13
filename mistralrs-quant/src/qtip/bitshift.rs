@@ -86,6 +86,7 @@ use crate::{
     IsqType, QuantMethod, QuantMethodConfig, QuantizeOntoGuard, QuantizedSerde, QuantizedSerdeType,
 };
 
+use super::grouped::ExpertBpwTable;
 use super::{apply_block_rotation, rotation_block_size, QtipMode, QTIP_ROTATION_SEED};
 
 #[cfg(feature = "cuda")]
@@ -329,6 +330,11 @@ pub struct Qtip2bLayer {
     /// MCG multiplier defining the computed codebook. Persisted in UQFF so a
     /// future retuned constant can't silently mis-decode old checkpoints.
     mcg_mult: u32,
+    /// Per-expert bit-width descriptors for the grouped-GEMM dispatch
+    /// (`Some` iff this is a 3-D expert stack). Uniform 2-bit today; the
+    /// table exists so mixed-precision stacks (4-bit hot experts) only have
+    /// to extend the per-class launch loop. See `super::grouped`.
+    expert_bpw: Option<ExpertBpwTable>,
 }
 
 impl Qtip2bLayer {
@@ -518,6 +524,7 @@ impl Qtip2bLayer {
             rotation_signs,
             rotation_block,
             mcg_mult,
+            expert_bpw: None,
         })
     }
 
@@ -584,6 +591,7 @@ impl Qtip2bLayer {
             rotation_signs,
             rotation_block,
             mcg_mult: QTIP2B_MCG_MULT,
+            expert_bpw: None,
         }))
     }
 
@@ -688,6 +696,7 @@ impl Qtip2bLayer {
             rotation_signs: shared_rotation_signs,
             rotation_block: shared_rotation_block,
             mcg_mult,
+            expert_bpw: Some(ExpertBpwTable::uniform_2bit(e)),
         }))
     }
 
@@ -1031,24 +1040,19 @@ impl Qtip2bLayer {
         self.dequantize_expert_cpu(&blocks_e, &scales_e, n, self.in_features)
     }
 
-    /// CPU sparse-gather forward (portable reference). Mirrors the LUT
-    /// rung's `gather_forward_cpu`: dequantize each **unique** routed expert
-    /// once (original frame), batch the (token, slot) pairs per expert, and
-    /// scatter results back.
-    fn gather_forward_cpu(&self, a: &Tensor, indices: &Tensor) -> Result<Tensor> {
-        let (n_tokens, n_experts_per_tok, cols) = a.dims3()?;
-        let (i_tokens, i_k) = indices.dims2()?;
-        if i_tokens != n_tokens || i_k != n_experts_per_tok {
-            candle_core::bail!(
-                "Qtip2bLayer::gather_forward: indices shape ({i_tokens}, {i_k}) doesn't match a shape ({n_tokens}, {n_experts_per_tok}, {cols})"
-            );
-        }
-        if cols != self.in_features {
-            candle_core::bail!(
-                "Qtip2bLayer::gather_forward: a.dim(-1)={cols} != in_features={}",
-                self.in_features
-            );
-        }
+    /// CPU grouped reference over flattened (token, slot) pairs: dequantize
+    /// each **unique** routed expert once (original frame), batch the pairs
+    /// per expert, dense matmul per group, scatter results back. This is
+    /// exactly the computation the CUDA grouped GEMM performs (loop experts
+    /// → dense matmul on dequantized weights) and is the correctness
+    /// reference its parity tests compare against.
+    ///
+    /// `a2d` is `[total_pairs, in_features]`, `indices` is `[total_pairs]`.
+    /// Returns `[total_pairs, out_features]` (bias-free — callers attach
+    /// the 2-D bias where the shape supports one).
+    fn gather_forward_batched_cpu(&self, a2d: &Tensor, indices: &Tensor) -> Result<Tensor> {
+        let (total_pairs, cols) = a2d.dims2()?;
+        debug_assert_eq!(cols, self.in_features);
         let rows = self.rows_per_expert()?;
         let num_experts = self.num_experts_count();
 
@@ -1057,6 +1061,12 @@ impl Qtip2bLayer {
             .flatten_all()?
             .to_dtype(DType::U32)?
             .to_vec1()?;
+        if idx_cpu.len() != total_pairs {
+            candle_core::bail!(
+                "Qtip2bLayer::gather_forward_batched: indices len {} != total_pairs {total_pairs}",
+                idx_cpu.len()
+            );
+        }
 
         let mut unique_ids: Vec<usize> = idx_cpu.iter().map(|&v| v as usize).collect();
         unique_ids.sort_unstable();
@@ -1074,11 +1084,10 @@ impl Qtip2bLayer {
         for &e in &unique_ids {
             let w_e = self
                 .dequantize_expert_weights_unrotated(e)?
-                .to_dtype(a.dtype())?;
+                .to_dtype(a2d.dtype())?;
             weight_cache.insert(e, w_e);
         }
 
-        let total_pairs = n_tokens * n_experts_per_tok;
         let mut positions_by_expert: std::collections::HashMap<usize, Vec<u32>> =
             std::collections::HashMap::with_capacity(unique_ids.len());
         for (flat, &e_u32) in idx_cpu.iter().enumerate() {
@@ -1088,26 +1097,140 @@ impl Qtip2bLayer {
                 .push(flat as u32);
         }
 
-        let a_flat = a.reshape((total_pairs, cols))?;
-        let device = a.device();
-        let mut out_flat = Tensor::zeros((total_pairs, rows), a.dtype(), device)?;
+        let device = a2d.device();
+        let mut out_flat = Tensor::zeros((total_pairs, rows), a2d.dtype(), device)?;
 
         for &e in &unique_ids {
             let positions = positions_by_expert
                 .get(&e)
                 .expect("positions for expert should be populated");
             let pos_tensor = Tensor::from_vec(positions.clone(), (positions.len(),), device)?;
-            let a_e = a_flat.index_select(&pos_tensor, 0)?;
+            let a_e = a2d.index_select(&pos_tensor, 0)?;
             let w_e = weight_cache.get(&e).expect("weight should be cached");
             let y_e = a_e.matmul(&w_e.t()?)?;
             out_flat = out_flat.index_add(&pos_tensor, &y_e, 0)?;
         }
+
+        Ok(out_flat)
+    }
+
+    /// CPU sparse-gather forward (portable reference). Mirrors the LUT
+    /// rung's `gather_forward_cpu`; the grouped math lives in
+    /// [`Self::gather_forward_batched_cpu`] on the flattened pair view.
+    fn gather_forward_cpu(&self, a: &Tensor, indices: &Tensor) -> Result<Tensor> {
+        let (n_tokens, n_experts_per_tok, cols) = a.dims3()?;
+        let (i_tokens, i_k) = indices.dims2()?;
+        if i_tokens != n_tokens || i_k != n_experts_per_tok {
+            candle_core::bail!(
+                "Qtip2bLayer::gather_forward: indices shape ({i_tokens}, {i_k}) doesn't match a shape ({n_tokens}, {n_experts_per_tok}, {cols})"
+            );
+        }
+        if cols != self.in_features {
+            candle_core::bail!(
+                "Qtip2bLayer::gather_forward: a.dim(-1)={cols} != in_features={}",
+                self.in_features
+            );
+        }
+        let rows = self.rows_per_expert()?;
+
+        let total_pairs = n_tokens * n_experts_per_tok;
+        let out_flat = self.gather_forward_batched_cpu(
+            &a.reshape((total_pairs, cols))?,
+            &indices.reshape((total_pairs,))?,
+        )?;
 
         let mut out = out_flat.reshape((n_tokens, n_experts_per_tok, rows))?;
         if let Some(bias) = &self.bias {
             out = out.broadcast_add(&bias.to_dtype(out.dtype())?)?;
         }
         Ok(out)
+    }
+
+    /// Batched MoE forward over flattened (token, slot) pairs — the prefill
+    /// regime's entry into the **trellis grouped GEMM** (Arc Stage 4,
+    /// `kernels/qtip/qtip_grouped_gemm.cu`).
+    ///
+    /// * `a2d`: `[total_pairs, in_features]` activations (original frame).
+    /// * `indices`: `[total_pairs]` router expert ids.
+    ///
+    /// Returns `[total_pairs, out_features]`.
+    ///
+    /// On CUDA with 16-bit activations and `in_features % 64 == 0`, pairs
+    /// are sorted by expert on-device (histogram → scans/tile-map → grouped
+    /// scatter — ZERO host syncs) and a persistent tensor-core kernel walks
+    /// the ragged tile list, decoding the 2-bit trellis in registers into
+    /// mma.sync fragments. Everywhere else this falls back to the CPU
+    /// grouped reference (dequantize each routed expert once, dense matmul
+    /// per group).
+    pub fn gather_forward_batched(&self, a2d: &Tensor, indices: &Tensor) -> Result<Tensor> {
+        if self.num_experts.is_none() {
+            candle_core::bail!(
+                "Qtip2bLayer::gather_forward_batched requires an expert-stacked 3-D layer"
+            );
+        }
+        let (total_pairs, cols) = a2d.dims2()?;
+        if cols != self.in_features {
+            candle_core::bail!(
+                "Qtip2bLayer::gather_forward_batched: a2d.dim(1)={cols} != in_features={}",
+                self.in_features
+            );
+        }
+        if indices.elem_count() != total_pairs {
+            candle_core::bail!(
+                "Qtip2bLayer::gather_forward_batched: indices len {} != total_pairs {total_pairs}",
+                indices.elem_count()
+            );
+        }
+        // Per-expert bit-width dispatch: the 2-bit class is implemented
+        // end-to-end; a mixed table partitions its expert groups by class
+        // and launches per class once the 4-bit rung lands.
+        if let Some(table) = &self.expert_bpw {
+            if !table.is_uniform_2bit() {
+                candle_core::bail!(
+                    "Qtip2bLayer::gather_forward_batched: mixed-bpw expert tables need the \
+                     per-class grouped dispatch (4-bit rung); only uniform 2-bit ships today"
+                );
+            }
+        }
+
+        #[cfg(feature = "cuda")]
+        {
+            if cuda_ops::can_use_qtip_cuda(&self.blocks)
+                && matches!(a2d.device(), candle_core::Device::Cuda(_))
+                && matches!(a2d.dtype(), DType::BF16 | DType::F16)
+                && self
+                    .in_features
+                    .is_multiple_of(super::grouped::GROUPED_TILE_K)
+            {
+                let a_contig = a2d.contiguous()?;
+                let a_rotated = if self.rotation_block >= 2 {
+                    let signs = match &self.rotation_signs {
+                        Some(t) => t,
+                        None => candle_core::bail!(
+                            "Qtip2bLayer: rotation_block={} but rotation_signs is None",
+                            self.rotation_block
+                        ),
+                    };
+                    cuda_ops::rotate_x_cuda(&a_contig, signs, self.rotation_block)?
+                } else {
+                    a_contig
+                };
+                let idx = indices
+                    .reshape((total_pairs,))?
+                    .to_dtype(DType::U32)?
+                    .contiguous()?;
+                return cuda_ops::grouped_gemm_2b_cuda(
+                    &self.blocks,
+                    &self.row_scales,
+                    self.mcg_mult,
+                    &a_rotated,
+                    &idx,
+                    self.in_features,
+                );
+            }
+        }
+
+        self.gather_forward_batched_cpu(a2d, indices)
     }
 
     /// On-device (sync-free) MoE gather + fused decode GEMV for the decode
@@ -1199,6 +1322,12 @@ impl Qtip2bLayer {
     pub fn rotation_block(&self) -> usize {
         self.rotation_block
     }
+
+    /// Per-expert bit-width descriptor table (`Some` iff this is a 3-D
+    /// expert stack). Consulted by the grouped-GEMM dispatch.
+    pub fn expert_bpw(&self) -> Option<&ExpertBpwTable> {
+        self.expert_bpw.as_ref()
+    }
 }
 
 impl QuantMethod for Qtip2bLayer {
@@ -1230,6 +1359,7 @@ impl QuantMethod for Qtip2bLayer {
                     rotation_signs,
                     rotation_block,
                     mcg_mult,
+                    expert_bpw: num_experts.map(ExpertBpwTable::uniform_2bit),
                 })
             }
             _ => candle_core::bail!("Qtip2bLayer requires QuantMethodConfig::Qtip2b"),
@@ -1281,6 +1411,33 @@ impl QuantMethod for Qtip2bLayer {
                 let ondevice_disabled = std::env::var("ARC_NO_QTIP_ONDEVICE_MOE").is_ok();
                 if !ondevice_disabled && n_tokens <= ondevice_max_tokens {
                     return self.gather_forward_cuda_ondevice(a, indices);
+                }
+
+                // Prefill regime: the trellis grouped GEMM (Arc Stage 4).
+                // Tokens sorted by expert on-device, persistent tensor-core
+                // tile loop over the ragged groups — this is where batched
+                // 2-bit MoE serving actually lives. 16-bit activations only
+                // (the mma.sync pipeline is the point); other dtypes keep
+                // the CPU reference below.
+                let grouped_disabled = std::env::var("ARC_NO_QTIP_GROUPED_MOE").is_ok();
+                if !grouped_disabled
+                    && matches!(a.dtype(), DType::BF16 | DType::F16)
+                    && self
+                        .in_features
+                        .is_multiple_of(super::grouped::GROUPED_TILE_K)
+                    && self.expert_bpw.as_ref().is_none_or(|t| t.is_uniform_2bit())
+                {
+                    let total_pairs = n_tokens * n_experts_per_tok;
+                    let out_flat = self.gather_forward_batched(
+                        &a.reshape((total_pairs, cols))?,
+                        &indices.reshape((total_pairs,))?,
+                    )?;
+                    let mut out =
+                        out_flat.reshape((n_tokens, n_experts_per_tok, self.rows_per_expert()?))?;
+                    if let Some(bias) = &self.bias {
+                        out = out.broadcast_add(&bias.to_dtype(out.dtype())?)?;
+                    }
+                    return Ok(out);
                 }
             }
         }
@@ -1412,6 +1569,10 @@ impl Qtip2bLayer {
                 rotation_signs,
                 rotation_block,
                 mcg_mult,
+                // UQFF today only carries the uniform 2-bit format; a
+                // mixed-bpw payload would arrive with the 4-bit rung's
+                // serde revision.
+                expert_bpw: num_experts.map(ExpertBpwTable::uniform_2bit),
             },
             ext_bias,
         ))
@@ -2227,6 +2388,183 @@ mod tests {
         Ok(())
     }
 
+    // -- grouped GEMM (batched MoE prefill) ---------------------------------
+
+    /// Quantize a 3-D expert stack and hand back the **concrete** layer
+    /// (via the UQFF round-trip — `quantize_with_options_3d` returns
+    /// `Arc<dyn QuantMethod>` and the trait has no downcast hook).
+    fn concrete_3d_layer(
+        w3: &Tensor,
+        device: &Device,
+        mode: QtipMode,
+        rotation: bool,
+    ) -> Result<Qtip2bLayer> {
+        let layer = Qtip2bLayer::quantize_with_options_3d(w3, device, mode, rotation)?;
+        let payload = layer.serialize()?;
+        let (concrete, _) =
+            Qtip2bLayer::deserialize_concrete(payload, device, QuantizeOntoGuard::new())?;
+        Ok(concrete)
+    }
+
+    /// Ragged (token, slot) pair fixtures for the grouped tests: returns
+    /// `(expert ids per pair)` for a handful of adversarial distributions.
+    fn ragged_index_fixtures(num_experts: usize) -> Vec<Vec<u32>> {
+        let e = num_experts as u32;
+        vec![
+            // 1 giant expert + many tiny (some experts empty).
+            {
+                let mut v = vec![0u32; 40];
+                v.extend([1, 2, 2, e - 1, 1, e - 2]);
+                v
+            },
+            // All pairs on one expert; every other expert empty. 33 pairs
+            // = 2 full m-tiles + 1 single-row tail tile.
+            vec![e / 2; 33],
+            // Single pair.
+            vec![e - 1],
+            // Round-robin (every expert non-empty, all groups partial).
+            (0..2 * e).map(|i| i % e).collect(),
+        ]
+    }
+
+    /// Correctness harness (a): the grouped batched output matches a
+    /// per-pair dense matmul on the dequantized weights, across ragged
+    /// group shapes.
+    #[test]
+    fn gather_forward_batched_matches_per_pair_dense() -> Result<()> {
+        let device = Device::Cpu;
+        let (e, n, k_in) = (4usize, 24usize, 64usize);
+        let w3 = build_3d_gaussian_weight(e, n, k_in)?;
+        let layer = concrete_3d_layer(&w3, &device, QtipMode::Viterbi, true)?;
+
+        for (case, idx) in ragged_index_fixtures(e).into_iter().enumerate() {
+            let p = idx.len();
+            let a_data = gaussian_fixture(p * k_in, 1000 + case as u64, 1.0);
+            let a2d = Tensor::from_vec(a_data, (p, k_in), &device)?;
+            let indices = Tensor::from_vec(idx.clone(), (p,), &device)?;
+
+            let grouped: Vec<f32> = layer
+                .gather_forward_batched(&a2d, &indices)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1()?;
+
+            // Per-pair dense reference: one matmul per pair against that
+            // pair's expert, no grouping anywhere.
+            let mut dense = vec![0f32; p * n];
+            for (pair, &expert) in idx.iter().enumerate() {
+                let w_e = layer
+                    .dequantize_expert_weights_unrotated(expert as usize)?
+                    .to_dtype(DType::F32)?;
+                let x_p = a2d.narrow(0, pair, 1)?;
+                let y_p: Vec<f32> = x_p.matmul(&w_e.t()?)?.flatten_all()?.to_vec1()?;
+                dense[pair * n..(pair + 1) * n].copy_from_slice(&y_p);
+            }
+
+            let c = cos_sim(&grouped, &dense);
+            assert!(
+                c > 0.9999,
+                "case {case}: grouped batched cos {c} vs per-pair dense"
+            );
+        }
+        Ok(())
+    }
+
+    /// The 3-D `gather_forward` API and the flattened
+    /// `gather_forward_batched` API compute the same thing.
+    #[test]
+    fn gather_forward_batched_matches_gather_forward() -> Result<()> {
+        let device = Device::Cpu;
+        let (e, n, k_in) = (4usize, 16usize, 64usize);
+        let w3 = build_3d_gaussian_weight(e, n, k_in)?;
+        let layer = concrete_3d_layer(&w3, &device, QtipMode::Viterbi, true)?;
+
+        let (n_tokens, top_k) = (6usize, 2usize);
+        let p = n_tokens * top_k;
+        let a_data = gaussian_fixture(p * k_in, 4321, 1.0);
+        let a3 = Tensor::from_vec(a_data, (n_tokens, top_k, k_in), &device)?;
+        let idx: Vec<u32> = (0..p as u32).map(|i| i % e as u32).collect();
+        let idx3 = Tensor::from_vec(idx.clone(), (n_tokens, top_k), &device)?;
+
+        let via_gather: Vec<f32> = layer.gather_forward(&a3, &idx3)?.flatten_all()?.to_vec1()?;
+        let via_batched: Vec<f32> = layer
+            .gather_forward_batched(
+                &a3.reshape((p, k_in))?,
+                &Tensor::from_vec(idx, (p,), &device)?,
+            )?
+            .flatten_all()?
+            .to_vec1()?;
+        assert_eq!(
+            via_gather.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            via_batched.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "gather_forward and gather_forward_batched diverged"
+        );
+        Ok(())
+    }
+
+    /// Correctness harness (c), CPU half: same input → bit-identical output.
+    #[test]
+    fn gather_forward_batched_deterministic() -> Result<()> {
+        let device = Device::Cpu;
+        let (e, n, k_in) = (3usize, 8usize, 64usize);
+        let w3 = build_3d_gaussian_weight(e, n, k_in)?;
+        let layer = concrete_3d_layer(&w3, &device, QtipMode::Greedy, false)?;
+
+        let idx: Vec<u32> = vec![2, 0, 2, 2, 1, 0, 2];
+        let p = idx.len();
+        let a_data = gaussian_fixture(p * k_in, 99, 1.0);
+        let a2d = Tensor::from_vec(a_data, (p, k_in), &device)?;
+        let indices = Tensor::from_vec(idx, (p,), &device)?;
+
+        let y1: Vec<f32> = layer
+            .gather_forward_batched(&a2d, &indices)?
+            .flatten_all()?
+            .to_vec1()?;
+        let y2: Vec<f32> = layer
+            .gather_forward_batched(&a2d, &indices)?
+            .flatten_all()?
+            .to_vec1()?;
+        assert_eq!(
+            y1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            y2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "batched gather is not deterministic"
+        );
+        Ok(())
+    }
+
+    /// The batched entry rejects mismatched shapes and 2-D layers.
+    #[test]
+    fn gather_forward_batched_validates_inputs() -> Result<()> {
+        let device = Device::Cpu;
+        let (e, _n, k_in) = (2usize, 4usize, 64usize);
+        let w3 = build_3d_gaussian_weight(e, 4, k_in)?;
+        let layer = concrete_3d_layer(&w3, &device, QtipMode::Greedy, false)?;
+
+        // Wrong K.
+        let a_bad = Tensor::zeros((2, k_in / 2), DType::F32, &device)?;
+        let idx = Tensor::zeros((2,), DType::U32, &device)?;
+        assert!(layer.gather_forward_batched(&a_bad, &idx).is_err());
+        // Wrong indices length.
+        let a_ok = Tensor::zeros((2, k_in), DType::F32, &device)?;
+        let idx_bad = Tensor::zeros((3,), DType::U32, &device)?;
+        assert!(layer.gather_forward_batched(&a_ok, &idx_bad).is_err());
+        // Out-of-range expert id (CPU path validates).
+        let idx_oob = Tensor::from_vec(vec![0u32, e as u32], (2,), &device)?;
+        assert!(layer.gather_forward_batched(&a_ok, &idx_oob).is_err());
+
+        // 2-D layers have no expert dim.
+        let w2 = Tensor::from_vec(gaussian_fixture(4 * k_in, 5, 0.5), (4, k_in), &device)?;
+        let layer2 = Qtip2bLayer::quantize_with_options_concrete(
+            &w2,
+            None,
+            &device,
+            QtipMode::Greedy,
+            false,
+        )?;
+        assert!(layer2.gather_forward_batched(&a_ok, &idx).is_err());
+        Ok(())
+    }
+
     // -- CUDA parity (compile-gated; run on the GPU session) -----------------
 
     /// CUDA dequantize matches the CPU decode bit-for-bit modulo the BF16
@@ -2271,6 +2609,7 @@ mod tests {
                 .transpose()?,
             rotation_block: layer.rotation_block,
             mcg_mult: layer.mcg_mult,
+            expert_bpw: None,
         };
         let cuda_dq: Vec<f32> = layer_cuda
             .dequantize_weights()?
@@ -2320,6 +2659,7 @@ mod tests {
                 .transpose()?,
             rotation_block: layer_cpu.rotation_block,
             mcg_mult: layer_cpu.mcg_mult,
+            expert_bpw: None,
         };
 
         let xdata = gaussian_fixture(k_in, 31337, 1.0);
@@ -2440,6 +2780,106 @@ mod tests {
             .to_vec1()?;
         let c = cos_sim(&dq_cpu, &dq_gpu);
         assert!(c > 0.99, "GPU-quantized dequant cos {c} vs CPU-quantized");
+        Ok(())
+    }
+
+    /// Correctness harness (b): the CUDA trellis grouped GEMM matches the
+    /// CPU grouped reference (loop experts, dense matmul on dequantized
+    /// weights) at cos > 0.9999 across ragged group shapes — 1 giant expert
+    /// + many tiny, all-pairs-one-expert (with empty experts), a single
+    /// pair, and round-robin partial groups. N = 96 exercises the n-tile
+    /// tail (96 = 64 + 32) and 40+ pairs exercise m-tile tails.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_grouped_gemm_matches_cpu_reference_ragged_shapes() -> Result<()> {
+        if !super::super::ffi::HAVE_QTIP_KERNELS {
+            return Ok(());
+        }
+        let cuda = Device::new_cuda(0)?;
+        let cpu = Device::Cpu;
+        let (e, n, k_in) = (8usize, 96usize, 256usize);
+        let w3 = build_3d_gaussian_weight(e, n, k_in)?;
+        let layer_cpu = concrete_3d_layer(&w3, &cpu, QtipMode::Viterbi, true)?;
+        let payload = layer_cpu.serialize()?;
+        let (layer_cuda, _) =
+            Qtip2bLayer::deserialize_concrete(payload, &cuda, QuantizeOntoGuard::new())?;
+
+        for (case, idx) in ragged_index_fixtures(e).into_iter().enumerate() {
+            let p = idx.len();
+            let a_data = gaussian_fixture(p * k_in, 7000 + case as u64, 1.0);
+            // Round activations to BF16 once so BOTH sides consume the same
+            // inputs; the CPU reference then runs in F32.
+            let a_bf16_cpu = Tensor::from_vec(a_data, (p, k_in), &cpu)?.to_dtype(DType::BF16)?;
+            let indices_cpu = Tensor::from_vec(idx.clone(), (p,), &cpu)?;
+
+            let reference: Vec<f32> = layer_cpu
+                .gather_forward_batched(&a_bf16_cpu.to_dtype(DType::F32)?, &indices_cpu)?
+                .flatten_all()?
+                .to_vec1()?;
+
+            let a_cuda = a_bf16_cpu.to_device(&cuda)?;
+            let indices_cuda = indices_cpu.to_device(&cuda)?;
+            let grouped: Vec<f32> = layer_cuda
+                .gather_forward_batched(&a_cuda, &indices_cuda)?
+                .to_dtype(DType::F32)?
+                .to_device(&cpu)?
+                .flatten_all()?
+                .to_vec1()?;
+
+            let c = cos_sim(&reference, &grouped);
+            assert!(
+                c > 0.9999,
+                "case {case}: grouped GEMM cos {c} vs CPU grouped reference"
+            );
+        }
+        Ok(())
+    }
+
+    /// Correctness harness (c), GPU half: the grouped kernel is bit-
+    /// identical across runs. The routing scatter uses atomic cursors (the
+    /// order WITHIN an expert group is run-dependent), but every output row
+    /// is a pure function of its own pair's activations with a fixed
+    /// k-summation order, so placement cannot change a single bit.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_grouped_gemm_deterministic() -> Result<()> {
+        if !super::super::ffi::HAVE_QTIP_KERNELS {
+            return Ok(());
+        }
+        let cuda = Device::new_cuda(0)?;
+        let cpu = Device::Cpu;
+        let (e, n, k_in) = (4usize, 64usize, 128usize);
+        let w3 = build_3d_gaussian_weight(e, n, k_in)?;
+        let layer_cpu = concrete_3d_layer(&w3, &cpu, QtipMode::Viterbi, true)?;
+        let payload = layer_cpu.serialize()?;
+        let (layer_cuda, _) =
+            Qtip2bLayer::deserialize_concrete(payload, &cuda, QuantizeOntoGuard::new())?;
+
+        // Heavy collisions on one expert so the atomic scatter order truly
+        // varies between runs.
+        let mut idx = vec![1u32; 50];
+        idx.extend([0, 3, 3, 2, 1, 0]);
+        let p = idx.len();
+        let a_data = gaussian_fixture(p * k_in, 31415, 1.0);
+        let a_cuda = Tensor::from_vec(a_data, (p, k_in), &cpu)?
+            .to_dtype(DType::BF16)?
+            .to_device(&cuda)?;
+        let indices_cuda = Tensor::from_vec(idx, (p,), &cpu)?.to_device(&cuda)?;
+
+        let run = || -> Result<Vec<u32>> {
+            Ok(layer_cuda
+                .gather_forward_batched(&a_cuda, &indices_cuda)?
+                .to_dtype(DType::F32)?
+                .to_device(&cpu)?
+                .flatten_all()?
+                .to_vec1::<f32>()?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect())
+        };
+        let y1 = run()?;
+        let y2 = run()?;
+        assert_eq!(y1, y2, "grouped GEMM output changed between runs");
         Ok(())
     }
 }

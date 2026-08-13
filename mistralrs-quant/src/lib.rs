@@ -83,7 +83,9 @@ pub use mxfp4::MXFP4Layer;
 pub use nvfp4::NVFP4Layer;
 pub use pending_layer::PendingIsqLayer;
 pub use pertensor_fp8::PerTensorFP8Linear;
-pub use qtip::{Qtip2bLayer, QtipLayer, QtipMode, QtipPackedView, QTIP2B_MCG_MULT};
+pub use qtip::{
+    ExpertBpwTable, Qtip2bLayer, QtipLayer, QtipMode, QtipPackedView, TrellisBpw, QTIP2B_MCG_MULT,
+};
 pub use td_moe_factored::TuckerFactoredLayer;
 pub use unquantized::UnquantLinear;
 pub use utils::flash_attn_sinks_metal;
