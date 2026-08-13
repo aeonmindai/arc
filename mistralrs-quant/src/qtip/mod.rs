@@ -55,11 +55,13 @@ use crate::{
     QuantizedSerdeType, ShardedVarBuilder,
 };
 
+pub mod bitshift;
 #[cfg(feature = "cuda")]
 mod cuda_ops;
 #[cfg(feature = "cuda")]
 mod ffi;
 mod viterbi;
+pub use bitshift::{Qtip2bLayer, QTIP2B_MCG_MULT};
 #[allow(unused_imports)]
 pub use viterbi::viterbi_quantize_row;
 

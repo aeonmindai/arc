@@ -52,6 +52,7 @@ impl QuantMethod for GgufMatMul {
             | QuantMethodConfig::MXFP4 { .. }
             | QuantMethodConfig::NVFP4 { .. }
             | QuantMethodConfig::Qtip { .. }
+            | QuantMethodConfig::Qtip2b { .. }
             | QuantMethodConfig::TuckerFactored { .. } => unreachable!(),
         }
     }

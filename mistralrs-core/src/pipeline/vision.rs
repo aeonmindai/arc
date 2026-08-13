@@ -380,6 +380,7 @@ impl Loader for VisionLoader {
                                 QuantizedSerdeType::Qtip => {
                                     IsqType::QtipBitshift2.pack_factor(dtype)
                                 }
+                                QuantizedSerdeType::Qtip2b => IsqType::Qtip2b.pack_factor(dtype),
                                 QuantizedSerdeType::TdMoeTucker => 1,
                             };
                             total_pack_factors += pack_factor;

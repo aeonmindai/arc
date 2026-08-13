@@ -464,6 +464,7 @@ impl QuantMethod for NVFP4Layer {
             | QuantMethodConfig::Afq { .. }
             | QuantMethodConfig::MXFP4 { .. }
             | QuantMethodConfig::Qtip { .. }
+            | QuantMethodConfig::Qtip2b { .. }
             | QuantMethodConfig::TuckerFactored { .. } => {
                 candle_core::bail!("NVFP4Layer requires QuantMethodConfig::NVFP4")
             }
@@ -523,7 +524,7 @@ impl QuantMethod for NVFP4Layer {
         if weight_is_3d
             && !matches!(
                 dtype,
-                Some(IsqType::QtipBitshift2) | Some(IsqType::NVFP4) | None
+                Some(IsqType::QtipBitshift2 | IsqType::Qtip2b) | Some(IsqType::NVFP4) | None
             )
         {
             candle_core::bail!(
@@ -670,7 +671,7 @@ impl QuantMethod for NVFP4Layer {
                 }
                 Ok(self)
             }
-            Some(IsqType::QtipBitshift2) => {
+            Some(isq @ (IsqType::QtipBitshift2 | IsqType::Qtip2b)) => {
                 let _acquired_quantize_guard = guard.acquire(&device);
                 if imatrix_weight.is_some() {
                     candle_core::bail!("QTIP does not support imatrix.");
@@ -696,12 +697,21 @@ impl QuantMethod for NVFP4Layer {
                         .map(|b| b.to_device(&device))
                         .transpose()?
                 };
-                crate::QtipLayer::quantize_with_mode(
-                    &weight.to_device(&device)?,
-                    bias,
-                    &device,
-                    crate::QtipMode::Viterbi,
-                )
+                if matches!(isq, IsqType::Qtip2b) {
+                    crate::Qtip2bLayer::quantize_with_mode(
+                        &weight.to_device(&device)?,
+                        bias,
+                        &device,
+                        crate::QtipMode::Viterbi,
+                    )
+                } else {
+                    crate::QtipLayer::quantize_with_mode(
+                        &weight.to_device(&device)?,
+                        bias,
+                        &device,
+                        crate::QtipMode::Viterbi,
+                    )
+                }
             }
             None => {
                 let _acquired_quantize_guard = guard.acquire(&device);

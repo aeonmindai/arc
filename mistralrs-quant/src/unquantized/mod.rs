@@ -42,6 +42,7 @@ impl QuantMethod for UnquantLinear {
             | QuantMethodConfig::MXFP4 { .. }
             | QuantMethodConfig::NVFP4 { .. }
             | QuantMethodConfig::Qtip { .. }
+            | QuantMethodConfig::Qtip2b { .. }
             | QuantMethodConfig::TuckerFactored { .. } => unreachable!(),
             QuantMethodConfig::Unquantized(l) => Ok(Self {
                 w: l.weight().clone(),
@@ -399,6 +400,30 @@ impl QuantMethod for UnquantLinear {
                     self.w.to_device(&device)?
                 };
                 crate::QtipLayer::quantize_with_mode(&w_for_quant, bias, &device, mode)
+            }
+            Some(IsqType::Qtip2b) => {
+                let _acquired_quantize_guard = guard.acquire(&device);
+                if imatrix_weight.is_some() {
+                    candle_core::bail!("QTIP2B does not support imatrix.");
+                }
+                n_quantized.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let bias = self.b.as_ref().map(|b| b.to_device(&device)).transpose()?;
+                // Same mode/device policy as the LUT rung above: 3-D MoE
+                // stacks default to greedy unless ARC_QTIP_EXPERT_VITERBI is
+                // set, and stay on their current device so the 3-D path can
+                // stream experts to the GPU one batch at a time.
+                let expert_viterbi = std::env::var_os("ARC_QTIP_EXPERT_VITERBI").is_some();
+                let mode = if self.w.dims().len() == 3 && !expert_viterbi {
+                    crate::QtipMode::Greedy
+                } else {
+                    crate::QtipMode::Viterbi
+                };
+                let w_for_quant = if self.w.dims().len() == 3 {
+                    self.w.clone()
+                } else {
+                    self.w.to_device(&device)?
+                };
+                crate::Qtip2bLayer::quantize_with_mode(&w_for_quant, bias, &device, mode)
             }
             Some(IsqType::F8Q8) => {
                 let _acquired_quantize_guard = guard.acquire(&device);

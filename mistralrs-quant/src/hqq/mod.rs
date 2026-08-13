@@ -888,6 +888,7 @@ impl QuantMethod for HqqLayer {
             | QuantMethodConfig::MXFP4 { .. }
             | QuantMethodConfig::NVFP4 { .. }
             | QuantMethodConfig::Qtip { .. }
+            | QuantMethodConfig::Qtip2b { .. }
             | QuantMethodConfig::TuckerFactored { .. } => {
                 unreachable!()
             }
