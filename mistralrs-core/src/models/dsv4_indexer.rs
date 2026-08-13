@@ -439,6 +439,41 @@ mod tests {
         ShardedSafeTensors::wrap(backend, dtype, dev.clone())
     }
 
+    /// Deterministic pseudo-Gaussian tensor (SplitMix64 + Box-Muller): the
+    /// same seed yields bit-identical F32 values on every run and platform.
+    ///
+    /// `make_indexer_tensors` used unseeded `Tensor::randn`, which made
+    /// `v4_indexer_agrees_with_cpu_reference` flaky: each test process draws
+    /// fresh weights, and occasionally two top-k scores land close enough
+    /// that candle's gemm accumulation order and the naive CPU reference
+    /// disagree on the ranking (observed failing on the macOS + Windows CI
+    /// lanes while ubuntu passed, 2026-08-13). Fixed weights make the test
+    /// outcome a constant.
+    fn det_randn(seed: u64, mean: f32, std: f32, shape: (usize, usize), device: &Device) -> Tensor {
+        let n = shape.0 * shape.1;
+        let mut state = seed;
+        let mut next = move || {
+            // SplitMix64
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let mut vals = Vec::with_capacity(n + 1);
+        while vals.len() < n {
+            // Box-Muller from two uniforms in (0, 1]
+            let u1 = ((next() >> 11) as f64 + 1.0) / (1u64 << 53) as f64;
+            let u2 = ((next() >> 11) as f64 + 1.0) / (1u64 << 53) as f64;
+            let r = (-2.0 * u1.ln()).sqrt();
+            let (s, c) = (2.0 * std::f64::consts::PI * u2).sin_cos();
+            vals.push((mean as f64 + std as f64 * r * c) as f32);
+            vals.push((mean as f64 + std as f64 * r * s) as f32);
+        }
+        vals.truncate(n);
+        Tensor::from_vec(vals, shape, device).unwrap()
+    }
+
     fn make_indexer_tensors(
         cfg: &super::super::deepseek4::DeepSeekV4Config,
         ratio: usize,
@@ -451,23 +486,28 @@ mod tests {
         // wq_b.weight: [n_heads*head_dim, q_lora_rank]
         m.insert(
             "wq_b.weight".to_string(),
-            Tensor::randn(
+            det_randn(
+                0xA11A_0001,
                 0.0f32,
                 0.02,
                 (cfg.index_n_heads * cfg.index_head_dim, cfg.q_lora_rank.unwrap()),
                 device,
             )
-            .unwrap()
             .to_dtype(dtype)
             .unwrap(),
         );
         // weights_proj.weight: [n_heads, hidden_size]
         m.insert(
             "weights_proj.weight".to_string(),
-            Tensor::randn(0.0f32, 0.02, (cfg.index_n_heads, cfg.hidden_size), device)
-                .unwrap()
-                .to_dtype(dtype)
-                .unwrap(),
+            det_randn(
+                0xA11A_0002,
+                0.0f32,
+                0.02,
+                (cfg.index_n_heads, cfg.hidden_size),
+                device,
+            )
+            .to_dtype(dtype)
+            .unwrap(),
         );
         // compressor.ape: [ratio, coff*head_dim]
         m.insert(
@@ -482,26 +522,26 @@ mod tests {
         // compressor.wgate.weight: [coff*head_dim, ratio*head_dim]
         m.insert(
             "compressor.wgate.weight".to_string(),
-            Tensor::randn(
+            det_randn(
+                0xA11A_0003,
                 0.0f32,
                 0.02,
                 (coff * cfg.index_head_dim, ratio * cfg.index_head_dim),
                 device,
             )
-            .unwrap()
             .to_dtype(dtype)
             .unwrap(),
         );
         // compressor.wkv.weight: [coff*head_dim, ratio*head_dim]
         m.insert(
             "compressor.wkv.weight".to_string(),
-            Tensor::randn(
+            det_randn(
+                0xA11A_0004,
                 0.0f32,
                 0.02,
                 (coff * cfg.index_head_dim, ratio * cfg.index_head_dim),
                 device,
             )
-            .unwrap()
             .to_dtype(dtype)
             .unwrap(),
         );
@@ -626,14 +666,13 @@ mod tests {
         // small but realistic shape: 1 batch, 2 query tokens, 3 heads,
         // head_dim=8, ratio=4, t_full=16 → T_c=4; topk=3.
         let cfg = synth_cfg(/*hidden*/ 16, /*q_lora*/ 16, /*n_heads*/ 3, /*head_dim*/ 8, /*topk*/ 3);
-        // Use a fixed-seed deterministic tensor map (the same one used by
-        // the other tests). Real-checkpoint values would differ but the
-        // agreement check is shape/structure-agnostic.
+        // Fixed-seed deterministic tensor map (see `det_randn`): identical
+        // weights on every run and platform, so this agreement check is a
+        // constant rather than a per-draw lottery over near-tied scores.
         let tensors = make_indexer_tensors(&cfg, 4, 2, &device);
 
-        // Snapshot the actual weight tensors so the reference uses identical
-        // values (the `make_indexer_tensors` uses randn so values differ run
-        // to run if we re-call it — capture the ones we use).
+        // Snapshot the actual weight tensors so the reference is guaranteed
+        // to use the very tensors the indexer consumed.
         let wq_b_w = tensors["wq_b.weight"].clone();
         let weights_proj_w = tensors["weights_proj.weight"].clone();
         let ape = tensors["compressor.ape"].clone();
