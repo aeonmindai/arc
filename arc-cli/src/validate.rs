@@ -135,27 +135,35 @@ pub struct HbmValidateOptions {
 ///
 /// Returns (total_param_count, active_param_count_per_token, has_moe).
 ///
-/// ⚠️ DISPUTED — these V4 figures are *estimates*, not confirmed specs, and they
-/// CONFLICT with other places in this repo. V4 Flash here is 140B, but README:51,
-/// the QTIP impl comments (mistralrs-quant/src/qtip/{cuda_ops,mod}.rs) and
-/// research/code/CODE_INDEX.md all say **284B / 13B active**; V4 Pro here is 680B
-/// vs **1.6T** in ARC_V2.md + CODE_INDEX. This function is the single source the
-/// `--target-hbm` HBM-fit estimate is computed from, and the estimate is linear in
-/// total params: at 140B V4 Flash mocks to ~58 GB (fits one 80 GB H100); at 284B
-/// it's ~116 GB (OOMs by ~36 GB → needs 2×H100). **Before any rental, pin the real
-/// V4 Flash count and reconcile all sites — do not trust the 60 GB fit until then.**
-/// (The unit test below pins 140B, so changing this will fail loudly — intended.)
+/// The V4 figures were reconciled in May 2026 (this function used to be the lone
+/// in-repo outlier at 140B Flash / 680B Pro — that dispute is RESOLVED):
+///
+/// - **V4 Flash = 284B logical / 13B active.** HF-verified four ways: model-card
+///   prose, the official release announcement
+///   (`api-docs.deepseek.com/news/news260424`), config geometry (43 layers,
+///   256+1 experts), and the HF safetensors breakdown (~148.7 GiB on disk).
+///   Note: the HF API's `safetensors.total` ≈ 158B is a *packed-element* count
+///   (experts ship ~4-bit packed), NOT the logical parameter count.
+/// - **V4 Pro = 1.6T / 49B active** per the official announcement. API-tier —
+///   no open checkpoint, so the vendor figure is not independently verifiable.
+///
+/// The `--mock` estimate derived from this table is deliberately conservative:
+/// it assumes a 20/80 attention/expert split, but V4 Flash's expert share is
+/// closer to ~95%, so the mock overestimates the qtip2+td-moe footprint
+/// (~116 GiB mocked vs the measured 68 GB UQFF artifact, which loads and serves
+/// on a single H100/H200 — empirically established June 2026 on RUN-161 and
+/// re-validated on an H200 in Aug 2026; see docs/BENCHMARKS.md). The real
+/// `--target-hbm` run on hardware is always the source of truth.
 pub fn known_model_params(model_id: &str) -> Option<(u64, u64, bool)> {
     let normalised = model_id.to_ascii_lowercase();
     if normalised.contains("deepseek-v4-flash") || normalised.contains("deepseekv4-flash") {
-        // V4 Flash: 27 layers, 128 experts, 6 active = ~140B total, ~14B active.
-        // Numbers calibrated from V3-Flash analog scaled to V4 config.
-        // ⚠️ DISPUTED vs 284B/13B elsewhere — see fn doc-comment above.
-        Some((140_000_000_000, 14_000_000_000, true))
+        // V4 Flash: 43 layers, 256+1 experts. 284B logical / 13B active.
+        // HF-verified — see fn doc-comment above for the provenance chain.
+        Some((284_000_000_000, 13_000_000_000, true))
     } else if normalised.contains("deepseek-v4-pro") || normalised.contains("deepseekv4-pro") {
-        // V4 Pro: 43 layers, 256 experts, 6 active = ~680B total, ~37B active.
-        // ⚠️ DISPUTED vs 1.6T elsewhere (ARC_V2.md, CODE_INDEX.md).
-        Some((680_000_000_000, 37_000_000_000, true))
+        // V4 Pro: 1.6T / 49B active per the official announcement (API-tier,
+        // no open checkpoint to verify against).
+        Some((1_600_000_000_000, 49_000_000_000, true))
     } else if normalised.contains("kimi-k2") {
         // K2-class: 61 layers, 384 experts. ~1.1T total, ~30B active.
         Some((1_100_000_000_000, 30_000_000_000, true))
@@ -668,9 +676,19 @@ mod tests {
 
     #[test]
     fn known_model_params_v4_flash() {
+        // HF-verified: 284B logical / 13B active (see known_model_params docs).
         let (total, active, has_moe) = known_model_params("deepseek-ai/DeepSeek-V4-Flash").unwrap();
-        assert_eq!(total, 140_000_000_000);
-        assert_eq!(active, 14_000_000_000);
+        assert_eq!(total, 284_000_000_000);
+        assert_eq!(active, 13_000_000_000);
+        assert!(has_moe);
+    }
+
+    #[test]
+    fn known_model_params_v4_pro() {
+        // Official announcement figure: 1.6T / 49B active (API-tier model).
+        let (total, active, has_moe) = known_model_params("deepseek-ai/DeepSeek-V4-Pro").unwrap();
+        assert_eq!(total, 1_600_000_000_000);
+        assert_eq!(active, 49_000_000_000);
         assert!(has_moe);
     }
 
@@ -680,24 +698,36 @@ mod tests {
     }
 
     #[test]
-    fn mock_v4_flash_qtip2_passes_60gb_target() {
-        let opts = HbmValidateOptions {
+    fn mock_v4_flash_qtip2_fails_60gb_but_passes_h200_target() {
+        // At the corrected 284B logical params, the deliberately-conservative
+        // 20/80 mock split lands at ~116 GiB — over an 80 GB H100 ceiling but
+        // under a 141 GB H200. (The *measured* artifact is 68 GB and serves on
+        // one H100/H200 — the mock overestimates by design; see fn docs.)
+        let mk = |target_hbm_gb: f64| HbmValidateOptions {
             model_id: "deepseek-ai/DeepSeek-V4-Flash".to_string(),
             compression_stack: CompressionStack::Qtip2PlusTdMoe,
-            target_hbm_gb: 60.0,
+            target_hbm_gb,
             output_path: PathBuf::from("/tmp/unused.json"),
             mock: true,
         };
-        let report = run_mock(&opts).unwrap();
+
+        let tight = run_mock(&mk(60.0)).unwrap();
         assert!(
-            report.pass,
-            "V4 Flash @ qtip2+td-moe should fit in 60 GB; got {:.2} GB",
-            report.measured.total_gb
+            !tight.pass,
+            "mock V4 Flash @ qtip2+td-moe should exceed 60 GB (conservative split); got {:.2} GB",
+            tight.measured.total_gb
         );
-        assert_eq!(report.mode, "mock");
-        assert_eq!(report.compression_stack, "qtip2+td-moe");
-        assert!(report.measured.weight_gb > 0.0);
-        assert!(report.measured.workspace_gb > 0.0);
+
+        let h200 = run_mock(&mk(141.0)).unwrap();
+        assert!(
+            h200.pass,
+            "mock V4 Flash @ qtip2+td-moe should fit an H200-class 141 GB; got {:.2} GB",
+            h200.measured.total_gb
+        );
+        assert_eq!(h200.mode, "mock");
+        assert_eq!(h200.compression_stack, "qtip2+td-moe");
+        assert!(h200.measured.weight_gb > 0.0);
+        assert!(h200.measured.workspace_gb > 0.0);
     }
 
     #[test]
@@ -764,16 +794,18 @@ mod tests {
     #[test]
     fn run_end_to_end_writes_json_and_returns_zero() {
         let tmp = TmpDir::new();
-        let out = tmp.path().join("v4_flash_h100_footprint.json");
+        let out = tmp.path().join("v4_flash_h200_footprint.json");
         let opts = HbmValidateOptions {
             model_id: "deepseek-ai/DeepSeek-V4-Flash".to_string(),
             compression_stack: CompressionStack::Qtip2PlusTdMoe,
-            target_hbm_gb: 60.0,
+            // H200-class ceiling: the conservative mock lands at ~116 GiB for
+            // the corrected 284B params (measured artifact is 68 GB).
+            target_hbm_gb: 141.0,
             output_path: out.clone(),
             mock: true,
         };
         let exit = run(opts).unwrap();
-        assert_eq!(exit, 0, "qtip2+td-moe on V4 Flash should pass");
+        assert_eq!(exit, 0, "qtip2+td-moe on V4 Flash should pass a 141 GB target");
         assert!(out.exists());
         let parsed: HbmReport =
             serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
