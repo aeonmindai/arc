@@ -408,8 +408,7 @@ impl QtipLayer {
             }
             return Self::quantize_with_options_3d(weight, device, mode, use_rotation);
         }
-        let layer =
-            Self::quantize_with_options_concrete(weight, bias, device, mode, use_rotation)?;
+        let layer = Self::quantize_with_options_concrete(weight, bias, device, mode, use_rotation)?;
         Ok(Arc::new(layer))
     }
 
@@ -1410,8 +1409,7 @@ impl QtipLayer {
             .flatten_all()?
             .to_dtype(DType::U32)?
             .to_vec1()?;
-        let mut unique_ids: Vec<usize> =
-            idx_cpu.iter().map(|&v| v as usize).collect();
+        let mut unique_ids: Vec<usize> = idx_cpu.iter().map(|&v| v as usize).collect();
         unique_ids.sort_unstable();
         unique_ids.dedup();
         for &e in &unique_ids {
@@ -1483,21 +1481,13 @@ impl QtipLayer {
         // `index_add` / `slice_assign` style operations. We use
         // `Tensor::zeros` then `index_add` for the scatter — this matches
         // candle's supported ops and avoids hand-rolling kernels.
-        let mut out_flat = Tensor::zeros(
-            (total_pairs, rows),
-            a_rotated_dtype,
-            device,
-        )?;
+        let mut out_flat = Tensor::zeros((total_pairs, rows), a_rotated_dtype, device)?;
 
         for &e in &unique_ids {
             let positions = positions_by_expert
                 .get(&e)
                 .expect("positions for expert should be populated");
-            let pos_tensor = Tensor::from_vec(
-                positions.clone(),
-                (positions.len(),),
-                device,
-            )?;
+            let pos_tensor = Tensor::from_vec(positions.clone(), (positions.len(),), device)?;
 
             // Gather the rotated activation rows that routed to expert e:
             //   a_e: [n_e, cols], same dtype as a_rotated.
@@ -1628,10 +1618,8 @@ impl QtipLayer {
             }
         }
 
-        let blocks_refs: Vec<&Tensor> =
-            per_expert_layers.iter().map(|l| &l.blocks).collect();
-        let scales_refs: Vec<&Tensor> =
-            per_expert_layers.iter().map(|l| &l.row_scales).collect();
+        let blocks_refs: Vec<&Tensor> = per_expert_layers.iter().map(|l| &l.blocks).collect();
+        let scales_refs: Vec<&Tensor> = per_expert_layers.iter().map(|l| &l.row_scales).collect();
 
         let blocks = Tensor::stack(&blocks_refs, 0)?;
         let row_scales = Tensor::stack(&scales_refs, 0)?;
@@ -1718,19 +1706,9 @@ impl QtipLayer {
         let n = scales_e.dim(0)?;
         let k_in = self.in_features;
 
-        let blocks_data: Vec<u8> = blocks_e
-            .to_device(&Device::Cpu)?
-            .flatten_all()?
-            .to_vec1()?;
-        let scales_data: Vec<f32> = scales_e
-            .to_device(&Device::Cpu)?
-            .flatten_all()?
-            .to_vec1()?;
-        let lut_data: Vec<f32> = self
-            .lut
-            .to_device(&Device::Cpu)?
-            .flatten_all()?
-            .to_vec1()?;
+        let blocks_data: Vec<u8> = blocks_e.to_device(&Device::Cpu)?.flatten_all()?.to_vec1()?;
+        let scales_data: Vec<f32> = scales_e.to_device(&Device::Cpu)?.flatten_all()?.to_vec1()?;
+        let lut_data: Vec<f32> = self.lut.to_device(&Device::Cpu)?.flatten_all()?.to_vec1()?;
 
         let num_symbols_per_row = k_in / V as usize;
         let packed_per_row = num_symbols_per_row / 2;
@@ -1812,8 +1790,7 @@ impl QtipLayer {
         // Track unique expert IDs so we only dequantize each one once even
         // when several (token, k) pairs share the same expert (which is the
         // common case for prefill — top-6 of 256 means many duplicates).
-        let mut unique_ids: Vec<usize> =
-            idx_cpu.iter().map(|&v| v as usize).collect();
+        let mut unique_ids: Vec<usize> = idx_cpu.iter().map(|&v| v as usize).collect();
         unique_ids.sort_unstable();
         unique_ids.dedup();
         for &e in &unique_ids {
@@ -1862,11 +1839,7 @@ impl QtipLayer {
             let positions = positions_by_expert
                 .get(&e)
                 .expect("positions for expert should be populated");
-            let pos_tensor = Tensor::from_vec(
-                positions.clone(),
-                (positions.len(),),
-                device,
-            )?;
+            let pos_tensor = Tensor::from_vec(positions.clone(), (positions.len(),), device)?;
             let a_e = a_flat.index_select(&pos_tensor, 0)?;
             let w_e = weight_cache.get(&e).expect("weight should be cached");
             let y_e = a_e.matmul(&w_e.t()?)?;
@@ -2213,6 +2186,111 @@ impl QtipLayer {
             rotation_block,
         }))
     }
+
+    /// Concrete-typed UQFF deserialize that returns a `QtipLayer` (plus the
+    /// optional bias tensor) instead of `Arc<dyn QuantMethod>`. Shared body
+    /// of `deserialize` / `deserialize_ext_bias`; also used by tests to
+    /// inspect typed fields without a `dyn`-downcast (the `QuantMethod`
+    /// trait does not extend `Any`).
+    ///
+    /// Handles both storage modes:
+    /// - 2-D: `blocks [N, packed_K]`, `row_scales [N]` → `num_experts: None`
+    /// - 3-D: `blocks [E, N, packed_K]`, `row_scales [E, N]` →
+    ///   `num_experts: Some(E)`
+    ///
+    /// The mode is inferred from the self-describing tensor shapes (UQFF
+    /// tensor payloads carry rank + dims), so no extra header bytes are
+    /// needed and 2-D payloads remain byte-identical to pre-v0.2.1 writers.
+    /// Each tensor is deserialized in one shot (single host buffer → single
+    /// device upload) — no per-expert round-trips at load.
+    fn deserialize_concrete(
+        data: Cow<[u8]>,
+        device: &Device,
+        guard: QuantizeOntoGuard,
+    ) -> Result<(Self, Option<Tensor>)> {
+        let mut buffer = Cursor::new(data);
+
+        let version = buffer.read_u32::<LittleEndian>()?;
+        if let Err(e) = version_is_compatible(version) {
+            return Err(candle_core::Error::wrap(e));
+        }
+        let isq_type = buffer.read_u8()? as usize;
+        if isq_type != QuantizedSerdeType::Qtip as usize {
+            candle_core::bail!(
+                "ISQ type ({isq_type}) doesn't match expected QTIP type {}",
+                QuantizedSerdeType::Qtip as usize
+            );
+        }
+        let has_bias = buffer.read_u8()? != 0;
+        let in_features = buffer.read_u32::<LittleEndian>()? as usize;
+
+        let _acquired_load_guard = guard.acquire(device);
+        let blocks = deserialize_tensor(&mut buffer, device)?;
+        let row_scales = deserialize_tensor(&mut buffer, device)?;
+        let lut = deserialize_tensor(&mut buffer, device)?;
+
+        let num_experts = match blocks.dims().len() {
+            2 => None,
+            3 => {
+                let e = blocks.dim(0)?;
+                if row_scales.dims().len() != 2
+                    || row_scales.dim(0)? != e
+                    || row_scales.dim(1)? != blocks.dim(1)?
+                {
+                    candle_core::bail!(
+                        "QtipLayer: 3-D blocks {:?} require row_scales [E, N]; got {:?}",
+                        blocks.dims(),
+                        row_scales.dims()
+                    );
+                }
+                if has_bias {
+                    // The serializer refuses to attach a bias to a 3-D
+                    // stack, so this indicates a corrupt payload.
+                    candle_core::bail!("QtipLayer: 3-D stacked-expert payloads are bias-free");
+                }
+                Some(e)
+            }
+            other => {
+                candle_core::bail!("QtipLayer: blocks tensor must be rank 2 or 3, got rank {other}")
+            }
+        };
+
+        let bias = if has_bias {
+            Some(deserialize_tensor(&mut buffer, device)?)
+        } else {
+            None
+        };
+        let ext_bias = bias.clone();
+
+        // RUN-158 rotation params. Legacy payloads (no flag byte) end here
+        // — we treat EOF / read error as "no rotation" and proceed.
+        let (rotation_signs, rotation_block) = match buffer.read_u8() {
+            Ok(0) => (None, 0usize),
+            Ok(1) => {
+                let block = buffer.read_u32::<LittleEndian>()? as usize;
+                let signs = deserialize_tensor(&mut buffer, device)?;
+                (Some(signs), block)
+            }
+            Ok(other) => candle_core::bail!(
+                "QtipLayer: unexpected rotation-flag byte {other} (expected 0 or 1)"
+            ),
+            Err(_) => (None, 0usize),
+        };
+
+        Ok((
+            Self {
+                blocks,
+                row_scales,
+                lut,
+                bias,
+                in_features,
+                num_experts,
+                rotation_signs,
+                rotation_block,
+            },
+            ext_bias,
+        ))
+    }
 }
 
 impl QuantizedSerde for QtipLayer {
@@ -2226,12 +2304,19 @@ impl QuantizedSerde for QtipLayer {
         self.serialize_with_bias(self.bias.clone())
     }
     fn serialize_with_bias(&self, bias: Option<Tensor>) -> Result<Cow<'_, [u8]>> {
-        // 3-D stacked-expert layers serialize fine: `serialize_tensor` writes
-        // each tensor's shape+data regardless of rank, so the only thing that
-        // distinguishes a 3-D layer is `blocks` being rank-3 (leading expert
-        // dim E). `deserialize_ext_bias` recovers `num_experts` from that
-        // rank, so no UQFF format/version change is needed and 2-D payloads
-        // are unaffected. (Enables V4 MoE expert stacks to round-trip.)
+        // 2-D and 3-D stacked-expert layers share one field order. UQFF
+        // tensor payloads are self-describing (rank + dims), so the 3-D
+        // `blocks [E, N, packed_K]` / `row_scales [E, N]` round-trip through
+        // the same `serialize_tensor` calls as the 2-D layout, with the
+        // shared `lut` / rotation metadata stored exactly once (not per
+        // expert). The deserializer infers the expert mode from the blocks
+        // rank — see `deserialize_concrete`.
+        if self.num_experts.is_some() && bias.is_some() {
+            // 3-D MoE stacks are bias-free (`quantize_with_options` bails on
+            // a bias too); refuse rather than silently attach a single [N]
+            // bias vector to E experts.
+            candle_core::bail!("QtipLayer::serialize: 3-D stacked-expert layers are bias-free");
+        }
         let mut buffer = Vec::new();
         buffer.extend(&UQFF_VERSION.to_le_bytes());
         buffer.push(QuantizedSerdeType::Qtip as u8);
@@ -2267,8 +2352,8 @@ impl QuantizedSerde for QtipLayer {
     where
         Self: Sized,
     {
-        let (layer, _) = Self::deserialize_ext_bias(data, device, guard)?;
-        Ok(layer)
+        let (layer, _) = Self::deserialize_concrete(data, device, guard)?;
+        Ok(Arc::new(layer))
     }
     fn deserialize_ext_bias(
         data: Cow<[u8]>,
@@ -2278,72 +2363,8 @@ impl QuantizedSerde for QtipLayer {
     where
         Self: Sized,
     {
-        let mut buffer = Cursor::new(data.to_vec());
-
-        let version = buffer.read_u32::<LittleEndian>()?;
-        if let Err(e) = version_is_compatible(version) {
-            return Err(candle_core::Error::wrap(e));
-        }
-        let isq_type = buffer.read_u8()? as usize;
-        if isq_type != QuantizedSerdeType::Qtip as usize {
-            candle_core::bail!(
-                "ISQ type ({isq_type}) doesn't match expected QTIP type {}",
-                QuantizedSerdeType::Qtip as usize
-            );
-        }
-        let has_bias = buffer.read_u8()? != 0;
-        let in_features = buffer.read_u32::<LittleEndian>()? as usize;
-
-        let _acquired_load_guard = guard.acquire(device);
-        let blocks = deserialize_tensor(&mut buffer, device)?;
-        let row_scales = deserialize_tensor(&mut buffer, device)?;
-        let lut = deserialize_tensor(&mut buffer, device)?;
-        let bias = if has_bias {
-            Some(deserialize_tensor(&mut buffer, device)?)
-        } else {
-            None
-        };
-        let ext_bias = bias.clone();
-
-        // RUN-158 rotation params. Legacy payloads (no flag byte) end here
-        // — we treat EOF / read error as "no rotation" and proceed.
-        let (rotation_signs, rotation_block) = match buffer.read_u8() {
-            Ok(0) => (None, 0usize),
-            Ok(1) => {
-                let block = buffer.read_u32::<LittleEndian>()? as usize;
-                let signs = deserialize_tensor(&mut buffer, device)?;
-                (Some(signs), block)
-            }
-            Ok(other) => candle_core::bail!(
-                "QtipLayer: unexpected rotation-flag byte {other} (expected 0 or 1)"
-            ),
-            Err(_) => (None, 0usize),
-        };
-
-        // Recover 2-D vs 3-D (stacked-expert) layout from the rank of
-        // `blocks`: rank-3 carries a leading expert dim E. Lets a
-        // UQFF-serialized MoE expert stack round-trip with no format change
-        // (2-D layers keep rank-2 blocks -> None). Computed before the struct
-        // literal so `blocks` isn't used after being moved in.
-        let num_experts = if blocks.rank() == 3 {
-            Some(blocks.dim(0)?)
-        } else {
-            None
-        };
-
-        Ok((
-            Arc::new(Self {
-                blocks,
-                row_scales,
-                lut,
-                bias,
-                in_features,
-                num_experts,
-                rotation_signs,
-                rotation_block,
-            }),
-            ext_bias,
-        ))
+        let (layer, ext_bias) = Self::deserialize_concrete(data, device, guard)?;
+        Ok((Arc::new(layer), ext_bias))
     }
 }
 
@@ -3635,8 +3656,7 @@ mod tests {
         mode: QtipMode,
     ) -> Result<(QtipLayer, Tensor)> {
         // Per-expert random Gaussian (deterministic per-expert seed).
-        let mut weights_per_expert: Vec<Tensor> =
-            Vec::with_capacity(num_experts);
+        let mut weights_per_expert: Vec<Tensor> = Vec::with_capacity(num_experts);
         let mut concrete_layers: Vec<QtipLayer> = Vec::with_capacity(num_experts);
         for e in 0..num_experts {
             let mut wdata = vec![0.0f32; rows * in_features];
@@ -3649,17 +3669,19 @@ mod tests {
                 z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
                 z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
                 z ^= z >> 31;
-                let u1 =
-                    ((z >> 32) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
-                let u2 = ((z & 0xFFFFFFFF) as u32 as f32 + 1.0)
-                    / (u32::MAX as f32 + 2.0);
+                let u1 = ((z >> 32) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+                let u2 = ((z & 0xFFFFFFFF) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
                 let r = (-2.0_f32 * u1.ln()).sqrt();
                 *v = r * (2.0 * std::f32::consts::PI * u2).cos() * 0.5;
             }
-            let w_e =
-                Tensor::from_vec(wdata.clone(), (rows, in_features), device)?;
-            let layer_e =
-                QtipLayer::quantize_with_options_concrete(&w_e, None, device, mode, matches!(mode, QtipMode::Viterbi))?;
+            let w_e = Tensor::from_vec(wdata.clone(), (rows, in_features), device)?;
+            let layer_e = QtipLayer::quantize_with_options_concrete(
+                &w_e,
+                None,
+                device,
+                mode,
+                matches!(mode, QtipMode::Viterbi),
+            )?;
             weights_per_expert.push(w_e);
             concrete_layers.push(layer_e);
         }
@@ -3679,7 +3701,11 @@ mod tests {
         let device = Device::Cpu;
         let (stack, _refs) = make_expert_stack(4, 16, 64, &device, QtipMode::Greedy)?;
         assert_eq!(stack.blocks.dims().len(), 3, "blocks must be rank 3");
-        assert_eq!(stack.row_scales.dims().len(), 2, "row_scales must be rank 2");
+        assert_eq!(
+            stack.row_scales.dims().len(),
+            2,
+            "row_scales must be rank 2"
+        );
         assert_eq!(stack.blocks.dim(0)?, 4, "expert dim wrong");
         assert_eq!(stack.row_scales.dim(0)?, 4, "expert dim wrong");
         assert_eq!(stack.in_features, 64);
@@ -3709,8 +3735,7 @@ mod tests {
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
             z ^= z >> 31;
             let u1 = ((z >> 32) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
-            let u2 =
-                ((z & 0xFFFFFFFF) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+            let u2 = ((z & 0xFFFFFFFF) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
             let r = (-2.0_f32 * u1.ln()).sqrt();
             *v = r * (2.0 * std::f32::consts::PI * u2).cos();
         }
@@ -3726,11 +3751,7 @@ mod tests {
             1, 3, // tok 1 → experts 1, 3
             2, 2, // tok 2 → expert 2 twice (duplicate path)
         ];
-        let indices = Tensor::from_vec(
-            idx_data.clone(),
-            (n_tokens, n_experts_per_tok),
-            &device,
-        )?;
+        let indices = Tensor::from_vec(idx_data.clone(), (n_tokens, n_experts_per_tok), &device)?;
 
         // Run the gather forward.
         let out = stack.gather_forward(&a, &indices)?;
@@ -3738,18 +3759,15 @@ mod tests {
 
         // Reference: per (tok, k), use the dense weights for the routed
         // expert and matmul.
-        let dense_w: Vec<f32> =
-            dense_w_stack.flatten_all()?.to_vec1()?;
+        let dense_w: Vec<f32> = dense_w_stack.flatten_all()?.to_vec1()?;
         let mut ref_out = vec![0f32; n_tokens * n_experts_per_tok * rows];
         for tok in 0..n_tokens {
             for k in 0..n_experts_per_tok {
                 let e = idx_data[tok * n_experts_per_tok + k] as usize;
-                let a_row =
-                    &adata[(tok * n_experts_per_tok + k) * in_features
-                        ..(tok * n_experts_per_tok + k + 1) * in_features];
+                let a_row = &adata[(tok * n_experts_per_tok + k) * in_features
+                    ..(tok * n_experts_per_tok + k + 1) * in_features];
                 for r in 0..rows {
-                    let w_row = &dense_w[e * rows * in_features
-                        + r * in_features
+                    let w_row = &dense_w[e * rows * in_features + r * in_features
                         ..e * rows * in_features + (r + 1) * in_features];
                     let mut s = 0f32;
                     for c in 0..in_features {
@@ -3770,9 +3788,7 @@ mod tests {
             }
             d / (na.sqrt() * nb.sqrt())
         };
-        println!(
-            "qtip_gather_forward_cpu_matches_reference: cos sim = {cos:.4}"
-        );
+        println!("qtip_gather_forward_cpu_matches_reference: cos sim = {cos:.4}");
         // Greedy QTIP at 2 bits typically lands at >0.85 cos sim for a
         // single matmul; aggregated across 6 routed slots the cos sim is
         // dominated by the lowest-quality slot but should still clear
@@ -3808,13 +3824,11 @@ mod tests {
 
         let mut adata = vec![0.0f32; n_tokens * n_experts_per_tok * in_features];
         for (i, v) in adata.iter_mut().enumerate() {
-            let mut z =
-                ((i + 9001) as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            let mut z = ((i + 9001) as u64).wrapping_mul(0x9E3779B97F4A7C15);
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
             z ^= z >> 31;
             let u1 = ((z >> 32) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
-            let u2 =
-                ((z & 0xFFFFFFFF) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+            let u2 = ((z & 0xFFFFFFFF) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
             let r = (-2.0_f32 * u1.ln()).sqrt();
             *v = r * (2.0 * std::f32::consts::PI * u2).cos();
         }
@@ -3824,11 +3838,7 @@ mod tests {
             &device,
         )?;
         let idx_data: Vec<u32> = vec![0, 1, 1, 2];
-        let indices = Tensor::from_vec(
-            idx_data.clone(),
-            (n_tokens, n_experts_per_tok),
-            &device,
-        )?;
+        let indices = Tensor::from_vec(idx_data.clone(), (n_tokens, n_experts_per_tok), &device)?;
         let out = stack.gather_forward(&a, &indices)?;
 
         let dense_w: Vec<f32> = dense_w_stack.flatten_all()?.to_vec1()?;
@@ -3836,12 +3846,10 @@ mod tests {
         for tok in 0..n_tokens {
             for k in 0..n_experts_per_tok {
                 let e = idx_data[tok * n_experts_per_tok + k] as usize;
-                let a_row =
-                    &adata[(tok * n_experts_per_tok + k) * in_features
-                        ..(tok * n_experts_per_tok + k + 1) * in_features];
+                let a_row = &adata[(tok * n_experts_per_tok + k) * in_features
+                    ..(tok * n_experts_per_tok + k + 1) * in_features];
                 for r in 0..rows {
-                    let w_row = &dense_w[e * rows * in_features
-                        + r * in_features
+                    let w_row = &dense_w[e * rows * in_features + r * in_features
                         ..e * rows * in_features + (r + 1) * in_features];
                     let mut s = 0f32;
                     for c in 0..in_features {
@@ -3862,9 +3870,7 @@ mod tests {
             }
             d / (na.sqrt() * nb.sqrt())
         };
-        println!(
-            "qtip_gather_forward_viterbi_with_rotation: cos sim = {cos:.4}"
-        );
+        println!("qtip_gather_forward_viterbi_with_rotation: cos sim = {cos:.4}");
         assert!(
             cos >= 0.85,
             "QTIP gather_forward Viterbi cos sim {cos} < 0.85"
@@ -3935,8 +3941,7 @@ mod tests {
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
             z ^= z >> 31;
             let u1 = ((z >> 32) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
-            let u2 = ((z & 0xFFFFFFFF) as u32 as f32 + 1.0)
-                / (u32::MAX as f32 + 2.0);
+            let u2 = ((z & 0xFFFFFFFF) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
             let r = (-2.0_f32 * u1.ln()).sqrt();
             *v = r * (2.0 * std::f32::consts::PI * u2).cos();
         }
@@ -3953,16 +3958,8 @@ mod tests {
         .to_dtype(DType::BF16)?;
 
         let idx_data: Vec<u32> = vec![0, 1, 2, 3, 1, 1];
-        let idx_cpu = Tensor::from_vec(
-            idx_data.clone(),
-            (n_tokens, n_experts_per_tok),
-            &cpu,
-        )?;
-        let idx_cuda = Tensor::from_vec(
-            idx_data,
-            (n_tokens, n_experts_per_tok),
-            &cuda,
-        )?;
+        let idx_cpu = Tensor::from_vec(idx_data.clone(), (n_tokens, n_experts_per_tok), &cpu)?;
+        let idx_cuda = Tensor::from_vec(idx_data, (n_tokens, n_experts_per_tok), &cuda)?;
 
         let y_cpu = cpu_stack.gather_forward(&a_cpu, &idx_cpu)?;
         let y_cuda = cuda_stack.gather_forward(&a_cuda, &idx_cuda)?;
@@ -4011,10 +4008,10 @@ mod tests {
         // hidden), and mismatched (intermediate / down_proj). All use
         // K=4 V=2 L=16 packing.
         for &(n, k_in) in &[
-            (32usize, 256usize),   // tiny
-            (128, 512),            // small attn-out
-            (256, 1024),           // mid
-            (1024, 4096),          // realistic LLM scale (decoder block)
+            (32usize, 256usize), // tiny
+            (128, 512),          // small attn-out
+            (256, 1024),         // mid
+            (1024, 4096),        // realistic LLM scale (decoder block)
         ] {
             // Random-ish Gaussian weights via deterministic hash.
             let mut wdata = vec![0.0f32; n * k_in];
@@ -4051,11 +4048,14 @@ mod tests {
             // against a manually-constructed dequant+matmul.
 
             // Single-token forward through the layer (triggers fused gemv).
-            let x_cuda_1tok = Tensor::from_vec(xdata.clone(), (1, k_in), &cuda)?
-                .to_dtype(DType::BF16)?;
+            let x_cuda_1tok =
+                Tensor::from_vec(xdata.clone(), (1, k_in), &cuda)?.to_dtype(DType::BF16)?;
             let y_fused = layer.forward(&x_cuda_1tok)?;
-            let y_fused_v: Vec<f32> =
-                y_fused.to_device(&cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+            let y_fused_v: Vec<f32> = y_fused
+                .to_device(&cpu)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1()?;
 
             // Manual dequant+matmul reference: dequantize_w() returns the
             // weight in the ORIGINAL (un-rotated) frame, so the matmul
@@ -4073,9 +4073,7 @@ mod tests {
                 nb += b * b;
             }
             let cos = dot / (na.sqrt() * nb.sqrt());
-            println!(
-                "Fused gemv vs dequant+matmul cos sim (n={n}, k_in={k_in}): {cos}"
-            );
+            println!("Fused gemv vs dequant+matmul cos sim (n={n}, k_in={k_in}): {cos}");
             assert!(
                 cos >= 0.999,
                 "Fused gemv deviates from dequant+matmul: cos sim {cos} < 0.999 (n={n}, k_in={k_in})"
@@ -4119,11 +4117,14 @@ mod tests {
         let w_cuda = Tensor::from_vec(wdata, (n, k_in), &cuda)?;
         let layer = QtipLayer::quantize_with_mode(&w_cuda, None, &cuda, QtipMode::Greedy)?;
 
-        let x_cuda_1tok = Tensor::from_vec(xdata.clone(), (1, k_in), &cuda)?
-            .to_dtype(DType::BF16)?;
+        let x_cuda_1tok =
+            Tensor::from_vec(xdata.clone(), (1, k_in), &cuda)?.to_dtype(DType::BF16)?;
         let y_fused = layer.forward(&x_cuda_1tok)?;
-        let y_fused_v: Vec<f32> =
-            y_fused.to_device(&cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let y_fused_v: Vec<f32> = y_fused
+            .to_device(&cpu)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
 
         let w_recon = layer.dequantize_w()?.to_dtype(DType::F32)?;
         let x_f32 = Tensor::from_vec(xdata, (1, k_in), &cuda)?;
@@ -4141,6 +4142,214 @@ mod tests {
         assert!(
             cos >= 0.999,
             "Fused gemv deviates from dequant+matmul (Greedy): cos sim {cos} < 0.999"
+        );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // UQFF serde round-trip tests (2-D regression + 3-D stacked experts).
+    // -----------------------------------------------------------------
+
+    /// Exact-bits tensor comparison (shape, dtype, and raw data).
+    fn assert_tensor_bits_eq(a: &Tensor, b: &Tensor, what: &str) -> Result<()> {
+        assert_eq!(a.dims(), b.dims(), "{what}: shape mismatch");
+        assert_eq!(a.dtype(), b.dtype(), "{what}: dtype mismatch");
+        match a.dtype() {
+            DType::U8 => {
+                let av: Vec<u8> = a.flatten_all()?.to_vec1()?;
+                let bv: Vec<u8> = b.flatten_all()?.to_vec1()?;
+                assert_eq!(av, bv, "{what}: packed bytes differ");
+            }
+            DType::F32 => {
+                let av: Vec<f32> = a.flatten_all()?.to_vec1()?;
+                let bv: Vec<f32> = b.flatten_all()?.to_vec1()?;
+                let ab: Vec<u32> = av.iter().map(|x| x.to_bits()).collect();
+                let bb: Vec<u32> = bv.iter().map(|x| x.to_bits()).collect();
+                assert_eq!(ab, bb, "{what}: f32 bit patterns differ");
+            }
+            other => panic!("assert_tensor_bits_eq: unhandled dtype {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// UQFF round-trip for the classic 2-D layout must stay lossless and
+    /// byte-compatible (bias branch + no-rotation branch covered).
+    #[test]
+    fn qtip_uqff_2d_round_trip_with_bias() -> Result<()> {
+        let device = Device::Cpu;
+        let (n, k_in) = (8usize, 64usize);
+        let wdata: Vec<f32> = (0..(n * k_in))
+            .map(|i| ((i as f32) * 0.31).cos() * 1.5)
+            .collect();
+        let w = Tensor::from_vec(wdata, (n, k_in), &device)?;
+        let bias_data: Vec<f32> = (0..n).map(|i| i as f32 * 0.05 - 0.2).collect();
+        let bias = Tensor::from_vec(bias_data, (n,), &device)?;
+        let layer = QtipLayer::quantize_with_options_concrete(
+            &w,
+            Some(bias),
+            &device,
+            QtipMode::Greedy,
+            false,
+        )?;
+
+        let data = layer.serialize()?.into_owned();
+        let (restored, ext_bias) = QtipLayer::deserialize_concrete(
+            Cow::Owned(data),
+            &device,
+            crate::QuantizeOntoGuard::new(),
+        )?;
+
+        assert_eq!(restored.num_experts, None);
+        assert_eq!(restored.in_features, k_in);
+        assert_eq!(restored.rotation_block, layer.rotation_block);
+        assert!(restored.rotation_signs.is_none());
+        assert_tensor_bits_eq(&layer.blocks, &restored.blocks, "blocks")?;
+        assert_tensor_bits_eq(&layer.row_scales, &restored.row_scales, "row_scales")?;
+        assert_tensor_bits_eq(&layer.lut, &restored.lut, "lut")?;
+        let (Some(b0), Some(b1)) = (&layer.bias, &restored.bias) else {
+            panic!("bias must survive the round-trip");
+        };
+        assert_tensor_bits_eq(b0, b1, "bias")?;
+        assert!(ext_bias.is_some(), "deserialize must also return ext bias");
+
+        // Identical bits ⇒ identical CPU forward outputs, exactly.
+        let xdata: Vec<f32> = (0..(2 * k_in)).map(|i| ((i as f32) * 0.05).sin()).collect();
+        let x = Tensor::from_vec(xdata, (2, k_in), &device)?;
+        let y0: Vec<f32> = layer
+            .forward(&x)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
+        let y1: Vec<f32> = restored
+            .forward(&x)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
+        assert_eq!(
+            y0.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            y1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "2-D forward outputs must match bit-exactly"
+        );
+        Ok(())
+    }
+
+    /// UQFF round-trip for a 3-D stacked-expert layer: serialize →
+    /// deserialize must reconstruct packed trellis data, scales, LUT,
+    /// rotation metadata, and config bit-identically — a UQFF load must
+    /// never need to re-run the (Viterbi) quantizer.
+    ///
+    /// Also asserts the production 3-D quantize entry
+    /// (`quantize_with_options` on a rank-3 weight) serializes byte-identical
+    /// to a per-expert `quantize` + `stack_experts` twin, which gives the
+    /// test typed access to the original fields. Greedy mode with rotation
+    /// force-enabled keeps the fixture fast while covering the shared
+    /// rotation-signs branch of the serde path.
+    #[test]
+    fn qtip_uqff_3d_expert_stack_round_trip() -> Result<()> {
+        let device = Device::Cpu;
+        let (num_experts, rows, in_features) = (4usize, 64usize, 64usize);
+        let w = build_3d_gaussian_weight(num_experts, rows, in_features, &device)?;
+
+        // Production entry: rank-3 dispatch inside `quantize_with_options`.
+        let prod_layer =
+            QtipLayer::quantize_with_options(&w, None, &device, QtipMode::Greedy, true)?;
+        let prod_bytes = prod_layer.serialize()?.into_owned();
+
+        // Typed twin from the same weight: per-expert quantize + stack.
+        // Quantization is deterministic, so the payloads must be identical.
+        let mut per_expert = Vec::with_capacity(num_experts);
+        for e in 0..num_experts {
+            let w_e = w.narrow(0, e, 1)?.squeeze(0)?;
+            per_expert.push(QtipLayer::quantize_with_options_concrete(
+                &w_e,
+                None,
+                &device,
+                QtipMode::Greedy,
+                true,
+            )?);
+        }
+        let stack = QtipLayer::stack_experts(per_expert)?;
+        let stack_bytes = stack.serialize()?.into_owned();
+        assert_eq!(
+            prod_bytes, stack_bytes,
+            "3-D quantize and stack_experts must serialize byte-identically"
+        );
+
+        let (restored, ext_bias) = QtipLayer::deserialize_concrete(
+            Cow::Owned(prod_bytes),
+            &device,
+            crate::QuantizeOntoGuard::new(),
+        )?;
+
+        // Config fields.
+        assert_eq!(restored.num_experts, Some(num_experts));
+        assert_eq!(restored.in_features, in_features);
+        assert_eq!(restored.rotation_block, stack.rotation_block);
+        assert!(ext_bias.is_none());
+        assert!(restored.bias.is_none());
+
+        // Bit-identical tensors.
+        assert_eq!(
+            restored.blocks.dims(),
+            &[num_experts, rows, in_features / 4]
+        );
+        assert_tensor_bits_eq(&stack.blocks, &restored.blocks, "blocks")?;
+        assert_tensor_bits_eq(&stack.row_scales, &restored.row_scales, "row_scales")?;
+        assert_tensor_bits_eq(&stack.lut, &restored.lut, "lut")?;
+        let (Some(s0), Some(s1)) = (&stack.rotation_signs, &restored.rotation_signs) else {
+            panic!("rotation signs must be present on both sides of the round-trip");
+        };
+        assert_tensor_bits_eq(s0, s1, "rotation_signs")?;
+
+        // Identical bits ⇒ identical CPU gather_forward outputs, exactly.
+        let (n_tokens, n_experts_per_tok) = (3usize, 2usize);
+        let mut adata = vec![0.0f32; n_tokens * n_experts_per_tok * in_features];
+        for (i, v) in adata.iter_mut().enumerate() {
+            let mut z = ((i + 31_337) as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z ^= z >> 31;
+            let u1 = ((z >> 32) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+            let u2 = ((z & 0xFFFFFFFF) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+            let r = (-2.0_f32 * u1.ln()).sqrt();
+            *v = r * (2.0 * std::f32::consts::PI * u2).cos();
+        }
+        let a = Tensor::from_vec(adata, (n_tokens, n_experts_per_tok, in_features), &device)?;
+        let indices = Tensor::from_vec(
+            vec![0u32, 2, 1, 3, 2, 2],
+            (n_tokens, n_experts_per_tok),
+            &device,
+        )?;
+        let y0: Vec<f32> = stack
+            .gather_forward(&a, &indices)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
+        let y1: Vec<f32> = restored
+            .gather_forward(&a, &indices)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
+        assert_eq!(
+            y0.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            y1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "3-D gather_forward outputs must match bit-exactly"
+        );
+        Ok(())
+    }
+
+    /// Serializing a 3-D layer with an externally-supplied bias must be
+    /// refused (3-D MoE stacks are bias-free by contract).
+    #[test]
+    fn qtip_uqff_3d_serialize_rejects_bias() -> Result<()> {
+        let device = Device::Cpu;
+        let w = build_3d_gaussian_weight(2, 4, 32, &device)?;
+        let layer = QtipLayer::quantize_with_options(&w, None, &device, QtipMode::Greedy, false)?;
+        let bias = Tensor::zeros((4,), DType::F32, &device)?;
+        let err = layer.serialize_with_bias(Some(bias)).err();
+        assert!(
+            err.as_ref()
+                .is_some_and(|e| e.to_string().contains("bias-free")),
+            "expected bias-free rejection, got {err:?}"
         );
         Ok(())
     }

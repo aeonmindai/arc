@@ -9,10 +9,14 @@ use half::{bf16, f16};
 // v0.1.2: add F8E4M3
 // v0.1.3: add AFQ
 // v0.2.0: add f4/f6e3m2/f6e2m3/f8e8m0 type handling
+// v0.2.1: QTIP 3-D stacked-expert (MoE) payloads. Tensor payloads are
+//         self-describing (rank + dims), so 2-D QTIP payloads are unchanged;
+//         readers older than this version mis-decode rank-3 QTIP payloads
+//         rather than failing cleanly, so the bump records provenance.
 
 const UQFF_VERSION_MAJOR: u32 = 0;
 const UQFF_VERSION_MINOR: u32 = 2;
-const UQFF_VERSION_PATCH: u32 = 0;
+const UQFF_VERSION_PATCH: u32 = 1;
 
 /// Format 4 bytes, little endian: [ UNSPECIFIED ] [ MAJOR ] [ MINOR ] [ PATCH ]
 pub(crate) const UQFF_VERSION: u32 =
