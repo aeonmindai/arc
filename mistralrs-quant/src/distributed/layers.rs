@@ -326,6 +326,9 @@ impl QuantizedSerde for RowParallelLayer {
             QuantizedSerdeType::Mxfp4 => MXFP4Layer::deserialize_ext_bias(data, device, guard)?,
             QuantizedSerdeType::Nvfp4 => NVFP4Layer::deserialize_ext_bias(data, device, guard)?,
             QuantizedSerdeType::Qtip => QtipLayer::deserialize_ext_bias(data, device, guard)?,
+            QuantizedSerdeType::Qtip2b => {
+                crate::Qtip2bLayer::deserialize_ext_bias(data, device, guard)?
+            }
             QuantizedSerdeType::TdMoeTucker => candle_core::bail!(
                 "TD-MoE Tucker layers deserialize directly, not via a distributed wrapper"
             ),
@@ -665,6 +668,9 @@ impl QuantizedSerde for ColumnParallelLayer {
             QuantizedSerdeType::Mxfp4 => MXFP4Layer::deserialize_ext_bias(data, device, guard)?,
             QuantizedSerdeType::Nvfp4 => NVFP4Layer::deserialize_ext_bias(data, device, guard)?,
             QuantizedSerdeType::Qtip => QtipLayer::deserialize_ext_bias(data, device, guard)?,
+            QuantizedSerdeType::Qtip2b => {
+                crate::Qtip2bLayer::deserialize_ext_bias(data, device, guard)?
+            }
             QuantizedSerdeType::TdMoeTucker => candle_core::bail!(
                 "TD-MoE Tucker layers deserialize directly, not via a distributed wrapper"
             ),
@@ -971,6 +977,9 @@ impl QuantizedSerde for ReplicatedLayer {
             QuantizedSerdeType::Mxfp4 => MXFP4Layer::deserialize(data, device, comm, guard)?,
             QuantizedSerdeType::Nvfp4 => NVFP4Layer::deserialize(data, device, comm, guard)?,
             QuantizedSerdeType::Qtip => QtipLayer::deserialize(data, device, comm, guard)?,
+            QuantizedSerdeType::Qtip2b => {
+                crate::Qtip2bLayer::deserialize(data, device, comm, guard)?
+            }
             QuantizedSerdeType::TdMoeTucker => {
                 crate::TuckerFactoredLayer::deserialize(data, device, comm, guard)?
             }

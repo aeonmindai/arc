@@ -83,7 +83,7 @@ pub use mxfp4::MXFP4Layer;
 pub use nvfp4::NVFP4Layer;
 pub use pending_layer::PendingIsqLayer;
 pub use pertensor_fp8::PerTensorFP8Linear;
-pub use qtip::{QtipLayer, QtipMode, QtipPackedView};
+pub use qtip::{Qtip2bLayer, QtipLayer, QtipMode, QtipPackedView, QTIP2B_MCG_MULT};
 pub use td_moe_factored::TuckerFactoredLayer;
 pub use unquantized::UnquantLinear;
 pub use utils::flash_attn_sinks_metal;
@@ -481,6 +481,22 @@ pub enum QuantMethodConfig {
         /// Block size for the block-diagonal Hadamard rotation. 0 disables.
         rotation_block: usize,
     },
+    /// QTIP computed-codebook "bitshift trellis" rung (`qtip2b`). Unlike
+    /// [`QuantMethodConfig::Qtip`] there is no LUT tensor — the codebook is a
+    /// pure function of the trellis state and the MCG multiplier. Blocks may
+    /// be rank-2 (`[N, K/4]`) or rank-3 (`[E, N, K/4]`, stacked experts).
+    Qtip2b {
+        blocks: Tensor,
+        row_scales: Tensor,
+        bias: Option<Tensor>,
+        in_features: usize,
+        /// MCG multiplier defining the computed codebook.
+        mcg_mult: u32,
+        /// Hadamard incoherence rotation signs [in_features], ±1.0.
+        rotation_signs: Option<Tensor>,
+        /// Block size for the block-diagonal Hadamard rotation. 0 disables.
+        rotation_block: usize,
+    },
     /// TD-MoE Tucker decomposition kept in factored form (paper §3.3 storage
     /// path). Stores `G ×₁ U₁ ×₂ U₂ ×₃ U₃` for MoE expert stacks of shape
     /// `[K, d_out, d_in]`. See `td_moe_factored::TuckerFactoredLayer`.
@@ -617,6 +633,10 @@ pub enum IsqType {
     MXFP4,
     NVFP4,
     QtipBitshift2,
+    /// QTIP 2-bit with a **computed** codebook (`qtip2b`): 3-ALU-op MCG
+    /// decode in registers instead of the 512 KB LUT gather. Same 2 bits/wt
+    /// rate as `QtipBitshift2`; K=2/V=1 trellis. See `qtip::bitshift`.
+    Qtip2b,
 }
 
 /// Target bit width for automatic ISQ quantization.
@@ -711,6 +731,7 @@ impl std::fmt::Display for IsqType {
             Self::MXFP4 => write!(f, "mxfp4"),
             Self::NVFP4 => write!(f, "nvfp4"),
             Self::QtipBitshift2 => write!(f, "qtip2"),
+            Self::Qtip2b => write!(f, "qtip2b"),
         }
     }
 }
@@ -763,6 +784,9 @@ impl IsqType {
             // 95%-of-80GB fit. The per-row scale + shared LUT overhead is
             // negligible vs the 2-bit blocks. (RUN-161)
             Self::QtipBitshift2 => dtype.size_in_bytes() * 4,
+            // qtip2b: same 2 bits/weight; per-row fp32 scale is negligible and
+            // there is no LUT at all (computed codebook).
+            Self::Qtip2b => dtype.size_in_bytes() * 4,
         }
     }
 
@@ -781,7 +805,7 @@ impl IsqType {
                 // Use 1 because our HQQ quantizes on the GPU
                 Some(1.try_into().unwrap())
             }
-            IsqType::QtipBitshift2 => {
+            IsqType::QtipBitshift2 | IsqType::Qtip2b => {
                 // QTIP quantizes on the CPU (per-row trellis search), not the
                 // GPU. Greedy is fast enough single-threaded; Viterbi is ~10x
                 // heavier and must use all cores or a full requantize takes
@@ -887,6 +911,8 @@ pub enum QuantizedSerdeType {
     Nvfp4 = 7,
     Qtip = 8,
     TdMoeTucker = 9,
+    /// QTIP computed-codebook bitshift-trellis rung (`qtip2b`).
+    Qtip2b = 10,
 }
 
 impl TryFrom<usize> for QuantizedSerdeType {
@@ -903,6 +929,7 @@ impl TryFrom<usize> for QuantizedSerdeType {
             7 => Ok(Self::Nvfp4),
             8 => Ok(Self::Qtip),
             9 => Ok(Self::TdMoeTucker),
+            10 => Ok(Self::Qtip2b),
             other => candle_core::bail!("QuantizedSerdeType {other} is invalid."),
         }
     }

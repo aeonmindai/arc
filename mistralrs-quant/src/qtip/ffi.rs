@@ -222,4 +222,132 @@ extern "C" {
         num_experts: i32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
+
+    // =========================================================================
+    // qtip2b — bitshift-trellis computed-codebook kernels (kernels/qtip/
+    // qtip_bitshift.cu). K=2/V=1/L=16; codebook computed in-register from the
+    // MCG `mult` (no LUT pointer anywhere in this ABI).
+    // =========================================================================
+
+    // ----- Dequantize (rotated frame) -----
+    pub(crate) fn launch_qtip2b_dequantize_bf16(
+        d_packed: *const u8,
+        d_row_scales: *const f32,
+        d_out: *mut bf16,
+        n_rows: i32,
+        packed_per_row: i32,
+        num_symbols: i32,
+        mult: u32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
+    pub(crate) fn launch_qtip2b_dequantize_f16(
+        d_packed: *const u8,
+        d_row_scales: *const f32,
+        d_out: *mut f16,
+        n_rows: i32,
+        packed_per_row: i32,
+        num_symbols: i32,
+        mult: u32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
+    pub(crate) fn launch_qtip2b_dequantize_f32(
+        d_packed: *const u8,
+        d_row_scales: *const f32,
+        d_out: *mut f32,
+        n_rows: i32,
+        packed_per_row: i32,
+        num_symbols: i32,
+        mult: u32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
+    // ----- Fused decode + GEMV -----
+    //
+    // `d_indices == null` selects the plain 2-D path (every pair reads
+    // "expert 0", i.e. the whole [n_rows, packed_per_row] matrix); non-null
+    // gathers each pair's expert id ON-DEVICE (capturable MoE dispatch).
+    // `d_x_rotated` must already be in the QTIP-rotated frame.
+    pub(crate) fn launch_qtip2b_gemv_bf16(
+        d_packed: *const u8,
+        d_row_scales: *const f32,
+        d_x_rotated: *const bf16,
+        d_indices: *const u32,
+        d_y: *mut bf16,
+        n_rows: i32,
+        packed_per_row: i32,
+        num_symbols: i32,
+        n_pairs: i32,
+        num_experts: i32,
+        mult: u32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
+    pub(crate) fn launch_qtip2b_gemv_f16(
+        d_packed: *const u8,
+        d_row_scales: *const f32,
+        d_x_rotated: *const f16,
+        d_indices: *const u32,
+        d_y: *mut f16,
+        n_rows: i32,
+        packed_per_row: i32,
+        num_symbols: i32,
+        n_pairs: i32,
+        num_experts: i32,
+        mult: u32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
+    pub(crate) fn launch_qtip2b_gemv_f32(
+        d_packed: *const u8,
+        d_row_scales: *const f32,
+        d_x_rotated: *const f32,
+        d_indices: *const u32,
+        d_y: *mut f32,
+        n_rows: i32,
+        packed_per_row: i32,
+        num_symbols: i32,
+        n_pairs: i32,
+        num_experts: i32,
+        mult: u32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
+    // ----- Quantize side (F32 weights, same contract as the LUT rung) -----
+    pub(crate) fn launch_qtip2b_compute_row_scales_f32(
+        d_weight: *const f32,
+        d_row_scales: *mut f32,
+        n_rows: i32,
+        in_features: i32,
+        divisor: f32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
+    pub(crate) fn launch_qtip2b_quantize_rows_greedy_f32(
+        d_weight: *const f32,
+        d_row_scales: *const f32,
+        d_packed: *mut u8,
+        n_rows: i32,
+        in_features: i32,
+        num_symbols: i32,
+        mult: u32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
+    pub(crate) fn launch_qtip2b_quantize_rows_viterbi_f32(
+        d_weight: *const f32,
+        d_row_scales: *const f32,
+        d_packed: *mut u8,
+        d_cost_a: *mut f32,
+        d_cost_b: *mut f32,
+        d_prefix_cost: *mut f32,
+        d_backtrace: *mut u8,
+        n_rows: i32,
+        in_features: i32,
+        num_symbols: i32,
+        row_offset: i32,
+        mult: u32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
 }

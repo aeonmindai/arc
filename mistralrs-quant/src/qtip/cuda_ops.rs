@@ -247,12 +247,18 @@ pub(crate) fn fused_gemv_cuda(
         _ => candle_core::bail!("QTIP fused gemv CUDA: x storage must be CUDA"),
     };
 
-    let (blocks_ptr, _blocks_guard) =
-        slice_ptr(blocks_storage.as_cuda_slice::<u8>()?, blocks_layout.start_offset());
-    let (scales_ptr, _scales_guard) =
-        slice_ptr(scales_storage.as_cuda_slice::<f32>()?, scales_layout.start_offset());
-    let (lut_ptr, _lut_guard) =
-        slice_ptr(lut_storage.as_cuda_slice::<f32>()?, lut_layout.start_offset());
+    let (blocks_ptr, _blocks_guard) = slice_ptr(
+        blocks_storage.as_cuda_slice::<u8>()?,
+        blocks_layout.start_offset(),
+    );
+    let (scales_ptr, _scales_guard) = slice_ptr(
+        scales_storage.as_cuda_slice::<f32>()?,
+        scales_layout.start_offset(),
+    );
+    let (lut_ptr, _lut_guard) = slice_ptr(
+        lut_storage.as_cuda_slice::<f32>()?,
+        lut_layout.start_offset(),
+    );
 
     let res = match x_2d.dtype() {
         DType::BF16 => {
@@ -382,9 +388,7 @@ pub(crate) fn gather_gemv_cuda(
     }
     let idx_pairs = indices.elem_count();
     if idx_pairs != n_pairs {
-        candle_core::bail!(
-            "QTIP gather gemv CUDA: indices len {idx_pairs} != n_pairs {n_pairs}"
-        );
+        candle_core::bail!("QTIP gather gemv CUDA: indices len {idx_pairs} != n_pairs {n_pairs}");
     }
     let x_2d = x_rotated.contiguous()?;
     let indices = indices.flatten_all()?.contiguous()?;
@@ -427,14 +431,22 @@ pub(crate) fn gather_gemv_cuda(
         _ => candle_core::bail!("QTIP gather gemv CUDA: indices storage must be CUDA"),
     };
 
-    let (blocks_ptr, _blocks_guard) =
-        slice_ptr(blocks_storage.as_cuda_slice::<u8>()?, blocks_layout.start_offset());
-    let (scales_ptr, _scales_guard) =
-        slice_ptr(scales_storage.as_cuda_slice::<f32>()?, scales_layout.start_offset());
-    let (lut_ptr, _lut_guard) =
-        slice_ptr(lut_storage.as_cuda_slice::<f32>()?, lut_layout.start_offset());
-    let (idx_ptr, _idx_guard) =
-        slice_ptr(idx_storage.as_cuda_slice::<u32>()?, idx_layout.start_offset());
+    let (blocks_ptr, _blocks_guard) = slice_ptr(
+        blocks_storage.as_cuda_slice::<u8>()?,
+        blocks_layout.start_offset(),
+    );
+    let (scales_ptr, _scales_guard) = slice_ptr(
+        scales_storage.as_cuda_slice::<f32>()?,
+        scales_layout.start_offset(),
+    );
+    let (lut_ptr, _lut_guard) = slice_ptr(
+        lut_storage.as_cuda_slice::<f32>()?,
+        lut_layout.start_offset(),
+    );
+    let (idx_ptr, _idx_guard) = slice_ptr(
+        idx_storage.as_cuda_slice::<u32>()?,
+        idx_layout.start_offset(),
+    );
 
     let n_out = n_pairs * n_rows;
 
@@ -962,14 +974,12 @@ pub(crate) fn quantize_rows_cuda(
             Storage::Cuda(s) => s,
             _ => candle_core::bail!("QTIP refine scales: row_scales must be CUDA storage"),
         };
-        let (w_ptr, _wg) =
-            slice_ptr(w_storage.as_cuda_slice::<f32>()?, w_layout.start_offset());
+        let (w_ptr, _wg) = slice_ptr(w_storage.as_cuda_slice::<f32>()?, w_layout.start_offset());
         let (lut_ptr, _lg) = slice_ptr(
             lut_storage.as_cuda_slice::<f32>()?,
             lut_layout.start_offset(),
         );
-        let (rs_ptr, _rg) =
-            slice_ptr(rs_storage.as_cuda_slice::<f32>()?, rs_layout.start_offset());
+        let (rs_ptr, _rg) = slice_ptr(rs_storage.as_cuda_slice::<f32>()?, rs_layout.start_offset());
         let (pkd_ptr, _pg) = slice_ptr(&packed_buf, 0);
 
         unsafe {
@@ -988,6 +998,510 @@ pub(crate) fn quantize_rows_cuda(
 
     let packed_storage = CudaStorage::wrap_cuda_slice(packed_buf, dev.clone());
     let packed = Tensor::from((Storage::Cuda(packed_storage), packed_shape));
+
+    Ok((packed, row_scales))
+}
+
+// ===========================================================================
+// qtip2b — bitshift-trellis computed-codebook ops (no LUT anywhere).
+// ===========================================================================
+//
+// These are the qtip2b (K=2/V=1) siblings of the LUT-rung helpers above.
+// The codebook is computed in-register from the MCG multiplier, so none of
+// these take (or upload) a LUT tensor. Rotation helpers (`rotate_x_cuda`,
+// `rotate_weight_rows_cuda`) are format-agnostic and shared with the LUT
+// rung.
+
+use super::bitshift::QTIP2B_SCALE_DIVISOR;
+
+/// Symbols packed per byte for qtip2b (2-bit symbols).
+const Q2B_SYMS_PER_BYTE: usize = 4;
+/// 2^L trellis states (cost-table width for the Viterbi scratch).
+const Q2B_NSTATES: usize = 1 << 16;
+/// 2^(L-K) prefixes (per-prefix scratch width).
+const Q2B_PREFIX_COUNT: usize = 1 << 14;
+
+/// Dequantize qtip2b-packed weights into `[n_rows, in_features]` on GPU
+/// (rotated frame).
+pub(crate) fn dequantize_2b_cuda(
+    blocks: &Tensor,
+    row_scales: &Tensor,
+    mcg_mult: u32,
+    in_features: usize,
+    out_dtype: DType,
+) -> Result<Tensor> {
+    let n_rows = row_scales.dim(0)?;
+    let packed_per_row = blocks.dim(1)?;
+    let num_symbols = in_features; // V = 1
+    if blocks.dtype() != DType::U8 {
+        candle_core::bail!("qtip2b dequantize CUDA: blocks dtype must be U8");
+    }
+    if row_scales.dtype() != DType::F32 {
+        candle_core::bail!("qtip2b dequantize CUDA: row_scales dtype must be F32");
+    }
+    if !blocks.layout().is_contiguous() || !row_scales.layout().is_contiguous() {
+        candle_core::bail!("qtip2b dequantize CUDA: all inputs must be contiguous");
+    }
+
+    let dev = match blocks.device() {
+        candle_core::Device::Cuda(d) => d.clone(),
+        _ => candle_core::bail!("qtip2b dequantize CUDA: blocks must live on CUDA"),
+    };
+
+    let (blocks_storage, blocks_layout) = blocks.storage_and_layout();
+    let blocks_storage = match &*blocks_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("qtip2b dequantize CUDA: blocks must be CUDA storage"),
+    };
+    let (scales_storage, scales_layout) = row_scales.storage_and_layout();
+    let scales_storage = match &*scales_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("qtip2b dequantize CUDA: scales must be CUDA storage"),
+    };
+
+    let (blocks_ptr, _blocks_guard) = slice_ptr(
+        blocks_storage.as_cuda_slice::<u8>()?,
+        blocks_layout.start_offset(),
+    );
+    let (scales_ptr, _scales_guard) = slice_ptr(
+        scales_storage.as_cuda_slice::<f32>()?,
+        scales_layout.start_offset(),
+    );
+
+    let num_weights = n_rows * in_features;
+    let out_shape = candle_core::Shape::from_dims(&[n_rows, in_features]);
+
+    macro_rules! dequant_dtype {
+        ($T:ty, $launch:expr) => {{
+            let out_buf = dev.alloc_zeros::<$T>(num_weights)?;
+            let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
+            unsafe {
+                $launch(
+                    blocks_ptr as *const _,
+                    scales_ptr as *const _,
+                    out_ptr as *mut _,
+                    n_rows as i32,
+                    packed_per_row as i32,
+                    num_symbols as i32,
+                    mcg_mult,
+                    dev.cuda_stream().cu_stream(),
+                );
+            }
+            drop(out_guard);
+            CudaStorage::wrap_cuda_slice(out_buf, dev.clone())
+        }};
+    }
+
+    let res = match out_dtype {
+        DType::BF16 => dequant_dtype!(bf16, ffi::launch_qtip2b_dequantize_bf16),
+        DType::F16 => dequant_dtype!(f16, ffi::launch_qtip2b_dequantize_f16),
+        DType::F32 => dequant_dtype!(f32, ffi::launch_qtip2b_dequantize_f32),
+        other => candle_core::bail!("qtip2b dequantize CUDA: unsupported out dtype {other:?}"),
+    };
+
+    Ok(Tensor::from((Storage::Cuda(res), out_shape)))
+}
+
+/// Single-token fused decode + GEMV for a 2-D qtip2b layer. `x_rotated` must
+/// already be rotated. Returns `[1, n_rows]`.
+pub(crate) fn fused_gemv_2b_cuda(
+    blocks: &Tensor,
+    row_scales: &Tensor,
+    mcg_mult: u32,
+    x_rotated: &Tensor,
+    in_features: usize,
+) -> Result<Tensor> {
+    let n_rows = row_scales.dim(0)?;
+    let packed_per_row = blocks.dim(1)?;
+    let num_symbols = in_features; // V = 1
+
+    if blocks.dtype() != DType::U8 {
+        candle_core::bail!("qtip2b fused gemv CUDA: blocks dtype must be U8");
+    }
+    if row_scales.dtype() != DType::F32 {
+        candle_core::bail!("qtip2b fused gemv CUDA: row_scales dtype must be F32");
+    }
+    if !blocks.layout().is_contiguous() || !row_scales.layout().is_contiguous() {
+        candle_core::bail!("qtip2b fused gemv CUDA: blocks/scales must be contiguous");
+    }
+
+    let x_2d = match x_rotated.dims() {
+        [k] if *k == in_features => x_rotated.unsqueeze(0)?,
+        [b, k] if *b == 1 && *k == in_features => x_rotated.clone(),
+        other => candle_core::bail!(
+            "qtip2b fused gemv CUDA: x_rotated must be [k_in] or [1, k_in]; got {other:?} (k_in={in_features})"
+        ),
+    };
+    let x_2d = x_2d.contiguous()?;
+
+    let dev = match blocks.device() {
+        candle_core::Device::Cuda(d) => d.clone(),
+        _ => candle_core::bail!("qtip2b fused gemv CUDA: blocks must live on CUDA"),
+    };
+    if !matches!(x_2d.device(), candle_core::Device::Cuda(_)) {
+        candle_core::bail!("qtip2b fused gemv CUDA: x_rotated must live on CUDA");
+    }
+
+    let out_shape = candle_core::Shape::from_dims(&[1, n_rows]);
+
+    let (blocks_storage, blocks_layout) = blocks.storage_and_layout();
+    let blocks_storage = match &*blocks_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("qtip2b fused gemv CUDA: blocks storage must be CUDA"),
+    };
+    let (scales_storage, scales_layout) = row_scales.storage_and_layout();
+    let scales_storage = match &*scales_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("qtip2b fused gemv CUDA: scales storage must be CUDA"),
+    };
+    let (x_storage, x_layout) = x_2d.storage_and_layout();
+    let x_storage = match &*x_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("qtip2b fused gemv CUDA: x storage must be CUDA"),
+    };
+
+    let (blocks_ptr, _blocks_guard) = slice_ptr(
+        blocks_storage.as_cuda_slice::<u8>()?,
+        blocks_layout.start_offset(),
+    );
+    let (scales_ptr, _scales_guard) = slice_ptr(
+        scales_storage.as_cuda_slice::<f32>()?,
+        scales_layout.start_offset(),
+    );
+
+    macro_rules! gemv_dtype {
+        ($T:ty, $launch:expr) => {{
+            let (x_ptr, _x_guard) =
+                slice_ptr(x_storage.as_cuda_slice::<$T>()?, x_layout.start_offset());
+            let out_buf = dev.alloc_zeros::<$T>(n_rows)?;
+            let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
+            unsafe {
+                $launch(
+                    blocks_ptr as *const _,
+                    scales_ptr as *const _,
+                    x_ptr as *const _,
+                    std::ptr::null::<u32>(), // 2-D path: no gather indices
+                    out_ptr as *mut _,
+                    n_rows as i32,
+                    packed_per_row as i32,
+                    num_symbols as i32,
+                    1i32, // n_pairs
+                    1i32, // num_experts
+                    mcg_mult,
+                    dev.cuda_stream().cu_stream(),
+                );
+            }
+            drop(out_guard);
+            CudaStorage::wrap_cuda_slice(out_buf, dev.clone())
+        }};
+    }
+
+    let res = match x_2d.dtype() {
+        DType::BF16 => gemv_dtype!(bf16, ffi::launch_qtip2b_gemv_bf16),
+        DType::F16 => gemv_dtype!(f16, ffi::launch_qtip2b_gemv_f16),
+        DType::F32 => gemv_dtype!(f32, ffi::launch_qtip2b_gemv_f32),
+        other => candle_core::bail!("qtip2b fused gemv CUDA: unsupported x dtype {other:?}"),
+    };
+
+    Ok(Tensor::from((Storage::Cuda(res), out_shape)))
+}
+
+/// On-device MoE gather + fused decode GEMV for a 3-D stacked qtip2b layer
+/// (CUDA-graph-capturable decode dispatch). Returns `[n_pairs, n_rows]`.
+pub(crate) fn gather_gemv_2b_cuda(
+    blocks: &Tensor,
+    row_scales: &Tensor,
+    mcg_mult: u32,
+    x_rotated: &Tensor,
+    indices: &Tensor,
+    in_features: usize,
+) -> Result<Tensor> {
+    let num_experts = blocks.dim(0)?;
+    let n_rows = row_scales.dim(1)?;
+    let packed_per_row = blocks.dim(2)?;
+    let num_symbols = in_features; // V = 1
+
+    if blocks.dtype() != DType::U8 {
+        candle_core::bail!("qtip2b gather gemv CUDA: blocks dtype must be U8");
+    }
+    if row_scales.dtype() != DType::F32 {
+        candle_core::bail!("qtip2b gather gemv CUDA: row_scales dtype must be F32");
+    }
+    if indices.dtype() != DType::U32 {
+        candle_core::bail!("qtip2b gather gemv CUDA: indices dtype must be U32");
+    }
+    if !blocks.layout().is_contiguous() || !row_scales.layout().is_contiguous() {
+        candle_core::bail!("qtip2b gather gemv CUDA: blocks/scales must be contiguous");
+    }
+
+    let (n_pairs, x_cols) = x_rotated.dims2()?;
+    if x_cols != in_features {
+        candle_core::bail!(
+            "qtip2b gather gemv CUDA: x_rotated cols {x_cols} != in_features {in_features}"
+        );
+    }
+    let idx_pairs = indices.elem_count();
+    if idx_pairs != n_pairs {
+        candle_core::bail!("qtip2b gather gemv CUDA: indices len {idx_pairs} != n_pairs {n_pairs}");
+    }
+    let x_2d = x_rotated.contiguous()?;
+    let indices = indices.flatten_all()?.contiguous()?;
+
+    let dev = match blocks.device() {
+        candle_core::Device::Cuda(d) => d.clone(),
+        _ => candle_core::bail!("qtip2b gather gemv CUDA: blocks must live on CUDA"),
+    };
+    if !matches!(x_2d.device(), candle_core::Device::Cuda(_))
+        || !matches!(indices.device(), candle_core::Device::Cuda(_))
+    {
+        candle_core::bail!("qtip2b gather gemv CUDA: x_rotated and indices must live on CUDA");
+    }
+
+    let out_shape = candle_core::Shape::from_dims(&[n_pairs, n_rows]);
+
+    let (blocks_storage, blocks_layout) = blocks.storage_and_layout();
+    let blocks_storage = match &*blocks_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("qtip2b gather gemv CUDA: blocks storage must be CUDA"),
+    };
+    let (scales_storage, scales_layout) = row_scales.storage_and_layout();
+    let scales_storage = match &*scales_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("qtip2b gather gemv CUDA: scales storage must be CUDA"),
+    };
+    let (x_storage, x_layout) = x_2d.storage_and_layout();
+    let x_storage = match &*x_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("qtip2b gather gemv CUDA: x storage must be CUDA"),
+    };
+    let (idx_storage, idx_layout) = indices.storage_and_layout();
+    let idx_storage = match &*idx_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("qtip2b gather gemv CUDA: indices storage must be CUDA"),
+    };
+
+    let (blocks_ptr, _blocks_guard) = slice_ptr(
+        blocks_storage.as_cuda_slice::<u8>()?,
+        blocks_layout.start_offset(),
+    );
+    let (scales_ptr, _scales_guard) = slice_ptr(
+        scales_storage.as_cuda_slice::<f32>()?,
+        scales_layout.start_offset(),
+    );
+    let (idx_ptr, _idx_guard) = slice_ptr(
+        idx_storage.as_cuda_slice::<u32>()?,
+        idx_layout.start_offset(),
+    );
+
+    let n_out = n_pairs * n_rows;
+
+    macro_rules! gather_dtype {
+        ($T:ty, $launch:expr) => {{
+            let (x_ptr, _x_guard) =
+                slice_ptr(x_storage.as_cuda_slice::<$T>()?, x_layout.start_offset());
+            let out_buf = dev.alloc_zeros::<$T>(n_out)?;
+            let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
+            unsafe {
+                $launch(
+                    blocks_ptr as *const _,
+                    scales_ptr as *const _,
+                    x_ptr as *const _,
+                    idx_ptr as *const _,
+                    out_ptr as *mut _,
+                    n_rows as i32,
+                    packed_per_row as i32,
+                    num_symbols as i32,
+                    n_pairs as i32,
+                    num_experts as i32,
+                    mcg_mult,
+                    dev.cuda_stream().cu_stream(),
+                );
+            }
+            drop(out_guard);
+            CudaStorage::wrap_cuda_slice(out_buf, dev.clone())
+        }};
+    }
+
+    let res = match x_2d.dtype() {
+        DType::BF16 => gather_dtype!(bf16, ffi::launch_qtip2b_gemv_bf16),
+        DType::F16 => gather_dtype!(f16, ffi::launch_qtip2b_gemv_f16),
+        DType::F32 => gather_dtype!(f32, ffi::launch_qtip2b_gemv_f32),
+        other => candle_core::bail!("qtip2b gather gemv CUDA: unsupported x dtype {other:?}"),
+    };
+
+    Ok(Tensor::from((Storage::Cuda(res), out_shape)))
+}
+
+/// One-shot qtip2b quantize on GPU. `weight_rotated_f32` must already be F32
+/// on CUDA and in the rotated frame. Returns `(packed_blocks, row_scales)`
+/// with `packed_blocks: [n_rows, num_symbols / 4]` U8.
+pub(crate) fn quantize_rows_2b_cuda(
+    weight_rotated_f32: &Tensor,
+    mcg_mult: u32,
+    mode: QtipMode,
+) -> Result<(Tensor, Tensor)> {
+    if !ffi::HAVE_QTIP_KERNELS {
+        candle_core::bail!("qtip2b quantize CUDA: kernels not compiled in");
+    }
+    let (n_rows, k_in) = weight_rotated_f32.dims2()?;
+    let num_symbols = k_in; // V = 1
+    if !num_symbols.is_multiple_of(Q2B_SYMS_PER_BYTE) {
+        candle_core::bail!(
+            "qtip2b quantize CUDA: num_symbols ({num_symbols}) must be a multiple of 4"
+        );
+    }
+    if weight_rotated_f32.dtype() != DType::F32 {
+        candle_core::bail!(
+            "qtip2b quantize CUDA: weight dtype must be F32, got {:?}",
+            weight_rotated_f32.dtype()
+        );
+    }
+    let dev = match weight_rotated_f32.device() {
+        candle_core::Device::Cuda(d) => d.clone(),
+        _ => candle_core::bail!("qtip2b quantize CUDA: weight must live on CUDA"),
+    };
+
+    let weight_contig = weight_rotated_f32.contiguous()?;
+
+    // Step 1: row scales (max|row| / QTIP2B_SCALE_DIVISOR).
+    let row_scales = {
+        let (w_storage, w_layout) = weight_contig.storage_and_layout();
+        let w_storage = match &*w_storage {
+            Storage::Cuda(s) => s,
+            _ => candle_core::bail!("qtip2b quantize CUDA: weight must be CUDA storage"),
+        };
+        let (w_ptr, _w_guard) =
+            slice_ptr(w_storage.as_cuda_slice::<f32>()?, w_layout.start_offset());
+        let scales_buf = dev.alloc_zeros::<f32>(n_rows)?;
+        let (scales_ptr, scales_guard) = slice_ptr(&scales_buf, 0);
+        unsafe {
+            ffi::launch_qtip2b_compute_row_scales_f32(
+                w_ptr as *const _,
+                scales_ptr as *mut _,
+                n_rows as i32,
+                k_in as i32,
+                QTIP2B_SCALE_DIVISOR,
+                dev.cuda_stream().cu_stream(),
+            );
+        }
+        drop(scales_guard);
+        let res = CudaStorage::wrap_cuda_slice(scales_buf, dev.clone());
+        Tensor::from((Storage::Cuda(res), candle_core::Shape::from_dims(&[n_rows])))
+    };
+
+    // Step 2: packed output + quantize kernel.
+    let packed_per_row = num_symbols / Q2B_SYMS_PER_BYTE;
+    let packed_buf = dev.alloc_zeros::<u8>(n_rows * packed_per_row)?;
+    let packed_shape = candle_core::Shape::from_dims(&[n_rows, packed_per_row]);
+
+    {
+        let (w_storage, w_layout) = weight_contig.storage_and_layout();
+        let w_storage = match &*w_storage {
+            Storage::Cuda(s) => s,
+            _ => candle_core::bail!("qtip2b quantize CUDA: weight must be CUDA storage"),
+        };
+        let (rs_storage, rs_layout) = row_scales.storage_and_layout();
+        let rs_storage = match &*rs_storage {
+            Storage::Cuda(s) => s,
+            _ => candle_core::bail!("qtip2b quantize CUDA: row_scales must be CUDA storage"),
+        };
+        let (w_ptr, _w_guard) =
+            slice_ptr(w_storage.as_cuda_slice::<f32>()?, w_layout.start_offset());
+        let (rs_ptr, _rs_guard) =
+            slice_ptr(rs_storage.as_cuda_slice::<f32>()?, rs_layout.start_offset());
+        let (pkd_ptr, pkd_guard) = slice_ptr(&packed_buf, 0);
+
+        match mode {
+            QtipMode::Greedy => unsafe {
+                ffi::launch_qtip2b_quantize_rows_greedy_f32(
+                    w_ptr as *const _,
+                    rs_ptr as *const _,
+                    pkd_ptr as *mut _,
+                    n_rows as i32,
+                    k_in as i32,
+                    num_symbols as i32,
+                    mcg_mult,
+                    dev.cuda_stream().cu_stream(),
+                );
+            },
+            QtipMode::Viterbi => {
+                // Scratch budget mirrors the LUT rung: per-row backtrace is
+                // num_symbols * 2^(L-K) bytes (prefix-grouped), plus two
+                // 2^L-f32 cost ping-pong tables and one 2^(L-K)-f32 prefix
+                // table (the K=2 prefix table no longer fits shared memory —
+                // see the kernel comment).
+                let bt_bytes_per_row = num_symbols * Q2B_PREFIX_COUNT;
+                let per_row_bytes = bt_bytes_per_row + 2 * Q2B_NSTATES * 4 + Q2B_PREFIX_COUNT * 4;
+                let mut rows_in_flight = (viterbi_scratch_bytes() / per_row_bytes).max(1);
+                if rows_in_flight > n_rows {
+                    rows_in_flight = n_rows;
+                }
+
+                // Uninit alloc (not alloc_zeros): the kernel fully writes
+                // cost_a at t=0, prefix_cost in Phase A, cost_b in Phase B,
+                // and the backtrace before any read.
+                let cost_a = unsafe { dev.alloc::<f32>(rows_in_flight * Q2B_NSTATES)? };
+                let cost_b = unsafe { dev.alloc::<f32>(rows_in_flight * Q2B_NSTATES)? };
+                let prefix_cost = unsafe { dev.alloc::<f32>(rows_in_flight * Q2B_PREFIX_COUNT)? };
+                let backtrace = unsafe { dev.alloc::<u8>(rows_in_flight * bt_bytes_per_row)? };
+
+                let (ca_ptr, ca_guard) = slice_ptr(&cost_a, 0);
+                let (cb_ptr, cb_guard) = slice_ptr(&cost_b, 0);
+                let (pc_ptr, pc_guard) = slice_ptr(&prefix_cost, 0);
+                let (bt_ptr, bt_guard) = slice_ptr(&backtrace, 0);
+
+                let mut row_offset = 0usize;
+                while row_offset < n_rows {
+                    let this_batch = rows_in_flight.min(n_rows - row_offset);
+                    unsafe {
+                        ffi::launch_qtip2b_quantize_rows_viterbi_f32(
+                            w_ptr as *const _,
+                            rs_ptr as *const _,
+                            pkd_ptr as *mut _,
+                            ca_ptr as *mut _,
+                            cb_ptr as *mut _,
+                            pc_ptr as *mut _,
+                            bt_ptr as *mut _,
+                            this_batch as i32,
+                            k_in as i32,
+                            num_symbols as i32,
+                            row_offset as i32,
+                            mcg_mult,
+                            dev.cuda_stream().cu_stream(),
+                        );
+                    }
+                    row_offset += this_batch;
+                }
+
+                drop(ca_guard);
+                drop(cb_guard);
+                drop(pc_guard);
+                drop(bt_guard);
+                let _ = (cost_a, cost_b, prefix_cost, backtrace);
+            }
+        }
+
+        drop(pkd_guard);
+    }
+
+    let packed_storage = CudaStorage::wrap_cuda_slice(packed_buf, dev.clone());
+    let packed = Tensor::from((Storage::Cuda(packed_storage), packed_shape));
+
+    // Least-squares scale refinement — the GPU mirror of the CPU path's
+    // per-row `scale* = ⟨w, c⟩ / ⟨c, c⟩`. Implemented with candle tensor ops
+    // (one extra dequant pass at bake time) instead of a bespoke kernel:
+    //   ŵ = s₀·c  ⇒  s* = s₀·⟨w, ŵ⟩ / ⟨ŵ, ŵ⟩.
+    // Rows with a non-positive numerator (pathological: refined scale would
+    // flip every sign) or zero denominator keep the s₀ heuristic, matching
+    // the CPU guard exactly.
+    let row_scales = {
+        let w_hat = dequantize_2b_cuda(&packed, &row_scales, mcg_mult, k_in, DType::F32)?;
+        let num = (&weight_contig * &w_hat)?.sum(1)?; // [n_rows]
+        let den = (&w_hat * &w_hat)?.sum(1)?; // [n_rows]
+        let refined = ((&num / &den)? * &row_scales)?;
+        let mask = (num.gt(0f64)? * den.gt(0f64)?)?;
+        mask.where_cond(&refined, &row_scales)?
+    };
 
     Ok((packed, row_scales))
 }

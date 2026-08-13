@@ -217,6 +217,7 @@ impl QuantMethod for BnbLinear {
             | QuantMethodConfig::MXFP4 { .. }
             | QuantMethodConfig::NVFP4 { .. }
             | QuantMethodConfig::Qtip { .. }
+            | QuantMethodConfig::Qtip2b { .. }
             | QuantMethodConfig::TuckerFactored { .. } => unreachable!(),
             QuantMethodConfig::Bnb {
                 weight,

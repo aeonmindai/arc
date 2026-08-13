@@ -47,6 +47,7 @@ impl QuantMethod for BlockwiseFP8Linear {
             | QuantMethodConfig::MXFP4 { .. }
             | QuantMethodConfig::NVFP4 { .. }
             | QuantMethodConfig::Qtip { .. }
+            | QuantMethodConfig::Qtip2b { .. }
             | QuantMethodConfig::TuckerFactored { .. } => unreachable!(),
             QuantMethodConfig::BlockwiseFP8 {
                 weight,
@@ -380,7 +381,7 @@ impl QuantMethod for BlockwiseFP8Linear {
                     .transpose()?;
                 crate::NVFP4Layer::quantize(&w, b, &device)
             }
-            Some(IsqType::QtipBitshift2) => {
+            Some(isq @ (IsqType::QtipBitshift2 | IsqType::Qtip2b)) => {
                 let _acquired_quantize_guard = guard.acquire(&device);
                 if imatrix_weight.is_some() {
                     candle_core::bail!("QTIP does not support imatrix.");
@@ -391,12 +392,21 @@ impl QuantMethod for BlockwiseFP8Linear {
                     .as_ref()
                     .map(|b| b.to_device(&device))
                     .transpose()?;
-                crate::QtipLayer::quantize_with_mode(
-                    &weight.to_device(&device)?,
-                    bias,
-                    &device,
-                    crate::QtipMode::Viterbi,
-                )
+                if matches!(isq, IsqType::Qtip2b) {
+                    crate::Qtip2bLayer::quantize_with_mode(
+                        &weight.to_device(&device)?,
+                        bias,
+                        &device,
+                        crate::QtipMode::Viterbi,
+                    )
+                } else {
+                    crate::QtipLayer::quantize_with_mode(
+                        &weight.to_device(&device)?,
+                        bias,
+                        &device,
+                        crate::QtipMode::Viterbi,
+                    )
+                }
             }
             None => {
                 let _acquired_quantize_guard = guard.acquire(&device);

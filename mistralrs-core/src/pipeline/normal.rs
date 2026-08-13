@@ -424,6 +424,7 @@ impl Loader for NormalLoader {
                                 QuantizedSerdeType::Mxfp4 => IsqType::MXFP4.pack_factor(dtype),
                                 QuantizedSerdeType::Nvfp4 => IsqType::NVFP4.pack_factor(dtype),
                                 QuantizedSerdeType::Qtip => IsqType::QtipBitshift2.pack_factor(dtype),
+                                QuantizedSerdeType::Qtip2b => IsqType::Qtip2b.pack_factor(dtype),
                                 QuantizedSerdeType::TdMoeTucker => 1,
                             };
                             let len = artifact.len();
