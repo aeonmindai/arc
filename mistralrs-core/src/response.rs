@@ -9,7 +9,7 @@ use candle_core::Tensor;
 use pyo3::{pyclass, pymethods};
 use serde::Serialize;
 
-use crate::{sampler::TopLogprob, tools::ToolCallResponse};
+use crate::{arc_boost::VoteOutcome, sampler::TopLogprob, tools::ToolCallResponse};
 
 pub const SYSTEM_FINGERPRINT: &str = "local";
 
@@ -89,6 +89,16 @@ pub struct Choice {
     pub index: usize,
     pub message: ResponseMessage,
     pub logprobs: Option<Logprobs>,
+    /// Arc Boost confidence telemetry: rolling mean log10-probability of the
+    /// last `DEFAULT_CONFIDENCE_WINDOW` generated tokens (the DeepConf
+    /// signal). `<= 0`; closer to zero means more confident.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+    /// Arc Boost confidence telemetry: minimum sliding-window mean
+    /// log10-probability over the generation (DeepConf "lowest group
+    /// confidence" — the chain's most uncertain stretch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lowest_group_confidence: Option<f32>,
 }
 
 generate_repr!(Choice);
@@ -149,6 +159,10 @@ pub struct ChatCompletionResponse {
     pub system_fingerprint: String,
     pub object: String,
     pub usage: Usage,
+    /// Arc Boost voting metadata, present when the request used `n_votes`.
+    /// `choices[0]` is the winning chain; all candidates are listed here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vote: Option<VoteOutcome>,
 }
 
 generate_repr!(ChatCompletionResponse);

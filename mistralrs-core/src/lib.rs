@@ -53,6 +53,7 @@ pub use model_selected::ModelSelected;
 pub use toml_selector::{get_toml_selected_model_device_map_params, get_toml_selected_model_dtype};
 
 mod amoe;
+pub mod arc_boost;
 mod attention;
 mod diagnostics;
 mod diffusion_models;
@@ -92,6 +93,10 @@ pub use tuning::{
 };
 
 pub use amoe::{AnyMoeConfig, AnyMoeExpertType};
+pub use arc_boost::{
+    apply_vote, extract_answer, normalize_answer, ConfidenceTracker, VoteCandidate, VoteMode,
+    VoteOutcome,
+};
 pub use device_map::{
     DeviceLayerMapMetadata, DeviceMapMetadata, DeviceMapSetting, DeviceMapper, LayerDeviceMapper,
 };

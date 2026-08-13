@@ -160,6 +160,7 @@ fn interactive_sample_parameters() -> SamplingParams {
         top_k: Some(32),
         top_p: Some(0.1),
         min_p: Some(0.05),
+        top_nsigma: None,
         top_n_logprobs: 0,
         frequency_penalty: None,
         presence_penalty: None,
@@ -169,6 +170,8 @@ fn interactive_sample_parameters() -> SamplingParams {
         logits_bias: None,
         n_choices: 1,
         dry_params: Some(DrySamplingParams::default()),
+        early_stop_confidence: None,
+        reasoning_budget: None,
     }
 }
 

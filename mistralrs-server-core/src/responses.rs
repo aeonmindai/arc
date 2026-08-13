@@ -1467,6 +1467,8 @@ async fn parse_openresponses_request(
         top_k: oairequest.top_k,
         grammar: oairequest.grammar,
         min_p: oairequest.min_p,
+        // Arc Boost params are not exposed through the OpenResponses API.
+        top_nsigma: None,
         dry_multiplier: oairequest.dry_multiplier,
         dry_base: oairequest.dry_base,
         dry_allowed_length: oairequest.dry_allowed_length,
@@ -1474,6 +1476,11 @@ async fn parse_openresponses_request(
         enable_thinking,
         truncate_sequence,
         reasoning_effort,
+        n_votes: None,
+        vote_mode: None,
+        answer_regex: None,
+        early_stop_confidence: None,
+        reasoning_budget: None,
     };
 
     let (request, is_streaming) = parse_chat_request(chat_request, state, tx).await?;

@@ -58,6 +58,7 @@ async fn run_bench(
         top_k: Some(32),
         top_p: Some(0.1),
         min_p: Some(0.05),
+        top_nsigma: None,
         top_n_logprobs: 0,
         frequency_penalty: Some(0.1),
         presence_penalty: Some(0.1),
@@ -67,6 +68,8 @@ async fn run_bench(
         logits_bias: None,
         n_choices: 1,
         dry_params: Some(DrySamplingParams::default()),
+        early_stop_confidence: None,
+        reasoning_budget: None,
     };
     let sender = mistralrs.get_sender(None).unwrap();
     let (tx, mut rx) = channel(10_000);

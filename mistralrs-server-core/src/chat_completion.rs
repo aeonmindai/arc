@@ -16,7 +16,7 @@ use indexmap::IndexMap;
 use itertools::Itertools;
 use mistralrs_core::{
     ChatCompletionChunkResponse, ChatCompletionResponse, Constraint, MistralRs, ModelCategory,
-    NormalRequest, ReasoningEffort, Request, RequestMessage, Response, SamplingParams,
+    NormalRequest, ReasoningEffort, Request, RequestMessage, Response, SamplingParams, VoteMode,
 };
 use serde_json::Value;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -198,6 +198,37 @@ impl IntoResponse for ChatCompletionResponder {
             }
         }
     }
+}
+
+/// Arc Boost voting configuration extracted from a chat completion request.
+pub struct VoteOptions {
+    pub mode: VoteMode,
+    pub answer_regex: Option<String>,
+}
+
+/// Extract and validate the Arc Boost voting options of a request.
+///
+/// Returns `Ok(None)` when the request does not vote (`n_votes` absent or
+/// `< 2`); errors on an unknown `vote_mode` or an invalid `answer_regex`.
+pub fn parse_vote_options(oairequest: &ChatCompletionRequest) -> Result<Option<VoteOptions>> {
+    let Some(k) = oairequest.n_votes else {
+        return Ok(None);
+    };
+    if k < 2 {
+        return Ok(None);
+    }
+    let mode = match &oairequest.vote_mode {
+        Some(s) => s.parse::<VoteMode>().map_err(anyhow::Error::msg)?,
+        None => VoteMode::ConfidenceWeighted,
+    };
+    if let Some(pattern) = &oairequest.answer_regex {
+        mistralrs_core::arc_boost::validate_answer_regex(pattern)
+            .map_err(|e| anyhow::anyhow!("Invalid `answer_regex`: {e}"))?;
+    }
+    Ok(Some(VoteOptions {
+        mode,
+        answer_regex: oairequest.answer_regex.clone(),
+    }))
 }
 
 /// Parse reasoning_effort string to ReasoningEffort enum
@@ -546,6 +577,26 @@ pub async fn parse_request(
         anyhow::bail!("Request `grammar` and `response_format` were both provided but are mutually exclusive.")
     }
 
+    // Arc Boost voting: `n_votes: k` fans the request out to k chains (one
+    // sequence group -> same forward-pass batch); the winner is selected
+    // server-side after generation.
+    let n_choices = match oairequest.n_votes {
+        Some(0) => anyhow::bail!("`n_votes` must be greater than 0."),
+        Some(k) => {
+            if is_streaming {
+                anyhow::bail!("`n_votes` is not supported with `stream: true`.");
+            }
+            if oairequest.n_choices > 1 && oairequest.n_choices != k {
+                anyhow::bail!(
+                    "`n` ({}) and `n_votes` ({k}) were both provided but disagree.",
+                    oairequest.n_choices
+                );
+            }
+            k
+        }
+        None => oairequest.n_choices,
+    };
+
     let constraint = match oairequest.grammar {
         Some(Grammar::Regex(regex)) => Constraint::Regex(regex),
         Some(Grammar::Lark(lark)) => Constraint::Lark(lark),
@@ -569,6 +620,7 @@ pub async fn parse_request(
                 top_k: oairequest.top_k,
                 top_p: oairequest.top_p,
                 min_p: oairequest.min_p,
+                top_nsigma: oairequest.top_nsigma,
                 top_n_logprobs: oairequest.top_logprobs.unwrap_or(1),
                 frequency_penalty: oairequest.frequency_penalty,
                 presence_penalty: oairequest.presence_penalty,
@@ -576,8 +628,10 @@ pub async fn parse_request(
                 max_len: oairequest.max_tokens,
                 stop_toks,
                 logits_bias: oairequest.logit_bias,
-                n_choices: oairequest.n_choices,
+                n_choices,
                 dry_params,
+                early_stop_confidence: oairequest.early_stop_confidence,
+                reasoning_budget: oairequest.reasoning_budget,
             },
             response: tx,
             return_logprobs: oairequest.logprobs,
@@ -621,6 +675,12 @@ pub async fn chatcompletions(
         Some(oairequest.model.clone())
     };
 
+    // Arc Boost: extract voting options before the request is consumed.
+    let vote_opts = match parse_vote_options(&oairequest) {
+        Ok(v) => v,
+        Err(e) => return handle_error(state, e.into()),
+    };
+
     let (request, is_streaming) = match parse_request(oairequest, state.clone(), tx).await {
         Ok(x) => x,
         Err(e) => return handle_error(state, e.into()),
@@ -633,7 +693,14 @@ pub async fn chatcompletions(
     if is_streaming {
         ChatCompletionResponder::Sse(create_streamer(rx, state, None, None))
     } else {
-        process_non_streaming_response(&mut rx, state).await
+        let mut responder = process_non_streaming_response(&mut rx, state).await;
+        // Arc Boost vote orchestration: pick the winner among the k chains.
+        if let Some(opts) = vote_opts {
+            if let ChatCompletionResponder::Json(ref mut response) = responder {
+                mistralrs_core::apply_vote(response, opts.mode, opts.answer_regex.as_deref());
+            }
+        }
+        responder
     }
 }
 

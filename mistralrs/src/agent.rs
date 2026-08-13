@@ -277,6 +277,7 @@ impl<'a> AgentStream<'a> {
                                                     model: String::new(),
                                                     system_fingerprint: String::new(),
                                                     object: String::new(),
+                                                    vote: None,
                                                     usage: crate::Usage {
                                                         completion_tokens: 0,
                                                         prompt_tokens: 0,
