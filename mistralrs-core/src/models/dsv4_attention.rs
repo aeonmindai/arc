@@ -9,8 +9,23 @@
 //! V4 attention is a **single online softmax over a union of key sets**, not a
 //! learned gate and not a blend of separate softmaxes:
 //!
-//! - **Standard (`compress_ratio == 0`, layers 0/1/42)**: plain causal MLA SDPA
-//!   over the full K/V. The caller supplies the causal mask.
+//! - **Standard (`compress_ratio == 0`, layers 0/1/42 + MTP)**: sliding-window
+//!   attention over the last `window` raw tokens + `attn_sink`. NOT dense
+//!   causal! Both production references window ratio-0 layers exactly like the
+//!   raw branch of CSA/HCA, just with no compressed branch:
+//!     * SGLang `deepseek_v4_backend.py` (`forward`): `compress_ratio == 0`
+//!       leaves `extra_k_cache = None` and attends with
+//!       `indices=swa_page_indices` (the last `SWA_WINDOW = 128` positions,
+//!       `get_swa_page_indices`), `attn_sink` asserted present;
+//!     * vLLM `models/deepseek_v4/attention.py`: `swa_only = compress_ratio <=
+//!       1`; SWA-only layers have no own KV cache and decode/prefill attend
+//!       over the SWA indices alone (`top_k = 0, N = 0`).
+//!   Running these layers dense-causal (the pre-fix behavior) feeds
+//!   window-trained heads key/query relative distances they never saw in
+//!   training; on hardware this collapsed generation into repetition loops the
+//!   moment the context crossed 128 tokens, regardless of the compressed
+//!   branch (`ARC_V4_WINDOW_ONLY` made no difference — layers 0/1/42 were the
+//!   ones polluting the stream).
 //! - **CSA (`compress_ratio == 4`) / HCA (`compress_ratio == 128`)**: one
 //!   softmax over `[raw sliding-window KV ++ compressed KV]`, plus the per-head
 //!   `attn_sink` as an extra denominator column (supplied via
@@ -74,10 +89,22 @@ pub fn dsv4_attention(
     sdpa_params: &SdpaParams,
     cfg: Dsv4AttentionConfig,
 ) -> Result<Tensor> {
-    // ---- Standard layers: dense causal MLA via plain SDPA. ----------------
-    if cfg.compress_ratio == CompressRatio::Standard {
+    // ---- Standard layers: sliding-window + sink, same raw branch as CSA/HCA
+    // (see module docs — the reference SWA-onlys ratio-0 layers; dense causal
+    // here was the long-context collapse). ARC_V4_STANDARD_DENSE=1 restores
+    // the pre-fix dense-causal behavior for on-GPU A/B triage only.
+    if cfg.compress_ratio == CompressRatio::Standard
+        && std::env::var_os("ARC_V4_STANDARD_DENSE").is_some()
+    {
         return Sdpa.run_attention(q, k, v, attention_mask, Some(flash_params), sdpa_params);
     }
+    // Standard layers have no compressor; never let a stray compressed branch
+    // through (the caller's `Attention::compressed_kv` already returns `None`).
+    let compressed_kv = if cfg.compress_ratio == CompressRatio::Standard {
+        None
+    } else {
+        compressed_kv
+    };
 
     let (_b, _h, t_q, _d) = q.dims4()?;
     let t_k = k.dim(2)?;
@@ -133,7 +160,14 @@ pub fn dsv4_attention(
         .where_cond(&zeros, &neg_inf)?
         .reshape((1, 1, t_q, n_keys))?;
 
-    Sdpa.run_attention(q, &k_cat, &v_cat, Some(&mask), Some(flash_params), sdpa_params)
+    Sdpa.run_attention(
+        q,
+        &k_cat,
+        &v_cat,
+        Some(&mask),
+        Some(flash_params),
+        sdpa_params,
+    )
 }
 
 #[cfg(test)]
@@ -191,9 +225,74 @@ mod tests {
         Tensor::from_vec(data, (b, h, t, d), dev)
     }
 
-    /// Standard dispatch is exactly plain SDPA.
+    /// Builds the `[1, 1, t, t]` additive banded causal mask: query `i` sees
+    /// key `j` iff `i - window < j <= i`.
+    fn banded_causal_mask(t: usize, window: usize, device: &Device) -> Result<Tensor> {
+        let mut mask_data = vec![0f32; t * t];
+        for i in 0..t {
+            for j in 0..t {
+                if j > i || j + window <= i {
+                    mask_data[i * t + j] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        Tensor::from_vec(mask_data, (1, 1, t, t), device)
+    }
+
+    /// THE long-context regression test (RUN-161 hardware collapse): Standard
+    /// (`compress_ratio == 0`) layers must be **sliding-window** attention,
+    /// exactly like the raw branch of CSA/HCA — the reference SWA-onlys
+    /// ratio-0 layers (SGLang `deepseek_v4_backend.py`: `indices =
+    /// swa_page_indices`; vLLM: `swa_only = compress_ratio <= 1`). The pre-fix
+    /// code dense-causal'd them, which collapsed generation the moment the
+    /// context crossed the window. This test FAILS on the pre-fix dispatch.
     #[test]
-    fn standard_dispatch_matches_plain_sdpa() -> Result<()> {
+    fn standard_prefill_is_sliding_window_masked() -> Result<()> {
+        let device = Device::Cpu;
+        let (b, h, t, d, window) = (1, 2, 12, 16, 4);
+        let q = mk(b, h, t, d, 0.1, &device)?;
+        let k = mk(b, 1, t, d, 0.2, &device)?;
+        let v = mk(b, 1, t, d, 0.3, &device)?;
+
+        let sdpa = sdpa_params(d, h);
+        let flash = empty_flash_params();
+        let windowed_mask = banded_causal_mask(t, window, &device)?;
+        let expected = Sdpa.run_attention(&q, &k, &v, Some(&windowed_mask), Some(&flash), &sdpa)?;
+
+        let cfg = Dsv4AttentionConfig {
+            compress_ratio: CompressRatio::Standard,
+            sliding_window: window,
+        };
+        let actual = dsv4_attention(&q, &k, &v, None, None, &flash, &sdpa, cfg)?;
+
+        let e: Vec<f32> = expected.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let a: Vec<f32> = actual.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        for (ev, av) in e.iter().zip(a.iter()) {
+            assert!((ev - av).abs() < 1e-5, "{ev} != {av}");
+        }
+
+        // Sanity: with t > window the windowed output must differ from dense
+        // causal — otherwise this test couldn't catch the dense regression.
+        let causal_mask = banded_causal_mask(t, t, &device)?;
+        let dense = Sdpa.run_attention(&q, &k, &v, Some(&causal_mask), Some(&flash), &sdpa)?;
+        let dn: Vec<f32> = dense.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let max_diff = a
+            .iter()
+            .zip(dn.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            max_diff > 1e-3,
+            "windowed and dense outputs are indistinguishable (max_diff={max_diff}); test has no teeth"
+        );
+        Ok(())
+    }
+
+    /// Standard with a window covering the whole sequence reduces to plain
+    /// causal SDPA (the previous `standard_dispatch_matches_plain_sdpa`
+    /// contract, now with the correct causal+window semantics).
+    #[test]
+    fn standard_full_window_matches_causal_sdpa() -> Result<()> {
         let device = Device::Cpu;
         let (b, h, t, d) = (1, 2, 8, 16);
         let q = mk(b, h, t, d, 0.1, &device)?;
@@ -202,11 +301,12 @@ mod tests {
 
         let sdpa = sdpa_params(d, h);
         let flash = empty_flash_params();
-        let expected = Sdpa.run_attention(&q, &k, &v, None, Some(&flash), &sdpa)?;
+        let causal_mask = banded_causal_mask(t, t, &device)?;
+        let expected = Sdpa.run_attention(&q, &k, &v, Some(&causal_mask), Some(&flash), &sdpa)?;
 
         let cfg = Dsv4AttentionConfig {
             compress_ratio: CompressRatio::Standard,
-            sliding_window: 4,
+            sliding_window: t,
         };
         let actual = dsv4_attention(&q, &k, &v, None, None, &flash, &sdpa, cfg)?;
 
@@ -214,6 +314,185 @@ mod tests {
         let a: Vec<f32> = actual.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
         for (ev, av) in e.iter().zip(a.iter()) {
             assert!((ev - av).abs() < 1e-5, "{ev} != {av}");
+        }
+        Ok(())
+    }
+
+    /// Decode window boundary is exact: at cache length `t_k` (query at
+    /// position `t_k - 1`), a Standard layer attends over exactly the last
+    /// `window` keys `[t_k - window, t_k - 1]` — verified by comparing against
+    /// SDPA over the narrowed K/V at cache lengths crossing the window
+    /// boundary (the 128→129 hardware transition, scaled down). An off-by-one
+    /// in the window slice fails the equality at every post-window length.
+    /// Runs with (zero) sinks on both sides, matching deployment where
+    /// `attn_sink` is always present — and required here: the no-sink CPU
+    /// flash path NaNs on rows with a masked prefix (see the HCA test note).
+    #[test]
+    fn standard_decode_window_boundary_exact() -> Result<()> {
+        let device = Device::Cpu;
+        let (b, h, d, window) = (1, 2, 16, 4);
+        for t_k in [window - 1, window, window + 1, 2 * window, 4 * window + 1] {
+            let q = mk(b, h, 1, d, 0.07, &device)?;
+            let k = mk(b, 1, t_k, d, 0.13, &device)?;
+            let v = mk(b, 1, t_k, d, 0.19, &device)?;
+
+            let (sdpa, _sinks) = sdpa_params_with_sinks(d, h, &device)?;
+            let flash = empty_flash_params();
+
+            // Reference: (unmasked) sinks-SDPA over exactly the last
+            // min(window, t_k) keys.
+            let n_vis = window.min(t_k);
+            let k_win = k.narrow(2, t_k - n_vis, n_vis)?;
+            let v_win = v.narrow(2, t_k - n_vis, n_vis)?;
+            let expected = Sdpa.run_attention(&q, &k_win, &v_win, None, Some(&flash), &sdpa)?;
+
+            let cfg = Dsv4AttentionConfig {
+                compress_ratio: CompressRatio::Standard,
+                sliding_window: window,
+            };
+            let actual = dsv4_attention(&q, &k, &v, None, None, &flash, &sdpa, cfg)?;
+
+            let e: Vec<f32> = expected.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+            let a: Vec<f32> = actual.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+            for (ev, av) in e.iter().zip(a.iter()) {
+                assert!(
+                    (ev - av).abs() < 1e-5,
+                    "t_k={t_k}: {ev} != {av} (window slice off)"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Scalar (loop-based) reference for the full union semantics at decode:
+    /// one softmax over [raw window ++ compressed blocks] with the per-head
+    /// sink as a denominator-only column (value 0), at cache lengths crossing
+    /// 128/256/512 with the production window=128 / ratio=4. Pins:
+    ///   * raw window slice `[pos - 127, pos]` (absolute positions, no
+    ///     re-basing);
+    ///   * compressed-block causality `b < (pos + 1) / ratio`;
+    ///   * sink participating in the denominator only.
+    #[test]
+    fn union_decode_matches_scalar_reference() -> Result<()> {
+        let device = Device::Cpu;
+        let (b, h, d) = (1, 2, 8);
+        let window = 128usize;
+        let ratio = 4usize;
+        let scale = 1.0 / (d as f32).sqrt();
+
+        for t_k in [127usize, 128, 129, 256, 512, 513] {
+            let pos = t_k - 1;
+            let t_c = t_k / ratio; // caller compresses the largest ratio-multiple prefix
+            let q = mk(b, h, 1, d, 0.03, &device)?;
+            let k = mk(b, 1, t_k, d, 0.11, &device)?;
+            let v = mk(b, 1, t_k, d, 0.17, &device)?;
+            let comp = mk(b, 1, t_c, d, 0.05, &device)?;
+
+            // Per-head sinks, nonzero so a sink bug shifts the output.
+            let sinks_data: Vec<f32> = (0..h).map(|i| 0.5 + 0.25 * i as f32).collect();
+            let sinks = Tensor::from_vec(sinks_data.clone(), (1, h, 1, 1), &device)?;
+            let sdpa = SdpaParams {
+                n_kv_groups: h,
+                softcap: None,
+                softmax_scale: scale,
+                sliding_window: None,
+                sinks: Some(sinks),
+            };
+            let flash = empty_flash_params();
+            let cfg = Dsv4AttentionConfig {
+                compress_ratio: CompressRatio::Csa,
+                sliding_window: window,
+            };
+            let out = dsv4_attention(&q, &k, &v, Some(&comp), None, &flash, &sdpa, cfg)?;
+            let out_v: Vec<f32> = out.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+
+            // ---- Scalar reference ----
+            let qv: Vec<f32> = q.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?; // [h, d]
+            let kv: Vec<f32> = k.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?; // [t_k, d]
+            let vv: Vec<f32> = v.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?; // [t_k, d]
+            let cv: Vec<f32> = comp.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?; // [t_c, d]
+
+            let raw_lo = (pos + 1).saturating_sub(window); // first visible raw key
+            let n_blocks = (pos + 1) / ratio; // visible compressed blocks
+            assert!(n_blocks <= t_c);
+
+            // Scalar reference in f64. `include_sink=false` / `blocks`
+            // variants serve as negative controls (buggy semantics).
+            let scalar_ref = |raw_lo: usize, n_blocks: usize, include_sink: bool| -> Vec<f64> {
+                let dot = |a: &[f32], b: &[f32]| -> f64 {
+                    a.iter()
+                        .zip(b)
+                        .map(|(x, y)| *x as f64 * *y as f64)
+                        .sum::<f64>()
+                        * scale as f64
+                };
+                let mut out = vec![0f64; h * d];
+                for head in 0..h {
+                    let qh = &qv[head * d..(head + 1) * d];
+                    let mut logits: Vec<f64> = Vec::new();
+                    let mut values: Vec<&[f32]> = Vec::new();
+                    for j in raw_lo..=pos {
+                        logits.push(dot(qh, &kv[j * d..(j + 1) * d]));
+                        values.push(&vv[j * d..(j + 1) * d]);
+                    }
+                    for bidx in 0..n_blocks {
+                        let cb = &cv[bidx * d..(bidx + 1) * d];
+                        logits.push(dot(qh, cb));
+                        values.push(cb);
+                    }
+                    // Softmax; the sink is a denominator-only extra column.
+                    let sink = sinks_data[head] as f64;
+                    let m0 = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let m = if include_sink { m0.max(sink) } else { m0 };
+                    let mut denom: f64 = logits.iter().map(|&x| (x - m).exp()).sum();
+                    if include_sink {
+                        denom += (sink - m).exp();
+                    }
+                    for (lg, val) in logits.iter().zip(values.iter()) {
+                        let w = (lg - m).exp() / denom;
+                        for (e, x) in out[head * d..(head + 1) * d].iter_mut().zip(val.iter()) {
+                            *e += w * *x as f64;
+                        }
+                    }
+                }
+                out
+            };
+            let max_diff = |reference: &[f64]| -> f64 {
+                reference
+                    .iter()
+                    .zip(out_v.iter())
+                    .map(|(e, a)| (e - *a as f64).abs())
+                    .fold(0f64, f64::max)
+            };
+
+            // The dispatch's CPU matmuls round through F16 (MatMul::matmul
+            // CPU path), so the noise floor is ~1e-3, not f32 eps.
+            let d_correct = max_diff(&scalar_ref(raw_lo, n_blocks, true));
+            assert!(
+                d_correct < 1.5e-3,
+                "t_k={t_k}: dispatch deviates from union semantics (max diff {d_correct})"
+            );
+
+            // Discrimination (negative controls) at the shorter lengths,
+            // where per-column softmax mass is well above the F16 noise:
+            // dropping the last visible compressed block (block-causality
+            // off-by-one) or the sink column must move the reference away
+            // from the dispatch by a clear margin.
+            if t_k <= 129 && n_blocks > 0 {
+                let d_dropblock = max_diff(&scalar_ref(raw_lo, n_blocks - 1, true));
+                let d_nosink = max_diff(&scalar_ref(raw_lo, n_blocks, false));
+                let floor = 3.0 * d_correct;
+                assert!(
+                    d_dropblock > floor,
+                    "t_k={t_k}: dropping a compressed block is indistinguishable \
+                     (correct {d_correct} vs dropblock {d_dropblock}) — test has no teeth"
+                );
+                assert!(
+                    d_nosink > floor,
+                    "t_k={t_k}: omitting the sink is indistinguishable \
+                     (correct {d_correct} vs nosink {d_nosink}) — test has no teeth"
+                );
+            }
         }
         Ok(())
     }
