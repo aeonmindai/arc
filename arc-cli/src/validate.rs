@@ -805,7 +805,10 @@ mod tests {
             mock: true,
         };
         let exit = run(opts).unwrap();
-        assert_eq!(exit, 0, "qtip2+td-moe on V4 Flash should pass a 141 GB target");
+        assert_eq!(
+            exit, 0,
+            "qtip2+td-moe on V4 Flash should pass a 141 GB target"
+        );
         assert!(out.exists());
         let parsed: HbmReport =
             serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
