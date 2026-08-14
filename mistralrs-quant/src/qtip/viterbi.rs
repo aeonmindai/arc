@@ -142,7 +142,7 @@ impl TrellisSearch {
 
     /// Parse the `ARC_QTIP_BEAM` env override. Unset, empty, `0`, `off` or
     /// `exhaustive` ⇒ [`TrellisSearch::Exhaustive`]; any positive integer ⇒
-    /// a beam of that width. Unparseable values fall back to exhaustive so a
+    /// a beam of that width. Unparsable values fall back to exhaustive so a
     /// typo can never silently *lower* bake quality.
     pub fn from_env() -> Self {
         match std::env::var("ARC_QTIP_BEAM") {
