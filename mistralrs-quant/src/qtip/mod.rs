@@ -119,6 +119,144 @@ pub(crate) fn warn_dequant_materialize_at_decode(n_tokens: usize, context: &'sta
     }
 }
 
+// ---------------------------------------------------------------------------
+// GPU-quantize fallback accounting (wave6-Q)
+// ---------------------------------------------------------------------------
+
+/// Process-wide count of QTIP quantizes that engaged the CPU pipeline while a
+/// GPU was plausibly available (see [`expert_stack_quant_device`]). A silent
+/// switch from the GPU prefix-grouped Viterbi (~30 s/layer on H200) to the
+/// CPU rayon Viterbi (~11 min/layer) is a ~20x bake regression, so every such
+/// reroute is counted here and warned about (once per call site). CUDA tests
+/// assert this stays flat across a GPU-path quantize.
+static GPU_QUANT_CPU_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of times a QTIP quantize fell back to the CPU pipeline even though
+/// a GPU was plausibly available, since process start. Test/diagnostic hook
+/// for the wave6-Q regression guard.
+pub fn gpu_quantize_cpu_fallback_count() -> usize {
+    GPU_QUANT_CPU_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `true` the first time this `context` is seen (shared registry for the
+/// warn-once diagnostics below; contexts are distinct static strings).
+fn first_warn_for_context(context: &'static str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{LazyLock, Mutex};
+    static SEEN: LazyLock<Mutex<HashSet<&'static str>>> =
+        LazyLock::new(|| Mutex::new(HashSet::new()));
+    SEEN.lock()
+        .map(|mut seen| seen.insert(context))
+        .unwrap_or(false)
+}
+
+/// Record + warn (once per `context`) that a QTIP quantize is running on the
+/// CPU pipeline despite a GPU being plausibly available. `reason` carries the
+/// actual error/condition so the bake log names the culprit instead of just
+/// silently getting ~20x slower per layer.
+fn note_gpu_quant_cpu_fallback(context: &'static str, reason: &str) {
+    GPU_QUANT_CPU_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if first_warn_for_context(context) {
+        tracing::warn!(
+            "QTIP GPU quantize fallback: {context} is quantizing on the CPU — {reason}. \
+             Expect ~10-20x slower per-layer bake times (CPU Viterbi vs GPU \
+             prefix-grouped Viterbi). (warning once per call site)"
+        );
+    }
+}
+
+/// Probe for an NVIDIA driver when this binary was built WITHOUT the `cuda`
+/// feature: the one configuration where a GPU box silently bakes on the CPU
+/// with no CUDA code compiled in at all (wave6-Q trap). Linux-only paths;
+/// on other OSes this returns `false` and CPU-only builds stay quiet.
+#[cfg(not(feature = "cuda"))]
+fn nvidia_driver_present() -> bool {
+    use std::sync::LazyLock;
+    static PRESENT: LazyLock<bool> = LazyLock::new(|| {
+        std::path::Path::new("/proc/driver/nvidia").exists()
+            || std::path::Path::new("/dev/nvidia0").exists()
+    });
+    *PRESENT
+}
+
+/// Decide which device a 3-D `[E, N, K]` expert-stack quantize runs on.
+///
+/// The bake keeps expert stacks on the CPU (pre-moving the dense stack OOMs
+/// the single-GPU tail, RUN-161) and streams batches to the GPU from here.
+/// Every route that ends on the CPU while a GPU was plausibly available is
+/// LOUD: it increments [`gpu_quantize_cpu_fallback_count`] and warns with the
+/// actual reason. wave6-Q: the previous silent
+/// `cuda_if_available(0).unwrap_or_else(|_| cpu)` version of this gate could
+/// reroute a whole bake to the CPU Viterbi (~20x per layer) without logging
+/// a single line.
+pub(crate) fn expert_stack_quant_device(device: &Device, context: &'static str) -> Device {
+    if !matches!(device, Device::Cpu) {
+        // Weight already targets an accelerator: quantize where it lives. The
+        // CUDA path hard-fails instead of falling back, so there is nothing
+        // to instrument on this route.
+        return device.clone();
+    }
+    #[cfg(feature = "cuda")]
+    {
+        if !ffi::HAVE_QTIP_KERNELS {
+            note_gpu_quant_cpu_fallback(
+                context,
+                "CUDA build but the QTIP kernels were not compiled in \
+                 (`has_qtip_kernels` cfg absent; build-time compute cap < 8.0?)",
+            );
+            return device.clone();
+        }
+        match Device::new_cuda(0) {
+            Ok(cuda) => cuda,
+            Err(e) => {
+                note_gpu_quant_cpu_fallback(
+                    context,
+                    &format!("CUDA device 0 initialization failed: {e}"),
+                );
+                device.clone()
+            }
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        if nvidia_driver_present() {
+            note_gpu_quant_cpu_fallback(
+                context,
+                "an NVIDIA driver is present on this machine but mistralrs-quant \
+                 was built WITHOUT the `cuda` feature",
+            );
+        }
+        device.clone()
+    }
+}
+
+/// Warn (once per call site) when a model-scale 2-D weight runs the CPU
+/// quantize pipeline while a GPU is plausibly available. The 2-D CPU path is
+/// reached by design when a layer's ISQ target device is the CPU; unlike the
+/// 3-D expert-stack path it has no opportunistic GPU offload, so a mis-mapped
+/// bake pays the full CPU Viterbi cost with no error anywhere. The size
+/// threshold keeps unit-test shapes quiet. Does not increment the fallback
+/// counter (that is reserved for the 3-D gate the CUDA tests assert on).
+pub(crate) fn warn_big_cpu_2d_quantize(n: usize, k: usize, context: &'static str) {
+    const BIG_2D_WEIGHTS: usize = 1 << 22; // 4M weights: real-model scale
+    if n.saturating_mul(k) < BIG_2D_WEIGHTS {
+        return;
+    }
+    #[cfg(not(feature = "cuda"))]
+    if !nvidia_driver_present() {
+        return;
+    }
+    if first_warn_for_context(context) {
+        tracing::warn!(
+            "{context}: quantizing a {n}x{k} weight on the CPU Viterbi/greedy \
+             pipeline. The GPU quantize engages only when the layer's target \
+             device is CUDA (2-D) or via the 3-D expert-stack offload; if this \
+             is a bake on a GPU box, check the device mapping. \
+             (warning once per call site)"
+        );
+    }
+}
+
 /// Maximum block size for the block-diagonal Hadamard rotation.
 ///
 /// Real LLM linear layers have `in_features` that is not always a power of 2
@@ -547,6 +685,7 @@ impl QtipLayer {
 
         let weight_f32 = weight.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
         let (n, k_in) = weight_f32.dims2()?;
+        warn_big_cpu_2d_quantize(n, k_in, "QtipLayer::quantize_with_options_concrete");
         if !(k_in as u32).is_multiple_of(V) {
             candle_core::bail!("QTIP quantize: in_features ({k_in}) must be divisible by V ({V})");
         }
@@ -857,14 +996,12 @@ impl QtipLayer {
         // GPU F32, ~33MB transient + reused scratch), and we move the small
         // packed result back to `device` (CPU) for stacking — matching the
         // original output layout exactly. (RUN-161)
-        #[cfg(feature = "cuda")]
-        let quant_device = if ffi::HAVE_QTIP_KERNELS && matches!(device, Device::Cpu) {
-            candle_core::Device::cuda_if_available(0).unwrap_or_else(|_| device.clone())
-        } else {
-            device.clone()
-        };
-        #[cfg(not(feature = "cuda"))]
-        let quant_device = device.clone();
+        //
+        // Any reroute to the CPU pipeline while a GPU is plausibly available
+        // is counted + warned inside `expert_stack_quant_device` (wave6-Q:
+        // the silent version of this gate cost ~20x per layer).
+        let quant_device =
+            expert_stack_quant_device(device, "QtipLayer::quantize_with_options_3d");
         let move_back = matches!(quant_device, Device::Cuda(_)) && matches!(device, Device::Cpu);
 
         // RUN-161 expert-batching: the per-expert loop used to stream ONE expert
@@ -4441,6 +4578,38 @@ mod tests {
             err.as_ref()
                 .is_some_and(|e| e.to_string().contains("bias-free")),
             "expected bias-free rejection, got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// wave6-Q regression guard (LUT rung): a 3-D expert-stack quantize
+    /// whose target device is the CPU (the bake path) must stream through
+    /// the GPU kernels on a CUDA box — a reroute to the CPU Viterbi is a
+    /// ~20x per-layer bake regression and must be counted, never silent.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_3d_expert_quantize_does_not_fall_back_to_cpu() -> Result<()> {
+        if !ffi::HAVE_QTIP_KERNELS {
+            return Ok(());
+        }
+        if Device::new_cuda(0).is_err() {
+            // No physical GPU (e.g. a compile-gate CI lane running tests):
+            // the CPU fallback is correct behavior there, nothing to assert.
+            return Ok(());
+        }
+        let before = gpu_quantize_cpu_fallback_count();
+        let device = Device::Cpu;
+        let (e, n, k_in) = (4usize, 8usize, 256usize);
+        let w3 = build_3d_gaussian_weight(e, n, k_in, &device)?;
+        let layer = QtipLayer::quantize_with_options_3d(&w3, &device, QtipMode::Viterbi, true)?;
+        // Quantize really ran: the packed stack dequantizes at full shape.
+        assert_eq!(layer.dequantize_w()?.dims(), &[e, n, k_in]);
+        let after = gpu_quantize_cpu_fallback_count();
+        assert_eq!(
+            after, before,
+            "QtipLayer 3-D expert quantize fell back to the CPU pipeline on a CUDA box \
+             ({} new fallback(s)) — check the warn log for the reason",
+            after - before
         );
         Ok(())
     }

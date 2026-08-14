@@ -411,6 +411,7 @@ impl Qtip2bLayer {
 
         let weight_f32 = weight.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
         let (n, k_in) = weight_f32.dims2()?;
+        super::warn_big_cpu_2d_quantize(n, k_in, "Qtip2bLayer::quantize_with_options_concrete");
         if !k_in.is_multiple_of(SYMS_PER_BYTE) {
             candle_core::bail!(
                 "qtip2b quantize: in_features ({k_in}) must be divisible by {SYMS_PER_BYTE} for K=2 packing"
@@ -620,14 +621,11 @@ impl Qtip2bLayer {
         // Quantize on GPU when the kernels are available and the stack lives
         // on CPU (the ISQ load path), streaming batches of experts; results
         // come back to `device`. Mirrors the LUT rung's RUN-161 batching.
-        #[cfg(feature = "cuda")]
-        let quant_device = if super::ffi::HAVE_QTIP_KERNELS && matches!(device, Device::Cpu) {
-            candle_core::Device::cuda_if_available(0).unwrap_or_else(|_| device.clone())
-        } else {
-            device.clone()
-        };
-        #[cfg(not(feature = "cuda"))]
-        let quant_device = device.clone();
+        // Any reroute to the CPU pipeline while a GPU is plausibly available
+        // is counted + warned inside `expert_stack_quant_device` (wave6-Q:
+        // the silent version of this gate cost ~20x per layer).
+        let quant_device =
+            super::expert_stack_quant_device(device, "Qtip2bLayer::quantize_with_options_3d");
         let move_back = matches!(quant_device, Device::Cuda(_)) && matches!(device, Device::Cpu);
 
         let batch = std::env::var("ARC_QTIP_EXPERT_BATCH")
@@ -2887,6 +2885,38 @@ mod tests {
         let y1 = run()?;
         let y2 = run()?;
         assert_eq!(y1, y2, "grouped GEMM output changed between runs");
+        Ok(())
+    }
+
+    /// wave6-Q regression guard: a 3-D expert-stack quantize whose target
+    /// device is the CPU (the bake path) must stream through the GPU
+    /// kernels on a CUDA box — a reroute to the CPU Viterbi is a ~20x
+    /// per-layer bake regression and must be counted, never silent.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_3d_expert_quantize_does_not_fall_back_to_cpu() -> Result<()> {
+        if !super::super::ffi::HAVE_QTIP_KERNELS {
+            return Ok(());
+        }
+        if Device::new_cuda(0).is_err() {
+            // No physical GPU (e.g. a compile-gate CI lane running tests):
+            // the CPU fallback is correct behavior there, nothing to assert.
+            return Ok(());
+        }
+        let before = crate::gpu_quantize_cpu_fallback_count();
+        let (e, n, k_in) = (4usize, 8usize, 256usize);
+        let w3 = build_3d_gaussian_weight(e, n, k_in)?;
+        let layer =
+            Qtip2bLayer::quantize_with_options_3d(&w3, &Device::Cpu, QtipMode::Viterbi, true)?;
+        // Quantize really ran: the packed stack dequantizes at full shape.
+        assert_eq!(layer.dequantize_w()?.dims(), &[e, n, k_in]);
+        let after = crate::gpu_quantize_cpu_fallback_count();
+        assert_eq!(
+            after, before,
+            "Qtip2bLayer 3-D expert quantize fell back to the CPU pipeline on a CUDA box \
+             ({} new fallback(s)) — check the warn log for the reason",
+            after - before
+        );
         Ok(())
     }
 }
