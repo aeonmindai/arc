@@ -14,7 +14,7 @@ quantities plus vendor specs, not yet run end-to-end).
   all-reduce traffic on every layer.
 - Arc's artifact for the same model is **68 GB** (2-bit trellis experts + FP8
   attention), and one H200 loads and serves it with the quality numbers in
-  BENCHMARKS.md (GSM8K 84.0%, long-context 5/5+4/4) **[measured]**.
+  BENCHMARKS.md (GSM8K 87.0%, long-context 5/5+4/4) **[measured]**.
 - Therefore the same node can instead host **8 independent replicas** — no
   inter-GPU traffic, per-replica failure isolation, per-replica batch
   scheduling **[projected — the 8-up deployment itself has not been run; the
@@ -36,12 +36,14 @@ pool — and the pool size is what compression shrinks.
   node's aggregate is ~4.5K tok/s **[projected]**. The ~8× node-level gain
   comes from replica granularity — same silicon, same bandwidth, eight
   independent batches — which compression is what makes possible.
-- Reality check **[measured]**: today's gather-GEMV kernels run 153–186 GB/s
+- Reality check **[measured]**: today's gather-GEMV kernels run 153–192 GB/s
   (3–4% of H200 peak) with 13–19 µs fixed overhead per call, and single-stream
-  decode is 5.4 tok/s. The floor math above is the destination, not the
-  present. The keystone kernel (trellis grouped-GEMM for batched 2-bit MoE) is
-  merged compile-gated; hardware bring-up is pending. Until it is measured,
-  every throughput figure in this section stays tagged projected.
+  decode is 13.99 tok/s (×2.6 over the 5.4 baseline from the kernel-fix PRs;
+  GEMV tuning in progress). The floor math above is the destination, not the
+  present. The keystone kernel (trellis grouped-GEMM for batched 2-bit MoE)
+  passed its first hardware parity run (5/5, session 3); its batched
+  throughput curve is not yet measured. Until it is, every throughput figure
+  in this section stays tagged projected.
 
 ## 3. KV tenancy at 3.5-bit
 
@@ -62,13 +64,14 @@ Once weights fit, concurrent capacity is bounded by KV cache per sequence.
 | Claim | Status |
 |---|---|
 | 284B/13B MoE serves on one H200 from a 68 GB artifact, with quality numbers | **Measured** |
-| GSM8K 84.0% (n=100, 0-shot greedy) at 2-bit experts | **Measured** |
+| GSM8K 87.0% (n=100, 0-shot greedy, 2048-cap) at 2-bit experts | **Measured** |
 | TurboQuant KV 4.27× context (Qwen3-32B, 1×H100) | **Measured** |
 | qtip2b bitshift-trellis CUDA parity (20/20 on H200) | **Measured** |
-| Current kernels: 3–4% of peak HBM BW; 5.4 tok/s at b=1 | **Measured** |
+| Trellis grouped-GEMM first hardware parity run (5/5 on H200) | **Measured** |
+| Current kernels: 3–4% of peak HBM BW; 13.99 tok/s at b=1 (×2.6, tuning in progress) | **Measured** |
 | 8 replicas per 8×H200 node | Projected (building block measured) |
 | ~4.5K tok/s/GPU at saturated batch; ~8× node aggregate vs 1×TP8 | Projected (floor arithmetic) |
 | ~4× KV tenancy on V4-class MLA models | Projected (MLA path not done) |
 
-Cost of every measured number above: ≈ $77 of rented H200 time. Protocols,
+Cost of every measured number above: ≈ $108 of rented H200 time. Protocols,
 artifacts, and limitations: [BENCHMARKS.md](BENCHMARKS.md).
