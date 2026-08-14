@@ -163,7 +163,25 @@ fn quantize_matrix(
     h_diag: &[f32],
     rot_block: usize,
 ) -> (Vec<f32>, f64) {
-    let lut = gaussian_lut();
+    quantize_matrix_cb(w, n, k, cfg, h_diag, rot_block, &gaussian_lut())
+}
+
+/// As [`quantize_matrix`], with the codebook supplied by the caller.
+///
+/// Both the search and the reconstruction read the SAME table, so swapping it
+/// swaps the format coherently — which is what makes a computed codebook
+/// measurable here at all (wave19-AP). The row scale still comes from
+/// `max|row| / 3`, so any codebook handed in must already be normalised to the
+/// spread that policy assumes; see [`mcg_codebook_v2`].
+fn quantize_matrix_cb(
+    w: &[f32],
+    n: usize,
+    k: usize,
+    cfg: SearchCfg,
+    h_diag: &[f32],
+    rot_block: usize,
+    lut: &[f32],
+) -> (Vec<f32>, f64) {
     let signs = generate_signs(QTIP_ROTATION_SEED, k);
     let weights = cfg.weighted.then(|| hessian_row_weights(h_diag, rot_block));
     let num_symbols = k / V as usize;
@@ -181,10 +199,10 @@ fn quantize_matrix(
         let inv = 1.0 / scale;
         let target: Vec<f32> = rot.iter().map(|&v| v * inv).collect();
 
-        let syms = quantize_row(&target, &lut, cfg.search, weights.as_deref());
+        let syms = quantize_row(&target, lut, cfg.search, weights.as_deref());
         let packed = pack_symbols(&syms);
 
-        let mut recon: Vec<f32> = decode_packed(&packed, num_symbols, &lut)
+        let mut recon: Vec<f32> = decode_packed(&packed, num_symbols, lut)
             .into_iter()
             .map(|c| c * scale)
             .collect();
@@ -380,6 +398,301 @@ fn run_grid(
     }
 
     cells
+}
+
+// ---------------------------------------------------------------------------
+// wave19-AP — the computed codebook at K=4 / V=2: what does it cost in quality?
+// ---------------------------------------------------------------------------
+//
+// MEASURED SPEED PRIZE (A30 sm_80, wave19-AP): replacing the 512 KiB Gaussian
+// LUT with QTIP's computed codebook is worth **1.81x on the beam kernel**
+// (998.0 -> 551.7 ms at 1344 rows x k_in=7168), i.e. 201.5 -> 118.5 s/layer on
+// H200 and a 43-layer bake from ~2.9 h to ~85 min. That number is a SPEED
+// number. This is the gate it has to pass.
+//
+// The construction is the one already shipping on the `qtip2b` rung
+// (`bitshift.rs::mcg_codeword`, exllamav3 PR #26's spectrally-optimised
+// multiplier): one wrapping multiply, one masked XOR, and the two fp16 halves
+// of the 32-bit result. At K=2/V=1 the codeword is `hi + lo` — a SUM. Going to
+// V=2 forces a choice that does not exist at V=1, and the choice is the whole
+// experiment:
+//
+//   Split — take `hi` and `lo` as the two reproduction values.
+//           4 instructions for 2 weights. This is what the CUDA measurement
+//           above actually ran. But a masked fp16 half has exponent bits
+//           restricted to 12..15, so its magnitude lives in [0.125, 2.0) and
+//           **cannot be near zero** — the codebook has a hole exactly where a
+//           Gaussian weight distribution has most of its mass.
+//   Sum2  — two chained multiplies, each folded to `hi + lo`.
+//           10 instructions for 2 weights, and the summed distribution is the
+//           one qtip2b already ships and measures (sigma 1.2064).
+//   Pair  — `hi + lo` of states `2s` and `2s+1`. Same cost as Sum2, different
+//           correlation between the two values of one state.
+//
+// Every codebook here is normalised to unit sigma, because the row scale is
+// `max|row| / 3` and that policy assumes a unit-spread codebook. qtip2b does the
+// same thing with a constant (`QTIP2B_SCALE_DIVISOR = 3.0 x 1.2064`); folding it
+// into the table instead keeps the comparison to the Gaussian LUT exact and
+// costs nothing on GPU (it folds into the target scale). Skipping it would
+// measure a scale mismatch and call it a codebook result.
+
+/// Which V=2 codeword pair to derive from one MCG product.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum McgV2 {
+    /// `(f16(hi), f16(lo))` — 4 instructions, magnitude hole in (-0.125, 0.125).
+    Split,
+    /// `(hi+lo of x, hi+lo of x*mult)` — 10 instructions, qtip2b's distribution.
+    Sum2,
+    /// `(codeword(2s), codeword(2s+1))` — 10 instructions.
+    Pair,
+}
+
+impl McgV2 {
+    fn label(&self) -> &'static str {
+        match self {
+            McgV2::Split => "mcg-split",
+            McgV2::Sum2 => "mcg-sum2 ",
+            McgV2::Pair => "mcg-pair ",
+        }
+    }
+}
+
+/// One masked-MCG fp16 pair: `(x & 0x8FFF8FFF) ^ 0x3B603B60`, split into halves.
+fn mcg_halves(x: u32) -> (f32, f32) {
+    let m = (x & 0x8FFF_8FFF) ^ 0x3B60_3B60;
+    (
+        half::f16::from_bits((m >> 16) as u16).to_f32(),
+        half::f16::from_bits((m & 0xFFFF) as u16).to_f32(),
+    )
+}
+
+/// Materialise the K=4/V=2 computed codebook, normalised to unit sigma.
+///
+/// Same 65,536 x 2 layout as [`gaussian_lut`], so it is a drop-in replacement
+/// for both the trellis search and the decode.
+fn mcg_codebook_v2(mult: u32, variant: McgV2) -> Vec<f32> {
+    let mut cb = Vec::with_capacity((1usize << 16) * 2);
+    for state in 0..(1u32 << 16) {
+        let x = state.wrapping_mul(mult);
+        let (v0, v1) = match variant {
+            McgV2::Split => mcg_halves(x),
+            McgV2::Sum2 => {
+                let (a0, a1) = mcg_halves(x);
+                let (b0, b1) = mcg_halves(x.wrapping_mul(mult));
+                (a0 + a1, b0 + b1)
+            }
+            McgV2::Pair => {
+                let (a0, a1) = mcg_halves(state.wrapping_mul(2).wrapping_mul(mult));
+                let (b0, b1) = mcg_halves(state.wrapping_mul(2).wrapping_add(1).wrapping_mul(mult));
+                (a0 + a1, b0 + b1)
+            }
+        };
+        cb.push(v0);
+        cb.push(v1);
+    }
+    let n = cb.len() as f64;
+    let mean = cb.iter().map(|&v| v as f64).sum::<f64>() / n;
+    let var = cb.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n;
+    let sigma = var.sqrt();
+    if sigma > 0.0 {
+        for v in cb.iter_mut() {
+            *v = (*v as f64 / sigma) as f32;
+        }
+    }
+    cb
+}
+
+/// Shape statistics of a codebook: what the search actually has to work with.
+fn codebook_stats(cb: &[f32]) -> (f64, f64, f64, f64) {
+    let n = cb.len() as f64;
+    let mean = cb.iter().map(|&v| v as f64).sum::<f64>() / n;
+    let sigma = (cb.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n).sqrt();
+    let min_abs = cb.iter().map(|&v| v.abs() as f64).fold(f64::INFINITY, f64::min);
+    // Fraction of the table inside +/- 0.25 sigma — a Gaussian source puts
+    // ~19.7% of its mass there, so a codebook that puts ~0% there has a hole
+    // exactly where the weights are densest.
+    let near = cb.iter().filter(|&&v| (v as f64).abs() < 0.25).count() as f64 / n;
+    (mean, sigma, min_abs, near)
+}
+
+/// **THE GATE on the 1.81x codebook prize.**
+///
+/// Fixtures (D12 — the distribution is stated because it has flipped a decision
+/// in this repo twice): `gaussian` (control), `student_t4` (heavy-tailed), and
+/// `fp4_dequant` (FP4-lattice — the actual source chain of V4's experts, and the
+/// one that exposed greedy at 0.675 where Gaussian showed 0.888). THREE
+/// independent weight draws per family, because with the unweighted objective
+/// the quantization does not depend on the activations at all: varying the
+/// activation spread only redraws the evaluation set, so it measures eval noise
+/// and NOT search noise. Two activation spreads are kept inside the realistic
+/// 1e2-1e4 channel-energy band on top of that.
+///
+/// Weight NMSE is the primary number here and matmul cos the secondary one,
+/// which is the opposite of the rotation-vs-Hessian sweep's emphasis and is
+/// deliberate: NMSE is activation-independent, so it isolates what changing the
+/// codebook actually did, while cos mixes in the eval draw.
+///
+/// Production geometry throughout: K=4, V=2, L=16, beam W=256, rotation 128,
+/// unweighted objective.
+///
+/// `cargo test --release -p mistralrs-quant --lib probe_computed_codebook_quality \
+///     -- --ignored --nocapture`
+#[test]
+#[ignore = "evidence probe (~2 min); run with --release --ignored --nocapture"]
+fn probe_computed_codebook_quality() {
+    let (n, k, cb_batch, eb) = (48usize, 2048usize, 128usize, 128usize);
+    let search = TrellisSearch::Beam { width: 256 };
+
+    // exllamav3 PR #26's spectrally-optimised multiplier (what qtip2b ships) and
+    // EXL3's original, which is what the CUDA speed run happened to use.
+    let mults: [(&str, u32); 2] = [
+        ("opt", 0xCAF6_A435),
+        ("exl3", 0xCBAC_1FED),
+    ];
+
+    let mut books: Vec<(String, Vec<f32>)> = vec![("gaussian-LUT".to_string(), gaussian_lut())];
+    for (mname, mult) in mults {
+        for variant in [McgV2::Split, McgV2::Sum2, McgV2::Pair] {
+            books.push((
+                format!("{} {mname}", variant.label()),
+                mcg_codebook_v2(mult, variant),
+            ));
+        }
+    }
+
+    println!("\ncodebook shape (all normalised to unit sigma before use)");
+    println!(
+        "{:<20} | {:>9} | {:>7} | {:>9} | {:>13}",
+        "codebook", "mean", "sigma", "min |v|", "frac |v|<0.25"
+    );
+    for (name, book) in &books {
+        let (mean, sigma, min_abs, near) = codebook_stats(book);
+        println!(
+            "{name:<20} | {mean:>9.5} | {sigma:>7.4} | {min_abs:>9.5} | {:>12.2}%",
+            near * 100.0
+        );
+    }
+    println!("(a standard normal puts 19.7% of its mass inside +/-0.25)");
+
+    // Three independent weight draws per family.
+    let families: [(&str, u64, u64, u64); 3] = [
+        ("gaussian   ", 1, 11, 21),
+        ("student_t4 ", 2, 12, 22),
+        ("fp4_dequant", 0x0051_EA11, 0x0051_EA12, 0x0051_EA13),
+    ];
+    let spreads = [("awq-like", 0.3, 2.75), ("moderate", 0.6, 2.33)];
+
+    // [codebook][family] -> (cos samples, nmse samples)
+    let mut agg: Vec<Vec<(Vec<f64>, Vec<f64>)>> =
+        vec![vec![(Vec::new(), Vec::new()); families.len()]; books.len()];
+
+    for (fi, (fname, s0, s1, s2)) in families.iter().enumerate() {
+        for &seed in &[*s0, *s1, *s2] {
+            let w = match fi {
+                0 => super::bake_quality_tests::gen_gaussian(n, k, 0.02, seed),
+                1 => super::bake_quality_tests::gen_student_t(n, k, 0.02, seed),
+                _ => gen_fp4_dequant(n, k, 0.02, seed),
+            };
+            for (sname, sigma, oz) in spreads {
+                let _ = sname;
+                let scales = channel_scales_sigma(k, 0xC0FF_EE01, sigma, oz);
+                let x_cal = gen_activations(cb_batch, &scales, 0x1234_5678);
+                let x_eval = gen_activations(eb, &scales, 0x8765_4321);
+                let h = hessian_diag(&x_cal, cb_batch, k);
+                let ev = EvalSet {
+                    w: &w,
+                    n,
+                    k,
+                    x_eval: &x_eval,
+                    batch: eb,
+                    h_diag: &h,
+                };
+                for (bi, (_, book)) in books.iter().enumerate() {
+                    let cfg = SearchCfg {
+                        search,
+                        weighted: false,
+                    };
+                    let (w_hat, secs) = quantize_matrix_cb(&w, n, k, cfg, &h, ROT_BLOCK, book);
+                    let r = evaluate(&ev, &w_hat, secs);
+                    agg[bi][fi].0.push(r.matmul_cos);
+                    agg[bi][fi].1.push(r.weight_nmse);
+                }
+            }
+            let _ = fname;
+        }
+    }
+
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let spread_of = |v: &[f64]| {
+        v.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+            - v.iter().cloned().fold(f64::INFINITY, f64::min)
+    };
+
+    println!(
+        "\nbeam W=256, rotation 128, unweighted, n={n} k={k}, 3 weight draws x 2 activation draws"
+    );
+    println!(
+        "{:<20} | {:<12} | {:>9} | {:>9} | {:>10} | {:>10} | {:>9}",
+        "codebook", "fixture", "cos", "d(cos)", "w_nmse", "d_rel_nmse", "cos range"
+    );
+    for (bi, (bname, _)) in books.iter().enumerate() {
+        for (fi, (fname, ..)) in families.iter().enumerate() {
+            let c = mean(&agg[bi][fi].0);
+            let nm = mean(&agg[bi][fi].1);
+            let c0 = mean(&agg[0][fi].0);
+            let nm0 = mean(&agg[0][fi].1);
+            println!(
+                "{bname:<20} | {fname:<12} | {c:>9.5} | {:>+9.5} | {nm:>10.6} | {:>+9.2}% | {:>9.5}",
+                c - c0,
+                (nm / nm0 - 1.0) * 100.0,
+                spread_of(&agg[bi][fi].0)
+            );
+        }
+    }
+
+    println!(
+        "\n{:<20} | {:>10} | {:>10} | {:>11} | {:>11}",
+        "codebook", "mean cos", "d(cos)", "mean w_nmse", "d_rel_nmse"
+    );
+    let all = |bi: usize, sel: usize| -> f64 {
+        let mut v = Vec::new();
+        for cell in &agg[bi] {
+            let src = if sel == 0 { &cell.0 } else { &cell.1 };
+            v.extend(src.iter().cloned());
+        }
+        mean(&v)
+    };
+    let lut_cos = all(0, 0);
+    let lut_nmse = all(0, 1);
+    for (bi, (bname, _)) in books.iter().enumerate() {
+        println!(
+            "{bname:<20} | {:>10.5} | {:>+10.5} | {:>11.6} | {:>+10.2}%",
+            all(bi, 0),
+            all(bi, 0) - lut_cos,
+            all(bi, 1),
+            (all(bi, 1) / lut_nmse - 1.0) * 100.0
+        );
+    }
+
+    // The gate is not "is it better" — it is that the comparison is a codebook
+    // comparison at all. A codebook so mismatched that the search collapses would
+    // show a cos far below the ladder, and reporting THAT as a small delta is the
+    // failure mode this assertion exists to stop.
+    for (bi, (bname, _)) in books.iter().enumerate() {
+        assert!(
+            all(bi, 0) > 0.9,
+            "{bname} scored mean cos {} — the search collapsed rather than traded \
+             quality, so its delta against the LUT is not a codebook comparison",
+            all(bi, 0)
+        );
+    }
+    // Non-degeneracy of the fixture family: the three weight draws must actually
+    // differ, or "3 seeds" is decoration.
+    assert!(
+        spread_of(&agg[0][2].1) > 1e-6,
+        "the three fp4_dequant draws produced identical weight NMSE — they are \
+         not independent draws"
+    );
 }
 
 // ---------------------------------------------------------------------------

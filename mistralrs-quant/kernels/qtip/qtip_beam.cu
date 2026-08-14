@@ -99,14 +99,45 @@
 // it orthogonal to it? The beam reads far less codebook per position than the
 // exhaustive DP (ng x 128 B against the full 512 KiB), but wave16-AF named the
 // scattered dependent L2 loads as one of its four stall sources, so the answer
-// was not derivable. Building this file twice, with and without
-// `-DQB_COMPUTED_CB=1`, measures it.
+// was not derivable. Building this file twice measured it: **1.81x on the beam**
+// (998.0 -> 551.7 ms, A30, 1344 rows x k_in=7168).
 //
-// ⚠ Defining this changes the reproduction values and therefore the artifact.
-// It is not a format we ship at K=4/V=2 and its quality is unmeasured here.
+//   QB_COMPUTED_CB = 0   Gaussian LUT (production; this file is byte-for-byte
+//                        the kernel described above)
+//   QB_COMPUTED_CB = 1   MCG "sum2" — the SHIPPABLE form. Two chained products,
+//                        each folded to `hi + lo`, which is exactly the codeword
+//                        `bitshift.rs::mcg_codeword` already ships at K=2/V=1.
+//                        MEASURED QUALITY-NEUTRAL at K=4/V=2:
+//                        +0.0002 cos, +0.37% weight NMSE across 3 fixture
+//                        families x 3 weight draws (probe_computed_codebook_quality).
+//                        ~10 instructions per 2 weights.
+//   QB_COMPUTED_CB = 2   MCG "split" — `hi` and `lo` taken as the two V=2 values.
+//                        ~4 instructions per 2 weights, and this is the variant
+//                        the 1.81x was measured on — but it is QUALITY-NEGATIVE:
+//                        -0.0017 cos and **+3.7% weight NMSE**, because a masked
+//                        fp16 half has |v| >= 0.142 and the codebook therefore has
+//                        a hole exactly where a Gaussian weight distribution has
+//                        most of its mass. Kept only so the speed number stays
+//                        reproducible. DO NOT SHIP IT.
+//
+// The sum2 form adds ~96 instructions per thread per timestep over split
+// (~7.6% of the post-stack beam), so the shippable speedup is PROJECTED ~1.68x
+// rather than the measured 1.81x. That projection is UNMEASURED — it needs one
+// GPU run to settle, and it is the only number in this comment that is not
+// hardware.
+//
+// ⚠ Any nonzero value changes the reproduction values and therefore the
+// artifact: the CPU reference, the UQFF, and all four decode-side kernels
+// (dequantize / gemv / gather_gemv / grouped_gemm) must move in lockstep. This
+// switch is a measurement tool, not a format.
 #ifndef QB_COMPUTED_CB
 #define QB_COMPUTED_CB 0
 #endif
+
+// exllamav3 PR #26's spectrally-optimised multiplier — the one qtip2b ships as
+// `QTIP2B_MCG_MULT`. Measured indistinguishable from EXL3's original
+// 0xCBAC1FED at K=4/V=2 (+0.37% vs +0.26% NMSE, inside the fixture noise).
+#define QB_MCG_MULT 0xCAF6A435u
 
 namespace {
 
@@ -426,13 +457,28 @@ qtip_quantize_rows_beam_kernel(
             // Successors are `base_state | j` for consecutive j, so the MCG
             // product advances by one folded constant per j — a single integer
             // add, no codebook memory traffic at all.
-            const unsigned int prod0 = base_state * 0xCBAC1FEDu;
+            const unsigned int prod0 = base_state * QB_MCG_MULT;
             #pragma unroll
             for (int j = 0; j < (int)QB_ALPHABET; ++j) {
-                const unsigned int mm =
-                    ((prod0 + (unsigned int)j * 0xCBAC1FEDu) & 0x8FFF8FFFu) ^ 0x3B603B60u;
-                const float l0 = __half2float(__ushort_as_half((unsigned short)(mm >> 16)));
-                const float l1 = __half2float(__ushort_as_half((unsigned short)(mm & 0xFFFFu)));
+                const unsigned int x0 = prod0 + (unsigned int)j * QB_MCG_MULT;
+                const unsigned int m0 = (x0 & 0x8FFF8FFFu) ^ 0x3B603B60u;
+                const float h0 = __half2float(__ushort_as_half((unsigned short)(m0 >> 16)));
+                const float t0h = __half2float(__ushort_as_half((unsigned short)(m0 & 0xFFFFu)));
+#if QB_COMPUTED_CB == 2
+                // "split": the two halves ARE the two values. Fast, and it puts
+                // a hole in the codebook at |v| < 0.142. Measurement only.
+                const float l0 = h0;
+                const float l1 = t0h;
+#else
+                // "sum2": each value is `hi + lo` of its own product, which is
+                // the distribution qtip2b ships and measures.
+                const unsigned int x1 = x0 * QB_MCG_MULT;
+                const unsigned int m1 = (x1 & 0x8FFF8FFFu) ^ 0x3B603B60u;
+                const float h1 = __half2float(__ushort_as_half((unsigned short)(m1 >> 16)));
+                const float t1h = __half2float(__ushort_as_half((unsigned short)(m1 & 0xFFFFu)));
+                const float l0 = h0 + t0h;
+                const float l1 = h1 + t1h;
+#endif
                 const float err = qtip_decode_err_exact_lv(l0, l1, t0, t1);
                 cand[j] = qtip_total_order_key(__fadd_rn(gcost, err));
             }
