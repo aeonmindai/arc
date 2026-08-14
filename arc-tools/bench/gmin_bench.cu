@@ -253,7 +253,7 @@ int main(int argc, char** argv) {
             if (ms < best) best = ms;
         }
         report(names[v], best, units);
-        if (v < 2) {
+        if (v != 2 && v != 4) {
             CK(cudaMemcpy(host.data(), d_packed, host.size(), cudaMemcpyDeviceToHost));
             printf("       %s fnv1a=%016llx\n", names[v], (unsigned long long)fnv1a(host));
         }

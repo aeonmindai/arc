@@ -85,9 +85,28 @@
 // which needs SM70+).
 
 #include <cstdint>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include "qtip_exact_fp.cuh"
+
+// BENCH-ONLY compile switch, default OFF — the production build never defines
+// it and is byte-for-byte the kernel described above.
+//
+// wave19-AP measured that replacing the 512 KiB Gaussian LUT with QTIP's
+// computed codebook is worth 1.65x on the *exhaustive* kernel, which raised the
+// question this switch answers: is the codebook a property of the SEARCH, or is
+// it orthogonal to it? The beam reads far less codebook per position than the
+// exhaustive DP (ng x 128 B against the full 512 KiB), but wave16-AF named the
+// scattered dependent L2 loads as one of its four stall sources, so the answer
+// was not derivable. Building this file twice, with and without
+// `-DQB_COMPUTED_CB=1`, measures it.
+//
+// ⚠ Defining this changes the reproduction values and therefore the artifact.
+// It is not a format we ship at K=4/V=2 and its quality is unmeasured here.
+#ifndef QB_COMPUTED_CB
+#define QB_COMPUTED_CB 0
+#endif
 
 namespace {
 
@@ -403,6 +422,21 @@ qtip_quantize_rows_beam_kernel(
         if (active) {
             base_state = ((unsigned int)s_grp_g[tid]) << QB_K;
             const float gcost = s_grp_cost[tid];
+#if QB_COMPUTED_CB
+            // Successors are `base_state | j` for consecutive j, so the MCG
+            // product advances by one folded constant per j — a single integer
+            // add, no codebook memory traffic at all.
+            const unsigned int prod0 = base_state * 0xCBAC1FEDu;
+            #pragma unroll
+            for (int j = 0; j < (int)QB_ALPHABET; ++j) {
+                const unsigned int mm =
+                    ((prod0 + (unsigned int)j * 0xCBAC1FEDu) & 0x8FFF8FFFu) ^ 0x3B603B60u;
+                const float l0 = __half2float(__ushort_as_half((unsigned short)(mm >> 16)));
+                const float l1 = __half2float(__ushort_as_half((unsigned short)(mm & 0xFFFFu)));
+                const float err = qtip_decode_err_exact_lv(l0, l1, t0, t1);
+                cand[j] = qtip_total_order_key(__fadd_rn(gcost, err));
+            }
+#else
             // 16 consecutive states => one contiguous 128 B LUT run.
             const float* __restrict__ lp = lut + (size_t)base_state * 2u;
             #pragma unroll
@@ -410,6 +444,7 @@ qtip_quantize_rows_beam_kernel(
                 const float err = qtip_decode_err_exact_lv(lp[2 * j + 0], lp[2 * j + 1], t0, t1);
                 cand[j] = qtip_total_order_key(__fadd_rn(gcost, err));
             }
+#endif
         } else {
             #pragma unroll
             for (int j = 0; j < (int)QB_ALPHABET; ++j) cand[j] = 0u;
