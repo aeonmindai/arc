@@ -17,6 +17,45 @@ use crate::cuda::moe;
 use crate::layers::Activation;
 use crate::moe::shard;
 
+/// Apply the trained DeepSeek V4 SwiGLU clamp to the **pre-activation** gate
+/// and up projections, returning both in `F32`.
+///
+/// Authority: `sglang/jit_kernel/csrc/deepseek_v4/silu_and_mul_masked_post_quant.cuh:55-73`
+/// (`silu_and_mul<kApplySwigluLimit = true>`, which cites DeepGEMM
+/// `sm100_fp8_fp4_mega_moe.cuh:984-997` as source of truth and notes the clamp
+/// "must" happen in bf16):
+///
+/// ```text
+/// gate = __hmin2(gate, {limit, limit});    // ONE-SIDED upper clamp
+/// up   = __hmax2(up, {-limit, -limit});
+/// up   = __hmin2(up, {limit, limit});      // SYMMETRIC clamp
+/// ... silu = g / (1 + expf(-g)); val = silu * u;
+/// ```
+///
+/// Three properties this pins, all of which a naive "clamp the output"
+/// reading gets wrong:
+/// 1. the clamp is **pre-activation** — the product is never clamped;
+/// 2. the gate is **not** clamped from below;
+/// 3. `up` is clamped on both sides.
+///
+/// The same device function backs `silu_and_mul_clamp`, which the reference
+/// applies to the **shared** expert (`srt/models/deepseek_v2.py:318-323`, with
+/// the limit threaded in at `:619` via `swiglu_limit=getattr(config,
+/// "swiglu_limit", None)`), so routed and shared experts clamp identically.
+/// `deepseek-ai/DeepSeek-V4-Flash`'s published `config.json` carries
+/// `"swiglu_limit": 10.0`, so the reference clamps unconditionally — there is
+/// no config-dependent escape (wave13-AH).
+///
+/// Clamping after the `F32` upcast is equivalent to the reference's bf16 clamp:
+/// `min`/`max` are monotone, `10.0` is exact in bf16, and the reference upcasts
+/// to fp32 for the `silu` anyway.
+pub(crate) fn swiglu_clamp(gate: &Tensor, up: &Tensor, limit: f32) -> Result<(Tensor, Tensor)> {
+    let limit = limit as f64;
+    let gate = gate.to_dtype(DType::F32)?.minimum(limit)?;
+    let up = up.to_dtype(DType::F32)?.clamp(-limit, limit)?;
+    Ok((gate, up))
+}
+
 /// Configuration for MoEExperts
 pub struct MoEExpertsConfig {
     pub num_experts: usize,
@@ -371,6 +410,36 @@ impl MoEExperts {
         Ok(SlowExpertsWeights { experts })
     }
 
+    /// Gated activation for one expert step: `act(gate) * up`, with the V4
+    /// SwiGLU clamp applied pre-activation when `swiglu_limit` is set.
+    ///
+    /// Every backend routes its activation stage through here so the clamp
+    /// cannot be dropped on one path again (audit finding 5: it was live on
+    /// exactly one of five). With `swiglu_limit == None` this is bit-for-bit
+    /// the pre-clamp expression, so no non-V4 model changes.
+    fn swiglu(&self, gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+        let Some(limit) = self.swiglu_limit else {
+            return up.mul(&gate.apply(&self.act)?);
+        };
+        let out_dtype = gate.dtype();
+        let (gate, up) = swiglu_clamp(gate, up, limit)?;
+        let act_gate = gate.apply(&self.act)?;
+        crate::models::deepseek4::v4_stat_dbg(&act_gate, "exp.act_gate");
+        up.mul(&act_gate)?.to_dtype(out_dtype)
+    }
+
+    /// Split a packed `[.., 2 * w_size_n]` gate_up projection and run
+    /// [`Self::swiglu`] over the halves. This is the activation stage of
+    /// [`Self::forward_fused`]; it is factored out because the GEMMs around it
+    /// are CUDA-only, and this arithmetic is not.
+    fn swiglu_gate_up(&self, gate_up: &Tensor, w_size_n: usize) -> Result<Tensor> {
+        let gate = gate_up.narrow(D::Minus1, 0, w_size_n)?.contiguous()?;
+        let up = gate_up
+            .narrow(D::Minus1, w_size_n, w_size_n)?
+            .contiguous()?;
+        self.swiglu(&gate, &up)
+    }
+
     /// Forward pass through experts
     ///
     /// # Arguments
@@ -454,15 +523,12 @@ impl MoEExperts {
             )?
         };
 
-        // Split and apply activation
-        let gate = gate_up
-            .narrow(D::Minus1, 0, weights.w_size_n)?
-            .contiguous()?;
-        let up = gate_up
-            .narrow(D::Minus1, weights.w_size_n, weights.w_size_n)?
-            .contiguous()?;
-
-        let down_inputs = (up * gate.apply(&self.act)?)?.reshape(((), weights.w_size_n))?;
+        // Split and apply the (clamped) gated activation. Audit finding 5:
+        // this path used to drop the V4 SwiGLU clamp entirely, and it is the
+        // default CUDA path whenever no ISQ/quantization config is present.
+        let down_inputs = self
+            .swiglu_gate_up(&gate_up, weights.w_size_n)?
+            .reshape(((), weights.w_size_n))?;
 
         // Second GEMM: down projection with weight aggregation
         let ys = if weights.stacked_format {
@@ -529,24 +595,16 @@ impl MoEExperts {
             crate::models::deepseek4::v4_collapse_dbg(&xs, "exp.in", 0);
             crate::models::deepseek4::v4_collapse_dbg(&gate, "exp.gate", 0);
             crate::models::deepseek4::v4_collapse_dbg(&up, "exp.up", 0);
-            // V4 clamped SwiGLU, computed in F32 for stability — matches
-            // reference inference/model.py:596-606: gate=w1(x).float(),
-            // up=w3(x).float(); up clamped to [-limit, limit] but gate clamped
-            // ONLY on the max side; silu(gate)*up in f32, then back to the model
-            // dtype for the down projection. (Previously both clamped both-sided
-            // and computed in bf16.) RUN-161.
-            let out_dtype = gate.dtype();
-            let gate = gate.to_dtype(candle_core::DType::F32)?;
-            let up = up.to_dtype(candle_core::DType::F32)?;
-            let (gate, up) = if let Some(limit) = self.swiglu_limit {
-                let limit = limit as f64;
-                (gate.clamp(-1e30, limit)?, up.clamp(-limit, limit)?)
-            } else {
-                (gate, up)
-            };
-            let act_gate = gate.apply(&self.act)?;
-            crate::models::deepseek4::v4_stat_dbg(&act_gate, "exp.act_gate");
-            let prod = (up * act_gate)?.to_dtype(out_dtype)?;
+            // V4 clamped SwiGLU, computed in F32 for stability: `up` clamped to
+            // [-limit, limit], `gate` clamped ONLY on the max side, both BEFORE
+            // the activation; `silu(gate)*up` in f32, then back to the model
+            // dtype for the down projection. RUN-161.
+            //
+            // Authority is the CUDA kernel `silu_and_mul_masked_post_quant.cuh:55-73`
+            // (see [`swiglu_clamp`]) — NOT `inference/model.py:596-606`, which
+            // this comment used to cite and which contains no clamp anywhere
+            // (audit §"Prior-art corrections").
+            let prod = self.swiglu(&gate, &up)?;
             crate::models::deepseek4::v4_stat_dbg(&prod, "exp.prod");
             let down = weights
                 .fused_down_proj
@@ -565,9 +623,11 @@ impl MoEExperts {
             let up = weights
                 .fused_up_proj
                 .gather_forward_autocast(&xs, &indices)?;
+            // Audit finding 5: this branch (Metal, and every non-CUDA device)
+            // dropped the V4 SwiGLU clamp.
             let xs = weights
                 .fused_down_proj
-                .gather_forward_autocast(&(up * gate.apply(&self.act)?)?, &indices)?;
+                .gather_forward_autocast(&self.swiglu(&gate, &up)?, &indices)?;
             xs.squeeze(D::Minus2)?
                 .reshape((num_tokens, self.num_experts_per_tok, hidden_dim))?
         };
@@ -629,13 +689,15 @@ impl MoEExperts {
             if let Some(t) = weights.experts.gate_proj[expert_idx].quantized_act_type() {
                 expert_input = expert_input.to_dtype(t)?;
             }
-            let gate_out = MatMul
-                .qmethod_matmul(&expert_input, &*weights.experts.gate_proj[expert_idx])?
-                .apply(&self.act)?;
+            let gate_out =
+                MatMul.qmethod_matmul(&expert_input, &*weights.experts.gate_proj[expert_idx])?;
             let up_out =
                 MatMul.qmethod_matmul(&expert_input, &*weights.experts.up_proj[expert_idx])?;
+            // Audit finding 5: this path applied the activation to the raw gate
+            // with no V4 SwiGLU clamp. It is the CPU fallback, the quantized
+            // fallback, and what `ARC_MOE_SLOW=1` forces.
             let mut current_hidden_states = MatMul.qmethod_matmul(
-                &(gate_out * up_out)?,
+                &self.swiglu(&gate_out, &up_out)?,
                 &*weights.experts.down_proj[expert_idx],
             )?;
             if weights.experts.gate_proj[expert_idx]
@@ -680,5 +742,274 @@ impl MoEExperts {
                 layers
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+    use mistralrs_quant::safetensors::ShardedSafeTensors;
+    use std::collections::HashMap;
+
+    /// The V4 clamp limit used throughout these tests. Deliberately 1.0 rather
+    /// than the shipped 10.0 so the fixture's pre-activation values (5.0 gate,
+    /// 3.0 up) sit *well past* it — an assertion against an unclamped
+    /// implementation must move by ~20x, not by rounding.
+    const LIMIT: f32 = 1.0;
+
+    /// silu(1.0) * 1.0 — what the reference produces for a gate pre-activation
+    /// of 5.0 and an up pre-activation of 3.0 at `limit = 1.0`.
+    const CLAMPED: f32 = 0.731_058_6;
+    /// silu(5.0) * 3.0 — what an unclamped implementation produces for the
+    /// same inputs. 20.4x the clamped value: no tolerance can hide the gap.
+    const UNCLAMPED: f32 = 14.899_607;
+
+    fn cpu() -> Device {
+        Device::Cpu
+    }
+
+    fn comm(device: &Device) -> Arc<mistralrs_quant::Comm> {
+        Arc::new(
+            mistralrs_quant::Comm::from_device(mistralrs_quant::Id::new(), device, 0, 1).unwrap(),
+        )
+    }
+
+    fn wrap(tensors: HashMap<String, Tensor>, device: &Device) -> ShardedVarBuilder {
+        let backend: Box<dyn candle_nn::var_builder::SimpleBackend + 'static> = Box::new(tensors);
+        ShardedSafeTensors::wrap(backend, DType::F32, device.clone())
+    }
+
+    /// Stacked-format expert weights: every expert projects a `hidden`-wide
+    /// vector of ones onto `gate_pre` / `up_pre` in each of `inter` channels,
+    /// and `down_proj` is the identity so the test reads the gated activation
+    /// straight out of the layer output.
+    fn stacked_experts_vb(
+        num_experts: usize,
+        hidden: usize,
+        inter: usize,
+        gate_pre: f32,
+        up_pre: f32,
+        device: &Device,
+    ) -> ShardedVarBuilder {
+        assert_eq!(hidden, inter, "identity down_proj requires hidden == inter");
+        // [E, hidden, 2*inter]: first `inter` columns feed the gate, rest the up.
+        let mut gate_up = Vec::with_capacity(num_experts * hidden * inter * 2);
+        for _ in 0..num_experts {
+            for _ in 0..hidden {
+                for _ in 0..inter {
+                    gate_up.push(gate_pre / hidden as f32);
+                }
+                for _ in 0..inter {
+                    gate_up.push(up_pre / hidden as f32);
+                }
+            }
+        }
+        // [E, inter, hidden] identity.
+        let mut down = Vec::with_capacity(num_experts * inter * hidden);
+        for _ in 0..num_experts {
+            for i in 0..inter {
+                for h in 0..hidden {
+                    down.push(if i == h { 1.0f32 } else { 0.0 });
+                }
+            }
+        }
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "experts.gate_up_proj".to_string(),
+            Tensor::from_vec(gate_up, (num_experts, hidden, inter * 2), device).unwrap(),
+        );
+        tensors.insert(
+            "experts.down_proj".to_string(),
+            Tensor::from_vec(down, (num_experts, inter, hidden), device).unwrap(),
+        );
+        wrap(tensors, device)
+    }
+
+    fn experts_cfg(
+        num_experts: usize,
+        hidden: usize,
+        inter: usize,
+        limit: Option<f32>,
+    ) -> MoEExpertsConfig {
+        MoEExpertsConfig {
+            num_experts,
+            num_experts_per_tok: 1,
+            hidden_size: hidden,
+            moe_intermediate_size: inter,
+            swiglu_limit: limit,
+        }
+    }
+
+    fn build_experts(backend: MoEExpertsBackend, limit: Option<f32>) -> MoEExperts {
+        let device = cpu();
+        let (num_experts, hidden, inter) = (2usize, 2usize, 2usize);
+        let vb = stacked_experts_vb(num_experts, hidden, inter, 5.0, 3.0, &device);
+        MoEExperts::new_with_backend(
+            &experts_cfg(num_experts, hidden, inter, limit),
+            vb,
+            device,
+            &comm(&cpu()),
+            backend,
+            &None,
+            Activation::Silu,
+        )
+        .expect("experts load")
+    }
+
+    fn max_abs(t: &Tensor) -> f32 {
+        t.to_dtype(DType::F32)
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f32>())
+            .unwrap()
+            .into_iter()
+            .fold(0.0f32, |acc, v| acc.max(v.abs()))
+    }
+
+    /// Relative tolerance. `MatMul::matmul` downcasts CPU matmuls to F16
+    /// (`mistralrs-quant/src/lib.rs:595-599`), so any end-to-end CPU expert
+    /// forward carries ~5e-4 relative error. That is four orders of magnitude
+    /// smaller than the 20.4x gap between CLAMPED and UNCLAMPED, so it cannot
+    /// blur the two.
+    fn all_close(t: &Tensor, expected: f32) -> bool {
+        t.to_dtype(DType::F32)
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f32>())
+            .unwrap()
+            .into_iter()
+            .all(|v| (v - expected).abs() / expected.abs() < 2e-3)
+    }
+
+    /// The clamp is asymmetric by design, and getting it wrong in either
+    /// direction is a silent numerical divergence against the trained weights.
+    ///
+    /// Reference `silu_and_mul_masked_post_quant.cuh:55-73`:
+    /// `gate = __hmin2(gate, limit)` (upper only), `up = __hmin2(__hmax2(up,
+    /// -limit), limit)` (both sides), both PRE-activation.
+    #[test]
+    fn swiglu_clamp_is_one_sided_on_gate_and_symmetric_on_up() {
+        let device = cpu();
+        let vals = vec![-50.0f32, -5.0, 5.0, 50.0];
+        let gate = Tensor::from_vec(vals.clone(), (4,), &device).unwrap();
+        let up = Tensor::from_vec(vals, (4,), &device).unwrap();
+
+        let (g, u) = swiglu_clamp(&gate, &up, 10.0).unwrap();
+
+        // Gate: upper clamp only — large negatives survive untouched.
+        assert_eq!(g.to_vec1::<f32>().unwrap(), vec![-50.0, -5.0, 5.0, 10.0]);
+        // Up: symmetric.
+        assert_eq!(u.to_vec1::<f32>().unwrap(), vec![-10.0, -5.0, 5.0, 10.0]);
+    }
+
+    /// `forward_slow` — the CPU fallback, the quantized fallback, and what
+    /// `ARC_MOE_SLOW=1` forces. Audit finding 5 row 3. End-to-end through the
+    /// real `MoEExperts::forward`.
+    #[test]
+    fn slow_backend_applies_swiglu_clamp() {
+        let device = cpu();
+        let experts = build_experts(MoEExpertsBackend::Slow, Some(LIMIT));
+        let xs = Tensor::ones((1, 1, 2), DType::F32, &device).unwrap();
+        let topk_weights = Tensor::ones((1, 1), DType::F32, &device).unwrap();
+        let topk_ids = Tensor::from_vec(vec![0u32], (1, 1), &device).unwrap();
+
+        let out = experts.forward(&xs, topk_weights, &topk_ids).unwrap();
+        assert_eq!(out.dims(), &[1, 1, 2]);
+        assert!(
+            all_close(&out, CLAMPED),
+            "slow backend dropped the swiglu clamp: {:?}",
+            out.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+    }
+
+    /// The other half of the previous test: with no limit the SAME fixture
+    /// must produce the unclamped value. Without this, a `swiglu_clamp` that
+    /// (say) always clamped to 1.0 regardless of input would pass, and every
+    /// non-V4 model would silently change.
+    #[test]
+    fn slow_backend_without_a_limit_is_unclamped() {
+        let device = cpu();
+        let experts = build_experts(MoEExpertsBackend::Slow, None);
+        let xs = Tensor::ones((1, 1, 2), DType::F32, &device).unwrap();
+        let topk_weights = Tensor::ones((1, 1), DType::F32, &device).unwrap();
+        let topk_ids = Tensor::from_vec(vec![0u32], (1, 1), &device).unwrap();
+
+        let out = experts.forward(&xs, topk_weights, &topk_ids).unwrap();
+        assert!(
+            all_close(&out, UNCLAMPED),
+            "unlimited experts changed: {:?}",
+            out.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+    }
+
+    /// `forward_fused` — the default CUDA path whenever no ISQ or quantization
+    /// config is present (`MoEExpertsBackend::select`). Audit finding 5 row 1.
+    ///
+    /// The GEMMs around it are CUDA-only, so this drives the activation stage
+    /// `forward_fused` actually calls, including the gate/up split offsets.
+    #[test]
+    fn fused_backend_activation_stage_applies_swiglu_clamp() {
+        let device = cpu();
+        let experts = build_experts(MoEExpertsBackend::Slow, Some(LIMIT));
+        // What the first fused GEMM emits: [tokens, 2 * w_size_n], gate half
+        // first. Pre-activation 5.0 / 3.0, as in the end-to-end fixture.
+        let gate_up = Tensor::from_vec(vec![5.0f32, 5.0, 3.0, 3.0], (1, 4), &device).unwrap();
+
+        let out = experts.swiglu_gate_up(&gate_up, 2).unwrap();
+        assert_eq!(out.dims(), &[1, 2]);
+        assert!(all_close(&out, CLAMPED), "fused activation stage unclamped");
+
+        let unlimited = build_experts(MoEExpertsBackend::Slow, None);
+        assert!(
+            all_close(&unlimited.swiglu_gate_up(&gate_up, 2).unwrap(), UNCLAMPED),
+            "limitless fused activation stage changed"
+        );
+    }
+
+    /// `forward_fast` — both branches (CUDA gather, and Metal/other-device
+    /// gather) hand their gate/up projections to `swiglu`. Audit finding 5
+    /// rows 2 and 4: the Metal branch dropped the clamp; the CUDA branch had
+    /// it and must keep it.
+    ///
+    /// The gathers themselves need CUDA or Metal, so this drives the shared
+    /// activation both branches call.
+    #[test]
+    fn fast_backend_activation_stage_applies_swiglu_clamp() {
+        let device = cpu();
+        let experts = build_experts(MoEExpertsBackend::Slow, Some(LIMIT));
+        let gate = Tensor::from_vec(vec![5.0f32, 5.0], (1, 2), &device).unwrap();
+        let up = Tensor::from_vec(vec![3.0f32, 3.0], (1, 2), &device).unwrap();
+
+        assert!(
+            all_close(&experts.swiglu(&gate, &up).unwrap(), CLAMPED),
+            "fast activation stage unclamped"
+        );
+
+        let unlimited = build_experts(MoEExpertsBackend::Slow, None);
+        assert!(
+            all_close(&unlimited.swiglu(&gate, &up).unwrap(), UNCLAMPED),
+            "limitless fast activation stage changed"
+        );
+    }
+
+    /// The clamp must not change the output dtype: the down projection is fed
+    /// the model dtype, not F32. (The clamp computes in F32 internally, as the
+    /// reference does for the silu.)
+    #[test]
+    fn swiglu_preserves_the_input_dtype() {
+        let device = cpu();
+        let experts = build_experts(MoEExpertsBackend::Slow, Some(LIMIT));
+        let gate = Tensor::from_vec(vec![5.0f32, 5.0], (1, 2), &device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let up = Tensor::from_vec(vec![3.0f32, 3.0], (1, 2), &device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let out = experts.swiglu(&gate, &up).unwrap();
+        assert_eq!(out.dtype(), DType::BF16);
+        assert!(max_abs(&(out.to_dtype(DType::F32).unwrap() - CLAMPED as f64).unwrap()) < 1e-2);
+        // Sanity: the assertion above is not satisfied by the unclamped value.
+        assert!((UNCLAMPED - CLAMPED).abs() > 1.0);
     }
 }

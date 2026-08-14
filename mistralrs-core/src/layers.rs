@@ -2995,9 +2995,48 @@ pub struct Mlp {
     pub down: Arc<dyn QuantMethod>,
     act: Activation,
     params: Vec<usize>,
+    /// Pre-activation SwiGLU clamp limit. `None` (the default, and the case
+    /// for every model other than DeepSeek V4) leaves the fused GLU path
+    /// untouched. See [`Mlp::with_swiglu_limit`].
+    swiglu_limit: Option<f32>,
 }
 
 impl Mlp {
+    /// Enable the DeepSeek V4 pre-activation SwiGLU clamp on this MLP.
+    ///
+    /// V4's **shared** expert is clamped exactly like its routed experts: the
+    /// reference constructs it as `DeepseekV2MLP(..., swiglu_limit=getattr(
+    /// config, "swiglu_limit", None))` (`srt/models/deepseek_v2.py:613-622`)
+    /// and applies the limit at `:318-323` via `silu_and_mul_clamp`, which is
+    /// the same `silu_and_mul<true>` device function the routed experts use.
+    /// SGLang gives up an entire fusion optimization specifically to keep this
+    /// correct (`deepseek_v4.py:1266-1271`: "DeepSeek V4 requires different
+    /// clamping for shared and routed experts. Shared experts fusion
+    /// optimization is disabled.").
+    ///
+    /// Audit finding 5: Arc dropped this on the shared expert unconditionally,
+    /// on every device and backend.
+    pub fn with_swiglu_limit(mut self, limit: f32) -> Self {
+        self.swiglu_limit = Some(limit);
+        self
+    }
+
+    /// The active pre-activation SwiGLU clamp, if any.
+    pub fn swiglu_limit(&self) -> Option<f32> {
+        self.swiglu_limit
+    }
+
+    /// `act(gate) * up`, with the V4 SwiGLU clamp applied pre-activation when
+    /// one is configured. Bit-for-bit the old expression when it is not.
+    fn gated_act(&self, gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+        let Some(limit) = self.swiglu_limit else {
+            return crate::ops::mul_and_act(gate, up, self.act);
+        };
+        let out_dtype = gate.dtype();
+        let (gate, up) = crate::moe::swiglu_clamp(gate, up, limit)?;
+        crate::ops::mul_and_act(&gate, &up, self.act)?.to_dtype(out_dtype)
+    }
+
     pub fn new(
         vb: ShardedVarBuilder,
         hidden_size: usize,
@@ -3033,6 +3072,7 @@ impl Mlp {
             )?,
             act: hidden_act,
             params: vec![hidden_size, intermediate_size],
+            swiglu_limit: None,
         })
     }
 
@@ -3069,6 +3109,7 @@ impl Mlp {
             )?,
             act: hidden_act,
             params: vec![hidden_size, intermediate_size],
+            swiglu_limit: None,
         })
     }
 
@@ -3089,9 +3130,7 @@ impl Mlp {
         }
         let lhs = self.gate.forward(&xs)?;
         let rhs = self.up.forward(&xs)?;
-        let mut res = self
-            .down
-            .forward(&crate::ops::mul_and_act(&lhs, &rhs, self.act)?)?;
+        let mut res = self.down.forward(&self.gated_act(&lhs, &rhs)?)?;
         if self.gate.quantized_act_type().is_some() {
             res = res.to_dtype(original_dtype)?;
         }
@@ -3110,8 +3149,7 @@ impl MlpLayer for Mlp {
         }
         let lhs = MatMul.qmethod_matmul(&xs, &*self.gate)?;
         let rhs = MatMul.qmethod_matmul(&xs, &*self.up)?;
-        let mut res =
-            MatMul.qmethod_matmul(&crate::ops::mul_and_act(&lhs, &rhs, self.act)?, &*self.down)?;
+        let mut res = MatMul.qmethod_matmul(&self.gated_act(&lhs, &rhs)?, &*self.down)?;
         if self.gate.quantized_act_type().is_some() {
             res = res.to_dtype(original_dtype)?;
         }
@@ -3153,6 +3191,7 @@ impl MlpLayer for Mlp {
             down,
             act: self.act,
             params: self.params.clone(),
+            swiglu_limit: self.swiglu_limit,
         }))
     }
 
