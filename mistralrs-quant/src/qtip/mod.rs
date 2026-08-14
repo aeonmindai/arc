@@ -56,6 +56,8 @@ use crate::{
 };
 
 #[cfg(test)]
+mod bake_memory_tests;
+#[cfg(test)]
 mod bake_quality_tests;
 pub mod bitshift;
 #[cfg(feature = "cuda")]
@@ -1811,6 +1813,31 @@ impl QtipLayer {
         hessian_diag: Option<&[f32]>,
         bake_cfg: QtipBakeConfig,
     ) -> Result<Arc<dyn QuantMethod>> {
+        Ok(Arc::new(Self::quantize_3d_concrete_with_bake_config(
+            weight,
+            device,
+            mode,
+            use_rotation,
+            hessian_diag,
+            bake_cfg,
+        )?))
+    }
+
+    /// [`Self::quantize_3d_with_bake_config`] returning the concrete layer
+    /// instead of `Arc<dyn QuantMethod>`.
+    ///
+    /// `QuantMethod` does not extend `Any`, so without this there is no way to
+    /// inspect a freshly baked 3-D stack's `blocks` / `row_scales` — including
+    /// no way to assert *what memory it holds*, which is the property wave18
+    /// needed to pin (see `qtip/bake_memory_tests.rs`).
+    pub fn quantize_3d_concrete_with_bake_config(
+        weight: &Tensor,
+        device: &Device,
+        mode: QtipMode,
+        use_rotation: bool,
+        hessian_diag: Option<&[f32]>,
+        bake_cfg: QtipBakeConfig,
+    ) -> Result<Self> {
         let dims = weight.dims3()?;
         let (e, n, k_in) = (dims.0, dims.1, dims.2);
         if e == 0 || n == 0 || k_in == 0 {
@@ -1855,7 +1882,27 @@ impl QtipLayer {
         // is counted + warned inside `expert_stack_quant_device` (wave6-Q:
         // the silent version of this gate cost ~20x per layer).
         let quant_device = expert_stack_quant_device(device, "QtipLayer::quantize_with_options_3d");
-        let move_back = matches!(quant_device, Device::Cuda(_)) && matches!(device, Device::Cpu);
+
+        // Where the *result* lands, which is not always where the math ran.
+        //
+        // wave18: during a UQFF bake the quantized stack is only ever handed to
+        // `serialize()`, so keeping it on the accelerator buys nothing and costs
+        // the full artifact size in device memory — ~1.6 GiB per layer for V4
+        // Flash, ~68 GB over 43 layers — while also forcing the allocator to
+        // fit its multi-GiB per-chunk transients around a permanently growing
+        // set of resident blocks. That is what killed a 43-layer bake at layer
+        // 28 on a 140 GB H200 with nothing written. With the result on the host,
+        // device usage reaches steady state after the first layer and stays
+        // there, and the same transients are reused every chunk.
+        //
+        // `bake_isq_to_host()` is false for every serve/inference load, so this
+        // is a bake-only detour: nothing that will run a forward pass is moved.
+        let out_device = if crate::bake_isq_to_host() {
+            Device::Cpu
+        } else {
+            device.clone()
+        };
+        let move_back = !quant_device.same_device(&out_device);
 
         // RUN-161 expert-batching: the per-expert loop used to stream ONE expert
         // at a time -> 256 CPU<->GPU blocking round-trips/projection, which
@@ -1878,6 +1925,27 @@ impl QtipLayer {
             // [this_b, N, K] -> [this_b*N, K] (CPU reshape; concrete moves to GPU).
             let chunk = weight.narrow(0, expert_idx, this_b)?;
             let rows_2d = chunk.reshape((this_b * n, k_in))?;
+            // `narrow` + `reshape` produce a *view*: the layout shrinks to this
+            // chunk but the backing storage is still the whole [E, N, K] stack.
+            // `Tensor::to_device` copies the entire storage and clones the
+            // layout (offset included), so handing this view straight to the
+            // CUDA path uploads all E experts on every chunk — 4.3 GiB per call
+            // instead of 268 MiB for V4 Flash, 16x more traffic and a 4.3 GiB
+            // alloc/free cycle 48 times per layer for the allocator to work
+            // around. Materialise the chunk into its own storage first; skip it
+            // when the quantize runs where the weight already lives (no
+            // `to_device` copy happens then) or when the chunk *is* the whole
+            // stack. (wave18)
+            //
+            // Done for every partial chunk, not only when a device hop is
+            // pending: the copy is one chunk's worth (268 MiB for V4 Flash,
+            // microseconds of bandwidth) and making it unconditional keeps the
+            // path a CPU test can actually reach.
+            let rows_2d = if this_b < e {
+                rows_2d.force_contiguous()?
+            } else {
+                rows_2d
+            };
             // Every chunk is baked with the SAME `bake_cfg` the caller handed
             // in — not a per-chunk re-read. The cross-chunk `search_detail`
             // check below is what turns that into an enforced property rather
@@ -1894,12 +1962,12 @@ impl QtipLayer {
 
             // blocks [this_b*N, packed] -> [this_b, N, packed]; scales [this_b*N] -> [this_b, N].
             let blk = if move_back {
-                layer.blocks.to_device(device)?
+                layer.blocks.to_device(&out_device)?
             } else {
                 layer.blocks.clone()
             };
             let scl = if move_back {
-                layer.row_scales.to_device(device)?
+                layer.row_scales.to_device(&out_device)?
             } else {
                 layer.row_scales.clone()
             };
@@ -1908,12 +1976,12 @@ impl QtipLayer {
 
             if expert_idx == 0 {
                 shared_lut = Some(if move_back {
-                    layer.lut.to_device(device)?
+                    layer.lut.to_device(&out_device)?
                 } else {
                     layer.lut.clone()
                 });
                 shared_rotation_signs = match layer.rotation_signs.clone() {
-                    Some(s) if move_back => Some(s.to_device(device)?),
+                    Some(s) if move_back => Some(s.to_device(&out_device)?),
                     other => other,
                 };
                 shared_rotation_block = layer.rotation_block;
@@ -1947,7 +2015,7 @@ impl QtipLayer {
             candle_core::Error::Msg("QTIP 3-D quantize: no expert produced an LUT".into())
         })?;
 
-        Ok(Arc::new(Self {
+        Ok(Self {
             blocks: blocks_3d,
             row_scales: row_scales_2d,
             lut,
@@ -1961,7 +2029,7 @@ impl QtipLayer {
             rotation_block: shared_rotation_block,
             search: QtipSearchStamp::for_mode(mode),
             search_detail: shared_search_detail,
-        }))
+        })
     }
 
     /// Read the raw decoded weights *in the rotated frame*. When rotation is

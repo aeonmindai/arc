@@ -134,6 +134,12 @@ pub async fn run_quantize(model_type: QuantizeModelType, global: GlobalOptions) 
             .with_cpu(cpu)
             .with_num_device_layers_optional(device_layers)
             .with_in_situ_quant(isq.to_string())
+            // A bake never generates a token, so a KV cache is pure waste — and
+            // PagedAttention sizes its cache from *free* VRAM, so the more
+            // headroom the bake leaves (wave18 moved the quantized experts to
+            // the host) the larger the pointless allocation it makes right
+            // after the artifact is written. Off for quantize. (wave18)
+            .set_paged_attn(Some(false))
             .build()
             .await?;
 

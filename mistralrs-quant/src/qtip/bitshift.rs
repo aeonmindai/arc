@@ -668,7 +668,17 @@ impl Qtip2bLayer {
         // the silent version of this gate cost ~20x per layer).
         let quant_device =
             super::expert_stack_quant_device(device, "Qtip2bLayer::quantize_with_options_3d");
-        let move_back = matches!(quant_device, Device::Cuda(_)) && matches!(device, Device::Cpu);
+        // During a UQFF bake the quantized stack is only serialized, never used
+        // for a forward pass, so it is materialized on the host and device usage
+        // stays flat across layers instead of growing by the artifact size. See
+        // `crate::set_bake_isq_to_host` and the LUT rung's sibling comment.
+        // (wave18)
+        let out_device = if crate::bake_isq_to_host() {
+            Device::Cpu
+        } else {
+            device.clone()
+        };
+        let move_back = !quant_device.same_device(&out_device);
 
         let batch = std::env::var("ARC_QTIP_EXPERT_BATCH")
             .ok()
@@ -687,6 +697,15 @@ impl Qtip2bLayer {
             let this_b = batch.min(e - expert_idx);
             let chunk = weight.narrow(0, expert_idx, this_b)?;
             let rows_2d = chunk.reshape((this_b * n, k_in))?;
+            // A narrowed view still carries the WHOLE [E, N, K] storage, and
+            // `to_device` copies storage rather than layout — so without this
+            // the CUDA path uploads all E experts per chunk. See the LUT rung
+            // for the measured cost. (wave18)
+            let rows_2d = if this_b < e {
+                rows_2d.force_contiguous()?
+            } else {
+                rows_2d
+            };
             let layer = Self::quantize_with_options_concrete(
                 &rows_2d,
                 None,
@@ -696,12 +715,12 @@ impl Qtip2bLayer {
             )?;
 
             let blk = if move_back {
-                layer.blocks.to_device(device)?
+                layer.blocks.to_device(&out_device)?
             } else {
                 layer.blocks.clone()
             };
             let scl = if move_back {
-                layer.row_scales.to_device(device)?
+                layer.row_scales.to_device(&out_device)?
             } else {
                 layer.row_scales.clone()
             };
@@ -710,7 +729,7 @@ impl Qtip2bLayer {
 
             if expert_idx == 0 {
                 shared_rotation_signs = match layer.rotation_signs.clone() {
-                    Some(s) if move_back => Some(s.to_device(device)?),
+                    Some(s) if move_back => Some(s.to_device(&out_device)?),
                     other => other,
                 };
                 shared_rotation_block = layer.rotation_block;
