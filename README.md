@@ -9,7 +9,7 @@ Inference at the speed of physics.
 </h3>
 
 <p align="center">
-  <a href="https://runcrate.ai/arc"><b>Website</b></a> | <a href="#quick-start"><b>Quick Start</b></a> | <a href="#performance"><b>Performance</b></a> | <a href="#compression-stack"><b>Compression</b></a> | <a href="#supported-models"><b>Models</b></a> | <a href="#license"><b>License</b></a>
+  <a href="https://runcrate.ai/arc"><b>Website</b></a> | <a href="#quick-start"><b>Quick Start</b></a> | <a href="#results"><b>Results</b></a> | <a href="#compression-stack"><b>Compression</b></a> | <a href="#supported-models"><b>Models</b></a> | <a href="#license"><b>License</b></a>
 </p>
 
 <p align="center">
@@ -19,7 +19,7 @@ Inference at the speed of physics.
 
 ---
 
-Arc serves any LLM at HBM-bandwidth-floor decode throughput. ~85% of theoretical bandwidth utilization on H100 single-node, achieved by composing the most aggressive open compression stack in production: **QTIP 2-bit weights, TurboQuant 3.5-bit KV cache, TD-MoE Tucker decomposition**, and model-native sparse attention kernels.
+Arc is an inference engine built to serve frontier MoE models on radically less hardware, by composing the most aggressive open compression stack in production: **QTIP 2-bit weights, TurboQuant 3.5-bit KV cache, TD-MoE Tucker decomposition**, and model-native sparse attention kernels. Measured today: DeepSeek V4 Flash (284B / 13B active) serving from a 68 GB artifact on a **single H200**, at GSM8K 84.0% — see [Results](#results).
 
 Forked from [mistral.rs](https://github.com/EricLBuehler/mistral.rs). Apache 2.0. Upstream-merge-compatible.
 
@@ -27,7 +27,7 @@ Forked from [mistral.rs](https://github.com/EricLBuehler/mistral.rs). Apache 2.0
 
 | Feature | What it does |
 |---|---|
-| **TurboQuant K4/V3 KV** | Zandieh et al. (Google Research, [arXiv:2504.19874](https://arxiv.org/abs/2504.19874), ICLR'26) — Arc Rust impl with fused-kernel attention path. 3.5-bit average, paper-lossless. 4.6× KV bandwidth vs FP16. Works on any attention model. |
+| **TurboQuant K4/V3 KV** | Zandieh et al. (Google Research, [arXiv:2504.19874](https://arxiv.org/abs/2504.19874), ICLR'26) — Arc Rust impl with fused-kernel attention path. 3.5-bit average, paper-lossless. Measured: **4.27× KV compression** end-to-end (Qwen3-32B, single H100: 39K→169K context). GQA-attention models; MLA models currently fall back to the standard KV path. |
 | **QTIP 2-bit weights** | Cornell ICLR'25 — Viterbi-decoded trellis with Hadamard incoherence rotation. 8× weight compression vs FP16. Works on any model. |
 | **TD-MoE Tucker + whitening** | "Lossless 20%" extra compression on MoE expert pool via whitened Tucker decomposition. Works on any MoE. |
 | **Sparse attention kernels** | FlashMLASparse CUDA kernel (MIT, ported from sgl-project) for top-k attention. Dense O(n²) → sparse O(n·k). |
@@ -37,26 +37,22 @@ Forked from [mistral.rs](https://github.com/EricLBuehler/mistral.rs). Apache 2.0
 
 Plus everything from mistral.rs: PagedAttention, FlashAttention V2/V3, speculative decoding (EAGLE-3, Medusa, MTP), continuous batching, 100+ model architectures, GGUF/GPTQ/AWQ/ISQ, LoRA, MCP integration, multi-GPU tensor parallelism.
 
-## Performance
+## Results
 
-Single-user decode tok/s on a single H100 80GB. Derived from HBM-bandwidth math (3.35 TB/s, ~70% achieved efficiency):
+Measured on rented hardware; full protocols, raw-artifact provenance, and limitations in **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**. Fleet-economics analysis — with every claim tagged measured vs projected — in **[docs/FLEET.md](docs/FLEET.md)**.
 
-| Model | Memory residency | Short ctx tok/s | Long ctx (1M) tok/s |
-|---|---|---|---|
-| Llama-3.1-8B-Instruct | ~4 GB | ~3,200 | ~1,400 |
-| Qwen3-32B-Instruct | ~12 GB | ~1,500 | ~800 |
-| Mixtral 8x7B (47B / 13B active) | ~16 GB | ~1,200 | ~700 |
-| GLM-4.5 (similar MoE class) | ~55 GB | ~2,200 | ~2,000 |
-| Kimi K2.6 (160K vocab, 384 experts) | ~55 GB | ~2,200 | ~2,000 |
-| DeepSeek V4 Flash (284B / 13B active) | ~55 GB | ~2,400 | ~2,300 |
+Validated as of Aug 2026 (DeepSeek V4 Flash, 284B / 13B-active MoE, single H200 141 GB):
 
-Cost on a $3/hour H100:
+| Claim | Status | Number |
+|---|---|---|
+| Frontier MoE on one GPU | **Measured** | 284B/13B V4 Flash serves from a **68 GB** artifact (2-bit trellis experts + FP8 attention) on a single H200 |
+| Quality at 2-bit experts | **Measured** | GSM8K **84.0%** (n=100, 0-shot chat, greedy) vs 90.8 published for the base model (8-shot — different protocol); facts 22/22, arithmetic 8/8, coherence 6/6 |
+| Long-context correctness | **Measured** | 5/5 coherence + 4/4 needle recall (ablation matrix in BENCHMARKS.md) |
+| TurboQuant KV | **Measured** | **4.27×** KV compression, Qwen3-32B on one H100 (39K→169K-token context) |
+| qtip2b bitshift-trellis format | **Measured** | CUDA↔CPU parity, 20/20 tests on H200 |
+| Single-user decode speed | **Measured, unoptimized** | 5.4 tok/s (batch=1); expert-read kernels at 3–4% of peak HBM bandwidth — kernel optimization in progress (profile in BENCHMARKS.md) |
 
-- 8B dense models: **~$0.0026 per 10K tokens**
-- 32B dense models: **~$0.0056 per 10K tokens**
-- Frontier MoE (280B+ params, 13B active): **~$0.014 per 10K tokens**
-
-Same models running on vendor-default stacks need 4-8× the GPUs to hit the same throughput.
+Throughput beyond these numbers — saturated-batch floors, per-node replica math — is arithmetic, not measurement, and lives in [docs/FLEET.md](docs/FLEET.md) explicitly marked as projected. Total spend to produce every measured number above: ≈ $77 of rented H200 time.
 
 ## Compression Stack
 
@@ -75,6 +71,8 @@ KV cache bytes per token @ 32K context:
 ```
 
 Each layer compresses a different axis. The wins multiply.
+
+Measured end-to-end so far: **4.27×** KV (TurboQuant, Qwen3-32B on one H100) and 284B → **68 GB** weights (V4 Flash qtip2 bake, serving on one H200 — see [Results](#results)). The remaining multipliers above are format arithmetic until measured.
 
 For long context (1M+ tokens), the bottleneck shifts from weights to attention compute + KV bandwidth. Arc handles that via FlashMLASparse (CUDA kernel, MIT-licensed, ported from sgl-project), turning dense attention's O(n²) into sparse top-k O(n·k) on models with native sparse-attention training (DeepSeek V3.2+ family) and via top-k attention + sink preservation on the rest.
 
