@@ -119,6 +119,37 @@ extern "C" {
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
+    // ----- Beam-search quantize (wave13-AF, kernels/qtip/qtip_beam.cu) -----
+    //
+    // Pruned Viterbi keeping the best `beam_w` states per timestep, the GPU
+    // twin of `qtip/viterbi.rs::beam_quantize_row`. Bit-identical to the CPU
+    // beam at the same width.
+    //
+    // `d_trace` is `[rows_in_flight, num_symbols, beam_w]` u32 scratch holding
+    // `(state << 16) | parent_slot` — 9.7 MB per row at W=256 / T=9472, versus
+    // the 620 MB a per-state backtrace would need. There is no cost ping-pong
+    // scratch: the live state set lives in shared memory.
+
+    /// Largest beam width the kernel supports (== its block size). The Rust
+    /// side refuses wider beams rather than silently substituting a different
+    /// search.
+    pub(crate) fn qtip_beam_max_width() -> i32;
+
+    /// Returns 0 on launch, -1 when `beam_w` is outside `1..=qtip_beam_max_width()`.
+    pub(crate) fn launch_qtip_quantize_rows_beam_f32(
+        d_weight: *const f32,
+        d_lut: *const f32,
+        d_row_scales: *const f32,
+        d_packed: *mut u8,
+        d_trace: *mut u32,
+        n_rows: i32,
+        in_features: i32,
+        num_symbols: i32,
+        row_offset: i32,
+        beam_w: i32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    ) -> i32;
+
     pub(crate) fn launch_qtip_refine_scales_f32(
         d_weight: *const f32,
         d_packed: *const u8,

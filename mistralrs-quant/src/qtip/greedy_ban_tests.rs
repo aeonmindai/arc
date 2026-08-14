@@ -23,10 +23,31 @@ use candle_core::{DType, Device, Tensor};
 use std::borrow::Cow;
 use std::sync::{atomic::AtomicUsize, Arc};
 
-use super::{Qtip2bLayer, QtipLayer, QtipMode, QtipRotation, QtipSearchStamp};
+use super::{Qtip2bLayer, QtipLayer, QtipMode, QtipRotation, QtipSearchDetail, QtipSearchStamp};
 use crate::{
     IsqType, QuantMethod, QuantMethodConfig, QuantizeOntoGuard, QuantizedSerde, UnquantLinear,
 };
+
+/// The provenance tail of a serialized QTIP payload, in ONE place.
+///
+/// #34 appended a stamp byte; wave13-AF appended a search-detail flags byte
+/// after it (plus a `u16` little-endian width when the beam bit is set), so
+/// `bytes.last()` is no longer the stamp. Every artifact in this module is
+/// baked with the default exhaustive/unweighted search, so its tail is exactly
+/// `[stamp, 0x00]` — and asserting the flags byte here is not incidental: it
+/// pins that a default production bake claims "exhaustive, unweighted" rather
+/// than leaving those fields unset.
+fn provenance_tail(bytes: &[u8]) -> (Option<u8>, u8) {
+    let n = bytes.len();
+    assert!(n >= 2, "payload too short to carry a provenance tail");
+    (Some(bytes[n - 2]), bytes[n - 1])
+}
+
+/// Strip the provenance tail, producing a byte-for-byte pre-0.3.0 payload.
+fn strip_provenance(bytes: &mut Vec<u8>) {
+    let n = bytes.len();
+    bytes.truncate(n - 2);
+}
 
 /// Deterministic Gaussian-ish fixture (splitmix64 + Box-Muller), so no test in
 /// this module depends on an RNG seed that could drift.
@@ -135,10 +156,18 @@ fn isq_dispatch_never_bakes_greedy_on_either_rung_or_rank() {
             // The artifact is the evidence: a production bake must stamp
             // `trellis` AND carry the incoherence rotation.
             let bytes = layer.serialize().unwrap().into_owned();
+            let (stamp, flags) = provenance_tail(&bytes);
             assert_eq!(
-                bytes.last().copied(),
+                stamp,
                 QtipSearchStamp::Trellis.to_wire(),
                 "{isq:?} rank-{}: production bake did not stamp `trellis`",
+                dims.len()
+            );
+            assert_eq!(
+                flags,
+                0x00,
+                "{isq:?} rank-{}: production bake must record exhaustive + unweighted, \
+                 not leave the search detail unset",
                 dims.len()
             );
             // Reload through the D4 gate (it must pass) and confirm the bake
@@ -190,10 +219,16 @@ fn greedy_fixture_door_exists_only_under_cfg_test() {
     // A greedy fixture is a real artifact — it just may never be served. This
     // module (and `quantize_greedy_fixture` itself) is `cfg(test)`-only, so the
     // door does not exist in a release build at all.
+    let bytes = greedy.serialize().unwrap().into_owned();
+    let (stamp, flags) = provenance_tail(&bytes);
     assert_eq!(
-        greedy.serialize().unwrap().last().copied(),
+        stamp,
         QtipSearchStamp::Greedy.to_wire(),
         "the fixture door must stamp what it actually ran"
+    );
+    assert_eq!(
+        flags, 0x00,
+        "a greedy walk runs no trellis search, so it must claim no beam and no objective"
     );
 }
 
@@ -348,7 +383,7 @@ fn greedy_stamped_artifact_is_refused_at_load() {
         ),
     ] {
         assert_eq!(
-            bytes.last().copied(),
+            provenance_tail(&bytes).0,
             QtipSearchStamp::Greedy.to_wire(),
             "{rung}: greedy bake must stamp greedy"
         );
@@ -389,9 +424,9 @@ fn legacy_unstamped_without_rotation_is_refused() {
             .unwrap();
     assert_eq!(greedy.rotation_block(), 0);
 
-    // Truncate the trailing stamp byte: byte-for-byte a pre-0.3.0 payload.
+    // Truncate the whole provenance tail: byte-for-byte a pre-0.3.0 payload.
     let mut bytes = QuantizedSerde::serialize(&greedy).unwrap().into_owned();
-    bytes.pop();
+    strip_provenance(&mut bytes);
 
     let msg = QtipLayer::deserialize_ext_bias(
         Cow::Owned(bytes.clone()),
@@ -420,7 +455,7 @@ fn legacy_unstamped_with_rotation_is_served() {
     assert!(viterbi.rotation_block() >= 2);
 
     let mut bytes = QuantizedSerde::serialize(&viterbi).unwrap().into_owned();
-    bytes.pop();
+    strip_provenance(&mut bytes);
 
     let (restored, _) =
         QtipLayer::deserialize_ext_bias(Cow::Owned(bytes), &device, QuantizeOntoGuard::new())
@@ -438,12 +473,17 @@ fn unknown_provenance_cannot_be_laundered_into_a_stamp() {
         QtipLayer::quantize_with_options_concrete(&w, None, &device, QtipMode::Viterbi, true)
             .unwrap();
     let mut bytes = QuantizedSerde::serialize(&viterbi).unwrap().into_owned();
-    bytes.pop(); // pre-0.3.0 payload
+    strip_provenance(&mut bytes); // pre-0.3.0 payload
 
     let (legacy, _) =
         QtipLayer::deserialize_concrete(Cow::Owned(bytes), &device, QuantizeOntoGuard::new())
             .unwrap();
     assert_eq!(legacy.search_stamp(), QtipSearchStamp::Unstamped);
+    assert_eq!(
+        legacy.search_detail(),
+        QtipSearchDetail::Unknown,
+        "an unstamped payload's search detail is unknown too — not a default claim"
+    );
 
     let msg = QuantizedSerde::serialize(&legacy)
         .expect_err("re-serializing an unstamped layer must not invent provenance")
@@ -476,4 +516,208 @@ fn stamp_wire_encoding_is_pinned() {
         QtipSearchStamp::for_mode(QtipMode::Greedy),
         QtipSearchStamp::Greedy
     );
+}
+
+// ---------------------------------------------------------------------------
+// Search DETAIL (wave13-AF): the flags byte beside the stamp
+// ---------------------------------------------------------------------------
+//
+// The stamp answers "trellis or greedy". It deliberately cannot answer "which
+// trellis search", and a W=64 beam is a genuinely different quality point from
+// the exhaustive DP (PR #29: matmul cos 0.95054 vs 0.96495). An artifact that
+// cannot tell them apart is a mislabelled artifact, which is the failure class
+// the stamp exists to end — so these tests hold the detail to the same standard
+// the stamp is held to.
+//
+// What is and is not checkable, stated plainly: you cannot recover the search
+// from the packed symbols, so no test can prove an artifact's width claim
+// matches the search that actually ran. What the format CAN guarantee, and what
+// is tested here, is that a claim is internally consistent, that it round-trips
+// exactly, and that it is never invented at re-serialize time.
+
+/// `for_bake` records the plan that ran, and normalises the two widths that are
+/// not pruned searches (0, and anything at or above the state space) rather
+/// than recording them as beams.
+#[test]
+fn search_detail_records_the_plan_that_ran() {
+    use super::{TrellisSearch, LUT_SIZE};
+
+    for w in [1usize, 64, 128, 256, LUT_SIZE - 1] {
+        assert_eq!(
+            QtipSearchDetail::for_bake(QtipMode::Viterbi, TrellisSearch::Beam { width: w }, false)
+                .beam_width(),
+            Some(w as u16),
+            "a beam of width {w} must be recorded as such"
+        );
+    }
+    // Not pruned searches: width 0 is not a search, and a beam at or above the
+    // state space prunes nothing and IS the exhaustive DP.
+    for w in [0usize, LUT_SIZE, LUT_SIZE + 1] {
+        assert_eq!(
+            QtipSearchDetail::for_bake(QtipMode::Viterbi, TrellisSearch::Beam { width: w }, false)
+                .beam_width(),
+            None,
+            "width {w} is not a pruned beam and must not be recorded as one"
+        );
+    }
+    assert_eq!(
+        QtipSearchDetail::for_bake(QtipMode::Viterbi, TrellisSearch::Exhaustive, false),
+        QtipSearchDetail::EXHAUSTIVE_MSE
+    );
+    // Greedy runs no trellis search, so it can claim neither a beam nor an
+    // objective — even if the caller passes one.
+    assert_eq!(
+        QtipSearchDetail::for_bake(QtipMode::Greedy, TrellisSearch::Beam { width: 64 }, true),
+        QtipSearchDetail::EXHAUSTIVE_MSE
+    );
+}
+
+/// **The round-trip gate.** An exhaustive bake and a beam bake must be
+/// distinguishable from the artifact alone, and the width must survive the wire
+/// exactly — including the boundary widths.
+#[test]
+fn beam_width_round_trips_through_uqff_exactly() {
+    use super::LUT_SIZE;
+
+    let device = Device::Cpu;
+    let w = Tensor::from_vec(fixture(8 * 64, 21, 0.5), (8usize, 64usize), &device).unwrap();
+    let mut layer =
+        QtipLayer::quantize_with_options_concrete(&w, None, &device, QtipMode::Viterbi, true)
+            .unwrap();
+
+    // The bake above ran the exhaustive DP; that is what it recorded.
+    assert_eq!(layer.search_detail(), QtipSearchDetail::EXHAUSTIVE_MSE);
+    let exhaustive_bytes = QuantizedSerde::serialize(&layer).unwrap().into_owned();
+
+    for (width, hessian) in [
+        (1u16, false),
+        (64, false),
+        (128, true),
+        (256, false),
+        ((LUT_SIZE - 1) as u16, true),
+    ] {
+        layer.search_detail = QtipSearchDetail::Known {
+            beam_width: Some(width),
+            hessian,
+        };
+        let bytes = QuantizedSerde::serialize(&layer).unwrap().into_owned();
+
+        // Distinguishable from the exhaustive artifact by the bytes alone.
+        assert_ne!(
+            bytes, exhaustive_bytes,
+            "a W={width} beam artifact must not be byte-identical to an exhaustive one"
+        );
+
+        let (restored, _) =
+            QtipLayer::deserialize_concrete(Cow::Owned(bytes), &device, QuantizeOntoGuard::new())
+                .unwrap();
+        assert_eq!(
+            restored.search_detail(),
+            QtipSearchDetail::Known {
+                beam_width: Some(width),
+                hessian
+            },
+            "W={width} hessian={hessian} did not round-trip exactly"
+        );
+        assert_eq!(restored.search_stamp(), QtipSearchStamp::Trellis);
+    }
+}
+
+/// A self-contradictory or uninterpretable provenance claim is REFUSED, never
+/// normalised into a plausible one. Reading a malformed claim as "exhaustive"
+/// is exactly how a mislabelled artifact would get laundered into a trusted one.
+#[test]
+fn malformed_search_detail_claims_are_rejected_not_laundered() {
+    let device = Device::Cpu;
+    let w = Tensor::from_vec(fixture(8 * 64, 22, 0.5), (8usize, 64usize), &device).unwrap();
+    let layer =
+        QtipLayer::quantize_with_options_concrete(&w, None, &device, QtipMode::Viterbi, true)
+            .unwrap();
+    let good = QuantizedSerde::serialize(&layer).unwrap().into_owned();
+    // Tail is [stamp=1(trellis), flags=0x00].
+    assert_eq!(provenance_tail(&good), (Some(1), 0x00));
+
+    let load = |bytes: Vec<u8>| {
+        QtipLayer::deserialize_concrete(Cow::Owned(bytes), &device, QuantizeOntoGuard::new())
+    };
+
+    // (a) Reserved bits set — written by a newer Arc whose provenance fields
+    //     this build cannot interpret. Refuse rather than guess.
+    for reserved in [0x04u8, 0x40, 0x80, 0xFC] {
+        let mut bytes = good.clone();
+        *bytes.last_mut().unwrap() = reserved;
+        let msg = load(bytes)
+            .expect_err("reserved provenance bits must not be ignored")
+            .to_string();
+        assert!(msg.contains("reserved bits"), "{msg}");
+    }
+
+    // (b) Beam bit set with a width that is not a pruned search.
+    let mut bytes = good.clone();
+    *bytes.last_mut().unwrap() = 0x01;
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    let msg = load(bytes)
+        .expect_err("a beam of width 0 is not a search")
+        .to_string();
+    assert!(msg.contains("pruned search"), "{msg}");
+
+    // (c) Beam bit set but the width is missing — truncated payload.
+    let mut bytes = good.clone();
+    *bytes.last_mut().unwrap() = 0x01;
+    let msg = load(bytes)
+        .expect_err("a beam claim with no width is truncated, not exhaustive")
+        .to_string();
+    assert!(
+        msg.contains("width is") || msg.contains("truncated"),
+        "{msg}"
+    );
+
+    // (d) A `greedy` stamp claiming a beam width: two halves of the artifact
+    //     contradicting each other. This is the strongest form of "a stamp
+    //     claiming a search the payload did not use" that is detectable at all.
+    let mut bytes = good.clone();
+    let n = bytes.len();
+    bytes[n - 2] = 2; // greedy
+    bytes[n - 1] = 0x01; // ...but claims a beam
+    bytes.extend_from_slice(&256u16.to_le_bytes());
+    let msg = load(bytes)
+        .expect_err("greedy + beam width is self-contradictory")
+        .to_string();
+    assert!(msg.contains("contradicts itself"), "{msg}");
+    // ...and the same contradiction is refused on the WRITE side, so it can
+    // never be produced in the first place.
+    let mut bad =
+        QtipLayer::quantize_with_options_concrete(&w, None, &device, QtipMode::Viterbi, true)
+            .unwrap();
+    bad.search = QtipSearchStamp::Greedy;
+    bad.search_detail = QtipSearchDetail::Known {
+        beam_width: Some(256),
+        hessian: false,
+    };
+    let msg = QuantizedSerde::serialize(&bad)
+        .expect_err("a greedy stamp must not be writable with a beam width")
+        .to_string();
+    assert!(msg.contains("cannot carry a beam width"), "{msg}");
+
+    // (e) Stamp present, flags byte missing: a truncated 0.3.0 payload. It must
+    //     fail closed, NOT read as an exhaustive unweighted bake. (Dropping the
+    //     stamp too is a genuine pre-0.3.0 payload and stays legal — that
+    //     distinction is the whole reason the flags byte is mandatory.)
+    let mut bytes = good.clone();
+    bytes.pop();
+    let msg = load(bytes)
+        .expect_err("a stamped payload with no flags byte is truncated")
+        .to_string();
+    assert!(msg.contains("no search-detail"), "{msg}");
+
+    // (f) Unknown detail is never invented at re-serialize time — the same
+    //     no-laundering rule the stamp already enforces.
+    let mut unknown =
+        QtipLayer::quantize_with_options_concrete(&w, None, &device, QtipMode::Viterbi, true)
+            .unwrap();
+    unknown.search_detail = QtipSearchDetail::Unknown;
+    let msg = QuantizedSerde::serialize(&unknown)
+        .expect_err("unknown search detail must not be written as a specific claim")
+        .to_string();
+    assert!(msg.contains("never recorded"), "{msg}");
 }
