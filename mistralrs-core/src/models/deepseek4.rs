@@ -783,12 +783,6 @@ struct Attention {
     /// Audit §0 + §2 (SGLang line 195).
     #[allow(dead_code)]
     indexer: Option<super::dsv4_indexer::V4Indexer>,
-    /// R2: per-layer history of the compressor input `xs` (post-layernorm
-    /// attention input) so the compressed branch sees compressed *history*
-    /// during decode, not just the current token. CSA/HCA only, interior-
-    /// mutable, reset at sequence start (seqlen_offset==0). Single-sequence
-    /// (non-paged) correctness; paged/multi-seq is the follow-up.
-    xs_history: Option<std::sync::Mutex<crate::kv_cache::SingleCache>>,
 }
 
 impl Attention {
@@ -1074,15 +1068,6 @@ impl Attention {
             sliding_window: cfg.sliding_window,
             attn_sink,
             indexer,
-            xs_history: if compress_ratio != CompressRatio::Standard {
-                Some(std::sync::Mutex::new(crate::kv_cache::SingleCache::new(
-                    1,
-                    cfg.max_position_embeddings,
-                    256,
-                )))
-            } else {
-                None
-            },
             wo_a_t_cache: std::sync::RwLock::new(None),
         })
     }
@@ -1165,12 +1150,14 @@ impl Attention {
         Ok(Some(comp))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
         seqlen_offsets: &[usize],
         kv_cache: &mut KvCache,
+        xs_hist_cache: Option<&mut KvCache>,
         metadata: Option<(
             (Tensor, Tensor, Option<Tensor>, Option<Tensor>),
             &PagedAttentionInputMetadata,
@@ -1191,20 +1178,34 @@ impl Attention {
             &format!("seq_len={seq_len}\nseqlen_offsets={seqlen_offsets:?}\n"),
         );
 
-        // R2: the compressor (forward_from_xs) must see the *history* of the
-        // attention input during decode, not just the current token. Keep a
-        // per-layer history of `xs` and feed the full history to the
-        // compressed branch; the q/k/v projections below still use the
-        // current `xs`. Reset at sequence start (all seqlen_offsets == 0).
-        let xs_for_compressor = if let Some(hist) = &self.xs_history {
-            let mut h = hist.lock().unwrap();
-            if seqlen_offsets.iter().all(|&o| o == 0) {
-                h.reset();
+        // R2/R3: the compressor (forward_from_xs) must see the *history* of
+        // the attention input during decode, not just the current token. The
+        // history is a per-layer, per-SEQUENCE cache slot in the model's
+        // NormalCache (indices `num_hidden_layers..`), threaded in by
+        // `DeepSeekV4::forward`. Because it lives in the same cache vector as
+        // the KV entries, the engine's NormalCacheManager clone_in/clone_out
+        // batches it along dim 0 and splits it back per sequence — so
+        // multi-sequence batches (Arc Boost `n_votes` voting chains) each keep
+        // their own history instead of colliding in one shared buffer (R3;
+        // previously a per-model `Mutex<SingleCache>` that crashed/mis-sliced
+        // on batch>1 with divergent chains). Storage: `k` holds the xs history
+        // `[B, T, hidden]` (seq dim 1); `v` is a `[B, T, 1]` zero marker kept
+        // in lockstep because the cache managers require both sides populated.
+        // Reset at sequence start (all seqlen_offsets == 0), same as before;
+        // the in-layer reset also keeps direct `model.forward` callers
+        // (tests / SDK) correct without a cache manager. The q/k/v
+        // projections below still use the current `xs`.
+        let xs_for_compressor = match xs_hist_cache {
+            Some(hist) => {
+                if seqlen_offsets.iter().all(|&o| o == 0) {
+                    hist.reset();
+                }
+                let xs3 = xs.contiguous()?;
+                let marker = Tensor::zeros((bs, seq_len, 1), xs3.dtype(), xs3.device())?;
+                let (hist_xs, _marker) = hist.append(&xs3, &marker)?;
+                hist_xs
             }
-            h.append(&xs.contiguous()?)?;
-            h.current_data()?.expect("xs_history present after append")
-        } else {
-            xs.clone()
+            None => xs.clone(),
         };
         // 1. Q projection (LoRA). [B, T, hidden] → [B, T, n_heads*head_dim]
         //    → reshape to [B, n_heads, T, head_dim]. Audit §3.
@@ -2347,12 +2348,14 @@ impl DecoderLayer {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
         seqlen_offsets: &[usize],
         kv_cache: &mut KvCache,
+        xs_hist_cache: Option<&mut KvCache>,
         metadata: Option<(
             (Tensor, Tensor, Option<Tensor>, Option<Tensor>),
             &PagedAttentionInputMetadata,
@@ -2385,6 +2388,7 @@ impl DecoderLayer {
             attention_mask,
             seqlen_offsets,
             kv_cache,
+            xs_hist_cache,
             metadata,
             flash_params,
         )?;
@@ -2437,6 +2441,7 @@ impl DecoderLayer {
         attention_mask: Option<&Tensor>,
         seqlen_offsets: &[usize],
         kv_cache: &mut KvCache,
+        xs_hist_cache: Option<&mut KvCache>,
         metadata: Option<(
             (Tensor, Tensor, Option<Tensor>, Option<Tensor>),
             &PagedAttentionInputMetadata,
@@ -2473,6 +2478,7 @@ impl DecoderLayer {
                 attention_mask,
                 seqlen_offsets,
                 kv_cache,
+                xs_hist_cache,
                 metadata,
                 flash_params,
             )
@@ -2739,6 +2745,9 @@ impl MtpBlock {
             None,
             &seqlen_offsets,
             cache,
+            // MTP block is a Standard layer (`COMPRESS_RATIO_NEXTN_LAYER = 0`)
+            // — no compressor, no xs history.
+            None,
             None,
             &self.flash_params,
             Some(&ids),
@@ -2815,6 +2824,13 @@ pub struct DeepSeekV4 {
     /// `--mtp-depth`) does not cover it. See
     /// `IsqModel::load_mtp_block_from_source`.
     cfg_full: DeepSeekV4Config,
+    /// R3: per-layer slot of the compressor-input history inside the model's
+    /// NormalCache. `xs_hist_slots[i] = Some(j)` means layer `i` (CSA/HCA)
+    /// keeps its xs history at cache index `num_hidden_layers + j`; `None`
+    /// for Standard layers. The history rides the same per-sequence
+    /// clone_in/clone_out machinery as the KV entries, which is what makes
+    /// multi-sequence batches (voting chains) safe.
+    xs_hist_slots: Vec<Option<usize>>,
 }
 
 impl DeepSeekV4 {
@@ -3149,15 +3165,42 @@ impl DeepSeekV4 {
             &normal_loading_metadata.real_device,
         );
 
+        // R3: one extra per-sequence cache slot per CSA/HCA layer holding the
+        // compressor-input history `xs` (`[B, T, hidden]`, seq dim 1). Placed
+        // AFTER the `num_hidden_layers` KV entries so `cache[i]` stays the KV
+        // cache of layer `i`. The engine's NormalCacheManager iterates
+        // `metadata.num_hidden_layers`, which pipelines derive from the CACHE
+        // length — so these extra entries are cloned in/out per sequence
+        // exactly like KV, giving each sequence in a batch its own history.
+        let mut xs_hist_slots = Vec::with_capacity(cfg.num_hidden_layers);
+        let mut n_compress_layers = 0usize;
+        for i in 0..cfg.num_hidden_layers {
+            if cfg.layer_compress_ratio(i) != 0 {
+                xs_hist_slots.push(Some(n_compress_layers));
+                n_compress_layers += 1;
+            } else {
+                xs_hist_slots.push(None);
+            }
+        }
+        let cache = NormalCache::new(cfg.num_hidden_layers, cfg.max_position_embeddings);
+        {
+            let mut guard = cache.lock().unwrap();
+            for _ in 0..n_compress_layers {
+                // Same geometry as the previous per-model xs_history
+                // (`SingleCache::new(1, max_position_embeddings, 256)`):
+                // seq dim 1 over `[B, T, hidden]`, initial capacity 256.
+                guard
+                    .0
+                    .push(KvCache::new_normal(1, cfg.max_position_embeddings, 256));
+            }
+        }
+
         Ok(Self {
             lm_head,
             embed_tokens,
             norm,
             layers,
-            cache: EitherCache::Normal(NormalCache::new(
-                cfg.num_hidden_layers,
-                cfg.max_position_embeddings,
-            )),
+            cache: EitherCache::Normal(cache),
             device: normal_loading_metadata.real_device.clone(),
             max_seq_len: cfg.max_position_embeddings,
             cfg: ModelConfigMetadata {
@@ -3187,6 +3230,7 @@ impl DeepSeekV4 {
             mtp_head,
             mhc_head,
             cfg_full: cfg.clone(),
+            xs_hist_slots,
         })
     }
 
@@ -3220,6 +3264,14 @@ impl DeepSeekV4 {
                 .unwrap_or(true)
         });
         let attention_mask = DeviceMappedMask::new(attention_mask, &*self.mapper)?;
+
+        // R3: split the cache vector into the per-layer KV entries
+        // (`0..num_layers`) and the trailing per-layer compressor-input
+        // histories (`num_layers..`, CSA/HCA layers only; see
+        // `xs_hist_slots`). Two disjoint mutable regions so a layer can
+        // borrow both its KV cache and its xs history at once.
+        let n_layers = self.layers.len();
+        let (layer_caches, xs_caches) = cache.split_at_mut(n_layers);
 
         // RUN-164: 4-D mHC residual threading end-to-end.
         //
@@ -3255,7 +3307,8 @@ impl DeepSeekV4 {
                     &xs_4d,
                     attention_mask.as_ref().map(|m| m.get(xs_4d.device())),
                     seqlen_offsets,
-                    &mut cache[i],
+                    &mut layer_caches[i],
+                    self.xs_hist_slots[i].map(|slot| &mut xs_caches[slot]),
                     metadata
                         .as_ref()
                         .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
@@ -3312,7 +3365,8 @@ impl DeepSeekV4 {
                     &xs,
                     attention_mask.as_ref().map(|m| m.get(xs.device())),
                     seqlen_offsets,
-                    &mut cache[i],
+                    &mut layer_caches[i],
+                    self.xs_hist_slots[i].map(|slot| &mut xs_caches[slot]),
                     metadata
                         .as_ref()
                         .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
