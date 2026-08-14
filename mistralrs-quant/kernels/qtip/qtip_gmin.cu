@@ -90,6 +90,7 @@
 // SM80+ (gated by `has_qtip_kernels` in build.rs).
 
 #include <cstdint>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include "qtip_exact_fp.cuh"
@@ -121,13 +122,50 @@ constexpr unsigned long long GM_KEY_MAX = ~0ull;
 // global-memory latency per position.
 constexpr int GM_WALK_WINDOW = (2 * (int)GM_GROUP_COUNT) / GM_WORDS;   // 16
 
+// ---------------------------------------------------------------------------
+// COMPUTED CODEBOOK (measurement variant — NOT a format we ship)
+// ---------------------------------------------------------------------------
+//
+// The LUT-reading kernel below reads all 65,536 codebook entries per symbol
+// position: 512 KiB of L2 traffic per (row, position), which at 3.23e9
+// row-positions per layer is ~1.7 PB/layer. That term does not shrink with any
+// amount of scheduling work, so a measurement of the exhaustive DP against a
+// LUT answers a question nobody is asking if a computed codebook is on the
+// table. `COMPUTED_CB` replaces the two loads with QTIP's own construction —
+// the same masked-MCG shape `qtip2b_common.cuh::q2b_decode` already ships at
+// K=2/V=1, taking the two fp16 halves of one 32-bit product as the two V=2
+// reproduction values rather than summing them:
+//
+//     x = state * MULT ;  m = (x & 0x8FFF8FFF) ^ 0x3B603B60
+//     (v0, v1) = ( f32(fp16(m >> 16)), f32(fp16(m & 0xFFFF)) )
+//
+// One IMAD + one LOP3 + two H2F for two weights — QTIP's "as few as 2
+// instructions per weight" — and because this kernel's thread mapping walks
+// `state` in steps of 256 for consecutive `i`, the multiply strength-reduces to
+// a single integer add, which is exactly the trick EXL3 uses.
+//
+// ⚠ THIS PRODUCES A DIFFERENT ARTIFACT. A computed codebook is a different set
+// of reproduction values, so the packed output is NOT byte-comparable with the
+// LUT kernels and its quality is unmeasured at this geometry. It exists here to
+// price the L2 term on hardware instead of deriving it, and the bench never
+// includes it in the byte-identity check.
+constexpr uint32_t GM_CB_MULT = 0xCBAC1FEDu;   // EXL3 / qtip2b MCG multiplier
+constexpr uint32_t GM_CB_MASK = 0x8FFF8FFFu;
+constexpr uint32_t GM_CB_XOR  = 0x3B603B60u;
+
+__device__ __forceinline__ void gm_computed_pair(uint32_t prod, float* v0, float* v1) {
+    const uint32_t m = (prod & GM_CB_MASK) ^ GM_CB_XOR;
+    *v0 = __half2float(__ushort_as_half((unsigned short)(m >> 16)));
+    *v1 = __half2float(__ushort_as_half((unsigned short)(m & 0xFFFFu)));
+}
+
 // `WRITE_TRACE == false` is a measurement-only variant: it runs the identical
 // forward DP but emits neither the backtrace nor the packed symbols, which
 // isolates the forward arithmetic from the trace traffic. It must never be
 // reachable from a bake — `launch_qtip_quantize_rows_gmin_f32` only ever
-// instantiates the tracing variants, and the no-trace one is behind the
+// instantiates `<4, true, false>`, and every other instantiation is behind the
 // explicitly-named bench entry point.
-template <int MIN_BLOCKS, bool WRITE_TRACE>
+template <int MIN_BLOCKS, bool WRITE_TRACE, bool COMPUTED_CB>
 __global__ void __launch_bounds__(GM_THREADS, MIN_BLOCKS)
 qtip_quantize_rows_gmin_kernel(
     const float*   __restrict__ weight,      // [n_rows, in_features]
@@ -173,9 +211,19 @@ qtip_quantize_rows_gmin_kernel(
         #pragma unroll
         for (int i = 0; i < GM_GPT; ++i) {
             const unsigned int g = (unsigned int)tid + (unsigned int)(GM_THREADS * i);
-            const float c = (g < GM_ALPHABET)
-                                ? qtip_decode_err_exact(lut, g, t0, t1)
-                                : INFINITY;
+            float c;
+            if (g < GM_ALPHABET) {
+                float l0, l1;
+                if (COMPUTED_CB) {
+                    gm_computed_pair(g * GM_CB_MULT, &l0, &l1);
+                } else {
+                    l0 = lut[(size_t)g * 2u + 0u];
+                    l1 = lut[(size_t)g * 2u + 1u];
+                }
+                c = qtip_decode_err_exact_lv(l0, l1, t0, t1);
+            } else {
+                c = INFINITY;
+            }
             best[i]      = c;
             bm[i]        = 0u;
             s_gmin[0][g] = c;
@@ -197,11 +245,22 @@ qtip_quantize_rows_gmin_kernel(
         // +inf under a strict `<` would produce, and saves a compare per group.
         {
             const float* __restrict__ lp = lut + (size_t)((unsigned int)tid * 2u);
+            const unsigned int prod0 = (unsigned int)tid * GM_CB_MULT;
             #pragma unroll
             for (int i = 0; i < GM_GPT; ++i) {
                 const float cp = sp[qbase + 16u * (unsigned int)i];
-                const float d0 = __fsub_rn(lp[512 * i + 0], t0);
-                const float d1 = __fsub_rn(lp[512 * i + 1], t1);
+                float l0, l1;
+                if (COMPUTED_CB) {
+                    // state advances by GM_THREADS per i, so the multiply
+                    // collapses to one integer add against a folded constant.
+                    gm_computed_pair(prod0 + (unsigned int)(GM_THREADS * i) * GM_CB_MULT,
+                                     &l0, &l1);
+                } else {
+                    l0 = lp[512 * i + 0];
+                    l1 = lp[512 * i + 1];
+                }
+                const float d0 = __fsub_rn(l0, t0);
+                const float d1 = __fsub_rn(l1, t1);
                 const float e  = __fadd_rn(__fmul_rn(d0, d0), __fmul_rn(d1, d1));
                 best[i] = __fadd_rn(e, cp);
                 bm[i]   = 0u;
@@ -215,13 +274,22 @@ qtip_quantize_rows_gmin_kernel(
         // unrolled or they leave registers for local memory.
         #pragma unroll 1
         for (unsigned int m = 1; m < GM_ALPHABET; ++m) {
-            const float* __restrict__ lp =
-                lut + (size_t)(((m << GM_GROUP_BITS) | (unsigned int)tid) * 2u);
+            const unsigned int s_base = (m << GM_GROUP_BITS) | (unsigned int)tid;
+            const float* __restrict__ lp = lut + (size_t)(s_base * 2u);
+            const unsigned int prod0 = s_base * GM_CB_MULT;
             #pragma unroll
             for (int i = 0; i < GM_GPT; ++i) {
                 const float cp = sp[(m << 8) | (qbase + 16u * (unsigned int)i)];
-                const float d0 = __fsub_rn(lp[512 * i + 0], t0);
-                const float d1 = __fsub_rn(lp[512 * i + 1], t1);
+                float l0, l1;
+                if (COMPUTED_CB) {
+                    gm_computed_pair(prod0 + (unsigned int)(GM_THREADS * i) * GM_CB_MULT,
+                                     &l0, &l1);
+                } else {
+                    l0 = lp[512 * i + 0];
+                    l1 = lp[512 * i + 1];
+                }
+                const float d0 = __fsub_rn(l0, t0);
+                const float d1 = __fsub_rn(l1, t1);
                 const float e  = __fadd_rn(__fmul_rn(d0, d0), __fmul_rn(d1, d1));
                 const float c  = __fadd_rn(e, cp);
                 if (c < best[i]) {
@@ -350,18 +418,21 @@ int launch_qtip_quantize_rows_gmin_f32(
     cudaStream_t  stream
 ) {
     if (n_rows <= 0 || num_symbols <= 0) return -1;
-    qtip_quantize_rows_gmin_kernel<4, true><<<n_rows, GM_THREADS, 0, stream>>>(
+    qtip_quantize_rows_gmin_kernel<4, true, false><<<n_rows, GM_THREADS, 0, stream>>>(
         d_weight, d_lut, d_row_scales, d_packed, d_trace,
         in_features, num_symbols, row_offset);
     return 0;
 }
 
 // Bench-only entry point. `variant`:
-//   0 = __launch_bounds__(256, 4), traced   (identical to the production path)
-//   1 = __launch_bounds__(256, 2), traced   (register-pressure A/B)
-//   2 = __launch_bounds__(256, 4), forward DP only, no trace and no pack
-//       (isolates the forward arithmetic from the backtrace traffic; produces
-//        NO valid output and is never reachable from a bake)
+//   0 = LUT codebook, traced, __launch_bounds__(256, 4)  — the production path
+//   1 = LUT codebook, traced, __launch_bounds__(256, 2)  — register A/B
+//   2 = LUT codebook, forward DP only (no trace, no pack) — isolates the
+//       backtrace traffic; produces NO valid output
+//   3 = COMPUTED codebook, traced   — prices the 512 KiB/position L2 term.
+//       DIFFERENT ARTIFACT: not byte-comparable with 0/1/2.
+//   4 = COMPUTED codebook, forward DP only — the floor of the whole design
+// Variants 2-4 are never reachable from a bake.
 int launch_qtip_quantize_rows_gmin_variant_f32(
     const float*  d_weight,
     const float*  d_lut,
@@ -378,17 +449,27 @@ int launch_qtip_quantize_rows_gmin_variant_f32(
     if (n_rows <= 0 || num_symbols <= 0) return -1;
     switch (variant) {
         case 0:
-            qtip_quantize_rows_gmin_kernel<4, true><<<n_rows, GM_THREADS, 0, stream>>>(
+            qtip_quantize_rows_gmin_kernel<4, true, false><<<n_rows, GM_THREADS, 0, stream>>>(
                 d_weight, d_lut, d_row_scales, d_packed, d_trace,
                 in_features, num_symbols, row_offset);
             return 0;
         case 1:
-            qtip_quantize_rows_gmin_kernel<2, true><<<n_rows, GM_THREADS, 0, stream>>>(
+            qtip_quantize_rows_gmin_kernel<2, true, false><<<n_rows, GM_THREADS, 0, stream>>>(
                 d_weight, d_lut, d_row_scales, d_packed, d_trace,
                 in_features, num_symbols, row_offset);
             return 0;
         case 2:
-            qtip_quantize_rows_gmin_kernel<4, false><<<n_rows, GM_THREADS, 0, stream>>>(
+            qtip_quantize_rows_gmin_kernel<4, false, false><<<n_rows, GM_THREADS, 0, stream>>>(
+                d_weight, d_lut, d_row_scales, d_packed, d_trace,
+                in_features, num_symbols, row_offset);
+            return 0;
+        case 3:
+            qtip_quantize_rows_gmin_kernel<4, true, true><<<n_rows, GM_THREADS, 0, stream>>>(
+                d_weight, d_lut, d_row_scales, d_packed, d_trace,
+                in_features, num_symbols, row_offset);
+            return 0;
+        case 4:
+            qtip_quantize_rows_gmin_kernel<4, false, true><<<n_rows, GM_THREADS, 0, stream>>>(
                 d_weight, d_lut, d_row_scales, d_packed, d_trace,
                 in_features, num_symbols, row_offset);
             return 0;

@@ -228,9 +228,15 @@ int main(int argc, char** argv) {
         printf("       beam_w256 fnv1a=%016llx\n", (unsigned long long)fnv1a(host));
     }
 
-    // ---- gmin exhaustive, three variants ----------------------------------
-    const char* names[3] = {"gmin_lb4_traced", "gmin_lb2_traced", "gmin_lb4_notrace"};
-    for (int v = 0; v < 3; ++v) {
+    // ---- gmin exhaustive, five variants -----------------------------------
+    // 0/1 are the shippable LUT kernel (byte-identical to the exhaustive DP);
+    // 2 isolates the backtrace traffic; 3/4 swap in a computed codebook, which
+    // is a DIFFERENT ARTIFACT and is therefore never hashed against 0/1 — it
+    // exists to price the 512 KiB/position L2 term on hardware.
+    const char* names[5] = {"gmin_lut_lb4_traced", "gmin_lut_lb2_traced",
+                            "gmin_lut_lb4_notrace", "gmin_computed_traced",
+                            "gmin_computed_notrace"};
+    for (int v = 0; v < 5; ++v) {
         int rc = launch_qtip_quantize_rows_gmin_variant_f32(
             d_w, d_lut, d_scales, d_packed, d_trace, n_rows, k_in, T, 0, v, 0);
         if (rc != 0) { printf("gmin variant %d refused rc=%d\n", v, rc); continue; }
@@ -247,7 +253,7 @@ int main(int argc, char** argv) {
             if (ms < best) best = ms;
         }
         report(names[v], best, units);
-        if (v != 2) {
+        if (v < 2) {
             CK(cudaMemcpy(host.data(), d_packed, host.size(), cudaMemcpyDeviceToHost));
             printf("       %s fnv1a=%016llx\n", names[v], (unsigned long long)fnv1a(host));
         }
