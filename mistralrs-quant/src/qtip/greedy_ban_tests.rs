@@ -623,6 +623,116 @@ fn beam_width_round_trips_through_uqff_exactly() {
     }
 }
 
+/// **A real beam bake, end to end** (wave14-AK).
+///
+/// `beam_width_round_trips_through_uqff_exactly` above proves the *wire* half:
+/// a width, once set, survives serialize/deserialize. It cannot prove the half
+/// that actually matters — that asking for a beam produces an artifact which
+/// says so — because it stamps a layer that was baked exhaustively. That gap
+/// existed only because `ARC_QTIP_BEAM` is memoised in a `OnceLock`, so no test
+/// could request a search. [`QtipLayer::quantize_with_bake_config`] closes it.
+///
+/// This test bakes the SAME weights three ways through the production door and
+/// asserts on what comes out — the path a mislabelled artifact would have to
+/// travel.
+#[test]
+fn real_beam_bake_at_w256_stamps_the_width_it_ran() {
+    use super::{QtipBakeConfig, TrellisSearch};
+
+    let device = Device::Cpu;
+    // Deterministic Gaussian; this test is about provenance plumbing, not
+    // quality, so the realistic-fixture requirement (D12) is carried by
+    // `search_bench.rs` / `bake_quality_tests.rs`, which is where beam-vs-
+    // exhaustive quality is actually decided.
+    let w = Tensor::from_vec(fixture(8 * 64, 0xB3A3, 0.5), (8usize, 64usize), &device).unwrap();
+
+    let bake = |search: TrellisSearch| {
+        QtipLayer::quantize_with_bake_config(
+            &w,
+            None,
+            &device,
+            QtipMode::Viterbi,
+            true,
+            None,
+            QtipBakeConfig {
+                search,
+                hessian: false,
+            },
+        )
+        .expect("viterbi bake must succeed")
+    };
+
+    let exhaustive = bake(TrellisSearch::Exhaustive);
+    let beam256 = bake(TrellisSearch::Beam { width: 256 });
+
+    // 1. The artifact records the search that ran, not a default.
+    assert_eq!(exhaustive.search_detail(), QtipSearchDetail::EXHAUSTIVE_MSE);
+    assert_eq!(
+        beam256.search_detail().beam_width(),
+        Some(256),
+        "a W=256 bake must stamp beam(W=256)"
+    );
+    assert_eq!(beam256.search_stamp(), QtipSearchStamp::Trellis);
+
+    // 2. Distinguishable from an exhaustive bake by the bytes alone — the
+    //    property that makes "which search made this checkpoint" answerable
+    //    from a file rather than from a session log nobody kept.
+    let ex_bytes = QuantizedSerde::serialize(&exhaustive).unwrap().into_owned();
+    let beam_bytes = QuantizedSerde::serialize(&beam256).unwrap().into_owned();
+    assert_ne!(
+        beam_bytes, ex_bytes,
+        "a real W=256 beam artifact must not be byte-identical to an exhaustive one"
+    );
+    assert_eq!(provenance_tail(&ex_bytes), (Some(1), 0x00));
+    // A beam artifact's tail is 4 bytes, not 2: `[stamp, flags, width_le…]`.
+    assert_eq!(
+        &beam_bytes[beam_bytes.len() - 4..],
+        &[1u8, 0x01, 0x00, 0x01],
+        "tail must read: trellis stamp, beam bit set, width 256 little-endian"
+    );
+
+    // 3. The width round-trips exactly through UQFF.
+    let (restored, _) =
+        QtipLayer::deserialize_concrete(Cow::Owned(beam_bytes), &device, QuantizeOntoGuard::new())
+            .unwrap();
+    assert_eq!(
+        restored.search_detail(),
+        QtipSearchDetail::Known {
+            beam_width: Some(256),
+            hessian: false
+        }
+    );
+
+    // 4. NON-DEGENERACY (D12): the width must reach the SEARCH, not just the
+    //    stamp. If `bake_cfg.search` were dropped on the floor between the
+    //    caller and `viterbi::quantize_row`, every assertion above would still
+    //    pass — the stamp is derived from the request, so a request that never
+    //    ran would stamp identically. A W=1 beam keeps one state per timestep
+    //    and provably cannot find the exhaustive DP's path on this fixture, so
+    //    differing packed symbols are proof the search actually ran.
+    let beam1 = bake(TrellisSearch::Beam { width: 1 });
+    let packed = |l: &QtipLayer| l.blocks.flatten_all().unwrap().to_vec1::<u8>().unwrap();
+    let (ex_syms, b1_syms) = (packed(&exhaustive), packed(&beam1));
+    let differing = ex_syms.iter().zip(&b1_syms).filter(|(a, b)| a != b).count();
+    assert!(
+        differing > 0,
+        "a W=1 beam must pack different symbols than the exhaustive DP over \
+         {} bytes — identical output means the requested width never reached \
+         the trellis search and the beam stamp is decorative",
+        ex_syms.len()
+    );
+    assert_eq!(beam1.search_detail().beam_width(), Some(1));
+
+    // 5. And the env-driven production door is untouched: with no
+    //    `ARC_QTIP_BEAM` set in this process, the default config is exhaustive.
+    assert_eq!(
+        QtipBakeConfig::default().search,
+        TrellisSearch::Exhaustive,
+        "the default bake is the exhaustive DP; the override door must not \
+         change what production picks"
+    );
+}
+
 /// A self-contradictory or uninterpretable provenance claim is REFUSED, never
 /// normalised into a plausible one. Reading a malformed claim as "exhaustive"
 /// is exactly how a mislabelled artifact would get laundered into a trusted one.

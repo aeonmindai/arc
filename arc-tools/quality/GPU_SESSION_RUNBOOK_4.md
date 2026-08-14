@@ -8,12 +8,16 @@ bottom.
 
 **Branch model:** the box checks out **`session4-runbook`** (= master ≥ PR #17
 + this harness + the batch-curve bench + the session-2 Rust patches as files)
-and applies the three `arc-tools/quality/patches/s2_*.patch` files before the
-one build of the session. The patches are the PR #11 deltas — MTP acceptance
-telemetry, `ARC_QTIP_ROTATION_SEED`, perplexity `--dump-logprobs` — which are
-**NOT on master** (root cause of the session-3 MTP acceptance miss, see step
-6). All three are pre-verified to `git apply` cleanly against master
-`381063914` (post-#17).
+and applies the remaining `arc-tools/quality/patches/s2_*.patch` files before
+the one build of the session: `ARC_QTIP_ROTATION_SEED` and perplexity
+`--dump-logprobs`, which are **NOT on master**. Both are pre-verified to
+`git apply` cleanly against master `381063914` (post-#17).
+
+> **The MTP acceptance telemetry patch is GONE — do not look for it.** It is
+> **on master** as of wave14-AK: `record_acceptance` emits the periodic line
+> itself under `ARC_MTP_LOG_ACCEPTANCE=1`, covered by CPU tests in
+> `mtp_pipeline.rs`. `s2_mtp_acceptance_telemetry.patch` was deleted with that
+> change; re-applying a copy of it on top of master would conflict. See step 6.
 
 **What this session produces** (in `arc-tools/quality/results/` on the box):
 `speed_s4_baseline.json`, `speed_s4_tuned.json` (+`gemv_tune_winners` table +
@@ -215,10 +219,10 @@ export ARC=/mnt/work/arc V4_DIR=/mnt/models/DeepSeek-V4-Flash
 export Q=$ARC/arc-tools/quality
 cd $ARC
 git log --oneline -1                       # must be session4-runbook tip (>= 381063914 master)
-git apply arc-tools/quality/patches/s2_mtp_acceptance_telemetry.patch
+# MTP acceptance telemetry is ON MASTER (wave14-AK) — no patch to apply.
 git apply arc-tools/quality/patches/s2_rotation_seed_override.patch
 git apply arc-tools/quality/patches/s2_ppl_dump_logprobs.patch
-git diff --stat | tail -4                  # 3 files changed — record in the log
+git diff --stat | tail -4                  # 2 files changed — record in the log
 # cudnn feature: −62% decode on V4 (5.45 vs 14.58 tok/s), see session-4 — NEVER add it
 cargo build --release --features "cuda flash-attn" 2>&1 | tail -3
 cargo build --release -p mistralrs --example perplexity --features "cuda flash-attn" 2>&1 | tail -3
@@ -499,12 +503,14 @@ python3 $Q/run_gsm8k.py --n 100 --max-tokens 2048 --votes 5 --eight-shot \
 
 ## Step 6 — MTP acceptance, self-verifying (25m) — OBJECTIVE 2
 
-Why session 3 produced nothing: master's `log_acceptance_rate()` has **zero
-call sites** — the counters accumulate but no serve-path code ever logs
-them, so `grep "MTP acceptance"` could never match, and the chain's probe
-step silently produced no artifact. The periodic logger is PR #11's
-env-gated patch (`s2_mtp_acceptance_telemetry.patch`) — applied in step 1,
-so THIS build has it. Every sub-step below verifies before spending.
+Why session 3 produced nothing: `log_acceptance_rate()` had **zero call
+sites** — the counters accumulated but no serve-path code ever logged them,
+so `grep "MTP acceptance"` could never match, and the chain's probe step
+silently produced no artifact. **Fixed permanently on master (wave14-AK):**
+`record_acceptance` now emits the line itself every 64 proposed tokens when
+`ARC_MTP_LOG_ACCEPTANCE=1`, with CPU tests pinning the cadence, the reported
+ratio, and that the line reaches `tracing` at all. Nothing to patch — any
+build off master has it. Every sub-step below still verifies before spending.
 
 ```bash
 kill $SERVE_PID; sleep 10
@@ -729,7 +735,7 @@ the money.
 | 2-D mis-map warn | `…quantizing a NxK weight on the CPU Viterbi/greedy pipeline…` (≥4M weights) | PR #17, `warn_big_cpu_2d_quantize` |
 | s2-binary pivot commit | `cca7a9c2e` (session-2 master = merge PR #10; pre-#12..#15) | wave6-Q window reconstruction |
 | MTP flag + lines | `--mtp-depth 0..=8`; engaged: `MTP speculative decode engaged (depth=N)`; missing head: `MTP requested (depth=N) but the loaded model has no MTP head` | `mistralrs-cli/src/args/mod.rs:437-440`, `pipeline/mtp_pipeline.rs try_wrap_pipeline_with_mtp` |
-| MTP telemetry | `ARC_MTP_LOG_ACCEPTANCE=1` → `MTP acceptance rate: X% (a/p accepted)` per 64 proposed — **patch-only** (`s2_mtp_acceptance_telemetry.patch`); master's `log_acceptance_rate()` has NO call sites (session-3 root cause) | patch file (applies clean to `381063914`); grep of master |
+| MTP telemetry | `ARC_MTP_LOG_ACCEPTANCE=1` → `MTP acceptance rate: X% (a/p accepted)` per 64 proposed — **ON MASTER** since wave14-AK; the patch file is deleted, do not re-apply it. Off by default; counters are the raw accept/reject tallies, not an estimate (D9) | `mistralrs-core/src/pipeline/mtp_pipeline.rs` (`AcceptanceTelemetry`, `record_acceptance`); tests `acceptance_*` in that file |
 | Rotation seed | `ARC_QTIP_ROTATION_SEED=<u64\|0xhex>` → `QTIP rotation seed overridden: …` — **patch-only** (`s2_rotation_seed_override.patch`); decode reads STORED signs, so bakes stay self-consistent | patch file (applies clean); `qtip/mod.rs rotation_seed()` |
 | Logprob dump | `perplexity … --dump-logprobs <path>` — **patch-only** (`s2_ppl_dump_logprobs.patch`) | patch file (applies clean) |
 | GEMV autotune | MERGED (PR #19) + session-4 winners BAKED as dispatch defaults (v21 `w4_r2_i1_v2` for gate/up, v6 `w8_r4_i1_v2` for down); example `qtip_gemv_tune` ends with `WINNER_TABLE_WRITTEN: <path>` (parse it, never glob); serve-env `ARC_QTIP_TUNE_TABLE=<path>` overrides the baked table, no recompile | `mistralrs-quant/src/qtip/tune.rs`, `examples/qtip_gemv_tune.rs` |

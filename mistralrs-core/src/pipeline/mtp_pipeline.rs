@@ -539,6 +539,126 @@ impl MtpDecodeKit {
     }
 }
 
+/// Log the running MTP acceptance rate once per this many **proposed** tokens.
+///
+/// 64 proposals is ~32 decode steps at depth 2 — a line every few seconds at
+/// single-digit tok/s, which is enough resolution to watch acceptance settle
+/// without flooding the serve log. This is the cadence the session-2/4 runbooks
+/// document (`per 64 proposed`), so changing it invalidates their expected
+/// output.
+const ACCEPTANCE_LOG_EVERY_PROPOSED: usize = 64;
+
+/// `ARC_MTP_LOG_ACCEPTANCE=1` (also `true` / `on`) — env gate for the periodic
+/// acceptance-rate line in the serve log.
+///
+/// Read once per process into a `OnceLock`: `record_acceptance` runs on every
+/// verify, which is the decode hot path, and it must not do an env lookup per
+/// token. The name is load-bearing — GPU-session runbooks and
+/// `arc-tools/quality/qlib.py` both reference this exact variable.
+fn acceptance_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("ARC_MTP_LOG_ACCEPTANCE").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        )
+    })
+}
+
+/// Proposed/accepted tallies for MTP speculative decode, plus the env-gated
+/// periodic report that makes them visible from a serve log.
+///
+/// Split out of [`MtpSpeculativePipeline`] so the telemetry is testable on CPU
+/// without standing up a target `dyn Pipeline`. Before this existed,
+/// `log_acceptance_rate()` had **zero callers** anywhere in the workspace: the
+/// counters accumulated and nothing ever read them, so GPU session 3 measured
+/// MTP acceptance and produced an empty artifact.
+///
+/// Honesty (DOCTRINE D9): the reported rate is `accepted / proposed` exactly as
+/// counted at the accept/reject site in `step_mtp`. It is never derived from
+/// throughput, depth, or any other proxy — if the counters are wrong the number
+/// is wrong, and there is no smoothing to hide that.
+#[derive(Debug, Default)]
+pub(crate) struct AcceptanceTelemetry {
+    accepted: std::sync::atomic::AtomicUsize,
+    proposed: std::sync::atomic::AtomicUsize,
+}
+
+impl AcceptanceTelemetry {
+    /// `(accepted, proposed)` as currently counted.
+    fn snapshot(&self) -> (usize, usize) {
+        use std::sync::atomic::Ordering;
+        (
+            self.accepted.load(Ordering::Relaxed),
+            self.proposed.load(Ordering::Relaxed),
+        )
+    }
+
+    fn reset(&self) {
+        use std::sync::atomic::Ordering;
+        self.accepted.store(0, Ordering::Relaxed);
+        self.proposed.store(0, Ordering::Relaxed);
+    }
+
+    /// Accumulate one verify result; return `true` when this call carried the
+    /// running proposed total across a multiple of `every`, i.e. when the
+    /// caller should emit the periodic report.
+    ///
+    /// The boundary test uses the pre-add total returned by `fetch_add`, so
+    /// each proposed token belongs to exactly one caller's interval and
+    /// concurrent recorders cannot both claim (or both miss) a boundary.
+    /// `every == 0` disables reporting rather than dividing by zero.
+    fn accumulate(&self, proposed: usize, accepted: usize, every: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        let before = self.proposed.fetch_add(proposed, Ordering::Relaxed);
+        self.accepted.fetch_add(accepted, Ordering::Relaxed);
+        if every == 0 || proposed == 0 {
+            return false;
+        }
+        (before + proposed) / every != before / every
+    }
+
+    /// The exact line the periodic report emits, as a string, so a test can
+    /// assert on the reported ratio without parsing log plumbing.
+    // The crate denies `cast_precision_loss`; here the casts are on token
+    // counts that would need >2^53 proposals to lose a bit, and the value is
+    // printed to one decimal place.
+    #[allow(clippy::cast_precision_loss)]
+    fn report_line(&self) -> String {
+        let (accepted, proposed) = self.snapshot();
+        if proposed == 0 {
+            return "MTP acceptance: 0 proposals so far".to_string();
+        }
+        format!(
+            "MTP acceptance rate: {:.1}% ({accepted}/{proposed} accepted)",
+            100.0 * accepted as f64 / proposed as f64
+        )
+    }
+
+    /// Emit the report unconditionally (the manual `log_acceptance_rate` door).
+    fn log(&self) {
+        tracing::info!(target: "mtp_speculative", "{}", self.report_line());
+    }
+
+    /// Accumulate, and emit the periodic report if this call crossed a
+    /// reporting boundary **and** `enabled`.
+    ///
+    /// `enabled` is a parameter rather than a direct [`acceptance_log_enabled`]
+    /// call so the wiring is exercisable from a test: the env gate is memoised
+    /// process-wide (correctly — it is on the decode hot path), which would
+    /// otherwise make "does the logger actually fire" untestable.
+    fn record_gated(&self, proposed: usize, accepted: usize, enabled: bool) {
+        if self.accumulate(proposed, accepted, ACCEPTANCE_LOG_EVERY_PROPOSED) && enabled {
+            self.log();
+        }
+    }
+
+    /// Production entry: accumulate and report under `ARC_MTP_LOG_ACCEPTANCE`.
+    fn record(&self, proposed: usize, accepted: usize) {
+        self.record_gated(proposed, accepted, acceptance_log_enabled());
+    }
+}
+
 /// MTP-accelerated decode pipeline.
 ///
 /// Wraps a target [`Pipeline`] (must expose [`MtpDecodeKit`] via its
@@ -558,10 +678,8 @@ pub struct MtpSpeculativePipeline {
     kit: MtpDecodeKit,
     metadata: Arc<GeneralMetadata>,
     category: ModelCategory,
-    /// Running tally of accepted MTP tokens for acceptance-rate logging.
-    accepted_count: std::sync::atomic::AtomicUsize,
-    /// Running tally of proposed MTP tokens.
-    proposed_count: std::sync::atomic::AtomicUsize,
+    /// Running proposed/accepted tallies plus the env-gated periodic report.
+    acceptance: AcceptanceTelemetry,
     /// Persistent per-sequence draft KV caches (audit finding 2). Keyed by
     /// `Sequence::id`. Bounded by [`Self::MAX_DRAFT_KV_SEQS`] — an entry is
     /// one decoder layer's KV for one sequence.
@@ -619,8 +737,7 @@ impl MtpSpeculativePipeline {
             kit,
             metadata,
             category,
-            accepted_count: std::sync::atomic::AtomicUsize::new(0),
-            proposed_count: std::sync::atomic::AtomicUsize::new(0),
+            acceptance: AcceptanceTelemetry::default(),
             draft_kv: std::sync::Mutex::new(std::collections::HashMap::new()),
             draft_kv_clock: AtomicUsize::new(0),
             warned_unprimed: std::sync::atomic::AtomicBool::new(false),
@@ -650,8 +767,7 @@ impl MtpSpeculativePipeline {
             kit,
             metadata,
             category,
-            accepted_count: std::sync::atomic::AtomicUsize::new(0),
-            proposed_count: std::sync::atomic::AtomicUsize::new(0),
+            acceptance: AcceptanceTelemetry::default(),
             draft_kv: std::sync::Mutex::new(std::collections::HashMap::new()),
             draft_kv_clock: AtomicUsize::new(0),
             warned_unprimed: std::sync::atomic::AtomicBool::new(false),
@@ -669,41 +785,23 @@ impl MtpSpeculativePipeline {
     /// `accepted as f64 / proposed as f64`. Used by `Self::log_acceptance_rate`
     /// and exposed for tests / metrics.
     pub fn acceptance_counters(&self) -> (usize, usize) {
-        (
-            self.accepted_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-            self.proposed_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-        )
+        self.acceptance.snapshot()
     }
 
     /// Reset the MTP acceptance counters.
     pub fn reset_acceptance_counters(&self) {
-        self.accepted_count
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-        self.proposed_count
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.acceptance.reset();
     }
 
     /// Log the current acceptance rate at `info` level. Safe to call from any
     /// thread.
+    ///
+    /// The decode path does not need to call this by hand: `record_acceptance`
+    /// emits the same line every [`ACCEPTANCE_LOG_EVERY_PROPOSED`] proposed
+    /// tokens when `ARC_MTP_LOG_ACCEPTANCE=1`. This remains the door for a
+    /// one-off report (e.g. at the end of a benchmark run).
     pub fn log_acceptance_rate(&self) {
-        let (accepted, proposed) = self.acceptance_counters();
-        if proposed == 0 {
-            tracing::info!(
-                target: "mtp_speculative",
-                "MTP acceptance: 0 proposals so far"
-            );
-            return;
-        }
-        let rate = accepted as f64 / proposed as f64;
-        tracing::info!(
-            target: "mtp_speculative",
-            "MTP acceptance rate: {:.1}% ({}/{} accepted)",
-            rate * 100.0,
-            accepted,
-            proposed
-        );
+        self.acceptance.log();
     }
 
     /// Run one MTP draft chain (greedy, depth ≤ self.depth) against a caller-
@@ -734,11 +832,15 @@ impl MtpSpeculativePipeline {
     }
 
     /// Record acceptance counters from a verify result.
+    ///
+    /// With `ARC_MTP_LOG_ACCEPTANCE=1` on the serve process, this also emits
+    /// the running rate every [`ACCEPTANCE_LOG_EVERY_PROPOSED`] proposed
+    /// tokens, so a GPU session can read MTP acceptance out of the serve log
+    /// with `grep "MTP acceptance"`. Off by default — the counters otherwise
+    /// have no caller-facing sink, which is exactly how session 3 measured
+    /// acceptance and got an empty artifact.
     pub(crate) fn record_acceptance(&self, proposed: usize, accepted: usize) {
-        self.proposed_count
-            .fetch_add(proposed, std::sync::atomic::Ordering::Relaxed);
-        self.accepted_count
-            .fetch_add(accepted, std::sync::atomic::Ordering::Relaxed);
+        self.acceptance.record(proposed, accepted);
     }
 
     /// Cap on retained per-sequence draft KV caches. Each is one decoder
@@ -1876,15 +1978,186 @@ mod tests {
         Ok(())
     }
 
-    /// Acceptance-counter recording and snapshot work correctly.
+    // -----------------------------------------------------------------------
+    // MTP acceptance telemetry (wave14-AK)
+    // -----------------------------------------------------------------------
+    //
+    // `log_acceptance_rate()` had ZERO callers in the workspace and nothing in
+    // Rust read `ARC_MTP_LOG_ACCEPTANCE`, so GPU session 3 measured MTP
+    // acceptance and produced an empty artifact; sessions 4+ carried a patch
+    // file re-applied by hand every time. These tests are what makes the wiring
+    // permanent: the cadence, the honesty of the reported ratio, and the fact
+    // that the line actually reaches `tracing`.
+
+    /// Capture `tracing` output into a shared buffer so a test can assert that
+    /// a log line was *actually emitted*, not merely that a predicate returned
+    /// true.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capture buffer poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `f` with a thread-local `tracing` subscriber and return everything
+    /// it logged.
+    fn capture_logs(f: impl FnOnce()) -> String {
+        let writer = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = writer.0.lock().expect("capture buffer poisoned").clone();
+        String::from_utf8(bytes).expect("tracing output is UTF-8")
+    }
+
+    /// Counters accumulate exactly what the verify site hands them, and the
+    /// snapshot reads back `(accepted, proposed)` in that order.
     #[test]
     fn acceptance_counters_increment() {
-        let target = std::sync::atomic::AtomicUsize::new(0);
-        let counts = std::sync::atomic::AtomicUsize::new(0);
-        target.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
-        counts.fetch_add(3, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(target.load(std::sync::atomic::Ordering::Relaxed), 2);
-        assert_eq!(counts.load(std::sync::atomic::Ordering::Relaxed), 3);
+        let tel = AcceptanceTelemetry::default();
+        assert_eq!(tel.snapshot(), (0, 0));
+        tel.record_gated(2, 1, false);
+        tel.record_gated(2, 2, false);
+        assert_eq!(
+            tel.snapshot(),
+            (3, 4),
+            "snapshot is (accepted, proposed) = (1+2, 2+2)"
+        );
+        tel.reset();
+        assert_eq!(tel.snapshot(), (0, 0));
+    }
+
+    /// The report fires once per [`ACCEPTANCE_LOG_EVERY_PROPOSED`] proposed
+    /// tokens — no more, no less — including when a chain straddles the
+    /// boundary rather than landing on it.
+    #[test]
+    fn acceptance_report_fires_once_per_log_period() {
+        // Depth 2: 64 proposals = 32 steps, so the first 31 must be silent.
+        let tel = AcceptanceTelemetry::default();
+        for step in 1..=31 {
+            assert!(
+                !tel.accumulate(2, 1, ACCEPTANCE_LOG_EVERY_PROPOSED),
+                "step {step} (total {} proposed) is inside the first period",
+                step * 2
+            );
+        }
+        assert!(
+            tel.accumulate(2, 1, ACCEPTANCE_LOG_EVERY_PROPOSED),
+            "the step that carries the total to 64 must report"
+        );
+
+        // Depth 3 never lands exactly on 64 (64/3 is not an integer), so the
+        // boundary is *straddled*: 63 -> 66. A naive `total % every == 0` test
+        // would report zero times here, which is the shape of bug that makes a
+        // telemetry hook look wired while producing nothing.
+        let tel = AcceptanceTelemetry::default();
+        let fires = (0..300).filter(|_| tel.accumulate(3, 2, 64)).count();
+        assert_eq!(tel.snapshot(), (600, 900));
+        assert_eq!(fires, 900 / 64, "900 proposed tokens = 14 whole periods");
+
+        // A single oversized batch crosses several periods at once and still
+        // reports exactly once — the report is periodic, not per-period.
+        let tel = AcceptanceTelemetry::default();
+        assert!(tel.accumulate(1000, 500, 64));
+        assert!(!tel.accumulate(0, 0, 64), "an empty verify reports nothing");
+
+        // `every == 0` disables reporting instead of dividing by zero.
+        let tel = AcceptanceTelemetry::default();
+        assert!(!tel.accumulate(64, 32, 0));
+    }
+
+    /// The reported rate is proposed-vs-accepted **as counted** (DOCTRINE D9),
+    /// carrying both raw numbers so the reader can check the arithmetic — not
+    /// a derived or smoothed estimate.
+    #[test]
+    fn acceptance_report_states_the_counted_ratio() {
+        let tel = AcceptanceTelemetry::default();
+        assert_eq!(
+            tel.report_line(),
+            "MTP acceptance: 0 proposals so far",
+            "with no proposals there is no rate to report, and 0/0 must not be \
+             printed as 0% or NaN"
+        );
+
+        // 65 depth-2 chains: 26 fully accepted, 39 half accepted.
+        // 130 proposed / 91 accepted = exactly 70.0%.
+        for _ in 0..26 {
+            tel.record_gated(2, 2, false);
+        }
+        for _ in 0..39 {
+            tel.record_gated(2, 1, false);
+        }
+        let (accepted, proposed) = tel.snapshot();
+        assert_eq!((accepted, proposed), (91, 130));
+        let line = tel.report_line();
+        assert_eq!(line, "MTP acceptance rate: 70.0% (91/130 accepted)");
+        // The raw counters are in the line, so the percentage is auditable
+        // rather than something the reader has to trust.
+        assert!(line.contains(&format!("{accepted}/{proposed}")), "{line}");
+    }
+
+    /// **The wiring gate.** The line must reach `tracing` from
+    /// `record_acceptance`'s code path when the gate is on, and must not when
+    /// it is off. This is the assertion whose absence cost session 3 its MTP
+    /// number: the counters were fine; nothing ever logged them.
+    #[test]
+    fn acceptance_logger_fires_from_the_record_path_only_when_gated_on() {
+        // Gate ON: 32 depth-2 verifies = 64 proposed = one report.
+        let tel = AcceptanceTelemetry::default();
+        let logs = capture_logs(|| {
+            for _ in 0..32 {
+                tel.record_gated(2, 1, true);
+            }
+        });
+        assert_eq!(
+            logs.matches("MTP acceptance rate").count(),
+            1,
+            "exactly one periodic report over 64 proposed tokens; got:\n{logs}"
+        );
+        assert!(
+            logs.contains("MTP acceptance rate: 50.0% (32/64 accepted)"),
+            "the emitted line must carry the counted ratio; got:\n{logs}"
+        );
+
+        // Gate OFF: identical traffic, no output. (Counters still accumulate —
+        // `log_acceptance_rate()` and `acceptance_counters()` stay useful.)
+        let tel = AcceptanceTelemetry::default();
+        let logs = capture_logs(|| {
+            for _ in 0..32 {
+                tel.record_gated(2, 1, false);
+            }
+        });
+        assert!(
+            !logs.contains("MTP acceptance"),
+            "the report must stay off by default; got:\n{logs}"
+        );
+        assert_eq!(tel.snapshot(), (32, 64));
+
+        // The manual door still works regardless of the gate.
+        let logs = capture_logs(|| tel.log());
+        assert!(
+            logs.contains("MTP acceptance rate: 50.0% (32/64 accepted)"),
+            "log_acceptance_rate must report on demand; got:\n{logs}"
+        );
     }
 
     /// `MtpDecodeKit` Debug doesn't panic.
