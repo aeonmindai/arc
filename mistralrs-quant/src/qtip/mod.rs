@@ -57,6 +57,8 @@ use crate::{
 
 #[cfg(test)]
 mod bake_quality_tests;
+#[cfg(test)]
+mod greedy_ban_tests;
 pub mod bitshift;
 #[cfg(feature = "cuda")]
 mod cuda_ops;
@@ -471,6 +473,12 @@ pub struct QtipLayer {
     rotation_signs: Option<Tensor>,
     /// Block size for the block-diagonal Hadamard rotation. 0 when disabled.
     rotation_block: usize,
+    /// Which trellis search produced these blocks. Serialized into UQFF from
+    /// 0.3.0 and checked at load (DOCTRINE D4 §3) so a greedy bake can never
+    /// again pass itself off as Viterbi. Deliberately has no `Default`: every
+    /// construction site must state provenance, and payloads loaded from a
+    /// format that cannot carry it say [`QtipSearchStamp::Unstamped`].
+    search: QtipSearchStamp,
 }
 
 /// Borrowed, dequantization-free view of a [`QtipLayer`]'s packed trellis
@@ -515,18 +523,41 @@ impl QtipLayer {
     }
 }
 
-/// Quantization mode for QTIP.
-#[derive(Debug, Clone, Copy, Default)]
+/// Trellis search that produced (or will produce) a QTIP payload.
+///
+/// **`Greedy` is banned in production — DOCTRINE D4, "ban greedy forever".**
+/// It survives as an enum variant for exactly one reason: unit tests need a
+/// cheap search (an exhaustive trellis pass over even a modest fixture is
+/// ~8.5G ops — wave1-B), and deleting the variant would delete the reference
+/// implementation the Viterbi optimality tests compare against.
+///
+/// Every door into the quantizer refuses it:
+///
+/// | entry point | Greedy accepted? |
+/// |---|---|
+/// | ISQ dispatch (`--isq qtip2` / `qtip2b`, `unquantized/mod.rs`) | never — hard-wired to [`QtipMode::default_expert_mode`] |
+/// | `quantize` / `quantize_with_mode` (the production door) | never — hard error in **every** build |
+/// | `quantize_with_options*` / `quantize_with_calibration` (the fixture door) | only under `cfg!(test)`, i.e. only inside this crate's own test binaries |
+/// | UQFF load | never — a `Greedy` stamp is refused outright, see [`QtipSearchStamp`] |
+///
+/// So the ONLY route to a greedy-quantized layer is a direct
+/// `quantize_with_options*(.., QtipMode::Greedy, ..)` call compiled with
+/// `cfg(test)` inside `mistralrs-quant`. There is no env var, no CLI flag, no
+/// config field and no serde path anywhere in the workspace that reaches it,
+/// and a release build of this crate hard-errors before emitting a single
+/// greedy symbol. There is deliberately no `Default` impl: a defaulted search
+/// mode is how greedy escaped the first time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QtipMode {
     /// Fast but suboptimal: at each position, pick the locally-best symbol given the current state.
     /// ~5-10× faster than Viterbi at calibration time, with ~3× higher reconstruction error.
     ///
-    /// Default kept as Greedy because most existing callers (and any
-    /// pre-RUN-158 quantized checkpoints) expect the no-rotation format.
-    /// RUN-158 wires Viterbi + Hadamard incoherence rotation into the
-    /// forward path and shows ≥0.95 matmul cos sim; callers that want the
-    /// Cornell-quality numbers should opt in via `quantize_with_mode`.
-    #[default]
+    /// **BANNED in production (D4).** Measured cost on the realistic
+    /// FP4-lattice fixtures that match V4's expert source chain: matmul cos
+    /// 0.675 (greedy, no rotation) / 0.887 (greedy + rotation) vs 0.963
+    /// (Viterbi + rotation). It is also *cheaper at inference* when it
+    /// disables rotation, so a greedy artifact reports inflated speed as well
+    /// as degraded quality — there is no metric it is honest on.
     Greedy,
     /// Globally optimal symbol sequence via dynamic-programming search over the trellis.
     /// Matches Cornell's paper numbers; slower at calibration time but quantization is one-shot.
@@ -534,29 +565,49 @@ pub enum QtipMode {
 }
 
 impl QtipMode {
-    /// The mode the production ISQ path (`--isq qtip2`) uses for 3-D MoE
-    /// expert stacks. This is THE bake-quality decision point: Greedy also
-    /// disables the Hadamard incoherence rotation (`quantize_with_mode`), so
-    /// this choice controls search quality AND incoherence processing for
-    /// essentially all of a MoE model's weight mass.
+    /// The mode every production bake uses, for 3-D MoE expert stacks and for
+    /// plain 2-D linears alike. **Always Viterbi** — there is no env var and
+    /// no argument that changes it (D4).
     ///
-    /// Default: **Viterbi** (wave3-G fix). The previous Greedy default baked
-    /// every expert with greedy walk + NO rotation + max/3 scales and was the
-    /// root cause of PPL qtip2=58.85 vs q2k=22.50 (H200, 2026-08-13): on
-    /// realistic FP4-lattice heavy-tailed fixtures the greedy/no-rotation
-    /// path reaches matmul cos ≈0.68-0.80 vs ≥0.96 for Viterbi+rotation
-    /// (see `bake_quality_tests`). GPU Viterbi keeps the bake in the 7-20 min
-    /// budget (RUN-161 prefix-grouped kernel), so speed is no longer a reason
-    /// to default to Greedy.
-    ///
-    /// `ARC_QTIP_EXPERT_GREEDY=1` opts back into the fast low-quality bake
-    /// (smoke tests only). `ARC_QTIP_EXPERT_VITERBI` remains accepted as a
-    /// no-op for runbook compatibility.
-    pub fn default_expert_mode() -> Self {
-        if std::env::var_os("ARC_QTIP_EXPERT_GREEDY").is_some() {
-            QtipMode::Greedy
-        } else {
-            QtipMode::Viterbi
+    /// History: this used to read `ARC_QTIP_EXPERT_GREEDY`. That knob is gone.
+    /// The greedy default it guarded baked every V4 expert with greedy walk +
+    /// NO rotation + max/3 scales and was the root cause of PPL qtip2=58.85 vs
+    /// q2k=22.50 (H200, 2026-08-13). GPU Viterbi keeps the bake inside the
+    /// 7-20 min budget (RUN-161 prefix-grouped kernel), so speed was never a
+    /// reason to default to greedy — it was only ever a reason to fix the fast
+    /// path. `ARC_QTIP_EXPERT_VITERBI` is still accepted as a no-op so old
+    /// runbook invocations do not fail.
+    pub const fn default_expert_mode() -> Self {
+        QtipMode::Viterbi
+    }
+
+    /// **The production door.** Refuses `Greedy` in every build, tests
+    /// included, so a test can assert the ban holds and no in-crate caller can
+    /// smuggle greedy through a production entry point.
+    pub fn deny_greedy(self, entry_point: &str) -> Result<()> {
+        match self {
+            QtipMode::Viterbi => Ok(()),
+            QtipMode::Greedy => candle_core::bail!(
+                "{entry_point}: QtipMode::Greedy is banned in production (DOCTRINE D4). \
+                 Greedy costs ~0.29 matmul cosine on FP4-lattice experts (0.675 vs 0.963) \
+                 and silently disables the Hadamard incoherence rotation. There is no flag \
+                 to re-enable it: if a bake is too slow, fix the fast path — do not \
+                 downgrade the artifact. Tests that need a cheap search construct it \
+                 directly via `quantize_with_options*` under `cfg(test)`."
+            ),
+        }
+    }
+
+    /// **The fixture door.** Refuses `Greedy` in every build EXCEPT this
+    /// crate's own `cfg(test)` binaries, where a cheap search is a legitimate
+    /// fixture. `cfg!(test)` is false for every downstream crate and for every
+    /// release build, so this is a structural ban rather than a documented
+    /// convention.
+    pub fn deny_greedy_outside_tests(self, entry_point: &str) -> Result<()> {
+        match self {
+            QtipMode::Viterbi => Ok(()),
+            QtipMode::Greedy if cfg!(test) => Ok(()),
+            QtipMode::Greedy => self.deny_greedy(entry_point),
         }
     }
 
@@ -662,39 +713,252 @@ fn log_bake_header(
     }
 }
 
+/// Whether the Hadamard incoherence rotation is applied to a bake.
+///
+/// Split out from [`QtipMode`] deliberately (wave13-AG). Rotation used to be a
+/// *side effect* of the search mode: `matches!(mode, QtipMode::Viterbi)`,
+/// written independently in three places. A `matches!` test silently answers
+/// "off" for any mode variant added later — exactly the defect class that
+/// produced PPL 58.85, where a bake lost the search AND the incoherence
+/// processing at once and nothing in the code said so out loud.
+///
+/// [`QtipRotation::for_mode`] is now the single decision point and it is an
+/// exhaustive `match`: a new [`QtipMode`] variant fails to COMPILE until its
+/// rotation policy is stated, instead of silently inheriting "off".
+///
+/// Today's observable behaviour is unchanged (`Greedy → Off`, `Viterbi → On`),
+/// so no checkpoint bytes move; the point is that the decision is now visible
+/// and pinned by `rotation_policy_is_pinned_per_mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QtipRotation {
+    /// Block-diagonal Hadamard incoherence processing ON (D11: the default).
+    On,
+    /// No incoherence processing. Reachable only for test fixtures, since the
+    /// only mode mapped to it is the test-only [`QtipMode::Greedy`].
+    Off,
+}
+
+impl QtipRotation {
+    /// THE rotation policy table. Exhaustive by construction — every mode must
+    /// state its answer here.
+    pub const fn for_mode(mode: QtipMode) -> Self {
+        match mode {
+            // Greedy is a test fixture only (D4). Keeping rotation off holds
+            // the historical fixture bytes and keeps the fixture cheap; it is
+            // NOT a quality trade-off anyone can select in production.
+            QtipMode::Greedy => QtipRotation::Off,
+            // D11: rotation is the default and is data-free, so it holds on any
+            // tenant model with no calibration corpus.
+            QtipMode::Viterbi => QtipRotation::On,
+        }
+    }
+
+    /// Boolean form for the `use_rotation` plumbing.
+    pub const fn enabled(self) -> bool {
+        matches!(self, QtipRotation::On)
+    }
+}
+
+/// Search provenance stamped into every QTIP UQFF payload from UQFF 0.3.0
+/// (DOCTRINE D4 §3: "the format refuses it, not just the CLI").
+///
+/// Greedy escaped three times before this existed, and every escape was
+/// invisible for the same reason: nothing recorded which search produced an
+/// artifact, so a greedy bake could pass itself off as Viterbi indefinitely.
+/// The stamp closes that: provenance travels with the weights.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QtipSearchStamp {
+    /// Trellis dynamic program. Covers both of [`TrellisSearch`]'s arms — the
+    /// exhaustive `2^L` DP and the pruned beam (`ARC_QTIP_BEAM`, wave13-AD),
+    /// which approximates the *same* algorithm: an unpruned beam reproduces
+    /// the exhaustive DP bit-for-bit, and that equivalence is regression-tested
+    /// in `viterbi.rs`. The only search a production bake can emit.
+    ///
+    /// Not recorded: the beam *width*. A narrow beam is a genuinely different
+    /// quality point that this stamp cannot distinguish from the exhaustive
+    /// DP — a flags byte beside the stamp would carry the width and the
+    /// Hessian objective (wave13-AG follow-up).
+    Trellis,
+    /// Greedy walk. Refused at load, unconditionally.
+    Greedy,
+    /// Payload written before UQFF 0.3.0 — it carries no stamp byte, so its
+    /// provenance is unknown. See [`QtipSearchStamp::enforce_at_load`] for the
+    /// legacy policy.
+    Unstamped,
+}
+
+impl QtipSearchStamp {
+    /// Exhaustive mode → stamp mapping (mirrors [`QtipRotation::for_mode`]).
+    pub const fn for_mode(mode: QtipMode) -> Self {
+        match mode {
+            QtipMode::Greedy => QtipSearchStamp::Greedy,
+            QtipMode::Viterbi => QtipSearchStamp::Trellis,
+        }
+    }
+
+    /// Wire byte, or `None` for [`Self::Unstamped`] (which is never written —
+    /// it only ever comes from reading a pre-0.3.0 payload). `0` is reserved
+    /// and invalid so a zero-filled buffer can never read as a valid stamp.
+    pub const fn to_wire(self) -> Option<u8> {
+        match self {
+            QtipSearchStamp::Trellis => Some(1),
+            QtipSearchStamp::Greedy => Some(2),
+            QtipSearchStamp::Unstamped => None,
+        }
+    }
+
+    /// Parse a wire byte written by [`Self::to_wire`].
+    pub fn from_wire(byte: u8) -> Result<Self> {
+        match byte {
+            1 => Ok(QtipSearchStamp::Trellis),
+            2 => Ok(QtipSearchStamp::Greedy),
+            other => candle_core::bail!(
+                "QTIP artifact: unexpected search-stamp byte {other} (expected 1=trellis, 2=greedy)"
+            ),
+        }
+    }
+
+    /// Human tag for logs and errors.
+    pub const fn tag(self) -> &'static str {
+        match self {
+            QtipSearchStamp::Trellis => "trellis",
+            QtipSearchStamp::Greedy => "greedy",
+            QtipSearchStamp::Unstamped => "unstamped(pre-0.3.0)",
+        }
+    }
+
+    /// Load-time gate. Called by both rungs' UQFF deserializers.
+    ///
+    /// Policy:
+    /// * `Trellis` → serve.
+    /// * `Greedy` → **hard refuse, no override.** No build of Arc since the ban
+    ///   can emit this stamp, so its presence means a deliberately doctored or
+    ///   foreign artifact. D4 is absolute.
+    /// * `Unstamped` + **no rotation** → **refuse, overridable.** Every shipped
+    ///   bake policy enabled rotation iff the trellis search ran
+    ///   ([`QtipRotation::for_mode`]), so a pre-0.3.0 payload with
+    ///   `rotation_block == 0` is a greedy bake with very high confidence —
+    ///   this is precisely the artifact class that measured PPL 58.85.
+    /// * `Unstamped` + rotation present → **serve, with a loud one-time warn.**
+    ///   Rotation-on implies the trellis search under every shipped policy, so
+    ///   refusing would brick honest artifacts (e.g. everything baked between
+    ///   PR #20 and this change) for no quality gain. The warn names the file
+    ///   as unverifiable so an operator can choose to re-bake.
+    ///
+    /// `ARC_ALLOW_UNSTAMPED_QTIP=1` downgrades the refuse case to the warn
+    /// case. It is a LOAD-side escape for artifacts that already exist; it
+    /// cannot make a bake produce greedy, and it does not apply to an explicit
+    /// `Greedy` stamp.
+    pub fn enforce_at_load(self, rung: &str, rotation_block: usize) -> Result<()> {
+        match self {
+            QtipSearchStamp::Trellis => Ok(()),
+            QtipSearchStamp::Greedy => candle_core::bail!(
+                "{rung}: refusing a UQFF artifact stamped `greedy`. Greedy-baked weights are \
+                 banned (DOCTRINE D4): measured matmul cos 0.675 vs 0.963 for the trellis \
+                 search on the FP4-lattice experts this rung is built for, and the missing \
+                 incoherence rotation also makes the artifact report inflated decode speed. \
+                 Re-bake with `mistralrs quantize`. There is no override for this case."
+            ),
+            QtipSearchStamp::Unstamped if rotation_block >= 2 => {
+                warn_unstamped_qtip_artifact_once(rung);
+                Ok(())
+            }
+            QtipSearchStamp::Unstamped if allow_unstamped_qtip_artifacts() => {
+                warn_unstamped_qtip_artifact_once(rung);
+                Ok(())
+            }
+            QtipSearchStamp::Unstamped => candle_core::bail!(
+                "{rung}: refusing a pre-UQFF-0.3.0 QTIP artifact that carries no incoherence \
+                 rotation. Under every bake policy Arc has ever shipped, rotation was enabled \
+                 if and only if the trellis search ran, so this artifact was almost certainly \
+                 baked with the banned greedy walk (DOCTRINE D4) — the exact artifact class \
+                 that measured PPL 58.85 vs q2k 22.50. Re-bake with `mistralrs quantize`; \
+                 the new artifact carries a search stamp. To load it anyway for diagnostics, \
+                 set ARC_ALLOW_UNSTAMPED_QTIP=1."
+            ),
+        }
+    }
+}
+
+fn allow_unstamped_qtip_artifacts() -> bool {
+    matches!(
+        std::env::var("ARC_ALLOW_UNSTAMPED_QTIP").as_deref(),
+        Ok("1") | Ok("true") | Ok("on")
+    )
+}
+
+/// One warn per rung per process — a per-layer warn on a 61-layer MoE is noise
+/// that scrolls the useful line off the screen (that is how escape #2 stayed
+/// invisible).
+fn warn_unstamped_qtip_artifact_once(rung: &str) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let mut guard = match seen.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.insert(rung.to_string()) {
+        tracing::warn!(
+            "{rung}: UQFF artifact predates the 0.3.0 search stamp — its trellis search cannot \
+             be verified from the file. Rotation is present, which implies a Viterbi bake under \
+             every policy Arc has shipped, so it is being served. Re-bake to get a verifiable \
+             artifact."
+        );
+    }
+}
+
 impl QtipLayer {
-    /// Quantize an unquantized weight tensor [N, K_in] to QTIP 2-bit format.
-    /// Default mode is Greedy (rotation disabled). Use `quantize_with_mode` to
-    /// select Viterbi (rotation enabled — RUN-158 incoherence-processing fix).
+    /// Quantize an unquantized weight tensor [N, K_in] to QTIP 2-bit format
+    /// with the production recipe: [`QtipMode::default_expert_mode`] (Viterbi)
+    /// plus the rotation its [`QtipRotation`] policy selects.
     pub fn quantize(
         weight: &Tensor,
         bias: Option<Tensor>,
         device: &Device,
     ) -> Result<Arc<dyn QuantMethod>> {
-        Self::quantize_with_mode(weight, bias, device, QtipMode::default())
+        Self::quantize_with_mode(weight, bias, device, QtipMode::default_expert_mode())
     }
 
-    /// Quantize with explicit mode selection.
+    /// Quantize with explicit mode selection. **This is the production door**:
+    /// it refuses [`QtipMode::Greedy`] in every build (D4).
     ///
-    /// Mode-dependent rotation policy:
-    /// - `Greedy`: rotation **disabled** — preserves checkpoint format compat
-    ///   and the existing >0.85 cos sim (rotation neither hurts nor helps
-    ///   greedy meaningfully).
-    /// - `Viterbi`: rotation **enabled** — Cornell QTIP's incoherence-processing
-    ///   fix (RUN-158). Lifts Viterbi matmul cos sim from ~0.50 (broken) to
-    ///   ≥0.95 by making activations Gaussian-like at forward time so that
-    ///   Viterbi's reconstruction errors no longer correlate with the input.
+    /// Rotation is not inferred here — it comes from [`QtipRotation::for_mode`],
+    /// the single exhaustive policy table, so "which search" and "is incoherence
+    /// processing on" are two decisions that are each written down once.
     pub fn quantize_with_mode(
         weight: &Tensor,
         bias: Option<Tensor>,
         device: &Device,
         mode: QtipMode,
     ) -> Result<Arc<dyn QuantMethod>> {
-        let use_rotation = match mode {
-            QtipMode::Greedy => false,
-            QtipMode::Viterbi => true,
-        };
+        mode.deny_greedy("QtipLayer::quantize_with_mode")?;
+        let use_rotation = QtipRotation::for_mode(mode).enabled();
         Self::quantize_with_options(weight, bias, device, mode, use_rotation)
+    }
+
+    /// **The greedy fixture door — this crate's tests only (DOCTRINE D4).**
+    ///
+    /// Compiled only under `cfg(test)` of `mistralrs-quant`, so it is absent
+    /// from every release artifact and unreachable from every other crate.
+    /// Unit tests need a cheap search: an exhaustive trellis pass over even a
+    /// 4×64×64 expert fixture is ~8.5G ops in a debug build (wave1-B), which
+    /// would turn the serde/shape suites into multi-minute runs. Tests that
+    /// assert *quality* must never use this — they go through
+    /// `quantize_with_mode` like production does.
+    #[cfg(test)]
+    pub(crate) fn quantize_greedy_fixture(
+        weight: &Tensor,
+        bias: Option<Tensor>,
+        device: &Device,
+    ) -> Result<Arc<dyn QuantMethod>> {
+        Self::quantize_with_options(
+            weight,
+            bias,
+            device,
+            QtipMode::Greedy,
+            QtipRotation::for_mode(QtipMode::Greedy).enabled(),
+        )
     }
 
     /// Lowest-level quantize entry: explicit mode + explicit rotation flag.
@@ -800,6 +1064,12 @@ impl QtipLayer {
         use_rotation: bool,
         hessian_diag: Option<&[f32]>,
     ) -> Result<Self> {
+        // D4 fixture door: greedy is reachable only from this crate's own
+        // `cfg(test)` builds. Every production caller arrives via
+        // `quantize_with_mode`, which refuses greedy in all builds. Placed on
+        // the calibrated worker, not its uncalibrated shim, so both entry
+        // points are covered by one gate.
+        mode.deny_greedy_outside_tests("QtipLayer::quantize_with_options_concrete")?;
         // RUN-quant-on-gpu fast path. For 284B-parameter V4 Flash the CPU-only
         // Viterbi quantize took 30-90 min per load; the GPU path collapses
         // this to <1 min. The GPU Viterbi kernel uses prefix-grouping — for
@@ -1044,6 +1314,7 @@ impl QtipLayer {
             num_experts: None,
             rotation_signs,
             rotation_block,
+            search: QtipSearchStamp::for_mode(mode),
         })
     }
 
@@ -1141,6 +1412,7 @@ impl QtipLayer {
             num_experts: None,
             rotation_signs,
             rotation_block,
+            search: QtipSearchStamp::for_mode(mode),
         }))
     }
 
@@ -1314,6 +1586,7 @@ impl QtipLayer {
             num_experts: Some(e),
             rotation_signs: shared_rotation_signs,
             rotation_block: shared_rotation_block,
+            search: QtipSearchStamp::for_mode(mode),
         }))
     }
 
@@ -1969,6 +2242,12 @@ impl QtipLayer {
     /// the entry point used by the 3-D loader (#2 in the orchestrator
     /// blocker list); tests that need to construct a 3-D layer go through
     /// `stack_experts` which performs the rank promotion internally.
+    ///
+    /// `search` is the provenance of the supplied blocks. A loader reading a
+    /// format that cannot carry provenance must pass
+    /// [`QtipSearchStamp::Unstamped`] rather than assuming Trellis — claiming a
+    /// search we did not verify is the failure this stamp exists to end (D4).
+    #[allow(clippy::too_many_arguments)]
     pub fn from_stacked_parts(
         blocks: Tensor,
         row_scales: Tensor,
@@ -1977,6 +2256,7 @@ impl QtipLayer {
         in_features: usize,
         rotation_signs: Option<Tensor>,
         rotation_block: usize,
+        search: QtipSearchStamp,
     ) -> Result<QtipLayer> {
         if blocks.dims().len() != 3 {
             candle_core::bail!(
@@ -2014,6 +2294,7 @@ impl QtipLayer {
             num_experts: Some(e),
             rotation_signs,
             rotation_block,
+            search,
         })
     }
 
@@ -2066,6 +2347,15 @@ impl QtipLayer {
                     layer.row_scales.dims().len()
                 );
             }
+            // A stack whose experts came from different searches has no honest
+            // single stamp, so refuse rather than pick one (D4).
+            if layer.search != head.search {
+                candle_core::bail!(
+                    "QtipLayer::stack_experts: layer {i} search={} != head {}",
+                    layer.search.tag(),
+                    head.search.tag()
+                );
+            }
         }
 
         let blocks_refs: Vec<&Tensor> = per_expert_layers.iter().map(|l| &l.blocks).collect();
@@ -2087,6 +2377,7 @@ impl QtipLayer {
             num_experts: Some(e),
             rotation_signs: head.rotation_signs.clone(),
             rotation_block,
+            search: head.search,
         })
     }
 
@@ -2332,6 +2623,9 @@ impl QuantMethod for QtipLayer {
                 num_experts: None,
                 rotation_signs,
                 rotation_block,
+                // The config carries packed blocks from an unknown producer.
+                // We did not run the search, so we do not claim it (D4).
+                search: QtipSearchStamp::Unstamped,
             }),
             _ => candle_core::bail!("QtipLayer requires QuantMethodConfig::Qtip"),
         }
@@ -2541,6 +2835,11 @@ impl QtipLayer {
         self.rotation_block
     }
 
+    /// Which trellis search produced these blocks (DOCTRINE D4 §3).
+    pub fn search_stamp(&self) -> QtipSearchStamp {
+        self.search
+    }
+
     /// Dequantize the i-th expert's `[N, K_in]` BF16 weight matrix (3-D mode
     /// only). Internal use by `gather_forward` and friends; bails when called
     /// on a 2-D layer or with `expert_idx >= num_experts`.
@@ -2642,6 +2941,9 @@ impl QtipLayer {
             num_experts: None,
             rotation_signs,
             rotation_block,
+            // Safetensors QTIP checkpoints carry no provenance field, so the
+            // honest answer is "unknown" — see `QtipSearchStamp::enforce_at_load`.
+            search: QtipSearchStamp::Unstamped,
         }))
     }
 
@@ -2662,6 +2964,25 @@ impl QtipLayer {
     /// Each tensor is deserialized in one shot (single host buffer → single
     /// device upload) — no per-expert round-trips at load.
     fn deserialize_concrete(
+        data: Cow<[u8]>,
+        device: &Device,
+        guard: QuantizeOntoGuard,
+    ) -> Result<(Self, Option<Tensor>)> {
+        let (layer, ext_bias) = Self::deserialize_concrete_unchecked(data, device, guard)?;
+        // D4 §3 teeth: this is the load gate every serving path passes through
+        // (`deserialize` / `deserialize_ext_bias` both funnel here).
+        layer
+            .search
+            .enforce_at_load("qtip-layer", layer.rotation_block)?;
+        Ok((layer, ext_bias))
+    }
+
+    /// Payload parser without the D4 load gate. Private, and used only by the
+    /// checked wrapper above plus the serde round-trip tests, which need to
+    /// round-trip a cheap greedy fixture without asserting anything about
+    /// serving policy. Nothing outside this crate can reach it, and no serving
+    /// path calls it directly.
+    fn deserialize_concrete_unchecked(
         data: Cow<[u8]>,
         device: &Device,
         guard: QuantizeOntoGuard,
@@ -2735,6 +3056,14 @@ impl QtipLayer {
             Err(_) => (None, 0usize),
         };
 
+        // D4 §3 search stamp (UQFF ≥ 0.3.0). Pre-0.3.0 payloads end after the
+        // rotation section, so EOF means "unstamped" rather than a corrupt
+        // file — the version bump is what makes the absence unambiguous.
+        let search = match buffer.read_u8() {
+            Ok(byte) => QtipSearchStamp::from_wire(byte)?,
+            Err(_) => QtipSearchStamp::Unstamped,
+        };
+
         Ok((
             Self {
                 blocks,
@@ -2745,6 +3074,7 @@ impl QtipLayer {
                 num_experts,
                 rotation_signs,
                 rotation_block,
+                search,
             },
             ext_bias,
         ))
@@ -2798,6 +3128,18 @@ impl QuantizedSerde for QtipLayer {
             serialize_tensor(&mut buffer, signs)?;
         } else {
             buffer.push(0u8);
+        }
+        // D4 §3: stamp the trellis search. UQFF 0.3.0 always writes this byte;
+        // re-serializing a layer whose provenance we never knew is refused
+        // rather than laundered into a Trellis claim.
+        match self.search.to_wire() {
+            Some(byte) => buffer.push(byte),
+            None => candle_core::bail!(
+                "QtipLayer::serialize: refusing to write an artifact with unknown search \
+                 provenance. This layer was loaded from a pre-0.3.0 payload or a format that \
+                 carries no stamp; re-quantize from the source weights so the stamp is earned \
+                 rather than assumed (DOCTRINE D4)."
+            ),
         }
         Ok(Cow::from(buffer))
     }
@@ -2873,9 +3215,20 @@ mod tests {
         Ok(())
     }
 
-    /// Matmul correctness: dense vs QTIP-dequant-then-matmul should produce a
-    /// cosine similarity > 0.85 (lower than NVFP4's 0.99 because greedy QTIP
-    /// loses more precision; that's expected for Tier A — Viterbi closes the gap).
+    /// Matmul correctness through the PRODUCTION entry (`QtipLayer::quantize`,
+    /// now Viterbi + Hadamard rotation): dense vs QTIP-dequant-then-matmul.
+    ///
+    /// Fixture note (wave13-AG). This test used to quantize `w[i] =
+    /// cos(0.31·i)·1.5` — a pure sinusoid, i.e. a weight whose magnitudes are
+    /// near-uniform on a circle. That is the pathological input for incoherence
+    /// processing: rotating an already-flat vector CONCENTRATES its energy into
+    /// a few spectral spikes, the opposite of what the rotation is for.
+    /// Measured on that fixture: greedy/no-rot 0.900, viterbi+rot 0.836,
+    /// viterbi/no-rot 0.504. On a deterministic Gaussian of the same shape the
+    /// ladder points the normal way — greedy/no-rot 0.869, viterbi+rot 0.945 —
+    /// which matches every realistic fixture in `bake_quality_tests`. So the
+    /// fixture is now Gaussian and the bar went UP, rather than the production
+    /// recipe being judged against a distribution no weight matrix has.
     #[test]
     fn qtip_matmul_cosine_similarity() -> Result<()> {
         let device = Device::Cpu;
@@ -2883,7 +3236,13 @@ mod tests {
         let k_in = 64;
         let mut wdata = vec![0.0f32; n * k_in];
         for (i, v) in wdata.iter_mut().enumerate() {
-            *v = ((i as f32) * 0.31).cos() * 1.5;
+            let mut z = ((i + 1) as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^= z >> 31;
+            let u1 = ((z >> 32) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+            let u2 = ((z & 0xFFFF_FFFF) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+            *v = (-2.0_f32 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos() * 0.5;
         }
         let w = Tensor::from_vec(wdata.clone(), (n, k_in), &device)?;
 
@@ -2906,7 +3265,9 @@ mod tests {
             nq += q * q;
         }
         let cos = dot / (nd.sqrt() * nq.sqrt());
-        assert!(cos > 0.85, "QTIP matmul cos sim {cos} <= 0.85");
+        // Measured 0.9449 at k=64 (only 16 trellis symbols per row — the wide
+        // production rows in `bake_quality_tests` reach 0.963).
+        assert!(cos > 0.93, "QTIP matmul cos sim {cos} <= 0.93");
         Ok(())
     }
 
@@ -2927,7 +3288,7 @@ mod tests {
         let dense = x.matmul(&w.t()?)?;
         let dense_v: Vec<f32> = dense.flatten_all()?.to_vec1()?;
 
-        let g_layer = QtipLayer::quantize_with_mode(&w, None, &device, QtipMode::Greedy)?;
+        let g_layer = QtipLayer::quantize_greedy_fixture(&w, None, &device)?;
         let g_out = g_layer.forward(&x)?;
         let g_v: Vec<f32> = g_out.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
 
@@ -2974,7 +3335,13 @@ mod tests {
         let dense_v: Vec<f32> = dense.flatten_all()?.to_vec1()?;
 
         for mode in [QtipMode::Greedy, QtipMode::Viterbi] {
-            let layer = QtipLayer::quantize_with_mode(&w, None, &device, mode)?;
+            let layer = QtipLayer::quantize_with_options(
+                &w,
+                None,
+                &device,
+                mode,
+                QtipRotation::for_mode(mode).enabled(),
+            )?;
 
             // (a) via forward
             let qout_forward = layer.forward(&x)?;
@@ -3028,7 +3395,7 @@ mod tests {
             .collect();
         let w = Tensor::from_vec(wdata.clone(), (n, k_in), &device)?;
 
-        let greedy_layer = QtipLayer::quantize_with_mode(&w, None, &device, QtipMode::Greedy)?;
+        let greedy_layer = QtipLayer::quantize_greedy_fixture(&w, None, &device)?;
         let viterbi_layer = QtipLayer::quantize_with_mode(&w, None, &device, QtipMode::Viterbi)?;
 
         let g_recon = greedy_layer.dequantize_w()?.to_dtype(DType::F32)?;
@@ -3131,7 +3498,7 @@ mod tests {
             Ok(dot / (nd.sqrt() * nq.sqrt()))
         };
 
-        let greedy_layer = QtipLayer::quantize_with_mode(&w, None, &device, QtipMode::Greedy)?;
+        let greedy_layer = QtipLayer::quantize_greedy_fixture(&w, None, &device)?;
         let greedy_cos = cos_sim(greedy_layer)?;
 
         let viterbi_layer = QtipLayer::quantize_with_mode(&w, None, &device, QtipMode::Viterbi)?;
@@ -3358,7 +3725,7 @@ mod tests {
             Ok(dot / (nd.sqrt() * nq.sqrt()))
         };
 
-        let greedy = QtipLayer::quantize_with_mode(&w, None, &device, QtipMode::Greedy)?;
+        let greedy = QtipLayer::quantize_greedy_fixture(&w, None, &device)?;
         let viterbi = QtipLayer::quantize_with_mode(&w, None, &device, QtipMode::Viterbi)?;
 
         let greedy_cos = cos_sim(greedy)?;
@@ -3783,8 +4150,20 @@ mod tests {
             let w_cpu = Tensor::from_vec(wdata.clone(), (n, k_in), &cpu)?;
             let w_cuda = Tensor::from_vec(wdata.clone(), (n, k_in), &cuda)?;
 
-            let layer_cpu = QtipLayer::quantize_with_mode(&w_cpu, None, &cpu, mode)?;
-            let layer_cuda = QtipLayer::quantize_with_mode(&w_cuda, None, &cuda, mode)?;
+            let layer_cpu = QtipLayer::quantize_with_options(
+                &w_cpu,
+                None,
+                &cpu,
+                mode,
+                QtipRotation::for_mode(mode).enabled(),
+            )?;
+            let layer_cuda = QtipLayer::quantize_with_options(
+                &w_cuda,
+                None,
+                &cuda,
+                mode,
+                QtipRotation::for_mode(mode).enabled(),
+            )?;
 
             let cpu_recon: Vec<f32> = layer_cpu
                 .dequantize_w()?
@@ -3937,7 +4316,7 @@ mod tests {
         // we collect a `QtipLayer` instead of an `Arc<dyn QuantMethod>`.
         let dims = w.dims3()?;
         let (e, n, k_in) = (dims.0, dims.1, dims.2);
-        let use_rotation = matches!(mode, QtipMode::Viterbi);
+        let use_rotation = QtipRotation::for_mode(mode).enabled();
         let mut blocks_slices: Vec<Tensor> = Vec::with_capacity(e);
         let mut scales_slices: Vec<Tensor> = Vec::with_capacity(e);
         let mut shared_lut: Option<Tensor> = None;
@@ -3971,6 +4350,7 @@ mod tests {
             num_experts: Some(e),
             rotation_signs: shared_rotation_signs,
             rotation_block: shared_rotation_block,
+            search: QtipSearchStamp::for_mode(mode),
         })
         .inspect(|l| {
             debug_assert_eq!(l.blocks.dims(), &[e, n, k_in / 4]);
@@ -4008,7 +4388,7 @@ mod tests {
         let layer3d = quantize_3d_typed(&w, QtipMode::Greedy)?;
         for expert_idx in 0..e {
             let w_e = w.narrow(0, expert_idx, 1)?.squeeze(0)?.contiguous()?;
-            let layer2d_arc = QtipLayer::quantize_with_mode(&w_e, None, &device, QtipMode::Greedy)?;
+            let layer2d_arc = QtipLayer::quantize_greedy_fixture(&w_e, None, &device)?;
             let dq2d = layer2d_arc.dequantize_w()?.to_dtype(DType::F32)?;
             let dq3d_e = layer3d
                 .dequantize_expert(expert_idx)?
@@ -4058,7 +4438,7 @@ mod tests {
         let device = Device::Cpu;
         let (e, n, k_in) = (2usize, 4usize, 32usize);
         let w = build_3d_gaussian_weight(e, n, k_in, &device)?;
-        let layer = QtipLayer::quantize_with_mode(&w, None, &device, QtipMode::Greedy)?;
+        let layer = QtipLayer::quantize_greedy_fixture(&w, None, &device)?;
         let x = Tensor::zeros((1, k_in), DType::F32, &device)?;
         let err = layer.forward(&x).err();
         assert!(
@@ -4077,7 +4457,7 @@ mod tests {
         let (e, n, k_in) = (2usize, 4usize, 32usize);
         let w = build_3d_gaussian_weight(e, n, k_in, &device)?;
         let bias = Tensor::zeros((e, n), DType::F32, &device)?;
-        let err = QtipLayer::quantize_with_mode(&w, Some(bias), &device, QtipMode::Greedy).err();
+        let err = QtipLayer::quantize_greedy_fixture(&w, Some(bias), &device).err();
         assert!(
             err.as_ref().is_some_and(|e| e.to_string().contains("bias")),
             "expected bias rejection, got {err:?}"
@@ -4617,7 +4997,7 @@ mod tests {
 
         // Greedy mode → rotation disabled by default.
         let w_cuda = Tensor::from_vec(wdata, (n, k_in), &cuda)?;
-        let layer = QtipLayer::quantize_with_mode(&w_cuda, None, &cuda, QtipMode::Greedy)?;
+        let layer = QtipLayer::quantize_greedy_fixture(&w_cuda, None, &cuda)?;
 
         let x_cuda_1tok =
             Tensor::from_vec(xdata.clone(), (1, k_in), &cuda)?.to_dtype(DType::BF16)?;
@@ -4695,7 +5075,10 @@ mod tests {
         )?;
 
         let data = layer.serialize()?.into_owned();
-        let (restored, ext_bias) = QtipLayer::deserialize_concrete(
+        // `_unchecked`: this fixture is a cheap greedy bake, which the D4 load
+        // gate refuses on purpose (see `qtip/greedy_ban_tests.rs`). What this
+        // test asserts is field-for-field payload fidelity, not serving policy.
+        let (restored, ext_bias) = QtipLayer::deserialize_concrete_unchecked(
             Cow::Owned(data),
             &device,
             crate::QuantizeOntoGuard::new(),
@@ -4777,7 +5160,8 @@ mod tests {
             "3-D quantize and stack_experts must serialize byte-identically"
         );
 
-        let (restored, ext_bias) = QtipLayer::deserialize_concrete(
+        // `_unchecked`: cheap greedy fixture, see the 2-D round-trip above.
+        let (restored, ext_bias) = QtipLayer::deserialize_concrete_unchecked(
             Cow::Owned(prod_bytes),
             &device,
             crate::QuantizeOntoGuard::new(),

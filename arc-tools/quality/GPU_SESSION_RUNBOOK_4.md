@@ -47,7 +47,9 @@ anchor: 90.8 (8-shot EM — different protocol).
 - Gates OFF all session unless a step says otherwise: `ARC_QUANT_ATTENTION`,
   `ARC_QTIP_REFINE_SCALES`, `ARC_V4_WINDOW_ONLY`, `ARC_V4_STANDARD_DENSE`,
   `ARC_V4_NO_ABSORBED_DECODE`, `ARC_FORCE_NAIVE_SDPA`, `ARC_TIME_DECODE`,
-  `ARC_QTIP_EXPERT_GREEDY` (silently undoes #9!), `MISTRALRS_ISQ_SINGLETHREAD`.
+  `ARC_ALLOW_UNSTAMPED_QTIP` (would let a pre-0.3.0 greedy artifact serve!),
+  `MISTRALRS_ISQ_SINGLETHREAD`. (`ARC_QTIP_EXPERT_GREEDY` no longer exists —
+  greedy is banned in code, DOCTRINE D4; a bake handed it hard-errors.)
   `ARC_MTP_LOG_ACCEPTANCE` / `ARC_QTIP_TUNE_TABLE` / `ARC_QTIP_ROTATION_SEED`
   only where their steps say so.
 - perplexity binary and server CANNOT run simultaneously (CUDA OOM).
