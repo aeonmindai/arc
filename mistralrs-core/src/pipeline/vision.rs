@@ -545,7 +545,8 @@ impl Loader for VisionLoader {
 
         let use_immediate = allow_immediate_cli || has_override_isq;
         if use_immediate {
-            let (pool, num_threads) = mistralrs_quant::create_isq_thread_pool(immediate_ty);
+            let (pool, num_threads) =
+                mistralrs_quant::create_isq_thread_pool_for_device(immediate_ty, Some(&device));
             info!("Applying immediate ISQ in parallel on {num_threads} threads.");
             mistralrs_quant::set_immediate_isq_with_pool(
                 immediate_ty,

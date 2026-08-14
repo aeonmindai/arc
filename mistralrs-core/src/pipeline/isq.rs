@@ -1,7 +1,6 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
-    env,
     fs::File,
     path::PathBuf,
     str::FromStr,
@@ -55,10 +54,10 @@ use candle_core::{quantized, Context, Device, Tensor};
 use indicatif::{MultiProgress, ParallelProgressIterator, ProgressBar, ProgressStyle};
 use itertools::Itertools;
 use mistralrs_quant::{
-    AfqLayer, CollectedImatrixData, ColumnParallelLayer, DistributedKind, F8Q8Linear, FP8Linear,
-    GgufMatMul, HqqLayer, IsqBits, IsqType, MXFP4Layer, NVFP4Layer, Qtip2bLayer, QtipLayer,
-    QuantMethod, QuantizeOntoGuard, QuantizedSerde, QuantizedSerdeType, ReplicatedLayer,
-    RowParallelLayer, TuckerFactoredLayer, UnquantLinear,
+    isq_thread_policy, AfqLayer, CollectedImatrixData, ColumnParallelLayer, DistributedKind,
+    F8Q8Linear, FP8Linear, GgufMatMul, HqqLayer, IsqBits, IsqType, MXFP4Layer, NVFP4Layer,
+    Qtip2bLayer, QtipLayer, QuantMethod, QuantizeOntoGuard, QuantizedSerde, QuantizedSerdeType,
+    ReplicatedLayer, RowParallelLayer, TuckerFactoredLayer, UnquantLinear,
 };
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use regex::Regex;
@@ -644,27 +643,21 @@ pub trait IsqModel {
                 let t_start = Instant::now();
 
                 // Get the MINIMUM of the max isq threads the quant method
-                let mut minimum_max_threads = {
-                    let current_rayon_threads = rayon::current_num_threads();
-                    if let Some(dtype) = dtype {
-                        dtype
-                            .get_max_isq_cpu_threads()
-                            .map(usize::from)
-                            .unwrap_or(current_rayon_threads)
-                    } else {
-                        current_rayon_threads
-                    }
-                };
-                if env::var("MISTRALRS_ISQ_SINGLETHREAD").is_ok() {
-                    minimum_max_threads = 1;
-                }
+                // supports. `isq_thread_policy` also honors
+                // MISTRALRS_ISQ_SINGLETHREAD and knows whether this rung's
+                // quantize math runs on the GPU, in which case extra host
+                // threads only contend for the one device.
+                let (mut minimum_max_threads, mut threads_rationale) =
+                    isq_thread_policy(dtype, Some(&device));
 
                 if matches!(imatrix_source, Some(ImatrixDataSource::Collected)) {
                     // Collected imatrix means that the model is potentially on the gpu already
                     minimum_max_threads = 1;
+                    threads_rationale =
+                        "collected imatrix means the model may already be on the GPU";
                 }
 
-                info!("Applying ISQ on {minimum_max_threads} threads.");
+                info!("Applying ISQ on {minimum_max_threads} threads — {threads_rationale}.");
 
                 let pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(minimum_max_threads)

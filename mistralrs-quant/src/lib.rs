@@ -175,22 +175,74 @@ pub fn set_immediate_isq_with_pool(
     });
 }
 
+/// Resolve the ISQ quantize thread count together with the one-line rationale
+/// that justifies it, so a bake log always says *why* it picked N.
+///
+/// `device` is the device the quantize will target; pass `None` when the call
+/// site does not know it and the compiled-in backend should be assumed.
+pub fn isq_thread_policy(ty: Option<IsqType>, device: Option<&Device>) -> (usize, &'static str) {
+    let backend = match device {
+        Some(device) => IsqQuantizeBackend::for_device(device),
+        None => IsqQuantizeBackend::assumed(),
+    };
+    isq_thread_policy_on(
+        ty,
+        backend,
+        std::env::var("MISTRALRS_ISQ_SINGLETHREAD").is_ok(),
+    )
+}
+
+/// [`isq_thread_policy`] with the backend and the force-single-thread escape
+/// hatch supplied explicitly, so the decision is testable without touching
+/// process-global environment state.
+pub fn isq_thread_policy_on(
+    ty: Option<IsqType>,
+    backend: IsqQuantizeBackend,
+    force_singlethread: bool,
+) -> (usize, &'static str) {
+    if force_singlethread {
+        return (1, "MISTRALRS_ISQ_SINGLETHREAD is set");
+    }
+    match ty {
+        Some(ty) => {
+            let (threads, rationale) = ty.isq_cpu_thread_policy(backend);
+            (
+                threads
+                    .map(usize::from)
+                    .unwrap_or_else(rayon::current_num_threads),
+                rationale,
+            )
+        }
+        None => (
+            rayon::current_num_threads(),
+            "no ISQ type selected; all rayon workers",
+        ),
+    }
+}
+
 /// Create a rayon thread pool for parallel immediate ISQ.
 /// Returns `(pool, num_threads)` so callers can log the thread count.
 ///
-/// Thread count is based on the quantization type:
+/// Assumes the compiled-in backend for the quantize target; use
+/// [`create_isq_thread_pool_for_device`] when the device is known.
+pub fn create_isq_thread_pool(ty: Option<IsqType>) -> (rayon::ThreadPool, usize) {
+    create_isq_thread_pool_for_device(ty, None)
+}
+
+/// Create a rayon thread pool for parallel immediate ISQ, targeting a known device.
+/// Returns `(pool, num_threads)` so callers can log the thread count.
+///
+/// Thread count is based on the quantization type *and* on where its quantize
+/// math actually runs (see [`IsqQuantizeBackend`]):
 /// - GGML types (Q2K-Q8K) and F8E4M3: `rayon::current_num_threads()` (CPU quantization)
 /// - HQQ/AFQ: 1 thread (GPU quantization, serialized by `QuantizeOntoGuard`)
-pub fn create_isq_thread_pool(ty: Option<IsqType>) -> (rayon::ThreadPool, usize) {
-    let num_threads = if std::env::var("MISTRALRS_ISQ_SINGLETHREAD").is_ok() {
-        1
-    } else if let Some(ty) = ty {
-        ty.get_max_isq_cpu_threads()
-            .map(usize::from)
-            .unwrap_or_else(rayon::current_num_threads)
-    } else {
-        rayon::current_num_threads()
-    };
+/// - QTIP: 1 thread on a GPU-backed quantize, all cores only on a CPU-side Viterbi
+pub fn create_isq_thread_pool_for_device(
+    ty: Option<IsqType>,
+    device: Option<&Device>,
+) -> (rayon::ThreadPool, usize) {
+    let (num_threads, rationale) = isq_thread_policy(ty, device);
+    tracing::info!("ISQ thread policy: {num_threads} thread(s) — {rationale}.");
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
@@ -698,6 +750,46 @@ impl IsqBits {
     }
 }
 
+/// Where the quantize math for an ISQ rung actually executes.
+///
+/// This is *not* where the resulting weights live — it is where the
+/// quantizer's inner loop runs, and it is the only input that decides the ISQ
+/// thread policy. A GPU-backed quantize must stay near-serial on the host: N
+/// rayon workers each submitting kernels to ONE device just contend for it
+/// (and on CUDA `QuantizeOntoGuard` is a no-op, so nothing else serializes
+/// them). A genuinely CPU-side quantize wants every core.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum IsqQuantizeBackend {
+    /// Quantize kernels run on an accelerator.
+    Gpu,
+    /// Quantize kernels run on host CPU cores.
+    Cpu,
+}
+
+impl IsqQuantizeBackend {
+    /// The backend a quantize onto `device` will use.
+    ///
+    /// Only CUDA has GPU quantize kernels for the rungs whose policy depends
+    /// on this (QTIP); a Metal or CPU device takes the host path.
+    pub fn for_device(device: &Device) -> Self {
+        if cfg!(feature = "cuda") && device.is_cuda() {
+            Self::Gpu
+        } else {
+            Self::Cpu
+        }
+    }
+
+    /// The backend to assume when the call site does not know the device.
+    /// A CUDA-enabled build is overwhelmingly loading onto CUDA.
+    pub fn assumed() -> Self {
+        if cfg!(feature = "cuda") {
+            Self::Gpu
+        } else {
+            Self::Cpu
+        }
+    }
+}
+
 impl TryFrom<&str> for IsqBits {
     type Error = ();
     fn try_from(s: &str) -> std::result::Result<Self, ()> {
@@ -799,7 +891,36 @@ impl IsqType {
         }
     }
 
+    /// Max ISQ worker threads for this rung, assuming the compiled-in backend.
+    /// `None` means "use every rayon worker".
     pub fn get_max_isq_cpu_threads(&self) -> Option<NonZeroUsize> {
+        self.get_max_isq_cpu_threads_on(IsqQuantizeBackend::assumed())
+    }
+
+    /// Max ISQ worker threads for this rung when the quantize runs on `backend`.
+    /// `None` means "use every rayon worker".
+    pub fn get_max_isq_cpu_threads_on(&self, backend: IsqQuantizeBackend) -> Option<NonZeroUsize> {
+        self.isq_cpu_thread_policy(backend).0
+    }
+
+    /// Max ISQ worker threads plus the one-line rationale for the choice, so
+    /// bake logs record *why* a thread count was picked.
+    pub fn isq_cpu_thread_policy(
+        &self,
+        backend: IsqQuantizeBackend,
+    ) -> (Option<NonZeroUsize>, &'static str) {
+        self.isq_cpu_thread_policy_with_qtip_mode(backend, crate::QtipMode::default_expert_mode())
+    }
+
+    /// Thread policy with the QTIP bake mode supplied explicitly rather than
+    /// read from the environment. Tests use this to pin every rung/mode
+    /// combination without racing on process-global env state.
+    pub fn isq_cpu_thread_policy_with_qtip_mode(
+        &self,
+        backend: IsqQuantizeBackend,
+        qtip_mode: crate::QtipMode,
+    ) -> (Option<NonZeroUsize>, &'static str) {
+        let one = || Some(NonZeroUsize::new(1).unwrap());
         match self {
             /*IsqType::HQQ1 | IsqType::HQQ2 | IsqType::HQQ3 | */
             IsqType::HQQ4
@@ -812,22 +933,40 @@ impl IsqType {
             | IsqType::MXFP4
             | IsqType::NVFP4 => {
                 // Use 1 because our HQQ quantizes on the GPU
-                Some(1.try_into().unwrap())
+                (one(), "HQQ/AFQ-family quantize runs on the GPU")
             }
-            IsqType::QtipBitshift2 | IsqType::Qtip2b => {
-                // On a CPU-only build QTIP quantizes on the CPU (per-row
+            IsqType::QtipBitshift2 | IsqType::Qtip2b => match backend {
+                // GPU-backed bake: the trellis search is a CUDA kernel and the
+                // whole bake targets ONE device, while `QuantizeOntoGuard` is a
+                // no-op under the `cuda` feature. Handing rayon all cores means
+                // N host threads racing to submit Viterbi work plus its
+                // transfer traffic to that single device. Session 5 logged
+                // "Applying immediate ISQ in parallel on 24 threads" and saw
+                // 4-9 min/layer; session 3's fast bake logged 1 thread and did
+                // ~30 s/layer, so 1 is the empirically-fast configuration.
+                IsqQuantizeBackend::Gpu => (
+                    one(),
+                    "QTIP quantize runs in GPU kernels on one device; extra host threads only contend for it (session-5 bake trap)",
+                ),
+                // On a CPU-side bake QTIP really does burn host cores (per-row
                 // trellis search). Greedy is fast enough single-threaded;
                 // Viterbi is ~10x heavier and must use all cores or a full
                 // requantize takes hours. The per-tensor build is sequential,
                 // so the per-row par_iter is memory-safe at full width.
                 // Keyed off the same decision point as the bake itself
                 // (wave3-G: Viterbi is now the expert default). (RUN-161)
-                match crate::QtipMode::default_expert_mode() {
-                    crate::QtipMode::Greedy => Some(1.try_into().unwrap()),
-                    crate::QtipMode::Viterbi => None,
-                }
-            }
-            IsqType::F8E4M3 | IsqType::F8Q8 => None,
+                IsqQuantizeBackend::Cpu => match qtip_mode {
+                    crate::QtipMode::Greedy => (
+                        one(),
+                        "QTIP greedy trellis search on CPU is fast enough single-threaded",
+                    ),
+                    crate::QtipMode::Viterbi => (
+                        None,
+                        "QTIP Viterbi trellis search runs on host CPU; all cores",
+                    ),
+                },
+            },
+            IsqType::F8E4M3 | IsqType::F8Q8 => (None, "FP8 quantize runs on host CPU; all cores"),
             IsqType::Q2K
             | IsqType::Q3K
             | IsqType::Q4K
@@ -839,7 +978,7 @@ impl IsqType {
             | IsqType::Q6K
             | IsqType::Q8K
             | IsqType::Q8_0
-            | IsqType::Q8_1 => None,
+            | IsqType::Q8_1 => (None, "GGML quantize runs on host CPU; all cores"),
         }
     }
 }
@@ -1290,5 +1429,145 @@ pub fn linear_b(
         linear(in_dim, out_dim, config, vb)
     } else {
         linear_no_bias(in_dim, out_dim, config, vb)
+    }
+}
+
+/// Pins the ISQ thread policy per rung / backend / QTIP mode.
+///
+/// The regression this guards: PR #20 made Viterbi the QTIP expert default,
+/// which flipped `get_max_isq_cpu_threads()` to `None` (= all cores) for the
+/// QTIP rungs. On a GPU bake that put N host threads on ONE device — session 5
+/// logged "Applying immediate ISQ in parallel on 24 threads" and 4-9 min/layer
+/// versus session 3's 1 thread and ~30 s/layer.
+#[cfg(test)]
+mod isq_thread_policy_tests {
+    use super::*;
+
+    fn threads(ty: IsqType, backend: IsqQuantizeBackend, mode: QtipMode) -> Option<usize> {
+        ty.isq_cpu_thread_policy_with_qtip_mode(backend, mode)
+            .0
+            .map(usize::from)
+    }
+
+    #[test]
+    fn qtip_rungs_are_single_threaded_on_gpu_in_both_modes() {
+        for ty in [IsqType::QtipBitshift2, IsqType::Qtip2b] {
+            for mode in [QtipMode::Greedy, QtipMode::Viterbi] {
+                assert_eq!(
+                    threads(ty, IsqQuantizeBackend::Gpu, mode),
+                    Some(1),
+                    "{ty:?} on GPU with {mode:?} must cap at 1 thread"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn qtip_rungs_use_all_cores_only_for_cpu_viterbi() {
+        for ty in [IsqType::QtipBitshift2, IsqType::Qtip2b] {
+            assert_eq!(
+                threads(ty, IsqQuantizeBackend::Cpu, QtipMode::Viterbi),
+                None,
+                "{ty:?} CPU Viterbi should use all cores"
+            );
+            assert_eq!(
+                threads(ty, IsqQuantizeBackend::Cpu, QtipMode::Greedy),
+                Some(1),
+                "{ty:?} CPU greedy is fast enough single-threaded"
+            );
+        }
+    }
+
+    #[test]
+    fn non_qtip_rungs_are_backend_independent() {
+        // GPU-quantizing families stay at 1; CPU-quantizing families stay at all-cores,
+        // regardless of which backend the QTIP decision would have picked.
+        for backend in [IsqQuantizeBackend::Gpu, IsqQuantizeBackend::Cpu] {
+            for ty in [
+                IsqType::HQQ4,
+                IsqType::HQQ8,
+                IsqType::AFQ2,
+                IsqType::AFQ3,
+                IsqType::AFQ4,
+                IsqType::AFQ6,
+                IsqType::AFQ8,
+                IsqType::MXFP4,
+                IsqType::NVFP4,
+            ] {
+                assert_eq!(threads(ty, backend, QtipMode::Viterbi), Some(1), "{ty:?}");
+            }
+            for ty in [
+                IsqType::Q2K,
+                IsqType::Q3K,
+                IsqType::Q4K,
+                IsqType::Q4_0,
+                IsqType::Q4_1,
+                IsqType::Q5K,
+                IsqType::Q5_0,
+                IsqType::Q5_1,
+                IsqType::Q6K,
+                IsqType::Q8K,
+                IsqType::Q8_0,
+                IsqType::Q8_1,
+                IsqType::F8E4M3,
+                IsqType::F8Q8,
+            ] {
+                assert_eq!(threads(ty, backend, QtipMode::Viterbi), None, "{ty:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_rung_carries_a_rationale() {
+        for backend in [IsqQuantizeBackend::Gpu, IsqQuantizeBackend::Cpu] {
+            for mode in [QtipMode::Greedy, QtipMode::Viterbi] {
+                for ty in [
+                    IsqType::QtipBitshift2,
+                    IsqType::Qtip2b,
+                    IsqType::HQQ4,
+                    IsqType::Q4K,
+                    IsqType::F8E4M3,
+                ] {
+                    let (_, rationale) = ty.isq_cpu_thread_policy_with_qtip_mode(backend, mode);
+                    assert!(!rationale.is_empty(), "{ty:?}/{backend:?}/{mode:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn singlethread_override_wins_over_every_rung() {
+        for ty in [
+            Some(IsqType::QtipBitshift2),
+            Some(IsqType::Qtip2b),
+            Some(IsqType::Q4K),
+            Some(IsqType::F8E4M3),
+            None,
+        ] {
+            for backend in [IsqQuantizeBackend::Gpu, IsqQuantizeBackend::Cpu] {
+                let (n, rationale) = isq_thread_policy_on(ty, backend, true);
+                assert_eq!(n, 1, "{ty:?}/{backend:?}");
+                assert!(rationale.contains("MISTRALRS_ISQ_SINGLETHREAD"));
+            }
+        }
+    }
+
+    #[test]
+    fn policy_resolves_all_cores_to_a_concrete_count() {
+        let (n, _) = isq_thread_policy_on(Some(IsqType::Q4K), IsqQuantizeBackend::Cpu, false);
+        assert_eq!(n, rayon::current_num_threads());
+        let (n, _) =
+            isq_thread_policy_on(Some(IsqType::QtipBitshift2), IsqQuantizeBackend::Gpu, false);
+        assert_eq!(n, 1);
+        let (n, _) = isq_thread_policy_on(None, IsqQuantizeBackend::Gpu, false);
+        assert_eq!(n, rayon::current_num_threads());
+    }
+
+    #[test]
+    fn cpu_device_never_resolves_to_the_gpu_backend() {
+        assert_eq!(
+            IsqQuantizeBackend::for_device(&Device::Cpu),
+            IsqQuantizeBackend::Cpu
+        );
     }
 }
