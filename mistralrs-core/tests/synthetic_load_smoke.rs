@@ -1181,21 +1181,99 @@ fn v4c_row(logits: &Tensor, row: usize) -> Vec<f32> {
         .unwrap()
 }
 
-fn v4c_assert_close(a: &[f32], b: &[f32], tol: f32, what: &str) {
-    assert_eq!(a.len(), b.len(), "{what}: logit length mismatch");
-    let mut max_diff = 0f32;
-    for (x, y) in a.iter().zip(b.iter()) {
+/// Relative tolerance for comparing a batched run against a batch-of-1 run.
+///
+/// These two runs are real-number-identical but NOT bit-identical: `MatMul`'s
+/// CPU path rounds through F16, and a batch-2 GEMM tiles (and therefore
+/// rounds) differently from a batch-1 GEMM — the same documented CPU-MatMul
+/// F16 noise floor that `dsv4_attention::standard_decode_window_boundary_exact`
+/// budgets for. The fixture's logits land exactly on the F16 grid (e.g.
+/// 6.8867188 == 1763 * 2^-8, ulp 2^-8 in [4,8)), and CI (x86 / Windows /
+/// macOS-CI) observed a 2-ulp divergence — 0.0078125 abs at |logit| ~4.6,
+/// i.e. ~1.7e-3 relative — where this dev host (ARM) shows exactly 0.
+///
+/// F16's relative ulp is 2^-10 ~ 9.8e-4, so this budget is ~10 ulps: enough
+/// headroom for a differently-tiled accumulation on any arch, and still ~2
+/// orders of magnitude below a genuine cross-sequence leak (pinned by the
+/// negative control in `v4c_assert_chains_differ`, which measures what real
+/// contamination looks like — O(1) absolute, ~100x this bound).
+///
+/// Scaled by the compared magnitude because logits here reach ~7; a fixed
+/// absolute bound would be either vacuous for small logits or too tight for
+/// large ones.
+const V4C_F16_REL_TOL: f32 = 1e-2;
+
+fn v4c_max_abs(v: &[f32]) -> f32 {
+    v.iter().fold(0f32, |m, x| m.max(x.abs()))
+}
+
+fn v4c_max_diff(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max)
+}
+
+/// Tolerance for "same sequence, different batch composition": scaled to the
+/// magnitude being compared, floored at 1.0 so near-zero logit rows still get
+/// the full F16 budget.
+fn v4c_tol(expected: &[f32]) -> f32 {
+    V4C_F16_REL_TOL * v4c_max_abs(expected).max(1.0)
+}
+
+/// Assert a batched row matches the same sequence's batch-of-1 run within the
+/// F16 GEMM-tiling budget. Any real cross-sequence state leak is O(1) and
+/// blows through this by ~100x.
+fn v4c_assert_close(actual: &[f32], expected: &[f32], what: &str) {
+    assert_eq!(actual.len(), expected.len(), "{what}: logit length mismatch");
+    for (x, y) in actual.iter().zip(expected.iter()) {
         assert!(
             x.is_finite() && y.is_finite(),
             "{what}: non-finite logit ({x} vs {y})"
         );
-        max_diff = max_diff.max((x - y).abs());
     }
+    let max_diff = v4c_max_diff(actual, expected);
+    let tol = v4c_tol(expected);
     assert!(
         max_diff < tol,
         "{what}: batched vs single-sequence logits diverged (max abs diff \
-         {max_diff}, tol {tol}). The xs-history / KV state of one sequence \
-         leaked into the other — the voting correctness contract is broken."
+         {max_diff}, tol {tol} = {V4C_F16_REL_TOL} * max(1, |expected|max = \
+         {})). That is far above the CPU-MatMul F16 tiling floor, so the \
+         xs-history / KV state of one sequence leaked into the other — the \
+         voting correctness contract is broken.",
+        v4c_max_abs(expected)
+    );
+}
+
+/// Bit-exact equality, for comparisons where the batch SHAPE is identical and
+/// only a sibling sequence's CONTENT differs. GEMM tiling depends on shapes,
+/// not values, so a correct implementation is bit-identical here and any
+/// difference at all is cross-sequence contamination. This is the
+/// arch-independent anti-leak assertion — no rounding budget to hide behind.
+fn v4c_assert_bit_identical(actual: &[f32], expected: &[f32], what: &str) {
+    assert_eq!(actual.len(), expected.len(), "{what}: logit length mismatch");
+    let max_diff = v4c_max_diff(actual, expected);
+    assert!(
+        max_diff == 0.0,
+        "{what}: a sequence's logits changed (max abs diff {max_diff}) purely \
+         because its BATCH-MATE changed. Batch shape is identical in both \
+         runs, so this is not GEMM-tiling rounding — it is one sequence's \
+         xs-history / KV state bleeding into another."
+    );
+}
+
+/// Negative control / teeth: two distinct chains must produce grossly
+/// different logits. Establishes the magnitude of a genuine cross-sequence
+/// leak so the F16 budget above is provably not wide enough to hide one.
+fn v4c_assert_chains_differ(a: &[f32], b: &[f32], what: &str) {
+    let signal = v4c_max_diff(a, b);
+    let tol = v4c_tol(a);
+    assert!(
+        signal > 20.0 * tol,
+        "{what}: the two chains' logits differ by only {signal}, which is not \
+         comfortably above the equality tolerance {tol} — the equality \
+         assertions would have no teeth (a leak could pass unnoticed). Make \
+         the fixture chains more distinguishable."
     );
 }
 
@@ -1280,18 +1358,10 @@ fn v4_xs_history_two_seq_batch_matches_single_sequence() {
     let (a_solo, a_snap) = v4c_solo_run(&mut model, &a_prompt, &a_next);
     let (b_solo, b_snap) = v4c_solo_run(&mut model, &b_prompt, &b_next);
 
-    // Sanity: the two chains must actually produce different logits,
-    // otherwise the equality contract below is vacuous.
-    {
-        let mut max_diff = 0f32;
-        for (x, y) in a_solo[0].iter().zip(b_solo[0].iter()) {
-            max_diff = max_diff.max((x - y).abs());
-        }
-        assert!(
-            max_diff > 1e-3,
-            "fixture degenerate: chains A and B produced identical prefill \
-             logits (max diff {max_diff}); the equality test would be vacuous"
-        );
+    // Teeth: the chains must be grossly distinguishable at every step, so a
+    // genuine leak cannot hide inside the F16 tolerance.
+    for s in 0..=V4C_DECODE_STEPS {
+        v4c_assert_chains_differ(&a_solo[s], &b_solo[s], &format!("fixture chains at step {s}"));
     }
 
     // ---- Scenario 1: separate prefills, merged decode batch. This is the
@@ -1328,13 +1398,11 @@ fn v4_xs_history_two_seq_batch_matches_single_sequence() {
         v4c_assert_close(
             &v4c_row(&logits, 0),
             &a_solo[s + 1],
-            1e-4,
             &format!("merged decode step {s} chain A"),
         );
         v4c_assert_close(
             &v4c_row(&logits, 1),
             &b_solo[s + 1],
-            1e-4,
             &format!("merged decode step {s} chain B"),
         );
     }
@@ -1375,31 +1443,24 @@ fn v4_xs_history_two_seq_batch_matches_single_sequence() {
         v4c_assert_close(
             &v4c_row(&logits, 0),
             &b_solo[s + 1],
-            1e-4,
             &format!("post-shrink decode step {s} chain B"),
         );
     }
 
     // ---- Scenario 2: lockstep 2-chain batch (prefill + decode), the
-    // voting fast path where sibling chains enter one bucket together. ----
+    // voting fast path where sibling chains enter one bucket together.
+    // Chain A's rows are recorded so Scenario 3 can re-run it against a
+    // different batch-mate. ----
+    let mut a_with_b: Vec<Vec<f32>> = Vec::new();
     v4c_reset(&mut model);
     let mut both = a_prompt.clone();
     both.extend_from_slice(&b_prompt);
     let ids = Tensor::from_vec(both, (2, t), &device).unwrap();
     let logits = v4c_step(model.as_ref(), &ids, 0)
         .expect("2-chain batched prefill through the compressor path must not panic");
-    v4c_assert_close(
-        &v4c_row(&logits, 0),
-        &a_solo[0],
-        1e-4,
-        "lockstep prefill chain A",
-    );
-    v4c_assert_close(
-        &v4c_row(&logits, 1),
-        &b_solo[0],
-        1e-4,
-        "lockstep prefill chain B",
-    );
+    v4c_assert_close(&v4c_row(&logits, 0), &a_solo[0], "lockstep prefill chain A");
+    v4c_assert_close(&v4c_row(&logits, 1), &b_solo[0], "lockstep prefill chain B");
+    a_with_b.push(v4c_row(&logits, 0));
 
     for s in 0..V4C_DECODE_STEPS {
         let ids = Tensor::from_vec(vec![a_next[s], b_next[s]], (2, 1), &device).unwrap();
@@ -1408,14 +1469,75 @@ fn v4_xs_history_two_seq_batch_matches_single_sequence() {
         v4c_assert_close(
             &v4c_row(&logits, 0),
             &a_solo[s + 1],
-            1e-4,
             &format!("lockstep decode step {s} chain A"),
         );
         v4c_assert_close(
             &v4c_row(&logits, 1),
             &b_solo[s + 1],
-            1e-4,
             &format!("lockstep decode step {s} chain B"),
+        );
+        a_with_b.push(v4c_row(&logits, 0));
+    }
+
+    // ---- Scenario 3: batch-mate invariance — the strongest, and the only
+    // arch-independent, anti-leak assertion here.
+    //
+    // Re-run the identical lockstep schedule for chain A, but pair it with a
+    // DIFFERENT sibling (chain C instead of chain B). Chain A's own tokens,
+    // the batch shape, and every GEMM shape are unchanged, so F16 rounding is
+    // unchanged and a correct per-sequence implementation is BIT-IDENTICAL for
+    // chain A — no rounding budget for a leak to hide in. Under the old shared
+    // xs_history this is exactly what broke: chain A's compressed branch read
+    // whatever history the sibling had last written.
+    //
+    // Keeping GEMM shapes fixed takes one deliberate construction. The MoE
+    // slow backend (`moe/experts.rs::forward_slow`) flattens the batch and
+    // gathers per expert, so the per-expert GEMM row count depends on how ALL
+    // sequences in the batch route. Every layer here hash-routes (all 3 layers
+    // are < the default `num_hash_layers` = 3), so routing is a pure function
+    // of token id: with `tid2eid[j] = j % 4` over `[vocab, top_k=2]`, token
+    // `x` selects experts `[(2x)%4, (2x+1)%4]` — i.e. PARITY of the token id
+    // picks the expert pair. Deriving C from B by `+2 (mod even vocab)`
+    // preserves every token's parity, so C routes identically to B, the
+    // per-expert row counts are unchanged, and only the sibling's VALUES
+    // differ. (Per-row dot products are independent, so differing sibling
+    // values cannot perturb chain A's rows.)
+    let c_prompt: Vec<u32> = b_prompt.iter().map(|x| (x + 2) % vocab as u32).collect();
+    let c_next: Vec<u32> = b_next.iter().map(|x| (x + 2) % vocab as u32).collect();
+    assert_eq!(vocab % 2, 0, "parity-preserving +2 requires an even vocab");
+    for (bt, ct) in b_prompt.iter().zip(c_prompt.iter()) {
+        assert_eq!(
+            bt % 2,
+            ct % 2,
+            "chain C must preserve chain B's token parity so hash routing — \
+             and therefore every MoE GEMM shape — is identical"
+        );
+    }
+    // Chain C must still be a genuinely different neighbour, else the
+    // invariance check is vacuous.
+    let (c_solo, _c_snap) = v4c_solo_run(&mut model, &c_prompt, &c_next);
+    v4c_assert_chains_differ(&b_solo[0], &c_solo[0], "sibling chains B vs C");
+
+    v4c_reset(&mut model);
+    let mut both = a_prompt.clone();
+    both.extend_from_slice(&c_prompt);
+    let ids = Tensor::from_vec(both, (2, t), &device).unwrap();
+    let logits = v4c_step(model.as_ref(), &ids, 0)
+        .expect("A+C batched prefill must not panic");
+    v4c_assert_bit_identical(
+        &v4c_row(&logits, 0),
+        &a_with_b[0],
+        "batch-mate invariance, prefill chain A (sibling B -> C)",
+    );
+
+    for s in 0..V4C_DECODE_STEPS {
+        let ids = Tensor::from_vec(vec![a_next[s], c_next[s]], (2, 1), &device).unwrap();
+        let logits =
+            v4c_step(model.as_ref(), &ids, t + s).expect("A+C batched decode must not panic");
+        v4c_assert_bit_identical(
+            &v4c_row(&logits, 0),
+            &a_with_b[s + 1],
+            &format!("batch-mate invariance, decode step {s} chain A (sibling B -> C)"),
         );
     }
 }
