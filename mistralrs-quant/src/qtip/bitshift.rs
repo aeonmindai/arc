@@ -2840,13 +2840,25 @@ mod tests {
         Ok(())
     }
 
-    /// Every compiled autotune variant (kernels/qtip/qtip_bitshift_tune.cu)
-    /// meets the SAME parity contract as the legacy fixed-config kernel:
-    /// fused single-token GEMV vs dequant+matmul, and on-device gather GEMV
-    /// vs the CPU gather reference. Also drives an alignment-fallback shape
-    /// (packed_per_row odd), where every vectorized variant must be rejected
-    /// by the tuned launcher and silently fall back to the legacy kernel —
-    /// exercising the production fallback path, not just the happy path.
+    /// Every compiled autotune variant — gen 1
+    /// (kernels/qtip/qtip_bitshift_tune.cu) and gen 2
+    /// (kernels/qtip/qtip_bitshift_tune2.cu) alike — meets the SAME parity
+    /// contract as the legacy fixed-config kernel: fused single-token GEMV vs
+    /// dequant+matmul, and on-device gather GEMV vs the CPU gather reference.
+    ///
+    /// Fixtures, in order:
+    ///   * fused n=64 k=512 (packed_per_row 128),
+    ///   * gather e=4 n=32 k=256,
+    ///   * a k=4096 (packed_per_row 1024) fused fixture. This one is what
+    ///     makes the sweep honest for gen 2: those variants stage whole
+    ///     K-tiles of up to 1024 B per K-group, so the small fixtures reject
+    ///     them and they would silently fall back to legacy. EVERY compiled
+    ///     variant must be applicable here — asserted below — so no variant
+    ///     can go unmeasured.
+    ///   * an alignment-fallback shape (packed_per_row odd), where every
+    ///     variant must be rejected by the tuned launcher and silently fall
+    ///     back to the legacy kernel — exercising the production fallback
+    ///     path, not just the happy path.
     ///
     /// The forced-variant knob is process-global; that is benign here
     /// because every variant satisfies the same correctness contract the
@@ -2935,6 +2947,44 @@ mod tests {
         let a_cuda = a_cpu.to_device(&cuda)?.to_dtype(DType::BF16)?;
         let indices_cuda = indices_cpu.to_device(&cuda)?;
 
+        // --- wide fixture: k=4096 -> packed_per_row=1024, which every
+        // compiled variant (both generations) can tile. Greedy quantization
+        // keeps the CPU bake cheap; the kernel contract is mode-agnostic. ---
+        let (wn, wk) = (64usize, 4096usize);
+        let ww_cpu = Tensor::from_vec(gaussian_fixture(wn * wk, 4242, 0.5), (wn, wk), &cpu)?;
+        let wide_cpu = Qtip2bLayer::quantize_with_options_concrete(
+            &ww_cpu,
+            None,
+            &cpu,
+            QtipMode::Greedy,
+            true,
+        )?;
+        let wide = Qtip2bLayer {
+            blocks: wide_cpu.blocks.to_device(&cuda)?,
+            row_scales: wide_cpu.row_scales.to_device(&cuda)?,
+            bias: None,
+            in_features: wide_cpu.in_features,
+            num_experts: None,
+            rotation_signs: wide_cpu
+                .rotation_signs
+                .as_ref()
+                .map(|t| t.to_device(&cuda))
+                .transpose()?,
+            rotation_block: wide_cpu.rotation_block,
+            mcg_mult: wide_cpu.mcg_mult,
+            expert_bpw: None,
+        };
+        let xw = Tensor::from_vec(gaussian_fixture(wk, 24680, 1.0), (1, wk), &cpu)?
+            .to_device(&cuda)?
+            .to_dtype(DType::BF16)?;
+        let ww_dq = wide.dequantize_weights()?.to_dtype(DType::F32)?;
+        let yw_ref: Vec<f32> = xw
+            .to_dtype(DType::F32)?
+            .matmul(&ww_dq.t()?)?
+            .to_device(&cpu)?
+            .flatten_all()?
+            .to_vec1()?;
+
         // --- alignment-fallback fixture: k=100 -> packed_per_row=25 (odd),
         // no vectorized variant applies; the tuned launcher must return -1
         // and the dispatch must produce legacy-kernel results ---------------
@@ -3000,11 +3050,29 @@ mod tests {
             );
 
             if v != QTIP2B_GEMV_VARIANT_LEGACY {
+                // The wide fixture must reach every variant, or the loop
+                // below would be measuring the legacy fallback instead.
+                assert!(
+                    gemv_variant_applicable(v, wn, wk),
+                    "variant {v}: must be applicable to the wide fixture (n={wn} k={wk}); \
+                     otherwise it is never exercised"
+                );
                 assert!(
                     !gemv_variant_applicable(v, fn_, fk),
                     "variant {v}: expected inapplicable to odd packed_per_row (k={fk})"
                 );
             }
+            let yw: Vec<f32> = wide
+                .forward(&xw)?
+                .to_dtype(DType::F32)?
+                .to_device(&cpu)?
+                .flatten_all()?
+                .to_vec1()?;
+            let c = cos_sim(&yw, &yw_ref);
+            assert!(
+                c > 0.995,
+                "variant {v}: wide (k={wk}) GEMV cos {c} vs dequant+matmul reference"
+            );
             let yf: Vec<f32> = fb
                 .forward(&xf)?
                 .to_dtype(DType::F32)?

@@ -110,32 +110,8 @@ constexpr uint32_t QG_INVALID_PAIR = 0xFFFFFFFFu;
 // Persistent-CTA grid cap (see tuning notes).
 constexpr int QG_MAX_GRID = 1024;
 
-// ---------------------------------------------------------------------------
-// cp.async helpers (sm_80). `valid == false` uses the src-size-0 form, which
-// zero-fills the destination without touching the source address.
-// ---------------------------------------------------------------------------
-__device__ __forceinline__ void q2b_cp_async_16(void* smem_dst, const void* gmem_src, bool valid) {
-    const uint32_t d = (uint32_t)__cvta_generic_to_shared(smem_dst);
-    const int src_bytes = valid ? 16 : 0;
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
-                 :: "r"(d), "l"(gmem_src), "r"(src_bytes));
-}
-
-__device__ __forceinline__ void q2b_cp_async_4(void* smem_dst, const void* gmem_src, bool valid) {
-    const uint32_t d = (uint32_t)__cvta_generic_to_shared(smem_dst);
-    const int src_bytes = valid ? 4 : 0;
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n"
-                 :: "r"(d), "l"(gmem_src), "r"(src_bytes));
-}
-
-__device__ __forceinline__ void q2b_cp_commit() {
-    asm volatile("cp.async.commit_group;\n" ::);
-}
-
-template <int N>
-__device__ __forceinline__ void q2b_cp_wait() {
-    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
-}
+// cp.async helpers (q2b_cp_async_16 / _4 / _commit / _wait<N>) live in
+// qtip2b_common.cuh — shared with the gen-2 GEMV pipeline.
 
 // ---------------------------------------------------------------------------
 // mma.sync m16n8k16 row.col f32 accumulate, keyed on the 16-bit dtype.

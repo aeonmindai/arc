@@ -1,10 +1,18 @@
 // Autotuner sweep for the qtip2b bitshift-trellis fused decode+GEMV.
 //
-// Runs EVERY compiled kernel variant (kernels/qtip/qtip_bitshift_tune.cu:
-// warps/block x rows/warp x ILP streams x vector load width x launch_bounds
-// min-blocks x smem staging x prefetch) across the decode shapes that matter
-// for V4-Flash (gate/up N=2048 K=4096, down N=4096 K=2048; topk 6 and 8;
-// b = 1..8), plus the legacy fixed-config kernel as the baseline row, and:
+// Runs EVERY compiled kernel variant across the decode shapes that matter for
+// V4-Flash (gate/up N=2048 K=4096, down N=4096 K=2048; topk 6 and 8;
+// b = 1..8), plus the legacy fixed-config kernel as the baseline row. Two
+// generations are compiled in and swept together:
+//
+//   gen 1 (kernels/qtip/qtip_bitshift_tune.cu, ids 0..43): warps/block x
+//     rows/warp x ILP streams x vector load width x launch_bounds min-blocks
+//     x smem staging x prefetch.
+//   gen 2 (kernels/qtip/qtip_bitshift_tune2.cu, ids 44..): cp.async
+//     double/triple-buffered staged pipeline x rows/warp x ILP streams out of
+//     smem x staged load width x split-K x producer-warp specialization.
+//
+// The sweep also:
 //
 //   * prints per-variant GB/s + %peak and a best-per-shape table,
 //   * writes tune_results.json — its `winners` array is directly consumable
@@ -32,7 +40,12 @@
 // config — not part of this variant grid, just context for session 4).
 //
 // Knobs: ARC_TUNE_ITERS (default 150), ARC_TUNE_EXPERTS (default 64),
-//        ARC_PEAK_BW_GBPS (default 4800 = H200 HBM3e).
+//        ARC_PEAK_BW_GBPS (default 4800 = H200 HBM3e),
+//        ARC_TUNE_VARIANTS — restrict the sweep to a subset, so a rental
+//        session can re-measure one generation without paying for the whole
+//        grid. Accepts `gen1`, `gen2`, or a comma list of ids and inclusive
+//        ranges, e.g. `44-97`, `0,6,21,44-60`. The legacy baseline row is
+//        always measured.
 //
 //   cargo run --release -p mistralrs-quant --example qtip_gemv_tune --features cuda
 
@@ -179,6 +192,59 @@ fn variant_name(v: u32) -> String {
     }
 }
 
+/// Variant ids to sweep, honoring `ARC_TUNE_VARIANTS` (see the header).
+/// Unparseable entries are ignored; an empty selection falls back to the
+/// full grid so a typo cannot silently produce a one-row sweep.
+fn selected_variants(n_variants: usize) -> Vec<u32> {
+    let all: Vec<u32> = (0..n_variants as u32).collect();
+    let Ok(spec) = std::env::var("ARC_TUNE_VARIANTS") else {
+        return all;
+    };
+    let spec = spec.trim();
+    let by_gen = |g: u8| -> Vec<u32> {
+        all.iter()
+            .copied()
+            .filter(|v| qtip2b_gemv_variant_desc(*v as usize).is_some_and(|d| d.generation == g))
+            .collect()
+    };
+    let picked: Vec<u32> = match spec.to_ascii_lowercase().as_str() {
+        "gen1" => by_gen(1),
+        "gen2" => by_gen(2),
+        _ => {
+            let mut ids = vec![];
+            for part in spec.split(',') {
+                let part = part.trim();
+                match part.split_once('-') {
+                    Some((a, b)) => {
+                        if let (Ok(a), Ok(b)) = (a.trim().parse::<u32>(), b.trim().parse::<u32>()) {
+                            ids.extend((a..=b).filter(|v| (*v as usize) < n_variants));
+                        }
+                    }
+                    None => {
+                        if let Ok(v) = part.parse::<u32>() {
+                            if (v as usize) < n_variants {
+                                ids.push(v);
+                            }
+                        }
+                    }
+                }
+            }
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        }
+    };
+    if picked.is_empty() {
+        println!("ARC_TUNE_VARIANTS={spec} selected nothing; sweeping the full grid");
+        return all;
+    }
+    println!(
+        "ARC_TUNE_VARIANTS={spec} -> {} of {n_variants} variants\n",
+        picked.len()
+    );
+    picked
+}
+
 fn main() -> Result<()> {
     // The decode-regime on-device MoE path is what we're tuning; make sure a
     // stale kill-switch doesn't silently reroute the sweep to fallbacks.
@@ -189,17 +255,23 @@ fn main() -> Result<()> {
     let e = env_usize("ARC_TUNE_EXPERTS", 64);
     let n_variants = qtip2b_gemv_num_variants();
 
-    println!(
-        "=== qtip2b GEMV autotune: {} variants + legacy | E={e} iters={iters} peak {:.1} TB/s ===\n",
-        n_variants,
-        peak / 1e12
-    );
     if n_variants == 0 {
         println!(
             "no tuned variants compiled in (needs --features cuda on SM80+); nothing to sweep"
         );
         return Ok(());
     }
+    let n_gen2 = (0..n_variants)
+        .filter(|v| qtip2b_gemv_variant_desc(*v).is_some_and(|d| d.generation >= 2))
+        .count();
+    println!(
+        "=== qtip2b GEMV autotune: {} variants ({} gen1 + {} gen2) + legacy | E={e} iters={iters} peak {:.1} TB/s ===\n",
+        n_variants,
+        n_variants - n_gen2,
+        n_gen2,
+        peak / 1e12
+    );
+    let sweep_ids = selected_variants(n_variants);
 
     let shapes = [
         Shape {
@@ -242,7 +314,7 @@ fn main() -> Result<()> {
             "legacy(w8_r2_i1_v2_replay)".to_string(),
         )?];
         let mut skipped: Vec<u32> = vec![];
-        for v in 0..n_variants as u32 {
+        for &v in &sweep_ids {
             if !gemv_variant_applicable(v, s.n, s.k) {
                 skipped.push(v);
                 continue;
@@ -348,6 +420,9 @@ fn main() -> Result<()> {
         "iters": iters,
         "experts": e,
         "num_variants": n_variants,
+        // Which ids this run actually measured — a filtered sweep's winners
+        // are only best-of-subset, so record the subset next to them.
+        "swept_variants": sweep_ids,
         "winners": winners,
         "shapes": shape_reports,
     });

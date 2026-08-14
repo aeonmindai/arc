@@ -46,6 +46,14 @@
 //       -> 0 on launch, -1 when the variant is not applicable to the shape
 //          (caller falls back to launch_qtip2b_gemv_*).
 //
+// GENERATIONS. This TU owns the gen-1 grid, variant ids 0..43. The
+// second-generation grid (cp.async-staged pipeline, split-K, warp
+// specialization) lives in the companion TU qtip_bitshift_tune2.cu and owns
+// ids 44.. — the two are separate translation units so nvcc compiles them in
+// PARALLEL (cudaforge builds kernel sources with rayon), keeping build wall
+// time at max(TU) rather than sum(TU). The three functions above remain the
+// single entry point: gen-2 ids are forwarded to the gen-2 TU below.
+//
 // SM80+ (uses __nv_bfloat16). Gated by `has_qtip_kernels` in build.rs.
 
 #include <cstdint>
@@ -55,7 +63,39 @@
 
 #include "qtip2b_common.cuh"
 
+// ---------------------------------------------------------------------------
+// Gen-2 grid (kernels/qtip/qtip_bitshift_tune2.cu). Ids >= Q2B_GEN2_ID_BASE
+// are forwarded there; that TU never appears in the Rust FFI.
+// ---------------------------------------------------------------------------
+extern "C" {
+int qtip2b_gemv_gen2_num_variants(void);
+int qtip2b_gemv_gen2_variant_info(int idx, int* consumer_warps, int* rows_per_warp,
+                                  int* ilp, int* wbytes, int* ksplit, int* stages,
+                                  int* producer_warps, int* min_blocks);
+int qtip2b_gemv_gen2_launch_bf16(int local_variant, const uint8_t*, const float*,
+                                 const __nv_bfloat16*, const uint32_t*, __nv_bfloat16*,
+                                 int, int, int, int, int, uint32_t, cudaStream_t);
+int qtip2b_gemv_gen2_launch_f16(int local_variant, const uint8_t*, const float*,
+                                const __half*, const uint32_t*, __half*,
+                                int, int, int, int, int, uint32_t, cudaStream_t);
+int qtip2b_gemv_gen2_launch_f32(int local_variant, const uint8_t*, const float*,
+                                const float*, const uint32_t*, float*,
+                                int, int, int, int, int, uint32_t, cudaStream_t);
+}
+
 namespace {
+
+// Dtype-keyed gen-2 forwarder so the shared dispatch template stays generic.
+template <typename T> struct q2b_gen2_fwd;
+template <> struct q2b_gen2_fwd<__nv_bfloat16> {
+    static constexpr auto launch = qtip2b_gemv_gen2_launch_bf16;
+};
+template <> struct q2b_gen2_fwd<__half> {
+    static constexpr auto launch = qtip2b_gemv_gen2_launch_f16;
+};
+template <> struct q2b_gen2_fwd<float> {
+    static constexpr auto launch = qtip2b_gemv_gen2_launch_f32;
+};
 
 // Packed-word type per load width. Spelled as the exact builtin types the
 // __ldg overload set covers (uint64_t may alias `unsigned long` on LP64,
@@ -343,6 +383,10 @@ qtip2b_gemv_tuned_kernel(
 constexpr int Q2B_TUNE_NUM_VARIANTS = 0 Q2B_TUNE_VARIANTS(Q2B_TUNE_COUNT_ONE);
 #undef Q2B_TUNE_COUNT_ONE
 
+// First gen-2 global id. Frozen: gen-1 owns [0, Q2B_GEN2_ID_BASE).
+constexpr int Q2B_GEN2_ID_BASE = Q2B_TUNE_NUM_VARIANTS;
+static_assert(Q2B_GEN2_ID_BASE == 44, "gen-1 ids are ABI: append only, never renumber");
+
 // Launch one variant; -1 when the variant is not applicable to the shape.
 template <typename T, int WARPS, int R, int ILP, int W, int MINB, bool STAGE, bool PF>
 int q2b_launch_variant(
@@ -393,6 +437,12 @@ int q2b_tuned_dispatch(
     uint32_t mult,
     cudaStream_t stream
 ) {
+    if (variant >= Q2B_GEN2_ID_BASE) {
+        return q2b_gen2_fwd<T>::launch(
+            variant - Q2B_GEN2_ID_BASE, d_packed, d_row_scales, d_x, d_indices,
+            d_y, n_rows, packed_per_row, num_symbols, n_pairs, num_experts,
+            mult, stream);
+    }
     switch (variant) {
 #define Q2B_TUNE_CASE(id, WARPS, R, ILP, W, MINB, STAGE, PF)                   \
         case id:                                                               \
@@ -416,9 +466,16 @@ int q2b_tuned_dispatch(
 extern "C" {
 
 int qtip2b_gemv_num_variants(void) {
-    return Q2B_TUNE_NUM_VARIANTS;
+    return Q2B_TUNE_NUM_VARIANTS + qtip2b_gemv_gen2_num_variants();
 }
 
+// Axis values of one variant, across both generations. `gen` says which set
+// of axes is meaningful:
+//   gen 1: warps/rows_per_warp/ilp/wbytes/min_blocks/stage/prefetch;
+//          ksplit=1, stages=0, producer_warps=0.
+//   gen 2: warps = CONSUMER warps, plus ksplit / stages (cp.async pipeline
+//          depth) / producer_warps; stage is always 1 and prefetch 0 (the
+//          gen-1 flags are subsumed by the pipeline).
 int qtip2b_gemv_variant_info(
     int idx,
     int* warps,
@@ -427,8 +484,26 @@ int qtip2b_gemv_variant_info(
     int* wbytes,
     int* min_blocks,
     int* stage,
-    int* prefetch
+    int* prefetch,
+    int* gen,
+    int* ksplit,
+    int* stages,
+    int* producer_warps
 ) {
+    if (idx >= Q2B_GEN2_ID_BASE) {
+        const int rc = qtip2b_gemv_gen2_variant_info(
+            idx - Q2B_GEN2_ID_BASE, warps, rows_per_warp, ilp, wbytes, ksplit,
+            stages, producer_warps, min_blocks);
+        if (rc != 0) return rc;
+        *gen = 2;
+        *stage = 1;
+        *prefetch = 0;
+        return 0;
+    }
+    *gen = 1;
+    *ksplit = 1;
+    *stages = 0;
+    *producer_warps = 0;
     switch (idx) {
 #define Q2B_TUNE_INFO(id, WARPS, R, ILP, W, MINB, STAGE, PF)                   \
         case id:                                                               \
