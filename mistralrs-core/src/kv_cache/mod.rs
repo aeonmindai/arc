@@ -579,10 +579,10 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
             let total_layers = pipeline.cache().normal().0.len();
             let mut layer_devices = Vec::with_capacity(total_layers);
             for layer in 0..total_layers {
-                let device = device_mapper
-                    .device_for(layer, false)
-                    .cloned()
-                    .expect("Internal bug, layer out of range!");
+                // `None` for cache entries beyond the device-mapped layer
+                // range (e.g. DeepSeek V4's trailing xs-history entries,
+                // which are skipped below before this is consulted).
+                let device = device_mapper.device_for(layer, false).cloned();
                 layer_devices.push(device);
             }
             layer_devices
@@ -596,13 +596,25 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 continue;
             }
 
+            // Auxiliary non-KV cache entries (DeepSeek V4's compressor-input
+            // xs histories, seq dim 1 over `[B, T, hidden]`) have no
+            // preallocated per-sequence buffer — the preallocated caches are
+            // KV-shaped `[1, kv_heads, T, head_dim]`. They always start a
+            // fresh sequence empty.
+            if matches!(&old_caches[layer_idx], KvCache::Normal { k, .. } if k.dim != 2) {
+                layer.reset();
+                continue;
+            }
+
             let mut k_caches = Vec::new();
             let mut v_caches = Vec::new();
             for seq in seqs.iter_mut() {
                 let (mut k_preallocated_cache, mut v_preallocated_cache) =
                     (*seq.preallocated_cache().as_ref().unwrap()).clone();
                 if let Some(layer_devices) = &layer_devices {
-                    let layer_dev = &layer_devices[layer_idx];
+                    let layer_dev = layer_devices[layer_idx]
+                        .as_ref()
+                        .expect("Internal bug, layer out of range!");
                     k_preallocated_cache = k_preallocated_cache
                         .to_device(layer_dev)
                         .expect("Could not prepare cache");

@@ -873,6 +873,676 @@ fn v4_uqff_missing_mtp_falls_back_to_source_checkpoint() {
 }
 
 // ===========================================================================
+// V4 XS-HISTORY MULTI-SEQUENCE (VOTING) TESTS
+// ===========================================================================
+//
+// The V4 compressor input history (`xs_history`) used to be a single
+// per-model buffer, which crashed / cross-contaminated when a batch held
+// more than one sequence (Arc Boost `n_votes` voting chains — the hardware
+// repro: `n_votes: 2` → `narrow invalid args ... [1, 2, 18, 512]`). The fix
+// stores the history as extra per-layer entries in the model's NormalCache
+// so the engine's per-sequence clone_in/clone_out machinery batches it along
+// dim 0 exactly like the KV cache.
+//
+// These tests pin the correctness contract for voting: a 2-sequence batch
+// through the compressor path (CSA ratio-4 + HCA ratio-128 layers), crossing
+// the 128-token sliding window, must produce per-sequence outputs equal to
+// the same sequences run separately (batch-of-1), within f32 tolerance —
+// both when the two chains run in lockstep from prefill, and when they are
+// prefilled separately and merged into one decode batch (the engine's
+// clone_in path).
+
+mod v4_compress {
+    use super::*;
+
+    pub const NUM_LAYERS: usize = 3;
+    pub const HIDDEN_SIZE: usize = 64;
+    pub const HEAD_DIM: usize = 32;
+    pub const QK_ROPE_HEAD_DIM: usize = 8;
+    pub const NUM_ATTN_HEADS: usize = 2;
+    pub const NUM_KV_HEADS: usize = 1;
+    pub const Q_LORA_RANK: usize = 16;
+    pub const O_LORA_RANK: usize = 16;
+    pub const O_GROUPS: usize = 1;
+    pub const MOE_INTERMEDIATE_SIZE: usize = 32;
+    pub const NUM_ROUTED_EXPERTS: usize = 4;
+    pub const NUM_SHARED_EXPERTS: usize = 1;
+    pub const NUM_EXPERTS_PER_TOK: usize = 2;
+    pub const VOCAB_SIZE: usize = 128;
+    pub const MAX_POSITION_EMBEDDINGS: usize = 256;
+    pub const RMS_NORM_EPS: f64 = 1e-6;
+    pub const ROPE_THETA: f32 = 10000.0;
+    pub const COMPRESS_ROPE_THETA: f32 = 40000.0;
+    /// Real V4 window. The test prefills PAST this so the compressed
+    /// (distant-context) branch is live with a non-trivial history — the
+    /// exact shape class of the voting crash.
+    pub const SLIDING_WINDOW: usize = 128;
+    /// Per-layer compress dispatch: Standard, CSA (ratio 4, overlap
+    /// compressor), HCA (ratio 128).
+    pub const COMPRESS_RATIOS: [i32; NUM_LAYERS] = [0, 4, 128];
+
+    /// Deterministic non-degenerate weights: unlike the zero-weight smoke
+    /// fixture, the equality assertions here are only meaningful if two
+    /// different token sequences produce two different logit streams.
+    pub fn patterned(
+        shape: &[usize],
+        scale: f32,
+        phase: f32,
+        device: &Device,
+    ) -> CandleResult<Tensor> {
+        let n: usize = shape.iter().product();
+        let data: Vec<f32> = (0..n)
+            .map(|i| ((i as f32) * 0.37 + phase).sin() * scale)
+            .collect();
+        Tensor::from_vec(data, shape, device)
+    }
+
+    pub fn weights(device: &Device) -> CandleResult<HashMap<String, Tensor>> {
+        let mut t = HashMap::new();
+        let o = |s: &[usize]| ones(s, device);
+
+        t.insert(
+            "model.embed_tokens.weight".to_string(),
+            patterned(&[VOCAB_SIZE, HIDDEN_SIZE], 0.35, 0.0, device)?,
+        );
+        t.insert("model.norm.weight".to_string(), o(&[HIDDEN_SIZE])?);
+        t.insert(
+            "lm_head.weight".to_string(),
+            patterned(&[VOCAB_SIZE, HIDDEN_SIZE], 0.2, 1.0, device)?,
+        );
+
+        for i in 0..NUM_LAYERS {
+            let l = format!("model.layers.{i}");
+            let ph = i as f32 + 0.5;
+
+            t.insert(format!("{l}.input_layernorm.weight"), o(&[HIDDEN_SIZE])?);
+            t.insert(
+                format!("{l}.post_attention_layernorm.weight"),
+                o(&[HIDDEN_SIZE])?,
+            );
+
+            // Q LoRA (HF fallback naming).
+            t.insert(
+                format!("{l}.self_attn.q_a_proj.weight"),
+                patterned(&[Q_LORA_RANK, HIDDEN_SIZE], 0.15, ph, device)?,
+            );
+            t.insert(
+                format!("{l}.self_attn.q_a_layernorm.weight"),
+                o(&[Q_LORA_RANK])?,
+            );
+            t.insert(
+                format!("{l}.self_attn.q_b_proj.weight"),
+                patterned(
+                    &[NUM_ATTN_HEADS * HEAD_DIM, Q_LORA_RANK],
+                    0.15,
+                    ph + 0.1,
+                    device,
+                )?,
+            );
+
+            // Fused wkv (V3-style fallback naming) + kv_norm.
+            t.insert(
+                format!("{l}.self_attn.kv_a_proj_with_mqa.weight"),
+                patterned(&[HEAD_DIM, HIDDEN_SIZE], 0.15, ph + 0.2, device)?,
+            );
+            t.insert(
+                format!("{l}.self_attn.kv_a_layernorm.weight"),
+                o(&[HEAD_DIM])?,
+            );
+
+            // Grouped o_proj LoRA.
+            let wo_a_in = NUM_ATTN_HEADS * HEAD_DIM / O_GROUPS.max(1);
+            let o_inner = O_GROUPS * O_LORA_RANK;
+            t.insert(
+                format!("{l}.self_attn.o_a_proj.weight"),
+                patterned(&[o_inner, wo_a_in], 0.15, ph + 0.3, device)?,
+            );
+            t.insert(
+                format!("{l}.self_attn.o_b_proj.weight"),
+                patterned(&[HIDDEN_SIZE, o_inner], 0.15, ph + 0.4, device)?,
+            );
+
+            // Per-head attn_sink — REQUIRED for finite decode on CPU: the
+            // no-sink CPU attention path NaNs on rows with a masked window
+            // prefix (see the `standard_decode_window_boundary_exact` note in
+            // dsv4_attention.rs); deployment always ships attn_sink.
+            t.insert(
+                format!("{l}.self_attn.attn_sink"),
+                patterned(&[NUM_ATTN_HEADS], 0.4, ph + 0.5, device)?,
+            );
+
+            // Real compressor weights on CSA/HCA layers, so the compressed
+            // branch runs the actual `forward_from_xs` (softmax-pooled,
+            // overlap-windowed for ratio 4) over the xs history.
+            let ratio = COMPRESS_RATIOS[i];
+            if ratio != 0 {
+                let coff = if ratio == 4 { 2 } else { 1 };
+                t.insert(
+                    format!("{l}.self_attn.compressor.wkv_gate.weight"),
+                    patterned(&[2 * coff * HEAD_DIM, HIDDEN_SIZE], 0.12, ph + 0.6, device)?,
+                );
+                t.insert(
+                    format!("{l}.self_attn.compressor.norm.weight"),
+                    o(&[HEAD_DIM])?,
+                );
+                t.insert(
+                    format!("{l}.self_attn.compressor.ape"),
+                    patterned(&[ratio as usize, coff * HEAD_DIM], 0.05, ph + 0.7, device)?,
+                );
+            }
+
+            // MoE (hash-routed: tid2eid is required for layers below the
+            // default num_hash_layers).
+            t.insert(
+                format!("{l}.mlp.gate.weight"),
+                patterned(&[NUM_ROUTED_EXPERTS, HIDDEN_SIZE], 0.1, ph + 0.8, device)?,
+            );
+            let tid2eid: Vec<i64> = (0..VOCAB_SIZE * NUM_EXPERTS_PER_TOK)
+                .map(|j| (j % NUM_ROUTED_EXPERTS) as i64)
+                .collect();
+            t.insert(
+                format!("{l}.mlp.gate.tid2eid"),
+                Tensor::from_vec(tid2eid, &[VOCAB_SIZE, NUM_EXPERTS_PER_TOK], device)?,
+            );
+            t.insert(
+                format!("{l}.mlp.experts.gate_up_proj"),
+                patterned(
+                    &[NUM_ROUTED_EXPERTS, HIDDEN_SIZE, 2 * MOE_INTERMEDIATE_SIZE],
+                    0.08,
+                    ph + 0.9,
+                    device,
+                )?,
+            );
+            t.insert(
+                format!("{l}.mlp.experts.down_proj"),
+                patterned(
+                    &[NUM_ROUTED_EXPERTS, MOE_INTERMEDIATE_SIZE, HIDDEN_SIZE],
+                    0.08,
+                    ph + 1.0,
+                    device,
+                )?,
+            );
+            let shared_inter = MOE_INTERMEDIATE_SIZE * NUM_SHARED_EXPERTS;
+            t.insert(
+                format!("{l}.mlp.shared_experts.gate_proj.weight"),
+                patterned(&[shared_inter, HIDDEN_SIZE], 0.08, ph + 1.1, device)?,
+            );
+            t.insert(
+                format!("{l}.mlp.shared_experts.up_proj.weight"),
+                patterned(&[shared_inter, HIDDEN_SIZE], 0.08, ph + 1.2, device)?,
+            );
+            t.insert(
+                format!("{l}.mlp.shared_experts.down_proj.weight"),
+                patterned(&[HIDDEN_SIZE, shared_inter], 0.08, ph + 1.3, device)?,
+            );
+        }
+        Ok(t)
+    }
+
+    pub fn config_json() -> String {
+        serde_json::json!({
+            "architectures": ["DeepseekV4ForCausalLM"],
+            "vocab_size": VOCAB_SIZE,
+            "hidden_size": HIDDEN_SIZE,
+            "head_dim": HEAD_DIM,
+            "moe_intermediate_size": MOE_INTERMEDIATE_SIZE,
+            "num_hidden_layers": NUM_LAYERS,
+            "num_attention_heads": NUM_ATTN_HEADS,
+            "num_key_value_heads": NUM_KV_HEADS,
+            "n_shared_experts": NUM_SHARED_EXPERTS,
+            "n_routed_experts": NUM_ROUTED_EXPERTS,
+            "routed_scaling_factor": 1.0,
+            "topk_method": "greedy",
+            "scoring_func": "softmax",
+            "num_experts_per_tok": NUM_EXPERTS_PER_TOK,
+            "moe_layer_freq": 1,
+            "first_k_dense_replace": 0,
+            "hidden_act": "silu",
+            "max_position_embeddings": MAX_POSITION_EMBEDDINGS,
+            "rms_norm_eps": RMS_NORM_EPS,
+            "tie_word_embeddings": false,
+            "rope_theta": ROPE_THETA,
+            "attention_bias": false,
+            "q_lora_rank": Q_LORA_RANK,
+            "qk_rope_head_dim": QK_ROPE_HEAD_DIM,
+            "n_group": 1,
+            "topk_group": 1,
+            "compress_ratios": COMPRESS_RATIOS,
+            "sliding_window": SLIDING_WINDOW,
+            "compress_rope_theta": COMPRESS_ROPE_THETA,
+            "o_lora_rank": O_LORA_RANK,
+            "o_groups": O_GROUPS,
+        })
+        .to_string()
+    }
+}
+
+/// Prompt length: past the 128-token sliding window, and NOT a multiple of
+/// the CSA ratio (4) so the ragged `< ratio` tail is exercised too.
+const V4C_PREFILL_T: usize = 130;
+/// Decode steps after prefill (crosses further ratio-4 block boundaries).
+const V4C_DECODE_STEPS: usize = 6;
+
+fn v4c_load() -> Box<dyn NormalModel + Send + Sync> {
+    let device = Device::Cpu;
+    let tensors =
+        v4_compress::weights(&device).expect("V4 compress fixture construction must not fail");
+    let vb = wrap_as_vb(tensors, &device);
+    let loader = DeepSeekV4Loader;
+    loader
+        .load(
+            &v4_compress::config_json(),
+            vb,
+            make_metadata(&device),
+            AttentionImplementation::Eager,
+        )
+        .expect(
+            "DeepSeekV4Loader::load must succeed on the compress fixture. A \
+             missing-tensor error here means the compressor probing contract \
+             drifted (see v4_compress::weights).",
+        )
+}
+
+/// One forward step, returning the LAST position's logits `[B, 1, vocab]`.
+fn v4c_step(
+    model: &(dyn NormalModel + Send + Sync),
+    ids: &Tensor,
+    offset: usize,
+) -> CandleResult<Tensor> {
+    let (b, t) = ids.dims2()?;
+    let context_lens = vec![(t - 1, 1); b];
+    let position_ids = (offset..offset + t).collect::<Vec<_>>();
+    let seqlen_offsets = vec![offset; b];
+    model.forward(
+        ids,
+        &seqlen_offsets,
+        context_lens,
+        position_ids,
+        None,
+        &empty_flash_params(),
+    )
+}
+
+fn v4c_reset(model: &mut Box<dyn NormalModel + Send + Sync>) {
+    let mut cache = model.cache_mut().normal();
+    cache.0.iter_mut().for_each(|c| c.reset());
+}
+
+/// Extract batch row `row` of `[B, 1, vocab]` logits as a flat Vec<f32>.
+fn v4c_row(logits: &Tensor, row: usize) -> Vec<f32> {
+    logits
+        .narrow(0, row, 1)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec1()
+        .unwrap()
+}
+
+/// Relative tolerance for comparing a batched run against a batch-of-1 run.
+///
+/// These two runs are real-number-identical but NOT bit-identical: `MatMul`'s
+/// CPU path rounds through F16, and a batch-2 GEMM tiles (and therefore
+/// rounds) differently from a batch-1 GEMM — the same documented CPU-MatMul
+/// F16 noise floor that `dsv4_attention::standard_decode_window_boundary_exact`
+/// budgets for. The fixture's logits land exactly on the F16 grid (e.g.
+/// 6.8867188 == 1763 * 2^-8, ulp 2^-8 in [4,8)), and CI (x86 / Windows /
+/// macOS-CI) observed a 2-ulp divergence — 0.0078125 abs at |logit| ~4.6,
+/// i.e. ~1.7e-3 relative — where this dev host (ARM) shows exactly 0.
+///
+/// F16's relative ulp is 2^-10 ~ 9.8e-4, so this budget is ~10 ulps: enough
+/// headroom for a differently-tiled accumulation on any arch, and still ~2
+/// orders of magnitude below a genuine cross-sequence leak (pinned by the
+/// negative control in `v4c_assert_chains_differ`, which measures what real
+/// contamination looks like — O(1) absolute, ~100x this bound).
+///
+/// Scaled by the compared magnitude because logits here reach ~7; a fixed
+/// absolute bound would be either vacuous for small logits or too tight for
+/// large ones.
+const V4C_F16_REL_TOL: f32 = 1e-2;
+
+fn v4c_max_abs(v: &[f32]) -> f32 {
+    v.iter().fold(0f32, |m, x| m.max(x.abs()))
+}
+
+fn v4c_max_diff(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max)
+}
+
+/// Tolerance for "same sequence, different batch composition": scaled to the
+/// magnitude being compared, floored at 1.0 so near-zero logit rows still get
+/// the full F16 budget.
+fn v4c_tol(expected: &[f32]) -> f32 {
+    V4C_F16_REL_TOL * v4c_max_abs(expected).max(1.0)
+}
+
+/// Assert a batched row matches the same sequence's batch-of-1 run within the
+/// F16 GEMM-tiling budget. Any real cross-sequence state leak is O(1) and
+/// blows through this by ~100x.
+fn v4c_assert_close(actual: &[f32], expected: &[f32], what: &str) {
+    assert_eq!(actual.len(), expected.len(), "{what}: logit length mismatch");
+    for (x, y) in actual.iter().zip(expected.iter()) {
+        assert!(
+            x.is_finite() && y.is_finite(),
+            "{what}: non-finite logit ({x} vs {y})"
+        );
+    }
+    let max_diff = v4c_max_diff(actual, expected);
+    let tol = v4c_tol(expected);
+    assert!(
+        max_diff < tol,
+        "{what}: batched vs single-sequence logits diverged (max abs diff \
+         {max_diff}, tol {tol} = {V4C_F16_REL_TOL} * max(1, |expected|max = \
+         {})). That is far above the CPU-MatMul F16 tiling floor, so the \
+         xs-history / KV state of one sequence leaked into the other — the \
+         voting correctness contract is broken.",
+        v4c_max_abs(expected)
+    );
+}
+
+/// Bit-exact equality, for comparisons where the batch SHAPE is identical and
+/// only a sibling sequence's CONTENT differs. GEMM tiling depends on shapes,
+/// not values, so a correct implementation is bit-identical here and any
+/// difference at all is cross-sequence contamination. This is the
+/// arch-independent anti-leak assertion — no rounding budget to hide behind.
+fn v4c_assert_bit_identical(actual: &[f32], expected: &[f32], what: &str) {
+    assert_eq!(actual.len(), expected.len(), "{what}: logit length mismatch");
+    let max_diff = v4c_max_diff(actual, expected);
+    assert!(
+        max_diff == 0.0,
+        "{what}: a sequence's logits changed (max abs diff {max_diff}) purely \
+         because its BATCH-MATE changed. Batch shape is identical in both \
+         runs, so this is not GEMM-tiling rounding — it is one sequence's \
+         xs-history / KV state bleeding into another."
+    );
+}
+
+/// Negative control / teeth: two distinct chains must produce grossly
+/// different logits. Establishes the magnitude of a genuine cross-sequence
+/// leak so the F16 budget above is provably not wide enough to hide one.
+fn v4c_assert_chains_differ(a: &[f32], b: &[f32], what: &str) {
+    let signal = v4c_max_diff(a, b);
+    let tol = v4c_tol(a);
+    assert!(
+        signal > 20.0 * tol,
+        "{what}: the two chains' logits differ by only {signal}, which is not \
+         comfortably above the equality tolerance {tol} — the equality \
+         assertions would have no teeth (a leak could pass unnoticed). Make \
+         the fixture chains more distinguishable."
+    );
+}
+
+/// Run one chain solo (batch=1): prefill + decodes. Returns the per-step
+/// last-token logits (index 0 = prefill) and the post-prefill cache snapshot
+/// `(k, v)` per cache entry (KV layers AND xs-history entries), which the
+/// merged-decode test batches the way `NormalCacheManager::clone_in_cache`
+/// does.
+#[allow(clippy::type_complexity)]
+fn v4c_solo_run(
+    model: &mut Box<dyn NormalModel + Send + Sync>,
+    prompt: &[u32],
+    next_toks: &[u32],
+) -> (Vec<Vec<f32>>, Vec<(Tensor, Tensor)>) {
+    let device = Device::Cpu;
+    v4c_reset(model);
+    let mut outs = Vec::new();
+
+    let ids = Tensor::from_vec(prompt.to_vec(), (1, prompt.len()), &device).unwrap();
+    let logits = v4c_step(model.as_ref(), &ids, 0).expect("solo prefill must not error");
+    outs.push(v4c_row(&logits, 0));
+
+    let snapshot: Vec<(Tensor, Tensor)> = model
+        .cache()
+        .normal()
+        .0
+        .iter()
+        .map(|c| {
+            let k = c
+                .k()
+                .unwrap()
+                .expect("cache entry populated after prefill")
+                .copy()
+                .unwrap();
+            let v = c
+                .v()
+                .unwrap()
+                .expect("cache entry populated after prefill")
+                .copy()
+                .unwrap();
+            (k, v)
+        })
+        .collect();
+
+    for (s, tok) in next_toks.iter().enumerate() {
+        let ids = Tensor::from_vec(vec![*tok], (1, 1), &device).unwrap();
+        let logits =
+            v4c_step(model.as_ref(), &ids, prompt.len() + s).expect("solo decode must not error");
+        outs.push(v4c_row(&logits, 0));
+    }
+    (outs, snapshot)
+}
+
+/// A 2-sequence batch through the V4 compressor path (CSA + HCA), crossing
+/// the 128-token sliding window, must not panic AND must produce, for every
+/// step, per-sequence logits equal to the same sequences run separately.
+/// This is the correctness contract for Arc Boost voting (`n_votes`), whose
+/// sibling chains run as one batch. Covers both engine batch shapes:
+///   1. lockstep — both chains prefill AND decode in one batch;
+///   2. merged  — chains prefilled separately (batch=1), their per-sequence
+///      caches batched along dim 0 (the `clone_in_cache` dance), then decoded
+///      together.
+#[test]
+fn v4_xs_history_two_seq_batch_matches_single_sequence() {
+    let device = Device::Cpu;
+    let mut model = v4c_load();
+
+    let t = V4C_PREFILL_T;
+    let vocab = v4_compress::VOCAB_SIZE;
+    let a_prompt: Vec<u32> = (0..t).map(|i| ((i * 7 + 1) % vocab) as u32).collect();
+    let b_prompt: Vec<u32> = (0..t).map(|i| ((i * 13 + 5) % vocab) as u32).collect();
+    let a_next: Vec<u32> = (0..V4C_DECODE_STEPS)
+        .map(|s| ((s * 11 + 3) % vocab) as u32)
+        .collect();
+    let b_next: Vec<u32> = (0..V4C_DECODE_STEPS)
+        .map(|s| ((s * 17 + 9) % vocab) as u32)
+        .collect();
+
+    // ---- Reference: each chain alone (batch=1). Also the bit-identity
+    // baseline for the sacred single-sequence path: any regression here
+    // fails the equality asserts below symmetrically. ----
+    let (a_solo, a_snap) = v4c_solo_run(&mut model, &a_prompt, &a_next);
+    let (b_solo, b_snap) = v4c_solo_run(&mut model, &b_prompt, &b_next);
+
+    // Teeth: the chains must be grossly distinguishable at every step, so a
+    // genuine leak cannot hide inside the F16 tolerance.
+    for s in 0..=V4C_DECODE_STEPS {
+        v4c_assert_chains_differ(&a_solo[s], &b_solo[s], &format!("fixture chains at step {s}"));
+    }
+
+    // ---- Scenario 1: separate prefills, merged decode batch. This is the
+    // engine-real flow (`clone_out_cache` after each solo prefill, then
+    // `clone_in_cache` batching per-sequence caches along dim 0 for the
+    // joint decode) — the exact composition change the old per-model
+    // xs_history could not survive: at this point the shared history buffer
+    // held ONLY chain B's batch-1 state, so the batch-2 decode either
+    // crashed on the shape mismatch or fed chain A chain B's history. ----
+    {
+        let mut cache = model.cache_mut().normal();
+        assert_eq!(
+            a_snap.len(),
+            cache.0.len(),
+            "snapshot length must match the model cache (KV entries + xs-history entries)"
+        );
+        for (entry, ((ka, va), (kb, vb))) in
+            cache.0.iter_mut().zip(a_snap.iter().zip(b_snap.iter()))
+        {
+            let k = Tensor::cat(&[ka, kb], 0).unwrap();
+            let v = Tensor::cat(&[va, vb], 0).unwrap();
+            entry.reset();
+            entry
+                .append(&k, &v)
+                .expect("merging per-sequence caches into a batch must not fail");
+        }
+    }
+    // First half of the decode: both chains in one batch.
+    let shrink_at = V4C_DECODE_STEPS / 2;
+    for s in 0..shrink_at {
+        let ids = Tensor::from_vec(vec![a_next[s], b_next[s]], (2, 1), &device).unwrap();
+        let logits = v4c_step(model.as_ref(), &ids, t + s)
+            .expect("merged 2-chain decode through the compressor path must not panic");
+        v4c_assert_close(
+            &v4c_row(&logits, 0),
+            &a_solo[s + 1],
+            &format!("merged decode step {s} chain A"),
+        );
+        v4c_assert_close(
+            &v4c_row(&logits, 1),
+            &b_solo[s + 1],
+            &format!("merged decode step {s} chain B"),
+        );
+    }
+    // Batch shrink: chain A finishes (EOS in the voting run); chain B
+    // continues alone. Engine-wise: clone_out chunks the batch back per
+    // sequence, then clone_in rebuilds a batch of 1 from chain B's slots.
+    // The old shared xs_history kept its batch-2 buffer here and crashed on
+    // the next batch-1 append.
+    {
+        let mut cache = model.cache_mut().normal();
+        for entry in cache.0.iter_mut() {
+            let k = entry
+                .k()
+                .unwrap()
+                .expect("cache entry populated during decode")
+                .narrow(0, 1, 1)
+                .unwrap()
+                .copy()
+                .unwrap();
+            let v = entry
+                .v()
+                .unwrap()
+                .expect("cache entry populated during decode")
+                .narrow(0, 1, 1)
+                .unwrap()
+                .copy()
+                .unwrap();
+            entry.reset();
+            entry
+                .append(&k, &v)
+                .expect("splitting chain B back out of the batch must not fail");
+        }
+    }
+    for s in shrink_at..V4C_DECODE_STEPS {
+        let ids = Tensor::from_vec(vec![b_next[s]], (1, 1), &device).unwrap();
+        let logits = v4c_step(model.as_ref(), &ids, t + s)
+            .expect("chain B's post-shrink decode must not panic");
+        v4c_assert_close(
+            &v4c_row(&logits, 0),
+            &b_solo[s + 1],
+            &format!("post-shrink decode step {s} chain B"),
+        );
+    }
+
+    // ---- Scenario 2: lockstep 2-chain batch (prefill + decode), the
+    // voting fast path where sibling chains enter one bucket together.
+    // Chain A's rows are recorded so Scenario 3 can re-run it against a
+    // different batch-mate. ----
+    let mut a_with_b: Vec<Vec<f32>> = Vec::new();
+    v4c_reset(&mut model);
+    let mut both = a_prompt.clone();
+    both.extend_from_slice(&b_prompt);
+    let ids = Tensor::from_vec(both, (2, t), &device).unwrap();
+    let logits = v4c_step(model.as_ref(), &ids, 0)
+        .expect("2-chain batched prefill through the compressor path must not panic");
+    v4c_assert_close(&v4c_row(&logits, 0), &a_solo[0], "lockstep prefill chain A");
+    v4c_assert_close(&v4c_row(&logits, 1), &b_solo[0], "lockstep prefill chain B");
+    a_with_b.push(v4c_row(&logits, 0));
+
+    for s in 0..V4C_DECODE_STEPS {
+        let ids = Tensor::from_vec(vec![a_next[s], b_next[s]], (2, 1), &device).unwrap();
+        let logits = v4c_step(model.as_ref(), &ids, t + s)
+            .expect("2-chain batched decode through the compressor path must not panic");
+        v4c_assert_close(
+            &v4c_row(&logits, 0),
+            &a_solo[s + 1],
+            &format!("lockstep decode step {s} chain A"),
+        );
+        v4c_assert_close(
+            &v4c_row(&logits, 1),
+            &b_solo[s + 1],
+            &format!("lockstep decode step {s} chain B"),
+        );
+        a_with_b.push(v4c_row(&logits, 0));
+    }
+
+    // ---- Scenario 3: batch-mate invariance — the strongest, and the only
+    // arch-independent, anti-leak assertion here.
+    //
+    // Re-run the identical lockstep schedule for chain A, but pair it with a
+    // DIFFERENT sibling (chain C instead of chain B). Chain A's own tokens,
+    // the batch shape, and every GEMM shape are unchanged, so F16 rounding is
+    // unchanged and a correct per-sequence implementation is BIT-IDENTICAL for
+    // chain A — no rounding budget for a leak to hide in. Under the old shared
+    // xs_history this is exactly what broke: chain A's compressed branch read
+    // whatever history the sibling had last written.
+    //
+    // Keeping GEMM shapes fixed takes one deliberate construction. The MoE
+    // slow backend (`moe/experts.rs::forward_slow`) flattens the batch and
+    // gathers per expert, so the per-expert GEMM row count depends on how ALL
+    // sequences in the batch route. Every layer here hash-routes (all 3 layers
+    // are < the default `num_hash_layers` = 3), so routing is a pure function
+    // of token id: with `tid2eid[j] = j % 4` over `[vocab, top_k=2]`, token
+    // `x` selects experts `[(2x)%4, (2x+1)%4]` — i.e. PARITY of the token id
+    // picks the expert pair. Deriving C from B by `+2 (mod even vocab)`
+    // preserves every token's parity, so C routes identically to B, the
+    // per-expert row counts are unchanged, and only the sibling's VALUES
+    // differ. (Per-row dot products are independent, so differing sibling
+    // values cannot perturb chain A's rows.)
+    let c_prompt: Vec<u32> = b_prompt.iter().map(|x| (x + 2) % vocab as u32).collect();
+    let c_next: Vec<u32> = b_next.iter().map(|x| (x + 2) % vocab as u32).collect();
+    assert_eq!(vocab % 2, 0, "parity-preserving +2 requires an even vocab");
+    for (bt, ct) in b_prompt.iter().zip(c_prompt.iter()) {
+        assert_eq!(
+            bt % 2,
+            ct % 2,
+            "chain C must preserve chain B's token parity so hash routing — \
+             and therefore every MoE GEMM shape — is identical"
+        );
+    }
+    // Chain C must still be a genuinely different neighbour, else the
+    // invariance check is vacuous.
+    let (c_solo, _c_snap) = v4c_solo_run(&mut model, &c_prompt, &c_next);
+    v4c_assert_chains_differ(&b_solo[0], &c_solo[0], "sibling chains B vs C");
+
+    v4c_reset(&mut model);
+    let mut both = a_prompt.clone();
+    both.extend_from_slice(&c_prompt);
+    let ids = Tensor::from_vec(both, (2, t), &device).unwrap();
+    let logits = v4c_step(model.as_ref(), &ids, 0)
+        .expect("A+C batched prefill must not panic");
+    v4c_assert_bit_identical(
+        &v4c_row(&logits, 0),
+        &a_with_b[0],
+        "batch-mate invariance, prefill chain A (sibling B -> C)",
+    );
+
+    for s in 0..V4C_DECODE_STEPS {
+        let ids = Tensor::from_vec(vec![a_next[s], c_next[s]], (2, 1), &device).unwrap();
+        let logits =
+            v4c_step(model.as_ref(), &ids, t + s).expect("A+C batched decode must not panic");
+        v4c_assert_bit_identical(
+            &v4c_row(&logits, 0),
+            &a_with_b[s + 1],
+            &format!("batch-mate invariance, decode step {s} chain A (sibling B -> C)"),
+        );
+    }
+}
+
+// ===========================================================================
 // KIMI K2.5 / K2.6 SYNTHETIC SMOKE
 // ===========================================================================
 //
