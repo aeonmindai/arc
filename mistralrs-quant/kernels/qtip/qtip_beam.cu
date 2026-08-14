@@ -137,6 +137,13 @@ __device__ __forceinline__ void qb_hist_inc(
 // Block-wide exclusive prefix sum of one value per thread (exactly QB_THREADS
 // threads participate). Returns this thread's exclusive prefix; `*total`
 // receives the block sum. Contains its own barriers: safe to call back to back.
+// wave16-AF: `slot` selects one of two scratch buffers, alternating per call.
+// The original had to open with a `__syncthreads()` purely to stop this call's
+// writes from racing the *previous* call's reads of the same 8 words. At ~6
+// scans per timestep that barrier was ~6 of the 33 per-step barriers, on a
+// kernel measured to be latency-bound. Alternating buffers removes the hazard
+// structurally — no ordering invariant for a future caller to violate — for 32
+// extra bytes of shared memory.
 __device__ __forceinline__ unsigned int qb_block_excl_scan(
     unsigned int v, unsigned int* __restrict__ s_warp_tot, unsigned int* total
 ) {
@@ -149,8 +156,6 @@ __device__ __forceinline__ unsigned int qb_block_excl_scan(
         const unsigned int y = __shfl_up_sync(0xFFFFFFFFu, x, d);
         if (lane >= (unsigned int)d) x += y;
     }
-    // Barrier before touching the scratch: a previous call may still be read.
-    __syncthreads();
     if (lane == 31u) s_warp_tot[warp] = x;
     __syncthreads();
     if (warp == 0u) {
@@ -168,7 +173,15 @@ __device__ __forceinline__ unsigned int qb_block_excl_scan(
     return warp_excl + x - v;
 }
 
-__global__ void __launch_bounds__(QB_THREADS)
+// wave16-AF: the second argument is load-bearing. Without a
+// `minBlocksPerMultiprocessor` nvcc may use up to 255 registers/thread, which
+// caps this kernel at 1-2 blocks/SM — and at 1757 instructions and 33 barriers
+// per timestep it is latency-bound, so occupancy is the multiplier on
+// everything. 4 blocks/SM caps registers at 64/thread and fits shared memory
+// (4 x 37,984 B = 152 KiB of sm_90's 228 KiB). The 32-bit selection above is
+// what makes 64 registers reachable: it removes the 64-bit key temporaries
+// that were live across the whole radix loop.
+__global__ void __launch_bounds__(QB_THREADS, 4)
 qtip_quantize_rows_beam_kernel(
     const float*   __restrict__ weight,      // [n_rows, in_features]
     const float*   __restrict__ lut,         // [2^L * V]
@@ -189,7 +202,11 @@ qtip_quantize_rows_beam_kernel(
     __shared__ float          s_grp_cost   [QB_MAX_BEAM];
     __shared__ unsigned short s_grp_parent [QB_MAX_BEAM];
     __shared__ unsigned int   s_hist[256];
-    __shared__ unsigned int   s_warp_tot[QB_WARPS];
+    // Two scan scratch buffers, alternated by `qb_scan_slot` (see
+    // qb_block_excl_scan): consecutive scans never touch the same words, so no
+    // barrier is needed to separate them.
+    __shared__ unsigned int   s_warp_tot_buf[2 * QB_WARPS];
+    unsigned int qb_scan_slot = 0u;
     __shared__ unsigned int   s_sel_bin;
     __shared__ unsigned int   s_sel_k;
     __shared__ unsigned int   s_sel_cnt;
@@ -224,6 +241,10 @@ qtip_quantize_rows_beam_kernel(
     for (int i = tid; i < (int)QB_GROUP_COUNT; i += QB_THREADS) {
         s_gmin[i] = QB_KEY_MAX;
     }
+    // The digit histogram is zeroed ONCE per row. Every radix pass clears its
+    // own bin immediately after reading it (see below), so "all zero on entry"
+    // is an invariant the passes maintain rather than a cost they re-pay.
+    s_hist[tid] = 0u;
     if (tid == 0) {
         s_beam_n   = 0;
         s_n_groups = 0;
@@ -268,7 +289,7 @@ qtip_quantize_rows_beam_kernel(
             //     per non-empty group) and compact deterministically.
             const unsigned int win = (in_beam && s_gmin[my_g] == my_key) ? 1u : 0u;
             unsigned int n_groups = 0u;
-            const unsigned int pos = qb_block_excl_scan(win, s_warp_tot, &n_groups);
+            const unsigned int pos = qb_block_excl_scan(win, s_warp_tot_buf + QB_WARPS * (qb_scan_slot ^= 1u), &n_groups);
             // The scan's barriers separate the s_gmin reads above from the
             // releases below.
             if (win) {
@@ -309,31 +330,54 @@ qtip_quantize_rows_beam_kernel(
             if (tid == 0) s_threshold = QB_KEY_MAX;
             __syncthreads();
         } else {
-            unsigned long long prefix = 0ull;
+            // wave16-AF: radix-select over the 32-bit COST key, with an exact
+            // fallback into the 16 state bits only when costs actually tie.
+            //
+            // The previous version resolved the full 48-bit `(cost, state)`
+            // composite, paying 64-bit shifts and compares on every digit.
+            // `probe_beam_kernel_cost_drivers` measured what that buys: the
+            // selection terminates inside the cost key in 98.4% of timesteps
+            // (the pass histogram reaches the state bits 229 times in 14,328).
+            // So the state half of the key is dead weight almost always, and
+            // splitting it out turns the hot loop into 32-bit arithmetic
+            // without changing which candidate is chosen.
+            //
+            // Ordering is unchanged and remains exactly `f32::total_cmp` on the
+            // cost, then ascending state: `cost_prefix` is resolved first and
+            // the tie pass below breaks equal cost keys by state, which is the
+            // same lexicographic order the composite key encoded.
+            unsigned int cost_prefix = 0u;
             int k = beam_w;
-            for (int shift = 40; shift >= 0; shift -= 8) {
-                for (int i = tid; i < 256; i += QB_THREADS) s_hist[i] = 0u;
-                __syncthreads();
+            unsigned int tie_count = 0u;   // candidates sharing the final cost key
+            int exit_shift = 0;            // digit at which the scan stopped
+            for (int shift = 24; shift >= 0; shift -= 8) {
+                exit_shift = shift;
 
                 #pragma unroll
                 for (int j = 0; j < (int)QB_ALPHABET; ++j) {
-                    unsigned long long key = 0ull;
+                    unsigned int ck = 0u;
                     bool part = false;
                     if (active) {
-                        key = ((unsigned long long)qtip_total_order_key(cand[j]) << 16)
-                            | (unsigned long long)(base_state | (unsigned int)j);
-                        part = ((key >> (shift + 8)) == (prefix >> (shift + 8)));
+                        ck = qtip_total_order_key(cand[j]);
+                        // `shift == 24` makes the guard vacuous; the compiler
+                        // folds it away in that unrolled iteration.
+                        part = (shift == 24) ||
+                               ((ck >> (shift + 8)) == (cost_prefix >> (shift + 8)));
                     }
-                    const unsigned int bin =
-                        part ? (unsigned int)((key >> shift) & 0xFFull) : 0u;
+                    const unsigned int bin = part ? ((ck >> shift) & 0xFFu) : 0u;
                     qb_hist_inc(s_hist, part, bin);
                 }
                 __syncthreads();
 
                 // Find the digit bin holding the k-th smallest of this prefix.
+                // Clear-for-next-pass here rather than at the top of the next
+                // one: every thread reads only its OWN bin, so zeroing it
+                // immediately after that read needs no barrier, and it removes
+                // one barrier per radix pass.
                 const unsigned int v = s_hist[tid];
+                s_hist[tid] = 0u;
                 unsigned int total = 0u;
-                const unsigned int excl = qb_block_excl_scan(v, s_warp_tot, &total);
+                const unsigned int excl = qb_block_excl_scan(v, s_warp_tot_buf + QB_WARPS * (qb_scan_slot ^= 1u), &total);
                 if (excl < (unsigned int)k && (unsigned int)k <= excl + v) {
                     s_sel_bin = (unsigned int)tid;
                     s_sel_k   = (unsigned int)k - excl;
@@ -341,18 +385,71 @@ qtip_quantize_rows_beam_kernel(
                 }
                 __syncthreads();
 
-                prefix |= ((unsigned long long)s_sel_bin) << shift;
+                cost_prefix |= s_sel_bin << shift;
                 k = (int)s_sel_k;
-                if (s_sel_cnt == 1u) {
-                    // A single candidate carries this prefix, so it IS the
-                    // beam_w-th smallest: saturate the unresolved low bits and
-                    // stop. `key <= threshold` then selects it plus everything
-                    // strictly below — exactly beam_w candidates.
-                    if (shift > 0) prefix |= (1ull << shift) - 1ull;
-                    break;
+                tie_count = s_sel_cnt;
+                if (tie_count == 1u) {
+                    break;   // unique cost key: the state bits cannot matter
                 }
             }
-            if (tid == 0) s_threshold = prefix;
+
+            unsigned long long threshold_key;
+            if (tie_count == 1u) {
+                // One candidate carries this cost prefix, so it is the beam_w-th
+                // smallest outright — but the scan may have stopped before
+                // resolving every bit, so the unresolved low cost bits must be
+                // saturated too, not just the state half. `key <= threshold`
+                // then admits that candidate plus everything strictly cheaper —
+                // exactly beam_w candidates.
+                const unsigned int cost_hi =
+                    (exit_shift > 0) ? (cost_prefix | ((1u << exit_shift) - 1u)) : cost_prefix;
+                threshold_key = ((unsigned long long)cost_hi << 16) | 0xFFFFull;
+            } else {
+                // Genuine cost tie (1.6% of timesteps, measured). `k` of the
+                // `tie_count` candidates sharing `cost_prefix` are admitted, and
+                // the tie-break is ascending state — identical to what the
+                // 48-bit composite did, resolved here in two 8-bit passes over
+                // the 16-bit state.
+                unsigned int state_prefix = 0u;
+                for (int shift = 8; shift >= 0; shift -= 8) {
+
+                    #pragma unroll
+                    for (int j = 0; j < (int)QB_ALPHABET; ++j) {
+                        bool part = false;
+                        unsigned int st = 0u;
+                        if (active) {
+                            st = base_state | (unsigned int)j;
+                            part = (qtip_total_order_key(cand[j]) == cost_prefix) &&
+                                   ((shift == 8) ||
+                                    ((st >> (shift + 8)) == (state_prefix >> (shift + 8))));
+                        }
+                        const unsigned int bin = part ? ((st >> shift) & 0xFFu) : 0u;
+                        qb_hist_inc(s_hist, part, bin);
+                    }
+                    __syncthreads();
+
+                    const unsigned int v = s_hist[tid];
+                    s_hist[tid] = 0u;   // maintain the all-zero invariant
+                    unsigned int total = 0u;
+                    const unsigned int excl = qb_block_excl_scan(v, s_warp_tot_buf + QB_WARPS * (qb_scan_slot ^= 1u), &total);
+                    if (excl < (unsigned int)k && (unsigned int)k <= excl + v) {
+                        s_sel_bin = (unsigned int)tid;
+                        s_sel_k   = (unsigned int)k - excl;
+                        s_sel_cnt = v;
+                    }
+                    __syncthreads();
+
+                    state_prefix |= s_sel_bin << shift;
+                    k = (int)s_sel_k;
+                    if (s_sel_cnt == 1u) {
+                        if (shift > 0) state_prefix |= (1u << shift) - 1u;
+                        break;
+                    }
+                }
+                threshold_key = ((unsigned long long)cost_prefix << 16)
+                              | (unsigned long long)(state_prefix & 0xFFFFu);
+            }
+            if (tid == 0) s_threshold = threshold_key;
             __syncthreads();
         }
 
@@ -373,7 +470,7 @@ qtip_quantize_rows_beam_kernel(
             }
         }
         unsigned int kept = 0u;
-        const unsigned int base_slot = qb_block_excl_scan(keep_cnt, s_warp_tot, &kept);
+        const unsigned int base_slot = qb_block_excl_scan(keep_cnt, s_warp_tot_buf + QB_WARPS * (qb_scan_slot ^= 1u), &kept);
         // After the scan nothing reads the previous beam (the group records
         // already captured every value the expansion needed), so the beam is
         // rewritten in place.

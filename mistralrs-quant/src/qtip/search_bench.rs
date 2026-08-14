@@ -837,3 +837,215 @@ fn beam_cost_model_invariants() {
         "the 4096-entry group table should dominate the shared-memory budget"
     );
 }
+
+// ---------------------------------------------------------------------------
+// CUDA beam kernel: measured cost drivers (wave16-AF)
+// ---------------------------------------------------------------------------
+//
+// The hardware run measured 238 s/layer for the beam-256 GPU search against
+// 510 s/layer for the exhaustive kernel — 2.1x, where wave13-AF projected
+// 6-12x. GPU telemetry during the search read sm=100%, mem=1%, 261 W of 700 W
+// at max clocks: resident everywhere, working nowhere. Memory was NOT the
+// limit (mem=1% confirms the 257x HBM cut landed), so the cost has to be in
+// how the kernel spends issue slots.
+//
+// Two quantities set that, and neither is visible in the CUDA source because
+// both are data-dependent:
+//
+//   * `ng`, the number of distinct prefix groups in the beam. The kernel maps
+//     ONE THREAD PER GROUP (`active = tid < ng` in qtip_beam.cu), so `ng` is
+//     literally the number of the block's 256 threads that have work in the
+//     expansion phase. If `ng` is small, most of the block idles at a barrier.
+//   * the number of 8-bit radix-select passes. Each pass costs 6 block
+//     barriers and 16 key rebuilds per thread, so the pass count multiplies
+//     the most expensive phase of the step.
+//
+// Both are properties of the beam search, not of CUDA, so they are measurable
+// here. This probe replaces the guesswork in the wave13-AF projection with
+// arithmetic over observed values.
+
+/// `cargo test -p mistralrs-quant --lib probe_beam_kernel_cost_drivers -- --ignored --nocapture`
+#[test]
+#[ignore = "evidence probe (~1-2 min); run with --ignored --nocapture"]
+fn probe_beam_kernel_cost_drivers() {
+    use super::viterbi::beam_kernel_stats;
+
+    let lut = gaussian_lut();
+    // V4-Flash MoE expert shapes: gate/up read hidden_size = 7168, down reads
+    // moe_intermediate_size = 2048. Rows are the parallel axis; K sets the
+    // trellis length, which is what this probe cares about.
+    let shapes: [(&str, usize); 2] = [("gate/up  k=7168", 7168), ("down     k=2048", 2048)];
+    let n_rows = 4;
+
+    println!(
+        "\n=== CUDA beam kernel cost drivers, measured on the CPU beam \
+         (FP4-lattice weights, hadamard-128, W=256) ==="
+    );
+    println!(
+        "{:<16} | {:>7} | {:>9} | {:>7} | {:>7} | {:>10} | ng histogram (1,16,32,64,96,128,160,208+)",
+        "shape", "steps", "mean ng", "min ng", "max ng", "mean pass"
+    );
+
+    for (label, k) in shapes {
+        let w = gen_fp4_dequant(n_rows, k, 0.02, 0x00BE_A115);
+        let signs = generate_signs(QTIP_ROTATION_SEED, k);
+        let mut agg = super::viterbi::BeamKernelStats {
+            group_min: usize::MAX,
+            ..Default::default()
+        };
+        for row in 0..n_rows {
+            let mut rot = w[row * k..(row + 1) * k].to_vec();
+            apply_block_rotation(&mut rot, &signs, ROT_BLOCK);
+            let max_abs = rot.iter().fold(0f32, |m, &v| m.max(v.abs()));
+            let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 3.0 };
+            let inv = 1.0 / scale;
+            let target: Vec<f32> = rot.iter().map(|&v| v * inv).collect();
+
+            let s = beam_kernel_stats(&target, &lut, 256);
+            agg.steps += s.steps;
+            agg.group_sum += s.group_sum;
+            agg.group_min = agg.group_min.min(s.group_min);
+            agg.group_max = agg.group_max.max(s.group_max);
+            agg.pass_sum += s.pass_sum;
+            agg.unpruned_steps += s.unpruned_steps;
+            for i in 0..8 {
+                agg.group_hist[i] += s.group_hist[i];
+            }
+            for i in 0..7 {
+                agg.pass_hist[i] += s.pass_hist[i];
+            }
+            agg.wasted_leading_digits_sum += s.wasted_leading_digits_sum;
+            agg.top_differing_bit_sum += s.top_differing_bit_sum;
+            agg.skip_pass_sum += s.skip_pass_sum;
+        }
+        println!(
+            "{label:<16} | {:>7} | {:>9.1} | {:>7} | {:>7} | {:>10.2} | {:?}",
+            agg.steps,
+            agg.mean_groups(),
+            agg.group_min,
+            agg.group_max,
+            agg.mean_passes(),
+            agg.group_hist
+        );
+        println!(
+            "{:<16}   radix pass histogram (index = passes): {:?}, unpruned steps {}",
+            "", agg.pass_hist, agg.unpruned_steps
+        );
+
+        // The derived per-step kernel costs, stated in the units the analysis
+        // needs: active threads out of 256, and block barriers per timestep
+        // (10 fixed + 6 per radix pass, counted from qtip_beam.cu).
+        let occupancy = agg.mean_groups() / 256.0;
+        let barriers = 10.0 + 6.0 * agg.mean_passes();
+        println!(
+            "{:<16}   => expansion-phase thread occupancy {:.1}% of the block; \
+             {:.0} block barriers per timestep",
+            "",
+            occupancy * 100.0,
+            barriers
+        );
+        println!(
+            "{:<16}   => mean {:.2} of those passes are WASTED (all candidates in one bin); \
+             highest differing key bit {:.1} of 48",
+            "",
+            agg.mean_wasted_digits(),
+            agg.mean_top_differing_bit()
+        );
+        println!(
+            "{:<16}   => starting the scan at the first differing digit: {:.2} passes \
+             (vs {:.2}), i.e. {:.0} barriers instead of {:.0}",
+            "",
+            agg.mean_skip_passes(),
+            agg.mean_passes(),
+            10.0 + 6.0 * agg.mean_skip_passes(),
+            barriers
+        );
+    }
+}
+
+/// **The parity argument for the wave16-AF kernel rewrite, checked on CPU.**
+///
+/// `qtip_beam.cu` used to radix-select over the 48-bit `(cost, state)`
+/// composite key; it now scans the 32-bit cost key and falls back into the
+/// state bits only when costs genuinely tie. That is a change to *which bits
+/// are examined in what order*, and it must not be a change to *which
+/// candidates are selected* — byte-identity with the CPU beam is the whole
+/// reason the artifact is trustworthy.
+///
+/// This replays both scans on every real candidate set produced by beam
+/// searching production-shaped rows, and asserts they admit the identical set.
+/// It is a much stronger check than comparing thresholds: two different
+/// thresholds can still select the same set, and the set is what matters.
+///
+/// This runs on any machine, so the rewrite is guarded before it ever reaches
+/// a GPU. `cuda_beam_matches_cpu_beam_bit_for_bit` remains the hardware gate.
+#[test]
+fn wave16_split_key_selection_matches_composite_key() {
+    use super::viterbi::{for_each_candidate_set, threshold_composite_key, threshold_split_key};
+
+    let lut = gaussian_lut();
+    let mut checked = 0usize;
+    let mut tie_steps = 0usize;
+
+    // Two shapes, and a width that prunes hard, so the selection actually runs.
+    for (k, seed, width) in [
+        (2048usize, 0x00BE_A115u64, 256usize),
+        (1024, 0x0051_EA11, 64),
+    ] {
+        let w = gen_fp4_dequant(2, k, 0.02, seed);
+        let signs = generate_signs(QTIP_ROTATION_SEED, k);
+        for row in 0..2 {
+            let mut rot = w[row * k..(row + 1) * k].to_vec();
+            apply_block_rotation(&mut rot, &signs, ROT_BLOCK);
+            let max_abs = rot.iter().fold(0f32, |m, &v| m.max(v.abs()));
+            let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 3.0 };
+            let inv = 1.0 / scale;
+            let target: Vec<f32> = rot.iter().map(|&v| v * inv).collect();
+
+            for_each_candidate_set(&target, &lut, width, |keys, wdt| {
+                let t_old = threshold_composite_key(keys, wdt);
+                let t_new = threshold_split_key(keys, wdt);
+
+                let sel_old = keys.iter().filter(|&&x| x <= t_old).count();
+                let sel_new = keys.iter().filter(|&&x| x <= t_new).count();
+                assert_eq!(
+                    sel_old, wdt,
+                    "composite scan must admit exactly the beam width"
+                );
+                assert_eq!(
+                    sel_new, wdt,
+                    "split-key scan admitted {sel_new} candidates, not {wdt}"
+                );
+                // Same COUNT is not enough — it must be the same SET.
+                for &key in keys {
+                    assert_eq!(
+                        key <= t_old,
+                        key <= t_new,
+                        "split-key scan disagrees on candidate {key:#x} \
+                         (composite threshold {t_old:#x}, split {t_new:#x})"
+                    );
+                }
+                // Track how often the state bits are actually needed.
+                let cost_hi = (t_old >> 16) as u32;
+                if keys
+                    .iter()
+                    .filter(|&&x| (x >> 16) as u32 == cost_hi)
+                    .count()
+                    > 1
+                {
+                    tie_steps += 1;
+                }
+                checked += 1;
+            });
+        }
+    }
+
+    assert!(
+        checked > 3000,
+        "only {checked} candidate sets checked — fixture too small to be evidence"
+    );
+    println!(
+        "wave16 split-key selection == composite-key selection on {checked} real candidate \
+         sets ({tie_steps} of them needed the state-bit tie-break)"
+    );
+}
