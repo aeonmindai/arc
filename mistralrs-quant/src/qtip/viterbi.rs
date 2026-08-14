@@ -1241,6 +1241,240 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // wave19-AP — the gmin-only exhaustive recursion (kernels/qtip/qtip_gmin.cu)
+    // -----------------------------------------------------------------------
+
+    /// Deliberate defects injected into the replay to prove the identity
+    /// assertion below can actually fail. A parity test whose assertion is
+    /// unreachable is worse than no test (DOCTRINE D12).
+    ///
+    /// Every variant here is *load-bearing*: it changes the answer on ordinary
+    /// data. Two plausible-looking mutations were tried and rejected because
+    /// they have no teeth, which is itself worth recording — both are pure
+    /// tie-breaks, and with a non-degenerate LUT an exact `f32` tie between
+    /// `err(s_m) + gmin[pred_m]` for two different `m` essentially never
+    /// happens on finite costs:
+    ///   * `c <= best` (last predecessor wins ties) — measured identical on all
+    ///     43 fixtures. Ties DO occur, but only in the `+inf` region of the
+    ///     early timesteps, i.e. in groups the optimal path never enters.
+    ///   * final state keyed by `(cost, group)` instead of `(cost, state)` —
+    ///     same reason: the state's high bits only break a cost tie.
+    /// Both rules are still implemented exactly as the CPU reference has them,
+    /// because that is what makes the equivalence an identity rather than an
+    /// approximation; they are simply not independently observable here.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum GminMutation {
+        /// The kernel as written.
+        None,
+        /// Predecessor group `(m << 8) | (g >> 4)` mis-derived as
+        /// `(m << 8) | (g & 0xFF)` — the single most likely transcription error
+        /// in the whole recursion.
+        WrongPredecessorGroup,
+        /// Branch metric drops the accumulated predecessor cost, turning the DP
+        /// into a per-position greedy pick.
+        DropPredecessorCost,
+        /// Local error evaluated at the group `g` instead of the full state
+        /// `(m << 12) | g` — i.e. forgetting that the 16 states of a group have
+        /// different codebook entries.
+        ErrAtGroupNotState,
+        /// Backtrace read one position late (`trace[t - 1]` instead of
+        /// `trace[t]`). The index shift between "argmin stored at t" and
+        /// "argmin consumed at t" is the subtlest part of the derivation.
+        WalkTraceOffByOne,
+        /// Emitted symbol taken from the wrong nibble of the group.
+        WalkSymbolFromHighNibble,
+    }
+
+    /// Replay of `kernels/qtip/qtip_gmin.cu` in the kernel's exact scan order.
+    ///
+    /// The kernel never materialises the 2^L cost array: it iterates the
+    /// recursion
+    ///
+    /// ```text
+    /// gmin_t[g] = min over m of ( err_t((m << 12) | g) + gmin_{t-1}[(m << 8) | (g >> 4)] )
+    /// ```
+    ///
+    /// on 4096 f32, carries the argmin `m` as the backtrace, and walks back on
+    /// groups alone (`sym_t = g_t & 0xF`, `g_{t-1} = (arg_t[g_t] << 8) | (g_t >> 4)`).
+    #[allow(clippy::needless_range_loop)]
+    fn gmin_replay_quantize_row(
+        target_row: &[f32],
+        lut: &[f32],
+        mutation: GminMutation,
+    ) -> Vec<u8> {
+        const G_BITS: u32 = super::super::L - K; // 12
+        const G_COUNT: usize = 1 << G_BITS; // 4096
+        let num_symbols = target_row.len() / V as usize;
+        assert!(num_symbols > 0);
+        let inf = f32::INFINITY;
+
+        // t = 0: only states 0..ALPHABET are reachable from the implicit start
+        // state 0, and group g collects {(m << 12) | g}, of which only m = 0 can
+        // be below 16.
+        let target0 = &target_row[..V as usize];
+        let mut gmin: Vec<f32> = (0..G_COUNT)
+            .map(|g| {
+                if g < ALPHABET {
+                    decode_error(lut, g as u32, target0)
+                } else {
+                    inf
+                }
+            })
+            .collect();
+        let mut next = vec![inf; G_COUNT];
+        // `trace[t]` is the per-group argmin at position t; index 0 is never
+        // read (the walk terminates by emitting `g_0 & 0xF`).
+        let mut trace: Vec<Vec<u8>> = vec![vec![0u8; G_COUNT]];
+
+        for t in 1..num_symbols {
+            let tt = &target_row[t * V as usize..(t + 1) * V as usize];
+            let mut arg = vec![0u8; G_COUNT];
+            for g in 0..G_COUNT {
+                let mut best = inf;
+                let mut bm = 0u8;
+                for m in 0..ALPHABET as u32 {
+                    let s = match mutation {
+                        GminMutation::ErrAtGroupNotState => g as u32,
+                        _ => (m << G_BITS) | g as u32,
+                    };
+                    let pred = match mutation {
+                        GminMutation::WrongPredecessorGroup => (m << 8) | (g as u32 & 0xFF),
+                        _ => (m << 8) | (g as u32 >> K),
+                    };
+                    let err = decode_error(lut, s, tt);
+                    let c = match mutation {
+                        GminMutation::DropPredecessorCost => err,
+                        _ => err + gmin[pred as usize],
+                    };
+                    if c < best {
+                        best = c;
+                        bm = m as u8;
+                    }
+                }
+                next[g] = best;
+                arg[g] = bm;
+            }
+            std::mem::swap(&mut gmin, &mut next);
+            trace.push(arg);
+        }
+
+        // Best final state, as a min over the 4096 group representatives.
+        // Within a group the argmin is the lowest-indexed state attaining the
+        // group minimum, so the lowest state attaining the GLOBAL minimum is
+        // among them; `(cost, state)` on the ordered key reproduces the CPU
+        // reference's "strict `<` over ascending s".
+        let arg_last = &trace[num_symbols - 1];
+        let mut best_key = u64::MAX;
+        for g in 0..G_COUNT {
+            let m = arg_last[g] as u32;
+            let st = (m << G_BITS) | g as u32;
+            let key = ((total_order_key(gmin[g]) as u64) << 16) | st as u64;
+            if key < best_key {
+                best_key = key;
+            }
+        }
+        let mut g = (best_key as u32) & (G_COUNT as u32 - 1);
+
+        let sym_of = |g: u32| -> u8 {
+            match mutation {
+                GminMutation::WalkSymbolFromHighNibble => ((g >> K) & (ALPHABET as u32 - 1)) as u8,
+                _ => (g & (ALPHABET as u32 - 1)) as u8,
+            }
+        };
+        let mut symbols = vec![0u8; num_symbols];
+        symbols[num_symbols - 1] = sym_of(g);
+        for t in (1..num_symbols).rev() {
+            let src = match mutation {
+                GminMutation::WalkTraceOffByOne => t - 1,
+                _ => t,
+            };
+            let m = trace[src][g as usize] as u32;
+            g = (m << (G_BITS - K)) | (g >> K);
+            symbols[t - 1] = sym_of(g);
+        }
+        symbols
+    }
+
+    /// **THE CPU-side gate for the gmin kernel.** The gmin-only recursion is not
+    /// an approximation of the exhaustive DP — it is the same DP with the 16x
+    /// state replication removed — so it must return the byte-identical symbol
+    /// stream, on every fixture, including the FP4-lattice weights that are the
+    /// actual source distribution of V4's experts (D12: a Gaussian-only or
+    /// sinusoid-only fixture set has misled this repo twice).
+    ///
+    /// The mutation arm is what gives the assertion teeth: five transcription
+    /// errors that a reviewer could plausibly wave through are each shown to
+    /// change the output.
+    #[test]
+    fn gmin_replay_matches_exhaustive_bit_for_bit() {
+        let lut = gaussian_lut();
+
+        // Fixture family. `test_row` variants are periodic/analytic (variant 3
+        // manufactures exact ties); `fp4_dequant` is the heavy-tailed lattice
+        // distribution real experts come from.
+        let mut rows: Vec<(String, Vec<f32>)> = Vec::new();
+        for num_symbols in [1usize, 2, 3, 7, 16, 33, 64] {
+            for variant in 0..5u32 {
+                rows.push((
+                    format!("analytic T={num_symbols} v={variant}"),
+                    test_row(num_symbols, variant),
+                ));
+            }
+        }
+        let fp4 = super::super::bake_quality_tests::gen_fp4_dequant(4, 256, 0.02, 0x00A9_1234);
+        for r in 0..4usize {
+            let raw = &fp4[r * 256..(r + 1) * 256];
+            let max_abs = raw.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+            let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 3.0 };
+            rows.push((
+                format!("fp4_dequant row={r}"),
+                raw.iter().map(|&v| v / scale).collect(),
+            ));
+        }
+
+        let mut alphabet_seen = [false; 16];
+        for (name, target) in &rows {
+            let reference = viterbi_quantize_row(target, &lut);
+            let replay = gmin_replay_quantize_row(target, &lut, GminMutation::None);
+            for &s in &reference {
+                alphabet_seen[(s & 0x0F) as usize] = true;
+            }
+            assert_eq!(
+                reference, replay,
+                "{name}: the gmin-only recursion diverged from the exhaustive DP"
+            );
+        }
+        // Non-vacuity: if the search only ever emitted one or two symbols the
+        // identity above would be nearly free.
+        let distinct = alphabet_seen.iter().filter(|&&b| b).count();
+        assert!(
+            distinct >= 12,
+            "the fixture family only exercised {distinct}/16 symbols — too \
+             degenerate for byte identity to mean much"
+        );
+
+        // Teeth: each mutation must change the answer somewhere.
+        for mutation in [
+            GminMutation::WrongPredecessorGroup,
+            GminMutation::DropPredecessorCost,
+            GminMutation::ErrAtGroupNotState,
+            GminMutation::WalkTraceOffByOne,
+            GminMutation::WalkSymbolFromHighNibble,
+        ] {
+            let differed = rows.iter().any(|(_, target)| {
+                let reference = viterbi_quantize_row(target, &lut);
+                let replay = gmin_replay_quantize_row(target, &lut, mutation);
+                replay != reference
+            });
+            assert!(
+                differed,
+                "{mutation:?} produced the reference answer on every fixture — \
+                 the identity assertion above has no teeth against it"
+            );
+        }
+    }
+
     // --- helpers ---
 
     /// Naive O(T·2^L·2^K) Viterbi — the pre-optimization reference, kept ONLY to
