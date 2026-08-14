@@ -83,6 +83,12 @@ pub use mxfp4::MXFP4Layer;
 pub use nvfp4::NVFP4Layer;
 pub use pending_layer::PendingIsqLayer;
 pub use pertensor_fp8::PerTensorFP8Linear;
+pub use qtip::tune::{
+    gemv_num_variants as qtip2b_gemv_num_variants, gemv_variant_applicable,
+    gemv_variant_desc as qtip2b_gemv_variant_desc,
+    gemv_variant_for_shape as qtip2b_gemv_variant_for_shape, set_forced_gemv_variant,
+    GemvTuneEntry, GemvVariantDesc, QTIP2B_GEMV_BAKED_TABLE, QTIP2B_GEMV_VARIANT_LEGACY,
+};
 pub use qtip::{
     gpu_quantize_cpu_fallback_count, ExpertBpwTable, Qtip2bLayer, QtipLayer, QtipMode,
     QtipPackedView, TrellisBpw, QTIP2B_MCG_MULT,
