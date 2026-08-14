@@ -111,9 +111,15 @@ pub use mistralrs_mcp::{
 pub use mistralrs_quant::{IsqBits, IsqType, MULTI_LORA_DELIMITER};
 pub use paged_attention::{AttentionImplementation, MemoryGpuConfig, PagedAttentionConfig, PagedCacheType};
 pub use pipeline::hf::{hf_home_dir, hf_hub_cache_dir, hf_token_path};
+pub use pipeline::calibration::{
+    begin_model_calibration, calibration_requested, extract_calibration_artifact,
+    peek_calibration_request, set_calibration_request, take_calibration_request, ArmReport,
+    CalibrationRequest, CalibrationRunInfo,
+};
 pub use pipeline::post_load_hooks::{register_post_load_hook, PostLoadHook};
 pub use pipeline::{
-    chat_template::ChatTemplate, expand_isq_value, parse_isq_value, AdapterPaths, AnyMoeLoader,
+    chat_template::ChatTemplate, expand_isq_value, isq_artifact_tensor_name, parse_isq_value,
+    AdapterPaths, AnyMoeLoader,
     AnyMoePipeline, AutoDeviceMapParams, AutoLoader, AutoLoaderBuilder, AutoNormalLoader,
     DeepSeekV3Loader, DeepSeekV4Loader, DiffusionGenerationParams, DiffusionLoader,
     DiffusionLoaderBuilder, DiffusionLoaderType, EmbeddingLoader, EmbeddingLoaderBuilder,

@@ -3,11 +3,13 @@
 //! This module provides cleanly organized argument structs using clap's derive macros.
 //! Arguments are grouped logically to improve discoverability and reduce duplication.
 
+mod calibrate;
 mod model;
 mod paged_attn;
 mod quantize;
 mod server;
 
+pub use calibrate::*;
 pub use model::*;
 pub use paged_attn::*;
 pub use quantize::*;
@@ -82,6 +84,21 @@ pub enum Command {
         /// Default quantize options (used when model type is not specified)
         #[command(flatten)]
         default_quantize: QuantizeDefaultOptions,
+    },
+
+    /// Collect per-linear activation statistics into a `.arccalib` artifact.
+    ///
+    /// Runs the model unquantized and forward-only over a text corpus,
+    /// accumulating `diag(XᵀX)` (plus optional gram blocks and per-expert
+    /// statistics) for every ISQ-eligible linear. The artifact feeds
+    /// activation-aware quantization and TD-MoE whitening.
+    Calibrate {
+        #[command(subcommand)]
+        model_type: Option<CalibrateModelType>,
+
+        /// Default calibrate options (used when model type is not specified)
+        #[command(flatten)]
+        default_calibrate: CalibrateDefaultOptions,
     },
 
     /// Run system diagnostics and environment checks

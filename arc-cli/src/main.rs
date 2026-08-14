@@ -287,9 +287,15 @@ fn main() {
     }
 }
 
-/// Strip Arc-only flags (`--td-moe-rank N`, `--td-moe-calibration N`) from `args`
-/// and translate them into environment variables that the spawned `mistralrs`
-/// subprocess will pick up via `arc_engine::td_moe_loader::register_td_moe_hook`.
+/// Strip Arc-only flags (`--td-moe-rank N`, `--td-moe-calibration N`,
+/// `--calib <path>`) from `args` and translate them into environment variables
+/// that the spawned `mistralrs` subprocess will pick up via
+/// `arc_engine::td_moe_loader::register_td_moe_hook`.
+///
+/// `--calib <path>` points at a `.arccalib` artifact produced by
+/// `mistralrs calibrate`; supplying it switches TD-MoE whitening from the
+/// identity to the measured input activation covariance. Omitting it keeps the
+/// historical identity behaviour.
 ///
 /// Returns `(env_vars_to_set, remaining_args_to_forward)`.
 fn extract_arc_flags(args: Vec<String>) -> (HashMap<String, String>, Vec<String>) {
@@ -319,6 +325,16 @@ fn extract_arc_flags(args: Vec<String>) -> (HashMap<String, String>, Vec<String>
                     std::process::exit(2);
                 }
             }
+            "--calib" => {
+                if let Some(val) = args.get(i + 1) {
+                    env_vars.insert("ARC_TD_MOE_CALIB_PATH".into(), val.clone());
+                    i += 2;
+                    continue;
+                } else {
+                    eprintln!("ERROR: --calib requires a path to a .arccalib artifact");
+                    std::process::exit(2);
+                }
+            }
             _ => {
                 // Also support --flag=value form for the same Arc flags.
                 if let Some(rest) = arg.strip_prefix("--td-moe-rank=") {
@@ -328,6 +344,11 @@ fn extract_arc_flags(args: Vec<String>) -> (HashMap<String, String>, Vec<String>
                 }
                 if let Some(rest) = arg.strip_prefix("--td-moe-calibration=") {
                     env_vars.insert("ARC_TD_MOE_CALIBRATION".into(), rest.to_string());
+                    i += 1;
+                    continue;
+                }
+                if let Some(rest) = arg.strip_prefix("--calib=") {
+                    env_vars.insert("ARC_TD_MOE_CALIB_PATH".into(), rest.to_string());
                     i += 1;
                     continue;
                 }

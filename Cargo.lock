@@ -3617,6 +3617,7 @@ dependencies = [
  "mime_guess",
  "mistralrs",
  "mistralrs-core",
+ "mistralrs-quant",
  "mistralrs-server-core",
  "regex",
  "rustyline",

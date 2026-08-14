@@ -1,5 +1,6 @@
 mod amoe;
 mod auto;
+pub mod calibration;
 pub mod chat_template;
 mod diffusion;
 mod embedding;
@@ -39,8 +40,8 @@ use image::DynamicImage;
 pub use inputs_processor::InputProcessorOutput;
 pub(crate) use isq::IsqModelLoader;
 pub use isq::{
-    expand_isq_value, parse_isq_value, IsqModel, IsqOrganization, UqffFullSer, UqffSourceWeights,
-    UQFF_MTP_TENSOR_PREFIX, UQFF_MULTI_FILE_DELIMITER,
+    expand_isq_value, isq_artifact_tensor_name, parse_isq_value, IsqModel, IsqOrganization,
+    UqffFullSer, UqffSourceWeights, UQFF_MTP_TENSOR_PREFIX, UQFF_MULTI_FILE_DELIMITER,
 };
 pub use post_load_hooks::{register_post_load_hook, PostLoadHook};
 use llguidance::toktrie::TokEnv;

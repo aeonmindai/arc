@@ -860,10 +860,40 @@ impl Loader for NormalLoader {
                 IsqOrganization::MoeExpertsOnly => model.begin_track_stats_moe_experts_only()?,
             }
 
+            // Arc: a registered calibration request additionally arms the
+            // richer per-layer accumulators (raw diag(XᵀX) + optional gram +
+            // per-expert). With no request this is a no-op and the sweep
+            // behaves exactly as before.
+            let calib_request = crate::pipeline::calibration::take_calibration_request();
+            if let Some(req) = &calib_request {
+                let report =
+                    crate::pipeline::calibration::begin_model_calibration(&mut *model, &req.opts);
+                info!(
+                    "Arc calibration: armed {}/{} ISQ layers (options {:?})",
+                    report.armed, report.total, req.opts
+                );
+                if report.armed == 0 {
+                    warn!(
+                        "Arc calibration: no ISQ layer accepted an accumulator. The artifact \
+                         will contain a layer inventory but no statistics. This happens when the \
+                         checkpoint is already quantized on disk (FP8/GPTQ)."
+                    );
+                }
+            }
+            let max_chunks = calib_request.as_ref().and_then(|r| r.max_chunks);
+
             const CHUNK_SIZE: usize = 1024;
-            let n_chunks = tokens.len().div_ceil(CHUNK_SIZE);
+            let n_chunks = match max_chunks {
+                Some(max) => tokens.len().div_ceil(CHUNK_SIZE).min(max),
+                None => tokens.len().div_ceil(CHUNK_SIZE),
+            };
+            let mut swept_chunks = 0usize;
+            let mut swept_tokens = 0u64;
             let start = Instant::now();
             for (i, chunk) in tokens.chunks(CHUNK_SIZE).enumerate() {
+                if max_chunks.is_some_and(|max| i >= max) {
+                    break;
+                }
                 let mut chunk = chunk.to_vec();
                 if let Some(bos_tok_id) = bos_tok_id {
                     chunk.insert(0, bos_tok_id);
@@ -908,6 +938,9 @@ impl Loader for NormalLoader {
                     }
                 }
 
+                swept_chunks += 1;
+                swept_tokens += chunk_len as u64;
+
                 let end = Instant::now();
                 info!(
                     "Processed chunk {}/{n_chunks} ({chunk_len} tokens), {:.2}s",
@@ -921,6 +954,37 @@ impl Loader for NormalLoader {
                 "Finished collecting imatrix in {:.2}s",
                 end.duration_since(start).as_secs_f32()
             );
+
+            // Arc: harvest the calibration accumulators and write the artifact.
+            if let Some(req) = calib_request {
+                let run_info = crate::pipeline::calibration::CalibrationRunInfo {
+                    model_id: req.model_id.clone(),
+                    model_sha: None,
+                    arch: req.arch.clone(),
+                    isq_organization: match self.config.organization {
+                        IsqOrganization::Default => "default".to_string(),
+                        IsqOrganization::MoeExpertsOnly => "moqe".to_string(),
+                    },
+                    calibration_file: Some(calibration_file.display().to_string()),
+                    samples: swept_chunks,
+                    seq_len: CHUNK_SIZE,
+                    total_tokens: swept_tokens,
+                    model_dtype: format!("{dtype:?}"),
+                    options: req.opts,
+                };
+                let artifact = crate::pipeline::calibration::extract_calibration_artifact(
+                    &mut *model,
+                    run_info,
+                )?;
+                artifact.save(&req.out)?;
+                info!(
+                    "Arc calibration: wrote `{}` ({} layers, {} with statistics, {} tokens)",
+                    req.out.display(),
+                    artifact.layers.len(),
+                    artifact.supported_layer_count(),
+                    swept_tokens
+                );
+            }
         }
 
         // Only if loading from UQFF

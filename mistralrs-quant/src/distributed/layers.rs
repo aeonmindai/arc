@@ -254,6 +254,16 @@ impl QuantMethod for RowParallelLayer {
         self.weight.end_track_stats()
     }
 
+    fn begin_calibration(&mut self, opts: &crate::calibration::CalibOptions) -> Result<()> {
+        Arc::get_mut(&mut self.weight)
+            .context("Failed to get &mut to weight")?
+            .begin_calibration(opts)
+    }
+
+    fn end_calibration(&self) -> Result<crate::calibration::CalibLayerData> {
+        self.weight.end_calibration()
+    }
+
     fn quantized_act_type(&self) -> Option<candle_core::DType> {
         self.weight.quantized_act_type()
     }
@@ -600,6 +610,16 @@ impl QuantMethod for ColumnParallelLayer {
         self.weight.end_track_stats()
     }
 
+    fn begin_calibration(&mut self, opts: &crate::calibration::CalibOptions) -> Result<()> {
+        Arc::get_mut(&mut self.weight)
+            .context("Failed to get &mut to weight")?
+            .begin_calibration(opts)
+    }
+
+    fn end_calibration(&self) -> Result<crate::calibration::CalibLayerData> {
+        self.weight.end_calibration()
+    }
+
     fn quantized_act_type(&self) -> Option<candle_core::DType> {
         self.weight.quantized_act_type()
     }
@@ -918,6 +938,16 @@ impl QuantMethod for ReplicatedLayer {
 
     fn end_track_stats(&self) -> Result<Tensor> {
         self.0.end_track_stats()
+    }
+
+    fn begin_calibration(&mut self, opts: &crate::calibration::CalibOptions) -> Result<()> {
+        Arc::get_mut(&mut self.0)
+            .context("Failed to get &mut to weight")?
+            .begin_calibration(opts)
+    }
+
+    fn end_calibration(&self) -> Result<crate::calibration::CalibLayerData> {
+        self.0.end_calibration()
     }
 
     fn quantized_act_type(&self) -> Option<candle_core::DType> {
