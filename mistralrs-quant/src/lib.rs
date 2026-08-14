@@ -296,6 +296,81 @@ pub fn create_isq_thread_pool_for_device(
     (pool, num_threads)
 }
 
+/// Environment override for the host-side expert-unpack width.
+pub const EXPERT_UNPACK_THREADS_ENV: &str = "ARC_UNPACK_THREADS";
+
+/// Resolve the expert-unpack width from an explicit override and the machine's
+/// available parallelism, with no process-global state so it stays testable.
+///
+/// A malformed or zero override is ignored rather than honored: the failure
+/// mode of `ARC_UNPACK_THREADS=oops` must not be a serial bake.
+fn expert_unpack_threads_from(override_value: Option<&str>, available: usize) -> usize {
+    override_value
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or_else(|| available.max(1))
+}
+
+/// How many threads unpack (dequantize) packed MoE experts on the host.
+///
+/// **This is deliberately NOT [`isq_thread_policy`], and the two must not be
+/// collapsed back into one number.** They size different resources:
+///
+/// * [`isq_thread_policy`] sizes the pool that *submits quantize work to the
+///   GPU*. For QTIP on a GPU backend it must stay at 1. Session 5 ran it at 24
+///   and measured **4-9 min/layer** with no warning: every rayon worker
+///   launched Viterbi kernels and host<->device copies against the one device,
+///   so they only contended. PR #25 closed that trap and it stays closed.
+/// * this sizes the pool that *unpacks INT4/FP8 expert weights into BF16 on the
+///   CPU*. That work is pure host compute over mmap'd bytes, touches no device,
+///   and is embarrassingly parallel across experts, so it wants every core.
+///
+/// Session 6 (H200, beam W=256) is why they are now separate: the beam search
+/// made the GPU half of a layer ~64x cheaper, and the bake settled at
+/// **240 s/layer** with the process at **100.5% CPU** (one core of 24) and
+/// loadavg **1.14** — the CPU unpack, not the GPU search, had become the
+/// limiter. Anything that reunites these two numbers reintroduces one of those
+/// two failures, depending on which value survives.
+///
+/// Override with `ARC_UNPACK_THREADS` (see [`EXPERT_UNPACK_THREADS_ENV`]);
+/// defaults to the machine's available parallelism. Never reads
+/// `MISTRALRS_ISQ_SINGLETHREAD` — that flag is about GPU submission.
+pub fn expert_unpack_threads() -> usize {
+    let override_value = std::env::var(EXPERT_UNPACK_THREADS_ENV).ok();
+    expert_unpack_threads_from(
+        override_value.as_deref(),
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+    )
+}
+
+fn build_expert_unpack_pool(num_threads: usize) -> rayon::ThreadPool {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads.max(1))
+        .thread_name(|i| format!("arc-unpack-{i}"))
+        .build()
+        .expect("Failed to create expert unpack thread pool")
+}
+
+/// Process-wide pool for the host-side expert unpack.
+///
+/// Callers `install` on it rather than using the ambient rayon context, so the
+/// unpack keeps its full width *by construction* even when the calling thread
+/// is a worker of a narrower pool (e.g. the 1-thread ISQ submission pool). See
+/// [`expert_unpack_threads`] for why the two widths differ.
+pub fn expert_unpack_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let num_threads = expert_unpack_threads();
+        tracing::info!(
+            "Expert unpack pool: {num_threads} thread(s) (host-side INT4/FP8 -> BF16 dequant; \
+             independent of the ISQ thread policy, override with {EXPERT_UNPACK_THREADS_ENV})."
+        );
+        build_expert_unpack_pool(num_threads)
+    })
+}
+
 pub fn get_immediate_isq() -> Option<ImmediateIsqParams> {
     ENGINE_IMMEDIATE_ISQ.with(|cell| cell.borrow().clone())
 }
@@ -1623,6 +1698,99 @@ mod isq_thread_policy_tests {
         assert_eq!(n, 1);
         let (n, _) = isq_thread_policy_on(None, IsqQuantizeBackend::Gpu, false);
         assert_eq!(n, rayon::current_num_threads());
+    }
+
+    #[test]
+    fn unpack_width_is_not_the_isq_width() {
+        // The whole point of the split: layer-level GPU submission stays at 1
+        // for QTIP-on-GPU (session-5's 4-9 min/layer trap stays closed) while
+        // the host-side expert unpack takes the whole machine (session-6's
+        // 240 s/layer at 100.5% CPU on 24 cores).
+        for ty in [IsqType::QtipBitshift2, IsqType::Qtip2b] {
+            let (isq_threads, _) = isq_thread_policy_on(Some(ty), IsqQuantizeBackend::Gpu, false);
+            assert_eq!(
+                isq_threads, 1,
+                "{ty:?} GPU submission must stay at 1 thread"
+            );
+        }
+        assert_eq!(expert_unpack_threads_from(None, 24), 24);
+        // MISTRALRS_ISQ_SINGLETHREAD (the bake exports it) must keep forcing
+        // layer-level single-threading and must not reach across and
+        // re-serialize the unpack, which reads its own override only.
+        for backend in [IsqQuantizeBackend::Gpu, IsqQuantizeBackend::Cpu] {
+            let (n, rationale) = isq_thread_policy_on(
+                Some(IsqType::QtipBitshift2),
+                backend,
+                /* forced */ true,
+            );
+            assert_eq!(n, 1);
+            assert!(rationale.contains("MISTRALRS_ISQ_SINGLETHREAD"));
+        }
+        assert_eq!(expert_unpack_threads_from(None, 24), 24);
+        assert_eq!(expert_unpack_threads_from(Some("6"), 24), 6);
+    }
+
+    #[test]
+    fn unpack_width_defaults_and_override() {
+        assert_eq!(expert_unpack_threads_from(None, 1), 1);
+        assert_eq!(expert_unpack_threads_from(None, 0), 1, "never zero threads");
+        assert_eq!(expert_unpack_threads_from(Some(" 8 "), 24), 8);
+        // A malformed or zero override must not silently serialize a bake.
+        assert_eq!(expert_unpack_threads_from(Some("oops"), 24), 24);
+        assert_eq!(expert_unpack_threads_from(Some("0"), 24), 24);
+        assert_eq!(expert_unpack_threads_from(Some(""), 24), 24);
+    }
+
+    /// The failure this guards: a bare `into_par_iter()` inherits the pool of
+    /// whatever thread calls it, so an expert unpack reached from inside the
+    /// 1-thread ISQ pool would run serially with no warning. `install` on the
+    /// dedicated pool must restore full width even from inside a 1-thread pool.
+    #[test]
+    fn unpack_pool_is_concurrent_even_nested_in_a_single_thread_pool() {
+        use rayon::prelude::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const WORKERS: usize = 4;
+        let isq_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let unpack_pool = build_expert_unpack_pool(WORKERS);
+
+        let in_flight = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+
+        isq_pool.install(|| {
+            assert_eq!(
+                rayon::current_num_threads(),
+                1,
+                "precondition: the ISQ pool is single-threaded"
+            );
+            unpack_pool.install(|| {
+                assert_eq!(rayon::current_num_threads(), WORKERS);
+                (0..WORKERS).into_par_iter().for_each(|_| {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    // Spin (bounded) until every worker is in flight, so the
+                    // assertion below cannot pass on a serial run and cannot
+                    // hang if the pool is narrower than expected.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while in_flight.load(Ordering::SeqCst) < WORKERS
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::yield_now();
+                    }
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                });
+            });
+        });
+
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            WORKERS,
+            "expert unpack ran with fewer than {WORKERS} concurrent workers: the \
+             dedicated pool did not survive being nested in the 1-thread ISQ pool"
+        );
     }
 
     #[test]
