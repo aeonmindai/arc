@@ -1348,3 +1348,679 @@ mod tests {
         s / a.len() as f32
     }
 }
+
+// ---------------------------------------------------------------------------
+// GPU-kernel cost instrumentation (wave16-AF)
+// ---------------------------------------------------------------------------
+
+/// Per-timestep statistics of the beam that the CUDA kernel's cost is driven by.
+///
+/// `kernels/qtip/qtip_beam.cu` maps **one thread per prefix group** and one
+/// radix-select pass per 8 bits of the 48-bit `(cost, state)` key. Both of
+/// those are data-dependent, and neither can be read off the source — but both
+/// are properties of the *search*, not of CUDA, so they are measurable here on
+/// a CPU. This exists to turn the kernel's performance analysis from a
+/// projection into arithmetic over measured quantities.
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BeamKernelStats {
+    /// Number of timesteps observed (excludes `t = 0`, which is degenerate).
+    pub steps: usize,
+    /// Distinct prefix groups in the beam, i.e. how many of the kernel's 256
+    /// threads have work in the expansion phase. Histogram over 8 buckets:
+    /// `[1..16, 16..32, 32..64, 64..96, 96..128, 128..160, 160..208, 208..=256]`.
+    pub group_hist: [usize; 8],
+    pub group_sum: usize,
+    pub group_min: usize,
+    pub group_max: usize,
+    /// Radix-select digit passes actually executed (1..=6), indexed by count.
+    pub pass_hist: [usize; 7],
+    pub pass_sum: usize,
+    /// Timesteps where the candidate set did not exceed the beam width, so no
+    /// selection ran at all.
+    pub unpruned_steps: usize,
+    /// Leading 8-bit digit positions of the 48-bit key for which EVERY
+    /// candidate shares the same value. Those passes are pure overhead: the
+    /// histogram has one non-empty bin and the pass cannot narrow anything.
+    pub wasted_leading_digits_sum: usize,
+    /// Highest differing bit position across all candidate keys (0..48),
+    /// summed. `48 - this` is how many leading bits are common.
+    pub top_differing_bit_sum: usize,
+    /// Passes the same radix-select would take if it began at the highest
+    /// differing bit rather than always at bit 40.
+    pub skip_pass_sum: usize,
+}
+
+#[cfg(test)]
+impl BeamKernelStats {
+    pub fn mean_groups(&self) -> f64 {
+        if self.steps == 0 {
+            0.0
+        } else {
+            self.group_sum as f64 / self.steps as f64
+        }
+    }
+    pub fn mean_passes(&self) -> f64 {
+        let pruned = self.steps - self.unpruned_steps;
+        if pruned == 0 {
+            0.0
+        } else {
+            self.pass_sum as f64 / pruned as f64
+        }
+    }
+    pub fn mean_wasted_digits(&self) -> f64 {
+        let pruned = self.steps - self.unpruned_steps;
+        if pruned == 0 {
+            0.0
+        } else {
+            self.wasted_leading_digits_sum as f64 / pruned as f64
+        }
+    }
+    pub fn mean_skip_passes(&self) -> f64 {
+        let pruned = self.steps - self.unpruned_steps;
+        if pruned == 0 {
+            0.0
+        } else {
+            self.skip_pass_sum as f64 / pruned as f64
+        }
+    }
+    pub fn mean_top_differing_bit(&self) -> f64 {
+        let pruned = self.steps - self.unpruned_steps;
+        if pruned == 0 {
+            0.0
+        } else {
+            self.top_differing_bit_sum as f64 / pruned as f64
+        }
+    }
+}
+
+/// The kernel's `qtip_total_order_key` — the f32→u32 map that makes ascending
+/// unsigned order equal `f32::total_cmp` order.
+#[cfg(test)]
+fn total_order_key(x: f32) -> u32 {
+    let b = x.to_bits();
+    if b & 0x8000_0000 != 0 {
+        !b
+    } else {
+        b | 0x8000_0000
+    }
+}
+
+/// Replay `kernels/qtip/qtip_beam.cu`'s radix-select on a real candidate set and
+/// return how many 8-bit digit passes it executes.
+///
+/// This is a transcription of the kernel loop, early exit included: it stops as
+/// soon as a digit bin holds a single candidate.
+#[cfg(test)]
+fn radix_passes_for(keys: &[u64], width: usize) -> usize {
+    radix_passes_from(keys, width, 40)
+}
+
+/// As [`radix_passes_for`], but starting the digit scan at `start_shift` —
+/// used to price the "skip provably-common leading digits" optimisation.
+#[cfg(test)]
+fn radix_passes_from(keys: &[u64], width: usize, start_shift: i32) -> usize {
+    let mut prefix: u64 = 0;
+    let mut k = width as u64;
+    let mut passes = 0usize;
+    let mut shift: i32 = start_shift;
+    while shift >= 0 {
+        passes += 1;
+        let mut hist = [0u32; 256];
+        for &key in keys {
+            if (key >> (shift + 8)) == (prefix >> (shift + 8)) {
+                hist[((key >> shift) & 0xFF) as usize] += 1;
+            }
+        }
+        let mut excl = 0u64;
+        let mut chosen = 0usize;
+        for (b, &h) in hist.iter().enumerate() {
+            if excl < k && k <= excl + h as u64 {
+                chosen = b;
+                break;
+            }
+            excl += h as u64;
+        }
+        k -= excl;
+        prefix |= (chosen as u64) << shift;
+        if hist[chosen] == 1 {
+            break;
+        }
+        shift -= 8;
+    }
+    passes
+}
+
+/// Transcription of `qtip_beam.cu`'s **wave16-AF** selection: radix over the
+/// 32-bit cost key, with an exact fallback into the 16 state bits when costs
+/// tie. Returns the 48-bit threshold, exactly as the kernel computes it.
+///
+/// Kept beside [`radix_passes_for`] (the pre-wave16 48-bit composite scan) so
+/// the two can be proved to select the identical set on real candidate data —
+/// that equivalence is the whole parity argument for the rewrite, and it is
+/// checkable without a GPU.
+#[cfg(test)]
+pub(crate) fn threshold_split_key(keys: &[u64], width: usize) -> u64 {
+    let cost_of = |k: u64| (k >> 16) as u32;
+    let state_of = |k: u64| (k & 0xFFFF) as u32;
+
+    let mut cost_prefix: u32 = 0;
+    let mut k = width as u64;
+    let mut tie_count: u32 = 0;
+    let mut exit_shift: i32 = 0;
+    let mut shift: i32 = 24;
+    while shift >= 0 {
+        exit_shift = shift;
+        let mut hist = [0u32; 256];
+        for &key in keys {
+            let ck = cost_of(key);
+            let part = shift == 24 || (ck >> (shift + 8)) == (cost_prefix >> (shift + 8));
+            if part {
+                hist[((ck >> shift) & 0xFF) as usize] += 1;
+            }
+        }
+        let mut excl = 0u64;
+        let mut chosen = 0usize;
+        for (b, &h) in hist.iter().enumerate() {
+            if excl < k && k <= excl + h as u64 {
+                chosen = b;
+                break;
+            }
+            excl += h as u64;
+        }
+        k -= excl;
+        cost_prefix |= (chosen as u32) << shift;
+        tie_count = hist[chosen];
+        if tie_count == 1 {
+            break;
+        }
+        shift -= 8;
+    }
+
+    if tie_count == 1 {
+        let cost_hi = if exit_shift > 0 {
+            cost_prefix | ((1u32 << exit_shift) - 1)
+        } else {
+            cost_prefix
+        };
+        return ((cost_hi as u64) << 16) | 0xFFFF;
+    }
+
+    let mut state_prefix: u32 = 0;
+    let mut shift: i32 = 8;
+    while shift >= 0 {
+        let mut hist = [0u32; 256];
+        for &key in keys {
+            let st = state_of(key);
+            let part = cost_of(key) == cost_prefix
+                && (shift == 8 || (st >> (shift + 8)) == (state_prefix >> (shift + 8)));
+            if part {
+                hist[((st >> shift) & 0xFF) as usize] += 1;
+            }
+        }
+        let mut excl = 0u64;
+        let mut chosen = 0usize;
+        for (b, &h) in hist.iter().enumerate() {
+            if excl < k && k <= excl + h as u64 {
+                chosen = b;
+                break;
+            }
+            excl += h as u64;
+        }
+        k -= excl;
+        state_prefix |= (chosen as u32) << shift;
+        if hist[chosen] == 1 {
+            if shift > 0 {
+                state_prefix |= (1u32 << shift) - 1;
+            }
+            break;
+        }
+        shift -= 8;
+    }
+    ((cost_prefix as u64) << 16) | (state_prefix & 0xFFFF) as u64
+}
+
+/// The pre-wave16 48-bit composite scan, kept as the reference the split-key
+/// scan must reproduce.
+#[cfg(test)]
+pub(crate) fn threshold_composite_key(keys: &[u64], width: usize) -> u64 {
+    let mut prefix: u64 = 0;
+    let mut k = width as u64;
+    let mut shift: i32 = 40;
+    while shift >= 0 {
+        let mut hist = [0u32; 256];
+        for &key in keys {
+            if (key >> (shift + 8)) == (prefix >> (shift + 8)) {
+                hist[((key >> shift) & 0xFF) as usize] += 1;
+            }
+        }
+        let mut excl = 0u64;
+        let mut chosen = 0usize;
+        for (b, &h) in hist.iter().enumerate() {
+            if excl < k && k <= excl + h as u64 {
+                chosen = b;
+                break;
+            }
+            excl += h as u64;
+        }
+        k -= excl;
+        prefix |= (chosen as u64) << shift;
+        if hist[chosen] == 1 {
+            if shift > 0 {
+                prefix |= (1u64 << shift) - 1;
+            }
+            break;
+        }
+        shift -= 8;
+    }
+    prefix
+}
+
+/// Every candidate set seen while beam-searching `target_row`, handed to
+/// `visit` — so a test can replay the kernel's selection on real data.
+#[cfg(test)]
+pub(crate) fn for_each_candidate_set(
+    target_row: &[f32],
+    lut: &[f32],
+    width: usize,
+    mut visit: impl FnMut(&[u64], usize),
+) {
+    let num_symbols = target_row.len() / V as usize;
+    let width = width.clamp(1, LUT_SIZE);
+    let mut slot = vec![u32::MAX; LUT_SIZE];
+    let mut touched: Vec<u16> = Vec::new();
+    let mut cands: Vec<BeamEntry> = Vec::new();
+    let target_first = &target_row[..V as usize];
+    let mut beam: Vec<BeamEntry> = (0..ALPHABET as u32)
+        .map(|s| BeamEntry {
+            cost: branch_metric(lut, s, target_first, None),
+            state: s as u16,
+            parent: 0,
+        })
+        .collect();
+    prune_to_width(&mut beam, width);
+
+    for t in 1..num_symbols {
+        let target_t = &target_row[t * V as usize..(t + 1) * V as usize];
+        cands.clear();
+        touched.clear();
+        for (pi, entry) in beam.iter().enumerate() {
+            let base = ((entry.state as u32) << K) & STATE_MASK;
+            for sym in 0..ALPHABET as u32 {
+                let succ = (base | sym) as u16;
+                let existing = slot[succ as usize];
+                if existing == u32::MAX {
+                    slot[succ as usize] = cands.len() as u32;
+                    touched.push(succ);
+                    cands.push(BeamEntry {
+                        cost: entry.cost,
+                        state: succ,
+                        parent: pi as u16,
+                    });
+                } else {
+                    let c = &mut cands[existing as usize];
+                    if entry.cost < c.cost {
+                        c.cost = entry.cost;
+                        c.parent = pi as u16;
+                    }
+                }
+            }
+        }
+        for c in cands.iter_mut() {
+            c.cost += branch_metric(lut, c.state as u32, target_t, None);
+        }
+        for &s in &touched {
+            slot[s as usize] = u32::MAX;
+        }
+        if cands.len() > width {
+            let keys: Vec<u64> = cands
+                .iter()
+                .map(|c| ((total_order_key(c.cost) as u64) << 16) | c.state as u64)
+                .collect();
+            visit(&keys, width);
+        }
+        prune_to_width(&mut cands, width);
+        std::mem::swap(&mut beam, &mut cands);
+    }
+}
+
+/// Run the production beam and record the two data-dependent quantities the
+/// CUDA kernel's cost model needs. Mirrors [`beam_quantize_row`] step for step;
+/// any divergence here would make the numbers meaningless, so the shared
+/// helpers are reused rather than reimplemented.
+#[cfg(test)]
+pub(crate) fn beam_kernel_stats(target_row: &[f32], lut: &[f32], width: usize) -> BeamKernelStats {
+    let num_symbols = target_row.len() / V as usize;
+    let width = width.clamp(1, LUT_SIZE);
+    let mut stats = BeamKernelStats {
+        group_min: usize::MAX,
+        ..Default::default()
+    };
+
+    let mut slot = vec![u32::MAX; LUT_SIZE];
+    let mut touched: Vec<u16> = Vec::with_capacity(width * ALPHABET);
+    let mut cands: Vec<BeamEntry> = Vec::with_capacity(width * ALPHABET);
+
+    let target_first = &target_row[..V as usize];
+    let mut beam: Vec<BeamEntry> = (0..ALPHABET as u32)
+        .map(|s| BeamEntry {
+            cost: branch_metric(lut, s, target_first, None),
+            state: s as u16,
+            parent: 0,
+        })
+        .collect();
+    prune_to_width(&mut beam, width);
+
+    // The kernel's prefix-group mask: successors of a state depend on it only
+    // through its low `L - K` bits.
+    const GROUP_MASK: u32 = (1u32 << (super::L - K)) - 1;
+
+    for t in 1..num_symbols {
+        let target_t = &target_row[t * V as usize..(t + 1) * V as usize];
+
+        // How many of the kernel's 256 threads have work: distinct groups.
+        let mut seen = std::collections::HashSet::with_capacity(beam.len());
+        for e in &beam {
+            seen.insert((e.state as u32) & GROUP_MASK);
+        }
+        let ng = seen.len();
+        stats.steps += 1;
+        stats.group_sum += ng;
+        stats.group_min = stats.group_min.min(ng);
+        stats.group_max = stats.group_max.max(ng);
+        let bucket = match ng {
+            0..=15 => 0,
+            16..=31 => 1,
+            32..=63 => 2,
+            64..=95 => 3,
+            96..=127 => 4,
+            128..=159 => 5,
+            160..=207 => 6,
+            _ => 7,
+        };
+        stats.group_hist[bucket] += 1;
+
+        cands.clear();
+        touched.clear();
+        for (pi, entry) in beam.iter().enumerate() {
+            let base = ((entry.state as u32) << K) & STATE_MASK;
+            for sym in 0..ALPHABET as u32 {
+                let succ = (base | sym) as u16;
+                let s_idx = succ as usize;
+                let existing = slot[s_idx];
+                if existing == u32::MAX {
+                    slot[s_idx] = cands.len() as u32;
+                    touched.push(succ);
+                    cands.push(BeamEntry {
+                        cost: entry.cost,
+                        state: succ,
+                        parent: pi as u16,
+                    });
+                } else {
+                    let c = &mut cands[existing as usize];
+                    if entry.cost < c.cost {
+                        c.cost = entry.cost;
+                        c.parent = pi as u16;
+                    }
+                }
+            }
+        }
+        for c in cands.iter_mut() {
+            c.cost += branch_metric(lut, c.state as u32, target_t, None);
+        }
+        for &s in &touched {
+            slot[s as usize] = u32::MAX;
+        }
+
+        if cands.len() <= width {
+            stats.unpruned_steps += 1;
+        } else {
+            let keys: Vec<u64> = cands
+                .iter()
+                .map(|c| ((total_order_key(c.cost) as u64) << 16) | c.state as u64)
+                .collect();
+            let passes = radix_passes_for(&keys, width);
+            stats.pass_sum += passes;
+            stats.pass_hist[passes.min(6)] += 1;
+
+            // How much of the key carries no information at this step: the
+            // costs are CUMULATIVE, so at timestep t they agree to roughly
+            // log2(t) bits and the leading digits are constant across the whole
+            // candidate set. Every such digit costs a full radix pass (6 block
+            // barriers + 16 key rebuilds per thread) and narrows nothing.
+            let diff = keys.iter().fold(0u64, |a, &k| a | (k ^ keys[0]));
+            let top_bit = if diff == 0 {
+                0
+            } else {
+                64 - diff.leading_zeros() as usize
+            };
+            stats.top_differing_bit_sum += top_bit;
+            let mut wasted = 0usize;
+            let mut shift: i32 = 40;
+            while shift >= 0 && (diff >> shift) == 0 {
+                wasted += 1;
+                shift -= 8;
+            }
+            stats.wasted_leading_digits_sum += wasted;
+
+            // Price the optimisation: start the digit scan at the first digit
+            // that actually differs, instead of always at bit 40.
+            let start = if top_bit == 0 {
+                0
+            } else {
+                (((top_bit - 1) / 8) * 8) as i32
+            };
+            stats.skip_pass_sum += radix_passes_from(&keys, width, start);
+        }
+
+        prune_to_width(&mut cands, width);
+        std::mem::swap(&mut beam, &mut cands);
+    }
+    if stats.group_min == usize::MAX {
+        stats.group_min = 0;
+    }
+    stats
+}
+
+// ---------------------------------------------------------------------------
+// Guess-Verify-Refine premise measurement (wave17-AF)
+// ---------------------------------------------------------------------------
+//
+// wave17-AN's top recommendation is Guess-Verify-Refine (arXiv 2604.22312):
+// warm-start the top-W threshold from step t-1, verify by counting, refine
+// only on a miss. Its premise is that the threshold barely moves between
+// consecutive positions. AN argues our correlation is the strongest the
+// technique could be handed, because the survivors at t+1 are literally
+// `cost_t + branch_metric` over the same paths.
+//
+// That premise is TESTABLE ON A CPU and it must be tested before any kernel is
+// written on top of it, because it has an obvious failure mode: our costs are
+// CUMULATIVE. They grow without bound as t advances, so the raw threshold does
+// not sit still at all — it drifts upward every single step. Whether a warm
+// start works therefore depends entirely on whether the drift is *predictable*,
+// which is an empirical question about this cost distribution.
+//
+// Two families of guess are measured:
+//
+//   * **Temporal** — extrapolate the threshold's own trajectory. Cheap, but
+//     inexact by nature: a miss costs a refine.
+//   * **Dr. Top-k Rule 2 (beta-delegate)** — the max over groups of each
+//     group's beta-th smallest candidate is a PROVABLE upper bound on the
+//     W-th smallest whenever `beta * ng >= W`. Proof: those `beta*ng` delegates
+//     are all <= the bound and all lie in the candidate set, so at least
+//     `beta*ng >= W` candidates are <= it, hence the W-th smallest is too.
+//     No temporal assumption at all, and it can never miss low — the only
+//     question is how TIGHT it is, i.e. how many candidates survive it.
+//
+// The number that decides the design is the survivor count under each guess:
+// the refine step's cost is proportional to it.
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct GvrStats {
+    pub steps: usize,
+    /// Candidates examined, summed (mean n_cand ~ 3979).
+    pub n_cand_sum: usize,
+    /// Exact hits, where a guess yields count == W and no refine is needed.
+    pub temporal_exact_hits: usize,
+    /// Guess landed above the true threshold (safe: refine downward).
+    pub temporal_high: usize,
+    /// Guess landed below (would need widening — the expensive miss).
+    pub temporal_low: usize,
+    /// Survivors under the temporal guess, summed over steps where it was a
+    /// valid (high) bound.
+    pub temporal_survivors_sum: usize,
+    /// Survivors under the Rule-2 beta=1 bound (valid only when ng >= W).
+    pub delegate1_survivors_sum: usize,
+    pub delegate1_valid_steps: usize,
+    /// Survivors under the Rule-2 beta=2 bound (valid whenever 2*ng >= W).
+    pub delegate2_survivors_sum: usize,
+    pub delegate2_valid_steps: usize,
+    /// Survivors under beta=4.
+    pub delegate4_survivors_sum: usize,
+    pub delegate4_valid_steps: usize,
+    /// Steps where the true threshold's rank among candidates was exactly W.
+    pub width_sum: usize,
+    /// Survivors under the TIGHT Rule-2 bound: the W-th smallest of the
+    /// beta-delegate vector, rather than its maximum. Same proof, far tighter.
+    pub tight2_survivors_sum: usize,
+    pub tight2_steps: usize,
+    pub tight4_survivors_sum: usize,
+    pub tight4_steps: usize,
+    /// Delegate-vector size, summed (beta * ng).
+    pub tight2_delegates_sum: usize,
+}
+
+#[cfg(test)]
+impl GvrStats {
+    fn mean(sum: usize, n: usize) -> f64 {
+        if n == 0 {
+            0.0
+        } else {
+            sum as f64 / n as f64
+        }
+    }
+    pub fn mean_n_cand(&self) -> f64 {
+        Self::mean(self.n_cand_sum, self.steps)
+    }
+    pub fn mean_temporal_survivors(&self) -> f64 {
+        Self::mean(self.temporal_survivors_sum, self.temporal_high)
+    }
+    pub fn mean_delegate_survivors(&self, beta: usize) -> f64 {
+        match beta {
+            1 => Self::mean(self.delegate1_survivors_sum, self.delegate1_valid_steps),
+            2 => Self::mean(self.delegate2_survivors_sum, self.delegate2_valid_steps),
+            _ => Self::mean(self.delegate4_survivors_sum, self.delegate4_valid_steps),
+        }
+    }
+}
+
+/// Measure how much leverage a Guess-Verify-Refine front-end would actually
+/// have on this cost distribution.
+///
+/// `groups` is the candidate list's group structure: the kernel gives thread
+/// `p` the 16 successors of group `p`, so candidate `c` belongs to group
+/// `c / 16` — exactly how `for_each_candidate_set` lays them out.
+#[cfg(test)]
+pub(crate) fn measure_gvr_leverage(target_row: &[f32], lut: &[f32], width: usize) -> GvrStats {
+    let mut stats = GvrStats::default();
+    let mut prev_threshold: Option<u64> = None;
+    let mut prev_delta: Option<i128> = None;
+
+    for_each_candidate_set(target_row, lut, width, |keys, w| {
+        stats.steps += 1;
+        stats.n_cand_sum += keys.len();
+        stats.width_sum += w;
+
+        let mut sorted = keys.to_vec();
+        sorted.sort_unstable();
+        let truth = sorted[w - 1];
+
+        // ---- temporal guess: extrapolate the threshold's own trajectory ----
+        if let (Some(prev), Some(delta)) = (prev_threshold, prev_delta) {
+            let guess = (prev as i128 + delta).clamp(0, u64::MAX as i128) as u64;
+            let count = keys.iter().filter(|&&k| k <= guess).count();
+            if count == w {
+                stats.temporal_exact_hits += 1;
+            }
+            if guess >= truth {
+                stats.temporal_high += 1;
+                stats.temporal_survivors_sum += count;
+            } else {
+                stats.temporal_low += 1;
+            }
+        }
+        if let Some(prev) = prev_threshold {
+            prev_delta = Some(truth as i128 - prev as i128);
+        }
+        prev_threshold = Some(truth);
+
+        // ---- Dr. Top-k Rule 2: max over groups of the beta-th smallest ----
+        let ng = keys.len() / 16;
+        for (beta, sum, valid) in [
+            (
+                1usize,
+                &mut stats.delegate1_survivors_sum,
+                &mut stats.delegate1_valid_steps,
+            ),
+            (
+                2,
+                &mut stats.delegate2_survivors_sum,
+                &mut stats.delegate2_valid_steps,
+            ),
+            (
+                4,
+                &mut stats.delegate4_survivors_sum,
+                &mut stats.delegate4_valid_steps,
+            ),
+        ] {
+            if beta * ng < w {
+                continue; // bound not provable at this beta
+            }
+            let mut bound = 0u64;
+            for g in 0..ng {
+                let mut grp: [u64; 16] = keys[g * 16..(g + 1) * 16].try_into().unwrap();
+                grp.sort_unstable();
+                bound = bound.max(grp[beta - 1]);
+            }
+            debug_assert!(bound >= truth, "Rule-2 delegate bound must not miss low");
+            *sum += keys.iter().filter(|&&k| k <= bound).count();
+            *valid += 1;
+        }
+
+        // ---- TIGHT Rule 2: the W-th smallest OF THE DELEGATE VECTOR --------
+        // The loose form above takes the delegate vector's MAXIMUM, which is
+        // the weakest valid choice. Dr. Top-k's actual rule is that the k-th
+        // smallest of the delegate vector bounds the k-th smallest of the full
+        // set: those k delegates are all <= it and all lie in the set. Same
+        // proof, and it is a selection over beta*ng ~ 500 elements instead of
+        // ~4000 — which is itself the cheap sub-problem the refine needs.
+        for (beta, sum, cnt) in [
+            (
+                2usize,
+                &mut stats.tight2_survivors_sum,
+                &mut stats.tight2_steps,
+            ),
+            (4, &mut stats.tight4_survivors_sum, &mut stats.tight4_steps),
+        ] {
+            if beta * ng < w {
+                continue;
+            }
+            let mut delegates: Vec<u64> = Vec::with_capacity(beta * ng);
+            for g in 0..ng {
+                let mut grp: [u64; 16] = keys[g * 16..(g + 1) * 16].try_into().unwrap();
+                grp.sort_unstable();
+                delegates.extend_from_slice(&grp[..beta]);
+            }
+            delegates.sort_unstable();
+            let bound = delegates[w - 1];
+            debug_assert!(bound >= truth, "tight Rule-2 bound must not miss low");
+            *sum += keys.iter().filter(|&&k| k <= bound).count();
+            *cnt += 1;
+            if beta == 2 {
+                stats.tight2_delegates_sum += delegates.len();
+            }
+        }
+    });
+    stats
+}
