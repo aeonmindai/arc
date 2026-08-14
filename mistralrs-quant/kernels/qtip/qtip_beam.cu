@@ -173,15 +173,40 @@ __device__ __forceinline__ unsigned int qb_block_excl_scan(
     return warp_excl + x - v;
 }
 
-// wave16-AF: the second argument is load-bearing. Without a
-// `minBlocksPerMultiprocessor` nvcc may use up to 255 registers/thread, which
-// caps this kernel at 1-2 blocks/SM — and at 1757 instructions and 33 barriers
-// per timestep it is latency-bound, so occupancy is the multiplier on
-// everything. 4 blocks/SM caps registers at 64/thread and fits shared memory
-// (4 x 37,984 B = 152 KiB of sm_90's 228 KiB). The 32-bit selection above is
-// what makes 64 registers reachable: it removes the 64-bit key temporaries
-// that were live across the whole radix loop.
-__global__ void __launch_bounds__(QB_THREADS, 4)
+// Blocks per SM this kernel is compiled to fit.
+//
+// MEASURED, not assumed: `cuobjdump -res-usage` on the pre-wave16 kernel
+// reported `REG:80 STACK:0 SHARED:38992 LOCAL:0` for sm_90a. 256 threads x 80
+// registers = 20,480 per block, and 65,536 / 20,480 = 3 blocks/SM — 24 of 64
+// warps, 37.5% occupancy, **register-limited** (shared memory would allow 5:
+// 3 x 38,992 B is 114 KiB of the 228 KiB an SM has). The bake drew 261 W of
+// 700 W = 37% of TDP against that 37.5% occupancy, which is an independent
+// check on the kernel being latency-bound rather than throughput-bound.
+//
+// Raising this to 4 caps registers at 65,536 / 4 / 256 = 64 per thread and buys
+// 32 warps instead of 24 (+33% occupancy, which for a latency-bound kernel is a
+// ~1.33x throughput term). Shared memory still fits: 4 x ~39 KiB = 156 KiB.
+//
+// ⚠ THE FAILURE MODE IS SILENT. `__launch_bounds__` does not refuse to compile
+// when it cannot reach the register budget — it SPILLS to local memory, and a
+// spilled load inside the radix loop executes 16 x ~3.87 times per timestep,
+// which would cost more than the occupancy gains. The 32-bit selection above is
+// what is expected to free the 16 registers (it removes the 64-bit key
+// temporaries that were live across the whole radix), but register allocation
+// is nvcc's scheduling decision and CANNOT be proven from source.
+//
+// REQUIRED CHECK after any change here, on the build box, no GPU needed:
+//     cuobjdump -res-usage <obj> | grep -A1 beam_kernel
+// `LOCAL:` must remain 0. If it is not, set QB_MIN_BLOCKS_PER_SM back to 3
+// (which reproduces today's measured allocation exactly and is a no-op) rather
+// than trading a real latency regression for a nominal occupancy gain.
+//
+// Related landmine: `float cand[QB_ALPHABET]` must stay in registers, which
+// requires EVERY loop indexing it to be fully unrolled. Weakening any of those
+// `#pragma unroll`s sends the array to local memory on its own.
+constexpr int QB_MIN_BLOCKS_PER_SM = 4;
+
+__global__ void __launch_bounds__(QB_THREADS, QB_MIN_BLOCKS_PER_SM)
 qtip_quantize_rows_beam_kernel(
     const float*   __restrict__ weight,      // [n_rows, in_features]
     const float*   __restrict__ lut,         // [2^L * V]

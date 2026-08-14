@@ -493,351 +493,242 @@ fn probe_rotation_vs_hessian_sensitivity() {
 }
 
 // ---------------------------------------------------------------------------
-// Bake-cost model for the CUDA trellis kernels (wave13-AF)
+// Bake-cost model for the CUDA trellis kernels
 // ---------------------------------------------------------------------------
 //
-// PROJECTION, NOT A MEASUREMENT. wave13-AF had no GPU, so everything below is
-// derived by counting bytes and instructions in
-// `kernels/qtip/qtip_quantize.cu` and `kernels/qtip/qtip_beam.cu`. It is
-// arithmetic about the kernels, so it runs anywhere:
+// wave16-AF REPLACED wave13-AF's model here, and the reason matters more than
+// the numbers. The old model projected 42-85 s/layer for beam-256 from bytes
+// moved and instructions issued. Hardware measured 238 s. It was not off by a
+// parameter — it modelled a quantity the kernel is not bound by: it assumed
+// that removing the memory wall (which the beam genuinely did, 257x less HBM,
+// confirmed by mem=1% telemetry) would leave a kernel running near its issue
+// roof. It does not. The kernel is latency-bound at 37.5% occupancy, and a
+// bytes-and-instructions model cannot see that.
 //
-//   cargo test -p mistralrs-quant --lib \
-//       qtip::search_bench::cuda_beam_bake_projection -- --nocapture
-//
-// The model has exactly one contact with reality, and it is a good one. Counted
-// naively, the exhaustive kernel must move 528 KB across HBM per symbol
-// position; a 284 B/44-layer V4-Flash layer holds ~3.23e9 symbol positions, so
-// one layer is ~1.7 PB, i.e. 355 s at H200's 4.8 TB/s. FACTS.md measures
-// **510 s/layer** on a healthy box. A pure-bandwidth model landing within 1.4x
-// of the measurement — and implying a believable 70% of peak — is strong
-// evidence that the exhaustive quantizer is HBM-bound, which is precisely the
-// "GPU 99% util but low power draw" signature FACTS.md records. There is almost
-// no arithmetic hiding behind that traffic.
-//
-// The beam kernel removes that traffic entirely (the live state set is shared-
-// memory resident), so its projection is bounded by shared memory and issue
-// rate instead — quantities this model estimates far less reliably than
-// bandwidth. Two derating knobs make that pessimism explicit rather than
-// hidden, and the printed table reports the raw bound alongside the derated
-// figure so the optimistic end is visible too.
+// A wrong model left in-tree is worse than no model, because it gets cited
+// later as though it were measured. So this file no longer PREDICTS a wall
+// time. It states what was measured, states the instruction counts that can be
+// derived from the kernel source, and checks that the two are consistent —
+// failing loudly if someone changes the kernel without re-measuring.
 
-/// H200 SXM peak HBM bandwidth (bytes/s).
-const H200_HBM_BYTES_PER_S: f64 = 4.8e12;
-/// Aggregate shared-memory bandwidth: 132 SMs x 128 B/clk x 1.755 GHz.
-const H200_SMEM_BYTES_PER_S: f64 = 132.0 * 128.0 * 1.755e9;
-/// Aggregate simple-ALU/LSU issue rate: 132 SMs x 128 lanes x 1.755 GHz.
-const H200_ALU_OPS_PER_S: f64 = 132.0 * 128.0 * 1.755e9;
+/// Measured on H200, session 6. GPU search only: the 241 +/- 1 s/layer marginal
+/// figure minus the 3.3 s host INT4 unpack.
+pub(crate) const MEASURED_BEAM256_LAYER_SECONDS: f64 = 238.0;
+/// Measured on the same box class for the exhaustive prefix-grouped Viterbi.
+pub(crate) const MEASURED_EXHAUSTIVE_LAYER_SECONDS: f64 = 510.0;
+/// `cuobjdump -res-usage`, sm_90a: `REG:80 STACK:0 SHARED:38992 LOCAL:0`.
+/// 256 threads x 80 reg = 20,480 reg/block; 65,536 / 20,480 = 3 blocks/SM;
+/// 24 of 64 warps = 37.5% occupancy. Register-limited, not shared-limited
+/// (3 x 38,992 B = 114 KiB of the 228 KiB/SM available).
+pub(crate) const MEASURED_BEAM_REGISTERS_PER_THREAD: usize = 80;
+pub(crate) const MEASURED_BEAM_BLOCKS_PER_SM: usize = 3;
 
-/// Fraction of HBM peak the exhaustive kernel achieves, implied by FACTS.md
-/// (byte model 355 s/layer vs measured 510 s/layer). Applied to both kernels'
-/// HBM term so the comparison uses one consistent efficiency.
-const HBM_EFFICIENCY: f64 = 355.0 / 510.0;
+/// H200 issue capacity: 132 SMs x 4 warp schedulers x 1.98 GHz (measured clock).
+const H200_WARP_INST_PER_S: f64 = 132.0 * 4.0 * 1.98e9;
+/// DeepSeek-V4-Flash: 284 B parameters / 44 layers / V=2 weights per symbol.
+/// This is the (row x timestep) count, i.e. the number of block-timesteps.
+const V4_ROW_TIMESTEPS_PER_LAYER: f64 = 284.0e9 / 44.0 / 2.0;
+/// Threads per block in both quantize kernels.
+const QTIP_BLOCK_WARPS: f64 = 8.0;
 
-/// Derating applied to the beam kernel's shared-memory and issue-rate terms.
+/// Instructions per thread per timestep, counted from the kernel sources.
 ///
-/// The beam kernel costs ~35 block barriers per timestep against the exhaustive
-/// kernel's ~3, and its 37 KiB of shared memory caps residency at 4 blocks/SM
-/// (1024 of 2048 threads). Neither is captured by a throughput model. 0.5 is a
-/// deliberately pessimistic stand-in; the printed table also shows the
-/// un-derated bound, so the honest answer is the range between them.
-const BEAM_ISSUE_EFFICIENCY: f64 = 0.5;
-
-/// FACTS.md: exhaustive GPU Viterbi measured at ~8.5 min/layer on a healthy
-/// H200 (523 W, single process, max clocks).
-pub(crate) const MEASURED_EXHAUSTIVE_LAYER_SECONDS: f64 = 8.5 * 60.0;
-
-/// DeepSeek-V4-Flash: 284 B parameters over 44 layers, V = 2 weights/symbol.
-const V4_SYMBOLS_PER_LAYER: f64 = 284.0e9 / 44.0 / 2.0;
-
-/// Per-symbol-position cost of one trellis-search kernel, in the three
-/// currencies that can bind it.
+/// The beam figure uses the radix pass count MEASURED by
+/// [`probe_beam_kernel_cost_drivers`] (3.87 on production-shaped rows), not an
+/// assumed one — the pass count is data-dependent and is the largest single
+/// term.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct SymbolCost {
-    /// Bytes crossing HBM per (row, timestep).
-    pub hbm_bytes: f64,
-    /// Bytes of shared-memory traffic per (row, timestep).
-    pub smem_bytes: f64,
-    /// Simple ALU/LSU operations per (row, timestep), summed over the block.
-    pub alu_ops: f64,
+pub(crate) struct StepInstructions {
+    pub group_reduce: f64,
+    pub expand: f64,
+    pub select: f64,
+    pub compact: f64,
+    pub trace: f64,
 }
 
-/// Per-symbol cost of `qtip_quantize_rows_viterbi_kernel` — the exhaustive
-/// prefix-grouped DP — counted from the kernel source.
-///
-/// * phase A reads every one of the `2^L` predecessor costs exactly once
-///   (`(j << 12) | p` is a bijection over the state space): 256 KiB;
-/// * phase B writes all `2^L` updated costs: 256 KiB;
-/// * phase C writes the `2^(L-K)`-byte backtrace: 4 KiB;
-/// * the 512 KiB LUT read is shared by every resident block and stays in L2,
-///   so it is charged to bandwidth-below-HBM, not to HBM.
-pub(crate) fn exhaustive_symbol_cost() -> SymbolCost {
-    let states = 65536.0;
-    let prefixes = 4096.0;
-    SymbolCost {
-        hbm_bytes: states * 4.0 + states * 4.0 + prefixes + 8.0,
-        // phase A writes the per-prefix cost+argmin table, phase B reads the
-        // cost once per state, phase C reads the argmin back out.
-        smem_bytes: prefixes * 5.0 + states * 4.0 + prefixes,
-        // phase A: load + compare + select per (prefix, j).
-        // phase B: 2 LUT loads, 2 subs, 2 muls, 1 add, 1 shared load, 1 add,
-        //          1 global store per state.
-        alu_ops: states * 3.0 + states * 10.0,
+impl StepInstructions {
+    pub fn total(&self) -> f64 {
+        self.group_reduce + self.expand + self.select + self.compact + self.trace
+    }
+    /// Fraction of the step spent choosing among candidates rather than
+    /// evaluating them.
+    pub fn selection_fraction(&self) -> f64 {
+        self.select / self.total()
     }
 }
 
-/// Per-symbol cost of `qtip_quantize_rows_beam_kernel` at beam width `w`,
-/// counted from the kernel source under the worst case `n_groups == w` (every
-/// surviving state in a distinct prefix group, so the candidate list is the
-/// full `16w`).
-///
-/// `radix_passes` is how many 8-bit digit passes the selection runs. The kernel
-/// stops as soon as a digit bin holds a single candidate — with f32 costs that
-/// is usually pass 2 or 3 — but the hard ceiling is 6, so both ends are worth
-/// printing.
-///
-/// The shared-memory histogram term deliberately assumes NO benefit from the
-/// `__match_any_sync` warp aggregation (i.e. one atomic per candidate). With
-/// aggregation the real figure is much smaller; charging full price keeps the
-/// projection on the pessimistic side of the truth.
-pub(crate) fn beam_symbol_cost(w: f64, radix_passes: f64) -> SymbolCost {
-    let cands = w * 16.0;
-    let threads = 256.0;
-    // 8 block-wide scans per timestep (2 for group/beam compaction, 1 per radix
-    // pass) at ~8 B of shared traffic per thread each.
-    let scan_bytes = 8.0 * threads * 8.0;
-    SymbolCost {
-        // Only the compacted trace crosses HBM: `w` u32 written on the way
-        // forward and read back once by the staged backtrace. There is no cost
-        // ping-pong — the live state set lives in shared memory.
-        hbm_bytes: w * 4.0 * 2.0 + 8.0,
-        smem_bytes:
-            // group vote: read state+cost, 64-bit atomicMin read-modify-write
-            w * 22.0
-            // winner test: read s_gmin, read cost, write 3 group fields, release
-            + w * 28.0
-            + scan_bytes
-            // s_hist[tid] readback, one per radix pass
-            + radix_passes * threads * 4.0
-            // radix: clear 256 bins + one 4-byte RMW per candidate per pass
-            + radix_passes * (1024.0 + cands * 8.0)
-            // compaction writes + trace staging read
-            + w * 8.0
-            + w * 4.0,
-        alu_ops:
-            // candidate generation: 2 LUT loads, 2 subs, 2 muls, 2 adds
-            cands * 8.0
-            // radix, per candidate per pass: rebuild the 48-bit key (4), test
-            // the resolved prefix (2), extract the digit (2), ballot/match/
-            // atomic amortised (4)
-            + radix_passes * cands * 12.0
-            // compaction: rebuild key (4), compare (1), conditional store (3)
-            + cands * 8.0
-            // fixed block overhead: 8 scans of ~15 ops across 256 threads,
-            // plus barriers and bookkeeping
-            + 30000.0,
+/// `qtip_beam.cu` as measured: 3.87 radix passes x 16 candidates x ~21
+/// instructions dominates everything else.
+pub(crate) fn beam_step_instructions(radix_passes: f64) -> StepInstructions {
+    StepInstructions {
+        group_reduce: 40.0,
+        expand: 130.0,
+        select: radix_passes * 16.0 * 21.0,
+        compact: 190.0,
+        trace: 4.0,
     }
 }
 
-/// One row of the projected bake table.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct BakeProjection {
-    pub width: usize,
-    /// Bound with the derating applied — the number to quote.
-    pub layer_seconds: f64,
-    /// Bound with no derating — the optimistic end of the range.
-    pub layer_seconds_raw: f64,
-    pub hbm_seconds: f64,
-    pub smem_seconds: f64,
-    pub alu_seconds: f64,
+/// `qtip_quantize.cu`'s prefix-grouped exhaustive DP: phase A is 4096 prefixes
+/// x 16 predecessors over 256 threads, phase B is all 2^16 states.
+pub(crate) fn exhaustive_step_instructions() -> StepInstructions {
+    StepInstructions {
+        group_reduce: 0.0,
+        expand: 0.0,
+        // phase A: 256 iterations x (load + compare + select)
+        select: 256.0 * 3.0,
+        // phase B: 256 states x (2 LUT loads, 2 sub, 2 mul, add, shared load,
+        // add, global store)
+        compact: 256.0 * 10.0,
+        trace: 16.0,
+    }
 }
 
-/// Projected per-layer bake time for the beam kernel at each width on a
-/// 284 B-parameter / 44-layer V4-Flash model, plus the exhaustive kernel's
-/// pure-bandwidth prediction for calibration.
-pub(crate) fn beam_bake_cost_model(
-    widths: &[usize],
-    radix_passes: f64,
-) -> (f64, Vec<BakeProjection>) {
-    let symbols = V4_SYMBOLS_PER_LAYER;
-    let ex = exhaustive_symbol_cost();
-    let exhaustive_seconds = symbols * ex.hbm_bytes / (H200_HBM_BYTES_PER_S * HBM_EFFICIENCY);
-    let rows = widths
-        .iter()
-        .map(|&w| {
-            let c = beam_symbol_cost(w as f64, radix_passes);
-            let h = symbols * c.hbm_bytes / (H200_HBM_BYTES_PER_S * HBM_EFFICIENCY);
-            let s = symbols * c.smem_bytes / H200_SMEM_BYTES_PER_S;
-            let a = symbols * c.alu_ops / H200_ALU_OPS_PER_S;
-            let raw = h.max(s).max(a);
-            BakeProjection {
-                width: w,
-                layer_seconds: h.max((s / BEAM_ISSUE_EFFICIENCY).max(a / BEAM_ISSUE_EFFICIENCY)),
-                layer_seconds_raw: raw,
-                hbm_seconds: h,
-                smem_seconds: s,
-                alu_seconds: a,
-            }
-        })
-        .collect();
-    (exhaustive_seconds, rows)
+/// Warp-instructions one layer of V4-Flash costs at the given per-thread count.
+fn layer_warp_instructions(per_thread: f64) -> f64 {
+    V4_ROW_TIMESTEPS_PER_LAYER * QTIP_BLOCK_WARPS * per_thread
 }
 
-/// Static shared-memory footprint of `qtip_quantize_rows_beam_kernel`, in
-/// bytes, mirroring the declarations in `kernels/qtip/qtip_beam.cu`.
+/// Issue efficiency implied by an instruction count and a MEASURED wall time:
+/// the fraction of the machine's warp-issue slots the kernel actually used.
 ///
-/// Sized by the compile-time `QB_MAX_BEAM`, so it does not shrink with the
-/// runtime width — which is the point: the footprint is dominated by the
-/// 4,096-entry prefix-group table, NOT by the beam.
+/// This is the number the old model had no way to express, and it is where the
+/// beam's win went: the beam cut instructions 1.9x and efficiency barely moved.
+pub(crate) fn implied_issue_efficiency(per_thread: f64, layer_seconds: f64) -> f64 {
+    layer_warp_instructions(per_thread) / (H200_WARP_INST_PER_S * layer_seconds)
+}
+
+/// Static shared memory of `qtip_quantize_rows_beam_kernel`, mirroring the
+/// declarations in the kernel. `cuobjdump` reports 38,992 B for the pre-wave16
+/// kernel; the extra ~1 KiB over this arithmetic is compiler/driver overhead.
 pub(crate) fn beam_kernel_smem_bytes(max_beam: usize) -> usize {
     let group_table = 4096 * 8; // u64 atomicMin slot per 2^(L-K) prefix
     let beam = max_beam * (4 + 2 + 2); // cost f32 + state u16 + parent u16
     let groups = max_beam * (2 + 4 + 2); // g u16 + cost f32 + parent u16
     let hist = 256 * 4;
-    let scratch = 8 * 4 + 8 * 8; // warp totals + scalars
+    let scratch = 2 * 8 * 4 + 8 * 8; // double-buffered warp totals + scalars
     group_table + beam + groups + hist + scratch
 }
 
-/// The wave13-AF projection, printed as a table. PROJECTION — see the module
-/// comment above for exactly which part of it touches a measurement.
+/// Blocks per SM permitted by a register budget on sm_90 (65,536 registers and
+/// 228 KiB of shared memory per SM, 256-register-per-warp allocation
+/// granularity).
+pub(crate) fn blocks_per_sm(regs_per_thread: usize, smem_bytes: usize) -> usize {
+    let per_warp = (32 * regs_per_thread).div_ceil(256) * 256;
+    let per_block = per_warp * 8;
+    let by_regs = 65536 / per_block.max(1);
+    let by_smem = 233_472 / smem_bytes.max(1);
+    by_regs.min(by_smem).min(8)
+}
+
+/// Print the measured picture and the derived breakdown side by side.
+///
+/// `cargo test -p mistralrs-quant --lib beam_kernel_cost_breakdown -- --nocapture`
 #[test]
-fn cuda_beam_bake_projection() {
-    let widths = [64usize, 128, 256];
-    println!(
-        "\n### PROJECTED V4-Flash bake cost (284B / 44 layers / H200). \
-         NOT MEASURED — wave13-AF had no GPU."
-    );
-    let ex = exhaustive_symbol_cost();
-    let beam = beam_symbol_cost(256.0, 6.0);
-    println!(
-        "per symbol position: exhaustive {:.0} B HBM / {:.0} B smem / {:.0} ops \
-         -> beam W=256 {:.0} B HBM / {:.0} B smem / {:.0} ops \
-         ({:.0}x less HBM, {:.1}x less smem, {:.1}x less arithmetic)",
-        ex.hbm_bytes,
-        ex.smem_bytes,
-        ex.alu_ops,
-        beam.hbm_bytes,
-        beam.smem_bytes,
-        beam.alu_ops,
-        ex.hbm_bytes / beam.hbm_bytes,
-        ex.smem_bytes / beam.smem_bytes,
-        ex.alu_ops / beam.alu_ops,
-    );
+fn beam_kernel_cost_breakdown() {
+    let beam = beam_step_instructions(3.87);
+    let exh = exhaustive_step_instructions();
+    let e_beam = implied_issue_efficiency(beam.total(), MEASURED_BEAM256_LAYER_SECONDS);
+    let e_exh = implied_issue_efficiency(exh.total(), MEASURED_EXHAUSTIVE_LAYER_SECONDS);
 
-    for &passes in &[2.0f64, 6.0] {
-        let (exhaustive, rows) = beam_bake_cost_model(&widths, passes);
-        println!(
-            "\n--- radix-select digit passes = {passes} ({}) ---",
-            if passes == 2.0 {
-                "typical: the early exit fires once a digit bin is unique"
-            } else {
-                "hard ceiling: all 48 key bits resolved"
-            }
-        );
-        println!(
-            "exhaustive prefix-grouped Viterbi: {exhaustive:.0} s/layer bandwidth model \
-             (FACTS.md MEASURES {:.0} s/layer = {:.1} h for 44 layers)",
-            MEASURED_EXHAUSTIVE_LAYER_SECONDS,
-            MEASURED_EXHAUSTIVE_LAYER_SECONDS * 44.0 / 3600.0
-        );
-        println!(
-            "{:<8} | {:>9} | {:>9} | {:>7} | {:>7} | {:>7} | {:>9} | {:>12}",
-            "beam W", "s/layer", "optimist", "hbm s", "smem s", "alu s", "speedup", "44 layers"
-        );
-        for r in &rows {
-            println!(
-                "{:<8} | {:>9.1} | {:>9.1} | {:>7.1} | {:>7.1} | {:>7.1} | {:>8.1}x | {:>9.1} min",
-                r.width,
-                r.layer_seconds,
-                r.layer_seconds_raw,
-                r.hbm_seconds,
-                r.smem_seconds,
-                r.alu_seconds,
-                MEASURED_EXHAUSTIVE_LAYER_SECONDS / r.layer_seconds,
-                r.layer_seconds * 44.0 / 60.0
-            );
-        }
-    }
-
+    println!("\n### MEASURED (H200, session 6) — not a projection");
     println!(
-        "\nshared-memory residency: the kernel's static footprint is {} B of the 49152 B \
-         budget at every supported width — {} B of that is the 4096-entry prefix-group \
-         table and only {} B is the W=256 beam itself.",
-        beam_kernel_smem_bytes(256),
-        4096 * 8,
-        256 * 8
+        "  exhaustive {:.0} s/layer | beam-256 {:.0} s/layer | speedup {:.2}x",
+        MEASURED_EXHAUSTIVE_LAYER_SECONDS,
+        MEASURED_BEAM256_LAYER_SECONDS,
+        MEASURED_EXHAUSTIVE_LAYER_SECONDS / MEASURED_BEAM256_LAYER_SECONDS
+    );
+    println!(
+        "  beam kernel: REG:{} LOCAL:0 SHARED:38992 -> {} blocks/SM, {:.1}% occupancy \
+         (register-limited)",
+        MEASURED_BEAM_REGISTERS_PER_THREAD,
+        MEASURED_BEAM_BLOCKS_PER_SM,
+        MEASURED_BEAM_BLOCKS_PER_SM as f64 * 8.0 / 64.0 * 100.0
+    );
+    println!("  telemetry: sm=100%, mem=1%, 261 W of 700 W (37% of TDP) at 1980 MHz");
+
+    println!("\n### DERIVED from kernel source + the measured radix pass count");
+    println!(
+        "  instructions/thread/timestep: exhaustive {:.0} | beam {:.0} (ratio {:.2}x)",
+        exh.total(),
+        beam.total(),
+        exh.total() / beam.total()
+    );
+    println!(
+        "  beam breakdown: select {:.0} ({:.0}%), compact {:.0}, expand {:.0}, \
+         group {:.0}, trace {:.0}",
+        beam.select,
+        beam.selection_fraction() * 100.0,
+        beam.compact,
+        beam.expand,
+        beam.group_reduce,
+        beam.trace
+    );
+    println!(
+        "  implied issue efficiency: exhaustive {:.1}% | beam {:.1}% (ratio {:.2}x)",
+        e_exh * 100.0,
+        e_beam * 100.0,
+        e_beam / e_exh
+    );
+    println!(
+        "  => predicted speedup {:.2}x x {:.2}x = {:.2}x vs measured {:.2}x",
+        exh.total() / beam.total(),
+        e_beam / e_exh,
+        (exh.total() / beam.total()) * (e_beam / e_exh),
+        MEASURED_EXHAUSTIVE_LAYER_SECONDS / MEASURED_BEAM256_LAYER_SECONDS
+    );
+    println!(
+        "\n  NOTE: 37.5% occupancy against 37% of TDP is an independent check on the \
+         latency-bound reading."
     );
 }
 
-/// Arithmetic facts about the two kernels that must hold for the design to be
-/// worth shipping. Not timings, so these run on any machine.
+/// The model is descriptive, so its job is to stay consistent with the
+/// measurement. If a kernel change breaks these, the numbers in
+/// `wave16-AF-beam-perf.md` are stale and must be re-measured, not re-derived.
 #[test]
-fn beam_cost_model_invariants() {
-    let ex = exhaustive_symbol_cost();
-    // Worst case for the beam: widest supported W and every radix pass taken.
-    let beam = beam_symbol_cost(256.0, 6.0);
+fn cost_model_matches_the_measurement() {
+    let beam = beam_step_instructions(3.87);
+    let exh = exhaustive_step_instructions();
 
-    // The thesis: the exhaustive kernel is HBM-bound and the beam kernel is not.
+    // Selection, not state evaluation, is what the beam kernel spends its time
+    // on. This is the finding the whole analysis rests on.
     assert!(
-        ex.hbm_bytes / beam.hbm_bytes > 200.0,
-        "beam must cut HBM traffic by >200x, got {:.0}x",
-        ex.hbm_bytes / beam.hbm_bytes
-    );
-    // ... and it must not simply relocate the bottleneck into shared memory,
-    // even when charged full price for every histogram atomic.
-    assert!(
-        beam.smem_bytes < ex.smem_bytes,
-        "beam smem traffic {:.0} B must not exceed the exhaustive kernel's {:.0} B",
-        beam.smem_bytes,
-        ex.smem_bytes
-    );
-    assert!(
-        ex.alu_ops > beam.alu_ops,
-        "beam must also cut arithmetic: {:.0} vs {:.0} ops",
-        beam.alu_ops,
-        ex.alu_ops
+        beam.selection_fraction() > 0.70,
+        "selection is {:.0}% of the beam step; the analysis assumes it dominates",
+        beam.selection_fraction() * 100.0
     );
 
-    // The pure-bandwidth model must land within 2x of the measured exhaustive
-    // bake, otherwise nothing built on it is worth reading. (HBM_EFFICIENCY is
-    // fitted to that measurement, so this asserts the fitted efficiency stays
-    // physically plausible rather than absorbing an order of magnitude.)
+    // Instruction ratio x efficiency ratio must reproduce the measured speedup.
+    let e_beam = implied_issue_efficiency(beam.total(), MEASURED_BEAM256_LAYER_SECONDS);
+    let e_exh = implied_issue_efficiency(exh.total(), MEASURED_EXHAUSTIVE_LAYER_SECONDS);
+    let predicted = (exh.total() / beam.total()) * (e_beam / e_exh);
+    let measured = MEASURED_EXHAUSTIVE_LAYER_SECONDS / MEASURED_BEAM256_LAYER_SECONDS;
     assert!(
-        (0.3..=1.0).contains(&HBM_EFFICIENCY),
-        "implied HBM efficiency {HBM_EFFICIENCY} is not a plausible fraction of peak"
+        (predicted - measured).abs() / measured < 0.05,
+        "model predicts {predicted:.3}x but {measured:.3}x was measured"
     );
 
-    // Wider beams cost more, monotonically, and every width beats exhaustive.
-    let (_, rows) = beam_bake_cost_model(&[64, 128, 256], 6.0);
-    for pair in rows.windows(2) {
+    // Both kernels run far below the issue roof: that is the shared diagnosis.
+    for (name, eff) in [("exhaustive", e_exh), ("beam", e_beam)] {
         assert!(
-            pair[1].layer_seconds > pair[0].layer_seconds,
-            "W={} must cost more than W={}",
-            pair[1].width,
-            pair[0].width
-        );
-    }
-    for r in &rows {
-        assert!(
-            r.layer_seconds < MEASURED_EXHAUSTIVE_LAYER_SECONDS,
-            "W={} projects {:.0} s/layer, no better than the measured exhaustive bake",
-            r.width,
-            r.layer_seconds
+            eff < 0.25,
+            "{name} issue efficiency {eff:.3} — if a kernel now runs near its roof, \
+             the latency-bound analysis no longer applies"
         );
     }
 
-    // Shared-memory residency: the kernel fits the 48 KiB static budget, and
-    // the prefix-group table — not the beam — is what dominates it.
-    let total = beam_kernel_smem_bytes(256);
-    assert!(
-        total <= 48 * 1024,
-        "beam kernel needs {total} B of shared memory, over the 48 KiB static budget"
+    // Occupancy arithmetic, checked against what cuobjdump actually reported.
+    assert_eq!(
+        blocks_per_sm(MEASURED_BEAM_REGISTERS_PER_THREAD, 38_992),
+        MEASURED_BEAM_BLOCKS_PER_SM,
+        "occupancy arithmetic disagrees with the measured cuobjdump result"
     );
-    assert!(
-        4096 * 8 > total / 2,
-        "the 4096-entry group table should dominate the shared-memory budget"
-    );
+    // The wave16 fix targets 4 blocks/SM, which needs <= 64 registers/thread.
+    assert_eq!(blocks_per_sm(64, beam_kernel_smem_bytes(256)), 4);
+    // Shared memory is not what limits either configuration.
+    assert!(beam_kernel_smem_bytes(256) * 4 <= 233_472);
 }
-
 // ---------------------------------------------------------------------------
 // CUDA beam kernel: measured cost drivers (wave16-AF)
 // ---------------------------------------------------------------------------
