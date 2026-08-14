@@ -46,10 +46,10 @@ use crate::turboquant::wht::generate_signs;
 // Deterministic RNG (splitmix64) + samplers
 // ---------------------------------------------------------------------------
 
-struct Rng(u64);
+pub(super) struct Rng(u64);
 
 impl Rng {
-    fn new(seed: u64) -> Self {
+    pub(super) fn new(seed: u64) -> Self {
         Rng(seed)
     }
     fn next_u64(&mut self) -> u64 {
@@ -64,7 +64,7 @@ impl Rng {
         ((self.next_u64() >> 11) as f64 + 1.0) / ((1u64 << 53) as f64 + 2.0)
     }
     /// Standard normal (Box-Muller, no caching — determinism over speed).
-    fn normal(&mut self) -> f64 {
+    pub(super) fn normal(&mut self) -> f64 {
         let u1 = self.uniform();
         let u2 = self.uniform();
         (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
@@ -106,7 +106,7 @@ fn snap_to_fp4(x: f32) -> f32 {
 
 /// Pure Gaussian control fixture (what the existing tests use — the fixture
 /// on which everything looks fine).
-fn gen_gaussian(n: usize, k: usize, sigma: f64, seed: u64) -> Vec<f32> {
+pub(super) fn gen_gaussian(n: usize, k: usize, sigma: f64, seed: u64) -> Vec<f32> {
     let mut rng = Rng::new(seed);
     (0..n * k).map(|_| (rng.normal() * sigma) as f32).collect()
 }
@@ -124,7 +124,7 @@ fn gen_student_t(n: usize, k: usize, sigma: f64, seed: u64) -> Vec<f32> {
 /// lattice with a per-32-column block scale — exactly what "INT4-packed FP4
 /// experts dequantized to BF16" produces. Rows are 16-level lattice mixtures,
 /// NOT Gaussian.
-fn gen_fp4_dequant(n: usize, k: usize, sigma: f64, seed: u64) -> Vec<f32> {
+pub(super) fn gen_fp4_dequant(n: usize, k: usize, sigma: f64, seed: u64) -> Vec<f32> {
     const BLOCK: usize = 32;
     let base = gen_student_t(n, k, sigma, seed);
     let mut out = vec![0f32; n * k];
@@ -197,7 +197,7 @@ fn greedy_quantize_row(target: &[f32], lut: &[f32]) -> Vec<u8> {
 }
 
 /// Pack two K=4 symbols per byte, low nibble first (production layout).
-fn pack_symbols(symbols: &[u8]) -> Vec<u8> {
+pub(super) fn pack_symbols(symbols: &[u8]) -> Vec<u8> {
     let mut packed = vec![0u8; symbols.len() / 2];
     for (i, &s) in symbols.iter().enumerate() {
         if i % 2 == 0 {
@@ -211,7 +211,7 @@ fn pack_symbols(symbols: &[u8]) -> Vec<u8> {
 
 /// Production decoder walk: packed bytes → unscaled codeword sequence.
 /// Mirrors `qtip_dequantize_v2_k4_l16_kernel` / `dequantize_weights_f32`.
-fn decode_packed(packed: &[u8], num_symbols: usize, lut: &[f32]) -> Vec<f32> {
+pub(super) fn decode_packed(packed: &[u8], num_symbols: usize, lut: &[f32]) -> Vec<f32> {
     let mut state: u32 = 0;
     let mut out = Vec::with_capacity(num_symbols * V as usize);
     for t in 0..num_symbols {
@@ -333,7 +333,7 @@ fn quantize_matrix(w: &[f32], n: usize, k: usize, cfg: Cfg) -> Vec<f32> {
 // Metrics
 // ---------------------------------------------------------------------------
 
-fn cosine(a: &[f32], b: &[f32]) -> f64 {
+pub(super) fn cosine(a: &[f32], b: &[f32]) -> f64 {
     let mut dot = 0f64;
     let mut na = 0f64;
     let mut nb = 0f64;
@@ -346,7 +346,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
 }
 
 /// y = x @ W^T for x `[batch, k]`, W `[n, k]` → `[batch, n]`.
-fn matmul_t(x: &[f32], w: &[f32], batch: usize, n: usize, k: usize) -> Vec<f32> {
+pub(super) fn matmul_t(x: &[f32], w: &[f32], batch: usize, n: usize, k: usize) -> Vec<f32> {
     let mut y = vec![0f32; batch * n];
     for b in 0..batch {
         for r in 0..n {

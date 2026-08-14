@@ -63,12 +63,16 @@ mod cuda_ops;
 #[cfg(feature = "cuda")]
 mod ffi;
 pub mod grouped;
+#[cfg(test)]
+mod search_bench;
 pub mod tune;
 mod viterbi;
 pub use bitshift::{Qtip2bLayer, QTIP2B_MCG_MULT};
 pub use grouped::{ExpertBpwTable, TrellisBpw};
 #[allow(unused_imports)]
-pub use viterbi::viterbi_quantize_row;
+pub use viterbi::{
+    hessian_row_weights, quantize_row, viterbi_quantize_row, TrellisSearch, HESSIAN_SIGMA_REG,
+};
 
 /// Default seed for the QTIP Hadamard incoherence rotation.
 ///
@@ -555,6 +559,107 @@ impl QtipMode {
             QtipMode::Viterbi
         }
     }
+
+    /// Tag for the bake log header. Task #17: a Greedy bake must never again be
+    /// mistakable for a Viterbi bake by reading the log.
+    fn tag(&self) -> &'static str {
+        match self {
+            QtipMode::Greedy => "greedy",
+            QtipMode::Viterbi => "viterbi",
+        }
+    }
+}
+
+/// Bake-time search + objective selection for the trellis quantizer (wave13-AD).
+///
+/// Both axes default to today's behaviour and are read once per process from
+/// the environment:
+///
+/// * `ARC_QTIP_BEAM=<W>` — prune the trellis search to a beam of width `W`.
+///   Unset / `0` / `off` keeps the exhaustive `2^L` dynamic program.
+/// * `ARC_QTIP_HESSIAN=1` — minimise `(w−ŵ)ᵀ H (w−ŵ)` using a diagonal
+///   activation Hessian instead of `‖w−ŵ‖²`. Requires calibration data (an
+///   imatrix); without it the bake silently stays unweighted, which the log
+///   header reports as `mse(no-calibration)`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QtipBakeConfig {
+    /// Search strategy over the trellis state space.
+    pub search: TrellisSearch,
+    /// Whether to use the diagonal-Hessian objective when calibration data is
+    /// available.
+    pub hessian: bool,
+}
+
+impl QtipBakeConfig {
+    /// Read (and memoise) the bake configuration from the environment.
+    pub fn get() -> Self {
+        static CFG: std::sync::OnceLock<QtipBakeConfig> = std::sync::OnceLock::new();
+        *CFG.get_or_init(|| QtipBakeConfig {
+            search: TrellisSearch::from_env(),
+            hessian: matches!(
+                std::env::var("ARC_QTIP_HESSIAN").as_deref(),
+                Ok("1") | Ok("true") | Ok("on")
+            ),
+        })
+    }
+}
+
+/// Emit the bake header describing exactly what search and objective produced
+/// this checkpoint — once per distinct configuration per process.
+///
+/// Task #17: "a Greedy bake must never again be mistakable for Viterbi." The
+/// header names the mode, the search strategy, the objective (including whether
+/// calibration data was actually supplied), and the incoherence rotation width,
+/// so a bake log is self-describing.
+fn bake_header_line(
+    rung: &str,
+    mode: QtipMode,
+    cfg: QtipBakeConfig,
+    rotation_block: usize,
+    have_calibration: bool,
+) -> String {
+    // Greedy ignores the trellis search entirely — it is a one-step walk, not a
+    // dynamic program — so never label a greedy bake with a beam width.
+    let search = match mode {
+        QtipMode::Greedy => "greedy-walk (no trellis search)".to_string(),
+        QtipMode::Viterbi => cfg.search.tag(),
+    };
+    let objective = match (cfg.hessian, have_calibration) {
+        (true, true) => "hessian-diag (weighted)",
+        (true, false) => "mse(no-calibration)",
+        (false, _) => "mse (unweighted)",
+    };
+    let rotation = if rotation_block >= 2 {
+        format!("hadamard-{rotation_block}")
+    } else {
+        "off".to_string()
+    };
+    format!(
+        "QTIP bake [{rung}]: mode={} search={search} objective={objective} rotation={rotation}",
+        mode.tag()
+    )
+}
+
+fn log_bake_header(
+    rung: &str,
+    mode: QtipMode,
+    cfg: QtipBakeConfig,
+    rotation_block: usize,
+    have_calibration: bool,
+) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+    let line = bake_header_line(rung, mode, cfg, rotation_block, have_calibration);
+
+    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let mut guard = match seen.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.insert(line.clone()) {
+        tracing::info!("{line}");
+    }
 }
 
 impl QtipLayer {
@@ -609,6 +714,25 @@ impl QtipLayer {
         mode: QtipMode,
         use_rotation: bool,
     ) -> Result<Arc<dyn QuantMethod>> {
+        Self::quantize_with_calibration(weight, bias, device, mode, use_rotation, None)
+    }
+
+    /// [`Self::quantize_with_options`] plus an optional activation Hessian
+    /// diagonal for the weighted objective (wave13-AD, axis B).
+    ///
+    /// `hessian_diag` is `H_jj = (1/N) Σ_n x_{n,j}²` over calibration
+    /// activations — one entry per **input** feature, i.e. exactly the vector
+    /// [`crate::ImatrixLayerStats::compute_imatrix`] produces. It is ignored
+    /// unless `ARC_QTIP_HESSIAN=1` is set, so wiring calibration data through
+    /// is safe by default.
+    pub fn quantize_with_calibration(
+        weight: &Tensor,
+        bias: Option<Tensor>,
+        device: &Device,
+        mode: QtipMode,
+        use_rotation: bool,
+        hessian_diag: Option<&[f32]>,
+    ) -> Result<Arc<dyn QuantMethod>> {
         // Dispatch by rank. 3-D inputs come from V4 Flash MoE expert stacks
         // (gate_proj / up_proj / down_proj fused across all experts) and are
         // not supported by the dims2()-based pipeline below.
@@ -621,9 +745,22 @@ impl QtipLayer {
                     "QTIP 3-D quantize: bias not supported for stacked-expert weights"
                 );
             }
-            return Self::quantize_with_options_3d(weight, device, mode, use_rotation);
+            return Self::quantize_with_options_3d_calibrated(
+                weight,
+                device,
+                mode,
+                use_rotation,
+                hessian_diag,
+            );
         }
-        let layer = Self::quantize_with_options_concrete(weight, bias, device, mode, use_rotation)?;
+        let layer = Self::quantize_with_options_concrete_calibrated(
+            weight,
+            bias,
+            device,
+            mode,
+            use_rotation,
+            hessian_diag,
+        )?;
         Ok(Arc::new(layer))
     }
 
@@ -642,6 +779,26 @@ impl QtipLayer {
         device: &Device,
         mode: QtipMode,
         use_rotation: bool,
+    ) -> Result<Self> {
+        Self::quantize_with_options_concrete_calibrated(
+            weight,
+            bias,
+            device,
+            mode,
+            use_rotation,
+            None,
+        )
+    }
+
+    /// [`Self::quantize_with_options_concrete`] with an optional activation
+    /// Hessian diagonal (`[K_in]`) for the weighted objective.
+    pub fn quantize_with_options_concrete_calibrated(
+        weight: &Tensor,
+        bias: Option<Tensor>,
+        device: &Device,
+        mode: QtipMode,
+        use_rotation: bool,
+        hessian_diag: Option<&[f32]>,
     ) -> Result<Self> {
         // RUN-quant-on-gpu fast path. For 284B-parameter V4 Flash the CPU-only
         // Viterbi quantize took 30-90 min per load; the GPU path collapses
@@ -665,6 +822,29 @@ impl QtipLayer {
                 candle_core::bail!(
                     "QTIP quantize: CUDA device but QTIP kernels not compiled in. \
                      Rebuild mistralrs-quant with CUDA + has_qtip_kernels."
+                );
+            }
+            // wave13-AD: the beam search and the Hessian-weighted objective are
+            // CPU-only for now (`qtip_quantize_rows_viterbi_kernel` is still the
+            // exhaustive prefix-grouped DP with an unweighted branch metric —
+            // see the kernel plan in `qtip/search_bench.rs`). Rather than
+            // silently baking a *different* objective on GPU than the flag asks
+            // for, refuse: an unnoticed objective mismatch is exactly the class
+            // of defect task #17 exists to prevent.
+            let bake_cfg = QtipBakeConfig::get();
+            if !matches!(bake_cfg.search, TrellisSearch::Exhaustive) {
+                candle_core::bail!(
+                    "QTIP quantize: ARC_QTIP_BEAM is set but the CUDA quantize kernel only \
+                     implements the exhaustive trellis search. Either unset ARC_QTIP_BEAM or \
+                     bake on CPU; the GPU path will not silently substitute a different search."
+                );
+            }
+            if bake_cfg.hessian && hessian_diag.is_some() {
+                candle_core::bail!(
+                    "QTIP quantize: ARC_QTIP_HESSIAN=1 with calibration data, but the CUDA \
+                     quantize kernel only implements the unweighted branch metric. Either unset \
+                     ARC_QTIP_HESSIAN or bake on CPU; the GPU path will not silently substitute \
+                     a different objective."
                 );
             }
             match Self::quantize_with_options_cuda(
@@ -721,6 +901,34 @@ impl QtipLayer {
             (0usize, Vec::new())
         };
 
+        // wave13-AD axis B: project the calibration Hessian diagonal into the
+        // frame the trellis actually searches. `hessian_row_weights` folds in
+        // QTIP's relative damping and the `diag(RᵀHR) = block-mean(diag H)`
+        // correction; a flat Hessian normalises to exactly 1.0 everywhere and
+        // is therefore bit-identical to the unweighted objective.
+        let bake_cfg = QtipBakeConfig::get();
+        let calibration_ok = hessian_diag.is_some_and(|h| h.len() == k_in);
+        if let Some(h) = hessian_diag {
+            if bake_cfg.hessian && h.len() != k_in {
+                candle_core::bail!(
+                    "QTIP quantize: Hessian diagonal has {} entries but in_features is {k_in}",
+                    h.len()
+                );
+            }
+        }
+        let search_weights: Option<Vec<f32>> = if bake_cfg.hessian && calibration_ok {
+            hessian_diag.map(|h| viterbi::hessian_row_weights(h, rotation_block))
+        } else {
+            None
+        };
+        log_bake_header(
+            "K4/V2 2-bit",
+            mode,
+            bake_cfg,
+            rotation_block,
+            search_weights.is_some(),
+        );
+
         use rayon::prelude::*;
         let row_results: Vec<(Vec<u8>, f32)> = (0..n)
             .into_par_iter()
@@ -755,7 +963,12 @@ impl QtipLayer {
 
                 // Encode the symbol sequence via the selected mode.
                 let symbols: Vec<u8> = match mode {
-                    QtipMode::Viterbi => viterbi::viterbi_quantize_row(&scaled_target, &lut_data),
+                    QtipMode::Viterbi => viterbi::quantize_row(
+                        &scaled_target,
+                        &lut_data,
+                        bake_cfg.search,
+                        search_weights.as_deref(),
+                    ),
                     QtipMode::Greedy => {
                         let mut state: u32 = 0;
                         let mut syms = vec![0u8; num_symbols_per_row];
@@ -959,6 +1172,19 @@ impl QtipLayer {
         mode: QtipMode,
         use_rotation: bool,
     ) -> Result<Arc<dyn QuantMethod>> {
+        Self::quantize_with_options_3d_calibrated(weight, device, mode, use_rotation, None)
+    }
+
+    /// [`Self::quantize_with_options_3d`] with an optional activation Hessian
+    /// diagonal (`[K_in]`, shared across experts because every expert in a
+    /// stack reads the same input features).
+    pub fn quantize_with_options_3d_calibrated(
+        weight: &Tensor,
+        device: &Device,
+        mode: QtipMode,
+        use_rotation: bool,
+        hessian_diag: Option<&[f32]>,
+    ) -> Result<Arc<dyn QuantMethod>> {
         let dims = weight.dims3()?;
         let (e, n, k_in) = (dims.0, dims.1, dims.2);
         if e == 0 || n == 0 || k_in == 0 {
@@ -1001,8 +1227,7 @@ impl QtipLayer {
         // Any reroute to the CPU pipeline while a GPU is plausibly available
         // is counted + warned inside `expert_stack_quant_device` (wave6-Q:
         // the silent version of this gate cost ~20x per layer).
-        let quant_device =
-            expert_stack_quant_device(device, "QtipLayer::quantize_with_options_3d");
+        let quant_device = expert_stack_quant_device(device, "QtipLayer::quantize_with_options_3d");
         let move_back = matches!(quant_device, Device::Cuda(_)) && matches!(device, Device::Cpu);
 
         // RUN-161 expert-batching: the per-expert loop used to stream ONE expert
@@ -1026,12 +1251,13 @@ impl QtipLayer {
             // [this_b, N, K] -> [this_b*N, K] (CPU reshape; concrete moves to GPU).
             let chunk = weight.narrow(0, expert_idx, this_b)?;
             let rows_2d = chunk.reshape((this_b * n, k_in))?;
-            let layer = Self::quantize_with_options_concrete(
+            let layer = Self::quantize_with_options_concrete_calibrated(
                 &rows_2d,
                 None,
                 &quant_device,
                 mode,
                 use_rotation,
+                hessian_diag,
             )?;
 
             // blocks [this_b*N, packed] -> [this_b, N, packed]; scales [this_b*N] -> [this_b, N].
@@ -3284,6 +3510,50 @@ mod tests {
         }
     }
 
+    /// Task #17: a Greedy bake must never again be mistakable for a Viterbi
+    /// bake by reading the log. The header names the mode, the search, the
+    /// objective (including whether calibration data actually arrived) and the
+    /// rotation width — and a Greedy bake must never be labelled with a beam
+    /// width it does not use.
+    #[test]
+    fn bake_header_names_the_search_and_objective() {
+        let beam = QtipBakeConfig {
+            search: TrellisSearch::Beam { width: 128 },
+            hessian: true,
+        };
+
+        let greedy = bake_header_line("K4/V2 2-bit", QtipMode::Greedy, beam, 0, false);
+        assert!(greedy.contains("mode=greedy"), "{greedy}");
+        assert!(greedy.contains("greedy-walk"), "{greedy}");
+        assert!(
+            !greedy.contains("viterbi") && !greedy.contains("W=128"),
+            "a greedy bake must not advertise a trellis search: {greedy}"
+        );
+        assert!(greedy.contains("rotation=off"), "{greedy}");
+        // Hessian requested but no calibration data => say so, don't imply it.
+        assert!(greedy.contains("mse(no-calibration)"), "{greedy}");
+
+        let viterbi = bake_header_line("K4/V2 2-bit", QtipMode::Viterbi, beam, 128, true);
+        assert!(viterbi.contains("mode=viterbi"), "{viterbi}");
+        assert!(viterbi.contains("viterbi-beam(W=128)"), "{viterbi}");
+        assert!(viterbi.contains("hessian-diag"), "{viterbi}");
+        assert!(viterbi.contains("rotation=hadamard-128"), "{viterbi}");
+
+        // The shipped default must read as today's bake, unambiguously.
+        let default = bake_header_line(
+            "K4/V2 2-bit",
+            QtipMode::Viterbi,
+            QtipBakeConfig::default(),
+            128,
+            false,
+        );
+        assert_eq!(
+            default,
+            "QTIP bake [K4/V2 2-bit]: mode=viterbi search=viterbi-exhaustive \
+             objective=mse (unweighted) rotation=hadamard-128"
+        );
+    }
+
     /// Non-power-of-2 in_features that's divisible by 2 should still get a
     /// non-trivial block size. (Defensive — real LLMs often have
     /// `intermediate_size = 14336 = 7·2^11`, block_size should be 128.)
@@ -4607,7 +4877,8 @@ mod tests {
         assert_eq!(layer.dequantize_w()?.dims(), &[e, n, k_in]);
         let after = gpu_quantize_cpu_fallback_count();
         assert_eq!(
-            after, before,
+            after,
+            before,
             "QtipLayer 3-D expert quantize fell back to the CPU pipeline on a CUDA box \
              ({} new fallback(s)) — check the warn log for the reason",
             after - before

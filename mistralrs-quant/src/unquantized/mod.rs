@@ -370,9 +370,21 @@ impl QuantMethod for UnquantLinear {
             }
             Some(IsqType::QtipBitshift2) => {
                 let _acquired_quantize_guard = guard.acquire(&device);
-                if imatrix_weight.is_some() {
-                    candle_core::bail!("QTIP does not support imatrix.");
-                }
+                // wave13-AD axis B: the imatrix IS the diagonal activation
+                // Hessian this rung wants — `ImatrixLayerStats` accumulates
+                // `Σ_n x_{n,j}²` per input column, i.e. `N · diag(XᵀX)`, which
+                // is `diag(H)` up to the global scale the trellis metric is
+                // invariant to. It is only consumed when `ARC_QTIP_HESSIAN=1`;
+                // otherwise we keep the historical "unsupported" contract
+                // rather than silently ignoring calibration data.
+                let hessian_diag = match (&imatrix_weight, crate::QtipBakeConfig::get().hessian) {
+                    (Some(h), true) => Some(h.as_slice()),
+                    (Some(_), false) => candle_core::bail!(
+                        "QTIP does not support imatrix. Set ARC_QTIP_HESSIAN=1 to bake with the \
+                         diagonal activation-Hessian objective instead."
+                    ),
+                    (None, _) => None,
+                };
                 n_quantized.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let bias = self.b.as_ref().map(|b| b.to_device(&device)).transpose()?;
                 // 3D weights are MoE expert stacks (e.g. [256, 2048, 4096]).
@@ -400,7 +412,15 @@ impl QuantMethod for UnquantLinear {
                 } else {
                     self.w.to_device(&device)?
                 };
-                crate::QtipLayer::quantize_with_mode(&w_for_quant, bias, &device, mode)
+                let use_rotation = matches!(mode, crate::QtipMode::Viterbi);
+                crate::QtipLayer::quantize_with_calibration(
+                    &w_for_quant,
+                    bias,
+                    &device,
+                    mode,
+                    use_rotation,
+                    hessian_diag,
+                )
             }
             Some(IsqType::Qtip2b) => {
                 let _acquired_quantize_guard = guard.acquire(&device);

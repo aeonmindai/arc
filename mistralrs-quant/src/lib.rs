@@ -90,8 +90,9 @@ pub use qtip::tune::{
     GemvTuneEntry, GemvVariantDesc, QTIP2B_GEMV_BAKED_TABLE, QTIP2B_GEMV_VARIANT_LEGACY,
 };
 pub use qtip::{
-    gpu_quantize_cpu_fallback_count, ExpertBpwTable, Qtip2bLayer, QtipLayer, QtipMode,
-    QtipPackedView, TrellisBpw, QTIP2B_MCG_MULT,
+    gpu_quantize_cpu_fallback_count, hessian_row_weights, viterbi_quantize_row, ExpertBpwTable,
+    Qtip2bLayer, QtipBakeConfig, QtipLayer, QtipMode, QtipPackedView, TrellisBpw, TrellisSearch,
+    QTIP2B_MCG_MULT,
 };
 pub use td_moe_factored::TuckerFactoredLayer;
 pub use unquantized::UnquantLinear;
