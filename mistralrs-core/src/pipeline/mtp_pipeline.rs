@@ -340,10 +340,7 @@ impl MtpSpeculativePipeline {
     /// pipeline directly).
     ///
     /// Returns `None` if the target pipeline doesn't expose an MTP head.
-    pub fn try_new(
-        target: Arc<tokio::sync::Mutex<dyn Pipeline>>,
-        depth: usize,
-    ) -> Option<Self> {
+    pub fn try_new(target: Arc<tokio::sync::Mutex<dyn Pipeline>>, depth: usize) -> Option<Self> {
         if depth == 0 {
             return None;
         }
@@ -588,38 +585,66 @@ async fn run_target_forward(
 /// Inspect the target's Normal cache and return the current sequence length
 /// in the K cache of layer 0. Caller has already gated on
 /// `EitherCache::Normal`, so this is safe.
+///
+/// Reads through `self.target_cache` — an `EitherCache::Normal` clone shares
+/// its `Arc<Mutex<NormalCache>>` with the target pipeline, so no pipeline
+/// lock is needed. (The previous implementation ran
+/// `futures::executor::block_on(target.lock())` inside the async `step()`,
+/// parking a runtime worker on a pipeline mutex — a deadlock class we do not
+/// want in the serve hot path; see docs/notes/mtp-hang-triage.md.)
 fn current_normal_cache_len(this: &MtpSpeculativePipeline) -> usize {
-    let target = futures::executor::block_on(this.target.lock());
-    let cache = target.cache();
-    let EitherCache::Normal(normal) = cache else {
+    let EitherCache::Normal(normal) = &this.target_cache else {
         return 0;
     };
-    let len = normal.lock().unwrap().0[0].current_seq_len();
-    drop(target);
-    len
+    normal.lock().unwrap().0[0].current_seq_len()
 }
 
 /// Truncate the target's Normal KV cache by `n_drop` positions on every layer.
-/// Used after MTP verify to discard rejected speculative positions so the
-/// sequence's token count and the cache stay in lockstep.
+/// Used after MTP verify to discard speculative positions the committed
+/// sequence does not need, so the token count and the cache stay in lockstep.
+/// Same lock-free-on-the-pipeline access as [`current_normal_cache_len`].
 fn truncate_normal_cache(this: &MtpSpeculativePipeline, n_drop: usize) -> Result<()> {
-    let target = futures::executor::block_on(this.target.lock());
-    let cache = target.cache();
-    let EitherCache::Normal(normal) = cache else {
+    let EitherCache::Normal(normal) = &this.target_cache else {
         return Ok(());
     };
-    {
-        let mut guard = normal.lock().unwrap();
-        for cache in &mut *guard.0 {
-            let cur = cache.current_seq_len();
-            let new_len = cur.saturating_sub(n_drop);
-            cache
-                .set_len(new_len)
-                .map_err(|_| candle_core::Error::msg("MTP: KV cache set_len failed."))?;
-        }
+    let mut guard = normal.lock().unwrap();
+    for cache in &mut *guard.0 {
+        let cur = cache.current_seq_len();
+        let new_len = cur.saturating_sub(n_drop);
+        cache
+            .set_len(new_len)
+            .map_err(|_| candle_core::Error::msg("MTP: KV cache set_len failed."))?;
     }
-    drop(target);
     Ok(())
+}
+
+/// How many trailing KV-cache positions to drop after an MTP verify forward.
+///
+/// Invariant to restore (what plain decode maintains): entering a decode
+/// step, the target cache holds the KV of every committed token EXCEPT the
+/// last one — the last committed token is the next step's single-token input
+/// (`make_completion_chunk` feeds `toks[len-1..]` only).
+///
+/// Bookkeeping: after the verify forward the cache gained `n_proposed` extra
+/// positions (the inputs `[T0, P1, …, P_{d-1}]`). The step commits
+/// `1 (T0) + commit_len` tokens, where `commit_len = accepted + correction`
+/// ([`VerifyResult::commit_len`]). The cache must therefore keep
+/// `commit_len` of the extras and drop the rest:
+///
+/// ```text
+/// n_drop = n_proposed - commit_len
+///        = n_proposed - n_accepted        (no rejection: keep every extra)
+///        = n_proposed - n_accepted - 1    (rejection: the correction token is
+///                                          committed but was never a verify
+///                                          input, so one FEWER slot is dropped)
+/// ```
+///
+/// The pre-session-5 code dropped `n_proposed - n_accepted` unconditionally —
+/// one slot too many on EVERY rejected chain, permanently desyncing the cache
+/// from the committed tokens (cumulative, one position per rejection). See
+/// docs/notes/mtp-hang-triage.md for the full derivation.
+fn n_cache_positions_to_drop(n_proposed: usize, verify_result: &VerifyResult) -> usize {
+    n_proposed.saturating_sub(verify_result.commit_len())
 }
 
 /// Greedy argmax over a (depth × vocab) or (1 × depth × vocab) logits tensor;
@@ -827,7 +852,10 @@ impl Pipeline for MtpSpeculativePipeline {
             && input_seqs.len() == 1
             && !return_raw_logits
             && matches!(self.target_cache, EitherCache::Normal(_))
-            && matches!(backend_metadata, CacheBackendMetadata::DefaultInstructions { .. })
+            && matches!(
+                backend_metadata,
+                CacheBackendMetadata::DefaultInstructions { .. }
+            )
             && !get_mut_arcmutex!(self.target).get_metadata().is_xlora
             && !get_mut_arcmutex!(self.target).get_metadata().no_kv_cache;
 
@@ -847,8 +875,7 @@ impl Pipeline for MtpSpeculativePipeline {
         }
 
         // ===== MTP fast path =====
-        let CacheBackendMetadata::DefaultInstructions { pre_op, post_op } = backend_metadata
-        else {
+        let CacheBackendMetadata::DefaultInstructions { pre_op, post_op } = backend_metadata else {
             unreachable!("guarded above");
         };
 
@@ -874,10 +901,7 @@ impl Pipeline for MtpSpeculativePipeline {
 
         // ---- Step 1: target forward + sample T0 ----
         let (logits_t0, _exec_t0) = run_target_forward(
-            self,
-            seq,
-            /* is_prompt = */ false,
-            /* prefill_window = */ None,
+            self, seq, /* is_prompt = */ false, /* prefill_window = */ None,
         )
         .await?;
         let t0_logprobs = sample_sequence(
@@ -945,7 +969,12 @@ impl Pipeline for MtpSpeculativePipeline {
         // extra tokens through `process_inputs` like the non-MTP speculative
         // pipeline does.
         let mut verify_input = vec![t0];
-        verify_input.extend(proposed.iter().take(proposed.len().saturating_sub(1)).copied());
+        verify_input.extend(
+            proposed
+                .iter()
+                .take(proposed.len().saturating_sub(1))
+                .copied(),
+        );
         seq.set_prefill_toks(verify_input.clone());
 
         let initial_cache_len = current_normal_cache_len(self);
@@ -975,9 +1004,12 @@ impl Pipeline for MtpSpeculativePipeline {
         // ---- Step 5: truncate KV cache ----
         // After the verify forward, the cache holds positions for
         // [T0, T1, ..., T_{depth-1}] (i.e., `proposed.len()` extra positions
-        // beyond `initial_cache_len`). We keep `n_accepted` extra positions
-        // and drop the rest.
-        let n_to_drop = n_proposed.saturating_sub(n_accepted);
+        // beyond `initial_cache_len`). Keep exactly as many extras as the
+        // cache-vs-committed-tokens invariant requires — see
+        // `n_cache_positions_to_drop` for the derivation (the old
+        // `n_proposed - n_accepted` dropped one slot too many on every
+        // rejection, cumulatively desyncing cache and sequence).
+        let n_to_drop = n_cache_positions_to_drop(n_proposed, &verify_result);
         if n_to_drop > 0 {
             truncate_normal_cache(self, n_to_drop)?;
         }
@@ -1260,6 +1292,74 @@ mod tests {
         assert_eq!(r.commit_len(), 1);
     }
 
+    /// Cache-truncation accounting after a verify forward (the session-4 MTP
+    /// hang triage's confirmed bug — see `n_cache_positions_to_drop`).
+    ///
+    /// Model: before the step the cache holds `tokens - 1` positions (plain
+    /// decode invariant). The step-1 forward adds 1; the verify forward adds
+    /// `n_proposed`; the step commits `1 + commit_len` tokens. After dropping
+    /// `n_cache_positions_to_drop`, the invariant must hold again.
+    #[test]
+    fn cache_truncation_restores_decode_invariant() {
+        // (proposed, target) pairs covering depth-2 all-accept, mid-reject,
+        // first-reject, plus a depth-4 mid-reject.
+        let cases: &[(&[u32], &[u32])] = &[
+            (&[1, 2], &[1, 2]),             // all accepted
+            (&[1, 2], &[1, 9]),             // rejected at 1
+            (&[1, 2], &[9, 2]),             // rejected at 0
+            (&[1, 2, 3, 4], &[1, 2, 9, 4]), // depth 4, rejected at 2
+        ];
+        for (proposed, target) in cases {
+            let r = verify_proposed(proposed, target);
+            let d = proposed.len();
+            let n_drop = n_cache_positions_to_drop(d, &r);
+
+            // Simulate the bookkeeping around one fast-path step.
+            let tokens_before = 100usize;
+            let cache_before = tokens_before - 1; // plain-decode invariant
+            let cache_after_t0_fwd = cache_before + 1; // step-1 target forward
+            let cache_after_verify = cache_after_t0_fwd + d; // verify forward
+            let cache_final = cache_after_verify - n_drop;
+
+            let tokens_committed = 1 + r.commit_len(); // T0 + accepted + correction
+            let tokens_after = tokens_before + tokens_committed;
+
+            assert_eq!(
+                cache_final,
+                tokens_after - 1,
+                "cache must hold every committed token except the last \
+                 (proposed={proposed:?} target={target:?} accepted={} \
+                 rejected={} n_drop={n_drop})",
+                r.accepted.len(),
+                r.rejection.is_some(),
+            );
+        }
+    }
+
+    /// The rejection case drops exactly one FEWER slot than the accepted-gap:
+    /// the correction token is committed but never entered the cache, so its
+    /// slot must not be charged. (The pre-fix code dropped
+    /// `n_proposed - n_accepted` and desynced by one per rejection.)
+    #[test]
+    fn cache_truncation_rejection_off_by_one_pinned() {
+        // depth 2, rejected at 0: accepted 0 → old code dropped 2, correct is 1.
+        let r = verify_proposed(&[1, 2], &[9, 2]);
+        assert_eq!(n_cache_positions_to_drop(2, &r), 1);
+        // depth 2, rejected at 1: accepted 1 → old code dropped 1, correct is 0.
+        let r = verify_proposed(&[1, 2], &[1, 9]);
+        assert_eq!(n_cache_positions_to_drop(2, &r), 0);
+        // depth 2, all accepted: no rejection → drop 0 (unchanged from old code).
+        let r = verify_proposed(&[1, 2], &[1, 2]);
+        assert_eq!(n_cache_positions_to_drop(2, &r), 0);
+        // Degenerate: verifier produced fewer rows than proposals (no
+        // rejection recorded, accepted < proposed) → drop the un-verified
+        // tail (matches the old code on this edge).
+        let r = verify_proposed(&[1, 2, 3], &[1, 2]);
+        assert!(r.rejection.is_none());
+        assert_eq!(r.accepted.len(), 2);
+        assert_eq!(n_cache_positions_to_drop(3, &r), 1);
+    }
+
     /// `propose_chain` truncates to `max_tokens` when it is below `depth`.
     /// Also covers `max_tokens == 0` (returns empty) and the equal case.
     #[test]
@@ -1319,8 +1419,7 @@ mod tests {
         let device = Device::Cpu;
         let data: Vec<f32> = vec![
             // batch=0, depth=0 → argmax at col 1
-            0.0, 1.0, 0.0,
-            // batch=0, depth=1 → argmax at col 2
+            0.0, 1.0, 0.0, // batch=0, depth=1 → argmax at col 2
             0.0, 0.0, 1.0,
         ];
         let logits = Tensor::from_vec(data, (1, 2, 3), &device)?;
@@ -1376,14 +1475,24 @@ mod tests {
         // Walk 32 / depth = 8 cycles — one MTP draft + verify per iteration.
         for _cycle in 0..8 {
             let proposed = kit.propose_chain(&prev_hidden, prev_tok, depth, depth, 0)?;
-            assert_eq!(proposed.len(), depth, "kit should give exactly depth tokens");
+            assert_eq!(
+                proposed.len(),
+                depth,
+                "kit should give exactly depth tokens"
+            );
 
             // Mock verifier: agree with proposals on even positions, diverge on
             // odd positions (so accept rate is exactly 50%).
             let target: Vec<u32> = proposed
                 .iter()
                 .enumerate()
-                .map(|(i, t)| if i % 2 == 0 { *t } else { (*t + 7) % vocab as u32 })
+                .map(|(i, t)| {
+                    if i % 2 == 0 {
+                        *t
+                    } else {
+                        (*t + 7) % vocab as u32
+                    }
+                })
                 .collect();
             let res = verify_proposed(&proposed, &target);
             total_proposed += proposed.len();
@@ -1438,7 +1547,7 @@ mod tests {
     use crate::pipeline::loaders::ModelKind;
     use crate::pipeline::{
         AnyMoePipelineMixin, CacheBackendMetadata, CacheManagerMixin, ForwardInputsResult,
-        GeneralMetadata, IsqPipelineMixin, MetadataMixin, ModelCategory, Modalities, Pipeline,
+        GeneralMetadata, IsqPipelineMixin, MetadataMixin, Modalities, ModelCategory, Pipeline,
         PreProcessingMixin, Processor,
     };
     use crate::prefix_cacher::PrefixCacheManagerV2;
@@ -1499,7 +1608,9 @@ mod tests {
             None
         }
         fn get_processor(&self) -> Arc<dyn Processor> {
-            unreachable!("StubPipeline: get_processor not reachable from try_wrap_pipeline_with_mtp")
+            unreachable!(
+                "StubPipeline: get_processor not reachable from try_wrap_pipeline_with_mtp"
+            )
         }
     }
     impl IsqPipelineMixin for StubPipeline {
