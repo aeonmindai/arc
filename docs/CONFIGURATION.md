@@ -9,7 +9,8 @@ This document covers environment variables and server configuration for mistral.
 | `MISTRALRS_DEBUG=1` | Enable debug mode: outputs tensor info files for GGUF/GGML models, increases logging verbosity |
 | `MISTRALRS_NO_MMAP=1` | Disable memory-mapped file loading, forcing all tensor data into memory |
 | `MISTRALRS_NO_MLA=1` | Disable [MLA](MLA.md) (Multi-head Latent Attention) optimization for DeepSeek V2/V3 and GLM-4.7-Flash |
-| `MISTRALRS_ISQ_SINGLETHREAD=1` | Force ISQ (In-Situ Quantization) to run single-threaded |
+| `MISTRALRS_ISQ_SINGLETHREAD=1` | Force ISQ (In-Situ Quantization) to run single-threaded. Caps how many *layers* quantize at once (GPU submission); does **not** affect the expert unpack |
+| `ARC_UNPACK_THREADS` | Threads for the host-side MoE expert unpack (packed INT4/FP8 → BF16). Defaults to available parallelism. Independent of the ISQ thread policy: that one bounds GPU submission, this one is pure CPU work |
 | `MISTRALRS_IGPU_MEMORY_FRACTION` | Memory fraction for integrated/unified-memory CUDA GPUs (e.g. NVIDIA Grace Blackwell, Jetson). Float between 0.0 and 1.0, default: `0.75` |
 | `MCP_CONFIG_PATH` | Fallback path for MCP client configuration (used if `--mcp-config` not provided) |
 | `KEEP_ALIVE_INTERVAL` | SSE keep-alive interval in milliseconds (default: 10000) |

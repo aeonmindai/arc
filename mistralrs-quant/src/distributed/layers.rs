@@ -1268,9 +1268,16 @@ impl PackedExperts {
                             );
 
                             // RUN-161: parallel INT4→BF16 dequant across experts.
+                            // Runs on the dedicated expert-unpack pool, never on
+                            // the ambient rayon context: see
+                            // `crate::expert_unpack_threads` for why this width is
+                            // separate from the ISQ (GPU-submission) width.
                             use rayon::prelude::*;
+                            let unpack_t0 = std::time::Instant::now();
+                            let unpack_threads = crate::expert_unpack_threads();
                             #[allow(clippy::type_complexity)]
                             let experts_dequant: Vec<candle_core::Result<(Arc<dyn QuantMethod>, Arc<dyn QuantMethod>, Arc<dyn QuantMethod>)>> =
+                                crate::expert_unpack_pool().install(|| {
                                 (0..num_local_experts)
                                     .into_par_iter()
                                     .map(|i| {
@@ -1310,13 +1317,18 @@ impl PackedExperts {
                                         let d: Arc<dyn QuantMethod> = Arc::new(UnquantLinear::new(QuantMethodConfig::Unquantized(Linear::new(down_bf16, None)))?);
                                         Ok((g, u, d))
                                     })
-                                    .collect();
+                                    .collect()
+                                });
                             for result in experts_dequant {
                                 let (g, u, d) = result?;
                                 gs.push(g);
                                 us.push(u);
                                 ds.push(d);
                             }
+                            tracing::info!(
+                                "Unpacked {num_local_experts} INT4 experts on {unpack_threads} thread(s) in {:.1}s",
+                                unpack_t0.elapsed().as_secs_f32()
+                            );
                         } else {
                             // Standard FP8 E4M3 per-expert path
                             for i in 0..num_local_experts {
@@ -2015,8 +2027,17 @@ impl FusedExperts {
                 // Each expert's load (mmap read) + dequant is independent and
                 // CPU-bound. Parallelizing with rayon cuts the ~40s/layer serial
                 // bottleneck to ~40s/num_threads.
+                //
+                // The pool is explicit, not the ambient rayon context: this runs
+                // inside a load that also drives a deliberately 1-thread ISQ
+                // submission pool, and a nested `par_iter` inherits whatever pool
+                // its caller sits on. `crate::expert_unpack_threads` documents why
+                // host-unpack width and GPU-submission width must stay separate.
                 use rayon::prelude::*;
+                let unpack_t0 = std::time::Instant::now();
+                let unpack_threads = crate::expert_unpack_threads();
                 let experts_dequant: Vec<candle_core::Result<(Tensor, Tensor, Tensor)>> =
+                    crate::expert_unpack_pool().install(|| {
                     (0..num_experts)
                         .into_par_iter()
                         .map(|i| {
@@ -2071,7 +2092,8 @@ impl FusedExperts {
 
                             Ok((gate_bf16, up_bf16, down_bf16))
                         })
-                        .collect();
+                        .collect()
+                    });
 
                 let mut gate_proj_vec = Vec::with_capacity(num_experts);
                 let mut up_proj_vec = Vec::with_capacity(num_experts);
@@ -2082,6 +2104,13 @@ impl FusedExperts {
                     up_proj_vec.push(up);
                     down_proj_vec.push(down);
                 }
+                // Per-layer split of unpack (host, wide) vs quantize (device,
+                // serialized) so a bake log says which half is the limiter
+                // instead of leaving it to be inferred from `top`.
+                tracing::info!(
+                    "Unpacked {num_experts} INT4 experts on {unpack_threads} thread(s) in {:.1}s",
+                    unpack_t0.elapsed().as_secs_f32()
+                );
 
                 // Stack into [num_experts, N, K] and wrap as UnquantLinear
                 let target_device = experts_vb.device().clone();
@@ -2114,12 +2143,17 @@ impl FusedExperts {
                 }) = crate::get_immediate_isq()
                 {
                     let n = std::sync::atomic::AtomicUsize::new(0);
+                    let isq_t0 = std::time::Instant::now();
                     let fused_gate_proj =
                         fused_gate_proj.apply_isq(Some(isq_ty), target_device.clone(), &n, None, guard.clone())?;
                     let fused_up_proj =
                         fused_up_proj.apply_isq(Some(isq_ty), target_device.clone(), &n, None, guard.clone())?;
                     let fused_down_proj =
                         fused_down_proj.apply_isq(Some(isq_ty), target_device.clone(), &n, None, guard)?;
+                    tracing::info!(
+                        "Quantized fused experts ({isq_ty:?}) in {:.1}s",
+                        isq_t0.elapsed().as_secs_f32()
+                    );
                     // Return the freed BF16 expert quant transient to the OS
                     // before the next layer's dequant, so cached blocks don't
                     // accumulate in the CUDA pool and OOM near the final layers.
