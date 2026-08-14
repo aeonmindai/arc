@@ -26,7 +26,8 @@
 #   S6_LOG          driver log to grep      (default /root/logs/s6.log)
 #   S6_START_EPOCH  session start, epoch s  (default: file mtime of S6_LOG)
 #   S6_RATE_HR      $/hr for the spend line (default 4.92)
-#   S6_WIRE_H       teardown trip-wire, h   (default 7.75)
+#   S6_WIRE_H       anti-hang teardown wire, h (default 7.75; NOT a budget cap —
+#                   Jish tops up, this only stops a hung step billing forever)
 #   S6_EVENTS       how many markers to show (default 12)
 set -uo pipefail
 
@@ -45,12 +46,24 @@ echo "$$" >> "$STATUS_DIR/pids"
 
 # The complete marker vocabulary the driver emits. Keep in sync with s6_driver.sh
 # (test_s6_driver.sh asserts every marker the driver can print appears here).
-MARKERS='^::::::|^HEALTH_|^BUILD_|^BEAM_|^BAKE_|^PACE\[|^UPLOAD_|^BATCH\[|^BATCHSWEEP\[|^SPEED\[|^COHERENCE|^GSM8K\[|^WINNERS:|^TUNE_|^CALIB_|^MTP_|^RESULTS_TGZ|^S6_COMPLETE|^ABORT_|^SKIP_|^TRIPWIRE|^FAIL:|panicked at|CUDA_ERROR|out of memory'
+MARKERS='^::::::|^HEALTH_|^BUILD_|^BEAM_|^BAKE_|^PACE\[|^UPLOAD_|^BATCH\[|^BATCHSWEEP\[|^SPEED\[|^COHERENCE|^GSM8K\[|^WINNERS:|^TUNE_|^CALIB_|^MTP_|^RESULTS_TGZ|^PULL_WITH|^S6_COMPLETE|^ABORT_|^ABORTED_AWAITING_DECISION|^FAILED_ASSERTION|^DECISION_|^RESUMING_IN_PLACE|^PAUSE|^PAUSED|^DELETE_INSTANCE_NOW|^BIN_SOURCE|^CACHE_|^BINCACHE_|^SKIP_|^TRIPWIRE|^FAIL:|panicked at|CUDA_ERROR|out of memory'
 
 while true; do
   now=$(date +%s)
   elapsed=$(( now - S6_START_EPOCH ))
   {
+    # A demand to delete outranks everything: a forgotten paused box is exactly
+    # the failure DOCTRINE D10 exists to prevent, and this page is what the 60 s
+    # watchdog reads. It goes FIRST so no amount of scrolling can hide it.
+    if [ -f "$STATUS_DIR/DELETE_ME" ]; then
+      printf 'DELETE_INSTANCE_NOW %s\n' "$(cat "$STATUS_DIR/DELETE_ME")"
+      printf '  results: %s\n' "$STATUS_DIR/s6_results.tgz"
+    elif grep -qa '^ABORTED_AWAITING_DECISION' "$S6_LOG" 2>/dev/null \
+         && ! grep -qa '^DECISION_RECEIVED' "$S6_LOG" 2>/dev/null; then
+      printf 'ABORTED_AWAITING_DECISION — box is PAUSED, write a decision or it self-condemns\n'
+      grep -a '^ABORTED_AWAITING_DECISION' "$S6_LOG" | tail -1
+      grep -a '^FAILED_ASSERTION' "$S6_LOG" | tail -1
+    fi
     printf '== arc session 6 @ %s ==\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     awk -v e="$elapsed" -v r="$S6_RATE_HR" -v w="$S6_WIRE_H" 'BEGIN{
       h = e/3600.0;

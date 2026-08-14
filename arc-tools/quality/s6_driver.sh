@@ -14,6 +14,51 @@
 # machine-greppable markers that s6_status_digest.sh folds into
 # /srv/arcstatus/s6.txt for a 60 s watchdog.
 #
+# =============================================================================
+#                     ***  NEVER DEBUG ON A PAID BOX.  ***
+#
+# Jish, 2026-08-14: "if you spot any problem on gpu, tear down, fix on cpu, try
+# again — loop, don't worry about balance."
+#
+# The instant any ABORT-IF trips, this driver harvests EVERYTHING it has into
+# /srv/arcstatus/s6_results.tgz, writes results/s6_failure.json with the exact
+# failed assertion (expected vs got, plus which log in the tarball explains
+# it), and exits 10. It never retries a failed step, never "just checks one
+# thing", and never leaves work in flight. The orchestrator then pulls the
+# tarball, DELETES the instance, and diagnoses on CPU where compute is free.
+#
+# The tarball is the deliverable of a FAILED session, not a consolation prize:
+# a box that dies with nothing pulled makes the next attempt blind and we pay
+# twice for the same ignorance. So the harvest is unconditional and always
+# happens BEFORE the delete — including on the health-gate path, where the one
+# file it saves (box_health.json) is exactly what decides whether the next box
+# should be in a different region.
+#
+# BUT "never debug on a paid box" means never SIT AND THINK on one. It does not
+# mean throwing away 70 minutes of paid setup to fix a typo.
+# Jish, 2026-08-14: "loop teardowns only makes sense if its more than 5 minutes
+# of code work, if its less, continue holding the box."
+#
+# So an abort HARVESTS and then PAUSES: work stopped, server down, results
+# already tarred and pullable, box alive, waiting for one decision. The
+# arithmetic is printed in the pause banner so the call is mechanical:
+#
+#   idle box            $4.92/hr = $0.082/min
+#   re-entry PRE-upload  boot ~10 + 149 GB download ~35 + build ~25
+#                        = ~70 min = ~$5.74 before any work happens
+#   re-entry POST-upload boot ~10 + cached binary <1 + 68 GB UQFF ~15
+#                        = ~26 min = ~$2.13   (no weights, no bake)
+#   resume in place      0 min = $0
+#
+# Hold if the fix is shorter than the re-entry; delete if it is longer.
+#
+# D10 ("never leave a GPU idle") still governs, and a forgotten paused box is
+# EXACTLY the failure D10 exists to prevent — so the pause has a hard idle
+# timeout (PAUSE_IDLE_SECS, default 900 s) after which the driver demands an
+# immediate DELETE and stops waiting. See the runbook: the on-box timer cannot
+# delete the instance, it makes the delete unmissable inside 60 s.
+# =============================================================================
+#
 # STEP ORDER — priority order, with ONE deliberate deviation, stated here so
 # nobody has to re-derive it at 3am:
 #
@@ -72,6 +117,7 @@ S6_BOOT=${S6_BOOT:-$S6_ROOT/boot.sh}
 S6_HEALTH_GATE=${S6_HEALTH_GATE:-$S6_ROOT/box_health_gate.sh}
 S6_SENTINEL=${S6_SENTINEL:-$S6_ROOT/stall_sentinel.sh}
 S6_UPLOAD_PY=${S6_UPLOAD_PY:-$S6_ROOT/s6_upload_uqff.py}
+S6_BINCACHE_PY=${S6_BINCACHE_PY:-$S6_ROOT/s6_bin_cache.py}
 S6_TOKEN_FILE=${S6_TOKEN_FILE:-$S6_ROOT/.hf_token}
 
 # ---------------------------------------------------------------- policy
@@ -82,8 +128,14 @@ CHAT_TEMPLATE=${CHAT_TEMPLATE:-$ARC/chat_templates/deepseek_v4.json}
 PORT=${PORT:-1234}
 RATE_HR=${RATE_HR:-4.92}
 
-BEAM_WIDTH=${BEAM_WIDTH:-256}       # requested; S2 may lower it to 128
-BEAM_MIN_PUBLISHABLE=${BEAM_MIN_PUBLISHABLE:-128}
+# W=256 OR NO BAKE. There is no width ladder and no "degraded" rung.
+# Jish, 2026-08-14: "beam should work on 256, if fail, tear down, spin up, loop
+# until alright, any other problem -> do the fucking same."
+# W=128 costs -0.004 matmul cos and the width is STAMPED INTO THE ARTIFACT
+# forever. Shipping it because the good one was inconvenient is the same
+# species of shortcut DOCTRINE D4 bans. If 256 does not hold on this box, the
+# answer is a different box, not a worse artifact.
+BEAM_WIDTH=${BEAM_WIDTH:-256}
 GSM8K_N=${GSM8K_N:-100}
 GSM8K_MAXTOK=${GSM8K_MAXTOK:-2048}
 VOTES=${VOTES:-5}
@@ -92,7 +144,16 @@ MTP_DEPTH=${MTP_DEPTH:-2}
 CALIB_SAMPLES=${CALIB_SAMPLES:-8}
 CALIB_BOX_SECS=${CALIB_BOX_SECS:-1500}   # 25 min hard box on S8
 
-# Trip-wires, cumulative hours from driver start (see the runbook's cost model).
+# ------------------------------------------------------- single-attempt wires
+# These are ANTI-HANG bounds for one attempt, not budget caps. Jish tops up;
+# the reason a step is not allowed to run forever is that a hung step teaches
+# us nothing while it bills, not that we are rationing dollars.
+S6_ATTEMPT=${S6_ATTEMPT:-1}
+PAUSE_IDLE_SECS=${PAUSE_IDLE_SECS:-900}       # hard idle timeout on the paused state
+REENTRY_MIN_PRE_UPLOAD=${REENTRY_MIN_PRE_UPLOAD:-70}
+REENTRY_MIN_POST_UPLOAD=${REENTRY_MIN_POST_UPLOAD:-26}
+S6_USE_BIN_CACHE=${S6_USE_BIN_CACHE:-1}       # try the cached binary before building
+BIN_CACHE_PREFIX=${BIN_CACHE_PREFIX:-arc-bin}
 WIRE_BAKE_H=${WIRE_BAKE_H:-2.85}
 WIRE_UPLOAD_H=${WIRE_UPLOAD_H:-3.30}
 WIRE_LASTCHANCE_H=${WIRE_LASTCHANCE_H:-6.00}
@@ -108,14 +169,188 @@ export S6_START_EPOCH=$START_EPOCH
 
 SERVE_PID=""
 BAKE_PID=""
+FAIL_LOG="s6.log"   # which log the current step would blame; used by abort()
 
 mkdir -p "$LOG_DIR" "$STATUS_DIR" "$RESULTS" 2>/dev/null
 
 # ---------------------------------------------------------------- helpers
 mark()  { echo ":::::: $* ::::::"; date -u +%H:%M:%S; }
 say()   { echo "$*"; }
-abort() { echo "ABORT_$1 $2"; teardown_hint; exit 1; }
 skipm() { echo "SKIP_$1 $2"; }
+
+# Exit code 10 = this attempt failed. The ONE rule this driver exists to
+# enforce, and the reason every terminal path funnels through one function:
+#
+#   ***  NEVER DEBUG ON A PAID BOX.  ***
+#
+# Not one step. Not "let me just check one thing while I'm here." The instant
+# an ABORT-IF trips, we harvest everything we have and the box dies. Whether
+# the cause was our code or a bad rental gets decided from the pulled
+# artifacts, on a laptop, off the clock. An in-session retry of a failed step
+# on the same box is never allowed: the box is the one variable we cannot
+# control, and $4.92/hr is the worst possible place to think.
+#
+# The driver cannot delete the instance itself (that is the orchestrator's
+# Runcrate MCP job), so its whole responsibility is to make the pull-and-delete
+# unmissable AND to guarantee the tarball exists BEFORE anyone deletes.
+#
+#   abort <STEP_TAG> <assertion-id> <expected> <got> <message>
+#
+# All five are mandatory. A failure report that does not say expected-vs-got is
+# a report someone has to rent a box to reproduce.
+abort() {
+  local step=$1 assertion=$2 expected=$3 got=$4 msg=$5
+  echo "ABORT_$step $msg"
+  echo "FAILED_ASSERTION $assertion  expected=[$expected]  got=[$got]"
+  {
+    printf '{\n  "attempt": %s,\n  "step": "%s",\n  "assertion": "%s",\n' \
+      "$S6_ATTEMPT" "$step" "$assertion"
+    printf '  "expected": "%s",\n  "got": "%s",\n' \
+      "$(jstr "$expected")" "$(jstr "$got")"
+    printf '  "message": "%s",\n' "$(jstr "$msg")"
+    printf '  "logs_in_tarball": [%s],\n' "$(printf '"results/%s"' "$(basename "${FAIL_LOG:-s6.log}")")"
+    printf '  "elapsed_h": %s,\n  "attempt_cost_usd": %s,\n' \
+      "$(elapsed_h)" "$(awk -v e="$(elapsed_h)" -v r="$RATE_HR" 'BEGIN{printf "%.2f", e*r}')"
+    printf '  "gpu": "%s",\n' "$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null | head -1)"
+    printf '  "arc_commit": "%s",\n' "$(cd "$ARC" 2>/dev/null && git rev-parse HEAD 2>/dev/null)"
+    printf '  "utc": "%s"\n}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$RESULTS/s6_failure.json" 2>/dev/null
+  cp "$RESULTS/s6_failure.json" "$STATUS_DIR/s6_failure.json" 2>/dev/null
+  harvest "FAILED at $step"
+  pause_for_decision "$step" "$assertion"
+}
+
+# The paused state. Reached only from abort(), and only AFTER harvest() has
+# already produced a pullable tarball — so a decision to delete is never a
+# decision to lose evidence.
+#
+# Decisions arrive as one line in $STATUS_DIR/s6_decision (one ssh_execute):
+#   resume:S5   continue from step S5 — bake and upload are NOT redone
+#   retry       re-run the step that just failed, on this box, after a fix
+#   hold:N      extend the pause by N seconds (a fix is in progress)
+#   delete      give up now
+# The file is consumed on read, so a stale decision cannot loop the driver.
+pause_for_decision() {
+  local failed_step=$1 assertion=$2
+  local dfile="$STATUS_DIR/s6_decision"
+  local reentry=$REENTRY_MIN_PRE_UPLOAD phase="PRE-upload"
+  if [ -f "$RESULTS/.uploaded" ]; then
+    reentry=$REENTRY_MIN_POST_UPLOAD; phase="POST-upload"
+  fi
+  rm -f "$dfile"
+  echo "ABORTED_AWAITING_DECISION step=$failed_step assertion=$assertion idle_timeout_s=$PAUSE_IDLE_SECS"
+  echo "  Box is PAUSED: no work processes, no server, results already tarred and pullable."
+  echo "  HOLD-OR-DELETE ARITHMETIC ($phase): idle costs \$0.082/min; re-entering"
+  echo "    costs ~${reentry} min ~= \$$(awk -v m="$reentry" -v r="$RATE_HR" 'BEGIN{printf "%.2f", m*r/60}')."
+  echo "    => HOLD if the fix is under ~${reentry} min of code work. DELETE if it is longer."
+  echo "  Decide with ONE ssh_execute:"
+  echo "    echo resume:S5 > $dfile   # continue from S5 (bake/upload NOT redone)"
+  echo "    echo retry     > $dfile   # re-run $failed_step here after an in-session fix"
+  echo "    echo hold:1800 > $dfile   # a fix is in progress, extend the pause"
+  echo "    echo delete    > $dfile   # give up now"
+  local waited=0 deadline=$PAUSE_IDLE_SECS
+  while [ "$waited" -lt "$deadline" ]; do
+    if [ -s "$dfile" ]; then
+      local d
+      d=$(head -1 "$dfile" | tr -d '[:space:]')
+      rm -f "$dfile"
+      echo "DECISION_RECEIVED $d after ${waited}s"
+      case "$d" in
+        delete|abort|teardown) demand_delete "operator chose delete" ;;
+        hold:*)
+          local extra=${d#hold:}
+          deadline=$((deadline + extra))
+          echo "PAUSE_EXTENDED by ${extra}s (new deadline ${deadline}s)"
+          ;;
+        retry)
+          echo "RESUMING_IN_PLACE from $failed_step (no bake, no re-upload)"
+          exec env S6_START_EPOCH="$START_EPOCH" S6_ATTEMPT="$S6_ATTEMPT" \
+            S6_FROM="$failed_step" S6_ONLY="" bash "$0"
+          ;;
+        resume:*)
+          local tgt=${d#resume:}
+          echo "RESUMING_IN_PLACE from $tgt (no bake, no re-upload)"
+          exec env S6_START_EPOCH="$START_EPOCH" S6_ATTEMPT="$S6_ATTEMPT" \
+            S6_FROM="$tgt" S6_ONLY="" bash "$0"
+          ;;
+        *) echo "DECISION_UNKNOWN '$d' — ignoring, still waiting" ;;
+      esac
+    fi
+    nap 10; waited=$((waited + 10))
+    if [ $((waited % 120)) -eq 0 ]; then
+      echo "PAUSED ${waited}s/${deadline}s — no decision yet (idle cost so far \$$(awk -v w="$waited" -v r="$RATE_HR" 'BEGIN{printf "%.2f", w*r/3600}'))"
+    fi
+    [ "$DRYRUN" = "1" ] && [ "$waited" -ge 80 ] && break
+  done
+  demand_delete "idle timeout after ${deadline}s with no decision"
+}
+
+# The one path that could reintroduce a forgotten idle box (D10). It cannot
+# call Runcrate itself, so it makes the delete impossible to miss: a marker
+# file the status digest prints as its FIRST line, and a marker the 60 s
+# watchdog greps for and acts on without asking.
+demand_delete() {
+  echo "DELETE_INSTANCE_NOW ($1)"
+  echo "delete: $1 at $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATUS_DIR/DELETE_ME" 2>/dev/null
+  echo "  Results are already at $STATUS_DIR/s6_results.tgz — pull, then DELETE (not stop)."
+  echo "  Fix on CPU (free), then rent again with S6_ATTEMPT=$((S6_ATTEMPT + 1))."
+  budget_line
+  exit 10
+}
+
+# A cached binary that passes --version can still be the wrong binary. Its
+# DEFINITIVE smoke is the first real use, so the two steps that constitute one
+# (the bake header at S3, /health at S5) call this before they abort.
+# Rebuilding off a bad cache is NOT debugging on a paid box — it is
+# invalidating a cache we chose to trust, with no diagnosis involved — so it is
+# the one retry the policy allows, and only once.
+rebuild_from_source_if_cached() {
+  local why=$1
+  [ "${BIN_FROM_CACHE:-0}" = "1" ] || return 1
+  echo "CACHE_REJECTED $why — the cached binary failed its first real use; rebuilding from source (once)"
+  BIN_FROM_CACHE=0
+  rm -f "$S6_MISTRALRS"
+  ( cd "$ARC" && $S6_CARGO build --release -p arc-cli -p mistralrs-cli --features "cuda flash-attn" ) \
+    2>&1 | tail -3 | tee -a "$LOG_DIR/build_rebuild.log"
+  [ -x "$S6_MISTRALRS" ] && { echo "BIN_SOURCE=built-from-source (after cache rejection)"; return 0; }
+  return 1
+}
+
+# JSON string escaping for the failure report (quotes, backslashes, newlines).
+jstr() { printf '%s' "$1" | tr '\n\t' '  ' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+# THE tar-and-publish path. Shared by success and failure on purpose: the
+# tarball is the deliverable of a FAILED session too, not a consolation prize.
+# A box that dies with nothing pulled makes the next attempt blind, and we pay
+# twice for the same ignorance. Unconditional, and always BEFORE the delete —
+# including on the health-gate path, where there is barely anything to tar and
+# it still runs, because "barely anything" includes box_health.json, which is
+# exactly what decides whether the next box should be in a different region.
+harvest() {
+  local why=${1:-done}
+  echo ":::::: HARVEST ($why) ::::::"
+  kill_pid "${SERVE_PID:-}" 4 2>/dev/null; SERVE_PID=""
+  kill_pid "${BAKE_PID:-}" 4 2>/dev/null;  BAKE_PID=""
+  mkdir -p "$RESULTS" 2>/dev/null
+  cp "$LOG_DIR"/*.log "$RESULTS/" 2>/dev/null
+  cp "$STATUS_DIR"/box_health*.json "$RESULTS/" 2>/dev/null
+  cp "$STATUS_DIR"/stall*.txt "$RESULTS/" 2>/dev/null
+  ( cd "$(dirname "$RESULTS")" && tar czf "$S6_ROOT/s6_results.tgz" "$(basename "$RESULTS")/" ) 2>/dev/null
+  cp "$S6_ROOT/s6_results.tgz" "$STATUS_DIR/" 2>/dev/null
+  if [ -s "$STATUS_DIR/s6_results.tgz" ]; then
+    echo "RESULTS_TGZ: $STATUS_DIR/s6_results.tgz ($(wc -c < "$STATUS_DIR/s6_results.tgz" | tr -d ' ') bytes, $(tar tzf "$S6_ROOT/s6_results.tgz" 2>/dev/null | wc -l | tr -d ' ') entries)"
+    echo "PULL_WITH: curl -s -o s6_results.tgz http://<BOX_IP>:8899/s6_results.tgz"
+  else
+    echo "FAIL: could not write the results tarball — pull /root/logs/ file by file before deleting"
+  fi
+  # The token must not outlive the box, on ANY path (session 5 leaked one and
+  # it had to be rotated).
+  if [ -f "$S6_TOKEN_FILE" ]; then
+    shred -u "$S6_TOKEN_FILE" 2>/dev/null || rm -f "$S6_TOKEN_FILE"
+    [ -f "$S6_TOKEN_FILE" ] && echo "FAIL: token file still present" || echo "TOKEN_DELETED"
+  fi
+  budget_line
+}
 
 elapsed_h() {
   awk -v s="$START_EPOCH" -v n="$(date +%s)" 'BEGIN{printf "%.3f", (n-s)/3600.0}'
@@ -130,11 +365,6 @@ budget_line() {
 # Sleep, but collapse to a heartbeat under S6_DRYRUN so test_s6_driver.sh can
 # exercise the whole chain in seconds instead of hours.
 nap() { if [ "$DRYRUN" = "1" ]; then sleep 0.2; else sleep "$1"; fi; }
-
-teardown_hint() {
-  echo "TRIPWIRE teardown required: tar results, download, DELETE the instance."
-  budget_line
-}
 
 # Should this step run? Honors S6_FROM (ordered resume) and S6_ONLY (subset).
 step_order() { case "$1" in
@@ -170,6 +400,7 @@ kill_pid() {  # PID kill only. Never a pattern (it would kill the caller).
 
 wait_health() {  # wait_health <seconds>
   local limit=${1:-600} waited=0
+  [ "$DRYRUN" = "1" ] && limit=20
   while [ "$waited" -lt "$limit" ]; do
     if curl -sf "http://localhost:$PORT/health" >/dev/null 2>&1; then
       echo "SERVE_UP after ${waited}s"; return 0
@@ -214,7 +445,7 @@ mark "S6 DRIVER START  branch=$ARC_BRANCH arc=$ARC v4=$V4_DIR beam=$BEAM_WIDTH"
 budget_line
 echo "ENV gates that must be UNSET all session (except where a step sets them):"
 env | grep -E '^(ARC_QUANT_ATTENTION|ARC_QTIP_REFINE_SCALES|ARC_V4_WINDOW_ONLY|ARC_V4_STANDARD_DENSE|ARC_V4_NO_ABSORBED_DECODE|ARC_FORCE_NAIVE_SDPA|ARC_TIME_DECODE|ARC_ALLOW_UNSTAMPED_QTIP|ARC_QTIP_HESSIAN)=' \
-  && abort ENV_DIRTY "one of the banned gates is exported — unset it and restart" \
+  && abort ENV_DIRTY "banned_gate_exported" "none of ARC_QUANT_ATTENTION/ARC_QTIP_REFINE_SCALES/ARC_V4_*/ARC_FORCE_NAIVE_SDPA/ARC_TIME_DECODE/ARC_ALLOW_UNSTAMPED_QTIP/ARC_QTIP_HESSIAN exported" "$(env | grep -cE '^(ARC_QUANT_ATTENTION|ARC_QTIP_REFINE_SCALES|ARC_V4_WINDOW_ONLY|ARC_V4_STANDARD_DENSE|ARC_V4_NO_ABSORBED_DECODE|ARC_FORCE_NAIVE_SDPA|ARC_TIME_DECODE|ARC_ALLOW_UNSTAMPED_QTIP|ARC_QTIP_HESSIAN)=') exported (listed above)" "a banned gate is exported into the session environment; unset it in the launching shell and re-run" \
   || echo "ENV_CLEAN"
 
 # =============================================================================
@@ -224,19 +455,20 @@ env | grep -E '^(ARC_QUANT_ATTENTION|ARC_QTIP_REFINE_SCALES|ARC_V4_WINDOW_ONLY|A
 # =============================================================================
 if want S0; then
   mark "S0 box-health"
+  FAIL_LOG=health.log
   CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')
   echo "HEALTH_COMPUTE_CAP=$CC"
   # has_qtip_kernels is set by mistralrs-quant/build.rs iff compute_cap >= 8.0.
   # Below that, EVERY cuda parity test in S2 returns Ok(()) VACUOUSLY.
   awk -v c="${CC:-0}" 'BEGIN{exit !(c+0 >= 8.0)}' \
-    || abort BOX_COMPUTE_CAP "compute_cap=$CC < 8.0 — qtip kernels would not compile in and S2 would pass vacuously"
+    || abort BOX_COMPUTE_CAP "nvidia-smi --query-gpu=compute_cap" ">= 8.0" "${CC:-<no answer>}" "compute_cap below 8.0: mistralrs-quant/build.rs:113 would not set has_qtip_kernels, so every CUDA parity test in S2 returns Ok(()) SILENTLY and the gate passes vacuously. Rent an H100/H200-class box (cap 9.0). results/health.log"
   DRV=$(nvidia-smi 2>/dev/null | grep -o 'CUDA Version: [0-9][0-9.]*' | grep -o '[0-9][0-9.]*$')
   TK=$(nvcc --version 2>/dev/null | grep -o 'release [0-9][0-9.]*' | grep -o '[0-9][0-9.]*$')
   echo "HEALTH_CUDA driver_max=$DRV toolkit=$TK"
   if [ -n "$DRV" ] && [ -n "$TK" ]; then
     NEWEST=$(printf '%s\n%s\n' "$DRV" "$TK" | sort -V | tail -1)
     [ "$TK" != "$DRV" ] && [ "$NEWEST" = "$TK" ] \
-      && abort BOX_TOOLKIT "toolkit $TK newer than driver max $DRV — runtime UNSUPPORTED_PTX_VERSION. apt-get install cuda-toolkit-${DRV/./-} and re-export CUDA_HOME first"
+      && abort BOX_TOOLKIT "nvcc release vs nvidia-smi driver max CUDA" "toolkit <= $DRV" "toolkit $TK" "the CUDA toolkit is newer than the driver supports; the build succeeds and then dies at runtime with CUDA_ERROR_UNSUPPORTED_PTX_VERSION (cost session 1 forty minutes). Fixable in-image: apt-get install -y cuda-toolkit-${DRV/./-} then export CUDA_HOME=/usr/local/cuda-$DRV — but per policy this box dies and the next one is rented from an image whose toolkit matches. results/health.log"
   fi
   if [ "$DRYRUN" = "1" ]; then
     bash "$S6_HEALTH_GATE" --json "$STATUS_DIR/box_health.json" 2>&1 | tee "$LOG_DIR/health.log"
@@ -247,7 +479,8 @@ if want S0; then
   rc=${PIPESTATUS[0]}
   if [ "$rc" != "0" ]; then
     echo "HEALTH_FAIL rc=$rc"
-    abort BOX_HEALTH "box_health_gate exit $rc — DELETE THIS INSTANCE AND RE-RENT a different box/region. Do NOT debug the rental; deleting costs \$0.08, s5a cost \$7. Nothing below has run, so nothing is lost."
+    FAILLINE=$(grep -m1 '^FAIL ' "$LOG_DIR/health.log")
+    abort BOX_HEALTH "box_health_gate.sh exit code" "0 (all gates PASS)" "$rc — ${FAILLINE:-see results/health.log}" "the rental is bad. DELETE it and rent a different box, preferably a different region. Do NOT debug the rental: s5a ran 99% util at 132W of a 700W limit (transfer-starved) and cost ~1.5h and ~\$7 before anyone noticed; abandoning here costs ~\$0.30 because the gate precedes the 149 GB download. results/health.log + results/box_health.json (the JSON is what tells you offline whether to change region)."
   fi
   echo "HEALTH_PASS"
   cp "$STATUS_DIR/box_health.json" "$RESULTS/box_health.json" 2>/dev/null
@@ -259,6 +492,42 @@ fi
 # =============================================================================
 if want S1; then
   mark "S1 bootstrap"
+  FAIL_LOG=boot.log
+  # BINARY CACHE. A cache HIT skips the ~25 min cargo build. It is only taken
+  # when the arc commit, driver version, CUDA toolkit, compute cap and glibc
+  # all match the box the binary was built on, and the sha256 matches — those
+  # are the five things that make a Linux CUDA binary refuse to run, or run
+  # wrongly, somewhere else. A code fix changes arc_commit, so the cache
+  # invalidates itself on exactly the loop where a stale binary would be
+  # dangerous. See s6_bin_cache.py for the full reasoning.
+  BIN_FROM_CACHE=0
+  if [ "$S6_USE_BIN_CACHE" = "1" ] && [ -s "$S6_TOKEN_FILE" ] && [ -d "$ARC/.git" ]; then
+    if $S6_PY "$S6_BINCACHE_PY" pull --repo-id "$HF_REPO" --prefix "$BIN_CACHE_PREFIX" \
+         --token-file "$S6_TOKEN_FILE" --arc "$ARC" --out "$S6_MISTRALRS" \
+         2>&1 | grep -v -i token | tee "$LOG_DIR/bincache.log" | grep -q BINCACHE_HIT; then
+      # Pre-trust smoke: proves the file executes and its dynamic objects
+      # resolve. The DEFINITIVE smoke is its first real use (the bake header at
+      # S3, or /health at S5); a failure there rebuilds from source.
+      if "$S6_MISTRALRS" --version > "$LOG_DIR/bincache_smoke.log" 2>&1 \
+         && ! ldd "$S6_MISTRALRS" 2>/dev/null | grep -q "not found"; then
+        BIN_FROM_CACHE=1
+        echo "BIN_SOURCE=cache ($(head -1 "$LOG_DIR/bincache_smoke.log"))"
+        echo "CACHE_SMOKE=pass (--version + ldd; definitive smoke is first real use)"
+      else
+        echo "CACHE_SMOKE=fail — cached binary does not run here; building from source"
+        rm -f "$S6_MISTRALRS"
+      fi
+    else
+      echo "BIN_SOURCE=cache-miss (see results/bincache.log for which field mismatched)"
+    fi
+  fi
+
+  if [ "$BIN_FROM_CACHE" = "1" ] && [ "${S6_SKIP_BOOT:-0}" != "1" ]; then
+    # Still need the repo (arc-tools, chat_templates, cargo examples) and the
+    # weights unless we are on the post-upload path, but NOT the cargo build.
+    echo "BOOT_MODE=cache (repo + data only, build skipped)"
+  fi
+
   if [ "${S6_SKIP_BOOT:-0}" != "1" ]; then
     ARC_BRANCH=$ARC_BRANCH nohup bash "$S6_BOOT" > "$LOG_DIR/boot.log" 2>&1 < /dev/null &
     BOOT_PID=$!
@@ -268,26 +537,35 @@ if want S1; then
     while [ "$waited" -lt 7200 ]; do
       grep -q "BOOTSTRAP_COMPLETE" "$LOG_DIR/boot.log" 2>/dev/null && break
       grep -q "^FAIL:" "$LOG_DIR/boot.log" 2>/dev/null \
-        && abort BUILD "boot.sh reported: $(grep -m1 '^FAIL:' "$LOG_DIR/boot.log")"
+        && abort BUILD "boot.sh completes without FAIL:" "no FAIL: line" "$(grep -m1 '^FAIL:' "$LOG_DIR/boot.log")" "bootstrap failed; the line above is boot.sh's own diagnosis. results/boot.log"
       kill -0 "$BOOT_PID" 2>/dev/null || break
       nap 30; waited=$((waited + 30))
     done
     grep -q "BOOTSTRAP_COMPLETE" "$LOG_DIR/boot.log" 2>/dev/null \
-      || abort BUILD "no BOOTSTRAP_COMPLETE after ${waited}s — see $LOG_DIR/boot.log"
+      || abort BUILD "BOOTSTRAP_COMPLETE in boot.log" "present within 7200s" "absent after ${waited}s" "bootstrap neither completed nor reported FAIL: — most likely the 149 GB download or the cargo build is still crawling. results/boot.log + results/dl.log"
   fi
-  [ -x "$S6_MISTRALRS" ] || abort BUILD "$S6_MISTRALRS missing after bootstrap"
+  [ -x "$S6_MISTRALRS" ] || abort BUILD "release binary exists" "$S6_MISTRALRS executable" "missing or not executable" "boot.sh claimed BOOTSTRAP_COMPLETE but produced no binary. results/boot.log"
+  echo "BIN_SOURCE=built-from-source"
 
-  # MTP acceptance telemetry. VERIFIED 2026-08-14: master's
-  # log_acceptance_rate() still has ZERO call sites (mtp_pipeline.rs:690), so
-  # S10 would measure nothing — the exact session-3 failure. The session-2-era
+  # MTP acceptance telemetry. VERIFIED 2026-08-14: at master d6ceaf1ad
+  # log_acceptance_rate() has ZERO call sites (mtp_pipeline.rs:690), so S10
+  # would measure nothing — the exact session-3 failure. The session-2-era
   # patch NO LONGER APPLIES (PR #30 rewrote the file); s6_mtp_acceptance_
   # telemetry.patch is regenerated against d6ceaf1ad and compiles clean.
-  if git -C "$ARC" apply --check "$Q/patches/s6_mtp_acceptance_telemetry.patch" 2>/dev/null; then
+  #
+  # BUT agent AK is landing a PERMANENT call site in mistralrs-core. If that
+  # merged first, this checkout already logs and applying the patch on top
+  # would add a SECOND call and double-count acceptance. So the patch is a
+  # no-op whenever a call site is already present — the grep is the authority,
+  # not the merge order.
+  if grep -rq "log_acceptance_rate()" --include='*.rs' "$ARC/mistralrs-core/src" 2>/dev/null; then
+    skipm MTP_PATCH "a log_acceptance_rate() call site is already in this checkout (agent AK's permanent fix landed) — NOT applying the patch, which would double-count acceptance. Telemetry still needs ARC_MTP_LOG_ACCEPTANCE=1 unless AK made it unconditional; S10 verifies either way."
+  elif git -C "$ARC" apply --check "$Q/patches/s6_mtp_acceptance_telemetry.patch" 2>/dev/null; then
     git -C "$ARC" apply "$Q/patches/s6_mtp_acceptance_telemetry.patch" \
       && echo "PATCH_OK s6_mtp_acceptance_telemetry"
     ( cd "$ARC" && $S6_CARGO build --release -p mistralrs-cli --features "cuda flash-attn" ) \
       2>&1 | tail -3 | tee -a "$LOG_DIR/build_patch.log"
-    [ -x "$S6_MISTRALRS" ] || abort BUILD "rebuild after the MTP patch produced no binary"
+    [ -x "$S6_MISTRALRS" ] || abort BUILD "release binary after the MTP patch rebuild" "$S6_MISTRALRS executable" "missing" "the MTP telemetry patch applied but the rebuild failed. results/build_patch.log — reproduce with the patch on CPU."
   else
     skipm MTP_PATCH "s6_mtp_acceptance_telemetry.patch does not apply to this checkout — S10 will measure nothing; record that, do not debug"
   fi
@@ -304,22 +582,25 @@ fi
 # ~6.2 h exhaustive bake, but NO GPU HAS EVER RUN IT. The default was
 # deliberately not flipped: hardware parity must pass first.
 #
-# FALLBACK IS EXPLICIT AND NARROW. cuda_beam_matches_cpu_beam_bit_for_bit
-# iterates W = 64 -> 128 -> 256 and fails at the FIRST bad width, naming it in
-# the assert ("W=128: CUDA beam differs..."). So:
-#   * all pass                -> bake at 256 (quality-neutral, PR #29)
-#   * 256 fails, 128 passes   -> bake at 128 (-0.004 cos; acceptable, FLAGGED)
-#   * only 64 passes          -> DO NOT BAKE. -0.014 cos is a real regression
-#                                and the width is stamped into the artifact
-#                                forever. Tear down; fix on CPU.
-#   * none pass               -> tear down.
-# In NO case do we fall back to a ~6.2 h exhaustive bake inside a paid session:
-# that is $30 of a $48.54 balance for the old generation at full price, and it
-# is exactly the mistake session 5 was killed for.
+# W=256 OR NO BAKE. There is no width ladder, no "largest passing width", no
+# degraded rung behind a flag. cuda_beam_matches_cpu_beam_bit_for_bit iterates
+# W = 64 -> 128 -> 256 and fails at the FIRST bad width, so a W=256 failure
+# still tells us plenty offline — but it does not license baking at 128.
+# Shipping a checkpoint we KNOW is worse (-0.004 matmul cos at 128, -0.014 at
+# 64), with the inferior width stamped into it forever, because the good one
+# was inconvenient, is the same species of shortcut DOCTRINE D4 bans.
+#
+# And we do NOT fall back to a ~6.2 h exhaustive bake: that buys the previous
+# generation at full price and leaves nothing for measurement — the exact
+# mistake session 5 was killed for.
+#
+# On failure the box dies. Diagnosis happens on CPU, where the fixtures are
+# free and a Viterbi fixture costs nothing but patience.
 # =============================================================================
 BAKE_W=$BEAM_WIDTH
 if want S2; then
   mark "S2 beam-parity"
+  FAIL_LOG=beam_parity.log
   ( cd "$ARC" && $S6_CARGO test -p mistralrs-quant --release --features cuda cuda_ -- --nocapture ) \
     > "$LOG_DIR/beam_parity.log" 2>&1
   rc=$?
@@ -331,28 +612,26 @@ if want S2; then
   # Vacuity guards. The tests return Ok(()) silently when the kernels are not
   # compiled in, and with a message when no CUDA device answers.
   grep -q "CUDA not available; skipping" "$LOG_DIR/beam_parity.log" \
-    && abort BEAM_VACUOUS "the parity tests skipped: no CUDA device visible to the test binary. The 'passes' mean nothing."
+    && abort BEAM_VACUOUS "beam parity tests must actually run" "no 'CUDA not available; skipping' line" "the test binary printed it" "the parity tests SKIPPED — no CUDA device was visible to them, so their 'passes' mean nothing and a bake on this box would be unproven. results/beam_parity.txt"
   grep -qE "^test result: ok\..* 0 failed" "$LOG_DIR/beam_parity.log" || true
 
   if [ "$rc" = "0" ]; then
     echo "BEAM_PARITY[W=64]=PASS"; echo "BEAM_PARITY[W=128]=PASS"; echo "BEAM_PARITY[W=256]=PASS"
     BAKE_W=$BEAM_WIDTH
-    echo "BEAM_GATE=W${BAKE_W} (all widths bit-identical to the CPU beam)"
+    echo "BEAM_GATE=W${BAKE_W} (bit-identical to the CPU beam at every width)"
   else
     FAILW=$(grep -oE '\bW=(64|128|256): CUDA beam differs' "$LOG_DIR/beam_parity.log" \
             | head -1 | grep -oE '[0-9]+')
+    MISMATCH=$(sed -n 's/.*CUDA beam differs from the CPU beam in \([0-9]*\/[0-9]*\) bytes.*/\1/p' \
+            "$LOG_DIR/beam_parity.log" | head -1)
+    FAILED_TEST=$(grep -m1 -E '^test .* \.\.\. FAILED' "$LOG_DIR/beam_parity.log" | sed 's/^test //; s/ \.\.\. FAILED//')
     echo "BEAM_FAILING_WIDTH=${FAILW:-unknown}"
-    case "${FAILW:-0}" in
-      256) BAKE_W=128 ;;
-      128) BAKE_W=64  ;;
-      *)   BAKE_W=0   ;;
-    esac
-    if [ "$BAKE_W" -lt "$BEAM_MIN_PUBLISHABLE" ]; then
-      grep -E "panicked at|assertion|differs from the CPU beam|test result:" \
-        "$LOG_DIR/beam_parity.log" | head -12
-      abort BEAM_PARITY "CUDA beam parity failed at W=${FAILW:-all} (rc=$rc). The largest passing width (${BAKE_W}) is below the publishable floor ${BEAM_MIN_PUBLISHABLE} (W=64 costs -0.014 matmul cos vs exhaustive, and the width is STAMPED into the artifact forever). Per the runbook: do NOT fall back to a ~6.2 h exhaustive bake inside a paid session. Capture $LOG_DIR/beam_parity.log, tar, DELETE the instance, fix on CPU."
-    fi
-    echo "BEAM_GATE=W${BAKE_W} (DEGRADED: W=${FAILW} failed parity; W=${BAKE_W} costs ~-0.004 matmul cos vs exhaustive — FLAG THIS IN THE RESULTS)"
+    grep -E "panicked at|assertion|differs from the CPU beam|^test result:" \
+      "$LOG_DIR/beam_parity.log" | head -12
+    abort BEAM_PARITY "CUDA beam == CPU beam, byte-identical, at W=$BEAM_WIDTH" \
+      "0 mismatched bytes at W=64, W=128 and W=256" \
+      "${FAILED_TEST:-cargo test exit $rc} failed at W=${FAILW:-unknown}${MISMATCH:+, ${MISMATCH} bytes differ}" \
+      "the CUDA beam kernel does not reproduce the CPU beam on this silicon. W=$BEAM_WIDTH or no bake — there is no degraded rung and no exhaustive fallback. Reproduce on CPU for free: cargo test -p mistralrs-quant qtip::search_bench (the CPU beam is PR #29's beam_quantize_row) and diff against kernels/qtip/qtip_beam.cu. Full test output: results/beam_parity.txt"
   fi
   echo "$BAKE_W" > "$RESULTS/beam_width_used.txt"
 elif [ -s "$RESULTS/beam_width_used.txt" ]; then
@@ -376,7 +655,8 @@ fi
 # =============================================================================
 if want S3; then
   mark "S3 bake W=$BAKE_W"
-  [ "$BAKE_W" -ge "$BEAM_MIN_PUBLISHABLE" ] || abort BAKE "no publishable beam width from S2"
+  FAIL_LOG=bake.log
+  [ "$BAKE_W" = "$BEAM_WIDTH" ] || abort BAKE "bake width" "W=$BEAM_WIDTH" "W=$BAKE_W" "refusing to bake at anything but W=$BEAM_WIDTH — there is no degraded rung"
   mkdir -p "$UQFF_DIR"
   export ARC_QTIP_BEAM=$BAKE_W
   export MISTRALRS_ISQ_SINGLETHREAD=1
@@ -403,19 +683,30 @@ if want S3; then
     kill -0 "$BAKE_PID" 2>/dev/null || { sleep 1; HDR=$(grep -m1 "QTIP bake \[" "$LOG_DIR/bake.log" 2>/dev/null); break; }
     sleep 2
   done
+  if [ -z "$HDR" ] && rebuild_from_source_if_cached "no bake header"; then
+    kill_pid "$BAKE_PID"
+    echo "RETRY_BAKE once with the freshly built binary"
+    nohup env ARC_QTIP_BEAM="$BAKE_W" MISTRALRS_ISQ_SINGLETHREAD=1 \
+      "$S6_MISTRALRS" quantize text -m "$V4_DIR" -a deepseekv4 --isq qtip2 \
+      -o "$UQFF_DIR/" --uqff-base-model "$BASE_MODEL" --uqff-repo-id "$HF_REPO" \
+      >> "$LOG_DIR/bake.log" 2>&1 < /dev/null &
+    BAKE_PID=$!; BAKE_T0=$(date +%s)
+    nap 20
+    HDR=$(grep -m1 "QTIP bake \[" "$LOG_DIR/bake.log" 2>/dev/null)
+  fi
   if [ -z "$HDR" ]; then
     kill_pid "$BAKE_PID"
-    abort BAKE_HEADER "no 'QTIP bake [...]' header in the first 3 min. Before PR #33 the GPU path returned BEFORE log_bake_header, so this binary cannot prove which search produced the checkpoint. Refusing to bake an unprovenanced artifact (D4)."
+    abort BAKE_HEADER "bake log contains 'QTIP bake ['" "a header line within ${HDR_DEADLINE}s" "no header (log is $(wc -c < "$LOG_DIR/bake.log" 2>/dev/null | tr -d ' ') bytes)" "before PR #33 the GPU path returned BEFORE log_bake_header (mistralrs-quant/src/qtip/mod.rs:1437,:1653), so this binary cannot prove which search produced the checkpoint. Refusing to bake an unprovenanced artifact (D4). Check offline that the built tree really contains #33. results/bake.log"
   fi
   echo "BAKE_HEADER: $HDR"
   case "$HDR" in
     *"search=viterbi-beam(W=$BAKE_W)"*) echo "BAKE_SEARCH_OK W=$BAKE_W" ;;
-    *"search=greedy"*) kill_pid "$BAKE_PID"; abort BAKE_GREEDY "the bake header says greedy. DOCTRINE D4: greedy is banned forever, structurally. This is a code regression, not a session problem." ;;
-    *) kill_pid "$BAKE_PID"; abort BAKE_SEARCH "header does not name viterbi-beam(W=$BAKE_W): '$HDR'. cuda_search_plan may translate but must never substitute a search." ;;
+    *"search=greedy"*) kill_pid "$BAKE_PID"; abort BAKE_GREEDY "bake header search field" "search=viterbi-beam(W=$BAKE_W)" "$HDR" "the bake selected GREEDY. DOCTRINE D4: greedy is banned forever, structurally — no env, flag or config path may reach it and a bake handed it must hard-error. This is a CODE REGRESSION in the ban (mistralrs-quant/src/qtip/mod.rs QtipRotation::for_mode / greedy_ban_tests.rs), not a box problem. results/bake.log" ;;
+    *) kill_pid "$BAKE_PID"; abort BAKE_SEARCH "bake header search field" "search=viterbi-beam(W=$BAKE_W)" "$HDR" "the header names a different search than ARC_QTIP_BEAM=$BAKE_W requested. cuda_search_plan (qtip/mod.rs:714) may TRANSLATE (a beam >= 2^L runs the exhaustive kernel) but must never SUBSTITUTE. results/bake.log" ;;
   esac
   case "$HDR" in
     *"rotation=hadamard-"*) echo "BAKE_ROTATION_OK" ;;
-    *) kill_pid "$BAKE_PID"; abort BAKE_ROTATION "header says rotation off — D11 makes Hadamard rotation the permanent default; a no-rotation artifact is a different (worse) product" ;;
+    *) kill_pid "$BAKE_PID"; abort BAKE_ROTATION "bake header rotation field" "rotation=hadamard-N" "$HDR" "rotation is OFF. D11 makes the block-diagonal Hadamard the permanent default, its signs are serialized into the UQFF and consumed by the forward path, and a no-rotation artifact is a different (worse) product (fp4-sourced experts: 0.887 vs 0.963 matmul cos). results/bake.log" ;;
   esac
 
   # `grep -c` EXITS 1 on zero matches, and `set -o pipefail` makes a
@@ -425,7 +716,7 @@ if want S3; then
   if [ "${FB:-0}" -gt 0 ]; then
     grep -m1 "QTIP GPU quantize fallback" "$LOG_DIR/bake.log"
     kill_pid "$BAKE_PID"
-    abort BAKE_FALLBACK "the bake fell back to the CPU pipeline (~11 min/layer = ~8 h). The warn line above names the condition and IS the deliverable."
+    abort BAKE_FALLBACK "QTIP GPU quantize fallback count" "0" "$FB" "the bake fell back to the CPU Viterbi pipeline (~11 min/layer ~= 8 h). The warn line printed above names the exact condition and IS the deliverable — read it in results/bake.log and fix the named cause on CPU."
   fi
   ISQ_LINE=$(grep -m1 -E "ISQ thread policy|Applying (immediate )?ISQ .*threads" "$LOG_DIR/bake.log")
   echo "BAKE_ISQ_THREADS: ${ISQ_LINE:-<none>}"
@@ -444,13 +735,13 @@ if want S3; then
   echo "PACE[t=3m]=$L3 layers"
   if [ "$DRYRUN" != "1" ] && [ "${L3:-0}" -lt 2 ]; then
     kill_pid "$BAKE_PID"
-    abort BAKE_PACE "only $L3 layer(s) in 3 min. The beam projection is 42-85 s/layer (2-4 layers per 3 min); <2 means the beam is not really engaged or the box is starved. Re-run box_health_gate.sh --with-bake-probe; on FAIL delete and re-rent."
+    abort BAKE_PACE "'Detected INT4' lines at t=3min" ">= 2 (beam projection 42-85 s/layer)" "$L3" "bake pace too slow at 3 min. Either the beam kernel is not really engaged (check results/bake.log for the header width) or the box is transfer-starved like s5a (99% util at 132W of 700W). Compare results/box_health.json power against the 200W floor offline."
   fi
   if [ "$DRYRUN" != "1" ]; then
     nap 420
     L10=$(grep -c "Detected INT4" "$LOG_DIR/bake.log")
     echo "PACE[t=10m]=$L10 layers"
-    [ "${L10:-0}" -ge 6 ] || { kill_pid "$BAKE_PID"; abort BAKE_PACE "only $L10 layers in 10 min (need 6): projected 44-layer bake > 75 min, which breaks the cost model"; }
+    [ "${L10:-0}" -ge 6 ] || { kill_pid "$BAKE_PID"; abort BAKE_PACE "'Detected INT4' lines at t=10min" ">= 6" "$L10" "projected 44-layer bake > 75 min against a 31-62 min projection. results/bake.log + results/box_health.json"; }
   fi
 
   waited=0
@@ -458,7 +749,7 @@ if want S3; then
     nap 30; waited=$((waited + 30))
     if past "$WIRE_BAKE_H"; then
       kill_pid "$BAKE_PID"
-      abort BAKE_TRIPWIRE "bake still running at the $WIRE_BAKE_H h trip-wire. $(budget_line)"
+      abort BAKE_TRIPWIRE "bake completes before the anti-hang wire" "done by ${WIRE_BAKE_H}h cumulative" "still running at $(elapsed_h)h" "the bake overran its wire; it is hung or the box is starved. results/bake.log has the last layer line — count layers/min offline."
     fi
     [ "$DRYRUN" = "1" ] && break
   done
@@ -468,9 +759,9 @@ if want S3; then
   grep -E "QTIP bake \[|ISQ thread policy|QTIP GPU quantize fallback" "$LOG_DIR/bake.log" \
     > "$RESULTS/bake_log_excerpt.txt" 2>/dev/null
   if [ "$DRYRUN" != "1" ]; then
-    [ "${SHARDS:-0}" -ge 1 ] || abort BAKE_SIZE "no .uqff shards written"
+    [ "${SHARDS:-0}" -ge 1 ] || abort BAKE_SIZE "*.uqff shards in $UQFF_DIR" ">= 1" "0" "the bake exited without writing a shard. results/bake.log"
     awk -v b="${BYTES:-0}" 'BEGIN{exit !(b > 40e9 && b < 120e9)}' \
-      || abort BAKE_SIZE "uqff dir is ${BYTES} bytes; expected ~68 GB (40-120 GB band)"
+      || abort BAKE_SIZE "uqff directory size" "40-120 GB (expect ~68 GB / 7 shards)" "$(awk -v b="${BYTES:-0}" 'BEGIN{printf "%.1f GB", b/1e9}') / ${SHARDS:-0} shards" "the artifact is the wrong size — do not publish it. results/bake.log"
   fi
   unset ARC_QTIP_BEAM MISTRALRS_ISQ_SINGLETHREAD
 fi
@@ -484,6 +775,7 @@ fi
 # =============================================================================
 if want S4; then
   mark "S4 upload-uqff"
+  FAIL_LOG=upload.log
   MANIFEST="$UQFF_DIR/arc_bake_manifest.json"
   {
     printf '{\n'
@@ -521,6 +813,19 @@ if want S4; then
     UP=$(grep -c "UPLOAD_OK" "$LOG_DIR/upload.log" 2>/dev/null || true)
     [ "${UP:-0}" -gt 0 ] && echo "UPLOAD_VERIFIED (every local file listed back from the hub)"
   fi
+  # Mark the phase so the pause banner quotes the cheaper re-entry arithmetic.
+  grep -q "UPLOAD_OK" "$LOG_DIR/upload.log" 2>/dev/null && touch "$RESULTS/.uploaded"
+
+  # Push the binary to the cache while the token is already in play. ~200 MB,
+  # seconds, and it is what turns a future ~70 min re-entry into ~26 min. Skip
+  # when this binary CAME from the cache (nothing new to publish).
+  if [ -s "$S6_TOKEN_FILE" ] && [ "${BIN_FROM_CACHE:-0}" != "1" ]; then
+    $S6_PY "$S6_BINCACHE_PY" push --repo-id "$HF_REPO" --prefix "$BIN_CACHE_PREFIX" \
+      --token-file "$S6_TOKEN_FILE" --arc "$ARC" --binary "$S6_MISTRALRS" \
+      --built-utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      2>&1 | grep -v -i token | tee -a "$LOG_DIR/bincache.log" | tail -2
+  fi
+
   if past "$WIRE_UPLOAD_H"; then
     echo "TRIPWIRE past $WIRE_UPLOAD_H h at end of S4 — expect to lose S11 (voting truncates)"
   fi
@@ -534,7 +839,11 @@ fi
 # =============================================================================
 if want S5; then
   mark "S5 serve + batch sweep"
-  start_serve serve_baseline || abort SERVE "server never became healthy — see $LOG_DIR/serve_baseline.log"
+  FAIL_LOG=serve_baseline.log
+  if ! start_serve serve_baseline; then
+    rebuild_from_source_if_cached "server never came up" && start_serve serve_baseline
+  fi
+  [ -n "$SERVE_PID" ] || abort SERVE "GET /health on port $PORT" "200 within 900s of launch" "no healthy response" "the server never came up on the freshly baked UQFF (and a rebuild off the binary cache did not help, if one applied). results/serve_baseline.log + results/bincache.log"
   ( cd "$Q" && $S6_PY "$Q/run_coherence.py" --skip-facts ) 2>&1 | tail -4 | tee "$LOG_DIR/coherence.log"
   ( cd "$Q" && $S6_PY "$Q/speed_probe.py" --label s6_b1_diag ) 2>&1 | tail -3 | tee "$LOG_DIR/speed_b1.log"
   SWEEP_ARGS="--label s6_baseline --batches $BATCHES"
@@ -655,10 +964,11 @@ fi
 # =============================================================================
 if want S9; then
   mark "S9 tuned batch sweep"
+  FAIL_LOG=serve_tuned.log
   if [ -z "${ARC_QTIP_TUNE_TABLE:-}" ]; then
     skipm TUNED_SWEEP "no winner table from S7 — the S5 sweep already covers the baked defaults"
   else
-    start_serve serve_tuned || abort SERVE "tuned server never became healthy"
+    start_serve serve_tuned || abort SERVE "GET /health on port $PORT (tuned)" "200 within 900s of launch" "no healthy response" "the server came up untuned in S5 but not with ARC_QTIP_TUNE_TABLE set — suspect the winner table. results/serve_tuned.log + results/gemv_tune_winners.json"
     # The env must reach the SERVE process, not just this shell (session-4 bug).
     tr '\0' '\n' < "/proc/$SERVE_PID/environ" 2>/dev/null | grep -q ARC_QTIP_TUNE_TABLE \
       && echo "TUNE_TABLE_IN_SERVE_ENV=yes" || echo "TUNE_TABLE_IN_SERVE_ENV=NO — the sweep result is NOT applied; label the numbers accordingly"
@@ -741,20 +1051,6 @@ if [ -n "$S6_ONLY" ] && ! want S12; then
 fi
 
 mark "S12 teardown"
-stop_serve
-cp "$LOG_DIR"/*.log "$RESULTS/" 2>/dev/null
-( cd "$Q" && tar czf "$S6_ROOT/s6_results.tgz" results/ ) 2>/dev/null
-cp "$S6_ROOT/s6_results.tgz" "$STATUS_DIR/" 2>/dev/null
-ls -l "$STATUS_DIR/s6_results.tgz" 2>/dev/null
-echo "RESULTS_TGZ: $STATUS_DIR/s6_results.tgz"
+harvest "S6 complete"
 tar tzf "$S6_ROOT/s6_results.tgz" 2>/dev/null | head -30
-
-# The token must not outlive the session (session-5: a token was shared in
-# plaintext and had to be rotated).
-if [ -f "$S6_TOKEN_FILE" ]; then
-  shred -u "$S6_TOKEN_FILE" 2>/dev/null || rm -f "$S6_TOKEN_FILE"
-  [ -f "$S6_TOKEN_FILE" ] && echo "FAIL: token file still present" || echo "TOKEN_DELETED"
-fi
-
-budget_line
 echo "S6_COMPLETE — now DELETE the instance (delete, not stop) and verify with list_instances."

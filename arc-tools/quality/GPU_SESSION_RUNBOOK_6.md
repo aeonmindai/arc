@@ -1,15 +1,105 @@
 # GPU SESSION 6 RUNBOOK — publish the bake, then measure the fleet
 
 **Target:** one Runcrate H200 (141 GB HBM, ≥24 cores, ≥720 GB disk; sessions
-1–5 were NY, **$4.92/hr**). **Balance at staging: $48.54.** Planned spend
-**≈ $35.7 over ≈ 7:15**, hard teardown at **7:45 ≈ $38.1**, leaving ~$10 for a
-bad-box re-rent and overrun.
+1–5 were NY, **$4.92/hr**). One clean attempt is **≈ $35.7 over ≈ 7:15**.
+There is **no attempt cap and no retry budget** — Jish tops up; the wires below
+exist so a hung step cannot bill forever, not to ration dollars.
 
 Everything below is executed by a **single prepared driver**,
 `arc-tools/quality/s6_driver.sh`, uploaded with `file_upload` and run detached.
 The human/agent driving the session runs six commands total (§1) and then
 polls one URL. This document exists so that nothing has to be *decided* while
 the meter runs.
+
+---
+
+## THE STANDING RULE — read this before anything else
+
+### NEVER DEBUG ON A PAID BOX
+
+> *"if you spot any problem on gpu, tear down, fix on cpu, try again — loop,
+> don't worry about balance."* — Jish, 2026-08-14
+
+The instant any ABORT-IF trips, the driver stops work, **harvests everything
+into a pullable tarball**, and hands you one decision. It never retries a
+failed step by itself, never "just checks one thing", and never leaves work in
+flight. Diagnosis happens from the tarball, on a laptop, where compute is free.
+
+**The tarball is the deliverable of a FAILED session, not a consolation
+prize.** A box that dies with nothing pulled makes the next attempt blind and
+we pay twice for the same ignorance. So the harvest is unconditional and always
+runs BEFORE the delete — including on the health-gate path, where the one file
+it saves (`box_health.json`) is exactly what tells you offline whether the next
+box should be in a different region.
+
+### …but hold the box when the fix is cheaper than re-entering
+
+> *"loop teardowns only makes sense if its more than 5 minutes of code work, if
+> its less, continue holding the box."* — Jish, 2026-08-14
+
+"Never debug on a paid box" means never *sit and think* on one. It does not
+mean throwing away 70 minutes of paid setup to fix a typo. The driver therefore
+**pauses** after harvesting and prints the arithmetic, so the call is
+mechanical rather than a vibe:
+
+| | cost |
+|---|---|
+| holding an idle box | **$0.082/min** ($4.92/hr) |
+| re-entry **before** the UQFF upload | boot ~10 min + 149 GB download ~35 min + build ~25 min = **~70 min ≈ $5.74** before any work happens |
+| re-entry **after** the upload | boot ~10 min + cached binary <1 min + 68 GB UQFF ~15 min = **~26 min ≈ $2.13** (no weights, no bake) |
+| resume in place on a paused box | **0 min, $0** |
+
+**HOLD if the fix is shorter than the re-entry. DELETE if it is longer.**
+Jish's 5-minute floor is conservative; pre-upload the true break-even is ~70
+minutes of code work. The driver prints the right number for the phase it
+failed in.
+
+### The paused state, and the timer that keeps D10 true
+
+A paused box is the one path in this whole design that could reintroduce a
+forgotten idle GPU — exactly the failure DOCTRINE **D10** exists to prevent. So
+the pause is **hard-bounded**:
+
+```
+PAUSE_IDLE_SECS   default 900 s (15 min)
+```
+
+With no decision inside that window the driver prints `DELETE_INSTANCE_NOW`,
+drops `/srv/arcstatus/DELETE_ME`, and exits 10. **The digest prints that as its
+FIRST line and the 60 s watchdog acts on it without asking** — the on-box timer
+cannot call Runcrate itself, so what it actually guarantees is that the delete
+becomes unmissable inside one watchdog tick. **Do not raise this timeout
+because a fix is taking longer; extend the pause explicitly with `hold:N`, so
+the box is idle on purpose and on the record.**
+
+Decisions are one line, one `ssh_execute`:
+
+```bash
+echo resume:S5 > /srv/arcstatus/s6_decision   # continue from S5 — bake and upload are NOT redone
+echo retry     > /srv/arcstatus/s6_decision   # re-run the failed step here, after an in-session fix
+echo hold:1800 > /srv/arcstatus/s6_decision   # a fix is in progress, extend the pause by N seconds
+echo delete    > /srv/arcstatus/s6_decision   # give up now
+```
+
+`resume:` and `retry` re-exec the driver in place with `S6_FROM=<step>` and the
+original start time, so the trip-wires stay honest and **the bake and the
+upload are not repeated**. The file is consumed on read, so a stale decision
+cannot loop the driver.
+
+### W=256 or no bake
+
+There is no width ladder, no "largest passing width", no degraded rung behind a
+flag. Shipping a checkpoint we know is worse (−0.004 matmul cos at W=128,
+−0.014 at W=64), with the inferior width **stamped into the artifact forever**
+by #33's UQFF flags byte, because the good one was inconvenient, is the same
+species of shortcut DOCTRINE **D4** bans. And we never fall back to a ~6.2 h
+exhaustive bake: that buys the previous generation at full price and leaves
+nothing for measurement — the exact mistake session 5 was killed for.
+
+### No attempt caps, no retry budget
+
+Jish tops up. The wires in §2 are **anti-hang bounds for one attempt**, not
+rationing: a hung step teaches us nothing while it bills.
 
 ---
 
@@ -46,6 +136,7 @@ still leaves the artifact.
 # 2. upload the prepared scripts (file_upload — NEVER a heredoc through ssh_execute)
 #      /root/s6_driver.sh          arc-tools/quality/s6_driver.sh
 #      /root/s6_upload_uqff.py     arc-tools/quality/s6_upload_uqff.py
+#      /root/s6_bin_cache.py       arc-tools/quality/s6_bin_cache.py
 #      /root/box_health_gate.sh    arc-tools/quality/box_health_gate.sh
 #      /root/stall_sentinel.sh     arc-tools/quality/stall_sentinel.sh
 #      /root/stall_sentinel2.sh    arc-tools/quality/stall_sentinel2.sh
@@ -95,11 +186,21 @@ $4.92/hr = **$0.082/min**. Cumulative from *instance creation*.
 | S11 | **Voting GSM8K k=5** — the 90+ attempt | 90m | 7:00 | 7.38 | 34.44 |
 | S12 | Tar + teardown (**NEVER CUT**) | 15m | 7:15 | 1.23 | **35.67** |
 
-Leaves **$12.87**. A box that fails S0 costs **~$0.30** to abandon — that is
-the entire point of gating before the download. A box that fails the S3 pace
-gate costs ~$6, which the remainder absorbs once.
+**Abandon cost by failure point** — this is what the pause banner's
+hold-or-delete arithmetic is comparing against:
 
-### Trip-wires (enforced by the driver, not by memory)
+| Fails at | Elapsed | Cost of abandoning | Cost of re-entering |
+|---|---|---|---|
+| S0 health / compute cap | 0:03 | **$0.25** | ~70 min ≈ $5.74 (pre-upload) |
+| S1 build | 0:58 | $4.76 | ~70 min ≈ $5.74, or **~26 min ≈ $2.13** with the binary cache when the tree is unchanged |
+| S2 beam parity | 1:13 | $5.99 | ~70 min ≈ $5.74 (a parity fix changes the tree, so the cache invalidates — see §3 S1) |
+| S3 bake gates | ~1:15 | ~$6.1 | as S2 |
+| anything ≥ S5 | ≥ 2:58 | ≥ $14.6 | **~26 min ≈ $2.13** — post-upload, no weights, no bake |
+
+Gating the box health *before* the 149 GB download is what makes the cheapest
+row cheap: **$0.25 to walk away from a bad rental.**
+
+### Anti-hang wires (enforced by the driver, not by memory)
 
 | Cum | Wire | Driver behaviour |
 |---|---|---|
@@ -107,7 +208,7 @@ gate costs ~$6, which the remainder absorbs once.
 | 3:18 | `WIRE_UPLOAD_H=3.30` | past this at end of S4 ⇒ log `TRIPWIRE`, expect to lose S11 |
 | 6:00 | `WIRE_LASTCHANCE_H=6.00` | batch sweep drops `--include-128`; voting starts at `--n 60` |
 | 7:15 | `WIRE_STOP_H=7.25` | any running eval is PID-killed; JSON keeps its partial `n`; go to S12 |
-| 7:45 | `WIRE_TEARDOWN_H=7.75` ($38.13) | **HARD teardown, no matter what** — the watchdog shouts `BUDGET_WIRE` |
+| 7:45 | `WIRE_TEARDOWN_H=7.75` | **HARD teardown, no matter what** — the watchdog shouts `BUDGET_WIRE` |
 
 ### Cut order (from the bottom, with one stated exception)
 
@@ -186,6 +287,48 @@ candle fork as a sibling, starts the 149 GB download in the background, builds
   (`ABORT_BUILD`), or the binary is missing after the patched rebuild.
 - **SKIP (not abort)** if the patch fails to apply: `SKIP_MTP_PATCH`, and S10
   will produce nothing. Record it; do not debug.
+- **The patch is a NO-OP when a `log_acceptance_rate()` call site already
+  exists.** Agent AK is landing a permanent one in `mistralrs-core`; applying
+  the patch on top would add a second call and **double-count acceptance**. The
+  driver greps `mistralrs-core/src` and skips on a hit — the grep is the
+  authority, not the merge order, so this is correct whichever PR lands first.
+
+**Binary cache — this is what makes the tear-down-and-retry loop cheap.**
+
+```bash
+python3 /root/s6_bin_cache.py pull --repo-id <repo> --prefix arc-bin \
+  --token-file /root/.hf_token --arc $ARC --out $ARC/target/release/mistralrs
+```
+
+A cache HIT skips the ~25 min cargo build. It is taken only when **all five**
+of `arc_commit`, `driver_version`, `toolkit_version`, `compute_cap` and `glibc`
+match the box the binary was built on, **and** the sha256 matches the manifest —
+those are the things that make a Linux CUDA binary refuse to run, or run
+wrongly, on a different rental.
+
+- **Where, and why there:** the same private repo as the checkpoint,
+  `aeonmind/DeepSeek-V4-Flash-UQFF-qtip2` under `arc-bin/`. One repo = one token
+  scope and one place to look, and the checkpoint travels with the exact binary
+  that can read its stamp/flags byte. Two repos would drift, and the failure
+  mode of drift here is a binary that silently cannot read the artifact beside
+  it. Cost: a non-model file in a model repo, namespaced and private.
+- **Honest about what it does NOT buy:** the commonest re-entry after a real
+  failure is "our Rust was wrong", which changes `arc_commit` — so the cache
+  invalidates itself on exactly the loop where a stale binary would be
+  dangerous. It helps the *other* loops: a bad rental, a harness bug, a
+  measurement-only re-run. It also does **not** cover `cargo run --example`
+  (S7's gemv sweep, S8's `stats_info`), which still need a source build.
+- **Validation before trust:** `--version` runs, `ldd` reports no missing
+  objects, sha256 matches. The **definitive** smoke is the first real use — the
+  bake header at S3 or `/health` at S5 — and if that fails the driver prints
+  `CACHE_REJECTED`, rebuilds from source once, and retries that one step. That
+  is not debugging on a paid box: it is invalidating a cache we chose to trust,
+  with no diagnosis involved.
+- **The 149 GB source weights are never cached.** After the bake and upload they
+  are not needed; the 68 GB UQFF replaces them.
+- The binary is pushed to the cache in S4, right after the UQFF, while the token
+  is already in play (~200 MB, seconds). Skipped when the binary itself came
+  from the cache.
 
 ### S2 — **CUDA beam parity gate** (15 min) — THE GATE
 
@@ -205,25 +348,18 @@ That filter runs all six relevant tests in one compile:
 
 - **ABORT-IF the log contains `CUDA not available; skipping`**
   (`ABORT_BEAM_VACUOUS`) — the passes mean nothing.
-- **The width ladder.** The parity test iterates 64 → 128 → 256 and fails at
-  the **first** bad width, naming it: `W={width}: CUDA beam differs from the
-  CPU beam in N/M bytes`. The driver parses that and picks the largest width
-  strictly below it:
-
-| Outcome | Action |
-|---|---|
-| all three pass | bake at **W=256** (PR #29: quality-neutral, matmul cos 0.96680 vs exhaustive 0.96495) |
-| W=256 fails, 128 passes | bake at **W=128**, `BEAM_GATE=W128 (DEGRADED)` — −0.004 cos; **flag it in the results and in FACTS.md** |
-| only W=64 passes | **do not bake.** −0.014 cos (0.95054) is a real regression, and the width is **stamped into the artifact forever** (#33's UQFF flags byte). Tear down. |
-| none pass | tear down |
-
-- **ABORT-IF the largest passing width < 128** (`ABORT_BEAM_PARITY`).
-  **The fallback is NOT an exhaustive bake.** A ~6.2 h exhaustive bake is ~$30
-  of a $48.54 balance, buys the old generation at full price, and leaves
-  nothing for measurement — session 5 was killed for exactly this
-  (*"I'm not willing to wait 6 hours so you can kill the viterbi machine
-  that's wasting money"*). Capture `beam_parity.log`, tar, **DELETE**, fix on
-  CPU where the fixtures are free.
+- **W=256 or no bake.** The parity test iterates 64 → 128 → 256 and fails at
+  the **first** bad width, naming it: `W={width}: CUDA beam differs from the CPU
+  beam in N/M bytes`. The driver records that width (useful offline) and
+  **aborts** — it does not bake at a narrower width and it does not fall back to
+  the exhaustive DP. See the standing rule at the top: a worse artifact with the
+  worse width stamped into it forever is the shortcut D4 bans, and a ~6.2 h
+  exhaustive bake is what session 5 was killed for.
+- **ABORT-IF the parity tests fail** (`ABORT_BEAM_PARITY`). The failure report
+  carries the failing width, the mismatched byte count, and the failing test
+  name, and points at the free CPU reproduction:
+  `cargo test -p mistralrs-quant qtip::search_bench` against
+  `kernels/qtip/qtip_beam.cu`. Harvest → pause → fix on CPU → rent → retry.
 
 ### S3 — Bake with the beam (projected 31–62 min at W=256)
 
@@ -495,7 +631,9 @@ Plus, off-box and permanent: **`aeonmind/DeepSeek-V4-Flash-UQFF-qtip2`** with
   let a pre-0.3.0 unstamped artifact serve). The driver aborts
   (`ABORT_ENV_DIRTY`) if any is exported at start.
 - **No debugging beyond the ABORT-IF rules.** Findings are deliverables; fixes
-  happen offline where compute is free.
+  happen offline where compute is free. The driver enforces this: an ABORT-IF
+  harvests, pauses for exactly one decision, and self-condemns after
+  `PAUSE_IDLE_SECS`.
 
 ---
 
@@ -548,7 +686,16 @@ while true; do
   s=$(curl -s --max-time 10 http://<IP>:8899/s6.txt 2>/dev/null || true)
   if [ -z "$s" ]; then misses=$((misses+1)); [ $misses -ge 4 ] && { echo "STATUS_SILENT x$misses"; misses=0; sleep 240; }; sleep 60; continue; fi
   misses=0
-  cur=$(echo "$s" | grep -E '^:{6}|^HEALTH_|^BUILD_|^BEAM_|^BAKE_|^PACE\[|^UPLOAD_|^BATCH|^SPEED\[|^GSM8K\[|^WINNERS:|^CALIB_|^MTP_|^RESULTS_TGZ|^S6_COMPLETE|^ABORT_|^SKIP_|^TRIPWIRE|STALL_|panicked|CUDA_ERROR' | sort -u)
+  # ACT, do not just print: a delete demand means the box has already harvested
+  # and is now pure cost. Pull, then DELETE. No deliberation.
+  if echo "$s" | grep -q '^DELETE_INSTANCE_NOW'; then
+    echo "DELETE_INSTANCE_NOW seen — pull s6_results.tgz then delete_instance NOW"
+  fi
+  if echo "$s" | grep -q '^ABORTED_AWAITING_DECISION'; then
+    echo "PAUSED — decide within PAUSE_IDLE_SECS or it self-condemns:"
+    echo "$s" | grep -E '^ABORTED_AWAITING_DECISION|^FAILED_ASSERTION'
+  fi
+  cur=$(echo "$s" | grep -E '^:{6}|^HEALTH_|^BUILD_|^BEAM_|^BAKE_|^PACE\[|^UPLOAD_|^BATCH|^SPEED\[|^GSM8K\[|^WINNERS:|^CALIB_|^MTP_|^BIN_SOURCE|^CACHE_|^RESULTS_TGZ|^S6_COMPLETE|^ABORT_|^FAILED_ASSERTION|^DECISION_|^RESUMING_IN_PLACE|^DELETE_INSTANCE_NOW|^SKIP_|^TRIPWIRE|STALL_|panicked|CUDA_ERROR' | sort -u)
   comm -13 <(echo "$prev") <(echo "$cur") 2>/dev/null | grep -v '^$' || true
   prev="$cur"
   h=$(echo "$s" | grep -oE 'cum_h=[0-9.]+' | cut -d= -f2 | head -1)
@@ -560,31 +707,54 @@ done
 `Monitor` with `persistent: true`, `timeout_ms: 3600000`. **`TaskStop` it the
 moment the box is deleted.** One watchdog per session; replace, never stack.
 
----
+**The two markers that require action rather than reading:**
+
+| Marker | What you do, immediately |
+|---|---|
+| `ABORTED_AWAITING_DECISION` | read `FAILED_ASSERTION`, apply the hold-or-delete arithmetic from the top of this doc, write ONE line into `/srv/arcstatus/s6_decision` |
+| `DELETE_INSTANCE_NOW` | pull `s6_results.tgz`, then `delete_instance`. The harvest already happened; every further second is pure cost |
 
 ## 8. Pre-flight validation performed at staging (all $0, no GPU)
 
 | Check | Result |
 |---|---|
 | `bash -n` on `s6_driver.sh`, `s6_status_digest.sh`, `stall_sentinel2.sh`, `test_s6_driver.sh` | clean |
-| `python3 -m py_compile s6_upload_uqff.py` | clean |
+| `python3 -m py_compile` on `s6_upload_uqff.py`, `s6_bin_cache.py` | clean |
 | `git apply --check patches/s6_mtp_acceptance_telemetry.patch` against `d6ceaf1ad` | applies clean |
 | `cargo check -p mistralrs-core --lib` with the patch applied | **green, zero new warnings** |
 | `s6_upload_uqff.py` guard paths (missing folder / no shard / empty token / no lib) | all refuse with `UPLOAD_FAIL`, exit 1 |
-| **`bash test_s6_driver.sh`** — 7 mocked scenarios, 41 assertions | **ALL PASS** |
+| `typos --config .typos.toml` | clean |
+| **`bash test_s6_driver.sh`** — 11 mocked scenarios, **147 assertions** | **ALL PASS** |
 
-The dry run found three real bugs before they could cost rental time:
+**Scenarios.** `A` happy path · `B` bad box · `C` compute cap < 8.0 · `D` beam
+broken at W=64 · `E` beam broken at W=256 (asserts there is **no** W=128 rung,
+no bake, no upload) · `F` no bake header · `G` greedy header · `H` a paused box
+takes `retry`, resumes in place, and finishes **with the bake and upload each
+having run exactly once** · `I` agent AK's permanent call site makes the MTP
+patch a no-op · `J` binary-cache hit (smoke passes, no re-push) · `K` cache
+fingerprint mismatch → source build → push.
 
-1. `grep -c … \| grep -qx 0` under `set -o pipefail` reports the *first* grep's
+**Every failure scenario asserts the same contract**, because it *is* the
+policy: name the failed assertion as expected-vs-got, harvest before anything
+else, leave a pullable tarball and print its pull command, shred the token,
+pause with the hold-or-delete arithmetic, demand a delete on idle timeout, drop
+`DELETE_ME` for the watchdog, write `results/s6_failure.json`, and exit 10 —
+with `RESULTS_TGZ` ordered before `ABORTED_AWAITING_DECISION` before
+`DELETE_INSTANCE_NOW`.
+
+The dry run found four real bugs before they could cost rental time:
+
+1. `grep -c … | grep -qx 0` under `set -o pipefail` reports the *first* grep's
    exit 1 on zero matches — the fallback check would have **aborted every
    healthy bake**.
 2. The `dynamic range` extraction matched the `e` in `range` and returned two
    lines, producing a malformed `CALIB_VERDICT`.
-3. A blind `sleep 180` before reading the bake header was replaced by a poll,
-   which both removed a race and now aborts a header-less bake in ~10 s instead
-   of 3 paid minutes.
-
----
+3. A blind `sleep 180` before reading the bake header raced the launch; replaced
+   by a poll, which also aborts a header-less bake in ~10 s instead of 3 paid
+   minutes.
+4. A cached binary written over its own source path would have destroyed the
+   binary it was meant to install — caught by pinning the driver's binary to
+   `target/release/` in the harness rather than a PATH directory.
 
 ## 9. Appendix — verified names and citations (master `d6ceaf1ad`, 2026-08-14)
 
@@ -617,3 +787,6 @@ The dry run found three real bugs before they could cost rental time:
 | Boot script | honours `ARC_BRANCH` (default master), picks `WORK`/`MODELS` from the first existing of `/ephemeral /workspace /mnt /root`, backgrounds the 149 GB download, prints `BOOTSTRAP_COMPLETE` | `arc-tools/boot_run161_h200.sh:31` |
 | Box health gate | `[--burn auto\|example\|torch\|nvcc\|cargo] [--burn-secs N] [--min-power W] [--with-bake-probe DIR]`; **exit 1 = delete + re-rent**; thresholds documented as one-datapoint heuristics from s5a | `arc-tools/quality/box_health_gate.sh` |
 | HF upload | `HfApi.upload_folder` (resumable, multi-commit); `upload_large_folder` **deprecated**; `HF_XET_HIGH_PERFORMANCE=1`; `HF_TOKEN` read from env | huggingface_hub docs, fetched 2026-08-14 |
+| Binary cache | `s6_bin_cache.py {push,pull,fingerprint}`; repo `aeonmind/DeepSeek-V4-Flash-UQFF-qtip2` prefix `arc-bin/`; trusted only when `arc_commit`+`driver_version`+`toolkit_version`+`compute_cap`+`glibc` all match **and** sha256 matches | `arc-tools/quality/s6_bin_cache.py` |
+| Pause decisions | one line into `/srv/arcstatus/s6_decision`: `resume:<STEP>` \| `retry` \| `hold:<secs>` \| `delete`; consumed on read; `PAUSE_IDLE_SECS` default 900 then `DELETE_INSTANCE_NOW` + `/srv/arcstatus/DELETE_ME` | `arc-tools/quality/s6_driver.sh` |
+| Failure report | `results/s6_failure.json` — step, assertion, expected, got, message, which log in the tarball, elapsed, attempt cost, GPU, arc commit | `arc-tools/quality/s6_driver.sh` `abort()` |
