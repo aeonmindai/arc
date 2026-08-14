@@ -67,7 +67,7 @@ extend-ignore-re = [
 "ba" = "ba"
 "ratatui" = "ratatui"
 
-[type.markdown.extend-identifiers]
+[type.md.extend-identifiers]
 "arange" = "arange"
 
 [type.rust.extend-identifiers]
