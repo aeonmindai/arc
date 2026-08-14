@@ -56,7 +56,9 @@ use std::sync::Arc;
 #[cfg_attr(not(test), allow(unused_imports))]
 use candle_core::{DType, Device, Result, Tensor};
 use mistralrs_core::IsqModel;
-use mistralrs_quant::{QuantMethod, QuantMethodConfig, TuckerFactoredLayer};
+use mistralrs_quant::{
+    CalibrationArtifact, LayerCalibStats, QuantMethod, QuantMethodConfig, TuckerFactoredLayer,
+};
 use tracing::{info, warn};
 
 use crate::td_moe::{cholesky_in_place, tucker_decompose_with_whitening};
@@ -69,6 +71,15 @@ pub const ARC_TD_MOE_RANK_ENV: &str = "ARC_TD_MOE_RANK";
 /// only used for Tier B (file-driven) calibration in the future.
 pub const ARC_TD_MOE_CALIB_ENV: &str = "ARC_TD_MOE_CALIBRATION";
 
+/// Environment variable holding a path to a `.arccalib` calibration artifact
+/// (see `mistralrs calibrate`). Set by arc-cli's `--calib <path>`.
+///
+/// When present and readable, the whitening uses the artifact's measured input
+/// activation covariance instead of the identity. **When absent the behaviour
+/// is unchanged** (identity covariance, i.e. plain Tucker), so nothing
+/// regresses silently.
+pub const ARC_TD_MOE_CALIB_PATH_ENV: &str = "ARC_TD_MOE_CALIB_PATH";
+
 /// Register the TD-MoE post-load hook with mistralrs-core *iff*
 /// `ARC_TD_MOE_RANK` is set in the environment. Safe to call unconditionally
 /// from startup code — a no-op when the env var is unset or invalid.
@@ -80,9 +91,55 @@ pub fn register_td_moe_hook() {
         return;
     };
     let calibration = parse_env_calibration().unwrap_or(256);
-    info!("Arc: registering TD-MoE post-load hook (rank={rank}, calibration={calibration})");
+
+    // Flag-gated: only a supplied `--calib <path>` switches the whitening off
+    // identity. A missing/unreadable artifact never fails the load — it falls
+    // back to the historical identity path with a warning.
+    let calib = match std::env::var(ARC_TD_MOE_CALIB_PATH_ENV) {
+        Ok(path) if !path.trim().is_empty() => match CalibrationArtifact::load(path.trim()) {
+            Ok(art) => {
+                info!(
+                    "Arc TD-MoE: loaded calibration artifact `{}` ({} layers, {} with statistics, \
+                     organization={})",
+                    path.trim(),
+                    art.layers.len(),
+                    art.supported_layer_count(),
+                    art.meta.isq_organization
+                );
+                if art.meta.isq_organization != "moqe" {
+                    warn!(
+                        "Arc TD-MoE: calibration artifact was collected with \
+                         isq_organization={} but TD-MoE walks the `moqe` layer list. Layer \
+                         indices may not line up; re-run `mistralrs calibrate` with \
+                         `--isq-organization moqe`.",
+                        art.meta.isq_organization
+                    );
+                }
+                Some(Arc::new(art))
+            }
+            Err(e) => {
+                warn!(
+                    "Arc TD-MoE: could not read calibration artifact `{}`: {e}. \
+                     Falling back to identity covariance.",
+                    path.trim()
+                );
+                None
+            }
+        },
+        _ => None,
+    };
+
+    info!(
+        "Arc: registering TD-MoE post-load hook (rank={rank}, calibration={calibration}, \
+         whitening={})",
+        if calib.is_some() {
+            "calibrated"
+        } else {
+            "identity"
+        }
+    );
     mistralrs_core::register_post_load_hook(Box::new(move |model: &mut dyn IsqModel| {
-        apply_td_moe_to_model(model, rank, calibration)
+        apply_td_moe_to_model_with_calib(model, rank, calibration, calib.as_deref())
             .map_err(|e| anyhow::anyhow!("TD-MoE compression failed: {e}"))
     }));
 }
@@ -114,13 +171,81 @@ fn parse_env_calibration() -> Option<usize> {
 /// reconstruction.
 ///
 /// `rank` is clamped per-axis to fit each tensor's actual dimensions
-/// (Tucker ranks must be `<= dim_i`). `_calibration_set_size` is currently
-/// only used to size the synthetic activation distribution for Tier A; the
-/// real-prompt Tier B path is deferred to a follow-up.
+/// (Tucker ranks must be `<= dim_i`). `calibration_set_size` is currently only
+/// used to size the synthetic activation distribution for Tier A.
+///
+/// Whitens against the identity. Use [`apply_td_moe_to_model_with_calib`] to
+/// supply a measured activation covariance.
 pub fn apply_td_moe_to_model(
     model: &mut dyn IsqModel,
     rank: usize,
+    calibration_set_size: usize,
+) -> Result<()> {
+    apply_td_moe_to_model_with_calib(model, rank, calibration_set_size, None)
+}
+
+/// Build the input covariance `Σ_in` (row-major `[d_in, d_in]`) for one expert
+/// stack from its calibration statistics.
+///
+/// - When the artifact carries a **full** gram of matching dimension, it is
+///   used as-is (a real, dense `XᵀX`).
+/// - Otherwise a **diagonal** covariance is built from `diag(XᵀX)/tokens`.
+///   Diagonal whitening is exactly per-input-channel rescaling — the same
+///   signal AWQ-style scaling exploits — and is strictly more informative than
+///   the identity.
+///
+/// The covariance is rescaled to unit mean diagonal. Only the *relative*
+/// channel weighting matters to the whitening, and normalising keeps the
+/// downstream Cholesky epsilon (`1e-3`) at a sane magnitude relative to the
+/// covariance regardless of corpus size or activation scale.
+///
+/// Returns `None` when the layer has no usable statistics (never collected,
+/// unsupported quant method, zero tokens, or a width mismatch) so the caller
+/// falls back to identity rather than whitening against garbage.
+fn cov_in_from_stats(stats: &LayerCalibStats, d_in: usize) -> Option<Vec<f32>> {
+    if let Some(gram) = &stats.gram {
+        if let mistralrs_quant::GramLayout::Full { dim } = gram.layout {
+            if dim == d_in && gram.data.len() == d_in * d_in && stats.tokens > 0 {
+                let inv = 1.0 / stats.tokens as f64;
+                let trace: f64 = (0..d_in).map(|i| gram.data[i * d_in + i] * inv).sum();
+                if trace.is_finite() && trace > 0.0 {
+                    let scale = d_in as f64 / trace;
+                    return Some(gram.data.iter().map(|v| (v * inv * scale) as f32).collect());
+                }
+            }
+        }
+    }
+
+    let diag = stats.normalized_diag()?;
+    if diag.len() != d_in {
+        return None;
+    }
+    let sum: f64 = diag.iter().sum();
+    if !sum.is_finite() || sum <= 0.0 {
+        return None;
+    }
+    let scale = d_in as f64 / sum;
+    let mut cov = vec![0f32; d_in * d_in];
+    for (i, v) in diag.iter().enumerate() {
+        let s = (v * scale) as f32;
+        // Guard the degenerate case of a channel that was never activated.
+        cov[i * d_in + i] = if s.is_finite() && s > 0.0 { s } else { 1e-6 };
+    }
+    Some(cov)
+}
+
+/// Run TD-MoE compression, optionally whitening against measured calibration
+/// statistics.
+///
+/// `calib` is looked up **by position in the `moqe` ISQ layer list**, the same
+/// keying `mistralrs calibrate` writes. A `None` artifact — or a layer the
+/// artifact has no usable statistics for — falls back to identity covariance,
+/// i.e. the historical behaviour.
+pub fn apply_td_moe_to_model_with_calib(
+    model: &mut dyn IsqModel,
+    rank: usize,
     _calibration_set_size: usize,
+    calib: Option<&CalibrationArtifact>,
 ) -> Result<()> {
     if rank < 4 {
         candle_core::bail!("TD-MoE rank {rank} too small (need >= 4)");
@@ -151,6 +276,7 @@ pub fn apply_td_moe_to_model(
 
     struct LayerStat {
         compressed: bool,
+        calibrated: bool,
         orig: u64,
         comp: u64,
         err: f64,
@@ -158,6 +284,7 @@ pub fn apply_td_moe_to_model(
     }
     let skipped = || LayerStat {
         compressed: false,
+        calibrated: false,
         orig: 0,
         comp: 0,
         err: 0.0,
@@ -187,7 +314,8 @@ pub fn apply_td_moe_to_model(
         layers
             .into_par_iter()
             .zip(devices)
-            .map(|((layer_arc, _layer_idx), gpu_device)| {
+            .enumerate()
+            .map(|(isq_index, ((layer_arc, _layer_idx), gpu_device))| {
                 let layer_t0 = std::time::Instant::now();
                 // Pull the dense weight out of the quant method (lands on CPU).
                 let weight = match layer_arc.dequantize_w() {
@@ -207,9 +335,16 @@ pub fn apply_td_moe_to_model(
                     return skipped();
                 }
 
-                // Tier A: identity covariance (whitening reduces to plain Tucker).
+                // Output-side covariance stays identity: a calibration sweep
+                // observes layer *inputs*, so there is no honest Σ_out to use.
                 let cov_out = identity_matrix(d_out);
-                let cov_in = identity_matrix(d_in);
+                // Input-side: measured activation covariance when the artifact
+                // has usable statistics for this ISQ slot, identity otherwise.
+                let calibrated_cov = calib
+                    .and_then(|art| art.by_isq_index(isq_index))
+                    .and_then(|stats| cov_in_from_stats(stats, d_in));
+                let calibrated = calibrated_cov.is_some();
+                let cov_in = calibrated_cov.unwrap_or_else(|| identity_matrix(d_in));
                 let r1 = rank.min(k);
                 let r2 = rank.min(d_out);
                 let r3 = rank.min(d_in);
@@ -296,11 +431,17 @@ pub fn apply_td_moe_to_model(
                 let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 info!(
                     "Arc TD-MoE: [{n}] compressed expert stack [{k},{d_out},{d_in}] \
-                     -> rank [{r1},{r2},{r3}] in {:.1}s",
+                     -> rank [{r1},{r2},{r3}] ({}) in {:.1}s",
+                    if calibrated {
+                        "calibrated Σ_in"
+                    } else {
+                        "identity Σ_in"
+                    },
                     layer_t0.elapsed().as_secs_f32()
                 );
                 LayerStat {
                     compressed: true,
+                    calibrated,
                     orig: orig_elems,
                     comp: stored_elems,
                     err,
@@ -311,7 +452,15 @@ pub fn apply_td_moe_to_model(
     });
 
     let compressed_layers = stats.iter().filter(|s| s.compressed).count();
+    let calibrated_layers = stats.iter().filter(|s| s.calibrated).count();
     let skipped_layers = stats.len() - compressed_layers;
+    if calib.is_some() && compressed_layers > 0 && calibrated_layers == 0 {
+        warn!(
+            "Arc TD-MoE: a calibration artifact was supplied but no expert stack matched a \
+             layer with usable statistics — whitening ran against the identity. Check that the \
+             artifact was collected for this model with `--isq-organization moqe`."
+        );
+    }
     let total_orig_elems: u64 = stats.iter().map(|s| s.orig).sum();
     let total_compressed_elems: u64 = stats.iter().map(|s| s.comp).sum();
     let total_recon_err_l2: f64 = stats.iter().map(|s| s.err).sum();
@@ -339,7 +488,7 @@ pub fn apply_td_moe_to_model(
 
     info!(
         "Arc TD-MoE: compressed {compressed_layers} expert stacks \
-         (skipped {skipped_layers}), \
+         ({calibrated_layers} with calibrated Σ_in, skipped {skipped_layers}), \
          storage ratio {ratio:.2}x ({total_orig_elems} -> {total_compressed_elems} elems), \
          rel L2 reconstruction err {rel_err:.4}"
     );
@@ -787,5 +936,203 @@ mod tests {
         for x in &v {
             assert!(x.is_finite(), "non-finite output {x}");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Calibrated whitening (the flag-gated non-identity covariance path)
+    // -----------------------------------------------------------------
+
+    fn calib_meta() -> mistralrs_quant::CalibrationMeta {
+        mistralrs_quant::CalibrationMeta {
+            model_id: "test/moe".to_string(),
+            model_sha: None,
+            arch: None,
+            isq_organization: "moqe".to_string(),
+            calibration_file: None,
+            samples: 1,
+            seq_len: 1024,
+            total_tokens: 1024,
+            model_dtype: "F32".to_string(),
+            storage_dtype: "F64".to_string(),
+            collector_version: mistralrs_quant::CALIB_COLLECTOR_VERSION,
+            producer: "test".to_string(),
+            created_unix: 0,
+            options: mistralrs_quant::CalibOptions::default(),
+            isq_layer_count: 1,
+        }
+    }
+
+    /// Single-layer artifact whose `diag(XᵀX)` is `diag` (raw sums over
+    /// `tokens` rows), keyed to ISQ index 0.
+    fn artifact_with_diag(diag: Vec<f64>, tokens: u64) -> CalibrationArtifact {
+        let d_in = diag.len();
+        let layer = LayerCalibStats::from_data(
+            0,
+            "0".to_string(),
+            Some("experts.0.down_proj.weight".to_string()),
+            Some(0),
+            mistralrs_quant::CalibLayerData {
+                in_features: d_in,
+                tokens,
+                calls: 1,
+                diag,
+                gram: None,
+                experts: Vec::new(),
+            },
+        );
+        CalibrationArtifact::new(calib_meta(), vec![layer])
+    }
+
+    fn compress_and_dump(
+        weight: &Tensor,
+        rank: usize,
+        calib: Option<&CalibrationArtifact>,
+    ) -> Vec<f32> {
+        let mut model = build_fake_model(weight.clone());
+        apply_td_moe_to_model_with_calib(&mut model, rank, 16, calib).expect("apply succeeded");
+        model
+            .layer
+            .dequantize_w()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    }
+
+    /// THE FLAG-GATED PATH: a non-uniform calibrated covariance must actually
+    /// reach the whitening math, i.e. change the decomposition result. Run at a
+    /// reduced rank so the decomposition is genuinely lossy and Σ_in matters.
+    #[test]
+    fn calibrated_covariance_changes_the_whitening_result() {
+        let (k, d_out, d_in, rank) = (4usize, 16usize, 16usize, 4usize);
+        let weight = random_expert_stack(k, d_out, d_in);
+
+        let identity_out = compress_and_dump(&weight, rank, None);
+
+        // Strongly non-uniform channel importance.
+        let diag: Vec<f64> = (0..d_in).map(|i| 1.0 + 100.0 * i as f64).collect();
+        let art = artifact_with_diag(diag, 1000);
+        let calibrated_out = compress_and_dump(&weight, rank, Some(&art));
+
+        assert_eq!(identity_out.len(), calibrated_out.len());
+        for x in &calibrated_out {
+            assert!(x.is_finite(), "non-finite calibrated weight {x}");
+        }
+        let max_delta = identity_out
+            .iter()
+            .zip(&calibrated_out)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            max_delta > 1e-4,
+            "calibrated covariance did not reach the whitening math \
+             (max |Δ| = {max_delta}); the --calib path is a no-op"
+        );
+    }
+
+    /// Guard on the normalisation: a *uniform* calibrated diagonal is
+    /// mathematically the identity and must reproduce the identity result.
+    /// Together with the test above this proves the covariance is both used
+    /// and used correctly, rather than the outputs differing for some
+    /// unrelated reason.
+    #[test]
+    fn uniform_calibrated_covariance_reproduces_the_identity_path() {
+        let (k, d_out, d_in, rank) = (4usize, 12usize, 12usize, 4usize);
+        let weight = random_expert_stack(k, d_out, d_in);
+
+        let identity_out = compress_and_dump(&weight, rank, None);
+        // Uniform diag with an arbitrary scale: unit-mean normalisation must
+        // collapse it back to I.
+        let art = artifact_with_diag(vec![37.5; d_in], 250);
+        let uniform_out = compress_and_dump(&weight, rank, Some(&art));
+
+        for (i, (a, b)) in identity_out.iter().zip(&uniform_out).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "elem {i}: uniform covariance diverged from identity ({a} vs {b})"
+            );
+        }
+    }
+
+    /// Default path is unchanged: no artifact => identity covariance, matching
+    /// the legacy `apply_td_moe_to_model` entry point exactly.
+    #[test]
+    fn default_path_without_calibration_is_unchanged() {
+        let (k, d_out, d_in, rank) = (4usize, 12usize, 12usize, 4usize);
+        let weight = random_expert_stack(k, d_out, d_in);
+
+        let mut legacy_model = build_fake_model(weight.clone());
+        apply_td_moe_to_model(&mut legacy_model, rank, 16).unwrap();
+        let legacy: Vec<f32> = legacy_model
+            .layer
+            .dequantize_w()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        let explicit_none = compress_and_dump(&weight, rank, None);
+        assert_eq!(legacy, explicit_none);
+    }
+
+    /// An artifact with no usable statistics for the layer must fall back to
+    /// identity rather than whitening against an all-zero covariance.
+    #[test]
+    fn unusable_statistics_fall_back_to_identity() {
+        let (k, d_out, d_in, rank) = (4usize, 12usize, 12usize, 4usize);
+        let weight = random_expert_stack(k, d_out, d_in);
+        let identity_out = compress_and_dump(&weight, rank, None);
+
+        // Layer present in the inventory but never armed.
+        let unsupported = CalibrationArtifact::new(
+            calib_meta(),
+            vec![LayerCalibStats::unsupported(
+                0,
+                "0".to_string(),
+                None,
+                Some(0),
+            )],
+        );
+        assert_eq!(
+            compress_and_dump(&weight, rank, Some(&unsupported)),
+            identity_out
+        );
+
+        // Layer armed but the sweep routed no tokens through it.
+        let zero_tokens = artifact_with_diag(vec![0.0; d_in], 0);
+        assert_eq!(
+            compress_and_dump(&weight, rank, Some(&zero_tokens)),
+            identity_out
+        );
+
+        // Layer whose statistics are for a different width.
+        let wrong_width = artifact_with_diag(vec![1.0; d_in + 3], 100);
+        assert_eq!(
+            compress_and_dump(&weight, rank, Some(&wrong_width)),
+            identity_out
+        );
+    }
+
+    /// Statistics are looked up by ISQ index, so an artifact keyed to a
+    /// different slot must not be applied to this layer.
+    #[test]
+    fn statistics_are_keyed_by_isq_index() {
+        let (k, d_out, d_in, rank) = (4usize, 12usize, 12usize, 4usize);
+        let weight = random_expert_stack(k, d_out, d_in);
+        let identity_out = compress_and_dump(&weight, rank, None);
+
+        let diag: Vec<f64> = (0..d_in).map(|i| 1.0 + 100.0 * i as f64).collect();
+        let mut art = artifact_with_diag(diag, 1000);
+        // Re-key the only layer to ISQ slot 7; the model's layer is slot 0.
+        art.layers[0].isq_index = 7;
+        art.layers[0].artifact_name = "7".to_string();
+
+        assert_eq!(
+            compress_and_dump(&weight, rank, Some(&art)),
+            identity_out,
+            "statistics from a different ISQ slot must not be applied"
+        );
     }
 }

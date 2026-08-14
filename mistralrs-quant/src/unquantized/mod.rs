@@ -9,6 +9,7 @@ use candle_core::{quantized::GgmlDType, DType, Device, DeviceLocation, Result, S
 use candle_nn::Linear;
 
 use crate::{
+    calibration::{CalibAccumulator, CalibLayerData, CalibOptions},
     cublaslt::{maybe_init_cublas_lt_wrapper, CUBLASLT_CONTROLLER},
     generate_isq, generate_isq_imatrix,
     hqq::{HqqAxis, HqqBits, HqqConfig, HqqLayer, ISQ_HQQ_DEFAULT_OPT_STEPS, ISQ_HQQ_GROUP_SIZE},
@@ -22,6 +23,9 @@ pub struct UnquantLinear {
     w: Tensor,
     b: Option<Tensor>,
     stats: Option<ImatrixLayerStats>,
+    /// Armed by [`QuantMethod::begin_calibration`] for a forward-only
+    /// calibration sweep. Independent of `stats` (the imatrix path).
+    calib: Option<CalibAccumulator>,
 }
 
 impl QuantMethod for UnquantLinear {
@@ -48,6 +52,7 @@ impl QuantMethod for UnquantLinear {
                 w: l.weight().clone(),
                 b: l.bias().cloned(),
                 stats: None,
+                calib: None,
             }),
         }
     }
@@ -74,6 +79,9 @@ impl QuantMethod for UnquantLinear {
 
         if let Some(stats) = &self.stats {
             stats.process(a)?;
+        }
+        if let Some(calib) = &self.calib {
+            calib.process(a)?;
         }
 
         if let Some(b) = self.b.as_ref() {
@@ -154,6 +162,12 @@ impl QuantMethod for UnquantLinear {
         let w = &self.w;
         let (_num_experts, out_features, _in_features) = w.dims3()?;
 
+        // Per-expert calibration needs the routing indices, which only this
+        // entry point sees — the dense `forward` hook cannot recover them.
+        if let Some(calib) = &self.calib {
+            calib.process_gather(a, indices)?;
+        }
+
         match a.dims() {
             // Metal path: 5D input (b_size, seq_len, 1, 1, hidden_dim)
             &[b_size, seq_len, 1, 1, hidden_dim] => {
@@ -225,6 +239,7 @@ impl QuantMethod for UnquantLinear {
             w: (&self.w + delta)?,
             b: self.b.clone(),
             stats: self.stats.clone(),
+            calib: self.calib.clone(),
         }))
     }
 
@@ -495,6 +510,25 @@ impl QuantMethod for UnquantLinear {
             candle_core::bail!("`{}` does not support tracking stats.", self.name())
         }
     }
+
+    fn begin_calibration(&mut self, opts: &CalibOptions) -> Result<()> {
+        // 2-D `[out, in]` linears and 3-D `[experts, out, in]` MoE stacks both
+        // carry the input width in the trailing dimension.
+        let dims = self.w.dims();
+        let in_features = *dims
+            .last()
+            .ok_or_else(|| candle_core::Error::Msg("UnquantLinear: scalar weight".to_string()))?;
+        let num_experts = if dims.len() == 3 { Some(dims[0]) } else { None };
+        self.calib = Some(CalibAccumulator::new(in_features, num_experts, *opts)?);
+        Ok(())
+    }
+
+    fn end_calibration(&self) -> Result<CalibLayerData> {
+        match &self.calib {
+            Some(calib) => calib.finish(),
+            None => candle_core::bail!("`{}` was not armed for calibration.", self.name()),
+        }
+    }
 }
 
 // Serialization structure:
@@ -580,7 +614,12 @@ impl QuantizedSerde for UnquantLinear {
             None
         };
 
-        Ok(Arc::new(Self { w, b, stats: None }))
+        Ok(Arc::new(Self {
+            w,
+            b,
+            stats: None,
+            calib: None,
+        }))
     }
     fn deserialize_ext_bias(
         data: Cow<[u8]>,
@@ -621,6 +660,7 @@ impl QuantizedSerde for UnquantLinear {
                 w,
                 b: None,
                 stats: None,
+                calib: None,
             }),
             b,
         ))

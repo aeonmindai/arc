@@ -16,10 +16,13 @@ use clap::{CommandFactory, Parser};
 use clap_complete::generate;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use args::{resolve_model_type, resolve_quantize_model_type, CacheCommand, Cli, Command};
+use args::{
+    resolve_calibrate_model_type, resolve_model_type, resolve_quantize_model_type, CacheCommand,
+    Cli, Command,
+};
 use commands::{
-    run_bench, run_cache_delete, run_cache_list, run_doctor, run_from_config, run_interactive,
-    run_login, run_quantize, run_server, run_tune,
+    run_bench, run_cache_delete, run_cache_list, run_calibrate, run_doctor, run_from_config,
+    run_interactive, run_login, run_quantize, run_server, run_tune,
 };
 
 #[tokio::main]
@@ -71,6 +74,14 @@ async fn main() -> Result<()> {
         } => {
             let model_type = resolve_quantize_model_type(model_type, default_quantize)?;
             run_quantize(model_type, cli.global).await?;
+        }
+
+        Command::Calibrate {
+            model_type,
+            default_calibrate,
+        } => {
+            let model_type = resolve_calibrate_model_type(model_type, default_calibrate)?;
+            run_calibrate(model_type, cli.global).await?;
         }
 
         Command::FromConfig { file } => {

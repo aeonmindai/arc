@@ -20,6 +20,7 @@ doc = false
 
 [dependencies]
 mistralrs-core = { workspace = true }
+mistralrs-quant = { workspace = true }
 mistralrs-server-core = { workspace = true }
 mistralrs = { workspace = true }
 arc-engine = { path = "../arc-engine" }

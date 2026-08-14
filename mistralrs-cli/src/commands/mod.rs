@@ -2,6 +2,7 @@
 
 mod bench;
 mod cache;
+mod calibrate;
 mod config;
 mod doctor;
 mod login;
@@ -12,6 +13,7 @@ mod tune;
 
 pub use bench::run_bench;
 pub use cache::{run_cache_delete, run_cache_list};
+pub use calibrate::run_calibrate;
 pub use config::run_from_config;
 pub use doctor::run_doctor;
 pub use login::run_login;

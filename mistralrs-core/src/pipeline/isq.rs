@@ -295,6 +295,21 @@ pub enum ImatrixDataSource<'a> {
     Collected,
 }
 
+/// Canonical artifact name for ISQ layer `i` of a model whose always-present
+/// (non-MTP) layer count is `main_len`.
+///
+/// This is the single source of truth for how an ISQ ordinal is named: the UQFF
+/// serializer below and the calibration artifact in
+/// [`crate::pipeline::calibration`] both go through it, so a calibration
+/// artifact's layer inventory matches the quantizer's layer set exactly.
+pub fn isq_artifact_tensor_name(i: usize, main_len: usize) -> String {
+    if i < main_len {
+        i.to_string()
+    } else {
+        format!("{UQFF_MTP_TENSOR_PREFIX}{}", i - main_len)
+    }
+}
+
 /// Source-checkpoint weights handed to [`IsqModel::load_from_artifacts`] so a
 /// model whose optional MTP decoder block is NOT covered by the UQFF artifact
 /// (baked without `--mtp-depth`) can load the block unquantized (BF16/FP8)
@@ -564,13 +579,7 @@ pub trait IsqModel {
             // Where the MTP draft path starts for FLOOR purposes — see
             // `mtp_isq_floor_len`. Always <= `main_len`.
             let mtp_floor_start = total_tensors.saturating_sub(mtp_floor_tail);
-            let artifact_tensor_name = move |i: usize| {
-                if i < main_len {
-                    i.to_string()
-                } else {
-                    format!("{UQFF_MTP_TENSOR_PREFIX}{}", i - main_len)
-                }
-            };
+            let artifact_tensor_name = move |i: usize| isq_artifact_tensor_name(i, main_len);
 
             if apply_quantization {
                 let imatrix_to_weight: Vec<Option<Vec<f32>>> =

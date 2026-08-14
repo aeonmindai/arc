@@ -18,6 +18,7 @@ mod metal_kernels;
 mod afq;
 mod bitsandbytes;
 mod blockwise_fp8;
+pub mod calibration;
 pub mod cublaslt;
 pub mod distributed;
 mod dummy;
@@ -53,6 +54,11 @@ pub use safetensors::{attach_rename_rules, Shard, ShardedSafeTensors, ShardedVar
 
 pub use afq::{AfqBits, AfqGroupSize, AfqLayer};
 pub use bitsandbytes::{BnbLinear, BnbQuantParams, BnbQuantType};
+pub use calibration::{
+    CalibAccumulator, CalibLayerData, CalibOptions, CalibrationArtifact, CalibrationMeta,
+    ExpertCalibData, ExpertStatus, GramBlocks, GramLayout, GramMode, LayerCalibStats,
+    CALIB_COLLECTOR_VERSION, CALIB_EXTENSION, CALIB_FORMAT_VERSION,
+};
 pub use blockwise_fp8::{
     blockwise_fp8_moe, fp8_blockwise_dequantize, fp8_blockwise_quantize,
     mx_int4_blockwise_dequantize, BlockwiseFP8Linear,
@@ -1266,6 +1272,23 @@ pub trait QuantMethod: Send + Sync + Debug + QuantizedSerde {
     /// End tracking stats into an ImatrixLayerStats. Returns the computed imatrix.
     fn end_track_stats(&self) -> Result<Tensor> {
         candle_core::bail!("`{}` does not support tracking stats.", self.name())
+    }
+
+    /// Arm a richer calibration accumulator on this layer for a forward-only
+    /// sweep (see [`crate::calibration`]). Independent of the imatrix path:
+    /// this collects raw `diag(XᵀX)` plus optional gram blocks and per-expert
+    /// statistics, with explicit token counts.
+    ///
+    /// The default declines; callers must treat that as "layer emits no
+    /// statistics", not as a fatal error, because layers already quantized on
+    /// disk (FP8, GPTQ, …) can never track activations.
+    fn begin_calibration(&mut self, _opts: &crate::calibration::CalibOptions) -> Result<()> {
+        candle_core::bail!("`{}` does not support calibration stats.", self.name())
+    }
+
+    /// Finish the calibration sweep for this layer and yield its statistics.
+    fn end_calibration(&self) -> Result<crate::calibration::CalibLayerData> {
+        candle_core::bail!("`{}` does not support calibration stats.", self.name())
     }
 
     fn is_distributed(&self) -> Option<DistributedKind> {
