@@ -1,8 +1,18 @@
 //! Autotune dispatch for the qtip2b bitshift-trellis fused decode+GEMV.
 //!
-//! `kernels/qtip/qtip_bitshift_tune.cu` compile-time instantiates the GEMV
-//! over the tuning axes (warps/block, rows/warp, ILP streams/thread, vector
-//! load width, `__launch_bounds__` min-blocks, smem staging, prefetch depth).
+//! Two compile-time instantiated variant grids sit behind one dispatch entry:
+//!
+//! * **gen 1** — `kernels/qtip/qtip_bitshift_tune.cu`, ids `0..43`: warps per
+//!   block, rows per warp, ILP streams per thread (out of global memory),
+//!   vector load width, `__launch_bounds__` min-blocks, smem staging,
+//!   prefetch depth.
+//! * **gen 2** — `kernels/qtip/qtip_bitshift_tune2.cu`, ids `44..`: a
+//!   cp.async double/triple-buffered staged pipeline (the Marlin pattern the
+//!   trellis grouped GEMM already runs), with ILP streams read from STAGED
+//!   smem, split-K across warp groups (blocks per row x1/x2/x4, reduced in
+//!   fixed order so it stays bit-exact run to run), wider staged loads, and
+//!   an optional dedicated cp.async producer warp.
+//!
 //! This module decides WHICH variant a production launch uses, in priority
 //! order:
 //!
@@ -173,9 +183,14 @@ pub fn gemv_variant_for_shape(n_rows: usize, k_in: usize) -> Option<u32> {
     lookup(QTIP2B_GEMV_BAKED_TABLE, n_rows, k_in)
 }
 
-/// The tuning-axis values of one compiled variant.
+/// The tuning-axis values of one compiled variant. `gen` selects which axes
+/// are meaningful — see the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GemvVariantDesc {
+    /// Variant generation: 1 = global-load grid, 2 = cp.async staged grid.
+    pub generation: u8,
+    /// gen 1: warps per block. gen 2: CONSUMER warps per block (the optional
+    /// producer warp is counted by `producer_warps`).
     pub warps: usize,
     pub rows_per_warp: usize,
     pub ilp: usize,
@@ -183,21 +198,48 @@ pub struct GemvVariantDesc {
     pub min_blocks: usize,
     pub stage: bool,
     pub prefetch: bool,
+    /// gen 2: K-split factor (consumer warp groups per row); 1 for gen 1.
+    pub ksplit: usize,
+    /// gen 2: cp.async pipeline depth (2 = double, 3 = triple); 0 for gen 1.
+    pub stages: usize,
+    /// gen 2: warps dedicated to issuing cp.async (0 = every warp stages).
+    pub producer_warps: usize,
 }
 
 impl GemvVariantDesc {
-    /// Compact label, e.g. `w8_r2_i1_v2_mb1_s1_p0`.
+    /// Staged bytes per row per K-tile (gen 2 only): one warp pass over the
+    /// variant's ILP streams covers exactly one tile.
+    pub fn tile_bytes(&self) -> usize {
+        32 * self.wbytes * self.ilp
+    }
+
+    /// Compact label, e.g. `w8_r2_i1_v2_mb1_s1_p0` (gen 1) or
+    /// `g2_w8_r2_i2_v4_k2_st3_mb1_pw1` (gen 2).
     pub fn label(&self) -> String {
-        format!(
-            "w{}_r{}_i{}_v{}_mb{}_s{}_p{}",
-            self.warps,
-            self.rows_per_warp,
-            self.ilp,
-            self.wbytes,
-            self.min_blocks,
-            self.stage as u8,
-            self.prefetch as u8
-        )
+        if self.generation >= 2 {
+            format!(
+                "g2_w{}_r{}_i{}_v{}_k{}_st{}_mb{}_pw{}",
+                self.warps,
+                self.rows_per_warp,
+                self.ilp,
+                self.wbytes,
+                self.ksplit,
+                self.stages,
+                self.min_blocks,
+                self.producer_warps
+            )
+        } else {
+            format!(
+                "w{}_r{}_i{}_v{}_mb{}_s{}_p{}",
+                self.warps,
+                self.rows_per_warp,
+                self.ilp,
+                self.wbytes,
+                self.min_blocks,
+                self.stage as u8,
+                self.prefetch as u8
+            )
+        }
     }
 }
 
@@ -223,12 +265,25 @@ pub fn gemv_variant_desc(idx: usize) -> Option<GemvVariantDesc> {
         return None;
     }
     let (mut w, mut r, mut i, mut v, mut mb, mut s, mut p) = (0i32, 0, 0, 0, 0, 0, 0);
+    let (mut generation, mut ks, mut st, mut pw) = (0i32, 0, 0, 0);
     let rc = unsafe {
         super::ffi::qtip2b_gemv_variant_info(
-            idx as i32, &mut w, &mut r, &mut i, &mut v, &mut mb, &mut s, &mut p,
+            idx as i32,
+            &mut w,
+            &mut r,
+            &mut i,
+            &mut v,
+            &mut mb,
+            &mut s,
+            &mut p,
+            &mut generation,
+            &mut ks,
+            &mut st,
+            &mut pw,
         )
     };
     (rc == 0).then(|| GemvVariantDesc {
+        generation: generation as u8,
         warps: w as usize,
         rows_per_warp: r as usize,
         ilp: i as usize,
@@ -236,6 +291,9 @@ pub fn gemv_variant_desc(idx: usize) -> Option<GemvVariantDesc> {
         min_blocks: mb as usize,
         stage: s != 0,
         prefetch: p != 0,
+        ksplit: ks as usize,
+        stages: st as usize,
+        producer_warps: pw as usize,
     })
 }
 
@@ -255,10 +313,23 @@ pub fn gemv_variant_applicable(variant: u32, _n_rows: usize, k_in: usize) -> boo
     let Some(d) = gemv_variant_desc(variant as usize) else {
         return false;
     };
+    variant_applicable_desc(&d, k_in)
+}
+
+/// Shape rule behind [`gemv_variant_applicable`], split out so it is unit
+/// testable without a GPU. Mirrors the launchers in `qtip_bitshift_tune.cu`
+/// (gen 1) and `qtip_bitshift_tune2.cu` (gen 2).
+fn variant_applicable_desc(d: &GemvVariantDesc, k_in: usize) -> bool {
     if !k_in.is_multiple_of(4) {
         return false;
     }
     let packed_per_row = k_in / 4;
+    if d.generation >= 2 {
+        // gen 2: whole K-tiles per K-group. Shared memory is static and
+        // shape-independent (compile-time asserted <= 48 KiB), so tiling is
+        // the only shape constraint.
+        return packed_per_row.is_multiple_of(d.ksplit * d.tile_bytes());
+    }
     if !packed_per_row.is_multiple_of(d.wbytes) {
         return false;
     }
@@ -389,9 +460,9 @@ mod tests {
         assert_eq!(gemv_variant_for_shape(2048, 4096), Some(21));
     }
 
-    #[test]
-    fn variant_desc_label_format() {
-        let d = GemvVariantDesc {
+    fn gen1_desc() -> GemvVariantDesc {
+        GemvVariantDesc {
+            generation: 1,
             warps: 8,
             rows_per_warp: 2,
             ilp: 4,
@@ -399,8 +470,74 @@ mod tests {
             min_blocks: 2,
             stage: true,
             prefetch: false,
+            ksplit: 1,
+            stages: 0,
+            producer_warps: 0,
+        }
+    }
+
+    #[test]
+    fn variant_desc_label_format() {
+        assert_eq!(gen1_desc().label(), "w8_r2_i4_v4_mb2_s1_p0");
+
+        // gen 2 gets its own label shape: the pipeline/split-K axes replace
+        // the gen-1 stage/prefetch flags.
+        let g2 = GemvVariantDesc {
+            generation: 2,
+            warps: 8,
+            rows_per_warp: 2,
+            ilp: 2,
+            wbytes: 4,
+            min_blocks: 1,
+            stage: true,
+            prefetch: false,
+            ksplit: 2,
+            stages: 3,
+            producer_warps: 1,
         };
-        assert_eq!(d.label(), "w8_r2_i4_v4_mb2_s1_p0");
+        assert_eq!(g2.label(), "g2_w8_r2_i2_v4_k2_st3_mb1_pw1");
+        // One warp pass over ILP streams = one staged tile.
+        assert_eq!(g2.tile_bytes(), 32 * 4 * 2);
+        assert_eq!(gen1_desc().tile_bytes(), 32 * 4 * 4);
+    }
+
+    /// Shape rule parity with the CUDA launchers, checked without a GPU.
+    #[test]
+    fn variant_applicability_shape_rules() {
+        // gen 1: needs packed_per_row % wbytes == 0 and, when staging, the
+        // whole block's rows must fit 48 KiB of smem.
+        let mut d = gen1_desc();
+        d.wbytes = 8;
+        assert!(variant_applicable_desc(&d, 4096)); // ppr 1024
+        assert!(!variant_applicable_desc(&d, 100)); // ppr 25, odd
+        assert!(!variant_applicable_desc(&d, 4095)); // k not a multiple of 4
+        d.warps = 16;
+        d.rows_per_warp = 4;
+        // 64 rows x 4096 staged bytes = 256 KiB > 48 KiB.
+        assert!(!variant_applicable_desc(&d, 16384));
+
+        // gen 2: whole K-tiles per K-group; smem is shape-independent.
+        let g2 = GemvVariantDesc {
+            generation: 2,
+            warps: 8,
+            rows_per_warp: 2,
+            ilp: 2,
+            wbytes: 4,
+            min_blocks: 1,
+            stage: true,
+            prefetch: false,
+            ksplit: 2,
+            stages: 3,
+            producer_warps: 0,
+        };
+        // tile = 32*4*2 = 256 B; ksplit 2 => 512 B per (K-group, tile).
+        assert_eq!(g2.ksplit * g2.tile_bytes(), 512);
+        assert!(variant_applicable_desc(&g2, 4096)); // ppr 1024 = 2 x 512
+        assert!(variant_applicable_desc(&g2, 2048)); // ppr 512
+        assert!(!variant_applicable_desc(&g2, 1024)); // ppr 256 < one K-group tile
+        assert!(!variant_applicable_desc(&g2, 100));
+        // Row count never enters the rule (rows are padded per block).
+        assert!(variant_applicable_desc(&g2, 4096));
     }
 
     #[test]

@@ -314,16 +314,23 @@ extern "C" {
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
-    // ----- Autotuned GEMV variants (kernels/qtip/qtip_bitshift_tune.cu) -----
+    // ----- Autotuned GEMV variants -----------------------------------------
     //
-    // Compile-time instantiated sweep grid over {warps/block, rows/warp,
-    // ILP streams/thread, vector load width, launch_bounds min-blocks, smem
-    // staging, prefetch depth}. The tuned launchers return 0 on launch and
-    // -1 when the variant is not applicable to the shape (alignment / smem
-    // capacity) — the caller must then fall back to `launch_qtip2b_gemv_*`,
-    // whose correctness contract the variants share.
+    // Two compile-time instantiated grids behind one dispatch entry:
+    //   gen 1 (`qtip_bitshift_tune.cu`, ids 0..43): {warps/block, rows/warp,
+    //     ILP streams/thread, vector load width, launch_bounds min-blocks,
+    //     smem staging, prefetch depth}.
+    //   gen 2 (`qtip_bitshift_tune2.cu`, ids 44..): cp.async double/triple-
+    //     buffered staged pipeline over {consumer warps, rows/warp, ILP
+    //     streams from smem, staged load width, split-K, pipeline stages,
+    //     producer warps, min-blocks}.
+    // The tuned launchers return 0 on launch and -1 when the variant is not
+    // applicable to the shape (alignment / smem capacity) — the caller must
+    // then fall back to `launch_qtip2b_gemv_*`, whose correctness contract
+    // the variants share.
     pub(crate) fn qtip2b_gemv_num_variants() -> i32;
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn qtip2b_gemv_variant_info(
         idx: i32,
         warps: *mut i32,
@@ -333,6 +340,10 @@ extern "C" {
         min_blocks: *mut i32,
         stage: *mut i32,
         prefetch: *mut i32,
+        generation: *mut i32,
+        ksplit: *mut i32,
+        stages: *mut i32,
+        producer_warps: *mut i32,
     ) -> i32;
 
     pub(crate) fn launch_qtip2b_gemv_tuned_bf16(

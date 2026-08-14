@@ -63,6 +63,54 @@ __device__ __forceinline__ uint32_t q2b_state_from_window(uint32_t win16) {
     return ((r & 0x5555u) << 1) | ((r >> 1) & 0x5555u);
 }
 
+// ---------------------------------------------------------------------------
+// cp.async helpers (sm_80+). `valid == false` uses the src-size-0 form, which
+// zero-fills the destination without touching the source address — that is
+// what makes out-of-range rows / past-the-end tiles free of tail guards.
+//
+// Shared by the grouped GEMM (qtip_grouped_gemm.cu) and the gen-2 GEMV
+// pipeline (qtip_bitshift_tune2.cu). Below sm_80 the bodies degrade to plain
+// synchronous copies so the TUs still compile on old arches (the kernels
+// using them are unreachable there — `has_qtip_kernels` is off below SM80).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void q2b_cp_async_16(void* smem_dst, const void* gmem_src, bool valid) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    const uint32_t d = (uint32_t)__cvta_generic_to_shared(smem_dst);
+    const int src_bytes = valid ? 16 : 0;
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+                 :: "r"(d), "l"(gmem_src), "r"(src_bytes));
+#else
+    int4* d = reinterpret_cast<int4*>(smem_dst);
+    *d = valid ? *reinterpret_cast<const int4*>(gmem_src) : make_int4(0, 0, 0, 0);
+#endif
+}
+
+__device__ __forceinline__ void q2b_cp_async_4(void* smem_dst, const void* gmem_src, bool valid) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    const uint32_t d = (uint32_t)__cvta_generic_to_shared(smem_dst);
+    const int src_bytes = valid ? 4 : 0;
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n"
+                 :: "r"(d), "l"(gmem_src), "r"(src_bytes));
+#else
+    uint32_t* d = reinterpret_cast<uint32_t*>(smem_dst);
+    *d = valid ? *reinterpret_cast<const uint32_t*>(gmem_src) : 0u;
+#endif
+}
+
+__device__ __forceinline__ void q2b_cp_commit() {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+
+// Wait until at most N committed cp.async groups are still outstanding.
+template <int N>
+__device__ __forceinline__ void q2b_cp_wait() {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+#endif
+}
+
 template <typename T>
 __device__ __forceinline__ T q2b_from_f32(float v);
 template <>
