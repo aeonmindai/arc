@@ -3,7 +3,9 @@
 Arc's wedge is datacenter capacity: the same GPU fleet serving a multiple of
 its original throughput, cheaper per token. This page states that case with
 every claim explicitly tagged **[measured]** (a saved artifact exists — see
-[BENCHMARKS.md](BENCHMARKS.md)) or **[projected]** (arithmetic from measured
+[BENCHMARKS.md](BENCHMARKS.md)), **[measured-kernel]** (measured on hardware
+at the kernel level — a microbenchmark of the bottleneck path, not an
+end-to-end serving run), or **[projected]** (arithmetic from measured
 quantities plus vendor specs, not yet run end-to-end).
 
 ## 1. Replica granularity: 8 independent replicas per node, not 1×TP8
@@ -36,14 +38,26 @@ pool — and the pool size is what compression shrinks.
   node's aggregate is ~4.5K tok/s **[projected]**. The ~8× node-level gain
   comes from replica granularity — same silicon, same bandwidth, eight
   independent batches — which compression is what makes possible.
-- Reality check **[measured]**: today's gather-GEMV kernels run 153–192 GB/s
-  (3–4% of H200 peak) with 13–19 µs fixed overhead per call, and single-stream
-  decode is 13.99 tok/s (×2.6 over the 5.4 baseline from the kernel-fix PRs;
-  GEMV tuning in progress). The floor math above is the destination, not the
-  present. The keystone kernel (trellis grouped-GEMM for batched 2-bit MoE)
-  passed its first hardware parity run (5/5, session 3); its batched
-  throughput curve is not yet measured. Until it is, every throughput figure
-  in this section stays tagged projected.
+- **First hardware evidence [measured-kernel]** (session 4): the trellis
+  grouped-GEMM batch curve on one H200 is **flat at ~63.5 ms/step from B=16
+  to B=64** — the expert-read amortization mechanism above, demonstrated on
+  silicon. At B=64 that is **~1,006 aggregate tok/s** on the expert path,
+  which at the $4.92/hr rental rate is **≈$1.36/Mtok** — kernel-level floor
+  economics. This is a microbenchmark of the batched 2-bit MoE expert path
+  (40-layer extrapolation); it excludes attention, routing, sampling, and
+  engine overhead, so it is an upper bound on serving throughput at today's
+  kernel efficiency, not a serving number. The end-to-end batched-serving
+  measurement is planned for session 5.
+- Reality check **[measured]**: single-stream decode is 14.58 tok/s
+  (no-cudnn build; progression 5.4 → 13.99 → 14.58 across the kernel-fix
+  PRs). The session-4 autotune sweep lifted the gather-GEMV kernels from
+  153–192 GB/s (3–4% of H200 peak) to ~36 µs / 450–467 GB/s best-variant
+  (~9.5% of peak, 2.3× — now the shipped dispatch defaults, PR #20), but
+  the tuned dispatch is not yet reflected in the 14.58 end-to-end number
+  (see BENCHMARKS.md). The floor math above is the destination, not the
+  present: measured kernel-level throughput at B=64 is ~1,006 tok/s against
+  the ~4.5K tok/s spec-bandwidth floor (~22% of it), and serving-level
+  throughput will be lower still until the engine-level batched run exists.
 
 ## 3. KV tenancy at 3.5-bit
 
@@ -67,11 +81,15 @@ Once weights fit, concurrent capacity is bounded by KV cache per sequence.
 | GSM8K 87.0% (n=100, 0-shot greedy, 2048-cap) at 2-bit experts | **Measured** |
 | TurboQuant KV 4.27× context (Qwen3-32B, 1×H100) | **Measured** |
 | qtip2b bitshift-trellis CUDA parity (20/20 on H200) | **Measured** |
-| Trellis grouped-GEMM first hardware parity run (5/5 on H200) | **Measured** |
-| Current kernels: 3–4% of peak HBM BW; 13.99 tok/s at b=1 (×2.6, tuning in progress) | **Measured** |
+| Trellis grouped-GEMM hardware parity (5/5 on H200) | **Measured** |
+| b=1 decode 14.58 tok/s (no-cudnn build; 5.4 → 13.99 → 14.58) | **Measured** |
+| GEMV autotune: ~36 µs / 450–467 GB/s best-variant (~9.5% peak, 2.3×), shipped as dispatch defaults | **Measured-kernel** (end-to-end effect pending) |
+| Grouped-GEMM batch curve flat ~63.5 ms/step B=16→64 ⇒ ~1,006 aggregate tok/s ⇒ ≈$1.36/Mtok at $4.92/hr | **Measured-kernel** (expert path only; serving run pending) |
+| End-to-end batched serving tok/s and $/Mtok on one H200 | Pending (planned session 5) |
 | 8 replicas per 8×H200 node | Projected (building block measured) |
-| ~4.5K tok/s/GPU at saturated batch; ~8× node aggregate vs 1×TP8 | Projected (floor arithmetic) |
+| ~4.5K tok/s/GPU at saturated batch; ~8× node aggregate vs 1×TP8 | Projected (floor arithmetic; kernel-level evidence at ~22% of the floor) |
 | ~4× KV tenancy on V4-class MLA models | Projected (MLA path not done) |
 
-Cost of every measured number above: ≈ $108 of rented H200 time. Protocols,
-artifacts, and limitations: [BENCHMARKS.md](BENCHMARKS.md).
+Cost of every measured number above: ≈ $123 of rented H200 time across four
+sessions. Protocols, artifacts, and limitations:
+[BENCHMARKS.md](BENCHMARKS.md).
