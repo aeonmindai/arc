@@ -193,7 +193,7 @@ fn variant_name(v: u32) -> String {
 }
 
 /// Variant ids to sweep, honoring `ARC_TUNE_VARIANTS` (see the header).
-/// Unparseable entries are ignored; an empty selection falls back to the
+/// Entries that do not parse are ignored; an empty selection falls back to the
 /// full grid so a typo cannot silently produce a one-row sweep.
 fn selected_variants(n_variants: usize) -> Vec<u32> {
     let all: Vec<u32> = (0..n_variants as u32).collect();
