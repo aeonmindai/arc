@@ -1169,27 +1169,57 @@ pub(crate) fn fused_gemv_2b_cuda(
         scales_layout.start_offset(),
     );
 
+    // Autotune dispatch: try the per-shape winning variant first (baked
+    // table / ARC_QTIP_TUNE_TABLE / forced); a non-zero return means the
+    // variant is inapplicable to this shape and we fall back to the legacy
+    // fixed-config kernel, which shares the correctness contract.
+    let tune_variant = super::tune::gemv_variant_for_shape(n_rows, in_features)
+        .filter(|&v| v != super::tune::QTIP2B_GEMV_VARIANT_LEGACY);
+
     macro_rules! gemv_dtype {
-        ($T:ty, $launch:expr) => {{
+        ($T:ty, $launch:expr, $launch_tuned:expr) => {{
             let (x_ptr, _x_guard) =
                 slice_ptr(x_storage.as_cuda_slice::<$T>()?, x_layout.start_offset());
             let out_buf = dev.alloc_zeros::<$T>(n_rows)?;
             let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
-            unsafe {
-                $launch(
-                    blocks_ptr as *const _,
-                    scales_ptr as *const _,
-                    x_ptr as *const _,
-                    std::ptr::null::<u32>(), // 2-D path: no gather indices
-                    out_ptr as *mut _,
-                    n_rows as i32,
-                    packed_per_row as i32,
-                    num_symbols as i32,
-                    1i32, // n_pairs
-                    1i32, // num_experts
-                    mcg_mult,
-                    dev.cuda_stream().cu_stream(),
-                );
+            let mut launched = false;
+            if let Some(v) = tune_variant {
+                let rc = unsafe {
+                    $launch_tuned(
+                        v as i32,
+                        blocks_ptr as *const _,
+                        scales_ptr as *const _,
+                        x_ptr as *const _,
+                        std::ptr::null::<u32>(), // 2-D path: no gather indices
+                        out_ptr as *mut _,
+                        n_rows as i32,
+                        packed_per_row as i32,
+                        num_symbols as i32,
+                        1i32, // n_pairs
+                        1i32, // num_experts
+                        mcg_mult,
+                        dev.cuda_stream().cu_stream(),
+                    )
+                };
+                launched = rc == 0;
+            }
+            if !launched {
+                unsafe {
+                    $launch(
+                        blocks_ptr as *const _,
+                        scales_ptr as *const _,
+                        x_ptr as *const _,
+                        std::ptr::null::<u32>(), // 2-D path: no gather indices
+                        out_ptr as *mut _,
+                        n_rows as i32,
+                        packed_per_row as i32,
+                        num_symbols as i32,
+                        1i32, // n_pairs
+                        1i32, // num_experts
+                        mcg_mult,
+                        dev.cuda_stream().cu_stream(),
+                    );
+                }
             }
             drop(out_guard);
             CudaStorage::wrap_cuda_slice(out_buf, dev.clone())
@@ -1197,9 +1227,21 @@ pub(crate) fn fused_gemv_2b_cuda(
     }
 
     let res = match x_2d.dtype() {
-        DType::BF16 => gemv_dtype!(bf16, ffi::launch_qtip2b_gemv_bf16),
-        DType::F16 => gemv_dtype!(f16, ffi::launch_qtip2b_gemv_f16),
-        DType::F32 => gemv_dtype!(f32, ffi::launch_qtip2b_gemv_f32),
+        DType::BF16 => gemv_dtype!(
+            bf16,
+            ffi::launch_qtip2b_gemv_bf16,
+            ffi::launch_qtip2b_gemv_tuned_bf16
+        ),
+        DType::F16 => gemv_dtype!(
+            f16,
+            ffi::launch_qtip2b_gemv_f16,
+            ffi::launch_qtip2b_gemv_tuned_f16
+        ),
+        DType::F32 => gemv_dtype!(
+            f32,
+            ffi::launch_qtip2b_gemv_f32,
+            ffi::launch_qtip2b_gemv_tuned_f32
+        ),
         other => candle_core::bail!("qtip2b fused gemv CUDA: unsupported x dtype {other:?}"),
     };
 
@@ -1295,27 +1337,54 @@ pub(crate) fn gather_gemv_2b_cuda(
 
     let n_out = n_pairs * n_rows;
 
+    // Autotune dispatch — same policy as `fused_gemv_2b_cuda` above.
+    let tune_variant = super::tune::gemv_variant_for_shape(n_rows, in_features)
+        .filter(|&v| v != super::tune::QTIP2B_GEMV_VARIANT_LEGACY);
+
     macro_rules! gather_dtype {
-        ($T:ty, $launch:expr) => {{
+        ($T:ty, $launch:expr, $launch_tuned:expr) => {{
             let (x_ptr, _x_guard) =
                 slice_ptr(x_storage.as_cuda_slice::<$T>()?, x_layout.start_offset());
             let out_buf = dev.alloc_zeros::<$T>(n_out)?;
             let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
-            unsafe {
-                $launch(
-                    blocks_ptr as *const _,
-                    scales_ptr as *const _,
-                    x_ptr as *const _,
-                    idx_ptr as *const _,
-                    out_ptr as *mut _,
-                    n_rows as i32,
-                    packed_per_row as i32,
-                    num_symbols as i32,
-                    n_pairs as i32,
-                    num_experts as i32,
-                    mcg_mult,
-                    dev.cuda_stream().cu_stream(),
-                );
+            let mut launched = false;
+            if let Some(v) = tune_variant {
+                let rc = unsafe {
+                    $launch_tuned(
+                        v as i32,
+                        blocks_ptr as *const _,
+                        scales_ptr as *const _,
+                        x_ptr as *const _,
+                        idx_ptr as *const _,
+                        out_ptr as *mut _,
+                        n_rows as i32,
+                        packed_per_row as i32,
+                        num_symbols as i32,
+                        n_pairs as i32,
+                        num_experts as i32,
+                        mcg_mult,
+                        dev.cuda_stream().cu_stream(),
+                    )
+                };
+                launched = rc == 0;
+            }
+            if !launched {
+                unsafe {
+                    $launch(
+                        blocks_ptr as *const _,
+                        scales_ptr as *const _,
+                        x_ptr as *const _,
+                        idx_ptr as *const _,
+                        out_ptr as *mut _,
+                        n_rows as i32,
+                        packed_per_row as i32,
+                        num_symbols as i32,
+                        n_pairs as i32,
+                        num_experts as i32,
+                        mcg_mult,
+                        dev.cuda_stream().cu_stream(),
+                    );
+                }
             }
             drop(out_guard);
             CudaStorage::wrap_cuda_slice(out_buf, dev.clone())
@@ -1323,9 +1392,21 @@ pub(crate) fn gather_gemv_2b_cuda(
     }
 
     let res = match x_2d.dtype() {
-        DType::BF16 => gather_dtype!(bf16, ffi::launch_qtip2b_gemv_bf16),
-        DType::F16 => gather_dtype!(f16, ffi::launch_qtip2b_gemv_f16),
-        DType::F32 => gather_dtype!(f32, ffi::launch_qtip2b_gemv_f32),
+        DType::BF16 => gather_dtype!(
+            bf16,
+            ffi::launch_qtip2b_gemv_bf16,
+            ffi::launch_qtip2b_gemv_tuned_bf16
+        ),
+        DType::F16 => gather_dtype!(
+            f16,
+            ffi::launch_qtip2b_gemv_f16,
+            ffi::launch_qtip2b_gemv_tuned_f16
+        ),
+        DType::F32 => gather_dtype!(
+            f32,
+            ffi::launch_qtip2b_gemv_f32,
+            ffi::launch_qtip2b_gemv_tuned_f32
+        ),
         other => candle_core::bail!("qtip2b gather gemv CUDA: unsupported x dtype {other:?}"),
     };
 

@@ -2842,6 +2842,186 @@ mod tests {
         Ok(())
     }
 
+    /// Every compiled autotune variant (kernels/qtip/qtip_bitshift_tune.cu)
+    /// meets the SAME parity contract as the legacy fixed-config kernel:
+    /// fused single-token GEMV vs dequant+matmul, and on-device gather GEMV
+    /// vs the CPU gather reference. Also drives an alignment-fallback shape
+    /// (packed_per_row odd), where every vectorized variant must be rejected
+    /// by the tuned launcher and silently fall back to the legacy kernel —
+    /// exercising the production fallback path, not just the happy path.
+    ///
+    /// The forced-variant knob is process-global; that is benign here
+    /// because every variant satisfies the same correctness contract the
+    /// other CUDA tests assert (a concurrent test at worst runs a different
+    /// — equally correct — variant).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_gemv_2b_all_tuned_variants_match_reference() -> Result<()> {
+        use super::super::tune::{
+            gemv_variant_applicable, set_forced_gemv_variant, QTIP2B_GEMV_VARIANT_LEGACY,
+        };
+        if !super::super::ffi::HAVE_QTIP_KERNELS {
+            return Ok(());
+        }
+        let n_variants = super::super::tune::gemv_num_variants();
+        if n_variants == 0 {
+            return Ok(());
+        }
+        struct ResetForced;
+        impl Drop for ResetForced {
+            fn drop(&mut self) {
+                super::super::tune::set_forced_gemv_variant(None);
+            }
+        }
+        let _reset = ResetForced;
+
+        let cuda = Device::new_cuda(0)?;
+        let cpu = Device::Cpu;
+
+        // --- fused single-token fixture (n=64, k=512 -> ppr=128, all
+        // vector widths + smem stagings applicable) + reference -----------
+        let (n, k_in) = (64usize, 512usize);
+        let w_cpu = Tensor::from_vec(gaussian_fixture(n * k_in, 555, 0.5), (n, k_in), &cpu)?;
+        let fused_cpu = Qtip2bLayer::quantize_with_options_concrete(
+            &w_cpu,
+            None,
+            &cpu,
+            QtipMode::Viterbi,
+            true,
+        )?;
+        let fused = Qtip2bLayer {
+            blocks: fused_cpu.blocks.to_device(&cuda)?,
+            row_scales: fused_cpu.row_scales.to_device(&cuda)?,
+            bias: None,
+            in_features: fused_cpu.in_features,
+            num_experts: None,
+            rotation_signs: fused_cpu
+                .rotation_signs
+                .as_ref()
+                .map(|t| t.to_device(&cuda))
+                .transpose()?,
+            rotation_block: fused_cpu.rotation_block,
+            mcg_mult: fused_cpu.mcg_mult,
+            expert_bpw: None,
+        };
+        let x = Tensor::from_vec(gaussian_fixture(k_in, 31337, 1.0), (1, k_in), &cpu)?
+            .to_device(&cuda)?
+            .to_dtype(DType::BF16)?;
+        let w_dq = fused.dequantize_weights()?.to_dtype(DType::F32)?;
+        let y_ref: Vec<f32> = x
+            .to_dtype(DType::F32)?
+            .matmul(&w_dq.t()?)?
+            .to_device(&cpu)?
+            .flatten_all()?
+            .to_vec1()?;
+
+        // --- gather fixture (e=4, n=32, k=256) + CPU reference -----------
+        let (ge, gn, gk) = (4usize, 32usize, 256usize);
+        let w3 = build_3d_gaussian_weight(ge, gn, gk)?;
+        let gather_cpu = Qtip2bLayer::quantize_with_options_3d(&w3, &cpu, QtipMode::Viterbi, true)?;
+        let payload = gather_cpu.serialize()?;
+        let (gather_cuda, _) =
+            Qtip2bLayer::deserialize_ext_bias(payload, &cuda, QuantizeOntoGuard::new())?;
+        let (n_tokens, top_k) = (2usize, 2usize);
+        let a_cpu = Tensor::from_vec(
+            gaussian_fixture(n_tokens * top_k * gk, 12345, 1.0),
+            (n_tokens, top_k, gk),
+            &cpu,
+        )?;
+        let indices_cpu = Tensor::from_vec(vec![0u32, 3, 2, 1], (n_tokens, top_k), &cpu)?;
+        let gather_ref: Vec<f32> = gather_cpu
+            .gather_forward(&a_cpu, &indices_cpu)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
+        let a_cuda = a_cpu.to_device(&cuda)?.to_dtype(DType::BF16)?;
+        let indices_cuda = indices_cpu.to_device(&cuda)?;
+
+        // --- alignment-fallback fixture: k=100 -> packed_per_row=25 (odd),
+        // no vectorized variant applies; the tuned launcher must return -1
+        // and the dispatch must produce legacy-kernel results ---------------
+        let (fn_, fk) = (16usize, 100usize);
+        let wf_cpu = Tensor::from_vec(gaussian_fixture(fn_ * fk, 777, 0.5), (fn_, fk), &cpu)?;
+        let fb_cpu = Qtip2bLayer::quantize_with_options_concrete(
+            &wf_cpu,
+            None,
+            &cpu,
+            QtipMode::Greedy,
+            false,
+        )?;
+        let fb = Qtip2bLayer {
+            blocks: fb_cpu.blocks.to_device(&cuda)?,
+            row_scales: fb_cpu.row_scales.to_device(&cuda)?,
+            bias: None,
+            in_features: fb_cpu.in_features,
+            num_experts: None,
+            rotation_signs: None,
+            rotation_block: 0,
+            mcg_mult: fb_cpu.mcg_mult,
+            expert_bpw: None,
+        };
+        let xf = Tensor::from_vec(gaussian_fixture(fk, 999, 1.0), (1, fk), &cpu)?
+            .to_device(&cuda)?
+            .to_dtype(DType::BF16)?;
+        let wf_dq = fb.dequantize_weights()?.to_dtype(DType::F32)?;
+        let yf_ref: Vec<f32> = xf
+            .to_dtype(DType::F32)?
+            .matmul(&wf_dq.t()?)?
+            .to_device(&cpu)?
+            .flatten_all()?
+            .to_vec1()?;
+
+        // Legacy sentinel first, then every variant.
+        let mut ids: Vec<u32> = vec![QTIP2B_GEMV_VARIANT_LEGACY];
+        ids.extend(0..n_variants as u32);
+        for v in ids {
+            set_forced_gemv_variant(Some(v));
+
+            let y_fused: Vec<f32> = fused
+                .forward(&x)?
+                .to_dtype(DType::F32)?
+                .to_device(&cpu)?
+                .flatten_all()?
+                .to_vec1()?;
+            let c = cos_sim(&y_fused, &y_ref);
+            assert!(
+                c > 0.995,
+                "variant {v}: fused GEMV cos {c} vs dequant+matmul reference"
+            );
+
+            let out_cuda: Vec<f32> = gather_cuda
+                .gather_forward(&a_cuda, &indices_cuda)?
+                .to_dtype(DType::F32)?
+                .to_device(&cpu)?
+                .flatten_all()?
+                .to_vec1()?;
+            let c = cos_sim(&gather_ref, &out_cuda);
+            assert!(
+                c > 0.995,
+                "variant {v}: gather GEMV cos {c} vs CPU gather reference"
+            );
+
+            if v != QTIP2B_GEMV_VARIANT_LEGACY {
+                assert!(
+                    !gemv_variant_applicable(v, fn_, fk),
+                    "variant {v}: expected inapplicable to odd packed_per_row (k={fk})"
+                );
+            }
+            let yf: Vec<f32> = fb
+                .forward(&xf)?
+                .to_dtype(DType::F32)?
+                .to_device(&cpu)?
+                .flatten_all()?
+                .to_vec1()?;
+            let c = cos_sim(&yf, &yf_ref);
+            assert!(
+                c > 0.995,
+                "variant {v}: odd-ppr fallback GEMV cos {c} vs dequant+matmul reference"
+            );
+        }
+        Ok(())
+    }
+
     /// Correctness harness (c), GPU half: the grouped kernel is bit-
     /// identical across runs. The routing scatter uses atomic cursors (the
     /// order WITHIN an expert group is run-dependent), but every output row

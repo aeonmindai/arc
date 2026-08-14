@@ -314,6 +314,75 @@ extern "C" {
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
+    // ----- Autotuned GEMV variants (kernels/qtip/qtip_bitshift_tune.cu) -----
+    //
+    // Compile-time instantiated sweep grid over {warps/block, rows/warp,
+    // ILP streams/thread, vector load width, launch_bounds min-blocks, smem
+    // staging, prefetch depth}. The tuned launchers return 0 on launch and
+    // -1 when the variant is not applicable to the shape (alignment / smem
+    // capacity) — the caller must then fall back to `launch_qtip2b_gemv_*`,
+    // whose correctness contract the variants share.
+    pub(crate) fn qtip2b_gemv_num_variants() -> i32;
+
+    pub(crate) fn qtip2b_gemv_variant_info(
+        idx: i32,
+        warps: *mut i32,
+        rows_per_warp: *mut i32,
+        ilp: *mut i32,
+        wbytes: *mut i32,
+        min_blocks: *mut i32,
+        stage: *mut i32,
+        prefetch: *mut i32,
+    ) -> i32;
+
+    pub(crate) fn launch_qtip2b_gemv_tuned_bf16(
+        variant: i32,
+        d_packed: *const u8,
+        d_row_scales: *const f32,
+        d_x_rotated: *const bf16,
+        d_indices: *const u32,
+        d_y: *mut bf16,
+        n_rows: i32,
+        packed_per_row: i32,
+        num_symbols: i32,
+        n_pairs: i32,
+        num_experts: i32,
+        mult: u32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    ) -> i32;
+
+    pub(crate) fn launch_qtip2b_gemv_tuned_f16(
+        variant: i32,
+        d_packed: *const u8,
+        d_row_scales: *const f32,
+        d_x_rotated: *const f16,
+        d_indices: *const u32,
+        d_y: *mut f16,
+        n_rows: i32,
+        packed_per_row: i32,
+        num_symbols: i32,
+        n_pairs: i32,
+        num_experts: i32,
+        mult: u32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    ) -> i32;
+
+    pub(crate) fn launch_qtip2b_gemv_tuned_f32(
+        variant: i32,
+        d_packed: *const u8,
+        d_row_scales: *const f32,
+        d_x_rotated: *const f32,
+        d_indices: *const u32,
+        d_y: *mut f32,
+        n_rows: i32,
+        packed_per_row: i32,
+        num_symbols: i32,
+        n_pairs: i32,
+        num_experts: i32,
+        mult: u32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    ) -> i32;
+
     // ----- Quantize side (F32 weights, same contract as the LUT rung) -----
     pub(crate) fn launch_qtip2b_compute_row_scales_f32(
         d_weight: *const f32,
