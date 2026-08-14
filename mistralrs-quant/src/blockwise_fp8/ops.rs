@@ -1558,8 +1558,21 @@ mod tests {
     fn test_fp8_blockwise_quant_dequant_roundtrip() -> Result<()> {
         let dev = &Device::new_cuda(0)?;
 
-        // Create test input
-        let input = Tensor::randn(0f32, 2f32, (8, 8), dev)?;
+        // Fixed input: 8x8 drawn N(0, 2) by `det_randn`, so `max_error` below
+        // is a constant, not a sample.
+        //
+        // This test had the worst unseeded-`randn` flake found in the sweep:
+        // over 20 000 independent `Tensor::randn(0, 2, 64)` draws through this
+        // exact block-scaled round trip, 4517 exceeded the old `< 0.16` bound —
+        // 22.6%, better than one run in five, worst 0.27634335. Being
+        // `cfg(feature = "cuda")` it only ever runs on a rented GPU box, where
+        // a spurious red costs money and invites debugging on the clock
+        // (DOCTRINE D4b).
+        let input = Tensor::from_vec(
+            crate::test_rng::det_randn(0xB10C_0003, 0.0, 2.0, 64),
+            (8, 8),
+            dev,
+        )?;
         let weight_block_size = vec![4, 4];
 
         // Quantize
@@ -1589,9 +1602,38 @@ mod tests {
             }
         }
 
-        // FP8 E4M3 has limited precision, so we expect some error
-        // but it should be reasonable
-        assert!(max_error < 0.16, "Max error {} is too large", max_error);
+        // Non-degeneracy: FP8 E4M3 keeps 3 mantissa bits, so a real round trip
+        // MUST lose something. Without this floor an all-zero fixture — or a
+        // quantize kernel that silently returned its input — would sail past
+        // the upper bound while testing nothing (D12).
+        assert!(
+            max_error > 1e-3,
+            "max error {max_error} is implausibly small — the fixture is \
+             degenerate or the round trip is not exercising quantization"
+        );
+        // Upper bound derived from the MEASURED error on this fixed input:
+        // observed max_error = 0.09135818 (F8E4M3, per-4x4-block scaling,
+        // seed 0xB10C0003). The bar is that value + ~5%, which is 40% tighter
+        // than the old 0.16 and therefore has MORE teeth, not less.
+        //
+        // Measured on CPU by replicating `quant_fp8_blockwise_kernel` /
+        // `dequant_fp8_blockwise_kernel` exactly — this op has no CPU path — so
+        // the margin is justified against the two ways the GPU can differ:
+        //
+        //  1. The kernel rounds TWICE: `__float2half` then
+        //     `__nv_cvt_halfraw_to_fp8(_, __NV_SATFINITE, __NV_E4M3)`. Both
+        //     roundings are round-to-nearest-even, and on this input the
+        //     double-rounded result gives a max_error bit-identical to a single
+        //     f32 -> fp8 rounding (0.09135818 either way): a code only flips
+        //     within half an f16 ULP of an fp8 midpoint, where either choice
+        //     sits half a step from the true value. Dequant is exact on both
+        //     sides (fp8 -> f16 -> f32 loses nothing).
+        //  2. `det_randn`'s `ln`/`sin_cos` can differ in the last bit across
+        //     libm implementations. Perturbing every input element by 1e-6
+        //     *relative* — orders of magnitude beyond last-bit f32 drift — over
+        //     64 patterns moved max_error only within [0.09134674, 0.09136963],
+        //     i.e. +/-1.1e-5. The 5% margin is ~400x that.
+        assert!(max_error < 0.096, "Max error {} is too large", max_error);
 
         Ok(())
     }
