@@ -1377,8 +1377,11 @@ impl Attention {
                 // Use ONLY the fixed-width graph mask (matches the C-wide K).
                 // The eager `attention_mask` is kv_len-wide (growing) and would
                 // both mismatch the fixed window and break shape-constancy.
-                // None here => attends over zero-padding (finite, not yet
-                // correct) until set_graph_mode_mask is wired.
+                // `dsv4_attention` now folds whatever it is handed into its own
+                // union mask (it used to discard it), so wiring
+                // `set_graph_mode_mask` is all that remains for this path: until
+                // then `graph_mode_mask()` is `None` and the unwritten tail slots
+                // are attended as zero-padding (finite, not yet correct).
                 let gmask = crate::layers::graph_mode_mask();
                 super::dsv4_attention::dsv4_attention(
                     &q,

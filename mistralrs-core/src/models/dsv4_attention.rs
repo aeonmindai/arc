@@ -54,10 +54,26 @@
 //!   - `compressed_kv`: `[B, 1, T_c, D]` — compressed (distant-context) KV with
 //!     compress-θ RoPE already applied at the strided compressed positions, or
 //!     `None` (Standard layers, or history shorter than one `ratio` block).
+//!   - `attention_mask`: an **additive** mask over the raw keys, rank 2
+//!     `[T_q, T_k]` or rank 4 `[B, H, T_q, T_k]` (a `[1, 1]` tensor is the
+//!     flash-attn placeholder and is ignored). It is *folded into* the mask
+//!     this module builds, never replaced by it and never dropped — see
+//!     `compose_caller_mask`.
 //!
 //! Returns `[B, n_heads, T_q, D]` matching plain SDPA's output shape so the
 //! caller's post-attention inverse-RoPE + grouped `wo_a`/`wo_b` chain works
 //! as-is.
+//!
+//! ## Multi-sequence correctness
+//!
+//! Every mask this module can compute — raw causality, the sliding window,
+//! compressed-block causality — is derived from *absolute positions*, so it is
+//! per-query-row and holds identically for every sequence in a batch. What it
+//! cannot see is which columns are padding, which is why the caller's mask is
+//! composed in rather than discarded. Because the composed mask is always
+//! passed to `Sdpa::run_attention`, the call can never be diverted onto
+//! `sinks_attn`'s varlen backend, which has no mask parameter (see the routing
+//! comment in `attention/backends/sinks.rs`).
 
 use candle_core::{DType, Result, Tensor};
 use mistralrs_quant::MatMul;
@@ -135,6 +151,80 @@ fn absorbed_mqa_decode(
     // Weighted sum in the latent space: [B, 1, H, T] @ [B, 1, T, D].
     let out = MatMul.matmul(&att.reshape((b, 1, h * t_q, t_k))?, v)?;
     out.reshape((b, h, t_q, d))
+}
+
+/// Fold a caller-supplied additive `attention_mask` into the locally built
+/// union mask.
+///
+/// The local mask (`[1, 1, t_q, n_keys]`) encodes only what *this* module
+/// knows: raw causality, the sliding window, and compressed-block causality.
+/// Everything the *caller* knows — padding columns in a ragged batch, the
+/// fixed-width graph-decode length mask, any custom bias — lives in
+/// `attention_mask` and used to be thrown away here, so padded/unwritten
+/// positions polluted every batched request (reference audit §1(e)).
+///
+/// Additive masks compose by addition (`0` keeps, `-inf` kills, and `-inf`
+/// wins over `0`), so folding is a broadcast add. The only work is lining up
+/// the key axis: the caller's mask spans the **raw** keys `[0, t_k)`, while the
+/// union axis is `[raw ++ compressed]` of width `n_keys = t_k + t_c`. The
+/// caller has no opinion about compressed blocks (they are not tokens in its
+/// sequence; their causality is `comp_valid`), so the compressed columns are
+/// padded with `0`.
+///
+/// A width that is neither `t_k` nor `n_keys` is a contract violation and is
+/// reported rather than dropped — silently ignoring a mismatched mask is the
+/// exact failure mode this function exists to end.
+fn compose_caller_mask(local: &Tensor, caller: &Tensor, t_q: usize, t_k: usize) -> Result<Tensor> {
+    // `CausalMasker::make_causal_mask_matrix` returns a `[1, 1]` zero
+    // placeholder when built with flash-attn on CUDA (there the kernel applies
+    // causality itself). It carries no information, so folding it is a no-op.
+    if caller.elem_count() == 1 {
+        return Ok(local.clone());
+    }
+    let n_keys = local.dim(3)?;
+    let caller = caller.to_dtype(local.dtype())?;
+    let caller = match caller.rank() {
+        2 => {
+            let (q_rows, k_cols) = caller.dims2()?;
+            caller.reshape((1, 1, q_rows, k_cols))?
+        }
+        4 => caller,
+        rank => {
+            return Err(candle_core::Error::Msg(format!(
+                "dsv4_attention: attention_mask must be rank 2 [t_q, t_k] or rank 4 \
+                 [b, h, t_q, t_k], got rank {rank} with dims {:?}",
+                caller.dims()
+            )))
+        }
+    };
+    let q_rows = caller.dim(2)?;
+    if q_rows != t_q && q_rows != 1 {
+        return Err(candle_core::Error::Msg(format!(
+            "dsv4_attention: attention_mask query axis is {q_rows}, expected {t_q} (or 1 to \
+             broadcast); dims {:?}",
+            caller.dims()
+        )));
+    }
+    let k_cols = caller.dim(3)?;
+    let caller = if k_cols == n_keys {
+        caller
+    } else if k_cols == t_k {
+        // Raw-only mask: neutral (0) over the compressed columns.
+        let (b, h) = (caller.dim(0)?, caller.dim(1)?);
+        let pad = Tensor::zeros(
+            (b, h, q_rows, n_keys - t_k),
+            caller.dtype(),
+            caller.device(),
+        )?;
+        Tensor::cat(&[&caller, &pad], 3)?
+    } else {
+        return Err(candle_core::Error::Msg(format!(
+            "dsv4_attention: attention_mask key axis is {k_cols}, expected the raw cache width \
+             {t_k} or the full union width {n_keys}; dims {:?}",
+            caller.dims()
+        )));
+    };
+    local.broadcast_add(&caller)
 }
 
 /// Per-call configuration for V4 hybrid attention.
@@ -231,6 +321,15 @@ pub fn dsv4_attention(
         .where_cond(&zeros, &neg_inf)?
         .reshape((1, 1, t_q, n_keys))?;
 
+    // Fold in whatever the caller knows that this module cannot see: padding
+    // columns in a ragged batch, the graph-decode length mask, custom bias.
+    // Dropping it (the pre-fix behavior) let one sequence's padding vote in
+    // its neighbours' softmax on every batched request.
+    let mask = match attention_mask {
+        Some(caller) => compose_caller_mask(&mask, caller, t_q, t_k)?,
+        None => mask,
+    };
+
     // ---- Absorbed-MLA decode (stage-2 perf) -------------------------------
     // Single-token decode with one KV head and sinks present (the deployment
     // configuration on every V4 layer) computes attention directly in the
@@ -242,6 +341,10 @@ pub fn dsv4_attention(
         return absorbed_mqa_decode(q, &k_cat, &v_cat, &mask, sdpa_params);
     }
 
+    // Always `Some(&mask)`: V4 owns its causality (raw window ∧ compressed
+    // block-causality ∧ the caller's mask), and `sinks_attn` only takes the
+    // mask-free varlen path when `mask.is_none()` — so this call can never be
+    // routed through a backend that would drop it.
     Sdpa.run_attention(
         q,
         &k_cat,
@@ -266,6 +369,98 @@ mod tests {
             cumulative_seqlens_k: HashMap::new(),
             causal: false,
         }
+    }
+
+    /// `FlashParams` carrying `cu_seqlens` for the CPU device — the shape the
+    /// engine actually produces on a flash-attn build (`inputs_processor.rs`
+    /// populates `cumulative_seqlens_{q,k}` for every unique device whenever
+    /// `using_flash_attn()`), and the trigger for `sinks_attn`'s varlen route.
+    /// Lengths are the PADDED per-sequence lengths, matching the engine.
+    fn varlen_flash_params(seqlens_q: &[u32], seqlens_k: &[u32], dev: &Device) -> FlashParams {
+        let cumsum = |lens: &[u32]| -> Tensor {
+            let mut acc = 0u32;
+            let mut out = vec![0u32];
+            for l in lens {
+                acc += l;
+                out.push(acc);
+            }
+            Tensor::from_vec(out, lens.len() + 1, dev).unwrap()
+        };
+        let mut q_map = HashMap::new();
+        let mut k_map = HashMap::new();
+        q_map.insert(dev.location(), cumsum(seqlens_q));
+        k_map.insert(dev.location(), cumsum(seqlens_k));
+        FlashParams {
+            max_q: seqlens_q.iter().copied().max().unwrap_or(0),
+            max_k: seqlens_k.iter().copied().max().unwrap_or(0),
+            cumulative_seqlens_q: q_map,
+            cumulative_seqlens_k: k_map,
+            causal: true,
+        }
+    }
+
+    /// Additive `[b, 1, t, t]` mask: causal, plus `-inf` on the leading
+    /// `left_pad[i]` key columns of batch row `i`. Left padding is the case
+    /// causality alone cannot cover — the padded columns sit *before* every
+    /// real query, squarely inside the causal (and sliding-window) set — so it
+    /// is the honest probe for "is the caller's mask actually applied?".
+    fn left_padded_causal_mask(left_pad: &[usize], t: usize, dev: &Device) -> Result<Tensor> {
+        let b = left_pad.len();
+        let mut data = vec![0f32; b * t * t];
+        for (i, &pad) in left_pad.iter().enumerate() {
+            for r in 0..t {
+                for j in 0..t {
+                    if j > r || j < pad {
+                        data[(i * t + r) * t + j] = f32::NEG_INFINITY;
+                    }
+                }
+            }
+        }
+        Tensor::from_vec(data, (b, 1, t, t), dev)
+    }
+
+    /// Replace `k`/`v` (`[b, 1, t, d]`) with loud, distinctive values wherever
+    /// `select(i, j)` is true, leaving every other entry bit-identical.
+    fn perturb_keys(
+        k: &Tensor,
+        v: &Tensor,
+        select: impl Fn(usize, usize) -> bool,
+    ) -> Result<(Tensor, Tensor)> {
+        let (b, _kv, t, _d) = k.dims4()?;
+        let mut sel = vec![0u8; b * t];
+        for (i, row) in sel.chunks_mut(t).enumerate() {
+            for (j, cell) in row.iter_mut().enumerate() {
+                *cell = u8::from(select(i, j));
+            }
+        }
+        let sel = Tensor::from_vec(sel, (b, 1, t, 1), k.device())?
+            .broadcast_as(k.shape())?
+            .contiguous()?;
+        // Deliberately large: if a masked-out key were attended at all, its
+        // logit would dominate the softmax and the output could not survive
+        // the equality assertions below.
+        let loud = Tensor::full(9.0f32, k.shape(), k.device())?.to_dtype(k.dtype())?;
+        Ok((
+            sel.where_cond(&loud, k)?.contiguous()?,
+            sel.where_cond(&loud.neg()?, v)?.contiguous()?,
+        ))
+    }
+
+    fn flat(t: &Tensor) -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    }
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len(), "length mismatch");
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
     }
 
     fn sdpa_params(head_dim: usize, n_kv_groups: usize) -> SdpaParams {
@@ -769,6 +964,404 @@ mod tests {
         assert_eq!(out.dims(), &[b, h, t_q, d]);
         let data: Vec<f32> = out.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
         assert!(data.iter().all(|x| x.is_finite()));
+        Ok(())
+    }
+
+    // =======================================================================
+    // BATCHED-SERVING CORRECTNESS (reference audit §1(e), findings 3 and 4)
+    // =======================================================================
+
+    /// **Batch-vs-solo equivalence.** N sequences of DIFFERENT lengths, run
+    /// right-padded as one batch and again individually, must agree per
+    /// sequence over that sequence's real rows.
+    ///
+    /// This is the test that would have caught finding 3. The `FlashParams`
+    /// here carry `cu_seqlens` for the query device — which is what the engine
+    /// produces on every flash-attn build — and with `b_sz > 1` that used to
+    /// send this call into `sinks_attn_varlen`, a backend with no mask
+    /// parameter whose CPU fallback attended bidirectionally over a packed
+    /// K/V layout the caller never supplies. Pre-fix this test does not merely
+    /// disagree: it fails outright inside the varlen path.
+    #[test]
+    fn ragged_batch_prefill_matches_per_sequence() -> Result<()> {
+        let device = Device::Cpu;
+        let (h, d, window) = (2, 16, 6);
+        // Ragged on purpose, and none of them a multiple of the CSA ratio.
+        let lens = [12usize, 7, 5];
+        let b = lens.len();
+        let t = lens[0];
+        let t_c = 3;
+
+        let q = mk(b, h, t, d, 0.11, &device)?;
+        let k = mk(b, 1, t, d, 0.23, &device)?;
+        let v = mk(b, 1, t, d, 0.31, &device)?;
+        let comp = mk(b, 1, t_c, d, 0.07, &device)?;
+
+        let (sdpa, _sinks) = sdpa_params_with_sinks(d, h, &device)?;
+        let cfg = Dsv4AttentionConfig {
+            compress_ratio: CompressRatio::Csa,
+            sliding_window: window,
+        };
+
+        // The engine pads every sequence to the batch max and reports PADDED
+        // lengths in cu_seqlens (see the `FlashParams` doc in
+        // `inputs_processor.rs`), so all entries are `t`.
+        let padded = vec![t as u32; b];
+        let flash = varlen_flash_params(&padded, &padded, &device);
+        // Right padding: a plain per-batch causal mask is what `CausalMasker`
+        // hands the layer. Rank 4, raw-width — it must be folded in, not
+        // dropped, and must not disturb the compressed columns.
+        let mask = left_padded_causal_mask(&[0, 0, 0], t, &device)?;
+
+        let batched = dsv4_attention(&q, &k, &v, Some(&comp), Some(&mask), &flash, &sdpa, cfg)?;
+        assert_eq!(batched.dims(), &[b, h, t, d]);
+
+        let solo_flash = empty_flash_params();
+        let mut solos: Vec<Vec<f32>> = Vec::new();
+        for (i, &len) in lens.iter().enumerate() {
+            let qi = q.narrow(0, i, 1)?.narrow(2, 0, len)?.contiguous()?;
+            let ki = k.narrow(0, i, 1)?.narrow(2, 0, len)?.contiguous()?;
+            let vi = v.narrow(0, i, 1)?.narrow(2, 0, len)?.contiguous()?;
+            let ci = comp.narrow(0, i, 1)?.contiguous()?;
+            let solo = dsv4_attention(&qi, &ki, &vi, Some(&ci), None, &solo_flash, &sdpa, cfg)?;
+
+            let got = flat(&batched.narrow(0, i, 1)?.narrow(2, 0, len)?.contiguous()?);
+            let want = flat(&solo);
+            // Batch-2/3 and batch-1 GEMMs tile — and therefore round —
+            // differently on `MatMul`'s F16 CPU path; same documented noise
+            // floor as `union_decode_matches_scalar_reference`.
+            let diff = max_abs_diff(&got, &want);
+            assert!(
+                diff < 1.5e-3,
+                "sequence {i} (len {len}) differs between the batch and its solo run \
+                 (max abs diff {diff}) — batched serving is not per-sequence correct"
+            );
+            solos.push(want);
+        }
+
+        // Teeth: the sequences must be grossly distinguishable, so agreement
+        // above is not the vacuous kind. Compare over the shortest length.
+        let short = *lens.iter().min().unwrap();
+        let head = |v: &[f32]| v[..h * short * d].to_vec();
+        assert!(
+            max_abs_diff(&head(&solos[0]), &head(&solos[1])) > 1e-2,
+            "fixture sequences are too similar for the equality assertions to have teeth"
+        );
+        Ok(())
+    }
+
+    /// **Causality probe.** Plant a loud, distinctive key/value strictly in
+    /// the future of a query row; the row's output must not move at all.
+    ///
+    /// Run at `b_sz > 1` with `cu_seqlens` present — the configuration whose
+    /// backend had no causality whatsoever. The perturbation is bit-exactly
+    /// invisible when masking is right (a `-inf` logit gives an exactly-zero
+    /// softmax weight, and `0 * x == 0`), so this asserts exact equality; the
+    /// negative control shows the same perturbation moves the output by O(1)
+    /// the moment it lands inside the causal set.
+    #[test]
+    fn future_keys_cannot_influence_batched_prefill() -> Result<()> {
+        let device = Device::Cpu;
+        let (h, d, window) = (2, 16, 32);
+        let (b, t, t_c) = (2, 10, 2);
+        let cut = 5usize; // rows 0..=cut must not see keys > cut
+
+        let q = mk(b, h, t, d, 0.09, &device)?;
+        let k = mk(b, 1, t, d, 0.19, &device)?;
+        let v = mk(b, 1, t, d, 0.29, &device)?;
+        let comp = mk(b, 1, t_c, d, 0.04, &device)?;
+
+        let (sdpa, _sinks) = sdpa_params_with_sinks(d, h, &device)?;
+        let cfg = Dsv4AttentionConfig {
+            compress_ratio: CompressRatio::Csa,
+            sliding_window: window, // window >= t, so ONLY causality is on trial
+        };
+        let padded = vec![t as u32; b];
+        let flash = varlen_flash_params(&padded, &padded, &device);
+        let mask = left_padded_causal_mask(&[0; 2], t, &device)?;
+
+        let base = dsv4_attention(&q, &k, &v, Some(&comp), Some(&mask), &flash, &sdpa, cfg)?;
+
+        // Distinctive token late in sequence 0 only.
+        let (k_fut, v_fut) = perturb_keys(&k, &v, |i, j| i == 0 && j > cut)?;
+        let futured = dsv4_attention(
+            &q,
+            &k_fut,
+            &v_fut,
+            Some(&comp),
+            Some(&mask),
+            &flash,
+            &sdpa,
+            cfg,
+        )?;
+
+        let rows = |x: &Tensor| -> Result<Vec<f32>> {
+            Ok(flat(
+                &x.narrow(0, 0, 1)?.narrow(2, 0, cut + 1)?.contiguous()?,
+            ))
+        };
+        let diff = max_abs_diff(&rows(&base)?, &rows(&futured)?);
+        assert_eq!(
+            diff, 0.0,
+            "a token planted AFTER position {cut} changed the output at positions 0..={cut} \
+             (max abs diff {diff}) — batch prefill is not causal"
+        );
+
+        // Negative control: the identical perturbation inside the causal set
+        // moves the same rows by a wide margin, so the equality above is a
+        // real constraint and not an artifact of an inert perturbation.
+        let (k_past, v_past) = perturb_keys(&k, &v, |i, j| i == 0 && j <= cut)?;
+        let pasted = dsv4_attention(
+            &q,
+            &k_past,
+            &v_past,
+            Some(&comp),
+            Some(&mask),
+            &flash,
+            &sdpa,
+            cfg,
+        )?;
+        let control = max_abs_diff(&rows(&base)?, &rows(&pasted)?);
+        assert!(
+            control > 1e-2,
+            "the probe token is invisible even inside the causal set (diff {control}); \
+             the causality assertion has no teeth"
+        );
+
+        // Sequence 1 was never touched: batch-mate invariance.
+        let mate = |x: &Tensor| -> Result<Vec<f32>> { Ok(flat(&x.narrow(0, 1, 1)?.contiguous()?)) };
+        assert_eq!(
+            max_abs_diff(&mate(&base)?, &mate(&futured)?),
+            0.0,
+            "perturbing sequence 0's keys changed sequence 1's output — cross-sequence leak"
+        );
+        Ok(())
+    }
+
+    /// **Padding mask honored.** A caller mask that kills the leading `pad[i]`
+    /// key columns of batch row `i` (left padding — the columns causality
+    /// cannot exclude) must make those positions unable to influence anything.
+    ///
+    /// Pre-fix, `dsv4_attention` read `attention_mask` on exactly one
+    /// env-gated branch and dropped it on every live path, so this fails by
+    /// the width of the negative control below.
+    #[test]
+    fn caller_padding_mask_is_honored() -> Result<()> {
+        let device = Device::Cpu;
+        let (h, d, window) = (2, 16, 8);
+        let (t, t_c) = (12, 3);
+        let pads = [0usize, 4, 6];
+        let b = pads.len();
+
+        let q = mk(b, h, t, d, 0.13, &device)?;
+        let k = mk(b, 1, t, d, 0.21, &device)?;
+        let v = mk(b, 1, t, d, 0.27, &device)?;
+        let comp = mk(b, 1, t_c, d, 0.06, &device)?;
+
+        let (sdpa, _sinks) = sdpa_params_with_sinks(d, h, &device)?;
+        let cfg = Dsv4AttentionConfig {
+            compress_ratio: CompressRatio::Csa,
+            sliding_window: window,
+        };
+        let padded = vec![t as u32; b];
+        let flash = varlen_flash_params(&padded, &padded, &device);
+        let mask = left_padded_causal_mask(&pads, t, &device)?;
+
+        let base = dsv4_attention(&q, &k, &v, Some(&comp), Some(&mask), &flash, &sdpa, cfg)?;
+        // Perturb ONLY the padded columns. Every real query row still sits
+        // inside the sliding window of some of them, so an unapplied mask
+        // leaks immediately.
+        let (k_p, v_p) = perturb_keys(&k, &v, |i, j| j < pads[i])?;
+        let perturbed =
+            dsv4_attention(&q, &k_p, &v_p, Some(&comp), Some(&mask), &flash, &sdpa, cfg)?;
+
+        for (i, &pad) in pads.iter().enumerate() {
+            let real = |x: &Tensor| -> Result<Vec<f32>> {
+                Ok(flat(
+                    &x.narrow(0, i, 1)?.narrow(2, pad, t - pad)?.contiguous()?,
+                ))
+            };
+            let diff = max_abs_diff(&real(&base)?, &real(&perturbed)?);
+            assert_eq!(
+                diff, 0.0,
+                "sequence {i}: changing PADDED key positions [0, {pad}) moved the real \
+                 positions' output (max abs diff {diff}) — the caller's padding mask is \
+                 not applied"
+            );
+        }
+
+        // Negative control: without the mask the very same perturbation is
+        // loudly visible, i.e. the padded columns really are inside the
+        // causal ∧ window set and the assertion above is not vacuous.
+        let unmasked_base = dsv4_attention(&q, &k, &v, Some(&comp), None, &flash, &sdpa, cfg)?;
+        let unmasked_pert = dsv4_attention(&q, &k_p, &v_p, Some(&comp), None, &flash, &sdpa, cfg)?;
+        let control = max_abs_diff(&flat(&unmasked_base), &flat(&unmasked_pert));
+        assert!(
+            control > 1e-2,
+            "padded keys are inert even with no mask at all (diff {control}); this test \
+             cannot distinguish an applied mask from a dropped one"
+        );
+        Ok(())
+    }
+
+    /// **Union guard.** Folding the caller's mask must not disturb the
+    /// raw∪compressed union semantics: the branches are concatenated, not
+    /// deduplicated, so a token that is visible BOTH as a raw key and inside a
+    /// visible compressed block contributes twice. The reference audit
+    /// confirmed this double counting matches SGLang (`clip_down`/`get_raw_loc`
+    /// there are ring-buffer addressing, not masking), so it is a contract to
+    /// hold, not a bug to fix. The caller's mask spans the raw axis only and
+    /// must leave the compressed columns alone.
+    #[test]
+    fn caller_mask_preserves_raw_union_compressed_double_counting() -> Result<()> {
+        let device = Device::Cpu;
+        let (b, h, d) = (1usize, 2usize, 8usize);
+        let (t, t_c, ratio) = (8usize, 2usize, 4usize);
+        let scale = 1.0 / (d as f32).sqrt();
+
+        let q = mk(b, h, t, d, 0.03, &device)?;
+        let k = mk(b, 1, t, d, 0.11, &device)?;
+        let v = mk(b, 1, t, d, 0.17, &device)?;
+        let comp = mk(b, 1, t_c, d, 0.05, &device)?;
+
+        let sinks_data: Vec<f32> = (0..h).map(|i| 0.5 + 0.25 * i as f32).collect();
+        let sinks = Tensor::from_vec(sinks_data.clone(), (1, h, 1, 1), &device)?;
+        let sdpa = SdpaParams {
+            n_kv_groups: h,
+            softcap: None,
+            softmax_scale: scale,
+            sliding_window: None,
+            sinks: Some(sinks),
+        };
+        let cfg = Dsv4AttentionConfig {
+            compress_ratio: CompressRatio::Csa,
+            // Window covers the whole sequence, so every raw key a query can
+            // see is ALSO covered by a visible compressed block: maximum
+            // overlap, which is what makes the double counting observable.
+            sliding_window: t,
+        };
+        // Rank-4 causal mask (what `CausalMasker` hands the layer), raw width.
+        let caller = left_padded_causal_mask(&[0], t, &device)?;
+        let out = dsv4_attention(
+            &q,
+            &k,
+            &v,
+            Some(&comp),
+            Some(&caller),
+            &empty_flash_params(),
+            &sdpa,
+            cfg,
+        )?;
+        let got = flat(&out);
+
+        let qv = flat(&q);
+        let kv = flat(&k);
+        let vv = flat(&v);
+        let cv = flat(&comp);
+        let dot = |a: &[f32], bb: &[f32]| -> f64 {
+            a.iter()
+                .zip(bb)
+                .map(|(x, y)| *x as f64 * *y as f64)
+                .sum::<f64>()
+                * scale as f64
+        };
+        // `dedup` collapses the raw/compressed overlap — the "fix" the audit
+        // says NOT to make. It serves as the negative control.
+        let scalar_ref = |dedup: bool| -> Vec<f64> {
+            let mut out = vec![0f64; h * t * d];
+            for head in 0..h {
+                for r in 0..t {
+                    let qh = &qv[(head * t + r) * d..(head * t + r + 1) * d];
+                    let mut logits: Vec<f64> = Vec::new();
+                    let mut values: Vec<&[f32]> = Vec::new();
+                    let n_blocks = (r + 1) / ratio;
+                    // Raw branch: causal, window == t so nothing is dropped.
+                    let raw_lo = if dedup { n_blocks * ratio } else { 0 };
+                    for j in raw_lo..=r {
+                        logits.push(dot(qh, &kv[j * d..(j + 1) * d]));
+                        values.push(&vv[j * d..(j + 1) * d]);
+                    }
+                    for bidx in 0..n_blocks {
+                        let cb = &cv[bidx * d..(bidx + 1) * d];
+                        logits.push(dot(qh, cb));
+                        values.push(cb);
+                    }
+                    let sink = sinks_data[head] as f64;
+                    let m = logits
+                        .iter()
+                        .cloned()
+                        .fold(f64::NEG_INFINITY, f64::max)
+                        .max(sink);
+                    let denom: f64 =
+                        logits.iter().map(|&x| (x - m).exp()).sum::<f64>() + (sink - m).exp();
+                    let base = (head * t + r) * d;
+                    for (lg, val) in logits.iter().zip(values.iter()) {
+                        let w = (lg - m).exp() / denom;
+                        for (e, x) in out[base..base + d].iter_mut().zip(val.iter()) {
+                            *e += w * *x as f64;
+                        }
+                    }
+                }
+            }
+            out
+        };
+        let diff = |reference: &[f64]| -> f64 {
+            reference
+                .iter()
+                .zip(got.iter())
+                .map(|(e, a)| (e - *a as f64).abs())
+                .fold(0f64, f64::max)
+        };
+
+        let d_union = diff(&scalar_ref(false));
+        assert!(
+            d_union < 1.5e-3,
+            "prefill union semantics drifted (max diff {d_union}) — raw and compressed \
+             must be one softmax over the concatenated key set, with the caller's mask \
+             folded into the raw half only"
+        );
+        let d_dedup = diff(&scalar_ref(true));
+        assert!(
+            d_dedup > 3.0 * d_union.max(1e-4),
+            "de-duplicating the raw/compressed overlap is indistinguishable here \
+             (union {d_union} vs dedup {d_dedup}); this guard has no teeth"
+        );
+        Ok(())
+    }
+
+    /// A caller mask whose key axis matches neither the raw cache width nor
+    /// the union width is a contract violation, and is reported rather than
+    /// silently ignored — silence is what made findings 3 and 4 survive.
+    #[test]
+    fn mismatched_caller_mask_is_rejected() -> Result<()> {
+        let device = Device::Cpu;
+        let (b, h, t, d) = (1, 2, 8, 16);
+        let q = mk(b, h, t, d, 0.1, &device)?;
+        let k = mk(b, 1, t, d, 0.2, &device)?;
+        let v = mk(b, 1, t, d, 0.3, &device)?;
+        let (sdpa, _sinks) = sdpa_params_with_sinks(d, h, &device)?;
+        let flash = empty_flash_params();
+        let cfg = Dsv4AttentionConfig {
+            compress_ratio: CompressRatio::Standard,
+            sliding_window: 4,
+        };
+        let bad = Tensor::zeros((1, 1, t, t + 3), DType::F32, &device)?;
+        let err = dsv4_attention(&q, &k, &v, None, Some(&bad), &flash, &sdpa, cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("attention_mask key axis"),
+            "expected a mask-width error, got: {err}"
+        );
+
+        // The flash-attn `[1, 1]` placeholder carries no information and must
+        // stay a no-op rather than trip the width check.
+        let dummy = Tensor::zeros((1, 1), DType::F32, &device)?;
+        let with_dummy = dsv4_attention(&q, &k, &v, None, Some(&dummy), &flash, &sdpa, cfg)?;
+        let without = dsv4_attention(&q, &k, &v, None, None, &flash, &sdpa, cfg)?;
+        assert_eq!(
+            max_abs_diff(&flat(&with_dummy), &flat(&without)),
+            0.0,
+            "the flash-attn placeholder mask changed the result"
+        );
         Ok(())
     }
 }

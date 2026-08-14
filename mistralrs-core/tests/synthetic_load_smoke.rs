@@ -1225,7 +1225,11 @@ fn v4c_tol(expected: &[f32]) -> f32 {
 /// F16 GEMM-tiling budget. Any real cross-sequence state leak is O(1) and
 /// blows through this by ~100x.
 fn v4c_assert_close(actual: &[f32], expected: &[f32], what: &str) {
-    assert_eq!(actual.len(), expected.len(), "{what}: logit length mismatch");
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "{what}: logit length mismatch"
+    );
     for (x, y) in actual.iter().zip(expected.iter()) {
         assert!(
             x.is_finite() && y.is_finite(),
@@ -1251,7 +1255,11 @@ fn v4c_assert_close(actual: &[f32], expected: &[f32], what: &str) {
 /// difference at all is cross-sequence contamination. This is the
 /// arch-independent anti-leak assertion — no rounding budget to hide behind.
 fn v4c_assert_bit_identical(actual: &[f32], expected: &[f32], what: &str) {
-    assert_eq!(actual.len(), expected.len(), "{what}: logit length mismatch");
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "{what}: logit length mismatch"
+    );
     let max_diff = v4c_max_diff(actual, expected);
     assert!(
         max_diff == 0.0,
@@ -1361,7 +1369,11 @@ fn v4_xs_history_two_seq_batch_matches_single_sequence() {
     // Teeth: the chains must be grossly distinguishable at every step, so a
     // genuine leak cannot hide inside the F16 tolerance.
     for s in 0..=V4C_DECODE_STEPS {
-        v4c_assert_chains_differ(&a_solo[s], &b_solo[s], &format!("fixture chains at step {s}"));
+        v4c_assert_chains_differ(
+            &a_solo[s],
+            &b_solo[s],
+            &format!("fixture chains at step {s}"),
+        );
     }
 
     // ---- Scenario 1: separate prefills, merged decode batch. This is the
@@ -1522,8 +1534,7 @@ fn v4_xs_history_two_seq_batch_matches_single_sequence() {
     let mut both = a_prompt.clone();
     both.extend_from_slice(&c_prompt);
     let ids = Tensor::from_vec(both, (2, t), &device).unwrap();
-    let logits = v4c_step(model.as_ref(), &ids, 0)
-        .expect("A+C batched prefill must not panic");
+    let logits = v4c_step(model.as_ref(), &ids, 0).expect("A+C batched prefill must not panic");
     v4c_assert_bit_identical(
         &v4c_row(&logits, 0),
         &a_with_b[0],
@@ -1538,6 +1549,129 @@ fn v4_xs_history_two_seq_batch_matches_single_sequence() {
             &v4c_row(&logits, 0),
             &a_with_b[s + 1],
             &format!("batch-mate invariance, decode step {s} chain A (sibling B -> C)"),
+        );
+    }
+}
+
+// ===========================================================================
+// V4 RAGGED-BATCH PREFILL (multi-sequence serving correctness)
+// ===========================================================================
+//
+// The fleet thesis is many sequences per GPU, so "one batch == N solo runs"
+// is the load-bearing contract. Two defects broke it on every live V4 path
+// (reference audit §1(e)):
+//
+//   1. `b_sz > 1` prefill routed to `sinks_attn_varlen`, a backend with no
+//      mask parameter whose CPU fallback attended with `mask = None` — i.e.
+//      no causality at all. `cumulative_seqlens_k` is populated on every
+//      flash-attn build (the documented production build), so this fired for
+//      every real batched prompt.
+//   2. `dsv4_attention` read the caller's `attention_mask` on exactly one
+//      env-gated branch and discarded it everywhere else, so padded columns
+//      voted in their neighbours' softmax.
+//
+// This test is the engine-level counterpart of the unit tests in
+// `dsv4_attention.rs`: three prompts of DIFFERENT lengths, right-padded into
+// one batch exactly the way `make_prompt_chunk` does, with the same
+// padded-length `cu_seqlens` the input processor emits.
+
+/// Cumulative-seqlen `FlashParams` for the CPU device, mirroring
+/// `inputs_processor.rs`: lengths are the PADDED per-sequence lengths, and the
+/// maps are keyed by device location. Their mere presence is what used to
+/// divert a batched prefill onto the mask-free varlen backend.
+fn v4c_varlen_flash_params(batch: usize, padded_len: usize, device: &Device) -> FlashParams {
+    let cu: Vec<u32> = (0..=batch).map(|i| (i * padded_len) as u32).collect();
+    let cu = Tensor::from_vec(cu, batch + 1, device).unwrap();
+    let mut q_map = HashMap::new();
+    let mut k_map = HashMap::new();
+    q_map.insert(device.location(), cu.clone());
+    k_map.insert(device.location(), cu);
+    FlashParams {
+        max_q: padded_len as u32,
+        max_k: padded_len as u32,
+        cumulative_seqlens_q: q_map,
+        cumulative_seqlens_k: k_map,
+        causal: true,
+    }
+}
+
+/// Three prompts of DIFFERENT lengths, prefilled as one right-padded batch,
+/// must each yield the logits of their own last REAL token — the same logits
+/// the sequence produces when prefilled alone.
+///
+/// Pre-fix this does not merely drift: the batched prefill fails inside
+/// `sinks_attn_varlen`, which reads the `[B, 1, T, D]` K/V as if it were a
+/// packed `[total_kv, kv_H, D]` buffer.
+#[test]
+fn v4_ragged_batch_prefill_matches_solo() {
+    let device = Device::Cpu;
+    let mut model = v4c_load();
+    let vocab = v4_compress::VOCAB_SIZE;
+
+    // Lengths straddle the 128 sliding window and are deliberately not
+    // multiples of the CSA ratio (4), so the ragged compressor tail is live
+    // and the batch's compressed axis is wider than the short sequences'.
+    let lens = [V4C_PREFILL_T, 97, 61];
+    let t_max = lens[0];
+    let prompts: Vec<Vec<u32>> = lens
+        .iter()
+        .enumerate()
+        .map(|(s, &len)| {
+            (0..len)
+                .map(|i| ((i * (7 + 6 * s) + 1 + 4 * s) % vocab) as u32)
+                .collect()
+        })
+        .collect();
+
+    // ---- Reference: each prompt alone. ----
+    let solo: Vec<Vec<f32>> = prompts
+        .iter()
+        .map(|p| {
+            v4c_reset(&mut model);
+            let ids = Tensor::from_vec(p.clone(), (1, p.len()), &device).unwrap();
+            let logits = v4c_step(model.as_ref(), &ids, 0).expect("solo prefill must not error");
+            v4c_row(&logits, 0)
+        })
+        .collect();
+
+    // Teeth: the prompts must be grossly distinguishable, so per-sequence
+    // agreement below cannot be satisfied by an implementation that mixes
+    // them.
+    v4c_assert_chains_differ(&solo[0], &solo[1], "ragged fixture prompts 0 vs 1");
+    v4c_assert_chains_differ(&solo[1], &solo[2], "ragged fixture prompts 1 vs 2");
+
+    // ---- Batched: right-pad to the batch max, exactly like the engine. ----
+    let mut flat: Vec<u32> = Vec::with_capacity(lens.len() * t_max);
+    for p in &prompts {
+        flat.extend_from_slice(p);
+        flat.extend(std::iter::repeat_n(0u32, t_max - p.len()));
+    }
+    let ids = Tensor::from_vec(flat, (lens.len(), t_max), &device).unwrap();
+    // Each row's logits come from its own last REAL token, not the padding.
+    let context_lens: Vec<(usize, usize)> = lens.iter().map(|&len| (len - 1, 1)).collect();
+    let flash = v4c_varlen_flash_params(lens.len(), t_max, &device);
+
+    v4c_reset(&mut model);
+    let logits = model
+        .forward(
+            &ids,
+            &vec![0usize; lens.len()],
+            context_lens,
+            (0..t_max).collect(),
+            None,
+            &flash,
+        )
+        .expect(
+            "ragged batched prefill must not error. A shape error from the varlen sinks \
+             backend here means `sinks_attn` is still routing a masked V4 call onto the \
+             mask-free packed-KV path.",
+        );
+
+    for (i, &len) in lens.iter().enumerate() {
+        v4c_assert_close(
+            &v4c_row(&logits, i),
+            &solo[i],
+            &format!("ragged batch prefill, sequence {i} (len {len})"),
         );
     }
 }
