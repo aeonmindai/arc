@@ -131,6 +131,18 @@ short version:
   | pre-0.3.0, **without** incoherence rotation | **refused.** Under every bake policy shipped so far, rotation was on if and only if the trellis search ran, so such a file is a greedy bake. Re-bake with `mistralrs quantize`, or set `ARC_ALLOW_UNSTAMPED_QTIP=1` to load it anyway for diagnostics. |
   | stamped `greedy` | **refused, no override** |
 
+  The stamp is accompanied by a one-byte **search-detail** field recording
+  *which* trellis search ran: the beam width (`ARC_QTIP_BEAM`, 0 meaning the
+  exhaustive `2^L` dynamic program) and whether the activation-Hessian
+  objective was used. A beam is a real quality trade — `W = 64` measures matmul
+  cosine 0.951 against the exhaustive DP's 0.965 — so an artifact records which
+  one produced it rather than leaving the two indistinguishable. Reserved bits
+  in that field, a width outside `1..65536`, and a `greedy` stamp carrying a
+  beam width are all **refused rather than normalised**: a self-contradictory
+  provenance claim never gets read as a plausible one. The field is mandatory
+  wherever the stamp is present, so a truncated 0.3.0 payload fails closed
+  instead of reading as an exhaustive unweighted bake.
+
   If you baked a `--isq qtip2b` MoE artifact with a build before this release,
   **re-bake it**: that path selected the greedy walk for 3-D expert stacks, so
   the artifact is at the degraded quality even though nothing in the log or the
