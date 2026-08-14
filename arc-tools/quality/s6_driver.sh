@@ -731,6 +731,15 @@ fi
 # =============================================================================
 # S12 — Results out + teardown prep.  NEVER CUT.
 # =============================================================================
+# S12 always runs at the end of a full chain (it is never a trip-wire cut), but
+# a deliberate subset run (S6_ONLY=S4 to retry an upload, say) must NOT tar and
+# shred the token out from under a session that is still going.
+if [ -n "$S6_ONLY" ] && ! want S12; then
+  echo "SKIP_S12 (S6_ONLY=$S6_ONLY) — results and token left untouched"
+  budget_line
+  exit 0
+fi
+
 mark "S12 teardown"
 stop_serve
 cp "$LOG_DIR"/*.log "$RESULTS/" 2>/dev/null

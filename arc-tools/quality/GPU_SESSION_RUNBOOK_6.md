@@ -509,9 +509,22 @@ Three processes, brought up **before** the driver:
 | `s6_status_digest.sh` | `http://<IP>:8899/s6.txt` — **small**: elapsed, spend, budget wire, one GPU line, last 12 event markers, stall markers. This is what the 60 s watchdog polls. |
 | `stall_sentinel2.sh` | three-signal stall detection into `/srv/arcstatus/stall.txt`, folded into the digest |
 
-Plus a per-step `stall_sentinel.sh <log> <secs> <pid>` armed by the driver on
-every long step (boot, bake, gsm8k, voting, each serve) — that one **kills the
-exact PID** on a frozen log.
+Coverage per long step:
+
+| Step | v1 PID sentinel (kills) | v2 global (reports) | other bound |
+|---|---|---|---|
+| S1 boot/build | yes, 30 min | yes | `BOOTSTRAP_COMPLETE` poll, 2 h cap |
+| S2 parity | — (foreground) | yes | — |
+| S3 bake | yes, 20 min | yes | pace gates + `WIRE_BAKE_H` |
+| S4 upload | — (foreground) | yes | one retry, then continue |
+| S5/S9/S10/S11 serve | yes, 15 min each | yes | `wait_health` 900 s |
+| S6/S11 evals | yes, 30 min | yes | `WIRE_STOP_H` |
+| S7 sweep | — (foreground) | yes | — |
+| S8 calibration | — (foreground) | yes | `timeout 1500` |
+
+The v1 sentinel is armed with the step's exact PID captured from `$!` and
+**kills** on a frozen log; v2 never kills. Foreground steps have no PID to arm,
+so they lean on v2 plus their own bound.
 
 **Why v2 exists.** v1 watches one log and kills on no-growth; that misses a step
 that is genuinely working but silent for 20 minutes (it would kill it), and a
