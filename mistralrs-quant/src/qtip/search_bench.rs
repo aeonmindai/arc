@@ -516,12 +516,42 @@ fn probe_rotation_vs_hessian_sensitivity() {
 pub(crate) const MEASURED_BEAM256_LAYER_SECONDS: f64 = 238.0;
 /// Measured on the same box class for the exhaustive prefix-grouped Viterbi.
 pub(crate) const MEASURED_EXHAUSTIVE_LAYER_SECONDS: f64 = 510.0;
-/// `cuobjdump -res-usage`, sm_90a: `REG:80 STACK:0 SHARED:38992 LOCAL:0`.
-/// 256 threads x 80 reg = 20,480 reg/block; 65,536 / 20,480 = 3 blocks/SM;
-/// 24 of 64 warps = 37.5% occupancy. Register-limited, not shared-limited
-/// (3 x 38,992 B = 114 KiB of the 228 KiB/SM available).
+/// `cuobjdump -res-usage` on sm_90a, BEFORE wave16:
+/// `REG:80 STACK:0 SHARED:38992 LOCAL:0`. 256 threads x 80 reg = 20,480
+/// reg/block; 65,536 / 20,480 = 3 blocks/SM; 24 of 64 warps = 37.5% occupancy.
+/// Register-limited, not shared-limited (3 x 38,992 B = 114 KiB of 228 KiB).
 pub(crate) const MEASURED_BEAM_REGISTERS_PER_THREAD: usize = 80;
+pub(crate) const MEASURED_BEAM_SHARED_BYTES: usize = 38_992;
 pub(crate) const MEASURED_BEAM_BLOCKS_PER_SM: usize = 3;
+
+/// The same command on a wave16 build (branch head `9affb097d`, built in a
+/// separate checkout so the running bake was untouched):
+/// `REG:64 STACK:0 SHARED:39024 LOCAL:0`.
+///
+/// `LOCAL:0` is the load-bearing half. `__launch_bounds__(256, 4)` does not
+/// refuse to compile when it cannot reach 64 registers — it spills, and a
+/// spilled load in the radix loop would run 16 x ~3.87 times per timestep and
+/// invert the occupancy gain. nvcc reached the budget without spilling, so the
+/// 3 -> 4 blocks/SM step is real.
+///
+/// This is a property of the exact source that produced it. Any later edit to
+/// the radix loop or the candidate registers re-opens the question and the
+/// `cuobjdump` gate must be re-run — which is why both endpoints are asserted
+/// below rather than left in a document.
+pub(crate) const MEASURED_BEAM_REGISTERS_AFTER_WAVE16: usize = 64;
+pub(crate) const MEASURED_BEAM_SHARED_BYTES_AFTER_WAVE16: usize = 39_024;
+pub(crate) const MEASURED_BEAM_BLOCKS_PER_SM_AFTER_WAVE16: usize = 4;
+
+// Compile-time, because these are facts about constants and a runtime assert
+// would only fire if someone happened to run the test.
+const _: () = assert!(
+    MEASURED_BEAM_BLOCKS_PER_SM_AFTER_WAVE16 > MEASURED_BEAM_BLOCKS_PER_SM,
+    "the wave16 launch bounds are supposed to BUY occupancy"
+);
+const _: () = assert!(
+    MEASURED_BEAM_SHARED_BYTES_AFTER_WAVE16 * MEASURED_BEAM_BLOCKS_PER_SM_AFTER_WAVE16 <= 233_472,
+    "sm_90 has 228 KiB of shared memory per SM; the target occupancy must fit it"
+);
 
 /// H200 issue capacity: 132 SMs x 4 warp schedulers x 1.98 GHz (measured clock).
 const H200_WARP_INST_PER_S: f64 = 132.0 * 4.0 * 1.98e9;
@@ -639,11 +669,20 @@ fn beam_kernel_cost_breakdown() {
         MEASURED_EXHAUSTIVE_LAYER_SECONDS / MEASURED_BEAM256_LAYER_SECONDS
     );
     println!(
-        "  beam kernel: REG:{} LOCAL:0 SHARED:38992 -> {} blocks/SM, {:.1}% occupancy \
-         (register-limited)",
+        "  beam kernel  (pre-wave16): REG:{} SHARED:{} LOCAL:0 -> {} blocks/SM, \
+         {:.1}% occupancy (register-limited)",
         MEASURED_BEAM_REGISTERS_PER_THREAD,
+        MEASURED_BEAM_SHARED_BYTES,
         MEASURED_BEAM_BLOCKS_PER_SM,
         MEASURED_BEAM_BLOCKS_PER_SM as f64 * 8.0 / 64.0 * 100.0
+    );
+    println!(
+        "  beam kernel (post-wave16): REG:{} SHARED:{} LOCAL:0 -> {} blocks/SM, \
+         {:.1}% occupancy — no spill",
+        MEASURED_BEAM_REGISTERS_AFTER_WAVE16,
+        MEASURED_BEAM_SHARED_BYTES_AFTER_WAVE16,
+        MEASURED_BEAM_BLOCKS_PER_SM_AFTER_WAVE16,
+        MEASURED_BEAM_BLOCKS_PER_SM_AFTER_WAVE16 as f64 * 8.0 / 64.0 * 100.0
     );
     println!("  telemetry: sm=100%, mem=1%, 261 W of 700 W (37% of TDP) at 1980 MHz");
 
@@ -718,16 +757,48 @@ fn cost_model_matches_the_measurement() {
         );
     }
 
-    // Occupancy arithmetic, checked against what cuobjdump actually reported.
+    // Occupancy arithmetic, checked against what `cuobjdump -res-usage`
+    // actually reported at BOTH ends of the wave16 change. Encoding both means
+    // a future edit that silently costs occupancy fails here rather than in a
+    // six-hour bake.
     assert_eq!(
-        blocks_per_sm(MEASURED_BEAM_REGISTERS_PER_THREAD, 38_992),
+        blocks_per_sm(
+            MEASURED_BEAM_REGISTERS_PER_THREAD,
+            MEASURED_BEAM_SHARED_BYTES
+        ),
         MEASURED_BEAM_BLOCKS_PER_SM,
-        "occupancy arithmetic disagrees with the measured cuobjdump result"
+        "occupancy arithmetic disagrees with the pre-wave16 cuobjdump result"
     );
-    // The wave16 fix targets 4 blocks/SM, which needs <= 64 registers/thread.
-    assert_eq!(blocks_per_sm(64, beam_kernel_smem_bytes(256)), 4);
-    // Shared memory is not what limits either configuration.
-    assert!(beam_kernel_smem_bytes(256) * 4 <= 233_472);
+    assert_eq!(
+        blocks_per_sm(
+            MEASURED_BEAM_REGISTERS_AFTER_WAVE16,
+            MEASURED_BEAM_SHARED_BYTES_AFTER_WAVE16
+        ),
+        MEASURED_BEAM_BLOCKS_PER_SM_AFTER_WAVE16,
+        "occupancy arithmetic disagrees with the post-wave16 cuobjdump result"
+    );
+    // 64 registers/thread is exactly the budget 4 blocks/SM requires: one more
+    // register per thread drops it back to 3, so this is a cliff, not a slope.
+    assert_eq!(
+        blocks_per_sm(
+            MEASURED_BEAM_REGISTERS_AFTER_WAVE16 + 1,
+            MEASURED_BEAM_SHARED_BYTES_AFTER_WAVE16
+        ),
+        3,
+        "65 registers/thread should fall off the 4-blocks/SM cliff"
+    );
+    // Shared memory limits neither configuration; registers do.
+    assert!(
+        blocks_per_sm(1, MEASURED_BEAM_SHARED_BYTES_AFTER_WAVE16)
+            > MEASURED_BEAM_BLOCKS_PER_SM_AFTER_WAVE16,
+        "shared memory alone would allow more blocks — the limit is registers"
+    );
+    // The hand arithmetic in `beam_kernel_smem_bytes` should track the reported
+    // figure closely; the gap is compiler/driver overhead, not a miscount.
+    assert!(
+        MEASURED_BEAM_SHARED_BYTES_AFTER_WAVE16.saturating_sub(beam_kernel_smem_bytes(256)) < 2048,
+        "declared shared memory drifted from what cuobjdump reports"
+    );
 }
 // ---------------------------------------------------------------------------
 // CUDA beam kernel: measured cost drivers (wave16-AF)
