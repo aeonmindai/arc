@@ -388,3 +388,113 @@ fn run_grid(
 
     cells
 }
+
+// ---------------------------------------------------------------------------
+// Rotation vs. Hessian: which fixture regime does each one win in?
+// ---------------------------------------------------------------------------
+
+/// Per-channel scales with a tunable dispersion: log-normal(0, `sigma`) bulk
+/// plus a 10x outlier tail for channels above `outlier_z`.
+fn channel_scales_sigma(k: usize, seed: u64, sigma: f64, outlier_z: f64) -> Vec<f32> {
+    let mut rng = Rng::new(seed);
+    (0..k)
+        .map(|_| {
+            let base = (rng.normal() * sigma).exp();
+            let outlier = if rng.normal() > outlier_z { 10.0 } else { 1.0 };
+            (base * outlier) as f32
+        })
+        .collect()
+}
+
+/// **The control that stops the headline table being over-read.**
+///
+/// `trellis_search_headroom_table`'s rotation-off arm reports matmul cos 0.995
+/// for the Hessian objective against 0.965 for the shipping recipe
+/// (rotation + unweighted). Both arms share one fixture, one calibration draw,
+/// one held-out evaluation draw and one dense reference, so those numbers ARE
+/// directly comparable — which invites the reading "drop rotation, weight by
+/// the Hessian instead". This sweep shows that reading is an artefact of a
+/// single fixture's activation dispersion.
+///
+/// Sweeping the channel-energy dynamic range of `diag(H)` across three weight
+/// fixtures shows the crossover sits far above anything an LLM produces:
+/// at AWQ-like dispersion (~10³:1) rotation wins by 0.08 cos on FP4-lattice
+/// weights, at 10⁴:1 it still wins by 0.03, and only past ~10⁷:1 — where the
+/// weakest input channel carries twelve million times less energy than the
+/// strongest — does the unrotated Hessian objective overtake it.
+///
+/// It also reproduces wave3-G independently (FP4-lattice, rotation on vs off,
+/// unweighted: 0.957 vs 0.843 here; 0.963 vs 0.860 there) and shows rotation
+/// buys nothing on already-Gaussian weights (0.9633 vs 0.9626) — i.e. rotation's
+/// job is fixing heavy-tailed/lattice weight distributions, which is a different
+/// job from the Hessian's.
+///
+/// `cargo test -p mistralrs-quant --lib probe_rotation_vs_hessian -- --ignored --nocapture`
+#[test]
+#[ignore = "evidence probe (~45s); run with --ignored --nocapture"]
+fn probe_rotation_vs_hessian_sensitivity() {
+    let (n, k, cb, eb) = (16usize, 2048usize, 256usize, 256usize);
+    let fixtures: Vec<(&str, Vec<f32>)> = vec![
+        (
+            "gaussian   ",
+            super::bake_quality_tests::gen_gaussian(n, k, 0.02, 1),
+        ),
+        (
+            "student_t4 ",
+            super::bake_quality_tests::gen_student_t(n, k, 0.02, 2),
+        ),
+        ("fp4_dequant", gen_fp4_dequant(n, k, 0.02, 0x0051_EA11)),
+    ];
+    let spreads = [
+        ("flat       s=0.0 out=0%  ", 0.0, 999.0),
+        ("mild       s=0.3 out=0%  ", 0.3, 999.0),
+        ("awq-like   s=0.3 out=0.3%", 0.3, 2.75),
+        ("moderate   s=0.6 out=1%  ", 0.6, 2.33),
+        ("PR fixture s=0.9 out=3%  ", 0.9, 1.88),
+    ];
+    println!("\nfixture     | spread                    | h_range | r128+unw | r128+hes | r0+unw  | r0+hes");
+    for (fname, w) in &fixtures {
+        for (sname, sigma, oz) in spreads {
+            let scales = channel_scales_sigma(k, 0xC0FF_EE01, sigma, oz);
+            let x_cal = gen_activations(cb, &scales, 0x1234_5678);
+            let x_eval = gen_activations(eb, &scales, 0x8765_4321);
+            let h = hessian_diag(&x_cal, cb, k);
+            let hmax = h.iter().cloned().fold(0f32, f32::max);
+            let hmin = h.iter().cloned().fold(f32::INFINITY, f32::min);
+            let ev = EvalSet {
+                w,
+                n,
+                k,
+                x_eval: &x_eval,
+                batch: eb,
+                h_diag: &h,
+            };
+            let mut cos = [0f64; 4];
+            for (i, (rot, wt)) in [
+                (ROT_BLOCK, false),
+                (ROT_BLOCK, true),
+                (NO_ROT, false),
+                (NO_ROT, true),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let cfg = SearchCfg {
+                    search: TrellisSearch::Exhaustive,
+                    weighted: wt,
+                };
+                let (w_hat, s) = quantize_matrix(w, n, k, cfg, &h, rot);
+                cos[i] = evaluate(&ev, &w_hat, s).matmul_cos;
+            }
+            println!(
+                "{fname} | {sname} | {:>7.0} | {:>8.5} | {:>8.5} | {:>7.5} | {:>7.5}",
+                (hmax / hmin) as f64,
+                cos[0],
+                cos[1],
+                cos[2],
+                cos[3]
+            );
+        }
+        println!("---");
+    }
+}

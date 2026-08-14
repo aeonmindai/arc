@@ -112,7 +112,7 @@ pub(super) fn gen_gaussian(n: usize, k: usize, sigma: f64, seed: u64) -> Vec<f32
 }
 
 /// Heavy-tailed rows: Student-t(4), scaled to std ~sigma.
-fn gen_student_t(n: usize, k: usize, sigma: f64, seed: u64) -> Vec<f32> {
+pub(super) fn gen_student_t(n: usize, k: usize, sigma: f64, seed: u64) -> Vec<f32> {
     let mut rng = Rng::new(seed);
     // Var of t(4) is nu/(nu-2) = 2 → divide by sqrt(2) to hit target sigma.
     (0..n * k)
