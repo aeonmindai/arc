@@ -107,7 +107,7 @@ pub use td_moe_factored::TuckerFactoredLayer;
 pub use unquantized::UnquantLinear;
 pub use utils::bake_budget::{
     arm_bake_budget, bake_budget_armed, disarm_bake_budget, note_bake_layer, project_bake_peak,
-    BakeProjection,
+    BakeBudgetVerdict, BakeProjection,
 };
 pub use utils::flash_attn_sinks_metal;
 pub use utils::flash_attn_sinks_varlen_metal;

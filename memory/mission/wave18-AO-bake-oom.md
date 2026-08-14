@@ -161,22 +161,39 @@ once per fused MoE layer from `FusedExperts::new`. Per layer it samples
 `cuMemGetInfo` and projects:
 
 ```
-growth = max( (used_now − used_after_layer_1) / (layers_done − 1),  used_now − used_prev )
+growth = (used_now − used_4_layers_ago) / 4          # SLOPE_WINDOW = 4
 peak   = used_now + (total_layers − layers_done) × growth
-budget = device_total × (1 − headroom)      # headroom 8%, ARC_BAKE_HEADROOM
+budget = device_total × (1 − headroom)               # 8%, ARC_BAKE_HEADROOM
 ```
 
-Bails with every term printed plus remediations. It measures **device usage**,
-not the bytes we produced, so it sees pool caching and fragmentation — the exact
-thing a tensor-size accounting would miss. Overestimating `total_layers` (dense
-prefix layers never reach `FusedExperts`) only makes it conservative, and it
-only bites when usage is actually growing.
+Stops the bake only after **5 consecutive** over-budget projections
+(`CONSECUTIVE_TRIPS = SLOPE_WINDOW + 1`), then bails with every term printed
+plus remediations. The debounce is the point: a single unlucky layer, where the
+pool happens to grab a whole scratch block, lifts a windowed slope for exactly
+`SLOPE_WINDOW` samples and then falls out of the window, so it can never reach
+the count. Sustained growth can. Killing a healthy two-hour bake on allocator
+noise would be worse than the failure the guard exists to prevent.
 
-Replayed against tonight's samples in
-`bake_budget::tests::wave18_v4_flash_samples_trip_the_guard_at_the_acceleration`:
-quiet through the flat 1.8 GB/layer stretch, fires at the layer-24
-acceleration. Honest accounting: that saves ~15 min of a 2 h run — the value is
-that it fails with a diagnosis and a number instead of a bare `DriverError`.
+It measures **device usage**, not the bytes we produced, so it sees pool caching
+and fragmentation — the exact thing a tensor-size accounting would miss.
+Overestimating `total_layers` (dense prefix layers never reach `FusedExperts`)
+only makes it conservative, and it only bites when usage is actually growing.
+
+**What it would and would not have caught — stated honestly.**
+
+- The *pre-fix retention shape* on an 80 GB H100 (1.61 GiB/layer from layer 1):
+  fires at **layer 6 of 43**, ~22 minutes in, instead of dying at ~layer 40
+  after 2.5 hours. Pinned by
+  `steady_retention_growth_is_caught_in_the_first_quarter_of_the_bake`.
+- **Tonight's actual 140 GB curve: it would not have saved this run.** The
+  steady 1.71 GiB/layer stretch through layer 22 genuinely projects to ~85–95 GB
+  on a 140 GB card — it *fits*. The run was killed by a late nonlinearity that no
+  early projection could see; by the time the trailing window registered it, the
+  card was already near the wall. That is pinned as a test
+  (`the_measured_v4_flash_trend_projects_to_fit_on_a_140gb_card`) so nobody later
+  assumes otherwise. The fix for this particular run is 3a, not the guard.
+- The post-fix shape (flat usage) never even reaches `Watching`
+  (`a_flat_bake_never_warns`).
 
 ### 3d. Streaming UQFF shard writer
 
@@ -260,9 +277,13 @@ it.
 - `bake_to_host_flag_is_visible_from_another_thread` — the switch is
   process-global, so an ISQ-pool thread sees it.
 
-`mistralrs-quant/src/utils/bake_budget.rs` — 6 tests, including tonight's
-measured samples replayed, flat-usage (post-fix shape) never tripping, and the
-`max(average, recent)` slope rule.
+`mistralrs-quant/src/utils/bake_budget.rs` — 8 tests driving the whole state
+machine over 43 samples: a flat bake never warns on either card size; the
+pre-fix 1.61 GiB/layer retention shape is stopped at layer 6 of 43 on an 80 GB
+card; a one-off 20 GiB allocator jump warns but never stops; sustained growth
+stops after exactly `CONSECUTIVE_TRIPS` confirmations; and tonight's measured
+trend is recorded as *fitting* on 140 GB, so the guard's limits are documented
+in code rather than assumed.
 
 Supporting change: `QtipLayer::quantize_3d_concrete_with_bake_config` returns
 the concrete layer (`QuantMethod` does not extend `Any`, so there was previously
