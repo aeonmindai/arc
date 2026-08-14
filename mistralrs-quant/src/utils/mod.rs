@@ -1,3 +1,4 @@
+pub mod bake_budget;
 #[cfg(feature = "cuda")]
 mod ffi;
 pub(crate) mod isq;

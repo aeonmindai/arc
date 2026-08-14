@@ -469,6 +469,21 @@ impl Loader for EmbeddingLoader {
         loading_isq |= topology_requires_post_quant;
         loading_isq |= self.config.from_uqff.is_some();
 
+        // wave18 — same UQFF bake memory policy as the normal loader: a bake
+        // only serializes, so quantized MoE expert stacks are materialized on
+        // the host instead of accumulating on the accelerator. Set on every
+        // load (not just bakes) so a serve is never judged by a previous
+        // bake's setting in the same process.
+        let is_uqff_bake = self.config.write_uqff.is_some()
+            && self.config.from_uqff.is_none()
+            && !crate::pipeline::post_load_hooks::has_registered_hooks();
+        mistralrs_quant::set_bake_isq_to_host(is_uqff_bake);
+        if is_uqff_bake {
+            mistralrs_quant::arm_bake_budget(self.inner.num_layers(&config)?);
+        } else {
+            mistralrs_quant::disarm_bake_budget();
+        }
+
         // Load onto the regular device if not using isq.
         // For immediate ISQ on discrete GPUs, load to CPU: the mapper will set the correct target
         // device per-layer, and linear constructors will override to CPU for ISQ-targeted weights.
@@ -584,6 +599,10 @@ impl Loader for EmbeddingLoader {
         };
 
         let tokenizer = get_tokenizer(paths.get_tokenizer_filename(), None)?;
+
+        // Construction is done; the bake budget has nothing left to police.
+        // (wave18)
+        mistralrs_quant::disarm_bake_budget();
 
         let should_serialize = self.config.write_uqff.is_some();
         let should_quantize_pass = loading_isq;

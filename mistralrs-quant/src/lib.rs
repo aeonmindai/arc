@@ -105,6 +105,10 @@ pub use qtip::{
 };
 pub use td_moe_factored::TuckerFactoredLayer;
 pub use unquantized::UnquantLinear;
+pub use utils::bake_budget::{
+    arm_bake_budget, bake_budget_armed, disarm_bake_budget, note_bake_layer, project_bake_peak,
+    BakeProjection,
+};
 pub use utils::flash_attn_sinks_metal;
 pub use utils::flash_attn_sinks_varlen_metal;
 #[cfg(feature = "cuda")]
@@ -161,6 +165,37 @@ pub fn set_loading_from_uqff(v: bool) {
 
 pub fn loading_from_uqff() -> bool {
     LOADING_FROM_UQFF.with(|c| c.get())
+}
+
+/// Process-global: whether the current run is a UQFF *bake* whose quantized
+/// output only has to be serialized, never used for a forward pass.
+static BAKE_ISQ_TO_HOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark the current load as a UQFF bake, so quantized MoE expert stacks are
+/// materialized on the **host** instead of being retained on the accelerator.
+///
+/// Why this exists (wave18): a bake used to leave every quantized layer
+/// resident on the GPU, so device usage grew by the full artifact size —
+/// ~1.6 GiB per layer for V4 Flash, ~68 GB over 43 layers — on top of the
+/// per-layer quantize working set, and the allocator had to thread its
+/// multi-GiB transients around a permanently growing set of blocks. A 43-layer
+/// bake died at layer 28 on a 140 GB H200 with a 4 KB output directory.
+///
+/// A bake never runs a forward pass: the layers exist only to be handed to
+/// `QuantizedSerde::serialize`, which works the same from host memory. The
+/// quantize math still runs on the GPU — only the *result* comes back.
+///
+/// Not thread-local: the immediate-ISQ thread pool may run a layer's quantize
+/// off the construction thread, and the answer must not depend on which thread
+/// asks. Self-resetting: every load sets it to its own state.
+pub fn set_bake_isq_to_host(v: bool) {
+    BAKE_ISQ_TO_HOST.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether quantized expert stacks should land on the host — see
+/// [`set_bake_isq_to_host`].
+pub fn bake_isq_to_host() -> bool {
+    BAKE_ISQ_TO_HOST.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn set_immediate_isq(isq: Option<IsqType>, predicates: Vec<Regex>) {

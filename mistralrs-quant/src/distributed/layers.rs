@@ -2275,6 +2275,19 @@ impl FusedExperts {
             (gate_proj, up_proj, down_proj)
         };
 
+        // One device-memory sample per fused MoE layer. Inert unless a UQFF
+        // bake armed the budget (`arm_bake_budget`), in which case it refuses
+        // to keep spending GPU-hours once the observed growth rate says the
+        // remaining layers cannot fit — instead of dying at layer 28 of 43 with
+        // an empty output directory, as wave18 did.
+        //
+        // The budget is armed with the model's total layer count, which is an
+        // upper bound on the number of MoE layers (dense prefix layers never
+        // reach here). Overestimating the remaining count only makes the
+        // projection conservative, and it is only ever consulted when device
+        // usage is actually growing per layer.
+        crate::note_bake_layer()?;
+
         Ok(Self {
             fused_gate_proj,
             fused_up_proj,

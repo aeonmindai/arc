@@ -630,6 +630,34 @@ impl Loader for NormalLoader {
             self.config.write_uqff.is_some() && self.config.from_uqff.is_none(),
         );
 
+        // wave18 — UQFF bake memory policy.
+        //
+        // A bake constructs the model only to serialize it: no forward pass
+        // ever runs. Retaining each quantized MoE expert stack on the GPU
+        // therefore buys nothing and costs the whole artifact in device memory
+        // (~68 GB for V4 Flash), which is what made a 43-layer bake die at
+        // layer 28 on a 140 GB H200 with a 4 KB output directory. With this
+        // set, the quantize still runs on the GPU but the packed result is
+        // materialized on the host, so device usage is flat across layers.
+        //
+        // Excluded when a post-load hook is registered (arc-engine's TD-MoE
+        // compressor rewrites the quantized layers in place after the load and
+        // expects them where the model was mapped), and when loading *from* a
+        // UQFF, which is a serve.
+        let is_uqff_bake = self.config.write_uqff.is_some()
+            && self.config.from_uqff.is_none()
+            && !crate::pipeline::post_load_hooks::has_registered_hooks();
+        mistralrs_quant::set_bake_isq_to_host(is_uqff_bake);
+        if is_uqff_bake {
+            info!(
+                "UQFF bake: quantized MoE expert stacks will be materialized on the host \
+                 (quantize still runs on the accelerator)."
+            );
+            mistralrs_quant::arm_bake_budget(self.inner.num_layers(&config)?);
+        } else {
+            mistralrs_quant::disarm_bake_budget();
+        }
+
         if self.config.imatrix.is_some() && self.config.calibration_file.is_some() {
             anyhow::bail!(
                 "`imatrix` and `calibration_file` were both specified, this is not allowed."
@@ -986,6 +1014,12 @@ impl Loader for NormalLoader {
                 );
             }
         }
+
+        // Construction (and with it every per-layer quantize) is done, so the
+        // bake budget has nothing left to police. Disarm it before the
+        // serialize pass so a serve later in this process is not judged against
+        // a stale projection. (wave18)
+        mistralrs_quant::disarm_bake_budget();
 
         // Only if loading from UQFF
         let should_serialize = self.config.write_uqff.is_some();
