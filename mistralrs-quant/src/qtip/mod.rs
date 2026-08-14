@@ -57,13 +57,13 @@ use crate::{
 
 #[cfg(test)]
 mod bake_quality_tests;
-#[cfg(test)]
-mod greedy_ban_tests;
 pub mod bitshift;
 #[cfg(feature = "cuda")]
 mod cuda_ops;
 #[cfg(feature = "cuda")]
 mod ffi;
+#[cfg(test)]
+mod greedy_ban_tests;
 pub mod grouped;
 #[cfg(test)]
 mod search_bench;
@@ -1303,6 +1303,10 @@ impl QtipLayer {
 
     /// [`Self::quantize_with_options_concrete`] with an optional activation
     /// Hessian diagonal (`[K_in]`) for the weighted objective.
+    ///
+    /// Takes the bake configuration from the process environment
+    /// ([`QtipBakeConfig::get`]). To drive a specific search from a test, use
+    /// [`Self::quantize_with_bake_config`].
     pub fn quantize_with_options_concrete_calibrated(
         weight: &Tensor,
         bias: Option<Tensor>,
@@ -1310,6 +1314,44 @@ impl QtipLayer {
         mode: QtipMode,
         use_rotation: bool,
         hessian_diag: Option<&[f32]>,
+    ) -> Result<Self> {
+        Self::quantize_with_bake_config(
+            weight,
+            bias,
+            device,
+            mode,
+            use_rotation,
+            hessian_diag,
+            QtipBakeConfig::get(),
+        )
+    }
+
+    /// [`Self::quantize_with_options_concrete_calibrated`] with the bake
+    /// configuration passed **explicitly** instead of read from the process
+    /// environment.
+    ///
+    /// Why this exists (wave13-AF finding, fixed in wave14-AK): production
+    /// reads `ARC_QTIP_BEAM` / `ARC_QTIP_HESSIAN` once into a `OnceLock` —
+    /// correct, since a bake must not re-read the environment per row, and a
+    /// mid-run change of search would produce a checkpoint no stamp could
+    /// honestly describe. But the memoisation also meant **no test could drive
+    /// a real beam bake end to end**: the round-trip test had to stamp an
+    /// already-baked layer, leaving the path from "a width was requested" to
+    /// "the artifact says beam(W=…)" untested in the one subsystem where a
+    /// mislabelled artifact has burned us repeatedly (DOCTRINE D4).
+    ///
+    /// The env stays the production path and stays memoised; this door only
+    /// lets a caller say which search it wants. It is deliberately *not* wired
+    /// into any loader, CLI flag, or config file — `QtipBakeConfig::get()` is
+    /// still the only way a production bake picks its search.
+    pub fn quantize_with_bake_config(
+        weight: &Tensor,
+        bias: Option<Tensor>,
+        device: &Device,
+        mode: QtipMode,
+        use_rotation: bool,
+        hessian_diag: Option<&[f32]>,
+        bake_cfg: QtipBakeConfig,
     ) -> Result<Self> {
         // D4 fixture door: greedy is reachable only from this crate's own
         // `cfg(test)` builds. Every production caller arrives via
@@ -1349,7 +1391,6 @@ impl QtipLayer {
             //
             // The Hessian-weighted objective remains CPU-only (the branch metric
             // in every CUDA kernel is unweighted), so that flag still refuses.
-            let bake_cfg = QtipBakeConfig::get();
             let cuda_search = cuda_search_plan(bake_cfg.search, cuda_ops::beam_max_width())?;
             if bake_cfg.hessian && hessian_diag.is_some() {
                 candle_core::bail!(
@@ -1419,7 +1460,6 @@ impl QtipLayer {
         // QTIP's relative damping and the `diag(RᵀHR) = block-mean(diag H)`
         // correction; a flat Hessian normalises to exactly 1.0 everywhere and
         // is therefore bit-identical to the unweighted objective.
-        let bake_cfg = QtipBakeConfig::get();
         let calibration_ok = hessian_diag.is_some_and(|h| h.len() == k_in);
         if let Some(h) = hessian_diag {
             if bake_cfg.hessian && h.len() != k_in {

@@ -477,12 +477,46 @@ mod tests {
         Ok(())
     }
 
+    /// Deterministic pseudo-Gaussian values (SplitMix64 + Box-Muller): the same
+    /// seed yields bit-identical `f32`s on every run and every platform.
+    ///
+    /// Same fix, same reason as `dsv4_indexer.rs::det_randn`: this module's
+    /// round-trip test used unseeded `Tensor::randn`, so each test process drew
+    /// a fresh input and the observed FP8 E4M3 max error wandered right up to
+    /// the assertion bound — failing roughly 1 run in 8 (observed 0.2954
+    /// against a `< 0.27` bar). A flaky suite trains everyone to shrug at red,
+    /// so the input is pinned and the bound is set from the measured error on
+    /// *that* input rather than widened until the flake stops.
+    fn det_randn(seed: u64, mean: f32, std: f32, n: usize) -> Vec<f32> {
+        let mut state = seed;
+        let mut next = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let mut vals = Vec::with_capacity(n + 1);
+        while vals.len() < n {
+            // Box-Muller from two uniforms in (0, 1].
+            let u1 = ((next() >> 11) as f64 + 1.0) / (1u64 << 53) as f64;
+            let u2 = ((next() >> 11) as f64 + 1.0) / (1u64 << 53) as f64;
+            let r = (-2.0 * u1.ln()).sqrt();
+            let (s, c) = (2.0 * std::f64::consts::PI * u2).sin_cos();
+            vals.push((mean as f64 + std as f64 * r * c) as f32);
+            vals.push((mean as f64 + std as f64 * r * s) as f32);
+        }
+        vals.truncate(n);
+        vals
+    }
+
     #[test]
     fn test_fp8_vector_quant_cpu() -> Result<()> {
         let dev = &Device::Cpu;
 
-        // Create test input with 256 elements (2 vectors)
-        let input = Tensor::randn(0f32, 2f32, 256, dev)?;
+        // Fixed input: 256 elements (2 vectors of 128) drawn N(0, 2) by
+        // `det_randn`, so `max_error` below is a constant, not a sample.
+        let input = Tensor::from_vec(det_randn(0xF8E4_0001, 0.0, 2.0, 256), 256, dev)?;
 
         // Quantize
         let (quantized, scales) = fp8_vector_quantize(&input)?;
@@ -508,8 +542,22 @@ mod tests {
             max_error = max_error.max(error);
         }
 
-        // FP8 E4M3 has limited precision, so we expect some error
-        assert!(max_error < 0.27, "Max error {max_error} is too large");
+        // Non-degeneracy: FP8 E4M3 keeps 3 mantissa bits, so a real round trip
+        // MUST lose something. An all-zero or otherwise trivial input would
+        // sail past the upper bound while testing nothing.
+        assert!(
+            max_error > 1e-3,
+            "max error {max_error} is implausibly small — the fixture is \
+             degenerate or the round trip is not exercising quantization"
+        );
+        // Upper bound derived from the MEASURED error on this fixed input:
+        // observed max_error = 0.16177654 (F8E4M3, per-128-element scaling,
+        // seed 0xF8E40001). The bar is that value + ~5%, which is far tighter
+        // than the old 0.27 and therefore has MORE teeth, not less: the only
+        // slack is for the last-bit drift `ln`/`sin_cos` can show across libm
+        // implementations, which moves the block max — and hence every scaled
+        // error — by ~1e-6 relative, not by percent.
+        assert!(max_error < 0.17, "Max error {max_error} is too large");
 
         Ok(())
     }
