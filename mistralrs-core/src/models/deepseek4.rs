@@ -351,6 +351,77 @@ impl DeepSeekV4Config {
         self.compress_ratios.get(layer_idx).copied().unwrap_or(0)
     }
 
+    /// The RoPE scaling that applies to a layer with compress ratio
+    /// `compress_ratio`.
+    ///
+    /// YaRN is **per layer** in V4, keyed on the compress ratio. Reference
+    /// `srt/models/deepseek_v4.py:234-238`:
+    ///
+    /// ```python
+    /// if self.compress_ratio:
+    ///     original_seq_len = rope_scaling["original_max_position_embeddings"]
+    /// else:
+    ///     original_seq_len = 0
+    /// ```
+    ///
+    /// and `precompute_freqs_cis` (`srt/layers/deepseek_v4_rope.py:47-53`)
+    /// skips the whole interpolation branch when `original_seq_len == 0`:
+    /// ratio-0 (Standard) layers therefore get plain `1/θ^(2i/d)` with
+    /// `θ = rope_theta`, no ramp and no `factor` division. The MTP block is
+    /// Standard too (`COMPRESS_RATIO_NEXTN_LAYER = 0`,
+    /// `deepseek_v4_nextn.py:47`).
+    ///
+    /// For `deepseek-ai/DeepSeek-V4-Flash` the ratio-0 set is exactly
+    /// `{0, 1, 43}` — layers 0 and 1, plus slot 43, the MTP block. (Layer 42
+    /// has ratio 4; it is *not* Standard.) With the published `factor: 16`,
+    /// applying YaRN there compresses low-frequency rotation ~16×, which is
+    /// what `dsv4_attention.rs` blames for the RUN-161 long-context
+    /// repetition collapse. Audit finding 6.
+    ///
+    /// `ARC_YARN_ON_STANDARD_LAYERS=1` restores Arc's pre-fix behaviour (YaRN
+    /// on every layer) for A/B work; it is not a supported serving mode.
+    pub(crate) fn rope_scaling_for_compress_ratio(
+        &self,
+        compress_ratio: i32,
+    ) -> Option<DeepSeekV2RopeScaling> {
+        if compress_ratio == 0 && std::env::var_os("ARC_YARN_ON_STANDARD_LAYERS").is_none() {
+            None
+        } else {
+            self.rope_scaling.clone()
+        }
+    }
+
+    /// [`Self::rope_scaling_for_compress_ratio`] for a specific layer index.
+    /// `layer_idx == num_hidden_layers` addresses the MTP slot.
+    pub(crate) fn rope_scaling_for_layer(&self, layer_idx: usize) -> Option<DeepSeekV2RopeScaling> {
+        self.rope_scaling_for_compress_ratio(self.layer_compress_ratio(layer_idx))
+    }
+
+    /// RoPE table config for Standard (compress-ratio-0) layers: base
+    /// `rope_theta`, and — per [`Self::rope_scaling_for_compress_ratio`] — no
+    /// YaRN.
+    pub(crate) fn standard_rope_config(&self) -> DeepSeekV2RopeConfig {
+        DeepSeekV2RopeConfig {
+            rope_scaling: self.rope_scaling_for_compress_ratio(0),
+            max_position_embeddings: self.max_position_embeddings,
+            rope_theta: self.rope_theta,
+            qk_rope_head_dim: self.qk_rope_head_dim,
+        }
+    }
+
+    /// RoPE table config for compressed layers (ratio 4 = CSA, 128 = HCA):
+    /// base `compress_rope_theta`, YaRN applied. Reference
+    /// `deepseek_v4.py:220`: `rope_base = config.compress_rope_theta if
+    /// self.compress_ratio else rope_theta`.
+    pub(crate) fn compress_rope_config(&self) -> DeepSeekV2RopeConfig {
+        DeepSeekV2RopeConfig {
+            rope_scaling: self.rope_scaling_for_compress_ratio(4),
+            max_position_embeddings: self.max_position_embeddings,
+            rope_theta: self.compress_rope_theta,
+            qk_rope_head_dim: self.qk_rope_head_dim,
+        }
+    }
+
     /// V4: the "nope" portion of each head vector — the first
     /// `head_dim - qk_rope_head_dim` dims (no RoPE applied here). In V4
     /// Flash this is `512 - 64 = 448`. Derived per audit §0
@@ -1871,14 +1942,23 @@ impl Moe {
 
         let shared_experts = if let Some(n_shared_experts) = n_shared_experts {
             let intermediate_size = cfg.moe_intermediate_size * n_shared_experts;
-            Some(Mlp::new(
-                mapper.set_device(layer_idx, vb.pp("shared_experts"), loading_isq),
-                cfg.hidden_size,
-                intermediate_size,
-                &cfg.quantization_config,
-                cfg.hidden_act,
-                comm,
-            )?)
+            Some(
+                Mlp::new(
+                    mapper.set_device(layer_idx, vb.pp("shared_experts"), loading_isq),
+                    cfg.hidden_size,
+                    intermediate_size,
+                    &cfg.quantization_config,
+                    cfg.hidden_act,
+                    comm,
+                )?
+                // V4: the shared expert carries the SAME trained SwiGLU clamp
+                // as the routed experts — the reference passes
+                // `swiglu_limit=getattr(config, "swiglu_limit", None)` into
+                // `DeepseekV2MLP` (`deepseek_v2.py:619`) and V4 Flash publishes
+                // `swiglu_limit: 10.0`. Audit finding 5: this was dropped on
+                // every device and backend.
+                .with_swiglu_limit(cfg.swiglu_limit),
+            )
         } else {
             None
         };
@@ -3060,26 +3140,13 @@ impl DeepSeekV4 {
         // (10000); compress layers use `compress_rope_theta` (160000).
         let mut rope_standard: HashMap<_, Arc<DeepSeekV2RotaryEmbedding>> = HashMap::new();
         let mut rope_compress: HashMap<_, Arc<DeepSeekV2RotaryEmbedding>> = HashMap::new();
-        let rope_cfg_standard = DeepSeekV2RopeConfig {
-            // RUN-161 ablation: the reference disables YARN on standard layers
-            // (`original_seq_len, rope_theta = 0, args.rope_theta`); arc applies
-            // it. ARC_DISABLE_YARN_STD=1 matches the reference to test whether
-            // YARN-on-standard contributes to the context collapse.
-            rope_scaling: if std::env::var_os("ARC_DISABLE_YARN_STD").is_some() {
-                None
-            } else {
-                cfg.rope_scaling.clone()
-            },
-            max_position_embeddings: cfg.max_position_embeddings,
-            rope_theta: cfg.rope_theta,
-            qk_rope_head_dim: cfg.qk_rope_head_dim,
-        };
-        let rope_cfg_compress = DeepSeekV2RopeConfig {
-            rope_scaling: cfg.rope_scaling.clone(),
-            max_position_embeddings: cfg.max_position_embeddings,
-            rope_theta: cfg.compress_rope_theta,
-            qk_rope_head_dim: cfg.qk_rope_head_dim,
-        };
+        // Audit finding 6: Standard (ratio-0) layers get NO YaRN — the
+        // reference forces `original_seq_len = 0` for them, which skips the
+        // interpolation entirely. Compressed layers (ratio 4 / 128) do get it,
+        // on the `compress_rope_theta` base. See
+        // [`DeepSeekV4Config::rope_scaling_for_compress_ratio`].
+        let rope_cfg_standard = cfg.standard_rope_config();
+        let rope_cfg_compress = cfg.compress_rope_config();
         let mut need_standard_devices: std::collections::HashSet<_> =
             std::collections::HashSet::new();
         let mut need_compress_devices: std::collections::HashSet<_> =
@@ -5197,6 +5264,320 @@ mod tests {
         assert!(
             max_diff > 1e-4,
             "Standard layer output matches dense SDPA — sliding window not applied"
+        );
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // Audit finding 5 — the shared expert's SwiGLU clamp.
+    // ---------------------------------------------------------------------
+
+    /// A layer config small enough to build a real `Moe` on CPU, carrying the
+    /// V4-shaped fields the MoE construction reads. `swiglu_limit` is 1.0 (not
+    /// the shipped 10.0) so the fixture's pre-activations sit far past it.
+    const MOE_FIXTURE_JSON: &str = r#"{
+        "vocab_size": 8,
+        "hidden_size": 2,
+        "moe_intermediate_size": 2,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 1,
+        "n_routed_experts": 2,
+        "n_shared_experts": 1,
+        "num_experts_per_tok": 1,
+        "num_hash_layers": 0,
+        "max_position_embeddings": 8,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000.0,
+        "qk_rope_head_dim": 2,
+        "head_dim": 4,
+        "swiglu_limit": 1.0,
+        "compress_ratios": [0]
+    }"#;
+
+    /// silu(1.0) * 1.0 — the reference output for a gate pre-activation of 5.0
+    /// and an up pre-activation of 3.0 clamped at 1.0.
+    const SHARED_CLAMPED: f32 = 0.731_058_6;
+    /// silu(5.0) * 3.0 — what an unclamped shared expert produces. 20.4x the
+    /// clamped value.
+    const SHARED_UNCLAMPED: f32 = 14.899_607;
+
+    fn moe_fixture_vb(device: &Device) -> ShardedVarBuilder {
+        use std::collections::HashMap;
+        let mut t: HashMap<String, Tensor> = HashMap::new();
+        // Routed experts: all zero, so `y_routed == 0` and the assertion below
+        // reads the shared expert alone.
+        t.insert(
+            "experts.gate_up_proj".to_string(),
+            Tensor::zeros((2, 2, 4), DType::F32, device).unwrap(),
+        );
+        t.insert(
+            "experts.down_proj".to_string(),
+            Tensor::zeros((2, 2, 2), DType::F32, device).unwrap(),
+        );
+        // Shared expert: hidden = inter = 2, input all ones, so the gate
+        // pre-activation is 2 * 2.5 = 5.0 and the up pre-activation 2 * 1.5 = 3.0.
+        // `down_proj` is the identity, so the layer output IS the gated
+        // activation.
+        t.insert(
+            "shared_experts.gate_proj.weight".to_string(),
+            Tensor::from_vec(vec![2.5f32; 4], (2, 2), device).unwrap(),
+        );
+        t.insert(
+            "shared_experts.up_proj.weight".to_string(),
+            Tensor::from_vec(vec![1.5f32; 4], (2, 2), device).unwrap(),
+        );
+        t.insert(
+            "shared_experts.down_proj.weight".to_string(),
+            Tensor::from_vec(vec![1.0f32, 0.0, 0.0, 1.0], (2, 2), device).unwrap(),
+        );
+        t.insert(
+            "gate.weight".to_string(),
+            Tensor::zeros((2, 2), DType::F32, device).unwrap(),
+        );
+        let backend: Box<dyn candle_nn::var_builder::SimpleBackend + 'static> = Box::new(t);
+        mistralrs_quant::safetensors::ShardedSafeTensors::wrap(backend, DType::F32, device.clone())
+    }
+
+    fn build_moe_fixture(cfg: &DeepSeekV4Config) -> Moe {
+        let device = Device::Cpu;
+        let mapper = crate::device_map::DummyDeviceMapper {
+            nm_device: device.clone(),
+        };
+        let comm = mapper.get_comm_for(0).unwrap();
+        Moe::new(
+            cfg,
+            moe_fixture_vb(&device),
+            &mapper,
+            0,
+            false,
+            cfg.n_shared_experts,
+            cfg.n_routed_experts.unwrap(),
+            &comm,
+            device,
+        )
+        .expect("Moe loads")
+    }
+
+    /// Highest-value MoE assertion: the shared expert's clamp is
+    /// device-independent and unconditional, so this runs everywhere.
+    ///
+    /// The reference builds the shared expert as `DeepseekV2MLP(...,
+    /// swiglu_limit=getattr(config, "swiglu_limit", None))`
+    /// (`srt/models/deepseek_v2.py:613-622`) and applies it at `:318-323`;
+    /// V4 Flash publishes `swiglu_limit: 10.0`, so the clamp is mandatory.
+    /// SGLang disables an entire fusion optimization to keep it
+    /// (`deepseek_v4.py:1266-1271`). Arc dropped it on every backend
+    /// (audit finding 5).
+    #[test]
+    fn v4_shared_expert_swiglu_is_clamped() {
+        let cfg: DeepSeekV4Config = serde_json::from_str(MOE_FIXTURE_JSON).unwrap();
+        let moe = build_moe_fixture(&cfg);
+
+        // Wiring: the config's limit reaches the shared expert at all.
+        assert_eq!(
+            moe.shared_experts.as_ref().unwrap().swiglu_limit(),
+            Some(1.0),
+            "config swiglu_limit not threaded into the shared expert"
+        );
+
+        let xs = Tensor::ones((1, 1, 2), DType::F32, &Device::Cpu).unwrap();
+        let out = moe.forward(&xs, None).unwrap();
+        let vals: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        // Relative tolerance: `MatMul::matmul` downcasts CPU matmuls to F16
+        // (mistralrs-quant/src/lib.rs:595-599), so ~5e-4 relative error is
+        // structural. The clamped/unclamped gap is 20.4x.
+        for v in &vals {
+            assert!(
+                (v - SHARED_CLAMPED).abs() / SHARED_CLAMPED < 2e-3,
+                "shared expert dropped the swiglu clamp: {vals:?} (clamped {SHARED_CLAMPED}, unclamped {SHARED_UNCLAMPED})"
+            );
+        }
+    }
+
+    /// The mirror: with no limit the same fixture must produce the unclamped
+    /// value. Without this, a clamp hard-wired to 1.0 would pass the test
+    /// above while breaking every model that is not V4.
+    #[test]
+    fn shared_expert_without_a_swiglu_limit_is_unclamped() {
+        let cfg: DeepSeekV4Config = serde_json::from_str(MOE_FIXTURE_JSON).unwrap();
+        let moe = build_moe_fixture(&cfg);
+        let shared = moe.shared_experts.as_ref().unwrap().clone();
+        let unlimited = Mlp::new(
+            moe_fixture_vb(&Device::Cpu).pp("shared_experts"),
+            2,
+            2,
+            &None,
+            Activation::Silu,
+            &crate::device_map::DummyDeviceMapper {
+                nm_device: Device::Cpu,
+            }
+            .get_comm_for(0)
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(shared.swiglu_limit(), Some(1.0));
+        assert_eq!(unlimited.swiglu_limit(), None);
+
+        let xs = Tensor::ones((1, 2), DType::F32, &Device::Cpu).unwrap();
+        let clamped: Vec<f32> = shared
+            .forward(&xs)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let raw: Vec<f32> = unlimited
+            .forward(&xs)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        for v in &clamped {
+            assert!(
+                (v - SHARED_CLAMPED).abs() / SHARED_CLAMPED < 2e-3,
+                "{clamped:?}"
+            );
+        }
+        for v in &raw {
+            assert!(
+                (v - SHARED_UNCLAMPED).abs() / SHARED_UNCLAMPED < 2e-3,
+                "unlimited Mlp changed: {raw:?}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Audit finding 6 — YaRN must not be applied to Standard (ratio-0) layers.
+    // ---------------------------------------------------------------------
+
+    /// The published `rope_scaling` and `compress_ratios` from
+    /// `deepseek-ai/DeepSeek-V4-Flash`'s `config.json` (fetched 2026-08-14,
+    /// see `memory/mission/wave13-AH-config.md`), on a table small enough to
+    /// build in a unit test. `max_position_embeddings` is reduced from the
+    /// shipped 1048576 — it only sets the table's row count, not the ramp.
+    const V4_ROPE_JSON: &str = r#"{
+        "vocab_size": 129280,
+        "hidden_size": 4096,
+        "moe_intermediate_size": 2048,
+        "num_hidden_layers": 43,
+        "num_attention_heads": 64,
+        "max_position_embeddings": 16384,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000,
+        "compress_rope_theta": 160000,
+        "qk_rope_head_dim": 64,
+        "head_dim": 512,
+        "rope_scaling": {
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "factor": 16,
+            "original_max_position_embeddings": 65536,
+            "type": "yarn"
+        },
+        "compress_ratios": [0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 0]
+    }"#;
+
+    /// Pins **which** layers get YaRN, so a config change or a refactor cannot
+    /// silently re-enable it on the ratio-0 set.
+    ///
+    /// Reference `deepseek_v4.py:234-238` forces `original_seq_len = 0` when
+    /// `compress_ratio == 0`, and `deepseek_v4_rope.py:47-53` then skips the
+    /// interpolation entirely. For V4 Flash the ratio-0 set is exactly
+    /// `{0, 1, 43}` — layers 0 and 1 plus slot 43, the MTP block.
+    /// **Layer 42 has ratio 4 and is NOT in the set** (the audit text says
+    /// "0, 1, 42"; that is an error, corrected by the published config).
+    #[test]
+    fn yarn_applies_to_compressed_layers_only() {
+        let cfg: DeepSeekV4Config = serde_json::from_str(V4_ROPE_JSON).unwrap();
+        assert_eq!(cfg.compress_ratios.len(), 44);
+        assert!(
+            cfg.rope_scaling.is_some(),
+            "fixture must publish rope_scaling"
+        );
+
+        let unscaled: Vec<usize> = (0..44)
+            .filter(|i| cfg.rope_scaling_for_layer(*i).is_none())
+            .collect();
+        assert_eq!(
+            unscaled,
+            vec![0, 1, 43],
+            "the no-YaRN set must be exactly layers 0, 1 and the MTP slot (43)"
+        );
+        // Layer 42 is CSA (ratio 4), so it keeps YaRN — the audit's "0, 1, 42"
+        // wording is wrong.
+        assert_eq!(cfg.layer_compress_ratio(42), 4);
+        assert!(cfg.rope_scaling_for_layer(42).is_some());
+
+        for i in 0..44 {
+            assert_eq!(
+                cfg.rope_scaling_for_layer(i).is_some(),
+                cfg.layer_compress_ratio(i) != 0,
+                "layer {i} YaRN decision disagrees with its compress ratio"
+            );
+        }
+        // Ratio histogram from the published config: 21 CSA, 20 HCA, 3 Standard.
+        assert_eq!(cfg.compress_ratios.iter().filter(|r| **r == 4).count(), 21);
+        assert_eq!(
+            cfg.compress_ratios.iter().filter(|r| **r == 128).count(),
+            20
+        );
+        assert_eq!(cfg.compress_ratios.iter().filter(|r| **r == 0).count(), 3);
+    }
+
+    /// The numerical half: the Standard-layer rotary table must be plain
+    /// `1/θ^(2i/d)` — bit-comparable to an explicitly unscaled config — while
+    /// the compressed table must still show the YaRN ramp.
+    ///
+    /// The mirror assertion matters as much as the first: a "fix" that
+    /// disabled YaRN everywhere would pass the first check alone.
+    #[test]
+    fn standard_layer_rope_is_unscaled_and_compressed_is_not() -> Result<()> {
+        let cfg: DeepSeekV4Config = serde_json::from_str(V4_ROPE_JSON).unwrap();
+        let dev = Device::Cpu;
+        let pos = cfg.max_position_embeddings - 1;
+        let shape = (1usize, 1usize, 1usize, cfg.qk_rope_head_dim);
+        let q = Tensor::ones(shape, DType::F32, &dev)?;
+
+        let rope_of = |c: &DeepSeekV2RopeConfig| -> Result<Vec<f32>> {
+            let r = DeepSeekV2RotaryEmbedding::new(c, DType::F32, &dev)?;
+            let (out, _) = r.forward(&q, &q, &[pos])?;
+            out.flatten_all()?.to_vec1::<f32>()
+        };
+        let max_diff = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b.iter())
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max)
+        };
+
+        // Standard layers: what `DeepSeekV4::new` builds vs the reference's
+        // `original_seq_len = 0` table (plain inverse frequencies, base 10000).
+        let standard = rope_of(&cfg.standard_rope_config())?;
+        let reference_unscaled = rope_of(&DeepSeekV2RopeConfig {
+            rope_scaling: None,
+            max_position_embeddings: cfg.max_position_embeddings,
+            rope_theta: cfg.rope_theta,
+            qk_rope_head_dim: cfg.qk_rope_head_dim,
+        })?;
+        assert!(
+            max_diff(&standard, &reference_unscaled) < 1e-6,
+            "Standard-layer RoPE is YaRN-scaled (max diff {})",
+            max_diff(&standard, &reference_unscaled)
+        );
+
+        // Compressed layers: YaRN must still bite, on the compress base.
+        let compressed = rope_of(&cfg.compress_rope_config())?;
+        let compressed_unscaled = rope_of(&DeepSeekV2RopeConfig {
+            rope_scaling: None,
+            max_position_embeddings: cfg.max_position_embeddings,
+            rope_theta: cfg.compress_rope_theta,
+            qk_rope_head_dim: cfg.qk_rope_head_dim,
+        })?;
+        assert!(
+            max_diff(&compressed, &compressed_unscaled) > 1e-3,
+            "compressed-layer RoPE lost its YaRN ramp (max diff {})",
+            max_diff(&compressed, &compressed_unscaled)
         );
         Ok(())
     }
