@@ -102,6 +102,51 @@ nvcc --version | tail -2      # toolkit (or ls /usr/local/cuda-*)
   build shell for the whole session (session-3's pinning).
 - Also check: H200 141GB visible; ≥600GB disk free. HF_TOKEN not needed.
 
+**0a-BIS. BOX HEALTH GATE — MANDATORY, before the download starts** (session
+5: ~1.5h and ~$7 lost). A rental can be individually bad in a way no compile
+check will show. Box **s5a** (NY H200, 192.241.248.189) ran the *session-3
+binary* `cca7a9c2e` — proven at ~30 s/layer — at **~3 min/layer**. A bisect
+proved the slowdown was ENVIRONMENTAL, not our kernels. The signature:
+
+| metric | s5a | reading |
+|---|---|---|
+| GPU utilization | **99%** | looks perfectly healthy — this is the trap |
+| `power.draw` | **~132 W of a 700 W limit** (19%) | the tell |
+| `clocks.sm` | at max | not throttling |
+| temperature | fine | not thermal |
+
+Clocks maxed + power floored = the device is **starved waiting on host↔device
+transfers**. QTIP Viterbi quantize streams every expert CPU→GPU→CPU, so the
+bake is transfer-heavy; a slow host/PCIe path on one rental crawls it.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/aeonmindai/arc/session4-runbook/arc-tools/quality/box_health_gate.sh -o /root/box_health_gate.sh
+bash /root/box_health_gate.sh --json /srv/arcstatus/box_health.json   # ~90s
+```
+
+- Checks: GPU name/driver, **sustained `power.draw` under a ~60 s synthetic
+  CUDA load** (auto-picks a prebuilt `viterbi_bake_bench`, else a torch
+  matmul+H2D loop, else an nvcc'd burn), `clocks.sm` vs `clocks.max.sm`,
+  PCIe gen/width, `nproc`, disk free. Writes PASS/FAIL lines + JSON.
+- **ABORT-IF exit code 1** (sustained power < 28.6% of the enforced limit =
+  **<200 W on a 700 W H200**, or any other FAIL line): **delete the instance
+  and re-rent a different box — preferably a different region.** Do NOT debug
+  the rental, do NOT "see how it goes". Deleting costs $0.08; s5a cost $7.
+- Thresholds are **heuristics from one datapoint (s5a)**, tuned to catch a 6×
+  slow box, not to grade a 10% slow one. `--min-power <W>` overrides.
+- After step 1's build, re-run with the ground-truth pace probe — this is the
+  highest-signal check and supersedes the proxies above:
+
+```bash
+bash /root/box_health_gate.sh --arc $ARC --with-bake-probe "$V4_DIR" \
+  --json /srv/arcstatus/box_health_bake.json      # 3 min, then it kills the bake
+```
+
+  It starts the real `quantize`, counts `Detected INT4` layer-progress lines
+  for 3 minutes, PID-kills it, and **FAILs at <3 lines** (session-3 healthy ≈
+  6 per 3 min at ~30 s/layer; s5a ≈ 1). It also flags a `QTIP GPU quantize
+  fallback` line and warns if the binary asks for >2 ISQ threads.
+
 **0b. Boot** (build ∥ download; boot script honors `ARC_BRANCH` and re-runs
 the toolkit gate):
 
@@ -221,7 +266,8 @@ nohup bash /root/stall_sentinel.sh /root/logs/bake4.log 900 $BAKE_PID \
 ```bash
 sleep 180
 grep -c "QTIP GPU quantize fallback" /root/logs/bake4.log     # MUST be 0
-grep "Applying ISQ on" /root/logs/bake4.log                   # >1 threads (Viterbi)
+grep -E "Applying (immediate )?ISQ .*threads" /root/logs/bake4.log  # MUST be 1 thread
+grep -c "Detected INT4" /root/logs/bake4.log                  # MUST be >=3 by minute 3
 wc -c /root/logs/bake4.log; sleep 60; wc -c /root/logs/bake4.log   # still growing
 ```
 
@@ -230,6 +276,18 @@ wc -c /root/logs/bake4.log; sleep 60; wc -c /root/logs/bake4.log   # still growi
   per-layer progress (≥1 layer/min equivalent — log actively growing past
   the first expert stacks). CPU-crawl pace is ~11 min/layer: a log that has
   the fallback warn, or that freezes after the first stack, is the crawl.
+- **Thread count MUST read 1** (session-5 trap). PR #20's Viterbi-default
+  flipped `get_max_isq_cpu_threads()` to `None` = all cores, so the bake
+  logged `Applying immediate ISQ in parallel on 24 threads` — 24 host threads
+  submitting Viterbi work to ONE device, ~4-9 min/layer with no fallback
+  warning. Session-3's fast bake logged `1 threads`. Fixed in code (the QTIP
+  rungs now cap at 1 whenever the quantize runs on GPU, and the log carries
+  the rationale); `MISTRALRS_ISQ_SINGLETHREAD=1` remains the belt-and-braces
+  override on any older binary — including the s2-binary pivot below.
+- **Slow bake with 1 thread and no fallback warn ⇒ it is the BOX, not us.**
+  Do not bisect our kernels (session 5 did, and the session-3 binary was just
+  as slow). Run `box_health_gate.sh` from step 0a-BIS, and on FAIL delete +
+  re-rent.
 - **ABORT-AND-DIAGNOSE if the fallback warn appears**: capture the full warn
   line (it names the condition — that line is a primary session deliverable
   for wave6-Q). `kill $BAKE_PID`, then pivot to the **s2-binary bake trick**
@@ -618,6 +676,45 @@ python3 $Q/batch_load_probe.py --label s5_sustained --batches 64 --duration 120
 - Pre-session validation, $0, no GPU: `python3 $Q/test_batch_load_probe.py`
   (mock-server smoke asserting the probe's math — wave-1 dry-run precedent).
 
+### SESSION 5 DELTA — two hardware lessons, now enforced in code
+
+**1. The box-health gate is MANDATORY (step 0a-BIS).** Session 5 rented an
+H200 (s5a, NY, 192.241.248.189) where the *session-3 binary* baked at ~3
+min/layer instead of ~30 s. Environmental, not ours: 99% util, **132 W of a
+700 W limit**, clocks maxed, temps fine ⇒ starved on host↔device transfers.
+Cost ~1.5h before detection. From session 6 on:
+
+```bash
+bash /root/box_health_gate.sh --json /srv/arcstatus/box_health.json          # after boot, ~90s
+bash /root/box_health_gate.sh --arc $ARC --with-bake-probe "$V4_DIR" \
+     --json /srv/arcstatus/box_health_bake.json                              # after the build, 3 min
+```
+
+Exit 1 ⇒ **delete the instance and re-rent a different box/region**. Never
+debug a rental. Thresholds (<200 W sustained on a 700 W board; <3 layers per
+3 min) are one-datapoint heuristics, documented as such in the script.
+
+**2. Bake threading is fixed in code — stop relying on the env var.** Session
+5 also logged `Applying immediate ISQ in parallel on 24 threads` where
+session 3 logged `1 threads`: PR #20's Viterbi-default made
+`IsqType::QtipBitshift2 | Qtip2b => get_max_isq_cpu_threads()` return `None`
+(= all cores), so N CPU threads each pushed GPU Viterbi work at ONE device.
+The QTIP rungs now resolve their thread cap against where the quantize
+actually runs (`IsqQuantizeBackend`): **1 thread on a GPU-backed bake**, all
+cores only for a genuinely CPU-side Viterbi. Every ISQ log line now carries
+the rationale, e.g.
+
+```
+ISQ thread policy: 1 thread(s) — QTIP quantize runs in GPU kernels on one
+device; extra host threads only contend for it (session-5 bake trap).
+```
+
+`MISTRALRS_ISQ_SINGLETHREAD=1` still wins over everything and is still the
+right thing to export for the s2-binary pivot (that binary predates the fix).
+On the bad box single-threading did NOT fix the crawl — that was the
+environment — so both lessons are needed, and gate 1 is the one that saves
+the money.
+
 ## Appendix — verified names cheat sheet (verified against master 381063914, 2026-08-14)
 
 | Thing | Value | Where verified |
@@ -637,5 +734,6 @@ python3 $Q/batch_load_probe.py --label s5_sustained --batches 64 --duration 120
 | Batch-curve bench | `cargo run --release -p mistralrs-quant --example qtip_grouped_curve --features cuda` — this branch; CPU smoke verified | `mistralrs-quant/examples/qtip_grouped_curve.rs` |
 | GSM8K harness knobs | `--votes K --vote-mode … [--client-votes] [--eight-shot] [--fewshot-seed 8] --max-tokens 2048`; output name gains `_8shot`/`_votes5`/`_cvotes5` suffixes; train pool `data/gsm8k_train.jsonl` (fetch_data.sh) | this branch, `run_gsm8k.py`/`qlib.py`/`fetch_data.sh` |
 | Vote-smoke risk | compressor `xs_history` is one per-model `Mutex<SingleCache>` — multi-chain batches untested on V4 before step 3c | `mistralrs-core/src/models/deepseek4.rs:791` |
-| Ops scripts | `status_server.sh` (HTTP :8899, /srv/arcstatus, 30s snapshots), `stall_sentinel.sh <log> <secs> [pid]` (PID-kill escalation) | this branch, `arc-tools/quality/` |
+| Ops scripts | `status_server.sh` (HTTP :8899, /srv/arcstatus, 30s snapshots), `stall_sentinel.sh <log> <secs> [pid]` (PID-kill escalation), `box_health_gate.sh [--with-bake-probe <dir>]` (step 0a-BIS; exit 1 = delete + re-rent) | this branch, `arc-tools/quality/` |
+| ISQ thread policy | `mistralrs_quant::isq_thread_policy(ty, device)` → `(threads, rationale)`; QTIP rungs cap at **1** when `IsqQuantizeBackend::Gpu`. Log line: `ISQ thread policy: N thread(s) — <rationale>` | `mistralrs-quant/src/lib.rs`, session-5 delta |
 | Serve / bake commands | runbook 2 base (`serve -p 1234 … --from-uqff … --prefix-cache-n 0`; `quantize text … --isq qtip2`) **+ every serve line adds `--chat-template chat_templates/deepseek_v4.json`** — without it `/v1/chat/completions` 422s (session-4 root cause #1 of the vote-API failures) | runbook-2 appendix; session-4 finding |
