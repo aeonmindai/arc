@@ -2447,6 +2447,26 @@ mod tests {
         let (restored, ext_bias) = Qtip2bLayer::deserialize_ext_bias(payload, &device, guard)?;
         assert!(ext_bias.is_some());
 
+        // wave13-AF: this rung shares the LUT rung's wire rule, so its
+        // search-detail flags byte must survive the round-trip too. The bake
+        // claim is always exhaustive/unweighted today — `viterbi_quantize_row_2b`
+        // IS the exhaustive DP and this rung has no weighted metric — and
+        // pinning it is what will catch the claim drifting when qtip2b grows a
+        // beam kernel. (The wire half is covered by the byte-exact dequant
+        // comparison below: a mis-sized provenance tail desynchronises the
+        // parse.)
+        assert_eq!(layer.search_detail(), QtipSearchDetail::EXHAUSTIVE_MSE);
+        let (typed, _) = Qtip2bLayer::deserialize_concrete(
+            layer.serialize()?,
+            &device,
+            QuantizeOntoGuard::new(),
+        )?;
+        assert_eq!(
+            typed.search_detail(),
+            QtipSearchDetail::EXHAUSTIVE_MSE,
+            "qtip2b search detail did not survive the UQFF round-trip"
+        );
+
         let dq_orig: Vec<f32> = layer
             .dequantize_weights()?
             .to_dtype(DType::F32)?
