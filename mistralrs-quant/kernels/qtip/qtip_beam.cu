@@ -206,6 +206,68 @@ __device__ __forceinline__ unsigned int qb_block_excl_scan(
 // `#pragma unroll`s sends the array to local memory on its own.
 constexpr int QB_MIN_BLOCKS_PER_SM = 4;
 
+// Locate the digit bin containing the k-th smallest, and clear the histogram
+// behind it — the whole scan done by ONE warp, with no block barrier inside.
+//
+// wave17-AF: this replaces a general block-wide exclusive scan that cost three
+// `__syncthreads` on a path executed ~3.87 times per timestep. The general scan
+// is the wrong tool: we do not need all 256 prefix sums, only the single bin
+// where the running total crosses `k`. Warp 0 covers the 256 bins as 32 lanes ×
+// 8 bins, warp-scans the 32 lane subtotals with shuffles (no barrier exists
+// inside a warp), and the one lane whose range straddles `k` walks its own 8
+// bins to pin the bin exactly.
+//
+// The caller supplies the barrier AFTER this returns; the barrier BEFORE it
+// (making the histogram visible) is the caller's histogram-fill barrier. Net
+// cost: 2 barriers per radix pass instead of 5.
+//
+// Clearing is folded in: every bin is read exactly once here, by exactly one
+// lane, so zeroing it in the same pass maintains the all-zero invariant with no
+// extra traffic and no extra barrier.
+__device__ __forceinline__ void qb_select_digit_bin(
+    unsigned int* __restrict__ s_hist,
+    int k,
+    unsigned int* __restrict__ s_sel_bin,
+    unsigned int* __restrict__ s_sel_k,
+    unsigned int* __restrict__ s_sel_cnt
+) {
+    if (threadIdx.x >= 32u) return;
+    const unsigned int lane = threadIdx.x;
+    const unsigned int base = lane * 8u;
+
+    unsigned int c[8];
+    unsigned int sub = 0u;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        c[i] = s_hist[base + i];
+        s_hist[base + i] = 0u;      // maintain the all-zero invariant
+        sub += c[i];
+    }
+
+    // Inclusive scan of the 32 lane subtotals.
+    unsigned int inc = sub;
+    #pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+        const unsigned int y = __shfl_up_sync(0xFFFFFFFFu, inc, d);
+        if (lane >= (unsigned int)d) inc += y;
+    }
+    const unsigned int excl = inc - sub;
+
+    // Exactly one lane's 8-bin range straddles k.
+    if (excl < (unsigned int)k && (unsigned int)k <= inc) {
+        unsigned int run = excl;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            if (run < (unsigned int)k && (unsigned int)k <= run + c[i]) {
+                *s_sel_bin = base + (unsigned int)i;
+                *s_sel_k   = (unsigned int)k - run;
+                *s_sel_cnt = c[i];
+            }
+            run += c[i];
+        }
+    }
+}
+
 __global__ void __launch_bounds__(QB_THREADS, QB_MIN_BLOCKS_PER_SM)
 qtip_quantize_rows_beam_kernel(
     const float*   __restrict__ weight,      // [n_rows, in_features]
@@ -331,7 +393,13 @@ qtip_quantize_rows_beam_kernel(
         const int  ng     = s_n_groups;
         const bool active = (tid < ng);
         unsigned int base_state = 0u;
-        float cand[QB_ALPHABET];
+        // wave17-AF: the candidates are carried as their ORDERED u32 KEYS, not
+        // as floats. `qtip_total_order_key` is a bijection, so this loses
+        // nothing, and it deletes a key rebuild (2 instructions x 16
+        // candidates) from every radix pass and from compaction — ~5 rebuilds
+        // per timestep at the measured 3.87 passes. The float is recovered
+        // exactly, once, for the survivors that reach the beam.
+        unsigned int cand[QB_ALPHABET];
         if (active) {
             base_state = ((unsigned int)s_grp_g[tid]) << QB_K;
             const float gcost = s_grp_cost[tid];
@@ -340,11 +408,11 @@ qtip_quantize_rows_beam_kernel(
             #pragma unroll
             for (int j = 0; j < (int)QB_ALPHABET; ++j) {
                 const float err = qtip_decode_err_exact_lv(lp[2 * j + 0], lp[2 * j + 1], t0, t1);
-                cand[j] = __fadd_rn(gcost, err);
+                cand[j] = qtip_total_order_key(__fadd_rn(gcost, err));
             }
         } else {
             #pragma unroll
-            for (int j = 0; j < (int)QB_ALPHABET; ++j) cand[j] = 0.0f;
+            for (int j = 0; j < (int)QB_ALPHABET; ++j) cand[j] = 0u;
         }
         const int n_cand = ng * (int)QB_ALPHABET;
 
@@ -383,7 +451,7 @@ qtip_quantize_rows_beam_kernel(
                     unsigned int ck = 0u;
                     bool part = false;
                     if (active) {
-                        ck = qtip_total_order_key(cand[j]);
+                        ck = cand[j];
                         // `shift == 24` makes the guard vacuous; the compiler
                         // folds it away in that unrolled iteration.
                         part = (shift == 24) ||
@@ -395,19 +463,7 @@ qtip_quantize_rows_beam_kernel(
                 __syncthreads();
 
                 // Find the digit bin holding the k-th smallest of this prefix.
-                // Clear-for-next-pass here rather than at the top of the next
-                // one: every thread reads only its OWN bin, so zeroing it
-                // immediately after that read needs no barrier, and it removes
-                // one barrier per radix pass.
-                const unsigned int v = s_hist[tid];
-                s_hist[tid] = 0u;
-                unsigned int total = 0u;
-                const unsigned int excl = qb_block_excl_scan(v, s_warp_tot_buf + QB_WARPS * (qb_scan_slot ^= 1u), &total);
-                if (excl < (unsigned int)k && (unsigned int)k <= excl + v) {
-                    s_sel_bin = (unsigned int)tid;
-                    s_sel_k   = (unsigned int)k - excl;
-                    s_sel_cnt = v;
-                }
+                qb_select_digit_bin(s_hist, k, &s_sel_bin, &s_sel_k, &s_sel_cnt);
                 __syncthreads();
 
                 cost_prefix |= s_sel_bin << shift;
@@ -444,7 +500,7 @@ qtip_quantize_rows_beam_kernel(
                         unsigned int st = 0u;
                         if (active) {
                             st = base_state | (unsigned int)j;
-                            part = (qtip_total_order_key(cand[j]) == cost_prefix) &&
+                            part = (cand[j] == cost_prefix) &&
                                    ((shift == 8) ||
                                     ((st >> (shift + 8)) == (state_prefix >> (shift + 8))));
                         }
@@ -453,15 +509,7 @@ qtip_quantize_rows_beam_kernel(
                     }
                     __syncthreads();
 
-                    const unsigned int v = s_hist[tid];
-                    s_hist[tid] = 0u;   // maintain the all-zero invariant
-                    unsigned int total = 0u;
-                    const unsigned int excl = qb_block_excl_scan(v, s_warp_tot_buf + QB_WARPS * (qb_scan_slot ^= 1u), &total);
-                    if (excl < (unsigned int)k && (unsigned int)k <= excl + v) {
-                        s_sel_bin = (unsigned int)tid;
-                        s_sel_k   = (unsigned int)k - excl;
-                        s_sel_cnt = v;
-                    }
+                    qb_select_digit_bin(s_hist, k, &s_sel_bin, &s_sel_k, &s_sel_cnt);
                     __syncthreads();
 
                     state_prefix |= s_sel_bin << shift;
@@ -485,8 +533,7 @@ qtip_quantize_rows_beam_kernel(
         if (active) {
             #pragma unroll
             for (int j = 0; j < (int)QB_ALPHABET; ++j) {
-                const unsigned long long key =
-                    ((unsigned long long)qtip_total_order_key(cand[j]) << 16)
+                const unsigned long long key = ((unsigned long long)cand[j] << 16)
                     | (unsigned long long)(base_state | (unsigned int)j);
                 if (key <= threshold) {
                     keep_mask |= (1u << j);
@@ -505,7 +552,8 @@ qtip_quantize_rows_beam_kernel(
             #pragma unroll
             for (int j = 0; j < (int)QB_ALPHABET; ++j) {
                 if (keep_mask & (1u << j)) {
-                    s_beam_cost[p]   = cand[j];
+                    // Exact inverse; the bijection makes this the identical f32.
+                    s_beam_cost[p]   = qtip_key_to_float(cand[j]);
                     s_beam_state[p]  = (unsigned short)(base_state | (unsigned int)j);
                     s_beam_parent[p] = parent;
                     ++p;

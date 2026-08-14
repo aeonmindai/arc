@@ -91,3 +91,14 @@ __device__ __forceinline__ unsigned int qtip_total_order_key(float x) {
     const unsigned int b = __float_as_uint(x);
     return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
 }
+
+// Exact inverse of `qtip_total_order_key`. The map is a bijection on the 2^32
+// bit patterns, so a candidate can be carried through the selection as its
+// ordered key alone and turned back into the identical float at the end —
+// which is what lets the kernel stop rebuilding a key from a float on every
+// radix pass (wave17-AF). Round-trip identity is pinned by
+// `order_key_round_trips_bitwise` on the Rust side.
+__device__ __forceinline__ float qtip_key_to_float(unsigned int k) {
+    const unsigned int b = (k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k;
+    return __uint_as_float(b);
+}

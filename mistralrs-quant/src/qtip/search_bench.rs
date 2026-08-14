@@ -1011,3 +1011,178 @@ fn wave16_split_key_selection_matches_composite_key() {
          sets ({tie_steps} of them needed the state-bit tie-break)"
     );
 }
+
+/// Does the Guess-Verify-Refine premise actually hold for OUR cost
+/// distribution? wave17-AN ranks GVR the top identity-safe lever; this measures
+/// its premise before any kernel is written on it.
+///
+/// `cargo test -p mistralrs-quant --lib probe_gvr_leverage -- --ignored --nocapture`
+#[test]
+#[ignore = "evidence probe (~1 min); run with --ignored --nocapture"]
+fn probe_gvr_leverage() {
+    use super::viterbi::measure_gvr_leverage;
+
+    let lut = gaussian_lut();
+    println!(
+        "\n=== Guess-Verify-Refine leverage on the real beam cost distribution (W=256) ===\n\
+         survivors = candidates left after the guess; the refine step's cost is proportional to it."
+    );
+    for (label, k) in [("gate/up k=7168", 7168usize), ("down    k=2048", 2048)] {
+        let w = gen_fp4_dequant(2, k, 0.02, 0x00BE_A115);
+        let signs = generate_signs(QTIP_ROTATION_SEED, k);
+        let mut agg = super::viterbi::GvrStats::default();
+        for row in 0..2 {
+            let mut rot = w[row * k..(row + 1) * k].to_vec();
+            apply_block_rotation(&mut rot, &signs, ROT_BLOCK);
+            let max_abs = rot.iter().fold(0f32, |m, &v| m.max(v.abs()));
+            let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 3.0 };
+            let inv = 1.0 / scale;
+            let target: Vec<f32> = rot.iter().map(|&v| v * inv).collect();
+            let s = measure_gvr_leverage(&target, &lut, 256);
+            agg.steps += s.steps;
+            agg.n_cand_sum += s.n_cand_sum;
+            agg.temporal_exact_hits += s.temporal_exact_hits;
+            agg.temporal_high += s.temporal_high;
+            agg.temporal_low += s.temporal_low;
+            agg.temporal_survivors_sum += s.temporal_survivors_sum;
+            agg.delegate1_survivors_sum += s.delegate1_survivors_sum;
+            agg.delegate1_valid_steps += s.delegate1_valid_steps;
+            agg.delegate2_survivors_sum += s.delegate2_survivors_sum;
+            agg.delegate2_valid_steps += s.delegate2_valid_steps;
+            agg.delegate4_survivors_sum += s.delegate4_survivors_sum;
+            agg.delegate4_valid_steps += s.delegate4_valid_steps;
+            agg.tight2_survivors_sum += s.tight2_survivors_sum;
+            agg.tight2_steps += s.tight2_steps;
+            agg.tight4_survivors_sum += s.tight4_survivors_sum;
+            agg.tight4_steps += s.tight4_steps;
+            agg.tight2_delegates_sum += s.tight2_delegates_sum;
+        }
+        let n = agg.mean_n_cand();
+        println!(
+            "\n{label}: {} steps, mean n_cand {n:.0}, W=256 (k/n = 1/{:.0})",
+            agg.steps,
+            n / 256.0
+        );
+        println!(
+            "  TEMPORAL extrapolation: exact hits {:.2}% | usable (guess >= truth) {:.1}% | \
+             misses low {:.1}%",
+            100.0 * agg.temporal_exact_hits as f64 / agg.steps.max(1) as f64,
+            100.0 * agg.temporal_high as f64 / agg.steps.max(1) as f64,
+            100.0 * agg.temporal_low as f64 / agg.steps.max(1) as f64
+        );
+        if agg.temporal_high > 0 {
+            println!(
+                "     survivors when usable: {:.0} of {n:.0} ({:.1}x reduction)",
+                agg.mean_temporal_survivors(),
+                n / agg.mean_temporal_survivors().max(1.0)
+            );
+        }
+        for beta in [1usize, 2, 4] {
+            let valid = match beta {
+                1 => agg.delegate1_valid_steps,
+                2 => agg.delegate2_valid_steps,
+                _ => agg.delegate4_valid_steps,
+            };
+            if valid == 0 {
+                println!("  Dr.Top-k RULE 2 beta={beta}: bound never provable (beta*ng < W)");
+                continue;
+            }
+            let surv = agg.mean_delegate_survivors(beta);
+            println!(
+                "  Dr.Top-k RULE 2 beta={beta} (LOOSE, max of delegates): provable on {:.0}% \
+                 of steps | survivors {surv:.0} of {n:.0} ({:.1}x reduction)",
+                100.0 * valid as f64 / agg.steps as f64,
+                n / surv.max(1.0)
+            );
+        }
+        for (beta, sum, cnt) in [
+            (2usize, agg.tight2_survivors_sum, agg.tight2_steps),
+            (4, agg.tight4_survivors_sum, agg.tight4_steps),
+        ] {
+            if cnt == 0 {
+                continue;
+            }
+            let surv = sum as f64 / cnt as f64;
+            println!(
+                "  Dr.Top-k RULE 2 beta={beta} (TIGHT, W-th of delegates): provable on {:.0}% \
+                 of steps | survivors {surv:.0} of {n:.0} ({:.1}x reduction)",
+                100.0 * cnt as f64 / agg.steps as f64,
+                n / surv.max(1.0)
+            );
+        }
+        if agg.tight2_steps > 0 {
+            println!(
+                "     delegate vector is {:.0} elements ({:.1} per thread vs 16) — the refine's \
+                 own sub-selection",
+                agg.tight2_delegates_sum as f64 / agg.tight2_steps as f64,
+                agg.tight2_delegates_sum as f64 / agg.tight2_steps as f64 / 256.0
+            );
+        }
+    }
+}
+
+/// The ordered-key transform must be an exact bijection, because wave17-AF's
+/// kernel now carries candidates as keys and recovers the float only for the
+/// survivors. If the round trip were lossy the beam would store a different
+/// cost than the one it selected on, and every later step would drift.
+///
+/// Exhaustive over all 2^32 bit patterns is too slow for CI; this covers every
+/// structurally interesting class plus a large pseudo-random sample.
+#[test]
+fn order_key_round_trips_bitwise() {
+    fn key(x: f32) -> u32 {
+        let b = x.to_bits();
+        if b & 0x8000_0000 != 0 {
+            !b
+        } else {
+            b | 0x8000_0000
+        }
+    }
+    fn unkey(k: u32) -> f32 {
+        f32::from_bits(if k & 0x8000_0000 != 0 {
+            k & 0x7FFF_FFFF
+        } else {
+            !k
+        })
+    }
+
+    let mut cases: Vec<u32> = vec![
+        0x0000_0000, // +0.0
+        0x8000_0000, // -0.0
+        0x0000_0001, // smallest denormal
+        0x0080_0000, // smallest normal
+        0x3F80_0000, // 1.0
+        0x7F7F_FFFF, // f32::MAX
+        0x7F80_0000, // +inf
+        0xFF80_0000, // -inf
+    ];
+    for i in 0..200_000u32 {
+        let mut z = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        cases.push((z >> 32) as u32);
+    }
+
+    let mut prev: Option<(u32, f32)> = None;
+    for bits in cases {
+        let x = f32::from_bits(bits);
+        if x.is_nan() {
+            continue; // NaN has no defined position in the cost order
+        }
+        assert_eq!(
+            unkey(key(x)).to_bits(),
+            x.to_bits(),
+            "round trip lost bits for {x} ({bits:#010x})"
+        );
+        // Ordering must agree with `f32::total_cmp`, which is what the CPU
+        // beam's `prune_to_width` selects on.
+        if let Some((pk, px)) = prev {
+            let k = key(x);
+            assert_eq!(
+                k.cmp(&pk),
+                x.total_cmp(&px),
+                "key order disagrees with total_cmp for {x} vs {px}"
+            );
+        }
+        prev = Some((key(x), x));
+    }
+}
