@@ -36,6 +36,11 @@ make fmt
 cargo fmt --all -- --check
 
 # Run clippy
+# NOTE: the workspace-wide form below floods with ~180 pre-existing upstream
+# errors and is NOT what CI gates on. Run the scoped lane CI actually uses:
+cargo clippy --no-deps -p arc-bench -p arc-engine -p arc-cuda-graph -p arc-cli \
+  -p mistralrs-quant --tests --examples -- -D warnings
+# (mistralrs-core is out of clippy scope — keep Arc code there clean by hand.)
 cargo clippy --workspace --tests --examples -- -D warnings
 ```
 
