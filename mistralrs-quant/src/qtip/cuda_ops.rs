@@ -638,7 +638,7 @@ pub(crate) fn rotate_x_cuda(x: &Tensor, signs: &Tensor, block_size: usize) -> Re
 // kernel launch, no CPU detour). The function returns `(packed_blocks,
 // row_scales)`.
 
-use super::QtipMode;
+use super::{QtipMode, TrellisSearch};
 
 /// Apply block-diagonal D·H·D rotation in-place to each row of `weight`,
 /// on GPU. `signs` is `[in_features]` F32 ±1 already on the device.
@@ -728,7 +728,7 @@ pub(crate) fn rotate_weight_rows_cuda(
 
 /// Compute per-row scale = max(|row|) / 3.0 (or 1.0 if max=0), returning a
 /// fresh F32 tensor of shape `[n_rows]` on the same device as `weight`.
-fn compute_row_scales_cuda(weight: &Tensor) -> Result<Tensor> {
+pub(crate) fn compute_row_scales_cuda(weight: &Tensor) -> Result<Tensor> {
     if !ffi::HAVE_QTIP_KERNELS {
         candle_core::bail!("QTIP row-scale CUDA: kernels not compiled in");
     }
@@ -805,6 +805,22 @@ const QTIP_LUT_SIZE: usize = 1 << super::L;
 /// prefix share the same predecessor reduction.
 const QTIP_PREFIX_COUNT: usize = 1 << (super::L - super::K);
 
+/// Largest beam width `kernels/qtip/qtip_beam.cu` can run, read from the
+/// kernel itself so the Rust limit can never drift from the CUDA one.
+///
+/// Returns 0 when the kernels were not compiled in.
+pub(crate) fn beam_max_width() -> usize {
+    if !ffi::HAVE_QTIP_KERNELS {
+        return 0;
+    }
+    let w = unsafe { ffi::qtip_beam_max_width() };
+    if w < 0 {
+        0
+    } else {
+        w as usize
+    }
+}
+
 /// One-shot quantize entry point. Returns `(packed_blocks, row_scales)`:
 /// * `packed_blocks` — `[n_rows, num_symbols / 2]` U8, two K=4 symbols per byte.
 /// * `row_scales`    — `[n_rows]` F32, per-row scale.
@@ -812,10 +828,16 @@ const QTIP_PREFIX_COUNT: usize = 1 << (super::L - super::K);
 /// `weight_rotated_f32` should already be in the rotated frame (caller is
 /// responsible for applying `rotate_weight_rows_cuda` first when rotation
 /// is enabled). This split lets the test path verify each step on its own.
+///
+/// `search` selects the trellis search when `mode == Viterbi`:
+/// [`TrellisSearch::Exhaustive`] runs the prefix-grouped DP over all `2^L`
+/// states; [`TrellisSearch::Beam`] runs the pruned kernel. `Greedy` ignores it
+/// (a greedy walk is not a trellis search at all — see `bake_header_line`).
 pub(crate) fn quantize_rows_cuda(
     weight_rotated_f32: &Tensor,
     lut: &Tensor,
     mode: QtipMode,
+    search: TrellisSearch,
 ) -> Result<(Tensor, Tensor)> {
     if !ffi::HAVE_QTIP_KERNELS {
         candle_core::bail!("QTIP quantize CUDA: kernels not compiled in");
@@ -893,6 +915,64 @@ pub(crate) fn quantize_rows_cuda(
                     dev.cuda_stream().cu_stream(),
                 );
             },
+            QtipMode::Viterbi if !matches!(search, TrellisSearch::Exhaustive) => {
+                // wave13-AF beam kernel. The live state set is `width` entries
+                // in shared memory, so there is NO cost ping-pong scratch at
+                // all — only the compacted backtrace, `width * 4` bytes per
+                // timestep instead of the exhaustive kernel's 4096.
+                let width = match search {
+                    TrellisSearch::Beam { width } => width,
+                    TrellisSearch::Exhaustive => unreachable!("guarded by the match arm"),
+                };
+                let max_w = beam_max_width();
+                if width == 0 || width > max_w {
+                    candle_core::bail!(
+                        "QTIP quantize CUDA: beam width {width} is outside the kernel's \
+                         supported range 1..={max_w}. Refusing to substitute a different \
+                         width — a bake must never silently change its search."
+                    );
+                }
+                let trace_bytes_per_row = num_symbols * width * 4;
+                let mut rows_in_flight = (viterbi_scratch_bytes() / trace_bytes_per_row).max(1);
+                if rows_in_flight > n_rows {
+                    rows_in_flight = n_rows;
+                }
+
+                // Uninit alloc: the kernel writes every trace slot it later
+                // reads (the backtrace walk only visits slots the forward pass
+                // populated), so zeroing GBs of scratch is wasted bandwidth.
+                let trace = unsafe { dev.alloc::<u32>(rows_in_flight * num_symbols * width)? };
+                let (tr_ptr, tr_guard) = slice_ptr(&trace, 0);
+
+                let mut row_offset = 0usize;
+                while row_offset < n_rows {
+                    let this_batch = rows_in_flight.min(n_rows - row_offset);
+                    let rc = unsafe {
+                        ffi::launch_qtip_quantize_rows_beam_f32(
+                            w_ptr as *const _,
+                            lut_ptr as *const _,
+                            rs_ptr as *const _,
+                            pkd_ptr as *mut _,
+                            tr_ptr as *mut _,
+                            this_batch as i32,
+                            k_in as i32,
+                            num_symbols as i32,
+                            row_offset as i32,
+                            width as i32,
+                            dev.cuda_stream().cu_stream(),
+                        )
+                    };
+                    if rc != 0 {
+                        candle_core::bail!(
+                            "QTIP quantize CUDA: beam kernel refused width {width} (rc={rc})"
+                        );
+                    }
+                    row_offset += this_batch;
+                }
+
+                drop(tr_guard);
+                let _ = trace;
+            }
             QtipMode::Viterbi => {
                 // Allocate per-batch scratch. With prefix-grouped backtrace,
                 //   bt_bytes_per_row = num_symbols * 2^(L-K) = num_symbols * 4096

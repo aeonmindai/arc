@@ -691,6 +691,45 @@ fn bake_header_line(
     )
 }
 
+/// Map a requested [`TrellisSearch`] onto the CUDA quantize kernels.
+///
+/// * `Ok(TrellisSearch::Exhaustive)` — run the prefix-grouped DP kernel.
+/// * `Ok(TrellisSearch::Beam { width })` — run `qtip_beam.cu` at that width.
+/// * `Err(_)` — the CUDA path cannot honour this search. **Never** substitute a
+///   different one: PR #29 exists precisely so that the same command cannot
+///   produce two different checkpoints depending on which device it ran on.
+///
+/// A width at or above the full state space prunes nothing, so it is mapped to
+/// the exhaustive kernel — identical semantics, and it mirrors the CPU
+/// `viterbi::quantize_row`, which routes `Beam { width >= 2^L }` the same way.
+/// `max_beam_width` is read from the kernel itself (`qtip_beam_max_width`) so
+/// the Rust-side limit cannot drift from the CUDA one; pass 0 when the kernels
+/// are absent.
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn cuda_search_plan(
+    search: TrellisSearch,
+    max_beam_width: usize,
+) -> Result<TrellisSearch> {
+    match search {
+        TrellisSearch::Exhaustive => Ok(TrellisSearch::Exhaustive),
+        TrellisSearch::Beam { width } if width >= LUT_SIZE => Ok(TrellisSearch::Exhaustive),
+        // `beam_quantize_row` clamps the width to at least 1; mirror it rather
+        // than inventing a third behaviour for a width the env parser can never
+        // produce anyway.
+        TrellisSearch::Beam { width } if width.max(1) <= max_beam_width => {
+            Ok(TrellisSearch::Beam {
+                width: width.max(1),
+            })
+        }
+        TrellisSearch::Beam { width } => candle_core::bail!(
+            "QTIP quantize: ARC_QTIP_BEAM={width} but the CUDA beam kernel supports \
+             widths 1..={max_beam_width}. Either lower the width (256 is the \
+             quality-neutral setting measured in PR #29) or bake on CPU; the GPU \
+             path will not silently substitute a different search."
+        ),
+    }
+}
+
 fn log_bake_header(
     rung: &str,
     mode: QtipMode,
@@ -1094,21 +1133,16 @@ impl QtipLayer {
                      Rebuild mistralrs-quant with CUDA + has_qtip_kernels."
                 );
             }
-            // wave13-AD: the beam search and the Hessian-weighted objective are
-            // CPU-only for now (`qtip_quantize_rows_viterbi_kernel` is still the
-            // exhaustive prefix-grouped DP with an unweighted branch metric —
-            // see the kernel plan in `qtip/search_bench.rs`). Rather than
-            // silently baking a *different* objective on GPU than the flag asks
-            // for, refuse: an unnoticed objective mismatch is exactly the class
-            // of defect task #17 exists to prevent.
+            // wave13-AF: the beam search now has a CUDA kernel
+            // (`kernels/qtip/qtip_beam.cu`), so `ARC_QTIP_BEAM` is honoured on
+            // GPU instead of hard-failing. `cuda_search_plan` still refuses any
+            // width the kernel cannot run rather than substituting one it can —
+            // a bake must never silently change its search.
+            //
+            // The Hessian-weighted objective remains CPU-only (the branch metric
+            // in every CUDA kernel is unweighted), so that flag still refuses.
             let bake_cfg = QtipBakeConfig::get();
-            if !matches!(bake_cfg.search, TrellisSearch::Exhaustive) {
-                candle_core::bail!(
-                    "QTIP quantize: ARC_QTIP_BEAM is set but the CUDA quantize kernel only \
-                     implements the exhaustive trellis search. Either unset ARC_QTIP_BEAM or \
-                     bake on CPU; the GPU path will not silently substitute a different search."
-                );
-            }
+            let cuda_search = cuda_search_plan(bake_cfg.search, cuda_ops::beam_max_width())?;
             if bake_cfg.hessian && hessian_diag.is_some() {
                 candle_core::bail!(
                     "QTIP quantize: ARC_QTIP_HESSIAN=1 with calibration data, but the CUDA \
@@ -1123,6 +1157,7 @@ impl QtipLayer {
                 device,
                 mode,
                 use_rotation,
+                cuda_search,
             )? {
                 Some(layer) => return Ok(layer),
                 None => candle_core::bail!(
@@ -1343,6 +1378,7 @@ impl QtipLayer {
         device: &Device,
         mode: QtipMode,
         use_rotation: bool,
+        search: TrellisSearch,
     ) -> Result<Option<Self>> {
         // Sanity preconditions; any failure falls through to CPU.
         let (n, k_in) = match weight.dims2() {
@@ -1392,8 +1428,26 @@ impl QtipLayer {
             weight_cuda_f32
         };
 
+        // Task #17: the GPU fast path returns before the CPU pipeline's header
+        // call, so it must emit its own — otherwise a GPU bake is exactly the
+        // unlabelled artifact the header exists to prevent. `search` is the
+        // plan the kernels will actually run (post `cuda_search_plan`), not the
+        // raw env request, so the log never over-promises. The GPU branch
+        // metric is unweighted, hence `have_calibration = false`.
+        log_bake_header(
+            "K4/V2 2-bit",
+            mode,
+            QtipBakeConfig {
+                search,
+                hessian: false,
+            },
+            rotation_block,
+            false,
+        );
+
         // Quantize (Viterbi or Greedy) on-device.
-        let (blocks, row_scales) = cuda_ops::quantize_rows_cuda(&weight_rotated, &lut, mode)?;
+        let (blocks, row_scales) =
+            cuda_ops::quantize_rows_cuda(&weight_rotated, &lut, mode, search)?;
 
         let bias = bias.map(|b| b.to_device(device)).transpose()?;
         let rotation_signs = if rotation_block >= 2 {
@@ -3922,6 +3976,321 @@ mod tests {
             "QTIP bake [K4/V2 2-bit]: mode=viterbi search=viterbi-exhaustive \
              objective=mse (unweighted) rotation=hadamard-128"
         );
+    }
+
+    /// wave13-AF: the GPU dispatch may translate a search, but it may never
+    /// SUBSTITUTE one. The only legal translation is "a beam at least as wide
+    /// as the state space prunes nothing, so run the exhaustive kernel" —
+    /// exactly what the CPU `viterbi::quantize_row` does. Anything the kernel
+    /// cannot run must be an error, never a quietly narrower beam.
+    #[test]
+    fn cuda_search_plan_never_substitutes_a_width() {
+        const MAX_W: usize = 256;
+
+        assert_eq!(
+            cuda_search_plan(TrellisSearch::Exhaustive, MAX_W).unwrap(),
+            TrellisSearch::Exhaustive
+        );
+        for w in [1usize, 16, 64, 128, 256] {
+            assert_eq!(
+                cuda_search_plan(TrellisSearch::Beam { width: w }, MAX_W).unwrap(),
+                TrellisSearch::Beam { width: w },
+                "width {w} must be honoured exactly"
+            );
+        }
+        // A beam that prunes nothing is the exhaustive DP, by definition.
+        for w in [LUT_SIZE, LUT_SIZE + 1, usize::MAX] {
+            assert_eq!(
+                cuda_search_plan(TrellisSearch::Beam { width: w }, MAX_W).unwrap(),
+                TrellisSearch::Exhaustive
+            );
+        }
+        // Width 0 mirrors `beam_quantize_row`'s `clamp(1, LUT_SIZE)`.
+        assert_eq!(
+            cuda_search_plan(TrellisSearch::Beam { width: 0 }, MAX_W).unwrap(),
+            TrellisSearch::Beam { width: 1 }
+        );
+        // Too wide for the kernel: refuse. The failure mode this guards is a
+        // bake that quietly runs W=256 when the operator asked for W=1024.
+        for w in [MAX_W + 1, 1024, LUT_SIZE - 1] {
+            let err = cuda_search_plan(TrellisSearch::Beam { width: w }, MAX_W)
+                .expect_err("a width beyond the kernel limit must not be silently narrowed");
+            let msg = format!("{err}");
+            assert!(msg.contains("will not silently substitute"), "{msg}");
+        }
+        // Kernels absent (max width 0): every beam request must fail loudly.
+        assert!(cuda_search_plan(TrellisSearch::Beam { width: 64 }, 0).is_err());
+    }
+
+    /// Reference packing for the CUDA parity tests: run the CPU trellis search
+    /// on `weight` using scales produced by the GPU row-scale kernel, and pack
+    /// exactly as `quantize_with_options_concrete_calibrated` does.
+    #[cfg(feature = "cuda")]
+    fn cpu_reference_packed(
+        weight: &[f32],
+        n: usize,
+        k_in: usize,
+        scales: &[f32],
+        lut: &[f32],
+        search: TrellisSearch,
+    ) -> Vec<u8> {
+        let num_symbols = k_in / V as usize;
+        let mut out = Vec::with_capacity(n * (num_symbols / 2));
+        for row in 0..n {
+            let raw = &weight[row * k_in..(row + 1) * k_in];
+            let inv_scale = 1.0f32 / scales[row];
+            let scaled: Vec<f32> = raw.iter().map(|w| w * inv_scale).collect();
+            let symbols = super::viterbi::quantize_row(&scaled, lut, search, None);
+            let mut packed = vec![0u8; num_symbols / 2];
+            for (i, &sym) in symbols.iter().enumerate() {
+                if i.is_multiple_of(2) {
+                    packed[i / 2] = sym & 0x0F;
+                } else {
+                    packed[i / 2] |= (sym & 0x0F) << 4;
+                }
+            }
+            out.extend_from_slice(&packed);
+        }
+        out
+    }
+
+    /// Deterministic Gaussian fixture shared by the CUDA parity tests.
+    #[cfg(feature = "cuda")]
+    fn parity_fixture(len: usize, seed: u64, sigma: f32) -> Vec<f32> {
+        (0..len)
+            .map(|i| {
+                let mut z = (i as u64)
+                    .wrapping_add(seed)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z ^= z >> 31;
+                let u1 = ((z >> 32) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+                let u2 = ((z & 0xFFFF_FFFF) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+                (-2.0_f32 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos() * sigma
+            })
+            .collect()
+    }
+
+    /// THE correctness gate for wave13-AF.
+    ///
+    /// The CUDA beam kernel must emit the **byte-identical** symbol stream the
+    /// CPU beam (PR #29) emits at the same width — not a similar one. Cosine
+    /// similarity would hide exactly the failure mode that matters: a GPU bake
+    /// and a CPU bake of the same weights with the same flag silently producing
+    /// different checkpoints.
+    ///
+    /// Non-vacuity: the same fixture is also baked with the exhaustive kernel
+    /// and asserted to DIFFER, so the test cannot pass by the beam happening to
+    /// reproduce the full DP.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_beam_matches_cpu_beam_bit_for_bit() -> Result<()> {
+        let cuda = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("CUDA not available; skipping cuda_beam_matches_cpu_beam_bit_for_bit");
+                return Ok(());
+            }
+        };
+        if !ffi::HAVE_QTIP_KERNELS {
+            return Ok(());
+        }
+        let cpu = Device::Cpu;
+        let n = 8;
+        let k_in = 512; // num_symbols = 256, long enough to prune every step
+        let wdata = parity_fixture(n * k_in, 0xBEEF, 0.5);
+
+        let w_cuda = Tensor::from_vec(wdata.clone(), (n, k_in), &cuda)?;
+        let lut_data = gaussian_lut();
+        let lut_cuda =
+            Tensor::from_vec(lut_data.clone(), (LUT_SIZE, V as usize), &cpu)?.to_device(&cuda)?;
+
+        // Both sides must see the SAME per-row scale, so take the GPU kernel's.
+        let scales: Vec<f32> = cuda_ops::compute_row_scales_cuda(&w_cuda)?
+            .to_device(&cpu)?
+            .to_vec1()?;
+
+        let exhaustive: Vec<u8> = cuda_ops::quantize_rows_cuda(
+            &w_cuda,
+            &lut_cuda,
+            QtipMode::Viterbi,
+            TrellisSearch::Exhaustive,
+        )?
+        .0
+        .to_device(&cpu)?
+        .flatten_all()?
+        .to_vec1()?;
+
+        let mut any_differed = false;
+        for width in [64usize, 128, 256] {
+            let search = TrellisSearch::Beam { width };
+            let gpu: Vec<u8> =
+                cuda_ops::quantize_rows_cuda(&w_cuda, &lut_cuda, QtipMode::Viterbi, search)?
+                    .0
+                    .to_device(&cpu)?
+                    .flatten_all()?
+                    .to_vec1()?;
+            let reference = cpu_reference_packed(&wdata, n, k_in, &scales, &lut_data, search);
+
+            assert_eq!(gpu.len(), reference.len());
+            let mismatches = gpu
+                .iter()
+                .zip(reference.iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(
+                mismatches,
+                0,
+                "W={width}: CUDA beam differs from the CPU beam in {mismatches}/{} bytes — \
+                 the GPU and CPU bakes of the same weights are not the same checkpoint",
+                gpu.len()
+            );
+            if gpu != exhaustive {
+                any_differed = true;
+            }
+        }
+        assert!(
+            any_differed,
+            "beam and exhaustive produced identical bytes at every width — the fixture \
+             does not actually exercise pruning, so bit-identity proves nothing"
+        );
+        Ok(())
+    }
+
+    /// Mirror of PR #29's `beam_unpruned_matches_exhaustive_bit_for_bit`, on GPU.
+    ///
+    /// A beam wide enough to prune nothing must reproduce the exhaustive DP
+    /// byte for byte. `num_symbols = 2` makes that provable rather than
+    /// incidental: from the implicit start state 0 only the 16 states
+    /// `0..ALPHABET` are reachable at t=0, and their 16 successors each are the
+    /// 256 states `0..256` at t=1 — so at W=256 the beam never drops a
+    /// candidate, and the exhaustive DP's finite-cost set is exactly the same
+    /// 256 states. (A longer row cannot be tested this way: from t=3 the
+    /// reachable set is the full 2^16, which no shared-memory-resident beam can
+    /// hold. Long rows are covered transitively —
+    /// `cuda_beam_matches_cpu_beam_bit_for_bit` pins CUDA to the CPU beam, and
+    /// PR #29 pins the unpruned CPU beam to the CPU exhaustive DP.)
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_beam_unpruned_matches_cuda_exhaustive() -> Result<()> {
+        let cuda = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!(
+                    "CUDA not available; skipping cuda_beam_unpruned_matches_cuda_exhaustive"
+                );
+                return Ok(());
+            }
+        };
+        if !ffi::HAVE_QTIP_KERNELS {
+            return Ok(());
+        }
+        let cpu = Device::Cpu;
+        let n = 64;
+        let k_in = 4; // num_symbols = 2 -> the beam provably prunes nothing at W=256
+        let wdata = parity_fixture(n * k_in, 0x5EED, 0.9);
+        let w_cuda = Tensor::from_vec(wdata, (n, k_in), &cuda)?;
+        let lut_cuda =
+            Tensor::from_vec(gaussian_lut(), (LUT_SIZE, V as usize), &cpu)?.to_device(&cuda)?;
+
+        let exhaustive: Vec<u8> = cuda_ops::quantize_rows_cuda(
+            &w_cuda,
+            &lut_cuda,
+            QtipMode::Viterbi,
+            TrellisSearch::Exhaustive,
+        )?
+        .0
+        .to_device(&cpu)?
+        .flatten_all()?
+        .to_vec1()?;
+        let unpruned: Vec<u8> = cuda_ops::quantize_rows_cuda(
+            &w_cuda,
+            &lut_cuda,
+            QtipMode::Viterbi,
+            TrellisSearch::Beam { width: 256 },
+        )?
+        .0
+        .to_device(&cpu)?
+        .flatten_all()?
+        .to_vec1()?;
+
+        assert_eq!(
+            unpruned, exhaustive,
+            "an unpruned CUDA beam must be the exhaustive DP, byte for byte"
+        );
+        Ok(())
+    }
+
+    /// wave13-AF also removed the fast-math divergence between the CUDA
+    /// trellis kernels and the Rust reference (`qtip_exact_fp.cuh`): FMA
+    /// contraction in the branch metric and an approximate `1.0f/scale`.
+    /// With those gone the exhaustive kernel is bit-identical to the CPU DP,
+    /// which is what makes the beam guard above meaningful — and what makes a
+    /// CPU-baked and a GPU-baked checkpoint the same artifact.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_exhaustive_matches_cpu_exhaustive_bit_for_bit() -> Result<()> {
+        let cuda = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!(
+                    "CUDA not available; skipping cuda_exhaustive_matches_cpu_exhaustive_bit_for_bit"
+                );
+                return Ok(());
+            }
+        };
+        if !ffi::HAVE_QTIP_KERNELS {
+            return Ok(());
+        }
+        let cpu = Device::Cpu;
+        let n = 4;
+        let k_in = 256;
+        let wdata = parity_fixture(n * k_in, 0xC0FFEE, 0.5);
+        let w_cuda = Tensor::from_vec(wdata.clone(), (n, k_in), &cuda)?;
+        let lut_data = gaussian_lut();
+        let lut_cuda =
+            Tensor::from_vec(lut_data.clone(), (LUT_SIZE, V as usize), &cpu)?.to_device(&cuda)?;
+
+        let scales: Vec<f32> = cuda_ops::compute_row_scales_cuda(&w_cuda)?
+            .to_device(&cpu)?
+            .to_vec1()?;
+        // The row-scale kernel must agree with `max_abs / 3.0` exactly, too.
+        for row in 0..n {
+            let max_abs = wdata[row * k_in..(row + 1) * k_in]
+                .iter()
+                .fold(0.0f32, |m, &v| m.max(v.abs()));
+            let expected = if max_abs == 0.0 { 1.0 } else { max_abs / 3.0 };
+            assert_eq!(
+                scales[row].to_bits(),
+                expected.to_bits(),
+                "row {row}: GPU scale {} != CPU scale {expected}",
+                scales[row]
+            );
+        }
+
+        let gpu: Vec<u8> = cuda_ops::quantize_rows_cuda(
+            &w_cuda,
+            &lut_cuda,
+            QtipMode::Viterbi,
+            TrellisSearch::Exhaustive,
+        )?
+        .0
+        .to_device(&cpu)?
+        .flatten_all()?
+        .to_vec1()?;
+        let reference = cpu_reference_packed(
+            &wdata,
+            n,
+            k_in,
+            &scales,
+            &lut_data,
+            TrellisSearch::Exhaustive,
+        );
+        assert_eq!(
+            gpu, reference,
+            "the CUDA exhaustive DP must be bit-identical to the CPU one"
+        );
+        Ok(())
     }
 
     /// Non-power-of-2 in_features that's divisible by 2 should still get a

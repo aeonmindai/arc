@@ -33,6 +33,15 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
+// Per-operation IEEE f32 helpers. The crate builds with --use_fast_math, which
+// would otherwise contract the branch metric into an FMA and turn `1.0f/scale`
+// into an approximate reciprocal — either of which can flip a Viterbi tie and
+// make a GPU bake disagree with the CPU reference in `qtip/viterbi.rs`.
+// wave13-AF: routing the trellis arithmetic through these intrinsics makes the
+// exhaustive kernel, the greedy kernel and the new beam kernel all bit-identical
+// to their Rust counterparts. See kernels/qtip/qtip_exact_fp.cuh.
+#include "qtip_exact_fp.cuh"
+
 namespace {
 
 constexpr uint32_t QTIP_K          = 4;
@@ -131,7 +140,10 @@ __global__ void qtip_row_scale_kernel(
 
     if (tid == 0) {
         float m = smax[0];
-        float s = (m == 0.0f) ? 1.0f : (m / 3.0f);
+        // __fdiv_rn, not `/`: --use_fast_math turns `/` into an approximate
+        // reciprocal-multiply, which would make the GPU row scale differ from
+        // the CPU's `max_abs / 3.0` and desynchronise every downstream target.
+        float s = (m == 0.0f) ? 1.0f : __fdiv_rn(m, 3.0f);
         row_scales[row] = s;
     }
 }
@@ -172,7 +184,7 @@ __global__ void qtip_quantize_rows_greedy_kernel(
     uint8_t*     my_pkd = packed + (size_t)row * (num_symbols / 2);
 
     float scale     = row_scales[row];
-    float inv_scale = 1.0f / scale;
+    float inv_scale = qtip_inv_scale_exact(scale);
 
     uint32_t state = 0u;
 
@@ -184,19 +196,14 @@ __global__ void qtip_quantize_rows_greedy_kernel(
 
     for (int t = 0; t < num_symbols; ++t) {
         // Target values for timestep t (V=2 weights).
-        float t0 = my_row[t * 2 + 0] * inv_scale;
-        float t1 = my_row[t * 2 + 1] * inv_scale;
+        float t0 = qtip_scaled_target_exact(my_row[t * 2 + 0], inv_scale);
+        float t1 = qtip_scaled_target_exact(my_row[t * 2 + 1], inv_scale);
 
         // Compute err for this thread's symbol candidate.
         float err = INFINITY;
         if (tid < (int)QTIP_ALPHABET) {
             uint32_t next_state = ((state << QTIP_K) | my_sym) & QTIP_STATE_MASK;
-            size_t off = (size_t)next_state * QTIP_V;
-            float l0 = lut[off + 0];
-            float l1 = lut[off + 1];
-            float d0 = l0 - t0;
-            float d1 = l1 - t1;
-            err = d0 * d0 + d1 * d1;
+            err = qtip_decode_err_exact(lut, next_state, t0, t1);
         }
 
         // Warp reduction: find min err and its sym.
@@ -279,15 +286,12 @@ constexpr uint32_t QTIP_PREFIX_COUNT  = 1u << QTIP_PREFIX_BITS;   // 4096
 constexpr uint32_t QTIP_SUFFIX_COUNT  = 1u << QTIP_K;             // 16
 
 // Decode-error of state `s` against the V=2 target vector (already scaled).
+// Delegates to the non-contracting helper so the DP's branch metric is
+// bit-identical to `qtip/viterbi.rs::decode_error`.
 __device__ __forceinline__ float decode_err_fp(
     const float* __restrict__ lut, uint32_t s, float t0, float t1
 ) {
-    size_t off = (size_t)s * QTIP_V;
-    float l0 = lut[off + 0];
-    float l1 = lut[off + 1];
-    float d0 = l0 - t0;
-    float d1 = l1 - t1;
-    return d0 * d0 + d1 * d1;
+    return qtip_decode_err_exact(lut, s, t0, t1);
 }
 
 __global__ void qtip_quantize_rows_viterbi_kernel(
@@ -315,7 +319,7 @@ __global__ void qtip_quantize_rows_viterbi_kernel(
                        (size_t)local_row * (size_t)num_symbols * QTIP_PREFIX_COUNT;
 
     float scale     = row_scales[row];
-    float inv_scale = 1.0f / scale;
+    float inv_scale = qtip_inv_scale_exact(scale);
 
     // Per-prefix tables in shared mem: 4096 × (f32 + u8) = 20 KiB. Plus the
     // argmin reduction tile reused at the end (256 × (f32+u32) = 2 KiB). All
@@ -326,8 +330,8 @@ __global__ void qtip_quantize_rows_viterbi_kernel(
     // -------- Init t=0 --------
     // Only first ALPHABET states reachable; rest = +inf.
     {
-        float t0 = my_row[0] * inv_scale;
-        float t1 = my_row[1] * inv_scale;
+        float t0 = qtip_scaled_target_exact(my_row[0], inv_scale);
+        float t1 = qtip_scaled_target_exact(my_row[1], inv_scale);
         for (uint32_t i = tid; i < QTIP_LUT_SIZE; i += VITERBI_THREADS) {
             if (i < QTIP_ALPHABET) {
                 my_cost_a[i] = decode_err_fp(lut, i, t0, t1);
@@ -343,8 +347,8 @@ __global__ void qtip_quantize_rows_viterbi_kernel(
     float* curr = my_cost_b;
 
     for (int t = 1; t < num_symbols; ++t) {
-        float tt0 = my_row[t * 2 + 0] * inv_scale;
-        float tt1 = my_row[t * 2 + 1] * inv_scale;
+        float tt0 = qtip_scaled_target_exact(my_row[t * 2 + 0], inv_scale);
+        float tt1 = qtip_scaled_target_exact(my_row[t * 2 + 1], inv_scale);
 
         // Phase A: per-prefix 16-way reduction (4096 prefixes, 16 j-values each).
         // Reads prev[] randomly but coalesced within a warp (consecutive prefixes
@@ -371,7 +375,7 @@ __global__ void qtip_quantize_rows_viterbi_kernel(
         for (uint32_t s = tid; s < QTIP_LUT_SIZE; s += VITERBI_THREADS) {
             float err = decode_err_fp(lut, s, tt0, tt1);
             uint32_t p = s >> QTIP_K;
-            curr[s] = err + s_best_cost[p];
+            curr[s] = __fadd_rn(err, s_best_cost[p]);
         }
 
         // Phase C: emit per-prefix backtrace for this timestep.
