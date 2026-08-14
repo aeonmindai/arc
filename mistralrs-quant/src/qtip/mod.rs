@@ -479,6 +479,11 @@ pub struct QtipLayer {
     /// construction site must state provenance, and payloads loaded from a
     /// format that cannot carry it say [`QtipSearchStamp::Unstamped`].
     search: QtipSearchStamp,
+    /// *Which* trellis search, beside `search`'s *whether*: the beam width and
+    /// the objective. Serialized as the UQFF ≥ 0.3.0 flags byte. Like `search`
+    /// it has no `Default` — [`QtipSearchDetail::Unknown`] is the only way to
+    /// say "not recorded", and it refuses to serialize.
+    search_detail: QtipSearchDetail,
 }
 
 /// Borrowed, dequantization-free view of a [`QtipLayer`]'s packed trellis
@@ -919,6 +924,209 @@ impl QtipSearchStamp {
     }
 }
 
+/// The flags byte that rides beside [`QtipSearchStamp`] from UQFF 0.3.0
+/// (wave13-AF, closing the gap wave13-AG named in its own hand-off).
+///
+/// The stamp answers "was this a trellis search or a greedy walk" — the D4 ban.
+/// It deliberately cannot answer "*which* trellis search", and a `W = 64` beam
+/// is a genuinely different quality point from the exhaustive `2^L` DP
+/// (PR #29 measured matmul cos 0.95054 vs 0.96495 on FP4-lattice fixtures).
+/// An artifact that cannot distinguish them is a mislabelled artifact, which is
+/// the failure class the stamp exists to end — so the detail travels with the
+/// weights too.
+///
+/// ## Wire format
+///
+/// One flags byte immediately after the stamp byte, then a `u16` little-endian
+/// width **iff** the beam bit is set:
+///
+/// | bit | meaning |
+/// |---|---|
+/// | `0x01` | pruned beam; a `u16` width follows |
+/// | `0x02` | diagonal-activation-Hessian objective (`ARC_QTIP_HESSIAN`) |
+/// | `0x04..=0x80` | reserved — **must be zero** |
+///
+/// So an exhaustive unweighted bake costs exactly one byte (`0x00`) and a
+/// `W = 256` beam costs three (`0x01`, `0x00 0x01`). No version bump: 0.3.0 is
+/// unreleased, so the byte is free to add now, and it is **mandatory** — a
+/// payload carrying a stamp but no flags byte is truncated, and truncation
+/// fails closed rather than being read as "exhaustive".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QtipSearchDetail {
+    /// Provenance recorded by the process that ran the search.
+    Known {
+        /// `None` — exhaustive dynamic program over all `2^L` states.
+        /// `Some(w)` — pruned beam keeping the best `w` states per timestep,
+        /// `1 <= w < 2^L`. A width at or above `2^L` prunes nothing and *is*
+        /// the exhaustive DP, so it is normalised to `None` at construction
+        /// rather than recorded as a beam.
+        beam_width: Option<u16>,
+        /// The `(w − ŵ)ᵀ H (w − ŵ)` objective was used instead of `‖w − ŵ‖²`.
+        hessian: bool,
+    },
+    /// Not recorded: a pre-0.3.0 payload, or a loader for a format that cannot
+    /// carry provenance. Mirrors [`QtipSearchStamp::Unstamped`] — it refuses to
+    /// serialize, so an unknown artifact can never be re-emitted as a specific
+    /// claim.
+    Unknown,
+}
+
+impl QtipSearchDetail {
+    const FLAG_BEAM: u8 = 0x01;
+    const FLAG_HESSIAN: u8 = 0x02;
+    const FLAG_RESERVED: u8 = !(Self::FLAG_BEAM | Self::FLAG_HESSIAN);
+
+    /// The detail a bake earned. `search` is the plan that actually ran (post
+    /// [`cuda_search_plan`] on the GPU path), never the raw env request.
+    ///
+    /// Greedy is not a trellis search, so it records neither a width nor an
+    /// objective — the flags byte of a greedy artifact is always `0x00`. (It is
+    /// refused at load anyway; this just keeps the two fields from contradicting
+    /// each other on the wire.)
+    pub fn for_bake(mode: QtipMode, search: TrellisSearch, hessian: bool) -> Self {
+        match mode {
+            QtipMode::Greedy => QtipSearchDetail::Known {
+                beam_width: None,
+                hessian: false,
+            },
+            QtipMode::Viterbi => QtipSearchDetail::Known {
+                beam_width: match search {
+                    TrellisSearch::Beam { width } if (1..LUT_SIZE).contains(&width) => {
+                        Some(width as u16)
+                    }
+                    // width >= 2^L prunes nothing; width 0 is not a search.
+                    _ => None,
+                },
+                hessian,
+            },
+        }
+    }
+
+    /// The detail of a bake that ran the exhaustive DP with the unweighted
+    /// objective. This is every `qtip2b` bake by construction: that rung's
+    /// `viterbi_quantize_row_2b` is the exhaustive `2^L` DP and it has no
+    /// weighted branch metric, so the claim is earned from the code path, not
+    /// assumed.
+    pub const EXHAUSTIVE_MSE: Self = QtipSearchDetail::Known {
+        beam_width: None,
+        hessian: false,
+    };
+
+    /// Beam width, or `None` for the exhaustive DP / unknown provenance.
+    pub fn beam_width(self) -> Option<u16> {
+        match self {
+            QtipSearchDetail::Known { beam_width, .. } => beam_width,
+            QtipSearchDetail::Unknown => None,
+        }
+    }
+
+    /// Human tag for logs and errors.
+    pub fn tag(self) -> String {
+        match self {
+            QtipSearchDetail::Unknown => "unrecorded".to_string(),
+            QtipSearchDetail::Known {
+                beam_width,
+                hessian,
+            } => {
+                let search = match beam_width {
+                    Some(w) => format!("beam(W={w})"),
+                    None => "exhaustive".to_string(),
+                };
+                let obj = if hessian { "hessian-diag" } else { "mse" };
+                format!("{search}/{obj}")
+            }
+        }
+    }
+
+    /// Encode to `(flags, Option<width>)`. `Err` when the detail was never
+    /// observed, or when it contradicts the stamp it would be written beside.
+    fn to_wire(self, stamp: QtipSearchStamp) -> Result<(u8, Option<u16>)> {
+        let (beam_width, hessian) = match self {
+            QtipSearchDetail::Unknown => candle_core::bail!(
+                "QtipLayer::serialize: refusing to write a search-detail flags byte for a layer \
+                 whose search detail was never recorded. Re-quantize from the source weights so \
+                 the beam width and objective are earned rather than invented (DOCTRINE D4)."
+            ),
+            QtipSearchDetail::Known {
+                beam_width,
+                hessian,
+            } => (beam_width, hessian),
+        };
+        if matches!(stamp, QtipSearchStamp::Greedy) && (beam_width.is_some() || hessian) {
+            candle_core::bail!(
+                "QtipLayer::serialize: a `greedy` stamp cannot carry a beam width or a weighted \
+                 objective — a greedy walk runs no trellis search at all. Refusing to write a \
+                 self-contradictory artifact."
+            );
+        }
+        if let Some(w) = beam_width {
+            if w == 0 || (w as usize) >= LUT_SIZE {
+                candle_core::bail!(
+                    "QtipLayer::serialize: beam width {w} is not a pruned search (valid range \
+                     1..{LUT_SIZE}); the exhaustive DP must be written as `no beam`, not as a \
+                     beam wide enough to prune nothing."
+                );
+            }
+        }
+        let mut flags = 0u8;
+        if beam_width.is_some() {
+            flags |= Self::FLAG_BEAM;
+        }
+        if hessian {
+            flags |= Self::FLAG_HESSIAN;
+        }
+        Ok((flags, beam_width))
+    }
+
+    /// Decode a flags byte (and, when the beam bit is set, the width that
+    /// follows). Every rejected case below is a claim the artifact makes about
+    /// itself that cannot be true; none of them is normalised into a plausible
+    /// value, because silently reading a malformed claim as "exhaustive" is how
+    /// a mislabelled artifact would get laundered.
+    fn from_wire(
+        flags: u8,
+        stamp: QtipSearchStamp,
+        read_width: impl FnOnce() -> Result<u16>,
+    ) -> Result<Self> {
+        if flags & Self::FLAG_RESERVED != 0 {
+            candle_core::bail!(
+                "QTIP artifact: reserved bits set in the search-detail flags byte \
+                 (0x{flags:02X}). This artifact was written by a newer Arc whose provenance \
+                 fields this build cannot interpret; refusing rather than guessing."
+            );
+        }
+        let hessian = flags & Self::FLAG_HESSIAN != 0;
+        let beam_width = if flags & Self::FLAG_BEAM != 0 {
+            let w = read_width()?;
+            if w == 0 || (w as usize) >= LUT_SIZE {
+                candle_core::bail!(
+                    "QTIP artifact: search-detail claims a beam of width {w}, which is not a \
+                     pruned search (valid range 1..{LUT_SIZE}). A width at or above the state \
+                     space prunes nothing and must be recorded as the exhaustive DP."
+                );
+            }
+            Some(w)
+        } else {
+            None
+        };
+        if matches!(stamp, QtipSearchStamp::Greedy) && (beam_width.is_some() || hessian) {
+            candle_core::bail!(
+                "QTIP artifact: stamped `greedy` but the search-detail claims {}. A greedy walk \
+                 runs no trellis search, so this artifact contradicts itself; refusing.",
+                QtipSearchDetail::Known {
+                    beam_width,
+                    hessian
+                }
+                .tag()
+            );
+        }
+        Ok(QtipSearchDetail::Known {
+            beam_width,
+            hessian,
+        })
+    }
+}
+
 fn allow_unstamped_qtip_artifacts() -> bool {
     matches!(
         std::env::var("ARC_ALLOW_UNSTAMPED_QTIP").as_deref(),
@@ -1350,6 +1558,14 @@ impl QtipLayer {
             rotation_signs,
             rotation_block,
             search: QtipSearchStamp::for_mode(mode),
+            // The plan that ran, not the env request: `bake_cfg.search` is what
+            // `quantize_row` was called with, and `search_weights` is `Some`
+            // only when calibration data actually arrived.
+            search_detail: QtipSearchDetail::for_bake(
+                mode,
+                bake_cfg.search,
+                search_weights.is_some(),
+            ),
         })
     }
 
@@ -1467,6 +1683,10 @@ impl QtipLayer {
             rotation_signs,
             rotation_block,
             search: QtipSearchStamp::for_mode(mode),
+            // `search` here is the post-`cuda_search_plan` plan the kernels
+            // actually ran. Every CUDA branch metric is unweighted, so the
+            // objective bit is false by construction, not by omission.
+            search_detail: QtipSearchDetail::for_bake(mode, search, false),
         }))
     }
 
@@ -1538,6 +1758,7 @@ impl QtipLayer {
         let mut shared_lut: Option<Tensor> = None;
         let mut shared_rotation_signs: Option<Tensor> = None;
         let mut shared_rotation_block: usize = 0;
+        let mut shared_search_detail = QtipSearchDetail::Unknown;
 
         // Per-expert streaming. The full stack is kept on CPU (caller passes
         // device=CPU for the 3-D experts to avoid the ~4GB dense BF16 transient
@@ -1611,9 +1832,22 @@ impl QtipLayer {
                     other => other,
                 };
                 shared_rotation_block = layer.rotation_block;
+                shared_search_detail = layer.search_detail;
             } else {
                 debug_assert_eq!(layer.lut.dims(), shared_lut.as_ref().unwrap().dims());
                 debug_assert_eq!(layer.rotation_block, shared_rotation_block);
+                // Every chunk runs the same bake config, so a divergence here
+                // means the stack would carry one expert's provenance while
+                // holding another's weights. Hard-check it (D4).
+                if layer.search_detail != shared_search_detail {
+                    candle_core::bail!(
+                        "QTIP 3-D quantize: expert chunk at {expert_idx} recorded search \
+                         detail {} but the stack already carries {} — refusing to stamp a \
+                         mixed-provenance artifact.",
+                        layer.search_detail.tag(),
+                        shared_search_detail.tag()
+                    );
+                }
             }
             expert_idx += this_b;
         }
@@ -1641,6 +1875,7 @@ impl QtipLayer {
             rotation_signs: shared_rotation_signs,
             rotation_block: shared_rotation_block,
             search: QtipSearchStamp::for_mode(mode),
+            search_detail: shared_search_detail,
         }))
     }
 
@@ -2301,6 +2536,8 @@ impl QtipLayer {
     /// format that cannot carry provenance must pass
     /// [`QtipSearchStamp::Unstamped`] rather than assuming Trellis — claiming a
     /// search we did not verify is the failure this stamp exists to end (D4).
+    /// `search_detail` is the same contract one level finer (which trellis
+    /// search): pass [`QtipSearchDetail::Unknown`] unless you ran it.
     #[allow(clippy::too_many_arguments)]
     pub fn from_stacked_parts(
         blocks: Tensor,
@@ -2311,6 +2548,7 @@ impl QtipLayer {
         rotation_signs: Option<Tensor>,
         rotation_block: usize,
         search: QtipSearchStamp,
+        search_detail: QtipSearchDetail,
     ) -> Result<QtipLayer> {
         if blocks.dims().len() != 3 {
             candle_core::bail!(
@@ -2340,6 +2578,7 @@ impl QtipLayer {
         }
         let e = blocks.dim(0)?;
         Ok(QtipLayer {
+            search_detail,
             blocks,
             row_scales,
             lut,
@@ -2410,6 +2649,13 @@ impl QtipLayer {
                     head.search.tag()
                 );
             }
+            if layer.search_detail != head.search_detail {
+                candle_core::bail!(
+                    "QtipLayer::stack_experts: layer {i} search detail={} != head {}",
+                    layer.search_detail.tag(),
+                    head.search_detail.tag()
+                );
+            }
         }
 
         let blocks_refs: Vec<&Tensor> = per_expert_layers.iter().map(|l| &l.blocks).collect();
@@ -2432,6 +2678,7 @@ impl QtipLayer {
             rotation_signs: head.rotation_signs.clone(),
             rotation_block,
             search: head.search,
+            search_detail: head.search_detail,
         })
     }
 
@@ -2680,6 +2927,7 @@ impl QuantMethod for QtipLayer {
                 // The config carries packed blocks from an unknown producer.
                 // We did not run the search, so we do not claim it (D4).
                 search: QtipSearchStamp::Unstamped,
+                search_detail: QtipSearchDetail::Unknown,
             }),
             _ => candle_core::bail!("QtipLayer requires QuantMethodConfig::Qtip"),
         }
@@ -2894,6 +3142,13 @@ impl QtipLayer {
         self.search
     }
 
+    /// *Which* trellis search: beam width and objective (UQFF ≥ 0.3.0 flags
+    /// byte). [`QtipSearchDetail::Unknown`] for artifacts whose producer could
+    /// not record it.
+    pub fn search_detail(&self) -> QtipSearchDetail {
+        self.search_detail
+    }
+
     /// Dequantize the i-th expert's `[N, K_in]` BF16 weight matrix (3-D mode
     /// only). Internal use by `gather_forward` and friends; bails when called
     /// on a 2-D layer or with `expert_idx >= num_experts`.
@@ -2998,6 +3253,7 @@ impl QtipLayer {
             // Safetensors QTIP checkpoints carry no provenance field, so the
             // honest answer is "unknown" — see `QtipSearchStamp::enforce_at_load`.
             search: QtipSearchStamp::Unstamped,
+            search_detail: QtipSearchDetail::Unknown,
         }))
     }
 
@@ -3118,6 +3374,34 @@ impl QtipLayer {
             Err(_) => QtipSearchStamp::Unstamped,
         };
 
+        // wave13-AF search-detail flags byte. Unlike the stamp this is NOT
+        // optional: every payload that carries a stamp carries the flags byte
+        // too, so EOF here means the file is truncated. Fail closed — reading a
+        // missing flags byte as "exhaustive, unweighted" would invent exactly
+        // the claim this field exists to make verifiable.
+        let search_detail = match search {
+            QtipSearchStamp::Unstamped => QtipSearchDetail::Unknown,
+            stamp => {
+                let flags = buffer.read_u8().map_err(|_| {
+                    candle_core::Error::Msg(
+                        "QtipLayer: payload carries a search stamp but no search-detail flags \
+                         byte. UQFF 0.3.0 always writes one, so this file is truncated; \
+                         refusing rather than assuming an exhaustive unweighted bake."
+                            .into(),
+                    )
+                })?;
+                QtipSearchDetail::from_wire(flags, stamp, || {
+                    buffer.read_u16::<LittleEndian>().map_err(|_| {
+                        candle_core::Error::Msg(
+                            "QtipLayer: search-detail flags claim a beam but the width is \
+                             missing (truncated payload)."
+                                .into(),
+                        )
+                    })
+                })?
+            }
+        };
+
         Ok((
             Self {
                 blocks,
@@ -3129,6 +3413,7 @@ impl QtipLayer {
                 rotation_signs,
                 rotation_block,
                 search,
+                search_detail,
             },
             ext_bias,
         ))
@@ -3194,6 +3479,15 @@ impl QuantizedSerde for QtipLayer {
                  carries no stamp; re-quantize from the source weights so the stamp is earned \
                  rather than assumed (DOCTRINE D4)."
             ),
+        }
+        // wave13-AF: the search DETAIL beside the stamp — beam width and
+        // objective — so an exhaustive bake and a W=256 beam are distinguishable
+        // from the artifact alone. Refuses unknown or self-contradictory detail
+        // for the same reason the stamp does.
+        let (flags, beam_width) = self.search_detail.to_wire(self.search)?;
+        buffer.push(flags);
+        if let Some(w) = beam_width {
+            buffer.extend(&w.to_le_bytes());
         }
         Ok(Cow::from(buffer))
     }
@@ -4691,6 +4985,7 @@ mod tests {
         let mut shared_lut: Option<Tensor> = None;
         let mut shared_rotation_signs: Option<Tensor> = None;
         let mut shared_rotation_block: usize = 0;
+        let mut shared_search_detail = QtipSearchDetail::Unknown;
         for expert_idx in 0..e {
             let expert_w = w.narrow(0, expert_idx, 1)?.squeeze(0)?;
             let layer = QtipLayer::quantize_with_options_concrete(
@@ -4706,6 +5001,7 @@ mod tests {
                 shared_lut = Some(layer.lut);
                 shared_rotation_signs = layer.rotation_signs;
                 shared_rotation_block = layer.rotation_block;
+                shared_search_detail = layer.search_detail;
             }
         }
         let blocks_3d = Tensor::stack(&blocks_slices, 0)?;
@@ -4720,6 +5016,7 @@ mod tests {
             rotation_signs: shared_rotation_signs,
             rotation_block: shared_rotation_block,
             search: QtipSearchStamp::for_mode(mode),
+            search_detail: shared_search_detail,
         })
         .inspect(|l| {
             debug_assert_eq!(l.blocks.dims(), &[e, n, k_in / 4]);

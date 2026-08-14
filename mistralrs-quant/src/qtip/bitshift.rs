@@ -88,8 +88,8 @@ use crate::{
 
 use super::grouped::ExpertBpwTable;
 use super::{
-    apply_block_rotation, rotation_block_size, QtipMode, QtipRotation, QtipSearchStamp,
-    QTIP_ROTATION_SEED,
+    apply_block_rotation, rotation_block_size, QtipMode, QtipRotation, QtipSearchDetail,
+    QtipSearchStamp, QTIP_ROTATION_SEED,
 };
 
 #[cfg(feature = "cuda")]
@@ -341,6 +341,13 @@ pub struct Qtip2bLayer {
     /// Which trellis search produced these blocks. Serialized into UQFF from
     /// 0.3.0 and checked at load (DOCTRINE D4 §3).
     search: QtipSearchStamp,
+    /// *Which* trellis search (UQFF ≥ 0.3.0 flags byte). This rung's
+    /// `viterbi_quantize_row_2b` is the exhaustive DP with an unweighted branch
+    /// metric and has no beam, so a bake here always records
+    /// [`QtipSearchDetail::EXHAUSTIVE_MSE`]; the field exists so both rungs
+    /// share ONE wire format rather than diverging the moment qtip2b grows a
+    /// beam kernel.
+    search_detail: QtipSearchDetail,
 }
 
 impl Qtip2bLayer {
@@ -558,6 +565,7 @@ impl Qtip2bLayer {
             mcg_mult,
             expert_bpw: None,
             search: QtipSearchStamp::for_mode(mode),
+            search_detail: QtipSearchDetail::EXHAUSTIVE_MSE,
         })
     }
 
@@ -626,6 +634,7 @@ impl Qtip2bLayer {
             mcg_mult: QTIP2B_MCG_MULT,
             expert_bpw: None,
             search: QtipSearchStamp::for_mode(mode),
+            search_detail: QtipSearchDetail::EXHAUSTIVE_MSE,
         }))
     }
 
@@ -729,6 +738,7 @@ impl Qtip2bLayer {
             mcg_mult,
             expert_bpw: Some(ExpertBpwTable::uniform_2bit(e)),
             search: QtipSearchStamp::for_mode(mode),
+            search_detail: QtipSearchDetail::EXHAUSTIVE_MSE,
         }))
     }
 
@@ -1369,6 +1379,11 @@ impl Qtip2bLayer {
         self.search
     }
 
+    /// *Which* trellis search: beam width and objective (UQFF ≥ 0.3.0).
+    pub fn search_detail(&self) -> QtipSearchDetail {
+        self.search_detail
+    }
+
     /// Per-expert bit-width descriptor table (`Some` iff this is a 3-D
     /// expert stack). Consulted by the grouped-GEMM dispatch.
     pub fn expert_bpw(&self) -> Option<&ExpertBpwTable> {
@@ -1409,6 +1424,7 @@ impl QuantMethod for Qtip2bLayer {
                     // Blocks arrive already packed from an unknown producer;
                     // we did not run the search, so we do not claim it (D4).
                     search: QtipSearchStamp::Unstamped,
+                    search_detail: QtipSearchDetail::Unknown,
                 })
             }
             _ => candle_core::bail!("Qtip2bLayer requires QuantMethodConfig::Qtip2b"),
@@ -1632,6 +1648,33 @@ impl Qtip2bLayer {
             Err(_) => QtipSearchStamp::Unstamped,
         };
 
+        // wave13-AF search-detail flags byte — same wire rule as the LUT rung,
+        // deliberately: one format, not one per rung. Mandatory whenever a
+        // stamp is present, so a truncated payload fails closed instead of
+        // reading as an exhaustive unweighted bake.
+        let search_detail = match search {
+            QtipSearchStamp::Unstamped => QtipSearchDetail::Unknown,
+            stamp => {
+                let flags = buffer.read_u8().map_err(|_| {
+                    candle_core::Error::Msg(
+                        "Qtip2bLayer: payload carries a search stamp but no search-detail \
+                         flags byte; refusing a truncated artifact rather than assuming an \
+                         exhaustive unweighted bake."
+                            .into(),
+                    )
+                })?;
+                QtipSearchDetail::from_wire(flags, stamp, || {
+                    buffer.read_u16::<LittleEndian>().map_err(|_| {
+                        candle_core::Error::Msg(
+                            "Qtip2bLayer: search-detail flags claim a beam but the width is \
+                             missing (truncated payload)."
+                                .into(),
+                        )
+                    })
+                })?
+            }
+        };
+
         Ok((
             Self {
                 blocks,
@@ -1643,6 +1686,7 @@ impl Qtip2bLayer {
                 rotation_block,
                 mcg_mult,
                 search,
+                search_detail,
                 // UQFF today only carries the uniform 2-bit format; a
                 // mixed-bpw payload would arrive with the 4-bit rung's
                 // serde revision.
@@ -1705,6 +1749,14 @@ impl QuantizedSerde for Qtip2bLayer {
                  no stamp; re-quantize from the source weights so the stamp is earned rather \
                  than assumed (DOCTRINE D4)."
             ),
+        }
+        // wave13-AF: the search detail beside the stamp. Always
+        // exhaustive/unweighted on this rung today, but written through the
+        // same encoder so the two rungs cannot drift apart on the wire.
+        let (flags, beam_width) = self.search_detail.to_wire(self.search)?;
+        buffer.push(flags);
+        if let Some(w) = beam_width {
+            buffer.extend(&w.to_le_bytes());
         }
         Ok(Cow::from(buffer))
     }
@@ -2698,6 +2750,7 @@ mod tests {
             mcg_mult: layer.mcg_mult,
             expert_bpw: None,
             search: layer.search,
+            search_detail: layer.search_detail,
         };
         let cuda_dq: Vec<f32> = layer_cuda
             .dequantize_weights()?
@@ -2749,6 +2802,7 @@ mod tests {
             mcg_mult: layer_cpu.mcg_mult,
             expert_bpw: None,
             search: layer_cpu.search,
+            search_detail: layer_cpu.search_detail,
         };
 
         let xdata = gaussian_fixture(k_in, 31337, 1.0);
@@ -2998,6 +3052,7 @@ mod tests {
             mcg_mult: fused_cpu.mcg_mult,
             expert_bpw: None,
             search: fused_cpu.search,
+            search_detail: fused_cpu.search_detail,
         };
         let x = Tensor::from_vec(gaussian_fixture(k_in, 31337, 1.0), (1, k_in), &cpu)?
             .to_device(&cuda)?
@@ -3059,6 +3114,7 @@ mod tests {
             mcg_mult: wide_cpu.mcg_mult,
             expert_bpw: None,
             search: wide_cpu.search,
+            search_detail: wide_cpu.search_detail,
         };
         let xw = Tensor::from_vec(gaussian_fixture(wk, 24680, 1.0), (1, wk), &cpu)?
             .to_device(&cuda)?
@@ -3094,6 +3150,7 @@ mod tests {
             mcg_mult: fb_cpu.mcg_mult,
             expert_bpw: None,
             search: fb_cpu.search,
+            search_detail: fb_cpu.search_detail,
         };
         let xf = Tensor::from_vec(gaussian_fixture(fk, 999, 1.0), (1, fk), &cpu)?
             .to_device(&cuda)?
