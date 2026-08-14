@@ -19,12 +19,56 @@
 //!      indexer head, distinct from main-attention heads).
 //!   2. Runs an internal smaller compressor over `k_full` to produce
 //!      `indexer_k: [B, n_heads, T_c, head_dim]` (with `T_c = T_full / 4`).
-//!   3. Computes per-head dot-product scores `indexer_q @ indexer_k^T`.
-//!   4. Scales each head by a learned per-token `weights_proj(x)` factor.
-//!   5. Returns the `topk` indices into `T_c` per (batch, head, query).
+//!   3. Computes per-head dot-product scores `indexer_q @ indexer_k^T`,
+//!      **rectifies** them (`relu`), scales each head by the learned per-token
+//!      `weights_proj(x) * weight_scale` factor, and **sums over heads** to
+//!      one logit per `(batch, query, compressed-key)`.
+//!   4. Returns the `topk` indices into `T_c` per (batch, query) — a **single
+//!      key set shared by every head**.
 //!
 //! The downstream caller (V4 attention) then gathers only those `topk`
 //! compressed-K entries for the actual sparse attention reduction.
+//!
+//! ## Scoring formula (the authoritative one)
+//!
+//! ```text
+//! logit[b, q, c] = kv_scale[c] * Σ_h relu(q[b,h,q,:] · k[b,h,c,:]) * w[b,h,q]
+//! w[b,h,q]       = weights_proj(x)[b,q,h] * weight_scale
+//! weight_scale   = softmax_scale * n_heads^-0.5,  softmax_scale = head_dim^-0.5
+//! topk_idx[b,q]  = argtopk_c(logit[b, q, :])          // one selection, all heads
+//! ```
+//!
+//! This mirrors SGLang's reference implementation of the DSV4 indexer logits,
+//! `dsv4/indexer.py::fp8_paged_mqa_logits_torch` (lines 84-89):
+//!
+//! ```python
+//! score = F.linear(kvcache_value, q)   # [T_c, n_heads]  per-head q·k
+//! score = F.relu(score)                # (1) rectify BEFORE mixing heads
+//! score *= q_scale[None, :]            # per-head weight (weight_scale folded in)
+//! score = score.sum(dim=1)             # (2) ONE logit per key
+//! score *= kvcache_scale               # (3) per-key FP8 dequant scale
+//! ```
+//!
+//! and `C4Indexer.__init__` line 519 for (3'):
+//! `self.weight_scale = self.softmax_scale * self.n_heads**-0.5`, folded into
+//! the weights by `compute_weights` / `fused_scale` before the logits kernel.
+//!
+//! Three properties this buys over a plain per-head `(q·k) * w` + per-head
+//! top-k:
+//!   1. **ReLU**: without it, a strongly *negative* head dot cancels a strongly
+//!      positive one and a different key wins. Selection is not invariant.
+//!   2. **Sum over heads → one shared selection**: per-head top-k would emit
+//!      `n_heads` (= 64) different key sets, multiplying the sparse-gather
+//!      traffic by 64 and defeating the point of the sparse path. The shared
+//!      page set is what makes the gather cheap.
+//!   3. **`weight_scale`**: a uniform positive factor, so selection-neutral,
+//!      but required if the logits are ever consumed directly (debug dumps,
+//!      thresholding, calibration).
+//!
+//! `kv_scale[c]` is the per-key FP8 dequantisation scale of SGLang's paged
+//! indexer K cache. Arc keeps the indexer K in BF16/F32 (no FP8 indexer cache
+//! yet), so `kv_scale ≡ 1` here and the term is absent; it reappears when the
+//! FP8 paged cache lands.
 //!
 //! ## Tensor name auto-detection
 //!
@@ -99,6 +143,14 @@ pub struct V4Indexer {
     /// Overlap-mode coefficient. `coff = 1 + overlap`. For ratio==4 (CSA),
     /// `overlap = True` and `coff = 2`. See SGLang `Compressor.__init__`.
     pub coff: usize,
+    /// `softmax_scale * n_heads^-0.5` with `softmax_scale = head_dim^-0.5`.
+    ///
+    /// SGLang `C4Indexer.__init__` line 519. Folded into the per-head weights
+    /// (`compute_weights` / `fused_scale`) before the logits kernel runs, so
+    /// the kernel and the CPU reference both receive weights that already
+    /// carry it. Uniform and positive → selection-neutral, but the logits are
+    /// only numerically correct with it.
+    pub weight_scale: f64,
 }
 
 impl V4Indexer {
@@ -185,6 +237,11 @@ impl V4Indexer {
             comp_vb.pp("wkv"),
         )?;
 
+        // SGLang C4Indexer.__init__:
+        //   self.softmax_scale = self.head_dim ** -0.5
+        //   self.weight_scale  = self.softmax_scale * self.n_heads ** -0.5
+        let weight_scale = (head_dim as f64).powf(-0.5) * (n_heads as f64).powf(-0.5);
+
         Ok(Self {
             wq_b,
             weights_proj,
@@ -197,6 +254,7 @@ impl V4Indexer {
             topk,
             ratio,
             coff,
+            weight_scale,
         })
     }
 
@@ -209,12 +267,14 @@ impl V4Indexer {
     ///   - `xs`: `[B, T_q, hidden_size]` — original input for `weights_proj`.
     ///
     /// Output:
-    ///   - `top_k_indices`: `[B, n_heads, T_q, topk]` indices into
-    ///     `T_c = T_full / ratio`.
+    ///   - `top_k_indices`: `[B, T_q, topk]` indices into
+    ///     `T_c = T_full / ratio`. **One key set per (batch, query), shared by
+    ///     every head** — see the module-level "Scoring formula" section.
     ///
     /// SGLang reference: `C4Indexer.compute_q`, `compute_weights`,
-    /// and the final scoring step (folded into the fused triton kernel
-    /// `fp8_paged_mqa_logits`). This is the unfused candle equivalent.
+    /// and the final scoring step (`fp8_paged_mqa_logits`, whose torch
+    /// reference is `dsv4/indexer.py::fp8_paged_mqa_logits_torch` lines
+    /// 84-89). This is the unfused candle equivalent.
     pub fn forward(&self, q_a: &Tensor, k_full: &Tensor, xs: &Tensor) -> Result<Tensor> {
         let q_dims = q_a.dims();
         if q_dims.len() != 3 {
@@ -321,37 +381,41 @@ impl V4Indexer {
             .reshape((b, h_k, t_c, self.head_dim))?
             .contiguous()?;
 
-        // --- 3+4+5. Score + scale + top-k -------------------------------
+        // --- 3+4+5. Score + relu + weighted head-sum + top-k -------------
         // CUDA fast path (RUN-163): when running on a CUDA device with a
         // supported (topk, head_dim) combo, dispatch to the vendored
         // FlashMLASparse kernels for fused score + radix top-k. The pure
         // Rust path below remains the spec / reference and is also taken
         // on CPU / non-CUDA devices and for unsupported shapes.
         //
-        // Per-head scale: weights_proj(xs) → [B, T_q, n_heads]
-        //                                  → [B, n_heads, T_q]
+        // Per-head weights: weights_proj(xs) * weight_scale
+        //   → [B, T_q, n_heads] → [B, n_heads, T_q]
+        // `weight_scale` is folded in here (not in the kernel), exactly as
+        // SGLang folds it in `compute_weights` / `fused_scale` before the
+        // logits kernel. The kernel and `cpu_reference` therefore both take
+        // weights that already carry it.
         let per_head_scale_3d = self
             .weights_proj
             .forward_autocast(xs)? // [B, T_q, n_heads]
             .transpose(1, 2)? // [B, n_heads, T_q]
-            .contiguous()?;
+            .contiguous()?
+            .affine(self.weight_scale, 0.0)?;
 
         #[cfg(feature = "cuda")]
         {
             if matches!(q.device(), candle_core::Device::Cuda(_))
                 && q.dtype() == candle_core::DType::BF16
-                && arc_cuda_graph::flashmlasparse::SUPPORTED_TOPK
-                    .contains(&self.topk.min(t_c))
+                && arc_cuda_graph::flashmlasparse::SUPPORTED_TOPK.contains(&self.topk.min(t_c))
             {
                 // Ensure all three inputs are BF16 contiguous on the same device.
                 let q_bf16 = q.to_dtype(candle_core::DType::BF16)?.contiguous()?;
-                let k_bf16 = indexer_k
-                    .to_dtype(candle_core::DType::BF16)?
-                    .contiguous()?;
+                let k_bf16 = indexer_k.to_dtype(candle_core::DType::BF16)?.contiguous()?;
                 let s_bf16 = per_head_scale_3d
                     .to_dtype(candle_core::DType::BF16)?
                     .contiguous()?;
                 let topk = self.topk.min(t_c);
+                // Returns [B, T_q, topk] — the head dim is reduced inside the
+                // kernel, matching `indexer_logits` below.
                 let out = arc_cuda_graph::flashmlasparse::score_and_topk_bf16(
                     &q_bf16, &k_bf16, &s_bf16, topk,
                 )?;
@@ -361,24 +425,53 @@ impl V4Indexer {
         }
 
         // --- Pure-Rust reference path ----------------------------------
-        // q:        [B, n_heads, T_q, head_dim]
-        // k^T:      [B, n_heads, head_dim, T_c]
-        // scores:   [B, n_heads, T_q, T_c]
-        let k_t = indexer_k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
-        let scores = q.matmul(&k_t)?;
-
-        // Per-head scale: [B, n_heads, T_q] → [B, n_heads, T_q, 1] for broadcast.
-        let per_head_scale = per_head_scale_3d
-            .unsqueeze(D::Minus1)? // [B, n_heads, T_q, 1]
-            .contiguous()?;
-        let scaled = scores.broadcast_mul(&per_head_scale.to_dtype(scores.dtype())?)?;
+        let logits = indexer_logits(&q, &indexer_k, &per_head_scale_3d)?;
 
         // Top-k along T_c (last dim). Returns indices into [0, T_c).
-        let scaled = scaled.contiguous()?;
         let k = self.topk.min(t_c);
-        let TopKOutput { indices, .. } = scaled.topk_unsorted(k)?;
+        let TopKOutput { indices, .. } = logits.contiguous()?.topk_unsorted(k)?;
         Ok(indices)
     }
+}
+
+/// The V4 Lightning Indexer logit reduction — the piece the CUDA kernel
+/// (`arc_flashmlasparse_logits_*`) and `arc_cuda_graph::flashmlasparse::
+/// cpu_reference` must agree with bit-for-bit in semantics.
+///
+/// ```text
+/// logit[b, q, c] = Σ_h relu(q[b,h,q,:] · k[b,h,c,:]) * w[b,h,q]
+/// ```
+///
+/// Inputs:
+///   - `q`: `[B, n_heads, T_q, head_dim]`
+///   - `k`: `[B, n_heads, T_c, head_dim]`
+///   - `weights`: `[B, n_heads, T_q]` — `weights_proj(x) * weight_scale`,
+///     i.e. `weight_scale` is already folded in by the caller (SGLang does
+///     the same in `compute_weights`).
+///
+/// Output: `[B, T_q, T_c]` — **one logit per (query, key)**, no head axis.
+///
+/// Reference: SGLang `dsv4/indexer.py::fp8_paged_mqa_logits_torch` lines
+/// 84-89 (`F.linear` → `F.relu` → `*= q_scale` → `.sum(dim=1)`).
+pub fn indexer_logits(q: &Tensor, k: &Tensor, weights: &Tensor) -> Result<Tensor> {
+    // q [B, H, T_q, D] @ k^T [B, H, D, T_c] → [B, H, T_q, T_c]
+    let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
+    let scores = q.matmul(&k_t)?;
+
+    // (1) ReLU on the per-head dot, BEFORE mixing heads. Without this a
+    //     negative head cancels a positive one and a different key wins.
+    let scores = scores.relu()?;
+
+    // Per-head weight: [B, H, T_q] → [B, H, T_q, 1] for broadcast.
+    let w = weights
+        .unsqueeze(D::Minus1)?
+        .to_dtype(scores.dtype())?
+        .contiguous()?;
+    let scaled = scores.broadcast_mul(&w)?;
+
+    // (2) Sum over heads → ONE logit per (batch, query, key), so the
+    //     downstream top-k selects a single key set shared by all heads.
+    scaled.sum(1)
 }
 
 #[cfg(test)]
@@ -570,11 +663,13 @@ mod tests {
         let xs = Tensor::randn(0.0f32, 1.0, (b, t_q, cfg.hidden_size), &device)?;
 
         let out = indexer.forward(&q_a, &k_full, &xs)?;
-        // Output shape should be [B, n_heads, T_q, topk] where topk
-        // is clamped to T_c = 4 (since synth_cfg uses topk=6 > T_c=4).
+        // Output shape is [B, T_q, topk] — no head axis: the head dot products
+        // are relu'd and summed into ONE logit per (query, key), so a single
+        // key set is selected and shared by every head. `topk` is clamped to
+        // T_c = 4 (synth_cfg uses topk=6 > T_c=4).
         let t_c = t_full / 4;
         let expected_k = cfg.index_topk.min(t_c);
-        assert_eq!(out.dims(), &[b, cfg.index_n_heads, t_q, expected_k]);
+        assert_eq!(out.dims(), &[b, t_q, expected_k]);
         Ok(())
     }
 
@@ -652,9 +747,10 @@ mod tests {
     }
 
     /// Agreement test (RUN-163): the V4Indexer's Candle forward path must
-    /// agree with a hand-rolled per-(B, H, T_q) score+top-k baseline that
-    /// mirrors what the CUDA FlashMLASparse kernels compute. This locks in
-    /// the spec the CUDA kernels are compared against on a GPU host.
+    /// agree with a hand-rolled per-(B, T_q) relu + weighted-head-sum + top-k
+    /// baseline that mirrors what the CUDA FlashMLASparse kernels compute.
+    /// This locks in the spec the CUDA kernels are compared against on a GPU
+    /// host.
     ///
     /// We construct an indexer with ape=0 + RMSNorm weight=1 so the inner
     /// compressor reduces to a pure sigmoid(gate)*kv + sum-over-coff
@@ -833,7 +929,8 @@ mod tests {
             }
         }
 
-        // 3. weights_proj(xs) → [B, T_q, n_heads] → [B, H, T_q]
+        // 3. weights_proj(xs) * weight_scale → [B, T_q, n_heads] → [B, H, T_q]
+        let weight_scale = ((head_dim as f64).powf(-0.5) * (n_heads as f64).powf(-0.5)) as f32;
         let wp_flat = lin(&weights_proj_v, hidden, n_heads, &xs_v);
         let mut scale = vec![0.0f32; b * n_heads * t_q];
         for bi in 0..b {
@@ -841,47 +938,52 @@ mod tests {
                 for h in 0..n_heads {
                     let src = (bi * t_q + ti) * n_heads + h;
                     let dst = (bi * n_heads + h) * t_q + ti;
-                    scale[dst] = wp_flat[src];
+                    scale[dst] = wp_flat[src] * weight_scale;
                 }
             }
         }
 
-        // 4. Per-(B, H, T_q) scoring + top-k. Use the same lowest-index
-        // tiebreak as both V4Indexer::forward (candle's topk_unsorted) and
-        // the FlashMLASparse CPU reference.
+        // 4. Per-(B, T_q) logits + top-k:
+        //      logit[b,q,c] = Σ_h relu(q_h · k_c) * w[b,h,q]
+        //    then ONE top-k over c, shared by all heads. Use the same
+        //    lowest-index tiebreak as both V4Indexer::forward (candle's
+        //    topk_unsorted) and the FlashMLASparse CPU reference.
         let k_top = topk.min(t_c);
-        let mut expected = vec![0u32; b * n_heads * t_q * k_top];
+        let mut expected = vec![0u32; b * t_q * k_top];
         for bi in 0..b {
-            for h in 0..n_heads {
-                for ti in 0..t_q {
-                    let s = scale[(bi * n_heads + h) * t_q + ti];
-                    let q_base = ((bi * n_heads + h) * t_q + ti) * head_dim;
-                    let mut scored: Vec<(usize, f32)> = (0..t_c)
-                        .map(|ci| {
+            for ti in 0..t_q {
+                let mut scored: Vec<(usize, f32)> = (0..t_c)
+                    .map(|ci| {
+                        let mut logit = 0.0f32;
+                        for h in 0..n_heads {
+                            let s = scale[(bi * n_heads + h) * t_q + ti];
+                            let q_base = ((bi * n_heads + h) * t_q + ti) * head_dim;
                             let k_base = ((bi * n_heads + h) * t_c + ci) * head_dim;
                             let mut acc = 0.0f32;
                             for d in 0..head_dim {
                                 acc += q_bhqd[q_base + d] * indexer_k[k_base + d];
                             }
-                            (ci, acc * s)
-                        })
-                        .collect();
-                    scored.sort_by(|a, b| {
-                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                            .then(a.0.cmp(&b.0))
-                    });
-                    let out_base = ((bi * n_heads + h) * t_q + ti) * k_top;
-                    for i in 0..k_top {
-                        expected[out_base + i] = scored[i].0 as u32;
-                    }
+                            logit += acc.max(0.0) * s;
+                        }
+                        (ci, logit)
+                    })
+                    .collect();
+                scored.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.0.cmp(&b.0))
+                });
+                let out_base = (bi * t_q + ti) * k_top;
+                for i in 0..k_top {
+                    expected[out_base + i] = scored[i].0 as u32;
                 }
             }
         }
 
         // Candle's topk_unsorted returns indices in arbitrary order (no
         // guarantee of sort). The flashmlasparse spec also produces an
-        // unsorted set. Compare as sets per (B, H, T_q) row.
-        for row in 0..(b * n_heads * t_q) {
+        // unsorted set. Compare as sets per (B, T_q) row.
+        for row in 0..(b * t_q) {
             let mut g: Vec<u32> = got[row * k_top..(row + 1) * k_top].to_vec();
             let mut e: Vec<u32> = expected[row * k_top..(row + 1) * k_top].to_vec();
             g.sort_unstable();
@@ -892,6 +994,188 @@ mod tests {
                  got={g:?} expected={e:?}"
             );
         }
+        Ok(())
+    }
+
+    /// **Force-full-selection dense-equivalence.** With `index_topk >= T_c`
+    /// the indexer has no choice: it must return *every* compressed key. So
+    /// gathering K/V with the selection and attending over the gathered set
+    /// must reproduce dense attention over all of `T_c` **bit-exactly**.
+    ///
+    /// This is the property that makes today's serving path safe (CSA
+    /// top-512 covers all compressed entries whenever
+    /// `ctx <= index_topk * ratio = 2048`) and it is the free regression
+    /// guard the previous per-head formula never had: any selection bug that
+    /// drops or duplicates a key breaks it immediately.
+    #[test]
+    fn v4_indexer_full_selection_is_dense_equivalent() -> Result<()> {
+        let device = Device::Cpu;
+        let b = 2usize;
+        let t_q = 3usize;
+        let t_full = 20usize;
+        let t_c = t_full / 4; // 5
+        let n_heads = 3usize;
+        let head_dim = 8usize;
+        // index_topk = 8 >= T_c = 5 → forced full selection.
+        let cfg = synth_cfg(/*hidden*/ 16, /*q_lora*/ 16, n_heads, head_dim, /*topk*/ 8);
+        assert!(cfg.index_topk >= t_c, "test requires index_topk >= T_c");
+
+        let tensors = make_indexer_tensors(&cfg, 4, 2, &device);
+        let vb = vb_from_map(tensors, DType::F32, &device);
+        let indexer = V4Indexer::new(&cfg, vb, &device, false)?;
+
+        let q_a = det_randn(0xF0FF_0001, 0.0, 1.0, (b * t_q, cfg.q_lora_rank.unwrap()), &device)
+            .reshape((b, t_q, cfg.q_lora_rank.unwrap()))?;
+        let k_full = det_randn(
+            0xF0FF_0002,
+            0.0,
+            1.0,
+            (b * n_heads * t_full, head_dim),
+            &device,
+        )
+        .reshape((b, n_heads, t_full, head_dim))?;
+        let xs = det_randn(0xF0FF_0003, 0.0, 1.0, (b * t_q, cfg.hidden_size), &device)
+            .reshape((b, t_q, cfg.hidden_size))?;
+
+        let idx = indexer.forward(&q_a, &k_full, &xs)?;
+        assert_eq!(idx.dims(), &[b, t_q, t_c]);
+
+        // (a) The selection is the complete key set for every (batch, query).
+        let idx_v: Vec<u32> = idx.flatten_all()?.to_vec1()?;
+        for row in 0..(b * t_q) {
+            let mut r: Vec<u32> = idx_v[row * t_c..(row + 1) * t_c].to_vec();
+            r.sort_unstable();
+            let full: Vec<u32> = (0..t_c as u32).collect();
+            assert_eq!(
+                r, full,
+                "row {row}: forced-full selection must return every key exactly once"
+            );
+        }
+
+        // (b) Gathering main-attention K/V with that selection and attending
+        //     over the gathered set reproduces dense attention bit-exactly.
+        //     Sorted indices are the identity permutation, so no reordering
+        //     can perturb the softmax accumulation order.
+        let main_q = det_randn(0xF0FF_0004, 0.0, 1.0, (b * n_heads * t_q, head_dim), &device)
+            .reshape((b, n_heads, t_q, head_dim))?;
+        let main_k = det_randn(0xF0FF_0005, 0.0, 1.0, (b * n_heads * t_c, head_dim), &device)
+            .reshape((b, n_heads, t_c, head_dim))?;
+        let main_v = det_randn(0xF0FF_0006, 0.0, 1.0, (b * n_heads * t_c, head_dim), &device)
+            .reshape((b, n_heads, t_c, head_dim))?;
+
+        let attend = |k: &Tensor, v: &Tensor| -> Result<Vec<f32>> {
+            let s = main_q.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
+            let p = candle_nn::ops::softmax_last_dim(&s)?;
+            p.matmul(v)?.flatten_all()?.to_vec1::<f32>()
+        };
+
+        let dense = attend(&main_k, &main_v)?;
+
+        // Gather with the (sorted) selection of query 0 — the selection is
+        // identical for every query since it is the full set.
+        let mut sel: Vec<u32> = idx_v[0..t_c].to_vec();
+        sel.sort_unstable();
+        let sel_t = Tensor::from_vec(sel, (t_c,), &device)?;
+        let gathered_k = main_k.index_select(&sel_t, 2)?.contiguous()?;
+        let gathered_v = main_v.index_select(&sel_t, 2)?.contiguous()?;
+        let sparse = attend(&gathered_k, &gathered_v)?;
+
+        assert_eq!(
+            dense, sparse,
+            "forced-full-selection sparse attention must equal dense attention bit-exactly"
+        );
+        Ok(())
+    }
+
+    /// Pin the scoring semantics on a hand-computed fixture where the OLD
+    /// formula (`(q_h · k_c) * w_h`, no relu, top-k **per head**) and the NEW
+    /// one (`Σ_h relu(q_h · k_c) * w_h`, one shared top-k) provably select
+    /// **different** keys — so a regression to the old formula cannot pass
+    /// silently.
+    ///
+    /// Fixture: B=1, T_q=1, n_heads=2, head_dim=1, T_c=2, w = [1, 1],
+    /// `q = 1` on both heads, `k = [[3, -1], [-4, 2]]` (head-major).
+    ///
+    /// | key | h0 dot | h1 dot | new: Σ relu·w | no-relu sum | old per-head  |
+    /// |-----|--------|--------|---------------|-------------|---------------|
+    /// | c0  |  +3    |  -4    | 3 + 0 = **3** | 3 - 4 = -1  | h0 picks c0   |
+    /// | c1  |  -1    |  +2    | 0 + 2 =   2   | -1 + 2 = +1 | h1 picks c1   |
+    ///
+    /// New picks **c0**. Dropping the relu (but keeping the head sum) picks
+    /// c1. Keeping per-head top-k picks c0 for head 0 and c1 for head 1 — two
+    /// different key sets. All three outcomes are distinct.
+    #[test]
+    fn indexer_logits_relu_and_head_sum_pick_different_keys() -> Result<()> {
+        let device = Device::Cpu;
+        let (b, n_heads, t_q, t_c, head_dim) = (1usize, 2usize, 1usize, 2usize, 1usize);
+
+        let q = Tensor::from_vec(vec![1.0f32, 1.0], (b, n_heads, t_q, head_dim), &device)?;
+        // k[h=0] = [3, -1]; k[h=1] = [-4, 2]
+        let k = Tensor::from_vec(
+            vec![3.0f32, -1.0, -4.0, 2.0],
+            (b, n_heads, t_c, head_dim),
+            &device,
+        )?;
+        let w = Tensor::from_vec(vec![1.0f32, 1.0], (b, n_heads, t_q), &device)?;
+
+        let logits = indexer_logits(&q, &k, &w)?;
+        assert_eq!(logits.dims(), &[b, t_q, t_c]);
+        let got: Vec<f32> = logits.flatten_all()?.to_vec1()?;
+        // relu(3)*1 + relu(-4)*1 = 3 ; relu(-1)*1 + relu(2)*1 = 2
+        assert_eq!(got, vec![3.0f32, 2.0], "hand-computed logits");
+
+        let TopKOutput { indices, .. } = logits.contiguous()?.topk_unsorted(1)?;
+        let picked: Vec<u32> = indices.flatten_all()?.to_vec1()?;
+        assert_eq!(picked, vec![0u32], "new formula must select key c0");
+
+        // --- The old formulas, computed inline, must disagree. ---
+        // (a) no relu, but summed over heads → c1 wins (score +1 vs -1).
+        let no_relu = q
+            .matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?
+            .broadcast_mul(&w.unsqueeze(D::Minus1)?)?
+            .sum(1)?;
+        let no_relu_v: Vec<f32> = no_relu.flatten_all()?.to_vec1()?;
+        assert_eq!(no_relu_v, vec![-1.0f32, 1.0]);
+        let TopKOutput { indices, .. } = no_relu.contiguous()?.topk_unsorted(1)?;
+        let old_pick: Vec<u32> = indices.flatten_all()?.to_vec1()?;
+        assert_eq!(
+            old_pick,
+            vec![1u32],
+            "no-relu variant must pick a DIFFERENT key than the fixed formula"
+        );
+        assert_ne!(old_pick, picked);
+
+        // (b) per-head top-k (no relu) → head 0 picks c0, head 1 picks c1:
+        //     two different key sets, i.e. n_heads× the gather traffic.
+        let per_head = q
+            .matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?
+            .broadcast_mul(&w.unsqueeze(D::Minus1)?)?;
+        let TopKOutput { indices, .. } = per_head.contiguous()?.topk_unsorted(1)?;
+        let per_head_pick: Vec<u32> = indices.flatten_all()?.to_vec1()?;
+        assert_eq!(per_head_pick, vec![0u32, 1u32]);
+        assert_ne!(
+            per_head_pick[0], per_head_pick[1],
+            "fixture must make the heads disagree, or it proves nothing"
+        );
+        Ok(())
+    }
+
+    /// `weight_scale = softmax_scale * n_heads^-0.5` is applied to the
+    /// logits (selection-neutral, but the logit magnitudes must be right).
+    #[test]
+    fn v4_indexer_weight_scale_matches_sglang() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = synth_cfg(16, 16, /*n_heads*/ 4, /*head_dim*/ 16, 8);
+        let tensors = make_indexer_tensors(&cfg, 4, 2, &device);
+        let vb = vb_from_map(tensors, DType::F32, &device);
+        let indexer = V4Indexer::new(&cfg, vb, &device, false)?;
+        // softmax_scale = head_dim^-0.5 = 16^-0.5 = 0.25
+        // weight_scale  = 0.25 * 4^-0.5 = 0.125
+        assert!(
+            (indexer.weight_scale - 0.125).abs() < 1e-12,
+            "weight_scale = {} != 0.125",
+            indexer.weight_scale
+        );
         Ok(())
     }
 }
