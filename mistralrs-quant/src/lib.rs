@@ -41,6 +41,8 @@ pub mod rotary;
 pub mod safetensors;
 mod scalar_fp8;
 pub mod td_moe_factored;
+#[cfg(test)]
+mod test_rng;
 pub mod turboquant;
 mod unquantized;
 mod utils;

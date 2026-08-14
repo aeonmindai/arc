@@ -456,6 +456,13 @@ mod tests {
     use super::*;
     use candle_core::{DType, Device, Result, Tensor};
 
+    /// Deterministic pseudo-Gaussian inputs. Lives in [`crate::test_rng`]
+    /// because `blockwise_fp8`'s round-trip test needs the same fixture and
+    /// had the same defect; that module also records the measured flake rates
+    /// of the unseeded `Tensor::randn` bounds these tests used to assert
+    /// against.
+    use crate::test_rng::det_randn;
+
     #[test]
     fn test_fp8_vector_dequant() -> Result<()> {
         let dev = &Device::Cpu;
@@ -475,39 +482,6 @@ mod tests {
         }
 
         Ok(())
-    }
-
-    /// Deterministic pseudo-Gaussian values (SplitMix64 + Box-Muller): the same
-    /// seed yields bit-identical `f32`s on every run and every platform.
-    ///
-    /// Same fix, same reason as `dsv4_indexer.rs::det_randn`: this module's
-    /// round-trip test used unseeded `Tensor::randn`, so each test process drew
-    /// a fresh input and the observed FP8 E4M3 max error wandered right up to
-    /// the assertion bound — failing roughly 1 run in 8 (observed 0.2954
-    /// against a `< 0.27` bar). A flaky suite trains everyone to shrug at red,
-    /// so the input is pinned and the bound is set from the measured error on
-    /// *that* input rather than widened until the flake stops.
-    fn det_randn(seed: u64, mean: f32, std: f32, n: usize) -> Vec<f32> {
-        let mut state = seed;
-        let mut next = move || {
-            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = state;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
-        };
-        let mut vals = Vec::with_capacity(n + 1);
-        while vals.len() < n {
-            // Box-Muller from two uniforms in (0, 1].
-            let u1 = ((next() >> 11) as f64 + 1.0) / (1u64 << 53) as f64;
-            let u2 = ((next() >> 11) as f64 + 1.0) / (1u64 << 53) as f64;
-            let r = (-2.0 * u1.ln()).sqrt();
-            let (s, c) = (2.0 * std::f64::consts::PI * u2).sin_cos();
-            vals.push((mean as f64 + std as f64 * r * c) as f32);
-            vals.push((mean as f64 + std as f64 * r * s) as f32);
-        }
-        vals.truncate(n);
-        vals
     }
 
     #[test]
@@ -567,8 +541,21 @@ mod tests {
     fn test_fp8_vector_quant_dequant_roundtrip() -> Result<()> {
         let dev = &Device::new_cuda(0)?;
 
-        // Create test input with 256 elements (2 vectors)
-        let input = Tensor::randn(0f32, 2f32, 256, dev)?;
+        // Fixed input: 256 elements (2 vectors of 128) drawn N(0, 2) by
+        // `det_randn`, so `max_error` below is a constant, not a sample. Seed
+        // differs from `test_fp8_vector_quant_cpu`'s deliberately — the two
+        // tests then cover two independent inputs, and CPU/CUDA agreement on a
+        // *shared* input already has its own test
+        // (`test_fp8_vector_cpu_cuda_equivalence`).
+        //
+        // This test carried the same unseeded-`randn` defect the CPU test did,
+        // against a *tighter* bar, so it flaked harder: over 20 000 independent
+        // `Tensor::randn(0, 2, 256)` draws through this exact round trip,
+        // 851 exceeded the old `< 0.24` bound — 4.26%, about 1 run in 23,
+        // worst 0.32366514. Being `cfg(feature = "cuda")` it only ever runs on
+        // a rented GPU box, where a spurious red costs money and invites
+        // debugging on the clock (DOCTRINE D4b).
+        let input = Tensor::from_vec(det_randn(0xF8E4_0002, 0.0, 2.0, 256), 256, dev)?;
 
         // Quantize
         let (quantized, scales) = fp8_vector_quantize(&input)?;
@@ -594,8 +581,40 @@ mod tests {
             max_error = max_error.max(error);
         }
 
-        // FP8 E4M3 has limited precision, so we expect some error
-        assert!(max_error < 0.24, "Max error {} is too large", max_error);
+        // Non-degeneracy: FP8 E4M3 keeps 3 mantissa bits, so a real round trip
+        // MUST lose something. Without this floor an all-zero fixture — or a
+        // quantize kernel that silently returned its input — would sail past
+        // the upper bound while testing nothing (D12).
+        assert!(
+            max_error > 1e-3,
+            "max error {max_error} is implausibly small — the fixture is \
+             degenerate or the round trip is not exercising quantization"
+        );
+        // Upper bound derived from the MEASURED error on this fixed input:
+        // observed max_error = 0.17539787 (F8E4M3, per-128-element scaling,
+        // seed 0xF8E40002; block absmax 5.266437 / 6.4388623). The bar is that
+        // value + ~5%, which is tighter than the old 0.24 and therefore has
+        // MORE teeth, not less.
+        //
+        // This value was measured on CPU, not on a GPU, so the margin is
+        // justified against the two ways the CUDA path can differ:
+        //
+        //  1. The kernel rounds TWICE — `__float2half` then
+        //     `__nv_cvt_halfraw_to_fp8(_, __NV_SATFINITE, __NV_E4M3)` — where
+        //     `cpu_vector_quantize` rounds f32 -> fp8 once via
+        //     `F8E4M3::from_f32`. Both are round-to-nearest-even (float8 0.7.0
+        //     `src/lib.rs:182-197`; CUDA `__NV_SATFINITE` RNE), and dequant is
+        //     exact on both sides (fp8 -> f16 -> f32 loses nothing). Emulating
+        //     the double rounding on this exact input moves ONE code out of 256
+        //     and leaves max_error bit-identical at 0.17539787: a code only
+        //     flips within half an f16 ULP of an fp8 midpoint, where either
+        //     choice sits half a step from the true value.
+        //  2. `det_randn`'s `ln`/`sin_cos` can differ in the last bit across
+        //     libm implementations. Perturbing every input element by 1e-6
+        //     *relative* — orders of magnitude beyond last-bit f32 drift — over
+        //     64 patterns moved max_error only within [0.17538404, 0.17541313],
+        //     i.e. +/-1.5e-5. The 5% margin is ~300x that.
+        assert!(max_error < 0.185, "Max error {} is too large", max_error);
 
         Ok(())
     }

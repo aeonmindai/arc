@@ -1764,12 +1764,52 @@ impl QtipLayer {
     /// [`Self::quantize_with_options_3d`] with an optional activation Hessian
     /// diagonal (`[K_in]`, shared across experts because every expert in a
     /// stack reads the same input features).
+    ///
+    /// Takes the bake configuration from the process environment
+    /// ([`QtipBakeConfig::get`]). To drive a specific search from a test, use
+    /// [`Self::quantize_3d_with_bake_config`].
     pub fn quantize_with_options_3d_calibrated(
         weight: &Tensor,
         device: &Device,
         mode: QtipMode,
         use_rotation: bool,
         hessian_diag: Option<&[f32]>,
+    ) -> Result<Arc<dyn QuantMethod>> {
+        Self::quantize_3d_with_bake_config(
+            weight,
+            device,
+            mode,
+            use_rotation,
+            hessian_diag,
+            QtipBakeConfig::get(),
+        )
+    }
+
+    /// [`Self::quantize_with_options_3d_calibrated`] with the bake configuration
+    /// passed **explicitly** instead of read from the process environment — the
+    /// 3-D sibling of [`Self::quantize_with_bake_config`].
+    ///
+    /// Why this exists: wave14-AK opened the explicit-config door for 2-D
+    /// linears, but this is the path `--isq qtip2`/`qtip2b` actually takes for
+    /// V4 Flash — the stacked MoE experts, which are essentially the entire
+    /// weight mass of the model. Because the per-expert chunks went through
+    /// [`Self::quantize_with_options_concrete_calibrated`], which reads the
+    /// memoised env config internally, a 3-D beam bake could not be exercised
+    /// by any test at all: the one code path a paid GPU session spends its
+    /// money on was the one path no test had ever run.
+    ///
+    /// The env stays the production path and stays memoised — a bake must not
+    /// re-read the environment per row, and a mid-run change of search would
+    /// produce a checkpoint no stamp could honestly describe. This door only
+    /// lets a caller say which search it wants; it is deliberately *not* wired
+    /// into any loader, CLI flag, or config file.
+    pub fn quantize_3d_with_bake_config(
+        weight: &Tensor,
+        device: &Device,
+        mode: QtipMode,
+        use_rotation: bool,
+        hessian_diag: Option<&[f32]>,
+        bake_cfg: QtipBakeConfig,
     ) -> Result<Arc<dyn QuantMethod>> {
         let dims = weight.dims3()?;
         let (e, n, k_in) = (dims.0, dims.1, dims.2);
@@ -1838,13 +1878,18 @@ impl QtipLayer {
             // [this_b, N, K] -> [this_b*N, K] (CPU reshape; concrete moves to GPU).
             let chunk = weight.narrow(0, expert_idx, this_b)?;
             let rows_2d = chunk.reshape((this_b * n, k_in))?;
-            let layer = Self::quantize_with_options_concrete_calibrated(
+            // Every chunk is baked with the SAME `bake_cfg` the caller handed
+            // in — not a per-chunk re-read. The cross-chunk `search_detail`
+            // check below is what turns that into an enforced property rather
+            // than a comment.
+            let layer = Self::quantize_with_bake_config(
                 &rows_2d,
                 None,
                 &quant_device,
                 mode,
                 use_rotation,
                 hessian_diag,
+                bake_cfg,
             )?;
 
             // blocks [this_b*N, packed] -> [this_b, N, packed]; scales [this_b*N] -> [this_b, N].
