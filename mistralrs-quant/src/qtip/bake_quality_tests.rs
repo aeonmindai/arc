@@ -625,3 +625,83 @@ fn probe_bake_quality_ladder() {
         println!("------");
     }
 }
+
+/// **The qtip2b twin of `bake_quality_regression_default_expert_path`
+/// (wave13-AG).**
+///
+/// The LUT rung's regression test above was fixed in PR #20; the bitshift rung
+/// next to it was missed and kept sending 3-D expert stacks to
+/// `QtipMode::Greedy` unless `ARC_QTIP_EXPERT_VITERBI` was set — which also
+/// disabled the Hadamard rotation. That is the rung the trellis grouped-GEMM
+/// keystone and both GEMV autotune grids are built around, so it was never a
+/// dormant path.
+///
+/// This test goes through the **production ISQ dispatch itself** —
+/// `UnquantLinear::apply_isq(Some(IsqType::Qtip2b), ..)`, the exact code
+/// `mistralrs quantize --isq qtip2b` runs — rather than calling a quantize
+/// helper directly. A twin that called `Qtip2bLayer::quantize_with_mode`
+/// would have stayed green through the entire defect, because the defect was
+/// in the *dispatch*, not in the quantizer.
+///
+/// Fixture: FP4/e2m1 lattice values with per-32-column block scales over
+/// heavy-tailed rows — the real source chain of the V4-Flash experts after the
+/// INT4-packed FP4 weights are dequantized to BF16.
+///
+/// Measured on this fixture: **matmul cos 0.6794** with the old greedy
+/// dispatch (RED), **0.9623** after the fix (GREEN). 0.679 reproduces
+/// wave3-G's independently-measured 0.675 for greedy + no-rotation on the
+/// FP4-lattice fixtures.
+#[test]
+fn qtip2b_bake_quality_regression_production_isq_path() {
+    use crate::{IsqType, QuantMethod, QuantMethodConfig, QuantizeOntoGuard, UnquantLinear};
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::Linear;
+    use std::sync::{atomic::AtomicUsize, Arc};
+
+    let (e, n, k) = (2usize, 16usize, 512usize);
+    let w_data = gen_fp4_dequant(e * n, k, 0.02, 42);
+    let w = Tensor::from_vec(w_data.clone(), (e, n, k), &Device::Cpu)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap();
+
+    let unquant: Arc<UnquantLinear> =
+        Arc::new(UnquantLinear::new(QuantMethodConfig::Unquantized(Linear::new(w, None))).unwrap());
+    let layer = unquant
+        .apply_isq(
+            Some(IsqType::Qtip2b),
+            Device::Cpu,
+            &AtomicUsize::new(0),
+            None,
+            QuantizeOntoGuard::new(),
+        )
+        .expect("production qtip2b ISQ dispatch must quantize a 3-D expert stack");
+
+    let w_hat: Vec<f32> = layer
+        .dequantize_w()
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let mut worst = f64::INFINITY;
+    for ex in 0..e {
+        let m = evaluate(
+            &w_data[ex * n * k..(ex + 1) * n * k],
+            &w_hat[ex * n * k..(ex + 1) * n * k],
+            n,
+            k,
+        );
+        worst = worst.min(m.matmul_cos);
+    }
+    assert!(
+        worst >= 0.95,
+        "bake-quality defect: the production `--isq qtip2b` dispatch reaches matmul cos \
+         {worst:.4} on FP4-lattice heavy-tailed experts; the trellis+rotation floor on this \
+         fixture is ≥0.95. Greedy search and/or a missing Hadamard rotation is the cause — \
+         see DOCTRINE D4 and mistralrs-quant/src/unquantized/mod.rs."
+    );
+}

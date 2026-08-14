@@ -87,7 +87,10 @@ use crate::{
 };
 
 use super::grouped::ExpertBpwTable;
-use super::{apply_block_rotation, rotation_block_size, QtipMode, QTIP_ROTATION_SEED};
+use super::{
+    apply_block_rotation, rotation_block_size, QtipMode, QtipRotation, QtipSearchStamp,
+    QTIP_ROTATION_SEED,
+};
 
 #[cfg(feature = "cuda")]
 use super::cuda_ops;
@@ -335,19 +338,43 @@ pub struct Qtip2bLayer {
     /// table exists so mixed-precision stacks (4-bit hot experts) only have
     /// to extend the per-class launch loop. See `super::grouped`.
     expert_bpw: Option<ExpertBpwTable>,
+    /// Which trellis search produced these blocks. Serialized into UQFF from
+    /// 0.3.0 and checked at load (DOCTRINE D4 §3).
+    search: QtipSearchStamp,
 }
 
 impl Qtip2bLayer {
-    /// Quantize with the default mode policy (mirrors the LUT rung):
-    /// Greedy → rotation off, Viterbi → rotation on.
+    /// **The production door** for this rung. Refuses [`QtipMode::Greedy`] in
+    /// every build (D4) and takes its rotation from [`QtipRotation::for_mode`],
+    /// the single policy table shared with the LUT rung — no local
+    /// `matches!(mode, Viterbi)` that a future mode could slip past.
     pub fn quantize_with_mode(
         weight: &Tensor,
         bias: Option<Tensor>,
         device: &Device,
         mode: QtipMode,
     ) -> Result<Arc<dyn QuantMethod>> {
-        let use_rotation = matches!(mode, QtipMode::Viterbi);
+        mode.deny_greedy("Qtip2bLayer::quantize_with_mode")?;
+        let use_rotation = QtipRotation::for_mode(mode).enabled();
         Self::quantize_with_options(weight, bias, device, mode, use_rotation)
+    }
+
+    /// **The greedy fixture door — this crate's tests only (DOCTRINE D4).**
+    /// See [`super::QtipLayer::quantize_greedy_fixture`]; compiled only under
+    /// `cfg(test)` of `mistralrs-quant`.
+    #[cfg(test)]
+    pub(crate) fn quantize_greedy_fixture(
+        weight: &Tensor,
+        bias: Option<Tensor>,
+        device: &Device,
+    ) -> Result<Arc<dyn QuantMethod>> {
+        Self::quantize_with_options(
+            weight,
+            bias,
+            device,
+            QtipMode::Greedy,
+            QtipRotation::for_mode(QtipMode::Greedy).enabled(),
+        )
     }
 
     /// Lowest-level quantize entry: explicit mode + explicit rotation flag.
@@ -382,6 +409,10 @@ impl Qtip2bLayer {
         mode: QtipMode,
         use_rotation: bool,
     ) -> Result<Self> {
+        // D4 fixture door: greedy is reachable only from this crate's own
+        // `cfg(test)` builds. Production callers arrive via
+        // `quantize_with_mode`, which refuses greedy in all builds.
+        mode.deny_greedy_outside_tests("Qtip2bLayer::quantize_with_options_concrete")?;
         // GPU fast path. Same hard rule as the LUT rung: when CUDA is
         // compiled in AND the tensor targets CUDA, there is NO CPU fallback —
         // quantize stays on the device the model lives on.
@@ -526,6 +557,7 @@ impl Qtip2bLayer {
             rotation_block,
             mcg_mult,
             expert_bpw: None,
+            search: QtipSearchStamp::for_mode(mode),
         })
     }
 
@@ -593,6 +625,7 @@ impl Qtip2bLayer {
             rotation_block,
             mcg_mult: QTIP2B_MCG_MULT,
             expert_bpw: None,
+            search: QtipSearchStamp::for_mode(mode),
         }))
     }
 
@@ -695,6 +728,7 @@ impl Qtip2bLayer {
             rotation_block: shared_rotation_block,
             mcg_mult,
             expert_bpw: Some(ExpertBpwTable::uniform_2bit(e)),
+            search: QtipSearchStamp::for_mode(mode),
         }))
     }
 
@@ -1330,6 +1364,11 @@ impl Qtip2bLayer {
         self.rotation_block
     }
 
+    /// Which trellis search produced these blocks (DOCTRINE D4 §3).
+    pub fn search_stamp(&self) -> QtipSearchStamp {
+        self.search
+    }
+
     /// Per-expert bit-width descriptor table (`Some` iff this is a 3-D
     /// expert stack). Consulted by the grouped-GEMM dispatch.
     pub fn expert_bpw(&self) -> Option<&ExpertBpwTable> {
@@ -1367,6 +1406,9 @@ impl QuantMethod for Qtip2bLayer {
                     rotation_block,
                     mcg_mult,
                     expert_bpw: num_experts.map(ExpertBpwTable::uniform_2bit),
+                    // Blocks arrive already packed from an unknown producer;
+                    // we did not run the search, so we do not claim it (D4).
+                    search: QtipSearchStamp::Unstamped,
                 })
             }
             _ => candle_core::bail!("Qtip2bLayer requires QuantMethodConfig::Qtip2b"),
@@ -1493,7 +1535,23 @@ impl Qtip2bLayer {
     /// needed — the same mechanism as the LUT rung's `deserialize_concrete`
     /// (UQFF v0.2.1). Each tensor is deserialized in one shot (single host
     /// buffer → single device upload) — no per-expert round-trips at load.
-    fn deserialize_concrete(
+    pub(super) fn deserialize_concrete(
+        data: Cow<[u8]>,
+        device: &Device,
+        guard: QuantizeOntoGuard,
+    ) -> Result<(Self, Option<Tensor>)> {
+        let (layer, ext_bias) = Self::deserialize_concrete_unchecked(data, device, guard)?;
+        // D4 §3 teeth: the load gate every serving path passes through.
+        layer
+            .search
+            .enforce_at_load("qtip2b-layer", layer.rotation_block)?;
+        Ok((layer, ext_bias))
+    }
+
+    /// Payload parser without the D4 load gate. Private; used by the checked
+    /// wrapper above and by serde round-trip tests that round-trip a cheap
+    /// greedy fixture. No serving path calls it directly.
+    fn deserialize_concrete_unchecked(
         data: Cow<[u8]>,
         device: &Device,
         guard: QuantizeOntoGuard,
@@ -1567,6 +1625,13 @@ impl Qtip2bLayer {
             Err(_) => (None, 0usize),
         };
 
+        // D4 §3 search stamp (UQFF ≥ 0.3.0). Pre-0.3.0 payloads end after the
+        // rotation section, so EOF means "unstamped".
+        let search = match buffer.read_u8() {
+            Ok(byte) => QtipSearchStamp::from_wire(byte)?,
+            Err(_) => QtipSearchStamp::Unstamped,
+        };
+
         Ok((
             Self {
                 blocks,
@@ -1577,6 +1642,7 @@ impl Qtip2bLayer {
                 rotation_signs,
                 rotation_block,
                 mcg_mult,
+                search,
                 // UQFF today only carries the uniform 2-bit format; a
                 // mixed-bpw payload would arrive with the 4-bit rung's
                 // serde revision.
@@ -1629,6 +1695,16 @@ impl QuantizedSerde for Qtip2bLayer {
             serialize_tensor(&mut buffer, signs)?;
         } else {
             buffer.push(0u8);
+        }
+        // D4 §3: stamp the trellis search (UQFF 0.3.0).
+        match self.search.to_wire() {
+            Some(byte) => buffer.push(byte),
+            None => candle_core::bail!(
+                "Qtip2bLayer::serialize: refusing to write an artifact with unknown search \
+                 provenance. This layer came from a pre-0.3.0 payload or a format that carries \
+                 no stamp; re-quantize from the source weights so the stamp is earned rather \
+                 than assumed (DOCTRINE D4)."
+            ),
         }
         Ok(Cow::from(buffer))
     }
@@ -2161,7 +2237,7 @@ mod tests {
         let x = Tensor::from_vec(xdata, (batch, k_in), &device)?;
         let dense_v: Vec<f32> = x.matmul(&w.t()?)?.flatten_all()?.to_vec1()?;
 
-        let layer = Qtip2bLayer::quantize_with_mode(&w, None, &device, QtipMode::Greedy)?;
+        let layer = Qtip2bLayer::quantize_greedy_fixture(&w, None, &device)?;
         let qv: Vec<f32> = layer
             .forward(&x)?
             .to_dtype(DType::F32)?
@@ -2276,7 +2352,7 @@ mod tests {
         let device = Device::Cpu;
         let wdata = gaussian_fixture(4 * 64, 21, 0.5);
         let w = Tensor::from_vec(wdata, (4, 64), &device)?;
-        let layer = Qtip2bLayer::quantize_with_mode(&w, None, &device, QtipMode::Greedy)?;
+        let layer = Qtip2bLayer::quantize_greedy_fixture(&w, None, &device)?;
         let a = Tensor::zeros((1, 2, 64), DType::F32, &device)?;
         let indices = Tensor::zeros((1, 2), DType::U32, &device)?;
         assert!(layer.gather_forward(&a, &indices).is_err());
@@ -2409,8 +2485,11 @@ mod tests {
     ) -> Result<Qtip2bLayer> {
         let layer = Qtip2bLayer::quantize_with_options_3d(w3, device, mode, rotation)?;
         let payload = layer.serialize()?;
+        // `_unchecked`: several callers build a cheap greedy fixture, which the
+        // D4 load gate refuses on purpose. That gate has its own tests
+        // (`qtip/greedy_ban_tests.rs`); this helper only needs the typed layer.
         let (concrete, _) =
-            Qtip2bLayer::deserialize_concrete(payload, device, QuantizeOntoGuard::new())?;
+            Qtip2bLayer::deserialize_concrete_unchecked(payload, device, QuantizeOntoGuard::new())?;
         Ok(concrete)
     }
 
@@ -2618,6 +2697,7 @@ mod tests {
             rotation_block: layer.rotation_block,
             mcg_mult: layer.mcg_mult,
             expert_bpw: None,
+            search: layer.search,
         };
         let cuda_dq: Vec<f32> = layer_cuda
             .dequantize_weights()?
@@ -2668,6 +2748,7 @@ mod tests {
             rotation_block: layer_cpu.rotation_block,
             mcg_mult: layer_cpu.mcg_mult,
             expert_bpw: None,
+            search: layer_cpu.search,
         };
 
         let xdata = gaussian_fixture(k_in, 31337, 1.0);
@@ -2916,6 +2997,7 @@ mod tests {
             rotation_block: fused_cpu.rotation_block,
             mcg_mult: fused_cpu.mcg_mult,
             expert_bpw: None,
+            search: fused_cpu.search,
         };
         let x = Tensor::from_vec(gaussian_fixture(k_in, 31337, 1.0), (1, k_in), &cpu)?
             .to_device(&cuda)?
@@ -2976,6 +3058,7 @@ mod tests {
             rotation_block: wide_cpu.rotation_block,
             mcg_mult: wide_cpu.mcg_mult,
             expert_bpw: None,
+            search: wide_cpu.search,
         };
         let xw = Tensor::from_vec(gaussian_fixture(wk, 24680, 1.0), (1, wk), &cpu)?
             .to_device(&cuda)?
@@ -3010,6 +3093,7 @@ mod tests {
             rotation_block: 0,
             mcg_mult: fb_cpu.mcg_mult,
             expert_bpw: None,
+            search: fb_cpu.search,
         };
         let xf = Tensor::from_vec(gaussian_fixture(fk, 999, 1.0), (1, fk), &cpu)?
             .to_device(&cuda)?

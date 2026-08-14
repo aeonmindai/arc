@@ -113,11 +113,37 @@ short version:
 
 ## Upgrade notes
 
-- **UQFF 0.2.1.** v2.0 writes UQFF 0.2.1, which adds rank-3 stacked-expert
-  (MoE) QTIP payloads — the format the 68 GB V4 artifact uses. **Readers
-  older than 0.2.1 do not fail cleanly on rank-3 payloads: they mis-decode
-  them.** Do not load v2.0 artifacts with pre-v2.0 builds. (0.2.1 readers
-  load older 0.2.x artifacts fine.)
+- **UQFF 0.3.0 — QTIP artifacts now record which trellis search baked them,
+  and old ones may be refused.** Every QTIP payload (both the `qtip2` LUT rung
+  and the `qtip2b` bitshift rung) carries a search-provenance stamp, and the
+  loader checks it. This closes a real hole: nothing in the 0.2.x format said
+  whether a bake used the full trellis search or the greedy walk, so a
+  low-quality artifact was indistinguishable from a good one at load time —
+  and greedy costs matmul cosine 0.675 vs 0.963 on the FP4-lattice experts V4
+  uses, while also disabling the Hadamard incoherence rotation.
+
+  What this means for existing artifacts:
+
+  | artifact | behaviour under v2.0 |
+  |---|---|
+  | baked by v2.0 (stamped `trellis`) | loads normally |
+  | pre-0.3.0, **with** incoherence rotation | loads, with a one-time warning that its search cannot be verified from the file |
+  | pre-0.3.0, **without** incoherence rotation | **refused.** Under every bake policy shipped so far, rotation was on if and only if the trellis search ran, so such a file is a greedy bake. Re-bake with `mistralrs quantize`, or set `ARC_ALLOW_UNSTAMPED_QTIP=1` to load it anyway for diagnostics. |
+  | stamped `greedy` | **refused, no override** |
+
+  If you baked a `--isq qtip2b` MoE artifact with a build before this release,
+  **re-bake it**: that path selected the greedy walk for 3-D expert stacks, so
+  the artifact is at the degraded quality even though nothing in the log or the
+  file said so. Greedy is no longer selectable at all — the
+  `ARC_QTIP_EXPERT_GREEDY` environment variable has been removed, and a bake
+  handed the greedy mode hard-errors rather than warning.
+
+  Version mechanics: this is a **minor** bump, so pre-0.3.0 builds now refuse
+  v2.0 artifacts cleanly ("newer than this build supports") instead of reading
+  them and ignoring the stamp; 0.3.0 reads every 0.1.x/0.2.x artifact subject
+  to the table above. Rank-3 stacked-expert (MoE) QTIP payloads arrived in
+  0.2.1 and **readers older than 0.2.1 mis-decode them rather than failing**,
+  so pre-v2.0 builds must not be pointed at v2.0 artifacts either way.
 - **Breaking: the `qtip2` trellis parser/naming moved to the `bitshift`
   family.** The QTIP trellis implementation now lives under
   `qtip::bitshift`; in the Rust API the 2-bit rung is

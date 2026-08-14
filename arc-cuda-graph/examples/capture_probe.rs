@@ -21,7 +21,10 @@ fn main() -> candle_core::Result<()> {
 
     let (e, k, ntok, topk) = (8usize, 512usize, 1usize, 6usize);
     let w = Tensor::randn(0f32, 0.02f32, (e, 512usize, k), &dev)?.to_dtype(DType::BF16)?;
-    let layer = QtipLayer::quantize_with_options(&w, None, &dev, QtipMode::Greedy, false)?;
+    // Greedy is banned outside this crate's own tests (DOCTRINE D4), and the
+    // probe runs on CUDA where the trellis quantize is a kernel — the bake is
+    // not the thing being measured here anyway.
+    let layer = QtipLayer::quantize_with_mode(&w, None, &dev, QtipMode::default_expert_mode())?;
     let idx: Vec<u32> = (0..ntok * topk).map(|i| (i % e) as u32).collect();
     let indices = Tensor::from_vec(idx, (ntok, topk), &dev)?;
     let x = Tensor::randn(0f32, 1f32, (ntok, topk, k), &dev)?.to_dtype(DType::BF16)?;

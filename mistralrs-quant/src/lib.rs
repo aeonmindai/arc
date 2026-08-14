@@ -98,8 +98,8 @@ pub use qtip::tune::{
 };
 pub use qtip::{
     gpu_quantize_cpu_fallback_count, hessian_row_weights, viterbi_quantize_row, ExpertBpwTable,
-    Qtip2bLayer, QtipBakeConfig, QtipLayer, QtipMode, QtipPackedView, TrellisBpw, TrellisSearch,
-    QTIP2B_MCG_MULT,
+    Qtip2bLayer, QtipBakeConfig, QtipLayer, QtipMode, QtipPackedView, QtipRotation,
+    QtipSearchStamp, TrellisBpw, TrellisSearch, QTIP2B_MCG_MULT,
 };
 pub use td_moe_factored::TuckerFactoredLayer;
 pub use unquantized::UnquantLinear;

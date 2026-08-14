@@ -13,10 +13,21 @@ use half::{bf16, f16};
 //         self-describing (rank + dims), so 2-D QTIP payloads are unchanged;
 //         readers older than this version mis-decode rank-3 QTIP payloads
 //         rather than failing cleanly, so the bump records provenance.
+// v0.3.0: QTIP search stamp. Both QTIP rungs append a trailing provenance byte
+//         (1 = trellis, 2 = greedy) naming the search that produced the blocks,
+//         and refuse a greedy-stamped payload at load (DOCTRINE D4).
+//         This is a MINOR bump, not a patch, on purpose: `version_is_compatible`
+//         only gates on major/minor, so a 0.2.x reader would happily accept a
+//         0.2.2 payload and then ignore the stamp — i.e. exactly the silent
+//         mis-decode that the v0.2.1 note warns about. With 0.3.0 an older
+//         binary fails cleanly ("newer than this build supports") instead of
+//         serving weights whose provenance it cannot check, while this build
+//         still reads every 0.1.x/0.2.x artifact (see
+//         `QtipSearchStamp::enforce_at_load` for the legacy policy).
 
 const UQFF_VERSION_MAJOR: u32 = 0;
-const UQFF_VERSION_MINOR: u32 = 2;
-const UQFF_VERSION_PATCH: u32 = 1;
+const UQFF_VERSION_MINOR: u32 = 3;
+const UQFF_VERSION_PATCH: u32 = 0;
 
 /// Format 4 bytes, little endian: [ UNSPECIFIED ] [ MAJOR ] [ MINOR ] [ PATCH ]
 pub(crate) const UQFF_VERSION: u32 =

@@ -402,19 +402,14 @@ impl QuantMethod for UnquantLinear {
                 };
                 n_quantized.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let bias = self.b.as_ref().map(|b| b.to_device(&device)).transpose()?;
-                // 3D weights are MoE expert stacks (e.g. [256, 2048, 4096]).
-                // Greedy is 5-10x faster than Viterbi, but the precision gap is
-                // NOT negligible: measured matmul cos vs FP4 is greedy=0.887 vs
-                // viterbi=0.962 (3x less error) on real V4 experts. Set
-                // ARC_QTIP_EXPERT_VITERBI=1 to quantize experts with Viterbi +
-                // Hadamard rotation (gather_forward applies the rotation). (RUN-161)
-                let mode = if self.w.dims().len() == 3 {
-                    // Decision point shared with the bake-quality regression
-                    // test (qtip/bake_quality_tests.rs).
-                    crate::QtipMode::default_expert_mode()
-                } else {
-                    crate::QtipMode::Viterbi
-                };
+                // 3-D weights are MoE expert stacks (e.g. [256, 2048, 4096]).
+                // Both ranks bake with the trellis search + Hadamard rotation;
+                // greedy is banned (DOCTRINE D4) and there is no env var that
+                // brings it back. `default_expert_mode()` is the shared
+                // decision point with the bake-quality regression tests
+                // (qtip/bake_quality_tests.rs) and with the ISQ thread policy
+                // (`IsqType::isq_cpu_thread_policy`).
+                let mode = crate::QtipMode::default_expert_mode();
                 // For 3D MoE expert stacks ([E, N, K], e.g. [256, 2048, 4096]),
                 // keep the full weight on its current device (CPU during ISQ
                 // load) and let `quantize_with_options_3d` stream one expert at a
@@ -427,7 +422,10 @@ impl QuantMethod for UnquantLinear {
                 } else {
                     self.w.to_device(&device)?
                 };
-                let use_rotation = matches!(mode, crate::QtipMode::Viterbi);
+                // One shared policy table, not a local `matches!` — a fourth
+                // independent copy of the rotation decision is exactly how it
+                // drifts (wave13-AG / PR #29 both flagged this line).
+                let use_rotation = crate::QtipRotation::for_mode(mode).enabled();
                 crate::QtipLayer::quantize_with_calibration(
                     &w_for_quant,
                     bias,
@@ -444,16 +442,16 @@ impl QuantMethod for UnquantLinear {
                 }
                 n_quantized.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let bias = self.b.as_ref().map(|b| b.to_device(&device)).transpose()?;
-                // Same mode/device policy as the LUT rung above: 3-D MoE
-                // stacks default to greedy unless ARC_QTIP_EXPERT_VITERBI is
-                // set, and stay on their current device so the 3-D path can
-                // stream experts to the GPU one batch at a time.
-                let expert_viterbi = std::env::var_os("ARC_QTIP_EXPERT_VITERBI").is_some();
-                let mode = if self.w.dims().len() == 3 && !expert_viterbi {
-                    crate::QtipMode::Greedy
-                } else {
-                    crate::QtipMode::Viterbi
-                };
+                // Same mode/device policy as the LUT rung above. This arm used
+                // to send 3-D expert stacks to `QtipMode::Greedy` unless
+                // ARC_QTIP_EXPERT_VITERBI was set — the sibling rung had
+                // already been fixed (PR #20) and this one was missed, so the
+                // rung the trellis grouped-GEMM and both GEMV autotune grids
+                // are built around was still baking at greedy quality
+                // (matmul cos 0.843 without rotation vs 0.957 with, wave13-AD).
+                // Greedy is now banned outright (DOCTRINE D4): one shared
+                // decision point, no env opt-in, no rank-dependent branch.
+                let mode = crate::QtipMode::default_expert_mode();
                 let w_for_quant = if self.w.dims().len() == 3 {
                     self.w.clone()
                 } else {
