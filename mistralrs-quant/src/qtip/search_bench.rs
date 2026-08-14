@@ -383,6 +383,147 @@ fn run_grid(
 }
 
 // ---------------------------------------------------------------------------
+// wave19-AP — is exhaustive Viterbi actually better than the beam we ship?
+// ---------------------------------------------------------------------------
+
+/// The quality half of the gmin-exhaustive decision.
+///
+/// The gmin-only CUDA kernel (`kernels/qtip/qtip_gmin.cu`) is byte-identical to
+/// `TrellisSearch::Exhaustive` — `gmin_replay_matches_exhaustive_bit_for_bit`
+/// proves the recursion, and the hardware gate proves the kernel — so "what
+/// does exhaustive cost or buy in quality against beam-256" is the whole
+/// question, and it must be answered on the fixture FAMILY rather than on one
+/// draw (D12: a pure sinusoid once made the banned greedy search look better
+/// than Viterbi, and a single over-dispersed Hessian fixture nearly inverted
+/// the rotation default).
+///
+/// The intuition that exhaustive must win is WRONG in a way worth stating: the
+/// beam is not an approximation of the objective being scored here. Both
+/// searches minimise the same per-row trellis cost, exhaustive attains its
+/// minimum exactly, and the beam attains it or slightly above — but the score
+/// is `cos` of a *matmul* against held-out activations, which the trellis cost
+/// only proxies. A search that is optimal on the proxy can land marginally
+/// worse on the score, and `STATUS.md` already records one fixture where it
+/// does (beam W=256 0.96680 vs exhaustive 0.96495).
+///
+/// `cargo test --release -p mistralrs-quant --lib probe_exhaustive_vs_beam_quality \
+///     -- --ignored --nocapture`
+#[test]
+#[ignore = "evidence probe (minutes); run with --release --ignored --nocapture"]
+fn probe_exhaustive_vs_beam_quality() {
+    let (n, k, cb, eb) = (16usize, 1024usize, 128usize, 128usize);
+    let fixtures: Vec<(&str, Vec<f32>)> = vec![
+        (
+            "gaussian   ",
+            super::bake_quality_tests::gen_gaussian(n, k, 0.02, 1),
+        ),
+        (
+            "student_t4 ",
+            super::bake_quality_tests::gen_student_t(n, k, 0.02, 2),
+        ),
+        ("fp4_dequant", gen_fp4_dequant(n, k, 0.02, 0x0051_EA11)),
+    ];
+    // Channel-energy dispersions inside the band real LLM activations occupy
+    // (~1e2-1e4), per D11/D12 — not the log-normal fantasy that produced the
+    // 1.2e7:1 artefact.
+    let spreads = [
+        ("mild     s=0.3 out=0%  ", 0.3, 999.0),
+        ("awq-like s=0.3 out=0.3%", 0.3, 2.75),
+        ("moderate s=0.6 out=1%  ", 0.6, 2.33),
+    ];
+
+    println!(
+        "\nfixture     | spread                  | exhaustive |  beam W=256 |  beam W=128 | \
+         d(256) | d(128) | w_nmse exh | w_nmse b256"
+    );
+    let mut beam256_wins = 0usize;
+    let mut cells = 0usize;
+    for (fname, w) in &fixtures {
+        for (sname, sigma, oz) in spreads {
+            let scales = channel_scales_sigma(k, 0xC0FF_EE01, sigma, oz);
+            let x_cal = gen_activations(cb, &scales, 0x1234_5678);
+            let x_eval = gen_activations(eb, &scales, 0x8765_4321);
+            let h = hessian_diag(&x_cal, cb, k);
+            let ev = EvalSet {
+                w,
+                n,
+                k,
+                x_eval: &x_eval,
+                batch: eb,
+                h_diag: &h,
+            };
+            let mut cos = [0f64; 3];
+            let mut wn = [0f64; 3];
+            for (i, search) in [
+                TrellisSearch::Exhaustive,
+                TrellisSearch::Beam { width: 256 },
+                TrellisSearch::Beam { width: 128 },
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let cfg = SearchCfg {
+                    search,
+                    weighted: false,
+                };
+                let (w_hat, s) = quantize_matrix(w, n, k, cfg, &h, ROT_BLOCK);
+                let r = evaluate(&ev, &w_hat, s);
+                cos[i] = r.matmul_cos;
+                wn[i] = r.weight_nmse;
+            }
+            cells += 1;
+            if cos[1] > cos[0] {
+                beam256_wins += 1;
+            }
+            println!(
+                "{fname} | {sname} | {:>10.5} | {:>11.5} | {:>11.5} | {:>+6.4} | {:>+6.4} | \
+                 {:>10.6} | {:>11.6}",
+                cos[0],
+                cos[1],
+                cos[2],
+                cos[1] - cos[0],
+                cos[2] - cos[0],
+                wn[0],
+                wn[1]
+            );
+        }
+    }
+    println!(
+        "\nbeam W=256 scored HIGHER than exhaustive on {beam256_wins}/{cells} cells \
+         (the metric is matmul cos, which the trellis cost only proxies)"
+    );
+
+    // Exhaustive minimises the objective the search actually optimises, so its
+    // WEIGHT nmse must never be beaten by a pruned search. That is the
+    // invariant worth pinning; matmul cos is a downstream proxy and is not.
+    for (fname, w) in &fixtures {
+        let scales = channel_scales_sigma(k, 0xC0FF_EE01, 0.3, 2.75);
+        let x_cal = gen_activations(cb, &scales, 0x1234_5678);
+        let h = hessian_diag(&x_cal, cb, k);
+        let mut nm = [0f64; 2];
+        for (i, search) in [TrellisSearch::Exhaustive, TrellisSearch::Beam { width: 256 }]
+            .into_iter()
+            .enumerate()
+        {
+            let cfg = SearchCfg {
+                search,
+                weighted: false,
+            };
+            let (w_hat, _) = quantize_matrix(w, n, k, cfg, &h, ROT_BLOCK);
+            nm[i] = nmse(w, &w_hat, None, k);
+        }
+        assert!(
+            nm[0] <= nm[1] * 1.000_001,
+            "{fname}: exhaustive weight nmse {} is WORSE than beam-256's {} — the \
+             exhaustive DP is by construction the minimiser, so this means the \
+             searches are not optimising the same cost",
+            nm[0],
+            nm[1]
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Rotation vs. Hessian: which fixture regime does each one win in?
 // ---------------------------------------------------------------------------
 

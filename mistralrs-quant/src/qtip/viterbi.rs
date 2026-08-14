@@ -1255,11 +1255,13 @@ mod tests {
     /// tie-breaks, and with a non-degenerate LUT an exact `f32` tie between
     /// `err(s_m) + gmin[pred_m]` for two different `m` essentially never
     /// happens on finite costs:
-    ///   * `c <= best` (last predecessor wins ties) — measured identical on all
-    ///     43 fixtures. Ties DO occur, but only in the `+inf` region of the
-    ///     early timesteps, i.e. in groups the optimal path never enters.
-    ///   * final state keyed by `(cost, group)` instead of `(cost, state)` —
-    ///     same reason: the state's high bits only break a cost tie.
+    ///
+    /// * `c <= best` (last predecessor wins ties) — measured identical on all
+    ///   43 fixtures. Ties DO occur, but only in the `+inf` region of the early
+    ///   timesteps, i.e. in groups the optimal path never enters.
+    /// * final state keyed by `(cost, group)` instead of `(cost, state)` — same
+    ///   reason: the state's high bits only break a cost tie.
+    ///
     /// Both rules are still implemented exactly as the CPU reference has them,
     /// because that is what makes the equivalence an identity rather than an
     /// approximation; they are simply not independently observable here.
