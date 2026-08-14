@@ -40,9 +40,133 @@
 //!   symbol sequence given the LUT.
 //! - Tests demonstrate: smaller reconstruction error than greedy; deterministic
 //!   for fixed input; matches reference on small handcrafted cases.
+//!
+//! ## Two orthogonal knobs (wave13-AD)
+//!
+//! The exhaustive DP above is *one* point in a 2-D design space. Both axes are
+//! independently selectable via [`TrellisSearch`] and the optional per-position
+//! weight vector, and both default to today's behaviour.
+//!
+//! ### Axis A — search: exhaustive vs. beam
+//!
+//! [`TrellisSearch::Beam`] keeps only the best `W` states per timestep instead
+//! of all `2^L`. The candidate set at step `t` is `W · 2^K` (successors of the
+//! surviving states), deduplicated by successor state with a min-cost merge —
+//! i.e. it is *pruned Viterbi*, not a different algorithm. Setting
+//! `W >= 2^L` prunes nothing and reproduces [`TrellisSearch::Exhaustive`]
+//! **bit-for-bit** (see `beam_unpruned_matches_exhaustive_bit_for_bit`); this
+//! is the regression guard that keeps the fast path honest.
+//!
+//! Two properties make the beam exact-compatible:
+//! * The beam is kept **sorted by state ascending**, so for any successor `s'`
+//!   the 16 candidate predecessors `p = (j << (L-K)) | (s' >> K)` are visited
+//!   in ascending `j` — matching the group-min scan's `0..2^K` order.
+//! * Merging uses strict `<` (first-seen wins ties), matching the group-min
+//!   tie-break, and merges on the *predecessor* cost before the local error is
+//!   added (the local error is identical for a fixed successor, so it cannot
+//!   change the argmin — and this way `decode_error` runs once per distinct
+//!   successor instead of once per candidate).
+//!
+//! Beam search also collapses the backtrace from `2^L` bytes per timestep to
+//! `4·W` bytes — the reason the exhaustive kernel needs a multi-GB scratch
+//! budget on production-shaped rows (`num_symbols = 9472` ⇒ 620 MB vs 9.7 MB
+//! at `W = 256`).
+//!
+//! ### Axis B — objective: unweighted MSE vs. diagonal Hessian
+//!
+//! Today's branch metric is `‖w − ŵ‖²`. The proxy-Hessian objective used by
+//! GPTQ / LDLQ / QuIP# / QTIP is `(w − ŵ)ᵀ H (w − ŵ)` with `H = (1/N)·XᵀX`
+//! accumulated over calibration activations
+//! (`research/code/01_weight_compression/qtip/lib/utils/data_utils.py:28-36`,
+//! normalised at `quantize_llama/input_hessian_llama.py:137`), relatively
+//! damped by `H ← H + σ·mean(diag H)·I` with `σ = 1e-2`
+//! (`lib/utils/math_utils.py:44-49`).
+//!
+//! **Derivation for a per-row trellis.** Keeping only `diag(H)` makes the LDL
+//! factor the identity, so the objective separates over input columns and
+//! collapses to `Σ_j H_jj (w_j − ŵ_j)²` — a per-position weight in the branch
+//! metric. That is exactly [`decode_error_weighted`]. (The official QTIP
+//! `viterbi` is *unweighted*: `lib/codebook/bitshift.py:204-206,218-223` has no
+//! Hessian argument at all. The Hessian enters through LDLQ's error feedback in
+//! the LDL-transformed frame — `lib/algo/ldlq.py:48-67` — where the per-block
+//! `D_ii` weighting is dropped and the trellis solves a plain nearest-sequence
+//! problem on the corrected target. So per-position weights capture the
+//! *diagonal* of what LDLQ captures in full.)
+//!
+//! **Frame correction.** The search runs on the rotated row `w̃ = R·w` with
+//! `R = D·H_B·D` block-diagonal of width `B`. The error in the original frame
+//! is `e = R·ẽ`, so `eᵀ H e = ẽᵀ (RᵀHR) ẽ`. Every entry of a normalised
+//! Hadamard satisfies `R_ji² = 1/B`, hence
+//! `diag(RᵀHR)_ii = Σ_j H_jj R_ji² = mean(H_jj over i's block)`. The correct
+//! search-frame weight is therefore the **block mean** of `diag(H)`, computed
+//! by [`hessian_row_weights`]. Two consequences worth stating plainly:
+//! with *full-width* rotation the weights become globally constant and the
+//! objective degenerates to unweighted; with the production cap `B = 128` a
+//! `K = 4096` row keeps 32 distinct weights, so the signal survives but is
+//! deliberately smoothed by incoherence processing.
 
 #[allow(unused_imports)]
 use super::{ALPHABET, K, LUT_SIZE, STATE_MASK, V};
+
+/// Relative Hessian damping, matching QTIP's `--sigma_reg` default
+/// (`research/code/01_weight_compression/qtip/lib/utils/math_utils.py:44-49`:
+/// `H ← H + σ·mean(diag H)·I`).
+pub const HESSIAN_SIGMA_REG: f64 = 1e-2;
+
+/// How the trellis search explores the `2^L` state space.
+///
+/// `Exhaustive` is the historical (and default) behaviour. `Beam { width }`
+/// keeps only the best `width` states per timestep; `width >= 2^L` prunes
+/// nothing and is bit-identical to `Exhaustive`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TrellisSearch {
+    /// Full dynamic program over all `2^L` states (today's bake).
+    #[default]
+    Exhaustive,
+    /// Pruned dynamic program keeping the best `width` states per timestep.
+    Beam {
+        /// Number of surviving states per timestep. Clamped to `2^L`.
+        width: usize,
+    },
+}
+
+impl TrellisSearch {
+    /// Short tag for the bake log header (task #17: a Greedy bake must never
+    /// again be mistakable for a Viterbi bake).
+    pub fn tag(&self) -> String {
+        match self {
+            TrellisSearch::Exhaustive => "viterbi-exhaustive".to_string(),
+            TrellisSearch::Beam { width } => format!("viterbi-beam(W={width})"),
+        }
+    }
+
+    /// Parse the `ARC_QTIP_BEAM` env override. Unset, empty, `0`, `off` or
+    /// `exhaustive` ⇒ [`TrellisSearch::Exhaustive`]; any positive integer ⇒
+    /// a beam of that width. Unparsable values fall back to exhaustive so a
+    /// typo can never silently *lower* bake quality.
+    pub fn from_env() -> Self {
+        match std::env::var("ARC_QTIP_BEAM") {
+            Ok(v) => Self::parse(&v),
+            Err(_) => TrellisSearch::Exhaustive,
+        }
+    }
+
+    fn parse(v: &str) -> Self {
+        let v = v.trim();
+        if v.is_empty() || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("exhaustive") {
+            return TrellisSearch::Exhaustive;
+        }
+        match v.parse::<usize>() {
+            Ok(0) => TrellisSearch::Exhaustive,
+            Ok(w) if w >= LUT_SIZE => TrellisSearch::Exhaustive,
+            Ok(w) => TrellisSearch::Beam { width: w },
+            Err(_) => {
+                tracing::warn!("ARC_QTIP_BEAM={v:?} is not a width; using exhaustive Viterbi");
+                TrellisSearch::Exhaustive
+            }
+        }
+    }
+}
 
 /// Predecessors of state `s` in the trellis: 2^K states sharing low (L-K) bits.
 ///
@@ -75,6 +199,103 @@ fn decode_error(lut: &[f32], s: u32, target: &[f32]) -> f32 {
     err
 }
 
+/// Hessian-weighted squared error for state `s` against a V-vector target.
+///
+/// `w` holds the V per-position weights for this timestep (the diagonal of the
+/// search-frame Hessian, see [`hessian_row_weights`]).
+#[inline]
+fn decode_error_weighted(lut: &[f32], s: u32, target: &[f32], w: &[f32]) -> f32 {
+    debug_assert_eq!(target.len(), V as usize);
+    debug_assert_eq!(w.len(), V as usize);
+    let off = (s as usize) * V as usize;
+    let mut err = 0f32;
+    for v in 0..V as usize {
+        let d = lut[off + v] - target[v];
+        err += w[v] * d * d;
+    }
+    err
+}
+
+/// Branch metric dispatch: unweighted MSE, or diagonal-Hessian weighted.
+#[inline]
+fn branch_metric(lut: &[f32], s: u32, target: &[f32], w: Option<&[f32]>) -> f32 {
+    match w {
+        None => decode_error(lut, s, target),
+        Some(w) => decode_error_weighted(lut, s, target, w),
+    }
+}
+
+/// Project a per-input-column Hessian diagonal into the trellis *search* frame.
+///
+/// Input: `h_diag[j] = H_jj = (1/N) Σ_n x_{n,j}²` over calibration activations,
+/// in the model's original input-feature frame — precisely what
+/// [`crate::ImatrixLayerStats::compute_imatrix`] already accumulates.
+///
+/// Output: one non-negative weight per input column, in the frame the trellis
+/// actually searches, normalised to mean 1 so the branch metric keeps the same
+/// dynamic range as the unweighted one (a global scale cannot change the
+/// argmin, but it does change how close the accumulated costs get to `f32`
+/// saturation on long rows).
+///
+/// `rotation_block`: the Hadamard block width used at quantize time, or 0 when
+/// rotation is disabled. Because every entry of a normalised Hadamard obeys
+/// `R_ji² = 1/B`, `diag(RᵀHR)` is the **block mean** of `diag(H)` — see the
+/// module header. A relative damping of [`HESSIAN_SIGMA_REG`] is applied first,
+/// mirroring QTIP's `regularize_H`, so an all-but-dead input block can never
+/// drive its weight to exactly zero (which would let the trellis emit arbitrary
+/// symbols there).
+pub fn hessian_row_weights(h_diag: &[f32], rotation_block: usize) -> Vec<f32> {
+    let k = h_diag.len();
+    if k == 0 {
+        return Vec::new();
+    }
+
+    // Sanitize: negatives / NaN / inf from a truncated or corrupt calibration
+    // pass must not poison the metric.
+    let mut w: Vec<f64> = h_diag
+        .iter()
+        .map(|&v| {
+            if v.is_finite() && v > 0.0 {
+                v as f64
+            } else {
+                0.0
+            }
+        })
+        .collect();
+
+    // Relative damping, QTIP `regularize_H` (math_utils.py:44-49).
+    let raw_mean = w.iter().sum::<f64>() / k as f64;
+    if raw_mean <= 0.0 {
+        // No usable calibration signal — fall back to the unweighted objective.
+        return vec![1.0f32; k];
+    }
+    for v in w.iter_mut() {
+        *v += HESSIAN_SIGMA_REG * raw_mean;
+    }
+
+    // Frame correction: diag(RᵀHR) is the per-block mean of diag(H).
+    if rotation_block >= 2 {
+        let mut b0 = 0usize;
+        while b0 < k {
+            let end = (b0 + rotation_block).min(k);
+            let len = end - b0;
+            let mean = w[b0..end].iter().sum::<f64>() / len as f64;
+            for v in w[b0..end].iter_mut() {
+                *v = mean;
+            }
+            b0 = end;
+        }
+    }
+
+    // Normalise to mean 1. For a uniform input this yields exactly 1.0 in every
+    // slot, so a flat Hessian is bit-identical to the unweighted objective.
+    let mean = w.iter().sum::<f64>() / k as f64;
+    if mean <= 0.0 || !mean.is_finite() {
+        return vec![1.0f32; k];
+    }
+    w.into_iter().map(|v| (v / mean) as f32).collect()
+}
+
 /// Viterbi-quantize a single row of weights into the optimal symbol sequence.
 ///
 /// `target_row`: input weights of length `num_symbols * V` (the V-grouped target sequence)
@@ -82,13 +303,42 @@ fn decode_error(lut: &[f32], s: u32, target: &[f32]) -> f32 {
 ///
 /// Returns a Vec<u8> of length `num_symbols` containing one K-bit symbol per
 /// position (packed into u8, low K bits of each).
+///
+/// This is the unweighted, exhaustive default. [`quantize_row`] exposes the
+/// beam-width and Hessian-weighting knobs.
+pub fn viterbi_quantize_row(target_row: &[f32], lut: &[f32]) -> Vec<u8> {
+    exhaustive_quantize_row(target_row, lut, None)
+}
+
+/// Full search entry point: pick the search strategy and the objective.
+///
+/// `weights`: optional per-input-column weights of length `target_row.len()`,
+/// already projected into the search frame by [`hessian_row_weights`]. `None`
+/// selects the unweighted `‖w − ŵ‖²` objective.
+pub fn quantize_row(
+    target_row: &[f32],
+    lut: &[f32],
+    search: TrellisSearch,
+    weights: Option<&[f32]>,
+) -> Vec<u8> {
+    debug_assert!(weights.is_none_or(|w| w.len() == target_row.len()));
+    match search {
+        TrellisSearch::Exhaustive => exhaustive_quantize_row(target_row, lut, weights),
+        TrellisSearch::Beam { width } if width >= LUT_SIZE => {
+            exhaustive_quantize_row(target_row, lut, weights)
+        }
+        TrellisSearch::Beam { width } => beam_quantize_row(target_row, lut, weights, width),
+    }
+}
+
+/// Exhaustive group-min dynamic program over all `2^L` states.
 //
 // The index-based loops over `prev_cost` and the explicit `ALPHABET` casts are
 // deliberate in this Viterbi/scales hot path — its numerical parity is only
 // validated on an sm_80+ GPU, so we suppress the style lints rather than rewrite
 // the indexing (see arc-tools/CI_HYGIENE.md).
 #[allow(clippy::needless_range_loop, clippy::unnecessary_cast)]
-pub fn viterbi_quantize_row(target_row: &[f32], lut: &[f32]) -> Vec<u8> {
+fn exhaustive_quantize_row(target_row: &[f32], lut: &[f32], weights: Option<&[f32]>) -> Vec<u8> {
     let num_symbols = target_row.len() / V as usize;
     assert!(
         num_symbols > 0,
@@ -117,8 +367,9 @@ pub fn viterbi_quantize_row(target_row: &[f32], lut: &[f32]) -> Vec<u8> {
     // symbol sequence wouldn't decode back to the Viterbi-predicted reconstruction
     // (because the decoder also starts from state 0).
     let target_first = &target_row[..V as usize];
+    let weights_first = weights.map(|w| &w[..V as usize]);
     for s in 0..ALPHABET as usize {
-        prev_cost[s] = decode_error(lut, s as u32, target_first);
+        prev_cost[s] = branch_metric(lut, s as u32, target_first, weights_first);
     }
     // States with high bits set remain at +inf.
 
@@ -159,10 +410,25 @@ pub fn viterbi_quantize_row(target_row: &[f32], lut: &[f32]) -> Vec<u8> {
         }
 
         // Phase 2: per-state cost = local decode error + the group's predecessor min.
-        for s in 0..LUT_SIZE {
-            let g = s >> K; // high (L-K) bits select the predecessor group
-            curr_cost[s] = decode_error(lut, s as u32, target_t) + group_cost[g];
-            bt_t[s] = group_j[g];
+        // Split by objective so the unweighted hot path keeps its exact shape
+        // (no per-state branch, bit-identical to the pre-wave13 code).
+        match weights {
+            None => {
+                for s in 0..LUT_SIZE {
+                    let g = s >> K; // high (L-K) bits select the predecessor group
+                    curr_cost[s] = decode_error(lut, s as u32, target_t) + group_cost[g];
+                    bt_t[s] = group_j[g];
+                }
+            }
+            Some(w) => {
+                let w_t = &w[t * V as usize..(t + 1) * V as usize];
+                for s in 0..LUT_SIZE {
+                    let g = s >> K;
+                    curr_cost[s] =
+                        decode_error_weighted(lut, s as u32, target_t, w_t) + group_cost[g];
+                    bt_t[s] = group_j[g];
+                }
+            }
         }
 
         backtrace.push(bt_t);
@@ -193,6 +459,166 @@ pub fn viterbi_quantize_row(target_row: &[f32], lut: &[f32]) -> Vec<u8> {
     }
 
     symbols
+}
+
+// ---------------------------------------------------------------------------
+// Beam search (axis A)
+// ---------------------------------------------------------------------------
+
+/// One surviving trellis state at a timestep.
+#[derive(Clone, Copy)]
+struct BeamEntry {
+    /// Cumulative path cost into this state. During candidate generation this
+    /// transiently holds the *predecessor* cost (the local error is added once
+    /// per distinct successor, after merging).
+    cost: f32,
+    /// Trellis state (`L = 16` bits, so `u16` is exact).
+    state: u16,
+    /// Index of the chosen predecessor in the previous timestep's beam.
+    parent: u16,
+}
+
+/// Pruned Viterbi keeping the best `width` states per timestep.
+///
+/// Complexity per timestep is `O(width · 2^K)` candidate generations plus one
+/// `O(width · 2^K)` selection, versus `O(2^L)` for the exhaustive DP.
+/// Backtrace memory is `4 · width` bytes per timestep instead of `2^L`.
+///
+/// See the module header for why this reproduces [`exhaustive_quantize_row`]
+/// exactly when `width >= 2^L`.
+fn beam_quantize_row(
+    target_row: &[f32],
+    lut: &[f32],
+    weights: Option<&[f32]>,
+    width: usize,
+) -> Vec<u8> {
+    let num_symbols = target_row.len() / V as usize;
+    assert!(
+        num_symbols > 0,
+        "beam_quantize_row requires at least one symbol position"
+    );
+    debug_assert_eq!(target_row.len() % V as usize, 0);
+    // A beam wider than the state space prunes nothing; clamp so `u16` indices
+    // (and the dedup slot table) stay valid.
+    let width = width.clamp(1, LUT_SIZE);
+
+    // Dedup table: successor state -> index into `cands`. Allocated once and
+    // cleared through `touched` so we never pay a 2^L memset per timestep.
+    let mut slot = vec![u32::MAX; LUT_SIZE];
+    let mut touched: Vec<u16> = Vec::with_capacity(width * ALPHABET);
+    let mut cands: Vec<BeamEntry> = Vec::with_capacity(width * ALPHABET);
+
+    // Compacted backtrace, flat: `(state, parent)` for every surviving entry of
+    // every timestep, with one start offset per timestep. A `Vec<Vec<_>>` here
+    // costs one allocation per timestep, which on production-shaped rows
+    // (`num_symbols = 9472`) dominates the search itself.
+    let mut trace: Vec<(u16, u16)> = Vec::with_capacity(num_symbols * width.min(ALPHABET * 4));
+    let mut trace_off: Vec<u32> = Vec::with_capacity(num_symbols);
+
+    // t = 0: the decoder starts from state 0, so exactly the `2^K` states
+    // s ∈ [0, ALPHABET) are reachable, in ascending order.
+    let target_first = &target_row[..V as usize];
+    let weights_first = weights.map(|w| &w[..V as usize]);
+    let mut beam: Vec<BeamEntry> = (0..ALPHABET as u32)
+        .map(|s| BeamEntry {
+            cost: branch_metric(lut, s, target_first, weights_first),
+            state: s as u16,
+            parent: 0,
+        })
+        .collect();
+    prune_to_width(&mut beam, width);
+    trace_off.push(0);
+    trace.extend(beam.iter().map(|e| (e.state, e.parent)));
+
+    for t in 1..num_symbols {
+        let target_t = &target_row[t * V as usize..(t + 1) * V as usize];
+        let weights_t = weights.map(|w| &w[t * V as usize..(t + 1) * V as usize]);
+
+        cands.clear();
+        touched.clear();
+
+        // Expand: every surviving state × every symbol. The beam is sorted by
+        // state ascending, so for a fixed successor the predecessors arrive in
+        // ascending `j` — matching the exhaustive group-min scan order — and
+        // strict `<` keeps the smallest `j` on ties.
+        for (pi, entry) in beam.iter().enumerate() {
+            let base = ((entry.state as u32) << K) & STATE_MASK;
+            for sym in 0..ALPHABET as u32 {
+                let succ = (base | sym) as u16;
+                let s_idx = succ as usize;
+                let existing = slot[s_idx];
+                if existing == u32::MAX {
+                    slot[s_idx] = cands.len() as u32;
+                    touched.push(succ);
+                    cands.push(BeamEntry {
+                        cost: entry.cost,
+                        state: succ,
+                        parent: pi as u16,
+                    });
+                } else {
+                    let c = &mut cands[existing as usize];
+                    if entry.cost < c.cost {
+                        c.cost = entry.cost;
+                        c.parent = pi as u16;
+                    }
+                }
+            }
+        }
+
+        // Add the local branch metric once per distinct successor. The metric
+        // is identical for every candidate reaching the same state, so doing it
+        // after the merge cannot change any argmin.
+        for c in cands.iter_mut() {
+            c.cost += branch_metric(lut, c.state as u32, target_t, weights_t);
+        }
+
+        // Release the dedup slots for the next timestep.
+        for &s in &touched {
+            slot[s as usize] = u32::MAX;
+        }
+
+        prune_to_width(&mut cands, width);
+        // `cands` becomes the new beam; the old beam is recycled as next
+        // timestep's candidate buffer (no per-timestep allocation).
+        std::mem::swap(&mut beam, &mut cands);
+        trace_off.push(trace.len() as u32);
+        trace.extend(beam.iter().map(|e| (e.state, e.parent)));
+    }
+
+    // Final state: lowest cost, lowest state index on ties (the beam is state
+    // sorted, so a strict-`<` scan reproduces the exhaustive tie-break).
+    let mut best_idx = 0usize;
+    let mut best_cost = f32::INFINITY;
+    for (i, e) in beam.iter().enumerate() {
+        if e.cost < best_cost {
+            best_cost = e.cost;
+            best_idx = i;
+        }
+    }
+
+    let mut symbols = vec![0u8; num_symbols];
+    let mut idx = best_idx;
+    for t in (0..num_symbols).rev() {
+        let (state, parent) = trace[trace_off[t] as usize + idx];
+        symbols[t] = symbol_of(state as u32) as u8;
+        idx = parent as usize;
+    }
+    symbols
+}
+
+/// Keep the best `width` entries and restore ascending-state order.
+///
+/// Selection is by `(cost, state)` under [`f32::total_cmp`] so the survivor set
+/// is fully deterministic; the trailing sort by state is what makes the next
+/// timestep's predecessor visit order match the exhaustive group-min scan.
+fn prune_to_width(beam: &mut Vec<BeamEntry>, width: usize) {
+    if beam.len() > width {
+        beam.select_nth_unstable_by(width - 1, |a, b| {
+            a.cost.total_cmp(&b.cost).then(a.state.cmp(&b.state))
+        });
+        beam.truncate(width);
+    }
+    beam.sort_unstable_by_key(|e| e.state);
 }
 
 #[cfg(test)]
@@ -532,6 +958,287 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Axis A — beam search
+    // -----------------------------------------------------------------------
+
+    /// Deterministic pseudo-random row generator for the search tests.
+    fn test_row(num_symbols: usize, variant: u32) -> Vec<f32> {
+        (0..(num_symbols * V as usize))
+            .map(|i| {
+                let x = i as f32;
+                match variant {
+                    0 => (x * 0.0313).sin() * 1.2,
+                    1 => (x * 0.31).cos() * 1.5,
+                    2 => ((x * 0.7).sin() + (x * 0.013).cos()) * 0.9,
+                    3 => ((i % 5) as f32 - 2.0) * 0.5, // exact ties / zeros
+                    _ => ((x * 1.7).sin() * (x * 0.011).cos()) * 2.5,
+                }
+            })
+            .collect()
+    }
+
+    /// **THE regression guard for axis A.** An unpruned beam (`W >= 2^L`) must
+    /// return a BYTE-IDENTICAL symbol stream to the exhaustive group-min DP.
+    /// This is what keeps the beam an *approximation of the same algorithm*
+    /// rather than a different one: if it ever diverges here, the beam's
+    /// tie-breaking or merge order has drifted and every quality number in the
+    /// harness is measuring something else.
+    #[test]
+    fn beam_unpruned_matches_exhaustive_bit_for_bit() {
+        let lut = gaussian_lut();
+        for num_symbols in [1usize, 2, 3, 7, 16, 33, 64] {
+            for variant in 0..5u32 {
+                let target = test_row(num_symbols, variant);
+                let exact = viterbi_quantize_row(&target, &lut);
+                let beam = beam_quantize_row(&target, &lut, None, LUT_SIZE);
+                assert_eq!(
+                    exact, beam,
+                    "unpruned beam diverged from exhaustive at num_symbols={num_symbols}, variant={variant}"
+                );
+                // The public dispatcher must route W >= 2^L to the exact path.
+                let via_api = quantize_row(
+                    &target,
+                    &lut,
+                    TrellisSearch::Beam {
+                        width: LUT_SIZE * 4,
+                    },
+                    None,
+                );
+                assert_eq!(exact, via_api);
+            }
+        }
+    }
+
+    /// Same guard with the Hessian objective engaged: an unpruned weighted beam
+    /// must equal the weighted exhaustive DP bit-for-bit.
+    #[test]
+    fn beam_unpruned_matches_exhaustive_weighted() {
+        let lut = gaussian_lut();
+        for num_symbols in [2usize, 9, 32] {
+            for variant in 0..5u32 {
+                let target = test_row(num_symbols, variant);
+                let k = target.len();
+                // Non-uniform, outlier-heavy diagonal Hessian.
+                let h: Vec<f32> = (0..k)
+                    .map(|j| 0.05 + ((j as f32) * 0.37).sin().abs() * 4.0)
+                    .collect();
+                let w = hessian_row_weights(&h, 0);
+                let exact = exhaustive_quantize_row(&target, &lut, Some(&w));
+                let beam = beam_quantize_row(&target, &lut, Some(&w), LUT_SIZE);
+                assert_eq!(
+                    exact, beam,
+                    "weighted unpruned beam diverged at num_symbols={num_symbols}, variant={variant}"
+                );
+            }
+        }
+    }
+
+    /// A beam is never *better* than the exhaustive DP on the metric it
+    /// optimizes, and at production widths it must be very close. This pins the
+    /// direction of the trade so a future "optimization" that silently degrades
+    /// quality cannot land unnoticed.
+    #[test]
+    fn beam_cost_is_bounded_by_exhaustive() {
+        let lut = gaussian_lut();
+        let num_symbols = 128;
+        for variant in 0..5u32 {
+            let target = test_row(num_symbols, variant);
+            let exact_mse = mse(
+                &target,
+                &decode_symbols(&viterbi_quantize_row(&target, &lut), &lut),
+            );
+            let mut prev = f32::INFINITY;
+            for width in [64usize, 128, 256] {
+                let syms = quantize_row(&target, &lut, TrellisSearch::Beam { width }, None);
+                assert_eq!(syms.len(), num_symbols);
+                let beam_mse = mse(&target, &decode_symbols(&syms, &lut));
+                assert!(
+                    beam_mse >= exact_mse - 1e-6,
+                    "variant {variant}, W={width}: beam MSE {beam_mse} beat exhaustive {exact_mse} — impossible"
+                );
+                // Widening the beam is monotone non-worsening.
+                assert!(
+                    beam_mse <= prev + 1e-6,
+                    "variant {variant}: W={width} MSE {beam_mse} worse than the narrower beam's {prev}"
+                );
+                prev = beam_mse;
+            }
+        }
+    }
+
+    /// Beam search is deterministic and always emits legal symbols.
+    #[test]
+    fn beam_is_deterministic_and_well_formed() {
+        let lut = gaussian_lut();
+        let target = test_row(48, 2);
+        for width in [1usize, 4, 64, 256] {
+            let a = quantize_row(&target, &lut, TrellisSearch::Beam { width }, None);
+            let b = quantize_row(&target, &lut, TrellisSearch::Beam { width }, None);
+            assert_eq!(a, b, "beam W={width} is not deterministic");
+            assert_eq!(a.len(), 48);
+            for s in &a {
+                assert!((*s as usize) < ALPHABET);
+            }
+        }
+    }
+
+    /// `ARC_QTIP_BEAM` parsing: only an explicit positive width below the state
+    /// space count switches the search — anything else stays exhaustive so a
+    /// typo can never silently lower bake quality.
+    #[test]
+    fn beam_env_parsing_defaults_to_exhaustive() {
+        assert_eq!(TrellisSearch::parse(""), TrellisSearch::Exhaustive);
+        assert_eq!(TrellisSearch::parse("0"), TrellisSearch::Exhaustive);
+        assert_eq!(TrellisSearch::parse("off"), TrellisSearch::Exhaustive);
+        assert_eq!(
+            TrellisSearch::parse("Exhaustive"),
+            TrellisSearch::Exhaustive
+        );
+        assert_eq!(TrellisSearch::parse("nonsense"), TrellisSearch::Exhaustive);
+        assert_eq!(TrellisSearch::parse("65536"), TrellisSearch::Exhaustive);
+        assert_eq!(
+            TrellisSearch::parse(" 128 "),
+            TrellisSearch::Beam { width: 128 }
+        );
+        assert_eq!(TrellisSearch::Exhaustive.tag(), "viterbi-exhaustive");
+        assert_eq!(
+            TrellisSearch::Beam { width: 64 }.tag(),
+            "viterbi-beam(W=64)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Axis B — Hessian objective
+    // -----------------------------------------------------------------------
+
+    /// A flat Hessian must reduce to the unweighted objective EXACTLY. This is
+    /// the "default OFF is really off" guard: enabling the weighted code path
+    /// with uninformative calibration data cannot change a single baked symbol.
+    #[test]
+    fn flat_hessian_is_bit_identical_to_unweighted() {
+        let lut = gaussian_lut();
+        for rotation_block in [0usize, 2, 32, 128] {
+            for variant in 0..5u32 {
+                let target = test_row(64, variant);
+                let h = vec![0.75f32; target.len()];
+                let w = hessian_row_weights(&h, rotation_block);
+                assert!(
+                    w.iter().all(|&v| v == 1.0),
+                    "flat Hessian did not normalise to exactly 1.0 (block={rotation_block})"
+                );
+                assert_eq!(
+                    viterbi_quantize_row(&target, &lut),
+                    exhaustive_quantize_row(&target, &lut, Some(&w))
+                );
+                assert_eq!(
+                    quantize_row(&target, &lut, TrellisSearch::Beam { width: 64 }, None),
+                    quantize_row(&target, &lut, TrellisSearch::Beam { width: 64 }, Some(&w))
+                );
+            }
+        }
+    }
+
+    /// The frame correction: because every entry of a normalised Hadamard obeys
+    /// `R_ji² = 1/B`, `diag(RᵀHR)` is the per-block MEAN of `diag(H)`. So the
+    /// projected weights must be piecewise constant on rotation blocks, and a
+    /// full-width rotation must flatten them entirely.
+    #[test]
+    fn hessian_weights_are_block_means_under_rotation() {
+        let k = 256;
+        let h: Vec<f32> = (0..k).map(|j| (j as f32) + 1.0).collect();
+
+        // No rotation → weights track diag(H) directly (up to the mean-1 scale).
+        let unrot = hessian_row_weights(&h, 0);
+        let ratio = unrot[10] / unrot[0];
+        let expected =
+            (h[10] as f64 + HESSIAN_SIGMA_REG * 128.5) / (h[0] as f64 + HESSIAN_SIGMA_REG * 128.5);
+        assert!(
+            (ratio as f64 - expected).abs() < 1e-3,
+            "unrotated weights should follow diag(H): {ratio} vs {expected}"
+        );
+
+        // Block rotation → piecewise constant on 64-wide blocks, and the ratio
+        // between blocks is the ratio of block means.
+        let rot = hessian_row_weights(&h, 64);
+        for b in 0..4 {
+            for j in 1..64 {
+                assert_eq!(
+                    rot[b * 64],
+                    rot[b * 64 + j],
+                    "weights not constant within rotation block {b}"
+                );
+            }
+        }
+        assert!(rot[0] < rot[64] && rot[64] < rot[128] && rot[128] < rot[192]);
+
+        // Full-width rotation → the Hessian diagonal is fully whitened, so the
+        // weighted objective degenerates to the unweighted one.
+        let full = hessian_row_weights(&h, k);
+        assert!(full.iter().all(|&v| v == 1.0));
+    }
+
+    /// Degenerate calibration input (all zeros, NaNs, negatives) must fall back
+    /// to a flat objective rather than producing zero or non-finite weights.
+    #[test]
+    fn hessian_weights_survive_degenerate_calibration() {
+        for h in [vec![0.0f32; 32], vec![f32::NAN; 32], vec![-1.0f32; 32], {
+            let mut v = vec![0.0f32; 32];
+            v[7] = 5.0;
+            v[9] = f32::INFINITY;
+            v
+        }] {
+            for block in [0usize, 8] {
+                let w = hessian_row_weights(&h, block);
+                assert_eq!(w.len(), 32);
+                assert!(
+                    w.iter().all(|&v| v.is_finite() && v > 0.0),
+                    "degenerate calibration produced an unusable weight vector: {w:?}"
+                );
+            }
+        }
+        assert!(hessian_row_weights(&[], 0).is_empty());
+    }
+
+    /// The weighted objective actually optimizes the weighted error: on a row
+    /// with a strongly non-uniform Hessian, the Hessian-weighted search must
+    /// beat the unweighted search on the Hessian-weighted metric.
+    #[test]
+    fn hessian_objective_improves_hessian_weighted_error() {
+        let lut = gaussian_lut();
+        let num_symbols = 96;
+        let mut wins = 0usize;
+        for variant in 0..5u32 {
+            let target = test_row(num_symbols, variant);
+            let k = target.len();
+            // Outlier channels: a few inputs carry 100x the activation energy.
+            let h: Vec<f32> = (0..k)
+                .map(|j| if j % 17 == 0 { 100.0 } else { 1.0 })
+                .collect();
+            let w = hessian_row_weights(&h, 0);
+
+            let plain = decode_symbols(&viterbi_quantize_row(&target, &lut), &lut);
+            let weighted = decode_symbols(&exhaustive_quantize_row(&target, &lut, Some(&w)), &lut);
+
+            let werr = |recon: &[f32]| -> f64 {
+                target
+                    .iter()
+                    .zip(recon.iter())
+                    .zip(w.iter())
+                    .map(|((&t, &r), &wi)| wi as f64 * ((t - r) as f64).powi(2))
+                    .sum::<f64>()
+                    / k as f64
+            };
+            if werr(&weighted) < werr(&plain) {
+                wins += 1;
+            }
+        }
+        assert!(
+            wins >= 4,
+            "Hessian-weighted search only beat unweighted on {wins}/5 rows of its own metric"
+        );
     }
 
     // --- helpers ---
