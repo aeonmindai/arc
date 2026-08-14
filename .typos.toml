@@ -67,6 +67,9 @@ extend-ignore-re = [
 "ba" = "ba"
 "ratatui" = "ratatui"
 
+[type.md.extend-identifiers]
+"arange" = "arange"
+
 [type.rust.extend-identifiers]
 "arange" = "arange"
 "arange_step" = "arange_step"
