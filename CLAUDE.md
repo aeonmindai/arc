@@ -14,7 +14,8 @@ mistral.rs is a blazing-fast LLM inference engine written in Rust. It supports t
 cargo build --release
 
 # With CUDA support (Linux)
-cargo build --release --features "cuda flash-attn cudnn"
+# cudnn feature: −62% decode on V4 (5.45 vs 14.58 tok/s), see session-4 — do not add it
+cargo build --release --features "cuda flash-attn"
 
 # With Metal support (macOS)
 cargo build --release --features metal

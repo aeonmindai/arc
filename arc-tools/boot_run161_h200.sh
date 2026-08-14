@@ -22,7 +22,9 @@ V4_MODEL=${V4_MODEL:-deepseek-ai/DeepSeek-V4-Flash}
 CANDLE_REPO=https://github.com/asmit383/candle.git
 CANDLE_BRANCH=run-161-cuda-graph-capture
 ARC_REPO=https://github.com/aeonmindai/arc.git
-ARC_BRANCH=RUN-161
+# Session-1 bug: this was a hard assignment, silently ignoring the caller's
+# ARC_BRANCH. Now honored; default = master (post merge-wave).
+ARC_BRANCH=${ARC_BRANCH:-master}
 
 step() { echo; echo ":::::: $* ::::::"; date -u +%H:%M:%S; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -49,6 +51,23 @@ export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
 nvcc --version >/dev/null 2>&1 || fail "nvcc not found at $CUDA_HOME"
 ok "cuda @ $CUDA_HOME ($(nvcc --version | grep release))"
+
+# --- driver-vs-toolkit gate (session-1 lesson, 2026-08-13) ---
+# A toolkit NEWER than the driver's max supported CUDA builds fine but dies at
+# RUNTIME with CUDA_ERROR_UNSUPPORTED_PTX_VERSION (box driver 580.173 = CUDA
+# 13.0 max, image toolkit 13.1 → 40 min lost). Fail BEFORE the build instead.
+DRIVER_CUDA=$(nvidia-smi 2>/dev/null | grep -o 'CUDA Version: [0-9][0-9.]*' | grep -o '[0-9][0-9.]*$' || true)
+TOOLKIT_CUDA=$(nvcc --version | grep -o 'release [0-9][0-9.]*' | grep -o '[0-9][0-9.]*$' || true)
+if [ -n "$DRIVER_CUDA" ] && [ -n "$TOOLKIT_CUDA" ]; then
+  NEWEST=$(printf '%s\n%s\n' "$DRIVER_CUDA" "$TOOLKIT_CUDA" | sort -V | tail -1)
+  if [ "$TOOLKIT_CUDA" != "$DRIVER_CUDA" ] && [ "$NEWEST" = "$TOOLKIT_CUDA" ]; then
+    MAJOR_MINOR=$(echo "$DRIVER_CUDA" | tr . -)
+    fail "CUDA toolkit $TOOLKIT_CUDA is NEWER than driver max $DRIVER_CUDA — build would die at runtime (UNSUPPORTED_PTX_VERSION). Fix FIRST: apt-get install -y cuda-toolkit-$MAJOR_MINOR, then export CUDA_HOME=/usr/local/cuda-$DRIVER_CUDA and rerun; or pick an image whose toolkit matches the driver."
+  fi
+  ok "driver/toolkit compatible (driver max $DRIVER_CUDA >= toolkit $TOOLKIT_CUDA)"
+else
+  echo "WARN: could not parse driver ($DRIVER_CUDA) or toolkit ($TOOLKIT_CUDA) CUDA version — verify manually: nvidia-smi header vs nvcc --version"
+fi
 
 step "2 clone candle fork SIBLING ($CANDLE_BRANCH)"
 if [ ! -d "$WORK/candle/.git" ]; then
@@ -100,5 +119,5 @@ step "7 schema validate"
 
 echo
 echo "BOOTSTRAP_COMPLETE — ready to serve. V4_DIR=$V4_DIR"
-echo "Serve (run detached separately):"
-echo "  ./target/release/mistralrs serve -p 1234 --isq qtip2 --prefix-cache-n 0 -m $V4_DIR -a deepseekv4"
+echo "Serve (run detached separately; --chat-template is REQUIRED or /v1/chat/completions 422s):"
+echo "  ./target/release/mistralrs serve -p 1234 --isq qtip2 --prefix-cache-n 0 -m $V4_DIR -a deepseekv4 --chat-template chat_templates/deepseek_v4.json"

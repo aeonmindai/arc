@@ -13,6 +13,19 @@
 //   * writes qtip_tune_baked.rs — a ready-to-paste replacement for
 //     `QTIP2B_GEMV_BAKED_TABLE` in src/qtip/tune.rs.
 //
+// Machine contract (session-4 fix: a driving script's glob missed the output
+// filename, so the tuned serve ran WITHOUT the table): the LAST stdout line is
+//
+//   WINNER_TABLE_WRITTEN: <absolute path to tune_results.json>
+//
+// Drivers must parse that line rather than glob, then serve with it applied:
+//
+//   TUNE_TABLE=$(grep '^WINNER_TABLE_WRITTEN: ' sweep.log | tail -1 | cut -d' ' -f2)
+//   ARC_QTIP_TUNE_TABLE="$TUNE_TABLE" ./target/release/mistralrs serve ...
+//
+// (The env var must be set in the SERVE process's environment; only the
+// `winners` array of the JSON is consumed, other keys are ignored.)
+//
 // Methodology (same as the RUN-161 bandwidth microbench this replaces
 // as the tuning driver, examples/qtip_gemv_bw.rs):
 //   * E=64 experts (>100 MB of packed codes per shape) with rotating index
@@ -373,5 +386,11 @@ fn main() -> Result<()> {
     std::fs::write("qtip_tune_baked.rs", baked).map_err(candle_core::Error::wrap)?;
 
     println!("wrote tune_results.json (ARC_QTIP_TUNE_TABLE consumable) + qtip_tune_baked.rs");
+    // Machine-readable contract — MUST stay the last line (drivers parse it;
+    // see the header comment). Absolute path so the driver can export it from
+    // any cwd.
+    let winner_table_path = std::fs::canonicalize("tune_results.json")
+        .unwrap_or_else(|_| std::path::PathBuf::from("tune_results.json"));
+    println!("WINNER_TABLE_WRITTEN: {}", winner_table_path.display());
     Ok(())
 }

@@ -153,7 +153,7 @@ cp /root/logs/guard_tests.log $Q/results/guard_tests.txt
     log; usually the driver/toolkit mismatch from 0a.
   - `an NVIDIA driver is present on this machine but mistralrs-quant was
     built WITHOUT the 'cuda' feature` → the build command lost its features;
-    rebuild with `--features "cuda flash-attn cudnn"`.
+    rebuild with `--features "cuda flash-attn"` (NO cudnn — see step 1).
   Capture the warn line VERBATIM (it is a session deliverable either way),
   fix the named condition, re-run the tests. **ABORT-IF** they still fail
   after one targeted fix → bake would crawl at ~11min/layer; pivot directly
@@ -172,7 +172,8 @@ git apply arc-tools/quality/patches/s2_mtp_acceptance_telemetry.patch
 git apply arc-tools/quality/patches/s2_rotation_seed_override.patch
 git apply arc-tools/quality/patches/s2_ppl_dump_logprobs.patch
 git diff --stat | tail -4                  # 3 files changed — record in the log
-cargo build --release --features "cuda flash-attn cudnn" 2>&1 | tail -3
+# cudnn feature: −62% decode on V4 (5.45 vs 14.58 tok/s), see session-4 — NEVER add it
+cargo build --release --features "cuda flash-attn" 2>&1 | tail -3
 cargo build --release -p mistralrs --example perplexity --features "cuda flash-attn" 2>&1 | tail -3
 bash $Q/fetch_data.sh                      # now ALSO fetches gsm8k_train.jsonl (8-shot pool)
 ```
@@ -188,6 +189,19 @@ bash $Q/fetch_data.sh                      # now ALSO fetches gsm8k_train.jsonl 
   step 8, dump patch kills 8's dumps.
 - **ABORT IF** build fails twice on the same compile error (not network):
   capture log, tear down, fix offline.
+
+**Why the build line dropped `cudnn` (session-4 measured finding):** the
+cudnn-feature build decoded V4 at **5.45 tok/s vs 14.58 without it (−62%)** —
+same box, same bake, only the feature flag differed
+(`results/speed_s4_tuned.json` vs `speed_nocudnn.json`, gpu-run4-results).
+HYPOTHESIS ONLY (unverified, needs an offline profile session): candle's
+`cudnn` feature swaps the SDPA/attention backend to the cuDNN path, which
+bypasses our flash-attn integration and with it the V4 absorbed-decode fast
+path — turning every decode step's attention into the slow generic route.
+Deeper investigation queued offline: profile one decode step under both
+builds (`ARC_TIME_DECODE`/nsys), confirm which kernel serves attention, and
+check whether cudnn also disables the fused decode kernels. Until that lands:
+**no session build line ever includes `cudnn`.**
 
 ## Step 2 — GPU Viterbi bake + pace gate (30m) — with the current master build
 
@@ -227,8 +241,8 @@ wc -c /root/logs/bake4.log; sleep 60; wc -c /root/logs/bake4.log   # still growi
 # session-3 87.0%/13.99 numbers were produced exactly this way).
 cd /mnt/work && git -C arc worktree add /mnt/work/arc-s2 cca7a9c2e
 cd /mnt/work/arc-s2
-# same pinned toolchain exports as step 0a, then:
-cargo build --release --features "cuda flash-attn cudnn" 2>&1 | tail -3
+# same pinned toolchain exports as step 0a, then (NO cudnn — −62% decode, step 1):
+cargo build --release --features "cuda flash-attn" 2>&1 | tail -3
 nohup ./target/release/mistralrs quantize text -m "$V4_DIR" -a deepseekv4 \
   --isq qtip2 -o "$V4_DIR/uqff/" > /root/logs/bake4_s2.log 2>&1 & BAKE_PID=$!
 # (~25m build + 24m bake; serve/tests still use the MASTER build in $ARC.
@@ -253,8 +267,10 @@ grep -E "Applying ISQ on|QTIP GPU quantize fallback" /root/logs/bake4*.log > $Q/
 
 ```bash
 cd $ARC
+# --chat-template is REQUIRED: without it /v1/chat/completions 422s (session-4)
 nohup ./target/release/mistralrs serve -p 1234 -m "$V4_DIR" -a deepseekv4 \
-  --from-uqff "$UQFF0" --prefix-cache-n 0 > /root/logs/serve_s4.log 2>&1 & SERVE_PID=$!
+  --from-uqff "$UQFF0" --prefix-cache-n 0 \
+  --chat-template chat_templates/deepseek_v4.json > /root/logs/serve_s4.log 2>&1 & SERVE_PID=$!
 until curl -s localhost:1234/health >/dev/null; do sleep 5; done && echo UP
 python3 $Q/speed_probe.py --label s4_baseline     # anchor: 13.99 tok/s (session 3)
 # SESSION 5+: b=1 is the kernel-latency DIAGNOSTIC only — the headline speed
@@ -330,7 +346,8 @@ git merge --no-edit origin/perf/gemv-autotune \
 # verify the contract before relying on it (names were coordinated, VERIFY anyway):
 git grep -l "ARC_QTIP_TUNE_TABLE" -- mistralrs-quant/ || echo "CONTRACT MISSING - SKIP STEP"
 ls mistralrs-quant/examples/qtip_gemv_tune.rs || echo "EXAMPLE MISSING - SKIP STEP"
-cargo build --release --features "cuda flash-attn cudnn" 2>&1 | tail -2   # kernels changed -> rebuild
+# NO cudnn (−62% decode, step 1); kernels changed -> rebuild
+cargo build --release --features "cuda flash-attn" 2>&1 | tail -2
 ```
 
 - **SKIP the whole step** (note it, continue to step 5 with the baseline
@@ -342,15 +359,22 @@ cargo build --release --features "cuda flash-attn cudnn" 2>&1 | tail -2   # kern
 ```bash
 cargo run --release -p mistralrs-quant --example qtip_gemv_tune --features cuda \
   2>&1 | tee $Q/results/gemv_tune_sweep.txt
-# winner table path: whatever qtip_gemv_tune prints/writes — copy it to:
-#   $Q/results/gemv_tune_winners.<ext>   and export:
-export ARC_QTIP_TUNE_TABLE=$Q/results/gemv_tune_winners.<ext>
+# Winner-table contract (session-4 fix — a glob missed the filename and the
+# tuned serve ran WITHOUT the table): the sweep's LAST line is
+#   WINNER_TABLE_WRITTEN: <absolute path>
+# Parse THAT line, never glob:
+TUNE_TABLE=$(grep '^WINNER_TABLE_WRITTEN: ' $Q/results/gemv_tune_sweep.txt | tail -1 | cut -d' ' -f2)
+[ -s "$TUNE_TABLE" ] || echo "WINNER TABLE MISSING - serve will use baked defaults"
+cp "$TUNE_TABLE" $Q/results/gemv_tune_winners.json
+export ARC_QTIP_TUNE_TABLE=$Q/results/gemv_tune_winners.json
 # kernel-level after (compare against session-3 anchors 153-192 GB/s):
 cargo run --release -p mistralrs-quant --example qtip_gemv_bw --features cuda \
   2>&1 | tee $Q/results/qtip_gemv_bw_tuned.txt
-# end-to-end after:
+# end-to-end after (env must reach the SERVE process; verify with
+#   tr '\0' '\n' < /proc/$SERVE_PID/environ | grep ARC_QTIP_TUNE_TABLE):
 nohup env ARC_QTIP_TUNE_TABLE=$ARC_QTIP_TUNE_TABLE ./target/release/mistralrs serve \
   -p 1234 -m "$V4_DIR" -a deepseekv4 --from-uqff "$UQFF0" --prefix-cache-n 0 \
+  --chat-template chat_templates/deepseek_v4.json \
   > /root/logs/serve_s4_tuned.log 2>&1 & SERVE_PID=$!
 until curl -s localhost:1234/health >/dev/null; do sleep 5; done && echo UP
 python3 $Q/speed_probe.py --label s4_tuned      # THE before/after tok/s pair
@@ -428,6 +452,7 @@ cd $ARC
 nohup env ARC_MTP_LOG_ACCEPTANCE=1 ${ARC_QTIP_TUNE_TABLE:+ARC_QTIP_TUNE_TABLE=$ARC_QTIP_TUNE_TABLE} \
   ./target/release/mistralrs serve -p 1234 -m "$V4_DIR" -a deepseekv4 \
   --from-uqff "$UQFF0" --prefix-cache-n 0 --mtp-depth 2 \
+  --chat-template chat_templates/deepseek_v4.json \
   > /root/logs/serve_mtp2.log 2>&1 & SERVE_PID=$!
 until curl -s localhost:1234/health >/dev/null; do sleep 5; done && echo UP
 
@@ -608,9 +633,9 @@ python3 $Q/batch_load_probe.py --label s5_sustained --batches 64 --duration 120
 | MTP telemetry | `ARC_MTP_LOG_ACCEPTANCE=1` → `MTP acceptance rate: X% (a/p accepted)` per 64 proposed — **patch-only** (`s2_mtp_acceptance_telemetry.patch`); master's `log_acceptance_rate()` has NO call sites (session-3 root cause) | patch file (applies clean to `381063914`); grep of master |
 | Rotation seed | `ARC_QTIP_ROTATION_SEED=<u64\|0xhex>` → `QTIP rotation seed overridden: …` — **patch-only** (`s2_rotation_seed_override.patch`); decode reads STORED signs, so bakes stay self-consistent | patch file (applies clean); `qtip/mod.rs rotation_seed()` |
 | Logprob dump | `perplexity … --dump-logprobs <path>` — **patch-only** (`s2_ppl_dump_logprobs.patch`) | patch file (applies clean) |
-| GEMV autotune | branch `perf/gemv-autotune`, example `qtip_gemv_tune`, serve-env `ARC_QTIP_TUNE_TABLE` — **coordinated contract, UNVERIFIED at authoring** (branch not on origin yet); step 4 greps the fetched branch before relying on it | task coordination; verify on fetch |
+| GEMV autotune | MERGED (PR #19) + session-4 winners BAKED as dispatch defaults (v21 `w4_r2_i1_v2` for gate/up, v6 `w8_r4_i1_v2` for down); example `qtip_gemv_tune` ends with `WINNER_TABLE_WRITTEN: <path>` (parse it, never glob); serve-env `ARC_QTIP_TUNE_TABLE=<path>` overrides the baked table, no recompile | `mistralrs-quant/src/qtip/tune.rs`, `examples/qtip_gemv_tune.rs` |
 | Batch-curve bench | `cargo run --release -p mistralrs-quant --example qtip_grouped_curve --features cuda` — this branch; CPU smoke verified | `mistralrs-quant/examples/qtip_grouped_curve.rs` |
 | GSM8K harness knobs | `--votes K --vote-mode … [--client-votes] [--eight-shot] [--fewshot-seed 8] --max-tokens 2048`; output name gains `_8shot`/`_votes5`/`_cvotes5` suffixes; train pool `data/gsm8k_train.jsonl` (fetch_data.sh) | this branch, `run_gsm8k.py`/`qlib.py`/`fetch_data.sh` |
 | Vote-smoke risk | compressor `xs_history` is one per-model `Mutex<SingleCache>` — multi-chain batches untested on V4 before step 3c | `mistralrs-core/src/models/deepseek4.rs:791` |
 | Ops scripts | `status_server.sh` (HTTP :8899, /srv/arcstatus, 30s snapshots), `stall_sentinel.sh <log> <secs> [pid]` (PID-kill escalation) | this branch, `arc-tools/quality/` |
-| Serve / bake commands | unchanged from runbook 2 (`serve -p 1234 … --from-uqff … --prefix-cache-n 0`; `quantize text … --isq qtip2`) | runbook-2 appendix; #16/#17 touched no CLI |
+| Serve / bake commands | runbook 2 base (`serve -p 1234 … --from-uqff … --prefix-cache-n 0`; `quantize text … --isq qtip2`) **+ every serve line adds `--chat-template chat_templates/deepseek_v4.json`** — without it `/v1/chat/completions` 422s (session-4 root cause #1 of the vote-API failures) | runbook-2 appendix; session-4 finding |

@@ -53,7 +53,7 @@ Mistral.rs supports multiple model types and advanced features via dedicated cra
 ## Building
 
 1. Install Rust via rustup (Rust 2021 edition).
-2. Choose optional features (e.g., `cuda`, `flash-attn`, `cudnn`, `metal`, `mkl`, `accelerate`).
+2. Choose optional features (e.g., `cuda`, `flash-attn`, `metal`, `mkl`, `accelerate`). Avoid `cudnn`: −62% decode on V4 (see session-4).
 3. Build the entire workspace:
    ```bash
    cargo build --workspace --release --features "<features>"

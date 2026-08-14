@@ -41,22 +41,34 @@ pub struct GemvTuneEntry {
     pub variant: u32,
 }
 
-/// Baked-in default winners (current best guesses). Variant 0 is the tuned
-/// replica of the production baseline config (warps=8, rows/warp=2, ILP=1,
-/// 2-byte loads, smem staging) — behavior-identical to the legacy kernel
-/// modulo the O(1) warm-up. Replace these ids with sweep winners from
-/// `qtip_gemv_tune` (the binary prints a ready-to-paste table).
+/// Baked-in default winners — measured, not guessed: session-4 H200 sweep
+/// (2026-08-14, `gemv_tune_winners.json` in `mission/gpu-run4-results/`).
+/// b=1 36-37μs/call and 450-484 GB/s slope (9.4-10.1% of HBM3e peak) vs the
+/// legacy config's 78-83μs and 153-207 GB/s — a 2.2-2.3x kernel win.
+///
+/// Variant ids are ABI with `kernels/qtip/qtip_bitshift_tune.cu`'s
+/// `Q2B_TUNE_VARIANTS` listing (append-only, never renumbered):
+///   - 21 = `w4_r2_i1_v2_mb1_s1_p0` (4 warps/block, 2 rows/warp, ILP 1,
+///     2-byte loads, smem staging)
+///   - 6  = `w8_r4_i1_v2_mb1_s1_p0` (8 warps/block, 4 rows/warp)
+///
+/// The cfg(cuda) test below pins the id -> label mapping so a kernel-table
+/// edit that silently renumbers these fails the suite.
+///
+/// A fresh sweep (`qtip_gemv_tune`, prints `WINNER_TABLE_WRITTEN: <path>`)
+/// still overrides this table at serve time via
+/// `ARC_QTIP_TUNE_TABLE=<path>` — no recompile.
 pub const QTIP2B_GEMV_BAKED_TABLE: &[GemvTuneEntry] = &[
     // V4-Flash decode shapes (per expert): gate/up and down projections.
     GemvTuneEntry {
         n: 2048,
         k: 4096,
-        variant: 0,
+        variant: 21,
     },
     GemvTuneEntry {
         n: 4096,
         k: 2048,
-        variant: 0,
+        variant: 6,
     },
 ];
 
@@ -260,11 +272,59 @@ pub fn gemv_variant_applicable(variant: u32, _n_rows: usize, k_in: usize) -> boo
 mod tests {
     use super::*;
 
+    /// Serializes tests that touch the process-global FORCED state (or read
+    /// dispatch that the FORCED state can override) so they cannot interleave.
+    static DISPATCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn baked_table_covers_v4_decode_shapes() {
-        assert_eq!(lookup(QTIP2B_GEMV_BAKED_TABLE, 2048, 4096), Some(0));
-        assert_eq!(lookup(QTIP2B_GEMV_BAKED_TABLE, 4096, 2048), Some(0));
+        // Session-4 sweep winners (see QTIP2B_GEMV_BAKED_TABLE docs).
+        assert_eq!(lookup(QTIP2B_GEMV_BAKED_TABLE, 2048, 4096), Some(21));
+        assert_eq!(lookup(QTIP2B_GEMV_BAKED_TABLE, 4096, 2048), Some(6));
         assert_eq!(lookup(QTIP2B_GEMV_BAKED_TABLE, 1234, 5678), None);
+    }
+
+    /// b=1 serve-path integration check (CUDA builds): the production GEMV
+    /// dispatch (`gemv_variant_for_shape`, consulted by `cuda_ops` on every
+    /// qtip2b gather/gemv launch) must pick the session-4 tuned winners for
+    /// the V4 decode shapes — NOT the old production-baseline config
+    /// (variant 0) and NOT the legacy kernel — and the winner ids must still
+    /// decode to the exact tuned configs measured in session 4 (guards
+    /// against a silent renumbering of `Q2B_TUNE_VARIANTS`).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn serve_dispatch_picks_tuned_winners_for_b1_decode_shapes() {
+        let _g = DISPATCH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // No forced variant, no env table: pure baked-table dispatch, exactly
+        // what a b=1 serve reaches when ARC_QTIP_GEMV_VARIANT /
+        // ARC_QTIP_TUNE_TABLE are unset.
+        set_forced_gemv_variant(None);
+        for (n, k, want_variant, want_label) in [
+            (2048usize, 4096usize, 21u32, "w4_r2_i1_v2_mb1_s1_p0"),
+            (4096, 2048, 6, "w8_r4_i1_v2_mb1_s1_p0"),
+        ] {
+            let got = gemv_variant_for_shape(n, k);
+            assert_eq!(
+                got,
+                Some(want_variant),
+                "dispatch for [n={n}, k={k}] must pick the session-4 winner"
+            );
+            let v = got.unwrap();
+            assert_ne!(v, 0, "winner must not be the old baseline config");
+            assert_ne!(v, QTIP2B_GEMV_VARIANT_LEGACY);
+            if gemv_num_variants() > 0 {
+                // Kernels compiled in: pin the id -> tuned-config mapping and
+                // make sure the launcher will actually accept it (no silent
+                // legacy fallback for the V4 shapes).
+                let desc = gemv_variant_desc(v as usize)
+                    .unwrap_or_else(|| panic!("variant {v} missing from the compiled table"));
+                assert_eq!(desc.label(), want_label, "variant {v} was renumbered");
+                assert!(
+                    gemv_variant_applicable(v, n, k),
+                    "winner {v} must be applicable to [n={n}, k={k}]"
+                );
+            }
+        }
     }
 
     #[test]
@@ -301,6 +361,7 @@ mod tests {
 
     #[test]
     fn forced_variant_set_and_parse() {
+        let _g = DISPATCH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // parse_forced: ids, legacy keyword, junk.
         assert_eq!(parse_forced("7"), Some(7));
         assert_eq!(
@@ -314,9 +375,9 @@ mod tests {
         assert_eq!(parse_forced("-3"), None);
         assert_eq!(parse_forced("fast"), None);
 
-        // Global forced state: set → read → clear. (Other tests don't touch
-        // this global; the env latch only fires when the state is UNINIT, so
-        // an explicit set always wins.)
+        // Global forced state: set → read → clear. (Tests touching this
+        // global serialize on DISPATCH_LOCK; the env latch only fires when
+        // the state is UNINIT, so an explicit set always wins.)
         set_forced_gemv_variant(Some(3));
         assert_eq!(forced_gemv_variant(), Some(3));
         assert_eq!(gemv_variant_for_shape(2048, 4096), Some(3));
@@ -324,8 +385,8 @@ mod tests {
         assert_eq!(forced_gemv_variant(), Some(QTIP2B_GEMV_VARIANT_LEGACY));
         set_forced_gemv_variant(None);
         assert_eq!(forced_gemv_variant(), None);
-        // Back to table-driven dispatch.
-        assert_eq!(gemv_variant_for_shape(2048, 4096), Some(0));
+        // Back to table-driven dispatch (session-4 baked winner).
+        assert_eq!(gemv_variant_for_shape(2048, 4096), Some(21));
     }
 
     #[test]
