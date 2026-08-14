@@ -257,6 +257,8 @@ nohup ./target/release/mistralrs serve -p 1234 -m "$V4_DIR" -a deepseekv4 \
   --from-uqff "$UQFF0" --prefix-cache-n 0 > /root/logs/serve_s4.log 2>&1 & SERVE_PID=$!
 until curl -s localhost:1234/health >/dev/null; do sleep 5; done && echo UP
 python3 $Q/speed_probe.py --label s4_baseline     # anchor: 13.99 tok/s (session 3)
+# SESSION 5+: b=1 is the kernel-latency DIAGNOSTIC only — the headline speed
+# metric is the batch_load_probe sweep (see SESSION 5 DELTA section below).
 python3 $Q/run_coherence.py --skip-facts          # 6/6 gate
 ```
 
@@ -555,6 +557,41 @@ python3 arc-tools/quality/ensemble_ppl.py results/lp_bakeA.ndjson results/lp_bak
   exhausted). Either verdict is publishable.
 
 ---
+
+## SESSION 5 DELTA — speed measurement is batch-first (headline change)
+
+Directive: production is always B=32/64/128 concurrent users; **b=1 is a
+kernel-latency diagnostic only**. From session 5 on, the speed-measurement
+step's headline is the `batch_load_probe.py` sweep; `speed_probe.py` keeps
+the diagnostic line.
+
+```bash
+# HEADLINE — batch-first serving measurement (chat endpoint, server template):
+python3 $Q/batch_load_probe.py --label s5_baseline --max-ctx <server KV budget, tokens>
+#   -> results/batch_load_s5_baseline.json + one BATCH[B=..] line per B (1,8,16,32,64)
+# b=1 kernel-latency DIAGNOSTIC (unchanged; session-3/4 anchor 13.99 tok/s):
+python3 $Q/speed_probe.py --label s5_b1_diag
+# if budget allows — B=128 and/or the production-shaped sustained window:
+python3 $Q/batch_load_probe.py --label s5_128 --include-128 --max-ctx <budget>
+python3 $Q/batch_load_probe.py --label s5_sustained --batches 64 --duration 120
+```
+
+- **Two headline numbers per config**: aggregate decode tok/s at the best B
+  (fleet economics) and per-user p50 decode tok/s at that B (product feel);
+  TTFT p50/p95 rides along. The `BATCHSWEEP[...]` line prints all of them.
+- **$/Mtok**, inline in the probe output: `$/Mtok = 4.92e6 / (agg_tok_s × 3600)`
+  at $4.92/hr H200 — b=1 13.99 tok/s ⇒ $97.68/Mtok; 300 tok/s aggregate ⇒
+  $4.56/Mtok. That division is the whole fleet argument in one line.
+- **PREREQ**: the served build must include the xs_history per-seq fix
+  (PR #21) — concurrent V4 sequences crash or silently corrupt without it.
+  The probe's own warmup batch is the de-facto gate; step 3c's vote smoke is
+  a weaker cousin (sibling chains, one request).
+- The session rule "ONE scored request at a time" still holds for SCORED
+  evals; the batch probe is the sanctioned exception (unscored throughput).
+- KV guard: the probe estimates `B × (prompt + decode)` tokens before each B
+  and WARNS (never blocks) when it exceeds `--max-ctx`.
+- Pre-session validation, $0, no GPU: `python3 $Q/test_batch_load_probe.py`
+  (mock-server smoke asserting the probe's math — wave-1 dry-run precedent).
 
 ## Appendix — verified names cheat sheet (verified against master 381063914, 2026-08-14)
 

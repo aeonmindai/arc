@@ -1,0 +1,514 @@
+#!/usr/bin/env python3
+"""Batch-first serving load probe — session-5's PRIMARY speed metric.
+
+Production is always B=32/64/128 concurrent users; b=1 is a kernel-latency
+diagnostic only (speed_probe.py keeps that job). This probe fires B concurrent
+requests at the running server for each B in a sweep and reports, per B:
+
+  - aggregate decode tok/s   (sum of completion tokens / wall after the
+                              batch's first token — the $/Mtok number)
+  - per-request decode tok/s p50/p95   (what one user feels at that load)
+  - TTFT p50/p95
+  - errors
+
+plus a `--duration N` closed-loop sustained mode (keep B in-flight for N
+seconds — closer to production than one-shot batches).
+
+Measurement mechanics (verified against mistralrs-core/src/pipeline/sampling.rs
+and response.rs on this branch):
+  - Requests use SSE streaming *internally* because TTFT and the decode-only
+    rate are unmeasurable without first-token timing; streamed text is
+    discarded, never stored. `--no-stream` switches to plain requests (exact
+    usage-based token counts, no TTFT — sanity-check mode).
+  - /v1/chat/completions streams carry exact `usage` on the FINAL chunk
+    (sampling.rs "Send usage on final chunk"); we read completion/prompt
+    tokens from it. /v1/completions streams have NO usage field
+    (CompletionChunkResponse) — one chunk == one decoded token there
+    (speed_probe precedent), so we count chunks.
+  - Distinct prompts (unique token-0 salt + rotating topics, ~64 tokens each)
+    defeat prefix effects even without --prefix-cache-n 0.
+
+V4 PREREQUISITE: concurrent sequences on DeepSeek-V4 require the xs_history
+per-sequence fix (PR #21) in the served build — the old per-model buffer
+crashes or silently corrupts with >1 sequence in flight.
+
+The runbook's "ONE scored request at a time" rule is for SCORED evals; this
+probe is the deliberate exception (unscored throughput measurement).
+
+Stdlib only — no pip deps (same constraint as qlib).
+"""
+import argparse
+import json
+import os
+import threading
+import time
+import urllib.error
+import urllib.request
+
+import qlib
+
+GPU_COST_HR_DEFAULT = 4.92  # Runcrate H200, sessions 1-4
+
+# ---------------------------------------------------------------- prompt pool
+
+_TOPICS = [
+    "the tradeoffs between batch size and per-user latency in LLM serving",
+    "how paged attention changes memory fragmentation on long contexts",
+    "why speculative decoding acceptance rates fall on creative writing",
+    "the history of the fast Walsh-Hadamard transform in signal processing",
+    "how mixture-of-experts routing decides which experts see a token",
+    "the difference between tensor and pipeline parallelism for inference",
+    "why KV-cache quantization hurts retrieval-heavy tasks more than chat",
+    "how continuous batching schedulers interleave prefill and decode",
+    "the role of rotary position embeddings in length extrapolation",
+    "why grouped-query attention reduces memory bandwidth at decode time",
+    "how trellis-coded quantization differs from uniform scalar quantization",
+    "the economics of GPU rental pricing for always-on inference fleets",
+    "why perplexity is an incomplete proxy for downstream task quality",
+    "how chunked prefill bounds time-to-first-token under heavy load",
+    "the interaction between CUDA graphs and dynamic batch shapes",
+    "why multi-token prediction heads need acceptance-rate telemetry",
+]
+
+_FILLER = (
+    "Cover the main mechanism, one concrete numeric example, the most common "
+    "misconception, and when the standard advice breaks down in practice. "
+    "Keep the answer tight and well organized."
+)
+
+
+def make_prompt(i):
+    """Distinct-from-token-0 prompt, ~64 tokens: unique salt first, rotating
+    topic, shared filler tail."""
+    return (
+        f"Case {i:05d}, priority {i % 7}: explain {_TOPICS[i % len(_TOPICS)]}. "
+        + _FILLER
+    )
+
+
+# ---------------------------------------------------------------- HTTP client
+
+
+def _build_request(prompt_text, args):
+    """Returns (url, body_bytes) for one request."""
+    if args.raw:
+        payload = {
+            "model": "default",
+            "prompt": qlib.encode_chat(prompt_text),
+            "max_tokens": args.max_tokens,
+            "temperature": args.temperature,
+            "top_p": 1.0,
+            "stop": [qlib.eos_token],
+        }
+        url = qlib.URL
+    else:
+        payload = {
+            "model": "default",
+            "messages": [
+                {"role": "system", "content": qlib.SYSTEM_PROMPT},
+                {"role": "user", "content": prompt_text},
+            ],
+            "max_tokens": args.max_tokens,
+            "temperature": args.temperature,
+            "top_p": 1.0,
+        }
+        url = qlib.CHAT_URL
+    if not args.no_stream:
+        payload["stream"] = True
+    return url, json.dumps(payload).encode()
+
+
+def _one_request_stream(prompt_text, args):
+    """One SSE request. Returns a record dict (monotonic timestamps)."""
+    url, body = _build_request(prompt_text, args)
+    req = urllib.request.Request(url, data=body,
+                                 headers={"Content-Type": "application/json"})
+    t0 = time.monotonic()
+    t_first = None
+    n_chunks = 0
+    usage = None
+    finish = None
+    try:
+        with urllib.request.urlopen(req, timeout=args.timeout) as r:
+            for raw in r:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[len("data:"):].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                choices = obj.get("choices") or []
+                if not choices:
+                    continue
+                if t_first is None:
+                    t_first = time.monotonic()
+                n_chunks += 1
+                fr = choices[0].get("finish_reason")
+                if fr:
+                    finish = fr
+                if obj.get("usage"):  # chat endpoint: exact usage, final chunk
+                    usage = obj["usage"]
+    except Exception as e:  # noqa: BLE001 — every failure is one error datum
+        return _err_record(e, t0)
+    t_end = time.monotonic()
+    if usage:
+        tokens = usage.get("completion_tokens")
+        prompt_tokens = usage.get("prompt_tokens")
+    else:  # raw /v1/completions stream: one chunk == one token
+        tokens = n_chunks
+        prompt_tokens = None
+    decode_tok_s = None
+    if t_first is not None and tokens and tokens > 1 and t_end > t_first:
+        decode_tok_s = round((tokens - 1) / (t_end - t_first), 2)
+    return {
+        "ok": tokens is not None and tokens > 0,
+        "error": None if tokens else "zero tokens streamed",
+        "ttft_s": round(t_first - t0, 3) if t_first is not None else None,
+        "seconds": round(t_end - t0, 3),
+        "completion_tokens": tokens,
+        "prompt_tokens": prompt_tokens,
+        "decode_tok_s": decode_tok_s,
+        "finish_reason": finish,
+        "_t0": t0, "_t_first": t_first, "_t_end": t_end,
+    }
+
+
+def _one_request_nostream(prompt_text, args):
+    """One plain (non-stream) request. Exact usage counts, no TTFT."""
+    url, body = _build_request(prompt_text, args)
+    req = urllib.request.Request(url, data=body,
+                                 headers={"Content-Type": "application/json"})
+    t0 = time.monotonic()
+    try:
+        resp = json.load(urllib.request.urlopen(req, timeout=args.timeout))
+    except Exception as e:  # noqa: BLE001
+        return _err_record(e, t0)
+    t_end = time.monotonic()
+    usage = resp.get("usage") or {}
+    tokens = usage.get("completion_tokens")
+    ch = (resp.get("choices") or [{}])[0]
+    secs = t_end - t0
+    return {
+        "ok": bool(tokens),
+        "error": None if tokens else "no usage in response",
+        "ttft_s": None,
+        "seconds": round(secs, 3),
+        "completion_tokens": tokens,
+        "prompt_tokens": usage.get("prompt_tokens"),
+        # e2e rate (includes prefill) — the honest number without streaming
+        "decode_tok_s": round(tokens / secs, 2) if tokens and secs > 0 else None,
+        "finish_reason": ch.get("finish_reason"),
+        "_t0": t0, "_t_first": None, "_t_end": t_end,
+    }
+
+
+def _err_record(e, t0):
+    t_end = time.monotonic()
+    status = getattr(e, "code", None)
+    return {
+        "ok": False,
+        "error": f"{type(e).__name__}: {e}"[:200] + (f" (HTTP {status})" if status else ""),
+        "ttft_s": None, "seconds": round(t_end - t0, 3),
+        "completion_tokens": None, "prompt_tokens": None,
+        "decode_tok_s": None, "finish_reason": None,
+        "_t0": t0, "_t_first": None, "_t_end": t_end,
+    }
+
+
+def _one_request(prompt_text, args):
+    if args.no_stream:
+        return _one_request_nostream(prompt_text, args)
+    return _one_request_stream(prompt_text, args)
+
+
+# ---------------------------------------------------------------- batch modes
+
+
+def run_oneshot_batch(bsz, args, prompt_counter):
+    """Fire bsz concurrent requests (barrier-synchronized). Returns
+    (records, wall_s, t_batch0)."""
+    records = [None] * bsz
+    barrier = threading.Barrier(bsz + 1)
+
+    def worker(slot, prompt_text):
+        barrier.wait()
+        records[slot] = _one_request(prompt_text, args)
+
+    threads = []
+    for slot in range(bsz):
+        p = make_prompt(next(prompt_counter))
+        t = threading.Thread(target=worker, args=(slot, p), daemon=True)
+        t.start()
+        threads.append(t)
+    t_batch0 = time.monotonic()
+    barrier.wait()  # release all workers together
+    for t in threads:
+        t.join()
+    wall_s = max(r["_t_end"] for r in records) - t_batch0
+    return records, wall_s, t_batch0
+
+
+def run_sustained(bsz, args, prompt_counter):
+    """Closed loop: keep bsz requests in flight for args.duration seconds.
+    Workers stop LAUNCHING at the deadline; in-flight requests finish and
+    count (wall extends to the last completion, so no inflation)."""
+    records = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(bsz + 1)
+    stop_at = [0.0]  # filled after barrier release
+
+    def worker():
+        barrier.wait()
+        while time.monotonic() < stop_at[0]:
+            with lock:
+                idx = next(prompt_counter)
+            rec = _one_request(make_prompt(idx), args)
+            with lock:
+                records.append(rec)
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(bsz)]
+    for t in threads:
+        t.start()
+    t_batch0 = time.monotonic()
+    stop_at[0] = t_batch0 + args.duration
+    barrier.wait()
+    for t in threads:
+        t.join()
+    wall_s = (max(r["_t_end"] for r in records) - t_batch0) if records else 0.0
+    return records, wall_s, t_batch0
+
+
+# ---------------------------------------------------------------- math
+
+
+def percentile(values, q):
+    """Linear-interpolation percentile of a list (q in [0,100])."""
+    vals = sorted(v for v in values if v is not None)
+    if not vals:
+        return None
+    k = (len(vals) - 1) * q / 100.0
+    lo, hi = int(k), min(int(k) + 1, len(vals) - 1)
+    return round(vals[lo] + (vals[hi] - vals[lo]) * (k - lo), 3)
+
+
+def aggregate_rep(records, wall_s, t_batch0):
+    """Per-rep aggregate metrics from raw records."""
+    ok = [r for r in records if r["ok"]]
+    total_tokens = sum(r["completion_tokens"] or 0 for r in ok)
+    firsts = [r["_t_first"] for r in ok if r["_t_first"] is not None]
+    t_end_max = max((r["_t_end"] for r in records), default=t_batch0)
+    agg_decode = None
+    if firsts and total_tokens:
+        decode_wall = t_end_max - min(firsts)  # wall after batch's first token
+        if decode_wall > 0:
+            agg_decode = round(total_tokens / decode_wall, 2)
+    agg_e2e = round(total_tokens / wall_s, 2) if wall_s > 0 and total_tokens else None
+    return {
+        "requests": len(records),
+        "ok": len(ok),
+        "errors": len(records) - len(ok),
+        "total_completion_tokens": total_tokens,
+        "wall_s": round(wall_s, 3),
+        "agg_decode_tok_s": agg_decode,
+        "agg_e2e_tok_s": agg_e2e,
+        "req_per_s": round(len(ok) / wall_s, 3) if wall_s > 0 else None,
+    }
+
+
+def cost_per_mtok(agg_tok_s, gpu_cost_hr):
+    """$/Mtok = gpu_cost_hr * 1e6 / (agg_tok_s * 3600)."""
+    if not agg_tok_s:
+        return None
+    return round(gpu_cost_hr * 1e6 / (agg_tok_s * 3600.0), 2)
+
+
+def kv_guard(bsz, prompt_est, max_tokens, max_ctx):
+    """Estimate KV token need for a batch; WARN (never block) if it exceeds
+    --max-ctx. Returns the dict recorded in the JSON."""
+    est = bsz * (prompt_est + max_tokens)
+    guard = {"B": bsz, "est_kv_tokens": est, "max_ctx": max_ctx or None,
+             "warned": False}
+    if max_ctx and est > max_ctx:
+        guard["warned"] = True
+        print(f"  WARNING[KV] B={bsz}: est KV need ~{est} tokens "
+              f"(B x (prompt~{prompt_est} + decode {max_tokens})) exceeds "
+              f"--max-ctx {max_ctx}; expect eviction/queueing — measuring anyway.")
+    elif bsz >= 64:
+        print(f"  KV[B={bsz}]: est ~{est} tokens "
+              f"(B x (prompt~{prompt_est} + decode {max_tokens}))"
+              + ("" if max_ctx else " — pass --max-ctx to compare vs budget"))
+    return guard
+
+
+def _strip_private(records):
+    return [{k: v for k, v in r.items() if not k.startswith("_")} for r in records]
+
+
+# ---------------------------------------------------------------- main
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--batches", default="1,8,16,32,64",
+                    help="comma-separated batch sizes to sweep")
+    ap.add_argument("--include-128", action="store_true",
+                    help="append B=128 to the sweep")
+    ap.add_argument("--reps", type=int, default=2,
+                    help="measured repetitions per B (mean reported)")
+    ap.add_argument("--max-tokens", type=int, default=128, help="decode length")
+    ap.add_argument("--warmup-tokens", type=int, default=32,
+                    help="decode length of the one warmup batch per B")
+    ap.add_argument("--raw", action="store_true",
+                    help="raw /v1/completions + encoding_dsv4 template "
+                         "(default: /v1/chat/completions, server template)")
+    ap.add_argument("--no-stream", action="store_true",
+                    help="plain requests: exact usage token counts, but no "
+                         "TTFT and e2e (not decode-only) rates")
+    ap.add_argument("--duration", type=int, default=0,
+                    help="sustained mode: keep B in-flight for N seconds "
+                         "(closed loop) instead of one-shot reps")
+    ap.add_argument("--max-ctx", type=int, default=0,
+                    help="server KV/context budget in tokens for the guard "
+                         "warning (0 = unknown)")
+    ap.add_argument("--gpu-cost-hr", type=float, default=GPU_COST_HR_DEFAULT,
+                    help="$/hr for the $/Mtok line (default: H200 %(default)s)")
+    ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--timeout", type=int, default=900, help="per-request timeout (s)")
+    ap.add_argument("--label", default="batch", help="tag for the results file")
+    ap.add_argument("--out", default=None)
+    args = ap.parse_args(argv)
+
+    batches = [int(b) for b in args.batches.split(",") if b.strip()]
+    if args.include_128 and 128 not in batches:
+        batches.append(128)
+
+    qlib.ensure_dirs()
+    qlib.health_or_die()
+    out_path = args.out or os.path.join(qlib.RESULTS_DIR, f"batch_load_{args.label}.json")
+
+    prompt_counter = iter(range(10 ** 9))
+    endpoint = "completions_raw" if args.raw else "chat_completions"
+    mode = f"sustained_{args.duration}s" if args.duration else f"oneshot_x{args.reps}"
+    print(f"batch_load_probe [{args.label}] endpoint={endpoint} "
+          f"stream={not args.no_stream} mode={mode} "
+          f"batches={batches} max_tokens={args.max_tokens}")
+
+    prompt_est = 64  # refined from the first warmup's measured prompt_tokens
+    per_b = []
+    for bsz in batches:
+        # -- warmup (also refines prompt_est for the KV guard)
+        wargs = argparse.Namespace(**vars(args))
+        wargs.max_tokens = min(args.warmup_tokens, args.max_tokens)
+        wrecs, _, _ = run_oneshot_batch(bsz, wargs, prompt_counter)
+        measured_pt = [r["prompt_tokens"] for r in wrecs if r.get("prompt_tokens")]
+        if measured_pt:
+            prompt_est = max(measured_pt)
+        werrs = sum(1 for r in wrecs if not r["ok"])
+        if werrs:
+            print(f"  warmup B={bsz}: {werrs}/{bsz} errors "
+                  f"(first: {next(r['error'] for r in wrecs if not r['ok'])})")
+
+        guard = kv_guard(bsz, prompt_est, args.max_tokens, args.max_ctx)
+
+        # -- measured reps (or one sustained window)
+        reps_out = []
+        all_records = []
+        n_reps = 1 if args.duration else args.reps
+        for rep in range(n_reps):
+            if args.duration:
+                recs, wall, t0 = run_sustained(bsz, args, prompt_counter)
+            else:
+                recs, wall, t0 = run_oneshot_batch(bsz, args, prompt_counter)
+            agg = aggregate_rep(recs, wall, t0)
+            agg["records"] = _strip_private(recs)
+            reps_out.append(agg)
+            all_records.extend(recs)
+            print(f"  B={bsz} rep{rep + 1}: agg {agg['agg_decode_tok_s']} tok/s "
+                  f"(e2e {agg['agg_e2e_tok_s']}) | wall {agg['wall_s']}s | "
+                  f"errs {agg['errors']}/{agg['requests']}")
+
+        # -- mean across reps + pooled distributions
+        def _mean(key):
+            vals = [r[key] for r in reps_out if r[key] is not None]
+            return round(sum(vals) / len(vals), 2) if vals else None
+
+        dist = {
+            "per_req_decode_tok_s_p50": percentile(
+                [r["decode_tok_s"] for r in all_records], 50),
+            "per_req_decode_tok_s_p95": percentile(
+                [r["decode_tok_s"] for r in all_records], 95),
+            "ttft_s_p50": percentile([r["ttft_s"] for r in all_records], 50),
+            "ttft_s_p95": percentile([r["ttft_s"] for r in all_records], 95),
+        }
+        errors = sum(r["errors"] for r in reps_out)
+        n_requests = sum(r["requests"] for r in reps_out)
+        # headline: decode-only aggregate; e2e fallback in --no-stream mode
+        mean_agg = _mean("agg_decode_tok_s") or _mean("agg_e2e_tok_s")
+        entry = {
+            "B": bsz,
+            "kv_guard": guard,
+            "mean": {
+                "agg_tok_s_headline": mean_agg,
+                "agg_decode_tok_s": _mean("agg_decode_tok_s"),
+                "agg_e2e_tok_s": _mean("agg_e2e_tok_s"),
+                "wall_s": _mean("wall_s"),
+                "req_per_s": _mean("req_per_s"),
+            },
+            "dist": dist,
+            "errors": errors,
+            "requests": n_requests,
+            "cost_per_mtok_usd": cost_per_mtok(mean_agg, args.gpu_cost_hr),
+            "reps": reps_out,
+        }
+        per_b.append(entry)
+        ttft = dist["ttft_s_p50"]
+        print(f"BATCH[B={bsz}] agg {mean_agg} tok/s | "
+              f"per-user p50 {dist['per_req_decode_tok_s_p50']} tok/s | "
+              f"TTFT p50 {ttft if ttft is not None else '-'}s | "
+              f"errors {errors}/{n_requests}")
+
+    # -- sweep summary
+    scored = [e for e in per_b if e["mean"]["agg_tok_s_headline"]]
+    peak = max(scored, key=lambda e: e["mean"]["agg_tok_s_headline"]) if scored else None
+    b1 = next((e for e in per_b if e["B"] == 1), None)
+    summary = {
+        "peak_agg_decode_tok_s": peak["mean"]["agg_tok_s_headline"] if peak else None,
+        "peak_B": peak["B"] if peak else None,
+        "per_user_p50_at_peak": peak["dist"]["per_req_decode_tok_s_p50"] if peak else None,
+        "ttft_p50_at_peak": peak["dist"]["ttft_s_p50"] if peak else None,
+        "cost_per_mtok_at_peak_usd": peak["cost_per_mtok_usd"] if peak else None,
+        "b1_decode_tok_s": (b1["dist"]["per_req_decode_tok_s_p50"] if b1 else None),
+        "gpu_cost_hr_usd": args.gpu_cost_hr,
+        "total_errors": sum(e["errors"] for e in per_b),
+    }
+    out = {
+        "meta": qlib.run_meta({
+            "eval": "batch_load_probe", "label": args.label,
+            "endpoint": endpoint, "stream": not args.no_stream,
+            "mode": mode, "batches": batches,
+            "max_tokens": args.max_tokens, "warmup_tokens": args.warmup_tokens,
+            "temperature": args.temperature, "prompt_tokens_est": prompt_est,
+        }),
+        "summary": summary,
+        "per_b": per_b,
+    }
+    qlib.write_json(out_path, out)
+    if peak:
+        print(f"\nBATCHSWEEP[{args.label}]: peak {summary['peak_agg_decode_tok_s']} tok/s "
+              f"@B={summary['peak_B']} | per-user p50 @peak "
+              f"{summary['per_user_p50_at_peak']} tok/s | "
+              f"$/Mtok @peak {summary['cost_per_mtok_at_peak_usd']} "
+              f"(${args.gpu_cost_hr}/hr) | b=1 p50 {summary['b1_decode_tok_s']} tok/s | "
+              f"errors {summary['total_errors']}")
+    else:
+        print(f"\nBATCHSWEEP[{args.label}]: NO SUCCESSFUL BATCHES — see {out_path}")
+    print(f"-> {out_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
