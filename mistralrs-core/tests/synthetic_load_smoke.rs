@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use candle_core::{DType, Device, Module, Result as CandleResult, Tensor};
+use candle_core::{DType, Device, IndexOp, Module, Result as CandleResult, Tensor};
 use indicatif::MultiProgress;
 
 use mistralrs_core::{
@@ -156,6 +156,24 @@ fn zeros(shape: &[usize], device: &Device) -> CandleResult<Tensor> {
 
 fn ones(shape: &[usize], device: &Device) -> CandleResult<Tensor> {
     Tensor::ones(shape, DType::F32, device)
+}
+
+/// Deterministic non-constant weights: element `n` is
+/// `base + n * step` folded into a small band. Used where a test needs the
+/// value to actually depend on its input (see `synthetic_v4_weights_with_mtp`).
+fn ramp(shape: &[usize], base: f32, step: f32, device: &Device) -> CandleResult<Tensor> {
+    let n: usize = shape.iter().product();
+    let data: Vec<f32> = (0..n)
+        .map(|i| {
+            let v = base + (i % 97) as f32 * step;
+            if i % 2 == 0 {
+                v
+            } else {
+                -v
+            }
+        })
+        .collect();
+    Tensor::from_vec(data, shape, device)
 }
 
 /// Run a `[1, seq]` forward pass and return the logits. Single-token seq=1 is
@@ -383,17 +401,68 @@ mod v4 {
     pub fn synthetic_v4_weights_with_mtp(device: &Device) -> CandleResult<HashMap<String, Tensor>> {
         let mut t = synthetic_v4_weights(device)?;
         let l = "mtp.layers.0";
-        let z = |s: &[usize]| zeros(s, device);
         let o = |s: &[usize]| ones(s, device);
 
-        // Light heads (always loaded when present).
+        // The MTP fixture is deliberately NON-degenerate, unlike the base V4
+        // fixture. Audit §5 ("Existing Arc MTP tests are structurally
+        // vacuous") called this out: with `h_proj`/`e_proj` both zero, `fused`
+        // is identically 0, every draft token is the same constant, and no
+        // assertion about the MTP math can fail. Here:
+        //   * `embed_tokens` varies with the token id, so `e_proj`'s input is
+        //     token-dependent,
+        //   * `lm_head` varies with the hidden state, so argmax is not
+        //     trivially 0, and
+        //   * `h_proj` and `e_proj` are DIFFERENT non-zero maps, so a test can
+        //     tell the two branches apart.
+        // Confined to the MTP fixture on purpose — the base fixture's
+        // degenerate weights are load-path assertions and stay as they are.
+        t.insert(
+            "model.embed_tokens.weight".to_string(),
+            ramp(&[VOCAB_SIZE, HIDDEN_SIZE], 0.03, 0.011, device)?,
+        );
+        t.insert(
+            "lm_head.weight".to_string(),
+            ramp(&[VOCAB_SIZE, HIDDEN_SIZE], 0.02, 0.007, device)?,
+        );
+
+        // The base fixture's decoder weights are all zero, so attention and
+        // MoE contribute nothing and the residual stream leaves the embedding
+        // untouched — the hidden state and the embedding would be the SAME
+        // vector, and a test asserting `h != embed(t)` could not distinguish a
+        // correct capture from the finding-1 bug. Give each main layer a
+        // non-zero shared expert so the residual actually moves.
+        let shared_inter = MOE_INTERMEDIATE_SIZE * NUM_SHARED_EXPERTS;
+        for i in 0..NUM_LAYERS {
+            let l = format!("model.layers.{i}");
+            t.insert(
+                format!("{l}.mlp.shared_experts.gate_proj.weight"),
+                ramp(&[shared_inter, HIDDEN_SIZE], 0.01, 0.004, device)?,
+            );
+            t.insert(
+                format!("{l}.mlp.shared_experts.up_proj.weight"),
+                ramp(&[shared_inter, HIDDEN_SIZE], 0.015, 0.003, device)?,
+            );
+            t.insert(
+                format!("{l}.mlp.shared_experts.down_proj.weight"),
+                ramp(&[HIDDEN_SIZE, shared_inter], 0.012, 0.002, device)?,
+            );
+        }
+
+        // Light heads (always loaded when present). Distinct maps: a scaled
+        // identity vs. a scaled cyclic shift.
+        let mut h_data = vec![0f32; HIDDEN_SIZE * HIDDEN_SIZE];
+        let mut e_data = vec![0f32; HIDDEN_SIZE * HIDDEN_SIZE];
+        for i in 0..HIDDEN_SIZE {
+            h_data[i * HIDDEN_SIZE + i] = 0.5;
+            e_data[i * HIDDEN_SIZE + (i + 1) % HIDDEN_SIZE] = 0.25;
+        }
         t.insert(
             format!("{l}.h_proj.weight"),
-            z(&[HIDDEN_SIZE, HIDDEN_SIZE])?,
+            Tensor::from_vec(h_data, (HIDDEN_SIZE, HIDDEN_SIZE), device)?,
         );
         t.insert(
             format!("{l}.e_proj.weight"),
-            z(&[HIDDEN_SIZE, HIDDEN_SIZE])?,
+            Tensor::from_vec(e_data, (HIDDEN_SIZE, HIDDEN_SIZE), device)?,
         );
         // Wrapper norms for the full block.
         t.insert(format!("{l}.hnorm.weight"), o(&[HIDDEN_SIZE])?);
@@ -571,14 +640,18 @@ fn v4_flash_mtp_full_block_load_smoke() {
         "mtp_load_depth > 0 + full mtp.layers.0.* tensors must load the block"
     );
 
-    // Draft a 2-token chain through the real block: seed hidden state from
-    // the embedding of token 1 (the pipeline's Tier-A seeding), positions
-    // starting at 0 (empty target cache in this synthetic setting).
-    let seed_tok = Tensor::from_vec(vec![1u32], (1,), &device).unwrap();
-    let seed_hidden = kit
-        .embed_tokens
-        .forward(&seed_tok)
-        .expect("embedding the seed token must succeed");
+    // Draft a 2-token chain through the real block, starting from an empty
+    // context (start_pos 0 with an empty draft KV is the degenerate but
+    // self-consistent case: slot k really is absolute position k).
+    let seed_hidden = Tensor::from_vec(
+        (0..v4::HIDDEN_SIZE).map(|i| 0.01 * i as f32).collect(),
+        (1, v4::HIDDEN_SIZE),
+        &device,
+    )
+    .unwrap();
+    let mut draft_cache = kit
+        .new_draft_cache()
+        .expect("a full-block kit must offer a draft KV cache");
     let toks = kit
         .propose_chain(
             &seed_hidden,
@@ -586,6 +659,7 @@ fn v4_flash_mtp_full_block_load_smoke() {
             /*depth=*/ 2,
             /*max_tokens=*/ 8,
             /*start_pos=*/ 0,
+            Some(&mut draft_cache),
         )
         .expect("MTP full-block draft chain must not error");
     assert_eq!(toks.len(), 2, "depth-2 chain must yield exactly 2 tokens");
@@ -596,6 +670,323 @@ fn v4_flash_mtp_full_block_load_smoke() {
             v4::VOCAB_SIZE
         );
     }
+}
+
+/// Load a depth-2-capable V4 fixture and hand back the model.
+fn load_v4_with_mtp_block(device: &Device) -> Box<dyn NormalModel + Send + Sync> {
+    let config = v4::config_json();
+    mistralrs_core::set_mtp_load_depth(2);
+    let tensors = v4::synthetic_v4_weights_with_mtp(device)
+        .expect("V4+MTP synthetic tensor construction must not fail");
+    let vb = wrap_as_vb(tensors, device);
+    let model = DeepSeekV4Loader.load(
+        &config,
+        vb,
+        make_metadata(device),
+        AttentionImplementation::Eager,
+    );
+    // Reset the process-wide gate before any assertion can panic.
+    mistralrs_core::set_mtp_load_depth(0);
+    model.expect("V4 load with the full mtp.layers.0.* module must succeed")
+}
+
+/// **Audit finding 1** — the MTP head must be fed TWO DIFFERENT signals: the
+/// target model's hidden state into `h_proj`, and the token embedding into
+/// `e_proj`.
+///
+/// Reference: `deepseek_v4_nextn.py:155-161` —
+/// `h_proj(hnorm(spec_info.hidden_states))` + `e_proj(enorm(embed(input_ids)))`.
+/// The pre-fix pipeline passed `embed(T0)` to *both*, collapsing the head to a
+/// single-input function of the token id: acceptance ≈ noise regardless of
+/// quantization.
+///
+/// The test pins the observable consequence: with the two inputs held apart, a
+/// draft step must respond to a change in the hidden state alone. Under the
+/// old seeding it could not — the hidden state was not an input at all.
+#[test]
+fn v4_mtp_draft_depends_on_the_target_hidden_state_not_only_the_token() {
+    let _gate = mtp_gate_guard();
+    let device = Device::Cpu;
+    let model = load_v4_with_mtp_block(&device);
+    let kit = model.mtp_decode_kit().expect("MTP kit must exist");
+    assert!(kit.has_full_block());
+
+    let hidden_a = Tensor::from_vec(
+        (0..v4::HIDDEN_SIZE).map(|i| 0.05 * i as f32).collect(),
+        (1, v4::HIDDEN_SIZE),
+        &device,
+    )
+    .unwrap();
+    let hidden_b = Tensor::from_vec(
+        (0..v4::HIDDEN_SIZE)
+            .map(|i| -0.05 * (i as f32) - 1.0)
+            .collect(),
+        (1, v4::HIDDEN_SIZE),
+        &device,
+    )
+    .unwrap();
+
+    // Teeth check: the two candidate `h` inputs are genuinely different, and
+    // neither is the embedding that `e_proj` receives. If a future refactor
+    // re-seeds `h` from `embed(tok)`, this is the assertion that goes stale
+    // first — so assert it explicitly rather than relying on the value test.
+    let e_input = kit
+        .embed_tokens
+        .forward(&Tensor::from_vec(vec![3u32], (1,), &device).unwrap())
+        .unwrap();
+    let as_vec = |t: &Tensor| -> Vec<f32> { t.flatten_all().unwrap().to_vec1().unwrap() };
+    assert_ne!(as_vec(&hidden_a), as_vec(&hidden_b));
+    assert_ne!(
+        as_vec(&hidden_a),
+        as_vec(&e_input),
+        "the h_proj input and the e_proj input must not be the same tensor — \
+         feeding embed(T0) to both is audit finding 1"
+    );
+
+    // Same token, same positions, same (empty) context: the ONLY difference is
+    // the hidden state fed to `h_proj`. `propose_chain` at depth 2 is the
+    // smallest public surface that runs real steps.
+    let mut cache_a = kit.new_draft_cache().unwrap();
+    let mut cache_b = kit.new_draft_cache().unwrap();
+    let chain_a = kit
+        .propose_chain(&hidden_a, 3, 2, 8, 0, Some(&mut cache_a))
+        .expect("draft step must not error");
+    let chain_b = kit
+        .propose_chain(&hidden_b, 3, 2, 8, 0, Some(&mut cache_b))
+        .expect("draft step must not error");
+    assert_ne!(
+        chain_a, chain_b,
+        "the MTP draft step ignored the target hidden state — h_proj is \
+         receiving something that does not vary with `h` (audit finding 1)"
+    );
+
+    // ---- The part that actually pins the pipeline fix. -------------------
+    // The old pipeline had no way to obtain `h` at all, so it seeded BOTH
+    // branches with `embed(T0)`. The fix is the capture channel: the target's
+    // own forward must hand out its pre-`lm_head` hidden states, and they must
+    // not be the token embedding.
+    let input_ids = Tensor::from_vec(vec![4u32, 9, 16], &[1usize, 3], &device).unwrap();
+    let _ = run_forward_smoke(model.as_ref(), &input_ids).expect("V4 forward must succeed");
+    let (start_pos, captured) = kit
+        .hidden_capture
+        .take()
+        .expect("an armed MTP kit must capture the target's hidden states");
+    assert_eq!(
+        start_pos, 0,
+        "the capture must be tagged with the absolute position of its first row"
+    );
+    assert_eq!(
+        captured.dims(),
+        &[1usize, 3, v4::HIDDEN_SIZE],
+        "the capture must cover EVERY input position (the draft-KV prefill \
+         needs h_i at each one), not just the sampled row"
+    );
+    let h_last = captured.i((0, 2)).unwrap();
+    let embed_last = kit
+        .embed_tokens
+        .forward(&Tensor::from_vec(vec![16u32], (1,), &device).unwrap())
+        .unwrap()
+        .squeeze(0)
+        .unwrap();
+    assert_ne!(
+        as_vec(&h_last),
+        as_vec(&embed_last),
+        "the captured hidden state is the token embedding — the pipeline would \
+         be feeding the SAME vector to h_proj and e_proj (audit finding 1)"
+    );
+
+    // Taking clears the slot: a stale block must never be readable by a later
+    // step (that is how one sequence's hidden state would leak into another's).
+    assert!(
+        kit.hidden_capture.take().is_none(),
+        "the capture slot must be empty after a take"
+    );
+}
+
+/// **Audit finding 2** — the MTP block's KV cache must hold the accepted
+/// context before the first draft step, because the block applies ABSOLUTE
+/// RoPE positions.
+///
+/// Reference: the draft model owns its own KV pool and prefills it over the
+/// whole context (`eagle_worker.py:134-138`, `:1094-1128`), so a draft query
+/// at position `P` attends over real keys at `0..P`. The pre-fix code
+/// allocated a fresh empty cache per chain and then indexed positions
+/// `P, P+1, …` into it — a query the model believes is at position 200 000
+/// attending one key.
+///
+/// Pins three things:
+///   (i)   a full-block kit REFUSES to draft without a draft KV,
+///   (ii)  the draft KV is non-empty at the first draft step after a prefill,
+///         and the chain appends to it rather than starting from zero, and
+///   (iii) slot index and absolute position cannot silently drift apart.
+#[test]
+fn v4_mtp_draft_kv_holds_the_accepted_context() {
+    let _gate = mtp_gate_guard();
+    let device = Device::Cpu;
+    let model = load_v4_with_mtp_block(&device);
+    let kit = model.mtp_decode_kit().expect("MTP kit must exist");
+
+    // (i) No draft KV -> hard error, never a silent empty-cache draft.
+    let seed = Tensor::zeros((1, v4::HIDDEN_SIZE), DType::F32, &device).unwrap();
+    let err = kit
+        .propose_chain(&seed, 1, 2, 8, 0, None)
+        .expect_err("full-block drafting without a draft KV must be refused");
+    assert!(
+        format!("{err}").contains("draft KV"),
+        "unexpected error: {err}"
+    );
+
+    // (ii) Prefill the draft KV over a 5-token "accepted context", exactly as
+    // the pipeline does from the prompt forward's captured hidden states:
+    // slot i is the MTP state of (h_i, tok_{i+1}).
+    const CTX: usize = 5;
+    let mut cache = kit.new_draft_cache().unwrap();
+    assert_eq!(cache.current_seq_len(), 0, "a fresh draft KV starts empty");
+
+    let ctx_hidden = ramp(&[1, CTX, v4::HIDDEN_SIZE], 0.02, 0.005, &device).unwrap();
+    let next_tokens = Tensor::from_vec(vec![2u32, 3, 5, 7, 11], (1, CTX), &device).unwrap();
+    let filled = kit
+        .extend_draft_cache(&mut cache, 0, &ctx_hidden, &next_tokens)
+        .expect("draft-KV prefill over the accepted context must succeed");
+    assert_eq!(filled, CTX);
+    assert_eq!(
+        cache.current_seq_len(),
+        CTX,
+        "the draft KV must hold one entry per accepted context position — an \
+         empty cache here is audit finding 2"
+    );
+
+    // The first draft step now attends over a NON-EMPTY cache, and lands at
+    // the next absolute position.
+    let toks = kit
+        .propose_chain(&seed, 13, 2, 8, CTX, Some(&mut cache))
+        .expect("chain against a primed draft KV must not error");
+    assert_eq!(toks.len(), 2);
+    assert_eq!(
+        cache.current_seq_len(),
+        CTX + 2,
+        "each draft step must append exactly one entry at its absolute position"
+    );
+
+    // (iii) A cache whose length disagrees with the step's absolute position
+    // is a desync, not something to paper over.
+    let mut stale = kit.new_draft_cache().unwrap();
+    let err = kit
+        .propose_chain(&seed, 13, 1, 8, 137, Some(&mut stale))
+        .expect_err("start_pos far past an empty draft KV must be refused");
+    assert!(
+        format!("{err}").contains("desync"),
+        "unexpected error: {err}"
+    );
+}
+
+/// **Acceptance path, end to end on the synthetic model.**
+///
+/// Uses the real V4 fixture as its own verifier: run a forward, take the
+/// target's greedy argmax per position, and drive the accept/reject logic with
+/// (a) a deliberately CORRECT draft — the target's own tokens, which must be
+/// accepted with no correction — and (b) a deliberately WRONG draft, which
+/// must be rejected at exactly the corrupted slot and corrected to the
+/// target's token.
+///
+/// The load-bearing assertion is the losslessness contract the whole module
+/// rests on: whatever the draft proposes, the committed stream equals the
+/// target's own greedy decode.
+#[test]
+fn v4_mtp_accept_path_accepts_correct_drafts_and_rejects_wrong_ones() {
+    let _gate = mtp_gate_guard();
+    let device = Device::Cpu;
+    let model = load_v4_with_mtp_block(&device);
+    // Fetch the kit BEFORE the forward: that is what arms the hidden capture.
+    let kit = model.mtp_decode_kit().expect("MTP kit must exist");
+
+    // Target's greedy tokens over a short window — the verifier's answer.
+    let input_ids = Tensor::from_vec(vec![4u32, 9, 16, 25], &[1usize, 4], &device).unwrap();
+    let logits = run_forward_smoke(model.as_ref(), &input_ids).expect("V4 forward must succeed");
+    assert_finite(&logits, "V4 MTP verify");
+    let rows = logits.squeeze(0).unwrap();
+    let verifier: Vec<u32> = (0..rows.dim(0).unwrap())
+        .map(|i| {
+            rows.get(i)
+                .unwrap()
+                .argmax(0)
+                .unwrap()
+                .to_dtype(DType::U32)
+                .unwrap()
+                .to_scalar::<u32>()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(verifier.len(), 4);
+
+    // (a) Deliberately CORRECT draft: every proposal matches the target.
+    let correct = verifier.clone();
+    let res = mistralrs_core::verify_proposed(&correct, &verifier);
+    assert_eq!(
+        res.accepted, verifier,
+        "a draft that matches the target's greedy tokens must be fully accepted"
+    );
+    assert!(
+        res.rejection.is_none(),
+        "no correction is due when nothing was rejected"
+    );
+    assert_eq!(res.commit_len(), verifier.len());
+    let committed: Vec<u32> = res.accepted.clone();
+    assert_eq!(
+        committed, verifier,
+        "losslessness: the committed stream must equal the target's own decode"
+    );
+
+    // (b) Deliberately WRONG draft: corrupt slot 2 only.
+    let mut wrong = verifier.clone();
+    wrong[2] = (verifier[2] + 1) % v4::VOCAB_SIZE as u32;
+    assert_ne!(wrong[2], verifier[2], "the corruption must actually differ");
+    let res = mistralrs_core::verify_proposed(&wrong, &verifier);
+    assert_eq!(
+        res.accepted,
+        verifier[..2].to_vec(),
+        "the matching prefix must still be accepted"
+    );
+    assert_eq!(
+        res.rejection,
+        Some((2, verifier[2])),
+        "rejection must land on the corrupted slot and carry the TARGET's token"
+    );
+    let mut committed = res.accepted.clone();
+    committed.push(res.rejection.unwrap().1);
+    assert_eq!(
+        committed,
+        verifier[..3].to_vec(),
+        "losslessness: accepted ++ correction must equal the target's own decode"
+    );
+
+    // (c) A REAL draft from the MTP block, verified against the same target.
+    // Whatever it proposes, the committed stream must still be a prefix of the
+    // target's own greedy decode — the invariant the whole module rests on.
+    let (_, captured) = kit
+        .hidden_capture
+        .take()
+        .expect("the forward above must have captured hidden states");
+    let seed = captured.i((0, captured.dim(1).unwrap() - 1)).unwrap();
+    let mut cache = kit.new_draft_cache().unwrap();
+    let drafted = kit
+        .propose_chain(&seed, verifier[0], verifier.len(), 8, 0, Some(&mut cache))
+        .expect("a real MTP draft chain must not error");
+    let res = mistralrs_core::verify_proposed(&drafted, &verifier);
+    let mut committed = res.accepted.clone();
+    if let Some((_, correction)) = res.rejection {
+        committed.push(correction);
+    }
+    assert_eq!(
+        committed,
+        verifier[..committed.len()].to_vec(),
+        "losslessness violated: the MTP-committed stream diverged from the \
+         target's own greedy decode (drafted={drafted:?} verifier={verifier:?})"
+    );
+    assert!(
+        res.accepted.len() <= drafted.len(),
+        "cannot accept more tokens than were proposed"
+    );
 }
 
 // ===========================================================================
@@ -853,11 +1244,10 @@ fn v4_uqff_missing_mtp_falls_back_to_source_checkpoint() {
     );
 
     // The reloaded block must actually draft.
-    let seed_tok = Tensor::from_vec(vec![1u32], (1,), &device).unwrap();
-    let seed_hidden = kit
-        .embed_tokens
-        .forward(&seed_tok)
-        .expect("embedding the seed token must succeed");
+    let seed_hidden = ramp(&[1, v4::HIDDEN_SIZE], 0.01, 0.003, &device).unwrap();
+    let mut draft_cache = kit
+        .new_draft_cache()
+        .expect("a full-block kit must offer a draft KV cache");
     let toks = kit
         .propose_chain(
             &seed_hidden,
@@ -865,6 +1255,7 @@ fn v4_uqff_missing_mtp_falls_back_to_source_checkpoint() {
             /*depth=*/ 2,
             /*max_tokens=*/ 8,
             0,
+            Some(&mut draft_cache),
         )
         .expect("draft chain through the source-reloaded block must not error");
     assert_eq!(toks.len(), 2, "depth-2 chain must yield exactly 2 tokens");

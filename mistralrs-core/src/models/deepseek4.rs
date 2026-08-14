@@ -2691,10 +2691,30 @@ impl MtpBlock {
         }))
     }
 
-    /// Fresh per-draft-chain KV cache (dim 2 = the sequence axis, matching
-    /// `NormalCache::new`). One chain never sees another chain's (possibly
-    /// rejected) draft tokens.
-    pub fn new_chain_cache(&self) -> KvCache {
+    /// Fresh **draft KV cache** for one sequence (dim 2 = the sequence axis,
+    /// matching `NormalCache::new`).
+    ///
+    /// This cache is **persistent per sequence and prefilled over the accepted
+    /// context**, mirroring the reference: SGLang's EAGLE/NextN worker gives
+    /// the draft model its own KV pool (`eagle_worker.py:134-138` — *"Share the
+    /// allocator with a target worker. Draft and target worker own their own
+    /// KV cache pools."*) which is filled by really running the draft module
+    /// over the context (`forward_draft_extend`, `:1094-1128`) and extended
+    /// over each verify's accepted tokens (`forward_draft_extend_after_decode`,
+    /// `:1134+`).
+    ///
+    /// The draft KV is **not** a copy or a view of the target's KV: the MTP
+    /// block has its own `wkv`, so its keys/values are different numbers for
+    /// the same tokens. Entry `i` of this cache is the MTP state of the pair
+    /// `(h_i, tok_{i+1})` — the target hidden at position `i` combined with
+    /// the *next* token — which is the alignment
+    /// `apply_eagle_prefill_input_rotation` (`eagle_utils.py:26-46`) sets up:
+    /// *"Each req's slice [t_0..t_{n-1}] -> [t_1..t_{n-1}, t_n] … Aligns
+    /// draft's position-i hidden with target's label at i+1."*
+    ///
+    /// The pipeline owns the lifetime; see
+    /// [`crate::pipeline::mtp_pipeline::MtpSpeculativePipeline`].
+    pub fn new_draft_cache(&self) -> KvCache {
         KvCache::new_normal(2, self.max_seq_len, 16)
     }
 
@@ -2714,37 +2734,52 @@ impl MtpBlock {
     }
 
     /// Run the combined `h_proj + e_proj` state through the real MTP decoder
-    /// layer for ONE draft token.
+    /// layer for `T` consecutive tokens.
     ///
-    /// * `fused`: `[B, 1, hidden]` — `h_proj(hnorm(h)) + e_proj(enorm(e))`.
-    /// * `pos`: absolute sequence position of this draft token (RoPE).
-    /// * `cache`: the per-chain KV cache from [`Self::new_chain_cache`];
-    ///   draft token `i` attends over draft tokens `0..=i` of its chain.
-    /// * `input_ids`: `[B, 1]` current token ids — required by the
-    ///   hash-routed (`tid2eid`) MoE gate; ignored by score-routed gates.
+    /// * `fused`: `[B, T, hidden]` — `h_proj(hnorm(h)) + e_proj(enorm(e))`.
+    /// * `start_pos`: absolute sequence position of `fused[:, 0]` (RoPE). The
+    ///   draft KV cache must already hold exactly `start_pos` entries, so that
+    ///   cache slot `k` is the state of absolute position `k` and the
+    ///   attention's own `q0 = t_k - t_q` position arithmetic
+    ///   (`dsv4_attention.rs`) lines up with RoPE.
+    /// * `cache`: the persistent draft KV from [`Self::new_draft_cache`].
+    /// * `input_ids`: `[B, T]` current token ids — required by the hash-routed
+    ///   (`tid2eid`) MoE gate; ignored by score-routed gates.
     ///
-    /// Returns the decoder output `[B, 1, hidden]` (pre-`norm`; the caller
+    /// Returns the decoder output `[B, T, hidden]` (pre-`norm`; the caller
     /// applies [`Self::norm_out`] before lm_head and feeds THIS tensor
-    /// forward as the next step's hidden state, matching the reference).
+    /// forward as the next step's hidden state, matching the reference's
+    /// `pre_hc_head` hand-off in `deepseek_v4_nextn.py:186-201`).
+    ///
+    /// No caller mask is passed: the MTP block is a Standard (ratio-0) layer,
+    /// and `dsv4_attention` derives its own causal + sliding-window mask from
+    /// absolute positions, so a `T > 1` extend is causal by construction.
     ///
     /// Uses the 3-D decoder path: when the checkpoint ships the per-layer
     /// mHC tensors, `DecoderLayer::forward` applies the learned
     /// `hc_attn_*`/`hc_ffn_*` blend via the 3-D bridge (RUN-169); otherwise
     /// it falls back to standard residuals.
-    pub fn forward_step(
+    pub fn forward_tokens(
         &self,
         fused: &Tensor,
-        pos: usize,
+        start_pos: usize,
         cache: &mut KvCache,
         input_ids: &Tensor,
     ) -> Result<Tensor> {
+        let cached = cache.current_seq_len();
+        if cached != start_pos {
+            candle_core::bail!(
+                "MTP draft KV desync: cache holds {cached} entries but the step starts at \
+                 absolute position {start_pos}. Draft-KV slot k must be absolute position k \
+                 (see MtpBlock::new_draft_cache)."
+            );
+        }
         let in_device = fused.device().clone();
         let xs = fused.to_device(&self.device)?;
         let ids = input_ids.to_device(&self.device)?;
-        let seqlen_offsets = [pos];
+        let seqlen_offsets = [start_pos];
         let out = self.layer.forward(
             &xs,
-            // Single-token step: attends over the whole chain cache, no mask.
             None,
             &seqlen_offsets,
             cache,
@@ -2756,6 +2791,17 @@ impl MtpBlock {
             Some(&ids),
         )?;
         out.to_device(&in_device)
+    }
+
+    /// Single-token convenience wrapper over [`Self::forward_tokens`].
+    pub fn forward_step(
+        &self,
+        fused: &Tensor,
+        pos: usize,
+        cache: &mut KvCache,
+        input_ids: &Tensor,
+    ) -> Result<Tensor> {
+        self.forward_tokens(fused, pos, cache, input_ids)
     }
 
     /// ISQ handles for the block's quantizable projections: attention
@@ -2801,6 +2847,12 @@ pub struct MtpHead {
     /// Full MTP decoder block (attention + MoE + hnorm/enorm/norm).
     /// `None` for heads-only loads (older exports or `--mtp-depth 0`).
     pub block: Option<Arc<MtpBlock>>,
+    /// Side-channel carrying this model's pre-`lm_head` hidden states out to
+    /// the MTP draft path — the reference's `hidden_states_before_norm` /
+    /// `pre_hc_head` capture (`deepseek_v4.py:1168-1175`, consumed at
+    /// `deepseek_v4_nextn.py:149-154`). Disarmed (and therefore free) until
+    /// [`NormalModel::mtp_decode_kit`] hands a kit out.
+    pub hidden_capture: Arc<crate::pipeline::mtp_pipeline::MtpHiddenCapture>,
 }
 
 pub struct DeepSeekV4 {
@@ -3147,6 +3199,7 @@ impl DeepSeekV4 {
                             None
                         };
                         Some(MtpHead {
+                            hidden_capture: Arc::new(Default::default()),
                             h_proj,
                             e_proj,
                             block,
@@ -3381,6 +3434,30 @@ impl DeepSeekV4 {
         };
 
         v4_stat_dbg(&xs, "before_norm");
+
+        // ---- MTP hidden-state capture (audit finding 1) ----------------
+        // The reference hands the MTP head the target's own hidden state, NOT
+        // an embedding: `deepseek_v4.py:1168-1175` returns `pre_hc_head` (the
+        // residual stack *before* the final norm) and `logits_processor.py:
+        // 603-606` makes it the captured `spec_info.hidden_states`, which
+        // `deepseek_v4_nextn.py:152-154` feeds to `h_proj(hnorm(·))`.
+        //
+        // We capture the pre-`norm` state for EVERY input position (before
+        // `extract_logits` narrows to the sampled rows), because the draft KV
+        // prefill needs `h_i` at every context position, not just the last.
+        //
+        // Divergence, deliberate and documented: the reference's capture is
+        // the *pre-collapse* `[T, hc_mult·d]` stack; Arc's MTP path has no
+        // `hc_mult` stream axis (audit finding 5(b), separately owned), so we
+        // capture the post-`hc_head`, pre-`norm` `[B, T, hidden]` state — the
+        // same tensor in the "pre-norm" sense, one collapse later.
+        if let Some(mtp) = &self.mtp_head {
+            if mtp.hidden_capture.is_armed() {
+                mtp.hidden_capture
+                    .store(seqlen_offsets.first().copied().unwrap_or(0), &xs);
+            }
+        }
+
         let xs = xs.apply(&self.norm)?;
         v4_stat_dbg(&xs, "after_norm");
         let xs = extract_logits(&xs, context_lens)?;
@@ -3661,6 +3738,19 @@ impl IsqModel for DeepSeekV4 {
         })
     }
 
+    fn mtp_isq_floor_len(&mut self) -> usize {
+        // `get_layers` pushes `h_proj` and `e_proj` immediately before the
+        // block's tensors whenever the MTP head loaded at all, so the draft
+        // path is the block's tail PLUS those two. They are excluded from
+        // `mtp_isq_tail_len` because that boundary also names UQFF entries.
+        let tail = self.mtp_isq_tail_len();
+        if self.mtp_head.is_some() {
+            tail + 2
+        } else {
+            0
+        }
+    }
+
     fn load_mtp_block_from_source(
         &mut self,
         source: &crate::pipeline::UqffSourceWeights<'_>,
@@ -3791,12 +3881,19 @@ impl NormalModel for DeepSeekV4 {
     /// native single-step speculative draft.
     fn mtp_decode_kit(&self) -> Option<crate::pipeline::mtp_pipeline::MtpDecodeKit> {
         let head = self.mtp_head.as_ref()?;
+        // Arm the hidden-state side-channel: from here on every forward
+        // retains its pre-`norm` hidden state for the draft path. Kept behind
+        // an explicit arm so a model loaded with MTP tensors but served
+        // without `--mtp-depth` never pays to hold a `[B, T, hidden]` prompt
+        // activation alive.
+        head.hidden_capture.arm();
         Some(crate::pipeline::mtp_pipeline::MtpDecodeKit {
             embed_tokens: self.embed_tokens.clone(),
             lm_head: self.lm_head.clone(),
             h_proj: head.h_proj.clone(),
             e_proj: head.e_proj.clone(),
             block: head.block.clone(),
+            hidden_capture: head.hidden_capture.clone(),
         })
     }
 }

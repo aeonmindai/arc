@@ -985,7 +985,10 @@ impl Qtip2bLayer {
         };
 
         let n_tokens = x_rotated.dim(0)?;
-        if n_tokens == 1 {
+        // `spec_pin_gemm()` (default off) sends the 1-token case down the
+        // multi-token path so a speculative draft and its verify read the same
+        // weights through the same kernel — see `tune::spec_pin_gemm`.
+        if n_tokens == 1 && !super::tune::spec_pin_gemm() {
             let y = cuda_ops::fused_gemv_2b_cuda(
                 &self.blocks,
                 &self.row_scales,

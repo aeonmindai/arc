@@ -97,7 +97,8 @@ pub(crate) use processing::{
 use rand_isaac::Isaac64Rng;
 pub use mtp_pipeline::{
     mtp_load_depth, mtp_uqff_bake, set_mtp_load_depth, set_mtp_uqff_bake,
-    try_wrap_pipeline_with_mtp, MtpDecodeKit, MtpSpeculativePipeline,
+    try_wrap_pipeline_with_mtp, verify_proposed, MtpDecodeKit, MtpHiddenCapture,
+    MtpSpeculativePipeline, VerifyResult,
 };
 pub use speculative::{SpeculativeConfig, SpeculativeLoader, SpeculativePipeline};
 pub use speech::{SpeechLoader, SpeechPipeline};

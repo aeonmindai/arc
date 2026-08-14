@@ -1505,7 +1505,10 @@ impl QtipLayer {
         // shape the matmul path returns ([1, k_in] @ [k_in, n_rows] →
         // [1, n_rows]).
         let n_tokens = x_rotated.dim(0)?;
-        if n_tokens == 1 {
+        // See `tune::spec_pin_gemm` — default off; pins draft and verify onto
+        // one kernel family so MTP's exact-argmax verification is not decided
+        // by floating-point accumulation order.
+        if n_tokens == 1 && !tune::spec_pin_gemm() {
             let y = cuda_ops::fused_gemv_cuda(
                 &self.blocks,
                 &self.row_scales,
