@@ -139,6 +139,7 @@ serde_default_fn!(usize, default_hc_sinkhorn_iters, 20);
 serde_default_fn!(f32, default_swiglu_limit, 10.0);
 serde_default_fn!(usize, default_n_group, 1);
 serde_default_fn!(usize, default_topk_group, 1);
+serde_default_fn!(bool, default_norm_topk_prob, true);
 
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TopkMethod {
@@ -167,13 +168,20 @@ pub(crate) enum ScoringFunc {
 }
 
 /// V4 Flash config — matches the real `config.json` published at
-/// `https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash`.
+/// <https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/resolve/main/config.json>.
 ///
-/// **Notably absent vs V3**: `kv_lora_rank`, `v_head_dim`, `qk_nope_head_dim`,
-/// `intermediate_size`. **Newly present**: `head_dim`, `num_key_value_heads`,
-/// `num_hash_layers`, `hc_mult`, `hc_eps`, `hc_sinkhorn_iters`, `swiglu_limit`,
-/// `compress_ratios`, `compress_rope_theta`, `o_lora_rank`, `o_groups`,
-/// `index_*`. See `v4_audit.md §0 + §5`.
+/// The published file is reproduced verbatim as `V4_FLASH_CONFIG_JSON` in this
+/// module's test block; every "absent"/"present" claim below is asserted there
+/// rather than assumed.
+///
+/// **Verified absent vs V3**: `kv_lora_rank`, `v_head_dim`, `qk_nope_head_dim`,
+/// `intermediate_size`, `first_k_dense_replace`, `n_group`, `topk_group`, and
+/// (inside `rope_scaling`) `mscale` / `mscale_all_dim`.
+/// **Verified present**: `head_dim`, `num_key_value_heads`, `num_hash_layers`
+/// (that spelling — *not* `n_hash_layers`), `hc_mult`, `hc_eps`,
+/// `hc_sinkhorn_iters`, `swiglu_limit`, `norm_topk_prob`, `compress_ratios`,
+/// `compress_rope_theta`, `o_lora_rank`, `o_groups`, `index_*`, `rope_scaling`
+/// (yarn, `factor: 16`, `original_max_position_embeddings: 65536`).
 ///
 /// For backwards-compat with older test fixtures and SGLang's dataclass
 /// (which carries V3 defaults), `intermediate_size`, `kv_lora_rank`,
@@ -248,11 +256,12 @@ pub struct DeepSeekV4Config {
     pub(crate) qk_nope_head_dim: Option<usize>,
     #[serde(alias = "quantization")]
     pub(crate) quantization_config: Option<QuantizedConfig>,
-    /// V4: not in real config. Default 1. Audit §5 line 457
-    /// ("`n_group` — Make optional, default 1").
+    /// **Verified absent** from the published V4 Flash `config.json` ⇒ default
+    /// 1 ⇒ `MoeGate::forward` takes the ungrouped top-k branch, matching
+    /// SGLang's unconditional `use_grouped_topk=False` override for V4.
     #[serde(default = "default_n_group")]
     pub(crate) n_group: usize,
-    /// V4: not in real config. Default 1.
+    /// **Verified absent** from the published V4 Flash `config.json`. Default 1.
     #[serde(default = "default_topk_group")]
     pub(crate) topk_group: usize,
 
@@ -301,8 +310,22 @@ pub struct DeepSeekV4Config {
     #[serde(default = "default_hc_sinkhorn_iters")]
     pub(crate) hc_sinkhorn_iters: usize,
     /// SwiGLU clamp for MoE expert MLP (V4: 10.0). Audit §0 + §5 line 462.
+    ///
+    /// **Verified present** in the published `config.json` (`"swiglu_limit":
+    /// 10.0`), so the reference's `getattr(config, "swiglu_limit", None)`
+    /// resolves and the clamp is mandatory, not optional.
     #[serde(default = "default_swiglu_limit")]
     pub(crate) swiglu_limit: f32,
+    /// Whether the selected top-k routing weights are renormalized to sum to
+    /// 1 before `routed_scaling_factor` is applied (V4 Flash: `true`).
+    ///
+    /// The reference passes this straight through as
+    /// `renormalize=config.norm_topk_prob` (`deepseek_v2.py:553`). Arc used
+    /// to infer it from `scoring_func` instead, which agrees for every real
+    /// V4/V3 checkpoint but silently ignored an explicit `false`.
+    /// Audit finding 21.
+    #[serde(default = "default_norm_topk_prob")]
+    pub(crate) norm_topk_prob: bool,
 }
 
 fn default_sliding_window() -> usize {
@@ -1676,9 +1699,15 @@ impl MoeGate {
                     // V4 Flash: no correction bias (TD-MoE routing), use raw scores.
                     scores_flat
                 };
-                // V4 Flash config does NOT publish `n_group` (audit §5 +
-                // /tmp/v4_flash_config.json). When n_group==1 the grouping
-                // degenerates; fall back to a flat top-k over all experts.
+                // The published V4 Flash `config.json` contains neither
+                // `n_group` nor `topk_group` — verified against
+                // <https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/resolve/main/config.json>
+                // and pinned by `v4_flash_config_settles_the_audit_questions`.
+                // The serde defaults (1/1) therefore apply and this branch is
+                // dead for the real checkpoint, which is the same end state
+                // SGLang reaches by force-disabling group limiting for V4
+                // (`deepseek_v2.py:572-577`). It stays reachable only for
+                // V3-style configs that do publish the keys.
                 if self.cfg.n_group > 1 {
                     let group_scores = scores_for_choice
                         .reshape((bs * seq_len, self.cfg.n_group, ()))?
@@ -1734,10 +1763,20 @@ impl MoeGate {
             }
         };
 
-        if matches!(
-            self.cfg.scoring_func,
-            ScoringFunc::Sigmoid | ScoringFunc::SqrtSoftplus
-        ) {
+        // Renormalize the selected weights to sum to 1. The reference gates
+        // this purely on the config flag (`renormalize=config.norm_topk_prob`,
+        // `deepseek_v2.py:553` → `topk.py:876-882`); softmax scores are already
+        // normalized over the full expert set, so V2/V3-style softmax gates
+        // keep the historical Arc behavior of skipping it. V4 Flash publishes
+        // `"norm_topk_prob": true` with `sqrtsoftplus`, so this is taken —
+        // identical to the previous scoring-function-derived condition.
+        // Audit finding 21.
+        if self.cfg.norm_topk_prob
+            && matches!(
+                self.cfg.scoring_func,
+                ScoringFunc::Sigmoid | ScoringFunc::SqrtSoftplus
+            )
+        {
             let denominator = (topk_weight.sum_keepdim(D::Minus1)? + 1e-20)?;
             topk_weight = topk_weight.broadcast_div(&denominator)?;
         }
@@ -3804,47 +3843,92 @@ impl AnyMoeBaseModelMixin for DeepSeekV4 {}
 mod tests {
     use super::*;
 
-    /// Real V4 Flash config.json (slimmed) parses cleanly through the
-    /// rewritten DeepSeekV4Config. Audit §0.
+    /// The **verbatim** `config.json` published at
+    /// <https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/resolve/main/config.json>
+    /// (fetched 2026-08-14, HTTP 200, 1749 bytes; repo is public + MIT).
+    ///
+    /// Byte-for-byte, keys included that Arc does not parse (`expert_dtype`,
+    /// `num_nextn_predict_layers`, `initializer_range`, …) — the whole point
+    /// of the fixture is that it is *not* slimmed. The previous fixture was
+    /// hand-written and omitted `rope_scaling`, `norm_topk_prob`,
+    /// `quantization_config`, `hidden_act`, `attention_bias` and
+    /// `tie_word_embeddings`, which made it useless for settling exactly the
+    /// questions the V4 reference audit could not close
+    /// (`docs/notes/v4-reference-audit.md`).
+    const V4_FLASH_CONFIG_JSON: &str = r#"{
+  "architectures": [
+    "DeepseekV4ForCausalLM"
+  ],
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "bos_token_id": 0,
+  "eos_token_id": 1,
+  "expert_dtype": "fp4",
+  "hc_eps": 1e-06,
+  "hc_mult": 4,
+  "hc_sinkhorn_iters": 20,
+  "head_dim": 512,
+  "hidden_act": "silu",
+  "hidden_size": 4096,
+  "index_head_dim": 128,
+  "index_n_heads": 64,
+  "index_topk": 512,
+  "initializer_range": 0.02,
+  "max_position_embeddings": 1048576,
+  "model_type": "deepseek_v4",
+  "moe_intermediate_size": 2048,
+  "n_routed_experts": 256,
+  "n_shared_experts": 1,
+  "norm_topk_prob": true,
+  "num_attention_heads": 64,
+  "num_experts_per_tok": 6,
+  "num_hidden_layers": 43,
+  "num_hash_layers": 3,
+  "num_key_value_heads": 1,
+  "num_nextn_predict_layers": 1,
+  "o_groups": 8,
+  "o_lora_rank": 1024,
+  "q_lora_rank": 1024,
+  "qk_rope_head_dim": 64,
+  "quantization_config": {
+    "activation_scheme": "dynamic",
+    "fmt": "e4m3",
+    "quant_method": "fp8",
+    "scale_fmt": "ue8m0",
+    "weight_block_size": [
+      128,
+      128
+    ]
+  },
+  "rms_norm_eps": 1e-06,
+  "rope_scaling": {
+    "beta_fast": 32,
+    "beta_slow": 1,
+    "factor": 16,
+    "original_max_position_embeddings": 65536,
+    "type": "yarn"
+  },
+  "rope_theta": 10000,
+  "routed_scaling_factor": 1.5,
+  "scoring_func": "sqrtsoftplus",
+  "sliding_window": 128,
+  "swiglu_limit": 10.0,
+  "tie_word_embeddings": false,
+  "topk_method": "noaux_tc",
+  "torch_dtype": "bfloat16",
+  "transformers_version": "4.57.1",
+  "use_cache": true,
+  "vocab_size": 129280,
+  "compress_rope_theta": 160000,
+  "compress_ratios": [0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 0]
+}"#;
+
+    /// The real V4 Flash `config.json` parses cleanly through
+    /// `DeepSeekV4Config` and yields the dimensions the forward path assumes.
     #[test]
     fn v4_flash_real_config_parses() {
-        let cfg_json = r#"{
-            "architectures": ["DeepseekV4ForCausalLM"],
-            "vocab_size": 129280,
-            "hidden_size": 4096,
-            "moe_intermediate_size": 2048,
-            "num_hidden_layers": 43,
-            "num_attention_heads": 64,
-            "num_key_value_heads": 1,
-            "n_routed_experts": 256,
-            "n_shared_experts": 1,
-            "num_experts_per_tok": 6,
-            "first_k_dense_replace": 0,
-            "max_position_embeddings": 1048576,
-            "rms_norm_eps": 1e-6,
-            "rope_theta": 10000,
-            "q_lora_rank": 1024,
-            "qk_rope_head_dim": 64,
-            "head_dim": 512,
-            "compress_ratios": [0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 0],
-            "sliding_window": 128,
-            "compress_rope_theta": 160000,
-            "o_lora_rank": 1024,
-            "o_groups": 8,
-            "index_n_heads": 64,
-            "index_head_dim": 128,
-            "index_topk": 512,
-            "num_hash_layers": 3,
-            "hc_mult": 4,
-            "hc_eps": 1e-6,
-            "hc_sinkhorn_iters": 20,
-            "swiglu_limit": 10.0,
-            "routed_scaling_factor": 1.5,
-            "scoring_func": "sqrtsoftplus",
-            "topk_method": "noaux_tc"
-        }"#;
-
-        let cfg: DeepSeekV4Config = serde_json::from_str(cfg_json).expect("V4 config parses");
+        let cfg: DeepSeekV4Config =
+            serde_json::from_str(V4_FLASH_CONFIG_JSON).expect("V4 config parses");
         // Derived qk_nope_head_dim = head_dim - qk_rope_head_dim
         assert_eq!(cfg.qk_nope_head_dim(), 448);
         assert_eq!(cfg.head_dim, 512);
@@ -3852,23 +3936,167 @@ mod tests {
         assert_eq!(cfg.q_lora_rank, Some(1024));
         assert_eq!(cfg.qk_rope_head_dim, 64);
         assert_eq!(cfg.hc_mult, 4);
+        assert_eq!(cfg.hc_sinkhorn_iters, 20);
+        assert_eq!(cfg.hc_eps, 1e-6);
         assert_eq!(cfg.num_hash_layers, 3);
-        assert_eq!(cfg.swiglu_limit, 10.0);
         assert!(matches!(cfg.scoring_func, ScoringFunc::SqrtSoftplus));
         assert!(matches!(cfg.topk_method, TopkMethod::NoAuxTc));
         assert_eq!(cfg.routed_scaling_factor, 1.5);
+        assert_eq!(cfg.o_lora_rank, Some(1024));
+        assert_eq!(cfg.o_groups, Some(8));
+        assert_eq!(cfg.index_n_heads, 64);
+        assert_eq!(cfg.index_head_dim, 128);
+        assert_eq!(cfg.index_topk, 512);
+        assert_eq!(cfg.sliding_window, 128);
+        assert!(!cfg.attention_bias);
+        assert!(!cfg.tie_word_embeddings);
+        assert!(matches!(cfg.hidden_act, Activation::Silu));
         // MQA broadcast factor
         assert_eq!(cfg.n_kv_groups(), 64);
+
+        // Keys the real config genuinely does NOT publish. Each of these is
+        // load-bearing: the forward path derives them instead, and the audit
+        // premises that depend on their absence are recorded below.
+        assert_eq!(cfg.intermediate_size, None);
+        assert_eq!(cfg.kv_lora_rank, None);
+        assert_eq!(cfg.v_head_dim, None);
+        assert_eq!(cfg.qk_nope_head_dim, None);
+        // `first_k_dense_replace` is absent ⇒ default 0 ⇒ every one of the 43
+        // layers is MoE. Corroborated by `model.safetensors.index.json`, which
+        // ships 43 × 256 = 11008 `layers.N.ffn.experts.M.w1.weight` tensors and
+        // no dense `mlp.*` tensors at any layer.
+        assert_eq!(cfg.first_k_dense_replace, 0);
+
         // Compress ratios cover all 43 layers + the MTP slot
         assert_eq!(cfg.compress_ratios.len(), 44);
-        // Layer 0/1 = standard, 2 = CSA, 3 = HCA, 43 = standard (MTP).
+        // Layers 0/1 = standard, even 2..=42 = CSA(4), odd 3..=41 = HCA(128),
+        // slot 43 = standard (the MTP block).
         assert_eq!(cfg.layer_compress_ratio(0), 0);
         assert_eq!(cfg.layer_compress_ratio(1), 0);
         assert_eq!(cfg.layer_compress_ratio(2), 4);
         assert_eq!(cfg.layer_compress_ratio(3), 128);
+        assert_eq!(cfg.layer_compress_ratio(42), 4);
         assert_eq!(cfg.layer_compress_ratio(43), 0);
+        // Exactly three ratio-0 slots: layers 0, 1 and the MTP slot 43. Every
+        // other layer is compressed — layer 42 included.
+        let standard: Vec<usize> = (0..44)
+            .filter(|i| cfg.layer_compress_ratio(*i) == 0)
+            .collect();
+        assert_eq!(standard, vec![0, 1, 43]);
         // Out of bounds → 0
         assert_eq!(cfg.layer_compress_ratio(99), 0);
+    }
+
+    /// The five open questions in `docs/notes/v4-reference-audit.md` that
+    /// bottomed out in "we do not have the real config.json". Each assertion
+    /// below is the settled answer; do not relax one without re-fetching the
+    /// file from the URL quoted on [`V4_FLASH_CONFIG_JSON`].
+    #[test]
+    fn v4_flash_config_settles_the_audit_questions() {
+        let raw: serde_json::Value = serde_json::from_str(V4_FLASH_CONFIG_JSON).unwrap();
+        let cfg: DeepSeekV4Config = serde_json::from_str(V4_FLASH_CONFIG_JSON).unwrap();
+
+        // ── Audit finding 11: group-limited routing ──────────────────────
+        // The shipped config publishes NEITHER `n_group` NOR `topk_group`, so
+        // Arc's serde defaults (1/1) apply and `MoeGate::forward` takes the
+        // flat top-k branch — which is what SGLang force-disables group
+        // limiting to reach. No divergence, and the group branch is dead code
+        // for this checkpoint.
+        assert!(raw.get("n_group").is_none(), "real config has no n_group");
+        assert!(
+            raw.get("topk_group").is_none(),
+            "real config has no topk_group"
+        );
+        assert_eq!(cfg.n_group, 1);
+        assert_eq!(cfg.topk_group, 1);
+
+        // ── Audit finding 12: hash-layer key spelling ────────────────────
+        // Spelled `num_hash_layers`, NOT `n_hash_layers`. That is the key
+        // SGLang's runtime reads (`getattr(config, "num_hash_layers", 0)`),
+        // so the reference runs three hash layers too — Arc matches.
+        // Corroborated by the tensor index: `layers.{0,1,2}.ffn.gate.tid2eid`
+        // exist and are the only three layers WITHOUT a `ffn.gate.bias`.
+        assert!(raw.get("num_hash_layers").is_some());
+        assert!(
+            raw.get("n_hash_layers").is_none(),
+            "the SGLang dataclass spelling is not what ships"
+        );
+        assert_eq!(cfg.num_hash_layers, 3);
+
+        // ── Audit finding 24: rope_scaling / mscale ──────────────────────
+        // `rope_scaling` IS present (the old fixture omitted it entirely and
+        // could not have been the real config — the reference dereferences
+        // `rope_scaling["factor"]` unconditionally). It carries no `mscale`
+        // and no `mscale_all_dim`, so Arc's defaults (1.0 / 1.0) apply and
+        // the sin/cos magnitude factor is
+        // `yarn_get_mscale(f, 1.0) / yarn_get_mscale(f, 1.0) == 1.0` — i.e.
+        // Arc's mscale multiply is a no-op, matching the reference's
+        // unit-magnitude `torch.polar`.
+        let rs = raw.get("rope_scaling").expect("rope_scaling is present");
+        assert!(rs.get("mscale").is_none(), "no mscale key ships");
+        assert!(
+            rs.get("mscale_all_dim").is_none(),
+            "no mscale_all_dim ships"
+        );
+        match cfg.rope_scaling.as_ref().expect("parses as Yarn") {
+            DeepSeekV2RopeScaling::Yarn {
+                original_max_position_embeddings,
+                beta_fast,
+                beta_slow,
+                factor,
+                mscale,
+                mscale_all_dim,
+                ..
+            } => {
+                assert_eq!(*original_max_position_embeddings, 65536);
+                assert_eq!(*beta_fast, 32.0);
+                assert_eq!(*beta_slow, 1.0);
+                assert_eq!(*factor, 16.0);
+                // Equal ⇒ the mscale ratio is exactly 1.0 ⇒ neutral.
+                assert_eq!(mscale, mscale_all_dim);
+                assert_eq!(*mscale, 1.0);
+            }
+            other => panic!("expected Yarn rope scaling, got {other:?}"),
+        }
+
+        // ── Audit finding 5 (rider i): swiglu_limit ──────────────────────
+        // The key IS published, so the reference's
+        // `getattr(config, "swiglu_limit", None)` resolves to 10.0 and the
+        // reference clamps. Arc's hard default of 10.0 coincides — which
+        // means the clamp is REQUIRED, and every Arc expert path that skips
+        // it is a genuine divergence, not a config-dependent maybe.
+        assert!(raw.get("swiglu_limit").is_some());
+        assert_eq!(cfg.swiglu_limit, 10.0);
+
+        // ── compress_rope_theta ──────────────────────────────────────────
+        // Published as 160000, matching Arc's default. SGLang's *dataclass*
+        // default of 40000 is never reached for this checkpoint.
+        assert_eq!(
+            raw.get("compress_rope_theta").and_then(|v| v.as_f64()),
+            Some(160_000.0)
+        );
+        assert_eq!(cfg.compress_rope_theta, 160_000.0);
+        assert_eq!(cfg.rope_theta, 10_000.0);
+
+        // ── Audit finding 21: norm_topk_prob ─────────────────────────────
+        // Published as `true`; now parsed rather than inferred.
+        assert!(cfg.norm_topk_prob);
+
+        // ── The fp8 checkpoint block parses (finding 14 context) ─────────
+        // `scale_fmt: "ue8m0"` is direct evidence that the shipped weight
+        // scales are power-of-two, which is what finding 14 says Arc's
+        // FP8 K-cache path does not reproduce.
+        assert_eq!(
+            raw.pointer("/quantization_config/scale_fmt")
+                .and_then(|v| v.as_str()),
+            Some("ue8m0")
+        );
+        match cfg.quantization_config.as_ref().expect("fp8 block parses") {
+            QuantizedConfig::Fp8 { weight_block_size } => {
+                assert_eq!(weight_block_size.as_deref(), Some(&[128usize, 128][..]));
+            }
+            other => panic!("expected Fp8 quantization config, got {other:?}"),
+        }
     }
 
     /// Backwards-compat: a V3-style fixture (with `kv_lora_rank`,
