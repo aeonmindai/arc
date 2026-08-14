@@ -10,23 +10,45 @@
 //!
 //! # Architecture (RUN-156 Tier A + full-block Tier B)
 //!
-//! Per the V4 paper and SGLang's `deepseek_v4_nextn.py`:
+//! Per the V4 paper and SGLang's `deepseek_v4_nextn.py:149-161`:
 //! ```text
-//! prev_hidden = target.forward(input_ids)[-1]   # [B, hidden]
-//! e_emb       = embed_tokens(last_token)         # [B, hidden]
+//! h           = target hidden state at position i   # pre-`norm`, NOT an embedding
+//! e_emb       = embed_tokens(tok_{i+1})             # [B, hidden]
 //! # Full-block path (checkpoint ships mtp.0.* decoder + --mtp-depth > 0):
-//! fused       = h_proj(hnorm(prev_hidden)) + e_proj(enorm(e_emb))
+//! fused       = h_proj(hnorm(h)) + e_proj(enorm(e_emb))
 //! hidden      = mtp_decoder_layer(fused)         # V4 attention + 256-expert MoE
 //! mtp_logits  = lm_head(norm(hidden))            # [B, vocab]
 //! # Tier-A fallback (older exports / --mtp-depth 0 at load):
-//! fused       = h_proj(prev_hidden) + e_proj(e_emb)
+//! fused       = h_proj(h) + e_proj(e_emb)
 //! mtp_logits  = lm_head(fused)
 //! draft_token = argmax(mtp_logits)
 //! ```
 //!
 //! When `depth > 1`, the block output (or the projected `fused` on the
-//! Tier-A path) becomes the next step's `prev_hidden`. The full proposed
+//! Tier-A path) becomes the next step's `h`. The full proposed
 //! sequence is then verified.
+//!
+//! # The two signals must differ (audit finding 1)
+//!
+//! `h_proj` takes the **target model's own hidden state** and `e_proj` takes
+//! the **token embedding**. Combining two different signals is the entire
+//! point of the trained head; feeding `embed(T0)` to both collapses it and
+//! drives acceptance to noise regardless of quantization. The hidden state
+//! arrives through [`MtpHiddenCapture`], a side-channel the target model
+//! fills during its own forward — no second forward pass is run.
+//!
+//! # The draft KV must hold the accepted context (audit finding 2)
+//!
+//! The MTP block applies **absolute** RoPE positions, so its KV cache must be
+//! the real context, not an empty per-chain buffer. Mirroring
+//! `eagle_worker.py` (`:134-138` own KV pool, `:1094-1128` prefill over the
+//! prompt, `:1134+` extend over accepted tokens), this module keeps a
+//! **persistent per-sequence draft KV** whose slot `k` is absolute position
+//! `k`, holding the MTP state of the pair `(h_k, tok_{k+1})`. It is prefilled
+//! from the prompt forward's captured hidden states and extended after every
+//! verify. When it cannot be established contiguously (batched prefill,
+//! prefix-cache hit) drafting is **skipped** rather than run against a cache
+//! whose positions mean nothing — skipping is lossless, drafting blind is not.
 //!
 //! # Constraints (this module)
 //!
@@ -114,6 +136,140 @@ pub fn mtp_uqff_bake() -> bool {
     MTP_UQFF_BAKE.load(Ordering::Relaxed)
 }
 
+/// Is `ty` narrower than 8 bits per weight?
+///
+/// Everything at or above 8 bits (`Q8_*`, `HQQ8`, `AFQ8`, the FP8 types) is
+/// safe for the MTP tail; everything else is not. See [`floor_mtp_isq`].
+pub fn isq_is_sub_int8(ty: mistralrs_quant::IsqType) -> bool {
+    use mistralrs_quant::IsqType as T;
+    !matches!(
+        ty,
+        T::Q8_0 | T::Q8_1 | T::Q8K | T::HQQ8 | T::AFQ8 | T::F8E4M3 | T::F8Q8
+    )
+}
+
+/// Raise a requested ISQ dtype to the MTP path's 8-bit floor.
+///
+/// **Why a floor exists.** The MTP head is a second logit-producing path, and
+/// it is far more fragile than the main one: it must reproduce the target's
+/// *argmax*, and `verify_proposed` accepts on exact `u32` equality, so every
+/// distribution wobble is a rejected token rather than a slightly different
+/// word. colibrì measured an int4 MTP draft head at **0-4% acceptance**
+/// (`EXTERNAL_FINDINGS.md` F3) — at which point speculation is pure overhead.
+///
+/// This is the same call the project already made for `lm_head` (RUN-161:
+/// *"quantizing the logit projection to 2-bit corrupts EOS probabilities and
+/// breaks chat/instruction-following"*), applied to the other logit path.
+///
+/// Set `ARC_MTP_ALLOW_SUB_INT8=1` to opt out and get the requested width.
+pub fn floor_mtp_isq(
+    requested: Option<mistralrs_quant::IsqType>,
+) -> Option<mistralrs_quant::IsqType> {
+    use mistralrs_quant::IsqType as T;
+    let Some(ty) = requested else {
+        return requested;
+    };
+    if !isq_is_sub_int8(ty) {
+        return requested;
+    }
+    if std::env::var_os("ARC_MTP_ALLOW_SUB_INT8").is_some() {
+        warn_sub_int8_once(ty, None);
+        return requested;
+    }
+    // Stay inside the requested backend family where an 8-bit sibling exists,
+    // so the tensor keeps using the same kernels as its neighbours.
+    let floored = match ty {
+        T::AFQ2 | T::AFQ3 | T::AFQ4 | T::AFQ6 => T::AFQ8,
+        T::HQQ4 => T::HQQ8,
+        _ => T::Q8_0,
+    };
+    warn_sub_int8_once(ty, Some(floored));
+    Some(floored)
+}
+
+static WARNED_SUB_INT8: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn warn_sub_int8_once(
+    requested: mistralrs_quant::IsqType,
+    floored: Option<mistralrs_quant::IsqType>,
+) {
+    if WARNED_SUB_INT8.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    match floored {
+        Some(floored) => tracing::warn!(
+            target: "mtp_speculative",
+            "MTP tail requested at {requested:?} (sub-int8); raising to {floored:?}. An int4 \
+             MTP draft head measured 0-4% acceptance in the field, which makes speculative \
+             decode a net slowdown. Set ARC_MTP_ALLOW_SUB_INT8=1 to override."
+        ),
+        None => tracing::warn!(
+            target: "mtp_speculative",
+            "ARC_MTP_ALLOW_SUB_INT8 is set: leaving the MTP tail at {requested:?} (sub-int8). \
+             Expect near-zero acceptance and a net decode slowdown."
+        ),
+    }
+}
+
+/// Side-channel carrying the target model's pre-`lm_head` hidden states out of
+/// its own forward pass and into the MTP draft path.
+///
+/// This is Arc's counterpart to the reference's
+/// `LogitsProcessor(hidden_states_before_norm=…)` capture
+/// (`logits_processor.py:603-606`), which becomes `spec_info.hidden_states`
+/// and is consumed by `h_proj(hnorm(·))` at `deepseek_v4_nextn.py:152-154`.
+///
+/// Contract:
+/// * The model stores the **whole** `[B, T, hidden]` block for the positions
+///   it just ran, tagged with the absolute position of its first row, and only
+///   while [`Self::arm`] has been called. Every store overwrites the previous
+///   one, so a consumer must take the value in the same step that produced it.
+/// * [`Self::take`] clears the slot — holding a prompt-sized activation alive
+///   past its use would cost `T × hidden` of device memory for nothing.
+#[derive(Debug, Default)]
+pub struct MtpHiddenCapture {
+    armed: std::sync::atomic::AtomicBool,
+    /// `(absolute position of row 0, [B, T, hidden])`.
+    slot: std::sync::Mutex<Option<(usize, Tensor)>>,
+}
+
+impl MtpHiddenCapture {
+    /// Start retaining hidden states. Called when an [`MtpDecodeKit`] is
+    /// handed out, i.e. when MTP drafting is actually engaged.
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the model should pay for the capture on this forward.
+    pub fn is_armed(&self) -> bool {
+        self.armed.load(Ordering::Relaxed)
+    }
+
+    /// Record the hidden states of the positions just computed. `start_pos` is
+    /// the absolute sequence position of row 0 (the model's `seqlen_offsets`).
+    /// A no-op while disarmed.
+    pub fn store(&self, start_pos: usize, hidden: &Tensor) {
+        if !self.is_armed() {
+            return;
+        }
+        if let Ok(mut slot) = self.slot.lock() {
+            *slot = Some((start_pos, hidden.clone()));
+        }
+    }
+
+    /// Take and clear the captured block.
+    pub fn take(&self) -> Option<(usize, Tensor)> {
+        self.slot.lock().ok().and_then(|mut slot| slot.take())
+    }
+
+    /// Drop any captured block without consuming it.
+    pub fn clear(&self) {
+        if let Ok(mut slot) = self.slot.lock() {
+            *slot = None;
+        }
+    }
+}
+
 /// Components needed to run one MTP draft step.
 ///
 /// All fields are Arc/Clone-cheap handles into the target model's
@@ -141,6 +297,9 @@ pub struct MtpDecodeKit {
     /// (older exports, or `--mtp-depth 0`); drafting then falls back to the
     /// Tier-A projection-only path.
     pub(crate) block: Option<Arc<crate::models::deepseek4::MtpBlock>>,
+    /// Shared with the target model: carries the target's pre-`lm_head`
+    /// hidden states into `h_proj`. See [`MtpHiddenCapture`].
+    pub hidden_capture: Arc<MtpHiddenCapture>,
 }
 
 impl std::fmt::Debug for MtpDecodeKit {
@@ -201,19 +360,81 @@ impl MtpDecodeKit {
         Ok((mtp_logits, fused))
     }
 
+    /// Fresh persistent draft KV cache, or `None` on the Tier-A (heads-only)
+    /// path where there is no block to cache for.
+    pub fn new_draft_cache(&self) -> Option<KvCache> {
+        self.block.as_ref().map(|b| b.new_draft_cache())
+    }
+
+    /// The reference's `h`/`e` combine, applied to a whole `[B, T, hidden]`
+    /// block of positions at once.
+    ///
+    /// `deepseek_v4_nextn.py:155-161`:
+    /// ```python
+    /// h_proj_out, _ = self.h_proj(self.hnorm(hc_flat))
+    /// e_proj_hidden_states, _ = self.e_proj(self.enorm(hidden_states))
+    /// hidden_states = e_proj_hidden_states[:, None, :] + h_proj_hidden_states
+    /// ```
+    /// — norms **before** the projections, two projections then add. The two
+    /// inputs are different tensors by construction: `hidden` is the target's
+    /// captured hidden state, `tokens` are the *next* token ids.
+    fn combine(
+        &self,
+        block: &crate::models::deepseek4::MtpBlock,
+        hidden: &Tensor,
+        tokens: &Tensor,
+    ) -> Result<Tensor> {
+        let e_emb = self.embed_tokens.forward(tokens)?;
+        let h_out = self.h_proj.forward_autocast(&block.norm_h(hidden)?)?;
+        let e_out = self.e_proj.forward_autocast(&block.norm_e(&e_emb)?)?;
+        h_out + e_out
+    }
+
+    /// Extend the persistent draft KV over a run of committed context
+    /// positions — Arc's `forward_draft_extend` (`eagle_worker.py:1094-1128`)
+    /// / `forward_draft_extend_after_decode` (`:1134+`).
+    ///
+    /// `hidden` is `[B, T, hidden]`, the target's captured states for absolute
+    /// positions `start_pos .. start_pos + T`; `next_tokens` is `[B, T]`, the
+    /// committed token at each of those positions **plus one** — the pairing
+    /// `apply_eagle_prefill_input_rotation` sets up (`eagle_utils.py:31-33`).
+    /// The cache must already hold exactly `start_pos` entries.
+    ///
+    /// Returns the new fill level (`start_pos + T`).
+    pub fn extend_draft_cache(
+        &self,
+        cache: &mut KvCache,
+        start_pos: usize,
+        hidden: &Tensor,
+        next_tokens: &Tensor,
+    ) -> Result<usize> {
+        let Some(block) = self.block.as_ref() else {
+            return Ok(cache.current_seq_len());
+        };
+        let n = next_tokens.dim(next_tokens.rank() - 1)?;
+        if n == 0 {
+            return Ok(start_pos);
+        }
+        let fused = self.combine(block, hidden, next_tokens)?;
+        block.forward_tokens(&fused, start_pos, cache, next_tokens)?;
+        Ok(start_pos + n)
+    }
+
     /// Run one MTP draft step through the full transformer block (Tier B).
     ///
     /// Mirrors SGLang's `DeepseekV4ModelNextN.forward` (audit §2 "MTP head"):
     /// ```text
     /// fused  = h_proj(hnorm(prev_hidden)) + e_proj(enorm(embed(token)))
-    /// hidden = decoder_layer(fused)          # V4 attention + MoE, own KV cache
+    /// hidden = decoder_layer(fused)          # V4 attention + MoE, draft KV
     /// logits = lm_head(norm(hidden))         # mtp.0.norm, shared lm_head
     /// ```
-    /// `pos` is the absolute sequence position of the drafted token (used for
-    /// RoPE); `cache` is the per-chain KV cache so later draft tokens attend
-    /// over earlier ones. Returns `(logits [B, vocab], next_hidden [B, hidden])`
-    /// where `next_hidden` is the decoder output pre-`norm` (the reference
-    /// feeds the pre-head hidden state forward between spec steps).
+    /// `pos` is the absolute sequence position of this step (used for RoPE and
+    /// as the draft KV slot); `cache` is the persistent draft KV, already
+    /// holding the accepted context, so the step attends over the real prefix
+    /// and not just its own chain. Returns
+    /// `(logits [B, vocab], next_hidden [B, hidden])` where `next_hidden` is
+    /// the decoder output pre-`norm` (the reference feeds the pre-head hidden
+    /// state forward between spec steps).
     fn step_full(
         &self,
         block: &crate::models::deepseek4::MtpBlock,
@@ -227,19 +448,13 @@ impl MtpDecodeKit {
         } else {
             last_token.clone()
         };
-        let e_emb = self.embed_tokens.forward(&last_token)?;
         let prev_hidden = if prev_hidden.rank() == 1 {
             prev_hidden.unsqueeze(0)?
         } else {
             prev_hidden.clone()
         };
 
-        // Reference semantics: the norms are applied BEFORE the projections
-        // (deepseek_v4_nextn.py: `h_proj(hnorm(h))` / `e_proj(enorm(emb))`).
-        let h_out = self.h_proj.forward_autocast(&block.norm_h(&prev_hidden)?)?;
-        let e_out = self.e_proj.forward_autocast(&block.norm_e(&e_emb)?)?;
-        let fused = (h_out + e_out)?; // [B, hidden]
-
+        let fused = self.combine(block, &prev_hidden, &last_token)?; // [B, hidden]
         let fused3 = fused.unsqueeze(1)?; // [B, 1, hidden]
         let ids = last_token.unsqueeze(1)?; // [B, 1] (hash-routed MoE gate input)
         let hidden = block.forward_step(&fused3, pos, cache, &ids)?; // [B, 1, hidden]
@@ -259,10 +474,20 @@ impl MtpDecodeKit {
     /// 3. Feeds the new token (and the hidden state) back into the next
     ///    iteration.
     ///
-    /// `start_pos` is the absolute sequence position of the FIRST drafted
-    /// token (i.e. the target's KV-cache length after the free token); the
-    /// full-block path uses it for RoPE and its per-chain KV cache. The
-    /// Tier-A path ignores it.
+    /// `last_hidden` MUST be the **target model's** hidden state at position
+    /// `start_pos` (via [`MtpHiddenCapture`]), never an embedding — see the
+    /// module docs.
+    ///
+    /// `start_pos` is the absolute sequence position of the FIRST draft step,
+    /// which is `len(committed_tokens) - 1`: that step is the pair
+    /// `(h_{L-1}, T0)` and is a *real* context entry, exactly the last entry
+    /// the reference writes during its draft extend
+    /// (`eagle_worker.py:1094-1128`); the reference's own draft-decode loop
+    /// then starts one position later at `seq_len` (`:726`, `:910`).
+    ///
+    /// `draft_cache` is the persistent per-sequence draft KV, which must
+    /// already hold `start_pos` entries of accepted context. `None` is only
+    /// valid on the Tier-A (heads-only) path, which has no attention at all.
     ///
     /// Returns the list of proposed token IDs (length is exactly
     /// `min(depth, max_tokens)`).
@@ -273,22 +498,27 @@ impl MtpDecodeKit {
         depth: usize,
         max_tokens: usize,
         start_pos: usize,
+        draft_cache: Option<&mut KvCache>,
     ) -> Result<Vec<u32>> {
         let n = depth.min(max_tokens);
         let mut tokens = Vec::with_capacity(n);
         if n == 0 {
             return Ok(tokens);
         }
+        if self.block.is_some() && draft_cache.is_none() {
+            candle_core::bail!(
+                "MTP full-block drafting requires the persistent draft KV cache; drafting \
+                 against an empty per-chain cache while applying absolute RoPE positions is \
+                 the RUN-169 acceptance-killer (audit finding 2)."
+            );
+        }
         let device = last_hidden.device();
         let mut prev_hidden = last_hidden.clone();
         let mut tok = last_token_id;
-        // Per-chain KV cache for the full-block path: draft token i attends
-        // over draft tokens 0..i at their absolute positions. Fresh per chain
-        // — rejected drafts never pollute a later chain.
-        let mut chain_cache = self.block.as_ref().map(|b| b.new_chain_cache());
+        let mut draft_cache = draft_cache;
         for i in 0..n {
             let tok_tensor = Tensor::from_vec(vec![tok], (1,), device)?;
-            let (mtp_logits, next_hidden) = match (&self.block, &mut chain_cache) {
+            let (mtp_logits, next_hidden) = match (&self.block, draft_cache.as_deref_mut()) {
                 (Some(block), Some(cache)) => {
                     self.step_full(block, &prev_hidden, &tok_tensor, start_pos + i, cache)?
                 }
@@ -332,6 +562,32 @@ pub struct MtpSpeculativePipeline {
     accepted_count: std::sync::atomic::AtomicUsize,
     /// Running tally of proposed MTP tokens.
     proposed_count: std::sync::atomic::AtomicUsize,
+    /// Persistent per-sequence draft KV caches (audit finding 2). Keyed by
+    /// `Sequence::id`. Bounded by [`Self::MAX_DRAFT_KV_SEQS`] — an entry is
+    /// one decoder layer's KV for one sequence.
+    draft_kv: std::sync::Mutex<std::collections::HashMap<usize, DraftKv>>,
+    /// Monotonic clock for the draft-KV eviction order.
+    draft_kv_clock: AtomicUsize,
+    /// Latches so the "drafting skipped, draft KV unprimed" explanation is
+    /// logged once per process rather than once per token.
+    warned_unprimed: std::sync::atomic::AtomicBool,
+}
+
+/// One sequence's persistent MTP draft KV.
+///
+/// Invariant: slot `k` of `cache` is the MTP block's state for **absolute**
+/// position `k`, i.e. the pair `(h_k, tok_{k+1})`. `filled` is the number of
+/// such committed entries; anything the cache holds beyond `filled` is the
+/// speculative tail of the last chain and is truncated before reuse.
+struct DraftKv {
+    cache: KvCache,
+    filled: usize,
+    /// Set once the cache can no longer be trusted to index absolute
+    /// positions (a non-contiguous prefill, or an extend that errored).
+    /// Drafting is skipped for the sequence from then on — lossless, and it
+    /// stops us re-attempting a doomed extend on every token.
+    poisoned: bool,
+    last_used: usize,
 }
 
 impl MtpSpeculativePipeline {
@@ -365,6 +621,9 @@ impl MtpSpeculativePipeline {
             category,
             accepted_count: std::sync::atomic::AtomicUsize::new(0),
             proposed_count: std::sync::atomic::AtomicUsize::new(0),
+            draft_kv: std::sync::Mutex::new(std::collections::HashMap::new()),
+            draft_kv_clock: AtomicUsize::new(0),
+            warned_unprimed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -393,6 +652,9 @@ impl MtpSpeculativePipeline {
             category,
             accepted_count: std::sync::atomic::AtomicUsize::new(0),
             proposed_count: std::sync::atomic::AtomicUsize::new(0),
+            draft_kv: std::sync::Mutex::new(std::collections::HashMap::new()),
+            draft_kv_clock: AtomicUsize::new(0),
+            warned_unprimed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -444,19 +706,22 @@ impl MtpSpeculativePipeline {
         );
     }
 
-    /// Run one MTP draft chain (greedy, depth ≤ self.depth).
+    /// Run one MTP draft chain (greedy, depth ≤ self.depth) against a caller-
+    /// supplied draft KV.
     ///
-    /// Given the latest hidden state from the target forward and the just-emitted
-    /// token, produces up to `self.depth` proposed tokens by chaining MTP steps.
-    /// The chain stops early if it would exceed `max_tokens` (e.g., the EOS or
-    /// the requested generation length). `start_pos` is the absolute position
-    /// of the first drafted token (see [`MtpDecodeKit::propose_chain`]).
+    /// Given the target's hidden state at `start_pos` and the just-emitted
+    /// token, produces up to `self.depth` proposed tokens by chaining MTP
+    /// steps. The chain stops early if it would exceed `max_tokens` (e.g., the
+    /// EOS or the requested generation length). See
+    /// [`MtpDecodeKit::propose_chain`] for the `start_pos` / `draft_cache`
+    /// contract.
     pub fn propose_chain(
         &self,
         last_hidden: &Tensor,
         last_token_id: u32,
         max_tokens: usize,
         start_pos: usize,
+        draft_cache: Option<&mut KvCache>,
     ) -> Result<Vec<u32>> {
         self.kit.propose_chain(
             last_hidden,
@@ -464,6 +729,7 @@ impl MtpSpeculativePipeline {
             self.depth,
             max_tokens,
             start_pos,
+            draft_cache,
         )
     }
 
@@ -473,6 +739,147 @@ impl MtpSpeculativePipeline {
             .fetch_add(proposed, std::sync::atomic::Ordering::Relaxed);
         self.accepted_count
             .fetch_add(accepted, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Cap on retained per-sequence draft KV caches. Each is one decoder
+    /// layer's KV for one sequence; the engine only ever drafts for the
+    /// sequence it is currently stepping, so a small LRU is plenty.
+    const MAX_DRAFT_KV_SEQS: usize = 64;
+
+    /// Take a sequence's draft KV out of the map (so the borrow checker lets
+    /// us hand `&mut KvCache` to the kit while `self` stays shared), creating
+    /// it on first use. `None` on the Tier-A heads-only path.
+    fn checkout_draft_kv(&self, seq_id: usize) -> Option<DraftKv> {
+        let mut map = self.draft_kv.lock().ok()?;
+        if let Some(state) = map.remove(&seq_id) {
+            return Some(state);
+        }
+        let cache = self.kit.new_draft_cache()?;
+        Some(DraftKv {
+            cache,
+            filled: 0,
+            poisoned: false,
+            last_used: self.draft_kv_clock.fetch_add(1, Ordering::Relaxed),
+        })
+    }
+
+    /// Put a sequence's draft KV back, evicting the least-recently-used entry
+    /// if the map has grown past [`Self::MAX_DRAFT_KV_SEQS`].
+    fn checkin_draft_kv(&self, seq_id: usize, mut state: DraftKv) {
+        state.last_used = self.draft_kv_clock.fetch_add(1, Ordering::Relaxed);
+        let Ok(mut map) = self.draft_kv.lock() else {
+            return;
+        };
+        map.insert(seq_id, state);
+        while map.len() > Self::MAX_DRAFT_KV_SEQS {
+            let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, s)| s.last_used)
+                .map(|(id, _)| *id)
+            else {
+                break;
+            };
+            map.remove(&oldest);
+        }
+    }
+
+    /// Forget a sequence's draft KV (sequence finished, or the target's own
+    /// cache was reset out from under it).
+    fn drop_draft_kv(&self, seq_id: usize) {
+        if let Ok(mut map) = self.draft_kv.lock() {
+            map.remove(&seq_id);
+        }
+    }
+
+    /// Forget every draft KV — the target cache was reset wholesale.
+    fn clear_draft_kv(&self) {
+        if let Ok(mut map) = self.draft_kv.lock() {
+            map.clear();
+        }
+    }
+
+    /// Bring one sequence's draft KV up to date from a captured block of
+    /// target hidden states.
+    ///
+    /// This is `forward_draft_extend` / `forward_draft_extend_after_decode`
+    /// (`eagle_worker.py:1094-1128`, `:1134+`): draft-KV slot `i` is the MTP
+    /// state of `(h_i, tok_{i+1})`, so from a capture covering absolute
+    /// positions `[off, off+T)` and a committed token list of length `L` we
+    /// can write slots `i ∈ [max(off, filled), min(off+T, L-1))`.
+    ///
+    /// The `i ≤ L-2` bound is doing double duty: it is also exactly the
+    /// condition that `h_i` was conditioned only on *committed* tokens, so a
+    /// rejected proposal's hidden state can never enter the cache.
+    ///
+    /// Returns `Ok(false)` when the run is not contiguous with what the cache
+    /// already holds (`off > filled`) — the caller must then skip drafting
+    /// rather than let slot index and absolute position drift apart.
+    fn extend_draft_kv(
+        &self,
+        state: &mut DraftKv,
+        capture: Option<(usize, Tensor)>,
+        toks: &[u32],
+    ) -> Result<bool> {
+        if state.poisoned {
+            return Ok(false);
+        }
+        let Some((off, hidden)) = capture else {
+            return Ok(true);
+        };
+        if self.kit.block.is_none() {
+            return Ok(true);
+        }
+        // Normalize to [B, T, hidden]; the model captures before
+        // `extract_logits`, so T is the full input width of that forward.
+        let hidden = match hidden.rank() {
+            2 => hidden.unsqueeze(0)?,
+            3 => hidden,
+            other => candle_core::bail!("MTP hidden capture had unexpected rank {other}"),
+        };
+        if hidden.dim(0)? != 1 {
+            // Batched forward: rows cannot be attributed to this sequence.
+            return Ok(false);
+        }
+        let t = hidden.dim(1)?;
+        if off > state.filled {
+            return Ok(false);
+        }
+        let lo = state.filled.max(off);
+        // `tok_{i+1}` must be committed: i + 1 <= toks.len() - 1.
+        let hi = (off + t).min(toks.len().saturating_sub(1));
+        if hi <= lo {
+            return Ok(true);
+        }
+        let n = hi - lo;
+        let hidden_slice = hidden.narrow(1, lo - off, n)?;
+        let next_tokens = Tensor::from_slice(&toks[lo + 1..hi + 1], (1, n), hidden.device())?;
+        state.cache.set_len(state.filled).map_err(|e| {
+            candle_core::Error::msg(format!(
+                "MTP draft KV truncate to {} failed: {e}",
+                state.filled
+            ))
+        })?;
+        state.filled =
+            self.kit
+                .extend_draft_cache(&mut state.cache, lo, &hidden_slice, &next_tokens)?;
+        Ok(true)
+    }
+
+    /// Log the "draft KV could not be primed, drafting skipped" explanation
+    /// once per process.
+    fn warn_unprimed_once(&self, reason: &str) {
+        if !self
+            .warned_unprimed
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(
+                target: "mtp_speculative",
+                "MTP drafting skipped: {reason}. The MTP block applies ABSOLUTE RoPE \
+                 positions, so drafting without a draft KV covering the accepted context \
+                 would attend over nothing at positions that index nothing (audit finding \
+                 2). Skipping is lossless; decode continues at plain target speed."
+            );
+        }
     }
 }
 
@@ -805,11 +1212,13 @@ impl Pipeline for MtpSpeculativePipeline {
     /// Algorithm per V4 paper § 2.2 (RUN-156):
     ///
     /// 1. Target forward over the current input — yields `T0` (the "free"
-    ///    target token) and advances the KV cache by 1.
-    /// 2. Propose chain: feed `embed(T0)` as the initial `prev_hidden` to the
-    ///    MTP head's `propose_chain`, producing `[T1, …, T_depth]` greedy
-    ///    candidates (Tier A: embedding-as-hidden seed; Tier B will plumb the
-    ///    real target hidden state).
+    ///    target token), advances the KV cache by 1, and (through
+    ///    [`MtpHiddenCapture`]) hands out the target's own hidden state
+    ///    `h_{L-1}` at the last committed position.
+    /// 2. Propose chain: feed `h_{L-1}` to `h_proj` and `embed(T0)` to
+    ///    `e_proj` — two different signals, as the head was trained — and run
+    ///    the chain against the persistent draft KV, which already holds the
+    ///    accepted context, producing `[T1, …, T_depth]` greedy candidates.
     /// 3. Target verify forward over `[T0, T1, …, T_{depth-1}]` — yields
     ///    `depth` extra logit slots; greedy-argmax gives `[V0, V1, …, V_{depth-1}]`
     ///    where `V0` is the target's correction for "what comes after T0",
@@ -860,18 +1269,58 @@ impl Pipeline for MtpSpeculativePipeline {
             && !get_mut_arcmutex!(self.target).get_metadata().no_kv_cache;
 
         if !take_fast_path {
-            let mut target = self.target.lock().await;
-            return target
-                .step(
-                    input_seqs,
-                    is_prompt,
-                    return_raw_logits,
-                    prefix_cacher,
-                    disable_eos_stop,
-                    rng,
-                    backend_metadata,
-                )
-                .await;
+            // The prompt forward is the ONE place the target produces hidden
+            // states for the whole context, so it is where the draft KV gets
+            // prefilled — the reference's `forward_draft_extend`
+            // (`eagle_worker.py:1094-1128`). Any other fallback (batched,
+            // xlora, raw logits) just drops the capture, so a stale block can
+            // never be attributed to the wrong sequence on a later step.
+            let single_seq_prompt = is_prompt && input_seqs.len() == 1;
+            let seq_id = single_seq_prompt.then(|| *input_seqs[0].id());
+            let elapsed = {
+                let mut target = self.target.lock().await;
+                target
+                    .step(
+                        input_seqs,
+                        is_prompt,
+                        return_raw_logits,
+                        prefix_cacher,
+                        disable_eos_stop,
+                        rng,
+                        backend_metadata,
+                    )
+                    .await?
+            };
+            match seq_id {
+                Some(seq_id) if self.kit.block.is_some() => {
+                    let capture = self.kit.hidden_capture.take();
+                    if let Some(mut state) = self.checkout_draft_kv(seq_id) {
+                        let toks = input_seqs[0].get_toks().to_vec();
+                        match self.extend_draft_kv(&mut state, capture, &toks) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                state.poisoned = true;
+                                self.warn_unprimed_once(
+                                    "the prompt forward's hidden states do not cover the \
+                                     sequence contiguously from position 0 (batched prefill, \
+                                     chunked prefill, or a prefix-cache hit)",
+                                );
+                            }
+                            Err(e) => {
+                                state.poisoned = true;
+                                tracing::warn!(
+                                    target: "mtp_speculative",
+                                    "MTP draft-KV prefill failed ({e}); drafting disabled for \
+                                     this sequence"
+                                );
+                            }
+                        }
+                        self.checkin_draft_kv(seq_id, state);
+                    }
+                }
+                _ => self.kit.hidden_capture.clear(),
+            }
+            return Ok(elapsed);
         }
 
         // ===== MTP fast path =====
@@ -887,17 +1336,28 @@ impl Pipeline for MtpSpeculativePipeline {
             CacheInstruction::Reset {
                 reset_non_granular,
                 load_preallocated_cache,
-            } => self.set_none_cache(
-                input_seqs,
-                reset_non_granular,
-                false,
-                load_preallocated_cache,
-            ),
+            } => {
+                // The target's KV was thrown away; the draft KV that shadowed
+                // it is now meaningless too.
+                self.clear_draft_kv();
+                self.set_none_cache(
+                    input_seqs,
+                    reset_non_granular,
+                    false,
+                    load_preallocated_cache,
+                )
+            }
             _ => unreachable!("Unreachable PRE cache op."),
         }
 
         let start = Instant::now();
+        let seq_id = *input_seqs[0].id();
         let seq = &mut input_seqs[0];
+
+        // A capture can only be stale here: every path that produces one
+        // consumes it in the same step. Dropping it makes it impossible for a
+        // block belonging to another sequence to be read as this one's.
+        self.kit.hidden_capture.clear();
 
         // ---- Step 1: target forward + sample T0 ----
         let (logits_t0, _exec_t0) = run_target_forward(
@@ -938,27 +1398,105 @@ impl Pipeline for MtpSpeculativePipeline {
         };
 
         // ---- Step 2: MTP propose [T1, …, T_depth] ----
-        // Seed `prev_hidden` from `embed_tokens(T0)`. (Plumbing the target's
-        // real last hidden state through `forward_inputs` is the remaining
-        // Tier-B follow-up.) When the full MTP block is loaded, the chain
-        // flows through the real decoder layer at the absolute positions
-        // starting at the current cache length (= T0's successor slot).
-        let device = get_mut_arcmutex!(self.target).device();
-        let t0_tensor = Tensor::from_vec(vec![t0], (1,), &device)?;
-        let embedded_t0 = self.kit.embed_tokens.forward(&t0_tensor)?; // [1, hidden]
-        let chain_start_pos = current_normal_cache_len(self);
-        let proposed = self.kit.propose_chain(
-            &embedded_t0,
-            t0,
-            self.depth,
-            toks_remaining_budget,
-            chain_start_pos,
-        )?;
+        //
+        // `h_proj` gets the TARGET'S hidden state at the last committed
+        // position — captured during the forward we just ran, never a second
+        // forward — and `e_proj` gets `embed(T0)`. Two different signals, as
+        // `deepseek_v4_nextn.py:155-161` requires (audit finding 1).
+        //
+        // The first draft step sits at absolute position `L - 1` (`L` =
+        // committed tokens): that step is the pair `(h_{L-1}, T0)`, which is
+        // the last entry the reference writes during its draft extend, and its
+        // logits are the first draft token (`eagle_worker.py:1094-1132`). The
+        // reference's own draft-decode loop then starts at `seq_len` (`:726`).
+        let capture = self.kit.hidden_capture.take();
+        let mut draft_state = self.checkout_draft_kv(seq_id);
+        let seeded = match &capture {
+            Some((off, hidden)) if hidden.rank() == 3 && hidden.dim(0)? == 1 => {
+                let t = hidden.dim(1)?;
+                Some((off + t - 1, hidden.i((0, t - 1))?))
+            }
+            _ => None,
+        };
 
-        // If the budget left no room (max_len hit, depth=0), commit T0 and
-        // return — no verify needed.
+        // `L - 1` from the KV cache, which the forward above just advanced to
+        // `L`. Cross-checked against the position the capture reports so a
+        // silent drift between the two bookkeepings can never seed the chain.
+        let chain_start_pos = current_normal_cache_len(self).saturating_sub(1);
+        let can_draft = match (&seeded, &draft_state) {
+            (Some((pos, _)), Some(state)) => {
+                !state.poisoned && *pos == chain_start_pos && state.filled == chain_start_pos
+            }
+            // Tier-A (heads-only) drafting has no attention and therefore no
+            // KV to prime; it only needs the hidden state.
+            (Some((pos, _)), None) => self.kit.block.is_none() && *pos == chain_start_pos,
+            (None, _) => false,
+        };
+
+        let proposed = if can_draft {
+            let (_, seed_hidden) = seeded.as_ref().expect("gated by can_draft");
+            self.kit.propose_chain(
+                seed_hidden,
+                t0,
+                self.depth,
+                toks_remaining_budget,
+                chain_start_pos,
+                draft_state.as_mut().map(|s| &mut s.cache),
+            )?
+        } else {
+            if self.kit.block.is_some() {
+                let filled = draft_state.as_ref().map(|s| s.filled);
+                self.warn_unprimed_once(&format!(
+                    "draft KV holds {filled:?} committed entries but the chain must start at \
+                     absolute position {chain_start_pos}"
+                ));
+            }
+            Vec::new()
+        };
+
+        // Credit the chain's FIRST entry as committed context: it is the pair
+        // `(h_{L-1}, T0)` built from the target's own hidden state and a token
+        // that is committed unconditionally below, so it is a real context
+        // entry, not a speculative one. Everything the chain wrote after it
+        // used the DRAFT's hidden states and is truncated on the next extend.
+        if let Some(state) = draft_state.as_mut() {
+            if !proposed.is_empty() {
+                state.filled = chain_start_pos + 1;
+            }
+        }
+
+        // If the budget left no room (max_len hit, depth=0) or the draft KV
+        // was not primed, commit T0 and return — no verify needed.
         if proposed.is_empty() {
+            // Still advance the draft KV over T0 so the NEXT step can draft:
+            // `h_{L-1}` is in hand right now and never comes back.
+            if let (Some(state), Some((_, seed_hidden))) = (draft_state.as_mut(), &seeded) {
+                if !state.poisoned && state.filled == chain_start_pos {
+                    let h3 = seed_hidden.reshape((1, 1, ()))?;
+                    let ids = Tensor::from_vec(vec![t0], (1, 1), h3.device())?;
+                    match self
+                        .kit
+                        .extend_draft_cache(&mut state.cache, chain_start_pos, &h3, &ids)
+                    {
+                        Ok(filled) => state.filled = filled,
+                        Err(e) => {
+                            state.poisoned = true;
+                            tracing::warn!(
+                                target: "mtp_speculative",
+                                "MTP draft-KV extend over T0 failed ({e}); drafting disabled \
+                                 for this sequence"
+                            );
+                        }
+                    }
+                }
+            }
+            if let Some(state) = draft_state {
+                self.checkin_draft_kv(seq_id, state);
+            }
             finish_or_add_toks_to_seq(self, prefix_cacher, seq, t0_logprobs, eos_tok, true).await?;
+            if let CacheInstruction::Reset { .. } = post_op {
+                self.drop_draft_kv(seq_id);
+            }
             handle_post_cache_op(self, input_seqs, post_op);
             return Ok(start.elapsed());
         }
@@ -1044,8 +1582,46 @@ impl Pipeline for MtpSpeculativePipeline {
             finish_or_add_toks_to_seq(self, prefix_cacher, seq, lp, eos_tok, true).await?;
         }
 
+        // ---- Step 7: extend the draft KV over the newly committed tokens ----
+        // `forward_draft_extend_after_decode` (`eagle_worker.py:1134+`): the
+        // verify forward's captured hidden states are the TARGET's states for
+        // the accepted positions, so the draft KV entries for them are rebuilt
+        // from the target's `h` — the chain's own entries beyond the first
+        // used the DRAFT's `h` and are truncated away inside `extend_draft_kv`.
+        //
+        // Its `i <= L-2` bound also guarantees a rejected proposal's hidden
+        // state is never written: `h_i` past the last accepted position pairs
+        // with a token that was not committed.
+        if let Some(mut state) = draft_state {
+            let capture = self.kit.hidden_capture.take();
+            let toks = seq.get_toks().to_vec();
+            match self.extend_draft_kv(&mut state, capture, &toks) {
+                Ok(true) => {}
+                Ok(false) => {
+                    state.poisoned = true;
+                    self.warn_unprimed_once(
+                        "the verify forward's hidden states were not contiguous with the draft KV",
+                    );
+                }
+                Err(e) => {
+                    state.poisoned = true;
+                    tracing::warn!(
+                        target: "mtp_speculative",
+                        "MTP draft-KV extend after verify failed ({e}); drafting disabled for \
+                         this sequence"
+                    );
+                }
+            }
+            self.checkin_draft_kv(seq_id, state);
+        } else {
+            self.kit.hidden_capture.clear();
+        }
+
         // POST cache op (matches what `Pipeline::step` does after a normal
         // forward).
+        if let CacheInstruction::Reset { .. } = post_op {
+            self.drop_draft_kv(seq_id);
+        }
         handle_post_cache_op(self, input_seqs, post_op);
 
         Ok(start.elapsed())
@@ -1180,6 +1756,7 @@ mod tests {
         let lm_w = Tensor::from_vec(lm_data, (vocab, hidden), device)?;
 
         Ok(MtpDecodeKit {
+            hidden_capture: Arc::new(MtpHiddenCapture::default()),
             embed_tokens,
             lm_head: wrap_linear(lm_w),
             h_proj: wrap_linear(h_w),
@@ -1207,6 +1784,67 @@ mod tests {
         Ok(())
     }
 
+    /// The MTP tail must never be resolved below 8 bits, whatever the global
+    /// ISQ request. An int4 draft head measured 0-4% acceptance in the field
+    /// (`EXTERNAL_FINDINGS.md` F3) — the same failure class RUN-161 already
+    /// fixed for `lm_head`.
+    #[test]
+    fn mtp_tail_is_floored_at_int8() {
+        use mistralrs_quant::IsqType as T;
+        let sub_int8 = [
+            T::Q4_0,
+            T::Q4_1,
+            T::Q5_0,
+            T::Q5_1,
+            T::Q2K,
+            T::Q3K,
+            T::Q4K,
+            T::Q5K,
+            T::Q6K,
+            T::HQQ4,
+            T::AFQ2,
+            T::AFQ3,
+            T::AFQ4,
+            T::AFQ6,
+            T::MXFP4,
+            T::NVFP4,
+            T::QtipBitshift2,
+            T::Qtip2b,
+        ];
+        for ty in sub_int8 {
+            assert!(isq_is_sub_int8(ty), "{ty:?} should be classified sub-int8");
+            let floored = floor_mtp_isq(Some(ty)).expect("a Some request stays Some");
+            assert!(
+                !isq_is_sub_int8(floored),
+                "{ty:?} floored to {floored:?}, which is still below int8"
+            );
+        }
+
+        // 8-bit and wider requests pass through untouched — the floor must not
+        // silently change a width the user asked for and can afford.
+        for ty in [
+            T::Q8_0,
+            T::Q8_1,
+            T::Q8K,
+            T::HQQ8,
+            T::AFQ8,
+            T::F8E4M3,
+            T::F8Q8,
+        ] {
+            assert!(!isq_is_sub_int8(ty));
+            assert_eq!(floor_mtp_isq(Some(ty)), Some(ty));
+        }
+
+        // No ISQ requested -> nothing to floor.
+        assert_eq!(floor_mtp_isq(None), None);
+
+        // Family preserved where an 8-bit sibling exists, so the floored
+        // tensor keeps using its neighbours' kernels.
+        assert_eq!(floor_mtp_isq(Some(T::AFQ2)), Some(T::AFQ8));
+        assert_eq!(floor_mtp_isq(Some(T::HQQ4)), Some(T::HQQ8));
+        assert_eq!(floor_mtp_isq(Some(T::Qtip2b)), Some(T::Q8_0));
+    }
+
     /// `argmax_token` returns the index of the max value as u32.
     #[test]
     fn argmax_token_picks_max() -> Result<()> {
@@ -1229,7 +1867,7 @@ mod tests {
         let prev_hidden = Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0], (1, hidden), &device)?;
         let depth = 3;
         let max_tokens = 16;
-        let tokens = kit.propose_chain(&prev_hidden, 0, depth, max_tokens, 0)?;
+        let tokens = kit.propose_chain(&prev_hidden, 0, depth, max_tokens, 0, None)?;
         assert_eq!(tokens.len(), depth, "should return exactly depth tokens");
         // All proposed token ids should be within vocab range.
         for t in &tokens {
@@ -1371,7 +2009,7 @@ mod tests {
         let prev_hidden = Tensor::zeros((1, hidden), DType::F32, &device)?;
 
         // depth=5, max_tokens=2 → exactly 2 tokens.
-        let tokens = kit.propose_chain(&prev_hidden, 0, 5, 2, 0)?;
+        let tokens = kit.propose_chain(&prev_hidden, 0, 5, 2, 0, None)?;
         assert_eq!(
             tokens.len(),
             2,
@@ -1379,15 +2017,15 @@ mod tests {
         );
 
         // depth=4, max_tokens=4 → exactly 4 (equality holds).
-        let tokens = kit.propose_chain(&prev_hidden, 0, 4, 4, 0)?;
+        let tokens = kit.propose_chain(&prev_hidden, 0, 4, 4, 0, None)?;
         assert_eq!(tokens.len(), 4);
 
         // max_tokens=0 → empty chain regardless of depth.
-        let tokens = kit.propose_chain(&prev_hidden, 0, 8, 0, 0)?;
+        let tokens = kit.propose_chain(&prev_hidden, 0, 8, 0, 0, None)?;
         assert!(tokens.is_empty(), "max_tokens=0 must return no tokens");
 
         // depth=0 → empty chain regardless of max_tokens.
-        let tokens = kit.propose_chain(&prev_hidden, 0, 0, 8, 0)?;
+        let tokens = kit.propose_chain(&prev_hidden, 0, 0, 8, 0, None)?;
         assert!(tokens.is_empty(), "depth=0 must return no tokens");
 
         Ok(())
@@ -1474,7 +2112,7 @@ mod tests {
         let mut total_accepted = 0usize;
         // Walk 32 / depth = 8 cycles — one MTP draft + verify per iteration.
         for _cycle in 0..8 {
-            let proposed = kit.propose_chain(&prev_hidden, prev_tok, depth, depth, 0)?;
+            let proposed = kit.propose_chain(&prev_hidden, prev_tok, depth, depth, 0, None)?;
             assert_eq!(
                 proposed.len(),
                 depth,

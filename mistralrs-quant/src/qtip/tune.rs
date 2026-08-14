@@ -120,6 +120,46 @@ pub fn forced_gemv_variant() -> Option<u32> {
     (cur >= 0).then_some(cur as u32)
 }
 
+// Speculative kernel pin: UNINIT until first read (then latched from the env).
+const SPEC_PIN_UNINIT: i8 = -1;
+static SPEC_PIN: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(SPEC_PIN_UNINIT);
+
+/// Pin single-token QTIP forwards onto the SAME kernel multi-token forwards
+/// use (dequantize + GEMM), instead of the fused in-register GEMV.
+///
+/// **Why this knob exists.** Speculative decode runs the draft one token at a
+/// time and the verify over `depth` tokens, so the *same weights* are read by
+/// two different kernels — fused GEMV at `n_tokens == 1`
+/// (`bitshift.rs`/`mod.rs` `forward_dequantize_cuda`) and dequantize+cuBLAS
+/// above it. Different accumulation orders give slightly different logits, and
+/// MTP verification accepts on **exact `u32` argmax equality**, so every
+/// near-tie the kernel switch flips is a spurious rejection. An external
+/// engine (colibrì) ships an equivalent pin because this silently destroyed
+/// their acceptance rate.
+///
+/// **Default OFF.** Turning it on costs real decode throughput — the fused
+/// GEMV is the entire point of the 2-bit trellis format — so it must be
+/// measured on GPU before it could ever become a default. Set
+/// `ARC_SPEC_PIN=1` to A/B acceptance with the kernel family held constant.
+///
+/// Note this is orthogonal to [`forced_gemv_variant`], which only selects
+/// among launch configurations *inside* the GEMV arm and cannot change which
+/// arm is taken.
+pub fn spec_pin_gemm() -> bool {
+    let mut cur = SPEC_PIN.load(Ordering::SeqCst);
+    if cur == SPEC_PIN_UNINIT {
+        let init = i8::from(
+            std::env::var("ARC_SPEC_PIN")
+                .ok()
+                .is_some_and(|v| !matches!(v.trim(), "" | "0" | "false" | "off")),
+        );
+        let _ =
+            SPEC_PIN.compare_exchange(SPEC_PIN_UNINIT, init, Ordering::SeqCst, Ordering::SeqCst);
+        cur = SPEC_PIN.load(Ordering::SeqCst);
+    }
+    cur == 1
+}
+
 #[derive(Deserialize)]
 struct TuneFile {
     winners: Vec<GemvTuneEntry>,

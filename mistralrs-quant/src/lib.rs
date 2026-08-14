@@ -87,7 +87,8 @@ pub use qtip::tune::{
     gemv_num_variants as qtip2b_gemv_num_variants, gemv_variant_applicable,
     gemv_variant_desc as qtip2b_gemv_variant_desc,
     gemv_variant_for_shape as qtip2b_gemv_variant_for_shape, set_forced_gemv_variant,
-    GemvTuneEntry, GemvVariantDesc, QTIP2B_GEMV_BAKED_TABLE, QTIP2B_GEMV_VARIANT_LEGACY,
+    spec_pin_gemm, GemvTuneEntry, GemvVariantDesc, QTIP2B_GEMV_BAKED_TABLE,
+    QTIP2B_GEMV_VARIANT_LEGACY,
 };
 pub use qtip::{
     gpu_quantize_cpu_fallback_count, ExpertBpwTable, Qtip2bLayer, QtipLayer, QtipMode,

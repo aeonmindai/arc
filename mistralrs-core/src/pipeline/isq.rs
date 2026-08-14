@@ -416,6 +416,18 @@ pub trait IsqModel {
         0
     }
 
+    /// Number of TRAILING entries of `get_layers()` that live on the MTP draft
+    /// path and must therefore respect the 8-bit floor
+    /// ([`crate::pipeline::mtp_pipeline::floor_mtp_isq`]).
+    ///
+    /// Separate from [`Self::mtp_isq_tail_len`] on purpose: that one is the
+    /// UQFF *naming* boundary and cannot move without renaming every tensor in
+    /// existing artifacts, while this one also has to cover the always-loaded
+    /// `h_proj`/`e_proj` heads, which sit just ahead of the block's tensors.
+    fn mtp_isq_floor_len(&mut self) -> usize {
+        self.mtp_isq_tail_len()
+    }
+
     /// UQFF fallback: called by [`Self::load_from_artifacts`] when the
     /// artifact does not cover the model's MTP decoder block (it was baked
     /// without `--mtp-depth`) but the block was requested for this load.
@@ -538,6 +550,7 @@ pub trait IsqModel {
             // Must be computed before `get_layers` takes its `&mut self`
             // borrows. Both layer organizations append the same MTP tail.
             let mtp_tail = self.mtp_isq_tail_len();
+            let mtp_floor_tail = self.mtp_isq_floor_len();
 
             let (mut tensors, mapper) = match organization {
                 IsqOrganization::Default => self.get_layers(),
@@ -549,6 +562,9 @@ pub trait IsqModel {
             // `main_len..` are the optional MTP decoder block, serialized
             // under `mtp.<j>` names (see UQFF_MTP_TENSOR_PREFIX).
             let main_len = total_tensors.saturating_sub(mtp_tail);
+            // Where the MTP draft path starts for FLOOR purposes — see
+            // `mtp_isq_floor_len`. Always <= `main_len`.
+            let mtp_floor_start = total_tensors.saturating_sub(mtp_floor_tail);
             let artifact_tensor_name = move |i: usize| {
                 if i < main_len {
                     i.to_string()
@@ -609,7 +625,7 @@ pub trait IsqModel {
                 });
 
                 let mut devices_and_dtypes = Vec::new();
-                for (_, layer_num) in &tensors {
+                for (i, (_, layer_num)) in tensors.iter().enumerate() {
                     let device = if let Some(ref layers) = layers {
                         if let Some(layer) = layer_num {
                             layers
@@ -635,6 +651,20 @@ pub trait IsqModel {
                         } else {
                             dtype
                         }
+                    } else {
+                        dtype
+                    };
+                    // The MTP draft path is floored at 8 bits.
+                    //
+                    // These tensors carry `layer_num: None`, which resolves to
+                    // the GLOBAL requested dtype unconditionally — and, being
+                    // index-less, `--topology` cannot reach them either, so a
+                    // user could not raise them even deliberately. `--isq
+                    // qtip2b` therefore put the MTP draft head at 2 bits, on
+                    // the flagship path, silently. See `floor_mtp_isq` for why
+                    // that is not survivable for a speculative draft head.
+                    let dtype = if i >= mtp_floor_start {
+                        crate::pipeline::mtp_pipeline::floor_mtp_isq(dtype)
                     } else {
                         dtype
                     };
