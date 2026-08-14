@@ -1,5 +1,37 @@
 // QTIP gmin-only exhaustive Viterbi trellis quantize kernel (K=4 / V=2 / L=16).
 //
+// ⛔ MEASURED VERDICT (wave19-AP, A30 sm_80, one binary, one data set, best-of-4):
+// THIS KERNEL IS SLOWER THAN THE BEAM IT WAS BUILT TO REPLACE. DO NOT SHIP IT.
+//
+//   1344 rows x k_in=7168        beam W=256   this kernel   ratio
+//   ------------------------------------------------------------
+//   Gaussian LUT codebook          998.0 ms     1035.0 ms    0.96x
+//   computed codebook              551.7 ms      625.8 ms    0.88x
+//
+// It is correct — byte-identical to the exhaustive DP at both test shapes — and
+// it does everything the design predicted: ONE `__syncthreads()` per symbol
+// position against the beam's measured 15.7, no atomics, no divergence, the
+// same 4 blocks/SM. That bought a 4% REGRESSION. Barriers were not the
+// constraint, and this is the third architectural prediction in this program to
+// die that way.
+//
+// The arithmetic that explains it: exhaustive must relax 65,536
+// (state, predecessor) pairs per position — the information-theoretic floor,
+// which both this codebase (qtip_quantize.cu:356-378, Phase A) and EXL3 already
+// sit on — at ~8 ops each, i.e. ~524k thread-ops per row-position against the
+// post-stack beam's ~315k. It starts 1.66x behind on instruction count and has
+// to win all of it back on issue efficiency. It won back all but 4%.
+//
+// What the exercise DID find is that the codebook, not the search, is the
+// lever, and that it is worth MORE to the beam (1.81x) than to this kernel
+// (1.60x) — the opposite of what a traffic model predicts, because the loads it
+// removes from the beam are scattered and dependent rather than streamed. See
+// `QB_COMPUTED_CB` in qtip_beam.cu.
+//
+// Kept in tree as the evidence for that conclusion and because
+// `gmin_replay_matches_exhaustive_bit_for_bit` pins the recursion. Full log:
+// memory/mission/wave19-AP-gmin-exhaustive.md.
+//
 // WHAT THIS IS
 // ------------
 // The exhaustive DP in `qtip_quantize.cu` materialises the full 2^L = 65,536
