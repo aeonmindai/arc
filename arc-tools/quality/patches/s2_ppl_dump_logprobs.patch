@@ -1,0 +1,72 @@
+diff --git a/mistralrs/examples/advanced/perplexity/main.rs b/mistralrs/examples/advanced/perplexity/main.rs
+index 99b1c21a3..9ba527510 100644
+--- a/mistralrs/examples/advanced/perplexity/main.rs
++++ b/mistralrs/examples/advanced/perplexity/main.rs
+@@ -49,6 +49,14 @@ struct Args {
+     /// sparse-attention paths.
+     #[arg(long, default_value_t = 1024)]
+     chunk_size: usize,
++
++    /// Dump per-token TARGET-token logprobs to this NDJSON file (one line per
++    /// chunk: `{"chunk":i,"tokens":[...],"logprobs":[...]}`). Feeds the
++    /// offline twin-seed ensemble analysis
++    /// (`arc-tools/quality/ensemble_ppl.py`): two dumps over the same corpus
++    /// from different bakes can be probability-averaged without rerunning.
++    #[arg(long)]
++    dump_logprobs: Option<PathBuf>,
+ }
+ 
+ async fn process_chunk(runner: &MistralRs, chunk: Vec<u32>) -> anyhow::Result<(Tensor, Vec<u32>)> {
+@@ -136,6 +144,12 @@ async fn main() -> Result<()> {
+ 
+     let n_chunks = tokens.len().div_ceil(prompt_chunksize);
+     let mut ppl_measurements = Vec::new();
++    let mut dump_file = match &args.dump_logprobs {
++        Some(p) => Some(std::io::BufWriter::new(
++            std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
++        )),
++        None => None,
++    };
+     for (i, chunk) in tokens.chunks(prompt_chunksize).enumerate() {
+         let start = Instant::now();
+         let (logits, tokens) = {
+@@ -151,6 +165,23 @@ async fn main() -> Result<()> {
+ 
+         let loss_fct = cross_entropy_loss(&shift_logits, &shift_labels)?;
+         let perplexity = loss_fct.exp()?.to_scalar::<f32>()?;
++
++        if let Some(f) = dump_file.as_mut() {
++            use std::io::Write;
++            let logprobs = candle_nn::ops::log_softmax(&shift_logits, 1)?;
++            let target_lp: Vec<f32> = logprobs
++                .gather(&shift_labels.unsqueeze(1)?, 1)?
++                .squeeze(1)?
++                .to_vec1::<f32>()?;
++            let toks: Vec<String> = tokens[1..].iter().map(|t| t.to_string()).collect();
++            let lps: Vec<String> = target_lp.iter().map(|v| format!("{v:.6}")).collect();
++            writeln!(
++                f,
++                "{{\"chunk\":{i},\"tokens\":[{}],\"logprobs\":[{}]}}",
++                toks.join(","),
++                lps.join(",")
++            )?;
++        }
+         let end = Instant::now();
+ 
+         ppl_measurements.push(perplexity);
+@@ -163,6 +194,15 @@ async fn main() -> Result<()> {
+         );
+     }
+ 
++    if let Some(mut f) = dump_file {
++        use std::io::Write;
++        f.flush()?;
++        println!(
++            "Dumped per-token logprobs to `{}`.",
++            args.dump_logprobs.as_ref().unwrap().display()
++        );
++    }
++
+     let mean = ppl_measurements.iter().sum::<f32>() / ppl_measurements.len() as f32;
+     let variance = ppl_measurements
+         .iter()

@@ -1,0 +1,53 @@
+diff --git a/mistralrs-core/src/pipeline/mtp_pipeline.rs b/mistralrs-core/src/pipeline/mtp_pipeline.rs
+index 54494a45a..aadac8252 100644
+--- a/mistralrs-core/src/pipeline/mtp_pipeline.rs
++++ b/mistralrs-core/src/pipeline/mtp_pipeline.rs
+@@ -450,14 +450,44 @@ impl MtpSpeculativePipeline {
+     }
+ 
+     /// Record acceptance counters from a verify result.
++    ///
++    /// With `ARC_MTP_LOG_ACCEPTANCE=1` set on the server process, the running
++    /// acceptance rate is logged (via [`Self::log_acceptance_rate`]) every
++    /// [`ACCEPTANCE_LOG_EVERY_PROPOSED`] proposed tokens, so a GPU session can
++    /// measure MTP acceptance from the serve log alone (`grep "MTP acceptance"`).
++    /// Off by default: the counters otherwise have no caller-facing sink.
+     pub(crate) fn record_acceptance(&self, proposed: usize, accepted: usize) {
+-        self.proposed_count
+-            .fetch_add(proposed, std::sync::atomic::Ordering::Relaxed);
+-        self.accepted_count
+-            .fetch_add(accepted, std::sync::atomic::Ordering::Relaxed);
++        use std::sync::atomic::Ordering;
++        let total = self.proposed_count.fetch_add(proposed, Ordering::Relaxed) + proposed;
++        self.accepted_count.fetch_add(accepted, Ordering::Relaxed);
++        if acceptance_log_enabled()
++            && proposed > 0
++            && total / ACCEPTANCE_LOG_EVERY_PROPOSED
++                != (total - proposed) / ACCEPTANCE_LOG_EVERY_PROPOSED
++        {
++            self.log_acceptance_rate();
++        }
+     }
+ }
+ 
++/// Log the running MTP acceptance rate once per this many proposed tokens
++/// (~every 32 decode steps at depth 2 — a line every handful of seconds at
++/// single-digit tok/s, without flooding the serve log).
++const ACCEPTANCE_LOG_EVERY_PROPOSED: usize = 64;
++
++/// `ARC_MTP_LOG_ACCEPTANCE=1` (or `true`) — env-gated MTP acceptance-rate
++/// telemetry in the serve log (RUN-161 GPU-session measurement).
++fn acceptance_log_enabled() -> bool {
++    use std::sync::OnceLock;
++    static ENABLED: OnceLock<bool> = OnceLock::new();
++    *ENABLED.get_or_init(|| {
++        matches!(
++            std::env::var("ARC_MTP_LOG_ACCEPTANCE").as_deref(),
++            Ok("1") | Ok("true")
++        )
++    })
++}
++
+ /// Verification result against the target model's correct next tokens.
+ ///
+ /// Mirrors `arc_engine::mtp::VerifyResult` — duplicated locally because
