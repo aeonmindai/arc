@@ -12,10 +12,10 @@ difference is stated inline.
 | | |
 |---|---|
 | Model | DeepSeek V4 Flash — 284B logical / 13B active MoE (HF-verified: model card + release announcement + config geometry, 43 layers / 256+1 experts) |
-| Artifact | **74.18 GB** UQFF bake, **8 shards + residual** (15 files): 2-bit trellis (qtip2) experts + FP8 attention; `lm_head` and the context compressor excluded from 2-bit. Published as `aeonmind/DeepSeek-V4-Flash-UQFF-qtip2`; size and file count **verified against the HF API**, not the uploader's report. Loads in 12.94 s / 517 tensors. Earlier docs said "68 GB / 7 shards" — that was a pre-publication estimate |
-| Hardware | 1× NVIDIA H200 (141 GB HBM3e), rented via Runcrate (NY), $4.92/hr |
+| Artifact | **74.19 GB** UQFF bake, **8 shards + residual** (15 files): 2-bit trellis (qtip2) experts; `lm_head` and the context compressor excluded from 2-bit. Published as `aeonmind/DeepSeek-V4-Flash-UQFF-qtip2`; size and file count **verified against the HF API** and again on disk. ⚠️ **Not standalone** — it is an overlay that requires the source checkpoint at `-m`; see the banner below |
+| Hardware | 1× NVIDIA H200. Sessions 1–4: Runcrate **New York**, $4.92/hr. Session 5: Runcrate **Helsinki**, **$4.85/hr**. `nvidia-smi` reports **143,771 MiB = 150.75 GB decimal = 140.40 GiB**; NVIDIA's "141 GB" spec figure is really ~141 **GiB** (see the units note under session 5) |
 | Engine | Arc (this repo), CUDA + flash-attn build; serve via OpenAI-compatible HTTP API |
-| Sessions | Session 1: 2026-08-12T23:31Z, 9.2 h. Session 2: 2026-08-13T12:47Z (re-bake with the Viterbi encoder fix, PR #9). Session 3: 2026-08-13T20:31Z, ≈6.2 h (throughput session: all kernel-fix PRs #8/#10/#14/#15 in the build; token budget raised to 2048). Session 4: 2026-08-14T03:35Z, ≈3 h (payoff session: GEMV autotune sweep, grouped-GEMM batch curve, no-cudnn rebuild) |
+| Sessions | Session 1: 2026-08-12T23:31Z, 9.2 h. Session 2: 2026-08-13T12:47Z (re-bake with the Viterbi encoder fix, PR #9). Session 3: 2026-08-13T20:31Z, ≈6.2 h (throughput session: all kernel-fix PRs #8/#10/#14/#15 in the build; token budget raised to 2048). Session 4: 2026-08-14T03:35Z, ≈3 h (payoff session: GEMV autotune sweep, grouped-GEMM batch curve, no-cudnn rebuild). Session 5: 2026-08-15T11:37Z (first end-to-end **batched serving** measurement; found the published artifact non-loadable and re-baked in situ) |
 
 ## Headline results (latest measured session per row)
 
@@ -28,8 +28,55 @@ difference is stated inline.
 | Perplexity (session 2) | **12.50 ± 3.46** | 70 × 1024-token chunks, wiki mini-corpus (`wiki.test_small`) | See corpus caveat below |
 | Long context (session 2) | **5/5 coherence + 4/4 needle** | greedy; ablation matrix below | — |
 | Decode speed (b=1, session 4) | **14.58 tok/s** | single stream, 256 decode tokens, 525-token prompt; prefill ~57 tok/s, TTFT ~9.2 s; build **without** the `cudnn` feature (see pitfall below) | Progression 5.4 → 13.99 → 14.58 across the kernel-fix PRs; see kernel profile below |
-| Grouped-GEMM batch curve (session 4) | **~63.5 ms/step flat from B=16 to B=64 ⇒ ~1,006 aggregate tok/s** on one H200 | **kernel-level microbench** of the batched 2-bit MoE expert path (40 MoE layers extrapolation), not end-to-end serving | Expert-read amortization demonstrated exactly as designed; the full batched-serving number is pending (planned session 5) |
+| Grouped-GEMM batch curve (session 4) | **~63.5 ms/step flat from B=16 to B=64 ⇒ ~1,006 aggregate tok/s** on one H200 | **kernel-level microbench** of the batched 2-bit MoE expert path (40 MoE layers extrapolation), not end-to-end serving | **NOT reproduced end-to-end.** Session 5 measured **8.14 tok/s aggregate at B=64** through the server — two orders of magnitude below this projection. See the batched-serving section |
+| **Batched serving (session 5)** — the fleet number | **peak aggregate 15.35 tok/s, at B=1**; B=8 14.83, B=16 10.31, B=32 5.07, B=64 8.14 | end-to-end through the OpenAI-compatible server, `--max-seqs 128`, 64 decode tokens, `effective_B == B` on every row, 0 errors in 121 requests, $4.85/hr | Aggregate **falls** with batch size. Prefill scales 4.8× (11.09 → 52.71 tok/s server-instrumented); decode does not |
 
+> ### ⚠️ Aggregate throughput FALLS as batch size rises — session 5 [measured]
+>
+> The first end-to-end batched serving measurement through the real server.
+> **Peak aggregate throughput across the whole sweep is at B=1.**
+>
+> ```
+> B=1  15.35 tok/s   B=8  14.83   B=16  10.31   B=32  5.07   B=64  8.14
+> ```
+>
+> A single H200 serving 32 concurrent users delivers **one third** the total
+> throughput of the same card serving one user, at **3.0×** the cost per token
+> ($265.72 vs $87.77 per Mtok @ $4.85/hr). `effective_B == B` on every row,
+> every concurrency verdict `pass`, 0 errors in 121 requests — this is not a
+> capped or vacuous measurement. Full table and controls below.
+>
+> **Prefill does scale**: server-instrumented prefill rises **4.8×** from B=1 to
+> B=64 (11.09 → 52.71 tok/s). The compute-bound leg amortizes; the
+> bandwidth-bound decode leg does not. Measured B=64 aggregate is **~0.2% of the
+> 4,141 tok/s roofline**, and the grouped-GEMM microbenchmark's projected
+> ~1,006 tok/s at B=64 is **not reproduced end-to-end by two orders of
+> magnitude**. That gap is the open question.
+>
+> ### ⚠️ The published UQFF artifact is not standalone — session 5 [measured]
+>
+> `aeonmind/DeepSeek-V4-Flash-UQFF-qtip2` (74.19 GB, 15 files) **loads and
+> serves — but only when `-m` points at the SOURCE checkpoint**, not at the
+> artifact:
+>
+> | invocation | result |
+> |---|---|
+> | `-m <ARTIFACT dir> --from-uqff <artifact>/qtip2-0.uqff` | **fails** — `DummyLayer not replaced at index 1, layer Some(0)` |
+> | `-m <SOURCE checkpoint> --from-uqff <artifact>/qtip2-0.uqff` | **works** — 3 m 10 s cold load, 75,859 MiB, generation 3/3 |
+>
+> The artifact is an **overlay of quantized experts**, not a self-contained
+> model: `residual.safetensors` carries 575 tensors (embeddings, norms, router
+> gates, compressor) and **zero** attention projections or shared-expert
+> weights; the `.uqff` shards carry 171 quantized tensors against a ~512-slot
+> graph. `paths.rs:365-386` decides which weight files are used from `-m`, so
+> pointing it at the source supplies the rest.
+>
+> **The model card documents the failing form** (`-m <the artifact repo>`), so a
+> user following it cannot load the model, and `DummyLayer not replaced at index
+> 1` gives them nothing to act on. Either the packaging or the card needs to
+> change, and the bake should assert at write time that the quantized set and
+> the residual cover the model between them.
+>
 > ### GSM8K 87.0% is PROVISIONAL — the decode math changed after it was measured
 >
 > It was honestly measured under the protocol stated above (**n=100, 0-shot chat,
@@ -106,6 +153,64 @@ intact.
 | Trellis grouped-GEMM (batched 2-bit MoE, Stage 4) | **5/5 parity tests passed on H200** (session 3 — first hardware run of the keystone kernel: deterministic output, CPU-reference match on ragged expert-group shapes, tile-map partitioning, descriptor table, window-state recurrence). Batched throughput curve measured at kernel level in session 4 — see below |
 | Sinkhorn fused kernel vs reference path | **Token-identical** on 6/6 greedy 128-token prompts, and perplexity **bit-identical** — after the PR #8 identity fix. (Session 1, pre-fix: rejected with 4/6 token divergence — recorded, fixed, re-validated.) The fused path is now on by default (PR #15) |
 | MLA absorbed decode vs non-absorbed | **Token-identical** on 6/6 prompts |
+
+## Batched serving — the fleet-capacity measurement (session 5) [measured]
+
+The first end-to-end batched measurement through the real server. **b=1 is a
+diagnostic row and is never the headline** — but on this build it is also,
+unfortunately, the peak.
+
+**Protocol.** 1× H200 @ **$4.85/hr** (Helsinki). arc `092b0967b`,
+`cuda flash-attn`, no `cudnn`. Model quantized **in situ** from the source
+checkpoint to qtip2 (`ARC_QTIP_BEAM=32`, `ARC_QTIP_EXPERT_BATCH=8`) — not the
+published artifact (see banner). Server `--max-seqs 128 --prefix-cache-n 0`
+with the V4 chat template. Probe `arc-tools/quality/batch_load_probe.py`,
+`/v1/chat/completions` streaming, distinct ~68-token prompts, **64 decode
+tokens, 1 rep**, `--max-ctx 118000`, temperature 0. Post-load footprint
+**89,543 MiB of 143,771 MiB**.
+
+| B | prefill agg tok/s (TTFT-derived, **lower bound**) | prefill agg tok/s (server-instrumented, **compute only**) | decode tok/s per user (p50) | **decode AGGREGATE tok/s** | TTFT p50/p95 (s) | $/Mtok @ $4.85/hr | effective_B |
+|---|---|---|---|---|---|---|---|
+| 1 *(diagnostic)* | 11.08 | 11.09 | 15.11 | **15.35** | 5.78 / 5.78 | **87.77** | 1 |
+| 8 | 18.67 | 19.12 | 2.705 | **14.83** | 17.31 / 28.17 | 90.84 | 8 |
+| 16 | 17.85 | 18.79 | 1.18 | **10.31** | 28.11 / 47.83 | 130.67 | 16 |
+| 32 | 18.90 | 32.07 | 0.21 | **5.07** | 32.82 / 110.66 | 265.72 | 32 |
+| 64 | 36.37 | 52.71 | 0.175 | **8.14** | 37.53 / 115.03 | 165.51 | 64 |
+
+**Prefill and decode are never blended** — they have different bottlenecks and
+both prefill columns carry their method label. Prefill is the good news:
+server-instrumented prefill rises **4.8×** across the sweep, so the
+compute-bound grouped-GEMM leg amortizes across a batch as designed. Decode
+aggregate falls.
+
+**Controls, because a probe that measures nothing still prints a number:**
+
+- `effective_B == B` on all five rows; every concurrency verdict `pass`;
+  **0 errors in 121 requests**. Concurrency is measured from per-request decode
+  window overlap, not from how the client launched them.
+- The probe's failure detector was mutation-tested **on this box**:
+  `mutation(serial): probe exited 1, effective_B 1/4 — the assertion CAN fail`,
+  and `mutation(cap 2 of 8): FAIL at default gate`.
+- Not KV-bound: the guard put B=64 at ~8,448 tokens against a 118,000-token
+  budget; no `WARNING[KV]` on any row.
+- Not client-bound: no `WARN[CLIENT]`; 44 cores.
+- Not a bad bake: b=1 measured 15.35 tok/s against the session-4 historical
+  14.58 tok/s.
+
+The engine's own scheduler corroborates independently — at B=8 it logs
+`5 running, 3 waiting`; at B=64, `32 running, 32 waiting`. The requests do
+overlap; they just slow down faster than concurrency grows.
+
+**Against the roofline** (74.19 GB ÷ 4.8 TB/s = 15.46 ms/step ⇒ ~4,141 tok/s at
+B=64): the measured B=64 aggregate is **~0.2%** of the bandwidth bound. Note the
+roofline ignores KV traffic and assumes 100% of theoretical peak; at a realistic
+70–85% it would be ~3,300–3,500 tok/s. Either way the served path is nowhere
+near it.
+
+> **This is a negative result and it is reported as one.** The footprint claim —
+> V4-Flash on **one** H200 at 69.10 GiB where the smallest published artifact of
+> any kind is 142.00 GiB — is measured and stands. The *throughput* half of the
+> fleet-capacity thesis is not yet earned.
 
 ## Decode speed and kernel profile
 
