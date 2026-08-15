@@ -4,7 +4,35 @@
 // dispatch entry (`launch_qtip2b_gemv_tuned_*`, which forwards here).
 //
 // -------------------------------------------------------------------------
-// Why a second grid
+// MEASURED VERDICT (wave23-AT): this grid LOSES to gen-1. Do not ship it.
+// -------------------------------------------------------------------------
+// First actual speed measurement of these 54 variants (they had only ever
+// been parity-checked). Full 98-variant sweep, A30 sm_80, E=64, iters=150,
+// peak 933 GB/s, both V4 decode shapes, zero variants skipped on gate:
+//
+//   gate N=2048 K=4096 : best gen-1 v6  144 GB/s (15.4% peak)
+//                        best gen-2 v54 132 GB/s (14.2%) -- rank 11, -8.3%
+//   down N=4096 K=2048 : best gen-1 v6  140 GB/s (15.0% peak)
+//                        best gen-2 v54 125 GB/s (13.4%) -- rank  9, -10.7%
+//
+// Every structural axis this file was built to exploit measured NEGATIVE
+// (gate, best-in-class GB/s): split-K KS=1 132 -> KS=2 115 -> KS=4 110;
+// staged width W=2 132 -> W=4 119 -> W=8 73; producer-warp specialization
+// pw0 132 -> pw1 82 (-38%). Only STAGES=3 > STAGES=2 (132 vs 122) and a
+// mild ILP=2 optimum survived, and the best gen-2 variant
+// (g2_w8_r4_i2_v2_k1_st3) is precisely the one that most closely imitates
+// gen-1's winner geometry -- i.e. cp.async staging buys nothing here and its
+// smem traffic + barrier structure costs ~8-11%.
+//
+// Read: at ~15% of peak this GEMV is NOT latency-bound, so hiding latency
+// harder cannot help; the ceiling is elsewhere (per-symbol trellis decode
+// serialization). The premise below is preserved as written because it is
+// what the grid tested -- it is now known to be the WRONG diagnosis, and the
+// next attempt should target decode throughput, not memory latency.
+// Percentages of peak transfer across cards; absolute GB/s does not.
+//
+// -------------------------------------------------------------------------
+// Why a second grid (original premise -- disproven above)
 // -------------------------------------------------------------------------
 // The session-4 H200 sweep of the gen-1 grid put the winner at the SHALLOW
 // edge: w4_r2_i1_v2 / w8_r4_i1_v2, 36 us at b=1 and ~467-489 GB/s marginal
