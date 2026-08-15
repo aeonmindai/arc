@@ -163,7 +163,7 @@ I reported this as a fabricated competitor comparison. On investigation it is
 **two** fabrications, and the second was not in the brief:
 
 1. **The competitor half.** We have never benchmarked SGLang or vLLM.
-2. 🔴 **Arc's own 33 tok/s is equally unmeasured.** Verified: `grep -rin
+2. 🔴 **Arc's own 33 tok/s is equally unmeasured.** Verified: `grep -rni
    'B200\|Qwen3-32B'` across all of `memory/mission/` returns **zero** hits in
    `FACTS.md` and zero in every wave log. **No B200 was ever rented.**
    `memory/project_cuda_graph_findings.md` says "Ready for single deploy to
