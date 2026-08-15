@@ -417,9 +417,8 @@ qtip_quantize_rows_beam_kernel(
                 #pragma unroll
                 for (int j = 0; j < (int)QB_ALPHABET; ++j) {
                     const unsigned int x0 = prod0 + (unsigned int)j * cb_mult;
-                    const unsigned int x1 = x0 * cb_mult;
-                    const float err = qtip_decode_err_exact_lv(
-                        qtip_cb_fold(x0), qtip_cb_fold(x1), t0, t1);
+                    const float2 c = qtip_cb_pair_from_x0(x0, cb_mult);
+                    const float err = qtip_decode_err_exact_lv(c.x, c.y, t0, t1);
                     cand[j] = qtip_total_order_key(__fadd_rn(gcost, err));
                 }
             } else {

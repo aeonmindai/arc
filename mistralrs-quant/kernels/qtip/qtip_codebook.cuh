@@ -74,12 +74,23 @@ __device__ __forceinline__ float qtip_cb_fold(unsigned int x) {
     return __fadd_rn(hi, lo);
 }
 
+// The V=2 codeword pair, given the FIRST MCG product `x0 = state * mult`.
+//
+// Split out from `qtip_cb_sum2` so the beam kernel — which reaches its 16
+// successors by strength-reducing `(base|j) * mult` to `base*mult + j*mult`,
+// and so already holds `x0` — shares this arithmetic instead of restating it.
+// The duplicate cost a real mutation its teeth: changing `x1 = x0 * mult` here
+// used to leave the beam kernel untouched, so the bake parity gate could not
+// see it (measured, wave24-AU mutation M3).
+__device__ __forceinline__ float2 qtip_cb_pair_from_x0(unsigned int x0, unsigned int mult) {
+    const unsigned int x1 = x0 * mult;   // chained — this is what makes it V=2
+    return make_float2(qtip_cb_fold(x0), qtip_cb_fold(x1));
+}
+
 // The V=2 codeword pair for trellis `state`. `mult` is the MCG multiplier
 // (`QTIP_MCG_V2_MULT` on the Rust side).
 __device__ __forceinline__ float2 qtip_cb_sum2(unsigned int state, unsigned int mult) {
-    const unsigned int x0 = state * mult;
-    const unsigned int x1 = x0 * mult;
-    return make_float2(qtip_cb_fold(x0), qtip_cb_fold(x1));
+    return qtip_cb_pair_from_x0(state * mult, mult);
 }
 
 // ---------------------------------------------------------------------------
