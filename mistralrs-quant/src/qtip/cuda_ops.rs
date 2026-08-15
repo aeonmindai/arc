@@ -390,6 +390,10 @@ pub(crate) fn gather_gemv_cuda(
     if idx_pairs != n_pairs {
         candle_core::bail!("QTIP gather gemv CUDA: indices len {idx_pairs} != n_pairs {n_pairs}");
     }
+    // The kernel maps one pair to one `grid.y` index. Past `maxGridSize[1]` the
+    // launch fails, the `extern "C"` launcher discards the status, and the
+    // caller silently receives the zero-initialized output buffer below.
+    super::gather_policy::check_gather_gemv_pairs(n_pairs, "QTIP gather gemv CUDA")?;
     let x_2d = x_rotated.contiguous()?;
     let indices = indices.flatten_all()?.contiguous()?;
 
@@ -1366,6 +1370,9 @@ pub(crate) fn gather_gemv_2b_cuda(
     if idx_pairs != n_pairs {
         candle_core::bail!("qtip2b gather gemv CUDA: indices len {idx_pairs} != n_pairs {n_pairs}");
     }
+    // One pair per `grid.y` index; past `maxGridSize[1]` the launch fails
+    // silently and the zero-filled output buffer is returned as if valid.
+    super::gather_policy::check_gather_gemv_pairs(n_pairs, "qtip2b gather gemv CUDA")?;
     let x_2d = x_rotated.contiguous()?;
     let indices = indices.flatten_all()?.contiguous()?;
 
