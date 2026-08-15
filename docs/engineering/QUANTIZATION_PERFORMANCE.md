@@ -139,7 +139,7 @@ extrapolated]. Converted to the H200 measurement (225.2 s kernel + ~16 s host):
 
 | | kernel | + host |
 |---|---|---|
-| banked today (1.21× stack) | 186 s | **202 s/layer** [projected from the A30 ratio] |
+| banked today (**≤1.21×** stack — upper bound, see caveat) | 186 s | **202 s/layer** [projected from the A30 ratio] |
 | every remaining identity-safe idea lands perfectly (3.47×) | 65 s | **81 s/layer** [projected] |
 
 So **45–50 s/layer of kernel with byte-identical output is not reachable from
@@ -302,7 +302,25 @@ authority. What replaced it is a *descriptive* model anchored to measurements
 that predicts no wall time and fails CI if the kernel changes without
 re-measurement.
 
-**2. "The optimization stack will be 1.80–2.07×." Measured 1.21×.**
+**2. "The optimization stack will be 1.80–2.07×." Measured ≤1.21×.**
+
+> **Caveat on this number, added after review.** The A/B compared the correct
+> commits (verified by hash), but it was built with **nvcc 11.5 targeting sm_80** —
+> not the toolchain that builds the bake. Registers do **not** differ by card:
+> A30 and A100 are both sm_80 and share codegen for a given toolkit, so the
+> `REG:110/59` seen there versus `REG:80/64` on the H200 build is explained by
+> nvcc version and sm_80-vs-sm_90a alone. This matters directionally: on that box
+> the *baseline* was register-starved at **REG:110 → 2 blocks/SM** where the
+> shipped baseline is **REG:80 → 3 blocks/SM**, so the measurement handed the
+> register squeeze **more** headroom than production has (2→4 rather than 3→4)
+> and still yielded only 1.21×. Giving a change more room than it really has and
+> measuring 1.21× bounds the shipped gain at **≤1.21×**. Treat it as an upper
+> bound on an unrepresentative toolchain, not a verified value for the shipped
+> build. The contributions of the three parts (short key / launch bounds /
+> barriers) were **never separated**, so it is still open whether any one of them
+> is a no-op. The cheap authoritative test is to build the bake box itself at the
+> merge's first parent and time one layer against the 373.6 s/layer it already
+> measures with the stack in.
 The stack (32-bit selection key with exact tie fallback, a register squeeze
 pinning 4 blocks/SM, and a barrier reduction 33 → 15.7) delivered exactly what it
 was designed to deliver: it cut the **fixed** per-timestep term 1.71× and did
@@ -381,7 +399,7 @@ kernel, pipe-level floor), `wave15-AM-unpack.md` (host unpack call-graph trace).
 
 Pull requests: **#29** (CPU beam + W=128 quality cost), **#33** (CUDA beam
 kernel, bake header), **#34** (search stamped into the artifact), **#39**
-(unpack pool + per-layer timing instrumentation), **#40** (the measured 1.21 ×
+(unpack pool + per-layer timing instrumentation), **#40** (the ≤1.21×
 kernel stack), **#42** (the exhaustive prototype — correct, byte-identical,
 slower; **not merged**, its value is the measurement).
 
