@@ -16,8 +16,6 @@ use crate::ffi::*;
 #[cfg(feature = "cuda")]
 use candle_core::cuda::cudarc::driver::sys::CUstream;
 #[cfg(feature = "cuda")]
-use candle_core::cuda::cudarc::driver::DevicePtr;
-#[cfg(feature = "cuda")]
 use candle_core::{Device, IndexOp, Tensor};
 
 // F32→BF16 cast kernel exposed from cuda/decode_kernels.cu. Declared locally
@@ -112,19 +110,25 @@ unsafe impl Send for AutonomousDecodeRunner {}
 unsafe impl Sync for AutonomousDecodeRunner {}
 
 /// Get raw GPU pointer from a Candle tensor as a usize (for casting to *mut/*const).
+///
+/// `CudaStorage::as_cuda_slice::<T>()` type-checks `T` against the storage's
+/// dtype and errors otherwise, so the type argument MUST be dispatched on
+/// `t.dtype()`. This helper used to hardcode `::<u8>()` — the fourth copy of
+/// the same defect (see `flashmlasparse.rs` / `sampling_cuda.rs`, fixed in
+/// PR #52). Every tensor this function is actually called on is U32, I64 or
+/// BF16 (`buffers.rs:24-28`, `:48-52`, and `logits_buf`), so **all 28 call
+/// sites failed**, every time, with `unexpected dtype, expected: U8, got: ...`.
+/// It went unnoticed because the autonomous decode path is gated off before
+/// it ever runs (`mistralrs-core/src/pipeline/normal.rs:1841` bails when
+/// `cache_config` is `None`, which is always on V4). A path that never
+/// executes never reports its own breakage.
+///
+/// `weights::tensor_device_ptr` already does the dtype dispatch correctly, so
+/// delegate rather than keep a fifth copy.
 #[cfg(feature = "cuda")]
 fn tensor_ptr(t: &Tensor) -> candle_core::Result<usize> {
     let t = t.contiguous()?;
-    let (storage, layout) = t.storage_and_layout();
-    match &*storage {
-        candle_core::Storage::Cuda(cuda_storage) => {
-            let slice = cuda_storage.as_cuda_slice::<u8>()?;
-            let (ptr, _guard) = slice.device_ptr(slice.stream());
-            let offset_bytes = layout.start_offset() * t.dtype().size_in_bytes();
-            Ok(ptr as usize + offset_bytes)
-        }
-        _ => candle_core::bail!("tensor_ptr requires CUDA tensor"),
-    }
+    Ok(crate::weights::tensor_device_ptr(&t)? as usize)
 }
 
 #[cfg(feature = "cuda")]
@@ -858,5 +862,58 @@ impl Drop for AutonomousDecodeRunner {
                 cudaFreeHost(self.ring_write_head_ptr as *mut _);
             }
         }
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::*;
+
+    /// `tensor_ptr` must accept every dtype the autonomous decode loop
+    /// actually hands it — U32, I64 and BF16.
+    ///
+    /// Regression for the fourth copy of the `as_cuda_slice::<u8>()` dtype
+    /// bug. Candle type-checks that parameter against the storage's runtime
+    /// dtype, so the hardcoded `u8` made **all 28** `tensor_ptr` call sites in
+    /// this file fail with `unexpected dtype, expected: U8, got: U32`. Not one
+    /// of the buffers is U8 (`buffers.rs:24-28`, `:48-52`), so the GPU
+    /// autonomous decode runner could never have taken a single pointer.
+    ///
+    /// Without the fix this test fails on the first `tensor_ptr` call.
+    #[test]
+    fn tensor_ptr_accepts_every_decode_buffer_dtype() -> candle_core::Result<()> {
+        let Ok(cuda) = Device::new_cuda(0) else {
+            // No GPU on this host: nothing to assert.
+            return Ok(());
+        };
+
+        // Exactly the dtypes `DecodeInputBuffers` / `DecodeState` / the logits
+        // buffer are built with.
+        for dtype in [
+            candle_core::DType::U32,
+            candle_core::DType::I64,
+            candle_core::DType::BF16,
+        ] {
+            let t = Tensor::zeros((4, 8), dtype, &cuda)?;
+            let ptr = tensor_ptr(&t).map_err(|e| {
+                candle_core::Error::msg(format!("tensor_ptr failed for {dtype:?}: {e}"))
+            })?;
+            assert_ne!(ptr, 0, "tensor_ptr returned a null pointer for {dtype:?}");
+        }
+
+        // A non-zero start offset must be scaled by the tensor's own dtype
+        // width, not by u8: row 1 of an I64 [4, 8] tensor is 64 bytes in.
+        let base = Tensor::zeros((4, 8), candle_core::DType::I64, &cuda)?;
+        let row1 = base.narrow(0, 1, 1)?;
+        assert_eq!(
+            tensor_ptr(&row1)? - tensor_ptr(&base)?,
+            8 * std::mem::size_of::<i64>(),
+            "start_offset must be scaled by the tensor's own dtype width"
+        );
+        Ok(())
     }
 }
