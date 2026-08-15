@@ -24,8 +24,7 @@ use std::borrow::Cow;
 use std::sync::{atomic::AtomicUsize, Arc};
 
 use super::{
-    Qtip2bLayer, QtipCodebook, QtipLayer, QtipMode, QtipRotation, QtipSearchDetail,
-    QtipSearchStamp,
+    Qtip2bLayer, QtipCodebook, QtipLayer, QtipMode, QtipRotation, QtipSearchDetail, QtipSearchStamp,
 };
 use crate::{
     IsqType, QuantMethod, QuantMethodConfig, QuantizeOntoGuard, QuantizedSerde, UnquantLinear,
