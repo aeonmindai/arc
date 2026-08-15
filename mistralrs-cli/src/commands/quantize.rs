@@ -42,6 +42,16 @@ fn get_model_id(model_type: &QuantizeModelType) -> &str {
     }
 }
 
+/// Extract the `--bake-devices` list from the QuantizeModelType
+fn get_bake_devices(model_type: &QuantizeModelType) -> Option<&Vec<usize>> {
+    match model_type {
+        QuantizeModelType::Auto { device, .. }
+        | QuantizeModelType::Text { device, .. }
+        | QuantizeModelType::Vision { device, .. }
+        | QuantizeModelType::Embedding { device, .. } => device.bake_devices.as_ref(),
+    }
+}
+
 /// Extract the no_readme flag from the QuantizeModelType
 fn get_no_readme(model_type: &QuantizeModelType) -> bool {
     match model_type {
@@ -75,6 +85,24 @@ pub async fn run_quantize(model_type: QuantizeModelType, global: GlobalOptions) 
     let is_vision = matches!(&model_type, QuantizeModelType::Vision { .. });
     let no_readme = get_no_readme(&model_type);
     let (flag_base_model, flag_repo_id) = get_readme_overrides(&model_type);
+
+    // Spread the bake across several CUDA devices when asked. Validated here,
+    // before the checkpoint download, so a typo costs a second rather than the
+    // 149 GB fetch that precedes the first quantized layer.
+    if let Some(bake_devices) = get_bake_devices(&model_type) {
+        let spec = bake_devices
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let ordinals = mistralrs_quant::parse_bake_devices(&spec)
+            .map_err(|e| anyhow::anyhow!("--bake-devices: {e}"))?;
+        info!(
+            "Baking across CUDA device(s) {spec}: ISQ layers are independent, so each device takes \
+             whichever layer frees up next. The artifact is byte-identical to a single-device bake."
+        );
+        mistralrs_quant::set_bake_device_override(Some(ordinals));
+    }
 
     // Expand numeric ISQ shorthands into concrete variants (both Metal and non-Metal),
     // then deduplicate by IsqType.

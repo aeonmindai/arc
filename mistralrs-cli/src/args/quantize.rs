@@ -141,6 +141,14 @@ pub struct QuantizeDeviceOptions {
     /// Max batch size for automatic device mapping
     #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE)]
     pub max_batch_size: usize,
+
+    /// CUDA devices to spread the bake across, e.g. `--bake-devices 0,1,2,3`.
+    /// ISQ layers are independent, so each device quantizes whichever layer
+    /// frees up next; the model is downloaded and loaded once for the box. The
+    /// artifact is byte-identical to a single-device bake. Defaults to the one
+    /// mapped device. Also settable as `ARC_BAKE_DEVICES`.
+    #[arg(long, value_delimiter = ',')]
+    pub bake_devices: Option<Vec<usize>>,
 }
 
 /// Output options for UQFF generation
@@ -237,6 +245,11 @@ pub struct QuantizeDefaultOptions {
     #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE)]
     pub max_batch_size: usize,
 
+    /// CUDA devices to spread the bake across, e.g. `--bake-devices 0,1,2,3`.
+    /// See `QuantizeDeviceOptions::bake_devices`.
+    #[arg(long, value_delimiter = ',')]
+    pub bake_devices: Option<Vec<usize>>,
+
     /// Output path: a `.uqff` file path (single ISQ) or a directory (auto-names files per ISQ type).
     #[arg(short = 'o', long = "output")]
     pub output_path: Option<PathBuf>,
@@ -299,6 +312,7 @@ impl QuantizeDefaultOptions {
                 hf_cache: self.hf_cache,
                 max_seq_len: self.max_seq_len,
                 max_batch_size: self.max_batch_size,
+                bake_devices: self.bake_devices,
             },
             output: QuantizeOutputOptions {
                 output_path,

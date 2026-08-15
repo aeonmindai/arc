@@ -127,10 +127,10 @@ use candle_core::{quantized, Context, Device, Tensor};
 use indicatif::{MultiProgress, ParallelProgressIterator, ProgressBar, ProgressStyle};
 use itertools::Itertools;
 use mistralrs_quant::{
-    isq_thread_policy, AfqLayer, CollectedImatrixData, ColumnParallelLayer, DistributedKind,
-    F8Q8Linear, FP8Linear, GgufMatMul, HqqLayer, IsqBits, IsqType, MXFP4Layer, NVFP4Layer,
-    Qtip2bLayer, QtipLayer, QuantMethod, QuantizeOntoGuard, QuantizedSerde, QuantizedSerdeType,
-    ReplicatedLayer, RowParallelLayer, TuckerFactoredLayer, UnquantLinear,
+    isq_thread_policy_for_devices, AfqLayer, CollectedImatrixData, ColumnParallelLayer,
+    DistributedKind, F8Q8Linear, FP8Linear, GgufMatMul, HqqLayer, IsqBits, IsqType, MXFP4Layer,
+    NVFP4Layer, Qtip2bLayer, QtipLayer, QuantMethod, QuantizeOntoGuard, QuantizedSerde,
+    QuantizedSerdeType, ReplicatedLayer, RowParallelLayer, TuckerFactoredLayer, UnquantLinear,
 };
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use regex::Regex;
@@ -380,6 +380,108 @@ pub fn isq_artifact_tensor_name(i: usize, main_len: usize) -> String {
         i.to_string()
     } else {
         format!("{UQFF_MTP_TENSOR_PREFIX}{}", i - main_len)
+    }
+}
+
+/// The CUDA ordinal `device` sits on, if it is a CUDA device.
+fn cuda_ordinal(device: &Device) -> Option<usize> {
+    match device.location() {
+        candle_core::DeviceLocation::Cuda { gpu_id } => Some(gpu_id),
+        _ => None,
+    }
+}
+
+/// Resolve `--bake-devices` / `ARC_BAKE_DEVICES` into the devices a UQFF bake
+/// will spread its per-layer quantize work across (wave22).
+///
+/// Returns `None` for the historical single-device behaviour, which is also
+/// what every run without the setting gets.
+///
+/// # Why this is the whole design
+///
+/// ISQ layers are independent, so a bake is embarrassingly parallel; it has
+/// simply always run on one device (373.6 s/layer x 43 = 4.5 h on one A100).
+/// The obvious alternative — N processes each baking a layer range, then a
+/// merge — was rejected for two concrete reasons, not for taste:
+///
+/// 1. **Shard packing is a global sequential fold.** `UqffShardWriter` closes a
+///    shard when the running byte total crosses `MAX_UQFF_SIZE_BYTES`, so a
+///    shard boundary can fall *inside* any process's range and depends on every
+///    earlier tensor's serialized size. N processes cannot emit shards that
+///    merge into what one process would have written without a final pass that
+///    re-packs every tensor — i.e. re-reading and re-writing the whole 68 GB
+///    artifact, and reintroducing exactly the whole-artifact buffering PR #41
+///    removed.
+/// 2. **Each process would load the whole model.** The bootstrap that makes a
+///    multi-GPU box cheap — one 149 GB download, one load — would be paid N
+///    times in host RAM, which does not fit.
+///
+/// Keeping one process and moving only the *device* each layer's quantize runs
+/// on avoids both. `get_layers()` order, the positional ordinals that become
+/// UQFF tensor names, `isq_artifact_tensor_name`'s `mtp.N` tail, and the shard
+/// packing are all untouched and never learn the bake was parallel: there is no
+/// merge step, therefore no merge contract to violate. What remains to be true
+/// is that the quantizer's output does not depend on which device ran it —
+/// which is required anyway, since a 2-device bake puts layer 1 on device 1
+/// where a 1-device bake put it on device 0.
+fn resolve_bake_devices(base: &Device) -> candle_core::Result<Option<Vec<Device>>> {
+    let Some(ordinals) = mistralrs_quant::bake_device_ordinals() else {
+        return Ok(None);
+    };
+    let Some(base_ordinal) = cuda_ordinal(base) else {
+        candle_core::bail!(
+            "`{}` selects the CUDA devices a UQFF bake spreads its layers across, but this \
+             bake's device is {:?}. Remove the setting, or bake on CUDA.",
+            mistralrs_quant::BAKE_DEVICES_ENV,
+            base.location()
+        );
+    };
+    let mut devices = Vec::with_capacity(ordinals.len());
+    for ordinal in ordinals {
+        // Reuse the bake's own device object for its own ordinal. Candle mints
+        // a fresh `DeviceId` on every `Device::new_cuda`, so a second handle to
+        // the same GPU compares `same_device() == false` and would add a
+        // pointless copy on every layer that landed there.
+        if ordinal == base_ordinal {
+            devices.push(base.clone());
+        } else {
+            devices.push(Device::new_cuda(ordinal)?);
+        }
+    }
+    Ok(Some(devices))
+}
+
+/// [`resolve_bake_devices`] when this really is a host-materializing bake, and
+/// a loud no-op otherwise: a device list must never move a layer for a run that
+/// will actually execute a forward pass.
+fn bake_devices_for(base: &Device, host_bake: bool) -> candle_core::Result<Option<Vec<Device>>> {
+    if host_bake {
+        return resolve_bake_devices(base);
+    }
+    if mistralrs_quant::bake_device_ordinals().is_some() {
+        warn!(
+            "Ignoring `{}`: it only applies to a UQFF bake whose quantized layers are \
+             materialized on the host. Quantizing on the mapped devices.",
+            mistralrs_quant::BAKE_DEVICES_ENV
+        );
+    }
+    Ok(None)
+}
+
+/// The device an ISQ worker should quantize on: its own, when the bake is
+/// spread across several, otherwise the one the device map chose.
+///
+/// Each rayon worker owns exactly one device for the whole bake (keyed on
+/// `current_thread_index`) and the pool is sized to one worker per device, so
+/// no two concurrently-running layers ever share a device — which is the
+/// property PR #25's single-thread cap was protecting.
+fn worker_bake_device(bake_devices: Option<&[Device]>, mapped: Device) -> Device {
+    match bake_devices {
+        Some(devices) => {
+            let worker = rayon::current_thread_index().unwrap_or(0);
+            devices[worker % devices.len()].clone()
+        }
+        None => mapped,
     }
 }
 
@@ -754,13 +856,39 @@ pub trait IsqModel {
 
                 let t_start = Instant::now();
 
+                // wave22: spread this bake's per-layer quantize across several
+                // CUDA devices.
+                //
+                // Gated on `bake_isq_to_host()`, not merely on "an artifact is
+                // being written". That flag is the model's own statement that
+                // it will never run a forward pass and its quantized weights
+                // only have to reach `serialize()` — which is precisely the
+                // condition under which a layer may be quantized somewhere
+                // other than where the device map placed it. A bake with a
+                // registered post-load hook (arc-engine's TD-MoE compressor
+                // rewrites layers in place afterwards) leaves the flag false
+                // and keeps every layer on its mapped device.
+                let host_bake = write_artifacts.is_some() && mistralrs_quant::bake_isq_to_host();
+                let bake_devices = bake_devices_for(&device, host_bake)?;
+                let n_bake_devices = bake_devices.as_ref().map_or(1, |devices| devices.len());
+                if let Some(devices) = &bake_devices {
+                    info!(
+                        "Parallel UQFF bake across {n_bake_devices} device(s): {:?}. Layers are \
+                         claimed by whichever device frees up first; the artifact is byte-identical \
+                         to a single-device bake.",
+                        devices.iter().map(|d| d.location()).collect::<Vec<_>>()
+                    );
+                }
+
                 // Get the MINIMUM of the max isq threads the quant method
                 // supports. `isq_thread_policy` also honors
                 // MISTRALRS_ISQ_SINGLETHREAD and knows whether this rung's
                 // quantize math runs on the GPU, in which case extra host
-                // threads only contend for the one device.
+                // threads only contend for the one device — so the width it
+                // returns is PER DEVICE, and a multi-device bake gets one
+                // submitter each (see `isq_thread_policy_for_devices`).
                 let (mut minimum_max_threads, mut threads_rationale) =
-                    isq_thread_policy(dtype, Some(&device));
+                    isq_thread_policy_for_devices(dtype, Some(&device), n_bake_devices);
 
                 if matches!(imatrix_source, Some(ImatrixDataSource::Collected)) {
                     // Collected imatrix means that the model is potentially on the gpu already
@@ -777,6 +905,38 @@ pub trait IsqModel {
                     .map_err(candle_core::Error::msg)?;
 
                 let guard = QuantizeOntoGuard::new();
+                let bake_devices_ref = bake_devices.as_deref();
+
+                // One body for both iterations, so the device policy cannot
+                // drift between the silent and progress-bar paths.
+                //
+                // Layers are not pre-assigned to devices: a worker takes the
+                // next one when it frees up, so a device that draws a cheap
+                // attention layer immediately picks up more work instead of
+                // idling behind a 256-expert MoE stack on its neighbour.
+                type Layer = Arc<dyn QuantMethod>;
+                let quantize_layer =
+                    |tensor: &mut Layer,
+                     mapped: Device,
+                     dtype: Option<IsqType>,
+                     imatrix_weight: Option<Vec<f32>>| {
+                        let device = worker_bake_device(bake_devices_ref, mapped);
+                        if bake_devices_ref.is_some() {
+                            // So device-selecting fallbacks inside the quantizer
+                            // (`expert_stack_quant_device`) route to this worker's
+                            // device rather than hardcoded device 0.
+                            mistralrs_quant::set_worker_cuda_ordinal(cuda_ordinal(&device));
+                        }
+                        let quantized = tensor.clone().apply_isq(
+                            dtype,
+                            device.clone(),
+                            &n_quantized,
+                            imatrix_weight,
+                            guard.clone(),
+                        );
+                        *tensor = quantized.unwrap();
+                        device.synchronize().unwrap();
+                    };
 
                 pool.install(|| {
                     use indicatif::ParallelProgressIterator;
@@ -789,17 +949,7 @@ pub trait IsqModel {
                             .zip(devices_and_dtypes)
                             .zip(imatrix_to_weight)
                             .for_each(|(((tensor, _), (device, dtype)), imatrix_weight)| {
-                                **tensor = tensor
-                                    .clone()
-                                    .apply_isq(
-                                        dtype,
-                                        device.clone(),
-                                        &n_quantized,
-                                        imatrix_weight,
-                                        guard.clone(),
-                                    )
-                                    .unwrap();
-                                device.synchronize().unwrap();
+                                quantize_layer(&mut **tensor, device, dtype, imatrix_weight);
                             });
                     } else {
                         tensors
@@ -808,20 +958,11 @@ pub trait IsqModel {
                             .zip(imatrix_to_weight)
                             .progress_with(bar)
                             .for_each(|(((tensor, _), (device, dtype)), imatrix_weight)| {
-                                **tensor = tensor
-                                    .clone()
-                                    .apply_isq(
-                                        dtype,
-                                        device.clone(),
-                                        &n_quantized,
-                                        imatrix_weight,
-                                        guard.clone(),
-                                    )
-                                    .unwrap();
-                                device.synchronize().unwrap();
+                                quantize_layer(&mut **tensor, device, dtype, imatrix_weight);
                             });
                     }
                 });
+                mistralrs_quant::set_worker_cuda_ordinal(None);
 
                 let t_end = Instant::now();
                 info!(

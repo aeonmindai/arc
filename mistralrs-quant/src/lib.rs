@@ -109,6 +109,10 @@ pub use utils::bake_budget::{
     arm_bake_budget, bake_budget_armed, disarm_bake_budget, note_bake_layer, project_bake_peak,
     BakeBudgetVerdict, BakeProjection,
 };
+pub use utils::bake_devices::{
+    bake_device_ordinals, clear_bake_device_override, parse_bake_devices, set_bake_device_override,
+    set_worker_cuda_ordinal, worker_cuda_ordinal, BAKE_DEVICES_ENV,
+};
 pub use utils::flash_attn_sinks_metal;
 pub use utils::flash_attn_sinks_varlen_metal;
 #[cfg(feature = "cuda")]
@@ -262,6 +266,75 @@ pub fn isq_thread_policy_on(
             rayon::current_num_threads(),
             "no ISQ type selected; all rayon workers",
         ),
+    }
+}
+
+/// [`isq_thread_policy`] for a bake spread across `n_devices` devices
+/// (wave22, `--bake-devices`).
+///
+/// The single-device answer is a **per-device submission width**, not a global
+/// one. PR #25 capped QTIP at one host thread because N rayon workers all
+/// submitting Viterbi kernels and transfers to *the same* device only contend
+/// (session 5 measured 4-9 min/layer at 24 threads vs ~30 s/layer at 1). That
+/// reasoning is about contention for one device and says nothing about a second
+/// device sitting idle next to it, so with N devices the correct width is
+/// `per_device * N`: one submitter each, never two on one.
+///
+/// The multiplication applies only when the per-device cap exists *because* the
+/// quantize math runs on the device (`get_max_isq_cpu_threads_on` returns a
+/// bound under [`IsqQuantizeBackend::Gpu`]). Rungs that quantize on host cores
+/// — GGML Q*_K, FP8 — already ask for every core and gain nothing from extra
+/// devices, so their width is left alone.
+///
+/// `MISTRALRS_ISQ_SINGLETHREAD` is honored as *one thread per device*, which is
+/// what it has always meant: it exists to stop several host threads piling onto
+/// a single device.
+pub fn isq_thread_policy_for_devices(
+    ty: Option<IsqType>,
+    device: Option<&Device>,
+    n_devices: usize,
+) -> (usize, &'static str) {
+    let backend = match device {
+        Some(device) => IsqQuantizeBackend::for_device(device),
+        None => IsqQuantizeBackend::assumed(),
+    };
+    isq_thread_policy_for_devices_on(
+        ty,
+        backend,
+        std::env::var("MISTRALRS_ISQ_SINGLETHREAD").is_ok(),
+        n_devices,
+    )
+}
+
+/// [`isq_thread_policy_for_devices`] with the backend and the force-single-thread
+/// escape hatch supplied explicitly, so the decision is testable without a
+/// second GPU or process-global environment state.
+pub fn isq_thread_policy_for_devices_on(
+    ty: Option<IsqType>,
+    backend: IsqQuantizeBackend,
+    force_singlethread: bool,
+    n_devices: usize,
+) -> (usize, &'static str) {
+    let (per_device, rationale) = isq_thread_policy_on(ty, backend, force_singlethread);
+    let n_devices = n_devices.max(1);
+    if n_devices == 1 {
+        return (per_device, rationale);
+    }
+    // The cap only means "one submitter per device" when it exists *because*
+    // the quantize math runs on the device. A rung that quantizes on host cores
+    // already asked for every core and gains nothing from a second GPU.
+    let device_bound = matches!(backend, IsqQuantizeBackend::Gpu)
+        && ty.is_some_and(|ty| ty.get_max_isq_cpu_threads_on(backend).is_some());
+    if device_bound {
+        (
+            per_device.saturating_mul(n_devices),
+            "one submit thread per bake device — distinct devices do not contend (PR #25 capped submitters per device, not per box)",
+        )
+    } else {
+        (
+            per_device,
+            "quantize math runs on host cores; extra bake devices add no submit width",
+        )
     }
 }
 
@@ -1698,6 +1771,91 @@ mod isq_thread_policy_tests {
         assert_eq!(n, 1);
         let (n, _) = isq_thread_policy_on(None, IsqQuantizeBackend::Gpu, false);
         assert_eq!(n, rayon::current_num_threads());
+    }
+
+    #[test]
+    fn a_multi_device_bake_gets_one_submitter_per_device() {
+        // PR #25's cap is per DEVICE. Session 5's trap was 24 host threads on
+        // ONE device (4-9 min/layer); two threads on two devices is not that
+        // trap, and refusing to widen here would leave every device but one
+        // idle for the whole bake.
+        for ty in [IsqType::QtipBitshift2, IsqType::Qtip2b] {
+            let (one, _) =
+                isq_thread_policy_for_devices_on(Some(ty), IsqQuantizeBackend::Gpu, false, 1);
+            assert_eq!(one, 1, "{ty:?} on a single device stays at 1");
+            for n in [2usize, 4, 8] {
+                let (width, rationale) =
+                    isq_thread_policy_for_devices_on(Some(ty), IsqQuantizeBackend::Gpu, false, n);
+                assert_eq!(width, n, "{ty:?} across {n} devices");
+                assert!(rationale.contains("per bake device"), "{rationale}");
+            }
+        }
+        // HQQ/AFQ quantize on the device too, and get the same treatment.
+        let (width, _) = isq_thread_policy_for_devices_on(
+            Some(IsqType::AFQ4),
+            IsqQuantizeBackend::Gpu,
+            false,
+            4,
+        );
+        assert_eq!(width, 4);
+    }
+
+    #[test]
+    fn host_quantized_rungs_do_not_widen_with_more_devices() {
+        // GGML and FP8 quantize on host cores; a second GPU adds no compute, so
+        // multiplying their width would only oversubscribe the CPU.
+        for ty in [IsqType::Q4K, IsqType::Q8_0, IsqType::F8E4M3] {
+            for backend in [IsqQuantizeBackend::Gpu, IsqQuantizeBackend::Cpu] {
+                let (width, _) = isq_thread_policy_for_devices_on(Some(ty), backend, false, 4);
+                assert_eq!(
+                    width,
+                    rayon::current_num_threads(),
+                    "{ty:?}/{backend:?} must keep its host width"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn one_device_is_exactly_the_single_device_policy() {
+        // The default path must not shift for existing users: with one device
+        // the new entry point has to agree with the old one everywhere.
+        for ty in [
+            Some(IsqType::QtipBitshift2),
+            Some(IsqType::Qtip2b),
+            Some(IsqType::Q4K),
+            Some(IsqType::AFQ4),
+            Some(IsqType::F8E4M3),
+            None,
+        ] {
+            for backend in [IsqQuantizeBackend::Gpu, IsqQuantizeBackend::Cpu] {
+                for forced in [false, true] {
+                    assert_eq!(
+                        isq_thread_policy_for_devices_on(ty, backend, forced, 1),
+                        isq_thread_policy_on(ty, backend, forced),
+                        "{ty:?}/{backend:?}/forced={forced}"
+                    );
+                    // A zero-length list is not a way to get zero threads.
+                    assert_eq!(
+                        isq_thread_policy_for_devices_on(ty, backend, forced, 0),
+                        isq_thread_policy_on(ty, backend, forced),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn singlethread_flag_means_one_thread_per_device() {
+        // MISTRALRS_ISQ_SINGLETHREAD exists to stop several host threads piling
+        // onto ONE device; across N devices its faithful reading is one each.
+        let (width, _) = isq_thread_policy_for_devices_on(
+            Some(IsqType::QtipBitshift2),
+            IsqQuantizeBackend::Gpu,
+            /* forced */ true,
+            4,
+        );
+        assert_eq!(width, 4);
     }
 
     #[test]

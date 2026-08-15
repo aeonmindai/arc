@@ -207,6 +207,28 @@ This produces the following in `phi3.5-uqff/`:
 
 > Note: Multiple `--isq` values require a directory output path (not a `.uqff` file path).
 
+### Baking across several GPUs
+
+ISQ layers are independent — quantizing layer 7 needs nothing produced by layer 6 — so a bake on a multi-GPU box can quantize N layers at once. `--bake-devices` names the CUDA devices to use:
+
+```bash
+# Quantize on all four GPUs instead of one
+mistralrs quantize -m <model> --isq qtip2b --bake-devices 0,1,2,3 -o out/
+```
+
+Equivalently, set `ARC_BAKE_DEVICES=0,1,2,3` in the environment; the flag wins if both are given.
+
+The important properties:
+
+- **The artifact is byte-identical to a single-device bake** — same tensor names, same order, same bytes. The model is loaded once and the UQFF writer never learns the bake was parallel; only the device each layer's quantize runs on changes. There is no merge step.
+- **Roughly the same GPU-hours, a fraction of the wall time.** The expensive bootstrap (checkpoint download, model load) is paid once per *box*, not once per device, so an N-GPU box finishes the quantize phase in about 1/N the time for comparable spend.
+- **Layers are not pre-assigned.** Each device takes whichever layer frees up next, so a device that draws a cheap attention layer picks up more work instead of idling behind a 256-expert MoE stack on its neighbour.
+- **Default is unchanged.** Without the flag, a bake runs exactly as before on the single mapped device.
+
+Each device gets exactly one host thread submitting work to it. That is the same rule as the single-device policy (see `MISTRALRS_ISQ_SINGLETHREAD` in [CONFIGURATION.md](CONFIGURATION.md)), which caps *submitters per device* — several host threads on one device only contend for it, but one thread each on N devices does not.
+
+Requires a CUDA bake; the setting is rejected on other backends rather than silently ignored. Listing a device twice is an error.
+
 ### Model card generation
 
 When using directory output mode, the `quantize` command automatically generates a `README.md` model card in the output directory. This model card includes Hugging Face YAML frontmatter, a description, and an examples table with the appropriate `--from-uqff` commands for each quantization.

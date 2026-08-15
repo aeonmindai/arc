@@ -215,12 +215,19 @@ pub(crate) fn expert_stack_quant_device(device: &Device, context: &'static str) 
             );
             return device.clone();
         }
-        match Device::new_cuda(0) {
+        // Route to the ordinal this ISQ worker owns, not unconditionally to 0.
+        // A hardcoded 0 here is the landmine for a multi-device bake
+        // (wave22 / `--bake-devices`): every worker whose layer resolved to a
+        // CPU target would pile its expert stacks onto device 0 while the other
+        // devices idled, and would exhaust device 0's memory doing it.
+        // Unset (the default, and every single-device bake) still means 0.
+        let ordinal = crate::worker_cuda_ordinal().unwrap_or(0);
+        match Device::new_cuda(ordinal) {
             Ok(cuda) => cuda,
             Err(e) => {
                 note_gpu_quant_cpu_fallback(
                     context,
-                    &format!("CUDA device 0 initialization failed: {e}"),
+                    &format!("CUDA device {ordinal} initialization failed: {e}"),
                 );
                 device.clone()
             }

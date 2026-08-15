@@ -11,6 +11,7 @@ This document covers environment variables and server configuration for mistral.
 | `MISTRALRS_NO_MLA=1` | Disable [MLA](MLA.md) (Multi-head Latent Attention) optimization for DeepSeek V2/V3 and GLM-4.7-Flash |
 | `MISTRALRS_ISQ_SINGLETHREAD=1` | Force ISQ (In-Situ Quantization) to run single-threaded. Caps how many *layers* quantize at once (GPU submission); does **not** affect the expert unpack |
 | `ARC_UNPACK_THREADS` | Threads for the host-side MoE expert unpack (packed INT4/FP8 → BF16). Defaults to available parallelism. Independent of the ISQ thread policy: that one bounds GPU submission, this one is pure CPU work |
+| `ARC_BAKE_DEVICES` | CUDA ordinals a UQFF bake may spread its layers across, e.g. `0,1,2,3`. ISQ layers are independent, so an N-GPU box finishes the quantize phase in ~1/N the wall time; the artifact is byte-identical to a single-device bake. Defaults to the single mapped device. The `--bake-devices` flag on `mistralrs quantize` sets the same list and takes precedence. See [UQFF.md](UQFF.md#baking-across-several-gpus) |
 | `MISTRALRS_IGPU_MEMORY_FRACTION` | Memory fraction for integrated/unified-memory CUDA GPUs (e.g. NVIDIA Grace Blackwell, Jetson). Float between 0.0 and 1.0, default: `0.75` |
 | `MCP_CONFIG_PATH` | Fallback path for MCP client configuration (used if `--mcp-config` not provided) |
 | `KEEP_ALIVE_INTERVAL` | SSE keep-alive interval in milliseconds (default: 10000) |

@@ -13,6 +13,8 @@ pub(crate) mod llg;
 mod loaders;
 mod macros;
 mod normal;
+#[cfg(test)]
+mod parallel_bake_tests;
 mod paths;
 pub mod post_load_hooks;
 pub mod mtp_pipeline;
