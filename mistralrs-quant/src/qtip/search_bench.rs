@@ -280,9 +280,19 @@ fn trellis_search_grid_invariants() {
                 res.matmul_cos,
                 base.0
             );
+            // Wall-clock, so it carries an explicit tolerance. The real gap
+            // between beam and exhaustive on this grid is only ~4% — a shared
+            // CI runner's scheduler noise is larger than that, so a STRICT
+            // `<` here is a stopwatch gating CI, and it has already blocked a
+            // PR spuriously. The invariant worth defending is "beam is not
+            // dramatically slower than the exhaustive search it prunes", which
+            // a real regression (beam falling back to exhaustive work, or
+            // worse) violates by multiples, not by percent.
+            const TIMING_SLACK: f64 = 1.5;
             assert!(
-                res.secs_per_row < base.1,
-                "beam W={width} ({:.4}s/row) was not faster than exhaustive ({:.4}s/row)",
+                res.secs_per_row < base.1 * TIMING_SLACK,
+                "beam W={width} ({:.4}s/row) was more than {TIMING_SLACK}x the exhaustive search \
+                 ({:.4}s/row) — that is a real regression, not timing noise",
                 res.secs_per_row,
                 base.1
             );
@@ -334,11 +344,17 @@ fn run_grid(
     // contiguous block lets a single scheduler or thermal event corrupt every
     // sample for that config; interleaving bounds the damage to one round.
     // The search is deterministic, so this only touches the timing column.
-    if print {
+    //
+    // This used to be gated on `print`, which meant the ALWAYS-ON test — the
+    // one that asserts on the timing column — was the only caller that never
+    // got the variance reduction, and asserted on a single un-repeated sample
+    // of a 4-row quantize. That is why it flaked. It now runs for both callers;
+    // `print` only decides how many rounds we pay for.
+    {
         const TIMED_ROWS: usize = 8;
-        const ROUNDS: usize = 5;
+        let rounds = if print { 5 } else { 3 };
         let rows = TIMED_ROWS.min(n);
-        for _ in 0..ROUNDS {
+        for _ in 0..rounds {
             for (cfg, res) in cells.iter_mut() {
                 let (_, secs) = quantize_matrix(&w, rows, k, *cfg, &h, rot_block);
                 res.secs_per_row = res.secs_per_row.min(secs);

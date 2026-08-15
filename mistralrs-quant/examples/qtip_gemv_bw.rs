@@ -25,6 +25,9 @@ use mistralrs_quant::{QtipLayer, QtipMode};
 use std::time::Instant;
 
 const H200_PEAK: f64 = 4.8e12; // bytes/s
+/// H200 L2. The whole L2-defeat argument above is only true while the packed
+/// stack is bigger than this — asserted, not assumed (DOCTRINE D12).
+const H200_L2_BYTES: f64 = 60e6;
 const TOPK: usize = 6; // V4-Flash active experts/token
 
 struct Shape {
@@ -52,17 +55,52 @@ fn time_call(dev: &Device, layer: &std::sync::Arc<dyn mistralrs_quant::QuantMeth
 }
 
 fn run_shape(dev: &Device, s: &Shape, e: usize, iters: usize) -> candle_core::Result<()> {
+    let bpe = bytes_per_expert(s);
+    // D12 guard: the "L2 defeat" claim in the header is load-bearing — if the
+    // packed stack fits in L2 the GB/s column is L2 bandwidth wearing an HBM
+    // label, and the %-of-peak conclusion inverts.
+    let working_set = e as f64 * bpe;
+    if working_set <= H200_L2_BYTES {
+        candle_core::bail!(
+            "packed working set {:.1} MB fits in L2 ({:.0} MB): the GB/s column would report L2 \
+             bandwidth, not HBM. Raise E or the shape.",
+            working_set / 1e6,
+            H200_L2_BYTES / 1e6
+        );
+    }
+
     let w = Tensor::randn(0f32, 0.02f32, (e, s.n, s.k), dev)?.to_dtype(DType::BF16)?;
-    let layer = QtipLayer::quantize_with_options(&w, None, dev, QtipMode::Greedy, false)?;
+    // Viterbi, not Greedy: `Greedy` is refused by every quantizer door outside
+    // this crate's own `cfg(test)` binaries (DOCTRINE D4), and an example is
+    // not one — this bench died at the first fixture before this. The trellis
+    // search decides WHICH symbols get packed, never how many bytes they
+    // occupy or how many ops the decode costs, so the measured bandwidth is
+    // identical either way; only bake time changes. `use_rotation = false` is
+    // kept from the session-4 baseline: rotation adds a `rotate_x_cuda` pass
+    // over the activations before the GEMV, fixed overhead outside the kernel
+    // whose marginal bandwidth this bench fits. (Same fix as PR #47.)
+    let layer = QtipLayer::quantize_with_options(&w, None, dev, QtipMode::Viterbi, false)?;
+    drop(w);
     std::env::remove_var("ARC_NO_QTIP_ONDEVICE_MOE");
 
-    let bpe = bytes_per_expert(s);
     println!("[{}] N={} K={}  (bytes/expert={:.2} MB)", s.name, s.n, s.k, bpe / 1e6);
 
     let batches = [1usize, 2, 4, 8];
     let mut pts: Vec<(f64, f64)> = vec![]; // (pairs, secs)
     for &b in &batches {
         let n_pairs = b * TOPK;
+        // D12 guard: the linear fit below charges `bpe * n_pairs` bytes, which
+        // is only right while every pair in a window lands on a DIFFERENT
+        // expert. Once the rotating window wraps, pairs share experts, the
+        // real traffic is lower, and the reported marginal bandwidth is
+        // inflated by exactly the collision rate.
+        if n_pairs > e {
+            candle_core::bail!(
+                "b={b} needs {n_pairs} distinct experts but E={e}: the rotating index window \
+                 wraps, pairs collide on the same expert, and the `bpe * n_pairs` traffic model \
+                 behind the GB/s column overstates the bytes actually read."
+            );
+        }
         // rotating index sets: each iter touches a different window of experts
         let n_rot = 16usize;
         let mut idx_sets = Vec::with_capacity(n_rot);
