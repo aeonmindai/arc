@@ -41,6 +41,8 @@
 // exhaustive kernel, the greedy kernel and the new beam kernel all bit-identical
 // to their Rust counterparts. See kernels/qtip/qtip_exact_fp.cuh.
 #include "qtip_exact_fp.cuh"
+// Codebook selection (stored Gaussian LUT vs in-register sum2 code).
+#include "qtip_codebook.cuh"
 
 namespace {
 
@@ -50,6 +52,20 @@ constexpr uint32_t QTIP_V          = 2;
 constexpr uint32_t QTIP_STATE_MASK = (1u << QTIP_L) - 1u;
 constexpr uint32_t QTIP_ALPHABET   = 1u << QTIP_K;       // 16
 constexpr uint32_t QTIP_LUT_SIZE   = 1u << QTIP_L;       // 65536
+
+// Branch metric with the codebook selected at compile time. The `false`
+// instantiation is exactly `qtip_decode_err_exact` (two LUT loads, then the
+// non-contracting f32 arithmetic); the `true` one derives the same two values
+// from the state with no memory access. Both feed the identical
+// `qtip_decode_err_exact_lv`, so the DP's rounding behaviour is unchanged and
+// the CUDA search stays bit-identical to its Rust twin at either codebook.
+template <bool COMPUTED_CB>
+__device__ __forceinline__ float qtip_cb_err(
+    const float* __restrict__ lut, unsigned int s, float t0, float t1, unsigned int mult
+) {
+    const float2 c = qtip_cb_value<COMPUTED_CB>(lut, s, mult);
+    return qtip_decode_err_exact_lv(c.x, c.y, t0, t1);
+}
 
 // ---------------------------------------------------------------------------
 // Rotation kernel for weight rows (FP32 in-place block-diagonal D·H·D).
@@ -102,16 +118,22 @@ __global__ void qtip_rotate_weight_rows_kernel(
 // Per-row scale computation kernel.
 // ---------------------------------------------------------------------------
 //
-// One CUDA block per row. Computes scale = max(|row|) / 3.0 (or 1.0 if
+// One CUDA block per row. Computes scale = max(|row|) / divisor (or 1.0 if
 // max is 0) via parallel reduction. The per-row scale is then used by
 // the quantize kernel to map weights into the unit-Gaussian frame.
+//
+// `divisor` is 3.0 for the Gaussian LUT (which is unit-sigma by construction)
+// and 3*sigma for the computed sum2 codebook (sigma = 1.225552), which is the
+// same `max|row| / 3-sigma` policy `QTIP2B_SCALE_DIVISOR` encodes at K=2/V=1.
+// It is passed rather than folded into the values so the decode pays nothing.
 
 constexpr int SCALE_THREADS = 256;
 
 __global__ void qtip_row_scale_kernel(
     const float* __restrict__ weight,    // [n_rows, in_features]
     float*       __restrict__ row_scales, // [n_rows]
-    int in_features
+    int in_features,
+    float divisor                         // 3.0 (Gaussian LUT) or 3*sigma (computed)
 ) {
     __shared__ float smax[SCALE_THREADS];
 
@@ -143,7 +165,7 @@ __global__ void qtip_row_scale_kernel(
         // __fdiv_rn, not `/`: --use_fast_math turns `/` into an approximate
         // reciprocal-multiply, which would make the GPU row scale differ from
         // the CPU's `max_abs / 3.0` and desynchronise every downstream target.
-        float s = (m == 0.0f) ? 1.0f : __fdiv_rn(m, 3.0f);
+        float s = (m == 0.0f) ? 1.0f : __fdiv_rn(m, divisor);
         row_scales[row] = s;
     }
 }
@@ -169,13 +191,15 @@ __global__ void qtip_row_scale_kernel(
 
 constexpr int GREEDY_THREADS = 32;
 
+template <bool COMPUTED_CB>
 __global__ void qtip_quantize_rows_greedy_kernel(
     const float*   __restrict__ weight,        // [n_rows, in_features]
-    const float*   __restrict__ lut,           // [LUT_SIZE * V]
+    const float*   __restrict__ lut,           // [LUT_SIZE * V] (unused if computed)
     const float*   __restrict__ row_scales,    // [n_rows]
     uint8_t*       __restrict__ packed,        // [n_rows, num_symbols / 2]
     int in_features,
-    int num_symbols
+    int num_symbols,
+    unsigned int cb_mult
 ) {
     int row = blockIdx.x;
     int tid = threadIdx.x;
@@ -203,7 +227,7 @@ __global__ void qtip_quantize_rows_greedy_kernel(
         float err = INFINITY;
         if (tid < (int)QTIP_ALPHABET) {
             uint32_t next_state = ((state << QTIP_K) | my_sym) & QTIP_STATE_MASK;
-            err = qtip_decode_err_exact(lut, next_state, t0, t1);
+            err = qtip_cb_err<COMPUTED_CB>(lut, next_state, t0, t1, cb_mult);
         }
 
         // Warp reduction: find min err and its sym.
@@ -288,15 +312,17 @@ constexpr uint32_t QTIP_SUFFIX_COUNT  = 1u << QTIP_K;             // 16
 // Decode-error of state `s` against the V=2 target vector (already scaled).
 // Delegates to the non-contracting helper so the DP's branch metric is
 // bit-identical to `qtip/viterbi.rs::decode_error`.
+template <bool COMPUTED_CB>
 __device__ __forceinline__ float decode_err_fp(
-    const float* __restrict__ lut, uint32_t s, float t0, float t1
+    const float* __restrict__ lut, uint32_t s, float t0, float t1, unsigned int mult
 ) {
-    return qtip_decode_err_exact(lut, s, t0, t1);
+    return qtip_cb_err<COMPUTED_CB>(lut, s, t0, t1, mult);
 }
 
+template <bool COMPUTED_CB>
 __global__ void qtip_quantize_rows_viterbi_kernel(
     const float*   __restrict__ weight,        // [n_rows, in_features]
-    const float*   __restrict__ lut,           // [LUT_SIZE * V]
+    const float*   __restrict__ lut,           // [LUT_SIZE * V] (unused if computed)
     const float*   __restrict__ row_scales,    // [n_rows]
     uint8_t*       __restrict__ packed,        // [n_rows, num_symbols / 2]
     float*         __restrict__ cost_a,        // scratch [BATCH, LUT_SIZE]
@@ -304,7 +330,8 @@ __global__ void qtip_quantize_rows_viterbi_kernel(
     uint8_t*       __restrict__ backtrace,     // scratch [BATCH, T, PREFIX_COUNT]
     int in_features,
     int num_symbols,
-    int row_offset                              // global row index of grid block 0
+    int row_offset,                             // global row index of grid block 0
+    unsigned int cb_mult
 ) {
     int local_row = blockIdx.x;
     int row       = row_offset + local_row;
@@ -334,7 +361,7 @@ __global__ void qtip_quantize_rows_viterbi_kernel(
         float t1 = qtip_scaled_target_exact(my_row[1], inv_scale);
         for (uint32_t i = tid; i < QTIP_LUT_SIZE; i += VITERBI_THREADS) {
             if (i < QTIP_ALPHABET) {
-                my_cost_a[i] = decode_err_fp(lut, i, t0, t1);
+                my_cost_a[i] = decode_err_fp<COMPUTED_CB>(lut, i, t0, t1, cb_mult);
             } else {
                 my_cost_a[i] = INFINITY;
             }
@@ -373,7 +400,7 @@ __global__ void qtip_quantize_rows_viterbi_kernel(
         // Phase B: per-state cost update (65536 states). Reads err from LUT,
         // adds shared best_cost[prefix], writes curr[]. All consecutive in s.
         for (uint32_t s = tid; s < QTIP_LUT_SIZE; s += VITERBI_THREADS) {
-            float err = decode_err_fp(lut, s, tt0, tt1);
+            float err = decode_err_fp<COMPUTED_CB>(lut, s, tt0, tt1, cb_mult);
             uint32_t p = s >> QTIP_K;
             curr[s] = __fadd_rn(err, s_best_cost[p]);
         }
@@ -450,6 +477,95 @@ __global__ void qtip_quantize_rows_viterbi_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Least-squares scale refinement kernel.
+// ---------------------------------------------------------------------------
+//
+// After Viterbi/Greedy picks the optimal state sequence, the heuristic scale
+// (max|row|/3) is suboptimal.  The MSE-optimal scale for a fixed state
+// sequence is:
+//
+//   s* = dot(w_rotated, lut_values) / dot(lut_values, lut_values)
+//
+// where lut_values[i] = lut[state_for_i].  This kernel replays the trellis
+// from the packed symbols, reconstructs the unscaled LUT values, and
+// computes the two dot products in one pass via parallel reduction.
+//
+// One CUDA block per row, SCALE_THREADS threads.
+
+template <bool COMPUTED_CB>
+__global__ void qtip_refine_scales_kernel(
+    const float*   __restrict__ weight,      // [n_rows, in_features] rotated
+    const uint8_t* __restrict__ packed,       // [n_rows, num_symbols / 2]
+    const float*   __restrict__ lut,          // [LUT_SIZE * V] (unused if computed)
+    float*         __restrict__ row_scales,   // [n_rows] — updated in-place
+    int in_features,
+    int num_symbols,
+    unsigned int cb_mult
+) {
+    __shared__ float s_dot_wl[SCALE_THREADS];
+    __shared__ float s_dot_ll[SCALE_THREADS];
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    const float*   my_row = weight + (size_t)row * in_features;
+    const uint8_t* my_pkd = packed + (size_t)row * (num_symbols / 2);
+
+    // Each thread accumulates partial sums over its strided slice of symbols.
+    float dot_wl = 0.0f;
+    float dot_ll = 0.0f;
+
+    // Replay the trellis to recover states.  The trellis is sequential
+    // (state_t depends on state_{t-1}), but we only need the LUT values
+    // which are determined by the state AFTER each symbol.  We can replay
+    // serially on thread 0 and broadcast, but that serialises the row.
+    //
+    // Better: each thread independently replays ALL symbols (cheap — just
+    // shift+mask per symbol) but only accumulates its own strided portion.
+    // The replay is identical across threads (deterministic), so this is
+    // correct and fully parallel for the dot products.
+
+    uint32_t state = 0u;
+    for (int t = 0; t < num_symbols; ++t) {
+        // Unpack symbol.
+        uint8_t byte = my_pkd[t / 2];
+        uint32_t sym = ((t & 1) == 0) ? (byte & 0x0Fu) : (byte >> 4);
+
+        state = ((state << QTIP_K) | sym) & QTIP_STATE_MASK;
+
+        // Only accumulate for this thread's slice.
+        if ((t % SCALE_THREADS) == tid) {
+            const float2 c = qtip_cb_value<COMPUTED_CB>(lut, state, cb_mult);
+            float l0 = c.x;
+            float l1 = c.y;
+            float w0 = my_row[t * 2 + 0];
+            float w1 = my_row[t * 2 + 1];
+            dot_wl += w0 * l0 + w1 * l1;
+            dot_ll += l0 * l0 + l1 * l1;
+        }
+    }
+
+    s_dot_wl[tid] = dot_wl;
+    s_dot_ll[tid] = dot_ll;
+    __syncthreads();
+
+    // Tree reduction.
+    for (int stride = SCALE_THREADS / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_dot_wl[tid] += s_dot_wl[tid + stride];
+            s_dot_ll[tid] += s_dot_ll[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float denom = s_dot_ll[0];
+        float s = (denom > 0.0f) ? (s_dot_wl[0] / denom) : row_scales[row];
+        row_scales[row] = s;
+    }
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -509,14 +625,17 @@ void launch_qtip_compute_row_scales_f32(
     float*        d_row_scales,
     int n_rows,
     int in_features,
+    float         divisor,
     cudaStream_t  stream
 ) {
     qtip_row_scale_kernel<<<n_rows, SCALE_THREADS, 0, stream>>>(
-        d_weight, d_row_scales, in_features);
+        d_weight, d_row_scales, in_features, divisor);
 }
 
 // ----- Greedy quantize ------------------------------------------------------
 
+// `cb_mult == 0` selects the stored Gaussian LUT; nonzero selects the computed
+// sum2 codebook with that MCG multiplier. See qtip_codebook.cuh.
 void launch_qtip_quantize_rows_greedy_f32(
     const float*  d_weight,
     const float*  d_lut,
@@ -525,12 +644,20 @@ void launch_qtip_quantize_rows_greedy_f32(
     int n_rows,
     int in_features,
     int num_symbols,
+    unsigned int  cb_mult,
     cudaStream_t  stream
 ) {
-    qtip_quantize_rows_greedy_kernel
-        <<<n_rows, GREEDY_THREADS, 0, stream>>>(
-            d_weight, d_lut, d_row_scales, d_packed,
-            in_features, num_symbols);
+    if (cb_mult != 0u) {
+        qtip_quantize_rows_greedy_kernel<true>
+            <<<n_rows, GREEDY_THREADS, 0, stream>>>(
+                d_weight, d_lut, d_row_scales, d_packed,
+                in_features, num_symbols, cb_mult);
+    } else {
+        qtip_quantize_rows_greedy_kernel<false>
+            <<<n_rows, GREEDY_THREADS, 0, stream>>>(
+                d_weight, d_lut, d_row_scales, d_packed,
+                in_features, num_symbols, 0u);
+    }
 }
 
 // ----- Viterbi quantize -----------------------------------------------------
@@ -547,103 +674,26 @@ void launch_qtip_quantize_rows_viterbi_f32(
     int in_features,
     int num_symbols,
     int row_offset,
+    unsigned int  cb_mult,
     cudaStream_t  stream
 ) {
-    qtip_quantize_rows_viterbi_kernel
-        <<<n_rows, VITERBI_THREADS, 0, stream>>>(
-            d_weight, d_lut, d_row_scales, d_packed,
-            d_cost_a, d_cost_b, d_backtrace,
-            in_features, num_symbols, row_offset);
-}
-
-// ---------------------------------------------------------------------------
-// Least-squares scale refinement kernel.
-// ---------------------------------------------------------------------------
-//
-// After Viterbi/Greedy picks the optimal state sequence, the heuristic scale
-// (max|row|/3) is suboptimal.  The MSE-optimal scale for a fixed state
-// sequence is:
-//
-//   s* = dot(w_rotated, lut_values) / dot(lut_values, lut_values)
-//
-// where lut_values[i] = lut[state_for_i].  This kernel replays the trellis
-// from the packed symbols, reconstructs the unscaled LUT values, and
-// computes the two dot products in one pass via parallel reduction.
-//
-// One CUDA block per row, SCALE_THREADS threads.
-
-__global__ void qtip_refine_scales_kernel(
-    const float*   __restrict__ weight,      // [n_rows, in_features] rotated
-    const uint8_t* __restrict__ packed,       // [n_rows, num_symbols / 2]
-    const float*   __restrict__ lut,          // [LUT_SIZE * V]
-    float*         __restrict__ row_scales,   // [n_rows] — updated in-place
-    int in_features,
-    int num_symbols
-) {
-    __shared__ float s_dot_wl[SCALE_THREADS];
-    __shared__ float s_dot_ll[SCALE_THREADS];
-
-    int row = blockIdx.x;
-    int tid = threadIdx.x;
-
-    const float*   my_row = weight + (size_t)row * in_features;
-    const uint8_t* my_pkd = packed + (size_t)row * (num_symbols / 2);
-
-    // Each thread accumulates partial sums over its strided slice of symbols.
-    float dot_wl = 0.0f;
-    float dot_ll = 0.0f;
-
-    // Replay the trellis to recover states.  The trellis is sequential
-    // (state_t depends on state_{t-1}), but we only need the LUT values
-    // which are determined by the state AFTER each symbol.  We can replay
-    // serially on thread 0 and broadcast, but that serialises the row.
-    //
-    // Better: each thread independently replays ALL symbols (cheap — just
-    // shift+mask per symbol) but only accumulates its own strided portion.
-    // The replay is identical across threads (deterministic), so this is
-    // correct and fully parallel for the dot products.
-
-    uint32_t state = 0u;
-    for (int t = 0; t < num_symbols; ++t) {
-        // Unpack symbol.
-        uint8_t byte = my_pkd[t / 2];
-        uint32_t sym = ((t & 1) == 0) ? (byte & 0x0Fu) : (byte >> 4);
-
-        state = ((state << QTIP_K) | sym) & QTIP_STATE_MASK;
-
-        // Only accumulate for this thread's slice.
-        if ((t % SCALE_THREADS) == tid) {
-            size_t off = (size_t)state * QTIP_V;
-            float l0 = lut[off + 0];
-            float l1 = lut[off + 1];
-            float w0 = my_row[t * 2 + 0];
-            float w1 = my_row[t * 2 + 1];
-            dot_wl += w0 * l0 + w1 * l1;
-            dot_ll += l0 * l0 + l1 * l1;
-        }
-    }
-
-    s_dot_wl[tid] = dot_wl;
-    s_dot_ll[tid] = dot_ll;
-    __syncthreads();
-
-    // Tree reduction.
-    for (int stride = SCALE_THREADS / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            s_dot_wl[tid] += s_dot_wl[tid + stride];
-            s_dot_ll[tid] += s_dot_ll[tid + stride];
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0) {
-        float denom = s_dot_ll[0];
-        float s = (denom > 0.0f) ? (s_dot_wl[0] / denom) : row_scales[row];
-        row_scales[row] = s;
+    if (cb_mult != 0u) {
+        qtip_quantize_rows_viterbi_kernel<true>
+            <<<n_rows, VITERBI_THREADS, 0, stream>>>(
+                d_weight, d_lut, d_row_scales, d_packed,
+                d_cost_a, d_cost_b, d_backtrace,
+                in_features, num_symbols, row_offset, cb_mult);
+    } else {
+        qtip_quantize_rows_viterbi_kernel<false>
+            <<<n_rows, VITERBI_THREADS, 0, stream>>>(
+                d_weight, d_lut, d_row_scales, d_packed,
+                d_cost_a, d_cost_b, d_backtrace,
+                in_features, num_symbols, row_offset, 0u);
     }
 }
 
-// ----- Scale refinement launch -----------------------------------------------
+// ----- Scale refinement launch (kernel is in the anonymous namespace above:
+// a template cannot have C linkage, so only the launcher lives here) --------
 
 void launch_qtip_refine_scales_f32(
     const float*   d_weight,
@@ -653,12 +703,20 @@ void launch_qtip_refine_scales_f32(
     int n_rows,
     int in_features,
     int num_symbols,
+    unsigned int   cb_mult,
     cudaStream_t   stream
 ) {
-    qtip_refine_scales_kernel
-        <<<n_rows, SCALE_THREADS, 0, stream>>>(
-            d_weight, d_packed, d_lut, d_row_scales,
-            in_features, num_symbols);
+    if (cb_mult != 0u) {
+        qtip_refine_scales_kernel<true>
+            <<<n_rows, SCALE_THREADS, 0, stream>>>(
+                d_weight, d_packed, d_lut, d_row_scales,
+                in_features, num_symbols, cb_mult);
+    } else {
+        qtip_refine_scales_kernel<false>
+            <<<n_rows, SCALE_THREADS, 0, stream>>>(
+                d_weight, d_packed, d_lut, d_row_scales,
+                in_features, num_symbols, 0u);
+    }
 }
 
 } // extern "C"

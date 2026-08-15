@@ -35,6 +35,12 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+// The `sum2` computed codebook. RUN-161 already deleted the LUT *load* from
+// this kernel by evaluating the Gaussian in registers — but that costs a
+// logf + sqrtf + sincosf per weight on the SFU. The sum2 code replaces all
+// three transcendentals with IMAD/LOP3/cvt/FADD.
+#include "qtip_codebook.cuh"
+
 namespace {
 
 constexpr uint32_t QTIP_K          = 4;
@@ -118,6 +124,18 @@ __device__ __forceinline__ float2 qtip_decode_state(uint32_t state) {
     float s, c;
     sincosf(theta, &s, &c);
     return make_float2(r * c, r * s);  // (g0, g1) == (lut[2*state], lut[2*state+1])
+}
+
+// Codebook dispatch for the decode loop. `COMPUTED_CB == false` keeps the
+// RUN-161 Gaussian-in-registers behaviour byte-for-byte; `true` is the sum2
+// code. `mult` is unused in the Gaussian arm (the Gaussian codebook has no
+// tunable constant — it is a pure function of the state).
+template <bool COMPUTED_CB>
+__device__ __forceinline__ float2 gg_codeword(uint32_t state, unsigned int mult) {
+    if (COMPUTED_CB) {
+        return qtip_cb_sum2(state, mult);
+    }
+    return qtip_decode_state(state);
 }
 
 // One block per (output row, pair). Reads the pair's expert id on-device,
@@ -264,7 +282,7 @@ qtip_gather_gemv_v2_k4_l16_kernel(
 // vs a ~10^4 op/weight compute budget). R independent rows give the ILP to hide
 // long_scoreboard (warm-up global reads) + wait (state-carry dep) and push
 // inst/cyc up toward peak, where memory finally becomes the wall.
-template <typename T, int WARPS_PER_BLOCK, int ROWS_PER_WARP>
+template <typename T, int WARPS_PER_BLOCK, int ROWS_PER_WARP, bool COMPUTED_CB>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32)
 qtip_gather_gemv_warp_kernel(
     const uint8_t*  __restrict__ packed,
@@ -278,7 +296,8 @@ qtip_gather_gemv_warp_kernel(
     int num_symbols,
     int n_pairs,
     int num_experts,
-    int stage_packed   // 1 => block's packed rows staged to shared (set by launcher)
+    int stage_packed,  // 1 => block's packed rows staged to shared (set by launcher)
+    unsigned int cb_mult
 ) {
     // Shared layout: [LUT floats][packed bytes for this block's rows].
     //   - LUT staged when it fits (L=8 -> 2 KB; L>=~13 falls back to global LUT).
@@ -388,7 +407,7 @@ qtip_gather_gemv_warp_kernel(
                 const uint8_t b = row_packed[s >> 1];
                 const uint32_t sym = (s & 1) ? ((b >> 4) & 0x0F) : (b & 0x0F);
                 state = ((state << QTIP_K) | sym) & QTIP_STATE_MASK;
-                const float2 w = qtip_decode_state(state);
+                const float2 w = gg_codeword<COMPUTED_CB>(state, cb_mult);
                 a = fmaf(w.x * scale, xg[j].x, a);
                 a = fmaf(w.y * scale, xg[j].y, a);
             }
@@ -412,91 +431,51 @@ qtip_gather_gemv_warp_kernel(
 
 extern "C" {
 
-void launch_qtip_gather_gemv_v2_k4_l16_bf16(
-    const uint8_t*       d_packed,
-    const float*         d_row_scales,
-    const float*         d_lut,
-    const __nv_bfloat16* d_x_rotated,
-    const uint32_t*      d_indices,
-    __nv_bfloat16*       d_y,
-    int n_rows,
-    int packed_per_row,
-    int num_symbols,
-    int n_pairs,
-    int num_experts,
-    cudaStream_t         stream
-) {
-    constexpr int WARPS_PER_BLOCK = 8;
-    constexpr int ROWS_PER_WARP = 2;   // register-blocking: rows/warp (x reused)
-    constexpr int ROWS_PER_BLOCK = WARPS_PER_BLOCK * ROWS_PER_WARP;
-    // RUN-161: codebook is computed in-register, so shared memory only ever
-    // stages the packed weight bytes (no LUT term anymore).
-    const size_t packed_smem = (size_t)ROWS_PER_BLOCK * packed_per_row;
-    const bool   stage_packed = packed_smem <= 48 * 1024;                         // stage weights into shared when they fit
-    const size_t SHMEM = stage_packed ? packed_smem : 0;
-    dim3 grid((n_rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, n_pairs, 1);
-    qtip_gather_gemv_warp_kernel<__nv_bfloat16, WARPS_PER_BLOCK, ROWS_PER_WARP>
-        <<<grid, WARPS_PER_BLOCK * 32, SHMEM, stream>>>(
-            d_packed, d_row_scales, d_lut, d_x_rotated, d_indices, d_y,
-            n_rows, packed_per_row, num_symbols, n_pairs, num_experts, stage_packed ? 1 : 0);
-}
+// `cb_mult == 0` selects the RUN-161 in-register Gaussian (bit-faithful to the
+// stored 512 KiB LUT it replaced); nonzero selects the computed sum2 codebook
+// with that MCG multiplier. See qtip_codebook.cuh.
+#define QTIP_GATHER_GEMV_LAUNCHER(NAME, T)                                            \
+    void NAME(const uint8_t*  d_packed,                                               \
+              const float*    d_row_scales,                                           \
+              const float*    d_lut,                                                  \
+              const T*        d_x_rotated,                                            \
+              const uint32_t* d_indices,                                              \
+              T*              d_y,                                                    \
+              int n_rows,                                                             \
+              int packed_per_row,                                                     \
+              int num_symbols,                                                        \
+              int n_pairs,                                                            \
+              int num_experts,                                                        \
+              unsigned int cb_mult,                                                   \
+              cudaStream_t    stream) {                                               \
+        constexpr int WARPS_PER_BLOCK = 8;                                            \
+        constexpr int ROWS_PER_WARP = 2;  /* register-blocking: rows/warp (x reused) */ \
+        constexpr int ROWS_PER_BLOCK = WARPS_PER_BLOCK * ROWS_PER_WARP;               \
+        /* RUN-161: codebook is computed in-register, so shared memory only ever      \
+           stages the packed weight bytes (no LUT term anymore). */                   \
+        const size_t packed_smem = (size_t)ROWS_PER_BLOCK * packed_per_row;           \
+        const bool   stage_packed = packed_smem <= 48 * 1024;                         \
+        const size_t SHMEM = stage_packed ? packed_smem : 0;                          \
+        dim3 grid((n_rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, n_pairs, 1);        \
+        if (cb_mult != 0u) {                                                          \
+            qtip_gather_gemv_warp_kernel<T, WARPS_PER_BLOCK, ROWS_PER_WARP, true>     \
+                <<<grid, WARPS_PER_BLOCK * 32, SHMEM, stream>>>(                      \
+                    d_packed, d_row_scales, d_lut, d_x_rotated, d_indices, d_y,       \
+                    n_rows, packed_per_row, num_symbols, n_pairs, num_experts,        \
+                    stage_packed ? 1 : 0, cb_mult);                                   \
+        } else {                                                                      \
+            qtip_gather_gemv_warp_kernel<T, WARPS_PER_BLOCK, ROWS_PER_WARP, false>    \
+                <<<grid, WARPS_PER_BLOCK * 32, SHMEM, stream>>>(                      \
+                    d_packed, d_row_scales, d_lut, d_x_rotated, d_indices, d_y,       \
+                    n_rows, packed_per_row, num_symbols, n_pairs, num_experts,        \
+                    stage_packed ? 1 : 0, 0u);                                        \
+        }                                                                             \
+    }
 
-void launch_qtip_gather_gemv_v2_k4_l16_f16(
-    const uint8_t* d_packed,
-    const float*   d_row_scales,
-    const float*   d_lut,
-    const __half*  d_x_rotated,
-    const uint32_t* d_indices,
-    __half*        d_y,
-    int n_rows,
-    int packed_per_row,
-    int num_symbols,
-    int n_pairs,
-    int num_experts,
-    cudaStream_t   stream
-) {
-    constexpr int WARPS_PER_BLOCK = 8;
-    constexpr int ROWS_PER_WARP = 2;   // register-blocking: rows/warp (x reused)
-    constexpr int ROWS_PER_BLOCK = WARPS_PER_BLOCK * ROWS_PER_WARP;
-    // RUN-161: codebook is computed in-register, so shared memory only ever
-    // stages the packed weight bytes (no LUT term anymore).
-    const size_t packed_smem = (size_t)ROWS_PER_BLOCK * packed_per_row;
-    const bool   stage_packed = packed_smem <= 48 * 1024;                         // stage weights into shared when they fit
-    const size_t SHMEM = stage_packed ? packed_smem : 0;
-    dim3 grid((n_rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, n_pairs, 1);
-    qtip_gather_gemv_warp_kernel<__half, WARPS_PER_BLOCK, ROWS_PER_WARP>
-        <<<grid, WARPS_PER_BLOCK * 32, SHMEM, stream>>>(
-            d_packed, d_row_scales, d_lut, d_x_rotated, d_indices, d_y,
-            n_rows, packed_per_row, num_symbols, n_pairs, num_experts, stage_packed ? 1 : 0);
-}
+QTIP_GATHER_GEMV_LAUNCHER(launch_qtip_gather_gemv_v2_k4_l16_bf16, __nv_bfloat16)
+QTIP_GATHER_GEMV_LAUNCHER(launch_qtip_gather_gemv_v2_k4_l16_f16,  __half)
+QTIP_GATHER_GEMV_LAUNCHER(launch_qtip_gather_gemv_v2_k4_l16_f32,  float)
 
-void launch_qtip_gather_gemv_v2_k4_l16_f32(
-    const uint8_t* d_packed,
-    const float*   d_row_scales,
-    const float*   d_lut,
-    const float*   d_x_rotated,
-    const uint32_t* d_indices,
-    float*         d_y,
-    int n_rows,
-    int packed_per_row,
-    int num_symbols,
-    int n_pairs,
-    int num_experts,
-    cudaStream_t   stream
-) {
-    constexpr int WARPS_PER_BLOCK = 8;
-    constexpr int ROWS_PER_WARP = 2;   // register-blocking: rows/warp (x reused)
-    constexpr int ROWS_PER_BLOCK = WARPS_PER_BLOCK * ROWS_PER_WARP;
-    // RUN-161: codebook is computed in-register, so shared memory only ever
-    // stages the packed weight bytes (no LUT term anymore).
-    const size_t packed_smem = (size_t)ROWS_PER_BLOCK * packed_per_row;
-    const bool   stage_packed = packed_smem <= 48 * 1024;                         // stage weights into shared when they fit
-    const size_t SHMEM = stage_packed ? packed_smem : 0;
-    dim3 grid((n_rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, n_pairs, 1);
-    qtip_gather_gemv_warp_kernel<float, WARPS_PER_BLOCK, ROWS_PER_WARP>
-        <<<grid, WARPS_PER_BLOCK * 32, SHMEM, stream>>>(
-            d_packed, d_row_scales, d_lut, d_x_rotated, d_indices, d_y,
-            n_rows, packed_per_row, num_symbols, n_pairs, num_experts, stage_packed ? 1 : 0);
-}
+#undef QTIP_GATHER_GEMV_LAUNCHER
 
 } // extern "C"

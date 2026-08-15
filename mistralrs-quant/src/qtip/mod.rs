@@ -60,6 +60,8 @@ mod bake_memory_tests;
 #[cfg(test)]
 mod bake_quality_tests;
 pub mod bitshift;
+#[cfg(test)]
+mod codebook_tests;
 #[cfg(feature = "cuda")]
 mod cuda_ops;
 #[cfg(feature = "cuda")]
@@ -408,6 +410,241 @@ fn box_muller(u1: f32, u2: f32) -> (f32, f32) {
     (r * theta.cos(), r * theta.sin())
 }
 
+// ===========================================================================
+// The computed codebook (wave24-AU) — the K=4/V=2 twin of the qtip2b rung's
+// `mcg_codeword`.
+// ===========================================================================
+
+/// MCG multiplier for the computed K=4/V=2 codebook. Same spectrally-optimized
+/// constant the `qtip2b` rung ships (`bitshift::QTIP2B_MCG_MULT`,
+/// exllamav3 PR #26); measured indistinguishable from EXL3's original
+/// `0xCBAC1FED` at this geometry (+0.37% vs +0.26% weight NMSE, inside the
+/// fixture noise).
+pub const QTIP_MCG_V2_MULT: u32 = 0xCAF6_A435;
+
+/// σ of the computed `sum2` codebook over all 2^16 states (both V values),
+/// measured in f64. Pinned by `computed_codebook_sigma_matches_constant`.
+///
+/// This is the K=4/V=2 analogue of the 1.2064 that
+/// `bitshift::QTIP2B_SCALE_DIVISOR` folds in at K=2/V=1; it differs
+/// because the second value of each pair comes from a *chained* product, whose
+/// masked-fp16 halves have a slightly wider spread (1.2444 vs 1.2064).
+pub(crate) const QTIP_MCG_V2_SIGMA: f32 = 1.225_552;
+
+/// Row-scale divisor for the computed codebook: `max|row| / (3 · σ)`.
+///
+/// The Gaussian LUT is unit-σ by construction, so the rung's historical policy
+/// is `max|row| / 3`. The computed codebook is not normalized in the table —
+/// normalizing the *values* would cost a multiply on every decoded weight,
+/// which is exactly the instruction budget this change exists to save — so σ
+/// is folded into the divisor instead. Same policy, same objective (the search
+/// minimises `Σ(cb − t/scale)²`, and scaling cb by 1/σ while scaling the
+/// divisor by σ leaves the argmin identical), zero decode cost. This mirrors
+/// `QTIP2B_SCALE_DIVISOR = 3.0 × 1.2064` on the sibling rung.
+pub(crate) const QTIP_MCG_V2_SCALE_DIVISOR: f32 = 3.0 * QTIP_MCG_V2_SIGMA;
+
+/// Divisor for the Gaussian LUT: it is already unit-σ, so `max|row| / 3`.
+pub(crate) const QTIP_GAUSSIAN_SCALE_DIVISOR: f32 = 3.0;
+
+/// The `cb_mult` value every K=4/V=2 CUDA launcher reads as "gather the
+/// reproduction values from the stored table".
+///
+/// 0 is a safe sentinel because an MCG multiplier must be odd to have full
+/// period, so it can never name a real computed codebook. Produced only by
+/// [`QtipCodebook::cuda_mult`].
+pub(crate) const CB_MULT_GAUSSIAN_LUT: u32 = 0;
+
+/// One masked MCG product folded to a codeword: `(x & 0x8FFF8FFF) ^ 0x3B603B60`,
+/// then the two fp16 halves summed **in f32**.
+///
+/// The f32 sum (rather than `__hadd`) is what makes the CUDA kernel
+/// bit-identical to this reference: both fp16→f32 conversions are exact and the
+/// f32 add is correctly rounded. Mirrors `qtip_cb_fold` in
+/// `kernels/qtip/qtip_codebook.cuh`.
+#[inline]
+fn mcg_fold(x: u32) -> f32 {
+    let m = (x & 0x8FFF_8FFF) ^ 0x3B60_3B60;
+    let hi = half::f16::from_bits((m >> 16) as u16);
+    let lo = half::f16::from_bits((m & 0xFFFF) as u16);
+    hi.to_f32() + lo.to_f32()
+}
+
+/// The V=2 codeword pair for trellis `state`, "sum2" construction.
+///
+/// `v0` folds `state · mult`; `v1` folds the **chained** product
+/// `state · mult²`. Both values therefore have the sum-of-two-masked-halves
+/// distribution the `qtip2b` rung already ships and measures, which is the
+/// whole point: the cheaper alternative ("split", taking the two halves of one
+/// product as the pair) cannot produce `|v| < 0.142` — the mask keeps 12 low
+/// bits and the XOR pins each half's exponent into 12..15 — and so puts a hole
+/// in the codebook exactly where a Gaussian weight distribution has most of its
+/// mass. Measured at this geometry (wave19-AP part 2): sum2 is **+0.00017 cos /
+/// +0.37% weight NMSE** against the Gaussian LUT (neutral, 3–8× inside the
+/// fixture noise), split is **−0.00174 cos / +3.73% NMSE**.
+///
+/// Mirrors `qtip_cb_sum2` in `kernels/qtip/qtip_codebook.cuh`.
+#[inline]
+pub fn mcg_codeword_v2(state: u32, mult: u32) -> (f32, f32) {
+    let x0 = (state & STATE_MASK).wrapping_mul(mult);
+    let x1 = x0.wrapping_mul(mult);
+    (mcg_fold(x0), mcg_fold(x1))
+}
+
+/// Materialize the computed codebook in the same `[2^L, V]` flat layout as
+/// [`gaussian_lut`], so it is a drop-in for the search and the CPU decode.
+///
+/// The GPU decode paths never call this — they compute each codeword in
+/// registers, which is the point. It exists because the CPU Viterbi/beam inner
+/// loop wants a flat table, and because keeping the table in the artifact is
+/// what lets a reader that predates the codebook discriminator still decode a
+/// new bake correctly.
+pub(crate) fn mcg_codebook_v2(mult: u32) -> Vec<f32> {
+    let mut cb = Vec::with_capacity(LUT_SIZE * V as usize);
+    for state in 0..(1u32 << L) {
+        let (v0, v1) = mcg_codeword_v2(state, mult);
+        cb.push(v0);
+        cb.push(v1);
+    }
+    cb
+}
+
+/// Which codebook a [`QtipLayer`]'s symbols decode against.
+///
+/// **This is a format discriminator, not a runtime knob.** The two codebooks
+/// produce different reproduction values, so an artifact baked against one
+/// cannot be decoded against the other. It is serialized into the UQFF and
+/// read back; artifacts written before the field existed end at EOF and are
+/// [`QtipCodebook::Gaussian`], which is what they are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QtipCodebook {
+    /// The original 65,536 × 2 Box-Muller table ([`gaussian_lut`]), gathered
+    /// from memory at decode time.
+    Gaussian,
+    /// The computed "sum2" MCG code — no table read anywhere. `mult` is the
+    /// MCG multiplier so a future retune stays readable.
+    Mcg { mult: u32 },
+}
+
+impl Default for QtipCodebook {
+    /// What a fresh bake uses when nothing says otherwise.
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl QtipCodebook {
+    /// The computed codebook at the multiplier this rung ships.
+    pub const COMPUTED: Self = QtipCodebook::Mcg {
+        mult: QTIP_MCG_V2_MULT,
+    };
+
+    /// What a fresh bake picks when `ARC_QTIP_CODEBOOK` says nothing. Old
+    /// artifacts always keep whatever they were written with; this only decides
+    /// what a new quantize produces.
+    ///
+    /// **Still `Gaussian`, and the flip to [`Self::COMPUTED`] is this one
+    /// line.** It is deliberately not taken in the change that introduces the
+    /// mechanism: switching it changes what every future artifact *means*, and
+    /// the two are separable — the port is worthless if it is wrong, and the
+    /// flip is worthless if it is unmeasured. Set `ARC_QTIP_CODEBOOK=mcg` to
+    /// bake against the computed codebook today.
+    pub const DEFAULT: Self = QtipCodebook::Gaussian;
+
+    /// Read the codebook choice from the environment. `ARC_QTIP_CODEBOOK` is
+    /// `mcg` (default) or `gaussian`; anything else is refused rather than
+    /// silently resolved, because picking the wrong one changes the artifact.
+    pub fn from_env() -> Result<Self> {
+        match std::env::var("ARC_QTIP_CODEBOOK").as_deref() {
+            Err(_) | Ok("") => Ok(Self::DEFAULT),
+            Ok("mcg") | Ok("computed") | Ok("sum2") => Ok(Self::COMPUTED),
+            Ok("gaussian") | Ok("lut") => Ok(QtipCodebook::Gaussian),
+            Ok(other) => candle_core::bail!(
+                "ARC_QTIP_CODEBOOK={other:?} is not a codebook. Use `mcg` (computed, default) \
+                 or `gaussian` (the stored LUT). Refusing rather than guessing — the choice \
+                 changes the artifact's reproduction values."
+            ),
+        }
+    }
+
+    /// `max|row| / divisor` is the per-row scale policy; this is the divisor.
+    pub fn scale_divisor(self) -> f32 {
+        match self {
+            QtipCodebook::Gaussian => QTIP_GAUSSIAN_SCALE_DIVISOR,
+            QtipCodebook::Mcg { .. } => QTIP_MCG_V2_SCALE_DIVISOR,
+        }
+    }
+
+    /// The `[2^L, V]` table. Always materialized for the CPU search and for
+    /// the artifact; the GPU decode paths compute instead.
+    pub(crate) fn materialize(self) -> Vec<f32> {
+        match self {
+            QtipCodebook::Gaussian => gaussian_lut(),
+            QtipCodebook::Mcg { mult } => mcg_codebook_v2(mult),
+        }
+    }
+
+    /// The CUDA ABI selector: [`CB_MULT_GAUSSIAN_LUT`] (0) means "gather from
+    /// the stored table", nonzero is the MCG multiplier. This is the only thing
+    /// that produces the value every K=4/V=2 launcher takes.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn cuda_mult(self) -> u32 {
+        match self {
+            QtipCodebook::Gaussian => CB_MULT_GAUSSIAN_LUT,
+            QtipCodebook::Mcg { mult } => mult,
+        }
+    }
+
+    /// Short label for bake headers and error messages.
+    pub fn tag(self) -> String {
+        match self {
+            QtipCodebook::Gaussian => "gaussian-lut".to_string(),
+            QtipCodebook::Mcg { mult } => format!("mcg-sum2({mult:#010X})"),
+        }
+    }
+
+    /// Wire encoding, appended after the search-detail section.
+    ///
+    /// **`Gaussian` writes nothing.** The discriminator is purely additive: an
+    /// artifact baked against the stored table is byte-identical to one this
+    /// codebase produced before the field existed, so no reader, test, or
+    /// checksum that predates it moves. Absence has always meant "gather from
+    /// the stored table" and still does; only the codebook that *cannot* be
+    /// read off the table announces itself.
+    ///
+    /// Tag `0` is deliberately unused, so a zero byte from a corrupt or
+    /// zero-padded payload is refused rather than read as a valid codebook.
+    /// Tag `1` is reserved for a future codebook that needs to be named
+    /// explicitly rather than inferred from absence.
+    fn to_wire(self) -> Option<(u8, u32)> {
+        match self {
+            QtipCodebook::Gaussian => None,
+            QtipCodebook::Mcg { mult } => Some((2, mult)),
+        }
+    }
+
+    /// Parse the wire tag, reading the multiplier only when the tag calls for
+    /// one. Unknown tags fail closed (DOCTRINE: refuse, never launder).
+    fn from_wire(tag: u8, read_mult: impl FnOnce() -> Result<u32>) -> Result<Self> {
+        match tag {
+            2 => {
+                let mult = read_mult()?;
+                if mult == 0 || mult % 2 == 0 {
+                    candle_core::bail!(
+                        "QtipLayer: computed-codebook multiplier {mult:#010X} is even. An MCG \
+                         multiplier must be odd to have full period; this payload is corrupt."
+                    );
+                }
+                Ok(QtipCodebook::Mcg { mult })
+            }
+            other => candle_core::bail!(
+                "QtipLayer: unknown codebook tag {other} in the UQFF payload. This artifact was \
+                 written by a newer Arc than this build understands; refusing rather than \
+                 decoding its symbols against the wrong codebook."
+            ),
+        }
+    }
+}
+
 /// QTIP 2-bit weight layer.
 ///
 /// # Storage layout — two modes
@@ -494,6 +731,14 @@ pub struct QtipLayer {
     /// it has no `Default` — [`QtipSearchDetail::Unknown`] is the only way to
     /// say "not recorded", and it refuses to serialize.
     search_detail: QtipSearchDetail,
+    /// Which codebook `lut` holds, and therefore which reproduction values
+    /// these symbols mean. [`QtipCodebook::Gaussian`] for every artifact
+    /// written before the discriminator existed — those keep gathering from
+    /// their stored table exactly as they always did. A
+    /// [`QtipCodebook::Mcg`] layer's `lut` holds the same values the decode
+    /// computes, so the table stays a correct fallback (and the CPU search
+    /// still wants a flat one) while every GPU path skips it entirely.
+    codebook: QtipCodebook,
 }
 
 /// Borrowed, dequantization-free view of a [`QtipLayer`]'s packed trellis
@@ -654,19 +899,37 @@ pub struct QtipBakeConfig {
     /// Whether to use the diagonal-Hessian objective when calibration data is
     /// available.
     pub hessian: bool,
+    /// Which codebook the symbols will mean. Unlike `search` and `hessian`
+    /// this is not a quality/speed dial — it is the artifact's format — so an
+    /// unrecognised `ARC_QTIP_CODEBOOK` is refused instead of defaulted.
+    pub codebook: QtipCodebook,
 }
 
 impl QtipBakeConfig {
     /// Read (and memoise) the bake configuration from the environment.
-    pub fn get() -> Self {
-        static CFG: std::sync::OnceLock<QtipBakeConfig> = std::sync::OnceLock::new();
-        *CFG.get_or_init(|| QtipBakeConfig {
-            search: TrellisSearch::from_env(),
-            hessian: matches!(
-                std::env::var("ARC_QTIP_HESSIAN").as_deref(),
-                Ok("1") | Ok("true") | Ok("on")
-            ),
-        })
+    ///
+    /// Fallible because `ARC_QTIP_CODEBOOK` fails closed: a typo there would
+    /// otherwise silently bake against a different codebook than the operator
+    /// asked for, and unlike a mis-set beam width that is not recoverable by
+    /// re-reading the artifact.
+    pub fn get() -> Result<Self> {
+        static CFG: std::sync::OnceLock<std::result::Result<QtipBakeConfig, String>> =
+            std::sync::OnceLock::new();
+        let cfg = CFG.get_or_init(|| {
+            let codebook = QtipCodebook::from_env().map_err(|e| e.to_string())?;
+            Ok(QtipBakeConfig {
+                search: TrellisSearch::from_env(),
+                hessian: matches!(
+                    std::env::var("ARC_QTIP_HESSIAN").as_deref(),
+                    Ok("1") | Ok("true") | Ok("on")
+                ),
+                codebook,
+            })
+        });
+        match cfg {
+            Ok(c) => Ok(*c),
+            Err(msg) => candle_core::bail!("{msg}"),
+        }
     }
 }
 
@@ -701,8 +964,10 @@ fn bake_header_line(
         "off".to_string()
     };
     format!(
-        "QTIP bake [{rung}]: mode={} search={search} objective={objective} rotation={rotation}",
-        mode.tag()
+        "QTIP bake [{rung}]: mode={} search={search} objective={objective} \
+         rotation={rotation} codebook={}",
+        mode.tag(),
+        cfg.codebook.tag()
     )
 }
 
@@ -1332,7 +1597,7 @@ impl QtipLayer {
             mode,
             use_rotation,
             hessian_diag,
-            QtipBakeConfig::get(),
+            QtipBakeConfig::get()?,
         )
     }
 
@@ -1417,6 +1682,7 @@ impl QtipLayer {
                 mode,
                 use_rotation,
                 cuda_search,
+                bake_cfg.codebook,
             )? {
                 Some(layer) => return Ok(layer),
                 None => candle_core::bail!(
@@ -1442,8 +1708,12 @@ impl QtipLayer {
             );
         }
 
-        // Build the global LUT once.
-        let lut_data = gaussian_lut();
+        // Build the codebook once. For the computed codebook this table is
+        // what the CPU search reads and what goes into the artifact; the GPU
+        // decode paths never touch it (they compute each codeword in
+        // registers), which is the whole point of the change.
+        let codebook = bake_cfg.codebook;
+        let lut_data = codebook.materialize();
         let weight_data: Vec<f32> = weight_f32.flatten_all()?.to_vec1()?;
 
         // Compute the Hadamard incoherence rotation parameters (RUN-158).
@@ -1513,10 +1783,17 @@ impl QtipLayer {
                     row_slice
                 };
 
-                // Pick row scale = max(|row|) / 3.0 so most values live in [-3, 3] (the
-                // bulk of a standard normal). LUT values are in roughly [-4, 4].
+                // Pick row scale = max(|row|) / (3 sigma) so most values live
+                // in [-3 sigma, 3 sigma] (the bulk of the codebook). The
+                // Gaussian LUT is unit-sigma so its divisor is 3.0; the
+                // computed codebook folds its own sigma in — see
+                // `QtipCodebook::scale_divisor`.
                 let max_abs = working_row.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-                let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 3.0 };
+                let scale = if max_abs == 0.0 {
+                    1.0
+                } else {
+                    max_abs / codebook.scale_divisor()
+                };
                 let inv_scale = 1.0 / scale;
 
                 let mut packed = vec![0u8; num_symbols_per_row / 2];
@@ -1616,6 +1893,7 @@ impl QtipLayer {
                 bake_cfg.search,
                 search_weights.is_some(),
             ),
+            codebook,
         })
     }
 
@@ -1645,6 +1923,7 @@ impl QtipLayer {
         mode: QtipMode,
         use_rotation: bool,
         search: TrellisSearch,
+        codebook: QtipCodebook,
     ) -> Result<Option<Self>> {
         // Sanity preconditions; any failure falls through to CPU.
         let (n, k_in) = match weight.dims2() {
@@ -1667,8 +1946,12 @@ impl QtipLayer {
         // bf16->f32 widening is exact, so this is bit-identical. RUN-161.
         let weight_cuda_f32 = weight.to_device(device)?.to_dtype(DType::F32)?;
 
-        // Build LUT on host (tiny, ~512 KiB) and upload.
-        let lut_data = gaussian_lut();
+        // Build the codebook on host (~512 KiB) and upload. The quantize
+        // kernels ignore this buffer when the codebook is computed; it is
+        // uploaded anyway because it is what the artifact stores, and because
+        // an artifact whose table still matches its symbols stays decodable by
+        // a reader that predates the codebook discriminator.
+        let lut_data = codebook.materialize();
         let lut =
             Tensor::from_vec(lut_data, (LUT_SIZE, V as usize), &Device::Cpu)?.to_device(device)?;
 
@@ -1706,6 +1989,7 @@ impl QtipLayer {
             QtipBakeConfig {
                 search,
                 hessian: false,
+                codebook,
             },
             rotation_block,
             false,
@@ -1713,7 +1997,7 @@ impl QtipLayer {
 
         // Quantize (Viterbi or Greedy) on-device.
         let (blocks, row_scales) =
-            cuda_ops::quantize_rows_cuda(&weight_rotated, &lut, mode, search)?;
+            cuda_ops::quantize_rows_cuda(&weight_rotated, &lut, mode, search, codebook)?;
 
         let bias = bias.map(|b| b.to_device(device)).transpose()?;
         let rotation_signs = if rotation_block >= 2 {
@@ -1737,6 +2021,7 @@ impl QtipLayer {
             // actually ran. Every CUDA branch metric is unweighted, so the
             // objective bit is false by construction, not by omission.
             search_detail: QtipSearchDetail::for_bake(mode, search, false),
+            codebook,
         }))
     }
 
@@ -1791,7 +2076,7 @@ impl QtipLayer {
             mode,
             use_rotation,
             hessian_diag,
-            QtipBakeConfig::get(),
+            QtipBakeConfig::get()?,
         )
     }
 
@@ -1874,6 +2159,7 @@ impl QtipLayer {
         let mut shared_rotation_signs: Option<Tensor> = None;
         let mut shared_rotation_block: usize = 0;
         let mut shared_search_detail = QtipSearchDetail::Unknown;
+        let mut shared_codebook = QtipCodebook::Gaussian;
 
         // Per-expert streaming. The full stack is kept on CPU (caller passes
         // device=CPU for the 3-D experts to avoid the ~4GB dense BF16 transient
@@ -1994,6 +2280,7 @@ impl QtipLayer {
                 };
                 shared_rotation_block = layer.rotation_block;
                 shared_search_detail = layer.search_detail;
+                shared_codebook = layer.codebook;
             } else {
                 debug_assert_eq!(layer.lut.dims(), shared_lut.as_ref().unwrap().dims());
                 debug_assert_eq!(layer.rotation_block, shared_rotation_block);
@@ -2007,6 +2294,19 @@ impl QtipLayer {
                          mixed-provenance artifact.",
                         layer.search_detail.tag(),
                         shared_search_detail.tag()
+                    );
+                }
+                // Same argument for the codebook, and harder: a stack whose
+                // experts mean different reproduction values decodes to
+                // garbage, and the single stored table can only match one of
+                // them.
+                if layer.codebook != shared_codebook {
+                    candle_core::bail!(
+                        "QTIP 3-D quantize: expert chunk at {expert_idx} used codebook {} but \
+                         the stack already carries {} — refusing to build a stack whose experts \
+                         decode against different codebooks.",
+                        layer.codebook.tag(),
+                        shared_codebook.tag()
                     );
                 }
             }
@@ -2037,6 +2337,7 @@ impl QtipLayer {
             rotation_block: shared_rotation_block,
             search: QtipSearchStamp::for_mode(mode),
             search_detail: shared_search_detail,
+            codebook: shared_codebook,
         })
     }
 
@@ -2161,6 +2462,7 @@ impl QtipLayer {
                     &self.lut,
                     self.in_features,
                     DType::BF16,
+                    self.codebook,
                 )?;
                 if self.rotation_block >= 2 {
                     let signs = match &self.rotation_signs {
@@ -2207,6 +2509,7 @@ impl QtipLayer {
                     &self.lut,
                     k_in,
                     DType::BF16,
+                    self.codebook,
                 )?;
                 return if self.rotation_block >= 2 {
                     let signs = match &self.rotation_signs {
@@ -2464,6 +2767,7 @@ impl QtipLayer {
                 &self.lut,
                 &x_rotated,
                 k_in,
+                self.codebook,
             )?;
             if y.dtype() != out_dtype {
                 return y.to_dtype(out_dtype);
@@ -2481,6 +2785,7 @@ impl QtipLayer {
             &self.lut,
             k_in,
             w_dtype,
+            self.codebook,
         )?;
 
         let y = x_rotated.matmul(&w_rotated.t()?)?;
@@ -2557,6 +2862,7 @@ impl QtipLayer {
             &a_rotated,
             &idx_u32,
             self.in_features,
+            self.codebook,
         )?;
         let out = out_flat
             .reshape((n_tokens, n_experts_per_tok, rows))?
@@ -2629,6 +2935,7 @@ impl QtipLayer {
                 &self.lut,
                 self.in_features,
                 a_rotated_dtype,
+                self.codebook,
             )?;
             weight_cache.insert(e, w_e);
         }
@@ -2699,6 +3006,12 @@ impl QtipLayer {
     /// search we did not verify is the failure this stamp exists to end (D4).
     /// `search_detail` is the same contract one level finer (which trellis
     /// search): pass [`QtipSearchDetail::Unknown`] unless you ran it.
+    ///
+    /// `codebook` says what `lut` holds. [`QtipCodebook::Gaussian`] is the
+    /// always-safe answer for a loader that has no discriminator to read: it
+    /// means "gather from the supplied table", which decodes correctly no
+    /// matter which codebook produced the table — it just does not take the
+    /// computed-decode fast path.
     #[allow(clippy::too_many_arguments)]
     pub fn from_stacked_parts(
         blocks: Tensor,
@@ -2710,6 +3023,7 @@ impl QtipLayer {
         rotation_block: usize,
         search: QtipSearchStamp,
         search_detail: QtipSearchDetail,
+        codebook: QtipCodebook,
     ) -> Result<QtipLayer> {
         if blocks.dims().len() != 3 {
             candle_core::bail!(
@@ -2749,6 +3063,7 @@ impl QtipLayer {
             rotation_signs,
             rotation_block,
             search,
+            codebook,
         })
     }
 
@@ -2817,6 +3132,15 @@ impl QtipLayer {
                     head.search_detail.tag()
                 );
             }
+            // Only `head.lut` survives the stack, so experts that mean
+            // different reproduction values cannot be stacked at all.
+            if layer.codebook != head.codebook {
+                candle_core::bail!(
+                    "QtipLayer::stack_experts: layer {i} codebook={} != head {}",
+                    layer.codebook.tag(),
+                    head.codebook.tag()
+                );
+            }
         }
 
         let blocks_refs: Vec<&Tensor> = per_expert_layers.iter().map(|l| &l.blocks).collect();
@@ -2840,6 +3164,7 @@ impl QtipLayer {
             rotation_block,
             search: head.search,
             search_detail: head.search_detail,
+            codebook: head.codebook,
         })
     }
 
@@ -3089,6 +3414,14 @@ impl QuantMethod for QtipLayer {
                 // We did not run the search, so we do not claim it (D4).
                 search: QtipSearchStamp::Unstamped,
                 search_detail: QtipSearchDetail::Unknown,
+                // Same contract for the codebook: the config carries a table
+                // and no discriminator, so the only honest reading is "these
+                // symbols mean whatever that table says". `Gaussian` is
+                // exactly that instruction — gather from the stored values —
+                // and stays correct for a computed-codebook table, since the
+                // table holds the computed values. It only forgoes the
+                // in-register decode.
+                codebook: QtipCodebook::Gaussian,
             }),
             _ => candle_core::bail!("QtipLayer requires QuantMethodConfig::Qtip"),
         }
@@ -3328,6 +3661,15 @@ impl QtipLayer {
         self.search_detail
     }
 
+    /// Which codebook these symbols decode against.
+    /// [`QtipCodebook::Gaussian`] for every artifact written before the
+    /// discriminator existed, and for any loader that has no field to read it
+    /// from — in both cases it means "gather from the stored table", which is
+    /// correct for any table.
+    pub fn codebook(&self) -> QtipCodebook {
+        self.codebook
+    }
+
     /// Dequantize the i-th expert's `[N, K_in]` BF16 weight matrix (3-D mode
     /// only). Internal use by `gather_forward` and friends; bails when called
     /// on a 2-D layer or with `expert_idx >= num_experts`.
@@ -3433,6 +3775,11 @@ impl QtipLayer {
             // honest answer is "unknown" — see `QtipSearchStamp::enforce_at_load`.
             search: QtipSearchStamp::Unstamped,
             search_detail: QtipSearchDetail::Unknown,
+            // No codebook discriminator in safetensors either. Gather from the
+            // table that is actually in the checkpoint (or the synthesized
+            // Gaussian default above) — correct for any table, and never
+            // assumes a computed codebook we cannot verify.
+            codebook: QtipCodebook::Gaussian,
         }))
     }
 
@@ -3581,6 +3928,26 @@ impl QtipLayer {
             }
         };
 
+        // wave24-AU codebook discriminator. EOF here is the *answer*, not a
+        // truncation: the section is written only for a non-Gaussian codebook
+        // (`QtipCodebook::to_wire`), so its absence says "gather from the
+        // stored table" — which is what every payload without it has always
+        // meant. An unknown tag value, on the other hand, IS refused: that
+        // means a newer Arc wrote it, and decoding its symbols against a
+        // codebook we guessed would be silent corruption.
+        let codebook = match buffer.read_u8() {
+            Ok(tag) => QtipCodebook::from_wire(tag, || {
+                buffer.read_u32::<LittleEndian>().map_err(|_| {
+                    candle_core::Error::Msg(
+                        "QtipLayer: codebook tag claims a computed codebook but the multiplier \
+                         is missing (truncated payload)."
+                            .into(),
+                    )
+                })
+            })?,
+            Err(_) => QtipCodebook::Gaussian,
+        };
+
         Ok((
             Self {
                 blocks,
@@ -3593,6 +3960,7 @@ impl QtipLayer {
                 rotation_block,
                 search,
                 search_detail,
+                codebook,
             },
             ext_bias,
         ))
@@ -3667,6 +4035,20 @@ impl QuantizedSerde for QtipLayer {
         buffer.push(flags);
         if let Some(w) = beam_width {
             buffer.extend(&w.to_le_bytes());
+        }
+        // wave24-AU: the codebook discriminator, appended LAST and only when
+        // the codebook is not the historical Gaussian one — see
+        // `QtipCodebook::to_wire`. A Gaussian artifact is therefore byte-for-
+        // byte what this writer produced before the field existed.
+        //
+        // A build that predates the field, handed a computed-codebook payload,
+        // parses identically up to here and then ignores a trailing section it
+        // does not know about — and still decodes correctly, because the table
+        // written above holds the computed values. The tag buys the
+        // in-register decode, not correctness.
+        if let Some((cb_tag, cb_mult)) = self.codebook.to_wire() {
+            buffer.push(cb_tag);
+            buffer.extend(&cb_mult.to_le_bytes());
         }
         Ok(Cow::from(buffer))
     }
@@ -4417,6 +4799,7 @@ mod tests {
         let beam = QtipBakeConfig {
             search: TrellisSearch::Beam { width: 128 },
             hessian: true,
+            codebook: QtipCodebook::Gaussian,
         };
 
         let greedy = bake_header_line("K4/V2 2-bit", QtipMode::Greedy, beam, 0, false);
@@ -4436,6 +4819,24 @@ mod tests {
         assert!(viterbi.contains("hessian-diag"), "{viterbi}");
         assert!(viterbi.contains("rotation=hadamard-128"), "{viterbi}");
 
+        // wave24-AU: the codebook is part of what produced the artifact, so a
+        // bake log that omits it cannot be checked against the file. A computed
+        // bake must be distinguishable from a stored-table one by the header
+        // alone, and must name the multiplier it ran.
+        let computed = bake_header_line(
+            "K4/V2 2-bit",
+            QtipMode::Viterbi,
+            QtipBakeConfig {
+                codebook: QtipCodebook::COMPUTED,
+                ..beam
+            },
+            128,
+            true,
+        );
+        assert!(computed.contains("codebook=mcg-sum2"), "{computed}");
+        assert!(computed.contains("0xCAF6A435"), "{computed}");
+        assert!(!viterbi.contains("mcg"), "{viterbi}");
+
         // The shipped default must read as today's bake, unambiguously.
         let default = bake_header_line(
             "K4/V2 2-bit",
@@ -4447,7 +4848,7 @@ mod tests {
         assert_eq!(
             default,
             "QTIP bake [K4/V2 2-bit]: mode=viterbi search=viterbi-exhaustive \
-             objective=mse (unweighted) rotation=hadamard-128"
+             objective=mse (unweighted) rotation=hadamard-128 codebook=gaussian-lut"
         );
     }
 
@@ -4579,15 +4980,17 @@ mod tests {
             Tensor::from_vec(lut_data.clone(), (LUT_SIZE, V as usize), &cpu)?.to_device(&cuda)?;
 
         // Both sides must see the SAME per-row scale, so take the GPU kernel's.
-        let scales: Vec<f32> = cuda_ops::compute_row_scales_cuda(&w_cuda)?
-            .to_device(&cpu)?
-            .to_vec1()?;
+        let scales: Vec<f32> =
+            cuda_ops::compute_row_scales_cuda(&w_cuda, QTIP_GAUSSIAN_SCALE_DIVISOR)?
+                .to_device(&cpu)?
+                .to_vec1()?;
 
         let exhaustive: Vec<u8> = cuda_ops::quantize_rows_cuda(
             &w_cuda,
             &lut_cuda,
             QtipMode::Viterbi,
             TrellisSearch::Exhaustive,
+            QtipCodebook::Gaussian,
         )?
         .0
         .to_device(&cpu)?
@@ -4597,12 +5000,17 @@ mod tests {
         let mut any_differed = false;
         for width in [64usize, 128, 256] {
             let search = TrellisSearch::Beam { width };
-            let gpu: Vec<u8> =
-                cuda_ops::quantize_rows_cuda(&w_cuda, &lut_cuda, QtipMode::Viterbi, search)?
-                    .0
-                    .to_device(&cpu)?
-                    .flatten_all()?
-                    .to_vec1()?;
+            let gpu: Vec<u8> = cuda_ops::quantize_rows_cuda(
+                &w_cuda,
+                &lut_cuda,
+                QtipMode::Viterbi,
+                search,
+                QtipCodebook::Gaussian,
+            )?
+            .0
+            .to_device(&cpu)?
+            .flatten_all()?
+            .to_vec1()?;
             let reference = cpu_reference_packed(&wdata, n, k_in, &scales, &lut_data, search);
 
             assert_eq!(gpu.len(), reference.len());
@@ -4671,6 +5079,7 @@ mod tests {
             &lut_cuda,
             QtipMode::Viterbi,
             TrellisSearch::Exhaustive,
+            QtipCodebook::Gaussian,
         )?
         .0
         .to_device(&cpu)?
@@ -4681,6 +5090,7 @@ mod tests {
             &lut_cuda,
             QtipMode::Viterbi,
             TrellisSearch::Beam { width: 256 },
+            QtipCodebook::Gaussian,
         )?
         .0
         .to_device(&cpu)?
@@ -4724,9 +5134,10 @@ mod tests {
         let lut_cuda =
             Tensor::from_vec(lut_data.clone(), (LUT_SIZE, V as usize), &cpu)?.to_device(&cuda)?;
 
-        let scales: Vec<f32> = cuda_ops::compute_row_scales_cuda(&w_cuda)?
-            .to_device(&cpu)?
-            .to_vec1()?;
+        let scales: Vec<f32> =
+            cuda_ops::compute_row_scales_cuda(&w_cuda, QTIP_GAUSSIAN_SCALE_DIVISOR)?
+                .to_device(&cpu)?
+                .to_vec1()?;
         // The row-scale kernel must agree with `max_abs / 3.0` exactly, too.
         for row in 0..n {
             let max_abs = wdata[row * k_in..(row + 1) * k_in]
@@ -4746,6 +5157,7 @@ mod tests {
             &lut_cuda,
             QtipMode::Viterbi,
             TrellisSearch::Exhaustive,
+            QtipCodebook::Gaussian,
         )?
         .0
         .to_device(&cpu)?
@@ -5165,6 +5577,7 @@ mod tests {
         let mut shared_rotation_signs: Option<Tensor> = None;
         let mut shared_rotation_block: usize = 0;
         let mut shared_search_detail = QtipSearchDetail::Unknown;
+        let mut shared_codebook = QtipCodebook::Gaussian;
         for expert_idx in 0..e {
             let expert_w = w.narrow(0, expert_idx, 1)?.squeeze(0)?;
             let layer = QtipLayer::quantize_with_options_concrete(
@@ -5181,6 +5594,7 @@ mod tests {
                 shared_rotation_signs = layer.rotation_signs;
                 shared_rotation_block = layer.rotation_block;
                 shared_search_detail = layer.search_detail;
+                shared_codebook = layer.codebook;
             }
         }
         let blocks_3d = Tensor::stack(&blocks_slices, 0)?;
@@ -5196,6 +5610,7 @@ mod tests {
             rotation_block: shared_rotation_block,
             search: QtipSearchStamp::for_mode(mode),
             search_detail: shared_search_detail,
+            codebook: shared_codebook,
         })
         .inspect(|l| {
             debug_assert_eq!(l.blocks.dims(), &[e, n, k_in / 4]);
