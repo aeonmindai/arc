@@ -24,7 +24,8 @@ use std::borrow::Cow;
 use std::sync::{atomic::AtomicUsize, Arc};
 
 use super::{
-    Qtip2bLayer, QtipCodebook, QtipLayer, QtipMode, QtipRotation, QtipSearchDetail, QtipSearchStamp,
+    Qtip2bLayer, QtipBakeConfig, QtipCodebook, QtipLayer, QtipMode, QtipRotation, QtipSearchDetail,
+    QtipSearchStamp,
 };
 use crate::{
     IsqType, QuantMethod, QuantMethodConfig, QuantizeOntoGuard, QuantizedSerde, UnquantLinear,
@@ -70,6 +71,17 @@ fn codebook_section_len(cb: QtipCodebook) -> usize {
 /// Section length for a payload that carries no codebook discriminator: the
 /// qtip2b rung, and any qtip2 payload written against the stored table.
 const CB_NONE: usize = 0;
+
+/// Section length for a qtip2 payload produced by a **production** bake.
+///
+/// Reads the bake config rather than `QtipCodebook::DEFAULT`, because
+/// `ARC_QTIP_CODEBOOK` can select the computed codebook at run time — and a
+/// helper that assumed the compile-time default would start silently reading a
+/// multiplier byte as a search stamp the moment anyone set it. (It did. That is
+/// why this function exists rather than the constant.)
+fn production_codebook_section_len() -> usize {
+    codebook_section_len(QtipBakeConfig::get().expect("bake config must parse").codebook)
+}
 
 /// Deterministic Gaussian-ish fixture (splitmix64 + Box-Muller), so no test in
 /// this module depends on an RNG seed that could drift.
@@ -181,7 +193,7 @@ fn isq_dispatch_never_bakes_greedy_on_either_rung_or_rank() {
             // qtip2b's codebook is its format and carries no discriminator;
             // qtip2 carries one only when it is not baking the stored table.
             let cb_len = match isq {
-                IsqType::QtipBitshift2 => codebook_section_len(QtipCodebook::DEFAULT),
+                IsqType::QtipBitshift2 => production_codebook_section_len(),
                 _ => CB_NONE,
             };
             let (stamp, flags) = provenance_tail(&bytes, cb_len);
@@ -248,7 +260,7 @@ fn greedy_fixture_door_exists_only_under_cfg_test() {
     // module (and `quantize_greedy_fixture` itself) is `cfg(test)`-only, so the
     // door does not exist in a release build at all.
     let bytes = greedy.serialize().unwrap().into_owned();
-    let (stamp, flags) = provenance_tail(&bytes, codebook_section_len(QtipCodebook::DEFAULT));
+    let (stamp, flags) = provenance_tail(&bytes, production_codebook_section_len());
     assert_eq!(
         stamp,
         QtipSearchStamp::Greedy.to_wire(),
@@ -413,7 +425,7 @@ fn greedy_stamped_artifact_is_refused_at_load() {
         // qtip2b carries no codebook discriminator; qtip2 carries one only
         // when its codebook is not the stored table.
         let cb_len = if rung == "qtip2" {
-            codebook_section_len(QtipCodebook::DEFAULT)
+            production_codebook_section_len()
         } else {
             CB_NONE
         };
@@ -461,7 +473,7 @@ fn legacy_unstamped_without_rotation_is_refused() {
 
     // Truncate the whole provenance tail: byte-for-byte a pre-0.3.0 payload.
     let mut bytes = QuantizedSerde::serialize(&greedy).unwrap().into_owned();
-    strip_provenance(&mut bytes, codebook_section_len(QtipCodebook::DEFAULT));
+    strip_provenance(&mut bytes, production_codebook_section_len());
 
     let msg = QtipLayer::deserialize_ext_bias(
         Cow::Owned(bytes.clone()),
@@ -490,7 +502,7 @@ fn legacy_unstamped_with_rotation_is_served() {
     assert!(viterbi.rotation_block() >= 2);
 
     let mut bytes = QuantizedSerde::serialize(&viterbi).unwrap().into_owned();
-    strip_provenance(&mut bytes, codebook_section_len(QtipCodebook::DEFAULT));
+    strip_provenance(&mut bytes, production_codebook_section_len());
 
     let (restored, _) =
         QtipLayer::deserialize_ext_bias(Cow::Owned(bytes), &device, QuantizeOntoGuard::new())
@@ -508,7 +520,7 @@ fn unknown_provenance_cannot_be_laundered_into_a_stamp() {
         QtipLayer::quantize_with_options_concrete(&w, None, &device, QtipMode::Viterbi, true)
             .unwrap();
     let mut bytes = QuantizedSerde::serialize(&viterbi).unwrap().into_owned();
-    strip_provenance(&mut bytes, codebook_section_len(QtipCodebook::DEFAULT)); // pre-0.3.0 payload
+    strip_provenance(&mut bytes, production_codebook_section_len()); // pre-0.3.0 payload
 
     let (legacy, _) =
         QtipLayer::deserialize_concrete(Cow::Owned(bytes), &device, QuantizeOntoGuard::new())
@@ -672,7 +684,7 @@ fn beam_width_round_trips_through_uqff_exactly() {
 /// travel.
 #[test]
 fn real_beam_bake_at_w256_stamps_the_width_it_ran() {
-    use super::{QtipBakeConfig, TrellisSearch};
+    use super::TrellisSearch;
 
     let device = Device::Cpu;
     // Deterministic Gaussian; this test is about provenance plumbing, not
@@ -796,7 +808,7 @@ fn real_beam_bake_at_w256_stamps_the_width_it_ran() {
 #[test]
 fn real_3d_expert_stack_beam_bake_at_w256_stamps_the_width_it_ran() {
     use super::bake_quality_tests::gen_fp4_dequant;
-    use super::{QtipBakeConfig, TrellisSearch};
+    use super::TrellisSearch;
 
     let device = Device::Cpu;
     let (e, n, k) = (3usize, 4usize, 64usize);
