@@ -90,7 +90,7 @@ framed as a kernel problem from the first question asked about it.
 | 4 GPUs | ~44 min | ~$13.50 |
 | 8 GPUs | ~24 min | ~$14.80 |
 
-[projected, from the measured 241 s/layer and current rental prices]
+[projected, from the measured **pre-#40** 241 s/layer and current rental prices. Post-#40 the single-GPU row is ~2.2 h, itself projected — the 1.33× was measured on an A100, not this H200]
 
 **Same cost, 4–8× less wall clock**, with zero risk to the artifact format, the
 inference path, or quality. The only obstacle is **naming**: UQFF shard names are
@@ -137,7 +137,7 @@ These are cheap, decided, and blocked only on someone doing them.
 | 2 | **Port the computed codebook to the decode side** | The 512 KiB LUT gather is the *named* inference bottleneck (~388 GB/s ≈ 8 % of HBM). The same change pays twice, and **we have not priced the inference half.** | A port of a pattern already proven at `K=2 / V=1` with 20/20 CUDA parity |
 | 3 | **Decompose the ~13.5 s/layer "other host" bucket** | It is 5.6 % today and becomes 28 % after any 2× kernel win. Never decomposed. | Instrumentation only; zero GPU time |
 | 4 | **Profiler stall attribution (`ncu`)** | Which of barriers / shared-memory atomics / scattered L2 dominates the beam kernel's stalls is still **inferred**, never measured. It decides what to attack next if anyone reopens the kernel. | One profiled launch |
-| 5 | ~~**What PR #40's kernel stack is actually worth on the shipped build**~~ **— RUN 2026-08-15. Answer: 1.33×** | Measured on the production toolchain (same A100, CUDA 12.8, same driver/model/data, immediately post-bake): pre-#40 520.3 s/layer vs `master` 391.9 s/layer. The previously published **≤1.21× "upper bound" was wrong, and wrong in the cautious direction** — nvcc 11.5 *under*-stated the gain, it did not flatter it. Full protocol and the retraction in [QUANTIZATION_PERFORMANCE.md](QUANTIZATION_PERFORMANCE.md#predictions-that-failed-and-why), items 2 and 5. **Still open:** it is the #37→`master` delta (#38–#41 all landed in between), and #40's three parts were never separated. | ~~Zero rental~~ **Done, ~$0.35** |
+| 5 | ~~**What PR #40's kernel stack is actually worth on the shipped build**~~ **— RUN 2026-08-15. Answer: 1.33×** | Measured on the production toolchain (same A100, CUDA 12.8, same driver/model/data, immediately post-bake): pre-#40 520.3 s/layer vs `master` 391.9 s/layer. The previously published **≤1.21× "upper bound" was wrong, and wrong in the cautious direction** — nvcc 11.5 *under*-stated the gain, it did not flatter it. Full protocol and the retraction in [QUANTIZATION_PERFORMANCE.md](QUANTIZATION_PERFORMANCE.md#predictions-that-failed-and-why), items 2 and 5. **Still open:** it is the #37→`master` delta (#38–#41 all landed in between); #40's three parts were never separated; and it is an **A100** number, so every H200 per-layer figure derived from it is `[projected]`, not measured. | ~~Zero rental~~ **Done, ~$0.35** |
 
 ---
 
@@ -170,6 +170,15 @@ and none of them is backed by a measurement.
   anchor's assumptions. The two kernels compared could also scale differently
   between architectures — one is latency- and shared-memory-bound, the other
   arithmetic- and L2-streaming-bound.
+- **Why the kernel stack measures 1.21× on an A30 and 1.33× on an A100.** The
+  gap is **measured but unattributed**: no fixed-vs-per-candidate decomposition
+  has been run on the production toolchain. Do not speculate a mechanism — the
+  A30 sweep's split does not transfer, for the same cross-card reason as below.
+- **Whether the 1.33× transfers to an H200 at all.** It was measured on an
+  **A100**; every per-layer H200 figure derived from it is `[projected]`, not
+  measured. Direct counter-evidence that ratios need not transfer: the same
+  gen-1 GEMV kernel measured **15.4 % of peak on an A30** against **9.4–9.7 % on
+  an H200**. Settling it needs one H200 A/B.
 - **Any ratio measured on a different toolchain, when the change under test is a
   register or occupancy change.** Ratios transfer between *cards*; they do not
   transfer between *compilers*. Register pressure — and therefore blocks/SM, and

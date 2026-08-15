@@ -159,7 +159,7 @@ limiter — that it was strangling the host-side INT4→BF16 expert unpack, with
    pool is only ever `spawn`ed onto, never `install`ed, so the caller is not in
    it; and layer construction runs sequentially on the loader thread. The unpack
    was already using rayon's global pool at full width. [source-verified]
-2. **Direct instrumentation measured the unpack at 2.5 s of a 241 s layer — 1.0 %.**
+2. **Direct instrumentation measured the unpack at 2.5 s of a 241 s layer — 1.0 %.** (That 241 s is the **pre-#40** layer time; the share is what matters here and #40 only made the kernel share larger.)
    [measured]
 
 The projected 3–5× was worth 1.01×. What did ship is a **separation of concerns**

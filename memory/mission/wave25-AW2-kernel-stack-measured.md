@@ -58,13 +58,57 @@ the direction of the effect to be measured before it may be applied.
 `225.2 / 1.33 = 169.6` ⇒ kernel **≈170 s**, +16 s host ⇒ **≈186 s/layer**
 (was `≥186 s` / `≥202 s/layer`).
 
-⚠️ **Surfaced, not resolved:** `225.2 s` does two jobs in that document — the
-*shipped* post-stack kernel at the headline, and the *divisor* both ceiling rows
-scale down from (which only works if it is the pre-stack baseline). This predates
-the correction; the `65 s`/`81 s` ceiling row is computed the same way
-(`225.2/3.47`). Flagged in-place rather than silently re-based, because guessing
-would swap a known ambiguity for an invented number. **Needs one decision from
-the coordinator: which build does 225.2 s belong to?** Both rows move with it.
+### `225.2 s` ambiguity — RESOLVED: it is **PRE-#40**
+
+Settled from the git record (coordinator): PR #40 merged **2026-08-14T21:41:26Z**
+(`c5384fbcd`); the s6 H200 bake the decomposition was read off ran from ~20:25Z
+with ETA 21:39Z; the instrumentation that produced the split (PR #39) merged
+22:12:46Z. So the split was read off a live **pre-#40** run.
+
+Consequences applied:
+- `225.2 / 1.33 = 169.6` stands. The original `225.2 / 1.21 = 186` implied the
+  same pre-stack reading, so that lineage was always internally consistent.
+- **The headline's use of 225.2 s as the *shipped* kernel was wrong** and is
+  fixed: the whole "where a layer's 241 seconds go" section now opens with a red
+  banner stating every number in it is pre-#40 and was read as current for a
+  week, with the timestamps. The kernel row is labelled
+  `[measured, PRE-#40, H200, s6 bake]`. Host figures explicitly carry forward
+  (#40 touched only the kernel); the kernel figure explicitly does not.
+- The `65 s` / `81 s/layer` ceiling row now states its divisor's side of #40:
+  the 3.47× is computed from the **pre-#40 baseline** (`1227.5 / 354`), so
+  divisor and numerator sit on the same side. Consistent lineage — and it is
+  *also* cross-card (A30).
+
+### 🔴 Cross-card grading error — caught by the coordinator, not by me
+
+**1.33× was measured on an A100. 225.2 s was measured on an H200.** Dividing one
+by the other is a **cross-card projection, not a measurement.**
+
+`≈170 s` and `≈186 s/layer` are therefore now graded **`[projected]`**, with the
+basis stated inline: *pre-#40 H200 kernel 225.2 s [measured] ÷ 1.33× [measured on
+A100] — assumes the speedup transfers across cards, which is unverified.*
+
+Direct counter-evidence is cited in place: the same gen-1 GEMV kernel measured
+**15.4 % of peak on an A30** vs **9.4–9.7 % on an H200** (agent AT) — a ratio
+that does not transfer at all. Same trap, one day apart.
+
+The `65 s` / `81 s/layer` row carries the identical caveat (A30 divisor) and was
+already `[projected]`, which was right for the wrong reason — now stated.
+
+**Lineage audit for everything else I recomputed:** the artifact-derived chain
+(15.5 ms/step, ~4.1K tok/s, ~33K node, ~24 % of roofline, ~59 GB usable, the
+7.7×) runs through *artifact size ÷ vendor bandwidth* — it does **not** pass
+through the cross-card division, so its existing `[derived]`/`[projected]` grades
+stand unchanged. Only the two `225.2 ÷ ratio` cells moved.
+
+### Pre-#40 labelling swept beyond the one section
+
+The pre-#40 rate was being read as current in five more places, all now labelled:
+the bake-rate leaderboard row (`2.9 h on H200` → `pre-#40`, with the ~2.2 h
+post-#40 projection beside it), the `~4 min/layer` comparison, the parallel-bake
+cost table in `OPEN_QUESTIONS.md` (a projection someone would act on),
+`HARDWARE_LESSONS.md`'s unpack-share example, and `TESTING_DISCIPLINE.md`'s
+worked measurement example.
 
 Also newly recorded: the gap between the A30 A/B's 1.21× and production's 1.33×
 is measured but **not attributed** — no fixed-vs-per-candidate decomposition has

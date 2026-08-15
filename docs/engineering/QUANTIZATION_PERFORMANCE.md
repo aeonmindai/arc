@@ -33,21 +33,33 @@ Every number below carries one of these labels. Nothing is stated without one.
   at `V = 2`. [source-verified, `mistralrs-quant/kernels/qtip/qtip_beam.cu:11-25`]
 - Artifact: **74.18 GB** UQFF in **8 shards + residual** (15 files). [measured, H200, reproduced 4×; size HF-API-verified on the published repo. Earlier revisions said "~68 GB / 7 shards" — an estimate]
 
-## Headline: where a layer's 241 seconds go
+## Headline: where a layer's 241 seconds go — **on the pre-#40 build**
 
-**Beam W=256 on an H200: 241 ± 1 s/layer.** [measured] Measured twice, as
-marginal deltas between consecutive layer markers: run A 240 s, 242 s; run B
-241 s, 242 s. The exhaustive DP over the same trellis is **510 s/layer**
+> 🔴 **Every number in this section is PRE-#40**, and it was read as "current" for
+> a week. The s6 H200 bake it came off started ~20:25Z with an ETA of 21:39Z on
+> 2026-08-14; **PR #40 merged at 21:41:26Z** (`c5384fbcd`), and the instrumentation
+> that produced the split (PR #39) merged at 22:12:46Z — so the decomposition was
+> read off a live run of the **pre-#40** kernel. For what the **shipped** kernel
+> does, see the projected `≈170 s` under "The beam's architectural ceiling" —
+> **not** the 225.2 s below.
+
+**Beam W=256 on an H200: 241 ± 1 s/layer.** [measured, **pre-#40**] Measured
+twice, as marginal deltas between consecutive layer markers: run A 240 s, 242 s;
+run B 241 s, 242 s. The exhaustive DP over the same trellis is **510 s/layer**
 [measured, same box class] ⇒ the beam is **2.1×** faster.
 
 Per-layer decomposition, from in-tree instrumentation read off a live bake over
-**4 consecutive layers, ±0.2 s** [measured]:
+**4 consecutive layers, ±0.2 s** [measured, **pre-#40**, H200, s6 bake]:
 
 | component | time | share |
 |---|---|---|
-| GPU beam kernel (`Quantized fused experts`) | **225.2 s** | **93.4 %** |
+| GPU beam kernel (`Quantized fused experts`) | **225.2 s** [measured, **PRE-#40**, H200, s6 bake] | **93.4 %** |
 | host INT4→BF16 expert unpack, 24 threads | 2.5 s | 1.0 % |
 | other host (rotation, scales, serialize) | ~13.5 s | 5.6 % |
+
+**The host figures carry forward; the kernel figure does not.** #40 touched only
+the kernel, so the ~16 s host floor still stands, but 225.2 s is now the
+*baseline* the 1.33× measured speedup applies to.
 
 Two things follow, and both changed what we worked on:
 
@@ -61,8 +73,10 @@ Two things follow, and both changed what we worked on:
    width) is correct by construction and a **no-op on wall time**. Keeping it was
    a deliberate choice, not a claim.
 
-The 43-layer bake is therefore **≈2.9 h ≈ $14** at $4.92/hr [derived], which
-works out to **~27 M parameters/s** [derived].
+The 43-layer bake at that rate is **≈2.9 h ≈ $14** at $4.92/hr [derived,
+**pre-#40**], working out to **~27 M parameters/s** [derived, **pre-#40**]. The
+post-#40 equivalent is **≈2.2 h** [projected — carries the cross-card assumption
+described in the next section; not measured on an H200].
 
 ## Why the kernel is slow: selection, not arithmetic
 
@@ -149,29 +163,35 @@ Fitting `time = fixed + b·W`:
 **The fixed term does not go away by making selection cheaper.** Even with
 per-candidate work driven to *zero*, this kernel cannot beat
 `1227.5 / 354 = 3.47×` [measured — the floor was measured directly at W=16, not
-extrapolated]. Converted to the H200 measurement (225.2 s kernel + ~16 s host):
+extrapolated]. Both rows below scale down from the **pre-#40 H200 baseline**
+(225.2 s kernel + ~16 s host), which is the correct divisor now that the
+headline's provenance is settled:
 
-| | kernel | + host |
-|---|---|---|
-| banked today (**1.33×** stack, **[measured]** — see below) | **≈170 s** | **≈186 s/layer** [derived from the measured 1.33×] |
-| every remaining identity-safe idea lands perfectly (3.47×) | 65 s | **81 s/layer** [projected] |
+| | kernel | + host | grade |
+|---|---|---|---|
+| what ships today (pre-#40 baseline ÷ the **1.33×** stack) | **≈170 s** | **≈186 s/layer** | **[projected]** — see the cross-card caveat below |
+| every remaining identity-safe idea lands perfectly (÷ **3.47×**) | 65 s | **81 s/layer** | **[projected]** — same caveat; the 3.47× divisor is **pre-#40-based** and was measured on an **A30** |
 
-The "banked today" row is now **[derived from a measurement]**, not a bound. The
-1.33× it divides by was measured end-to-end on the production toolchain (protocol
-under "Predictions that failed", item 2). An earlier revision of this document
-published these cells as `≥186 s` / `≥202 s/layer` on the grounds that the stack's
-value was only an upper bound; **that was wrong, and wrong in the cautious
-direction** — see item 5.
+> 🔴 **Both rows are `[projected]`, not measured, and the reason is the same:
+> each divides an H200 measurement by a ratio measured on a different card.**
+>
+> - `≈170 s` / `≈186 s/layer` = **225.2 s [measured, H200, pre-#40]** ÷ **1.33×
+>   [measured, A100]**. It **assumes the speedup transfers across cards, which is
+>   unverified.**
+> - `65 s` / `81 s/layer` = the same 225.2 s ÷ **3.47× [measured, A30]** — and
+>   that 3.47× is likewise computed from the **pre-#40 baseline** (`1227.5 / 354`
+>   in the sweep above), so the divisor sits on the same side of #40 as the
+>   numerator. Consistent lineage, but the same cross-card assumption.
+>
+> **We have direct evidence this assumption can fail.** The same gen-1 GEMV
+> kernel measured **15.4 % of peak on an A30** against **9.4–9.7 % on an H200** —
+> a ratio that does not transfer at all. Treat any cross-card division here as a
+> projection until an H200 A/B is run.
 
-> ⚠️ **Surfaced, not resolved: `225.2 s` is doing two jobs in this document.** At
-> the headline it is the **shipped** (post-stack) H200 kernel time, measured off a
-> live bake. Here it is used as the **divisor** both rows scale down from, which
-> only makes sense if it is the *pre*-stack baseline. Both rows in this table
-> inherit that ambiguity — it predates this correction (the `65 s` / `81 s/layer`
-> ceiling row is computed the same way, `225.2 / 3.47`). Resolving it needs one
-> decision about which build the 225.2 s belongs to, and would move both rows. It
-> is flagged rather than silently re-based, because guessing would replace a known
-> ambiguity with an invented number.
+The "what ships today" row is now anchored to a measurement rather than a bound.
+An earlier revision published these cells as `≥186 s` / `≥202 s/layer` on the
+grounds that the stack's value was only an upper bound; **that was wrong, and
+wrong in the cautious direction** — see item 5.
 
 So **45–50 s/layer of kernel with byte-identical output is not reachable from
 this beam architecture.** That is a measured statement about the architecture,
@@ -361,10 +381,17 @@ re-measurement.
 > host floor gives `(520.3 − 16) / (391.9 − 16) =` **1.34×**, consistent with the
 > 93.4 % kernel share in the decomposition above.
 >
-> ⚠️ **Scope it exactly: this is the #37 → `master` delta, not #40 in
-> isolation.** The pre-#40 binary is PR **#37**, and **#38, #39, #40 and #41 all
-> landed between**. #39's unpack pool measured as a speed no-op (1.0 % of layer
-> time) and #41 is a memory fix, so **#40 is the dominant term — but the isolated
+> ⚠️ **It is an A100 number.** 1.33× is measured, and measured on the production
+> *toolchain* — but on an **A100**, not the H200 the per-layer tables are
+> anchored to. Applying it to an H200 figure is a **cross-card projection**; any
+> such result must be graded `[projected]`, never `[measured]`. The gen-1 GEMV
+> kernel measured 15.4 % of peak on an A30 against 9.4–9.7 % on an H200, so
+> ratios demonstrably do not always transfer.
+>
+> **Scope it exactly: this is the #37 → `master` delta, not #40 in isolation.**
+> The pre-#40 binary is PR **#37**, and **#38, #39, #40 and #41 all landed
+> between**. #39's unpack pool measured as a speed no-op (1.0 % of layer time)
+> and #41 is a memory fix, so **#40 is the dominant term — but the isolated
 > figure for #40 alone has still never been measured.** Do not quote 1.33× as
 > "#40's speedup"; quote it as the stack delta across that range.
 >
@@ -462,10 +489,10 @@ Per-parameter bake rates:
 | AQLM | 11 B | ~38 h A100 (~46 min/layer) | 0.03 M param/s | [published] |
 | QuIP# | 70 B | "a few hours" on an 8-GPU node | ~1.9 M param/s | [published] |
 | EXL3 (closest relative) | 70 B+ | "a few hours" on one RTX 4090 | ~6.5 M param/s | [published] |
-| **Arc** | 284 B MoE, 43 layers | 2.9 h on H200 | **~27 M param/s** | [measured + derived] |
+| **Arc** | 284 B MoE, 43 layers | 2.9 h on H200 (**pre-#40**; ~2.2 h post-#40 [projected]) | **~27 M param/s** | [measured + derived, pre-#40] |
 
 **EXL3 publishes no per-layer number**; the one clean third-party trellis figure
-is QTIP at ~14 min/layer on an A100. Our ~4 min/layer is on an **H200** and on a
+is QTIP at ~14 min/layer on an A100. Our ~4 min/layer (pre-#40) is on an **H200** and on a
 **25× larger** model, so the two numbers **cannot be divided** — different
 silicon, different model, no shared benchmark. Quoting a ratio between them
 would be exactly the fabricated head-to-head this program has banned elsewhere;
