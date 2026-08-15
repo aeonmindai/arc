@@ -74,6 +74,37 @@ name: CUDA compile check (no GPU)
 # compiles perfectly and fails only at runtime on candle's dtype check. No
 # amount of type-checking finds it. For that class the answer is the GPU-gated
 # regression tests — and actually running them on a GPU.
+#
+# THE CACHE/ISA TRAP (wave37-BO, fixed 2026-08-16 — read before touching a key)
+# ----------------
+# A cache keyed WITHOUT an ISA component, combined with `-C target-cpu=native`,
+# equals SIGILL on a different runner. Master goes green; the next PR eats it.
+#
+# That is not hypothetical — it happened one hour after this lane landed. The
+# `cargo check (cuda, workspace)` job saved a 4.44 GB `target/` under
+# `cuda-check-cc90-<Cargo.lock hash>`. PR #64 restored it onto a runner with a
+# different CPU and both `mistralrs-quant` and `mistralrs-paged-attn` died with
+# `build-script-build (signal: 4, SIGILL: illegal instruction)`. Zero Rust
+# diagnostics; `cargo check` never reached type-checking. Evicting the two
+# cache entries by hand took the SAME SHA red -> green with no code change.
+#
+# Why it is so easy to misread: the failure names crates the PR never touched,
+# it looks exactly like a compile error the new gate "caught", and master looks
+# healthy because master was the cache MISS that *populated* the poison. The
+# first consumer pays, not the producer. It was in fact reported upward as a
+# genuine compile error before the logs were read closely.
+#
+# Two invariants keep it fixed. Break either one and the trap re-arms:
+#   1. `RUSTFLAGS` pins a concrete ISA (see the `env:` block below), so nothing
+#      in `target/` is built for the builder's specific CPU.
+#   2. Every `actions/cache` key AND restore-key that includes `target` carries
+#      that ISA as a literal segment, so artifacts can never be restored across
+#      an ISA change — and so a bare prefix cannot resurrect an old entry.
+# If you would rather not maintain the pin, the other safe answer is to drop
+# `target` from the cache `path:` lists entirely and cache only `~/.cargo`,
+# which is ISA-independent. Do NOT "fix" this by deleting `target-cpu=native`
+# from `.cargo/config.toml` — that flag is a deliberate repo-wide codegen
+# choice for an inference engine. The defect was the cache key, not the flag.
 
 on:
   push:
@@ -113,6 +144,37 @@ env:
   CARGO_BUILD_JOBS: "2"
   RAYON_NUM_THREADS: "2"
   CARGO_INCREMENTAL: "0"
+  # ISA PIN — load-bearing. Do not remove without also removing `target` from
+  # every `actions/cache` path below. See "THE CACHE/ISA TRAP" at the top.
+  #
+  # `.cargo/config.toml` sets `[build] rustflags = ["-C","target-cpu=native"]`
+  # repo-wide. That is a deliberate choice for real builds and stays. But it
+  # also applies to build scripts (verified: a `cargo build -v` with only
+  # `[build] rustflags` set emits `-C target-cpu=native` for BOTH
+  # `--crate-name build_script_build` and the crate itself), and `native`
+  # is the one rustflag value that is *fingerprint-opaque*: Cargo hashes the
+  # flag STRING, not the ISA it resolves to. Two runners with different CPUs
+  # produce byte-incompatible artifacts under an identical fingerprint, so a
+  # restored `target/` is silently mismatched -> SIGILL in build-script-build.
+  #
+  # Pinning a concrete ISA makes everything in `target/` portable across the
+  # hosted fleet and restores the invariant Cargo already relies on (different
+  # flags => different fingerprint => rebuild).
+  #
+  # Why `RUSTFLAGS` and not `CARGO_BUILD_RUSTFLAGS`: rustflags precedence is
+  # `RUSTFLAGS` env > `target.<triple>.rustflags` > `build.rustflags`, and only
+  # ONE level applies (they do not merge). `CARGO_BUILD_RUSTFLAGS` sits at the
+  # `build.rustflags` level, so it would be silently defeated the day anyone
+  # adds a `[target.x86_64-unknown-linux-gnu]` section to `.cargo/config.toml`.
+  # Verified both ways locally: with a `[target.<triple>]` section present,
+  # `CARGO_BUILD_RUSTFLAGS` was ignored and `RUSTFLAGS` won.
+  #
+  # Why `x86-64-v3` and not plain `x86-64`: v3 (Haswell/Zen1 baseline — AVX,
+  # AVX2, BMI1/2, FMA, F16C) is supported by every GitHub-hosted x64 Linux
+  # runner, and it keeps `#[cfg(target_feature = "avx")]` ENABLED, so the AVX
+  # branch of mistralrs-quant/src/f8q8/mod.rs stays compiled. Plain `x86-64`
+  # exposes only sse/sse2 and would silently drop that path from the gate.
+  RUSTFLAGS: "-C target-cpu=x86-64-v3"
 
 jobs:
   cuda-compile:
@@ -176,9 +238,16 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: cuda-cc${{ matrix.compute_cap }}-${{ hashFiles('Cargo.lock') }}
+          # The `-X64-isa-x86-64-v3-` segment records the ISA the cached
+          # artifacts were compiled for (see the RUSTFLAGS note at the top of
+          # this file). It is not decoration: it is what makes the cache safe
+          # to restore onto a different runner, and changing the ISA pin above
+          # MUST change this token too. The restore-key prefix carries it as
+          # well — a bare `cuda-cc90-` prefix would happily match (and restore)
+          # the pre-fix, `target-cpu=native` entries this change orphans.
+          key: cuda-cc${{ matrix.compute_cap }}-${{ runner.arch }}-isa-x86-64-v3-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cuda-cc${{ matrix.compute_cap }}-
+            cuda-cc${{ matrix.compute_cap }}-${{ runner.arch }}-isa-x86-64-v3-
 
       # ---- The gate. Each `cargo build` here runs nvcc on the Arc .cu files
       #      for the matrix arch. These are LIBRARY builds (no final -lcuda
@@ -268,9 +337,16 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: cuda-check-cc90-${{ hashFiles('Cargo.lock') }}
+          # See the identical note on the nvcc job's cache above. This is the
+          # key that actually bit: `cuda-check-cc90-<lockhash>` with a bare
+          # `cuda-check-cc90-` restore prefix. PR #64 restored a 4.44 GB entry
+          # saved by a different-CPU runner and died with
+          # `build-script-build (signal: 4, SIGILL: illegal instruction)` in
+          # mistralrs-quant AND mistralrs-paged-attn — a crate its diff never
+          # touched — before `cargo check` type-checked a single line.
+          key: cuda-check-cc90-${{ runner.arch }}-isa-x86-64-v3-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cuda-check-cc90-
+            cuda-check-cc90-${{ runner.arch }}-isa-x86-64-v3-
 
       # `--workspace --features cuda` turns the `cuda` feature on for every
       # workspace member that defines one (14 of them today), so the FFI shims,
