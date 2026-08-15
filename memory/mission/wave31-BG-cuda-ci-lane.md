@@ -189,6 +189,14 @@ good outcome and worth stating plainly rather than manufacturing a finding.
 | `cargo check --workspace --features cuda --tests` | **+45.7s** |
 | whole job (incl. ~4m toolkit install) | 15m00s |
 
+Steady state, cache warm (run
+[31909093461](https://github.com/aeonmindai/arc/actions/runs/31909093461),
+final commit): **whole job 5m25s**, both steps green. Most of that is the CUDA
+toolkit install, not compilation — so the marginal cost of the Rust half is
+small and roughly fixed. For comparison, the nvcc jobs on the same run took
+13m29s (sm_80) and 12m49s (sm_90); the new job is the *fastest* of the three
+and finishes well inside their shadow.
+
 `check --tests` does no codegen, so it costs a fraction of the existing
 `cargo test --no-run -p mistralrs-quant` step. Leaving it out would have been
 the wrong call. The new job runs **in parallel** with the two nvcc jobs
@@ -265,6 +273,28 @@ Both probes reverted in `120ae16`; the branch carries only the workflow change.
 ordering (the library error is the more fundamental one) but it means a single
 red run reports only the first failure class. Do not read "step 2 skipped" as
 "tests are fine."
+
+---
+
+### Gotcha found by getting it wrong
+
+I claimed in a commit message that a docs-only commit would not re-run the CUDA
+workflow, since `memory/**.md` is not in `paths:`. **Wrong, and the push proved
+it within seconds:** commit `e04d831` changed one markdown file and the workflow
+queued anyway.
+
+`paths:` resolves differently per event:
+
+- **`push`** — matched against the files in *that push*. A docs-only push to
+  master genuinely skips the lane.
+- **`pull_request`** — matched against the **entire PR diff** versus the base,
+  not the head commit. This PR already touches
+  `.github/workflows/cuda_compile_check.yaml`, so *every* push to it re-runs the
+  lane no matter what the new commit contains.
+
+So "a wave-log-only **PR** skips the lane" is true; "a wave-log-only **commit**
+skips it" is not. Budget for CI accordingly: iterating on a PR that touches any
+`.rs` file pays the CUDA lane every push (~5m25s warm, in parallel).
 
 ---
 
