@@ -36,29 +36,74 @@ name: CUDA compile check (no GPU)
 #   GPU-less runner — only a stub exists). The full binary link with the
 #   exact rental feature combo (`cuda flash-attn`) is validated on the build
 #   box by arc-tools/cuda_compile_check.sh, where the driver + ample RAM exist.
+#
+# THE RUST HALF (cuda-typecheck job, added 2026-08-15 — wave31-BG)
+# ----------------
+# The two nvcc jobs above compile every Arc .cu file, and — because a `cargo
+# build --features cuda` of a crate also type-checks that crate's Rust — they
+# did cover the `#[cfg(feature = "cuda")]` Rust of three packages
+# (mistralrs-quant, arc-cuda-graph, arc-engine + its deps). Two holes remained,
+# and both were live:
+#   1. The `paths:` filter below did not list `mistralrs-core/**`, so a PR that
+#      touched only mistralrs-core did not run this workflow AT ALL. PR #59
+#      (XsRollingCache + KvCache::XsRolling, ~1,480 lines through kv_cache,
+#      deepseek4 and prefix_cacher) merged to master without a single
+#      `--features cuda` build of any kind — `gh pr checks 59` lists no CUDA
+#      job. The filter is now keyed on `**/*.rs`: any Rust change anywhere runs
+#      the lane, while a docs/wave-log-only PR still skips it.
+#   2. Scope was three `--lib` targets. Fourteen workspace crates define a
+#      `cuda` feature; those three plus mistralrs-core and mistralrs-paged-attn
+#      (pulled in transitively by arc-engine) make five. The remaining NINE —
+#      arc-cli, arc-turbo, mistralrs-cli, mistralrs-server-core, mistralrs,
+#      mistralrs-pyo3, mistralrs-bench, mistralrs-web-chat, mistralrs-server —
+#      had `cuda` enabled by no lane, ever. Two of them own real gated blocks:
+#      arc-cli (`run_real_gpu`, the whole `bench::vendor::in_process` module,
+#      the real-vendor branch of `bench::run`) and mistralrs-cli
+#      (`commands/doctor.rs`); the other seven only forward the feature. Also
+#      uncovered: every test target outside mistralrs-quant. The cuda-typecheck
+#      job runs `cargo check --workspace --features cuda [--tests]`, which
+#      enables `cuda` on every member that has it and covers test targets too.
+#
+# WHAT THE RUST HALF BUYS — AND WHAT IT DOES NOT
+# ----------------
+# It buys: compile errors, type errors, borrow errors, FFI signature drift,
+# renames, and trait-impl breakage in CUDA-gated Rust — the class that used to
+# surface at the start of a *paid* GPU session.
+# It does NOT buy runtime correctness. The bug that motivated this lane,
+# `as_cuda_slice::<u8>()` on a BF16 buffer (five copies, wave27-AY/AY2),
+# compiles perfectly and fails only at runtime on candle's dtype check. No
+# amount of type-checking finds it. For that class the answer is the GPU-gated
+# regression tests — and actually running them on a GPU.
 
 on:
   push:
     branches: [master]
     paths:
+      # Keyed on "**/*.rs" so a Rust change ANYWHERE runs the lane (build.rs
+      # included); a docs/wave-log-only PR still skips it. YAML anchors are not
+      # supported by GitHub Actions, hence the duplicated list.
+      - "**/*.rs"
       - "**/*.cu"
       - "**/*.cuh"
-      - "**/build.rs"
-      - "mistralrs-quant/**"
-      - "arc-cuda-graph/**"
-      - "arc-engine/**"
+      - "**/Cargo.toml"
+      - "Cargo.lock"
       - ".github/workflows/cuda_compile_check.yaml"
   pull_request:
     branches: [master]
     paths:
+      - "**/*.rs"
       - "**/*.cu"
       - "**/*.cuh"
-      - "**/build.rs"
-      - "mistralrs-quant/**"
-      - "arc-cuda-graph/**"
-      - "arc-engine/**"
+      - "**/Cargo.toml"
+      - "Cargo.lock"
       - ".github/workflows/cuda_compile_check.yaml"
   workflow_dispatch:
+
+# Widening the trigger to "**/*.rs" makes this workflow run on most PRs, so
+# stop paying for superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
 
 # Bound codegen parallelism so a large CUDA lib build fits a small hosted
 # runner (2 vCPU / 7 GB on private repos). A flaky/OOMing gate is worse than
@@ -161,3 +206,85 @@ jobs:
           # in test code is caught too. They EXECUTE only on a real GPU
           # (rental step 4b).
           cargo test --no-run -p mistralrs-quant --features cuda
+
+  # ---------------------------------------------------------------------------
+  # The Rust half: type-check every `#[cfg(feature = "cuda")]` block in the
+  # WORKSPACE, not just the three packages the nvcc jobs build. See the "THE
+  # RUST HALF" note at the top of this file for the two holes this closes.
+  #
+  # `cargo check` still runs every build.rs, so nvcc compiles the .cu files here
+  # too — that work is unavoidable, not duplicated for its own sake. One compute
+  # cap is enough: no Arc Rust is `cfg`-gated on the arch, only the .cu files
+  # are, and sm_80/sm_90 are covered above. `check` never links, so the absent
+  # driver (`-lcuda`) is a non-issue.
+  # ---------------------------------------------------------------------------
+  cuda-typecheck:
+    name: cargo check (cuda, workspace)
+    runs-on: ubuntu-latest
+    env:
+      # H100/Hopper — the V4 Flash rental target.
+      CUDA_COMPUTE_CAP: "90"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
+
+      - name: Install CUDA toolkit (no driver, no GPU)
+        uses: Jimver/cuda-toolkit@v0.2.35
+        id: cuda-toolkit
+        with:
+          cuda: "12.4.1"
+          method: "local"
+          linux-local-args: '["--toolkit"]'
+
+      - name: CUDA + link-path setup
+        run: |
+          echo "CUDA_COMPUTE_CAP=$CUDA_COMPUTE_CAP"
+          which nvcc
+          nvcc --version
+          CUDA_ROOT="${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
+          echo "LIBRARY_PATH=${CUDA_ROOT}/lib64/stubs:${CUDA_ROOT}/lib64:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=${CUDA_ROOT}/lib64/stubs:${CUDA_ROOT}/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libssl-dev pkg-config
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cuda-check-cc90-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cuda-check-cc90-
+
+      # `--workspace --features cuda` turns the `cuda` feature on for every
+      # workspace member that defines one (14 of them today), so the FFI shims,
+      # pointer helpers, graph-capture code, sampler bindings and cache variants
+      # are all compiled — including in the crates the nvcc jobs never touch.
+      - name: Type-check CUDA-gated Rust (workspace)
+        run: cargo check --workspace --features cuda
+
+      # Extends the same check to test targets. Several CUDA-gated tests are
+      # written on a Mac and never compiled anywhere until a GPU is rented
+      # (radix_topk_rows_f32_accepts_f32_scores,
+      # tensor_ptr_accepts_every_decode_buffer_dtype, the fused-vs-fallback
+      # parity tests, the XsRolling equivalence test). `check --tests` does no
+      # codegen, so it is a fraction of the cost of `cargo test --no-run`.
+      # These still only EXECUTE on a real GPU.
+      - name: Type-check CUDA-gated tests (no codegen, no run)
+        run: cargo check --workspace --features cuda --tests
