@@ -27,6 +27,7 @@ use half::{bf16, f16};
 use crate::utils::slice_ptr;
 
 use super::ffi;
+use super::QtipCodebook;
 
 /// Returns true when the layer parameters live on CUDA *and* the kernels
 /// were compiled in.
@@ -45,7 +46,9 @@ pub(crate) fn dequantize_rotated_cuda(
     lut: &Tensor,
     in_features: usize,
     out_dtype: DType,
+    codebook: QtipCodebook,
 ) -> Result<Tensor> {
+    let cb_mult = codebook.cuda_mult();
     let n_rows = row_scales.dim(0)?;
     let packed_per_row = blocks.dim(1)?;
     let num_symbols = in_features / super::V as usize;
@@ -115,6 +118,7 @@ pub(crate) fn dequantize_rotated_cuda(
                     n_rows as i32,
                     packed_per_row as i32,
                     num_symbols as i32,
+                    cb_mult,
                     dev.cuda_stream().cu_stream(),
                 );
             }
@@ -133,6 +137,7 @@ pub(crate) fn dequantize_rotated_cuda(
                     n_rows as i32,
                     packed_per_row as i32,
                     num_symbols as i32,
+                    cb_mult,
                     dev.cuda_stream().cu_stream(),
                 );
             }
@@ -151,6 +156,7 @@ pub(crate) fn dequantize_rotated_cuda(
                     n_rows as i32,
                     packed_per_row as i32,
                     num_symbols as i32,
+                    cb_mult,
                     dev.cuda_stream().cu_stream(),
                 );
             }
@@ -185,7 +191,9 @@ pub(crate) fn fused_gemv_cuda(
     lut: &Tensor,
     x_rotated: &Tensor,
     in_features: usize,
+    codebook: QtipCodebook,
 ) -> Result<Tensor> {
+    let cb_mult = codebook.cuda_mult();
     let n_rows = row_scales.dim(0)?;
     let packed_per_row = blocks.dim(1)?;
     let num_symbols = in_features / super::V as usize;
@@ -276,6 +284,7 @@ pub(crate) fn fused_gemv_cuda(
                     n_rows as i32,
                     packed_per_row as i32,
                     num_symbols as i32,
+                    cb_mult,
                     dev.cuda_stream().cu_stream(),
                 );
             }
@@ -297,6 +306,7 @@ pub(crate) fn fused_gemv_cuda(
                     n_rows as i32,
                     packed_per_row as i32,
                     num_symbols as i32,
+                    cb_mult,
                     dev.cuda_stream().cu_stream(),
                 );
             }
@@ -318,6 +328,7 @@ pub(crate) fn fused_gemv_cuda(
                     n_rows as i32,
                     packed_per_row as i32,
                     num_symbols as i32,
+                    cb_mult,
                     dev.cuda_stream().cu_stream(),
                 );
             }
@@ -353,7 +364,9 @@ pub(crate) fn gather_gemv_cuda(
     x_rotated: &Tensor,
     indices: &Tensor,
     in_features: usize,
+    codebook: QtipCodebook,
 ) -> Result<Tensor> {
+    let cb_mult = codebook.cuda_mult();
     // 3-D stacked layout: [E, n_rows, packed_per_row] / [E, n_rows].
     let num_experts = blocks.dim(0)?;
     let n_rows = row_scales.dim(1)?;
@@ -469,6 +482,7 @@ pub(crate) fn gather_gemv_cuda(
                     num_symbols as i32,
                     n_pairs as i32,
                     num_experts as i32,
+                    cb_mult,
                     dev.cuda_stream().cu_stream(),
                 );
             }
@@ -493,6 +507,7 @@ pub(crate) fn gather_gemv_cuda(
                     num_symbols as i32,
                     n_pairs as i32,
                     num_experts as i32,
+                    cb_mult,
                     dev.cuda_stream().cu_stream(),
                 );
             }
@@ -517,6 +532,7 @@ pub(crate) fn gather_gemv_cuda(
                     num_symbols as i32,
                     n_pairs as i32,
                     num_experts as i32,
+                    cb_mult,
                     dev.cuda_stream().cu_stream(),
                 );
             }
@@ -726,9 +742,12 @@ pub(crate) fn rotate_weight_rows_cuda(
     )))
 }
 
-/// Compute per-row scale = max(|row|) / 3.0 (or 1.0 if max=0), returning a
-/// fresh F32 tensor of shape `[n_rows]` on the same device as `weight`.
-pub(crate) fn compute_row_scales_cuda(weight: &Tensor) -> Result<Tensor> {
+/// Compute per-row scale = max(|row|) / `divisor` (or 1.0 if max=0), returning
+/// a fresh F32 tensor of shape `[n_rows]` on the same device as `weight`.
+///
+/// `divisor` is the codebook's [`QtipCodebook::scale_divisor`]: 3.0 for the
+/// unit-sigma Gaussian LUT, 3*sigma for the computed sum2 codebook.
+pub(crate) fn compute_row_scales_cuda(weight: &Tensor, divisor: f32) -> Result<Tensor> {
     if !ffi::HAVE_QTIP_KERNELS {
         candle_core::bail!("QTIP row-scale CUDA: kernels not compiled in");
     }
@@ -760,6 +779,7 @@ pub(crate) fn compute_row_scales_cuda(weight: &Tensor) -> Result<Tensor> {
             scales_ptr as *mut _,
             n_rows as i32,
             k_in as i32,
+            divisor,
             dev.cuda_stream().cu_stream(),
         );
     }
@@ -838,7 +858,9 @@ pub(crate) fn quantize_rows_cuda(
     lut: &Tensor,
     mode: QtipMode,
     search: TrellisSearch,
+    codebook: QtipCodebook,
 ) -> Result<(Tensor, Tensor)> {
+    let cb_mult = codebook.cuda_mult();
     if !ffi::HAVE_QTIP_KERNELS {
         candle_core::bail!("QTIP quantize CUDA: kernels not compiled in");
     }
@@ -867,7 +889,7 @@ pub(crate) fn quantize_rows_cuda(
     let lut_contig = lut.contiguous()?;
 
     // Step 1: row scales.
-    let row_scales = compute_row_scales_cuda(&weight_contig)?;
+    let row_scales = compute_row_scales_cuda(&weight_contig, codebook.scale_divisor())?;
 
     // Step 2: allocate packed output.
     let packed_per_row = num_symbols / 2;
@@ -912,6 +934,7 @@ pub(crate) fn quantize_rows_cuda(
                     n_rows as i32,
                     k_in as i32,
                     num_symbols as i32,
+                    cb_mult,
                     dev.cuda_stream().cu_stream(),
                 );
             },
@@ -959,6 +982,7 @@ pub(crate) fn quantize_rows_cuda(
                             num_symbols as i32,
                             row_offset as i32,
                             width as i32,
+                            cb_mult,
                             dev.cuda_stream().cu_stream(),
                         )
                     };
@@ -1018,6 +1042,7 @@ pub(crate) fn quantize_rows_cuda(
                             k_in as i32,
                             num_symbols as i32,
                             row_offset as i32,
+                            cb_mult,
                             dev.cuda_stream().cu_stream(),
                         );
                     }
@@ -1071,6 +1096,7 @@ pub(crate) fn quantize_rows_cuda(
                 n_rows as i32,
                 k_in as i32,
                 num_symbols as i32,
+                cb_mult,
                 dev.cuda_stream().cu_stream(),
             );
         }

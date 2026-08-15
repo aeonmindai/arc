@@ -392,7 +392,7 @@ impl QuantMethod for UnquantLinear {
                 // invariant to. It is only consumed when `ARC_QTIP_HESSIAN=1`;
                 // otherwise we keep the historical "unsupported" contract
                 // rather than silently ignoring calibration data.
-                let hessian_diag = match (&imatrix_weight, crate::QtipBakeConfig::get().hessian) {
+                let hessian_diag = match (&imatrix_weight, crate::QtipBakeConfig::get()?.hessian) {
                     (Some(h), true) => Some(h.as_slice()),
                     (Some(_), false) => candle_core::bail!(
                         "QTIP does not support imatrix. Set ARC_QTIP_HESSIAN=1 to bake with the \

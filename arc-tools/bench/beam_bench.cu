@@ -8,7 +8,13 @@
 //     nvcc -O3 -std=c++17 --use_fast_math -arch=sm_80 \
 //          -I<kernels/qtip dir> beam_bench.cu -o bench
 //
-// Usage: ./bench <n_rows> <k_in> <beam_w> <iters> <out.bin>
+// Usage: ./bench <n_rows> <k_in> <beam_w> <iters> <out.bin> [cb_mult]
+//
+// `cb_mult` (default 0) selects the codebook: 0 gathers from the uploaded
+// Gaussian table, nonzero computes the `sum2` code in registers with that MCG
+// multiplier. `arc-tools/bench/codebook_bench.cu` is the harness that prices
+// the two against each other across all five kernels; this one stays a
+// single-kernel driver.
 //
 // The LUT and weights are generated with the SAME deterministic hashes the Rust
 // side uses (`gaussian_lut`, splitmix64 + Box-Muller), so the candidate cost
@@ -57,6 +63,7 @@ int main(int argc, char** argv) {
     int beam_w  = argc > 3 ? atoi(argv[3]) : 256;
     int iters   = argc > 4 ? atoi(argv[4]) : 3;
     const char* out = argc > 5 ? argv[5] : nullptr;
+    unsigned int cb_mult = argc > 6 ? (unsigned int)strtoul(argv[6], nullptr, 0) : 0u;
 
     const int num_symbols   = k_in / 2;            // V = 2
     const int packed_per_row = num_symbols / 2;    // two K=4 symbols per byte
@@ -99,7 +106,8 @@ int main(int argc, char** argv) {
 
     // ---- warmup + timed runs ---------------------------------------------
     int rc = launch_qtip_quantize_rows_beam_f32(d_w, d_lut, d_scales, d_packed, d_trace,
-                                                n_rows, k_in, num_symbols, 0, beam_w, 0);
+                                                n_rows, k_in, num_symbols, 0, beam_w,
+                                                cb_mult, 0);
     if (rc != 0) { printf("launch refused rc=%d\n", rc); return 1; }
     CK(cudaDeviceSynchronize());
 
@@ -110,7 +118,7 @@ int main(int argc, char** argv) {
     for (int it = 0; it < iters; ++it) {
         CK(cudaEventRecord(t0));
         launch_qtip_quantize_rows_beam_f32(d_w, d_lut, d_scales, d_packed, d_trace,
-                                           n_rows, k_in, num_symbols, 0, beam_w, 0);
+                                           n_rows, k_in, num_symbols, 0, beam_w, cb_mult, 0);
         CK(cudaEventRecord(t1));
         CK(cudaEventSynchronize(t1));
         float ms = 0.0f;

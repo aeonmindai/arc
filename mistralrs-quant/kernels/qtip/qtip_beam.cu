@@ -88,6 +88,8 @@
 #include <cuda_runtime.h>
 
 #include "qtip_exact_fp.cuh"
+// Codebook selection (stored Gaussian LUT vs in-register sum2 code).
+#include "qtip_codebook.cuh"
 
 namespace {
 
@@ -268,17 +270,19 @@ __device__ __forceinline__ void qb_select_digit_bin(
     }
 }
 
+template <bool COMPUTED_CB>
 __global__ void __launch_bounds__(QB_THREADS, QB_MIN_BLOCKS_PER_SM)
 qtip_quantize_rows_beam_kernel(
     const float*   __restrict__ weight,      // [n_rows, in_features]
-    const float*   __restrict__ lut,         // [2^L * V]
+    const float*   __restrict__ lut,         // [2^L * V] (unused when computed)
     const float*   __restrict__ row_scales,  // [n_rows]
     uint8_t*       __restrict__ packed,      // [n_rows, num_symbols / 2]
     uint32_t*      __restrict__ trace,       // [BATCH, num_symbols, beam_w]
     int in_features,
     int num_symbols,
     int row_offset,
-    int beam_w
+    int beam_w,
+    unsigned int cb_mult
 ) {
     // ~37.1 KiB at QB_MAX_BEAM = 256; the 48 KiB static limit is the gate.
     __shared__ unsigned long long s_gmin[QB_GROUP_COUNT];   // 32 KiB
@@ -403,12 +407,29 @@ qtip_quantize_rows_beam_kernel(
         if (active) {
             base_state = ((unsigned int)s_grp_g[tid]) << QB_K;
             const float gcost = s_grp_cost[tid];
-            // 16 consecutive states => one contiguous 128 B LUT run.
-            const float* __restrict__ lp = lut + (size_t)base_state * 2u;
-            #pragma unroll
-            for (int j = 0; j < (int)QB_ALPHABET; ++j) {
-                const float err = qtip_decode_err_exact_lv(lp[2 * j + 0], lp[2 * j + 1], t0, t1);
-                cand[j] = qtip_total_order_key(__fadd_rn(gcost, err));
+            if (COMPUTED_CB) {
+                // The 16 successors are `base_state | j` for consecutive j, and
+                // base_state's low K bits are zero, so `(base_state|j)*mult ==
+                // base_state*mult + j*mult`: the MCG product advances by one
+                // folded constant per j — a single integer add, and no codebook
+                // memory traffic at all.
+                const unsigned int prod0 = base_state * cb_mult;
+                #pragma unroll
+                for (int j = 0; j < (int)QB_ALPHABET; ++j) {
+                    const unsigned int x0 = prod0 + (unsigned int)j * cb_mult;
+                    const unsigned int x1 = x0 * cb_mult;
+                    const float err = qtip_decode_err_exact_lv(
+                        qtip_cb_fold(x0), qtip_cb_fold(x1), t0, t1);
+                    cand[j] = qtip_total_order_key(__fadd_rn(gcost, err));
+                }
+            } else {
+                // 16 consecutive states => one contiguous 128 B LUT run.
+                const float* __restrict__ lp = lut + (size_t)base_state * 2u;
+                #pragma unroll
+                for (int j = 0; j < (int)QB_ALPHABET; ++j) {
+                    const float err = qtip_decode_err_exact_lv(lp[2 * j + 0], lp[2 * j + 1], t0, t1);
+                    cand[j] = qtip_total_order_key(__fadd_rn(gcost, err));
+                }
             }
         } else {
             #pragma unroll
@@ -648,6 +669,8 @@ int qtip_beam_max_width() { return QB_MAX_BEAM; }
 
 // Returns 0 on launch, -1 when `beam_w` is out of range (caller must not
 // silently fall back to a different search).
+// `cb_mult == 0` selects the stored Gaussian LUT; nonzero selects the computed
+// sum2 codebook with that MCG multiplier. See qtip_codebook.cuh.
 int launch_qtip_quantize_rows_beam_f32(
     const float*  d_weight,
     const float*  d_lut,
@@ -659,12 +682,19 @@ int launch_qtip_quantize_rows_beam_f32(
     int num_symbols,
     int row_offset,
     int beam_w,
+    unsigned int  cb_mult,
     cudaStream_t  stream
 ) {
     if (beam_w < 1 || beam_w > QB_MAX_BEAM) return -1;
-    qtip_quantize_rows_beam_kernel<<<n_rows, QB_THREADS, 0, stream>>>(
-        d_weight, d_lut, d_row_scales, d_packed, d_trace,
-        in_features, num_symbols, row_offset, beam_w);
+    if (cb_mult != 0u) {
+        qtip_quantize_rows_beam_kernel<true><<<n_rows, QB_THREADS, 0, stream>>>(
+            d_weight, d_lut, d_row_scales, d_packed, d_trace,
+            in_features, num_symbols, row_offset, beam_w, cb_mult);
+    } else {
+        qtip_quantize_rows_beam_kernel<false><<<n_rows, QB_THREADS, 0, stream>>>(
+            d_weight, d_lut, d_row_scales, d_packed, d_trace,
+            in_features, num_symbols, row_offset, beam_w, 0u);
+    }
     return 0;
 }
 

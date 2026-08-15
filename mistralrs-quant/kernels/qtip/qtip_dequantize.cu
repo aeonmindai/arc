@@ -27,6 +27,10 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+// The codebook: either the stored 512 KiB Gaussian table or the in-register
+// "sum2" computed code, selected at compile time per instantiation.
+#include "qtip_codebook.cuh"
+
 namespace {
 
 constexpr uint32_t QTIP_K          = 4;
@@ -84,15 +88,16 @@ __device__ __forceinline__ float to_f32<__nv_bfloat16>(__nv_bfloat16 v) {
 // We pre-multiply scale into the local accumulator (free), so each write is
 // a fused mul + dtype convert + store.
 
-template <typename T, int THREADS>
+template <typename T, int THREADS, bool COMPUTED_CB>
 __global__ void qtip_dequantize_v2_k4_l16_kernel(
     const uint8_t* __restrict__ packed,       // [n_rows, packed_per_row]
     const float*   __restrict__ row_scales,   // [n_rows]
-    const float*   __restrict__ lut,          // [2^L * V]
+    const float*   __restrict__ lut,          // [2^L * V] (unused when computed)
     T*             __restrict__ out,          // [n_rows, num_weights]
     int n_rows,
     int packed_per_row,
-    int num_symbols
+    int num_symbols,
+    unsigned int cb_mult
 ) {
     int row = blockIdx.x * THREADS + threadIdx.x;
     if (row >= n_rows) return;
@@ -112,18 +117,16 @@ __global__ void qtip_dequantize_v2_k4_l16_kernel(
         // First symbol (low nibble).
         state = ((state << QTIP_K) | (uint32_t)sym_lo) & QTIP_STATE_MASK;
         int out_idx_lo = (b * 2) * (int)QTIP_V;
-        float w0 = lut[(size_t)state * QTIP_V + 0] * scale;
-        float w1 = lut[(size_t)state * QTIP_V + 1] * scale;
-        my_out[out_idx_lo + 0] = from_f32<T>(w0);
-        my_out[out_idx_lo + 1] = from_f32<T>(w1);
+        float2 c = qtip_cb_value<COMPUTED_CB>(lut, state, cb_mult);
+        my_out[out_idx_lo + 0] = from_f32<T>(c.x * scale);
+        my_out[out_idx_lo + 1] = from_f32<T>(c.y * scale);
 
         // Second symbol (high nibble).
         state = ((state << QTIP_K) | (uint32_t)sym_hi) & QTIP_STATE_MASK;
         int out_idx_hi = (b * 2 + 1) * (int)QTIP_V;
-        w0 = lut[(size_t)state * QTIP_V + 0] * scale;
-        w1 = lut[(size_t)state * QTIP_V + 1] * scale;
-        my_out[out_idx_hi + 0] = from_f32<T>(w0);
-        my_out[out_idx_hi + 1] = from_f32<T>(w1);
+        c = qtip_cb_value<COMPUTED_CB>(lut, state, cb_mult);
+        my_out[out_idx_hi + 0] = from_f32<T>(c.x * scale);
+        my_out[out_idx_hi + 1] = from_f32<T>(c.y * scale);
     }
 }
 
@@ -203,59 +206,38 @@ extern "C" {
 
 // ----- Dequantize -----------------------------------------------------------
 
-void launch_qtip_dequantize_v2_k4_l16_bf16(
-    const uint8_t* d_packed,
-    const float*   d_row_scales,
-    const float*   d_lut,
-    __nv_bfloat16* d_out,
-    int n_rows,
-    int packed_per_row,
-    int num_symbols,
-    cudaStream_t   stream
-) {
-    constexpr int THREADS = 64;
-    const int blocks = (n_rows + THREADS - 1) / THREADS;
-    qtip_dequantize_v2_k4_l16_kernel<__nv_bfloat16, THREADS>
-        <<<blocks, THREADS, 0, stream>>>(
-            d_packed, d_row_scales, d_lut, d_out,
-            n_rows, packed_per_row, num_symbols);
-}
+// `cb_mult == 0` selects the stored Gaussian LUT; nonzero selects the computed
+// sum2 codebook with that MCG multiplier. See qtip_codebook.cuh.
+#define QTIP_DEQ_LAUNCHER(NAME, T)                                                 \
+    void NAME(const uint8_t* d_packed,                                             \
+              const float*   d_row_scales,                                         \
+              const float*   d_lut,                                                \
+              T*             d_out,                                                \
+              int n_rows,                                                          \
+              int packed_per_row,                                                  \
+              int num_symbols,                                                     \
+              unsigned int cb_mult,                                                \
+              cudaStream_t   stream) {                                             \
+        constexpr int THREADS = 64;                                                \
+        const int blocks = (n_rows + THREADS - 1) / THREADS;                       \
+        if (cb_mult != 0u) {                                                       \
+            qtip_dequantize_v2_k4_l16_kernel<T, THREADS, true>                     \
+                <<<blocks, THREADS, 0, stream>>>(                                  \
+                    d_packed, d_row_scales, d_lut, d_out,                          \
+                    n_rows, packed_per_row, num_symbols, cb_mult);                 \
+        } else {                                                                   \
+            qtip_dequantize_v2_k4_l16_kernel<T, THREADS, false>                    \
+                <<<blocks, THREADS, 0, stream>>>(                                  \
+                    d_packed, d_row_scales, d_lut, d_out,                          \
+                    n_rows, packed_per_row, num_symbols, 0u);                      \
+        }                                                                          \
+    }
 
-void launch_qtip_dequantize_v2_k4_l16_f16(
-    const uint8_t* d_packed,
-    const float*   d_row_scales,
-    const float*   d_lut,
-    __half*        d_out,
-    int n_rows,
-    int packed_per_row,
-    int num_symbols,
-    cudaStream_t   stream
-) {
-    constexpr int THREADS = 64;
-    const int blocks = (n_rows + THREADS - 1) / THREADS;
-    qtip_dequantize_v2_k4_l16_kernel<__half, THREADS>
-        <<<blocks, THREADS, 0, stream>>>(
-            d_packed, d_row_scales, d_lut, d_out,
-            n_rows, packed_per_row, num_symbols);
-}
+QTIP_DEQ_LAUNCHER(launch_qtip_dequantize_v2_k4_l16_bf16, __nv_bfloat16)
+QTIP_DEQ_LAUNCHER(launch_qtip_dequantize_v2_k4_l16_f16,  __half)
+QTIP_DEQ_LAUNCHER(launch_qtip_dequantize_v2_k4_l16_f32,  float)
 
-void launch_qtip_dequantize_v2_k4_l16_f32(
-    const uint8_t* d_packed,
-    const float*   d_row_scales,
-    const float*   d_lut,
-    float*         d_out,
-    int n_rows,
-    int packed_per_row,
-    int num_symbols,
-    cudaStream_t   stream
-) {
-    constexpr int THREADS = 64;
-    const int blocks = (n_rows + THREADS - 1) / THREADS;
-    qtip_dequantize_v2_k4_l16_kernel<float, THREADS>
-        <<<blocks, THREADS, 0, stream>>>(
-            d_packed, d_row_scales, d_lut, d_out,
-            n_rows, packed_per_row, num_symbols);
-}
+#undef QTIP_DEQ_LAUNCHER
 
 // ----- In-place activation rotation -----------------------------------------
 

@@ -38,6 +38,12 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+// The LUT gather this kernel's header calls "small enough to stay hot" is the
+// measured decode limiter (388 GB/s ~ 8% of HBM on H200; the stall is the
+// dependent, scattered load, not the bytes). `qtip_cb_value_ldg<true>` removes
+// it entirely — see qtip_codebook.cuh.
+#include "qtip_codebook.cuh"
+
 namespace {
 
 constexpr uint32_t QTIP_K          = 4;
@@ -112,17 +118,18 @@ __device__ __forceinline__ float warp_reduce_sum(float v) {
 //                          stays cache-hot across the whole grid.
 //   * row_scales:          1 float per row.
 //   * output write:        1 element per row.
-template <typename T, int THREADS>
+template <typename T, int THREADS, bool COMPUTED_CB>
 __global__ void __launch_bounds__(THREADS)
 qtip_fused_gemv_v2_k4_l16_kernel(
     const uint8_t* __restrict__ packed,       // [n_rows, packed_per_row]
     const float*   __restrict__ row_scales,   // [n_rows]
-    const float*   __restrict__ lut,          // [2^L * V]
+    const float*   __restrict__ lut,          // [2^L * V] (unused when computed)
     const T*       __restrict__ x,            // [k_in]   (k_in == num_weights)
     T*             __restrict__ y,            // [n_rows]
     int n_rows,
     int packed_per_row,
-    int num_symbols
+    int num_symbols,
+    unsigned int cb_mult
 ) {
     const int row = blockIdx.x;
     if (row >= n_rows) return;
@@ -203,11 +210,11 @@ qtip_fused_gemv_v2_k4_l16_kernel(
 
             if (do_lo) {
                 state = ((state << QTIP_K) | sym_lo) & QTIP_STATE_MASK;
-                // LUT is 512 KiB FP32 — bound to live in L2 across all
-                // blocks. __ldg signals read-only path.
-                const float* lut_p = lut + (size_t)state * QTIP_V;
-                float w0 = __ldg(lut_p)     * scale;
-                float w1 = __ldg(lut_p + 1) * scale;
+                // LUT path: 512 KiB FP32, L2-resident, __ldg read-only.
+                // Computed path: no load at all.
+                const float2 c = qtip_cb_value_ldg<COMPUTED_CB>(lut, state, cb_mult);
+                float w0 = c.x * scale;
+                float w1 = c.y * scale;
                 int x_off = sym_idx * (int)QTIP_V;
                 float x0 = to_f32<T>(__ldg(x + x_off + 0));
                 float x1 = to_f32<T>(__ldg(x + x_off + 1));
@@ -219,9 +226,9 @@ qtip_fused_gemv_v2_k4_l16_kernel(
 
             // High nibble (the second symbol in this byte).
             state = ((state << QTIP_K) | sym_hi) & QTIP_STATE_MASK;
-            const float* lut_p_hi = lut + (size_t)state * QTIP_V;
-            float w0 = __ldg(lut_p_hi)     * scale;
-            float w1 = __ldg(lut_p_hi + 1) * scale;
+            const float2 c_hi = qtip_cb_value_ldg<COMPUTED_CB>(lut, state, cb_mult);
+            float w0 = c_hi.x * scale;
+            float w1 = c_hi.y * scale;
             int x_off = sym_idx * (int)QTIP_V;
             float x0 = to_f32<T>(__ldg(x + x_off + 0));
             float x1 = to_f32<T>(__ldg(x + x_off + 1));
@@ -256,58 +263,37 @@ qtip_fused_gemv_v2_k4_l16_kernel(
 
 extern "C" {
 
-void launch_qtip_fused_gemv_v2_k4_l16_bf16(
-    const uint8_t*       d_packed,
-    const float*         d_row_scales,
-    const float*         d_lut,
-    const __nv_bfloat16* d_x_rotated,
-    __nv_bfloat16*       d_y,
-    int n_rows,
-    int packed_per_row,
-    int num_symbols,
-    cudaStream_t         stream
-) {
-    constexpr int THREADS = 128;
-    qtip_fused_gemv_v2_k4_l16_kernel<__nv_bfloat16, THREADS>
-        <<<n_rows, THREADS, 0, stream>>>(
-            d_packed, d_row_scales, d_lut, d_x_rotated, d_y,
-            n_rows, packed_per_row, num_symbols);
-}
+// `cb_mult == 0` selects the stored Gaussian LUT; nonzero selects the computed
+// sum2 codebook with that MCG multiplier. See qtip_codebook.cuh.
+#define QTIP_GEMV_LAUNCHER(NAME, T)                                                \
+    void NAME(const uint8_t* d_packed,                                             \
+              const float*   d_row_scales,                                         \
+              const float*   d_lut,                                                \
+              const T*       d_x_rotated,                                          \
+              T*             d_y,                                                  \
+              int n_rows,                                                          \
+              int packed_per_row,                                                  \
+              int num_symbols,                                                     \
+              unsigned int cb_mult,                                                \
+              cudaStream_t   stream) {                                             \
+        constexpr int THREADS = 128;                                               \
+        if (cb_mult != 0u) {                                                       \
+            qtip_fused_gemv_v2_k4_l16_kernel<T, THREADS, true>                     \
+                <<<n_rows, THREADS, 0, stream>>>(                                  \
+                    d_packed, d_row_scales, d_lut, d_x_rotated, d_y,               \
+                    n_rows, packed_per_row, num_symbols, cb_mult);                 \
+        } else {                                                                   \
+            qtip_fused_gemv_v2_k4_l16_kernel<T, THREADS, false>                    \
+                <<<n_rows, THREADS, 0, stream>>>(                                  \
+                    d_packed, d_row_scales, d_lut, d_x_rotated, d_y,               \
+                    n_rows, packed_per_row, num_symbols, 0u);                      \
+        }                                                                          \
+    }
 
-void launch_qtip_fused_gemv_v2_k4_l16_f16(
-    const uint8_t* d_packed,
-    const float*   d_row_scales,
-    const float*   d_lut,
-    const __half*  d_x_rotated,
-    __half*        d_y,
-    int n_rows,
-    int packed_per_row,
-    int num_symbols,
-    cudaStream_t   stream
-) {
-    constexpr int THREADS = 128;
-    qtip_fused_gemv_v2_k4_l16_kernel<__half, THREADS>
-        <<<n_rows, THREADS, 0, stream>>>(
-            d_packed, d_row_scales, d_lut, d_x_rotated, d_y,
-            n_rows, packed_per_row, num_symbols);
-}
+QTIP_GEMV_LAUNCHER(launch_qtip_fused_gemv_v2_k4_l16_bf16, __nv_bfloat16)
+QTIP_GEMV_LAUNCHER(launch_qtip_fused_gemv_v2_k4_l16_f16,  __half)
+QTIP_GEMV_LAUNCHER(launch_qtip_fused_gemv_v2_k4_l16_f32,  float)
 
-void launch_qtip_fused_gemv_v2_k4_l16_f32(
-    const uint8_t* d_packed,
-    const float*   d_row_scales,
-    const float*   d_lut,
-    const float*   d_x_rotated,
-    float*         d_y,
-    int n_rows,
-    int packed_per_row,
-    int num_symbols,
-    cudaStream_t   stream
-) {
-    constexpr int THREADS = 128;
-    qtip_fused_gemv_v2_k4_l16_kernel<float, THREADS>
-        <<<n_rows, THREADS, 0, stream>>>(
-            d_packed, d_row_scales, d_lut, d_x_rotated, d_y,
-            n_rows, packed_per_row, num_symbols);
-}
+#undef QTIP_GEMV_LAUNCHER
 
 } // extern "C"

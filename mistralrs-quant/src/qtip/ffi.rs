@@ -11,6 +11,16 @@ use half::{bf16, f16};
 /// capability.
 pub(crate) const HAVE_QTIP_KERNELS: bool = cfg!(has_qtip_kernels);
 
+/// Codebook selector carried by every K=4/V=2 launcher below.
+///
+/// `cb_mult == 0` means "gather the reproduction values from the stored
+/// `d_lut` table" — the Gaussian rung, unchanged. A nonzero value is the MCG
+/// multiplier of the computed `sum2` codebook, and the kernel then ignores
+/// `d_lut` entirely (`kernels/qtip/qtip_codebook.cuh`). 0 is a safe sentinel
+/// because an MCG multiplier must be odd, so it can never name a real
+/// codebook. `QtipCodebook::cuda_mult()` is the only thing that produces it.
+pub(crate) const CB_MULT_GAUSSIAN_LUT: u32 = 0;
+
 #[cfg(feature = "cuda")]
 extern "C" {
     pub(crate) fn launch_qtip_dequantize_v2_k4_l16_bf16(
@@ -21,6 +31,7 @@ extern "C" {
         n_rows: i32,
         packed_per_row: i32,
         num_symbols: i32,
+        cb_mult: u32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
@@ -32,6 +43,7 @@ extern "C" {
         n_rows: i32,
         packed_per_row: i32,
         num_symbols: i32,
+        cb_mult: u32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
@@ -43,6 +55,7 @@ extern "C" {
         n_rows: i32,
         packed_per_row: i32,
         num_symbols: i32,
+        cb_mult: u32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
@@ -90,6 +103,7 @@ extern "C" {
         d_row_scales: *mut f32,
         n_rows: i32,
         in_features: i32,
+        divisor: f32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
@@ -101,6 +115,7 @@ extern "C" {
         n_rows: i32,
         in_features: i32,
         num_symbols: i32,
+        cb_mult: u32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
@@ -116,6 +131,7 @@ extern "C" {
         in_features: i32,
         num_symbols: i32,
         row_offset: i32,
+        cb_mult: u32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
@@ -147,6 +163,7 @@ extern "C" {
         num_symbols: i32,
         row_offset: i32,
         beam_w: i32,
+        cb_mult: u32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     ) -> i32;
 
@@ -158,6 +175,7 @@ extern "C" {
         n_rows: i32,
         in_features: i32,
         num_symbols: i32,
+        cb_mult: u32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
@@ -176,6 +194,7 @@ extern "C" {
         n_rows: i32,
         packed_per_row: i32,
         num_symbols: i32,
+        cb_mult: u32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
@@ -188,6 +207,7 @@ extern "C" {
         n_rows: i32,
         packed_per_row: i32,
         num_symbols: i32,
+        cb_mult: u32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
@@ -200,6 +220,7 @@ extern "C" {
         n_rows: i32,
         packed_per_row: i32,
         num_symbols: i32,
+        cb_mult: u32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
@@ -221,6 +242,7 @@ extern "C" {
         num_symbols: i32,
         n_pairs: i32,
         num_experts: i32,
+        cb_mult: u32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
@@ -236,6 +258,7 @@ extern "C" {
         num_symbols: i32,
         n_pairs: i32,
         num_experts: i32,
+        cb_mult: u32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
@@ -251,6 +274,7 @@ extern "C" {
         num_symbols: i32,
         n_pairs: i32,
         num_experts: i32,
+        cb_mult: u32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 

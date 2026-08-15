@@ -637,7 +637,7 @@ fn beam_width_round_trips_through_uqff_exactly() {
 /// travel.
 #[test]
 fn real_beam_bake_at_w256_stamps_the_width_it_ran() {
-    use super::{QtipBakeConfig, TrellisSearch};
+    use super::{QtipBakeConfig, QtipCodebook, TrellisSearch};
 
     let device = Device::Cpu;
     // Deterministic Gaussian; this test is about provenance plumbing, not
@@ -657,6 +657,7 @@ fn real_beam_bake_at_w256_stamps_the_width_it_ran() {
             QtipBakeConfig {
                 search,
                 hessian: false,
+                codebook: QtipCodebook::Gaussian,
             },
         )
         .expect("viterbi bake must succeed")
@@ -753,7 +754,7 @@ fn real_beam_bake_at_w256_stamps_the_width_it_ran() {
 #[test]
 fn real_3d_expert_stack_beam_bake_at_w256_stamps_the_width_it_ran() {
     use super::bake_quality_tests::gen_fp4_dequant;
-    use super::{QtipBakeConfig, TrellisSearch};
+    use super::{QtipBakeConfig, QtipCodebook, TrellisSearch};
 
     let device = Device::Cpu;
     let (e, n, k) = (3usize, 4usize, 64usize);
@@ -776,6 +777,7 @@ fn real_3d_expert_stack_beam_bake_at_w256_stamps_the_width_it_ran() {
             QtipBakeConfig {
                 search,
                 hessian: false,
+                codebook: QtipCodebook::Gaussian,
             },
         )
         .expect("3-D viterbi bake must succeed");
@@ -876,6 +878,7 @@ fn real_3d_expert_stack_beam_bake_at_w256_stamps_the_width_it_ran() {
         QtipBakeConfig {
             search: TrellisSearch::Beam { width: 1 },
             hessian: false,
+            codebook: QtipCodebook::Gaussian,
         },
     )
     .expect("a multi-chunk expert stack must bake");

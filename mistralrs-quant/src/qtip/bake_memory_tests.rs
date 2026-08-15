@@ -32,7 +32,7 @@ use std::borrow::Cow;
 use candle_core::{DType, Device, Storage, Tensor};
 
 use super::bake_quality_tests::gen_fp4_dequant;
-use super::{QtipBakeConfig, QtipLayer, QtipMode, TrellisSearch};
+use super::{QtipBakeConfig, QtipCodebook, QtipLayer, QtipMode, TrellisSearch};
 use crate::{QuantizeOntoGuard, QuantizedSerde};
 
 /// Bake a 3-D expert stack through the production door, keeping the concrete
@@ -47,6 +47,7 @@ fn bake_3d(stack: &Tensor) -> QtipLayer {
         QtipBakeConfig {
             search: TrellisSearch::Beam { width: 4 },
             hessian: false,
+            codebook: QtipCodebook::Gaussian,
         },
     )
     .expect("3-D bake must succeed")
