@@ -171,10 +171,25 @@ fn absorbed_mqa_decode(
 /// sequence; their causality is `comp_valid`), so the compressed columns are
 /// padded with `0`.
 ///
-/// A width that is neither `t_k` nor `n_keys` is a contract violation and is
-/// reported rather than dropped — silently ignoring a mismatched mask is the
-/// exact failure mode this function exists to end.
-fn compose_caller_mask(local: &Tensor, caller: &Tensor, t_q: usize, t_k: usize) -> Result<Tensor> {
+/// A width that is neither `t_k_full` nor `t_k_full + t_c` is a contract
+/// violation and is reported rather than dropped — silently ignoring a
+/// mismatched mask is the exact failure mode this function exists to end.
+///
+/// `raw_base`/`t_k` describe the raw-key narrowing the caller has already
+/// applied to K and V (see the narrowing block in [`dsv4_attention`]): the
+/// local mask spans raw keys `[raw_base, raw_base + t_k)`, while the caller's
+/// mask always spans the *full* raw cache `[0, t_k_full)`. The caller's mask is
+/// therefore sliced to the same window before folding. When nothing was
+/// narrowed (`raw_base == 0 && t_k == t_k_full`) the slice is the identity and
+/// this behaves exactly as it did before.
+fn compose_caller_mask(
+    local: &Tensor,
+    caller: &Tensor,
+    t_q: usize,
+    t_k_full: usize,
+    raw_base: usize,
+    t_k: usize,
+) -> Result<Tensor> {
     // `CausalMasker::make_causal_mask_matrix` returns a `[1, 1]` zero
     // placeholder when built with flash-attn on CUDA (there the kernel applies
     // causality itself). It carries no information, so folding it is a no-op.
@@ -206,25 +221,57 @@ fn compose_caller_mask(local: &Tensor, caller: &Tensor, t_q: usize, t_k: usize) 
         )));
     }
     let k_cols = caller.dim(3)?;
-    let caller = if k_cols == n_keys {
-        caller
-    } else if k_cols == t_k {
-        // Raw-only mask: neutral (0) over the compressed columns.
-        let (b, h) = (caller.dim(0)?, caller.dim(1)?);
-        let pad = Tensor::zeros(
-            (b, h, q_rows, n_keys - t_k),
-            caller.dtype(),
-            caller.device(),
-        )?;
-        Tensor::cat(&[&caller, &pad], 3)?
+    // Compressed-column count: the local mask is `[raw(t_k) ++ compressed(t_c)]`.
+    let t_c = n_keys - t_k;
+    let caller = if k_cols == t_k_full + t_c {
+        // Full union mask: slice its raw half to the retained window and keep
+        // its compressed half as-is.
+        let raw = caller.narrow(3, raw_base, t_k)?;
+        if t_c == 0 {
+            raw
+        } else {
+            let comp = caller.narrow(3, t_k_full, t_c)?;
+            Tensor::cat(&[&raw, &comp], 3)?
+        }
+    } else if k_cols == t_k_full {
+        // Raw-only mask: slice to the retained window, then neutral (0) over
+        // the compressed columns.
+        let raw = caller.narrow(3, raw_base, t_k)?;
+        if t_c == 0 {
+            raw
+        } else {
+            let (b, h) = (caller.dim(0)?, caller.dim(1)?);
+            let pad = Tensor::zeros((b, h, q_rows, t_c), caller.dtype(), caller.device())?;
+            Tensor::cat(&[&raw, &pad], 3)?
+        }
     } else {
         return Err(candle_core::Error::Msg(format!(
             "dsv4_attention: attention_mask key axis is {k_cols}, expected the raw cache width \
-             {t_k} or the full union width {n_keys}; dims {:?}",
+             {t_k_full} or the full union width {}; dims {:?}",
+            t_k_full + t_c,
             caller.dims()
         )));
     };
-    local.broadcast_add(&caller)
+    local.broadcast_add(&caller.contiguous()?)
+}
+
+/// The span of raw keys any query row in this block can reach, as
+/// `(base, len)` into the full raw cache `[0, t_k_full)`.
+///
+/// Query row `r` (`r` in `[0, t_q)`) sits at absolute position `q0 + r` where
+/// `q0 = t_k_full - t_q`, and attends raw key `j` iff
+/// `q0 + r - window < j <= q0 + r`. Taking the union over `r`:
+///
+/// * the largest reachable `j` is `q0 + t_q - 1 = t_k_full - 1` (row `t_q-1`
+///   attending its own position);
+/// * the smallest is `q0 - window + 1` (row `0` at its window's far edge).
+///
+/// So the span is the trailing `t_q + window - 1` keys, clamped to the cache.
+/// Every key before `base` is `-inf` on **every** row, which is why dropping
+/// them is an identity rather than an approximation.
+fn raw_keep_span(t_q: usize, window: usize, t_k_full: usize) -> (usize, usize) {
+    let keep = (t_q + window - 1).min(t_k_full);
+    (t_k_full - keep, keep)
 }
 
 /// Per-call configuration for V4 hybrid attention.
@@ -268,21 +315,57 @@ pub fn dsv4_attention(
     };
 
     let (_b, _h, t_q, _d) = q.dims4()?;
-    let t_k = k.dim(2)?;
+    let t_k_full = k.dim(2)?;
     let window = cfg.sliding_window.max(1);
     let dev = q.device();
 
-    // Absolute positions. `k` is the full cached sequence over `[0, t_k)`; the
-    // current query block is its last `t_q` tokens, so query row `r` is at
-    // position `q0 + r` with `q0 = t_k - t_q` (holds for prefill `t_q == t_k`
-    // and decode `t_q == 1`).
-    let q0 = t_k - t_q;
+    // Absolute positions. `k` is the full cached sequence over `[0, t_k_full)`;
+    // the current query block is its last `t_q` tokens, so query row `r` is at
+    // position `q0 + r` with `q0 = t_k_full - t_q` (holds for prefill
+    // `t_q == t_k_full` and decode `t_q == 1`).
+    let q0 = t_k_full - t_q;
+
+    // ---- Raw working-set narrowing ----------------------------------------
+    // Only the trailing `t_q + window - 1` raw keys are reachable by ANY query
+    // row in this block: row `r` sits at absolute position `q0 + r` and attends
+    // raw key `j` iff `q0 + r - window < j <= q0 + r`, so over `r` in
+    // `[0, t_q)` the union of reachable `j` is `[q0 - window + 1, t_k_full)` —
+    // exactly `t_q + window - 1` columns. Every earlier column is `-inf` on
+    // every row, so dropping it is an identity, not an approximation.
+    //
+    // It is worth dropping because the cost of carrying it is not the mask: it
+    // is the `Tensor::cat` below, which copies the whole raw cache (twice, once
+    // for K and once for V) on every decode step, and the scores GEMM over
+    // every one of those columns. At 2048 ctx a decode step (`t_q == 1`) goes
+    // from 2048 raw columns to `window` = 128. Prefill (`t_q == t_k_full`) is
+    // untouched — there the reachable union is the whole cache.
+    //
+    // NOTE (wave33): this is the *read* side. The cache itself is still grown
+    // to the full sequence (`kv_cache::NormalCache`), because `q0` above is
+    // derived from `t_k_full`. Capping the stored raw KV at `window` — what
+    // SGLang's DSV4 pool does, charging raw KV at `swa_full_tokens_ratio`
+    // (`model_executor/pool_configurator.py:397`) — requires threading the true
+    // absolute position in rather than inferring it from the cache length.
+    let (raw_base, keep) = raw_keep_span(t_q, window, t_k_full);
+    let (k_owned, v_owned) = if keep == t_k_full {
+        (None, None)
+    } else {
+        (
+            Some(k.narrow(2, raw_base, keep)?.contiguous()?),
+            Some(v.narrow(2, raw_base, keep)?.contiguous()?),
+        )
+    };
+    let k = k_owned.as_ref().unwrap_or(k);
+    let v = v_owned.as_ref().unwrap_or(v);
+    let t_k = keep;
 
     // ---- Raw sliding-window branch mask: [t_q, t_k] -----------------------
     // query r attends raw key j iff (q0+r-window < j <= q0+r): causal AND
     // within the trailing `window` tokens. The diagonal (j == q0+r) is always
-    // valid, so no query row is fully masked (no softmax NaN).
-    let kp = Tensor::arange(0u32, t_k as u32, dev)?
+    // valid, so no query row is fully masked (no softmax NaN). `kp` carries the
+    // ABSOLUTE position of each retained key, so the comparison against `qp` is
+    // unchanged by the narrowing above.
+    let kp = Tensor::arange(raw_base as u32, (raw_base + t_k) as u32, dev)?
         .to_dtype(DType::F32)?
         .reshape((1, t_k))?;
     let qp = Tensor::arange(q0 as u32, (q0 + t_q) as u32, dev)?
@@ -326,7 +409,7 @@ pub fn dsv4_attention(
     // Dropping it (the pre-fix behavior) let one sequence's padding vote in
     // its neighbours' softmax on every batched request.
     let mask = match attention_mask {
-        Some(caller) => compose_caller_mask(&mask, caller, t_q, t_k)?,
+        Some(caller) => compose_caller_mask(&mask, caller, t_q, t_k_full, raw_base, t_k)?,
         None => mask,
     };
 
@@ -1325,6 +1408,103 @@ mod tests {
             d_dedup > 3.0 * d_union.max(1e-4),
             "de-duplicating the raw/compressed overlap is indistinguishable here \
              (union {d_union} vs dedup {d_dedup}); this guard has no teeth"
+        );
+        Ok(())
+    }
+
+    /// The raw working-set span is exactly the reachable set — no wider (or the
+    /// narrowing buys nothing) and no narrower (or it silently drops attended
+    /// keys). Derived independently here by brute force over the same
+    /// per-row window rule `dsv4_attention` implements, so an edit to
+    /// [`raw_keep_span`]'s arithmetic has to survive the definition, not a
+    /// restatement of itself.
+    #[test]
+    fn raw_keep_span_is_exactly_the_reachable_set() {
+        let mut narrowed_at_least_once = false;
+        for window in [1usize, 2, 4, 8, 128] {
+            for t_k_full in [1usize, 3, 8, 129, 256, 2048] {
+                for t_q in [1usize, 2, 7, 64] {
+                    if t_q > t_k_full {
+                        continue;
+                    }
+                    let q0 = t_k_full - t_q;
+                    // Brute-force union of {j : q0+r-window < j <= q0+r, 0<=j<t_k_full}.
+                    let reachable: Vec<usize> = (0..t_k_full)
+                        .filter(|j| {
+                            (0..t_q).any(|r| {
+                                let p = q0 + r;
+                                *j <= p && p < *j + window
+                            })
+                        })
+                        .collect();
+                    let (base, keep) = raw_keep_span(t_q, window, t_k_full);
+                    assert_eq!(
+                        (base, base + keep),
+                        (reachable[0], reachable[reachable.len() - 1] + 1),
+                        "window={window} t_k_full={t_k_full} t_q={t_q}"
+                    );
+                    // The span must be contiguous for a `narrow` to be valid.
+                    assert_eq!(reachable.len(), keep);
+                    if keep < t_k_full {
+                        narrowed_at_least_once = true;
+                    }
+                }
+            }
+        }
+        // Without this the loop above could pass while `raw_keep_span` was the
+        // identity on every case it visits (DOCTRINE D12).
+        assert!(
+            narrowed_at_least_once,
+            "no case actually narrowed; the sweep cannot discriminate a real \
+             narrowing from `keep == t_k_full` everywhere"
+        );
+        // Production decode: window 128, 2048 ctx, one query.
+        assert_eq!(raw_keep_span(1, 128, 2048), (1920, 128));
+        // Prefill is untouched.
+        assert_eq!(raw_keep_span(2048, 128, 2048), (0, 2048));
+    }
+
+    /// End-to-end identity: keys outside the retained span cannot influence the
+    /// output (so dropping them is lossless), and the key at the retained
+    /// boundary CAN (so the span is not over-trimmed). Uses the deliberately
+    /// loud `perturb_keys` values — an attended-but-dropped key would dominate
+    /// the softmax and could not survive the equality.
+    #[test]
+    fn keys_outside_the_retained_span_cannot_influence_decode() -> Result<()> {
+        let device = Device::Cpu;
+        let (b, h, d, window, t_k) = (1, 2, 16, 8usize, 64usize);
+        let q = mk(b, h, 1, d, 0.07, &device)?;
+        let k = mk(b, 1, t_k, d, 0.13, &device)?;
+        let v = mk(b, 1, t_k, d, 0.19, &device)?;
+        let (sdpa, _sinks) = sdpa_params_with_sinks(d, h, &device)?;
+        let flash = empty_flash_params();
+        let cfg = Dsv4AttentionConfig {
+            compress_ratio: CompressRatio::Standard,
+            sliding_window: window,
+        };
+
+        let (base, keep) = raw_keep_span(1, window, t_k);
+        assert!(keep < t_k, "fixture does not narrow; the test has no teeth");
+        assert_eq!((base, keep), (56, 8));
+
+        let baseline = dsv4_attention(&q, &k, &v, None, None, &flash, &sdpa, cfg)?;
+
+        // Every key before the span: output must be bit-identical.
+        let (k_out, v_out) = perturb_keys(&k, &v, |_, j| j < base)?;
+        let perturbed_outside = dsv4_attention(&q, &k_out, &v_out, None, None, &flash, &sdpa, cfg)?;
+        assert_eq!(
+            max_abs_diff(&flat(&baseline), &flat(&perturbed_outside)),
+            0.0,
+            "a key outside the retained span changed the output"
+        );
+
+        // The first key INSIDE the span: output must move, or the span is
+        // wider than it needs to be and this test proves nothing.
+        let (k_in, v_in) = perturb_keys(&k, &v, |_, j| j == base)?;
+        let perturbed_inside = dsv4_attention(&q, &k_in, &v_in, None, None, &flash, &sdpa, cfg)?;
+        assert!(
+            max_abs_diff(&flat(&baseline), &flat(&perturbed_inside)) > 1e-3,
+            "the oldest retained key had no effect; the span is over-wide"
         );
         Ok(())
     }

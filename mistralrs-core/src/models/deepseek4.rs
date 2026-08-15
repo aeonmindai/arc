@@ -1451,12 +1451,24 @@ impl Attention {
         //    sum). This is the MLA "absorb V into K" trick at scale.
         //    Audit §3 ("absorbed the MLA split into a single fused output").
         //
-        // Use copy() not clone(): clone() shares the storage Arc<RwLock>, so k
-        // and v alias the same storage. PagedAttention's reshape_and_cache is an
-        // in-place op that write-locks and read-locks that storage -> RwLock
-        // self-deadlock (the dummy-run hang). copy() gives v its own storage.
-        // Cheap here: MQA means 1 KV head. (RUN-161)
-        let v = k.copy()?;
+        // wave33: because `v` IS `k` — bit for bit, unconditionally — the V
+        // half of the KV slot used to store a second full `[B, 1, T, 512]`
+        // copy of a tensor the model already has. That doubled the V4 KV
+        // footprint for nothing: 2 * 512 * 2 B = 2048 B/token/layer where the
+        // reference stores one K (SGLang
+        // `mem_cache/deepseek_v4_memory_pool.py:93-111`, 584 B/token/layer).
+        // The V half is now a 1-wide zero marker (`append_v_marker`), exactly
+        // the device this same file already used for the `xs` history slot
+        // (see the R2/R3 comment above: "`v` is a `[B, T, 1]` zero marker kept
+        // in lockstep because the cache managers require both sides
+        // populated"). Nothing downstream reads it: every consumer of the
+        // cached V is `dsv4_attention`, which is handed the cached K.
+        //
+        // A materialised `v` survives only on the PagedAttention arm, which
+        // writes through `reshape_and_cache` into engine-owned block storage
+        // that this model does not control. It is built there, not here, so
+        // the live (non-paged — `DeepSeekV4Loader::supports_paged_attention`
+        // returns false) decode path no longer pays the copy either.
 
         // 5. Attention dispatch (RUN-155 + RUN-167).
         //
@@ -1515,6 +1527,13 @@ impl Attention {
                 // mask, which the dense paged kernel cannot apply.
                 Some(((mut key_cache, mut value_cache, _, _), input_metadata)) => {
                     v4_paged_dispatch_precheck(bs)?;
+                    // Use copy() not clone(): clone() shares the storage
+                    // Arc<RwLock>, so k and v alias the same storage.
+                    // PagedAttention's reshape_and_cache is an in-place op that
+                    // write-locks and read-locks that storage -> RwLock
+                    // self-deadlock (the dummy-run hang). copy() gives v its own
+                    // storage. Cheap here: MQA means 1 KV head. (RUN-161)
+                    let v = k.copy()?;
                     let (k_full, v_full) = paged_attn.cache_write_and_gather(
                         &k,
                         &v,
@@ -1541,7 +1560,7 @@ impl Attention {
                     super::dsv4_attention::dsv4_attention(
                         &q,
                         &k,
-                        &v,
+                        &k,
                         compressed_kv.as_ref(),
                         attention_mask,
                         flash_params,
@@ -1561,7 +1580,7 @@ impl Attention {
                     .ok_or_else(|| candle_core::Error::Msg("graph positions unset".into()))?
                     .to_dtype(candle_core::DType::U32)?;
                 let cap = self.sliding_window.max(1);
-                let (k_full, v_full) = kv_cache.append_graph(&k, &v, &position, cap)?;
+                let k_full = append_graph_kv_mqa(kv_cache, &k, &position, cap)?;
                 // Use ONLY the fixed-width graph mask (matches the C-wide K).
                 // The eager `attention_mask` is kv_len-wide (growing) and would
                 // both mismatch the fixed window and break shape-constancy.
@@ -1574,7 +1593,7 @@ impl Attention {
                 super::dsv4_attention::dsv4_attention(
                     &q,
                     &k_full,
-                    &v_full,
+                    &k_full,
                     compressed_kv.as_ref(),
                     gmask.as_ref(),
                     flash_params,
@@ -1583,17 +1602,20 @@ impl Attention {
                 )?
             }
             None => {
-                let (k_cached, v_cached) = kv_cache.append(&k, &v)?;
+                let k_cached = append_kv_mqa(kv_cache, &k)?;
                 // Cache read-back: in decode this is prefill's K (0..N-1) + the
                 // new token's K. Diff vs prefill's freshly-computed K splits a
                 // cache-storage bug (old rows differ) from a new-token position
                 // bug (only the last row differs).
                 v4_trace_dump(self.dbg_layer_idx, &k_cached, "40_k_cached");
-                v4_trace_dump(self.dbg_layer_idx, &v_cached, "41_v_cached");
+                // Same tensor as `40_k_cached` by construction (V4 MQA: V == K).
+                // Kept under the historic tag so `v4_trace_diff.py` still lines
+                // up against pre-wave33 traces.
+                v4_trace_dump(self.dbg_layer_idx, &k_cached, "41_v_cached");
                 super::dsv4_attention::dsv4_attention(
                     &q,
                     &k_cached,
-                    &v_cached,
+                    &k_cached,
                     compressed_kv.as_ref(),
                     attention_mask,
                     flash_params,
@@ -2165,6 +2187,80 @@ impl MoeOrMlp {
 /// Per 64-element block: scale = amax/448 (E4M3 max), quantize to F8E4M3, dequant
 /// back. Rope dims (last `rope_dim`) untouched. Computed in F32 (ref does FP32
 /// internally). (RUN-161)
+/// Width, in elements per token, of the V half of a V4 KV cache slot.
+///
+/// V4 is MQA with a single fused `wkv` projection: `V` **is** `K`, bit for bit
+/// (see step 4 of [`Attention::forward`]). Storing a second full `head_dim`
+/// copy therefore buys nothing, and it is the whole of V4's KV overshoot
+/// against the reference — SGLang's DSV4 pool keeps one K per token
+/// (`mem_cache/deepseek_v4_memory_pool.py:93-111`).
+///
+/// The V half cannot simply be dropped: [`crate::kv_cache::NormalCacheManager`]
+/// unwraps `v.all_data` unconditionally when it batches sequences in
+/// (`clone_in_cache`) and splits them back out (`clone_out_cache`), so both
+/// halves must stay populated and must stay length-synchronised for every
+/// truncation path (prefix cacher, MTP verify rollback, speculative rejection)
+/// to keep working. One element per token satisfies all of that at
+/// `head_dim`× less memory. This is the same device the `xs` compressor-history
+/// slot has always used (see the R2/R3 note in [`Attention::forward`]).
+pub(crate) const V4_V_MARKER_WIDTH: usize = 1;
+
+/// Build the `[B, n_kv_heads, T, 1]` zero marker stored in place of the
+/// duplicate V. See [`V4_V_MARKER_WIDTH`].
+fn v4_v_marker(k: &Tensor) -> Result<Tensor> {
+    let (b, h, t, _d) = k.dims4()?;
+    Tensor::zeros((b, h, t, V4_V_MARKER_WIDTH), k.dtype(), k.device())
+}
+
+/// Reject a KV slot that is not a plain [`KvCache::Normal`].
+///
+/// The marker layout relies on the two halves of a `Normal` slot being
+/// independent [`crate::kv_cache::SingleCache`]s that may differ in their last
+/// dimension. `Rotating` would silently window the marker against the K half's
+/// own offset bookkeeping, and `TurboQuant` would try to quantize a 1-wide
+/// vector. Neither is reachable for V4 today (`NormalCache::new` hands out
+/// `Normal` slots unless the global TurboQuant head-dim is one of 64/128/256,
+/// and V4's is 512) — this exists so a future cache change fails loudly
+/// instead of corrupting the V4 decode path.
+fn require_normal_kv_slot(kv_cache: &KvCache) -> Result<()> {
+    if matches!(kv_cache, KvCache::Normal { .. }) {
+        return Ok(());
+    }
+    candle_core::bail!(
+        "V4 attention was handed a {} KV slot; the MQA V-marker layout requires a \
+         KvCache::Normal entry (see V4_V_MARKER_WIDTH).",
+        match kv_cache {
+            KvCache::Normal { .. } => unreachable!(),
+            KvCache::Rotating { .. } => "Rotating",
+            KvCache::TurboQuant(_) => "TurboQuant",
+            KvCache::XsRolling(_) => "XsRolling",
+        }
+    )
+}
+
+/// Append V4's fused K/V, storing K once and a 1-wide marker in place of the
+/// duplicate V. Returns the full cached K — which is also the full cached V.
+fn append_kv_mqa(kv_cache: &mut KvCache, k: &Tensor) -> Result<Tensor> {
+    require_normal_kv_slot(kv_cache)?;
+    let marker = v4_v_marker(k)?;
+    let (k_cached, _marker_cached) = kv_cache.append(k, &marker)?;
+    Ok(k_cached)
+}
+
+/// [`append_kv_mqa`] for the CUDA-graph decode path: writes at the device-held
+/// `position` and reads back a fixed `cap`-wide window.
+fn append_graph_kv_mqa(
+    kv_cache: &mut KvCache,
+    k: &Tensor,
+    position: &Tensor,
+    cap: usize,
+) -> Result<Tensor> {
+    require_normal_kv_slot(kv_cache)?;
+    let marker = v4_v_marker(k)?;
+    let (k_full, _marker_full) = kv_cache.append_graph(k, &marker, position, cap)?;
+    Ok(k_full)
+}
+
 fn act_quant_kv_nope(k: &Tensor, rope_dim: usize) -> Result<Tensor> {
     let head_dim = k.dim(D::Minus1)?;
     let nope = head_dim - rope_dim;
@@ -2234,13 +2330,105 @@ pub(crate) static MLA_NS: [std::sync::atomic::AtomicU64; 3] = [
 ];
 pub(crate) const MLA_NAMES: [&str; 3] = ["q_proj", "kv_proj_rope", "invrope_oproj"];
 
+/// Log one forward's per-component split and reset the accumulators.
+///
+/// Two things this used to get wrong, both of which made the resulting profile
+/// hard to act on (wave33):
+///
+/// 1. **It only fired on the 4-D mHC path.** The emit block lived inside the
+///    `use_4d_mhc` arm of [`DeepSeekV4::forward`], so a checkpoint without the
+///    global mHC head ran with `ARC_TIME_DECODE=1` and printed nothing at all.
+///    It is now called for both arms; on the 3-D arm it says so, because the
+///    `timed()` wrappers themselves live in `DecoderLayer::forward_4d` and a
+///    3-D forward genuinely has no component split to report. Silence and
+///    "this path is not instrumented" are different answers.
+/// 2. **It carried no batch geometry.** A B=64 profile and a B=1 profile
+///    printed identical-looking lines, so a percentage split could not be
+///    attributed to a batch size after the fact — and the split that motivated
+///    a month of MoE work was taken at b=1 on a build that has since been
+///    abandoned. The line now carries `b`, `t`, the token count, and
+///    per-token-of-batch time, so B=1 and B=64 runs are self-describing.
+fn emit_decode_profile(input_ids: &Tensor, instrumented: bool) {
+    use std::sync::atomic::Ordering;
+    if !decode_timing_enabled() {
+        return;
+    }
+    let (b, t) = match input_ids.dims2() {
+        Ok(bt) => bt,
+        // `[B]`-shaped decode inputs and anything else: report what we can
+        // rather than dropping the whole profile.
+        Err(_) => (input_ids.elem_count(), 1),
+    };
+    if !instrumented {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                "ARC_TIME_DECODE is set but this model is running the 3-D residual \
+                 fallback path, which has no per-component timers (they live in \
+                 DecoderLayer::forward_4d). No split will be reported. This means \
+                 the checkpoint has no global mHC head — see DeepSeekV4::new."
+            );
+        });
+        return;
+    }
+    let total: u64 = DECODE_NS.iter().map(|a| a.load(Ordering::Relaxed)).sum();
+    let parts: Vec<String> = DECODE_NAMES
+        .iter()
+        .zip(DECODE_NS.iter())
+        .map(|(n, a)| {
+            let ns = a.load(Ordering::Relaxed);
+            format!(
+                "{}={:.2}ms({:.0}%)",
+                n,
+                ns as f64 / 1e6,
+                100.0 * ns as f64 / total.max(1) as f64
+            )
+        })
+        .collect();
+    let mla_parts: Vec<String> = MLA_NAMES
+        .iter()
+        .zip(MLA_NS.iter())
+        .map(|(n, a)| format!("{}={:.2}ms", n, a.load(Ordering::Relaxed) as f64 / 1e6))
+        .collect();
+    let tokens = (b * t).max(1);
+    tracing::info!(
+        "ARC_TIME_DECODE b={} t={} tokens={} forward_total={:.2}ms ({:.3}ms/token) | {} \
+         || MLA[{}] (sdpa=mla_attn-these)",
+        b,
+        t,
+        tokens,
+        total as f64 / 1e6,
+        total as f64 / 1e6 / tokens as f64,
+        parts.join(" "),
+        mla_parts.join(" ")
+    );
+    for a in DECODE_NS.iter() {
+        a.store(0, Ordering::Relaxed);
+    }
+    for a in MLA_NS.iter() {
+        a.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Whether `ARC_TIME_DECODE=1` was set at process start.
+///
+/// Cached: the timers wrap 9 components per layer, so a `var_os` per call was
+/// ~390 environment scans per forward *when the profiler is off*. It is also
+/// what makes the gate honest — `var_os` on every call meant the profiler could
+/// half-enable mid-run.
+pub(crate) fn decode_timing_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("ARC_TIME_DECODE").is_some())
+}
+
 #[inline]
 pub(crate) fn timed_mla<T>(
     idx: usize,
     dev: &candle_core::Device,
     f: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    if std::env::var_os("ARC_TIME_DECODE").is_none() {
+    if !decode_timing_enabled() {
         return f();
     }
     let _ = dev.synchronize();
@@ -2260,7 +2448,7 @@ pub(crate) fn timed<T>(
     dev: &candle_core::Device,
     f: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    if std::env::var_os("ARC_TIME_DECODE").is_none() {
+    if !decode_timing_enabled() {
         return f();
     }
     let _ = dev.synchronize();
@@ -3583,40 +3771,6 @@ impl DeepSeekV4 {
                 )?;
                 v4_stat_dbg(&xs_4d, &format!("L{i}"));
             }
-            if std::env::var_os("ARC_TIME_DECODE").is_some() {
-                use std::sync::atomic::Ordering;
-                let total: u64 = DECODE_NS.iter().map(|a| a.load(Ordering::Relaxed)).sum();
-                let parts: Vec<String> = DECODE_NAMES
-                    .iter()
-                    .zip(DECODE_NS.iter())
-                    .map(|(n, a)| {
-                        let ns = a.load(Ordering::Relaxed);
-                        format!(
-                            "{}={:.2}ms({:.0}%)",
-                            n,
-                            ns as f64 / 1e6,
-                            100.0 * ns as f64 / total.max(1) as f64
-                        )
-                    })
-                    .collect();
-                let mla_parts: Vec<String> = MLA_NAMES
-                    .iter()
-                    .zip(MLA_NS.iter())
-                    .map(|(n, a)| format!("{}={:.2}ms", n, a.load(Ordering::Relaxed) as f64 / 1e6))
-                    .collect();
-                tracing::info!(
-                    "ARC_TIME_DECODE forward_total={:.2}ms | {} || MLA[{}] (sdpa=mla_attn-these)",
-                    total as f64 / 1e6,
-                    parts.join(" "),
-                    mla_parts.join(" ")
-                );
-                for a in DECODE_NS.iter() {
-                    a.store(0, Ordering::Relaxed);
-                }
-                for a in MLA_NS.iter() {
-                    a.store(0, Ordering::Relaxed);
-                }
-            }
             let xs_4d = xs_4d.to_device(&self.device)?;
             // Collapse via the learned global mHC head: 4-D → 3-D.
             let collapsed = mhc_head.forward(&xs_4d)?;
@@ -3641,6 +3795,10 @@ impl DeepSeekV4 {
             }
             xs.to_device(&self.device)?
         };
+
+        // Per-component decode profile. Emitted for BOTH residual paths and
+        // stamped with the batch geometry — see `emit_decode_profile`.
+        emit_decode_profile(input_ids, use_4d_mhc);
 
         v4_stat_dbg(&xs, "before_norm");
 
@@ -4108,6 +4266,186 @@ impl NormalModel for DeepSeekV4 {
 }
 
 impl AnyMoeBaseModelMixin for DeepSeekV4 {}
+
+#[cfg(test)]
+mod kv_footprint_tests {
+    use super::*;
+    use crate::kv_cache::{NormalCache, SingleCache};
+
+    /// Bytes one token occupies in one half of a KV slot.
+    ///
+    /// `all_data` is over-allocated in `CACHE_GROW_SIZE` steps, so the honest
+    /// per-token figure is the size of one row along the sequence dim — every
+    /// dimension except `c.dim`, times the element size — not
+    /// `all_data.elem_count()`.
+    fn per_token_bytes(c: &SingleCache) -> usize {
+        let d = c.all_data.as_ref().expect("cache half not materialised");
+        let row: usize = d
+            .dims()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != c.dim)
+            .map(|(_, n)| *n)
+            .product();
+        row * d.dtype().size_in_bytes()
+    }
+
+    /// Drive `tokens` decode steps through the real V4 append path
+    /// ([`append_kv_mqa`]) on a slot built exactly as
+    /// [`NormalCache::new`] builds V4's, and return
+    /// `(k_bytes_per_token, v_bytes_per_token)`.
+    fn drive_v4_kv(head_dim: usize, tokens: usize) -> Result<(usize, usize, KvCache)> {
+        let dev = Device::Cpu;
+        let mut slot = KvCache::new_normal(2, 4096, NormalCache::CACHE_GROW_SIZE);
+        for _ in 0..tokens {
+            // `[B=1, n_kv_heads=1, T=1, head_dim]` — V4's MQA K, one token.
+            let k = Tensor::zeros((1, 1, 1, head_dim), DType::BF16, &dev)?;
+            append_kv_mqa(&mut slot, &k)?;
+        }
+        let KvCache::Normal { k, v } = &slot else {
+            panic!("V4 slot must be KvCache::Normal");
+        };
+        let (kb, vb) = (per_token_bytes(k), per_token_bytes(v));
+        Ok((kb, vb, slot.clone()))
+    }
+
+    /// **The byte count.** V4 Flash geometry: MQA (`num_key_value_heads = 1`),
+    /// `head_dim = 512`, BF16 activations, 43 layers.
+    ///
+    /// Before wave33 the V half stored a full duplicate of K (`v = k.copy()`,
+    /// then `kv_cache.append(&k, &v)`), so a token cost
+    /// `2 * 1 * 512 * 2 = 2048` B per layer. It now costs
+    /// `1 * 512 * 2` (K) `+ 1 * 1 * 2` (marker) `= 1026` B.
+    ///
+    /// Reference: SGLang's DSV4 pool charges **584** B/token/layer
+    /// (`research/code/06_foundation/sglang/python/sglang/srt/mem_cache/
+    /// deepseek_v4_memory_pool.py:93-111`, whose own assert spells the layout:
+    /// `448` nope FP8 + `64*2` rope BF16 + `7` UE8M0 block scales + `1` pad).
+    /// The residual 1026/584 = 1.76x is dtype, not duplication: Arc stores the
+    /// nope dims BF16 where the reference stores them FP8. See
+    /// `act_quant_kv_nope` — Arc already round-trips exactly those dims through
+    /// E4M3 with 64-wide blocks, so that gap is recoverable losslessly.
+    #[test]
+    fn v4_kv_bytes_per_token_per_layer() -> Result<()> {
+        const HEAD_DIM: usize = 512;
+        const LAYERS: usize = 43;
+        const BF16: usize = 2;
+
+        let (k_bytes, v_bytes, slot) = drive_v4_kv(HEAD_DIM, 300)?;
+
+        // --- Fixture discrimination (DOCTRINE D12) -------------------------
+        // If the marker width equalled `head_dim`, a duplicate-V implementation
+        // and a marker implementation would produce the SAME byte count and
+        // this test could not tell them apart. Assert the fixture separates
+        // them before asserting anything about it.
+        assert_ne!(
+            HEAD_DIM, V4_V_MARKER_WIDTH,
+            "fixture cannot discriminate: a full-V layout and the marker layout \
+             would both measure {HEAD_DIM} elements in the V half"
+        );
+
+        assert_eq!(
+            k_bytes,
+            HEAD_DIM * BF16,
+            "K half: 1 KV head * head_dim {HEAD_DIM} * {BF16} B (BF16)"
+        );
+        assert_eq!(
+            v_bytes,
+            V4_V_MARKER_WIDTH * BF16,
+            "V half must be the {V4_V_MARKER_WIDTH}-wide marker, not a duplicate of K"
+        );
+
+        let per_token_per_layer = k_bytes + v_bytes;
+        assert_eq!(per_token_per_layer, 1026);
+
+        // The pre-wave33 layout, computed from the same fixture. Asserting the
+        // gap (rather than only the new number) is what makes a silent revert
+        // to `append(&k, &k.copy())` fail here instead of passing quietly.
+        let duplicated_v_layout = 2 * HEAD_DIM * BF16;
+        assert_eq!(duplicated_v_layout, 2048);
+        assert!(
+            per_token_per_layer < duplicated_v_layout,
+            "the marker layout must be strictly smaller than the duplicate-V layout"
+        );
+
+        // Whole-model, all 43 layers.
+        assert_eq!(per_token_per_layer * LAYERS, 44_118);
+        assert_eq!(duplicated_v_layout * LAYERS, 88_064);
+
+        // The two halves must stay length- and capacity-synchronised: the cache
+        // managers rebuild BOTH halves from the K half's `current_seq_len` and
+        // `capacity_seq_len` (`kv_cache/mod.rs` `clone_in_cache`), so a drift
+        // here would silently mis-slice every batched sequence.
+        let KvCache::Normal { k, v } = &slot else {
+            panic!("V4 slot must be KvCache::Normal");
+        };
+        assert_eq!(k.current_seq_len, 300);
+        assert_eq!(k.current_seq_len, v.current_seq_len);
+        assert_eq!(k.capacity_seq_len, v.capacity_seq_len);
+        assert_eq!(k.dim, v.dim);
+        Ok(())
+    }
+
+    /// The marker must never be mistaken for a value: `append_kv_mqa` returns
+    /// the cached K, and that tensor is what `dsv4_attention` receives as BOTH
+    /// K and V. Pin that the returned tensor carries K's geometry and K's
+    /// contents — not the marker's.
+    #[test]
+    fn append_kv_mqa_returns_k_for_both_sides() -> Result<()> {
+        let dev = Device::Cpu;
+        let head_dim = 8usize;
+        let mut slot = KvCache::new_normal(2, 4096, NormalCache::CACHE_GROW_SIZE);
+
+        let mut expected = Vec::new();
+        for t in 0..5u32 {
+            let row: Vec<f32> = (0..head_dim)
+                .map(|i| (t as f32) + 0.25 * i as f32)
+                .collect();
+            expected.extend(row.iter().copied());
+            let k = Tensor::from_vec(row, (1, 1, 1, head_dim), &dev)?;
+            let cached = append_kv_mqa(&mut slot, &k)?;
+            assert_eq!(cached.dims(), &[1, 1, (t + 1) as usize, head_dim]);
+        }
+
+        let cached = append_kv_mqa(
+            &mut slot,
+            &Tensor::zeros((1, 1, 1, head_dim), DType::F32, &dev)?,
+        )?;
+        let got: Vec<f32> = cached.narrow(2, 0, 5)?.flatten_all()?.to_vec1()?;
+        assert_eq!(
+            got, expected,
+            "the cached K read back must be K, not the marker"
+        );
+
+        // And the marker itself is all zeros and 1-wide — nothing readable.
+        let KvCache::Normal { v, .. } = &slot else {
+            panic!()
+        };
+        let marker = v.current_data()?.expect("marker materialised");
+        assert_eq!(marker.dims(), &[1, 1, 6, V4_V_MARKER_WIDTH]);
+        assert!(marker
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .iter()
+            .all(|x| *x == 0.0));
+        Ok(())
+    }
+
+    /// A non-`Normal` KV slot must be refused loudly rather than silently
+    /// quantizing or windowing a 1-wide marker.
+    #[test]
+    fn non_normal_kv_slot_is_refused() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut rotating = KvCache::new_rotating(2, 16, NormalCache::CACHE_GROW_SIZE);
+        let k = Tensor::zeros((1, 1, 1, 8), DType::F32, &dev)?;
+        let err = append_kv_mqa(&mut rotating, &k).unwrap_err();
+        assert!(
+            err.to_string().contains("Rotating"),
+            "expected a loud slot-type error, got: {err}"
+        );
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests {
