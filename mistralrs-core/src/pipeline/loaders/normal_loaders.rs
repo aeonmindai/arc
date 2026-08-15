@@ -3229,11 +3229,49 @@ impl NormalModelLoader for DeepSeekV4Loader {
         Ok(true)
     }
     fn supports_paged_attention(&self, _config: &str) -> Result<bool> {
-        // V4 MLA uses head_dim=512, which exceeds the PagedAttention kernel's
-        // supported head sizes (64/80/96/112/128/192/256). Paged attention
-        // therefore cannot run V4 — report unsupported so the pipeline
-        // auto-selects the non-paged SDPA path instead of crashing at runtime
-        // with "`head_size` must be one of ...". (RUN-161)
+        // Still `false`, but NOT for the reason this comment used to give.
+        // Wave 29 (BC) audited it; the corrected record:
+        //
+        // 1. THE OLD REASON DOES NOT APPLY. It said head_dim=512 exceeds the
+        //    paged kernel's supported head sizes (64/80/96/112/128/192/256,
+        //    `pagedattention.cuh:714`). Those sizes are switched on inside
+        //    `PagedAttention::forward` — and V4 never calls it. The single
+        //    `paged_attn.` call site in `models/deepseek4.rs` is
+        //    `cache_write_and_gather`, which only runs `reshape_and_cache` +
+        //    `gather_kv_cache`; neither switches on head size. V4 uses
+        //    PagedAttention as block-allocated KV *storage*, then runs its own
+        //    `dsv4_attention` over the gathered K/V. head_dim=512 never binds.
+        //
+        // 2. THE MLA PAGED PATH (`mla/forward.rs`, which is how V2/V3 get
+        //    paged attention) CANNOT SERVE V4 EITHER, for two independent
+        //    reasons. Geometry: `flashinfer_mla_decode.cu:12-13` fixes
+        //    HEAD_DIM_CKV=512 / HEAD_DIM_KPE=64 as template constants;
+        //    instantiating V4's 448 gives `vec_size_ckv = 448/32 = 14`
+        //    (`decode.cuh:1107`) and `vec_t<{half,nv_bfloat16}, 14>` trips
+        //    `static_assert(vec_size % 8 == 0)` (`vec_dtypes.cuh:1362,1566`) —
+        //    it does not compile. Algorithm (the harder one): the kernel runs
+        //    dense causal attention, `DefaultAttention<false,false,false,false>`
+        //    — no sliding window, no attention sinks, no second key set. Every
+        //    one of V4's 43 layers is sliding-window + sink, with CSA/HCA
+        //    layers folding a compressed key set into the SAME softmax
+        //    (`models/dsv4_attention.rs` module docs). No V4 layer computes the
+        //    function that kernel computes.
+        //
+        // 3. WHAT ACTUALLY BLOCKS FLIPPING THIS. (a) `cache_write_and_gather`
+        //    returns a varlen pack `[1, H, sum(seqlen), D]`
+        //    (`paged_attention.rs:508-509`), which `dsv4_attention` would read
+        //    as one sequence — see `v4_paged_dispatch_precheck` in
+        //    `deepseek4.rs`, which refuses `bs > 1` rather than corrupt it.
+        //    (b) V4's compressor-input `xs` history lives in extra NormalCache
+        //    slots (`deepseek4.rs:3331-3356`) that are made per-sequence only
+        //    by `NormalCacheManager::clone_in_cache`; the engine's
+        //    PagedAttention arm (`engine/mod.rs:556+`) never issues
+        //    `CacheInstruction::In`/`Out`, so under paging that history becomes
+        //    one buffer shared by every sequence. `xs` is ~4x the KV footprint
+        //    per token and has no block table — paging it is its own project.
+        //
+        // Reporting `false` keeps the pipeline on the non-paged SDPA path.
+        // (RUN-161; rationale corrected wave 29.)
         Ok(false)
     }
     fn get_config_repr(&self, config: &str) -> Result<Box<dyn Debug>> {

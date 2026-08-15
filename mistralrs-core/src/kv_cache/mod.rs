@@ -303,6 +303,61 @@ impl NormalCache {
 
 pub struct NormalCacheManager;
 
+/// Find the first cache slot whose `current_seq_len` disagrees across `seqs`.
+///
+/// Returns `Some((layer, len_of_seq0, len_of_seq_i, i))` for the first
+/// disagreement found, or `None` when every populated slot agrees.
+///
+/// This is the invariant [`NormalCacheManager::clone_in_cache`] silently
+/// assumes: it builds ONE dense batched cache and takes `seqs[0]` as the
+/// template for `current_seq_len` / `capacity_seq_len`, and
+/// [`SingleCache::append`] then writes every sequence's new K/V at that single
+/// shared offset. Two sequences at different lengths therefore write to the
+/// wrong slot and attend over the wrong window.
+///
+/// It fails silently rather than loudly because `NormalCache::CACHE_GROW_SIZE`
+/// is 512: two sequences 100 tokens apart still have identical `all_data`
+/// shapes, so the `slice_set` in `clone_in_cache` succeeds. Only
+/// `current_seq_len` differs. The scheduler upholds the invariant by bucketing
+/// on `seq.len()` (`scheduler/default_scheduler.rs`); this check exists so a
+/// future scheduler change fails loudly instead of emitting wrong tokens.
+pub(crate) fn first_mismatched_cache_len(
+    seqs: &mut [&mut crate::sequence::Sequence],
+    modify_draft_cache: bool,
+) -> Option<(usize, usize, usize, usize)> {
+    if seqs.len() < 2 {
+        return None;
+    }
+    let lens: Vec<Vec<Option<usize>>> = seqs
+        .iter_mut()
+        .map(|seq| {
+            let cache = if modify_draft_cache {
+                seq.normal_draft_cache()
+            } else {
+                seq.normal_cache()
+            };
+            cache
+                .iter()
+                .map(|slot| slot.as_ref().map(KvCache::current_seq_len))
+                .collect()
+        })
+        .collect();
+
+    let template = &lens[0];
+    for (i, other) in lens.iter().enumerate().skip(1) {
+        for (layer, expected) in template.iter().enumerate() {
+            let (Some(expected), Some(got)) = (*expected, other.get(layer).copied().flatten())
+            else {
+                continue;
+            };
+            if expected != got {
+                return Some((layer, expected, got, i));
+            }
+        }
+    }
+    None
+}
+
 impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCacheManager {
     fn clone_in_cache(
         &self,
@@ -310,6 +365,19 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
         seqs: &mut [&mut crate::sequence::Sequence],
         modify_draft_cache: bool,
     ) {
+        // Loud failure for the silent-corruption path described on
+        // `first_mismatched_cache_len`. Debug-only: the check walks every
+        // sequence's whole cache vector, which is not free on the hot decode
+        // path, and the scheduler is what actually enforces the invariant.
+        debug_assert!(
+            first_mismatched_cache_len(seqs, modify_draft_cache).is_none(),
+            "clone_in_cache: sequences in one batch must share current_seq_len \
+             (seqs[0] is the template for the whole dense batched cache, and \
+             SingleCache::append writes every sequence at that one offset) — \
+             mismatch: {:?}",
+            first_mismatched_cache_len(seqs, modify_draft_cache)
+        );
+
         let mut new_k_cache = Vec::new();
         let mut new_v_cache = Vec::new();
 
@@ -1266,5 +1334,247 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod clone_in_cache_invariant_tests {
+    use super::*;
+    use crate::sampler::Sampler;
+    use crate::sequence::{SeqStepType, SequenceGroup, SequenceRecognizer};
+    use tokio::sync::Mutex as TokioMutex;
+
+    /// A cache slot whose only interesting property is its `current_seq_len`.
+    /// `all_data` stays `None` — `first_mismatched_cache_len` reads lengths,
+    /// never tensors, which is exactly the point: `CACHE_GROW_SIZE = 512` means
+    /// the tensor shapes agree even when the lengths do not, so a shape check
+    /// would not catch this.
+    fn slot(current_seq_len: usize) -> KvCache {
+        KvCache::Normal {
+            k: SingleCache {
+                all_data: None,
+                dim: 2,
+                current_seq_len,
+                capacity_seq_len: 512,
+                max_seq_len: 4096,
+            },
+            v: SingleCache {
+                all_data: None,
+                dim: 2,
+                current_seq_len,
+                capacity_seq_len: 512,
+                max_seq_len: 4096,
+            },
+        }
+    }
+
+    /// Minimal sequence carrying `n_layers` normal-cache slots all at
+    /// `current_seq_len`. Mirrors `sequence::tests::dummy_seq`: no model, no
+    /// engine.
+    fn seq_with_cache_len(id: usize, n_layers: usize, current_seq_len: usize) -> Sequence {
+        let (dummy_sender, _rx) = tokio::sync::mpsc::channel(1);
+        let dummy_sampler = Sampler::new(
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            -1,
+            0.0,
+            0.0,
+            None,
+            vec![],
+        )
+        .unwrap();
+        let group = Arc::new(TokioMutex::new(SequenceGroup::new(1, false, false, None)));
+        let mut seq = Sequence::new_waiting(
+            vec![1u32; current_seq_len.max(1)],
+            String::new(),
+            id,
+            0,
+            n_layers,
+            dummy_sender,
+            dummy_sampler,
+            vec![],
+            vec![],
+            None,
+            false,
+            false,
+            group,
+            0,
+            0,
+            SequenceRecognizer::None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            SeqStepType::PromptAndDecode,
+            None,
+            None,
+            None,
+            false,
+            vec![],
+        );
+        let cache = seq.normal_cache();
+        cache.clear();
+        for _ in 0..n_layers {
+            cache.push(Some(slot(current_seq_len)));
+        }
+        seq
+    }
+
+    #[test]
+    fn uniform_cache_lens_are_accepted() {
+        let mut a = seq_with_cache_len(0, 4, 100);
+        let mut b = seq_with_cache_len(1, 4, 100);
+        let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
+        assert_eq!(
+            first_mismatched_cache_len(&mut seqs, false),
+            None,
+            "sequences at equal cache lengths must be accepted — this is the \
+             normal, correct batch the scheduler produces"
+        );
+    }
+
+    /// The silent-corruption case. Two sequences 100 tokens apart still have
+    /// identical `all_data` shapes (CACHE_GROW_SIZE = 512), so `slice_set` in
+    /// `clone_in_cache` succeeds and only `current_seq_len` differs — the
+    /// shorter sequence would then write its next token at the longer one's
+    /// offset and attend over a window of zeros.
+    #[test]
+    fn mismatched_cache_lens_are_detected() {
+        let mut a = seq_with_cache_len(0, 4, 100);
+        let mut b = seq_with_cache_len(1, 4, 200);
+        let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
+        assert_eq!(
+            first_mismatched_cache_len(&mut seqs, false),
+            Some((0, 100, 200, 1)),
+            "a length-mismatched batch must be reported: layer 0, seqs[0]=100 \
+             vs seqs[1]=200"
+        );
+    }
+
+    /// Minimal `CacheManagerMixin + MetadataMixin` so the tests below can call
+    /// the real `NormalCacheManager::clone_in_cache` — the point is to exercise
+    /// the guard where it actually lives, not a copy of its condition.
+    struct StubPipeline {
+        cache: crate::kv_cache::EitherCache,
+        metadata: Arc<crate::pipeline::GeneralMetadata>,
+    }
+
+    impl StubPipeline {
+        fn new(n_layers: usize) -> Self {
+            Self {
+                cache: crate::kv_cache::EitherCache::Normal(NormalCache::new(n_layers, 4096)),
+                metadata: Arc::new(crate::pipeline::GeneralMetadata {
+                    max_seq_len: 4096,
+                    llg_factory: None,
+                    no_kv_cache: false,
+                    no_prefix_cache: false,
+                    num_hidden_layers: n_layers,
+                    eos_tok: vec![],
+                    kind: crate::pipeline::ModelKind::Normal,
+                    is_xlora: false,
+                    activation_dtype: candle_core::DType::F32,
+                    sliding_window: None,
+                    cache_config: None,
+                    cache_engine: None,
+                    model_metadata: None,
+                    modalities: crate::pipeline::Modalities {
+                        input: vec![],
+                        output: vec![],
+                    },
+                }),
+            }
+        }
+    }
+
+    impl CacheManagerMixin for StubPipeline {
+        fn clone_in_cache(&self, _seqs: &mut [&mut Sequence]) {
+            unreachable!("tests drive NormalCacheManager directly")
+        }
+        fn clone_out_cache(&self, _seqs: &mut [&mut Sequence]) {
+            unreachable!("tests drive NormalCacheManager directly")
+        }
+        fn set_none_cache(
+            &self,
+            _seqs: &mut [&mut Sequence],
+            _reset_non_granular: bool,
+            _modify_draft_cache: bool,
+            _load_preallocated_cache: bool,
+        ) {
+            unreachable!("tests drive NormalCacheManager directly")
+        }
+        fn cache(&self) -> &crate::kv_cache::EitherCache {
+            &self.cache
+        }
+    }
+
+    impl MetadataMixin for StubPipeline {
+        fn device(&self) -> candle_core::Device {
+            candle_core::Device::Cpu
+        }
+        fn tokenizer(&self) -> Option<Arc<tokenizers::Tokenizer>> {
+            None
+        }
+        fn name(&self) -> String {
+            "stub".to_string()
+        }
+        fn reset_non_granular_state(&self) {}
+        fn get_metadata(&self) -> Arc<crate::pipeline::GeneralMetadata> {
+            self.metadata.clone()
+        }
+        fn device_mapper(&self) -> Option<&dyn crate::device_map::DeviceMapper> {
+            None
+        }
+    }
+
+    /// The guard as actually installed: `clone_in_cache` must refuse a
+    /// length-mismatched batch loudly.
+    ///
+    /// Mutation check: delete the `debug_assert!` at the top of
+    /// `clone_in_cache` and this test fails — without it the function walks on
+    /// and panics on `all_data.unwrap()` with a message that says nothing about
+    /// sequence lengths, which is exactly the diagnostic gap being closed.
+    ///
+    /// `debug_assertions`-gated because `debug_assert!` compiles out of release
+    /// test builds; a `--release` run would otherwise fail on the wrong panic.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "must share current_seq_len")]
+    fn clone_in_cache_refuses_a_length_mismatched_batch() {
+        let pipeline = StubPipeline::new(4);
+        let mut a = seq_with_cache_len(0, 4, 100);
+        let mut b = seq_with_cache_len(1, 4, 200);
+        let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
+        NormalCacheManager.clone_in_cache(&pipeline, &mut seqs, false);
+    }
+
+    /// A single sequence is trivially self-consistent, and a mismatch below
+    /// layer 0 must still be found (the scan must not stop at the first layer).
+    #[test]
+    fn mismatch_is_found_on_any_layer_and_single_seqs_pass() {
+        let mut solo = seq_with_cache_len(0, 4, 7);
+        {
+            let mut seqs: Vec<&mut Sequence> = vec![&mut solo];
+            assert_eq!(first_mismatched_cache_len(&mut seqs, false), None);
+        }
+
+        let mut a = seq_with_cache_len(0, 4, 100);
+        let mut b = seq_with_cache_len(1, 4, 100);
+        // Only layer 2 diverges — e.g. an extra per-sequence slot (V4 stores
+        // its compressor `xs` history in slots past the KV entries) drifting
+        // out of lockstep with the KV caches.
+        b.normal_cache()[2] = Some(slot(101));
+        let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
+        assert_eq!(
+            first_mismatched_cache_len(&mut seqs, false),
+            Some((2, 100, 101, 1))
+        );
     }
 }
