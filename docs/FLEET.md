@@ -16,7 +16,8 @@ quantities plus vendor specs, not yet run end-to-end).
   all-reduce traffic on every layer.
 - Arc's artifact for the same model is **68 GB** (2-bit trellis experts + FP8
   attention), and one H200 loads and serves it with the quality numbers in
-  BENCHMARKS.md (GSM8K 87.0%, long-context 5/5+4/4) **[measured]**.
+  BENCHMARKS.md (GSM8K 87.0%, long-context 5/5+4/4) **[measured — provisional,
+  pre-PR-#35 decode math; see BENCHMARKS.md]**.
 - Therefore the same node can instead host **8 independent replicas** — no
   inter-GPU traffic, per-replica failure isolation, per-replica batch
   scheduling **[projected — the 8-up deployment itself has not been run; the
@@ -78,7 +79,7 @@ Once weights fit, concurrent capacity is bounded by KV cache per sequence.
 | Claim | Status |
 |---|---|
 | 284B/13B MoE serves on one H200 from a 68 GB artifact, with quality numbers | **Measured** |
-| GSM8K 87.0% (n=100, 0-shot greedy, 2048-cap) at 2-bit experts | **Measured** |
+| GSM8K 87.0% (n=100, 0-shot greedy, seed 161, 2048-cap) at 2-bit experts | **Measured — provisional** (PR #35 changed the decode math after the run; re-measure pending) |
 | TurboQuant KV 4.27× context (Qwen3-32B, 1×H100) | **Measured** |
 | qtip2b bitshift-trellis CUDA parity (20/20 on H200) | **Measured** |
 | Trellis grouped-GEMM hardware parity (5/5 on H200) | **Measured** |

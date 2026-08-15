@@ -35,9 +35,15 @@ mechanically once approved.
       commit.
 - [ ] Version bump: confirm the crate/CLI version reported by `arc --version`
       matches the tag (update `Cargo.toml` workspace version if not).
-- [ ] Docs consistency sweep: README.md still carries session-2-era numbers
-      (84.0%, 5.4 tok/s, ≈$77) — update to the BENCHMARKS.md current state
-      (87.0%, 14.58 tok/s, ≈$123) **before** tagging.
+- [x] Docs consistency sweep: README.md carried session-2-era numbers
+      (84.0%, 5.4 tok/s, ≈$77); reconciled to the BENCHMARKS.md current state
+      (87.0%, 14.58 tok/s, ≈$123) in `docs/correct-kernel-stack-bound`.
+- [ ] **Provisional labels intact.** GSM8K 87.0% / perplexity 12.50 /
+      long-context were measured on pre-PR-#35 decode math and are labeled
+      **provisional** in README.md, BENCHMARKS.md, FLEET.md and
+      RELEASE_NOTES_v2.0.md. Either re-measure on post-#35 math before tagging,
+      or confirm every one of those labels survived the freeze. Do not tag with
+      the labels stripped and no re-measure.
 
 ## 2. Tag (only after §0 sign-off)
 

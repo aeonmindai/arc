@@ -20,11 +20,24 @@ Cumulative spend across the first four measurement sessions was **≈$123**
 [measured], all on H200 at $4.92/hr. Two later kernel questions that would each
 have cost $10–20 of H200 time were answered on an A30 for **$0.39** and **$0.07**
 respectively, because the questions were about *ratios* (kernel A vs kernel B,
-byte-identity, occupancy) and ratios transfer between cards while absolute times
-do not.
+byte-identity) and ratios transfer between cards while absolute times do not.
 
 **Rule that follows: decide, before renting, whether the question is a ratio or
 an absolute.** Ratio questions belong on the cheapest card that runs the kernel.
+
+**The exception that cost us a published number: occupancy is *not* a
+card property.** Registers per thread — and therefore blocks/SM — are fixed by
+the **nvcc version** and the **`-arch` target**, not by the silicon. An A30 and
+an A100 are both `sm_80` and get identical codegen from a given toolkit. So a
+cheap-card A/B is only valid for a register or occupancy change **if the cheap
+box builds with the same toolchain as production**. PR #40's kernel stack was
+A/B'd under nvcc 11.5 against a production build on CUDA 12.8; the old compiler
+produced a more register-starved *baseline*, which handed the optimization more
+headroom than the shipped build has, and turned the resulting 1.21× into an
+**upper bound rather than a measurement**. Record `nvcc --version` and the
+`-arch` alongside every occupancy or register number, and never compare across
+them. Full write-up in
+[QUANTIZATION_PERFORMANCE.md](QUANTIZATION_PERFORMANCE.md#predictions-that-failed-and-why).
 
 ### Re-entry arithmetic (why "just delete it" is sometimes wrong)
 

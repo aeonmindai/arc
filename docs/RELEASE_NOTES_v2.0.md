@@ -20,7 +20,8 @@ The release is built on five pieces:
 1. **Single-GPU 284B serving.** A 2-bit trellis expert bake (qtip2 family) +
    FP8 attention produces a 68 GB, 7-shard UQFF artifact that loads and
    serves on one 141 GB H200 with the model fully resident. Quality on that
-   artifact: GSM8K 87.0% (n=100, 0-shot chat greedy, ±6.6 pp), facts 22/22,
+   artifact: GSM8K 87.0% — **provisional**, see the caveats section (n=100,
+   0-shot chat greedy, seed 161, 2048-token cap, ±6.6 pp), facts 22/22,
    arithmetic 8/8, coherence 6/6, long-context 5/5 coherence + 4/4 needle
    with a published ablation matrix.
 
@@ -69,8 +70,8 @@ table: **≈ $123**.
 | Number | Value | Type |
 |---|---|---|
 | Model on one GPU | 284B/13B V4 Flash from a 68 GB artifact (2-bit trellis experts + FP8 attention) | Measured |
-| GSM8K | **87.0%** (n=100, 0-shot chat greedy, 2048-token cap, ±6.6 pp; base model card 90.8 is 8-shot — different protocol) | Measured |
-| Quality ladder | GSM8K 64 → 84 → 87.0 across sessions (Viterbi encoder fix, then token budget) | Measured |
+| GSM8K | **87.0%** (n=100, 0-shot chat greedy, seed 161, 2048-token cap, ±6.6 pp; base model card 90.8 is **8-shot** — a different and easier protocol) | **Measured — provisional** (pre-PR-#35 decode math) |
+| Quality ladder | GSM8K 64 → 84 → 87.0 across sessions (Viterbi encoder fix, then token budget) | **Measured — provisional** |
 | Factual recall / arithmetic / coherence | 22/22 · 8/8 · 6/6 | Measured |
 | Perplexity (internal rung) | 12.50 ± 3.46 (70-chunk wiki mini-corpus; not comparable to full-wikitext numbers) | Measured |
 | Long context | 5/5 coherence + 4/4 needle, with 3-config ablation isolating window vs compressed-KV mechanisms | Measured |
@@ -107,9 +108,16 @@ short version:
   other architectures inherit mistral.rs support but have not had the same
   measurement treatment. TurboQuant KV's 4.27× is measured on Qwen3-32B and
   does not yet apply to MLA models (V4 included).
-- **GSM8K is an n=100 subset** under a 0-shot chat protocol; the published
-  base-model 90.8 is 8-shot EM. Both stated because hiding either would
-  flatter us.
+- **GSM8K is an n=100 subset** under a 0-shot chat protocol (seed 161,
+  2048-token cap); the published base-model 90.8 is **8-shot EM**, a different
+  and easier protocol. Both stated because hiding either would flatter us.
+- **The quality numbers are provisional.** PR #35 (`830a41ed9`) changed the
+  decode math *after* they were measured: a SwiGLU clamp was missing on 4 of 5
+  expert paths — including the shared expert, which every token traverses in
+  every layer — and YaRN was applied to ratio-0 layers (the correct set is
+  exactly {0, 1, 43}). Expected direction is neutral-to-better, but that is
+  **unmeasured**. GSM8K, perplexity, and the long-context rows all carry this
+  vintage and must be re-measured before they are republished as current.
 
 ## Upgrade notes
 

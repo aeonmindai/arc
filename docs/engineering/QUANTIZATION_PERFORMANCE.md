@@ -20,6 +20,7 @@ Every number below carries one of these labels. Nothing is stated without one.
 | **[source-verified]** | read directly in shipped code (ours or a third party's) |
 | **[projected]** | a forward estimate. Not a measurement. Several of ours were wrong — see "Predictions that failed" |
 | **[published]** | a third party's number, measured against *their* baseline, not ours |
+| **[upper bound]** | run on hardware, but under conditions that gave the change *more* room than the shipped build has. It **caps** the shipped value; it does not establish it. The shipped value is unmeasured |
 
 ## What is being quantized
 
@@ -110,6 +111,15 @@ The account closes to within 2 %.
 Occupancy was measured statically rather than guessed, and the answer was better
 than feared: `cuobjdump -res-usage` on sm_90a reports `REG:80 SHARED:38992
 LOCAL:0` ⇒ **3 blocks/SM = 37.5 % occupancy, register-limited** [measured].
+
+> **Register counts are a property of the compiler and the target arch, not of
+> the card.** A different `REG:` figure from another box does *not* mean the two
+> cards allocate registers differently — an A30 and an A100 are both `sm_80` and
+> share codegen for a given toolkit. What moves the number is the **nvcc version**
+> and the **`-arch` it was built for**. Any occupancy figure quoted in this
+> document is therefore only valid for the toolchain that produced it, and must
+> be restated with that toolchain named. This mattered — see "Predictions that
+> failed", item 2.
 A corroboration nobody planned: the bake draws **261 W of 700 W = 37 % of TDP**
 against 37.5 % occupancy. A throughput-bound kernel would not have those two
 track each other; a latency-bound one at fixed clocks does.
@@ -139,8 +149,14 @@ extrapolated]. Converted to the H200 measurement (225.2 s kernel + ~16 s host):
 
 | | kernel | + host |
 |---|---|---|
-| banked today (1.21× stack) | 186 s | **202 s/layer** [projected from the A30 ratio] |
+| banked today (**≤1.21×** stack) | **≥186 s** | **≥202 s/layer** [projected from the A30 ratio, off an **[upper bound]** — see the caveat under "Predictions that failed", item 2] |
 | every remaining identity-safe idea lands perfectly (3.47×) | 65 s | **81 s/layer** [projected] |
+
+The "banked today" row is a **best case**, not a current state: the 1.21× it
+divides by is an upper bound measured on a non-production toolchain, so the true
+kernel time is **at least** 186 s and the stack's shipped contribution has never
+been measured. The 3.47× architectural ceiling below is unaffected — it comes
+from the W sweep, not from the stack.
 
 So **45–50 s/layer of kernel with byte-identical output is not reachable from
 this beam architecture.** That is a measured statement about the architecture,
@@ -302,13 +318,52 @@ authority. What replaced it is a *descriptive* model anchored to measurements
 that predicts no wall time and fails CI if the kernel changes without
 re-measurement.
 
-**2. "The optimization stack will be 1.80–2.07×." Measured 1.21×.**
+**2. "The optimization stack will be 1.80–2.07×." Measured ≤1.21× — and the
+shipped figure is still unmeasured.**
+
+> **Caveat on this number, added after review — read it before quoting the
+> figure.** The A/B compared the correct commits (verified by hash: the merge's
+> first parent is the "base" that was built, its kernel md5 matches, and nothing
+> has touched `kernels/qtip/` since). But it was built with **nvcc 11.5 targeting
+> `sm_80`** — a four-year-old compiler, and not the CUDA 12.8 toolchain that
+> builds the bake.
+>
+> The difference is **directional, not merely imprecise.** On that box the
+> *baseline* was register-starved at `REG:110` ⇒ **2 blocks/SM**, where the
+> shipped baseline is `REG:80` ⇒ **3 blocks/SM**. The measurement therefore
+> handed the register squeeze **more** occupancy headroom than production has
+> (2→4 rather than 3→4) — and still produced only 1.21×. Giving a change more
+> room than it really has and measuring 1.21× **bounds** the shipped gain at
+> **≤1.21×**; it does not establish it. The real figure is ≤1.21× and possibly
+> much less. **[upper bound]**
+>
+> **This is a compiler difference, not a card difference.** The `REG:110/59`
+> seen on that box versus `REG:80/64` on the H200 build is explained by nvcc
+> version and `sm_80`-vs-`sm_90a` alone. A30 and A100 are **both `sm_80`** and
+> share codegen for a given toolkit; no card-to-card register story is needed or
+> supported.
+>
+> **The decisive experiment has not been run.** It was staged and it is cheap and
+> needs no rental: build the bake box itself at the merge's first parent and time
+> one layer against the 373.6 s/layer it already measures with the stack in —
+> same silicon, same toolkit, same driver, same data. Until that runs, the
+> shipped value of this stack is **unknown**. (Re-verification on rented silicon
+> was attempted once and did not complete: two A100 rentals hung in `deploying`
+> and no A30 capacity was available. All rentals were deleted.)
+>
+> **Also unmeasured:** the three parts of the stack (short key / `__launch_bounds__`
+> register squeeze / barrier reduction) were **never separated**, so whether any
+> one of them is a no-op is still open — which matters, because two other changes
+> from the same session measured as no-ops.
+
 The stack (32-bit selection key with exact tie fallback, a register squeeze
 pinning 4 blocks/SM, and a barrier reduction 33 → 15.7) delivered exactly what it
 was designed to deliver: it cut the **fixed** per-timestep term 1.71× and did
 essentially nothing to the per-candidate term (0.95×). The projection had modeled
 occupancy as a multiplier on everything. **Occupancy 2 → 4 blocks/SM bought
-~nothing on its own** — that model is falsified by direct measurement. Do not
+~nothing on its own** — that model is falsified by direct measurement. Note that
+the 2 → 4 is the *measurement box's* range under nvcc 11.5; on the shipped
+toolchain the same squeeze is a 3 → 4 move, i.e. less headroom still. Do not
 spend on occupancy for this kernel again.
 
 **3. "Deleting selection will win big — GPUs are built for that shape."
@@ -381,8 +436,9 @@ kernel, pipe-level floor), `wave15-AM-unpack.md` (host unpack call-graph trace).
 
 Pull requests: **#29** (CPU beam + W=128 quality cost), **#33** (CUDA beam
 kernel, bake header), **#34** (search stamped into the artifact), **#39**
-(unpack pool + per-layer timing instrumentation), **#40** (the measured 1.21 ×
-kernel stack), **#42** (the exhaustive prototype — correct, byte-identical,
+(unpack pool + per-layer timing instrumentation), **#40** (the kernel stack —
+**≤1.21×**, an upper bound on a non-production toolchain, never verified on the
+shipped build), **#42** (the exhaustive prototype — correct, byte-identical,
 slower; **not merged**, its value is the measurement).
 
 In-tree source: `mistralrs-quant/kernels/qtip/qtip_beam.cu`,

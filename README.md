@@ -19,7 +19,7 @@ Inference at the speed of physics.
 
 ---
 
-Arc is an inference engine built to serve frontier MoE models on radically less hardware, by composing the most aggressive open compression stack in production: **QTIP 2-bit weights, TurboQuant 3.5-bit KV cache, TD-MoE Tucker decomposition**, and model-native sparse attention kernels. Measured today: DeepSeek V4 Flash (284B / 13B active) serving from a 68 GB artifact on a **single H200**, at GSM8K 84.0% — see [Results](#results).
+Arc is an inference engine built to serve frontier MoE models on radically less hardware, by composing the most aggressive open compression stack in production: **QTIP 2-bit weights, TurboQuant 3.5-bit KV cache, TD-MoE Tucker decomposition**, and model-native sparse attention kernels. Measured today: DeepSeek V4 Flash (284B / 13B active) serving from a 68 GB artifact on a **single H200**, at GSM8K 87.0% (provisional — see [Results](#results)).
 
 Forked from [mistral.rs](https://github.com/EricLBuehler/mistral.rs). Apache 2.0. Upstream-merge-compatible.
 
@@ -46,13 +46,13 @@ Validated as of Aug 2026 (DeepSeek V4 Flash, 284B / 13B-active MoE, single H200 
 | Claim | Status | Number |
 |---|---|---|
 | Frontier MoE on one GPU | **Measured** | 284B/13B V4 Flash serves from a **68 GB** artifact (2-bit trellis experts + FP8 attention) on a single H200 |
-| Quality at 2-bit experts | **Measured** | GSM8K **84.0%** (n=100, 0-shot chat, greedy) vs 90.8 published for the base model (8-shot — different protocol); facts 22/22, arithmetic 8/8, coherence 6/6 |
+| Quality at 2-bit experts | **Measured — provisional** | GSM8K **87.0%** (n=100, 0-shot chat, greedy, seed 161, 2048-token cap) vs 90.8 published for the base model (**8-shot** — a different and easier protocol); facts 22/22, arithmetic 8/8, coherence 6/6. **Provisional:** PR #35 changed the decode math after this was measured (SwiGLU clamp missing on 4 of 5 expert paths incl. the shared expert; YaRN on ratio-0 layers). Direction expected neutral-to-better, **unmeasured** — [details](docs/BENCHMARKS.md) |
 | Long-context correctness | **Measured** | 5/5 coherence + 4/4 needle recall (ablation matrix in BENCHMARKS.md) |
 | TurboQuant KV | **Measured** | **4.27×** KV compression, Qwen3-32B on one H100 (39K→169K-token context) |
 | qtip2b bitshift-trellis format | **Measured** | CUDA↔CPU parity, 20/20 tests on H200 |
-| Single-user decode speed | **Measured, unoptimized** | 5.4 tok/s (batch=1); expert-read kernels at 3–4% of peak HBM bandwidth — kernel optimization in progress (profile in BENCHMARKS.md) |
+| Single-user decode speed | **Measured** | **14.58 tok/s** (batch=1, no-`cudnn` build; progression 5.4 → 13.99 → 14.58 across the kernel-fix PRs). The tuned gather-GEMV variants reach 450–467 GB/s ≈ 9.5% of peak HBM — **measured-kernel**, end-to-end effect pending (profile in BENCHMARKS.md) |
 
-Throughput beyond these numbers — saturated-batch floors, per-node replica math — is arithmetic, not measurement, and lives in [docs/FLEET.md](docs/FLEET.md) explicitly marked as projected. Total spend to produce every measured number above: ≈ $77 of rented H200 time.
+Throughput beyond these numbers — saturated-batch floors, per-node replica math — is arithmetic, not measurement, and lives in [docs/FLEET.md](docs/FLEET.md) explicitly marked as projected. Total spend to produce every measured number above: ≈ $123 of rented H200 time across four sessions.
 
 ## Compression Stack
 

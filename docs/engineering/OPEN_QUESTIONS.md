@@ -110,7 +110,13 @@ and numbers in
 [QUANTIZATION_PERFORMANCE.md](QUANTIZATION_PERFORMANCE.md#the-exhaustive-prototype-a-clean-negative).
 
 Likewise, **occupancy work on this kernel family is exhausted** — 2 → 4 blocks/SM
-bought essentially nothing [measured].
+bought essentially nothing [measured]. The 2 → 4 is the measurement box's range
+under **nvcc 11.5**; the shipped toolchain's baseline is already at 3 blocks/SM,
+so the squeeze has *less* room in production, not more. Register counts move with
+the **compiler version and target arch**, not with the card. The speed figure
+that came out of that same run is an **upper bound and not a measurement of the
+shipped build** — see item 5 below and
+[QUANTIZATION_PERFORMANCE.md](QUANTIZATION_PERFORMANCE.md#predictions-that-failed-and-why).
 
 ---
 
@@ -124,6 +130,7 @@ These are cheap, decided, and blocked only on someone doing them.
 | 2 | **Port the computed codebook to the decode side** | The 512 KiB LUT gather is the *named* inference bottleneck (~388 GB/s ≈ 8 % of HBM). The same change pays twice, and **nobody has priced the inference half.** | A port of a pattern already proven at `K=2 / V=1` with 20/20 CUDA parity |
 | 3 | **Decompose the ~13.5 s/layer "other host" bucket** | It is 5.6 % today and becomes 28 % after any 2× kernel win. Never decomposed. | Instrumentation only; zero GPU time |
 | 4 | **Profiler stall attribution (`ncu`)** | Which of barriers / shared-memory atomics / scattered L2 dominates the beam kernel's stalls is still **inferred**, never measured. It decides what to attack next if anyone reopens the kernel. | One profiled launch |
+| 5 | **What PR #40's kernel stack is actually worth on the shipped build** | The published 1.21× was measured under **nvcc 11.5**, whose register-starved baseline gave the change *more* headroom than production has. It is an **upper bound (≤1.21×)**, never a measurement of the shipped build. The stack's three parts were also never separated, so any one of them may be a no-op. | **Zero rental** — build the existing bake box at the merge's first parent and time one layer against the 373.6 s/layer it already measures with the stack in. Staged; **not run** |
 
 ---
 
@@ -156,6 +163,13 @@ and none of them is backed by a measurement.
   anchor's assumptions. The two kernels compared could also scale differently
   between architectures — one is latency- and shared-memory-bound, the other
   arithmetic- and L2-streaming-bound.
+- **Any ratio measured on a different toolchain, when the change under test is a
+  register or occupancy change.** Ratios transfer between *cards*; they do not
+  transfer between *compilers*. Register pressure — and therefore blocks/SM, and
+  therefore the entire value of a register squeeze — is set by the nvcc version
+  and the `-arch` target. A ratio measured against a more register-starved
+  baseline than production's is an **upper bound** on the production ratio. This
+  is exactly what happened to PR #40's 1.21×.
 
 ---
 
