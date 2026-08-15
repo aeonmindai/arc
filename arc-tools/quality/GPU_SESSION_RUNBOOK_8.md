@@ -140,11 +140,16 @@ python3 batch_load_probe.py --batches 8 --reps 1 --max-tokens 32 --label selftes
 # b. and it must FAIL when the server is forced to serialise.
 #    Restart the server with --max-seqs 1, re-run, then restore --max-seqs 128.
 python3 batch_load_probe.py --batches 8 --reps 1 --max-tokens 32 --label selftest_serial
-# expect: FAIL: CONCURRENCY[B=8] effective_B=1 ...       -> exit 1
+# expect: FAIL: CONCURRENCY[B=8] effective_B=<1 or 2> ... -> exit 1
 ```
 
+Both halves were verified on an A6000 before this runbook was written
+(wave25-AV §2). Note `--max-seqs 1` measured `effective_B=2`, not 1 — the
+engine still overlaps one sequence's tail with the next sequence's first token.
+**Anything ≤ 2 is the serialised signature; what matters is that (b) exits 1.**
+
 > **ABORT-IF (a) does not print `verdict=pass`** — the server is not batching.
-> Read `effective_B`: `1` means strictly serial (suspect the xs_history
+> Read `effective_B`: `1`–`2` means strictly serial (suspect the xs_history
 > per-sequence fix, PR #21, is missing from this binary — the old per-model
 > buffer corrupts or crashes with >1 sequence in flight); `32` with
 > `--max-seqs 128` set means the flag did not take.
@@ -396,6 +401,13 @@ So the probe measures its own concurrency and can fail:
   with `effective_B=1`; a second mutation caps the mock at 2-of-8 (the realistic
   `--max-seqs` bug) and asserts it is both detected and reported. S2(b) repeats
   the proof on real hardware with `--max-seqs 1`.
+
+**Why this is not paranoia.** On the A6000 validation box, a server capped at
+`--max-seqs 4` and probed at B=16 reported an aggregate of **190.01 tok/s**.
+The genuine B=16 figure on the same box minutes earlier was **198.34 tok/s** —
+a **4% difference**. A silently-capped sweep and a real one are
+indistinguishable by inspection. `effective_B` is the only thing that tells
+them apart, which is why it is a required column in §3.
 
 Also guarded: `WARN[CLIENT]` when the probe's own CPU use suggests the *client*
 is the bottleneck (a real risk at B=128, and it would understate the server);
