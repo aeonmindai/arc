@@ -13,6 +13,7 @@ mod hybrid_cache;
 mod rotating_cache;
 mod single_cache;
 pub mod turboquant_cache;
+mod xs_rolling;
 
 pub use full_cache::{EitherCache, LayerCaches};
 pub use hybrid_cache::{
@@ -22,6 +23,7 @@ pub use hybrid_cache::{
 pub use rotating_cache::RotatingCache;
 pub use single_cache::SingleCache;
 pub use turboquant_cache::TurboQuantCache;
+pub use xs_rolling::XsRollingCache;
 
 pub trait CacheManager<T: CacheManagerMixin + MetadataMixin + ?Sized> {
     fn clone_in_cache(
@@ -42,9 +44,20 @@ pub trait CacheManager<T: CacheManagerMixin + MetadataMixin + ?Sized> {
 
 #[derive(Debug, Clone)]
 pub enum KvCache {
-    Normal { k: SingleCache, v: SingleCache },
-    Rotating { k: RotatingCache, v: RotatingCache },
+    Normal {
+        k: SingleCache,
+        v: SingleCache,
+    },
+    Rotating {
+        k: RotatingCache,
+        v: RotatingCache,
+    },
     TurboQuant(Box<TurboQuantCache>),
+    /// DeepSeek V4's rolling compressor state (see [`XsRollingCache`]). Not a
+    /// K/V cache: it holds completed compressed rows plus a bounded raw tail,
+    /// and reports its length in tokens so the generic truncation paths keep
+    /// working.
+    XsRolling(Box<XsRollingCache>),
 }
 
 impl KvCache {
@@ -69,6 +82,8 @@ impl KvCache {
             Self::Normal { k, .. } => k.current_data(),
             Self::Rotating { k, .. } => k.current_data(),
             Self::TurboQuant(tq) => tq.k.current_data(),
+            // The compressed rows are this entry's "keys".
+            Self::XsRolling(xs) => xs.comp.current_data(),
         }
     }
 
@@ -77,6 +92,8 @@ impl KvCache {
             Self::Normal { v, .. } => v.current_data(),
             Self::Rotating { v, .. } => v.current_data(),
             Self::TurboQuant(tq) => tq.v.current_data(),
+            // The retained raw tail is this entry's "values".
+            Self::XsRolling(xs) => Ok(xs.tail.clone()),
         }
     }
 
@@ -98,7 +115,9 @@ impl KvCache {
                 let out_v = vc.append_graph(&v, position, read_capacity)?;
                 Ok((out_k, out_v))
             }
-            _ => candle_core::bail!("append_graph: only the Normal KV cache supports graph capture"),
+            _ => {
+                candle_core::bail!("append_graph: only the Normal KV cache supports graph capture")
+            }
         }
     }
 
@@ -120,6 +139,10 @@ impl KvCache {
                 (Some(out_k), Some(out_v))
             }
             Self::TurboQuant(_) => unreachable!(),
+            Self::XsRolling(_) => candle_core::bail!(
+                "KvCache::append: the V4 xs rolling cache is advanced through \
+                 `XsRollingCache::advance`, not the K/V append path"
+            ),
         };
         let k = match out_k {
             None => {
@@ -127,7 +150,7 @@ impl KvCache {
                 match self {
                     Self::Normal { k, .. } => shape[k.dim] = 0,
                     Self::Rotating { k, .. } => shape[k.dim] = 0,
-                    Self::TurboQuant(_) => unreachable!(),
+                    Self::TurboQuant(_) | Self::XsRolling(_) => unreachable!(),
                 }
                 Tensor::zeros(shape, k.dtype(), k.device())?
             }
@@ -139,7 +162,7 @@ impl KvCache {
                 match self {
                     Self::Normal { v, .. } => shape[v.dim] = 0,
                     Self::Rotating { v, .. } => shape[v.dim] = 0,
-                    Self::TurboQuant(_) => unreachable!(),
+                    Self::TurboQuant(_) | Self::XsRolling(_) => unreachable!(),
                 }
                 Tensor::zeros(shape, v.dtype(), v.device())?
             }
@@ -153,6 +176,7 @@ impl KvCache {
             Self::Normal { k, .. } => k.current_seq_len(),
             Self::Rotating { k, .. } => k.current_seq_len(),
             Self::TurboQuant(tq) => tq.current_seq_len(),
+            Self::XsRolling(xs) => xs.current_seq_len(),
         }
     }
 
@@ -168,6 +192,9 @@ impl KvCache {
             }
             Self::TurboQuant(tq) => {
                 tq.reset();
+            }
+            Self::XsRolling(xs) => {
+                xs.reset();
             }
         }
     }
@@ -190,6 +217,7 @@ impl KvCache {
                 tq.v.set_len(len)?;
                 Ok(())
             }
+            Self::XsRolling(xs) => xs.set_len(len),
         }
     }
 
@@ -209,6 +237,7 @@ impl KvCache {
                 // TurboQuant doesn't support try_set_len yet
                 Ok(())
             }
+            Self::XsRolling(xs) => xs.try_set_len(len),
         }
     }
 
@@ -343,6 +372,19 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                             tq.v.current_data().unwrap().unwrap(),
                         )
                     }
+                    // Compressed rows batch like K, the raw tail like V.
+                    // Both are materialised by `XsRollingCache::advance`, so a
+                    // sequence that has been cloned out at least once always
+                    // has them.
+                    KvCache::XsRolling(xs) => (
+                        xs.comp
+                            .all_data
+                            .clone()
+                            .expect("xs rolling cache: compressed rows not materialised"),
+                        xs.tail
+                            .clone()
+                            .expect("xs rolling cache: raw tail not materialised"),
+                    ),
                 }
             };
             // Build dims for batched cache
@@ -373,6 +415,15 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     KvCache::TurboQuant(tq) => (
                         tq.k.current_data().unwrap().unwrap(),
                         tq.v.current_data().unwrap().unwrap(),
+                    ),
+                    KvCache::XsRolling(xs) => (
+                        xs.comp
+                            .all_data
+                            .clone()
+                            .expect("xs rolling cache: compressed rows not materialised"),
+                        xs.tail
+                            .clone()
+                            .expect("xs rolling cache: raw tail not materialised"),
                     ),
                 };
                 let offset = i * first_k.dims()[0];
@@ -467,6 +518,18 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 KvCache::TurboQuant(tq) => {
                     caches.push(KvCache::TurboQuant(tq.clone()));
                 }
+                KvCache::XsRolling(xs) => {
+                    // Everything except the two buffers (token count, base,
+                    // completed-row count, ratio) is per-batch metadata taken
+                    // from the seq0 template, exactly like the Normal arm's
+                    // `current_seq_len`. The scheduler guarantees a uniform
+                    // length across the batch; a mismatch there is the silent
+                    // failure the debug assert on this function guards.
+                    let mut rebuilt = (**xs).clone();
+                    rebuilt.comp.all_data = k_cache.map(|x| x.contiguous().unwrap());
+                    rebuilt.tail = v_cache.map(|x| x.contiguous().unwrap());
+                    caches.push(KvCache::XsRolling(Box::new(rebuilt)));
+                }
             }
         }
         *pipeline.cache().normal() = NormalCache(caches);
@@ -490,6 +553,15 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 KvCache::TurboQuant(tq) => (
                     tq.k.current_data().unwrap().unwrap(),
                     tq.v.current_data().unwrap().unwrap(),
+                ),
+                KvCache::XsRolling(xs) => (
+                    xs.comp
+                        .all_data
+                        .clone()
+                        .expect("xs rolling cache: compressed rows not materialised"),
+                    xs.tail
+                        .clone()
+                        .expect("xs rolling cache: raw tail not materialised"),
                 ),
             };
 
@@ -557,6 +629,12 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                         // Clone the TurboQuant cache as-is
                         *seq_cache = Some(KvCache::TurboQuant(tq.clone()));
                     }
+                    KvCache::XsRolling(xs) => {
+                        let mut per_seq = (**xs).clone();
+                        per_seq.comp.all_data = Some(k);
+                        per_seq.tail = Some(v);
+                        *seq_cache = Some(KvCache::XsRolling(Box::new(per_seq)));
+                    }
                 }
             }
         }
@@ -601,7 +679,9 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
             // preallocated per-sequence buffer — the preallocated caches are
             // KV-shaped `[1, kv_heads, T, head_dim]`. They always start a
             // fresh sequence empty.
-            if matches!(&old_caches[layer_idx], KvCache::Normal { k, .. } if k.dim != 2) {
+            if matches!(&old_caches[layer_idx], KvCache::Normal { k, .. } if k.dim != 2)
+                || matches!(&old_caches[layer_idx], KvCache::XsRolling(_))
+            {
                 layer.reset();
                 continue;
             }
@@ -638,6 +718,13 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
 
             // Use this for the various parameters. Assumes all seqs are from one model.
             match &old_caches[layer_idx] {
+                // Unreachable: the xs rolling entries are reset and skipped
+                // above (they have no preallocated KV-shaped buffer). Kept as
+                // a reset rather than a panic so a future reordering degrades
+                // to "start empty", which is always safe for this entry.
+                KvCache::XsRolling(_) => {
+                    layer.reset();
+                }
                 KvCache::Normal { k, .. } => {
                     let template_cache_dim = k.dim;
                     let template_cache_msl = k.max_seq_len;

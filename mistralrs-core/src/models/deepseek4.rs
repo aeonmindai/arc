@@ -121,6 +121,8 @@ use crate::{
     utils::{progress::NiceProgressBar, unvarbuilder::UnVarBuilder},
 };
 
+use crate::kv_cache::XsRollingCache;
+
 use super::dsv4_mhc::V4MHCLayerParams;
 
 serde_default_fn!(f64, routed_scaling_factor, 1.5);
@@ -1209,6 +1211,17 @@ impl Attention {
     /// branch in [`super::dsv4_attention::dsv4_attention`]. Reference
     /// `inference/model.py` `Attention.forward` (the `kv_compress` path).
     fn compressed_kv(&self, xs_hist: &Tensor) -> Result<Option<Tensor>> {
+        let Some(rows) = self.compress_prefix(xs_hist)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.compressed_kv_from_rows(&rows)?))
+    }
+
+    /// Compress the largest `ratio`-multiple prefix of a *raw* history in one
+    /// shot — the whole-history recompute. Still the prefill path (and the
+    /// path for callers with no per-sequence cache), and the reference the
+    /// rolling state is tested against.
+    fn compress_prefix(&self, xs_hist: &Tensor) -> Result<Option<Tensor>> {
         if self.compress_ratio == CompressRatio::Standard {
             return Ok(None);
         }
@@ -1226,8 +1239,16 @@ impl Attention {
         } else {
             xs_hist.narrow(1, 0, t_trunc)?
         };
-        // [B, T_c, head_dim] (pre-RoPE) → [B, 1, T_c, head_dim].
-        let comp = compressor.forward_from_xs(&xs_trunc)?.unsqueeze(1)?;
+        Ok(Some(compressor.forward_from_xs(&xs_trunc)?))
+    }
+
+    /// `[B, T_c, head_dim]` pre-RoPE compressed rows → `[B, 1, T_c, head_dim]`
+    /// with compress-θ RoPE applied at the strided compressed positions.
+    /// Row `j` sits at absolute position `j * ratio` and its rotation depends
+    /// on nothing but `j`, which is why the rows can be cached pre-RoPE.
+    fn compressed_kv_from_rows(&self, rows: &Tensor) -> Result<Tensor> {
+        let ratio = self.compress_ratio.ratio();
+        let comp = rows.unsqueeze(1)?;
         let t_c = comp.dim(2)?;
         // Compressed entry j sits at absolute position j*ratio. Apply the
         // layer's (compress-θ) RoPE to the last qk_rope_head_dim dims there.
@@ -1238,10 +1259,8 @@ impl Attention {
         let positions = (Tensor::arange(0u32, t_c as u32, dev)?.to_dtype(DType::F32)?
             * (ratio as f64))?
         .to_dtype(DType::U32)?;
-        let comp =
-            self.rotary_emb
-                .forward_at_positions(&comp, self.cfg.qk_rope_head_dim, &positions)?;
-        Ok(Some(comp))
+        self.rotary_emb
+            .forward_at_positions(&comp, self.cfg.qk_rope_head_dim, &positions)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1289,17 +1308,54 @@ impl Attention {
         // the in-layer reset also keeps direct `model.forward` callers
         // (tests / SDK) correct without a cache manager. The q/k/v
         // projections below still use the current `xs`.
-        let xs_for_compressor = match xs_hist_cache {
+        //
+        // RUN-170 (wave30): the slot no longer holds the raw `[B, T, hidden]`
+        // history. `forward_from_xs` is a strided local reduction — row `j` is
+        // final once token `(j+1)*ratio - 1` has arrived and can never change
+        // — so what the slot keeps is the *result*: the completed compressed
+        // rows `[B, T/ratio, head_dim]` plus the bounded raw tail a future row
+        // still needs (`span_groups * ratio + margin` tokens). That is
+        // `8 * ratio` times smaller per token (32x on CSA, 1024x on HCA) and
+        // removes the O(T) recompute per decode step. `XsRollingCache` owns
+        // the token↔row mapping so the engine's token-unit truncations
+        // (prefix cacher, MTP verify rollback, speculative rejection) stay
+        // correct, and refuses — loudly — the ones it cannot resume.
+        let compressed_rows = match xs_hist_cache {
             Some(hist) => {
                 if seqlen_offsets.iter().all(|&o| o == 0) {
                     hist.reset();
                 }
-                let xs3 = xs.contiguous()?;
-                let marker = Tensor::zeros((bs, seq_len, 1), xs3.dtype(), xs3.device())?;
-                let (hist_xs, _marker) = hist.append(&xs3, &marker)?;
-                hist_xs
+                let KvCache::XsRolling(state) = hist else {
+                    candle_core::bail!(
+                        "V4 compressor layer was handed a {} cache slot; the compressor-input \
+                         history must be a KvCache::XsRolling entry (see DeepSeekV4::new).",
+                        match hist {
+                            KvCache::Normal { .. } => "Normal",
+                            KvCache::Rotating { .. } => "Rotating",
+                            KvCache::TurboQuant(_) => "TurboQuant",
+                            KvCache::XsRolling(_) => unreachable!(),
+                        }
+                    );
+                };
+                match self.compressor.as_ref() {
+                    Some(compressor) => {
+                        debug_assert_eq!(
+                            state.span_groups, compressor.coff,
+                            "xs rolling cache span must equal the compressor's group span"
+                        );
+                        let xs3 = xs.contiguous()?;
+                        // Always advanced, including under the window-only
+                        // ablation below: skipping it would drop the raw tail
+                        // and leave a hole the next group cannot be built from.
+                        state.advance(&xs3, |window| compressor.forward_from_xs(window))?
+                    }
+                    None => None,
+                }
             }
-            None => xs.clone(),
+            // No per-sequence slot (direct `model.forward` callers — tests,
+            // the SDK — and the MTP block, which is a ratio-0 layer): compress
+            // the tokens in hand, exactly as before.
+            None => self.compress_prefix(xs)?,
         };
         // 1. Q projection (LoRA). [B, T, hidden] → [B, T, n_heads*head_dim]
         //    → reshape to [B, n_heads, T, head_dim]. Audit §3.
@@ -1408,10 +1464,11 @@ impl Attention {
         // branch off so attention degenerates to pure sliding-window. Used to
         // isolate whether long-ctx sustained-generation degradation lives in
         // the compressed branch (coherent window-only ⇒ yes) vs elsewhere.
-        let compressed_kv = if std::env::var_os("ARC_V4_WINDOW_ONLY").is_some() {
-            None
-        } else {
-            self.compressed_kv(&xs_for_compressor)?
+        let compressed_kv = match compressed_rows {
+            Some(rows) if std::env::var_os("ARC_V4_WINDOW_ONLY").is_none() => {
+                Some(self.compressed_kv_from_rows(&rows)?)
+            }
+            _ => None,
         };
         let mut attn_out = match &self.paged_attn {
             Some(paged_attn) => match metadata {
@@ -3335,11 +3392,12 @@ impl DeepSeekV4 {
         // length — so these extra entries are cloned in/out per sequence
         // exactly like KV, giving each sequence in a batch its own history.
         let mut xs_hist_slots = Vec::with_capacity(cfg.num_hidden_layers);
-        let mut n_compress_layers = 0usize;
+        let mut compress_ratios_in_order = Vec::new();
         for i in 0..cfg.num_hidden_layers {
-            if cfg.layer_compress_ratio(i) != 0 {
-                xs_hist_slots.push(Some(n_compress_layers));
-                n_compress_layers += 1;
+            let ratio = cfg.layer_compress_ratio(i);
+            if ratio != 0 {
+                xs_hist_slots.push(Some(compress_ratios_in_order.len()));
+                compress_ratios_in_order.push(ratio as usize);
             } else {
                 xs_hist_slots.push(None);
             }
@@ -3347,13 +3405,21 @@ impl DeepSeekV4 {
         let cache = NormalCache::new(cfg.num_hidden_layers, cfg.max_position_embeddings);
         {
             let mut guard = cache.lock().unwrap();
-            for _ in 0..n_compress_layers {
-                // Same geometry as the previous per-model xs_history
-                // (`SingleCache::new(1, max_position_embeddings, 256)`):
-                // seq dim 1 over `[B, T, hidden]`, initial capacity 256.
+            for ratio in compress_ratios_in_order {
+                // wave30: the rolling compressed state, not the raw history.
+                // `span_groups` mirrors `V4Compressor::coff` — the ratio-4
+                // compressor's `overlap_transform` folds the previous group in,
+                // so one row consumes two groups of raw tokens; every other
+                // ratio consumes one.
+                let span_groups = if ratio == 4 { 2 } else { 1 };
                 guard
                     .0
-                    .push(KvCache::new_normal(1, cfg.max_position_embeddings, 256));
+                    .push(KvCache::XsRolling(Box::new(XsRollingCache::new(
+                        ratio,
+                        span_groups,
+                        cfg.head_dim,
+                        cfg.max_position_embeddings,
+                    ))));
             }
         }
 
@@ -5578,6 +5644,287 @@ mod tests {
             max_diff(&compressed, &compressed_unscaled) > 1e-3,
             "compressed-layer RoPE lost its YaRN ramp (max diff {})",
             max_diff(&compressed, &compressed_unscaled)
+        );
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // wave30: the rolling compressed `xs` state.
+    //
+    // The whole memory win rests on one claim: `forward_from_xs` is a strided
+    // LOCAL reduction, so a completed compressed row never changes and the raw
+    // tokens behind it can be dropped. These tests execute that claim instead
+    // of asserting it — feed the compressor one group at a time through
+    // `XsRollingCache::advance` and require the result to equal the
+    // whole-history recompute the model used to do on every decode step.
+    // ---------------------------------------------------------------------
+
+    /// A real `V4Compressor` with deterministic, non-degenerate weights.
+    /// Zero weights would make every equivalence assertion below vacuous, so
+    /// the fixture asserts its own output is non-trivial.
+    fn rolling_test_compressor(
+        ratio: usize,
+        hidden: usize,
+        head_dim: usize,
+        device: &Device,
+    ) -> Result<V4Compressor> {
+        let coff = if ratio == 4 { 2 } else { 1 };
+        let patterned = |shape: (usize, usize), phase: f32| -> Result<Tensor> {
+            let n = shape.0 * shape.1;
+            let data: Vec<f32> = (0..n)
+                .map(|i| ((i as f32) * 0.31 + phase).sin() * 0.5)
+                .collect();
+            Tensor::from_vec(data, shape, device)
+        };
+        let wkv_gate: Arc<dyn QuantMethod> = Arc::new(mistralrs_quant::UnquantLinear::new(
+            mistralrs_quant::QuantMethodConfig::Unquantized(candle_nn::Linear::new(
+                patterned((2 * coff * head_dim, hidden), 0.0)?,
+                None,
+            )),
+        )?);
+        let norm = RmsNorm::from_w(
+            patterned((1, head_dim), 1.0)?.reshape(head_dim)?.abs()?,
+            1e-6,
+        )?;
+        Ok(V4Compressor {
+            wkv_gate,
+            norm,
+            ape: patterned((ratio, coff * head_dim), 0.7)?,
+            ratio,
+            head_dim,
+            coff,
+            hidden_size: hidden,
+        })
+    }
+
+    fn rolling_test_xs(t: usize, hidden: usize, device: &Device) -> Result<Tensor> {
+        let data: Vec<f32> = (0..t * hidden)
+            .map(|i| ((i as f32) * 0.017 + 0.3).cos() * 0.8)
+            .collect();
+        Tensor::from_vec(data, (1, t, hidden), device)
+    }
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> Result<f32> {
+        (a - b)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()
+    }
+
+    /// Feeding the history one token at a time through the rolling state must
+    /// reproduce, at every step, the compressed rows the whole-history
+    /// recompute produces — for both compressor shapes: ratio 4 (`coff == 2`,
+    /// `overlap_transform` folds in the PREVIOUS group, so a row spans two
+    /// groups) and ratio 128 (`coff == 1`, one group per row).
+    fn rolling_matches_full_recompute(ratio: usize, prefill: usize, steps: usize) -> Result<()> {
+        let device = Device::Cpu;
+        let hidden = 32;
+        let head_dim = 16;
+        let compressor = rolling_test_compressor(ratio, hidden, head_dim, &device)?;
+        let span_groups = compressor.coff;
+        let total = prefill + steps;
+        let xs = rolling_test_xs(total, hidden, &device)?;
+
+        let mut state = XsRollingCache::new(ratio, span_groups, head_dim, 4096);
+        state.advance(&xs.narrow(1, 0, prefill)?, |w| {
+            compressor.forward_from_xs(w)
+        })?;
+
+        let mut saw_rows = 0usize;
+        for step in 0..steps {
+            let tok = xs.narrow(1, prefill + step, 1)?;
+            let got = state.advance(&tok, |w| compressor.forward_from_xs(w))?;
+            let seen = prefill + step + 1;
+            assert_eq!(state.current_seq_len(), seen);
+
+            // Ground truth: compress the whole history from scratch, exactly
+            // what `Attention::compress_prefix` does.
+            let t_trunc = (seen / ratio) * ratio;
+            if t_trunc == 0 {
+                assert!(got.is_none(), "no group has completed yet at {seen} tokens");
+                continue;
+            }
+            let want = compressor.forward_from_xs(&xs.narrow(1, 0, t_trunc)?)?;
+            let got = got.expect("a completed group must produce rows");
+            assert_eq!(
+                got.dims(),
+                want.dims(),
+                "rolling rows have the wrong shape at {seen} tokens"
+            );
+            let diff = max_abs_diff(&got, &want)?;
+            assert!(
+                diff <= 1e-5,
+                "rolling compressed rows diverged from the whole-history recompute at \
+                 {seen} tokens (ratio {ratio}): max abs diff {diff}"
+            );
+            saw_rows = want.dim(1)?;
+            // Non-degenerate: a zero fixture would make the equality vacuous.
+            let mag = want.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+            assert!(mag > 1e-3, "fixture produced ~zero compressed rows ({mag})");
+        }
+        assert!(
+            saw_rows >= 2,
+            "test did not cross two `ratio` strides (only {saw_rows} rows)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rolling_xs_matches_full_recompute_csa_ratio4() -> Result<()> {
+        // 10 prefill tokens then 14 decode steps: crosses the ratio-4 group
+        // boundary five times, and the overlap window (2 groups) three times.
+        rolling_matches_full_recompute(4, 10, 14)
+    }
+
+    #[test]
+    fn rolling_xs_matches_full_recompute_hca_ratio128() -> Result<()> {
+        // Two 128-token strides completed during single-token decode.
+        rolling_matches_full_recompute(128, 100, 160)
+    }
+
+    /// The tail retained after each step must stay bounded — that IS the
+    /// memory win. Without this, "rolling" would just be the old raw history
+    /// under a new name.
+    #[test]
+    fn rolling_xs_tail_is_bounded_by_the_compressor_span() -> Result<()> {
+        let device = Device::Cpu;
+        let (hidden, head_dim, ratio) = (32usize, 16usize, 4usize);
+        let compressor = rolling_test_compressor(ratio, hidden, head_dim, &device)?;
+        let mut state = XsRollingCache::new(ratio, compressor.coff, head_dim, 4096);
+        let xs = rolling_test_xs(400, hidden, &device)?;
+        state.advance(&xs.narrow(1, 0, 200)?, |w| compressor.forward_from_xs(w))?;
+        let bound = compressor.coff * ratio + state.margin;
+        for step in 0..200 {
+            state.advance(&xs.narrow(1, 200 + step, 1)?, |w| {
+                compressor.forward_from_xs(w)
+            })?;
+            let tail_rows = state.tail.as_ref().unwrap().dim(1)?;
+            assert!(
+                tail_rows <= bound,
+                "raw tail grew to {tail_rows} rows at {} tokens (bound {bound}) — the rolling \
+                 state is retaining history it can never need",
+                state.current_seq_len()
+            );
+        }
+        // ... and the compressed rows are the only thing that grows with T.
+        assert_eq!(state.comp.current_seq_len(), 400 / ratio);
+        Ok(())
+    }
+
+    /// A rollback of up to `margin` tokens must be accepted and resumable at
+    /// EVERY length — including the ones that cross a group boundary, where
+    /// the rolled-back group's compressed row has to be rebuilt from the start
+    /// of its group. This is the MTP verify / speculative rejection contract:
+    /// unlike the prefix cacher, those callers cannot decline, they error.
+    #[test]
+    fn rolling_xs_accepts_any_rollback_within_the_margin() -> Result<()> {
+        let device = Device::Cpu;
+        let (hidden, head_dim) = (32usize, 16usize);
+        // ratio 128 is the case that bites: with `span_groups == 1` the naive
+        // "keep the last span*ratio + margin tokens" rule retains only 16
+        // tokens before the boundary, but resuming inside the previous group
+        // needs all of it.
+        for ratio in [4usize, 128] {
+            let compressor = rolling_test_compressor(ratio, hidden, head_dim, &device)?;
+            let span = compressor.coff;
+            let xs = rolling_test_xs(300, hidden, &device)?;
+            for tokens in [ratio, ratio + 1, 2 * ratio, 2 * ratio + 3, 300] {
+                let mut state = XsRollingCache::new(ratio, span, head_dim, 4096);
+                state.advance(&xs.narrow(1, 0, tokens)?, |w| {
+                    compressor.forward_from_xs(w)
+                })?;
+                let drop = state.margin.min(tokens);
+                let len = tokens - drop;
+                state.set_len(len).map_err(|e| {
+                    candle_core::Error::Msg(format!(
+                        "ratio {ratio}: rolling back {drop} tokens from {tokens} (the MTP \
+                         rollback bound) must be accepted, got: {e}"
+                    ))
+                })?;
+                // Re-feed to the original length and require the whole-history
+                // answer: a rollback that "succeeds" but resumes from a gap is
+                // exactly the silent corruption this is guarding.
+                for i in len..tokens {
+                    state.advance(&xs.narrow(1, i, 1)?, |w| compressor.forward_from_xs(w))?;
+                }
+                let t_trunc = (tokens / ratio) * ratio;
+                let want = compressor.forward_from_xs(&xs.narrow(1, 0, t_trunc)?)?;
+                let got = state.compressed_rows()?.expect("rows after resume");
+                assert!(
+                    max_abs_diff(&got, &want)? <= 1e-5,
+                    "ratio {ratio}: resuming after a {drop}-token rollback at {tokens} tokens \
+                     did not reproduce the whole-history recompute"
+                );
+                let tail_rows = state.tail.as_ref().unwrap().dim(1)?;
+                assert!(
+                    tail_rows <= span * ratio + state.margin,
+                    "ratio {ratio}: rollback support cost more tail than the bound \
+                     ({tail_rows} rows)"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Token-unit truncation (prefix cacher / MTP verify rollback /
+    /// speculative rejection) must land on both time bases, and a rollback
+    /// behind the retained raw window must be REFUSED, never silently
+    /// resumed from a gap.
+    #[test]
+    fn rolling_xs_set_len_truncates_both_time_bases() -> Result<()> {
+        let device = Device::Cpu;
+        let (hidden, head_dim, ratio) = (32usize, 16usize, 4usize);
+        let compressor = rolling_test_compressor(ratio, hidden, head_dim, &device)?;
+        let xs = rolling_test_xs(64, hidden, &device)?;
+        let feed = |state: &mut XsRollingCache, from: usize, to: usize| -> Result<()> {
+            for i in from..to {
+                state.advance(&xs.narrow(1, i, 1)?, |w| compressor.forward_from_xs(w))?;
+            }
+            Ok(())
+        };
+
+        let mut state = XsRollingCache::new(ratio, compressor.coff, head_dim, 4096);
+        feed(&mut state, 0, 50)?;
+        assert_eq!(state.comp.current_seq_len(), 12);
+
+        // A short rollback (the MTP/speculative case) is inside the margin.
+        state.set_len(47)?;
+        assert_eq!(state.current_seq_len(), 47);
+        assert_eq!(state.comp.current_seq_len(), 47 / ratio);
+        // Resuming after the rollback must reproduce a from-scratch run of
+        // the same 50 tokens: the compressor sees no gap.
+        feed(&mut state, 47, 50)?;
+        let want = compressor.forward_from_xs(&xs.narrow(1, 0, 48)?)?;
+        let got = state.compressed_rows()?.expect("rows after resume");
+        assert!(
+            max_abs_diff(&got, &want)? <= 1e-5,
+            "resuming after a truncation did not reproduce the whole-history recompute"
+        );
+
+        // A rollback that lands inside the retained tail but leaves the NEXT
+        // compressed row unbuildable (the `coff == 2` predecessor group is
+        // gone) must also be refused — `set_len` succeeding here would push
+        // the failure into `advance`, one step later and further from the
+        // cause. At 50 tokens the tail starts at token `(12-1)*4 - 16 = 28`,
+        // so 30 is inside it but resuming would need tokens from 24.
+        let inside_tail_but_unresumable = 30;
+        assert!(inside_tail_but_unresumable >= state.resumable_from());
+        assert!(
+            state.try_set_len(inside_tail_but_unresumable).is_err(),
+            "a rollback past the compressor's own span must be refused even when the raw tail \
+             still covers it"
+        );
+
+        // A rollback behind the retained window is refused, by both the
+        // check-only and the mutating entry point, and leaves the state intact.
+        let too_far = state.resumable_from().saturating_sub(1);
+        assert!(
+            state.try_set_len(too_far).is_err(),
+            "a rollback to {too_far} tokens is behind base {} and must be refused",
+            state.resumable_from()
+        );
+        assert!(state.set_len(too_far).is_err());
+        assert_eq!(
+            state.current_seq_len(),
+            50,
+            "a refused rollback must not mutate"
         );
         Ok(())
     }

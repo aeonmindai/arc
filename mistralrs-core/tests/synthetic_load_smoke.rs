@@ -36,8 +36,9 @@ use indicatif::MultiProgress;
 
 use mistralrs_core::{
     AttentionImplementation, DeepSeekV3Loader, DeepSeekV4Loader, DeviceMapper, GLM4MoeLoader,
-    IsqOrganization, NormalLoaderType, NormalLoadingMetadata, NormalModel, NormalModelLoader,
-    TextFlashParams as FlashParams, UqffFullSer, UqffSourceWeights, UQFF_MTP_TENSOR_PREFIX,
+    IsqOrganization, KvCache, NormalLoaderType, NormalLoadingMetadata, NormalModel,
+    NormalModelLoader, SingleCache, TextFlashParams as FlashParams, UqffFullSer, UqffSourceWeights,
+    UQFF_MTP_TENSOR_PREFIX,
 };
 use mistralrs_quant::{safetensors::ShardedSafeTensors, ShardedVarBuilder};
 
@@ -1682,11 +1683,94 @@ fn v4c_assert_chains_differ(a: &[f32], b: &[f32], what: &str) {
 /// merged-decode test batches the way `NormalCacheManager::clone_in_cache`
 /// does.
 #[allow(clippy::type_complexity)]
+/// Deep-copy one cache entry. A plain `clone()` shares tensor storage with
+/// the live cache, and `SingleCache::append` writes through `slice_set`, so a
+/// shallow snapshot would be silently rewritten by the next decode step.
+fn v4c_snapshot_entry(c: &KvCache) -> KvCache {
+    let copy = |t: &Option<Tensor>| t.as_ref().map(|t| t.copy().unwrap());
+    match c {
+        KvCache::Normal { k, v } => KvCache::Normal {
+            k: SingleCache {
+                all_data: copy(&k.all_data),
+                ..k.clone()
+            },
+            v: SingleCache {
+                all_data: copy(&v.all_data),
+                ..v.clone()
+            },
+        },
+        KvCache::XsRolling(xs) => {
+            let mut out = (**xs).clone();
+            out.comp.all_data = copy(&xs.comp.all_data);
+            out.tail = copy(&xs.tail);
+            KvCache::XsRolling(Box::new(out))
+        }
+        other => other.clone(),
+    }
+}
+
+/// Batch two per-sequence entries along dim 0, taking every length field from
+/// the first — byte-for-byte the contract of
+/// `NormalCacheManager::clone_in_cache` (`kv_cache/mod.rs`), which builds the
+/// batched buffer from `seqs[0]` as template and `slice_set`s each sequence in.
+fn v4c_merge_entries(a: &KvCache, b: &KvCache) -> KvCache {
+    let cat = |x: &Option<Tensor>, y: &Option<Tensor>| {
+        Some(Tensor::cat(&[x.as_ref().unwrap(), y.as_ref().unwrap()], 0).unwrap())
+    };
+    match (a, b) {
+        (KvCache::Normal { k: ka, v: va }, KvCache::Normal { k: kb, v: vb }) => KvCache::Normal {
+            k: SingleCache {
+                all_data: cat(&ka.all_data, &kb.all_data),
+                ..ka.clone()
+            },
+            v: SingleCache {
+                all_data: cat(&va.all_data, &vb.all_data),
+                ..va.clone()
+            },
+        },
+        (KvCache::XsRolling(xa), KvCache::XsRolling(xb)) => {
+            let mut out = (**xa).clone();
+            out.comp.all_data = cat(&xa.comp.all_data, &xb.comp.all_data);
+            out.tail = cat(&xa.tail, &xb.tail);
+            KvCache::XsRolling(Box::new(out))
+        }
+        _ => panic!("v4c_merge_entries: mismatched cache entry kinds"),
+    }
+}
+
+/// Slice sequence `row` back out of a batched entry — the `clone_out_cache`
+/// half, which chunks each buffer along dim 0 and keeps the length fields.
+fn v4c_split_entry(entry: &KvCache, row: usize) -> KvCache {
+    let take = |t: &Option<Tensor>| {
+        t.as_ref()
+            .map(|t| t.narrow(0, row, 1).unwrap().copy().unwrap())
+    };
+    match entry {
+        KvCache::Normal { k, v } => KvCache::Normal {
+            k: SingleCache {
+                all_data: take(&k.all_data),
+                ..k.clone()
+            },
+            v: SingleCache {
+                all_data: take(&v.all_data),
+                ..v.clone()
+            },
+        },
+        KvCache::XsRolling(xs) => {
+            let mut out = (**xs).clone();
+            out.comp.all_data = take(&xs.comp.all_data);
+            out.tail = take(&xs.tail);
+            KvCache::XsRolling(Box::new(out))
+        }
+        other => other.clone(),
+    }
+}
+
 fn v4c_solo_run(
     model: &mut Box<dyn NormalModel + Send + Sync>,
     prompt: &[u32],
     next_toks: &[u32],
-) -> (Vec<Vec<f32>>, Vec<(Tensor, Tensor)>) {
+) -> (Vec<Vec<f32>>, Vec<KvCache>) {
     let device = Device::Cpu;
     v4c_reset(model);
     let mut outs = Vec::new();
@@ -1695,26 +1779,12 @@ fn v4c_solo_run(
     let logits = v4c_step(model.as_ref(), &ids, 0).expect("solo prefill must not error");
     outs.push(v4c_row(&logits, 0));
 
-    let snapshot: Vec<(Tensor, Tensor)> = model
+    let snapshot: Vec<KvCache> = model
         .cache()
         .normal()
         .0
         .iter()
-        .map(|c| {
-            let k = c
-                .k()
-                .unwrap()
-                .expect("cache entry populated after prefill")
-                .copy()
-                .unwrap();
-            let v = c
-                .v()
-                .unwrap()
-                .expect("cache entry populated after prefill")
-                .copy()
-                .unwrap();
-            (k, v)
-        })
+        .map(v4c_snapshot_entry)
         .collect();
 
     for (s, tok) in next_toks.iter().enumerate() {
@@ -1724,6 +1794,97 @@ fn v4c_solo_run(
         outs.push(v4c_row(&logits, 0));
     }
     (outs, snapshot)
+}
+
+/// The rolling compressed `xs` state must be indistinguishable from the
+/// whole-history recompute it replaces.
+///
+/// Ground truth is not "what the previous implementation printed" — it is a
+/// FRESH FULL PREFILL at every length, which runs the compressor over the
+/// entire raw history in one shot (`Attention::compress_prefix`, the prefill
+/// path, untouched by wave30). Decoding one token at a time must reproduce it
+/// exactly: same sampled token at every step, and logits inside the CPU-MatMul
+/// F16 budget the fixture already documents.
+///
+/// The schedule is chosen to exercise the part that can go wrong:
+///   * 120-token prompt, then 20 single-token decode steps;
+///   * five ratio-4 (CSA) group boundaries are crossed DURING DECODE — every
+///     one of them is a row the rolling state must build from its retained
+///     tail plus the previous group (`overlap_transform`), not from the raw
+///     history it no longer has;
+///   * the ratio-128 (HCA) boundary at token 128 is crossed during decode too,
+///     so the second compressor shape (`coff == 1`) is live.
+///
+/// Teeth (verified by mutation, wave30 §6): reverting `XsRollingCache::advance`
+/// to hand the compressor only the current group — dropping the `coff == 2`
+/// predecessor — fails this test on the first CSA boundary; dropping the tail
+/// retention makes it bail with the history-gap guard.
+#[test]
+fn v4_rolling_xs_decode_matches_whole_history_prefill() {
+    let device = Device::Cpu;
+    let mut model = v4c_load();
+    let vocab = v4_compress::VOCAB_SIZE;
+    const PREFILL: usize = 120;
+    const TOTAL: usize = 140;
+    let toks: Vec<u32> = (0..TOTAL).map(|i| ((i * 7 + 1) % vocab) as u32).collect();
+
+    // Rolling: one prefill, then single-token decode.
+    v4c_reset(&mut model);
+    let ids = Tensor::from_vec(toks[..PREFILL].to_vec(), (1, PREFILL), &device).unwrap();
+    let mut rolling: Vec<Vec<f32>> = vec![v4c_row(
+        &v4c_step(model.as_ref(), &ids, 0).expect("prefill"),
+        0,
+    )];
+    for s in PREFILL..TOTAL {
+        let ids = Tensor::from_vec(vec![toks[s]], (1, 1), &device).unwrap();
+        let logits = v4c_step(model.as_ref(), &ids, s).expect("rolling decode step");
+        rolling.push(v4c_row(&logits, 0));
+    }
+
+    // Ground truth: recompute the whole history at every length.
+    let mut n_strides = 0usize;
+    for (i, len) in (PREFILL..=TOTAL).enumerate() {
+        v4c_reset(&mut model);
+        let ids = Tensor::from_vec(toks[..len].to_vec(), (1, len), &device).unwrap();
+        let logits = v4c_step(model.as_ref(), &ids, 0).expect("reference full prefill");
+        let want = v4c_row(&logits, 0);
+        let got = &rolling[i];
+
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
+                    if x > bv {
+                        (i, x)
+                    } else {
+                        (bi, bv)
+                    }
+                })
+                .0
+        };
+        assert_eq!(
+            argmax(got),
+            argmax(&want),
+            "rolling decode sampled a different token than the whole-history recompute at \
+             {len} tokens: the compressed (distant-context) branch diverged"
+        );
+        v4c_assert_close(
+            got,
+            &want,
+            &format!("rolling decode vs whole-history prefill at {len} tokens"),
+        );
+        if len > PREFILL && len % 4 == 0 {
+            n_strides += 1;
+        }
+    }
+    assert!(
+        n_strides >= 2,
+        "schedule crossed only {n_strides} ratio-4 strides during decode"
+    );
+    assert!(
+        (PREFILL..TOTAL).contains(&128),
+        "schedule must cross the ratio-128 HCA stride during decode"
+    );
 }
 
 /// A 2-sequence batch through the V4 compressor path (CSA + HCA), crossing
@@ -1781,15 +1942,8 @@ fn v4_xs_history_two_seq_batch_matches_single_sequence() {
             cache.0.len(),
             "snapshot length must match the model cache (KV entries + xs-history entries)"
         );
-        for (entry, ((ka, va), (kb, vb))) in
-            cache.0.iter_mut().zip(a_snap.iter().zip(b_snap.iter()))
-        {
-            let k = Tensor::cat(&[ka, kb], 0).unwrap();
-            let v = Tensor::cat(&[va, vb], 0).unwrap();
-            entry.reset();
-            entry
-                .append(&k, &v)
-                .expect("merging per-sequence caches into a batch must not fail");
+        for (entry, (a, b)) in cache.0.iter_mut().zip(a_snap.iter().zip(b_snap.iter())) {
+            *entry = v4c_merge_entries(a, b);
         }
     }
     // First half of the decode: both chains in one batch.
@@ -1817,26 +1971,7 @@ fn v4_xs_history_two_seq_batch_matches_single_sequence() {
     {
         let mut cache = model.cache_mut().normal();
         for entry in cache.0.iter_mut() {
-            let k = entry
-                .k()
-                .unwrap()
-                .expect("cache entry populated during decode")
-                .narrow(0, 1, 1)
-                .unwrap()
-                .copy()
-                .unwrap();
-            let v = entry
-                .v()
-                .unwrap()
-                .expect("cache entry populated during decode")
-                .narrow(0, 1, 1)
-                .unwrap()
-                .copy()
-                .unwrap();
-            entry.reset();
-            entry
-                .append(&k, &v)
-                .expect("splitting chain B back out of the batch must not fail");
+            *entry = v4c_split_entry(entry, 1);
         }
     }
     for s in shrink_at..V4C_DECODE_STEPS {

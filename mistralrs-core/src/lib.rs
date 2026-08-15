@@ -140,6 +140,10 @@ pub use pipeline::{
 };
 /// `FlashParams` is needed by integration tests that call `NormalModel::forward` directly.
 pub use pipeline::text_models_inputs_processor::FlashParams as TextFlashParams;
+/// The cache entry types are needed by integration tests that drive the
+/// per-sequence cache dance (`clone_in_cache` / `clone_out_cache`) by hand
+/// against a bare `NormalModel`, without standing up a whole pipeline.
+pub use kv_cache::{KvCache, SingleCache, XsRollingCache};
 pub use request::{
     ApproximateUserLocation, Constraint, DetokenizationRequest, ImageGenerationResponseFormat,
     LlguidanceGrammar, MessageContent, NormalRequest, ReasoningEffort, Request, RequestMessage,
