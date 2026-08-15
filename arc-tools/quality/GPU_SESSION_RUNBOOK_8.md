@@ -90,7 +90,7 @@ $4.92/hr = **$0.082/min**. Cumulative from *instance creation*.
 | S0 | **Box health gate — before the 234 GB pull** | 4m | 0:04 | 0.33 | **0.33** |
 | S1 | Build ∥ pull **234 GB** (74 overlay + 160 source) from HF | 30m | 0:34 | 2.46 | 2.79 |
 | S2 | Serve + load gate (**~3 min cold**) + **concurrency self-test** | 10m | 0:44 | 0.82 | 3.61 |
-| S3 | **Speed sweep B ∈ {1,8,16,32,64,128}** — THE deliverable | 25m | 1:09 | 2.05 | 5.66 |
+| S3 | **Speed sweep B ∈ {1,8,16,32,64,128,256}** — THE deliverable | 25m | 1:09 | 2.05 | 5.66 |
 | S4 | Sustained-mode confirmation at the two best B | 10m | 1:19 | 0.82 | 6.48 |
 | S5 | **GSM8K n=100, 0-shot, 2048-cap, seed 161** | 40m | 1:59 | 3.28 | 9.76 |
 | S6 | coherence6 + facts/math | 8m | 2:07 | 0.66 | 10.42 |
@@ -180,7 +180,7 @@ re-derive this command; copy it.
   -a deepseekv4 \
   --from-uqff /workspace/uqff/qtip2-0.uqff \
   --chat-template chat_templates/deepseek_v4.json \
-  --max-seqs 128 \
+  --max-seqs 256 \
   --prefix-cache-n 0 \
   --max-seq-len 4096 --max-batch-size 128
 ```
@@ -217,7 +217,7 @@ running**, not after.
 > and report the exact command and error.** Do not attempt to produce the
 > weights by any other means.
 
-**`--max-seqs 128` is load-bearing and is the single most likely way this
+**`--max-seqs` is load-bearing and is the single most likely way this
 session silently produces garbage.** mistral.rs defaults `--max-seqs` to **32**
 (`mistralrs-cli/src/args/mod.rs:414-416`). Serve without this flag and the
 B=64 and B=128 rows quietly become B=32 rows: the probe still returns, the
@@ -236,7 +236,7 @@ python3 batch_load_probe.py --batches 8 --reps 1 --max-tokens 32 --label selftes
 # expect: CONC[B=8] effective_B=8 ... verdict=pass       -> exit 0
 
 # b. and it must FAIL when the server is forced to serialise.
-#    Restart the server with --max-seqs 1, re-run, then restore --max-seqs 128.
+#    Restart the server with --max-seqs 1, re-run, then restore --max-seqs 256.
 python3 batch_load_probe.py --batches 8 --reps 1 --max-tokens 32 --label selftest_serial
 # expect: FAIL: CONCURRENCY[B=8] effective_B=<1 or 2> ... -> exit 1
 ```
@@ -250,7 +250,7 @@ engine still overlaps one sequence's tail with the next sequence's first token.
 > Read `effective_B`: `1`–`2` means strictly serial (suspect the xs_history
 > per-sequence fix, PR #21, is missing from this binary — the old per-model
 > buffer corrupts or crashes with >1 sequence in flight); `32` with
-> `--max-seqs 128` set means the flag did not take.
+> `--max-seqs 256` set means the flag did not take.
 > **ABORT-IF (b) exits 0.** The concurrency assertion is then non-functional
 > and **every number this session produces is unfalsifiable**. This is a
 > harness bug, not a box bug: delete, fix on CPU against
@@ -270,12 +270,17 @@ engine still overlaps one sequence's tail with the next sequence's first token.
 
 ```bash
 python3 batch_load_probe.py \
-  --batches 1,8,16,32,64,128 \
+  --batches 1,8,16,32,64,128,256 \
   --reps 3 --max-tokens 256 --warmup-tokens 32 \
-  --max-ctx 153000 \
+  --max-ctx 545000 \
   --cost-per-hour 4.92 \
   --label s8_sweep
 ```
+
+🔴 **Serve with `--max-seqs 256` for this sweep** (§S2 shows 128). The flag
+defaults to **32**; if it is below the largest B, those rows silently become
+B=32 rows reporting a believable number. See §5 — 190.01 vs 198.34 tok/s, 4%
+apart, indistinguishable by inspection.
 
 Produces exactly one table. **Copy it out verbatim; do not re-derive numbers.**
 
@@ -287,6 +292,7 @@ Produces exactly one table. **Copy it out verbatim; do not re-derive numbers.**
 | 32 | | | | | | |
 | 64 | | | | | | |
 | 128 | | | | | | |
+| 256 | | | | | | |
 
 Fill from the probe's own markers — `PREFILL[B=n]`, `BATCH[B=n]`, `CONC[B=n]`
 — never by eyeballing the JSON.
@@ -319,7 +325,7 @@ One-shot batches measure a burst; production is a closed loop. Confirm the two
 best B from S3 under sustained load:
 
 ```bash
-python3 batch_load_probe.py --batches 64,128 --duration 120 \
+python3 batch_load_probe.py --batches 128,256 --duration 120 \
   --max-tokens 256 --cost-per-hour 4.92 --label s8_sustained
 ```
 
@@ -370,14 +376,27 @@ python3 run_coherence.py --out results/coherence_s8.json
 
 ---
 
-## 3. KV budget arithmetic — **does B=128 fit in 141 GB?**
+## 3. KV budget arithmetic — **does B=256 fit in 141 GB?**
 
-**Answer: yes at the sweep's context, no at long context.** The arithmetic,
-from the repo rather than from memory:
+> 🔴 **REWRITTEN FOR PR #59 (merged 2026-08-15 20:13:30Z).** Every figure in
+> this section before that PR — `424,018 B/token`, "largest sweep row is
+> **B=64**", `--max-ctx 153000` — described the *pre-rolling* `xs` cache and is
+> now wrong by **3.91×**. Left in place it does active harm: `--max-ctx 153000`
+> makes the probe fire `WARNING[KV]` at B=128 and B=256, and §S3's own ABORT-IF
+> then instructs the operator to *"drop to the largest B that does not warn"* —
+> i.e. the stale number would have thrown away exactly the two rows the session
+> exists to produce. Use the numbers below.
 
-**Headroom.** 141 GB (H200) − 68 GB (artifact) = **73 GB raw**. Reserve ~8 GB
-for the CUDA context, prefill activations at B=128, logits and fragmentation
-⇒ **~65 GB usable for cache.**
+**Answer: yes — B=256 fits at 2048 context, with ~2.2 GB spare.** The
+arithmetic, from the repo rather than from memory
+(`memory/mission/wave30-BE-rolling-xs.md`, the PR's own derivation):
+
+**Headroom.** 141 GB (H200) − 74.18 GB (artifact) − ~8 GB reserve (CUDA
+context, prefill activations, logits, fragmentation) ⇒ **~59 GB usable for
+cache.** *(The pre-#59 text said "141 − 68 = 73 raw ⇒ 65 usable". 68 GB
+understates the artifact: the HF listing totals **74.19 GB** and the model card
+measures **75.7 GB resident on load**. 59 GB is the figure PR #59 sized
+against and is the one used throughout this section.)*
 
 **Per-token cost.** V4-Flash is **MQA, not MLA** — there is no `kv_lora_rank`
 and no compressed latent; the config carries `num_key_value_heads = 1` and
@@ -387,13 +406,20 @@ keep a full cache** — the ratio-0 layers {0,1} differ only in RoPE, and "43" i
 that set is the MTP slot, not a real layer. KV is **BF16** on CUDA CC≥8.0, and
 there is **no KV quantization on this path**.
 
-Two caches, and the second is the big one:
+Two caches. **The second used to be the big one; PR #59 is what changed that.**
 
 | cache | formula | B/token |
 |---|---|---|
 | attention KV, 43 layers | `43 x 2(K,V) x 1 head x 512 x 2 B` | 88,064 |
-| compressor `xs` history, 41 compressed layers | `41 x (4096 + 1) x 2 B` | 335,954 |
-| **total** | | **424,018 ≈ 414 KiB/token** |
+| compressor `xs`, 41 layers — **pre-#59**, verbatim `[B,T,4096]` history | `41 x 4096 x 2 B` | ~~335,872~~ |
+| compressor `xs`, 41 layers — **post-#59**, rolling compressed state | 41.4 MB/seq @2048 ctx ÷ 2048 | **20,224** |
+| **total, post-#59** | | **108,288 ≈ 106 KiB/token** |
+
+The `xs` term is now **0.23×** the KV cache instead of **3.8×** it — a **3.91×**
+cut in per-token footprint (423,936 → 108,288). PR #59 keeps the *compressed
+rows* plus a bounded raw tail rather than the whole raw history, on the grounds
+that the history is a recompute buffer and not state
+(`mistralrs-core/src/kv_cache/xs_rolling.rs`).
 
 The KV formula is the repo's own
 (`paged_attention/config.rs:62-70` `kv_cache_elements_per_token`, times layers
@@ -402,27 +428,37 @@ V4** — `DeepSeekV4Loader::supports_paged_attention()` returns `false` because
 head_dim=512 exceeds the kernel's supported sizes — so **every `--pa-*` flag is
 silently inert here** and the cache is contiguous, grown in 512-token chunks.
 
-**Per sequence, and the resulting cap** (65 GB usable, allocation rounded up to
-the 512-token grow granularity):
+**Per sequence, and the resulting cap** (59 GB usable, 108,288 B/token):
 
-| context C (prompt + decode) | per-seq | max B | **B=128?** |
-|---|---|---|---|
-| 320 → **512 alloc** (the S3 sweep: ~64 prompt + 256 decode) | 0.217 GB | ~299 | **YES** — uses 27.8 GB of 65 |
-| 1024 | 0.434 GB | ~149 | **YES** — 55.6 GB, tight |
-| 2048 | 0.868 GB | **~74** | **NO** — largest sweep row is **B=64** |
-| 4096 | 1.737 GB | ~37 | **NO** — largest sweep row is **B=32** |
+| context C (prompt + decode) | per-seq | max B post-#59 | max B pre-#59 | **B=256?** |
+|---|---|---|---|---|
+| 320 → **512 alloc** (the S3 sweep: ~64 prompt + 256 decode) | 0.055 GB | ~1,064 | ~271 | **YES** — 14.2 GB of 59 |
+| 1024 | 0.111 GB | ~532 | ~135 | **YES** — 28.4 GB |
+| 2048 | 0.222 GB | **~266** | ~68 | **YES** — **56.8 GB, ~2.2 GB spare** |
+| 4096 | 0.444 GB | ~133 | ~34 | **NO** — largest row is **B=128** |
 
-**So: B=128 fits and must be run at the S3 sweep's context.** Beyond roughly
-**1,150 tokens per sequence B=128 stops fitting**, and at a 2048-token context
-the largest feasible batch is ~74 — i.e. the sweep tops out at B=64 and the
-table must say *why*, not omit the row. `--max-ctx 153000` in S3 is exactly
-65 GB / 424,018 B, so the probe's KV guard warns at the real boundary.
+**So the whole sweep B ∈ {1,8,16,32,64,128,256} fits**, comfortably at the S3
+sweep's own ~320-token context and still (tightly) at a full 2048. B=256 was
+**3.9× out of reach on memory** before #59; it is the first batch large enough
+to reach the expert-amortisation regime, since `E(B) = 256·(1−(1−8/256)^B)`
+puts the 8× point at B≈256.
 
-> **Noticed:** the `xs` history cache is **3.8× the KV cache itself** and is
-> what actually caps batch size — 41 layers × full `[B,T,4096]` BF16 hidden
-> states. The reference stores 584 B/token/layer of KV where Arc stores 1,024
-> plus 8,194 of history. Halving it (fp8, or recomputing) would roughly
-> **4× the feasible batch at long context**. Worth a separate change?
+🔴 **`--max-ctx` must be updated with this section.** The guard is *"server
+KV/context budget in tokens"*, i.e. usable-bytes ÷ bytes-per-token:
+
+| | usable ÷ B/token | `--max-ctx` |
+|---|---|---|
+| pre-#59 (**stale — do not use**) | 65e9 / 424,018 | ~~153000~~ |
+| **post-#59** | 59e9 / 108,288 | **545000** |
+
+Passing the stale 153000 fires a spurious `WARNING[KV]` on the B=128 and B=256
+rows and, per S3's ABORT-IF, would get them dropped. S3 below carries 545000.
+
+> **Noticed:** with `xs` no longer dominant, **attention KV is now 81% of the
+> per-token budget** and is the next thing capping batch at long context. V4 is
+> MQA with `head_dim=512` and 43 full-cache layers; the reference stores 584
+> B/token/layer where Arc stores 1,024. FP8 KV would roughly double feasible B
+> again. Worth a separate change?
 
 ---
 
