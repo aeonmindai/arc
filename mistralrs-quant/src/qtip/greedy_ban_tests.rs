@@ -80,7 +80,11 @@ const CB_NONE: usize = 0;
 /// multiplier byte as a search stamp the moment anyone set it. (It did. That is
 /// why this function exists rather than the constant.)
 fn production_codebook_section_len() -> usize {
-    codebook_section_len(QtipBakeConfig::get().expect("bake config must parse").codebook)
+    codebook_section_len(
+        QtipBakeConfig::get()
+            .expect("bake config must parse")
+            .codebook,
+    )
 }
 
 /// Deterministic Gaussian-ish fixture (splitmix64 + Box-Muller), so no test in
