@@ -477,6 +477,95 @@ __global__ void qtip_quantize_rows_viterbi_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Least-squares scale refinement kernel.
+// ---------------------------------------------------------------------------
+//
+// After Viterbi/Greedy picks the optimal state sequence, the heuristic scale
+// (max|row|/3) is suboptimal.  The MSE-optimal scale for a fixed state
+// sequence is:
+//
+//   s* = dot(w_rotated, lut_values) / dot(lut_values, lut_values)
+//
+// where lut_values[i] = lut[state_for_i].  This kernel replays the trellis
+// from the packed symbols, reconstructs the unscaled LUT values, and
+// computes the two dot products in one pass via parallel reduction.
+//
+// One CUDA block per row, SCALE_THREADS threads.
+
+template <bool COMPUTED_CB>
+__global__ void qtip_refine_scales_kernel(
+    const float*   __restrict__ weight,      // [n_rows, in_features] rotated
+    const uint8_t* __restrict__ packed,       // [n_rows, num_symbols / 2]
+    const float*   __restrict__ lut,          // [LUT_SIZE * V] (unused if computed)
+    float*         __restrict__ row_scales,   // [n_rows] — updated in-place
+    int in_features,
+    int num_symbols,
+    unsigned int cb_mult
+) {
+    __shared__ float s_dot_wl[SCALE_THREADS];
+    __shared__ float s_dot_ll[SCALE_THREADS];
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    const float*   my_row = weight + (size_t)row * in_features;
+    const uint8_t* my_pkd = packed + (size_t)row * (num_symbols / 2);
+
+    // Each thread accumulates partial sums over its strided slice of symbols.
+    float dot_wl = 0.0f;
+    float dot_ll = 0.0f;
+
+    // Replay the trellis to recover states.  The trellis is sequential
+    // (state_t depends on state_{t-1}), but we only need the LUT values
+    // which are determined by the state AFTER each symbol.  We can replay
+    // serially on thread 0 and broadcast, but that serialises the row.
+    //
+    // Better: each thread independently replays ALL symbols (cheap — just
+    // shift+mask per symbol) but only accumulates its own strided portion.
+    // The replay is identical across threads (deterministic), so this is
+    // correct and fully parallel for the dot products.
+
+    uint32_t state = 0u;
+    for (int t = 0; t < num_symbols; ++t) {
+        // Unpack symbol.
+        uint8_t byte = my_pkd[t / 2];
+        uint32_t sym = ((t & 1) == 0) ? (byte & 0x0Fu) : (byte >> 4);
+
+        state = ((state << QTIP_K) | sym) & QTIP_STATE_MASK;
+
+        // Only accumulate for this thread's slice.
+        if ((t % SCALE_THREADS) == tid) {
+            const float2 c = qtip_cb_value<COMPUTED_CB>(lut, state, cb_mult);
+            float l0 = c.x;
+            float l1 = c.y;
+            float w0 = my_row[t * 2 + 0];
+            float w1 = my_row[t * 2 + 1];
+            dot_wl += w0 * l0 + w1 * l1;
+            dot_ll += l0 * l0 + l1 * l1;
+        }
+    }
+
+    s_dot_wl[tid] = dot_wl;
+    s_dot_ll[tid] = dot_ll;
+    __syncthreads();
+
+    // Tree reduction.
+    for (int stride = SCALE_THREADS / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_dot_wl[tid] += s_dot_wl[tid + stride];
+            s_dot_ll[tid] += s_dot_ll[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float denom = s_dot_ll[0];
+        float s = (denom > 0.0f) ? (s_dot_wl[0] / denom) : row_scales[row];
+        row_scales[row] = s;
+    }
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -603,96 +692,8 @@ void launch_qtip_quantize_rows_viterbi_f32(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Least-squares scale refinement kernel.
-// ---------------------------------------------------------------------------
-//
-// After Viterbi/Greedy picks the optimal state sequence, the heuristic scale
-// (max|row|/3) is suboptimal.  The MSE-optimal scale for a fixed state
-// sequence is:
-//
-//   s* = dot(w_rotated, lut_values) / dot(lut_values, lut_values)
-//
-// where lut_values[i] = lut[state_for_i].  This kernel replays the trellis
-// from the packed symbols, reconstructs the unscaled LUT values, and
-// computes the two dot products in one pass via parallel reduction.
-//
-// One CUDA block per row, SCALE_THREADS threads.
-
-template <bool COMPUTED_CB>
-__global__ void qtip_refine_scales_kernel(
-    const float*   __restrict__ weight,      // [n_rows, in_features] rotated
-    const uint8_t* __restrict__ packed,       // [n_rows, num_symbols / 2]
-    const float*   __restrict__ lut,          // [LUT_SIZE * V] (unused if computed)
-    float*         __restrict__ row_scales,   // [n_rows] — updated in-place
-    int in_features,
-    int num_symbols,
-    unsigned int cb_mult
-) {
-    __shared__ float s_dot_wl[SCALE_THREADS];
-    __shared__ float s_dot_ll[SCALE_THREADS];
-
-    int row = blockIdx.x;
-    int tid = threadIdx.x;
-
-    const float*   my_row = weight + (size_t)row * in_features;
-    const uint8_t* my_pkd = packed + (size_t)row * (num_symbols / 2);
-
-    // Each thread accumulates partial sums over its strided slice of symbols.
-    float dot_wl = 0.0f;
-    float dot_ll = 0.0f;
-
-    // Replay the trellis to recover states.  The trellis is sequential
-    // (state_t depends on state_{t-1}), but we only need the LUT values
-    // which are determined by the state AFTER each symbol.  We can replay
-    // serially on thread 0 and broadcast, but that serialises the row.
-    //
-    // Better: each thread independently replays ALL symbols (cheap — just
-    // shift+mask per symbol) but only accumulates its own strided portion.
-    // The replay is identical across threads (deterministic), so this is
-    // correct and fully parallel for the dot products.
-
-    uint32_t state = 0u;
-    for (int t = 0; t < num_symbols; ++t) {
-        // Unpack symbol.
-        uint8_t byte = my_pkd[t / 2];
-        uint32_t sym = ((t & 1) == 0) ? (byte & 0x0Fu) : (byte >> 4);
-
-        state = ((state << QTIP_K) | sym) & QTIP_STATE_MASK;
-
-        // Only accumulate for this thread's slice.
-        if ((t % SCALE_THREADS) == tid) {
-            const float2 c = qtip_cb_value<COMPUTED_CB>(lut, state, cb_mult);
-            float l0 = c.x;
-            float l1 = c.y;
-            float w0 = my_row[t * 2 + 0];
-            float w1 = my_row[t * 2 + 1];
-            dot_wl += w0 * l0 + w1 * l1;
-            dot_ll += l0 * l0 + l1 * l1;
-        }
-    }
-
-    s_dot_wl[tid] = dot_wl;
-    s_dot_ll[tid] = dot_ll;
-    __syncthreads();
-
-    // Tree reduction.
-    for (int stride = SCALE_THREADS / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            s_dot_wl[tid] += s_dot_wl[tid + stride];
-            s_dot_ll[tid] += s_dot_ll[tid + stride];
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0) {
-        float denom = s_dot_ll[0];
-        float s = (denom > 0.0f) ? (s_dot_wl[0] / denom) : row_scales[row];
-        row_scales[row] = s;
-    }
-}
-
-// ----- Scale refinement launch -----------------------------------------------
+// ----- Scale refinement launch (kernel is in the anonymous namespace above:
+// a template cannot have C linkage, so only the launcher lives here) --------
 
 void launch_qtip_refine_scales_f32(
     const float*   d_weight,
