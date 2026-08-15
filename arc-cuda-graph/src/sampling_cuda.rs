@@ -32,9 +32,6 @@ use crate::sampling_cpu::{apply_penalties, apply_temperature, greedy_argmax, Sam
 #[cfg(feature = "cuda")]
 use candle_core::{cuda::cudarc::driver::sys::CUstream, DType, Device, Tensor};
 
-#[cfg(feature = "cuda")]
-use candle_core::cuda::cudarc::driver::DevicePtr;
-
 /// POD passed to the CUDA kernel. Field layout MUST match
 /// `arc_sampler::SamplingParams` in `cuda/sampling_kernel.cu`.
 #[repr(C)]
@@ -214,19 +211,17 @@ extern "C" {
     );
 }
 
+/// Raw device pointer for a CUDA tensor, byte-offset aware.
+///
+/// `as_cuda_slice::<T>()` type-checks `T` against the storage dtype, so the
+/// type argument has to follow `t.dtype()`. This used to hardcode `::<u8>()`
+/// and therefore failed on every F32/BF16/U32 tensor with
+/// `unexpected dtype, expected: U8, got: F32`, which took out the whole fused
+/// GPU sampler. `weights::tensor_device_ptr` already dispatches correctly.
 #[cfg(feature = "cuda")]
 fn cuda_tensor_ptr(t: &Tensor) -> candle_core::Result<usize> {
     let t = t.contiguous()?;
-    let (storage, layout) = t.storage_and_layout();
-    match &*storage {
-        candle_core::Storage::Cuda(cuda_storage) => {
-            let slice = cuda_storage.as_cuda_slice::<u8>()?;
-            let (ptr, _guard) = slice.device_ptr(slice.stream());
-            let offset = layout.start_offset() * t.dtype().size_in_bytes();
-            Ok(ptr as usize + offset)
-        }
-        _ => candle_core::bail!("cuda_tensor_ptr requires CUDA tensor"),
-    }
+    Ok(crate::weights::tensor_device_ptr(&t)? as usize)
 }
 
 #[cfg(feature = "cuda")]

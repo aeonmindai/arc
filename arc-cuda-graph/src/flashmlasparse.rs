@@ -178,25 +178,24 @@ pub use cuda_impl::*;
 mod cuda_impl {
     use super::*;
     use candle_core::cuda::cudarc::driver::sys::CUstream;
-    use candle_core::cuda::cudarc::driver::DevicePtr;
     use std::ffi::c_void;
 
     /// Convert a CUDA Candle tensor into a raw device pointer (byte-offset
-    /// aware). Matches the helper used elsewhere in this crate
-    /// (`sampling_cuda::cuda_tensor_ptr`). Returns the pointer as `usize` so
-    /// callers can cast freely.
+    /// aware). Returns the pointer as `usize` so callers can cast freely.
+    ///
+    /// `CudaStorage::as_cuda_slice::<T>()` type-checks `T` against the
+    /// storage's dtype and errors otherwise, so the type argument MUST be
+    /// dispatched on `t.dtype()`. This helper used to hardcode `::<u8>()`,
+    /// which made **every** call on a non-U8 tensor fail with
+    /// `unexpected dtype, expected: U8, got: F32` — silently disabling the
+    /// whole GPU radix top-k sampler path (`mistralrs-core/src/sampler.rs`
+    /// logged `GPU radix top-k sampling failed; falling back to CPU` on
+    /// every request) and the V4 Lightning Indexer's fused CUDA kernel.
+    /// `weights::tensor_device_ptr` already does the dtype dispatch
+    /// correctly, so delegate rather than keep a third copy.
     fn cuda_tensor_ptr(t: &Tensor) -> Result<usize> {
         let t = t.contiguous()?;
-        let (storage, layout) = t.storage_and_layout();
-        match &*storage {
-            candle_core::Storage::Cuda(cuda_storage) => {
-                let slice = cuda_storage.as_cuda_slice::<u8>()?;
-                let (ptr, _guard) = slice.device_ptr(slice.stream());
-                let offset = layout.start_offset() * t.dtype().size_in_bytes();
-                Ok(ptr as usize + offset)
-            }
-            _ => candle_core::bail!("cuda_tensor_ptr requires CUDA tensor"),
-        }
+        Ok(crate::weights::tensor_device_ptr(&t)? as usize)
     }
 
     fn cuda_stream(device: &Device) -> Result<CUstream> {
@@ -832,5 +831,43 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), topk, "top-k must produce distinct indices");
+    }
+
+    // -- CUDA regression (compile-gated; run on the GPU session) -------------
+
+    /// `radix_topk_rows_f32` must accept an **F32** scores tensor.
+    ///
+    /// Regression for the `cuda_tensor_ptr` dtype bug: the helper called
+    /// `as_cuda_slice::<u8>()` unconditionally, so every call on a non-U8
+    /// tensor returned `unexpected dtype, expected: U8, got: F32`. That made
+    /// the big-vocab GPU sampler path in `mistralrs-core/src/sampler.rs`
+    /// (`sample_fast_topk_gpu`) fail 100% of the time — the H200 session
+    /// logged `GPU radix top-k sampling failed; falling back to CPU:
+    /// unexpected dtype, expected: U8, got: F32` on startup.
+    ///
+    /// Without the fix this test fails at the `?` on `radix_topk_rows_f32`.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn radix_topk_rows_f32_accepts_f32_scores() -> Result<()> {
+        use candle_core::Device;
+
+        let Ok(cuda) = Device::new_cuda(0) else {
+            // No GPU on this host: nothing to assert.
+            return Ok(());
+        };
+        let len = 4096usize;
+        let topk = 64usize;
+        // Strictly decreasing scores => the top-k set is exactly {0..topk}.
+        let scores: Vec<f32> = (0..len).map(|i| -(i as f32)).collect();
+        let scores = Tensor::from_vec(scores, (1, len), &cuda)?;
+
+        let idx = radix_topk_rows_f32(&scores, topk)?;
+        assert_eq!(idx.dims(), &[1, topk]);
+
+        let mut got: Vec<u32> = idx.reshape((topk,))?.to_vec1()?;
+        got.sort_unstable();
+        let want: Vec<u32> = (0..topk as u32).collect();
+        assert_eq!(got, want, "radix top-k must select the largest `topk` rows");
+        Ok(())
     }
 }
