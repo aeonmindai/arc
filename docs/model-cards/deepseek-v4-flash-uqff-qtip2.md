@@ -227,7 +227,7 @@ Every number on this card, with how it was obtained.
 | Tensors restored | 517 | Load log, A100, 2026-08-15 |
 | Load time | 12.94 s | Measured on the same A100 that baked it, 2026-08-15 |
 | Resident on load | 75.7 GB of 80 GB | Measured, A100, 2026-08-15 |
-| Bits/param | ≈ 1.9 | 74.18 GB over 284 B params |
+| Bits/param | ≈ 1.9 | 74.19 GB over 284 B params |
 | Bake config | beam W=256 / hadamard-128 / mse | Bake header string, read off the box |
 | Bake cost | 43 layers @ 370–376 s/layer on a \$1.49/hr A100, completed 04:44:51Z 2026-08-15 | Differenced consecutive layer markers (never a running average) |
 | Indexer shape mismatch | expected `[256,512]`, got `[256,4096]`, every CSA layer | Load log, this artifact |

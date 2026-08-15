@@ -169,7 +169,9 @@ impl V4Indexer {
         device: &Device,
         loading_isq: bool,
     ) -> Result<Self> {
-        let _ = device;
+        // `loading_isq` is accepted for signature parity with the other layer
+        // constructors; the indexer's tensors are unquantized in the reference
+        // and `ReplicatedLayer::new` already honours `cfg.quantization_config`.
         let _ = loading_isq;
         let n_heads = cfg.index_n_heads;
         let head_dim = cfg.index_head_dim;
