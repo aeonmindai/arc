@@ -232,6 +232,64 @@ CPU cost on hardware, unproduced.
   quantizers" table is third-party bake rates already graded **[published]**,
   with "no incumbent to catch" stated plainly. Correct as-is.
 
+## Repo-wide sweep for other competitor / superiority claims
+
+Nine more found beyond the two in the brief. Fixed:
+
+| # | site | defect | fix |
+|---|---|---|---|
+| A1 | `README.md:36` | "AA-AgentPerf-style benchmark suite … **side-by-side vs SGLang/vLLM**" advertised as a shipped feature. Harness *can* target them (`arc-bench/src/lib.rs:10`) but **no run ever happened** — direct contradiction with the PEAK_INFERENCE retraction | reworded to "supported, but **we have not run one**" |
+| B1 | `README.md:22` | "the **most aggressive open compression stack in production**" — superlative over every other open engine, in the repo's headline sentence, with nothing anywhere inspecting another engine's stack | → "composing published compression research end-to-end" |
+| A7 | `README.md:32` | TD-MoE **"Lossless 20%"** — a third-party paper's headline number presented as an Arc feature, unattributed | attributed as the paper's (NeurIPS'25), *published, not reproduced by us* |
+| B9 | `README.md:193` | Roadmap "Benchmark **wins** on GSM8K + HumanEval" — a future result stated as a deliverable | → an open question / hypothesis, not a scheduled result |
+| A2/B3 | `QUANTIZATION_PERFORMANCE.md:401-404` | QTIP's **~14 min/layer on an A100** set against "our ~4 min/layer on a 25× larger model" — cross-card, cross-model, no shared benchmark — then "advancing the **state of the art**" | states plainly the two **cannot be divided**; quoting a ratio would be the same fabricated head-to-head banned elsewhere. Consequence narrowed to: no external number to tune against, so targets come from our own roofline |
+| B2/A3 | `QUANTIZATION_PERFORMANCE.md:389-391` | "There is **no incumbent to catch**", under heading "Where Arc sits **against** other trellis quantizers", with Arc's bolded row in the same column as EXL3's — reads as a leaderboard even though each cell is graded `[published]` | heading → "What other trellis quantizers **report about themselves**"; explicit "**not a leaderboard, rows are not comparable**" preamble |
+| B5 | `OPEN_QUESTIONS.md:42-44` | "**No literature covers this trade**" + "the **only** prior art" labeled `[published survey]` — but `wave20-AQ` is *our own agent log*, not a published survey. Two universal claims about a field, self-sourced | relabeled "survey **by us** … *not* a published survey; **absence of evidence, not evidence of absence**", claims narrowed to "we found" |
+| A4 | `OPEN_QUESTIONS.md:261` | "**64×** the indexer key memory" vs "a comparable implementation" — unnamed third party, unlabeled | named (SGLang's V4 impl) and graded `[source-verified …, not benchmarked]` with the audit line cite that already existed |
+| B6 | `QUANTIZATION_PERFORMANCE.md:295`, `OPEN_QUESTIONS.md:132` | "**Nobody** has priced that half" — means *we* have not, but written as a claim about the field | → "**we** have not priced" |
+
+### 🔴 The sweep also caught my own new PEAK_INFERENCE text — and was right
+
+Two defects in the replacement I had just written for the fabricated table:
+
+1. It landed on a **universal negative** — "no single-GPU baseline on **any**
+   engine … for **anyone else**" — derived from a handful of unnamed model
+   cards. Rewritten as a scoped table of *what we actually checked and what it
+   said*, graded `[published … survey by us, not exhaustive]`, with the claim
+   restated as "we searched and found no published single-GPU configuration",
+   explicitly **absence of evidence, not evidence of absence**.
+2. It argued for the footprint claim partly *because* "unlike a number it
+   cannot be refuted by rerunning it" — i.e. recommending a claim on grounds of
+   **unfalsifiability**, which inverts D9. Deleted. Replaced with what *would*
+   refute it (anyone producing a single-GPU config for this model) and the
+   principle that a claim worth publishing states what would falsify it.
+
+This is the failure mode the whole PR is about, reproduced inside the fix for
+it, and it is why the sweep was run by a second pair of eyes rather than by the
+agent that wrote the text.
+
+### Found, deliberately NOT fixed — upstream-inherited, out of fork scope
+
+- `docs/UQFF.md:4` — *"The uniquely powerful quantized file format."*
+- `docs/QUANTS.md:7` — *"Automatic selection to use the **fastest and most
+  accurate** method."*
+
+Both are upstream mistral.rs marketing prose describing upstream features, not
+Arc claims or competitor comparisons. Per fork policy (do not churn upstream
+files) they are reported, not edited. Worth a decision if Arc is going to own
+these pages at publish time.
+
+### Checked and clean
+
+`BENCHMARKS.md` (the 90.8 handling and the "no 'beats q2k' claim yet" are model
+honesty), `FLEET.md` (all rows tagged; "~8× node aggregate vs 1×TP8" compares
+against *our own* BF16 arithmetic and is marked Projected), `RELEASE_NOTES_v2.0.md`,
+`HARDWARE_LESSONS.md`, `TESTING_DISCIPLINE.md`, `v4-reference-audit.md` (SGLang
+refs are source-path citations for a correctness audit; `:1067` actively
+*refuses* comparison to published V4 acceptance numbers), `PAGED_ATTENTION.md:106`
+(attribution, no number), `IMATRIX.md` (llama.cpp interop), and the model/CLI/MCP
+reference docs.
+
 ## PR-base trap → BACKLOG
 
 Landed in `memory/mission/BACKLOG.md` under a new **🔴 CI/PR TRAPS** heading at

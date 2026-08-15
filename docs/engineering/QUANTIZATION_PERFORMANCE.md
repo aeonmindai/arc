@@ -292,7 +292,7 @@ attributed]. For context, the tuned GEMV path runs at 450–467 GB/s = 9.4–9.7
 a 4.8 TB/s peak, up 2.3× from a pre-tuning 153–192 GB/s [measured].
 
 So the same change that makes the bake ~1.68× faster also attacks the named
-inference bottleneck. **Nobody has priced that half.** It is not a one-line swap:
+inference bottleneck. **We have not priced that half.** It is not a one-line swap:
 it needs the CPU quantizer, four decode kernels, a UQFF codebook discriminator so
 old artifacts stay readable, and parity across all of it. The `K=2 / V=1` rung
 already does exactly this and has 20/20 CUDA parity on hardware, so it is a port
@@ -386,9 +386,15 @@ Two further measured negatives worth keeping:
   bit costs **4.76 passes, not 3.87**, because misaligning the digit boundaries
   costs more than the skipped pass saves.
 
-## Where Arc sits against other trellis quantizers
+## What other trellis quantizers report about themselves
 
-There is no incumbent to catch. Per-parameter bake rates:
+**This table is not a leaderboard and the rows are not comparable.** Every
+third-party figure is that project's own published number, measured on *their*
+hardware, *their* model, and *their* protocol — different cards, different model
+sizes, different layer definitions. We have run none of them. Read the column as
+"what each project reports about itself", never as a ranking.
+
+Per-parameter bake rates:
 
 | method | model | wall time | rate | grade |
 |---|---|---|---|---|
@@ -399,9 +405,17 @@ There is no incumbent to catch. Per-parameter bake rates:
 | **Arc** | 284 B MoE, 43 layers | 2.9 h on H200 | **~27 M param/s** | [measured + derived] |
 
 **EXL3 publishes no per-layer number**; the one clean third-party trellis figure
-is QTIP at ~14 min/layer on an A100, against our ~4 min/layer on a 25× larger
-model. Whatever Arc lands becomes the reference number, so bake-speed work here
-should be framed as advancing the state of the art, not as catching up.
+is QTIP at ~14 min/layer on an A100. Our ~4 min/layer is on an **H200** and on a
+**25× larger** model, so the two numbers **cannot be divided** — different
+silicon, different model, no shared benchmark. Quoting a ratio between them
+would be exactly the fabricated head-to-head this program has banned elsewhere;
+the honest statement is that no directly comparable third-party per-layer figure
+exists.
+
+The practical consequence for planning is narrower than a superiority claim:
+there is no external number to tune against, so **bake-speed targets have to come
+from our own instruction-count and roofline floors** (above), not from a
+competitor's published rate.
 
 ## What is settled, and what is next
 

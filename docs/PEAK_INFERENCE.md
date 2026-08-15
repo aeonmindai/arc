@@ -55,18 +55,29 @@ Two separate defects were in that one line:
    here and must not be quoted as this baseline.
 
 **Why no competitor row can be reconstructed for the flagship model.** For
-DeepSeek V4 Flash there is **no single-GPU baseline on any engine, because the
-model does not fit on one card for anyone else**: the native checkpoint is
-≈160 GB, the smallest published serving config is **4×H200**, the only W4A16
-quantization is 143 GB and its own model card states *"TP=1 OOMs on a single
-141 GB H200"*, and NVFP4 is Blackwell-only. Arc's ~68 GB artifact (≈1.9
-bits/param) is what makes 1×H200 possible at all. **[published, third-party
-model cards and configs]**
+DeepSeek V4 Flash, **every published serving configuration we have been able to
+find needs more than one GPU.** What we actually checked, and what it said
+**[published — third-party model cards and configs; survey by us, not
+exhaustive]**:
 
-The honest comparison is therefore **footprint — one GPU against a published
-four — plus $/Mtok per node**, not a head-to-head we cannot run. "Nobody else
-fits this model on one card" is a stronger claim than a number we cannot
-produce, and unlike a number it cannot be refuted by rerunning it.
+| what we checked | what it says |
+|---|---|
+| the native checkpoint | ≈160 GB — larger than a 141 GB H200 |
+| smallest published serving config | **4×H200** |
+| the one W4A16 quantization we found | 143 GB; its own model card states *"TP=1 OOMs on a single 141 GB H200"* |
+| NVFP4 | Blackwell-only, so not an H200 option |
+
+Arc's ~68 GB artifact (≈1.9 bits/param) is what makes 1×H200 possible for us.
+
+**Scope this claim honestly.** It is "we searched and found no published
+single-GPU configuration", not "none exists" — absence of evidence, not evidence
+of absence. It would be **refuted** by anyone producing a single-GPU config for
+this model, and that is the right way to state it: a claim worth publishing is
+one that says what would falsify it.
+
+The comparison we *can* defend is therefore **footprint — one GPU against a
+published four — plus $/Mtok per node**, and not a tok/s head-to-head, which we
+have never run against any engine.
 
 **Sanity-check against a roofline instead of a competitor.** For V4 Flash on
 H200: 68 GB ÷ 4.8 TB/s = 14.2 ms/step ⇒ **~4,500 tok/s at B=64** **[derived]**,

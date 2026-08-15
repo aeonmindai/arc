@@ -39,9 +39,11 @@ a hexagonal packing covers space better than a square grid ("granular gain"), an
 the advantage grows with dimension. One code over 4 weights sits closer to the
 rate-distortion bound than one over 2. **Theory only; must be measured.** The
 counter-consideration is that trellis memory `L / kV` drops from 4 symbols to 2,
-and shallower memory hurts. **No literature covers this trade at `L = 16`**
-[published survey, `wave20-AQ`] — classical trellis-coded quantization tops out at
-256 states, and the only prior art above ~1,000 states is QTIP itself.
+and shallower memory hurts. **Our literature search found nothing covering this
+trade at `L = 16`** [survey by us, `wave20-AQ` — an internal agent log, *not* a
+published survey; absence of evidence, not evidence of absence] — the classical
+trellis-coded quantization we found tops out at 256 states, and the only prior
+art we located above ~1,000 states is QTIP itself.
 
 **What it touches — this is why it is a project, not a flag:**
 
@@ -127,7 +129,7 @@ These are cheap, decided, and blocked only on someone doing them.
 | # | item | why it matters | cost to settle |
 |---|---|---|---|
 | 1 | **Speed of the quality-neutral `sum2` codebook** | The last unmeasured number on the bake path. The measured 1.81× belongs to a *quality-negative* variant; the shippable one is projected at ~1.68×. | One binary, three settings, **~10 min of A30 time** |
-| 2 | **Port the computed codebook to the decode side** | The 512 KiB LUT gather is the *named* inference bottleneck (~388 GB/s ≈ 8 % of HBM). The same change pays twice, and **nobody has priced the inference half.** | A port of a pattern already proven at `K=2 / V=1` with 20/20 CUDA parity |
+| 2 | **Port the computed codebook to the decode side** | The 512 KiB LUT gather is the *named* inference bottleneck (~388 GB/s ≈ 8 % of HBM). The same change pays twice, and **we have not priced the inference half.** | A port of a pattern already proven at `K=2 / V=1` with 20/20 CUDA parity |
 | 3 | **Decompose the ~13.5 s/layer "other host" bucket** | It is 5.6 % today and becomes 28 % after any 2× kernel win. Never decomposed. | Instrumentation only; zero GPU time |
 | 4 | **Profiler stall attribution (`ncu`)** | Which of barriers / shared-memory atomics / scattered L2 dominates the beam kernel's stalls is still **inferred**, never measured. It decides what to attack next if anyone reopens the kernel. | One profiled launch |
 | 5 | **What PR #40's kernel stack is actually worth on the shipped build** | The published 1.21× was measured under **nvcc 11.5**, whose register-starved baseline gave the change *more* headroom than production has. It is an **upper bound (≤1.21×)**, never a measurement of the shipped build. The stack's three parts were also never separated, so any one of them may be a no-op. | **Zero rental** — build the existing bake box at the merge's first parent and time one layer against the 373.6 s/layer it already measures with the stack in. Staged; **not run** |
@@ -258,9 +260,10 @@ scheduled.
   not parse. Anything trusting that block uniformly mis-reads **11,008 of 69,187
   tensors**. The current code is right by hardcoded assumption, not by reading
   configuration. That is a correctness risk the moment a second model arrives.
-- **Sparse-attention indexer memory.** Arc's indexer key tensor is per-head where a
-  comparable implementation uses a single shared head, costing roughly **64×** the
-  indexer key memory and compute. It bites exactly when the sparse path goes live —
+- **Sparse-attention indexer memory.** Arc's indexer key tensor is per-head where
+  SGLang's V4 implementation uses a single shared head, costing roughly **64×**
+  the indexer key memory and compute [source-verified against SGLang's source,
+  not benchmarked — see `docs/notes/v4-reference-audit.md:1354`]. It bites exactly when the sparse path goes live —
   which is the feature that motivates this model class.
 - **Silent, math-changing environment variables.** Several env-gated overrides can
   alter numerical behaviour and **nothing records whether they were set during a
