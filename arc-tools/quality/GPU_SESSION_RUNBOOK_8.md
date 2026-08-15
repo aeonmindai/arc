@@ -15,16 +15,54 @@ roughly B=24 at any useful context and makes the headline row unreachable.
 
 **Prerequisite:** the UQFF is **published** to HF
 `aeonmind/DeepSeek-V4-Flash-UQFF-qtip2` (HF org is `aeonmind`; the GitHub org
-is `aeonmindai` — they differ). This session **pulls the 68 GB artifact and
-loads it in ~11 s**. There is **no bake and no 149 GB source download.** If the
-artifact is not published, this session does not start — run session 6/7 first.
+is `aeonmindai` — they differ). If the artifact is not published, this session
+does not start — run session 6/7 first.
 
-Estimated clean run: **≈ 2:05 for ≈ $10.3.**
+> 🔴 **THE ARTIFACT IS AN OVERLAY. YOU NEED THE SOURCE CHECKPOINT TOO.**
+> An earlier revision of this runbook said "no bake and **no 149 GB source
+> download**". **That was wrong and it cost a session.** The UQFF repo ships a
+> `config.json` and a tokenizer, which makes it look standalone; it is not. Its
+> only non-quantized weight file, `residual.safetensors`, is 1.29 GB — 1.7% of
+> the repo. Arc **builds the model from the source checkpoint and overlays the
+> quantized layers from the shards.**
+>
+> Confirmed in code, not from memory: with `--from-uqff` set, `normal.rs:679-687`
+> loads the ISQ layers by deserialization and leaves the base expert weights as
+> `DummyLayer` placeholders — but the **non-ISQ** weights (embeddings, norms,
+> lm_head, compressor) still come through the source VarBuilder. So the source
+> tree must be on disk. The expert bulk is *not* read from it, which is why this
+> is still not a bake.
+>
+> **Two downloads, both required** (sizes read from the HF API, 2026-08-15):
+> | repo | bytes | note |
+> |---|---:|---|
+> | `aeonmind/DeepSeek-V4-Flash-UQFF-qtip2` | 74.19 GB | 8 shards + `residual.safetensors` — **all 9 or it fails** |
+> | `deepseek-ai/DeepSeek-V4-Flash` | 159.63 GB | public, ungated; the overlay base |
+> | **total** | **233.8 GB** | budget disk ≥ 400 GB |
+>
+> Downloading the source **as the overlay base is expected and correct**. What
+> RULE ZERO forbids is downloading it in order to *re-quantize*.
+
+Estimated clean run: **≈ 2:17 for ≈ $11.2.** (Up from the old ≈2:05/$10.3, which
+omitted the 159.63 GB source pull and assumed a warm-cache load time.)
 
 ---
 
 ## 0. Standing rules that apply before anything else
 
+- 🔴 **RULE ZERO — IF THE ARTIFACT DOES NOT LOAD, STOP. DELETE THE BOX.
+  REPORT.** Do not bake. Do not quantize. Do not re-derive the artifact by any
+  route. **There is no fallback path any agent is authorized to invent.** A
+  clean "it failed, here is the exact error and the exact command" is a GOOD
+  outcome and costs ~$2 instead of ~$15.
+  *This rule exists because a session improvised exactly that fallback: unable
+  to load the artifact, it downloaded the source checkpoint and ran a full
+  in-memory quantization on a $4.85/hr H200, burning ~$10 to produce nothing.*
+- 🔴 **PREFLIGHT ON THE LAPTOP, BEFORE RENTING.** Every check that does not
+  need a GPU is free and must happen first — HF token identity, repo
+  reachability, artifact completeness, and **that the GPU provider session is
+  actually authenticated** (`runcrate ps`). A session that discovers a broken
+  login *after* renting has paid for the discovery. See §10.
 - **NEVER DEBUG ON A PAID BOX.** Any ABORT-IF below means: harvest, then
   decide hold-vs-delete on the arithmetic in §8. Diagnosis happens on a laptop
   where compute is free.
@@ -48,14 +86,15 @@ $4.92/hr = **$0.082/min**. Cumulative from *instance creation*.
 
 | # | Step | Wall | Cum | $ step | Cum $ |
 |---|---|---|---|---|---|
-| S0 | **Box health gate — before the 68 GB pull** | 4m | 0:04 | 0.33 | **0.33** |
-| S1 | Build (binary cache hit) ∥ pull 68 GB UQFF from HF | 20m | 0:24 | 1.64 | 1.97 |
-| S2 | Serve + load gate (~11 s load) + **concurrency self-test** | 8m | 0:32 | 0.66 | 2.63 |
-| S3 | **Speed sweep B ∈ {1,8,16,32,64,128}** — THE deliverable | 25m | 0:57 | 2.05 | 4.68 |
-| S4 | Sustained-mode confirmation at the two best B | 10m | 1:07 | 0.82 | 5.50 |
-| S5 | **GSM8K n=100, 0-shot, 2048-cap, seed 161** | 40m | 1:47 | 3.28 | 8.78 |
-| S6 | coherence6 + facts/math | 8m | 1:55 | 0.66 | 9.44 |
-| S7 | Tar + **teardown (NEVER CUT)** | 10m | 2:05 | 0.82 | **10.26** |
+| P | **Preflight on the laptop (§10) — FREE, before renting** | — | — | **0.00** | **0.00** |
+| S0 | **Box health gate — before the 234 GB pull** | 4m | 0:04 | 0.33 | **0.33** |
+| S1 | Build ∥ pull **234 GB** (74 overlay + 160 source) from HF | 30m | 0:34 | 2.46 | 2.79 |
+| S2 | Serve + load gate (**~3 min cold**) + **concurrency self-test** | 10m | 0:44 | 0.82 | 3.61 |
+| S3 | **Speed sweep B ∈ {1,8,16,32,64,128}** — THE deliverable | 25m | 1:09 | 2.05 | 5.66 |
+| S4 | Sustained-mode confirmation at the two best B | 10m | 1:19 | 0.82 | 6.48 |
+| S5 | **GSM8K n=100, 0-shot, 2048-cap, seed 161** | 40m | 1:59 | 3.28 | 9.76 |
+| S6 | coherence6 + facts/math | 8m | 2:07 | 0.66 | 10.42 |
+| S7 | Tar + **teardown (NEVER CUT)** | 10m | 2:17 | 0.82 | **11.24** |
 
 S5 is the long pole and is **independent of S3/S4** — if the session must be
 cut short, S3+S4 (the thing that has never been measured) is what survives, and
@@ -98,26 +137,85 @@ cargo build --release -p mistralrs-cli --features "cuda flash-attn"
 # NOTE: do NOT add the `cudnn` feature. Measured -62% decode on V4
 # (5.45 vs 14.58 tok/s, session 4).
 
-# B: the artifact — 68 GB, NOT the 149 GB source
+# B: the overlay — 74 GB (private; needs the token)
 huggingface-cli download aeonmind/DeepSeek-V4-Flash-UQFF-qtip2 \
   --local-dir /workspace/uqff --max-workers 16
+
+# C: the overlay BASE — 160 GB. REQUIRED. See the prerequisite box above.
+huggingface-cli download deepseek-ai/DeepSeek-V4-Flash \
+  --local-dir /workspace/src --max-workers 16
 ```
+
+Token: upload `/Users/jish/.config/arc/env`'s `HF_TOKEN` to the box as
+`/root/.hf_token` with `file_upload`, `chmod 600`, and `export
+HF_TOKEN=$(cat /root/.hf_token)`. **Never echo it.** The overlay repo is
+private; the source repo is public and ungated.
 
 > **ABORT-IF** the HF download 404s or resolves to a repo under `aeonmindai`
 > (GitHub org) rather than `aeonmind` (HF org) — the artifact is not published;
 > this session cannot run. Delete the box; it is $2 spent, not $10.
-> **ABORT-IF** the download sustains < 200 MB/s for 5 min — 68 GB will not land
+> **ABORT-IF** the download sustains < 200 MB/s for 5 min — 234 GB will not land
 > inside the budget. Delete and re-rent in another region.
+> **ABORT-IF** either download is incomplete. Verify **before** serving —
+> the failure mode downstream is the misleading `DummyLayer` error, not a
+> "missing file" message:
+> ```bash
+> ls /workspace/uqff/qtip2-*.uqff | wc -l   # must be 8
+> ls -l /workspace/uqff/residual.safetensors # must exist, 1,293,806,700 B
+> ls /workspace/src/model-*.safetensors | wc -l  # must be 46
+> ```
 
 ### S2 — Serve, load gate, and the concurrency self-test (8 min)
 
+🔴 **The invocation below is the one VERIFIED on hardware** (517 tensors,
+12.94 s load). The previous revision of this runbook printed
+`serve --from-uqff /workspace/uqff` with **no `-m`, no `-a`, and a directory
+where a file belongs** — three independent errors, each of which alone produces
+the `DummyLayer` error in §"the one error you are most likely to hit". Do not
+re-derive this command; copy it.
+
 ```bash
 /root/arc/target/release/mistralrs serve -p 1234 \
-  --from-uqff /workspace/uqff \
+  -m /workspace/src \
+  -a deepseekv4 \
+  --from-uqff /workspace/uqff/qtip2-0.uqff \
+  --chat-template chat_templates/deepseek_v4.json \
   --max-seqs 128 \
   --prefix-cache-n 0 \
   --max-seq-len 4096 --max-batch-size 128
 ```
+
+Four things that are each load-bearing:
+
+* **`-m` points at the SOURCE checkpoint, never at the UQFF directory.** The
+  overlay is not a model. This is the single most common way to hit `DummyLayer`.
+* **`-a deepseekv4`** — the architecture is stated explicitly.
+* **`--from-uqff` takes the FIRST SHARD FILE, not a directory**
+  (`mistralrs-cli/src/args/model.rs:91-95`: *"UQFF file(s) to load from. Shards
+  are auto-discovered: specifying the first shard … automatically finds …"*).
+  Success logs `Auto-discovered 8 UQFF shard files (from 1 specified)`.
+* **`--chat-template chat_templates/deepseek_v4.json`** — present in the
+  measured-working invocation (wave26-AX §2). The probe and every scored eval
+  post to `/v1/chat/completions` and rely on the server-side template.
+
+**Why `-m` decides it, from the source** (`paths.rs:365-386`): weight files are
+picked as `if !safetensors.is_empty() { safetensors } else if uqff_residual …`.
+With `-m` at the artifact the only match is `residual.safetensors` — which holds
+575 tensors (embeddings, norms, router gates, compressor) and **zero attention
+projections, zero shared-expert weights, no `gate.tid2eid`**. With `-m` at the
+source, the 46 shards supply everything the overlay does not carry.
+
+Full documentation of the artifact, including the failure table, is in
+`docs/model-cards/deepseek-v4-flash-uqff-qtip2.md`. **Read it before the box is
+running**, not after.
+
+> 🔴 **ABORT-IF the load fails — RULE ZERO.** In particular
+> `Error: DummyLayer not replaced at index 1, layer Some(0) after
+> load_from_artifacts` means a quantizable layer never got its weights. Check,
+> in this order: (1) is `-m` the source and not the overlay? (2) are all 8
+> shards **and** `residual.safetensors` present? Then **STOP, delete the box,
+> and report the exact command and error.** Do not attempt to produce the
+> weights by any other means.
 
 **`--max-seqs 128` is load-bearing and is the single most likely way this
 session silently produces garbage.** mistral.rs defaults `--max-seqs` to **32**
@@ -157,9 +255,16 @@ engine still overlaps one sequence's tail with the next sequence's first token.
 > and **every number this session produces is unfalsifiable**. This is a
 > harness bug, not a box bug: delete, fix on CPU against
 > `test_batch_load_probe.py`, re-rent.
-> **ABORT-IF** UQFF load takes > 3 min (expected ~11 s) — the artifact is being
-> re-quantized rather than loaded; check for `Applying ISQ` in the server log,
-> which must NOT appear on a `--from-uqff` path.
+> **ABORT-IF** UQFF load takes **> 8 min** — the artifact is being re-quantized
+> rather than loaded. The reliable signal is not the clock but the log: grep for
+> `Applying ISQ`, which **must NOT appear** on a `--from-uqff` path.
+>
+> ⚠️ **The old threshold here was "> 3 min (expected ~11 s)" and it was wrong in
+> both halves.** The 12.94 s figure on the model card was measured on the A100
+> that had just baked the artifact, with the file cache warm. The only
+> cold-cache measurement we have is **3 m 10 s** (wave26-AX §2, load 14:52:47 →
+> serving 14:55:57) — i.e. the old rule would have **aborted a perfectly healthy
+> load.** Expect **~3 min cold**, seconds warm.
 
 ### S3 — The speed sweep (25 min) — **THE DELIVERABLE**
 
@@ -226,8 +331,17 @@ python3 batch_load_probe.py --batches 64,128 --duration 120 \
 ### S5 — Quality re-measure (40 min)
 
 ```bash
-python3 run_gsm8k.py --n 100 --shots 0 --max-tokens 2048 --seed 161 --label s8
+# 0-shot is the DEFAULT (--eight-shot is the opt-in). There is no --shots flag
+# and no --label flag; the run is named through --out.
+python3 run_gsm8k.py --n 100 --max-tokens 2048 --seed 161 \
+  --out results/gsm8k_s8.json
 ```
+
+> **The previous revision printed `--shots 0 … --label s8`. Neither flag
+> exists** (`run_gsm8k.py:141-161`) and argparse rejects the whole command, so
+> the step fails instantly on a paid box. `--eight-shot` is the only shot
+> control; omitting it *is* 0-shot. Requires `data/gsm8k_test.jsonl` — run
+> `bash fetch_data.sh` first.
 
 **87.0% is PROVISIONAL and must be re-measured.** PR #35 changed the decode
 math on every token's path: the SwiGLU clamp was missing on **4 of the 5 expert
@@ -246,7 +360,8 @@ probe is the deliberate exception to that rule; scored evals are not).
 Then coherence6 and facts/math:
 
 ```bash
-python3 run_coherence.py --label s8
+# Again: no --label. `run_coherence.py` takes --out and --skip-facts only.
+python3 run_coherence.py --out results/coherence_s8.json
 ```
 
 > **ABORT-IF** GSM8K lands below ~80% — a >7-point drop from the provisional
@@ -451,7 +566,7 @@ offline which region to avoid.
 | | cost |
 |---|---|
 | holding an idle box | **$0.082/min** |
-| re-entry (boot ~10 min + cached binary <1 min + 68 GB pull ~15 min) | **~26 min ≈ $2.13** |
+| re-entry (boot ~10 min + cached binary <1 min + 234 GB pull ~20 min) | **~31 min ≈ $2.54** |
 
 **HOLD if the fix is shorter than ~26 minutes of work. DELETE if it is
 longer.** "Never debug on a paid box" means never *sit and think* on one; it
@@ -467,3 +582,59 @@ does not mean throwing away 25 minutes of paid setup to fix a typo.
 
 **DOCTRINE D10.** The delete is confirmed by a `list_instances` that comes back
 without this box, not by having called delete.
+
+---
+
+## 10. Preflight — run ALL of this on the laptop, before renting anything
+
+Every check here is free and each one has, at least once, been discovered the
+expensive way. **Do not create an instance until all four pass.**
+
+**1. Is the GPU provider session alive?** *(This is the one that blocked
+wave31-BF: both the Runcrate MCP server and the CLI had expired refresh tokens,
+`runcrate login` needs an interactive browser, and the session could not rent a
+box at all. Discovered for $0 because it was checked first; discovered after
+renting it would have been billed.)*
+
+```bash
+runcrate ps               # must list instances, not "session expired"
+runcrate billing balance  # must return a balance
+```
+
+If this fails with `session expired — run: runcrate login`, **the session
+cannot proceed and must stop here.** Re-auth is interactive and only the user
+can do it.
+
+**2. Is anything already running and billing?** `runcrate ps` again — DOCTRINE
+D10 applies across sessions, not just within one. An instance left up by a
+previous session bills at $0.082/min whether or not anyone is looking at it.
+
+**3. Is the HF token valid and does it see the private org?**
+
+```bash
+set -a; . ~/.config/arc/env; set +a
+curl -s https://huggingface.co/api/whoami-v2 -H "Authorization: Bearer $HF_TOKEN" \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['name'], [o['name'] for o in d.get('orgs',[])])"
+# expect: heydryft ['aeonmind']
+```
+
+The HF org is **`aeonmind`**; the GitHub org is **`aeonmindai`**. A token that
+does not list `aeonmind` cannot read the private overlay.
+
+**4. Are both repos reachable and is the overlay complete?**
+
+```bash
+set -a; . ~/.config/arc/env; set +a
+for R in aeonmind/DeepSeek-V4-Flash-UQFF-qtip2 deepseek-ai/DeepSeek-V4-Flash; do
+  curl -s "https://huggingface.co/api/models/$R?blobs=true" \
+    -H "Authorization: Bearer $HF_TOKEN" \
+  | python3 -c "
+import json,sys; d=json.load(sys.stdin); s=d.get('siblings',[])
+print('$R', len(s), 'files', round(sum(x.get('size',0) or 0 for x in s)/1e9,2), 'GB')"
+done
+# expect: overlay 15 files 74.19 GB   |   source 73 files 159.63 GB
+```
+
+Verified 2026-08-15: overlay HTTP 200, `private: True`, 15 files, 74.19 GB with
+all 9 weight files byte-matching the model card; source HTTP 200, public,
+ungated, 73 files, 159.63 GB.
