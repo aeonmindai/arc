@@ -114,39 +114,86 @@ check/bail or `to_dtype()`, or by a documented struct-field invariant
 | `arc-cuda-graph/src/flashmlasparse.rs` | 1 call + 2 comments | fixed in #52 |
 | `arc-cuda-graph/src/sampling_cuda.rs` | 1 comment | fixed in #52 |
 | `arc-cuda-graph/src/weights.rs` | 7 | legitimate — each is an arm of the `match tensor.dtype()` in `tensor_device_ptr`; the two `::<u8>` at `:165`/`:171` are the genuine U8 and F8E4M3 arms (F8E4M3 is stored as u8 in cudarc) |
-| `mistralrs-core/src/cuda/{gdn,moe,sinkhorn,ssm}.rs` | 32 | legitimate |
-| `mistralrs-paged-attn/src/cuda/backend/*.rs` | 66 | legitimate |
-| `mistralrs-quant/src/**` (17 files) | 203 | legitimate |
+| `mistralrs-core/src/cuda/{gdn,moe,sinkhorn,ssm}.rs` | 32 | legitimate — `match dtype`→`cuda_fwd::<T>` dispatch; the hardcoded-f32 recurrence helpers in `gdn.rs`/`ssm.rs` have a documented f32-only contract their sole callers honour with `to_dtype(F32)` (`models/gdn.rs:579-611`, `models/granite.rs:1046-1063`) |
+| `mistralrs-paged-attn/src/cuda/backend/cache.rs` | 1 | **BUG — fixed here** (copy 5) |
+| `mistralrs-paged-attn/src/cuda/backend/*.rs` (rest) | 65 | legitimate — `match q.dtype()`→`cuda_fwd_t::<T>`; the `::<u8>` sites are TurboQuant packed caches, `::<f32>` are alibi/scale scalars |
+| `mistralrs-quant/src/**` (17 files) | 203 | legitimate — candle `CustomOp` `match dtype` arms, `map_dtype!`-style macro dispatch, explicit `if x.dtype() != ... { bail }` guards, or asserted format invariants (packed U8 blocks, F32 scales) |
 
-**Zero further bugs found**, established structurally rather than by reading
-300 sites one at a time:
+### A fifth site — and a correction to my own first answer
 
-1. **The antipattern needs a dtype-erased helper, and outside
-   `arc-cuda-graph` there isn't one.**
-   `git grep -n 'fn .*ptr.*(.*&Tensor' -- '*.rs'` returns **no hits** outside
-   `arc-cuda-graph/`. No other crate has a function that takes a bare
-   `&Tensor` and hands back a raw pointer. That is precisely the signature
-   that lets a hardcoded `T` meet a varying dtype.
-2. **The shared helper upstream code does use is generic, so it cannot carry
-   the bug.** `slice_ptr<T: DeviceRepr>`
-   (`mistralrs-quant/src/utils/mod.rs:43`,
-   `mistralrs-paged-attn/src/cuda/backend/mod.rs:22`) takes an
-   already-typed `CudaSlice<T>`; it inherits whatever `as_cuda_slice::<T>()`
-   produced and adds no assumption of its own.
-3. **Upstream call sites pin the dtype before reaching for the slice.** Two
-   representative checks: `mistralrs-core/src/cuda/gdn.rs:34` uses
-   `::<f32>()` inside an f32-only entry point; `mistralrs-quant/src/qtip/cuda_ops.rs:90-98`
-   uses `::<u8>()` for packed blocks and `::<f32>()` for scales/LUT, which are
-   struct-field invariants *explicitly asserted* a few lines earlier
-   (`cuda_ops.rs:1346-1354` bails if `blocks` is not U8, `row_scales` not F32,
-   `indices` not U32).
+**I initially published "zero further bugs" and it was wrong.** Recording the
+error, because how it happened is the point of this whole wave.
 
-So the defect is confined to Arc-authored generic pointer helpers in
-`arc-cuda-graph/`, which is the shape to expect: upstream mistral.rs reaches
-for `as_cuda_slice` from inside candle `CustomOp` implementations and typed
-entry points where the dtype is already pinned by construction, so the hazard
-cannot arise there. The two `::<u8>` arms in `weights.rs:165`/`:171` are the
-genuine U8 and F8E4M3 arms of the correct dispatch, not copies of the bug.
+My argument was structural: the antipattern needs a *dtype-erased pointer
+helper*, and `git grep -n 'fn .*ptr.*(.*&Tensor' -- '*.rs'` returns no hits
+outside `arc-cuda-graph/`. Two supporting observations were and remain true —
+the shared `slice_ptr<T: DeviceRepr>`
+(`mistralrs-quant/src/utils/mod.rs:43`,
+`mistralrs-paged-attn/src/cuda/backend/mod.rs:22`) is generic over `T` and
+adds no assumption of its own; and upstream call sites overwhelmingly pin the
+dtype first (`mistralrs-core/src/cuda/gdn.rs:34` is an f32-only entry point;
+`mistralrs-quant/src/qtip/cuda_ops.rs:90-98` relies on struct invariants that
+are *explicitly asserted* at `cuda_ops.rs:1346-1354`).
+
+**But the premise was wrong.** The defect does not need a named helper. It
+needs only a hardcoded `T` at a site where the dtype varies — and that can sit
+inline in any function. A grep for `fn .*ptr` cannot see it. A concurrent
+per-site audit found exactly that, at:
+
+**`mistralrs-paged-attn/src/cuda/backend/cache.rs:247-251`** — in
+`swap_blocks`'s `(Device::Cpu, Device::Cuda)` arm:
+
+```rust
+let (dst_ptr, _guard_dst) = slice_ptr(
+    dst_storage.as_cuda_slice::<u8>()?,   // always fails
+    dst_layout.start_offset(),
+);
+let src_slice = src_storage.as_slice::<u8>()?;   // CPU twin, same dtype check
+```
+
+`swap_blocks` takes bare `Tensor`/`&Tensor` with no dtype parameter and no
+guard. The **sibling `(Cuda, Cuda)` arm in the same function**
+(`cache.rs:196-215`) pins the intended domain: it matches
+`CudaStorageSlice::{BF16, F16, F32}` and bails with *"only f32, f16 and bf16
+input data type supported!"*. U8 is not in that set, so the CPU→CUDA path
+returns `UnexpectedDType { expected: U8, got: BF16 }` before copying a byte.
+Both sides are broken — `CpuStorage::as_slice::<u8>()` has the identical
+check.
+
+Same root cause as the four in `arc-cuda-graph`: the author reached for `u8`
+because the copy is byte-oriented (the comment at `cache.rs:221` says "u8s
+because we copy by bytes"), but candle **type-checks the view rather than
+reinterpreting it**. That is the one-sentence statement of the whole bug
+family, and it is worth more than my structural argument was.
+
+**Status:** pre-existing upstream mistral.rs code, not Arc code, and currently
+**dead** — `git grep swap_blocks -- '*.rs'` finds the definition
+(`cache.rs:176`) and two re-exports (`backend/mod.rs:8`, `cuda/mod.rs:9`), no
+caller. Zero production impact today; it would fire the moment CPU KV-cache
+offload/swap is wired up. Fixed here anyway, since a latent broken path that
+nothing exercises is precisely the debt this wave exists to clear.
+
+**The fix** mirrors the sibling arm's verified shape rather than inventing
+one: match `&*dst_storage.slice` on BF16/F16/F32 and call `slice_ptr` with the
+correctly-typed slice, match `src_storage` on the same three `CpuStorage`
+variants, and cast to bytes afterwards via a small `as_byte_slice` helper.
+Note the offset semantics this corrects: `slice_ptr(v, lo)` does `v.slice(lo..)`,
+so `lo` is in **elements of `T`**. Passing `dst_layout.start_offset()` (an
+element count) alongside a `CudaSlice<u8>` conflated elements with bytes; with
+the slice correctly typed the two agree, exactly as they already do in the
+`(Cuda, Cuda)` arm.
+
+**The lesson, corrected:** the right standing check is not "find the dtype-erased
+helpers" — it is `git grep -n 'as_cuda_slice::<'` (plus `as_slice::<`) and a
+verdict on *every* site. A structural shortcut that reasons about where a bug
+*could* live will miss the instance that lives somewhere else. I reached for
+the shortcut because 300 sites looked expensive; the shortcut was wrong, and
+the exhaustive pass was what found the fifth.
+
+So: **five copies, not four.** Four in Arc-authored `arc-cuda-graph` generic
+pointer helpers (#52 ×3, #53 ×1) and one inline in upstream paged-attn (#53).
+The two `::<u8>` arms in `weights.rs:165`/`:171` are the genuine U8 and F8E4M3
+arms of the correct dispatch, not copies of the bug.
 
 ## 5. The lesson, recorded in BACKLOG as instance seven
 
@@ -168,6 +215,23 @@ dispatches on `t.dtype()` or sits under a pinned dtype.
 > which is why it has never fired. One `bail!` on non-contiguous input makes
 > it impossible. Same note as #52 — still unfixed, now in four places' worth
 > of call sites.
+> Worth a separate change?
+
+> **Noticed:** three helpers take a bare `&Tensor` and hardcode `::<f32>()`
+> with **no runtime dtype bail** — `mistralrs-core/src/cuda/gdn.rs:34,41,48,55,62,69`
+> and `:147,154,161,168,175,182`, and `mistralrs-core/src/cuda/ssm.rs:64,83`.
+> They are correct *today* only because every caller converts with
+> `to_dtype(F32)` first. Same shape as the bug family, held together by caller
+> discipline. `mistralrs-core/src/cuda/sinkhorn.rs:33-38` does the identical
+> job but *does* bail on a dtype mismatch — that is the cheap hardening
+> pattern if these should fail loudly rather than silently depend on callers.
+> Worth a separate change?
+
+> **Noticed:** `swap_blocks`'s `(Cpu, Cuda)` arm binds `_src_layout` and then
+> ignores it — the src offset is computed as `src_block_number *
+> block_size_in_bytes` with no `start_offset()` term, so a *sliced* CPU source
+> tensor would be read from the wrong address. Pre-existing, orthogonal to the
+> dtype bug, and equally dead today. Left alone.
 > Worth a separate change?
 
 > **Noticed:** nothing in the repo distinguishes "implemented" from

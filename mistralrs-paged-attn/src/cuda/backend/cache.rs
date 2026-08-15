@@ -6,8 +6,22 @@ use candle_core::backend::BackendDevice;
 use candle_core::cuda_backend::CudaStorageSlice;
 use candle_core::Result;
 use candle_core::{
-    cuda_backend::cudarc::driver::CudaSlice, DType, Device, IndexOp, Storage, Tensor,
+    cuda_backend::cudarc::driver::CudaSlice, CpuStorage, DType, Device, IndexOp, Storage, Tensor,
 };
+
+/// Reinterpret a POD slice as raw bytes.
+///
+/// `swap_blocks` copies KV-cache blocks byte-wise, but candle's
+/// `CudaStorage::as_cuda_slice::<T>()` / `CpuStorage::as_slice::<T>()`
+/// *type-check* `T` against the storage's runtime dtype rather than
+/// reinterpreting it. So the view has to be taken at the real dtype and cast
+/// to bytes afterwards — asking for `::<u8>()` up front just fails.
+fn as_byte_slice<T: Copy>(v: &[T]) -> &[u8] {
+    // SAFETY: `T` is only ever bf16/f16/f32 here — plain POD with no padding
+    // and no invalid bit patterns — and the result covers exactly the same
+    // allocation, borrowed for the same lifetime.
+    unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
+}
 
 pub fn copy_blocks(
     key_caches: Vec<&mut Tensor>,
@@ -244,11 +258,37 @@ pub unsafe fn swap_blocks(
             let Storage::Cuda(dst_storage) = &*dst_storage else {
                 unreachable!()
             };
-            let (dst_ptr, _guard_dst) = slice_ptr(
-                dst_storage.as_cuda_slice::<u8>()?,
-                dst_layout.start_offset(),
-            );
-            let src_slice = src_storage.as_slice::<u8>()?;
+            // `as_cuda_slice::<T>()` / `as_slice::<T>()` type-check `T` against
+            // the storage's runtime dtype, so the hardcoded `::<u8>()` these two
+            // lines used to carry failed for EVERY dtype this function handles:
+            // the sibling (Cuda, Cuda) arm above pins the domain to
+            // BF16/F16/F32, none of which is U8. Take the view at the real
+            // dtype — same match shape as that arm — and cast to bytes after.
+            let dst_ptr = match &*dst_storage.slice {
+                CudaStorageSlice::BF16(slice_dst) => {
+                    let (ptr, _guard) = slice_ptr(slice_dst, dst_layout.start_offset());
+                    ptr
+                }
+                CudaStorageSlice::F16(slice_dst) => {
+                    let (ptr, _guard) = slice_ptr(slice_dst, dst_layout.start_offset());
+                    ptr
+                }
+                CudaStorageSlice::F32(slice_dst) => {
+                    let (ptr, _guard) = slice_ptr(slice_dst, dst_layout.start_offset());
+                    ptr
+                }
+                _ => {
+                    candle_core::bail!("only f32, f16 and bf16 input data type supported!")
+                }
+            };
+            let src_slice: &[u8] = match src_storage {
+                CpuStorage::BF16(v) => as_byte_slice(v),
+                CpuStorage::F16(v) => as_byte_slice(v),
+                CpuStorage::F32(v) => as_byte_slice(v),
+                _ => {
+                    candle_core::bail!("only f32, f16 and bf16 input data type supported!")
+                }
+            };
 
             for (src_block_number, dst_block_number) in block_mapping {
                 let src_offset = src_block_number * block_size_in_bytes;
