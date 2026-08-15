@@ -312,7 +312,16 @@ fn main() -> Result<()> {
             bpe / 1e6
         );
         let w = Tensor::randn(0f32, 0.02f32, (e, s.n, s.k), &dev)?.to_dtype(DType::BF16)?;
-        let layer = Qtip2bLayer::quantize_with_options_3d(&w, &dev, QtipMode::Greedy, false)?;
+        // Viterbi, not Greedy: `Greedy` is refused by every quantizer door
+        // outside this crate's own `cfg(test)` binaries (DOCTRINE D4), and an
+        // example is not one — the sweep died at the first fixture before this.
+        // The search only decides WHICH symbols get packed, never how many
+        // bytes they occupy or how many ops the trellis decode costs, so the
+        // measured bandwidth is identical either way; only bake time changes.
+        // `use_rotation = false` is kept from the session-4 baseline: rotation
+        // adds a `rotate_x_cuda` pass over the activations before the GEMV,
+        // which is fixed overhead outside the kernel under test.
+        let layer = Qtip2bLayer::quantize_with_options_3d(&w, &dev, QtipMode::Viterbi, false)?;
         drop(w);
 
         // Baseline row first, then every applicable variant.
