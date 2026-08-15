@@ -242,19 +242,77 @@ non-degenerate weights, asserted non-degenerate):**
 
 **End-to-end (`tests/synthetic_load_smoke.rs`, the 3-layer V4 fixture with
 ratios `[0, 4, 128]`):**
-- `v4_rolling_xs_decode_matches_whole_history_prefill` — **the token-identity
-  test the brief asked for.** 120-token prompt then 20 single-token decode
-  steps; ground truth is a **fresh full prefill at every length** (the
-  whole-history recompute, not "what the old code printed"). Asserts the
-  **same argmax token** at all 21 lengths plus logits inside the fixture's
-  documented CPU-MatMul F16 budget. Crosses five ratio-4 strides **and** the
-  ratio-128 stride during decode.
+- `v4_rolling_xs_decode_matches_whole_history_prefill` — 120-token prompt then
+  20 single-token decode steps, crossing five ratio-4 strides **and** the
+  ratio-128 stride during decode; ground truth is a **fresh full prefill of
+  the same tokens** (the whole-history recompute, not "what the old code
+  printed"). It asserts on the **compressor state** — the compressed rows in
+  the model's own `XsRolling` slots — and on the logits second. See §5a: the
+  first version of this test asserted on the sampled token, and that was
+  wrong.
 - `v4_xs_history_two_seq_batch_matches_single_sequence` (pre-existing, R3's
   voting contract) — updated to snapshot/merge/split whole cache **entries**
   through helpers that mirror `clone_in_cache`/`clone_out_cache` field for
   field, instead of the old `reset()+append(k,v)` stand-in. Still asserts
   batched == solo across merged / shrink / lockstep, still bit-exact on the
   batch-mate invariance.
+
+### 5a. The first version of this test was arch-dependent and toothless — CI caught it, and the numbers say why
+
+Worth recording, because it is exactly the D12 failure mode and it nearly
+shipped.
+
+**v1 asserted `argmax(rolling) == argmax(reference)` at every step.** Green on
+this dev host (ARM: max logit diff **exactly 0.0** at all 21 steps), red on all
+three CI platforms (x86):
+
+```
+rolling decode sampled a different token than the whole-history recompute at
+122 tokens … left: 111, right: 85
+```
+
+Probing the fixture rather than loosening the bound:
+
+```
+PROBE len=120 top1=3.302734 top2=3.296875 gap=0.005859 tol=0.033027 maxdiff=0.000000
+PROBE len=121 top1=3.150391 top2=3.150391 gap=0.000000 tol=0.031504 maxdiff=0.000000
+PROBE len=122 top1=3.003906 top2=3.001953 gap=0.001953 tol=0.030039 maxdiff=0.000000
+…all 21 steps: gap ∈ [0.0000, 0.0098], tol ∈ [0.027, 0.067]
+```
+
+The patterned `lm_head` has near-duplicate rows, so **the top-2 gap is below
+the CPU-MatMul F16 noise floor at every step**: the sampled token is decided by
+GEMM tiling, not by the model. No implementation — including the unmodified one
+— has an arch-independent argmax on this fixture. The assertion was testing the
+host.
+
+**v2 asserted logit equality within the documented F16 budget.** Also wrong,
+and worse — it could not fail. Measured under mutation 1 (a fully corrupted
+compressor):
+
+```
+             logit max-diff   tolerance
+window=128:  0.008 – 0.043    0.030 – 0.056     (passes!)
+window=8:    0.018 – 0.027    0.026 – 0.044     (passes!)
+```
+
+A 3-layer fixture with patterned weights is close to a constant function: even
+a one-token history change moves the logits by only 0.006–0.05, i.e. ~1x the
+tolerance. **A logit-level equality test on this fixture cannot have teeth.**
+
+**v3 asserts on the compressor state itself** — the compressed rows in the
+model's `XsRolling` slots after 20 decode steps, against the rows a single
+whole-history prefill of the same tokens produces — with the logits kept as a
+secondary plumbing check. The signal is undiluted:
+
+```
+mutation 1 vs v3:  diverged by 2.1469789 (magnitude 2.614, budget 0.026)  = 82x margin
+```
+
+The fixture also gained `config_json_with_window` so this test can run at
+`sliding_window = 8`: at the real 128 the window covers the whole 140-token
+fixture and the compressed branch barely reaches the output, which is not a
+sensitivity a compressor test should be run at.
 
 ### Mutations
 
@@ -265,8 +323,8 @@ ratios `[0, 4, 128]`):**
 >   rolling compressed rows diverged from the whole-history recompute at 12
 >   tokens (ratio 4): max abs diff 0.74833465
 > v4_rolling_xs_decode_matches_whole_history_prefill ... FAILED
->   rolling decode sampled a different token than the whole-history recompute
->   at 125 tokens: the compressed (distant-context) branch diverged
+>   compressed layer 0: 20 decode steps of rolling state diverged from the
+>   whole-history recompute by 2.1469789 (magnitude 2.6140704, budget 0.0261)
 > ```
 > `hca_ratio128` correctly still passes — `span_groups == 1` there.
 
@@ -291,7 +349,7 @@ ratios `[0, 4, 128]`):**
 > without it, ~3% of MTP verify steps would have hard-errored in production.
 
 All reverted; `cargo test -p mistralrs-core` = 261 lib + 12 smoke + 2 e2e
-green. `cargo check --workspace --tests` green. Scoped clippy lane green.
+green (and green on all three CI platforms, which v1 was not). `cargo check --workspace --tests` green. Scoped clippy lane green.
 Formatting: `kv_cache/mod.rs`, `prefix_cacher.rs`, `synthetic_load_smoke.rs`
 returned to their **zero-hunk** baseline; `deepseek4.rs` left at its
 pre-existing 27 hunks (fork policy — no mass reformat).

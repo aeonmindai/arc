@@ -1472,6 +1472,16 @@ mod v4_compress {
     }
 
     pub fn config_json() -> String {
+        config_json_with_window(SLIDING_WINDOW)
+    }
+
+    /// Same fixture with a narrower sliding window. The window and the
+    /// compressed (distant-context) branch split the same softmax, so the
+    /// window size decides how much of the output the compressor is
+    /// responsible for — at the real 128 it dominates the 130-token fixture
+    /// and a corrupted compressed row barely moves the logits, which is
+    /// exactly the sensitivity a compressor test must not be run at.
+    pub fn config_json_with_window(sliding_window: usize) -> String {
         serde_json::json!({
             "architectures": ["DeepseekV4ForCausalLM"],
             "vocab_size": VOCAB_SIZE,
@@ -1500,7 +1510,7 @@ mod v4_compress {
             "n_group": 1,
             "topk_group": 1,
             "compress_ratios": COMPRESS_RATIOS,
-            "sliding_window": SLIDING_WINDOW,
+            "sliding_window": sliding_window,
             "compress_rope_theta": COMPRESS_ROPE_THETA,
             "o_lora_rank": O_LORA_RANK,
             "o_groups": O_GROUPS,
@@ -1516,6 +1526,10 @@ const V4C_PREFILL_T: usize = 130;
 const V4C_DECODE_STEPS: usize = 6;
 
 fn v4c_load() -> Box<dyn NormalModel + Send + Sync> {
+    v4c_load_with_window(v4_compress::SLIDING_WINDOW)
+}
+
+fn v4c_load_with_window(sliding_window: usize) -> Box<dyn NormalModel + Send + Sync> {
     let device = Device::Cpu;
     let tensors =
         v4_compress::weights(&device).expect("V4 compress fixture construction must not fail");
@@ -1523,7 +1537,7 @@ fn v4c_load() -> Box<dyn NormalModel + Send + Sync> {
     let loader = DeepSeekV4Loader;
     loader
         .load(
-            &v4_compress::config_json(),
+            &v4_compress::config_json_with_window(sliding_window),
             vb,
             make_metadata(&device),
             AttentionImplementation::Eager,
@@ -1797,36 +1811,63 @@ fn v4c_solo_run(
 }
 
 /// The rolling compressed `xs` state must be indistinguishable from the
-/// whole-history recompute it replaces.
+/// whole-history recompute it replaces — end to end, through the real loader,
+/// the real cache slots and the real decode loop.
 ///
-/// Ground truth is not "what the previous implementation printed" — it is a
-/// FRESH FULL PREFILL at every length, which runs the compressor over the
-/// entire raw history in one shot (`Attention::compress_prefix`, the prefill
-/// path, untouched by wave30). Decoding one token at a time must reproduce it
-/// exactly: same sampled token at every step, and logits inside the CPU-MatMul
-/// F16 budget the fixture already documents.
+/// **What is compared, and why it is the compressor state and not the logits.**
+/// Ground truth is a FRESH FULL PREFILL of the same tokens: prefill hands the
+/// compressor the whole prefix in one call (`Attention::compress_prefix`, the
+/// path wave30 did not touch), so its compressed rows are what the old
+/// every-step recompute produced. Decoding one token at a time must land on
+/// the same rows.
 ///
-/// The schedule is chosen to exercise the part that can go wrong:
-///   * 120-token prompt, then 20 single-token decode steps;
-///   * five ratio-4 (CSA) group boundaries are crossed DURING DECODE — every
-///     one of them is a row the rolling state must build from its retained
-///     tail plus the previous group (`overlap_transform`), not from the raw
-///     history it no longer has;
-///   * the ratio-128 (HCA) boundary at token 128 is crossed during decode too,
-///     so the second compressor shape (`coff == 1`) is live.
+/// The logits are checked too, but they are the *weaker* signal and must not
+/// be mistaken for the proof. Measured on this fixture (wave30 §5): a fully
+/// corrupted compressor (mutation 1) moves the compressed rows by ~0.7 but the
+/// logits by only ~0.02 — at or below the documented CPU-MatMul F16 budget,
+/// because a 3-layer fixture with patterned weights is close to a constant
+/// function. Asserting only on logits here would be a test that cannot fail.
+/// Comparing the rows directly restores ~2 orders of magnitude of margin.
 ///
-/// Teeth (verified by mutation, wave30 §6): reverting `XsRollingCache::advance`
-/// to hand the compressor only the current group — dropping the `coff == 2`
-/// predecessor — fails this test on the first CSA boundary; dropping the tail
-/// retention makes it bail with the history-gap guard.
+/// The schedule exercises the part that can go wrong: a 120-token prompt then
+/// 20 single-token decode steps, crossing five ratio-4 (CSA) group boundaries
+/// and the ratio-128 (HCA) boundary DURING DECODE — every one of them a row
+/// the rolling state must build from its retained tail plus the previous
+/// group, not from raw history it no longer has.
 #[test]
 fn v4_rolling_xs_decode_matches_whole_history_prefill() {
     let device = Device::Cpu;
-    let mut model = v4c_load();
+    // A narrow window on purpose: the window and the compressed branch share
+    // one softmax, so at the real 128 the window covers this whole fixture and
+    // the compressor barely reaches the output. See `config_json_with_window`.
+    const WINDOW: usize = 8;
+    let mut model = v4c_load_with_window(WINDOW);
     let vocab = v4_compress::VOCAB_SIZE;
     const PREFILL: usize = 120;
     const TOTAL: usize = 140;
     let toks: Vec<u32> = (0..TOTAL).map(|i| ((i * 7 + 1) % vocab) as u32).collect();
+
+    /// The compressed rows held by every `XsRolling` slot (the entries past
+    /// the per-layer KV caches), deep-copied.
+    fn compressor_rows(model: &(dyn NormalModel + Send + Sync)) -> Vec<Tensor> {
+        model
+            .cache()
+            .normal()
+            .0
+            .iter()
+            .skip(v4_compress::NUM_LAYERS)
+            .map(|c| {
+                c.k()
+                    .unwrap()
+                    .expect("xs slot populated")
+                    .copy()
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+            })
+            .collect()
+    }
+    let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
 
     // Rolling: one prefill, then single-token decode.
     v4c_reset(&mut model);
@@ -1840,46 +1881,79 @@ fn v4_rolling_xs_decode_matches_whole_history_prefill() {
         let logits = v4c_step(model.as_ref(), &ids, s).expect("rolling decode step");
         rolling.push(v4c_row(&logits, 0));
     }
+    let rolled_rows = compressor_rows(model.as_ref());
 
     // Ground truth: recompute the whole history at every length.
-    let mut n_strides = 0usize;
-    for (i, len) in (PREFILL..=TOTAL).enumerate() {
+    let mut reference: Vec<Vec<f32>> = Vec::new();
+    let mut prefilled_rows = Vec::new();
+    for len in PREFILL..=TOTAL {
         v4c_reset(&mut model);
         let ids = Tensor::from_vec(toks[..len].to_vec(), (1, len), &device).unwrap();
         let logits = v4c_step(model.as_ref(), &ids, 0).expect("reference full prefill");
-        let want = v4c_row(&logits, 0);
-        let got = &rolling[i];
-
-        let argmax = |v: &[f32]| {
-            v.iter()
-                .enumerate()
-                .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
-                    if x > bv {
-                        (i, x)
-                    } else {
-                        (bi, bv)
-                    }
-                })
-                .0
-        };
-        assert_eq!(
-            argmax(got),
-            argmax(&want),
-            "rolling decode sampled a different token than the whole-history recompute at \
-             {len} tokens: the compressed (distant-context) branch diverged"
-        );
-        v4c_assert_close(
-            got,
-            &want,
-            &format!("rolling decode vs whole-history prefill at {len} tokens"),
-        );
-        if len > PREFILL && len % 4 == 0 {
-            n_strides += 1;
+        reference.push(v4c_row(&logits, 0));
+        if len == TOTAL {
+            prefilled_rows = compressor_rows(model.as_ref());
         }
     }
+
+    // ---- (1) The proof: 20 decode steps of rolling state == one whole-history
+    // recompute, row for row, on every compressed layer. ----
+    assert_eq!(
+        rolled_rows.len(),
+        prefilled_rows.len(),
+        "the fixture must expose one xs slot per compressed layer"
+    );
+    assert_eq!(
+        rolled_rows.len(),
+        2,
+        "fixture ratios [0, 4, 128] give exactly two compressed layers"
+    );
+    for (layer, (got, want)) in rolled_rows.iter().zip(prefilled_rows.iter()).enumerate() {
+        assert_eq!(
+            got.dims(),
+            want.dims(),
+            "compressed-row shape diverged on compressed layer {layer}"
+        );
+        let (got, want) = (flat(got), flat(want));
+        let magnitude = v4c_max_abs(&want);
+        // Non-degenerate: an all-zero compressor would make this vacuous.
+        assert!(
+            magnitude > 1e-2,
+            "compressed rows on layer {layer} are ~zero ({magnitude}) — the equality below \
+             would prove nothing"
+        );
+        let diff = v4c_max_diff(&got, &want);
+        assert!(
+            diff <= V4C_F16_REL_TOL * magnitude,
+            "compressed layer {layer}: 20 decode steps of rolling state diverged from the \
+             whole-history recompute by {diff} (magnitude {magnitude}, budget {})",
+            V4C_F16_REL_TOL * magnitude
+        );
+    }
+    // The two layers must not be copies of each other: identical rows would
+    // mean the slots are crossed and the comparison above is testing one layer
+    // twice.
     assert!(
-        n_strides >= 2,
-        "schedule crossed only {n_strides} ratio-4 strides during decode"
+        v4c_max_diff(&flat(&rolled_rows[0]), &flat(&rolled_rows[1])) > 1e-2
+            || rolled_rows[0].dims() != rolled_rows[1].dims(),
+        "the CSA and HCA slots hold the same rows — the per-layer slots are crossed"
+    );
+
+    // ---- (2) And the model output agrees, within the documented F16 budget.
+    // Secondary by construction (see the doc comment): kept as a plumbing
+    // regression, not as the correctness proof. ----
+    for (i, len) in (PREFILL..=TOTAL).enumerate() {
+        v4c_assert_close(
+            &rolling[i],
+            &reference[i],
+            &format!("rolling decode vs whole-history prefill at {len} tokens"),
+        );
+    }
+
+    let strides = (PREFILL + 1..=TOTAL).filter(|l| l % 4 == 0).count();
+    assert!(
+        strides >= 2,
+        "schedule crossed only {strides} ratio-4 strides during decode"
     );
     assert!(
         (PREFILL..TOTAL).contains(&128),
