@@ -19,6 +19,22 @@ distributed in Arc/mistral.rs's **UQFF** format.
 
 ## How to run it
 
+### The binary
+
+You need [Arc](https://github.com/aeonmindai/arc) built with CUDA. qtip2 is an
+Arc quantization; an upstream mistral.rs build will not read these shards.
+
+```bash
+cargo install --path mistralrs-cli --features "cuda flash-attn"
+```
+
+> **Do not add the `cudnn` feature.** A same-box A/B on V4 measured it as a
+> large decode regression, not a speedup. The measurement is kept in Arc's
+> internal record; no throughput numbers are quoted on this card (see
+> [Known limitations §2](#2-no-throughput-figures-are-published-here)).
+
+### The command
+
 ```bash
 # 1. Have the SOURCE checkpoint locally (config, tokenizer, weights).
 #    <SOURCE_DIR> = the DeepSeek-V4-Flash model directory.
@@ -232,7 +248,7 @@ Every number on this card, with how it was obtained.
 | Bake cost | 43 layers @ 370–376 s/layer on a \$1.49/hr A100, completed 04:44:51Z 2026-08-15 | Differenced consecutive layer markers (never a running average) |
 | Indexer shape mismatch | expected `[256,512]`, got `[256,4096]`, every CSA layer | Load log, this artifact |
 | GSM8K 87.0% | **PROVISIONAL**, superseded math, different bake | n=100, 0-shot chat, greedy, 2048-cap, seed 161 |
-| Throughput | **not published** | Not measured on this artifact |
+| Throughput (any form) | **not published** | Not measured on this artifact. The `cudnn` warning above is a build-flag direction, deliberately stated without numbers |
 
 ---
 
