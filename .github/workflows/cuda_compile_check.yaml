@@ -46,19 +46,23 @@ name: CUDA compile check (no GPU)
 # and both were live:
 #   1. The `paths:` filter below did not list `mistralrs-core/**`, so a PR that
 #      touched only mistralrs-core did not run this workflow AT ALL. PR #59
-#      (XsRollingCache, ~1.5k lines with a `cuda`-gated path) merged without a
-#      single CUDA build. The filter is now keyed on `**/*.rs`: any Rust change
-#      anywhere runs the lane, while a docs/wave-log-only PR still skips it.
+#      (XsRollingCache + KvCache::XsRolling, ~1,480 lines through kv_cache,
+#      deepseek4 and prefix_cacher) merged to master without a single
+#      `--features cuda` build of any kind — `gh pr checks 59` lists no CUDA
+#      job. The filter is now keyed on `**/*.rs`: any Rust change anywhere runs
+#      the lane, while a docs/wave-log-only PR still skips it.
 #   2. Scope was three `--lib` targets. Fourteen workspace crates define a
 #      `cuda` feature; those three plus mistralrs-core and mistralrs-paged-attn
 #      (pulled in transitively by arc-engine) make five. The remaining NINE —
 #      arc-cli, arc-turbo, mistralrs-cli, mistralrs-server-core, mistralrs,
 #      mistralrs-pyo3, mistralrs-bench, mistralrs-web-chat, mistralrs-server —
-#      had their CUDA-gated Rust compiled by nothing, ever. arc-cli alone gates
-#      `run_real_gpu` and the whole `bench::vendor::in_process` module on
-#      `cuda`. The cuda-typecheck job runs `cargo check --workspace --features
-#      cuda [--tests]`, which enables `cuda` on every member that has it, and
-#      covers test targets as well as libs.
+#      had `cuda` enabled by no lane, ever. Two of them own real gated blocks:
+#      arc-cli (`run_real_gpu`, the whole `bench::vendor::in_process` module,
+#      the real-vendor branch of `bench::run`) and mistralrs-cli
+#      (`commands/doctor.rs`); the other seven only forward the feature. Also
+#      uncovered: every test target outside mistralrs-quant. The cuda-typecheck
+#      job runs `cargo check --workspace --features cuda [--tests]`, which
+#      enables `cuda` on every member that has it and covers test targets too.
 #
 # WHAT THE RUST HALF BUYS — AND WHAT IT DOES NOT
 # ----------------
