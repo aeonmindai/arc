@@ -127,6 +127,9 @@ impl PrefixCacheManagerV2 {
                     // TurboQuant cache is CPU-resident for now
                     &Device::Cpu
                 }
+                KvCache::XsRolling(xs) => {
+                    xs.tail.as_ref().expect("No xs rolling cache data").device()
+                }
             };
 
             if !matches!(cache_device, Device::Cpu) {
@@ -154,6 +157,9 @@ impl PrefixCacheManagerV2 {
                 KvCache::TurboQuant(_) => {
                     // TurboQuant cache is CPU-resident for now
                     &Device::Cpu
+                }
+                KvCache::XsRolling(xs) => {
+                    xs.tail.as_ref().expect("No xs rolling cache data").device()
                 }
             };
 

@@ -36,8 +36,9 @@ use indicatif::MultiProgress;
 
 use mistralrs_core::{
     AttentionImplementation, DeepSeekV3Loader, DeepSeekV4Loader, DeviceMapper, GLM4MoeLoader,
-    IsqOrganization, NormalLoaderType, NormalLoadingMetadata, NormalModel, NormalModelLoader,
-    TextFlashParams as FlashParams, UqffFullSer, UqffSourceWeights, UQFF_MTP_TENSOR_PREFIX,
+    IsqOrganization, KvCache, NormalLoaderType, NormalLoadingMetadata, NormalModel,
+    NormalModelLoader, SingleCache, TextFlashParams as FlashParams, UqffFullSer, UqffSourceWeights,
+    UQFF_MTP_TENSOR_PREFIX,
 };
 use mistralrs_quant::{safetensors::ShardedSafeTensors, ShardedVarBuilder};
 
@@ -1471,6 +1472,16 @@ mod v4_compress {
     }
 
     pub fn config_json() -> String {
+        config_json_with_window(SLIDING_WINDOW)
+    }
+
+    /// Same fixture with a narrower sliding window. The window and the
+    /// compressed (distant-context) branch split the same softmax, so the
+    /// window size decides how much of the output the compressor is
+    /// responsible for — at the real 128 it dominates the 130-token fixture
+    /// and a corrupted compressed row barely moves the logits, which is
+    /// exactly the sensitivity a compressor test must not be run at.
+    pub fn config_json_with_window(sliding_window: usize) -> String {
         serde_json::json!({
             "architectures": ["DeepseekV4ForCausalLM"],
             "vocab_size": VOCAB_SIZE,
@@ -1499,7 +1510,7 @@ mod v4_compress {
             "n_group": 1,
             "topk_group": 1,
             "compress_ratios": COMPRESS_RATIOS,
-            "sliding_window": SLIDING_WINDOW,
+            "sliding_window": sliding_window,
             "compress_rope_theta": COMPRESS_ROPE_THETA,
             "o_lora_rank": O_LORA_RANK,
             "o_groups": O_GROUPS,
@@ -1515,6 +1526,10 @@ const V4C_PREFILL_T: usize = 130;
 const V4C_DECODE_STEPS: usize = 6;
 
 fn v4c_load() -> Box<dyn NormalModel + Send + Sync> {
+    v4c_load_with_window(v4_compress::SLIDING_WINDOW)
+}
+
+fn v4c_load_with_window(sliding_window: usize) -> Box<dyn NormalModel + Send + Sync> {
     let device = Device::Cpu;
     let tensors =
         v4_compress::weights(&device).expect("V4 compress fixture construction must not fail");
@@ -1522,7 +1537,7 @@ fn v4c_load() -> Box<dyn NormalModel + Send + Sync> {
     let loader = DeepSeekV4Loader;
     loader
         .load(
-            &v4_compress::config_json(),
+            &v4_compress::config_json_with_window(sliding_window),
             vb,
             make_metadata(&device),
             AttentionImplementation::Eager,
@@ -1682,11 +1697,94 @@ fn v4c_assert_chains_differ(a: &[f32], b: &[f32], what: &str) {
 /// merged-decode test batches the way `NormalCacheManager::clone_in_cache`
 /// does.
 #[allow(clippy::type_complexity)]
+/// Deep-copy one cache entry. A plain `clone()` shares tensor storage with
+/// the live cache, and `SingleCache::append` writes through `slice_set`, so a
+/// shallow snapshot would be silently rewritten by the next decode step.
+fn v4c_snapshot_entry(c: &KvCache) -> KvCache {
+    let copy = |t: &Option<Tensor>| t.as_ref().map(|t| t.copy().unwrap());
+    match c {
+        KvCache::Normal { k, v } => KvCache::Normal {
+            k: SingleCache {
+                all_data: copy(&k.all_data),
+                ..k.clone()
+            },
+            v: SingleCache {
+                all_data: copy(&v.all_data),
+                ..v.clone()
+            },
+        },
+        KvCache::XsRolling(xs) => {
+            let mut out = (**xs).clone();
+            out.comp.all_data = copy(&xs.comp.all_data);
+            out.tail = copy(&xs.tail);
+            KvCache::XsRolling(Box::new(out))
+        }
+        other => other.clone(),
+    }
+}
+
+/// Batch two per-sequence entries along dim 0, taking every length field from
+/// the first — byte-for-byte the contract of
+/// `NormalCacheManager::clone_in_cache` (`kv_cache/mod.rs`), which builds the
+/// batched buffer from `seqs[0]` as template and `slice_set`s each sequence in.
+fn v4c_merge_entries(a: &KvCache, b: &KvCache) -> KvCache {
+    let cat = |x: &Option<Tensor>, y: &Option<Tensor>| {
+        Some(Tensor::cat(&[x.as_ref().unwrap(), y.as_ref().unwrap()], 0).unwrap())
+    };
+    match (a, b) {
+        (KvCache::Normal { k: ka, v: va }, KvCache::Normal { k: kb, v: vb }) => KvCache::Normal {
+            k: SingleCache {
+                all_data: cat(&ka.all_data, &kb.all_data),
+                ..ka.clone()
+            },
+            v: SingleCache {
+                all_data: cat(&va.all_data, &vb.all_data),
+                ..va.clone()
+            },
+        },
+        (KvCache::XsRolling(xa), KvCache::XsRolling(xb)) => {
+            let mut out = (**xa).clone();
+            out.comp.all_data = cat(&xa.comp.all_data, &xb.comp.all_data);
+            out.tail = cat(&xa.tail, &xb.tail);
+            KvCache::XsRolling(Box::new(out))
+        }
+        _ => panic!("v4c_merge_entries: mismatched cache entry kinds"),
+    }
+}
+
+/// Slice sequence `row` back out of a batched entry — the `clone_out_cache`
+/// half, which chunks each buffer along dim 0 and keeps the length fields.
+fn v4c_split_entry(entry: &KvCache, row: usize) -> KvCache {
+    let take = |t: &Option<Tensor>| {
+        t.as_ref()
+            .map(|t| t.narrow(0, row, 1).unwrap().copy().unwrap())
+    };
+    match entry {
+        KvCache::Normal { k, v } => KvCache::Normal {
+            k: SingleCache {
+                all_data: take(&k.all_data),
+                ..k.clone()
+            },
+            v: SingleCache {
+                all_data: take(&v.all_data),
+                ..v.clone()
+            },
+        },
+        KvCache::XsRolling(xs) => {
+            let mut out = (**xs).clone();
+            out.comp.all_data = take(&xs.comp.all_data);
+            out.tail = take(&xs.tail);
+            KvCache::XsRolling(Box::new(out))
+        }
+        other => other.clone(),
+    }
+}
+
 fn v4c_solo_run(
     model: &mut Box<dyn NormalModel + Send + Sync>,
     prompt: &[u32],
     next_toks: &[u32],
-) -> (Vec<Vec<f32>>, Vec<(Tensor, Tensor)>) {
+) -> (Vec<Vec<f32>>, Vec<KvCache>) {
     let device = Device::Cpu;
     v4c_reset(model);
     let mut outs = Vec::new();
@@ -1695,26 +1793,12 @@ fn v4c_solo_run(
     let logits = v4c_step(model.as_ref(), &ids, 0).expect("solo prefill must not error");
     outs.push(v4c_row(&logits, 0));
 
-    let snapshot: Vec<(Tensor, Tensor)> = model
+    let snapshot: Vec<KvCache> = model
         .cache()
         .normal()
         .0
         .iter()
-        .map(|c| {
-            let k = c
-                .k()
-                .unwrap()
-                .expect("cache entry populated after prefill")
-                .copy()
-                .unwrap();
-            let v = c
-                .v()
-                .unwrap()
-                .expect("cache entry populated after prefill")
-                .copy()
-                .unwrap();
-            (k, v)
-        })
+        .map(v4c_snapshot_entry)
         .collect();
 
     for (s, tok) in next_toks.iter().enumerate() {
@@ -1724,6 +1808,160 @@ fn v4c_solo_run(
         outs.push(v4c_row(&logits, 0));
     }
     (outs, snapshot)
+}
+
+/// The rolling compressed `xs` state must be indistinguishable from the
+/// whole-history recompute it replaces — end to end, through the real loader,
+/// the real cache slots and the real decode loop.
+///
+/// **What is compared, and why it is the compressor state and not the logits.**
+/// Ground truth is a FRESH FULL PREFILL of the same tokens: prefill hands the
+/// compressor the whole prefix in one call (`Attention::compress_prefix`, the
+/// path wave30 did not touch), so its compressed rows are what the old
+/// every-step recompute produced. Decoding one token at a time must land on
+/// the same rows.
+///
+/// The logits are checked too, but they are the *weaker* signal and must not
+/// be mistaken for the proof. Measured on this fixture (wave30 §5): a fully
+/// corrupted compressor (mutation 1) moves the compressed rows by ~0.7 but the
+/// logits by only ~0.02 — at or below the documented CPU-MatMul F16 budget,
+/// because a 3-layer fixture with patterned weights is close to a constant
+/// function. Asserting only on logits here would be a test that cannot fail.
+/// Comparing the rows directly restores ~2 orders of magnitude of margin.
+///
+/// The schedule exercises the part that can go wrong: a 120-token prompt then
+/// 20 single-token decode steps, crossing five ratio-4 (CSA) group boundaries
+/// and the ratio-128 (HCA) boundary DURING DECODE — every one of them a row
+/// the rolling state must build from its retained tail plus the previous
+/// group, not from raw history it no longer has.
+#[test]
+fn v4_rolling_xs_decode_matches_whole_history_prefill() {
+    let device = Device::Cpu;
+    // A narrow window on purpose: the window and the compressed branch share
+    // one softmax, so at the real 128 the window covers this whole fixture and
+    // the compressor barely reaches the output. See `config_json_with_window`.
+    const WINDOW: usize = 8;
+    let mut model = v4c_load_with_window(WINDOW);
+    let vocab = v4_compress::VOCAB_SIZE;
+    const PREFILL: usize = 120;
+    const TOTAL: usize = 140;
+    let toks: Vec<u32> = (0..TOTAL).map(|i| ((i * 7 + 1) % vocab) as u32).collect();
+
+    /// The compressed rows held by every `XsRolling` slot (the entries past
+    /// the per-layer KV caches), deep-copied.
+    fn compressor_rows(model: &(dyn NormalModel + Send + Sync)) -> Vec<Tensor> {
+        model
+            .cache()
+            .normal()
+            .0
+            .iter()
+            .skip(v4_compress::NUM_LAYERS)
+            .map(|c| {
+                c.k()
+                    .unwrap()
+                    .expect("xs slot populated")
+                    .copy()
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+            })
+            .collect()
+    }
+    let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+    // Rolling: one prefill, then single-token decode. Comparing the FINAL row
+    // set covers every row ever produced — rows are append-only, so a row
+    // built wrong at step k is still wrong at the end.
+    v4c_reset(&mut model);
+    let ids = Tensor::from_vec(toks[..PREFILL].to_vec(), (1, PREFILL), &device).unwrap();
+    let mut rolling: Vec<Vec<f32>> = vec![v4c_row(
+        &v4c_step(model.as_ref(), &ids, 0).expect("prefill"),
+        0,
+    )];
+    for s in PREFILL..TOTAL {
+        let ids = Tensor::from_vec(vec![toks[s]], (1, 1), &device).unwrap();
+        let logits = v4c_step(model.as_ref(), &ids, s).expect("rolling decode step");
+        rolling.push(v4c_row(&logits, 0));
+    }
+    let rolled_rows = compressor_rows(model.as_ref());
+
+    // Ground truth: one whole-history recompute of the same tokens.
+    v4c_reset(&mut model);
+    let ids = Tensor::from_vec(toks[..TOTAL].to_vec(), (1, TOTAL), &device).unwrap();
+    v4c_step(model.as_ref(), &ids, 0).expect("reference full prefill");
+    let prefilled_rows = compressor_rows(model.as_ref());
+
+    // ---- (1) The proof: 20 decode steps of rolling state == one whole-history
+    // recompute, row for row, on every compressed layer. ----
+    assert_eq!(
+        rolled_rows.len(),
+        prefilled_rows.len(),
+        "the fixture must expose one xs slot per compressed layer"
+    );
+    assert_eq!(
+        rolled_rows.len(),
+        2,
+        "fixture ratios [0, 4, 128] give exactly two compressed layers"
+    );
+    for (layer, (got, want)) in rolled_rows.iter().zip(prefilled_rows.iter()).enumerate() {
+        assert_eq!(
+            got.dims(),
+            want.dims(),
+            "compressed-row shape diverged on compressed layer {layer}"
+        );
+        let (got, want) = (flat(got), flat(want));
+        let magnitude = v4c_max_abs(&want);
+        // Non-degenerate: an all-zero compressor would make this vacuous.
+        assert!(
+            magnitude > 1e-2,
+            "compressed rows on layer {layer} are ~zero ({magnitude}) — the equality below \
+             would prove nothing"
+        );
+        let diff = v4c_max_diff(&got, &want);
+        assert!(
+            diff <= V4C_F16_REL_TOL * magnitude,
+            "compressed layer {layer}: 20 decode steps of rolling state diverged from the \
+             whole-history recompute by {diff} (magnitude {magnitude}, budget {})",
+            V4C_F16_REL_TOL * magnitude
+        );
+    }
+    // The two layers must not be copies of each other: identical rows would
+    // mean the slots are crossed and the comparison above is testing one layer
+    // twice.
+    assert!(
+        v4c_max_diff(&flat(&rolled_rows[0]), &flat(&rolled_rows[1])) > 1e-2
+            || rolled_rows[0].dims() != rolled_rows[1].dims(),
+        "the CSA and HCA slots hold the same rows — the per-layer slots are crossed"
+    );
+
+    // ---- (2) The decode stream itself stays finite. Deliberately NOT a
+    // logit-equality check against the prefill: measured both ways, that
+    // comparison carries no signal about the compressor (mutation 1 moves
+    // these logits 0.008-0.043 against a 0.030-0.056 budget — it passes) while
+    // carrying ~1.5x the batch-vs-solo F16 tiling budget on x86 (observed:
+    // 0.0508 vs 0.0349 at 121 tokens), because a 121-token prefill GEMM and a
+    // 1-token decode over a 121-long cache round differently. Keeping it would
+    // be a check that cannot catch the bug but can fail on the host. The
+    // logit-level regression for this path is
+    // `v4_xs_history_two_seq_batch_matches_single_sequence`, which compares
+    // batched against solo — like for like, which is what that budget was
+    // calibrated on. ----
+    for (i, logits) in rolling.iter().enumerate() {
+        assert!(
+            logits.iter().all(|x| x.is_finite()),
+            "rolling decode produced a non-finite logit at step {i}"
+        );
+    }
+
+    let strides = (PREFILL + 1..=TOTAL).filter(|l| l % 4 == 0).count();
+    assert!(
+        strides >= 2,
+        "schedule crossed only {strides} ratio-4 strides during decode"
+    );
+    assert!(
+        (PREFILL..TOTAL).contains(&128),
+        "schedule must cross the ratio-128 HCA stride during decode"
+    );
 }
 
 /// A 2-sequence batch through the V4 compressor path (CSA + HCA), crossing
@@ -1781,15 +2019,8 @@ fn v4_xs_history_two_seq_batch_matches_single_sequence() {
             cache.0.len(),
             "snapshot length must match the model cache (KV entries + xs-history entries)"
         );
-        for (entry, ((ka, va), (kb, vb))) in
-            cache.0.iter_mut().zip(a_snap.iter().zip(b_snap.iter()))
-        {
-            let k = Tensor::cat(&[ka, kb], 0).unwrap();
-            let v = Tensor::cat(&[va, vb], 0).unwrap();
-            entry.reset();
-            entry
-                .append(&k, &v)
-                .expect("merging per-sequence caches into a batch must not fail");
+        for (entry, (a, b)) in cache.0.iter_mut().zip(a_snap.iter().zip(b_snap.iter())) {
+            *entry = v4c_merge_entries(a, b);
         }
     }
     // First half of the decode: both chains in one batch.
@@ -1817,26 +2048,7 @@ fn v4_xs_history_two_seq_batch_matches_single_sequence() {
     {
         let mut cache = model.cache_mut().normal();
         for entry in cache.0.iter_mut() {
-            let k = entry
-                .k()
-                .unwrap()
-                .expect("cache entry populated during decode")
-                .narrow(0, 1, 1)
-                .unwrap()
-                .copy()
-                .unwrap();
-            let v = entry
-                .v()
-                .unwrap()
-                .expect("cache entry populated during decode")
-                .narrow(0, 1, 1)
-                .unwrap()
-                .copy()
-                .unwrap();
-            entry.reset();
-            entry
-                .append(&k, &v)
-                .expect("splitting chain B back out of the batch must not fail");
+            *entry = v4c_split_entry(entry, 1);
         }
     }
     for s in shrink_at..V4C_DECODE_STEPS {
