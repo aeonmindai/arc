@@ -64,6 +64,7 @@ pub mod bitshift;
 mod cuda_ops;
 #[cfg(feature = "cuda")]
 mod ffi;
+pub(crate) mod gather_policy;
 #[cfg(test)]
 mod greedy_ban_tests;
 pub mod grouped;
@@ -3180,30 +3181,48 @@ impl QuantMethod for QtipLayer {
                 && matches!(a.device(), candle_core::Device::Cuda(_))
                 && matches!(a.dtype(), DType::BF16 | DType::F16 | DType::F32)
             {
-                // On-device (sync-free) path for the DECODE regime: reads the
-                // routing indices on-GPU so the MoE dispatch is CUDA-graph
-                // capturable. The existing `gather_forward_cuda` pulls indices
-                // to the host (a capture-aborting sync), so it stays the
-                // PREFILL path (better expert reuse across many tokens) and the
-                // fallback. Additive — existing behavior is preserved.
-                let ondevice_max_tokens = std::env::var("ARC_QTIP_ONDEVICE_MOE_MAX_TOKENS")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(8);
+                // On-device (sync-free) fused path: reads the routing indices
+                // on-GPU so the MoE dispatch is CUDA-graph capturable. The
+                // alternative, `gather_forward_cuda`, pulls indices to the host
+                // (a capture-aborting sync), dequantizes every DISTINCT expert
+                // to BF16 in HBM and holds them all live — so, unlike the
+                // bitshift rung, this rung's over-boundary path is NOT an
+                // amortizing grouped GEMM. The boundary is therefore derived
+                // from the traffic ratio between the two (16x: a BF16 write
+                // plus a BF16 read against the packed 2-bit bytes) rather than
+                // pinned at a decode-shaped constant, and it still stays inside
+                // the kernel's real structural limit (grid.y = n_pairs <=
+                // 65535). See `gather_policy` for the arithmetic.
+                let num_experts = self.num_experts_count();
+                let use_ondevice = match gather_policy::ondevice_max_tokens_override() {
+                    Some(cap) => {
+                        n_tokens <= cap
+                            && n_tokens.saturating_mul(n_experts_per_tok)
+                                <= gather_policy::GATHER_GEMV_MAX_PAIRS
+                    }
+                    None => gather_policy::lut_fused_gather_preferred(
+                        n_tokens,
+                        n_experts_per_tok,
+                        num_experts,
+                    ),
+                };
                 let ondevice_disabled = std::env::var("ARC_NO_QTIP_ONDEVICE_MOE").is_ok();
-                if !ondevice_disabled && n_tokens <= ondevice_max_tokens {
-                    // Decode regime: on-device ONLY, propagate its error. The
-                    // host fallback (`gather_forward_cuda`) does a `to_vec1` D2H
-                    // read of `indices` which, under CUDA-graph capture, is
+                if !ondevice_disabled && use_ondevice {
+                    // On-device ONLY, propagate its error. The host fallback
+                    // (`gather_forward_cuda`) does a `to_vec1` D2H read of
+                    // `indices` which, under CUDA-graph capture, is
                     // recorded-not-executed -> returns garbage indices ->
                     // out-of-bounds expert-weight read -> MMU fault. So we must
                     // never silently fall back to it in the capturable path.
                     // (RUN-161)
                     return self.gather_forward_cuda_ondevice(a, indices);
                 }
-                // Reaching here with a decode-shaped n_tokens means the
-                // on-device fused path was disabled — the per-expert
-                // dequantize below materializes weights to HBM.
+                // The per-expert dequantize below materializes weights to HBM.
+                gather_policy::log_lut_gather_fallback_once(
+                    n_tokens,
+                    n_experts_per_tok,
+                    num_experts,
+                );
                 warn_dequant_materialize_at_decode(
                     n_tokens,
                     "QtipLayer::gather_forward_cuda (per-expert dequantize+matmul)",
@@ -5691,6 +5710,194 @@ mod tests {
             cos >= 0.999,
             "CUDA gather_forward deviates from CPU: cos sim {cos} < 0.999"
         );
+        Ok(())
+    }
+
+    /// Deterministic Gaussian fixture (splitmix64 + Box-Muller), shared by the
+    /// wave28-AZ gather-boundary tests.
+    #[cfg(feature = "cuda")]
+    fn az_gaussian(len: usize, seed: u64) -> Vec<f32> {
+        let mut out = vec![0.0f32; len];
+        for (i, v) in out.iter_mut().enumerate() {
+            let mut z = ((i as u64) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let u1 = ((z >> 32) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+            let u2 = ((z & 0xFFFF_FFFF) as u32 as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+            *v = (-2.0_f32 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
+        }
+        out
+    }
+
+    #[cfg(feature = "cuda")]
+    fn az_cos_sim(x: &Tensor, y: &Tensor) -> Result<f64> {
+        let to_v = |t: &Tensor| -> Result<Vec<f32>> {
+            t.to_device(&Device::Cpu)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1()
+        };
+        let (xv, yv) = (to_v(x)?, to_v(y)?);
+        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+        for (a, b) in xv.iter().zip(yv.iter()) {
+            dot += (*a as f64) * (*b as f64);
+            na += (*a as f64) * (*a as f64);
+            nb += (*b as f64) * (*b as f64);
+        }
+        Ok(dot / (na.sqrt() * nb.sqrt()))
+    }
+
+    /// wave28-AZ — the fused on-device gather and the per-expert
+    /// dequantize-materialize fallback must agree numerically at every token
+    /// count, in particular on both sides of the hard cap of 8 this change
+    /// removed (8 / 9 / 16 / 32 / 64 / 128).
+    ///
+    /// **The test carries its own anti-vacuity guard.** A parity assertion
+    /// between two paths that both return zeros — or that both ignore the
+    /// routing — passes for free; this repo has found seven tests that could
+    /// not fail. So each token count also compares the fused output against
+    /// the fallback run on a *different* routing and requires that one to
+    /// disagree. An all-zero, constant, or routing-independent output makes the
+    /// negative control fail, which is the outcome we want from a broken kernel
+    /// rather than a green parity line.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_fused_gather_matches_dequantize_fallback_across_the_old_cap() -> Result<()> {
+        let cuda = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!(
+                    "CUDA not available; skipping \
+                     cuda_fused_gather_matches_dequantize_fallback_across_the_old_cap"
+                );
+                return Ok(());
+            }
+        };
+        let (num_experts, rows, in_features, top_k) = (16usize, 32usize, 128usize, 4usize);
+        let (stack, _w) =
+            make_expert_stack(num_experts, rows, in_features, &cuda, QtipMode::Viterbi)?;
+
+        for &n_tokens in &[1usize, 8, 9, 16, 32, 64, 128] {
+            let pairs = n_tokens * top_k;
+
+            // The dispatch change under test: the old cap sent everything past
+            // 8 tokens to the fallback; all of these must now pick the fused
+            // path for this routing shape.
+            assert!(
+                gather_policy::lut_fused_gather_preferred(n_tokens, top_k, num_experts),
+                "{n_tokens} tokens must dispatch to the fused gather"
+            );
+
+            let a = Tensor::from_vec(
+                az_gaussian(
+                    pairs * in_features,
+                    0x5A20_u64.wrapping_add(n_tokens as u64),
+                ),
+                (n_tokens, top_k, in_features),
+                &cuda,
+            )?
+            .to_dtype(DType::BF16)?;
+
+            let idx: Vec<u32> = (0..pairs)
+                .map(|i| ((i * 7 + 3) % num_experts) as u32)
+                .collect();
+            let idx_shifted: Vec<u32> = idx.iter().map(|&e| (e + 1) % num_experts as u32).collect();
+            let idx_t = Tensor::from_vec(idx, (n_tokens, top_k), &cuda)?;
+            let idx_shifted_t = Tensor::from_vec(idx_shifted, (n_tokens, top_k), &cuda)?;
+
+            let fused = stack.gather_forward_cuda_ondevice(&a, &idx_t)?;
+            let fallback = stack.gather_forward_cuda(&a, &idx_t)?;
+            assert_eq!(fused.dims(), fallback.dims(), "n_tokens={n_tokens}");
+
+            let cos = az_cos_sim(&fused, &fallback)?;
+            assert!(
+                cos >= 0.999,
+                "n_tokens={n_tokens}: fused gather vs dequantize fallback cos sim {cos} < 0.999"
+            );
+
+            // Cos sim is scale-blind, so also bound the absolute error against
+            // the fallback's own dynamic range.
+            let fv: Vec<f32> = fused
+                .to_device(&Device::Cpu)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1()?;
+            let bv: Vec<f32> = fallback
+                .to_device(&Device::Cpu)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1()?;
+            let scale = bv.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+            let max_abs = fv
+                .iter()
+                .zip(bv.iter())
+                .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+            assert!(
+                max_abs / scale <= 2e-2,
+                "n_tokens={n_tokens}: max |fused - fallback| = {max_abs} ({:.3}% of range {scale})",
+                100.0 * max_abs / scale
+            );
+
+            // ---- anti-vacuity: the comparison must be able to fail ----
+            let fallback_other = stack.gather_forward_cuda(&a, &idx_shifted_t)?;
+            let cos_other = az_cos_sim(&fused, &fallback_other)?;
+            assert!(
+                cos_other < 0.9,
+                "n_tokens={n_tokens}: output does not depend on the routing \
+                 (cos sim {cos_other} against a shifted expert assignment) — the parity \
+                 assertion above is vacuous"
+            );
+        }
+        Ok(())
+    }
+
+    /// The fused gather's one real structural limit is `grid.y = n_pairs`,
+    /// bounded by CUDA's `maxGridSize[1] = 65535`. Past it the launch fails
+    /// with `cudaErrorInvalidConfiguration`, the `extern "C"` launcher discards
+    /// the status, and the caller receives the zero-initialised output buffer —
+    /// a silently all-zero MoE layer. Assert we now get an **error** there, and
+    /// that the production dispatcher never asks for it.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_fused_gather_errors_past_the_grid_limit_instead_of_returning_zeros() -> Result<()> {
+        let cuda = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!(
+                    "CUDA not available; skipping \
+                     cuda_fused_gather_errors_past_the_grid_limit_instead_of_returning_zeros"
+                );
+                return Ok(());
+            }
+        };
+        let (num_experts, rows, in_features, top_k) = (4usize, 8usize, 64usize, 4usize);
+        let (stack, _w) =
+            make_expert_stack(num_experts, rows, in_features, &cuda, QtipMode::Viterbi)?;
+
+        let n_tokens = gather_policy::GATHER_GEMV_MAX_PAIRS / top_k + 1;
+        assert!(n_tokens * top_k > gather_policy::GATHER_GEMV_MAX_PAIRS);
+
+        let a = Tensor::from_vec(
+            az_gaussian(n_tokens * top_k * in_features, 0xA2C0),
+            (n_tokens, top_k, in_features),
+            &cuda,
+        )?
+        .to_dtype(DType::BF16)?;
+        let idx = Tensor::zeros((n_tokens, top_k), DType::U32, &cuda)?;
+
+        let err = stack
+            .gather_forward_cuda_ondevice(&a, &idx)
+            .expect_err("a launch past grid.y must be an error, not a zero-filled tensor");
+        let msg = err.to_string();
+        assert!(msg.contains("grid.y"), "unexpected error: {msg}");
+
+        // The production dispatcher must never route here in the first place.
+        assert!(!gather_policy::lut_fused_gather_preferred(
+            n_tokens,
+            top_k,
+            num_experts
+        ));
         Ok(())
     }
 

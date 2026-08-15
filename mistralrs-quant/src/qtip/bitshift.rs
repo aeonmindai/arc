@@ -1485,15 +1485,28 @@ impl QuantMethod for Qtip2bLayer {
                 && matches!(a.device(), candle_core::Device::Cuda(_))
                 && matches!(a.dtype(), DType::BF16 | DType::F16 | DType::F32)
             {
-                // Same decode-regime policy as the LUT rung: on-device only,
-                // propagate errors (host fallback would D2H-sync under graph
-                // capture and read garbage indices).
-                let ondevice_max_tokens = std::env::var("ARC_QTIP_ONDEVICE_MOE_MAX_TOKENS")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(8);
+                // On-device only, propagate errors (the CPU fallback would
+                // D2H-sync under graph capture and read garbage indices).
+                //
+                // This rung KEEPS the decode-shaped boundary while the LUT rung
+                // derives a much larger one, and the asymmetry is deliberate:
+                // above the boundary this rung goes to the trellis grouped GEMM
+                // below — tokens sorted by expert on-device, each expert's bytes
+                // read once per tile — which is precisely the amortizing kernel
+                // the fleet math wants. Raising this cap would replace a kernel
+                // whose cost tracks the number of DISTINCT experts with one
+                // whose cost is linear in (token, slot) pairs. The LUT rung has
+                // no grouped kernel, so its over-boundary path is a
+                // dequantize-materialize loop and the same cap was pure loss
+                // there. See `super::gather_policy`.
+                let ondevice_max_tokens = super::gather_policy::ondevice_max_tokens_override()
+                    .unwrap_or(super::DECODE_REGIME_MAX_TOKENS);
                 let ondevice_disabled = std::env::var("ARC_NO_QTIP_ONDEVICE_MOE").is_ok();
-                if !ondevice_disabled && n_tokens <= ondevice_max_tokens {
+                if !ondevice_disabled
+                    && n_tokens <= ondevice_max_tokens
+                    && n_tokens.saturating_mul(n_experts_per_tok)
+                        <= super::gather_policy::GATHER_GEMV_MAX_PAIRS
+                {
                     return self.gather_forward_cuda_ondevice(a, indices);
                 }
 
