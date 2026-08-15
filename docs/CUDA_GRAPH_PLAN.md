@@ -1,8 +1,22 @@
 # Arc GPU-Autonomous Decode
 
+> **This document is a PLAN.** Every figure in it is a design target. Nothing
+> here has been measured on hardware — `FACTS.md` carries no CUDA-graph decode
+> numbers, and the path has never been deployed.
+
 **Goal:** Zero CPU involvement during decode. One `cuGraphLaunch` generates the entire response. The GPU runs forward pass → sampling → EOS check → position increment → loop, without ever returning to the host.
 
-**No existing system does this.** vLLM, SGLang, and TensorRT-LLM all launch graphs from the CPU each step (~10μs). Arc eliminates the CPU from the decode loop entirely.
+**What we can say about our own design:** Arc's decode loop is built around CUDA
+12.4 **conditional graph nodes**, so the loop condition is evaluated on the
+device and no per-step host round-trip is required by construction.
+
+**What we deliberately do not claim:** we have **not** inspected or benchmarked
+vLLM, SGLang, or TensorRT-LLM's decode paths, so this document makes no claim
+about what they do or do not do. An earlier version asserted *"No existing
+system does this"* and that they *"all launch graphs from the CPU each step
+(~10μs)"* — uncited claims about third-party internals we have never read. If a
+comparison is wanted, it has to be sourced to their code or their published
+numbers, or run.
 
 ---
 
@@ -267,11 +281,19 @@ mistralrs-core/src/engine/mod.rs                           # Ring buffer polling
 
 ---
 
-## What this achieves
+## What this is designed to achieve
 
-- **0μs per-step CPU overhead** — GPU loops autonomously
-- **~2.5μs per-generation overhead** — one graph launch
-- **Zero padding waste** — fine-grained batch buckets
-- **Streaming without sync** — zero-copy ring buffer
-- **Model-agnostic** — only RoPE needs a graph-mode path; everything else is engine-level
-- **Better than every existing system** — vLLM, SGLang, TRT-LLM all have >0μs per-step CPU cost
+**All targets — none measured.** These follow from the design; none has been
+confirmed on hardware.
+
+- **0μs per-step CPU overhead** — the GPU loops autonomously via conditional
+  graph nodes, so no host round-trip is required per step **[target]**
+- **~2.5μs per-generation overhead** — one graph launch **[target]**
+- **Zero padding waste** — fine-grained batch buckets **[target]**
+- **Streaming without sync** — zero-copy ring buffer **[target]**
+- **Model-agnostic** — only RoPE needs a graph-mode path; everything else is engine-level **[design property]**
+
+No claim is made here about how this compares to vLLM, SGLang, or TRT-LLM. We
+have not measured them, and we have not read their decode paths. The number that
+would settle it is our own per-step CPU cost on hardware, which has not been
+produced.

@@ -19,7 +19,7 @@ Inference at the speed of physics.
 
 ---
 
-Arc is an inference engine built to serve frontier MoE models on radically less hardware, by composing the most aggressive open compression stack in production: **QTIP 2-bit weights, TurboQuant 3.5-bit KV cache, TD-MoE Tucker decomposition**, and model-native sparse attention kernels. Measured today: DeepSeek V4 Flash (284B / 13B active) serving from a 68 GB artifact on a **single H200**, at GSM8K 84.0% — see [Results](#results).
+Arc is an inference engine built to serve frontier MoE models on radically less hardware, by composing published compression research end-to-end: **QTIP 2-bit weights, TurboQuant 3.5-bit KV cache, TD-MoE Tucker decomposition**, and model-native sparse attention kernels. Measured today: DeepSeek V4 Flash (284B / 13B active) serving from a 68 GB artifact on a **single H200**, at GSM8K 87.0% (provisional — see [Results](#results)).
 
 Forked from [mistral.rs](https://github.com/EricLBuehler/mistral.rs). Apache 2.0. Upstream-merge-compatible.
 
@@ -29,11 +29,11 @@ Forked from [mistral.rs](https://github.com/EricLBuehler/mistral.rs). Apache 2.0
 |---|---|
 | **TurboQuant K4/V3 KV** | Zandieh et al. (Google Research, [arXiv:2504.19874](https://arxiv.org/abs/2504.19874), ICLR'26) — Arc Rust impl with fused-kernel attention path. 3.5-bit average, paper-lossless. Measured: **4.27× KV compression** end-to-end (Qwen3-32B, single H100: 39K→169K context). GQA-attention models; MLA models currently fall back to the standard KV path. |
 | **QTIP 2-bit weights** | Cornell ICLR'25 — Viterbi-decoded trellis with Hadamard incoherence rotation. 8× weight compression vs FP16. Works on any model. |
-| **TD-MoE Tucker + whitening** | "Lossless 20%" extra compression on MoE expert pool via whitened Tucker decomposition. Works on any MoE. |
+| **TD-MoE Tucker + whitening** | Whitened Tucker decomposition of the MoE expert pool. The **"lossless 20%"** figure is the **paper's** (NeurIPS'25), not ours — *published, not reproduced by us*. Works on any MoE. |
 | **Sparse attention kernels** | FlashMLASparse CUDA kernel (MIT, ported from sgl-project) for top-k attention. Dense O(n²) → sparse O(n·k). |
 | **arc-cuda-graph autonomous decode** | Full decode loop (forward + sample + EOS check) on GPU. Zero CPU sync per token. Works on any model. |
 | **`arc validate --target-hbm`** | Pre-flight memory-footprint verification on any GPU before you spend rental hours. |
-| **AA-AgentPerf-style benchmark suite** | Real agentic coding trajectories, sustained concurrent load, market-derived SLO tiers, side-by-side vs SGLang/vLLM. |
+| **AA-AgentPerf-style benchmark suite** | Real agentic coding trajectories, sustained concurrent load, market-derived SLO tiers. The harness can target other OpenAI-compatible servers, so side-by-side runs against SGLang/vLLM are *supported*, but **we have not run one** — no third-party comparison appears anywhere in this repo. |
 
 Plus everything from mistral.rs: PagedAttention, FlashAttention V2/V3, speculative decoding (EAGLE-3, Medusa, MTP), continuous batching, 100+ model architectures, GGUF/GPTQ/AWQ/ISQ, LoRA, MCP integration, multi-GPU tensor parallelism.
 
@@ -46,13 +46,13 @@ Validated as of Aug 2026 (DeepSeek V4 Flash, 284B / 13B-active MoE, single H200 
 | Claim | Status | Number |
 |---|---|---|
 | Frontier MoE on one GPU | **Measured** | 284B/13B V4 Flash serves from a **68 GB** artifact (2-bit trellis experts + FP8 attention) on a single H200 |
-| Quality at 2-bit experts | **Measured** | GSM8K **84.0%** (n=100, 0-shot chat, greedy) vs 90.8 published for the base model (8-shot — different protocol); facts 22/22, arithmetic 8/8, coherence 6/6 |
+| Quality at 2-bit experts | **Measured — provisional** | GSM8K **87.0%** (n=100, 0-shot chat, greedy, seed 161, 2048-token cap) vs 90.8 published for the base model (**8-shot** — a different and easier protocol); facts 22/22, arithmetic 8/8, coherence 6/6. **Provisional:** PR #35 changed the decode math after this was measured (SwiGLU clamp missing on 4 of 5 expert paths incl. the shared expert; YaRN on ratio-0 layers). Direction expected neutral-to-better, **unmeasured** — [details](docs/BENCHMARKS.md) |
 | Long-context correctness | **Measured** | 5/5 coherence + 4/4 needle recall (ablation matrix in BENCHMARKS.md) |
 | TurboQuant KV | **Measured** | **4.27×** KV compression, Qwen3-32B on one H100 (39K→169K-token context) |
 | qtip2b bitshift-trellis format | **Measured** | CUDA↔CPU parity, 20/20 tests on H200 |
-| Single-user decode speed | **Measured, unoptimized** | 5.4 tok/s (batch=1); expert-read kernels at 3–4% of peak HBM bandwidth — kernel optimization in progress (profile in BENCHMARKS.md) |
+| Single-user decode speed | **Measured** | **14.58 tok/s** (batch=1, no-`cudnn` build; progression 5.4 → 13.99 → 14.58 across the kernel-fix PRs). The tuned gather-GEMV variants reach 450–467 GB/s ≈ 9.5% of peak HBM — **measured-kernel**, end-to-end effect pending (profile in BENCHMARKS.md) |
 
-Throughput beyond these numbers — saturated-batch floors, per-node replica math — is arithmetic, not measurement, and lives in [docs/FLEET.md](docs/FLEET.md) explicitly marked as projected. Total spend to produce every measured number above: ≈ $77 of rented H200 time.
+Throughput beyond these numbers — saturated-batch floors, per-node replica math — is arithmetic, not measurement, and lives in [docs/FLEET.md](docs/FLEET.md) explicitly marked as projected. Total spend to produce every measured number above: ≈ $123 of rented H200 time across four sessions.
 
 ## Compression Stack
 
@@ -190,7 +190,7 @@ In rough order:
 
 - **Phase 1 — Correctness across frontier models:** Llama, Qwen, Mixtral, DeepSeek V4, Kimi K2.6, GLM-5.1 all loading and serving correctly with Arc-native fast paths.
 - **Phase 2 — Compression composition:** TEAL FFN sparsity, adaptive top-k routing, speculative routing, xKV cross-layer KV pool, MoE-aware EAGLE-3 speculative drafting.
-- **Phase 3 — Quality moat:** SCMoE (Self-Contrastive MoE decoding) with 100% retention via shared-attention + symmetric fused-kernel + one-layer-offset pipelining. Benchmark wins on GSM8K + HumanEval vs FP16 reference.
+- **Phase 3 — Quality moat:** SCMoE (Self-Contrastive MoE decoding) with 100% retention via shared-attention + symmetric fused-kernel + one-layer-offset pipelining. The open question this phase exists to answer is whether it can match — or beat — our own FP16 reference on GSM8K + HumanEval. That is a hypothesis, not a scheduled result.
 - **Phase 4 — Hardware tier expansion:** B200 / NVFP4 path for trillion-parameter models.
 
 ## License

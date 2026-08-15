@@ -21,7 +21,7 @@ difference is stated inline.
 
 | Eval | Result | Protocol | Reference point |
 |---|---|---|---|
-| GSM8K (session 3) | **87.0%** (87/100, ±6.6 pp CI95) | n=100, 0-shot chat, greedy (t=0), seed 161, max_tokens 2048; 2 degenerate outputs, 9 still truncated even at the 2048 cap; mean completion 528.4 tokens | Base model card: **90.8** — but that is **8-shot EM**, a different protocol; not directly comparable |
+| GSM8K (session 3) — **PROVISIONAL**, see below | **87.0%** (87/100, ±6.6 pp CI95) | n=100, **0-shot chat**, greedy (t=0), **seed 161**, max_tokens **2048**; 2 degenerate outputs, 9 still truncated even at the 2048 cap; mean completion 528.4 tokens | Base model card: **90.8** — but that is **8-shot EM**, a different and easier protocol; not directly comparable |
 | Factual recall (session 2) | **22/22** | greedy | — |
 | Arithmetic (session 2) | **8/8** | greedy | — |
 | Coherence battery (session 3) | **6/6** | t=1.0, p=0.95; re-validated on the session-3 bake | — |
@@ -29,6 +29,28 @@ difference is stated inline.
 | Long context (session 2) | **5/5 coherence + 4/4 needle** | greedy; ablation matrix below | — |
 | Decode speed (b=1, session 4) | **14.58 tok/s** | single stream, 256 decode tokens, 525-token prompt; prefill ~57 tok/s, TTFT ~9.2 s; build **without** the `cudnn` feature (see pitfall below) | Progression 5.4 → 13.99 → 14.58 across the kernel-fix PRs; see kernel profile below |
 | Grouped-GEMM batch curve (session 4) | **~63.5 ms/step flat from B=16 to B=64 ⇒ ~1,006 aggregate tok/s** on one H200 | **kernel-level microbench** of the batched 2-bit MoE expert path (40 MoE layers extrapolation), not end-to-end serving | Expert-read amortization demonstrated exactly as designed; the full batched-serving number is pending (planned session 5) |
+
+> ### GSM8K 87.0% is PROVISIONAL — the decode math changed after it was measured
+>
+> It was honestly measured under the protocol stated above (**n=100, 0-shot chat,
+> greedy, seed 161, 2048-token cap**). It is provisional because **PR #35**
+> (`830a41ed9`, merged after the session-3 run) changed the numerics the model
+> decodes with:
+>
+> - A **SwiGLU clamp** (`swiglu_limit: 10.0`, published in the model's own
+>   `config.json`) was missing on **4 of 5 expert paths** — *including the shared
+>   expert, which every token traverses in every layer*. On a fixture where it
+>   bites, clamped 0.7311 vs unclamped 14.8996 = **20.4×**.
+> - **YaRN** rope scaling was being applied to ratio-0 layers that must not
+>   receive it. The correct affected set is exactly **{0, 1, 43}**.
+>
+> Expected direction is neutral-to-better, but **that is unmeasured on the real
+> model**. Until the eval is re-run on post-#35 math, 87.0% must be quoted with
+> its vintage and never as the current quality of the shipped engine. The
+> perplexity (12.50) and long-context rows below carry the **same vintage and are
+> provisional for the same reason** — YaRN is a long-context effect, so the
+> long-context results are the most exposed. See
+> [engineering/OPEN_QUESTIONS.md §4](engineering/OPEN_QUESTIONS.md).
 
 **Perplexity caveat:** 12.50 is measured on a 70-chunk wiki mini-corpus, **not**
 the full wikitext-2 test set. It is NOT comparable to published full-wikitext
@@ -43,7 +65,7 @@ no "beats q2k" claim yet.
 
 | Metric | Session 1 | Session 2 | Session 3 | Session 4 | What changed |
 |---|---|---|---|---|---|
-| GSM8K | 64.0% (32/50, ±13.3 pp; 4 degenerate, 33/50 truncated at a 640-token cap) | 84.0% (n=100; 0 degenerate, 17/100 truncated at 1024) | 87.0% (n=100; 2 degenerate, 9/100 truncated at 2048) | not re-run | Session 2: PR #9 — the bake had run greedy trellis encoding (not Viterbi) on 3-D expert stacks and disabled the Hadamard rotation — fixed; token budget 640 → 1024. Session 3: token budget 1024 → 2048 (truncation was still costing points) |
+| GSM8K | 64.0% (32/50, ±13.3 pp; 4 degenerate, 33/50 truncated at a 640-token cap) | 84.0% (n=100; 0 degenerate, 17/100 truncated at 1024) | **87.0%** — **provisional** (n=100; 2 degenerate, 9/100 truncated at 2048) | not re-run | Session 2: PR #9 — the bake had run greedy trellis encoding (not Viterbi) on 3-D expert stacks and disabled the Hadamard rotation — fixed; token budget 640 → 1024. Session 3: token budget 1024 → 2048 (truncation was still costing points) |
 | Decode (b=1) | 5.24 tok/s | 5.4 tok/s | 13.99 tok/s | 14.58 tok/s | Sessions 2→3: kernel-fix PRs #8/#10/#14/#15 (Sinkhorn fused default-on, absorbed-MLA decode, FP8 GEMV, dequant-materialize guard) compounding in one build. Session 4: rebuild **without** the `cudnn` feature (see pitfall below) |
 | Perplexity (same rung) | 58.85 ± 24.76 (3 chunks) | 12.50 ± 3.46 (70 chunks) | not re-run | not re-run | Viterbi fix; wider corpus |
 | Facts | 21/22 | 22/22 | not re-run | not re-run | — |
@@ -215,11 +237,16 @@ reserved capacity.
 - **One model family validated so far.** Everything on this page is DeepSeek
   V4 Flash. Claims about other architectures are untested until they get the
   same treatment.
-- **GSM8K is an n=100 subset** (±6.6 pp CI95) under a 0-shot chat protocol
-  with a 2048-token budget (9/100 answers still truncated even at that cap,
-  and 2 degenerate outputs — both counted as wrong); the published 90.8
-  base-model figure is 8-shot EM. We state both because hiding either would
-  flatter us.
+- **GSM8K is an n=100 subset** (±6.6 pp CI95) under a 0-shot chat protocol,
+  seed 161, with a 2048-token budget (9/100 answers still truncated even at that
+  cap, and 2 degenerate outputs — both counted as wrong); the published 90.8
+  base-model figure is **8-shot EM**, a different and easier protocol. We state
+  both because hiding either would flatter us.
+- **…and it is provisional.** PR #35 (`830a41ed9`) changed the decode math
+  after it was measured — a missing SwiGLU clamp on 4 of 5 expert paths
+  (including the shared expert) and YaRN applied to ratio-0 layers. Direction is
+  expected neutral-to-better and is **unmeasured**. The same applies to the
+  perplexity and long-context rows. See the banner under the headline table.
 - **TurboQuant KV was validated on a different model** (4.27× KV compression,
   Qwen3-32B on one H100, 39K→169K context, Apr 2026). MLA-attention models —
   including V4 Flash — currently fall back to the standard KV path, so the KV

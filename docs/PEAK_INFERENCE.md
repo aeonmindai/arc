@@ -1,21 +1,93 @@
-# Peak Inference: 120 tok/s on BF16
+# Peak Inference: a 120 tok/s BF16 target
 
-**Goal:** Qwen3-32B BF16 on a single NVIDIA B200 at 120 tokens/second per request.
+> **This document is a PLAN, not a results page.** Every tok/s figure in it is a
+> **[target]** or a **[derived]** roofline. **Nothing here has been run.** No
+> B200 has ever been rented for this project, and `deploy/benchmark.py` — cited
+> below as the measurement harness — **does not exist in the tree**. For numbers
+> that were actually measured, see [BENCHMARKS.md](BENCHMARKS.md).
 
-**Theoretical limit:** 123 tok/s (65 GB weights / 8 TB/s HBM = 8.125ms, plus ~0.4ms non-weight overhead = 8.53ms → 117 tok/s conservative, 123 tok/s best case).
+## Evidence grades
 
-**Current state:** 33 tok/s (Arc), 60 tok/s (SGLang), 43 tok/s (vLLM). All on same hardware, same model, same benchmark.
+Same grading as the rest of `docs/`. Every number below carries one.
 
-**The gap is 100% software overhead.** The math:
-- Weight reads: 8.125ms (unavoidable)
-- Non-weight compute: ~0.16ms (attention, norms, activations at short context)
-- Fixed costs: ~0.25ms (LM head, sampling, graph replay)
-- **Available budget: 8.53ms per token → 117 tok/s**
-- Arc today: ~30ms per token → 17.5ms of pure overhead (kernel launches, scheduling, allocation)
+| grade | meaning |
+|---|---|
+| **[measured]** | someone ran it on hardware; the box and the shape are stated |
+| **[derived]** | arithmetic over measured quantities or over published hardware specs |
+| **[target]** | a goal we are designing toward. **Not a measurement and not a forecast** — nobody has run it |
+| **[published]** | a third party's number, measured against *their* baseline, not ours |
+
+**Target:** Qwen3-32B BF16 on a single NVIDIA B200 at 120 tokens/second per
+request. **[target]**
+
+**Roofline — needs no third party:** 65 GB weights ÷ 8 TB/s HBM = 8.125 ms/step,
+plus ~0.4 ms non-weight overhead = 8.53 ms → **117 tok/s conservative, 123 tok/s
+best case**. **[derived, from published B200 HBM specs and the model's weight
+footprint]**
+
+**Where the budget goes** — the whole reason a plan exists **[derived]**:
+- Weight reads: 8.125 ms (unavoidable)
+- Non-weight compute: ~0.16 ms (attention, norms, activations at short context)
+- Fixed costs: ~0.25 ms (LM head, sampling, graph replay)
+- **Available budget: 8.53 ms per token → 117 tok/s**
+
+Everything above the 8.53 ms floor is software overhead — kernel launches,
+scheduling, allocation — which is what the phases below attack.
+
+### What this document does NOT claim
+
+It previously published a line reading *"Current state: 33 tok/s (Arc), 60 tok/s
+(SGLang), 43 tok/s (vLLM). All on same hardware, same model, same benchmark."*
+**That comparison was never run**, on any hardware, by anyone on this project.
+It has been deleted rather than re-sourced, and no estimated replacement row has
+been substituted for it, per DOCTRINE D3.
+
+Two separate defects were in that one line:
+
+1. **The competitor half was fabricated.** We have never benchmarked SGLang or
+   vLLM. No third-party engine number in this repo may be presented as a
+   head-to-head against Arc unless we ran both sides ourselves and say where.
+2. **Arc's own 33 tok/s was equally unmeasured** — it is not in `FACTS.md`, no
+   B200 was ever rented, and the harness it was attributed to does not exist.
+   Arc's only measured decode figure is **14.58 tok/s** on a *different* model
+   and a *different* card (DeepSeek V4 Flash, 1×H200, b=1, no-`cudnn` build)
+   **[measured]** — see [BENCHMARKS.md](BENCHMARKS.md). It does not transfer
+   here and must not be quoted as this baseline.
+
+**Why no competitor row can be reconstructed for the flagship model.** For
+DeepSeek V4 Flash, **every published serving configuration we have been able to
+find needs more than one GPU.** What we actually checked, and what it said
+**[published — third-party model cards and configs; survey by us, not
+exhaustive]**:
+
+| what we checked | what it says |
+|---|---|
+| the native checkpoint | ≈160 GB — larger than a 141 GB H200 |
+| smallest published serving config | **4×H200** |
+| the one W4A16 quantization we found | 143 GB; its own model card states *"TP=1 OOMs on a single 141 GB H200"* |
+| NVFP4 | Blackwell-only, so not an H200 option |
+
+Arc's ~68 GB artifact (≈1.9 bits/param) is what makes 1×H200 possible for us.
+
+**Scope this claim honestly.** It is "we searched and found no published
+single-GPU configuration", not "none exists" — absence of evidence, not evidence
+of absence. It would be **refuted** by anyone producing a single-GPU config for
+this model, and that is the right way to state it: a claim worth publishing is
+one that says what would falsify it.
+
+The comparison we *can* defend is therefore **footprint — one GPU against a
+published four — plus $/Mtok per node**, and not a tok/s head-to-head, which we
+have never run against any engine.
+
+**Sanity-check against a roofline instead of a competitor.** For V4 Flash on
+H200: 68 GB ÷ 4.8 TB/s = 14.2 ms/step ⇒ **~4,500 tok/s at B=64** **[derived]**,
+against which the measured 63.5 ms grouped-GEMM microbenchmark sits at **~22% of
+roofline** **[measured-kernel]**. That is a real, refutable gap, and it needs no
+third party to state.
 
 ---
 
-## Phase 1: CUDA Graph Capture (33 → 90+ tok/s)
+## Phase 1: CUDA Graph Capture — target 90+ tok/s **[target]**
 
 CUDA graphs record a sequence of kernel launches once, then replay the entire sequence with a single API call (~10-20μs vs 3-7ms of individual launches). This is the single largest optimization — it eliminates the dominant source of overhead.
 
@@ -155,7 +227,7 @@ These run AFTER the graph replay, outside the captured region.
 
 ---
 
-## Phase 2: Kernel Fusion (90 → 110+ tok/s)
+## Phase 2: Kernel Fusion — target 110+ tok/s **[target]**
 
 Fused kernels eliminate intermediate memory round-trips and reduce graph node count.
 
@@ -187,7 +259,7 @@ For QKV fusion: modify model forward pass to concatenate weight matrices at load
 
 ---
 
-## Phase 3: Memory & Scheduling (110 → 120 tok/s)
+## Phase 3: Memory & Scheduling — target 120 tok/s **[target]**
 
 ### Zero-allocation decode path
 
@@ -254,14 +326,26 @@ For long contexts (1K+ tokens), split the sequence dimension across multiple thr
 
 ## Benchmark Targets
 
-| Phase | Expected tok/s | Overhead | Utilization |
-|-------|---------------|----------|-------------|
-| Current (Arc) | 33 | ~22ms | 26% |
-| Phase 1 (CUDA graphs) | 90-100 | ~1-2ms | 72-81% |
-| Phase 2 (kernel fusion) | 105-115 | ~0.5-1ms | 85-93% |
-| Phase 3 (scheduling + cuBLAS) | 115-120 | ~0.3-0.5ms | 93-97% |
+**Every row is a [target]. None has been run.** There is no measured baseline
+row because no B200 benchmark of Qwen3-32B has ever been executed on this
+project — see the caveat at the top of this document.
 
-Measurement: `deploy/benchmark.py` with 20 requests, 5 concurrent, 256 max tokens on Modal B200.
+| Phase | Target tok/s | Target overhead | Target utilization | Status |
+|-------|---------------|----------|-------------|---|
+| Baseline (Arc, unmeasured) | — | — | — | **Never run.** No B200 rental exists; the previously published "33 tok/s / ~22 ms / 26%" row was not a measurement and has been removed |
+| Phase 1 (CUDA graphs) | 90-100 | ~1-2ms | 72-81% | **[target]** |
+| Phase 2 (kernel fusion) | 105-115 | ~0.5-1ms | 85-93% | **[target]** |
+| Phase 3 (scheduling + cuBLAS) | 115-120 | ~0.3-0.5ms | 93-97% | **[target]** |
+
+**Intended** measurement protocol, once someone runs it: 20 requests, 5
+concurrent, 256 max tokens, on a Modal B200. Note that the harness this was
+attributed to, `deploy/benchmark.py`, **does not exist in the tree** — only
+`deploy/modal_b200.py` does. Writing it is part of the work, not a prerequisite
+already satisfied.
+
+**The first honest step for this document is to produce its own baseline row.**
+Until that exists, no phase in this plan has a measured starting point, and the
+speedup ratios implied by the table are unfounded.
 
 ---
 
