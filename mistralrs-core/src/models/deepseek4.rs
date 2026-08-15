@@ -812,6 +812,42 @@ impl QProj {
     }
 }
 
+/// Guard for the PagedAttention arm of [`Attention::forward`].
+///
+/// `PagedAttention::cache_write_and_gather`
+/// (`paged_attention/layers/paged_attention.rs:391`) returns the gathered K/V
+/// as `[1, H, N_total, D]`: the CUDA `gather_kv_cache` produces
+/// `[N_total, H, D]` where `N_total = sum_i(seqlen_i)` over every scheduled
+/// sequence, and the wrapper lifts it with a bare `unsqueeze(0)` (`:508-509`).
+/// That is a **varlen pack**, not a batch.
+///
+/// [`super::dsv4_attention::dsv4_attention`]'s shape contract is
+/// `k, v: [B, 1, T_k, D]` with `T_k` the cached length of ONE sequence: it
+/// derives `q0 = t_k - t_q` and both the sliding-window mask and the
+/// compressed-block causality mask from `t_k` alone
+/// (`dsv4_attention.rs:270-294`). Handing it the pack at `bs > 1` makes every
+/// query attend over the concatenation of all sequences' keys, positioned as
+/// if they were one stream — wrong output, no error.
+///
+/// The per-sequence slice + dispatch loop that would fix it is audit §8 P0
+/// item 9 and is not implemented (`paged_attention.rs:383-388` records the
+/// deferral). Until it exists, refuse the batch loudly rather than serve
+/// corrupted tokens. This is only reachable if
+/// `DeepSeekV4Loader::supports_paged_attention` is flipped to `true`; see the
+/// rationale there.
+fn v4_paged_dispatch_precheck(bs: usize) -> Result<()> {
+    if bs > 1 {
+        candle_core::bail!(
+            "V4 PagedAttention dispatch does not support batch_size > 1 (got {bs}): \
+             cache_write_and_gather returns a varlen pack [1, H, sum(seqlen), D], \
+             but dsv4_attention needs one sequence's [B, 1, T_k, D]. Enabling \
+             paged attention for V4 requires the per-sequence slice + dispatch \
+             loop (audit §8 P0 item 9) first."
+        );
+    }
+    Ok(())
+}
+
 /// V4 Attention layer — MQA with fused KV projection.
 ///
 /// Audit §0 + §2 (SGLang `MQALayer` lines 172-360). The fundamental
@@ -1421,6 +1457,7 @@ impl Attention {
                 // through `dsv4_attention` — they need the sliding-window
                 // mask, which the dense paged kernel cannot apply.
                 Some(((mut key_cache, mut value_cache, _, _), input_metadata)) => {
+                    v4_paged_dispatch_precheck(bs)?;
                     let (k_full, v_full) = paged_attn.cache_write_and_gather(
                         &k,
                         &v,
@@ -5081,6 +5118,163 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    // ============================================================
+    // Wave 29 (BC): the PagedAttention arm is single-sequence only.
+    //
+    // `PagedAttention::cache_write_and_gather` returns the gathered K/V as
+    // `[1, H, N_total, D]` — the CUDA `gather_kv_cache` emits
+    // `[sum_i(seqlen_i), H, D]` and the wrapper lifts it with a bare
+    // `unsqueeze(0)` (`paged_attention/layers/paged_attention.rs:508-509`).
+    // That is a varlen PACK, not a batch. `dsv4_attention` reads `t_k` as one
+    // sequence's cached length and derives `q0 = t_k - t_q` plus the
+    // sliding-window and compressed-block masks from it
+    // (`dsv4_attention.rs:270-294`), so at `bs > 1` every query attends over
+    // the concatenation of all sequences' keys at wrong absolute positions.
+    //
+    // The two tests below (a) demonstrate that corruption on real tensors and
+    // (b) prove the guard that now refuses it.
+
+    /// The varlen pack is NOT a batch: attending over it gives sequence 0 a
+    /// different answer than attending over its own keys alone. This is the
+    /// concrete failure `v4_paged_dispatch_precheck` exists to prevent — it is
+    /// demonstrated here rather than asserted, so the guard is not justified by
+    /// a claim nobody checked.
+    #[test]
+    fn v4_paged_varlen_pack_leaks_keys_across_sequences() -> Result<()> {
+        use crate::attention::SdpaParams;
+        use crate::models::dsv4_attention::{dsv4_attention, Dsv4AttentionConfig};
+        use crate::pipeline::text_models_inputs_processor::FlashParams;
+
+        let device = Device::Cpu;
+        let head_dim = 8;
+        let t_k = 3; // cached length of EACH sequence
+        let n_q_heads = 1;
+
+        let mk = |seed: f32, t: usize| -> Result<Tensor> {
+            Tensor::from_vec(
+                (0..(t * head_dim))
+                    .map(|i| ((i as f32) * 0.31 + seed).sin())
+                    .collect::<Vec<f32>>(),
+                (1, 1, t, head_dim),
+                &device,
+            )
+        };
+        // Per-sequence K/V (V == K on V4) and one decode query each.
+        let k0 = mk(0.0, t_k)?;
+        let k1 = mk(5.0, t_k)?;
+        let q0 = mk(1.0, 1)?;
+        let q1 = mk(2.0, 1)?;
+
+        let sdpa_params = SdpaParams {
+            n_kv_groups: 1,
+            softcap: None,
+            softmax_scale: 1.0 / (head_dim as f32).sqrt(),
+            sliding_window: None,
+            sinks: None,
+        };
+        let flash_params = FlashParams {
+            max_q: 0,
+            max_k: 0,
+            cumulative_seqlens_q: std::collections::HashMap::new(),
+            cumulative_seqlens_k: std::collections::HashMap::new(),
+            causal: false,
+        };
+        // Standard (ratio-0) layer with a window wide enough that masking is
+        // not what separates the two results — only the key set is.
+        let cfg = Dsv4AttentionConfig {
+            compress_ratio: CompressRatio::Standard,
+            sliding_window: 1024,
+        };
+
+        // Correct: sequence 0 attends over its own 3 keys.
+        let want = dsv4_attention(&q0, &k0, &k0, None, None, &flash_params, &sdpa_params, cfg)?;
+
+        // What the paged arm would hand it at bs=2: K/V packed along the
+        // sequence axis with B still 1, queries batched with B=2.
+        let k_pack = Tensor::cat(&[&k0, &k1], 2)?.contiguous()?;
+        let q_batch = Tensor::cat(&[&q0, &q1], 0)?.contiguous()?;
+        assert_eq!(k_pack.dims(), &[1, 1, 2 * t_k, head_dim]);
+        assert_eq!(q_batch.dims(), &[2, n_q_heads, 1, head_dim]);
+
+        // (a) The mechanism, silently: `dsv4_attention` reads `t_k` as ONE
+        //     sequence's cached length, so the pack changes both the key set
+        //     sequence 0 sees (6 keys, 3 of them sequence 1's) and its own
+        //     absolute position (`q0 = t_k - t_q`). Same query, same weights,
+        //     different answer — no error anywhere.
+        let leaked = dsv4_attention(
+            &q0,
+            &k_pack,
+            &k_pack,
+            None,
+            None,
+            &flash_params,
+            &sdpa_params,
+            cfg,
+        )?;
+        let want_v: Vec<f32> = want.flatten_all()?.to_vec1()?;
+        let leaked_v: Vec<f32> = leaked.flatten_all()?.to_vec1()?;
+        assert_eq!(want_v.len(), leaked_v.len());
+        let max_diff = want_v
+            .iter()
+            .zip(leaked_v.iter())
+            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(
+            max_diff > 1e-4,
+            "the two-sequence pack reproduced sequence 0's own answer exactly \
+             (max_diff={max_diff}); if gather ever starts returning a real \
+             batch, delete v4_paged_dispatch_precheck rather than keep a guard \
+             that no longer guards anything"
+        );
+
+        // (b) And the honestly-batched form does not survive at all: with `q`
+        //     at B=2 against the B=1 pack, the CPU SDPA backend indexes off the
+        //     end of its slice. A crash deep in `attention/backends/cpu.rs` is
+        //     not a diagnosis — which is why the guard names the batch size at
+        //     the call site instead.
+        let batched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dsv4_attention(
+                &q_batch,
+                &k_pack,
+                &k_pack,
+                None,
+                None,
+                &flash_params,
+                &sdpa_params,
+                cfg,
+            )
+        }));
+        let survived_cleanly = matches!(&batched, Ok(Ok(_)));
+        assert!(
+            !survived_cleanly,
+            "a B=2 query against a B=1 varlen pack returned an output — if the \
+             backends have started broadcasting this, re-derive whether the \
+             result is per-sequence correct before relaxing the guard"
+        );
+        Ok(())
+    }
+
+    /// The guard actually invoked at the PagedAttention call site in
+    /// `Attention::forward`. Mutation check: make `v4_paged_dispatch_precheck`
+    /// return `Ok(())` unconditionally and this test fails.
+    #[test]
+    fn v4_paged_dispatch_precheck_refuses_multi_sequence_batches() {
+        assert!(
+            v4_paged_dispatch_precheck(1).is_ok(),
+            "single-sequence paged decode is the supported case and must pass"
+        );
+        for bs in [2usize, 8, 32, 128] {
+            let err = v4_paged_dispatch_precheck(bs).expect_err(
+                "bs>1 must be refused: cache_write_and_gather packs, it does not batch",
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("batch_size > 1") && msg.contains(&bs.to_string()),
+                "the refusal must name the offending batch size so a paid-box log \
+                 says what happened; got: {msg}"
+            );
+        }
     }
 
     /// Same shape contract for HCA (ratio=128). Verifies that the larger
