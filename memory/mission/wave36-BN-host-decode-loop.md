@@ -123,6 +123,12 @@ B=64 profile puts `forward_total` at **210 ms of a 2105 ms step — 10 %**. So
 suspects, none of which has been shown to sum to 24 ms/seq. Do not let this
 report close the question.
 
+> **Caveat on that 10 %, stated because it is load-bearing.** The 210 ms came
+> from a **separate serve process** (`ARC_TIME_DECODE=1`) and the 2105 ms from
+> the sweep process; the ratio assumes the two ran at the same step rate. Same
+> binary, same model, same box — but it is a cross-process comparison, not one
+> measurement. Confirming it needs the §8.3 instrumentation on one process.
+
 **Instrumentation gap that makes this hard:** the `STEP_us avg ... TOTAL= fwd=
 sample= other=` line only exists in the **PagedAttention** branch
 (`pipeline/mod.rs:1300-1324`). V4 has `supports_paged_attention() -> false`
