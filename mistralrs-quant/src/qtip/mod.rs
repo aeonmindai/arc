@@ -75,7 +75,20 @@ mod search_bench;
 pub mod tune;
 mod viterbi;
 pub use bitshift::{Qtip2bLayer, QTIP2B_MCG_MULT};
-pub use grouped::{ExpertBpwTable, TrellisBpw};
+// The MoE dispatch facts a benchmark needs in order to prove it measured what
+// it claims: the routing model the amortization argument rests on, the
+// structural pair ceiling, the env var that selects the path, and the tile
+// geometry that decides whether the grouped kernel is reachable at all.
+// Exported rather than re-derived so a harness cannot drift from the dispatch.
+pub use gather_policy::{
+    expected_distinct_experts as qtip_expected_distinct_experts,
+    GATHER_GEMV_MAX_PAIRS as QTIP_GATHER_GEMV_MAX_PAIRS,
+    ONDEVICE_MOE_MAX_TOKENS_ENV as QTIP_ONDEVICE_MOE_MAX_TOKENS_ENV,
+};
+pub use grouped::{
+    ExpertBpwTable, TrellisBpw, GROUPED_TILE_K as QTIP_GROUPED_TILE_K,
+    GROUPED_TILE_M as QTIP_GROUPED_TILE_M, GROUPED_TILE_N as QTIP_GROUPED_TILE_N,
+};
 #[allow(unused_imports)]
 pub use viterbi::{
     hessian_row_weights, quantize_row, viterbi_quantize_row, TrellisSearch, HESSIAN_SIGMA_REG,

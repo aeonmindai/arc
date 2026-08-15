@@ -22,15 +22,21 @@
 //!    with `QG_TILE_M` / `QG_TILE_N` / `QG_TILE_K` there.
 
 /// Pairs per m-tile (one `mma.m16n8k16` M dimension). Mirrors `QG_TILE_M`.
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))] // CUDA dispatch + tests
-pub(crate) const GROUPED_TILE_M: usize = 16;
+///
+/// Public because the amortization a benchmark can legitimately claim is
+/// bounded by it: each expert's weights are staged once per m-tile, so the
+/// asymptotic weight-read saving over a per-pair GEMV is at most `TILE_M`.
+pub const GROUPED_TILE_M: usize = 16;
 /// Weight rows per n-tile (4 warps x 16). Mirrors `QG_TILE_N`.
-#[allow(dead_code)] // device-side geometry; kept host-side for tests/docs
-pub(crate) const GROUPED_TILE_N: usize = 64;
+pub const GROUPED_TILE_N: usize = 64;
 /// Symbols per k-chunk (16 packed bytes per row). Mirrors `QG_TILE_K`.
 /// The grouped path requires `in_features % GROUPED_TILE_K == 0`.
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))] // CUDA dispatch gate
-pub(crate) const GROUPED_TILE_K: usize = 64;
+///
+/// Public so a harness can assert its fixture actually reaches the grouped
+/// kernel: when this divisibility fails, `gather_forward` silently takes the
+/// CPU reference instead and a "grouped" timing measures something else
+/// entirely (DOCTRINE D12).
+pub const GROUPED_TILE_K: usize = 64;
 
 /// Host-side upper bound on the grouped GEMM's m-tile count: every expert
 /// group contributes at most one partial tile beyond its full tiles, so
