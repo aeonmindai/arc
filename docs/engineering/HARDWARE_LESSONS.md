@@ -31,13 +31,24 @@ the **nvcc version** and the **`-arch` target**, not by the silicon. An A30 and
 an A100 are both `sm_80` and get identical codegen from a given toolkit. So a
 cheap-card A/B is only valid for a register or occupancy change **if the cheap
 box builds with the same toolchain as production**. PR #40's kernel stack was
-A/B'd under nvcc 11.5 against a production build on CUDA 12.8; the old compiler
-produced a more register-starved *baseline*, which handed the optimization more
-headroom than the shipped build has, and turned the resulting 1.21× into an
-**upper bound rather than a measurement**. Record `nvcc --version` and the
-`-arch` alongside every occupancy or register number, and never compare across
-them. Full write-up in
-[QUANTIZATION_PERFORMANCE.md](QUANTIZATION_PERFORMANCE.md#predictions-that-failed-and-why).
+A/B'd under nvcc 11.5 against a production build on CUDA 12.8, and the number it
+produced (1.21×) was **not** the production number (**1.33×**, measured
+2026-08-15). Record `nvcc --version` and the `-arch` alongside every occupancy or
+register number, and never compare across them.
+
+**The second, sharper half of this lesson — it cost us more than the first.** On
+seeing the toolchain mismatch we reasoned that nvcc 11.5's register-starved
+baseline had *flattered* the optimisation, and published 1.21× as an **upper
+bound** on the shipped gain. Production measured **higher**. The wrong-toolchain
+observation was correct; the **direction** we inferred from it was assumed, never
+tested, and backwards. A cheap-card ratio built on the wrong toolchain is
+**unrepresentative in an unknown direction** — it is not a bound in either
+direction until you measure which way it errs. The cheap fix is the one we
+eventually ran: **~$0.35 of box time on the machine that already had the model
+resident**, differencing per-layer log markers between two binaries. Full
+write-up in
+[QUANTIZATION_PERFORMANCE.md](QUANTIZATION_PERFORMANCE.md#predictions-that-failed-and-why),
+items 2 and 5.
 
 ### Re-entry arithmetic (why "just delete it" is sometimes wrong)
 
@@ -175,8 +186,9 @@ quantizing this model.
 device as the quantization target and passes it to the ISQ apply. That makes the
 "move the result back to host" condition false, so **every quantized expert stack
 stays resident on the GPU**. For this model that is `3 × 537 MB = 1.61 GB/layer`,
-**69 GB over 43 layers** — exactly the size of the 68 GB artifact, and exactly the
-measured 1.7–1.9 GB/layer baseline growth [measured + derived]. Correct behaviour
+**69 GB over 43 layers** — the same order as the 74.18 GB artifact (the residual
+is the non-expert tensors the artifact also carries), and exactly the measured
+1.7–1.9 GB/layer baseline growth [measured + derived]. Correct behaviour
 for a *serve*; pure cost for a *bake*, which constructs the model only so it can
 be serialized.
 
@@ -202,7 +214,7 @@ magnitude — not an 80 GB difference.
 | bake-to-host switch | during a UQFF bake the quantize still runs on the accelerator, but the packed result is materialized on the **host**, reusing the move-back path that already existed |
 | contiguous chunk materialization | `force_contiguous()` on partial chunks, so `to_device` ships the chunk (268 MiB) rather than the whole stack (4.295 GiB) |
 | VRAM budget guard | samples device usage once per fused MoE layer and bails when `used + remaining × growth` would exceed the card, printing every term; slope is a trailing 4-layer mean and it stops only after **5 consecutive** over-budget projections, so a one-off allocator jump cannot trip it |
-| streaming shard writer | writes ≤10 GB shards as it goes instead of buffering the whole 68 GB artifact in host RAM before splitting |
+| streaming shard writer | writes ≤10 GB shards as it goes instead of buffering the whole ~74 GB artifact in host RAM before splitting |
 | PagedAttention off for `quantize` | it sizes its KV cache from *free* VRAM — which this fix makes large — for a command that never emits a token |
 
 **Result: a flat ~10.5 GiB peak across all 43 layers** [derived from the per-layer

@@ -67,7 +67,10 @@ exhaustive]**:
 | the one W4A16 quantization we found | 143 GB; its own model card states *"TP=1 OOMs on a single 141 GB H200"* |
 | NVFP4 | Blackwell-only, so not an H200 option |
 
-Arc's ~68 GB artifact (≈1.9 bits/param) is what makes 1×H200 possible for us.
+Arc's **74.18 GB** artifact (≈1.9 bits/param [derived], measured via the HF API
+on the published `aeonmind/DeepSeek-V4-Flash-UQFF-qtip2`) is what makes 1×H200
+possible for us — with ~59 GB of the 141 GB card left for KV and activations
+(141 − 74.18 − ~8 GB runtime).
 
 **Scope this claim honestly.** It is "we searched and found no published
 single-GPU configuration", not "none exists" — absence of evidence, not evidence
@@ -80,9 +83,9 @@ published four — plus $/Mtok per node**, and not a tok/s head-to-head, which w
 have never run against any engine.
 
 **Sanity-check against a roofline instead of a competitor.** For V4 Flash on
-H200: 68 GB ÷ 4.8 TB/s = 14.2 ms/step ⇒ **~4,500 tok/s at B=64** **[derived]**,
-against which the measured 63.5 ms grouped-GEMM microbenchmark sits at **~22% of
-roofline** **[measured-kernel]**. That is a real, refutable gap, and it needs no
+H200: 74.18 GB ÷ 4.8 TB/s = 15.5 ms/step ⇒ **~4,100 tok/s at B=64**
+**[derived]**, against which the measured 63.5 ms grouped-GEMM microbenchmark
+sits at **~24% of roofline** **[measured-kernel]**. That is a real, refutable gap, and it needs no
 third party to state.
 
 ---

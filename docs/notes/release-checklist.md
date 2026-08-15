@@ -106,7 +106,7 @@ hf upload <org>/DeepSeek-V4-Flash-UQFF <output-dir> --repo-type model --private
 
 Plan:
 
-1. Source of the artifact: **reuse the session-4 bake** (68 GB, 7 shards,
+1. Source of the artifact: **reuse the session-4 bake** (74.18 GB, 8 shards + residual,
    `--isq qtip2` 2-bit trellis experts + FP8 attention, baked with the
    Viterbi default) if the session tarball is intact; otherwise re-bake on a
    rented H200 (~25 min build + ~24 min bake at 30 s/layer, ~$5 of GPU time)

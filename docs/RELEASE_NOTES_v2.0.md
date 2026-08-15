@@ -10,7 +10,7 @@
 Arc v2.0 is the first release of Arc as a product rather than a fork-in-
 progress: a Rust inference engine that serves a frontier MoE — DeepSeek V4
 Flash, 284B logical / 13B active parameters — **on a single H200** from a
-**68 GB artifact**, with the quality, correctness, and speed numbers measured
+**74.18 GB artifact**, with the quality, correctness, and speed numbers measured
 on rented hardware and published with their protocols
 ([docs/BENCHMARKS.md](BENCHMARKS.md)) and the fleet-economics case tagged
 measured vs projected ([docs/FLEET.md](FLEET.md)).
@@ -18,7 +18,7 @@ measured vs projected ([docs/FLEET.md](FLEET.md)).
 The release is built on five pieces:
 
 1. **Single-GPU 284B serving.** A 2-bit trellis expert bake (qtip2 family) +
-   FP8 attention produces a 68 GB, 7-shard UQFF artifact that loads and
+   FP8 attention produces a 74.18 GB, 8-shard-plus-residual UQFF artifact (15 files, HF-API-verified) that loads and
    serves on one 141 GB H200 with the model fully resident. Quality on that
    artifact: GSM8K 87.0% — **provisional**, see the caveats section (n=100,
    0-shot chat greedy, seed 161, 2048-token cap, ±6.6 pp), facts 22/22,
@@ -69,7 +69,7 @@ table: **≈ $123**.
 
 | Number | Value | Type |
 |---|---|---|
-| Model on one GPU | 284B/13B V4 Flash from a 68 GB artifact (2-bit trellis experts + FP8 attention) | Measured |
+| Model on one GPU | 284B/13B V4 Flash from a 74.18 GB artifact (2-bit trellis experts + FP8 attention) | Measured |
 | GSM8K | **87.0%** (n=100, 0-shot chat greedy, seed 161, 2048-token cap, ±6.6 pp; base model card 90.8 is **8-shot** — a different and easier protocol) | **Measured — provisional** (pre-PR-#35 decode math) |
 | Quality ladder | GSM8K 64 → 84 → 87.0 across sessions (Viterbi encoder fix, then token budget) | **Measured — provisional** |
 | Factual recall / arithmetic / coherence | 22/22 · 8/8 · 6/6 | Measured |
