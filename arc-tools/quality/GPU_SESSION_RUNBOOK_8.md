@@ -349,6 +349,36 @@ python3 run_gsm8k.py --n 100 --max-tokens 2048 --seed 161 \
 > control; omitting it *is* 0-shot. Requires `data/gsm8k_test.jsonl` — run
 > `bash fetch_data.sh` first.
 
+#### S5b — FULL-SET GSM8K (~2 h, ~$10 at $4.85/h) — ready to fire
+
+```bash
+# 1,319 problems, batched. Resumable: rerun the identical command after any
+# drop and it picks up where it stopped.
+python3 run_gsm8k.py --all --concurrency 16 --max-tokens 2048 --seed 161 \
+  --checkpoint-every 10 --out results/gsm8k_full.json
+```
+
+**Why the full set.** At n=100 the 95% CI is **±3.8pp** — [92.2, 99.8] around
+96.0, which cannot be separated from the published 90.8 anchor. At n=1,319 it
+tightens to **±1.1pp**. That is the difference between a number that survives
+public scrutiny and one that does not.
+
+**Cost basis** (wave34-BL measurements, not estimates): mean completion 148.5
+tok x 1,319 = ~196k decode tokens. Aggregate decode peaks at **B=16, 30.65
+tok/s** and is flat to B=64, so ~1.8 h of decode, ~2 h wall with prefill and
+HTTP. At `--concurrency 1` the same run is **~3.8 h / ~$19** — the batching is
+worth roughly $9 and two hours.
+
+> ⚠️ `--concurrency 16` REQUIRES the per-sequence `xs_history` fix (PR #21) in
+> the served build. On an older build concurrent sequences share the
+> compressor buffer and the numbers are silently wrong, not loudly broken.
+>
+> ⚠️ The run now **exits 1** if it sees any degenerate loop, any truncation or
+> any request error (`--max-degenerate/--max-truncated/--max-errors`, all
+> default 0). The results JSON is still written. Read the `FAIL:` line before
+> assuming the cap is at fault — `--max-tokens 2048` was enough for 100/100 of
+> wave34-BL at a mean of 148 tokens.
+
 **87.0% is PROVISIONAL and must be re-measured.** PR #35 changed the decode
 math on every token's path: the SwiGLU clamp was missing on **4 of the 5 expert
 paths including the shared expert**, and YaRN was being applied to the ratio-0
