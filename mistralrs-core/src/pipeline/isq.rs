@@ -899,6 +899,19 @@ pub trait IsqModel {
 
                 info!("Applying ISQ on {minimum_max_threads} threads — {threads_rationale}.");
 
+                // Fewer submitters than devices means the tail of the device
+                // list never receives a layer. That is a silent no-speedup, so
+                // say which of the two reasons caused it rather than letting a
+                // 4-hour bake quietly run on one GPU.
+                if minimum_max_threads < n_bake_devices {
+                    warn!(
+                        "Only {minimum_max_threads} of the {n_bake_devices} requested bake \
+                         device(s) will receive layers: {threads_rationale}. Either this rung \
+                         quantizes on host cores (extra GPUs add no compute) or an imatrix \
+                         collection forced a single submitter."
+                    );
+                }
+
                 let pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(minimum_max_threads)
                     .build()
