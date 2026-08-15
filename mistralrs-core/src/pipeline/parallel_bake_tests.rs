@@ -480,6 +480,54 @@ fn a_device_list_is_rejected_on_a_non_cuda_bake() {
 // The real thing, on real silicon
 // ---------------------------------------------------------------------------
 
+/// The invariant every device-spreading design needs, isolated from the
+/// spreading itself: quantizing a layer on device 1 gives the same bytes as
+/// quantizing it on device 0.
+///
+/// This is not implied by the two-device test — it is what *makes* the
+/// two-device test's result meaningful. A 2-device bake puts layer 1 on device
+/// 1 where a 1-device bake put it on device 0, so if the quantizer's output
+/// were device-dependent at all, no design could produce a byte-identical
+/// artifact. Testing it on its own says which half broke when it breaks.
+#[cfg(feature = "cuda")]
+#[test]
+fn a_layer_quantizes_identically_on_either_device() {
+    let (Ok(dev0), Ok(_)) = (Device::new_cuda(0), Device::new_cuda(1)) else {
+        eprintln!("skipping: fewer than two CUDA devices");
+        return;
+    };
+    let ty = Some(mistralrs_quant::IsqType::QtipBitshift2);
+    let globals = BakeGlobals::acquire(Some(vec![0]), /*to_host=*/ true);
+
+    let on_zero = scratch_dir("only-cuda0");
+    bake(
+        &mut FakeModel::new(4, 0, 512, 1024),
+        &on_zero,
+        ty,
+        dev0.clone(),
+    );
+    let zero_counts = mistralrs_quant::bake_device_layer_counts();
+
+    globals.set_devices(Some(vec![1]));
+    let on_one = scratch_dir("only-cuda1");
+    bake(
+        &mut FakeModel::new(4, 0, 512, 1024),
+        &on_one,
+        ty,
+        dev0.clone(),
+    );
+    let one_counts = mistralrs_quant::bake_device_layer_counts();
+
+    // Each leg really did run entirely on the device it names.
+    assert_eq!(zero_counts.keys().copied().collect::<Vec<_>>(), vec![0]);
+    assert_eq!(one_counts.keys().copied().collect::<Vec<_>>(), vec![1]);
+
+    compare_inventories(&inventory(&on_one), &inventory(&on_zero)).expect(
+        "the same layer quantized on cuda:1 must produce the same bytes as on \
+         cuda:0 — every parallel-bake design depends on this",
+    );
+}
+
 /// Bake the same model on one CUDA device and on two, and require the artifacts
 /// to be byte-identical.
 ///
