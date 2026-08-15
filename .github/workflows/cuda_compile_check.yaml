@@ -49,12 +49,16 @@ name: CUDA compile check (no GPU)
 #      (XsRollingCache, ~1.5k lines with a `cuda`-gated path) merged without a
 #      single CUDA build. The filter is now keyed on `**/*.rs`: any Rust change
 #      anywhere runs the lane, while a docs/wave-log-only PR still skips it.
-#   2. Scope was three `--lib` targets. The other twelve workspace crates that
-#      define a `cuda` feature (arc-cli, arc-bench, arc-turbo, mistralrs-cli,
-#      mistralrs-server-core, mistralrs, mistralrs-pyo3, ...) and every
-#      non-lib target were never type-checked under `cuda`. The cuda-typecheck
-#      job runs `cargo check --workspace --features cuda [--tests]`, which
-#      enables `cuda` on every workspace member that has it.
+#   2. Scope was three `--lib` targets. Fourteen workspace crates define a
+#      `cuda` feature; those three plus mistralrs-core and mistralrs-paged-attn
+#      (pulled in transitively by arc-engine) make five. The remaining NINE —
+#      arc-cli, arc-turbo, mistralrs-cli, mistralrs-server-core, mistralrs,
+#      mistralrs-pyo3, mistralrs-bench, mistralrs-web-chat, mistralrs-server —
+#      had their CUDA-gated Rust compiled by nothing, ever. arc-cli alone gates
+#      `run_real_gpu` and the whole `bench::vendor::in_process` module on
+#      `cuda`. The cuda-typecheck job runs `cargo check --workspace --features
+#      cuda [--tests]`, which enables `cuda` on every member that has it, and
+#      covers test targets as well as libs.
 #
 # WHAT THE RUST HALF BUYS — AND WHAT IT DOES NOT
 # ----------------
@@ -265,7 +269,7 @@ jobs:
             cuda-check-cc90-
 
       # `--workspace --features cuda` turns the `cuda` feature on for every
-      # workspace member that defines one (15 of them today), so the FFI shims,
+      # workspace member that defines one (14 of them today), so the FFI shims,
       # pointer helpers, graph-capture code, sampler bindings and cache variants
       # are all compiled — including in the crates the nvcc jobs never touch.
       - name: Type-check CUDA-gated Rust (workspace)
