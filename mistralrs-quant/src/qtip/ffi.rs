@@ -11,15 +11,14 @@ use half::{bf16, f16};
 /// capability.
 pub(crate) const HAVE_QTIP_KERNELS: bool = cfg!(has_qtip_kernels);
 
-/// Codebook selector carried by every K=4/V=2 launcher below.
-///
-/// `cb_mult == 0` means "gather the reproduction values from the stored
-/// `d_lut` table" — the Gaussian rung, unchanged. A nonzero value is the MCG
-/// multiplier of the computed `sum2` codebook, and the kernel then ignores
-/// `d_lut` entirely (`kernels/qtip/qtip_codebook.cuh`). 0 is a safe sentinel
-/// because an MCG multiplier must be odd, so it can never name a real
-/// codebook. `QtipCodebook::cuda_mult()` is the only thing that produces it.
-pub(crate) const CB_MULT_GAUSSIAN_LUT: u32 = 0;
+// Codebook selector carried by every K=4/V=2 launcher below.
+//
+// `cb_mult == 0` (`super::CB_MULT_GAUSSIAN_LUT`) means "gather the reproduction
+// values from the stored `d_lut` table" — the Gaussian rung, unchanged, and
+// byte-for-byte the kernel that shipped before the selector existed. A nonzero
+// value is the MCG multiplier of the computed `sum2` codebook, and the kernel
+// then ignores `d_lut` entirely (`kernels/qtip/qtip_codebook.cuh`).
+// `QtipCodebook::cuda_mult()` is the only thing that produces the value.
 
 #[cfg(feature = "cuda")]
 extern "C" {

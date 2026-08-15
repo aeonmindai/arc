@@ -34,6 +34,10 @@ use super::{
 };
 use crate::turboquant::wht::generate_signs;
 
+/// A one-edit variant of `mcg_codeword_v2`: same `(state, mult)` in, a
+/// codeword pair out.
+type Mutation = fn(u32, u32) -> (f32, f32);
+
 /// Mean / sigma / min|v| / fraction inside ±0.25σ of a codebook, in f64.
 fn stats(cb: &[f32]) -> (f64, f64, f64, f64) {
     let n = cb.len() as f64;
@@ -199,7 +203,7 @@ fn codeword_mutations_all_change_the_codebook() {
             + half::f16::from_bits((y & 0xFFFF) as u16).to_f32()
     };
 
-    let mutations: [(&str, fn(u32, u32) -> (f32, f32)); 5] = [
+    let mutations: [(&str, Mutation); 5] = [
         // v1 folds `state * mult` again instead of chaining from x0.
         ("v1 restarts from the state", |s, m| {
             let f = |x: u32| {

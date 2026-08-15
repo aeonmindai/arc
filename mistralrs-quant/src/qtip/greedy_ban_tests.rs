@@ -23,7 +23,10 @@ use candle_core::{DType, Device, Tensor};
 use std::borrow::Cow;
 use std::sync::{atomic::AtomicUsize, Arc};
 
-use super::{Qtip2bLayer, QtipLayer, QtipMode, QtipRotation, QtipSearchDetail, QtipSearchStamp};
+use super::{
+    Qtip2bLayer, QtipCodebook, QtipLayer, QtipMode, QtipRotation, QtipSearchDetail,
+    QtipSearchStamp,
+};
 use crate::{
     IsqType, QuantMethod, QuantMethodConfig, QuantizeOntoGuard, QuantizedSerde, UnquantLinear,
 };
@@ -37,17 +40,37 @@ use crate::{
 /// `[stamp, 0x00]` — and asserting the flags byte here is not incidental: it
 /// pins that a default production bake claims "exhaustive, unweighted" rather
 /// than leaving those fields unset.
-fn provenance_tail(bytes: &[u8]) -> (Option<u8>, u8) {
-    let n = bytes.len();
+fn provenance_tail(bytes: &[u8], cb_len: usize) -> (Option<u8>, u8) {
+    let n = bytes.len() - cb_len;
     assert!(n >= 2, "payload too short to carry a provenance tail");
     (Some(bytes[n - 2]), bytes[n - 1])
 }
 
-/// Strip the provenance tail, producing a byte-for-byte pre-0.3.0 payload.
-fn strip_provenance(bytes: &mut Vec<u8>) {
+/// Strip the provenance tail (and any codebook section after it), producing a
+/// byte-for-byte pre-0.3.0 payload.
+fn strip_provenance(bytes: &mut Vec<u8>, cb_len: usize) {
     let n = bytes.len();
-    bytes.truncate(n - 2);
+    bytes.truncate(n - 2 - cb_len);
 }
+
+/// Bytes the wave24-AU codebook discriminator occupies at the very end of a
+/// **qtip2** payload.
+///
+/// `Gaussian` writes nothing — that is what keeps a stored-table artifact
+/// byte-identical to one produced before the field existed, and it is why every
+/// assertion in this module held unchanged when the field landed. The computed
+/// codebook writes a tag plus its `u32` multiplier. The qtip2b rung carries no
+/// such section at all (its codebook IS the format), hence `CB_NONE`.
+fn codebook_section_len(cb: QtipCodebook) -> usize {
+    match cb {
+        QtipCodebook::Gaussian => 0,
+        QtipCodebook::Mcg { .. } => 5,
+    }
+}
+
+/// Section length for a payload that carries no codebook discriminator: the
+/// qtip2b rung, and any qtip2 payload written against the stored table.
+const CB_NONE: usize = 0;
 
 /// Deterministic Gaussian-ish fixture (splitmix64 + Box-Muller), so no test in
 /// this module depends on an RNG seed that could drift.
@@ -156,7 +179,13 @@ fn isq_dispatch_never_bakes_greedy_on_either_rung_or_rank() {
             // The artifact is the evidence: a production bake must stamp
             // `trellis` AND carry the incoherence rotation.
             let bytes = layer.serialize().unwrap().into_owned();
-            let (stamp, flags) = provenance_tail(&bytes);
+            // qtip2b's codebook is its format and carries no discriminator;
+            // qtip2 carries one only when it is not baking the stored table.
+            let cb_len = match isq {
+                IsqType::QtipBitshift2 => codebook_section_len(QtipCodebook::DEFAULT),
+                _ => CB_NONE,
+            };
+            let (stamp, flags) = provenance_tail(&bytes, cb_len);
             assert_eq!(
                 stamp,
                 QtipSearchStamp::Trellis.to_wire(),
@@ -220,7 +249,7 @@ fn greedy_fixture_door_exists_only_under_cfg_test() {
     // module (and `quantize_greedy_fixture` itself) is `cfg(test)`-only, so the
     // door does not exist in a release build at all.
     let bytes = greedy.serialize().unwrap().into_owned();
-    let (stamp, flags) = provenance_tail(&bytes);
+    let (stamp, flags) = provenance_tail(&bytes, codebook_section_len(QtipCodebook::DEFAULT));
     assert_eq!(
         stamp,
         QtipSearchStamp::Greedy.to_wire(),
@@ -382,8 +411,15 @@ fn greedy_stamped_artifact_is_refused_at_load() {
             .into_owned(),
         ),
     ] {
+        // qtip2b carries no codebook discriminator; qtip2 carries one only
+        // when its codebook is not the stored table.
+        let cb_len = if rung == "qtip2" {
+            codebook_section_len(QtipCodebook::DEFAULT)
+        } else {
+            CB_NONE
+        };
         assert_eq!(
-            provenance_tail(&bytes).0,
+            provenance_tail(&bytes, cb_len).0,
             QtipSearchStamp::Greedy.to_wire(),
             "{rung}: greedy bake must stamp greedy"
         );
@@ -426,7 +462,7 @@ fn legacy_unstamped_without_rotation_is_refused() {
 
     // Truncate the whole provenance tail: byte-for-byte a pre-0.3.0 payload.
     let mut bytes = QuantizedSerde::serialize(&greedy).unwrap().into_owned();
-    strip_provenance(&mut bytes);
+    strip_provenance(&mut bytes, codebook_section_len(QtipCodebook::DEFAULT));
 
     let msg = QtipLayer::deserialize_ext_bias(
         Cow::Owned(bytes.clone()),
@@ -455,7 +491,7 @@ fn legacy_unstamped_with_rotation_is_served() {
     assert!(viterbi.rotation_block() >= 2);
 
     let mut bytes = QuantizedSerde::serialize(&viterbi).unwrap().into_owned();
-    strip_provenance(&mut bytes);
+    strip_provenance(&mut bytes, codebook_section_len(QtipCodebook::DEFAULT));
 
     let (restored, _) =
         QtipLayer::deserialize_ext_bias(Cow::Owned(bytes), &device, QuantizeOntoGuard::new())
@@ -473,7 +509,7 @@ fn unknown_provenance_cannot_be_laundered_into_a_stamp() {
         QtipLayer::quantize_with_options_concrete(&w, None, &device, QtipMode::Viterbi, true)
             .unwrap();
     let mut bytes = QuantizedSerde::serialize(&viterbi).unwrap().into_owned();
-    strip_provenance(&mut bytes); // pre-0.3.0 payload
+    strip_provenance(&mut bytes, codebook_section_len(QtipCodebook::DEFAULT)); // pre-0.3.0 payload
 
     let (legacy, _) =
         QtipLayer::deserialize_concrete(Cow::Owned(bytes), &device, QuantizeOntoGuard::new())
@@ -637,7 +673,7 @@ fn beam_width_round_trips_through_uqff_exactly() {
 /// travel.
 #[test]
 fn real_beam_bake_at_w256_stamps_the_width_it_ran() {
-    use super::{QtipBakeConfig, QtipCodebook, TrellisSearch};
+    use super::{QtipBakeConfig, TrellisSearch};
 
     let device = Device::Cpu;
     // Deterministic Gaussian; this test is about provenance plumbing, not
@@ -684,10 +720,17 @@ fn real_beam_bake_at_w256_stamps_the_width_it_ran() {
         beam_bytes, ex_bytes,
         "a real W=256 beam artifact must not be byte-identical to an exhaustive one"
     );
-    assert_eq!(provenance_tail(&ex_bytes), (Some(1), 0x00));
-    // A beam artifact's tail is 4 bytes, not 2: `[stamp, flags, width_le…]`.
+    // These fixtures bake with `codebook: QtipCodebook::Gaussian` (above), so
+    // the payload carries no codebook section at all — the tail IS the
+    // provenance tail. Asserted through the same helper so the two stay in
+    // step if the section ever becomes unconditional.
+    let cb_len = codebook_section_len(QtipCodebook::Gaussian);
+    assert_eq!(provenance_tail(&ex_bytes, cb_len), (Some(1), 0x00));
+    // A beam artifact's provenance tail is 4 bytes, not 2:
+    // `[stamp, flags, width_le…]` — before any codebook section.
+    let tail_end = beam_bytes.len() - cb_len;
     assert_eq!(
-        &beam_bytes[beam_bytes.len() - 4..],
+        &beam_bytes[tail_end - 4..tail_end],
         &[1u8, 0x01, 0x00, 0x01],
         "tail must read: trellis stamp, beam bit set, width 256 little-endian"
     );
@@ -754,7 +797,7 @@ fn real_beam_bake_at_w256_stamps_the_width_it_ran() {
 #[test]
 fn real_3d_expert_stack_beam_bake_at_w256_stamps_the_width_it_ran() {
     use super::bake_quality_tests::gen_fp4_dequant;
-    use super::{QtipBakeConfig, QtipCodebook, TrellisSearch};
+    use super::{QtipBakeConfig, TrellisSearch};
 
     let device = Device::Cpu;
     let (e, n, k) = (3usize, 4usize, 64usize);
@@ -790,10 +833,17 @@ fn real_3d_expert_stack_beam_bake_at_w256_stamps_the_width_it_ran() {
     // 1. Distinguishable from an exhaustive bake by the bytes alone. The tail
     //    is checked FIRST so a regression prints four bytes rather than two
     //    whole payload dumps.
-    assert_eq!(provenance_tail(&ex_bytes), (Some(1), 0x00));
-    // A beam artifact's tail is 4 bytes, not 2: `[stamp, flags, width_le..]`.
+    // These fixtures bake with `codebook: QtipCodebook::Gaussian` (above), so
+    // the payload carries no codebook section at all — the tail IS the
+    // provenance tail. Asserted through the same helper so the two stay in
+    // step if the section ever becomes unconditional.
+    let cb_len = codebook_section_len(QtipCodebook::Gaussian);
+    assert_eq!(provenance_tail(&ex_bytes, cb_len), (Some(1), 0x00));
+    // A beam artifact's provenance tail is 4 bytes, not 2:
+    // `[stamp, flags, width_le..]` — before any codebook section.
+    let tail_end = beam_bytes.len() - cb_len;
     assert_eq!(
-        &beam_bytes[beam_bytes.len() - 4..],
+        &beam_bytes[tail_end - 4..tail_end],
         &[1u8, 0x01, 0x00, 0x01],
         "tail must read: trellis stamp, beam bit set, width 256 little-endian \
          — an exhaustive tail here means the requested search never reached \
@@ -911,9 +961,14 @@ fn malformed_search_detail_claims_are_rejected_not_laundered() {
     let layer =
         QtipLayer::quantize_with_options_concrete(&w, None, &device, QtipMode::Viterbi, true)
             .unwrap();
-    let good = QuantizedSerde::serialize(&layer).unwrap().into_owned();
+    let mut good = QuantizedSerde::serialize(&layer).unwrap().into_owned();
+    // Every mutation below addresses the search-detail section by offset from
+    // the END, so drop any codebook section first: this test is about the
+    // search-detail wire format, and a payload with no codebook section is a
+    // legal stored-table payload (see `QtipCodebook::to_wire`).
+    good.truncate(good.len() - codebook_section_len(layer.codebook()));
     // Tail is [stamp=1(trellis), flags=0x00].
-    assert_eq!(provenance_tail(&good), (Some(1), 0x00));
+    assert_eq!(provenance_tail(&good, CB_NONE), (Some(1), 0x00));
 
     let load = |bytes: Vec<u8>| {
         QtipLayer::deserialize_concrete(Cow::Owned(bytes), &device, QuantizeOntoGuard::new())

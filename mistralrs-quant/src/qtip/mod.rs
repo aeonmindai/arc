@@ -438,6 +438,14 @@ pub(crate) const QTIP_MCG_V2_SCALE_DIVISOR: f32 = 3.0 * QTIP_MCG_V2_SIGMA;
 /// Divisor for the Gaussian LUT: it is already unit-σ, so `max|row| / 3`.
 pub(crate) const QTIP_GAUSSIAN_SCALE_DIVISOR: f32 = 3.0;
 
+/// The `cb_mult` value every K=4/V=2 CUDA launcher reads as "gather the
+/// reproduction values from the stored table".
+///
+/// 0 is a safe sentinel because an MCG multiplier must be odd to have full
+/// period, so it can never name a real computed codebook. Produced only by
+/// [`QtipCodebook::cuda_mult`].
+pub(crate) const CB_MULT_GAUSSIAN_LUT: u32 = 0;
+
 /// One masked MCG product folded to a codeword: `(x & 0x8FFF8FFF) ^ 0x3B603B60`,
 /// then the two fp16 halves summed **in f32**.
 ///
@@ -567,12 +575,13 @@ impl QtipCodebook {
         }
     }
 
-    /// The CUDA ABI selector: 0 means "gather from the stored table", nonzero
-    /// is the MCG multiplier. See `ffi::CB_MULT_GAUSSIAN_LUT`.
+    /// The CUDA ABI selector: [`CB_MULT_GAUSSIAN_LUT`] (0) means "gather from
+    /// the stored table", nonzero is the MCG multiplier. This is the only thing
+    /// that produces the value every K=4/V=2 launcher takes.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn cuda_mult(self) -> u32 {
         match self {
-            QtipCodebook::Gaussian => 0,
+            QtipCodebook::Gaussian => CB_MULT_GAUSSIAN_LUT,
             QtipCodebook::Mcg { mult } => mult,
         }
     }
