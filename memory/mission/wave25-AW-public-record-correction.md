@@ -144,7 +144,109 @@ changed — only labeled.
   per-step CPU cost."* Competitive claims about third-party internals with no
   source citation and no label.
 
+---
+
+# EXTENSION (same PR #49) — the fabricated head-to-head
+
+Coordinator extended scope after item 6: `docs/PEAK_INFERENCE.md:7` is a worse
+defect than the 1.21×. Governed by **DOCTRINE D3 (revised 2026-08-15 by
+wave25-AV)** and **D9**.
+
+## The defect was larger than reported
+
+`PEAK_INFERENCE.md:7` published:
+
+> *"Current state: 33 tok/s (Arc), 60 tok/s (SGLang), 43 tok/s (vLLM). All on
+> same hardware, same model, same benchmark."*
+
+I reported this as a fabricated competitor comparison. On investigation it is
+**two** fabrications, and the second was not in the brief:
+
+1. **The competitor half.** We have never benchmarked SGLang or vLLM.
+2. 🔴 **Arc's own 33 tok/s is equally unmeasured.** Verified: `grep -rin
+   'B200\|Qwen3-32B'` across all of `memory/mission/` returns **zero** hits in
+   `FACTS.md` and zero in every wave log. **No B200 was ever rented.**
+   `memory/project_cuda_graph_findings.md` says "Ready for single deploy to
+   B200" — i.e. never deployed. So the "Arc" column was as invented as the other
+   two, and the sentence "All on same hardware, same model, same benchmark"
+   describes a run that never occurred in any column.
+3. Line 264 cited the harness: *"Measurement: `deploy/benchmark.py` … on Modal
+   B200."* **`deploy/` contains only `modal_b200.py`.** The named measurement
+   script does not exist in the tree.
+
+Arc's only measured decode figure is **14.58 tok/s**, on a different model and a
+different card (V4 Flash, 1×H200, b=1, no-`cudnn`). It does not transfer to
+Qwen3-32B/B200 and is explicitly marked as non-transferable in the rewrite.
+
+## What replaced it (D3-compliant — deleted, not re-estimated)
+
+No substitute competitor row was invented. The number is **gone**, and in its
+place:
+
+- A **document-level banner**: this is a PLAN, not a results page; nothing here
+  has been run; the cited harness does not exist.
+- An **evidence-grade table** matching the rest of `docs/`, with a new
+  **`[target]`** grade — *"a goal we are designing toward. Not a measurement and
+  not a forecast."* The file previously had **zero** labels (`grep -c
+  'measured\|projected'` → 0) while every sibling doc claims universal grading.
+- An explicit **"What this document does NOT claim"** section naming the deleted
+  sentence verbatim, so the retraction is discoverable by anyone who saw the
+  original.
+- The **footprint argument** (D3): no single-GPU baseline exists on any engine
+  for V4 Flash — native ckpt ≈160 GB, smallest published config **4×H200**, sole
+  W4A16 quant 143 GB whose own card says *"TP=1 OOMs on a single 141 GB H200"*,
+  NVFP4 Blackwell-only; Arc's ~68 GB (≈1.9 bits/param) is what makes 1×H200
+  possible at all. One GPU vs a published four, plus $/Mtok per node.
+- The **third-party-free roofline**: 68 GB ÷ 4.8 TB/s = 14.2 ms/step ⇒ ~4,500
+  tok/s at B=64 ⇒ the measured 63.5 ms grouped-GEMM microbench is at **~22% of
+  roofline**. Refutable, ours, needs nobody else.
+- Headings changed from achieved-state to target form: `33 → 90+ tok/s` becomes
+  `Phase 1: CUDA Graph Capture — target 90+ tok/s [target]`, same for phases 2
+  and 3.
+- The **Benchmark Targets** table's `Current (Arc) | 33 | ~22ms | 26%` row is
+  replaced by an explicit "**Never run.** No B200 rental exists" row, with the
+  closing note that *the first honest step for this document is to produce its
+  own baseline row*, since without one every speedup ratio in the table is
+  unfounded.
+
+## CUDA_GRAPH_PLAN.md
+
+`:5` *"No existing system does this. vLLM, SGLang, and TensorRT-LLM all launch
+graphs from the CPU each step (~10μs)"* and `:277` *"Better than every existing
+system"* — uncited claims about third-party internals never inspected. Reduced
+to what we know about our own implementation: Arc's loop uses CUDA 12.4
+**conditional graph nodes**, so no per-step host round-trip is required **by
+construction**. The retracted sentences are quoted in place so the correction is
+visible. `FACTS.md` has **no** CUDA-graph decode numbers at all, so the "What
+this achieves" list — which read as achieved outcomes — is retitled "What this
+is designed to achieve" with every bullet marked `[target]`, and closes by
+stating that the number which would settle any comparison is our own per-step
+CPU cost on hardware, unproduced.
+
+## Not changed (checked, correctly framed)
+
+- `README.md` Roadmap phases 3–4 ("Benchmark wins on GSM8K + HumanEval vs FP16
+  reference", "B200 / NVFP4 path") sit under an explicit **Roadmap / "In rough
+  order"** heading — aspirational by construction, not presented as measured.
+- `QUANTIZATION_PERFORMANCE.md`'s "Where Arc sits against other trellis
+  quantizers" table is third-party bake rates already graded **[published]**,
+  with "no incumbent to catch" stated plainly. Correct as-is.
+
+## PR-base trap → BACKLOG
+
+Landed in `memory/mission/BACKLOG.md` under a new **🔴 CI/PR TRAPS** heading at
+the top of the file. Content: a PR whose `baseRefName` is another PR's branch is
+auto-closed silently when the parent merges; #44 died ~2 s after #43 with
+`mergedAt=null` and the correction was reported up as fixed when it was not.
+Rules recorded: (1) always open against `master` unless deliberately stacking,
+and re-target the child *before* the parent merges; (2) verify by
+`state=MERGED` **and** non-null `mergedAt`, never by a watcher's exit code —
+`CLOSED` also vanishes from the open list; (3) a correction PR is not done when
+opened — re-verify file content on `master` after the merge. Plus a detector:
+`gh pr list --state closed --json number,title,mergedAt --jq
+'.[]|select(.mergedAt==null)'`.
+
 ## 7. Gates
 
-Markdown only, so no cargo gates apply. `git status` shows 8 modified `.md`
+Markdown only, so no cargo gates apply. `git status` shows modified `.md`
 files and nothing else. No `cargo fmt` / `rustfmt` was run anywhere.
