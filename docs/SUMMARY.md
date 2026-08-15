@@ -110,6 +110,14 @@
 - [MCP Transports](MCP/transports.md)
 - [MCP Advanced Usage](MCP/advanced.md)
 
+# Engineering Record
+
+- [Overview](engineering/README.md)
+  - [Quantization Performance](engineering/QUANTIZATION_PERFORMANCE.md)
+  - [Hardware Lessons](engineering/HARDWARE_LESSONS.md)
+  - [Testing Discipline](engineering/TESTING_DISCIPLINE.md)
+  - [Open Questions](engineering/OPEN_QUESTIONS.md)
+
 # Reference
 
 - [Configuration](CONFIGURATION.md)
