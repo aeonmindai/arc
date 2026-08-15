@@ -300,6 +300,18 @@ A 3-layer fixture with patterned weights is close to a constant function: even
 a one-token history change moves the logits by only 0.006–0.05, i.e. ~1x the
 tolerance. **A logit-level equality test on this fixture cannot have teeth.**
 
+**v3a — and the logit check had to go entirely.** Kept as a "secondary
+plumbing regression", the prefill-vs-decode logit comparison went red on x86
+again: `max abs diff 0.05078125, tol 0.034941` at 121 tokens. Not a bug — a
+121-token prefill GEMM and a 1-token decode over a 121-long cache round
+differently, ~1.5x the budget that was calibrated on batch-vs-solo (a much
+smaller shape change). Combined with the v2 measurement — that the same
+comparison *passes* under a fully corrupted compressor — it is a check that
+cannot catch the bug but can fail on the host, so it is deleted rather than
+widened. The logit-level regression for this path is
+`v4_xs_history_two_seq_batch_matches_single_sequence`, which compares batched
+against solo: like for like, the comparison that budget exists for.
+
 **v3 asserts on the compressor state itself** — the compressed rows in the
 model's `XsRolling` slots after 20 decode steps, against the rows a single
 whole-history prefill of the same tokens produces — with the logits kept as a
