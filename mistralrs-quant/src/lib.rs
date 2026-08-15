@@ -110,8 +110,9 @@ pub use utils::bake_budget::{
     BakeBudgetVerdict, BakeProjection,
 };
 pub use utils::bake_devices::{
-    bake_device_ordinals, clear_bake_device_override, parse_bake_devices, set_bake_device_override,
-    set_worker_cuda_ordinal, worker_cuda_ordinal, BAKE_DEVICES_ENV,
+    bake_device_layer_counts, bake_device_ordinals, clear_bake_device_override, parse_bake_devices,
+    reset_bake_device_layer_counts, set_bake_device_override, set_worker_cuda_ordinal,
+    worker_cuda_ordinal, BAKE_DEVICES_ENV,
 };
 pub use utils::flash_attn_sinks_metal;
 pub use utils::flash_attn_sinks_varlen_metal;

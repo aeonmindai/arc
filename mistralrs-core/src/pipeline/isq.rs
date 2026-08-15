@@ -919,6 +919,7 @@ pub trait IsqModel {
 
                 let guard = QuantizeOntoGuard::new();
                 let bake_devices_ref = bake_devices.as_deref();
+                mistralrs_quant::reset_bake_device_layer_counts();
 
                 // One body for both iterations, so the device policy cannot
                 // drift between the silent and progress-bar paths.
@@ -983,6 +984,27 @@ pub trait IsqModel {
                     t_end.duration_since(t_start).as_secs_f32(),
                     total_tensors
                 );
+                if bake_devices.is_some() {
+                    // Prove the spread actually happened. An artifact produced
+                    // on one device is byte-identical to one produced on N, so
+                    // nothing downstream can tell you that N-1 GPUs sat idle
+                    // for four hours — only this can.
+                    let counts = mistralrs_quant::bake_device_layer_counts();
+                    info!(
+                        "Layers quantized per device: {}.",
+                        counts
+                            .iter()
+                            .map(|(ordinal, n)| format!("cuda:{ordinal}={n}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                    if counts.len() < n_bake_devices {
+                        warn!(
+                            "Only {} of {n_bake_devices} bake device(s) received any layer.",
+                            counts.len()
+                        );
+                    }
+                }
             } else if imatrix_source.is_some() {
                 info!(
                     "Imatrix data provided but quantization was skipped; existing tensors will be serialized as-is."

@@ -27,6 +27,7 @@
 //! merge step, so there is no merge contract to get wrong.
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
 /// Environment variable naming the CUDA ordinals a UQFF bake may use, e.g.
@@ -127,6 +128,36 @@ pub fn bake_device_ordinals() -> Option<Vec<usize>> {
     }
 }
 
+/// How many layers each CUDA ordinal actually quantized.
+///
+/// Not a metric for its own sake: it is the only way to tell a bake that really
+/// spread across N devices from one that silently ran on a single device and
+/// produced — correctly! — an identical artifact. A byte-identity test alone
+/// passes vacuously in that case, so the multi-device test asserts on this too,
+/// and a real bake logs it so a 4-hour job cannot quietly waste N-1 GPUs.
+fn layer_counts() -> &'static Mutex<BTreeMap<usize, usize>> {
+    static COUNTS: OnceLock<Mutex<BTreeMap<usize, usize>>> = OnceLock::new();
+    COUNTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Layers quantized per CUDA ordinal since the last
+/// [`reset_bake_device_layer_counts`].
+pub fn bake_device_layer_counts() -> BTreeMap<usize, usize> {
+    layer_counts()
+        .lock()
+        .expect("bake device lock poisoned")
+        .clone()
+}
+
+/// Clear the per-device layer tally (a bake calls this before its quantize
+/// pass; tests call it to isolate one bake from the next).
+pub fn reset_bake_device_layer_counts() {
+    layer_counts()
+        .lock()
+        .expect("bake device lock poisoned")
+        .clear();
+}
+
 thread_local! {
     /// CUDA ordinal this ISQ worker thread owns for the duration of one layer.
     static WORKER_CUDA_ORDINAL: Cell<Option<usize>> = const { Cell::new(None) };
@@ -142,6 +173,13 @@ thread_local! {
 /// device for the whole bake.
 pub fn set_worker_cuda_ordinal(ordinal: Option<usize>) {
     WORKER_CUDA_ORDINAL.with(|c| c.set(ordinal));
+    if let Some(ordinal) = ordinal {
+        *layer_counts()
+            .lock()
+            .expect("bake device lock poisoned")
+            .entry(ordinal)
+            .or_insert(0) += 1;
+    }
 }
 
 /// The CUDA ordinal pinned by [`set_worker_cuda_ordinal`], if any.
@@ -210,6 +248,23 @@ mod tests {
         std::thread::spawn(|| assert_eq!(worker_cuda_ordinal(), None))
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn layer_counts_tally_per_ordinal() {
+        reset_bake_device_layer_counts();
+        set_worker_cuda_ordinal(Some(0));
+        set_worker_cuda_ordinal(Some(1));
+        set_worker_cuda_ordinal(Some(1));
+        set_worker_cuda_ordinal(None);
+        let counts = bake_device_layer_counts();
+        assert_eq!(counts.get(&0), Some(&1));
+        assert_eq!(counts.get(&1), Some(&2));
+        // Clearing the pin is not a layer.
+        assert_eq!(counts.len(), 2);
+        reset_bake_device_layer_counts();
+        assert!(bake_device_layer_counts().is_empty());
+        set_worker_cuda_ordinal(None);
     }
 
     #[test]

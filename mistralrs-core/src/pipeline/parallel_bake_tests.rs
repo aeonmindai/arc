@@ -503,26 +503,72 @@ fn byte_identical_across_two_cuda_devices() {
     // host, which is what makes relocating a layer's quantize legal.
     let ty = Some(mistralrs_quant::IsqType::QtipBitshift2);
     let globals = BakeGlobals::acquire(None, /*to_host=*/ true);
+    let (layers, mtp, out_features, in_features) = (10, 2, 512, 1024);
+
+    let fallbacks_before = mistralrs_quant::gpu_quantize_cpu_fallback_count();
 
     let one = scratch_dir("cuda-1gpu");
     let t_one = std::time::Instant::now();
-    bake(&mut FakeModel::new(6, 2, 128, 256), &one, ty, dev0.clone());
+    bake(
+        &mut FakeModel::new(layers, mtp, out_features, in_features),
+        &one,
+        ty,
+        dev0.clone(),
+    );
     let one_elapsed = t_one.elapsed();
+    let one_counts = mistralrs_quant::bake_device_layer_counts();
 
     let two = scratch_dir("cuda-2gpu");
     globals.set_devices(Some(vec![0, 1]));
     let t_two = std::time::Instant::now();
-    bake(&mut FakeModel::new(6, 2, 128, 256), &two, ty, dev0.clone());
+    bake(
+        &mut FakeModel::new(layers, mtp, out_features, in_features),
+        &two,
+        ty,
+        dev0.clone(),
+    );
     let two_elapsed = t_two.elapsed();
+    let two_counts = mistralrs_quant::bake_device_layer_counts();
 
     eprintln!(
-        "1 device: {:.2}s   2 devices: {:.2}s",
+        "1 device: {:.2}s {one_counts:?}   2 devices: {:.2}s {two_counts:?}",
         one_elapsed.as_secs_f32(),
         two_elapsed.as_secs_f32()
     );
 
+    // Byte-identity alone would pass VACUOUSLY if the spread never engaged: a
+    // bake that quietly ran on one device produces exactly the same artifact.
+    // So assert the parallelism actually happened before believing the match.
+    assert!(
+        one_counts.is_empty(),
+        "the single-device leg must not pin any worker to a device, got {one_counts:?}"
+    );
+    assert_eq!(
+        two_counts.keys().copied().collect::<Vec<_>>(),
+        vec![0, 1],
+        "both CUDA devices must have quantized at least one layer"
+    );
+    assert_eq!(
+        two_counts.values().sum::<usize>(),
+        layers + mtp,
+        "every layer must be quantized exactly once across the devices"
+    );
+
+    // And that the quantize really ran in GPU kernels: a silent reroute to the
+    // CPU Viterbi would also be byte-identical, ~20x slower, and would make the
+    // whole comparison meaningless.
+    assert_eq!(
+        mistralrs_quant::gpu_quantize_cpu_fallback_count(),
+        fallbacks_before,
+        "a QTIP bake on CUDA must not fall back to the CPU pipeline"
+    );
+
     let single = inventory(&one);
-    assert_eq!(single.len(), 8, "every layer must reach the artifact");
+    assert_eq!(
+        single.len(),
+        layers + mtp,
+        "every layer must reach the artifact"
+    );
     compare_inventories(&inventory(&two), &single).expect(
         "a bake spread over two CUDA devices must produce the same artifact as a \
          single-device bake, byte for byte",
