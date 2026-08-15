@@ -167,6 +167,62 @@ Cost of the shipped fix: **one cold run per job** (the key changed, so the first
 run misses), then warm as before. Steady-state CI time is unchanged; only the
 ISA the artifacts are built for changes.
 
+## 5b. Operational proof — run 1 (PR #66, `31914112007`, all three jobs green)
+
+A workflow fix has no unit test, so it was proved on the runner. Verbatim from
+the job logs:
+
+```
+Cargo cache   key: cuda-check-cc90-X64-isa-x86-64-v3-10d492c78c97…
+Cargo cache   restore-keys: cuda-check-cc90-X64-isa-x86-64-v3-
+Cargo cache   Cache not found for input keys:
+              cuda-check-cc90-X64-isa-x86-64-v3-10d492c78c97…,
+              cuda-check-cc90-X64-isa-x86-64-v3-
+Post Cargo cache  Cache saved with key:
+              cuda-check-cc90-X64-isa-x86-64-v3-10d492c78c97…
+```
+
+and on the nvcc leg:
+
+```
+Cargo cache   key: cuda-cc80-X64-isa-x86-64-v3-10d492c78c97…
+Cargo cache   Cache not found for input keys: cuda-cc80-X64-isa-x86-64-v3-…
+Post Cargo cache  Cache saved with key: cuda-cc80-X64-isa-x86-64-v3-10d492c78c97…
+```
+
+Three things this establishes that a diff alone could not:
+
+1. **`${{ runner.arch }}` is real and resolves** — it rendered as the literal
+   `X64`. Had it been a phantom context the key would have contained an empty
+   segment; the fix would have "looked applied" and done nothing.
+2. **The orphaning is empirical, not argued.** The poisoned
+   `cuda-cc80-10d492c78c97…` (1.37 GiB) and
+   `cuda-check-cc90-10d492c78c97…` entries were **still live** in
+   `gh cache list` at that moment, and the *old* restore prefixes
+   (`cuda-cc80-`, `cuda-check-cc90-`) match them. The new prefixes reported
+   `Cache not found`. That is the miss we wanted, observed rather than reasoned.
+3. **The save wrote the new key**, so run 2 has something to restore.
+
+## 5c. Cold nvcc — the number that decides (c) over (b)
+
+Run 1 bumped all three keys, so all three jobs were cold. Compare against the
+warm nvcc runs from §5:
+
+| job | run 1 (COLD, new key) | previously (WARM) | delta |
+|---|---|---|---|
+| `cargo check (cuda, workspace)` | 14m26s | never warm-succeeded | — |
+| `nvcc compile (sm_80)` | **32m55s** | 13m27s–14m04s | **+19m** |
+| `nvcc compile (sm_90)` | **31m27s** | 13m52s–17m42s | **+14m** |
+
+This retires the "wall-clock may be unaffected either way" assumption in the
+scope note. It holds for the `cargo check` lane and is **false for the nvcc
+legs**: their 1.37 GiB caches are worth ~15–19 minutes *per run*. Option (b)
+applied uniformly — dropping `target/` everywhere — would have more than
+doubled this workflow's critical path on every PR, permanently, to fix a bug
+that (c) fixes for the price of one cold run. The measurement was not available
+when the options were framed; it is now, and it is the single strongest
+argument for the option shipped.
+
 ## 6. Every other `target/`-caching site in the repo
 
 Audited all 9 workflows. Four cache `target/`; a fifth caches Docker layers.
