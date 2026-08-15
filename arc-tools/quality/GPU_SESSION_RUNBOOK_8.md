@@ -704,3 +704,18 @@ done
 Verified 2026-08-15: overlay HTTP 200, `private: True`, 15 files, 74.19 GB with
 all 9 weight files byte-matching the model card; source HTTP 200, public,
 ungated, 73 files, 159.63 GB.
+
+**5. Do the harnesses still work?** Free, no GPU, no model, ~40 s total.
+
+```bash
+cd arc-tools/quality
+python3 test_batch_load_probe.py   # batch probe math + concurrency guard
+python3 test_degeneracy.py         # degeneracy detector, extractor, quality gate
+bash    test_s6_driver.sh          # driver dry run
+```
+
+`test_degeneracy.py` is the one that stops the wave34 mistake recurring: it
+runs the real `run_gsm8k.py` against a mock server in clean / loop / truncate
+modes and asserts the exit code MOVES, so a scored run cannot report a
+degenerate loop and still exit 0. **If it fails, do not rent a box** — the
+number the session would produce could not be trusted.
