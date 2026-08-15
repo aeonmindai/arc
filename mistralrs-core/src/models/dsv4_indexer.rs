@@ -13,12 +13,13 @@
 //! ## What it does
 //!
 //! For V4 CSA layers, given the main attention's pre-`q_b` LoRA-A output
-//! `q_a: [B, T_q, q_lora_rank]` and the full K tensor
-//! `k_full: [B, n_heads, T_full, head_dim]`, the indexer:
+//! `q_a: [B, T_q, q_lora_rank]` and the layer's hidden states
+//! `xs_full: [B, T_full, hidden_size]`, the indexer:
 //!   1. Projects `q_a` through `wq_b` to produce `indexer_q` (one query per
 //!      indexer head, distinct from main-attention heads).
-//!   2. Runs an internal smaller compressor over `k_full` to produce
-//!      `indexer_k: [B, n_heads, T_c, head_dim]` (with `T_c = T_full / 4`).
+//!   2. Runs an internal smaller compressor **over the hidden states** to
+//!      produce `indexer_k: [B, T_c, head_dim]` (with `T_c = T_full / 4`) —
+//!      **one key per compressed slot, shared by every head (MQA)**.
 //!   3. Computes per-head dot-product scores `indexer_q @ indexer_k^T`,
 //!      **rectifies** them (`relu`), scales each head by the learned per-token
 //!      `weights_proj(x) * weight_scale` factor, and **sums over heads** to
@@ -79,8 +80,28 @@
 //!     `compressor.ape.weight` instead of bare `compressor.ape`).
 //!
 //! The caller is responsible for passing the right `vb.pp("indexer")`
-//! prefix; this module only handles the leaf tensor name probe for
-//! `ape` (which lacks a `.weight` suffix in native format).
+//! prefix; the leaf-name probes (`ape` vs `ape.weight`, split `wkv`+`wgate`
+//! vs pre-fused `wkv_gate`) live in [`V4Compressor`].
+//!
+//! ## ⚠️ The inner compressor consumes HIDDEN STATES, not K
+//!
+//! `C4Indexer` builds its inner compressor from the **same** `Compressor`
+//! class the attention path uses, with `head_dim = index_head_dim` and
+//! `is_in_indexer = True` (`indexer.py:506-516`), and that class takes the
+//! layer input `x` — `wkv_gate = ReplicatedLinear(config.hidden_size,
+//! 2 * coff * head_dim)` (`compressor.py:305, 318-325`). So the published
+//! weights are `[coff*head_dim, hidden_size]` per half
+//! (`deepseek_v4.py:1633-1652` concatenates `cat([wkv, wgate], dim=0)`).
+//!
+//! This module previously declared them `[coff*head_dim, ratio*head_dim]` and
+//! fed the compressor grouped **K** instead. Consequence: the indexer failed
+//! to load from Arc's own published UQFF on **every** CSA layer
+//! (`shape mismatch for layers.N.attn.indexer.compressor.wgate.weight,
+//! expected: [256, 512], got: [256, 4096]`) and silently fell back to
+//! dense-over-compressed. Arc's attention-side compressor had already been
+//! corrected for exactly this (RUN-161/162); the indexer kept a stale private
+//! copy. It now delegates to the shared [`V4Compressor`] so there is one
+//! implementation, not two.
 //!
 //! ## Phase-2 perf
 //!
@@ -96,13 +117,10 @@
 
 use std::sync::Arc;
 
-use candle_core::{DType, Device, Result, Tensor, D};
+use candle_core::{Device, Result, Tensor, D};
 use mistralrs_quant::{QuantMethod, ReplicatedLayer, ShardedVarBuilder};
 
-use crate::{
-    layers::RmsNorm,
-    ops::{TopKLastDimOp, TopKOutput},
-};
+use crate::ops::{TopKLastDimOp, TopKOutput};
 
 /// Pure-Rust V4 Lightning Indexer.
 ///
@@ -115,22 +133,11 @@ pub struct V4Indexer {
     pub wq_b: Arc<dyn QuantMethod>,
     /// `hidden_size` → `n_heads`. Per-token per-head score weighting.
     pub weights_proj: Arc<dyn QuantMethod>,
-    /// Inner compressor's absolute-positional-encoding parameter.
-    ///
-    /// Shape: `[ratio=4, coff*head_dim]`. Added (broadcast) to the gated
-    /// compressed-K activations. In SGLang this is also reshaped via
-    /// `apply_ape_hotfix` on overlap layers; we preserve the raw shape
-    /// here and sum over the ratio dim for the prototype broadcast.
-    pub inner_ape: Tensor,
-    /// Inner compressor RMSNorm applied to each `head_dim` slice after
-    /// gating + ape.
-    pub inner_norm: RmsNorm,
-    /// Inner-compressor gate linear: `ratio*head_dim` → `coff*head_dim`.
-    /// Used as `sigmoid(gate(x_grouped))`.
-    pub inner_wgate: Arc<dyn QuantMethod>,
-    /// Inner-compressor value linear: `ratio*head_dim` → `coff*head_dim`.
-    /// Used as `gate * kv(x_grouped)`.
-    pub inner_wkv: Arc<dyn QuantMethod>,
+    /// Inner compressor — the **same** `Compressor` module the attention path
+    /// uses, instantiated with `head_dim = index_head_dim` and `ratio = 4`
+    /// (SGLang `C4Indexer.__init__`, `indexer.py:506-516`). It consumes the
+    /// layer's hidden states and emits one `head_dim` key per compressed slot.
+    pub compressor: super::deepseek4::V4Compressor,
     /// Number of indexer heads (default 64 per V4 Flash).
     pub n_heads: usize,
     /// Per-head dim (default 128 per V4 Flash).
@@ -162,7 +169,9 @@ impl V4Indexer {
         device: &Device,
         loading_isq: bool,
     ) -> Result<Self> {
-        let _ = device;
+        // `loading_isq` is accepted for signature parity with the other layer
+        // constructors; the indexer's tensors are unquantized in the reference
+        // and `ReplicatedLayer::new` already honours `cfg.quantization_config`.
         let _ = loading_isq;
         let n_heads = cfg.index_n_heads;
         let head_dim = cfg.index_head_dim;
@@ -198,44 +207,26 @@ impl V4Indexer {
         )?;
 
         // --- Inner compressor (vb.pp("compressor")) --------------------
-        // Native checkpoints store ape as a bare parameter ("compressor.ape");
-        // HF checkpoints store it as "compressor.ape.weight". Probe both.
-        let comp_vb = vb.pp("compressor");
-
-        let inner_ape = if comp_vb.contains_tensor("ape") {
-            comp_vb.get((ratio, coff * head_dim), "ape")?
-        } else if comp_vb.contains_tensor("ape.weight") {
-            comp_vb.get((ratio, coff * head_dim), "ape.weight")?
-        } else {
-            // Synthetic-weights fallback: zeros (no positional contribution).
-            // Real V4 checkpoints publish this tensor; unit tests construct
-            // it explicitly via `from_synth` (see tests below).
-            Tensor::zeros((ratio, coff * head_dim), DType::F32, comp_vb.device())?
-        };
-
-        let inner_norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, comp_vb.pp("norm"))?;
-
-        // Inner gate/kv linears: `ratio * head_dim` → `coff * head_dim`.
+        // Delegated to the shared `V4Compressor`, which is the corrected
+        // (RUN-161/162) port of SGLang's `Compressor`: it takes the layer's
+        // hidden states, loads `wkv`/`wgate` at `[coff*head_dim,
+        // hidden_size]` (or a pre-fused `wkv_gate` at `[2*coff*head_dim,
+        // hidden_size]`), probes both `ape` spellings, and pools with a
+        // softmax over the (overlapped) group axis.
         //
-        // NB: SGLang publishes a single fused `wkv_gate` (`2 * coff *
-        // head_dim` out_features) in some checkpoints but the V4 weight
-        // schema (arc-engine `weight_schema::v4_indexer_tensors_for_layer`)
-        // shows two separate tensors `compressor.wgate.weight` and
-        // `compressor.wkv.weight`. We follow the schema.
-        let inner_wgate = ReplicatedLayer::new(
-            ratio * head_dim,
-            coff * head_dim,
-            &None,
-            false,
-            comp_vb.pp("wgate"),
-        )?;
-        let inner_wkv = ReplicatedLayer::new(
-            ratio * head_dim,
-            coff * head_dim,
-            &None,
-            false,
-            comp_vb.pp("wkv"),
-        )?;
+        // `head_dim` here is `index_head_dim`, NOT the attention head_dim —
+        // `indexer.py:512` passes `head_dim=self.head_dim` where
+        // `self.head_dim = config.index_head_dim`.
+        let comp_vb = vb.pp("compressor");
+        if !super::deepseek4::V4Compressor::has_weights(&comp_vb) {
+            candle_core::bail!(
+                "V4Indexer: indexer compressor weights are absent — expected either \
+                 `compressor.wkv.weight` + `compressor.wgate.weight` (V4 native) or \
+                 a pre-fused `compressor.wkv_gate.weight`"
+            );
+        }
+        let compressor =
+            super::deepseek4::V4Compressor::new(cfg, comp_vb, ratio, head_dim, device)?;
 
         // SGLang C4Indexer.__init__:
         //   self.softmax_scale = self.head_dim ** -0.5
@@ -245,10 +236,7 @@ impl V4Indexer {
         Ok(Self {
             wq_b,
             weights_proj,
-            inner_ape,
-            inner_norm,
-            inner_wgate,
-            inner_wkv,
+            compressor,
             n_heads,
             head_dim,
             topk,
@@ -262,9 +250,13 @@ impl V4Indexer {
     ///
     /// Inputs:
     ///   - `q_a`: `[B, T_q, q_lora_rank]` — output of main Q LoRA-A.
-    ///   - `k_full`: `[B, n_heads, T_full, head_dim]` — full K tensor.
-    ///     `T_full` must be divisible by `ratio` (= 4).
-    ///   - `xs`: `[B, T_q, hidden_size]` — original input for `weights_proj`.
+    ///   - `xs_full`: `[B, T_full, hidden_size]` — hidden states of **every**
+    ///     token the compressed keys are built from. `T_full` must be
+    ///     divisible by `ratio` (= 4). This is the compressor's input in the
+    ///     reference (`indexer.py:299-304` passes `x=x`), not K.
+    ///   - `xs_q`: `[B, T_q, hidden_size]` — hidden states of the *query*
+    ///     tokens, for `weights_proj`. In prefill this is the same tensor as
+    ///     `xs_full`.
     ///
     /// Output:
     ///   - `top_k_indices`: `[B, T_q, topk]` indices into
@@ -275,52 +267,33 @@ impl V4Indexer {
     /// and the final scoring step (`fp8_paged_mqa_logits`, whose torch
     /// reference is `dsv4/indexer.py::fp8_paged_mqa_logits_torch` lines
     /// 84-89). This is the unfused candle equivalent.
-    pub fn forward(&self, q_a: &Tensor, k_full: &Tensor, xs: &Tensor) -> Result<Tensor> {
+    pub fn forward(&self, q_a: &Tensor, xs_full: &Tensor, xs_q: &Tensor) -> Result<Tensor> {
         let q_dims = q_a.dims();
         if q_dims.len() != 3 {
             candle_core::bail!("V4Indexer.q_a expected [B, T_q, q_lora_rank], got {:?}", q_dims);
         }
         let (b, t_q, _q_rank) = (q_dims[0], q_dims[1], q_dims[2]);
 
-        let k_dims = k_full.dims();
-        if k_dims.len() != 4 {
-            candle_core::bail!("V4Indexer.k_full expected [B, H, T_full, D], got {:?}", k_dims);
-        }
-        let (b_k, h_k, t_full, d_k) = (k_dims[0], k_dims[1], k_dims[2], k_dims[3]);
-        if b_k != b {
+        let full_dims = xs_full.dims();
+        if full_dims.len() != 3 || full_dims[0] != b {
             candle_core::bail!(
-                "V4Indexer: q_a batch {} != k_full batch {}",
-                b,
-                b_k
+                "V4Indexer.xs_full expected [B={b}, T_full, hidden], got {full_dims:?}"
             );
         }
-        if h_k != self.n_heads {
-            candle_core::bail!(
-                "V4Indexer: k_full heads {} != n_heads {}",
-                h_k,
-                self.n_heads
-            );
-        }
-        if d_k != self.head_dim {
-            candle_core::bail!(
-                "V4Indexer: k_full head_dim {} != head_dim {}",
-                d_k,
-                self.head_dim
-            );
-        }
+        let t_full = full_dims[1];
         if t_full % self.ratio != 0 {
             candle_core::bail!(
-                "V4Indexer: k_full T_full ({}) must be divisible by ratio ({})",
+                "V4Indexer: T_full ({}) must be divisible by ratio ({})",
                 t_full,
                 self.ratio
             );
         }
         let t_c = t_full / self.ratio;
 
-        let xs_dims = xs.dims();
+        let xs_dims = xs_q.dims();
         if xs_dims.len() != 3 || xs_dims[0] != b || xs_dims[1] != t_q {
             candle_core::bail!(
-                "V4Indexer.xs expected [B={}, T_q={}, hidden], got {:?}",
+                "V4Indexer.xs_q expected [B={}, T_q={}, hidden], got {:?}",
                 b,
                 t_q,
                 xs_dims
@@ -337,48 +310,20 @@ impl V4Indexer {
             .transpose(1, 2)?
             .contiguous()?;
 
-        // --- 2. Inner compressor on K ----------------------------------
-        // k_full [B, n_heads, T_full, head_dim] →
-        //   group along T_full into windows of `ratio`:
-        //     [B, n_heads, T_c, ratio*head_dim] →
-        //     [B*n_heads*T_c, ratio*head_dim]   (x_grouped)
-        let k_grouped = k_full
-            .reshape((b, h_k, t_c, self.ratio * self.head_dim))?
-            .reshape((b * h_k * t_c, self.ratio * self.head_dim))?;
-        let work_dtype = k_grouped.dtype();
+        // --- 2. Inner compressor on the HIDDEN STATES ------------------
+        // `[B, T_full, hidden]` → `[B, T_c, head_dim]`: ONE key per
+        // compressed slot, shared by every indexer head (SGLang's indexer K
+        // cache is MQA, `num_heads_kv = 1`).
+        let indexer_k_mqa = self.compressor.forward_from_xs(xs_full)?;
 
-        // Linear projections.
-        let gate_out = self.inner_wgate.forward_autocast(&k_grouped)?;
-        let kv_out = self.inner_wkv.forward_autocast(&k_grouped)?;
-        let gated = (candle_nn::ops::sigmoid(&gate_out)? * kv_out)?;
-
-        // Add ape positional bias. inner_ape is [ratio, coff*head_dim].
-        // For the prototype we sum over the ratio axis to produce a
-        // single broadcastable [coff*head_dim] bias. Phase-2 TileLang
-        // kernel will reproduce SGLang's per-position-in-group ape
-        // ordering. The bias shape [coff*head_dim] matches gated's last
-        // dim and broadcasts correctly across all grouped rows.
-        let ape_bias = self
-            .inner_ape
-            .to_dtype(work_dtype)?
-            .sum(0)?; // [coff*head_dim]
-        let gated = gated.broadcast_add(&ape_bias)?;
-
-        // Reshape to expose `head_dim` for RMSNorm. SGLang's compressor
-        // norm operates per-`head_dim` slice. With coff=2 we have two
-        // such slices per output position. Treat them as additional
-        // (B*H*T_c)*coff rows of head_dim each.
-        let total_groups = b * h_k * t_c;
-        let gated = gated.reshape((total_groups * self.coff, self.head_dim))?;
-        let normed = gated.apply(&self.inner_norm)?;
-
-        // We need a single [head_dim] output per compressed slot — collapse
-        // the `coff` overlap dimension by sum (matches SGLang's overlap
-        // handling: the two halves are summed at the kernel level when
-        // computing scores; see `compress_forward` triton kernel).
-        let normed = normed.reshape((total_groups, self.coff, self.head_dim))?.sum(1)?;
-        let indexer_k = normed
-            .reshape((b, h_k, t_c, self.head_dim))?
+        // The scoring path below (and the CUDA FlashMLASparse kernel) takes
+        // `[B, H, T_c, D]`, so broadcast the single key set across heads.
+        // This is exact — every head sees the identical key — but it does
+        // materialise `n_heads` copies. Collapsing it into a broadcasting
+        // matmul is a memory/compute win only; it does not change results.
+        let indexer_k = indexer_k_mqa
+            .unsqueeze(1)?
+            .expand((b, self.n_heads, t_c, self.head_dim))?
             .contiguous()?;
 
         // --- 3+4+5. Score + relu + weighted head-sum + top-k -------------
@@ -388,7 +333,7 @@ impl V4Indexer {
         // Rust path below remains the spec / reference and is also taken
         // on CPU / non-CUDA devices and for unsupported shapes.
         //
-        // Per-head weights: weights_proj(xs) * weight_scale
+        // Per-head weights: weights_proj(xs_q) * weight_scale
         //   → [B, T_q, n_heads] → [B, n_heads, T_q]
         // `weight_scale` is folded in here (not in the kernel), exactly as
         // SGLang folds it in `compute_weights` / `fused_scale` before the
@@ -396,7 +341,7 @@ impl V4Indexer {
         // weights that already carry it.
         let per_head_scale_3d = self
             .weights_proj
-            .forward_autocast(xs)? // [B, T_q, n_heads]
+            .forward_autocast(xs_q)? // [B, T_q, n_heads]
             .transpose(1, 2)? // [B, n_heads, T_q]
             .contiguous()?
             .affine(self.weight_scale, 0.0)?;
@@ -477,7 +422,7 @@ pub fn indexer_logits(q: &Tensor, k: &Tensor, weights: &Tensor) -> Result<Tensor
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
+    use candle_core::{DType, Device};
     use candle_nn::var_builder::VarBuilderArgs;
     use mistralrs_quant::ShardedSafeTensors;
     use std::collections::HashMap;
@@ -612,27 +557,30 @@ mod tests {
             "compressor.norm.weight".to_string(),
             Tensor::ones(cfg.index_head_dim, dtype, device).unwrap(),
         );
-        // compressor.wgate.weight: [coff*head_dim, ratio*head_dim]
+        // compressor.wgate.weight: [coff*head_dim, hidden_size] — the
+        // compressor consumes HIDDEN STATES, so its in_features is
+        // `hidden_size`, never `ratio*head_dim`. See the module docs and
+        // `v4_indexer_loads_published_artifact_shapes`.
         m.insert(
             "compressor.wgate.weight".to_string(),
             det_randn(
                 0xA11A_0003,
                 0.0f32,
                 0.02,
-                (coff * cfg.index_head_dim, ratio * cfg.index_head_dim),
+                (coff * cfg.index_head_dim, cfg.hidden_size),
                 device,
             )
             .to_dtype(dtype)
             .unwrap(),
         );
-        // compressor.wkv.weight: [coff*head_dim, ratio*head_dim]
+        // compressor.wkv.weight: [coff*head_dim, hidden_size]
         m.insert(
             "compressor.wkv.weight".to_string(),
             det_randn(
                 0xA11A_0004,
                 0.0f32,
                 0.02,
-                (coff * cfg.index_head_dim, ratio * cfg.index_head_dim),
+                (coff * cfg.index_head_dim, cfg.hidden_size),
                 device,
             )
             .to_dtype(dtype)
@@ -645,7 +593,7 @@ mod tests {
     #[test]
     fn v4_indexer_forward_shape() -> Result<()> {
         let device = Device::Cpu;
-        let cfg = synth_cfg(/*hidden*/ 32, /*q_lora*/ 24, /*n_heads*/ 4, /*head_dim*/ 8, /*topk*/ 6);
+        let cfg = synth_cfg(/*hidden*/ 20, /*q_lora*/ 24, /*n_heads*/ 4, /*head_dim*/ 8, /*topk*/ 6);
         let tensors = make_indexer_tensors(&cfg, 4, 2, &device);
         let vb = vb_from_map(tensors, DType::F32, &device);
         let indexer = V4Indexer::new(&cfg, vb, &device, false)?;
@@ -654,15 +602,10 @@ mod tests {
         let t_q = 3usize;
         let t_full = 16usize; // T_c = 4
         let q_a = Tensor::randn(0.0f32, 1.0, (b, t_q, cfg.q_lora_rank.unwrap()), &device)?;
-        let k_full = Tensor::randn(
-            0.0f32,
-            1.0,
-            (b, cfg.index_n_heads, t_full, cfg.index_head_dim),
-            &device,
-        )?;
-        let xs = Tensor::randn(0.0f32, 1.0, (b, t_q, cfg.hidden_size), &device)?;
+        let xs_full = Tensor::randn(0.0f32, 1.0, (b, t_full, cfg.hidden_size), &device)?;
+        let xs_q = Tensor::randn(0.0f32, 1.0, (b, t_q, cfg.hidden_size), &device)?;
 
-        let out = indexer.forward(&q_a, &k_full, &xs)?;
+        let out = indexer.forward(&q_a, &xs_full, &xs_q)?;
         // Output shape is [B, T_q, topk] — no head axis: the head dot products
         // are relu'd and summed into ONE logit per (query, key), so a single
         // key set is selected and shared by every head. `topk` is clamped to
@@ -677,7 +620,7 @@ mod tests {
     #[test]
     fn v4_indexer_indices_in_range() -> Result<()> {
         let device = Device::Cpu;
-        let cfg = synth_cfg(32, 24, 4, 8, /*topk*/ 3);
+        let cfg = synth_cfg(20, 24, 4, 8, /*topk*/ 3);
         let tensors = make_indexer_tensors(&cfg, 4, 2, &device);
         let vb = vb_from_map(tensors, DType::F32, &device);
         let indexer = V4Indexer::new(&cfg, vb, &device, false)?;
@@ -686,15 +629,10 @@ mod tests {
         let t_q = 2usize;
         let t_full = 12usize; // T_c = 3
         let q_a = Tensor::randn(0.0f32, 1.0, (b, t_q, cfg.q_lora_rank.unwrap()), &device)?;
-        let k_full = Tensor::randn(
-            0.0f32,
-            1.0,
-            (b, cfg.index_n_heads, t_full, cfg.index_head_dim),
-            &device,
-        )?;
-        let xs = Tensor::randn(0.0f32, 1.0, (b, t_q, cfg.hidden_size), &device)?;
+        let xs_full = Tensor::randn(0.0f32, 1.0, (b, t_full, cfg.hidden_size), &device)?;
+        let xs_q = Tensor::randn(0.0f32, 1.0, (b, t_q, cfg.hidden_size), &device)?;
 
-        let out = indexer.forward(&q_a, &k_full, &xs)?;
+        let out = indexer.forward(&q_a, &xs_full, &xs_q)?;
         let t_c = (t_full / 4) as u32;
         // Flatten to Vec<u32> for in-range check.
         let flat: Vec<u32> = out.flatten_all()?.to_vec1()?;
@@ -711,7 +649,7 @@ mod tests {
     #[test]
     fn v4_indexer_deterministic() -> Result<()> {
         let device = Device::Cpu;
-        let cfg = synth_cfg(16, 12, 2, 4, /*topk*/ 4);
+        let cfg = synth_cfg(20, 12, 2, 4, /*topk*/ 4);
         let tensors = make_indexer_tensors(&cfg, 4, 2, &device);
         let vb = vb_from_map(tensors, DType::F32, &device);
         let indexer = V4Indexer::new(&cfg, vb, &device, false)?;
@@ -723,23 +661,19 @@ mod tests {
         let q_a = Tensor::arange(0u32, (b * t_q * cfg.q_lora_rank.unwrap()) as u32, &device)?
             .reshape((b, t_q, cfg.q_lora_rank.unwrap()))?
             .to_dtype(DType::F32)?;
-        let k_full = Tensor::arange(
-            0u32,
-            (b * cfg.index_n_heads * t_full * cfg.index_head_dim) as u32,
-            &device,
-        )?
-        .reshape((b, cfg.index_n_heads, t_full, cfg.index_head_dim))?
-        .to_dtype(DType::F32)?;
-        let xs = Tensor::arange(0u32, (b * t_q * cfg.hidden_size) as u32, &device)?
+        let xs_full = Tensor::arange(0u32, (b * t_full * cfg.hidden_size) as u32, &device)?
+            .reshape((b, t_full, cfg.hidden_size))?
+            .to_dtype(DType::F32)?;
+        let xs_q = Tensor::arange(0u32, (b * t_q * cfg.hidden_size) as u32, &device)?
             .reshape((b, t_q, cfg.hidden_size))?
             .to_dtype(DType::F32)?;
 
         let out_a: Vec<u32> = indexer
-            .forward(&q_a, &k_full, &xs)?
+            .forward(&q_a, &xs_full, &xs_q)?
             .flatten_all()?
             .to_vec1()?;
         let out_b: Vec<u32> = indexer
-            .forward(&q_a, &k_full, &xs)?
+            .forward(&q_a, &xs_full, &xs_q)?
             .flatten_all()?
             .to_vec1()?;
         assert_eq!(out_a, out_b, "indexer must be deterministic across re-runs");
@@ -752,10 +686,13 @@ mod tests {
     /// This locks in the spec the CUDA kernels are compared against on a GPU
     /// host.
     ///
-    /// We construct an indexer with ape=0 + RMSNorm weight=1 so the inner
-    /// compressor reduces to a pure sigmoid(gate)*kv + sum-over-coff
-    /// transformation. Then we replicate that transformation in pure Rust
-    /// and verify the top-k indices match.
+    /// The compressor is treated as a black box here — its output is taken
+    /// from [`V4Compressor::forward_from_xs`], whose own semantics are pinned
+    /// by the tests in `deepseek4.rs` — because the kernels this test exists
+    /// to specify compute **only** the score + top-k. Duplicating the
+    /// compressor math here is what made the previous version of this test
+    /// vacuous: it mirrored the loader's own (wrong) assumption instead of the
+    /// checkpoint's.
     #[test]
     fn v4_indexer_agrees_with_cpu_reference() -> Result<()> {
         let device = Device::Cpu;
@@ -771,10 +708,6 @@ mod tests {
         // to use the very tensors the indexer consumed.
         let wq_b_w = tensors["wq_b.weight"].clone();
         let weights_proj_w = tensors["weights_proj.weight"].clone();
-        let ape = tensors["compressor.ape"].clone();
-        let norm_w = tensors["compressor.norm.weight"].clone();
-        let wgate_w = tensors["compressor.wgate.weight"].clone();
-        let wkv_w = tensors["compressor.wkv.weight"].clone();
 
         let vb = vb_from_map(tensors, DType::F32, &device);
         let indexer = V4Indexer::new(&cfg, vb, &device, false)?;
@@ -790,22 +723,18 @@ mod tests {
             .reshape((b, t_q, cfg.q_lora_rank.unwrap()))?
             .to_dtype(DType::F32)?
             .affine(0.013, -0.5)?; // diversify
-        let k_full = Tensor::arange(
-            0u32,
-            (b * cfg.index_n_heads * t_full * cfg.index_head_dim) as u32,
-            &device,
-        )?
-        .reshape((b, cfg.index_n_heads, t_full, cfg.index_head_dim))?
-        .to_dtype(DType::F32)?
-        .affine(0.007, -0.25)?;
-        let xs = Tensor::arange(0u32, (b * t_q * cfg.hidden_size) as u32, &device)?
+        let xs_full = Tensor::arange(0u32, (b * t_full * cfg.hidden_size) as u32, &device)?
+            .reshape((b, t_full, cfg.hidden_size))?
+            .to_dtype(DType::F32)?
+            .affine(0.007, -0.25)?;
+        let xs_q = Tensor::arange(0u32, (b * t_q * cfg.hidden_size) as u32, &device)?
             .reshape((b, t_q, cfg.hidden_size))?
             .to_dtype(DType::F32)?
             .affine(0.011, -0.3)?;
 
         // ---- Candle forward (the path under test) ----
         let got: Vec<u32> = indexer
-            .forward(&q_a, &k_full, &xs)?
+            .forward(&q_a, &xs_full, &xs_q)?
             .flatten_all()?
             .to_vec1()?;
 
@@ -815,18 +744,11 @@ mod tests {
         let head_dim = cfg.index_head_dim;
         let q_lora = cfg.q_lora_rank.unwrap();
         let hidden = cfg.hidden_size;
-        let ratio = 4usize;
-        let coff = 2usize;
 
         let q_a_v: Vec<f32> = q_a.flatten_all()?.to_vec1()?;
-        let xs_v: Vec<f32> = xs.flatten_all()?.to_vec1()?;
-        let k_full_v: Vec<f32> = k_full.flatten_all()?.to_vec1()?;
+        let xs_q_v: Vec<f32> = xs_q.flatten_all()?.to_vec1()?;
         let wq_b_v: Vec<f32> = wq_b_w.flatten_all()?.to_vec1()?;
         let weights_proj_v: Vec<f32> = weights_proj_w.flatten_all()?.to_vec1()?;
-        let ape_v: Vec<f32> = ape.flatten_all()?.to_vec1()?;
-        let norm_w_v: Vec<f32> = norm_w.flatten_all()?.to_vec1()?;
-        let wgate_v: Vec<f32> = wgate_w.flatten_all()?.to_vec1()?;
-        let wkv_v: Vec<f32> = wkv_w.flatten_all()?.to_vec1()?;
 
         // Linear: out[i] = sum_k(w[i,k] * in[k])
         let lin = |w: &[f32], in_dim: usize, out_dim: usize, x: &[f32]| -> Vec<f32> {
@@ -861,77 +783,20 @@ mod tests {
             }
         }
 
-        // 2. Inner compressor on K. Group K [B,H,T_full,D] → [B*H*T_c, ratio*D]
-        let mut k_grouped = vec![0.0f32; b * n_heads * t_c * (ratio * head_dim)];
-        for bi in 0..b {
-            for h in 0..n_heads {
-                for ci in 0..t_c {
-                    for ri in 0..ratio {
-                        for d in 0..head_dim {
-                            let src = ((bi * n_heads + h) * t_full + ci * ratio + ri) * head_dim + d;
-                            let dst = ((bi * n_heads + h) * t_c + ci) * (ratio * head_dim)
-                                + ri * head_dim
-                                + d;
-                            k_grouped[dst] = k_full_v[src];
-                        }
-                    }
-                }
-            }
-        }
+        // 2. Compressed keys: `[B, T_c, head_dim]` — MQA, one key per
+        //    compressed slot shared by every head (SGLang's indexer K cache is
+        //    `num_heads_kv = 1`). Taken from the shared compressor rather than
+        //    re-derived; see the doc comment.
+        let indexer_k: Vec<f32> = indexer
+            .compressor
+            .forward_from_xs(&xs_full)?
+            .flatten_all()?
+            .to_vec1()?;
+        assert_eq!(indexer_k.len(), b * t_c * head_dim);
 
-        // Linear projections wgate, wkv → [B*H*T_c, coff*head_dim]
-        let gate_out = lin(&wgate_v, ratio * head_dim, coff * head_dim, &k_grouped);
-        let kv_out = lin(&wkv_v, ratio * head_dim, coff * head_dim, &k_grouped);
-        // sigmoid(gate) * kv
-        let mut gated: Vec<f32> = gate_out
-            .iter()
-            .zip(kv_out.iter())
-            .map(|(&g, &v)| (1.0 / (1.0 + (-g).exp())) * v)
-            .collect();
-        // ape bias: sum over ratio axis to get [coff*head_dim], broadcast
-        // add across all rows.
-        let mut ape_bias = vec![0.0f32; coff * head_dim];
-        for ri in 0..ratio {
-            for d in 0..(coff * head_dim) {
-                ape_bias[d] += ape_v[ri * (coff * head_dim) + d];
-            }
-        }
-        let n_rows_gated = b * n_heads * t_c;
-        for r in 0..n_rows_gated {
-            for d in 0..(coff * head_dim) {
-                gated[r * (coff * head_dim) + d] += ape_bias[d];
-            }
-        }
-
-        // Reshape gated [B*H*T_c, coff*head_dim] → [(B*H*T_c)*coff, head_dim],
-        // apply RMSNorm per row, then sum over coff to get [B*H*T_c, head_dim].
-        let rms_eps = cfg.rms_norm_eps as f32;
-        let mut normed = vec![0.0f32; n_rows_gated * coff * head_dim];
-        for r in 0..(n_rows_gated * coff) {
-            // RMSNorm: x * weight / sqrt(mean(x^2) + eps)
-            let base = r * head_dim;
-            let mut sumsq = 0.0f32;
-            for d in 0..head_dim {
-                sumsq += gated[base + d].powi(2);
-            }
-            let scale = 1.0 / (sumsq / head_dim as f32 + rms_eps).sqrt();
-            for d in 0..head_dim {
-                normed[base + d] = gated[base + d] * scale * norm_w_v[d];
-            }
-        }
-        // Sum over coff → indexer_k [B, H, T_c, head_dim]
-        let mut indexer_k = vec![0.0f32; n_rows_gated * head_dim];
-        for r in 0..n_rows_gated {
-            for c in 0..coff {
-                for d in 0..head_dim {
-                    indexer_k[r * head_dim + d] += normed[(r * coff + c) * head_dim + d];
-                }
-            }
-        }
-
-        // 3. weights_proj(xs) * weight_scale → [B, T_q, n_heads] → [B, H, T_q]
+        // 3. weights_proj(xs_q) * weight_scale → [B, T_q, n_heads] → [B, H, T_q]
         let weight_scale = ((head_dim as f64).powf(-0.5) * (n_heads as f64).powf(-0.5)) as f32;
-        let wp_flat = lin(&weights_proj_v, hidden, n_heads, &xs_v);
+        let wp_flat = lin(&weights_proj_v, hidden, n_heads, &xs_q_v);
         let mut scale = vec![0.0f32; b * n_heads * t_q];
         for bi in 0..b {
             for ti in 0..t_q {
@@ -958,7 +823,8 @@ mod tests {
                         for h in 0..n_heads {
                             let s = scale[(bi * n_heads + h) * t_q + ti];
                             let q_base = ((bi * n_heads + h) * t_q + ti) * head_dim;
-                            let k_base = ((bi * n_heads + h) * t_c + ci) * head_dim;
+                            // MQA: the key set has no head axis.
+                            let k_base = (bi * t_c + ci) * head_dim;
                             let mut acc = 0.0f32;
                             for d in 0..head_dim {
                                 acc += q_bhqd[q_base + d] * indexer_k[k_base + d];
@@ -1026,18 +892,12 @@ mod tests {
 
         let q_a = det_randn(0xF0FF_0001, 0.0, 1.0, (b * t_q, cfg.q_lora_rank.unwrap()), &device)
             .reshape((b, t_q, cfg.q_lora_rank.unwrap()))?;
-        let k_full = det_randn(
-            0xF0FF_0002,
-            0.0,
-            1.0,
-            (b * n_heads * t_full, head_dim),
-            &device,
-        )
-        .reshape((b, n_heads, t_full, head_dim))?;
-        let xs = det_randn(0xF0FF_0003, 0.0, 1.0, (b * t_q, cfg.hidden_size), &device)
+        let xs_full = det_randn(0xF0FF_0002, 0.0, 1.0, (b * t_full, cfg.hidden_size), &device)
+            .reshape((b, t_full, cfg.hidden_size))?;
+        let xs_q = det_randn(0xF0FF_0003, 0.0, 1.0, (b * t_q, cfg.hidden_size), &device)
             .reshape((b, t_q, cfg.hidden_size))?;
 
-        let idx = indexer.forward(&q_a, &k_full, &xs)?;
+        let idx = indexer.forward(&q_a, &xs_full, &xs_q)?;
         assert_eq!(idx.dims(), &[b, t_q, t_c]);
 
         // (a) The selection is the complete key set for every (batch, query).
@@ -1175,6 +1035,139 @@ mod tests {
             (indexer.weight_scale - 0.125).abs() < 1e-12,
             "weight_scale = {} != 0.125",
             indexer.weight_scale
+        );
+        Ok(())
+    }
+
+    // ===== Round-trip shape contract vs. the PUBLISHED artifact =====
+    //
+    // Arc's first published artifact, `aeonmind/DeepSeek-V4-Flash-UQFF-qtip2`
+    // (baked 2026-08-15), carries
+    // `layers.N.attn.indexer.compressor.wgate.weight` at **[256, 4096]** on
+    // every CSA layer (2, 4, …, 42). This loader asked for **[256, 512]**, so
+    // every CSA layer logged
+    //   `V4 CSA layer N: indexer load failed (shape mismatch for
+    //    layers.N.attn.indexer.compressor.wgate.weight,
+    //    expected: [256, 512], got: [256, 4096])`
+    // and silently fell back to dense-over-compressed. The loader was wrong,
+    // not the artifact:
+    //   * `[256, 4096] == [coff * index_head_dim, hidden_size]`
+    //     (`coff = 2`, `index_head_dim = 128`, `hidden_size = 4096`);
+    //   * SGLang builds it as `ReplicatedLinear(config.hidden_size,
+    //     2 * coff * head_dim)` —
+    //     `research/code/06_foundation/sglang/python/sglang/srt/layers/
+    //      attention/dsv4/compressor.py:305,318-325`;
+    //   * and its V4 loader concatenates two `[coff*head_dim, hidden_size]`
+    //     halves — `.../sglang/srt/models/deepseek_v4.py:1633-1652`.
+    // Arc's own reference audit had already recorded this
+    // (`docs/notes/v4-reference-audit.md:1358-1365`) and it shipped anyway,
+    // because the only tests were built from the loader's own assumption.
+    //
+    // These two tests are the contract in both directions: the artifact's
+    // shape MUST load, and the pre-fix shape MUST be rejected.
+
+    /// Real V4-Flash dimensions, taken from `DeepSeekV4Config`'s pinned
+    /// `V4_FLASH_CONFIG_JSON` (`deepseek4.rs`): `hidden_size = 4096`,
+    /// `index_n_heads = 64`, `index_head_dim = 128`, `index_topk = 512`,
+    /// `q_lora_rank = 1024` (`research/v4_audit.md:104`).
+    fn v4_flash_indexer_cfg() -> super::super::deepseek4::DeepSeekV4Config {
+        synth_cfg(
+            /*hidden*/ 4096, /*q_lora*/ 1024, /*n_heads*/ 64, /*head_dim*/ 128,
+            /*topk*/ 512,
+        )
+    }
+
+    /// Tensors at exactly the shapes the published UQFF contains. Zeros —
+    /// only the shapes are under test, and zeros keep the ~43 MB fixture
+    /// cheap to build.
+    fn published_artifact_indexer_tensors(
+        cfg: &super::super::deepseek4::DeepSeekV4Config,
+        compressor_in_features: usize,
+        device: &Device,
+    ) -> Result<HashMap<String, Tensor>> {
+        const COFF: usize = 2;
+        const RATIO: usize = 4;
+        let hd = cfg.index_head_dim;
+        let mut m = HashMap::new();
+        let z = |dims: (usize, usize)| Tensor::zeros(dims, DType::F32, device);
+        m.insert(
+            "wq_b.weight".to_string(),
+            z((cfg.index_n_heads * hd, cfg.q_lora_rank.unwrap()))?,
+        );
+        m.insert(
+            "weights_proj.weight".to_string(),
+            z((cfg.index_n_heads, cfg.hidden_size))?,
+        );
+        m.insert("compressor.ape".to_string(), z((RATIO, COFF * hd))?);
+        m.insert(
+            "compressor.norm.weight".to_string(),
+            Tensor::ones(hd, DType::F32, device)?,
+        );
+        m.insert(
+            "compressor.wgate.weight".to_string(),
+            z((COFF * hd, compressor_in_features))?,
+        );
+        m.insert(
+            "compressor.wkv.weight".to_string(),
+            z((COFF * hd, compressor_in_features))?,
+        );
+        Ok(m)
+    }
+
+    /// The artifact's shapes load. Regression guard for
+    /// `indexer load failed (shape mismatch …)` on every CSA layer.
+    #[test]
+    fn v4_indexer_loads_published_artifact_shapes() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = v4_flash_indexer_cfg();
+
+        // What the artifact actually holds: [coff*index_head_dim, hidden_size].
+        let in_features = cfg.hidden_size;
+        assert_eq!(
+            (2 * cfg.index_head_dim, in_features),
+            (256, 4096),
+            "fixture must reproduce the artifact's observed [256, 4096]"
+        );
+
+        let tensors = published_artifact_indexer_tensors(&cfg, in_features, &device)?;
+        let vb = vb_from_map(tensors, DType::F32, &device);
+        let indexer = V4Indexer::new(&cfg, vb, &device, false)?;
+
+        assert_eq!(indexer.compressor.head_dim, cfg.index_head_dim);
+        assert_eq!(indexer.compressor.hidden_size, cfg.hidden_size);
+        assert_eq!(indexer.compressor.coff, 2);
+        assert_eq!(indexer.compressor.ratio, 4);
+        Ok(())
+    }
+
+    /// The pre-fix expectation `[coff*head_dim, ratio*head_dim] = [256, 512]`
+    /// must now be REJECTED. This is the half that proves the test above is
+    /// not vacuous: revert the loader to `ratio * head_dim` and this test
+    /// goes green while `v4_indexer_loads_published_artifact_shapes` goes red.
+    #[test]
+    fn v4_indexer_rejects_pre_fix_compressor_shape() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = v4_flash_indexer_cfg();
+
+        // The wrong in_features the loader used to ask for.
+        let bad_in_features = 4 * cfg.index_head_dim; // 512
+        assert_ne!(
+            bad_in_features, cfg.hidden_size,
+            "fixture is only meaningful when the two candidate in_features differ"
+        );
+
+        let tensors = published_artifact_indexer_tensors(&cfg, bad_in_features, &device)?;
+        let vb = vb_from_map(tensors, DType::F32, &device);
+        let msg = match V4Indexer::new(&cfg, vb, &device, false) {
+            Ok(_) => panic!(
+                "[256, 512] is not a V4 indexer compressor weight and must not load — \
+                 the loader has drifted back to `ratio * head_dim` in_features"
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("shape mismatch") || msg.contains("wkv"),
+            "expected a shape-mismatch error naming the compressor tensor, got: {msg}"
         );
         Ok(())
     }

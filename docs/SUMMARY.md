@@ -110,6 +110,10 @@
 - [MCP Transports](MCP/transports.md)
 - [MCP Advanced Usage](MCP/advanced.md)
 
+# Model Cards
+
+- [DeepSeek-V4-Flash UQFF (qtip2)](model-cards/deepseek-v4-flash-uqff-qtip2.md)
+
 # Engineering Record
 
 - [Overview](engineering/README.md)
