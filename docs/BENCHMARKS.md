@@ -12,7 +12,7 @@ difference is stated inline.
 | | |
 |---|---|
 | Model | DeepSeek V4 Flash — 284B logical / 13B active MoE (HF-verified: model card + release announcement + config geometry, 43 layers / 256+1 experts) |
-| Artifact | 68 GB UQFF bake, 7 shards: 2-bit trellis (qtip2) experts + FP8 attention; `lm_head` and the context compressor excluded from 2-bit |
+| Artifact | **74.18 GB** UQFF bake, **8 shards + residual** (15 files): 2-bit trellis (qtip2) experts + FP8 attention; `lm_head` and the context compressor excluded from 2-bit. Published as `aeonmind/DeepSeek-V4-Flash-UQFF-qtip2`; size and file count **verified against the HF API**, not the uploader's report. Loads in 12.94 s / 517 tensors. Earlier docs said "68 GB / 7 shards" — that was a pre-publication estimate |
 | Hardware | 1× NVIDIA H200 (141 GB HBM3e), rented via Runcrate (NY), $4.92/hr |
 | Engine | Arc (this repo), CUDA + flash-attn build; serve via OpenAI-compatible HTTP API |
 | Sessions | Session 1: 2026-08-12T23:31Z, 9.2 h. Session 2: 2026-08-13T12:47Z (re-bake with the Viterbi encoder fix, PR #9). Session 3: 2026-08-13T20:31Z, ≈6.2 h (throughput session: all kernel-fix PRs #8/#10/#14/#15 in the build; token budget raised to 2048). Session 4: 2026-08-14T03:35Z, ≈3 h (payoff session: GEMV autotune sweep, grouped-GEMM batch curve, no-cudnn rebuild) |
@@ -185,7 +185,8 @@ Outline:
    (−62% decode on V4: 5.45 vs 14.58 tok/s, session 4).
 3. `arc-tools/quality/fetch_data.sh` (model + eval data; ~149 GB download).
 4. Bake the UQFF artifact (qtip2 experts + FP8 attention; Viterbi is the
-   default expert encode mode since PR #9). Expect ~68 GB across 7 shards.
+   default expert encode mode since PR #9). Expect **~74 GB across 8 shards +
+   residual** (the published artifact measures 74.18 GB / 15 files).
 5. Serve on port 1234; run `run_coherence.py`, `run_gsm8k.py`, `run_longctx.py`
    (with the `ARC_V4_STANDARD_DENSE` / `ARC_V4_WINDOW_ONLY` gates for the
    ablation), `speed_probe.py`, `run_sinkhorn_ab.py`; run `run_ppl.sh` with the

@@ -19,7 +19,7 @@ Inference at the speed of physics.
 
 ---
 
-Arc is an inference engine built to serve frontier MoE models on radically less hardware, by composing published compression research end-to-end: **QTIP 2-bit weights, TurboQuant 3.5-bit KV cache, TD-MoE Tucker decomposition**, and model-native sparse attention kernels. Measured today: DeepSeek V4 Flash (284B / 13B active) serving from a 68 GB artifact on a **single H200**, at GSM8K 87.0% (provisional — see [Results](#results)).
+Arc is an inference engine built to serve frontier MoE models on radically less hardware, by composing published compression research end-to-end: **QTIP 2-bit weights, TurboQuant 3.5-bit KV cache, TD-MoE Tucker decomposition**, and model-native sparse attention kernels. Measured today: DeepSeek V4 Flash (284B / 13B active) serving from a **74.18 GB** artifact on a **single H200**, at GSM8K 87.0% (provisional — see [Results](#results)).
 
 Forked from [mistral.rs](https://github.com/EricLBuehler/mistral.rs). Apache 2.0. Upstream-merge-compatible.
 
@@ -45,7 +45,7 @@ Validated as of Aug 2026 (DeepSeek V4 Flash, 284B / 13B-active MoE, single H200 
 
 | Claim | Status | Number |
 |---|---|---|
-| Frontier MoE on one GPU | **Measured** | 284B/13B V4 Flash serves from a **68 GB** artifact (2-bit trellis experts + FP8 attention) on a single H200 |
+| Frontier MoE on one GPU | **Measured** | 284B/13B V4 Flash serves from a **74.18 GB** artifact (2-bit trellis experts + FP8 attention, 8 shards + residual) on a single H200 — size HF-API-verified on the published `aeonmind/DeepSeek-V4-Flash-UQFF-qtip2` |
 | Quality at 2-bit experts | **Measured — provisional** | GSM8K **87.0%** (n=100, 0-shot chat, greedy, seed 161, 2048-token cap) vs 90.8 published for the base model (**8-shot** — a different and easier protocol); facts 22/22, arithmetic 8/8, coherence 6/6. **Provisional:** PR #35 changed the decode math after this was measured (SwiGLU clamp missing on 4 of 5 expert paths incl. the shared expert; YaRN on ratio-0 layers). Direction expected neutral-to-better, **unmeasured** — [details](docs/BENCHMARKS.md) |
 | Long-context correctness | **Measured** | 5/5 coherence + 4/4 needle recall (ablation matrix in BENCHMARKS.md) |
 | TurboQuant KV | **Measured** | **4.27×** KV compression, Qwen3-32B on one H100 (39K→169K-token context) |
@@ -72,7 +72,7 @@ KV cache bytes per token @ 32K context:
 
 Each layer compresses a different axis. The wins multiply.
 
-Measured end-to-end so far: **4.27×** KV (TurboQuant, Qwen3-32B on one H100) and 284B → **68 GB** weights (V4 Flash qtip2 bake, serving on one H200 — see [Results](#results)). The remaining multipliers above are format arithmetic until measured.
+Measured end-to-end so far: **4.27×** KV (TurboQuant, Qwen3-32B on one H100) and 284B → **74.18 GB** weights (V4 Flash qtip2 bake, serving on one H200 — see [Results](#results)). The remaining multipliers above are format arithmetic until measured.
 
 For long context (1M+ tokens), the bottleneck shifts from weights to attention compute + KV bandwidth. Arc handles that via FlashMLASparse (CUDA kernel, MIT-licensed, ported from sgl-project), turning dense attention's O(n²) into sparse top-k O(n·k) on models with native sparse-attention training (DeepSeek V3.2+ family) and via top-k attention + sink preservation on the rest.
 

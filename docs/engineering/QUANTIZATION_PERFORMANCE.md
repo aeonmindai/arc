@@ -20,7 +20,7 @@ Every number below carries one of these labels. Nothing is stated without one.
 | **[source-verified]** | read directly in shipped code (ours or a third party's) |
 | **[projected]** | a forward estimate. Not a measurement. Several of ours were wrong — see "Predictions that failed" |
 | **[published]** | a third party's number, measured against *their* baseline, not ours |
-| **[upper bound]** | run on hardware, but under conditions that gave the change *more* room than the shipped build has. It **caps** the shipped value; it does not establish it. The shipped value is unmeasured |
+| **[upper bound]** | run on hardware, but under conditions established to give the change *more* room than the shipped build has. It **caps** the shipped value; it does not establish it. ⚠️ Only valid once the **direction** of that effect is itself measured — asserting it from a plausible mechanism is how this document published a 1.33× win as "≤1.21×" (see "Predictions that failed", item 5) |
 
 ## What is being quantized
 
@@ -31,23 +31,35 @@ Every number below carries one of these labels. Nothing is stated without one.
 - Reference model: DeepSeek-V4-Flash, 284 B total / 13 B active, 43 quantized
   MoE layers, **6.4 B parameters per layer** ⇒ 3.2e9 symbol positions per layer
   at `V = 2`. [source-verified, `mistralrs-quant/kernels/qtip/qtip_beam.cu:11-25`]
-- Artifact: ~68 GB UQFF in 7 shards. [measured, H200, reproduced 4×]
+- Artifact: **74.18 GB** UQFF in **8 shards + residual** (15 files). [measured, H200, reproduced 4×; size HF-API-verified on the published repo. Earlier revisions said "~68 GB / 7 shards" — an estimate]
 
-## Headline: where a layer's 241 seconds go
+## Headline: where a layer's 241 seconds go — **on the pre-#40 build**
 
-**Beam W=256 on an H200: 241 ± 1 s/layer.** [measured] Measured twice, as
-marginal deltas between consecutive layer markers: run A 240 s, 242 s; run B
-241 s, 242 s. The exhaustive DP over the same trellis is **510 s/layer**
+> 🔴 **Every number in this section is PRE-#40**, and it was read as "current" for
+> a week. The s6 H200 bake it came off started ~20:25Z with an ETA of 21:39Z on
+> 2026-08-14; **PR #40 merged at 21:41:26Z** (`c5384fbcd`), and the instrumentation
+> that produced the split (PR #39) merged at 22:12:46Z — so the decomposition was
+> read off a live run of the **pre-#40** kernel. For what the **shipped** kernel
+> does, see the projected `≈170 s` under "The beam's architectural ceiling" —
+> **not** the 225.2 s below.
+
+**Beam W=256 on an H200: 241 ± 1 s/layer.** [measured, **pre-#40**] Measured
+twice, as marginal deltas between consecutive layer markers: run A 240 s, 242 s;
+run B 241 s, 242 s. The exhaustive DP over the same trellis is **510 s/layer**
 [measured, same box class] ⇒ the beam is **2.1×** faster.
 
 Per-layer decomposition, from in-tree instrumentation read off a live bake over
-**4 consecutive layers, ±0.2 s** [measured]:
+**4 consecutive layers, ±0.2 s** [measured, **pre-#40**, H200, s6 bake]:
 
 | component | time | share |
 |---|---|---|
-| GPU beam kernel (`Quantized fused experts`) | **225.2 s** | **93.4 %** |
+| GPU beam kernel (`Quantized fused experts`) | **225.2 s** [measured, **PRE-#40**, H200, s6 bake] | **93.4 %** |
 | host INT4→BF16 expert unpack, 24 threads | 2.5 s | 1.0 % |
 | other host (rotation, scales, serialize) | ~13.5 s | 5.6 % |
+
+**The host figures carry forward; the kernel figure does not.** #40 touched only
+the kernel, so the ~16 s host floor still stands, but 225.2 s is now the
+*baseline* the 1.33× measured speedup applies to.
 
 Two things follow, and both changed what we worked on:
 
@@ -61,8 +73,10 @@ Two things follow, and both changed what we worked on:
    width) is correct by construction and a **no-op on wall time**. Keeping it was
    a deliberate choice, not a claim.
 
-The 43-layer bake is therefore **≈2.9 h ≈ $14** at $4.92/hr [derived], which
-works out to **~27 M parameters/s** [derived].
+The 43-layer bake at that rate is **≈2.9 h ≈ $14** at $4.92/hr [derived,
+**pre-#40**], working out to **~27 M parameters/s** [derived, **pre-#40**]. The
+post-#40 equivalent is **≈2.2 h** [projected — carries the cross-card assumption
+described in the next section; not measured on an H200].
 
 ## Why the kernel is slow: selection, not arithmetic
 
@@ -119,7 +133,11 @@ LOCAL:0` ⇒ **3 blocks/SM = 37.5 % occupancy, register-limited** [measured].
 > and the **`-arch` it was built for**. Any occupancy figure quoted in this
 > document is therefore only valid for the toolchain that produced it, and must
 > be restated with that toolchain named. This mattered — see "Predictions that
-> failed", item 2.
+> failed", items 2 and 5. **But note what it does *not* license:** knowing the
+> toolchain differed tells you the number is unrepresentative, **not which way it
+> is wrong.** Assuming the direction is what produced this document's one
+> published-and-retracted bound.
+
 A corroboration nobody planned: the bake draws **261 W of 700 W = 37 % of TDP**
 against 37.5 % occupancy. A throughput-bound kernel would not have those two
 track each other; a latency-bound one at fixed clocks does.
@@ -145,18 +163,35 @@ Fitting `time = fixed + b·W`:
 **The fixed term does not go away by making selection cheaper.** Even with
 per-candidate work driven to *zero*, this kernel cannot beat
 `1227.5 / 354 = 3.47×` [measured — the floor was measured directly at W=16, not
-extrapolated]. Converted to the H200 measurement (225.2 s kernel + ~16 s host):
+extrapolated]. Both rows below scale down from the **pre-#40 H200 baseline**
+(225.2 s kernel + ~16 s host), which is the correct divisor now that the
+headline's provenance is settled:
 
-| | kernel | + host |
-|---|---|---|
-| banked today (**≤1.21×** stack) | **≥186 s** | **≥202 s/layer** [projected from the A30 ratio, off an **[upper bound]** — see the caveat under "Predictions that failed", item 2] |
-| every remaining identity-safe idea lands perfectly (3.47×) | 65 s | **81 s/layer** [projected] |
+| | kernel | + host | grade |
+|---|---|---|---|
+| what ships today (pre-#40 baseline ÷ the **1.33×** stack) | **≈170 s** | **≈186 s/layer** | **[projected]** — see the cross-card caveat below |
+| every remaining identity-safe idea lands perfectly (÷ **3.47×**) | 65 s | **81 s/layer** | **[projected]** — same caveat; the 3.47× divisor is **pre-#40-based** and was measured on an **A30** |
 
-The "banked today" row is a **best case**, not a current state: the 1.21× it
-divides by is an upper bound measured on a non-production toolchain, so the true
-kernel time is **at least** 186 s and the stack's shipped contribution has never
-been measured. The 3.47× architectural ceiling below is unaffected — it comes
-from the W sweep, not from the stack.
+> 🔴 **Both rows are `[projected]`, not measured, and the reason is the same:
+> each divides an H200 measurement by a ratio measured on a different card.**
+>
+> - `≈170 s` / `≈186 s/layer` = **225.2 s [measured, H200, pre-#40]** ÷ **1.33×
+>   [measured, A100]**. It **assumes the speedup transfers across cards, which is
+>   unverified.**
+> - `65 s` / `81 s/layer` = the same 225.2 s ÷ **3.47× [measured, A30]** — and
+>   that 3.47× is likewise computed from the **pre-#40 baseline** (`1227.5 / 354`
+>   in the sweep above), so the divisor sits on the same side of #40 as the
+>   numerator. Consistent lineage, but the same cross-card assumption.
+>
+> **We have direct evidence this assumption can fail.** The same gen-1 GEMV
+> kernel measured **15.4 % of peak on an A30** against **9.4–9.7 % on an H200** —
+> a ratio that does not transfer at all. Treat any cross-card division here as a
+> projection until an H200 A/B is run.
+
+The "what ships today" row is now anchored to a measurement rather than a bound.
+An earlier revision published these cells as `≥186 s` / `≥202 s/layer` on the
+grounds that the stack's value was only an upper bound; **that was wrong, and
+wrong in the cautious direction** — see item 5.
 
 So **45–50 s/layer of kernel with byte-identical output is not reachable from
 this beam architecture.** That is a measured statement about the architecture,
@@ -300,9 +335,13 @@ of a proven pattern to a second geometry, not new research.
 
 ## Predictions that failed, and why
 
-This program has now had **four** architectural predictions die on measurement.
-They are recorded because the failure mode repeats: *the mechanism was real, the
-magnitude was assumed.*
+This program has now had **five** predictions die on measurement. The first four
+are architectural, and they are recorded because the failure mode repeats: *the
+mechanism was real, the magnitude was assumed.*
+
+**The fifth is different in kind, and it is the most uncomfortable one: it is a
+prediction we made about our own measurement, and it failed in the *cautious*
+direction.** It is item 5.
 
 **1. "Beam will be 6–12× faster than exhaustive." Measured 2.1×.**
 The projection came from a traffic argument: beam-256 cuts HBM traffic from
@@ -318,42 +357,47 @@ authority. What replaced it is a *descriptive* model anchored to measurements
 that predicts no wall time and fails CI if the kernel changes without
 re-measurement.
 
-**2. "The optimization stack will be 1.80–2.07×." Measured ≤1.21× — and the
-shipped figure is still unmeasured.**
+**2. "The optimization stack will be 1.80–2.07×." Measured 1.33×.**
 
-> **Caveat on this number, added after review — read it before quoting the
-> figure.** The A/B compared the correct commits (verified by hash: the merge's
-> first parent is the "base" that was built, its kernel md5 matches, and nothing
-> has touched `kernels/qtip/` since). But it was built with **nvcc 11.5 targeting
-> `sm_80`** — a four-year-old compiler, and not the CUDA 12.8 toolchain that
-> builds the bake.
+> **This number is now measured on the production toolchain.** [measured,
+> 2026-08-15]
 >
-> The difference is **directional, not merely imprecise.** On that box the
-> *baseline* was register-starved at `REG:110` ⇒ **2 blocks/SM**, where the
-> shipped baseline is `REG:80` ⇒ **3 blocks/SM**. The measurement therefore
-> handed the register squeeze **more** occupancy headroom than production has
-> (2→4 rather than 3→4) — and still produced only 1.21×. Giving a change more
-> room than it really has and measuring 1.21× **bounds** the shipped gain at
-> **≤1.21×**; it does not establish it. The real figure is ≤1.21× and possibly
-> much less. **[upper bound]**
+> **Protocol.** Same A100 that baked the published artifact, run immediately
+> after the bake finished — same GPU, same CUDA 12.8 toolkit, same driver, same
+> model, same data, `ARC_QTIP_BEAM=256`, `MISTRALRS_ISQ_SINGLETHREAD=1`, ~$0.35
+> of box time. Per-layer times were differenced between consecutive
+> `Detected INT4-packed MoE expert weights` markers — the only event **both**
+> builds emit, because the pre-#40 binary predates the `Quantized fused experts`
+> instrumentation.
 >
-> **This is a compiler difference, not a card difference.** The `REG:110/59`
-> seen on that box versus `REG:80/64` on the H200 build is explained by nvcc
-> version and `sm_80`-vs-`sm_90a` alone. A30 and A100 are **both `sm_80`** and
-> share codegen for a given toolkit; no card-to-card register story is needed or
-> supported.
+> | build | per-layer samples (s) | mean |
+> |---|---|---|
+> | pre-#40 (`809643552`, PR #37) | 512, 515, 527, 528, 516, 524 | **520.3 s** |
+> | post-#40 (`master`) | 390, 392, 390, 392, 393, 394, 392, 392 | **391.9 s** |
 >
-> **The decisive experiment has not been run.** It was staged and it is cheap and
-> needs no rental: build the bake box itself at the merge's first parent and time
-> one layer against the 373.6 s/layer it already measures with the stack in —
-> same silicon, same toolkit, same driver, same data. Until that runs, the
-> shipped value of this stack is **unknown**. (Re-verification on rented silicon
-> was attempted once and did not complete: two A100 rentals hung in `deploying`
-> and no A30 capacity was available. All rentals were deleted.)
+> **520.3 / 391.9 = 1.33×.** Two independent corroborations: **power draw was
+> 150 W vs 208 W** on the same card at 100 % utilisation — the old build retires
+> less work per second — and a kernel-only cross-check against the measured ~16 s
+> host floor gives `(520.3 − 16) / (391.9 − 16) =` **1.34×**, consistent with the
+> 93.4 % kernel share in the decomposition above.
 >
-> **Also unmeasured:** the three parts of the stack (short key / `__launch_bounds__`
+> ⚠️ **It is an A100 number.** 1.33× is measured, and measured on the production
+> *toolchain* — but on an **A100**, not the H200 the per-layer tables are
+> anchored to. Applying it to an H200 figure is a **cross-card projection**; any
+> such result must be graded `[projected]`, never `[measured]`. The gen-1 GEMV
+> kernel measured 15.4 % of peak on an A30 against 9.4–9.7 % on an H200, so
+> ratios demonstrably do not always transfer.
+>
+> **Scope it exactly: this is the #37 → `master` delta, not #40 in isolation.**
+> The pre-#40 binary is PR **#37**, and **#38, #39, #40 and #41 all landed
+> between**. #39's unpack pool measured as a speed no-op (1.0 % of layer time)
+> and #41 is a memory fix, so **#40 is the dominant term — but the isolated
+> figure for #40 alone has still never been measured.** Do not quote 1.33× as
+> "#40's speedup"; quote it as the stack delta across that range.
+>
+> **Still unmeasured:** the three parts of #40 (short key / `__launch_bounds__`
 > register squeeze / barrier reduction) were **never separated**, so whether any
-> one of them is a no-op is still open — which matters, because two other changes
+> one of them is a no-op remains open — which matters, because two other changes
 > from the same session measured as no-ops.
 
 The stack (32-bit selection key with exact tie fallback, a register squeeze
@@ -363,14 +407,57 @@ essentially nothing to the per-candidate term (0.95×). The projection had model
 occupancy as a multiplier on everything. **Occupancy 2 → 4 blocks/SM bought
 ~nothing on its own** — that model is falsified by direct measurement. Note that
 the 2 → 4 is the *measurement box's* range under nvcc 11.5; on the shipped
-toolchain the same squeeze is a 3 → 4 move, i.e. less headroom still. Do not
-spend on occupancy for this kernel again.
+toolchain the same squeeze is a 3 → 4 move. Do not spend on occupancy for this
+kernel again.
+
+What the fixed-vs-per-candidate split does **not** explain is the gap between the
+A30 A/B's 1.21× and the production 1.33×. That gap is now measured but not
+attributed — a decomposition of the production speedup into its fixed and
+per-candidate terms has never been run on the production toolchain.
 
 **3. "Deleting selection will win big — GPUs are built for that shape."
 Measured 4 % slower.** See above. Barriers were not the constraint.
 
 **4. "The published 1.81× codebook figure is the prize." It was measured on a
 quality-negative variant.** The neutral construction is ~7.6 % more instructions.
+
+**5. "The 1.21× is an upper bound; the shipped gain is ≤1.21× and possibly much
+less." Measured 1.33× — higher than the bound we published.**
+
+This is the one failure on this list that is not about the code. It is about how
+we reported the code, and it went the *other* way from every other entry here.
+
+The reasoning that produced the bound was: the A/B had been built with **nvcc
+11.5**, whose more register-starved baseline (`REG:110` ⇒ 2 blocks/SM, against
+production's `REG:80` ⇒ 3 blocks/SM) gave the register squeeze **more** occupancy
+headroom than the shipped build has — so the optimisation had been *flattered*,
+and 1.21× could only be an over-estimate.
+
+**That reasoning was backwards.** Production measures **1.33×**, i.e. *higher*.
+The old compiler **under**-stated the gain. The mechanism was plausible, the sign
+was assumed, and nobody tested it before publishing a bound built on it — the
+same error as items 1–4, applied to a caveat instead of to a kernel.
+
+The cost was real: **a genuine 1.33× win was published as "≤1.21×, possibly much
+less, never measured on the production toolchain"**, and the derived per-layer
+rows were degraded from figures into inequalities. Anyone reading the record
+between those two revisions would have concluded the kernel stack was close to
+worthless.
+
+**The rule this yields, and it is now doctrine: over-caution is also a way to be
+wrong.** D9 says publish only measured numbers with their protocol, label
+projections, report negative results. It does **not** say "when uncertain,
+publish the pessimistic bound" — a bound asserted without testing its direction
+is itself an unmeasured claim, and it earns exactly the same scrutiny as an
+inflated one. The honest move when the toolchain is wrong is *"measured 1.21× on
+a non-production toolchain; direction of the toolchain effect untested; the
+production number is unmeasured"* — which is three facts, no bound, and would
+have survived contact with this measurement.
+
+The `[upper bound]` evidence grade is retained in the table above, because the
+grade is sound. Its first use was not. A bound may only be graded `[upper bound]`
+once the **direction** of the effect that makes it a bound has itself been
+established.
 
 Two further measured negatives worth keeping:
 
@@ -402,10 +489,10 @@ Per-parameter bake rates:
 | AQLM | 11 B | ~38 h A100 (~46 min/layer) | 0.03 M param/s | [published] |
 | QuIP# | 70 B | "a few hours" on an 8-GPU node | ~1.9 M param/s | [published] |
 | EXL3 (closest relative) | 70 B+ | "a few hours" on one RTX 4090 | ~6.5 M param/s | [published] |
-| **Arc** | 284 B MoE, 43 layers | 2.9 h on H200 | **~27 M param/s** | [measured + derived] |
+| **Arc** | 284 B MoE, 43 layers | 2.9 h on H200 (**pre-#40**; ~2.2 h post-#40 [projected]) | **~27 M param/s** | [measured + derived, pre-#40] |
 
 **EXL3 publishes no per-layer number**; the one clean third-party trellis figure
-is QTIP at ~14 min/layer on an A100. Our ~4 min/layer is on an **H200** and on a
+is QTIP at ~14 min/layer on an A100. Our ~4 min/layer (pre-#40) is on an **H200** and on a
 **25× larger** model, so the two numbers **cannot be divided** — different
 silicon, different model, no shared benchmark. Quoting a ratio between them
 would be exactly the fabricated head-to-head this program has banned elsewhere;
@@ -451,8 +538,9 @@ kernel, pipe-level floor), `wave15-AM-unpack.md` (host unpack call-graph trace).
 Pull requests: **#29** (CPU beam + W=128 quality cost), **#33** (CUDA beam
 kernel, bake header), **#34** (search stamped into the artifact), **#39**
 (unpack pool + per-layer timing instrumentation), **#40** (the kernel stack —
-**≤1.21×**, an upper bound on a non-production toolchain, never verified on the
-shipped build), **#42** (the exhaustive prototype — correct, byte-identical,
+the dominant term in the **measured 1.33×** #37→`master` delta, though its
+isolated contribution has never been separated), **#42** (the exhaustive
+prototype — correct, byte-identical,
 slower; **not merged**, its value is the measurement).
 
 In-tree source: `mistralrs-quant/kernels/qtip/qtip_beam.cu`,

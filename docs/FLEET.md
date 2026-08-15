@@ -14,8 +14,10 @@ quantities plus vendor specs, not yet run end-to-end).
   At BF16 that is ~568 GB of weights (284B × 2 bytes) **[arithmetic]** — an
   8×H200 node (8 × 141 GB) runs **one** tensor-parallel replica, with
   all-reduce traffic on every layer.
-- Arc's artifact for the same model is **68 GB** (2-bit trellis experts + FP8
-  attention), and one H200 loads and serves it with the quality numbers in
+- Arc's artifact for the same model is **74.18 GB** (2-bit trellis experts + FP8
+  attention) **[measured — HF API, `aeonmind/DeepSeek-V4-Flash-UQFF-qtip2`, 15
+  files, 8 shards + residual]**, and one H200 loads and serves it with the
+  quality numbers in
   BENCHMARKS.md (GSM8K 87.0%, long-context 5/5+4/4) **[measured — provisional,
   pre-PR-#35 decode math; see BENCHMARKS.md]**.
 - Therefore the same node can instead host **8 independent replicas** — no
@@ -30,10 +32,12 @@ HBM. At batch ≈ 32+ concurrent sequences, essentially all 257 experts are
 activated every step, so per-step weight traffic approaches the entire expert
 pool — and the pool size is what compression shrinks.
 
-- Arc pool: the full artifact is 68 GB **[measured]**. One step's weight read
-  at H200 spec bandwidth (4.8 TB/s, vendor figure) ≈ 68 GB / 4.8 TB/s ≈ 14 ms
-  → ~70 steps/s; at batch 64 that is **~4.5K tok/s per GPU**, ~36K tok/s per
-  8-replica node **[projected]**.
+- Arc pool: the full artifact is **74.18 GB** **[measured]**. One step's weight
+  read at H200 spec bandwidth (4.8 TB/s, vendor figure) ≈ 74.18 GB / 4.8 TB/s ≈
+  **15.5 ms** → ~65 steps/s; at batch 64 that is **~4.1K tok/s per GPU**, ~33K
+  tok/s per 8-replica node **[projected]**. (Was quoted as ~4.5K/~36K off a
+  68 GB estimate; the artifact is measured at 74.18 GB, so the floor is
+  correspondingly lower.)
 - BF16 comparison: the per-GPU read floor under TP8 is similar (~568 GB / 8 ≈
   71 GB per GPU per step), but the whole node serves **one** replica, so the
   node's aggregate is ~4.5K tok/s **[projected]**. The ~8× node-level gain
@@ -57,7 +61,7 @@ pool — and the pool size is what compression shrinks.
   the tuned dispatch is not yet reflected in the 14.58 end-to-end number
   (see BENCHMARKS.md). The floor math above is the destination, not the
   present: measured kernel-level throughput at B=64 is ~1,006 tok/s against
-  the ~4.5K tok/s spec-bandwidth floor (~22% of it), and serving-level
+  the ~4.1K tok/s spec-bandwidth floor (~24% of it), and serving-level
   throughput will be lower still until the engine-level batched run exists.
 
 ## 3. KV tenancy at 3.5-bit
@@ -78,7 +82,7 @@ Once weights fit, concurrent capacity is bounded by KV cache per sequence.
 
 | Claim | Status |
 |---|---|
-| 284B/13B MoE serves on one H200 from a 68 GB artifact, with quality numbers | **Measured** |
+| 284B/13B MoE serves on one H200 from a **74.18 GB** artifact, with quality numbers | **Measured** (artifact size HF-API-verified) |
 | GSM8K 87.0% (n=100, 0-shot greedy, seed 161, 2048-cap) at 2-bit experts | **Measured — provisional** (PR #35 changed the decode math after the run; re-measure pending) |
 | TurboQuant KV 4.27× context (Qwen3-32B, 1×H100) | **Measured** |
 | qtip2b bitshift-trellis CUDA parity (20/20 on H200) | **Measured** |
@@ -88,7 +92,7 @@ Once weights fit, concurrent capacity is bounded by KV cache per sequence.
 | Grouped-GEMM batch curve flat ~63.5 ms/step B=16→64 ⇒ ~1,006 aggregate tok/s ⇒ ≈$1.36/Mtok at $4.92/hr | **Measured-kernel** (expert path only; serving run pending) |
 | End-to-end batched serving tok/s and $/Mtok on one H200 | Pending (planned session 5) |
 | 8 replicas per 8×H200 node | Projected (building block measured) |
-| ~4.5K tok/s/GPU at saturated batch; ~8× node aggregate vs 1×TP8 | Projected (floor arithmetic; kernel-level evidence at ~22% of the floor) |
+| ~4.1K tok/s/GPU at saturated batch; ~8× node aggregate vs 1×TP8 | Projected (floor arithmetic off the measured 74.18 GB artifact; kernel-level evidence at ~24% of the floor) |
 | ~4× KV tenancy on V4-class MLA models | Projected (MLA path not done) |
 
 Cost of every measured number above: ≈ $123 of rented H200 time across four

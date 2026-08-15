@@ -172,7 +172,7 @@ and keeps drifting as the run proceeds. Two numbers were published from it:
 **135 s/layer** and a **3.8×** speedup.
 
 Measured as **marginal deltas between consecutive layer markers**, twice, on two
-runs: run A 240 s, 242 s; run B 241 s, 242 s ⇒ **241 ± 1 s/layer**, and the
+runs: run A 240 s, 242 s; run B 241 s, 242 s ⇒ **241 ± 1 s/layer** (on the **pre-#40** build), and the
 speedup is **2.1×**, not 3.8×.
 
 **A running average is not a rate.** It is a rate only in the limit, and only if
