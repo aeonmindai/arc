@@ -1634,10 +1634,16 @@ impl Attention {
                     ),
                 };
                 let k_cached = cached.span(raw_prefix, keep, k.dtype())?;
-                // Cache read-back: in decode this is prefill's K (0..N-1) + the
-                // new token's K. Diff vs prefill's freshly-computed K splits a
+                // Cache read-back. Diff vs prefill's freshly-computed K splits a
                 // cache-storage bug (old rows differ) from a new-token position
                 // bug (only the last row differs).
+                //
+                // NOTE: under packed storage this is the RETAINED SPAN
+                // (`[raw_prefix, raw_prefix + keep)`), not `[0, N)` — a decode
+                // step dumps the trailing `window` rows, ending with the new
+                // token's K. `v4_trace_diff.py` comparisons against pre-wave43
+                // decode traces must be re-based by `raw_prefix`; prefill is
+                // unchanged (`raw_prefix == 0`, the whole cache).
                 v4_trace_dump(self.dbg_layer_idx, &k_cached, "40_k_cached");
                 // Same tensor as `40_k_cached` by construction (V4 MQA: V == K).
                 // Kept under the historic tag so `v4_trace_diff.py` still lines
