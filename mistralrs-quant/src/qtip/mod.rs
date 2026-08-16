@@ -572,9 +572,9 @@ impl QtipCodebook {
             Ok("mcg") | Ok("computed") | Ok("sum2") => Ok(Self::COMPUTED),
             Ok("gaussian") | Ok("lut") => Ok(QtipCodebook::Gaussian),
             Ok(other) => candle_core::bail!(
-                "ARC_QTIP_CODEBOOK={other:?} is not a codebook. Use `mcg` (computed, default) \
-                 or `gaussian` (the stored LUT). Refusing rather than guessing — the choice \
-                 changes the artifact's reproduction values."
+                "ARC_QTIP_CODEBOOK={other:?} is not a codebook. Use `mcg` (computed) \
+                 or `gaussian` (the stored LUT, the default). Refusing rather than guessing \
+                 — the choice changes the artifact's reproduction values."
             ),
         }
     }
