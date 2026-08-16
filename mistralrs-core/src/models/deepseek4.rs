@@ -3026,18 +3026,19 @@ impl MtpBlock {
             .unwrap_or_else(|| real_device.clone());
 
         // MTP attention is standard MQA (`COMPRESS_RATIO_NEXTN_LAYER = 0`,
-        // audit §2) → standard-θ RoPE, same YARN handling as the main
-        // standard layers (see the rope construction in `DeepSeekV4::new`).
-        let rope_cfg = DeepSeekV2RopeConfig {
-            rope_scaling: if std::env::var_os("ARC_DISABLE_YARN_STD").is_some() {
-                None
-            } else {
-                cfg.rope_scaling.clone()
-            },
-            max_position_embeddings: cfg.max_position_embeddings,
-            rope_theta: cfg.rope_theta,
-            qk_rope_head_dim: cfg.qk_rope_head_dim,
-        };
+        // `deepseek_v4_nextn.py:47`, audit §2) → the **Standard** RoPE table:
+        // base `rope_theta`, and NO YaRN (`deepseek_v4.py:234-238` forces
+        // `original_seq_len = 0` for ratio-0 layers, which makes
+        // `precompute_freqs_cis` skip the interpolation branch entirely).
+        //
+        // This is the one-liner PR #35 deliberately deferred to #30's owner:
+        // #35 fixed the identical defect on the main model's Standard layers
+        // but could not touch this file. Until it was applied the MTP block
+        // drafted on a YaRN-compressed table while the target attended on an
+        // unscaled one, so the draft's positions meant something different
+        // from the verifier's — and any acceptance measured on it would have
+        // been a measurement of that mismatch.
+        let rope_cfg = cfg.standard_rope_config();
         let rotary_emb = Arc::new(DeepSeekV2RotaryEmbedding::new(
             &rope_cfg,
             vb.dtype(),
@@ -6180,6 +6181,86 @@ mod tests {
         Ok(())
     }
 
+    /// The **MTP block** takes the Standard (no-YaRN) table too.
+    ///
+    /// PR #35 fixed the main model's ratio-0 layers and deliberately deferred
+    /// the identical one-liner in `MtpBlock::try_new` to #30's owner; it sat
+    /// unapplied, so the draft head rotated its queries on a YaRN-compressed
+    /// table while the target it has to agree with rotated on an unscaled one.
+    /// Speculative decode accepts on exact argmax equality, so a
+    /// draft-vs-target position mismatch shows up as rejections and nothing
+    /// else — an acceptance rate measured on it would have been measuring the
+    /// mismatch, not the head.
+    ///
+    /// `MtpBlock::try_new` now builds its rotary from
+    /// [`DeepSeekV4Config::standard_rope_config`]; this pins both halves of
+    /// that: the MTP slot really is ratio-0, and the table that helper yields
+    /// is the unscaled one. The mirror assertion (the pre-fix expression is
+    /// *measurably different*) is what stops this passing vacuously on a
+    /// config where YaRN happens to be a no-op.
+    #[test]
+    fn mtp_block_takes_the_standard_unscaled_rope_table() -> Result<()> {
+        let cfg: DeepSeekV4Config = serde_json::from_str(V4_ROPE_JSON).unwrap();
+        let mtp_slot = cfg.num_hidden_layers; // the MTP block's virtual index
+        assert_eq!(
+            cfg.layer_compress_ratio(mtp_slot),
+            0,
+            "the MTP slot must be Standard (COMPRESS_RATIO_NEXTN_LAYER = 0, \
+             deepseek_v4_nextn.py:47)"
+        );
+        assert!(
+            cfg.rope_scaling_for_layer(mtp_slot).is_none(),
+            "the MTP slot must resolve to NO YaRN"
+        );
+
+        let dev = Device::Cpu;
+        let pos = cfg.max_position_embeddings - 1;
+        let shape = (1usize, 1usize, 1usize, cfg.qk_rope_head_dim);
+        let q = Tensor::ones(shape, DType::F32, &dev)?;
+        let rope_of = |c: &DeepSeekV2RopeConfig| -> Result<Vec<f32>> {
+            let r = DeepSeekV2RotaryEmbedding::new(c, DType::F32, &dev)?;
+            let (out, _) = r.forward(&q, &q, &[pos])?;
+            out.flatten_all()?.to_vec1::<f32>()
+        };
+        let max_diff = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b.iter())
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max)
+        };
+
+        // What `MtpBlock::try_new` builds today.
+        let mtp = rope_of(&cfg.standard_rope_config())?;
+        let reference_unscaled = rope_of(&DeepSeekV2RopeConfig {
+            rope_scaling: None,
+            max_position_embeddings: cfg.max_position_embeddings,
+            rope_theta: cfg.rope_theta,
+            qk_rope_head_dim: cfg.qk_rope_head_dim,
+        })?;
+        assert!(
+            max_diff(&mtp, &reference_unscaled) < 1e-6,
+            "the MTP block's RoPE table is YaRN-scaled (max diff {})",
+            max_diff(&mtp, &reference_unscaled)
+        );
+
+        // Mirror: the expression this replaced (`cfg.rope_scaling.clone()`)
+        // really does produce a different table, so the assertion above has
+        // something to catch.
+        let pre_fix = rope_of(&DeepSeekV2RopeConfig {
+            rope_scaling: cfg.rope_scaling.clone(),
+            max_position_embeddings: cfg.max_position_embeddings,
+            rope_theta: cfg.rope_theta,
+            qk_rope_head_dim: cfg.qk_rope_head_dim,
+        })?;
+        assert!(
+            max_diff(&mtp, &pre_fix) > 1e-3,
+            "the pre-fix MTP RoPE table is indistinguishable from the fixed one \
+             (max diff {}) — this test would pass either way",
+            max_diff(&mtp, &pre_fix)
+        );
+        Ok(())
+    }
+
     // ---------------------------------------------------------------------
     // wave30: the rolling compressed `xs` state.
     //
@@ -6459,5 +6540,281 @@ mod tests {
             "a refused rollback must not mutate"
         );
         Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // wave42: the MTP verify rollback, against the cache V4 actually has.
+    //
+    // The tests above prove `XsRollingCache` honours a truncation *when it is
+    // handed one*. What they do not touch is the caller that has to hand it
+    // one: the MTP rejection path truncates the whole `NormalCache` by a
+    // single `n_drop`, and in V4 that Vec is not homogeneous — 43 K/V entries
+    // followed by one `KvCache::XsRolling` per compressed layer, each of which
+    // maps the token-unit drop onto two different time bases and is the only
+    // entry that can *refuse*.
+    //
+    // A refusal there is a hard error, not a fallback: unlike the prefix
+    // cacher, MTP cannot decline and re-prefill mid-decode. That is what makes
+    // this path worth its own test.
+    // ---------------------------------------------------------------------
+
+    /// A V4-shaped cache: `n_kv` K/V entries, then one `XsRolling` entry per
+    /// `(ratio, span_groups)` — the layout `DeepSeekV4::new` builds.
+    fn v4_shaped_cache(
+        n_kv: usize,
+        compressed: &[(usize, usize)],
+        head_dim: usize,
+        max_pos: usize,
+    ) -> EitherCache {
+        let cache = NormalCache::new(n_kv, max_pos);
+        {
+            let mut guard = cache.lock().unwrap();
+            for &(ratio, span_groups) in compressed {
+                guard.0.push(KvCache::XsRolling(Box::new(XsRollingCache::new(
+                    ratio, span_groups, head_dim, max_pos,
+                ))));
+            }
+        }
+        EitherCache::Normal(cache)
+    }
+
+    /// Append `t` positions of K/V to every `KvCache::Normal` entry, and `t`
+    /// tokens of compressor input to every `XsRolling` entry — one forward's
+    /// worth, exactly as a decode/verify step would.
+    fn feed_v4_cache(
+        cache: &EitherCache,
+        xs: &Tensor,
+        from: usize,
+        t: usize,
+        compressor: &V4Compressor,
+    ) -> Result<()> {
+        let EitherCache::Normal(normal) = cache else {
+            unreachable!("fixture builds a Normal cache")
+        };
+        let mut guard = normal.lock().unwrap();
+        for entry in &mut *guard.0 {
+            match entry {
+                KvCache::XsRolling(state) => {
+                    let slice = xs.narrow(1, from, t)?;
+                    state.advance(&slice, |w| compressor.forward_from_xs(w))?;
+                }
+                _ => {
+                    let kv = Tensor::zeros((1, 1, t, 4), DType::F32, xs.device())?;
+                    entry.append(&kv, &kv)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cache_lens(cache: &EitherCache) -> Vec<usize> {
+        let EitherCache::Normal(normal) = cache else {
+            unreachable!()
+        };
+        let guard = normal.lock().unwrap();
+        guard.0.iter().map(|c| c.current_seq_len()).collect()
+    }
+
+    fn compressed_rows_of(cache: &EitherCache, idx: usize) -> Result<Option<Tensor>> {
+        let EitherCache::Normal(normal) = cache else {
+            unreachable!()
+        };
+        let guard = normal.lock().unwrap();
+        match &guard.0[idx] {
+            KvCache::XsRolling(state) => state.compressed_rows(),
+            _ => unreachable!("entry {idx} is not an XsRolling cache"),
+        }
+    }
+
+    /// **A rejected MTP draft must restore the compressor rows exactly.**
+    ///
+    /// Drives the production rollback — `verify_proposed` →
+    /// `n_cache_positions_to_drop` → `truncate_cache_by` — over a V4-shaped
+    /// mixed cache, at every draft depth clap accepts (`--mtp-depth 0..=8`)
+    /// and every accept/reject shape, and requires after each one that:
+    ///
+    /// 1. the rollback is *accepted* (a refusal here is the hard-error class
+    ///    `XS_TAIL_MARGIN_TOKENS` exists to prevent),
+    /// 2. every entry — K/V and compressed alike — lands on the same length,
+    ///    and that length is the plain-decode invariant `committed - 1`,
+    /// 3. the surviving compressed rows are bit-comparable to a from-scratch
+    ///    compress over the committed prefix, and
+    /// 4. decoding *onward* from the rolled-back state keeps matching the
+    ///    from-scratch reference — i.e. the raw tail was restored too, not
+    ///    just the row count.
+    ///
+    /// Check 4 is the one with teeth. A rollback that trims `comp` but leaves
+    /// `tail`/`base` inconsistent passes 1-3 and then silently compresses a gap
+    /// on the next completed group, which is a wrong distant-context branch and
+    /// not an error anywhere.
+    #[test]
+    fn mtp_verify_rollback_restores_the_compressor_rows_exactly() -> Result<()> {
+        let device = Device::Cpu;
+        let (hidden, head_dim) = (32usize, 16usize);
+        let max_pos = 4096usize;
+        // Both V4 compressor shapes: ratio 4 (`coff == 2`, a row spans two
+        // groups) and ratio 128 (`coff == 1`). 128 is the case the naive
+        // retention rule got wrong.
+        let c4 = rolling_test_compressor(4, hidden, head_dim, &device)?;
+        let c128 = rolling_test_compressor(128, hidden, head_dim, &device)?;
+        let xs = rolling_test_xs(1024, hidden, &device)?;
+
+        // (proposed, verifier) covering all-accept, mid-reject, first-reject
+        // and the degenerate short-verifier case.
+        let shapes: &[(&[u32], &[u32])] = &[
+            (&[1], &[1]),
+            (&[1], &[9]),
+            (&[1, 2], &[1, 2]),
+            (&[1, 2], &[1, 9]),
+            (&[1, 2], &[9, 2]),
+            (&[1, 2, 3, 4], &[1, 2, 9, 4]),
+            (&[1, 2, 3, 4, 5, 6, 7, 8], &[1, 2, 3, 4, 5, 6, 7, 8]),
+            (&[1, 2, 3, 4, 5, 6, 7, 8], &[9, 2, 3, 4, 5, 6, 7, 8]),
+            (&[1, 2, 3, 4, 5, 6, 7, 8], &[1, 2, 3, 9, 5, 6, 7, 8]),
+        ];
+
+        let mut saw_a_real_truncation = false;
+        let mut saw_a_row_drop = false;
+
+        for (ratio, compressor) in [(4usize, &c4), (128usize, &c128)] {
+            // Prefill lengths chosen so `L + depth` straddles a group boundary
+            // — the rollback then has to rebuild a compressed row from the
+            // START of its group, which is the case a "keep the last
+            // span*ratio + margin tokens" rule gets wrong.
+            let prefills: &[usize] = if ratio == 4 {
+                &[13, 15, 16, 20, 61]
+            } else {
+                &[130, 250, 255, 256, 383]
+            };
+            for &committed in prefills {
+                // Every prefill must already have completed a group, or the
+                // "surviving rows" assertion below has no rows to compare and
+                // the case proves nothing.
+                assert!(
+                    committed > ratio,
+                    "ratio {ratio}: prefill {committed} completes no compressed group"
+                );
+                for (proposed, verifier) in shapes {
+                    let depth = proposed.len();
+                    let result = crate::pipeline::verify_proposed(proposed, verifier);
+                    let n_drop = crate::pipeline::n_cache_positions_to_drop(depth, &result);
+                    let commit_len = result.commit_len();
+
+                    let cache = v4_shaped_cache(2, &[(ratio, compressor.coff)], head_dim, max_pos);
+                    let xs_idx = 2; // after the two K/V entries
+
+                    // Prefill: the cache holds every committed token but the
+                    // last (the plain-decode invariant `step()` enters on).
+                    feed_v4_cache(&cache, &xs, 0, committed - 1, compressor)?;
+                    // T0 forward (+1), then the verify forward (+depth).
+                    feed_v4_cache(&cache, &xs, committed - 1, 1, compressor)?;
+                    feed_v4_cache(&cache, &xs, committed, depth, compressor)?;
+                    assert_eq!(
+                        cache_lens(&cache),
+                        vec![committed + depth; 3],
+                        "fixture desync before the rollback"
+                    );
+                    let rows_before = compressed_rows_of(&cache, xs_idx)?
+                        .map(|r| r.dim(1))
+                        .transpose()?
+                        .unwrap_or(0);
+
+                    // ---- the production rollback ----
+                    crate::pipeline::truncate_cache_by(&cache, n_drop).map_err(|e| {
+                        candle_core::Error::Msg(format!(
+                            "ratio {ratio}, {committed} committed, depth {depth}, dropping \
+                             {n_drop}: the MTP rejection rollback was REFUSED. \
+                             XS_TAIL_MARGIN_TOKENS is supposed to make this impossible for any \
+                             --mtp-depth (clap caps it at 8). {e}"
+                        ))
+                    })?;
+
+                    // (1)+(2) every entry agrees, on the decode invariant.
+                    let tokens_after = committed + 1 + commit_len;
+                    let want_len = tokens_after - 1;
+                    assert_eq!(
+                        cache_lens(&cache),
+                        vec![want_len; 3],
+                        "ratio {ratio}: K/V and compressed entries disagree after a depth-{depth} \
+                         rollback of {n_drop} (accepted {}, rejection {})",
+                        result.accepted.len(),
+                        result.rejection.is_some(),
+                    );
+                    if n_drop > 0 {
+                        saw_a_real_truncation = true;
+                    }
+
+                    // (3) the surviving rows are the from-scratch answer.
+                    let t_trunc = (want_len / ratio) * ratio;
+                    let want = compressor.forward_from_xs(&xs.narrow(1, 0, t_trunc)?)?;
+                    let got = compressed_rows_of(&cache, xs_idx)?
+                        .expect("the prefill completed at least one group");
+                    assert_eq!(got.dim(1)?, want.dim(1)?, "ratio {ratio}: wrong row count");
+                    assert!(
+                        max_abs_diff(&got, &want)? <= 1e-5,
+                        "ratio {ratio}, {committed} committed, depth {depth}: the rolled-back \
+                         compressed rows are not the from-scratch answer"
+                    );
+                    if got.dim(1)? < rows_before {
+                        saw_a_row_drop = true;
+                    }
+                    // D12: a fixture whose compressor emits ~0 would make every
+                    // equality above hold for the wrong reason.
+                    let mag = want.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+                    assert!(
+                        mag > 1e-3,
+                        "degenerate fixture: the compressor emits ~zero rows ({mag}), so \
+                         'restored exactly' would be satisfied by any state at all"
+                    );
+
+                    // (4) decoding onward still matches from-scratch: the raw
+                    // tail and `base` were restored, not just the row count.
+                    let onward = 2 * ratio;
+                    feed_v4_cache(&cache, &xs, want_len, onward, compressor)?;
+                    let seen = want_len + onward;
+                    let want =
+                        compressor.forward_from_xs(&xs.narrow(1, 0, (seen / ratio) * ratio)?)?;
+                    let got = compressed_rows_of(&cache, xs_idx)?.expect("rows after resume");
+                    assert!(
+                        max_abs_diff(&got, &want)? <= 1e-5,
+                        "ratio {ratio}, {committed} committed, depth {depth}: resuming after the \
+                         rollback compressed a GAP — the rows diverge from the whole-history \
+                         recompute at {seen} tokens"
+                    );
+                }
+            }
+        }
+
+        assert!(
+            saw_a_real_truncation,
+            "every case rolled back 0 positions — the test never exercised a truncation"
+        );
+        assert!(
+            saw_a_row_drop,
+            "no case ever crossed a group boundary, so the compressed-row rebuild — the part a \
+             naive retention rule gets wrong — was never exercised"
+        );
+        Ok(())
+    }
+
+    /// The MTP rollback bound and the retained-tail margin are two constants in
+    /// two places that must stay ordered. `--mtp-depth` is clap-capped at 8
+    /// (`mistralrs-cli/src/args/mod.rs`), a rejection rolls back at most that
+    /// many positions, and [`crate::XS_TAIL_MARGIN_TOKENS`] is what keeps that
+    /// rollback inside the retained raw window.
+    ///
+    /// Raising the depth cap past the margin would not fail to compile and
+    /// would not fail any test above — it would fail in production, on the
+    /// fraction of rejections that happen to cross a group boundary.
+    #[test]
+    fn mtp_depth_cap_stays_within_the_retained_rollback_margin() {
+        const MAX_MTP_DEPTH: usize = 8; // clap: `.range(0..=8)`
+        assert!(
+            MAX_MTP_DEPTH <= crate::XS_TAIL_MARGIN_TOKENS,
+            "--mtp-depth accepts up to {MAX_MTP_DEPTH}, but the xs rolling cache only retains {} \
+             tokens of rollback margin. A deeper draft can be rejected past the retained raw \
+             window, and that rollback HARD-ERRORS mid-decode.",
+            crate::XS_TAIL_MARGIN_TOKENS
+        );
     }
 }

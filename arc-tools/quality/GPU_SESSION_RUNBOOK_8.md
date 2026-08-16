@@ -319,6 +319,74 @@ Fill from the probe's own markers — `PREFILL[B=n]`, `BATCH[B=n]`, `CONC[B=n]`
 > eviction. Record it, drop to the largest B that does not warn, and state the
 > cap in the table rather than deleting the row.
 
+### S3b — MTP acceptance (6 min) — the number three sessions came home without
+
+Speculative decode is the only lever that raises **per-user** decode on ONE
+card: accepted draft tokens are emitted without reading the experts again.
+Nothing else on the board does that, and the rate has never once been measured
+— sessions 2, 3 and 6 all harvested an empty acceptance file.
+
+Run it with the same binary, on the same box, right after S3. One command:
+
+```bash
+ARC_MTP_LOG_ACCEPTANCE=1 /root/arc/target/release/mistralrs bench \
+  -m /workspace/src \
+  -a deepseekv4 \
+  --from-uqff /workspace/uqff/qtip2-0.uqff \
+  --chat-template chat_templates/deepseek_v4.json \
+  --mtp-depth 2 \
+  --paged-attn off \
+  --max-seq-len 4096 \
+  --prompt-len 256 --gen-len 256 --iterations 3 --warmup 1 \
+  2>&1 | tee /root/logs/mtp_acceptance.log
+```
+
+Flag spellings verified against `mistralrs-cli/src/args/mod.rs` (`Command::Bench`:
+`--prompt-len`, `--gen-len`, `--iterations`, `--warmup`) — `bench` does **not**
+take the probe's `-p/-g/-r`.
+
+Then `grep 'MTP\[' /root/logs/mtp_acceptance.log`. The last line is the answer:
+
+```
+MTP[agg] accept_rate=… accepted=… proposed=… steps=… drafted_steps=… committed=… tok_per_step=…
+```
+
+`tok_per_step` is the number that multiplies the S3 per-user column;
+`accept_rate` is the draft head's quality. Report **both** — a useless head
+still yields `tok_per_step = 2.0`, so `tok_per_step` alone does not say
+whether MTP is working.
+
+🔴 **Two flags are load-bearing and each one silently zeroes the measurement;
+two more conditions `bench` already satisfies but a *serve*-based run would not:**
+
+* **`--mtp-depth 2`** — default is `0`, which does not load the MTP decoder
+  block at all. That default is the entire reason the last three artifacts were
+  empty; the serve log said so:
+  `UQFF artifact contains 3 MTP decoder block tensors but the MTP block is not
+  loaded ('--mtp-depth 0'); skipping them.`
+* **`--paged-attn off`** — on CUDA `--paged-attn` defaults to `auto` = **ON**,
+  and the MTP fast path requires `CacheBackendMetadata::DefaultInstructions`
+  (`mtp_pipeline.rs`, `take_fast_path`). With PagedAttention on, `--mtp-depth 2`
+  loads the block, logs *"MTP speculative decode engaged"*, and then defers to
+  the target on **every** step. Engagement is not measurement.
+* **B must be 1.** The fast path also requires `input_seqs.len() == 1`; batched
+  decode falls back wholesale. `bench` forces this (`with_max_seqs(1)`), so
+  acceptance is a **B=1** measurement today — it does **not** yet lift the
+  B=128 row of S3, and must not be reported as if it did.
+* **Prefix caching must be off.** The draft KV primes from the prompt forward's
+  hidden states; a prefix-cache hit skips that forward and the sequence then
+  declines to draft (logged once as *"the prompt forward's hidden states do not
+  cover the sequence contiguously from position 0"*). `bench` forces
+  `with_prefix_cache_n(0)`; a serve-based run needs `--prefix-cache-n 0`.
+
+> **This step cannot fail silently.** If no MTP step ran, the bench prints
+> `WARN[MTP] --mtp-depth 2 was requested but no MTP decode step ran: …` and the
+> acceptance is recorded as **UNMEASURED**, never as 0%. Harvest that line as
+> the result if it appears — it names which of the four flags was wrong.
+> **ABORT-IF** `drafted_steps=0` with `steps>0`: the block loaded and the fast
+> path ran, but the draft KV never primed. That is a bug, not a rate; harvest
+> `mtp_acceptance.log` and report it as a defect.
+
 ### S4 — Sustained-mode confirmation (10 min)
 
 One-shot batches measure a burst; production is a closed loop. Confirm the two

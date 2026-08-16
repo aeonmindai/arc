@@ -990,6 +990,171 @@ fn v4_mtp_accept_path_accepts_correct_drafts_and_rejects_wrong_ones() {
     );
 }
 
+/// **The acceptance counter counts the accept/reject outcome — proved by
+/// mutation.**
+///
+/// Three GPU sessions tried to measure MTP acceptance and produced empty
+/// files, so this is the assertion that has to hold before any number is worth
+/// quoting: on a fixture whose outcome is known *by construction*, forcing
+/// every draft accepted must drive the reported rate to exactly 1.0 and
+/// forcing every draft rejected must drive it to exactly 0.0.
+///
+/// The whole path under test is the production one — `verify_proposed` →
+/// [`MtpAcceptance::from_verify`] → `record_mtp_step` → the reported marker.
+/// The only thing the test substitutes is the proposal, which is what makes
+/// the outcome known.
+///
+/// DOCTRINE D12: the fixture asserts its own non-degeneracy first. The
+/// recorded trap here is specific — the MTP fixture once had `h_proj` and
+/// `e_proj` both zero, so `fused ≡ 0`, every draft token was the same constant
+/// and NO MTP defect was observable. A constant draft would also make
+/// "all-accept" and "all-reject" indistinguishable, so that check is load
+/// bearing for this test in particular.
+#[test]
+fn mtp_acceptance_counter_moves_with_the_accept_reject_outcome() {
+    let _gate = mtp_gate_guard();
+    let device = Device::Cpu;
+    let model = load_v4_with_mtp_block(&device);
+    // Fetching the kit is what arms the hidden capture — before the forward.
+    let kit = model.mtp_decode_kit().expect("MTP kit must exist");
+
+    let input_ids = Tensor::from_vec(vec![4u32, 9, 16, 25], &[1usize, 4], &device).unwrap();
+    let logits = run_forward_smoke(model.as_ref(), &input_ids).expect("V4 forward must succeed");
+    assert_finite(&logits, "V4 MTP acceptance counter");
+    let rows = logits.squeeze(0).unwrap();
+    let verifier: Vec<u32> = (0..rows.dim(0).unwrap())
+        .map(|i| {
+            rows.get(i)
+                .unwrap()
+                .argmax(0)
+                .unwrap()
+                .to_dtype(DType::U32)
+                .unwrap()
+                .to_scalar::<u32>()
+                .unwrap()
+        })
+        .collect();
+
+    // ---- D12: the fixture is not the recorded degenerate one. ----
+    let (_, captured) = kit
+        .hidden_capture
+        .take()
+        .expect("the forward must have captured hidden states");
+    let seed = captured.i((0, captured.dim(1).unwrap() - 1)).unwrap();
+    let mut cache = kit.new_draft_cache().unwrap();
+    let drafted = kit
+        .propose_chain(&seed, verifier[0], 3, 8, 0, Some(&mut cache))
+        .expect("a real MTP draft chain must not error");
+    let fused_is_live = {
+        // `fused = h_proj(hnorm(h)) + e_proj(enorm(e))`. If both projections
+        // were zero the chain would be a constant function of nothing; drive
+        // the same head with a different hidden state and require a different
+        // chain.
+        let other = (&seed * -1.0).unwrap();
+        let mut cache2 = kit.new_draft_cache().unwrap();
+        let drafted2 = kit
+            .propose_chain(&other, verifier[0], 3, 8, 0, Some(&mut cache2))
+            .expect("a real MTP draft chain must not error");
+        drafted2 != drafted
+    };
+    assert!(
+        fused_is_live,
+        "the MTP fixture is degenerate: the draft chain does not respond to the \
+         hidden state at all (h_proj/e_proj ~ 0 => fused == 0 => every draft \
+         token constant). No MTP defect — and no acceptance outcome — would be \
+         observable through it."
+    );
+
+    // The two proposals below must be genuinely different streams, or
+    // "all accepted" and "all rejected" would be the same experiment.
+    let vocab = v4::VOCAB_SIZE as u32;
+    let all_wrong: Vec<u32> = verifier.iter().map(|t| (t + 1) % vocab).collect();
+    assert!(
+        verifier
+            .iter()
+            .zip(all_wrong.iter())
+            .all(|(a, b)| a != b),
+        "the corrupted proposal must differ at every slot"
+    );
+
+    const STEPS: usize = 20;
+    let depth = verifier.len();
+
+    // ---- Mutation 1: every draft accepted. ----
+    mistralrs_core::reset_mtp_acceptance();
+    for _ in 0..STEPS {
+        let res = mistralrs_core::verify_proposed(&verifier, &verifier);
+        assert_eq!(res.accepted.len(), depth, "fixture must accept everything");
+        mistralrs_core::record_mtp_step(mistralrs_core::MtpAcceptance::from_verify(depth, &res));
+    }
+    let all_accept = mistralrs_core::mtp_acceptance();
+    let marker = mistralrs_core::mtp_acceptance_marker().expect("steps were recorded");
+    assert_eq!(all_accept.rate(), Some(1.0), "{marker}");
+    assert!(marker.contains("accept_rate=1.0000"), "{marker}");
+    assert_eq!(
+        all_accept.tokens_per_step(),
+        Some(depth as f64 + 1.0),
+        "all-accept commits T0 + depth tokens per step: {marker}"
+    );
+
+    // ---- Mutation 2: every draft rejected. ----
+    mistralrs_core::reset_mtp_acceptance();
+    for _ in 0..STEPS {
+        let res = mistralrs_core::verify_proposed(&all_wrong, &verifier);
+        assert!(res.accepted.is_empty(), "fixture must reject everything");
+        mistralrs_core::record_mtp_step(mistralrs_core::MtpAcceptance::from_verify(depth, &res));
+    }
+    let all_reject = mistralrs_core::mtp_acceptance();
+    let marker = mistralrs_core::mtp_acceptance_marker().expect("steps were recorded");
+    assert_eq!(all_reject.rate(), Some(0.0), "{marker}");
+    assert!(marker.contains("accept_rate=0.0000"), "{marker}");
+    assert_eq!(
+        all_reject.tokens_per_step(),
+        Some(2.0),
+        "a fully rejected chain still commits T0 + the correction: {marker}"
+    );
+
+    // Same proposals in both runs, opposite outcomes: no single broken counter
+    // satisfies both assertions.
+    assert_eq!(all_accept.proposed, all_reject.proposed);
+    assert_eq!(all_accept.steps, all_reject.steps);
+    assert_ne!(all_accept.accepted, all_reject.accepted);
+
+    // ---- Mutation 3: one slot corrupted => exactly that prefix accepted. ----
+    let corrupt_at = 2usize;
+    assert!(corrupt_at < depth, "fixture must be deep enough to corrupt");
+    let mut partial = verifier.clone();
+    partial[corrupt_at] = (verifier[corrupt_at] + 1) % vocab;
+    mistralrs_core::reset_mtp_acceptance();
+    for _ in 0..STEPS {
+        let res = mistralrs_core::verify_proposed(&partial, &verifier);
+        assert_eq!(res.accepted.len(), corrupt_at);
+        mistralrs_core::record_mtp_step(mistralrs_core::MtpAcceptance::from_verify(depth, &res));
+    }
+    let partial_stats = mistralrs_core::mtp_acceptance();
+    let expected = corrupt_at as f64 / depth as f64;
+    assert!(
+        (partial_stats.rate().unwrap() - expected).abs() < 1e-12,
+        "reported {:?}, counted {}/{} = {expected}",
+        partial_stats.rate(),
+        partial_stats.accepted,
+        partial_stats.proposed
+    );
+    assert!(
+        partial_stats.rate() > all_reject.rate() && partial_stats.rate() < all_accept.rate(),
+        "a partially-accepted run must land strictly between the two extremes"
+    );
+
+    // ---- Un-engaged is reported as "unmeasured", never as 0%. ----
+    mistralrs_core::reset_mtp_acceptance();
+    assert_eq!(
+        mistralrs_core::mtp_acceptance_marker(),
+        None,
+        "with no MTP step recorded there is no acceptance rate — reporting 0% \
+         here is how an un-engaged run gets published as a failed one"
+    );
+}
+
 // ===========================================================================
 // V4 UQFF ↔ MTP ARTIFACT COVERAGE
 // ===========================================================================

@@ -129,9 +129,10 @@ pub use pipeline::{
     LLaVANextLoader, LlamaLoader, Loader, LocalModelPaths, LoraAdapterPaths, MistralLoader,
     MixtralLoader, Modalities, ModelKind, ModelPaths, MultimodalPromptPrefixer, NormalLoader,
     NormalLoaderBuilder, NormalLoaderType, NormalLoadingMetadata, NormalModel, NormalModelLoader,
-    mtp_load_depth, mtp_uqff_bake, set_mtp_load_depth, set_mtp_uqff_bake,
-    try_wrap_pipeline_with_mtp, verify_proposed, MtpDecodeKit, MtpHiddenCapture,
-    MtpSpeculativePipeline, NormalSpecificConfig, VerifyResult,
+    mtp_acceptance, mtp_acceptance_marker, mtp_load_depth, mtp_uqff_bake, record_mtp_step,
+    reset_mtp_acceptance, set_mtp_load_depth, set_mtp_uqff_bake, try_wrap_pipeline_with_mtp,
+    verify_proposed, MtpAcceptance, MtpDecodeKit, MtpHiddenCapture, MtpSpeculativePipeline,
+    NormalSpecificConfig, VerifyResult,
     Phi2Loader, Phi3Loader, Phi3VLoader, Qwen2Loader, SpeculativeConfig, SpeculativeLoader,
     SpeculativePipeline, SpeechLoader, SpeechPipeline, Starcoder2Loader,
     SupportedModality, TokenSource, UqffFullSer, UqffSourceWeights, VisionLoader,
@@ -143,7 +144,7 @@ pub use pipeline::text_models_inputs_processor::FlashParams as TextFlashParams;
 /// The cache entry types are needed by integration tests that drive the
 /// per-sequence cache dance (`clone_in_cache` / `clone_out_cache`) by hand
 /// against a bare `NormalModel`, without standing up a whole pipeline.
-pub use kv_cache::{KvCache, SingleCache, XsRollingCache};
+pub use kv_cache::{KvCache, SingleCache, XsRollingCache, XS_TAIL_MARGIN_TOKENS};
 pub use request::{
     ApproximateUserLocation, Constraint, DetokenizationRequest, ImageGenerationResponseFormat,
     LlguidanceGrammar, MessageContent, NormalRequest, ReasoningEffort, Request, RequestMessage,
