@@ -140,7 +140,16 @@ was missing.
 
 ### Gates
 
-`ARC_V4_FP8_KV=0` turns packing off (on-GPU A/B triage). It is also
+> 🔴 **CORRECTED 2026-08-16 by wave49-BZ.** This section shipped the gate
+> **defaulted ON** (`!(v == "0")`, so unset meant on) and it was merged without
+> the GPU exercise this same document called for below. The first V4 forward on
+> a commit containing it died — every request, including the engine's dummy run
+> — with `dtype mismatch in slice-set, lhs: BF16, rhs: U8` (wave48-BY).
+> **FP8 K storage is now OPT-IN: off unless `ARC_V4_FP8_KV=1`.** Read every
+> "default" below as "what you get with `ARC_V4_FP8_KV=1`".
+
+`ARC_V4_FP8_KV=1` turns packing on; unset (and any other value) leaves it off.
+It is also
 automatically off under `ARC_V4_CAPTURE_PROBE`, because the CUDA-graph decode
 arm writes through `mistralrs_quant::kvwrite::write_kv_inplace`, which is
 instantiated for F16/BF16/F32 only (`kvwrite/mod.rs:98-116`). `append_graph_kv_mqa`
@@ -339,9 +348,21 @@ by this change and are unverified:
    bytes — but the code path is new.
 
 The cheap first check on a box: run the existing generation smoke with
-`ARC_V4_FP8_KV=1` (default) and `=0` and diff the greedy token stream. They must
+`ARC_V4_FP8_KV=1` and with it **unset** (the default since wave49-BZ), and diff
+the greedy token stream. They must
 be **identical**, because the change is bit-exact; any divergence is a CUDA-path
 bug, not a quality question. Then re-measure the batch sweep — the claim to
 falsify is 493 → ~696 concurrent sequences at 2048 ctx.
+
+> 🔴 **wave49-BZ addendum.** One of the three items above has since been
+> exercised — on CPU, where it should have been exercised in the first place.
+> The U8 `SingleCache` never got as far as `copy2d_u8`: the engine installs a
+> **preallocated BF16 `[1,1,cap,512]` buffer** as `all_data` before the first
+> append (`engine/add_request.rs:464` → `kv_cache/mod.rs:802`), so the packed
+> append met it at `single_cache.rs:161` and `slice_set` rejected the dtype.
+> Fixed in `SingleCache::append`, which now rebuilds a preallocated buffer the
+> source does not fit while the cache is still empty. Items 2 and 3
+> (`index_select` over the LUT, the U8 H2D leg) remain **GPU-only and
+> unexercised**.
 
 Not needed: any re-bake, any quality re-measurement, any PagedAttention work.

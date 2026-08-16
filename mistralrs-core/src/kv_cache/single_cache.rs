@@ -126,8 +126,72 @@ impl SingleCache {
         ad.narrow(self.dim, 0, read_capacity)
     }
 
+    /// Can `src` be written into the buffer this cache already holds?
+    ///
+    /// `Tensor::slice_set` requires an exact dtype match and an exact match on
+    /// every dimension except the one being written along
+    /// (`candle-core/src/tensor_cat.rs:254` and `:278`, in that order — dtype
+    /// is checked first, which is why a dtype disagreement masks a width one).
+    /// `None` (no buffer yet) always fits: [`Self::append`] allocates it from
+    /// `src`.
+    fn preallocation_fits(&self, src: &Tensor) -> bool {
+        let Some(ad) = self.all_data.as_ref() else {
+            return true;
+        };
+        ad.dtype() == src.dtype()
+            && ad.rank() == src.rank()
+            && ad
+                .dims()
+                .iter()
+                .zip(src.dims())
+                .enumerate()
+                .all(|(i, (a, s))| i == self.dim || a == s)
+    }
+
     pub fn append(&mut self, src: &Tensor) -> Result<()> {
         let seq_len = src.dim(self.dim)?;
+
+        // A buffer can be present before the first append: on a prompt step
+        // with no prefix hit the engine issues `CacheInstruction::Reset {
+        // load_preallocated_cache: true }` (`engine/mod.rs:470`) and
+        // `NormalCacheManager::set_none_cache` installs the sequence's
+        // preallocated tensor as `all_data` (`kv_cache/mod.rs:802`). That
+        // tensor is shaped and typed from `ModelConfigMetadata::{k_head_dim,
+        // v_head_dim}` and `activation_dtype` (`engine/add_request.rs:464`),
+        // which assumes every model stores dense activation-precision K and V
+        // of the declared head width.
+        //
+        // DeepSeek V4 does not, in either of its layouts: the V half is a
+        // 1-wide marker (`V4_V_MARKER_WIDTH`, V *is* K for fused MQA) and,
+        // under `ARC_V4_FP8_KV=1`, the K half is U8 E4M3 codes `head_dim -
+        // qk_rope_head_dim` wide with `[rope ++ amax]` in the V half. Forcing
+        // `src` into a buffer it does not fit is what produced `dtype mismatch
+        // in slice-set, lhs: BF16, rhs: U8` on every V4 forward — including
+        // the engine's own dummy run — the first time that code met a GPU
+        // (wave48-BY), and `shape mismatch on dim 3, 512 <> 1` behind it.
+        //
+        // An empty cache's buffer holds nothing, so the honest answer is to
+        // discard it and allocate from `src` at the same capacity — the
+        // pre-grow is kept, only its dtype and width are corrected. A NON-empty
+        // cache is a different matter: the tokens already in it were written in
+        // some other layout, so a disagreement there is real corruption and is
+        // raised rather than papered over.
+        if !self.preallocation_fits(src) {
+            if self.current_seq_len != 0 {
+                let ad = self.all_data.as_ref().expect("mismatch implies a buffer");
+                candle_core::bail!(
+                    "kv-cache: cannot append {:?} {:?} into a cache already holding {} \
+                     token(s) as {:?} {:?} — the layout changed mid-sequence",
+                    src.dtype(),
+                    src.dims(),
+                    self.current_seq_len,
+                    ad.dtype(),
+                    ad.dims()
+                );
+            }
+            self.all_data = None;
+        }
+
         // This doesn't seem very idiomatic but because the creation can fail, it's tricky to use
         // self.all_data.get_or_insert_with.
         if self.all_data.is_none() {
@@ -160,6 +224,121 @@ impl SingleCache {
 
         ad.slice_set(src, self.dim, self.current_seq_len)?;
         self.current_seq_len += seq_len;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{DType, Device};
+
+    const CAP: usize = 8;
+
+    /// A cache carrying a pre-grown buffer, as `set_none_cache` leaves it
+    /// before the first append (`kv_cache/mod.rs:802`).
+    fn preallocated(width: usize, dtype: DType) -> Result<SingleCache> {
+        Ok(SingleCache {
+            all_data: Some(Tensor::zeros(
+                (1usize, 1usize, CAP, width),
+                dtype,
+                &Device::Cpu,
+            )?),
+            dim: 2,
+            current_seq_len: 0,
+            max_seq_len: 4096,
+            capacity_seq_len: CAP,
+        })
+    }
+
+    fn row(width: usize, dtype: DType, fill: f32) -> Result<Tensor> {
+        Tensor::from_vec(
+            vec![fill; width],
+            (1usize, 1usize, 1usize, width),
+            &Device::Cpu,
+        )?
+        .to_dtype(dtype)
+    }
+
+    /// A preallocated buffer the source fits must be **kept**, not silently
+    /// thrown away — that pre-grow is the whole point of
+    /// `load_preallocated_cache`, and reallocating it every prompt would be a
+    /// quiet performance regression no equality assertion would catch.
+    ///
+    /// Discriminated by a sentinel written past the append offset: a
+    /// reallocated buffer comes back zeroed, so a test that only checked the
+    /// appended row would pass either way.
+    #[test]
+    fn a_fitting_preallocation_is_reused() -> Result<()> {
+        let cache = preallocated(4, DType::F32)?;
+        let sentinel = row(4, DType::F32, 7.0)?;
+        cache
+            .all_data
+            .as_ref()
+            .unwrap()
+            .slice_set(&sentinel, 2, CAP - 1)?;
+        let mut cache = cache;
+
+        cache.append(&row(4, DType::F32, 1.0)?)?;
+
+        let ad = cache.all_data.as_ref().unwrap();
+        assert_eq!(ad.dims(), &[1, 1, CAP, 4]);
+        assert_eq!(cache.current_seq_len, 1);
+        let tail: Vec<f32> = ad.narrow(2, CAP - 1, 1)?.flatten_all()?.to_vec1()?;
+        assert_eq!(
+            tail,
+            vec![7.0f32; 4],
+            "the preallocated buffer was reallocated even though the source fit it"
+        );
+        Ok(())
+    }
+
+    /// A preallocated buffer the source does NOT fit — wrong dtype (V4's U8
+    /// E4M3 codes) or wrong width (V4's 1-wide V marker) — is discarded and
+    /// rebuilt from the source, at the capacity that was preallocated.
+    ///
+    /// Before this, both cases reached `slice_set` and killed the forward:
+    /// `dtype mismatch in slice-set, lhs: BF16, rhs: U8` and `shape mismatch on
+    /// dim 3, 512 <> 1` respectively (wave48-BY / wave49-BZ).
+    #[test]
+    fn a_mismatched_preallocation_is_rebuilt_while_empty() -> Result<()> {
+        // Wrong dtype.
+        let mut cache = preallocated(4, DType::BF16)?;
+        cache.append(&row(4, DType::U8, 3.0)?)?;
+        let ad = cache.all_data.as_ref().unwrap();
+        assert_eq!(ad.dtype(), DType::U8);
+        assert_eq!(ad.dims(), &[1, 1, CAP, 4], "capacity must be preserved");
+        assert_eq!(cache.capacity_seq_len, CAP);
+        let got: Vec<u8> = ad.narrow(2, 0, 1)?.flatten_all()?.to_vec1()?;
+        assert_eq!(got, vec![3u8; 4]);
+
+        // Wrong width on a non-sequence dim.
+        let mut cache = preallocated(512, DType::BF16)?;
+        cache.append(&row(1, DType::BF16, 0.0)?)?;
+        assert_eq!(cache.all_data.as_ref().unwrap().dims(), &[1, 1, CAP, 1]);
+        assert_eq!(cache.current_seq_len, 1);
+        Ok(())
+    }
+
+    /// Rebuilding is only honest while the cache is empty. Once it holds
+    /// tokens, a layout disagreement means the tokens already written are in a
+    /// different layout than the one now being appended — silently dropping
+    /// them would corrupt the sequence, so it is refused loudly.
+    #[test]
+    fn a_layout_change_mid_sequence_is_refused() -> Result<()> {
+        let mut cache = preallocated(4, DType::BF16)?;
+        cache.append(&row(4, DType::BF16, 1.0)?)?;
+        assert_eq!(cache.current_seq_len, 1);
+
+        let err = cache.append(&row(4, DType::U8, 1.0)?).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("layout changed mid-sequence") && msg.contains("1 token(s)"),
+            "expected a loud mid-sequence layout error, got: {msg}"
+        );
+        // And the tokens already cached are untouched.
+        assert_eq!(cache.current_seq_len, 1);
+        assert_eq!(cache.all_data.as_ref().unwrap().dtype(), DType::BF16);
         Ok(())
     }
 }

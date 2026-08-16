@@ -52,6 +52,9 @@ extend-ignore-re = [
 #   ist           : IST-DASLab (research org)
 #   ratatui       : the Ratatui TUI crate
 #   writeable     : valid alternate spelling used in kernel comments
+#   optin         : "opt-in" without the hyphen — CUDA's
+#                   cudaDevAttrMaxSharedMemoryPerBlockOptin, and filenames /
+#                   branches that cannot carry a hyphen there
 "nd" = "nd"
 "clen" = "clen"
 "tpos" = "tpos"
@@ -66,6 +69,7 @@ extend-ignore-re = [
 "ue" = "ue"
 "ba" = "ba"
 "ratatui" = "ratatui"
+"optin" = "optin"
 
 [type.md.extend-identifiers]
 "arange" = "arange"
