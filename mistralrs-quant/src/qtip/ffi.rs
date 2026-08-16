@@ -485,6 +485,39 @@ extern "C" {
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
+    // ----- Beam-search quantize, K=2 rung (wave46-BX, kernels/qtip/qtip2b_beam.cu) ---
+    //
+    // Pruned Viterbi keeping the best `beam_w` states per timestep, the GPU
+    // twin of `qtip/bitshift.rs::beam_quantize_row_2b`. Bit-identical to the
+    // CPU beam at the same width.
+    //
+    // `d_trace` is `[rows_in_flight, num_symbols, beam_w]` u32 scratch holding
+    // `(state << 16) | parent_slot`. There is no cost ping-pong scratch and no
+    // per-prefix table: the live state set is `beam_w` entries in shared
+    // memory, against the exhaustive kernel's two 2^16-f32 tables plus a
+    // 2^14-f32 prefix table per row in flight.
+
+    /// Largest beam width the K=2 kernel supports (== its block size). The
+    /// Rust side refuses wider beams rather than silently substituting a
+    /// different search (DOCTRINE D4b).
+    pub(crate) fn qtip2b_beam_max_width() -> i32;
+
+    /// Returns 0 on launch, -1 when `beam_w` is outside
+    /// `1..=qtip2b_beam_max_width()`.
+    pub(crate) fn launch_qtip2b_quantize_rows_beam_f32(
+        d_weight: *const f32,
+        d_row_scales: *const f32,
+        d_packed: *mut u8,
+        d_trace: *mut u32,
+        n_rows: i32,
+        in_features: i32,
+        num_symbols: i32,
+        row_offset: i32,
+        beam_w: i32,
+        mult: u32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    ) -> i32;
+
     // ----- Grouped GEMM (batched MoE prefill; kernels/qtip/qtip_grouped_gemm.cu) -----
     //
     // On-device routing (histogram + scans/tile-map + grouped scatter) for

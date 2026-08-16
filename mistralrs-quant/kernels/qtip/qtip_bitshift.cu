@@ -56,6 +56,10 @@
 
 // Shared 3INST decode + dtype helpers (also used by qtip_grouped_gemm.cu).
 #include "qtip2b_common.cuh"
+// Per-operation IEEE f32 for the trellis search (--use_fast_math would
+// otherwise contract `d*d + cost` into an FMA and turn `1.0f/scale` into a
+// reciprocal approximation, silently diverging from the Rust reference).
+#include "qtip_exact_fp.cuh"
 
 namespace {
 
@@ -391,15 +395,19 @@ __global__ void qtip2b_quantize_rows_viterbi_kernel(
     uint8_t* my_bt   = backtrace +
                        (size_t)local_row * (size_t)num_symbols * Q2B_PREFIX_COUNT;
 
-    const float inv_scale = 1.0f / row_scales[row];
+    // wave46-BX: exact IEEE ops, so a qtip2b GPU bake and a qtip2b CPU bake of
+    // the same weights are the SAME checkpoint — and so "an unpruned beam
+    // reproduces the exhaustive DP byte for byte" is testable on GPU. Mirrors
+    // what wave13-AF did for the LUT rung.
+    const float inv_scale = qtip_inv_scale_exact(row_scales[row]);
 
     // -------- Init t=0: only states 0..ALPHABET reachable --------
     {
-        float t0 = my_row[0] * inv_scale;
+        float t0 = qtip_scaled_target_exact(my_row[0], inv_scale);
         for (uint32_t i = tid; i < Q2B_NSTATES; i += Q2B_VITERBI_THREADS) {
             if (i < Q2B_ALPHABET) {
-                float d = q2b_decode(i, mult) - t0;
-                my_cost_a[i] = d * d;
+                float d = __fsub_rn(q2b_decode(i, mult), t0);
+                my_cost_a[i] = __fmul_rn(d, d);
             } else {
                 my_cost_a[i] = INFINITY;
             }
@@ -412,7 +420,7 @@ __global__ void qtip2b_quantize_rows_viterbi_kernel(
     float* curr = my_cost_b;
 
     for (int t = 1; t < num_symbols; ++t) {
-        float tt = my_row[t] * inv_scale;
+        float tt = qtip_scaled_target_exact(my_row[t], inv_scale);
         uint8_t* bt_t = my_bt + (size_t)t * Q2B_PREFIX_COUNT;
 
         // Phase A: per-prefix 4-way reduction, results to gmem scratch.
@@ -436,8 +444,8 @@ __global__ void qtip2b_quantize_rows_viterbi_kernel(
 
         // Phase B: per-state cost update with the in-register codebook.
         for (uint32_t s = tid; s < Q2B_NSTATES; s += Q2B_VITERBI_THREADS) {
-            float d = q2b_decode(s, mult) - tt;
-            curr[s] = d * d + my_pc[s >> Q2B_K];
+            float d = __fsub_rn(q2b_decode(s, mult), tt);
+            curr[s] = __fadd_rn(__fmul_rn(d, d), my_pc[s >> Q2B_K]);
         }
         __syncthreads();
 

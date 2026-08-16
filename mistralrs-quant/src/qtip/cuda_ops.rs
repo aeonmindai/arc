@@ -1526,13 +1526,92 @@ pub(crate) fn gather_gemv_2b_cuda(
     Ok(Tensor::from((Storage::Cuda(res), out_shape)))
 }
 
+/// Largest beam width `kernels/qtip/qtip2b_beam.cu` can run, read from the
+/// kernel itself so the Rust limit can never drift from the CUDA one.
+///
+/// Returns 0 when the kernels were not compiled in.
+pub(crate) fn beam_2b_max_width() -> usize {
+    if !ffi::HAVE_QTIP_KERNELS {
+        return 0;
+    }
+    // SAFETY: a pure constant getter with no arguments and no side effects.
+    let w = unsafe { ffi::qtip2b_beam_max_width() };
+    if w < 0 {
+        0
+    } else {
+        w as usize
+    }
+}
+
+/// Per-row search scale for the K=2 rung: `max|row| / QTIP2B_SCALE_DIVISOR`,
+/// as computed by the CUDA kernel.
+///
+/// Split out of [`quantize_rows_2b_cuda`] so the parity tests can hand the CPU
+/// reference the SAME scale the kernel searched against — the LS refinement at
+/// the end of `quantize_rows_2b_cuda` returns a *different* (post-hoc) scale,
+/// so the returned scales of that function cannot be used to reproduce its own
+/// symbol stream.
+pub(crate) fn compute_row_scales_2b_cuda(weight_f32: &Tensor) -> Result<Tensor> {
+    if !ffi::HAVE_QTIP_KERNELS {
+        candle_core::bail!("qtip2b row-scale CUDA: kernels not compiled in");
+    }
+    let (n_rows, k_in) = weight_f32.dims2()?;
+    if weight_f32.dtype() != DType::F32 {
+        candle_core::bail!(
+            "qtip2b row-scale CUDA: weight dtype must be F32, got {:?}",
+            weight_f32.dtype()
+        );
+    }
+    let dev = match weight_f32.device() {
+        candle_core::Device::Cuda(d) => d.clone(),
+        _ => candle_core::bail!("qtip2b row-scale CUDA: weight must live on CUDA"),
+    };
+    let weight_contig = weight_f32.contiguous()?;
+    let (w_storage, w_layout) = weight_contig.storage_and_layout();
+    let w_storage = match &*w_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("qtip2b row-scale CUDA: weight must be CUDA storage"),
+    };
+    let (w_ptr, _w_guard) = slice_ptr(w_storage.as_cuda_slice::<f32>()?, w_layout.start_offset());
+    let scales_buf = dev.alloc_zeros::<f32>(n_rows)?;
+    let (scales_ptr, scales_guard) = slice_ptr(&scales_buf, 0);
+    unsafe {
+        ffi::launch_qtip2b_compute_row_scales_f32(
+            w_ptr as *const _,
+            scales_ptr as *mut _,
+            n_rows as i32,
+            k_in as i32,
+            QTIP2B_SCALE_DIVISOR,
+            dev.cuda_stream().cu_stream(),
+        );
+    }
+    drop(scales_guard);
+    let res = CudaStorage::wrap_cuda_slice(scales_buf, dev.clone());
+    Ok(Tensor::from((
+        Storage::Cuda(res),
+        candle_core::Shape::from_dims(&[n_rows]),
+    )))
+}
+
 /// One-shot qtip2b quantize on GPU. `weight_rotated_f32` must already be F32
 /// on CUDA and in the rotated frame. Returns `(packed_blocks, row_scales)`
 /// with `packed_blocks: [n_rows, num_symbols / 4]` U8.
+///
+/// `search` selects the trellis search when `mode == Viterbi`:
+/// [`TrellisSearch::Exhaustive`] runs the prefix-grouped DP over all `2^L`
+/// states (best quality, ~984 s/layer measured on H200 by wave41-BS);
+/// [`TrellisSearch::Beam`] runs `qtip2b_beam.cu` at that width. `Greedy`
+/// ignores it — a greedy walk is not a trellis search at all.
+///
+/// The caller is expected to have put `search` through
+/// [`super::cuda_search_plan`] already; the explicit range check below is the
+/// backstop that keeps a mis-plumbed width from becoming a silently different
+/// bake rather than an error.
 pub(crate) fn quantize_rows_2b_cuda(
     weight_rotated_f32: &Tensor,
     mcg_mult: u32,
     mode: QtipMode,
+    search: TrellisSearch,
 ) -> Result<(Tensor, Tensor)> {
     if !ffi::HAVE_QTIP_KERNELS {
         candle_core::bail!("qtip2b quantize CUDA: kernels not compiled in");
@@ -1558,30 +1637,7 @@ pub(crate) fn quantize_rows_2b_cuda(
     let weight_contig = weight_rotated_f32.contiguous()?;
 
     // Step 1: row scales (max|row| / QTIP2B_SCALE_DIVISOR).
-    let row_scales = {
-        let (w_storage, w_layout) = weight_contig.storage_and_layout();
-        let w_storage = match &*w_storage {
-            Storage::Cuda(s) => s,
-            _ => candle_core::bail!("qtip2b quantize CUDA: weight must be CUDA storage"),
-        };
-        let (w_ptr, _w_guard) =
-            slice_ptr(w_storage.as_cuda_slice::<f32>()?, w_layout.start_offset());
-        let scales_buf = dev.alloc_zeros::<f32>(n_rows)?;
-        let (scales_ptr, scales_guard) = slice_ptr(&scales_buf, 0);
-        unsafe {
-            ffi::launch_qtip2b_compute_row_scales_f32(
-                w_ptr as *const _,
-                scales_ptr as *mut _,
-                n_rows as i32,
-                k_in as i32,
-                QTIP2B_SCALE_DIVISOR,
-                dev.cuda_stream().cu_stream(),
-            );
-        }
-        drop(scales_guard);
-        let res = CudaStorage::wrap_cuda_slice(scales_buf, dev.clone());
-        Tensor::from((Storage::Cuda(res), candle_core::Shape::from_dims(&[n_rows])))
-    };
+    let row_scales = compute_row_scales_2b_cuda(&weight_contig)?;
 
     // Step 2: packed output + quantize kernel.
     let packed_per_row = num_symbols / Q2B_SYMS_PER_BYTE;
@@ -1618,6 +1674,65 @@ pub(crate) fn quantize_rows_2b_cuda(
                     dev.cuda_stream().cu_stream(),
                 );
             },
+            QtipMode::Viterbi if !matches!(search, TrellisSearch::Exhaustive) => {
+                // wave46-BX beam kernel. The live state set is `width` entries
+                // in shared memory, so there is NO cost ping-pong scratch and
+                // no per-prefix table at all — only the compacted backtrace,
+                // `width * 4` bytes per timestep instead of the exhaustive
+                // kernel's 16384.
+                let width = match search {
+                    TrellisSearch::Beam { width } => width,
+                    TrellisSearch::Exhaustive => unreachable!("guarded by the match arm"),
+                };
+                let max_w = beam_2b_max_width();
+                if width == 0 || width > max_w {
+                    candle_core::bail!(
+                        "qtip2b quantize CUDA: beam width {width} is outside the kernel's \
+                         supported range 1..={max_w}. Refusing to substitute a different \
+                         width — a bake must never silently change its search."
+                    );
+                }
+                let trace_bytes_per_row = num_symbols * width * 4;
+                let mut rows_in_flight = (viterbi_scratch_bytes() / trace_bytes_per_row).max(1);
+                if rows_in_flight > n_rows {
+                    rows_in_flight = n_rows;
+                }
+
+                // Uninit alloc: the kernel writes every trace slot it later
+                // reads (the backtrace walk only visits slots the forward pass
+                // populated), so zeroing GBs of scratch is wasted bandwidth.
+                let trace = unsafe { dev.alloc::<u32>(rows_in_flight * num_symbols * width)? };
+                let (tr_ptr, tr_guard) = slice_ptr(&trace, 0);
+
+                let mut row_offset = 0usize;
+                while row_offset < n_rows {
+                    let this_batch = rows_in_flight.min(n_rows - row_offset);
+                    let rc = unsafe {
+                        ffi::launch_qtip2b_quantize_rows_beam_f32(
+                            w_ptr as *const _,
+                            rs_ptr as *const _,
+                            pkd_ptr as *mut _,
+                            tr_ptr as *mut _,
+                            this_batch as i32,
+                            k_in as i32,
+                            num_symbols as i32,
+                            row_offset as i32,
+                            width as i32,
+                            mcg_mult,
+                            dev.cuda_stream().cu_stream(),
+                        )
+                    };
+                    if rc != 0 {
+                        candle_core::bail!(
+                            "qtip2b quantize CUDA: beam kernel refused width {width} (rc={rc})"
+                        );
+                    }
+                    row_offset += this_batch;
+                }
+
+                drop(tr_guard);
+                let _ = trace;
+            }
             QtipMode::Viterbi => {
                 // Scratch budget mirrors the LUT rung: per-row backtrace is
                 // num_symbols * 2^(L-K) bytes (prefix-grouped), plus two
