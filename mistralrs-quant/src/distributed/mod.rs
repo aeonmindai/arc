@@ -309,6 +309,21 @@ mod ring {
                     config.world_size
                 );
             }
+            // `SumAllReduce::run` performs exactly ONE exchange — send right, read
+            // left — and `sum_all_reduce` then computes `xs + delta`. That is a
+            // complete sum only when each rank has exactly one peer, i.e.
+            // world_size == 2. At world_size >= 4 it silently yields a PARTIAL sum
+            // (self + left neighbour) with no error, which is a wrong-numerics bug
+            // rather than a failure. Reject it here until the ring is a real
+            // reduce-scatter + all-gather.
+            if config.world_size > 2 {
+                candle_core::bail!(
+                    "Ring backend currently implements a single-exchange all-reduce, which is \
+                     only correct for world_size == 2 (got {}). Use the NCCL backend for larger \
+                     world sizes.",
+                    config.world_size
+                );
+            }
             Ok(Self { config })
         }
 
