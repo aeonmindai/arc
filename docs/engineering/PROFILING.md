@@ -43,12 +43,14 @@ do not:**
 
 | timer | name implies | actually wraps | what leaks into "sdpa" |
 |---|---|---|---|
+| `MLA_NS[0]` | `q_proj` | **only** `self.q.forward(xs)` (`:1403`) | the Q reshape/transpose/contiguous and the per-head `q_rmsnorm` |
 | `MLA_NS[1]` | `kv_proj_rope` | **only** `self.wkv.forward_autocast(xs)` | `kv_norm`, `apply_rope_inplace`, the FP8 K quant/dequant, `append_kv_mqa`, `cached.span(...)` |
 | `MLA_NS[2]` | `invrope_oproj` | **only** the `o_proj` LoRA block | `forward_inverse_tail` — the inverse RoPE the name claims to include |
 | — | — | — | `compressor_advance` and `compressed_kv_from_rows`, inside `mla_attn` but wrapped by no MLA timer at all |
 
-⇒ **The "SDPA" residual is the attention kernel plus RoPE, inverse RoPE,
-kv_norm, the KV cache append and span, the FP8 round trip, and the compressor.**
+⇒ **The "SDPA" residual is the attention kernel plus q_rmsnorm, RoPE, inverse
+RoPE, kv_norm, the KV cache append and span, the FP8 round trip, and the
+compressor.**
 Every figure derived from it is a ceiling on the kernel, not a measurement of it.
 Concretely, treat these as **superseded, not merely stale**:
 

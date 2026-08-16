@@ -119,6 +119,8 @@ subtraction**, `sdpa = mla_attn − (q_proj + kv_proj_rope + invrope_oproj)`
 `"(sdpa=mla_attn-these)"`). That is only valid if those three cover everything
 in `mla_attn` bar the kernel. They do not:
 
+- `MLA_NS[0]` "q_proj" wraps **only** `self.q.forward(xs)` (`:1403`) — the Q
+  reshape and the per-head `q_rmsnorm` leak into the residual;
 - `MLA_NS[1]` "kv_proj_rope" wraps **only** `self.wkv.forward_autocast(xs)`
   (`:1433`) — `kv_norm`, `apply_rope_inplace`, the FP8 K quant/dequant,
   `append_kv_mqa` and `cached.span(...)` all leak into the residual;
@@ -128,8 +130,8 @@ in `mla_attn` bar the kernel. They do not:
 - `compressor_advance` and `compressed_kv_from_rows` sit inside `mla_attn` and
   are wrapped by no MLA timer at all.
 
-⇒ The "SDPA" residual is the attention kernel **plus** RoPE, inverse RoPE,
-kv_norm, the KV append + span, the FP8 round trip, and the compressor. SUPERSEDE:
+⇒ The "SDPA" residual is the attention kernel **plus** q_rmsnorm, RoPE, inverse
+RoPE, kv_norm, the KV append + span, the FP8 round trip, and the compressor. SUPERSEDE:
 the b=1 split `mla_attn 49% (q_proj 22 ms, kv_proj_rope 7.7 ms, invrope_oproj
 16.6 ms, rest = SDPA)` and the `fp8_matmul 31.5% / qtip_dequantize 26.5%`
 framing built on it. The B=64 `mla_attn 39%` **total is sound** (it wraps the
