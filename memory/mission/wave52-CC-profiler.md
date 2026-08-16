@@ -109,11 +109,35 @@ busy-wait, the unconditional `CacheInstruction::Out`, `seq.get_toks().to_vec()`
 per sequence per step, the serial `responder.send().await` under the pipeline
 mutex, the per-sequence GPU `Tensor::new` (CLAUDE.md pitfall #5), the logits D2H.
 
-Two known bugs in the OLD timers, surfaced by placing spans correctly and
-documented in code: `MLA_NAMES[1]="kv_proj_rope"` excludes RoPE, and
-`MLA_NAMES[2]="invrope_oproj"` **excludes the inverse tail** — so
-`sdpa = mla_attn − the three MLA timers` over-attributed rope, inv-rope, kv_norm
-and the cache append into "sdpa". Both now have their own nodes.
+### 🔴 The old four-bucket component percentages are OVER-ATTRIBUTED TO SDPA
+
+Placing spans against the real call sites surfaced a defect in the **existing**
+`ARC_TIME_DECODE` timers that invalidates every component percentage this
+program has quoted from them. "SDPA" was never measured — it is **derived by
+subtraction**, `sdpa = mla_attn − (q_proj + kv_proj_rope + invrope_oproj)`
+(`deepseek4.rs:2497-2507`; the emitted line says so itself:
+`"(sdpa=mla_attn-these)"`). That is only valid if those three cover everything
+in `mla_attn` bar the kernel. They do not:
+
+- `MLA_NS[1]` "kv_proj_rope" wraps **only** `self.wkv.forward_autocast(xs)`
+  (`:1433`) — `kv_norm`, `apply_rope_inplace`, the FP8 K quant/dequant,
+  `append_kv_mqa` and `cached.span(...)` all leak into the residual;
+- `MLA_NS[2]` "invrope_oproj" wraps **only** the o_proj block (`:1762`) —
+  `forward_inverse_tail` (`:1750`) is **outside** it, i.e. the inverse RoPE the
+  name claims to include leaks in too;
+- `compressor_advance` and `compressed_kv_from_rows` sit inside `mla_attn` and
+  are wrapped by no MLA timer at all.
+
+⇒ The "SDPA" residual is the attention kernel **plus** RoPE, inverse RoPE,
+kv_norm, the KV append + span, the FP8 round trip, and the compressor. SUPERSEDE:
+the b=1 split `mla_attn 49% (q_proj 22 ms, kv_proj_rope 7.7 ms, invrope_oproj
+16.6 ms, rest = SDPA)` and the `fp8_matmul 31.5% / qtip_dequantize 26.5%`
+framing built on it. The B=64 `mla_attn 39%` **total is sound** (it wraps the
+whole attention call) — only the decomposition inside it is wrong, so "MoE grows
+with batch, everything else collapses" survives; "attention is mostly SDPA" does
+not. `arc-profiler` measures all fourteen MLA sub-ops directly with **no
+subtraction anywhere**; the §7 GPU run replaces the superseded numbers, and
+until it lands, quote neither set.
 
 ### Declared UNREACHABLE on V4 (striped in the HTML, never a silent zero)
 
@@ -127,6 +151,14 @@ and the cache append into "sdpa". Both now have their own nodes.
 ⇒ **No CUDA graph capture or replay executes in a default V4 run.** Jish's
 "profile cuda graph" is answered as *"it does not run, here is the line that
 bails"*, which is the honest answer.
+
+🔴 **Headline in its own right:** three independent bails, all rooted in
+`supports_paged_attention() == false` ⇒ `cache_config == None`, mean the
+graph/megakernel path on V4 is **UNREACHABLE, not merely deferred**. Any plan
+treating "turn on CUDA graphs" as a tuning step is mis-scoped — it is a
+prerequisite project (give V4 a cache config, or a capture path that needs
+none). Equally: no V4 measurement to date can have been affected by graph
+capture, in either direction.
 
 ---
 

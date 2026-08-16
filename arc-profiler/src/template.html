@@ -1142,12 +1142,12 @@ function renderChart(){
   const W = Math.max(120, chart.clientWidth || chart.parentElement.clientWidth || 900);
 
   const z = zoomNode();
-  const anc = ancestry(z);                     // [root, ..., z]
+  const ancestors = ancestry(z);                     // [root, ..., z]
   const placed = [];
 
   // ancestors above the zoom target: full width, dimmed, clickable to go back
-  for (let i = 0; i < anc.length - 1; i++) placed.push({ n: anc[i], x: 0, w: W, row: i, ctx: true });
-  place(z, 0, W, anc.length - 1, placed, md);
+  for (let i = 0; i < ancestors.length - 1; i++) placed.push({ n: ancestors[i], x: 0, w: W, row: i, ctx: true });
+  place(z, 0, W, ancestors.length - 1, placed, md);
 
   let maxRow = 0;
   for (const p of placed) if (p.row > maxRow) maxRow = p.row;
@@ -1188,7 +1188,7 @@ function renderChart(){
     BAR_INDEX.set(parseInt(bars[i].getAttribute('data-id'), 10), bars[i]);
   }
 
-  renderCrumbs(anc);
+  renderCrumbs(ancestors);
   renderLegend(placed.length, m.all.length);
   $('zoomOutBtn').disabled = !z._up;
   $('resetBtn').disabled   = (z === m.root);
@@ -1227,9 +1227,9 @@ function place(n, x, w, row, out, md){
   }
 }
 
-function renderCrumbs(anc){
-  const parts = anc.map((n, i) => {
-    const cur = (i === anc.length - 1);
+function renderCrumbs(ancestors){
+  const parts = ancestors.map((n, i) => {
+    const cur = (i === ancestors.length - 1);
     return '<button data-id="' + n.id + '"' + (cur ? ' class="cur"' : '') + '>' + esc(n._name) + '</button>';
   });
   $('crumbs').innerHTML = parts.join('<span class="sepr">›</span>');

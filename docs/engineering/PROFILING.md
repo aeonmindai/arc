@@ -18,7 +18,7 @@ execution — and in which node of the call tree.**
 
 | What existed | What it gave | Why it could not close the gap |
 |---|---|---|
-| `ARC_TIME_DECODE` (`deepseek4.rs:2430`) | four buckets: `moe / mla_attn / mhc_attn_pre / mhc_ffn_pre` (+3 MLA sub-timers) | Four buckets cannot locate a 150x gap. It also `device.synchronize()`s twice per timed call — **774 full device syncs per token** at 43 layers — so it changes the run it measures. |
+| `ARC_TIME_DECODE` (`deepseek4.rs:2484`) | four buckets: `moe / mla_attn / mhc_attn_pre / mhc_ffn_pre` (+3 MLA sub-timers) | Four buckets cannot locate a 150x gap. It also `device.synchronize()`s twice per timed call — **774 full device syncs per token** at 43 layers — so it changes the run it measures. |
 | `STEP_us TOTAL/fwd/sample/other` (`pipeline/mod.rs`, PagedAttention arm) | a host/forward split | **V4 never takes that arm.** `DeepSeekV4Loader::supports_paged_attention()` returns `false`, so the engine always issues `DefaultInstructions`. V4 logged no host/forward split at all. |
 | wave36-BN's fit | `k=105.9 ms, a=24.26 ms/seq, c=0.109 ms` | The quadratic term was found and fixed (PR #67). **The linear `a` — roughly 69 points of a B=64 step — stayed unattributed** because nothing measured below the level of "forward".
 
@@ -26,6 +26,46 @@ The measured starting point this profiler exists to explain: aggregate decode
 **91.5 tok/s @ B=64 → 106.4 @ B=128 → 111.7 @ B=256** on an H200 serving
 `qtip2b`, against a physics ceiling at B=256 of **~16,600 tok/s**
 (`memory/mission/CEILINGS.json`).
+
+### 🔴 The old four-bucket numbers are OVER-ATTRIBUTED TO SDPA — do not re-derive a plan from them
+
+Placing spans against the real call sites surfaced a defect in the *existing*
+`ARC_TIME_DECODE` timers, and it invalidates every component percentage this
+program has quoted from them.
+
+The four buckets are computed as accumulator sums, and "SDPA" was never measured
+directly — it was **derived by subtraction**:
+`sdpa = mla_attn − (q_proj + kv_proj_rope + invrope_oproj)`
+(`deepseek4.rs:2497-2507`, and the `emit_decode_profile` line's own
+`"(sdpa=mla_attn-these)"` legend). That subtraction is only correct if the three
+named timers cover everything in `mla_attn` except the attention kernel. **They
+do not:**
+
+| timer | name implies | actually wraps | what leaks into "sdpa" |
+|---|---|---|---|
+| `MLA_NS[1]` | `kv_proj_rope` | **only** `self.wkv.forward_autocast(xs)` | `kv_norm`, `apply_rope_inplace`, the FP8 K quant/dequant, `append_kv_mqa`, `cached.span(...)` |
+| `MLA_NS[2]` | `invrope_oproj` | **only** the `o_proj` LoRA block | `forward_inverse_tail` — the inverse RoPE the name claims to include |
+| — | — | — | `compressor_advance` and `compressed_kv_from_rows`, inside `mla_attn` but wrapped by no MLA timer at all |
+
+⇒ **The "SDPA" residual is the attention kernel plus RoPE, inverse RoPE,
+kv_norm, the KV cache append and span, the FP8 round trip, and the compressor.**
+Every figure derived from it is a ceiling on the kernel, not a measurement of it.
+Concretely, treat these as **superseded, not merely stale**:
+
+- the b=1 split `mla_attn 49% (q_proj 22 ms, kv_proj_rope 7.7 ms,
+  invrope_oproj 16.6 ms, rest = SDPA)`, and the `fp8_matmul 31.5% /
+  qtip_dequantize 26.5%` framing built on top of it;
+- the B=64 split `moe 49–64% / mla_attn 39% / mhc_* 4% / 4%`. The **`mla_attn`
+  total is sound** (it wraps the whole attention call); it is only the
+  *decomposition inside it* that is wrong. So "MoE grows with batch while
+  everything else collapses" survives; "attention is mostly SDPA" does not.
+
+`arc-profiler` measures all fourteen MLA sub-operations directly — `q_proj`,
+`q_rmsnorm`, `kv_proj`, `kv_norm`, `rope`, `kv_fp8_quant`, `kv_fp8_dequant`,
+`compressor_advance`, `compressed_kv_build`, `kv_cache_append`, `kv_cache_span`,
+`sdpa`, `inv_rope`, `o_proj` — with **no subtraction anywhere**. `sdpa` in this
+report is the `dsv4_attention` call and nothing else. The GPU run in §9 is what
+replaces the superseded numbers; until it lands, quote neither set.
 
 ---
 
@@ -240,6 +280,16 @@ the branch that bails rather than left silent.
 **So: no CUDA graph capture or replay executes in a default V4 run.** If a
 future change makes one reachable, the node stops being striped and starts
 carrying time — which is the point of declaring it rather than omitting it.
+
+🔴 **This is a finding in its own right, not a footnote about the profiler.**
+Three independent bails, each with a line number, all rooted in the same fact —
+`DeepSeekV4Loader::supports_paged_attention()` returns `false`, so `cache_config`
+is `None` — mean the graph/megakernel path on V4 is **unreachable, not merely
+deferred**. Any plan that treats "turn on CUDA graphs" as a tuning step is
+mis-scoped: it is a prerequisite project (give V4 a paged/backed cache config,
+or a capture path that does not require one), and it should be prioritised as
+one. Equally, no measurement taken on V4 to date can have been affected by graph
+capture, in either direction.
 
 ---
 
