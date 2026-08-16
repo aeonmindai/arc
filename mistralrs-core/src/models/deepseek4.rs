@@ -123,6 +123,7 @@ use crate::{
 
 use crate::kv_cache::XsRollingCache;
 
+use super::dsv4_kv_fp8::V4PackedK;
 use super::dsv4_mhc::V4MHCLayerParams;
 
 serde_default_fn!(f64, routed_scaling_factor, 1.5);
@@ -1442,7 +1443,21 @@ impl Attention {
         // `act_quant(kv[..., :-rd], 64, ..., inplace=True)`). The model was
         // trained with the KV non-rope dims round-tripped through block-wise
         // FP8; feeding full BF16 is out-of-distribution. V=K so v inherits it.
-        let k = act_quant_kv_nope(&k, self.cfg.qk_rope_head_dim)?;
+        //
+        // wave43: the quantized form is kept, not just its BF16 shadow. The
+        // non-paged cache stores the E4M3 codes + each block's `amax` directly
+        // (`dsv4_kv_fp8`), which is BIT-EXACT with the BF16 tensor built on the
+        // next line — the round trip has already happened by then — at 590
+        // B/token/layer instead of 1026.
+        let k_packed = super::dsv4_kv_fp8::quantize_k(
+            &k,
+            self.cfg.qk_rope_head_dim,
+            super::dsv4_kv_fp8::KvQuantMode::from_env(),
+        )?;
+        let k = match &k_packed {
+            Some(packed) => packed.dequant(k.dtype())?,
+            None => k,
+        };
         v4_stat_dbg(&k, "attn.k_actquant");
         v4_trace_dump(self.dbg_layer_idx, &k, "30_k_actquant");
 
@@ -1501,6 +1516,7 @@ impl Attention {
         let dsv4_cfg = super::dsv4_attention::Dsv4AttentionConfig {
             compress_ratio: self.compress_ratio,
             sliding_window: self.sliding_window,
+            raw_prefix: 0,
         };
         // Faithful V4: the compressed (distant-context) KV, with compress-θ
         // RoPE at the strided compressed positions. `dsv4_attention` runs a
@@ -1602,7 +1618,22 @@ impl Attention {
                 )?
             }
             None => {
-                let k_cached = append_kv_mqa(kv_cache, &k)?;
+                let cached = append_kv_mqa(kv_cache, &k, k_packed.as_ref())?;
+                // Reconstruct only what any query row in this block can reach.
+                // Dense storage stays whole (`raw_prefix = 0`) so
+                // `dsv4_attention` narrows exactly as it did before; packed
+                // storage narrows here, because the narrowing is what keeps the
+                // dequant O(window) rather than O(context).
+                let t_k_full = cached.seq_len()?;
+                let (raw_prefix, keep) = match &cached {
+                    V4CachedK::Dense(_) => (0, t_k_full),
+                    V4CachedK::Packed(_) => super::dsv4_attention::raw_keep_span(
+                        seq_len,
+                        self.sliding_window.max(1),
+                        t_k_full,
+                    ),
+                };
+                let k_cached = cached.span(raw_prefix, keep, k.dtype())?;
                 // Cache read-back: in decode this is prefill's K (0..N-1) + the
                 // new token's K. Diff vs prefill's freshly-computed K splits a
                 // cache-storage bug (old rows differ) from a new-token position
@@ -1620,7 +1651,10 @@ impl Attention {
                     attention_mask,
                     flash_params,
                     &self.sdpa_params,
-                    dsv4_cfg,
+                    super::dsv4_attention::Dsv4AttentionConfig {
+                        raw_prefix,
+                        ..dsv4_cfg
+                    },
                 )?
             }
         };
@@ -2182,12 +2216,10 @@ impl MoeOrMlp {
     }
 }
 
-/// V4 QAT: block-wise (64) FP8 round-trip on the non-rope dims of K, matching
-/// reference inference/model.py:506 `act_quant(kv[..., :-rd], 64, ..., inplace=True)`.
-/// Per 64-element block: scale = amax/448 (E4M3 max), quantize to F8E4M3, dequant
-/// back. Rope dims (last `rope_dim`) untouched. Computed in F32 (ref does FP32
-/// internally). (RUN-161)
-/// Width, in elements per token, of the V half of a V4 KV cache slot.
+/// Width, in elements per token, of the V half of a V4 KV cache slot in the
+/// **unpacked** layout (FP8 KV off, or a geometry whose non-rope dims are not
+/// whole 64-wide blocks — synthetic fixtures). The packed layout puts the rope
+/// tail and the block scales there instead; see [`super::dsv4_kv_fp8`].
 ///
 /// V4 is MQA with a single fused `wkv` projection: `V` **is** `K`, bit for bit
 /// (see step 4 of [`Attention::forward`]). Storing a second full `head_dim`
@@ -2238,17 +2270,83 @@ fn require_normal_kv_slot(kv_cache: &KvCache) -> Result<()> {
     )
 }
 
-/// Append V4's fused K/V, storing K once and a 1-wide marker in place of the
-/// duplicate V. Returns the full cached K — which is also the full cached V.
-fn append_kv_mqa(kv_cache: &mut KvCache, k: &Tensor) -> Result<Tensor> {
+/// One layer's cached V4 keys, in whichever layout the slot holds.
+///
+/// V4's `V` **is** its `K`, bit for bit (step 4 of [`Attention::forward`]), so
+/// there is only ever one thing here.
+#[derive(Debug)]
+pub(crate) enum V4CachedK {
+    /// Activation-dtype `[B, H, T, head_dim]`, V half a 1-wide marker.
+    Dense(Tensor),
+    /// FP8 codes in the K half, rope tail + block `amax` in the V half.
+    Packed(Box<V4PackedK>),
+}
+
+impl V4CachedK {
+    /// Number of cached tokens.
+    fn seq_len(&self) -> Result<usize> {
+        match self {
+            Self::Dense(k) => k.dim(2),
+            Self::Packed(p) => p.seq_len(),
+        }
+    }
+
+    /// Materialise keys `[base, base + len)` at activation precision.
+    ///
+    /// For the packed layout this is where the dequant happens, and it is why
+    /// the caller narrows first: reconstructing the whole context every decode
+    /// step would write `T * head_dim` activations per layer, which at large
+    /// batch costs more bandwidth than the storage saves. Reconstructing only
+    /// [`super::dsv4_attention::raw_keep_span`] makes it `O(window)`.
+    fn span(&self, base: usize, len: usize, out_dtype: DType) -> Result<Tensor> {
+        match self {
+            Self::Dense(k) => {
+                if base == 0 && len == k.dim(2)? {
+                    Ok(k.clone())
+                } else {
+                    k.narrow(2, base, len)?.contiguous()
+                }
+            }
+            Self::Packed(p) => p.narrow(base, len)?.dequant(out_dtype),
+        }
+    }
+}
+
+/// Append V4's fused K/V. `packed` is the quantized form of `k` when the
+/// geometry admits one; it is stored in place of `k` unless FP8 KV is off
+/// ([`v4_fp8_kv_enabled`]), in which case `k` is stored dense beside a 1-wide
+/// marker. Returns the full cached sequence in whichever layout was written.
+fn append_kv_mqa(
+    kv_cache: &mut KvCache,
+    k: &Tensor,
+    packed: Option<&V4PackedK>,
+) -> Result<V4CachedK> {
     require_normal_kv_slot(kv_cache)?;
-    let marker = v4_v_marker(k)?;
-    let (k_cached, _marker_cached) = kv_cache.append(k, &marker)?;
-    Ok(k_cached)
+    match packed.filter(|_| v4_fp8_kv_enabled()) {
+        Some(p) => {
+            let (codes, side) = kv_cache.append(&p.codes, &p.side)?;
+            Ok(V4CachedK::Packed(Box::new(V4PackedK {
+                codes,
+                side,
+                rope_dim: p.rope_dim,
+            })))
+        }
+        None => {
+            let marker = v4_v_marker(k)?;
+            let (k_cached, _marker_cached) = kv_cache.append(k, &marker)?;
+            Ok(V4CachedK::Dense(k_cached))
+        }
+    }
 }
 
 /// [`append_kv_mqa`] for the CUDA-graph decode path: writes at the device-held
 /// `position` and reads back a fixed `cap`-wide window.
+///
+/// Dense only. `mistralrs_quant::kvwrite::write_kv_inplace` is instantiated for
+/// F16/BF16/F32, so a U8 code cache cannot be written at a device-held slot;
+/// [`v4_fp8_kv_enabled`] is therefore false whenever this arm can run, and the
+/// check below turns a future divergence into an explicit error rather than a
+/// dtype mismatch deep inside the kernel dispatch.
 fn append_graph_kv_mqa(
     kv_cache: &mut KvCache,
     k: &Tensor,
@@ -2256,53 +2354,32 @@ fn append_graph_kv_mqa(
     cap: usize,
 ) -> Result<Tensor> {
     require_normal_kv_slot(kv_cache)?;
+    if v4_fp8_kv_enabled() {
+        candle_core::bail!(
+            "V4 CUDA-graph decode needs the dense KV layout, but FP8 KV storage is on. \
+             Set ARC_V4_FP8_KV=0, or teach mistralrs_quant::kvwrite::write_kv_inplace \
+             the U8 code cache."
+        );
+    }
     let marker = v4_v_marker(k)?;
     let (k_full, _marker_full) = kv_cache.append_graph(k, &marker, position, cap)?;
     Ok(k_full)
 }
 
-fn act_quant_kv_nope(k: &Tensor, rope_dim: usize) -> Result<Tensor> {
-    let head_dim = k.dim(D::Minus1)?;
-    let nope = head_dim - rope_dim;
-    const BLOCK: usize = 64;
-    if nope == 0 || nope % BLOCK != 0 {
-        return Ok(k.clone());
-    }
-    let k_nope = k.narrow(D::Minus1, 0, nope)?;
-    let k_rope = k.narrow(D::Minus1, nope, rope_dim)?;
-    let orig_dims = k_nope.dims().to_vec();
-    let mut blk = orig_dims.clone();
-    let last = blk.len() - 1;
-    blk[last] = nope / BLOCK;
-    blk.push(BLOCK);
-    let kb = k_nope.to_dtype(DType::F32)?.reshape(blk)?;
-    let amax = kb.abs()?.max_keepdim(D::Minus1)?;
-    let scale = (amax / 448.0)?.affine(1.0, 1e-12)?;
-    let scaled = kb.broadcast_div(&scale)?;
-    // candle's F8E4M3 cast has no CUDA kernel ("named symbol not found"), so the
-    // exact round-trip runs on CPU — but that forces a GPU<->CPU sync every
-    // attention layer (43 syncs/token), serializing decode. ARC_GPU_ACT_QUANT=1
-    // does an on-GPU E4M3 round-trip instead (round-to-nearest, 3 mantissa bits,
-    // exp range [-6,8], max 448) — removes the sync at a sub-ULP-of-FP8
-    // approximation the FP8-trained model tolerates. (RUN-161 throughput)
-    let dev = scaled.device().clone();
-    let rt = if std::env::var_os("ARC_GPU_ACT_QUANT").is_some() {
-        let ln2 = std::f64::consts::LN_2;
-        let x = scaled.clamp(-448f32, 448f32)?;
-        let ax = x.abs()?.clamp(1e-30f32, 1e30f32)?;
-        let e = ax.log()?.affine(1.0 / ln2, 0.0)?.floor()?.clamp(-6f32, 8f32)?; // floor(log2|x|)
-        let step = e.affine(ln2, -3.0 * ln2)?.exp()?; // 2^(e-3)
-        x.broadcast_div(&step)?.round()?.broadcast_mul(&step)?
-    } else {
-        scaled
-            .to_device(&candle_core::Device::Cpu)?
-            .to_dtype(DType::F8E4M3)?
-            .to_dtype(DType::F32)?
-            .to_device(&dev)?
-    };
-    let q = rt.broadcast_mul(&scale)?;
-    let k_nope_q = q.reshape(orig_dims)?.to_dtype(k.dtype())?;
-    Tensor::cat(&[&k_nope_q, &k_rope], D::Minus1)?.contiguous()
+/// FP8 storage for the cached K, on by default.
+///
+/// Off when `ARC_V4_FP8_KV=0` (on-GPU A/B triage), and off under
+/// `ARC_V4_CAPTURE_PROBE` because the CUDA-graph decode arm writes through
+/// `mistralrs_quant::kvwrite::write_kv_inplace`, which is instantiated for
+/// F16/BF16/F32 only — a U8 code cache needs a U8 variant of that kernel.
+/// Resolved once: `deepseek4` used to scan the environment per timer call and
+/// paid ~390 `getenv`s per forward for it (wave33).
+fn v4_fp8_kv_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let off = std::env::var("ARC_V4_FP8_KV").map(|v| v == "0").unwrap_or(false);
+        !off && std::env::var_os("ARC_V4_CAPTURE_PROBE").is_none()
+    })
 }
 
 /// RUN-161 decode profiler. Enabled by `ARC_TIME_DECODE=1`. Accumulates
@@ -4294,13 +4371,32 @@ mod kv_footprint_tests {
     /// ([`append_kv_mqa`]) on a slot built exactly as
     /// [`NormalCache::new`] builds V4's, and return
     /// `(k_bytes_per_token, v_bytes_per_token)`.
-    fn drive_v4_kv(head_dim: usize, tokens: usize) -> Result<(usize, usize, KvCache)> {
+    ///
+    /// `rope_dim = None` stores dense (the fallback layout); `Some(rd)` runs the
+    /// real quantizer and stores packed, which is what the live path does.
+    fn drive_v4_kv(
+        head_dim: usize,
+        tokens: usize,
+        rope_dim: Option<usize>,
+    ) -> Result<(usize, usize, KvCache)> {
         let dev = Device::Cpu;
         let mut slot = KvCache::new_normal(2, 4096, NormalCache::CACHE_GROW_SIZE);
-        for _ in 0..tokens {
+        for t in 0..tokens {
             // `[B=1, n_kv_heads=1, T=1, head_dim]` — V4's MQA K, one token.
-            let k = Tensor::zeros((1, 1, 1, head_dim), DType::BF16, &dev)?;
-            append_kv_mqa(&mut slot, &k)?;
+            // Non-constant so the quantizer sees real block scales.
+            let row: Vec<f32> = (0..head_dim)
+                .map(|i| ((t + 1) as f32) * 0.017 + 0.25 * (i % 37) as f32)
+                .collect();
+            let k = Tensor::from_vec(row, (1, 1, 1, head_dim), &dev)?.to_dtype(DType::BF16)?;
+            let packed = match rope_dim {
+                Some(rd) => super::super::dsv4_kv_fp8::quantize_k(
+                    &k,
+                    rd,
+                    super::super::dsv4_kv_fp8::KvQuantMode::CpuExact,
+                )?,
+                None => None,
+            };
+            append_kv_mqa(&mut slot, &k, packed.as_ref())?;
         }
         let KvCache::Normal { k, v } = &slot else {
             panic!("V4 slot must be KvCache::Normal");
@@ -4310,66 +4406,95 @@ mod kv_footprint_tests {
     }
 
     /// **The byte count.** V4 Flash geometry: MQA (`num_key_value_heads = 1`),
-    /// `head_dim = 512`, BF16 activations, 43 layers.
+    /// `head_dim = 512`, `qk_rope_head_dim = 64`, BF16 activations, 43 layers.
     ///
-    /// Before wave33 the V half stored a full duplicate of K (`v = k.copy()`,
-    /// then `kv_cache.append(&k, &v)`), so a token cost
-    /// `2 * 1 * 512 * 2 = 2048` B per layer. It now costs
-    /// `1 * 512 * 2` (K) `+ 1 * 1 * 2` (marker) `= 1026` B.
+    /// The ladder this pins, all measured by this one fixture:
+    ///
+    /// | layout | K half | V half | B/token/layer |
+    /// |---|---|---|---|
+    /// | pre-wave33, duplicated V | 512 BF16 | 512 BF16 | 2048 |
+    /// | wave33, V a marker | 512 BF16 | 1 BF16 | 1026 |
+    /// | **wave43, packed** | **448 U8** | **64 + 7 BF16** | **590** |
     ///
     /// Reference: SGLang's DSV4 pool charges **584** B/token/layer
     /// (`research/code/06_foundation/sglang/python/sglang/srt/mem_cache/
     /// deepseek_v4_memory_pool.py:93-111`, whose own assert spells the layout:
     /// `448` nope FP8 + `64*2` rope BF16 + `7` UE8M0 block scales + `1` pad).
-    /// The residual 1026/584 = 1.76x is dtype, not duplication: Arc stores the
-    /// nope dims BF16 where the reference stores them FP8. See
-    /// `act_quant_kv_nope` — Arc already round-trips exactly those dims through
-    /// E4M3 with 64-wide blocks, so that gap is recoverable losslessly.
+    /// The 6-byte residual is deliberate: Arc keeps each block's `amax` at
+    /// activation precision rather than rounding it into a UE8M0 exponent,
+    /// which is what makes the round trip bit-exact against what was stored
+    /// before (`dsv4_kv_fp8::kv_fp8_roundtrip_is_bit_exact_vs_reference`).
     #[test]
     fn v4_kv_bytes_per_token_per_layer() -> Result<()> {
         const HEAD_DIM: usize = 512;
+        const ROPE_DIM: usize = 64;
         const LAYERS: usize = 43;
         const BF16: usize = 2;
+        const NOPE: usize = HEAD_DIM - ROPE_DIM; // 448
+        const N_BLOCKS: usize = NOPE / super::super::dsv4_kv_fp8::KV_QUANT_BLOCK; // 7
 
-        let (k_bytes, v_bytes, slot) = drive_v4_kv(HEAD_DIM, 300)?;
+        let (k_bytes, v_bytes, slot) = drive_v4_kv(HEAD_DIM, 300, Some(ROPE_DIM))?;
 
         // --- Fixture discrimination (DOCTRINE D12) -------------------------
-        // If the marker width equalled `head_dim`, a duplicate-V implementation
-        // and a marker implementation would produce the SAME byte count and
-        // this test could not tell them apart. Assert the fixture separates
-        // them before asserting anything about it.
-        assert_ne!(
-            HEAD_DIM, V4_V_MARKER_WIDTH,
-            "fixture cannot discriminate: a full-V layout and the marker layout \
-             would both measure {HEAD_DIM} elements in the V half"
+        // Three ways this fixture could measure a wrong implementation as
+        // right, each ruled out before anything is asserted about it:
+        //
+        //  1. if the code byte were as wide as the activation, the packed and
+        //     the dense layouts would weigh the same;
+        //  2. if the nope dims were the whole head, the rope tail would cost
+        //     nothing and a layout that wrongly quantized the rope dims too
+        //     would measure identically;
+        //  3. if there were one block per token, per-block scales and one
+        //     global scale would be indistinguishable.
+        assert!(
+            std::mem::size_of::<u8>() < BF16,
+            "fixture cannot discriminate: a code byte the width of an \
+             activation makes the packed and dense layouts weigh the same"
+        );
+        assert!(
+            ROPE_DIM > 0 && NOPE > 0,
+            "fixture cannot discriminate: the rope tail must be non-empty, or \
+             quantizing it too would measure the same"
+        );
+        assert!(
+            N_BLOCKS > 1,
+            "fixture cannot discriminate: {N_BLOCKS} block(s) per token makes \
+             per-block and global scales weigh the same"
         );
 
         assert_eq!(
-            k_bytes,
-            HEAD_DIM * BF16,
-            "K half: 1 KV head * head_dim {HEAD_DIM} * {BF16} B (BF16)"
+            k_bytes, NOPE,
+            "K half: {NOPE} E4M3 codes, one byte each"
         );
         assert_eq!(
             v_bytes,
-            V4_V_MARKER_WIDTH * BF16,
-            "V half must be the {V4_V_MARKER_WIDTH}-wide marker, not a duplicate of K"
+            (ROPE_DIM + N_BLOCKS) * BF16,
+            "V half: {ROPE_DIM} rope dims + {N_BLOCKS} block amax, at activation precision"
         );
 
         let per_token_per_layer = k_bytes + v_bytes;
-        assert_eq!(per_token_per_layer, 1026);
+        assert_eq!(per_token_per_layer, 590);
 
-        // The pre-wave33 layout, computed from the same fixture. Asserting the
-        // gap (rather than only the new number) is what makes a silent revert
-        // to `append(&k, &k.copy())` fail here instead of passing quietly.
+        // The two layouts this replaced, computed from the same geometry.
+        // Asserting the gaps (rather than only the new number) is what makes a
+        // silent revert fail here instead of passing quietly.
         let duplicated_v_layout = 2 * HEAD_DIM * BF16;
+        let marker_layout = HEAD_DIM * BF16 + V4_V_MARKER_WIDTH * BF16;
         assert_eq!(duplicated_v_layout, 2048);
+        assert_eq!(marker_layout, 1026);
         assert!(
-            per_token_per_layer < duplicated_v_layout,
-            "the marker layout must be strictly smaller than the duplicate-V layout"
+            per_token_per_layer < marker_layout,
+            "the packed layout must be strictly smaller than the marker layout"
         );
 
+        // And the dense layout is still exactly what it was — measured, not
+        // assumed, by driving the same fixture with the quantizer switched off.
+        let (dense_k, dense_v, _) = drive_v4_kv(HEAD_DIM, 300, None)?;
+        assert_eq!(dense_k + dense_v, marker_layout);
+
         // Whole-model, all 43 layers.
-        assert_eq!(per_token_per_layer * LAYERS, 44_118);
+        assert_eq!(per_token_per_layer * LAYERS, 25_370);
+        assert_eq!(marker_layout * LAYERS, 44_118);
         assert_eq!(duplicated_v_layout * LAYERS, 88_064);
 
         // The two halves must stay length- and capacity-synchronised: the cache
@@ -4386,10 +4511,82 @@ mod kv_footprint_tests {
         Ok(())
     }
 
-    /// The marker must never be mistaken for a value: `append_kv_mqa` returns
-    /// the cached K, and that tensor is what `dsv4_attention` receives as BOTH
-    /// K and V. Pin that the returned tensor carries K's geometry and K's
-    /// contents — not the marker's.
+    /// The cache must give back what went in. Drives the packed store over many
+    /// tokens and checks every reconstructed row against the reference round
+    /// trip — this is the end-to-end form of the bit-exactness claim, through
+    /// the real `KvCache` rather than the quantizer alone.
+    #[test]
+    fn packed_cache_reconstructs_the_stored_keys() -> Result<()> {
+        const HEAD_DIM: usize = 512;
+        const ROPE_DIM: usize = 64;
+        let dev = Device::Cpu;
+        let mut slot = KvCache::new_normal(2, 4096, NormalCache::CACHE_GROW_SIZE);
+        let mode = super::super::dsv4_kv_fp8::KvQuantMode::CpuExact;
+
+        let mut expected: Vec<u16> = Vec::new();
+        let tokens = 6usize;
+        for t in 0..tokens {
+            let row: Vec<f32> = (0..HEAD_DIM)
+                .map(|i| ((t + 1) as f32) * 0.31 - 0.02 * (i % 53) as f32)
+                .collect();
+            let k = Tensor::from_vec(row, (1, 1, 1, HEAD_DIM), &dev)?.to_dtype(DType::BF16)?;
+            let packed = super::super::dsv4_kv_fp8::quantize_k(&k, ROPE_DIM, mode)?
+                .expect("448 nope dims are 7 whole blocks");
+            // What the pre-packing path would have stored for this token.
+            expected.extend(
+                packed
+                    .dequant(DType::BF16)?
+                    .flatten_all()?
+                    .to_vec1::<half::bf16>()?
+                    .into_iter()
+                    .map(|v| v.to_bits()),
+            );
+            let cached = append_kv_mqa(&mut slot, &k, Some(&packed))?;
+            assert!(matches!(cached, V4CachedK::Packed(_)));
+            assert_eq!(cached.seq_len()?, t + 1);
+        }
+
+        let cached = {
+            let KvCache::Normal { k, v } = &slot else {
+                panic!("V4 slot must be KvCache::Normal")
+            };
+            V4CachedK::Packed(Box::new(V4PackedK {
+                codes: k.current_data()?.expect("codes materialised"),
+                side: v.current_data()?.expect("side materialised"),
+                rope_dim: ROPE_DIM,
+            }))
+        };
+        let rebuilt = cached.span(0, tokens, DType::BF16)?;
+        assert_eq!(rebuilt.dims(), &[1, 1, tokens, HEAD_DIM]);
+        let got: Vec<u16> = rebuilt
+            .flatten_all()?
+            .to_vec1::<half::bf16>()?
+            .into_iter()
+            .map(|v| v.to_bits())
+            .collect();
+        assert_eq!(
+            got, expected,
+            "the packed cache must read back bit-identically to the BF16 tensor \
+             the pre-packing path stored"
+        );
+
+        // And the span the decode path actually asks for is a suffix of it.
+        let (base, keep) = super::super::dsv4_attention::raw_keep_span(1, 3, tokens);
+        assert_eq!((base, keep), (3, 3));
+        let span = cached.span(base, keep, DType::BF16)?;
+        let span_bits: Vec<u16> = span
+            .flatten_all()?
+            .to_vec1::<half::bf16>()?
+            .into_iter()
+            .map(|v| v.to_bits())
+            .collect();
+        assert_eq!(span_bits, expected[base * HEAD_DIM..]);
+        Ok(())
+    }
+
+    /// With FP8 storage declined (no whole 64-wide nope blocks), the dense
+    /// fallback must still return K, not the marker: that tensor is what
+    /// `dsv4_attention` receives as BOTH K and V.
     #[test]
     fn append_kv_mqa_returns_k_for_both_sides() -> Result<()> {
         let dev = Device::Cpu;
@@ -4403,15 +4600,21 @@ mod kv_footprint_tests {
                 .collect();
             expected.extend(row.iter().copied());
             let k = Tensor::from_vec(row, (1, 1, 1, head_dim), &dev)?;
-            let cached = append_kv_mqa(&mut slot, &k)?;
-            assert_eq!(cached.dims(), &[1, 1, (t + 1) as usize, head_dim]);
+            let cached = append_kv_mqa(&mut slot, &k, None)?;
+            assert!(matches!(cached, V4CachedK::Dense(_)));
+            let materialised = cached.span(0, cached.seq_len()?, DType::F32)?;
+            assert_eq!(materialised.dims(), &[1, 1, (t + 1) as usize, head_dim]);
         }
 
         let cached = append_kv_mqa(
             &mut slot,
             &Tensor::zeros((1, 1, 1, head_dim), DType::F32, &dev)?,
+            None,
         )?;
-        let got: Vec<f32> = cached.narrow(2, 0, 5)?.flatten_all()?.to_vec1()?;
+        let got: Vec<f32> = cached
+            .span(0, 5, DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
         assert_eq!(
             got, expected,
             "the cached K read back must be K, not the marker"
@@ -4438,7 +4641,7 @@ mod kv_footprint_tests {
         let dev = Device::Cpu;
         let mut rotating = KvCache::new_rotating(2, 16, NormalCache::CACHE_GROW_SIZE);
         let k = Tensor::zeros((1, 1, 1, 8), DType::F32, &dev)?;
-        let err = append_kv_mqa(&mut rotating, &k).unwrap_err();
+        let err = append_kv_mqa(&mut rotating, &k, None).unwrap_err();
         assert!(
             err.to_string().contains("Rotating"),
             "expected a loud slot-type error, got: {err}"
@@ -5464,6 +5667,7 @@ mod tests {
         let cfg = Dsv4AttentionConfig {
             compress_ratio: CompressRatio::Csa,
             sliding_window: 4,
+            raw_prefix: 0,
         };
 
         // Compressed KV (precomputed by `Attention::compressed_kv` in the real
@@ -5590,6 +5794,7 @@ mod tests {
         let cfg = Dsv4AttentionConfig {
             compress_ratio: CompressRatio::Standard,
             sliding_window: 1024,
+            raw_prefix: 0,
         };
 
         // Correct: sequence 0 attends over its own 3 keys.
@@ -5732,6 +5937,7 @@ mod tests {
         let cfg = Dsv4AttentionConfig {
             compress_ratio: CompressRatio::Hca,
             sliding_window: 8,
+            raw_prefix: 0,
         };
 
         // Compressed KV: T_c = t_k / ratio = 1 entry, shape [B, 1, T_c, D].
@@ -5817,6 +6023,7 @@ mod tests {
         let cfg = Dsv4AttentionConfig {
             compress_ratio: CompressRatio::Standard,
             sliding_window: 4,
+            raw_prefix: 0,
         };
 
         // Standard layers must bypass the compressed branch entirely: even if

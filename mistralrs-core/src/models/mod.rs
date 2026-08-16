@@ -30,4 +30,5 @@ pub(crate) mod starcoder2;
 pub(crate) mod deepseek4;
 pub(crate) mod dsv4_attention;
 pub(crate) mod dsv4_indexer;
+pub(crate) mod dsv4_kv_fp8;
 pub(crate) mod dsv4_mhc;
