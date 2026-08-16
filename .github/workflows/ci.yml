@@ -85,7 +85,7 @@ jobs:
       - uses: actions-rs/cargo@v1
         with:
           command: fmt
-          args: -p arc-bench -p arc-engine -p arc-cuda-graph -p arc-cli -- --check
+          args: -p arc-bench -p arc-engine -p arc-cuda-graph -p arc-cli -p arc-profiler -- --check
 
   clippy:
     name: Clippy
@@ -107,7 +107,7 @@ jobs:
       - uses: actions-rs/cargo@v1
         with:
           command: clippy
-          args: --no-deps -p arc-bench -p arc-engine -p arc-cuda-graph -p arc-cli -p mistralrs-quant --tests --examples -- -D warnings
+          args: --no-deps -p arc-bench -p arc-engine -p arc-cuda-graph -p arc-cli -p arc-profiler -p mistralrs-quant --tests --examples -- -D warnings
 
   docs:
     name: Docs

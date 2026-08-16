@@ -407,9 +407,13 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
             first_mismatched_cache_len(seqs, modify_draft_cache)
         );
 
+        let _prof = arc_profiler::span("clone_in_cache");
         let mut new_k_cache = Vec::new();
         let mut new_v_cache = Vec::new();
 
+        // `num_hidden_layers` here is the *cache vector* length, not 43: V4
+        // appends one `XsRolling` compressor-history slot per CSA/HCA layer
+        // after the KV entries, so this loop runs 43 + n_compressed times.
         for layer in 0..pipeline.get_metadata().num_hidden_layers {
             // Preallocate combined k and v caches across all sequences, avoiding Tensor::cat copies
             let batch_len = seqs.len();
@@ -460,9 +464,17 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
             let mut dims_v = first_v.dims().to_vec();
             dims_k[0] *= batch_len;
             dims_v[0] *= batch_len;
-            let batch_k = Tensor::zeros(dims_k.clone(), first_k.dtype(), first_k.device()).unwrap();
-            let batch_v = Tensor::zeros(dims_v.clone(), first_v.dtype(), first_v.device()).unwrap();
-            // Fill each sequence's cache slice
+            let (batch_k, batch_v) = {
+                // Two fresh device allocations per layer, every step.
+                let _s = arc_profiler::device_span("clone_in.alloc");
+                (
+                    Tensor::zeros(dims_k.clone(), first_k.dtype(), first_k.device()).unwrap(),
+                    Tensor::zeros(dims_v.clone(), first_v.dtype(), first_v.device()).unwrap(),
+                )
+            };
+            // Fill each sequence's cache slice: two device copies per sequence
+            // per layer, i.e. O(B x layers) copies per token.
+            let _prof_fill = arc_profiler::device_span("clone_in.slice_set");
             for (i, seq) in seqs.iter_mut().enumerate() {
                 let src_cache = if modify_draft_cache {
                     seq.normal_draft_cache()
@@ -498,6 +510,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 batch_k.slice_set(&src_k, 0, offset).unwrap();
                 batch_v.slice_set(&src_v, 0, offset).unwrap();
             }
+            drop(_prof_fill);
             new_k_cache.push(Some(batch_k));
             new_v_cache.push(Some(batch_v));
         }
@@ -603,6 +616,11 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
         *pipeline.cache().normal() = NormalCache(caches);
     }
     fn clone_out_cache(&self, pipeline: &T, seqs: &mut [&mut Sequence], modify_draft_cache: bool) {
+        // Runs on EVERY decode step: `post_op` is `CacheInstruction::Out`
+        // unconditionally (`engine/mod.rs:397-404`), so the batched cache is
+        // split back into B per-sequence caches once per token, per layer,
+        // including the compressor-history slots.
+        let _prof = arc_profiler::span("clone_out_cache");
         let all_cache = pipeline.cache().normal();
         for layer in 0..pipeline.get_metadata().num_hidden_layers {
             let cache = all_cache.0.get(layer).unwrap();
@@ -633,11 +651,16 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 ),
             };
 
-            let k_caches = k_cache.chunk(seqs.len(), 0).unwrap();
-            debug_assert_eq!(k_caches.len(), seqs.len());
-            let v_caches = v_cache.chunk(seqs.len(), 0).unwrap();
-            debug_assert_eq!(v_caches.len(), seqs.len());
+            let (k_caches, v_caches) = {
+                let _s = arc_profiler::device_span("clone_out.chunk");
+                let k_caches = k_cache.chunk(seqs.len(), 0).unwrap();
+                debug_assert_eq!(k_caches.len(), seqs.len());
+                let v_caches = v_cache.chunk(seqs.len(), 0).unwrap();
+                debug_assert_eq!(v_caches.len(), seqs.len());
+                (k_caches, v_caches)
+            };
 
+            let _prof_rebuild = arc_profiler::span("clone_out.rebuild_per_seq");
             for (seq_i, seq) in seqs.iter_mut().enumerate() {
                 let output_cache = if modify_draft_cache {
                     seq.normal_draft_cache()
