@@ -269,7 +269,7 @@ fn compose_caller_mask(
 /// So the span is the trailing `t_q + window - 1` keys, clamped to the cache.
 /// Every key before `base` is `-inf` on **every** row, which is why dropping
 /// them is an identity rather than an approximation.
-fn raw_keep_span(t_q: usize, window: usize, t_k_full: usize) -> (usize, usize) {
+pub(crate) fn raw_keep_span(t_q: usize, window: usize, t_k_full: usize) -> (usize, usize) {
     let keep = (t_q + window - 1).min(t_k_full);
     (t_k_full - keep, keep)
 }
@@ -281,6 +281,25 @@ pub struct Dsv4AttentionConfig {
     pub compress_ratio: CompressRatio,
     /// Sliding-window size for the always-on local branch (V4 default 128).
     pub sliding_window: usize,
+    /// How many raw keys the caller has already dropped from the front of `k`
+    /// / `v`, i.e. the absolute position of `k[.., 0, ..]`.
+    ///
+    /// `0` (the default everywhere except the packed-KV decode path) means `k`
+    /// is the whole cached sequence and the absolute query position is inferred
+    /// from its length, which is what this module did unconditionally before.
+    ///
+    /// It exists because the absolute position is the *only* thing this module
+    /// needs the dropped prefix for: query row `r` sits at `q0 + r` with
+    /// `q0 = raw_prefix + k.dim(2) - t_q`. Passing it lets the caller hand over
+    /// just the reachable span — which is what makes the FP8 KV dequant
+    /// `O(window)` per decode step instead of `O(context)` (see
+    /// [`crate::models::dsv4_kv_fp8`]) — without corrupting the sliding-window
+    /// mask or the compressed-block causality threshold.
+    ///
+    /// The caller may only drop keys this module would have masked out anyway:
+    /// `raw_prefix` above [`raw_keep_span`]'s base is a hard error, not a
+    /// silent truncation.
+    pub raw_prefix: usize,
 }
 
 /// V4 hybrid attention dispatch — a single softmax over the union of the raw
@@ -315,15 +334,25 @@ pub fn dsv4_attention(
     };
 
     let (_b, _h, t_q, _d) = q.dims4()?;
-    let t_k_full = k.dim(2)?;
+    let t_k_given = k.dim(2)?;
+    // `k` spans absolute positions `[raw_prefix, t_k_full)`; `raw_prefix == 0`
+    // (every path but packed-KV decode) makes this the cache length, exactly as
+    // before.
+    let t_k_full = cfg.raw_prefix + t_k_given;
     let window = cfg.sliding_window.max(1);
     let dev = q.device();
 
-    // Absolute positions. `k` is the full cached sequence over `[0, t_k_full)`;
-    // the current query block is its last `t_q` tokens, so query row `r` is at
-    // position `q0 + r` with `q0 = t_k_full - t_q` (holds for prefill
-    // `t_q == t_k_full` and decode `t_q == 1`).
-    let q0 = t_k_full - t_q;
+    // Absolute positions. The current query block is the last `t_q` tokens of
+    // the sequence, so query row `r` is at position `q0 + r` with
+    // `q0 = t_k_full - t_q` (holds for prefill `t_q == t_k_full` and decode
+    // `t_q == 1`).
+    let q0 = t_k_full
+        .checked_sub(t_q)
+        .ok_or_else(|| candle_core::Error::Msg(format!(
+            "dsv4_attention: {t_q} query rows against only {t_k_full} keys \
+             (raw_prefix {} + {t_k_given} given)",
+            cfg.raw_prefix
+        )))?;
 
     // ---- Raw working-set narrowing ----------------------------------------
     // Only the trailing `t_q + window - 1` raw keys are reachable by ANY query
@@ -340,19 +369,29 @@ pub fn dsv4_attention(
     // from 2048 raw columns to `window` = 128. Prefill (`t_q == t_k_full`) is
     // untouched — there the reachable union is the whole cache.
     //
-    // NOTE (wave33): this is the *read* side. The cache itself is still grown
-    // to the full sequence (`kv_cache::NormalCache`), because `q0` above is
-    // derived from `t_k_full`. Capping the stored raw KV at `window` — what
-    // SGLang's DSV4 pool does, charging raw KV at `swa_full_tokens_ratio`
-    // (`model_executor/pool_configurator.py:397`) — requires threading the true
-    // absolute position in rather than inferring it from the cache length.
+    // NOTE (wave33/wave43): this is the *read* side, and `cfg.raw_prefix` is
+    // how a caller opts into doing part of it itself — the packed-KV decode
+    // path narrows before it reconstructs, so it only ever dequantizes the span
+    // computed here. The cache itself is still grown to the full sequence
+    // (`kv_cache::NormalCache`); capping the *store* at `window` — what SGLang's
+    // DSV4 pool does, charging raw KV at `swa_full_tokens_ratio`
+    // (`model_executor/pool_configurator.py:397`) — is now unblocked by
+    // `raw_prefix` but is a separate change.
     let (raw_base, keep) = raw_keep_span(t_q, window, t_k_full);
-    let (k_owned, v_owned) = if keep == t_k_full {
+    let rel_base = raw_base.checked_sub(cfg.raw_prefix).ok_or_else(|| {
+        candle_core::Error::Msg(format!(
+            "dsv4_attention: caller dropped {} raw keys but rows in this block \
+             reach back to absolute key {raw_base}; the dropped keys are NOT \
+             unreachable and the window mask would be wrong",
+            cfg.raw_prefix
+        ))
+    })?;
+    let (k_owned, v_owned) = if rel_base == 0 && keep == t_k_given {
         (None, None)
     } else {
         (
-            Some(k.narrow(2, raw_base, keep)?.contiguous()?),
-            Some(v.narrow(2, raw_base, keep)?.contiguous()?),
+            Some(k.narrow(2, rel_base, keep)?.contiguous()?),
+            Some(v.narrow(2, rel_base, keep)?.contiguous()?),
         )
     };
     let k = k_owned.as_ref().unwrap_or(k);
@@ -622,6 +661,7 @@ mod tests {
         let cfg = Dsv4AttentionConfig {
             compress_ratio: CompressRatio::Standard,
             sliding_window: window,
+            raw_prefix: 0,
         };
         let actual = dsv4_attention(&q, &k, &v, None, None, &flash, &sdpa, cfg)?;
 
@@ -667,6 +707,7 @@ mod tests {
         let cfg = Dsv4AttentionConfig {
             compress_ratio: CompressRatio::Standard,
             sliding_window: t,
+            raw_prefix: 0,
         };
         let actual = dsv4_attention(&q, &k, &v, None, None, &flash, &sdpa, cfg)?;
 
@@ -721,6 +762,7 @@ mod tests {
             let cfg = Dsv4AttentionConfig {
                 compress_ratio: CompressRatio::Standard,
                 sliding_window: window,
+                raw_prefix: 0,
             };
             let actual = dsv4_attention(&q, &k, &v, None, None, &flash, &sdpa, cfg)?;
 
@@ -756,6 +798,132 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// `raw_prefix` must be a pure accounting change: handing over only the
+    /// reachable span, and saying how much was dropped, must produce the
+    /// bit-identical output of handing over the whole cache.
+    ///
+    /// This is the contract the FP8 KV decode path rests on — it narrows the
+    /// packed cache *before* reconstructing it, so if `raw_prefix` shifted the
+    /// window mask or the compressed-block causality threshold by even one
+    /// position, decode would silently attend the wrong keys.
+    #[test]
+    fn raw_prefix_is_equivalent_to_passing_the_whole_cache() -> Result<()> {
+        let device = Device::Cpu;
+        let (b, h, d) = (1, 2, 8);
+        let window = 6usize;
+        let scale = 1.0 / (d as f32).sqrt();
+        let sinks = Tensor::from_vec(vec![0.5f32, 0.75], (1, h, 1, 1), &device)?;
+        let sdpa = SdpaParams {
+            n_kv_groups: h,
+            softcap: None,
+            softmax_scale: scale,
+            sliding_window: None,
+            sinks: Some(sinks),
+        };
+        let flash = empty_flash_params();
+
+        let mut narrowed_at_least_once = false;
+        for (ratio, t_k, t_q) in [
+            (CompressRatio::Standard, 20usize, 1usize),
+            (CompressRatio::Csa, 20, 1),
+            (CompressRatio::Csa, 20, 3),
+            (CompressRatio::Hca, 40, 1),
+        ] {
+            let q = mk(b, h, t_q, d, 0.03, &device)?;
+            let k = mk(b, 1, t_k, d, 0.11, &device)?;
+            let comp = mk(b, 1, (t_k / ratio.ratio()).max(1), d, 0.05, &device)?;
+            let compressed = (ratio != CompressRatio::Standard).then_some(&comp);
+
+            let whole = dsv4_attention(
+                &q,
+                &k,
+                &k,
+                compressed,
+                None,
+                &flash,
+                &sdpa,
+                Dsv4AttentionConfig {
+                    compress_ratio: ratio,
+                    sliding_window: window,
+                    raw_prefix: 0,
+                },
+            )?;
+
+            let (base, keep) = raw_keep_span(t_q, window, t_k);
+            if base > 0 {
+                narrowed_at_least_once = true;
+            }
+            let k_span = k.narrow(2, base, keep)?.contiguous()?;
+            let spanned = dsv4_attention(
+                &q,
+                &k_span,
+                &k_span,
+                compressed,
+                None,
+                &flash,
+                &sdpa,
+                Dsv4AttentionConfig {
+                    compress_ratio: ratio,
+                    sliding_window: window,
+                    raw_prefix: base,
+                },
+            )?;
+
+            let a: Vec<f32> = whole.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+            let c: Vec<f32> = spanned.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+            assert_eq!(
+                a, c,
+                "{ratio:?} t_k={t_k} t_q={t_q}: raw_prefix={base} changed the output"
+            );
+        }
+        // Without this the sweep could pass while every case had `base == 0`,
+        // i.e. while `raw_prefix` was never actually exercised.
+        assert!(
+            narrowed_at_least_once,
+            "fixture cannot discriminate: no case actually dropped a prefix"
+        );
+        Ok(())
+    }
+
+    /// Dropping keys a query row can still reach is a caller bug, and must be
+    /// refused rather than silently answered with a truncated window.
+    #[test]
+    fn raw_prefix_past_the_reachable_span_is_refused() -> Result<()> {
+        let device = Device::Cpu;
+        let (b, h, d) = (1, 2, 8);
+        let q = mk(b, h, 1, d, 0.03, &device)?;
+        let k = mk(b, 1, 4, d, 0.11, &device)?;
+        let sdpa = SdpaParams {
+            n_kv_groups: h,
+            softcap: None,
+            softmax_scale: 1.0 / (d as f32).sqrt(),
+            sliding_window: None,
+            sinks: None,
+        };
+        // window 16 > 4 cached keys, so row 0 reaches key 0: nothing is
+        // droppable, yet the caller claims to have dropped 4.
+        let err = dsv4_attention(
+            &q,
+            &k,
+            &k,
+            None,
+            None,
+            &empty_flash_params(),
+            &sdpa,
+            Dsv4AttentionConfig {
+                compress_ratio: CompressRatio::Standard,
+                sliding_window: 16,
+                raw_prefix: 4,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("are NOT"),
+            "expected a loud unreachable-prefix error, got: {err}"
+        );
         Ok(())
     }
 
@@ -797,6 +965,7 @@ mod tests {
             let cfg = Dsv4AttentionConfig {
                 compress_ratio: CompressRatio::Csa,
                 sliding_window: window,
+                raw_prefix: 0,
             };
             let out = dsv4_attention(&q, &k, &v, Some(&comp), None, &flash, &sdpa, cfg)?;
             let out_v: Vec<f32> = out.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
@@ -919,6 +1088,7 @@ mod tests {
         let cfg = Dsv4AttentionConfig {
             compress_ratio: CompressRatio::Csa,
             sliding_window: t, // window covers everything → windowed == causal
+            raw_prefix: 0,
         };
         let actual = dsv4_attention(&q, &k, &v, None, None, &flash, &sdpa, cfg)?;
 
@@ -947,6 +1117,7 @@ mod tests {
         let cfg = Dsv4AttentionConfig {
             compress_ratio: CompressRatio::Csa,
             sliding_window: 4,
+            raw_prefix: 0,
         };
         let out = dsv4_attention(&q, &k, &v, Some(&comp), None, &flash, &sdpa, cfg)?;
         assert_eq!(out.dims(), &[b, h, t_q, d]);
@@ -1042,6 +1213,7 @@ mod tests {
         let cfg = Dsv4AttentionConfig {
             compress_ratio: CompressRatio::Hca,
             sliding_window: 128,
+            raw_prefix: 0,
         };
         let out = dsv4_attention(&q, &k, &v, Some(&comp), None, &flash, &sdpa, cfg)?;
         assert_eq!(out.dims(), &[b, h, t_q, d]);
@@ -1084,6 +1256,7 @@ mod tests {
         let cfg = Dsv4AttentionConfig {
             compress_ratio: CompressRatio::Csa,
             sliding_window: window,
+            raw_prefix: 0,
         };
 
         // The engine pads every sequence to the batch max and reports PADDED
@@ -1158,6 +1331,7 @@ mod tests {
         let cfg = Dsv4AttentionConfig {
             compress_ratio: CompressRatio::Csa,
             sliding_window: window, // window >= t, so ONLY causality is on trial
+            raw_prefix: 0,
         };
         let padded = vec![t as u32; b];
         let flash = varlen_flash_params(&padded, &padded, &device);
@@ -1245,6 +1419,7 @@ mod tests {
         let cfg = Dsv4AttentionConfig {
             compress_ratio: CompressRatio::Csa,
             sliding_window: window,
+            raw_prefix: 0,
         };
         let padded = vec![t as u32; b];
         let flash = varlen_flash_params(&padded, &padded, &device);
@@ -1322,6 +1497,7 @@ mod tests {
             // see is ALSO covered by a visible compressed block: maximum
             // overlap, which is what makes the double counting observable.
             sliding_window: t,
+            raw_prefix: 0,
         };
         // Rank-4 causal mask (what `CausalMasker` hands the layer), raw width.
         let caller = left_padded_causal_mask(&[0], t, &device)?;
@@ -1481,6 +1657,7 @@ mod tests {
         let cfg = Dsv4AttentionConfig {
             compress_ratio: CompressRatio::Standard,
             sliding_window: window,
+            raw_prefix: 0,
         };
 
         let (base, keep) = raw_keep_span(1, window, t_k);
@@ -1524,6 +1701,7 @@ mod tests {
         let cfg = Dsv4AttentionConfig {
             compress_ratio: CompressRatio::Standard,
             sliding_window: 4,
+            raw_prefix: 0,
         };
         let bad = Tensor::zeros((1, 1, t, t + 3), DType::F32, &device)?;
         let err = dsv4_attention(&q, &k, &v, None, Some(&bad), &flash, &sdpa, cfg).unwrap_err();
