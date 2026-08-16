@@ -20,8 +20,9 @@ CUDA kernel is pinned to bit-for-bit by `cuda_beam_2b_matches_cpu_beam_bit_for_b
 """
 import subprocess
 import sys
+from pathlib import Path
 
-P = 'mistralrs-quant/src/qtip/bitshift.rs'
+P = Path('mistralrs-quant/src/qtip/bitshift.rs')
 
 MUTATIONS = [
     (
@@ -139,30 +140,30 @@ MUTATIONS = [
 def run(test):
     r = subprocess.run(
         ['cargo', 'test', '-p', 'mistralrs-quant', '--lib', '--', test],
-        capture_output=True, text=True)
+        capture_output=True, text=True, check=False)
     return r.returncode == 0
 
 
 def main():
-    src0 = open(P).read()
+    src0 = P.read_text()
     ok = True
     try:
         for name, old, new, test in MUTATIONS:
-            s = open(P).read()
+            s = P.read_text()
             if old not in s:
                 print(f'SKIP  (anchor not found) :: {name}')
                 ok = False
                 continue
-            open(P, 'w').write(s.replace(old, new, 1))
+            P.write_text(s.replace(old, new, 1))
             survived = run(test)
-            open(P, 'w').write(src0)
+            P.write_text(src0)
             if survived:
                 print(f'SURVIVED  {test} still passes :: {name}')
                 ok = False
             else:
                 print(f'killed by {test:52s} :: {name}')
     finally:
-        open(P, 'w').write(src0)
+        P.write_text(src0)
     print('ALL MUTATIONS KILLED' if ok else 'SOME MUTATIONS SURVIVED')
     return 0 if ok else 1
 
