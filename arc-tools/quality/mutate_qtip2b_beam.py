@@ -99,6 +99,27 @@ MUTATIONS = [
         'beam_2b_stamps_its_width_into_the_artifact',
     ),
     (
+        'width plumbing (3-D): the expert chunks are quantized exhaustively '
+        'while the assembled stack still claims the beam',
+        '''            let layer = Self::quantize_with_options_concrete_search(
+                &rows_2d,
+                None,
+                &quant_device,
+                mode,
+                use_rotation,
+                search,
+            )?;''',
+        '''            let layer = Self::quantize_with_options_concrete_search(
+                &rows_2d,
+                None,
+                &quant_device,
+                mode,
+                use_rotation,
+                TrellisSearch::Exhaustive,
+            )?;''',
+        'beam_2b_stamps_its_width_on_a_3d_expert_stack',
+    ),
+    (
         'stamp: a beam bake records itself as exhaustive',
         '''            search_detail: QtipSearchDetail::for_bake(mode, search, false),
         })

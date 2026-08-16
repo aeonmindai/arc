@@ -4025,6 +4025,68 @@ mod tests {
         Ok(())
     }
 
+    /// The **3-D expert-stack** path, which is the one a V4 bake actually
+    /// takes — all 11.75 h of the wave41-BS projection is MoE expert stacks.
+    ///
+    /// The stack is quantized in chunks of experts; every chunk must be handed
+    /// the SAME search, so a stack can never come out half beam and half
+    /// exhaustive, and the stamp on the assembled layer must be the width that
+    /// ran on all of them.
+    #[test]
+    fn beam_2b_stamps_its_width_on_a_3d_expert_stack() -> Result<()> {
+        let device = Device::Cpu;
+        let (e, n, k) = (3usize, 4usize, 128usize);
+        let w3 = Tensor::from_vec(gaussian_fixture(e * n * k, 0xBEB2, 0.4), (e, n, k), &device)?;
+
+        let exhaustive = Qtip2bLayer::quantize_with_options_3d_search(
+            &w3,
+            &device,
+            QtipMode::Viterbi,
+            true,
+            TrellisSearch::Exhaustive,
+        )?;
+        let ex_w: Vec<f32> = exhaustive
+            .dequantize_w()?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
+
+        let beam = Qtip2bLayer::quantize_with_options_3d_search(
+            &w3,
+            &device,
+            QtipMode::Viterbi,
+            true,
+            TrellisSearch::Beam { width: 64 },
+        )?;
+        let bm_w: Vec<f32> = beam
+            .dequantize_w()?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
+        assert_ne!(
+            ex_w.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            bm_w.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "the 3-D beam path produced the exhaustive artifact — the search \
+             never reached the per-expert chunks"
+        );
+
+        // `quantize_with_options_3d_search` hands back a `dyn QuantMethod`, so
+        // read the stamp off the wire, which is what a loader would see anyway.
+        let payload = beam.serialize()?;
+        let (back, _) =
+            Qtip2bLayer::deserialize_concrete(payload, &device, QuantizeOntoGuard::new())?;
+        assert_eq!(back.num_experts, Some(e));
+        assert_eq!(
+            back.search_detail(),
+            QtipSearchDetail::Known {
+                beam_width: Some(64),
+                hessian: false,
+            },
+            "a 3-D expert-stack beam bake did not record the width it ran"
+        );
+        Ok(())
+    }
+
     /// D4b: the GPU dispatch may TRANSLATE a search ("a beam at least as wide
     /// as the state space prunes nothing, so run the exhaustive kernel") but it
     /// may never SUBSTITUTE one. A width `qtip2b_beam.cu` cannot run is an
