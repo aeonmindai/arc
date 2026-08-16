@@ -91,8 +91,28 @@ impl PrefixCacheManagerV2 {
         if !self.has_paged_attention {
             let cache = seq.normal_cache().to_vec();
 
+            // Key the entry by the token prefix the cache ACTUALLY covers.
+            //
+            // `search_for_matching_cache` calls `set_len(match_len)` on the
+            // stored layers, and `SingleCache::try_set_len` only checks
+            // capacity, not validity — so a key longer than the cache is an
+            // over-claim that hands out uninitialised K/V. Plain decode is safe
+            // by an accident of two facts that happen to cancel: `cache_len ==
+            // len - 1`, and a full-length match is rejected by the
+            // `new_toks.is_empty()` guard, which caps `match_len` at `len - 1`.
+            //
+            // Batched MTP breaks the accident: a sequence can finish carrying
+            // an uncached committed tail of up to `depth + 1` tokens
+            // (`mtp_pipeline.rs`, the window invariant), so `match_len` could
+            // reach `len - 1` while the cache stops at `len - u`. Capping the
+            // key at `cache_len + 1` restores the guard's arithmetic exactly,
+            // and is a no-op whenever `u == 1`.
+            let cache_len = seq.cache_bucket_len();
+            let toks = seq.get_toks();
+            let key_len = toks.len().min(cache_len + 1);
+
             self.caches.insert(
-                seq.get_toks().to_vec().into(),
+                toks[..key_len].to_vec().into(),
                 CacheElement {
                     cache,
                     recurrent_snapshots,
@@ -320,6 +340,16 @@ impl PrefixCacheManagerV2 {
             };
             for layer in cache.cache.iter_mut().flatten() {
                 if layer.try_set_len(match_len).is_err() {
+                    return Ok(None);
+                }
+                // `try_set_len` checks CAPACITY, not validity — it will happily
+                // extend a length into slots that were never written. Declining
+                // a match longer than the cache actually holds is the belt to
+                // `add_sequence`'s braces (it caps the key at the covered
+                // prefix); either alone is sufficient, and serving
+                // uninitialised K/V is a wrong answer nothing downstream
+                // catches.
+                if match_len > layer.current_seq_len() {
                     return Ok(None);
                 }
             }

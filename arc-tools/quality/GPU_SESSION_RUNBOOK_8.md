@@ -369,10 +369,14 @@ two more conditions `bench` already satisfies but a *serve*-based run would not:
   (`mtp_pipeline.rs`, `take_fast_path`). With PagedAttention on, `--mtp-depth 2`
   loads the block, logs *"MTP speculative decode engaged"*, and then defers to
   the target on **every** step. Engagement is not measurement.
-* **B must be 1.** The fast path also requires `input_seqs.len() == 1`; batched
-  decode falls back wholesale. `bench` forces this (`with_max_seqs(1)`), so
-  acceptance is a **B=1** measurement today — it does **not** yet lift the
-  B=128 row of S3, and must not be reported as if it did.
+* ~~B must be 1.~~ **No longer true (wave45-BW).** The fast path runs at every
+  batch size: each sequence feeds a fixed `depth + 1` window of its uncached
+  committed tail plus its own drafts, verification is ragged per sequence, and
+  the shared cache rolls back to the one length every sequence can prove.
+  `bench` still forces `with_max_seqs(1)`, so a **`bench` run is a B=1
+  diagnostic row only** (DOCTRINE D2) — to measure acceptance at batch use the
+  serve + `batch_load_probe.py` recipe in **§S3c** below and read the
+  `MTP[b=<B>]` lines out of the serve log.
 * **Prefix caching must be off.** The draft KV primes from the prompt forward's
   hidden states; a prefix-cache hit skips that forward and the sequence then
   declines to draft (logged once as *"the prompt forward's hidden states do not
@@ -386,6 +390,46 @@ two more conditions `bench` already satisfies but a *serve*-based run would not:
 > **ABORT-IF** `drafted_steps=0` with `steps>0`: the block loaded and the fast
 > path ran, but the draft KV never primed. That is a bug, not a rate; harvest
 > `mtp_acceptance.log` and report it as a defect.
+
+### S3c — MTP acceptance **at batch** (~8 min, inside the S2 serve)
+
+`bench` pins `--max-seqs 1`, so it can only ever produce the B=1 row. The
+batched numbers come from the same serve process the S3 sweep uses, with MTP
+turned on and paged attention off:
+
+```bash
+ARC_MTP_LOG_ACCEPTANCE=1 /root/arc/target/release/mistralrs serve -p 1234 \
+  -m /workspace/src -a deepseekv4 \
+  --from-uqff /workspace/uqff/qtip2-0.uqff \
+  --chat-template chat_templates/deepseek_v4.json \
+  --mtp-depth 3 --paged-attn off --prefix-cache-n 0 \
+  --max-seqs 256 --max-seq-len 4096 --max-batch-size 128 \
+  2>&1 | tee /root/logs/mtp_batch.log &
+
+python3 batch_load_probe.py --batches 1,8,16,32,64,128 --reps 3 \
+  --max-tokens 128 --label mtp_depth3
+
+grep 'MTP\[' /root/logs/mtp_batch.log | tail -40
+```
+
+Read **three** numbers per line, and read them per batch size:
+
+```
+MTP[b=128] accept_rate=… accepted=… proposed=… steps=… drafted_steps=… \
+           committed=… tok_per_step=… batch_steps=… mean_batch=… tok_per_batch_step=…
+```
+
+* `accept_rate` — draft-head quality. Reference floor for DeepSeek V4 MTP is
+  **2.30 accepted-tokens-per-verify** in SGLang's own non-simulated CI
+  (`test/manual/dsv4/test_dsv4_pro_mtp.py:261`); their simulated runs quote 2.96.
+* `tok_per_step` — the **per-user** multiplier. This is the one that multiplies
+  the per-user ceiling in `CEILINGS.json` (83 tok/s at B=64, 68 at B=128).
+* `tok_per_batch_step` — the **aggregate** multiplier, tokens out per forward.
+
+🔴 **`mean_batch` must be close to the probe's `effective_B`.** If it collapses
+toward 1 while the probe reports a large batch, the cohort fragmented and the
+scheduler is running one bucket at a time — check that `Sequence::cache_bucket_len`
+is what `bucket_and_waitlist_seqs_waiting` keys on.
 
 ### S4 — Sustained-mode confirmation (10 min)
 

@@ -74,7 +74,7 @@ use candle_nn::{Embedding, Module};
 use rand_isaac::Isaac64Rng;
 use tokenizers::Tokenizer;
 
-use crate::kv_cache::KvCache;
+use crate::kv_cache::{KvCache, SingleCache};
 
 use crate::device_map::DeviceMapper;
 use crate::pipeline::sampling::{finish_or_add_toks_to_seq, sample_sequence};
@@ -537,6 +537,171 @@ impl MtpDecodeKit {
         }
         Ok(tokens)
     }
+
+    /// [`Self::propose_chain`] for a whole group of sequences at once.
+    ///
+    /// Every sequence in the group is at the **same** absolute position
+    /// `start_pos`, so one `[G, 1, hidden]` MTP-block forward per chain step
+    /// drafts for all of them: `G` chains cost the same block reads as one.
+    /// That is the whole reason the batched fast path groups by uncached-tail
+    /// length before drafting — see [`MtpSpeculativePipeline::step`].
+    ///
+    /// * `seed_hidden` — `[G, hidden]`, the target's hidden state at
+    ///   `start_pos` for each sequence.
+    /// * `last_tokens` — `[G]`, `tok_{start_pos+1}` for each sequence.
+    /// * `cache` — ONE batched draft KV holding `start_pos` entries for all
+    ///   `G` rows (built by [`batch_draft_caches`]).
+    ///
+    /// Returns `G` chains of exactly `n` tokens each.
+    fn propose_chain_batched(
+        &self,
+        seed_hidden: &Tensor,
+        last_tokens: &[u32],
+        n: usize,
+        start_pos: usize,
+        mut cache: Option<&mut KvCache>,
+    ) -> Result<Vec<Vec<u32>>> {
+        let g = last_tokens.len();
+        let mut chains = vec![Vec::with_capacity(n); g];
+        if n == 0 || g == 0 {
+            return Ok(chains);
+        }
+        if self.block.is_some() && cache.is_none() {
+            candle_core::bail!(
+                "MTP full-block drafting requires the persistent draft KV cache; drafting \
+                 against an empty per-chain cache while applying absolute RoPE positions is \
+                 the RUN-169 acceptance-killer (audit finding 2)."
+            );
+        }
+        let device = seed_hidden.device().clone();
+        let mut prev_hidden = seed_hidden.clone(); // [G, hidden]
+        let mut toks = last_tokens.to_vec();
+        for i in 0..n {
+            let tok_tensor = Tensor::from_vec(toks.clone(), (g,), &device)?;
+            let (logits, next_hidden) = match (&self.block, cache.as_deref_mut()) {
+                (Some(block), Some(cache)) => {
+                    let fused = self.combine(block, &prev_hidden, &tok_tensor)?; // [G, hidden]
+                    let ids = tok_tensor.reshape((g, 1))?;
+                    let hidden =
+                        block.forward_step(&fused.unsqueeze(1)?, start_pos + i, cache, &ids)?;
+                    let normed = block.norm_out(&hidden)?;
+                    (
+                        self.lm_head.forward_autocast(&normed.squeeze(1)?)?,
+                        hidden.squeeze(1)?,
+                    )
+                }
+                // Tier-A (heads-only): no attention, so no position and no
+                // cache — the projection pair batches trivially.
+                _ => self.step(&prev_hidden, &tok_tensor)?,
+            };
+            let next = argmax_rows(&logits)?;
+            for (row, tok) in next.iter().enumerate() {
+                chains[row].push(*tok);
+            }
+            toks = next;
+            prev_hidden = next_hidden;
+        }
+        Ok(chains)
+    }
+}
+
+/// Row-wise greedy argmax over a `[G, vocab]` logits tensor.
+///
+/// One device-side `argmax` plus one `G`-element copy, rather than `G`
+/// single-row argmaxes: the batched draft chain runs this once per chain step,
+/// so a per-row loop would put `G` device syncs on the decode hot path.
+fn argmax_rows(logits: &Tensor) -> Result<Vec<u32>> {
+    let l2 = match logits.rank() {
+        1 => logits.unsqueeze(0)?,
+        2 => logits.clone(),
+        3 => logits.squeeze(1)?,
+        other => candle_core::bail!("MTP argmax_rows: unexpected logits rank {other}"),
+    };
+    l2.argmax(candle_core::D::Minus1)?
+        .to_dtype(candle_core::DType::U32)?
+        .to_vec1::<u32>()
+}
+
+/// Build ONE batched draft KV from a group's per-sequence caches.
+///
+/// The MTP block is a single decoder layer, so this mirrors
+/// `NormalCacheManager::clone_in_cache` at 1/43 of its cost: concatenate the
+/// per-sequence `all_data` along the batch dim and keep `seqs[0]`'s length
+/// metadata, which is exact because every sequence in a group is at the same
+/// fill level by construction.
+///
+/// Returns `None` (drafting is then skipped for the group, losslessly) when a
+/// cache has not been materialised yet or the group's buffers disagree on
+/// shape — a state the group invariant says cannot happen, so refusing beats
+/// concatenating tensors whose rows would not mean what the caller thinks.
+fn batch_draft_caches(caches: &[&KvCache]) -> Option<KvCache> {
+    let first = caches.first()?;
+    if caches.len() == 1 {
+        return Some((*first).clone());
+    }
+    let KvCache::Normal { k: k0, v: v0 } = first else {
+        return None;
+    };
+    let (mut ks, mut vs) = (
+        Vec::with_capacity(caches.len()),
+        Vec::with_capacity(caches.len()),
+    );
+    for cache in caches {
+        let KvCache::Normal { k, v } = cache else {
+            return None;
+        };
+        if k.current_seq_len != k0.current_seq_len
+            || k.capacity_seq_len != k0.capacity_seq_len
+            || k.dim != k0.dim
+        {
+            return None;
+        }
+        ks.push(k.all_data.clone()?);
+        vs.push(v.all_data.clone()?);
+    }
+    let batched_k = Tensor::cat(&ks, 0).ok()?.contiguous().ok()?;
+    let batched_v = Tensor::cat(&vs, 0).ok()?.contiguous().ok()?;
+    Some(KvCache::Normal {
+        k: SingleCache {
+            all_data: Some(batched_k),
+            ..k0.clone()
+        },
+        v: SingleCache {
+            all_data: Some(batched_v),
+            ..v0.clone()
+        },
+    })
+}
+
+/// Split a batched draft KV back into `g` per-sequence caches — the
+/// `clone_out_cache` half of [`batch_draft_caches`].
+fn split_draft_cache(batched: &KvCache, g: usize) -> Option<Vec<KvCache>> {
+    if g == 1 {
+        return Some(vec![batched.clone()]);
+    }
+    let KvCache::Normal { k, v } = batched else {
+        return None;
+    };
+    let ks = k.all_data.as_ref()?.chunk(g, 0).ok()?;
+    let vs = v.all_data.as_ref()?.chunk(g, 0).ok()?;
+    if ks.len() != g || vs.len() != g {
+        return None;
+    }
+    Some(
+        ks.into_iter()
+            .zip(vs)
+            .map(|(kc, vc)| KvCache::Normal {
+                k: SingleCache {
+                    all_data: Some(kc),
+                    ..k.clone()
+                },
+                v: SingleCache {
+                    all_data: Some(vc),
+                    ..v.clone()
+                },
+            })
+            .collect(),
+    )
 }
 
 /// Log the running MTP acceptance rate once per this many **proposed** tokens.
@@ -608,6 +773,16 @@ pub struct MtpAcceptance {
     pub drafted_steps: usize,
     /// User-visible tokens committed across those steps.
     pub committed: usize,
+    /// **Engine** steps (one forward over the whole batch), as distinct from
+    /// [`Self::steps`], which counts one per *sequence* per engine step.
+    ///
+    /// The two ratios they produce answer the two different questions the
+    /// ceiling model asks. `committed / steps` is the **per-user** multiplier —
+    /// the one that multiplies the 68 tok/s per-user floor at B=128. `committed
+    /// / batch_steps` is the **aggregate** multiplier, tokens out per forward.
+    /// At B=1 they are equal, which is exactly why a B=1 measurement cannot
+    /// tell you whether MTP lifts a batched row (DOCTRINE D2).
+    pub batch_steps: usize,
 }
 
 impl MtpAcceptance {
@@ -627,6 +802,25 @@ impl MtpAcceptance {
             steps: 1,
             drafted_steps: usize::from(n_proposed > 0),
             committed: 1 + result.commit_len(),
+            batch_steps: 0,
+        }
+    }
+
+    /// The accounting for one sequence in a **fused** batched step, which runs
+    /// ONE target forward and commits `1 + accepted` tokens (`accepted`
+    /// verified drafts plus the target's own correction-or-bonus token).
+    ///
+    /// Distinct from [`Self::from_verify`], which describes the two-forward
+    /// shape: there `committed = 1 + commit_len` because `T0` came out of a
+    /// *separate* target forward that this shape no longer runs.
+    pub fn from_fused_verify(n_proposed: usize, n_accepted: usize) -> Self {
+        Self {
+            accepted: n_accepted,
+            proposed: n_proposed,
+            steps: 1,
+            drafted_steps: usize::from(n_proposed > 0),
+            committed: 1 + n_accepted,
+            batch_steps: 0,
         }
     }
 
@@ -639,6 +833,7 @@ impl MtpAcceptance {
             steps: 1,
             drafted_steps: 0,
             committed: 1,
+            batch_steps: 0,
         }
     }
 
@@ -650,11 +845,30 @@ impl MtpAcceptance {
         (self.proposed > 0).then(|| self.accepted as f64 / self.proposed as f64)
     }
 
-    /// Committed tokens per decode step — the effective speculative multiplier.
-    /// Plain (non-speculative) decode is exactly 1.0.
+    /// Committed tokens per decode step **per user** — the effective
+    /// speculative multiplier on the per-user ceiling. Plain (non-speculative)
+    /// decode is exactly 1.0.
     #[allow(clippy::cast_precision_loss)]
     pub fn tokens_per_step(&self) -> Option<f64> {
         (self.steps > 0).then(|| self.committed as f64 / self.steps as f64)
+    }
+
+    /// Committed tokens per **engine** step — the aggregate multiplier, i.e.
+    /// tokens out per target forward across the whole batch.
+    ///
+    /// `None` when no batched step was recorded (the counter is set by the
+    /// pipeline once per forward, not once per sequence, so a caller that only
+    /// ever recorded per-sequence tallies honestly has no batch data).
+    #[allow(clippy::cast_precision_loss)]
+    pub fn tokens_per_batch_step(&self) -> Option<f64> {
+        (self.batch_steps > 0).then(|| self.committed as f64 / self.batch_steps as f64)
+    }
+
+    /// Mean batch size across the recorded engine steps — `steps /
+    /// batch_steps`. The label a per-user multiplier has to be read against.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn mean_batch(&self) -> Option<f64> {
+        (self.batch_steps > 0).then(|| self.steps as f64 / self.batch_steps as f64)
     }
 
     /// The machine-greppable one-liner, in the project's marker convention
@@ -667,7 +881,7 @@ impl MtpAcceptance {
         let fmt = |v: Option<f64>| v.map_or_else(|| "n/a".to_string(), |x| format!("{x:.4}"));
         format!(
             "MTP[{scope}] accept_rate={} accepted={} proposed={} steps={} drafted_steps={} \
-             committed={} tok_per_step={}",
+             committed={} tok_per_step={} batch_steps={} mean_batch={} tok_per_batch_step={}",
             fmt(self.rate()),
             self.accepted,
             self.proposed,
@@ -675,6 +889,9 @@ impl MtpAcceptance {
             self.drafted_steps,
             self.committed,
             fmt(self.tokens_per_step()),
+            self.batch_steps,
+            fmt(self.mean_batch()),
+            fmt(self.tokens_per_batch_step()),
         )
     }
 
@@ -700,6 +917,7 @@ impl MtpAcceptance {
         self.steps += other.steps;
         self.drafted_steps += other.drafted_steps;
         self.committed += other.committed;
+        self.batch_steps += other.batch_steps;
     }
 }
 
@@ -718,6 +936,17 @@ pub(crate) struct AcceptanceTelemetry {
     steps: AtomicUsize,
     drafted_steps: AtomicUsize,
     committed: AtomicUsize,
+    batch_steps: AtomicUsize,
+    /// The same counters again, split by the batch size of the engine step
+    /// that produced them.
+    ///
+    /// An aggregate over a run whose batch size moved is a number about no
+    /// particular batch — and the whole reason batched MTP exists is that the
+    /// per-user ceiling is a function of B (`CEILINGS.json`: 1413 at B=1, 68 at
+    /// B=128). One `MTP[b=<B>]` line per observed batch size is the smallest
+    /// thing that makes "does MTP still multiply at B=128" answerable from a
+    /// log.
+    by_batch: std::sync::Mutex<std::collections::BTreeMap<usize, MtpAcceptance>>,
 }
 
 impl AcceptanceTelemetry {
@@ -728,6 +957,8 @@ impl AcceptanceTelemetry {
             steps: AtomicUsize::new(0),
             drafted_steps: AtomicUsize::new(0),
             committed: AtomicUsize::new(0),
+            batch_steps: AtomicUsize::new(0),
+            by_batch: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -739,6 +970,33 @@ impl AcceptanceTelemetry {
             steps: self.steps.load(Ordering::Relaxed),
             drafted_steps: self.drafted_steps.load(Ordering::Relaxed),
             committed: self.committed.load(Ordering::Relaxed),
+            batch_steps: self.batch_steps.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Per-batch-size breakdown, smallest batch first.
+    fn snapshot_by_batch(&self) -> Vec<(usize, MtpAcceptance)> {
+        self.by_batch
+            .lock()
+            .map(|m| m.iter().map(|(b, a)| (*b, *a)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Fold one engine step's per-sequence tallies into the batch-size bucket
+    /// for `batch_size`, and count the engine step itself exactly once.
+    fn record_batch(&self, batch_size: usize, per_seq: &[MtpAcceptance]) {
+        let mut total = MtpAcceptance {
+            batch_steps: 1,
+            ..MtpAcceptance::default()
+        };
+        for step in per_seq {
+            total.add(step);
+        }
+        // `add` also folded each sequence's (zero) batch_steps, so the count
+        // survives as exactly one per forward.
+        self.batch_steps.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut map) = self.by_batch.lock() {
+            map.entry(batch_size).or_default().add(&total);
         }
     }
 
@@ -748,6 +1006,10 @@ impl AcceptanceTelemetry {
         self.steps.store(0, Ordering::Relaxed);
         self.drafted_steps.store(0, Ordering::Relaxed);
         self.committed.store(0, Ordering::Relaxed);
+        self.batch_steps.store(0, Ordering::Relaxed);
+        if let Ok(mut map) = self.by_batch.lock() {
+            map.clear();
+        }
     }
 
     /// Accumulate one decode step; return `true` when this call carried the
@@ -782,6 +1044,9 @@ impl AcceptanceTelemetry {
     fn log(&self) {
         let snap = self.snapshot();
         tracing::info!(target: "mtp_speculative", "{}", snap.marker("agg"));
+        for (b, per_b) in self.snapshot_by_batch() {
+            tracing::info!(target: "mtp_speculative", "{}", per_b.marker(&format!("b={b}")));
+        }
         tracing::info!(target: "mtp_speculative", "{}", snap.report_line());
     }
 
@@ -841,6 +1106,34 @@ pub fn record_mtp_step(step: MtpAcceptance) {
     GLOBAL_ACCEPTANCE.record(&step);
 }
 
+/// Process-wide MTP counters split by the batch size that produced them,
+/// smallest batch first.
+pub fn mtp_acceptance_by_batch() -> Vec<(usize, MtpAcceptance)> {
+    GLOBAL_ACCEPTANCE.snapshot_by_batch()
+}
+
+/// Record one engine step's per-sequence tallies against its batch size.
+///
+/// Exposed alongside [`record_mtp_step`] so the batched accounting can be
+/// proven from a fixture whose per-sequence outcomes are known by
+/// construction, without renting a GPU.
+pub fn record_mtp_batch_step(batch_size: usize, per_seq: &[MtpAcceptance]) {
+    GLOBAL_ACCEPTANCE.record_batch(batch_size, per_seq);
+}
+
+/// Every machine-greppable MTP line for this process: the aggregate first,
+/// then one per observed batch size. Empty when MTP never ran.
+pub fn mtp_acceptance_markers() -> Vec<String> {
+    let Some(agg) = mtp_acceptance_marker() else {
+        return Vec::new();
+    };
+    let mut out = vec![agg];
+    for (b, per_b) in mtp_acceptance_by_batch() {
+        out.push(per_b.marker(&format!("b={b}")));
+    }
+    out
+}
+
 /// MTP-accelerated decode pipeline.
 ///
 /// Wraps a target [`Pipeline`] (must expose [`MtpDecodeKit`] via its
@@ -886,13 +1179,29 @@ pub struct MtpSpeculativePipeline {
 /// such committed entries; anything the cache holds beyond `filled` is the
 /// speculative tail of the last chain and is truncated before reuse.
 struct DraftKv {
-    cache: KvCache,
+    /// `None` on the Tier-A (heads-only) path, which has no attention and so
+    /// nothing to cache. The struct still exists there because [`Self::seed`]
+    /// does — the fused step needs somewhere to carry the hidden state between
+    /// steps regardless of which tier drafts.
+    cache: Option<KvCache>,
     filled: usize,
     /// Set once the cache can no longer be trusted to index absolute
     /// positions (a non-contiguous prefill, or an extend that errored).
     /// Drafting is skipped for the sequence from then on — lossless, and it
     /// stops us re-attempting a doomed extend on every token.
     poisoned: bool,
+    /// `(absolute position p, target hidden state at p)` — the seed of the
+    /// NEXT chain, carried over from the forward that produced it.
+    ///
+    /// This is what removes the second target forward per step (see
+    /// [`MtpSpeculativePipeline::step`]). The chain step at draft-KV slot `p`
+    /// is the pair `(h_p, tok_{p+1})` and predicts `tok_{p+2}`; with committed
+    /// length `L` the first proposal must predict `tok_L`, so `p = L - 2`.
+    /// That row is always inside the window the last forward covered — on a
+    /// rejection at slot `j` the committed length is `C + j + 1` and
+    /// `p = C + j - 1`; on a full accept it is the window's last input — so
+    /// the state never has to be recomputed.
+    seed: Option<(usize, Tensor)>,
     last_used: usize,
 }
 
@@ -967,6 +1276,19 @@ impl MtpSpeculativePipeline {
     /// Configured MTP draft depth (number of speculative tokens per target forward).
     pub fn depth(&self) -> usize {
         self.depth
+    }
+
+    /// Fixed width, in token slots, of the window every sequence feeds the
+    /// target per fused MTP step: its uncached committed tail `u ∈ [1, w]`
+    /// followed by `w - u` drafts.
+    ///
+    /// `depth + 1` is what makes the window invariant close. A step commits at
+    /// most `1 + (w - u)` tokens while the shared cache advances by at least
+    /// one, so the next tail is `u' = u + commit - advance <= w` — the tail can
+    /// never outgrow the window, and a sequence that has run all the way out to
+    /// `u == w` simply drafts nothing that step and catches back up.
+    pub fn window(&self) -> usize {
+        self.depth + 1
     }
 
     /// Snapshot of this pipeline's MTP acceptance counters.
@@ -1077,11 +1399,15 @@ impl MtpSpeculativePipeline {
         if let Some(state) = map.remove(&seq_id) {
             return Some(state);
         }
-        let cache = self.kit.new_draft_cache()?;
+        let cache = self.kit.new_draft_cache();
+        if cache.is_none() && self.kit.block.is_some() {
+            return None;
+        }
         Some(DraftKv {
             cache,
             filled: 0,
             poisoned: false,
+            seed: None,
             last_used: self.draft_kv_clock.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -1152,6 +1478,24 @@ impl MtpSpeculativePipeline {
         capture: Option<(usize, Tensor)>,
         toks: &[u32],
     ) -> Result<bool> {
+        self.extend_draft_kv_row(state, capture, toks, 0, 1)
+    }
+
+    /// [`Self::extend_draft_kv`] for row `row` of a `[B, T, hidden]` capture
+    /// produced by a batched forward over `batch` sequences.
+    ///
+    /// Also stashes [`DraftKv::seed`]: the target hidden state at absolute
+    /// position `toks.len() - 2`, which is where the *next* chain starts. That
+    /// row is inside every capture this is called with, which is what lets the
+    /// fast path run one target forward per step instead of two.
+    fn extend_draft_kv_row(
+        &self,
+        state: &mut DraftKv,
+        capture: Option<(usize, Tensor)>,
+        toks: &[u32],
+        row: usize,
+        batch: usize,
+    ) -> Result<bool> {
         if state.poisoned {
             return Ok(false);
         }
@@ -1168,13 +1512,21 @@ impl MtpSpeculativePipeline {
             3 => hidden,
             other => candle_core::bail!("MTP hidden capture had unexpected rank {other}"),
         };
-        if hidden.dim(0)? != 1 {
-            // Batched forward: rows cannot be attributed to this sequence.
+        if hidden.dim(0)? != batch || row >= batch {
+            // The capture does not describe the batch we were told it does, so
+            // no row can be attributed to this sequence.
             return Ok(false);
         }
+        let hidden = hidden.narrow(0, row, 1)?;
         let t = hidden.dim(1)?;
         if off > state.filled {
             return Ok(false);
+        }
+        // The seed for the next chain: `(h_{L-2}, tok_{L-1})` predicts `tok_L`.
+        if let Some(seed_pos) = toks.len().checked_sub(2) {
+            if seed_pos >= off && seed_pos < off + t {
+                state.seed = Some((seed_pos, hidden.i((0, seed_pos - off))?));
+            }
         }
         let lo = state.filled.max(off);
         // `tok_{i+1}` must be committed: i + 1 <= toks.len() - 1.
@@ -1183,17 +1535,23 @@ impl MtpSpeculativePipeline {
             return Ok(true);
         }
         let n = hi - lo;
+        let Some(cache) = state.cache.as_mut() else {
+            // Tier A: nothing to extend, but `filled` still tracks how much
+            // committed context the seed is allowed to assume.
+            state.filled = hi;
+            return Ok(true);
+        };
         let hidden_slice = hidden.narrow(1, lo - off, n)?;
         let next_tokens = Tensor::from_slice(&toks[lo + 1..hi + 1], (1, n), hidden.device())?;
-        state.cache.set_len(state.filled).map_err(|e| {
+        cache.set_len(state.filled).map_err(|e| {
             candle_core::Error::msg(format!(
                 "MTP draft KV truncate to {} failed: {e}",
                 state.filled
             ))
         })?;
-        state.filled =
-            self.kit
-                .extend_draft_cache(&mut state.cache, lo, &hidden_slice, &next_tokens)?;
+        state.filled = self
+            .kit
+            .extend_draft_cache(cache, lo, &hidden_slice, &next_tokens)?;
         Ok(true)
     }
 
@@ -1268,6 +1626,66 @@ pub fn verify_proposed(proposed: &[u32], target: &[u32]) -> VerifyResult {
     }
 }
 
+/// What one fused batched MTP step does to the shared cache, given each
+/// sequence's uncached tail and how many of its drafts the target accepted.
+///
+/// Split out of [`MtpSpeculativePipeline::step`] because this arithmetic is the
+/// whole of the ragged-batch problem and none of it needs a GPU: one dense
+/// `NormalCache` carries ONE length for the batch, so a step where sequence A
+/// accepted 3 drafts and sequence B accepted none has to resolve two different
+/// answers into one number without losing a token or keeping a slot that holds
+/// a rejected draft's K/V.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BatchStepPlan {
+    /// Window slots the shared cache keeps: `min_i(u_i + accepted_i)`.
+    pub keep: usize,
+    /// Window slots rolled back: `w - keep`.
+    pub n_drop: usize,
+    /// Each sequence's uncached committed tail at the START of the next step.
+    pub next_uncached: Vec<usize>,
+}
+
+/// Which row of a sequence's `[w, vocab]` verify output carries the target's
+/// own token for draft slot `j`.
+///
+/// The window is `u` real committed tokens then `w - u` drafts, so the row
+/// sitting on the last real token (`u - 1`) predicts the position draft 0
+/// proposed; row `u - 1 + d` is the bonus token a fully accepted chain earns.
+/// Off-by-one here is invisible — it just looks like a bad draft head — which
+/// is why the row arithmetic lives in one named place that the tests drive.
+pub(crate) const fn window_verify_row(uncached: usize, j: usize) -> usize {
+    uncached - 1 + j
+}
+
+/// Resolve one fused batched step. `w` is the window width
+/// ([`MtpSpeculativePipeline::window`]), `uncached[i]` the tail sequence `i`
+/// fed, `accepted[i]` how many of its `w - uncached[i]` drafts were accepted.
+///
+/// Invariants this maintains, all of which the tests pin:
+/// * `keep >= 1` — the shared cache always advances, so a batch cannot stall.
+/// * `1 <= next_uncached[i] <= w` — a tail can never outgrow the window, so
+///   every sequence always has at least one real slot to feed and the fast path
+///   never has to bail out of a state it created.
+/// * No slot beyond `keep` survives — a rejected draft's K/V is never readable.
+pub(crate) fn plan_batch_step(uncached: &[usize], accepted: &[usize], w: usize) -> BatchStepPlan {
+    let keep = uncached
+        .iter()
+        .zip(accepted)
+        .map(|(u, a)| u + a)
+        .min()
+        .unwrap_or(0);
+    let next_uncached = uncached
+        .iter()
+        .zip(accepted)
+        .map(|(u, a)| (u + a + 1).saturating_sub(keep))
+        .collect();
+    BatchStepPlan {
+        keep,
+        n_drop: w.saturating_sub(keep),
+        next_uncached,
+    }
+}
+
 /// Greedy argmax over a 1-D logits tensor — returns the token ID.
 fn argmax_token(logits: &Tensor) -> Result<u32> {
     // logits shape [vocab]
@@ -1282,6 +1700,52 @@ fn argmax_token(logits: &Tensor) -> Result<u32> {
 /// `prefill_window = Some((n, initial_cache_len))` instructs the inputs
 /// processor to slice the last `n` tokens past `initial_cache_len` — this is
 /// what the non-MTP speculative pipeline uses for its verifier forward.
+/// [`run_target_forward`] over a whole batch.
+///
+/// Every sequence must already carry a window of the SAME width via
+/// `set_prefill_toks`, and `prefill_window = Some((w, cache_len))` — one shared
+/// `seqlen_offset` and one shared logit width, which is the invariant the dense
+/// batched `NormalCache` demands (`kv_cache/mod.rs::first_mismatched_cache_len`).
+/// Returns `[B, w, vocab]`.
+async fn run_target_forward_batch(
+    this: &MtpSpeculativePipeline,
+    seqs: &mut [&mut Sequence],
+    prefill_window: Option<(usize, usize)>,
+) -> Result<(Tensor, Duration)> {
+    let device = get_mut_arcmutex!(this.target).device();
+    let is_xlora = get_mut_arcmutex!(this.target).get_metadata().is_xlora;
+    let no_kv_cache = get_mut_arcmutex!(this.target).get_metadata().no_kv_cache;
+    let inputs = this
+        .get_processor()
+        .inputs_processor()
+        .process_inputs(
+            this.tokenizer(),
+            seqs,
+            /* is_prompt = */ true,
+            is_xlora,
+            &device,
+            no_kv_cache,
+            prefill_window,
+            false,
+            None,
+            None,
+            get_mut_arcmutex!(this.target).device_mapper(),
+        )
+        .map_err(|e| candle_core::Error::Msg(format!("MTP inputs_processor failed: {e}")))?
+        .inputs;
+
+    let start = Instant::now();
+    let raw = get_mut_arcmutex!(this.target).forward_inputs(inputs, false)?;
+    let exec = start.elapsed();
+    #[allow(irrefutable_let_patterns)]
+    let ForwardInputsResult::CausalGeneration { logits } = raw
+    else {
+        candle_core::bail!("MTP verify requires `CausalGeneration` forward results");
+    };
+    Ok((logits, exec))
+}
+
+#[allow(dead_code)]
 async fn run_target_forward(
     this: &MtpSpeculativePipeline,
     seq: &mut Sequence,
@@ -1418,12 +1882,20 @@ pub(crate) fn truncate_cache_by(cache: &EitherCache, n_drop: usize) -> Result<()
 /// one slot too many on EVERY rejected chain, permanently desyncing the cache
 /// from the committed tokens (cumulative, one position per rejection). See
 /// docs/notes/mtp-hang-triage.md for the full derivation.
+///
+/// Retained as a test-only helper: the fused window shape computes the same
+/// quantity through [`plan_batch_step`] (which has to resolve a whole batch,
+/// not one sequence), while `mtp_verify_rollback_restores_the_compressor_rows_exactly`
+/// keeps driving this derivation into the live [`truncate_cache_by`] so the
+/// `XsRollingCache` refusal contract stays pinned against a real V4 cache.
+#[cfg(test)]
 pub(crate) fn n_cache_positions_to_drop(n_proposed: usize, verify_result: &VerifyResult) -> usize {
     n_proposed.saturating_sub(verify_result.commit_len())
 }
 
 /// Greedy argmax over a (depth × vocab) or (1 × depth × vocab) logits tensor;
 /// returns one token per row.
+#[cfg(test)]
 fn argmax_logits_per_row(logits: &Tensor, expected_rows: usize) -> Result<Vec<u32>> {
     // Possible shapes from the inputs processor:
     //   [1, depth, vocab]  (batch=1 with multi-position output)
@@ -1615,36 +2087,108 @@ impl Pipeline for MtpSpeculativePipeline {
         rng: Arc<std::sync::Mutex<Isaac64Rng>>,
         backend_metadata: CacheBackendMetadata,
     ) -> Result<Duration> {
-        // Tier-A fallback: prompt, batched, xlora, raw-logit, and
-        // paged-attention paths all defer to the wrapped target pipeline. The
-        // MTP-driven fast path is only taken when:
-        //   - this is a decode step (not prompt),
-        //   - exactly one sequence (no batched draft path in Tier A),
-        //   - no raw-logit request,
-        //   - the target uses Normal cache (Full / Hybrid have different
-        //     truncation contracts that Tier B will handle), and
-        //   - cache backend is `DefaultInstructions` (PagedAttention path
-        //     manages slots itself, also Tier B).
+        // Fallback: prompt, xlora, raw-logit, non-`NormalCache` and
+        // PagedAttention steps defer to the wrapped target pipeline.
+        //
+        // **Batch size is no longer one of these conditions.** What used to gate
+        // the fast path at `input_seqs.len() == 1` was never a property of MTP;
+        // it is a property of the dense batched `NormalCache`, whose
+        // `SingleCache::append` writes every sequence's new K/V at ONE shared
+        // offset (`kv_cache/single_cache.rs:161`) and whose batched view carries
+        // ONE `current_seq_len` for the whole batch. Per-sequence accept lengths
+        // make committed token counts diverge, and that cache cannot represent a
+        // per-sequence length — so a naive batched MTP either corrupts the
+        // cache or fragments the batch into one length-bucket per accept length
+        // (`scheduler/default_scheduler.rs::select_running_bucket` runs exactly
+        // one bucket per step, so fragmentation costs more than MTP wins).
+        //
+        // The fast path below resolves it by keeping the CACHE lengths uniform
+        // and letting the TOKEN lengths diverge instead: each sequence carries
+        // an `uncached` committed tail of `u ∈ [1, w]` tokens, feeds
+        // `u` real tokens plus `w - u` drafts into a fixed-width window, and the
+        // batch rolls back to the one shared length every sequence can prove.
+        // Every non-MTP path keeps `u == 1`, which is the invariant plain decode
+        // already maintains.
+        //
+        // Every remaining condition is STATIC for a sequence
+        // (`return_raw_logits` is a per-request field the engine asserts is
+        // uniform across a batch, `engine/mod.rs:406-411`), so a sequence that
+        // once entered the fast path cannot be handed to the target mid-run with
+        // an uncached tail it would misread.
+        //
+        // # PagedAttention is NOT mutually exclusive with MTP
+        //
+        // The `DefaultInstructions` condition below is an **unimplemented
+        // branch**, not an incompatibility. What is missing is exactly one
+        // thing: the rollback. This path rolls rejected drafts back with
+        // `truncate_cache_by`, which walks a `NormalCache` and calls `set_len`
+        // per layer. Under paging the K/V lives in the block table the
+        // PagedAttention KV-cache manager owns, the `EitherCache::Normal`
+        // entries are unused, and that truncate would be a silent no-op —
+        // leaving a rejected draft's K/V addressable. Refusing is the only
+        // correct thing to do until the paged free-list step exists.
+        //
+        // It is also the *cheap* case to add, and the reference proves it:
+        // SGLang frees exactly the complement of its accept set
+        // (`eagle_info.py:488-490`), and for a **linear chain** — `topk == 1`,
+        // which is what DeepSeek MTP is in SGLang's own shipped config
+        // (`server_args.py:7611-7627`, `(3, 1, 4)` for every DeepSeek arch) —
+        // the accepted tokens are a contiguous prefix of the allocated run, so
+        // the rollback is pure truncation with no KV movement at all
+        // (`eagle_info.py:492-501`). Only tree drafting needs the
+        // `move_kv_cache` compaction (`:505-545`).
+        //
+        // Further: paged KV is a *better* substrate for batched MTP than the
+        // dense cache, because a per-sequence block table makes per-sequence
+        // lengths free and the whole uncached-tail scheme below unnecessary.
+        //
+        // **For V4 specifically the question is moot, twice over.**
+        // `DeepSeekV4Loader::supports_paged_attention` returns `false`
+        // (`loaders/normal_loaders.rs`, rationale corrected in wave29-BC:
+        // `flashinfer_mla_decode.cu` fixes `HEAD_DIM_CKV=512` as a template
+        // constant and computes dense causal attention, while every V4 layer is
+        // sliding-window + sink), so the engine never hands V4 a
+        // `CacheBackendMetadata::PagedAttention` at all. And `mtp_decode_kit`
+        // has exactly one implementation in the tree — `deepseek4.rs:4250`; the
+        // trait default at `loaders/normal_loaders.rs:104` returns `None` — so
+        // the MTP wrapper cannot currently wrap a model that pages. The two
+        // features have never met, and this guard has never fired.
+        let (target_is_xlora, target_no_kv_cache) = {
+            let meta = get_mut_arcmutex!(self.target).get_metadata();
+            (meta.is_xlora, meta.no_kv_cache)
+        };
         let take_fast_path = !is_prompt
-            && input_seqs.len() == 1
+            && !input_seqs.is_empty()
             && !return_raw_logits
             && matches!(self.target_cache, EitherCache::Normal(_))
             && matches!(
                 backend_metadata,
                 CacheBackendMetadata::DefaultInstructions { .. }
             )
-            && !get_mut_arcmutex!(self.target).get_metadata().is_xlora
-            && !get_mut_arcmutex!(self.target).get_metadata().no_kv_cache;
+            && !target_is_xlora
+            && !target_no_kv_cache;
 
         if !take_fast_path {
             // The prompt forward is the ONE place the target produces hidden
             // states for the whole context, so it is where the draft KV gets
             // prefilled — the reference's `forward_draft_extend`
-            // (`eagle_worker.py:1094-1128`). Any other fallback (batched,
-            // xlora, raw logits) just drops the capture, so a stale block can
-            // never be attributed to the wrong sequence on a later step.
-            let single_seq_prompt = is_prompt && input_seqs.len() == 1;
-            let seq_id = single_seq_prompt.then(|| *input_seqs[0].id());
+            // (`eagle_worker.py:1094-1128`). Any other fallback (xlora, raw
+            // logits) just drops the capture, so a stale block can never be
+            // attributed to the wrong sequence on a later step.
+            //
+            // A **batched** prompt primes every row, not just row 0. Skipping
+            // it would have made batched MTP dead on arrival in a real serve:
+            // 128 concurrent arrivals prefill together, so no sequence would
+            // ever get a seed and every decode step would decline to draft —
+            // losslessly, silently, and at exactly zero speedup.
+            // `make_prompt_chunk` right-pads to the batch's longest prompt, so
+            // row `i`'s real positions are `[0, len_i)` and
+            // `extend_draft_kv_row`'s own `i <= L-2` bound already stops there.
+            let prompt_ids: Vec<usize> = if is_prompt && self.kit.block.is_some() {
+                input_seqs.iter().map(|s| *s.id()).collect()
+            } else {
+                Vec::new()
+            };
             let elapsed = {
                 let mut target = self.target.lock().await;
                 target
@@ -1659,34 +2203,37 @@ impl Pipeline for MtpSpeculativePipeline {
                     )
                     .await?
             };
-            match seq_id {
-                Some(seq_id) if self.kit.block.is_some() => {
-                    let capture = self.kit.hidden_capture.take();
-                    if let Some(mut state) = self.checkout_draft_kv(seq_id) {
-                        let toks = input_seqs[0].get_toks().to_vec();
-                        match self.extend_draft_kv(&mut state, capture, &toks) {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                state.poisoned = true;
-                                self.warn_unprimed_once(
-                                    "the prompt forward's hidden states do not cover the \
-                                     sequence contiguously from position 0 (batched prefill, \
-                                     chunked prefill, or a prefix-cache hit)",
-                                );
-                            }
-                            Err(e) => {
-                                state.poisoned = true;
-                                tracing::warn!(
-                                    target: "mtp_speculative",
-                                    "MTP draft-KV prefill failed ({e}); drafting disabled for \
-                                     this sequence"
-                                );
-                            }
+            if prompt_ids.is_empty() {
+                self.kit.hidden_capture.clear();
+            } else {
+                let capture = self.kit.hidden_capture.take();
+                let batch = prompt_ids.len();
+                for (row, seq_id) in prompt_ids.into_iter().enumerate() {
+                    let Some(mut state) = self.checkout_draft_kv(seq_id) else {
+                        continue;
+                    };
+                    let toks = input_seqs[row].get_toks().to_vec();
+                    match self.extend_draft_kv_row(&mut state, capture.clone(), &toks, row, batch) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            state.poisoned = true;
+                            self.warn_unprimed_once(
+                                "the prompt forward's hidden states do not cover the \
+                                 sequence contiguously from position 0 (chunked prefill \
+                                 or a prefix-cache hit)",
+                            );
                         }
-                        self.checkin_draft_kv(seq_id, state);
+                        Err(e) => {
+                            state.poisoned = true;
+                            tracing::warn!(
+                                target: "mtp_speculative",
+                                "MTP draft-KV prefill failed ({e}); drafting disabled for \
+                                 this sequence"
+                            );
+                        }
                     }
+                    self.checkin_draft_kv(seq_id, state);
                 }
-                _ => self.kit.hidden_capture.clear(),
             }
             return Ok(elapsed);
         }
@@ -1719,34 +2266,55 @@ impl Pipeline for MtpSpeculativePipeline {
         }
 
         let start = Instant::now();
-        let seq_id = *input_seqs[0].id();
-        let seq = &mut input_seqs[0];
 
         // A capture can only be stale here: every path that produces one
         // consumes it in the same step. Dropping it makes it impossible for a
         // block belonging to another sequence to be read as this one's.
         self.kit.hidden_capture.clear();
 
-        // ---- Step 1: target forward + sample T0 ----
-        let (logits_t0, _exec_t0) = run_target_forward(
-            self, seq, /* is_prompt = */ false, /* prefill_window = */ None,
-        )
-        .await?;
-        let t0_logprobs = sample_sequence(
-            logits_t0.clone(),
-            seq,
-            seq.return_logprobs(),
-            rng.clone(),
-            false,
-            false,
-            false,
-        )
-        .await?;
-        let t0 = t0_logprobs.token;
+        // ---- The window invariant ----
+        //
+        // `cache_len` (C) is shared by the whole batch — the scheduler buckets
+        // on it (`scheduler/default_scheduler.rs`) and `clone_in_cache` builds
+        // one dense batched cache from it. Each sequence's committed length is
+        // `C + u`, where `u` is its uncached committed tail; plain decode holds
+        // `u == 1`. `w = depth + 1` is the fixed window width every sequence
+        // feeds: `u` real tokens, then `w - u` drafts.
+        let w = self.window();
+        let batch = input_seqs.len();
+        let cache_len = current_normal_cache_len(self);
+        let uncached: Vec<usize> = input_seqs
+            .iter()
+            .map(|s| s.get_toks().len().saturating_sub(cache_len))
+            .collect();
+        let window_ok = cache_len + uncached.iter().copied().min().unwrap_or(0) >= 2
+            && uncached.iter().all(|u| (1..=w).contains(u));
+        if !window_ok {
+            // Not a state this fast path produced — a cache reset, a
+            // prefix-cache hit, a chunked prefill. The target's own bookkeeping
+            // is authoritative there, so defer (the PRE op is already applied).
+            self.clear_draft_kv();
+            let elapsed = {
+                let mut target = self.target.lock().await;
+                target
+                    .step(
+                        input_seqs,
+                        is_prompt,
+                        return_raw_logits,
+                        prefix_cacher,
+                        disable_eos_stop,
+                        rng,
+                        CacheBackendMetadata::DefaultInstructions {
+                            pre_op: CacheInstruction::Nothing,
+                            post_op,
+                        },
+                    )
+                    .await?
+            };
+            self.kit.hidden_capture.clear();
+            return Ok(elapsed);
+        }
 
-        // EOS/finished short-circuit: if T0 is an EOS, commit it and bail.
-        // This avoids running MTP / verify for a no-op tail and matches the
-        // semantics of the non-MTP step.
         let eos_owned = get_mut_arcmutex!(self.target)
             .get_metadata()
             .eos_tok
@@ -1756,223 +2324,258 @@ impl Pipeline for MtpSpeculativePipeline {
         } else {
             Some(&eos_owned[..])
         };
+        let max_seq_len = get_mut_arcmutex!(self.target).get_metadata().max_seq_len;
+        let budgets: Vec<usize> = input_seqs
+            .iter()
+            .map(|s| max_seq_len.saturating_sub(s.get_toks().len()))
+            .collect();
 
-        // Determine how many tokens we can still propose without exceeding
-        // the sequence's max_len budget. This mirrors the way the non-MTP
-        // sampler caps at the EOS / generation length.
-        let toks_remaining_budget = {
-            let meta = get_mut_arcmutex!(self.target).get_metadata().max_seq_len;
-            meta.saturating_sub(seq.get_toks().len() + 1) // +1 for T0 once committed
-        };
+        let seq_ids: Vec<usize> = input_seqs.iter().map(|s| *s.id()).collect();
+        let mut states: Vec<Option<DraftKv>> = seq_ids
+            .iter()
+            .map(|id| self.checkout_draft_kv(*id))
+            .collect();
 
-        // ---- Step 2: MTP propose [T1, …, T_depth] ----
+        // ---- Draft, grouped by uncached-tail length ----
         //
-        // `h_proj` gets the TARGET'S hidden state at the last committed
-        // position — captured during the forward we just ran, never a second
-        // forward — and `e_proj` gets `embed(T0)`. Two different signals, as
-        // `deepseek_v4_nextn.py:155-161` requires (audit finding 1).
-        //
-        // The first draft step sits at absolute position `L - 1` (`L` =
-        // committed tokens): that step is the pair `(h_{L-1}, T0)`, which is
-        // the last entry the reference writes during its draft extend, and its
-        // logits are the first draft token (`eagle_worker.py:1094-1132`). The
-        // reference's own draft-decode loop then starts at `seq_len` (`:726`).
-        let capture = self.kit.hidden_capture.take();
-        let mut draft_state = self.checkout_draft_kv(seq_id);
-        let seeded = match &capture {
-            Some((off, hidden)) if hidden.rank() == 3 && hidden.dim(0)? == 1 => {
-                let t = hidden.dim(1)?;
-                Some((off + t - 1, hidden.i((0, t - 1))?))
-            }
-            _ => None,
-        };
-
-        // `L - 1` from the KV cache, which the forward above just advanced to
-        // `L`. Cross-checked against the position the capture reports so a
-        // silent drift between the two bookkeepings can never seed the chain.
-        let chain_start_pos = current_normal_cache_len(self).saturating_sub(1);
-        let can_draft = match (&seeded, &draft_state) {
-            (Some((pos, _)), Some(state)) => {
-                !state.poisoned && *pos == chain_start_pos && state.filled == chain_start_pos
-            }
-            // Tier-A (heads-only) drafting has no attention and therefore no
-            // KV to prime; it only needs the hidden state.
-            (Some((pos, _)), None) => self.kit.block.is_none() && *pos == chain_start_pos,
-            (None, _) => false,
-        };
-
-        let proposed = if can_draft {
-            let (_, seed_hidden) = seeded.as_ref().expect("gated by can_draft");
-            self.kit.propose_chain(
-                seed_hidden,
-                t0,
-                self.depth,
-                toks_remaining_budget,
-                chain_start_pos,
-                draft_state.as_mut().map(|s| &mut s.cache),
-            )?
-        } else {
-            if self.kit.block.is_some() {
-                let filled = draft_state.as_ref().map(|s| s.filled);
-                self.warn_unprimed_once(&format!(
-                    "draft KV holds {filled:?} committed entries but the chain must start at \
-                     absolute position {chain_start_pos}"
-                ));
-            }
-            Vec::new()
-        };
-
-        // Credit the chain's FIRST entry as committed context: it is the pair
-        // `(h_{L-1}, T0)` built from the target's own hidden state and a token
-        // that is committed unconditionally below, so it is a real context
-        // entry, not a speculative one. Everything the chain wrote after it
-        // used the DRAFT's hidden states and is truncated on the next extend.
-        if let Some(state) = draft_state.as_mut() {
-            if !proposed.is_empty() {
-                state.filled = chain_start_pos + 1;
+        // Within a group every sequence sits at the SAME absolute chain start
+        // `C + u - 2` (because they share `C`) and needs the SAME number of
+        // drafts `w - u`, so one batched MTP-block forward per chain step
+        // drafts for all of them. `u` ranges over `[1, w]`, so a batch splits
+        // into at most `depth + 1` groups no matter how large it is — the draft
+        // cost stays a small multiple of one single-layer forward, not a
+        // multiple of the batch size.
+        let mut drafts: Vec<Vec<u32>> = vec![Vec::new(); batch];
+        let mut groups: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (i, &u) in uncached.iter().enumerate() {
+            if u < w {
+                groups.entry(u).or_default().push(i);
             }
         }
-
-        // If the budget left no room (max_len hit, depth=0) or the draft KV
-        // was not primed, commit T0 and return — no verify needed.
-        if proposed.is_empty() {
-            // Still advance the draft KV over T0 so the NEXT step can draft:
-            // `h_{L-1}` is in hand right now and never comes back.
-            if let (Some(state), Some((_, seed_hidden))) = (draft_state.as_mut(), &seeded) {
-                if !state.poisoned && state.filled == chain_start_pos {
-                    let h3 = seed_hidden.reshape((1, 1, ()))?;
-                    let ids = Tensor::from_vec(vec![t0], (1, 1), h3.device())?;
-                    match self
-                        .kit
-                        .extend_draft_cache(&mut state.cache, chain_start_pos, &h3, &ids)
-                    {
-                        Ok(filled) => state.filled = filled,
-                        Err(e) => {
-                            state.poisoned = true;
-                            tracing::warn!(
-                                target: "mtp_speculative",
-                                "MTP draft-KV extend over T0 failed ({e}); drafting disabled \
-                                 for this sequence"
-                            );
-                        }
+        for (u, members) in groups {
+            let n_draft = w - u;
+            let chain_start = cache_len + u - 2;
+            let mut rows: Vec<usize> = Vec::with_capacity(members.len());
+            let mut seeds: Vec<Tensor> = Vec::with_capacity(members.len());
+            let mut last_toks: Vec<u32> = Vec::with_capacity(members.len());
+            for i in members {
+                if budgets[i] == 0 {
+                    continue;
+                }
+                let Some(state) = states[i].as_ref() else {
+                    continue;
+                };
+                if state.poisoned {
+                    continue;
+                }
+                let Some((seed_pos, seed)) = state.seed.as_ref() else {
+                    continue;
+                };
+                // The seed must be the target's hidden state at exactly the
+                // chain's first slot, and the draft KV must hold at least that
+                // many committed entries. Anything else and slot index and
+                // absolute RoPE position have drifted apart.
+                if *seed_pos != chain_start || state.filled < chain_start {
+                    continue;
+                }
+                let toks = input_seqs[i].get_toks();
+                rows.push(i);
+                seeds.push(seed.clone());
+                last_toks.push(toks[toks.len() - 1]);
+            }
+            if rows.is_empty() {
+                if self.kit.block.is_some() {
+                    self.warn_unprimed_once(&format!(
+                        "no sequence in the u={u} group has a draft KV seeded at absolute \
+                         position {chain_start}"
+                    ));
+                }
+                continue;
+            }
+            let seed_hidden = Tensor::stack(&seeds, 0)?;
+            // One batched draft KV for the group: the MTP block is a single
+            // decoder layer, so this is `clone_in_cache` at 1/43 of its cost.
+            let mut group_cache = if self.kit.block.is_some() {
+                let borrowed: Vec<&KvCache> = rows
+                    .iter()
+                    .filter_map(|i| states[*i].as_ref().and_then(|s| s.cache.as_ref()))
+                    .collect();
+                if borrowed.len() != rows.len() {
+                    continue;
+                }
+                let Some(mut batched) = batch_draft_caches(&borrowed) else {
+                    self.warn_unprimed_once(
+                        "the draft KVs in one uncached-tail group disagree on shape, so they \
+                         cannot share a batched forward",
+                    );
+                    continue;
+                };
+                if batched.set_len(chain_start).is_err() {
+                    continue;
+                }
+                Some(batched)
+            } else {
+                None
+            };
+            let chains = self.kit.propose_chain_batched(
+                &seed_hidden,
+                &last_toks,
+                n_draft,
+                chain_start,
+                group_cache.as_mut(),
+            )?;
+            if let Some(batched) = group_cache.as_ref() {
+                let Some(split) = split_draft_cache(batched, rows.len()) else {
+                    continue;
+                };
+                for (slot, i) in rows.iter().enumerate() {
+                    if let Some(state) = states[*i].as_mut() {
+                        state.cache = Some(split[slot].clone());
+                        // The chain's FIRST entry is committed context — the
+                        // pair `(h_{L-2}, tok_{L-1})`, both of which are real.
+                        // Everything after it used the DRAFT's hidden states
+                        // and is truncated by the next extend.
+                        state.filled = chain_start + 1;
                     }
                 }
             }
-            if let Some(state) = draft_state {
-                self.checkin_draft_kv(seq_id, state);
+            for (slot, i) in rows.iter().enumerate() {
+                drafts[*i] = chains[slot].clone();
             }
-            // A step that drafted nothing still emitted one token. Counting it
-            // is what keeps `tok_per_step` honest: a run where the draft KV
-            // never primes must report 1.0, not "no data".
-            self.record_step(seq_id, MtpAcceptance::skipped_step());
-            finish_or_add_toks_to_seq(self, prefix_cacher, seq, t0_logprobs, eos_tok, true).await?;
-            let done = seq_is_terminal(seq);
-            if let CacheInstruction::Reset { .. } = post_op {
-                self.drop_draft_kv(seq_id);
-            } else if done {
-                self.flush_seq_acceptance(seq_id);
-            }
-            handle_post_cache_op(self, input_seqs, post_op);
-            return Ok(start.elapsed());
         }
 
-        // ---- Step 3: verifier forward over [T0, T1, …, T_{depth-1}] ----
-        // The target reads these as a packed batch, producing `depth` logit
-        // rows — one per proposed slot. We use `set_prefill_toks` to push the
-        // extra tokens through `process_inputs` like the non-MTP speculative
-        // pipeline does.
-        let mut verify_input = vec![t0];
-        verify_input.extend(
-            proposed
-                .iter()
-                .take(proposed.len().saturating_sub(1))
-                .copied(),
-        );
-        seq.set_prefill_toks(verify_input.clone());
-
-        let initial_cache_len = current_normal_cache_len(self);
-
-        let (verify_logits, _exec_v) = run_target_forward(
-            self,
-            seq,
-            /* is_prompt = */ true, // use prefill_prompt_toks
-            Some((proposed.len(), initial_cache_len)),
-        )
-        .await?;
-        seq.reset_prefill_toks();
-
-        // verify_logits has shape [batch, depth, vocab] OR [depth, vocab] —
-        // we accept either; `argmax_logits_per_row` normalizes.
-        let verifier_tokens = argmax_logits_per_row(&verify_logits, proposed.len())?;
-
-        // ---- Step 4: accept/reject ----
-        // `verifier_tokens[i]` is the target's natural next token AFTER
-        // committing T0 + proposed[..=i-1]. Accept proposed[i] iff
-        // verifier_tokens[i] == proposed[i].
-        let verify_result = verify_proposed(&proposed, &verifier_tokens);
-        let n_proposed = proposed.len();
-        self.record_step(
-            seq_id,
-            MtpAcceptance::from_verify(n_proposed, &verify_result),
-        );
-
-        // ---- Step 5: truncate KV cache ----
-        // After the verify forward, the cache holds positions for
-        // [T0, T1, ..., T_{depth-1}] (i.e., `proposed.len()` extra positions
-        // beyond `initial_cache_len`). Keep exactly as many extras as the
-        // cache-vs-committed-tokens invariant requires — see
-        // `n_cache_positions_to_drop` for the derivation (the old
-        // `n_proposed - n_accepted` dropped one slot too many on every
-        // rejection, cumulatively desyncing cache and sequence).
-        let n_to_drop = n_cache_positions_to_drop(n_proposed, &verify_result);
-        if n_to_drop > 0 {
-            truncate_normal_cache(self, n_to_drop)?;
-        }
-
-        // ---- Step 6: commit accepted tokens + correction (if any) ----
-        // First commit T0 (the always-free target token).
-        finish_or_add_toks_to_seq(self, prefix_cacher, seq, t0_logprobs, eos_tok, true).await?;
-
-        // Then commit each accepted MTP proposal. Build a minimal
-        // `Logprobs` for each — the MTP path is greedy-only in Tier A so
-        // we can synthesize a one-hot logprob without re-running the sampler.
-        for &tok in &verify_result.accepted {
-            let lp = crate::sampler::Logprobs {
-                token: tok,
-                logprob: 0.0,
-                top_logprobs: None,
-                bytes: None,
-            };
-            finish_or_add_toks_to_seq(self, prefix_cacher, seq, lp, eos_tok, true).await?;
-        }
-
-        // Then, if there was a rejection, commit the verifier's correction.
-        // That correction is the same as what the target would have produced
-        // on its own at the rejected slot — this preserves losslessness.
-        if let Some((_idx, correction_tok)) = verify_result.rejection {
-            let lp = crate::sampler::Logprobs {
-                token: correction_tok,
-                logprob: 0.0,
-                top_logprobs: None,
-                bytes: None,
-            };
-            finish_or_add_toks_to_seq(self, prefix_cacher, seq, lp, eos_tok, true).await?;
-        }
-
-        // ---- Step 7: extend the draft KV over the newly committed tokens ----
-        // `forward_draft_extend_after_decode` (`eagle_worker.py:1134+`): the
-        // verify forward's captured hidden states are the TARGET's states for
-        // the accepted positions, so the draft KV entries for them are rebuilt
-        // from the target's `h` — the chain's own entries beyond the first
-        // used the DRAFT's `h` and are truncated away inside `extend_draft_kv`.
+        // ---- Verify: ONE target forward over the fixed-width window ----
         //
-        // Its `i <= L-2` bound also guarantees a rejected proposal's hidden
-        // state is never written: `h_i` past the last accepted position pairs
-        // with a token that was not committed.
-        if let Some(mut state) = draft_state {
-            let capture = self.kit.hidden_capture.take();
-            let toks = seq.get_toks().to_vec();
-            match self.extend_draft_kv(&mut state, capture, &toks) {
+        // The pre-fusion shape ran TWO target forwards per step (one to
+        // materialise `T0` and its hidden state, one to verify), which caps the
+        // multiplier at `(depth + 1) / 2` — at depth 1 that is exactly 1.0, no
+        // speedup at all. The seed carried on `DraftKv` removes the first
+        // forward: the row the next chain needs is always inside the window the
+        // last verify already covered. SGLang does the same thing from the
+        // other direction, skipping the final draft forward because the
+        // draft-extend it must run anyway already produced that token
+        // (`eagle_worker.py:871-873`).
+        for (i, seq) in input_seqs.iter_mut().enumerate() {
+            let toks = seq.get_toks();
+            let mut window: Vec<u32> = toks[cache_len..].to_vec();
+            window.extend(drafts[i].iter().copied());
+            let pad = *window.last().expect("uncached tail is at least 1 token");
+            window.resize(w, pad);
+            seq.set_prefill_toks(window);
+        }
+        let verify = run_target_forward_batch(self, input_seqs, Some((w, cache_len))).await;
+        for seq in input_seqs.iter_mut() {
+            seq.reset_prefill_toks();
+        }
+        let (verify_logits, _exec) = verify?;
+        // `[B, w]` greedy argmax — one device op, not `B * w` of them.
+        let arg = verify_logits
+            .argmax(candle_core::D::Minus1)?
+            .to_dtype(candle_core::DType::U32)?
+            .to_vec2::<u32>()?;
+
+        // ---- Accept / reject, per sequence ----
+        let mut accepted: Vec<Vec<u32>> = Vec::with_capacity(batch);
+        let mut valid_extent: Vec<usize> = Vec::with_capacity(batch);
+        let mut per_seq_stats: Vec<MtpAcceptance> = Vec::with_capacity(batch);
+        for i in 0..batch {
+            let u = uncached[i];
+            let d = drafts[i].len();
+            // Row `u - 1 + j` predicts the token at position `L + j`, which is
+            // what draft `j` proposed. Row `u - 1 + d` is the bonus token that
+            // a fully accepted chain earns.
+            let targets: Vec<u32> = (0..d).map(|j| arg[i][window_verify_row(u, j)]).collect();
+            let result = verify_proposed(&drafts[i], &targets);
+            let mut n_acc = result.accepted.len();
+            // Never commit past the sequence's own length budget.
+            if n_acc + 1 > budgets[i] {
+                n_acc = budgets[i].saturating_sub(1);
+            }
+            accepted.push(result.accepted[..n_acc].to_vec());
+            valid_extent.push(u + n_acc);
+            per_seq_stats.push(MtpAcceptance::from_fused_verify(d, n_acc));
+        }
+
+        // ---- Roll the shared cache back to the length every sequence can prove ----
+        //
+        // The forward advanced the batched cache by `w` for everyone. Sequence
+        // `i` can only vouch for `u_i + accepted_i` of those slots: the rest
+        // hold KV for draft tokens that were rejected (or for the pad a
+        // sequence that could not draft fed). One dense cache means one length,
+        // so the batch keeps the minimum — and each sequence's surplus stays
+        // committed as TOKENS and comes back as a longer uncached tail next
+        // step, which is exactly what `w - u` drafts leaves room for. `u >= 1`
+        // for every sequence, so the cache always advances by at least one
+        // position and the batch can never stall.
+        let n_accepted: Vec<usize> = accepted.iter().map(Vec::len).collect();
+        let plan = plan_batch_step(&uncached, &n_accepted, w);
+        debug_assert_eq!(
+            plan.keep,
+            valid_extent.iter().copied().min().unwrap_or(0),
+            "plan_batch_step must agree with the per-sequence valid extents"
+        );
+        if plan.n_drop > 0 {
+            truncate_normal_cache(self, plan.n_drop)?;
+        }
+
+        // ---- Commit ----
+        for i in 0..batch {
+            let u = uncached[i];
+            let n_acc = accepted[i].len();
+            let seq = &mut input_seqs[i];
+            for &tok in &accepted[i] {
+                let lp = crate::sampler::Logprobs {
+                    token: tok,
+                    logprob: 0.0,
+                    top_logprobs: None,
+                    bytes: None,
+                };
+                finish_or_add_toks_to_seq(self, prefix_cacher, seq, lp, eos_tok, true).await?;
+                if seq_is_terminal(seq) {
+                    break;
+                }
+            }
+            if seq_is_terminal(seq) || budgets[i] <= n_acc {
+                continue;
+            }
+            // The one token of the step that was NOT a verified draft — the
+            // target's correction at the rejected slot, or the bonus token
+            // after a full accept. It goes through the real sampler, so the
+            // request's temperature / penalties apply to it exactly as they
+            // would without MTP.
+            let row = window_verify_row(u, n_acc);
+            let row_logits = verify_logits.i(i)?.narrow(0, row, 1)?.unsqueeze(0)?;
+            let want_logprobs = seq.return_logprobs();
+            let lp = sample_sequence(
+                row_logits,
+                seq,
+                want_logprobs,
+                rng.clone(),
+                false,
+                false,
+                false,
+            )
+            .await?;
+            finish_or_add_toks_to_seq(self, prefix_cacher, seq, lp, eos_tok, true).await?;
+        }
+
+        // ---- Extend the draft KV over the newly committed tokens ----
+        //
+        // The verify forward's captured hidden states are the TARGET's states
+        // for the accepted positions, so the draft-KV entries for them are
+        // rebuilt from the target's `h`; the chain's own entries beyond the
+        // first used the DRAFT's `h` and are truncated inside
+        // `extend_draft_kv_row`. Its `i <= L-2` bound also guarantees a rejected
+        // proposal's hidden state is never written, and it is what re-stamps
+        // the seed for the next step.
+        let capture = self.kit.hidden_capture.take();
+        for i in 0..batch {
+            let Some(mut state) = states[i].take() else {
+                continue;
+            };
+            let toks = input_seqs[i].get_toks().to_vec();
+            match self.extend_draft_kv_row(&mut state, capture.clone(), &toks, i, batch) {
                 Ok(true) => {}
                 Ok(false) => {
                     state.poisoned = true;
@@ -1989,18 +2592,24 @@ impl Pipeline for MtpSpeculativePipeline {
                     );
                 }
             }
-            self.checkin_draft_kv(seq_id, state);
-        } else {
-            self.kit.hidden_capture.clear();
+            self.checkin_draft_kv(seq_ids[i], state);
         }
+
+        // ---- Account ----
+        for (i, stat) in per_seq_stats.iter().enumerate() {
+            self.record_step(seq_ids[i], *stat);
+        }
+        record_mtp_batch_step(batch, &per_seq_stats);
 
         // POST cache op (matches what `Pipeline::step` does after a normal
         // forward).
-        let done = seq_is_terminal(&*input_seqs[0]);
-        if let CacheInstruction::Reset { .. } = post_op {
-            self.drop_draft_kv(seq_id);
-        } else if done {
-            self.flush_seq_acceptance(seq_id);
+        for i in 0..batch {
+            let done = seq_is_terminal(input_seqs[i]);
+            if let CacheInstruction::Reset { .. } = post_op {
+                self.drop_draft_kv(seq_ids[i]);
+            } else if done {
+                self.flush_seq_acceptance(seq_ids[i]);
+            }
         }
         handle_post_cache_op(self, input_seqs, post_op);
 
@@ -2325,6 +2934,7 @@ mod tests {
             steps: 1,
             drafted_steps: usize::from(proposed > 0),
             committed: 1 + accepted + correction,
+            batch_steps: 0,
         }
     }
 
@@ -2346,6 +2956,7 @@ mod tests {
                 // step 1: T0 + 1 accepted + 1 correction = 3
                 // step 2: T0 + 2 accepted, no correction = 3
                 committed: 6,
+                batch_steps: 0,
             }
         );
         tel.reset();
@@ -2425,6 +3036,7 @@ mod tests {
             steps: 1,
             drafted_steps: 0,
             committed: 1,
+            batch_steps: 0,
         };
         let tel = AcceptanceTelemetry::default();
         for _ in 0..10 {
@@ -3118,5 +3730,453 @@ mod tests {
             "wrapper name should advertise MTP-speculative with depth=4; got {name}"
         );
         Ok(())
+    }
+
+    // =====================================================================
+    // Batched MTP: the ragged accept/reject case (wave45-BW)
+    // =====================================================================
+    //
+    // The case that breaks a batched speculative decoder is one step in which
+    // different sequences accept different numbers of drafts. One dense
+    // `NormalCache` carries ONE length for the whole batch, so that step has to
+    // resolve B different answers into one number while every sequence's
+    // user-visible token stream stays exactly what it would have been alone.
+    //
+    // These tests drive the PRODUCTION arithmetic — `plan_batch_step`,
+    // `window_verify_row`, `verify_proposed` — against a deterministic
+    // target/draft pair, so a change to the real functions moves the test.
+
+    /// A deterministic stand-in for the target model: the next token is a
+    /// function of the last two committed tokens.
+    ///
+    /// Deliberately NOT a constant and NOT a function of position: the fixture
+    /// trap this repo already stepped on (`h_proj`/`e_proj` both zero ⇒
+    /// `fused ≡ 0` ⇒ every draft token identical) makes accept and reject the
+    /// same experiment, and every MTP defect invisible. DOCTRINE D12.
+    fn oracle_target(ctx: &[u32]) -> u32 {
+        let a = u64::from(*ctx.last().expect("non-empty context"));
+        let b = u64::from(ctx.get(ctx.len().wrapping_sub(2)).copied().unwrap_or(7));
+        ((a.wrapping_mul(1103515245)
+            .wrapping_add(b.wrapping_mul(12345)))
+            % 97
+            + 3) as u32
+    }
+
+    /// A deterministic stand-in for the MTP draft head. `agree_mod` controls how
+    /// often it reproduces the target: the draft agrees whenever the target's
+    /// own answer is divisible by `agree_mod`, which makes acceptance depend on
+    /// the sequence's own content — the only way two sequences in one batch end
+    /// up with different accept lengths.
+    fn oracle_draft(ctx: &[u32], agree_mod: u32) -> u32 {
+        let t = oracle_target(ctx);
+        if agree_mod != 0 && t % agree_mod == 0 {
+            t
+        } else {
+            t.wrapping_add(1)
+        }
+    }
+
+    /// One sequence's decode state under the fused window scheme.
+    #[derive(Clone)]
+    struct SimSeq {
+        toks: Vec<u32>,
+        agree_mod: u32,
+        /// Uncached committed tail — `len - shared_cache_len`.
+        uncached: usize,
+    }
+
+    /// Run one fused step for a batch of `SimSeq`, exactly as
+    /// `MtpSpeculativePipeline::step` does: draft `w - u` tokens per sequence,
+    /// feed a `w`-wide window, verify with `verify_proposed` against the rows
+    /// `window_verify_row` names, then resolve the batch with
+    /// `plan_batch_step`. Returns the tokens each sequence emitted this step.
+    ///
+    /// `plan_override` lets a mutation test substitute a WRONG batch resolution
+    /// and show that the assertions catch it.
+    fn sim_step(
+        seqs: &mut [SimSeq],
+        w: usize,
+        plan_override: Option<fn(&[usize], &[usize], usize) -> BatchStepPlan>,
+    ) -> Vec<Vec<u32>> {
+        let uncached: Vec<usize> = seqs.iter().map(|s| s.uncached).collect();
+        let mut drafts: Vec<Vec<u32>> = Vec::with_capacity(seqs.len());
+        for s in seqs.iter() {
+            let n_draft = w - s.uncached;
+            let mut chain = Vec::with_capacity(n_draft);
+            let mut ctx = s.toks.clone();
+            for _ in 0..n_draft {
+                let next = oracle_draft(&ctx, s.agree_mod);
+                chain.push(next);
+                ctx.push(next);
+            }
+            drafts.push(chain);
+        }
+
+        // The verify forward: row `window_verify_row(u, j)` of the window is the
+        // target's own token after the window's first `u + j` tokens.
+        let mut emitted: Vec<Vec<u32>> = Vec::with_capacity(seqs.len());
+        let mut n_accepted: Vec<usize> = Vec::with_capacity(seqs.len());
+        for (i, s) in seqs.iter().enumerate() {
+            let d = drafts[i].len();
+            let mut rows: Vec<u32> = vec![0; w];
+            let mut ctx = s.toks.clone();
+            // Row for j = 0 sits on the last real token; rows for j >= 1 sit on
+            // draft j-1, so the context grows with the drafts.
+            for j in 0..=d {
+                rows[window_verify_row(s.uncached, j)] = oracle_target(&ctx);
+                if j < d {
+                    ctx.push(drafts[i][j]);
+                }
+            }
+            let targets: Vec<u32> = (0..d)
+                .map(|j| rows[window_verify_row(s.uncached, j)])
+                .collect();
+            let result = verify_proposed(&drafts[i], &targets);
+            let a = result.accepted.len();
+            let mut out = result.accepted.clone();
+            out.push(rows[window_verify_row(s.uncached, a)]);
+            n_accepted.push(a);
+            emitted.push(out);
+        }
+
+        let plan = plan_override.unwrap_or(plan_batch_step)(&uncached, &n_accepted, w);
+        for (i, s) in seqs.iter_mut().enumerate() {
+            s.toks.extend_from_slice(&emitted[i]);
+            s.uncached = (s.uncached + n_accepted[i] + 1).saturating_sub(plan.keep);
+        }
+        emitted
+    }
+
+    /// The window invariant closes: over every depth 1..=8 and every ragged
+    /// accept pattern a batch can produce, the shared cache advances by at
+    /// least one position and no sequence's uncached tail ever outgrows the
+    /// window.
+    ///
+    /// These two are what make the fast path total. If `keep` could be 0 the
+    /// batch would stall forever; if a tail could exceed `w` the sequence would
+    /// have no room left to feed its own committed tokens and the fast path
+    /// would have to bail out of a state it created — which is precisely the
+    /// state no other code path knows how to read.
+    #[test]
+    fn batched_window_invariant_closes_at_every_depth_and_accept_pattern() {
+        let mut checked = 0usize;
+        for depth in 1..=8usize {
+            let w = depth + 1;
+            // Every reachable (u, a) pair for a batch of up to 4 sequences.
+            let pairs: Vec<(usize, usize)> = (1..=w)
+                .flat_map(|u| (0..=(w - u)).map(move |a| (u, a)))
+                .collect();
+            for i in 0..pairs.len() {
+                for j in 0..pairs.len() {
+                    for k in 0..pairs.len() {
+                        let batch = [pairs[i], pairs[j], pairs[k]];
+                        let uncached: Vec<usize> = batch.iter().map(|(u, _)| *u).collect();
+                        let accepted: Vec<usize> = batch.iter().map(|(_, a)| *a).collect();
+                        let plan = plan_batch_step(&uncached, &accepted, w);
+                        assert!(
+                            plan.keep >= 1,
+                            "depth {depth}: the shared cache must advance every step, else the \
+                             batch stalls forever (u={uncached:?} a={accepted:?})"
+                        );
+                        assert!(
+                            plan.n_drop <= w,
+                            "depth {depth}: cannot roll back more than the window ({plan:?})"
+                        );
+                        for (seq, next_u) in plan.next_uncached.iter().enumerate() {
+                            assert!(
+                                (1..=w).contains(next_u),
+                                "depth {depth}, seq {seq}: next uncached tail {next_u} escaped \
+                                 [1, {w}] from u={uncached:?} a={accepted:?}"
+                            );
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 5_000, "only {checked} patterns exercised");
+    }
+
+    /// A batch whose sequences accept DIFFERENT numbers of drafts in the same
+    /// step emits, per sequence, exactly the token stream that sequence would
+    /// have produced alone.
+    ///
+    /// This is the whole claim of the batched fast path. The batch changes how
+    /// many tokens a sequence commits per *step* (its tail shrinks the drafts it
+    /// gets), never *which* tokens it commits.
+    #[test]
+    fn batched_ragged_accept_is_token_identical_to_the_b1_reference() {
+        for depth in 1..=4usize {
+            let w = depth + 1;
+            // Different `agree_mod` per sequence is what produces different
+            // accept lengths in the same step.
+            let seeds: [(u32, u32); 5] = [(11, 2), (23, 3), (41, 1), (57, 5), (73, 4)];
+            let make = |(tok, agree): (u32, u32)| SimSeq {
+                toks: vec![1, tok],
+                agree_mod: agree,
+                uncached: 1,
+            };
+
+            // Reference: each sequence alone.
+            let mut reference: Vec<Vec<u32>> = Vec::new();
+            for s in seeds {
+                let mut solo = vec![make(s)];
+                let mut stream = Vec::new();
+                for _ in 0..200 {
+                    let out = sim_step(&mut solo, w, None);
+                    stream.extend_from_slice(&out[0]);
+                    assert_eq!(
+                        solo[0].uncached, 1,
+                        "at B=1 the batch minimum is the sequence itself, so its tail must \
+                         return to 1 every step"
+                    );
+                    if stream.len() >= 60 {
+                        break;
+                    }
+                }
+                reference.push(stream);
+            }
+
+            // Batched: all five together, ragged by construction.
+            let mut batch: Vec<SimSeq> = seeds.into_iter().map(make).collect();
+            let mut streams: Vec<Vec<u32>> = vec![Vec::new(); batch.len()];
+            let mut saw_ragged = false;
+            let mut saw_tail_above_one = false;
+            for _ in 0..200 {
+                let before: Vec<usize> = batch.iter().map(|s| s.toks.len()).collect();
+                let out = sim_step(&mut batch, w, None);
+                let commits: Vec<usize> = out.iter().map(Vec::len).collect();
+                if commits.iter().any(|c| *c != commits[0]) {
+                    saw_ragged = true;
+                }
+                if batch.iter().any(|s| s.uncached > 1) {
+                    saw_tail_above_one = true;
+                }
+                for (i, toks) in out.iter().enumerate() {
+                    streams[i].extend_from_slice(toks);
+                    assert_eq!(
+                        batch[i].toks.len(),
+                        before[i] + toks.len(),
+                        "committed token count and emitted token count must not drift"
+                    );
+                }
+                if streams.iter().all(|s| s.len() >= 60) {
+                    break;
+                }
+            }
+
+            // Non-degeneracy first (D12): if the batch never went ragged and no
+            // tail ever exceeded one, this test proves nothing about the case it
+            // exists for.
+            assert!(
+                saw_ragged,
+                "depth {depth}: no step had different accept lengths across the batch — the \
+                 fixture is degenerate and would pass with the ragged path deleted"
+            );
+            assert!(
+                saw_tail_above_one,
+                "depth {depth}: no sequence ever carried an uncached tail > 1, so the window \
+                 mechanism was never exercised"
+            );
+
+            for (i, stream) in streams.iter().enumerate() {
+                let n = stream.len().min(reference[i].len());
+                assert!(n >= 50, "seq {i} produced only {n} comparable tokens");
+                assert_eq!(
+                    &stream[..n],
+                    &reference[i][..n],
+                    "depth {depth}, seq {i}: batched MTP diverged from the B=1 reference"
+                );
+            }
+        }
+    }
+
+    /// Mutation: resolve the batch on the MAXIMUM valid extent instead of the
+    /// minimum — the obvious "keep as much cache as possible" mistake.
+    ///
+    /// It reads as harmless (it only keeps *more* cache) and it is not: the
+    /// sequences that accepted fewer drafts would carry K/V for tokens they
+    /// never committed, and their next tail underflows. The equivalence test
+    /// above must fail on it, or it is not testing the rollback at all.
+    #[test]
+    fn batched_rollback_mutation_max_instead_of_min_is_caught() {
+        fn bad_plan(uncached: &[usize], accepted: &[usize], w: usize) -> BatchStepPlan {
+            let keep = uncached
+                .iter()
+                .zip(accepted)
+                .map(|(u, a)| u + a)
+                .max()
+                .unwrap_or(0);
+            BatchStepPlan {
+                keep,
+                n_drop: w.saturating_sub(keep),
+                next_uncached: uncached
+                    .iter()
+                    .zip(accepted)
+                    .map(|(u, a)| (u + a + 1).saturating_sub(keep))
+                    .collect(),
+            }
+        }
+
+        let w = 4usize;
+        let seeds: [(u32, u32); 4] = [(11, 2), (23, 3), (41, 1), (57, 5)];
+        let make = |(tok, agree): (u32, u32)| SimSeq {
+            toks: vec![1, tok],
+            agree_mod: agree,
+            uncached: 1,
+        };
+
+        let mut good: Vec<SimSeq> = seeds.into_iter().map(make).collect();
+        let mut bad: Vec<SimSeq> = seeds.into_iter().map(make).collect();
+        let mut good_tails = Vec::new();
+        let mut bad_tails = Vec::new();
+        for _ in 0..12 {
+            sim_step(&mut good, w, None);
+            good_tails.push(good.iter().map(|s| s.uncached).collect::<Vec<_>>());
+            // The mutation is allowed to reach a state the window scheme
+            // forbids; stepping ONWARD from it would index a row that does not
+            // exist, which is the corruption itself, so stop at the evidence.
+            if bad.iter().all(|s| (1..=w).contains(&s.uncached)) {
+                sim_step(&mut bad, w, Some(bad_plan));
+                bad_tails.push(bad.iter().map(|s| s.uncached).collect::<Vec<_>>());
+            }
+        }
+        // Under the mutation at least one sequence's tail collapses to 0 — it
+        // would have to feed a zero-width window, i.e. its own committed tokens
+        // would sit in the cache as K/V computed from a draft that was rejected.
+        assert!(
+            bad_tails.iter().flatten().any(|u| *u == 0),
+            "the max-instead-of-min mutation must drive some tail to 0; if it does not, the \
+             fixture is not ragged enough to catch it"
+        );
+        assert!(
+            good_tails.iter().flatten().all(|u| (1..=w).contains(u)),
+            "the production plan must keep every tail inside [1, {w}]"
+        );
+        assert_ne!(
+            good_tails, bad_tails,
+            "the mutation produced identical state — the test has no teeth"
+        );
+    }
+
+    /// Mutation: shift the verify row by one. This is the defect that hides
+    /// perfectly — it does not crash, it does not corrupt the cache, it just
+    /// compares each draft against the target's answer for the wrong position,
+    /// so acceptance collapses and looks like a bad draft head.
+    #[test]
+    fn window_verify_row_off_by_one_destroys_acceptance() {
+        let w = 4usize;
+        let seq = SimSeq {
+            toks: vec![1, 11],
+            agree_mod: 1, // draft always agrees with the target
+            uncached: 1,
+        };
+        let mut good = vec![seq.clone()];
+        let emitted = sim_step(&mut good, w, None);
+        assert_eq!(
+            emitted[0].len(),
+            w, // all w-1 drafts accepted, plus the bonus token
+            "with a perfectly agreeing draft head every draft must be accepted"
+        );
+
+        // Same chain, rows read one slot late.
+        let d = w - seq.uncached;
+        let mut ctx = seq.toks.clone();
+        let mut drafts = Vec::new();
+        for _ in 0..d {
+            let next = oracle_draft(&ctx, 1);
+            drafts.push(next);
+            ctx.push(next);
+        }
+        let mut rows = vec![0u32; w + 1];
+        let mut ctx = seq.toks.clone();
+        for j in 0..=d {
+            rows[window_verify_row(seq.uncached, j)] = oracle_target(&ctx);
+            if j < d {
+                ctx.push(drafts[j]);
+            }
+        }
+        let shifted: Vec<u32> = (0..d)
+            .map(|j| rows[window_verify_row(seq.uncached, j) + 1])
+            .collect();
+        let bad = verify_proposed(&drafts, &shifted);
+        assert!(
+            bad.accepted.len() < d,
+            "a one-row shift must reject something; it accepted all {d}"
+        );
+    }
+
+    /// Acceptance is reported per batch size, and the two multipliers the
+    /// ceiling model needs are both on the line.
+    ///
+    /// `tok_per_step` is per user (what multiplies the 68 tok/s floor at
+    /// B=128); `tok_per_batch_step` is aggregate (tokens out per forward). At
+    /// B=1 they are equal, which is exactly why a B=1 measurement cannot answer
+    /// whether MTP still pays at batch.
+    #[test]
+    fn batched_acceptance_is_reported_per_batch_size() {
+        let tel = AcceptanceTelemetry::default();
+        // B=4, every sequence accepts 2 of 2 drafts.
+        let all_accept: Vec<MtpAcceptance> = (0..4)
+            .map(|_| MtpAcceptance::from_fused_verify(2, 2))
+            .collect();
+        tel.record_batch(4, &all_accept);
+        // B=2, nothing accepted.
+        let all_reject: Vec<MtpAcceptance> = (0..2)
+            .map(|_| MtpAcceptance::from_fused_verify(2, 0))
+            .collect();
+        tel.record_batch(2, &all_reject);
+
+        let by_batch = tel.snapshot_by_batch();
+        assert_eq!(
+            by_batch.iter().map(|(b, _)| *b).collect::<Vec<_>>(),
+            vec![2, 4],
+            "batch sizes must be reported smallest-first and not merged"
+        );
+        let b2 = by_batch[0].1;
+        let b4 = by_batch[1].1;
+
+        // Mutation-style bracketing: the two extremes must read 0.0 and 1.0.
+        assert_eq!(b2.rate(), Some(0.0), "all-reject must report 0%, not n/a");
+        assert_eq!(b4.rate(), Some(1.0), "all-accept must report 100%");
+
+        // Per-user multiplier: all-accept at depth 2 commits 3 tokens/step/user.
+        assert_eq!(b4.tokens_per_step(), Some(3.0));
+        assert_eq!(b2.tokens_per_step(), Some(1.0));
+        // Aggregate multiplier: 4 users x 3 tokens out of ONE forward.
+        assert_eq!(b4.tokens_per_batch_step(), Some(12.0));
+        assert_eq!(b2.tokens_per_batch_step(), Some(2.0));
+        assert_eq!(b4.mean_batch(), Some(4.0));
+
+        let marker = b4.marker("b=4");
+        for field in [
+            "accept_rate=1.0000",
+            "tok_per_step=3.0000",
+            "batch_steps=1",
+            "mean_batch=4.0000",
+            "tok_per_batch_step=12.0000",
+        ] {
+            assert!(marker.contains(field), "marker missing `{field}`: {marker}");
+        }
+    }
+
+    /// `plan_batch_step` is the one place the batch resolution lives, and the
+    /// fast path asserts against it. Pin the exact ragged case by hand so a
+    /// refactor cannot quietly redefine "keep".
+    #[test]
+    fn plan_batch_step_keeps_only_what_every_sequence_can_prove() {
+        // Window 4. Seq 0 fed 1 real token and accepted 3 drafts; seq 1 fed 1
+        // real token and accepted none; seq 2 fed 2 real tokens and accepted 1.
+        let plan = plan_batch_step(&[1, 1, 2], &[3, 0, 1], 4);
+        assert_eq!(
+            plan.keep, 1,
+            "seq 1 can only vouch for its single real slot"
+        );
+        assert_eq!(plan.n_drop, 3);
+        // Seq 0 committed 4 tokens but the cache advanced 1, so it carries 4
+        // uncached; seq 1 committed 1 and carries 1; seq 2 committed 2 against
+        // a 2-slot valid extent and carries 3.
+        assert_eq!(plan.next_uncached, vec![4, 1, 3]);
+        assert!(plan.next_uncached.iter().all(|u| (1..=4).contains(u)));
     }
 }

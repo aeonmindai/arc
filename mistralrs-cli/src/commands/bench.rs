@@ -199,15 +199,24 @@ pub async fn run_bench(
 /// for and nothing was measured, that is itself the finding and it gets its own
 /// `WARN[MTP]` line rather than an absence.
 fn report_mtp_acceptance(mtp_depth: usize) {
-    match mistralrs_core::mtp_acceptance_marker() {
-        Some(marker) => println!("{marker}"),
-        None if mtp_depth > 0 => println!(
+    let markers = mistralrs_core::mtp_acceptance_markers();
+    if !markers.is_empty() {
+        // Aggregate first, then one line per batch size. The per-user
+        // multiplier is a function of B (`CEILINGS.json`: the per-user ceiling
+        // falls from 1413 tok/s at B=1 to 68 at B=128), so an aggregate over a
+        // run whose batch size moved is a number about no particular batch.
+        for marker in markers {
+            println!("{marker}");
+        }
+        return;
+    }
+    if mtp_depth > 0 {
+        println!(
             "WARN[MTP] --mtp-depth {mtp_depth} was requested but no MTP decode step ran: \
              either the model exposes no MTP head, or every step fell back to the target \
-             pipeline (batched / paged-attn / xlora / raw-logits). Acceptance is UNMEASURED \
+             pipeline (paged-attn / xlora / raw-logits). Acceptance is UNMEASURED \
              for this run — do not read it as 0%."
-        ),
-        None => {}
+        );
     }
 }
 
