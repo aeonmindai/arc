@@ -775,6 +775,37 @@ impl Sequence {
         &mut self.normal_cache
     }
 
+    /// The key sequences must agree on to share a forward pass: how many
+    /// positions of this sequence are already in its `NormalCache`.
+    ///
+    /// **Not** `len()`. `NormalCacheManager::clone_in_cache` builds ONE dense
+    /// batched cache and `SingleCache::append` writes every sequence's new K/V
+    /// at that single shared offset, so it is the *cache* length that has to
+    /// match, never the token count.
+    ///
+    /// For every non-speculative path the two are the same partition —
+    /// `cache_len == len() - 1` is the invariant plain decode maintains, and
+    /// subtracting one from every key does not move a single sequence between
+    /// buckets. MTP is what makes them differ: a step commits between 1 and
+    /// `depth + 1` tokens per sequence while the shared cache advances by the
+    /// batch minimum, so token lengths diverge while cache lengths stay
+    /// uniform. Bucketing on `len()` there would shatter a batch into one
+    /// bucket per accept length and idle all but one of them
+    /// (`select_running_bucket` runs exactly one bucket per step) — which is
+    /// the throughput cliff batched MTP exists to avoid.
+    ///
+    /// Falls back to `len().saturating_sub(1)` when no cache slot is populated
+    /// yet (a fresh sequence, or a PagedAttention run where the `NormalCache`
+    /// is unused), which reproduces the historical key exactly.
+    pub fn cache_bucket_len(&self) -> usize {
+        self.normal_cache
+            .iter()
+            .flatten()
+            .map(KvCache::current_seq_len)
+            .next()
+            .unwrap_or_else(|| self.len().saturating_sub(1))
+    }
+
     pub fn normal_draft_cache(&mut self) -> &mut Vec<Option<KvCache>> {
         &mut self.normal_draft_cache
     }

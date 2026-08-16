@@ -172,7 +172,11 @@ impl<Backer: FcfsBacker> BucketingManager<Backer> for FixedBucketingManager {
         let mut seq_buckets: HashMap<BucketKey, Vec<Sequence>> = HashMap::new();
         let mut seq_priorities: HashMap<BucketKey, f64> = HashMap::new();
         for seq in running {
-            let len = seq.len();
+            // The cache length, not the token count — see
+            // `Sequence::cache_bucket_len`. Identical partition for every
+            // non-speculative path; the one that keeps a batched MTP cohort
+            // whole when its accept lengths differ.
+            let len = seq.cache_bucket_len();
             match seq_buckets.get_mut(&(
                 len,
                 seq.images().is_some() && seq.is_prompt(),
