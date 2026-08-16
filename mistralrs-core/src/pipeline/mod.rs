@@ -99,10 +99,15 @@ pub(crate) use processing::{
 };
 use rand_isaac::Isaac64Rng;
 pub use mtp_pipeline::{
-    mtp_load_depth, mtp_uqff_bake, set_mtp_load_depth, set_mtp_uqff_bake,
-    try_wrap_pipeline_with_mtp, verify_proposed, MtpDecodeKit, MtpHiddenCapture,
+    mtp_acceptance, mtp_acceptance_marker, mtp_load_depth, mtp_uqff_bake, record_mtp_step,
+    reset_mtp_acceptance, set_mtp_load_depth, set_mtp_uqff_bake,
+    try_wrap_pipeline_with_mtp, verify_proposed, MtpAcceptance, MtpDecodeKit, MtpHiddenCapture,
     MtpSpeculativePipeline, VerifyResult,
 };
+/// The MTP rejection rollback, reachable from the V4 model's own tests so the
+/// cache it truncates (K/V **and** `XsRolling` entries) is the real one.
+#[cfg(test)]
+pub(crate) use mtp_pipeline::{n_cache_positions_to_drop, truncate_cache_by};
 pub use speculative::{SpeculativeConfig, SpeculativeLoader, SpeculativePipeline};
 pub use speech::{SpeechLoader, SpeechPipeline};
 use std::any::Any;

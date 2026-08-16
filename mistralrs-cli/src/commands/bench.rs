@@ -107,6 +107,10 @@ pub async fn run_bench(
         if let Ok(logger) = mistralrs.get_logger(None) {
             logger.reset();
         }
+        // …and the MTP counters with them, so the reported acceptance covers
+        // the measured iterations only. Warmup decodes a different (32/16)
+        // shape and its acceptance is not the number being reported.
+        mistralrs_core::reset_mtp_acceptance();
     }
 
     // Run benchmarks
@@ -176,7 +180,35 @@ pub async fn run_bench(
     // Print results
     print_results(&model_id, iterations, &results);
 
+    // MTP speculative decode: report the acceptance rate the run actually
+    // measured, on the same greppable convention as `SPEED[...]`/`BATCH[...]`.
+    //
+    // This is the whole point of putting the counters in a process-global sink:
+    // a GPU session that runs the throughput sweep gets the acceptance number
+    // out of the same process, with no second run and no second rental.
+    report_mtp_acceptance(runtime.mtp_depth as usize);
+
     Ok(())
+}
+
+/// Print the `MTP[agg] …` marker for this process, or say plainly that no
+/// number was produced.
+///
+/// Three separate GPU sessions came home with an empty acceptance artifact, so
+/// silence is not an acceptable outcome here: if `--mtp-depth > 0` was asked
+/// for and nothing was measured, that is itself the finding and it gets its own
+/// `WARN[MTP]` line rather than an absence.
+fn report_mtp_acceptance(mtp_depth: usize) {
+    match mistralrs_core::mtp_acceptance_marker() {
+        Some(marker) => println!("{marker}"),
+        None if mtp_depth > 0 => println!(
+            "WARN[MTP] --mtp-depth {mtp_depth} was requested but no MTP decode step ran: \
+             either the model exposes no MTP head, or every step fell back to the target \
+             pipeline (batched / paged-attn / xlora / raw-logits). Acceptance is UNMEASURED \
+             for this run — do not read it as 0%."
+        ),
+        None => {}
+    }
 }
 
 /// Calculate mean and standard deviation

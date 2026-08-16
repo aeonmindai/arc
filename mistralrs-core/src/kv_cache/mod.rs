@@ -23,7 +23,7 @@ pub use hybrid_cache::{
 pub use rotating_cache::RotatingCache;
 pub use single_cache::SingleCache;
 pub use turboquant_cache::TurboQuantCache;
-pub use xs_rolling::XsRollingCache;
+pub use xs_rolling::{XsRollingCache, XS_TAIL_MARGIN_TOKENS};
 
 pub trait CacheManager<T: CacheManagerMixin + MetadataMixin + ?Sized> {
     fn clone_in_cache(

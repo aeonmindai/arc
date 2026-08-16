@@ -548,59 +548,209 @@ impl MtpDecodeKit {
 /// output.
 const ACCEPTANCE_LOG_EVERY_PROPOSED: usize = 64;
 
-/// `ARC_MTP_LOG_ACCEPTANCE=1` (also `true` / `on`) — env gate for the periodic
-/// acceptance-rate line in the serve log.
+/// Parse the `ARC_MTP_LOG_ACCEPTANCE` gate. **Default ON.**
+///
+/// Off-by-default was how three GPU sessions measured MTP acceptance and came
+/// home with empty files: the number only exists while the process that
+/// produced it is alive, and nobody sets a variable they have not read about.
+/// A speculative decoder that will not say how often it was right is not
+/// measurable, so the line is on whenever MTP is engaged and
+/// `ARC_MTP_LOG_ACCEPTANCE=0` (also `false` / `off` / `no`) turns it off. The
+/// existing runbooks set it to `1`, which still means the same thing.
+fn acceptance_log_from_env(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(str::trim),
+        Some("0") | Some("false") | Some("off") | Some("no")
+    )
+}
+
+/// Whether to emit the periodic acceptance report.
 ///
 /// Read once per process into a `OnceLock`: `record_acceptance` runs on every
 /// verify, which is the decode hot path, and it must not do an env lookup per
-/// token. The name is load-bearing — GPU-session runbooks and
+/// token. The variable name is load-bearing — GPU-session runbooks and
 /// `arc-tools/quality/qlib.py` both reference this exact variable.
 fn acceptance_log_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("ARC_MTP_LOG_ACCEPTANCE").as_deref(),
-            Ok("1") | Ok("true") | Ok("on")
-        )
+        acceptance_log_from_env(std::env::var("ARC_MTP_LOG_ACCEPTANCE").ok().as_deref())
     })
 }
 
-/// Proposed/accepted tallies for MTP speculative decode, plus the env-gated
-/// periodic report that makes them visible from a serve log.
+/// One scope's MTP speculative-decode accounting, as counted at the
+/// accept/reject site.
+///
+/// Every field is a raw count taken at the one place the decision is made
+/// (`MtpSpeculativePipeline::step`). Nothing here is derived from throughput,
+/// wall-clock, or the configured depth: if the counters are wrong the number is
+/// wrong, and there is no smoothing to hide it (DOCTRINE D9).
+///
+/// The two ratios answer different questions and both are needed:
+/// * [`Self::rate`] — `accepted / proposed`, how good the draft head is.
+/// * [`Self::tokens_per_step`] — `committed / steps`, what the decode loop
+///   actually got out of it. This is the number that moves the per-user
+///   ceiling: at B=256 one H200 can sustain ~65 tok/s/user of *steps*, so
+///   `tok_per_step` multiplies straight through it.
+///
+/// [`Self::drafted_steps`] is what separates "the head is bad" from "we never
+/// drafted at all" — a distinction that matters because the draft KV declines
+/// to draft (losslessly, and silently after the first warning) whenever it
+/// cannot be primed. Without it, a 0% acceptance rate is ambiguous.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MtpAcceptance {
+    /// Draft tokens the verifier accepted.
+    pub accepted: usize,
+    /// Draft tokens handed to the verifier.
+    pub proposed: usize,
+    /// MTP decode steps taken, including steps that drafted nothing.
+    pub steps: usize,
+    /// Steps that proposed at least one draft token.
+    pub drafted_steps: usize,
+    /// User-visible tokens committed across those steps.
+    pub committed: usize,
+}
+
+impl MtpAcceptance {
+    /// The accounting for one MTP decode step that proposed `n_proposed` draft
+    /// tokens and got `result` back from the verifier.
+    ///
+    /// `committed` is T0 (always emitted) + the accepted proposals + the
+    /// verifier's correction when there was a rejection — exactly the tokens
+    /// `step()` passes to `finish_or_add_toks_to_seq`. Deriving it here rather
+    /// than at the call site is deliberate: a drift between "what we counted"
+    /// and "what we emitted" is precisely how a speculative decoder comes to
+    /// report a multiplier it never delivered.
+    pub fn from_verify(n_proposed: usize, result: &VerifyResult) -> Self {
+        Self {
+            accepted: result.accepted.len(),
+            proposed: n_proposed,
+            steps: 1,
+            drafted_steps: usize::from(n_proposed > 0),
+            committed: 1 + result.commit_len(),
+        }
+    }
+
+    /// The accounting for a decode step that drafted nothing — no draft KV, no
+    /// budget left, or MTP simply declined. One token out, no proposals.
+    pub fn skipped_step() -> Self {
+        Self {
+            accepted: 0,
+            proposed: 0,
+            steps: 1,
+            drafted_steps: 0,
+            committed: 1,
+        }
+    }
+
+    /// `accepted / proposed`, or `None` when nothing was ever proposed (0/0 is
+    /// not 0%, and printing it as one is how an un-engaged run gets mistaken
+    /// for a failed one).
+    #[allow(clippy::cast_precision_loss)] // counts; >2^53 tokens is not a case
+    pub fn rate(&self) -> Option<f64> {
+        (self.proposed > 0).then(|| self.accepted as f64 / self.proposed as f64)
+    }
+
+    /// Committed tokens per decode step — the effective speculative multiplier.
+    /// Plain (non-speculative) decode is exactly 1.0.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn tokens_per_step(&self) -> Option<f64> {
+        (self.steps > 0).then(|| self.committed as f64 / self.steps as f64)
+    }
+
+    /// The machine-greppable one-liner, in the project's marker convention
+    /// (`SPEED[...]`, `BATCH[...]`, `GSM8K[...]`).
+    ///
+    /// `scope` is `agg` for the process total or `req=<id>` for one request.
+    /// Every raw count is on the line, so both ratios are auditable without
+    /// trusting the formatter.
+    pub fn marker(&self, scope: &str) -> String {
+        let fmt = |v: Option<f64>| v.map_or_else(|| "n/a".to_string(), |x| format!("{x:.4}"));
+        format!(
+            "MTP[{scope}] accept_rate={} accepted={} proposed={} steps={} drafted_steps={} \
+             committed={} tok_per_step={}",
+            fmt(self.rate()),
+            self.accepted,
+            self.proposed,
+            self.steps,
+            self.drafted_steps,
+            self.committed,
+            fmt(self.tokens_per_step()),
+        )
+    }
+
+    /// The human-readable line the runbooks already grep for
+    /// (`grep "MTP acceptance"`). Kept alongside [`Self::marker`] so existing
+    /// GPU-session tooling does not need a new parser.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn report_line(&self) -> String {
+        match self.rate() {
+            None => "MTP acceptance: 0 proposals so far".to_string(),
+            Some(r) => format!(
+                "MTP acceptance rate: {:.1}% ({}/{} accepted)",
+                100.0 * r,
+                self.accepted,
+                self.proposed
+            ),
+        }
+    }
+
+    fn add(&mut self, other: &Self) {
+        self.accepted += other.accepted;
+        self.proposed += other.proposed;
+        self.steps += other.steps;
+        self.drafted_steps += other.drafted_steps;
+        self.committed += other.committed;
+    }
+}
+
+/// Atomic tallies behind an [`MtpAcceptance`] snapshot, plus the periodic
+/// report that makes them visible from a serve log.
 ///
 /// Split out of [`MtpSpeculativePipeline`] so the telemetry is testable on CPU
 /// without standing up a target `dyn Pipeline`. Before this existed,
 /// `log_acceptance_rate()` had **zero callers** anywhere in the workspace: the
 /// counters accumulated and nothing ever read them, so GPU session 3 measured
 /// MTP acceptance and produced an empty artifact.
-///
-/// Honesty (DOCTRINE D9): the reported rate is `accepted / proposed` exactly as
-/// counted at the accept/reject site in `step_mtp`. It is never derived from
-/// throughput, depth, or any other proxy — if the counters are wrong the number
-/// is wrong, and there is no smoothing to hide that.
 #[derive(Debug, Default)]
 pub(crate) struct AcceptanceTelemetry {
-    accepted: std::sync::atomic::AtomicUsize,
-    proposed: std::sync::atomic::AtomicUsize,
+    accepted: AtomicUsize,
+    proposed: AtomicUsize,
+    steps: AtomicUsize,
+    drafted_steps: AtomicUsize,
+    committed: AtomicUsize,
 }
 
 impl AcceptanceTelemetry {
-    /// `(accepted, proposed)` as currently counted.
-    fn snapshot(&self) -> (usize, usize) {
-        use std::sync::atomic::Ordering;
-        (
-            self.accepted.load(Ordering::Relaxed),
-            self.proposed.load(Ordering::Relaxed),
-        )
+    const fn new() -> Self {
+        Self {
+            accepted: AtomicUsize::new(0),
+            proposed: AtomicUsize::new(0),
+            steps: AtomicUsize::new(0),
+            drafted_steps: AtomicUsize::new(0),
+            committed: AtomicUsize::new(0),
+        }
+    }
+
+    /// Everything counted so far.
+    fn snapshot(&self) -> MtpAcceptance {
+        MtpAcceptance {
+            accepted: self.accepted.load(Ordering::Relaxed),
+            proposed: self.proposed.load(Ordering::Relaxed),
+            steps: self.steps.load(Ordering::Relaxed),
+            drafted_steps: self.drafted_steps.load(Ordering::Relaxed),
+            committed: self.committed.load(Ordering::Relaxed),
+        }
     }
 
     fn reset(&self) {
-        use std::sync::atomic::Ordering;
         self.accepted.store(0, Ordering::Relaxed);
         self.proposed.store(0, Ordering::Relaxed);
+        self.steps.store(0, Ordering::Relaxed);
+        self.drafted_steps.store(0, Ordering::Relaxed);
+        self.committed.store(0, Ordering::Relaxed);
     }
 
-    /// Accumulate one verify result; return `true` when this call carried the
+    /// Accumulate one decode step; return `true` when this call carried the
     /// running proposed total across a multiple of `every`, i.e. when the
     /// caller should emit the periodic report.
     ///
@@ -608,36 +758,31 @@ impl AcceptanceTelemetry {
     /// each proposed token belongs to exactly one caller's interval and
     /// concurrent recorders cannot both claim (or both miss) a boundary.
     /// `every == 0` disables reporting rather than dividing by zero.
-    fn accumulate(&self, proposed: usize, accepted: usize, every: usize) -> bool {
-        use std::sync::atomic::Ordering;
-        let before = self.proposed.fetch_add(proposed, Ordering::Relaxed);
-        self.accepted.fetch_add(accepted, Ordering::Relaxed);
-        if every == 0 || proposed == 0 {
+    fn accumulate(&self, step: &MtpAcceptance, every: usize) -> bool {
+        let before = self.proposed.fetch_add(step.proposed, Ordering::Relaxed);
+        self.accepted.fetch_add(step.accepted, Ordering::Relaxed);
+        self.steps.fetch_add(step.steps, Ordering::Relaxed);
+        self.drafted_steps
+            .fetch_add(step.drafted_steps, Ordering::Relaxed);
+        self.committed.fetch_add(step.committed, Ordering::Relaxed);
+        if every == 0 || step.proposed == 0 {
             return false;
         }
-        (before + proposed) / every != before / every
+        (before + step.proposed) / every != before / every
     }
 
     /// The exact line the periodic report emits, as a string, so a test can
     /// assert on the reported ratio without parsing log plumbing.
-    // The crate denies `cast_precision_loss`; here the casts are on token
-    // counts that would need >2^53 proposals to lose a bit, and the value is
-    // printed to one decimal place.
-    #[allow(clippy::cast_precision_loss)]
+    #[cfg(test)]
     fn report_line(&self) -> String {
-        let (accepted, proposed) = self.snapshot();
-        if proposed == 0 {
-            return "MTP acceptance: 0 proposals so far".to_string();
-        }
-        format!(
-            "MTP acceptance rate: {:.1}% ({accepted}/{proposed} accepted)",
-            100.0 * accepted as f64 / proposed as f64
-        )
+        self.snapshot().report_line()
     }
 
     /// Emit the report unconditionally (the manual `log_acceptance_rate` door).
     fn log(&self) {
-        tracing::info!(target: "mtp_speculative", "{}", self.report_line());
+        let snap = self.snapshot();
+        tracing::info!(target: "mtp_speculative", "{}", snap.marker("agg"));
+        tracing::info!(target: "mtp_speculative", "{}", snap.report_line());
     }
 
     /// Accumulate, and emit the periodic report if this call crossed a
@@ -647,16 +792,53 @@ impl AcceptanceTelemetry {
     /// call so the wiring is exercisable from a test: the env gate is memoised
     /// process-wide (correctly — it is on the decode hot path), which would
     /// otherwise make "does the logger actually fire" untestable.
-    fn record_gated(&self, proposed: usize, accepted: usize, enabled: bool) {
-        if self.accumulate(proposed, accepted, ACCEPTANCE_LOG_EVERY_PROPOSED) && enabled {
+    fn record_gated(&self, step: &MtpAcceptance, enabled: bool) {
+        if self.accumulate(step, ACCEPTANCE_LOG_EVERY_PROPOSED) && enabled {
             self.log();
         }
     }
 
     /// Production entry: accumulate and report under `ARC_MTP_LOG_ACCEPTANCE`.
-    fn record(&self, proposed: usize, accepted: usize) {
-        self.record_gated(proposed, accepted, acceptance_log_enabled());
+    fn record(&self, step: &MtpAcceptance) {
+        self.record_gated(step, acceptance_log_enabled());
     }
+}
+
+/// Process-wide MTP accounting.
+///
+/// The per-pipeline counters live behind `Arc<Mutex<dyn Pipeline>>` and cannot
+/// be downcast back out, so a harness that only holds a `MistralRs` handle —
+/// `mistralrs bench`, every HTTP client — has no way to read them. This static
+/// is the sink that makes the number reachable from outside the pipeline
+/// without threading an accessor through the whole `Pipeline` trait.
+static GLOBAL_ACCEPTANCE: AcceptanceTelemetry = AcceptanceTelemetry::new();
+
+/// Process-wide MTP acceptance counters, across every request and every
+/// pipeline instance. All zero when MTP never ran.
+pub fn mtp_acceptance() -> MtpAcceptance {
+    GLOBAL_ACCEPTANCE.snapshot()
+}
+
+/// Zero the process-wide counters (e.g. after benchmark warmup).
+pub fn reset_mtp_acceptance() {
+    GLOBAL_ACCEPTANCE.reset();
+}
+
+/// The aggregate `MTP[agg] …` marker line, or `None` when no MTP decode step
+/// has run in this process — the honest answer to "what was the acceptance
+/// rate" when nothing was measured is *nothing*, not `0%`.
+pub fn mtp_acceptance_marker() -> Option<String> {
+    let snap = mtp_acceptance();
+    (snap.steps > 0).then(|| snap.marker("agg"))
+}
+
+/// Record one MTP decode step into the process-wide counters.
+///
+/// This is exactly the call `MtpSpeculativePipeline::step` makes at its
+/// accept/reject site, exposed so the accounting can be proven — with a
+/// fixture whose outcome is known by construction — without renting a GPU.
+pub fn record_mtp_step(step: MtpAcceptance) {
+    GLOBAL_ACCEPTANCE.record(&step);
 }
 
 /// MTP-accelerated decode pipeline.
@@ -680,6 +862,12 @@ pub struct MtpSpeculativePipeline {
     category: ModelCategory,
     /// Running proposed/accepted tallies plus the env-gated periodic report.
     acceptance: AcceptanceTelemetry,
+    /// Per-request tallies, keyed by `Sequence::id`, flushed as one
+    /// `MTP[req=<id>] …` line when the sequence reaches a terminal state.
+    /// Aggregates hide the case that matters most — one request drafting well
+    /// while another never drafts at all — and that case is the *expected* one
+    /// here, because the draft KV declines to prime on a prefix-cache hit.
+    per_seq: std::sync::Mutex<std::collections::HashMap<usize, MtpAcceptance>>,
     /// Persistent per-sequence draft KV caches (audit finding 2). Keyed by
     /// `Sequence::id`. Bounded by [`Self::MAX_DRAFT_KV_SEQS`] — an entry is
     /// one decoder layer's KV for one sequence.
@@ -738,6 +926,7 @@ impl MtpSpeculativePipeline {
             metadata,
             category,
             acceptance: AcceptanceTelemetry::default(),
+            per_seq: std::sync::Mutex::new(std::collections::HashMap::new()),
             draft_kv: std::sync::Mutex::new(std::collections::HashMap::new()),
             draft_kv_clock: AtomicUsize::new(0),
             warned_unprimed: std::sync::atomic::AtomicBool::new(false),
@@ -768,6 +957,7 @@ impl MtpSpeculativePipeline {
             metadata,
             category,
             acceptance: AcceptanceTelemetry::default(),
+            per_seq: std::sync::Mutex::new(std::collections::HashMap::new()),
             draft_kv: std::sync::Mutex::new(std::collections::HashMap::new()),
             draft_kv_clock: AtomicUsize::new(0),
             warned_unprimed: std::sync::atomic::AtomicBool::new(false),
@@ -779,13 +969,16 @@ impl MtpSpeculativePipeline {
         self.depth
     }
 
-    /// Snapshot of MTP acceptance counters.
-    ///
-    /// Returns `(accepted, proposed)`. The acceptance rate is
-    /// `accepted as f64 / proposed as f64`. Used by `Self::log_acceptance_rate`
-    /// and exposed for tests / metrics.
-    pub fn acceptance_counters(&self) -> (usize, usize) {
+    /// Snapshot of this pipeline's MTP acceptance counters.
+    pub fn acceptance(&self) -> MtpAcceptance {
         self.acceptance.snapshot()
+    }
+
+    /// Snapshot of MTP acceptance counters as `(accepted, proposed)`.
+    /// [`Self::acceptance`] carries the step/commit counts too.
+    pub fn acceptance_counters(&self) -> (usize, usize) {
+        let snap = self.acceptance.snapshot();
+        (snap.accepted, snap.proposed)
     }
 
     /// Reset the MTP acceptance counters.
@@ -831,16 +1024,44 @@ impl MtpSpeculativePipeline {
         )
     }
 
-    /// Record acceptance counters from a verify result.
+    /// Record one MTP decode step: this pipeline's counters, the per-request
+    /// tally, and the process-wide sink [`mtp_acceptance`].
     ///
-    /// With `ARC_MTP_LOG_ACCEPTANCE=1` on the serve process, this also emits
-    /// the running rate every [`ACCEPTANCE_LOG_EVERY_PROPOSED`] proposed
-    /// tokens, so a GPU session can read MTP acceptance out of the serve log
-    /// with `grep "MTP acceptance"`. Off by default — the counters otherwise
-    /// have no caller-facing sink, which is exactly how session 3 measured
-    /// acceptance and got an empty artifact.
-    pub(crate) fn record_acceptance(&self, proposed: usize, accepted: usize) {
-        self.acceptance.record(proposed, accepted);
+    /// Unless `ARC_MTP_LOG_ACCEPTANCE=0`, this also emits the running rate
+    /// every [`ACCEPTANCE_LOG_EVERY_PROPOSED`] proposed tokens, so a GPU
+    /// session reads MTP acceptance out of the serve log with
+    /// `grep 'MTP\[' serve.log` — no extra run, no extra rental.
+    ///
+    /// Steps that drafted nothing are recorded too (`proposed = 0`,
+    /// `committed = 1`): they are what makes `tok_per_step` honest, and
+    /// `drafted_steps` is what tells a reader whether a 0% rate means the head
+    /// was wrong or the draft KV never primed.
+    fn record_step(&self, seq_id: usize, step: MtpAcceptance) {
+        self.acceptance.record_gated(&step, false);
+        if let Ok(mut map) = self.per_seq.lock() {
+            map.entry(seq_id).or_default().add(&step);
+        }
+        // The process-wide sink owns the periodic report so a multi-pipeline
+        // process emits one cadence, not one per pipeline.
+        GLOBAL_ACCEPTANCE.record(&step);
+    }
+
+    /// Emit and forget one request's tally. Called when the sequence reaches a
+    /// terminal state, and again when its draft KV is dropped, so a request
+    /// that ends on a path the fast path never sees is still reported.
+    fn flush_seq_acceptance(&self, seq_id: usize) {
+        let Some(snap) = self
+            .per_seq
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(&seq_id))
+        else {
+            return;
+        };
+        if snap.steps == 0 || !acceptance_log_enabled() {
+            return;
+        }
+        tracing::info!(target: "mtp_speculative", "{}", snap.marker(&format!("req={seq_id}")));
     }
 
     /// Cap on retained per-sequence draft KV caches. Each is one decoder
@@ -891,12 +1112,21 @@ impl MtpSpeculativePipeline {
         if let Ok(mut map) = self.draft_kv.lock() {
             map.remove(&seq_id);
         }
+        self.flush_seq_acceptance(seq_id);
     }
 
     /// Forget every draft KV — the target cache was reset wholesale.
     fn clear_draft_kv(&self) {
         if let Ok(mut map) = self.draft_kv.lock() {
             map.clear();
+        }
+        let ids: Vec<usize> = self
+            .per_seq
+            .lock()
+            .map(|map| map.keys().copied().collect())
+            .unwrap_or_default();
+        for id in ids {
+            self.flush_seq_acceptance(id);
         }
     }
 
@@ -1101,6 +1331,19 @@ async fn run_target_forward(
 /// `futures::executor::block_on(target.lock())` inside the async `step()`,
 /// parking a runtime worker on a pipeline mutex — a deadlock class we do not
 /// want in the serve hot path; see docs/notes/mtp-hang-triage.md.)
+/// Has this sequence stopped generating? The trigger for flushing its
+/// per-request `MTP[req=…]` line.
+fn seq_is_terminal(seq: &Sequence) -> bool {
+    use crate::sequence::SequenceState;
+    matches!(
+        seq.getstate(),
+        SequenceState::Done(_)
+            | SequenceState::FinishedAborted
+            | SequenceState::FinishedIgnored
+            | SequenceState::Error
+    )
+}
+
 fn current_normal_cache_len(this: &MtpSpeculativePipeline) -> usize {
     let EitherCache::Normal(normal) = &this.target_cache else {
         return 0;
@@ -1113,16 +1356,39 @@ fn current_normal_cache_len(this: &MtpSpeculativePipeline) -> usize {
 /// sequence does not need, so the token count and the cache stay in lockstep.
 /// Same lock-free-on-the-pipeline access as [`current_normal_cache_len`].
 fn truncate_normal_cache(this: &MtpSpeculativePipeline, n_drop: usize) -> Result<()> {
-    let EitherCache::Normal(normal) = &this.target_cache else {
+    truncate_cache_by(&this.target_cache, n_drop)
+}
+
+/// The rollback itself, on a bare [`EitherCache`].
+///
+/// Split from [`truncate_normal_cache`] so the rejection path can be exercised
+/// against a **real** cache — including DeepSeek V4's [`crate::XsRollingCache`]
+/// entries, which are not K/V at all: they hold completed compressed rows plus
+/// a bounded raw tail, and map a token-unit truncation onto those two time
+/// bases themselves. Every entry reports its length in tokens, so one `n_drop`
+/// is correct for all of them; what differs is what each has to do to honour
+/// it, and only the xs entries can *refuse*.
+///
+/// A refusal here is a hard error on purpose. `XsRollingCache` declines a
+/// rollback whose raw rows it no longer retains, because resuming from that gap
+/// would silently corrupt the compressor's distant-context branch — a wrong
+/// answer that nothing downstream would catch. `XS_TAIL_MARGIN_TOKENS` (16) is
+/// sized to cover any `--mtp-depth` (clap caps it at 8), so a refusal on this
+/// path means an invariant broke, not that the margin was too small.
+pub(crate) fn truncate_cache_by(cache: &EitherCache, n_drop: usize) -> Result<()> {
+    let EitherCache::Normal(normal) = cache else {
         return Ok(());
     };
     let mut guard = normal.lock().unwrap();
     for cache in &mut *guard.0 {
         let cur = cache.current_seq_len();
         let new_len = cur.saturating_sub(n_drop);
-        cache
-            .set_len(new_len)
-            .map_err(|_| candle_core::Error::msg("MTP: KV cache set_len failed."))?;
+        cache.set_len(new_len).map_err(|e| {
+            candle_core::Error::msg(format!(
+                "MTP: cache set_len({new_len}) failed rolling back {n_drop} of {cur} \
+                 positions: {e}"
+            ))
+        })?;
     }
     Ok(())
 }
@@ -1152,7 +1418,7 @@ fn truncate_normal_cache(this: &MtpSpeculativePipeline, n_drop: usize) -> Result
 /// one slot too many on EVERY rejected chain, permanently desyncing the cache
 /// from the committed tokens (cumulative, one position per rejection). See
 /// docs/notes/mtp-hang-triage.md for the full derivation.
-fn n_cache_positions_to_drop(n_proposed: usize, verify_result: &VerifyResult) -> usize {
+pub(crate) fn n_cache_positions_to_drop(n_proposed: usize, verify_result: &VerifyResult) -> usize {
     n_proposed.saturating_sub(verify_result.commit_len())
 }
 
@@ -1595,9 +1861,16 @@ impl Pipeline for MtpSpeculativePipeline {
             if let Some(state) = draft_state {
                 self.checkin_draft_kv(seq_id, state);
             }
+            // A step that drafted nothing still emitted one token. Counting it
+            // is what keeps `tok_per_step` honest: a run where the draft KV
+            // never primes must report 1.0, not "no data".
+            self.record_step(seq_id, MtpAcceptance::skipped_step());
             finish_or_add_toks_to_seq(self, prefix_cacher, seq, t0_logprobs, eos_tok, true).await?;
+            let done = seq_is_terminal(seq);
             if let CacheInstruction::Reset { .. } = post_op {
                 self.drop_draft_kv(seq_id);
+            } else if done {
+                self.flush_seq_acceptance(seq_id);
             }
             handle_post_cache_op(self, input_seqs, post_op);
             return Ok(start.elapsed());
@@ -1637,9 +1910,11 @@ impl Pipeline for MtpSpeculativePipeline {
         // committing T0 + proposed[..=i-1]. Accept proposed[i] iff
         // verifier_tokens[i] == proposed[i].
         let verify_result = verify_proposed(&proposed, &verifier_tokens);
-        let n_accepted = verify_result.accepted.len();
         let n_proposed = proposed.len();
-        self.record_acceptance(n_proposed, n_accepted);
+        self.record_step(
+            seq_id,
+            MtpAcceptance::from_verify(n_proposed, &verify_result),
+        );
 
         // ---- Step 5: truncate KV cache ----
         // After the verify forward, the cache holds positions for
@@ -1721,8 +1996,11 @@ impl Pipeline for MtpSpeculativePipeline {
 
         // POST cache op (matches what `Pipeline::step` does after a normal
         // forward).
+        let done = seq_is_terminal(&*input_seqs[0]);
         if let CacheInstruction::Reset { .. } = post_op {
             self.drop_draft_kv(seq_id);
+        } else if done {
+            self.flush_seq_acceptance(seq_id);
         }
         handle_post_cache_op(self, input_seqs, post_op);
 
@@ -1800,6 +2078,12 @@ pub fn try_wrap_pipeline_with_mtp(
 }
 
 #[cfg(test)]
+// The crate denies the cast lints. Inside these tests every cast is on a small
+// literal token count (depths of 1-8, step counts of tens) being compared
+// against an exact expected ratio — the precision the lints guard would need
+// >2^53 proposals to matter, and spelling the casts out defensively would
+// obscure the arithmetic the assertions exist to pin.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
     use candle_core::{DType, Device};
@@ -2029,21 +2313,163 @@ mod tests {
         String::from_utf8(bytes).expect("tracing output is UTF-8")
     }
 
+    /// A depth-`proposed` step with `accepted` of them accepted, committing
+    /// T0 + accepted + (the verifier's correction, when anything was rejected)
+    /// — the same arithmetic `step()` does at its accept/reject site.
+    fn step_of(proposed: usize, accepted: usize) -> MtpAcceptance {
+        assert!(accepted <= proposed);
+        let correction = usize::from(accepted < proposed);
+        MtpAcceptance {
+            accepted,
+            proposed,
+            steps: 1,
+            drafted_steps: usize::from(proposed > 0),
+            committed: 1 + accepted + correction,
+        }
+    }
+
     /// Counters accumulate exactly what the verify site hands them, and the
-    /// snapshot reads back `(accepted, proposed)` in that order.
+    /// snapshot reads them back field for field.
     #[test]
     fn acceptance_counters_increment() {
         let tel = AcceptanceTelemetry::default();
-        assert_eq!(tel.snapshot(), (0, 0));
-        tel.record_gated(2, 1, false);
-        tel.record_gated(2, 2, false);
+        assert_eq!(tel.snapshot(), MtpAcceptance::default());
+        tel.record_gated(&step_of(2, 1), false);
+        tel.record_gated(&step_of(2, 2), false);
         assert_eq!(
             tel.snapshot(),
-            (3, 4),
-            "snapshot is (accepted, proposed) = (1+2, 2+2)"
+            MtpAcceptance {
+                accepted: 3,
+                proposed: 4,
+                steps: 2,
+                drafted_steps: 2,
+                // step 1: T0 + 1 accepted + 1 correction = 3
+                // step 2: T0 + 2 accepted, no correction = 3
+                committed: 6,
+            }
         );
         tel.reset();
-        assert_eq!(tel.snapshot(), (0, 0));
+        assert_eq!(tel.snapshot(), MtpAcceptance::default());
+    }
+
+    /// **The mutation proof (DOCTRINE D12).** The counter must *move* with the
+    /// outcome, not merely exist. Force every draft accepted and the reported
+    /// rate must be exactly 1.0; force every draft rejected and it must be
+    /// exactly 0.0. A counter hard-wired to a constant — or one reading the
+    /// wrong side of the accept/reject decision — fails one of the two.
+    #[test]
+    fn acceptance_rate_moves_to_one_on_all_accept_and_zero_on_all_reject() {
+        const DEPTH: usize = 3;
+        const STEPS: usize = 40;
+
+        let all_accept = AcceptanceTelemetry::default();
+        for _ in 0..STEPS {
+            all_accept.record_gated(&step_of(DEPTH, DEPTH), false);
+        }
+        let accept_snap = all_accept.snapshot();
+        assert_eq!(
+            accept_snap.rate(),
+            Some(1.0),
+            "{}",
+            accept_snap.marker("all-accept")
+        );
+        // Every proposal accepted => T0 + depth committed per step, so the
+        // effective multiplier is exactly depth + 1.
+        assert_eq!(accept_snap.tokens_per_step(), Some(DEPTH as f64 + 1.0));
+
+        let all_reject = AcceptanceTelemetry::default();
+        for _ in 0..STEPS {
+            all_reject.record_gated(&step_of(DEPTH, 0), false);
+        }
+        let reject_snap = all_reject.snapshot();
+        assert_eq!(
+            reject_snap.rate(),
+            Some(0.0),
+            "{}",
+            reject_snap.marker("all-reject")
+        );
+        // Nothing accepted still commits T0 + the verifier's correction: even a
+        // useless draft head yields 2 tokens per step, which is exactly why
+        // acceptance and tok_per_step are both reported and neither alone.
+        assert_eq!(reject_snap.tokens_per_step(), Some(2.0));
+
+        // Non-degenerate: the two runs proposed the same number of tokens and
+        // are still distinguishable, so no single broken implementation
+        // satisfies both assertions above.
+        assert_eq!(accept_snap.proposed, reject_snap.proposed);
+        assert_ne!(accept_snap.accepted, reject_snap.accepted);
+
+        // A mixed run lands strictly between them, at the counted ratio.
+        let mixed = AcceptanceTelemetry::default();
+        for i in 0..STEPS {
+            mixed.record_gated(&step_of(DEPTH, i % (DEPTH + 1)), false);
+        }
+        let snap = mixed.snapshot();
+        let rate = snap.rate().expect("the mixed run proposed tokens");
+        assert!(rate > 0.0 && rate < 1.0, "{}", snap.marker("mixed"));
+        assert!(
+            (rate - snap.accepted as f64 / snap.proposed as f64).abs() < f64::EPSILON,
+            "the reported rate must be the counted ratio, with nothing smoothed"
+        );
+    }
+
+    /// A step that drafted nothing is still a step. Without it `tok_per_step`
+    /// would silently exclude the case the draft KV hits most often — drafting
+    /// skipped because the cache could not be primed — and report a multiplier
+    /// the decode loop never delivered.
+    #[test]
+    fn skipped_draft_steps_count_as_steps_and_pull_the_multiplier_to_one() {
+        let skipped = MtpAcceptance {
+            accepted: 0,
+            proposed: 0,
+            steps: 1,
+            drafted_steps: 0,
+            committed: 1,
+        };
+        let tel = AcceptanceTelemetry::default();
+        for _ in 0..10 {
+            tel.record_gated(&skipped, false);
+        }
+        let snap = tel.snapshot();
+        assert_eq!(
+            snap.rate(),
+            None,
+            "0 proposals is 'no measurement', not '0% acceptance'"
+        );
+        assert_eq!(
+            snap.tokens_per_step(),
+            Some(1.0),
+            "a run that never drafted must report the plain-decode multiplier"
+        );
+        assert_eq!(snap.drafted_steps, 0);
+        assert!(
+            snap.marker("agg").contains("accept_rate=n/a"),
+            "{}",
+            snap.marker("agg")
+        );
+
+        // Half drafted, half skipped: the multiplier is the honest average.
+        for _ in 0..10 {
+            tel.record_gated(&step_of(2, 2), false);
+        }
+        let snap = tel.snapshot();
+        assert_eq!((snap.steps, snap.drafted_steps), (20, 10));
+        assert_eq!(snap.rate(), Some(1.0));
+        assert_eq!(snap.tokens_per_step(), Some((10.0 + 30.0) / 20.0));
+    }
+
+    /// The env gate is **on by default**. Three GPU sessions produced empty
+    /// acceptance artifacts; an opt-in measurement is one a rented box forgets
+    /// to turn on. Only an explicit off-value suppresses it.
+    #[test]
+    fn acceptance_logging_is_on_unless_explicitly_disabled() {
+        assert!(acceptance_log_from_env(None), "unset must mean ON");
+        for on in ["1", "true", "on", "yes", " 1 "] {
+            assert!(acceptance_log_from_env(Some(on)), "{on:?} must mean ON");
+        }
+        for off in ["0", "false", "off", "no", " 0 "] {
+            assert!(!acceptance_log_from_env(Some(off)), "{off:?} must mean OFF");
+        }
     }
 
     /// The report fires once per [`ACCEPTANCE_LOG_EVERY_PROPOSED`] proposed
@@ -2055,13 +2481,13 @@ mod tests {
         let tel = AcceptanceTelemetry::default();
         for step in 1..=31 {
             assert!(
-                !tel.accumulate(2, 1, ACCEPTANCE_LOG_EVERY_PROPOSED),
+                !tel.accumulate(&step_of(2, 1), ACCEPTANCE_LOG_EVERY_PROPOSED),
                 "step {step} (total {} proposed) is inside the first period",
                 step * 2
             );
         }
         assert!(
-            tel.accumulate(2, 1, ACCEPTANCE_LOG_EVERY_PROPOSED),
+            tel.accumulate(&step_of(2, 1), ACCEPTANCE_LOG_EVERY_PROPOSED),
             "the step that carries the total to 64 must report"
         );
 
@@ -2070,19 +2496,25 @@ mod tests {
         // would report zero times here, which is the shape of bug that makes a
         // telemetry hook look wired while producing nothing.
         let tel = AcceptanceTelemetry::default();
-        let fires = (0..300).filter(|_| tel.accumulate(3, 2, 64)).count();
-        assert_eq!(tel.snapshot(), (600, 900));
+        let fires = (0..300)
+            .filter(|_| tel.accumulate(&step_of(3, 2), 64))
+            .count();
+        let snap = tel.snapshot();
+        assert_eq!((snap.accepted, snap.proposed), (600, 900));
         assert_eq!(fires, 900 / 64, "900 proposed tokens = 14 whole periods");
 
         // A single oversized batch crosses several periods at once and still
         // reports exactly once — the report is periodic, not per-period.
         let tel = AcceptanceTelemetry::default();
-        assert!(tel.accumulate(1000, 500, 64));
-        assert!(!tel.accumulate(0, 0, 64), "an empty verify reports nothing");
+        assert!(tel.accumulate(&step_of(1000, 500), 64));
+        assert!(
+            !tel.accumulate(&MtpAcceptance::default(), 64),
+            "an empty verify reports nothing"
+        );
 
         // `every == 0` disables reporting instead of dividing by zero.
         let tel = AcceptanceTelemetry::default();
-        assert!(!tel.accumulate(64, 32, 0));
+        assert!(!tel.accumulate(&step_of(64, 32), 0));
     }
 
     /// The reported rate is proposed-vs-accepted **as counted** (DOCTRINE D9),
@@ -2101,18 +2533,37 @@ mod tests {
         // 65 depth-2 chains: 26 fully accepted, 39 half accepted.
         // 130 proposed / 91 accepted = exactly 70.0%.
         for _ in 0..26 {
-            tel.record_gated(2, 2, false);
+            tel.record_gated(&step_of(2, 2), false);
         }
         for _ in 0..39 {
-            tel.record_gated(2, 1, false);
+            tel.record_gated(&step_of(2, 1), false);
         }
-        let (accepted, proposed) = tel.snapshot();
-        assert_eq!((accepted, proposed), (91, 130));
+        let snap = tel.snapshot();
+        assert_eq!((snap.accepted, snap.proposed), (91, 130));
         let line = tel.report_line();
         assert_eq!(line, "MTP acceptance rate: 70.0% (91/130 accepted)");
         // The raw counters are in the line, so the percentage is auditable
         // rather than something the reader has to trust.
-        assert!(line.contains(&format!("{accepted}/{proposed}")), "{line}");
+        assert!(
+            line.contains(&format!("{}/{}", snap.accepted, snap.proposed)),
+            "{line}"
+        );
+
+        // Same for the greppable marker: every raw count plus both ratios.
+        let marker = snap.marker("agg");
+        assert!(marker.starts_with("MTP[agg] "), "{marker}");
+        for field in [
+            "accept_rate=0.7000",
+            "accepted=91",
+            "proposed=130",
+            "steps=65",
+            "drafted_steps=65",
+            // 26 * (1 + 2) + 39 * (1 + 1 + 1) = 78 + 117
+            "committed=195",
+            "tok_per_step=3.0000",
+        ] {
+            assert!(marker.contains(field), "marker missing {field}: {marker}");
+        }
     }
 
     /// **The wiring gate.** The line must reach `tracing` from
@@ -2125,7 +2576,7 @@ mod tests {
         let tel = AcceptanceTelemetry::default();
         let logs = capture_logs(|| {
             for _ in 0..32 {
-                tel.record_gated(2, 1, true);
+                tel.record_gated(&step_of(2, 1), true);
             }
         });
         assert_eq!(
@@ -2133,24 +2584,30 @@ mod tests {
             1,
             "exactly one periodic report over 64 proposed tokens; got:\n{logs}"
         );
+        assert_eq!(
+            logs.matches("MTP[agg]").count(),
+            1,
+            "the greppable marker must accompany it, exactly once; got:\n{logs}"
+        );
         assert!(
             logs.contains("MTP acceptance rate: 50.0% (32/64 accepted)"),
             "the emitted line must carry the counted ratio; got:\n{logs}"
         );
 
         // Gate OFF: identical traffic, no output. (Counters still accumulate —
-        // `log_acceptance_rate()` and `acceptance_counters()` stay useful.)
+        // `log_acceptance_rate()` and `acceptance()` stay useful.)
         let tel = AcceptanceTelemetry::default();
         let logs = capture_logs(|| {
             for _ in 0..32 {
-                tel.record_gated(2, 1, false);
+                tel.record_gated(&step_of(2, 1), false);
             }
         });
         assert!(
-            !logs.contains("MTP acceptance"),
-            "the report must stay off by default; got:\n{logs}"
+            !logs.contains("MTP acceptance") && !logs.contains("MTP["),
+            "the gate must suppress every line; got:\n{logs}"
         );
-        assert_eq!(tel.snapshot(), (32, 64));
+        let snap = tel.snapshot();
+        assert_eq!((snap.accepted, snap.proposed), (32, 64));
 
         // The manual door still works regardless of the gate.
         let logs = capture_logs(|| tel.log());
