@@ -191,21 +191,130 @@ def complete_stream(prompt, max_tokens=256, temperature=0.0, top_p=1.0, timeout=
     }
 
 
-def looks_degenerate(text, max_period=8, min_span=14):
-    """Detect the classic 2-bit repetition loop ("UserUserUser...",
-    "Red green blue red green blue ..."): >= `min_span` consecutive words
-    forming a cycle of period <= `max_period`."""
-    words = text.split()
+# ------------------------------------------------------------- degeneracy
+#
+# WHY THIS WAS REWRITTEN (wave39-BQ). The original detector was
+#
+#     words = text.split()
+#     for p in 1..=8:  run of words[i] == words[i-p];  return True if run+p >= 14
+#
+# and it was wrong in BOTH directions, verified against the four archived
+# GSM8K runs (s1/s2/s3/s9 results JSON):
+#
+#  * FALSE POSITIVE. `run + p >= 14` means ONE repetition of a 7-word phrase
+#    trips it. Step-by-step algebra does that naturally: wave34-BL's single
+#    reported "degenerate" (gsm8k_s9.json idx=211) is a CORRECT, cleanly
+#    stopped 185-token answer whose LaTeX derivation lines
+#      \( 3r + 5r + 10 = 42 \)  /  \( 8r + 10 = 42 \)
+#    repeat at period 7. The published "1 degenerate" was a harness artifact.
+#  * FALSE NEGATIVE, on its own headline example. `text.split()` collapses an
+#    unspaced token loop into ONE word, so looks_degenerate("User" * 200) is
+#    False — the docstring's first case was undetectable.
+#  * FALSE NEGATIVE, on real loops. s1 idx=465 ("Thus final answer: ####30."
+#    x N, period 13 words) and s1 idx=553 (period 22 words) are unambiguous
+#    loops that the old p<=8 window could not see; both were scored clean.
+#
+# The replacement is a union of three checks, each tuned against real output:
+#   1. word cycle   - short cycles, but now needs >= 4 full repeats / 40 words
+#   2. char cycle   - catches unspaced loops the word path is blind to
+#   3. n-gram saturation - distinct 4-grams in the tail; catches long-period
+#                          loops that no small-period scan can reach
+#
+# SEPARATION (measured on 350 archived completions, 300-char tails):
+#   worst distinct-4gram ratio among CORRECT + finish_reason=="stop" .. 0.574
+#   best  distinct-4gram ratio among the four known loops ............ 0.418
+# The 0.45 threshold sits in that gap. test_degeneracy.py asserts the gap
+# still exists, so a future retune cannot silently close it.
+
+DEGEN_WORD_MAX_PERIOD = 10      # word-cycle: periods 1..N considered
+DEGEN_WORD_MIN_REPEATS = 4      # word-cycle: full cycles required
+DEGEN_WORD_MIN_SPAN = 40        # word-cycle: words the cycle must cover
+DEGEN_CHAR_MAX_PERIOD = 60      # char-cycle: periods 1..N considered
+DEGEN_CHAR_MIN_REPEATS = 6      # char-cycle: full cycles required
+DEGEN_CHAR_MIN_SPAN = 150       # char-cycle: chars the cycle must cover
+DEGEN_NGRAM_N = 4               # saturation: n-gram size
+DEGEN_NGRAM_WINDOW = 120        # saturation: trailing words examined
+DEGEN_NGRAM_MIN_GRAMS = 40      # saturation: too-short tails are not judged
+DEGEN_NGRAM_MAX_RATIO = 0.45    # saturation: distinct/total below this = loop
+
+
+def _longest_cycle(seq, max_period, min_repeats, min_span):
+    """Longest repeated cycle in `seq` meeting both bars, else None.
+
+    Returns (period, span, end_index). `span` counts the whole periodic
+    region (the seed cycle plus every repeat of it), so `span // period` is
+    the number of full repetitions.
+    """
+    n = len(seq)
+    best = None
     for p in range(1, max_period + 1):
+        if n < p * min_repeats:
+            break
         run = 0
-        for i in range(p, len(words)):
-            if words[i] == words[i - p]:
+        for i in range(p, n):
+            if seq[i] == seq[i - p]:
                 run += 1
-                if run + p >= min_span:
-                    return True
+                span = run + p
+                if (run // p + 1 >= min_repeats and span >= min_span
+                        and (best is None or span > best[1])):
+                    best = (p, span, i)
             else:
                 run = 0
-    return False
+        if best is not None:
+            return best
+    return None
+
+
+def _ngram_saturation(text, n=DEGEN_NGRAM_N, window=DEGEN_NGRAM_WINDOW):
+    """(distinct_ratio, n_grams) over the trailing `window` words, or
+    (None, 0) when the tail is too short to judge."""
+    words = text.split()[-window:]
+    if len(words) < n + 8:
+        return None, 0
+    grams = [tuple(words[i:i + n]) for i in range(len(words) - n + 1)]
+    return len(set(grams)) / len(grams), len(grams)
+
+
+def degeneracy_report(text):
+    """None for a healthy completion; a dict describing the loop otherwise.
+
+    The dict always carries `kind` ("word_cycle" | "char_cycle" |
+    "ngram_saturation") and enough numbers to audit the call without rerunning
+    the model — results JSON stores it verbatim, so a flagged run can be
+    triaged offline.
+    """
+    if not text:
+        return None
+
+    cyc = _longest_cycle(text.split(), DEGEN_WORD_MAX_PERIOD,
+                         DEGEN_WORD_MIN_REPEATS, DEGEN_WORD_MIN_SPAN)
+    if cyc is not None:
+        period, span, _ = cyc
+        return {"kind": "word_cycle", "period_words": period,
+                "span_words": span, "repeats": span // period}
+
+    cyc = _longest_cycle(text, DEGEN_CHAR_MAX_PERIOD,
+                         DEGEN_CHAR_MIN_REPEATS, DEGEN_CHAR_MIN_SPAN)
+    if cyc is not None:
+        period, span, end = cyc
+        return {"kind": "char_cycle", "period_chars": period,
+                "span_chars": span, "repeats": span // period,
+                "unit": text[end - period + 1:end + 1]}
+
+    ratio, n_grams = _ngram_saturation(text)
+    if ratio is not None and n_grams >= DEGEN_NGRAM_MIN_GRAMS \
+            and ratio < DEGEN_NGRAM_MAX_RATIO:
+        return {"kind": "ngram_saturation", "n": DEGEN_NGRAM_N,
+                "distinct_ratio": round(ratio, 4), "n_grams": n_grams,
+                "window_words": DEGEN_NGRAM_WINDOW}
+
+    return None
+
+
+def looks_degenerate(text):
+    """Bool form of degeneracy_report() — kept for run_coherence.py and
+    run_longctx.py, which gate PASS/FAIL on it."""
+    return degeneracy_report(text) is not None
 
 
 def write_json(path, obj):
