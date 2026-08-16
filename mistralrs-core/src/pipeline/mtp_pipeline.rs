@@ -2172,11 +2172,23 @@ impl Pipeline for MtpSpeculativePipeline {
             // The prompt forward is the ONE place the target produces hidden
             // states for the whole context, so it is where the draft KV gets
             // prefilled — the reference's `forward_draft_extend`
-            // (`eagle_worker.py:1094-1128`). Any other fallback (batched,
-            // xlora, raw logits) just drops the capture, so a stale block can
-            // never be attributed to the wrong sequence on a later step.
-            let single_seq_prompt = is_prompt && input_seqs.len() == 1;
-            let seq_id = single_seq_prompt.then(|| *input_seqs[0].id());
+            // (`eagle_worker.py:1094-1128`). Any other fallback (xlora, raw
+            // logits) just drops the capture, so a stale block can never be
+            // attributed to the wrong sequence on a later step.
+            //
+            // A **batched** prompt primes every row, not just row 0. Skipping
+            // it would have made batched MTP dead on arrival in a real serve:
+            // 128 concurrent arrivals prefill together, so no sequence would
+            // ever get a seed and every decode step would decline to draft —
+            // losslessly, silently, and at exactly zero speedup.
+            // `make_prompt_chunk` right-pads to the batch's longest prompt, so
+            // row `i`'s real positions are `[0, len_i)` and
+            // `extend_draft_kv_row`'s own `i <= L-2` bound already stops there.
+            let prompt_ids: Vec<usize> = if is_prompt && self.kit.block.is_some() {
+                input_seqs.iter().map(|s| *s.id()).collect()
+            } else {
+                Vec::new()
+            };
             let elapsed = {
                 let mut target = self.target.lock().await;
                 target
@@ -2191,34 +2203,37 @@ impl Pipeline for MtpSpeculativePipeline {
                     )
                     .await?
             };
-            match seq_id {
-                Some(seq_id) if self.kit.block.is_some() => {
-                    let capture = self.kit.hidden_capture.take();
-                    if let Some(mut state) = self.checkout_draft_kv(seq_id) {
-                        let toks = input_seqs[0].get_toks().to_vec();
-                        match self.extend_draft_kv(&mut state, capture, &toks) {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                state.poisoned = true;
-                                self.warn_unprimed_once(
-                                    "the prompt forward's hidden states do not cover the \
-                                     sequence contiguously from position 0 (batched prefill, \
-                                     chunked prefill, or a prefix-cache hit)",
-                                );
-                            }
-                            Err(e) => {
-                                state.poisoned = true;
-                                tracing::warn!(
-                                    target: "mtp_speculative",
-                                    "MTP draft-KV prefill failed ({e}); drafting disabled for \
-                                     this sequence"
-                                );
-                            }
+            if prompt_ids.is_empty() {
+                self.kit.hidden_capture.clear();
+            } else {
+                let capture = self.kit.hidden_capture.take();
+                let batch = prompt_ids.len();
+                for (row, seq_id) in prompt_ids.into_iter().enumerate() {
+                    let Some(mut state) = self.checkout_draft_kv(seq_id) else {
+                        continue;
+                    };
+                    let toks = input_seqs[row].get_toks().to_vec();
+                    match self.extend_draft_kv_row(&mut state, capture.clone(), &toks, row, batch) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            state.poisoned = true;
+                            self.warn_unprimed_once(
+                                "the prompt forward's hidden states do not cover the \
+                                 sequence contiguously from position 0 (chunked prefill \
+                                 or a prefix-cache hit)",
+                            );
                         }
-                        self.checkin_draft_kv(seq_id, state);
+                        Err(e) => {
+                            state.poisoned = true;
+                            tracing::warn!(
+                                target: "mtp_speculative",
+                                "MTP draft-KV prefill failed ({e}); drafting disabled for \
+                                 this sequence"
+                            );
+                        }
                     }
+                    self.checkin_draft_kv(seq_id, state);
                 }
-                _ => self.kit.hidden_capture.clear(),
             }
             return Ok(elapsed);
         }
