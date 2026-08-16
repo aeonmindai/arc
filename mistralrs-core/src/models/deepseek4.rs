@@ -1618,7 +1618,13 @@ impl Attention {
                 )?
             }
             None => {
-                let cached = append_kv_mqa(kv_cache, &k, k_packed.as_ref())?;
+                // FP8 code storage is opt-in (`ARC_V4_FP8_KV=1`); unset stores
+                // the dense BF16 K the model has always stored.
+                let cached = append_kv_mqa(
+                    kv_cache,
+                    &k,
+                    k_packed.as_ref().filter(|_| v4_fp8_kv_enabled()),
+                )?;
                 // Reconstruct only what any query row in this block can reach.
                 // Dense storage stays whole (`raw_prefix = 0`) so
                 // `dsv4_attention` narrows exactly as it did before; packed
@@ -2318,17 +2324,23 @@ impl V4CachedK {
     }
 }
 
-/// Append V4's fused K/V. `packed` is the quantized form of `k` when the
-/// geometry admits one; it is stored in place of `k` unless FP8 KV is off
-/// ([`v4_fp8_kv_enabled`]), in which case `k` is stored dense beside a 1-wide
-/// marker. Returns the full cached sequence in whichever layout was written.
+/// Append V4's fused K/V. `packed` is the quantized form of `k`, already
+/// filtered by the caller: `Some` stores the FP8 codes, `None` stores `k` dense
+/// beside a 1-wide marker. Returns the full cached sequence in whichever layout
+/// was written.
+///
+/// The [`v4_fp8_kv_enabled`] gate is applied by the caller, not here, so this
+/// function's two layouts are both reachable from a test without mutating the
+/// process environment — the `OnceLock` behind that gate resolves once per
+/// process, so an env-driven test of the packed path would silently measure the
+/// dense one under a different default.
 fn append_kv_mqa(
     kv_cache: &mut KvCache,
     k: &Tensor,
     packed: Option<&V4PackedK>,
 ) -> Result<V4CachedK> {
     require_normal_kv_slot(kv_cache)?;
-    match packed.filter(|_| v4_fp8_kv_enabled()) {
+    match packed {
         Some(p) => {
             let (codes, side) = kv_cache.append(&p.codes, &p.side)?;
             Ok(V4CachedK::Packed(Box::new(V4PackedK {
@@ -2363,7 +2375,7 @@ fn append_graph_kv_mqa(
     if v4_fp8_kv_enabled() {
         candle_core::bail!(
             "V4 CUDA-graph decode needs the dense KV layout, but FP8 KV storage is on. \
-             Set ARC_V4_FP8_KV=0, or teach mistralrs_quant::kvwrite::write_kv_inplace \
+             Unset ARC_V4_FP8_KV, or teach mistralrs_quant::kvwrite::write_kv_inplace \
              the U8 code cache."
         );
     }
@@ -2372,20 +2384,42 @@ fn append_graph_kv_mqa(
     Ok(k_full)
 }
 
-/// FP8 storage for the cached K, on by default.
+/// FP8 storage for the cached K. **Opt-in: off unless `ARC_V4_FP8_KV=1`.**
 ///
-/// Off when `ARC_V4_FP8_KV=0` (on-GPU A/B triage), and off under
-/// `ARC_V4_CAPTURE_PROBE` because the CUDA-graph decode arm writes through
-/// `mistralrs_quant::kvwrite::write_kv_inplace`, which is instantiated for
-/// F16/BF16/F32 only — a U8 code cache needs a U8 variant of that kernel.
+/// wave43-BU shipped this defaulted ON without ever running it on a GPU — its
+/// own notes said *"needs a GPU: first CUDA exercise of a U8 `SingleCache`"* —
+/// and the first V4 forward on a commit that contained it died, every request,
+/// with `dtype mismatch in slice-set, lhs: BF16, rhs: U8` (wave48-BY). The
+/// layout is sound and bit-exact (see [`super::dsv4_kv_fp8`]); what was never
+/// exercised is the CUDA leg of it. Until a GPU A/B has shown
+/// `ARC_V4_FP8_KV=1` and unset producing token-identical greedy output, the
+/// default is the layout that has actually served (wave49-BZ).
+///
+/// Also forced off under `ARC_V4_CAPTURE_PROBE`: the CUDA-graph decode arm
+/// writes through `mistralrs_quant::kvwrite::write_kv_inplace`, which is
+/// instantiated for F16/BF16/F32 only — a U8 code cache needs a U8 variant of
+/// that kernel.
+///
 /// Resolved once: `deepseek4` used to scan the environment per timer call and
 /// paid ~390 `getenv`s per forward for it (wave33).
 fn v4_fp8_kv_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        let off = std::env::var("ARC_V4_FP8_KV").map(|v| v == "0").unwrap_or(false);
-        !off && std::env::var_os("ARC_V4_CAPTURE_PROBE").is_none()
+        fp8_kv_enabled_from(
+            std::env::var("ARC_V4_FP8_KV").ok().as_deref(),
+            std::env::var_os("ARC_V4_CAPTURE_PROBE").is_some(),
+        )
     })
+}
+
+/// The opt-in decision itself, separated from the process-wide [`OnceLock`] so
+/// it can be tested against every input rather than against whatever the test
+/// runner's environment happened to be (`v4_fp8_kv_is_opt_in`). A `OnceLock`
+/// resolves once per process: a test that sets the variable proves nothing
+/// about the default, which is exactly the kind of test DOCTRINE D12 counts as
+/// worse than none.
+fn fp8_kv_enabled_from(var: Option<&str>, capture_probe: bool) -> bool {
+    var == Some("1") && !capture_probe
 }
 
 /// RUN-161 decode profiler. Enabled by `ARC_TIME_DECODE=1`. Accumulates
@@ -4639,6 +4673,238 @@ mod kv_footprint_tests {
             .iter()
             .all(|x| *x == 0.0));
         Ok(())
+    }
+
+    /// A V4 KV slot built **the way the engine builds it for a prompt step**,
+    /// which is not how any other test in this file builds one.
+    ///
+    /// Every test above starts from `KvCache::new_normal`, whose `all_data` is
+    /// `None`, so `SingleCache::append` allocates the buffer from the *first*
+    /// `src` and can never disagree with it. The live path does the opposite:
+    ///
+    /// * `engine/add_request.rs:464` allocates a per-sequence buffer
+    ///   `[1, num_kv_heads, cap, k_head_dim]` in the **activation dtype** —
+    ///   for V4 Flash, BF16 and `head_dim = 512` wide, for BOTH halves
+    ///   (`ModelConfigMetadata::v_head_dim` is also `cfg.head_dim`);
+    /// * on a prompt step with `token_offset() == 0` the engine issues
+    ///   `CacheInstruction::Reset { load_preallocated_cache: true }`
+    ///   (`engine/mod.rs:470`), and `NormalCacheManager::set_none_cache`
+    ///   installs that buffer as `all_data` (`kv_cache/mod.rs:802`) **before
+    ///   the first append**.
+    ///
+    /// So the first thing V4's append meets is a pre-grown BF16 512-wide
+    /// buffer, and neither of V4's two layouts fits it: the packed K half is
+    /// U8 448-wide and the dense V half is a 1-wide marker. This helper
+    /// reproduces that construction exactly.
+    fn preallocated_v4_slot(capacity: usize, head_dim: usize) -> Result<KvCache> {
+        let dev = Device::Cpu;
+        // `k_head_dim == v_head_dim == cfg.head_dim` (see `ModelConfigMetadata`
+        // in `DeepSeekV4::new`), and the dtype is `activation_dtype`.
+        let shape = (1usize, 1usize, capacity, head_dim);
+        Ok(KvCache::Normal {
+            k: SingleCache {
+                all_data: Some(Tensor::zeros(shape, DType::BF16, &dev)?),
+                dim: 2,
+                current_seq_len: 0,
+                max_seq_len: 4096,
+                capacity_seq_len: capacity,
+            },
+            v: SingleCache {
+                all_data: Some(Tensor::zeros(shape, DType::BF16, &dev)?),
+                dim: 2,
+                current_seq_len: 0,
+                max_seq_len: 4096,
+                capacity_seq_len: capacity,
+            },
+        })
+    }
+
+    /// **The regression wave48-BY hit on hardware.** Packed storage appending
+    /// into the engine's preallocated slot: the K half's `all_data` is BF16 and
+    /// the codes are U8, so `SingleCache::append`'s `slice_set` used to fail
+    /// with `dtype mismatch in slice-set, lhs: BF16, rhs: U8` — every forward,
+    /// including the engine's own dummy run, 0 tokens returned.
+    ///
+    /// The assertion is not merely "it does not error": a cache that silently
+    /// dropped the write, or reallocated and lost the token, would still not
+    /// error. It must read back **bit-identically** to the reference round
+    /// trip, which is the same claim
+    /// [`packed_cache_reconstructs_the_stored_keys`] makes about the
+    /// freshly-allocated slot.
+    #[test]
+    fn packed_append_into_the_engines_preallocated_slot_round_trips() -> Result<()> {
+        const HEAD_DIM: usize = 512;
+        const ROPE_DIM: usize = 64;
+        const CAPACITY: usize = NormalCache::CACHE_GROW_SIZE;
+        let dev = Device::Cpu;
+        let mode = super::super::dsv4_kv_fp8::KvQuantMode::CpuExact;
+        let mut slot = preallocated_v4_slot(CAPACITY, HEAD_DIM)?;
+
+        // Fixture discrimination (DOCTRINE D12): the slot must actually
+        // disagree with what the packed layout writes, or this test passes for
+        // a cache that never had to reallocate anything.
+        {
+            let KvCache::Normal { k, v } = &slot else {
+                panic!("preallocated V4 slot must be Normal")
+            };
+            let (kd, vd) = (k.all_data.as_ref().unwrap(), v.all_data.as_ref().unwrap());
+            assert_eq!(kd.dtype(), DType::BF16);
+            assert_ne!(
+                kd.dtype(),
+                DType::U8,
+                "fixture cannot discriminate: the preallocated K half must be \
+                 the activation dtype, or there is no dtype contract to break"
+            );
+            assert_ne!(
+                kd.dims()[3],
+                HEAD_DIM - ROPE_DIM,
+                "fixture cannot discriminate: the preallocated K half must be \
+                 head_dim-wide, not nope-wide"
+            );
+            assert_ne!(
+                vd.dims()[3],
+                ROPE_DIM + (HEAD_DIM - ROPE_DIM) / super::super::dsv4_kv_fp8::KV_QUANT_BLOCK,
+                "fixture cannot discriminate: the preallocated V half must be \
+                 head_dim-wide, not [rope ++ amax]-wide"
+            );
+        }
+
+        let tokens = 5usize;
+        let mut expected: Vec<u16> = Vec::new();
+        for t in 0..tokens {
+            let row: Vec<f32> = (0..HEAD_DIM)
+                .map(|i| ((t + 1) as f32) * 0.41 - 0.03 * (i % 47) as f32)
+                .collect();
+            let k = Tensor::from_vec(row, (1, 1, 1, HEAD_DIM), &dev)?.to_dtype(DType::BF16)?;
+            let packed = super::super::dsv4_kv_fp8::quantize_k(&k, ROPE_DIM, mode)?
+                .expect("448 nope dims are 7 whole blocks");
+            expected.extend(
+                packed
+                    .dequant(DType::BF16)?
+                    .flatten_all()?
+                    .to_vec1::<half::bf16>()?
+                    .into_iter()
+                    .map(|v| v.to_bits()),
+            );
+            let cached = append_kv_mqa(&mut slot, &k, Some(&packed))?;
+            assert!(matches!(cached, V4CachedK::Packed(_)));
+            assert_eq!(cached.seq_len()?, t + 1);
+        }
+
+        let KvCache::Normal { k, v } = &slot else {
+            panic!("V4 slot must be KvCache::Normal")
+        };
+        // The buffer that survives is the packed one, at the capacity the
+        // engine preallocated — the pre-grow is kept, only its dtype/width are
+        // corrected.
+        let kd = k.all_data.as_ref().expect("codes materialised");
+        assert_eq!(kd.dtype(), DType::U8);
+        assert_eq!(kd.dims(), &[1, 1, CAPACITY, HEAD_DIM - ROPE_DIM]);
+        assert_eq!(k.capacity_seq_len, CAPACITY);
+        assert_eq!(k.current_seq_len, tokens);
+        assert_eq!(k.current_seq_len, v.current_seq_len);
+
+        let cached = V4CachedK::Packed(Box::new(V4PackedK {
+            codes: k.current_data()?.expect("codes materialised"),
+            side: v.current_data()?.expect("side materialised"),
+            rope_dim: ROPE_DIM,
+        }));
+        let got: Vec<u16> = cached
+            .span(0, tokens, DType::BF16)?
+            .flatten_all()?
+            .to_vec1::<half::bf16>()?
+            .into_iter()
+            .map(|v| v.to_bits())
+            .collect();
+        assert_eq!(
+            got, expected,
+            "the packed cache must read back bit-identically after being \
+             appended into the engine's preallocated slot"
+        );
+        Ok(())
+    }
+
+    /// The same contract for the **default** (opt-out) layout, which is what
+    /// `master` now runs: dense K plus the 1-wide V marker. This one never
+    /// disagreed on dtype, so it never produced wave48-BY's message — it
+    /// disagreed on WIDTH, and `slice_set` checks dtype before shape
+    /// (`candle-core/src/tensor_cat.rs:254` vs `:278`), so this failure was
+    /// hiding *behind* the FP8 one. Flipping the gate alone would have moved
+    /// the error, not removed it.
+    #[test]
+    fn dense_append_into_the_engines_preallocated_slot_round_trips() -> Result<()> {
+        const HEAD_DIM: usize = 512;
+        const CAPACITY: usize = NormalCache::CACHE_GROW_SIZE;
+        let dev = Device::Cpu;
+        let mut slot = preallocated_v4_slot(CAPACITY, HEAD_DIM)?;
+
+        let tokens = 4usize;
+        let mut expected: Vec<u16> = Vec::new();
+        for t in 0..tokens {
+            let row: Vec<f32> = (0..HEAD_DIM)
+                .map(|i| ((t + 1) as f32) * 0.13 + 0.05 * (i % 29) as f32)
+                .collect();
+            let k = Tensor::from_vec(row, (1, 1, 1, HEAD_DIM), &dev)?.to_dtype(DType::BF16)?;
+            expected.extend(
+                k.flatten_all()?
+                    .to_vec1::<half::bf16>()?
+                    .into_iter()
+                    .map(|v| v.to_bits()),
+            );
+            let cached = append_kv_mqa(&mut slot, &k, None)?;
+            assert!(matches!(cached, V4CachedK::Dense(_)));
+        }
+
+        let KvCache::Normal { k, v } = &slot else {
+            panic!("V4 slot must be KvCache::Normal")
+        };
+        // K keeps the preallocated buffer verbatim (it fits); only V is
+        // rebuilt, to the marker width.
+        assert_eq!(
+            k.all_data.as_ref().unwrap().dims(),
+            &[1, 1, CAPACITY, HEAD_DIM]
+        );
+        assert_eq!(
+            v.all_data.as_ref().unwrap().dims(),
+            &[1, 1, CAPACITY, V4_V_MARKER_WIDTH]
+        );
+        assert_eq!(k.current_seq_len, tokens);
+        assert_eq!(k.current_seq_len, v.current_seq_len);
+
+        let got: Vec<u16> = k
+            .current_data()?
+            .expect("dense K materialised")
+            .flatten_all()?
+            .to_vec1::<half::bf16>()?
+            .into_iter()
+            .map(|v| v.to_bits())
+            .collect();
+        assert_eq!(got, expected, "dense K must read back exactly what went in");
+        Ok(())
+    }
+
+    /// FP8 K storage is **opt-in**. PR #72 shipped `!(v == "0")`, so every
+    /// value — and, decisively, *unset* — turned it on; the first GPU that ran
+    /// it failed every forward (wave48-BY). Only the literal `1` may enable it,
+    /// and `ARC_V4_CAPTURE_PROBE` still vetoes it because the CUDA-graph decode
+    /// arm cannot write a U8 cache.
+    ///
+    /// This tests [`fp8_kv_enabled_from`] rather than [`v4_fp8_kv_enabled`] on
+    /// purpose: the latter is a `OnceLock`, so a test that set the variable
+    /// would resolve it once and prove nothing about the default.
+    #[test]
+    fn v4_fp8_kv_is_opt_in() {
+        assert!(!fp8_kv_enabled_from(None, false), "unset must be OFF");
+        assert!(!fp8_kv_enabled_from(Some("0"), false));
+        assert!(!fp8_kv_enabled_from(Some(""), false));
+        assert!(!fp8_kv_enabled_from(Some("true"), false));
+        assert!(!fp8_kv_enabled_from(Some("on"), false));
+        assert!(!fp8_kv_enabled_from(Some("2"), false));
+        assert!(fp8_kv_enabled_from(Some("1"), false), "=1 must be ON");
+        assert!(
+            !fp8_kv_enabled_from(Some("1"), true),
+            "ARC_V4_CAPTURE_PROBE must veto it: write_kv_inplace has no U8 arm"
+        );
     }
 
     /// A non-`Normal` KV slot must be refused loudly rather than silently
