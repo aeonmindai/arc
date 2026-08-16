@@ -89,7 +89,7 @@ use crate::{
 use super::grouped::ExpertBpwTable;
 use super::{
     apply_block_rotation, rotation_block_size, QtipMode, QtipRotation, QtipSearchDetail,
-    QtipSearchStamp, QTIP_ROTATION_SEED,
+    QtipSearchStamp, TrellisSearch, QTIP_ROTATION_SEED,
 };
 
 #[cfg(feature = "cuda")]
@@ -270,6 +270,192 @@ pub(crate) fn viterbi_quantize_row_2b(target_row: &[f32], codebook: &[f32]) -> V
     symbols
 }
 
+// ---------------------------------------------------------------------------
+// Beam search (K=2, V=1) — the pruned twin of `viterbi_quantize_row_2b`.
+// ---------------------------------------------------------------------------
+
+/// One surviving trellis state at a timestep. Mirrors
+/// [`super::viterbi`]'s `BeamEntry` with K=2 geometry.
+#[derive(Clone, Copy)]
+struct BeamEntry2b {
+    /// Cumulative path cost into this state. During candidate generation this
+    /// transiently holds the *predecessor* cost (the local error is added once
+    /// per distinct successor, after merging).
+    cost: f32,
+    /// Trellis state (`L = 16` bits, so `u16` is exact).
+    state: u16,
+    /// Index of the chosen predecessor in the previous timestep's beam.
+    parent: u16,
+}
+
+/// Keep the best `width` entries and restore ascending-state order.
+///
+/// Selection is by `(cost, state)` under [`f32::total_cmp`] so the survivor set
+/// is fully deterministic; the trailing sort by state is what makes the next
+/// timestep's predecessor visit order match the exhaustive group-min scan (and
+/// therefore reproduce its "lowest predecessor state wins a tie" rule).
+fn prune_to_width_2b(beam: &mut Vec<BeamEntry2b>, width: usize) {
+    if beam.len() > width {
+        beam.select_nth_unstable_by(width - 1, |a, b| {
+            a.cost.total_cmp(&b.cost).then(a.state.cmp(&b.state))
+        });
+        beam.truncate(width);
+    }
+    beam.sort_unstable_by_key(|e| e.state);
+}
+
+/// Pruned Viterbi for the K=2/V=1 bitshift trellis, keeping the best `width`
+/// states per timestep.
+///
+/// **This is a strictly worse search than [`viterbi_quantize_row_2b`] and a
+/// much cheaper one** (DOCTRINE D4: declared, never hidden). Complexity per
+/// timestep is `O(width · 2^K)` candidate generations plus one `O(width · 2^K)`
+/// selection, versus `O(2^L)` for the exhaustive DP — at `width = 256` that is
+/// 1024 candidates instead of 65536 states, per symbol.
+///
+/// `width >= 2^L` prunes nothing and reproduces the exhaustive DP bit for bit,
+/// which is what `beam_2b_unpruned_matches_exhaustive_bit_for_bit` pins.
+///
+/// K=2 vs the LUT rung's K=4: 4 successors per predecessor instead of 16, and
+/// the dedup key space (successor states reachable from the beam) is
+/// `width · 4` instead of `width · 16`. Everything else — the merge rule, the
+/// selection order, the tie-break — is identical, because both rungs share the
+/// transition `s_t = ((s_{t-1} << K) | sym) & (2^L − 1)`.
+pub(crate) fn beam_quantize_row_2b(target_row: &[f32], codebook: &[f32], width: usize) -> Vec<u8> {
+    let num_symbols = target_row.len();
+    assert!(
+        num_symbols > 0,
+        "beam_quantize_row_2b requires at least one symbol position"
+    );
+    debug_assert_eq!(codebook.len(), CB_SIZE_2B);
+    // A beam wider than the state space prunes nothing; clamp so `u16` indices
+    // (and the dedup slot table) stay valid.
+    let width = width.clamp(1, CB_SIZE_2B);
+
+    // Dedup table: successor state -> index into `cands`. Allocated once and
+    // cleared through `touched` so we never pay a 2^L memset per timestep.
+    let mut slot = vec![u32::MAX; CB_SIZE_2B];
+    let mut touched: Vec<u16> = Vec::with_capacity(width * ALPHABET_2B);
+    let mut cands: Vec<BeamEntry2b> = Vec::with_capacity(width * ALPHABET_2B);
+
+    // Compacted backtrace, flat: `(state, parent)` for every surviving entry of
+    // every timestep, with one start offset per timestep.
+    let mut trace: Vec<(u16, u16)> = Vec::with_capacity(num_symbols * width.min(ALPHABET_2B * 4));
+    let mut trace_off: Vec<u32> = Vec::with_capacity(num_symbols);
+
+    // t = 0: the decoder starts from state 0, so exactly the `2^K` states
+    // s ∈ [0, ALPHABET) are reachable, in ascending order.
+    let mut beam: Vec<BeamEntry2b> = (0..ALPHABET_2B as u32)
+        .map(|s| {
+            let d = codebook[s as usize] - target_row[0];
+            BeamEntry2b {
+                cost: d * d,
+                state: s as u16,
+                parent: 0,
+            }
+        })
+        .collect();
+    prune_to_width_2b(&mut beam, width);
+    trace_off.push(0);
+    trace.extend(beam.iter().map(|e| (e.state, e.parent)));
+
+    for &target_t in target_row.iter().skip(1) {
+        cands.clear();
+        touched.clear();
+
+        // Expand: every surviving state × every symbol. The beam is sorted by
+        // state ascending, so for a fixed successor the predecessors arrive in
+        // ascending `j` — matching the exhaustive group-min scan order — and
+        // strict `<` keeps the smallest `j` on ties.
+        for (pi, entry) in beam.iter().enumerate() {
+            let base = ((entry.state as u32) << K2B) & STATE_MASK_2B;
+            for sym in 0..ALPHABET_2B as u32 {
+                let succ = (base | sym) as u16;
+                let s_idx = succ as usize;
+                let existing = slot[s_idx];
+                if existing == u32::MAX {
+                    slot[s_idx] = cands.len() as u32;
+                    touched.push(succ);
+                    cands.push(BeamEntry2b {
+                        cost: entry.cost,
+                        state: succ,
+                        parent: pi as u16,
+                    });
+                } else {
+                    let c = &mut cands[existing as usize];
+                    if entry.cost < c.cost {
+                        c.cost = entry.cost;
+                        c.parent = pi as u16;
+                    }
+                }
+            }
+        }
+
+        // Add the local branch metric once per distinct successor. The metric
+        // is identical for every candidate reaching the same state, so doing it
+        // after the merge cannot change any argmin.
+        for c in cands.iter_mut() {
+            let d = codebook[c.state as usize] - target_t;
+            c.cost += d * d;
+        }
+
+        // Release the dedup slots for the next timestep.
+        for &s in &touched {
+            slot[s as usize] = u32::MAX;
+        }
+
+        prune_to_width_2b(&mut cands, width);
+        // `cands` becomes the new beam; the old beam is recycled as next
+        // timestep's candidate buffer (no per-timestep allocation).
+        std::mem::swap(&mut beam, &mut cands);
+        trace_off.push(trace.len() as u32);
+        trace.extend(beam.iter().map(|e| (e.state, e.parent)));
+    }
+
+    // Final state: lowest cost, lowest state index on ties (the beam is state
+    // sorted, so a strict-`<` scan reproduces the exhaustive tie-break).
+    let mut best_idx = 0usize;
+    let mut best_cost = f32::INFINITY;
+    for (i, e) in beam.iter().enumerate() {
+        if e.cost < best_cost {
+            best_cost = e.cost;
+            best_idx = i;
+        }
+    }
+
+    let mut symbols = vec![0u8; num_symbols];
+    let mut idx = best_idx;
+    for t in (0..num_symbols).rev() {
+        let (state, parent) = trace[trace_off[t] as usize + idx];
+        symbols[t] = (state as u32 & (ALPHABET_2B as u32 - 1)) as u8;
+        idx = parent as usize;
+    }
+    symbols
+}
+
+/// Search-strategy dispatch for this rung, mirroring
+/// [`super::viterbi::quantize_row`].
+///
+/// [`TrellisSearch::Exhaustive`] is the default and the best quality this rung
+/// can produce. A beam is faster and slightly worse, and it is recorded in the
+/// artifact (`QtipSearchDetail`) so a checkpoint can never claim a search it
+/// did not run.
+pub(crate) fn quantize_row_2b(
+    target_row: &[f32],
+    codebook: &[f32],
+    search: TrellisSearch,
+) -> Vec<u8> {
+    match search {
+        TrellisSearch::Exhaustive => viterbi_quantize_row_2b(target_row, codebook),
+        // A beam at least as wide as the state space prunes nothing and IS the
+        // exhaustive DP; run the cheaper implementation of the same function.
+        TrellisSearch::Beam { width } if width >= CB_SIZE_2B => {
+            viterbi_quantize_row_2b(target_row, codebook)
+        }
+        TrellisSearch::Beam { width } => beam_quantize_row_2b(target_row, codebook, width),
+    }
+}
+
 /// Greedy quantizer: at each step pick the locally-best of the 4 candidate
 /// symbols given the current state. Fast, suboptimal — kept for parity with
 /// the LUT rung's mode selection (3-D expert stacks default to greedy).
@@ -341,12 +527,17 @@ pub struct Qtip2bLayer {
     /// Which trellis search produced these blocks. Serialized into UQFF from
     /// 0.3.0 and checked at load (DOCTRINE D4 §3).
     search: QtipSearchStamp,
-    /// *Which* trellis search (UQFF ≥ 0.3.0 flags byte). This rung's
-    /// `viterbi_quantize_row_2b` is the exhaustive DP with an unweighted branch
-    /// metric and has no beam, so a bake here always records
-    /// [`QtipSearchDetail::EXHAUSTIVE_MSE`]; the field exists so both rungs
-    /// share ONE wire format rather than diverging the moment qtip2b grows a
-    /// beam kernel.
+    /// *Which* trellis search (UQFF ≥ 0.3.0 flags byte).
+    ///
+    /// This field was added while the rung had only
+    /// [`viterbi_quantize_row_2b`] — "so both rungs share ONE wire format
+    /// rather than diverging the moment qtip2b grows a beam kernel". That
+    /// moment is wave46-BX: the rung now has [`beam_quantize_row_2b`] and
+    /// `kernels/qtip/qtip2b_beam.cu`, so a bake records
+    /// [`QtipSearchDetail::EXHAUSTIVE_MSE`] only when it actually ran the
+    /// exhaustive DP and `Known { beam_width: Some(W), .. }` when it ran a
+    /// beam. The objective bit stays false by construction: this rung has no
+    /// Hessian-weighted branch metric.
     search_detail: QtipSearchDetail,
 }
 
@@ -364,6 +555,19 @@ impl Qtip2bLayer {
         mode.deny_greedy("Qtip2bLayer::quantize_with_mode")?;
         let use_rotation = QtipRotation::for_mode(mode).enabled();
         Self::quantize_with_options(weight, bias, device, mode, use_rotation)
+    }
+
+    /// The **search axis**, read from `ARC_QTIP_BEAM` exactly like the LUT
+    /// rung's [`super::QtipBakeConfig`].
+    ///
+    /// Unset (the default) is [`TrellisSearch::Exhaustive`] — the best quality
+    /// this rung can produce, and what every artifact baked before the beam
+    /// kernel landed contains. A beam is much faster and measurably *worse*
+    /// (wave19-AP: exhaustive beat W=256 on 8 of 9 fixture cells on the LUT
+    /// rung); it never happens unless an operator asks for it by name, and when
+    /// it does the width is stamped into the artifact and re-checked at load.
+    fn env_search() -> TrellisSearch {
+        TrellisSearch::from_env()
     }
 
     /// **The greedy fixture door — this crate's tests only (DOCTRINE D4).**
@@ -394,15 +598,49 @@ impl Qtip2bLayer {
         mode: QtipMode,
         use_rotation: bool,
     ) -> Result<Arc<dyn QuantMethod>> {
+        Self::quantize_with_options_search(
+            weight,
+            bias,
+            device,
+            mode,
+            use_rotation,
+            Self::env_search(),
+        )
+    }
+
+    /// [`Self::quantize_with_options`] with the trellis search named
+    /// explicitly instead of read from the environment. Tests drive this so
+    /// they can pin a width without mutating process-global state.
+    pub fn quantize_with_options_search(
+        weight: &Tensor,
+        bias: Option<Tensor>,
+        device: &Device,
+        mode: QtipMode,
+        use_rotation: bool,
+        search: TrellisSearch,
+    ) -> Result<Arc<dyn QuantMethod>> {
         if weight.dims().len() == 3 {
             if bias.is_some() {
                 candle_core::bail!(
                     "qtip2b 3-D quantize: bias not supported for stacked-expert weights"
                 );
             }
-            return Self::quantize_with_options_3d(weight, device, mode, use_rotation);
+            return Self::quantize_with_options_3d_search(
+                weight,
+                device,
+                mode,
+                use_rotation,
+                search,
+            );
         }
-        let layer = Self::quantize_with_options_concrete(weight, bias, device, mode, use_rotation)?;
+        let layer = Self::quantize_with_options_concrete_search(
+            weight,
+            bias,
+            device,
+            mode,
+            use_rotation,
+            search,
+        )?;
         Ok(Arc::new(layer))
     }
 
@@ -415,6 +653,28 @@ impl Qtip2bLayer {
         device: &Device,
         mode: QtipMode,
         use_rotation: bool,
+    ) -> Result<Self> {
+        Self::quantize_with_options_concrete_search(
+            weight,
+            bias,
+            device,
+            mode,
+            use_rotation,
+            Self::env_search(),
+        )
+    }
+
+    /// [`Self::quantize_with_options_concrete`] with an explicit trellis
+    /// search. On CUDA the plan is put through [`super::cuda_search_plan`]
+    /// before it reaches a kernel, so the width recorded in `search_detail` is
+    /// what ran, never what was requested.
+    pub fn quantize_with_options_concrete_search(
+        weight: &Tensor,
+        bias: Option<Tensor>,
+        device: &Device,
+        mode: QtipMode,
+        use_rotation: bool,
+        search: TrellisSearch,
     ) -> Result<Self> {
         // D4 fixture door: greedy is reachable only from this crate's own
         // `cfg(test)` builds. Production callers arrive via
@@ -437,6 +697,7 @@ impl Qtip2bLayer {
                 device,
                 mode,
                 use_rotation,
+                search,
             )? {
                 Some(layer) => return Ok(layer),
                 None => candle_core::bail!(
@@ -500,7 +761,7 @@ impl Qtip2bLayer {
                 let scaled_target: Vec<f32> = working_row.iter().map(|w| w * inv_scale).collect();
 
                 let symbols: Vec<u8> = match mode {
-                    QtipMode::Viterbi => viterbi_quantize_row_2b(&scaled_target, &codebook),
+                    QtipMode::Viterbi => quantize_row_2b(&scaled_target, &codebook, search),
                     QtipMode::Greedy => greedy_quantize_row_2b(&scaled_target, &codebook),
                 };
 
@@ -565,7 +826,10 @@ impl Qtip2bLayer {
             mcg_mult,
             expert_bpw: None,
             search: QtipSearchStamp::for_mode(mode),
-            search_detail: QtipSearchDetail::EXHAUSTIVE_MSE,
+            // The plan that ran, not the env request. `hessian: false` is
+            // earned rather than assumed: this rung has no weighted branch
+            // metric at all.
+            search_detail: QtipSearchDetail::for_bake(mode, search, false),
         })
     }
 
@@ -581,6 +845,7 @@ impl Qtip2bLayer {
         device: &Device,
         mode: QtipMode,
         use_rotation: bool,
+        search: TrellisSearch,
     ) -> Result<Option<Self>> {
         let (_n, k_in) = match weight.dims2() {
             Ok((n, k)) => (n, k),
@@ -613,8 +878,13 @@ impl Qtip2bLayer {
             weight_cuda_f32
         };
 
+        // Never substitute a search the kernel cannot run (D4b): a width the
+        // beam kernel refuses is an error, not a quietly narrower beam. A width
+        // at or above the state space prunes nothing and IS the exhaustive DP.
+        let search = super::cuda_search_plan(search, cuda_ops::beam_2b_max_width())?;
+
         let (blocks, row_scales) =
-            cuda_ops::quantize_rows_2b_cuda(&weight_rotated, QTIP2B_MCG_MULT, mode)?;
+            cuda_ops::quantize_rows_2b_cuda(&weight_rotated, QTIP2B_MCG_MULT, mode, search)?;
 
         let bias = bias.map(|b| b.to_device(device)).transpose()?;
         let rotation_signs = if rotation_block >= 2 {
@@ -634,7 +904,10 @@ impl Qtip2bLayer {
             mcg_mult: QTIP2B_MCG_MULT,
             expert_bpw: None,
             search: QtipSearchStamp::for_mode(mode),
-            search_detail: QtipSearchDetail::EXHAUSTIVE_MSE,
+            // The plan that ran, not the env request. `hessian: false` is
+            // earned rather than assumed: this rung has no weighted branch
+            // metric at all.
+            search_detail: QtipSearchDetail::for_bake(mode, search, false),
         }))
     }
 
@@ -648,6 +921,23 @@ impl Qtip2bLayer {
         device: &Device,
         mode: QtipMode,
         use_rotation: bool,
+    ) -> Result<Arc<dyn QuantMethod>> {
+        Self::quantize_with_options_3d_search(
+            weight,
+            device,
+            mode,
+            use_rotation,
+            Self::env_search(),
+        )
+    }
+
+    /// [`Self::quantize_with_options_3d`] with an explicit trellis search.
+    pub fn quantize_with_options_3d_search(
+        weight: &Tensor,
+        device: &Device,
+        mode: QtipMode,
+        use_rotation: bool,
+        search: TrellisSearch,
     ) -> Result<Arc<dyn QuantMethod>> {
         let (e, n, k_in) = weight.dims3()?;
         if e == 0 || n == 0 || k_in == 0 {
@@ -706,12 +996,15 @@ impl Qtip2bLayer {
             } else {
                 rows_2d
             };
-            let layer = Self::quantize_with_options_concrete(
+            // Every chunk is baked with the SAME search the caller handed in,
+            // so an expert stack can never be half beam and half exhaustive.
+            let layer = Self::quantize_with_options_concrete_search(
                 &rows_2d,
                 None,
                 &quant_device,
                 mode,
                 use_rotation,
+                search,
             )?;
 
             let blk = if move_back {
@@ -757,7 +1050,10 @@ impl Qtip2bLayer {
             mcg_mult,
             expert_bpw: Some(ExpertBpwTable::uniform_2bit(e)),
             search: QtipSearchStamp::for_mode(mode),
-            search_detail: QtipSearchDetail::EXHAUSTIVE_MSE,
+            // The plan that ran, not the env request. `hessian: false` is
+            // earned rather than assumed: this rung has no weighted branch
+            // metric at all.
+            search_detail: QtipSearchDetail::for_bake(mode, search, false),
         }))
     }
 
@@ -3356,10 +3652,753 @@ mod tests {
         assert_eq!(layer.dequantize_w()?.dims(), &[e, n, k_in]);
         let after = crate::gpu_quantize_cpu_fallback_count();
         assert_eq!(
-            after, before,
+            after,
+            before,
             "Qtip2bLayer 3-D expert quantize fell back to the CPU pipeline on a CUDA box \
              ({} new fallback(s)) — check the warn log for the reason",
             after - before
+        );
+        Ok(())
+    }
+    // =======================================================================
+    // Beam search (wave46-BX) — the K=2 / V=1 port of the LUT rung's beam.
+    //
+    // 🔴 THIS IS A DECLARED QUALITY TRADE (DOCTRINE D4). Exhaustive search is
+    // the best this rung can do and stays the default; the beam exists because
+    // wave41-BS measured the exhaustive K=2 bake at >=984 s for layer 0 alone,
+    // projecting ~11.75 h / ~$57 for 43 layers. These tests exist to prove the
+    // beam is a *legitimate, recorded, slightly worse* search — never a silent
+    // one, and never greedy.
+    // =======================================================================
+
+    /// **The load-bearing proof.** A beam wide enough to prune nothing must
+    /// reproduce [`viterbi_quantize_row_2b`] — the exhaustive 2^L dynamic
+    /// program — symbol for symbol. Anything less and "beam" would just mean
+    /// "a different algorithm that happens to look similar".
+    ///
+    /// This is what makes the K=2 successor geometry checkable: 4 successors
+    /// per group instead of 16, groups keyed by the low `L-K = 14` bits instead
+    /// of the low 12, and a dedup/merge rule that has to reproduce the
+    /// exhaustive DP's "lowest predecessor state wins a cost tie" exactly.
+    ///
+    /// D12 (fixtures lie): a pure Gaussian and the realistic `fp4_dequant`
+    /// chain are not enough on their own — mutation testing showed that
+    /// flipping the dedup tie-break from `<` to `<=` SURVIVES on both, because
+    /// neither produces exact equal-cost predecessor pairs often enough. The
+    /// third fixture below fixes that by degenerating the *codebook* rather
+    /// than the data: with only four distinct codeword values, equal-cost paths
+    /// are everywhere, and the two searches can only agree if they resolve ties
+    /// identically ("lowest predecessor state wins").
+    #[test]
+    fn beam_2b_unpruned_matches_exhaustive_bit_for_bit() {
+        use super::super::bake_quality_tests::gen_fp4_dequant;
+        let real = computed_codebook(QTIP2B_MCG_MULT);
+        // A CONSTANT codebook makes every symbol stream cost exactly the same,
+        // so the emitted stream is decided *entirely* by the tie-break rule —
+        // "lowest predecessor state wins", in both searches. It is a synthetic
+        // codebook precisely because a realistic one cannot be relied on to
+        // produce exact f32 ties often enough (measured: `<` -> `<=` survives
+        // on gaussian and on fp4_dequant).
+        let all_ties: Vec<f32> = vec![0.25f32; CB_SIZE_2B];
+        let rows = 4usize;
+        let k = 64usize;
+
+        let fixtures: [(&str, Vec<f32>, &Vec<f32>); 3] = [
+            ("gaussian", gaussian_fixture(rows * k, 0xBEA3, 1.0), &real),
+            ("fp4_dequant", gen_fp4_dequant(rows, k, 1.0, 0xBEA4), &real),
+            (
+                "constant-codebook(all ties)",
+                gaussian_fixture(rows * k, 0xBEA2, 1.0),
+                &all_ties,
+            ),
+        ];
+
+        for (name, data, codebook) in fixtures {
+            for row in 0..rows {
+                let target = &data[row * k..(row + 1) * k];
+                let exhaustive = viterbi_quantize_row_2b(target, codebook);
+                let unpruned = beam_quantize_row_2b(target, codebook, CB_SIZE_2B);
+                assert_eq!(
+                    unpruned, exhaustive,
+                    "{name} row {row}: an unpruned beam is not the exhaustive DP — \
+                     the K=2 beam is a different search, not a pruned one"
+                );
+                // `quantize_row_2b` must route a prune-nothing width to the
+                // exhaustive implementation, not to the beam.
+                assert_eq!(
+                    quantize_row_2b(
+                        target,
+                        codebook,
+                        TrellisSearch::Beam {
+                            width: CB_SIZE_2B * 2
+                        }
+                    ),
+                    exhaustive,
+                    "{name} row {row}: width >= 2^L must dispatch to the exhaustive DP"
+                );
+            }
+        }
+    }
+
+    /// D4b on the CPU dispatcher: `quantize_row_2b` must run the width it was
+    /// handed, not a width it finds convenient.
+    ///
+    /// The specific failure this exists for: a beam width above the CUDA
+    /// kernel's 256-slot limit being quietly clamped on the CPU path too, so a
+    /// CPU bake and a GPU bake of `ARC_QTIP_BEAM=1024` would silently be
+    /// different searches (and the GPU one would have errored). Non-vacuity is
+    /// the `assert_ne!`: the two widths must actually produce different bytes,
+    /// or "the width was honoured" would be unfalsifiable.
+    #[test]
+    fn quantize_row_2b_never_substitutes_a_beam_width() {
+        let codebook = computed_codebook(QTIP2B_MCG_MULT);
+        let target = gaussian_fixture(512, 0xBEAE, 0.8);
+        for width in [64usize, 256, 1024, 4096] {
+            assert_eq!(
+                quantize_row_2b(&target, &codebook, TrellisSearch::Beam { width }),
+                beam_quantize_row_2b(&target, &codebook, width),
+                "W={width}: the dispatcher ran a different width than it was asked for"
+            );
+        }
+        assert_ne!(
+            beam_quantize_row_2b(&target, &codebook, 1024),
+            beam_quantize_row_2b(&target, &codebook, 256),
+            "W=1024 and W=256 produced identical bytes — this row does not \
+             discriminate the width, so the assertions above prove nothing"
+        );
+    }
+
+    /// Non-vacuity for the test above, plus the quality direction.
+    ///
+    /// At production widths the beam MUST actually prune (otherwise the
+    /// unpruned test proves nothing about the pruned kernel), and because
+    /// pruning can only discard paths, the beam's reconstruction error must be
+    /// at least the exhaustive DP's. Both halves are asserted: a beam that came
+    /// out *better* would mean the exhaustive DP is not optimal, i.e. a bug in
+    /// the thing we currently ship.
+    #[test]
+    fn beam_2b_prunes_and_never_beats_exhaustive() {
+        use super::super::bake_quality_tests::gen_fp4_dequant;
+        let codebook = computed_codebook(QTIP2B_MCG_MULT);
+        let rows = 4usize;
+        let k = 256usize;
+        let data = gen_fp4_dequant(rows, k, 1.0, 0xBEA5);
+
+        let mut any_differed = false;
+        for width in [16usize, 64, 256] {
+            for row in 0..rows {
+                let target = &data[row * k..(row + 1) * k];
+                let exhaustive = viterbi_quantize_row_2b(target, &codebook);
+                let beam = beam_quantize_row_2b(target, &codebook, width);
+                if beam != exhaustive {
+                    any_differed = true;
+                }
+                let e_mse = mse(target, &decode_symbols_2b(&exhaustive, &codebook));
+                let b_mse = mse(target, &decode_symbols_2b(&beam, &codebook));
+                assert!(
+                    b_mse >= e_mse - 1e-6,
+                    "W={width} row {row}: beam MSE {b_mse} beat the exhaustive DP's {e_mse} — \
+                     the exhaustive search is supposed to be optimal"
+                );
+            }
+        }
+        assert!(
+            any_differed,
+            "the beam reproduced the exhaustive DP at every width on a 256-symbol row — \
+             this fixture does not exercise pruning, so bit-identity elsewhere proves nothing"
+        );
+    }
+
+    /// Same input, same bytes, twice — the beam's selection and its group
+    /// dedup are both order-independent by construction and must stay so.
+    #[test]
+    fn beam_2b_is_deterministic() {
+        let codebook = computed_codebook(QTIP2B_MCG_MULT);
+        let target = gaussian_fixture(512, 0xBEA6, 0.7);
+        for width in [8usize, 64, 256] {
+            let a = beam_quantize_row_2b(&target, &codebook, width);
+            let b = beam_quantize_row_2b(&target, &codebook, width);
+            assert_eq!(a, b, "W={width}: beam is not deterministic");
+            assert_eq!(a.len(), target.len());
+            assert!(a.iter().all(|&s| (s as usize) < ALPHABET_2B));
+        }
+    }
+
+    /// 🔴 **The declared cost of the trade, measured on the realistic
+    /// distribution** (D4 + D12).
+    ///
+    /// wave19-AP measured exhaustive beating beam W=256 on 8 of 9 cells for the
+    /// LUT rung. This is the same measurement for the K=2 rung, on
+    /// `fp4_dequant` (heavy-tailed Student-t(4) snapped to the FP4 lattice with
+    /// per-32 block scales — V4's actual source chain) rather than on a pure
+    /// Gaussian, which hides exactly this class of effect.
+    ///
+    /// The assertion is deliberately a *ceiling on the loss*, not a claim of
+    /// equality: the beam is allowed to be worse, and is expected to be. The
+    /// printed numbers are the deliverable — they are what a W recommendation
+    /// has to be argued from.
+    #[test]
+    fn beam_2b_quality_delta_vs_exhaustive_is_bounded_and_reported() {
+        use super::super::bake_quality_tests::gen_fp4_dequant;
+        let codebook = computed_codebook(QTIP2B_MCG_MULT);
+        let rows = 8usize;
+        let k = 1024usize;
+
+        // The trellis searches in the ROTATED frame in production, and the
+        // rotation is what makes a heavy-tailed row look Gaussian — so a
+        // measurement taken only on the raw rows would overstate the beam's
+        // difficulty. Both frames are reported.
+        let signs = generate_signs(QTIP_ROTATION_SEED, k);
+        let block = rotation_block_size(k);
+        let fp4 = gen_fp4_dequant(rows, k, 0.02, 0xBEA7);
+        let fp4_rot = {
+            let mut out = fp4.clone();
+            for row in 0..rows {
+                apply_block_rotation(&mut out[row * k..(row + 1) * k], &signs, block);
+            }
+            out
+        };
+
+        for (name, data) in [
+            ("fp4_dequant", fp4),
+            ("fp4_dequant+hadamard", fp4_rot),
+            (
+                "gaussian(control)",
+                gaussian_fixture(rows * k, 0xBEA8, 0.02),
+            ),
+        ] {
+            for width in [64usize, 128, 256] {
+                let mut cos_ex = 0f64;
+                let mut cos_bm = 0f64;
+                let mut nmse_ex = 0f64;
+                let mut nmse_bm = 0f64;
+                for row in 0..rows {
+                    let raw = &data[row * k..(row + 1) * k];
+                    let max_abs = raw.iter().fold(0f32, |m, &v| m.max(v.abs()));
+                    let scale = if max_abs == 0.0 {
+                        1.0
+                    } else {
+                        max_abs / QTIP2B_SCALE_DIVISOR
+                    };
+                    let target: Vec<f32> = raw.iter().map(|w| w / scale).collect();
+
+                    let ex =
+                        decode_symbols_2b(&viterbi_quantize_row_2b(&target, &codebook), &codebook);
+                    let bm = decode_symbols_2b(
+                        &beam_quantize_row_2b(&target, &codebook, width),
+                        &codebook,
+                    );
+                    cos_ex += cos_sim(&target, &ex) as f64;
+                    cos_bm += cos_sim(&target, &bm) as f64;
+                    let den: f64 = target.iter().map(|&t| (t as f64) * (t as f64)).sum();
+                    nmse_ex += mse(&target, &ex) as f64 * k as f64 / den;
+                    nmse_bm += mse(&target, &bm) as f64 * k as f64 / den;
+                }
+                let (cos_ex, cos_bm) = (cos_ex / rows as f64, cos_bm / rows as f64);
+                let (nmse_ex, nmse_bm) = (nmse_ex / rows as f64, nmse_bm / rows as f64);
+                println!(
+                    "[qtip2b search quality] {name:18} W={width:<4} \
+                     cos exhaustive={cos_ex:.6} beam={cos_bm:.6} (Δ={:+.6})  \
+                     nmse exhaustive={nmse_ex:.6} beam={nmse_bm:.6} (Δ={:+.6})",
+                    cos_bm - cos_ex,
+                    nmse_bm - nmse_ex
+                );
+                // The beam may be worse. It may not be *broken*: a 0.01 cosine
+                // cliff would mean the pruning is discarding the right path
+                // wholesale rather than occasionally.
+                assert!(
+                    cos_ex - cos_bm < 0.01,
+                    "{name} W={width}: beam lost {:.6} cosine to the exhaustive DP — \
+                     that is a pruning failure, not a quality trade",
+                    cos_ex - cos_bm
+                );
+            }
+        }
+    }
+
+    /// The same trade measured on the **whole production pipeline** — block
+    /// Hadamard rotation, `max|row|/3.62` search scale, trellis search, then
+    /// least-squares scale refinement — rather than on the search in isolation.
+    /// This is the number that describes the artifact an operator would ship,
+    /// and the one a `W` recommendation has to be argued from.
+    #[test]
+    fn beam_2b_layer_quality_delta_vs_exhaustive_is_reported() -> Result<()> {
+        use super::super::bake_quality_tests::gen_fp4_dequant;
+        let device = Device::Cpu;
+        let (n, k) = (8usize, 1024usize);
+        let raw = gen_fp4_dequant(n, k, 0.02, 0xBEB1);
+        let w = Tensor::from_vec(raw.clone(), (n, k), &device)?;
+
+        let quantized = |search: TrellisSearch| -> Result<Vec<f32>> {
+            let layer = Qtip2bLayer::quantize_with_options_concrete_search(
+                &w,
+                None,
+                &device,
+                QtipMode::Viterbi,
+                true,
+                search,
+            )?;
+            layer
+                .dequantize_weights()?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1()
+        };
+
+        let ex = quantized(TrellisSearch::Exhaustive)?;
+        let cos_ex = cos_sim(&raw, &ex);
+        for width in [64usize, 128, 256] {
+            let bm = quantized(TrellisSearch::Beam { width })?;
+            let cos_bm = cos_sim(&raw, &bm);
+            println!(
+                "[qtip2b layer quality] fp4_dequant n={n} k={k} W={width:<4} \
+                 weight-cos exhaustive={cos_ex:.6} beam={cos_bm:.6} (Δ={:+.6})",
+                cos_bm - cos_ex
+            );
+            assert!(
+                cos_ex - cos_bm < 0.01,
+                "W={width}: the beam lost {:.6} weight cosine on the full pipeline",
+                cos_ex - cos_bm
+            );
+        }
+        Ok(())
+    }
+
+    /// A beam bake must SAY it was a beam bake, at the exact width that ran,
+    /// and the claim must survive a UQFF round trip (DOCTRINE D4 §3).
+    #[test]
+    fn beam_2b_stamps_its_width_into_the_artifact() -> Result<()> {
+        let device = Device::Cpu;
+        let (n, k) = (8usize, 128usize);
+        let w = Tensor::from_vec(gaussian_fixture(n * k, 0xBEA9, 0.4), (n, k), &device)?;
+
+        let exhaustive = Qtip2bLayer::quantize_with_options_concrete_search(
+            &w,
+            None,
+            &device,
+            QtipMode::Viterbi,
+            true,
+            TrellisSearch::Exhaustive,
+        )?;
+        assert_eq!(exhaustive.search_detail(), QtipSearchDetail::EXHAUSTIVE_MSE);
+
+        for width in [64usize, 256] {
+            let beam = Qtip2bLayer::quantize_with_options_concrete_search(
+                &w,
+                None,
+                &device,
+                QtipMode::Viterbi,
+                true,
+                TrellisSearch::Beam { width },
+            )?;
+            assert_eq!(
+                beam.search_detail(),
+                QtipSearchDetail::Known {
+                    beam_width: Some(width as u16),
+                    hessian: false,
+                },
+                "a W={width} bake did not record W={width}"
+            );
+            // Non-vacuity: the recorded width describes a genuinely different
+            // artifact, not a label stuck on identical bytes.
+            let a: Vec<u8> = beam.blocks.flatten_all()?.to_vec1()?;
+            let b: Vec<u8> = exhaustive.blocks.flatten_all()?.to_vec1()?;
+            assert_ne!(
+                a, b,
+                "W={width} produced byte-identical blocks to the exhaustive DP — \
+                 the search-detail stamp would be describing nothing"
+            );
+
+            // Round trip: the claim is on the wire, not just in memory.
+            let payload = beam.serialize()?;
+            let (back, _) =
+                Qtip2bLayer::deserialize_concrete(payload, &device, QuantizeOntoGuard::new())?;
+            assert_eq!(
+                back.search_detail(),
+                QtipSearchDetail::Known {
+                    beam_width: Some(width as u16),
+                    hessian: false,
+                },
+                "W={width}: the beam width did not survive UQFF serialization"
+            );
+        }
+        Ok(())
+    }
+
+    /// The **3-D expert-stack** path, which is the one a V4 bake actually
+    /// takes — all 11.75 h of the wave41-BS projection is MoE expert stacks.
+    ///
+    /// The stack is quantized in chunks of experts; every chunk must be handed
+    /// the SAME search, so a stack can never come out half beam and half
+    /// exhaustive, and the stamp on the assembled layer must be the width that
+    /// ran on all of them.
+    #[test]
+    fn beam_2b_stamps_its_width_on_a_3d_expert_stack() -> Result<()> {
+        let device = Device::Cpu;
+        let (e, n, k) = (3usize, 4usize, 128usize);
+        let w3 = Tensor::from_vec(gaussian_fixture(e * n * k, 0xBEB2, 0.4), (e, n, k), &device)?;
+
+        let exhaustive = Qtip2bLayer::quantize_with_options_3d_search(
+            &w3,
+            &device,
+            QtipMode::Viterbi,
+            true,
+            TrellisSearch::Exhaustive,
+        )?;
+        let ex_w: Vec<f32> = exhaustive
+            .dequantize_w()?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
+
+        let beam = Qtip2bLayer::quantize_with_options_3d_search(
+            &w3,
+            &device,
+            QtipMode::Viterbi,
+            true,
+            TrellisSearch::Beam { width: 64 },
+        )?;
+        let bm_w: Vec<f32> = beam
+            .dequantize_w()?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
+        assert_ne!(
+            ex_w.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            bm_w.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "the 3-D beam path produced the exhaustive artifact — the search \
+             never reached the per-expert chunks"
+        );
+
+        // `quantize_with_options_3d_search` hands back a `dyn QuantMethod`, so
+        // read the stamp off the wire, which is what a loader would see anyway.
+        let payload = beam.serialize()?;
+        let (back, _) =
+            Qtip2bLayer::deserialize_concrete(payload, &device, QuantizeOntoGuard::new())?;
+        assert_eq!(back.num_experts, Some(e));
+        assert_eq!(
+            back.search_detail(),
+            QtipSearchDetail::Known {
+                beam_width: Some(64),
+                hessian: false,
+            },
+            "a 3-D expert-stack beam bake did not record the width it ran"
+        );
+        Ok(())
+    }
+
+    /// D4b: the GPU dispatch may TRANSLATE a search ("a beam at least as wide
+    /// as the state space prunes nothing, so run the exhaustive kernel") but it
+    /// may never SUBSTITUTE one. A width `qtip2b_beam.cu` cannot run is an
+    /// error, never a quietly narrower beam.
+    ///
+    /// The 2b kernel's `QB2_MAX_BEAM` is its block size, 256 — the same as the
+    /// LUT rung's, so an operator's `ARC_QTIP_BEAM` means the same thing on
+    /// both rungs. On a CUDA build the constant is read back from the kernel so
+    /// this test cannot drift from the compiled limit.
+    #[test]
+    fn qtip2b_cuda_search_plan_never_substitutes_a_width() {
+        use super::super::cuda_search_plan;
+        const MAX_W: usize = 256;
+
+        #[cfg(feature = "cuda")]
+        if super::super::ffi::HAVE_QTIP_KERNELS {
+            assert_eq!(
+                super::super::cuda_ops::beam_2b_max_width(),
+                MAX_W,
+                "the compiled qtip2b beam kernel's max width drifted from this test"
+            );
+        }
+
+        assert_eq!(
+            cuda_search_plan(TrellisSearch::Exhaustive, MAX_W).unwrap(),
+            TrellisSearch::Exhaustive
+        );
+        for w in [1usize, 16, 64, 128, 256] {
+            assert_eq!(
+                cuda_search_plan(TrellisSearch::Beam { width: w }, MAX_W).unwrap(),
+                TrellisSearch::Beam { width: w },
+                "width {w} must be honoured exactly"
+            );
+        }
+        for w in [CB_SIZE_2B, CB_SIZE_2B + 1, usize::MAX] {
+            assert_eq!(
+                cuda_search_plan(TrellisSearch::Beam { width: w }, MAX_W).unwrap(),
+                TrellisSearch::Exhaustive
+            );
+        }
+        for w in [MAX_W + 1, 1024, CB_SIZE_2B - 1] {
+            let err = cuda_search_plan(TrellisSearch::Beam { width: w }, MAX_W)
+                .expect_err("a width beyond the kernel limit must not be silently narrowed");
+            assert!(format!("{err}").contains("will not silently substitute"));
+        }
+        assert!(cuda_search_plan(TrellisSearch::Beam { width: 64 }, 0).is_err());
+    }
+
+    /// 🔴 D4 IS ABSOLUTE: growing a beam does NOT open a door for greedy.
+    ///
+    /// The production entry point must still refuse [`QtipMode::Greedy`] in
+    /// every build and at every search setting, and a greedy stamp must still
+    /// be unable to carry a beam width (a greedy walk runs no trellis search,
+    /// so an artifact claiming both is self-contradictory and is refused on
+    /// both the write and the read side).
+    #[test]
+    fn beam_does_not_make_greedy_reachable() -> Result<()> {
+        let device = Device::Cpu;
+        let w = Tensor::from_vec(gaussian_fixture(4 * 64, 0xBEAA, 0.5), (4, 64), &device)?;
+
+        let err = Qtip2bLayer::quantize_with_mode(&w, None, &device, QtipMode::Greedy)
+            .expect_err("the production door must refuse greedy");
+        assert!(format!("{err}").to_lowercase().contains("greedy"), "{err}");
+
+        // The fixture door (open only inside this crate's own `cfg(test)`
+        // build) must not become a way to launder a greedy bake as a beam bake:
+        // even with a beam explicitly requested, a greedy layer records no
+        // width at all.
+        let greedy_fixture = Qtip2bLayer::quantize_with_options_concrete_search(
+            &w,
+            None,
+            &device,
+            QtipMode::Greedy,
+            QtipRotation::for_mode(QtipMode::Greedy).enabled(),
+            TrellisSearch::Beam { width: 256 },
+        )?;
+        assert_eq!(
+            greedy_fixture.search_detail(),
+            QtipSearchDetail::EXHAUSTIVE_MSE,
+            "a greedy fixture recorded a beam width"
+        );
+        assert_eq!(greedy_fixture.search, QtipSearchStamp::Greedy);
+        // ...and it is still refused at load, beam or no beam.
+        let payload = greedy_fixture.serialize()?;
+        assert!(
+            Qtip2bLayer::deserialize_concrete(payload, &device, QuantizeOntoGuard::new()).is_err(),
+            "a greedy-stamped qtip2b artifact must not load"
+        );
+
+        assert_eq!(
+            QtipSearchDetail::for_bake(QtipMode::Greedy, TrellisSearch::Beam { width: 256 }, true),
+            QtipSearchDetail::EXHAUSTIVE_MSE,
+            "a greedy bake must never record a beam width or a weighted objective"
+        );
+        Ok(())
+    }
+
+    /// The CUDA beam kernel must emit the **byte-identical** symbol stream the
+    /// CPU beam emits at the same width — not a similar one. Cosine similarity
+    /// would hide exactly the failure mode that matters: a GPU bake and a CPU
+    /// bake of the same weights with the same flag silently producing different
+    /// checkpoints.
+    ///
+    /// Non-vacuity: the same fixture is also baked with the exhaustive kernel
+    /// and asserted to DIFFER, so the test cannot pass by the beam happening to
+    /// reproduce the full DP.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_beam_2b_matches_cpu_beam_bit_for_bit() -> Result<()> {
+        use super::super::cuda_ops;
+        if !super::super::ffi::HAVE_QTIP_KERNELS {
+            return Ok(());
+        }
+        let cuda = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => return Ok(()),
+        };
+        let cpu = Device::Cpu;
+        let n = 8;
+        let k_in = 512; // 512 symbols at V=1: long enough to prune every step
+        let wdata = gaussian_fixture(n * k_in, 0xBEAB, 0.5);
+        let w_cuda = Tensor::from_vec(wdata.clone(), (n, k_in), &cuda)?;
+
+        // Both sides must see the SAME per-row scale, so take the kernel's.
+        let scales: Vec<f32> = cuda_ops::compute_row_scales_2b_cuda(&w_cuda)?
+            .to_device(&cpu)?
+            .to_vec1()?;
+        let codebook = computed_codebook(QTIP2B_MCG_MULT);
+
+        let cpu_reference = |search: TrellisSearch| -> Vec<u8> {
+            let mut out = Vec::with_capacity(n * (k_in / SYMS_PER_BYTE));
+            for row in 0..n {
+                let inv_scale = 1.0f32 / scales[row];
+                let target: Vec<f32> = wdata[row * k_in..(row + 1) * k_in]
+                    .iter()
+                    .map(|w| w * inv_scale)
+                    .collect();
+                out.extend_from_slice(&pack_symbols_2b(&quantize_row_2b(
+                    &target, &codebook, search,
+                )));
+            }
+            out
+        };
+
+        let exhaustive: Vec<u8> = cuda_ops::quantize_rows_2b_cuda(
+            &w_cuda,
+            QTIP2B_MCG_MULT,
+            QtipMode::Viterbi,
+            TrellisSearch::Exhaustive,
+        )?
+        .0
+        .to_device(&cpu)?
+        .flatten_all()?
+        .to_vec1()?;
+
+        let mut any_differed = false;
+        for width in [64usize, 128, 256] {
+            let search = TrellisSearch::Beam { width };
+            let gpu: Vec<u8> = cuda_ops::quantize_rows_2b_cuda(
+                &w_cuda,
+                QTIP2B_MCG_MULT,
+                QtipMode::Viterbi,
+                search,
+            )?
+            .0
+            .to_device(&cpu)?
+            .flatten_all()?
+            .to_vec1()?;
+            let reference = cpu_reference(search);
+            assert_eq!(gpu.len(), reference.len());
+            let mismatches = gpu
+                .iter()
+                .zip(reference.iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(
+                mismatches,
+                0,
+                "W={width}: CUDA beam differs from the CPU beam in {mismatches}/{} bytes — \
+                 the GPU and CPU bakes of the same weights are not the same checkpoint",
+                gpu.len()
+            );
+            if gpu != exhaustive {
+                any_differed = true;
+            }
+        }
+        assert!(
+            any_differed,
+            "beam and exhaustive produced identical bytes at every width — the fixture \
+             does not actually exercise pruning, so bit-identity proves nothing"
+        );
+        Ok(())
+    }
+
+    /// **The load-bearing GPU proof**: a beam wide enough to prune nothing must
+    /// reproduce the exhaustive kernel byte for byte.
+    ///
+    /// `num_symbols = 4` makes that provable rather than incidental. From the
+    /// implicit start state 0 the reachable set at K=2 is 4 states at t=0, 16 at
+    /// t=1, 64 at t=2 and 256 at t=3 — so at W=256 the beam never drops a
+    /// candidate through the whole row, and the exhaustive DP's finite-cost set
+    /// is exactly the same 256 states. (The K=2 geometry lets this run 4
+    /// timesteps deep where the K=4 rung's twin only reaches 2.)
+    ///
+    /// Longer rows are covered transitively: `cuda_beam_2b_matches_cpu_beam_
+    /// bit_for_bit` pins CUDA to the CPU beam, and
+    /// `beam_2b_unpruned_matches_exhaustive_bit_for_bit` pins the unpruned CPU
+    /// beam to the CPU exhaustive DP on 64-symbol rows.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_beam_2b_unpruned_matches_exhaustive() -> Result<()> {
+        use super::super::cuda_ops;
+        if !super::super::ffi::HAVE_QTIP_KERNELS {
+            return Ok(());
+        }
+        let cuda = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => return Ok(()),
+        };
+        let cpu = Device::Cpu;
+        let n = 64;
+        let k_in = 4; // 4 symbols -> the beam provably prunes nothing at W=256
+        let w_cuda = Tensor::from_vec(gaussian_fixture(n * k_in, 0xBEAC, 0.9), (n, k_in), &cuda)?;
+
+        let exhaustive: Vec<u8> = cuda_ops::quantize_rows_2b_cuda(
+            &w_cuda,
+            QTIP2B_MCG_MULT,
+            QtipMode::Viterbi,
+            TrellisSearch::Exhaustive,
+        )?
+        .0
+        .to_device(&cpu)?
+        .flatten_all()?
+        .to_vec1()?;
+        let unpruned: Vec<u8> = cuda_ops::quantize_rows_2b_cuda(
+            &w_cuda,
+            QTIP2B_MCG_MULT,
+            QtipMode::Viterbi,
+            TrellisSearch::Beam { width: 256 },
+        )?
+        .0
+        .to_device(&cpu)?
+        .flatten_all()?
+        .to_vec1()?;
+
+        assert_eq!(
+            unpruned, exhaustive,
+            "an unpruned CUDA beam must be the exhaustive DP, byte for byte"
+        );
+        Ok(())
+    }
+
+    /// wave46-BX also put the exhaustive K=2 kernel onto `qtip_exact_fp.cuh`
+    /// (it was contracting `d*d + cost` into an FMA and computing `1.0f/scale`
+    /// with a reciprocal approximation under `--use_fast_math`). With those
+    /// gone the exhaustive kernel is bit-identical to the CPU DP — which is
+    /// what makes the unpruned-beam guard above meaningful, and what makes a
+    /// CPU-baked and a GPU-baked qtip2b checkpoint the same artifact.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_exhaustive_2b_matches_cpu_exhaustive_bit_for_bit() -> Result<()> {
+        use super::super::cuda_ops;
+        if !super::super::ffi::HAVE_QTIP_KERNELS {
+            return Ok(());
+        }
+        let cuda = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => return Ok(()),
+        };
+        let cpu = Device::Cpu;
+        let n = 8;
+        let k_in = 256;
+        let wdata = gaussian_fixture(n * k_in, 0xBEAD, 0.6);
+        let w_cuda = Tensor::from_vec(wdata.clone(), (n, k_in), &cuda)?;
+
+        let scales: Vec<f32> = cuda_ops::compute_row_scales_2b_cuda(&w_cuda)?
+            .to_device(&cpu)?
+            .to_vec1()?;
+        let codebook = computed_codebook(QTIP2B_MCG_MULT);
+
+        let gpu: Vec<u8> = cuda_ops::quantize_rows_2b_cuda(
+            &w_cuda,
+            QTIP2B_MCG_MULT,
+            QtipMode::Viterbi,
+            TrellisSearch::Exhaustive,
+        )?
+        .0
+        .to_device(&cpu)?
+        .flatten_all()?
+        .to_vec1()?;
+
+        let mut reference = Vec::with_capacity(gpu.len());
+        for row in 0..n {
+            let inv_scale = 1.0f32 / scales[row];
+            let target: Vec<f32> = wdata[row * k_in..(row + 1) * k_in]
+                .iter()
+                .map(|w| w * inv_scale)
+                .collect();
+            reference.extend_from_slice(&pack_symbols_2b(&viterbi_quantize_row_2b(
+                &target, &codebook,
+            )));
+        }
+        let mismatches = gpu
+            .iter()
+            .zip(reference.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(
+            mismatches,
+            0,
+            "the qtip2b exhaustive CUDA kernel differs from the CPU DP in {mismatches}/{} bytes",
+            gpu.len()
         );
         Ok(())
     }
