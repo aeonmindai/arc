@@ -461,6 +461,52 @@ impl ForwardInputsResult {
     }
 }
 
+/// How many host copies of a **batched** forward result
+/// [`host_copy_batched_result`] has issued.
+///
+/// One per decode step is correct. One per *sequence* per step is the O(B²)
+/// regression this counter exists to pin — see the function docs and
+/// `pipeline::host_copy_tests`.
+pub(crate) static LOGITS_HOST_COPIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Move a batched forward result to `host` with a **single** transfer, before
+/// it is split into per-sequence views.
+///
+/// This ordering is load-bearing, not stylistic. `Tensor::i()` /
+/// `Tensor::narrow` return a *view* that clones the storage `Arc`, so a
+/// per-sequence slice of a `[B, 1, vocab]` logits tensor still refers to the
+/// whole `B * vocab` allocation. `Tensor::to_device` then copies the **entire
+/// storage** — `Tensor::to_device` → `CudaStorage::to_cpu_storage` →
+/// `clone_dtoh(slice)` (candle `d2d1d07`, `tensor.rs:2379`,
+/// `cuda_backend/mod.rs:1788`) — and merely carries the view's layout across.
+///
+/// So splitting first and copying after moves `B * (B * vocab)` elements over
+/// PCIe **every decode step**, i.e. O(B²). Copying first and splitting after
+/// moves `B * vocab`, i.e. O(B). At B=256 with V4's `vocab_size = 129_280` in
+/// BF16 that is 16.9 GB/step versus 66 MB/step.
+///
+/// A single sequence is left on the device on purpose: `Sampler::sample`'s
+/// GPU fast path is gated on `!logits.device().is_cpu()` (`sampler.rs`), so
+/// moving a B=1 batch to the host would silently disable it.
+pub(crate) fn host_copy_batched_result(
+    raw: ForwardInputsResult,
+    n_seqs: usize,
+    host: &Device,
+) -> candle_core::Result<ForwardInputsResult> {
+    let needs_copy = match &raw {
+        // Always returned to the caller on the host.
+        ForwardInputsResult::RawLogits { .. } | ForwardInputsResult::Embeddings { .. } => true,
+        ForwardInputsResult::CausalGeneration { .. } => n_seqs > 1,
+        ForwardInputsResult::Image { .. } | ForwardInputsResult::Speech { .. } => false,
+    };
+    if !needs_copy {
+        return Ok(raw);
+    }
+    LOGITS_HOST_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    raw.to_device(host)
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct FileListCache {
     files: Vec<String>,
@@ -863,13 +909,17 @@ pub trait Pipeline:
                     let end = Instant::now();
                     exec_duration += end.duration_since(start);
 
+                    // ONE host copy for the whole batch, *before* the
+                    // per-sequence split. See `host_copy_batched_result`: the
+                    // reverse order costs O(B²) D2H bytes per step.
+                    let raw_logits =
+                        host_copy_batched_result(raw_logits, input_seqs.len(), &Device::Cpu)?;
+
                     for (logit_idx, seq_idx) in seq_indices.into_iter().enumerate() {
                         if let ForwardInputsResult::RawLogits { logits } = &raw_logits {
-                            raw_out_logits[seq_idx][i] =
-                                Some(logits.i(logit_idx)?.to_device(&Device::Cpu)?);
+                            raw_out_logits[seq_idx][i] = Some(logits.i(logit_idx)?);
                         } else if let ForwardInputsResult::Embeddings { embeddings } = &raw_logits {
-                            embedding_logits[seq_idx] =
-                                Some(embeddings.i(logit_idx)?.to_device(&Device::Cpu)?);
+                            embedding_logits[seq_idx] = Some(embeddings.i(logit_idx)?);
                         } else {
                             logits[seq_idx] = Some(raw_logits.index_bs(logit_idx)?);
                         }
@@ -929,18 +979,11 @@ pub trait Pipeline:
                 }
 
                 let start = Instant::now();
-                let logits_on_cpu = logits.len() > 1;
+                // Already on the host (one batched copy above) when B > 1.
                 let logits = logits
                     .into_iter()
-                    .map(|l| {
-                        let l = l.expect("Did not get any inputs. This is shocking.");
-                        if logits_on_cpu {
-                            l.to_device(&Device::Cpu)
-                        } else {
-                            Ok(l)
-                        }
-                    })
-                    .collect::<candle_core::Result<Vec<_>>>()?;
+                    .map(|l| l.expect("Did not get any inputs. This is shocking."))
+                    .collect::<Vec<_>>();
 
                 match &logits[0] {
                     ForwardInputsResult::RawLogits { .. }
@@ -1101,13 +1144,19 @@ pub trait Pipeline:
                     exec_duration += end.duration_since(start);
                     __pa_t_fwd_us += end.duration_since(start).as_secs_f64() * 1e6;
 
+                    // ONE host copy for the whole batch, *before* the
+                    // per-sequence split. See `host_copy_batched_result`: the
+                    // reverse order costs O(B²) D2H bytes per step. (This moves
+                    // the logits D2H out of `STEP_us`' `sample` bucket and into
+                    // `other`; it is the same work, attributed where it happens.)
+                    let raw_logits =
+                        host_copy_batched_result(raw_logits, input_seqs.len(), &Device::Cpu)?;
+
                     for (logit_idx, seq_idx) in seq_indices.into_iter().enumerate() {
                         if let ForwardInputsResult::RawLogits { logits } = &raw_logits {
-                            raw_out_logits[seq_idx][i] =
-                                Some(logits.i(logit_idx)?.to_device(&Device::Cpu)?);
+                            raw_out_logits[seq_idx][i] = Some(logits.i(logit_idx)?);
                         } else if let ForwardInputsResult::Embeddings { embeddings } = &raw_logits {
-                            embedding_logits[seq_idx] =
-                                Some(embeddings.i(logit_idx)?.to_device(&Device::Cpu)?);
+                            embedding_logits[seq_idx] = Some(embeddings.i(logit_idx)?);
                         } else {
                             logits[seq_idx] = Some(raw_logits.index_bs(logit_idx)?);
                         }
@@ -1152,18 +1201,11 @@ pub trait Pipeline:
                 }
 
                 let start = Instant::now();
-                let logits_on_cpu = logits.len() > 1;
+                // Already on the host (one batched copy above) when B > 1.
                 let logits = logits
                     .into_iter()
-                    .map(|l| {
-                        let l = l.expect("Did not get any inputs. This is shocking.");
-                        if logits_on_cpu {
-                            l.to_device(&Device::Cpu)
-                        } else {
-                            Ok(l)
-                        }
-                    })
-                    .collect::<candle_core::Result<Vec<_>>>()?;
+                    .map(|l| l.expect("Did not get any inputs. This is shocking."))
+                    .collect::<Vec<_>>();
 
                 match &logits[0] {
                     ForwardInputsResult::RawLogits { .. }
@@ -1567,5 +1609,185 @@ mod tests {
         inputs.push(message);
 
         test_with_inputs(&templates, &expected_outputs, inputs);
+    }
+}
+
+/// Regression tests for the per-step host copy of the batched logits.
+///
+/// The decode step used to slice the `[B, 1, vocab]` logits into B
+/// per-sequence tensors and *then* move each one to the host. Because
+/// `Tensor::i()` returns a view that keeps the whole batch storage alive, and
+/// `Tensor::to_device` copies the whole storage, that moved `B * (B * vocab)`
+/// elements over PCIe every decode step. These tests pin the fixed order and
+/// prove the assertions can fail under the old one.
+#[cfg(test)]
+mod host_copy_tests {
+    use super::*;
+    use candle_core::{CpuStorage, Storage};
+    use std::sync::atomic::Ordering;
+
+    /// Number of elements candle would move across a device boundary for `t`:
+    /// the size of the whole backing storage, NOT `t.elem_count()`.
+    /// `Tensor::to_device` hands the *storage* to `to_cpu_storage()` and only
+    /// carries the view's layout across (candle `d2d1d07`, `tensor.rs:2379`,
+    /// `cuda_backend/mod.rs:1788`).
+    fn storage_elems(t: &Tensor) -> usize {
+        let (storage, _layout) = t.storage_and_layout();
+        match &*storage {
+            Storage::Cpu(CpuStorage::F32(v)) => v.len(),
+            _ => panic!("fixture must be a CPU F32 tensor"),
+        }
+    }
+
+    fn logits_of(r: &ForwardInputsResult) -> &Tensor {
+        match r {
+            ForwardInputsResult::CausalGeneration { logits } => logits,
+            _ => panic!("fixture is CausalGeneration"),
+        }
+    }
+
+    /// `0.0, 1.0, ... (n-1).0` without an integer→float cast.
+    fn ramp(n: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(n);
+        let mut x = 0f32;
+        for _ in 0..n {
+            out.push(x);
+            x += 1.0;
+        }
+        out
+    }
+
+    /// `[b, 1, v]` holding `0..b*v`, so every row is distinguishable from
+    /// every other row and from its own index.
+    fn batch(b: usize, v: usize) -> ForwardInputsResult {
+        ForwardInputsResult::CausalGeneration {
+            logits: Tensor::from_vec(ramp(b * v), (b, 1, v), &Device::Cpu).unwrap(),
+        }
+    }
+
+    #[test]
+    fn batched_host_copy_is_o1_in_batch_while_the_old_order_was_o_b_squared() {
+        // 7 is equal to none of the batch sizes used below and coprime with
+        // all of them, so no assertion can pass by `b * v` aliasing `v`, `b`,
+        // or `v * b` (DOCTRINE D12: the fixture must discriminate).
+        const V: usize = 7;
+        const BATCHES: [usize; 4] = [2, 5, 8, 64];
+
+        // ── The premise, measured against candle rather than assumed ───────
+        // A per-sequence slice is a VIEW: it addresses V elements but still
+        // owns the whole B*V storage, so ONE `to_device` on it costs B*V.
+        {
+            let b = 5;
+            assert_ne!(b, V, "fixture must not let B and V alias");
+            let raw = batch(b, V);
+            let row = raw.index_bs(2).unwrap();
+            assert_eq!(
+                logits_of(&row).elem_count(),
+                V,
+                "the view addresses exactly one row"
+            );
+            assert_eq!(
+                storage_elems(logits_of(&row)),
+                b * V,
+                "...but candle would copy the WHOLE batch storage for it. If \
+                 this ever fails, `Tensor::i()` started copying and the O(B^2) \
+                 premise behind `host_copy_batched_result` is retired."
+            );
+        }
+
+        // ── Fixed order: copy the batch once, then split ───────────────────
+        for b in BATCHES {
+            let before = LOGITS_HOST_COPIES.load(Ordering::Relaxed);
+            let host = host_copy_batched_result(batch(b, V), b, &Device::Cpu).unwrap();
+            let copies = LOGITS_HOST_COPIES.load(Ordering::Relaxed) - before;
+
+            assert_eq!(
+                copies, 1,
+                "B={b}: one host copy per STEP, not one per sequence"
+            );
+            assert_eq!(
+                storage_elems(logits_of(&host)),
+                b * V,
+                "B={b}: exactly one batch of elements crosses the boundary"
+            );
+
+            // The split must still hand each sequence its own row.
+            let all = ramp(b * V);
+            for k in 0..b {
+                let row = host.index_bs(k).unwrap();
+                assert_eq!(
+                    logits_of(&row)
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap(),
+                    all[k * V..(k + 1) * V].to_vec(),
+                    "B={b}: row {k} is wrong after the hoisted copy"
+                );
+            }
+        }
+
+        // ── MUTATION CONTROL: the pre-fix order, split then copy ───────────
+        // Same counter, same helper, only the ORDER differs. This is what
+        // proves `copies == 1` above is falsifiable rather than vacuous.
+        for b in BATCHES {
+            let raw = batch(b, V);
+            let before = LOGITS_HOST_COPIES.load(Ordering::Relaxed);
+            let mut old_elems = 0usize;
+            for k in 0..b {
+                let row = raw.index_bs(k).unwrap();
+                old_elems += storage_elems(logits_of(&row));
+                // `n_seqs = 2` only so the helper takes the copy branch; this
+                // is the per-sequence `to_device` the fix removed.
+                let _ = host_copy_batched_result(row, 2, &Device::Cpu).unwrap();
+            }
+            let old_copies = LOGITS_HOST_COPIES.load(Ordering::Relaxed) - before;
+
+            assert_eq!(
+                old_copies,
+                u64::try_from(b).unwrap(),
+                "pre-fix order: one host copy per SEQUENCE"
+            );
+            assert_ne!(
+                old_copies, 1,
+                "B={b}: the fixture must distinguish the two orders"
+            );
+            assert_eq!(old_elems, b * b * V, "pre-fix order moved O(B^2) elements");
+            assert_eq!(
+                old_elems / (b * V),
+                b,
+                "B={b}: the fix is worth exactly a factor of B in D2H bytes"
+            );
+        }
+
+        // ── A single sequence must NOT be pulled to the host ───────────────
+        // `Sampler::sample`'s GPU fast path is gated on
+        // `!logits.device().is_cpu()`; copying a B=1 batch would disable it.
+        let before = LOGITS_HOST_COPIES.load(Ordering::Relaxed);
+        let one = host_copy_batched_result(batch(1, V), 1, &Device::Cpu).unwrap();
+        assert_eq!(
+            LOGITS_HOST_COPIES.load(Ordering::Relaxed) - before,
+            0,
+            "B=1 CausalGeneration must stay on the device"
+        );
+        assert_eq!(logits_of(&one).dims(), &[1, 1, V]);
+
+        // ...but raw-logit and embedding requests always come back, at any B.
+        for raw in [
+            ForwardInputsResult::RawLogits {
+                logits: Tensor::zeros((1, 1, V), DType::F32, &Device::Cpu).unwrap(),
+            },
+            ForwardInputsResult::Embeddings {
+                embeddings: Tensor::zeros((1, V), DType::F32, &Device::Cpu).unwrap(),
+            },
+        ] {
+            let before = LOGITS_HOST_COPIES.load(Ordering::Relaxed);
+            host_copy_batched_result(raw, 1, &Device::Cpu).unwrap();
+            assert_eq!(
+                LOGITS_HOST_COPIES.load(Ordering::Relaxed) - before,
+                1,
+                "raw logits / embeddings always return to the host"
+            );
+        }
     }
 }
