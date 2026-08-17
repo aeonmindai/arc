@@ -71,10 +71,13 @@
 # probe and the summary refuses to turn it into a ratio, rather than printing a
 # confident 0.00 (D18).
 #
-# Arm B's other failure mode there was a retry storm off a PRE-EXISTING
-# long-prompt fault at ~1,055 words, present on older builds and unrelated to
-# the admission chain. Until the fused 512 kernel lands, cap `--mixed` prompt
-# lengths below that: set `MIXED_MAX_WORDS` (default 512 here, was 2048).
+# Arm B's other failure mode there was a retry storm off a long-prompt fault at
+# ~1,055 words, assumed to be a hard blocker on the mixed arms. It did NOT
+# reproduce on a provenance-verified build (1,100 words in 6.6 s), and a
+# five-cohort differential to 256x prompt-length spread, paged on and off, found
+# zero faults — so the ladder keeps its full 32..2048 (64x) spread, which is what
+# makes D large enough to test. `MIXED_WORDS_MAX=512` narrows it to 16x if a
+# particular box turns out to have the fault after all.
 #
 # 5. `grep "cannot honour it" $LOG` in arms C/D must be EMPTY (the mode was
 #    granted). In arms A/B it must cite `ARC_MTP_PER_SEQ_KV` — the flag, not a
@@ -138,7 +141,7 @@ fi
 # ── The load driver. Mixed vs uniform prompt lengths, K concurrent workers,
 #    each looping until told to stop. Emits one JSON line of aggregates.
 cat > "$OUT/drive.py" <<'PYEOF'
-import argparse, json, random, threading, time, urllib.request
+import argparse, json, os, random, threading, time, urllib.request
 
 FILLER = ("alpha bravo charlie delta echo foxtrot golf hotel india juliet "
           "kilo lima mike november oscar papa quebec romeo sierra tango ")
@@ -147,12 +150,17 @@ def prompt_of(words: int) -> str:
     return ("Summarise the following log excerpt in detail. " +
             (FILLER * ((words // 20) + 1))[: words * 6])
 
-# Prompt-length ladder for the MIXED arms. Capped at 512 words: a
-# pre-existing long-prompt fault at ~1,055 words (unrelated to batch admission,
-# present on older builds) turned arm B of the first run into a 91,933-entry
-# retry storm. Raise this once the fused 512 kernel lands — the spread, not the
-# absolute length, is what the experiment needs, and 32..512 is still 16x.
-MIXED_WORDS = [32, 64, 128, 256, 512]
+# Prompt-length ladder for the MIXED arms. The SPREAD is the independent
+# variable — D, the number of distinct cache lengths in flight — so capping it
+# weakens exactly the contrast this experiment draws. 32..2048 is 64x.
+#
+# The first run's arm B produced a 91,933-entry retry storm off a long-prompt
+# fault at ~1,055 words, which was assumed to be a hard blocker. It did NOT
+# reproduce on a provenance-verified build (1,100 words in 6.6 s), so the ladder
+# is not capped on that assumption. `MIXED_WORDS_MAX=512` narrows it to 16x if a
+# given box turns out to have it — the experiment survives either way.
+MIXED_WORDS = [w for w in [32, 64, 128, 256, 512, 1024, 2048]
+               if w <= int(os.environ.get("MIXED_WORDS_MAX", "2048"))]
 
 def main():
     ap = argparse.ArgumentParser()
