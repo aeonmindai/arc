@@ -425,7 +425,9 @@ class Runner:
             This is the default setting, and it defaults to the `max-seq-len` specified in after the model type.
         - `pa_blk_size` sets the block size (number of tokens per block) for PagedAttention. If this is not set and the device is CUDA,
             it will default to 32. PagedAttention is supported on CUDA and Metal. It is automatically activated on CUDA but not on Metal.
-        - `pa_cache_type` sets the PagedAttention KV cache type. Defaults to `TurboQuant` (3.5-bit, lossless). Options: Auto, F8E4M3, TurboQuant, TurboQuant3, TurboQuantAggressive.
+        - `pa_cache_type` sets the PagedAttention KV cache type. Defaults to `TurboQuant` (K4/V3, 3.5-bit), **not** to `Auto`: a standard-layout head_dim-128 model
+            gets quantized KV and loses prefix caching unless you pass `Auto`. Other geometries fall back to `Auto` with a warning. Quality under TurboQuant has
+            never been evaluated by Arc. Options: Auto, F8E4M3, TurboQuant, TurboQuant3, TurboQuantAggressive.
         - `no_paged_attn` disables PagedAttention on CUDA. Because PagedAttention is already disabled on Metal, this is only applicable on CUDA.
         - `paged_attn` enables PagedAttention on Metal. Because PagedAttention is already enabled on CUDA, this is only applicable on Metal.
         - `seed`, used to ensure reproducible random number generation.

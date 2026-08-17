@@ -28,11 +28,15 @@ Papers backing each of the nine engineering bets in the single-B200 NVIDIA roadm
 
 | Paper | arXiv | Supports | Confidence |
 |---|---|---|---|
-| **TurboQuant** (Arc, ICLR 2026) | 2504.19874 | Your own paper. WHT + Lloyd-Max codebooks, 3.5-bit lossless KV. | ✓ |
+| **TurboQuant** (Arc, ICLR 2026) | 2504.19874 | Your own paper. WHT + Lloyd-Max codebooks, 3.5-bit KV. "Lossless" is **the paper's** LongBench result on Llama-3.1-8B — Arc has never reproduced it. | ✓ |
 | **QuaRot** (2024) | 2404.00456 | Hadamard rotation makes activations Gaussian, easier to quantize. **Direct backing for the rotation step in TurboQuant.** | ✓ |
 | **SpinQuant** (2024) | 2405.16406 | Learned rotation matrices for outlier suppression. Extension of QuaRot. | ✓ |
 
-**Honest read:** Already shipped; defend the lossless line.
+**Honest read:** Shipped — TurboQuant is the paged default at head_dim 128, and
+it has served Qwen3-32B on a B200 at 55 tok/s with correct output
+(`4eba13905`). **The lossless line is not ours to defend yet:** it is the
+paper's LongBench number, and Arc has run no quality evaluation under any
+preset. Reproducing it is open work, not a settled claim.
 
 ---
 

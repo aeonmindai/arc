@@ -443,7 +443,25 @@ pub fn calculate_cache_config(
 
     if !silent {
         info!("Allocating {mem_gpu} MB for PagedAttention KV cache per GPU");
-        info!("PagedAttention KV cache type is {dtype:?}");
+        // Print the cache *type*, not just its storage dtype. Every TurboQuant
+        // preset stores as `U8`, so a bare `{dtype:?}` printed "U8" and a user
+        // getting the ambient TurboQuant default had no way to see it from the
+        // logs. TurboQuant being the default is the single most consequential
+        // implicit choice on the paged path — it changes the KV format and
+        // silently disables prefix caching — so it is named explicitly.
+        let origin = if cache_type_explicit {
+            "requested"
+        } else {
+            "default"
+        };
+        info!("PagedAttention KV cache type is {cache_type:?} ({origin}, stored as {dtype:?})");
+        if cache_type.is_turboquant() {
+            info!(
+                "TurboQuant KV is active: keys/values are quantized in the paged cache, and \
+                 prefix caching is disabled (packed U8 blocks cannot be gathered). \
+                 Pass `--pa-cache-type auto` for an unquantized KV cache."
+            );
+        }
         info!("Using PagedAttention with block size {block_size} and {num_gpu_blocks} GPU blocks: available context length is {} tokens", num_gpu_blocks*block_size);
     }
     Ok(CacheConfig {

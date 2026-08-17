@@ -28,7 +28,7 @@ State the parent on the first line of a new module's `//!` doc.
 - `/arc-cli/`             : the `arc` binary — run, serve, bench, validate (ArcServe/CLI)
 - `/arc-engine/`          : Rust façade + Tier-A research modules (ArcServe/SDK)
 - `/arc-cuda-graph/`      : GPU-autonomous decode, GPU sampler (ArcGraph)
-- `/arc-turbo/`           : TurboQuant KV cache type — experimental, off by default
+- `/arc-turbo/`           : TurboQuant KV cache type — **paged default** at head_dim 128 (eager path is the opt-in one); served on a B200, quality unmeasured
 - `/arc-profiler/`        : wall/device/sync span-tree profiler (ArcLab/Profiler)
 - `/arc-bench/`           : AA-AgentPerf trajectory replay harness (ArcLab/Bench)
 - `/arc-tools/`           : shell + Python ops tooling — **not a Cargo crate** (ArcLab/Ops)

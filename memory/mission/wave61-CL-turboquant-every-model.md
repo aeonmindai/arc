@@ -2,6 +2,35 @@
 
 Branch `feat/turboquant-every-model`, draft PR **#87**, base `master` @ `c763123be`.
 
+> 🔵 **CORRECTION APPENDED 2026-08-17 — this document is the origin of a
+> repo-wide erasure. Read this before quoting anything below.**
+>
+> §1 gets the forensics right and the verdict wrong. It correctly finds
+> `4eba13905` — *"55 tok/s with TurboQuant = 46% over Candle baseline"*, B200 —
+> and even writes *"This is the only throughput number ever tied to
+> TurboQuant."* It then says the **model** is "unstated". It is not:
+> `deploy/modal_b200.py`, in this tree, pins `gpu="B200"`,
+> `MODEL="Qwen/Qwen3-32B"` and `mistralrs serve --pa-cache-type turboquant`.
+> One file away, never opened.
+>
+> Because that lookup was skipped, the conclusion became **"never measured"**,
+> and that phrase propagated verbatim into README, ARC_V2, FLEET, BENCHMARKS,
+> PEAK_INFERENCE, RELEASE_NOTES, TAXONOMY, CODE_INDEX and two crate `//!` docs,
+> until Jish corrected it. **Jish's testimony quoted at the head of §1 —
+> *"turboquant works in arc tried and tested when we built it months ago"* —
+> was accurate, and this document recorded it and then contradicted it.**
+>
+> **What survives here unchanged:** the 4.27× byte arithmetic in §1 is exactly
+> right and that figure stays retracted; `Lossless quality confirmed
+> end-to-end` really does have no eval behind it; and the eager path really did
+> never run. **What is retracted from this document:** the claim that
+> TurboQuant has never been measured, and the framing of the paged path as
+> unexercised. It was measured — narrowly (b=1, one card, one model, head_dim
+> 128, `Default` preset, no A/B isolating TurboQuant, no quality score).
+>
+> Canonical record: the TurboQuant section of [[facts]]. The failure mode is
+> written up next to D18 in [[kernel-rules]].
+
 ---
 
 ## 1. Did it ever work, and via which path?

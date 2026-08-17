@@ -86,24 +86,46 @@ Once weights fit, concurrent capacity is bounded by KV cache per sequence.
   K4/V3 measured **4.27× context capacity end-to-end on Qwen3-32B on a single
   H100 (39K → 169K tokens)**. **That number is format arithmetic — bytes per
   token at 3.5 bits versus BF16 — and was never produced by a forward pass on
-  any GPU.** No TurboQuant measurement exists anywhere in this repo's record.
-  It must not be cited as measured, and the "Apr 2026, quality confirmed"
+  any GPU.** It must not be cited as measured, and the "quality confirmed"
   provenance attached to it was not real.
-- **TurboQuant is not on any default serving path today [code-verified]:**
-  - The eager KV path is **opt-in via `ARC_TURBOQUANT_KV=1`**, default off
-    (`mistralrs-core/src/kv_cache/mod.rs`).
-  - The paged path has a kernel at **head_dim 128 only**
-    (`TURBOQUANT_HEAD_DIM`); the ambient default auto-falls back to `Auto`
-    with a warning, and an explicit `--pa-cache-type turboquant` hard-errors
-    off-envelope.
-  - **No kernel exists at head_dim 512**, so DeepSeek V4 cannot use it at all.
+- 🔵 **COUNTER-CORRECTION (2026-08-17).** The retraction above originally
+  carried a second sentence — *"No TurboQuant measurement exists anywhere in
+  this repo's record"* — and **that sentence was false**. It has been removed.
+  A serving run does exist: commit **`4eba13905` (2026-04-06)**, *"55 tok/s
+  with TurboQuant = 46% over Candle baseline"*, on a **B200**. The harness is
+  in the tree — `deploy/modal_b200.py` pins `gpu="B200"`,
+  `MODEL="Qwen/Qwen3-32B"`, and `mistralrs serve --pa-cache-type turboquant`.
+  Eight CUDA correctness defects were found against that hardware on
+  2026-04-02, including a V-cache stride mismatch (`143b5ab20`) and a Q·K
+  warp-reduction deadlock (`fd0074792`) — defects that cannot be found without
+  running. **Retracting the ratio was right; retracting the run was not.**
+- **What the B200 run does and does not establish [read both halves]:**
+  - **Does:** TurboQuant K4/V3 paged KV serves a real model on real hardware
+    and produces correct output. Any claim that "no TurboQuant forward pass has
+    ever been benchmarked" is false.
+  - **Does not:** it was **b=1, one card, one model, head_dim 128, `Default`
+    preset**. The "46% over Candle baseline" compares Arc's whole dedicated
+    decode path against Candle's — it **isolates nothing about TurboQuant**.
+    There is no A/B against an unquantized cache, and **no quality evaluation
+    at any preset**. Context length and eval score were never recorded.
+- **TurboQuant *is* the paged default, inside a narrow envelope
+  [code-verified]:**
+  - `defaults::PAGED_CACHE_TYPE` is `PagedCacheType::TurboQuant` and
+    `--pa-cache-type` has no clap default, so a standard-layout **head_dim-128**
+    model on CUDA takes it with no flag set. An earlier revision of this bullet
+    read "TurboQuant is not on any default serving path today" — wrong.
+  - Off that envelope the ambient default auto-falls back to `Auto` with a
+    warning; an explicit `--pa-cache-type turboquant` hard-errors instead.
+  - **No kernel exists at head_dim 512**, so DeepSeek V4 does not take it —
+    which is why every V4 number on this page was measured *without* it.
   - The prefix cache auto-disables under TurboQuant (packed U8 blocks cannot
-    be gathered).
-- Fleet meaning **[projected — arithmetic only]**: *if* TurboQuant were on a
-  serving path, 3.5-bit KV would buy roughly 4× the concurrent tenants per
-  replica at fixed HBM on GQA-attention models. Nothing here is measured, and
-  the honest gap is larger than "MLA is pending": the feature is a compression
-  format with no measured serving run behind it.
+    be gathered). Users on the default path lose prefix reuse silently.
+  - The **eager** KV path is separate and genuinely **opt-in via
+    `ARC_TURBOQUANT_KV=1`** (`mistralrs-core/src/kv_cache/mod.rs`).
+- Fleet meaning **[projected — arithmetic only]**: 3.5-bit KV would buy roughly
+  4× the concurrent tenants per replica at fixed HBM on GQA-attention models.
+  **That multiple is arithmetic, not measurement** — the B200 run measured
+  throughput, never tenancy — and it does not reach V4-class MLA models at all.
 
 ## Summary table
 
@@ -117,7 +139,9 @@ Once weights fit, concurrent capacity is bounded by KV cache per sequence.
 | b=1 decode 18.27 tok/s aggregate (17.99 per-user p50) | **Measured** |
 | GEMV autotune: ~36 µs / 450–467 GB/s best-variant (~9.5% peak, 2.3×), shipped as dispatch defaults | **Measured-kernel** |
 | Grouped-vs-GEMV crossover at **B=64**; grouped keeps climbing (527 tok/s @ B=128) while GEMV is flat (315→317) | **Measured-kernel** (MoE-GEMM floor only) |
-| TurboQuant KV compression | **Never measured** — the former "4.27×" was format arithmetic, now retracted; not on any default path |
+| TurboQuant KV — serving | **Measured, narrowly** — Qwen3-32B on a B200, 55 tok/s, correct output (`4eba13905`). b=1, head_dim 128, no A/B, no quality score |
+| TurboQuant KV — compression ratio | **Never measured** — the former "4.27×" was format arithmetic, now retracted, and it stays retracted |
+| TurboQuant KV — quality | **Never measured** — no eval at any preset, at any width |
 | 8 replicas per 8×H200 node | Projected (building block measured) |
 | ~4.1K tok/s/GPU at saturated batch; ~8× node aggregate vs 1×TP8 | Projected (floor arithmetic off the measured 74.18 GB artifact; serving is at ~2% of the floor) |
 | Expert parallelism across cards | Projected — **not implemented** (`Comm::Dummy`, world_size 1); design only |

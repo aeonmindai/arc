@@ -18,7 +18,15 @@ pub const TURBOQUANT_HEAD_DIM: usize = 128;
 pub enum PagedCacheType {
     Auto,
     F8E4M3,
-    /// TurboQuant default: 4-bit keys, 3-bit values (3.5 bits avg). Lossless quality.
+    /// TurboQuant default: 4-bit keys, 3-bit values (3.5 bits avg).
+    ///
+    /// This is the `#[default]`, and it is the default the server actually
+    /// resolves to (`defaults::PAGED_CACHE_TYPE`) when `--pa-cache-type` is
+    /// left unset — so a standard-layout head_dim-128 model on CUDA gets it
+    /// without asking. It has one end-to-end serving run behind it (Qwen3-32B
+    /// on a B200, 55 tok/s, correct output, 2026-04-06); it has **no quality
+    /// evaluation** at any width. Earlier revisions of this comment read
+    /// "Lossless quality" — that was never measured and has been removed.
     #[default]
     TurboQuant,
     /// TurboQuant balanced: 3-bit keys, 3-bit values (3.0 bits avg).
