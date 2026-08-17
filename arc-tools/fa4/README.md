@@ -24,12 +24,68 @@ Each rung is independently testable. Build in order.
 
 | Rung | What | V4? |
 |---|---|---|
-| **1** | **THE GATE.** `export_to_c()` → linkable `.o` with `__tvm_ffi_<name>`, callable from Rust, no Python at runtime. | — |
+| **1** | **THE GATE.** AOT export → linkable `.o` with a C-callable entry point, reachable from Rust, no Python at runtime. | — |
 | 2 | Vanilla FA4 callable from Arc at head_dim 64/128, output matching the Python reference. Proves the binding independently of kernel novelty. | no |
 | 3 | Extend to **head_dim 512 with MQA**. The wall is ~228 KB SM shared memory against a ~320 KB naive tile budget at d=512. The exploit V4 hands us and stock FA cannot assume: **64 query heads, 1 KV head** — load K/V once, reuse across all heads. Study `absorbed_mqa_decode` (`dsv4_attention.rs:125`), which already avoids materialising 512-wide K/V per head at `t_q == 1`. | **yes** |
 | 4 | **Attention sinks in the softmax.** No FA and no FlashMLA release has this. The sink is a **per-head scalar in the denominator — zero cache bytes**, not a KV region. | **yes** |
 | 5 | **N-region read.** V4 reads 2 regions: raw sliding window (128) ++ compressed KV (ratio 4 = CSA, 128 = HCA; ratio 0 = window-only on layers **{0,1,43}** — 43, not 42; layer 42 is CSA). Must compose with PR #90's segment allocator, whose finding is that the existing gather kernel treats **a segment as a row**, needing zero `.cu` changes. Read `memory/mission/wave61-CL-segment-allocator.md` first. | **yes** |
+| **5b** | **Read our compressed KV format (D17).** The KV load path takes the format as a **parameter** — standard BF16 *and* TurboQuant (WHT + codebook). Designed in from rung 3, not retrofitted. | **yes** |
 | 6 | Wire into `dsv4_attention` and measure against the unfused `softmax_with_sinks` baseline. **That delta is the deliverable number.** | **yes** |
+
+Every rung is also bound by **D16** (dual-arch) and **D17** (our byte formats), below.
+
+## D16 — dual-arch is a design constraint, not a follow-up
+
+**SM90 (H100/H200) and SM100/SM103 (B200/B300) are both first-class.** Not "sm90 now, retarget later" — that is the same reasoning that chose CuTeDSL over FlashMLA-C++ in the first place.
+
+This is a **gift here, not a burden**: the reference `hca_fp8.py` is *already* SM100. So the job is not to port it off Blackwell but to **keep the SM100 path and add SM90**. The FlashInfer evaluation's stratification says where the fork lines fall:
+
+| Share | Lines | Disposition |
+|---|---|---|
+| ~26% | ~1,002 | **Ports as-is** — the *semantics*: two-region addressing, SWA handoff, page tables, split-KV, `can_implement`. |
+| ~17% | ~656 | **Deleted, not ported.** The `p_cor` correction exists only because tcgen05 writes accumulators to TMEM; Hopper's wgmma accumulates in registers. Replaced by the ~110-line `OnlineSoftmaxWithSink` (`variants.py:55-166`) — **which already handles sinks**, so rung 4 has a reference. |
+| ~57% | ~2,216 | **Genuine redesign** — 2-CTA MMA has no Hopper equivalent. |
+
+Structure the kernel so that 57% lives in **arch-specialised paths**, never a rewrite that abandons SM100.
+
+**Say which arches were measured vs merely compiled.** We rent SM90, so SM100 will likely be compile-verified only. A compile pass must never read as a benchmark.
+
+> Context for why this rule exists: `mistralrs-quant/build.rs` already emits SM89/90/100, but the kernels are written to an Ampere baseline (`qtip_grouped_gemm.cu:8` → `sm_80`; `__CUDA_ARCH__ >= 800` at `:327,:444`). We are **arch-portable by being arch-naive** — the keystone GEMM runs on H200 and B200 while exploiting neither. "Runs on Blackwell" is not "written for Blackwell."
+
+## D17 — the kernel must read *our* KV format
+
+The moat is not one kernel; it is **"we store things in formats nobody else reads,"** and it surfaces in two places. Weights packed as trellis/QTIP hit the **GEMM** (structurally unadoptable: closed dtype enum, no weight-decode hook, `ElementA = ElementB`). **KV compressed by TurboQuant hits the attention kernel — this one.**
+
+So reading TurboQuant KV is a **first-class requirement alongside** head_dim 512, MQA, sinks and the two-region read. Even FlashInfer's Blackwell-gated `cute_dsl_hca_decode` reads *standard* KV, so this has genuinely never existed anywhere and cannot be lifted from anyone.
+
+**Design the KV load path with the format as a parameter** — standard BF16 **and** TurboQuant-compressed — rather than hardcoding BF16 and retrofitting.
+
+### What already exists in-repo, and its limits
+
+`mistralrs-paged-attn/src/cuda/turbo_paged_attention.cuh` is real prior art: it reads compressed KV directly — Q is WHT-rotated **once** per query, K/V are packed indices resolved by codebook lookup in shared memory, per-token norms applied after the dot product. Its cache layout is documented in the header:
+
+```
+k_cache: [num_blocks, num_kv_heads, packed_k_bytes_per_head, block_size]
+k_norms: [num_blocks, num_kv_heads, block_size]   (half)
+```
+
+The property that makes fusion cheap, and which carries straight to d=512: **the K dot product runs in the rotated domain, so no inverse rotation is needed.**
+
+Three limits to design around, all verified in the source:
+
+1. `static_assert(HEAD_SIZE == 128, "TurboQuant currently supports HEAD_SIZE=128 only")` — **V4 needs 512.** PR #87 generalises TurboQuant beyond {64,128,256}; coordinate with it rather than assuming 128.
+2. **No `__CUDA_ARCH__` guards at all** in that file — Ampere-baseline, i.e. D16-non-compliant as written.
+3. The query pointer is `const float*` (F32), not BF16 — an interface detail the binding must reconcile.
+
+Structural bonus worth exploiting: TurboQuant's own `fp16_window` (recent tokens kept uncompressed) **lines up with V4's raw sliding window**, and its compressed region with V4's compressed KV. Rung 5's two-region read and rung 5b's format parameter are closer to the same mechanism than they look.
+
+> Surfaced while reading this: `TurboQuantSingleCache` (`arc-turbo/src/cache.rs`) is **not referenced anywhere outside `arc-turbo`** — the Rust-side compressed cache does not feed the CUDA kernel that was written for it. That is the BACKLOG's "wired but dead code" category and it should be confirmed before rung 5b depends on it.
+
+## Sequencing caution — this kernel is not the current bottleneck
+
+From our own ceilings data and independently confirmed by the FlashInfer evaluation: **the measured gaps are dominated by host overhead, MoE dedup and the `xs` history — not attention.** At 111.69 tok/s aggregate we are using low single-digit percent of H200 memory bandwidth.
+
+This kernel is the right long-term build. **It must not be described as the current bottleneck** — by anyone, including in this repo's own PR text.
 
 ### Not starting cold
 
