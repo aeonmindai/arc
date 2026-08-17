@@ -10,7 +10,7 @@ mechanically once approved.
 
 | # | Decision | Options / default |
 |---|---|---|
-| A1 | **Release timing**: ship v2.0 on today's numbers, or hold for session 5's end-to-end batched-serving number (the serving-level $/Mtok) | Notes are written to be honest either way; holding upgrades the fleet story from kernel-level to serving-level |
+| A1 | **Release timing**: ship v2.0 on today's numbers, or hold for the end-to-end batched-serving number (the serving-level $/Mtok) | Notes are written to be honest either way; holding upgrades the fleet story from kernel-level to serving-level. **Update: that measurement now exists** — sessions 6–8 measured end-to-end serving on the published `qtip2b` artifact (**111.69 tok/s aggregate at B=256, $12.06/Mtok**, 0 errors / 505 requests) [measured, 1×H200]. The "hold for it" branch is closed; what remains is a decision about which artifact v2.0 headlines |
 | A2 | **Release notes content**: [docs/RELEASE_NOTES_v2.0.md](../RELEASE_NOTES_v2.0.md) as drafted (incl. limitations wording) | Approve / edit |
 | A3 | **Version string**: `v2.0.0` tag name | Or `v2.0.0-rc1` first |
 | A4 | **HF org + repo name** for the pre-baked UQFF upload | e.g. `<org>/DeepSeek-V4-Flash-UQFF` — org must be Jish's call |
@@ -36,14 +36,29 @@ mechanically once approved.
 - [ ] Version bump: confirm the crate/CLI version reported by `arc --version`
       matches the tag (update `Cargo.toml` workspace version if not).
 - [x] Docs consistency sweep: README.md carried session-2-era numbers
-      (84.0%, 5.4 tok/s, ≈$77); reconciled to the BENCHMARKS.md current state
-      (87.0%, 14.58 tok/s, ≈$123) in `docs/correct-kernel-stack-bound`.
-- [ ] **Provisional labels intact.** GSM8K 87.0% / perplexity 12.50 /
-      long-context were measured on pre-PR-#35 decode math and are labeled
-      **provisional** in README.md, BENCHMARKS.md, FLEET.md and
-      RELEASE_NOTES_v2.0.md. Either re-measure on post-#35 math before tagging,
-      or confirm every one of those labels survived the freeze. Do not tag with
-      the labels stripped and no re-measure.
+      (84.0%, 5.4 tok/s, ≈$77); reconciled to the then-current BENCHMARKS.md
+      state (87.0%, 14.58 tok/s, ≈$123) in `docs/correct-kernel-stack-bound`.
+      ⚠️ **That reconciliation target is itself now superseded** — see the two
+      items below and §5. The sweep happened; its numbers did not survive.
+- [ ] **Re-do the sweep against the sessions 7–8 numbers, not the session-4
+      ones.** Current state [measured, 2026-08-17]:
+      - GSM8K **1270/1319 = 96.3% ± 1.0 pp**, **full** test set, 0-shot,
+        **0 degenerate / 0 truncated / 0 errors**, mean 157.8 tokens. The
+        reference model's published **90.8 is 8-shot** — a different and easier
+        protocol — so **96.3 is not a like-for-like win over it**, and any copy
+        that implies otherwise fails A7.
+      - b=1 decode **18.27 tok/s aggregate / 17.99 per-user p50** (not 14.58).
+      - Batched serving **111.69 tok/s aggregate at B=256, $12.06/Mtok**,
+        rising monotonically from B=1; 0 errors across 505 requests, 1×H200,
+        published `qtip2b` artifact.
+- [ ] **Provisional labels: GSM8K's is retired, the others are not.** The
+      **87.0% is superseded** by the full-set 96.3% above — retire its
+      "provisional / re-measure pending" framing rather than re-freezing it.
+      **Perplexity 12.50 and the long-context results remain provisional**
+      (measured on pre-PR-#35 decode math, never re-measured); confirm those
+      labels survived the freeze in README.md, BENCHMARKS.md, FLEET.md and
+      RELEASE_NOTES_v2.0.md. Do not tag with a provisional label stripped and no
+      re-measure behind it.
 
 ## 2. Tag (only after §0 sign-off)
 
@@ -77,7 +92,11 @@ gracefully.
 | `macos-arm64-metal` | Apple Silicon | `metal` | Build on macOS arm64 |
 
 **WARNING — no `cudnn` in any CUDA release binary.** The `cudnn` feature
-costs −62% decode on V4 (5.45 vs 14.58 tok/s, measured session 4). Every
+costs −62% decode on V4 (5.45 vs **14.58** tok/s, measured session 4 — a valid
+same-box, one-flag A/B whose **ratio still stands**; but **14.58 is a
+session-4-vintage b=1 figure and is no longer the current decode number**, which
+is **18.27 tok/s aggregate / 17.99 per-user p50** [measured, 2026-08-17]. Quote
+the −62% as the A/B result, never 14.58 as today's speed). Every
 CUDA asset above is `--features "cuda flash-attn"` and nothing more. A
 release binary accidentally built with `cudnn` would ship the regression to
 every user; check the feature list in the build log before packaging each
@@ -107,10 +126,14 @@ hf upload <org>/DeepSeek-V4-Flash-UQFF <output-dir> --repo-type model --private
 Plan:
 
 1. Source of the artifact: **reuse the session-4 bake** (74.18 GB, 8 shards + residual,
-   `--isq qtip2` 2-bit trellis experts + FP8 attention, baked with the
-   Viterbi default) if the session tarball is intact; otherwise re-bake on a
-   rented H200 (~25 min build + ~24 min bake at 30 s/layer, ~$5 of GPU time)
-   using the runbook-4 flow **without cudnn**.
+   **2.09 bits/param**, `--isq qtip2` 2-bit trellis experts + FP8 attention,
+   baked with the Viterbi default) if the session tarball is intact; otherwise
+   re-bake. **Budget the re-bake from measured per-layer times, not from the
+   "30 s/layer / ~24 min" figure this line used to carry — that was wrong by
+   roughly an order of magnitude.** Measured: beam W=256 is **241 s/layer** on
+   an H200 (pre-PR-#40) and the published artifact was actually baked at
+   **370–376 s/layer on a \$1.49/hr A100**, 43 layers ⇒ **hours, not minutes**.
+   Use the runbook-4 flow **without cudnn**.
 2. Run `arc quantize` directory mode (or `--base-model`/`--repo-id` flags to
    skip the prompts) so the generated README names the base model
    `deepseek-ai/DeepSeek-V4-Flash` and the target repo from A4.
@@ -126,9 +149,13 @@ Plan:
 
 ## 5. Docs freeze check (same commit as the tag)
 
-- [ ] README.md numbers == BENCHMARKS.md numbers (87.0 / 14.58 / ≈$123 /
-      grouped-GEMM curve labeled kernel-level).
-- [ ] FLEET.md tags intact ([measured] / [measured-kernel] / [projected]).
+- [ ] README.md numbers == BENCHMARKS.md numbers. The current set is
+      **96.3% GSM8K (1270/1319, full set, 0-shot)** / **18.27 tok/s b=1
+      aggregate** / **111.69 tok/s aggregate at B=256, $12.06/Mtok** — **not**
+      the superseded `87.0 / 14.58 / ≈$123` triple this line used to name. The
+      grouped-GEMM curve stays labeled **kernel-level**.
+- [ ] FLEET.md tags intact ([measured] / [measured-kernel] / [projected]) — and
+      every number in the release copy carries one of those three.
 - [ ] RELEASE_NOTES_v2.0.md drops its DRAFT banner (single-line edit) —
       only at tag time, per A2.
 - [ ] `docs/UQFF.md` mentions 0.2.1 rank-3 payloads and the reader
@@ -154,8 +181,11 @@ quotes the projected columns as achievements.
 
 ## 7. Post-release
 
-- [ ] Open the session-5 tracking issue: end-to-end batched serving tok/s +
-      $/Mtok, tuned-dispatch validation, MTP acceptance, voting after PR #21
-      hardware validation — these are v2.1's headline candidates.
+- [ ] Open the follow-up tracking issue. ~~end-to-end batched serving tok/s +
+      $/Mtok~~ **— done, measured on `qtip2b` (111.69 tok/s at B=256,
+      $12.06/Mtok)**; what remains open is tuned-dispatch validation, MTP
+      acceptance, voting after PR #21 hardware validation, and the missing
+      in-class side-by-side against another serving stack — these are v2.1's
+      headline candidates.
 - [ ] Watch the first 48h of issues for artifact-download and
       chat-template-missing reports (the two known footguns).
