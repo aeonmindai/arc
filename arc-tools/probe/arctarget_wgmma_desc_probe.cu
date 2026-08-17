@@ -91,13 +91,21 @@ static constexpr int N = 8;
 static constexpr int K = 16;
 static constexpr int WG_THREADS = 128;  // one warpgroup
 
-// Candidate encodings for the descriptor's byte-offset fields. The documented
-// phrase is "encoded value", which in every published example means
-// `(x & 0x3FFFF) >> 4` — but "which x" (row pitch in bytes? core-matrix
-// stride? element count?) is the part that is not literal, so we sweep the
-// resulting field value directly.
-static constexpr uint32_t CAND[] = {0, 1, 2, 4, 8, 16, 32, 64, 128, 256};
-static constexpr int NCAND = sizeof(CAND) / sizeof(CAND[0]);
+// Candidate encodings for the descriptor's byte-offset fields: 0 and then the
+// powers of two up to 256. The documented phrase is "encoded value", which in
+// every published example means `(x & 0x3FFFF) >> 4` — but "which x" (row pitch
+// in bytes? core-matrix stride? element count?) is the part that is not
+// literal, so we sweep the resulting field value directly.
+//
+// A FUNCTION rather than a table on purpose. A namespace-scope `constexpr`
+// array indexed by a RUNTIME value inside a kernel is odr-used, and nvcc
+// rejects it ("identifier is undefined in device code") because there is no
+// device copy. This form is a compile-time constant expression on both sides
+// and needs no `__constant__` symbol or `cudaMemcpyToSymbol`.
+static constexpr int NCAND = 10;
+__device__ __host__ __forceinline__ uint32_t cand(int i) {
+    return i == 0 ? 0u : (1u << (i - 1));  // 0,1,2,4,8,16,32,64,128,256
+}
 
 // Shared pool, in bf16 elements. The 128-element (256 B) B tile sits at the
 // front; the rest is POISON.
@@ -236,7 +244,7 @@ __global__ void probe_kernel(float* __restrict__ out_wgmma,  // [NCAND*NCAND][M*
     for (int li = 0; li < NCAND; ++li) {
         for (int si = 0; si < NCAND; ++si) {
             float d[4] = {0.f, 0.f, 0.f, 0.f};
-            const uint64_t desc = make_desc(&s_pool[0], CAND[li], CAND[si],
+            const uint64_t desc = make_desc(&s_pool[0], cand(li), cand(si),
                                             (uint32_t)base_offset, (uint32_t)swizzle);
             if constexpr (TRANS_B == 0) {
                 wgmma_m64n8k16_regA_0(d, a, desc);
@@ -322,11 +330,11 @@ static int run_config(const char* layout_name, const float* ref, float* d_wgmma,
             ++out.matches;
             printf("PROBE_MATCH layout=%s trans_b=%d lbo_field=%u sbo_field=%u "
                    "base_offset=0 swizzle=0\n",
-                   layout_name, TRANS_B, CAND[v / NCAND], CAND[v % NCAND]);
+                   layout_name, TRANS_B, cand(v / NCAND), cand(v % NCAND));
         }
     }
     printf("PROBE_BEST_PARTIAL layout=%s trans_b=%d lbo_field=%u sbo_field=%u hits=%d/%d\n",
-           layout_name, TRANS_B, CAND[out.best_idx / NCAND], CAND[out.best_idx % NCAND],
+           layout_name, TRANS_B, cand(out.best_idx / NCAND), cand(out.best_idx % NCAND),
            out.best_hits, M * N);
     printf("PROBE_CONFIG layout=%s trans_b=%d matches=%d of %d\n", layout_name, TRANS_B,
            out.matches, variants);
