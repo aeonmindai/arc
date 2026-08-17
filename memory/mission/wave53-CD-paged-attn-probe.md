@@ -200,6 +200,22 @@ engine's PagedAttention arm (wave29-BC §4b). Both hold.
 
 ---
 
+### 5c-bis. The "three separate bails" are one cause seen three times, plus one the flag cannot fix
+
+The profiler reported bails at `normal.rs:1554`, `normal.rs:1844`, and
+`pipeline/mod.rs:1088`. Reading them:
+
+| site | what it is | does the flag stop it? |
+|---|---|---|
+| `pipeline/mod.rs:1088` | `CacheBackendMetadata::PagedAttention {..} =>` — the `step()` arm V4 never enters | **yes** |
+| `normal.rs:1844` | `autonomous_decode`: `cache_config == None` | **yes** — and the next gate (`is_captured()`, §5c) fires instead |
+| `normal.rs:1554` | `if probe && seq_len == 1 && self.cuda_graph_runner.is_some()` | **no** — `probe` is `ARC_V4_CAPTURE_PROBE` (`normal.rs:1528`), nothing to do with paging |
+
+So two of the three are the same root cause (flag false) observed at two depths,
+and the third is an unrelated, separately env-gated probe that the flag makes
+*worse*: `ARC_V4_CAPTURE_PROBE` drives `has_graph_mode_positions()`, and §5a
+shows the arm it feeds is shadowed once `paged_attn` is `Some`.
+
 ### 5f. 🔴 THE LANDMINE — the flag makes `try_dedicated_decode` *reachable*, and it computes the wrong model
 
 This one cuts the other way from §5a–§5e and is the most important thing in this
