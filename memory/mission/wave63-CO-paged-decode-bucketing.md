@@ -59,13 +59,15 @@ Harness `/root/batchinv_tput.py` copied **verbatim** from the batchinv chain
 (md5 `e6232773a2cc7c51ddb48bb9ff43a1e4`) so the numbers are comparable to that A/B.
 Card exclusive: `compute-apps` empty at start, only the server pid at end.
 
-|   B | arm     | baseline | fix     | delta     |
-|----:|---------|---------:|--------:|----------:|
-|   1 | —       |   278.14 |  274.70 |     0.99x |
-|   8 | uniform |   923.19 |  869.36 |     0.94x |
-|   8 | spread  | **99.21**| **865.50** | **8.72x** |
-|  32 | uniform |  1230.87 | 1264.72 |     1.03x |
-|  32 | spread  |**147.77**|**1196.47** | **8.10x** |
+Two independent samples on **two different H200 boxes**:
+
+|   B | arm     | box B base | box B fix | box A base | box A fix | delta |
+|----:|---------|-----------:|----------:|-----------:|----------:|------:|
+|   1 | —       |     278.14 |    274.70 |     272.79 |    280.38 | flat |
+|   8 | uniform |     923.19 |    869.36 |     902.87 |    947.43 | −5.8% then **+4.9%** |
+|   8 | spread  |  **99.21** |**865.50** |  **98.61** |**902.57** | **8.72× / 9.15×** |
+|  32 | uniform |    1230.87 |   1264.72 |    1289.78 |   1286.77 | +2.8% then **−0.2%** |
+|  32 | spread  | **147.77** |**1196.47**| **147.77** |**1233.30**| **8.10× / 8.35×** |
 
 (aggregate tok/s; `max_tokens=64`; spread = prompt lengths 50…500, mean matched to the
 uniform arm so both arms push the same total prompt tokens.)
@@ -73,9 +75,11 @@ uniform arm so both arms push the same total prompt tokens.)
 * Baseline B=8 spread is **2.80× slower than baseline B=1** — batching was NEGATIVE.
 * After: B=8 spread is 3.15× faster than B=1, and length diversity is nearly free —
   spread/uniform is **0.996** at B=8 and **0.946** at B=32.
-* The uniform arms move in opposite directions (−5.8% at B=8, +2.8% at B=32) on **single
-  samples**. A neighbour took the card before a repeat, so this is noise-vs-signal
-  **unresolved**, not "no regression".
+* **The uniform cells flip sign between samples** (−5.8% → +4.9%, +2.8% → −0.2%), so the
+  apparent movement there is run-to-run noise, not a regression. This was recorded as
+  UNRESOLVED after one sample and is resolved only because the second sample exists.
+* B=32 spread baseline is **147.77 on both boxes to two decimals** — the pathology is
+  perfectly deterministic, because it is perfectly serialised.
 
 **Mechanism, from the engine's own log rather than inferred** — running/waiting histogram:
 
@@ -98,6 +102,54 @@ The V4 number that motivated this work — **24.54 → 7.91 tok/s (3.10×)** —
 `DeepSeekV4Loader::supports_paged_attention` returns `false`
 (`normal_loaders.rs:3265`). **This change does not address that number.** Different
 scheduler, different model. Do not read the 8.72× as the flagship getting faster.
+
+### 3.2 🔴 MEASURED — the tokens do not change
+
+A throughput win that changes the output is not a win.
+
+**The first check was confounded, and the confound is recorded because it is instructive.**
+Comparing each binary's B=8-**spread** output against its own B=1 gave baseline 5/8
+identical, fix 2/8. That reads like "the fix diverges more" and it is **not a like-for-like
+comparison**: the baseline *serialises* a spread batch, so its "B=8" is effectively B≈1,
+while the fix genuinely runs it at B=8. The comparison cannot separate *actually batching*
+from a defect.
+
+The control that removes it uses a **uniform** batch — same length, distinct content — which
+**both** binaries schedule identically (one bucket either way):
+
+| comparison | result |
+|---|---|
+| **A.** baseline B=8-uniform vs **fix** B=8-uniform | **8/8 identical** |
+| **B.** baseline B=1 vs baseline B=8-uniform | 1/8 identical |
+| **B.** fix B=1 vs fix B=8-uniform | **1/8 identical** |
+
+**A** — on a batch both binaries schedule the same way, the tokens are bit-identical: the
+change does not alter the computation.
+**B** — at the *same batch shape*, both arms diverge from B=1 by exactly the same amount, so
+the fix adds no divergence of its own. (7/8 divergence is simply what true B=8 costs in this
+engine — bf16 reduction order is batch-dependent, the known batch-invariance issue. It is
+also why check 1 flattered the baseline.)
+
+Two vacuity guards, both load-bearing:
+
+* **Check A asserts *identical*, which passes trivially if both URLs hit the same binary.**
+  The script takes both md5s, refuses with cannot-answer if they are equal, and writes them
+  into `tokens2.json` under `_provenance` — so the artefact identifies its arm independently
+  of the `git revision` log line, which cannot (§8). Printed:
+  `[arms differ] baseline md5 9d34749eab05 vs fix md5 7131ddc29669`.
+* **Self-consistency**: the baseline reproduces its own B=1 output 8/8, so greedy decoding
+  really is deterministic on this build and a cross-binary difference would have been
+  attributable. Without this, `sampler.rs`'s two disagreeing argmax tie-breaks could have
+  produced a difference that is nobody's bug.
+
+Plus teeth: 4 distinct completions across the 8 prompts, so identity is not satisfied by a
+model emitting one constant string.
+
+⚠️ **Not directly observed:** the uniform fixture's own running/waiting histogram is empty —
+that run is shorter than the engine's 5 s logger interval. "The baseline ran it as one
+bucket" is *by construction* (the bucket key is exact length; equal lengths ⇒ one bucket),
+corroborated by the §3 throughput runs whose uniform arms did log `run=8 wait=0` and
+`run=32 wait=0`.
 
 ## 4. Also fixed at source: ragged prefill sampled from padding (PR #117, split out first)
 
