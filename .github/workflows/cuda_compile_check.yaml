@@ -349,10 +349,44 @@ jobs:
 
       # The gate itself. build.rs fails the build if any requested arch is
       # missing from the archive it just produced.
+      # Separate "this toolkit cannot compile that file for that arch" from
+      # "Arc's build wiring is wrong". They are different failures with
+      # different owners, and the first run of this job conflated them:
+      # `cargo build` reported `CompilationFailed { path: "gemv_bf16.cu",
+      # message: "nvcc error:\n\n" }` with an EMPTY message, because the real
+      # stderr was `Segmentation fault (core dumped)` — nvcc itself crashed.
+      # An empty error message is the same failure mode this whole PR is about.
+      #
+      # So each kernel is compiled standalone, once per architecture, and every
+      # (file, arch) pair prints its own line. This step never fails the job:
+      # it is the diagnostic that makes the gate below interpretable.
+      - name: Per-arch nvcc probe (diagnostic — names the failing pair)
+        run: |
+          set -uo pipefail
+          for arch in sm_80 sm_90a sm_100a sm_103a; do
+            for f in arc-cuda-graph/src/cuda/*.cu arc-cuda-graph/src/cuda/flashmlasparse/*.cu; do
+              if out=$(nvcc -arch=$arch -std=c++17 -O3 \
+                    -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__ \
+                    -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__ \
+                    -Xcompiler -fPIC \
+                    -c -o /tmp/probe.o "$f" 2>&1); then
+                echo "OK    $arch  $f"
+              else
+                echo "FAIL  $arch  $f  :: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)"
+              fi
+            done
+          done
+          echo "(diagnostic only — the gate is the cargo build below)"
+
+      # `-j 1` on purpose. The first run built this crate and mistralrs-quant
+      # concurrently, each spawning parallel nvcc processes across four
+      # architectures on a 4-core runner, and nvcc segfaulted. Serialising
+      # removes memory pressure as a variable so a failure here means the
+      # toolkit genuinely cannot do it, not that it ran out of room trying.
       - name: Build arc-cuda-graph for all four architectures
         env:
           ARC_CUDA_ARCHS: "80,90,100,103"
-        run: cargo build -p arc-cuda-graph --lib --features cuda
+        run: cargo build -j 1 -p arc-cuda-graph --lib --features cuda
 
       # Independent confirmation: do not let the code under test be the only
       # witness for its own claim.
