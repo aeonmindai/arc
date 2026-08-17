@@ -3036,17 +3036,24 @@ impl DecoderLayer {
         v4_nan_dbg(&comb_attn, &format!("L{li}.attn_pre.comb"));
         let y_attn_normed = self.input_layernorm.forward(&y_attn)?;
         v4_nan_dbg(&y_attn_normed, &format!("L{li}.input_layernorm"));
-        let attn_out = timed(1, &tdev, || {
-            self.attn.forward(
-                &y_attn_normed,
-                attention_mask,
-                seqlen_offsets,
-                kv_cache,
-                xs_hist_cache,
-                metadata,
-                flash_params,
-            )
-        })?;
+        let attn_out = {
+            // Two device spans, aggregated over all layers, so a decode step
+            // splits into the only two blocks large enough to matter. Enough to
+            // answer "what grows with B"; not a substitute for the fourteen
+            // MLA sub-spans on master, which this branch predates.
+            let _p = arc_profiler::device_span("mla_attn");
+            timed(1, &tdev, || {
+                self.attn.forward(
+                    &y_attn_normed,
+                    attention_mask,
+                    seqlen_offsets,
+                    kv_cache,
+                    xs_hist_cache,
+                    metadata,
+                    flash_params,
+                )
+            })?
+        };
         v4_nan_dbg(&attn_out, &format!("L{li}.attn_out"));
         v4_collapse_dbg(&attn_out, &format!("L{li}.attn_out"), 1);
         let xs_4d = timed(2, &tdev, || {
@@ -3062,7 +3069,10 @@ impl DecoderLayer {
         v4_collapse_dbg(&y_ffn, &format!("L{li}.y_ffn"), 1);
         let y_ffn_normed = self.post_attention_layernorm.forward(&y_ffn)?;
         v4_nan_dbg(&y_ffn_normed, &format!("L{li}.post_attention_layernorm"));
-        let ffn_out = timed(4, &tdev, || self.moe_or_mlp.forward(&y_ffn_normed, input_ids))?;
+        let ffn_out = {
+            let _p = arc_profiler::device_span("moe");
+            timed(4, &tdev, || self.moe_or_mlp.forward(&y_ffn_normed, input_ids))?
+        };
         v4_nan_dbg(&ffn_out, &format!("L{li}.ffn_out"));
         v4_collapse_dbg(&ffn_out, &format!("L{li}.ffn_out"), 1);
         let out = timed(5, &tdev, || {
