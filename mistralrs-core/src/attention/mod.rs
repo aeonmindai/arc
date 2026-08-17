@@ -7,7 +7,9 @@ use candle_core::{DType, Device, Result, Tensor};
 mod backends;
 
 #[allow(unused)]
-pub(crate) use backends::{flash_attn, maybe_synchronize, naive_sdpa, sinks_attn};
+pub(crate) use backends::{
+    cuda_flash_attn_supported, flash_attn, maybe_synchronize, naive_sdpa, sinks_attn,
+};
 
 /// Chunk size for attention computation to avoid OOM on long sequences
 pub(crate) const ATTENTION_CHUNK_SIZE: usize = 1024;
@@ -138,8 +140,20 @@ impl Sdpa {
         let (_, _, _, k_head_dim) = k.dims4()?;
         let (_, _, _, v_head_dim) = v.dims4()?;
 
+        // The CUDA flash kernels accept a bounded envelope of shapes: FA2 takes
+        // any head_dim that is a multiple of 8 up to 256, FA3 takes only
+        // {64, 128, 256} and has no softcap kernel. Asking for anything else
+        // used to enter the flash path and hard-`bail!` inside candle; now it
+        // degrades to non-flash SDPA, which has no such restriction. See
+        // `backends::flash` for the envelope and its provenance.
+        //
+        // (The CPU branch below is a separate, unrestricted implementation and
+        // is deliberately not gated on this predicate.)
         let can_use_flash = q.device().is_cpu()
-            || q.device().is_cuda() && crate::using_flash_attn() && q.dtype() != DType::F32;
+            || q.device().is_cuda()
+                && crate::using_flash_attn()
+                && q.dtype() != DType::F32
+                && cuda_flash_attn_supported(head_dim, k_head_dim, v_head_dim, sdpa_params.softcap);
 
         if can_use_flash {
             // flash-attn expects (b_sz, seq_len, nheads, head_dim)
@@ -171,6 +185,36 @@ impl Sdpa {
             } else {
                 return flash_attn(&q, &k, &v, flash_params, sdpa_params)?.transpose(1, 2);
             }
+        }
+
+        // Diverting to non-flash SDPA is only safe if a real mask exists.
+        //
+        // `LayersMasker` skips materializing the causal mask whenever
+        // `using_flash_attn() && device.is_cuda()`, handing back a `(1, 1)`
+        // zeros placeholder instead (see `layers_masker.rs`) on the assumption
+        // that the flash kernel applies causality itself. `naive_sdpa` does
+        // `att.broadcast_add(mask)`, so that placeholder broadcasts to zeros and
+        // the result is silently NON-causal — the exact failure mode this file
+        // exists to prevent.
+        //
+        // A `(1, 1)` mask with `seq_len > 1` can only be that placeholder: a
+        // genuinely bidirectional caller (vision/audio encoders) passes `None`,
+        // which stays `None` and is correctly non-causal. So refuse loudly here
+        // rather than return wrong numbers. This restores the pre-dispatch
+        // behaviour for these shapes, which hard-`bail!`ed inside candle.
+        if seq_len > 1
+            && q.device().is_cuda()
+            && crate::using_flash_attn()
+            && mask.is_some_and(|m| m.dims() == [1, 1])
+        {
+            candle_core::bail!(
+                "no CUDA flash backend accepts this shape (head_dim {head_dim}, k {k_head_dim}, \
+                 v {v_head_dim}, softcap {:?}) and the causal mask was not materialized because \
+                 the build enables flash-attn. Falling back to non-flash SDPA here would compute \
+                 NON-causal attention. Rebuild without a flash feature to use this model, or add \
+                 `--features flash-attn` if only flash-attn-v3 is enabled.",
+                sdpa_params.softcap
+            );
         }
 
         self.run_attention_noflash(q, k, v, mask, sdpa_params)
