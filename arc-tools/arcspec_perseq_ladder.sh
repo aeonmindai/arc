@@ -393,10 +393,17 @@ run_arm() {
 
 run_arm OFF || die "OFF arm failed"
 run_arm ON ARC_V4_XS_PER_SEQ=1 ARC_MTP_PER_SEQ_KV=1 || die "ON arm failed"
+# The third arm prices the window pin, which is ON by default in every arm
+# above. Same flags as ON, pin disabled — so ON vs ON_UNPINNED isolates one
+# change: whether the compressor's raw window is reallocated every decode step
+# on all 41 compressed layers, or held at its documented bound.
+run_arm ON_UNPINNED ARC_V4_XS_PER_SEQ=1 ARC_MTP_PER_SEQ_KV=1 ARC_V4_XS_PIN_WINDOW=0 \
+  || die "ON_UNPINNED arm failed"
 
 cat > "$OUT/report.py" <<'PYEOF'
 import json, os, sys
 out, batches, regimes = sys.argv[1], sys.argv[2].split(), sys.argv[3].split()
+ARMS = ("OFF", "ON", "ON_UNPINNED")
 def cell(arm, regime, k):
     p = os.path.join(out, f"{arm}.{regime}.k{k}.cell.json")
     try:
@@ -411,15 +418,15 @@ print("aggregate_tok/s is wall-clock and is THE number. tok/batch_step x")
 print("batch_steps/s reconstructs it: when aggregate does not move, those two")
 print("say which factor ate it. run_bucket is the width the engine ACTUALLY ran")
 print("— compare it to offered before reading any cell as a batch result.")
-hdr = (f"{'regime':<8} {'B':>4} {'arm':<4} {'aggregate_tok/s':>15} {'tok/step':>9} "
+hdr = (f"{'regime':<8} {'B':>4} {'arm':<12} {'aggregate_tok/s':>15} {'tok/step':>9} "
        f"{'tok/bstep':>10} {'bsteps/s':>9} {'ms/bstep':>9} "
        f"{'buckets/step':>13} {'run_bucket':>11} {'offered':>8}")
 print(hdr); print("-" * len(hdr))
 for regime in regimes:
     for k in batches:
-        for arm in ("OFF", "ON"):
+        for arm in ARMS:
             c = cell(arm, regime, k)
-            print(f"{regime:<8} {k:>4} {arm:<4} {str(g(c,'aggregate_tok_s')):>15} "
+            print(f"{regime:<8} {k:>4} {arm:<12} {str(g(c,'aggregate_tok_s')):>15} "
                   f"{str(g(c,'tok_per_step')):>9} {str(g(c,'tok_per_batch_step')):>10} "
                   f"{str(g(c,'batch_steps_per_s')):>9} {str(g(c,'ms_per_batch_step')):>9} "
                   f"{str(g(c,'buckets_per_step')):>13} {str(g(c,'running_bucket_size')):>11} "
@@ -439,6 +446,20 @@ for regime in regimes:
         print(f"        tok/bstep  {ratio('tok_per_batch_step')}")
         print(f"        bsteps/s   {ratio('batch_steps_per_s')}")
         print(f"        run_bucket {ratio('running_bucket_size')}")
+print("\n=== THE WINDOW PIN, isolated (ON vs ON_UNPINNED) ===")
+print("Same per-seq flags in both; the only difference is whether the")
+print("compressor's raw window is reallocated every decode step on 41 layers.")
+for regime in regimes:
+    for k in batches:
+        u, p_ = cell("ON_UNPINNED", regime, k), cell("ON", regime, k)
+        def r2(key):
+            a, b = u.get(key), p_.get(key)
+            if not a or not b:
+                return "NA"
+            return f"{b/a:.3f}x ({a} -> {b})"
+        print(f"  {regime:<8} B={k:<4} aggregate {r2('aggregate_tok_s')}  "
+              f"ms/bstep {r2('ms_per_batch_step')}")
+
 print("\n=== THE BUCKETING LAW, checked against this run ===")
 print("The scheduler A/B measured `running bucket = B / distinct lengths`.")
 print("uniform has 1 distinct length, spread has 8, so the prediction is:")
@@ -446,12 +467,12 @@ for regime in regimes:
     dist = 1 if regime == "uniform" else 8
     for k in batches:
         pred = max(1.0, int(k) / dist)
-        for arm in ("OFF", "ON"):
+        for arm in ARMS:
             c = cell(arm, regime, k)
             got = c.get("running_bucket_size")
             if got is None:
                 continue
-            print(f"  {regime:<8} B={k:<4} {arm:<4} predicted {pred:>6.2f}  measured {got:>7.3f}")
+            print(f"  {regime:<8} B={k:<4} {arm:<12} predicted {pred:>6.2f}  measured {got:>7.3f}")
 print("\n⚠️ Read every spread cell against its run_bucket. If run_bucket is ~1,")
 print("that cell is a measurement of the scheduler serialising the batch, not")
 print("of per-sequence KV advance, and its aggregate cannot be attributed here.")
