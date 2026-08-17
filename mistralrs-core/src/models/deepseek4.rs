@@ -1189,11 +1189,14 @@ impl Attention {
                 n_kv_groups,
                 softcap: None,
                 softmax_scale: cfg.softmax_scale(),
-                sliding_window: if compress_ratio != CompressRatio::Standard {
-                    Some(cfg.sliding_window)
-                } else {
-                    None
-                },
+                // Audit §1(e): this was inverted. The value describes the key
+                // axis `dsv4_attention` hands the backend, which is the raw
+                // window alone on Standard and `[raw ++ compressed]` on
+                // CSA/HCA — see `dsv4_attention::sdpa_sliding_window`.
+                sliding_window: super::dsv4_attention::sdpa_sliding_window(
+                    compress_ratio,
+                    cfg.sliding_window,
+                ),
                 sinks: sinks_for_sdpa,
             },
             compress_ratio,
