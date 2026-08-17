@@ -1,0 +1,1221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arc — How An Inference Engine Actually Works</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%230a0d12'/%3E%3Cpath d='M3 11.5 8 4l5 7.5' stroke='%236ea8fe' stroke-width='1.8' fill='none' stroke-linejoin='round'/%3E%3C/svg%3E">
+<style>
+:root{
+  --bg:#0a0d12; --bg2:#0e1219; --panel:#121822; --panel2:#161d29; --panelh:#1b2432;
+  --line:#1f2836; --line2:#2b3646; --line3:#3a485c;
+  --fg:#e4eaf3; --fg2:#95a3b8; --fg3:#66748a;
+  --accent:#6ea8fe; --accent2:#8fc0ff;
+  --m-agg:#f5a524; --m-user:#38bdf8; --m-ttft:#b794f6; --m-size:#4ade80; --m-qual:#f472b6;
+  --s-shipped:#3fb950; --s-off:#d9a521; --s-none:#8b98ab; --s-concept:#7aa2c9;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{
+  margin:0; background:var(--bg); color:var(--fg);
+  font-family:var(--sans); font-size:15px; line-height:1.55;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1240px;margin:0 auto;padding:0 22px}
+code{font-family:var(--mono);font-size:.87em;background:#1a2330;border:1px solid var(--line2);
+  border-radius:4px;padding:.5px 4px;color:#c3d3e8;
+  white-space:normal;overflow-wrap:anywhere;max-width:100%}
+strong{color:#fff;font-weight:650}
+em{font-style:italic;color:#c9d6e8}
+a{color:var(--accent)}
+
+/* ---------- header ---------- */
+header.top{
+  border-bottom:1px solid var(--line); background:linear-gradient(180deg,#0e1420,#0a0d12);
+  padding:34px 0 26px;
+}
+.eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;
+  color:var(--fg3);margin:0 0 10px}
+h1{font-size:31px;line-height:1.2;margin:0 0 10px;letter-spacing:-.02em;font-weight:660}
+h1 .dim{color:var(--fg2);font-weight:400}
+.lede{max-width:78ch;color:var(--fg2);margin:0 0 18px;font-size:15.5px}
+.lede b{color:var(--fg);font-weight:600}
+.keyrow{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}
+.keyfact{
+  border:1px solid var(--line2);background:var(--panel);border-radius:8px;
+  padding:7px 11px;font-size:12.5px;color:var(--fg2);
+}
+.keyfact b{display:block;color:var(--fg);font-family:var(--mono);font-size:15px;font-weight:600;letter-spacing:-.01em}
+
+/* ---------- section chrome ---------- */
+section{padding:44px 0 8px;border-top:1px solid var(--line)}
+section:first-of-type{border-top:none}
+.sechead{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:6px}
+.secnum{font-family:var(--mono);font-size:12px;color:var(--accent);letter-spacing:.1em}
+h2{font-size:23px;margin:0;letter-spacing:-.015em;font-weight:640}
+.secsub{color:var(--fg2);max-width:80ch;margin:8px 0 22px;font-size:14.5px}
+
+/* ---------- journey diagram ---------- */
+.diagwrap{
+  border:1px solid var(--line);border-radius:12px;background:var(--bg2);
+  overflow-x:auto;overflow-y:hidden;padding:6px;
+}
+.diagwrap svg{display:block;min-width:940px;width:100%;height:auto}
+svg .bx rect{fill:var(--panel);stroke:var(--line3);stroke-width:1.2;transition:fill .12s,stroke .12s}
+svg .bx{cursor:pointer;outline:none}
+svg .bx:hover rect,svg .bx:focus-visible rect{fill:var(--panelh);stroke:var(--accent)}
+svg .bx:focus-visible rect{stroke-width:2}
+svg .bx.on rect{fill:#17243a;stroke:var(--accent);stroke-width:2}
+svg .bt{fill:var(--fg);font:600 14px var(--sans)}
+svg .bs{fill:var(--fg2);font:400 11.5px var(--sans)}
+svg .bs.hi{fill:var(--m-agg)}
+svg .bs.cool{fill:var(--m-user)}
+svg .flow{stroke:var(--line3);stroke-width:1.6;fill:none}
+svg .loopline{stroke:var(--accent);stroke-width:2.4;fill:none}
+svg .lbl{fill:var(--fg3);font:500 11px var(--sans)}
+svg .lbl.acc{fill:var(--accent2);font-weight:600;font-size:11.5px}
+svg .zone{fill:none;stroke:var(--line2);stroke-width:1.4;stroke-dasharray:5 5}
+svg .zonelbl{fill:var(--accent2);font:700 11.5px var(--mono);letter-spacing:.1em}
+svg .note{fill:var(--fg3);font:400 11.5px var(--sans)}
+svg .note tspan.k{fill:var(--fg2);font-weight:600}
+svg .phase{font:700 10.5px var(--mono);letter-spacing:.13em}
+
+.crosscut{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin-top:14px}
+.cc{
+  text-align:left;border:1px solid var(--line2);background:var(--panel);color:var(--fg2);
+  border-radius:9px;padding:11px 13px;cursor:pointer;font:inherit;font-size:13px;transition:.12s;
+}
+.cc:hover,.cc:focus-visible{background:var(--panelh);border-color:var(--line3);color:var(--fg);outline:none}
+.cc b{display:block;color:var(--fg);font-size:13.5px;margin-bottom:3px;font-weight:620}
+
+/* ---------- toolbar ---------- */
+.toolbar{
+  position:sticky;top:0;z-index:40;background:rgba(10,13,18,.93);
+  backdrop-filter:blur(10px);border-bottom:1px solid var(--line);
+  padding:12px 0;margin-bottom:20px;
+}
+.tbrow{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.search{
+  flex:1 1 240px;min-width:200px;background:var(--panel);border:1px solid var(--line2);
+  border-radius:8px;padding:9px 12px;color:var(--fg);font:inherit;font-size:14px;
+}
+.search:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(110,168,254,.13)}
+.search::placeholder{color:var(--fg3)}
+.chips{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.chiplbl{font-family:var(--mono);font-size:10.5px;letter-spacing:.11em;text-transform:uppercase;
+  color:var(--fg3);margin-right:2px}
+.chip{
+  border:1px solid var(--line2);background:var(--panel);color:var(--fg2);border-radius:20px;
+  padding:5px 11px;font:inherit;font-size:12.5px;cursor:pointer;transition:.12s;white-space:nowrap;
+  display:inline-flex;align-items:center;gap:6px;
+}
+.chip:hover{border-color:var(--line3);color:var(--fg)}
+.chip:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.chip .dot{width:8px;height:8px;border-radius:50%;background:currentColor;flex:none}
+.chip[aria-pressed=true]{color:#06121f;font-weight:640}
+.chip.m-agg[aria-pressed=true]{background:var(--m-agg);border-color:var(--m-agg)}
+.chip.m-user[aria-pressed=true]{background:var(--m-user);border-color:var(--m-user)}
+.chip.m-ttft[aria-pressed=true]{background:var(--m-ttft);border-color:var(--m-ttft)}
+.chip.m-size[aria-pressed=true]{background:var(--m-size);border-color:var(--m-size)}
+.chip.m-qual[aria-pressed=true]{background:var(--m-qual);border-color:var(--m-qual)}
+.chip.s-shipped[aria-pressed=true]{background:var(--s-shipped);border-color:var(--s-shipped)}
+.chip.s-off[aria-pressed=true]{background:var(--s-off);border-color:var(--s-off)}
+.chip.s-none[aria-pressed=true]{background:var(--s-none);border-color:var(--s-none)}
+.chip.s-concept[aria-pressed=true]{background:var(--s-concept);border-color:var(--s-concept)}
+.chip.m-agg .dot{color:var(--m-agg)} .chip.m-user .dot{color:var(--m-user)}
+.chip.m-ttft .dot{color:var(--m-ttft)} .chip.m-size .dot{color:var(--m-size)}
+.chip.m-qual .dot{color:var(--m-qual)}
+.chip.s-shipped .dot{color:var(--s-shipped)} .chip.s-off .dot{color:var(--s-off)}
+.chip.s-none .dot{color:var(--s-none)} .chip.s-concept .dot{color:var(--s-concept)}
+.chip[aria-pressed=true] .dot{color:#06121f}
+.viewtoggle{display:flex;border:1px solid var(--line2);border-radius:8px;overflow:hidden}
+.viewtoggle button{
+  background:var(--panel);border:none;color:var(--fg2);padding:8px 14px;font:inherit;
+  font-size:12.5px;cursor:pointer;transition:.12s
+}
+.viewtoggle button+button{border-left:1px solid var(--line2)}
+.viewtoggle button[aria-pressed=true]{background:var(--accent);color:#06121f;font-weight:640}
+.viewtoggle button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.statusline{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:10px;
+  font-size:12.5px;color:var(--fg3);font-family:var(--mono)}
+.pill{background:#17243a;border:1px solid var(--accent);color:var(--accent2);border-radius:20px;
+  padding:3px 10px;font-size:12px;display:inline-flex;gap:8px;align-items:center;font-family:var(--sans)}
+.pill button{background:none;border:none;color:var(--accent2);cursor:pointer;font:inherit;
+  padding:0 0 0 2px;font-size:14px;line-height:1}
+.btn-reset{background:var(--panel);border:1px solid var(--line2);color:var(--fg2);border-radius:7px;
+  padding:5px 10px;font:inherit;font-size:12px;cursor:pointer}
+.btn-reset:hover{color:var(--fg);border-color:var(--line3)}
+
+/* ---------- matrix ---------- */
+.groupname{
+  font-family:var(--mono);font-size:11.5px;letter-spacing:.15em;text-transform:uppercase;
+  color:var(--accent);margin:30px 0 12px;padding-bottom:7px;border-bottom:1px solid var(--line);
+  display:flex;justify-content:space-between;align-items:baseline;
+}
+.groupname span{color:var(--fg3);letter-spacing:.06em}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(370px,1fr));gap:12px}
+.card{
+  border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:14px 15px 13px;
+  display:flex;flex-direction:column;gap:8px;border-left-width:3px;
+}
+.card.st-shipped{border-left-color:var(--s-shipped)}
+.card.st-off{border-left-color:var(--s-off)}
+.card.st-none{border-left-color:var(--s-none)}
+.card.st-concept{border-left-color:var(--s-concept)}
+.chead{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+.cterm{font-size:15.5px;font-weight:640;letter-spacing:-.01em;margin:0;line-height:1.3}
+.cstat{
+  font-family:var(--mono);font-size:9.5px;letter-spacing:.09em;text-transform:uppercase;
+  padding:3px 7px;border-radius:5px;white-space:nowrap;flex:none;margin-top:2px;font-weight:600;
+}
+.cstat.shipped{background:rgba(63,185,80,.14);color:var(--s-shipped);border:1px solid rgba(63,185,80,.32)}
+.cstat.off{background:rgba(217,165,33,.14);color:var(--s-off);border:1px solid rgba(217,165,33,.32)}
+.cstat.none{background:rgba(139,152,171,.13);color:var(--s-none);border:1px solid rgba(139,152,171,.3)}
+.cstat.concept{background:rgba(122,162,201,.13);color:var(--s-concept);border:1px solid rgba(122,162,201,.3)}
+.cdef{margin:0;font-size:14px;color:var(--fg);line-height:1.5}
+.cana{margin:0;font-size:13.2px;color:var(--fg2);line-height:1.5;padding-left:10px;
+  border-left:2px solid var(--line2);font-style:italic}
+.cana::before{content:"Like: ";font-style:normal;color:var(--fg3);font-family:var(--mono);font-size:10.5px;
+  letter-spacing:.08em;text-transform:uppercase}
+.cmoves{display:flex;gap:5px;flex-wrap:wrap;align-items:center}
+.mv{font-family:var(--mono);font-size:9.5px;letter-spacing:.07em;text-transform:uppercase;
+  padding:2.5px 7px;border-radius:4px;font-weight:600;white-space:nowrap}
+.mv.agg{background:rgba(245,165,36,.14);color:var(--m-agg);border:1px solid rgba(245,165,36,.3)}
+.mv.user{background:rgba(56,189,248,.13);color:var(--m-user);border:1px solid rgba(56,189,248,.3)}
+.mv.ttft{background:rgba(183,148,246,.14);color:var(--m-ttft);border:1px solid rgba(183,148,246,.3)}
+.mv.size{background:rgba(74,222,128,.13);color:var(--m-size);border:1px solid rgba(74,222,128,.3)}
+.mv.qual{background:rgba(244,114,182,.13);color:var(--m-qual);border:1px solid rgba(244,114,182,.3)}
+.carc{margin:0;font-size:13.2px;color:var(--fg2);line-height:1.55;
+  background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:9px 11px}
+.carc::before{content:"In Arc today";display:block;font-family:var(--mono);font-size:9.5px;
+  letter-spacing:.11em;text-transform:uppercase;color:var(--fg3);margin-bottom:5px}
+.carc b{color:var(--fg)}
+
+/* priority view */
+.prio{display:flex;flex-direction:column;gap:8px}
+.prow{
+  display:grid;grid-template-columns:38px 1fr 132px;gap:14px;align-items:center;
+  border:1px solid var(--line);border-left-width:3px;background:var(--panel);border-radius:9px;padding:11px 14px;
+}
+.prow.st-shipped{border-left-color:var(--s-shipped)} .prow.st-off{border-left-color:var(--s-off)}
+.prow.st-none{border-left-color:var(--s-none)} .prow.st-concept{border-left-color:var(--s-concept)}
+.prank{font-family:var(--mono);font-size:19px;color:var(--fg3);text-align:right;font-weight:600}
+.pmain h4{margin:0 0 3px;font-size:14.5px;font-weight:640;display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+.pmain h4 em{font-style:normal;font-family:var(--mono);font-size:10px;color:var(--fg3);letter-spacing:.08em;
+  text-transform:uppercase}
+.pmain p{margin:0;font-size:12.8px;color:var(--fg2);line-height:1.5}
+.pscore{text-align:right;font-family:var(--mono);font-size:11px;color:var(--fg3);line-height:1.7}
+.pscore b{display:block;font-size:19px;color:var(--accent2);font-weight:600}
+.bars{display:flex;gap:3px;justify-content:flex-end;margin-top:3px}
+.bar{width:7px;height:7px;border-radius:2px;background:var(--line2)}
+.bar.f{background:var(--accent)}
+.bar.g{background:var(--m-agg)}
+
+.empty{padding:44px;text-align:center;color:var(--fg3);border:1px dashed var(--line2);border-radius:10px}
+.legend{display:flex;gap:16px;flex-wrap:wrap;margin:18px 0 0;font-size:12.5px;color:var(--fg2)}
+.legend div{display:flex;gap:7px;align-items:center}
+.sw{width:11px;height:11px;border-radius:3px;flex:none}
+.callout{
+  border:1px solid var(--line2);border-left:3px solid var(--accent);background:var(--panel);
+  border-radius:9px;padding:13px 16px;margin:18px 0;font-size:14px;color:var(--fg2);line-height:1.6;
+}
+.callout b{color:var(--fg)}
+.callout .h{display:block;color:var(--accent2);font-weight:650;margin-bottom:5px;font-size:14px}
+table.mini{border-collapse:collapse;width:100%;font-size:13px;margin:12px 0 4px}
+table.mini th,table.mini td{border-bottom:1px solid var(--line);padding:7px 9px;text-align:left}
+table.mini th{color:var(--fg3);font-family:var(--mono);font-size:10.5px;letter-spacing:.09em;
+  text-transform:uppercase;font-weight:600}
+table.mini td{font-family:var(--mono);font-size:12.5px;color:var(--fg2)}
+table.mini td:first-child{font-family:var(--sans);font-size:13.5px;color:var(--fg)}
+table.mini td b{color:var(--fg)}
+footer{border-top:1px solid var(--line);margin-top:48px;padding:24px 0 60px;color:var(--fg3);font-size:12.5px}
+footer code{font-size:11.5px}
+.kbd{font-family:var(--mono);font-size:11px;background:#1a2330;border:1px solid var(--line3);
+  border-bottom-width:2px;border-radius:4px;padding:1px 5px;color:var(--fg2)}
+@media (max-width:640px){
+  h1{font-size:24px} .grid{grid-template-columns:1fr}
+  .prow{grid-template-columns:28px 1fr;gap:10px} .pscore{grid-column:2;text-align:left}
+  .bars{justify-content:flex-start}
+}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <p class="eyebrow">Arc · DeepSeek-V4-Flash · one H200</p>
+    <h1>How an inference engine actually works <span class="dim">— and which knob moves which number</span></h1>
+    <p class="lede">
+      Two halves. <b>First</b>, the journey one token takes through the engine, drawn as a diagram, with a
+      visible loop — because the loop is the whole story. <b>Second</b>, every term you will hear in this
+      project, in plain English, tagged with <b>which of the five metrics it actually moves</b> and
+      <b>whether Arc has it today</b>. Click any stage in the diagram to filter the matrix down to that
+      stage. Search anything. Nothing here is invented: every number is tagged
+      <code>[measured]</code>, <code>[physics]</code> or <code>[projected]</code>, and there are no
+      competitor benchmark numbers we have not run ourselves.
+    </p>
+    <div class="keyrow">
+      <div class="keyfact"><b>74.19 GB</b>artifact @ 2.09 bits/param <span style="color:var(--fg3)">[measured]</span></div>
+      <div class="keyfact"><b>1 GPU</b>where every published config we surveyed needs 4 <span style="color:var(--fg3)">[measured]</span></div>
+      <div class="keyfact"><b>96.0%</b>GSM8K, our 0-shot protocol, n=100 <span style="color:var(--fg3)">[measured]</span></div>
+      <div class="keyfact"><b>111.7 tok/s</b>aggregate @ B=256 · $12.06/Mtok <span style="color:var(--fg3)">[measured]</span></div>
+      <div class="keyfact"><b>~16,600 tok/s</b>aggregate ceiling @ B=256 <span style="color:var(--fg3)">[physics]</span></div>
+      <div class="keyfact"><b>1,413 tok/s</b>single-user ceiling <span style="color:var(--fg3)">[physics]</span></div>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+
+<!-- ============================ HALF 1 ============================ -->
+<section id="journey">
+  <div class="sechead"><span class="secnum">HALF 1</span><h2>The journey of a token</h2></div>
+  <p class="secsub">
+    Read it left to right, top to bottom. The dashed box in the middle is the part that repeats —
+    once for <em>every single output token</em>. Almost everything hard about this engine lives inside
+    that box. <strong>Click any stage</strong> to filter the term matrix below to the things that live there.
+  </p>
+
+  <div class="diagwrap">
+  <svg viewBox="0 0 1160 800" role="img" aria-label="Diagram of a token's journey through the inference engine, from request through prefill into the decode loop and out to the user">
+    <defs>
+      <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#3a485c"/>
+      </marker>
+      <marker id="ahA" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#6ea8fe"/>
+      </marker>
+    </defs>
+
+    <!-- phase captions -->
+    <text class="phase" x="40" y="26" fill="#66748a">① INTAKE — cheap, and where TTFT starts ticking</text>
+
+    <!-- top row -->
+    <g class="bx" data-stage="request" tabindex="0" role="button" aria-label="Request in">
+      <rect x="40" y="40" width="200" height="54" rx="9"/>
+      <text class="bt" x="56" y="64">Request in</text>
+      <text class="bs" x="56" y="81">HTTP · prompt + params</text>
+    </g>
+    <g class="bx" data-stage="tokenize" tabindex="0" role="button" aria-label="Tokenize">
+      <rect x="300" y="40" width="200" height="54" rx="9"/>
+      <text class="bt" x="316" y="64">Tokenize</text>
+      <text class="bs" x="316" y="81">text → token ids</text>
+    </g>
+    <g class="bx" data-stage="schedule" tabindex="0" role="button" aria-label="Scheduler">
+      <rect x="560" y="40" width="200" height="54" rx="9"/>
+      <text class="bt" x="576" y="64">Scheduler</text>
+      <text class="bs" x="576" y="81">who runs this step?</text>
+    </g>
+    <g class="bx" data-stage="prefix" tabindex="0" role="button" aria-label="Prefix cache lookup">
+      <rect x="820" y="40" width="200" height="54" rx="9"/>
+      <text class="bt" x="836" y="64">Prefix cache</text>
+      <text class="bs" x="836" y="81">seen this opening before?</text>
+    </g>
+    <path class="flow" d="M240 67 L292 67" marker-end="url(#ah)"/>
+    <path class="flow" d="M500 67 L552 67" marker-end="url(#ah)"/>
+    <path class="flow" d="M760 67 L812 67" marker-end="url(#ah)"/>
+    <path class="flow" d="M920 94 L920 122 L300 122 L300 142" marker-end="url(#ah)"/>
+
+    <text class="phase" x="40" y="140" fill="#66748a">② PREFILL — the prompt, all at once</text>
+
+    <!-- prefill + kv -->
+    <g class="bx" data-stage="prefill" tabindex="0" role="button" aria-label="Prefill">
+      <rect x="40" y="150" width="520" height="104" rx="10"/>
+      <text class="bt" x="58" y="176">PREFILL — the whole prompt in ONE pass</text>
+      <text class="bs" x="58" y="197">Every prompt token is already known, so they all go through together.</text>
+      <text class="bs hi" x="58" y="215">COMPUTE-bound: each weight fetched does a lot of arithmetic.</text>
+      <text class="bs" x="58" y="233">This is your TTFT. Arc: 78 tok/s at B=1 → 157 at B=256 [measured].</text>
+    </g>
+    <g class="bx" data-stage="kv" tabindex="0" role="button" aria-label="KV cache">
+      <rect x="640" y="150" width="480" height="104" rx="10"/>
+      <text class="bt" x="658" y="176">KV CACHE — written once, read forever</text>
+      <text class="bs" x="658" y="197">Each token's keys + values are kept so nothing is recomputed.</text>
+      <text class="bs" x="658" y="215">It grows by one row per token, per user, per layer.</text>
+      <text class="bs cool" x="658" y="233">How big this is decides how many users fit on the card.</text>
+    </g>
+    <path class="flow" d="M560 200 L632 200" marker-end="url(#ah)"/>
+    <text class="lbl" x="566" y="192">K,V</text>
+    <path class="flow" d="M300 254 L300 272 L580 272"/>
+    <path class="flow" d="M880 254 L880 272 L580 272"/>
+    <path class="flow" d="M580 272 L580 286" marker-end="url(#ah)"/>
+
+    <!-- decode loop container -->
+    <rect class="zone" x="40" y="292" width="1080" height="348" rx="14"/>
+    <text class="zonelbl" x="62" y="316">③ DECODE LOOP — EVERYTHING BELOW REPEATS ONCE PER OUTPUT TOKEN</text>
+    <text class="note" x="62" y="337">Only one new token exists per trip, so each weight fetched does almost no arithmetic. <tspan class="k">Decode is MEMORY-bound — the opposite of prefill, and it needs the opposite fixes.</tspan></text>
+
+    <g class="bx" data-stage="attention" tabindex="0" role="button" aria-label="Attention">
+      <rect x="70" y="360" width="230" height="92" rx="10"/>
+      <text class="bt" x="86" y="384">Attention</text>
+      <text class="bs" x="86" y="404">Look back over every</text>
+      <text class="bs" x="86" y="421">previous token — reads the</text>
+      <text class="bs" x="86" y="438">whole KV cache, every step.</text>
+    </g>
+    <g class="bx" data-stage="route" tabindex="0" role="button" aria-label="MoE routing">
+      <rect x="330" y="360" width="230" height="92" rx="10"/>
+      <text class="bt" x="346" y="384">Route (MoE)</text>
+      <text class="bs" x="346" y="404">Pick 6 of 256 experts —</text>
+      <text class="bs" x="346" y="421">per token, per layer.</text>
+      <text class="bs" x="346" y="438">A tiny net decides.</text>
+    </g>
+    <g class="bx" data-stage="experts" tabindex="0" role="button" aria-label="Experts">
+      <rect x="590" y="360" width="230" height="92" rx="10"/>
+      <text class="bt" x="606" y="384">Experts</text>
+      <text class="bs" x="606" y="404">The actual matrix multiplies.</text>
+      <text class="bs" x="606" y="421">2-bit weights decoded on</text>
+      <text class="bs hi" x="606" y="438">the fly. 49–64% of the step.</text>
+    </g>
+    <g class="bx" data-stage="sample" tabindex="0" role="button" aria-label="Sample">
+      <rect x="850" y="360" width="230" height="92" rx="10"/>
+      <text class="bt" x="866" y="384">Sample</text>
+      <text class="bs" x="866" y="404">129,280 scores in →</text>
+      <text class="bs" x="866" y="421">exactly one token out.</text>
+      <text class="bs" x="866" y="438">Greedy, or a weighted roll.</text>
+    </g>
+    <path class="flow" d="M300 406 L322 406" marker-end="url(#ah)"/>
+    <path class="flow" d="M560 406 L582 406" marker-end="url(#ah)"/>
+    <path class="flow" d="M820 406 L842 406" marker-end="url(#ah)"/>
+
+    <!-- the loop back -->
+    <path class="loopline" d="M965 452 L965 555 L185 555 L185 460" marker-end="url(#ahA)"/>
+    <text class="lbl acc" x="330" y="547">↺ one more token · the KV cache grows by one row · do the whole thing again</text>
+    <text class="note" x="62" y="600">At B=1 one trip reads ~3.4 GB of weights <tspan class="k">[physics]</tspan>. At B=256 it reaches essentially the whole 74.19 GB artifact <tspan class="k">[measured]</tspan> —</text>
+    <text class="note" x="62" y="618">and past that point every additional user is nearly free. <tspan class="k">That sentence is the entire fleet argument.</tspan></text>
+
+    <!-- exit -->
+    <path class="flow" d="M1010 452 L1010 660 L790 660 L790 704" marker-end="url(#ah)"/>
+    <text class="lbl" x="820" y="652">EOS, a stop string, or max_tokens</text>
+
+    <g class="bx" data-stage="detok" tabindex="0" role="button" aria-label="Detokenize">
+      <rect x="660" y="712" width="260" height="54" rx="9"/>
+      <text class="bt" x="676" y="736">Detokenize</text>
+      <text class="bs" x="676" y="753">token ids → text</text>
+    </g>
+    <g class="bx" data-stage="stream" tabindex="0" role="button" aria-label="Stream out">
+      <rect x="960" y="712" width="160" height="54" rx="9"/>
+      <text class="bt" x="976" y="736">Stream out</text>
+      <text class="bs" x="976" y="753">SSE, token by token</text>
+    </g>
+    <path class="flow" d="M920 739 L952 739" marker-end="url(#ah)"/>
+
+    <!-- key -->
+    <text class="phase" x="40" y="700" fill="#66748a">KEY</text>
+    <text class="note" x="40" y="722">— thin grey line: data moving forward, once.</text>
+    <text class="note" x="40" y="740"><tspan fill="#8fc0ff" font-weight="600">— thick blue line: the loop.</tspan> Everything expensive is paid once per trip around it.</text>
+    <text class="note" x="40" y="758">Boxes are clickable — each one filters the matrix below.</text>
+  </svg>
+  </div>
+
+  <div class="crosscut" id="crosscut">
+    <button class="cc" data-stage="memory"><b>Memory layer</b>KV cache, the <code>xs</code> cache, paging, HBM bandwidth, roofline</button>
+    <button class="cc" data-stage="execution"><b>Execution layer</b>CUDA graphs, launch overhead, GEMV / GEMM / grouped GEMM, stalls</button>
+    <button class="cc" data-stage="bake"><b>Compression layer</b>QTIP, trellis, baking, codebooks, ISQ, UQFF, FP8</button>
+    <button class="cc" data-stage="parallel"><b>Parallelism layer</b>Tensor, pipeline, expert and data parallel · NVLink vs PCIe</button>
+  </div>
+
+  <div class="callout">
+    <span class="h">The one asymmetry to keep in your head</span>
+    <b>Prefill is compute-bound. Decode is memory-bound.</b> They need opposite fixes, and mixing them up
+    has cost this project real money. Prefill already scales — server-instrumented prefill rises
+    <b>4.8×</b> from B=1 to B=64 <code>[measured]</code>. Decode does not, and every hard problem below
+    is a decode problem. Batching is the one lever that turns decode's memory-bound shape into
+    prefill's compute-bound shape — which is why <b>aggregate</b> throughput and <b>per-user</b>
+    throughput pull in opposite directions, and why you must always say which one you mean.
+  </div>
+</section>
+
+<!-- ============================ HALF 2 ============================ -->
+<section id="matrix">
+  <div class="sechead"><span class="secnum">HALF 2</span><h2>The term matrix</h2></div>
+  <p class="secsub">
+    Every term, what it means without jargon, what it is <em>like</em>, which of the five metrics it moves,
+    and exactly where Arc stands on it today. Filter by metric or by status, search anything, or switch to
+    the leverage ranking to see what is worth your attention right now.
+  </p>
+
+  <div class="toolbar">
+    <div class="tbrow">
+      <input class="search" id="q" type="search" placeholder="Search terms, definitions, file paths…  (press / )" aria-label="Search terms">
+      <div class="viewtoggle" role="group" aria-label="View">
+        <button id="v-browse" aria-pressed="true">Browse</button>
+        <button id="v-prio" aria-pressed="false">What should I care about</button>
+      </div>
+      <button class="btn-reset" id="reset">Clear all</button>
+    </div>
+    <div class="tbrow" style="margin-top:9px">
+      <div class="chips" id="mchips">
+        <span class="chiplbl">Moves</span>
+        <button class="chip m-agg" data-m="agg" aria-pressed="false"><i class="dot"></i>Aggregate throughput</button>
+        <button class="chip m-user" data-m="user" aria-pressed="false"><i class="dot"></i>Per-user throughput</button>
+        <button class="chip m-ttft" data-m="ttft" aria-pressed="false"><i class="dot"></i>TTFT</button>
+        <button class="chip m-size" data-m="size" aria-pressed="false"><i class="dot"></i>Model size</button>
+        <button class="chip m-qual" data-m="qual" aria-pressed="false"><i class="dot"></i>Quality</button>
+      </div>
+    </div>
+    <div class="tbrow" style="margin-top:7px">
+      <div class="chips" id="schips">
+        <span class="chiplbl">Arc has it</span>
+        <button class="chip s-shipped" data-s="shipped" aria-pressed="false"><i class="dot"></i>Shipped</button>
+        <button class="chip s-off" data-s="off" aria-pressed="false"><i class="dot"></i>Built but off</button>
+        <button class="chip s-none" data-s="none" aria-pressed="false"><i class="dot"></i>Not built</button>
+        <button class="chip s-concept" data-s="concept" aria-pressed="false"><i class="dot"></i>Concept, nothing to ship</button>
+      </div>
+    </div>
+    <div class="statusline">
+      <span id="count"></span>
+      <span id="stagepill"></span>
+    </div>
+  </div>
+
+  <div id="browse"></div>
+  <div id="prio" hidden></div>
+</section>
+
+</main>
+
+<footer class="wrap">
+  <p>
+    <b>Sources.</b> Every number traces to <code>memory/mission/CEILINGS.json</code> (physics bounds and the
+    anti-pessimism protocol), <code>memory/mission/FACTS.md</code> (hardware-measured only, with provenance and
+    retractions) and <code>docs/BENCHMARKS.md</code>. <code>[measured]</code> = ran on real hardware.
+    <code>[physics]</code> = a bound reality imposes, derived from bytes and bandwidth.
+    <code>[projected]</code> = arithmetic, not yet run. <code>[measured-by-design]</code> = the byte accounting
+    is exact and verified in source, but the path has not executed on a GPU.
+  </p>
+  <p>
+    <b>House rule, and it is the important one:</b> a measured number describes <em>today's code</em>. It is
+    never evidence about what is <em>possible</em>. Only physics bounds what is possible. Quote the gap and the
+    bound in the same breath, so a bad number reads as work to do rather than as a verdict.
+  </p>
+  <p>
+    <b>No competitor benchmarks appear on this page that we have not run ourselves.</b> Where a reference
+    project's own published figure is cited — the 90.8 8-shot GSM8K, the ~80%-of-peak GEMV, the 2.30 MTP
+    acceptance floor — it is labelled as theirs, and as unverified by us.
+  </p>
+  <p style="margin-top:14px">
+    Keyboard: <span class="kbd">/</span> search · <span class="kbd">Esc</span> clear filters ·
+    <span class="kbd">Tab</span> through diagram stages · <span class="kbd">Enter</span> to filter by one.
+  </p>
+</footer>
+
+<script>
+"use strict";
+
+/* ============================================================
+   TERMS
+   t = term · g = group · s = journey stages it lives in
+   st = shipped | off | none | concept
+   m  = metrics it moves: agg, user, ttft, size, qual
+   d  = plain-English definition · a = analogy · arc = status in Arc today
+   k  = extra search keywords
+   gap/lev = 0..5, used only by the leverage ranking
+   ============================================================ */
+const TERMS = [
+
+/* ---------------- PIPELINE ---------------- */
+{t:"Tokenization",g:"Pipeline",s:["tokenize"],st:"shipped",m:["ttft","qual"],k:"tokenizer BPE token ids",
+d:"Turning the user's text into the integer ids the model actually reads. Roughly one token per four characters of English.",
+a:"Chopping a sentence into LEGO bricks the model has seen before.",
+arc:"Shipped, standard HF tokenizer. One real bug lived here: the tokenizer trie was silently **DELETING** tokens whose bytes it could not resolve — the `｜DSML｜` warnings were never cosmetic, and the splice signature (`…####276000The total cost…`) is all over session-3 output. Fixed in PR #68. ⚠️ `｜DSML｜` is the delimiter every V4 tool call is built from, so **V4 tool calling may still be broken** — mechanism traced, never measured. One served request with `tools` set settles it."},
+
+{t:"Prefill",g:"Pipeline",s:["prefill"],st:"shipped",m:["ttft","agg"],k:"prompt processing first pass",gap:1,lev:3,
+d:"The whole prompt is pushed through the model in ONE pass, because every prompt token is already known.",
+a:"Reading the entire question before you start answering — you can take it in at a glance.",
+arc:"**Prefill has never been the problem.** It scales as designed: server-instrumented prefill rises **4.8×** from B=1→64 `[measured]`, and in the latest sweep goes 78 tok/s at B=1 → 157 at B=256 `[measured]`. Use it as the discriminator: when the compute leg amortizes and the decode leg does not, the bug is in decode."},
+
+{t:"Decode",g:"Pipeline",s:["decode","attention","sample"],st:"shipped",m:["user","agg"],k:"generation autoregressive",gap:5,lev:5,
+d:"Generating output ONE token at a time, each one depending on the last. Cannot be parallelised within a single request.",
+a:"Writing an answer word by word, where you must re-read everything you have written so far before each new word.",
+arc:"**This is the whole fight.** b=1 decode is 16.27 tok/s `[measured]` against a 1,413 tok/s ceiling `[physics]` — 87×. Aggregate is 111.7 tok/s at B=256 `[measured]` against ~16,600 `[physics]` — ~149×. **Every one of those gaps is implementation, not physics.** That is the good news: none of it is a law, all of it is code we control."},
+
+{t:"Detokenization",g:"Pipeline",s:["detok"],st:"shipped",m:["qual"],k:"decode text output",
+d:"Turning generated token ids back into the text the user reads.",
+a:"Gluing the LEGO bricks back into a sentence.",
+arc:"Shipped — and it was silently corrupting output. `sampling.rs:38-48` detokenizes every token through the trie, whose empty byte entries decode to **nothing**, so a broken token id was deleted from the text and a stop-string could never match across the gap. Fixed in PR #68 by restoring the dropped bytes."},
+
+{t:"Scheduling",g:"Pipeline",s:["schedule"],st:"shipped",m:["agg","ttft"],k:"scheduler batch selection waiting queue",gap:1,lev:4,
+d:"Deciding, every single step, which of the waiting requests actually run in this batch.",
+a:"The maître d' deciding who gets seated this round.",
+arc:"Coalescing selector shipped (PR #54, ≈**2×**) `[measured]`. Before it, B=64 logged **`32 running, 32 waiting`** — literally half the batch idle, a flat 2–2.5× loss, and the reason B=64 once scored *better* than B=32. V4 still takes the length-bucketing `DefaultScheduler` (`default_scheduler.rs:128-168`) because paged attention reports false for it at `normal_loaders.rs:3231`."},
+
+{t:"Continuous batching",g:"Pipeline",s:["schedule","request"],st:"shipped",m:["agg","ttft"],k:"in-flight batching dynamic batching rolling batch",
+d:"New requests join the running batch mid-flight instead of waiting for the current one to finish.",
+a:"A bus that lets people on at every stop instead of only at the depot.",
+arc:"Shipped, and verified rather than assumed: `effective_B == B` on all seven rows of the latest sweep, every concurrency verdict `pass`, **0 errors in 505 requests** `[measured]`."},
+
+{t:"Batch size (B)",g:"Pipeline",s:["schedule"],st:"concept",m:["agg","user","ttft","size"],k:"concurrency max-seqs",
+d:"How many user requests are being decoded at the same time. The single biggest dial on this page — and it trades aggregate against per-user.",
+a:"How many diners the kitchen cooks for in one round. More diners, more meals per hour, longer wait for yours.",
+arc:"Sweeps run B=1…256. What caps B is **memory, not compute**, and the ladder moved three times in one day: max B **68 → 266** (rolling `xs`) **→ 493** (KV dedup) **→ ~696** (FP8 K, opt-in) `[measured-by-design]`. ⚠️ `--max-seqs` **defaults to 32** — launch the server with it set at or above your largest B or you are silently measuring B=32."},
+
+{t:"effective_B",g:"Pipeline",s:["schedule"],st:"shipped",m:["agg"],k:"concurrency verification probe honesty",
+d:"The batch size that ACTUALLY ran concurrently, measured from overlapping decode windows — not the number you asked for.",
+a:"Counting the diners actually eating, not the number on the reservation.",
+arc:"🔑 **This check is the reason our numbers can be trusted.** Because `--max-seqs` defaults to 32, a B=128 sweep against a default server is silently a B=32 sweep — and it still prints a plausible number: a run capped to B=2-of-8 reported **190.01 tok/s vs a genuine B=16's 198.34, 4% apart and indistinguishable without this** `[measured]`. Now asserted, mutation-tested on hardware, and the run exits non-zero on under-batching. ⚠️ Note the trap it replaced: *submit-window* overlap is a check that can never fail, because the launch barrier makes submissions overlap even under full serialization."},
+
+{t:"Streaming",g:"Pipeline",s:["stream","request"],st:"shipped",m:["ttft"],k:"SSE server-sent events incremental",
+d:"Sending each token to the user as it is produced, instead of waiting for the whole answer.",
+a:"Talking as you think, instead of writing the whole speech first.",
+arc:"Shipped (SSE, OpenAI-compatible). Costs nothing, and it is what makes TTFT the number the user actually feels rather than total completion time."},
+
+{t:"Sampler (temperature, top-k, top-p)",g:"Pipeline",s:["sample","request"],st:"shipped",m:["qual","user"],k:"sampling greedy radix top-k logits",gap:4,lev:3,
+d:"Turning the model's score for every possible next token into one actual choice.",
+a:"A weighted dice roll over the model's shortlist. Temperature 0 means always take the favourite.",
+arc:"Shipped, with two live facts worth carrying. **Batched decode has NEVER used the GPU sampler** — it is gated on `!logits.device().is_cpu()` (`sampler.rs:1220`), a real open project. And every sweep we have ran at temperature 0, whose greedy path returns *above* the radix branch — which is why **the “CPU sampler fallback” theory explained 0% of the throughput collapse** despite being named confidently in a user-facing report. Name a suspect, then prove the path executes."},
+
+{t:"Stop conditions (EOS, stop strings)",g:"Pipeline",s:["sample","detok","request"],st:"shipped",m:["qual","agg"],k:"end of sequence finish_reason max_tokens",gap:3,lev:2,
+d:"How the engine knows to stop: a special end token, a caller-supplied string, or a token budget.",
+a:"The full stop at the end of the sentence.",
+arc:"EOS is safe — a plain id comparison (`sequence.rs:982-987`), the tokenizer trie is never consulted. **Stop-STRING matching is not**: it rescans all completion bytes on every token, O(B·L²) (`sequence.rs:1005`). **Zero cost in every sweep we ran, because we set no stop strings — and a cliff waiting for the first customer who does.**"},
+
+{t:"Chat template",g:"Pipeline",s:["tokenize","request"],st:"shipped",m:["qual"],k:"jinja prompt format roles",
+d:"The exact formatting — roles, special markers — that a chat model was trained to expect.",
+a:"The letterhead and salutation a formal letter needs, or it gets binned unread.",
+arc:"Shipped, `chat_templates/deepseek_v4.json`. Without `--chat-template` the chat endpoint returns 422 — root cause of a lost hour in session 4, now in the runbook serve lines."},
+
+{t:"Cold load / warm-up",g:"Pipeline",s:["prefill"],st:"shipped",m:["ttft"],k:"startup load time weights resident",
+d:"The one-time cost of getting weights off disk into GPU memory before the first request is served.",
+a:"Preheating the oven. Once.",
+arc:"Cold load **2 m 11 s** for the published artifact; **12.94 s for 517 tensors** from a warm UQFF `[measured]`. Post-load footprint 78,865 MiB of 143,771 MiB, peak resident at B=256 114,665 MiB `[measured]`. ⚠️ On an 80 GB A100 the artifact alone occupies 75.7 GB, leaving ~4 GB for KV — which is why serving measurement has to happen on a 141 GB H200."},
+
+/* ---------------- COMPRESSION ---------------- */
+{t:"Quantization",g:"Compression",s:["bake","experts"],st:"shipped",m:["size","agg","user","qual"],k:"compression low-bit weights 2-bit",
+d:"Storing each weight in fewer bits than the 16 it was trained in, so the model fits in less memory and moves fewer bytes per token.",
+a:"Re-encoding a lossless master as a high-quality MP3 — much smaller, and you have to prove nobody can hear the difference.",
+arc:"**The reason V4-Flash runs on ONE GPU at all.** 74.19 GB at 2.09 bits/param `[measured]`. Every published config of this model we surveyed needs 4× H200; the one W4A16 quant is 143 GB and its own card says TP=1 OOMs on a single 141 GB H200. ⚠️ Scope that honestly: **“none found in our survey”, not “none exists”.**"},
+
+{t:"Bits per parameter (bpw)",g:"Compression",s:["bake"],st:"concept",m:["size","agg","user","qual"],k:"bpw bits/param density footprint",
+d:"The average number of bits each weight costs. Sets both the file size and how many bytes must move per token — so it is a size number AND a speed number.",
+a:"The compression setting. Every bit you drop is a byte you never have to read, and a bit of accuracy you have to earn back somewhere else.",
+arc:"**2.09 bits/param** `[measured]`. ⚠️ “≈1.9 bits/param” was repeated in our own notes for weeks and was **wrong** — it divided by a 68 GB *estimate* instead of the real 74.19 GB. A reminder that a number is not measured just because it has been said often."},
+
+{t:"QTIP",g:"Compression",s:["bake"],st:"shipped",m:["size","qual","user"],k:"trellis quantization qtip2 qtip2b 2-bit",
+d:"The 2-bit quantization family Arc ships. Weights are encoded as a PATH through a trellis rather than as independently rounded numbers.",
+a:"Instead of rounding each note of a melody separately, you pick the closest melody the instrument can actually play.",
+arc:"Shipped and baked. Two rungs (`qtip2`, `qtip2b`). The published artifact header reads `mode=viterbi search=viterbi-beam(W=256) objective=mse rotation=hadamard-128` `[measured]`, verified on the box rather than assumed."},
+
+{t:"Trellis",g:"Compression",s:["bake","experts"],st:"shipped",m:["size","qual","user"],k:"state machine path viterbi lattice",
+d:"A graph of allowed states across positions. The quantizer picks the best PATH through it, so each weight's code depends on its neighbours.",
+a:"A subway map where you must choose a whole route rather than teleport between stations. The constraint is exactly what buys you accuracy at 2 bits.",
+arc:"Shipped, and its cost is precisely located: decoding the trellis per symbol at inference time is what pins the decode GEMV near 15% of peak. ⇒ **the ceiling is per-symbol decode serialization, so the fix is to decode FEWER SYMBOLS (computed codebook, wider geometry) — not to hide memory latency** `[measured, 98/98 kernel variants]`."},
+
+{t:"Baking",g:"Compression",s:["bake"],st:"shipped",m:["size","qual"],k:"offline quantization job artifact build",gap:2,lev:4,
+d:"The one-off, offline job that converts the full-precision checkpoint into Arc's compressed artifact.",
+a:"Developing the negatives. Slow, done once, and every print afterwards comes from it.",
+arc:"**Hours, not minutes — there is no 25-minute bake.** That figure came from a pre-PR#9 *greedy* binary, i.e. the banned method, and read as a speed win for days. Real: `qtip2` beam W=256 is **241 s/layer** (H200) and **370–376 s/layer** (A100); `qtip2b` beam is **213 s/layer** on A100 ⇒ **2.55 h ≈ $3.80** `[measured]`. 💰 Bake `qtip2b` on the **A100, not the H200** — H200 wins wall-clock but loses dollars 2.1×, because the beam kernel is exactly the one that does not cash in H200 bandwidth. ⚠️ The artifact is buffered and written at the END: a killed bake loses everything, with no partial resume. ⚠️ Bake cost is a **product** issue — customers bake too."},
+
+{t:"ISQ (in-situ quantization)",g:"Compression",s:["bake"],st:"shipped",m:["size","qual"],k:"on-the-fly quantize load",
+d:"Quantizing the model as it loads, in memory, instead of loading a pre-baked file.",
+a:"Compressing the photos while importing them, rather than importing an album that was already compressed.",
+arc:"Shipped (`--isq qtip2`). Convenient for experiments and dangerous for claims: session 5's whole sweep came from an in-situ W=32 bake, so it measured the quantizer's speed but **did not validate the published artifact**, and no quality number could honestly be taken from it. That caveat has to ride with every ISQ measurement. ⚠️ Always bake with `MISTRALRS_ISQ_SINGLETHREAD=1` — 24 CPU threads thrashing one GPU cost 4–9 min/layer with no fallback warning."},
+
+{t:"UQFF",g:"Compression",s:["bake"],st:"shipped",m:["size","ttft"],k:"artifact format shards residual safetensors overlay",
+d:"Arc's on-disk format for a baked artifact — the shards you actually ship, publish and load.",
+a:"The pressed vinyl, as opposed to the studio session.",
+arc:"Shipped: **15 files, 74.19 GB, 8 shards + residual**, verified independently from the HF API, not from the uploader's claim `[measured]`. ⚠️ **It is an OVERLAY, not standalone** — `-m` must point at the SOURCE checkpoint; `residual.safetensors` is only 1.7% of the artifact and carries no attention projections. It ships a `config.json` and tokenizer, which makes it *look* standalone: that is the trap. **The published model card documents the FAILING form**, so a user following it cannot load the model. Packaging/doc defect, not corruption — fix before public release."},
+
+{t:"Codebook (lookup vs computed)",g:"Compression",s:["bake","experts"],st:"off",m:["user","agg","size"],k:"LUT gaussian mcg computed arithmetic sum2",gap:5,lev:5,
+d:"The table mapping a trellis code back to an actual number. You can LOOK IT UP in memory, or COMPUTE it with arithmetic.",
+a:"A phone book versus a formula for the number. The formula needs no shelf space, and no trip to the shelf.",
+arc:"🔑 **Merged (PR #46) but INERT until a bake activates it — none of its gain is in any number on this page.** Measured **3.86–4.03×** on the fused decode GEMV at k_in=7168 ⇒ ≈60% of peak `[measured]`, which **attacks the b=1 gap directly**, and ≈1.68× on bake time. Quality-neutral (`sum2`: −0.0008 cos worst family, 5× smaller than a beam-width change already rejected). ⚠️ The **1.81×** figure came from the `split` variant which is quality-NEGATIVE — do not cite it. ⚠️ `ARC_QTIP_CODEBOOK`/`ARC_QTIP_BEAM` are read **only** by the `qtip2` rung; `qtip2b` is computed-codebook by construction, so on the truck there is nothing to switch. Also found: the “shared” LUT is written **per layer**, ~90 MB duplicated."},
+
+{t:"Viterbi",g:"Compression",s:["bake"],st:"shipped",m:["qual","size"],k:"dynamic programming optimal path exhaustive DP",
+d:"The exact algorithm for finding the single best path through a trellis. Optimal, and expensive.",
+a:"Checking every possible route through the city and taking the true shortest one.",
+arc:"Shipped and default since PR #9. Its full exhaustive form on `qtip2b` measured **8,257 s/layer** on an A100 ⇒ 98.6 h ⇒ **$147 for one bake** `[measured]`. That number is why beam exists."},
+
+{t:"Beam search",g:"Compression",s:["bake"],st:"shipped",m:["qual","size"],k:"beam width W=256 pruning search",
+d:"Viterbi, but keeping only the best W partial paths at each step instead of all of them.",
+a:"Keeping your 256 most promising routes instead of all 65,536 — almost always the same answer, a fraction of the work.",
+arc:"Shipped on both rungs, and **proven bit-exact against CPU on silicon** (21/21 qtip CUDA tests; an unpruned W=256 beam IS the exhaustive DP, byte for byte) `[measured]`. 🔑 **Beam width barely affects bake time: W=256 is 82.7 s/layer vs W=32's 83.6 — about 1%** `[measured]` ⇒ **ALWAYS BAKE W=256.** Quality is free here, and a session that restarted at W=32 believing W drove bake time cost quality headroom and bought nothing."},
+
+{t:"Exhaustive search",g:"Compression",s:["bake"],st:"shipped",m:["qual"],k:"full search no pruning brute force",
+d:"Evaluating every possible trellis state rather than pruning to a beam. A slightly better answer, for a great deal more time.",
+a:"Reading every book in the library instead of the 256 most likely ones.",
+arc:"Shipped. It is genuinely **better quality — wins 8 of 9 fixture cells, +0.0013…+0.0021 cosine, strictly lower weight NMSE everywhere** `[measured]`. We ship beam knowingly and declare the trade. ⚠️ **“Beam at no quality cost” was published and is RETRACTED** — it was a single-fixture artifact. Exhaustive was rejected on **speed**, not on quality."},
+
+{t:"Greedy (BANNED)",g:"Compression",s:["bake"],st:"none",m:["qual"],k:"D4 doctrine ban local search fast bake",
+d:"Picking the locally best code at each position with no lookahead. The fastest search, and the worst.",
+a:"Turning toward the destination at every junction, and ending up in a canal.",
+arc:"🚫 **Banned by doctrine D4 outside `cfg(test)`, and enforced in code** (`cuda_search_plan_never_substitutes_a_width` passes on hardware). Worth knowing why it is on this page: **every “~25 minute bake” figure in this project's history came from a pre-PR#9 greedy binary** — the exact quality downgrade that was forbidden — and was reported as a speed achievement for days. The ban also had a second, invisible cost: it **silently bricked the GEMV speed benchmarks**, whose fixtures called `QtipMode::Greedy`, so a whole sweep was unrunnable on master for weeks."},
+
+{t:"Hadamard rotation",g:"Compression",s:["bake"],st:"shipped",m:["qual","size"],k:"incoherence processing outliers rotate_activation",
+d:"Multiplying weights by a structured rotation before quantizing, so outliers get spread across the block instead of dominating it.",
+a:"Shaking a jar of mixed nuts so the big ones stop sitting on top. Everything quantizes more evenly afterwards.",
+arc:"Shipped — `hadamard-128`, in the published artifact header `[measured]`. ⚠️ It flattens the **diagonal only**; off-diagonal correlations survive and remain recoverable by error feedback (an unfired quality lever). ⚠️ Still **MISSING on the indexer path** — `rotate_activation` plus compress-θ RoPE on the compressed indexer K — and that is what stands between the sparse attention path and going live."},
+
+{t:"qtip2 vs qtip2b (the rungs)",g:"Compression",s:["bake","experts"],st:"off",m:["agg","user","size","qual"],k:"K=4 V=2 K=2 V=1 bitshift geometry rung truck van",gap:5,lev:5,
+d:"Two trellis geometries. qtip2 is K=4/V=2 and carries the lookup codebook. qtip2b is K=2/V=1, computed by construction, and is the one that gets the fast BATCHED kernel.",
+a:"The van and the truck. The van is quicker off the line; the truck is the only one that keeps climbing when you load it up.",
+arc:"🔑 **The decision is made, by measurement: serve `qtip2b`.** The gemv path is **FLAT** — 315 tok/s at B=64, 317 at B=128. Grouped **CLIMBS** — 322 at B=64, **527 at B=128** `[measured, MoE-GEMM floor only]`. Jish: *“we'll not serve the van, we'll serve the truck.”* `qtip2b` was written off as un-bakeable (≥984 s/layer, ≈11.75 h) until it grew a beam kernel (PR #74) — now **213 s/layer, the cheapest rung to bake** `[measured]`, and that “un-bakeable” verdict is retracted. **The published artifact is still `qtip2`.**"},
+
+{t:"FP8 / E4M3",g:"Compression",s:["experts","kv"],st:"off",m:["size","agg","user"],k:"8-bit float e4m3 fp8 kv storage act_quant",gap:3,lev:4,
+d:"An 8-bit floating-point format — 4 exponent bits, 3 mantissa. Half the bytes of BF16 for values that never needed the precision.",
+a:"Storing a price as £12.50 rather than £12.4999999. The extra digits were not doing anything.",
+arc:"FP8 blockwise GEMV is shipped. FP8 **KV storage** is built, **OPT-IN** (`ARC_V4_FP8_KV=1`) and **has never executed on CUDA**. It is **bit-exact by construction, not by approximation**: `act_quant_kv_nope` already E4M3-round-trips K's 448 nope dims in 64-wide blocks and then *widens back to BF16 and stores that* — so storing the codes instead is bitwise identical `[measured-by-design]`. Worth 64,342 → 45,594 B/token ⇒ max B 493 → ~696. ⚠️ It shipped defaulted **ON** without the GPU run its own design note demanded, and V4 could not serve at all for a day. Acceptance is cheap: greedy generation with the flag on vs off must produce identical tokens, ~15 min inside a rental that is already up."},
+
+{t:"rANS (measured and REJECTED)",g:"Compression",s:["bake"],st:"none",m:["size"],k:"entropy coding arithmetic coding compression refuted",
+d:"Entropy coding — squeezing out the statistical redundancy left in an already-compressed file.",
+a:"Zipping a JPEG. There is nothing left to squeeze, and the zip header makes it bigger.",
+arc:"🔴 **Measured on the real artifact (1.074 billion symbols) and REFUTED. Do not reopen without new evidence.** Order-0 symbol entropy is **3.99987 of 4.0 bits ⇒ a 0.003% saving**; order-1 0.024%; order-2 0.259%. The per-row framing needed to keep random access costs **+0.78% — 150–250× more than the entropy recovered.** ⇒ **rANS makes the artifact BIGGER, before any decode cost.** That the trellis indices are already near-maximum-entropy is exactly what a good quantizer should produce. ✅ Real wins surfaced instead: F32 `row_scales` → BF16 (~0.39%, free) and the per-layer duplicated LUT (~90 MB)."},
+
+{t:"Calibration / LDLQ error feedback",g:"Compression",s:["bake"],st:"none",m:["qual"],k:"GPTQ data-aware block error diffusion",
+d:"Using a sample of real data during quantization, and pushing each block's rounding error forward into the next block instead of discarding it.",
+a:"A tailor fitting to the actual customer rather than to the average human — and remembering where the last seam ran long.",
+arc:"Not built. Named as an unfired quality lever precisely because rotation only flattens the diagonal: the off-diagonal correlations survive and stay recoverable. Would land as an **opt-in calibration pass for tenants who have data**. Low priority while quality is already above target."},
+
+{t:"Weight-only vs activation quantization",g:"Compression",s:["experts"],st:"shipped",m:["size","user","qual"],k:"W4A16 activations bf16 runtime precision",
+d:"You can compress the stored weights, the numbers flowing through at runtime, or both. Weight-only is safe and standard; activation quantization is usually where accuracy goes to die.",
+a:"Compressing the cookbook versus compressing the ingredients.",
+arc:"Arc's 2-bit is **weight-only**. Activations run BF16, with FP8 blockwise on some GEMV paths — and E4M3 round-tripping already happening inside `act_quant_kv_nope`, which is exactly what makes FP8 KV *storage* bit-exact rather than lossy. Worth knowing when comparing against a “W4A16” artifact: that name describes both halves."},
+
+/* ---------------- ATTENTION ---------------- */
+{t:"Attention",g:"Attention",s:["attention"],st:"shipped",m:["user","agg","ttft","qual"],k:"self-attention softmax qkv",gap:3,lev:4,
+d:"For each new token, mixing in information from every previous token, weighted by how relevant each one is.",
+a:"Re-reading the whole conversation before every word you say, and paying most attention to the parts that matter.",
+arc:"Shipped. ⚠️ Its importance was badly mis-stated for a week: a stale b=1 profile taken on an abandoned `cudnn` build read `mla_attn 49% / moe 16%` and made **“attention is the frontier”** the plan. The real profile **at batch** is `moe 49–64% / mla_attn 39%`, with MoE's share **growing** with batch while everything else collapses `[measured]`. Attention still matters — it is ~39% of decode and 81% of the per-token memory budget — but it is not the keystone."},
+
+{t:"Dense / full attention",g:"Attention",s:["attention"],st:"shipped",m:["user","qual","size"],k:"quadratic all-to-all standard causal",
+d:"Every token attends to every previous token. Perfect recall, and cost that grows with the square of the sequence.",
+a:"Re-reading the entire book before every sentence you write.",
+arc:"Shipped, and correct for most architectures. **For V4-Flash it is actively wrong on the “standard” layers**: forcing dense-causal there (`ARC_V4_STANDARD_DENSE=1`) drops long-context coherence **5/5 → 2/5** `[measured ablation]`, because those layers then see relative distances beyond 128 that they were never trained on."},
+
+{t:"Causal masking",g:"Attention",s:["attention"],st:"shipped",m:["qual"],k:"mask lookahead future tokens autoregressive",
+d:"Forbidding a token from seeing tokens that come after it, so that generation matches how the model was trained.",
+a:"Marking the exam so nobody can read ahead to the answers.",
+arc:"Shipped — and a place we got burned badly. **Batched prefill had NO causality**: `sinks_attn_varlen` passed a `None` mask and the caller's `attention_mask` was discarded on every live path. ⇒ **every batched-quality result taken before the fix is INVALID**, including anything using multi-sequence voting. Batch *throughput* numbers survived (identical kernel work); batched *outputs* did not `[measured]`. Worth remembering as a shape: a bug can invalidate one axis of a measurement and leave another standing."},
+
+{t:"Sliding window",g:"Attention",s:["attention"],st:"shipped",m:["size","user","qual"],k:"SWA local attention window 128",
+d:"Each token only attends to the last N tokens instead of all of them, so cost stops growing with sequence length.",
+a:"Only keeping the last page of the conversation in front of you.",
+arc:"Shipped — window 128 on V4's standard layers (config at `deepseek4.rs:280-281`). Proven necessary by ablation, and proven *insufficient alone*: window + sink gives **5/5 coherence but 0/4 needle recall** `[measured]`. Local fluency without long-range retrieval."},
+
+{t:"Attention sink",g:"Attention",s:["attention"],st:"shipped",m:["qual"],k:"streaming llm first token sink attn_sink",
+d:"Always keeping the first few tokens attendable, because models dump their excess attention mass there and fall apart without it.",
+a:"A lightning rod. Something has to absorb the charge, or it earths through your output.",
+arc:"Shipped alongside the sliding window (`attn_sink` field at `deepseek4.rs:908-914`, fed through `SdpaParams.sinks`, kernel `flash_attn_sinks.cu`). It is also **part of why V4 cannot use the stock PagedAttention kernel** — that kernel has no sink support at all."},
+
+{t:"Sparse attention",g:"Attention",s:["attention"],st:"off",m:["user","agg","size","qual"],k:"top-k selection compressed indexer selective",gap:5,lev:3,
+d:"Attending to a chosen SUBSET of previous tokens instead of all of them — picked by relevance rather than by position.",
+a:"Using the index of the book instead of re-reading every page.",
+arc:"🟡 **V4's compressed/indexer path is Arc's sparse route, and it is NOT live.** Still missing **Hadamard `rotate_activation` and compress-θ RoPE on the compressed indexer K** `[measured, wave28-BB]` — those two are the gate. ✅ The shape mismatch that looked like a corrupt artifact was a **loader** bug (the indexer kept a stale private copy of a fix already applied on the attention path — the fifth “N copies of one bug” case). Fixed by deleting the copy, **no re-bake needed**."},
+
+{t:"MQA (multi-query attention)",g:"Attention",s:["attention","kv"],st:"shipped",m:["size","user"],k:"shared kv heads multi-query",
+d:"All attention heads share ONE set of keys and values, so the KV cache is a fraction of the size.",
+a:"One shared filing cabinet for the whole office instead of one per desk.",
+arc:"🔑 **V4-Flash is MQA — this was mis-stated as MLA in our own notes.** Its fused `wkv` makes K and V **identical** (`deepseek4.rs` is literally `let v = k.copy()?`), which means storing them separately was wasting exactly half the KV cache. Dedup shipped: 1,026 → 590 B/token/layer, max B **266 → 493** `[measured-by-design]`."},
+
+{t:"GQA (grouped-query attention)",g:"Attention",s:["attention","kv"],st:"shipped",m:["size","user"],k:"grouped query kv heads llama qwen",
+d:"The middle ground: heads share keys and values in groups. Most modern open models use it.",
+a:"One filing cabinet per team, rather than one per person or one for the whole building.",
+arc:"Supported in the engine for other architectures. Not the V4-Flash path — included so the term isn't a gap when you read someone else's engine docs."},
+
+{t:"MLA (multi-head latent attention)",g:"Attention",s:["attention","kv"],st:"shipped",m:["size","user"],k:"latent compressed kv deepseek absorbed decode",
+d:"DeepSeek's trick: store a small COMPRESSED latent per token and expand it back into keys and values on the fly.",
+a:"Keeping shorthand notes and expanding them when you need them, instead of filing full transcripts.",
+arc:"Shipped, including an **absorbed-MLA decode** path validated token-identical on 6/6 prompts `[measured]`. ⚠️ **Naming trap:** our profiler counter is called `mla_attn` and reads 39% of decode at batch — but V4-Flash's KV geometry is MQA. **Do not let a counter's name settle an architecture question**; that mix-up survived in our notes for days."},
+
+{t:"CSA / HCA (compressed / hierarchical attention)",g:"Attention",s:["attention"],st:"shipped",m:["qual","size"],k:"compress ratio hierarchical second key set dsv4_attention",
+d:"Folding a second, COMPRESSED set of keys into the same softmax as the local window, so one attention operation sees both near and far.",
+a:"Reading the last page in full and the chapter summaries for everything before it — in a single glance.",
+arc:"Shipped in V4's layers (`dsv4_attention.rs`, `CompressRatio` at `deepseek4.rs:470`: ratio 4 → CSA with top-k 512, ratio 128 → HCA). 🔑 It is also **the precise reason PagedAttention cannot be used here**: the stock kernel is `DefaultAttention<false,false,false,false>` — dense causal, ONE key set, no window, no sinks."},
+
+{t:"Lightning Indexer",g:"Attention",s:["attention"],st:"off",m:["user","agg","qual"],k:"indexer scorer sparse gate flashmlasparse dead code",gap:5,lev:3,
+d:"A small, cheap scorer that decides WHICH distant tokens are worth attending to — the gate that makes sparse attention actually pay.",
+a:"The index at the back of the book. Useless if nobody opens it.",
+arc:"🟡 **Loaded from weights, never called.** The struct and its forward exist (`models/dsv4_indexer.rs`) and are exercised only by tests; it is loaded for CSA layers and stored on the model — where the field carries an explicit **`#[allow(dead_code)]`**, and there is no `self.indexer` use anywhere in `deepseek4.rs` or `dsv4_attention.rs`. Its CUDA twin (`arc-cuda-graph/src/flashmlasparse.rs`, `indexer_score.cu`) is likewise unwired. ⚠️ It was one of three paths un-deaded by a single one-line fix (`cuda_tensor_ptr` calling `as_cuda_slice::<u8>()` unconditionally) — **the sixth “wired, documented and dead” instance found in this codebase. Before trusting any instrumentation here, grep for its call site.**"},
+
+{t:"FlashAttention (1 → 2 → 3)",g:"Attention",s:["attention","prefill"],st:"shipped",m:["user","agg","ttft","size"],k:"FA1 FA2 FA3 flashattention1 flashattention2 flashattention3 flash-attn tiling online softmax hopper sram",
+d:"Computing attention without ever writing the giant attention matrix to memory — it is tiled and kept in fast on-chip SRAM. FA2 improved the work partitioning across warps; FA3 adds Hopper-specific asynchrony and FP8.",
+a:"Doing long division in your head instead of writing every intermediate step onto paper you then have to fetch back.",
+arc:"FA2 is what every measured session used (`--features \"cuda flash-attn\"`, `flash_attn_varlen_windowed`). **FA3 is wired behind a separate, mutually exclusive `flash-attn-v3` feature and has not been measured here.** ⚠️ Two live traps: adding `cudnn` costs **−62% decode** (5.45 vs 14.58 tok/s, same box, same bake) because it swaps the SDPA backend and bypasses flash-attn — **do not add it**; and on the CUDA flash path `causal` defaults to `seq_len > 1`, which silently breaks any encoder that needs bidirectional attention."},
+
+{t:"PagedAttention",g:"Attention",s:["attention","kv"],st:"off",m:["agg","size","ttft"],k:"vllm blocks virtual memory fragmentation paged kv",gap:2,lev:2,
+d:"Storing the KV cache in fixed-size blocks like operating-system virtual memory, so a batch doesn't need one big contiguous slab per sequence.",
+a:"Hotel rooms instead of whole floors — you stop wasting the empty half of every booking.",
+arc:"🟡 **Built and tested. OFF for V4 by one line** — `supports_paged_attention` for the V4 loader returns `Ok(false)` (`normal_loaders.rs:3231`, returning at `:3275`), landed in a profiler commit. **A probe is running.** Two independent blockers are verified in source: the MLA decode kernel fixes `HEAD_DIM_CKV=512`/`KPE=64` as **template** arguments and a 448 instantiation **does not compile** (`static_assert(vec_size % 8 == 0)`); and it is dense-causal with one key set while every V4 layer is sliding-window + sink + CSA. ⚠️ **It was called “the keystone unlocking three capabilities” and that was wrong twice: infeasible AND insufficient** — the `prime_for_step` bridge does not exist either, so flipping the flag would not deliver graph decode. V4 uses it only as block KV *storage* via `cache_write_and_gather`. **It is fine and correct on other architectures.**"},
+
+{t:"RadixAttention",g:"Attention",s:["prefix","attention"],st:"none",m:["ttft","agg"],k:"radix tree prefix sharing sglang shared prompt",gap:5,lev:3,
+d:"Sharing KV cache between requests that begin with the same text, using a radix TREE so any shared prefix is found automatically — not just exact matches.",
+a:"A shared filing system where two people researching the same topic reuse each other's notes, right down to the last common paragraph.",
+arc:"🔴 **Not built. A port with improvements is in flight.** The only radix code in the tree is an unrelated GPU radix **top-k sampler**; `radix_trie` is a declared dependency in `Cargo.toml` **with no use site anywhere**. Arc has a simpler prefix cache instead. **This is the biggest unclaimed TTFT lever for realistic traffic**, where a system prompt repeats across every single request."},
+
+{t:"Prefix caching",g:"Attention",s:["prefix"],st:"off",m:["ttft","agg"],k:"prompt cache reuse kv reuse prefix-cache-n cache hit",gap:4,lev:3,
+d:"Remembering the KV cache for a prompt you have already processed, so an identical opening doesn't have to be prefilled again.",
+a:"Not re-reading the standing agenda at the start of every meeting.",
+arc:"🟡 **It exists (`prefix_cacher.rs`, `PrefixCacheManagerV2`), it is simpler than radix, and it is ON by default** — `--prefix-cache-n` defaults to 16. 🔴 **But it was explicitly disabled (`--prefix-cache-n 0`) in EVERY sweep we have ever run.** ⇒ **every TTFT and throughput number on this page is the no-cache worst case**, and nobody has measured what turning it on is worth. A cache-key correctness fix landed recently (an entry is now keyed by the prefix its cache actually covers)."},
+
+{t:"ArcAttention",g:"Attention",s:["attention"],st:"none",m:["user","agg","size"],k:"M1_GATE roadmap own kernel target",gap:5,lev:3,
+d:"The named target for Arc's own attention path — the thing that would fold windowing, sinks, the compressed key set and paging into one kernel we control.",
+a:"The bespoke engine you build only after learning exactly why none of the off-the-shelf ones fit.",
+arc:"🔴 **A roadmap row in `arc-tools/M1_GATE.md` (M4 column) and nothing else. Zero matches for `ArcAttention` or `arc_attention` in any `.rs` or `.cu` file.** Listed here so it is never mistaken for something that exists. Everything under Attention above is the argument for why it might eventually need to."},
+
+{t:"SDPA",g:"Attention",s:["attention"],st:"shipped",m:["user","ttft"],k:"scaled dot product attention backend dispatch",
+d:"“Scaled dot-product attention” — the standard interface the engine calls, which then dispatches to whichever backend is fastest.",
+a:"The plug socket. What is behind it changes; the shape does not.",
+arc:"Shipped. **The dispatch behind it is exactly where the `cudnn` regression hid**: same call, different backend, −62% decode. When a build flag changes performance and no code changed, look at what the interface dispatched to."},
+
+{t:"RoPE / YaRN",g:"Attention",s:["attention"],st:"shipped",m:["qual"],k:"rotary position embedding scaling long context is_gptx",
+d:"How the model knows WHERE each token sits. RoPE rotates the query and key by position; YaRN stretches that scheme so a model trained short can run long.",
+a:"Seat numbers in a theatre. YaRN is how you renumber when you add rows the architect never drew.",
+arc:"Shipped, and it was wrong in two places: **YaRN was applied to ratio-0 layers** (the correct set is exactly {0, 1, 43} — an earlier audit's “0, 1, 42” was itself wrong), and the MTP block carried a stale RoPE table. Both fixed. ⚠️ **These are why GSM8K 87.0%, the perplexity number and the long-context results are VOID rather than merely old.** ⚠️ Related trap worth carrying: Mistral-native `consolidated.safetensors` stores Q/K with interleaved head dims, so it needs `is_gptx=false`; the wrong RoPE style gives cosine ~0.02 against reference — completely wrong output, no crash."},
+
+/* ---------------- MEMORY ---------------- */
+{t:"KV cache",g:"Memory",s:["kv"],st:"shipped",m:["size","agg","user"],k:"key value cache growth per token per layer",gap:2,lev:5,
+d:"Every token's keys and values, kept so later tokens don't recompute them. It grows with every token, for every user, in every layer.",
+a:"The running transcript of the meeting. Cheap to append, and read out loud again before every new sentence.",
+arc:"88,064 B/token across 43 layers originally; deduped, then FP8-able down to 590 B/token/layer `[measured-by-design]`. **Post-#59 it is 81% of the per-token memory budget** — it became the binding constraint the moment `xs` stopped being one. ⚠️ The reference stores 584 B/token/layer, so we are now within a few bytes of it rather than 1.75× over."},
+
+{t:"The xs compressor cache",g:"Memory",s:["kv"],st:"shipped",m:["size","agg"],k:"xs history rolling state compressor buffer xs_history",gap:1,lev:5,
+d:"V4's context compressor kept a raw history buffer per sequence — separate from, and once far larger than, the KV cache itself.",
+a:"Keeping the full uncut recording as well as the transcript, when all anyone ever plays is the summary.",
+arc:"🔑 **Was 335,954 B/token — 3.8× the KV cache and 79% of all per-token memory.** It was recomputed from a raw `[B,T,hidden]` buffer every step, while the compressor only ever consumed a stride-`ratio` reduction of it. A rolling compressed state (PR #59) cut it **60.7×**: 424,018 → 108,288 B/token, max batch **68 → 266** `[measured-by-design]`. **This single fix is what made B=128 and B=256 runnable at all** — they were out of memory by 3.91× before it. A textbook case of the keystone being an accounting mistake rather than a kernel."},
+
+{t:"Block tables / paging",g:"Memory",s:["kv"],st:"off",m:["size","agg"],k:"page table physical logical blocks cache engine",
+d:"The lookup table saying which physical KV block holds which logical position — the bookkeeping that makes non-contiguous caches possible.",
+a:"The page table in an operating system. Boring, and everything depends on it.",
+arc:"Built inside `mistralrs-paged-attn` (`cache_engine.rs`, `block_pool.rs`), unused on V4 because paged attention is off there. V4's only paged call site is `cache_write_and_gather` — **storage, with no head-size dispatch**, which is why the “head_dim=512” rationale that was once given for the flag was inapplicable."},
+
+{t:"HBM bandwidth",g:"Memory",s:["experts","attention"],st:"concept",m:["user","agg"],k:"memory bandwidth TB/s GB/s pipe",
+d:"How many bytes per second the GPU can pull from its own memory. For decode, this is the speed limit — not the arithmetic rate.",
+a:"The width of the pipe. It does not matter how fast the tap turns if the pipe is the same.",
+arc:"H200: **4.8 TB/s** `[physics]`. Every ceiling in `CEILINGS.json` is this number divided by bytes-per-step, and it is what makes the fleet case concrete: 74.19 GB ÷ 4.8 TB/s = **15.4 ms/step** at full expert coverage ⇒ ~16,600 tok/s aggregate at B=256 `[physics]`. ⚠️ Quote **% of peak**, never raw GB/s, when comparing kernels across cards — an A30 reached a *higher* fraction of its peak than an H200 did on the same kernel."},
+
+{t:"Memory-bound vs compute-bound",g:"Memory",s:["prefill","decode"],st:"concept",m:["user","agg","ttft"],k:"arithmetic intensity bottleneck bandwidth flops",
+d:"Whether you are waiting on bytes arriving or on arithmetic finishing. Decode is memory-bound; prefill is compute-bound. They need OPPOSITE fixes.",
+a:"A chef waiting on deliveries versus a chef waiting on the oven. Buying a bigger oven does nothing for the first one.",
+arc:"**The single most useful asymmetry on this page.** It is why prefill already scales 4.8× across a batch while decode does not `[measured]`; why batching lifts aggregate but never per-user; and why “make the kernel do less arithmetic” is usually the wrong instinct during decode. It is also why the cp.async GEMV work failed: **at ~15% of peak that kernel is not latency-bound, so hiding latency could not possibly pay** — the premise was disproven, not merely unrealized."},
+
+{t:"Roofline",g:"Memory",s:["decode"],st:"concept",m:["agg","user"],k:"upper bound bytes bandwidth ceiling model",
+d:"The simple upper bound: bytes you must move, divided by bandwidth. If you are far under it, the gap is your code.",
+a:"The speed-limit sign. Being at 1% of it tells you nothing about the road and everything about your driving.",
+arc:"⚠️ **We got this wrong twice, both times pessimistically.** “0.2% of roofline” assumed all 74 GB is read every step even at small batch — at B=1 only ~3.4 GB moves, so the roofline itself was overstated ~8×. And a “b=1 ceiling of 560 tok/s” guessed the dense term at 7 GB when it is **1.70 GB**. 🟢 **The real b=1 ceiling is 1,413 tok/s** `[physics]` — which made a 640 tok/s target **conservative**, not ambitious. Recompute the bound before believing a gap."},
+
+{t:"KV budget / max batch",g:"Memory",s:["kv","schedule"],st:"shipped",m:["size","agg"],k:"memory ladder bytes per token capacity max_B",gap:2,lev:4,
+d:"Total memory left after the weights, divided by memory per token, divided by context length. This — not the kernel — is what sets how many users fit.",
+a:"How many people fit in the lifeboat after the engine is aboard.",
+arc:"On an H200: 141 − 74.2 − ~8 reserve ⇒ **~59 GB usable** (earlier arithmetic said ~65 and was based on a 68 GB estimate). The ladder, three independent cuts: 424,018 → 108,288 → 64,342 B/token ⇒ max B **68 → 266 → 493**, and **~696** with FP8 K `[measured-by-design]`. 🔑 **This ladder, not the kernel, is what sets the fleet number** — past expert saturation, aggregate is just B ÷ 15.4 ms."},
+
+{t:"Context length",g:"Memory",s:["kv"],st:"shipped",m:["size","ttft","qual"],k:"sequence length max-ctx window long context needle",
+d:"How many tokens the model can hold at once. It multiplies every per-token memory cost, so it trades directly against batch size.",
+a:"The length of the table. Everything you store per guest gets multiplied by it.",
+arc:"Long context validated **5/5 coherence + 4/4 needle** `[measured — provisional, YaRN changed afterwards]`. The arithmetic that matters: at 2,048 tokens and 424,018 B/token one sequence cost ~868 MB and capped B near 68. Cut the per-token cost and the batch ceiling moves; that is the entire `xs` story."},
+
+/* ---------------- EXECUTION ---------------- */
+{t:"CUDA graphs",g:"Execution",s:["decode"],st:"off",m:["user","agg"],k:"graph capture replay launch autonomous decode megakernel",gap:3,lev:3,
+d:"Recording a whole sequence of GPU operations once and replaying it as a single unit, so the CPU stops re-issuing them every step.",
+a:"Recording a dance routine instead of shouting every step from the sidelines, every night.",
+arc:"🔴 **Unreachable on V4 today.** The `autonomous_decode` path refuses on three distinct conditions before capture is even attempted (`normal.rs`): **(1)** the dedicated decode path is unavailable — “Candle forward isn't graph-capturable”; **(2)** custom logits processors are present, which the GPU sampler cannot run; **(3)** `top_nsigma` is set, which it does not implement. It then also needs a `cache_config`, **and that is the one downstream of `supports_paged_attention=false`**. ⚠️ Flipping the paged flag would still not be enough — the `prime_for_step` bridge does not exist, so the runner never finishes a batch. **Reachable and useful for other models.** ⚠️ And note: **eight ranked host costs were found that graphs would not fix**, which is why the megakernel work stays correctly deferred."},
+
+{t:"Kernel launch overhead",g:"Execution",s:["decode"],st:"concept",m:["user","agg"],k:"per-op cpu cost dispatch cost small kernels",
+d:"The fixed CPU cost of telling the GPU to do something — paid per operation, per layer, per step, whether the operation is huge or tiny.",
+a:"The phone call before each delivery. Fine for one lorry; ruinous for a thousand envelopes.",
+arc:"Real, and **repeatedly mis-blamed**. The b=1 gap was confidently called “per-step host overhead” and that was **wrong**: the host-copy term contributes exactly zero at b=1 (`logits_on_cpu = len > 1` is false there), and the profile shows `forward_total 67.24 ms` against a 61.5 ms step — **the step IS the forward**. ⇒ **b=1 is a GPU kernel-efficiency problem, and we already have a measured fix for it.** Good news that was stated as bad news for a week."},
+
+{t:"GEMV (matrix × vector)",g:"Execution",s:["experts"],st:"shipped",m:["user"],k:"decode kernel single token bandwidth percent of peak autotune",gap:5,lev:4,
+d:"The shape of the maths when you have exactly ONE token: a huge matrix times a single vector. Reads every weight, then does almost no arithmetic with it.",
+a:"Driving an articulated lorry to collect one parcel. All of the fuel, none of the payload.",
+arc:"🔴 **Pinned at ~9.4–15% of peak — open and unacceptable.** ⚠️ Quote the **percentage**, not the GB/s: an A30 reached **15.4%** where the H200 reached **9.4–9.7%** on the same kernel ⇒ **this is our implementation, not a format limit**, and the cheap box was not flattering us. (Another implementation of this format publishes ~80% of peak — **their number, not one we have run.**) ✅ Autotune found **2.3×** (450–467 GB/s) and shipped it as the dispatch default. 🔴 **Gen-2 cp.async is DEAD: 98/98 variants measured, it loses 8–11%**, and every structural axis measured negative (split-K, staged width, warp specialization −38%). **The premise is disproven, not unrealized** — the real ceiling is per-symbol trellis decode serialization."},
+
+{t:"GEMM (matrix × matrix)",g:"Execution",s:["prefill","experts"],st:"shipped",m:["agg","ttft"],k:"batched matmul tensor cores arithmetic intensity",
+d:"The same weights multiplied by MANY tokens at once. Every weight byte you fetch does far more work.",
+a:"The same lorry, fully loaded. Same fuel, forty times the payload.",
+arc:"This is why prefill is healthy while decode is not, and it is the entire mechanism behind the fleet thesis: **batching is how you turn decode's GEMV shape into prefill's GEMM shape.** Everything under MoE below is about whether the expert path is allowed to make that conversion."},
+
+{t:"Grouped GEMM",g:"Execution",s:["experts"],st:"off",m:["agg"],k:"segmented ragged batched experts qtip_grouped_gemm crossover",gap:4,lev:5,
+d:"One kernel doing many differently-shaped matrix multiplies at once — necessary when 256 experts each receive a different, ragged handful of tokens.",
+a:"One delivery run serving 256 shops with different order sizes, instead of 256 separate runs.",
+arc:"🔑 **The keystone of the fleet claim. Built (`qtip_grouped_gemm.cu`, 5/5 hardware parity), live on the `qtip2b` rung — but the published artifact is `qtip2`, so it is not what serves today.** It carries a real, stable per-unit handicap: **8.2 µs/unit vs gemv's 4.4 — 1.88×** — which is exactly why the crossover sits at **B=64** and not lower. Past it: **1.66× at B=128 and still climbing while gemv is flat** `[measured]`. ✅ Worth noting: a blind prediction pre-committed to “dead if grouped never overtakes below B=68”, called crossover at 52 ± 15, and measured 64 — the first prediction in this program to survive contact with hardware."},
+
+{t:"Host vs device time",g:"Execution",s:["decode"],st:"concept",m:["agg","user"],k:"CPU bound GPU idle O(B^2) logits copy host overhead",gap:5,lev:5,
+d:"Whether the CPU or the GPU is the one holding everything up. The answer is usually the opposite of the guess.",
+a:"Is the kitchen slow, or is it the one waiter?",
+arc:"🔴 **The clearest measurement in the whole program: at B=256 the server pegged 100% of ONE core of 44 while the GPU sat at 0–4% and 121 W of 700** `[measured]`. The same box at B=64/128 drew 420–476 W. That led to an **O(B²) host copy**: `Tensor::i()` returns a *view* and `to_device` copies the *whole* storage, so the per-sequence logits D2H dragged all B×vocab elements, B times ⇒ **16.94 GB per step at B=256**, fixed to 66.2 MB. 🔑 **The shape was the proof, not just the code**: aggregate can only *plateau* under a linear step cost — only a quadratic term can make it *fall*, which is exactly what 128→256 did. ⚠️ A linear **24.26 ms/sequence** term remains **UNATTRIBUTED** — about 69 points of the B=64 step. Next hunt."},
+
+{t:"Synchronisation stalls",g:"Execution",s:["decode"],st:"concept",m:["user","agg"],k:"lock contention busy wait mutex device sync serialization",gap:4,lev:4,
+d:"The GPU idling because the CPU asked it for an answer and then waited — or because a lock is held while everyone else spins.",
+a:"Everyone standing still because one person is reading the map.",
+arc:"Two named mechanisms, both confirmed in source. **`get_mut_group!` is a `try_lock` + `yield_now` BUSY-WAIT** taken 5× per token per sequence (`utils/mod.rs:227-237`) — **this is the mechanism that converts lock contention into “100% of one core with the GPU idle”**. And the post-sample loop `.await`s a send per sequence **on the engine task holding the pipeline mutex**, while sampling itself is rayon-parallel ⇒ 43 of 44 cores idle. ⚠️ Related standing rule: never call `Tensor::from_vec`/`arange` with a GPU device inside a hot loop — it forces a CPU→GPU sync."},
+
+{t:"Megakernel / fused decode",g:"Execution",s:["decode"],st:"none",m:["user"],k:"fusion single kernel GPU-autonomous while loop",gap:4,lev:3,
+d:"Collapsing a whole decode step into one giant kernel, so the GPU never hands control back to the CPU between layers.",
+a:"One continuous production line instead of a thousand handoffs.",
+arc:"🟡 **Deliberately deferred, and correctly so** — eight ranked host costs were found that are fixable now and need none of it, and the b=1 term turned out to be kernel efficiency rather than dispatch. This is what stands between today's b=1 and the 640 tok/s target *after* the cheaper wins are taken, not before."},
+
+{t:"Autotuning / dispatch table",g:"Execution",s:["experts"],st:"shipped",m:["user","agg"],k:"kernel variants sweep winners launch parameters tuning",gap:2,lev:3,
+d:"Measuring many kernel variants on the real hardware and baking the winners into the dispatch table.",
+a:"Trying every gear ratio on the actual track, then welding the winner in.",
+arc:"Shipped (PR #20): 43+ variants swept; winners **v21 `w4_r2_i1_v2`** (gate/up) and **v6 `w8_r4_i1_v2`** (down) are the defaults, worth 2.3×. ⚠️ Dispatch is verified **at the ID level, not by timing** — the test returns 21 without the table and fails with it, which proves the production path consults it. (An earlier “tuned” probe accidentally ran *without* the table applied, so the number it produced was untuned.) ⚠️ Deliberately **not** retuned from A30 data: retuning on the wrong silicon would regress the H200 defaults."},
+
+/* ---------------- SPECULATION ---------------- */
+{t:"Speculative decoding",g:"Speculation",s:["decode"],st:"shipped",m:["user","agg"],k:"draft model verify guess ahead free tokens",
+d:"Guess several tokens cheaply, then check them all in ONE pass of the big model. Every guess that survives is a free token.",
+a:"Finishing someone's sentence. When you are right you both save time; when you are wrong you lose only the breath.",
+arc:"The one mechanism that gets more than one token out of a single memory-bound decode step — the bytes move once either way. Shipped for V4 via MTP; a generic `speculative.rs` path also exists for other models."},
+
+{t:"MTP (multi-token prediction)",g:"Speculation",s:["decode"],st:"shipped",m:["user","agg"],k:"multi token prediction draft head deepseek mtp-depth",gap:3,lev:4,
+d:"The model's own built-in extra head that proposes the next-next token — a draft model you get for free, trained alongside the model.",
+a:"A co-writer who already knows the author's voice, because they are the same person.",
+arc:"🟢 **Works at EVERY batch size as of PR #73.** Both earlier claims are now wrong: “B=1 only” and “mutually exclusive with PagedAttention”. **Jish was right to reject the exclusivity** — it was an unimplemented branch, not an incompatibility, and **the guard has never fired.** 🔑 **It could never have helped before this**: the old shape ran TWO full target forwards per step, capping the multiplier at (depth+1)/2, so `--mtp-depth 1` was *mathematically incapable* of beating no-MTP. ⚠️ `--mtp-depth` **defaults to 0**, so the default serve does not load the block even though the artifact ships the tensors — which is why three separate sessions collected empty acceptance files and blamed the logger."},
+
+{t:"Draft / verify",g:"Speculation",s:["decode"],st:"shipped",m:["user"],k:"rollback truncation tree verification longest prefix",
+d:"The two halves: something cheap DRAFTS k tokens; the real model VERIFIES them all in one pass and keeps the longest correct prefix.",
+a:"An assistant drafts the paragraph; you read it once and keep everything up to the first thing you would have written differently.",
+arc:"Shipped. At topk == 1 — which is what DeepSeek MTP *is* — the rollback is **pure truncation with zero KV movement**, so paged KV would be a *better* substrate, not an incompatible one. ⚠️ **The real B=1 gate was never MTP, it was a cache constraint**: `single_cache.rs` `append` does a `slice_set` with ONE offset for the whole batch. Solved by keeping *cache* lengths uniform while *token* lengths diverge, grouping drafts by uncached tail."},
+
+{t:"Acceptance rate (k)",g:"Speculation",s:["decode"],st:"shipped",m:["user","agg"],k:"tokens per step accept rate multiplier speculation efficiency",gap:3,lev:4,
+d:"How many tokens survive verification per step, on average. This IS the speedup multiplier — nothing else about speculation matters as much.",
+a:"The proportion of your co-writer's sentences you keep unedited.",
+arc:"🟢 **The first acceptance measurement in this program's history: accept_rate ≈ 0.42, tok_per_step ≈ 1.84** (27 of 64 proposals; 59 tokens over 32 steps; per-request spread 0.35–0.50) `[measured]`. We had been projecting from k = 2. ⚠️ **The sample is tiny — 32 steps.** The reference publishes a non-simulated floor of **2.30** (*their* number, not one we have run). ⚠️ And it multiplies a base far below its own bound: 1.84 × the B=128 per-user ceiling of 68 = **~125 tok/s/user**, which still clears the 100 target — **but MTP is a multiplier on whatever the base path achieves, and measured per-user at B=128 is ~60× under its ceiling. Fix the base first.**"},
+
+{t:"EAGLE / Medusa",g:"Speculation",s:["decode"],st:"off",m:["user","agg"],k:"eagle3 medusa draft heads hidden states magicdec",
+d:"Speculation schemes that draft from the big model's own hidden states (EAGLE) or from extra prediction heads bolted on (Medusa), rather than from a separate small model.",
+a:"Different ways of hiring the co-writer: train one on your notes, or grow extra hands.",
+arc:"🟡 **Modules exist in the tree — `arc-engine/src/eagle3.rs`, alongside `magicdec.rs` — but they are not the V4 path and none of them appear in any measured number.** MTP is V4's native equivalent and was correctly done first. Carry the names anyway: the acceptance-rate arithmetic above is identical for all of them, so an EAGLE claim should be read exactly the same way."},
+
+/* ---------------- MoE ---------------- */
+{t:"Mixture of Experts (MoE)",g:"MoE",s:["route","experts"],st:"shipped",m:["size","agg","user","qual"],k:"sparse model experts active params 284B 13B",
+d:"The model contains many parallel sub-networks; each token only uses a few of them. Huge total capacity, small per-token cost.",
+a:"A hospital with 256 specialists. Every patient sees six — the building is big, the appointment is short.",
+arc:"V4-Flash: **284B total / 13B active, 256 routed experts + 1 shared, top-6, 43 layers** `[measured from config]`. The split that every ceiling is derived from: 1.084B params/expert and 6.496B dense params ⇒ **1.697 GB dense + 6 × 0.2832 GB = 3.396 GB per token at B=1** `[physics]` — which checks out exactly against 13e9 active params × 0.26125 B/param."},
+
+{t:"Routing",g:"MoE",s:["route"],st:"shipped",m:["qual","agg"],k:"gate router sinkhorn expert selection load balance",gap:3,lev:3,
+d:"The small network deciding which experts each token goes to, at every layer.",
+a:"Triage at the front desk. Fast, and it decides everything downstream.",
+arc:"Shipped (`MoeGate`), with a fused Sinkhorn kernel validated **bit-identical perplexity and token-identical on 6/6** before being made default-on `[measured]`. 🔑 **Real-world routing CONCENTRATION has never been measured on this model, and it can only help us**: any concentration wakes *fewer* distinct experts, reads *fewer* bytes, and lands **above** the ceiling table. **Cheap, and unclaimed.**"},
+
+{t:"Top-k (experts per token)",g:"MoE",s:["route"],st:"shipped",m:["qual","agg","user"],k:"top-6 top-8 num_experts_per_tok routed",
+d:"How many experts each token is sent to. Higher k means better quality and more bytes read per token.",
+a:"How many specialists each patient sees. Six opinions cost six appointments.",
+arc:"⚠️ **V4-Flash is TOP-6, NOT top-8** (`num_experts_per_tok`, default 6). Our own notes used top-8 for days and **overstated every amortization row** — 4.07×/8.00× where the truth is 3.15×/6.01×. **Read the config, not the model family.**"},
+
+{t:"Expert coverage / saturation",g:"MoE",s:["route","experts"],st:"concept",m:["agg","user"],k:"E(B) distinct experts amortization saturation curve",
+d:"How many DISTINCT experts a batch wakes. Small batches wake few; large batches wake nearly all — and once you have woken all of them, extra users are almost free.",
+a:"One patient occupies six specialists. 256 patients occupy the whole hospital — and the 257th costs nothing extra to keep the lights on.",
+arc:"🔑 **The single most important shape on this page.** `E(B) = 256 × (1 − (1 − 6/256)^B)` `[physics]` ⇒ **6 / 43.9 / 135.3 / 199.1 / 243.4 / 255.4** distinct experts at B = 1/8/32/64/128/256. Weight amortization `6B / E(B)`: 1.0× / 1.09× / 1.42× / 1.93× / **3.15× / 6.01×**. ⚠️ **We nearly threw this away**: “MoE batch economics are structurally modest, ~1.57×” was written from data that stopped at B=32 — *the worst stretch of the curve* — and generalised into a structural ceiling. **Four more rows of the same formula refuted it.** Never extrapolate a ceiling from the edge of the sampled range. ⚠️ Uniform routing *maximises* distinct experts, so these are **lower bounds on the ceiling**, not ceilings."},
+
+{t:"Expert dedup / amortization",g:"MoE",s:["experts"],st:"none",m:["agg"],k:"no dedup per token per expert gemv flat scaling",gap:5,lev:5,
+d:"When many tokens in a batch want the same expert, reading that expert's weights ONCE instead of once per token.",
+a:"One trip to the pharmacy for the whole ward's prescriptions.",
+arc:"🔴 **OPEN — and it is exactly why aggregate stops collapsing but never starts scaling.** Today it is **one GEMV per (token, expert) pair with no dedup**, which makes the path **flat per token rather than amortizing**: per-token cost falls 61.5 → 32.6 ms from B=1→16 and is then **flat within 1% across B=16/32/64** `[measured]`. That flatness was *predicted* as the consequence of the gather-cap fix, and it arrived exactly as predicted. **The grouped kernel is the fix, it exists, and it is on the other rung.**"},
+
+{t:"MoE token cap",g:"MoE",s:["experts"],st:"shipped",m:["agg"],k:"gather cap 8 tokens fused dequantize materialize fallback",gap:0,lev:5,
+d:"A hard limit on how many tokens the fused expert-gather kernel could handle in one launch. Above it, the code silently fell back to materializing full weights to memory.",
+a:"A lift with a weight limit that, once exceeded, quietly makes everyone take the stairs — without telling them.",
+arc:"🔑 **Was HARD-CAPPED AT 8 TOKENS/STEP** on both rungs. The engine crossed it between B=16 (8 running) and B=32 (13 running) — **exactly where aggregate halved**. Per-sequence step cost was 65.1 / 67.4 / 97.0 ms below the cap and **197.2 ms above it**. ✅ Fixed (PR #56): the boundary is now derived rather than hardcoded, and **the silent all-zero failure mode above the launch limit is now a hard error** `[measured]`. A good example of the pattern: the number looked like a mystery and was a constant."},
+
+{t:"Shared expert",g:"MoE",s:["experts"],st:"shipped",m:["qual"],k:"always-on expert dense expert 256+1 swiglu clamp",
+d:"One expert that every token goes through, in every layer, on top of the routed ones.",
+a:"The GP everybody sees before the specialists.",
+arc:"V4 is **256 + 1**. This is why one small bug hurt so much: a **SwiGLU clamp was missing on 4 of 5 expert paths, including the shared expert** — a path every token traverses in every layer, on every prior run. Fixture magnitude when it bites: **0.7311 clamped vs 14.8996 unclamped = 20.4×**. That single omission is why GSM8K 87.0% and the perplexity number are **void rather than merely old**."},
+
+{t:"Expert parallelism (EP)",g:"MoE",s:["experts","parallel"],st:"none",m:["user","agg","size"],k:"shard experts across GPUs all-to-all EPLB nvlink",gap:4,lev:5,
+d:"Splitting the 256 experts across N GPUs so each card only reads its own slice — the per-token byte cost divides.",
+a:"Putting the specialists in different buildings; each building only pages its own staff.",
+arc:"🔑 **Designed and costed (PR #70), not built.** Saturated per-user floor at B=128: **65 (N=1) → 126 (N=2) → 193 (N=4) → 303 (N=8)** `[measured-by-design]` ⇒ **two cards clear the 100 tok/s-per-user target at any batch; eight are not needed to start.** ⚠️ **NVLink-only** — on PCIe/InfiniBand comms becomes 62% of the step and the N=8 win collapses 4.5× → 2.6×. The cost is **latency, not bandwidth**: 86 collectives/step ≈ 0.86 ms, three times the bandwidth term. ✅ Load imbalance is self-bounded here (+4.2% at B=128) because a GPU cannot read more experts than it owns — skip the balancer in stage 1, instrument for it. ⚠️ A projection of 543 tok/s at N=8 was **wrong**: it assumed the dense term shards. **It is replicated on every card.**"},
+
+/* ---------------- PARALLELISM ---------------- */
+{t:"Tensor parallel (TP)",g:"Parallelism",s:["parallel"],st:"shipped",m:["user","size"],k:"model parallel split matrices all-reduce megatron",
+d:"Splitting each individual matrix across GPUs, so every card does part of every layer.",
+a:"Four people each doing a quarter of every calculation, then comparing notes constantly.",
+arc:"Supported in the engine — and **the wrong choice for V4-Flash**. Its K/V is one fused MQA head, so TP **duplicates the KV cache on every card**, and the KV cache is the binding constraint. ⇒ **expert parallelism plus data-parallel attention beats tensor parallel here**, which is not the usual answer and is worth being able to explain."},
+
+{t:"Pipeline parallel (PP)",g:"Parallelism",s:["parallel"],st:"shipped",m:["size","agg"],k:"layer split stages bubble device map",
+d:"Different GPUs hold different LAYERS; a token walks through the cards in turn.",
+a:"An assembly line down a corridor of rooms.",
+arc:"Available via device mapping. It adds latency per token and needs deep batching to keep every stage busy, so it is a fit-enabler rather than a throughput lever. Not the interesting axis for this model."},
+
+{t:"Data parallel (DP)",g:"Parallelism",s:["parallel"],st:"concept",m:["agg"],k:"replicas independent copies scale out attention DP",
+d:"N complete copies of the model, each serving different users. Throughput multiplies; nothing else changes.",
+a:"Opening a second identical restaurant.",
+arc:"The trivial baseline every other form of parallelism has to beat. For V4 the interesting design is **expert-parallel for the experts, data-parallel for attention** — precisely because tensor parallel would duplicate the KV cache that data-parallel attention keeps naturally partitioned."},
+
+{t:"NVLink vs PCIe",g:"Parallelism",s:["parallel"],st:"concept",m:["user","agg"],k:"interconnect topology nvidia-smi topo collectives bandwidth",
+d:"How fast two GPUs in a box can talk to each other. NVLink is a wide direct link; PCIe goes through the host and is far slower.",
+a:"A door between two offices versus posting a letter across town.",
+arc:"🔑 **A hard preflight, not a detail: expert parallelism is NVLink-only.** On PCIe or InfiniBand, comms becomes **62% of the step** and the whole N=8 win collapses from 4.5× to 2.6× `[measured-by-design]`. **Run `nvidia-smi topo -m` before believing any multi-GPU plan** — the same code on the same GPUs gives a different answer depending on what is between them."},
+
+/* ---------------- METRICS ---------------- */
+{t:"TTFT (time to first token)",g:"Metrics",s:["prefill","stream"],st:"concept",m:["ttft"],k:"latency first token prefill queue wait p50 p95",
+d:"How long the user stares at nothing. Set by prefill, by queueing behind other requests, and by whether the prompt was cached.",
+a:"How long before the waiter says anything at all.",
+arc:"Measured, and it degrades hard with batch: p50 **0.822 s at B=1 → 70.66 s at B=256** (p95 130.4 s) `[measured]`. ⚠️ **Every TTFT number we hold was taken with the prefix cache explicitly off**, so they are the no-cache worst case — and there is no measurement at all of what turning it on is worth. ⚠️ Also note TTFT and aggregate throughput trade against each other through B: the batch size that maximises tokens per dollar is not the one that keeps users happy."},
+
+{t:"Aggregate throughput",g:"Metrics",s:["decode"],st:"concept",m:["agg"],k:"total tokens per second fleet capacity system throughput",
+d:"Total tokens per second the box produces across ALL users at once. This is the fleet number — the one that decides how many GPUs a datacenter has to buy.",
+a:"Meals served per hour by the whole kitchen.",
+arc:"**111.7 tok/s at B=256** `[measured]` against a **~16,600 tok/s** ceiling `[physics]` — a **~149× gap, all of it implementation**. The journey so far: 15.35 peak *at B=1* (aggregate actually **fell** with batch, the exact inverse of the thesis) → 30.65 at B=16 → **111.7 at B=256** `[measured]`. 🔑 **The shape matters more than the number**: the fix that mattered most made aggregate stop *falling*, which is a different achievement from making it rise."},
+
+{t:"Per-user throughput",g:"Metrics",s:["decode"],st:"concept",m:["user"],k:"per sequence tok/s single stream decode speed b=1",
+d:"Tokens per second that ONE user experiences. It falls as batch size rises — this is the fundamental trade every serving engine makes.",
+a:"How fast your own meal arrives, versus how many meals the kitchen serves per hour.",
+arc:"b=1: **16.27 tok/s** `[measured]` against a **1,413 tok/s** ceiling `[physics]`. ⚠️ Note the ceiling itself falls with batch: at B=256 the *saturated* per-user ceiling is only **65 tok/s** `[physics]` — no engine on one card beats that, because the whole model must be read every step. **Two cards with expert parallelism reach 126 at B=128** `[measured-by-design]`, and MTP multiplies whatever the base is by ~1.84 `[measured]`."},
+
+{t:"$/Mtok",g:"Metrics",s:["decode"],st:"concept",m:["agg"],k:"cost per million tokens economics unit economics rental",
+d:"Rental cost divided by tokens produced. The only metric a customer actually pays.",
+a:"Cost per meal, not cost per hour of chef.",
+arc:"**$12.06/Mtok at B=256** `[measured]` — an H200 at $4.85/hr ÷ (111.7 × 3600 ÷ 1e6). The ladder: $87.77 → $43.96 → **$12.06** `[measured]`. At the physics ceiling it is **$0.081** `[physics]`. 🔑 **The distance between $12.06 and $0.08 is entirely engineering** — and every step toward it is compute that does not have to be bought and power that does not have to be burned."},
+
+{t:"Latency (ITL / TPOT)",g:"Metrics",s:["decode","stream"],st:"concept",m:["user","ttft"],k:"inter token latency time per output token ms/token",
+d:"The gap between consecutive tokens once generation has started — “inter-token latency”, or “time per output token”. It is per-user throughput, inverted.",
+a:"The pause between spoken words. Under about 50 ms nobody notices; over about 200 ms everybody does.",
+arc:"We report it as per-user tok/s rather than milliseconds, but the conversion is the number a customer feels: b=1's 16.27 tok/s is **~61 ms per token** `[measured]`. Worth quoting in ms when talking to anyone who has not spent a week in throughput tables."},
+
+{t:"GSM8K",g:"Metrics",s:["bake","sample"],st:"shipped",m:["qual"],k:"grade school math eval accuracy 8-shot 0-shot benchmark",gap:0,lev:5,
+d:"A set of grade-school maths word problems. The standard check that a quantized model can still reason, not merely produce fluent text.",
+a:"The maths test you give after the compression, to prove you did not compress away the arithmetic.",
+arc:"🟢 **96.0% (96/100, ±3.8pp, 0 degenerate, 0 truncated)** on the published `qtip2` artifact `[measured]`, on **our own protocol: 0-shot chat, greedy, seed 161, 2048-token cap**. **~94% on `qtip2b` from a 1,319-problem run in progress** `[measured, in flight]`. ⚠️ **The reference publishes 90.8 — on 8-shot, a different and EASIER protocol. Not comparable, and we say so every single time.** ⚠️ At n=100 the confidence interval is [90.1, 98.5], which **cannot statistically separate 96.0 from 90.8** — which is exactly why the full-set run exists. 🔑 **Quality is not the bottleneck. Throughput is.**"},
+
+{t:"Perplexity",g:"Metrics",s:["bake"],st:"shipped",m:["qual"],k:"ppl wikitext corpus surprise language modelling",
+d:"How surprised the model is by real text. Lower is better, and it is sensitive enough to catch a broken quantizer before a task benchmark would.",
+a:"A hearing test — it finds damage that a normal conversation would not reveal.",
+arc:"**12.50 ± 3.46** on a 70-chunk wiki mini-corpus `[measured]` — **provisional**, taken before the SwiGLU/YaRN fix. ⚠️ **Not comparable to published full-wikitext numbers, and we never present it as one.** Its role is internal: the same rung read **58.85** before the Viterbi encoder fix, a 4.7× move into healthy range. That is what perplexity is for."},
+
+{t:"Degenerate output detection",g:"Metrics",s:["sample"],st:"shipped",m:["qual"],k:"repetition loop harness false positive detector",
+d:"Catching answers that collapse into a repeating loop — a failure quantization can cause, and one a raw accuracy score can hide.",
+a:"Noticing that the record is skipping, rather than that the song is bad.",
+arc:"🟢 A detector that was wrong in the *unflattering* direction: it false-positived on a **correct** answer because a 7-word phrase repeated once. Rebuilt as a union of word-cycle / char-cycle / 4-gram saturation at threshold 0.45 against a **measured** separation (worst clean 0.574 vs best real loop 0.418), **0 false positives on 350 archived completions**, and it catches two real loops the old one missed. ⇒ **96.0%, 0 degenerate, 0 truncated.** 🔑 **It also declined to inflate the score** by “fixing” an answer the model never actually computed — called fabrication, not extraction. **96.0 stayed 96.0.**"},
+
+{t:"Physics ceiling vs measured gap",g:"Metrics",s:["decode"],st:"concept",m:["agg","user","ttft","size","qual"],k:"anti-pessimism protocol not achievable roofline discipline",
+d:"The discipline of always quoting a measurement NEXT TO the bound physics imposes, so a bad number reads as work to do rather than as a verdict.",
+a:"“We are doing 15 mph” means nothing until you know whether the limit is 20 or 200.",
+arc:"🔑 **The house rule: a measured number describes TODAY'S CODE. It is never evidence about what is POSSIBLE. Only physics bounds what is possible.** Before writing “not achievable”, four checks: **(1)** Is this a physics bound — bytes that must move, arithmetic that must happen — or an engineering task? **(2)** Have I extrapolated past the edge of the sampled data? Compute four more rows before concluding a trend. **(3)** Am I quoting a % of peak that another implementation already beats? Then it is a verdict on our kernel, not on the format. **(4)** Is a worst-case assumption (like uniform routing) hiding in my model, and which way does it bias? ⚠️ **This project has six recorded pessimism failures. Every one was caught by re-deriving from physics** — and several had already been published."},
+
+/* ---------------- HARDWARE ---------------- */
+{t:"SM utilisation",g:"Hardware",s:["decode"],st:"concept",m:["agg","user"],k:"gpu util nvidia-smi busy occupancy misleading",
+d:"The percentage of the GPU's cores that are busy. Famously misleading: a core stalled waiting on a memory fetch still counts as busy.",
+a:"Bums on seats. It tells you the room is full, not that anyone in it is working.",
+arc:"⚠️ Our clearest example: during a bake `nvidia-smi` showed **`sm=100%` with `mem=1%` at 261 W of 700** — **resident but inefficient**. And a main thread at 99.9% user time looks *identical* whether it is doing real work or spinning in a CUDA sync. Two live explanations existed and the argument could not choose between them. **Settle it with the fix, not with the argument.**"},
+
+{t:"Power draw as a diagnostic",g:"Hardware",s:["decode"],st:"concept",m:["agg","user"],k:"watts nvidia-smi power.draw starved health gate",
+d:"Watts tell you whether work is actually being retired. A GPU at 100% “utilisation” drawing low power is starved, not busy.",
+a:"A car revving in neutral. The tachometer is high; you are not moving.",
+arc:"🔑 **The most reliable cheap diagnostic we have, and it has settled several arguments.** B=256 host-bound: **121 W of 700**, while the same box at B=64/128 drew **420–476 W** `[measured]`. Bad-box lottery: 99% util at **132 W** = starved on host↔device transfers ⇒ kill it and re-rent. A kernel A/B was corroborated by **150 W vs 208 W** at identical 100% util. ⚠️ **Sample power in a LOOP while confirming util > 50%** — a single early sample once declared a healthy 437 W box a failure, because the burn had not ramped yet."},
+
+{t:"Occupancy",g:"Hardware",s:["decode"],st:"concept",m:["user","agg"],k:"warps in flight latency hiding launch geometry",
+d:"How many groups of threads a GPU core can keep in flight at once — its capacity to hide waiting.",
+a:"How many pans the chef can watch simultaneously.",
+arc:"Named as one of two live explanations for the beam kernel's behaviour: either the serialized host work was the bottleneck, or the kernel was **under-parallelized — occupying SMs without using them**. Deliberately settled empirically rather than by argument, which is the right instinct whenever both stories predict the same `nvidia-smi` output."},
+
+{t:"Single-GPU vs multi-GPU",g:"Hardware",s:["parallel"],st:"concept",m:["size","user","agg"],k:"fit footprint one card 4xH200 published config",
+d:"Whether the model fits on one card at all. Below that line you compete on cost per token; above it you compete on whether it runs.",
+a:"Whether the piano fits through the door. Nothing else matters until it does.",
+arc:"🟢 **The proof already in hand: every published DeepSeek-V4-Flash config we surveyed needs 4× H200. Arc runs it on 1** `[measured]` — a 4× cut in silicon, power and embodied carbon for the same model, measured and published rather than projected. ⚠️ **Scope it honestly: “none found in our survey”, not “none exists on any engine.”** What would refute it: any published single-GPU V4-Flash config, or any engine loading it in ≤141 GB. **We want to know if one exists** — a claim we would rather not test is a claim doctrine forbids."},
+
+{t:"Bandwidth / compute crossover",g:"Hardware",s:["decode"],st:"concept",m:["agg"],k:"flop bound roofline knee B=415 saturation limit",
+d:"The batch size at which you stop waiting for bytes and start waiting for arithmetic. Past it, extra users are no longer nearly free.",
+a:"The point where the delivery van is finally full and you need a second oven, not a second van.",
+arc:"**B ≈ 415 on an H200** for V4-Flash `[physics]`. ⚠️ This is a correction to our own table: the far tail was **bandwidth-only and ignored the FLOP bound**, so B=699 should read ~27,000 rather than 45,400, and B=512 sits near the crossover and should be treated as an upper bound. 🟢 **The 16,600 headline at B=256 is unaffected — it sits well below the crossover.** A useful habit: when a model gets *more* optimistic the further you extrapolate, check which bound you stopped modelling."}
+];
+
+/* ============================================================
+   RENDER
+   ============================================================ */
+var METRIC_NAMES = {agg:"Aggregate",user:"Per-user",ttft:"TTFT",size:"Size",qual:"Quality"};
+var STATUS_NAMES = {shipped:"Shipped",off:"Built · off",none:"Not built",concept:"Concept"};
+var GROUP_ORDER = ["Pipeline","Compression","Attention","Memory","Execution","Speculation","MoE","Parallelism","Metrics","Hardware"];
+var STAGE_NAMES = {
+  request:"Request in", tokenize:"Tokenize", schedule:"Scheduler", prefix:"Prefix cache",
+  prefill:"Prefill", kv:"KV cache", attention:"Attention", route:"MoE routing",
+  experts:"Experts", sample:"Sampling", detok:"Detokenize", stream:"Streaming",
+  decode:"The decode loop", memory:"Memory layer", execution:"Execution layer",
+  bake:"Compression layer", parallel:"Parallelism layer"
+};
+/* stage -> extra groups pulled in when a cross-cutting layer chip is used */
+var STAGE_GROUPS = {memory:"Memory", execution:"Execution", bake:"Compression", parallel:"Parallelism"};
+
+function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+function fmt(s){
+  /* order matters: code, then **bold** (consumed into tags containing no *),
+     then what is left of *italic*. */
+  return esc(s)
+    .replace(/`([^`]+)`/g,'<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>')
+    .replace(/\*([^*\n]+)\*/g,'<em>$1</em>');
+}
+function plain(t){
+  return (t.t+" "+t.g+" "+(t.k||"")+" "+t.d+" "+t.a+" "+t.arc+" "+
+          t.m.map(function(x){return METRIC_NAMES[x];}).join(" ")+" "+STATUS_NAMES[t.st]).toLowerCase();
+}
+/* index each term twice: once verbatim, once with _ - ` * flattened to spaces, so
+   "paged attention" also finds `supports_paged_attention` and "flash attn" finds `flash-attn`. */
+TERMS.forEach(function(t){
+  var base = plain(t);
+  t._hay = base + " " + base.replace(/[_\-`*\/()]/g, " ");
+});
+
+var state = {q:"", qTokens:[], metrics:[], statuses:[], stage:null, view:"browse"};
+
+var $ = function(id){return document.getElementById(id);};
+var browseEl=$("browse"), prioEl=$("prio"), countEl=$("count"), pillEl=$("stagepill");
+
+function matches(t){
+  /* every whitespace-separated token must appear, so "flashattention 3" finds
+     "FlashAttention (1 -> 2 -> 3)" and "paged attention" finds "PagedAttention". */
+  if(state.qTokens.length && !state.qTokens.every(function(tok){ return t._hay.indexOf(tok) >= 0; })) return false;
+  if(state.metrics.length && !state.metrics.some(function(m){return t.m.indexOf(m)>=0;})) return false;
+  if(state.statuses.length && state.statuses.indexOf(t.st) === -1) return false;
+  if(state.stage){
+    var inStage = t.s.indexOf(state.stage) >= 0;
+    var g = STAGE_GROUPS[state.stage];
+    if(!inStage && !(g && t.g === g)) return false;
+  }
+  return true;
+}
+
+function cardHTML(t){
+  var mv = t.m.map(function(m){
+    return '<span class="mv '+m+'">'+esc(METRIC_NAMES[m])+'</span>';
+  }).join("");
+  return '<article class="card st-'+t.st+'">'
+    + '<div class="chead"><h3 class="cterm">'+esc(t.t)+'</h3>'
+    + '<span class="cstat '+t.st+'">'+esc(STATUS_NAMES[t.st])+'</span></div>'
+    + '<p class="cdef">'+fmt(t.d)+'</p>'
+    + '<p class="cana">'+fmt(t.a)+'</p>'
+    + '<div class="cmoves">'+mv+'</div>'
+    + '<p class="carc">'+fmt(t.arc)+'</p>'
+    + '</article>';
+}
+
+function renderBrowse(list){
+  var out = "", n = 0;
+  GROUP_ORDER.forEach(function(g){
+    var inG = list.filter(function(t){return t.g===g;});
+    if(!inG.length) return;
+    n += inG.length;
+    out += '<div class="groupname">'+esc(g)+'<span>'+inG.length+
+           (inG.length===1?" term":" terms")+'</span></div><div class="grid">'
+        + inG.map(cardHTML).join("") + '</div>';
+  });
+  browseEl.innerHTML = out || '<div class="empty">Nothing matches those filters. Try clearing one.</div>';
+  return n;
+}
+
+function bars(v, cls){
+  var s = "";
+  for(var i=1;i<=5;i++) s += '<i class="bar '+(i<=v?cls:"")+'"></i>';
+  return '<div class="bars">'+s+'</div>';
+}
+
+function renderPrio(list){
+  var scored = list.filter(function(t){return t.gap>0 && t.lev>0;})
+    .map(function(t){ var c=Object.create(t); c._p = t.gap*t.lev; return c; })
+    .sort(function(a,b){ return b._p - a._p || a.t.localeCompare(b.t); });
+
+  var head = '<div class="callout"><span class="h">How this ranking is built — and what it is not</span>'
+    + 'Each term is scored on two axes from 0 to 5: <b>gap</b> (how far Arc is from what is achievable on '
+    + 'this axis today) and <b>leverage</b> (how much moving it moves the metric that matters — fleet '
+    + 'aggregate throughput first, because that is the wedge). Rank = gap × leverage. '
+    + '<b>The two scores are judgement, not measurement</b> — they are anchored to the measured gaps and '
+    + 'ceilings quoted in each card, but the weighting is an opinion and should be argued with. '
+    + 'Terms that are pure concepts, or already done, score zero on gap and drop out.</div>';
+
+  if(!scored.length) return (prioEl.innerHTML = head +
+    '<div class="empty">No scored levers match those filters.</div>', 0);
+
+  var rows = scored.map(function(t,i){
+    return '<div class="prow st-'+t.st+'">'
+      + '<div class="prank">'+(i+1)+'</div>'
+      + '<div class="pmain"><h4>'+esc(t.t)+' <em>'+esc(t.g)+' · '+esc(STATUS_NAMES[t.st])+'</em></h4>'
+      + '<p>'+fmt(t.d)+'</p></div>'
+      + '<div class="pscore"><b>'+t._p+'</b>gap '+t.gap+' '+bars(t.gap,"g")
+      + 'lift '+t.lev+' '+bars(t.lev,"f")+'</div>'
+      + '</div>';
+  }).join("");
+  prioEl.innerHTML = head + '<div class="prio">' + rows + '</div>';
+  return scored.length;
+}
+
+function render(){
+  var list = TERMS.filter(matches);
+  var shown;
+  if(state.view === "browse"){
+    browseEl.hidden = false; prioEl.hidden = true;
+    shown = renderBrowse(list);
+  }else{
+    browseEl.hidden = true; prioEl.hidden = false;
+    shown = renderPrio(list);
+  }
+  countEl.textContent = "Showing " + shown + " of " + TERMS.length + " terms";
+  pillEl.innerHTML = state.stage
+    ? '<span class="pill">Stage: '+esc(STAGE_NAMES[state.stage]||state.stage)
+      +' <button type="button" id="clearstage" aria-label="Clear stage filter">×</button></span>'
+    : "";
+  var cs = $("clearstage");
+  if(cs) cs.addEventListener("click", function(){ setStage(null); });
+  document.querySelectorAll("svg .bx").forEach(function(g){
+    g.classList.toggle("on", g.getAttribute("data-stage") === state.stage);
+  });
+}
+
+function setStage(s){
+  state.stage = (state.stage === s) ? null : s;
+  render();
+  if(state.stage){
+    var m = document.getElementById("matrix");
+    if(m) m.scrollIntoView({behavior:"smooth", block:"start"});
+  }
+}
+
+/* ---- wiring ---- */
+$("q").addEventListener("input", function(e){
+  state.q = e.target.value.trim().toLowerCase();
+  state.qTokens = state.q ? state.q.split(/\s+/).filter(Boolean) : [];
+  render();
+});
+
+document.querySelectorAll("#mchips .chip").forEach(function(b){
+  b.addEventListener("click", function(){
+    var m = b.getAttribute("data-m"), i = state.metrics.indexOf(m);
+    if(i>=0) state.metrics.splice(i,1); else state.metrics.push(m);
+    b.setAttribute("aria-pressed", i>=0 ? "false" : "true");
+    render();
+  });
+});
+document.querySelectorAll("#schips .chip").forEach(function(b){
+  b.addEventListener("click", function(){
+    var s = b.getAttribute("data-s"), i = state.statuses.indexOf(s);
+    if(i>=0) state.statuses.splice(i,1); else state.statuses.push(s);
+    b.setAttribute("aria-pressed", i>=0 ? "false" : "true");
+    render();
+  });
+});
+document.querySelectorAll("svg .bx").forEach(function(g){
+  var s = g.getAttribute("data-stage");
+  g.addEventListener("click", function(){ setStage(s); });
+  g.addEventListener("keydown", function(e){
+    if(e.key === "Enter" || e.key === " "){ e.preventDefault(); setStage(s); }
+  });
+});
+document.querySelectorAll("#crosscut .cc").forEach(function(b){
+  b.addEventListener("click", function(){ setStage(b.getAttribute("data-stage")); });
+});
+
+function setView(v){
+  state.view = v;
+  $("v-browse").setAttribute("aria-pressed", v==="browse" ? "true":"false");
+  $("v-prio").setAttribute("aria-pressed", v==="prio" ? "true":"false");
+  render();
+}
+$("v-browse").addEventListener("click", function(){ setView("browse"); });
+$("v-prio").addEventListener("click", function(){ setView("prio"); });
+
+function resetAll(){
+  state.q = ""; state.qTokens = []; state.metrics = []; state.statuses = []; state.stage = null;
+  $("q").value = "";
+  document.querySelectorAll(".chip").forEach(function(b){ b.setAttribute("aria-pressed","false"); });
+  render();
+}
+$("reset").addEventListener("click", resetAll);
+
+document.addEventListener("keydown", function(e){
+  if(e.key === "/" && document.activeElement !== $("q")){ e.preventDefault(); $("q").focus(); }
+  else if(e.key === "Escape"){ resetAll(); $("q").blur(); }
+});
+
+render();
+</script>
+</body>
+</html>
