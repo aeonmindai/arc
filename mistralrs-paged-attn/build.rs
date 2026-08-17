@@ -68,8 +68,25 @@ fn main() -> Result<()> {
     // every .cu in this crate and that cost is not worth paying on a rented box
     // that only ever runs one arch. Release and publish builds set it.
     println!("cargo:rerun-if-env-changed=ARC_CUDA_ARCHS");
+
+    // Hoisted above the `ARC_CUDA_ARCHS` loop because it decides which of the
+    // requested arches are actually *extra*.
+    let compute_cap = builder.get_compute_cap().unwrap_or(80);
+
     if let Ok(archs) = std::env::var("ARC_CUDA_ARCHS") {
         for arch in archs.split(',').map(str::trim).filter(|a| !a.is_empty()) {
+            // cudaforge already emits one `-gencode` of its own, derived from
+            // `CUDA_COMPUTE_CAP` or the local `nvidia-smi`, and suffixes it `a`
+            // for cap >= 90 exactly as we do below (`GpuArch::auto_suffix` ->
+            // `to_gencode_arg`). It then appends `extra_args` verbatim, so
+            // re-requesting that arch here hands nvcc the byte-identical flag
+            // twice: on an H200 building `ARC_CUDA_ARCHS=90,100,103` the
+            // duplicate is `-gencode=arch=compute_90a,code=sm_90a`.
+            //
+            // Emit only what cudaforge does not already cover.
+            if arch.parse::<usize>().is_ok_and(|c| c == compute_cap) {
+                continue;
+            }
             // Arch-specific ("a") cubins: sm_90a/sm_100a expose the Hopper and
             // Blackwell-only instructions the arch-specialised kernel paths are
             // written against. Matches cudaforge's own suffixing for cap >= 90.
@@ -83,8 +100,6 @@ fn main() -> Result<()> {
             ));
         }
     }
-
-    let compute_cap = builder.get_compute_cap().unwrap_or(80);
     // Enable FP8 if compute capability >= 8.0 (Ampere and newer)
     let using_fp8 = if compute_cap >= 80 {
         builder = builder.arg("-DENABLE_FP8");
