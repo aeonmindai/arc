@@ -525,10 +525,18 @@ extern "C" {
     // cudaError_t as i32; on failure the out-params are untouched and the
     // caller MUST NOT substitute a default -- route and GEMM disagreeing on
     // `tile_m` mis-bins the tile map and yields wrong numbers, not an error.
+    //
+    // `out_arch_witness` is what the running BINARY contains, which is a
+    // different question from what the device is: 900 means the SM90 warpgroup
+    // kernel body survived compilation, anything lower means it was compiled
+    // out and a "successful" launch of it would write nothing at all (D18
+    // #12). It is measured by actually launching a witness kernel carrying the
+    // same `__CUDA_ARCH__` guard, once per process -- not inferred.
     pub(crate) fn qtip2b_grouped_query_schedule(
         out_cc_major: *mut i32,
         out_cc_minor: *mut i32,
         out_tile_m: *mut i32,
+        out_arch_witness: *mut i32,
     ) -> i32;
 
     // On-device routing (histogram + scans/tile-map + grouped scatter) for

@@ -883,6 +883,78 @@ cudaError_t qgw_prepare_smem() {
     return status;
 }
 
+// ---------------------------------------------------------------------------
+// THE ARCH WITNESS (D18 #12).
+//
+// The dispatch below picks the warpgroup path from the DEVICE's compute
+// capability, but `qtip2b_grouped_gemm_kernel_wg`'s body is `#if __CUDA_ARCH__
+// >= 900` -- a property of the BINARY, not the device. Those two can disagree,
+// and when they do nothing says so:
+//
+//   a build whose archive carries only sm_80 SASS, run on an H200, JITs from
+//   `compute_80` PTX -- PTX in which the warpgroup body was already compiled
+//   away. `cc_major` is 9, so dispatch takes the wide branch, launches a kernel
+//   that writes nothing, and `cudaGetLastError()` returns success. The caller
+//   receives its `alloc_zeros` buffer as a shape-correct, error-free, ALL-ZERO
+//   MoE layer.
+//
+// That is the same shape as the launch-status hole this PR closes, one level
+// up: the absence of a signal read as a specific signal. `ARC_CUDA_ARCHS`
+// (PR #108) is what makes the sm_90 cubin exist, but a guarantee that depends
+// on another PR having landed, on nobody building without the env var, and on
+// no branch being cut from an intermediate state is a sequencing hope. This is
+// the mechanical version.
+//
+// The witness is a real kernel carrying the SAME `__CUDA_ARCH__` guard as the
+// one it vouches for, compiled in the same translation unit with the same arch
+// flags. It reports what the running binary actually contains: 900 if the
+// warpgroup body survived compilation, otherwise the arch it was compiled for.
+__global__ void qgw_arch_witness_kernel(int* out) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
+    if (threadIdx.x == 0) *out = 900;
+#else
+    if (threadIdx.x == 0) *out = (int)__CUDA_ARCH__;
+#endif
+}
+
+struct QgwArchWitness {
+    cudaError_t status;
+    int         arch;  // 900 => the warpgroup body is present in this binary
+};
+
+// One launch and one sync, once per process, on first use. A function-local
+// static's initialization is thread-safe (C++11 [stmt.dcl]/4), which matters
+// because this is reachable from every model-parallel worker at once.
+//
+// It deliberately does NOT default `arch` on failure: a witness that could not
+// be taken is `status != cudaSuccess`, and the caller must refuse rather than
+// assume. "Could not answer" is not "answered yes".
+QgwArchWitness qgw_take_arch_witness() {
+    QgwArchWitness w{cudaSuccess, 0};
+    int* d = nullptr;
+    w.status = cudaMalloc(&d, sizeof(int));
+    if (w.status != cudaSuccess) return w;
+    w.status = cudaMemset(d, 0, sizeof(int));
+    if (w.status == cudaSuccess) {
+        qgw_arch_witness_kernel<<<1, 1>>>(d);
+        // Same D18 pairing as every launcher here: cudaDeviceSynchronize
+        // returns success for a kernel that never launched.
+        const cudaError_t launch_err = cudaGetLastError();
+        const cudaError_t sync_err   = cudaStreamSynchronize(0);
+        w.status = (launch_err != cudaSuccess) ? launch_err : sync_err;
+        if (w.status == cudaSuccess) {
+            w.status = cudaMemcpy(&w.arch, d, sizeof(int), cudaMemcpyDeviceToHost);
+        }
+    }
+    cudaFree(d);  // the witness result is already on the host
+    return w;
+}
+
+const QgwArchWitness& qgw_arch_witness() {
+    static const QgwArchWitness w = qgw_take_arch_witness();
+    return w;
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -910,7 +982,8 @@ extern "C" {
 // silently mis-bins the tile map).
 //
 // Mirrored by `grouped::grouped_tile_m_for_cc` on the Rust side.
-int qtip2b_grouped_query_schedule(int* out_cc_major, int* out_cc_minor, int* out_tile_m) {
+int qtip2b_grouped_query_schedule(int* out_cc_major, int* out_cc_minor, int* out_tile_m,
+                                  int* out_arch_witness) {
     int dev = 0;
     cudaError_t err = cudaGetDevice(&dev);
     if (err != cudaSuccess) return (int)err;
@@ -919,9 +992,14 @@ int qtip2b_grouped_query_schedule(int* out_cc_major, int* out_cc_minor, int* out
     if (err != cudaSuccess) return (int)err;
     err = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
     if (err != cudaSuccess) return (int)err;
+    // What the DEVICE is, and separately what the BINARY contains. Reporting
+    // only the first is what lets an all-zero MoE layer look valid.
+    const QgwArchWitness& w = qgw_arch_witness();
+    if (w.status != cudaSuccess) return (int)w.status;
     *out_cc_major = major;
     *out_cc_minor = minor;
     *out_tile_m = qg_tile_m_for_cc(major);
+    *out_arch_witness = w.arch;
     return (int)cudaSuccess;
 }
 
@@ -1029,6 +1107,14 @@ int launch_qtip2b_moe_route(
            ours; that must not be reported as a completed launch (D18). */     \
         if (grid <= 0) return (int)cudaErrorInvalidConfiguration;              \
         if (wide) {                                                            \
+            /* D18 #12: the device is SM90+, but is the SM90 kernel BODY in    \
+               this binary? If not, the launch below writes nothing and        \
+               reports success. Defence in depth -- the Rust caller checks the \
+               same witness and can say it in words; this keeps the C ABI safe \
+               for any other caller. */                                        \
+            const QgwArchWitness& w = qgw_arch_witness();                      \
+            if (w.status != cudaSuccess) return (int)w.status;                 \
+            if (w.arch < 900) return (int)cudaErrorInvalidDeviceFunction;      \
             err = qgw_prepare_smem<T>();                                       \
             if (err != cudaSuccess) return (int)err;                           \
             const size_t smem = qgw_smem_bytes<T>();                           \

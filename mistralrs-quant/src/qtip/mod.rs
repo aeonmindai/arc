@@ -97,12 +97,24 @@ pub use grouped::{
 /// rather than assume: the amortization a benchmark may legitimately claim is
 /// bounded by this number, and using the wrong one silently mis-states the
 /// grouped path's advantage in whichever direction the guess went.
+/// Reports the arch witness too, because a harness that reads `tile_m` off a
+/// binary with no SM90 device code would be modelling a kernel that cannot
+/// run on this device (D18 #12).
 #[cfg(feature = "cuda")]
 pub fn qtip_grouped_tile_m() -> candle_core::Result<usize> {
-    let (mut major, mut minor, mut tile_m) = (0i32, 0i32, 0i32);
-    let rc = unsafe { ffi::qtip2b_grouped_query_schedule(&mut major, &mut minor, &mut tile_m) };
+    let (mut major, mut minor, mut tile_m, mut witness) = (0i32, 0i32, 0i32, 0i32);
+    let rc = unsafe {
+        ffi::qtip2b_grouped_query_schedule(&mut major, &mut minor, &mut tile_m, &mut witness)
+    };
     if rc != 0 {
         candle_core::bail!("qtip grouped tile query failed (rc={rc})");
+    }
+    if major >= 9 && witness < 900 {
+        candle_core::bail!(
+            "qtip grouped tile query: device is sm_{major}{minor} but this binary carries \
+             no SM90 device code (arch witness {witness}); the SM90 m-tile it reports \
+             could never be the one that runs. Rebuild with ARC_CUDA_ARCHS including 90."
+        );
     }
     Ok(tile_m as usize)
 }

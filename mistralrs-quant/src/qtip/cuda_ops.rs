@@ -1911,10 +1911,10 @@ pub(crate) fn grouped_gemm_2b_cuda(
     // 64, the Ampere kernel's is 16). The routing kernel bins pairs into
     // m-tiles, so route, grid bound and GEMM must all use the SAME value --
     // ask the CUDA side which one this device selected rather than assuming.
-    let (cc_major, cc_minor, tile_m) = {
-        let (mut major, mut minor, mut tile_m) = (0i32, 0i32, 0i32);
+    let (cc_major, cc_minor, tile_m, arch_witness) = {
+        let (mut major, mut minor, mut tile_m, mut witness) = (0i32, 0i32, 0i32, 0i32);
         let rc = unsafe {
-            ffi::qtip2b_grouped_query_schedule(&mut major, &mut minor, &mut tile_m)
+            ffi::qtip2b_grouped_query_schedule(&mut major, &mut minor, &mut tile_m, &mut witness)
         };
         if rc != 0 {
             candle_core::bail!(
@@ -1922,8 +1922,22 @@ pub(crate) fn grouped_gemm_2b_cuda(
                  capability (rc={rc}); refusing to guess a tile schedule"
             );
         }
-        (major, minor, tile_m as usize)
+        (major, minor, tile_m as usize, witness)
     };
+    // D18 #12. `cc_major` says what the DEVICE is; `arch_witness` says what
+    // this BINARY contains. When they disagree the dispatch below still takes
+    // the SM90 branch, into a kernel whose body was compiled out -- it writes
+    // nothing, `cudaGetLastError` returns success, and the caller gets the
+    // `alloc_zeros` buffer as a valid all-zero MoE layer. Refuse instead.
+    if cc_major >= 9 && arch_witness < 900 {
+        candle_core::bail!(
+            "qtip2b grouped gemm CUDA: running on sm_{cc_major}{cc_minor}, but this \
+             binary carries no SM90 device code (arch witness reports {arch_witness}) \
+             -- the warpgroup kernel body was compiled out, so launching it would \
+             have produced an all-zero MoE layer with no error. Rebuild with \
+             ARC_CUDA_ARCHS including 90 (see the arc-target crate)."
+        );
+    }
     // Mechanical gate against the two definitions drifting apart: a mismatch
     // here would mis-bin the tile map and produce wrong numbers, not an error.
     if tile_m != grouped_tile_m_for_cc(cc_major) {
