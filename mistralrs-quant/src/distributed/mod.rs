@@ -1278,3 +1278,92 @@ mod collective_correctness_tests {
         assert_ne!(dropped, slots.iter().sum::<f64>());
     }
 }
+
+#[cfg(test)]
+mod dummy_comm_pinning_tests {
+    use super::*;
+    use candle_core::Device;
+
+    /// 🔑 **`DummyComm` must report world size 1 no matter what it was built
+    /// with, and this is load-bearing rather than cosmetic.**
+    ///
+    /// `dummy_ops::SumAllReduce::sum_all_reduce` is `Ok(xs.clone())` — a
+    /// silent no-op. Under expert parallelism each rank computes only the
+    /// partial sum of the experts it owns, so a no-op "all-reduce" yields a
+    /// model that is fluent and **wrong**, with nothing downstream to catch it.
+    ///
+    /// The only thing standing between a mis-built binary (no `nccl` feature,
+    /// launched with 2 ranks) and that outcome is
+    /// `build_expert_parallel_plan`'s `comm.world_size() != ep_size` bail —
+    /// and that bail only fires because `DummyComm` **discards** the
+    /// `rank`/`world_size` it was constructed with and hardcodes `0`/`1`.
+    ///
+    /// That discard reads like a bug. Someone will eventually "fix" it to
+    /// honour its constructor arguments, which is exactly the change that
+    /// re-arms the no-op all-reduce — silently, because every test still
+    /// passes and the model still speaks. This test is the tripwire: make
+    /// `DummyComm` honest about its arguments and this fails, loudly, with
+    /// the reason.
+    ///
+    /// See `MoEExperts::forward` (`if self.world_size > 1 { all_reduce }`) and
+    /// `deepseek4::build_expert_parallel_plan`.
+    #[test]
+    fn dummy_comm_pins_world_size_to_one_so_the_no_op_all_reduce_is_unreachable() {
+        for (rank, world_size) in [(0, 1), (1, 2), (3, 8), (7, 64)] {
+            let comm = Comm::from_device(Id::Dummy, &Device::Cpu, rank, world_size)
+                .expect("a dummy comm constructs on CPU");
+
+            assert_eq!(
+                comm.world_size(),
+                1,
+                "DummyComm reported world_size {} when built with {world_size}. Its \
+                 `sum_all_reduce` is `Ok(xs.clone())`, so any world_size > 1 makes the \
+                 expert-parallel combine a SILENT NO-OP and every rank serves a partial \
+                 sum as if it were the whole. The `ep_size != world_size` bail in \
+                 `build_expert_parallel_plan` depends on this staying 1.",
+                comm.world_size()
+            );
+            assert_eq!(
+                comm.rank(),
+                0,
+                "DummyComm reported rank {} when built with {rank}; a non-zero rank on a \
+                 comm that cannot communicate would let a rank select an expert shard it \
+                 will never be able to combine.",
+                comm.rank()
+            );
+        }
+    }
+
+    /// The consequence, stated as the arithmetic rather than as a comment: a
+    /// no-op combine returns one rank's partial sum, which is finite,
+    /// plausible, and missing terms — the same shape as the ring bug above.
+    ///
+    /// This is what the `world_size != ep_size` bail is protecting against, so
+    /// it is asserted rather than described.
+    #[test]
+    fn a_no_op_combine_returns_a_plausible_partial_sum_not_an_error() {
+        // Two ranks, four experts, contiguous placement: rank 0 owns {0,1}.
+        let expert_out = [1.0f64, 2.0, 4.0, 8.0];
+        let owner = [0usize, 0, 1, 1];
+        let partial = |rank: usize| -> f64 {
+            expert_out
+                .iter()
+                .zip(owner.iter())
+                .filter(|(_, &o)| o == rank)
+                .map(|(v, _)| v)
+                .sum()
+        };
+
+        let correct: f64 = expert_out.iter().sum();
+        let no_op = partial(0); // what `Ok(xs.clone())` leaves rank 0 holding
+
+        assert!(
+            no_op.is_finite() && no_op > 0.0,
+            "the failure is not a NaN or a crash — that is the whole problem"
+        );
+        assert_ne!(
+            no_op, correct,
+            "a no-op all-reduce must differ from the true combine, or this test proves nothing"
+        );
+    }
+}
