@@ -124,6 +124,45 @@ fn bucket_key_of(seq: &Sequence, ragged_len: Option<usize>) -> BucketKey {
     }
 }
 
+/// How many waiting sequences may be admitted to **prefill** in one engine
+/// iteration. `None` (the default, and the historical behaviour) means "all of
+/// them", which is where head-of-line blocking comes from.
+///
+/// # Why this exists
+///
+/// A prompt step is uninterruptible: `Engine::run`'s prompt branch calls
+/// `pipeline.step(.., is_prompt = true, ..)` once, holding the pipeline mutex
+/// for the whole prefill, and every scheduled sequence goes straight from
+/// `RunningPrompt` to `RunningCompletion`. There is no partially-prefilled
+/// state — `Sequence::set_token_offset` has no callers in this tree — so a
+/// prompt cannot yield mid-flight. Admitting K prompts therefore stops decode
+/// for as long as prefilling all K takes.
+///
+/// Measured on an H200 (2026-08-17, `qtip2b`, MTP depth 3, profiler PR #113):
+/// at K=32 with 256-word prompts, **ONE prompt step took 43.2 s — 50.3% of the
+/// profiled window** — and at K=128 prefill ran ~120 s while the client
+/// received **zero tokens for 70 s**.
+///
+/// Capping admission is the *request-level* half of chunked prefill: it does
+/// not split an individual prompt (that needs the token-level cursor described
+/// in `get_prompt_input`), but it bounds how much prefill can accumulate in one
+/// uninterruptible step, so decode gets a turn between groups. It trades
+/// time-to-first-token for the last-admitted requests against decode
+/// availability for everyone already running, and **both numbers have to be
+/// reported** — see `arc-tools`.
+///
+/// Read once from `ARC_PREFILL_MAX_SEQS`; unset or `0` reproduces the previous
+/// admission exactly, expression for expression.
+fn prefill_admission_cap() -> Option<usize> {
+    static CAP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("ARC_PREFILL_MAX_SEQS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+    })
+}
+
 /// Horizon, in decode steps, over which a coalescing choice must pay for itself.
 ///
 /// See [`select_running_bucket`]. Sized as roughly one completion: a choice that
@@ -345,11 +384,21 @@ impl<Backer: FcfsBacker> DefaultScheduler<Backer> {
                 };
             }
             (_, 0) => {
-                for seq in waiting.into_iter() {
-                    seq.set_state(SequenceState::RunningPrompt);
-                    self.running.push(seq);
+                // Cold start: nothing is decoding, so nothing is starved by a
+                // large prefill — but the cap still applies, because the group
+                // admitted here is exactly the group that will be decoding when
+                // the next group arrives.
+                let cap = prefill_admission_cap().unwrap_or(usize::MAX);
+                let mut held = Backer::new();
+                for (i, seq) in waiting.into_iter().enumerate() {
+                    if i < cap {
+                        seq.set_state(SequenceState::RunningPrompt);
+                        self.running.push(seq);
+                    } else {
+                        held.add(seq);
+                    }
                 }
-                self.waiting = Backer::new();
+                self.waiting = held;
                 let running = std::mem::take(&mut self.running);
                 self.running = self.bucket_and_waitlist_seqs(running);
                 logger.set_num_running(self.running.len());
@@ -382,10 +431,19 @@ impl<Backer: FcfsBacker> DefaultScheduler<Backer> {
 
         // If the waiting sequence will fit, add it. Otherwise remove it
         let mut new_waiting = Backer::new();
+        let cap = prefill_admission_cap().unwrap_or(usize::MAX);
+        let mut admitted_to_prefill = 0usize;
         for seq in waiting.into_iter() {
-            if self.sequence_fits(&running, &seq) {
-                if seq.is_waiting() {
+            // A sequence that is already running its prompt is not *newly*
+            // admitted and must not be counted against the cap, or a cohort
+            // mid-prefill would be re-queued behind itself.
+            let is_new_prefill = seq.is_waiting();
+            if self.sequence_fits(&running, &seq)
+                && (!is_new_prefill || admitted_to_prefill < cap)
+            {
+                if is_new_prefill {
                     seq.set_state(SequenceState::RunningPrompt);
+                    admitted_to_prefill += 1;
                 }
                 running.push(seq);
             } else {
