@@ -54,6 +54,33 @@ say(){ printf "[%s] %s\n" "$(date -u +%H:%M:%S)" "$*" | tee -a "$STATUS"; }
 die_env(){ say "VOID[$1] $2"; say "RESULT=VOID (environment) — not a measurement"; exit 2; }
 
 say "ladder start ref=$REF out=$OUT"
+
+# ------------------------------------------------------------------- the env
+# Source the box env BEFORE asserting on it. A non-login `runcrate ssh` shell
+# has neither cargo nor the CUDA vars on PATH, so a script that depends on its
+# caller having sourced this is a script that works for whoever wrote it and
+# fails for everyone else.
+#
+# This is not only about cargo. On this box LD_LIBRARY_PATH must carry the
+# forward-compat libcuda (/usr/local/cuda/compat): the toolkit is newer than
+# the driver, candle-kernels ships PTX only, and without compat the driver's
+# JIT fails in a way that lands in cudaGetLastError() rather than raising —
+# wrong numbers, clean exit. Sourcing it here is what makes the run trustworthy,
+# not just runnable.
+for envf in "${ARC_ENV:-}" /root/arcenv.sh "$REPO/arcenv.sh"; do
+    if [ -n "$envf" ] && [ -f "$envf" ]; then
+        # shellcheck disable=SC1090
+        . "$envf" && say "sourced env $envf"
+        break
+    fi
+done
+# Belt to that brace: rustup's default location, if the env file was absent.
+for c in /root/.cargo/bin "$HOME/.cargo/bin"; do
+    case ":$PATH:" in *":$c:"*) : ;; *) [ -d "$c" ] && export PATH="$c:$PATH" ;; esac
+done
+say "cargo=$(command -v cargo || echo MISSING) nvcc=$(command -v nvcc || echo MISSING)"
+say "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-unset}"
+
 # Assert the tools exist BEFORE taking the lock or building. A launcher that
 # prints a PID for a missing script is not a launch, and the only trace is one
 # line in a log nobody tails — the same shape as a server that never started.
@@ -97,11 +124,9 @@ fi
 export CARGO_TARGET_DIR="$WT/target-ladder"
 BIN="$CARGO_TARGET_DIR/release/mistralrs"
 
-# shellcheck disable=SC1091
-. /root/arcenv.sh 2>/dev/null
-if [ -f "$REPO/arc-tools/gpu_box_preflight.sh" ]; then
-    . "$REPO/arc-tools/gpu_box_preflight.sh" --quick >>"$STATUS" 2>&1
-fi
+for pf in "$REPO/arc-tools/gpu_box_preflight.sh" /root/arc-tools/gpu_box_preflight.sh; do
+    [ -f "$pf" ] && { . "$pf" --quick >>"$STATUS" 2>&1; say "preflight $pf rc=$?"; break; }
+done
 
 say "building $SHORT (private target dir)"
 t0=$SECONDS
@@ -160,10 +185,32 @@ run_config(){
     # worktree. The worktree is checked out at $REF — the code under test —
     # and the measurement tool is not part of what is being measured. Reading
     # it from $WT would also simply fail whenever $REF predates the tool.
+    # ---- RESOLVED STATE, read back from the server, not from our own flags ----
+    # `--paged-attn auto` and an unset PAGED_CACHE_TYPE both resolve inside the
+    # loader, so what we passed on the command line is not what is running. The
+    # leading candidate for the session-8 cliff is TurboQuant KV + paged-on +
+    # no prefix caching on a model whose loader reports supports_paged_attention
+    # = false; that claim is only checkable against what the pipeline actually
+    # resolved. Stamped on every row so a slow cell carries its mechanism.
+    local kv paged pfx ctx state
+    kv="$(grep -m1 -oE "PagedAttention KV cache type is [A-Za-z0-9_:]+" "$slog" | awk "{print \$NF}")"
+    ctx="$(grep -m1 -oE "available context length is [0-9]+" "$slog" | awk "{print \$NF}")"
+    if grep -q "Using PagedAttention with block size" "$slog"; then paged=on; else paged=off; fi
+    if grep -q "Prefix caching enabled (block-level, PagedAttention)" "$slog"; then
+        pfx=block
+    elif grep -q "Prefix caching enabled (radix tree" "$slog"; then
+        pfx=radix
+    else
+        pfx=none
+    fi
+    state="kv=${kv:-none};paged=${paged};prefix=${pfx};ctx=${ctx:-na}"
+    say "  resolved[$label] $state"
+
     python3 "$PROBE" \
         --base-url "http://127.0.0.1:$PORT" \
         --words "$WORDS" --batches "$BATCHES" \
         --cell-timeout "$CELL_TIMEOUT" --config "$label" \
+        --state "$state" --revision "$logged" \
         --tsv "$OUT/ladder_$label.tsv" 2>&1 | tee -a "$STATUS"
 
     say "  config[$label] server faults: cublas=$(grep -c CublasError "$slog") illegal=$(grep -c ILLEGAL_ADDRESS "$slog") panics=$(grep -c panicked "$slog")"

@@ -130,6 +130,14 @@ def main():
                          "dropped; session 8's headline was 386 s")
     ap.add_argument("--config", default="unknown",
                     help="label for this server configuration, e.g. pagedon")
+    ap.add_argument("--state", default="unknown",
+                    help="RESOLVED runtime state read back from the server's own "
+                         "startup log (kv cache type, paged on/off, prefix "
+                         "caching). Stamped on every row so a slow cell carries "
+                         "the mechanism next to it instead of a correlation.")
+    ap.add_argument("--revision", default="unknown",
+                    help="git revision the SERVER logged. Recorded per row so a "
+                         "build difference is attributable rather than assumed.")
     ap.add_argument("--tsv", default=None)
     args = ap.parse_args()
 
@@ -138,7 +146,8 @@ def main():
     batches = [int(b) for b in args.batches.split(",") if b.strip()]
 
     rows = []
-    hdr = ("config\twords\tB\tstatus\twall_s\tok\tfailed\tpeak_mib\tfirst_error")
+    hdr = ("config\trevision\twords\tB\tstatus\twall_s\tok\tfailed\tpeak_mib\t"
+           "resolved_state\tfirst_error")
     print(hdr)
     for bsz in batches:
         consecutive_timeouts = 0
@@ -146,26 +155,28 @@ def main():
             r = run_cell(url, w, bsz, args)
             r["config"] = args.config
             rows.append(r)
-            print(f"{args.config}\t{r['words']}\t{r['B']}\t{r['status']}\t"
-                  f"{r['wall_s']}\t{r['ok']}\t{r['failed']}\t"
-                  f"{r['peak_mib']}\t{r['first_error']}", flush=True)
+            print(f"{args.config}\t{args.revision}\t{r['words']}\t{r['B']}\t"
+                  f"{r['status']}\t{r['wall_s']}\t{r['ok']}\t{r['failed']}\t"
+                  f"{r['peak_mib']}\t{args.state}\t{r['first_error']}",
+                  flush=True)
             if r["status"] == "TIMEOUT":
                 consecutive_timeouts += 1
             else:
                 consecutive_timeouts = 0
             if consecutive_timeouts >= 2:
-                print(f"{args.config}\t-\t{bsz}\tABORTED_ROW\t-\t-\t-\t-\t"
-                      f"two consecutive timeouts; remaining words skipped to "
-                      f"bound rental cost", flush=True)
+                print(f"{args.config}\t{args.revision}\t-\t{bsz}\tABORTED_ROW\t"
+                      f"-\t-\t-\t-\t{args.state}\ttwo consecutive timeouts; "
+                      f"remaining words skipped to bound rental cost",
+                      flush=True)
                 break
 
     if args.tsv:
         with open(args.tsv, "w") as f:
             f.write(hdr + "\n")
             for r in rows:
-                f.write(f"{r['config']}\t{r['words']}\t{r['B']}\t{r['status']}\t"
-                        f"{r['wall_s']}\t{r['ok']}\t{r['failed']}\t"
-                        f"{r['peak_mib']}\t{r['first_error']}\n")
+                f.write(f"{r['config']}\t{args.revision}\t{r['words']}\t{r['B']}\t"
+                        f"{r['status']}\t{r['wall_s']}\t{r['ok']}\t{r['failed']}\t"
+                        f"{r['peak_mib']}\t{args.state}\t{r['first_error']}\n")
     return 0
 
 
