@@ -363,9 +363,16 @@ jobs:
       - name: Per-arch nvcc probe (diagnostic — names the failing pair)
         run: |
           set -uo pipefail
-          for arch in sm_80 sm_90a sm_100a sm_103a; do
+          # The explicit `-gencode` form, NOT `-arch=sm_90a`. That shorthand was
+          # accepted without complaint and then emitted a `compute_90`
+          # intermediate (see the wgmma probe, same day), so this diagnostic
+          # would have printed "OK sm_90a" for a file it had compiled as
+          # sm_90 — a false OK, from the step added to catch a false failure.
+          # Verification code is not exempt.
+          for pair in "compute_80:sm_80" "compute_90a:sm_90a" "compute_100a:sm_100a" "compute_103a:sm_103a"; do
+            arch=${pair##*:}
             for f in arc-cuda-graph/src/cuda/*.cu arc-cuda-graph/src/cuda/flashmlasparse/*.cu; do
-              if out=$(nvcc -arch=$arch -std=c++17 -O3 \
+              if out=$(nvcc -gencode "arch=${pair%%:*},code=$arch" -std=c++17 -O3 \
                     -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__ \
                     -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__ \
                     -Xcompiler -fPIC \
