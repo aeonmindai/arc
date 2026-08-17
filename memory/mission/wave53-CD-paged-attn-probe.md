@@ -400,7 +400,30 @@ non-paged* qtip2b server panic twice mid-run with
 engine and turning 34 GSM8K items into `finish_reason: "error"`. A crash of that
 signature in **either** leg is the known bug, not this flag.
 
-<!-- RESULT -->
+### 8a. RUN A — flag OFF (the control)
+
+Loaded **cold in ~90 s** (00:19:03 serve → `Dummy run completed in 2.097s` →
+`Server listening on http://0.0.0.0:1234` at 00:20:37), no `Applying ISQ` in the
+log, `Auto-discovered 8 UQFF shard files`. Decode **10.60 tok/s at b=1**.
+
+```
+[off] p0 tok=3  fin=stop :: 'Paris.'
+[off] p1 tok=36 fin=stop :: 'Memory bandwidth is critical for LLM inference because it
+                             determines how quickly model parameters can be loaded from
+                             memory to compute each token, directly limiting throughput
+                             and latency when processing large models.'
+[off] p2 tok=14 fin=stop :: '2, 3, 5, 7, 11'
+```
+
+All three EOS-terminated, all three correct. This is a healthy control — and
+incidentally the first clean qtip2b serve recorded on an **80 GB** card, which
+the runbook had ruled out for this artifact.
+
+Benign warnings present in both legs, already known: `toktrie_hf_tokenizers:
+missing char: ｜`, and `GPU radix top-k sampling failed; falling back to CPU:
+tensor_device_ptr: unsupported dtype I32`.
+
+<!-- RESULT B -->
 
 
 ---
