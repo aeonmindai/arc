@@ -118,6 +118,22 @@ impl std::error::Error for DenseShapeError {}
 /// Pure, and deliberately not CUDA-gated, so the contract is unit-testable on
 /// any host — including the macOS dev machines where `cargo check` does not
 /// type-check CUDA-gated code at all.
+///
+/// # Honest limits — what this does NOT check
+///
+/// It sees only the layer *tags*, so it verifies counts and grouping, not
+/// **order**. A model contributing exactly seven projections per layer in some
+/// order other than `q, k, v, o, gate, up, down` passes here and is still
+/// mis-assigned downstream. Nothing available at this boundary distinguishes
+/// them; catching that needs per-projection identity, which `get_layers()` does
+/// not carry.
+///
+/// The check is therefore **necessary, not sufficient** — it is a cheap refusal
+/// of the architectures that are obviously not describable (MoE, MLA, auxiliary
+/// heads, non-Llama MLPs), not a proof that a passing model is correct. It is
+/// still a strict improvement: every model it refuses was already being
+/// silently mis-indexed by the positional reads below, because seven-per-layer
+/// is exactly what those reads assume.
 pub fn check_dense_layer_inventory(
     tags: &[Option<usize>],
     num_layers: usize,
