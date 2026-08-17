@@ -3745,7 +3745,11 @@ impl DeepSeekV4 {
                 xs_hist_slots.push(None);
             }
         }
-        let cache = NormalCache::new(cfg.num_hidden_layers, cfg.max_position_embeddings);
+        // `new_plain`, not `new`: V4's fused-MQA layout stores a 1-wide marker
+        // in the V half of every slot (see `V4_V_MARKER_WIDTH`), which
+        // `require_normal_kv_slot` enforces. An ambient TurboQuant setting must
+        // not turn these into compressed slots.
+        let cache = NormalCache::new_plain(cfg.num_hidden_layers, cfg.max_position_embeddings);
         {
             let mut guard = cache.lock().unwrap();
             for ratio in compress_ratios_in_order {
@@ -7045,7 +7049,9 @@ mod tests {
         head_dim: usize,
         max_pos: usize,
     ) -> EitherCache {
-        let cache = NormalCache::new(n_kv, max_pos);
+        // `new_plain`: see the note on the other V4 cache constructor — the
+        // V-marker layout requires `KvCache::Normal` slots.
+        let cache = NormalCache::new_plain(n_kv, max_pos);
         {
             let mut guard = cache.lock().unwrap();
             for &(ratio, span_groups) in compressed {
