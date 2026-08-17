@@ -613,6 +613,17 @@ impl BatchSrc {
 /// The dead prefix does **not** grow without bound: `lead_pad_i` is
 /// `max_j L_j - L_i`, and sequences in one batch accept at statistically the
 /// same rate, so the spread is a `sqrt(steps)` random walk, not a linear one.
+///
+/// ⚠️ That last sentence is only true if the prefix is **taken back out** on
+/// the way to the per-sequence caches. `current_seq_len` here counts the dead
+/// columns as live (it has to — this is where the shared append offset comes
+/// from), so a caller that records this length as the sequence's own makes the
+/// next `front_align_batch` pad relative to an already-padded length and the
+/// prefix accumulates **linearly**. [`drop_dead_prefix`] is the inverse that
+/// keeps the claim honest, and
+/// `MtpSpeculativePipeline::step`'s per-sequence commit is the caller that
+/// applies it. `the_dead_prefix_does_not_accumulate_across_steps` pins the
+/// difference, with the un-stripped variant as its negative control.
 fn front_pad_single(sc: &mut SingleCache, target_len: usize) -> Result<usize> {
     let live = sc.current_seq_len;
     if target_len < live {
@@ -683,6 +694,73 @@ pub(crate) fn front_pad_kv_cache(cache: &mut KvCache, target_len: usize) -> Resu
         "the two halves of one slot describe the same positions"
     );
     Ok(lead_k)
+}
+
+/// Drop the `lead` dead columns [`front_pad_single`] put ahead of one
+/// `SingleCache`'s live run, so the run is left-anchored at column 0 again and
+/// `current_seq_len` counts only positions that hold real K/V.
+fn drop_front_single(sc: &mut SingleCache, lead: usize) -> Result<()> {
+    if lead == 0 {
+        return Ok(());
+    }
+    if lead > sc.current_seq_len {
+        candle_core::bail!(
+            "kv-cache: cannot drop a {lead}-column dead prefix from a slot that holds only {} \
+             position(s) — the caller's idea of this row's padding and the slot's own length \
+             disagree",
+            sc.current_seq_len
+        );
+    }
+    let Some(ad) = sc.all_data.as_ref() else {
+        candle_core::bail!("kv-cache: drop_dead_prefix on a slot whose buffer is not materialised");
+    };
+    let have = ad.dims()[sc.dim];
+    if have < sc.current_seq_len {
+        candle_core::bail!(
+            "kv-cache: slot claims {} live position(s) but its buffer is only {have} wide",
+            sc.current_seq_len
+        );
+    }
+    let kept = have - lead;
+    sc.all_data = Some(ad.narrow(sc.dim, lead, kept)?.contiguous()?);
+    sc.capacity_seq_len = kept;
+    sc.current_seq_len -= lead;
+    Ok(())
+}
+
+/// The inverse of [`front_pad_kv_cache`]: take a row's dead prefix back out
+/// once the dense batched forward that needed it is over.
+///
+/// 🔑 This is what stops the prefix from accumulating. Left-alignment is the
+/// only way a ragged cohort can share one append offset, but the length it
+/// leaves behind (`lead + live`) is not the sequence's own length. Recording
+/// *that* as the per-sequence length makes the next `front_align_batch` pad
+/// relative to it, so every step adds another `max_j c_j - c_i` columns and the
+/// buffer grows linearly in steps rather than tracking the `sqrt(steps)` spread
+/// of the sequences themselves. Stripping the prefix restores the invariant
+/// every other part of the cache assumes — that a slot's live run starts at
+/// column 0 — which is exactly what `front_pad_single`'s `narrow(dim, 0, live)`
+/// requires the next time round.
+///
+/// `lead == 0` (every B=1 request, every uniform batch) is a no-op that touches
+/// no tensor. An `XsRolling` slot is likewise untouched: `front_pad_kv_cache`
+/// never gave it a prefix — its compressed rows are start-anchored and its raw
+/// window is re-anchored per row by `XsRollingCache::split_row`.
+pub(crate) fn drop_dead_prefix(cache: &mut KvCache, lead: usize) -> Result<()> {
+    if matches!(cache, KvCache::XsRolling(_)) || lead == 0 {
+        return Ok(());
+    }
+    let KvCache::Normal { k, v } = cache else {
+        candle_core::bail!(
+            "kv-cache: drop_dead_prefix is only defined for a `Normal` slot; this one is a `{}`. \
+             Nothing front-pads it, so nothing should be stripping it either. See \
+             `KvCache::supports_per_sequence_len`.",
+            cache.kind_name()
+        );
+    };
+    drop_front_single(k, lead)?;
+    drop_front_single(v, lead)?;
+    Ok(())
 }
 
 /// Left-align a whole ragged cohort so every sequence's live K/V ends at the
@@ -2110,6 +2188,153 @@ mod clone_in_cache_invariant_tests {
                 assert_eq!(slot.current_seq_len(), 8);
             }
         }
+    }
+
+    /// 🔑 The inverse round-trip. Front padding then stripping must return the
+    /// slot to exactly what it was — same rows, same length — because that is
+    /// the only reason a per-sequence length recorded after a dense batched
+    /// forward means what it says.
+    #[test]
+    fn dropping_the_dead_prefix_inverts_front_pad() {
+        let mut slot = materialised_slot(5, 16, 100.0);
+        let before = rows(&slot)[..5].to_vec();
+        let lead = front_pad_kv_cache(&mut slot, 9).unwrap();
+        assert_eq!(lead, 4);
+        drop_dead_prefix(&mut slot, lead).unwrap();
+        assert_eq!(
+            slot.current_seq_len(),
+            5,
+            "after the strip the slot's length is its OWN live run again, not the batch's width"
+        );
+        assert_eq!(
+            rows(&slot)[..5],
+            before[..],
+            "the live run must survive the round trip bit-for-bit"
+        );
+    }
+
+    /// 🔴 The claim `front_pad_single`'s doc makes — that the dead prefix
+    /// tracks the `sqrt(steps)` spread of the sequences rather than growing
+    /// linearly — is a property of the code, not of the batch. It holds only
+    /// because the prefix is stripped on the way out.
+    ///
+    /// The fixture is a two-row cohort that diverges by a fixed 2 positions
+    /// every step, which is the *worst* case for the spread and still must not
+    /// compound. The negative control is the same loop with the strip removed:
+    /// that is the pre-change behaviour, and it grows without bound.
+    ///
+    /// ⚠️ Arithmetic on real tensors, not a hardware measurement (D14).
+    #[test]
+    fn the_dead_prefix_does_not_accumulate_across_steps() {
+        // One "step": pad both rows up to the batch max, pretend the forward
+        // appended `w`, keep `commit` of it, then (optionally) strip.
+        let run = |strip: bool, steps: usize| -> (Vec<usize>, Vec<Vec<f32>>) {
+            let w = 4usize;
+            let mut slots = [
+                materialised_slot(4, 512, 1.0),
+                materialised_slot(4, 512, 2.0),
+            ];
+            let commits = [3usize, 1];
+            for _ in 0..steps {
+                let target = slots
+                    .iter()
+                    .map(|s| s.current_seq_len())
+                    .max()
+                    .expect("two slots");
+                let leads: Vec<usize> = slots
+                    .iter_mut()
+                    .map(|s| front_pad_kv_cache(s, target).unwrap())
+                    .collect();
+                for (i, slot) in slots.iter_mut().enumerate() {
+                    // The batched forward writes `w` new positions for every row.
+                    slot.set_len(target + w).unwrap();
+                    if strip {
+                        drop_dead_prefix(slot, leads[i]).unwrap();
+                        // The slot's OWN length after the strip, deliberately
+                        // not recomputed here: `target + w - lead`. Deriving it
+                        // in the test instead would let a strip that moves no
+                        // data and updates no length still look right.
+                        let live = slot.current_seq_len() - w;
+                        slot.set_len(live + commits[i]).unwrap();
+                    } else {
+                        slot.set_len(target + commits[i]).unwrap();
+                    }
+                }
+            }
+            (
+                slots.iter().map(|s| s.current_seq_len()).collect(),
+                slots.iter().map(|s| rows(s)[..4].to_vec()).collect(),
+            )
+        };
+
+        // 4 committed to start, then `n` steps of 3 and 1 accepted tokens. The
+        // slow row's true length is `4 + n`; anything above that is padding
+        // being counted as content.
+        for n in [6usize, 12] {
+            let (lens, heads) = run(true, n);
+            assert_eq!(
+                lens,
+                vec![4 + n * 3, 4 + n],
+                "with the strip, each row's recorded length is exactly the tokens it committed"
+            );
+            assert_eq!(
+                heads,
+                vec![vec![1.0, 2.0, 3.0, 4.0], vec![2.0, 3.0, 4.0, 5.0]],
+                "and the live run is back at column 0 holding its own K/V — the pad/strip pair \
+                 has to be an identity on content, or the length is right about the wrong rows"
+            );
+        }
+        // Negative control — the pre-change behaviour. The error is the slow
+        // row's recorded length minus its true one, and it must grow with the
+        // step count rather than settling.
+        let err_at = |n: usize| run(false, n).0[1] - (4 + n);
+        assert_eq!(
+            (err_at(6), err_at(12)),
+            (10, 22),
+            "without the strip the slow row is inflated, and doubling the steps must roughly \
+             double the inflation — that is the linear accumulation, not a `sqrt(steps)` spread"
+        );
+        assert!(
+            err_at(12) >= 2 * err_at(6) - 2,
+            "the inflation must scale with the step count, not saturate"
+        );
+    }
+
+    /// A strip wider than the live run means the caller's per-row padding and
+    /// the slot disagree. Silently clamping would leave the sequence reading
+    /// another row's K/V, so it refuses by name (D18).
+    #[test]
+    fn dropping_more_dead_prefix_than_the_slot_holds_is_refused() {
+        let mut slot = materialised_slot(5, 16, 1.0);
+        let err = drop_dead_prefix(&mut slot, 6).unwrap_err().to_string();
+        assert!(
+            err.contains("dead prefix") && err.contains("disagree"),
+            "the refusal must say whose bookkeeping disagrees; got {err}"
+        );
+    }
+
+    /// A zero-width strip is the B=1 path and the uniform-batch path. It must
+    /// not reallocate or perturb anything.
+    #[test]
+    fn dropping_a_zero_width_dead_prefix_is_a_no_op() {
+        let mut slot = materialised_slot(7, 16, 3.0);
+        let before = rows(&slot);
+        drop_dead_prefix(&mut slot, 0).unwrap();
+        assert_eq!(rows(&slot), before);
+        assert_eq!(slot.current_seq_len(), 7);
+    }
+
+    /// The compressor slot is never front-padded, so it must never be
+    /// stripped either — its per-row token counts are the state the whole
+    /// path exists to carry.
+    #[test]
+    fn dropping_the_dead_prefix_leaves_an_xs_slot_untouched() {
+        xs_rolling::test_override::with(true, || {
+            let mut xs = KvCache::XsRolling(Box::new(XsRollingCache::new(4, 2, 64, 2048)));
+            let before = xs.current_seq_len();
+            drop_dead_prefix(&mut xs, 3).unwrap();
+            assert_eq!(xs.current_seq_len(), before);
+        });
     }
 
     /// With `ARC_V4_XS_PER_SEQ` off the slot that blocks DeepSeek V4 refuses

@@ -437,6 +437,21 @@ pub struct Sequence {
 
     // Prefix caching
     prefill_prompt_toks: Option<Vec<u32>>,
+    /// This sequence's OWN absolute position for the first token of
+    /// [`Self::prefill_prompt_toks`], when the batch it is in does not share
+    /// one.
+    ///
+    /// `None` — always, unless a caller set it with
+    /// [`Self::set_prefill_toks_at`] — means the batch shares
+    /// `input_seqs[0].token_offset()`, which is what every path did before and
+    /// still does. It exists because a left-aligned ragged cohort
+    /// ([`crate::kv_cache::front_align_batch`]) has no shared offset to collapse
+    /// to: row `i`'s queries start at its own committed KV length, and RoPE and
+    /// DeepSeek V4's per-row `row_q0` both read that from `seqlen_offsets`.
+    ///
+    /// Cleared by [`Self::reset_prefill_toks`] together with the window itself,
+    /// so an offset can never outlive the tokens it describes.
+    prefill_seqlen_offset: Option<usize>,
     /// Number of tokens at the start of the prompt that are cached (KV already computed).
     /// These tokens should be skipped during prefill.
     prefix_cache_len: usize,
@@ -575,6 +590,7 @@ impl Sequence {
             creation_time,
             recognizer,
             prefill_prompt_toks: None,
+            prefill_seqlen_offset: None,
             prefix_cache_len: 0,
             suffix,
             prefix,
@@ -847,9 +863,28 @@ impl Sequence {
         self.prefill_prompt_toks = Some(toks)
     }
 
+    /// [`Self::set_prefill_toks`] for a sequence whose batch has **no shared**
+    /// absolute position: `offset` is this row's own, and it replaces the
+    /// batch-wide `token_offset` in `seqlen_offsets`.
+    ///
+    /// Only the fused MTP step's left-aligned ragged path calls this. Every
+    /// other caller uses [`Self::set_prefill_toks`] and leaves the offset
+    /// `None`, which is the pre-change behaviour verbatim — see
+    /// `inputs_processor::resolve_row_offsets`, where the dispatch lives.
+    pub fn set_prefill_toks_at(&mut self, toks: Vec<u32>, offset: usize) {
+        self.prefill_prompt_toks = Some(toks);
+        self.prefill_seqlen_offset = Some(offset);
+    }
+
+    /// This row's own absolute position for its prefill window, if it has one.
+    pub fn prefill_seqlen_offset(&self) -> Option<usize> {
+        self.prefill_seqlen_offset
+    }
+
     /// Remove the prefill tokens.
     pub fn reset_prefill_toks(&mut self) {
-        self.prefill_prompt_toks = None
+        self.prefill_prompt_toks = None;
+        self.prefill_seqlen_offset = None;
     }
 
     /// Internal api to add one raw token.

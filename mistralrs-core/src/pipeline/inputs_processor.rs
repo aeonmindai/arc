@@ -188,8 +188,36 @@ pub mod text_models_inputs_processor {
         pub seq_indices: Vec<usize>,
     }
 
+    /// The per-row absolute offsets a batch needs, or `None` when it shares
+    /// one — which is every batch except the fused MTP step's left-aligned
+    /// ragged cohort.
+    ///
+    /// 🔑 Returning `None` for a batch that shares an offset is a **dispatch,
+    /// not an optimisation**: `None` sends [`make_prompt_chunk`] down the
+    /// pre-change scalar code verbatim, so every prompt, every decode and every
+    /// batch built with per-sequence KV advance off produces the characters it
+    /// always did. Split out as its own function for the reason PR #100's
+    /// `resolve_ragged_rows` was: the two branches agree exactly on their
+    /// common domain, so no numeric test can tell you which one ran, and a
+    /// mutation that routes a uniform batch down the per-row path is invisible
+    /// to everything except a test of the dispatch itself.
+    pub(crate) fn resolve_row_offsets(
+        per_seq: &[Option<usize>],
+        shared: usize,
+    ) -> Option<Vec<usize>> {
+        if !per_seq.iter().any(Option::is_some) {
+            return None;
+        }
+        Some(per_seq.iter().map(|o| o.unwrap_or(shared)).collect())
+    }
+
     // chunk_offset_toks is the number of tokens by which the tokens are offset,
     // chunk_offset_toks / prompt_chunksize = number of batches
+    //
+    // row_offsets: when provided, replaces `chunk_offset_toks` per sequence —
+    // the batch is a left-aligned ragged cohort with no shared absolute
+    // position (see `resolve_row_offsets`). `None` is the shared-offset path
+    // and is bit-for-bit what it always was.
     //
     // prefix_cache_lens: when provided, indicates how many tokens per sequence are already
     // cached in the paged KV cache. Only new (non-cached) tokens will be included in the
@@ -206,7 +234,17 @@ pub mod text_models_inputs_processor {
         mut paged_attn_metadata: Option<&mut PagedAttentionMeta>,
         mapper: Option<&dyn DeviceMapper>,
         prefix_cache_lens: Option<&[usize]>,
+        row_offsets: Option<&[usize]>,
     ) -> Result<InputMetadata> {
+        if let Some(offsets) = row_offsets {
+            if offsets.len() != seq_ids.len() {
+                anyhow::bail!(
+                    "inputs processor: {} per-row absolute offsets for a batch of {}",
+                    offsets.len(),
+                    seq_ids.len()
+                );
+            }
+        }
         // Determine effective tokens per sequence after prefix cache trimming
         let effective_lens: Vec<usize> = toks
             .iter()
@@ -234,6 +272,9 @@ pub mod text_models_inputs_processor {
         let has_any_cache_hit = prefix_cache_lens.is_some_and(|lens| lens.iter().any(|&l| l > 0));
         for (seq_idx, (seq_id, ctxt)) in seq_ids.iter().zip(&toks).enumerate() {
             let cached = prefix_cache_lens.map_or(0, |lens| lens[seq_idx]);
+            // This row's own absolute start, which is the shared
+            // `chunk_offset_toks` for every batch that has one.
+            let chunk_offset_toks = row_offsets.map_or(chunk_offset_toks, |o| o[seq_idx]);
             let full_prompt_len = ctxt.len();
             // The new (non-cached) tokens to process
             let new_toks = &ctxt[cached..];
@@ -838,6 +879,15 @@ pub mod text_models_inputs_processor {
         mapper: Option<&dyn DeviceMapper>,
     ) -> Result<InnerInputProcessorOutput> {
         let offset = input_seqs[0].token_offset();
+        // A left-aligned ragged cohort has no shared absolute position, so each
+        // row carries its own. `None` — every other batch — keeps `offset`.
+        let row_offsets = resolve_row_offsets(
+            &input_seqs
+                .iter()
+                .map(|s| s.prefill_seqlen_offset())
+                .collect::<Vec<_>>(),
+            offset,
+        );
         // Collect prefix cache lens when paged attention is in use
         let prefix_cache_lens: Vec<usize> =
             input_seqs.iter().map(|s| s.prefix_cache_len()).collect();
@@ -856,6 +906,7 @@ pub mod text_models_inputs_processor {
             } else {
                 None
             },
+            row_offsets.as_deref(),
         )
         .map(|inputs| InnerInputProcessorOutput {
             inputs,
@@ -1134,6 +1185,112 @@ pub mod text_models_inputs_processor {
 
         fn get_type(&self) -> InputsProcessorType {
             InputsProcessorType::Text
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{make_prompt_chunk, resolve_row_offsets};
+        use crate::device_map::DummyDeviceMapper;
+        use candle_core::Device;
+
+        /// 🔑 The wire itself: what the model actually receives. `positions` is
+        /// `seqlen_offsets`, which is where RoPE places each row's queries and —
+        /// on DeepSeek V4 — the per-row `row_q0` that masks a left-aligned
+        /// cohort. A per-row vector in must produce a per-row vector out.
+        #[test]
+        fn per_row_offsets_reach_seqlen_offsets_and_a_shared_one_still_does_not() {
+            let mapper = DummyDeviceMapper {
+                nm_device: Device::Cpu,
+            };
+            let window: Vec<u32> = vec![7, 8, 9, 10];
+            let toks: Vec<&[u32]> = vec![&window, &window, &window];
+            let run = |row_offsets: Option<&[usize]>, shared: usize| -> Vec<usize> {
+                make_prompt_chunk(
+                    shared,
+                    toks.clone(),
+                    &[0, 1, 2],
+                    &Device::Cpu,
+                    Some((window.len(), 0)),
+                    false,
+                    None,
+                    Some(&mapper),
+                    None,
+                    row_offsets,
+                )
+                .unwrap()
+                .positions
+            };
+
+            assert_eq!(
+                run(None, 40),
+                vec![40, 40, 40],
+                "with no per-row offsets the batch shares one, exactly as it always did"
+            );
+            assert_eq!(
+                run(Some(&[40, 33, 37]), 40),
+                vec![40, 33, 37],
+                "each row's own absolute position must survive to `seqlen_offsets`"
+            );
+        }
+
+        /// A per-row vector that does not describe this batch is a caller bug
+        /// that would silently mis-place two rows' queries. It refuses.
+        #[test]
+        fn a_per_row_offset_vector_of_the_wrong_width_is_refused() {
+            let mapper = DummyDeviceMapper {
+                nm_device: Device::Cpu,
+            };
+            let window: Vec<u32> = vec![7, 8];
+            let err = make_prompt_chunk(
+                0,
+                vec![&window, &window, &window],
+                &[0, 1, 2],
+                &Device::Cpu,
+                Some((2, 0)),
+                false,
+                None,
+                Some(&mapper),
+                None,
+                Some(&[1, 2]),
+            )
+            .err()
+            .expect("a per-row vector that does not describe this batch must be refused")
+            .to_string();
+            assert!(
+                err.contains("per-row absolute offsets") && err.contains("batch of 3"),
+                "the refusal must name both widths; got {err}"
+            );
+        }
+
+        /// 🔑 The dispatch, pinned directly. Every batch that has ever existed
+        /// carries no per-row override, and must return `None` — because `None`
+        /// is what runs `make_prompt_chunk`'s pre-change scalar code verbatim.
+        ///
+        /// ⚠️ Routing a batch that happens to agree down the per-row path is
+        /// **numerically invisible** (the vector would be the shared offset
+        /// repeated), so only a test of the dispatch itself can see that
+        /// mutation. Same trap PR #100 documented for `resolve_ragged_rows`.
+        #[test]
+        fn a_batch_with_no_per_row_offset_takes_the_shared_path() {
+            assert_eq!(resolve_row_offsets(&[None, None, None], 17), None);
+            assert_eq!(resolve_row_offsets(&[], 17), None);
+        }
+
+        /// One row carrying its own position is enough to make the batch
+        /// per-row; the rest fall back to the shared offset rather than to zero,
+        /// which is what keeps a partially-overridden batch coherent.
+        #[test]
+        fn a_row_with_its_own_offset_makes_the_whole_batch_per_row() {
+            assert_eq!(
+                resolve_row_offsets(&[Some(40), Some(33), Some(37)], 17),
+                Some(vec![40, 33, 37])
+            );
+            assert_eq!(
+                resolve_row_offsets(&[Some(40), None], 17),
+                Some(vec![40, 17]),
+                "a row without its own offset keeps the batch's, not 0"
+            );
         }
     }
 }
