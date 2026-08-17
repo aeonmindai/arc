@@ -922,23 +922,38 @@ struct QgwArchWitness {
     int         arch;  // 900 => the warpgroup body is present in this binary
 };
 
-// One launch and one sync, once per process, on first use. A function-local
-// static's initialization is thread-safe (C++11 [stmt.dcl]/4), which matters
-// because this is reachable from every model-parallel worker at once.
+// One launch and one sync, on first use.
 //
 // It deliberately does NOT default `arch` on failure: a witness that could not
 // be taken is `status != cudaSuccess`, and the caller must refuse rather than
 // assume. "Could not answer" is not "answered yes".
 QgwArchWitness qgw_take_arch_witness() {
     QgwArchWitness w{cudaSuccess, 0};
+
+    // If the legacy stream is capturing, a launch on it is APPENDED TO A GRAPH
+    // rather than executed, and the readback below would return the memset 0 --
+    // reported as "this binary has no SM90 device code" and blocking a path
+    // that works perfectly. A false negative is still a wrong answer, so refuse
+    // to answer here and let the caller retry outside capture.
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    const cudaError_t cap_err = cudaStreamIsCapturing(0, &cap);
+    if (cap_err != cudaSuccess) {
+        w.status = cap_err;
+        return w;
+    }
+    if (cap != cudaStreamCaptureStatusNone) {
+        w.status = cudaErrorStreamCaptureUnsupported;
+        return w;
+    }
+
     int* d = nullptr;
     w.status = cudaMalloc(&d, sizeof(int));
     if (w.status != cudaSuccess) return w;
     w.status = cudaMemset(d, 0, sizeof(int));
     if (w.status == cudaSuccess) {
         qgw_arch_witness_kernel<<<1, 1>>>(d);
-        // Same D18 pairing as every launcher here: cudaDeviceSynchronize
-        // returns success for a kernel that never launched.
+        // Same D18 pairing as every launcher here: a sync returns success for
+        // a kernel that never launched, so the launch status is read too.
         const cudaError_t launch_err = cudaGetLastError();
         const cudaError_t sync_err   = cudaStreamSynchronize(0);
         w.status = (launch_err != cudaSuccess) ? launch_err : sync_err;
@@ -950,8 +965,21 @@ QgwArchWitness qgw_take_arch_witness() {
     return w;
 }
 
+// Cached only once it has actually ANSWERED. Caching a failure would be the
+// same bug in slow motion: a witness that could not be taken during graph
+// capture would poison every later call, and the path would stay refused long
+// after the condition cleared. So a non-success result is retried.
+//
+// Two threads racing the first call may both take the witness. That is benign
+// and deliberate: the probe is idempotent and its result is a deterministic
+// property of the binary, so both writes store identical bytes. The
+// alternative -- a lock on a path that runs per MoE layer -- costs more than
+// the duplicate.
 const QgwArchWitness& qgw_arch_witness() {
-    static const QgwArchWitness w = qgw_take_arch_witness();
+    static QgwArchWitness w{cudaErrorNotReady, 0};  // "not taken yet"
+    if (w.status != cudaSuccess) {
+        w = qgw_take_arch_witness();
+    }
     return w;
 }
 
