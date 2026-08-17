@@ -166,6 +166,23 @@ __device__ __forceinline__ uint64_t make_desc(const void* smem_ptr,
 // One wgmma with A from registers and B from a shared-memory descriptor.
 // Register-A halves the unknowns: if the result is wrong, the descriptor is
 // the only thing it can be.
+//
+// OPERAND ARITY IS SETTLED — 7, no `imm-trans-a`:
+//   d, a, b-desc, scale-d, imm-scale-a, imm-scale-b, imm-trans-b
+//
+// Established without a GPU on 2026-08-17 by making ptxas discriminate for us:
+//   7 operands -> "Instruction 'wgmma.mma_async with floating point types' not
+//                  supported on .target 'sm_90'"  (arguments VALIDATED; only
+//                                                  the target objected)
+//   8 operands -> "Arguments mismatch for instruction 'wgmma.mma_async'"
+//                                                 (arguments REJECTED)
+//
+// A register operand has no shared-memory layout to transpose, which is why
+// the register-A form carries no transpose immediate for A. This is what PTX
+// ISA §9.7.16.5.2 would state if its body were not truncated in the published
+// HTML. `WGMMA_HAS_TRANS_A` is kept as a build knob anyway: it is what made
+// the compiler answer, and it is how the answer gets re-checked on a toolkit
+// we have not tried.
 #define DEFINE_WGMMA_REGA(TB)                                                  \
     __device__ __forceinline__ void wgmma_m64n8k16_regA_##TB(                  \
         float (&d)[4], const uint32_t (&a)[4], uint64_t b_desc) {              \
