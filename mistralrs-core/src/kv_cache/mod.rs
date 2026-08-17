@@ -1056,6 +1056,58 @@ pub(crate) fn batch_can_be_ragged(
     })
 }
 
+/// Would [`front_align_batch`] succeed on every slot, checked **before any of
+/// them is mutated**?
+///
+/// 🔑 This exists because `front_align_batch` pads in place, sequence by
+/// sequence and slot by slot. If it bailed halfway — an unmaterialised buffer,
+/// or a row whose padded capacity would exceed its `max_seq_len` — it would
+/// return `Err` having already rewritten the rows ahead of the failure. The
+/// blanket refusal it replaced (`ensure_uniform_batch_cache_lens` first, ask
+/// questions never) mutated **nothing** on the way out, and that property is
+/// part of what makes a refusal safe: the engine can fail those requests
+/// without the surviving sequences carrying a half-aligned cache.
+///
+/// So alignment is only attempted when it is known to complete. When this
+/// returns `false` the batch falls through to the original refusal, unmutated,
+/// exactly as before.
+fn front_align_would_succeed(
+    seqs: &mut [&mut crate::sequence::Sequence],
+    modify_draft_cache: bool,
+) -> bool {
+    let mut target = 0usize;
+    for seq in seqs.iter_mut() {
+        let cache = if modify_draft_cache {
+            seq.normal_draft_cache()
+        } else {
+            seq.normal_cache()
+        };
+        for slot in cache.iter().flatten() {
+            target = target.max(slot.current_seq_len());
+        }
+    }
+    seqs.iter_mut().all(|seq| {
+        let cache = if modify_draft_cache {
+            seq.normal_draft_cache()
+        } else {
+            seq.normal_cache()
+        };
+        cache.iter().flatten().all(|slot| match slot {
+            // Already per-row; `front_pad_kv_cache` returns Ok(0) untouched.
+            KvCache::XsRolling(_) => xs_per_sequence_enabled(),
+            KvCache::Normal { k, v } => [k, v].into_iter().all(|sc| {
+                if sc.current_seq_len == target {
+                    return true; // lead == 0, nothing to move
+                }
+                sc.all_data.is_some() && sc.capacity_seq_len.max(target) <= sc.max_seq_len
+            }),
+            // `supports_per_sequence_len` is false for these, so
+            // `batch_can_be_ragged` already refused; belt and braces.
+            KvCache::Rotating { .. } | KvCache::TurboQuant(_) => false,
+        })
+    })
+}
+
 /// Zero-extend `src` along `dim` to `width`, at the front when the content is
 /// end-anchored. Used only for preallocation slack and for the end-anchored
 /// `xs` window (see [`BatchSrc`]), so the added columns are never read.
@@ -1284,10 +1336,27 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
         // cost is that the very first cohort is still bucketed, after which the
         // scheduler has the answer. PagedAttention never reaches this function,
         // so its scheduler is unaffected.
+        // Two checks, deliberately overlapping, with DIFFERENT jobs — noted
+        // because a mutation test showed that deleting this one alone changes
+        // no behaviour, `front_align_would_succeed` having independently
+        // refused the same batches.
+        //   * this one answers "can this MODEL ever take ragged decode", and is
+        //     what the scheduler reads to stop bucketing;
+        //   * `front_align_would_succeed` answers "can THIS batch be aligned
+        //     right now, without mutating anything if the answer is no".
+        // The capability is pinned directly by
+        // `the_capability_predicate_is_what_the_scheduler_reads`.
         let can_be_ragged = batch_can_be_ragged(seqs, modify_draft_cache);
         set_ragged_decode_supported(can_be_ragged);
 
-        if first_mismatched_cache_len(seqs, modify_draft_cache).is_some() && can_be_ragged {
+        // Alignment is attempted only when it is known to complete, so the
+        // refusal path below stays NON-MUTATING exactly as it was before this
+        // change — see `front_align_would_succeed`. There is therefore no exit
+        // between here and `slice_set` that leaves a half-aligned batch.
+        if first_mismatched_cache_len(seqs, modify_draft_cache).is_some()
+            && can_be_ragged
+            && front_align_would_succeed(seqs, modify_draft_cache)
+        {
             let lead_pad = front_align_batch(seqs, modify_draft_cache)?;
             set_ragged_lead_pad(Some(lead_pad));
         } else {
@@ -2947,6 +3016,118 @@ mod clone_in_cache_invariant_tests {
             .to_string();
         assert!(err.contains("must share current_seq_len"), "got: {err}");
         assert!(err.contains("100") && err.contains("200"), "got: {err}");
+    }
+
+    /// 🔑 `batch_can_be_ragged` is the predicate the SCHEDULER acts on, so it
+    /// needs a test of its own.
+    ///
+    /// Found by mutation: replacing the call with `true` inside
+    /// `clone_in_cache` left the whole suite green, because
+    /// `front_align_would_succeed` independently refuses the same batches. The
+    /// alignment decision is therefore double-covered, but the *capability* —
+    /// which is published to the scheduler and decides whether it stops
+    /// bucketing at all — was covered by nothing.
+    #[test]
+    fn the_capability_predicate_is_what_the_scheduler_reads() {
+        let mut normal = seq_with_cache_len(0, 2, 4);
+        {
+            let cache = normal.normal_cache();
+            cache.clear();
+            for l in 0..2 {
+                cache.push(Some(materialised_slot(4, 8, (l * 100) as f32)));
+            }
+        }
+        assert!(
+            batch_can_be_ragged(&mut [&mut normal], false),
+            "a cache of Normal slots must report that it can carry per-sequence lengths"
+        );
+
+        let mut rotating = seq_with_cache_len(1, 2, 4);
+        {
+            let cache = rotating.normal_cache();
+            cache.clear();
+            for _ in 0..2 {
+                cache.push(Some(KvCache::new_rotating(2, 4096, 8)));
+            }
+        }
+        assert!(
+            !batch_can_be_ragged(&mut [&mut rotating], false),
+            "a Rotating slot cannot carry its own length, so the scheduler must keep bucketing"
+        );
+
+        // One bad slot in one sequence is enough to disqualify the cohort.
+        assert!(
+            !batch_can_be_ragged(&mut [&mut normal, &mut rotating], false),
+            "capability is a property of the WHOLE batch, not of its first sequence"
+        );
+    }
+
+    /// 🔑 A refusal must leave the batch EXACTLY as it found it.
+    ///
+    /// The blanket refusal this change replaced ran before anything was
+    /// touched. `front_align_batch` pads in place, row by row and slot by slot,
+    /// so a naive "align, then assert" would return `Err` having already
+    /// rewritten the rows ahead of whichever one failed — and the engine would
+    /// fail those requests while the surviving sequences carried a half-aligned
+    /// cache. `front_align_would_succeed` is what keeps that from happening.
+    ///
+    /// The fixture is the exact shape that bails midway: sequence 0's slots are
+    /// materialised and paddable, sequence 1's are not (`all_data: None`, which
+    /// is what `slot()` builds). Alignment must never start.
+    #[test]
+    fn a_refusal_does_not_leave_a_half_aligned_batch() {
+        let pipeline = StubPipeline::new(2);
+        let mut a = seq_with_cache_len(0, 2, 5);
+        let mut b = seq_with_cache_len(1, 2, 3);
+        {
+            let cache = a.normal_cache();
+            cache.clear();
+            for l in 0..2 {
+                cache.push(Some(materialised_slot(5, 8, (l * 100) as f32)));
+            }
+        }
+        // `b` keeps the unmaterialised `slot(3)` from the helper.
+
+        let before: Vec<usize> = [&mut a, &mut b]
+            .iter_mut()
+            .flat_map(|s| {
+                s.normal_cache()
+                    .iter()
+                    .flatten()
+                    .map(KvCache::current_seq_len)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(before, vec![5, 5, 3, 3], "fixture: ragged and mixed");
+
+        set_ragged_lead_pad(None);
+        let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
+        let err = NormalCacheManager
+            .clone_in_cache(&pipeline, &mut seqs, false)
+            .expect_err("an unpaddable batch must be refused")
+            .to_string();
+        assert!(err.contains("must share current_seq_len"), "got: {err}");
+        drop(seqs);
+
+        let after: Vec<usize> = [&mut a, &mut b]
+            .iter_mut()
+            .flat_map(|s| {
+                s.normal_cache()
+                    .iter()
+                    .flatten()
+                    .map(KvCache::current_seq_len)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            after, before,
+            "the refusal mutated the batch; a half-aligned cache survived a failed step"
+        );
+        assert_eq!(
+            ragged_lead_pad(),
+            None,
+            "a refused batch must not publish a dead prefix for the masker to trust"
+        );
     }
 
     /// 🔑 The other side of that contract: a ragged batch whose slots CAN carry
