@@ -28,16 +28,26 @@ All numbers below assume a single DGX-B200 node serving DeepSeek V4 Pro (1.6T to
 
 ## The metric targets
 
-| Metric | SGLang today | Arc v2 target | Multiple |
-|---|---|---|---|
-| Single-user decode tok/s @ 32K context | ~100 | 5,000–7,000 | 50–70× |
-| Single-user decode tok/s @ 1M context | ~30 | 3,000–5,000 | 100–170× |
-| Aggregate tok/s at full concurrency | ~25,000 | 250,000–350,000 | 10–14× |
-| Concurrent users at 1M context | ~10 | 120–300 | 12–30× |
-| Quality (perplexity drift from BF16) | 0% | ~1.5% | near-lossless |
-| Model size in HBM | 800 GB (NVFP4) | 320 GB | 2.5× |
+| Metric | Arc v2 target |
+|---|---|
+| Single-user decode tok/s @ 32K context | 5,000–7,000 |
+| Single-user decode tok/s @ 1M context | 3,000–5,000 |
+| Aggregate tok/s at full concurrency | 250,000–350,000 |
+| Concurrent users at 1M context | 120–300 |
+| Quality (perplexity drift from BF16) | ~1.5% |
+| Model size in HBM | 320 GB |
 
-These are honest, post-calibration numbers. Earlier drafts overstated. No apprentice-mode research bet; no Tucker-MoE-at-aggressive-rank hand-waving.
+These are Arc targets only. No apprentice-mode research bet; no Tucker-MoE-at-aggressive-rank hand-waving.
+
+> ⚠️ **A `SGLang today` baseline column and a derived `Multiple` column were removed
+> from this table on 2026-08-17.** They carried figures (`~100` and `~30` single-user,
+> `~25,000` aggregate, `~10` concurrent users) that **we have never run and cannot
+> source**, and every multiple was computed against them. This is the same defect class
+> as the fabricated competitor benchmark deleted from `docs/PEAK_INFERENCE.md` this
+> week. **Standing rule: name what another engine has; never state how fast it is
+> unless we ran it ourselves, on stated hardware, with the command recorded.** If a
+> baseline is wanted here, produce it with `arc-bench`, which is already
+> vendor-abstracted and can drive any OpenAI-compatible server.
 
 ---
 
@@ -48,7 +58,7 @@ Each technique is filed under one or more domains. Domains and their headline nu
 - **Domain 1 — Weight storage** (model footprint in HBM): target 320 GB for V4 Pro
 - **Domain 2 — KV memory per user** (concurrent users at long context): target 3 GB/user at 1M context
 - **Domain 3 — Per-token decode speed** (single-user tok/s): three sub-bottlenecks
-- **Domain 4 — Aggregate throughput** (utilization across all requests): target ~4× over standard SGLang scheduling
+- **Domain 4 — Aggregate throughput** (utilization across all requests): target ~4× over Arc's own measured scheduling baseline (a cross-engine multiple would need a run we have not done)
 - **Domain 5 — Quality preservation** (near-lossless stack)
 
 ### 1. NVFP4 weights (Domain 1, foundation)
