@@ -17,7 +17,7 @@
 #   experts dequant to BF16 ~560GB. Absolute KLD vs FP8 needs a bigger box.)
 #
 # --sinkhorn-ab : instead of the ladder, run the qtip2 rung twice on the mini
-#   corpus with ARC_FUSED_SINKHORN unset/1 and diff per-chunk ppl strings —
+#   corpus with ARC_NO_FUSED_SINKHORN set/unset and diff per-chunk ppl strings —
 #   identical strings == bit-identical f32 forward (see parse_ppl.py).
 #
 # Env:
@@ -72,8 +72,13 @@ if [ "${1:-}" = "--sinkhorn-ab" ]; then
   # rides for free on this run instead of a separate ppl pass).
   DUMPARGS=""
   [ -n "${SINK_DUMP_OFF:-}" ] && DUMPARGS="--dump-logprobs $SINK_DUMP_OFF"
-  env -u ARC_FUSED_SINKHORN "$BIN" -m "$MODEL_DIR" -a deepseekv4 -f "$MINI_FILE" -u "$UQFF0" --chunk-size 1024 $DUMPARGS 2>&1 | tee "$RES/ppl_sink_off.log"
-  ARC_FUSED_SINKHORN=1     "$BIN" -m "$MODEL_DIR" -a deepseekv4 -f "$MINI_FILE" -u "$UQFF0" --chunk-size 1024 2>&1 | tee "$RES/ppl_sink_on.log"
+  # The engine reads ARC_NO_FUSED_SINKHORN (fused is the DEFAULT and is on
+  # unless that variable is set). This script previously toggled
+  # ARC_FUSED_SINKHORN, which nothing reads — so `env -u ARC_FUSED_SINKHORN`
+  # did not disable anything and BOTH arms ran fused-on. Any "bit-identical"
+  # result produced by the old script compared fused against itself.
+  ARC_NO_FUSED_SINKHORN=1 "$BIN" -m "$MODEL_DIR" -a deepseekv4 -f "$MINI_FILE" -u "$UQFF0" --chunk-size 1024 $DUMPARGS 2>&1 | tee "$RES/ppl_sink_off.log"
+  env -u ARC_NO_FUSED_SINKHORN "$BIN" -m "$MODEL_DIR" -a deepseekv4 -f "$MINI_FILE" -u "$UQFF0" --chunk-size 1024 2>&1 | tee "$RES/ppl_sink_on.log"
   python3 "$HERE/parse_ppl.py" "$RES/ppl_sink_off.log" sink_off "$RES/ppl_sink_off.json" || fail "gate-off run failed"
   python3 "$HERE/parse_ppl.py" "$RES/ppl_sink_on.log"  sink_on  "$RES/ppl_sink_on.json"  || fail "gate-on run failed"
   python3 - "$RES/ppl_sink_off.json" "$RES/ppl_sink_on.json" <<'EOF'

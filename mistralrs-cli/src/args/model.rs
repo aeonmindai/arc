@@ -29,8 +29,13 @@ pub struct ModelSourceOptions {
 /// Format options for model loading
 #[derive(Args, Clone, Default, Deserialize)]
 pub struct FormatOptions {
-    /// Model format: plain (safetensors), gguf, or ggml
-    /// Auto-detected if not specified
+    /// Model format: plain (safetensors), gguf, or ggml.
+    /// Defaults to `plain`; `-f/--quantized-file` is ignored unless this is
+    /// set to `gguf` or `ggml`.
+    //
+    // This previously claimed "Auto-detected if not specified". There is no
+    // detection: every consumer does `format.unwrap_or(ModelFormat::Plain)`,
+    // so a user passing only `-f model.gguf` silently loaded the plain path.
     #[arg(long, value_enum)]
     pub format: Option<ModelFormat>,
 
@@ -76,8 +81,11 @@ pub struct AdapterOptions {
     #[arg(long, requires = "xlora")]
     pub xlora_order: Option<PathBuf>,
 
-    /// Target non-granular index for X-LoRA
-    #[arg(long, requires = "xlora")]
+    /// Target non-granular index for X-LoRA.
+    ///
+    /// Hidden: an X-LoRA scaling-granularity cutoff that also silently forces
+    /// `max_seqs = 1`. Developer/ablation knob, not a serving control.
+    #[arg(long, requires = "xlora", hide = true)]
     pub tgt_non_granular_index: Option<usize>,
 }
 

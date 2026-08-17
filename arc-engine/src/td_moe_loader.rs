@@ -67,9 +67,12 @@ use crate::td_moe::{cholesky_in_place, tucker_decompose_with_whitening};
 /// compression. Value must be a positive integer rank (>= 4).
 pub const ARC_TD_MOE_RANK_ENV: &str = "ARC_TD_MOE_RANK";
 
-/// Environment variable that selects the calibration set size. Optional;
-/// only used for Tier B (file-driven) calibration in the future.
-pub const ARC_TD_MOE_CALIB_ENV: &str = "ARC_TD_MOE_CALIBRATION";
+/// Retired environment variable. It was parsed, defaulted to 256, threaded
+/// through two function signatures and bound to `_calibration_set_size`, which
+/// no code path ever read — it never influenced a single output. Kept only so
+/// that setting it produces a deprecation warning instead of silently implying
+/// an effect it never had; remove one release after the warning ships.
+pub const ARC_TD_MOE_CALIB_ENV_DEPRECATED: &str = "ARC_TD_MOE_CALIBRATION";
 
 /// Environment variable holding a path to a `.arccalib` calibration artifact
 /// (see `mistralrs calibrate`). Set by arc-cli's `--calib <path>`.
@@ -90,7 +93,7 @@ pub fn register_td_moe_hook() {
     let Some(rank) = parse_env_rank() else {
         return;
     };
-    let calibration = parse_env_calibration().unwrap_or(256);
+    warn_if_deprecated_calibration_set();
 
     // Flag-gated: only a supplied `--calib <path>` switches the whitening off
     // identity. A missing/unreadable artifact never fails the load — it falls
@@ -130,8 +133,7 @@ pub fn register_td_moe_hook() {
     };
 
     info!(
-        "Arc: registering TD-MoE post-load hook (rank={rank}, calibration={calibration}, \
-         whitening={})",
+        "Arc: registering TD-MoE post-load hook (rank={rank}, whitening={})",
         if calib.is_some() {
             "calibrated"
         } else {
@@ -139,7 +141,7 @@ pub fn register_td_moe_hook() {
         }
     );
     mistralrs_core::register_post_load_hook(Box::new(move |model: &mut dyn IsqModel| {
-        apply_td_moe_to_model_with_calib(model, rank, calibration, calib.as_deref())
+        apply_td_moe_to_model_with_calib(model, rank, calib.as_deref())
             .map_err(|e| anyhow::anyhow!("TD-MoE compression failed: {e}"))
     }));
 }
@@ -158,9 +160,16 @@ fn parse_env_rank() -> Option<usize> {
     Some(parsed)
 }
 
-fn parse_env_calibration() -> Option<usize> {
-    let raw = std::env::var(ARC_TD_MOE_CALIB_ENV).ok()?;
-    raw.trim().parse().ok()
+/// Warn if the retired calibration-size variable is set. It has never had an
+/// effect, so this only replaces a silent no-op with an audible one.
+fn warn_if_deprecated_calibration_set() {
+    if std::env::var_os(ARC_TD_MOE_CALIB_ENV_DEPRECATED).is_some() {
+        warn!(
+            "{ARC_TD_MOE_CALIB_ENV_DEPRECATED} is deprecated and has no effect \
+             (it was never read); remove it. TD-MoE calibration is supplied by \
+             {ARC_TD_MOE_CALIB_PATH_ENV} / `--calib <path>`."
+        );
+    }
 }
 
 /// Run TD-MoE compression over the experts of `model`.
@@ -171,17 +180,12 @@ fn parse_env_calibration() -> Option<usize> {
 /// reconstruction.
 ///
 /// `rank` is clamped per-axis to fit each tensor's actual dimensions
-/// (Tucker ranks must be `<= dim_i`). `calibration_set_size` is currently only
-/// used to size the synthetic activation distribution for Tier A.
+/// (Tucker ranks must be `<= dim_i`).
 ///
 /// Whitens against the identity. Use [`apply_td_moe_to_model_with_calib`] to
 /// supply a measured activation covariance.
-pub fn apply_td_moe_to_model(
-    model: &mut dyn IsqModel,
-    rank: usize,
-    calibration_set_size: usize,
-) -> Result<()> {
-    apply_td_moe_to_model_with_calib(model, rank, calibration_set_size, None)
+pub fn apply_td_moe_to_model(model: &mut dyn IsqModel, rank: usize) -> Result<()> {
+    apply_td_moe_to_model_with_calib(model, rank, None)
 }
 
 /// Build the input covariance `Σ_in` (row-major `[d_in, d_in]`) for one expert
@@ -244,7 +248,6 @@ fn cov_in_from_stats(stats: &LayerCalibStats, d_in: usize) -> Option<Vec<f32>> {
 pub fn apply_td_moe_to_model_with_calib(
     model: &mut dyn IsqModel,
     rank: usize,
-    _calibration_set_size: usize,
     calib: Option<&CalibrationArtifact>,
 ) -> Result<()> {
     if rank < 4 {
@@ -687,7 +690,7 @@ mod tests {
         // near-exactly. Using rank = min dim verifies the loader hooks up
         // correctly without exercising lossy compression (that is the job
         // of the td_moe.rs unit tests).
-        apply_td_moe_to_model(&mut model, d_out, 16).expect("apply succeeded");
+        apply_td_moe_to_model(&mut model, d_out).expect("apply succeeded");
 
         let new_weight = model.layer.dequantize_w().unwrap();
         let new_v: Vec<f32> = new_weight.flatten_all().unwrap().to_vec1().unwrap();
@@ -710,7 +713,7 @@ mod tests {
         let mut model = build_fake_model(weight);
 
         // Rank 4 (the minimum we accept).
-        apply_td_moe_to_model(&mut model, 4, 16).expect("apply succeeded");
+        apply_td_moe_to_model(&mut model, 4).expect("apply succeeded");
 
         let new_weight = model.layer.dequantize_w().unwrap();
         let v: Vec<f32> = new_weight.flatten_all().unwrap().to_vec1().unwrap();
@@ -724,7 +727,7 @@ mod tests {
     fn td_moe_rejects_tiny_rank() {
         let weight = random_expert_stack(2, 4, 4);
         let mut model = build_fake_model(weight);
-        assert!(apply_td_moe_to_model(&mut model, 2, 8).is_err());
+        assert!(apply_td_moe_to_model(&mut model, 2).is_err());
     }
 
     /// Whitened Tucker pipeline on a moderate BF16 expert stack at full rank
@@ -754,7 +757,7 @@ mod tests {
         let mut model = build_fake_model(weight_bf16);
         // Full-rank decomposition: cos sim should approach 1.0 minus BF16
         // round-trip error. We require ≥ 0.98 as the task spec.
-        apply_td_moe_to_model(&mut model, d_out, 32).expect("apply succeeded");
+        apply_td_moe_to_model(&mut model, d_out).expect("apply succeeded");
 
         let new_weight = model.layer.dequantize_w().unwrap();
         let new_v: Vec<f32> = new_weight
@@ -798,7 +801,7 @@ mod tests {
         // Pre-condition: layer is an UnquantLinear at this point.
         assert_eq!(model.layer.name(), "unquant-linear");
 
-        apply_td_moe_to_model(&mut model, d_out, 16).expect("apply succeeded");
+        apply_td_moe_to_model(&mut model, d_out).expect("apply succeeded");
 
         // Post-condition: layer is the factored Tucker storage.
         assert_eq!(model.layer.name(), "td-moe-tucker-factored");
@@ -817,7 +820,7 @@ mod tests {
         let weight = random_expert_stack(k, d_out, d_in);
 
         let mut model = build_fake_model(weight);
-        apply_td_moe_to_model(&mut model, d_out, 16).expect("apply succeeded");
+        apply_td_moe_to_model(&mut model, d_out).expect("apply succeeded");
 
         // Build a tiny synthetic activation + indices, then check that
         //   layer.gather_forward(a, indices)
@@ -874,7 +877,7 @@ mod tests {
         // Sub-rank decomposition that should reduce storage well below dense.
         // The actual rank used is `rank.min(dim)` per axis.
         let rank = 8usize;
-        apply_td_moe_to_model(&mut model, rank, 16).expect("apply succeeded");
+        apply_td_moe_to_model(&mut model, rank).expect("apply succeeded");
 
         // Reach into the concrete `TuckerFactoredLayer` for the counters.
         let layer = model.layer.clone();
@@ -914,7 +917,7 @@ mod tests {
         let weight = random_expert_stack(k, d_out, d_in);
         let mut model = build_fake_model(weight);
 
-        apply_td_moe_to_model(&mut model, 16, 16).expect("apply succeeded");
+        apply_td_moe_to_model(&mut model, 16).expect("apply succeeded");
         assert_eq!(model.layer.name(), "td-moe-tucker-factored");
 
         // Forward a small batch through gather_forward (the path V4 MoE Fast
@@ -989,7 +992,7 @@ mod tests {
         calib: Option<&CalibrationArtifact>,
     ) -> Vec<f32> {
         let mut model = build_fake_model(weight.clone());
-        apply_td_moe_to_model_with_calib(&mut model, rank, 16, calib).expect("apply succeeded");
+        apply_td_moe_to_model_with_calib(&mut model, rank, calib).expect("apply succeeded");
         model
             .layer
             .dequantize_w()
@@ -1063,7 +1066,7 @@ mod tests {
         let weight = random_expert_stack(k, d_out, d_in);
 
         let mut legacy_model = build_fake_model(weight.clone());
-        apply_td_moe_to_model(&mut legacy_model, rank, 16).unwrap();
+        apply_td_moe_to_model(&mut legacy_model, rank).unwrap();
         let legacy: Vec<f32> = legacy_model
             .layer
             .dequantize_w()

@@ -81,7 +81,11 @@ enum Commands {
         #[arg(long, default_value_t = 2)]
         slo_tier: u8,
         /// Use the offline mock vendor — no GPU required.
-        #[arg(long)]
+        ///
+        /// Hidden: emits a fully-formed results artifact containing synthetic
+        /// numbers. It exists for harness tests; surfacing it in `--help`
+        /// invites publishing mock throughput as if it were measured.
+        #[arg(long, hide = true)]
         mock: bool,
         /// Cap on concurrent users explored by the scheduler.
         #[arg(long, default_value_t = 256)]
@@ -130,7 +134,11 @@ enum Commands {
         #[arg(long)]
         arch: Option<String>,
         /// (schema mode) For V4: assume LoRA o_proj layout instead of the default Either fallback.
-        #[arg(long, default_value = "either")]
+        ///
+        /// Hidden: a weight-schema assumption used to A/B checkpoint layouts.
+        /// The `either` default accepts both, so overriding it can only make
+        /// validation stricter than the loader actually is.
+        #[arg(long, default_value = "either", hide = true)]
         o_proj: String,
 
         // --- HBM-mode flags (RUN-191) ---
@@ -153,9 +161,17 @@ enum Commands {
 }
 
 fn main() {
-    // Print Arc banner
+    // Print Arc banner.
+    //
+    // D18: the banner states identity only. It must NOT name a subsystem as
+    // active — this process has not loaded a model yet, so it cannot know
+    // which cache type, attention backend, or MoE path will be resolved. The
+    // previous banner claimed "TurboQuant 3.5-bit KV cache compression
+    // (lossless, default)" unconditionally; that line was false for every MLA
+    // model and every head_dim != 128 (i.e. almost every model), and
+    // "lossless" was never measured at all. The engine now reports what it
+    // actually resolved, after load, via the ArcServe startup summary.
     eprintln!("Arc inference engine v{}", env!("CARGO_PKG_VERSION"));
-    eprintln!("TurboQuant 3.5-bit KV cache compression (lossless, default)");
     eprintln!("Aeonmind, LLC | https://runcrate.ai/arc");
     eprintln!();
 
@@ -326,9 +342,17 @@ fn extract_arc_flags(args: Vec<String>) -> (HashMap<String, String>, Vec<String>
                     std::process::exit(2);
                 }
             }
+            // `--td-moe-calibration` is retired: it set ARC_TD_MOE_CALIBRATION,
+            // which arc-engine parsed and then bound to an unread parameter. It
+            // never influenced an output. Accept-and-warn for one release so
+            // existing invocations keep running instead of failing on an
+            // unknown flag; use `--calib <path>` for real calibration.
             "--td-moe-calibration" => {
-                if let Some(val) = args.get(i + 1) {
-                    env_vars.insert("ARC_TD_MOE_CALIBRATION".into(), val.clone());
+                if args.get(i + 1).is_some() {
+                    eprintln!(
+                        "WARNING: --td-moe-calibration is deprecated and has no effect \
+                         (it never had one); use --calib <path.arccalib>"
+                    );
                     i += 2;
                     continue;
                 } else {
@@ -353,8 +377,11 @@ fn extract_arc_flags(args: Vec<String>) -> (HashMap<String, String>, Vec<String>
                     i += 1;
                     continue;
                 }
-                if let Some(rest) = arg.strip_prefix("--td-moe-calibration=") {
-                    env_vars.insert("ARC_TD_MOE_CALIBRATION".into(), rest.to_string());
+                if arg.strip_prefix("--td-moe-calibration=").is_some() {
+                    eprintln!(
+                        "WARNING: --td-moe-calibration is deprecated and has no effect \
+                         (it never had one); use --calib <path.arccalib>"
+                    );
                     i += 1;
                     continue;
                 }
