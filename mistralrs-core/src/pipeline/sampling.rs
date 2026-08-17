@@ -33,7 +33,12 @@ pub(crate) async fn finish_or_add_toks_to_seq(
     eos_tok: Option<&[u32]>,
     use_prefix_cacher: bool,
 ) -> Result<()> {
-    let mut is_done = seq.is_done(logprobs.token, eos_tok, this.get_metadata().max_seq_len);
+    // Stop-token / max-length / stop-string scanning. The stop-string arm walks
+    // the accumulated completion bytes, so its cost is not constant per token.
+    let mut is_done = {
+        let _s = arc_profiler::span("stop_check");
+        seq.is_done(logprobs.token, eos_tok, this.get_metadata().max_seq_len)
+    };
     let metadata = this.get_metadata();
     let tok_env = metadata.tok_env().ok_or(candle_core::Error::Msg(
         "`finish_or_add_toks_to_seq` requires the pipeline to have a token trie".to_string(),
@@ -42,10 +47,16 @@ pub(crate) async fn finish_or_add_toks_to_seq(
     // delimiters like <tool_call>, [TOOL_CALLS], <|python_tag|>) or when think tag
     // mode is enabled (so <think>/<\/think> delimiters are visible in the output).
     let include_special = seq.tools.is_some() || seq.is_think_tag_mode();
-    let completion_bytes = tok_env
-        .tok_trie()
-        .decode_ext(&[logprobs.token], include_special);
-    seq.add_token(logprobs.clone(), completion_bytes, &is_done);
+    let completion_bytes = {
+        let _s = arc_profiler::span("detokenize");
+        tok_env
+            .tok_trie()
+            .decode_ext(&[logprobs.token], include_special)
+    };
+    {
+        let _s = arc_profiler::span("seq.add_token");
+        seq.add_token(logprobs.clone(), completion_bytes, &is_done);
+    }
 
     // If we can have a tool and we got a tool, stop the sequence early.
     // Doesn't conflict with the logic below because it does the same thing anyway.
@@ -73,8 +84,19 @@ pub(crate) async fn finish_or_add_toks_to_seq(
         }
     }
 
-    // Handle streaming requests
-    if seq.get_mut_group().is_streaming {
+    // Handle streaming requests.
+    //
+    // `get_mut_group()` expands the `get_mut_group!` busy-wait
+    // (`utils/mod.rs:227-237`): `try_lock` in a bare `loop` with `yield_now()`
+    // and no backoff. A streaming decode step takes it nine times per token per
+    // sequence — five of those from `update_time_info()` re-locking to write
+    // five fields — against one `SequenceGroup` mutex shared by the whole
+    // request. This span is the first one that counts it.
+    let group_is_streaming = {
+        let _s = arc_profiler::span("group_lock.is_streaming");
+        seq.get_mut_group().is_streaming
+    };
+    if group_is_streaming {
         let mut tool_use_still_possible = false;
         let mut tool_use_is_done = false;
         if let Some(ref t) = seq.tools {
@@ -202,6 +224,11 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                 None
             };
 
+            // The serial dispatch loop: one `responder.send().await` per
+            // sequence, awaited in turn, with the pipeline mutex held for all
+            // of them. Sequential (not `join_all`), so a span across this await
+            // nests correctly.
+            let _s = arc_profiler::span("response.send");
             if seq
                 .get_mut_group()
                 .maybe_send_streaming_response(seq, this.name().clone(), usage_opt)
@@ -461,8 +488,22 @@ pub async fn sample_and_add_toks(
             )
         })
         .collect();
-    let sampled_vec = futures::future::join_all(sampling_futures).await;
+    let sampled_vec = {
+        // Wall time to sample the whole batch. When `use_async_pool` is true the
+        // per-sequence `Sampler::sample` runs on the rayon pool, off this
+        // thread, so it is deliberately NOT broken out below — see the note.
+        let _s = arc_profiler::span("sample.join_all");
+        arc_profiler::note(
+            "sample.join_all is not decomposed per sequence: for B>1 the sampler runs on the \
+             rayon pool via tokio_rayon::spawn, and opening a span inside a concurrently-polled \
+             future would interleave with its siblings and corrupt the tree shape. Its wall time \
+             is the batch's sampling cost; the per-sequence host prologue IS broken out as \
+             sample.logits_cast and sample.ctx_clone.",
+        );
+        futures::future::join_all(sampling_futures).await
+    };
 
+    let _s = arc_profiler::span("finish_or_add_toks");
     for (sampled, seq) in std::iter::zip(sampled_vec, seqs.iter_mut()) {
         let next_token = crate::handle_seq_error_stateaware_ok!(sampled, seq);
         // Arc Boost budget policy: graceful end-think injection on budget hit.
@@ -493,10 +534,21 @@ pub async fn sample_sequence(
     sample_speculative: bool,
     multiple_sequences: bool,
 ) -> Result<Logprobs> {
-    let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+    // Both of these open and close inside a single poll, before the first
+    // `.await`, so they nest correctly under `sample.join_all` even when B
+    // futures are being polled in turn on this thread.
+    let logits = {
+        let _s = arc_profiler::span("sample.logits_cast");
+        logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?
+    };
 
     let sampler = seq.sampler();
-    let ctx_clone = seq.get_toks().to_vec();
+    // Named suspect: a full copy of the sequence's token history, per sequence,
+    // per step — O(context) host work that grows as generation proceeds.
+    let ctx_clone = {
+        let _s = arc_profiler::span("sample.ctx_clone");
+        seq.get_toks().to_vec()
+    };
     let rng_clone = rng.clone();
     let logits_clone = logits.clone();
     let first_lobprobs_response = if use_async_pool {
