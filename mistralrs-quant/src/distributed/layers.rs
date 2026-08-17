@@ -26,6 +26,128 @@ fn shard(dim: usize, rank: usize, world_size: usize) -> Shard {
     }
 }
 
+/// Which of a MoE layer's experts this rank should actually load.
+///
+/// Under **expert parallelism** the `E` routed experts are split across ranks
+/// and each rank holds only `E / ep_size` of them. `global` stays the
+/// checkpoint's expert count (it is the leading dimension of every
+/// expert-stacked tensor on disk); `owned` is the ascending list of global ids
+/// this rank keeps.
+///
+/// [`ExpertSubset::all`] is the pre-EP behaviour and is what every non-EP call
+/// site passes, so a subset-unaware loader path is only ever reached with
+/// `owned == None`.
+#[derive(Debug, Clone)]
+pub struct ExpertSubset {
+    global: usize,
+    owned: Option<Arc<Vec<usize>>>,
+}
+
+impl ExpertSubset {
+    /// Every expert in the checkpoint — the non-expert-parallel case.
+    pub fn all(global: usize) -> Self {
+        Self {
+            global,
+            owned: None,
+        }
+    }
+
+    /// Keep only `owned` (ascending global ids) out of `global` experts.
+    pub fn owned(global: usize, owned: Vec<usize>) -> Result<Self> {
+        if owned.is_empty() {
+            candle_core::bail!("ExpertSubset: a rank must own at least one expert");
+        }
+        if owned.len() > global {
+            candle_core::bail!(
+                "ExpertSubset: {} owned experts exceeds the checkpoint's {global}",
+                owned.len()
+            );
+        }
+        for w in owned.windows(2) {
+            if w[0] >= w[1] {
+                candle_core::bail!(
+                    "ExpertSubset: owned expert ids must be strictly ascending, got {w:?}"
+                );
+            }
+        }
+        if let Some(&last) = owned.last() {
+            if last >= global {
+                candle_core::bail!(
+                    "ExpertSubset: owned expert id {last} is out of range for {global} experts"
+                );
+            }
+        }
+        Ok(Self {
+            global,
+            owned: Some(Arc::new(owned)),
+        })
+    }
+
+    /// The checkpoint's expert count — the leading dimension of the
+    /// expert-stacked tensors on disk.
+    pub fn global(&self) -> usize {
+        self.global
+    }
+
+    /// How many experts this rank keeps.
+    pub fn len(&self) -> usize {
+        self.owned.as_ref().map_or(self.global, |o| o.len())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// `true` when this rank keeps every expert.
+    pub fn is_all(&self) -> bool {
+        self.owned.is_none()
+    }
+
+    /// The global ids to keep, ascending.
+    pub fn ids(&self) -> std::borrow::Cow<'_, [usize]> {
+        match &self.owned {
+            Some(o) => std::borrow::Cow::Borrowed(o.as_slice()),
+            None => std::borrow::Cow::Owned((0..self.global).collect()),
+        }
+    }
+
+    /// Select the owned experts out of a tensor whose leading dimension is the
+    /// expert axis. A no-op when this rank owns everything.
+    pub fn select_dim0(&self, t: &Tensor) -> Result<Tensor> {
+        let Some(owned) = &self.owned else {
+            return Ok(t.clone());
+        };
+        // Contiguous blocks are the common case (`ExpertPlacement::contiguous`)
+        // and `narrow` avoids materialising an index tensor for them.
+        let contiguous = owned.windows(2).all(|w| w[1] == w[0] + 1);
+        if contiguous {
+            return t.narrow(0, owned[0], owned.len())?.contiguous();
+        }
+        let idx = Tensor::from_vec(
+            owned.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+            (owned.len(),),
+            t.device(),
+        )?;
+        t.index_select(&idx, 0)?.contiguous()
+    }
+
+    /// Refuse a loader path that cannot honour a subset, naming it, rather
+    /// than silently loading every expert on every rank.
+    pub fn require_all(&self, path: &str) -> Result<()> {
+        if self.is_all() {
+            return Ok(());
+        }
+        candle_core::bail!(
+            "expert parallelism is not implemented for the `{path}` expert-weight format \
+             (this rank owns {} of {} experts). Loading it would silently place every expert \
+             on every rank, which is a capacity bug, not a speed bug. Use an expert format \
+             whose leading dimension can be sliced, or run with ep_size = 1.",
+            self.len(),
+            self.global
+        );
+    }
+}
+
 /// This layer has a weight that is parallelized along the input dimension,
 /// returning the "full" output dimension.
 #[derive(Debug)]
@@ -1029,7 +1151,7 @@ impl PackedExperts {
     /// Note: we only support AFQ and unquantized here because they are the only ones that support indexed.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        num_local_experts: usize,
+        experts: &ExpertSubset,
         hidden_size: usize,
         intermediate_size: usize,
         config: &Option<QuantizedConfig>,
@@ -1040,8 +1162,12 @@ impl PackedExperts {
         if bias {
             candle_core::bail!("PackedExperts does not support bias.");
         }
+        // The checkpoint's expert count — the leading dimension of every
+        // expert-stacked tensor on disk, whatever subset this rank keeps.
+        let num_local_experts = experts.global();
 
         let (gate_proj, up_proj, down_proj) = if let Some(quant_conf) = &config {
+            experts.require_all("quantized packed experts")?;
             // GPTQ and BNB do not support tensor parallelism
             if comm.world_size() != 1 {
                 candle_core::bail!(
@@ -1459,6 +1585,9 @@ impl PackedExperts {
             }
         } else if !vb.contains_tensor("gate_up_proj") {
             // Handle the case where the layer is dummy (no tensors) during UQFF loading. Deserialize will handle it.
+            // Under expert parallelism the UQFF holds every expert, so the slice
+            // cannot happen here — `MoEExperts` narrows the deserialized layers
+            // after `load_from_artifacts` and refuses to run if that never ran.
             let mut gs: Vec<Arc<dyn QuantMethod>> = Vec::new();
             let mut us: Vec<Arc<dyn QuantMethod>> = Vec::new();
             let mut ds: Vec<Arc<dyn QuantMethod>> = Vec::new();
@@ -1476,8 +1605,19 @@ impl PackedExperts {
             // All reduce at the end.
 
             // Handle the case where the layer is dummy (no tensors)
-            let gate_up_block_size = intermediate_size / comm.world_size();
-            let gate_up_start = gate_up_block_size * comm.rank();
+            //
+            // Expert parallelism and tensor parallelism split the SAME layer on
+            // different axes, and stage 1 does not combine them: under EP each
+            // rank owns whole experts, so the intermediate dimension must stay
+            // whole. `comm` is still the EP communicator (its `world_size` is
+            // the EP size) and is used only for the combine all-reduce.
+            let (tp_world, tp_rank) = if experts.is_all() {
+                (comm.world_size(), comm.rank())
+            } else {
+                (1, 0)
+            };
+            let gate_up_block_size = intermediate_size / tp_world;
+            let gate_up_start = gate_up_block_size * tp_rank;
 
             // Gate is right before Up in the gate_up
             let shard_gate = Shard::Offset {
@@ -1492,8 +1632,8 @@ impl PackedExperts {
             };
             let shard_down = Shard::Simple {
                 dim: 1,
-                rank: comm.rank(),
-                world_size: comm.world_size(),
+                rank: tp_rank,
+                world_size: tp_world,
             };
 
             let vb_gate_up_proj = if should_apply_immediate_isq(&vb) {
@@ -1532,9 +1672,14 @@ impl PackedExperts {
                 .t()?
                 .contiguous()?;
 
-            let gc = gate_proj.chunk(num_local_experts, 0)?;
-            let uc = up_proj.chunk(num_local_experts, 0)?;
-            let dc = down_proj.chunk(num_local_experts, 0)?;
+            // Expert parallelism: keep only this rank's experts (dim 0).
+            let gate_proj = experts.select_dim0(&gate_proj)?;
+            let up_proj = experts.select_dim0(&up_proj)?;
+            let down_proj = experts.select_dim0(&down_proj)?;
+
+            let gc = gate_proj.chunk(experts.len(), 0)?;
+            let uc = up_proj.chunk(experts.len(), 0)?;
+            let dc = down_proj.chunk(experts.len(), 0)?;
             drop((gate_proj, up_proj, down_proj));
 
             let mut gs = Vec::new();
@@ -1598,10 +1743,13 @@ impl FusedExperts {
     pub fn new(
         hidden_size: usize,
         moe_intermediate_size: usize,
-        num_experts: usize,
+        experts: &ExpertSubset,
         quantization_config: &Option<QuantizedConfig>,
         vb: ShardedVarBuilder,
     ) -> Result<Self> {
+        // The checkpoint's expert count: every expert-stacked tensor on disk
+        // has this as its leading dimension, whatever subset this rank keeps.
+        let num_experts = experts.global();
         // Detect if weights are in stacked format (e.g., Qwen3 VL MoE):
         // - experts.gate_up_proj: (num_experts, hidden_size, intermediate_size * 2)
         // - experts.down_proj: (num_experts, intermediate_size, hidden_size)
@@ -1614,6 +1762,7 @@ impl FusedExperts {
             &quantization_config,
             Some(QuantizedConfig::Afq { .. })
         ) {
+            experts.require_all("AFQ packed experts")?;
             let quantization_config = quantization_config.as_ref().unwrap();
 
             let fused_gate_proj = AfqLayer::afq_packed_linear_b(
@@ -1650,6 +1799,7 @@ impl FusedExperts {
             let has_fp8_scales = experts_vb.contains_tensor("gate_up_proj.weight_scale_inv");
 
             if has_fp8_scales {
+                experts.require_all("stacked blockwise-FP8 experts")?;
                 let weight_block_size = match quantization_config {
                     Some(QuantizedConfig::Fp8 { weight_block_size }) => weight_block_size.clone(),
                     _ => unreachable!(),
@@ -1774,6 +1924,11 @@ impl FusedExperts {
                             .and_then(|t| t.transpose(1, 2)?.contiguous())
                     })?;
 
+                // Expert parallelism: keep only this rank's slice of the expert
+                // axis (dim 0) before anything else touches the tensors.
+                let gate_up_proj = experts.select_dim0(&gate_up_proj)?;
+                let down_proj_packed = experts.select_dim0(&down_proj_packed)?;
+
                 // Split gate_up_proj into gate_proj and up_proj along the last dimension
                 let gate_proj = gate_up_proj.narrow(2, 0, moe_intermediate_size)?;
                 let up_proj =
@@ -1820,6 +1975,7 @@ impl FusedExperts {
             // Stacked format with MXFP4 quantization
             // For MXFP4, weights are stored as packed FP4 (2 values per byte)
             // with E8M0 scales
+            experts.require_all("MXFP4 packed experts")?;
             let quantization_config = quantization_config.as_ref().unwrap();
 
             // Load MXFP4 packed experts using MXFP4Layer::packed_linear_b
@@ -1889,6 +2045,11 @@ impl FusedExperts {
                         .and_then(|t| t.transpose(1, 2)?.contiguous())
                 })?;
 
+            // Expert parallelism: keep only this rank's slice of the expert
+            // axis (dim 0) before anything else touches the tensors.
+            let gate_up_proj = experts.select_dim0(&gate_up_proj)?;
+            let down_proj_packed = experts.select_dim0(&down_proj_packed)?;
+
             // Split gate_up_proj into gate_proj and up_proj along the last dimension
             // gate_proj: [num_experts, hidden_size, intermediate_size]
             // up_proj: [num_experts, hidden_size, intermediate_size]
@@ -1938,6 +2099,7 @@ impl FusedExperts {
             // Per-expert format with FP8 quantization config.
             // The actual on-disk format may be FP8 E4M3 or INT4-packed-as-I8
             // (e.g. DeepSeek V4 Flash routed experts). Detect by probing shape.
+            experts.require_all("per-expert INT4/blockwise-FP8 experts")?;
             // RUN-161: the `contains_tensor` guard makes from-uqff (which filters
             // the base expert tensors out of the varbuilder) fall through to the
             // DummyLayer path below instead of re-loading+dequantizing the base
@@ -2275,7 +2437,10 @@ impl FusedExperts {
             let mut gate_proj_vec = Vec::new();
             let mut up_proj_vec = Vec::new();
             let mut down_proj_vec = Vec::new();
-            for i in 0..num_experts {
+            // Expert parallelism: read only this rank's experts off disk. This
+            // is the one format where the slice costs nothing — the experts are
+            // separate tensors, so the unowned ones are never touched.
+            for i in experts.ids().iter().copied() {
                 let expert_vb = load_experts_vb.pp(i);
                 let gate_proj =
                     expert_vb.get((moe_intermediate_size, hidden_size), "gate_proj.weight")?;

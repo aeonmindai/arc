@@ -20,6 +20,7 @@ mod bitsandbytes;
 mod blockwise_fp8;
 pub mod calibration;
 pub mod cublaslt;
+pub mod cuda_peer;
 pub mod distributed;
 mod dummy;
 pub mod f8q8;
@@ -65,10 +66,11 @@ pub use blockwise_fp8::{
     blockwise_fp8_moe, fp8_blockwise_dequantize, fp8_blockwise_quantize,
     mx_int4_blockwise_dequantize, BlockwiseFP8Linear,
 };
+pub use cuda_peer::{enable_peer_access, PeerAccessReport, PeerAccessStatus, PeerPair};
 pub use distributed::{
     layers::{
-        compute_kv_shard, compute_n_kv_groups, ColumnParallelLayer, FusedExperts, PackedExperts,
-        ReplicatedLayer, RowParallelLayer,
+        compute_kv_shard, compute_n_kv_groups, ColumnParallelLayer, ExpertSubset, FusedExperts,
+        PackedExperts, ReplicatedLayer, RowParallelLayer,
     },
     socket::{Client, Server},
     BarrierLike, Comm, Id, RingConfig, SumAllReduce,
@@ -1418,6 +1420,26 @@ pub trait QuantMethod: Send + Sync + Debug + QuantizedSerde {
     fn gather_forward(&self, _a: &Tensor, _indices: &Tensor) -> Result<Tensor> {
         candle_core::bail!(
             "{} does not support `gather_forward`. Please raise an issue.",
+            self.name()
+        )
+    }
+
+    /// Keep only the experts named by `ids` (ascending global indices) out of
+    /// an expert-stacked weight, returning a layer that holds `ids.len()`
+    /// experts indexed `0..ids.len()`.
+    ///
+    /// This is the **expert-parallel slice**. It exists as a post-load
+    /// operation because a UQFF artifact holds every expert: the shard cannot
+    /// be applied while constructing the layer, only after
+    /// `load_from_artifacts` has deserialized it.
+    ///
+    /// The default refuses, loudly and by name. Silently returning `self`
+    /// would leave every rank holding the whole expert set while believing it
+    /// had been sharded — EP would appear to work and buy nothing.
+    fn select_experts(&self, _ids: &[usize]) -> Result<Arc<dyn QuantMethod>> {
+        candle_core::bail!(
+            "{} does not support the expert-parallel slice (`select_experts`). \
+             Run with ep_size = 1, or add the slice for this quantization.",
             self.name()
         )
     }
