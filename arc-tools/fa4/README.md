@@ -117,11 +117,41 @@ Bootstraps pip/numpy/`nvidia-cutlass-dsl`, exports a trivial `@cute.jit` kernel,
 
 Send back `/tmp/arc_fa4_rung1/manifest.json`, `/tmp/arc_fa4_rung1/link_verdict.json`, and `rustc.log` if the link failed.
 
-**Verdicts:**
+**Verdicts, and the exit code contract.** Exit `0` = pass, `1` = **genuine substrate failure** (the only result that is a strategy signal), `2` = **this machine could not answer the question**. Conflating 2 with 1 is exactly the mistake v1 made.
 
-- `GATE_PASSES__export_to_c_is_linkable_from_rust_without_python` → the substrate bet is sound; start rung 2.
-- `LINKS_BUT_DRAGS_PYTHON__investigate` → determine whether `libpython` comes from the harness or the runtime `.so`.
-- `GATE_FAILS__no_rust_callable_object` / `NO_OBJECT__GATE_FAILS` → **STOP AND REPORT IMMEDIATELY.** FlashMLA-per-arch becomes the only road and the substrate decision gets revisited on this evidence.
+| Verdict | Exit | Meaning |
+|---|---|---|
+| `GATE_PASSES__aot_object_is_linkable_from_rust_without_python` | 0 | Substrate bet sound; start rung 2. |
+| `LINKS_BUT_DRAGS_PYTHON__investigate` | 2 | Determine whether `libpython` comes from the harness or the runtime `.so`. |
+| `CALLABLE_SYMBOL_PRESENT_BUT_LINK_FAILED__environment_not_substrate` | 2 | A genuine C TEXT symbol exists; the linker could not complete (missing `libcuda`, missing runtime `.so`). **Do NOT revise the FA4→MLA decision on this.** |
+| `NO_RUSTC` | 2 | Stage C could not run at all. |
+| `GATE_FAILS__no_rust_callable_object` | 1 | No callable TEXT symbol. **This** is the result that makes FlashMLA-per-arch the only road. |
+
+## Gate v1 had a false negative — the finding, and the rule it produced
+
+**v1 reported `GATE_FAILS` on an object that was fine.** It asserted the entry point would be named `__tvm_ffi_<name>`, a name taken from NVIDIA's documentation. The object the H200 actually produced (2032 bytes, DSL 4.7.0) exports **MLIR's C-interface convention** instead:
+
+```
+arc_fa4_probe_cutlass_arc_probe_noop
+arc_fa4_probe__mlir_ciface_cutlass_arc_probe_noop
+arc_fa4_probe_args_spec
+arc_fa4_probe_function_name
+```
+
+`_mlir_ciface_` is the standard MLIR wrapper emitted **precisely so C/C++/Rust can call in** — it *is* the linkable C ABI. So the gate declared the project's single most consequential question a failure on a naming mismatch.
+
+This is the same lesson as `CuteDSLRT_Module_Load`, which the docs name and the shipped wheel does not define. **The artifact is the authority, not the documentation.** Two rules came out of it, both now enforced:
+
+1. **Never test for a predicted name.** Enumerate `nm -g --defined-only`, filter ELF type `T`, and *rank* candidates by pattern. A future DSL rename degrades to a worse ranking, never a false failure. (Ranking normalises the platform's leading-underscore convention, so the mangled `_mlir_`-prefixed twin cannot outrank the clean exported spelling.)
+2. **Never let a host-environment artifact read as a substrate verdict.** A missing `libcuda` on a dev machine says nothing about CuTeDSL. `-lcuda` is now optional — the link is attempted with it and retried without — and environment failures get their own verdict code and exit 2.
+
+The only reason this was caught is that the probe **dumped the full symbol list instead of merely asserting on one name**. That property is worth more than the assertion was.
+
+## Rung-2 design constraint: native cubin, never PTX
+
+Discovered on the H200 after the first gate run: the box's **driver 580.173.02 supports CUDA 13.0, but the only toolkit is 13.1**. Anything that ships PTX and relies on driver JIT dies with `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`; a **native cubin (SASS) for the exact arch loads fine**. `rung1_gate.sh` now compares `nvidia-smi`'s driver-max CUDA against `nvcc --version` and prints the trap explicitly.
+
+**Rung 2 must load native cubin for `sm_90`, not PTX.** Design around this now rather than discovering it during the binding work.
 
 The probe assumes nothing about the API surface: `export_to_c` is tried in four argument shapes and `dump_to_object` in two, each outcome recorded separately, and the generated header is dumped **verbatim** — the header is the ABI contract, and reading it beats guessing at it. One run yields everything needed to design rung 2 whether it passes or fails.
 

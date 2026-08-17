@@ -5,14 +5,38 @@ THE GATE
 --------
 The whole FA4->MLA bet rests on one question:
 
-    Does `export_to_c()` emit a linkable `.o` exposing `__tvm_ffi_<name>`
-    symbols that Rust can call, with NO Python at runtime?
+    Does the AOT export emit a linkable `.o` with a C-callable entry point
+    that Rust can reach, with NO Python at runtime?
 
 If the answer is no, hand-written FlashMLA-per-arch is the only road and the
-strategy has to be revisited on evidence. So this stage assumes NOTHING about
-the API surface: it tries every plausible spelling, records exactly what each
-one did, and dumps the generated header verbatim — the header IS the ABI
-contract, and reading it beats guessing at it.
+strategy has to be revisited on evidence.
+
+WHAT v1 GOT WRONG, AND THE RULE IT PRODUCED
+-------------------------------------------
+v1 asserted the entry symbol would be named `__tvm_ffi_<name>` — a name taken
+from NVIDIA's documentation — and reported GATE_FAILS on an object that in fact
+carried perfectly good C symbols under MLIR's own convention:
+
+    arc_fa4_probe_cutlass_arc_probe_noop
+    arc_fa4_probe__mlir_ciface_cutlass_arc_probe_noop
+    arc_fa4_probe_args_spec
+
+`_mlir_ciface_` is the standard MLIR wrapper emitted precisely so C/C++/Rust
+can call in — it IS the linkable C ABI. That was a false negative on the single
+most consequential question in the project.
+
+Same lesson as `CuteDSLRT_Module_Load`, which NVIDIA's AOT docs name and the
+shipped wheel does not define: THE ARTIFACT IS THE AUTHORITY, NOT THE
+DOCUMENTATION. So this stage now enumerates `nm -g --defined-only`, keeps the
+FULL untruncated table, classifies by ELF symbol type, and RANKS candidates by
+pattern instead of testing for one predicted name. A future DSL rename degrades
+to a worse ranking, never to a false failure.
+
+It also introspects `inspect.signature` before calling the export functions
+rather than brute-forcing argument shapes (every v1 `export_to_c` attempt died
+on `missing 1 required positional argument: 'file_name'`), and — since no `.h`
+was emitted — it extracts the bytes of `<prefix>_args_spec`, which is the
+actual calling convention rung 2 needs.
 
 Output: /tmp/arc_fa4_rung1/manifest.json, consumed by rung1_link_test.sh,
 which does stage C (link from Rust, run, prove no libpython).
@@ -107,17 +131,64 @@ def try_export(compiled) -> None:
     M["exportish_attrs"] = exportish
     print(f"  export-shaped attributes on the compiled object:\n    {exportish}")
 
-    # Each candidate: (label, callable). Signatures differ across DSL minors,
-    # so every one is tried in several shapes and the outcome recorded.
-    candidates = [
+    # Read the ACTUAL signatures rather than guessing at them. v1 of this probe
+    # brute-forced argument shapes and every export_to_c call died on
+    # `missing 1 required positional argument: 'file_name'`; introspecting first
+    # turns that into a correct call.
+    import inspect
+
+    sigs: dict[str, Any] = {}
+    for a in exportish:
+        try:
+            fn = getattr(compiled, a)
+            if callable(fn):
+                sigs[a] = str(inspect.signature(fn))
+                doc = (inspect.getdoc(fn) or "").strip().splitlines()
+                sigs[a + "__doc"] = " ".join(doc[:4])[:400]
+        except BaseException as exc:  # noqa: BLE001
+            sigs[a] = f"<unavailable: {type(exc).__name__}>"
+    M["export_signatures"] = sigs
+    print("  signatures:")
+    for a in exportish:
+        if a in sigs:
+            print(f"    {a}{sigs[a]}")
+            if sigs.get(a + "__doc"):
+                print(f"        {sigs[a + '__doc'][:200]}")
+
+    def by_signature(attr: str):
+        """Call `attr` filling its parameters by NAME from what we know."""
+        fn = getattr(compiled, attr)
+        params = inspect.signature(fn).parameters
+        kwargs = {}
+        for pname, p in params.items():
+            if pname in ("self",) or p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
+                continue
+            low = pname.lower()
+            if "file" in low or "name" in low:
+                kwargs[pname] = name
+            elif "dir" in low or "path" in low or "folder" in low:
+                kwargs[pname] = OUT
+            elif p.default is inspect.Parameter.empty:
+                # A required parameter we cannot infer — surface it loudly.
+                kwargs[pname] = name
+        return fn(**kwargs)
+
+    # Signature-driven calls first, then the brute-force shapes as a fallback so
+    # a surprising signature still gets covered.
+    candidates: list[tuple[str, Any]] = []
+    for attr in ("export_to_c", "dump_to_object"):
+        if hasattr(compiled, attr):
+            candidates.append((f"{attr}(<by signature>)",
+                               (lambda a=attr: by_signature(a))))
+    candidates += [
+        ("export_to_c(file_name=name)",
+         lambda: compiled.export_to_c(file_name=name)),
+        ("export_to_c(OUT, file_name=name)",
+         lambda: compiled.export_to_c(OUT, file_name=name)),
         ("export_to_c(dir, name)",
          lambda: compiled.export_to_c(OUT, name)),
         ("export_to_c(name)",
          lambda: compiled.export_to_c(name)),
-        ("export_to_c(dir)",
-         lambda: compiled.export_to_c(OUT)),
-        ("export_to_c()",
-         lambda: compiled.export_to_c()),
         ("dump_to_object(name)",
          lambda: compiled.dump_to_object(name)),
         ("dump_to_object()",
@@ -184,6 +255,60 @@ def try_export(compiled) -> None:
 # ---------------------------------------------------------------------------
 
 
+def extract_data_symbol(obj: str, sym: str) -> dict[str, Any] | None:
+    """Dump the bytes a DATA symbol points at.
+
+    With no header emitted, `<prefix>_args_spec` IS the calling convention —
+    it is the thing rung 2 has to read. `objdump -t` gives the section, offset
+    and size; `objcopy --dump-section` gives the section bytes; we slice.
+    """
+    try:
+        t = subprocess.run(["objdump", "-t", obj], capture_output=True,
+                           text=True, timeout=120).stdout
+        section = offset = size = None
+        for ln in t.splitlines():
+            if ln.split()[-1:] != [sym]:
+                continue
+            parts = ln.split()
+            # objdump -t: <value> <flags...> <section> <size> <name>
+            try:
+                offset = int(parts[0], 16)
+                size = int(parts[-2], 16)
+                section = parts[-3]
+            except (ValueError, IndexError):
+                return {"error": f"unparsed objdump line: {ln[:200]}"}
+            break
+        if section is None:
+            return {"error": "symbol not found in objdump -t"}
+        if not size:
+            # Size 0 usually means a NUL-terminated string; grab a window and
+            # cut at the terminator below.
+            size = 4096
+
+        raw_path = f"{obj}.{sym}.section.bin"
+        rc = subprocess.run(
+            ["objcopy", "--dump-section", f"{section}={raw_path}", obj],
+            capture_output=True, text=True, timeout=120)
+        if rc.returncode != 0 or not os.path.exists(raw_path):
+            return {"error": f"objcopy failed: {rc.stderr[:200]}",
+                    "section": section, "offset": offset, "size": size}
+
+        with open(raw_path, "rb") as fh:
+            blob = fh.read()[offset:offset + size]
+        if b"\x00" in blob:
+            blob = blob.split(b"\x00", 1)[0] or blob
+        printable = sum(1 for b in blob if 32 <= b < 127 or b in (9, 10, 13))
+        out: dict[str, Any] = {"section": section, "offset": offset,
+                               "nbytes": len(blob)}
+        if blob and printable / len(blob) > 0.85:
+            out["text"] = blob.decode("utf-8", "replace")
+        else:
+            out["hex"] = blob[:512].hex()
+        return out
+    except BaseException as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+
+
 def describe_abi() -> None:
     sect("STAGE B — ABI description (header is the contract)")
 
@@ -200,24 +325,118 @@ def describe_abi() -> None:
     if not M["artifacts"].get("headers"):
         print("  no header emitted")
 
-    # --- symbol table of the object. The gate symbol is __tvm_ffi_<name>.
+    # --- symbol table.
+    #
+    # v1 of this probe looked ONLY for `__tvm_ffi_*` — a name taken from
+    # NVIDIA's docs — and reported GATE_FAILS on an object that in fact carried
+    # perfectly good C symbols under MLIR's own convention
+    # (`<prefix>_<kernel>` and `<prefix>__mlir_ciface_<kernel>`). Same lesson as
+    # CuteDSLRT_Module_Load, which the docs name and the wheel does not define:
+    # THE ARTIFACT IS THE AUTHORITY, NOT THE DOCUMENTATION.
+    #
+    # So: enumerate everything, keep the FULL list, classify by ELF symbol type,
+    # and RANK candidates by pattern rather than testing for one hardcoded name.
+    # A future DSL rename then degrades to a worse ranking, not a false failure.
     for o in M["artifacts"].get("objects") or []:
         p = o["path"]
         try:
             out = subprocess.run(["nm", "-g", "--defined-only", p],
                                  capture_output=True, text=True, timeout=120)
-            lines = [ln for ln in out.stdout.splitlines() if ln.strip()]
-            syms = [ln.split()[-1] for ln in lines]
-            tvm = [s for s in syms if "tvm_ffi" in s.lower()]
-            M["symbols"][p] = {"all": syms[:200], "tvm_ffi": tvm}
-            print(f"\n  {p}: {len(syms)} defined global symbols, "
-                  f"{len(tvm)} tvm_ffi")
-            for s in tvm[:20]:
-                print(f"      TVM_FFI  {s}")
-            for s in [s for s in syms if s not in tvm][:20]:
-                print(f"      sym      {s}")
+            raw = out.stdout
+            # Persist the untruncated table — inspectors upstream have clipped it.
+            dump = p + ".symbols.txt"
+            with open(dump, "w") as fh:
+                fh.write(raw)
+
+            entries = []
+            for ln in raw.splitlines():
+                parts = ln.split()
+                if len(parts) >= 2:
+                    entries.append({"type": parts[-2], "name": parts[-1]})
+            text = [e["name"] for e in entries if e["type"].upper() == "T"]
+            data = [e for e in entries if e["type"].upper() != "T"]
+
+            def score(s: str) -> int:
+                # Normalise away the platform's leading-underscore convention
+                # (Mach-O prepends one, ELF does not) so the same rule ranks
+                # correctly on both.
+                bare = s.lstrip("_")
+                lead = len(s) - len(bare)
+                v = 0
+                # The MLIR C-interface wrapper exists precisely so C/C++/Rust
+                # can call in. It is the intended external entry point.
+                if "_mlir_ciface_" in s:
+                    v += 100
+                if "tvm_ffi" in s.lower():
+                    v += 60
+                # `_mlir_`-prefixed duplicates are the internally mangled forms
+                # of the same function; prefer the clean exported spelling.
+                # Checked on the de-underscored name so `_mlir_x` and `__mlir_x`
+                # are both caught.
+                if bare.startswith("mlir_"):
+                    v -= 40
+                # Fewer leading underscores = the more public spelling. This is
+                # also the tie-break that keeps the mangled twin from winning.
+                v -= 5 * lead
+                return v
+
+            ranked = sorted(text, key=lambda s: (-score(s), s))
+            M["symbols"][p] = {
+                "full_table_path": dump,
+                "all": [e["name"] for e in entries],
+                "by_type": entries,
+                "text": text,
+                "ranked_candidates": [{"name": s, "score": score(s)}
+                                      for s in ranked],
+                "tvm_ffi": [s for s in text if "tvm_ffi" in s.lower()],
+                "mlir_ciface": [s for s in text if "_mlir_ciface_" in s],
+            }
+            print(f"\n  {p}: {len(entries)} defined global symbols "
+                  f"({len(text)} TEXT). Full table -> {dump}")
+            for e in entries:
+                print(f"      [{e['type']}] {e['name']}")
+            print("    ranked callable candidates:")
+            for s in ranked[:6]:
+                print(f"      score {score(s):4d}  {s}")
             if out.returncode != 0:
                 print(f"      (nm stderr: {out.stderr[:200]})")
+
+            # --- the non-TEXT symbols are the ABI contract when no .h is
+            #     emitted: `*_args_spec` and `*_function_name` describe how to
+            #     call the kernel. Extract their bytes.
+            for e in data:
+                nm_ = e["name"]
+                if not any(t in nm_ for t in ("args_spec", "function_name",
+                                              "arg_spec", "signature")):
+                    continue
+                blob = extract_data_symbol(p, nm_)
+                if blob is not None:
+                    M["symbols"][p].setdefault("data_blobs", {})[nm_] = blob
+                    print(f"\n    --- {nm_} ({blob.get('nbytes')} bytes,"
+                          f" section {blob.get('section')}) ---")
+                    if blob.get("text"):
+                        print("      " + blob["text"][:1200].replace(
+                            "\n", "\n      "))
+                    elif blob.get("hex"):
+                        print("      hex: " + blob["hex"][:300])
+                    elif blob.get("error"):
+                        print(f"      (extraction failed: {blob['error']})")
+
+            # Belt-and-braces: `strings` on the object recovers args_spec /
+            # function_name content even when the objdump symbol-table parse
+            # fails (its output format is not portable). The contract is what
+            # matters; how we recover it does not.
+            try:
+                st = subprocess.run(["strings", "-a", "-n", "6", p],
+                                    capture_output=True, text=True, timeout=120)
+                found = [ln for ln in st.stdout.splitlines() if ln.strip()]
+                M["symbols"][p]["strings"] = found[:200]
+                print("\n    strings(1) in the object (args_spec / "
+                      "function_name content lives here):")
+                for ln in found[:40]:
+                    print(f"      {ln[:200]}")
+            except BaseException as exc:  # noqa: BLE001
+                err(f"strings {p}", exc)
         except BaseException as exc:  # noqa: BLE001
             err(f"nm {p}", exc)
 
@@ -273,27 +492,45 @@ def describe_abi() -> None:
 def verdict() -> None:
     sect("RUNG 1 STAGE A/B VERDICT")
     objs = M["artifacts"].get("objects") or []
-    tvm_syms = [s for v in M["symbols"].values() for s in v.get("tvm_ffi", [])]
 
-    if objs and tvm_syms:
-        v = "OBJECT_AND_TVM_FFI_SYMBOLS_PRESENT__proceed_to_link_test"
+    # Rank across every object. The gate is "is there a callable C symbol",
+    # NOT "is there a symbol with the name the docs predicted".
+    ranked: list[dict[str, Any]] = []
+    for v_ in M["symbols"].values():
+        ranked += v_.get("ranked_candidates") or []
+    ranked.sort(key=lambda c: -c["score"])
+    gate_symbol = ranked[0]["name"] if ranked else None
+
+    # Which call actually produced the object? That decides the rung-2 plan.
+    produced_by = None
+    for a in M["attempts"]:
+        if a.get("ok") and (a.get("new_files") or a.get("written_from_bytes")):
+            produced_by = a["call"]
+            break
+
+    if objs and gate_symbol:
+        v = "OBJECT_WITH_CALLABLE_C_SYMBOLS__proceed_to_link_test"
     elif objs:
-        v = "OBJECT_BUT_NO_TVM_FFI_SYMBOL__inspect_symbol_list"
+        v = "OBJECT_BUT_NO_TEXT_SYMBOL__inspect_symbol_list"
     else:
         v = "NO_OBJECT_EMITTED__gate_fails_here"
 
     M["verdict"] = {
         "code": v,
         "n_objects": len(objs),
-        "tvm_ffi_symbols": tvm_syms,
-        "gate_symbol": tvm_syms[0] if tvm_syms else None,
+        "gate_symbol": gate_symbol,
+        "candidates": ranked[:10],
+        "produced_by": produced_by,
     }
     print(f"  {v}")
-    print(f"  objects: {len(objs)}   tvm_ffi symbols: {tvm_syms or 'none'}")
+    print(f"  objects: {len(objs)}   produced by: {produced_by or 'unknown'}")
+    print(f"  gate symbol: {gate_symbol or 'none'}")
+    for c in ranked[:5]:
+        print(f"      score {c['score']:4d}  {c['name']}")
     if v.startswith("NO_OBJECT"):
-        print("\n  => STOP AND REPORT. export_to_c() did not produce a linkable")
-        print("     object on this DSL version. FlashMLA-per-arch becomes the")
-        print("     only road and the strategy needs revisiting on this evidence.")
+        print("\n  => STOP AND REPORT. No linkable object on this DSL version.")
+        print("     FlashMLA-per-arch becomes the only road and the substrate")
+        print("     decision needs revisiting on this evidence.")
     else:
         print("\n  => Next: bash arc-tools/fa4/rung1_link_test.sh")
 

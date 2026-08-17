@@ -44,6 +44,27 @@ command -v rustc >/dev/null 2>&1 && echo "  rustc        $(rustc --version)" || 
 command -v nvcc  >/dev/null 2>&1 && echo "  nvcc         $(nvcc --version | tail -1)" || echo "  nvcc         missing"
 nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader 2>/dev/null | sed 's/^/  gpu          /'
 
+# ---- driver vs toolkit: the PTX-JIT trap ----------------------------------
+# `nvidia-smi` reports the highest CUDA version the DRIVER can JIT. If the
+# toolkit is newer than that, anything shipping PTX and relying on JIT dies with
+# CUDA_ERROR_UNSUPPORTED_PTX_VERSION, while a NATIVE CUBIN for the exact arch
+# loads fine. This is a live mismatch on our H200 (driver 580.173.02 -> CUDA
+# 13.0, toolkit 13.1), so it is checked here and it constrains rung 2: load
+# native cubin/SASS, never PTX.
+DRV_CUDA=$(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version: *\([0-9.]*\).*/\1/p' | head -1)
+TK_CUDA=$(nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9.]*\).*/\1/p' | head -1)
+echo "  driver max CUDA: ${DRV_CUDA:-unknown}   toolkit: ${TK_CUDA:-unknown}"
+if [ -n "${DRV_CUDA:-}" ] && [ -n "${TK_CUDA:-}" ]; then
+    if [ "$(printf '%s\n%s\n' "$DRV_CUDA" "$TK_CUDA" | sort -V | head -1)" = "$DRV_CUDA" ] \
+       && [ "$DRV_CUDA" != "$TK_CUDA" ]; then
+        echo "  ** PTX-JIT TRAP: toolkit $TK_CUDA > driver-supported $DRV_CUDA."
+        echo "     PTX will fail with CUDA_ERROR_UNSUPPORTED_PTX_VERSION."
+        echo "     Rung 2 MUST load native cubin (SASS) for sm_90, not PTX."
+    else
+        echo "  driver/toolkit CUDA versions compatible for PTX JIT"
+    fi
+fi
+
 echo
 echo "############ 1. stage A/B — export + ABI ############"
 python3 "$HERE/rung1_export.py"
