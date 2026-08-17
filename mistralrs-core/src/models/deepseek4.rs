@@ -33,7 +33,8 @@
 //!   `x + sublayer(norm(x))` residual at every layer. See
 //!   [`super::dsv4_mhc::V4MHCLayerParams`].
 //! - **Sparse attention dispatch** per layer via `compress_ratios`:
-//!   - `0`  → standard MQA (layers 0, 1, 42 only)
+//!   - `0`  → standard MQA (layers 0 and 1, plus slot 43 = the MTP block;
+//!     layer 42 is ratio 4, NOT standard)
 //!   - `4`  → CSA (compressor + C4 indexer top-k=512)
 //!   - `128` → HCA (compressor only, dense MQA over 128× compressed K)
 //! - **FP8 e4m3 + UE8M0 scales**, 128×128 weight blocks. Companion
@@ -883,7 +884,7 @@ struct Attention {
     /// forward — for a constant weight. Profiled at ~69ms/token (27% of decode,
     /// the single biggest cost). Built once on first forward, reused after.
     wo_a_t_cache: std::sync::RwLock<Option<Tensor>>,
-    /// RoPE — either `rope_theta`-based (standard layers 0/1/42) or
+    /// RoPE — either `rope_theta`-based (standard layers 0/1/43) or
     /// `compress_rope_theta`-based (compress layers). Caller picks at
     /// construction. Audit §0 + §8 P1 item 11.
     rotary_emb: Arc<DeepSeekV2RotaryEmbedding>,
@@ -1497,7 +1498,7 @@ impl Attention {
         // layers add the compressed (distant-context) branch in the same
         // single softmax. The previous wiring sent Standard layers through
         // dense causal SDPA / the dense paged kernel, which fed the
-        // window-trained layers 0/1/42 unseen relative distances and
+        // window-trained layers 0/1/43 unseen relative distances and
         // collapsed generation once the context crossed the 128-token
         // window (the long-ctx repetition failure; window-only ablation
         // unaffected because these layers are not gated by it).

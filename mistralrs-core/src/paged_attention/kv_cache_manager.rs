@@ -129,6 +129,20 @@ impl KVCacheManager {
         kv_cache_group_ids: Vec<u32>,
         segmented: bool,
     ) -> Self {
+        // Announce the backing, once per manager. This is the only way an
+        // operator (or a validation script) can tell the segmented path
+        // actually engaged: without it, a binary built *without* this change
+        // silently ignores `ARC_SEGMENTED_KV`, runs the control twice, and
+        // reports a perfect 1.00x ratio with identical output — a fake pass
+        // that looks exactly like a real one. Assert on this line, not on the
+        // environment variable.
+        if segmented {
+            tracing::info!(
+                "KV cache backing: SEGMENTED allocator (ARC_SEGMENTED_KV). \
+                 Per-request block tracking is a list of runs; dense models \
+                 run the degenerate 1-segment case."
+            );
+        }
         Self {
             block_pool: BlockPool::new(num_gpu_blocks, enable_caching, block_size),
             block_size,
