@@ -8,9 +8,12 @@
 //! 1. Normalize the input vector and store its L2 norm as fp16.
 //! 2. Apply a randomized Walsh-Hadamard rotation (D·H·D where D is a diagonal
 //!    of random ±1 signs and H is the Hadamard matrix). This makes every
-//!    coordinate follow a Beta(d/2, d/2) distribution regardless of input.
-//! 3. Quantize each coordinate independently using pre-computed Lloyd-Max
-//!    optimal codebooks for the Beta distribution.
+//!    coordinate follow the `S^{d-1}` coordinate marginal — density
+//!    `∝ (1 - x²)^((d-3)/2)` on [-1, 1], i.e. `(x+1)/2 ~ Beta((d-1)/2, (d-1)/2)`
+//!    — regardless of input.
+//! 3. Quantize each coordinate independently using Lloyd-Max optimal codebooks
+//!    for that density ([`codebook`] for the shipped dims, [`generate`] for
+//!    the rest).
 //! 4. Pack the quantized indices into sub-byte storage (4-bit nibble or
 //!    3-bit 10-in-32 packing).
 //!
@@ -20,9 +23,13 @@
 
 #[allow(clippy::excessive_precision)]
 pub mod codebook;
+pub mod generate;
+pub mod layout;
 pub mod wht;
 
 use codebook::Codebook;
+pub use generate::{MAX_BLOCK_DIM, MIN_BLOCK_DIM};
+pub use layout::{block_plan, BlockSpec, TurboQuantLayout};
 use serde::{Deserialize, Serialize};
 
 /// TurboQuant compression preset.
@@ -69,11 +76,23 @@ impl TurboQuantPreset {
     }
 
     /// Approximate memory compression ratio vs FP16.
+    ///
+    /// Accounts for block decomposition: a non-power-of-two `head_dim` stores
+    /// one `f16` norm per block, not one per vector, so the ratio for
+    /// `head_dim = 112` (three blocks) is genuinely below the `head_dim = 128`
+    /// one. See [`layout`].
     pub fn compression_ratio(&self, head_dim: usize) -> f32 {
         let fp16_bytes = (head_dim * 2 * 2) as f32; // K + V, 2 bytes each
-        let k_bytes = packed_size(head_dim, self.key_bits());
-        let v_bytes = packed_size(head_dim, self.value_bits());
-        let tq_bytes = (k_bytes + v_bytes + 4) as f32; // +4 for two fp16 norms
+        let stored = |bits: u32| -> usize {
+            match TurboQuantLayout::new(head_dim, bits, 0) {
+                Ok(l) => l.stored_bytes(),
+                // Below MIN_BLOCK_DIM there is no layout; fall back to the
+                // uncompressed size so the ratio degrades to 1.0 rather than
+                // reporting a saving that cannot be realised.
+                Err(_) => head_dim * 2,
+            }
+        };
+        let tq_bytes = (stored(self.key_bits()) + stored(self.value_bits())) as f32;
         fp16_bytes / tq_bytes
     }
 }
@@ -93,8 +112,13 @@ impl std::fmt::Display for TurboQuantPreset {
 pub struct TurboQuantConfig {
     /// Compression preset (determines key/value bit-widths).
     pub preset: TurboQuantPreset,
-    /// Head dimension. Must be 64, 128, or 256.
+    /// Key head dimension. Any value in `[MIN_BLOCK_DIM, MAX_BLOCK_DIM]`;
+    /// non-powers-of-two are handled by block decomposition (see [`layout`]).
     pub head_dim: usize,
+    /// Value head dimension. Equal to `head_dim` for every standard-layout
+    /// model, but MLA-style architectures cache K and V at different widths,
+    /// so the two are tracked separately.
+    pub v_head_dim: usize,
     /// Number of recent tokens to keep in full FP16 precision.
     /// These tokens are not compressed. Default: 128.
     pub fp16_window: usize,
@@ -108,13 +132,62 @@ impl TurboQuantConfig {
         Self {
             preset: TurboQuantPreset::Default,
             head_dim,
+            v_head_dim: head_dim,
             fp16_window: 128,
             seed: 42,
         }
     }
 
+    /// Fallible constructor: rejects head dimensions TurboQuant cannot serve
+    /// instead of deferring the panic to the first `append`.
+    pub fn try_new(head_dim: usize, v_head_dim: usize) -> Result<Self, String> {
+        let cfg = Self {
+            preset: TurboQuantPreset::Default,
+            head_dim,
+            v_head_dim,
+            fp16_window: 128,
+            seed: 42,
+        };
+        // Building both layouts validates dims *and* bit-widths up front.
+        cfg.key_layout()?;
+        cfg.value_layout()?;
+        Ok(cfg)
+    }
+
+    /// Whether TurboQuant can compress a vector of this width at all.
+    ///
+    /// The only true lower bound is [`MIN_BLOCK_DIM`]: below it there is
+    /// nothing for the rotation to flatten. Notably this is *not* a
+    /// power-of-two test — 80, 96, 112 and 192 are all supported via block
+    /// decomposition.
+    pub fn supports_head_dim(head_dim: usize) -> bool {
+        (MIN_BLOCK_DIM..=MAX_BLOCK_DIM).contains(&head_dim)
+    }
+
+    /// Packed layout for key vectors.
+    pub fn key_layout(&self) -> Result<TurboQuantLayout, String> {
+        TurboQuantLayout::new(self.head_dim, self.preset.key_bits(), self.seed)
+    }
+
+    /// Packed layout for value vectors.
+    ///
+    /// Uses a different seed base than the key layout so K and V of the same
+    /// token are not rotated by an identical sign pattern.
+    pub fn value_layout(&self) -> Result<TurboQuantLayout, String> {
+        TurboQuantLayout::new(
+            self.v_head_dim,
+            self.preset.value_bits(),
+            self.seed ^ 0x5644_4C41_5945_5253,
+        )
+    }
+
     pub fn with_preset(mut self, preset: TurboQuantPreset) -> Self {
         self.preset = preset;
+        self
+    }
+
+    pub fn with_v_head_dim(mut self, v_head_dim: usize) -> Self {
+        self.v_head_dim = v_head_dim;
         self
     }
 
@@ -135,7 +208,7 @@ impl TurboQuantConfig {
 
     /// Get the codebook for value vectors.
     pub fn value_codebook(&self) -> Codebook {
-        codebook::get_codebook(self.head_dim, self.preset.value_bits())
+        codebook::get_codebook(self.v_head_dim, self.preset.value_bits())
     }
 }
 

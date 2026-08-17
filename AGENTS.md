@@ -1,7 +1,38 @@
 <!-- AGENTS.md: Guidance for AI agents to navigate, build, test, and contribute to this repository -->
 # AGENTS
 
-This file provides instructions for AI agents to understand the layout of the `mistral.rs` repository, run builds/tests, and follow project conventions.
+This file provides instructions for AI agents to understand the layout of the repository, run builds/tests, and follow project conventions.
+
+> This repo is **Arc**, a fork of mistral.rs. Much of the text below is inherited
+> upstream guidance and still refers to `mistral.rs`; it remains accurate for the
+> `mistralrs-*` crates.
+
+## Named systems — orient here first
+
+Arc is organised as named systems, and **no subsystem may be left without an
+absolute parent system name**. Before adding code, find its parent. The full tree
+— every subsystem, where it lives, and what is shipped vs planned vs nonexistent
+— is **`memory/mission/TAXONOMY.md`**.
+
+```
+Arc ── ArcServe · ArcInfer (ArcSched, ArcKV, ArcAttention, ArcSpec, ArcMoE,
+       ArcGraph, ArcSample, ArcBoost) · ArcModels · ArcQuant (QTIP, TurboQuant,
+       ArcBake) · ArcKernels (ArcTarget) · ArcFormat · ArcLab · ArcGate
+```
+
+New model or architecture → **ArcModels**. New GPU or arch → **ArcTarget**.
+State the parent on the first line of a new module's `//!` doc.
+
+## Arc crates
+
+- `/arc-cli/`             : the `arc` binary — run, serve, bench, validate (ArcServe/CLI)
+- `/arc-engine/`          : Rust façade + Tier-A research modules (ArcServe/SDK)
+- `/arc-cuda-graph/`      : GPU-autonomous decode, GPU sampler (ArcGraph)
+- `/arc-turbo/`           : TurboQuant KV cache type — experimental, off by default
+- `/arc-profiler/`        : wall/device/sync span-tree profiler (ArcLab/Profiler)
+- `/arc-bench/`           : AA-AgentPerf trajectory replay harness (ArcLab/Bench)
+- `/arc-tools/`           : shell + Python ops tooling — **not a Cargo crate** (ArcLab/Ops)
+- `/memory/mission/`      : mission record — TAXONOMY, per-wave engineering logs
 
 ## Repository Structure
 

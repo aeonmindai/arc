@@ -9,7 +9,8 @@
 //! V4 attention is a **single online softmax over a union of key sets**, not a
 //! learned gate and not a blend of separate softmaxes:
 //!
-//! - **Standard (`compress_ratio == 0`, layers 0/1/42 + MTP)**: sliding-window
+//! - **Standard (`compress_ratio == 0`, layers 0 and 1 plus slot 43, the MTP
+//!   block — NOT layer 42, which is CSA)**: sliding-window
 //!   attention over the last `window` raw tokens + `attn_sink`. NOT dense
 //!   causal! Both production references window ratio-0 layers exactly like the
 //!   raw branch of CSA/HCA, just with no compressed branch:
@@ -24,7 +25,7 @@
 //!   window-trained heads key/query relative distances they never saw in
 //!   training; on hardware this collapsed generation into repetition loops the
 //!   moment the context crossed 128 tokens, regardless of the compressed
-//!   branch (`ARC_V4_WINDOW_ONLY` made no difference — layers 0/1/42 were the
+//!   branch (`ARC_V4_WINDOW_ONLY` made no difference — layers 0/1/43 were the
 //!   ones polluting the stream).
 //! - **CSA (`compress_ratio == 4`) / HCA (`compress_ratio == 128`)**: one
 //!   softmax over `[raw sliding-window KV ++ compressed KV]`, plus the per-head
@@ -397,6 +398,39 @@ fn ragged_union_mask(
 pub(crate) fn raw_keep_span(t_q: usize, window: usize, t_k_full: usize) -> (usize, usize) {
     let keep = (t_q + window - 1).min(t_k_full);
     (t_k_full - keep, keep)
+}
+
+/// The `SdpaParams::sliding_window` a V4 layer may declare, given the key axis
+/// [`dsv4_attention`] actually hands to the backend.
+///
+/// `sinks_attn` forwards `sdpa_params.sliding_window` to the fused flash-sinks
+/// kernels as `window_size`, and those kernels apply it as a bottom-right
+/// aligned *relative-distance* window over the key axis they are given. So the
+/// only correct value is the one that describes that axis:
+///
+/// * **Standard** (`compress_ratio == 0`): the axis is the raw sliding-window
+///   span and nothing else, so a relative-distance window of `sliding_window`
+///   selects exactly the set this module's own mask selects — `Some(window)`.
+/// * **CSA / HCA**: the axis is the concatenation `[raw sliding-window KV ++
+///   compressed KV]`. Relative distance across it is meaningless — compressed
+///   entry `j` stands for absolute position `j * ratio`, arbitrarily far back,
+///   not `t_k - j` — so *any* window applied to it deletes exactly the
+///   distant-context keys the compressed branch exists to supply. `None`.
+///
+/// Reference audit §1(e) found this inverted: Standard declared `None` and the
+/// compressed ratios declared `Some(128)`. It was inert only because
+/// `flash_sinks_ok` rejects `head_dim = 512` (`attention/backends/sinks.rs`),
+/// which is the head dim every V4 layer uses — i.e. it is a landmine that arms
+/// itself the moment a 512-wide flash-sinks kernel lands, and silently, because
+/// the fused path takes no mask to disagree with.
+pub(crate) fn sdpa_sliding_window(
+    compress_ratio: CompressRatio,
+    sliding_window: usize,
+) -> Option<usize> {
+    match compress_ratio {
+        CompressRatio::Standard => Some(sliding_window),
+        CompressRatio::Csa | CompressRatio::Hca => None,
+    }
 }
 
 /// Per-call configuration for V4 hybrid attention.
@@ -1319,6 +1353,86 @@ mod tests {
         assert_eq!(out.dims(), &[b, h, t_q, d]);
         let data: Vec<f32> = out.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
         assert!(data.iter().all(|x| x.is_finite()));
+        Ok(())
+    }
+
+    /// Audit §1(e): `SdpaParams::sliding_window` must describe the key axis
+    /// this module hands the backend, and it was inverted.
+    ///
+    /// `sinks_attn` passes it to the fused flash-sinks kernels as
+    /// `window_size`, a bottom-right-aligned relative-distance window over
+    /// that axis. Two claims, both checked here rather than asserted:
+    ///
+    /// 1. the orientation itself — Standard is the only ratio whose key axis
+    ///    *is* the raw sliding window;
+    /// 2. that declaring a window on CSA is not harmless: at a decode position
+    ///    past the window the union axis is wider than `sliding_window`, so a
+    ///    relative-distance window over it necessarily deletes columns — and
+    ///    the columns it deletes carry signal, which the output difference
+    ///    against the same call with no compressed branch measures.
+    ///
+    /// Inert today only because `flash_sinks_ok` rejects `head_dim = 512`
+    /// (`attention/backends/sinks.rs`), the head dim every V4 layer uses. A
+    /// 512-wide flash-sinks kernel arms it, silently, because the fused path
+    /// takes no mask that could disagree.
+    #[test]
+    fn sdpa_sliding_window_describes_the_key_axis_the_dispatch_builds() -> Result<()> {
+        // (1) Orientation.
+        assert_eq!(
+            sdpa_sliding_window(CompressRatio::Standard, 128),
+            Some(128),
+            "Standard's key axis is the raw sliding window and nothing else"
+        );
+        assert_eq!(
+            sdpa_sliding_window(CompressRatio::Csa, 128),
+            None,
+            "CSA's key axis is [raw ++ compressed]; a relative-distance window \
+             over it deletes distant-context keys"
+        );
+        assert_eq!(sdpa_sliding_window(CompressRatio::Hca, 128), None);
+
+        // (2) What a window on CSA would delete, and whether it matters.
+        let device = Device::Cpu;
+        let (b, h, d) = (1, 2, 16);
+        let window = 4usize;
+        let (t_k, t_q, t_c) = (32usize, 1usize, 8usize);
+        let q = mk(b, h, t_q, d, 0.1, &device)?;
+        let k = mk(b, 1, t_k, d, 0.2, &device)?;
+        let v = mk(b, 1, t_k, d, 0.3, &device)?;
+        let comp = mk(b, 1, t_c, d, 0.05, &device)?;
+
+        // The union axis this module builds for that call: the reachable raw
+        // span (`raw_keep_span`) followed by every compressed row.
+        let (_, raw_keep) = raw_keep_span(t_q, window, t_k);
+        let union_width = raw_keep + t_c;
+        assert!(
+            union_width > window,
+            "a {window}-wide relative-distance window over a {union_width}-wide \
+             union axis must delete columns; the premise of this test"
+        );
+
+        let (sdpa, _sinks) = sdpa_params_with_sinks(d, h, &device)?;
+        let flash = empty_flash_params();
+        let cfg = Dsv4AttentionConfig {
+            compress_ratio: CompressRatio::Csa,
+            sliding_window: window,
+            raw_prefix: 0,
+        };
+        let with_comp = dsv4_attention(&q, &k, &v, Some(&comp), None, &flash, &sdpa, cfg)?;
+        let without_comp = dsv4_attention(&q, &k, &v, None, None, &flash, &sdpa, cfg)?;
+        let diff = (with_comp - without_comp)?
+            .abs()?
+            .max_all()?
+            .to_dtype(DType::F32)?
+            .to_scalar::<f32>()?;
+        // The CPU MatMul F16 noise floor this module budgets elsewhere is
+        // ~1e-3; anything above that is signal, not rounding.
+        assert!(
+            diff > 1e-2,
+            "the compressed columns a union-axis window would delete carry no \
+             signal (max |Δ| = {diff}); if this ever holds, the fixture stopped \
+             exercising the compressed branch and the test is vacuous"
+        );
         Ok(())
     }
 

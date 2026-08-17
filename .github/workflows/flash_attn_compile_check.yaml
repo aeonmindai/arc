@@ -44,6 +44,15 @@ on:
         options:
           - "90"
           - "80"
+      features:
+        description: "Flash feature combo to compile. 'flash-attn flash-attn-v3' is the Hopper install.sh default and the combo that used to be a duplicate-definition compile error."
+        required: false
+        default: "flash-attn flash-attn-v3"
+        type: choice
+        options:
+          - "flash-attn flash-attn-v3"
+          - "flash-attn"
+          - "flash-attn-v3"
 
 # Bound parallelism: candle-flash-attn spawns many nvcc instantiations and each
 # is memory-hungry. One codegen unit at a time trades wall-time for not OOMing.
@@ -55,7 +64,7 @@ env:
 
 jobs:
   flash-attn-compile:
-    name: nvcc flash-attn compile (sm_${{ github.event.inputs.compute_cap }})
+    name: nvcc flash compile (sm_${{ github.event.inputs.compute_cap }}, ${{ github.event.inputs.features }})
     runs-on: ubuntu-latest
     # The FA kernel set can take a while on a hosted runner; give it room but
     # cap it so a hang fails the gate instead of burning the 6h job ceiling.
@@ -110,9 +119,13 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: flash-attn-cc${{ github.event.inputs.compute_cap }}-${{ hashFiles('Cargo.lock') }}
+          # The feature combo is part of the key: `target/` contents differ
+          # between the FA2-only, FA3-only and both-backends builds, so sharing
+          # one cache across them restores objects built for a different feature
+          # set.
+          key: flash-cc${{ github.event.inputs.compute_cap }}-${{ github.event.inputs.features }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            flash-attn-cc${{ github.event.inputs.compute_cap }}-
+            flash-cc${{ github.event.inputs.compute_cap }}-${{ github.event.inputs.features }}-
 
       # ---- The gate. `flash-attn` implies `cuda`, so this runs nvcc on both the
       #      candle-flash-attn FA kernels AND Arc's quant/cuda-graph kernels (via
