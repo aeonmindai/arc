@@ -113,6 +113,10 @@ impl SingleCache {
         // Buffer must be at least `read_capacity` along the seq dim. Reuse the
         // existing (eager-populated) all_data so past K/V is present; only
         // allocate if absent.
+        // Same preallocation correction `append` performs. Without it the
+        // graph path inherits the engine's dense [B,H,cap,head_dim] buffer and
+        // a 1-wide V4 marker cannot be written into it.
+        self.reconcile_preallocation(src)?;
         let need = read_capacity.max(self.capacity_seq_len);
         if self.all_data.is_none() {
             let mut shape = src.dims().to_vec();
@@ -150,6 +154,42 @@ impl SingleCache {
                 .all(|(i, (a, s))| i == self.dim || a == s)
     }
 
+    /// Discard a preallocated buffer that `src` cannot be written into.
+    ///
+    /// Shared by [`Self::append`] and [`Self::append_graph`] **so the two
+    /// cannot drift**. The graph path not having this was wave48-BY
+    /// reappearing in a path that did not exist when wave48-BY was fixed: the
+    /// engine preallocates from `ModelConfigMetadata::{k_head_dim,v_head_dim}`
+    /// and `activation_dtype`, which assumes dense activation-precision K and V
+    /// at the declared head width, and V4's V half is a 1-wide marker
+    /// (`V4_V_MARKER_WIDTH` — V *is* K for fused MQA). Measured on an H200:
+    /// `append_graph V half failed (k=[1,1,1,512], v=[1,1,1,1]) : kv-write:
+    /// src [1,1,1,1] incompatible with cache [1,1,512,512]`, on the engine's
+    /// own dummy run.
+    ///
+    /// An empty cache's buffer holds nothing, so discarding it is lossless —
+    /// the pre-grow is kept, only dtype and width are corrected. A NON-empty
+    /// cache is real corruption and is raised, never papered over.
+    fn reconcile_preallocation(&mut self, src: &Tensor) -> Result<()> {
+        if self.preallocation_fits(src) {
+            return Ok(());
+        }
+        if self.current_seq_len != 0 {
+            let ad = self.all_data.as_ref().expect("mismatch implies a buffer");
+            candle_core::bail!(
+                "kv-cache: cannot append {:?} {:?} into a cache already holding {} \
+                 token(s) as {:?} {:?} — the layout changed mid-sequence",
+                src.dtype(),
+                src.dims(),
+                self.current_seq_len,
+                ad.dtype(),
+                ad.dims()
+            );
+        }
+        self.all_data = None;
+        Ok(())
+    }
+
     pub fn append(&mut self, src: &Tensor) -> Result<()> {
         let seq_len = src.dim(self.dim)?;
 
@@ -178,21 +218,7 @@ impl SingleCache {
         // cache is a different matter: the tokens already in it were written in
         // some other layout, so a disagreement there is real corruption and is
         // raised rather than papered over.
-        if !self.preallocation_fits(src) {
-            if self.current_seq_len != 0 {
-                let ad = self.all_data.as_ref().expect("mismatch implies a buffer");
-                candle_core::bail!(
-                    "kv-cache: cannot append {:?} {:?} into a cache already holding {} \
-                     token(s) as {:?} {:?} — the layout changed mid-sequence",
-                    src.dtype(),
-                    src.dims(),
-                    self.current_seq_len,
-                    ad.dtype(),
-                    ad.dims()
-                );
-            }
-            self.all_data = None;
-        }
+        self.reconcile_preallocation(src)?;
 
         // This doesn't seem very idiomatic but because the creation can fail, it's tricky to use
         // self.all_data.get_or_insert_with.
@@ -341,6 +367,57 @@ mod tests {
         // And the tokens already cached are untouched.
         assert_eq!(cache.current_seq_len, 1);
         assert_eq!(cache.all_data.as_ref().unwrap().dtype(), DType::BF16);
+        Ok(())
+    }
+
+    /// wave48-BY, in the CUDA-graph path. The engine preallocates the KV buffer
+    /// from `ModelConfigMetadata::v_head_dim` — dense, activation-precision, at
+    /// the declared head width — and installs it as `all_data` before the first
+    /// append (`CacheInstruction::Reset { load_preallocated_cache: true }`).
+    /// V4's V half is a 1-wide marker, so that buffer does not fit.
+    ///
+    /// `append` has corrected this since wave48-BY; `append_graph` was written
+    /// later and did not, which is why V4 capture died on the engine's own
+    /// dummy run with
+    ///   `kv-write: src [1,1,1,1] incompatible with cache [1,1,512,512]`.
+    ///
+    /// Mutation: drop the `reconcile_preallocation` call from `append_graph`
+    /// and this fails with exactly that message.
+    #[test]
+    fn append_graph_corrects_a_preallocated_buffer_of_the_wrong_width() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut cache = SingleCache::new(2, 4096, 512);
+        // What the engine installs: dense V at the declared head width.
+        cache.all_data = Some(Tensor::zeros((1, 1, 512, 512), DType::F32, &dev)?);
+        assert_eq!(cache.current_seq_len, 0, "fixture must be an EMPTY preallocation");
+
+        // What V4 actually writes: a 1-wide marker.
+        let marker = Tensor::zeros((1, 1, 1, 1), DType::F32, &dev)?;
+        cache.reconcile_preallocation(&marker)?;
+        assert!(
+            cache.all_data.is_none(),
+            "an ill-fitting EMPTY preallocation must be discarded so it can be \
+             reallocated at the marker's width"
+        );
+        Ok(())
+    }
+
+    /// The other half of the contract: a NON-empty cache is real corruption and
+    /// must be raised, never silently discarded — that would drop live tokens.
+    #[test]
+    fn reconcile_refuses_to_discard_a_cache_holding_tokens() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut cache = SingleCache::new(2, 4096, 512);
+        cache.all_data = Some(Tensor::zeros((1, 1, 512, 512), DType::F32, &dev)?);
+        cache.current_seq_len = 7; // pretend seven tokens are already written
+
+        let marker = Tensor::zeros((1, 1, 1, 1), DType::F32, &dev)?;
+        let err = cache
+            .reconcile_preallocation(&marker)
+            .expect_err("a populated cache must not be silently discarded");
+        let msg = err.to_string();
+        assert!(msg.contains("layout changed mid-sequence"), "{msg}");
+        assert!(msg.contains('7'), "the message must name how many tokens are at risk: {msg}");
         Ok(())
     }
 }
