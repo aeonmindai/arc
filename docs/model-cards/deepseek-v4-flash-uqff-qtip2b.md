@@ -170,13 +170,63 @@ see either error, your Arc build predates the fix.**
 
 FP8 K storage is **opt-in** and off unless `ARC_V4_FP8_KV=1`.
 
-### 2. No throughput figures are published here
+### 2. Throughput is measured — and per-user decode is the number to read
 
-Arc's serving throughput on this rung has not been measured under a stated
-protocol. Nothing about tokens/s, latency, or cost-per-token belongs on this
-card until it has been. Do not infer performance from size or load time.
+This section previously said no throughput figure existed. One does now
+(session 7, 2026-08-16, **on this artifact**), and the honest reading of it is
+mixed, so both halves are stated here.
 
-### 3. The V4 sparse indexer
+**Aggregate decode, 1×H200 @ $4.85/hr**, through the OpenAI-compatible server,
+`--max-seqs 256`, 64 decode tokens, temperature 0, `effective_B == B` on every
+row, **0 errors in 505 requests**:
+
+| B | 1 | 8 | 16 | 32 | 64 | 128 | 256 |
+|---|---|---|---|---|---|---|---|
+| **aggregate tok/s** | 18.27 | 41.43 | 54.75 | 74.52 | 91.46 | 106.36 | **111.69** |
+| **per-user tok/s (p50)** | 17.99 | 5.67 | 3.97 | 2.87 | 1.82 | 1.09 | **0.53** |
+| **$/Mtok** | 73.74 | 32.52 | 24.61 | 18.08 | 14.73 | 12.67 | **12.06** |
+
+**Read the second row before the first.** Aggregate rises monotonically to
+111.69 tok/s at B=256 and $12.06/Mtok — but per-user decode at that point is
+**0.53 tok/s**, with TTFT p95 of 58.5 s. This rung is a throughput/cost result,
+**not** an interactive-latency result. Do not quote 111.69 without the batch
+size next to it.
+
+The curve is flattening by B=256 (+5.0% for a 2× batch), so B=256 is near the
+knee rather than past it.
+
+**Against the `qtip2` rung**, same probe and protocol: peak aggregate 30.65 →
+111.69 tok/s (**3.64×**, at **3.65× lower $/Mtok**), and the shape changes —
+`qtip2` peaked at B=16 and fell 37% by B=256, `qtip2b` does not fall at all. The
+**b=1 row moved only 1.12×** and that is the control: the 3–6× at batch is the
+grouped trellis kernel amortizing across the batch, not a faster box or a better
+bake.
+
+Full protocol and raw-artifact provenance: [`docs/BENCHMARKS.md`](../BENCHMARKS.md),
+session 7. Log: `memory/mission/wave51-CB-the-measurement.md`.
+
+### 2a. Quality — full-set GSM8K, measured on this artifact
+
+**GSM8K 1270/1319 = 96.3% (±1.0 pp)** — the **full** test set, 0-shot chat,
+greedy (t=0), seed 161, 2048-token cap, `--concurrency 16`; **0 degenerate,
+0 truncated, 0 errors**, mean completion 157.8 tokens.
+
+* The base model card's published **90.8** is **8-shot EM** — a different and
+  easier protocol. **These are not comparable**, and this is not a win over it.
+* This supersedes the provisional **87.0%** (n=100) figure that appeared in
+  earlier Arc docs: that was a different bake on decode math since changed, and
+  is retired rather than beaten.
+
+### 2b. MTP does not survive batch on this rung
+
+Speculative decode was measured for the first time here, and it only works at
+b=1: **1.84 emitted tokens per target forward, 41.9% draft acceptance**
+(`--mtp-depth 2`). At **B≥8 the engine panics** in `clone_in_cache` with a shape
+mismatch and then serves nothing. **No MTP number above b=1 exists** — it is
+unmeasurable today, not zero. Do not enable `--mtp-depth` with batching on this
+artifact.
+
+### 4. The V4 sparse indexer
 
 On CSA layers this artifact may log an indexer shape mismatch and fall back to
 dense-over-compressed attention. **The artifact is correct; Arc's loader was
