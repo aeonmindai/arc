@@ -227,9 +227,31 @@ pub fn timer_for(device: &candle_core::Device) -> Box<dyn DeviceTimer> {
     #[cfg(feature = "cuda")]
     {
         if let candle_core::Device::Cuda(dev) = device {
+            // 🔴 A NULL `CUstream` is NOT "no stream". It is CUDA's legacy
+            // default stream, and cudarc says so in as many words at
+            // `CudaContext::default_stream` — *"the default stream for this
+            // context (the null ptr stream)"*, constructed with
+            // `cu_stream: std::ptr::null_mut()`. A candle device that was never
+            // given an explicit stream hands back exactly that.
+            //
+            // The `!stream.is_null()` guard that used to stand here therefore
+            // rejected the single most common configuration and fell through to
+            // `NullTimer` — so every device span in every such run recorded
+            // nothing, `device_ns` and `sync_ns` were columns of "unmeasured",
+            // and the report blamed "no CUDA event timer attached" for a reason
+            // that was not true. Measured on an H200 (2026-08-17): device and
+            // sync were unmeasured for the whole of a V4 profile taken with
+            // `--features "cuda flash-attn"` on a CUDA device.
+            //
+            // `cudaEventRecord(ev, 0)` is valid and records on the default
+            // stream, so the handle needs no validation — but the *runtime*
+            // does, and it is cheaper to ask it than to assume. Probe once: if
+            // an event can actually be created and recorded, this timer works.
             let stream = dev.cuda_stream().cu_stream() as *mut std::ffi::c_void;
-            if !stream.is_null() {
-                return Box::new(CudaTimer::new(stream));
+            let timer = CudaTimer::new(stream);
+            if let Some(h) = timer.record() {
+                timer.release(&[h]);
+                return Box::new(timer);
             }
         }
     }
