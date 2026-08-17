@@ -123,8 +123,29 @@ pub fn try_init_autonomous_runner(
     }
     match AutonomousDecodeRunner::new(config, device) {
         Ok(runner) => {
-            tracing::info!(
-                "Autonomous decode runner allocated (graph capture deferred until first decode)"
+            // D18, second instance in this file. This used to read "graph
+            // capture deferred until first decode", which is not true: the only
+            // entry point into the capture chain is
+            // `AutonomousDecodeRunner::capture` / `capture_via_decode_forward`,
+            // and NOTHING in the workspace calls either. `pipeline/mod.rs:614`
+            // is a *comment* saying a pipeline must call it; no pipeline does.
+            // So `is_captured()` is permanently false, every `run_decode_loop`
+            // returns `Ok(None)`, and decode always falls back step-by-step.
+            // "Deferred until first decode" describes a wait that never ends.
+            // Say what is actually true, at a level that does not read as
+            // progress.
+            tracing::warn!(
+                "ArcAutonomous: buffers allocated but the runner is INERT — its capture entry \
+                 point (AutonomousDecodeRunner::capture) has no caller in the workspace, so the \
+                 graph is never captured, is_captured() stays false, and every decode falls back \
+                 to the step-by-step path. Allocating this runner buys nothing until a pipeline \
+                 calls capture()."
+            );
+            arc_profiler::mark_unreachable(
+                "decode.autonomous",
+                "AutonomousDecodeRunner::capture has no call site in the workspace; the graph is \
+                 never captured and run_decode_loop always returns None",
+                "arc-cuda-graph/src/lib.rs:120",
             );
             Some(runner)
         }
