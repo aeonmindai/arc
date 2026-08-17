@@ -1834,6 +1834,16 @@ impl Pipeline for NormalPipeline {
                                         None
                                     }
                                 };
+                                // Safe ONLY because every pool-destroying path in
+                                // `graph.rs` now drains the alloc cache before
+                                // `cuMemPoolDestroy`. This call moves `deferred`
+                                // into the reusable `free` list; before the drain
+                                // ordering existed, on an error path that moved
+                                // pointers whose private pool had ALREADY been
+                                // destroyed straight into the list the allocator
+                                // serves from. On the success path the pool is
+                                // still alive (owned by `CapturedGraph`), so the
+                                // pointers are valid and reuse is correct.
                                 if let candle_core::Device::Cuda(cd) = self.device() {
                                     cd.set_capture_mode(false);
                                 }
@@ -1943,6 +1953,16 @@ impl Pipeline for NormalPipeline {
                                     crate::layers::set_graph_mode_positions(None);
                                     if let Some(r) = self.cuda_graph_runner.as_mut() {
                                         r.disable();
+                                    }
+                                    // THE CACHE WAS NEVER DRAINED. `set_alloc_cache_enabled(true)`
+                                    // is called once at the start of capture and nothing ever
+                                    // called it with `false`, so every buffer it ever held —
+                                    // including private-pool allocations from every capture —
+                                    // was retained for the process lifetime. Now that graphs are
+                                    // off for good, the cache buys nothing and its buffers are
+                                    // returned to the driver.
+                                    if let candle_core::Device::Cuda(cd) = self.device() {
+                                        cd.set_alloc_cache_enabled(false);
                                     }
                                     self.model.forward(
                                         &input_ids,

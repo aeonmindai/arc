@@ -24,16 +24,39 @@ use std::collections::HashMap;
 #[cfg(feature = "cuda")]
 struct CapturedGraph {
     exec: CUgraphExec,
-    output: Tensor,
+    /// `Option` so [`Drop`] can release it BEFORE the pool dies. Its storage was
+    /// allocated from `pool` during capture, and dropping it returns that
+    /// pointer to the device alloc cache — which must then be drained while the
+    /// pool is still alive.
+    output: Option<Tensor>,
     /// Private memory pool for this graph's allocations
     pool: CUmemoryPool,
+    /// Needed to drain the alloc cache before `pool` is destroyed.
+    device: Device,
 }
 
 #[cfg(feature = "cuda")]
 impl Drop for CapturedGraph {
     fn drop(&mut self) {
+        // ORDER IS THE FIX. Previously this destroyed the exec and the pool and
+        // left `output` to drop afterwards (fields drop after the Drop body),
+        // which returned a private-pool pointer to the device alloc cache
+        // AFTER that pool no longer existed. The cache then handed it out again.
+        //
+        // 1. exec first: once it is destroyed no replay can reference the
+        //    captured addresses, so freeing them is safe.
         unsafe {
             cuGraphExecDestroy(self.exec);
+        }
+        // 2. release the captured output so its storage reaches the cache.
+        drop(self.output.take());
+        // 3. drain the cache while the pool is STILL ALIVE, so every buffer
+        //    allocated from it is freed into the pool that owns it.
+        if let Device::Cuda(cd) = &self.device {
+            cd.drain_alloc_cache_and_free();
+        }
+        // 4. only now is the pool unreferenced.
+        unsafe {
             cuMemPoolDestroy(self.pool);
         }
     }
@@ -41,6 +64,8 @@ impl Drop for CapturedGraph {
 
 #[cfg(feature = "cuda")]
 pub struct CudaGraphRunner {
+    /// Kept so every pool-destroying path can drain the alloc cache first.
+    device: Device,
     stream: CUstream,
     device_ordinal: CUdevice,
     graphs: HashMap<usize, CapturedGraph>,
@@ -141,6 +166,7 @@ impl CudaGraphRunner {
                 "arc-cuda-graph/src/graph.rs:71",
             );
             return Ok(Self {
+                device: device.clone(),
                 stream,
                 device_ordinal: 0,
                 graphs: HashMap::new(),
@@ -162,6 +188,7 @@ impl CudaGraphRunner {
         tracing::info!("CUDA graph: non-null stream on device {ordinal}, capture enabled");
 
         Ok(Self {
+            device: device.clone(),
             stream,
             device_ordinal: ordinal,
             graphs: HashMap::new(),
@@ -172,6 +199,20 @@ impl CudaGraphRunner {
             verify_failed: false,
             deferred_passes_remaining: deferred_passes,
         })
+    }
+
+    /// Free every cached buffer while the private pool is still alive.
+    ///
+    /// MUST precede every `cuMemPoolDestroy`. Allocations that miss the cache
+    /// during capture come from the private pool (`cuMemAllocAsync` draws from
+    /// the device's current default pool), and the cache records no pool
+    /// provenance — so a pointer outliving its pool is handed out again and
+    /// eventually freed into a pool that no longer exists. That is the host
+    /// heap corruption.
+    fn drain_alloc_cache(&self) {
+        if let Device::Cuda(cd) = &self.device {
+            cd.drain_alloc_cache_and_free();
+        }
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -326,7 +367,10 @@ output_trusted={} verify_remaining={} verify_failed={}",
                  batch_size={batch_size}): cudaError {sync}"
             );
         }
-        let out = captured.output.clone();
+        let out = captured
+            .output
+            .clone()
+            .ok_or_else(|| candle_core::Error::Msg("captured graph has no output".into()))?;
         self.replays += 1;
         Ok(out)
     }
@@ -362,6 +406,11 @@ output_trusted={} verify_remaining={} verify_failed={}",
             )
         };
         if s != CUDA_SUCCESS {
+            // No drain needed: this pool was created but never installed as the
+            // device default (`cuDeviceSetMemPool` has not succeeded), so
+            // `cuMemAllocAsync` cannot have served anything from it and the
+            // alloc cache holds no pointer into it. Draining here would flush a
+            // healthy cache for nothing.
             unsafe {
                 cuMemPoolDestroy(pool);
             }
@@ -384,6 +433,11 @@ output_trusted={} verify_remaining={} verify_failed={}",
         let mut original_pool: CUmemoryPool = std::ptr::null_mut();
         let s = unsafe { cuDeviceGetMemPool(&mut original_pool, self.device_ordinal) };
         if s != CUDA_SUCCESS {
+            // No drain needed: this pool was created but never installed as the
+            // device default (`cuDeviceSetMemPool` has not succeeded), so
+            // `cuMemAllocAsync` cannot have served anything from it and the
+            // alloc cache holds no pointer into it. Draining here would flush a
+            // healthy cache for nothing.
             unsafe {
                 cuMemPoolDestroy(graph_pool);
             }
@@ -393,6 +447,11 @@ output_trusted={} verify_remaining={} verify_failed={}",
         // Install private pool
         let s = unsafe { cuDeviceSetMemPool(self.device_ordinal, graph_pool) };
         if s != CUDA_SUCCESS {
+            // No drain needed: this pool was created but never installed as the
+            // device default (`cuDeviceSetMemPool` has not succeeded), so
+            // `cuMemAllocAsync` cannot have served anything from it and the
+            // alloc cache holds no pointer into it. Draining here would flush a
+            // healthy cache for nothing.
             unsafe {
                 cuMemPoolDestroy(graph_pool);
             }
@@ -411,6 +470,7 @@ output_trusted={} verify_remaining={} verify_failed={}",
         let s = unsafe { cuStreamBeginCapture_v2(self.stream, CUstreamCaptureMode::RELAXED) };
         if s != CUDA_SUCCESS {
             // Restore original pool before bailing
+            self.drain_alloc_cache();
             unsafe {
                 cuDeviceSetMemPool(self.device_ordinal, original_pool);
             }
@@ -445,6 +505,7 @@ output_trusted={} verify_remaining={} verify_failed={}",
         let mut graph: CUgraph = std::ptr::null_mut();
         let s = unsafe { cuStreamEndCapture(self.stream, &mut graph) };
         if s != CUDA_SUCCESS {
+            self.drain_alloc_cache();
             unsafe {
                 cuDeviceSetMemPool(self.device_ordinal, original_pool);
                 cuMemPoolDestroy(graph_pool);
@@ -470,6 +531,7 @@ output_trusted={} verify_remaining={} verify_failed={}",
             cuGraphDestroy(graph);
         }
         if s != CUDA_SUCCESS {
+            self.drain_alloc_cache();
             unsafe {
                 cuDeviceSetMemPool(self.device_ordinal, original_pool);
                 cuMemPoolDestroy(graph_pool);
@@ -482,6 +544,7 @@ output_trusted={} verify_remaining={} verify_failed={}",
         // allocated/backed here at the capture-time addresses).
         let s = unsafe { cuGraphLaunch(exec, self.stream) };
         if s != CUDA_SUCCESS {
+            self.drain_alloc_cache();
             unsafe {
                 cuDeviceSetMemPool(self.device_ordinal, original_pool);
                 cuGraphExecDestroy(exec);
@@ -522,6 +585,7 @@ output_trusted={} verify_remaining={} verify_failed={}",
             cuDeviceSetMemPool(self.device_ordinal, original_pool);
         }
         if sync != CUDA_SUCCESS {
+            self.drain_alloc_cache();
             unsafe {
                 cuGraphExecDestroy(exec);
                 cuMemPoolDestroy(graph_pool);
@@ -537,8 +601,9 @@ output_trusted={} verify_remaining={} verify_failed={}",
             batch_size,
             CapturedGraph {
                 exec,
-                output,
+                output: Some(output),
                 pool: graph_pool,
+                device: self.device.clone(),
             },
         );
         tracing::info!(
@@ -557,6 +622,11 @@ output_trusted={} verify_remaining={} verify_failed={}",
                 cuGraphDestroy(graph);
             }
             cuDeviceSetMemPool(self.device_ordinal, original_pool);
+        }
+        // Drain before the pool dies: an aborted capture may already have
+        // allocated from it, and those pointers are in the cache.
+        self.drain_alloc_cache();
+        unsafe {
             cuMemPoolDestroy(graph_pool);
         }
     }
