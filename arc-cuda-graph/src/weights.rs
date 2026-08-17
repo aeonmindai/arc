@@ -123,7 +123,47 @@ pub struct DecodeConfig {
     pub is_gpt_neox: bool,
 }
 
+/// Whether [`tensor_device_ptr`] can produce a device pointer for `dt`.
+///
+/// This is the single source of truth for the dispatch table below and is
+/// deliberately *not* CUDA-gated so the coverage test runs on any host.
+///
+/// The table is exactly candle's `cuda_dtype!` instantiations
+/// (`candle-core/src/cuda_backend/mod.rs`): `u8, u32, i16, i32, i64, f16,
+/// bf16, f32, f64, float8::F8E4M3`. The MX dummy formats (`F6E2M3`,
+/// `F6E3M2`, `F4`, `F8E8M0`) have no `CudaDType` impl, so `as_cuda_slice`
+/// can never yield them — and candle reports `size_in_bytes() == 0` for the
+/// sub-byte ones, which would make the `start_offset() * size_in_bytes()`
+/// byte-offset arithmetic below silently wrong for a view.
+///
+/// History: `I32` was missing here, which took out **every** consumer that
+/// passes an `int32_t` buffer to a kernel — the GPU radix top-k sampler
+/// (`seq_lens`), the fused `CudaSampler` (`token_ids`, `keep_idx_scratch`)
+/// and the V4 indexer's `score_and_topk_*`. The sampler's failure surfaced
+/// only as a per-token `WARN … falling back to CPU`, so it ran the slow path
+/// on every decode step in production. Widen this table, never the callers.
+pub const fn device_ptr_supports_dtype(dt: candle_core::DType) -> bool {
+    use candle_core::DType;
+    matches!(
+        dt,
+        DType::U8
+            | DType::U32
+            | DType::I16
+            | DType::I32
+            | DType::I64
+            | DType::BF16
+            | DType::F16
+            | DType::F32
+            | DType::F64
+            | DType::F8E4M3
+    )
+}
+
 /// Extract raw u64 device pointer from a Candle tensor (any dtype).
+///
+/// The dtype dispatch below must stay in lockstep with
+/// [`device_ptr_supports_dtype`] — `device_ptr_dispatch_matches_predicate`
+/// in this module's tests enforces it.
 #[cfg(feature = "cuda")]
 pub fn tensor_device_ptr(tensor: &Tensor) -> candle_core::Result<u64> {
     use candle_core::cuda::cudarc::driver::DevicePtr;
@@ -156,8 +196,27 @@ pub fn tensor_device_ptr(tensor: &Tensor) -> candle_core::Result<u64> {
                     let (p, _) = s.device_ptr(s.stream());
                     p
                 }
+                // I32 is what every `int32_t*` kernel argument in this crate is
+                // fed with (radix top-k `seq_lens`, `CudaSampler` token ids and
+                // keep-list scratch). Candle's `Tensor::from_vec(Vec<i32>, …)`
+                // produces it, so leaving it out disabled those paths wholesale.
+                DType::I32 => {
+                    let s = cuda_storage.as_cuda_slice::<i32>()?;
+                    let (p, _) = s.device_ptr(s.stream());
+                    p
+                }
+                DType::I16 => {
+                    let s = cuda_storage.as_cuda_slice::<i16>()?;
+                    let (p, _) = s.device_ptr(s.stream());
+                    p
+                }
                 DType::I64 => {
                     let s = cuda_storage.as_cuda_slice::<i64>()?;
+                    let (p, _) = s.device_ptr(s.stream());
+                    p
+                }
+                DType::F64 => {
+                    let s = cuda_storage.as_cuda_slice::<f64>()?;
                     let (p, _) = s.device_ptr(s.stream());
                     p
                 }
@@ -166,13 +225,22 @@ pub fn tensor_device_ptr(tensor: &Tensor) -> candle_core::Result<u64> {
                     let (p, _) = s.device_ptr(s.stream());
                     p
                 }
+                // NOT `as_cuda_slice::<u8>()`: candle stores this as
+                // `CudaStorageSlice::F8E4M3(CudaSlice<float8::F8E4M3>)`, and
+                // `as_cuda_slice::<T>` matches the storage variant by `T`, so
+                // asking for `u8` here returned `UnexpectedDType { expected:
+                // U8, got: F8E4M3 }` for every FP8 tensor — same class of
+                // defect as the missing I32 arm, on the FP8 KV-cache path.
                 DType::F8E4M3 => {
-                    // F8E4M3 is stored as u8 in cudarc
-                    let s = cuda_storage.as_cuda_slice::<u8>()?;
+                    let s = cuda_storage.as_cuda_slice::<float8::F8E4M3>()?;
                     let (p, _) = s.device_ptr(s.stream());
                     p
                 }
-                dt => candle_core::bail!("tensor_device_ptr: unsupported dtype {dt:?}"),
+                dt => candle_core::bail!(
+                    "tensor_device_ptr: unsupported dtype {dt:?} (sub-byte dtypes have \
+                     size_in_bytes()==0 so the offset arithmetic is undefined; every other \
+                     dtype belongs in this table — see device_ptr_supports_dtype)"
+                ),
             };
             Ok(base_ptr + offset_bytes as u64)
         }
@@ -397,6 +465,83 @@ mod cpu_anchor_tests {
         let v = anchor.to_vec2::<f32>().expect("tensor should be readable");
         assert_eq!(v.len(), 4);
         assert_eq!(v[0].len(), 8);
+    }
+
+    /// Every dtype a Candle CUDA tensor can actually hold must be resolvable
+    /// to a device pointer.
+    ///
+    /// `tensor_device_ptr`'s dispatch is a `match` on `DType`; a missing arm
+    /// is invisible until a kernel argument happens to use that dtype at
+    /// runtime, at which point the caller either hard-errors or — worse —
+    /// swallows it into a fallback. That is exactly how the missing `I32` arm
+    /// disabled the GPU radix top-k sampler for every decode step in
+    /// production while only emitting a per-token WARN.
+    ///
+    /// The `_dtype_is_exhaustive` match below is the tripwire: adding a
+    /// variant to candle's `DType` breaks compilation here, forcing a
+    /// decision about `tensor_device_ptr` instead of shipping another gap.
+    #[test]
+    fn device_ptr_covers_every_storable_dtype() {
+        use super::device_ptr_supports_dtype;
+
+        // Exhaustive over candle's DType — compilation fails if upstream adds
+        // a variant. `true` == candle has a `cuda_dtype!` impl for it, so
+        // `as_cuda_slice` can return it and `tensor_device_ptr` must handle it.
+        fn has_cuda_slice_impl(dt: DType) -> bool {
+            match dt {
+                DType::U8
+                | DType::U32
+                | DType::I16
+                | DType::I32
+                | DType::I64
+                | DType::BF16
+                | DType::F16
+                | DType::F32
+                | DType::F64
+                | DType::F8E4M3 => true,
+                // MX dummy formats: raw-byte storage, no `CudaDType` impl.
+                DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => false,
+            }
+        }
+
+        const ALL: &[DType] = &[
+            DType::U8,
+            DType::U32,
+            DType::I16,
+            DType::I32,
+            DType::I64,
+            DType::BF16,
+            DType::F16,
+            DType::F32,
+            DType::F64,
+            DType::F8E4M3,
+            DType::F6E2M3,
+            DType::F6E3M2,
+            DType::F4,
+            DType::F8E8M0,
+        ];
+
+        for &dt in ALL {
+            assert_eq!(
+                device_ptr_supports_dtype(dt),
+                has_cuda_slice_impl(dt),
+                "tensor_device_ptr dtype coverage drifted for {dt:?}: candle \
+                 {} a CudaSlice for it",
+                if has_cuda_slice_impl(dt) {
+                    "can produce"
+                } else {
+                    "cannot produce"
+                }
+            );
+        }
+
+        // The specific regression: I32 buffers back every `int32_t*` kernel
+        // argument in this crate.
+        assert!(
+            device_ptr_supports_dtype(DType::I32),
+            "I32 must be supported — radix top-k `seq_lens`, CudaSampler \
+             `token_ids` and `keep_idx_scratch` are all I32"
+        );
     }
 }
 

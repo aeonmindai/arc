@@ -19,6 +19,43 @@ use tokenizers::Tokenizer;
 static DRY_SEQUENCE_BREAKERS: LazyLock<Vec<String>> =
     LazyLock::new(|| ["\n", ":", "\"", "*"].map(String::from).to_vec());
 
+/// Health counters for the big-vocab GPU sampling path.
+///
+/// Falling back to the CPU sampler costs a full-logits-row D2H plus a
+/// full-vocab sort, **per sequence per decode step**. That is a throughput
+/// cliff, not a warning-level event — but it used to surface only as a
+/// per-token `tracing::warn!`, so a 100%-failure condition (the missing I32
+/// arm in `tensor_device_ptr`) shipped and ran in production unnoticed.
+///
+/// These counters exist so "we are on the slow path" is a number the interval
+/// logger prints, not something buried in a log nobody reads.
+pub mod gpu_sampling_health {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(super) static GPU_OK: AtomicU64 = AtomicU64::new(0);
+    /// The GPU path declined by design (`Ok(None)`) — e.g. `top_k` above the
+    /// kernel's dispatch cap. Expected, config-driven, not a defect.
+    pub(super) static DECLINED: AtomicU64 = AtomicU64::new(0);
+    /// The GPU path errored (`Err`). Always a defect.
+    pub(super) static FAILED: AtomicU64 = AtomicU64::new(0);
+
+    /// Cumulative `(gpu_ok, declined, failed)` since process start.
+    pub fn stats() -> (u64, u64, u64) {
+        (
+            GPU_OK.load(Ordering::Relaxed),
+            DECLINED.load(Ordering::Relaxed),
+            FAILED.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Reset all counters. Called after warmup so steady-state numbers are clean.
+    pub fn reset() {
+        GPU_OK.store(0, Ordering::Relaxed);
+        DECLINED.store(0, Ordering::Relaxed);
+        FAILED.store(0, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Stop sequences or ids.
 pub enum StopTokens {
@@ -1274,11 +1311,38 @@ impl Sampler {
             // guaranteed (Ok(None)) or on any GPU error.
             #[cfg(feature = "cuda")]
             if logits.device().is_cuda() {
+                use std::sync::atomic::Ordering;
                 match self.sample_fast_topk_gpu(&logits, rng.clone()) {
-                    Ok(Some(result)) => return Ok(result),
-                    Ok(None) => {}
+                    Ok(Some(result)) => {
+                        gpu_sampling_health::GPU_OK.fetch_add(1, Ordering::Relaxed);
+                        return Ok(result);
+                    }
+                    Ok(None) => {
+                        gpu_sampling_health::DECLINED.fetch_add(1, Ordering::Relaxed);
+                    }
                     Err(e) => {
-                        tracing::warn!("GPU radix top-k sampling failed; falling back to CPU: {e}");
+                        // Loud once, then rare. The first failure is an ERROR
+                        // because it means every subsequent token pays a
+                        // full-vocab D2H + CPU sort; after that we back off to
+                        // powers of two so a persistent fault stays visible
+                        // without emitting one line per token (the previous
+                        // behaviour: ~10 lines/s at B=256, which reads as
+                        // noise and got ignored for exactly that reason).
+                        let prior = gpu_sampling_health::FAILED.fetch_add(1, Ordering::Relaxed);
+                        if prior == 0 {
+                            tracing::error!(
+                                "GPU radix top-k sampling FAILED — every sampled token now \
+                                 falls back to the CPU sampler (full-vocab D2H + sort per \
+                                 sequence per step). This is a throughput regression, not a \
+                                 transient. Cause: {e}"
+                            );
+                        } else if (prior + 1).is_power_of_two() {
+                            tracing::warn!(
+                                "GPU radix top-k sampling still failing: {} CPU fallbacks so \
+                                 far. Cause: {e}",
+                                prior + 1
+                            );
+                        }
                     }
                 }
             }
