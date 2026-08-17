@@ -1,8 +1,19 @@
 /// Lloyd-Max optimal codebooks for TurboQuant KV cache compression.
 ///
-/// These are pre-computed centroids and decision boundaries for the Beta(d/2, d/2)
-/// distribution on [-1, 1], which is the marginal distribution of a single coordinate
-/// of a uniformly random point on the unit hypersphere S^{d-1} (Lemma 1, TurboQuant paper).
+/// These are pre-computed centroids and decision boundaries for the marginal
+/// distribution of a single coordinate of a uniformly random point on the unit
+/// hypersphere S^{d-1} (Lemma 1, TurboQuant paper), whose density on [-1, 1] is
+///
+/// ```text
+///     f_d(x) ∝ (1 - x²)^((d-3)/2)
+/// ```
+///
+/// equivalently `(x+1)/2 ~ Beta((d-1)/2, (d-1)/2)`. **The exponent is `(d-3)/2`,
+/// not `(d-2)/2` or `(d-1)/2`** — see `generator_reproduces_shipped_tables` in
+/// [`super::generate`], which pins the generated `mse_per_coord` to the constants
+/// in this file to 1e-9 for all nine `(dim, bits)` pairs. This doc previously read
+/// "Beta(d/2, d/2)", which is off by one half in both shape parameters; the tables
+/// below were always computed from the correct density.
 ///
 /// After a randomized Walsh-Hadamard rotation, every coordinate of the input vector
 /// follows this distribution regardless of the original data, making these codebooks

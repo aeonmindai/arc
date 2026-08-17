@@ -19,7 +19,7 @@ Inference at the speed of physics.
 
 ---
 
-Arc is an inference engine built to serve frontier MoE models on radically less hardware, by composing published compression research end-to-end: **QTIP 2-bit weights, TurboQuant 3.5-bit KV cache, TD-MoE Tucker decomposition**, and model-native sparse attention kernels. Measured today: DeepSeek V4 Flash (284B / 13B active) serving from a **74.18 GB** artifact on a **single H200**, at GSM8K 87.0% (provisional — see [Results](#results)).
+Arc is an inference engine built to serve frontier MoE models on radically less hardware, by composing published compression research end-to-end: **QTIP 2-bit weights, TD-MoE Tucker decomposition**, and model-native sparse attention. Measured today: DeepSeek V4 Flash (284B / 13B active) serving from a **~74 GB** artifact on a **single H200**, at **GSM8K 96.3%** on the full test set and **111.69 tok/s aggregate at B=256** — see [Results](#results).
 
 Forked from [mistral.rs](https://github.com/EricLBuehler/mistral.rs). Apache 2.0. Upstream-merge-compatible.
 
@@ -27,15 +27,17 @@ Forked from [mistral.rs](https://github.com/EricLBuehler/mistral.rs). Apache 2.0
 
 | Feature | What it does |
 |---|---|
-| **TurboQuant K4/V3 KV** | Zandieh et al. (Google Research, [arXiv:2504.19874](https://arxiv.org/abs/2504.19874), ICLR'26) — Arc Rust impl with fused-kernel attention path. 3.5-bit average, paper-lossless. Measured: **4.27× KV compression** end-to-end (Qwen3-32B, single H100: 39K→169K context). GQA-attention models; MLA models currently fall back to the standard KV path. |
-| **QTIP 2-bit weights** | Cornell ICLR'25 — Viterbi-decoded trellis with Hadamard incoherence rotation. 8× weight compression vs FP16. Works on any model. |
+| **QTIP 2-bit weights** | Cornell ICLR'25 — trellis quantization with Hadamard incoherence rotation. 8× weight compression vs FP16. Two rungs: `qtip2` (LUT) and `qtip2b` (computed codebook), the latter being what Arc serves. Works on any model. |
+| **TurboQuant KV** *(experimental, off by default)* | Zandieh et al. (Google Research, [arXiv:2504.19874](https://arxiv.org/abs/2504.19874), ICLR'26) — Arc Rust implementation of WHT + Lloyd-Max KV coding. **Not on any default path and never measured.** Eager KV is opt-in via `ARC_TURBOQUANT_KV=1`; the paged kernel exists at head_dim 128 only; there is no kernel at head_dim 512, so DeepSeek V4 cannot use it. |
 | **TD-MoE Tucker + whitening** | Whitened Tucker decomposition of the MoE expert pool. The **"lossless 20%"** figure is the **paper's** (NeurIPS'25), not ours — *published, not reproduced by us*. Works on any MoE. |
-| **Sparse attention kernels** | FlashMLASparse CUDA kernel (MIT, ported from sgl-project) for top-k attention. Dense O(n²) → sparse O(n·k). |
-| **arc-cuda-graph autonomous decode** | Full decode loop (forward + sample + EOS check) on GPU. Zero CPU sync per token. Works on any model. |
-| **`arc validate --target-hbm`** | Pre-flight memory-footprint verification on any GPU before you spend rental hours. |
-| **AA-AgentPerf-style benchmark suite** | Real agentic coding trajectories, sustained concurrent load, market-derived SLO tiers. The harness is vendor-abstracted and drives any OpenAI-compatible server, so side-by-side runs against SGLang/vLLM are *supported* — but **we have never run one**, on any engine, ever. No third-party engine has been benchmarked here, so any competitor performance figure anywhere in this tree is an unsourced leftover being struck on sight; please report one if you find it. |
+| **ArcAttention/Indexer** — sparse attention | DeepSeek V4's Lightning Indexer with FlashMLASparse CUDA kernels (MIT, ported from sgl-project) for top-k attention. Dense O(n²) → sparse O(n·k). |
+| **ArcGraph** — GPU-autonomous decode | Full decode loop (forward + sample + EOS check) on GPU. Zero CPU sync per token. Works on any model. |
+| **ArcLab/Validate** — `arc validate --target-hbm` | Pre-flight memory-footprint verification on any GPU before you spend rental hours. |
+| **ArcLab/Bench** — AA-AgentPerf suite | Real agentic coding trajectories, sustained concurrent load, market-derived SLO tiers. The harness is vendor-abstracted and drives any OpenAI-compatible server, so side-by-side runs against SGLang/vLLM are *supported* — but **we have never run one**, on any engine, ever. No third-party engine has been benchmarked here, so any competitor performance figure anywhere in this tree is an unsourced leftover being struck on sight; please report one if you find it. |
 
 Plus everything from mistral.rs: PagedAttention, FlashAttention V2/V3, speculative decoding (EAGLE-3, Medusa, MTP), continuous batching, 100+ model architectures, GGUF/GPTQ/AWQ/ISQ, LoRA, MCP integration, multi-GPU tensor parallelism.
+
+> **DeepSeek V4 does not use FlashAttention, at any generation.** Attention sinks are set on all 43 layers, so dispatch takes the sinks path before flash is considered — and the fused flash-with-sinks kernels only cover `head_dim ∈ {64,80,96,112,128,192,256}`, while V4 uses **512**. V4 runs an unfused matmul + `softmax_with_sinks` path on GPU. A fused 512-wide kernel is a *planned* rung with no implementation in the tree. Building with `--features flash-attn` is still correct and still helps every other architecture.
 
 ## Results
 
@@ -45,14 +47,15 @@ Validated as of Aug 2026 (DeepSeek V4 Flash, 284B / 13B-active MoE, single H200 
 
 | Claim | Status | Number |
 |---|---|---|
-| Frontier MoE on one GPU | **Measured** | 284B/13B V4 Flash serves from a **74.18 GB** artifact (2-bit trellis experts + FP8 attention, 8 shards + residual) on a single H200 — size HF-API-verified on the published `aeonmind/DeepSeek-V4-Flash-UQFF-qtip2` |
-| Quality at 2-bit experts | **Measured — provisional** | GSM8K **87.0%** (n=100, 0-shot chat, greedy, seed 161, 2048-token cap) vs 90.8 published for the base model (**8-shot** — a different and easier protocol); facts 22/22, arithmetic 8/8, coherence 6/6. **Provisional:** PR #35 changed the decode math after this was measured (SwiGLU clamp missing on 4 of 5 expert paths incl. the shared expert; YaRN on ratio-0 layers). Direction expected neutral-to-better, **unmeasured** — [details](docs/BENCHMARKS.md) |
+| Frontier MoE on one GPU | **Measured** | 284B/13B V4 Flash serves from a ~**74 GB** artifact (2-bit trellis experts, 8 shards + residual, **2.09 bits/param**) on a single H200. The `qtip2` rung is **74.18 GB**, independently verified against the HF API and again on disk; the `qtip2b` rung Arc serves is **74.12 GB** (recorded in BENCHMARKS.md, not separately HF-API-verified) |
+| Quality at 2-bit experts | **Measured** | GSM8K **1270/1319 = 96.3% ±1.0pp** — the **full** test set, 0-shot, **0 degenerate / 0 truncated / 0 errors**, mean 157.8 tokens. The base model's published 90.8 is **8-shot**, a different and easier protocol, so this is *not* a like-for-like win over it |
+| End-to-end serving throughput | **Measured** | **111.69 tok/s aggregate at B=256, $12.06/Mtok**, rising monotonically from 18.27 at B=1; `effective_B == B` on all seven batch rows; **0 errors across 505 requests** |
 | Long-context correctness | **Measured** | 5/5 coherence + 4/4 needle recall (ablation matrix in BENCHMARKS.md) |
-| TurboQuant KV | **Measured** | **4.27×** KV compression, Qwen3-32B on one H100 (39K→169K-token context) |
-| qtip2b bitshift-trellis format | **Measured** | CUDA↔CPU parity, 20/20 tests on H200 |
-| Single-user decode speed | **Measured** | **14.58 tok/s** (batch=1, no-`cudnn` build; progression 5.4 → 13.99 → 14.58 across the kernel-fix PRs). The tuned gather-GEMV variants reach 450–467 GB/s ≈ 9.5% of peak HBM — **measured-kernel**, end-to-end effect pending (profile in BENCHMARKS.md) |
+| qtip2b bitshift-trellis format | **Measured** | CUDA↔CPU bit-for-bit parity, 20/20 tests on H200 |
+| Batched MoE kernel crossover | **Measured-kernel** | Grouped GEMM overtakes GEMV at **B=64** and keeps climbing (527 tok/s at B=128) while GEMV is flat (315→317). MoE-GEMM path only |
+| TurboQuant KV | **Never measured** | A "4.27× KV compression" figure appeared here previously. It was **format arithmetic — bytes per token at 3.5 bits vs BF16 — and was never produced by a forward pass.** Retracted 2026-08-17 |
 
-Throughput beyond these numbers — saturated-batch floors, per-node replica math — is arithmetic, not measurement, and lives in [docs/FLEET.md](docs/FLEET.md) explicitly marked as projected. Total spend to produce every measured number above: ≈ $123 of rented H200 time across four sessions.
+Per-user speed is the honest weak spot: at B=128 each user sees 1.09 tok/s, and Arc is **overhead-bound rather than bandwidth-bound** today — 111.69 tok/s is low single-digit % of the H200's 4.8 TB/s. One named contributor is a GPU→CPU sampler fallback firing on every token. Saturated-batch floors and per-node replica math are arithmetic, not measurement, and live in [docs/FLEET.md](docs/FLEET.md) explicitly marked projected. **No side-by-side run against SGLang, vLLM or any other engine has ever been performed**, so every $/Mtok figure is Arc-versus-Arc.
 
 ## Compression Stack
 
@@ -70,9 +73,9 @@ KV cache bytes per token @ 32K context:
   + xKV cross-layer pool:     (head_dim × n_kv × 0.18 bytes)  → additional 2.5×
 ```
 
-Each layer compresses a different axis. The wins multiply.
+Each layer compresses a different axis, and in principle the wins multiply.
 
-Measured end-to-end so far: **4.27×** KV (TurboQuant, Qwen3-32B on one H100) and 284B → **74.18 GB** weights (V4 Flash qtip2 bake, serving on one H200 — see [Results](#results)). The remaining multipliers above are format arithmetic until measured.
+**Read the block above as arithmetic, because that is all it is.** Exactly one line of it has been measured end-to-end: 284B → **~74 GB** of weights at 2.09 bits/param (V4 Flash trellis bake, serving on one H200 — see [Results](#results)). The KV lines are bytes-per-token ratios; **no TurboQuant forward pass has ever been benchmarked**, TurboQuant is off by default, and it has no kernel at V4's head_dim of 512. The xKV pool is not implemented.
 
 For long context (1M+ tokens), the bottleneck shifts from weights to attention compute + KV bandwidth. Arc handles that via FlashMLASparse (CUDA kernel, MIT-licensed, ported from sgl-project), turning dense attention's O(n²) into sparse top-k O(n·k) on models with native sparse-attention training (DeepSeek V3.2+ family) and via top-k attention + sink preservation on the rest.
 
@@ -123,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
         .with_paged_attn(|| PagedAttentionConfig::new(
             None,
             Default::default(),
-            PagedCacheType::TurboQuant, // 3.5-bit KV by default
+            PagedCacheType::Auto, // TurboQuant is opt-in; see note below
         ))?
         .build()
         .await?;
@@ -133,7 +136,9 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-Python bindings: `pip install mistralrs-cuda` — TurboQuant is the default.
+Python bindings: `pip install mistralrs-cuda`.
+
+> **TurboQuant is not the default anywhere.** Requesting `PagedCacheType::TurboQuant` only works at head_dim 128; off-envelope it falls back to `Auto` with a warning, and an explicit `--pa-cache-type turboquant` is a hard error. The eager KV path is opt-in via `ARC_TURBOQUANT_KV=1`.
 
 ## Supported Models
 
@@ -173,18 +178,50 @@ Embedding Gemma, Qwen 3 Embedding
 
 ## Architecture
 
-Thin-wrapper over mistral.rs for upstream compatibility:
+Arc is organised as **named systems**. Every subsystem resolves upward to one of
+these, so there is always an answer to "what am I working on?" The full tree —
+every subsystem, what it does, where it lives, and what is shipped versus
+planned — is in **[memory/mission/TAXONOMY.md](memory/mission/TAXONOMY.md)**.
 
 ```
-arc-cli/          Arc CLI binary  ─ commands: run, serve, bench, validate
-arc-engine/       Engine          ─ model dispatchers, scheduling, speculative decoding
-arc-cuda-graph/   CUDA graphs     ─ autonomous decode, GPU sampler, FlashMLASparse kernel
-arc-turbo/        TurboQuant      ─ codebooks, WHT, packed KV cache, fused kernels
-arc-tools/        Operational     ─ rental preflight, weight schema validation
-mistralrs-*/      Upstream mistral.rs (MIT) ─ untouched, merge-compatible
+Arc
+├── ArcServe      the front door: HTTP/OpenAI, CLI, SDKs, MCP
+├── ArcInfer      the runtime: request → tokens
+│   ├── ArcSched      serving loop, admission, batching policy
+│   ├── ArcKV         key/value memory: sharing tree, paged, dense, FP8
+│   ├── ArcAttention  attention math + kernel dispatch
+│   ├── ArcSpec       speculative decoding (MTP, EAGLE-3)
+│   ├── ArcMoE        mixture-of-experts serving, TD-MoE
+│   ├── ArcGraph      GPU-autonomous decode (CUDA graphs)
+│   ├── ArcSample     token sampling
+│   └── ArcBoost      training-free serving-side quality
+├── ArcModels     architecture support — where new models land
+├── ArcQuant      compression: QTIP (weights), TurboQuant (KV), ArcBake
+├── ArcKernels    the GPU substrate — ArcTarget is where new GPUs land
+├── ArcFormat     the artifact: UQFF + the ArcOverlay serving convention
+├── ArcLab        measurement: profiler, benchmarks, ops tooling
+└── ArcGate       correctness gates and release discipline
 ```
 
-`git merge upstream/master` works cleanly. New models and fixes from upstream land immediately.
+Mapped onto the workspace:
+
+```
+arc-cli/          ArcServe/CLI    ─ the `arc` binary: run, serve, bench, validate
+arc-engine/       ArcServe/SDK    ─ façade + Tier-A research modules
+arc-cuda-graph/   ArcGraph        ─ autonomous decode, GPU sampler, FlashMLASparse
+arc-turbo/        TurboQuant      ─ packed KV cache type over the quant crate
+arc-profiler/     ArcLab/Profiler ─ wall/device/sync span tree
+arc-bench/        ArcLab/Bench    ─ AA-AgentPerf trajectory replay harness
+arc-tools/        ArcLab/Ops      ─ shell + Python only; NOT a Cargo crate
+mistralrs-*/      upstream mistral.rs (MIT), plus Arc's engine work in-place
+```
+
+> `mistralrs-*` is **not** untouched. Most of Arc's runtime — the V4
+> architecture, the KV sharing tree, attention dispatch, MTP, the trellis
+> quantizers and their kernels — lives inside `mistralrs-core/` and
+> `mistralrs-quant/` rather than in the `arc-*` crates. `git merge
+> upstream/master` still works cleanly, which is the property worth protecting;
+> "thin wrapper" was never an accurate description.
 
 ## Roadmap
 
@@ -209,7 +246,7 @@ Built on [mistral.rs](https://github.com/EricLBuehler/mistral.rs) by Eric Buehle
 
 Compression and inference techniques composed from published research:
 
-- **TurboQuant** — Zandieh et al., Google Research, ICLR'26 ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)). Arc provides the Rust implementation and fused-kernel attention integration.
+- **TurboQuant** — Zandieh et al., Google Research, ICLR'26 ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)). Arc provides the Rust implementation, runtime Lloyd-Max codebook generation for arbitrary block dimensions, and the non-power-of-two head_dim layout decomposition. Experimental, off by default.
 - **QTIP** — Cornell-RelaxML, ICLR'25
 - **TEAL** — ICLR'25 Spotlight
 - **SCMoE** — Shi et al., NeurIPS'24 ([arXiv:2405.14507](https://arxiv.org/abs/2405.14507))

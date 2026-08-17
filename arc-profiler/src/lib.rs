@@ -1,5 +1,7 @@
 //! `arc-profiler` — a reusable hierarchical profiler for the token path.
 //!
+//! **Parent system: ArcLab/Profiler** (see `memory/mission/TAXONOMY.md`).
+//!
 //! # What problem this solves
 //!
 //! Arc's decode step was, until this crate, described by a four-bucket split
