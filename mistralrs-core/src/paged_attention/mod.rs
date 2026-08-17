@@ -312,9 +312,11 @@ pub fn calculate_cache_config(
     if !SUPPORTED_BLOCK_SIZE.contains(&block_size) {
         anyhow::bail!("Block size must be in {SUPPORTED_BLOCK_SIZE:?}, got {block_size}");
     }
-    // TurboQuant only supports standard-layout models with head_dim == 128;
-    // resolve to a supported cache type (or error, if the user explicitly
-    // forced TurboQuant) before any sizing or allocation happens.
+    // TurboQuant needs a standard KV layout, and a head dim its kernels are
+    // instantiated for — narrowed further to the *measured* widths when the
+    // type is the ambient default rather than an explicit request. Resolve to a
+    // supported cache type (or error, if the user explicitly forced TurboQuant)
+    // before any sizing or allocation happens.
     let cache_type = cache_type.resolve_for_model(config, cache_type_explicit)?;
     let dtype = cache_type.to_dtype(dtype);
     let dtype_size = dtype.size_in_bytes();
