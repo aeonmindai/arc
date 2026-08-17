@@ -73,10 +73,17 @@ if [ "${1:-}" = "--sinkhorn-ab" ]; then
   DUMPARGS=""
   [ -n "${SINK_DUMP_OFF:-}" ] && DUMPARGS="--dump-logprobs $SINK_DUMP_OFF"
   # The engine reads ARC_NO_FUSED_SINKHORN (fused is the DEFAULT and is on
-  # unless that variable is set). This script previously toggled
-  # ARC_FUSED_SINKHORN, which nothing reads — so `env -u ARC_FUSED_SINKHORN`
-  # did not disable anything and BOTH arms ran fused-on. Any "bit-identical"
-  # result produced by the old script compared fused against itself.
+  # unless that variable is set). This script used to toggle ARC_FUSED_SINKHORN,
+  # which was correct until commit 9387e2bc5 (2026-08-13) flipped BOTH the
+  # variable name and the default. From that commit until this fix, nothing
+  # read ARC_FUSED_SINKHORN, so `env -u ARC_FUSED_SINKHORN` disabled nothing
+  # and both arms ran fused-on — a tautological A/B.
+  #
+  # This does NOT invalidate the s2 "bit-identical 6/6" result in FACTS.md:
+  # that ran before the flip, on the opt-in gate this script drove correctly,
+  # and the same harness had previously returned a NEGATIVE result (s1: ppl
+  # drift + 4/6 token divergence), which a no-op A/B cannot produce. Only runs
+  # dated between 2026-08-13 and this fix are meaningless.
   ARC_NO_FUSED_SINKHORN=1 "$BIN" -m "$MODEL_DIR" -a deepseekv4 -f "$MINI_FILE" -u "$UQFF0" --chunk-size 1024 $DUMPARGS 2>&1 | tee "$RES/ppl_sink_off.log"
   env -u ARC_NO_FUSED_SINKHORN "$BIN" -m "$MODEL_DIR" -a deepseekv4 -f "$MINI_FILE" -u "$UQFF0" --chunk-size 1024 2>&1 | tee "$RES/ppl_sink_on.log"
   python3 "$HERE/parse_ppl.py" "$RES/ppl_sink_off.log" sink_off "$RES/ppl_sink_off.json" || fail "gate-off run failed"
