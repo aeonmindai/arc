@@ -67,9 +67,26 @@ Two facts compose into the bug:
    sequences a 576-wide buffer, while one scheduled after a short batch hands
    them 64.**
 
+3. **How two different widths come to meet.** `clone_out_cache` stamps the
+   *batched* slot's `capacity_seq_len` onto every sequence that passes through a
+   batch, so the pipeline slot's capacity is monotonically non-decreasing for the
+   life of the process and active sequences converge on it. **But
+   `select_running_bucket` runs exactly ONE bucket per step and waitlists the
+   rest** (`default_scheduler.rs:81-157`), so a waiting sequence's cache is frozen
+   at 64 while the running bucket grows the pipeline slot to 576. When the buckets
+   later coalesce — which is what `COALESCE_PAYBACK_STEPS` exists to make happen —
+   the two widths meet in one `clone_in_cache`. This step is inferred from the
+   scheduler's own documented behaviour rather than observed in the log; steps 1
+   and 2 are read directly off the code and are what the CPU test reproduces.
+
 ⇒ **Two sequences at the identical length can hold different-width compressed-row
 buffers.** The scheduler cannot prevent it: it agrees on every length there is to
 bucket on. The extra width is preallocation slack holding nothing.
+
+**This also explains the sweep/GSM8K split twice over**: the sweep's sequences were
+all the same length (one bucket, no waitlisting) *and* too short to grow any
+buffer. GSM8K at `--concurrency 16` with 1,319 distinct prompt lengths is many
+buckets, constantly coalescing, with generations well past 260 tokens.
 
 **Verdict: not a ragged batch. A tolerance bug.** `KvCache::Normal` is
 slack-tolerant to ±511 tokens by accident of `CACHE_GROW_SIZE`; `comp` was
