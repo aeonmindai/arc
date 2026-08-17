@@ -80,7 +80,7 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 //
 // Template params:
 //   scalar_t : __half, __nv_bfloat16, or float
-//   HEAD_DIM : actual head dimension (64, 80, 96, 112, 128, 192, 256)
+//   HEAD_DIM : actual head dimension (64, 80, 96, 112, 128, 192, 256, 512)
 //   BR       : number of warps per block (= number of Q rows per block)
 //   BC       : KV tile size (number of KV positions per shared-memory tile)
 //
@@ -559,10 +559,29 @@ void flash_attn_sinks_launch(const void *Q, const void *K, const void *V,
   case 256:
     LAUNCH_KERNEL(256, 16);
     break;
+  // head_dim 512 (DeepSeek-V4: symmetric 512/512, MQA num_kv_heads=1).
+  //
+  // BC=8 continues the series the table already follows: shared memory is
+  // 2 * BC * D_PAD * sizeof(float), and every existing case holds it at ~32 KB
+  // by HALVING BC as HEAD_DIM DOUBLES — 64/BC=64, 128/BC=32, 256/BC=16 are all
+  // exactly 32.0 KB. 512/BC=8 is 2*8*512*4 = 32768 B, identical. That is under
+  // the 48 KB default per-block limit, so this needs no opt-in shared memory,
+  // no dynamic allocation, and no launch-config change.
+  //
+  // ⚠️ FEASIBILITY IS NOT PERFORMANCE. BC=8 means only 8 KV positions per tile,
+  // so V4's sliding_window=128 becomes 16 sequential tiles per query row. This
+  // is expected to WORK; whether it beats the unfused path it replaces is a
+  // separate, measured question. If it loses, the lever held in reserve is
+  // storing the tiles as scalar_t rather than float (the float32 choice above
+  // is for bank-conflict avoidance) — that would allow BC=16 at 512 in the same
+  // 32 KB and double the arithmetic intensity.
+  case 512:
+    LAUNCH_KERNEL(512, 8);
+    break;
   default:
     fprintf(stderr,
             "flash_attn_sinks: unsupported head_dim=%d. "
-            "Supported: 64, 80, 96, 112, 128, 192, 256\n",
+            "Supported: 64, 80, 96, 112, 128, 192, 256, 512\n",
             head_dim);
     break;
   }
@@ -651,10 +670,14 @@ void flash_attn_sinks_varlen_launch(
   case 256:
     LAUNCH_VARLEN_KERNEL(256, 16);
     break;
+  // See the dense switch above for why BC=8 at HEAD_DIM=512.
+  case 512:
+    LAUNCH_VARLEN_KERNEL(512, 8);
+    break;
   default:
     fprintf(stderr,
             "flash_attn_sinks_varlen: unsupported head_dim=%d. "
-            "Supported: 64, 80, 96, 112, 128, 192, 256\n",
+            "Supported: 64, 80, 96, 112, 128, 192, 256, 512\n",
             head_dim);
     break;
   }

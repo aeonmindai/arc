@@ -71,15 +71,28 @@ fn sinks_attn_regular(
     sdpa_params: &SdpaParams,
     window_size: usize,
 ) -> Result<Tensor> {
-    // R1: the CUDA/Metal flash-sinks kernels only support head_dim in
-    // {64,80,96,112,128,192,256}. V4 uses head_dim=512, which falls through
-    // to the unfused matmul + softmax_with_sinks path below (GPU-capable via
+    // The CUDA flash-sinks kernel now also instantiates head_dim=512 (V4:
+    // symmetric 512/512, MQA). METAL DOES NOT — its kernel still stops at 256
+    // (`metal/backend/paged_attention.rs:121`), so the Metal branch below is
+    // guarded separately and a 512 head on Metal still takes the unfused
+    // matmul + softmax_with_sinks path (GPU-capable via
     // SoftmaxWithSinks::cuda_fwd, same math as the old "cpu" fallback).
     let hd = q.dim(candle_core::D::Minus1)?;
-    let flash_sinks_ok = matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256);
+    // ⚠️ TWO BACKENDS, TWO ENVELOPES — this was ONE shared flag, and widening it
+    // for CUDA silently widened it for Metal too. Metal's sinks kernel stops at
+    // 256: `metal_kernels/mod.rs:3025` errors on any other head_dim, and
+    // `sdpa_with_sinks.metal` instantiates only {64,80,96,128,256}. Routing a
+    // 512 head there turns a working unfused fallback into a hard
+    // CompilationError. Each backend now advertises its own set.
+    let flash_sinks_ok_cuda = matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256 | 512);
+    let flash_sinks_ok_metal = matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256);
+    #[cfg(not(feature = "cuda"))]
+    let _ = flash_sinks_ok_cuda;
+    #[cfg(not(feature = "metal"))]
+    let _ = flash_sinks_ok_metal;
 
     #[cfg(feature = "cuda")]
-    if q.device().is_cuda() && flash_sinks_ok {
+    if q.device().is_cuda() && flash_sinks_ok_cuda {
         return mistralrs_paged_attn::flash_attn_sinks(
             q,
             k,
@@ -91,7 +104,7 @@ fn sinks_attn_regular(
     }
 
     #[cfg(feature = "metal")]
-    if q.device().is_metal() && flash_sinks_ok {
+    if q.device().is_metal() && flash_sinks_ok_metal {
         return mistralrs_quant::flash_attn_sinks_metal(
             q,
             k,
@@ -136,10 +149,21 @@ fn sinks_attn_varlen(
 
     // R1: head_dim guard (see sinks_attn_regular).
     let hd = q.dim(candle_core::D::Minus1)?;
-    let flash_sinks_ok = matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256);
+    // ⚠️ TWO BACKENDS, TWO ENVELOPES — this was ONE shared flag, and widening it
+    // for CUDA silently widened it for Metal too. Metal's sinks kernel stops at
+    // 256: `metal_kernels/mod.rs:3025` errors on any other head_dim, and
+    // `sdpa_with_sinks.metal` instantiates only {64,80,96,128,256}. Routing a
+    // 512 head there turns a working unfused fallback into a hard
+    // CompilationError. Each backend now advertises its own set.
+    let flash_sinks_ok_cuda = matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256 | 512);
+    let flash_sinks_ok_metal = matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256);
+    #[cfg(not(feature = "cuda"))]
+    let _ = flash_sinks_ok_cuda;
+    #[cfg(not(feature = "metal"))]
+    let _ = flash_sinks_ok_metal;
 
     #[cfg(feature = "cuda")]
-    if device.is_cuda() && flash_sinks_ok {
+    if device.is_cuda() && flash_sinks_ok_cuda {
         return mistralrs_paged_attn::flash_attn_sinks_varlen(
             q,
             &k_packed,
@@ -153,7 +177,7 @@ fn sinks_attn_varlen(
     }
 
     #[cfg(feature = "metal")]
-    if device.is_metal() && flash_sinks_ok {
+    if device.is_metal() && flash_sinks_ok_metal {
         return mistralrs_quant::flash_attn_sinks_varlen_metal(
             q,
             &k_packed,
