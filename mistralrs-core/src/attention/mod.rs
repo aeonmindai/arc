@@ -194,8 +194,8 @@ impl Sdpa {
         // flash call below does not even take a mask — see
         // `mask_must_be_applied_as_bias`. Route it to the bias path or serve
         // from zero-filled keys.
-        let can_use_flash = can_use_flash
-            && !mask_must_be_applied_as_bias(seq_len, mask.map(|m| m.dims()));
+        let can_use_flash =
+            can_use_flash && !mask_must_be_applied_as_bias(seq_len, mask.map(|m| m.dims()));
 
         if can_use_flash {
             // flash-attn expects (b_sz, seq_len, nheads, head_dim)

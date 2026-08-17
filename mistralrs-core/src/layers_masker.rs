@@ -282,6 +282,38 @@ impl CausalMasker {
             )?));
         }
 
+        // 🔑 The same thing, learned from the batch rather than from the cache
+        // argument. `NormalCacheManager::clone_in_cache` front-aligns a ragged
+        // cohort and publishes each row's dead prefix; every model reaches this
+        // function already, so picking it up here is what makes ragged dense
+        // decode work WITHOUT threading a new argument through all forty-odd
+        // model forwards. (Threading it would not have been enough anyway —
+        // `Sdpa::run_attention`'s flash branch takes no mask argument, so the
+        // mask has to be routed to the bias path too; see
+        // `attention::mask_must_be_applied_as_bias`.)
+        //
+        // `live[i] = past_kv_len - lead_pad[i]`, recovered from the cache's own
+        // current length so it stays correct as the cohort grows between
+        // `clone_in_cache` calls.
+        if let Some(lead_pad) = crate::kv_cache::ragged_lead_pad() {
+            if lead_pad.len() == b_sz && lead_pad.iter().any(|l| *l > 0) {
+                if let Some(live) = lead_pad
+                    .iter()
+                    .map(|l| past_kv_len.checked_sub(*l))
+                    .collect::<Option<Vec<usize>>>()
+                {
+                    return Ok(Some(self.make_left_padded_causal_mask(
+                        b_sz,
+                        tgt_len,
+                        past_kv_len,
+                        &live,
+                        dtype,
+                        input_ids.device(),
+                    )?));
+                }
+            }
+        }
+
         if tgt_len == 1 {
             return Ok(None);
         }
@@ -598,6 +630,58 @@ mod ragged_mask_tests {
                 assert_eq!(*v, want, "row {r} column {j}");
             }
         }
+    }
+
+    /// 🔑 The channel is what makes ragged dense decode reach the mask at all.
+    ///
+    /// No model passes a `RaggedKvLens`; they pass their own cache or their
+    /// `seqlen_offsets`, both of which report `per_seq_kv_lens() == None`. So a
+    /// decode step (`tgt_len == 1`) would take the `return Ok(None)` shortcut
+    /// and attend over each short row's zero-filled dead prefix — logit 0, real
+    /// softmax weight, silently wrong. Reading `clone_in_cache`'s published
+    /// `lead_pad` here is what closes that, without touching a single model.
+    #[test]
+    fn the_ragged_channel_produces_a_mask_where_the_cache_argument_cannot() {
+        let device = Device::Cpu;
+        let ids = Tensor::zeros((2, 1), DType::U32, &device).unwrap();
+        // What every model actually passes on the dense path.
+        let offsets: &[usize] = &[5, 5];
+
+        // Channel unset: unchanged behaviour, no mask at tgt_len == 1.
+        crate::kv_cache::set_ragged_lead_pad(None);
+        assert!(CausalMasker
+            .make_causal_mask_matrix(&ids, &offsets, DType::F32, 1)
+            .unwrap()
+            .is_none());
+
+        // Channel set with a real dead prefix: row 1 holds 1 live position of
+        // the 5 columns, so its first 4 must be killed.
+        crate::kv_cache::set_ragged_lead_pad(Some(vec![0, 4]));
+        let m = CausalMasker
+            .make_causal_mask_matrix(&ids, &offsets, DType::F32, 1)
+            .unwrap()
+            .expect("a front-aligned ragged cohort must get a mask at tgt_len == 1");
+        assert_eq!(m.dims(), &[2, 1, 1, 6]);
+        let rows = mask_rows(&m);
+        assert!(rows[0].iter().all(|x| *x == 0.0), "row 0 is fully live");
+        assert!(
+            rows[1][..4].iter().all(|x| *x == f32::NEG_INFINITY),
+            "row 1's dead prefix must be masked or it attends zero-filled keys"
+        );
+        assert!(rows[1][4..].iter().all(|x| *x == 0.0));
+
+        // An all-zero lead_pad is a uniform cohort: it must NOT divert to the
+        // bias path, or every uniform decode batch would lose the flash kernel.
+        crate::kv_cache::set_ragged_lead_pad(Some(vec![0, 0]));
+        assert!(
+            CausalMasker
+                .make_causal_mask_matrix(&ids, &offsets, DType::F32, 1)
+                .unwrap()
+                .is_none(),
+            "a cohort with no dead prefix must stay on the unmasked fast path"
+        );
+
+        crate::kv_cache::set_ragged_lead_pad(None);
     }
 
     /// `make_causal_mask_matrix` routes to the ragged builder BEFORE both of
