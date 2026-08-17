@@ -24,6 +24,46 @@ pub struct NotACache;
 
 pub trait PastKvLenCache {
     fn get_past_kv_len(&self) -> Result<usize>;
+
+    /// The number of **live** past positions each sequence in the batch holds,
+    /// when the dense batched cache is left-aligned and therefore ragged.
+    ///
+    /// `None` — the default, and what every caller in the tree returns today —
+    /// means "every row is live for the whole `get_past_kv_len()`", i.e. the
+    /// mask is batch-invariant and [`CausalMasker::make_causal_mask_matrix`]
+    /// builds exactly the rank-2 mask it always has.
+    ///
+    /// `Some(lens)` means row `b`'s live run is the **suffix**
+    /// `[past - lens[b], past)`; the `past - lens[b]` columns ahead of it are
+    /// the zero-filled dead prefix [`crate::kv_cache::front_pad_kv_cache`]
+    /// leaves behind. Those columns are not harmless: a zero K row scores logit
+    /// 0 and takes real softmax weight, so they must be masked, and this is how
+    /// the mask learns about them.
+    fn per_seq_kv_lens(&self) -> Option<&[usize]> {
+        None
+    }
+}
+
+/// A left-aligned ragged batch's mask inputs: the padded width every row shares
+/// and the live length each row actually holds.
+///
+/// Pass this as the `cache` argument to
+/// [`CausalMasker::make_causal_mask_matrix`] to get a `[B, 1, t_q, k]` additive
+/// mask that kills each row's dead prefix as well as the future.
+pub struct RaggedKvLens<'a> {
+    /// Columns every row of the batched buffer carries.
+    pub padded_len: usize,
+    /// `live[b]` — real past positions in row `b`, `<= padded_len`.
+    pub live: &'a [usize],
+}
+
+impl PastKvLenCache for RaggedKvLens<'_> {
+    fn get_past_kv_len(&self) -> Result<usize> {
+        Ok(self.padded_len)
+    }
+    fn per_seq_kv_lens(&self) -> Option<&[usize]> {
+        Some(self.live)
+    }
 }
 
 impl PastKvLenCache for NotACache {
@@ -169,6 +209,53 @@ impl CausalMasker {
         Ok(k_cache_1.dims()[2])
     }
 
+    /// The additive `[B, 1, t_q, past + t_q]` mask a **left-aligned ragged**
+    /// batch needs: `-inf` on the future (ordinary causality) and `-inf` on
+    /// each row's dead prefix `[0, past - live[b])`.
+    ///
+    /// Query row `i` of sequence `b` sits at absolute position
+    /// `live[b] + i`, and its live keys are the columns
+    /// `[past - live[b], past + i]`. Everything outside that is killed. Note
+    /// the row is never fully masked — column `past + i` is the query's own
+    /// position — so softmax cannot produce a NaN row.
+    pub fn make_left_padded_causal_mask(
+        &self,
+        b_sz: usize,
+        tgt_len: usize,
+        past_kv_len: usize,
+        live: &[usize],
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Tensor> {
+        if live.len() != b_sz {
+            candle_core::bail!(
+                "ragged mask: {} live lengths for a batch of {b_sz}",
+                live.len()
+            );
+        }
+        let k_len = past_kv_len + tgt_len;
+        let mut data: Vec<f32> = Vec::with_capacity(b_sz * tgt_len * k_len);
+        for &l in live {
+            if l > past_kv_len {
+                candle_core::bail!(
+                    "ragged mask: live length {l} exceeds the padded width {past_kv_len}"
+                );
+            }
+            let lead = past_kv_len - l;
+            for i in 0..tgt_len {
+                let last = past_kv_len + i;
+                for j in 0..k_len {
+                    data.push(if j < lead || j > last {
+                        f32::NEG_INFINITY
+                    } else {
+                        0.0
+                    });
+                }
+            }
+        }
+        Tensor::from_vec(data, (b_sz, 1, tgt_len, k_len), device)?.to_dtype(dtype)
+    }
+
     pub fn make_causal_mask_matrix(
         &self,
         input_ids: &Tensor,
@@ -177,7 +264,24 @@ impl CausalMasker {
         _n_attn_heads: usize,
     ) -> Result<Option<Tensor>> {
         let past_kv_len = cache.get_past_kv_len()?;
-        let (_b_sz, tgt_len) = input_ids.dims2()?;
+        let (b_sz, tgt_len) = input_ids.dims2()?;
+
+        // 🔑 A left-aligned ragged batch needs a mask even at `tgt_len == 1`,
+        // and it cannot take the flash-attn shortcut: both of those assume the
+        // mask is a pure function of causality, and the dead prefix
+        // `front_pad_kv_cache` leaves is neither causal nor batch-invariant.
+        // Order matters — this branch has to come before both early returns.
+        if let Some(live) = cache.per_seq_kv_lens() {
+            return Ok(Some(self.make_left_padded_causal_mask(
+                b_sz,
+                tgt_len,
+                past_kv_len,
+                live,
+                dtype,
+                input_ids.device(),
+            )?));
+        }
+
         if tgt_len == 1 {
             return Ok(None);
         }
@@ -418,5 +522,112 @@ impl BidirectionalMasker {
         let mask = self.make_swa_mask(tgt_len, sliding_window, input_ids.device(), dtype)?;
 
         Ok(mask)
+    }
+}
+
+#[cfg(test)]
+mod ragged_mask_tests {
+    use super::*;
+
+    fn mask_rows(m: &Tensor) -> Vec<Vec<f32>> {
+        let (b, _, q, k) = m.dims4().unwrap();
+        let flat = m.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        (0..b * q)
+            .map(|r| flat[r * k..(r + 1) * k].to_vec())
+            .collect()
+    }
+
+    /// 🔑 The mask a left-aligned per-sequence KV cache needs. Three things
+    /// have to hold at once, and each one is a wrong answer if it does not:
+    ///
+    /// * the dead prefix `front_pad_kv_cache` zero-fills is `-inf` — a zero K
+    ///   row is NOT a masked row, it scores logit 0 and takes softmax weight;
+    /// * the future is `-inf` — ordinary causality, which the ragged branch
+    ///   must not lose;
+    /// * no row is entirely `-inf` — a fully masked row is a softmax NaN.
+    #[test]
+    fn left_padded_mask_kills_the_dead_prefix_and_the_future_and_never_a_whole_row() {
+        let device = Device::Cpu;
+        // Padded width 6; sequence 0 holds 6 live positions, sequence 1 holds
+        // 2, so row 1 carries a 4-wide dead prefix. Two query rows.
+        let live = [6usize, 2];
+        let m = CausalMasker
+            .make_left_padded_causal_mask(2, 2, 6, &live, DType::F32, &device)
+            .unwrap();
+        assert_eq!(m.dims(), &[2, 1, 2, 8]);
+        let rows = mask_rows(&m);
+
+        // seq 0, query 0: keys 0..=6 live (own position is column 6), 7 future.
+        assert!(rows[0][..7].iter().all(|x| *x == 0.0));
+        assert_eq!(rows[0][7], f32::NEG_INFINITY);
+        // seq 0, query 1: keys 0..=7 all live.
+        assert!(rows[1].iter().all(|x| *x == 0.0));
+        // seq 1, query 0: columns 0..4 are the dead prefix.
+        assert!(
+            rows[2][..4].iter().all(|x| *x == f32::NEG_INFINITY),
+            "the dead prefix must be masked or the model attends zero-filled keys"
+        );
+        assert!(rows[2][4..7].iter().all(|x| *x == 0.0));
+        assert_eq!(rows[2][7], f32::NEG_INFINITY);
+        // seq 1, query 1.
+        assert!(rows[3][..4].iter().all(|x| *x == f32::NEG_INFINITY));
+        assert!(rows[3][4..8].iter().all(|x| *x == 0.0));
+
+        for (i, row) in rows.iter().enumerate() {
+            assert!(
+                row.iter().any(|x| *x == 0.0),
+                "row {i} is entirely masked, which is a softmax NaN"
+            );
+        }
+    }
+
+    /// A batch whose rows are all fully live must produce exactly the ordinary
+    /// causal mask — so turning the ragged path on cannot change a uniform
+    /// batch's answer.
+    #[test]
+    fn a_fully_live_ragged_mask_is_the_ordinary_causal_mask() {
+        let device = Device::Cpu;
+        let m = CausalMasker
+            .make_left_padded_causal_mask(2, 3, 4, &[4, 4], DType::F32, &device)
+            .unwrap();
+        let rows = mask_rows(&m);
+        for (r, row) in rows.iter().enumerate() {
+            let last = 4 + (r % 3);
+            for (j, v) in row.iter().enumerate() {
+                let want = if j > last { f32::NEG_INFINITY } else { 0.0 };
+                assert_eq!(*v, want, "row {r} column {j}");
+            }
+        }
+    }
+
+    /// `make_causal_mask_matrix` routes to the ragged builder BEFORE both of
+    /// its early returns — the `tgt_len == 1` shortcut and the flash-attn
+    /// placeholder. A decode step is `tgt_len == 1` and still has a dead prefix
+    /// to mask, so returning `None` there would serve from unmasked keys.
+    #[test]
+    fn a_single_query_row_still_gets_its_ragged_mask() {
+        let device = Device::Cpu;
+        let ids = Tensor::zeros((2, 1), DType::U32, &device).unwrap();
+        let ragged = RaggedKvLens {
+            padded_len: 5,
+            live: &[5, 1],
+        };
+        let m = CausalMasker
+            .make_causal_mask_matrix(&ids, &ragged, DType::F32, 1)
+            .unwrap()
+            .expect("a ragged batch must always get a mask, even at tgt_len == 1");
+        assert_eq!(m.dims(), &[2, 1, 1, 6]);
+        let rows = mask_rows(&m);
+        assert!(rows[0].iter().all(|x| *x == 0.0));
+        assert!(rows[1][..4].iter().all(|x| *x == f32::NEG_INFINITY));
+        assert!(rows[1][4..].iter().all(|x| *x == 0.0));
+
+        // And the default (`per_seq_kv_lens() == None`) path is untouched: one
+        // query row over a uniform batch still returns `None`.
+        let offsets: &[usize] = &[5, 5];
+        assert!(CausalMasker
+            .make_causal_mask_matrix(&ids, &offsets, DType::F32, 1)
+            .unwrap()
+            .is_none());
     }
 }

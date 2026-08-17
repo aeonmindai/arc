@@ -1170,6 +1170,10 @@ pub struct MtpSpeculativePipeline {
     /// Latches so the "drafting skipped, draft KV unprimed" explanation is
     /// logged once per process rather than once per token.
     warned_unprimed: std::sync::atomic::AtomicBool,
+    /// How this pipeline advances the KV cache after a verify. Latched on the
+    /// first fast-path step (the cache's slot kinds are fixed by then) so the
+    /// decision and its reason are logged once, not once per token.
+    kv_advance: std::sync::OnceLock<KvAdvance>,
 }
 
 /// One sequence's persistent MTP draft KV.
@@ -1239,6 +1243,7 @@ impl MtpSpeculativePipeline {
             draft_kv: std::sync::Mutex::new(std::collections::HashMap::new()),
             draft_kv_clock: AtomicUsize::new(0),
             warned_unprimed: std::sync::atomic::AtomicBool::new(false),
+            kv_advance: std::sync::OnceLock::new(),
         })
     }
 
@@ -1270,6 +1275,7 @@ impl MtpSpeculativePipeline {
             draft_kv: std::sync::Mutex::new(std::collections::HashMap::new()),
             draft_kv_clock: AtomicUsize::new(0),
             warned_unprimed: std::sync::atomic::AtomicBool::new(false),
+            kv_advance: std::sync::OnceLock::new(),
         }
     }
 
@@ -1289,6 +1295,79 @@ impl MtpSpeculativePipeline {
     /// `u == w` simply drafts nothing that step and catches back up.
     pub fn window(&self) -> usize {
         self.depth + 1
+    }
+
+    /// How this pipeline advances the KV cache after a verify, decided once.
+    ///
+    /// Default [`KvAdvance::Cohort`]. `ARC_MTP_PER_SEQ_KV=1` asks for
+    /// [`KvAdvance::PerSequence`]; it is granted only when **both** of these
+    /// hold, and the reason it was refused is logged by name so a run that
+    /// asked for it never silently gets the ceiling instead:
+    ///
+    /// 1. every cache slot can carry its own length
+    ///    ([`cache_supports_per_sequence_advance`]);
+    /// 2. the target model masks a left-aligned ragged batch's dead prefix
+    ///    ([`Self::target_masks_ragged_batches`]).
+    ///
+    /// (2) is not decoration. Per-sequence lengths in one dense buffer mean
+    /// `front_pad_kv_cache` zero-fills ahead of the shorter rows, and a zero K
+    /// row is **not** a masked row — it scores logit 0 and takes real softmax
+    /// weight. Serving from those columns would be a wrong answer nothing
+    /// downstream catches, which is the exact failure this project already paid
+    /// for once with FP8 KV. Refusing is the only correct behaviour until a
+    /// model threads [`crate::layers_masker::RaggedKvLens`].
+    pub(crate) fn kv_advance(&self) -> KvAdvance {
+        *self.kv_advance.get_or_init(|| {
+            if !per_sequence_kv_requested() {
+                return KvAdvance::Cohort;
+            }
+            let refusal = cache_supports_per_sequence_advance(&self.target_cache)
+                .err()
+                .or_else(|| self.target_masks_ragged_batches().err());
+            match refusal {
+                None => {
+                    tracing::info!(
+                        target: "mtp_speculative",
+                        "MTP: per-sequence KV advance is ON — each sequence advances by its own \
+                         accepted count and no cohort rollback is applied"
+                    );
+                    KvAdvance::PerSequence
+                }
+                Some(why) => {
+                    tracing::warn!(
+                        target: "mtp_speculative",
+                        "MTP: ARC_MTP_PER_SEQ_KV=1 was requested but this pipeline cannot honour \
+                         it, so batched MTP keeps the cohort rollback and its ceiling ({why})"
+                    );
+                    KvAdvance::Cohort
+                }
+            }
+        })
+    }
+
+    /// Whether the target model applies a per-row mask over a left-aligned
+    /// ragged batch's dead prefix.
+    ///
+    /// **No model in the tree does yet**, and this says so rather than
+    /// pretending. The plumbing that would flip it is exactly one wire:
+    /// `clone_in_cache` already computes `lead_pad` per sequence
+    /// ([`crate::kv_cache::front_align_batch`]) and
+    /// [`crate::layers_masker::CausalMasker::make_left_padded_causal_mask`]
+    /// already turns that into the `[B, 1, t_q, k]` additive mask a model wants
+    /// — what is missing is carrying it from the pipeline through
+    /// `inputs_processor` into the model forward, where today the mask is
+    /// rebuilt from `seqlen_offsets` alone.
+    ///
+    /// It is stated as a capability rather than hardcoded at the call site so
+    /// that the model that adds the wire overrides one thing, here.
+    fn target_masks_ragged_batches(&self) -> std::result::Result<(), String> {
+        Err(
+            "no model in this tree threads a ragged-batch mask into its forward yet, so the \
+             zero-filled dead prefix a left-aligned per-sequence cache leaves would be attended \
+             as real keys (a zero K row scores logit 0 and takes softmax weight). See \
+             `MtpSpeculativePipeline::target_masks_ragged_batches`."
+                .to_string(),
+        )
     }
 
     /// Snapshot of this pipeline's MTP acceptance counters.
@@ -1686,6 +1765,163 @@ pub(crate) fn plan_batch_step(uncached: &[usize], accepted: &[usize], w: usize) 
     }
 }
 
+/// How a batched MTP step advances the KV cache.
+///
+/// This is the whole of the batch problem, named. See
+/// [`plan_per_sequence_step`] for why `Cohort` has a ceiling that no amount of
+/// draft-quality work can lift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KvAdvance {
+    /// One dense cache, one length, rolled back to `min_i(u_i + a_i)`.
+    /// [`plan_batch_step`]. Correct, and bounded by [`plan_per_sequence_step`]'s
+    /// doc comment.
+    Cohort,
+    /// Every sequence advances by its own accepted count. What vLLM, SGLang and
+    /// TensorRT-LLM all do. [`plan_per_sequence_step`].
+    PerSequence,
+}
+
+/// What one fused batched MTP step does when each sequence advances its **own**
+/// KV by its **own** accepted count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PerSeqStepPlan {
+    /// `committed[i]` — how many of the `w` window slots sequence `i` keeps:
+    /// `u_i + a_i`. Its cache ends the step at `cache_len + committed[i]`.
+    pub committed: Vec<usize>,
+    /// Slots sequence `i` drops: `w - committed[i]`. Their K/V is never read
+    /// again — it is overwritten by the next step's window, exactly as vLLM and
+    /// SGLang leave rejected draft slots stale inside a request's own
+    /// over-allocated region rather than freeing them.
+    pub dropped: Vec<usize>,
+    /// Each sequence's uncached committed tail at the START of the next step.
+    /// **Always 1**, for every sequence, at every batch size — which is the
+    /// entire point, and is exactly the B=1 invariant.
+    pub next_uncached: Vec<usize>,
+}
+
+/// Resolve one fused batched step **without a cohort barrier**.
+///
+/// # Why this exists
+///
+/// [`plan_batch_step`] rolls one dense cache back to `keep = min_i(u_i + a_i)`,
+/// so `next_u_i = u_i + a_i + 1 - keep`. The moment any sequence rejects its
+/// first draft (`u=1, a=0`) that pins `keep = 1` and collapses to
+/// `next_u_i = u_i + a_i` — monotone non-decreasing, saturating at the window
+/// `w`, where the sequence drafts `w - u = 0` tokens. **The sequences that
+/// accept best are the ones that stop drafting.** At B=1 it cannot happen
+/// (`keep = u + a`, so `next_u ≡ 1`), which is why B=1 is the only regime
+/// batched MTP ever measured well in.
+///
+/// # What production engines do instead
+///
+/// All three reference engines key the advance on a **per-request scalar** and
+/// perform no reduction across the batch:
+///
+/// * vLLM v1 — `v1/core/sched/scheduler.py:1836-1848`, inside the per-`req_id`
+///   loop of `update_from_output`: `num_rejected = num_draft_tokens -
+///   num_accepted; request.num_computed_tokens -= num_rejected`.
+/// * SGLang — `speculative/eagle_worker_common.py:587-588`
+///   `new_seq_lens = batch.seq_lens + accept_lens` (elementwise), committed at
+///   `scheduler_components/batch_result_processor.py:686-687`
+///   `req.kv_committed_len += num_accept_tokens`.
+/// * TensorRT-LLM — `pyexecutor/resource_manager.py:1330-1346` rewinds
+///   `request.py_rewind_len` per request.
+///
+/// A batch-wide `min` over accept lengths appears in none of them. The only
+/// `min`s nearby are unrelated (vLLM's cascade-attention common-prefix pick) or
+/// per-request clamps.
+///
+/// # What happens to a rejected draft's K/V
+///
+/// Nothing. vLLM and SGLang neither free nor zero it: the request's length
+/// shrinks so attention stops reading those slots, and the next step's window
+/// writes over the same physical positions (SGLang says so in
+/// `eagle_worker_common.py:450` — "trailing unaccepted slots stay and are freed
+/// as overshoot"). TensorRT-LLM is the only one that reclaims, and only when a
+/// rewind empties a whole block (`kvCacheManager.cpp:4562-4600`). `dropped[i]`
+/// here is that same quantity: slots the sequence stops counting, not slots
+/// anyone hands back.
+///
+/// # Invariants
+///
+/// * `next_uncached[i] == 1` for every `i` — no ratchet is representable.
+/// * `committed[i] == u_i + a_i >= 1`, so every sequence advances every step.
+/// * `committed[i] + dropped[i] == w` — no window slot is unaccounted for.
+/// * **No value depends on any other sequence.** That is the property under
+///   test; a cohort reduction reintroduced anywhere breaks
+///   `per_sequence_advance_is_independent_of_every_other_sequence`.
+pub(crate) fn plan_per_sequence_step(
+    uncached: &[usize],
+    accepted: &[usize],
+    w: usize,
+) -> PerSeqStepPlan {
+    let committed: Vec<usize> = uncached
+        .iter()
+        .zip(accepted)
+        .map(|(u, a)| (u + a).min(w))
+        .collect();
+    PerSeqStepPlan {
+        dropped: committed.iter().map(|c| w.saturating_sub(*c)).collect(),
+        next_uncached: vec![1; committed.len()],
+        committed,
+    }
+}
+
+/// `ARC_MTP_PER_SEQ_KV=1` opts a run into [`KvAdvance::PerSequence`].
+///
+/// Default OFF. The flag alone is not enough: the batch's cache must also be
+/// able to carry a per-sequence length
+/// ([`cache_supports_per_sequence_advance`]), and a run that asks for it and
+/// cannot get it is told which slot refused rather than silently served the
+/// cohort answer.
+pub(crate) fn per_sequence_kv_requested() -> bool {
+    std::env::var("ARC_MTP_PER_SEQ_KV").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// Whether every slot of this cache can hold a length that differs from the
+/// rest of its batch, or the name of the first slot that cannot.
+///
+/// A dense batched forward writes every sequence's new K/V at ONE offset
+/// (`SingleCache::append`, `kv_cache/single_cache.rs:225`), so per-sequence
+/// lengths are only representable if a ragged cohort can be re-aligned into one
+/// buffer whose rows all *end* at the same column —
+/// [`crate::kv_cache::front_pad_kv_cache`]. That is well defined for a plain
+/// `Normal` slot and for nothing else in the tree today; see
+/// [`crate::kv_cache::KvCache::supports_per_sequence_len`] for why each of the
+/// other three declines.
+pub(crate) fn cache_supports_per_sequence_advance(
+    cache: &EitherCache,
+) -> std::result::Result<(), String> {
+    let EitherCache::Normal(normal) = cache else {
+        // Not a refusal of the *idea* — the opposite. PagedAttention already
+        // has per-sequence independence at the allocator surface, and under
+        // `ARC_SEGMENTED_KV=1` `KVCacheManager::trim_request_to_num_tokens`
+        // routes straight to `SegmentedAllocator::rollback(pool, request_id, 0,
+        // num_tokens)` (`paged_attention/kv_cache_manager.rs:445-448`), which
+        // is per-request and takes an ABSOLUTE token count. What blocks paged
+        // MTP is upstream of here: the fast path only accepts
+        // `CacheBackendMetadata::DefaultInstructions`, so a paged batch never
+        // reaches this rollback at all. That is its own change.
+        return Err(
+            "the target is on PagedAttention, whose per-sequence block tables already advance \
+             independently — this dense-cache path is not what it needs"
+                .to_string(),
+        );
+    };
+    let guard = normal.lock().unwrap();
+    for (i, slot) in guard.0.iter().enumerate() {
+        if !slot.supports_per_sequence_len() {
+            return Err(format!(
+                "cache slot {i} is a `{}`, which carries one length for the whole batch. \
+                 Per-sequence MTP advance needs every slot to hold its own length; see \
+                 `KvCache::supports_per_sequence_len`.",
+                slot.kind_name()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Greedy argmax over a 1-D logits tensor — returns the token ID.
 fn argmax_token(logits: &Tensor) -> Result<u32> {
     // logits shape [vocab]
@@ -1966,7 +2202,22 @@ impl IsqPipelineMixin for MtpSpeculativePipeline {
 }
 
 impl CacheManagerMixin for MtpSpeculativePipeline {
+    /// Under [`KvAdvance::PerSequence`] a cohort arrives here genuinely ragged
+    /// — that is the point — so it is left-aligned first: every sequence's live
+    /// K/V is shifted to END at the batch maximum, which makes
+    /// `SingleCache::append`'s one shared write offset simultaneously correct
+    /// for all of them. The dense batching code below is then completely
+    /// unchanged, and `ensure_uniform_batch_cache_lens` passes for the same
+    /// reason it always did.
+    ///
+    /// `front_align_batch` returns each row's dead prefix. It is discarded here
+    /// only because [`MtpSpeculativePipeline::kv_advance`] refuses to enter
+    /// this mode until a model consumes that mask; the moment one does, this is
+    /// where the mask is born.
     fn clone_in_cache(&self, seqs: &mut [&mut Sequence]) -> candle_core::Result<()> {
+        if self.kv_advance() == KvAdvance::PerSequence {
+            let _lead_pad = crate::kv_cache::front_align_batch(seqs, false)?;
+        }
         get_mut_arcmutex!(self.target).clone_in_cache(seqs)
     }
     fn clone_out_cache(&self, seqs: &mut [&mut Sequence]) {
@@ -2508,16 +2759,45 @@ impl Pipeline for MtpSpeculativePipeline {
         // step, which is exactly what `w - u` drafts leaves room for. `u >= 1`
         // for every sequence, so the cache always advances by at least one
         // position and the batch can never stall.
+        //
+        // Under [`KvAdvance::PerSequence`] none of the paragraph above applies:
+        // there is no minimum, no rollback of the shared buffer, and no
+        // surplus. Each sequence's own cache is set to `cache_len + u_i + a_i`
+        // on the way out and its next uncached tail is 1 — the B=1 invariant,
+        // at every batch size.
         let n_accepted: Vec<usize> = accepted.iter().map(Vec::len).collect();
-        let plan = plan_batch_step(&uncached, &n_accepted, w);
-        debug_assert_eq!(
-            plan.keep,
-            valid_extent.iter().copied().min().unwrap_or(0),
-            "plan_batch_step must agree with the per-sequence valid extents"
-        );
-        if plan.n_drop > 0 {
-            truncate_normal_cache(self, plan.n_drop)?;
-        }
+        // Per-sequence advance needs the batched buffer split back into each
+        // sequence's own storage before the lengths can diverge, and that is
+        // what `CacheInstruction::Out` does. Any other POST op leaves the
+        // batched cache in the pipeline, where there is no per-sequence length
+        // to set, so those steps take the cohort rule — correctly, and without
+        // a mid-run state that no other path knows how to read.
+        let advance = match post_op {
+            CacheInstruction::Out => self.kv_advance(),
+            _ => KvAdvance::Cohort,
+        };
+        let per_sequence_commit = match advance {
+            KvAdvance::Cohort => {
+                let plan = plan_batch_step(&uncached, &n_accepted, w);
+                debug_assert_eq!(
+                    plan.keep,
+                    valid_extent.iter().copied().min().unwrap_or(0),
+                    "plan_batch_step must agree with the per-sequence valid extents"
+                );
+                if plan.n_drop > 0 {
+                    truncate_normal_cache(self, plan.n_drop)?;
+                }
+                None
+            }
+            KvAdvance::PerSequence => {
+                let plan = plan_per_sequence_step(&uncached, &n_accepted, w);
+                debug_assert_eq!(
+                    plan.committed, valid_extent,
+                    "plan_per_sequence_step must agree with the per-sequence valid extents"
+                );
+                Some(plan.committed)
+            }
+        };
 
         // ---- Commit ----
         for i in 0..batch {
@@ -2612,6 +2892,42 @@ impl Pipeline for MtpSpeculativePipeline {
             }
         }
         handle_post_cache_op(self, input_seqs, post_op);
+
+        // ---- Per-sequence advance ----
+        //
+        // `handle_post_cache_op` has just split the batched buffer back into
+        // each sequence's own `normal_cache`, every row still `cache_len + w`
+        // long. Each sequence now keeps exactly the `cache_len + u_i + a_i` it
+        // can vouch for. The slots past that hold a rejected draft's K/V and
+        // are simply stopped being counted — vLLM
+        // (`v1/core/sched/scheduler.py:1836-1848`) and SGLang
+        // (`speculative/eagle_worker_common.py:450`) do the same thing and
+        // likewise never free or zero them; the next step's window overwrites
+        // the same physical positions.
+        //
+        // 🔑 The per-sequence state IS `Sequence::normal_cache`'s own
+        // `current_seq_len`. There is deliberately **no second map keyed by
+        // sequence id** anywhere in this pipeline: a shadow copy of a length
+        // that the cache also holds is exactly the divergence wave59-CJ §1
+        // documents, reappearing in a new place. The commit therefore happens
+        // here, in the same scope that computed it, from a plain `Vec` indexed
+        // by the batch row — and there is no reduction across `input_seqs` in
+        // it, which is the whole difference from the cohort path.
+        if let Some(committed) = per_sequence_commit {
+            for (i, c) in committed.iter().enumerate() {
+                let target = cache_len + c;
+                for slot in input_seqs[i].normal_cache().iter_mut().flatten() {
+                    let kind = slot.kind_name();
+                    if let Err(e) = slot.set_len(target) {
+                        candle_core::bail!(
+                            "MTP per-sequence advance: set_len({target}) refused on a {kind} slot \
+                             for batch row {i} ({e}). Continuing would leave that sequence \
+                             reading a rejected draft's K/V."
+                        );
+                    }
+                }
+            }
+        }
 
         Ok(start.elapsed())
     }
@@ -3798,6 +4114,37 @@ mod tests {
         w: usize,
         plan_override: Option<fn(&[usize], &[usize], usize) -> BatchStepPlan>,
     ) -> Vec<Vec<u32>> {
+        let (uncached, n_accepted, emitted) = sim_propose_and_verify(seqs, w);
+        let plan = plan_override.unwrap_or(plan_batch_step)(&uncached, &n_accepted, w);
+        for (i, s) in seqs.iter_mut().enumerate() {
+            s.toks.extend_from_slice(&emitted[i]);
+            s.uncached = (s.uncached + n_accepted[i] + 1).saturating_sub(plan.keep);
+        }
+        emitted
+    }
+
+    /// The same step under [`KvAdvance::PerSequence`]. **Byte-for-byte the same
+    /// drafting and the same verify** — `sim_propose_and_verify` is shared — so
+    /// the only thing that differs between this and [`sim_step`] is how the KV
+    /// cache advances. Any divergence in the tests below is therefore
+    /// attributable to the advance rule and to nothing else.
+    fn sim_step_per_sequence(seqs: &mut [SimSeq], w: usize) -> Vec<Vec<u32>> {
+        let (uncached, n_accepted, emitted) = sim_propose_and_verify(seqs, w);
+        let plan = plan_per_sequence_step(&uncached, &n_accepted, w);
+        for (i, s) in seqs.iter_mut().enumerate() {
+            s.toks.extend_from_slice(&emitted[i]);
+            s.uncached = plan.next_uncached[i];
+        }
+        emitted
+    }
+
+    /// Draft `w - u` tokens per sequence, feed the `w`-wide window, verify with
+    /// `verify_proposed` against the rows `window_verify_row` names. Returns
+    /// `(uncached, n_accepted, emitted)`; it does **not** touch the cache.
+    fn sim_propose_and_verify(
+        seqs: &[SimSeq],
+        w: usize,
+    ) -> (Vec<usize>, Vec<usize>, Vec<Vec<u32>>) {
         let uncached: Vec<usize> = seqs.iter().map(|s| s.uncached).collect();
         let mut drafts: Vec<Vec<u32>> = Vec::with_capacity(seqs.len());
         for s in seqs.iter() {
@@ -3839,12 +4186,299 @@ mod tests {
             emitted.push(out);
         }
 
-        let plan = plan_override.unwrap_or(plan_batch_step)(&uncached, &n_accepted, w);
-        for (i, s) in seqs.iter_mut().enumerate() {
-            s.toks.extend_from_slice(&emitted[i]);
-            s.uncached = (s.uncached + n_accepted[i] + 1).saturating_sub(plan.keep);
+        (uncached, n_accepted, emitted)
+    }
+
+    // =====================================================================
+    // Per-sequence KV advance — the production rule (wave62)
+    // =====================================================================
+    //
+    // `plan_batch_step` is correct and has a ceiling; `plan_per_sequence_step`
+    // is what vLLM, SGLang and TensorRT-LLM do. Every test below drives BOTH
+    // through the same `sim_propose_and_verify`, so the drafting, the verify
+    // and the accept rule are literally the same code and the only variable is
+    // the cache advance.
+
+    /// A B=128 cohort with content-dependent accept lengths — the fixture the
+    /// whole argument is about.
+    fn batch_of(n: usize) -> Vec<SimSeq> {
+        (0..n)
+            .map(|i| SimSeq {
+                // Distinct seeds so the sequences genuinely diverge; two equal
+                // seeds would make ragged accept unreachable and the test
+                // vacuous.
+                toks: vec![11 + (i as u32 % 61), 5 + (i as u32 % 37)],
+                // 2..=5: a spread of per-sequence acceptance, which is what
+                // makes `min_i` bite.
+                agree_mod: 2 + (i as u32 % 4),
+                uncached: 1,
+            })
+            .collect()
+    }
+
+    /// The capability probe is what stands between "asked for per-sequence
+    /// advance" and "silently served the cohort ceiling". A V4-shaped cache —
+    /// K/V slots plus the compressor's `XsRolling` histories — must decline,
+    /// and must name the slot, because that slot is the actual remaining work.
+    #[test]
+    fn the_capability_probe_names_the_slot_that_cannot_carry_its_own_length() {
+        use crate::kv_cache::{EitherCache, KvCache, NormalCache, XsRollingCache};
+        use std::sync::{Arc, Mutex};
+
+        let all_normal = EitherCache::Normal(Arc::new(Mutex::new(NormalCache(vec![
+            KvCache::new_normal(2, 4096, 512),
+            KvCache::new_normal(2, 4096, 512),
+        ]))));
+        assert!(
+            cache_supports_per_sequence_advance(&all_normal).is_ok(),
+            "a cache of plain Normal slots can carry per-sequence lengths"
+        );
+
+        // V4's shape: K/V slots interleaved with compressor histories.
+        let v4_shaped = EitherCache::Normal(Arc::new(Mutex::new(NormalCache(vec![
+            KvCache::new_normal(2, 4096, 512),
+            KvCache::XsRolling(Box::new(XsRollingCache::new(4, 2, 64, 2048))),
+        ]))));
+        let err = cache_supports_per_sequence_advance(&v4_shaped).unwrap_err();
+        assert!(
+            err.contains("slot 1") && err.contains("XsRolling"),
+            "the refusal must name which slot and which kind; got {err}"
+        );
+    }
+
+    /// The plan functions agree on the one thing they must: the slots a
+    /// sequence keeps. They differ only in what happens to the surplus — the
+    /// cohort rule rolls it back and re-feeds it as a longer tail next step,
+    /// the per-sequence rule keeps it and resets the tail to 1.
+    #[test]
+    fn both_plans_agree_on_what_each_sequence_can_vouch_for() {
+        let w = 5usize;
+        let uncached = [1usize, 2, 1, 4];
+        let accepted = [3usize, 1, 0, 0];
+        let per_seq = plan_per_sequence_step(&uncached, &accepted, w);
+        let cohort = plan_batch_step(&uncached, &accepted, w);
+        for i in 0..uncached.len() {
+            assert_eq!(
+                per_seq.committed[i],
+                uncached[i] + accepted[i],
+                "seq {i}: a sequence vouches for its own tail plus its own accepts"
+            );
         }
-        emitted
+        assert_eq!(
+            cohort.keep,
+            per_seq.committed.iter().copied().min().unwrap(),
+            "the cohort keep is exactly the batch minimum of the per-sequence commits — which \
+             is the barrier, stated as an equation"
+        );
+    }
+
+    /// 🔑 **The whole point.** Under the per-sequence rule no sequence's
+    /// uncached tail ever leaves 1, so every sequence drafts the full depth on
+    /// every step, at every batch size.
+    ///
+    /// The control in the same test shows the cohort rule does the opposite on
+    /// the identical fixture: tails ratchet up to the window and the sequences
+    /// sitting there draft **zero**. That control is what makes this test
+    /// non-vacuous — if someone reintroduces a cohort reduction inside
+    /// `plan_per_sequence_step` the first assertion fails, and if the cohort
+    /// rule ever stops ratcheting the second one fails and this whole
+    /// workstream is unnecessary.
+    #[test]
+    fn per_sequence_advance_never_lets_a_tail_ratchet_at_b128() {
+        let depth = 3usize;
+        let w = depth + 1;
+        let steps = 200usize;
+
+        let mut seqs = batch_of(128);
+        let mut min_drafted = usize::MAX;
+        for step in 0..steps {
+            for (i, s) in seqs.iter().enumerate() {
+                assert_eq!(
+                    s.uncached, 1,
+                    "step {step}, seq {i}: per-sequence advance must leave every uncached tail \
+                     at 1 — a tail above 1 is the ratchet, and a tail at w={w} drafts nothing"
+                );
+                min_drafted = min_drafted.min(w - s.uncached);
+            }
+            sim_step_per_sequence(&mut seqs, w);
+        }
+        assert_eq!(
+            min_drafted, depth,
+            "every sequence must draft the full depth on every step under the per-sequence rule"
+        );
+
+        // Control: the cohort rule on the identical fixture.
+        let mut cohort = batch_of(128);
+        let mut saturated = 0usize;
+        let mut zero_drafters = 0usize;
+        for _ in 0..steps {
+            sim_step(&mut cohort, w, None);
+        }
+        for s in &cohort {
+            if s.uncached == w {
+                saturated += 1;
+            }
+            if w - s.uncached == 0 {
+                zero_drafters += 1;
+            }
+        }
+        assert!(
+            saturated > 0,
+            "the cohort rule is supposed to ratchet tails to the window at B=128 — if it no \
+             longer does, this whole change is unnecessary and the premise must be re-derived"
+        );
+        assert_eq!(
+            saturated, zero_drafters,
+            "a saturated tail is exactly a sequence that drafts nothing"
+        );
+    }
+
+    /// Token identity: batched per-sequence decoding must produce, for every
+    /// sequence, exactly the tokens that sequence would have produced alone.
+    ///
+    /// This is the acceptance test for the whole design. `sim_step_per_sequence`
+    /// at B=128 vs the same sequence run at B=1 — no tolerance, exact equality
+    /// on the full stream.
+    #[test]
+    fn per_sequence_advance_is_token_identical_to_the_b1_reference() {
+        let w = 4usize;
+        let steps = 60usize;
+
+        let mut batched = batch_of(128);
+        for _ in 0..steps {
+            sim_step_per_sequence(&mut batched, w);
+        }
+
+        for (i, want) in batch_of(128).into_iter().enumerate() {
+            let mut solo = vec![want];
+            for _ in 0..steps {
+                sim_step_per_sequence(&mut solo, w);
+            }
+            assert_eq!(
+                batched[i].toks, solo[0].toks,
+                "sequence {i} at B=128 diverged from its own B=1 run — batched per-sequence \
+                 decoding is not user-invisible"
+            );
+        }
+    }
+
+    /// B=1 must not regress: at a batch of one the two rules are the same
+    /// function, so the flag cannot move the only regime that has ever been
+    /// measured.
+    #[test]
+    fn the_two_advance_rules_are_identical_at_batch_one() {
+        for depth in 1..=8usize {
+            let w = depth + 1;
+            let mut cohort = vec![batch_of(1).remove(0)];
+            let mut per_seq = vec![batch_of(1).remove(0)];
+            for step in 0..40 {
+                let a = sim_step(&mut cohort, w, None);
+                let b = sim_step_per_sequence(&mut per_seq, w);
+                assert_eq!(a, b, "depth {depth}, step {step}: B=1 emission differs");
+                assert_eq!(
+                    cohort[0].uncached, per_seq[0].uncached,
+                    "depth {depth}, step {step}: B=1 uncached tail differs"
+                );
+            }
+        }
+    }
+
+    /// No value the per-sequence plan produces for sequence `i` may depend on
+    /// any other sequence. This is the anti-cohort-barrier test: it fails the
+    /// moment anyone reintroduces a `min`, a `max` or any other reduction over
+    /// the batch.
+    #[test]
+    fn per_sequence_plan_ignores_every_other_sequence() {
+        let w = 5usize;
+        // A deliberately hostile batch: one permanent laggard (u=1, a=0) —
+        // exactly the sequence that pins `keep = 1` and ratchets everyone else
+        // under the cohort rule.
+        let uncached = [1usize, 1, 2, 3, 5, 1, 4];
+        let accepted = [0usize, 4, 3, 2, 0, 1, 0];
+        let batched = plan_per_sequence_step(&uncached, &accepted, w);
+
+        for i in 0..uncached.len() {
+            let solo = plan_per_sequence_step(&uncached[i..=i], &accepted[i..=i], w);
+            assert_eq!(
+                batched.committed[i], solo.committed[0],
+                "seq {i}: committed slots changed because of its neighbours"
+            );
+            assert_eq!(
+                batched.dropped[i], solo.dropped[0],
+                "seq {i}: dropped slots changed because of its neighbours"
+            );
+            assert_eq!(batched.next_uncached[i], 1, "seq {i}: tail must reset to 1");
+            assert_eq!(
+                batched.committed[i] + batched.dropped[i],
+                w,
+                "seq {i}: window slots unaccounted for"
+            );
+            assert!(batched.committed[i] >= 1, "seq {i}: cache must advance");
+        }
+
+        // Teeth: the cohort rule on the SAME input does depend on neighbours,
+        // so the equalities above are not trivially true of any plan.
+        let cohort = plan_batch_step(&uncached, &accepted, w);
+        assert_eq!(cohort.keep, 1, "the laggard pins the cohort keep at 1");
+        assert!(
+            cohort.next_uncached.iter().any(|u| *u > 1),
+            "the cohort rule must ratchet on this fixture or the contrast is vacuous"
+        );
+    }
+
+    /// The quantified gap, in the unit that matters. `tok_per_step` — NOT
+    /// `accept_rate`: a saturated sequence drafts 0, so it contributes
+    /// `proposed = 0` and leaves `accept_rate` flattering while `tok_per_step`
+    /// collapses. The two diverge exactly here.
+    ///
+    /// This is arithmetic on the production plan functions, not a hardware
+    /// measurement, and must never be quoted as one.
+    #[test]
+    fn tok_per_step_at_b128_is_bounded_by_the_cohort_rule_and_freed_by_the_per_sequence_rule() {
+        let w = 4usize; // depth 3, the shipped default
+        let steps = 200usize;
+        let b = 128usize;
+
+        let tok_per_step = |mut seqs: Vec<SimSeq>, per_seq: bool| -> f64 {
+            let mut emitted = 0usize;
+            for _ in 0..steps {
+                let out = if per_seq {
+                    sim_step_per_sequence(&mut seqs, w)
+                } else {
+                    sim_step(&mut seqs, w, None)
+                };
+                emitted += out.iter().map(Vec::len).sum::<usize>();
+            }
+            emitted as f64 / (steps * seqs.len()) as f64
+        };
+
+        let cohort = tok_per_step(batch_of(b), false);
+        let per_sequence = tok_per_step(batch_of(b), true);
+        // The B=1 baseline is the mean over each of the SAME 128 sequences run
+        // alone — not `batch_of(1)`, whose single member has one particular
+        // `agree_mod` and is not representative of the cohort's mix.
+        let solo = batch_of(b)
+            .into_iter()
+            .map(|s| tok_per_step(vec![s], false))
+            .sum::<f64>()
+            / b as f64;
+
+        assert!(
+            per_sequence > cohort * 1.10,
+            "per-sequence advance must beat the cohort rule at B=128 by a clear margin \
+             (cohort {cohort:.4}, per-sequence {per_sequence:.4} tok/step)"
+        );
+        assert!(
+            (per_sequence - solo).abs() < 1e-9,
+            "per-sequence advance at B=128 must reach what the same fixture reaches at B=1 \
+             (B=128 {per_sequence:.4}, B=1 {solo:.4} tok/step) — that is what 'no cohort \
+             barrier' means"
+        );
+        assert!(
+            cohort < solo,
+            "the cohort rule must lose against B=1 or there is no problem to solve \
+             (cohort {cohort:.4}, B=1 {solo:.4} tok/step)"
+        );
     }
 
     /// The window invariant closes: over every depth 1..=8 and every ragged
