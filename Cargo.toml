@@ -20,6 +20,7 @@ members = [
     "arc-cli",
     "arc-cuda-graph",
     "arc-bench",
+    "arc-profiler",
 ]
 resolver = "2"
 

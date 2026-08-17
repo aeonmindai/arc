@@ -720,6 +720,36 @@ impl Loader for NormalLoader {
             None
         };
 
+        // TurboQuant for the eager KV cache. Must run *before* the model is
+        // built: every model constructor calls `NormalCache::new`, which reads
+        // this gate. See `kv_cache::resolve_eager_turboquant` for why this is
+        // opt-in while the paged `PagedCacheType::TurboQuant` default is not.
+        {
+            let model_cfg = self.inner.model_config(&config)?;
+            let decision = crate::kv_cache::configure_eager_turboquant(
+                model_cfg.k_head_dim(),
+                model_cfg.v_head_dim(),
+                matches!(
+                    model_cfg.kv_cache_layout(),
+                    crate::paged_attention::KvCacheLayout::Standard
+                ),
+                paged_attn_config.is_some(),
+            );
+            match decision {
+                crate::kv_cache::EagerTurboQuantDecision::Enabled(k, v) => {
+                    let preset = mistralrs_quant::turboquant::TurboQuantPreset::default();
+                    info!(
+                        "TurboQuant KV cache ON for the eager path: {preset} at \
+                         k_head_dim={k}, v_head_dim={v} ({:.2}x vs FP16).",
+                        preset.compression_ratio(k)
+                    );
+                }
+                crate::kv_cache::EagerTurboQuantDecision::Disabled(reason) => {
+                    tracing::debug!("TurboQuant KV cache off for the eager path: {reason}");
+                }
+            }
+        }
+
         let mut model = if use_nccl || cfg!(feature = "ring") {
             let (mapper, sharded_vb) = distributed::prepare_distributed_mapper(
                 dtype,
@@ -1293,6 +1323,28 @@ impl Loader for NormalLoader {
             }
         };
 
+        // Bind the profiler's device timer to the device the model actually
+        // runs on, and stamp the provenance a report is worthless without.
+        // Both are no-ops unless `ARC_PROFILE=1`.
+        arc_profiler::attach_device(&device);
+        // `ARC_PROFILE_SELFTEST=1`: prove on this box, before any real
+        // measurement, that device time comes from CUDA events and not from
+        // launch timing. The verdict goes into the report's notes either way.
+        arc_profiler::maybe_selftest(&device);
+        arc_profiler::set_meta(|h| {
+            h.model = self.model_id.clone();
+            h.build_features = vec![
+                #[cfg(feature = "cuda")]
+                "cuda".to_string(),
+                #[cfg(feature = "flash-attn")]
+                "flash-attn".to_string(),
+                #[cfg(feature = "cudnn")]
+                "cudnn".to_string(),
+                #[cfg(feature = "metal")]
+                "metal".to_string(),
+            ];
+        });
+
         Ok(Arc::new(Mutex::new(NormalPipeline {
             model,
             tokenizer: tokenizer.into(),
@@ -1528,6 +1580,19 @@ impl Pipeline for NormalPipeline {
                 {
                     let probe = std::env::var_os("ARC_V4_CAPTURE_PROBE").is_some();
                     let (bs, seq_len) = input_ids.dims2().unwrap_or((0, 0));
+                    if !probe {
+                        // The only CUDA-graph path structurally reachable from
+                        // a plain V4 run, and it is gated off by default. Say so
+                        // in the report: a graph node reporting 0 ns because it
+                        // never executed must not read like a graph node that
+                        // executed instantly.
+                        arc_profiler::mark_unreachable(
+                            "cuda_graph.capture_probe",
+                            "ARC_V4_CAPTURE_PROBE is unset, so capture/replay is skipped and the \
+                             forward runs eagerly",
+                            "normal.rs:1554",
+                        );
+                    }
                     // Enable the candle caching allocator for graph-capture
                     // safety (RUN-161). Idempotent; gated so it's off during
                     // model load and only active for decode. Warmup decode
@@ -1842,6 +1907,12 @@ impl Pipeline for NormalPipeline {
             let block_size = match self.metadata.cache_config.as_ref() {
                 Some(c) => c.block_size,
                 None => {
+                    arc_profiler::mark_unreachable(
+                        "cuda_graph.autonomous_decode",
+                        "cache_config is None: DeepSeekV4Loader::supports_paged_attention() is \
+                         false, so no PagedAttention cache is ever built for V4",
+                        "normal.rs:1844",
+                    );
                     tracing::debug!("autonomous_decode: no cache_config, falling back");
                     return Ok(None);
                 }

@@ -3186,6 +3186,40 @@ impl DeviceMappedModelLoader for DeepSeekV3Loader {
 /// [`NormalLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.NormalLoader.html
 pub struct DeepSeekV4Loader;
 
+/// Pure decision half of [`v4_paged_attn_optin`], so the opt-in semantics can be
+/// unit-tested without mutating process environment.
+///
+/// Strict `"1"`: an unset, empty, or any-other-value variable keeps the shipped
+/// default. This is deliberately narrower than `is_some()` — wave43-BU shipped
+/// `ARC_V4_FP8_KV` as `!(v == "0")`, which made *unset* mean *on* and bricked
+/// every V4 forward for a day (wave49-BZ). An experiment flag must never be
+/// able to turn itself on.
+fn v4_paged_attn_optin_from(var: Option<&str>) -> bool {
+    var == Some("1")
+}
+
+/// `ARC_V4_PAGED_ATTN=1` — opt in to the V4 PagedAttention arm.
+///
+/// **Off by default; the default path is byte-for-byte what it was.** This
+/// exists so the arm described at [`DeepSeekV4Loader::supports_paged_attention`]
+/// can be measured on hardware rather than argued about. Read the cost list
+/// there before enabling: it disables V4's CUDA-graph decode arm, adds an
+/// O(context) gather per layer per step, and is b=1 only.
+fn v4_paged_attn_optin() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let on = v4_paged_attn_optin_from(std::env::var("ARC_V4_PAGED_ATTN").ok().as_deref());
+        if on {
+            once_log_info(
+                "ARC_V4_PAGED_ATTN=1: V4 PagedAttention arm ENABLED (experiment). \
+                 CUDA-graph decode is disabled by this flag and batch_size > 1 will \
+                 be refused by v4_paged_dispatch_precheck.",
+            );
+        }
+        on
+    })
+}
+
 impl NormalModelLoader for DeepSeekV4Loader {
     fn load(
         &self,
@@ -3272,6 +3306,52 @@ impl NormalModelLoader for DeepSeekV4Loader {
         //
         // Reporting `false` keeps the pipeline on the non-paged SDPA path.
         // (RUN-161; rationale corrected wave 29.)
+        //
+        // 4. WAVE 53 (CD) — `ARC_V4_PAGED_ATTN=1` flips this to `true` so the
+        //    arm can be measured instead of argued. **Default is unchanged.**
+        //    What the opt-in actually costs, all confirmed by code read:
+        //    - It DISABLES V4's only CUDA-graph decode arm. `deepseek4.rs:1594`
+        //      (`None if has_graph_mode_positions() && seq_len == 1`) is an arm
+        //      of `match &self.paged_attn`; once `paged_attn` is `Some`, the
+        //      `Some(..)` arm at `:1537` shadows it and graph-mode decode is
+        //      unreachable.
+        //    - It adds a full O(context) `gather_kv_cache` per layer per decode
+        //      step (`paged_attention.rs:499-509`) — paging is undone every
+        //      step to hand `dsv4_attention` a dense tensor.
+        //    - It does NOT reach GPU-autonomous decode. `cache_config` becomes
+        //      `Some` so the `normal.rs:1841` bail stops, but
+        //      `AutonomousDecodeRunner::capture` has no caller anywhere in the
+        //      workspace, so `is_captured()` (`normal.rs:1970`) is permanently
+        //      false and the next bail fires instead.
+        //    - It is b=1 only: `v4_paged_dispatch_precheck` refuses `bs > 1`,
+        //      and the `xs` compressor history in the extra NormalCache slots
+        //      is never cloned in/out under the engine's PagedAttention arm.
+        //    Use it to measure, not to serve.
+        //
+        // 5. 🔴 MEASURED, A100-80G, qtip2b, b=1 (wave53-CD). The flag works and
+        //    `cache_config` really does become `Some` ("Allocating 2048 MB for
+        //    PagedAttention KV cache per GPU ... 762 GPU blocks"). V4 then
+        //    produces ZERO tokens — it dies on the first forward:
+        //      `dsv4_attention: 1 query rows against only 0 keys
+        //       (raw_prefix 0 + 0 given)`   (dummy run)
+        //      `CublasError(CUBLAS_STATUS_INTERNAL_ERROR)` then
+        //      `DriverError(CUDA_ERROR_ILLEGAL_ADDRESS)`  (first real request)
+        //    ⇒ `cache_write_and_gather` misreads `context_lens`. The inputs
+        //    processor emits ONE ABSOLUTE SLOT INDEX PER TOKEN
+        //    (`inputs_processor.rs:300-302`) and flattens it to
+        //    `[batch * max_context_len]` (`:399-408`), but
+        //    `build_cu_seqlens_kv_from_context_lens`
+        //    (`paged_attention/mod.rs:59-78`) reads `dim(0)` as the batch and
+        //    cumsums the values as PER-SEQUENCE LENGTHS. On the dummy run the
+        //    `block_ids.is_none()` "during profiling" `continue`
+        //    (`inputs_processor.rs:285-289`) leaves `context_lens` and
+        //    `block_tables` empty outright, so the gather returns 0 rows.
+        //    **Fix that contract before this flag is worth anything.** Do not
+        //    re-rent a box to re-confirm the failure; re-read
+        //    `memory/mission/wave53-CD-paged-attn-probe.md` §8.
+        if v4_paged_attn_optin() {
+            return Ok(true);
+        }
         Ok(false)
     }
     fn get_config_repr(&self, config: &str) -> Result<Box<dyn Debug>> {
@@ -5570,6 +5650,50 @@ impl DeviceMappedModelLoader for Qwen3NextLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The V4 PagedAttention opt-in must be strict `"1"`.
+    ///
+    /// This is the wave43-BU regression in test form: that flag shipped as
+    /// `!(v == "0")`, so *unset* meant *on*, and every V4 forward died for a day
+    /// (wave49-BZ). Mutation check: widen the comparison to
+    /// `var.is_some_and(|v| v != "0")` and the `None`/`""`/`"true"` rows fail.
+    #[test]
+    fn v4_paged_attn_optin_requires_exactly_one() {
+        assert!(
+            v4_paged_attn_optin_from(Some("1")),
+            "ARC_V4_PAGED_ATTN=1 is the one value that opts in"
+        );
+        for off in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("true"),
+            Some("yes"),
+            Some(" 1"),
+        ] {
+            assert!(
+                !v4_paged_attn_optin_from(off),
+                "{off:?} must leave the shipped default (paged attention OFF) in place"
+            );
+        }
+    }
+
+    /// The shipped default must stay `false` regardless of this branch.
+    ///
+    /// `v4_paged_attn_optin` memoises a `OnceLock` read of the real environment,
+    /// so this asserts the value the loader reports in the test process — where
+    /// `ARC_V4_PAGED_ATTN` is unset — is still the non-paged path.
+    #[test]
+    fn v4_supports_paged_attention_defaults_to_false() {
+        assert!(
+            !v4_paged_attn_optin(),
+            "ARC_V4_PAGED_ATTN is unset in the test process; the opt-in must read false"
+        );
+        assert!(
+            !DeepSeekV4Loader.supports_paged_attention("{}").unwrap(),
+            "flipping V4's default to paged attention is a behaviour change, not a probe"
+        );
+    }
 
     #[test]
     fn dispatcher_recognizes_v4_architectures() {

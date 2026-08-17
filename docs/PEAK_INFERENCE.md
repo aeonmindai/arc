@@ -1,10 +1,14 @@
 # Peak Inference: a 120 tok/s BF16 target
 
-> **This document is a PLAN, not a results page.** Every tok/s figure in it is a
-> **[target]** or a **[derived]** roofline. **Nothing here has been run.** No
-> B200 has ever been rented for this project, and `deploy/benchmark.py` — cited
-> below as the measurement harness — **does not exist in the tree**. For numbers
-> that were actually measured, see [BENCHMARKS.md](BENCHMARKS.md).
+> **This document is a PLAN, not a results page.** Every tok/s figure *for this
+> plan* is a **[target]** or a **[projected]** roofline. **Nothing in this plan
+> has been run.** No B200 has ever been rented for this project, and
+> `deploy/benchmark.py` — cited below as the measurement harness — **does not
+> exist in the tree**. The only **[measured]** numbers quoted anywhere below are
+> Arc's DeepSeek-V4-on-H200 results, imported from
+> [BENCHMARKS.md](BENCHMARKS.md) purely to keep this document from inventing a
+> baseline; they are a different model on a different card and do not transfer
+> to the target here.
 
 ## Evidence grades
 
@@ -12,8 +16,9 @@ Same grading as the rest of `docs/`. Every number below carries one.
 
 | grade | meaning |
 |---|---|
-| **[measured]** | someone ran it on hardware; the box and the shape are stated |
-| **[derived]** | arithmetic over measured quantities or over published hardware specs |
+| **[measured]** | someone ran it end-to-end on hardware; the box and the shape are stated |
+| **[measured-kernel]** | a microbenchmark of one kernel or one path on hardware — **not** the served engine, and never interchangeable with **[measured]** |
+| **[derived]** / **[projected]** | arithmetic over measured quantities or over published hardware specs. **Arithmetic is not measurement** and must never be printed as if it were |
 | **[target]** | a goal we are designing toward. **Not a measurement and not a forecast** — nobody has run it |
 | **[published]** | a third party's number, measured against *their* baseline, not ours |
 
@@ -49,10 +54,17 @@ Two separate defects were in that one line:
    head-to-head against Arc unless we ran both sides ourselves and say where.
 2. **Arc's own 33 tok/s was equally unmeasured** — it is not in `FACTS.md`, no
    B200 was ever rented, and the harness it was attributed to does not exist.
-   Arc's only measured decode figure is **14.58 tok/s** on a *different* model
-   and a *different* card (DeepSeek V4 Flash, 1×H200, b=1, no-`cudnn` build)
-   **[measured]** — see [BENCHMARKS.md](BENCHMARKS.md). It does not transfer
-   here and must not be quoted as this baseline.
+   Arc's measured decode figures are all on a *different* model and a
+   *different* card (DeepSeek V4 Flash, 1×H200, no-`cudnn` build)
+   **[measured]**: **b=1 is 18.27 tok/s aggregate / 17.99 tok/s per-user p50**,
+   and batched serving peaks at **111.69 tok/s aggregate at B=256** — see
+   [BENCHMARKS.md](BENCHMARKS.md). None of it transfers here and none of it may
+   be quoted as this document's baseline.
+
+   > **Correction.** This section previously read *"Arc's only measured decode
+   > figure is **14.58 tok/s**"*. That has been false since session 7: 14.58 is
+   > the session-4 b=1 rung, superseded by 18.27, and it was never the *only*
+   > figure once the batched-serving sweeps existed.
 
 **Why no competitor row can be reconstructed for the flagship model.** For
 DeepSeek V4 Flash, **every published serving configuration we have been able to
@@ -67,10 +79,10 @@ exhaustive]**:
 | the one W4A16 quantization we found | 143 GB; its own model card states *"TP=1 OOMs on a single 141 GB H200"* |
 | NVFP4 | Blackwell-only, so not an H200 option |
 
-Arc's **74.18 GB** artifact (≈1.9 bits/param [derived], measured via the HF API
-on the published `aeonmind/DeepSeek-V4-Flash-UQFF-qtip2`) is what makes 1×H200
-possible for us — with ~59 GB of the 141 GB card left for KV and activations
-(141 − 74.18 − ~8 GB runtime).
+Arc's **74.18 GB** artifact (**2.09 bits/param**, measured via the HF API on the
+published `aeonmind/DeepSeek-V4-Flash-UQFF-qtip2`; the `qtip2b` rung is
+74.12 GB) is what makes 1×H200 possible for us — with ~59 GB of the 141 GB card
+left for KV and activations (141 − 74.18 − ~8 GB runtime) **[derived]**.
 
 **Scope this claim honestly.** It is "we searched and found no published
 single-GPU configuration", not "none exists" — absence of evidence, not evidence
@@ -84,9 +96,23 @@ have never run against any engine.
 
 **Sanity-check against a roofline instead of a competitor.** For V4 Flash on
 H200: 74.18 GB ÷ 4.8 TB/s = 15.5 ms/step ⇒ **~4,100 tok/s at B=64**
-**[derived]**, against which the measured 63.5 ms grouped-GEMM microbenchmark
-sits at **~24% of roofline** **[measured-kernel]**. That is a real, refutable gap, and it needs no
-third party to state.
+**[projected — a spec-bandwidth bound, not a target]**. Two very different
+things sit under it, and they must not be conflated:
+
+| what | value at B=64 | share of the ~4,100 roofline |
+|---|---|---|
+| grouped-GEMM expert path extrapolated from its measured 63.5 ms step floor **[measured-kernel floor → projected tok/s]** | ~1,006 tok/s | ~24% |
+| **what the server actually serves, end-to-end [measured]** | **91.46 tok/s** | **~2%** |
+
+The **~2%** is the honest gap: the served path is ~11× below even the
+expert-path extrapolation, and the extrapolation is ~4× below the bandwidth
+bound. Consistent with that, the peak served aggregate of 111.69 tok/s at B=256
+is a **low single-digit percentage of the H200's 4.8 TB/s** — the engine is
+**overhead-bound, not bandwidth-bound**. One measured contributor on the V4
+path: GPU radix top-k sampling falls back to CPU on *every token*
+(`tensor_device_ptr: unsupported dtype I32`, ~10 lines/sec), a device→host round
+trip per step. That is a real, refutable gap, and it needs no third party to
+state.
 
 ---
 
@@ -289,7 +315,21 @@ For QKV fusion: modify model forward pass to concatenate weight matrices at load
 
 ## Phase 4: TurboQuant Kernel Optimization (context scaling)
 
-Once the BF16 baseline hits 120 tok/s, TurboQuant's KV cache compression provides the scaling advantage at long contexts and high batch counts. The kernel optimizations:
+> 🔴 **Status before reading this phase.** **TurboQuant has never been measured
+> on a GPU, on any model.** The **4.27×** context figure quoted elsewhere in
+> this repo (Qwen3-32B, 39K → 169K) is **format arithmetic** — bytes per token
+> at 3.5 bits versus BF16 — and was **never produced by a forward pass**.
+> Anywhere it reads as measured, it is retracted. **[projected]**
+>
+> Ship state: TurboQuant is **off by default** (opt-in via
+> `ARC_TURBOQUANT_KV=1`); the paged kernel exists at **head_dim 128 only**; and
+> **there is no head_dim-512 kernel, so DeepSeek V4 Flash cannot use TurboQuant
+> at all.** The optimizations below are therefore work on a path that has no
+> measured baseline — producing one is a prerequisite, not a formality.
+
+Once the BF16 baseline hits 120 tok/s, TurboQuant's KV cache compression is
+*intended* to provide the scaling advantage at long contexts and high batch
+counts **[target]**. The kernel optimizations:
 
 ### cp_async pipelining
 
