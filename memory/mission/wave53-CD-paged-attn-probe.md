@@ -171,11 +171,20 @@ unconditionally** on the allocating call, and every later call hits
 if !runner.is_captured() { return Ok(None); }
 ```
 `AutonomousDecodeRunner::capture` / `capture_via_decode_forward`
-(`arc-cuda-graph/src/autonomous.rs:213,297`) have **no caller in the entire
-workspace** — `grep -rn "capture_via_decode_forward\|\.capture("` over
-`mistralrs-core/`, `arc-engine/`, `arc-cuda-graph/src/bin/` returns exactly one
-hit, and it is the comment at `pipeline/mod.rs:609` saying a pipeline *"must
-call `runner.capture(&forward_fn)`"*. Nothing does.
+(`arc-cuda-graph/src/autonomous.rs:297,213`) have **no caller anywhere in the
+workspace.** Grepping all eight crates (`mistralrs-core`, `arc-cuda-graph`,
+`arc-engine`, `arc-cli`, `arc-bench`, `mistralrs`, `mistralrs-server-core`,
+`mistralrs-cli`), excluding `target/`:
+
+* `capture_via_decode_forward` → 3 hits, all in `autonomous.rs`, and the two
+  besides the definition are its own doc comments. **Zero call sites.**
+* `.capture(` → 2 hits: `autonomous.rs:290` (inside
+  `capture_via_decode_forward`, i.e. the dead function calling itself onward)
+  and `pipeline/mod.rs:609`, which is a **comment** saying a pipeline *"must
+  call `runner.capture(&forward_fn)`"*. Nothing does.
+
+The whole capture chain is unreachable: the only entry point into it is a
+function nobody calls.
 
 ⇒ `is_captured()` is permanently false. **`cache_config` was never the binding
 constraint.** wave29-BC §3 called this "necessary but not sufficient"; it is
