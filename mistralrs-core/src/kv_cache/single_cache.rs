@@ -546,4 +546,49 @@ mod tests {
         assert_eq!(cache.all_data.as_ref().unwrap().dim(2)?, before);
         Ok(())
     }
+
+    /// THE PROPERTY THAT MATTERS IS AVAILABILITY, NOT A WELL-WORDED ERROR.
+    ///
+    /// When the pinned graph buffer refuses to grow, `normal.rs` drops graph
+    /// mode and retries the forward eagerly. That fallback is only real if the
+    /// EAGER path can serve the very demand the graph path just refused —
+    /// otherwise the retry fails too and the request dies anyway, which is an
+    /// availability regression traded for a memory saving, and a quiet one:
+    /// it fires on a sequence longer than whatever the buffer was pinned at,
+    /// i.e. on real traffic rather than in tests.
+    ///
+    /// So assert the fallback has somewhere to go.
+    ///
+    /// Mutation: give `append` the same pin (make it bail when
+    /// `all_data` is Some and too small) and this fails — which is exactly the
+    /// state that would make the eager retry in `normal.rs` useless.
+    #[test]
+    fn the_eager_path_still_serves_what_the_pinned_graph_refuses() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut cache = SingleCache::new(2, 1_048_576, 0);
+        let src = Tensor::zeros((1, 1, 1, 8), DType::F32, &dev)?;
+
+        // Pin small, then demand more than the pin: the graph path refuses.
+        cache.pregrow_for_graph(&src, 128)?;
+        assert!(
+            cache.pregrow_for_graph(&src, 4096).is_err(),
+            "precondition: the pinned graph buffer must refuse to grow"
+        );
+
+        // The eager path must still be able to serve that sequence. It has no
+        // pin — it grows — so the retry in `normal.rs` completes the request.
+        for _ in 0..200 {
+            cache.append(&src)?;
+        }
+        assert_eq!(
+            cache.current_seq_len, 200,
+            "the eager path must keep accepting tokens past the graph's pin, or \
+             the fallback is not a fallback"
+        );
+        assert!(
+            cache.all_data.as_ref().unwrap().dim(2)? >= 200,
+            "and it must have grown the buffer to hold them"
+        );
+        Ok(())
+    }
 }

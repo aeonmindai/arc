@@ -1908,14 +1908,54 @@ impl Pipeline for NormalPipeline {
                         };
                     match captured {
                         Some(o) => o,
-                        None => self.model.forward(
-                            &input_ids,
-                            &seqlen_offsets,
-                            context_lens,
-                            position_ids,
-                            paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
-                            &flash_meta,
-                        )?,
+                        None => {
+                            let attempt = self.model.forward(
+                                &input_ids,
+                                &seqlen_offsets,
+                                context_lens.clone(),
+                                position_ids.clone(),
+                                paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
+                                &flash_meta,
+                            );
+                            match attempt {
+                                Ok(o) => o,
+                                // AVAILABILITY. This forward runs with graph-mode
+                                // positions SET, so it takes V4's graph KV arm —
+                                // which can legitimately refuse (the pinned graph
+                                // buffer must not be resized under a captured
+                                // graph). Propagating that `?` would KILL THE
+                                // REQUEST, and it would do so on real traffic: the
+                                // trigger is a sequence longer than whatever the
+                                // buffer was pinned at. Trading a user's answer for
+                                // a memory saving is a worse bug than the one the
+                                // pin fixes, and a quieter one — the OOM it
+                                // replaced at least failed loudly at startup.
+                                //
+                                // So degrade instead: drop graph mode, disable the
+                                // runner for the rest of the process, and retry
+                                // eagerly. `append` (the eager path) has no pin and
+                                // grows normally, so the retry succeeds and the user
+                                // still gets an answer — slower, and correct.
+                                Err(e) if crate::layers::has_graph_mode_positions() => {
+                                    tracing::warn!(
+                                        "ARC capture: graph-mode forward failed ({e}); falling back                                          to eager for this and every later step so the request still                                          completes. CUDA graphs are now OFF for this process."
+                                    );
+                                    crate::layers::set_graph_mode_positions(None);
+                                    if let Some(r) = self.cuda_graph_runner.as_mut() {
+                                        r.disable();
+                                    }
+                                    self.model.forward(
+                                        &input_ids,
+                                        &seqlen_offsets,
+                                        context_lens,
+                                        position_ids,
+                                        paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
+                                        &flash_meta,
+                                    )?
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
                     }
                 }
                 #[cfg(not(feature = "cuda"))]
