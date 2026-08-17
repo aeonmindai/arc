@@ -806,6 +806,68 @@ pub(crate) fn ensure_uniform_batch_cache_lens(
     }
 }
 
+/// Reconcile the one quantity [`ensure_uniform_batch_cache_lens`] cannot see:
+/// [`XsRollingCache::base`].
+///
+/// Uniform `current_seq_len` is **not** sufficient for `tail` (which is
+/// `tokens - base` wide) to batch, because `base` tracks the sequence's
+/// *high-water* length rather than its current one: `set_len` narrows the tail
+/// without moving `base`, and `advance` never lowers it. Two sequences at an
+/// identical token count can therefore hold tails of different width — see
+/// [`XsRollingCache::trim_tail_to`] for the ways that happens.
+///
+/// This needs no speculative decoding to reach. `prefix_cacher.rs` calls
+/// `set_len` on every stored layer, so a sequence restored from a prefix-cache
+/// entry that was stored at a greater length holds a narrower tail than one that
+/// arrived directly — and `clone_in_cache` then batches the two with
+/// `slice_set`, which demands an exact dim match. That is a second, independent
+/// route into the same `shape mismatch on dim 1, …` failure that
+/// `ensure_uniform_batch_cache_lens` was added to close, and it is on the
+/// **plain decode path**.
+///
+/// Raising every member to the batch maximum is lossless by construction: the
+/// member already sitting at `base_max` proves no future compressed row needs a
+/// token below it. `trim_tail_to` refuses rather than silently dropping history
+/// if that were ever untrue.
+fn reconcile_xs_bases(
+    seqs: &mut [&mut crate::sequence::Sequence],
+    layer: usize,
+    modify_draft_cache: bool,
+) -> Result<()> {
+    let mut base_max = 0usize;
+    let mut any = false;
+    for seq in seqs.iter_mut() {
+        let cache = if modify_draft_cache {
+            seq.normal_draft_cache()
+        } else {
+            seq.normal_cache()
+        };
+        if let Some(KvCache::XsRolling(xs)) = cache.get(layer).and_then(|s| s.as_ref()) {
+            base_max = base_max.max(xs.base);
+            any = true;
+        }
+    }
+    if !any || base_max == 0 {
+        return Ok(());
+    }
+    for (i, seq) in seqs.iter_mut().enumerate() {
+        let cache = if modify_draft_cache {
+            seq.normal_draft_cache()
+        } else {
+            seq.normal_cache()
+        };
+        if let Some(KvCache::XsRolling(xs)) = cache.get_mut(layer).and_then(|s| s.as_mut()) {
+            xs.trim_tail_to(base_max).map_err(|e| {
+                candle_core::Error::msg(format!(
+                    "kv-cache: cannot reconcile cache slot {layer} of seqs[{i}] to the batch's \
+                     retained-window start {base_max}: {e}"
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
 impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCacheManager {
     fn clone_in_cache(
         &self,
@@ -839,6 +901,12 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     continue;
                 }
             }
+
+            // `tail` is content, not slack, so it cannot be padded — but it
+            // *can* be trimmed to a common start, which is lossless. Do that
+            // before gathering, so the batch's widths agree by construction
+            // rather than by luck.
+            reconcile_xs_bases(seqs, layer, modify_draft_cache)?;
 
             // Gather every sequence's two tensors for this slot up front, so
             // the batch's shape is decided by the whole batch instead of by
@@ -2376,6 +2444,121 @@ mod clone_in_cache_invariant_tests {
         assert_eq!(
             first_mismatched_cache_len(&mut seqs, false),
             Some((2, 100, 101, 1))
+        );
+    }
+
+    /// Equal `current_seq_len` is NOT sufficient for `tail` to batch.
+    ///
+    /// This is the second, independent route into the `shape mismatch on dim 1`
+    /// failure that `ensure_uniform_batch_cache_lens` closed only half of — and
+    /// it needs **no MTP whatsoever**. `prefix_cacher` calls `set_len` on every
+    /// stored layer, so a sequence restored from an entry stored at a greater
+    /// length holds a narrower tail than one that reached the same token count
+    /// directly.
+    ///
+    /// Mutation check: delete the `reconcile_xs_bases` call from
+    /// `clone_in_cache` and this test fails on the `clone_in_cache` line with
+    /// `shape mismatch on dim 1, 4 <> 132`.
+    #[test]
+    fn xs_base_divergence_at_equal_lengths_is_reconciled_not_refused() {
+        // Restored from a prefix-cache entry stored at 300 tokens, truncated to
+        // 260 — `base` stays at canonical(300), which is past canonical(260).
+        let mut restored = xs_state(128, 1);
+        feed_xs(&mut restored, 300);
+        assert_eq!(
+            restored.base, 256,
+            "canonical(300) for ratio 128, margin 16"
+        );
+        restored.set_len(260).unwrap();
+
+        // Reached 260 directly.
+        let mut direct = xs_state(128, 1);
+        feed_xs(&mut direct, 260);
+        assert_eq!(direct.base, 128, "canonical(260) sits a group lower");
+
+        // --- Fixture discrimination (D12) -------------------------------
+        assert_eq!(
+            (restored.current_seq_len(), direct.current_seq_len()),
+            (260, 260),
+            "the LENGTHS must agree, or this test is reproducing the ragged-length \
+             failure instead of the base one — `ensure_uniform_batch_cache_lens` \
+             would catch that and never reach the tensor"
+        );
+        assert_eq!(
+            (
+                restored.tail.as_ref().unwrap().dims()[1],
+                direct.tail.as_ref().unwrap().dims()[1]
+            ),
+            (4, 132),
+            "and the WIDTHS must disagree, or there is nothing to reconcile"
+        );
+        assert_eq!(
+            legacy_batch_error(
+                restored.tail.as_ref().unwrap(),
+                direct.tail.as_ref().unwrap()
+            ),
+            "shape mismatch on dim 1, 4 <> 132",
+            "uniform lengths still panic the legacy batcher — this is a second, \
+             independent way into the slice_set shape mismatch"
+        );
+
+        // --- The fix ----------------------------------------------------
+        let pipeline = StubPipeline::new(2);
+        let mut a = seq_with_slots(
+            0,
+            260,
+            vec![
+                v4_kv_slot(512, 8, 260),
+                KvCache::XsRolling(Box::new(restored)),
+            ],
+        );
+        let mut b = seq_with_slots(
+            1,
+            260,
+            vec![
+                v4_kv_slot(512, 8, 260),
+                KvCache::XsRolling(Box::new(direct)),
+            ],
+        );
+        let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
+        NormalCacheManager
+            .clone_in_cache(&pipeline, &mut seqs, false)
+            .expect("equal lengths with unequal retained windows must reconcile");
+
+        let batched = pipeline.cache().normal();
+        let KvCache::XsRolling(xs) = &batched.0[1] else {
+            panic!("slot 1 must stay an XsRolling entry")
+        };
+        assert_eq!(
+            xs.base, 256,
+            "trimmed to the batch's largest retained start"
+        );
+        assert_eq!(xs.tail.as_ref().unwrap().dims(), &[2, 4, XS_HIDDEN]);
+    }
+
+    /// `trim_tail_to` is lossless only up to what the compressor still needs,
+    /// and must refuse — by name — past it, rather than silently dropping the
+    /// rows the next compressed row is built from.
+    #[test]
+    fn trimming_the_retained_window_past_what_the_compressor_needs_is_refused() {
+        let mut state = xs_state(4, 2);
+        feed_xs(&mut state, 260);
+        let needs_from = state.compressor_needs_from();
+        assert!(
+            needs_from >= state.base,
+            "an untouched cache always retains what it needs"
+        );
+        assert!(
+            state.trim_tail_to(needs_from).is_ok(),
+            "trimming to exactly the needed start is the lossless boundary"
+        );
+        let err = state
+            .trim_tail_to(needs_from + 1)
+            .expect_err("one token past it drops history the next row is built from")
+            .to_string();
+        assert!(
+            err.contains("next compressed row is built from"),
+            "the refusal must name what it would have destroyed, got: {err}"
         );
     }
 }
