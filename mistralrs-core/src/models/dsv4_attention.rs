@@ -9,7 +9,8 @@
 //! V4 attention is a **single online softmax over a union of key sets**, not a
 //! learned gate and not a blend of separate softmaxes:
 //!
-//! - **Standard (`compress_ratio == 0`, layers 0/1/42 + MTP)**: sliding-window
+//! - **Standard (`compress_ratio == 0`, layers 0 and 1 plus slot 43, the MTP
+//!   block — NOT layer 42, which is CSA)**: sliding-window
 //!   attention over the last `window` raw tokens + `attn_sink`. NOT dense
 //!   causal! Both production references window ratio-0 layers exactly like the
 //!   raw branch of CSA/HCA, just with no compressed branch:
@@ -24,7 +25,7 @@
 //!   window-trained heads key/query relative distances they never saw in
 //!   training; on hardware this collapsed generation into repetition loops the
 //!   moment the context crossed 128 tokens, regardless of the compressed
-//!   branch (`ARC_V4_WINDOW_ONLY` made no difference — layers 0/1/42 were the
+//!   branch (`ARC_V4_WINDOW_ONLY` made no difference — layers 0/1/43 were the
 //!   ones polluting the stream).
 //! - **CSA (`compress_ratio == 4`) / HCA (`compress_ratio == 128`)**: one
 //!   softmax over `[raw sliding-window KV ++ compressed KV]`, plus the per-head
