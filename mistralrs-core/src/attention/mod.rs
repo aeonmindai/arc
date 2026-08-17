@@ -187,6 +187,36 @@ impl Sdpa {
             }
         }
 
+        // Diverting to non-flash SDPA is only safe if a real mask exists.
+        //
+        // `LayersMasker` skips materializing the causal mask whenever
+        // `using_flash_attn() && device.is_cuda()`, handing back a `(1, 1)`
+        // zeros placeholder instead (see `layers_masker.rs`) on the assumption
+        // that the flash kernel applies causality itself. `naive_sdpa` does
+        // `att.broadcast_add(mask)`, so that placeholder broadcasts to zeros and
+        // the result is silently NON-causal — the exact failure mode this file
+        // exists to prevent.
+        //
+        // A `(1, 1)` mask with `seq_len > 1` can only be that placeholder: a
+        // genuinely bidirectional caller (vision/audio encoders) passes `None`,
+        // which stays `None` and is correctly non-causal. So refuse loudly here
+        // rather than return wrong numbers. This restores the pre-dispatch
+        // behaviour for these shapes, which hard-`bail!`ed inside candle.
+        if seq_len > 1
+            && q.device().is_cuda()
+            && crate::using_flash_attn()
+            && mask.is_some_and(|m| m.dims() == [1, 1])
+        {
+            candle_core::bail!(
+                "no CUDA flash backend accepts this shape (head_dim {head_dim}, k {k_head_dim}, \
+                 v {v_head_dim}, softcap {:?}) and the causal mask was not materialized because \
+                 the build enables flash-attn. Falling back to non-flash SDPA here would compute \
+                 NON-causal attention. Rebuild without a flash feature to use this model, or add \
+                 `--features flash-attn` if only flash-attn-v3 is enabled.",
+                sdpa_params.softcap
+            );
+        }
+
         self.run_attention_noflash(q, k, v, mask, sdpa_params)
     }
 
