@@ -44,6 +44,12 @@ impl CacheElement {
                 Some(t) => t.device().clone(),
                 None => return false,
             },
+            // The dense tail is the device-resident half; the code records
+            // live beside it on the same device.
+            KvCache::V4Turbo(t) => match t.tail.as_ref() {
+                Some(t) => t.device().clone(),
+                None => return false,
+            },
         };
         !matches!(device, Device::Cpu)
     }

@@ -16,6 +16,27 @@
 __device__ __forceinline__ float tq_to_f(__half x) { return __half2float(x); }
 __device__ __forceinline__ float tq_to_f(__nv_bfloat16 x) { return __bfloat162float(x); }
 
+// Byte-for-byte the same `fast_tanh` the mainline paged-attention kernel uses
+// (pagedattention.cuh:94). Duplicated rather than included because that header
+// drags in the whole vLLM attention-utils tree, which this translation unit has
+// no other need for. Renamed so the two can never collide if a future TU takes
+// both. Logit softcapping must agree numerically between the two kernels or a
+// Gemma-2-style model would produce different logits depending only on whether
+// its KV cache happens to be TurboQuant-compressed.
+__device__ __forceinline__ float tq_fast_tanh(float x) {
+#if defined(__CUDA_ARCH__)
+#if (__CUDACC_VER_MAJOR__ >= 11) && (__CUDA_ARCH__ >= 750)
+    float y;
+    asm volatile("tanh.approx.f32 %0, %1; " : "=f"(y) : "f"(x));
+    return y;
+#else
+    return ::tanhf(x);
+#endif
+#else
+    return std::tanh(x);
+#endif
+}
+
 #include "turbo_paged_attention.cuh"
 
 #define TQ_WARP 32
@@ -310,7 +331,7 @@ __global__ void tq_attn(
     const __half* __restrict__ vn,
     const uint32_t* __restrict__ bt,
     const uint32_t* __restrict__ cl,
-    int nkvh, int mbps, int nh, float scale,
+    int nkvh, int mbps, int nh, float scale, float softcapping, int qs,
     int kbs, int khs, int vbs, int vhs, int nbs, int nhs
 ) {
     constexpr int NT = 128;
@@ -330,8 +351,13 @@ __global__ void tq_attn(
 
     // 1. Load + rotate Q. Attention runs in the rotated domain, so this is the
     //    only rotation the Q·K half needs.
+    //
+    //    `qs` is the query's sequence stride in elements; the head and dim
+    //    strides are still assumed contiguous, which the Rust wrapper checks
+    //    before it launches. For a contiguous query qs == nh*HS, so this is the
+    //    same address every previous caller computed.
     __shared__ float qr[HS];
-    for (int i = tid; i < HS; i += NT) qr[i] = tq_to_f(query[sidx*nh*HS + hidx*HS + i]);
+    for (int i = tid; i < HS; i += NT) qr[i] = tq_to_f(query[sidx*qs + hidx*HS + i]);
     __syncthreads();
     tq_rotate<HS, NT>(qr, tid);
 
@@ -344,6 +370,11 @@ __global__ void tq_attn(
     float qk_max = -FLT_MAX;
     const uint32_t* sbt = bt + sidx * mbps;
     const int nblocks = TQ_DIVUP(clen, BLOCK_SIZE);
+    // Softcapping is a launch-wide scalar, so this test is uniform across the
+    // whole grid and the default (1.0 == no cap) path keeps the token loop
+    // exactly as it was. Hoisted here so the comparison itself never runs per
+    // token.
+    const bool do_cap = (softcapping != 1.0f);
 
     // Each warp takes whole blocks; all 32 lanes collaborate on one token at a
     // time, each owning BPL packed bytes (2*BPL coordinates). A warp shuffle
@@ -382,6 +413,13 @@ __global__ void tq_attn(
 
             const float knorm = __half2float(kn[pb*nbs + kvh*nhs + t]);
             qk *= knorm * scale;
+
+            // Logit softcapping, applied after the scale multiply and before
+            // both the store and the running max — the same position and the
+            // same arithmetic as the mainline kernel (pagedattention.cuh:276).
+            // Capping only one of the two would leave the softmax renormalising
+            // against a maximum no stored logit can reach.
+            if (do_cap) qk = tq_fast_tanh(qk / softcapping) * softcapping;
 
             if (lane == 0) logits[bi*BLOCK_SIZE + t] = qk;
             qk_max = fmaxf(qk_max, qk);
@@ -499,7 +537,7 @@ __global__ void tq_attn_clocked(
     const uint32_t* __restrict__ bt,
     const uint32_t* __restrict__ cl,
     unsigned long long* __restrict__ clocks,
-    int nkvh, int mbps, int nh, float scale,
+    int nkvh, int mbps, int nh, float scale, float softcapping, int qs,
     int kbs, int khs, int vbs, int vhs, int nbs, int nhs
 ) {
     constexpr int NT = 128;
@@ -523,7 +561,7 @@ __global__ void tq_attn_clocked(
     const int kvh = hidx / (nh / nkvh);
 
     __shared__ float qr[HS];
-    for (int i = tid; i < HS; i += NT) qr[i] = tq_to_f(query[sidx*nh*HS + hidx*HS + i]);
+    for (int i = tid; i < HS; i += NT) qr[i] = tq_to_f(query[sidx*qs + hidx*HS + i]);
     __syncthreads();
     tq_rotate<HS, NT>(qr, tid);
     if (tid == 0) clocks[block_id * 6 + 1] = clock64();
@@ -536,6 +574,7 @@ __global__ void tq_attn_clocked(
     float qk_max = -FLT_MAX;
     const uint32_t* sbt = bt + sidx * mbps;
     const int nblocks = TQ_DIVUP(clen, BLOCK_SIZE);
+    const bool do_cap = (softcapping != 1.0f);
     // This loop must stay a mirror of tq_attn's: the whole point of the clocked
     // variant is that its phase-2 stamps describe the kernel that actually
     // runs. A scalar gather here against a vectorized one there would have made
@@ -568,6 +607,7 @@ __global__ void tq_attn_clocked(
                 qk += __shfl_xor_sync(0xffffffff, qk, mask);
             float knorm = __half2float(kn[pb*nbs + kvh*nhs + t]);
             qk *= knorm * scale;
+            if (do_cap) qk = tq_fast_tanh(qk / softcapping) * softcapping;
             if (lane == 0) logits[bi * BLOCK_SIZE + t] = qk;
             qk_max = fmaxf(qk_max, qk);
 #if TQ_PREFETCH > 1
@@ -670,7 +710,7 @@ template<int HS, int BLOCK_SIZE, typename QT, typename OutT>
 static void tq_launch_attn(
     void* out, const void* query, const void* kc, const void* vc,
     const void* kn, const void* vn, const uint32_t* bt, const uint32_t* cl,
-    int nkvh, int mbps, int nh, float scale,
+    int nkvh, int mbps, int nh, float scale, float softcapping, int qs,
     int kbs, int khs, int vbs, int vhs, int nbs, int nhs,
     dim3 grid, dim3 block, int smem, cudaStream_t stream
 ) {
@@ -686,14 +726,14 @@ static void tq_launch_attn(
     tq_attn<HS, BLOCK_SIZE, QT, OutT><<<grid, block, smem, stream>>>(
         (OutT*)out, (const QT*)query, (const uint8_t*)kc, (const uint8_t*)vc,
         (const __half*)kn, (const __half*)vn, bt, cl,
-        nkvh, mbps, nh, scale, kbs, khs, vbs, vhs, nbs, nhs);
+        nkvh, mbps, nh, scale, softcapping, qs, kbs, khs, vbs, vhs, nbs, nhs);
 }
 
 template<int HS, int BLOCK_SIZE, typename QT>
 static void tq_launch_attn_clocked(
     void* out_bf16, const void* query, const void* kc, const void* vc,
     const void* kn, const void* vn, const uint32_t* bt, const uint32_t* cl,
-    void* clocks, int nkvh, int mbps, int nh, float scale,
+    void* clocks, int nkvh, int mbps, int nh, float scale, float softcapping, int qs,
     int kbs, int khs, int vbs, int vhs, int nbs, int nhs,
     dim3 grid, dim3 block, int smem, cudaStream_t stream
 ) {
@@ -711,7 +751,7 @@ static void tq_launch_attn_clocked(
         (const uint8_t*)kc, (const uint8_t*)vc,
         (const __half*)kn, (const __half*)vn, bt, cl,
         (unsigned long long*)clocks,
-        nkvh, mbps, nh, scale, kbs, khs, vbs, vhs, nbs, nhs);
+        nkvh, mbps, nh, scale, softcapping, qs, kbs, khs, vbs, vhs, nbs, nhs);
 }
 
 // Paged block sizes the cache engine emits.
@@ -777,12 +817,12 @@ extern "C" void turbo_paged_attention_v1_bf16out_clocked(
     if (qdtype == 1) {
         TQ_ATTN_CLOCKED_BY_HS(__nv_bfloat16,
             out_bf16, query, kc, vc, kn, vn, bt, cl, clocks,
-            nkvh, mbps, nh, scale, kbs, khs, vvbs, vvhs, nbs, nhs,
+            nkvh, mbps, nh, scale, softcapping, qs, kbs, khs, vvbs, vvhs, nbs, nhs,
             grid, block, smem, stream)
     } else {
         TQ_ATTN_CLOCKED_BY_HS(__half,
             out_bf16, query, kc, vc, kn, vn, bt, cl, clocks,
-            nkvh, mbps, nh, scale, kbs, khs, vvbs, vvhs, nbs, nhs,
+            nkvh, mbps, nh, scale, softcapping, qs, kbs, khs, vvbs, vvhs, nbs, nhs,
             grid, block, smem, stream)
     }
 }
@@ -800,7 +840,7 @@ extern "C" void turbo_paged_attention_v1_f16(
     TQ_ATTN_PROLOGUE()
     TQ_ATTN_BY_HS(__half, float,
         out, query, kc, vc, kn, vn, bt, cl,
-        nkvh, mbps, nh, scale, kbs, khs, vvbs, vvhs, nbs, nhs,
+        nkvh, mbps, nh, scale, softcapping, qs, kbs, khs, vvbs, vvhs, nbs, nhs,
         grid, block, smem, stream)
 }
 
@@ -819,12 +859,12 @@ extern "C" void turbo_paged_attention_v1(
     if (dtype == 1) {
         TQ_ATTN_BY_HS(__nv_bfloat16, float,
             out, query, kc, vc, kn, vn, bt, cl,
-            nkvh, mbps, nh, scale, kbs, khs, vvbs, vvhs, nbs, nhs,
+            nkvh, mbps, nh, scale, softcapping, qs, kbs, khs, vvbs, vvhs, nbs, nhs,
             grid, block, smem, stream)
     } else {
         TQ_ATTN_BY_HS(__half, float,
             out, query, kc, vc, kn, vn, bt, cl,
-            nkvh, mbps, nh, scale, kbs, khs, vvbs, vvhs, nbs, nhs,
+            nkvh, mbps, nh, scale, softcapping, qs, kbs, khs, vvbs, vvhs, nbs, nhs,
             grid, block, smem, stream)
     }
 }
@@ -845,12 +885,12 @@ extern "C" void turbo_paged_attention_v1_bf16out(
     if (qdtype == 1) {
         TQ_ATTN_BY_HS(__nv_bfloat16, __nv_bfloat16,
             out_bf16, query, kc, vc, kn, vn, bt, cl,
-            nkvh, mbps, nh, scale, kbs, khs, vvbs, vvhs, nbs, nhs,
+            nkvh, mbps, nh, scale, softcapping, qs, kbs, khs, vvbs, vvhs, nbs, nhs,
             grid, block, smem, stream)
     } else {
         TQ_ATTN_BY_HS(__half, __nv_bfloat16,
             out_bf16, query, kc, vc, kn, vn, bt, cl,
-            nkvh, mbps, nh, scale, kbs, khs, vvbs, vvhs, nbs, nhs,
+            nkvh, mbps, nh, scale, softcapping, qs, kbs, khs, vvbs, vvhs, nbs, nhs,
             grid, block, smem, stream)
     }
 }

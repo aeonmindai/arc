@@ -1370,6 +1370,7 @@ impl Attention {
                             KvCache::Normal { .. } => "Normal",
                             KvCache::Rotating { .. } => "Rotating",
                             KvCache::TurboQuant(_) => "TurboQuant",
+                            KvCache::V4Turbo(_) => "V4Turbo",
                             KvCache::XsRolling(_) => unreachable!(),
                         }
                     );
@@ -1620,11 +1621,18 @@ impl Attention {
             None => {
                 // FP8 code storage is opt-in (`ARC_V4_FP8_KV=1`); unset stores
                 // the dense BF16 K the model has always stored.
-                let cached = append_kv_mqa(
-                    kv_cache,
-                    &k,
-                    k_packed.as_ref().filter(|_| v4_fp8_kv_enabled()),
-                )?;
+                let cached = if v4_turboquant_kv_enabled() {
+                    // TurboQuant storage: the cache compresses whatever the
+                    // sliding window has moved past and hands back only the
+                    // span this step can reach.
+                    append_kv_turbo(kv_cache, &k)?
+                } else {
+                    append_kv_mqa(
+                        kv_cache,
+                        &k,
+                        k_packed.as_ref().filter(|_| v4_fp8_kv_enabled()),
+                    )?
+                };
                 // Reconstruct only what any query row in this block can reach.
                 // Dense storage stays whole (`raw_prefix = 0`) so
                 // `dsv4_attention` narrows exactly as it did before; packed
@@ -1638,6 +1646,12 @@ impl Attention {
                         self.sliding_window.max(1),
                         t_k_full,
                     ),
+                    // TurboQuant narrows in the cache, not here: everything
+                    // before `base` is already packed, and `base` is always at
+                    // or before `raw_keep_span`'s base — so `dsv4_attention`'s
+                    // own `rel_base` check turns any future over-eviction into
+                    // a hard error instead of a wrong window mask.
+                    V4CachedK::Turbo { base, .. } => (*base, t_k_full - base),
                 };
                 let k_cached = cached.span(raw_prefix, keep, k.dtype())?;
                 // Cache read-back. Diff vs prefill's freshly-computed K splits a
@@ -2249,6 +2263,11 @@ impl MoeOrMlp {
 /// slot has always used (see the R2/R3 note in [`Attention::forward`]).
 pub(crate) const V4_V_MARKER_WIDTH: usize = 1;
 
+/// Sign-vector seed for V4's TurboQuant key layout. Matches
+/// [`mistralrs_quant::turboquant::TurboQuantConfig`]'s default so a V4 cache
+/// and a generic one rotate identically at the same width.
+pub(crate) const TURBOQUANT_KV_SEED: u64 = 42;
+
 /// Build the `[B, n_kv_heads, T, 1]` zero marker stored in place of the
 /// duplicate V. See [`V4_V_MARKER_WIDTH`].
 fn v4_v_marker(k: &Tensor) -> Result<Tensor> {
@@ -2273,13 +2292,20 @@ fn require_normal_kv_slot(kv_cache: &KvCache) -> Result<()> {
     candle_core::bail!(
         "V4 attention was handed a {} KV slot; the MQA V-marker layout requires a \
          KvCache::Normal entry (see V4_V_MARKER_WIDTH).",
-        match kv_cache {
-            KvCache::Normal { .. } => unreachable!(),
-            KvCache::Rotating { .. } => "Rotating",
-            KvCache::TurboQuant(_) => "TurboQuant",
-            KvCache::XsRolling(_) => "XsRolling",
-        }
+        kv_slot_kind(kv_cache)
     )
+}
+
+/// The slot variant's name, for error messages that have to say which one
+/// actually turned up.
+fn kv_slot_kind(kv_cache: &KvCache) -> &'static str {
+    match kv_cache {
+        KvCache::Normal { .. } => "Normal",
+        KvCache::Rotating { .. } => "Rotating",
+        KvCache::TurboQuant(_) => "TurboQuant",
+        KvCache::V4Turbo(_) => "V4Turbo",
+        KvCache::XsRolling(_) => "XsRolling",
+    }
 }
 
 /// One layer's cached V4 keys, in whichever layout the slot holds.
@@ -2292,6 +2318,24 @@ pub(crate) enum V4CachedK {
     Dense(Tensor),
     /// FP8 codes in the K half, rope tail + block `amax` in the V half.
     Packed(Box<V4PackedK>),
+    /// TurboQuant: the dense span `[base, tokens)` that
+    /// [`crate::kv_cache::V4TurboKCache::append`] just returned, with every
+    /// older token already compressed inside the cache.
+    ///
+    /// Unlike the other two arms this carries no whole-cache tensor, because
+    /// under TurboQuant there is no whole-cache tensor to carry: the older
+    /// region exists only as packed records, and reconstructing it is exactly
+    /// the host round trip this layout exists to avoid. The caller asks for
+    /// `[base, tokens)` and nothing else — see the `(raw_prefix, keep)` match
+    /// in `Attention::forward`.
+    Turbo {
+        /// Absolute position of `dense`'s first token.
+        base: usize,
+        /// Total cached tokens.
+        tokens: usize,
+        /// `[B, H, tokens - base, head_dim]` at activation precision.
+        dense: Tensor,
+    },
 }
 
 impl V4CachedK {
@@ -2300,6 +2344,7 @@ impl V4CachedK {
         match self {
             Self::Dense(k) => k.dim(2),
             Self::Packed(p) => p.seq_len(),
+            Self::Turbo { tokens, .. } => Ok(*tokens),
         }
     }
 
@@ -2320,6 +2365,25 @@ impl V4CachedK {
                 }
             }
             Self::Packed(p) => p.narrow(base, len)?.dequant(out_dtype),
+            // The dense span is handed over verbatim. A different range is a
+            // caller bug, not something to satisfy by reaching into the packed
+            // records: doing that silently would reintroduce the per-step host
+            // dequant on the decode path (see `crate::kv_cache::v4_turbo`).
+            Self::Turbo {
+                base: b,
+                tokens,
+                dense,
+            } => {
+                if base != *b || len != tokens - b {
+                    candle_core::bail!(
+                        "V4 TurboQuant cached K holds the dense span [{b}, {tokens}); the caller \
+                         asked for [{base}, {}). Only the span `V4TurboKCache::append` returned \
+                         is available here — ask the cache itself for anything else.",
+                        base + len
+                    );
+                }
+                dense.to_dtype(out_dtype)
+            }
         }
     }
 }
@@ -2355,6 +2419,27 @@ fn append_kv_mqa(
             Ok(V4CachedK::Dense(k_cached))
         }
     }
+}
+
+/// Append V4's fused K/V into a [`crate::kv_cache::V4TurboKCache`] slot.
+///
+/// The cache compresses whatever the sliding window has moved past and returns
+/// the dense span that is still reachable, which is what the caller hands to
+/// `dsv4_attention` as its `raw_prefix` window.
+fn append_kv_turbo(kv_cache: &mut KvCache, k: &Tensor) -> Result<V4CachedK> {
+    let KvCache::V4Turbo(state) = kv_cache else {
+        candle_core::bail!(
+            "V4 TurboQuant KV is enabled but layer was handed a {} slot; the slots are built \
+             in DeepSeekV4::new and must be KvCache::V4Turbo.",
+            kv_slot_kind(kv_cache)
+        );
+    };
+    let (base, dense) = state.append(k)?;
+    Ok(V4CachedK::Turbo {
+        base,
+        tokens: state.current_seq_len(),
+        dense,
+    })
 }
 
 /// [`append_kv_mqa`] for the CUDA-graph decode path: writes at the device-held
@@ -2419,6 +2504,43 @@ fn v4_fp8_kv_enabled() -> bool {
 /// about the default, which is exactly the kind of test DOCTRINE D12 counts as
 /// worse than none.
 fn fp8_kv_enabled_from(var: Option<&str>, capture_probe: bool) -> bool {
+    var == Some("1") && !capture_probe
+}
+
+/// TurboQuant storage for the cached K. **Opt-in: off unless
+/// `ARC_V4_TURBOQUANT=1`.**
+///
+/// Default-on is the destination, but it is not this change. wave43-BU turned
+/// FP8 KV on by default without ever running it on a GPU and killed every V4
+/// request; `ARC_V4_FP8_KV` is opt-in today for exactly that reason (wave49-BZ)
+/// and this layout has had no more hardware exposure than that one had. It
+/// flips when a box has shown it runs and does not cost decode throughput.
+///
+/// Forced off under `ARC_V4_CAPTURE_PROBE`: the CUDA-graph decode arm writes
+/// through `mistralrs_quant::kvwrite::write_kv_inplace` at a device-held slot,
+/// which cannot express "compress the token that just fell out of the window".
+///
+/// Refused outright — not silently ignored — alongside `ARC_V4_STANDARD_DENSE`.
+/// That ablation makes ratio-0 layers attend **densely over the whole cache**
+/// instead of through the sliding window, so the reachability argument this
+/// whole layout rests on (`dsv4_attention`'s raw branch can only see the
+/// trailing `t_q + window - 1` keys) stops holding, and the compressed region
+/// would be silently missing from those layers' softmax. That is D18's failure
+/// shape, so it is an error rather than a fallback.
+fn v4_turboquant_kv_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        turboquant_kv_enabled_from(
+            std::env::var("ARC_V4_TURBOQUANT").ok().as_deref(),
+            std::env::var_os("ARC_V4_CAPTURE_PROBE").is_some(),
+        )
+    })
+}
+
+/// The opt-in decision itself, separated from the process-wide [`OnceLock`] so
+/// it can be tested against every input rather than against whatever the test
+/// runner's environment happened to be. See [`fp8_kv_enabled_from`].
+fn turboquant_kv_enabled_from(var: Option<&str>, capture_probe: bool) -> bool {
     var == Some("1") && !capture_probe
 }
 
@@ -3747,9 +3869,49 @@ impl DeepSeekV4 {
         }
         // `new_plain`, not `new`: V4's fused-MQA layout stores a 1-wide marker
         // in the V half of every slot (see `V4_V_MARKER_WIDTH`), which
-        // `require_normal_kv_slot` enforces. An ambient TurboQuant setting must
-        // not turn these into compressed slots.
+        // `require_normal_kv_slot` enforces. An ambient *generic* TurboQuant
+        // setting must not turn these into `KvCache::TurboQuant` slots — that
+        // variant would try to quantize the 1-wide marker.
+        //
+        // V4's own TurboQuant layout (`ARC_V4_TURBOQUANT=1`, below) is a
+        // different thing: it replaces these slots with `KvCache::V4Turbo`,
+        // which knows the marker does not exist because V *is* K, and splits
+        // at the sliding-window boundary instead.
         let cache = NormalCache::new_plain(cfg.num_hidden_layers, cfg.max_position_embeddings);
+        if v4_turboquant_kv_enabled() {
+            // `ARC_V4_STANDARD_DENSE` makes ratio-0 layers attend densely over
+            // the WHOLE cache rather than through the sliding window, which is
+            // precisely the assumption `V4TurboKCache` evicts against. Refuse
+            // the combination by name rather than serve those layers a
+            // silently truncated key set (D18).
+            if std::env::var_os("ARC_V4_STANDARD_DENSE").is_some() {
+                candle_core::bail!(
+                    "ARC_V4_TURBOQUANT=1 and ARC_V4_STANDARD_DENSE=1 are incompatible: the \
+                     dense-causal ablation makes ratio-0 layers read raw keys older than the \
+                     sliding window, and TurboQuant KV has already compressed those. Unset one."
+                );
+            }
+            let bits = mistralrs_quant::turboquant::TurboQuantPreset::default().key_bits();
+            tracing::info!(
+                "V4 KV storage: TurboQuant (K{bits}-bit, head_dim {}, sliding window {}) across                  {} layers — ARC_V4_TURBOQUANT=1",
+                cfg.head_dim,
+                cfg.sliding_window,
+                cfg.num_hidden_layers,
+            );
+            let mut guard = cache.lock().unwrap();
+            for slot in guard.0.iter_mut() {
+                *slot = KvCache::V4Turbo(Box::new(
+                    crate::kv_cache::V4TurboKCache::try_new(
+                        cfg.head_dim,
+                        bits,
+                        TURBOQUANT_KV_SEED,
+                        cfg.sliding_window,
+                        cfg.max_position_embeddings,
+                    )
+                    .map_err(candle_core::Error::msg)?,
+                ));
+            }
+        }
         {
             let mut guard = cache.lock().unwrap();
             for ratio in compress_ratios_in_order {
@@ -4909,6 +5071,166 @@ mod kv_footprint_tests {
             !fp8_kv_enabled_from(Some("1"), true),
             "ARC_V4_CAPTURE_PROBE must veto it: write_kv_inplace has no U8 arm"
         );
+    }
+
+    /// TurboQuant KV storage is opt-in for the same reason FP8 KV is: the
+    /// layout that has actually served on hardware stays the default until a
+    /// box says otherwise. wave43-BU is what happens when it does not.
+    #[test]
+    fn v4_turboquant_kv_is_opt_in() {
+        assert!(
+            !turboquant_kv_enabled_from(None, false),
+            "unset must be OFF"
+        );
+        assert!(!turboquant_kv_enabled_from(Some("0"), false));
+        assert!(!turboquant_kv_enabled_from(Some(""), false));
+        assert!(!turboquant_kv_enabled_from(Some("true"), false));
+        assert!(!turboquant_kv_enabled_from(Some("on"), false));
+        assert!(!turboquant_kv_enabled_from(Some("2"), false));
+        assert!(
+            turboquant_kv_enabled_from(Some("1"), false),
+            "=1 must be ON"
+        );
+        assert!(
+            !turboquant_kv_enabled_from(Some("1"), true),
+            "ARC_V4_CAPTURE_PROBE must veto it: the graph decode arm writes at a device-held \
+             slot and cannot express window eviction"
+        );
+    }
+
+    /// 🔑 The claim the integration rests on, checked end to end at the cache
+    /// boundary: for every step of a real prefill+decode run, the span the
+    /// TurboQuant cache hands `dsv4_attention` is **bit-identical** to the same
+    /// range of the dense cache.
+    ///
+    /// It is bit-identical rather than merely close because the retained window
+    /// is never compressed, and everything older is unreachable — `-inf` on
+    /// every query row of V4's sliding-window raw branch. Combined with
+    /// `dsv4_attention`'s own `raw_prefix_is_equivalent_to_passing_the_whole_cache`,
+    /// this means the attention OUTPUT is unchanged, not approximated.
+    ///
+    /// A tolerance here would be the bug: it would mean the codec had reached
+    /// tokens the model can still see.
+    #[test]
+    fn turbo_and_dense_cached_spans_agree_bit_exactly() -> Result<()> {
+        const HEAD_DIM: usize = 128;
+        const WINDOW: usize = 8;
+        let dev = Device::Cpu;
+
+        let mut dense_slot = KvCache::new_normal(2, 4096, NormalCache::CACHE_GROW_SIZE);
+        let mut turbo_slot = KvCache::V4Turbo(Box::new(
+            crate::kv_cache::V4TurboKCache::try_new(
+                HEAD_DIM,
+                mistralrs_quant::turboquant::TurboQuantPreset::default().key_bits(),
+                TURBOQUANT_KV_SEED,
+                WINDOW,
+                4096,
+            )
+            .unwrap(),
+        ));
+
+        let mut seed = 1u64;
+        let mut next = |t: usize| -> Result<Tensor> {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let n = t * HEAD_DIM;
+            let mut s = seed | 1;
+            let data: Vec<f32> = (0..n)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    ((s >> 40) as f32) / (1u32 << 24) as f32 - 0.5
+                })
+                .collect();
+            Tensor::from_vec(data, &[1, 1, t, HEAD_DIM], &dev)
+        };
+
+        // Prefill, then enough decode steps to cross EVICT_CHUNK several times.
+        let mut steps = vec![64usize];
+        steps.extend(std::iter::repeat_n(1usize, 400));
+
+        // Rollbacks are part of the run, not a separate test: the retention
+        // margin exists ONLY for MTP verify / speculative rejection, so a
+        // fixture that never rolls back cannot tell a correct margin from no
+        // margin at all. (Deleting the margin term passes every assertion below
+        // without these three lines.) The rollback depth stays under
+        // `V4_TURBO_TAIL_MARGIN_TOKENS`, which is exactly what that constant
+        // promises to cover.
+        const ROLLBACK_EVERY: usize = 97;
+        const ROLLBACK_DEPTH: usize = 8;
+        assert!(
+            ROLLBACK_DEPTH < crate::kv_cache::V4_TURBO_TAIL_MARGIN_TOKENS,
+            "a rollback deeper than the margin is allowed to leave the dense tail"
+        );
+
+        let mut evicted_ever = 0usize;
+        let mut rollbacks = 0usize;
+        for (i, t) in steps.into_iter().enumerate() {
+            if i > 0 && i % ROLLBACK_EVERY == 0 {
+                let back = dense_slot.current_seq_len() - ROLLBACK_DEPTH;
+                dense_slot.set_len(back)?;
+                turbo_slot.set_len(back)?;
+                rollbacks += 1;
+            }
+            let k = next(t)?;
+            let dense = append_kv_mqa(&mut dense_slot, &k, None)?;
+            let turbo = append_kv_turbo(&mut turbo_slot, &k)?;
+
+            let tokens = dense.seq_len()?;
+            assert_eq!(turbo.seq_len()?, tokens, "step {i}: token counts diverged");
+            let V4CachedK::Turbo { base, .. } = &turbo else {
+                panic!("step {i}: expected the TurboQuant arm");
+            };
+            let base = *base;
+            evicted_ever = evicted_ever.max(base);
+
+            // The cache may never drop a key this step can still reach.
+            let (reach_base, _) = crate::models::dsv4_attention::raw_keep_span(t, WINDOW, tokens);
+            assert!(
+                base <= reach_base,
+                "step {i}: evicted to {base}, but the step reaches back to {reach_base}"
+            );
+
+            let got = turbo.span(base, tokens - base, DType::F32)?;
+            let want = dense
+                .span(0, tokens, DType::F32)?
+                .narrow(2, base, tokens - base)?;
+            let g: Vec<f32> = got.flatten_all()?.to_vec1()?;
+            let w: Vec<f32> = want.flatten_all()?.to_vec1()?;
+            assert_eq!(g.len(), w.len(), "step {i}: span widths differ");
+            assert!(
+                g == w,
+                "step {i}: the retained window is not bit-identical to the dense cache — \
+                 the codec reached a token the model can still see"
+            );
+        }
+
+        assert!(
+            evicted_ever > 128,
+            "only {evicted_ever} tokens were ever compressed — the fixture never crossed \
+             EVICT_CHUNK, so it compared two dense caches and proved nothing"
+        );
+        assert!(
+            rollbacks >= 3,
+            "only {rollbacks} rollbacks — the margin went untested"
+        );
+        Ok(())
+    }
+
+    /// MUTATION GUARD — the TurboQuant append must refuse a slot it did not
+    /// build, by name. Silently falling back to the dense path is D18's shape:
+    /// the flag would read as on while nothing was compressed.
+    #[test]
+    fn append_kv_turbo_refuses_a_non_turbo_slot() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut normal = KvCache::new_normal(2, 64, NormalCache::CACHE_GROW_SIZE);
+        let k = Tensor::zeros((1, 1, 1, 128), DType::F32, &dev)?;
+        let err = append_kv_turbo(&mut normal, &k).unwrap_err().to_string();
+        assert!(
+            err.contains("Normal") && err.contains("V4Turbo"),
+            "expected a loud slot-type error naming both, got: {err}"
+        );
+        Ok(())
     }
 
     /// A non-`Normal` KV slot must be refused loudly rather than silently

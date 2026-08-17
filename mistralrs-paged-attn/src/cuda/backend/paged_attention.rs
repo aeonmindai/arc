@@ -865,7 +865,21 @@ pub fn turbo_paged_attention(
     let bt_slice = bt.as_cuda_slice::<u32>()?;
     let cl_slice = cl.as_cuda_slice::<u32>()?;
 
-    let q_stride = q_l.stride()[0] as c_int;
+    // The kernel indexes the query as `seq * q_stride + head * head_size + dim`,
+    // so it honours an arbitrary sequence stride but still assumes the head and
+    // dim axes are packed. A query that is strided in those axes would be read
+    // at the wrong addresses and produce plausible-looking garbage, so refuse it
+    // here rather than let it through silently.
+    let q_strides = q_l.stride();
+    if q_strides[1] != head_size || q_strides[2] != 1 {
+        candle::bail!(
+            "turbo_paged_attention needs the query's head and dim axes contiguous: \
+             shape [{num_seqs}, {num_heads}, {head_size}] has strides {q_strides:?}, \
+             expected [_, {head_size}, 1]. Only the sequence stride is honoured by \
+             the kernel; call .contiguous() first"
+        );
+    }
+    let q_stride = q_strides[0] as c_int;
     let kv_block_stride = kc_l.stride()[0] as c_int;
     let kv_head_stride = kc_l.stride()[1] as c_int;
     let norm_block_stride = kn_l.stride()[0] as c_int;
