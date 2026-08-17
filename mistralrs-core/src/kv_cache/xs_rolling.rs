@@ -100,34 +100,42 @@
 //! [`XsRollingCache::advance`] keeps a verbatim uniform fast path and every
 //! B=1 and every uniform batch runs byte-identical code.
 //!
-//! # What `W` is now allowed to be
+//! # The window is a fixed-size buffer, and `advance` was the one thing
+//! # breaking that
 //!
-//! Nothing below still requires `W == max_i (tokens_i - base_i)`.
-//! [`plan_xs_advance`] and [`XsRollingCache::set_row_lens`] take `W` as *given*
-//! and ask only that every row fit inside it; every read offset is
-//! `need_start + W - tokens_i`, which tracks `W` exactly. So `W` may be any
-//! width at or above the widest row's run — including a **constant** one.
-//! `an_oversized_window_reads_exactly_the_same_absolute_tokens` pins that.
+//! Read the description of `tail` at the top of this file again: *"the raw rows
+//! behind `tokens`, **bounded by `span_groups * ratio + margin` and independent
+//! of context length**"*. That is an invariant this type has always claimed —
+//! a buffer whose size is a function of the layer's geometry and nothing else.
 //!
-//! It is worth writing down because this buffer does **not** have a constant
-//! size today. `tail` is rebuilt by `Tensor::cat` + `narrow` every step at
-//! width `tokens - base`, and that width is not stable: `tokens` climbs by one
-//! per token while `base` jumps a whole `ratio` at a group boundary, so the
-//! allocation cycles through `ratio` consecutive sizes. The ArcGraph chain
-//! measured exactly that from the outside — `4096 × {18, 19, 20, 21}` at
-//! `hidden = 4096`, `ratio = 4`. (Their separate hypothesis, that this is what
-//! stops a CUDA graph replaying, they have since retracted as unproven; the
-//! size measurement is a fact about this buffer either way.)
+//! It was not true of the allocation. `advance` rebuilt `tail` with
+//! `Tensor::cat` + `narrow` on every step at width exactly `tokens - base`, and
+//! that width is not stable: `tokens` climbs by one per token while `base` jumps
+//! a whole `ratio` at a group boundary, so the buffer cycled through `ratio`
+//! consecutive sizes and was reallocated every single decode step, on every one
+//! of the 41 compressed layers. The ArcGraph chain measured exactly that shape
+//! from outside the engine — `4096 × {18, 19, 20, 21}` at `hidden = 4096`,
+//! `ratio = 4`. (Their further hypothesis, that this is what stops a CUDA graph
+//! replaying, they have retracted as unproven. The reallocation is a per-token
+//! cost on the hot path whether or not anything is capturing, which is the
+//! reason it is fixed here.)
 //!
-//! Pinning `W` to the bound the retention rule already guarantees it never
-//! exceeds — `span_groups * ratio + margin` — would make the allocation
-//! constant per step **without touching any of the semantics above**: a row
-//! would simply carry more dead lead columns, exactly as a short row in a
-//! ragged batch already does. The places that decide `W` are the retention
-//! narrow at the end of [`XsRollingCache::advance_ragged`] and its counterpart
-//! in [`XsRollingCache::advance_uniform`], plus the fast-path predicate
-//! [`XsRollingCache::can_advance_uniform`], which reads the exact equality as
-//! its dispatch condition. Nothing here depends on that change being made.
+//! [`xs_pin_window_enabled`] holds the buffer at the documented bound instead.
+//! It required no new semantics: [`plan_xs_advance`] and
+//! [`XsRollingCache::set_row_lens`] already take `W` as *given* and ask only
+//! that every row fit inside it, and every read offset is
+//! `need_start + W - tokens_i`, which tracks `W` exactly. A pinned window is
+//! therefore just the widest case of the ragged one that already had to work —
+//! a row carrying dead lead columns it never promised.
+//! `an_oversized_window_reads_exactly_the_same_absolute_tokens` pins the
+//! arithmetic and `pinning_the_window_is_numerically_inert` pins the outcome.
+//!
+//! The two widths, reconciled: the steady-state band is
+//! `[capacity - ratio, capacity - 1]`, i.e. `{20..23}` at CSA geometry, and the
+//! `{18..21}` measured outside was the pre-saturation **ramp** — `base` is still
+//! at 0 while `tokens` climbs, so `W` has not finished growing.
+//! `the_window_ramps_then_settles_to_ratio_consecutive_sizes` checks both
+//! halves of that, so the bound is right for a reason rather than by luck.
 
 use std::sync::OnceLock;
 
@@ -234,6 +242,87 @@ pub fn xs_per_sequence_enabled() -> bool {
             Ok("1") | Ok("true") | Ok("TRUE")
         )
     })
+}
+
+/// `ARC_V4_XS_PIN_WINDOW` — hold the retained raw window at a **constant**
+/// width instead of re-narrowing it to `tokens - base` every step.
+/// **Default ON**; `=0` (also `false`/`off`/`no`) restores the resizing buffer.
+///
+/// # Why this is on by default without a throughput measurement first
+///
+/// The usual rule on this project is measure-then-default-on, and it exists
+/// because FP8 KV shipped defaulted-on and broke every forward for a day. The
+/// difference is what the two changes touch. FP8 KV changed the *values*. This
+/// changes only the *size of an allocation*: the compressor is handed a slice
+/// covering the same absolute tokens either way, because every offset is
+/// derived from the row's own token count rather than from the buffer's width
+/// (see [`plan_xs_advance`]). `pinning_the_window_is_numerically_inert` pins
+/// that as an exact-equality test rather than as an argument.
+///
+/// # The bound, which is the reviewable part
+///
+/// The retained width is `W = tokens - base`, and `base` is set from the
+/// retention rule at `tokens - margin`, then only ever raised:
+///
+/// ```text
+///   keep_from = ((tokens - margin) / ratio + 1 - span_groups) * ratio
+///   base      = max(keep_from, previous base), capped at tokens
+/// ```
+///
+/// Write `m = tokens - margin` and `q = floor(m / ratio)`. Then
+/// `q * ratio > m - ratio`, so
+///
+/// ```text
+///   keep_from = (q + 1 - span_groups) * ratio > m - span_groups * ratio
+///   W = tokens - base <= tokens - keep_from < margin + span_groups * ratio
+/// ```
+///
+/// so **`W <= span_groups * ratio + margin - 1`, always**. Pinning to
+/// `span_groups * ratio + margin` is therefore provably sufficient and provably
+/// never truncates a row's promised history. At V4's CSA geometry
+/// (`ratio 4, span_groups 2, margin 16`) that is 24, against a measured width
+/// cycling through `{20, 21, 22, 23}` — `ratio` consecutive sizes, which is
+/// exactly the `4096 x {18..21}`-shaped reallocation the ArcGraph chain
+/// observed from outside the engine.
+///
+/// This is a bound with a proof, not a chosen constant. The capacity is a
+/// function of the layer's own `ratio`/`span_groups`/`margin`, so it does not
+/// grow with context length.
+pub fn xs_pin_window_enabled() -> bool {
+    #[cfg(test)]
+    match pin_test_override::current() {
+        Some(on) => return on,
+        None => {}
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("ARC_V4_XS_PIN_WINDOW").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
+/// Test-only override for [`xs_pin_window_enabled`], thread-local for the same
+/// reason [`test_override`] is.
+#[cfg(test)]
+pub(crate) mod pin_test_override {
+    use std::cell::Cell;
+
+    thread_local! {
+        static STATE: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn current() -> Option<bool> {
+        STATE.with(|s| s.get())
+    }
+
+    pub(crate) fn with<R>(on: bool, f: impl FnOnce() -> R) -> R {
+        let prev = STATE.with(|s| s.replace(Some(on)));
+        let out = f();
+        STATE.with(|s| s.set(prev));
+        out
+    }
 }
 
 /// Test-only override for [`xs_per_sequence_enabled`].
@@ -537,8 +626,14 @@ impl XsRollingCache {
     /// `r + margin + (span_groups - 1) * ratio`, maximised at `r = ratio - 1`
     /// as `span_groups * ratio + margin - 1`. So pinning here only ever
     /// retains MORE than the compressor needs, never less.
+    ///
+    /// The same quantity as [`Self::window_capacity`], which #121 derived
+    /// independently for the serving pin. Delegating rather than repeating the
+    /// expression: two pins that computed "the pinned width" separately could
+    /// drift, and then capture and serving would disagree about a number whose
+    /// whole value is that it does not move.
     pub fn graph_tail_width(&self) -> usize {
-        self.span_groups * self.ratio + self.margin
+        self.window_capacity()
     }
 
     /// Hold the retained raw tail at [`Self::graph_tail_width`] columns instead
@@ -662,22 +757,95 @@ impl XsRollingCache {
             ))
         })?;
         let have = tail.dim(1)?;
-        // `want > have` cannot happen (`set_row_lens` refuses such a batch),
-        // but if it ever did, keeping the whole window and RAISING `base`
-        // degrades to "refuses a rollback it could have served" — never to
-        // resuming the compressor from a gap.
-        let want = (tok - base[i]).min(have);
+        // What this row actually promised. `promised > have` cannot happen
+        // (`set_row_lens` refuses such a batch), but if it ever did, keeping
+        // the whole window and RAISING `base` degrades to "refuses a rollback
+        // it could have served" — never to resuming the compressor from a gap.
+        let promised = (tok - base[i]).min(have);
+        // 🔑 With the window pinned, do NOT re-narrow to `promised` here.
+        // `clone_out_cache` calls this once per layer per sequence on EVERY
+        // engine step, so narrowing would reallocate the buffer every step and
+        // undo the pin exactly on the hot path it exists for. Keeping the
+        // pinned width costs nothing: the extra columns are older real tokens
+        // ahead of this row's `base`, and `plan_xs_advance` refuses to read
+        // below `base` regardless of how wide the buffer is.
+        //
+        // Clamped by `tok` so a per-sequence cache never ends up wider than the
+        // row is long — that state is legal but it would send every subsequent
+        // B=1 step down `advance_ragged`, which is the slower path.
+        let width = if self.pin_is_on() {
+            self.window_capacity().min(tok).min(have).max(promised)
+        } else {
+            promised
+        };
         let mut out = self.clone();
         out.comp.all_data = Some(comp);
         out.comp.current_seq_len = tok / self.ratio;
-        out.tail = Some(if want == have {
+        out.tail = Some(if width == have {
             tail
         } else {
-            tail.narrow(1, have - want, want)?.contiguous()?
+            tail.narrow(1, have - width, width)?.contiguous()?
         });
         out.tokens = vec![tok];
-        out.base = vec![tok - want];
+        // The resume point is this row's own, unchanged by how wide the buffer
+        // it landed in happens to be.
+        out.base = vec![tok - promised];
         Ok(out)
+    }
+
+    /// The width the retained raw window is pinned to — `span_groups * ratio +
+    /// margin`, the bound derived in [`xs_pin_window_enabled`] that
+    /// `tokens - base` provably never reaches.
+    ///
+    /// A function of the layer's own geometry, so it does not grow with context
+    /// length: 24 for V4's CSA layers, 144 for HCA. That is the whole point —
+    /// "the capacity it can never exceed" has to be a small number with a
+    /// proof, not a context-length ceiling.
+    pub fn window_capacity(&self) -> usize {
+        self.span_groups * self.ratio + self.margin
+    }
+
+    /// The width to retain this step: `needed` when the pin is off (which is
+    /// bit-identical to what this always did), otherwise the pinned capacity —
+    /// clamped so it can never exceed what the window physically holds, and
+    /// never fall below what the rows actually promised.
+    ///
+    /// `w_win` matters after a rollback: `set_len` narrows the buffer, so the
+    /// step after one may have fewer than `capacity` columns to give. Clamping
+    /// there degrades to "this one step reallocates", never to a truncated
+    /// history — `needed <= w_win` holds because `tokens - base <= w_phys` is
+    /// the type's invariant and `w_win = w_phys + t_new`.
+    fn retained_width(&self, needed: usize, tokens_new: usize, w_win: usize) -> usize {
+        if !self.pin_is_on() {
+            return needed;
+        }
+        self.window_capacity()
+            .min(tokens_new)
+            .min(w_win)
+            .max(needed)
+    }
+
+    /// Is the width pin on, by either of its two triggers?
+    ///
+    /// There are two, because the pin was arrived at twice for two different
+    /// reasons and both callers are real:
+    ///
+    /// * [`Self::pin_tail_width`] — a per-cache request, made by CUDA-graph
+    ///   capture, for which a moving allocation size is not slow but *invalid*
+    ///   (an allocation that misses the warm pool during capture becomes an
+    ///   unstable graph memory node). See that method for the measured
+    ///   H200 evidence.
+    /// * [`xs_pin_window_enabled`] — a process-wide serving switch, for which
+    ///   the point is that the reallocation per decode step is simply waste.
+    ///
+    /// One width policy answers both: the width each asks for is
+    /// `span_groups * ratio + margin`, the same expression, so they cannot
+    /// disagree about what "pinned" means. Keeping both triggers rather than
+    /// collapsing them keeps capture working when the env switch is off, which
+    /// is its default.
+    #[inline]
+    fn pin_is_on(&self) -> bool {
+        self.pin_tail || xs_pin_window_enabled()
     }
 
     /// Physical width of the retained raw window (0 when there is none).
@@ -717,11 +885,22 @@ impl XsRollingCache {
     /// batch with `ARC_V4_XS_PER_SEQ` off satisfies it (one length, one base,
     /// and `clone_in_cache` refuses any tail-width disagreement outright), so
     /// the "flag off is byte-identical" claim is unchanged.
+    ///
+    /// The width is deliberately **not** part of the test. It was, while the
+    /// buffer was re-narrowed to `tokens - base` every step; pinning the window
+    /// ([`xs_pin_window_enabled`]) makes it wider than that on purpose, and the
+    /// scalar path now measures its offsets from the buffer's physical start,
+    /// so a wider buffer is no longer an assumption it makes. What it still
+    /// needs is that the window begins at or after token 0 — `w_phys <= tokens`
+    /// — because otherwise its `tokens - w_phys` would underflow. That case is
+    /// a batch assembled around a longer neighbour, and `advance_ragged` is the
+    /// path written for it.
     fn can_advance_uniform(&self) -> Result<bool> {
         let (t0, b0) = (self.tokens[0], self.base[0]);
         Ok(self.tokens.iter().all(|&t| t == t0)
             && self.base.iter().all(|&b| b == b0)
-            && self.tail_width()? == t0 - b0)
+            && b0 <= t0
+            && self.tail_width()? <= t0)
     }
 
     pub fn reset(&mut self) {
@@ -1149,10 +1328,24 @@ impl XsRollingCache {
     {
         let tokens = self.tokens[0];
         let base = self.base[0];
+        let w_phys = self.tail_width()?;
 
-        // `window` covers tokens [win_start, tokens + t_new).
+        // `window` covers tokens [win_start, tokens + t_new), where `win_start`
+        // is the buffer's PHYSICAL start, not `base`.
+        //
+        // Those were the same number while the buffer was re-narrowed to
+        // exactly `tokens - base` every step. They are not once it is pinned: a
+        // pinned window keeps older columns this row no longer promises, so its
+        // physical start sits at or below `base`. Measuring offsets from the
+        // physical start is what makes the two cases one code path — and it is
+        // the same thing the ragged path already does, where a neighbour's
+        // width has always been able to widen the window.
+        //
+        // `tokens - w_phys` cannot underflow here: `can_advance_uniform`
+        // refuses this path when `w_phys > tokens`, sending that case to
+        // `advance_ragged`, which handles a window wider than the row is long.
         let (window, win_start) = match self.tail.as_ref() {
-            Some(tail) if tokens > base => (Tensor::cat(&[tail, xs_new], 1)?, base),
+            Some(tail) if w_phys > 0 => (Tensor::cat(&[tail, xs_new], 1)?, tokens - w_phys),
             _ => (xs_new.clone(), tokens),
         };
         let tokens_new = tokens + t_new;
@@ -1167,11 +1360,16 @@ impl XsRollingCache {
                 need_start,
                 (g_done + 1).saturating_sub(self.span_groups) * self.ratio
             );
-            if need_start < win_start {
+            // Bounded by `base`, not by the buffer's physical start — the same
+            // tightening `plan_xs_advance` carries. A pinned window physically
+            // holds tokens below `base`, and they are real, but they are not
+            // history this row promised to keep; reading them because the
+            // buffer happens to be wider would make the pin change answers.
+            if need_start < base {
                 candle_core::bail!(
                     "xs rolling cache: compressor history gap — row {g_done} needs tokens from \
-                     {need_start} but the retained window starts at {win_start}. This means a \
-                     truncation was applied without going through `set_len`."
+                     {need_start} but that row only retained from {base}. This means a truncation \
+                     was applied without going through `set_len`."
                 );
             }
             let off = need_start - win_start;
@@ -1209,22 +1407,32 @@ impl XsRollingCache {
         let rollback_floor = tokens_new.saturating_sub(self.margin);
         let keep_from = ((rollback_floor / self.ratio + 1).saturating_sub(self.span_groups)
             * self.ratio)
-            .max(win_start);
-        // Under `pin_tail_width` the retention point is the FIXED-width one
-        // instead, so the tail (and the cat, narrow and contiguous that build
-        // it) keeps one shape for the whole run — a capture precondition, see
-        // `pin_tail_width`. `graph_tail_width()` is an upper bound on what the
-        // unpinned policy would keep, so this only ever retains more, never
-        // less; `.max(win_start)` covers the transition step, where the window
-        // in hand may still be narrower than the pinned width.
-        let pinned_base = (self.pin_tail && tokens_new >= self.graph_tail_width())
-            .then(|| (tokens_new - self.graph_tail_width()).max(win_start));
-        let new_base = pinned_base.unwrap_or(keep_from).min(tokens_new);
-        self.tail = Some(
-            window
-                .narrow(1, new_base - win_start, tokens_new - new_base)?
-                .contiguous()?,
-        );
+            .max(base);
+        let new_base = keep_from.min(tokens_new);
+        // End-anchored, which is what it always was: with the pin off,
+        // `w_win - needed == new_base - win_start` identically, so this is the
+        // same narrow the scalar path has always taken. With it on, the extra
+        // columns are older real tokens ahead of `new_base` that nothing reads.
+        //
+        // This supersedes the `pinned_base` form that reached the integration
+        // branch first (#181's `pin_tail_width`). Both hold the retained tail
+        // at the SAME constant width -- `graph_tail_width()` and
+        // `window_capacity()` are the same expression, `span_groups * ratio +
+        // margin` -- which is the property capture needs. They differed only in
+        // where the constancy came from: that one moved `base` earlier so the
+        // logical span `tokens - base` became constant, this one leaves `base`
+        // at the retention point the type documents and widens the physical
+        // buffer instead. This form is the one that composes, because
+        // `win_start` here is the buffer's PHYSICAL start (`tokens - w_phys`)
+        // rather than `base`, so a buffer wider than the row promised is
+        // already a representable state -- and `plan_xs_advance` still refuses
+        // to read below `base`, so the pin cannot change any answer. Both
+        // triggers are honoured; see `retained_width`.
+        let w_win = window.dim(1)?;
+        let needed = tokens_new - new_base;
+        let width = self.retained_width(needed, tokens_new, w_win);
+        debug_assert!(width >= needed && width <= w_win);
+        self.tail = Some(window.narrow(1, w_win - width, width)?.contiguous()?);
         for (t, ba) in self.tokens.iter_mut().zip(self.base.iter_mut()) {
             *t = tokens_new;
             *ba = new_base;
@@ -1320,11 +1528,10 @@ impl XsRollingCache {
         // row's own token count and `plan_xs_advance` refuses any that would
         // reach below the row's `base`.
         let w_win = window.dim(1)?;
-        self.tail = Some(
-            window
-                .narrow(1, w_win - plan.tail_width, plan.tail_width)?
-                .contiguous()?,
-        );
+        let widest_row = plan.tokens_new.iter().copied().max().unwrap_or(0);
+        let width = self.retained_width(plan.tail_width, widest_row, w_win);
+        debug_assert!(width >= plan.tail_width && width <= w_win);
+        self.tail = Some(window.narrow(1, w_win - width, width)?.contiguous()?);
         self.tokens = plan.tokens_new;
         self.base = plan.base_new;
         self.compressed_rows()

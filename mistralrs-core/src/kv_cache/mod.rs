@@ -13,7 +13,7 @@ mod hybrid_cache;
 mod rotating_cache;
 mod single_cache;
 pub mod turboquant_cache;
-mod xs_rolling;
+pub(crate) mod xs_rolling;
 /// Thread-local `ARC_V4_XS_PER_SEQ` override, so a test outside this module can
 /// exercise both sides of the flag (the production read is a `OnceLock`).
 #[cfg(test)]
@@ -3958,8 +3958,23 @@ mod clone_in_cache_invariant_tests {
     /// compressor history and cannot share one dense buffer. It must be
     /// refused, by name — never papered over, and never a panic on the engine
     /// task.
+    ///
+    /// ⚠️ Run with the window pin OFF, deliberately. The widths 18 and 22 are
+    /// what the *resizing* buffer produced, and they are the whole
+    /// discriminator: pinning the window makes both 144
+    /// (`span_groups * ratio + margin`), so the shape mismatch at :499 cannot
+    /// arise and this fixture would silently stop testing anything. The
+    /// historical defect is still worth pinning — the pin is a flag, and the
+    /// refusal is what has to hold when it is off.
+    /// `the_pin_removes_this_fixtures_discriminator` records the other side.
     #[test]
     fn ragged_xs_tail_is_refused_by_name_not_panicked() {
+        crate::kv_cache::xs_rolling::pin_test_override::with(false, || {
+            ragged_xs_tail_is_refused_by_name_not_panicked_inner();
+        });
+    }
+
+    fn ragged_xs_tail_is_refused_by_name_not_panicked_inner() {
         let mut short = xs_state(128, 1);
         feed_xs(&mut short, 274);
         let mut long = xs_state(128, 1);
@@ -4013,6 +4028,38 @@ mod clone_in_cache_invariant_tests {
             "the refusal must name BOTH lengths so the operator can see which \
              sequences diverged, got: {err}"
         );
+    }
+
+    /// The other side of the fixture above: with the window pinned, the two
+    /// sequences' tails are the SAME width, so wave51-CB's shape mismatch is
+    /// not merely refused — it cannot be constructed.
+    ///
+    /// That is a consequence of the pin worth recording, not a reason to stop
+    /// refusing: the two caches still hold different history, and the batch is
+    /// still refused, just one layer earlier and by the token-count invariant
+    /// (`ensure_uniform_batch_cache_lens`) rather than by a tensor shape. A
+    /// refusal that depends on two buffers happening to differ in size is a
+    /// weaker guarantee than one that reads the lengths, and this shows the
+    /// weaker one is not what is holding.
+    #[test]
+    fn the_pin_removes_this_fixtures_discriminator() {
+        crate::kv_cache::xs_rolling::pin_test_override::with(true, || {
+            let mut short = xs_state(128, 1);
+            feed_xs(&mut short, 274);
+            let mut long = xs_state(128, 1);
+            feed_xs(&mut long, 278);
+            let (sw, lw) = (
+                short.tail.as_ref().unwrap().dims()[1],
+                long.tail.as_ref().unwrap().dims()[1],
+            );
+            assert_eq!(
+                (sw, lw),
+                (144, 144),
+                "pinned HCA windows must both be span_groups*ratio+margin = 144"
+            );
+            // …and the lengths still disagree, which is what the refusal reads.
+            assert_ne!(short.current_seq_len(), long.current_seq_len());
+        });
     }
 
     /// The ragged-tail refusal must not depend on the K/V slots noticing

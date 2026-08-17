@@ -122,7 +122,7 @@ use crate::{
     utils::{progress::NiceProgressBar, unvarbuilder::UnVarBuilder},
 };
 
-use crate::kv_cache::XsRollingCache;
+use crate::kv_cache::{xs_rolling, XsRollingCache};
 
 use super::dsv4_kv_fp8::V4PackedK;
 use super::dsv4_mhc::V4MHCLayerParams;
@@ -8149,6 +8149,150 @@ mod tests {
         ragged_batch_matches_b1(128, &[129, 143, 1024, 1150], 3)
     }
 
+    /// 🔑 Settles the one discrepancy between two independent models of this
+    /// buffer, and does it without a GPU.
+    ///
+    /// The ArcGraph chain measured the reallocation cycling through
+    /// `4096 x {18, 19, 20, 21}`. Running the retention rule forward predicts
+    /// `{20, 21, 22, 23}`. Both are `ratio`-consecutive, both contain 21, and
+    /// they are offset by exactly 2 — so one of the two models is wrong about
+    /// *why*, even though the bound holds either way.
+    ///
+    /// The pre-committed reconciliation was: theirs is the pre-saturation RAMP
+    /// (their run generated ~21 tokens, so `base` had not finished advancing
+    /// and `W = tokens - base` was still climbing), mine is the steady state.
+    /// This checks that claim directly by recording the width from token 1,
+    /// and it is the difference between a bound that is right for the right
+    /// reason and one that happens to be right — which is the trap the next
+    /// context length springs.
+    #[test]
+    fn the_window_ramps_then_settles_to_ratio_consecutive_sizes() -> Result<()> {
+        xs_rolling::pin_test_override::with(false, || {
+            let device = Device::Cpu;
+            let (hidden, head_dim, ratio) = (32usize, 16usize, 4usize);
+            let compressor = rolling_test_compressor(ratio, hidden, head_dim, &device)?;
+            let stream = per_row_streams(1, 130, hidden, &device)?.remove(0);
+            let mut s = XsRollingCache::new(ratio, compressor.coff, head_dim, 4096);
+
+            let mut widths = Vec::new();
+            for i in 0..128 {
+                s.advance(&stream.narrow(1, i, 1)?, |w| compressor.forward_from_xs(w))?;
+                widths.push(s.tail_width()?);
+            }
+            let cap = ratio * compressor.coff + crate::kv_cache::XS_TAIL_MARGIN_TOKENS;
+
+            // The ramp: early widths are BELOW the steady-state band, because
+            // `base` is still pinned at 0 while `tokens` climbs.
+            let ramp: std::collections::BTreeSet<_> = widths[..20].iter().copied().collect();
+            let steady: std::collections::BTreeSet<_> = widths[64..].iter().copied().collect();
+            assert!(
+                ramp.iter().min() < steady.iter().min(),
+                "the early widths must be a ramp, not the steady band: ramp {ramp:?} \
+                 steady {steady:?}"
+            );
+            // The steady state is exactly `ratio` consecutive sizes…
+            assert_eq!(
+                steady.len(),
+                ratio,
+                "steady-state width must cycle through exactly `ratio` sizes, got {steady:?}"
+            );
+            let lo = *steady.iter().next().unwrap();
+            assert_eq!(
+                steady.iter().copied().collect::<Vec<_>>(),
+                (lo..lo + ratio).collect::<Vec<_>>(),
+                "the steady band must be consecutive, got {steady:?}"
+            );
+            // …and it is the top of the range the bound allows: [cap-ratio, cap).
+            assert_eq!(
+                (lo, lo + ratio - 1),
+                (cap - ratio, cap - 1),
+                "steady band should be [cap-ratio, cap-1] = [{}, {}]",
+                cap - ratio,
+                cap - 1
+            );
+            // The bound, over every step including the ramp.
+            assert!(
+                widths.iter().all(|&w| w < cap),
+                "some width reached the pinned capacity {cap}, so pinning there could truncate: \
+                 max was {:?}",
+                widths.iter().max()
+            );
+            Ok(())
+        })
+    }
+
+    /// 🔑 Pinning the retained window must change the ALLOCATION and nothing
+    /// else. This is the evidence for defaulting `ARC_V4_XS_PIN_WINDOW` on
+    /// without a throughput number first: the two settings are run against the
+    /// same stream for 40 steps and required to agree EXACTLY, on the
+    /// compressed rows and on both time bases.
+    ///
+    /// The argument for why they must — every offset is derived from the row's
+    /// own token count, so a wider buffer shifts `off` by exactly the widening
+    /// and the compressor sees the same absolute tokens — is the kind of
+    /// argument that has been wrong on this chain before. So it is checked.
+    #[test]
+    fn pinning_the_window_is_numerically_inert() -> Result<()> {
+        let device = Device::Cpu;
+        let (hidden, head_dim, ratio) = (32usize, 16usize, 4usize);
+        let compressor = rolling_test_compressor(ratio, hidden, head_dim, &device)?;
+        let stream = per_row_streams(1, 220, hidden, &device)?.remove(0);
+
+        let run = |pinned: bool| -> Result<(Tensor, Vec<usize>, Vec<usize>, Vec<usize>)> {
+            xs_rolling::pin_test_override::with(pinned, || {
+                let mut s = XsRollingCache::new(ratio, compressor.coff, head_dim, 4096);
+                s.advance(&stream.narrow(1, 0, 37)?, |w| compressor.forward_from_xs(w))?;
+                let mut widths = Vec::new();
+                for i in 0..40 {
+                    s.advance(&stream.narrow(1, 37 + i, 1)?, |w| {
+                        compressor.forward_from_xs(w)
+                    })?;
+                    widths.push(s.tail_width()?);
+                }
+                let comp = s.compressed_rows()?.expect("past one full group");
+                let (tok, base) = s.row_lens();
+                Ok((comp, tok.to_vec(), base.to_vec(), widths))
+            })
+        };
+
+        let (comp_off, tok_off, base_off, widths_off) = run(false)?;
+        let (comp_on, tok_on, base_on, widths_on) = run(true)?;
+
+        assert_eq!(
+            max_abs_diff(&comp_off, &comp_on)?,
+            0.0,
+            "pinning the window changed the compressed rows — it must only change the allocation"
+        );
+        assert_eq!(tok_off, tok_on, "token counts diverged");
+        assert_eq!(base_off, base_on, "resume points diverged");
+
+        // …and the fixture must actually exercise the difference, or the
+        // equality above proves nothing (five fixtures on this chain have
+        // survived a mutation by not distinguishing the two answers).
+        let distinct_off: std::collections::BTreeSet<_> = widths_off.iter().collect();
+        assert!(
+            distinct_off.len() > 1,
+            "unpinned widths did not vary ({widths_off:?}), so this proves nothing about pinning"
+        );
+        assert_eq!(
+            distinct_off.len(),
+            ratio,
+            "unpinned width should cycle through `ratio` consecutive sizes, got {distinct_off:?}"
+        );
+        let cap = ratio * compressor.coff + crate::kv_cache::XS_TAIL_MARGIN_TOKENS;
+        assert!(
+            widths_on.iter().all(|&w| w == cap),
+            "pinned widths must be the constant {cap}, got {widths_on:?}"
+        );
+        // The bound the pin rests on: the unpinned width never reaches it.
+        assert!(
+            widths_off.iter().all(|&w| w < cap),
+            "the pinned capacity {cap} must exceed every width the retention rule produces, \
+             got {widths_off:?}"
+        );
+        Ok(())
+    }
+
     /// The control the ragged tests need: a UNIFORM batch takes the untouched
     /// scalar path and is also token-identical. If this ever failed, the
     /// "flag off is byte-identical" claim would be false and the ragged
@@ -8297,8 +8441,73 @@ mod tests {
     /// the per-sequence invariant `window width == tokens - base`, taking that
     /// row's share from the END of the shared window. Taking it from the front
     /// would hand the row somebody else's older tokens under its own `base`.
+    /// ⚠️ Run with the window pin OFF, deliberately. Its premise is a row
+    /// *narrower* than the shared window, which is what a resizing buffer
+    /// produces; pinned, every row is the same width and the premise — and the
+    /// re-anchoring it checks — cannot be constructed. The re-anchoring still
+    /// has to be right when the pin is off, and
+    /// `splitting_a_pinned_row_keeps_the_buffer_and_the_resume_point` covers
+    /// the pinned side, where the requirement is the opposite one.
     #[test]
     fn splitting_a_batched_row_restores_the_per_sequence_window() -> Result<()> {
+        xs_rolling::pin_test_override::with(false, splitting_a_batched_row_inner)
+    }
+
+    /// 🔑 The pinned counterpart, and the reason it matters is cost, not
+    /// correctness: `clone_out_cache` calls `split_row` once per layer per
+    /// sequence on EVERY engine step. A split that re-narrowed to
+    /// `tokens - base` would reallocate the buffer every step and undo the pin
+    /// precisely on the hot path it exists for. So the split must hand back the
+    /// SAME tensor, and must not move the row's resume point while doing it.
+    #[test]
+    fn splitting_a_pinned_row_keeps_the_buffer_and_the_resume_point() -> Result<()> {
+        xs_rolling::pin_test_override::with(true, || {
+            let device = Device::Cpu;
+            let (hidden, head_dim, ratio) = (32usize, 16usize, 4usize);
+            let compressor = rolling_test_compressor(ratio, hidden, head_dim, &device)?;
+            let lens = [37usize, 40];
+            let streams = per_row_streams(2, 64, hidden, &device)?;
+            let mut refs: Vec<XsRollingCache> = Vec::new();
+            for (i, &l) in lens.iter().enumerate() {
+                let mut s = XsRollingCache::new(ratio, compressor.coff, head_dim, 4096);
+                s.advance(&streams[i].narrow(1, 0, l)?, |w| {
+                    compressor.forward_from_xs(w)
+                })?;
+                refs.push(s);
+            }
+            let cap = ratio * compressor.coff + crate::kv_cache::XS_TAIL_MARGIN_TOKENS;
+            for r in &refs {
+                assert_eq!(
+                    r.tail.as_ref().unwrap().dim(1)?,
+                    cap,
+                    "a pinned per-sequence window must already be the capacity"
+                );
+            }
+            let batched = batch_xs(&refs)?;
+            let shared = batched.tail.as_ref().unwrap().dim(1)?;
+            assert_eq!(shared, cap, "pinned rows batch without any padding at all");
+
+            let comps = batched.comp.all_data.as_ref().unwrap().chunk(2, 0)?;
+            let tails = batched.tail.as_ref().unwrap().chunk(2, 0)?;
+            for i in 0..2 {
+                let out = batched.split_row(i, comps[i].clone(), tails[i].clone())?;
+                assert_eq!(
+                    out.tail.as_ref().unwrap().dim(1)?,
+                    cap,
+                    "row {i}: the split re-narrowed a pinned buffer, which would reallocate it \
+                     on every engine step"
+                );
+                assert_eq!(
+                    (out.row_lens().0[0], out.row_lens().1[0]),
+                    (refs[i].row_lens().0[0], refs[i].row_lens().1[0]),
+                    "row {i}: keeping the buffer must not move the resume point"
+                );
+            }
+            Ok(())
+        })
+    }
+
+    fn splitting_a_batched_row_inner() -> Result<()> {
         let device = Device::Cpu;
         let (hidden, head_dim, ratio) = (32usize, 16usize, 4usize);
         let compressor = rolling_test_compressor(ratio, hidden, head_dim, &device)?;
