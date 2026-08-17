@@ -58,6 +58,24 @@
 #    noise. B=1 is one sequence and one bucket under either rule; a difference
 #    there means something other than admission moved.
 #
+# ⚠️ **The first run of this experiment (PR #104) produced no usable ratio, and
+# the cause was the harness, not the server.** The driver counted
+# `usage.completion_tokens` off COMPLETED responses; at ~47 tok/s aggregate with
+# `max_tokens=128` and B>=32, one request needs ~90 s to finish against a 45 s
+# steady window, so every row reported 0 tokens / 0 completions / 0 errors — a
+# signature indistinguishable from a dead server. It was proven rather than
+# inferred: a fake SSE endpoint that never completes reproduced it exactly.
+# This driver now **streams** and counts each chunk as it arrives, so the
+# measurement no longer depends on any request finishing inside the window, and
+# every row carries a `verdict` column — `HARNESS_PRODUCED_NOTHING` is a broken
+# probe and the summary refuses to turn it into a ratio, rather than printing a
+# confident 0.00 (D18).
+#
+# Arm B's other failure mode there was a retry storm off a PRE-EXISTING
+# long-prompt fault at ~1,055 words, present on older builds and unrelated to
+# the admission chain. Until the fused 512 kernel lands, cap `--mixed` prompt
+# lengths below that: set `MIXED_MAX_WORDS` (default 512 here, was 2048).
+#
 # 5. `grep "cannot honour it" $LOG` in arms C/D must be EMPTY (the mode was
 #    granted). In arms A/B it must cite `ARC_MTP_PER_SEQ_KV` — the flag, not a
 #    blocker, because the flag is off.
@@ -129,6 +147,13 @@ def prompt_of(words: int) -> str:
     return ("Summarise the following log excerpt in detail. " +
             (FILLER * ((words // 20) + 1))[: words * 6])
 
+# Prompt-length ladder for the MIXED arms. Capped at 512 words: a
+# pre-existing long-prompt fault at ~1,055 words (unrelated to batch admission,
+# present on older builds) turned arm B of the first run into a 91,933-entry
+# retry storm. Raise this once the fused 512 kernel lands — the spread, not the
+# absolute length, is what the experiment needs, and 32..512 is still 16x.
+MIXED_WORDS = [32, 64, 128, 256, 512]
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, required=True)
@@ -142,7 +167,8 @@ def main():
     url = f"http://127.0.0.1:{a.port}/v1/completions"
     stop = threading.Event()
     lock = threading.Lock()
-    counted = {"tokens": 0, "requests": 0, "errors": 0}
+    counted = {"tokens": 0, "requests": 0, "errors": 0, "chunks": 0,
+               "error_kinds": []}
     t_steady_start = [None]
 
     # UNIFORM: every worker sends the same 256-word prompt, so every sequence
@@ -163,20 +189,51 @@ def main():
                 "max_tokens": (rng.randint(a.max_tokens // 2, a.max_tokens)
                                if a.mixed else a.max_tokens),
                 "temperature": 0,
+                "stream": True,
             }).encode()
             req = urllib.request.Request(
                 url, data=body, headers={"Content-Type": "application/json"})
             try:
+                # 🔴 STREAM, and count tokens as they ARRIVE.
+                #
+                # Counting `usage.completion_tokens` off completed responses is
+                # what destroyed the first run of this experiment: at ~47 tok/s
+                # aggregate with max_tokens=128 and B=32, a single request needs
+                # ~90 s to finish against a 45 s steady window, so EVERY row
+                # reported 0 tokens, 0 completions and 0 errors — a harness
+                # artefact that reads exactly like a dead server. It was proven
+                # by standing up a fake SSE endpoint that never completes and
+                # reproducing the signature (chunks counted, 0 completions).
+                #
+                # Streaming makes the measurement independent of whether any
+                # request finishes inside the window, which is the property a
+                # steady-state throughput probe needs.
                 with urllib.request.urlopen(req, timeout=600) as r:
-                    resp = json.load(r)
-                n = resp.get("usage", {}).get("completion_tokens", 0)
-                with lock:
-                    if t_steady_start[0] is not None:
-                        counted["tokens"] += n
-                        counted["requests"] += 1
-            except Exception:
+                    for raw in r:
+                        line = raw.decode("utf-8", "replace").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        payload = line[5:].strip()
+                        if payload == "[DONE]":
+                            with lock:
+                                if t_steady_start[0] is not None:
+                                    counted["requests"] += 1
+                            break
+                        try:
+                            ch = json.loads(payload)
+                        except ValueError:
+                            continue
+                        # One chunk == one decoded token on this server.
+                        if ch.get("choices"):
+                            with lock:
+                                if t_steady_start[0] is not None:
+                                    counted["tokens"] += 1
+                                    counted["chunks"] += 1
+            except Exception as e:
                 with lock:
                     counted["errors"] += 1
+                    if len(counted["error_kinds"]) < 5:
+                        counted["error_kinds"].append(repr(e)[:200])
 
     threads = [threading.Thread(target=worker, args=(i,), daemon=True)
                for i in range(a.k)]
@@ -187,6 +244,7 @@ def main():
         t_steady_start[0] = time.time()
         counted["tokens"] = 0
         counted["requests"] = 0
+        counted["chunks"] = 0
     time.sleep(a.steady)
     with lock:
         elapsed = time.time() - t_steady_start[0]
@@ -196,6 +254,13 @@ def main():
         t.join(timeout=5)
     snap["elapsed_s"] = elapsed
     snap["tok_s"] = snap["tokens"] / elapsed if elapsed > 0 else 0.0
+    # 🔴 D18: a cell that produced no tokens AND no errors is a broken harness,
+    # not a measurement of zero. Say which, in the row, so a summary can never
+    # divide by it as if it were a number.
+    snap["verdict"] = (
+        "OK" if snap["tokens"] > 0
+        else ("ALL_ERRORS" if snap["errors"] > 0 else "HARNESS_PRODUCED_NOTHING")
+    )
     print(json.dumps(snap))
 
 main()
@@ -224,7 +289,7 @@ mean = lambda v: (sum(v) / len(v)) if v else 0.0
 print(f"{mean(run):.2f}\t{mean(wait):.2f}\t{mean(tps):.2f}\t{len(run)}")
 PYEOF
 
-printf 'arm\tflags\tprompts\tB\ttok_s\trequests\terrors\tmean_running\tmean_waiting\tlog_tps\tsamples\n' \
+printf 'arm\tflags\tprompts\tB\ttok_s\trequests\terrors\tverdict\tmean_running\tmean_waiting\tlog_tps\tsamples\n' \
   > "$OUT/results.tsv"
 
 run_arm() {
@@ -262,11 +327,13 @@ run_arm() {
     tok_s=$(python3 -c "import json,sys;print(f\"{json.loads(sys.argv[1])['tok_s']:.2f}\")" "$res")
     reqs=$(python3 -c "import json,sys;print(json.loads(sys.argv[1])['requests'])" "$res")
     errs=$(python3 -c "import json,sys;print(json.loads(sys.argv[1])['errors'])" "$res")
+    verdict=$(python3 -c "import json,sys;print(json.loads(sys.argv[1])['verdict'])" "$res")
+    echo "$res" > "$OUT/drive.${arm}.B${b}.json"
     sched=$(python3 "$OUT/scrape.py" "$slog")
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$arm" "$flagdesc" "$prompts" "$b" "$tok_s" "$reqs" "$errs" "$sched" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$arm" "$flagdesc" "$prompts" "$b" "$tok_s" "$reqs" "$errs" "$verdict" "$sched" \
       >> "$OUT/results.tsv"
-    say "arm $arm B=$b -> tok/s $tok_s, errors $errs, scheduler(running/waiting/tps/n) $sched"
+    say "arm $arm B=$b -> tok/s $tok_s [$verdict], errors $errs, scheduler $sched"
   done
 }
 
@@ -286,15 +353,21 @@ run_arm D "granted" mixed   "$GRANT"
 import sys, collections
 rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1])][1:]
 by = {(r[0], int(r[3])): r for r in rows}
+def ok(arm, b):
+    r = by.get((arm, b))
+    return r is not None and r[7] == "OK"
 def f(arm, b, col):
-    r = by.get((arm, b));  return float(r[col]) if r else float("nan")
+    r = by.get((arm, b))
+    if r is None or r[7] != "OK":
+        return float("nan")   # never divide by a cell the harness did not measure
+    return float(r[col])
 maxb = max(int(r[3]) for r in rows)
 print("(1) tok_s(B)/tok_s(A) across the sweep  <- FALLS with B iff shattering is real:")
 for b in sorted({int(r[3]) for r in rows}):
     a_, b_ = f('A', b, 4), f('B', b, 4)
     print(f"      B={b:<4} mixed/uniform = {(b_ / a_ if a_ else float('nan')):.3f}"
           f"   (A={a_:.2f}, B={b_:.2f})")
-run_b = by.get(('B', maxb), [""] * 8)[7]
+run_b = by.get(('B', maxb), [""] * 9)[8]
 print(f"    scheduler `running` at B={maxb}, arm B: {run_b}"
       "   (NA = `serve` cannot emit the throughput log; see the header)")
 print(f"(2) tok_s(B)/tok_s(A) at B={maxb}: {f('B', maxb, 4) / f('A', maxb, 4):.3f} "
@@ -305,6 +378,12 @@ print("(4) B=1 across arms (must agree within noise): "
       + ", ".join(f"{a}={f(a, 1, 4):.2f}" for a in "ABCD"))
 print("(5) errors: "
       + ", ".join(f"{a}={sum(int(r[6]) for r in rows if r[0] == a)}" for a in "ABCD"))
+bad = [(r[0], r[3], r[7]) for r in rows if r[7] != "OK"]
+if bad:
+    print("🔴 CELLS THE HARNESS DID NOT MEASURE (any nan above traces to these):")
+    for arm, b, v in bad:
+        print(f"      arm {arm} B={b}: {v}")
+    print("    A row of HARNESS_PRODUCED_NOTHING is a broken probe, NOT a zero.")
 PYEOF
   echo
   echo "=== refusal reasons (arms A/B must cite ARC_MTP_PER_SEQ_KV; C/D must be empty) ==="
