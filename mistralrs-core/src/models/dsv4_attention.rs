@@ -274,11 +274,7 @@ fn compose_caller_mask(
 /// row must reach it. A batch that is ragged in some other way is not the
 /// layout this module knows how to mask, and guessing would be a wrong answer
 /// nothing downstream catches.
-fn resolve_ragged_rows<'a>(
-    rows: Option<&'a [usize]>,
-    q0: usize,
-    b_sz: usize,
-) -> Result<Option<&'a [usize]>> {
+fn resolve_ragged_rows(rows: Option<&[usize]>, q0: usize, b_sz: usize) -> Result<Option<&[usize]>> {
     let Some(rows) = rows.filter(|rows| rows.iter().any(|&r| r != q0)) else {
         return Ok(None);
     };
