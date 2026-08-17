@@ -1,6 +1,6 @@
 # Arc Benchmarks — DeepSeek V4 Flash on one H200
 
-Measured results from six rented GPU sessions (2026-08-12/13/14/15). Every
+Measured results from seven rented GPU sessions (2026-08-12 → 08-17). Every
 number on this page comes from a saved eval artifact produced by the
 `arc-tools/quality` harness; the one exception — the grouped-GEMM batch
 curve — is a kernel-level microbenchmark and is labeled as such where it
@@ -12,16 +12,19 @@ difference is stated inline.
 | | |
 |---|---|
 | Model | DeepSeek V4 Flash — 284B logical / 13B active MoE (HF-verified: model card + release announcement + config geometry, 43 layers / 256+1 experts) |
-| Artifact | **74.19 GB** UQFF bake, **8 shards + residual** (15 files): 2-bit trellis (qtip2) experts; `lm_head` and the context compressor excluded from 2-bit. Published as `aeonmind/DeepSeek-V4-Flash-UQFF-qtip2`; size and file count **verified against the HF API** and again on disk. ⚠️ **Not standalone** — it is an overlay that requires the source checkpoint at `-m`; see the banner below |
+| Artifact | **74.19 GB** UQFF bake, **8 shards + residual** (15 files): 2-bit trellis (qtip2) experts; `lm_head` and the context compressor excluded from 2-bit. Published as `aeonmind/DeepSeek-V4-Flash-UQFF-qtip2`; size and file count **verified against the HF API** and again on disk. ⚠️ **Not standalone** — it is an overlay that requires the source checkpoint at `-m`; see the banner below. **Session 7 measures a second artifact**, `aeonmind/DeepSeek-V4-Flash-UQFF-qtip2b` (the K=2/V=1 bitshift-trellis rung, **74.12 GB**, 15 files, public), same overlay contract |
 | Hardware | 1× NVIDIA H200. Sessions 1–4: Runcrate **New York**, $4.92/hr. Sessions 5–6: Runcrate **Helsinki**, **$4.85/hr**. `nvidia-smi` reports **143,771 MiB = 150.75 GB decimal = 140.40 GiB**; NVIDIA's "141 GB" spec figure is really ~141 **GiB** (see the units note under session 5) |
 | Engine | Arc (this repo), CUDA + flash-attn build; serve via OpenAI-compatible HTTP API |
-| Sessions | Session 1: 2026-08-12T23:31Z, 9.2 h. Session 2: 2026-08-13T12:47Z (re-bake with the Viterbi encoder fix, PR #9). Session 3: 2026-08-13T20:31Z, ≈6.2 h (throughput session: all kernel-fix PRs #8/#10/#14/#15 in the build; token budget raised to 2048). Session 4: 2026-08-14T03:35Z, ≈3 h (payoff session: GEMV autotune sweep, grouped-GEMM batch curve, no-cudnn rebuild). Session 5: 2026-08-15T11:37Z (first end-to-end **batched serving** measurement; found the published artifact non-loadable and re-baked in situ). Session 6: 2026-08-15T21:08Z, ≈1.9 h (post-fix re-sweep on the **published** artifact: B up to 256, component profile at batch, GSM8K re-measure) |
+| Sessions | Session 1: 2026-08-12T23:31Z, 9.2 h. Session 2: 2026-08-13T12:47Z (re-bake with the Viterbi encoder fix, PR #9). Session 3: 2026-08-13T20:31Z, ≈6.2 h (throughput session: all kernel-fix PRs #8/#10/#14/#15 in the build; token budget raised to 2048). Session 4: 2026-08-14T03:35Z, ≈3 h (payoff session: GEMV autotune sweep, grouped-GEMM batch curve, no-cudnn rebuild). Session 5: 2026-08-15T11:37Z (first end-to-end **batched serving** measurement; found the published artifact non-loadable and re-baked in situ). Session 6: 2026-08-15T21:08Z, ≈1.9 h (post-fix re-sweep on the **published** artifact: B up to 256, component profile at batch, GSM8K re-measure). **Session 7: 2026-08-16T21:02Z, 3.3 h** (first serving measurement of the **`qtip2b`** rung: batch sweep, first MTP acceptance number, full-set GSM8K, FP8-KV correctness) |
 
 ## Headline results (latest measured session per row)
 
 | Eval | Result | Protocol | Reference point |
 |---|---|---|---|
-| **GSM8K (session 6)** — on the **published** artifact | **96.0%** (96/100, ±3.8 pp CI95) | n=100, **0-shot chat**, greedy (t=0), **seed 161**, max_tokens **2048**; 1 degenerate, **0 truncated**, mean completion **148.5** tokens; arc `3460656d3` | Base model card: **90.8** — but that is **8-shot EM**, a different and **easier** protocol; **not directly comparable**. Meets DOCTRINE D6's ≥90 commitment on our own protocol for the first time |
+| **GSM8K (session 7)** — full test set, on the published **`qtip2b`** artifact | **96.3%** (1270/1319, **±1.0 pp** CI95) | **n=1,319 (all)**, **0-shot chat**, greedy (t=0), **seed 161**, max_tokens **2048**, `--concurrency 16`; **0 degenerate, 0 truncated, 0 errors**, mean completion **157.8** tokens; arc `46ea6948d`. First pass scored 94.0% ±1.3 pp with 34 requests lost to two engine panics; those 34 were re-run against the recovered engine — see the session-7 section | Base model card **90.8** is **8-shot EM**, an easier protocol; **not directly comparable**. Confirms session 6's n=100 96.0% with a 3.8× narrower CI |
+| **Batched serving (session 7)** — the `qtip2b` rung | **peak aggregate 111.69 tok/s at B=256**, **$12.06/Mtok**; B=1 18.27, B=8 41.43, B=16 54.75, B=32 74.52, B=64 91.46, B=128 106.36 | end-to-end through the OpenAI-compatible server on the published `qtip2b` overlay, `--max-seqs 256`, 64 decode tokens, `effective_B == B` on every row, 0 errors in 505 requests, $4.85/hr | **3.64× session 6's peak at 3.65× lower $/Mtok**, and aggregate **rises monotonically through B=256** instead of peaking at B=16. b=1 moved only 1.12× — the control |
+| **MTP acceptance (session 7)** — first ever measured | **B=1: 1.84 tokens per target forward**, 41.9% draft acceptance; **B≥8: engine panic, unmeasurable** | `--mtp-depth 2 --paged-attn off --prefix-cache-n 0`, `ARC_MTP_LOG_ACCEPTANCE=1` | SGLang's non-simulated CI floor for DeepSeek V4 MTP is **2.30 accepted-per-verify**; ours is 0.84 at depth 2 |
+| GSM8K (session 6) — on the **published** `qtip2` artifact | **96.0%** (96/100, ±3.8 pp CI95) | n=100, **0-shot chat**, greedy (t=0), **seed 161**, max_tokens **2048**; 1 degenerate, **0 truncated**, mean completion **148.5** tokens; arc `3460656d3` | Base model card: **90.8** — but that is **8-shot EM**, a different and **easier** protocol; **not directly comparable**. Meets DOCTRINE D6's ≥90 commitment on our own protocol for the first time |
 | GSM8K (session 3) — **VOID, superseded** | 87.0% (87/100, ±6.6 pp CI95) | same protocol but a **different bake** (session-3 GPU-Viterbi, not the published artifact) and **superseded decode math** — PR #35 later fixed a missing SwiGLU clamp on 4 of 5 expert paths and a wrongly-applied YaRN layer set; 2 degenerate, 9 truncated, mean completion 528.4 tokens | Retired by session 6, not beaten by it: the two numbers are not measurements of the same thing |
 | Factual recall (session 6) | **21/22** | greedy; on the published artifact, arc `3460656d3` | was 22/22 in session 2 — a one-item move on a small battery, reported as measured |
 | Arithmetic (session 6) | **8/8** | greedy; on the published artifact | unchanged |
@@ -30,7 +33,7 @@ difference is stated inline.
 | Long context (session 2) | **5/5 coherence + 4/4 needle** | greedy; ablation matrix below | — |
 | Decode speed (b=1, session 4) | **14.58 tok/s** | single stream, 256 decode tokens, 525-token prompt; prefill ~57 tok/s, TTFT ~9.2 s; build **without** the `cudnn` feature (see pitfall below) | Progression 5.4 → 13.99 → 14.58 across the kernel-fix PRs; see kernel profile below |
 | Grouped-GEMM batch curve (session 4) | **~63.5 ms/step flat from B=16 to B=64 ⇒ ~1,006 aggregate tok/s** on one H200 | **kernel-level microbench** of the batched 2-bit MoE expert path (40 MoE layers extrapolation), not end-to-end serving | **Still not reproduced end-to-end.** Session 6 measured **30.41 tok/s aggregate at B=64** through the server (up from session 5's 8.14) — closer, but still ~33× below this projection. See the batched-serving section |
-| **Batched serving (session 6)** — the fleet number | **peak aggregate 30.65 tok/s, at B=16**, $43.96/Mtok; B=1 16.27, B=8 26.96, B=32 30.59, B=64 30.41, B=128 28.86, B=256 19.02 | end-to-end through the OpenAI-compatible server on the **published** artifact, `--max-seqs 256`, 64 decode tokens, `effective_B == B` on every row, 0 errors in 505 requests, $4.85/hr | **2.00× session 5's peak at half the $/Mtok, and the peak moved off b=1.** Aggregate stops collapsing but does not scale: flat ~30.5 across B=16–64. B=256 is host-CPU-bound (GPU 0–4%, 121 W) |
+| Batched serving (session 6) — the `qtip2` rung | **peak aggregate 30.65 tok/s, at B=16**, $43.96/Mtok; B=1 16.27, B=8 26.96, B=32 30.59, B=64 30.41, B=128 28.86, B=256 19.02 | end-to-end through the OpenAI-compatible server on the **published** artifact, `--max-seqs 256`, 64 decode tokens, `effective_B == B` on every row, 0 errors in 505 requests, $4.85/hr | **2.00× session 5's peak at half the $/Mtok, and the peak moved off b=1.** Aggregate stops collapsing but does not scale: flat ~30.5 across B=16–64. B=256 is host-CPU-bound (GPU 0–4%, 121 W) |
 | Batched serving (session 5) — **superseded** | peak aggregate 15.35 tok/s, at B=1; B=8 14.83, B=16 10.31, B=32 5.07, B=64 8.14 | same probe, `--max-seqs 128`, in-situ W=32 bake, 0 errors in 121 requests | Aggregate **fell** with batch size. Retained as the pre-fix baseline |
 
 > ### ✅ Aggregate throughput no longer falls with batch — session 6 [measured]
@@ -162,6 +165,148 @@ intact.
 | Trellis grouped-GEMM (batched 2-bit MoE, Stage 4) | **5/5 parity tests passed on H200** (session 3 — first hardware run of the keystone kernel: deterministic output, CPU-reference match on ragged expert-group shapes, tile-map partitioning, descriptor table, window-state recurrence). Batched throughput curve measured at kernel level in session 4 — see below |
 | Sinkhorn fused kernel vs reference path | **Token-identical** on 6/6 greedy 128-token prompts, and perplexity **bit-identical** — after the PR #8 identity fix. (Session 1, pre-fix: rejected with 4/6 token divergence — recorded, fixed, re-validated.) The fused path is now on by default (PR #15) |
 | MLA absorbed decode vs non-absorbed | **Token-identical** on 6/6 prompts |
+
+## Batched serving on the `qtip2b` rung — session 7 [measured]
+
+**This is the first end-to-end serving measurement of the `qtip2b` (K=2/V=1
+bitshift-trellis) rung**, on the published `aeonmind/DeepSeek-V4-Flash-UQFF-qtip2b`
+artifact. Sessions 5 and 6 measured the `qtip2` rung; the switch was decided by a
+kernel-level crossover (gemv **flat** 315 → 317 tok/s from B=64 to B=128, grouped
+**climbing** 322 → 527) and this session tests whether that crossover survives the
+full serving path.
+
+**Protocol.** 1× H200 @ **$4.85/hr** (Helsinki), instance `arc-s15-measure`. arc
+**`46ea6948d`**, `cuda flash-attn`, no `cudnn`. Server
+`--max-seqs 256 --prefix-cache-n 0` with the V4 chat template. Probe
+`arc-tools/quality/batch_load_probe.py`, `/v1/chat/completions` streaming,
+distinct ~68-token prompts, **64 decode tokens, 1 rep** (sessions 5/6's protocol,
+kept so the rows compare line by line), `--max-ctx 545000`, temperature 0. Cold
+load **2 m 05 s** (517 tensors, no `Applying ISQ`); post-load footprint
+**78,801 MiB of 143,771 MiB**. Box health gate: full PASS (sustained **286 W**,
+SM **1980/1980 MHz**, PCIe gen 5 ×16).
+
+| B | prefill agg tok/s (TTFT-derived, **lower bound**) | prefill agg tok/s (server-instrumented, **compute only**) | decode tok/s per user (p50) | **decode AGGREGATE tok/s** | TTFT p50/p95 (s) | $/Mtok @ $4.85/hr | effective_B |
+|---|---|---|---|---|---|---|---|
+| 1 *(diagnostic)* | 170.56 | 171.58 | 17.99 | **18.27** | 0.375 / 0.375 | 73.74 | 1 |
+| 8 | 178.39 | 216.11 | 5.67 | **41.43** | 1.642 / 2.948 | 32.52 | 8 |
+| 16 | 196.49 | 235.59 | 3.965 | **54.75** | 3.135 / 5.321 | 24.61 | 16 |
+| 32 | 231.84 | 266.67 | 2.87 | **74.52** | 5.530 / 9.020 | 18.08 | 32 |
+| 64 | 260.92 | 293.96 | 1.82 | **91.46** | 9.914 / 16.031 | 14.73 | 64 |
+| 128 | 277.94 | 308.49 | 1.09 | **106.36** | 18.669 / 30.096 | 12.67 | 128 |
+| **256** | 285.85 | 314.72 | 0.53 | **111.69** | 27.779 / 58.529 | **12.06** | 256 |
+
+**Peak aggregate 111.69 tok/s at B=256, $12.06/Mtok @ $4.85/hr.**
+`effective_B == B` on all seven rows, every verdict `pass`, **0 errors in 505
+requests**, no `WARNING[KV]`, no `WARN[CLIENT]`.
+
+**Aggregate rises monotonically across every row, including past B=64** — 91.46 →
+106.36 (+16.3%) → 111.69 (+5.0%). On `qtip2` the same probe peaked at B=16 and
+fell 37% by B=256. The kernel-level crossover reproduced end-to-end; the curve is
+flattening by B=256 (+5% for a 2× batch), so B=256 is near the knee, not past it.
+
+| B | session 6 (`qtip2`) | session 7 (`qtip2b`) | ratio |
+|---|---|---|---|
+| 1 *(diagnostic)* | 16.27 | 18.27 | 1.12× |
+| 8 | 26.96 | 41.43 | 1.54× |
+| 16 | 30.65 ← its peak | 54.75 | 1.79× |
+| 32 | 30.59 | 74.52 | 2.44× |
+| 64 | 30.41 | 91.46 | 3.01× |
+| 128 | 28.86 | 106.36 | 3.69× |
+| 256 | 19.02 | **111.69** | **5.87×** |
+| **peak** | 30.65 @B=16 | **111.69 @B=256** | **3.64×** |
+| **best $/Mtok** | $43.96 | **$12.06** | **3.65× cheaper** |
+
+**b=1 moved only 1.12× — that is the control**: the 3–6× at batch is the grouped
+kernel amortizing across the batch, not a faster box or a better bake. The two
+uncontrolled differences (different rung ⇒ different bake, different rental) are
+exactly what the b=1 row is there to bound.
+
+**Per-user decode is what the batch rows cost.** 17.99 tok/s at b=1 → 1.09 at
+B=128 → 0.53 at B=256, with TTFT p95 58.5 s at B=256. Against the bandwidth
+ceilings in `memory/mission/CEILINGS.json` (uniform-routing ⇒ **lower bounds on
+the ceiling**): B=64 91.46 vs 5,289 (**58×**), B=128 106.36 vs 8,701 (**82×**),
+B=256 111.69 vs 16,602 (**149×**) — down from 174×/301×/873× on `qtip2`, and every
+remaining gap is implementation, not physics.
+
+### MTP acceptance — first ever measured, and it does not survive batch [measured]
+
+Speculative decode is the only lever that raises **per-user** decode on one card.
+Served with `--mtp-depth 2 --paged-attn off --prefix-cache-n 0` and
+`ARC_MTP_LOG_ACCEPTANCE=1`; the log confirms `V4 MTP: full decoder block loaded`
+and `MTP speculative decode engaged (depth=2)`.
+
+```
+MTP[b=1] accept_rate=0.4194 accepted=26 proposed=62 steps=31 drafted_steps=31
+         committed=57 tok_per_step=1.8387 mean_batch=1.0000
+```
+
+**B=1: 1.84 emitted tokens per target forward, 41.9% draft acceptance**
+(0.84 accepted-tokens-per-verify at depth 2, against SGLang's non-simulated CI
+floor of 2.30 for DeepSeek V4 MTP — our draft head is well below the reference).
+`drafted_steps == steps`, so the draft KV primed on every step.
+
+🔴 **At B=8 the engine panics** — `mistralrs-core/src/kv_cache/mod.rs:499`,
+`shape mismatch on dim 1, 18 <> 22`; reproduced from a freshly loaded server as
+`19 <> 23`. Both deltas are exactly 4. The engine reboots and then serves
+nothing further (requests hang, GPU 0%). **No MTP number above B=1 exists**, and
+the per-user-with-MTP question at B=128 is therefore **unmeasurable**, not zero.
+
+### Full-set GSM8K on `qtip2b` — 96.3% ± 1.0 pp [measured]
+
+**1,319 problems** (the whole test set), **0-shot chat**, greedy (t=0), **seed
+161**, 2048-token cap, `--concurrency 16`, served by the same standard
+(non-MTP) server as the sweep above. Main pass **1 h 49 m 51 s**.
+
+| | |
+|---|---|
+| **Accuracy** | **1270 / 1319 = 96.3%**, 95% CI **± 1.0 pp** |
+| degenerate loops / truncated / errors | **0 / 0 / 0**, `GATE[OK]` |
+| mean completion | **157.8 tokens** |
+
+This confirms and tightens session 6's n=100 **96.0% ± 3.8 pp** (measured on the
+`qtip2` rung) — the CI narrows 3.8× and the rung switch costs nothing measurable
+in quality. **The base model card's 90.8 is 8-shot EM**; ours is 0-shot chat, a
+different and harder protocol, so the two are **not directly comparable**.
+
+**The first pass of this run scored 1240/1319 = 94.0% ± 1.3 pp with 34 request
+errors.** 32 of those were requests in flight when the engine died and rebooted
+(below); they carried no model output at all and were re-run against the
+recovered engine to produce the complete set. **94.0% charges every crash to the
+model; 96.3% is the model.** Both are reported because the difference is a
+defect, not a protocol choice.
+
+### 🔴 Two engine panics on the ordinary decode path [measured]
+
+During that eval — no MTP, no speculative decode, `--concurrency 16`,
+2048-token cap — the engine died and rebooted **twice in ~1,300 requests**:
+
+| time | site | message | cost |
+|---|---|---|---|
+| 22:18:42Z | `mistralrs-core/src/kv_cache/mod.rs:498` | `shape mismatch on dim 1, **576 <> 64**` | 16 requests → HTTP 500 |
+| 23:31:41Z | `mistralrs-core/src/engine/mod.rs:428` | `unwrap()` on `SendError { .. }` | 16 requests → HTTP 500 |
+
+576 = V4's KV width (512 + 64); 64 is the RoPE half alone. Both times the engine
+rebooted and then served ~1,200 further problems normally, so the plain path
+recovers where the MTP path does not. **Neither appeared anywhere in the
+505-request sweep** — 64-token completions do not surface them; long generations
+under sustained concurrency do. **This is a serving-reliability defect on the
+default path**, not an MTP-only one.
+
+### FP8 KV storage on CUDA — token-identical [measured]
+
+`ARC_V4_FP8_KV=1` (opt-in since PR #76) had never run on CUDA. Same box, same
+binary, same artifact, same serve flags; the only difference is the environment
+variable, verified present in the serving process via `/proc/<pid>/environ`.
+5 fixed prompts, greedy, 96-token cap, one at a time:
+
+```
+FP8_IDENTICAL=5/5   FP8_VERDICT=TOKEN_IDENTICAL
+completion_tokens both arms: [35, 74, 17, 96, 66]
+```
+
+Every completion byte-identical, every token count equal. **Scope:** 288
+generated tokens, single-stream, short context — it does not test FP8 KV at
+batch, at long context, or through the sliding-window eviction path.
 
 ## Batched serving — the fleet-capacity measurement (session 6) [measured]
 
