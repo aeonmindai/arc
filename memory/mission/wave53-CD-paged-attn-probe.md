@@ -131,6 +131,30 @@ the answer is no, for a reason the code states outright.
 BF16 V. **Neither PR #63 nor PR #72 reaches it.** (Stale-doc note: the comment
 at `:1475` names `append_v_marker`; the function is actually `v4_v_marker`.)
 
+### 4a. And the counterfactual — a 1-wide V would fail LOUDLY, not silently
+
+Worth answering anyway, because "does `reshape_and_cache` cope with a 1-wide V?"
+is the right question to have asked. It does not cope, and it says so.
+`mistralrs-paged-attn/src/cuda/backend/paged_attention.rs:541-544`:
+
+```rust
+let (num_tokens, num_heads, head_size) = k_l.shape().dims3()?;
+if (num_tokens, num_heads, head_size) != v_l.shape().dims3()? {
+    candle::bail!("shape mismatch k {:?} and v {:?}", k_l.shape(), v_l.shape())
+}
+```
+followed by two more shape gates against the cache tensors (`:546-562`). Passing
+V4's `[N, 1, 1]` marker would abort with
+`shape mismatch k [N, 1, 512] and v [N, 1, 1]` before a single byte was written.
+
+⇒ The 1-wide-V hazard is **real in principle, unreachable in practice, and
+fail-loud if it ever becomes reachable.** That is the good outcome: it is not a
+silent-corruption class, so a future optimisation that tried to reuse the marker
+on the paged arm to halve the KV footprint would be stopped at the first token
+rather than degrade quality invisibly. Note the footprint cost is genuine —
+`v = k.copy()` makes paged V4 store **2× the bytes per token** (2,048 B/token/
+layer) that the non-paged arm stores.
+
 ---
 
 ## 5. What the flag COSTS — the part nobody had traced
