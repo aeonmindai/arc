@@ -21,6 +21,7 @@ members = [
     "arc-cuda-graph",
     "arc-bench",
     "arc-profiler",
+    "arc-target",
 ]
 resolver = "2"
 
@@ -187,6 +188,7 @@ hound = "3.5.1"
 apodize = "1.0.0"
 statrs = "0.18.0"
 
+arc-target = { path = "arc-target", version = "0.7.1-alpha.1" }
 mistralrs-core = { path = "mistralrs-core", version = "0.7.1-alpha.1" }
 mistralrs-paged-attn = { path = "mistralrs-paged-attn", version = "0.7.1-alpha.1" }
 mistralrs-quant = { path = "mistralrs-quant", version = "0.7.1-alpha.1" }

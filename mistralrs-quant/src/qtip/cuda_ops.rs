@@ -35,7 +35,19 @@ pub(crate) fn can_use_qtip_cuda(blocks: &Tensor) -> bool {
     if !ffi::HAVE_QTIP_KERNELS {
         return false;
     }
-    matches!(blocks.device(), candle_core::Device::Cuda(_))
+    match blocks.device() {
+        candle_core::Device::Cuda(dev) => {
+            // The first time Arc is about to run its own kernels on a device,
+            // state which of the three specialisations that device selects and
+            // whether this binary actually carries a cubin for it. Diagnostic
+            // only — the answer never changes the decision, so a device with no
+            // cubin still reaches the launch and still fails with the driver's
+            // own error, now preceded by the sentence that explains it.
+            crate::arc_target::log_once(dev);
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Dequantize the QTIP-packed weights into a `[n_rows, in_features]`

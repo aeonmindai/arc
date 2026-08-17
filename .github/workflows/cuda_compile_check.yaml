@@ -277,6 +277,101 @@ jobs:
           cargo test --no-run -p mistralrs-quant --features cuda
 
   # ---------------------------------------------------------------------------
+  # ArcTarget (D16): prove the multi-architecture fat binary is REAL — for free,
+  # on a runner with no GPU of any kind.
+  #
+  # nvcc compiles for an architecture it has never seen hardware for, so this
+  # job can produce and verify Blackwell cubins on ubuntu-latest. That matters
+  # because the failure it guards against is silent: on 2026-08-17 a build on a
+  # live H200 asked for `90,100,103`, exited 0, and emitted only `sm_90a`. The
+  # gate is `mistralrs-quant`'s and `arc-cuda-graph`'s build.rs running
+  # `cuobjdump --list-elf` over their own archives and failing when a requested
+  # arch is absent, so a green job here is evidence the cubins exist rather
+  # than evidence nvcc did not complain.
+  #
+  # `arc-cuda-graph` is the subject because it is the small kernel set (each
+  # extra arch is a full recompile of every .cu). CUDA 12.9 is the floor:
+  # sm_100a needs 12.8, sm_103a needs 12.9.
+  # ---------------------------------------------------------------------------
+  arctarget-multiarch:
+    name: ArcTarget fat binary (sm_80 + sm_90a + sm_100a + sm_103a)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
+
+      - name: Install CUDA toolkit (no driver, no GPU)
+        uses: Jimver/cuda-toolkit@v0.2.35
+        id: cuda-toolkit
+        with:
+          cuda: "12.9.0"
+          method: "local"
+          linux-local-args: '["--toolkit"]'
+
+      - name: CUDA + link-path setup
+        run: |
+          nvcc --version
+          nvcc --list-gpu-code
+          CUDA_ROOT="${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
+          echo "LIBRARY_PATH=${CUDA_ROOT}/lib64/stubs:${CUDA_ROOT}/lib64:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=${CUDA_ROOT}/lib64/stubs:${CUDA_ROOT}/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libssl-dev pkg-config
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: ArcTarget unit tests (arch parsing, coverage, cuobjdump parsing)
+        run: cargo test -p arc-target
+
+      # The gate itself. build.rs fails the build if any requested arch is
+      # missing from the archive it just produced.
+      - name: Build arc-cuda-graph for all four architectures
+        env:
+          ARC_CUDA_ARCHS: "80,90,100,103"
+        run: cargo build -p arc-cuda-graph --lib --features cuda
+
+      # Independent confirmation: do not let the code under test be the only
+      # witness for its own claim.
+      - name: Confirm the cubins independently
+        run: |
+          set -euo pipefail
+          ARCHIVE=$(find target -name libarccudagraph.a | head -1)
+          echo "archive: $ARCHIVE"
+          GOT=$(cuobjdump --list-elf "$ARCHIVE" | grep -o 'sm_[0-9]\+[af]\?' | sort -u | tr '\n' ' ')
+          echo "cubins: $GOT"
+          for want in sm_80 sm_90a sm_100a sm_103a; do
+            echo "$GOT" | grep -qw "$want" || { echo "MISSING $want"; exit 1; }
+          done
+
+      # Negative control: the check must still be able to say no. Without a
+      # working cuobjdump the build has made a claim it cannot back, and must
+      # refuse — if this step's build SUCCEEDS, the gate above proves nothing.
+      - name: Negative control — an unverifiable claim must not build
+        env:
+          ARC_CUDA_ARCHS: "80,90"
+          CUOBJDUMP: /bin/false
+        run: |
+          touch arc-cuda-graph/build.rs
+          if cargo build -p arc-cuda-graph --lib --features cuda 2> negctl.log; then
+            echo "FAIL: built successfully with cuobjdump unavailable"
+            exit 1
+          fi
+          grep -q "ArcTarget" negctl.log || {
+            echo "FAIL: build failed for an unrelated reason"; tail -20 negctl.log; exit 1; }
+          echo "OK: unverifiable arch claim refused to build"
+
+  # ---------------------------------------------------------------------------
   # The Rust half: type-check every `#[cfg(feature = "cuda")]` block in the
   # WORKSPACE, not just the three packages the nvcc jobs build. See the "THE
   # RUST HALF" note at the top of this file for the two holes this closes.
