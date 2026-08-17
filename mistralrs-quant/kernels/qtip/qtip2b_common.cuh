@@ -64,6 +64,30 @@ __device__ __forceinline__ uint32_t q2b_state_from_window(uint32_t win16) {
 }
 
 // ---------------------------------------------------------------------------
+// SEQUENTIAL RUN ADVANCE — the cheap half of the same identity.
+//
+// `q2b_state_from_window` costs ~11 ALU ops (two smem words, two shifts, an
+// OR, __brev, and the adjacent-bit swap). That is the price of decoding an
+// ISOLATED position. Along a CONTIGUOUS run of symbols the original trellis
+// recurrence is far cheaper — one SHF plus one LOP3:
+//
+//     state(t+1) = ((state(t) << 2) | sym[t+1]) & 0xFFFF
+//
+// so a run of R symbols costs `window + (R-1)*advance` instead of
+// `R * window`. At R = 32 that is ~11.3 ops/weight -> ~2 ops/weight of state
+// reconstruction. This matters because the trellis GEMM is ALU-issue-bound on
+// decode, not bandwidth-bound (98/98 gen-2 GEMV variants measured: latency
+// hiding does not pay, per-symbol decode is the ceiling).
+//
+// The window identity is still what SEEDS each run, so runs stay independent:
+// no cross-thread state chain, no warm-up replay. Mirrored and property-tested
+// on the Rust side by `grouped::run_states_2b`.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ uint32_t q2b_advance_state(uint32_t state, uint32_t sym) {
+    return ((state << Q2B_K) | (sym & (Q2B_ALPHABET - 1u))) & Q2B_STATE_MASK;
+}
+
+// ---------------------------------------------------------------------------
 // cp.async helpers (sm_80+). `valid == false` uses the src-size-0 form, which
 // zero-fills the destination without touching the source address — that is
 // what makes out-of-range rows / past-the-end tiles free of tail guards.

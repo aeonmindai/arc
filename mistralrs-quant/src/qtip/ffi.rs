@@ -525,6 +525,17 @@ extern "C" {
     // device and the GEMM grid is sized from the host-side upper bound
     // `max_m_tiles = ceil(n_pairs / TILE_M) + num_experts`. `d_counts` and
     // `d_cursors` must be zero-initialized.
+    // Which m-tile schedule this device's compute capability selects
+    // (`grouped::grouped_tile_m_for_cc` mirrors the rule). Returns a
+    // cudaError_t as i32; on failure the out-params are untouched and the
+    // caller MUST NOT substitute a default -- route and GEMM disagreeing on
+    // `tile_m` mis-bins the tile map and yields wrong numbers, not an error.
+    pub(crate) fn qtip2b_grouped_query_schedule(
+        out_cc_major: *mut i32,
+        out_cc_minor: *mut i32,
+        out_tile_m: *mut i32,
+    ) -> i32;
+
     pub(crate) fn launch_qtip2b_moe_route(
         d_indices: *const u32,
         d_counts: *mut u32,
@@ -539,7 +550,7 @@ extern "C" {
         num_experts: i32,
         tile_m: i32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
-    );
+    ) -> i32;
 
     // W2A16 trellis grouped GEMM over expert-sorted (token, slot) pairs.
     // `d_x_rotated` must already be in the QTIP-rotated frame; `d_y`
@@ -563,7 +574,7 @@ extern "C" {
         max_m_tiles: i32,
         mult: u32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
-    );
+    ) -> i32;
 
     pub(crate) fn launch_qtip2b_grouped_gemm_f16(
         d_packed: *const u8,
@@ -581,5 +592,5 @@ extern "C" {
         max_m_tiles: i32,
         mult: u32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
-    );
+    ) -> i32;
 }

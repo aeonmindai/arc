@@ -313,11 +313,15 @@ fn assert_config_is_measurable(e: usize, batches: &[usize]) -> Result<()> {
     // expert read once per step" — the model behind the floor column — only
     // holds while the average pairs per woken expert stays within one tile.
     let per_expert = max_pairs as f64 / qtip_expected_distinct_experts(max_b, TOPK, e);
-    if per_expert > QTIP_GROUPED_TILE_M as f64 {
+    // D16: the m-tile is arch-dependent (16 on Ampere, 64 on SM90+). Ask the
+    // device -- assuming the Ampere tile on an H200 would bail four times too
+    // early and mis-state the traffic model below.
+    let tile_m = tile_m_for_device()?;
+    if per_expert > tile_m as f64 {
         candle_core::bail!(
-            "at B={max_b} each woken expert takes {per_expert:.1} pairs, past GROUPED_TILE_M=\
-             {QTIP_GROUPED_TILE_M}: the grouped kernel re-stages weights per m-tile beyond that, \
-             so the unique-expert floor column would understate its real traffic."
+            "at B={max_b} each woken expert takes {per_expert:.1} pairs, past this device's \
+             grouped m-tile {tile_m}: the grouped kernel re-stages weights per m-tile beyond \
+             that, so the unique-expert floor column would understate its real traffic."
         );
     }
     Ok(())
@@ -437,6 +441,21 @@ struct Shape {
     calls_per_layer: f64,
 }
 
+/// The grouped kernel's m-tile ON THIS DEVICE (D16: 16 on Ampere, 64 on
+/// SM90+). Every traffic model in this harness is bounded by it, so it is
+/// queried, never assumed -- a wrong tile silently mis-states the grouped
+/// path's advantage.
+fn tile_m_for_device() -> Result<usize> {
+    #[cfg(feature = "cuda")]
+    {
+        mistralrs_quant::qtip_grouped_tile_m()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        Ok(QTIP_GROUPED_TILE_M)
+    }
+}
+
 /// Packed bytes per expert: 2-bit codes (n*k/4) + F32 row scales.
 fn bytes_per_expert(s: &Shape) -> f64 {
     s.n as f64 * s.k as f64 * 0.25 + s.n as f64 * 4.0
@@ -444,7 +463,12 @@ fn bytes_per_expert(s: &Shape) -> f64 {
 
 /// Build the routing draws once per batch size and share them across paths, so
 /// grouped and GEMV are compared on byte-identical traffic.
-fn build_routing(dev: &Device, b: usize, e: usize) -> Result<(Vec<Tensor>, f64, f64, f64)> {
+fn build_routing(
+    dev: &Device,
+    b: usize,
+    e: usize,
+    tile_m: usize,
+) -> Result<(Vec<Tensor>, f64, f64, f64)> {
     let mut rng = Rng(ROUTING_SEED ^ (b as u64).wrapping_mul(0x9E37_79B9));
     let mut sets = Vec::with_capacity(ROUTING_WINDOWS);
     let (mut sum_distinct, mut sum_tiles) = (0.0f64, 0.0f64);
@@ -454,7 +478,7 @@ fn build_routing(dev: &Device, b: usize, e: usize) -> Result<(Vec<Tensor>, f64, 
         sum_distinct += counts.iter().filter(|c| **c > 0).count() as f64;
         sum_tiles += counts
             .iter()
-            .map(|c| c.div_ceil(QTIP_GROUPED_TILE_M) as f64)
+            .map(|c| c.div_ceil(tile_m) as f64)
             .sum::<f64>();
         sets.push(Tensor::from_vec(idx, (b, TOPK), dev)?);
     }
@@ -479,7 +503,7 @@ fn time_curve(
     path.select();
     for &b in batches {
         assert_cap_unchanged(cap_at_startup)?;
-        let (idx_sets, mean_distinct, mean_tiles, pairs) = build_routing(dev, b, e)?;
+        let (idx_sets, mean_distinct, mean_tiles, pairs) = build_routing(dev, b, e, tile_m_for_device()?)?;
         assert_routing_matches_model(b, e, mean_distinct)?;
         let issued_units = if path == Path::Gemv {
             pairs

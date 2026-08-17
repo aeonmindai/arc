@@ -1185,7 +1185,7 @@ pub(crate) fn dequantize_2b_cuda(
         ($T:ty, $launch:expr) => {{
             let out_buf = dev.alloc_zeros::<$T>(num_weights)?;
             let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
-            unsafe {
+            let rc = unsafe {
                 $launch(
                     blocks_ptr as *const _,
                     scales_ptr as *const _,
@@ -1195,9 +1195,18 @@ pub(crate) fn dequantize_2b_cuda(
                     num_symbols as i32,
                     mcg_mult,
                     dev.cuda_stream().cu_stream(),
+                )
+            };
+            drop(out_guard);
+            // Without this the caller receives the `alloc_zeros` buffer as a
+            // shape-correct, error-free, all-zero MoE output (D18).
+            if rc != 0 {
+                candle_core::bail!(
+                    "qtip2b grouped gemm CUDA: kernel launch failed (rc={rc}) on \
+                     sm_{cc_major}{cc_minor} [n_pairs={n_pairs}, n_rows={n_rows}, \
+                     num_symbols={num_symbols}, tile_m={tile_m}]"
                 );
             }
-            drop(out_guard);
             CudaStorage::wrap_cuda_slice(out_buf, dev.clone())
         }};
     }
@@ -1842,7 +1851,7 @@ pub(crate) fn grouped_gemm_2b_cuda(
     indices: &Tensor,
     in_features: usize,
 ) -> Result<Tensor> {
-    use super::grouped::{grouped_max_m_tiles, GROUPED_TILE_K, GROUPED_TILE_M};
+    use super::grouped::{grouped_max_m_tiles, grouped_tile_m_for_cc, GROUPED_TILE_K};
 
     if !ffi::HAVE_QTIP_KERNELS {
         candle_core::bail!("qtip2b grouped gemm CUDA: kernels not compiled in");
@@ -1907,7 +1916,34 @@ pub(crate) fn grouped_gemm_2b_cuda(
         candle_core::bail!("qtip2b grouped gemm CUDA: x_rotated and indices must live on CUDA");
     }
 
-    let max_m_tiles = grouped_max_m_tiles(n_pairs, num_experts);
+    // D16: the m-tile schedule is arch-dependent (the SM90+ kernel's m-tile is
+    // 64, the Ampere kernel's is 16). The routing kernel bins pairs into
+    // m-tiles, so route, grid bound and GEMM must all use the SAME value --
+    // ask the CUDA side which one this device selected rather than assuming.
+    let (cc_major, cc_minor, tile_m) = {
+        let (mut major, mut minor, mut tile_m) = (0i32, 0i32, 0i32);
+        let rc = unsafe {
+            ffi::qtip2b_grouped_query_schedule(&mut major, &mut minor, &mut tile_m)
+        };
+        if rc != 0 {
+            candle_core::bail!(
+                "qtip2b grouped gemm CUDA: could not query the device compute \
+                 capability (rc={rc}); refusing to guess a tile schedule"
+            );
+        }
+        (major, minor, tile_m as usize)
+    };
+    // Mechanical gate against the two definitions drifting apart: a mismatch
+    // here would mis-bin the tile map and produce wrong numbers, not an error.
+    if tile_m != grouped_tile_m_for_cc(cc_major) {
+        candle_core::bail!(
+            "qtip2b grouped gemm CUDA: tile schedule disagreement on sm_{cc_major}{cc_minor} \
+             -- kernel says tile_m={tile_m}, host mirror says {}",
+            grouped_tile_m_for_cc(cc_major)
+        );
+    }
+
+    let max_m_tiles = grouped_max_m_tiles(n_pairs, num_experts, tile_m);
 
     // Routing scratch. `counts` and `cursors` MUST be zeroed (histogram /
     // scatter accumulate into them); the rest is written before being read.
@@ -1970,7 +2006,7 @@ pub(crate) fn grouped_gemm_2b_cuda(
 
     // Route: histogram -> scans + ragged tile map -> grouped scatter. All
     // on the stream; nothing comes back to the host.
-    unsafe {
+    let route_rc = unsafe {
         ffi::launch_qtip2b_moe_route(
             idx_ptr as *const _,
             counts_ptr as *mut _,
@@ -1983,8 +2019,14 @@ pub(crate) fn grouped_gemm_2b_cuda(
             sp_ptr as *mut _,
             n_pairs as i32,
             num_experts as i32,
-            GROUPED_TILE_M as i32,
+            tile_m as i32,
             dev.cuda_stream().cu_stream(),
+        )
+    };
+    if route_rc != 0 {
+        candle_core::bail!(
+            "qtip2b grouped gemm CUDA: MoE routing launch failed (rc={route_rc}, \
+             n_pairs={n_pairs}, num_experts={num_experts}, tile_m={tile_m})"
         );
     }
 
