@@ -22,6 +22,27 @@
 #   147456 / 155648 / 163840 / 172032 in one run = 4096 (hidden_size) x
 #   {18,19,20,21} in BF16 — consecutive integers, one per decode step.
 #
+# THE SHAPE NEEDED, NOT A PRESCRIBED FIX:
+#   This buffer has already been optimised hard — `8bc6af45c` took the xs
+#   compressor state from per-sequence to rolled, 16.6x less memory per
+#   sequence, max batch 68 -> 266. So `172032` is not a naive allocation nobody
+#   thought about; it is what REMAINS after a large win, and whoever owns it
+#   knows constraints this gate cannot see.
+#
+#   So this states a PROPERTY, not an implementation:
+#     the number of BYTES requested from the allocator must not vary with the
+#     token count on the decode path.
+#   How that is achieved is the owner's call — allocate once at a fixed
+#   capacity and narrow for reads; round the request up to a quantum so the
+#   distinct-size set is finite and warmable; or keep the tail in a slab that
+#   is written in place. Each trades memory or complexity against constancy,
+#   and the trade is theirs to make, not this gate's to dictate.
+#
+#   EXPECT IT TO COST SOMETHING. Constant size on a rolled, ragged buffer very
+#   likely means padding to a worst case, i.e. giving back some of that 16.6x.
+#   A requirement that pretends to be free is one the owner is right to
+#   distrust.
+#
 # EXIT CODES
 #   0  proven clean: capture ran, the forward completed, the counter demonstrably
 #      fires, and zero misses occurred after capture began
