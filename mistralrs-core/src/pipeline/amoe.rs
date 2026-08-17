@@ -196,7 +196,7 @@ impl CacheManagerMixin for AnyMoePipeline {
     fn cache(&self) -> &EitherCache {
         unreachable!()
     }
-    fn clone_in_cache(&self, seqs: &mut [&mut Sequence]) {
+    fn clone_in_cache(&self, seqs: &mut [&mut Sequence]) -> candle_core::Result<()> {
         get_mut_arcmutex!(self.target).clone_in_cache(seqs)
     }
     fn clone_out_cache(&self, seqs: &mut [&mut Sequence]) {
