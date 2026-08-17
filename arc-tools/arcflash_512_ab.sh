@@ -19,7 +19,7 @@ set -u
 L=/root/logs/arcflash; mkdir -p $L; S=$L/STATUS.txt; : > $S
 BIN=${BIN:-/root/arc/target/release/mistralrs}
 SRC=/root/models/v4-src; UQFF=/root/models/v4-uqff/qtip2b-0.uqff; PORT=1238
-LO=${LO:-1}; HI=${HI:-8}; TOK=${TOK:-16}
+LO=${LO:-1}; HI=${HI:-8}; TOK=${TOK:-16}; REPS=${REPS:-3}
 export CUDA_HOME=/usr/local/cuda-13.1
 export PATH="$CUDA_HOME/bin:/root/.cargo/bin:$PATH"
 export LD_LIBRARY_PATH="/usr/local/cuda/compat:${LD_LIBRARY_PATH:-}"
@@ -63,12 +63,29 @@ arm(){ # $1 name, $2 env
   for _ in $(seq 1 90); do curl -fsS --max-time 5 localhost:$PORT/health >/dev/null 2>&1 && { ok=1; break; }; kill -0 $PID 2>/dev/null || break; sleep 5; done
   [ $ok = 1 ] || { say "  server never healthy"; tail -3 $log | sed 's/^/    /' | tee -a $S; cleanup; PID=""; return 1; }
 
+  # ⚠️ MODE IS SAMPLED **AFTER** THE BURSTS, NOT BEFORE.
+  # `flash_512_enabled()` is a OnceLock initialised on the FIRST ATTENTION
+  # FORWARD, so the line does not exist until a request has run. Sampling it
+  # right after the health check — which runs no forward — read NONE/NONE and
+  # voided a run whose arms were in fact correctly UNFUSED and FUSED. The
+  # assertion failed safe, but for my bug rather than a real one.
+  local wlo whi r
+  # REPEATS. A single pair cannot distinguish a real effect from run-to-run
+  # noise, and the previous run showed an 11% gap between arms before their
+  # modes were even confirmed. Best-of-N at each point; best-of is the right
+  # statistic for a floor measurement (noise adds time, it does not remove it).
+  wlo=""; whi=""
+  for r in $(seq 1 "$REPS"); do
+    local a b
+    a=$(burst $LO); b=$(burst $HI)
+    say "    rep$r: B=$LO ${a}s  B=$HI ${b}s"
+    wlo=$(python3 -c "print(min([x for x in ['$wlo','$a'] if x]))")
+    whi=$(python3 -c "print(min([x for x in ['$whi','$b'] if x]))")
+  done
+
   local mode="NONE"
   grep -q "sinks path is FUSED"   $log && mode="FUSED"
   grep -q "sinks path is UNFUSED" $log && mode="UNFUSED"
-
-  local wlo whi
-  wlo=$(burst $LO); whi=$(burst $HI)
   # marginal seconds per additional sequence, over TOK tokens each
   local marg
   marg=$(python3 -c "print(f'{($whi-$wlo)/max($HI-$LO,1):.4f}')")
