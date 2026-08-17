@@ -200,6 +200,53 @@ engine's PagedAttention arm (wave29-BC §4b). Both hold.
 
 ---
 
+### 5f. 🔴 THE LANDMINE — the flag makes `try_dedicated_decode` *reachable*, and it computes the wrong model
+
+This one cuts the other way from §5a–§5e and is the most important thing in this
+document. `graph_wrapped_forward` (`pipeline/mod.rs:627-644`) tries the
+**DedicatedDecodePath** — the per-token Candle bypass the rental script calls
+*"the ACTIVE CUDA-graph decode path"* — before falling through to
+`forward_inputs`. `try_dedicated_decode` (`:649-670`) needs **three** things,
+and every one of them is a paged-attention artifact:
+
+```rust
+let paged_meta   = model_inputs.paged_attn_meta.as_ref()?;   // :659
+let cache_engine = metadata.cache_engine.as_ref()?;          // :663
+let cache_config = metadata.cache_config.as_ref()?;          // :664
+```
+
+⇒ **With the flag `false`, V4 bails at `:659` before the cache checks. The
+DedicatedDecodePath has never run on V4 at all.** Turning the flag on is exactly
+what would make it reachable — so the brief's instinct that this flag gates a
+graph path is *right*, just about a different path than the one it named.
+
+**And that is the danger, not the win.** `DecodeConfig`
+(`arc-cuda-graph/src/weights.rs:111-124`) describes a **dense Llama-shaped**
+model: `intermediate_size` (one MLP, no experts), a **fused QKV** buffer
+(`decode_forward.rs`: `qkv: [batch, q_dim + k_dim + v_dim]`, with `q`/`k`/`v`
+aliased into it), plain RoPE, no sliding window, no attention sinks, no second
+key set. V4 is none of those: one fused `wkv` producing a single 512-wide MQA
+head, grouped `wo_a`/`wo_b`, a 256-expert MoE, mHC 4-D residual, and
+sliding-window + sink + CSA/HCA attention. The construction site
+(`normal.rs:1250-1256`) even infers `intermediate_size` by assuming *"gate_proj
+is at index 1 + 4 (5th projection in first layer: q,k,v,o,gate)"* — V4's first
+layer is `wq_a, wq_b, wkv, wo_a, wo_b`, so index 5 is not a gate projection.
+
+Two things keep it from firing today, and both are accidents:
+1. `_decode_weights` extraction fails on V4 anyway — session 15 logged
+   `Decode path extraction failed: tensor_device_ptr requires CUDA tensor`,
+   leaving `dedicated_decode: None`.
+2. `ARC_NO_DEDICATED_DECODE=1`, which an 80 GB card needs regardless
+   (`normal.rs:1228-1233`).
+
+**⇒ If anyone ever flips this flag on for real AND the extraction starts
+succeeding, V4 decode silently routes into a dense-transformer kernel stack and
+produces garbage with no error.** That is a far better reason for caution than
+either objection on record. The A/B below sets `ARC_NO_DEDICATED_DECODE=1` in
+**both** legs precisely so this cannot confound the paging measurement.
+
+---
+
 ## 6. What shipped
 
 `mistralrs-core/src/pipeline/loaders/normal_loaders.rs` only:
@@ -233,9 +280,70 @@ the tests; it is addressed by §8.
 
 ---
 
+## 7b. PRE-REGISTERED PREDICTION — written before the box finished
+
+Recorded here, timestamped by the commit, so §8 can confirm or refute it rather
+than rationalise whatever came back.
+
+**Prediction: prompt 0 matches; prompts 1 and 2 diverge in the ON run.**
+
+Mechanism: V4 keeps the compressor-input `xs` history in extra `NormalCache`
+slots at index `num_hidden_layers + j` (`deepseek4.rs:3401-3405`), and the doc
+on that field states the dependency outright — *"The history rides the same
+per-sequence clone_in/clone_out machinery as the KV entries."* Under
+`SchedulerOutput::PagedAttention` (`engine/mod.rs:556+`) there is **no
+`CacheInstruction::In`/`Out` and no NormalCache reset** — I read the whole arm.
+The paged KV itself is safe (per-sequence block tables), but the `xs` slots are
+one process-wide buffer that is never cleared between requests. Request *n* > 0
+therefore starts with request *n−1*'s history still in the slot.
+
+**What would refute it:** all three prompts identical in the ON run. That would
+mean something else clears those slots, and §5e / wave29-BC §4b are both wrong
+about the mechanism.
+
+**What would confirm it:** prompt 0 identical, prompts 1–2 not. Note this is a
+*cross-request* leak at b=1 — strictly weaker than, and independent of, the
+`bs > 1` varlen-pack corruption `v4_paged_dispatch_precheck` already refuses.
+
+---
+
 ## 8. HARDWARE
 
-<!-- filled in below -->
+**Box:** Runcrate `arc-w53-paged`, **A100 80GB PCIe**, 28 cores, 700 GB
+`/ephemeral`, **$1.49/hr**. Self-destruct armed (`sleep 10800; shutdown -h now`,
+`ARMED` confirmed) before any build, per the standing rule.
+
+**Method:** one unattended script (`w53_probe.sh`, in this directory), polled by
+one on-box log read every 5 min. Both runs: `--max-seqs 1`, `--prefix-cache-n 0`,
+`--max-seq-len 4096`, `ARC_NO_DEDICATED_DECODE=1` (the extraction OOMs at 80 GB
+with a ~74 GB artifact — `normal.rs:1228-1233`), `temperature 0.0` (greedy /
+argmax), same 3 prompts, 48 tokens each.
+* **OFF** — `--paged-attn off`, `ARC_V4_PAGED_ATTN` unset.
+* **ON**  — `--paged-attn on --pa-cache-type auto --pa-memory-mb 2048`,
+  `ARC_V4_PAGED_ATTN=1`.
+
+`--pa-cache-type auto` is pinned deliberately: the CLI default is TurboQuant
+(K4/V3, 3.5-bit), which would quantise the paged KV and break token identity for
+a reason that has nothing to do with paging. (V4's `head_dim=512` would in fact
+auto-fall-back to `Auto` anyway — `paged_attention/mod.rs:306-308` — but pinning
+it removes the question.)
+
+**Known margin risk, stated before the result.** Session 15 measured qtip2b
+**resident at 78,801 MiB** after load on a 141 GB H200. The A100 has 81,920 MiB
+total, so the OFF run has ≈2.6 GB of headroom and the ON run spends up to
+another 2 GB of that on paged KV blocks. If the ON run OOMs where the OFF run
+did not, that is a **box-size** result, not a verdict on the arm, and must be
+re-run at `--pa-memory-mb 512` before it means anything. (b=1 needs far less:
+2·1·512·2 B · 43 layers = **88 KB/token**, so 4096 tokens of context is 360 MB.)
+
+**Pre-existing instability to not mis-attribute.** Session 15 saw the *plain,
+non-paged* qtip2b server panic twice mid-run with
+`kv_cache/mod.rs:498:54: shape mismatch on dim 1, 576 <> 64`, rebooting the
+engine and turning 34 GSM8K items into `finish_reason: "error"`. A crash of that
+signature in **either** leg is the known bug, not this flag.
+
+<!-- RESULT -->
+
 
 ---
 
