@@ -1316,7 +1316,28 @@ impl Loader for NormalLoader {
                     Some(w)
                 }
                 Err(e) => {
-                    tracing::warn!("Decode path extraction failed: {e}");
+                    // Two very different things land here and they must not read
+                    // the same. A refusal from the architecture guard is the
+                    // system working: the dense decode path cannot describe this
+                    // model, so it declines rather than computing the wrong one.
+                    // Anything else is a genuine fault.
+                    let refused = e
+                        .to_string()
+                        .contains("dedicated decode path does not support this architecture");
+                    if refused {
+                        tracing::info!("Dedicated decode path declined (by design): {e}");
+                        arc_profiler::mark_unreachable(
+                            "decode.dedicated",
+                            "the dense decode path refused this architecture; decode runs on the \
+                             standard Candle path",
+                            "normal.rs:1318",
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Decode path extraction FAILED (not a refusal — this is a fault): {e}. \
+                             Decode falls back to the standard Candle path."
+                        );
+                    }
                     None
                 }
             }
@@ -1730,11 +1751,29 @@ impl Pipeline for NormalPipeline {
                                 cap_result
                             } else if runner.has_graph(bs) {
                                 let t = std::time::Instant::now();
-                                match runner.replay(bs) {
-                                    Ok(_) => tracing::info!(
-                                        "ARC capture: REPLAY latency = {:?} (output discarded; correctness pending 2b/2c)",
-                                        t.elapsed()
-                                    ),
+                                // Hoisted out of the `match` scrutinee so the
+                                // mutable borrow of `runner` is unambiguously
+                                // over before `status_line()` is read below.
+                                let replayed = runner.replay(bs);
+                                match replayed {
+                                    Ok(_) => {
+                                        let dt = t.elapsed();
+                                        // The replayed logits are THROWN AWAY; the eager
+                                        // forward below produces this step's real output.
+                                        // Replay correctness needs static input buffers (2b)
+                                        // and a device-indexed KV write/read (2c), neither of
+                                        // which exists. So this is a latency measurement and
+                                        // nothing else — no token Arc has ever emitted came
+                                        // from a graph replay. Spelled out on every line,
+                                        // because a bare "REPLAY latency" reads like a working
+                                        // decode path in a log skim.
+                                        tracing::info!(
+                                            "ARC capture: REPLAY latency = {dt:?} — MEASUREMENT ONLY, \
+                                             output discarded, eager forward supplies this step's logits \
+                                             (replay correctness pending 2b/2c). {}",
+                                            runner.status_line()
+                                        );
+                                    }
                                     Err(e) => {
                                         tracing::warn!("ARC capture: replay failed: {e}")
                                     }

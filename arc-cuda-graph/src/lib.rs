@@ -67,11 +67,29 @@ pub fn try_init_graph_runner(device: &candle_core::Device) -> Option<CudaGraphRu
     // populate the cache so the captured forward is allocation-free (RUN-161).
     match CudaGraphRunner::new(device, 4) {
         Ok(runner) => {
-            tracing::info!("CUDA graph runner initialized");
+            // D18. The old line here was `info!("CUDA graph runner initialized")`,
+            // emitted unconditionally — including immediately after the runner
+            // had logged that capture was disabled and it would do nothing. A
+            // success message that a dead subsystem also prints is worse than
+            // no message: it reads as confirmation. Report the state, not the
+            // constructor's return.
+            if runner.capture_possible() {
+                tracing::info!(
+                    "ArcGraph: runner initialized on a capturable stream — capture WILL be \
+                     attempted after warmup. {}",
+                    runner.status_line()
+                );
+            } else {
+                tracing::warn!(
+                    "ArcGraph: runner initialized but INERT — it will not capture or replay \
+                     anything (see the preceding line for why). {}",
+                    runner.status_line()
+                );
+            }
             Some(runner)
         }
         Err(e) => {
-            tracing::warn!("CUDA graph runner unavailable: {e}");
+            tracing::warn!("ArcGraph: runner unavailable, decode runs eagerly: {e}");
             None
         }
     }

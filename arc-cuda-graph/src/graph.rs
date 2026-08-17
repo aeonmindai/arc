@@ -46,6 +46,11 @@ pub struct CudaGraphRunner {
     graphs: HashMap<usize, CapturedGraph>,
     enabled: bool,
     warmup_remaining: u32,
+    /// Successful `replay()` calls. Together with `graphs.len()` this is the
+    /// only honest answer to "did ArcGraph do anything this run" — see
+    /// [`CudaGraphRunner::status_line`]. A runner that constructed, logged
+    /// "initialized", and then did nothing reports `captured=0 replayed=0`.
+    replays: u64,
     /// RUN-161: the deferred-free warmup pass has run. After the eager warmups
     /// (which only fill the alloc cache to peak-live), exactly one forward must
     /// run with the device in capture mode so the cache grows to the FULL
@@ -69,13 +74,37 @@ impl CudaGraphRunner {
         let stream = cuda_dev.cuda_stream().cu_stream();
 
         if stream.is_null() {
-            tracing::warn!("CUDA graph: NULL stream, capture disabled");
+            // Not a bug in this crate, and not a lost stream: candle's
+            // `BackendDevice::new` binds `CudaContext::default_stream()`, which
+            // is the legacy default stream (handle 0). `cuStreamBeginCapture`
+            // rejects it by CUDA's own rules, so capture is genuinely
+            // impossible on this device — permanently, for this process.
+            //
+            // The remedy is a *launch-time* decision, so name it here: the
+            // operator reading this line is the only one who can act on it.
+            tracing::warn!(
+                "ArcGraph INERT: candle is on the legacy default (NULL) stream, which CUDA \
+                 forbids capturing. No CUDA graph will be captured or replayed for the life of \
+                 this process, and decode will run entirely eagerly. To enable capture, restart \
+                 with ARC_CAPTURE_STREAM=1 (server_builder init_device -> \
+                 Device::new_cuda_with_stream, a real capturable stream). Note capture also \
+                 requires ARC_V4_CAPTURE_PROBE=1 and ARC_CANDLE_ALLOC_CACHE=1; all three are \
+                 unset by default."
+            );
+            arc_profiler::mark_unreachable(
+                "cuda_graph.capture",
+                "candle is on the legacy default (NULL) stream; cuStreamBeginCapture is refused, \
+                 so no graph is captured or replayed. Set ARC_CAPTURE_STREAM=1 to bind a \
+                 capturable stream.",
+                "arc-cuda-graph/src/graph.rs:71",
+            );
             return Ok(Self {
                 stream,
                 device_ordinal: 0,
                 graphs: HashMap::new(),
                 enabled: false,
                 warmup_remaining: 0,
+                replays: 0,
                 deferred_pass_done: false,
             });
         }
@@ -94,12 +123,49 @@ impl CudaGraphRunner {
             graphs: HashMap::new(),
             enabled: true,
             warmup_remaining: warmup_steps,
+            replays: 0,
             deferred_pass_done: false,
         })
     }
 
     pub fn is_enabled(&self) -> bool {
         self.enabled && self.warmup_remaining == 0
+    }
+
+    /// Whether capture is physically possible on this device — i.e. the stream
+    /// is capturable and no capture attempt has failed and latched `enabled`
+    /// off.
+    ///
+    /// Distinct from [`is_enabled`](Self::is_enabled), which additionally
+    /// requires warmup to have finished. Callers reporting *status* want this
+    /// one; callers deciding whether to capture *now* want `is_enabled`.
+    pub fn capture_possible(&self) -> bool {
+        self.enabled
+    }
+
+    /// Graphs actually captured and instantiated, keyed by batch size.
+    pub fn graphs_captured(&self) -> usize {
+        self.graphs.len()
+    }
+
+    /// Successful graph replays so far.
+    pub fn replays(&self) -> u64 {
+        self.replays
+    }
+
+    /// The one line that distinguishes a working ArcGraph from an inert one.
+    ///
+    /// D18: "CUDA graph runner initialized" is emitted by a runner that will
+    /// never capture anything, so it carries no information. This does:
+    /// `captured=0 replayed=0` is a subsystem that did nothing, and says so in
+    /// terms nobody can mistake for success.
+    pub fn status_line(&self) -> String {
+        format!(
+            "ARCGRAPH STATUS: capture_possible={} captured={} replayed={}",
+            self.enabled,
+            self.graphs.len(),
+            self.replays
+        )
     }
 
     /// Returns `true` exactly once, after warmup completes and before the graph
@@ -133,18 +199,37 @@ impl CudaGraphRunner {
     }
 
     /// Replay a previously captured graph. Returns the output tensor.
-    pub fn replay(&self, batch_size: usize) -> candle_core::Result<Tensor> {
+    ///
+    /// Takes `&mut self` so a successful replay is counted — see
+    /// [`status_line`](Self::status_line). Without the count there is no way to
+    /// tell a runner that replayed from one that only initialised.
+    pub fn replay(&mut self, batch_size: usize) -> candle_core::Result<Tensor> {
         let captured = self.graphs.get(&batch_size).ok_or_else(|| {
             candle_core::Error::Msg(format!("No graph for batch_size={batch_size}"))
         })?;
-        unsafe {
+        let sync = unsafe {
             let s = cuGraphLaunch(captured.exec, self.stream);
             if s != CUDA_SUCCESS {
                 candle_core::bail!("cuGraphLaunch failed: {s}");
             }
-            cudaStreamSynchronize(self.stream);
+            // A fault DURING graph execution is asynchronous: the launch above
+            // returns SUCCESS and only the sync reports it. Discarding this
+            // return (the previous behaviour) turned an illegal access into a
+            // silently poisoned context and an output tensor full of whatever
+            // was in the buffer. `end_capture_and_cache` already checks its
+            // first launch this way; replay must too, or every replay after the
+            // first is unchecked.
+            cudaStreamSynchronize(self.stream)
+        };
+        if sync != CUDA_SUCCESS {
+            candle_core::bail!(
+                "graph replay sync failed (async fault during graph execution, \
+                 batch_size={batch_size}): cudaError {sync}"
+            );
         }
-        Ok(captured.output.clone())
+        let out = captured.output.clone();
+        self.replays += 1;
+        Ok(out)
     }
 
     /// Create a private memory pool for graph capture.
@@ -348,8 +433,6 @@ impl CudaGraphRunner {
             );
         }
 
-        tracing::info!("CUDA graph: captured + launched for batch_size={batch_size}");
-
         let result = output.clone();
         self.graphs.insert(
             batch_size,
@@ -358,6 +441,10 @@ impl CudaGraphRunner {
                 output,
                 pool: graph_pool,
             },
+        );
+        tracing::info!(
+            "CUDA graph: captured + launched for batch_size={batch_size} — {}",
+            self.status_line()
         );
         Ok(result)
     }

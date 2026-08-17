@@ -217,6 +217,7 @@ name = "arc-cuda-graph"
 version = "0.7.1-alpha.1"
 dependencies = [
  "anyhow",
+ "arc-profiler",
  "candle-core",
  "cudaforge",
  "half",
