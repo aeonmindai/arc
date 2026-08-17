@@ -128,8 +128,29 @@ impl KvCache {
         let v = v.contiguous()?;
         match self {
             Self::Normal { k: kc, v: vc } => {
-                let out_k = kc.append_graph(&k, position, read_capacity)?;
-                let out_v = vc.append_graph(&v, position, read_capacity)?;
+                // Name the half on failure. `write_kv_inplace`'s error prints
+                // both shapes but not WHICH cache it was writing, and the two
+                // halves are deliberately different widths here: V4 stores a
+                // real K (head_dim wide) against a 1-wide V marker
+                // (V4_V_MARKER_WIDTH). A bare "src [1,1,1,1] incompatible with
+                // cache [1,1,512,512]" is therefore ambiguous — it reads as a
+                // marker hitting a 512-wide buffer, but it is equally
+                // consistent with the K write receiving a degenerate src. That
+                // ambiguity cost a wrong diagnosis once; do not pay it twice.
+                let out_k = kc.append_graph(&k, position, read_capacity).map_err(|e| {
+                    candle_core::Error::Msg(format!(
+                        "append_graph K half failed (k={:?}, v={:?}, read_capacity={read_capacity}): {e}",
+                        k.dims(),
+                        v.dims()
+                    ))
+                })?;
+                let out_v = vc.append_graph(&v, position, read_capacity).map_err(|e| {
+                    candle_core::Error::Msg(format!(
+                        "append_graph V half failed (k={:?}, v={:?}, read_capacity={read_capacity}): {e}",
+                        k.dims(),
+                        v.dims()
+                    ))
+                })?;
                 Ok((out_k, out_v))
             }
             _ => {
