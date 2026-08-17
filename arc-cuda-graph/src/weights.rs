@@ -162,7 +162,7 @@ pub const fn device_ptr_supports_dtype(dt: candle_core::DType) -> bool {
 /// Extract raw u64 device pointer from a Candle tensor (any dtype).
 ///
 /// The dtype dispatch below must stay in lockstep with
-/// [`device_ptr_supports_dtype`] — `device_ptr_dispatch_matches_predicate`
+/// [`device_ptr_supports_dtype`] — `device_ptr_covers_every_storable_dtype`
 /// in this module's tests enforces it.
 #[cfg(feature = "cuda")]
 pub fn tensor_device_ptr(tensor: &Tensor) -> candle_core::Result<u64> {

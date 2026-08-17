@@ -229,13 +229,14 @@ mod cuda_impl {
     /// scores tensor those functions allocate anyway. The cap below is a
     /// backstop in case a future caller varies the key.
     fn seq_lens_full(device: &Device, n_rows: usize, len: usize) -> Result<Tensor> {
-        /// Enough for the sampler's single key plus a handful of concurrent
-        /// shapes; small enough that a growing-key caller can never leak.
+        // Enough for the sampler's single key plus a handful of concurrent
+        // shapes; small enough that a growing-key caller can never leak.
         const CACHE_CAP: usize = 8;
         use std::cell::RefCell;
+        // Named so the `thread_local!` type does not trip `clippy::type_complexity`.
+        type SeqLensEntry = (candle_core::DeviceLocation, usize, usize, Tensor);
         thread_local! {
-            static CACHE: RefCell<Vec<(candle_core::DeviceLocation, usize, usize, Tensor)>> =
-                const { RefCell::new(Vec::new()) };
+            static CACHE: RefCell<Vec<SeqLensEntry>> = const { RefCell::new(Vec::new()) };
         }
         let loc = device.location();
         if let Some(hit) = CACHE.with(|c| {
