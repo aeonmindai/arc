@@ -668,7 +668,6 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     // Skip for shared kv cache layers in models like gemma3n
                     continue;
                 };
-                let offset = i * one_k[0];
                 let src_k = match k_slack {
                     Some(d) => pad_slack(&src.k, d, one_k[d])?,
                     None => src.k.clone(),
@@ -677,8 +676,12 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     Some(d) => pad_slack(&src.v, d, one_v[d])?,
                     None => src.v.clone(),
                 };
-                batch_k.slice_set(&src_k, 0, offset)?;
-                batch_v.slice_set(&src_v, 0, offset)?;
+                // Each side is offset by its OWN batch dim. They are always
+                // equal in practice (both sides of a slot describe the same
+                // sequences), but the old code reused the K offset for V, which
+                // would have silently mis-placed the V half if they ever were not.
+                batch_k.slice_set(&src_k, 0, i * one_k[0])?;
+                batch_v.slice_set(&src_v, 0, i * one_v[0])?;
             }
             new_k_cache.push(Some(batch_k));
             new_v_cache.push(Some(batch_v));
