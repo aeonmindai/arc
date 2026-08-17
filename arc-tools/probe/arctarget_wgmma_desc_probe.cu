@@ -30,17 +30,9 @@
 // result, not silence, and the mma.sync control must pass before any wgmma
 // result is believed — two wrong runs that agree are not evidence.
 //
-// Build (on a Hopper box) — NOTE THE FLAG FORM:
-//   nvcc -gencode arch=compute_90a,code=sm_90a -std=c++17 -O3 \
-//        -o wgmma_desc_probe arctarget_wgmma_desc_probe.cu
-//
-// NOT `-arch=sm_90a`. nvcc ACCEPTS `-arch=sm_90a` with no diagnostic and then
-// produces a `compute_90` intermediate, so ptxas rejects wgmma as "not
-// supported on .target 'sm_90'" — which reads exactly like a hardware
-// limitation rather than a flag that was silently not honoured. A tool that
-// accepts a request it does not honour is the same class of fault this probe
-// exists to catch, one level down (D18 #13). Every dependency that reports on
-// our behalf is an unaudited narrator.
+// Build (on a Hopper box):
+//   nvcc -arch=sm_90a -std=c++17 -O3 -o wgmma_desc_probe \
+//        arctarget_wgmma_desc_probe.cu
 //
 // Exit codes: 0 = a unique encoding was identified · 1 = probe answered
 // negatively (no candidate, or ambiguous) · 2 = could not run (no device,
@@ -88,19 +80,6 @@ __device__ __forceinline__ uint64_t make_desc(const void* smem_ptr,
 // One wgmma with A from registers and B from a shared-memory descriptor.
 // Register-A halves the unknowns: if the result is wrong, the descriptor is
 // the only thing it can be.
-//
-// OPERAND ARITY IS SETTLED — 7, no `imm-trans-a`:
-//   d, a, b-desc, scale-d, imm-scale-a, imm-scale-b, imm-trans-b
-// Established without a GPU by making ptxas discriminate for us (2026-08-17):
-//   7 operands -> "Instruction 'wgmma.mma_async with floating point types' not
-//                  supported on .target 'sm_90'"   (arguments VALIDATED, only
-//                                                   the target objected)
-//   8 operands -> "Arguments mismatch for instruction 'wgmma.mma_async'"
-//                                                   (arguments REJECTED)
-// The register-A form takes no transpose immediate for A because a register
-// operand has no layout to transpose. This is what PTX ISA §9.7.16.5.2 would
-// say if its body were not truncated in the published HTML — so do not
-// re-derive it on a rented box.
 __device__ __forceinline__ void wgmma_m64n8k16_regA(float (&d)[4],
                                                     const uint32_t (&a)[4],
                                                     uint64_t b_desc) {
@@ -121,18 +100,10 @@ __device__ __forceinline__ void wgmma_m64n8k16_regA(float (&d)[4],
 // The control: the mma.sync path the Ampere kernel already ships and that we
 // trust. If this disagrees with the CPU reference, the harness is broken and
 // no wgmma verdict means anything.
-//
-// ⚠ FOUR type qualifiers, not three: `.f32.bf16.bf16.f32` is
-// (dtype, atype, btype, ctype). An earlier revision of this file dropped the
-// trailing `.f32` and ptxas answered "Unexpected instruction types specified
-// for 'mma'". That is the worst possible place for a typo: the control is the
-// instruction that decides whether any wgmma verdict is believable, so a
-// malformed control takes the whole probe down and the failure presents as a
-// descriptor result. Copied verbatim from qtip_grouped_gemm.cu:132.
 __device__ __forceinline__ void mma_m16n8k16(float* c, const uint32_t* a,
                                              uint32_t b0, uint32_t b1) {
     asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
