@@ -30,6 +30,17 @@
 #       => PROOF capture happened. captured>=1 is the only acceptable evidence.
 #          "runner initialized" is NOT evidence (D18).
 #   N4  leg A baseline decode tok/s at b=1 (steady-state, includes sampling)
+#   N5  THE FWD/HOST SPLIT, which V4 has never had. FACTS.md:588 records that
+#       the fwd/host split log exists only on the PagedAttention branch, so
+#       "V4's actual path logs no fwd/host split at all." N1 (the sync'd eager
+#       forward) against 1000/N4 ms (the full step) gives it directly:
+#           forward_fraction = T_eager / (1000 / tok_s)
+#       This matters MORE than the ratio. FACTS records eight host costs
+#       (engine/mod.rs, sampling.rs, utils/mod.rs, sequence.rs) that sit
+#       OUTSIDE the forward and that CUDA graphs cannot touch. If the forward
+#       is a small fraction of the step, then even a total win on N2/N1 moves
+#       end-to-end throughput very little, and graphs are the wrong lever
+#       regardless of how good the ratio looks.
 #
 # METHOD NOTE, STATED BEFORE THE RESULT
 # -------------------------------------
@@ -46,6 +57,8 @@ set -u
 LOGDIR="${LOGDIR:-/root/logs/arcgraph}"
 REPO="${REPO:-/root/arc}"
 BRANCH="${BRANCH:-arcgraph/capture-truth}"
+# Private worktree so we never disturb the shared checkout at $REPO.
+WORKTREE="${WORKTREE:-/root/arc-arcgraph}"
 SRC="${SRC:-/root/models/v4-src}"
 UQFF="${UQFF:-/root/models/v4-uqff/qtip2b-0.uqff}"
 PORT="${PORT:-1234}"
@@ -75,7 +88,8 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-cd "$REPO" || env_fail "repo $REPO absent"
+[ -d "$REPO" ] || env_fail "repo $REPO absent"
+cd "$REPO" || env_fail "cannot enter $REPO"
 
 # --------------------------------------------------------------------------
 # 0. Environment — MANDATORY. Driver caps at CUDA 13.0, only toolkit is 13.1.
@@ -115,9 +129,27 @@ say "preflight passed"
 #    NEVER cudnn (-62% decode on V4, banned in CLAUDE.md).
 # --------------------------------------------------------------------------
 step "gate 2/3: build $BRANCH"
-git fetch origin "$BRANCH" >>"$LOGDIR/build.log" 2>&1 || env_fail "git fetch $BRANCH failed"
-git checkout -q "FETCH_HEAD" >>"$LOGDIR/build.log" 2>&1 || env_fail "git checkout $BRANCH failed"
+# THE BOX IS SHARED WITH THREE OTHER CHAINS. Do NOT check out into /root/arc —
+# it currently sits on another chain's detached HEAD with uncommitted edits, and
+# a checkout there would silently destroy their working state. Use a private
+# worktree instead. CARGO_TARGET_DIR is shared with /root/arc on purpose: cargo
+# locks it (so concurrent builds serialise rather than corrupt) and dependency
+# artifacts — which are almost all of the build time — are reused, turning a
+# ~11 min cold build into an incremental one.
+git -C "$REPO" fetch -q origin "$BRANCH" >>"$LOGDIR/build.log" 2>&1 \
+    || env_fail "git fetch $BRANCH failed"
+if [ ! -d "$WORKTREE/.git" ] && [ ! -f "$WORKTREE/.git" ]; then
+    git -C "$REPO" worktree add --detach "$WORKTREE" FETCH_HEAD >>"$LOGDIR/build.log" 2>&1 \
+        || env_fail "could not create worktree at $WORKTREE"
+else
+    git -C "$WORKTREE" checkout -q --detach FETCH_HEAD >>"$LOGDIR/build.log" 2>&1 \
+        || env_fail "could not update worktree at $WORKTREE"
+fi
+cd "$WORKTREE" || env_fail "worktree $WORKTREE unusable"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO/target}"
+say "worktree = $WORKTREE (host repo $REPO left untouched)"
 say "HEAD = $(git log --oneline -1)"
+say "CARGO_TARGET_DIR = $CARGO_TARGET_DIR"
 FEATURES="cuda flash-attn"
 case "$FEATURES" in *cudnn*) env_fail "cudnn present; banned";; esac
 if ! cargo build --release --features "$FEATURES" -p arc-cli >>"$LOGDIR/build.log" 2>&1; then
@@ -125,7 +157,7 @@ if ! cargo build --release --features "$FEATURES" -p arc-cli >>"$LOGDIR/build.lo
     grep -m 40 -A 6 "^error" "$LOGDIR/build.log" | tee -a "$STATUS"
     env_fail "build failed; full log $LOGDIR/build.log"
 fi
-BIN="$REPO/target/release/mistralrs"
+BIN="$CARGO_TARGET_DIR/release/mistralrs"
 [ -x "$BIN" ] || env_fail "$BIN missing"
 say "build ok"
 
