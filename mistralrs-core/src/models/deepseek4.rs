@@ -1357,6 +1357,7 @@ impl Attention {
         // the token↔row mapping so the engine's token-unit truncations
         // (prefix cacher, MTP verify rollback, speculative rejection) stay
         // correct, and refuses — loudly — the ones it cannot resume.
+        let _prof_comp = arc_profiler::device_span("compressor_advance");
         let compressed_rows = match xs_hist_cache {
             Some(hist) => {
                 if seqlen_offsets.iter().all(|&o| o == 0) {
@@ -1394,9 +1395,13 @@ impl Attention {
             // the tokens in hand, exactly as before.
             None => self.compress_prefix(xs)?,
         };
+        drop(_prof_comp);
         // 1. Q projection (LoRA). [B, T, hidden] → [B, T, n_heads*head_dim]
         //    → reshape to [B, n_heads, T, head_dim]. Audit §3.
-        let q = timed_mla(0, &mdev, || self.q.forward(xs))?;
+        let q = {
+            let _s = arc_profiler::device_span("q_proj");
+            timed_mla(0, &mdev, || self.q.forward(xs))?
+        };
         v4_nan_dbg(&q, "attn.q_proj");
         let q = q
             .reshape((bs, seq_len, self.num_attention_heads, head_dim))?
@@ -1408,6 +1413,7 @@ impl Attention {
         // Missing it leaves Q ~30x too small -> near-uniform attention scores
         // -> the model cannot attend -> word-salad output (RUN-161).
         let q = {
+            let _s = arc_profiler::device_span("q_rmsnorm");
             let inv_rms = q
                 .sqr()?
                 .mean_keepdim(candle_core::D::Minus1)?
@@ -1422,9 +1428,15 @@ impl Attention {
         // 2. K/V projection: single fused wkv. [B, T, hidden] → [B, T,
         //    head_dim] → kv_norm → reshape to [B, num_kv_heads=1, T,
         //    head_dim]. Audit §0 + §3.
-        let kv_raw = timed_mla(1, &mdev, || self.wkv.forward_autocast(xs))?;
+        let kv_raw = {
+            let _s = arc_profiler::device_span("kv_proj");
+            timed_mla(1, &mdev, || self.wkv.forward_autocast(xs))?
+        };
         v4_nan_dbg(&kv_raw, "attn.wkv");
-        let kv_normed = self.kv_norm.forward(&kv_raw)?;
+        let kv_normed = {
+            let _s = arc_profiler::device_span("kv_norm");
+            self.kv_norm.forward(&kv_raw)?
+        };
         v4_nan_dbg(&kv_normed, "attn.kv_norm");
         let k = kv_normed
             .reshape((bs, seq_len, self.num_kv_heads, head_dim))?
@@ -1433,7 +1445,10 @@ impl Attention {
 
         // 3. RoPE applied in-place to the last qk_rope_head_dim dims of
         //    each Q-head and K-head's head_dim-vector. Audit §0 + §3.
-        let (q, k) = self.apply_rope_inplace(&q, &k, seqlen_offsets)?;
+        let (q, k) = {
+            let _s = arc_profiler::device_span("rope");
+            self.apply_rope_inplace(&q, &k, seqlen_offsets)?
+        };
         v4_nan_dbg(&q, "attn.q_rope");
         v4_nan_dbg(&k, "attn.k_rope");
         v4_trace_dump(self.dbg_layer_idx, &q, "20_q_rope");
@@ -1449,13 +1464,19 @@ impl Attention {
         // (`dsv4_kv_fp8`), which is BIT-EXACT with the BF16 tensor built on the
         // next line — the round trip has already happened by then — at 590
         // B/token/layer instead of 1026.
-        let k_packed = super::dsv4_kv_fp8::quantize_k(
-            &k,
-            self.cfg.qk_rope_head_dim,
-            super::dsv4_kv_fp8::KvQuantMode::from_env(),
-        )?;
+        let k_packed = {
+            let _s = arc_profiler::device_span("kv_fp8_quant");
+            super::dsv4_kv_fp8::quantize_k(
+                &k,
+                self.cfg.qk_rope_head_dim,
+                super::dsv4_kv_fp8::KvQuantMode::from_env(),
+            )?
+        };
         let k = match &k_packed {
-            Some(packed) => packed.dequant(k.dtype())?,
+            Some(packed) => {
+                let _s = arc_profiler::device_span("kv_fp8_dequant");
+                packed.dequant(k.dtype())?
+            }
             None => k,
         };
         v4_stat_dbg(&k, "attn.k_actquant");
@@ -1528,11 +1549,14 @@ impl Attention {
         // branch off so attention degenerates to pure sliding-window. Used to
         // isolate whether long-ctx sustained-generation degradation lives in
         // the compressed branch (coherent window-only ⇒ yes) vs elsewhere.
-        let compressed_kv = match compressed_rows {
-            Some(rows) if std::env::var_os("ARC_V4_WINDOW_ONLY").is_none() => {
-                Some(self.compressed_kv_from_rows(&rows)?)
+        let compressed_kv = {
+            let _s = arc_profiler::device_span("compressed_kv_build");
+            match compressed_rows {
+                Some(rows) if std::env::var_os("ARC_V4_WINDOW_ONLY").is_none() => {
+                    Some(self.compressed_kv_from_rows(&rows)?)
+                }
+                _ => None,
             }
-            _ => None,
         };
         let mut attn_out = match &self.paged_attn {
             Some(paged_attn) => match metadata {
@@ -1620,11 +1644,14 @@ impl Attention {
             None => {
                 // FP8 code storage is opt-in (`ARC_V4_FP8_KV=1`); unset stores
                 // the dense BF16 K the model has always stored.
-                let cached = append_kv_mqa(
-                    kv_cache,
-                    &k,
-                    k_packed.as_ref().filter(|_| v4_fp8_kv_enabled()),
-                )?;
+                let cached = {
+                    let _s = arc_profiler::device_span("kv_cache_append");
+                    append_kv_mqa(
+                        kv_cache,
+                        &k,
+                        k_packed.as_ref().filter(|_| v4_fp8_kv_enabled()),
+                    )?
+                };
                 // Reconstruct only what any query row in this block can reach.
                 // Dense storage stays whole (`raw_prefix = 0`) so
                 // `dsv4_attention` narrows exactly as it did before; packed
@@ -1639,7 +1666,10 @@ impl Attention {
                         t_k_full,
                     ),
                 };
-                let k_cached = cached.span(raw_prefix, keep, k.dtype())?;
+                let k_cached = {
+                    let _s = arc_profiler::device_span("kv_cache_span");
+                    cached.span(raw_prefix, keep, k.dtype())?
+                };
                 // Cache read-back. Diff vs prefill's freshly-computed K splits a
                 // cache-storage bug (old rows differ) from a new-token position
                 // bug (only the last row differs).
@@ -1655,6 +1685,7 @@ impl Attention {
                 // Kept under the historic tag so `v4_trace_diff.py` still lines
                 // up against pre-wave33 traces.
                 v4_trace_dump(self.dbg_layer_idx, &k_cached, "41_v_cached");
+                let _s = arc_profiler::device_span("sdpa");
                 super::dsv4_attention::dsv4_attention(
                     &q,
                     &k_cached,
@@ -1710,16 +1741,24 @@ impl Attention {
         // RoPE — diffing this vs 60_after_invtail isolates whether the bug is the
         // attention kernel itself or the inverse-tail de-rotation.
         v4_trace_dump(self.dbg_layer_idx, &attn_out_bhtd, "55_sdpa_bhtd");
-        let attn_out_bhtd = self.rotary_emb.forward_inverse_tail(
-            &attn_out_bhtd,
-            self.cfg.qk_rope_head_dim,
-            seqlen_offsets,
-        )?;
+        // NOTE for anyone reading the old four-bucket profile: the inverse tail
+        // is OUTSIDE `timed_mla(2)` even though that timer is named
+        // `invrope_oproj`, so `sdpa = mla_attn - the three MLA timers`
+        // over-attributed this work to SDPA. Here it is its own node.
+        let attn_out_bhtd = {
+            let _s = arc_profiler::device_span("inv_rope");
+            self.rotary_emb.forward_inverse_tail(
+                &attn_out_bhtd,
+                self.cfg.qk_rope_head_dim,
+                seqlen_offsets,
+            )?
+        };
         v4_trace_dump(self.dbg_layer_idx, &attn_out_bhtd, "60_after_invtail");
         // -> [B, T, H*head_dim]
         attn_out = attn_out_bhtd.transpose(1, 2)?.reshape((bs, seq_len, ()))?;
 
         let o_groups = self.cfg.o_groups.unwrap_or(1);
+        let _prof_oproj = arc_profiler::device_span("o_proj");
         let out = timed_mla(2, &mdev, || {
         let inner = if o_groups > 1 {
             // Grouped o_proj LoRA: each of `o_groups` head-groups gets its
@@ -1772,6 +1811,7 @@ impl Attention {
         v4_nan_dbg(&out, "attn.wo_b");
         Ok(out)
         })?;
+        drop(_prof_oproj);
         v4_trace_dump(self.dbg_layer_idx, &out, "70_o_out");
         Ok(out)
     }
@@ -1880,9 +1920,15 @@ impl MoeGate {
     fn forward(&self, xs: &Tensor, input_ids: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
         let (bs, seq_len, h) = xs.dims3()?;
         let xs = xs.reshape(((), h))?;
-        let logits = xs
-            .to_dtype(DType::F32)?
-            .broadcast_matmul(&self.weight.t()?.to_dtype(DType::F32)?)?;
+        // The router GEMM re-casts `self.weight` to F32 on every call — a
+        // per-layer, per-token dequant of a constant. Named so the report can
+        // price it rather than leaving it inside an opaque `moe` bucket.
+        let logits = {
+            let _s = arc_profiler::device_span("gate.router_gemm");
+            xs.to_dtype(DType::F32)?
+                .broadcast_matmul(&self.weight.t()?.to_dtype(DType::F32)?)?
+        };
+        let _prof_score = arc_profiler::device_span("gate.scoring");
         let scores = match self.cfg.scoring_func {
             ScoringFunc::Softmax => candle_nn::ops::softmax_last_dim(&logits)?,
             ScoringFunc::Sigmoid => candle_nn::ops::sigmoid(&logits)?,
@@ -1896,7 +1942,9 @@ impl MoeGate {
                 softplus.sqrt()?
             }
         };
+        drop(_prof_score);
 
+        let _prof_topk = arc_profiler::device_span("gate.topk");
         let (mut topk_weight, topk_idx) = if let Some(tid2eid) = &self.tid2eid {
             // Hash routing (layers < num_hash_layers): experts are a fixed
             // per-token lookup, NOT score top-k. Reference Gate.forward:
@@ -1999,6 +2047,9 @@ impl MoeGate {
             }
         };
 
+        drop(_prof_topk);
+
+        let _prof_renorm = arc_profiler::device_span("gate.renormalize");
         // Renormalize the selected weights to sum to 1. The reference gates
         // this purely on the config flag (`renormalize=config.norm_topk_prob`,
         // `deepseek_v2.py:553` → `topk.py:876-882`); softmax scores are already
@@ -2018,6 +2069,7 @@ impl MoeGate {
         }
 
         topk_weight = (topk_weight * self.cfg.routed_scaling_factor)?;
+        drop(_prof_renorm);
 
         // RUN-161 diagnostic: are the selected top-k routing weights peaked or
         // near-uniform? Near-uniform weights average 6 redundant experts and
@@ -2163,7 +2215,10 @@ impl Moe {
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
 
         v4_stat_dbg(xs, "moe.input");
-        let (topk_idx, topk_weight) = self.gate.forward(xs, input_ids)?;
+        let (topk_idx, topk_weight) = {
+            let _s = arc_profiler::device_span("moe.gate");
+            self.gate.forward(xs, input_ids)?
+        };
         v4_stat_dbg(&topk_weight, "moe.topk_w");
         v4_stat_dbg(&topk_idx, "moe.topk_idx");
         // RUN-161 diagnostic: dump the actual per-token selected expert IDs at a
@@ -2178,7 +2233,10 @@ impl Moe {
                 eprintln!("ARC_TOPKID [L{}] {:?}", self.layer_idx, v);
             }
         }
-        let mut y = self.experts.forward(xs, topk_weight, &topk_idx)?;
+        let mut y = {
+            let _s = arc_profiler::device_span("moe.experts");
+            self.experts.forward(xs, topk_weight, &topk_idx)?
+        };
         y = y.reshape((b_size, seq_len, hidden_dim))?;
         v4_stat_dbg(&y, "moe.routed");
         let li = self.layer_idx;
@@ -2190,6 +2248,7 @@ impl Moe {
         );
 
         if let Some(ref shared_experts) = self.shared_experts {
+            let _s = arc_profiler::device_span("moe.shared_expert");
             let shared_out = shared_experts.forward(&identity)?;
             v4_stat_dbg(&shared_out, "moe.shared");
             v4_collapse_dbg(&shared_out, &format!("L{li}.moe_shared"), 1);
@@ -2986,13 +3045,25 @@ impl DecoderLayer {
 
         // === ATTN BLOCK ===
         let residual_attn = xs_4d;
-        let (y_attn, post_attn, comb_attn) = timed(0, &tdev, || mhc.attn_pre(residual_attn))?;
+        // The six `timed(..)` wrappers below belong to `ARC_TIME_DECODE`, which
+        // synchronises the device twice per call — 774 full syncs per token at
+        // 43 layers. The `arc_profiler` spans wrapped around them use CUDA
+        // events instead and never synchronise, so both may be enabled at once
+        // but only `ARC_TIME_DECODE` perturbs the run.
+        let (y_attn, post_attn, comb_attn) = {
+            let _s = arc_profiler::device_span("mhc_attn_pre");
+            timed(0, &tdev, || mhc.attn_pre(residual_attn))?
+        };
         v4_nan_dbg(&y_attn, &format!("L{li}.attn_pre.y"));
         v4_collapse_dbg(&y_attn, &format!("L{li}.y_attn"), 1);
         v4_nan_dbg(&post_attn, &format!("L{li}.attn_pre.post"));
         v4_nan_dbg(&comb_attn, &format!("L{li}.attn_pre.comb"));
-        let y_attn_normed = self.input_layernorm.forward(&y_attn)?;
+        let y_attn_normed = {
+            let _s = arc_profiler::device_span("input_layernorm");
+            self.input_layernorm.forward(&y_attn)?
+        };
         v4_nan_dbg(&y_attn_normed, &format!("L{li}.input_layernorm"));
+        let _prof_attn = arc_profiler::device_span("mla_attn");
         let attn_out = timed(1, &tdev, || {
             self.attn.forward(
                 &y_attn_normed,
@@ -3004,27 +3075,43 @@ impl DecoderLayer {
                 flash_params,
             )
         })?;
+        drop(_prof_attn);
         v4_nan_dbg(&attn_out, &format!("L{li}.attn_out"));
         v4_collapse_dbg(&attn_out, &format!("L{li}.attn_out"), 1);
-        let xs_4d = timed(2, &tdev, || {
-            mhc.mix_post_4d(&attn_out, residual_attn, &post_attn, &comb_attn)
-        })?;
+        let xs_4d = {
+            let _s = arc_profiler::device_span("mix_post_attn");
+            timed(2, &tdev, || {
+                mhc.mix_post_4d(&attn_out, residual_attn, &post_attn, &comb_attn)
+            })?
+        };
         v4_nan_dbg(&xs_4d, &format!("L{li}.mix_post_attn"));
         v4_collapse_dbg(&xs_4d, &format!("L{li}.mix_post_attn"), 1);
 
         // === FFN BLOCK ===
         let residual_ffn = &xs_4d;
-        let (y_ffn, post_ffn, comb_ffn) = timed(3, &tdev, || mhc.ffn_pre(residual_ffn))?;
+        let (y_ffn, post_ffn, comb_ffn) = {
+            let _s = arc_profiler::device_span("mhc_ffn_pre");
+            timed(3, &tdev, || mhc.ffn_pre(residual_ffn))?
+        };
         v4_nan_dbg(&y_ffn, &format!("L{li}.ffn_pre.y"));
         v4_collapse_dbg(&y_ffn, &format!("L{li}.y_ffn"), 1);
-        let y_ffn_normed = self.post_attention_layernorm.forward(&y_ffn)?;
+        let y_ffn_normed = {
+            let _s = arc_profiler::device_span("post_attention_layernorm");
+            self.post_attention_layernorm.forward(&y_ffn)?
+        };
         v4_nan_dbg(&y_ffn_normed, &format!("L{li}.post_attention_layernorm"));
-        let ffn_out = timed(4, &tdev, || self.moe_or_mlp.forward(&y_ffn_normed, input_ids))?;
+        let ffn_out = {
+            let _s = arc_profiler::device_span("moe");
+            timed(4, &tdev, || self.moe_or_mlp.forward(&y_ffn_normed, input_ids))?
+        };
         v4_nan_dbg(&ffn_out, &format!("L{li}.ffn_out"));
         v4_collapse_dbg(&ffn_out, &format!("L{li}.ffn_out"), 1);
-        let out = timed(5, &tdev, || {
-            mhc.mix_post_4d(&ffn_out, residual_ffn, &post_ffn, &comb_ffn)
-        })?;
+        let out = {
+            let _s = arc_profiler::device_span("mix_post_ffn");
+            timed(5, &tdev, || {
+                mhc.mix_post_4d(&ffn_out, residual_ffn, &post_ffn, &comb_ffn)
+            })?
+        };
         v4_nan_dbg(&out, &format!("L{li}.mix_post_ffn"));
         v4_collapse_dbg(&out, &format!("L{li}.residual"), 1);
         Ok(out)
@@ -3745,7 +3832,11 @@ impl DeepSeekV4 {
                 xs_hist_slots.push(None);
             }
         }
-        let cache = NormalCache::new(cfg.num_hidden_layers, cfg.max_position_embeddings);
+        // `new_plain`, not `new`: V4's fused-MQA layout stores a 1-wide marker
+        // in the V half of every slot (see `V4_V_MARKER_WIDTH`), which
+        // `require_normal_kv_slot` enforces. An ambient TurboQuant setting must
+        // not turn these into compressed slots.
+        let cache = NormalCache::new_plain(cfg.num_hidden_layers, cfg.max_position_embeddings);
         {
             let mut guard = cache.lock().unwrap();
             for ratio in compress_ratios_in_order {
@@ -3817,8 +3908,16 @@ impl DeepSeekV4 {
         )>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
-        let xs_embed = self.embed_tokens.forward(input_ids)?;
+        let _prof_model = arc_profiler::span("model");
+        if let Ok((b, t)) = input_ids.dims2() {
+            arc_profiler::set_geometry(b, t);
+        }
+        let xs_embed = {
+            let _s = arc_profiler::device_span("embed");
+            self.embed_tokens.forward(input_ids)?
+        };
         let cache = &mut self.cache.normal().0;
+        let _prof_mask = arc_profiler::span("causal_mask");
         let attention_mask = CausalMasker.make_causal_mask_matrix(
             input_ids,
             metadata
@@ -3835,6 +3934,7 @@ impl DeepSeekV4 {
                 .unwrap_or(true)
         });
         let attention_mask = DeviceMappedMask::new(attention_mask, &*self.mapper)?;
+        drop(_prof_mask);
 
         // R3: split the cache vector into the per-layer KV entries
         // (`0..num_layers`) and the trailing per-layer compressor-input
@@ -3869,11 +3969,21 @@ impl DeepSeekV4 {
             let mhc_head = self.mhc_head.as_ref().unwrap();
             v4_nan_dbg(&xs_embed, "embed");
             v4_stat_dbg(&xs_embed, "embed");
-            let mut xs_4d = mhc_head.rt.lift_3d_to_4d(&xs_embed)?;
+            let mut xs_4d = {
+                let _s = arc_profiler::device_span("mhc.lift_3d_to_4d");
+                mhc_head.rt.lift_3d_to_4d(&xs_embed)?
+            };
             v4_nan_dbg(&xs_4d, "lift_3d_to_4d");
             v4_stat_dbg(&xs_4d, "lift_3d_to_4d");
+            let _prof_layers = arc_profiler::span("layers");
             for (i, layer) in self.layers.iter().enumerate() {
-                xs_4d = self.mapper.map(xs_4d, i)?;
+                // Aggregated across all layers by default (calls = n_layers,
+                // with min/max); `ARC_PROFILE_UNROLL=1` splits by index.
+                let _prof_layer = arc_profiler::span_idx("layer", i);
+                xs_4d = {
+                    let _s = arc_profiler::device_span("device_map.map");
+                    self.mapper.map(xs_4d, i)?
+                };
                 xs_4d = layer.forward_4d(
                     &xs_4d,
                     attention_mask.as_ref().map(|m| m.get(xs_4d.device())),
@@ -3889,14 +3999,20 @@ impl DeepSeekV4 {
                 )?;
                 v4_stat_dbg(&xs_4d, &format!("L{i}"));
             }
+            drop(_prof_layers);
             let xs_4d = xs_4d.to_device(&self.device)?;
             // Collapse via the learned global mHC head: 4-D → 3-D.
-            let collapsed = mhc_head.forward(&xs_4d)?;
+            let collapsed = {
+                let _s = arc_profiler::device_span("mhc_head");
+                mhc_head.forward(&xs_4d)?
+            };
             v4_stat_dbg(&collapsed, "after_mhc_head");
             collapsed
         } else {
             let mut xs = xs_embed;
+            let _prof_layers = arc_profiler::span("layers");
             for (i, layer) in self.layers.iter().enumerate() {
+                let _prof_layer = arc_profiler::span_idx("layer", i);
                 xs = self.mapper.map(xs, i)?;
                 xs = layer.forward(
                     &xs,
@@ -3943,11 +4059,20 @@ impl DeepSeekV4 {
             }
         }
 
-        let xs = xs.apply(&self.norm)?;
+        let xs = {
+            let _s = arc_profiler::device_span("final_norm");
+            xs.apply(&self.norm)?
+        };
         v4_stat_dbg(&xs, "after_norm");
-        let xs = extract_logits(&xs, context_lens)?;
+        let xs = {
+            let _s = arc_profiler::device_span("extract_logits");
+            extract_logits(&xs, context_lens)?
+        };
 
-        let logits = self.lm_head.forward_autocast(&xs)?;
+        let logits = {
+            let _s = arc_profiler::device_span("lm_head");
+            self.lm_head.forward_autocast(&xs)?
+        };
         v4_stat_dbg(&logits, "logits");
         Ok(logits)
     }
@@ -7045,7 +7170,9 @@ mod tests {
         head_dim: usize,
         max_pos: usize,
     ) -> EitherCache {
-        let cache = NormalCache::new(n_kv, max_pos);
+        // `new_plain`: see the note on the other V4 cache constructor — the
+        // V-marker layout requires `KvCache::Normal` slots.
+        let cache = NormalCache::new_plain(n_kv, max_pos);
         {
             let mut guard = cache.lock().unwrap();
             for &(ratio, span_groups) in compressed {

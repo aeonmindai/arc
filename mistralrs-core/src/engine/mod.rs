@@ -412,18 +412,48 @@ impl Engine {
             }
 
             let run_start = Instant::now();
-            let mut scheduler = get_mut_arcmutex!(self.scheduler);
-            let scheduled = scheduler.schedule(&self.logger);
+            // Root of the profile tree. Opened here rather than at the top of
+            // the loop because everything above this point is the idle path,
+            // and averaging idle iterations into a step time would understate
+            // every number below it.
+            let _prof_step = arc_profiler::step_scope("step");
+            let mut scheduler = {
+                let _s = arc_profiler::span("scheduler.lock");
+                get_mut_arcmutex!(self.scheduler)
+            };
+            let scheduled = {
+                let _s = arc_profiler::span("scheduler.schedule");
+                scheduler.schedule(&self.logger)
+            };
 
             match scheduled {
                 SchedulerOutput::DefaultScheduler {
                     output: mut scheduled,
                 } => {
                     if !scheduled.completion.is_empty() {
+                        // Stamped while `step` is the innermost span so the root
+                        // carries the batch this profile describes. A profile
+                        // that cannot say which B produced it is unattributable
+                        // after the fact.
+                        arc_profiler::set_geometry(scheduled.completion.len(), 1);
+                        // Decode and prefill are separated *above* the pipeline
+                        // so their sub-trees never merge. A prefill step is
+                        // orders of magnitude larger; averaging the two under
+                        // one `pipeline.step` node would hide the decode cost
+                        // this profiler exists to find.
+                        let _pdecode = arc_profiler::span("decode");
                         let current_completion_ids: Vec<usize> =
                             scheduled.completion.iter().map(|seq| *seq.id()).collect();
                         let res = {
-                            let mut pipeline = get_mut_arcmutex!(self.pipeline);
+                            // The pipeline mutex is held across the whole step,
+                            // including the serial `responder.send().await` loop
+                            // at the end of it, so the time spent waiting to
+                            // acquire it is a scheduling cost worth naming.
+                            let mut pipeline = {
+                                let _s = arc_profiler::span("pipeline.lock");
+                                get_mut_arcmutex!(self.pipeline)
+                            };
+                            let _pstep = arc_profiler::span("pipeline.step");
                             let pre_op = if !self.no_kv_cache
                                 && last_completion_ids != current_completion_ids
                             {
@@ -479,8 +509,17 @@ impl Engine {
                     }
 
                     if !scheduled.prompt.is_empty() {
+                        arc_profiler::set_geometry(
+                            scheduled.prompt.len(),
+                            scheduled.prompt.iter().map(|s| s.len()).max().unwrap_or(1),
+                        );
+                        let _pprompt = arc_profiler::span("prompt");
                         let prompt_exec_time = {
-                            let mut pipeline = get_mut_arcmutex!(self.pipeline);
+                            let mut pipeline = {
+                                let _s = arc_profiler::span("pipeline.lock");
+                                get_mut_arcmutex!(self.pipeline)
+                            };
+                            let _pstep = arc_profiler::span("pipeline.step");
 
                             // Run the prompt seqs
                             let post_op = if !self.no_kv_cache {

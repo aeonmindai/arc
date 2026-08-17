@@ -535,7 +535,13 @@ pub mod text_models_inputs_processor {
                 seqlens_k.push((ctxt.len() + start_pos) as u32);
             }
 
-            seqs_tensors.push(Tensor::new(ctxt, device).unwrap().unsqueeze(0).unwrap());
+            // CLAUDE.md pitfall #5, still live: one `Tensor::new` on the GPU
+            // device per sequence per decode step, i.e. B separate 1-element
+            // H2D transfers, each of which is a host/device round trip.
+            {
+                let _s = arc_profiler::sync_span("input_prep.h2d_per_seq");
+                seqs_tensors.push(Tensor::new(ctxt, device).unwrap().unsqueeze(0).unwrap());
+            }
 
             if let Some(paged_attn_metadata) = &mut paged_attn_metadata {
                 let kv_mgr = get_mut_arcmutex!(paged_attn_metadata.kv_cache_manager);
@@ -811,8 +817,12 @@ pub mod text_models_inputs_processor {
             None
         };
 
+        let input = {
+            let _s = arc_profiler::span("input_prep.cat");
+            Tensor::cat(&seqs_tensors, 0).unwrap()
+        };
         Ok(InputMetadata {
-            input: Tensor::cat(&seqs_tensors, 0).unwrap(),
+            input,
             positions: seqlen_offsets,
             context_lens,
             position_ids,
