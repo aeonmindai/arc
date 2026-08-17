@@ -104,8 +104,17 @@ cd "$REPO" || env_fail "cannot enter $REPO"
 # --------------------------------------------------------------------------
 # shellcheck disable=SC1091
 [ -f /root/arcenv.sh ] && . /root/arcenv.sh
-export LD_LIBRARY_PATH="/usr/local/cuda/compat:${LD_LIBRARY_PATH:-}"
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.1}"
+export LD_LIBRARY_PATH="/usr/local/cuda/compat:${LD_LIBRARY_PATH:-}"
+# Self-configure PATH rather than inherit it. `setsid nohup` from a
+# non-interactive ssh session does NOT get the login shell's PATH, so a probe
+# launched directly (instead of via the bootstrap, which exports it) died with
+# `cargo: command not found` AFTER a 1m13s build — the build ran because cargo
+# was found in an earlier step, and the freshness check then failed for a
+# reason that had nothing to do with freshness. A script that depends on its
+# caller's environment is not self-contained.
+export PATH="$CUDA_HOME/bin:/root/.cargo/bin:$PATH"
+command -v cargo >/dev/null || env_fail "cargo not on PATH even after adding /root/.cargo/bin"
 say "CUDA_HOME=$CUDA_HOME LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
 
 # --------------------------------------------------------------------------
