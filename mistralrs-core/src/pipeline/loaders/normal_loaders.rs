@@ -3327,6 +3327,28 @@ impl NormalModelLoader for DeepSeekV4Loader {
         //      and the `xs` compressor history in the extra NormalCache slots
         //      is never cloned in/out under the engine's PagedAttention arm.
         //    Use it to measure, not to serve.
+        //
+        // 5. 🔴 MEASURED, A100-80G, qtip2b, b=1 (wave53-CD). The flag works and
+        //    `cache_config` really does become `Some` ("Allocating 2048 MB for
+        //    PagedAttention KV cache per GPU ... 762 GPU blocks"). V4 then
+        //    produces ZERO tokens — it dies on the first forward:
+        //      `dsv4_attention: 1 query rows against only 0 keys
+        //       (raw_prefix 0 + 0 given)`   (dummy run)
+        //      `CublasError(CUBLAS_STATUS_INTERNAL_ERROR)` then
+        //      `DriverError(CUDA_ERROR_ILLEGAL_ADDRESS)`  (first real request)
+        //    ⇒ `cache_write_and_gather` misreads `context_lens`. The inputs
+        //    processor emits ONE ABSOLUTE SLOT INDEX PER TOKEN
+        //    (`inputs_processor.rs:300-302`) and flattens it to
+        //    `[batch * max_context_len]` (`:399-408`), but
+        //    `build_cu_seqlens_kv_from_context_lens`
+        //    (`paged_attention/mod.rs:59-78`) reads `dim(0)` as the batch and
+        //    cumsums the values as PER-SEQUENCE LENGTHS. On the dummy run the
+        //    `block_ids.is_none()` "during profiling" `continue`
+        //    (`inputs_processor.rs:285-289`) leaves `context_lens` and
+        //    `block_tables` empty outright, so the gather returns 0 rows.
+        //    **Fix that contract before this flag is worth anything.** Do not
+        //    re-rent a box to re-confirm the failure; re-read
+        //    `memory/mission/wave53-CD-paged-attn-probe.md` §8.
         if v4_paged_attn_optin() {
             return Ok(true);
         }
