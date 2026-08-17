@@ -7029,6 +7029,383 @@ mod tests {
         Ok(())
     }
 
+    // ---------------------------------------------------------------------
+    // wave63-CO: per-row `xs` state.
+    //
+    // The claim these execute is the keystone one: a batched compressor cache
+    // whose rows sit at DIFFERENT token counts advances each row exactly as if
+    // that sequence had been run alone. Until this landed, `tokens`/`base` were
+    // one number for the whole batch, so no sequence could advance its
+    // compressed KV independently — the blocker PR #90 §6, PR #92 §5.1 and
+    // wave29-BC §4b each arrived at from a different direction.
+    // ---------------------------------------------------------------------
+
+    /// Assemble one batched `XsRollingCache` from per-sequence ones exactly as
+    /// `NormalCacheManager::clone_in_cache` does: the START-anchored compressed
+    /// buffers are zero-extended to the widest capacity and stacked on dim 0,
+    /// the END-anchored raw windows are **front**-padded to the widest and
+    /// stacked, and the row lengths are the concatenation of the sequences'
+    /// own — not `seqs[0]`'s repeated.
+    fn batch_xs(per_seq: &[XsRollingCache]) -> Result<XsRollingCache> {
+        let width = |t: &Tensor| t.dim(1);
+        let cap = per_seq
+            .iter()
+            .map(|x| width(x.comp.all_data.as_ref().unwrap()))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .unwrap();
+        let w = per_seq
+            .iter()
+            .map(|x| width(x.tail.as_ref().unwrap()))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .unwrap();
+        let pad = |t: &Tensor, to: usize, at_front: bool| -> Result<Tensor> {
+            let have = t.dim(1)?;
+            if have == to {
+                return t.contiguous();
+            }
+            let mut shape = t.dims().to_vec();
+            shape[1] = to;
+            let z = Tensor::zeros(shape, t.dtype(), t.device())?;
+            z.slice_set(&t.contiguous()?, 1, if at_front { to - have } else { 0 })?;
+            Ok(z)
+        };
+        let mut comps = Vec::new();
+        let mut tails = Vec::new();
+        for x in per_seq {
+            comps.push(pad(x.comp.all_data.as_ref().unwrap(), cap, false)?);
+            tails.push(pad(x.tail.as_ref().unwrap(), w, true)?);
+        }
+        let mut out = per_seq[0].clone();
+        out.comp.all_data = Some(Tensor::cat(&comps, 0)?.contiguous()?);
+        out.comp.capacity_seq_len = cap;
+        out.tail = Some(Tensor::cat(&tails, 0)?.contiguous()?);
+        let tokens: Vec<usize> = per_seq.iter().map(|x| x.row_lens().0[0]).collect();
+        let base: Vec<usize> = per_seq.iter().map(|x| x.row_lens().1[0]).collect();
+        out.comp.current_seq_len = tokens.iter().copied().max().unwrap() / out.ratio;
+        out.set_row_lens(tokens, base)?;
+        Ok(out)
+    }
+
+    /// Run `lens.len()` sequences to their own token counts on one stream,
+    /// batch them, advance the batch by `t_new` of each row's OWN next tokens,
+    /// and require every row to equal the same sequence advanced alone.
+    fn ragged_batch_matches_b1(ratio: usize, lens: &[usize], t_new: usize) -> Result<()> {
+        let device = Device::Cpu;
+        let (hidden, head_dim) = (32usize, 16usize);
+        let compressor = rolling_test_compressor(ratio, hidden, head_dim, &device)?;
+        // A DIFFERENT stream per row. Sharing one stream would make every row's
+        // compressed block `j` cover the identical tokens, so a bug that read
+        // or wrote the wrong row would be invisible.
+        let total = lens.iter().copied().max().unwrap() + t_new + 8;
+        let streams = per_row_streams(lens.len(), total, hidden, &device)?;
+
+        let mut refs: Vec<XsRollingCache> = Vec::new();
+        for (i, &l) in lens.iter().enumerate() {
+            let mut s = XsRollingCache::new(ratio, compressor.coff, head_dim, 4096);
+            s.advance(&streams[i].narrow(1, 0, l)?, |w| {
+                compressor.forward_from_xs(w)
+            })?;
+            refs.push(s);
+        }
+        let mut batched = batch_xs(&refs)?;
+        assert_eq!(
+            batched.rows_uniform(),
+            lens.iter().all(|&l| l == lens[0]),
+            "the fixture must exercise the path it claims to"
+        );
+
+        // Row `i` gets ITS OWN next tokens, which is what a real batch of
+        // independent sequences hands the compressor.
+        let parts = lens
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| streams[i].narrow(1, l, t_new))
+            .collect::<Result<Vec<_>>>()?;
+        let xs_new = Tensor::cat(&parts, 0)?;
+        let got = batched
+            .advance(&xs_new, |w| compressor.forward_from_xs(w))?
+            .expect("a batch past one full group has compressed rows");
+
+        for (i, &l) in lens.iter().enumerate() {
+            let want = refs[i]
+                .advance(&streams[i].narrow(1, l, t_new)?, |w| {
+                    compressor.forward_from_xs(w)
+                })?
+                .expect("the reference is past one full group too");
+            let live = (l + t_new) / ratio;
+            assert!(live > 0, "fixture must complete at least one block");
+            let mine = got.narrow(0, i, 1)?.narrow(1, 0, live)?;
+            let theirs = want.narrow(1, 0, live)?;
+            assert_eq!(
+                max_abs_diff(&mine, &theirs)?,
+                0.0,
+                "row {i} (at {l} + {t_new} tokens) diverged from the same sequence run at B=1 \
+                 over its {live} live compressed block(s)"
+            );
+            assert_eq!(
+                (batched.row_lens().0[i], batched.row_lens().1[i]),
+                (refs[i].row_lens().0[0], refs[i].row_lens().1[0]),
+                "row {i}'s token count / resume point must equal the B=1 reference's"
+            );
+        }
+        // Non-degenerate: distinct rows must actually hold distinct values, or
+        // an implementation that broadcast one row everywhere would pass.
+        if lens.len() > 1 {
+            let a = got.narrow(0, 0, 1)?;
+            let b = got.narrow(0, 1, 1)?;
+            assert!(
+                max_abs_diff(&a, &b)? > 1e-6,
+                "the fixture's rows are indistinguishable, so this proves nothing"
+            );
+        }
+        Ok(())
+    }
+
+    /// `n` deterministic, mutually distinct compressor-input streams.
+    fn per_row_streams(n: usize, t: usize, hidden: usize, device: &Device) -> Result<Vec<Tensor>> {
+        (0..n)
+            .map(|row| {
+                let data: Vec<f32> = (0..t * hidden)
+                    .map(|i| ((i as f32) * 0.017 + 0.3 + row as f32 * 1.7).cos() * 0.8)
+                    .collect();
+                Tensor::from_vec(data, (1, t, hidden), device)
+            })
+            .collect()
+    }
+
+    /// 🔑 The keystone claim, on the CSA compressor (ratio 4, overlapping): four
+    /// rows at four different residues mod `ratio` — the worst case, since the
+    /// window geometry is a function of the residue — advance token-identically
+    /// to four B=1 runs. Three of the four complete a new block at three
+    /// different window offsets and land on the same absolute block; the fourth
+    /// completes none and must be left untouched.
+    #[test]
+    fn batched_ragged_xs_is_token_identical_to_the_b1_reference_csa() -> Result<()> {
+        ragged_batch_matches_b1(4, &[37, 38, 39, 40], 3)
+    }
+
+    /// 🔑 The case the `slot_mapping` indirection exists for: two rows that are
+    /// at the SAME residue mod `ratio` — so they share one compressor call —
+    /// but a whole block apart, so their outputs must land on **different**
+    /// `comp` columns. Under MTP this is the common case, not the exotic one:
+    /// the verify window is `depth + 1`, and a CSA layer's ratio is 4, so two
+    /// sequences a full window apart share a residue on most steps.
+    ///
+    /// Without the per-row destination — with one shared append offset, which
+    /// is all `SingleCache::append` can express — both rows would write the
+    /// same column and one of them would read the other's history.
+    #[test]
+    fn two_rows_one_compressor_call_two_destinations() -> Result<()> {
+        ragged_batch_matches_b1(4, &[39, 43, 40, 41], 1)
+    }
+
+    /// The same on HCA (ratio 128, non-overlapping), where a step's rows almost
+    /// all complete NO block and the scatter must write only the one that does.
+    #[test]
+    fn batched_ragged_xs_is_token_identical_to_the_b1_reference_hca() -> Result<()> {
+        ragged_batch_matches_b1(128, &[1022, 1023, 1024, 1025], 3)
+    }
+
+    /// The control the ragged tests need: a UNIFORM batch takes the untouched
+    /// scalar path and is also token-identical. If this ever failed, the
+    /// "flag off is byte-identical" claim would be false and the ragged
+    /// result above would be unattributable.
+    #[test]
+    fn a_uniform_batch_still_matches_the_b1_reference() -> Result<()> {
+        ragged_batch_matches_b1(4, &[40, 40, 40, 40], 3)
+    }
+
+    /// One step is not enough: a per-row `base` that drifts by one token per
+    /// step would still look right on step 1. Run the ragged batch and the B=1
+    /// references in lockstep for 24 steps, re-batching each time — which is
+    /// what the engine's `clone_in`/`clone_out` pair does — and require exact
+    /// agreement at every step.
+    #[test]
+    fn a_ragged_batch_stays_token_identical_across_many_steps() -> Result<()> {
+        let device = Device::Cpu;
+        let (hidden, head_dim, ratio) = (32usize, 16usize, 4usize);
+        let compressor = rolling_test_compressor(ratio, hidden, head_dim, &device)?;
+        // Rows 1 and 3 sit at the same residue mod `ratio` a block apart, so on
+        // every fourth step they share one compressor call and must land on two
+        // different `comp` columns.
+        let mut lens = [30usize, 31, 33, 35];
+        let streams = per_row_streams(lens.len(), 200, hidden, &device)?;
+
+        let mut refs: Vec<XsRollingCache> = Vec::new();
+        for (i, &l) in lens.iter().enumerate() {
+            let mut s = XsRollingCache::new(ratio, compressor.coff, head_dim, 4096);
+            s.advance(&streams[i].narrow(1, 0, l)?, |w| {
+                compressor.forward_from_xs(w)
+            })?;
+            refs.push(s);
+        }
+
+        for step in 0..24 {
+            let mut batched = batch_xs(&refs)?;
+            assert!(!batched.rows_uniform(), "step {step} lost its raggedness");
+            let parts = lens
+                .iter()
+                .enumerate()
+                .map(|(i, &l)| streams[i].narrow(1, l, 1))
+                .collect::<Result<Vec<_>>>()?;
+            let got = batched
+                .advance(&Tensor::cat(&parts, 0)?, |w| compressor.forward_from_xs(w))?
+                .unwrap();
+            for (i, l) in lens.iter_mut().enumerate() {
+                let want = refs[i]
+                    .advance(&streams[i].narrow(1, *l, 1)?, |w| {
+                        compressor.forward_from_xs(w)
+                    })?
+                    .unwrap();
+                *l += 1;
+                let live = *l / ratio;
+                assert_eq!(
+                    max_abs_diff(
+                        &got.narrow(0, i, 1)?.narrow(1, 0, live)?,
+                        &want.narrow(1, 0, live)?
+                    )?,
+                    0.0,
+                    "step {step}, row {i}: the batched compressor history left the B=1 reference"
+                );
+                assert_eq!(batched.row_lens().0[i], refs[i].row_lens().0[0]);
+                assert_eq!(batched.row_lens().1[i], refs[i].row_lens().1[0]);
+            }
+            // The retained window must stay bounded even though it is now the
+            // widest row's — otherwise the ragged path quietly reintroduces the
+            // unbounded raw history this cache exists to delete.
+            let bound = compressor.coff * ratio + batched.margin + (lens[3] - lens[0]);
+            assert!(
+                batched.tail.as_ref().unwrap().dim(1)? <= bound,
+                "step {step}: the shared window grew past {bound}"
+            );
+        }
+        Ok(())
+    }
+
+    /// 🔑 The MTP path in full: a sequence that has been rolled back keeps its
+    /// `base` where it was (`set_len` moves `tokens`, never `base`), so when it
+    /// is batched next to a neighbour the retention floor computed from its new
+    /// token count sits BELOW what it actually holds. Clamping to `base` is
+    /// what keeps it honest — without it the row would come out of the batch
+    /// claiming to be resumable from further back than it is, and the rollback
+    /// it should later refuse would succeed and resume the compressor from a
+    /// gap. That is the exact failure this cache exists to make impossible, and
+    /// it is invisible to any single-step or rollback-free fixture.
+    #[test]
+    fn a_rolled_back_row_keeps_its_own_resume_point_through_a_batch() -> Result<()> {
+        let device = Device::Cpu;
+        let (hidden, head_dim, ratio) = (32usize, 16usize, 4usize);
+        let compressor = rolling_test_compressor(ratio, hidden, head_dim, &device)?;
+        let streams = per_row_streams(2, 64, hidden, &device)?;
+
+        let mut rolled = XsRollingCache::new(ratio, compressor.coff, head_dim, 4096);
+        rolled.advance(&streams[0].narrow(1, 0, 40)?, |w| {
+            compressor.forward_from_xs(w)
+        })?;
+        let base_at_40 = rolled.row_lens().1[0];
+        rolled.set_len(36)?;
+        assert_eq!(
+            rolled.row_lens().1[0],
+            base_at_40,
+            "the fixture needs `set_len` to leave `base` above the natural floor"
+        );
+
+        let mut other = XsRollingCache::new(ratio, compressor.coff, head_dim, 4096);
+        other.advance(&streams[1].narrow(1, 0, 38)?, |w| {
+            compressor.forward_from_xs(w)
+        })?;
+
+        let mut refs = vec![rolled, other];
+        let mut batched = batch_xs(&refs)?;
+        let parts = [streams[0].narrow(1, 36, 2)?, streams[1].narrow(1, 38, 2)?];
+        let got = batched
+            .advance(&Tensor::cat(&parts, 0)?, |w| compressor.forward_from_xs(w))?
+            .unwrap();
+
+        for (i, (start, stream)) in [(36usize, &streams[0]), (38, &streams[1])]
+            .into_iter()
+            .enumerate()
+        {
+            let want = refs[i]
+                .advance(&stream.narrow(1, start, 2)?, |w| {
+                    compressor.forward_from_xs(w)
+                })?
+                .unwrap();
+            let live = (start + 2) / ratio;
+            assert_eq!(
+                max_abs_diff(
+                    &got.narrow(0, i, 1)?.narrow(1, 0, live)?,
+                    &want.narrow(1, 0, live)?
+                )?,
+                0.0,
+                "row {i} diverged from the B=1 reference after a rollback"
+            );
+            assert_eq!(
+                batched.row_lens().1[i],
+                refs[i].row_lens().1[0],
+                "row {i}'s resume point must not be loosened by being batched — a lower `base` \
+                 lets a rollback succeed that would resume the compressor from a gap"
+            );
+        }
+        Ok(())
+    }
+
+    /// The inverse of `batch_xs`: splitting a batched row back out must restore
+    /// the per-sequence invariant `window width == tokens - base`, taking that
+    /// row's share from the END of the shared window. Taking it from the front
+    /// would hand the row somebody else's older tokens under its own `base`.
+    #[test]
+    fn splitting_a_batched_row_restores_the_per_sequence_window() -> Result<()> {
+        let device = Device::Cpu;
+        let (hidden, head_dim, ratio) = (32usize, 16usize, 4usize);
+        let compressor = rolling_test_compressor(ratio, hidden, head_dim, &device)?;
+        let lens = [37usize, 40];
+        let streams = per_row_streams(2, 64, hidden, &device)?;
+        let mut refs: Vec<XsRollingCache> = Vec::new();
+        for (i, &l) in lens.iter().enumerate() {
+            let mut s = XsRollingCache::new(ratio, compressor.coff, head_dim, 4096);
+            s.advance(&streams[i].narrow(1, 0, l)?, |w| {
+                compressor.forward_from_xs(w)
+            })?;
+            refs.push(s);
+        }
+        let batched = batch_xs(&refs)?;
+        let shared = batched.tail.as_ref().unwrap().dim(1)?;
+        assert!(
+            refs.iter()
+                .any(|r| r.tail.as_ref().unwrap().dim(1).unwrap() < shared),
+            "the fixture must have a row narrower than the shared window"
+        );
+
+        let comps = batched.comp.all_data.as_ref().unwrap().chunk(2, 0)?;
+        let tails = batched.tail.as_ref().unwrap().chunk(2, 0)?;
+        for i in 0..2 {
+            let out = batched.split_row(i, comps[i].clone(), tails[i].clone())?;
+            let (tok, base) = (out.row_lens().0[0], out.row_lens().1[0]);
+            assert_eq!(
+                (tok, base),
+                (refs[i].row_lens().0[0], refs[i].row_lens().1[0])
+            );
+            assert_eq!(
+                out.tail.as_ref().unwrap().dim(1)?,
+                tok - base,
+                "a per-sequence cache's window is exactly `tokens - base` wide"
+            );
+            assert_eq!(
+                max_abs_diff(out.tail.as_ref().unwrap(), refs[i].tail.as_ref().unwrap())?,
+                0.0,
+                "row {i}'s retained raw tokens must be its own, taken from the END of the \
+                 shared window"
+            );
+            assert_eq!(out.comp.current_seq_len(), refs[i].comp.current_seq_len());
+        }
+        Ok(())
+    }
+
     /// A rollback of up to `margin` tokens must be accepted and resumable at
     /// EVERY length — including the ones that cross a group boundary, where
     /// the rolled-back group's compressed row has to be rebuilt from the start
