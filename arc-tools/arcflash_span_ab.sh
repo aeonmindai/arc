@@ -87,18 +87,32 @@ arm(){ # $1 name, $2 env
 import json, sys, glob, os
 pout, stem, mode, tok = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 js = sorted(glob.glob(os.path.join(pout, "*.json")))
-out = {"mode": mode, "tokens": tok, "device_ns": 0, "calls": 0, "reachable": False, "found": False}
+out = {"mode": mode, "tokens": tok, "device_ns": 0, "wall_ns": 0, "calls": 0,
+       "reachable": False, "found": False, "device_dark": True}
+# THERE ARE TWO mla_attn NODES: one under step.prompt (prefill, calls=0 here
+# because the profile window is decode) and one under step.decode. Taking the
+# first name match grabbed the PREFILL node and reported calls=0 — which the
+# guard correctly voided, for the wrong reason. Select on the decode path.
 for f in js:
     try:
         d = json.load(open(f))
     except Exception:
         continue
-    for n in d.get("nodes", []):
-        if n.get("name") == "mla_attn":
-            out.update(device_ns=n.get("device_ns", 0), calls=n.get("calls", 0),
-                       reachable=bool(n.get("reachable", False)), found=True,
-                       note=n.get("note"))
-            break
+    nodes = d.get("nodes", [])
+    cand = [n for n in nodes
+            if n.get("name") == "mla_attn"
+            and "step.decode" in n.get("path", "")
+            and n.get("calls", 0) > 0]
+    if not cand:
+        continue
+    n = max(cand, key=lambda x: x.get("calls", 0))
+    # Is the device timer alive ANYWHERE in this profile? device_ns==0 on a node
+    # can mean "fast" or "timer dark"; only the whole-profile answer separates
+    # them, and using wall as though it were device time would be a silent lie.
+    any_dev = any(x.get("device_ns", 0) > 0 for x in nodes)
+    out.update(device_ns=n.get("device_ns", 0), wall_ns=n.get("wall_ns", 0),
+               calls=n.get("calls", 0), reachable=bool(n.get("reachable", False)),
+               found=True, device_dark=(not any_dev), path=n.get("path", ""))
 open(stem + ".mla", "w").write(json.dumps(out))
 print(json.dumps(out))
 PY
@@ -132,12 +146,25 @@ for name, d in (("unfused", u), ("nullctl", c), ("fused", f)):
         print(f"  VOID: {name} mla_attn found={d['found']} reachable={d['reachable']} calls={d['calls']}.")
         print("  A zero from an unreached node is not a fast node. UNPROVEN.")
         print("RESULT: UNANSWERED"); raise SystemExit
-per = lambda d: d["device_ns"] / d["calls"] / 1000.0   # microseconds per invocation
+dark = any(d.get("device_dark", True) for d in (u, c, f))
+if dark:
+    print("  \u26a0 DEVICE TIMER IS DARK in this binary: device_ns == 0 on EVERY node")
+    print("     of the profile, not just mla_attn. The profiler chain fixed this;")
+    print("     that fix is not on this branch. Falling back to the span's WALL time,")
+    print("     which is far sharper than end-to-end (it isolates attention from load")
+    print("     and scheduling) but includes host and sync inside the span.")
+    print("     This is NOT the published baseline's device-time metric and must not")
+    print("     be compared against 58.0ms/113.4ms as if it were.")
+    per = lambda d: d["wall_ns"] / d["calls"] / 1000.0
+    unit = "us/invocation (SPAN WALL, device timer dark)"
+else:
+    per = lambda d: d["device_ns"] / d["calls"] / 1000.0
+    unit = "us/invocation (device time, CUDA events)"
 pu, pc, pf = per(u), per(c), per(f)
 floor = abs(pu - pc); eff = abs(pu - pf)
 fp = 100 * floor / pu if pu else 0.0
 ep = 100 * eff / pu if pu else 0.0
-print(f"  mla_attn device time per invocation (CUDA events):")
+print(f"  mla_attn per invocation — {unit}:")
 print(f"    unfused {pu:9.2f} us   (calls={u['calls']}, tokens={u['tokens']})")
 print(f"    null    {pc:9.2f} us   (same flag as unfused)")
 print(f"    fused   {pf:9.2f} us   (calls={f['calls']}, tokens={f['tokens']})")
