@@ -296,6 +296,19 @@ jobs:
   arctarget-multiarch:
     name: ArcTarget fat binary (sm_80 + sm_90a + sm_100a + sm_103a)
     runs-on: ubuntu-latest
+    # For the DEPENDENCIES, not for ArcTarget. `candle-kernels`' build script
+    # detects its arch by shelling out to `nvidia-smi`, which does not exist on
+    # a GPU-less runner, and fails the whole build before ArcTarget's gate is
+    # ever reached. The other CUDA jobs in this file already set this (see the
+    # nvcc matrix and the workspace `cargo check`); this job is new and missed
+    # it, which is why the miss only surfaced the first time it ran.
+    #
+    # It does NOT weaken the gate below. `mistralrs-quant` and `arc-cuda-graph`
+    # take their architectures from `split_primary` via `compute_cap_arch()`,
+    # which overrides cudaforge's env lookup outright, and the verification step
+    # asks `cuobjdump` what is actually in the archive either way.
+    env:
+      CUDA_COMPUTE_CAP: "90"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
