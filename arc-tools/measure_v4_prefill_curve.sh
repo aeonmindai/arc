@@ -90,12 +90,31 @@
 #   ARC_PC_REQ_TMO    per-request timeout, seconds   (default 2400)
 #   ARC_PC_MEM_WIN    Arm B sampling window, seconds (default 90)
 #   ARC_PC_TIMING_TS  Arm A ladder    (default "128 256 512 1024")
+#   ARC_PC_SUBTRACT_TS  T values that also get the max_tokens=5 probe, i.e.
+#                     where the decode step is MEASURED rather than modelled
+#                     (default "128 256"). Decode is linear in context while
+#                     prefill (the quantity under test) is not, so decode's
+#                     share of t1 falls as 1/T: measuring it at the cheap end
+#                     and extrapolating costs almost nothing in accuracy and
+#                     nearly halves the arm. Every point records which it got,
+#                     and what share of t1 the subtraction was, so a reader can
+#                     check that the modelled part stayed negligible.
 #   ARC_PC_MEM_TS     Arm B ladder    (default "512 1024 2048 4096")
 #   ARC_PC_EDGE       1 = also probe T=8192 LAST, to test the OOM prediction
 #                     for real. Off by default: it may kill the server, so it
 #                     runs only after every other number is banked.
 #   ARC_PC_DISCRIM    1 = run Arm C (ARC_V4_WINDOW_ONLY discriminator)
 #   ARC_PC_SKIP_BUILD 1 = a usable ./target/release/mistralrs already exists
+#
+# COST, IF THE MECHANISM IS REAL (that is its own prediction, so read it as one):
+#   Arm B ~6 min. Arm A ~1.8 h for the full 128/256/512/1024 ladder — T=1024 is
+#   ~75 min of that by itself. Under the default 70-min budget the ladder will
+#   therefore stop after T=512 and report {128, 256, 512}, which still spans 4x
+#   and separates 16x (quadratic) from 4x (linear) decisively. Raise
+#   ARC_PC_BUDGET_S to ~7000 only if the 1024 point is worth ~$3 more and the
+#   queue can afford it. If the mechanism is FALSE the whole run is ~15 min,
+#   because a linear prefill is ~30x cheaper at T=1024 — the cheap outcome is
+#   the one that refutes.
 #
 # The box is released (server killed) on every exit path — two other jobs are
 # queued behind this one (measure_radix_topk_ab.sh, wave63_turboquant_hd512_gate.sh).
@@ -115,6 +134,7 @@ ARC_PC_BUDGET_S="${ARC_PC_BUDGET_S:-4200}"
 ARC_PC_REQ_TMO="${ARC_PC_REQ_TMO:-2400}"
 ARC_PC_MEM_WIN="${ARC_PC_MEM_WIN:-90}"
 ARC_PC_TIMING_TS="${ARC_PC_TIMING_TS:-128 256 512 1024}"
+ARC_PC_SUBTRACT_TS="${ARC_PC_SUBTRACT_TS:-128 256}"
 ARC_PC_MEM_TS="${ARC_PC_MEM_TS:-512 1024 2048 4096}"
 ARC_PC_EDGE="${ARC_PC_EDGE:-0}"
 ARC_PC_DISCRIM="${ARC_PC_DISCRIM:-0}"
@@ -361,6 +381,30 @@ print(f'{$t_end-$t_start:.3f}', u.get('prompt_tokens',0), u.get('completion_toke
 
 record() { printf '%s\n' "$1" >> "$RAW"; }
 
+in_list() { case " $2 " in *" $1 "*) return 0;; *) return 1;; esac; }
+
+# Decode cost is linear in context length, so fit `d = d0 + d1*T` over the T
+# values where it was MEASURED and evaluate there. One point: carry it forward.
+extrapolate_decode() {  # $1 = T, $2 = "T:d T:d ..."
+    python3 - "$1" "$2" <<'PY'
+import sys
+T = float(sys.argv[1]); pts = []
+for tok in sys.argv[2].split():
+    if ':' in tok:
+        a, b = tok.split(':', 1)
+        try: pts.append((float(a), float(b)))
+        except ValueError: pass
+if len(pts) >= 2:
+    n = len(pts); sx = sum(p[0] for p in pts); sy = sum(p[1] for p in pts)
+    sxx = sum(p[0] ** 2 for p in pts); sxy = sum(p[0] * p[1] for p in pts)
+    den = n * sxx - sx * sx
+    if abs(den) > 1e-12:
+        d1 = (n * sxy - sx * sy) / den; d0 = (sy - d1 * sx) / n
+        print(f'{max(0.0, d0 + d1 * T):.4f}'); sys.exit()
+print(f'{pts[-1][1]:.4f}' if pts else '0.0')
+PY
+}
+
 # ---------------------------------------------------------------------------
 # 7. ARM B — the memory law. Runs FIRST: it is cheap, spans 8x, and can kill
 #    the mechanism before Arm A spends an hour on it.
@@ -422,6 +466,7 @@ done
 step "ARM A: prefill timing vs T (ladder: $ARC_PC_TIMING_TS, budget ${ARC_PC_BUDGET_S}s)"
 ARM_A_START=$(date +%s)
 TIMING_RESULTS=""
+DECODE_POINTS=""
 TRUNCATED_AT=""
 for T in $ARC_PC_TIMING_TS; do
     kill -0 "$SERVER_PID" 2>/dev/null || { say "server died before Arm A T=$T"; TRUNCATED_AT="$T"; break; }
@@ -438,20 +483,27 @@ for T in $ARC_PC_TIMING_TS; do
         record "{\"arm\":\"A\",\"T\":$T,\"status\":\"timeout\",\"lower_bound_s\":$t1}"
         TRUNCATED_AT="$T"; break
     fi
-    spent=$(( $(date +%s) - ARM_A_START )); left=$(( ARC_PC_BUDGET_S - spent ))
-    step "ARM A: T=$T (max_tokens=5), ${left}s of budget left"
-    read -r t5 pt5 _ ok5 <<<"$(fire_completion "$T" 5 "$(( left < ARC_PC_REQ_TMO ? left : ARC_PC_REQ_TMO ))")"
-    if [ "$ok5" != "1" ]; then
-        say "ARM A: T=$T max_tokens=5 timed out; decode cannot be subtracted at this T."
-        record "{\"arm\":\"A\",\"T\":$T,\"actual_tokens\":$pt1,\"t1_s\":$t1,\"status\":\"no_decode_subtraction\"}"
-        TIMING_RESULTS="$TIMING_RESULTS $pt1:$t1"
-        TRUNCATED_AT="$T"; break
+    if in_list "$T" "$ARC_PC_SUBTRACT_TS"; then
+        spent=$(( $(date +%s) - ARM_A_START )); left=$(( ARC_PC_BUDGET_S - spent ))
+        step "ARM A: T=$T (max_tokens=5, measuring the decode step), ${left}s of budget left"
+        read -r t5 pt5 _ ok5 <<<"$(fire_completion "$T" 5 "$(( left < ARC_PC_REQ_TMO ? left : ARC_PC_REQ_TMO ))")"
+        if [ "$ok5" != "1" ]; then
+            say "ARM A: T=$T max_tokens=5 timed out; decode cannot be measured at this T."
+            record "{\"arm\":\"A\",\"T\":$T,\"actual_tokens\":$pt1,\"t1_s\":$t1,\"status\":\"no_decode_subtraction\"}"
+            TRUNCATED_AT="$T"; break
+        fi
+        dstep=$(python3 -c "print(f'{($t5-$t1)/4.0:.4f}')")
+        DECODE_POINTS="$DECODE_POINTS $pt1:$dstep"
+        dsrc="measured"; t5_field="$t5"
+    else
+        dstep=$(extrapolate_decode "$T" "$DECODE_POINTS")
+        dsrc="extrapolated"; t5_field="null"
     fi
-    read -r dstep prefill <<<"$(python3 -c "
-d=($t5-$t1)/4.0
-print(f'{d:.4f}', f'{$t1-d:.4f}')")"
-    say "ARM A T=$T (actual ${pt1} tok): t1=${t1}s t5=${t5}s -> decode_step=${dstep}s prefill=${prefill}s"
-    record "{\"arm\":\"A\",\"T\":$T,\"actual_tokens\":$pt1,\"t1_s\":$t1,\"t5_s\":$t5,\"decode_step_s\":$dstep,\"prefill_s\":$prefill}"
+    read -r prefill dshare <<<"$(python3 -c "
+p=$t1-$dstep
+print(f'{p:.4f}', f'{($dstep/$t1 if $t1>0 else 0):.5f}')")"
+    say "ARM A T=$T (actual ${pt1} tok): t1=${t1}s decode_step=${dstep}s ($dsrc, ${dshare} of t1) -> prefill=${prefill}s"
+    record "{\"arm\":\"A\",\"T\":$T,\"actual_tokens\":$pt1,\"t1_s\":$t1,\"t5_s\":$t5_field,\"decode_step_s\":$dstep,\"decode_source\":\"$dsrc\",\"decode_share_of_t1\":$dshare,\"prefill_s\":$prefill}"
     TIMING_RESULTS="$TIMING_RESULTS $pt1:$prefill"
 done
 
