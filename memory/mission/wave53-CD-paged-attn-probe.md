@@ -430,6 +430,16 @@ tensor_device_ptr: unsupported dtype I32`.
 
 ## 9. Surfaced, not shipped
 
+> 🔴 **Noticed:** `try_dedicated_decode` (§5g) will happily run a **dense
+> Llama-shaped** decode — fused QKV, one MLP, no sliding window, no sinks — on
+> **any** model whose loader reports paged-attention support, with no
+> architecture check anywhere in the path. V4 is protected today only by
+> accidents (its weight extraction fails; its paged flag is off). Nothing
+> asserts that `DecodeConfig` actually describes the loaded model. A named guard
+> — refuse the dedicated path unless the architecture is one it implements — is
+> cheap and would convert a silent-wrong-output class into an error. Worth a
+> separate change?
+
 > **Noticed:** the missing `runner.capture(&forward_fn)` call is the *actual*
 > single thing standing between the workspace and GPU-autonomous decode, on
 > every model, not just V4 — `prime_for_step` is wired, the runner allocates,

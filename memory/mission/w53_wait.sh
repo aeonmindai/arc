@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Wait until both legs finish (or something dies). ONE ssh per 5 min.
-while true; do
+# Final waiter: ONE runcrate ssh per 5 min, exits when the probe writes W53_DONE.
+for i in $(seq 1 12); do
   sleep 300
-  N=$(runcrate ssh arc-w53-paged -- 'grep -cE "^(W53_DONE|FAIL:|RUN [AB] FAILED|SERVER \[)" /root/w53.log' 2>/dev/null | tr -dc '0-9')
-  if [ "${N:-0}" -gt 0 ]; then
-    runcrate ssh arc-w53-paged -- 'sed -n "/===== 4 RUN A/,\$p" /root/w53.log | tail -c 5000' 2>/dev/null
-    echo "W53_MILESTONE"
-    break
+  DONE=$(runcrate ssh arc-w53-paged -- 'grep -c W53_DONE /root/w53.log 2>/dev/null || echo 0' 2>/dev/null | tr -dc '0-9')
+  if [ "${DONE:-0}" != "0" ]; then
+    runcrate ssh arc-w53-paged -- 'cat /root/w53_result.txt 2>/dev/null; echo "=== gen_on ==="; cat /root/gen_on.json 2>/dev/null' 2>/dev/null
+    echo "W53_DONE_READ"
+    exit 0
   fi
 done
+echo "W53_TIMEOUT_60MIN"
