@@ -71,13 +71,44 @@ say "INFO  gpu:  $(nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader
 # --- 1. does this toolkit even support the arches we claim? ------------------
 # A missing sm_103a here is a TOOLKIT limit, not an Arc failure. Separating the
 # two is the whole point of having a step for it.
-CODES=$(nvcc --list-gpu-code 2>/dev/null | tr -d ' ')
+#
+# ⚠ DO NOT grep `nvcc --list-gpu-code`. That listing NEVER prints the `a`
+# variants — CUDA 12.9 shows sm_90 / sm_100 / sm_103 and no arch-specific
+# forms — so grepping it for `sm_90a` reports "toolkit cannot target sm_90a"
+# on a toolkit that can. A capability listing was consulted instead of the
+# artefact, and the answer was never going to be in it.
+#
+# Believe the artefact: compile for the target and read the `.target` line out
+# of the PTX. That also catches the sharper fault underneath — `-arch=sm_90a`
+# is accepted with no diagnostic and yields a `compute_90` intermediate, so a
+# request silently not honoured looks identical to a hardware limit.
+echo 'extern "C" __global__ void _arctarget_probe() {}' > "$WORK/_arch_probe.cu"
+toolkit_can() {                       # $1 = capability (80/89/90/100/103)
+  local cc=$1 sfx="" want ptx
+  [ "$cc" -ge 90 ] && sfx="a"
+  want="sm_${cc}${sfx}"
+  ptx="$WORK/_arch_probe_${want}.ptx"
+  if ! nvcc -gencode "arch=compute_${cc}${sfx},code=${want}" -ptx \
+       -o "$ptx" "$WORK/_arch_probe.cu" > "$WORK/_arch_probe_${want}.log" 2>&1; then
+    say "INFO  $want: nvcc refused — $(head -1 "$WORK/_arch_probe_${want}.log")"
+    return 1
+  fi
+  local got
+  got=$(grep -m1 '^\.target' "$ptx" | tr -d ' \t' | sed 's/^\.target//')
+  if [ "$got" != "$want" ]; then
+    # Accepted the request, produced something else, said nothing.
+    say "INFO  $want: nvcc ACCEPTED the flag and emitted .target '$got' (D18 #13)"
+    return 1
+  fi
+  return 0
+}
 TOOLKIT_ARCHS=""
-for a in sm_80 sm_89 sm_90a sm_100a sm_103a; do
-  if echo "$CODES" | grep -qx "$a"; then
-    TOOLKIT_ARCHS="$TOOLKIT_ARCHS $a"
+for cc in 80 89 90 100 103; do
+  sfx=""; [ "$cc" -ge 90 ] && sfx="a"
+  if toolkit_can "$cc"; then
+    TOOLKIT_ARCHS="$TOOLKIT_ARCHS sm_${cc}${sfx}"
   else
-    say "INFO  toolkit does NOT support $a"
+    say "INFO  toolkit does NOT support sm_${cc}${sfx}"
   fi
 done
 say "INFO  toolkit supports:$TOOLKIT_ARCHS"
@@ -88,11 +119,14 @@ say "INFO  toolkit supports:$TOOLKIT_ARCHS"
 # stated in the public docs — so ask the compiler instead of guessing. A path
 # guarded only on `__CUDA_ARCH__ >= 900` would fail to compile the moment
 # someone builds plain sm_90.
-for arch in sm_90 sm_90a sm_100a; do
-  echo "$TOOLKIT_ARCHS" | grep -q "$arch" || continue
-  defs=$(nvcc -arch=$arch -dM -E -x cu /dev/null 2>/dev/null \
+# `-gencode`, not `-arch`: `-arch=sm_90a` is accepted silently and yields a
+# compute_90 intermediate, so asking it for predefines would answer for the
+# plain target and we would conclude the distinguishing macro does not exist.
+for spec in "compute_90:sm_90" "compute_90a:sm_90a" "compute_100a:sm_100a"; do
+  virt=${spec%%:*}; real=${spec##*:}
+  defs=$(nvcc -gencode "arch=${virt},code=${real}" -dM -E -x cu /dev/null 2>/dev/null \
          | grep -i '__CUDA_ARCH' | sort | tr '\n' ' ')
-  say "INFO  $arch predefines: ${defs:-<none captured>}"
+  say "INFO  $real predefines: ${defs:-<none captured — target unsupported here>}"
 done
 # Build the request from what the toolkit can actually produce, so a toolkit
 # gap fails as a toolkit gap rather than as an Arc bug.
@@ -201,7 +235,7 @@ fi
 
 # --- 7. the wgmma descriptor probe -----------------------------------------
 say "STEP  wgmma shared-memory descriptor probe"
-if nvcc -arch=sm_90a -std=c++17 -O3 -o "$WORK/wgmma_probe" \
+if nvcc -gencode arch=compute_90a,code=sm_90a -std=c++17 -O3 -o "$WORK/wgmma_probe" \
      arc-tools/probe/arctarget_wgmma_desc_probe.cu > "$WORK/probe_build.log" 2>&1; then
   "$WORK/wgmma_probe" > "$WORK/probe_run.log" 2>&1
   prc=$?
@@ -236,7 +270,8 @@ __global__ void k(uint32_t* addr) {
 #endif
 }
 EOF
-  if nvcc -arch=sm_100a -std=c++17 -c -o "$WORK/tcgen05_probe.o" "$WORK/tcgen05_probe.cu" \
+  if nvcc -gencode arch=compute_100a,code=sm_100a -std=c++17 -c \
+       -o "$WORK/tcgen05_probe.o" "$WORK/tcgen05_probe.cu" \
        > "$WORK/tcgen05.log" 2>&1; then
     pass "tcgen05 mnemonics assemble for sm_100a (COMPILE-ONLY, never executed)"
   else

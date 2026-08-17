@@ -245,8 +245,14 @@ pub fn verify_and_export(archive: &Path, requested: Option<&[CudaArch]>) {
              MISSING: {}.\n\
              The build exited 0 while producing a binary that has no code for those \
              architectures; on such a device every Arc kernel launch fails with \
-             cudaErrorNoKernelImageForDevice (Arc embeds no PTX). Check that the toolkit \
-             supports them: `nvcc --list-gpu-code`.",
+             cudaErrorNoKernelImageForDevice (Arc embeds no PTX).\n\
+             To check whether the toolkit can target one, compile for it and read the \
+             artefact back — do NOT grep `nvcc --list-gpu-code`, which never prints the \
+             arch-specific `a` variants at all and so reports every one of them missing:\n\
+             \x20 nvcc -gencode arch=compute_90a,code=sm_90a -ptx -o /tmp/t.ptx t.cu \\\n\
+             \x20   && grep '^.target' /tmp/t.ptx\n\
+             Use `-gencode`, not `-arch`: `-arch=sm_90a` is accepted with no diagnostic \
+             and emits a compute_90 intermediate.",
             render_arch_list(want),
             archive.display(),
             render_arch_list(&built),

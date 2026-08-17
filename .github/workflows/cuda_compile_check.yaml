@@ -330,6 +330,11 @@ jobs:
       - name: CUDA + link-path setup
         run: |
           nvcc --version
+          # Informational ONLY — never gate on this. `--list-gpu-code` does not
+          # print the arch-specific `a` variants (no sm_90a/sm_100a/sm_103a
+          # appear even on a toolkit that targets all three), so grepping it
+          # for them reports every one missing. The gate below reads the
+          # produced artefact instead.
           nvcc --list-gpu-code
           CUDA_ROOT="${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
           echo "LIBRARY_PATH=${CUDA_ROOT}/lib64/stubs:${CUDA_ROOT}/lib64:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
