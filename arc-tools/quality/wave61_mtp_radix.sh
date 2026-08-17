@@ -53,6 +53,7 @@ OUT="${OUT:-/root/wave61}"
 PORT="${PORT:-1234}"
 COST_HR="${COST_HR:-4.92}"
 PREFIX_TOKENS="${PREFIX_TOKENS:-1400}"
+MTP_BATCHES="${MTP_BATCHES:-1 8 32 128 256}"
 Q="$REPO/arc-tools/quality"
 STATUS="$OUT/status.txt"
 
@@ -169,7 +170,7 @@ canary() {
 
 # ---------------------------------------------------------------- phase 1: MTP
 say "PHASE1 MTP acceptance at batch (depth 3, prefix cache OFF so draft KV primes)"
-start_server mtp 3 0 128 || die_env SERVER_MTP "MTP server never came up; see $OUT/serve_mtp.log"
+start_server mtp 3 0 256 || die_env SERVER_MTP "MTP server never came up; see $OUT/serve_mtp.log"
 grep -c "UNSUPPORTED_PTX" "$OUT/serve_mtp.log" | grep -qv '^0$' && \
     die_env PTX "UNSUPPORTED_PTX in the MTP serve log despite a passing preflight"
 canary mtp || die_env CANARY_MTP "MTP server is incoherent — the run is VOID, no MTP number is reported"
@@ -186,7 +187,7 @@ canary mtp || die_env CANARY_MTP "MTP server is incoherent — the run is VOID, 
 # the aggregate markers do not.
 say "PHASE1 sweep B=1,8,32,128 at 64 decode tokens, temperature 0 (one probe per B)"
 : > "$OUT/mtp_fences.txt"
-for B in 1 8 32 128; do
+for B in $MTP_BATCHES; do
     echo "FENCE_START B=$B $(date -u +%Y-%m-%dT%H:%M:%S)" >> "$OUT/mtp_fences.txt"
     ( cd "$Q" && python3 batch_load_probe.py \
         --batches "$B" --reps 2 --max-tokens 64 --temperature 0 \
@@ -217,6 +218,32 @@ if ! [ -s "$OUT/mtp_markers.txt" ] && ! [ -s "$OUT/mtp_by_batch.json" ]; then
     say "PHASE1 WARNING: no MTP data at all. Acceptance is UNMEASURED — NOT 0%."
     grep -m3 -iE "mtp|speculative" "$OUT/serve_mtp.log" | tee -a "$STATUS"
 fi
+stop_server
+
+# ---------------------------------------------------------------- phase 1b
+#
+# MTP-OFF CONTROL, same batch sizes, same everything else.
+#
+# Without it the MTP-on curve cannot be read. Run 1 peaked at B=32 (47.45 tok/s)
+# and FELL at B=128 (43.73), where prior work recorded a monotone rise to 111.69
+# at B=256 — but that baseline was --mtp-depth 0 with prefix caching on, so the
+# pair is not like-for-like and the shortfall cannot be attributed. --mtp-depth 3
+# adds a verify forward per step, which is exactly the kind of work that would
+# bend a throughput curve down as batch grows. This control differs from PHASE1
+# in ONE variable, so subtracting the two isolates MTP's cost from any
+# independent regression.
+say "PHASE1b MTP-OFF control (--mtp-depth 0), identical batch sizes and prompts"
+start_server mtpoff 0 0 256 || die_env SERVER_MTPOFF "MTP-off control server never came up"
+canary mtpoff --skip-facts || die_env CANARY_MTPOFF "MTP-off control is incoherent — VOID"
+for B in $MTP_BATCHES; do
+    ( cd "$Q" && python3 batch_load_probe.py \
+        --batches "$B" --reps 2 --max-tokens 64 --temperature 0 \
+        --cost-per-hour "$COST_HR" --label "mtpoff_b$B" \
+        --out "$OUT/mtpoff_b$B.json" ) > "$OUT/mtpoff_b$B.log" 2>&1
+    say "  control B=$B rc=$?"
+    grep -E "^(BATCH|CONC|FAIL|WARN)" "$OUT/mtpoff_b$B.log" | tee -a "$STATUS"
+    grep -E "^  B=[0-9]+ rep" "$OUT/mtpoff_b$B.log" | tee -a "$STATUS"
+done
 stop_server
 
 # ---------------------------------------------------------------- phase 2: radix
@@ -324,8 +351,15 @@ say "      production callers and is NOT reportable. Backlog, not a number."
 # batch row read `decode agg None tok/s` — a clean pass over an empty result,
 # which is the same fake-pass class the canary exists to prevent, one layer up.
 # A requested batch size that yields no throughput is a failed run.
+say "-- MTP-on vs MTP-off aggregate, per batch (the only comparable pair):"
+for B in $MTP_BATCHES; do
+    on="$(grep -h "^BATCH\[B=$B\]" "$OUT/mtp_b$B.log" 2>/dev/null | sed -n 's/.*decode agg \([^ ]*\) tok\/s.*/\1/p')"
+    off="$(grep -h "^BATCH\[B=$B\]" "$OUT/mtpoff_b$B.log" 2>/dev/null | sed -n 's/.*decode agg \([^ ]*\) tok\/s.*/\1/p')"
+    say "   B=$B  mtp_on=${on:-none}  mtp_off=${off:-none}"
+done
+
 missing=""
-for f in "$OUT"/mtp_b*.log "$OUT"/radix_*.log; do
+for f in "$OUT"/mtp_b*.log "$OUT"/mtpoff_b*.log "$OUT"/radix_*.log; do
     [ -f "$f" ] || continue
     while IFS= read -r line; do
         case "$line" in
