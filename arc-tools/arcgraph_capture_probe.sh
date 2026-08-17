@@ -351,10 +351,47 @@ ARC_PROFILE=1 ARC_PROFILE_STEPS=12 ARC_PROFILE_OUT=$LOGDIR/profile ARC_PROFILE_L
     fi
     LEGS_HEALTHY=$((LEGS_HEALTHY + 1))
     slog="$LOGDIR/capture_w${w}d${d}.server.log"
-    # Count ONLY misses after capture began. Misses during the deferred passes
-    # are the passes doing their job — the candle warning does not distinguish
-    # them, because `capturing` is set for both.
+
+    # ── The miss count is the direct test of the pre-grow mechanism, so it has
+    # to be impossible to read a zero that means something else. Three separate
+    # preconditions, each asserted on its own, because `grep -c` over a missing
+    # file cheerfully prints 0 — which is exactly how I nearly reported the
+    # mechanism confirmed off a run that never started.
+    if [ ! -s "$slog" ]; then
+        say "RESULT w=$w d=$d: NO MISS COUNT — server log missing or empty ($slog)"
+        continue
+    fi
+    if ! grep -q "capture started for batch_size" "$slog"; then
+        say "RESULT w=$w d=$d: NO MISS COUNT — capture never started, so zero \
+post-capture misses would be vacuous"
+        continue
+    fi
+    # A precondition confirmed is not the postcondition: capture STARTING says
+    # nothing about the forward COMPLETING, and a truncated forward never
+    # allocates the full set. That is precisely how a 4 -> 0 reading was
+    # produced earlier tonight and had to be retracted.
+    if grep -q "Model failed with error" "$slog"; then
+        say "RESULT w=$w d=$d: MISS COUNT NOT TRUSTWORTHY — the forward errored, \
+so any count is over a truncated allocation set. First error:"
+        grep -m1 -oE "Model failed with error: .{0,140}" "$slog" | sed 's/^/    /' | tee -a "$STATUS"
+        continue
+    fi
+
+    # POSITIVE CONTROL. Misses during the deferred-free passes are the passes
+    # doing their job, and candle emits them with the same string because its
+    # `capturing` flag is set for both. That makes them useful: if the whole log
+    # contains no miss line at all, this counter has never printed non-zero in
+    # this run and a post-capture zero proves nothing about the mechanism.
+    misses_total=$(grep -c "MISS during capture" "$slog" 2>/dev/null); misses_total=${misses_total:-0}
     misses=$(awk '/capture started for batch_size/{f=1} f && /MISS during capture/' "$slog" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$misses_total" -eq 0 ] 2>/dev/null; then
+        say "RESULT w=$w d=$d: post-capture misses=0 but the counter never fired \
+anywhere in this log (total=0) — UNPROVEN, not confirmed. A zero that has never \
+been seen non-zero is decoration."
+    else
+        say "counter proven live: $misses_total miss line(s) in the log overall, \
+$misses of them after capture began"
+    fi
     # 🔴 `grep -c` prints "0" AND exits 1 when there are no matches, so the
     # old `|| echo 0` appended a SECOND zero: `launched` became "0\n0", and the
     # string test `[ "$launched" != "0" ]` was true. The sweep announced
