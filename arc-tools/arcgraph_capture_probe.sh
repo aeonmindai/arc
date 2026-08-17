@@ -114,17 +114,41 @@ say "CUDA_HOME=$CUDA_HOME LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
 #    box; see measure_v4_prefill_curve.sh:212). Check the flag it sets, and
 #    require the flag to exist at all — unset means the checks never ran.
 # --------------------------------------------------------------------------
-step "gate 1/3: preflight"
+step "gate 1/3: PTX-JIT gate"
+# The silent-PTX trap must be gated, but `arc-tools/gpu_box_preflight.sh` is NOT
+# on master — it lives only on the unmerged branch wave61/box-preflight-shared-prefix
+# (commit 0f1805a7e). `measure_v4_prefill_curve.sh:204` hard-fails without it, so
+# that script cannot pass its own gate from a clean master checkout.
+#
+# Accept EITHER gate, and require that ONE of them actually ran. Never skip:
+# an ungated box reports a BETTER number, not a worse one, so a missing gate is
+# indistinguishable from a passing one in the results.
+PTX_RECEIPT="${PTX_RECEIPT:-$LOGDIR/PTX_GATE_PASSED}"
 PREFLIGHT="/root/arc-tools/gpu_box_preflight.sh"
-[ -f "$PREFLIGHT" ] || PREFLIGHT="$REPO/arc-tools/gpu_box_preflight.sh"
-[ -f "$PREFLIGHT" ] || env_fail "gpu_box_preflight.sh absent; refusing to measure without the PTX gate"
-# shellcheck disable=SC1090
-source "$PREFLIGHT" --flags "serve --from-uqff --max-seq-len --prefix-cache-n --paged-attn" || true
-if [ -z "${_ARC_PF_FAILED+x}" ]; then
-    env_fail "preflight did not set _ARC_PF_FAILED — the checks did not run"
+[ -f "$PREFLIGHT" ] || PREFLIGHT="$WORKTREE/arc-tools/gpu_box_preflight.sh"
+if [ -f "$PREFLIGHT" ]; then
+    # ⚠️ `source preflight || handler` DOES NOT WORK: on a failing box the
+    # script's trailing `[ ... ] || exit 1` succeeds, short-circuits the `||`,
+    # and `source` returns 0 — a FAILED preflight reads as a PASS. Check the
+    # flag it sets, and require the flag to exist at all.
+    # shellcheck disable=SC1090
+    source "$PREFLIGHT" --flags "serve --from-uqff --max-seq-len --prefix-cache-n --paged-attn" || true
+    [ -n "${_ARC_PF_FAILED+x}" ] || env_fail "sourcing $PREFLIGHT did not set _ARC_PF_FAILED — the checks never ran"
+    [ "$_ARC_PF_FAILED" = "0" ] || env_fail "gpu_box_preflight.sh FAILED; see its FAIL[<CHECK>] line above"
+    say "preflight passed ($PREFLIGHT)"
+elif [ -f "$PTX_RECEIPT" ]; then
+    # Written by arcgraph_box_bootstrap.sh, which compiles a kernel to PTX ONLY
+    # (-arch=compute_90 -code=compute_90, so the driver MUST JIT it), checks
+    # cudaGetLastError() — the error the silent path drops — and requires the
+    # kernel to return 42. Strictly stronger than a presence check.
+    say "PTX-JIT gate satisfied by receipt: $(cat "$PTX_RECEIPT")"
+else
+    env_fail "NO PTX GATE RAN. gpu_box_preflight.sh is absent (it is not on master — \
+only on wave61/box-preflight-shared-prefix) and no $PTX_RECEIPT receipt exists. \
+Refusing to measure ungated: without cuda-compat the driver JITs a too-new PTX ISA, \
+the failure lands in cudaGetLastError() which nothing checks, and the run produces \
+plausible WRONG numbers with a clean exit."
 fi
-[ "$_ARC_PF_FAILED" = "0" ] || env_fail "preflight FAILED; see its FAIL[<CHECK>] line above"
-say "preflight passed"
 
 # --------------------------------------------------------------------------
 # 2. Build the instrumented branch.
