@@ -17,6 +17,21 @@ on:
 
 name: Continuous integration
 
+# Widening the trigger above multiplies this workflow across every stacked PR,
+# so it must stop paying for superseded runs on the same ref — `ci.yml` is 12
+# jobs, the largest multiplier in the repo, and was the only workflow without
+# this. `cuda_compile_check.yaml` has carried the identical block for a while;
+# this is the same shape deliberately, not a new policy.
+#
+# The `head_ref || run_id` idiom is load-bearing: on `pull_request`, `head_ref`
+# is the source branch, so a new push cancels that PR's own in-flight run. On
+# `push`, `schedule` and `workflow_dispatch`, `head_ref` is empty and the
+# fallback `run_id` is unique per run — so master pushes and scheduled runs are
+# never cancelled by each other, only PR iterations are.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   check:
     name: Check
