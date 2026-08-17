@@ -207,12 +207,25 @@ verdict_for() {
     if ! grep -q "Loading model" "$f" 2>/dev/null && ! grep -q "Model loaded" "$f" 2>/dev/null; then
         echo "UNPROVEN (server never loaded)"; return
     fi
-    if [ "$(cat "$LOGDIR/$name.tokens" 2>/dev/null || echo 0)" = "0" ]; then
-        echo "UNPROVEN (leg served 0 tokens)"; return
-    fi
-    local n
+    local n tok
     n=$(grep -ciE 'malloc_consolidate|free\(\):|malloc\(\):|corrupted|double free' "$f" 2>/dev/null)
-    echo "${n:-0} glibc diagnostic(s) over $(cat "$LOGDIR/$name.tokens") tokens"
+    n=${n:-0}
+    tok=$(cat "$LOGDIR/$name.tokens" 2>/dev/null || echo 0)
+    # A leg that loaded, ran, and then DIED WITH A GLIBC DIAGNOSTIC is a result,
+    # not a vacuum — the zero tokens are the CONSEQUENCE of the finding, not
+    # evidence the leg never happened. The first version of this check reported
+    # exactly that case as "UNPROVEN (0 tokens)" and buried a positive result
+    # under a guard written for the opposite failure. Distinguish "never ran"
+    # from "ran and was killed by the thing we are measuring".
+    if [ "$tok" = "0" ] && [ "$n" -eq 0 ] 2>/dev/null; then
+        echo "UNPROVEN (server loaded but served 0 tokens, and no diagnostic to explain why)"
+        return
+    fi
+    if [ "$tok" = "0" ]; then
+        echo "$n glibc diagnostic(s); served 0 tokens BECAUSE it died — a result, not a vacuum"
+        return
+    fi
+    echo "$n glibc diagnostic(s) over $tok tokens"
 }
 say "  graphs_off: $(verdict_for graphs_off)"
 say "  graphs_on : $(verdict_for graphs_on)"
