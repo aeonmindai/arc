@@ -35,11 +35,16 @@ use std::time::Duration;
 
 /// Arc — A high-performance LLM inference engine with TurboQuant compression.
 ///
-/// Built on mistral.rs. Defaults to TurboQuant 3.5-bit KV cache (lossless).
+/// Built on mistral.rs. Arc picks the KV cache format, device map and
+/// quantisation for the model you load and logs what it resolved on startup.
+//
+// The second line used to read "Defaults to TurboQuant 3.5-bit KV cache
+// (lossless)" — the same unconditional claim removed from the runtime banner.
+// It is decided per model at load time, so `--help` cannot state it.
 #[derive(Parser)]
 #[command(name = "arc", version, about, long_about = None)]
 #[command(
-    after_help = "Arc inference engine by Aeonmind, LLC\nhttps://runcrate.ai/arc\nPowered by mistral.rs + TurboQuant (ICLR 2026)"
+    after_help = "Run `--help-all` on any subcommand for the complete flag set.\n\nArc inference engine by Aeonmind, LLC\nhttps://runcrate.ai/arc\nPowered by mistral.rs + TurboQuant (ICLR 2026)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -180,6 +185,39 @@ fn main() {
     //
     // In production, this will be a proper clap integration that reuses
     // the mistralrs-cli command definitions. For now, exec the upstream binary.
+    // `--help-all` un-hides arc's own debug flags. Subcommands that forward to
+    // the mistralrs binary pass the flag straight through, so it means the
+    // same thing everywhere.
+    if std::env::args().any(|a| a == "--help-all")
+        && !matches!(
+            std::env::args().nth(1).as_deref(),
+            Some("serve") | Some("run")
+        )
+    {
+        fn unhide_all(cmd: clap::Command) -> clap::Command {
+            cmd.mut_args(|a| a.hide(false)).mut_subcommands(unhide_all)
+        }
+        // Descend to the subcommand named on the command line so
+        // `arc bench --help-all` shows bench's flags, not the root's.
+        let mut cmd = unhide_all(<Cli as clap::CommandFactory>::command());
+        for token in std::env::args().skip(1) {
+            if token.starts_with('-') {
+                continue;
+            }
+            let matched = cmd
+                .get_subcommands()
+                .find(|s| s.get_name() == token)
+                .cloned();
+            match matched {
+                Some(sub) => cmd = sub,
+                None => break,
+            }
+        }
+        cmd.print_long_help().ok();
+        println!();
+        return;
+    }
+
     let cli = Cli::parse();
 
     let (subcmd, args) = match cli.command {

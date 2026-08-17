@@ -20,25 +20,36 @@ pub struct PagedAttentionOptions {
     /// - auto: enabled on CUDA, disabled on Metal/CPU (default)
     /// - on: force enable (fails if unsupported)
     /// - off: force disable
-    #[arg(long = "paged-attn", default_value = "auto", value_enum)]
+    ///
+    /// Hidden: `auto` already enables it everywhere it works. Forcing it off
+    /// costs throughput; forcing it on fails on unsupported devices.
+    #[arg(long = "paged-attn", default_value = "auto", value_enum, hide = true)]
     #[serde(default)]
     pub mode: PagedAttnMode,
 
-    /// Allocate KV cache for this context length.
-    /// If not specified, defaults to using 90% of available VRAM.
-    #[arg(long = "pa-context-len")]
+    /// How long conversations may get: sizes the KV cache for this many
+    /// tokens. Defaults to filling ~90% of free VRAM.
+    #[arg(long = "pa-context-len", help_heading = "Serving")]
     pub context_len: Option<usize>,
 
     /// GPU memory to allocate in MBs (alternative to context-len)
-    #[arg(long = "pa-memory-mb", conflicts_with = "context_len")]
+    ///
+    /// Hidden: a second way to say --pa-context-len, in units that do not
+    /// describe what the user actually wants.
+    #[arg(long = "pa-memory-mb", conflicts_with = "context_len", hide = true)]
     pub memory_mb: Option<usize>,
 
     /// GPU memory utilization fraction 0.0-1.0 (alternative to context-len/memory-mb)
-    #[arg(long = "pa-memory-fraction", conflicts_with_all = ["context_len", "memory_mb"])]
+    ///
+    /// Hidden: third spelling of the same decision.
+    #[arg(long = "pa-memory-fraction", conflicts_with_all = ["context_len", "memory_mb"], hide = true)]
     pub memory_fraction: Option<f32>,
 
     /// Tokens per block (default: 32 on CUDA)
-    #[arg(long = "pa-block-size")]
+    ///
+    /// Hidden: a paging granularity tradeoff with no user-visible meaning;
+    /// wrong values cost throughput silently.
+    #[arg(long = "pa-block-size", hide = true)]
     pub block_size: Option<usize>,
 
     /// KV cache quantization type: turboquant (K4/V3, 3.5-bit, experimental),
@@ -48,7 +59,12 @@ pub struct PagedAttentionOptions {
     /// other than 128, so most models get `auto`. Setting it explicitly makes
     /// an unsupported model a hard error instead. TurboQuant has no measured
     /// serving run behind it; quality is not established.
-    #[arg(long = "pa-cache-type", value_parser = parse_cache_type)]
+    // Hidden: overriding Arc's resolved KV cache type is the clearest way to
+    // silently make a deployment worse — every TurboQuant variant currently
+    // disables prefix caching, and an explicit choice converts the safe
+    // auto-fallback into a hard error. Still fully supported via `--help-all`.
+    // (Attribute only — the doc text above is owned by the TurboQuant chain.)
+    #[arg(long = "pa-cache-type", value_parser = parse_cache_type, hide = true)]
     #[serde(default)]
     pub cache_type: Option<PagedCacheType>,
 }

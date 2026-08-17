@@ -12,7 +12,7 @@ mod config;
 mod ui;
 
 use anyhow::Result;
-use clap::{CommandFactory, Parser};
+use clap::{Command as ClapCommand, CommandFactory, FromArgMatches};
 use clap_complete::generate;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -24,6 +24,59 @@ use commands::{
     run_bench, run_cache_delete, run_cache_list, run_calibrate, run_doctor, run_from_config,
     run_interactive, run_login, run_quantize, run_server, run_tune,
 };
+
+/// Recursively un-hide every argument so `--help-all` can render the complete
+/// surface.
+///
+/// Hiding a flag must never make it undiscoverable — the short `--help` answers
+/// "what do I need to type", and this answers "what else exists". Every hidden
+/// flag keeps working exactly as before; it only leaves the default menu.
+fn unhide_all(cmd: ClapCommand) -> ClapCommand {
+    cmd.mut_args(|a| a.hide(false)).mut_subcommands(unhide_all)
+}
+
+/// Advertise `--help-all` on every subcommand, not just the root — a user who
+/// types `arc serve --help` is exactly the person who needs to know the short
+/// list is deliberate and that the rest is one flag away.
+const HELP_ALL_HINT: &str = "Arc chooses sensible defaults for everything not listed here.\n\
+     Run `--help-all` (works on any subcommand) for the complete set,\n\
+     including quantisation internals, device-map planning and debug switches.\n\
+     On startup Arc logs an `ArcServe:` line reporting what it actually resolved.";
+
+fn with_help_all_hint(cmd: ClapCommand) -> ClapCommand {
+    cmd.after_help(HELP_ALL_HINT)
+        .mut_subcommands(with_help_all_hint)
+}
+
+/// Handle `--help-all` before clap parses, since it is not a real argument.
+///
+/// Returns `true` if help was printed and the process should exit.
+fn print_help_all_if_requested() -> bool {
+    if !std::env::args().any(|a| a == "--help-all") {
+        return false;
+    }
+    // Render the full help for the deepest subcommand named on the command
+    // line, so `arc serve --help-all` shows serve's flags rather than the top
+    // level. Anything that is not a known subcommand (values, flags) stops the
+    // descent.
+    let mut cmd = unhide_all(Cli::command());
+    for token in std::env::args().skip(1) {
+        if token.starts_with('-') {
+            continue;
+        }
+        let matched = cmd
+            .get_subcommands()
+            .find(|s| s.get_name() == token || s.get_all_aliases().any(|a| a == token))
+            .cloned();
+        match matched {
+            Some(sub) => cmd = sub,
+            None => break,
+        }
+    }
+    cmd.print_long_help().ok();
+    println!();
+    true
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -39,7 +92,15 @@ async fn main() -> Result<()> {
     // weights via whitened Tucker decomposition after model load.
     arc_engine::td_moe_loader::register_td_moe_hook();
 
-    let cli = Cli::parse();
+    if print_help_all_if_requested() {
+        return Ok(());
+    }
+
+    let matches = with_help_all_hint(Cli::command()).get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
 
     match cli.command {
         Command::Serve {
