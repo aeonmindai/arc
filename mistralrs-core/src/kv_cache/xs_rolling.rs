@@ -82,6 +82,19 @@
 //!   of them. `base_i` stays the *semantic* resume point and may sit above the
 //!   physical start when another row in the batch retained more.
 //!
+//!   The one invariant this costs is `base_i >= tokens_i - W` — row `i`'s
+//!   promised run has to fit in the shared window — and **nothing more**. In
+//!   particular a row may be *shorter than the window is wide*: a batch of
+//!   unequal prompts sizes `W` for its greediest row, and every other row is
+//!   front-padded into it (`kv_cache::pad_slack` with `v_slack_at_front`). Those
+//!   leading `W - tokens_i` columns would stand for tokens before token 0; they
+//!   are pad, and they are never read, because every offset
+//!   [`plan_xs_advance`] derives comes from that row's own token count and is
+//!   therefore `>= W - tokens_i`. Requiring `tokens_i >= W` instead — which is
+//!   what shipped, and is *sufficient* for the arithmetic rather than necessary
+//!   — refused exactly the batches this file exists to make possible: at B=8
+//!   with unequal prompts every request died at its first decode step.
+//!
 //! Today's uniform layout is the special case `W == tokens - base`, under
 //! which end-anchored and start-anchored coincide **exactly** — which is why
 //! [`XsRollingCache::advance`] keeps a verbatim uniform fast path and every
@@ -234,15 +247,29 @@ pub(crate) fn plan_xs_advance(
     let mut band_hi = 0usize;
 
     for (i, (&tok, &bas)) in tokens.iter().zip(base).enumerate() {
-        // Physical start of row `i`'s retained window, as an absolute token.
-        let phys_start = tok.checked_sub(w_phys).ok_or_else(|| {
-            candle_core::Error::msg(format!(
-                "xs rolling cache: row {i} holds {tok} tokens but the retained window is {w_phys} \
-                 wide, so it would begin before token 0. The window is end-anchored — every row's \
-                 live run finishes at the same column — so this means `tokens` and `tail` were \
-                 set inconsistently."
-            ))
-        })?;
+        // The one invariant the end-anchored layout needs: row `i`'s promised
+        // live run has to FIT in the shared physical window. It is exactly the
+        // `base[i] >= tokens[i] - w_phys` this type documents, written so it
+        // does not underflow when the window is wider than the row is long.
+        //
+        // 🔑 It is NOT `tok >= w_phys`. A row shorter than the widest row's
+        // window is the normal case the moment prompts differ in length: the
+        // batched window is `max_j (tokens_j - base_j)` wide, and a short row is
+        // front-padded into it (`kv_cache::pad_slack`, `v_slack_at_front`). Its
+        // leading `w_phys - tok` columns are pad — they would stand for tokens
+        // before token 0 — and every offset below is derived from this row's own
+        // token count, so `off >= w_phys - tok` holds for all of them and the
+        // pad is never read. Demanding `tok >= w_phys` refused that batch
+        // outright, which is what killed every ragged B>1 request at step 1.
+        if bas + w_phys < tok {
+            candle_core::bail!(
+                "xs rolling cache: row {i} holds {tok} tokens and promises to resume from {bas}, \
+                 a {}-token run, but the retained window is only {w_phys} wide. The window is \
+                 end-anchored, so a row's run has to fit inside it; this means `tokens`/`base` \
+                 and `tail` were set inconsistently.",
+                tok - bas
+            );
+        }
         let tok_new = tok + t_new;
         let g_done = tok / ratio;
         let g_target = tok_new / ratio;
@@ -252,14 +279,26 @@ pub(crate) fn plan_xs_advance(
             // Blocks `g_done..g_target` need raw tokens from group
             // `g_done + 1 - span_groups` onward.
             let need_start = (g_done + 1).saturating_sub(span_groups) * ratio;
-            if need_start < phys_start {
+            // Checked against this row's OWN `base`, not against the physical
+            // start of the shared window. The two differ whenever a neighbour
+            // retained more (`base > tok - w_phys`), and the columns in between
+            // are either another row's zero pad or tokens this row never
+            // promised to keep — reading them is the silent-wrong-answer the
+            // whole type exists to prevent, so the tighter bound is the one
+            // that has to hold. It always does: retention is computed at
+            // `tokens - margin`, which is never past `need_start`.
+            if need_start < bas {
                 candle_core::bail!(
                     "xs rolling cache: compressor history gap — row {i}'s block {g_done} needs \
-                     tokens from {need_start} but its retained window starts at {phys_start}. \
-                     This means a truncation was applied without going through `set_len`."
+                     tokens from {need_start} but that row only retained from {bas}. This means \
+                     a truncation was applied without going through `set_len`."
                 );
             }
-            let off = need_start - phys_start;
+            // `need_start - (tok - w_phys)`, evaluated so the intermediate
+            // cannot underflow when the window is wider than the row is long.
+            // `off >= w_phys - tok` because `need_start >= bas >= 0`, which is
+            // what proves the front pad is never read.
+            let off = (need_start + w_phys) - tok;
             let len = g_target * ratio - need_start;
             let take = g_target - g_done;
             band_lo = band_lo.min(g_done);
@@ -422,10 +461,18 @@ impl XsRollingCache {
                     "xs rolling cache: row {i} would resume from token {b} but has only seen {t}"
                 );
             }
-            if t < w {
+            // The end-anchored invariant, stated as this type's own doc states
+            // it (`base[i] >= tokens[i] - W`): row `i`'s promised run must FIT
+            // in the batched window. A row that is *shorter than the window* is
+            // fine and is the normal case for a batch of unequal prompts — it
+            // is front-padded, and `plan_xs_advance` derives every offset from
+            // this row's own token count, so the pad is never read.
+            if b + w < t {
                 candle_core::bail!(
-                    "xs rolling cache: row {i} holds {t} tokens, fewer than the {w}-wide retained \
-                     window it would have to end at"
+                    "xs rolling cache: row {i} promises to resume from token {b} of {t}, a \
+                     {}-token run, but the batched window is only {w} wide — the window is \
+                     end-anchored, so every row's run has to fit inside it",
+                    t - b
                 );
             }
         }
@@ -501,6 +548,29 @@ impl XsRollingCache {
     /// `ARC_V4_XS_PER_SEQ`.
     pub fn rows_uniform(&self) -> bool {
         self.tokens.iter().all(|&t| t == self.tokens[0])
+    }
+
+    /// Whether the scalar fast path's assumptions hold — which is strictly more
+    /// than "the token counts agree".
+    ///
+    /// [`Self::advance_uniform`] treats the retained window as beginning at
+    /// `base[0]`. That is true only when every row shares one `base` **and** the
+    /// window is exactly `tokens - base` wide. Equal token counts alone do not
+    /// give either: two sequences at the same length can sit at different
+    /// `base` (one of them rolled back, or batched beside a row that retained
+    /// more), and the batched window is then wider than `tokens - base[0]`. The
+    /// fast path would read from `base[0]` into a window that physically starts
+    /// earlier and silently compress the wrong tokens — for every row.
+    ///
+    /// So the dispatch tests the assumption instead of a proxy for it. Every
+    /// batch with `ARC_V4_XS_PER_SEQ` off satisfies it (one length, one base,
+    /// and `clone_in_cache` refuses any tail-width disagreement outright), so
+    /// the "flag off is byte-identical" claim is unchanged.
+    fn can_advance_uniform(&self) -> Result<bool> {
+        let (t0, b0) = (self.tokens[0], self.base[0]);
+        Ok(self.tokens.iter().all(|&t| t == t0)
+            && self.base.iter().all(|&b| b == b0)
+            && self.tail_width()? == t0 - b0)
     }
 
     pub fn reset(&mut self) {
@@ -742,7 +812,7 @@ impl XsRollingCache {
         self.ensure_rows(b)?;
         let xs_new = xs_new.contiguous()?;
 
-        if self.rows_uniform() {
+        if self.can_advance_uniform()? {
             return self.advance_uniform(b, t_new, &xs_new, compress);
         }
         self.advance_ragged(b, t_new, &xs_new, compress)
@@ -915,9 +985,12 @@ impl XsRollingCache {
         }
 
         // End-anchored retention: keep the last `tail_width` columns, which is
-        // the widest any row needs. A row that needs fewer simply carries a few
-        // real older tokens ahead of its own `base` — never read, because every
-        // offset is derived from that row's own `base`.
+        // the widest any row needs. A row that needs fewer carries dead columns
+        // ahead of its own `base` — older real tokens when this batch widened
+        // the window, zero pad when `clone_in_cache` front-padded a shorter
+        // sequence in. Neither is ever read: every offset is derived from that
+        // row's own token count and `plan_xs_advance` refuses any that would
+        // reach below the row's `base`.
         let w_win = window.dim(1)?;
         self.tail = Some(
             window
@@ -963,7 +1036,11 @@ mod tests {
         // counts: 20/24 share residue 0, 21/25 share residue 1.
         let toks = vec![20, 24, 21, 25, 20, 24, 21, 25];
         let base = vec![12, 16, 12, 16, 12, 16, 12, 16];
-        let plan = plan_xs_advance(&toks, &base, 8, 4, 4, 2, 16).unwrap();
+        // 9, not 8: the window is as wide as the greediest row's promised run
+        // (`21 - 12`), which is what a batch assembled from these rows would
+        // actually allocate. At 8 the odd rows promise more history than the
+        // window physically holds — a state no batch can produce.
+        let plan = plan_xs_advance(&toks, &base, 9, 4, 4, 2, 16).unwrap();
         assert!(!plan.uniform);
         assert_eq!(
             plan.groups.len(),
@@ -1041,20 +1118,81 @@ mod tests {
         assert!(ragged.tail_width >= ragged.tokens_new[1] - ragged.base_new[1]);
     }
 
-    /// A window that would have to start before the retained rows is a
-    /// *silent* history gap if it is not caught here.
+    /// A row whose next block needs raw tokens it no longer retained is a
+    /// *silent* history gap if it is not caught here. The bound is the row's
+    /// own `base`, not the physical start of the shared window: the columns
+    /// between the two belong to a neighbour's width, not to this row.
     #[test]
     fn a_history_gap_is_refused_and_names_the_row() {
-        // A 5-wide window is enough for row 0 (residue 0: needs `r + (span-1) *
-        // ratio = 4`) and one short for row 1 (residue 2: needs 6). Row 1's
-        // block 4 would have to read from token 12; its window starts at 13.
-        let err = plan_xs_advance(&[16, 18], &[12, 14], 5, 4, 4, 2, 16)
+        // Row 1's block 4 spans tokens [16, 20) and — `span_groups = 2` — also
+        // needs group 3, from token 12. It retained only from 13, so the row it
+        // would compress is one token short of the truth.
+        let err = plan_xs_advance(&[16, 18], &[12, 13], 6, 4, 4, 2, 16)
             .unwrap_err()
             .to_string();
         assert!(err.contains("compressor history gap"), "{err}");
         assert!(err.contains("row 1"), "{err}");
-        // …and the same batch with a window wide enough for both is fine.
-        plan_xs_advance(&[16, 18], &[12, 14], 6, 4, 4, 2, 16).unwrap();
+        // …and the same batch that did retain from 12 is fine, at the same
+        // physical width, which is what makes this a `base` check and not a
+        // width check.
+        plan_xs_advance(&[16, 18], &[12, 12], 6, 4, 4, 2, 16).unwrap();
+    }
+
+    /// The *other* refusal: a row whose promised run does not fit the shared
+    /// window at all. Widening the window is what fixes this one — which is
+    /// exactly what distinguishes it from the history gap above.
+    #[test]
+    fn a_row_whose_promise_outruns_the_window_is_refused() {
+        // Row 1 promises tokens [12, 18) — 6 wide — into a 5-wide window.
+        let err = plan_xs_advance(&[16, 18], &[12, 12], 5, 4, 4, 2, 16)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only 5 wide"), "{err}");
+        assert!(err.contains("row 1"), "{err}");
+        plan_xs_advance(&[16, 18], &[12, 12], 6, 4, 4, 2, 16).unwrap();
+    }
+
+    /// 🔑 The regression. A row SHORTER than the batched window is the normal
+    /// case the moment prompts differ in length, and it must plan, not bail:
+    /// the leading `w_phys - tokens` columns are front pad, and every offset is
+    /// far enough right to miss them.
+    ///
+    /// These are the shapes the H200 died on — `row 3 holds 9 tokens, fewer
+    /// than the 11-wide retained window` — with the widths a real V4 CSA layer
+    /// produces for those token counts.
+    #[test]
+    fn a_row_shorter_than_the_window_plans_and_never_reads_the_pad() {
+        // tokens 9/22/39/40 retain from 0/0/16/20 → widths 9/22/23/20, so the
+        // batched window is 23 and row 0 is 14 columns of pad.
+        let toks = [9usize, 22, 39, 40];
+        let base = [0usize, 0, 16, 20];
+        let w_phys = 23usize;
+        let plan = plan_xs_advance(&toks, &base, w_phys, 3, 4, 2, 16).unwrap();
+        assert!(!plan.uniform);
+        // Three distinct residues → three compressor calls; row 3 completes no
+        // block and joins none of them.
+        assert_eq!(plan.groups.len(), 3);
+        let planned: Vec<usize> = plan.groups.iter().flat_map(|g| g.rows.clone()).collect();
+        assert_eq!(planned, vec![0, 1, 2]);
+        for g in &plan.groups {
+            for &r in &g.rows {
+                let pad = w_phys.saturating_sub(toks[r]);
+                assert!(
+                    g.off >= pad,
+                    "row {r}'s slice starts at column {} but its first {pad} columns are pad — \
+                     compressing them would fabricate history before token 0",
+                    g.off
+                );
+                // …and it stays inside the window it was cut from.
+                assert!(g.off + g.len <= w_phys + 3);
+            }
+        }
+        // The short row's slice covers the same ABSOLUTE tokens it would alone:
+        // block 2 needs [4, 12), and the window's column 0 is token 9 - 23.
+        let g0 = plan.groups.iter().find(|g| g.rows == vec![0]).unwrap();
+        assert_eq!(g0.off + toks[0], 4 + w_phys);
+        assert_eq!(g0.len, 8);
+        assert_eq!(g0.dests, vec![2]);
     }
 
     /// `set_len` on a ragged cache cannot be expressed by one narrow of an
@@ -1096,6 +1234,36 @@ mod tests {
             err.contains("split_row"),
             "the refusal must name the way out; got {err}"
         );
+    }
+
+    /// 🔑 `set_row_lens` is the gate `NormalCacheManager::clone_in_cache` puts
+    /// every batch through, and the shape it must accept is "a row shorter than
+    /// the batched window". Refusing that is what turned every B=8 request with
+    /// unequal prompts into one token and `finish_reason: None`.
+    #[test]
+    fn a_row_shorter_than_the_batched_window_is_accepted() {
+        let dev = Device::Cpu;
+        let mut xs = XsRollingCache::new(4, 2, 8, 512);
+        // The window the batch allocates is the greediest row's: 11 columns.
+        xs.tail = Some(Tensor::zeros((4, 11, 32), DType::F32, &dev).unwrap());
+
+        // The H200's row 3: 9 tokens, resuming from 0, beside rows that
+        // retained 11. Its run (9) fits the window (11); it is 2 columns of
+        // front pad, which is legal and never read.
+        xs.set_row_lens(vec![14, 13, 12, 9], vec![3, 2, 1, 0])
+            .unwrap();
+        assert_eq!(xs.row_lens().0, &[14, 13, 12, 9]);
+
+        // What must still be refused: a row promising more history than the
+        // window physically holds — 12 tokens of run in an 11-wide window.
+        let err = xs
+            .set_row_lens(vec![14, 13, 12, 12], vec![3, 2, 1, 0])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("row 3"), "{err}");
+        assert!(err.contains("only 11 wide"), "{err}");
+        // …and the refusal must not have half-applied.
+        assert_eq!(xs.row_lens().0, &[14, 13, 12, 9]);
     }
 
     /// The flag is OFF unless explicitly asked for. Read once, latched, so a

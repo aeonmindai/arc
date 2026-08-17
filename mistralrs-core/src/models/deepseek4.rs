@@ -7243,6 +7243,35 @@ mod tests {
         ragged_batch_matches_b1(128, &[1022, 1023, 1024, 1025], 3)
     }
 
+    /// 🔑 The case the H200 died on, and the one every fixture above misses:
+    /// a row whose ENTIRE history is shorter than the batched window.
+    ///
+    /// The window a batch allocates is its greediest row's retained run — 23
+    /// columns for these token counts — so the 9-token row is front-padded by
+    /// 14 columns that stand for tokens before token 0. Every fixture above
+    /// uses rows long enough (37..43, 1022..1025, 30..35) that this never
+    /// happens, which is why they stayed green while `ARC_V4_XS_PER_SEQ=1` at
+    /// B=8 returned one token and `finish_reason: None` for every request:
+    /// `row 3 holds 9 tokens, fewer than the 11-wide retained window`.
+    ///
+    /// The trigger is prompt-length diversity, not generation length — so this
+    /// fails harder under real heterogeneous arrivals than under any
+    /// uniform-prompt benchmark.
+    #[test]
+    fn a_row_shorter_than_the_batched_window_is_token_identical_csa() -> Result<()> {
+        // Retained runs 9 / 22 / 23 / 20 → a 23-wide window; three distinct
+        // residues mod 4, so three compressor calls, and row 3 completes no
+        // block at all.
+        ragged_batch_matches_b1(4, &[9, 22, 39, 40], 3)
+    }
+
+    /// The same on HCA, where `ratio` is 128 and the retained run can reach
+    /// `ratio + margin`: a 129-token row sits inside a 143-wide window.
+    #[test]
+    fn a_row_shorter_than_the_batched_window_is_token_identical_hca() -> Result<()> {
+        ragged_batch_matches_b1(128, &[129, 143, 1024, 1150], 3)
+    }
+
     /// The control the ragged tests need: a UNIFORM batch takes the untouched
     /// scalar path and is also token-identical. If this ever failed, the
     /// "flag off is byte-identical" claim would be false and the ragged
