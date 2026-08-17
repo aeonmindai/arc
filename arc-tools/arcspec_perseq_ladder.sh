@@ -23,19 +23,40 @@
 #                             this says which factor ate it, in ms)
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# ⚠️ PROMPT LENGTHS ARE DELIBERATELY RAGGED — this is the difference from
-# `arcspec_perseq_ab.sh`, which fixed every prompt at 40 words on purpose.
+# ⚠️ TWO PROMPT REGIMES, MEAN-MATCHED. Both are needed, for opposite reasons.
 #
-# Uniform prompts hide the failure mode this stack addresses. The `xs` window
-# defect #116 fixed could not even be reached with equal-length prompts: the
-# retained window is sized for the greediest row, so a short row only becomes
-# shorter-than-the-window when arrivals differ in length. A benchmark that
-# sends one prompt to every worker measures the case that already worked.
+#   spread    144 24 320 64 260 40 200 96 words, cycled across workers
+#   uniform   144 words for every worker  (= the spread's mean, and its first
+#             element, so B=1 is byte-identical in both regimes)
 #
-# The spread is 24…320 words, cycled across workers. Session 8 measured V4
-# serving dying outright at ~1,055-word prompts and this branch does NOT carry
-# #97 (`pin V4 against length`), so 320 keeps a >3x margin to that cliff while
-# still being a real spread.
+# **spread** is the regime this stack exists for. Uniform prompts hide the
+# failure mode: the `xs` window defect #116 fixed could not even be reached with
+# equal-length prompts, because the retained window is sized for the greediest
+# row and a short row only becomes shorter-than-the-window when arrivals differ.
+# A benchmark that sends one prompt to every worker measures the case that
+# already worked.
+#
+# **uniform** is the only regime where the batch is WHOLE, and that is why it is
+# not optional. The scheduler A/B has now measured the bucketing law directly:
+#
+#     running bucket size  =  B / (distinct cache lengths)
+#
+# holding at 8/8=1 and 32/8=4, with `1 running, 7 waiting` sustained. Under a
+# spread of 8 distinct lengths, B=8 therefore runs ONE sequence at a time — that
+# chain measured B=8 spread at 7.91 tok/s against B=1's 15.36, i.e. batching is
+# *negative* on realistic traffic. So a flat aggregate in the spread arm is
+# unreadable on its own: it could be this fix not paying, or it could be that
+# the batch never existed. Uniform is where a whole batch actually forms, so it
+# is the only place this fix's effect on aggregate is visible without the
+# serialisation swamping it.
+#
+# Mean-matched on purpose: same total prompt tokens in both regimes, so the only
+# thing that differs is the *spread*, and a difference is attributable to
+# raggedness rather than to prompt length.
+#
+# Session 8 measured V4 serving dying outright at ~1,055-word prompts and this
+# branch does NOT carry #97 (`pin V4 against length`), so 320 keeps a >3x margin
+# to that cliff while still being a real spread.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # ⚠️ THE SCHEDULER CONFOUND, MEASURED RATHER THAN ASSUMED.
@@ -92,7 +113,10 @@ BATCHES="${BATCHES:-1 8 32 128}"
 WARMUP="${WARMUP:-20}"
 STEADY="${STEADY:-45}"
 MAX_TOKENS="${MAX_TOKENS:-4096}"
-WORD_SPREAD="${WORD_SPREAD:-24 40 64 96 144 200 260 320}"
+# 144 first so B=1 is byte-identical between the two regimes; mean is 144.
+WORD_SPREAD="${WORD_SPREAD:-144 24 320 64 260 40 200 96}"
+UNIFORM_WORDS="${UNIFORM_WORDS:-144}"
+REGIMES="${REGIMES:-uniform spread}"
 
 mkdir -p "$OUT" "$(dirname "$STATUS")"
 : > "$STATUS"
@@ -333,23 +357,30 @@ run_arm() {
   fi
   say "arm $arm — server up, revision $logged"
 
-  local spread_csv
-  spread_csv=$(echo "$WORD_SPREAD" | tr ' ' ',')
-  for k in $BATCHES; do
-    say "arm $arm — cell B=$k (warmup ${WARMUP}s, steady ${STEADY}s, prompts $spread_csv words)"
-    python3 "$OUT/drive.py" --port "$PORT" --k "$k" --warmup "$WARMUP" \
-      --steady "$STEADY" --spread "$spread_csv" --max-tokens "$MAX_TOKENS" \
-      --seed "$SEED" > "$OUT/$arm.k$k.drive.json" 2>"$OUT/$arm.k$k.drive.err" \
-      || { say "arm $arm cell B=$k — driver failed"; return 1; }
-    local t0 t1 el tok
-    t0=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['t_start'])" "$OUT/$arm.k$k.drive.json")
-    t1=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['t_end'])" "$OUT/$arm.k$k.drive.json")
-    el=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['elapsed_s'])" "$OUT/$arm.k$k.drive.json")
-    tok=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['driver_tok_s'])" "$OUT/$arm.k$k.drive.json")
-    python3 "$OUT/fence.py" "$slog" "$t0" "$t1" "$el" "$tok" > "$OUT/$arm.k$k.cell.json" \
-      || { say "arm $arm cell B=$k — fence extraction failed"; return 1; }
-    say "arm $arm B=$k -> $(cat "$OUT/$arm.k$k.cell.json")"
-    sleep 5
+  local regime k spread_csv tag
+  for regime in $REGIMES; do
+    if [ "$regime" = "uniform" ]; then
+      spread_csv="$UNIFORM_WORDS"
+    else
+      spread_csv=$(echo "$WORD_SPREAD" | tr ' ' ',')
+    fi
+    for k in $BATCHES; do
+      tag="$arm.$regime.k$k"
+      say "arm $arm — cell $regime B=$k (warmup ${WARMUP}s, steady ${STEADY}s, words $spread_csv)"
+      python3 "$OUT/drive.py" --port "$PORT" --k "$k" --warmup "$WARMUP" \
+        --steady "$STEADY" --spread "$spread_csv" --max-tokens "$MAX_TOKENS" \
+        --seed "$SEED" > "$OUT/$tag.drive.json" 2>"$OUT/$tag.drive.err" \
+        || { say "cell $tag — driver failed"; return 1; }
+      local t0 t1 el tok
+      t0=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['t_start'])" "$OUT/$tag.drive.json")
+      t1=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['t_end'])" "$OUT/$tag.drive.json")
+      el=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['elapsed_s'])" "$OUT/$tag.drive.json")
+      tok=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['driver_tok_s'])" "$OUT/$tag.drive.json")
+      python3 "$OUT/fence.py" "$slog" "$t0" "$t1" "$el" "$tok" > "$OUT/$tag.cell.json" \
+        || { say "cell $tag — fence extraction failed"; return 1; }
+      say "$tag -> $(cat "$OUT/$tag.cell.json")"
+      sleep 5
+    done
   done
 
   kill -TERM "$spid" 2>/dev/null || true
@@ -365,9 +396,9 @@ run_arm ON ARC_V4_XS_PER_SEQ=1 ARC_MTP_PER_SEQ_KV=1 || die "ON arm failed"
 
 cat > "$OUT/report.py" <<'PYEOF'
 import json, os, sys
-out, batches = sys.argv[1], sys.argv[2].split()
-def cell(arm, k):
-    p = os.path.join(out, f"{arm}.k{k}.cell.json")
+out, batches, regimes = sys.argv[1], sys.argv[2].split(), sys.argv[3].split()
+def cell(arm, regime, k):
+    p = os.path.join(out, f"{arm}.{regime}.k{k}.cell.json")
     try:
         return json.load(open(p))
     except Exception as e:
@@ -376,36 +407,61 @@ def g(c, k):
     v = c.get(k)
     return "NA" if v is None else v
 print("\n=== LADDER: aggregate throughput and its decomposition ===")
-hdr = (f"{'B':>4} {'arm':<4} {'aggregate_tok/s':>15} {'tok/step':>9} "
-       f"{'tok/batch_step':>15} {'batch_steps/s':>14} {'ms/step':>8} "
+print("aggregate_tok/s is wall-clock and is THE number. tok/batch_step x")
+print("batch_steps/s reconstructs it: when aggregate does not move, those two")
+print("say which factor ate it. run_bucket is the width the engine ACTUALLY ran")
+print("— compare it to offered before reading any cell as a batch result.")
+hdr = (f"{'regime':<8} {'B':>4} {'arm':<4} {'aggregate_tok/s':>15} {'tok/step':>9} "
+       f"{'tok/bstep':>10} {'bsteps/s':>9} {'ms/bstep':>9} "
        f"{'buckets/step':>13} {'run_bucket':>11} {'offered':>8}")
 print(hdr); print("-" * len(hdr))
-for k in batches:
-    for arm in ("OFF", "ON"):
-        c = cell(arm, k)
-        print(f"{k:>4} {arm:<4} {str(g(c,'aggregate_tok_s')):>15} "
-              f"{str(g(c,'tok_per_step')):>9} {str(g(c,'tok_per_batch_step')):>15} "
-              f"{str(g(c,'batch_steps_per_s')):>14} {str(g(c,'ms_per_batch_step')):>8} "
-              f"{str(g(c,'buckets_per_step')):>13} {str(g(c,'running_bucket_size')):>11} "
-              f"{str(g(c,'offered_per_step')):>8}")
-print("\n=== ON vs OFF ===")
-for k in batches:
-    o, n = cell("OFF", k), cell("ON", k)
-    def ratio(key):
-        a, b = o.get(key), n.get(key)
-        if not a or not b:
-            return "NA"
-        return f"{b/a:+.3f}x ({a} -> {b})"
-    print(f"  B={k:<4} aggregate {ratio('aggregate_tok_s')}")
-    print(f"        tok/step  {ratio('tok_per_step')}")
-    print(f"        tok/bstep {ratio('tok_per_batch_step')}")
-    print(f"        steps/s   {ratio('batch_steps_per_s')}")
-    print(f"        run_bucket{ratio('running_bucket_size')}")
+for regime in regimes:
+    for k in batches:
+        for arm in ("OFF", "ON"):
+            c = cell(arm, regime, k)
+            print(f"{regime:<8} {k:>4} {arm:<4} {str(g(c,'aggregate_tok_s')):>15} "
+                  f"{str(g(c,'tok_per_step')):>9} {str(g(c,'tok_per_batch_step')):>10} "
+                  f"{str(g(c,'batch_steps_per_s')):>9} {str(g(c,'ms_per_batch_step')):>9} "
+                  f"{str(g(c,'buckets_per_step')):>13} {str(g(c,'running_bucket_size')):>11} "
+                  f"{str(g(c,'offered_per_step')):>8}")
+print("\n=== ON vs OFF, per regime ===")
+for regime in regimes:
+    print(f"\n-- {regime} --")
+    for k in batches:
+        o, n = cell("OFF", regime, k), cell("ON", regime, k)
+        def ratio(key):
+            a, b = o.get(key), n.get(key)
+            if not a or not b:
+                return "NA"
+            return f"{b/a:.3f}x ({a} -> {b})"
+        print(f"  B={k:<4} aggregate  {ratio('aggregate_tok_s')}")
+        print(f"        tok/step   {ratio('tok_per_step')}")
+        print(f"        tok/bstep  {ratio('tok_per_batch_step')}")
+        print(f"        bsteps/s   {ratio('batch_steps_per_s')}")
+        print(f"        run_bucket {ratio('running_bucket_size')}")
+print("\n=== THE BUCKETING LAW, checked against this run ===")
+print("The scheduler A/B measured `running bucket = B / distinct lengths`.")
+print("uniform has 1 distinct length, spread has 8, so the prediction is:")
+for regime in regimes:
+    dist = 1 if regime == "uniform" else 8
+    for k in batches:
+        pred = max(1.0, int(k) / dist)
+        for arm in ("OFF", "ON"):
+            c = cell(arm, regime, k)
+            got = c.get("running_bucket_size")
+            if got is None:
+                continue
+            print(f"  {regime:<8} B={k:<4} {arm:<4} predicted {pred:>6.2f}  measured {got:>7.3f}")
+print("\n⚠️ Read every spread cell against its run_bucket. If run_bucket is ~1,")
+print("that cell is a measurement of the scheduler serialising the batch, not")
+print("of per-sequence KV advance, and its aggregate cannot be attributed here.")
 PYEOF
 
 {
   echo "=== ref ==="; echo "$SHA"
-  echo "=== prompts ==="; echo "word spread: $WORD_SPREAD (RAGGED — not the uniform 40 of arcspec_perseq_ab.sh)"
+  echo "=== prompts ==="
+  echo "  spread : $WORD_SPREAD (8 distinct lengths)"
+  echo "  uniform: $UNIFORM_WORDS (the spread's mean AND its first element, so B=1 matches)"
   echo
   echo "=== ENGAGEMENT ==="
   for m in "per-sequence KV advance is ON" "Ragged batch admission is ON"; do
@@ -417,7 +473,7 @@ PYEOF
   echo "  per_seq_steps final, ON:  $(grep -o 'per_seq_steps=[0-9]*' "$OUT/server.ON.log" 2>/dev/null | tail -1) (want >0)"
   echo "  per_seq_steps final, OFF: $(grep -o 'per_seq_steps=[0-9]*' "$OUT/server.OFF.log" 2>/dev/null | tail -1) (want =0)"
   echo "  'xs rolling cache' errors ON=$(grep -c 'xs rolling cache' "$OUT/server.ON.log" 2>/dev/null || echo 0) OFF=$(grep -c 'xs rolling cache' "$OUT/server.OFF.log" 2>/dev/null || echo 0) (want 0/0)"
-  python3 "$OUT/report.py" "$OUT" "$BATCHES"
+  python3 "$OUT/report.py" "$OUT" "$BATCHES" "$REGIMES"
 } | tee "$OUT/summary.txt"
 
 say "DONE — $OUT/summary.txt"
