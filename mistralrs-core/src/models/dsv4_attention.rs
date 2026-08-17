@@ -255,6 +255,59 @@ fn compose_caller_mask(
     local.broadcast_add(&caller.contiguous()?)
 }
 
+/// Does this call need the per-row treatment, and is the vector it was handed
+/// coherent with the layout that treatment assumes?
+///
+/// Returning `None` for a **uniform** batch is the load-bearing part, and it is
+/// a dispatch, not an optimisation: `None` sends [`dsv4_attention`] down the
+/// pre-change scalar path verbatim, so every B=1 request, every prefill and
+/// every batch built with per-sequence KV advance off runs the same characters
+/// it always did. That is what makes flag-off byte-identity structural rather
+/// than a number a test happened to observe — and it is why this is a separate
+/// function: the two branches agree bit-for-bit on their common domain, so no
+/// numeric test can tell you which one ran (a mutation that routed uniform
+/// batches down the ragged path survived every other test in this module).
+///
+/// The two refusals both describe the *same* invariant from opposite sides:
+/// [`crate::kv_cache::front_align_batch`] pads every row up to the batch
+/// maximum, so `q0` is that maximum — no row may exceed it, and at least one
+/// row must reach it. A batch that is ragged in some other way is not the
+/// layout this module knows how to mask, and guessing would be a wrong answer
+/// nothing downstream catches.
+fn resolve_ragged_rows<'a>(
+    rows: Option<&'a [usize]>,
+    q0: usize,
+    b_sz: usize,
+) -> Result<Option<&'a [usize]>> {
+    let Some(rows) = rows.filter(|rows| rows.iter().any(|&r| r != q0)) else {
+        return Ok(None);
+    };
+    if rows.len() != b_sz {
+        return Err(candle_core::Error::Msg(format!(
+            "dsv4_attention: {} per-row query positions for a batch of {b_sz}",
+            rows.len()
+        )));
+    }
+    if let Some(&ahead) = rows.iter().find(|&&r| r > q0) {
+        return Err(candle_core::Error::Msg(format!(
+            "dsv4_attention: row at absolute query position {ahead} is AHEAD of the batch's \
+             shared end column {q0}. Under left-alignment the longest row defines that column, \
+             so `q0` is the batch maximum by construction — a larger value means the caller's \
+             per-row lengths and the cache layout disagree, and masking from them would be \
+             silently wrong"
+        )));
+    }
+    if rows.iter().copied().max() != Some(q0) {
+        return Err(candle_core::Error::Msg(format!(
+            "dsv4_attention: no row sits at the batch's shared end column {q0} (the furthest is \
+             {:?}), so this batch is not the left-aligned cohort `front_pad_kv_cache` produces. \
+             Per-row masking is only defined for that layout",
+            rows.iter().copied().max()
+        )));
+    }
+    Ok(Some(rows))
+}
+
 /// The `[b, 1, t_q, t_k + t_c]` additive mask a **left-aligned ragged** cohort
 /// needs, from the rank-2 uniform validity the batch leader would have used.
 ///
@@ -472,42 +525,7 @@ pub fn dsv4_attention(
     // this point differs from the pre-change code. See
     // [`Dsv4AttentionConfig::row_q0`] for why the two branches need it and the
     // raw branch does not.
-    let row_q0 = match cfg.row_q0 {
-        Some(rows) if rows.iter().any(|&r| r != q0) => {
-            if rows.len() != b_sz {
-                return Err(candle_core::Error::Msg(format!(
-                    "dsv4_attention: {} per-row query positions for a batch of {b_sz}",
-                    rows.len()
-                )));
-            }
-            if let Some(&ahead) = rows.iter().find(|&&r| r > q0) {
-                return Err(candle_core::Error::Msg(format!(
-                    "dsv4_attention: row at absolute query position {ahead} is AHEAD of the \
-                     batch's shared end column {q0}. Under left-alignment the longest row \
-                     defines that column, so `q0` is the batch maximum by construction — a \
-                     larger value means the caller's per-row lengths and the cache layout \
-                     disagree, and masking from them would be silently wrong"
-                )));
-            }
-            // `front_align_batch` pads every row up to the batch maximum, so
-            // the longest row has NO dead prefix and sits exactly at `q0`. A
-            // batch that is ragged without one is ragged for some other reason
-            // — and this module would then be masking from a left-alignment
-            // geometry that does not hold. Refuse rather than guess: a wrong
-            // mask is a wrong answer nothing downstream catches.
-            if rows.iter().copied().max() != Some(q0) {
-                return Err(candle_core::Error::Msg(format!(
-                    "dsv4_attention: no row sits at the batch's shared end column {q0} (the \
-                     furthest is {:?}), so this batch is not the left-aligned cohort \
-                     `front_pad_kv_cache` produces. Per-row masking is only defined for that \
-                     layout",
-                    rows.iter().copied().max()
-                )));
-            }
-            Some(rows)
-        }
-        _ => None,
-    };
+    let row_q0 = resolve_ragged_rows(cfg.row_q0, q0, b_sz)?;
 
     // ---- Raw working-set narrowing ----------------------------------------
     // Only the trailing `t_q + window - 1` raw keys are reachable by ANY query
@@ -2014,6 +2032,38 @@ mod tests {
                 ..self.cfg()
             }
         }
+    }
+
+    /// **The dispatch itself**, pinned directly — because no numeric test can
+    /// pin it. The two branches of [`dsv4_attention`]'s mask build agree
+    /// bit-for-bit on a uniform batch, so a mutation that routes uniform
+    /// batches down the ragged path is numerically invisible and survived
+    /// every other test in this module. It is still a real defect: it would
+    /// build a `[b, 1, t_q, n_keys]` mask and two extra host→device copies on
+    /// every layer of every B=1 decode step, and it would end the structural
+    /// flag-off guarantee.
+    #[test]
+    fn a_uniform_batch_never_reaches_the_ragged_path() -> Result<()> {
+        // Uniform, at the batch's shared end column: not ragged, whatever the
+        // value is.
+        for (q0, b) in [(0usize, 1usize), (7, 1), (7, 4), (128, 3)] {
+            let rows = vec![q0; b];
+            assert!(
+                resolve_ragged_rows(Some(&rows), q0, b)?.is_none(),
+                "q0={q0} b={b}: a uniform vector must dispatch to the scalar path, not merely \
+                 compute the same numbers on the ragged one"
+            );
+        }
+        // Absent entirely — every path but per-sequence MTP.
+        assert!(resolve_ragged_rows(None, 12, 3)?.is_none());
+        // Genuinely ragged, and coherent: taken.
+        let ragged = [12usize, 10, 7];
+        assert_eq!(
+            resolve_ragged_rows(Some(&ragged), 12, 3)?,
+            Some(&ragged[..]),
+            "a cohort with rows behind the leader is exactly what the ragged path is for"
+        );
+        Ok(())
     }
 
     /// 🔑 **THE claim.** Every row of a left-aligned ragged cohort must produce

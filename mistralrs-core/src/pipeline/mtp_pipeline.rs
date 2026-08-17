@@ -1333,10 +1333,7 @@ impl MtpSpeculativePipeline {
             if !per_sequence_kv_requested() {
                 return KvAdvance::Cohort;
             }
-            let refusal = cache_supports_per_sequence_advance(&self.target_cache)
-                .err()
-                .or_else(|| self.target_masks_ragged_batches().err())
-                .or_else(|| self.step_carries_per_sequence_lengths().err());
+            let refusal = per_sequence_refusal(&self.target_cache);
             match refusal {
                 None => {
                     tracing::info!(
@@ -1356,79 +1353,6 @@ impl MtpSpeculativePipeline {
                 }
             }
         })
-    }
-
-    /// Whether the target model applies a per-row mask over a left-aligned
-    /// ragged batch's dead prefix **and** over its start-anchored compressed
-    /// columns.
-    ///
-    /// DeepSeek V4 now does, so this passes for a V4 target and still refuses
-    /// for every other model. `super::super::models::dsv4_attention` takes a
-    /// per-row `row_q0` and, when any row sits behind the cohort, builds a
-    /// `[B, 1, t_q, k]` union mask that kills each row's dead prefix on the raw
-    /// branch and rebuilds the compressed threshold from that row's own
-    /// absolute position — the piece a raw-only `[B, 1, t_q, k]` K/V mask
-    /// cannot express, because `ratio` and the compressed width differ per
-    /// layer while the caller's mask is built once for all of them.
-    ///
-    /// A V4 target is identified by its `XsRolling` compressor slots: it is the
-    /// only architecture in the tree that has any, which is the same signal
-    /// [`cache_supports_per_sequence_advance`] keys on.
-    fn target_masks_ragged_batches(&self) -> std::result::Result<(), String> {
-        model_masks_ragged_batches(&self.target_cache)
-    }
-
-    /// Whether the **fused step's own bookkeeping** can express a batch whose
-    /// rows hold different committed lengths.
-    ///
-    /// It cannot, and this is the blocker that remains after the mask. It is
-    /// stated separately, and named, because the two previous waves each
-    /// believed the mask was the last one.
-    ///
-    /// [`Self::step_full`] keys the entire step on ONE scalar
-    /// `cache_len = current_normal_cache_len(self)` — the *batched* buffer's
-    /// width, which under left-alignment is `max_j L_j`, not any row's length.
-    /// Four of its uses are arithmetically wrong the moment the rows diverge,
-    /// and they fail in different ways:
-    ///
-    /// * `uncached[i] = toks_i.len() - cache_len` saturates to **0** for every
-    ///   row but the longest, which fails `window_ok`'s `(1..=w)` check and
-    ///   sends every step down the deferral path — per-sequence advance would
-    ///   be *reachable but inert*, and the deferral is itself unsafe here
-    ///   because the target's own decode builds no mask at `t_q == 1`;
-    /// * `toks[cache_len..]` (the verify window) is a **panic** site once
-    ///   `cache_len > toks_i.len()`, reachable only because `window_ok` bails
-    ///   first;
-    /// * `run_target_forward_batch(.., Some((w, cache_len)))` becomes
-    ///   `seqlen_offsets[i] = cache_len` for every row
-    ///   (`inputs_processor.rs:244` — `last_n_context_len.1` is a shared
-    ///   scalar), so RoPE would place a shorter row's queries `lead_i` past
-    ///   their true positions. That same vector is what feeds the model's
-    ///   `row_q0`, so the mask this PR built is correct but would be handed
-    ///   uniform values;
-    /// * `set_len(cache_len + committed_i)` counts the dead prefix **inside**
-    ///   the recorded length (`front_pad_single` sets `current_seq_len =
-    ///   target_len`, and `clone_out_cache` copies the batched length verbatim
-    ///   into every row). So the next `front_align_batch` pads relative to
-    ///   already-padded lengths and the dead prefix **accumulates linearly**,
-    ///   not as the `sqrt(steps)` random walk `front_pad_single`'s doc claims.
-    ///   Nothing in `Sequence` or `SingleCache` records a row's true live
-    ///   length; the only honest source is `seq.get_toks().len()`.
-    ///
-    /// Fixing it is a change to this pipeline's step arithmetic plus a per-row
-    /// route through `inputs_processor` — not a model change, which is why it
-    /// is not in the PR that added the mask.
-    fn step_carries_per_sequence_lengths(&self) -> std::result::Result<(), String> {
-        Err(
-            "`step_full` keys the whole fused step on one shared `cache_len` (the BATCHED buffer \
-             width, which left-alignment makes `max_j L_j`): `uncached[i]` saturates to 0 for \
-             every row but the longest and trips `window_ok`, `toks[cache_len..]` would panic, \
-             `prefill_window` collapses `seqlen_offsets` to one scalar so the model's per-row \
-             `row_q0` is fed uniform values, and `set_len(cache_len + committed_i)` counts the \
-             dead prefix inside the length so it accumulates. See \
-             `MtpSpeculativePipeline::step_carries_per_sequence_lengths`."
-                .to_string(),
-        )
     }
 
     /// Snapshot of this pipeline's MTP acceptance counters.
@@ -1990,9 +1914,26 @@ pub(crate) fn cache_supports_per_sequence_advance(
     Ok(())
 }
 
+/// The whole of [`MtpSpeculativePipeline::kv_advance`]'s decision: the three
+/// capability checks, composed in order, or `None` when all three pass.
+///
+/// Composed here rather than inline in `kv_advance` so that "which checks are
+/// required" is itself testable — dropping one is otherwise invisible, because
+/// `kv_advance` needs a whole target pipeline to call.
+///
+/// Order matters only for which reason gets reported. Each check is
+/// independent, and each has been the *last* one at some point: (1) fell to
+/// wave63-CO, (2) to the per-row `row_q0`, and (3) is where it stands now.
+pub(crate) fn per_sequence_refusal(cache: &EitherCache) -> Option<String> {
+    cache_supports_per_sequence_advance(cache)
+        .err()
+        .or_else(|| model_masks_ragged_batches(cache).err())
+        .or_else(|| step_carries_per_sequence_lengths().err())
+}
+
 /// Whether the model behind this cache masks a left-aligned ragged batch, or
 /// why it does not. The cache-inspecting half of
-/// [`MtpSpeculativePipeline::target_masks_ragged_batches`], split out so it is
+/// [`MtpSpeculativePipeline::kv_advance`]'s second check, split out so it is
 /// testable without standing up a whole target pipeline — the same shape
 /// [`cache_supports_per_sequence_advance`] has.
 ///
@@ -2021,6 +1962,59 @@ pub(crate) fn model_masks_ragged_batches(cache: &EitherCache) -> std::result::Re
          prefix a left-aligned per-sequence cache leaves would be attended as real keys (a zero \
          K row scores logit 0 and takes softmax weight). See \
          `MtpSpeculativePipeline::target_masks_ragged_batches`."
+            .to_string(),
+    )
+}
+
+/// Whether the **fused step's own bookkeeping** can express a batch whose
+/// rows hold different committed lengths.
+///
+/// It cannot, and this is the blocker that remains after the mask. It is
+/// stated separately, and named, because the two previous waves each
+/// believed the mask was the last one.
+///
+/// [`MtpSpeculativePipeline::step_full`] keys the entire step on ONE scalar
+/// `cache_len = current_normal_cache_len(self)` — the *batched* buffer's
+/// width, which under left-alignment is `max_j L_j`, not any row's length.
+/// Four of its uses are arithmetically wrong the moment the rows diverge,
+/// and they fail in different ways:
+///
+/// * `uncached[i] = toks_i.len() - cache_len` saturates to **0** for every
+///   row but the longest, which fails `window_ok`'s `(1..=w)` check and
+///   sends every step down the deferral path — per-sequence advance would
+///   be *reachable but inert*, and the deferral is itself unsafe here
+///   because the target's own decode builds no mask at `t_q == 1`;
+/// * `toks[cache_len..]` (the verify window) is a **panic** site once
+///   `cache_len > toks_i.len()`, reachable only because `window_ok` bails
+///   first;
+/// * `run_target_forward_batch(.., Some((w, cache_len)))` becomes
+///   `seqlen_offsets[i] = cache_len` for every row
+///   (`inputs_processor.rs:244` — `last_n_context_len.1` is a shared
+///   scalar), so RoPE would place a shorter row's queries `lead_i` past
+///   their true positions. That same vector is what feeds the model's
+///   `row_q0`, so the mask this PR built is correct but would be handed
+///   uniform values;
+/// * `set_len(cache_len + committed_i)` counts the dead prefix **inside**
+///   the recorded length (`front_pad_single` sets `current_seq_len =
+///   target_len`, and `clone_out_cache` copies the batched length verbatim
+///   into every row). So the next `front_align_batch` pads relative to
+///   already-padded lengths and the dead prefix **accumulates linearly**,
+///   not as the `sqrt(steps)` random walk `front_pad_single`'s doc claims.
+///   Nothing in `Sequence` or `SingleCache` records a row's true live
+///   length; the only honest source is `seq.get_toks().len()`.
+///
+/// Fixing it is a change to this pipeline's step arithmetic plus a per-row
+/// route through `inputs_processor` — not a model change, which is why it
+/// is not in the PR that added the mask.
+pub(crate) fn step_carries_per_sequence_lengths() -> std::result::Result<(), String> {
+    Err(
+        "`step_full` keys the whole fused step on one shared `cache_len` (the BATCHED buffer \
+         width, which left-alignment makes `max_j L_j`): `uncached[i]` saturates to 0 for \
+         every row but the longest and trips `window_ok`, `toks[cache_len..]` would panic, \
+         `prefill_window` collapses `seqlen_offsets` to one scalar so the model's per-row \
+         `row_q0` is fed uniform values, and `set_len(cache_len + committed_i)` counts the \
+         dead prefix inside the length so it accumulates. See \
+         `MtpSpeculativePipeline::step_carries_per_sequence_lengths`."
             .to_string(),
     )
 }
@@ -4378,6 +4372,59 @@ mod tests {
         assert!(
             err.contains("XsRolling") && err.contains("dead"),
             "a non-V4 target must still refuse, and name why; got {err}"
+        );
+    }
+
+    /// 🔴 **The refusal moved; it did not disappear.** With both of the
+    /// previously-named blockers cleared — the cache carries per-row lengths
+    /// (wave63-CO) and V4's attention masks a ragged cohort (this wave) — a V4
+    /// target must STILL be refused, and the reason must now name the fused
+    /// step's shared `cache_len`.
+    ///
+    /// This is the test that stops the third check from being quietly dropped.
+    /// Granting the mode on the first two alone is not merely useless, it is
+    /// harmful: `window_ok` fails on every ragged step, the fused path defers
+    /// to the target's own decode, and that path builds no mask at all at
+    /// `t_q == 1` — so the dead prefix would be attended as real keys by the
+    /// fallback that was supposed to be the safe one.
+    #[test]
+    fn a_fully_capable_v4_cache_is_still_refused_and_now_names_the_step() {
+        use crate::kv_cache::{EitherCache, KvCache, NormalCache, XsRollingCache};
+        use std::sync::{Arc, Mutex};
+
+        let v4 = EitherCache::Normal(Arc::new(Mutex::new(NormalCache(vec![
+            KvCache::new_normal(2, 4096, 512),
+            KvCache::XsRolling(Box::new(XsRollingCache::new(4, 2, 64, 2048))),
+        ]))));
+
+        // Force the cache capability ON, thread-locally, so checks (1) and (2)
+        // both pass and check (3) is the only thing left standing.
+        let refusal = crate::kv_cache::xs_per_seq_test_override::with(true, || {
+            assert!(
+                cache_supports_per_sequence_advance(&v4).is_ok(),
+                "precondition: with ARC_V4_XS_PER_SEQ on, a V4 cache carries per-row lengths"
+            );
+            assert!(
+                model_masks_ragged_batches(&v4).is_ok(),
+                "precondition: V4's attention now masks a ragged cohort"
+            );
+            per_sequence_refusal(&v4)
+        });
+
+        let why = refusal.expect(
+            "per-sequence advance must STILL be refused: the fused step keys on one shared \
+             `cache_len`, and granting the mode without fixing that defers every ragged step \
+             into a decode path that builds no mask at all",
+        );
+        assert!(
+            why.contains("cache_len") && why.contains("window_ok"),
+            "the refusal must name the fused step's shared `cache_len`, not a blocker that is \
+             already cleared; got {why}"
+        );
+        assert!(
+            !why.contains("XsRolling"),
+            "the refusal still names the compressor slot, so the flag is not reaching the \
+             cache and this wave changed nothing; got {why}"
         );
     }
 
