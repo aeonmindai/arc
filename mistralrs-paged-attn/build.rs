@@ -52,6 +52,33 @@ fn main() -> Result<()> {
         .arg("--compiler-options")
         .arg("-fPIC");
 
+    // D16: ship cubins for every arch we target, not just the build box's GPU.
+    //
+    // cudaforge derives a single `-gencode` from `CUDA_COMPUTE_CAP` or the local
+    // `nvidia-smi`, so a binary built on an H200 carries SM90 only and PTX-JITs
+    // (or fails) on Blackwell. `ARC_CUDA_ARCHS` appends further targets to the
+    // fat binary — e.g. `ARC_CUDA_ARCHS=90,100,103` for Hopper + Blackwell.
+    //
+    // Left unset the build is unchanged, because each extra arch recompiles
+    // every .cu in this crate and that cost is not worth paying on a rented box
+    // that only ever runs one arch. Release and publish builds set it.
+    println!("cargo:rerun-if-env-changed=ARC_CUDA_ARCHS");
+    if let Ok(archs) = std::env::var("ARC_CUDA_ARCHS") {
+        for arch in archs.split(',').map(str::trim).filter(|a| !a.is_empty()) {
+            // Arch-specific ("a") cubins: sm_90a/sm_100a expose the Hopper and
+            // Blackwell-only instructions the arch-specialised kernel paths are
+            // written against. Matches cudaforge's own suffixing for cap >= 90.
+            let suffix = if arch.parse::<u32>().is_ok_and(|c| c >= 90) {
+                "a"
+            } else {
+                ""
+            };
+            builder = builder.arg(&format!(
+                "-gencode=arch=compute_{arch}{suffix},code=sm_{arch}{suffix}"
+            ));
+        }
+    }
+
     let compute_cap = builder.get_compute_cap().unwrap_or(80);
     // Enable FP8 if compute capability >= 8.0 (Ampere and newer)
     let using_fp8 = if compute_cap >= 80 {

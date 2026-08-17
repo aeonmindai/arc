@@ -8,10 +8,13 @@ use serde::{Deserialize, Serialize};
 
 use super::config::{KvCacheLayout, ModelConfigLike};
 
-/// Head dimension the TurboQuant CUDA kernels are specialized for. The packed
-/// K4/V3 block layout and every `turbo_*` kernel assume exactly this head
-/// size; the kernels exit early (`if (hs != 128) return;`) for anything else.
-pub const TURBOQUANT_HEAD_DIM: usize = 128;
+/// Head dimensions the TurboQuant CUDA kernels are instantiated for.
+///
+/// Re-exported from `mistralrs_quant::turboquant::cuda_tables`, which is also
+/// where the unit test lives that pins this list to the `case` arms of the
+/// kernel's own dispatch. Keeping one list on both sides of the FFI is what
+/// makes an unsupported width a refusal instead of an untouched output buffer.
+pub use mistralrs_quant::turboquant::TURBOQUANT_CUDA_HEAD_DIMS;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "pyo3_macros", pyo3::pyclass(eq, eq_int))]
@@ -57,19 +60,23 @@ impl PagedCacheType {
     }
 
     /// Whether the TurboQuant kernels support this model's KV geometry.
+    ///
+    /// K and V are compressed independently, so they only have to be widths the
+    /// kernels are instantiated for — they no longer have to be *the same*
+    /// width, and no longer have to be 128.
     fn turboquant_supports_model(config: &dyn ModelConfigLike) -> bool {
         matches!(config.kv_cache_layout(), KvCacheLayout::Standard)
-            && config.k_head_dim() == TURBOQUANT_HEAD_DIM
-            && config.v_head_dim() == TURBOQUANT_HEAD_DIM
+            && mistralrs_quant::turboquant::cuda_supports_head_dim(config.k_head_dim())
+            && mistralrs_quant::turboquant::cuda_supports_head_dim(config.v_head_dim())
     }
 
     /// Resolve this cache type against the target model's KV geometry.
     ///
-    /// The TurboQuant kernels only support the standard KV layout with
-    /// `head_dim == 128`:
-    /// * any other head size makes the `turbo_paged_attention.cu` kernels exit
-    ///   early with their (uninitialized) F32 output buffer untouched —
-    ///   silent garbage;
+    /// The TurboQuant kernels support the standard KV layout at any head
+    /// dimension in [`TURBOQUANT_CUDA_HEAD_DIMS`]:
+    /// * a head size with no instantiation falls through the kernel's dispatch
+    ///   switch, leaving the (uninitialized) output buffer untouched — silent
+    ///   garbage, which is why this gate runs before any allocation;
     /// * MLA-layout models (DeepSeek V2/V3, GLM4-MoE-lite) write through
     ///   `concat_and_cache_mla`, which bails on a packed U8 cache at runtime.
     ///
@@ -93,7 +100,8 @@ impl PagedCacheType {
                     .to_string()
             }
             KvCacheLayout::Standard => format!(
-                "the model has head_dim k={}/v={}, but the TurboQuant kernels only support head_dim={TURBOQUANT_HEAD_DIM}",
+                "the model has head_dim k={}/v={}, but the TurboQuant kernels are instantiated \
+                 for head_dim in {TURBOQUANT_CUDA_HEAD_DIMS:?}",
                 config.k_head_dim(),
                 config.v_head_dim(),
             ),
@@ -509,23 +517,66 @@ mod cache_type_tests {
         PagedCacheType::TurboQuantAggressive,
     ];
 
-    /// Supported geometry (standard layout, head_dim 128): every TurboQuant
-    /// preset resolves to itself, explicit or not.
+    /// Supported geometry (standard layout, any head dim the kernels are
+    /// instantiated for): every TurboQuant preset resolves to itself, explicit
+    /// or not.
+    ///
+    /// Driven off `TURBOQUANT_CUDA_HEAD_DIMS` rather than a literal, so adding
+    /// a kernel instantiation extends this test automatically instead of
+    /// leaving the new width silently uncovered.
     #[test]
     fn turboquant_stays_on_supported_geometry() {
-        let cfg = meta(128, 128, KvCacheLayout::Standard);
-        for t in TURBO_TYPES {
-            for explicit in [false, true] {
-                assert_eq!(t.resolve_for_model(&cfg, explicit).unwrap(), t);
+        for head_dim in TURBOQUANT_CUDA_HEAD_DIMS {
+            let cfg = meta(head_dim, head_dim, KvCacheLayout::Standard);
+            for t in TURBO_TYPES {
+                for explicit in [false, true] {
+                    assert_eq!(
+                        t.resolve_for_model(&cfg, explicit).unwrap(),
+                        t,
+                        "head_dim={head_dim} is instantiated and must be kept"
+                    );
+                }
             }
         }
     }
 
-    /// The default TurboQuant type falls back to Auto (instead of producing
-    /// silent garbage from the head_dim-128-only kernels) for other head dims.
+    /// DeepSeek-V4's width specifically. It is the reason the 128-only limit
+    /// was lifted, so it gets its own named assertion rather than riding on the
+    /// loop above.
+    #[test]
+    fn turboquant_accepts_v4_head_dim_512() {
+        assert!(
+            TURBOQUANT_CUDA_HEAD_DIMS.contains(&512),
+            "512 must stay in the instantiated set"
+        );
+        let cfg = meta(512, 512, KvCacheLayout::Standard);
+        assert_eq!(
+            PagedCacheType::TurboQuant
+                .resolve_for_model(&cfg, false)
+                .unwrap(),
+            PagedCacheType::TurboQuant
+        );
+    }
+
+    /// K and V are compressed independently, so mixed widths are fine as long
+    /// as each is instantiated.
+    #[test]
+    fn turboquant_accepts_mixed_but_instantiated_head_dims() {
+        let cfg = meta(512, 128, KvCacheLayout::Standard);
+        assert_eq!(
+            PagedCacheType::TurboQuant
+                .resolve_for_model(&cfg, false)
+                .unwrap(),
+            PagedCacheType::TurboQuant
+        );
+    }
+
+    /// The default TurboQuant type falls back to Auto (instead of falling
+    /// through the kernel's dispatch switch and leaving the output buffer
+    /// untouched) for head dims with no instantiation.
     #[test]
     fn default_turboquant_falls_back_on_unsupported_head_dim() {
-        for head_dim in [64, 96, 192, 256] {
+        for head_dim in [96, 192, 320, 1024] {
             let cfg = meta(head_dim, head_dim, KvCacheLayout::Standard);
             assert_eq!(
                 PagedCacheType::TurboQuant
@@ -535,8 +586,8 @@ mod cache_type_tests {
                 "head_dim={head_dim} must fall back"
             );
         }
-        // Mixed k/v head dims must also fall back.
-        let cfg = meta(128, 64, KvCacheLayout::Standard);
+        // A mixed pair still falls back when either half is uninstantiated.
+        let cfg = meta(128, 192, KvCacheLayout::Standard);
         assert_eq!(
             PagedCacheType::TurboQuant
                 .resolve_for_model(&cfg, false)
@@ -569,7 +620,7 @@ mod cache_type_tests {
     /// models rather than silently switching caches.
     #[test]
     fn explicit_turboquant_errors_on_unsupported_model() {
-        let cfg = meta(64, 64, KvCacheLayout::Standard);
+        let cfg = meta(192, 192, KvCacheLayout::Standard);
         for t in TURBO_TYPES {
             let err = t.resolve_for_model(&cfg, true).unwrap_err();
             assert!(
