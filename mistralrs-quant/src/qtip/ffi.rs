@@ -520,11 +520,6 @@ extern "C" {
 
     // ----- Grouped GEMM (batched MoE prefill; kernels/qtip/qtip_grouped_gemm.cu) -----
     //
-    // On-device routing (histogram + scans/tile-map + grouped scatter) for
-    // the trellis grouped GEMM. ZERO host syncs: `d_num_tiles` stays on the
-    // device and the GEMM grid is sized from the host-side upper bound
-    // `max_m_tiles = ceil(n_pairs / TILE_M) + num_experts`. `d_counts` and
-    // `d_cursors` must be zero-initialized.
     // Which m-tile schedule this device's compute capability selects
     // (`grouped::grouped_tile_m_for_cc` mirrors the rule). Returns a
     // cudaError_t as i32; on failure the out-params are untouched and the
@@ -536,6 +531,11 @@ extern "C" {
         out_tile_m: *mut i32,
     ) -> i32;
 
+    // On-device routing (histogram + scans/tile-map + grouped scatter) for
+    // the trellis grouped GEMM. ZERO host syncs: `d_num_tiles` stays on the
+    // device and the GEMM grid is sized from the host-side upper bound
+    // `max_m_tiles = ceil(n_pairs / tile_m) + num_experts`. `d_counts` and
+    // `d_cursors` must be zero-initialized. Returns a cudaError_t as i32.
     pub(crate) fn launch_qtip2b_moe_route(
         d_indices: *const u32,
         d_counts: *mut u32,

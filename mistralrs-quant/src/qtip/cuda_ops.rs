@@ -1185,7 +1185,7 @@ pub(crate) fn dequantize_2b_cuda(
         ($T:ty, $launch:expr) => {{
             let out_buf = dev.alloc_zeros::<$T>(num_weights)?;
             let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
-            let rc = unsafe {
+            unsafe {
                 $launch(
                     blocks_ptr as *const _,
                     scales_ptr as *const _,
@@ -1195,18 +1195,9 @@ pub(crate) fn dequantize_2b_cuda(
                     num_symbols as i32,
                     mcg_mult,
                     dev.cuda_stream().cu_stream(),
-                )
-            };
-            drop(out_guard);
-            // Without this the caller receives the `alloc_zeros` buffer as a
-            // shape-correct, error-free, all-zero MoE output (D18).
-            if rc != 0 {
-                candle_core::bail!(
-                    "qtip2b grouped gemm CUDA: kernel launch failed (rc={rc}) on \
-                     sm_{cc_major}{cc_minor} [n_pairs={n_pairs}, n_rows={n_rows}, \
-                     num_symbols={num_symbols}, tile_m={tile_m}]"
                 );
             }
+            drop(out_guard);
             CudaStorage::wrap_cuda_slice(out_buf, dev.clone())
         }};
     }
@@ -2038,7 +2029,7 @@ pub(crate) fn grouped_gemm_2b_cuda(
             // routing (out-of-range router ids) are never written.
             let out_buf = dev.alloc_zeros::<$T>(n_pairs * n_rows)?;
             let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
-            unsafe {
+            let rc = unsafe {
                 $launch(
                     blocks_ptr as *const _,
                     scales_ptr as *const _,
@@ -2055,9 +2046,18 @@ pub(crate) fn grouped_gemm_2b_cuda(
                     max_m_tiles as i32,
                     mcg_mult,
                     dev.cuda_stream().cu_stream(),
+                )
+            };
+            drop(out_guard);
+            // Without this the caller receives the `alloc_zeros` buffer as a
+            // shape-correct, error-free, all-zero MoE output (D18).
+            if rc != 0 {
+                candle_core::bail!(
+                    "qtip2b grouped gemm CUDA: kernel launch failed (rc={rc}) on \
+                     sm_{cc_major}{cc_minor} [n_pairs={n_pairs}, n_rows={n_rows}, \
+                     num_symbols={num_symbols}, tile_m={tile_m}]"
                 );
             }
-            drop(out_guard);
             CudaStorage::wrap_cuda_slice(out_buf, dev.clone())
         }};
     }
