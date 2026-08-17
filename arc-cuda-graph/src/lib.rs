@@ -41,6 +41,11 @@ pub mod sampling_cuda;
 
 pub use sampling_cuda::{gpu_algorithm_simulate, SamplingParams, GPU_MAX_KEEP};
 
+/// The dense-architecture guard. NOT CUDA-gated on purpose: callers must be
+/// able to refuse an unsupported architecture on any host, and the contract
+/// must be unit-testable where CUDA cannot compile.
+pub use weights::{check_dense_layer_inventory, DenseShapeError, DENSE_PROJS_PER_LAYER};
+
 #[cfg(feature = "cuda")]
 pub use sampling_cuda::CudaSampler;
 
