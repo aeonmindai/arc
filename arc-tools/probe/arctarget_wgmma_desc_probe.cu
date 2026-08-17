@@ -58,8 +58,10 @@
 //     swizzle mode 0.
 //   * DOES NOT PROVE anything about sm_100a `tcgen05`, which takes no register
 //     operands at all and has its own descriptor. Blackwell is compile-checked
-//     separately; we do not rent Blackwell today, and a compile pass is not a
-//     measurement.
+//     separately, by the inline sm_100a snippet in
+//     `arc-tools/wave65_arctarget_gate.sh` (which labels itself COMPILE-ONLY,
+//     NEVER EXECUTED). We do not rent Blackwell today, and a compile pass is
+//     not a measurement.
 //   * DOES NOT cover swizzled modes (1/2/3). The keystone kernel's decode
 //     stage writes its own smem tile, so it can choose to be unswizzled.
 //
