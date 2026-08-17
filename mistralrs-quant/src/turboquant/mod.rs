@@ -8,9 +8,12 @@
 //! 1. Normalize the input vector and store its L2 norm as fp16.
 //! 2. Apply a randomized Walsh-Hadamard rotation (D·H·D where D is a diagonal
 //!    of random ±1 signs and H is the Hadamard matrix). This makes every
-//!    coordinate follow a Beta(d/2, d/2) distribution regardless of input.
-//! 3. Quantize each coordinate independently using pre-computed Lloyd-Max
-//!    optimal codebooks for the Beta distribution.
+//!    coordinate follow the `S^{d-1}` coordinate marginal — density
+//!    `∝ (1 - x²)^((d-3)/2)` on [-1, 1], i.e. `(x+1)/2 ~ Beta((d-1)/2, (d-1)/2)`
+//!    — regardless of input.
+//! 3. Quantize each coordinate independently using Lloyd-Max optimal codebooks
+//!    for that density ([`codebook`] for the shipped dims, [`generate`] for
+//!    the rest).
 //! 4. Pack the quantized indices into sub-byte storage (4-bit nibble or
 //!    3-bit 10-in-32 packing).
 //!

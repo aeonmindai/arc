@@ -3,11 +3,22 @@
 #![allow(clippy::doc_overindented_list_items, clippy::doc_lazy_continuation)]
 //! Arc inference engine CLI.
 //!
-//! This is the `arc` binary — a thin wrapper around the mistral.rs CLI
-//! that adds Arc branding and defaults to TurboQuant KV cache compression.
+//! **Parent system: ArcServe/CLI** (see `memory/mission/TAXONOMY.md`).
+//!
+//! This is the `arc` binary — a wrapper around the mistral.rs CLI that adds Arc
+//! branding, the `validate` pre-flight command, and the AgentPerf bench suite.
+//!
+//! ⚠️ **TurboQuant is the *nominal* PagedAttention default only.**
+//! `PagedCacheType::resolve_for_model` falls back to the unquantized `auto`
+//! cache — with a warning — for any model TurboQuant cannot support, which
+//! means every MLA model and every head_dim other than 128. Requesting it
+//! explicitly turns that fallback into a hard error instead. The eager
+//! (non-paged) KV path is separately opt-in via `ARC_TURBOQUANT_KV=1`.
+//! In practice almost no model runs TurboQuant today, and none has been
+//! measured with it.
 //!
 //! Usage:
-//!   arc serve -m <model_id>                          # Start serving with TurboQuant (default)
+//!   arc serve -m <model_id>                          # Start serving
 //!   arc run -m <model_id>                            # Interactive chat
 //!   arc bench -m <model_id>                          # Run benchmarks
 //!   arc validate --index <path> --arch <arch>        # Pre-flight weight schema validation

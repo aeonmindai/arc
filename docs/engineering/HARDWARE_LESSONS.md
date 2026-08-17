@@ -125,7 +125,7 @@ include one-time setup.
 
 ## 4. `cudnn` costs 62 % of decode throughput on this workload
 
-Single-stream decode, same model, same box, two builds [measured]:
+Single-stream decode, same model, same box, two builds [measured, **session 4**]:
 
 | build | b=1 decode |
 |---|---|
@@ -136,8 +136,18 @@ Single-stream decode, same model, same box, two builds [measured]:
 "obviously beneficial" optional dependency is a large regression here. Arc builds
 without `cudnn` and the project's build documentation says so.
 
+> ⚠️ **The ratio stands; the absolute numbers are a session-4 vintage.** Both
+> rows are historical and are kept as the record of the A/B. **14.58 tok/s is no
+> longer Arc's b=1 decode figure** — b=1 now measures **18.27 tok/s aggregate,
+> 17.99 per-user p50** [measured, 2026-08-17, 1×H200, published `qtip2b`
+> artifact]. The A/B is still valid as a *same-box, one-flag ratio* at its own
+> vintage; it is **not** a current-speed quotation. Never re-quote 14.58 as
+> today's decode number, and never re-derive a `cudnn` figure by applying −62 %
+> to 18.27 — that A/B has not been re-run.
+
 (b=1 decode is a kernel diagnostic, not a headline metric — production batches are
-32–128 — but the A/B is valid: same kernels, same weights, one feature flag.)
+32–128, where the same box measures **111.69 tok/s aggregate at B=256**
+[measured] — but the A/B is valid: same kernels, same weights, one feature flag.)
 
 ## 5. ISQ thread policy: 24 host threads thrashing one GPU
 
