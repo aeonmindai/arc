@@ -4,6 +4,7 @@ use crate::{attention::backends::cpu, pipeline::text_models_inputs_processor::Fl
 
 use candle_core::{DType, Device, Result, Tensor};
 
+pub(crate) mod arcflash;
 mod backends;
 
 #[allow(unused)]
@@ -183,6 +184,7 @@ impl Sdpa {
                     }
                 }
             } else {
+                arcflash::note(arcflash::Path::VendorFlash);
                 return flash_attn(&q, &k, &v, flash_params, sdpa_params)?.transpose(1, 2);
             }
         }
@@ -259,6 +261,7 @@ impl Sdpa {
                 Some(mask) => Some(mask.broadcast_as(tgt_mask_shape)?),
                 None => None,
             };
+            arcflash::note(arcflash::Path::MetalSdpa);
             return candle_nn::ops::sdpa(
                 q,
                 k,
@@ -270,20 +273,34 @@ impl Sdpa {
             );
         }
 
+        // ArcAttention/Dispatch: from here no vendor kernel accepted the shape,
+        // so ArcFlash owns the decision. cuBLASLt keeps the shapes it is good
+        // at; everything else goes to ArcFlash/Tile, which folds the GQA
+        // expansion instead of materializing it and bounds the score matrix to
+        // one query tile. See `arcflash.rs` for why that is exact.
+        //
+        // A rank-2 mask and NCCL both stay off the cuBLASLt arm: the former is
+        // outside its "mask rank must be 3 or 4" contract, the latter is the
+        // pre-existing carve-out. Both are ordinary inputs to ArcFlash/Tile.
+        let cublaslt_ok = !force_naive_sdpa()
+            && matches!(q.device(), Device::Cuda(_))
+            && mistralrs_quant::cublaslt::CUBLASLT_CONTROLLER
+                .get_for_device(q.device())
+                .is_some()
+            && !mask.is_some_and(|x| x.rank() == 2)
+            && !mistralrs_quant::distributed::use_nccl();
+
+        // `union_attention` records its own engagement, so there is exactly one
+        // increment per dispatch.
+        if arcflash::plan_unfused(false, cublaslt_ok) == arcflash::Path::Tile {
+            return arcflash::union_attention(q, k, v, mask, None, sdpa_params);
+        }
+
+        // cuBLASLt's batch matmul takes one head axis, so this arm — and only
+        // this arm — still pays for the expansion.
         let k = repeat_kv(k.clone(), sdpa_params.n_kv_groups)?;
         let v = repeat_kv(v.clone(), sdpa_params.n_kv_groups)?;
 
-        if mask.is_some_and(|x| x.rank() == 2) || mistralrs_quant::distributed::use_nccl() {
-            return naive_sdpa(
-                &q.contiguous()?,
-                &k.contiguous()?,
-                &v.contiguous()?,
-                mask,
-                sdpa_params,
-            );
-        }
-
-        // TODO: bench?
         #[allow(unused)]
         if let (false, Device::Cuda(_), Some(cublaslt)) = (
             force_naive_sdpa(),
@@ -292,6 +309,7 @@ impl Sdpa {
         ) {
             #[cfg(feature = "cuda")]
             {
+                arcflash::note(arcflash::Path::Cublaslt);
                 maybe_synchronize(q.device())?;
 
                 // Use chunked attention for cuBLASLt path
@@ -365,5 +383,93 @@ impl Sdpa {
         } else {
             naive_sdpa(q, &k, &v, mask, sdpa_params)
         }
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use candle_core::DType;
+
+    fn mk(dims: &[usize], seed: f32) -> Result<Tensor> {
+        let n: usize = dims.iter().product();
+        let data: Vec<f32> = (0..n).map(|i| ((i as f32 + 1.0) * seed).sin()).collect();
+        Tensor::from_vec(data, dims, &Device::Cpu)?.to_dtype(DType::F32)
+    }
+
+    fn params(head_dim: usize, n_kv_groups: usize, sinks: Option<Tensor>) -> SdpaParams {
+        SdpaParams {
+            n_kv_groups,
+            softcap: None,
+            softmax_scale: 1.0 / (head_dim as f32).sqrt(),
+            sliding_window: None,
+            sinks,
+        }
+    }
+
+    /// D18, at the entry point every one of the ~69 model call sites uses.
+    ///
+    /// Treatment: DeepSeek-V4's shape — per-head sinks, MQA, head_dim 512. No
+    /// vendor kernel takes it (the fused sinks kernel stops at 256), so it must
+    /// land on ArcFlash/Tile.
+    ///
+    /// Control: the same call with no sinks at a head_dim the CPU flash backend
+    /// serves. ArcFlash/Tile must **not** move. The absence is the assertion —
+    /// without it, "Tile ran" could just mean "Tile runs for everything", which
+    /// would prove nothing about the dispatch.
+    #[test]
+    fn v4_shape_routes_to_arcflash_and_the_control_does_not() -> Result<()> {
+        // Treatment: b=1, 4 heads over 1 kv head, head_dim 512 (V4's), sinks on.
+        let (h, t, d) = (4usize, 3usize, 512usize);
+        let q = mk(&[1, h, t, d], 0.007)?;
+        let k = mk(&[1, 1, t, d], 0.011)?;
+        let v = mk(&[1, 1, t, d], 0.013)?;
+        let sinks = mk(&[1, h, 1, 1], 0.29)?;
+
+        let before = arcflash::engagement_local(arcflash::Path::Tile);
+        Sdpa.run_attention(&q, &k, &v, None, None, &params(d, h, Some(sinks)))?;
+        let after = arcflash::engagement_local(arcflash::Path::Tile);
+        assert!(
+            after > before,
+            "a V4-shaped call (sinks, MQA, head_dim 512) did not reach ArcFlash/Tile"
+        );
+
+        // Control: no sinks, head_dim 64 — the CPU flash backend serves this, so
+        // ArcFlash/Tile must stay put.
+        let d = 64usize;
+        let q = mk(&[1, h, t, d], 0.017)?.to_dtype(DType::BF16)?;
+        let k = mk(&[1, h, t, d], 0.019)?.to_dtype(DType::BF16)?;
+        let v = mk(&[1, h, t, d], 0.023)?.to_dtype(DType::BF16)?;
+
+        let before = arcflash::engagement_local(arcflash::Path::Tile);
+        Sdpa.run_attention(&q, &k, &v, None, None, &params(d, 1, None))?;
+        let after = arcflash::engagement_local(arcflash::Path::Tile);
+        assert_eq!(
+            after, before,
+            "a flash-eligible call was silently absorbed by ArcFlash/Tile; the \
+             treatment arm above therefore proves nothing about dispatch"
+        );
+        Ok(())
+    }
+
+    /// The sinks branch is taken before flash is even considered, so a head_dim
+    /// the vendor kernel *would* accept still routes through ArcAttention rather
+    /// than falling out of the system. Pins the ordering in `run_attention`.
+    #[test]
+    fn sinks_keep_the_call_inside_arcattention() -> Result<()> {
+        let (h, t, d) = (2usize, 4usize, 64usize);
+        let q = mk(&[1, h, t, d], 0.031)?;
+        let k = mk(&[1, h, t, d], 0.037)?;
+        let v = mk(&[1, h, t, d], 0.041)?;
+        let sinks = mk(&[1, h, 1, 1], 0.43)?;
+
+        let before = arcflash::engagement_local(arcflash::Path::Tile);
+        let out = Sdpa.run_attention(&q, &k, &v, None, None, &params(d, 1, Some(sinks)))?;
+        assert_eq!(out.dims(), &[1, h, t, d]);
+        assert!(
+            arcflash::engagement_local(arcflash::Path::Tile) > before,
+            "a sinks call at a flash-eligible head_dim escaped ArcAttention"
+        );
+        Ok(())
     }
 }
