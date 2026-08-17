@@ -432,7 +432,6 @@ mod tests {
         sequence::{SeqStepType, SequenceGroup, SequenceRecognizer},
     };
     use std::time::Duration;
-    use tokio::sync::Mutex;
 
     /// Minimal running-completion sequence of exactly `n_toks` tokens.
     /// Mirrors `sequence::tests::dummy_seq` / `pipeline::amoe::new_dummy_seq`:
@@ -455,7 +454,9 @@ mod tests {
             vec![],
         )
         .unwrap();
-        let group = Arc::new(Mutex::new(SequenceGroup::new(1, false, false, None)));
+        let group = Arc::new(std::sync::Mutex::new(SequenceGroup::new(
+            1, false, false, None,
+        )));
         let seq = Sequence::new_waiting(
             vec![1u32; n_toks],
             String::new(),

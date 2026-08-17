@@ -86,15 +86,15 @@ pub(crate) async fn finish_or_add_toks_to_seq(
 
     // Handle streaming requests.
     //
-    // `get_mut_group()` expands the `get_mut_group!` busy-wait
-    // (`utils/mod.rs:227-237`): `try_lock` in a bare `loop` with `yield_now()`
-    // and no backoff. A streaming decode step takes it nine times per token per
-    // sequence — five of those from `update_time_info()` re-locking to write
-    // five fields — against one `SequenceGroup` mutex shared by the whole
-    // request. This span is the first one that counts it.
-    let group_is_streaming = {
-        let _s = arc_profiler::span("group_lock.is_streaming");
-        seq.get_mut_group().is_streaming
+    // `get_mut_group()` is now a blocking `std::sync::Mutex` acquire, not the
+    // `try_lock` + `std::thread::yield_now()` spin it used to be. Both flags are
+    // read under one acquisition rather than two separate ones a few lines
+    // apart; the group's mode cannot change mid-request, so this is also the
+    // more honest read.
+    let (group_is_streaming, group_is_chat) = {
+        let _s = arc_profiler::span("group_lock.mode");
+        let group = seq.get_mut_group();
+        (group.is_streaming, group.is_chat)
     };
     if group_is_streaming {
         let mut tool_use_still_possible = false;
@@ -116,7 +116,7 @@ pub(crate) async fn finish_or_add_toks_to_seq(
             if send {
                 let delta_result = seq.get_delta();
                 if let Some(delta) = crate::handle_seq_error_ok!(delta_result, seq.responder()) {
-                    if seq.get_mut_group().is_chat {
+                    if group_is_chat {
                         // Check if we're in Harmony mode or think tag mode and use parsed content
                         let (content_delta, reasoning_delta) = if seq.is_harmony_mode() {
                             // In Harmony mode, use the parsed final content and reasoning
@@ -214,32 +214,40 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                 }
             }
 
-            // Send usage on final chunk.
-            let usage_opt = if is_done.is_some() {
-                let usage = seq.get_mut_group().get_usage();
-                seq.get_mut_group().total_prompt_toks = 0;
-                seq.get_mut_group().total_toks = 0;
-                Some(usage)
-            } else {
-                None
+            // Build the chunk and release the group lock BEFORE dispatching it.
+            // Usage on the final chunk is read under the same acquisition that
+            // resets the counters and takes the buffered chunks, instead of the
+            // four separate ones this used to be.
+            let response = {
+                let _s = arc_profiler::span("group_lock.take_response");
+                let mut group = seq.get_mut_group();
+                let usage_opt = if is_done.is_some() {
+                    let usage = group.get_usage();
+                    group.total_prompt_toks = 0;
+                    group.total_toks = 0;
+                    Some(usage)
+                } else {
+                    None
+                };
+                group.take_streaming_response(seq, this.name().clone(), usage_opt)
             };
 
-            // The serial dispatch loop: one `responder.send().await` per
-            // sequence, awaited in turn, with the pipeline mutex held for all
-            // of them. Sequential (not `join_all`), so a span across this await
-            // nests correctly.
-            let _s = arc_profiler::span("response.send");
-            if seq
-                .get_mut_group()
-                .maybe_send_streaming_response(seq, this.name().clone(), usage_opt)
-                .await
-                .is_err()
-            {
-                // If we can't send the response, cancel the sequence
-                seq.set_state(crate::sequence::SequenceState::Done(
-                    crate::sequence::StopReason::Canceled,
-                ));
-                this.reset_non_granular_state();
+            // Dispatch with the group lock dropped. `send_fast` pushes without
+            // awaiting whenever the client's channel has room, so one slow
+            // client no longer sits on the engine's critical path — and the
+            // pipeline mutex is no longer held across a suspension point here.
+            if let Some(response) = response {
+                let _s = arc_profiler::span("response.send");
+                if crate::utils::send_fast(&seq.responder(), response)
+                    .await
+                    .is_err()
+                {
+                    // If we can't send the response, cancel the sequence
+                    seq.set_state(crate::sequence::SequenceState::Done(
+                        crate::sequence::StopReason::Canceled,
+                    ));
+                    this.reset_non_granular_state();
+                }
             }
         }
 
@@ -328,7 +336,7 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                 }
             };
 
-            if seq.get_mut_group().is_chat {
+            if group_is_chat {
                 // In Harmony or think tag mode, use parsed content and tool calls
                 let (text_new, tool_calls, reasoning_content) = if seq.is_harmony_mode() {
                     let final_content = seq.get_harmony_final_content();
@@ -419,38 +427,34 @@ pub(crate) async fn finish_or_add_toks_to_seq(
             // Ensure timing info is synced to group before sending response
             seq.update_time_info();
 
-            let group = seq.get_mut_group();
-            if group.is_chat {
-                group
-                    .maybe_send_chat_done_response(
-                        crate::ChatCompletionResponse {
-                            id: seq.id().to_string(),
-                            choices: group.get_choices().to_vec(),
-                            created: seq.creation_time(),
-                            model: pipeline_name,
-                            system_fingerprint: crate::SYSTEM_FINGERPRINT.to_string(),
-                            object: "chat.completion".to_string(),
-                            usage: group.get_usage(),
-                            vote: None,
-                        },
-                        seq.responder(),
-                    )
-                    .await
-                    .map_err(candle_core::Error::msg)?;
-            } else {
-                group
-                    .maybe_send_completion_done_response(
-                        crate::CompletionResponse {
-                            id: seq.id().to_string(),
-                            choices: group.get_completion_choices().to_vec(),
-                            created: seq.creation_time(),
-                            model: pipeline_name,
-                            system_fingerprint: crate::SYSTEM_FINGERPRINT.to_string(),
-                            object: "text_completion".to_string(),
-                            usage: group.get_usage(),
-                        },
-                        seq.responder(),
-                    )
+            // Build under the lock, dispatch after dropping it.
+            let response = {
+                let group = seq.get_mut_group();
+                if group.is_chat {
+                    group.chat_done_response(crate::ChatCompletionResponse {
+                        id: seq.id().to_string(),
+                        choices: group.get_choices().to_vec(),
+                        created: seq.creation_time(),
+                        model: pipeline_name,
+                        system_fingerprint: crate::SYSTEM_FINGERPRINT.to_string(),
+                        object: "chat.completion".to_string(),
+                        usage: group.get_usage(),
+                        vote: None,
+                    })
+                } else {
+                    group.completion_done_response(crate::CompletionResponse {
+                        id: seq.id().to_string(),
+                        choices: group.get_completion_choices().to_vec(),
+                        created: seq.creation_time(),
+                        model: pipeline_name,
+                        system_fingerprint: crate::SYSTEM_FINGERPRINT.to_string(),
+                        object: "text_completion".to_string(),
+                        usage: group.get_usage(),
+                    })
+                }
+            };
+            if let Some(response) = response {
+                crate::utils::send_fast(&seq.responder(), response)
                     .await
                     .map_err(candle_core::Error::msg)?;
             }
