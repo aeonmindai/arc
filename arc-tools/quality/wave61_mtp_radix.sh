@@ -174,23 +174,47 @@ grep -c "UNSUPPORTED_PTX" "$OUT/serve_mtp.log" | grep -qv '^0$' && \
     die_env PTX "UNSUPPORTED_PTX in the MTP serve log despite a passing preflight"
 canary mtp || die_env CANARY_MTP "MTP server is incoherent — the run is VOID, no MTP number is reported"
 
-say "PHASE1 sweep B=1,8,32,128 at 64 decode tokens, temperature 0"
-( cd "$Q" && python3 batch_load_probe.py \
-    --batches 1,8,32,128 --reps 2 --max-tokens 64 --temperature 0 \
-    --cost-per-hour "$COST_HR" --label mtp_depth3 \
-    --out "$OUT/mtp_sweep.json" ) > "$OUT/mtp_sweep.log" 2>&1
-say "PHASE1 probe rc=$?"
-grep -E "^(BATCH|CONC|PREFILL|BATCHSWEEP|FAIL|WARN)" "$OUT/mtp_sweep.log" | tee -a "$STATUS"
+# One batch size per probe invocation, with a UTC fence recorded around each.
+#
+# WHY NOT ONE SWEEP: the MTP[b=<B>] markers are emitted by
+# AcceptanceTelemetry::log() only when a 64-proposed boundary is crossed, and
+# the per-request MTP[req=] lines carry no batch label at all. If the b= lines
+# do not appear, a single mixed-batch sweep leaves the per-request data
+# unattributable and the run yields nothing — which is exactly what happened on
+# the first attempt. Fencing each batch size in wall-clock lets the per-request
+# lines be bucketed by timestamp, so a usable tok_per_step survives even when
+# the aggregate markers do not.
+say "PHASE1 sweep B=1,8,32,128 at 64 decode tokens, temperature 0 (one probe per B)"
+: > "$OUT/mtp_fences.txt"
+for B in 1 8 32 128; do
+    echo "FENCE_START B=$B $(date -u +%Y-%m-%dT%H:%M:%S)" >> "$OUT/mtp_fences.txt"
+    ( cd "$Q" && python3 batch_load_probe.py \
+        --batches "$B" --reps 2 --max-tokens 64 --temperature 0 \
+        --cost-per-hour "$COST_HR" --label "mtp_b$B" \
+        --out "$OUT/mtp_b$B.json" ) > "$OUT/mtp_b$B.log" 2>&1
+    say "  B=$B probe rc=$?"
+    echo "FENCE_END B=$B $(date -u +%Y-%m-%dT%H:%M:%S)" >> "$OUT/mtp_fences.txt"
+    grep -E "^(BATCH|CONC|PREFILL|FAIL|WARN)" "$OUT/mtp_b$B.log" | tee -a "$STATUS"
+    grep -E "^  B=[0-9]+ rep" "$OUT/mtp_b$B.log" | tee -a "$STATUS"
+done
 
-# One MTP[b=N] bucket per observed engine batch size; counters are cumulative,
-# so the LAST line per bucket is that bucket's total.
-say "PHASE1 MTP markers (last per bucket):"
-grep -o "MTP\[b=[0-9]*\][^\"]*" "$OUT/serve_mtp.log" 2>/dev/null \
+say "PHASE1 MTP aggregate markers, if the engine emitted any:"
+grep -o "MTP\[agg\].*" "$OUT/serve_mtp.log" 2>/dev/null | tail -1 | tee -a "$STATUS"
+grep -o "MTP\[b=[0-9]*\].*" "$OUT/serve_mtp.log" 2>/dev/null \
     | awk '{ b=$1; last[b]=$0 } END { for (k in last) print last[k] }' \
     | sort -t= -k2 -n | tee "$OUT/mtp_markers.txt" | tee -a "$STATUS"
-grep -o "MTP\[agg\][^\"]*" "$OUT/serve_mtp.log" 2>/dev/null | tail -1 | tee -a "$STATUS"
-if ! [ -s "$OUT/mtp_markers.txt" ]; then
-    say "PHASE1 WARNING: no MTP[b=] markers. Acceptance is UNMEASURED for this run — NOT 0%."
+
+# Fallback: bucket the per-request lines by the wall-clock fences and sum the
+# raw counts. tok_per_step = committed/steps over the bucket, which is the same
+# ratio the engine's own marker reports — computed from the same raw fields, so
+# it is not a different metric, just a different aggregation point.
+say "PHASE1 per-request MTP bucketed by batch fence (tok_per_step = committed/steps):"
+python3 "$Q/mtp_bucket.py" --serve-log "$OUT/serve_mtp.log" \
+    --fences "$OUT/mtp_fences.txt" --out "$OUT/mtp_by_batch.json" \
+    2>&1 | tee -a "$STATUS"
+
+if ! [ -s "$OUT/mtp_markers.txt" ] && ! [ -s "$OUT/mtp_by_batch.json" ]; then
+    say "PHASE1 WARNING: no MTP data at all. Acceptance is UNMEASURED — NOT 0%."
     grep -m3 -iE "mtp|speculative" "$OUT/serve_mtp.log" | tee -a "$STATUS"
 fi
 stop_server
@@ -200,37 +224,84 @@ stop_server
 #   ON  + shared    radix can reuse
 #   OFF + shared    same workload, no cache  (the honest baseline)
 #   ON  + distinct  cache on, nothing reusable (matched-length control)
+#
+# ONE SERVER PER CELL. The hit-rate counters in engine/logger.rs are read with
+# `load`, not `swap` — only `tokens_processed` is reset per interval. So
+# `Prefix cache hitrate` is a CUMULATIVE lifetime ratio
+# (prefix_cache_hits / total_new_seqs) over everything the process ever served,
+# canary and warmups included. Running the shared and distinct cells against one
+# server therefore blends a cell that can hit with a cell that provably cannot,
+# and the printed rate belongs to neither. Separate processes, one rate each.
+#
+# WORKLOAD SHAPE. A barrier-synchronised one-shot batch releases all B requests
+# at the same instant, and sequences only enter the cache when they FINISH
+# (prefix_cacher.rs add_sequence is called from sampling.rs:229/:388). So the
+# entire first burst is a guaranteed miss no matter how good the cache is —
+# there is nothing in it yet. Production shared-prefix traffic is a closed loop,
+# not a thundering herd, so each cell now warms sequentially first and then
+# measures in --duration sustained mode, where finished requests are recycled
+# and the cache is actually exercised.
 run_radix_cell() {
     local tag="$1" batches="$2" mode="$3"
     say "  radix cell[$tag] batches=$batches prefix_mode=$mode tokens=$PREFIX_TOKENS"
     ( cd "$Q" && python3 batch_load_probe.py \
-        --batches "$batches" --include-128 --reps 2 --max-tokens 64 --temperature 0 \
+        --batches "$batches" --reps 2 --max-tokens 64 --temperature 0 \
         --prefix-tokens "$PREFIX_TOKENS" --prefix-mode "$mode" \
         --cost-per-hour "$COST_HR" --label "$tag" \
         --out "$OUT/radix_$tag.json" ) > "$OUT/radix_$tag.log" 2>&1
+    say "  radix cell[$tag] rc=$?"
     grep -E "^(BATCH|CONC|PREFILL|PREFIX|BATCHSWEEP|FAIL|WARN)" "$OUT/radix_$tag.log" | tee -a "$STATUS"
+    grep -E "^  B=[0-9]+ rep" "$OUT/radix_$tag.log" | tee -a "$STATUS"
+}
+
+# Sequential warm: a handful of one-at-a-time requests sharing the prefix, so
+# the cache is non-empty before the concurrent measurement starts.
+warm_prefix() {
+    local tag="$1" mode="$2"
+    say "  warming prefix cache for [$tag] (sequential, B=1 x 4)"
+    ( cd "$Q" && python3 batch_load_probe.py \
+        --batches 1 --reps 4 --max-tokens 8 --temperature 0 \
+        --prefix-tokens "$PREFIX_TOKENS" --prefix-mode "$mode" \
+        --cost-per-hour "$COST_HR" --label "warm_$tag" \
+        --out "$OUT/warm_$tag.json" ) > "$OUT/warm_$tag.log" 2>&1
+    say "  warm[$tag] hitrate after: $(grep -o "Prefix cache hitrate [0-9.]*%" "$OUT/serve_$tag.log" 2>/dev/null | tail -1)"
 }
 
 harvest_hitrate() {
     local tag="$1"
-    say "  hit rate[$tag] (engine/logger.rs interval line, last 5):"
-    grep -o "Throughput (T/s)[^\"]*" "$OUT/serve_$tag.log" 2>/dev/null | tail -5 | tee -a "$STATUS"
+    say "  hit rate[$tag] (CUMULATIVE lifetime ratio, last 3 intervals):"
+    grep -o "Throughput (T/s)[^\"]*" "$OUT/serve_$tag.log" 2>/dev/null | tail -3 | tee -a "$STATUS"
+    local dec
+    dec="$(grep -c "prefix cache: declining" "$OUT/serve_$tag.log" 2>/dev/null)"
+    say "  hit rate[$tag] declined matches: $dec"
+    if [ "${dec:-0}" -gt 0 ]; then
+        say "  NOTE: a declined match is a match the radix FOUND and then refused"
+        say "        on the KV-length guard. A low hit rate with declines>0 is a"
+        say "        KV-contract problem, not a cache-miss problem."
+        grep -o "prefix cache: declining[^\"]*" "$OUT/serve_$tag.log" 2>/dev/null | head -2 | tee -a "$STATUS"
+    fi
 }
 
-say "PHASE2 radix ON (--prefix-cache-n 16)"
-start_server radixon 0 16 256 || die_env SERVER_RADIXON "radix-ON server never came up"
-canary radixon --skip-facts || die_env CANARY_RADIXON "radix-ON server is incoherent — VOID"
-run_radix_cell radixon_shared "64,256" shared
-harvest_hitrate radixon
-run_radix_cell radixon_distinct "256" distinct
-harvest_hitrate radixon
+say "PHASE2a radix ON + shared prefix (--prefix-cache-n 16)"
+start_server radixon_shared 0 16 256 || die_env SERVER_RADIXON "radix-ON server never came up"
+canary radixon_shared --skip-facts || die_env CANARY_RADIXON "radix-ON server is incoherent — VOID"
+warm_prefix radixon_shared shared
+run_radix_cell radixon_shared "64,128,256" shared
+harvest_hitrate radixon_shared
 stop_server
 
-say "PHASE2 radix OFF (--prefix-cache-n 0) — the baseline the 111.69 tok/s @ B=256 figure was taken with"
-start_server radixoff 0 0 256 || die_env SERVER_RADIXOFF "radix-OFF server never came up"
-canary radixoff --skip-facts || die_env CANARY_RADIXOFF "radix-OFF server is incoherent — VOID"
-run_radix_cell radixoff_shared "64,256" shared
-harvest_hitrate radixoff
+say "PHASE2b radix ON + DISTINCT prefix (matched-length control, own server)"
+start_server radixon_distinct 0 16 256 || die_env SERVER_RADIXONDIST "control server never came up"
+warm_prefix radixon_distinct distinct
+run_radix_cell radixon_distinct "256" distinct
+harvest_hitrate radixon_distinct
+stop_server
+
+say "PHASE2c radix OFF + shared prefix — the baseline the 111.69 tok/s @ B=256 figure was taken with"
+start_server radixoff_shared 0 0 256 || die_env SERVER_RADIXOFF "radix-OFF server never came up"
+canary radixoff_shared --skip-facts || die_env CANARY_RADIXOFF "radix-OFF server is incoherent — VOID"
+run_radix_cell radixoff_shared "64,128,256" shared
+harvest_hitrate radixoff_shared
 stop_server
 
 # ---------------------------------------------------------------- summary
@@ -245,4 +316,32 @@ say "-- prefix cache hit rate (radix ON, last):"
 grep -o "Prefix cache hitrate[^,]*" "$OUT/serve_radixon.log" 2>/dev/null | tail -3 | tee -a "$STATUS"
 say "NOTE: cross-prefix reuse meter (share_stats/CrossPrefixMeter) has zero"
 say "      production callers and is NOT reportable. Backlog, not a number."
+
+# ---------------------------------------------------------------- assertion
+#
+# The canary proves the MODEL is fine. Nothing proved that NUMBERS WERE
+# ACTUALLY PRODUCED. The first run of this script printed RESULT=OK while every
+# batch row read `decode agg None tok/s` — a clean pass over an empty result,
+# which is the same fake-pass class the canary exists to prevent, one layer up.
+# A requested batch size that yields no throughput is a failed run.
+missing=""
+for f in "$OUT"/mtp_b*.log "$OUT"/radix_*.log; do
+    [ -f "$f" ] || continue
+    while IFS= read -r line; do
+        case "$line" in
+            *"decode agg None"*|*"decode agg  tok/s"*)
+                missing="$missing $(basename "$f" .log):$(printf '%s' "$line" | sed -n 's/.*BATCH\[B=\([0-9]*\)\].*/B=\1/p')" ;;
+        esac
+    done < <(grep "^BATCH\[B=" "$f" 2>/dev/null)
+done
+if [ -n "$missing" ]; then
+    say "ASSERT FAILED — these cells produced no throughput:$missing"
+    say "RESULT=INCOMPLETE (cells ran but yielded no number; see the per-rep rows above)"
+    exit 1
+fi
+if ! [ -s "$OUT/mtp_by_batch.json" ] && ! [ -s "$OUT/mtp_markers.txt" ]; then
+    say "ASSERT FAILED — no MTP acceptance data at any batch size."
+    say "RESULT=INCOMPLETE (MTP acceptance UNMEASURED — not 0%)"
+    exit 1
+fi
 say "RESULT=OK  artifacts in $OUT"
