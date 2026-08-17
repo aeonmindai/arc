@@ -66,7 +66,7 @@ __global__ void tq_cache_k(
     for(int i=tid;i<HS/2;i+=NT){
         const uint8_t pk=(ix[2*i]&0xF)|((ix[2*i+1]&0xF)<<4);
         constexpr int x=16;
-        cache[bi*cbs+head*chs+(i/x)*bs*x+bo*x+(i%x)]=pk;
+        cache[(long long)bi*cbs+(long long)head*chs+(i/x)*bs*x+bo*x+(i%x)]=pk;
     }
 }
 
@@ -106,7 +106,7 @@ __global__ void tq_cache_v(
         const int base=i*10; uint32_t w=0;
         const int cnt = (HS-base) < 10 ? (HS-base) : 10;
         for(int j=0;j<cnt;j++) w |= ((uint32_t)ix[base+j]&7)<<(j*3);
-        const int bb=bi*vbs+head*vhs+i*4*bs+bo;
+        const long long bb=(long long)bi*vbs+(long long)head*vhs+i*4*bs+bo;
         cache[bb]=(uint8_t)w; cache[bb+bs]=(uint8_t)(w>>8);
         cache[bb+2*bs]=(uint8_t)(w>>16); cache[bb+3*bs]=(uint8_t)(w>>24);
     }
@@ -156,7 +156,7 @@ __global__ void tq_cache_k_clocked(
     for(int i=tid;i<HS/2;i+=NT){
         const uint8_t pk=(ix[2*i]&0xF)|((ix[2*i+1]&0xF)<<4);
         constexpr int x=16;
-        cache[bi*cbs+head*chs+(i/x)*bs*x+bo*x+(i%x)]=pk;
+        cache[(long long)bi*cbs+(long long)head*chs+(i/x)*bs*x+bo*x+(i%x)]=pk;
     }
     if (tid == 0) clocks[vid * 5 + 4] = clock64();
 }
@@ -201,7 +201,7 @@ __global__ void tq_cache_v_clocked(
         const int base=i*10; uint32_t w=0;
         const int cnt = (HS-base) < 10 ? (HS-base) : 10;
         for(int j=0;j<cnt;j++) w |= ((uint32_t)ix[base+j]&7)<<(j*3);
-        const int bb=bi*vbs+head*vhs+i*4*bs+bo;
+        const long long bb=(long long)bi*vbs+(long long)head*vhs+i*4*bs+bo;
         cache[bb]=(uint8_t)w; cache[bb+bs]=(uint8_t)(w>>8);
         cache[bb+2*bs]=(uint8_t)(w>>16); cache[bb+3*bs]=(uint8_t)(w>>24);
     }
@@ -355,7 +355,7 @@ __global__ void tq_attn(
 
         // This lane's packed run: contiguous, and inside one x=16 group.
         const int byidx0 = lane * BPL;
-        const uint8_t* kbase = kc + pb*kbs + kvh*khs
+        const uint8_t* kbase = kc + (long long)pb*kbs + (long long)kvh*khs
                              + (byidx0 / 16) * BLOCK_SIZE * 16 + (byidx0 % 16);
 
         uint64_t cur = tq_load_klane<BPL>(kbase);
@@ -446,7 +446,7 @@ __global__ void tq_attn(
                 const int dim = tid + r * NT;
                 if (dim >= HS) continue;
                 const int group = dim / 10, pos = dim % 10;
-                const int bb = pb*vbs + kvh*vhs + group*4*BLOCK_SIZE + t;
+                const long long bb = (long long)pb*vbs + (long long)kvh*vhs + group*4*BLOCK_SIZE + t;
                 const uint32_t word = (uint32_t)vc[bb]
                                     | ((uint32_t)vc[bb + BLOCK_SIZE] << 8)
                                     | ((uint32_t)vc[bb + 2*BLOCK_SIZE] << 16)
@@ -536,29 +536,45 @@ __global__ void tq_attn_clocked(
     float qk_max = -FLT_MAX;
     const uint32_t* sbt = bt + sidx * mbps;
     const int nblocks = TQ_DIVUP(clen, BLOCK_SIZE);
+    // This loop must stay a mirror of tq_attn's: the whole point of the clocked
+    // variant is that its phase-2 stamps describe the kernel that actually
+    // runs. A scalar gather here against a vectorized one there would have made
+    // the timings describe a kernel nobody launches.
     for (int bi = warp; bi < nblocks; bi += NW) {
         int pb = sbt[bi];
         int tib = min(BLOCK_SIZE, (int)clen - bi*BLOCK_SIZE);
+        if (tib <= 0) continue;
+
+        const int byidx0 = lane * BPL;
+        const uint8_t* kbase = kc + (long long)pb*kbs + (long long)kvh*khs
+                             + (byidx0 / 16) * BLOCK_SIZE * 16 + (byidx0 % 16);
+        uint64_t cur = tq_load_klane<BPL>(kbase);
+
         for (int t = 0; t < tib; t++) {
-            int tpos = bi * BLOCK_SIZE + t;
+#if TQ_PREFETCH > 1
+            const uint64_t nxt = (t + 1 < tib)
+                ? tq_load_klane<BPL>(kbase + (t + 1) * 16) : 0ull;
+#endif
             float qk = 0.f;
             #pragma unroll
             for (int j = 0; j < BPL; j++) {
-                const int byidx = lane * BPL + j;
-                constexpr int x = 16;
-                const int koff = pb*kbs + kvh*khs + (byidx/x)*BLOCK_SIZE*x + t*x + (byidx%x);
-                const uint8_t pk = kc[koff];
-                const int d0 = byidx*2, d1 = byidx*2+1;
-                qk += qr[d0] * cb4[pk & 0xF];
-                qk += qr[d1] * cb4[(pk>>4) & 0xF];
+                const uint8_t pk = (uint8_t)((cur >> (8 * j)) & 0xFFull);
+                const int d0 = (byidx0 + j) * 2;
+                qk += qr[d0]     * cb4[pk & 0xF];
+                qk += qr[d0 + 1] * cb4[(pk >> 4) & 0xF];
             }
             #pragma unroll
             for (int mask = TQ_WARP/2; mask > 0; mask >>= 1)
                 qk += __shfl_xor_sync(0xffffffff, qk, mask);
             float knorm = __half2float(kn[pb*nbs + kvh*nhs + t]);
             qk *= knorm * scale;
-            if (lane == 0) logits[tpos] = qk;
+            if (lane == 0) logits[bi * BLOCK_SIZE + t] = qk;
             qk_max = fmaxf(qk_max, qk);
+#if TQ_PREFETCH > 1
+            cur = nxt;
+#else
+            if (t + 1 < tib) cur = tq_load_klane<BPL>(kbase + (t + 1) * 16);
+#endif
         }
     }
     if (tid == 0) clocks[block_id * 6 + 2] = clock64();
@@ -610,7 +626,7 @@ __global__ void tq_attn_clocked(
                 const int dim = tid + r * NT;
                 if (dim >= HS) continue;
                 const int group = dim / 10, pos = dim % 10;
-                const int bb = pb*vbs + kvh*vhs + group*4*BLOCK_SIZE + t;
+                const long long bb = (long long)pb*vbs + (long long)kvh*vhs + group*4*BLOCK_SIZE + t;
                 const uint32_t word = (uint32_t)vc[bb] |
                                ((uint32_t)vc[bb+BLOCK_SIZE]<<8) |
                                ((uint32_t)vc[bb+2*BLOCK_SIZE]<<16) |
@@ -658,13 +674,14 @@ static void tq_launch_attn(
     int kbs, int khs, int vbs, int vhs, int nbs, int nhs,
     dim3 grid, dim3 block, int smem, cudaStream_t stream
 ) {
-    static int granted = 0;
-    if (smem > 48 * 1024 && smem > granted) {
-        if (cudaFuncSetAttribute(
-                (const void*)(tq_attn<HS, BLOCK_SIZE, QT, OutT>),
-                cudaFuncAttributeMaxDynamicSharedMemorySize, smem) == cudaSuccess) {
-            granted = smem;
-        }
+    // Not cached: the requestable maximum differs by architecture, so a single
+    // process-wide flag would be wrong the moment two devices differ. A failure
+    // here means the request exceeds the device's opt-in cap; the launch below
+    // then fails with cudaErrorInvalidValue, which surfaces on the next sync.
+    if (smem > 48 * 1024) {
+        (void)cudaFuncSetAttribute(
+            (const void*)(tq_attn<HS, BLOCK_SIZE, QT, OutT>),
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     }
     tq_attn<HS, BLOCK_SIZE, QT, OutT><<<grid, block, smem, stream>>>(
         (OutT*)out, (const QT*)query, (const uint8_t*)kc, (const uint8_t*)vc,
@@ -680,13 +697,14 @@ static void tq_launch_attn_clocked(
     int kbs, int khs, int vbs, int vhs, int nbs, int nhs,
     dim3 grid, dim3 block, int smem, cudaStream_t stream
 ) {
-    static int granted = 0;
-    if (smem > 48 * 1024 && smem > granted) {
-        if (cudaFuncSetAttribute(
-                (const void*)(tq_attn_clocked<HS, BLOCK_SIZE, QT>),
-                cudaFuncAttributeMaxDynamicSharedMemorySize, smem) == cudaSuccess) {
-            granted = smem;
-        }
+    // Not cached: the requestable maximum differs by architecture, so a single
+    // process-wide flag would be wrong the moment two devices differ. A failure
+    // here means the request exceeds the device's opt-in cap; the launch below
+    // then fails with cudaErrorInvalidValue, which surfaces on the next sync.
+    if (smem > 48 * 1024) {
+        (void)cudaFuncSetAttribute(
+            (const void*)(tq_attn_clocked<HS, BLOCK_SIZE, QT>),
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     }
     tq_attn_clocked<HS, BLOCK_SIZE, QT><<<grid, block, smem, stream>>>(
         (__nv_bfloat16*)out_bf16, (const QT*)query,
