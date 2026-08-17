@@ -125,7 +125,7 @@ _FILLER = (
 )
 
 
-def make_prompt(i):
+def make_user_text(i):
     """Distinct-from-token-0 prompt, ~64 tokens: unique salt first, rotating
     topic, shared filler tail."""
     return (
@@ -134,15 +134,99 @@ def make_prompt(i):
     )
 
 
+# ------------------------------------------------------- shared-prefix support
+#
+# The default prompt above is deliberately distinct from token 0 so prefix reuse
+# CANNOT contaminate a throughput number. That makes this probe useless for
+# measuring a prefix cache, which is the opposite job: there the shared prefix
+# IS the independent variable.
+#
+# `--prefix-tokens N` prepends a ~N-token preamble to the SYSTEM message, ahead
+# of the distinct user turn, so the shared span is a strict prefix from token 0
+# under any chat template that emits system before user.
+#
+# `--prefix-mode` picks whether that preamble is reusable:
+#   shared   — byte-identical across every request (the fleet case: one system
+#              prompt, many users). Radix should collapse these to one copy.
+#   distinct — same LENGTH, but a per-request salt ahead of every shared byte,
+#              which breaks the match at token 0. This is the CONTROL, and it is
+#              a matched one: identical prompt-token count and identical prefill
+#              work, differing only in whether the span is reusable. Comparing
+#              shared-vs-distinct isolates prefix reuse from raw batching;
+#              comparing prefix-cache-on-vs-off would confound it with prompt
+#              length.
+_PREFIX_PARA = (
+    "You are an operations assistant for a large distributed inference fleet. "
+    "Follow the house style guide at all times. Answers must be concrete, must "
+    "name the mechanism before stating a conclusion, and must carry units on "
+    "every number. Never speculate about hardware you have not been told "
+    "about. When a question admits more than one reading, answer the most "
+    "common one and name the ambiguity in a single clause. Prefer a table "
+    "whenever more than three comparable items are in play. Cite the source "
+    "file and line whenever you refer to code. Do not repeat the question "
+    "back. Do not open with a summary of what you are about to say. "
+)
+
+# English averages roughly 0.75 words per token, so N tokens is ~0.75N words.
+# This is an ESTIMATE and is never reported as the prefix length: every record
+# carries the server's own usage.prompt_tokens and the sweep prints the measured
+# median (`measured_prompt_tok_p50`), so the real span is observed, not assumed.
+_WORDS_PER_TOKEN = 0.75
+
+
+def build_prefix(target_tokens, salt=None):
+    """Deterministic preamble of roughly `target_tokens` tokens.
+
+    `salt=None` yields a byte-identical string on every call (shared mode).
+    An integer `salt` puts a unique clause FIRST, which is what makes the
+    distinct control differ at token 0 rather than somewhere in the middle.
+    """
+    if target_tokens <= 0:
+        return ""
+    words = _PREFIX_PARA.split()
+    want = max(1, int(target_tokens * _WORDS_PER_TOKEN))
+    out = []
+    while len(out) < want:
+        out.extend(words)
+    body = " ".join(out[:want])
+    if salt is None:
+        return body
+    return f"Tenant {salt:06d}, directive {salt % 97}, revision {salt % 13}. " + body
+
+
+def make_prompt(i, args=None):
+    """Returns the (system, user) pair for request `i`.
+
+    Kept as a pair rather than one blob because the shared span has to sit in
+    the system turn to be a true prefix; `_build_request` is the only consumer
+    that needs to know which half is which.
+    """
+    user = make_user_text(i)
+    n = getattr(args, "prefix_tokens", 0) or 0
+    if n <= 0:
+        return (qlib.SYSTEM_PROMPT, user)
+    if getattr(args, "prefix_mode", "shared") == "shared":
+        return (qlib.SYSTEM_PROMPT + "\n\n" + build_prefix(n), user)
+    # Distinct control: the salt is placed ahead of EVERY shared byte,
+    # SYSTEM_PROMPT included. Putting it after would leave the two arms sharing
+    # the system preamble, and the control would silently still be measuring
+    # some prefix reuse. Same words, same count — only the order differs.
+    return (build_prefix(n, i) + "\n\n" + qlib.SYSTEM_PROMPT, user)
+
+
 # ---------------------------------------------------------------- HTTP client
 
 
-def _build_request(prompt_text, args):
-    """Returns (url, body_bytes) for one request."""
+def _build_request(prompt, args):
+    """Returns (url, body_bytes) for one request.
+
+    `prompt` is the (system, user) pair from `make_prompt`.
+    """
+    system_text, prompt_text = prompt
     if args.raw:
         payload = {
             "model": "default",
-            "prompt": qlib.encode_chat(prompt_text),
+            "prompt": qlib.encode_chat(prompt_text, system=system_text),
             "max_tokens": args.max_tokens,
             "temperature": args.temperature,
             "top_p": 1.0,
@@ -153,7 +237,7 @@ def _build_request(prompt_text, args):
         payload = {
             "model": "default",
             "messages": [
-                {"role": "system", "content": qlib.SYSTEM_PROMPT},
+                {"role": "system", "content": system_text},
                 {"role": "user", "content": prompt_text},
             ],
             "max_tokens": args.max_tokens,
@@ -308,7 +392,7 @@ def run_oneshot_batch(bsz, args, prompt_counter):
 
     threads = []
     for slot in range(bsz):
-        p = make_prompt(next(prompt_counter))
+        p = make_prompt(next(prompt_counter), args)
         t = threading.Thread(target=worker, args=(slot, p), daemon=True)
         t.start()
         threads.append(t)
@@ -334,7 +418,7 @@ def run_sustained(bsz, args, prompt_counter):
         while time.monotonic() < stop_at[0]:
             with lock:
                 idx = next(prompt_counter)
-            rec = _one_request(make_prompt(idx), args)
+            rec = _one_request(make_prompt(idx, args), args)
             with lock:
                 records.append(rec)
 
@@ -626,6 +710,16 @@ def main(argv=None):
                          "below this fraction of B (floor 2). 1.0 = demand "
                          "full concurrency; 0 = report only, never fail "
                          "(default: %(default)s)")
+    ap.add_argument("--prefix-tokens", type=int, default=0,
+                    help="prepend a ~N-token preamble to the SYSTEM turn so the "
+                         "span is a prefix from token 0. 0 (default) keeps the "
+                         "historic distinct-from-token-0 prompts.")
+    ap.add_argument("--prefix-mode", choices=("shared", "distinct"),
+                    default="shared",
+                    help="shared: preamble byte-identical across requests (the "
+                         "fleet case). distinct: same length, per-request salt "
+                         "ahead of every shared byte — the matched control that "
+                         "isolates prefix reuse from raw batching.")
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--timeout", type=int, default=900, help="per-request timeout (s)")
     ap.add_argument("--label", default="batch", help="tag for the results file")
@@ -715,6 +809,13 @@ def main(argv=None):
                 [r["decode_tok_s"] for r in all_records], 95),
             "ttft_s_p50": percentile([r["ttft_s"] for r in all_records], 50),
             "ttft_s_p95": percentile([r["ttft_s"] for r in all_records], 95),
+            # Measured, not assumed: build_prefix() targets a token count via a
+            # words-per-token estimate, so the only trustworthy statement about
+            # how long the shared span actually is comes from the server's own
+            # usage.prompt_tokens. A shared-vs-distinct pair whose p50s differ
+            # is not a matched control and the comparison is void.
+            "prompt_tokens_p50": percentile(
+                [r["prompt_tokens"] for r in all_records], 50),
         }
         def _mean_sub(section, key, reps_out=reps_out):
             vals = [r[section][key] for r in reps_out
@@ -788,6 +889,9 @@ def main(argv=None):
               f"bound) | server-instrumented agg "
               f"{prefill['agg_server_tok_s']} tok/s (compute only) | "
               f"per-req p50 {prefill['per_req_tok_s_p50']} tok/s")
+        print(f"PREFIX[B={bsz}] mode={args.prefix_mode} "
+              f"requested_tokens={args.prefix_tokens} "
+              f"measured_prompt_tok_p50={dist['prompt_tokens_p50']}")
         print(f"BATCH[B={bsz}] decode agg {mean_agg} tok/s | "
               f"decode per-user p50 {dist['per_req_decode_tok_s_p50']} tok/s "
               f"(p95 {dist['per_req_decode_tok_s_p95']}) | "
