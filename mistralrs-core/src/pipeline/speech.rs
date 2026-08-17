@@ -370,7 +370,9 @@ impl IsqPipelineMixin for SpeechPipeline {
 }
 
 impl CacheManagerMixin for SpeechPipeline {
-    fn clone_in_cache(&self, _seqs: &mut [&mut Sequence]) {}
+    fn clone_in_cache(&self, _seqs: &mut [&mut Sequence]) -> candle_core::Result<()> {
+        Ok(())
+    }
     fn clone_out_cache(&self, _seqs: &mut [&mut Sequence]) {}
     fn set_none_cache(
         &self,

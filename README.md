@@ -33,7 +33,7 @@ Forked from [mistral.rs](https://github.com/EricLBuehler/mistral.rs). Apache 2.0
 | **Sparse attention kernels** | FlashMLASparse CUDA kernel (MIT, ported from sgl-project) for top-k attention. Dense O(n²) → sparse O(n·k). |
 | **arc-cuda-graph autonomous decode** | Full decode loop (forward + sample + EOS check) on GPU. Zero CPU sync per token. Works on any model. |
 | **`arc validate --target-hbm`** | Pre-flight memory-footprint verification on any GPU before you spend rental hours. |
-| **AA-AgentPerf-style benchmark suite** | Real agentic coding trajectories, sustained concurrent load, market-derived SLO tiers. The harness can target other OpenAI-compatible servers, so side-by-side runs against SGLang/vLLM are *supported*, but **we have not run one** — no third-party comparison appears anywhere in this repo. |
+| **AA-AgentPerf-style benchmark suite** | Real agentic coding trajectories, sustained concurrent load, market-derived SLO tiers. The harness is vendor-abstracted and drives any OpenAI-compatible server, so side-by-side runs against SGLang/vLLM are *supported* — but **we have never run one**, on any engine, ever. No third-party engine has been benchmarked here, so any competitor performance figure anywhere in this tree is an unsourced leftover being struck on sight; please report one if you find it. |
 
 Plus everything from mistral.rs: PagedAttention, FlashAttention V2/V3, speculative decoding (EAGLE-3, Medusa, MTP), continuous batching, 100+ model architectures, GGUF/GPTQ/AWQ/ISQ, LoRA, MCP integration, multi-GPU tensor parallelism.
 
@@ -138,6 +138,8 @@ Python bindings: `pip install mistralrs-cuda` — TurboQuant is the default.
 ## Supported Models
 
 Arc supports every model mistral.rs supports — 100+ architectures across text, vision, speech, image generation, and embeddings.
+
+> **"Supported" here means an architecture loads — not that Arc has served it.** The only model Arc has ever run end-to-end on hardware is **DeepSeek V4 Flash**; every number in [Results](#results) comes from it. DeepSeek V4 Pro, Kimi K2.5 / K2.6 and GLM-5.1 have **never been loaded here** — they are roadmap targets ([Roadmap](#roadmap), Phase 1), listed below for architecture coverage only.
 
 <details>
 <summary><b>Text</b> — Llama, Mistral, Qwen, Gemma, Phi, DeepSeek, Kimi, GLM, Granite, GPT-OSS, and more</summary>

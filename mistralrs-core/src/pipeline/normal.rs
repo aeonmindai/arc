@@ -720,6 +720,36 @@ impl Loader for NormalLoader {
             None
         };
 
+        // TurboQuant for the eager KV cache. Must run *before* the model is
+        // built: every model constructor calls `NormalCache::new`, which reads
+        // this gate. See `kv_cache::resolve_eager_turboquant` for why this is
+        // opt-in while the paged `PagedCacheType::TurboQuant` default is not.
+        {
+            let model_cfg = self.inner.model_config(&config)?;
+            let decision = crate::kv_cache::configure_eager_turboquant(
+                model_cfg.k_head_dim(),
+                model_cfg.v_head_dim(),
+                matches!(
+                    model_cfg.kv_cache_layout(),
+                    crate::paged_attention::KvCacheLayout::Standard
+                ),
+                paged_attn_config.is_some(),
+            );
+            match decision {
+                crate::kv_cache::EagerTurboQuantDecision::Enabled(k, v) => {
+                    let preset = mistralrs_quant::turboquant::TurboQuantPreset::default();
+                    info!(
+                        "TurboQuant KV cache ON for the eager path: {preset} at \
+                         k_head_dim={k}, v_head_dim={v} ({:.2}x vs FP16).",
+                        preset.compression_ratio(k)
+                    );
+                }
+                crate::kv_cache::EagerTurboQuantDecision::Disabled(reason) => {
+                    tracing::debug!("TurboQuant KV cache off for the eager path: {reason}");
+                }
+            }
+        }
+
         let mut model = if use_nccl || cfg!(feature = "ring") {
             let (mapper, sharded_vb) = distributed::prepare_distributed_mapper(
                 dtype,
@@ -1425,7 +1455,7 @@ impl IsqPipelineMixin for NormalPipeline {
 }
 
 impl CacheManagerMixin for NormalPipeline {
-    fn clone_in_cache(&self, seqs: &mut [&mut Sequence]) {
+    fn clone_in_cache(&self, seqs: &mut [&mut Sequence]) -> candle_core::Result<()> {
         match self.model.cache() {
             EitherCache::Full(_) => FullCacheManager.clone_in_cache(self, seqs, false),
             EitherCache::Normal(_) => NormalCacheManager.clone_in_cache(self, seqs, false),

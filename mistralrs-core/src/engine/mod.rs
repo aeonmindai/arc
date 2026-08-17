@@ -13,6 +13,7 @@ use crate::{
     sequence::{SeqStepType, StopReason},
     tools, CompletionResponse, SchedulerConfig, DEBUG,
 };
+use futures::FutureExt;
 use interprocess::local_socket::{traits::Listener, ListenerOptions};
 use llguidance::ParserFactory;
 pub use logger::IntervalLogger;
@@ -152,6 +153,42 @@ pub fn reset_engine_terminate_flag() {
 pub static ENGINE_INSTRUCTIONS: LazyLock<
     std::sync::Mutex<HashMap<usize, Option<EngineInstruction>>>,
 > = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Turn a **panic** inside a pipeline step into an ordinary `Err`.
+///
+/// wave51-CB §3.2 / §4.1: three separate engine deaths in one session, all of
+/// them a `.unwrap()` inside the forward reached by one unlucky batch. A panic
+/// on the engine task takes the task down, and with it every *other* in-flight
+/// request — the GSM8K run lost 32 requests that had nothing wrong with them.
+/// The engine reboots lazily, on the next `get_sender`, and on the MTP pipeline
+/// it did not recover at all.
+///
+/// Catching here converts "the engine died" into "this batch failed", which
+/// `handle_pipeline_forward_error!` already knows how to report and recover
+/// from (respond to each sequence, mark it `Error`, reset the cache, continue).
+/// Known-bad states are still fixed at their source — this is the backstop for
+/// the ones nobody has found yet, and it is what makes a single bad request
+/// cost a single request.
+///
+/// The default panic hook still runs, so the backtrace is not lost.
+async fn step_catching_panics<F>(stage: &str, fut: F) -> candle_core::Result<Duration>
+where
+    F: std::future::Future<Output = candle_core::Result<Duration>>,
+{
+    match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+        Ok(res) => res,
+        Err(panic) => {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            Err(candle_core::Error::msg(format!(
+                "panic in {stage}: {msg} (contained: the batch fails, the engine keeps running)"
+            )))
+        }
+    }
+}
 
 pub struct Engine {
     tx: Sender<Request>,
@@ -442,8 +479,9 @@ impl Engine {
                                 "All sequences must either return raw logits, or not."
                             );
 
-                            pipeline
-                                .step(
+                            step_catching_panics(
+                                "completion step",
+                                pipeline.step(
                                     &mut scheduled.completion,
                                     false,
                                     return_raw_logits,
@@ -451,8 +489,9 @@ impl Engine {
                                     self.disable_eos_stop,
                                     rng.clone(),
                                     CacheBackendMetadata::DefaultInstructions { pre_op, post_op },
-                                )
-                                .await
+                                ),
+                            )
+                            .await
                         };
 
                         handle_pipeline_forward_error!(
@@ -512,8 +551,9 @@ impl Engine {
                                 }
                             };
 
-                            pipeline
-                                .step(
+                            step_catching_panics(
+                                "prompt step",
+                                pipeline.step(
                                     &mut scheduled.prompt,
                                     true,
                                     return_raw_logits,
@@ -521,8 +561,9 @@ impl Engine {
                                     self.disable_eos_stop,
                                     rng.clone(),
                                     CacheBackendMetadata::DefaultInstructions { pre_op, post_op },
-                                )
-                                .await
+                                ),
+                            )
+                            .await
                         };
 
                         let prompt_exec_time = handle_pipeline_forward_error!(
@@ -929,8 +970,9 @@ impl Engine {
                                     // separately via the runner's profiling.
                                     Ok(Duration::ZERO)
                                 } else {
-                                    pipeline
-                                        .step(
+                                    step_catching_panics(
+                                        "step",
+                                        pipeline.step(
                                             &mut guards_mut,
                                             is_prompt,
                                             return_raw_logits,
@@ -938,8 +980,9 @@ impl Engine {
                                             self.disable_eos_stop,
                                             rng.clone(),
                                             CacheBackendMetadata::PagedAttention { metadata },
-                                        )
-                                        .await
+                                        ),
+                                    )
+                                    .await
                                 }
                             }
                         };
@@ -1124,5 +1167,57 @@ impl Engine {
                 writer.write_all(req.as_bytes()).unwrap();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod step_panic_containment_tests {
+    use super::step_catching_panics;
+    use std::time::Duration;
+
+    /// wave51-CB: three engine deaths in one session, all of them a panic on
+    /// the engine task reached by one batch. The engine reboots only lazily
+    /// (on the next `get_sender`), and on the MTP pipeline it did not recover
+    /// at all — subsequent requests hung with the GPU at 0%.
+    ///
+    /// The specific panics are fixed at their source; this is the backstop that
+    /// makes "one unlucky sequence" cost one batch instead of the process.
+    ///
+    /// Mutation check: replace `step_catching_panics`' body with
+    /// `fut.await` and this test aborts the harness with the panic instead of
+    /// returning an `Err`.
+    #[tokio::test]
+    async fn a_panicking_step_becomes_an_error_not_an_engine_death() {
+        // Keep the default hook's noise out of the test log while still
+        // proving the panic really happened.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let res = step_catching_panics("completion step", async {
+            panic!("shape mismatch on dim 1, 18 <> 22");
+        })
+        .await;
+        std::panic::set_hook(prev);
+
+        let err = res
+            .expect_err("a panicking step must surface as an Err, not unwind the engine task")
+            .to_string();
+        assert!(
+            err.contains("panic in completion step"),
+            "the error must name the stage, got: {err}"
+        );
+        assert!(
+            err.contains("shape mismatch on dim 1, 18 <> 22"),
+            "the original panic message must survive so the operator can still \
+             diagnose it, got: {err}"
+        );
+    }
+
+    /// Containment must not change the happy path.
+    #[tokio::test]
+    async fn a_healthy_step_is_passed_through_unchanged() {
+        let res = step_catching_panics("prompt step", async { Ok(Duration::from_millis(7)) })
+            .await
+            .expect("a successful step must pass through");
+        assert_eq!(res, Duration::from_millis(7));
     }
 }

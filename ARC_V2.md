@@ -8,7 +8,17 @@ This document is the source of truth. If anything else in the repo contradicts i
 
 ## What Arc is
 
-Arc is a Rust inference engine, forked from `mistral.rs`. It serves frontier LLMs (DeepSeek V4 Pro, Kimi K2.6, GLM 5.1) at **10–70× the throughput of SGLang/vLLM on the same hardware**, at **near-lossless quality**, using only **techniques from peer-reviewed published research with public code**.
+Arc is a Rust inference engine, forked from `mistral.rs`. It is built to serve frontier MoE models on radically less hardware by composing **techniques from peer-reviewed published research with public code** — QTIP 2-bit weights, TurboQuant K4/V3 KV, TD-MoE Tucker decomposition, model-native sparse attention.
+
+**The only model Arc has ever served is DeepSeek V4 Flash.** DeepSeek V4 Pro, Kimi K2.6 and GLM 5.1 appear throughout this document as **roadmap targets** — they have never been loaded here. This is a roadmap: unless a number is explicitly labelled *measured*, it is a target.
+
+**What is measured** (protocols and raw-artifact provenance in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)):
+
+- **74.19 GB at 2.09 bits/param.** V4 Flash (284B total / 13B active) serves from one H200, where **every published V4-Flash config we could find needs four GPUs** — native checkpoint ≈160 GB, smallest published config 4×H200, and the one W4A16 quant is 143 GB whose own model card states that TP=1 OOMs on a single 141 GB H200. *This is checkable, and we want it checked: a published single-GPU V4-Flash config, or any engine loading it in ≤141 GB, refutes it.*
+- **GSM8K 1270/1319 = 96.3% ±1.0pp**, full test set, 0-shot, 0 degenerate / 0 truncated / 0 errors. The reference model's published 90.8 is **8-shot** — a different and easier protocol, so this is *not* a like-for-like win over it. (This supersedes the provisional **87.0%** n=100 subset still quoted on some `docs/` pages, which was measured on decode math since changed; those pages are not yet synced.)
+- **111.69 tok/s aggregate decode at B=256, $12.06/Mtok**, rising monotonically from B=1, `effective_B == B` on all seven batch rows, 0 errors across 505 requests.
+
+**No side-by-side run against SGLang, vLLM, or any other engine has ever been performed — not once — and no third-party performance number appears anywhere in this repo.** `arc-bench` is already vendor-abstracted and drives any OpenAI-compatible server, so a genuine baseline is one rental away; until that run exists, this document states what Arc does and what other engines *implement*, never how fast they are.
 
 The thesis: every frontier lab is implementing the same five-feature consensus stack (FP8/FP4 + FlashAttn3 + Paged/Radix KV + EAGLE + TP+EP). They're racing each other on execution speed of one recipe. Meanwhile, ~10 published techniques with public code sit unexploited because they require crossing team boundaries the labs haven't crossed.
 
@@ -28,16 +38,26 @@ All numbers below assume a single DGX-B200 node serving DeepSeek V4 Pro (1.6T to
 
 ## The metric targets
 
-| Metric | SGLang today | Arc v2 target | Multiple |
-|---|---|---|---|
-| Single-user decode tok/s @ 32K context | ~100 | 5,000–7,000 | 50–70× |
-| Single-user decode tok/s @ 1M context | ~30 | 3,000–5,000 | 100–170× |
-| Aggregate tok/s at full concurrency | ~25,000 | 250,000–350,000 | 10–14× |
-| Concurrent users at 1M context | ~10 | 120–300 | 12–30× |
-| Quality (perplexity drift from BF16) | 0% | ~1.5% | near-lossless |
-| Model size in HBM | 800 GB (NVFP4) | 320 GB | 2.5× |
+| Metric | Arc v2 target |
+|---|---|
+| Single-user decode tok/s @ 32K context | 5,000–7,000 |
+| Single-user decode tok/s @ 1M context | 3,000–5,000 |
+| Aggregate tok/s at full concurrency | 250,000–350,000 |
+| Concurrent users at 1M context | 120–300 |
+| Quality (perplexity drift from BF16) | ~1.5% |
+| Model size in HBM | 320 GB |
 
-These are honest, post-calibration numbers. Earlier drafts overstated. No apprentice-mode research bet; no Tucker-MoE-at-aggressive-rank hand-waving.
+These are Arc targets only. No apprentice-mode research bet; no Tucker-MoE-at-aggressive-rank hand-waving.
+
+> ⚠️ **A `SGLang today` baseline column and a derived `Multiple` column were removed
+> from this table on 2026-08-17.** They carried figures (`~100` and `~30` single-user,
+> `~25,000` aggregate, `~10` concurrent users) that **we have never run and cannot
+> source**, and every multiple was computed against them. This is the same defect class
+> as the fabricated competitor benchmark deleted from `docs/PEAK_INFERENCE.md` this
+> week. **Standing rule: name what another engine has; never state how fast it is
+> unless we ran it ourselves, on stated hardware, with the command recorded.** If a
+> baseline is wanted here, produce it with `arc-bench`, which is already
+> vendor-abstracted and can drive any OpenAI-compatible server.
 
 ---
 
@@ -48,7 +68,7 @@ Each technique is filed under one or more domains. Domains and their headline nu
 - **Domain 1 — Weight storage** (model footprint in HBM): target 320 GB for V4 Pro
 - **Domain 2 — KV memory per user** (concurrent users at long context): target 3 GB/user at 1M context
 - **Domain 3 — Per-token decode speed** (single-user tok/s): three sub-bottlenecks
-- **Domain 4 — Aggregate throughput** (utilization across all requests): target ~4× over standard SGLang scheduling
+- **Domain 4 — Aggregate throughput** (utilization across all requests): target ~4× over Arc's own measured scheduling baseline (a cross-engine multiple would need a run we have not done)
 - **Domain 5 — Quality preservation** (near-lossless stack)
 
 ### 1. NVFP4 weights (Domain 1, foundation)
@@ -162,7 +182,7 @@ Each technique is filed under one or more domains. Domains and their headline nu
 
 **What it does:** Each token attends only to a sparse subset of context blocks (MoBA) or a hierarchical sparse pattern (NSA). 5–10× attention speedup at long context with no quality loss.
 
-**Why:** Without this, attention dominates at 1M context and caps single-user tok/s at ~30. With it, attention becomes O(n log n) or O(n √n).
+**Why:** Without this, attention cost grows with context length until it dominates step time at 1M context. The tok/s ceiling that follows is **unmeasured** — on Arc and on every other engine; the `~30` previously printed here came from the unsourced SGLang column struck from the target table and was never run by anyone. With it, attention becomes O(n log n) or O(n √n).
 
 **Papers:**
 - `research/12_long_context/moba_mixture_of_block_attention.pdf` (Moonshot, shipped in Kimi K2/K2.6)
@@ -237,7 +257,7 @@ These stack on top of all the per-token speedups. Each addresses a different sou
 
 **What it does:** When N users are routing to the same MoE expert in the same step, load that expert from HBM once and serve all N. Amortizes expert load cost across users.
 
-**Why:** 2–3× aggregate throughput improvement on MoE workloads at >100 concurrent users.
+**Why:** Expected to improve aggregate throughput on MoE workloads at high concurrency. The `2–3×` previously stated here was **projected, with no paper and no run behind it** — this technique has no canonical paper to cite, so the size of the gain is an open question until Arc measures it.
 
 **Paper:** No single canonical paper; described in DeepSeek V3 § 3.2 (EPLB section) and SGLang scheduling docs.
 
@@ -271,7 +291,7 @@ These stack on top of all the per-token speedups. Each addresses a different sou
 
 **What it does:** Encode every conversation prefix as a 10,000-bit hypervector; look up by Hamming similarity instead of exact tree-walk match. Cache hits work on paraphrases.
 
-**Why:** Cache hit rate goes from ~30% (RadixAttention) to ~60% on real chat workloads.
+**Why:** An exact-prefix trie reuses KV only when a request opens with byte-identical text; a similarity index can also hit on paraphrases. **Neither hit rate has been measured** — the `~30%` attributed to RadixAttention and the `~60%` projected for this design were both unsourced, and this technique has no application paper to cite for them. Quantifying the gain requires a hit-rate measurement over a real chat trace, which `arc-bench` can produce.
 
 **Paper:** No single application paper; foundations in `research/07_holographic_cache/` (Plate 1995 HRR, Kanerva SDM, and the 2021 surveys).
 

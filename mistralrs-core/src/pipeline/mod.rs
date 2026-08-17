@@ -245,7 +245,12 @@ pub trait IsqPipelineMixin {
 pub trait CacheManagerMixin {
     /// Clone the cache FROM the sequences' cache TO the model cache. Only called for completion seqs.
     /// It is not a guarantee that this will be called for each completion step.
-    fn clone_in_cache(&self, seqs: &mut [&mut Sequence]);
+    /// Build the model's batched cache from `seqs`' per-sequence caches.
+    ///
+    /// Fallible so a batch that cannot be represented as one dense cache
+    /// fails the *requests* rather than panicking the engine task — see
+    /// [`crate::kv_cache::CacheManager::clone_in_cache`].
+    fn clone_in_cache(&self, seqs: &mut [&mut Sequence]) -> candle_core::Result<()>;
     /// Clone the cache FROM the model cache TO the sequences. Called for prompt and completion seqs.
     /// It is not a guarantee that this will be called for each step.
     fn clone_out_cache(&self, seqs: &mut [&mut Sequence]);
@@ -910,7 +915,7 @@ pub trait Pipeline:
                     if i == 0 {
                         let _s = arc_profiler::span("cache.pre_op");
                         match pre_op {
-                            CacheInstruction::In => self.clone_in_cache(input_seqs),
+                            CacheInstruction::In => self.clone_in_cache(input_seqs)?,
                             CacheInstruction::Nothing => (),
                             CacheInstruction::Reset {
                                 load_preallocated_cache,
