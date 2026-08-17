@@ -3328,22 +3328,46 @@ impl MtpBlock {
         cache: &mut KvCache,
         input_ids: &Tensor,
     ) -> Result<Tensor> {
-        let cached = cache.current_seq_len();
-        if cached != start_pos {
-            candle_core::bail!(
-                "MTP draft KV desync: cache holds {cached} entries but the step starts at \
-                 absolute position {start_pos}. Draft-KV slot k must be absolute position k \
-                 (see MtpBlock::new_draft_cache)."
-            );
-        }
+        self.forward_tokens_rows(fused, &[start_pos], cache, input_ids)
+    }
+
+    /// [`Self::forward_tokens`] for a batch whose rows sit at **different**
+    /// absolute positions.
+    ///
+    /// `start_pos` is one position per row, or a single shared one. The draft
+    /// KV must already be a **left-aligned** cohort — every row's live run
+    /// shifted to end at `max(start_pos)`, which is exactly what
+    /// [`crate::kv_cache::front_pad_kv_cache`] produces — so the one shared
+    /// append offset `SingleCache::append` writes at is simultaneously correct
+    /// for all of them.
+    ///
+    /// 🔑 Nothing new is plumbed to make the ragged case correct. `start_pos`
+    /// *is* `seqlen_offsets`, the vector `DecoderLayer::forward` already threads
+    /// to RoPE and (via `ragged_row_q0`) to `dsv4_attention`'s per-row `row_q0`,
+    /// which masks each row's dead prefix. What changed is that this function
+    /// stops collapsing it to one element.
+    ///
+    /// A **single-element** `start_pos` is the pre-change path verbatim: RoPE
+    /// takes its `seqlen_offsets.len() == 1` fast branch rather than the per-row
+    /// loop, and `resolve_ragged_rows` filters a one-element vector that equals
+    /// the batch's end column back to `None`. So the uniform group — every group
+    /// with per-sequence KV advance off — differs from the old code by control
+    /// flow, not by a tolerance.
+    pub fn forward_tokens_rows(
+        &self,
+        fused: &Tensor,
+        start_pos: &[usize],
+        cache: &mut KvCache,
+        input_ids: &Tensor,
+    ) -> Result<Tensor> {
+        draft_step_end_column(start_pos, fused.dim(0)?, cache.current_seq_len())?;
         let in_device = fused.device().clone();
         let xs = fused.to_device(&self.device)?;
         let ids = input_ids.to_device(&self.device)?;
-        let seqlen_offsets = [start_pos];
         let out = self.layer.forward(
             &xs,
             None,
-            &seqlen_offsets,
+            start_pos,
             cache,
             // MTP block is a Standard layer (`COMPRESS_RATIO_NEXTN_LAYER = 0`)
             // — no compressor, no xs history.
@@ -3364,6 +3388,18 @@ impl MtpBlock {
         input_ids: &Tensor,
     ) -> Result<Tensor> {
         self.forward_tokens(fused, pos, cache, input_ids)
+    }
+
+    /// [`Self::forward_step`] for a group whose rows sit at different absolute
+    /// positions — the single-token wrapper over [`Self::forward_tokens_rows`].
+    pub fn forward_step_rows(
+        &self,
+        fused: &Tensor,
+        pos: &[usize],
+        cache: &mut KvCache,
+        input_ids: &Tensor,
+    ) -> Result<Tensor> {
+        self.forward_tokens_rows(fused, pos, cache, input_ids)
     }
 
     /// ISQ handles for the block's quantizable projections: attention
@@ -3393,6 +3429,56 @@ impl MtpBlock {
         }
         tensors
     }
+}
+
+/// The shared end column a draft step's rows must present, or why this group is
+/// not one an MTP-block forward can run.
+///
+/// A dense `KvCache` appends at ONE offset, so a group can only share a forward
+/// when every row's live run ENDS at the same column — which is exactly what
+/// `kv_cache::front_pad_kv_cache` arranges and what makes the batch maximum
+/// `max(start_pos)` the cache's own `current_seq_len`. Each refusal below is a
+/// layout the caller believes in and the cache does not, and guessing would be
+/// a wrong answer nothing downstream catches:
+///
+/// * no positions at all — nothing to place the queries at;
+/// * a vector that is neither `1` nor `b_sz` wide — the caller and the tensor
+///   disagree about how many rows there are, and `seqlen_offsets` would be
+///   indexed past its end or silently applied to the wrong row;
+/// * a cache whose width is not the rows' shared end column — either the group
+///   was never left-aligned, or a row is *ahead* of the buffer it is drafting
+///   into, so its RoPE position and its draft-KV slot mean different things.
+///
+/// Extracted from [`MtpBlock::forward_tokens_rows`] so the three refusals can be
+/// exercised without standing up a 43-layer model — the same reason
+/// `dsv4_attention::resolve_ragged_rows` is a free function.
+pub(crate) fn draft_step_end_column(
+    start_pos: &[usize],
+    b_sz: usize,
+    cached: usize,
+) -> Result<usize> {
+    let Some(&end) = start_pos.iter().max() else {
+        candle_core::bail!(
+            "MTP draft step was given no absolute position at all; it needs one per row (or a \
+             single shared one)."
+        );
+    };
+    if start_pos.len() != 1 && start_pos.len() != b_sz {
+        candle_core::bail!(
+            "MTP draft step: {} absolute position(s) for a batch of {b_sz}. Pass one per row, \
+             or a single shared one.",
+            start_pos.len()
+        );
+    }
+    if cached != end {
+        candle_core::bail!(
+            "MTP draft KV desync: cache holds {cached} entries but the step's rows end at \
+             absolute position {end}. Draft-KV slot k must be absolute position k, and a ragged \
+             group must be left-aligned to its widest row first (see MtpBlock::new_draft_cache \
+             and kv_cache::front_pad_kv_cache)."
+        );
+    }
+    Ok(end)
 }
 
 /// V4 MTP head.
@@ -3979,10 +4065,17 @@ impl DeepSeekV4 {
         // `hc_mult` stream axis (audit finding 5(b), separately owned), so we
         // capture the post-`hc_head`, pre-`norm` `[B, T, hidden]` state — the
         // same tensor in the "pre-norm" sense, one collapse later.
+        //
+        // 🔑 The capture is tagged with `seqlen_offsets` — the WHOLE vector, not
+        // `seqlen_offsets[0]`. Row `i` of this block covers absolute positions
+        // `[seqlen_offsets[i], seqlen_offsets[i] + T)`, so collapsing it to row
+        // 0's offset made every other row's draft-KV extend read the leading
+        // row's idea of where it is. Under the cohort rule the rows agree and
+        // `MtpHiddenCapture::store_rows` folds them straight back to one shared
+        // offset, which is byte-identical to what the collapse produced.
         if let Some(mtp) = &self.mtp_head {
             if mtp.hidden_capture.is_armed() {
-                mtp.hidden_capture
-                    .store(seqlen_offsets.first().copied().unwrap_or(0), &xs);
+                mtp.hidden_capture.store_rows(seqlen_offsets, &xs);
             }
         }
 
@@ -7741,5 +7834,54 @@ mod tests {
              window, and that rollback HARD-ERRORS mid-decode.",
             crate::XS_TAIL_MARGIN_TOKENS
         );
+    }
+
+    /// 🔑 The MTP draft step's own precondition, and the three layouts it must
+    /// refuse rather than guess at.
+    ///
+    /// A dense `KvCache` appends at ONE offset, so a group shares a forward only
+    /// when every row's live run ends at the same column. The scalar form —
+    /// `&[pos]` — is the pre-change path exactly: `max` of a one-element slice
+    /// is that element, so the check reduces to the old `cached != start_pos`
+    /// character for character.
+    #[test]
+    fn the_draft_step_end_column_is_the_batch_maximum_and_refuses_every_other_layout() {
+        // Scalar: the pre-change behaviour, at any batch size.
+        assert_eq!(draft_step_end_column(&[7], 1, 7).unwrap(), 7);
+        assert_eq!(draft_step_end_column(&[7], 4, 7).unwrap(), 7);
+        let err = draft_step_end_column(&[7], 1, 6).unwrap_err().to_string();
+        assert!(
+            err.contains("desync") && err.contains("6") && err.contains("7"),
+            "a cache that is not at the step's position must say both numbers; got {err}"
+        );
+
+        // Ragged: the end column is the batch maximum, which is what
+        // `front_pad_kv_cache` left the cache at.
+        assert_eq!(draft_step_end_column(&[7, 4, 6], 3, 7).unwrap(), 7);
+        let err = draft_step_end_column(&[7, 4, 6], 3, 6)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("left-aligned"),
+            "a group that was never left-aligned must be told so; got {err}"
+        );
+
+        // A row AHEAD of the buffer it is drafting into: `max` exceeds `cached`,
+        // so its RoPE position and its draft-KV slot would mean different things.
+        assert!(draft_step_end_column(&[7, 9], 2, 7).is_err());
+
+        // Arity: neither 1 nor `b_sz`.
+        let err = draft_step_end_column(&[7, 4], 3, 7)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("2 absolute position(s) for a batch of 3"),
+            "a positions vector that does not describe the batch must refuse rather than be \
+             indexed past its end; got {err}"
+        );
+        assert!(draft_step_end_column(&[7, 7, 7, 7], 3, 7).is_err());
+
+        // No positions at all.
+        assert!(draft_step_end_column(&[], 1, 0).is_err());
     }
 }
