@@ -265,7 +265,7 @@ footer code{font-size:11.5px}
     <h1>How an inference engine actually works <span class="dim">— and which knob moves which number</span></h1>
     <p class="lede">
       Two halves. <b>First</b>, the journey one token takes through the engine, drawn as a diagram, with a
-      visible loop — because the loop is the whole story. <b>Second</b>, <b>322 terms</b> you could hear in a
+      visible loop — because the loop is the whole story. <b>Second</b>, <b>338 terms</b> you could hear in a
       meeting about this engine, in plain English, each tagged with <b>which of the five metrics it actually
       moves</b>, <b>whether Arc has it today</b>, and <b>whose idea it was</b> — Arc's own, inherited from
       upstream mistral.rs, an industry standard everyone ships, or research we read and deliberately did not
@@ -448,7 +448,7 @@ footer code{font-size:11.5px}
 <section id="matrix">
   <div class="sechead"><span class="secnum">HALF 2</span><h2>The term matrix</h2></div>
   <p class="secsub">
-    <b>322 terms.</b> Each one in plain English, with what it is <em>like</em>, which of the five metrics it
+    <b>338 terms.</b> Each one in plain English, with what it is <em>like</em>, which of the five metrics it
     moves, <b>whose idea it was</b> — ours, upstream mistral.rs, industry standard, or research we read and did
     not adopt — and exactly where Arc stands on it today. Filter by metric, status or origin, search anything,
     regroup by origin to see what is actually ours, or switch to the leverage ranking to see what is worth
@@ -1253,6 +1253,87 @@ arc:"**Partly shipped from upstream** — Arc serves GDN (Gated Delta Net) for Q
 d:"The theory that softmax attention is one update step of a continuous Hopfield network, with capacity exponential in dimension — the maths behind claims that a fixed-size vector can hold a great many tokens.",
 a:"The proof that the summary *could* be lossless, which is not the same as a summariser.",
 arc:"**Research only.** It was the mathematical backing for apprentice mode, which was **killed from the roadmap** for lack of any end-to-end validation.",gap:0,lev:0},
+/* ---------------- ARCHITECTURE ---------------- */
+{t:"RMSNorm",g:"Architecture",o:"ind",s:["attention","experts"],st:"shipped",m:["qual"],k:"root mean square layer normalization rms_norm_eps epsilon gain",
+d:"Rescaling a vector by its root-mean-square so its magnitude stays in a workable range, with a learned per-channel gain and no mean subtraction.",
+a:"A volume normaliser between every stage of the amplifier, so nothing clips downstream.",
+arc:"Shipped and used everywhere in V4 — `RmsNorm::new(head_dim, cfg.rms_norm_eps, …)`, plus a final norm before the shared `lm_head` and its own `enorm`/`hnorm`/`norm` inside the MTP head. **It moves none of the five metrics; it is here because it is on every architecture diagram you will be shown.**",gap:0,lev:0},
+
+{t:"LayerNorm",g:"Architecture",o:"ind",s:["attention"],st:"shipped",m:["qual"],k:"layer normalization mean subtraction beta bias older models",
+d:"The older normalizer that subtracts the mean as well as dividing by the standard deviation, and carries a bias term.",
+a:"The same volume normaliser, with an extra knob nobody found they needed.",
+arc:"Shipped from upstream for the model families that use it. **Modern LLMs, V4 included, use RMSNorm instead** — it is cheaper and works as well.",gap:0,lev:0},
+
+{t:"Pre-norm vs post-norm",g:"Architecture",o:"ind",s:["attention"],st:"shipped",m:["qual"],k:"x + sublayer(norm(x)) residual placement training stability",
+d:"Whether the normalization happens before the sublayer or after it. Pre-norm — `x + sublayer(norm(x))` — is what makes deep stacks trainable.",
+a:"Tuning the instrument before the solo rather than after it.",
+arc:"Shipped. **V4 does neither of the standard things** — it replaces that residual form entirely with mHC.",gap:0,lev:0},
+
+{t:"Residual stream",g:"Architecture",o:"ind",s:["attention","experts"],st:"shipped",m:["qual"],k:"skip connection additive backbone hidden state highway",
+d:"The running hidden state each layer adds into rather than overwrites. It is the backbone every layer reads from and writes back to.",
+a:"A conveyor belt down the middle of the factory; each station adds to what is already on it.",
+arc:"Shipped. **Arc's `xs` history cache exists because V4's compressor needs the raw residual stream of every past token, not just the keys** — which is how a 335,954 B/token second cache came to exist without anyone planning it.",gap:0,lev:0},
+
+{t:"mHC (manifold-constrained hyper-connections)",g:"Architecture",o:"ind",s:["attention","experts"],st:"shipped",m:["qual"],k:"replaces residual hyper connection width hc doubly stochastic V4",
+d:"V4's replacement for the ordinary residual: instead of one stream, several parallel streams that get mixed by a learned matrix at every layer.",
+a:"Several conveyor belts side by side, with a crossover that reshuffles between stations.",
+arc:"**Shipped as a pure-Rust port of the reference (`dsv4_mhc.rs`), and it is the single most V4-specific thing in the engine.** It touches every one of the 43 layers, at six named mix points per layer, and once more before the final norm and `lm_head`.",gap:0,lev:0},
+
+{t:"Sinkhorn normalization",g:"Architecture",o:"ind",s:["attention","execution"],st:"shipped",m:["qual","user"],k:"doubly stochastic matrix iterative row column hc_sinkhorn_iters split",
+d:"Iteratively rescaling a matrix's rows and columns until both sum to one — a doubly-stochastic mixing matrix, so the streams blend without any of them being amplified away.",
+a:"Rebalancing a spreadsheet until every row and every column adds to 100%.",
+arc:"**Shipped, and it is where a large chunk of decode time was hiding.** It is the normalizer inside mHC's `comb` matrix (`hc_sinkhorn_iters`). Naively compiled it became roughly **13,000 tiny kernel launches per token — about 18% of the decode step**; the fused kernel replaced them and is default-on after a bit-identity proof. `--use_fast_math` broke it once.",gap:0,lev:0},
+
+{t:"SwiGLU",g:"Architecture",o:"ind",s:["experts"],st:"shipped",m:["qual"],k:"gated linear unit gate up down proj feed forward three matrices",
+d:"The gated feed-forward block modern LLMs use: two projections up, one of them squashed and used as a gate on the other, then one projection back down.",
+a:"A tap and a valve in series — one decides how much, the other decides what.",
+arc:"Shipped. **This is what an *expert* physically is** in V4 — the `gate`, `up` and `down` matrices that Arc's autotuner picks kernels for (winners v21 for gate, v6 for down).",gap:0,lev:0},
+
+{t:"swiglu_limit",g:"Architecture",o:"ind",s:["experts"],st:"shipped",m:["qual"],k:"clamp 10.0 config field verified present reference getattr",
+d:"A clamp on the SwiGLU gate, bounding how large the gating value may get.",
+a:"A stop on the valve so it cannot be opened past a safe point.",
+arc:"Shipped. **Verified present in the published `config.json` at 10.0**, rather than assumed — the reference reads it with a `getattr` default, so a silently-missing field would have gone unnoticed.",gap:0,lev:0},
+
+{t:"SiLU / GELU / activation functions",g:"Architecture",o:"ind",s:["experts"],st:"shipped",m:["qual"],k:"swish sigmoid linear unit gaussian error relu nonlinearity hidden_act",
+d:"The nonlinearity inside the feed-forward block. Without one, stacking layers would collapse into a single matrix multiply.",
+a:"The bend in the response curve that stops the whole stack being one straight line.",
+arc:"Shipped, dispatched from the config's `hidden_act`. **V4's default is SiLU.** ReLU matters for a different reason: the sparsity family (TurboSparse, dReLU) works by making this function output exact zeros so the arithmetic can be skipped.",gap:0,lev:0},
+
+{t:"Embedding / unembedding (lm_head)",g:"Architecture",o:"ind",s:["tokenize","sample"],st:"shipped",m:["size","qual"],k:"embed_tokens vocab table tied weights output projection 129280",
+d:"The lookup table that turns token ids into vectors at the bottom, and the projection that turns the final vector back into a score per vocabulary entry at the top.",
+a:"The dictionary at the front of the book and the index at the back.",
+arc:"Shipped. **The unembedding is the widest single matrix in the model** — `hidden_size × 129,280` — which is why sampling has to reduce over 129,280 scores every step, and why Candle's `arg_sort` crashes at that width and Arc needed its own radix select.",gap:0,lev:0},
+
+{t:"Model shape vocabulary",g:"Architecture",o:"ind",s:[],st:"concept",m:[],k:"hidden_size head_dim num_heads n_layers intermediate_size vocab_size config.json",
+d:"The handful of integers that define a transformer: hidden size, head dimension, head count, layer count, feed-forward width, vocabulary size.",
+a:"The dimensions on the architect's drawing. Everything else is materials.",
+arc:"**V4-Flash: 43 layers, all MoE, hidden 4096, head_dim 512, 64 query heads and 1 KV head, 256 routed experts plus 1 shared, top-6, vocab 129,280.** Every number on this page is downstream of these.",gap:0,lev:0},
+
+{t:"Grouped LoRA o_proj",g:"Architecture",o:"ind",s:["attention"],st:"shipped",m:["size"],k:"wo_a wo_b n_groups 8 o_lora_rank 1024 factorized output projection",
+d:"V4 factorizes the attention output projection into two smaller matrices with a group structure, rather than one dense matrix.",
+a:"Two narrow doorways in series instead of one wide one.",
+arc:"Shipped: `wo_a [4096→8192]` then `wo_b [8192→4096]` with `n_groups=8`, `o_lora_rank=1024`. A weight-size saving that is architectural rather than a quantization choice.",gap:0,lev:0},
+
+{t:"sqrtsoftplus scoring",g:"Architecture",o:"ind",s:["route"],st:"shipped",m:["qual"],k:"scoring_func router gate softmax sigmoid alternative V4",
+d:"The function V4's router uses to turn raw gate logits into expert scores — neither softmax nor sigmoid.",
+a:"A different way of scoring the triage form.",
+arc:"Shipped (`scoring_func=\"sqrtsoftplus\"`). The kind of per-model detail that silently degrades routing if defaulted wrongly.",gap:0,lev:0},
+
+{t:"ALiBi / learned / sinusoidal position encodings",g:"Architecture",o:"up",s:["attention"],st:"shipped",m:["qual"],k:"attention with linear biases absolute relative pre-rope alternatives",
+d:"The position schemes that came before rotary: a linear distance penalty on attention scores, a learned table, or fixed sinusoids.",
+a:"Earlier drafts of the same idea — telling the model where it is.",
+arc:"Present from upstream for older families. **RoPE and YaRN have effectively won**, and are what V4 uses.",gap:0,lev:0},
+
+{t:"Dropout",g:"Architecture",o:"ind",s:[],st:"concept",m:["qual"],k:"regularization training only inactive at inference",
+d:"Randomly zeroing activations during training as a regularizer.",
+a:"Making the team practise with players missing, so nobody is indispensable.",
+arc:"**Inactive by definition — this is an inference engine.** Listed only because it appears on architecture diagrams and someone will ask where it went.",gap:0,lev:0},
+
+{t:"first_k_dense_replace",g:"Architecture",o:"ind",s:["route"],st:"shipped",m:[],k:"dense layers before MoE starts 0 all layers MoE deepseek",
+d:"How many leading layers use a plain feed-forward block before the MoE layers begin.",
+a:"How many floors of the building are open-plan before the specialist offices start.",
+arc:"**Zero for V4-Flash — all 43 layers are MoE.** That is why the expert-read arithmetic applies to the whole model rather than to a suffix of it.",gap:0,lev:0},
+
 /* ---------------- MEMORY ---------------- */
 {t:"KV cache",g:"Memory",o:"ind",s:["kv","attention","memory"],st:"shipped",m:["size","agg"],k:"keys values cache per token per layer growth",
 d:"The keys and values of every token seen so far, kept so nothing is recomputed. It grows by one row per token, per user, per layer.",
@@ -1547,7 +1628,7 @@ arc:"`cp.async` was **built and ruled out** in the gen-2 GEMV grid. TMA and WGMM
 {t:"Zero-allocation decode",g:"Execution",o:"arc",s:["execution"],st:"off",m:["user"],k:"preallocated buffers no per token tensor allocation DecodeState",
 d:"Pre-allocating every buffer once so the forward pass allocates nothing per token.",
 a:"Setting out all the tools before starting, rather than fetching each one.",
-arc:"Built (`DecodeInputBuffers`, `DecodeState`) as part of the dedicated decode path, and therefore inherits its unreachability. **Related standing rule: never call `Tensor::from_vec` or `arange` on a GPU device in a hot loop** — it forces a CPU-to-GPU sync.",gap:2,lev:2},
+arc:"Built (`DecodeInputBuffers`, `DecodeState`) as part of the dedicated decode path, and therefore inherits its unreachability. **Related standing rule: never build a small tensor on a GPU device inside a hot loop** — `Tensor::from_vec` and the range constructors each force a CPU-to-GPU sync. Precompute them at model init, or at the very start of the forward pass.",gap:2,lev:2},
 
 {t:"cudnn (do not enable)",g:"Execution",o:"arc",s:["execution"],st:"none",m:["user"],k:"regression 62% decode 5.45 vs 14.58 feature flag",
 d:"An NVIDIA library that, for this workload, made things dramatically worse.",
@@ -2203,7 +2284,7 @@ var ORIGIN_BLURB = {
   res:"Published technique with code or a paper we have read and NOT adopted. Listed so nobody thinks we missed it — we chose, and the card says why."
 };
 var ORIGIN_ORDER = ["arc","up","ind","res"];
-var GROUP_ORDER = ["Pipeline","Serving","Compression","Attention","Memory","Execution","Speculation","MoE","Parallelism","Sampling & quality","Metrics","Hardware","Practice"];
+var GROUP_ORDER = ["Pipeline","Serving","Compression","Attention","Architecture","Memory","Execution","Speculation","MoE","Parallelism","Sampling & quality","Metrics","Hardware","Practice"];
 var STAGE_NAMES = {
   request:"Request in", tokenize:"Tokenize", schedule:"Scheduler", prefix:"Prefix cache",
   prefill:"Prefill", kv:"KV cache", attention:"Attention", route:"MoE routing",
