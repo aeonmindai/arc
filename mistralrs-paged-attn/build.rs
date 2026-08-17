@@ -13,6 +13,11 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/cuda/pagedattention.cuh");
     println!("cargo:rerun-if-changed=src/cuda/turbo_paged_attention.cuh");
+    // Every other .cu here is listed; this one was not, and because emitting
+    // *any* rerun-if-changed disables cargo's watch-the-whole-package default,
+    // edits to it were relying entirely on cudaforge's object cache to trigger
+    // a rebuild.
+    println!("cargo:rerun-if-changed=src/cuda/turbo_paged_attention.cu");
     println!("cargo:rerun-if-changed=src/cuda/copy_blocks_kernel.cu");
     println!("cargo:rerun-if-changed=src/cuda/reshape_and_cache_kernel.cu");
     println!("cargo:rerun-if-changed=src/cuda/concat_and_cache_mla_kernel.cu");
