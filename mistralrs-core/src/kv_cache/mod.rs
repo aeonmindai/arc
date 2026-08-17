@@ -2190,6 +2190,129 @@ mod clone_in_cache_invariant_tests {
         }
     }
 
+    /// 🔴 **The barrier re-forming as padding, one layer up — at the admission
+    /// key itself.**
+    ///
+    /// #102 found this trap in the target cache (`set_len` counting the dead
+    /// prefix) and #103 found it again in the draft cache (`drop_dead_prefix`
+    /// running after `state.filled` was recorded). Both times the tell was the
+    /// same: the rows did not merely inflate, their **spread collapsed to a
+    /// constant** — every row advancing at the fastest row's rate.
+    ///
+    /// The admission layer has its own copy of it, and it is the nastier one.
+    /// `Sequence::cache_bucket_len` — the single function
+    /// `default_scheduler::bucket_key_of` reads — is `normal_cache()[0]
+    /// .current_seq_len()`. After `front_align_batch` that is the batch
+    /// **maximum** for every row. So a caller that records the padded length
+    /// makes every sequence report the *same* bucket length, and:
+    ///
+    /// * every row advances at the **fastest** row's rate, so the separation
+    ///   between them freezes at the per-step commit spread instead of growing;
+    /// * the length-bucketed scheduler therefore stops shattering — not because
+    ///   the batch became uniform, but because the lengths it buckets on are no
+    ///   longer the sequences' own;
+    /// * and the ragged bucket key looks like it is doing its job, over a batch
+    ///   whose raggedness has been silently erased.
+    ///
+    /// A fix measured against a frozen spread would measure nothing. So the
+    /// property is asserted on how the spread of `cache_bucket_len` behaves as
+    /// the step count grows — `3 + 2n` when the prefix is stripped, a constant
+    /// `2` when it is not — with the un-stripped loop as the negative control.
+    ///
+    /// ⚠️ Arithmetic over real tensors, not a hardware measurement (D14).
+    #[test]
+    fn the_scheduler_reads_each_row_s_own_length_not_the_padded_one() {
+        // One admission step: left-align the cohort (what `In` now does every
+        // step), let the forward append `w`, commit a per-row amount, and —
+        // only in the fixed version — take the dead prefix back out before the
+        // length the scheduler will read is recorded.
+        let run = |strip: bool, steps: usize| -> Vec<usize> {
+            let w = 4usize;
+            let commits = [3usize, 2, 1];
+            let mut a = seq_with_cache_len(0, 1, 1);
+            let mut b = seq_with_cache_len(1, 1, 1);
+            let mut c = seq_with_cache_len(2, 1, 1);
+            for (seq, live) in [(&mut a, 7usize), (&mut b, 5), (&mut c, 4)] {
+                let cache = seq.normal_cache();
+                cache.clear();
+                cache.push(Some(materialised_slot(live, 512, 1.0)));
+            }
+            for _ in 0..steps {
+                let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b, &mut c];
+                let leads = front_align_batch(&mut seqs, false).unwrap();
+                for (i, seq) in seqs.iter_mut().enumerate() {
+                    let slot = seq.normal_cache()[0].as_mut().expect("one slot");
+                    let target = slot.current_seq_len();
+                    slot.set_len(target + w).unwrap();
+                    if strip {
+                        drop_dead_prefix(slot, leads[i]).unwrap();
+                        // Read the stripped length back off the slot rather than
+                        // recomputing it, so a strip that moves no data and
+                        // updates no length cannot still look right (#103's
+                        // first draft passed that way).
+                        let live = slot.current_seq_len() - w;
+                        slot.set_len(live + commits[i]).unwrap();
+                    } else {
+                        slot.set_len(target + commits[i]).unwrap();
+                    }
+                }
+            }
+            // Exactly what the scheduler's bucket key reads.
+            [&a, &b, &c].iter().map(|s| s.cache_bucket_len()).collect()
+        };
+
+        for n in [1usize, 6, 12] {
+            let lens = run(true, n);
+            assert_eq!(
+                lens,
+                vec![7 + n * 3, 5 + n * 2, 4 + n],
+                "with the strip, the length the scheduler reads is each row's own committed \
+                 count"
+            );
+            let distinct: std::collections::BTreeSet<usize> = lens.iter().copied().collect();
+            assert_eq!(
+                distinct.len(),
+                3,
+                "and the batch stays genuinely ragged — `D` is 3, which is what makes the \
+                 ragged bucket worth having"
+            );
+        }
+
+        // Negative control: the same loop with the strip removed. This is the
+        // trap, and its signature is #103's exactly — the spread does not merely
+        // inflate, it **collapses to a constant**. Every row is padded up to the
+        // batch maximum and then records that as its own, so all three advance
+        // at the fastest row's rate and their separation freezes at the commit
+        // spread (3 - 1 = 2) instead of growing as 3 + 2n.
+        let spread = |lens: &[usize]| lens.iter().max().unwrap() - lens.iter().min().unwrap();
+        for n in [6usize, 12] {
+            let lens = run(false, n);
+            assert_eq!(
+                spread(&lens),
+                2,
+                "the control must reproduce the collapse: the spread has to freeze at the \
+                 commit spread regardless of the step count, or this is not the trap. Got \
+                 {lens:?} after {n} steps"
+            );
+            assert_eq!(
+                spread(&run(true, n)),
+                3 + 2 * n,
+                "...while the stripped version's spread grows with the steps, because it is \
+                 the sequences' own divergence rather than one padded length repeated"
+            );
+            assert!(
+                lens[2] > 4 + n,
+                "and the slow row is inflated by padding counted as content: {lens:?}"
+            );
+        }
+        // ...and the inflation grows with the step count rather than settling,
+        // which is the linear accumulation `front_pad_single`'s doc warns about.
+        assert!(
+            run(false, 12)[2] - (4 + 12) >= 2 * (run(false, 6)[2] - (4 + 6)) - 2,
+            "the control's inflation must scale with the step count"
+        );
+    }
+
     /// 🔑 The inverse round-trip. Front padding then stripping must return the
     /// slot to exactly what it was — same rows, same length — because that is
     /// the only reason a per-sequence length recorded after a dense batched

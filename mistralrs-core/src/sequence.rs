@@ -810,6 +810,21 @@ impl Sequence {
     /// (`select_running_bucket` runs exactly one bucket per step) — which is
     /// the throughput cliff batched MTP exists to avoid.
     ///
+    /// 🔑 This value is only a *bucket* key while ragged admission is refused.
+    /// When the pipeline declares it can serve a cohort at mixed cache lengths
+    /// (`CacheManagerMixin::ragged_batch_admission`), every completion sequence
+    /// takes one shared key and this length stops partitioning the batch at all
+    /// — see `scheduler::default_scheduler::ragged_bucket_len`. The value itself
+    /// is unchanged, and it stays the ordering key between the ragged bucket and
+    /// the surviving prompt buckets.
+    ///
+    /// ⚠️ It must be the row's **own** length, never the width of a dense
+    /// batched buffer it was front-padded into. Recording the padded length
+    /// makes every sequence report the same value, which erases the raggedness
+    /// this key exists to describe — see
+    /// `kv_cache::the_scheduler_reads_each_row_s_own_length_not_the_padded_one`
+    /// and its negative control.
+    ///
     /// Falls back to `len().saturating_sub(1)` when no cache slot is populated
     /// yet (a fresh sequence, or a PagedAttention run where the `NormalCache`
     /// is unused), which reproduces the historical key exactly.

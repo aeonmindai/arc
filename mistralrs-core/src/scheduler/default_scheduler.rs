@@ -10,7 +10,7 @@ use crate::{
     sequence::{Sequence, SequenceState, StopReason},
 };
 
-use super::{Scheduler, SchedulerOutput};
+use super::{RaggedAdmission, Scheduler, SchedulerOutput};
 
 pub trait FcfsBacker: Default {
     fn new() -> Self;
@@ -66,11 +66,63 @@ pub trait BucketingManager<Backer: FcfsBacker>: Send + Sync {
         waiting: Backer,
         discrete: bool,
     ) -> BucketedSeqs<Backer>;
+
+    /// See [`Scheduler::set_ragged_admission`].
+    fn set_ragged_admission(&mut self, _admission: RaggedAdmission) {}
 }
 
-// (cache length, (has_imgs && is_prompt), sequence offset)
+// (cache length, (has_imgs && is_prompt), sequence offset, ragged)
 // Bucket by that metric for images because if we are not a prompt, then this doesn't apply
-type BucketKey = (usize, bool, usize);
+//
+// The fourth component is the fix for the admission half of the "one batch, one
+// length" assumption. It is `false` for every sequence unless the pipeline
+// declared it can serve a ragged cohort ([`RaggedAdmission`]), so a run that did
+// not grant admission builds the identical three-part partition it always did
+// and this component is a constant. When it *is* granted, every completion
+// sequence gets `true` and one shared length, so they form ONE bucket however
+// far apart their caches are — see [`ragged_bucket_len`].
+type BucketKey = (usize, bool, usize, bool);
+
+/// The one shared length component every completion sequence takes when ragged
+/// admission is granted, or `None` when it is not (or when nothing running is a
+/// completion).
+///
+/// 🔑 The **minimum** rather than an arbitrary sentinel, and that is not
+/// cosmetic. `select_running_bucket` orders buckets by this component: under the
+/// historical rule the ragged sequences would have formed several buckets whose
+/// smallest key is exactly this value, and `discrete` scheduling picks the
+/// smallest. Collapsing them onto their own minimum therefore leaves this
+/// scheduler's *ordering* against the remaining (prompt) buckets exactly where
+/// it was, and changes only how many sequences the winning bucket holds — which
+/// is the single thing this change is for.
+///
+/// ⚠️ Prompt sequences are deliberately left out. Their cache lengths are not
+/// what makes them batchable: a batch of prompts shares one dense `[B, t]` input
+/// tensor and one `t`, so mixing prompt lengths is a different (and unmasked)
+/// raggedness from the decode-time one `front_align_batch` handles. Admitting
+/// them here would be exactly the silent wrong answer this gate exists to
+/// refuse, so they keep their own per-length buckets and the `false` flag, which
+/// also makes a prompt bucket unable to collide with the ragged one.
+fn ragged_bucket_len(running: &[Sequence], admission: &RaggedAdmission) -> Option<usize> {
+    if admission.buckets_by_cache_length() {
+        return None;
+    }
+    running
+        .iter()
+        .filter(|seq| seq.is_completion())
+        .map(Sequence::cache_bucket_len)
+        .min()
+}
+
+/// This sequence's bucket key. `ragged_len` is [`ragged_bucket_len`]'s answer.
+fn bucket_key_of(seq: &Sequence, ragged_len: Option<usize>) -> BucketKey {
+    let imgs = seq.images().is_some() && seq.is_prompt();
+    let offset = seq.token_offset();
+    match ragged_len {
+        Some(len) if seq.is_completion() => (len, imgs, offset, true),
+        _ => (seq.cache_bucket_len(), imgs, offset, false),
+    }
+}
 
 /// Horizon, in decode steps, over which a coalescing choice must pay for itself.
 ///
@@ -79,6 +131,13 @@ type BucketKey = (usize, bool, usize);
 const COALESCE_PAYBACK_STEPS: usize = 256;
 
 /// Pick the bucket that runs this step.
+///
+/// ⚠️ Everything below describes the rule that applies when ragged admission is
+/// **refused**, which is every run whose pipeline has not declared it can serve
+/// a cohort at mixed cache lengths. When it is granted, all completion
+/// sequences already share one key ([`ragged_bucket_len`]) and there is nothing
+/// left for this function to choose between — the coalescence question only
+/// exists because the batch was shattered in the first place.
 ///
 /// Sequences may only share a forward pass when their cache lengths are exactly
 /// equal — `NormalCacheManager::clone_in_cache`
@@ -119,7 +178,7 @@ fn select_running_bucket(
 ) -> BucketKey {
     let min = *seq_buckets
         .keys()
-        .min_by_key(|(x, _, _)| *x)
+        .min_by_key(|(x, _, _, _)| *x)
         .expect("No sequence buckets.");
     if discrete {
         return min;
@@ -138,8 +197,10 @@ fn select_running_bucket(
     // target must agree on the image flag and token offset too.
     let Some(next_len) = seq_buckets
         .keys()
-        .filter(|(len, imgs, offset)| *len > min.0 && *imgs == min.1 && *offset == min.2)
-        .map(|(len, _, _)| *len)
+        .filter(|(len, imgs, offset, ragged)| {
+            *len > min.0 && *imgs == min.1 && *offset == min.2 && *ragged == min.3
+        })
+        .map(|(len, _, _, _)| *len)
         .min()
     else {
         return greedy;
@@ -156,9 +217,16 @@ fn select_running_bucket(
     }
 }
 
-struct FixedBucketingManager;
+#[derive(Default)]
+struct FixedBucketingManager {
+    admission: RaggedAdmission,
+}
 
 impl<Backer: FcfsBacker> BucketingManager<Backer> for FixedBucketingManager {
+    fn set_ragged_admission(&mut self, admission: RaggedAdmission) {
+        self.admission = admission;
+    }
+
     /// Move the sequences into buckets, and run the ones with the shortest lengths.
     /// The others are moved to the waiting list (retaining high priority due to start time),
     /// without a state modification.
@@ -169,50 +237,29 @@ impl<Backer: FcfsBacker> BucketingManager<Backer> for FixedBucketingManager {
         discrete: bool,
     ) -> BucketedSeqs<Backer> {
         // Now, get the sequences with the smallest sequence lengths, and allow them to catch up.
+        //
+        // The cache length, not the token count — see
+        // `Sequence::cache_bucket_len`. Identical partition for every run that
+        // did not grant ragged admission; when it did, every completion
+        // sequence takes one shared key and the batch stops being shattered by
+        // its own length spread.
+        let ragged_len = ragged_bucket_len(&running, &self.admission);
         let mut seq_buckets: HashMap<BucketKey, Vec<Sequence>> = HashMap::new();
         let mut seq_priorities: HashMap<BucketKey, f64> = HashMap::new();
         for seq in running {
-            // The cache length, not the token count — see
-            // `Sequence::cache_bucket_len`. Identical partition for every
-            // non-speculative path; the one that keeps a batched MTP cohort
-            // whole when its accept lengths differ.
-            let len = seq.cache_bucket_len();
-            match seq_buckets.get_mut(&(
-                len,
-                seq.images().is_some() && seq.is_prompt(),
-                seq.token_offset(),
-            )) {
+            let key = bucket_key_of(&seq, ragged_len);
+            match seq_buckets.get_mut(&key) {
                 Some(bucket) => {
                     if !discrete {
-                        *seq_priorities
-                            .get_mut(&(
-                                len,
-                                seq.images().is_some() && seq.is_prompt(),
-                                seq.token_offset(),
-                            ))
-                            .unwrap() += seq.compute_priority();
+                        *seq_priorities.get_mut(&key).unwrap() += seq.compute_priority();
                     }
                     bucket.push(seq);
                 }
                 None => {
                     if !discrete {
-                        seq_priorities.insert(
-                            (
-                                len,
-                                seq.images().is_some() && seq.is_prompt(),
-                                seq.token_offset(),
-                            ),
-                            seq.compute_priority(),
-                        );
+                        seq_priorities.insert(key, seq.compute_priority());
                     }
-                    seq_buckets.insert(
-                        (
-                            len,
-                            seq.images().is_some() && seq.is_prompt(),
-                            seq.token_offset(),
-                        ),
-                        vec![seq],
-                    );
+                    seq_buckets.insert(key, vec![seq]);
                 }
             }
         }
@@ -255,7 +302,7 @@ pub struct DefaultScheduler<Backer: FcfsBacker> {
 impl<Backer: FcfsBacker> DefaultScheduler<Backer> {
     pub fn new(method: DefaultSchedulerMethod) -> Self {
         let bucketing_manager: Box<dyn BucketingManager<_>> = match method {
-            DefaultSchedulerMethod::Fixed(_) => Box::new(FixedBucketingManager),
+            DefaultSchedulerMethod::Fixed(_) => Box::new(FixedBucketingManager::default()),
         };
         Self {
             running: Vec::new(),
@@ -422,6 +469,9 @@ impl Scheduler for DefaultScheduler<VecDeque<Sequence>> {
     fn set_prefix_caching_enabled(&mut self, _enabled: bool) {
         // DefaultScheduler doesn't use PagedAttention prefix caching
     }
+    fn set_ragged_admission(&mut self, admission: RaggedAdmission) {
+        self.bucketing_manager.set_ragged_admission(admission);
+    }
 }
 
 #[cfg(test)]
@@ -507,7 +557,288 @@ mod tests {
 
     fn bucket_of(len: usize, n: usize, id_base: usize) -> (BucketKey, Vec<Sequence>) {
         let seqs = (0..n).map(|i| seq_of_len(id_base + i, len)).collect();
-        ((len, false, 0), seqs)
+        ((len, false, 0, false), seqs)
+    }
+
+    /// A scheduler under one admission rule, and how much of its admitted batch
+    /// actually runs.
+    ///
+    /// `n` sequences are admitted at `distinct` different cache lengths `gap`
+    /// tokens apart — the shape asynchronous arrival produces, where every
+    /// in-flight request sits at its own point in its own completion. Returns
+    /// the TOTAL number of sequences scheduled over `steps` steps and the last
+    /// step's count (the steady state, with the ramp excluded). Totals rather
+    /// than a mean so every assertion is exact integer arithmetic — a mean
+    /// invites a tolerance, and a tolerance is where a half-working fix hides.
+    ///
+    /// ⚠️ **This is a CPU simulation of the scheduler's own logic, not a
+    /// throughput measurement** (D14). It measures exactly one thing: how many
+    /// sequences this scheduler puts in one forward pass. What that is worth in
+    /// tok/s is a hardware question this cannot answer.
+    fn effective_batch(
+        n: usize,
+        distinct: usize,
+        gap: usize,
+        steps: usize,
+        admission: RaggedAdmission,
+    ) -> (usize, usize) {
+        let mut sched: DefaultScheduler<VecDeque<Sequence>> = DefaultScheduler::new(
+            DefaultSchedulerMethod::Fixed(NonZeroUsize::new(n.max(1)).unwrap()),
+        );
+        Scheduler::set_ragged_admission(&mut sched, admission);
+        for i in 0..n {
+            sched.add_seq(seq_of_len(i, 100 + (i % distinct) * gap));
+        }
+        let logger = IntervalLogger::new(Duration::from_secs(3600), None);
+        let mut total = 0usize;
+        let mut last = 0usize;
+        for _ in 0..steps {
+            let out = DefaultScheduler::schedule(&mut sched, &logger);
+            let mut scheduled: Vec<&mut Sequence> = out
+                .completion
+                .into_vec()
+                .into_iter()
+                .chain(out.prompt.into_vec())
+                .collect();
+            last = scheduled.len();
+            total += last;
+            for seq in scheduled.iter_mut() {
+                decode_one(seq);
+            }
+        }
+        (total, last)
+    }
+
+    /// 🔴 **The measurement this change exists for.** Length-bucketed admission
+    /// does not merely *prefer* uniform batches — it makes a ragged one
+    /// impossible, and the cost is a law, not a constant.
+    ///
+    /// With `B` sequences spread over `D` distinct cache lengths, far enough
+    /// apart that `select_running_bucket`'s coalescence override is refused, the
+    /// steady-state batch is `B / D`. Every other sequence is admitted, resident
+    /// in KV, counted as `running` by the logger — and idle.
+    ///
+    /// Measured by this test (CPU scheduler simulation, D14 — **not** a
+    /// hardware throughput number):
+    ///
+    /// ```text
+    ///                        sequences run per step
+    ///   B     D    gap=64     refused        granted
+    ///   8     8                   1              8
+    ///  32     8                   4             32
+    ///  32    32                   1             32
+    /// 128    32                   4            128
+    /// 128   128                   1            128
+    /// ```
+    ///
+    /// 🔑 The `granted` column IS the negative control, in the direction that
+    /// matters: the two rules run over the same sequences, the same steps and
+    /// the same arithmetic, and differ only in the bucket key. A fix that did
+    /// not actually merge the buckets would leave both columns equal.
+    #[test]
+    fn bucket_shattering_law() {
+        const STEPS: usize = 32;
+        for &(n, distinct) in &[(8usize, 8usize), (32, 8), (32, 32), (128, 32), (128, 128)] {
+            let (refused, refused_last) =
+                effective_batch(n, distinct, 64, STEPS, RaggedAdmission::refused());
+            let (granted, granted_last) =
+                effective_batch(n, distinct, 64, STEPS, RaggedAdmission::decide(Ok(())));
+
+            assert_eq!(
+                refused,
+                (n / distinct) * STEPS,
+                "B={n} over {distinct} distinct lengths: length-bucketed admission runs \
+                 B/D = {} sequences per step, every step",
+                n / distinct
+            );
+            assert_eq!(
+                refused_last,
+                n / distinct,
+                "B={n} over {distinct}: and that is the steady state, not a ramp"
+            );
+
+            assert_eq!(
+                granted,
+                n * STEPS,
+                "B={n} over {distinct} distinct lengths: with ragged admission granted, every \
+                 admitted sequence must run every step"
+            );
+            assert_eq!(granted_last, n, "B={n} over {distinct}: and stay that way");
+        }
+    }
+
+    /// The same law from the other side: at a fixed batch size, *aggregate*
+    /// scheduled work falls as length diversity rises — which is the shape a
+    /// throughput-vs-batch-size curve would show if this were the mechanism
+    /// behind it, and it is flat under ragged admission.
+    ///
+    /// ⚠️ Scheduler simulation, not tok/s (D14). Whether the H200's
+    /// `B=32 → 47.45, B=128 → 43.73` curve is *this* is a hardware question;
+    /// this test establishes only that the scheduler has a mechanism that would
+    /// produce it.
+    #[test]
+    fn admitted_batch_size_stops_buying_anything_once_lengths_diverge() {
+        const STEPS: usize = 32;
+        let mut refused_curve = Vec::new();
+        let mut granted_curve = Vec::new();
+        for &b in &[8usize, 32, 128] {
+            // Every sequence at its own length — the steady state of any server
+            // whose requests did not all arrive on the same tick.
+            refused_curve
+                .push(effective_batch(b, b, 64, STEPS, RaggedAdmission::refused()).0 / STEPS);
+            granted_curve
+                .push(effective_batch(b, b, 64, STEPS, RaggedAdmission::decide(Ok(()))).0 / STEPS);
+        }
+        assert_eq!(
+            refused_curve,
+            vec![1, 1, 1],
+            "raising the admitted batch size buys literally nothing when every sequence sits \
+             at its own cache length — the extra sequences are admitted and idle"
+        );
+        assert_eq!(
+            granted_curve,
+            vec![8, 32, 128],
+            "with ragged admission the curve is the batch size, which is what a batch is for"
+        );
+    }
+
+    /// B=1 cannot regress: one sequence is one bucket under either rule.
+    #[test]
+    fn b1_is_untouched_by_either_admission_rule() {
+        for admission in [RaggedAdmission::refused(), RaggedAdmission::decide(Ok(()))] {
+            assert_eq!(effective_batch(1, 1, 64, 16, admission), (16, 1));
+        }
+    }
+
+    /// 🔑 Flag-off identity, asserted **structurally** on the key itself rather
+    /// than inferred from a scheduling outcome.
+    ///
+    /// With admission refused, `ragged_bucket_len` returns `None` and
+    /// `bucket_key_of` is `(cache_bucket_len, imgs && is_prompt, token_offset,
+    /// false)` — the pre-change three-part key with a constant appended. No
+    /// sequence can move between buckets, at any length, in any state.
+    #[test]
+    fn a_refused_run_builds_the_pre_change_bucket_key() {
+        let seqs: Vec<Sequence> = (0..8).map(|i| seq_of_len(i, 100 + i * 7)).collect();
+        assert_eq!(
+            ragged_bucket_len(&seqs, &RaggedAdmission::refused()),
+            None,
+            "a refused run must not compute a shared length at all"
+        );
+        for seq in &seqs {
+            let key = bucket_key_of(seq, None);
+            assert_eq!(
+                key,
+                (
+                    seq.cache_bucket_len(),
+                    seq.images().is_some() && seq.is_prompt(),
+                    seq.token_offset(),
+                    false
+                ),
+                "the refused key must be the historical one, component for component"
+            );
+        }
+    }
+
+    /// The shared length is the members' **minimum**, which is what keeps this
+    /// scheduler's ordering against the surviving (prompt) buckets where it was
+    /// — `select_running_bucket` compares on that component.
+    #[test]
+    fn the_ragged_bucket_takes_its_members_minimum_length() {
+        let seqs: Vec<Sequence> = [140usize, 101, 300]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| seq_of_len(i, *n))
+            .collect();
+        let ragged = ragged_bucket_len(&seqs, &RaggedAdmission::decide(Ok(())));
+        assert_eq!(ragged, Some(100), "101 tokens => cache_bucket_len 100");
+        for seq in &seqs {
+            assert_eq!(bucket_key_of(seq, ragged).0, 100);
+            assert!(bucket_key_of(seq, ragged).3, "and flagged ragged");
+        }
+    }
+
+    /// ⚠️ Prompts are a **different** raggedness and must not be folded in. A
+    /// batch of prompts shares one dense `[B, t]` input tensor, which
+    /// `front_align_batch` says nothing about; admitting two prompt lengths
+    /// together would be the silent wrong answer this gate exists to refuse.
+    ///
+    /// Their `false` flag also makes a prompt bucket unable to collide with the
+    /// ragged one even when their length components coincide — which this
+    /// asserts directly, by choosing a prompt whose `cache_bucket_len` is
+    /// exactly the ragged bucket's.
+    #[test]
+    fn prompts_are_never_folded_into_the_ragged_completion_bucket() {
+        // Completions at 119 / 159 / 199, and three prompts: one SHORTER than
+        // every completion, one whose length is exactly the ragged key, one
+        // longer. The short prompt is what makes this test able to see a
+        // `ragged_bucket_len` that forgot to filter on `is_completion`.
+        let mut seqs: Vec<Sequence> = (0..3).map(|i| seq_of_len(i, 120 + i * 40)).collect();
+        for (id, toks) in [(10usize, 50usize), (11, 120), (12, 400)] {
+            let p = seq_of_len(id, toks);
+            p.set_state(SequenceState::RunningPrompt);
+            seqs.push(p);
+        }
+
+        let ragged = ragged_bucket_len(&seqs, &RaggedAdmission::decide(Ok(())));
+        assert_eq!(
+            ragged,
+            Some(119),
+            "the shared length must be computed over completions ONLY — the 49-length prompt \
+             must not pull it down, or a prompt decides where the decode bucket sorts"
+        );
+
+        let keys: Vec<BucketKey> = seqs.iter().map(|s| bucket_key_of(s, ragged)).collect();
+        assert_eq!(
+            keys[0], keys[1],
+            "completions at different lengths share one bucket"
+        );
+        assert_eq!(keys[1], keys[2]);
+        assert_ne!(
+            keys[4], keys[0],
+            "a prompt whose cache_bucket_len EQUALS the ragged key must still get its own \
+             bucket — that is what the fourth component is for"
+        );
+        assert_ne!(keys[3], keys[4], "and prompts keep their per-length buckets");
+        assert_ne!(keys[4], keys[5]);
+        assert!(!keys[3].3 && !keys[4].3 && !keys[5].3);
+    }
+
+    /// 🔴 The coalescence override must never fire across the ragged flag.
+    ///
+    /// Its whole justification is that running the shorter bucket **merges** it
+    /// into the next-shortest, so the two thereafter run together. A ragged
+    /// completion bucket and a prompt bucket can never merge — one is a dense
+    /// `[B, 1]` decode, the other a dense `[B, t]` prefill — so treating a
+    /// prompt bucket as the coalescing target would idle the whole decode
+    /// cohort waiting for a merge that cannot happen.
+    ///
+    /// This is what the `*ragged == min.3` clause in the filter is for, and
+    /// deleting it is otherwise invisible: the arithmetic below is *exactly*
+    /// the case where the override would be taken if the two keys looked
+    /// mergeable.
+    #[test]
+    fn the_coalescence_override_never_targets_a_bucket_it_cannot_merge_with() {
+        let ragged_key: BucketKey = (119, false, 0, true);
+        let prompt_key: BucketKey = (120, false, 0, false);
+        let seq_buckets = HashMap::from([
+            (ragged_key, (0..32).map(|i| seq_of_len(i, 120)).collect()),
+            (prompt_key, (32..64).map(|i| seq_of_len(i, 121)).collect()),
+        ]);
+        // Greedy favours the prompt bucket; the gap is 1 and the sizes are
+        // equal, so `(64 - 32) * 1 <= 32 * 256` — the override WOULD be taken
+        // if these two keys were mergeable.
+        let seq_priorities = HashMap::from([
+            (ragged_key, 32.0 * (120f64).log2()),
+            (prompt_key, 32.0 * (1.0 + (121f64).log2())),
+        ]);
+        assert!(seq_priorities[&prompt_key] > seq_priorities[&ragged_key]);
+        assert_eq!(
+            select_running_bucket(&seq_buckets, &seq_priorities, false),
+            prompt_key,
+            "the override must be refused across the ragged flag: these buckets cannot merge, \
+             so idling one for the other buys nothing back"
+        );
     }
 
     /// THE regression test.

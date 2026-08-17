@@ -1384,6 +1384,16 @@ pub struct MtpSpeculativePipeline {
     /// first fast-path step (the cache's slot kinds are fixed by then) so the
     /// decision and its reason are logged once, not once per token.
     kv_advance: std::sync::OnceLock<KvAdvance>,
+    /// What the admission layer decided, written by `Engine::new` through
+    /// [`CacheManagerMixin::set_ragged_batch_admission`] before the first step.
+    ///
+    /// Default `false`, which is the historical rule: the scheduler partitions
+    /// the running set by cache length and the engine only re-assembles the
+    /// batched cache when the cohort's ids change. Per-sequence advance is
+    /// unusable under that rule — see
+    /// [`batch_admission_admits_ragged_cohorts`] — so this bit is check (4) of
+    /// [`Self::kv_advance`].
+    ragged_admission_granted: std::sync::atomic::AtomicBool,
 }
 
 /// One sequence's persistent MTP draft KV.
@@ -1454,6 +1464,7 @@ impl MtpSpeculativePipeline {
             draft_kv_clock: AtomicUsize::new(0),
             warned_unprimed: std::sync::atomic::AtomicBool::new(false),
             kv_advance: std::sync::OnceLock::new(),
+            ragged_admission_granted: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1486,6 +1497,7 @@ impl MtpSpeculativePipeline {
             draft_kv_clock: AtomicUsize::new(0),
             warned_unprimed: std::sync::atomic::AtomicBool::new(false),
             kv_advance: std::sync::OnceLock::new(),
+            ragged_admission_granted: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1525,9 +1537,12 @@ impl MtpSpeculativePipeline {
     ///    positions ([`draft_chain_carries_per_sequence_positions`]) — cleared
     ///    for V4 by the per-row capture offsets, `forward_step_rows` and
     ///    [`front_align_draft_group`];
-    /// 4. the **scheduler** will admit a cohort whose cache lengths differ
-    ///    ([`scheduler_admits_ragged_cohorts`]) — **still refused**, and now the
-    ///    only one.
+    /// 4. the **admission layer** — the scheduler that picks a batch and the
+    ///    engine that decides how its cache is assembled — will hand this
+    ///    pipeline a cohort whose cache lengths differ
+    ///    ([`batch_admission_admits_ragged_cohorts`]) — cleared by the ragged
+    ///    bucket key and `issues_cache_in`, **when `Engine::new` granted it**
+    ///    from [`ragged_cohort_capability`].
     ///
     /// This pipeline's own step arithmetic used to be (3), before the draft
     /// chain was. It no longer is: every quantity in [`Self::step`] comes from
@@ -1543,19 +1558,26 @@ impl MtpSpeculativePipeline {
     /// nothing downstream catches, which is the exact failure this project
     /// already paid for once with FP8 KV.
     ///
-    /// (4) is worth stating explicitly because granting the mode on (1)-(3)
-    /// alone would be *correct* and measurably **slower**: the scheduler runs
-    /// exactly one cache-length bucket per step, so the first divergent accept
-    /// count shatters the batch and idles most of it, while MTP goes on
+    /// (4) was worth stating explicitly because granting the mode on (1)-(3)
+    /// alone would have been *correct* and measurably **slower**: the scheduler
+    /// ran exactly one cache-length bucket per step, so the first divergent
+    /// accept count shattered the batch and idled most of it, while MTP went on
     /// reporting a healthy `accept_rate`. A mode that is inert is bad; a mode
     /// that is a regression *and* still reports is D18's "the absence of a
-    /// signal read as a specific signal".
+    /// signal read as a specific signal". It is kept as a check rather than
+    /// deleted because the grant is a runtime fact — a pipeline the engine never
+    /// told still gets the cohort rule, loudly, instead of a ragged cohort it
+    /// cannot unpick.
     pub(crate) fn kv_advance(&self) -> KvAdvance {
         *self.kv_advance.get_or_init(|| {
             if !per_sequence_kv_requested() {
                 return KvAdvance::Cohort;
             }
-            let refusal = per_sequence_refusal(&self.target_cache);
+            let refusal = per_sequence_refusal(
+                &self.target_cache,
+                self.ragged_admission_granted
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
             match refusal {
                 None => {
                     tracing::info!(
@@ -2124,7 +2146,40 @@ pub(crate) fn plan_per_sequence_step(
 /// cannot get it is told which slot refused rather than silently served the
 /// cohort answer.
 pub(crate) fn per_sequence_kv_requested() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = per_seq_kv_test_override::current() {
+        return forced;
+    }
     std::env::var("ARC_MTP_PER_SEQ_KV").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// Test-only override for [`per_sequence_kv_requested`].
+///
+/// **Thread-local, not `std::env::set_var`.** `cargo test` runs tests
+/// concurrently in one process, so mutating the environment would leak into
+/// whatever else is running and make the flag-off assertions flaky rather than
+/// meaningful — and on recent Rust `set_var` is `unsafe` for exactly that
+/// reason. Same shape as [`crate::kv_cache::xs_per_seq_test_override`], so the
+/// two flags this change coordinates with are exercised the same way.
+#[cfg(test)]
+pub(crate) mod per_seq_kv_test_override {
+    use std::cell::Cell;
+
+    thread_local! {
+        static STATE: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn current() -> Option<bool> {
+        STATE.with(Cell::get)
+    }
+
+    /// Run `f` with `ARC_MTP_PER_SEQ_KV` forced to `on`, on this thread only.
+    pub(crate) fn with<R>(on: bool, f: impl FnOnce() -> R) -> R {
+        let prev = STATE.with(|s| s.replace(Some(on)));
+        let out = f();
+        STATE.with(|s| s.set(prev));
+        out
+    }
 }
 
 /// Whether every slot of this cache can hold a length that differs from the
@@ -2189,12 +2244,12 @@ pub(crate) fn cache_supports_per_sequence_advance(
 /// independent, and each has been the *last* one at some point: (1) fell to
 /// wave63-CO, (2) to the per-row `row_q0`, (3) to the per-row step arithmetic,
 /// (4) to this wave's per-row draft chain, and (5) is where it stands now.
-pub(crate) fn per_sequence_refusal(cache: &EitherCache) -> Option<String> {
+pub(crate) fn per_sequence_refusal(cache: &EitherCache, granted: bool) -> Option<String> {
     cache_supports_per_sequence_advance(cache)
         .err()
         .or_else(|| model_masks_ragged_batches(cache).err())
         .or_else(|| draft_chain_carries_per_sequence_positions(cache).err())
-        .or_else(|| batch_admission_admits_ragged_cohorts().err())
+        .or_else(|| batch_admission_admits_ragged_cohorts(granted).err())
 }
 
 /// Whether the model behind this cache masks a left-aligned ragged batch, or
@@ -2408,60 +2463,101 @@ pub(crate) fn draft_chain_carries_per_sequence_positions(
 /// the engine that decides how its cache is assembled — will hand this pipeline
 /// a cohort whose rows sit at different cache lengths.
 ///
-/// It will not, and this is where the refusal stands now. I am not claiming it
-/// is the last: four waves have made that claim and been wrong, and the useful
-/// output of each has been naming precisely where the refusal moved.
+/// It now will, **when it has been told to**, and this is that bit. `granted` is
+/// what `Engine::new` wrote through
+/// [`crate::pipeline::CacheManagerMixin::set_ragged_batch_admission`] after
+/// reading [`MtpSpeculativePipeline::ragged_batch_admission`]; it is `false`
+/// until then, and `false` forever for a run whose declaration was refused.
 ///
-/// Two sites, both above this file, and both the same "one batch, one length"
-/// assumption:
+/// # The two sites this used to name, and what each now does
 ///
-/// 🔴 **(a) `engine/mod.rs` — `pre_op` is `CacheInstruction::In` only when the
-/// scheduled completion id list *changed* since the last step.** A stable cohort
-/// therefore gets `Nothing` on every step after the first, and
-/// [`MtpSpeculativePipeline::step`]'s `per_seq_advance` requires
-/// `assembled_here`, which is set only on the `In` arm. So the mode would
-/// **interleave** with the cohort rule step by step rather than being on. That is
-/// not merely inert. The `PerSequence` arm deliberately runs no
-/// `truncate_normal_cache`, so the pipeline's resident batched cache stays
-/// `cache_len + w` wide while each sequence keeps `cache_len + u_i + a_i`; the
-/// next `Nothing` step reads that stale width through
-/// [`current_normal_cache_len`], `window_ok` fails, and — because `lead_pad` is
-/// all-zero on a step that did not assemble the batch — the loud left-aligned
-/// guard cannot fire. Control would reach the deferral, which hands the batch to
-/// the target's plain decode against a cache whose write offset and whose RoPE
-/// positions no longer agree. A wrong answer nothing downstream catches.
+/// **(a) `engine/mod.rs`.** `pre_op` was `CacheInstruction::In` only when the
+/// scheduled completion id list *changed*, so a stable cohort took `Nothing` on
+/// every steady-state step and [`MtpSpeculativePipeline::step`]'s
+/// `per_seq_advance` — which requires `assembled_here`, set only on the `In` arm
+/// — interleaved with the cohort rule step by step. It is now
+/// [`crate::scheduler::issues_cache_in`], which adds `|| granted`: a run with
+/// ragged admission re-assembles on every step, so `lead_pad` is this step's and
+/// the mode is on continuously rather than every other step. With `granted ==
+/// false` that expression is `!no_kv_cache && cohort_changed` character for
+/// character, so nothing else moves.
 ///
-/// 🔴 **(b) `scheduler/default_scheduler.rs` — the running set is partitioned by
-/// `Sequence::cache_bucket_len` and `select_running_bucket` runs exactly ONE
-/// bucket per step.** That partition is correct for every path that reaches it
-/// today, because the cohort rule keeps every sequence's cache length equal — it
-/// is `cache_bucket_len`'s own documented invariant, and per-sequence advance is
-/// precisely the thing that deletes it. Row `i` advances by `1 + a_i`, so the
-/// first step with differing accept counts shatters the batch into one bucket
-/// per length and idles all but one: the cohort barrier this workstream exists
-/// to remove, reappearing one layer up as admission, and costing more than the
-/// mode wins.
+/// **(b) `scheduler/default_scheduler.rs`.** The running set was partitioned by
+/// `Sequence::cache_bucket_len` with `select_running_bucket` running exactly ONE
+/// bucket per step, so the first step with differing accept counts shattered the
+/// batch into one bucket per length and idled all but one. Every completion
+/// sequence now takes one shared key when admission is granted
+/// (`ragged_bucket_len`), so the batch stays whole however far apart its caches
+/// are.
 ///
-/// Neither fix belongs in this pipeline. `front_align_batch` is exactly the
-/// statement that unequal cache lengths may now share a forward, so what has to
-/// change is *who is allowed to say that* — the engine's `In`/`Nothing` gate and
-/// the scheduler's bucket key — which is one change with its own question about
-/// how either learns which pipeline is running. Granting the mode first would
-/// ship (a) as a silent wrong answer and (b) as a measurable regression, both
-/// while MTP went on reporting a healthy `accept_rate`: D18's "the absence of a
-/// signal read as a specific signal".
-pub(crate) fn batch_admission_admits_ragged_cohorts() -> std::result::Result<(), String> {
+/// # 🔑 Why this was never only an MTP problem
+///
+/// Site (b) says: sequences whose cache lengths differ cannot batch together
+/// **at all**. In real serving requests arrive at different times, so lengths
+/// always diverge — with or without speculation. `bucket_shattering_law`
+/// (`default_scheduler.rs`, a CPU scheduler simulation, not a hardware
+/// measurement) puts a number on it: the mean sequences-run-per-step is
+/// `B / D` for `B` running sequences over `D` distinct cache lengths, once the
+/// lengths are far enough apart that `select_running_bucket`'s coalescence
+/// override is refused. At `B = 128` over 128 lengths 64 tokens apart that is
+/// **1.00**, in steady state. The MTP chain that surfaced this is worth ~+31%;
+/// this is worth the difference between a batch and a queue.
+///
+/// # What is still refused, and by whom
+///
+/// This function is now a bit, not a verdict. The verdict is
+/// [`MtpSpeculativePipeline::ragged_batch_admission`], and for every model but
+/// DeepSeek V4 it is still a refusal — from [`model_masks_ragged_batches`],
+/// because no other architecture in this tree threads a ragged-batch mask into
+/// its forward. That is where the refusal now lives for the general throughput
+/// problem, and it is a per-architecture job rather than a layer.
+pub(crate) fn batch_admission_admits_ragged_cohorts(
+    granted: bool,
+) -> std::result::Result<(), String> {
+    if granted {
+        return Ok(());
+    }
     Err(
-        "the batch admission layer keys on one length for the whole cohort, in two places. \
-         `engine/mod.rs` issues `CacheInstruction::In` only when the scheduled completion ids \
-         change, so a stable cohort takes `Nothing` and this step's `assembled_here` — and with \
-         it per-sequence advance — is false on the steady-state path, interleaving the two \
-         rules; and the scheduler buckets running sequences by `Sequence::cache_bucket_len` \
-         while `select_running_bucket` runs exactly ONE bucket per step, so diverging lengths \
-         shatter the batch and idle all but one. See \
+        "the batch admission layer has not granted this pipeline ragged cohorts, so it keys on \
+         one length for the whole batch: `engine/mod.rs` issues `CacheInstruction::In` only when \
+         the scheduled completion ids change, so a stable cohort takes `Nothing` and this step's \
+         `assembled_here` — and with it per-sequence advance — is false on the steady-state \
+         path; and the scheduler buckets running sequences by `Sequence::cache_bucket_len` while \
+         `select_running_bucket` runs exactly ONE bucket per step, so diverging lengths shatter \
+         the batch and idle all but one. `Engine::new` grants it from \
+         `CacheManagerMixin::ragged_batch_admission`; see \
          `MtpSpeculativePipeline::batch_admission_admits_ragged_cohorts`."
             .to_string(),
     )
+}
+
+/// This pipeline's declaration to the admission layer: the three *capability*
+/// checks, without check (4).
+///
+/// Deliberately not `per_sequence_refusal` — that one ends in check (4), which
+/// is the admission layer's own answer, and asking the admission layer to decide
+/// from its own decision is a cycle. Checks (1)-(3) are properties of the cache
+/// and the model; whether a ragged cohort is *formed* from them is what the
+/// engine and scheduler then do.
+///
+/// `per_sequence_kv_requested()` is part of the declaration rather than a
+/// seventh flag: a run that did not ask for per-sequence advance has nothing to
+/// gain from ragged admission (its rows never diverge) and would pay
+/// `clone_in_cache` on every step for it. `ARC_MTP_PER_SEQ_KV` and
+/// `ARC_V4_XS_PER_SEQ` are the same two flags #100, #102 and #103 coordinated
+/// on, and this adds none.
+pub(crate) fn ragged_cohort_capability(cache: &EitherCache) -> std::result::Result<(), String> {
+    if !per_sequence_kv_requested() {
+        return Err(
+            "this run did not ask for per-sequence KV advance (`ARC_MTP_PER_SEQ_KV`), so every \
+             sequence in a batch advances by the same amount and their cache lengths never \
+             diverge — ragged admission would cost a `clone_in_cache` per step and buy nothing"
+                .to_string(),
+        );
+    }
+    cache_supports_per_sequence_advance(cache)
+        .and_then(|()| model_masks_ragged_batches(cache))
+        .and_then(|()| draft_chain_carries_per_sequence_positions(cache))
 }
 
 /// Greedy argmax over a 1-D logits tensor — returns the token ID.
@@ -2782,6 +2878,35 @@ impl CacheManagerMixin for MtpSpeculativePipeline {
     }
     fn do_preallocated_cache(&self) -> bool {
         get_mut_arcmutex!(self.target).do_preallocated_cache()
+    }
+
+    /// [`ragged_cohort_capability`] — the three capability checks plus
+    /// `ARC_MTP_PER_SEQ_KV`, and nothing about what the admission layer then
+    /// does with the answer.
+    fn ragged_batch_admission(&self) -> std::result::Result<(), String> {
+        ragged_cohort_capability(&self.target_cache)
+    }
+
+    /// Record `Engine::new`'s decision. This is check (4) of
+    /// [`Self::kv_advance`].
+    ///
+    /// ⚠️ `kv_advance` latches into a `OnceLock`, so a grant that arrives after
+    /// the first fast-path step would be read as a refusal for the rest of the
+    /// run. `Engine::new` calls this before `Engine::run`, so it cannot happen —
+    /// and if some future caller reorders it, the latch is already set and this
+    /// says so loudly rather than serving a mode nobody can see is off (D18).
+    fn set_ragged_batch_admission(&self, granted: bool) {
+        self.ragged_admission_granted
+            .store(granted, std::sync::atomic::Ordering::Relaxed);
+        if granted && self.kv_advance.get().is_some() {
+            tracing::warn!(
+                target: "mtp_speculative",
+                "MTP: ragged batch admission was granted AFTER the KV-advance mode had already \
+                 been latched ({:?}); the grant cannot take effect this run. \
+                 `Engine::new` must call `set_ragged_batch_admission` before the first step.",
+                self.kv_advance.get()
+            );
+        }
     }
 }
 
@@ -3136,9 +3261,12 @@ impl Pipeline for MtpSpeculativePipeline {
             // stale width here and has an all-zero `lead_pad`, so the guard
             // above cannot see it — and the deferral below would decode against
             // a cache whose write offset and whose RoPE positions disagree.
-            // Refusing is the only honest answer; see
-            // [`batch_admission_admits_ragged_cohorts`], which is why the mode
-            // is not granted in the first place.
+            // Refusing is the only honest answer. With ragged admission granted
+            // the engine issues `In` on every step ([`issues_cache_in`]), so
+            // `assembled_here` is true and this branch is unreachable through
+            // the steady-state path — but it is kept, because "the engine will
+            // always have assembled" is a claim about another file and
+            // inheriting it silently is exactly D18.
             if self.kv_advance() == KvAdvance::PerSequence {
                 candle_core::bail!(
                     "MTP per-sequence step: the window invariant does not hold (uncached tails \
@@ -4573,7 +4701,29 @@ mod tests {
         fn new(kit: Option<MtpDecodeKit>) -> Arc<tokio::sync::Mutex<dyn Pipeline + Send + Sync>> {
             // Cache choice: Normal with a single layer is enough — try_new only
             // calls cache().clone() on it.
-            let cache = EitherCache::Normal(crate::kv_cache::NormalCache::new(1, 32));
+            Self::with_cache(
+                kit,
+                EitherCache::Normal(crate::kv_cache::NormalCache::new(1, 32)),
+            )
+        }
+
+        /// A stub whose cache carries an `XsRolling` compressor slot, i.e. the
+        /// shape `model_masks_ragged_batches` uses to recognise DeepSeek V4.
+        fn v4(kit: Option<MtpDecodeKit>) -> Arc<tokio::sync::Mutex<dyn Pipeline + Send + Sync>> {
+            use crate::kv_cache::{KvCache, NormalCache, XsRollingCache};
+            Self::with_cache(
+                kit,
+                EitherCache::Normal(Arc::new(std::sync::Mutex::new(NormalCache(vec![
+                    KvCache::new_normal(2, 4096, 512),
+                    KvCache::XsRolling(Box::new(XsRollingCache::new(4, 2, 64, 2048))),
+                ])))),
+            )
+        }
+
+        fn with_cache(
+            kit: Option<MtpDecodeKit>,
+            cache: EitherCache,
+        ) -> Arc<tokio::sync::Mutex<dyn Pipeline + Send + Sync>> {
             let metadata = Arc::new(GeneralMetadata {
                 max_seq_len: 32,
                 llg_factory: None,
@@ -4983,20 +5133,18 @@ mod tests {
         );
     }
 
-    /// 🔴 **The refusal moved; it did not disappear.** With all four
+    /// 🔴 **The refusal moved; it did not disappear.** With all five
     /// previously-named blockers cleared — the cache carries per-row lengths
     /// (wave63-CO), V4's attention masks a ragged cohort (PR #100), the fused
-    /// step's arithmetic is per-row (PR #102), and the draft chain now carries
-    /// per-row positions — a V4 target must STILL be refused, and the reason
-    /// must now name the **scheduler**.
+    /// step's arithmetic is per-row (PR #102), the draft chain carries per-row
+    /// positions (PR #103), and the admission layer now admits ragged cohorts —
+    /// a V4 target passes **when the admission layer granted it**, and is still
+    /// refused by name when it did not.
     ///
-    /// This is the test that stops the remaining check from being quietly
-    /// dropped, and the assertions that it no longer names the cleared ones are
-    /// what make "the refusal moved" a claim a test can fail. Each `!contains`
-    /// below is a previous wave's blocker: if any reappears, that wave was
-    /// reverted.
+    /// The `!contains` assertions are each a previous wave's blocker: if any
+    /// reappears, that wave was reverted.
     #[test]
-    fn a_fully_capable_v4_cache_is_still_refused_and_now_names_the_scheduler() {
+    fn a_fully_capable_v4_cache_passes_only_once_admission_is_granted() {
         use crate::kv_cache::{EitherCache, KvCache, NormalCache, XsRollingCache};
         use std::sync::{Arc, Mutex};
 
@@ -5006,8 +5154,8 @@ mod tests {
         ]))));
 
         // Force the cache capability ON, thread-locally, so checks (1)-(3) all
-        // pass and check (4) is the only thing left standing.
-        let refusal = crate::kv_cache::xs_per_seq_test_override::with(true, || {
+        // pass and check (4) is the only thing that can move.
+        let (ungranted, granted) = crate::kv_cache::xs_per_seq_test_override::with(true, || {
             assert!(
                 cache_supports_per_sequence_advance(&v4).is_ok(),
                 "precondition: with ARC_V4_XS_PER_SEQ on, a V4 cache carries per-row lengths"
@@ -5020,16 +5168,26 @@ mod tests {
                 draft_chain_carries_per_sequence_positions(&v4).is_ok(),
                 "precondition: V4's MTP draft chain now carries per-row positions"
             );
-            per_sequence_refusal(&v4)
+            (
+                per_sequence_refusal(&v4, false),
+                per_sequence_refusal(&v4, true),
+            )
         });
 
-        let why = refusal.expect(
-            "per-sequence advance must STILL be refused: the scheduler buckets by cache length \
-             and runs exactly one bucket per step, so divergent lengths shatter the batch",
+        assert_eq!(
+            granted, None,
+            "with every capability cleared AND the admission layer granting ragged cohorts, \
+             per-sequence advance must finally be reachable — otherwise this wave changed \
+             nothing"
+        );
+
+        let why = ungranted.expect(
+            "without the grant the mode must still be refused: the scheduler would bucket by \
+             cache length and run one bucket per step, shattering the batch",
         );
         assert!(
-            why.contains("cache_bucket_len") && why.contains("bucket"),
-            "the refusal must name the scheduler's bucket key, not a blocker that is already \
+            why.contains("cache_bucket_len") && why.contains("CacheInstruction::In"),
+            "the refusal must name BOTH admission sites, not a blocker that is already \
              cleared; got {why}"
         );
         assert!(
@@ -5044,9 +5202,211 @@ mod tests {
         );
         assert!(
             !why.contains("forward_step") && !why.contains("MtpHiddenCapture"),
-            "the refusal still names the draft chain's scalar `pos`, which THIS wave removed — \
-             so it changed nothing; got {why}"
+            "the refusal still names the draft chain's scalar `pos`, which PR #103 removed; \
+             got {why}"
         );
+    }
+
+    /// 🔴 **`PerSequence` is reachable.** The whole chain, through the real
+    /// trait methods rather than the free functions: the pipeline *declares*
+    /// ([`CacheManagerMixin::ragged_batch_admission`]), `Engine::new`'s two
+    /// lines decide and record it, and `kv_advance` — which five waves have
+    /// refused — finally returns [`KvAdvance::PerSequence`].
+    ///
+    /// The control is the same pipeline with the grant withheld: it must stay
+    /// `Cohort`, because a pipeline whose engine never told it would otherwise
+    /// be assuming a scheduler it cannot see.
+    #[test]
+    fn per_sequence_advance_is_reachable_once_the_engine_grants_admission() {
+        use crate::scheduler::RaggedAdmission;
+
+        let build = || {
+            let kit = make_test_kit(4, 8, &Device::Cpu).unwrap();
+            let target = StubPipeline::v4(None);
+            MtpSpeculativePipeline::new_for_test(target, 3, kit)
+        };
+
+        crate::kv_cache::xs_per_seq_test_override::with(true, || {
+            per_seq_kv_test_override::with(true, || {
+                // --- granted: exactly the two lines `Engine::new` runs.
+                let mtp = build();
+                let declared = mtp.ragged_batch_admission();
+                assert!(
+                    declared.is_ok(),
+                    "a fully capable V4 target must declare ragged admission; got {declared:?}"
+                );
+                let admission = RaggedAdmission::decide(declared);
+                mtp.set_ragged_batch_admission(admission.granted());
+                assert_eq!(
+                    mtp.kv_advance(),
+                    KvAdvance::PerSequence,
+                    "with every capability cleared and the admission layer granting ragged \
+                     cohorts, per-sequence advance must finally be ON"
+                );
+
+                // --- control: the identical pipeline, never told.
+                let ungranted = build();
+                assert_eq!(
+                    ungranted.kv_advance(),
+                    KvAdvance::Cohort,
+                    "without the grant the mode must stay off — the pipeline cannot assume a \
+                     scheduler it was never told about"
+                );
+            });
+        });
+    }
+
+    /// 🔴 **The default declaration must be a refusal.**
+    ///
+    /// `StubPipeline` does not override
+    /// [`CacheManagerMixin::ragged_batch_admission`], which is the position
+    /// every pipeline in this tree except the MTP one is in. If the default
+    /// granted, `Engine::new` would form ragged cohorts for a model whose
+    /// attention masks nothing and whose `clone_in_cache` never front-aligns —
+    /// the zero-filled dead prefix attended as real keys, which is a wrong
+    /// answer nothing downstream catches. Opting **in** is the whole safety
+    /// property of this gate.
+    #[test]
+    fn the_default_declaration_is_a_refusal_that_names_itself() {
+        let stub = StubPipeline::new(None);
+        let guard = futures::executor::block_on(stub.lock());
+        let err = guard
+            .ragged_batch_admission()
+            .expect_err("the DEFAULT must refuse: opting in is the safety property");
+        assert!(
+            err.contains("has not declared") && err.contains("left-aligning"),
+            "the refusal must say what it is refusing and why, so the engine's log names it; \
+             got {err}"
+        );
+    }
+
+    /// The cache capability is a distinct check from the mask, and the
+    /// discriminator is `ARC_V4_XS_PER_SEQ`. With that flag off a V4 cache still
+    /// masks a ragged batch but its `XsRolling` slots cannot carry a per-row
+    /// length, so the declaration must refuse and must name the *slot* — not the
+    /// mask, which is fine.
+    #[test]
+    fn the_declaration_refuses_a_v4_cache_whose_compressor_slots_carry_one_length() {
+        use crate::kv_cache::{EitherCache, KvCache, NormalCache, XsRollingCache};
+        use std::sync::{Arc, Mutex};
+
+        let v4 = EitherCache::Normal(Arc::new(Mutex::new(NormalCache(vec![
+            KvCache::new_normal(2, 4096, 512),
+            KvCache::XsRolling(Box::new(XsRollingCache::new(4, 2, 64, 2048))),
+        ]))));
+        crate::kv_cache::xs_per_seq_test_override::with(false, || {
+            per_seq_kv_test_override::with(true, || {
+                assert!(
+                    model_masks_ragged_batches(&v4).is_ok(),
+                    "precondition: the MASK check is architecture-only and still passes"
+                );
+                let err = ragged_cohort_capability(&v4).unwrap_err();
+                assert!(
+                    err.contains("XsRolling") && err.contains("one length for the whole batch"),
+                    "the declaration must refuse on the cache slot, not inherit the mask's \
+                     answer — the two checks are independent; got {err}"
+                );
+            });
+        });
+    }
+
+    /// A target that cannot mask a ragged batch declares a refusal, so
+    /// `Engine::new` withholds the grant and the mode stays off — end to end,
+    /// through the trait. This is the shape every non-V4 model takes today.
+    #[test]
+    fn a_non_v4_target_is_refused_end_to_end() {
+        use crate::scheduler::RaggedAdmission;
+
+        crate::kv_cache::xs_per_seq_test_override::with(true, || {
+            per_seq_kv_test_override::with(true, || {
+                let kit = make_test_kit(4, 8, &Device::Cpu).unwrap();
+                let mtp = MtpSpeculativePipeline::new_for_test(StubPipeline::new(None), 3, kit);
+                let admission = RaggedAdmission::decide(mtp.ragged_batch_admission());
+                assert!(!admission.granted());
+                assert!(
+                    admission.refusal().unwrap().contains("XsRolling"),
+                    "the reason must reach the engine's log, not be dropped"
+                );
+                mtp.set_ragged_batch_admission(admission.granted());
+                assert_eq!(mtp.kv_advance(), KvAdvance::Cohort);
+            });
+        });
+    }
+
+    /// 🔑 The declaration the admission layer gates on is **not**
+    /// `per_sequence_refusal`. Asking check (4) to decide from check (4)'s own
+    /// answer is a cycle; `ragged_cohort_capability` is checks (1)-(3) plus the
+    /// flag, and nothing about what the engine and scheduler do with it.
+    ///
+    /// A mutation that pointed `ragged_batch_admission` at `per_sequence_refusal`
+    /// would make the grant unreachable — admission would require the grant it
+    /// is supposed to produce — and this is the test that says so.
+    #[test]
+    fn the_declaration_does_not_depend_on_the_grant_it_produces() {
+        use crate::kv_cache::{EitherCache, KvCache, NormalCache, XsRollingCache};
+        use std::sync::{Arc, Mutex};
+
+        let v4 = EitherCache::Normal(Arc::new(Mutex::new(NormalCache(vec![
+            KvCache::new_normal(2, 4096, 512),
+            KvCache::XsRolling(Box::new(XsRollingCache::new(4, 2, 64, 2048))),
+        ]))));
+        crate::kv_cache::xs_per_seq_test_override::with(true, || {
+            per_seq_kv_test_override::with(true, || {
+                assert!(
+                    ragged_cohort_capability(&v4).is_ok(),
+                    "a fully capable V4 cache must be able to DECLARE ragged admission before \
+                     anything has granted it — otherwise the grant can never be produced"
+                );
+                // ...and the grant it produces is what unblocks check (4).
+                assert_eq!(per_sequence_refusal(&v4, true), None);
+            });
+        });
+    }
+
+    /// The declaration refuses for a model whose attention cannot mask a
+    /// left-aligned batch — which is every architecture in this tree except
+    /// DeepSeek V4. 🔴 This is where the refusal now lives for the *general*
+    /// throughput problem: the admission layer is fixed, the masks are not.
+    #[test]
+    fn the_declaration_still_refuses_every_model_that_cannot_mask_a_ragged_batch() {
+        use crate::kv_cache::{EitherCache, KvCache, NormalCache};
+        use std::sync::{Arc, Mutex};
+
+        let plain = EitherCache::Normal(Arc::new(Mutex::new(NormalCache(vec![
+            KvCache::new_normal(2, 4096, 512),
+        ]))));
+        per_seq_kv_test_override::with(true, || {
+            let err = ragged_cohort_capability(&plain).unwrap_err();
+            assert!(
+                err.contains("XsRolling") && err.contains("dead"),
+                "the refusal must name the ragged MASK as the blocker, since that is what a \
+                 second architecture would have to learn; got {err}"
+            );
+        });
+    }
+
+    /// And a run that never asked for per-sequence advance declares a refusal
+    /// too — ragged admission costs a `clone_in_cache` per step and buys a run
+    /// whose rows never diverge nothing. This is what keeps the change from
+    /// being a seventh uncoordinated flag: it rides `ARC_MTP_PER_SEQ_KV`.
+    #[test]
+    fn a_run_that_did_not_ask_for_per_sequence_advance_declares_a_refusal() {
+        use crate::kv_cache::{EitherCache, KvCache, NormalCache, XsRollingCache};
+        use std::sync::{Arc, Mutex};
+
+        let v4 = EitherCache::Normal(Arc::new(Mutex::new(NormalCache(vec![
+            KvCache::new_normal(2, 4096, 512),
+            KvCache::XsRolling(Box::new(XsRollingCache::new(4, 2, 64, 2048))),
+        ]))));
+        crate::kv_cache::xs_per_seq_test_override::with(true, || {
+            per_seq_kv_test_override::with(false, || {
+                let err = ragged_cohort_capability(&v4).unwrap_err();
+                assert!(
+                    err.contains("ARC_MTP_PER_SEQ_KV"),
+                    "the refusal must name the flag it rides, so nobody adds a seventh; got {err}"
+                );
+            });
+        });
     }
 
     /// The **draft-chain** capability, which this wave moves. A V4 target passes

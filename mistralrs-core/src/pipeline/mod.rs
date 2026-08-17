@@ -269,6 +269,46 @@ pub trait CacheManagerMixin {
     fn do_preallocated_cache(&self) -> bool {
         matches!(self.cache(), EitherCache::Normal(_))
     }
+
+    /// Whether this pipeline can be handed one batch whose sequences sit at
+    /// **different** cache lengths, or the reason it cannot.
+    ///
+    /// This is the declaration the admission layer gates on
+    /// ([`crate::scheduler::RaggedAdmission`]): `Engine::new` reads it once,
+    /// tells the scheduler whether it may still partition the running set by
+    /// cache length, and decides whether the batched cache is re-assembled on
+    /// every decode step.
+    ///
+    /// 🔑 The default is a **refusal carrying a reason**, not `false`. Serving a
+    /// ragged cohort means left-aligning it
+    /// ([`crate::kv_cache::front_align_batch`]) so one shared append offset is
+    /// correct for every row, and the zero-filled dead prefix that leaves is not
+    /// harmless — a zero K row scores logit 0 and takes real softmax weight. A
+    /// pipeline whose attention does not mask it would serve a wrong answer
+    /// nothing downstream catches. Overriding is therefore opt-in per pipeline,
+    /// and *not* overriding produces a named refusal in the log rather than
+    /// silence (D18).
+    fn ragged_batch_admission(&self) -> std::result::Result<(), String> {
+        Err(format!(
+            "`{}` has not declared that it can serve a batch at mixed cache lengths. Serving one \
+             means left-aligning the cohort, whose zero-filled dead prefix a model must mask \
+             explicitly; no default exists because attending it is a wrong answer nothing \
+             downstream catches. See `CacheManagerMixin::ragged_batch_admission`.",
+            std::any::type_name::<Self>()
+        ))
+    }
+
+    /// Record what the admission layer decided, so a pipeline whose own fast
+    /// path depends on being handed ragged cohorts can see it.
+    ///
+    /// Called by `Engine::new` immediately after
+    /// [`Self::ragged_batch_admission`], before any step. Takes `&self` because
+    /// the pipelines that care hold it in an atomic — a `&mut` here would churn
+    /// every call site of `Arc<Mutex<dyn Pipeline>>` for a single bit.
+    ///
+    /// The default drops it: a pipeline that declares the default refusal has
+    /// nothing to learn from being told it was refused.
+    fn set_ragged_batch_admission(&self, _granted: bool) {}
 }
 
 pub trait MetadataMixin {

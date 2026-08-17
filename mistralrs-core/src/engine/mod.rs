@@ -8,7 +8,7 @@ use crate::{
     },
     prefix_cacher::PrefixCacheManagerV2,
     response::CompletionChoice,
-    scheduler::{Scheduler, SchedulerOutput},
+    scheduler::{issues_cache_in, RaggedAdmission, Scheduler, SchedulerOutput},
     search::{self, rag::SearchPipeline},
     sequence::{SeqStepType, StopReason},
     tools, CompletionResponse, SchedulerConfig, DEBUG,
@@ -201,6 +201,10 @@ pub struct Engine {
     scheduler: Arc<Mutex<dyn Scheduler>>,
     id: Arc<Mutex<usize>>,
     no_kv_cache: bool,
+    /// Whether one forward pass may carry sequences at different cache lengths.
+    /// Decided once in [`Engine::new`] from the pipeline's declaration; the
+    /// scheduler holds the same value. See [`RaggedAdmission`].
+    ragged_admission: RaggedAdmission,
     prefix_cacher: Arc<Mutex<PrefixCacheManagerV2>>,
     is_debug: bool,
     disable_eos_stop: bool,
@@ -273,6 +277,35 @@ impl Engine {
         // This ensures PagedAttention prefix caching respects the same setting
         get_mut_arcmutex!(scheduler).set_prefix_caching_enabled(!no_prefix_cache);
 
+        // 🔑 Ragged batch admission — may one forward pass carry sequences at
+        // different cache lengths?
+        //
+        // Decided once, here, from the pipeline's own declaration, and then read
+        // by both sites that used to assume it could not: this loop's `pre_op`
+        // ([`issues_cache_in`]) and the scheduler's bucket key. Deciding it in
+        // one place is what stops the two from disagreeing — a scheduler that
+        // formed ragged cohorts for a pipeline the engine never re-assembled for
+        // would front-align once and then decode against a stale alignment.
+        //
+        // The refusal reason is logged rather than dropped: a run that asked for
+        // per-sequence advance and did not get it is told which layer said no,
+        // instead of quietly getting the length-bucketed ceiling (D18).
+        let ragged_admission =
+            RaggedAdmission::decide(get_mut_arcmutex!(pipeline).ragged_batch_admission());
+        get_mut_arcmutex!(pipeline).set_ragged_batch_admission(ragged_admission.granted());
+        get_mut_arcmutex!(scheduler).set_ragged_admission(ragged_admission.clone());
+        if ragged_admission.granted() {
+            tracing::info!(
+                "Ragged batch admission is ON: sequences at different cache lengths share one \
+                 forward pass, and the batched cache is re-assembled every decode step."
+            );
+        } else if let Some(why) = ragged_admission.refusal() {
+            tracing::debug!(
+                "Ragged batch admission is off; the scheduler keeps one cache-length bucket per \
+                 step ({why})"
+            );
+        }
+
         let has_paged_attention = get_mut_arcmutex!(scheduler).kv_cache_manager().is_some();
 
         Ok(Self {
@@ -286,6 +319,7 @@ impl Engine {
             scheduler: scheduler.clone(),
             id: Arc::new(Mutex::new(0)),
             no_kv_cache,
+            ragged_admission,
             prefix_cacher: Arc::new(Mutex::new(PrefixCacheManagerV2::new(
                 prefix_cache_n,
                 no_prefix_cache,
@@ -424,9 +458,25 @@ impl Engine {
                             scheduled.completion.iter().map(|seq| *seq.id()).collect();
                         let res = {
                             let mut pipeline = get_mut_arcmutex!(self.pipeline);
-                            let pre_op = if !self.no_kv_cache
-                                && last_completion_ids != current_completion_ids
-                            {
+                            // 🔑 Site (1) of the "one batch, one length"
+                            // assumption. Re-assembling only when the cohort's
+                            // *identity* changed is right exactly while every
+                            // row sits at the same cache length: the batched
+                            // cache stays valid because nothing about its
+                            // layout moved. Under ragged admission the layout
+                            // is a function of the rows' lengths — which
+                            // diverge — so it has to be rebuilt every step, and
+                            // that rebuild is also the only place a per-row
+                            // dead prefix is reported at all
+                            // (`clone_in_cache_reporting_lead`).
+                            //
+                            // With admission refused this is
+                            // `!no_kv_cache && ids_changed`, exactly as before.
+                            let pre_op = if issues_cache_in(
+                                self.no_kv_cache,
+                                last_completion_ids != current_completion_ids,
+                                self.ragged_admission.granted(),
+                            ) {
                                 CacheInstruction::In
                             } else {
                                 CacheInstruction::Nothing

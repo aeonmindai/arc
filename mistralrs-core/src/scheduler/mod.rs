@@ -1,8 +1,10 @@
 mod default_scheduler;
+mod ragged_admission;
 
 use std::sync::Arc;
 
 pub use default_scheduler::{DefaultScheduler, DefaultSchedulerMethod, DefaultSchedulerOutput};
+pub use ragged_admission::{issues_cache_in, RaggedAdmission};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -69,4 +71,15 @@ pub trait Scheduler: Send + Sync {
     /// Set whether prefix caching is enabled. Called by Engine after creation
     /// to synchronize with the global no_prefix_cache setting.
     fn set_prefix_caching_enabled(&mut self, enabled: bool);
+
+    /// Tell this scheduler whether one forward pass may carry sequences that
+    /// sit at **different** cache lengths. Called by `Engine::new` from the
+    /// pipeline's own declaration, exactly like
+    /// [`Self::set_prefix_caching_enabled`].
+    ///
+    /// The default ignores it, which is right for every scheduler whose
+    /// admission does not key on a shared length —
+    /// [`PagedAttentionScheduler`] allocates per request and never bucketed on
+    /// one in the first place.
+    fn set_ragged_admission(&mut self, _admission: RaggedAdmission) {}
 }
