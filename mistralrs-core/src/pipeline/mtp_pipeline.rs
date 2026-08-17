@@ -1886,9 +1886,16 @@ pub(crate) fn per_sequence_kv_requested() -> bool {
 /// lengths are only representable if a ragged cohort can be re-aligned into one
 /// buffer whose rows all *end* at the same column —
 /// [`crate::kv_cache::front_pad_kv_cache`]. That is well defined for a plain
-/// `Normal` slot and for nothing else in the tree today; see
-/// [`crate::kv_cache::KvCache::supports_per_sequence_len`] for why each of the
-/// other three declines.
+/// `Normal` slot, and — since wave63-CO, under `ARC_V4_XS_PER_SEQ` — for
+/// DeepSeek V4's `XsRolling` compressor slots, whose two time bases now carry
+/// a token count per batch row. `Rotating` and `TurboQuant` still decline; see
+/// [`crate::kv_cache::KvCache::supports_per_sequence_len`] for why.
+///
+/// ⚠️ A pass here is **not** sufficient on its own. `kv_advance` also requires
+/// [`MtpSpeculativePipeline::target_masks_ragged_batches`], which no model
+/// satisfies yet — so with `ARC_V4_XS_PER_SEQ=1` a V4 cache stops being the
+/// slot named in the refusal and the ragged mask becomes the sole remaining
+/// blocker. That is the whole point: the refusal moves, it does not disappear.
 pub(crate) fn cache_supports_per_sequence_advance(
     cache: &EitherCache,
 ) -> std::result::Result<(), String> {
