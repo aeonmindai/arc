@@ -99,6 +99,35 @@
 //! which end-anchored and start-anchored coincide **exactly** — which is why
 //! [`XsRollingCache::advance`] keeps a verbatim uniform fast path and every
 //! B=1 and every uniform batch runs byte-identical code.
+//!
+//! # What `W` is now allowed to be
+//!
+//! Nothing below still requires `W == max_i (tokens_i - base_i)`.
+//! [`plan_xs_advance`] and [`XsRollingCache::set_row_lens`] take `W` as *given*
+//! and ask only that every row fit inside it; every read offset is
+//! `need_start + W - tokens_i`, which tracks `W` exactly. So `W` may be any
+//! width at or above the widest row's run — including a **constant** one.
+//! `an_oversized_window_reads_exactly_the_same_absolute_tokens` pins that.
+//!
+//! It is worth writing down because this buffer does **not** have a constant
+//! size today. `tail` is rebuilt by `Tensor::cat` + `narrow` every step at
+//! width `tokens - base`, and that width is not stable: `tokens` climbs by one
+//! per token while `base` jumps a whole `ratio` at a group boundary, so the
+//! allocation cycles through `ratio` consecutive sizes. The ArcGraph chain
+//! measured exactly that from the outside — `4096 × {18, 19, 20, 21}` at
+//! `hidden = 4096`, `ratio = 4`. (Their separate hypothesis, that this is what
+//! stops a CUDA graph replaying, they have since retracted as unproven; the
+//! size measurement is a fact about this buffer either way.)
+//!
+//! Pinning `W` to the bound the retention rule already guarantees it never
+//! exceeds — `span_groups * ratio + margin` — would make the allocation
+//! constant per step **without touching any of the semantics above**: a row
+//! would simply carry more dead lead columns, exactly as a short row in a
+//! ragged batch already does. The places that decide `W` are the retention
+//! narrow at the end of [`XsRollingCache::advance_ragged`] and its counterpart
+//! in [`XsRollingCache::advance_uniform`], plus the fast-path predicate
+//! [`XsRollingCache::can_advance_uniform`], which reads the exact equality as
+//! its dispatch condition. Nothing here depends on that change being made.
 
 use std::sync::OnceLock;
 
@@ -1331,6 +1360,40 @@ mod tests {
             err.contains("split_row"),
             "the refusal must name the way out; got {err}"
         );
+    }
+
+    /// 🔑 `W` is no longer required to be the widest row's run — it may be any
+    /// width that fits every row, **including a constant one**. That is the
+    /// property a CUDA-graph capture needs from this buffer: `tokens - base`
+    /// cycles through `ratio` consecutive sizes as `base` jumps a whole group
+    /// while `tokens` climbs by one, so an exactly-sized window reallocates
+    /// every step and moves. Pinning `W` to its own bound would fix that, and
+    /// this pins the part that has to be true for it to be possible: widening
+    /// the window changes every offset by exactly the widening and reads the
+    /// same absolute tokens.
+    #[test]
+    fn an_oversized_window_reads_exactly_the_same_absolute_tokens() {
+        let toks = [9usize, 22, 39, 40];
+        let base = [0usize, 0, 16, 20];
+        let exact = plan_xs_advance(&toks, &base, 23, 3, 4, 2, 16).unwrap();
+        // `span_groups * ratio + margin` — the width the retention rule already
+        // guarantees is never exceeded, i.e. a constant-capacity buffer.
+        let pinned = plan_xs_advance(&toks, &base, 24, 3, 4, 2, 16).unwrap();
+
+        assert_eq!(exact.groups.len(), pinned.groups.len());
+        for (e, p) in exact.groups.iter().zip(&pinned.groups) {
+            assert_eq!(e.rows, p.rows);
+            assert_eq!(e.dests, p.dests);
+            assert_eq!((e.len, e.take), (p.len, p.take));
+            // The absolute token each slice starts at is what must not move.
+            for &r in &e.rows {
+                assert_eq!(e.off + toks[r] - 23, p.off + toks[r] - 24);
+            }
+            assert_eq!(p.off, e.off + 1, "a 1-wider window shifts reads by 1");
+        }
+        assert_eq!(exact.tokens_new, pinned.tokens_new);
+        assert_eq!(exact.base_new, pinned.base_new);
+        assert_eq!(exact.band, pinned.band);
     }
 
     /// 🔑 `set_row_lens` is the gate `NormalCacheManager::clone_in_cache` puts
