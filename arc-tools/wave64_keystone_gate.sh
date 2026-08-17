@@ -23,18 +23,27 @@
 # can never be read as success.
 #
 # Usage (main runs this; agents do not call runcrate — D15):
-#   setsid nohup bash arc-tools/wave64_keystone_gate.sh \
-#       < /dev/null > /tmp/wave64.log 2>&1 &
+#   GATE=/tmp/arc-gate-wave64-keystone
+#   mkdir -p $GATE && setsid nohup bash arc-tools/wave64_keystone_gate.sh \
+#       < /dev/null > $GATE/run.log 2>&1 &
+#
+# Every artefact lives under GATE_DIR, which is namespaced per D19. Shared,
+# un-namespaced log paths have already caused one agent's output to be read as
+# another's, and two gates running concurrently on the same box would otherwise
+# overwrite each other's status file and curve logs.
 #
 # Env:
 #   BASELINE_REF   git ref for the A/B baseline (default: origin/master)
-#   STATUS         status file (default: /tmp/wave64_status.txt)
+#   GATE_DIR       artefact dir (default: /tmp/arc-gate-wave64-keystone)
+#   STATUS         status file (default: $GATE_DIR/status.txt)
 #   SKIP_AB        set to 1 to run stages 1-2 only
 #   CURVE_ARGS     extra args for qtip_grouped_curve
 
 set -uo pipefail
 
-STATUS=${STATUS:-/tmp/wave64_status.txt}
+GATE_DIR=${GATE_DIR:-/tmp/arc-gate-wave64-keystone}
+mkdir -p "$GATE_DIR"
+STATUS=${STATUS:-$GATE_DIR/status.txt}
 BASELINE_REF=${BASELINE_REF:-origin/master}
 REPO=$(git rev-parse --show-toplevel 2>/dev/null) || {
   echo "STAGE0 env  FAIL not a git repo" | tee -a "$STATUS"; exit 2; }
@@ -76,11 +85,11 @@ for CC in 80 90 100; do
     esac
   fi
   if CUDA_COMPUTE_CAP=$CC FEATURES="cuda" RUN_GPU_TESTS=no \
-     timeout 3600 bash arc-tools/cuda_compile_check.sh > "/tmp/wave64_compile_${CC}.log" 2>&1; then
+     timeout 3600 bash arc-tools/cuda_compile_check.sh > "$GATE_DIR/compile_${CC}.log" 2>&1; then
     say "STAGE1 sm_${CC}  PASS"
   else
     rc=$?
-    [ "$rc" -eq 124 ] && say "STAGE1 sm_${CC}  FAIL timeout" || say "STAGE1 sm_${CC}  FAIL rc=$rc (see /tmp/wave64_compile_${CC}.log)"
+    [ "$rc" -eq 124 ] && say "STAGE1 sm_${CC}  FAIL timeout" || say "STAGE1 sm_${CC}  FAIL rc=$rc (see $GATE_DIR/compile_${CC}.log)"
     STAGE1_FAIL=1
   fi
 done
@@ -97,7 +106,7 @@ if [ -z "${GPU_CC:-}" ]; then
 fi
 
 export CUDA_COMPUTE_CAP=$GPU_CC
-PARITY_LOG=/tmp/wave64_parity.log
+PARITY_LOG=$GATE_DIR/parity.log
 if timeout 5400 cargo test --release -p mistralrs-quant --features cuda \
       cuda_grouped_gemm -- --nocapture --test-threads=1 > "$PARITY_LOG" 2>&1; then
   # D18 rule 1: a green result must PROVE work happened. `cargo test` reports
@@ -127,7 +136,7 @@ fi
 # STAGE 3 — A/B against the baseline on the SAME box and fixture.
 # ---------------------------------------------------------------------------
 run_curve() {  # $1 = label, $2 = dir
-  local out="/tmp/wave64_curve_$1.log"
+  local out="$GATE_DIR/curve_$1.log"
   if ! ( cd "$2" && timeout 5400 cargo run --release -p mistralrs-quant \
            --features cuda --example qtip_grouped_curve -- ${CURVE_ARGS:-} ) > "$out" 2>&1; then
     local rc=$?
@@ -145,7 +154,7 @@ run_curve() {  # $1 = label, $2 = dir
 
 run_curve head "$REPO" || { say "TERMINAL exit=1"; exit 1; }
 
-BASE_WT=/tmp/wave64-baseline
+BASE_WT=$GATE_DIR/baseline-worktree
 rm -rf "$BASE_WT"
 if ! git worktree add --detach "$BASE_WT" "$BASELINE_REF" >/dev/null 2>&1; then
   say "STAGE3 baseline  ENV-CANNOT-ANSWER could not create a worktree at $BASELINE_REF"
@@ -154,6 +163,6 @@ fi
 run_curve baseline "$BASE_WT" || { say "TERMINAL exit=1"; exit 1; }
 git worktree remove --force "$BASE_WT" >/dev/null 2>&1 || true
 
-say "STAGE3 ab      PASS — compare /tmp/wave64_curve_head.log vs /tmp/wave64_curve_baseline.log"
+say "STAGE3 ab      PASS — compare $GATE_DIR/curve_head.log vs $GATE_DIR/curve_baseline.log"
 say "TERMINAL exit=0"
 exit 0
