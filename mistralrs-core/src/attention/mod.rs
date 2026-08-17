@@ -107,6 +107,41 @@ pub struct SdpaParams {
     pub sinks: Option<Tensor>,
 }
 
+/// Does this mask have to be applied as an additive bias rather than handed to
+/// a flash kernel?
+///
+/// # Why this predicate has to exist
+///
+/// `flash_attn(&q, &k, &v, flash_params, sdpa_params)` — the CUDA branch of
+/// [`Sdpa::run_attention`] — **takes no mask argument at all**. Anything the
+/// caller passed in `mask` is silently DISCARDED there. The flash kernels'
+/// only masking knobs are `causal` and `window_size_left/right`, and all three
+/// are *batch-scalar*: one value for the whole batch.
+///
+/// So a mask that VARIES ACROSS THE BATCH is inexpressible on that path. The
+/// one such mask in this tree is
+/// [`crate::layers_masker::CausalMasker::make_left_padded_causal_mask`], the
+/// `[B, 1, 1, k]` mask a **left-aligned ragged decode batch** needs to kill
+/// each row's zero-filled dead prefix. A zero K row is not a masked row — it
+/// scores logit 0 and takes real softmax weight — so entering the flash path
+/// with it would serve every short sequence from padding, silently.
+///
+/// # Why it is scoped to `seq_len == 1`
+///
+/// Deliberately narrow, so this cannot change any batch that works today:
+/// * a **uniform** decode batch has `mask == None` and is untouched;
+/// * **prefill** (`seq_len > 1`) is untouched, including the 4-D padding masks
+///   the vision encoders build with `CausalMasker::expand_mask`. Those are
+///   *also* being dropped on the flash path today — a separate pre-existing
+///   defect, filed rather than fixed here, because widening this predicate to
+///   cover them would move every vision encoder off flash in the same change.
+fn mask_must_be_applied_as_bias(seq_len: usize, mask_dims: Option<&[usize]>) -> bool {
+    match mask_dims {
+        Some(dims) => seq_len == 1 && dims.len() == 4 && dims[0] > 1,
+        None => false,
+    }
+}
+
 pub struct Sdpa;
 
 impl Sdpa {
@@ -154,6 +189,13 @@ impl Sdpa {
                 && crate::using_flash_attn()
                 && q.dtype() != DType::F32
                 && cuda_flash_attn_supported(head_dim, k_head_dim, v_head_dim, sdpa_params.softcap);
+
+        // A batch-varying mask cannot be expressed by any flash kernel, and the
+        // flash call below does not even take a mask — see
+        // `mask_must_be_applied_as_bias`. Route it to the bias path or serve
+        // from zero-filled keys.
+        let can_use_flash = can_use_flash
+            && !mask_must_be_applied_as_bias(seq_len, mask.map(|m| m.dims()));
 
         if can_use_flash {
             // flash-attn expects (b_sz, seq_len, nheads, head_dim)
@@ -365,5 +407,41 @@ impl Sdpa {
         } else {
             naive_sdpa(q, &k, &v, mask, sdpa_params)
         }
+    }
+}
+
+#[cfg(test)]
+mod bias_dispatch_tests {
+    use super::mask_must_be_applied_as_bias;
+
+    /// 🔑 The mask a left-aligned ragged decode batch needs — `[B, 1, 1, k]`
+    /// with `B > 1` — must NOT reach the flash path, because `flash_attn` takes
+    /// no mask argument and would drop it, serving every short row from its
+    /// zero-filled dead prefix.
+    #[test]
+    fn a_ragged_decode_mask_must_go_to_the_bias_path() {
+        assert!(mask_must_be_applied_as_bias(1, Some(&[8, 1, 1, 500])));
+        assert!(mask_must_be_applied_as_bias(1, Some(&[2, 1, 1, 6])));
+    }
+
+    /// Everything that works today must be untouched. Each of these would be a
+    /// behaviour change if the predicate fired, and two of them (the `[1, 1]`
+    /// placeholder and the rank-2 causal mask) would push a working prefill
+    /// onto non-flash SDPA.
+    #[test]
+    fn nothing_that_works_today_is_diverted() {
+        // Uniform decode: no mask at all.
+        assert!(!mask_must_be_applied_as_bias(1, None));
+        // The flash placeholder `Tensor::zeros((1, 1))` from `layers_masker`.
+        assert!(!mask_must_be_applied_as_bias(4, Some(&[1, 1])));
+        assert!(!mask_must_be_applied_as_bias(1, Some(&[1, 1])));
+        // Ordinary rank-2 causal mask.
+        assert!(!mask_must_be_applied_as_bias(7, Some(&[7, 7])));
+        // Vision-encoder padding masks: 4-D and batched, but prefill-shaped.
+        // Dropped on the flash path today; deliberately out of this predicate's
+        // scope so this change cannot move every encoder off flash at once.
+        assert!(!mask_must_be_applied_as_bias(64, Some(&[4, 1, 64, 64])));
+        // A batch of ONE cannot be ragged — nothing to mask per row.
+        assert!(!mask_must_be_applied_as_bias(1, Some(&[1, 1, 1, 500])));
     }
 }
