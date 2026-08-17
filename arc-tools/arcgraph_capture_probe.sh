@@ -54,6 +54,7 @@
 #   2  the box could not answer (gate failed, model missing, build failed)
 set -u
 
+LOCKFILE=""
 LOGDIR="${LOGDIR:-/root/logs/arcgraph}"
 REPO="${REPO:-/root/arc}"
 BRANCH="${BRANCH:-arcgraph/capture-truth}"
@@ -84,6 +85,11 @@ cleanup() {
         kill -9 "$SERVER_PID" 2>/dev/null
     fi
     pkill -f "mistralrs serve -p ${PORT}" 2>/dev/null
+    # Release the GPU lock only if it is ours — never clear another chain's.
+    if [ -s "${LOCKFILE:-/nonexistent}" ] && grep -q "pid=$$ " "$LOCKFILE" 2>/dev/null; then
+        rm -f "$LOCKFILE"
+        say "GPU lock released"
+    fi
     return 0
 }
 trap cleanup EXIT INT TERM
@@ -152,14 +158,35 @@ say "HEAD = $(git log --oneline -1)"
 say "CARGO_TARGET_DIR = $CARGO_TARGET_DIR"
 FEATURES="cuda flash-attn"
 case "$FEATURES" in *cudnn*) env_fail "cudnn present; banned";; esac
-if ! cargo build --release --features "$FEATURES" -p arc-cli >>"$LOGDIR/build.log" 2>&1; then
-    say "BUILD FAILED — first errors:"
-    grep -m 40 -A 6 "^error" "$LOGDIR/build.log" | tee -a "$STATUS"
-    env_fail "build failed; full log $LOGDIR/build.log"
-fi
-BIN="$CARGO_TARGET_DIR/release/mistralrs"
-[ -x "$BIN" ] || env_fail "$BIN missing"
-say "build ok"
+
+# 🔴 THE BUG THIS BLOCK EXISTS TO PREVENT, found the hard way on 2026-08-17.
+# The idiom copied from measure_v4_prefill_curve.sh:241-244 builds `-p arc-cli`
+# and then runs `$TARGET/release/mistralrs`. Those are DIFFERENT BINARIES:
+# arc-cli's bin is named `arc` (arc-cli/Cargo.toml), and `mistralrs` comes from
+# mistralrs-cli, which arc-cli does not depend on. So the build succeeded, the
+# `[ -x "$BIN" ]` existence check passed against an hour-old binary from another
+# chain's commit, and the run measured code that was never built. The server
+# even logged `git revision: ab42c4508` while the checkout was 7fbdfcfdb — the
+# evidence was right there and the script did not look.
+#
+# So: build the package that actually produces the binary, take the path from
+# CARGO'S OWN artifact message rather than guessing it, and refuse unless the
+# binary contains a string that only the code under test has. Existence is not
+# freshness.
+PKG="${PKG:-mistralrs-cli}"
+BIN_NAME="${BIN_NAME:-mistralrs}"
+# A string present only in the instrumented code. If the binary lacks it, we
+# are about to measure something else.
+FRESHNESS_MARKER="${FRESHNESS_MARKER:-ARCGRAPH STATUS}"
+# shellcheck disable=SC1090,SC1091
+source "$WORKTREE/arc-tools/lib/build_and_verify.sh" \
+    || env_fail "arc-tools/lib/build_and_verify.sh missing from the checkout"
+arc_build_and_verify \
+    --package "$PKG" --bin "$BIN_NAME" --features "$FEATURES" \
+    --marker "$FRESHNESS_MARKER" --log "$LOGDIR/build.log" \
+    || env_fail "build/verify failed; see $LOGDIR/build.log (diagnosis above)"
+BIN="$ARC_VERIFIED_BIN"
+say "build ok — BIN=$BIN (cargo-reported), freshness marker present"
 
 # --------------------------------------------------------------------------
 # 3. Model + GPU
@@ -167,9 +194,28 @@ say "build ok"
 step "gate 3/3: model + GPU"
 [ -d "$SRC" ]  || env_fail "source checkpoint $SRC absent"
 [ -f "$UQFF" ] || env_fail "UQFF shard $UQFF absent"
+
+# The box is shared by four chains. `nvidia-smi` alone is NOT enough: a chain
+# between two runs holds no compute process but is still mid-measurement, and
+# starting under it corrupts both its numbers and ours. Honour the advisory
+# lock first, then check the device, then take the lock so the next chain sees
+# us. A held lock is a refusal, not a wait — the caller decides when to retry.
+LOCKDIR="${LOCKDIR:-/root/locks}"
+LOCKFILE="$LOCKDIR/gpu.lock"
+mkdir -p "$LOCKDIR"
+if [ -s "$LOCKFILE" ]; then
+    HOLDER=$(head -1 "$LOCKFILE")
+    HOLDER_PID=$(sed -n 's/.*pid=\([0-9]*\).*/\1/p' <<<"$HOLDER")
+    if [ -n "$HOLDER_PID" ] && kill -0 "$HOLDER_PID" 2>/dev/null; then
+        env_fail "GPU lock held: $HOLDER (pid alive). Not starting — overlapping runs give both \
+chains garbage. Retry when $LOCKFILE clears."
+    fi
+    say "stale lock from a dead holder ($HOLDER); reclaiming"
+fi
 OTHER=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ')
 [ "${OTHER:-0}" = "0" ] || env_fail "$OTHER compute process(es) already on the GPU; latency numbers are not attributable. Let the queue drain."
-say "GPU idle"
+echo "arcgraph pid=$$ since=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$LOCKFILE"
+say "GPU idle; lock taken ($(cat "$LOCKFILE"))"
 
 # --------------------------------------------------------------------------
 # 4. The two legs.
@@ -208,6 +254,15 @@ run_leg() {
         cleanup; SERVER_PID=""
         return 1
     fi
+    # PROVENANCE (step 4). Engagement proved the feature is compiled in; this
+    # proves the RUNNING process is the commit we built. Different guarantees.
+    if ! arc_assert_running_revision --log "$slog" --timeout-s 60; then
+        say "leg $name: PROVENANCE ASSERTION FAILED — voiding this leg rather than \
+banking a number of unknown origin (see stderr in $LOGDIR/run.log)"
+        cleanup; SERVER_PID=""
+        return 1
+    fi
+    say "leg $name: provenance ok (running rev $ARC_RUNNING_REV)"
     say "leg $name: healthy, generating $GEN_TOKENS tokens at b=1"
 
     local t0 t1 resp ntok
