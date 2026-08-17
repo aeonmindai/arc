@@ -363,7 +363,7 @@ impl DeepSeekV4Config {
     /// The expert-parallel world size actually in force.
     ///
     /// `ARC_EP_SIZE` wins over the config so a run can be sharded without
-    /// editing a published `config.json`; an unparseable value is ignored
+    /// editing a published `config.json`; an unparsable value is ignored
     /// rather than silently treated as 1, because "EP quietly turned itself
     /// off" is exactly the failure this whole path exists to avoid — it is
     /// reported at plan-construction time by the world-size check instead.
