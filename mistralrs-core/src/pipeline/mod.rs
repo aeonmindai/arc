@@ -872,7 +872,21 @@ pub trait Pipeline:
     ) -> Result<Duration, candle_core::Error> {
         match backend_metadata {
             CacheBackendMetadata::DefaultInstructions { pre_op, post_op } => {
-                let inputs_iter =
+                // This is the arm V4 takes. It is *not* the arm that carried
+                // the old `STEP_us TOTAL/fwd/sample/other` line — that lives
+                // only on the PagedAttention arm below, which V4 can never
+                // reach because `DeepSeekV4Loader::supports_paged_attention`
+                // returns false. Hence: no host/forward split existed here at
+                // all until this instrumentation.
+                arc_profiler::mark_unreachable(
+                    "paged_attention",
+                    "this pipeline was configured with DefaultInstructions; the PagedAttention \
+                     step arm (and with it graph_wrapped_forward / dedicated decode / CUDA graph \
+                     replay) is not on this path",
+                    "pipeline/mod.rs:1088",
+                );
+                let inputs_iter = {
+                    let _s = arc_profiler::span("input_prep");
                     std::iter::once(self.get_processor().inputs_processor().process_inputs(
                         self.tokenizer(),
                         input_seqs,
@@ -885,7 +899,8 @@ pub trait Pipeline:
                         self.get_input_processor_config(),
                         None,
                         self.device_mapper(),
-                    ));
+                    ))
+                };
 
                 let mut logits = vec![None; input_seqs.len()];
                 let len_inputs = 1;
@@ -899,6 +914,7 @@ pub trait Pipeline:
                         seq_indices,
                     } = inputs.map_err(candle_core::Error::msg)?;
                     if i == 0 {
+                        let _s = arc_profiler::span("cache.pre_op");
                         match pre_op {
                             CacheInstruction::In => self.clone_in_cache(input_seqs)?,
                             CacheInstruction::Nothing => (),
@@ -916,16 +932,29 @@ pub trait Pipeline:
                     }
 
                     let start = Instant::now();
-                    let raw_logits = self.forward_inputs(inputs, return_raw_logits)?;
+                    let raw_logits = {
+                        let _s = arc_profiler::span("forward");
+                        self.forward_inputs(inputs, return_raw_logits)?
+                    };
                     let end = Instant::now();
                     exec_duration += end.duration_since(start);
 
                     // ONE host copy for the whole batch, *before* the
                     // per-sequence split. See `host_copy_batched_result`: the
                     // reverse order costs O(B²) D2H bytes per step.
-                    let raw_logits =
-                        host_copy_batched_result(raw_logits, input_seqs.len(), &Device::Cpu)?;
+                    //
+                    // A `sync_span`, not a plain span: this is a blocking D2H,
+                    // so its cost is the host *waiting* on the device, and it
+                    // is also the point where every kernel queued by the
+                    // forward above finally has to have finished. Reported as
+                    // wait time it is diagnostic; reported as host time it
+                    // would look like CPU work that does not exist.
+                    let raw_logits = {
+                        let _s = arc_profiler::sync_span("logits_d2h");
+                        host_copy_batched_result(raw_logits, input_seqs.len(), &Device::Cpu)?
+                    };
 
+                    let _s = arc_profiler::span("logits_split");
                     for (logit_idx, seq_idx) in seq_indices.into_iter().enumerate() {
                         if let ForwardInputsResult::RawLogits { logits } = &raw_logits {
                             raw_out_logits[seq_idx][i] = Some(logits.i(logit_idx)?);
@@ -937,19 +966,27 @@ pub trait Pipeline:
                     }
                 }
 
-                match post_op {
-                    CacheInstruction::Out => self.clone_out_cache(input_seqs),
-                    CacheInstruction::Nothing => (),
-                    CacheInstruction::Reset {
-                        load_preallocated_cache,
-                        reset_non_granular,
-                    } => self.set_none_cache(
-                        input_seqs,
-                        reset_non_granular,
-                        false,
-                        load_preallocated_cache,
-                    ),
-                    _ => unreachable!("Unreachable POST cache op."),
+                {
+                    // `post_op` is `CacheInstruction::Out` unconditionally on
+                    // every decode step (`engine/mod.rs:397-404`), so
+                    // `clone_out_cache` rebuilds B x (layers + compressor
+                    // slots) per-sequence caches every token. This span is what
+                    // turns that from a code reading into a number.
+                    let _s = arc_profiler::span("cache.post_op");
+                    match post_op {
+                        CacheInstruction::Out => self.clone_out_cache(input_seqs),
+                        CacheInstruction::Nothing => (),
+                        CacheInstruction::Reset {
+                            load_preallocated_cache,
+                            reset_non_granular,
+                        } => self.set_none_cache(
+                            input_seqs,
+                            reset_non_granular,
+                            false,
+                            load_preallocated_cache,
+                        ),
+                        _ => unreachable!("Unreachable POST cache op."),
+                    }
                 }
 
                 if raw_out_logits[0][0].is_some() {
@@ -990,6 +1027,10 @@ pub trait Pipeline:
                 }
 
                 let start = Instant::now();
+                // Sampling, detokenisation, stop-string scanning and the serial
+                // `responder.send().await` loop all live under here, and the
+                // pipeline mutex is held for every one of them.
+                let _s = arc_profiler::span("sample_and_dispatch");
                 // Already on the host (one batched copy above) when B > 1.
                 let logits = logits
                     .into_iter()
@@ -1150,7 +1191,10 @@ pub trait Pipeline:
                     } = inputs.map_err(candle_core::Error::msg)?;
 
                     let start = Instant::now();
-                    let raw_logits = self.graph_wrapped_forward(inputs, is_prompt, return_raw_logits)?;
+                    let raw_logits = {
+                        let _s = arc_profiler::span("forward");
+                        self.graph_wrapped_forward(inputs, is_prompt, return_raw_logits)?
+                    };
                     let end = Instant::now();
                     exec_duration += end.duration_since(start);
                     __pa_t_fwd_us += end.duration_since(start).as_secs_f64() * 1e6;
@@ -1160,8 +1204,10 @@ pub trait Pipeline:
                     // reverse order costs O(B²) D2H bytes per step. (This moves
                     // the logits D2H out of `STEP_us`' `sample` bucket and into
                     // `other`; it is the same work, attributed where it happens.)
-                    let raw_logits =
-                        host_copy_batched_result(raw_logits, input_seqs.len(), &Device::Cpu)?;
+                    let raw_logits = {
+                        let _s = arc_profiler::sync_span("logits_d2h");
+                        host_copy_batched_result(raw_logits, input_seqs.len(), &Device::Cpu)?
+                    };
 
                     for (logit_idx, seq_idx) in seq_indices.into_iter().enumerate() {
                         if let ForwardInputsResult::RawLogits { logits } = &raw_logits {
@@ -1212,6 +1258,7 @@ pub trait Pipeline:
                 }
 
                 let start = Instant::now();
+                let _s = arc_profiler::span("sample_and_dispatch");
                 // Already on the host (one batched copy above) when B > 1.
                 let logits = logits
                     .into_iter()

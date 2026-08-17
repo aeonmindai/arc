@@ -1,8 +1,19 @@
 /// Lloyd-Max optimal codebooks for TurboQuant KV cache compression.
 ///
-/// These are pre-computed centroids and decision boundaries for the Beta(d/2, d/2)
-/// distribution on [-1, 1], which is the marginal distribution of a single coordinate
-/// of a uniformly random point on the unit hypersphere S^{d-1} (Lemma 1, TurboQuant paper).
+/// These are pre-computed centroids and decision boundaries for the marginal
+/// distribution of a single coordinate of a uniformly random point on the unit
+/// hypersphere S^{d-1} (Lemma 1, TurboQuant paper), whose density on [-1, 1] is
+///
+/// ```text
+///     f_d(x) ∝ (1 - x²)^((d-3)/2)
+/// ```
+///
+/// equivalently `(x+1)/2 ~ Beta((d-1)/2, (d-1)/2)`. **The exponent is `(d-3)/2`,
+/// not `(d-2)/2` or `(d-1)/2`** — see `generator_reproduces_shipped_tables` in
+/// [`super::generate`], which pins the generated `mse_per_coord` to the constants
+/// in this file to 1e-9 for all nine `(dim, bits)` pairs. This doc previously read
+/// "Beta(d/2, d/2)", which is off by one half in both shape parameters; the tables
+/// below were always computed from the correct density.
 ///
 /// After a randomized Walsh-Hadamard rotation, every coordinate of the input vector
 /// follows this distribution regardless of the original data, making these codebooks
@@ -287,14 +298,49 @@ static D256_4BIT_BOUNDARIES: [f32; 17] = [
 // Lookup function
 // ============================================================================
 
-/// Get the codebook for a given head dimension and bit-width.
+/// Get the codebook for a given block dimension and bit-width.
 ///
-/// Supported dimensions: 64, 128, 256.
-/// Supported bit-widths: 2, 3, 4.
+/// `dim` may be **any** value in
+/// `[generate::MIN_BLOCK_DIM, generate::MAX_BLOCK_DIM]`; `bits` must be 2, 3
+/// or 4. The three dimensions that shipped as hand-pasted tables (64, 128,
+/// 256) still return those exact tables, so nothing that was validated against
+/// them changes by a single bit. Every other dimension is served by
+/// [`super::generate::cached_generated_codebook`], which computes the same
+/// Lloyd–Max optimum numerically (and is pinned against these three tables by
+/// `generator_reproduces_shipped_tables`).
 ///
-/// Panics if an unsupported (dim, bits) combination is requested.
+/// Panics on an out-of-range `dim` or `bits`; use [`try_get_codebook`] where a
+/// bad model config should surface as an error rather than a panic.
 pub fn get_codebook(dim: usize, bits: u32) -> Codebook {
-    match (dim, bits) {
+    match try_get_codebook(dim, bits) {
+        Ok(cb) => cb,
+        Err(e) => panic!("{e}"),
+    }
+}
+
+/// Fallible [`get_codebook`].
+pub fn try_get_codebook(dim: usize, bits: u32) -> Result<Codebook, String> {
+    if !(2..=4).contains(&bits) {
+        return Err(format!(
+            "TurboQuant supports 2-, 3- and 4-bit codebooks; got bits={bits}"
+        ));
+    }
+    if !(super::generate::MIN_BLOCK_DIM..=super::generate::MAX_BLOCK_DIM).contains(&dim) {
+        return Err(format!(
+            "TurboQuant codebook dim={dim} is outside [{}, {}]. Head dimensions \
+             below {} cannot be rotation-flattened; see turboquant::generate.",
+            super::generate::MIN_BLOCK_DIM,
+            super::generate::MAX_BLOCK_DIM,
+            super::generate::MIN_BLOCK_DIM,
+        ));
+    }
+    Ok(static_codebook(dim, bits)
+        .unwrap_or_else(|| super::generate::cached_generated_codebook(dim, bits)))
+}
+
+/// The three hand-pasted tables that shipped with the original implementation.
+fn static_codebook(dim: usize, bits: u32) -> Option<Codebook> {
+    let cb = match (dim, bits) {
         (64, 2) => Codebook {
             centroids: &D64_2BIT_CENTROIDS,
             boundaries: &D64_2BIT_BOUNDARIES,
@@ -340,11 +386,9 @@ pub fn get_codebook(dim: usize, bits: u32) -> Codebook {
             boundaries: &D256_4BIT_BOUNDARIES,
             mse_per_coord: 0.0000367481,
         },
-        _ => panic!(
-            "TurboQuant codebook not available for dim={dim}, bits={bits}. \
-             Supported: dim={{64,128,256}}, bits={{2,3,4}}"
-        ),
-    }
+        _ => return None,
+    };
+    Some(cb)
 }
 
 #[cfg(test)]

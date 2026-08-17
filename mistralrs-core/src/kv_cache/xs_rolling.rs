@@ -576,6 +576,99 @@ impl XsRollingCache {
         Ok(())
     }
 
+    /// The first raw token any *future* compressed row can still need.
+    ///
+    /// Row `g` (the next one to complete) is built from group
+    /// `g + 1 - span_groups` onward, so everything below this index is dead
+    /// weight the cache is free to drop. It is the same expression
+    /// [`Self::advance`] uses for `need_start`, named once so the retention
+    /// rule and the trim rule cannot drift apart.
+    pub fn compressor_needs_from(&self) -> usize {
+        (self.comp.current_seq_len() + 1).saturating_sub(self.span_groups) * self.ratio
+    }
+
+    /// Raise this cache's `base` to `new_base`, dropping the leading raw rows.
+    ///
+    /// # Why this exists
+    ///
+    /// For a **single-row** cache `tail` is `tokens - base` wide and `base` is
+    /// **not** a function of `tokens`: it is `canonical(high-water tokens)`,
+    /// because [`Self::set_len`] narrows the tail without moving `base` and
+    /// [`Self::advance`] never lowers it. Two sequences at the identical token
+    /// count can therefore hold different-width tails — one that rolled back
+    /// across a group boundary, one that arrived directly, one restored from a
+    /// prefix-cache entry stored at a greater length.
+    /// `NormalCacheManager::clone_in_cache` batches `tail` with `slice_set`,
+    /// which demands an exact dim match, so that difference is the
+    /// `shape mismatch on dim 1, 18 <> 22` class of failure — on the **plain
+    /// decode path**, with no speculation involved (PR #93).
+    ///
+    /// Trimming to the batch's **largest** `base` reconciles them, and it is
+    /// lossless by construction: the member that already sits at `base_max`
+    /// proves no future compressed row needs a token below it. The rows dropped
+    /// here only ever shortened how far a *rollback* could reach.
+    ///
+    /// Refuses (rather than silently dropping history) if `new_base` would cut
+    /// into rows the next compressed row is built from, which is the same
+    /// condition [`Self::advance`] bails on as a "compressor history gap".
+    ///
+    /// # 🔴 Why this refuses a multi-row cache instead of reading `base[0]`
+    ///
+    /// `new_base` is ONE number, and `drop` / `keep` below are physical column
+    /// offsets applied across the whole batch dim. That is only meaningful when
+    /// the cache describes one row. Once `base` is per-row, "trim **the** raw
+    /// window" is not a statement this cache can evaluate: rows sharing a
+    /// physical width `W` sit at `base[i] >= tokens[i] - W`, so a single
+    /// `narrow` would move a different logical amount for each of them.
+    ///
+    /// Reading `base[0]` and proceeding would produce a plausible-looking wrong
+    /// answer — the tensor would come out the right *shape*, which is exactly
+    /// what the caller checks — so it refuses by name instead (D18). Every
+    /// production caller passes a per-sequence cache (`rows() == 1`):
+    /// `reconcile_xs_bases` runs before the batch is gathered, never after.
+    pub fn trim_tail_to(&mut self, new_base: usize) -> Result<()> {
+        if self.rows() > 1 {
+            candle_core::bail!(
+                "xs rolling cache: `trim_tail_to` is defined for a single-row cache, but this \
+                 one carries {} rows (tokens {:?}, base {:?}). A scalar `new_base` cannot \
+                 express a trim for rows that sit at different resume points — the retained \
+                 window is shared and end-anchored, so one `narrow` moves a different logical \
+                 amount per row. Split the batch first (`clone_out_cache`) and trim the \
+                 per-sequence caches.",
+                self.rows(),
+                self.tokens,
+                self.base
+            );
+        }
+        let tokens = self.tokens[0];
+        let base = self.base[0];
+        if new_base <= base {
+            return Ok(());
+        }
+        if new_base > tokens {
+            candle_core::bail!(
+                "xs rolling cache: cannot trim the raw window to start at {new_base}; the cache \
+                 only holds {tokens} tokens"
+            );
+        }
+        let need_start = self.compressor_needs_from();
+        if need_start < new_base {
+            candle_core::bail!(
+                "xs rolling cache: trimming the raw window to {new_base} would drop tokens the \
+                 next compressed row is built from (it needs them from {need_start}). Resuming \
+                 would silently skip history."
+            );
+        }
+        let keep = tokens - new_base;
+        let drop = new_base - base;
+        self.tail = match self.tail.take() {
+            Some(t) if keep > 0 => Some(t.narrow(1, drop, keep)?.contiguous()?),
+            _ => None,
+        };
+        self.base[0] = new_base;
+        Ok(())
+    }
+
     /// The compressed rows `[B, G, head_dim]`, or `None` when no group has
     /// completed yet (the sliding-window branch alone covers the context).
     ///
@@ -777,7 +870,11 @@ impl XsRollingCache {
         if g_target > g_done {
             // Rows g_done..g_target need raw tokens from group
             // `g_done + 1 - span_groups` onward.
-            let need_start = (g_done + 1).saturating_sub(self.span_groups) * self.ratio;
+            let need_start = self.compressor_needs_from();
+            debug_assert_eq!(
+                need_start,
+                (g_done + 1).saturating_sub(self.span_groups) * self.ratio
+            );
             if need_start < win_start {
                 candle_core::bail!(
                     "xs rolling cache: compressor history gap — row {g_done} needs tokens from \

@@ -17,9 +17,11 @@ quantities plus vendor specs, not yet run end-to-end).
 - Arc's artifact for the same model is **74.18 GB** (2-bit trellis experts + FP8
   attention) **[measured — HF API, `aeonmind/DeepSeek-V4-Flash-UQFF-qtip2`, 15
   files, 8 shards + residual]**, and one H200 loads and serves it with the
-  quality numbers in
-  BENCHMARKS.md (GSM8K 87.0%, long-context 5/5+4/4) **[measured — provisional,
-  pre-PR-#35 decode math; see BENCHMARKS.md]**.
+  quality numbers in BENCHMARKS.md (**GSM8K 1270/1319 = 96.3% ±1.0pp**, full
+  test set, 0-shot, 0 degenerate / 0 truncated / 0 errors; long-context 5/5+4/4)
+  **[measured — 2026-08-17, on the `qtip2b` artifact]**. The reference model's
+  published 90.8 is **8-shot**, a different and easier protocol, so 96.3 is not
+  a like-for-like win over it.
 - Therefore the same node can instead host **8 independent replicas** — no
   inter-GPU traffic, per-replica failure isolation, per-replica batch
   scheduling **[projected — the 8-up deployment itself has not been run; the
@@ -53,48 +55,74 @@ pool — and the pool size is what compression shrinks.
   engine overhead, so it is an upper bound on serving throughput at today's
   kernel efficiency, not a serving number. The end-to-end batched-serving
   measurement is planned for session 5.
-- Reality check **[measured]**: single-stream decode is 14.58 tok/s
-  (no-cudnn build; progression 5.4 → 13.99 → 14.58 across the kernel-fix
-  PRs). The session-4 autotune sweep lifted the gather-GEMV kernels from
-  153–192 GB/s (3–4% of H200 peak) to ~36 µs / 450–467 GB/s best-variant
-  (~9.5% of peak, 2.3× — now the shipped dispatch defaults, PR #20), but
-  the tuned dispatch is not yet reflected in the 14.58 end-to-end number
-  (see BENCHMARKS.md). The floor math above is the destination, not the
-  present: measured kernel-level throughput at B=64 is ~1,006 tok/s against
-  the ~4.1K tok/s spec-bandwidth floor (~24% of it), and serving-level
-  throughput will be lower still until the engine-level batched run exists.
+- **The end-to-end serving run now exists [measured]** (2026-08-17, 1×H200 @
+  $4.85/hr, published `qtip2b` artifact, $16.11, 0 errors across 505 requests,
+  `effective_B == B` on all seven batch rows):
+
+  | B | 1 | 8 | 16 | 32 | 64 | 128 | **256** |
+  |---|---|---|---|---|---|---|---|
+  | **decode aggregate tok/s** | 18.27 | 41.43 | 54.75 | 74.52 | 91.46 | 106.36 | **111.69** |
+  | per-user p50 tok/s | 17.99 | 5.67 | 3.97 | 2.87 | 1.82 | 1.09 | 0.53 |
+  | **$/Mtok** | 73.74 | 32.52 | 24.61 | 18.08 | 14.73 | 12.67 | **12.06** |
+
+  **Aggregate rises monotonically all the way to B=256** — the batching argument
+  survives the full serving path, not just the kernel microbenchmark. The b=1
+  row (1.12× over the `qtip2` rung) is the **control**: it shows the gain comes
+  from the rung plus batching, not from a faster box.
+- Reality check **[measured]**: the gap to the floor is large and is the work.
+  Serving aggregate at B=64 is **91.46 tok/s** against the ~4.1K tok/s
+  spec-bandwidth floor — **~2% of it**. Per-user at B=128 is 1.09 tok/s. A
+  named contributor: GPU top-k sampling falls back to CPU on **every token**
+  (`tensor_device_ptr: unsupported dtype I32`), a device→host round trip per
+  token in the decode loop **[measured, session 8]**. Arc is overhead-bound
+  today, not bandwidth-bound — 111.69 tok/s is low single-digit % of the H200's
+  4.8 TB/s.
 
 ## 3. KV tenancy at 3.5-bit
 
 Once weights fit, concurrent capacity is bounded by KV cache per sequence.
 
-- TurboQuant K4/V3 (3.5-bit average KV) measured **4.27× context capacity**
-  end-to-end on Qwen3-32B on a single H100: 39K → 169K tokens, with quality
-  confirmed **[measured — different model/GPU than the V4 runs; Apr 2026]**.
-- Fleet meaning: at fixed HBM headroom, ~4× the concurrent tenants per replica
-  (or ~4× the context per tenant) on GQA-attention models **[projected beyond
-  the measured Qwen3-32B configuration]**.
-- Honest gap: MLA-attention models — including DeepSeek V4 — currently fall
-  back to the standard KV path, so the 4.27× does **not** yet stack onto the
-  V4 replica math above. TurboQuant×MLA is in progress **[not measured]**.
+- 🔴 **RETRACTION (2026-08-17).** This section previously claimed TurboQuant
+  K4/V3 measured **4.27× context capacity end-to-end on Qwen3-32B on a single
+  H100 (39K → 169K tokens)**. **That number is format arithmetic — bytes per
+  token at 3.5 bits versus BF16 — and was never produced by a forward pass on
+  any GPU.** No TurboQuant measurement exists anywhere in this repo's record.
+  It must not be cited as measured, and the "Apr 2026, quality confirmed"
+  provenance attached to it was not real.
+- **TurboQuant is not on any default serving path today [code-verified]:**
+  - The eager KV path is **opt-in via `ARC_TURBOQUANT_KV=1`**, default off
+    (`mistralrs-core/src/kv_cache/mod.rs`).
+  - The paged path has a kernel at **head_dim 128 only**
+    (`TURBOQUANT_HEAD_DIM`); the ambient default auto-falls back to `Auto`
+    with a warning, and an explicit `--pa-cache-type turboquant` hard-errors
+    off-envelope.
+  - **No kernel exists at head_dim 512**, so DeepSeek V4 cannot use it at all.
+  - The prefix cache auto-disables under TurboQuant (packed U8 blocks cannot
+    be gathered).
+- Fleet meaning **[projected — arithmetic only]**: *if* TurboQuant were on a
+  serving path, 3.5-bit KV would buy roughly 4× the concurrent tenants per
+  replica at fixed HBM on GQA-attention models. Nothing here is measured, and
+  the honest gap is larger than "MLA is pending": the feature is a compression
+  format with no measured serving run behind it.
 
 ## Summary table
 
 | Claim | Status |
 |---|---|
-| 284B/13B MoE serves on one H200 from a **74.18 GB** artifact, with quality numbers | **Measured** (artifact size HF-API-verified) |
-| GSM8K 87.0% (n=100, 0-shot greedy, seed 161, 2048-cap) at 2-bit experts | **Measured — provisional** (PR #35 changed the decode math after the run; re-measure pending) |
-| TurboQuant KV 4.27× context (Qwen3-32B, 1×H100) | **Measured** |
+| 284B/13B MoE serves on one H200 from a **74.18 GB** artifact (`qtip2`) | **Measured** (size HF-API-verified; the `qtip2b` rung Arc serves is 74.12 GB per BENCHMARKS.md, not separately HF-API-verified) |
+| **GSM8K 96.3%** (1270/1319, full set, 0-shot, 0 degenerate / 0 truncated / 0 errors) at 2-bit experts | **Measured** (2026-08-17, `qtip2b`) |
+| **End-to-end serving: 111.69 tok/s aggregate @ B=256, $12.06/Mtok**, monotonic from B=1, 0 errors / 505 requests | **Measured** (1×H200, $16.11) |
 | qtip2b bitshift-trellis CUDA parity (20/20 on H200) | **Measured** |
 | Trellis grouped-GEMM hardware parity (5/5 on H200) | **Measured** |
-| b=1 decode 14.58 tok/s (no-cudnn build; 5.4 → 13.99 → 14.58) | **Measured** |
-| GEMV autotune: ~36 µs / 450–467 GB/s best-variant (~9.5% peak, 2.3×), shipped as dispatch defaults | **Measured-kernel** (end-to-end effect pending) |
-| Grouped-GEMM batch curve flat ~63.5 ms/step B=16→64 ⇒ ~1,006 aggregate tok/s ⇒ ≈$1.36/Mtok at $4.92/hr | **Measured-kernel** (expert path only; serving run pending) |
-| End-to-end batched serving tok/s and $/Mtok on one H200 | Pending (planned session 5) |
+| b=1 decode 18.27 tok/s aggregate (17.99 per-user p50) | **Measured** |
+| GEMV autotune: ~36 µs / 450–467 GB/s best-variant (~9.5% peak, 2.3×), shipped as dispatch defaults | **Measured-kernel** |
+| Grouped-vs-GEMV crossover at **B=64**; grouped keeps climbing (527 tok/s @ B=128) while GEMV is flat (315→317) | **Measured-kernel** (MoE-GEMM floor only) |
+| TurboQuant KV compression | **Never measured** — the former "4.27×" was format arithmetic, now retracted; not on any default path |
 | 8 replicas per 8×H200 node | Projected (building block measured) |
-| ~4.1K tok/s/GPU at saturated batch; ~8× node aggregate vs 1×TP8 | Projected (floor arithmetic off the measured 74.18 GB artifact; kernel-level evidence at ~24% of the floor) |
-| ~4× KV tenancy on V4-class MLA models | Projected (MLA path not done) |
+| ~4.1K tok/s/GPU at saturated batch; ~8× node aggregate vs 1×TP8 | Projected (floor arithmetic off the measured 74.18 GB artifact; serving is at ~2% of the floor) |
+| Expert parallelism across cards | Projected — **not implemented** (`Comm::Dummy`, world_size 1); design only |
+| ~4× KV tenancy on V4-class MLA models | Projected (no TurboQuant kernel at head_dim 512) |
 
-Cost of every measured number above: ≈ $123 of rented H200 time across four
-sessions. Protocols, artifacts, and limitations:
-[BENCHMARKS.md](BENCHMARKS.md).
+No side-by-side run against SGLang, vLLM, or any other engine has ever been
+performed, so every $/Mtok figure here is Arc-versus-Arc. Protocols, artifacts,
+and limitations: [BENCHMARKS.md](BENCHMARKS.md).

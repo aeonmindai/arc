@@ -16,6 +16,7 @@ Every number below carries one of these labels. Nothing is stated without one.
 | grade | meaning |
 |---|---|
 | **[measured]** | someone ran it on hardware; the box and the shape are stated |
+| **[measured-kernel]** | measured on hardware, but **at the kernel or microbenchmark level** — a real number about a kernel, and **not** a wall-time, bake-time or serving result. It may not be promoted to either by arithmetic alone. The cost of ignoring this is on the record: a flat-step-time microbenchmark implied ~1,006 aggregate tok/s at B=64; end-to-end serving measured **91.46** [see OPEN_QUESTIONS.md §3] |
 | **[derived]** | arithmetic over measured quantities or over constants read in shipped source |
 | **[source-verified]** | read directly in shipped code (ours or a third party's) |
 | **[projected]** | a forward estimate. Not a measurement. Several of ours were wrong — see "Predictions that failed" |
@@ -31,7 +32,12 @@ Every number below carries one of these labels. Nothing is stated without one.
 - Reference model: DeepSeek-V4-Flash, 284 B total / 13 B active, 43 quantized
   MoE layers, **6.4 B parameters per layer** ⇒ 3.2e9 symbol positions per layer
   at `V = 2`. [source-verified, `mistralrs-quant/kernels/qtip/qtip_beam.cu:11-25`]
-- Artifact: **74.18 GB** UQFF in **8 shards + residual** (15 files). [measured, H200, reproduced 4×; size HF-API-verified on the published repo. Earlier revisions said "~68 GB / 7 shards" — an estimate]
+- Artifact: **74.18 GB** UQFF in **8 shards + residual** (15 files) ⇒ **2.09
+  bits/param** over 284 B params. [measured, H200, reproduced 4×; size
+  HF-API-verified on the published repo. Earlier revisions said "~68 GB /
+  7 shards" — an estimate. ⚠️ **The "~1.9 bits/param" that circulated with it is
+  retracted**: it divided that 68 GB *estimate* by the parameter count. The
+  measured artifact gives 2.09.]
 
 ## Headline: where a layer's 241 seconds go — **on the pre-#40 build**
 
@@ -47,6 +53,14 @@ Every number below carries one of these labels. Nothing is stated without one.
 twice, as marginal deltas between consecutive layer markers: run A 240 s, 242 s;
 run B 241 s, 242 s. The exhaustive DP over the same trellis is **510 s/layer**
 [measured, same box class] ⇒ the beam is **2.1×** faster.
+
+> **What the *published* artifact actually cost, on a different card.** The
+> shipped `qtip2` bake was **not** run on this H200: it ran on a **\$1.49/hr
+> A100 at 370–376 s/layer, 43 layers**, beam W=256 / hadamard-128 / mse
+> [measured, per-layer marker differencing]. The 241 s/layer above is the H200
+> beam figure and is the right anchor for the kernel discussion below; it is
+> **not** what the release artifact was baked at. Do not use one where the other
+> is meant.
 
 Per-layer decomposition, from in-tree instrumentation read off a live bake over
 **4 consecutive layers, ±0.2 s** [measured, **pre-#40**, H200, s6 bake]:
