@@ -10,6 +10,19 @@
 #                 is wrong at the root and the tok/s number is meaningless.
 #   2. SECONDARY— decode throughput ratio B/A >= 0.99.
 #
+# THE THIRD FAKE-PASS MODE (added after the box's PTX defect was found):
+#   This image's driver (580.173.02) caps at CUDA 13.0 while the only toolkit is
+#   13.1, and `candle-kernels/build.rs:20` calls `build_ptx()` unconditionally.
+#   A hardware differential probe showed SASS returning 42 and driver-JIT'd PTX
+#   returning 0 -- with `err=no error`. Silently wrong, no crash.
+#   That defeats BOTH of the guards below: two phases sharing one broken PTX
+#   path produce IDENTICAL GARBAGE, so identity passes, the ratio is 1.00, and
+#   the script would report PASS on a model computing zeros.
+#   Identity between two wrong runs is not evidence. So the control run must
+#   first prove the kernels compute anything at all -- see the CANARY. A model
+#   whose logits are all zero argmaxes to the same token forever, which is
+#   exactly what the canary and the degeneracy check catch.
+#
 # Runs unattended. setsid-safe. Writes append-only progress to $STATUS_FILE
 # (tail -f it) and a machine-readable verdict to $RESULT_FILE.
 #
@@ -96,6 +109,29 @@ say "CUDA_HOME=$CUDA_HOME"
 
 command -v nvidia-smi >/dev/null 2>&1 || die_err "nvidia-smi not found — this must run on the GPU box"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader | tee -a "$STATUS_FILE"
+
+# --- PTX / driver forward-compatibility preflight ---------------------------
+# `nvidia-smi` prints the highest CUDA version the DRIVER can accept. If the
+# toolkit is newer, every PTX image candle-kernels emits must be JIT'd by a
+# driver that does not understand it. On this image that fails SILENTLY (wrong
+# values, no error), so refuse up front unless a forward-compat layer is
+# present. This is an ENVIRONMENT fault: exit 2, never exit 1.
+DRIVER_MAX_CUDA="$(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version: *\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)"
+NVCC_CUDA="$(nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)"
+say "driver accepts CUDA <= ${DRIVER_MAX_CUDA:-unknown}; toolkit is ${NVCC_CUDA:-unknown}"
+if [[ -n "$DRIVER_MAX_CUDA" && -n "$NVCC_CUDA" ]]; then
+  if python3 -c "import sys; sys.exit(0 if tuple(map(int,'$NVCC_CUDA'.split('.'))) > tuple(map(int,'$DRIVER_MAX_CUDA'.split('.'))) else 1)"; then
+    COMPAT_LIB="$(ls -d /usr/local/cuda/compat/libcuda.so* /usr/local/cuda-*/compat/libcuda.so* 2>/dev/null | head -1 || true)"
+    if [[ -n "$COMPAT_LIB" ]]; then
+      say "toolkit $NVCC_CUDA > driver max $DRIVER_MAX_CUDA, but forward-compat layer found: $COMPAT_LIB"
+      say "  (ensure it is on LD_LIBRARY_PATH, or the JIT still goes through the old driver)"
+    else
+      die_err "PTX TRAP: toolkit CUDA $NVCC_CUDA > driver max $DRIVER_MAX_CUDA and no cuda-compat layer found. \
+candle-kernels/build.rs:20 always emits PTX, and this driver JITs it to SILENTLY WRONG values (measured: SASS=42, PTX=0, err=no error). \
+Any result from this box would be garbage that looks clean. Install cuda-compat-13-1 (and put it on LD_LIBRARY_PATH) or use a driver >= CUDA $NVCC_CUDA."
+    fi
+  fi
+fi
 
 # python3 stdlib only. The image ships pip 22.0.2 with no numpy, so the driver
 # below uses urllib + json + concurrent.futures and nothing else.
@@ -191,7 +227,16 @@ except Exception:
     sys.exit(1)
 PY
   do
-    kill -0 "$SERVER_PID" 2>/dev/null || { tail -40 "$log" | tee -a "$STATUS_FILE"; die_err "server [$tag] died during boot — see $log"; }
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      tail -40 "$log" | tee -a "$STATUS_FILE"
+      # An unsupported-PTX death is an ENVIRONMENT fault, not a refuted claim.
+      # It must exit 2 so nobody reads it as "the segmented allocator broke it".
+      if grep -qiE 'UNSUPPORTED_PTX_VERSION|unsupported ptx|PTX JIT compil|CUDA_ERROR_INVALID_PTX' "$log"; then
+        die_err "server [$tag] died on a PTX/JIT error — driver cannot accept this toolkit's PTX. \
+ENVIRONMENT fault, not a result. Install cuda-compat or downgrade the toolkit. See $log."
+      fi
+      die_err "server [$tag] died during boot — see $log"
+    fi
     waited=$((waited + 5)); sleep 5
     (( waited % 60 == 0 )) && say "  ... waiting for [$tag] (${waited}s; first run includes the model download)"
     (( waited >= SERVER_BOOT_TIMEOUT )) && die_err "server [$tag] did not open :$PORT within ${SERVER_BOOT_TIMEOUT}s"
@@ -279,6 +324,38 @@ def completion_tokens(resp):
 # ---- warmup: never time a cold cache, and never let warmup pollute identity --
 chat("Warm up.", 8)
 
+# ---- CANARY: prove the kernels compute something correct --------------------
+# The PTX defect on this image returns wrong values with NO error. Two phases
+# sharing that defect agree perfectly, so identity proves nothing unless the
+# control run is first shown to be sane. These are questions a working 1.5B
+# instruct model answers with certainty; failing them means the arithmetic
+# underneath is broken, not that the model is weak.
+# All-zero logits argmax to the same token every step, so a degenerate answer
+# is the exact signature of the PTX failure.
+CANARIES = [
+    ("What is the capital of France? Reply with just the city name.", "paris"),
+    ("What is 2 + 2? Reply with just the number.", "4"),
+    ("Name the largest planet in our solar system. Reply with one word.", "jupiter"),
+]
+
+def degenerate(text):
+    """True if the text looks like all-zero logits: empty, or one token forever."""
+    t = text.strip()
+    if not t:
+        return True
+    words = t.split()
+    return len(set(words)) == 1 and len(words) > 3
+
+canary = {"passed": True, "details": []}
+for prompt, expect in CANARIES:
+    got = content(chat(prompt, 24))
+    ok = (expect in got.lower()) and not degenerate(got)
+    canary["details"].append({"prompt": prompt, "expect": expect,
+                              "got": got[:200], "ok": ok,
+                              "degenerate": degenerate(got)})
+    canary["passed"] = canary["passed"] and ok
+    print(f"    canary {'ok ' if ok else 'FAIL'} expect={expect!r} got={got[:60]!r}", flush=True)
+
 # ---- PHASE 1: identity. STRICTLY SEQUENTIAL, one request in flight. ----------
 # This matters. Run these concurrently and the batch composition differs between
 # phases, the reduction order in the attention kernels changes with it, and
@@ -288,8 +365,10 @@ chat("Warm up.", 8)
 identity = []
 for i, suf in enumerate(SUFFIXES):
     r = chat(PREFIX + suf, IDENT_MAX)
-    identity.append({"i": i, "prompt_suffix": suf,
-                     "text": content(r), "completion_tokens": completion_tokens(r)})
+    txt = content(r)
+    identity.append({"i": i, "prompt_suffix": suf, "text": txt,
+                     "completion_tokens": completion_tokens(r),
+                     "degenerate": degenerate(txt)})
     print(f"    identity[{i}] {completion_tokens(r)} tok", flush=True)
 
 # ---- PHASE 2: throughput. Concurrent, this is the number we compare. ---------
@@ -307,6 +386,7 @@ total_tokens = sum(t for t, _ in results)
 out = {
     "tag": TAG,
     "model": MODEL,
+    "canary": canary,
     "identity": identity,
     "throughput": {
         "concurrency": CONC,
@@ -326,6 +406,37 @@ say "=== phase 4: control run (flag OFF) ==="
 start_server control ""
 run_phase control
 stop_server
+
+# --------------------------------------------------- anti-fake-pass guard 3 --
+# THE ONE THAT CATCHES SILENTLY-WRONG KERNELS. Guards 1 and 2 both pass when
+# the PTX JIT returns zeros, because both phases are wrong in the same way and
+# therefore agree. Identity is only evidence if the control is first shown to
+# compute correct answers. A control failure here is an ENVIRONMENT fault --
+# exit 2, never exit 1: the segmented allocator did not cause it and must not
+# be blamed for it.
+say "=== phase 4b: control coherence canary ==="
+if ! python3 - "$OUT_DIR/phase.control.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+c = d.get("canary", {})
+if not c.get("passed"):
+    for x in c.get("details", []):
+        if not x["ok"]:
+            print(f"  canary FAIL: expected {x['expect']!r}, got {x['got']!r} "
+                  f"(degenerate={x['degenerate']})")
+    sys.exit(1)
+if any(i.get("degenerate") for i in d.get("identity", [])):
+    print("  identity outputs are degenerate (one token repeated / empty)")
+    sys.exit(1)
+sys.exit(0)
+PY
+then
+  die_err "CONTROL RUN PRODUCED INCOHERENT OUTPUT — the kernels are computing garbage. \
+This is the documented PTX trap on this image (driver JITs unsupported PTX to wrong values with err=no error): \
+SASS=42 vs PTX=0. Comparing two runs that are both wrong would have PASSED and meant nothing. \
+ENVIRONMENT fault, not a result about PR #90. Fix cuda-compat / driver first. See $OUT_DIR/phase.control.json."
+fi
+say "guard 3 ok: control run answers correctly — kernels are sane, so identity is meaningful"
 
 say "=== phase 5: segmented run (ARC_SEGMENTED_KV=1) ==="
 start_server segmented "1"
@@ -371,7 +482,14 @@ ta = A["throughput"]["tokens_per_second"]; tb = B["throughput"]["tokens_per_seco
 ratio = (tb / ta) if ta > 0 else 0.0
 tokens_match = A["throughput"]["completion_tokens_total"] == B["throughput"]["completion_tokens_total"]
 
-if not identical:
+seg_canary = B.get("canary", {}).get("passed", False)
+seg_degenerate = any(i.get("degenerate") for i in B["identity"])
+
+if not seg_canary or seg_degenerate:
+    # Control was already proven sane by guard 3, so this is the flag breaking
+    # generation -- a genuine refutation, not an environment fault.
+    verdict, reason = "FAIL", "segmented run produced incoherent output while the control was sane"
+elif not identical:
     verdict, reason = "FAIL", "output identity violated: the degenerate 1-segment path is NOT degenerate"
 elif ratio < 0.99:
     verdict, reason = "FAIL", f"throughput ratio {ratio:.4f} < 0.99"
@@ -381,6 +499,7 @@ else:
 json.dump({
     "verdict": verdict, "reason": reason, "model": A["model"],
     "output_identical": identical, "identity_diffs": diffs,
+    "canary": {"control": A.get("canary"), "segmented": B.get("canary")},
     "throughput_tokens_per_second": {"control": ta, "segmented": tb},
     "throughput_ratio_segmented_over_control": ratio,
     "throughput_completion_tokens_match": tokens_match,
