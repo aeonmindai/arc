@@ -51,6 +51,18 @@ pub struct CudaGraphRunner {
     /// [`CudaGraphRunner::status_line`]. A runner that constructed, logged
     /// "initialized", and then did nothing reports `captured=0 replayed=0`.
     replays: u64,
+    /// Replays still owed a side-by-side eager comparison before the graph's
+    /// output is trusted as this step's logits.
+    ///
+    /// Turning replay output ON is the one change in this subsystem that can
+    /// corrupt tokens silently: a graph reading a stale address returns
+    /// plausible logits, not an error. So the first `verify_remaining` replays
+    /// run the eager forward too and compare; only after they agree does the
+    /// replay output get used on its own. Set by `ARC_GRAPH_VERIFY_REPLAYS`
+    /// (default 3); 0 means trust immediately and is not recommended.
+    verify_remaining: u32,
+    /// Set once a verification has failed — latches replay off permanently.
+    verify_failed: bool,
     /// RUN-161: deferred-free warmup passes still owed. After the eager warmups
     /// (which only fill the alloc cache to peak-live), forwards must run with
     /// the device in capture mode so the cache grows to the FULL per-forward
@@ -135,6 +147,8 @@ impl CudaGraphRunner {
                 enabled: false,
                 warmup_remaining: 0,
                 replays: 0,
+                verify_remaining: 0,
+                verify_failed: false,
                 deferred_passes_remaining: 0,
             });
         }
@@ -154,6 +168,8 @@ impl CudaGraphRunner {
             enabled: true,
             warmup_remaining: warmup_steps,
             replays: 0,
+            verify_remaining: Self::default_verify_replays(),
+            verify_failed: false,
             deferred_passes_remaining: deferred_passes,
         })
     }
@@ -191,10 +207,14 @@ impl CudaGraphRunner {
     /// terms nobody can mistake for success.
     pub fn status_line(&self) -> String {
         format!(
-            "ARCGRAPH STATUS: capture_possible={} captured={} replayed={}",
+            "ARCGRAPH STATUS: capture_possible={} captured={} replayed={} \
+output_trusted={} verify_remaining={} verify_failed={}",
             self.enabled,
             self.graphs.len(),
-            self.replays
+            self.replays,
+            self.replay_output_trusted(),
+            self.verify_remaining,
+            self.verify_failed
         )
     }
 
@@ -210,6 +230,50 @@ impl CudaGraphRunner {
         } else {
             false
         }
+    }
+
+    /// How many replays must be proven against an eager forward before the
+    /// graph's output is trusted. `ARC_GRAPH_VERIFY_REPLAYS`, default 3.
+    pub fn default_verify_replays() -> u32 {
+        std::env::var("ARC_GRAPH_VERIFY_REPLAYS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(3)
+    }
+
+    /// Does this replay still owe a side-by-side eager comparison?
+    pub fn needs_verification(&self) -> bool {
+        !self.verify_failed && self.verify_remaining > 0
+    }
+
+    /// May the replay's output be used as the step's real logits?
+    pub fn replay_output_trusted(&self) -> bool {
+        !self.verify_failed && self.verify_remaining == 0
+    }
+
+    /// Record one replay that matched the eager forward.
+    pub fn record_verification_pass(&mut self) {
+        if self.verify_remaining > 0 {
+            self.verify_remaining -= 1;
+            if self.verify_remaining == 0 {
+                tracing::info!(
+                    "ArcGraph: replay output VERIFIED against eager; graph output is now used \
+                     as the real logits. {}",
+                    self.status_line()
+                );
+            }
+        }
+    }
+
+    /// Record a replay that did NOT match. Latches replay output off for good.
+    pub fn record_verification_failure(&mut self, detail: &str) {
+        self.verify_failed = true;
+        tracing::error!(
+            "ArcGraph: replay output DIVERGED from the eager forward ({detail}). Graph output \
+             will NOT be used; every step falls back to eager. This is a correctness stop, not a \
+             performance one — a graph that returns plausible-but-wrong logits is worse than no \
+             graph."
+        );
     }
 
     /// Deferred-free passes still owed before capture may begin.

@@ -278,6 +278,32 @@ impl NormalLoaderBuilder {
     }
 }
 
+/// Tolerance for accepting a CUDA-graph replay's logits as equal to the eager
+/// forward's. The two run the SAME kernels on the SAME inputs in the SAME
+/// order, so they should agree bit-for-bit; this is deliberately tight rather
+/// than a "close enough" band, because the failure this guards against —
+/// a graph reading a stale device address — produces plausible logits, not
+/// wildly wrong ones. A loose tolerance would wave exactly that through.
+#[cfg(feature = "cuda")]
+const GRAPH_REPLAY_TOLERANCE: f32 = 1e-4;
+
+/// Max absolute elementwise difference between two logit tensors.
+///
+/// Costs one device→host sync of a single scalar, and only runs on the handful
+/// of verification steps, never on the trusted path.
+#[cfg(feature = "cuda")]
+fn max_abs_diff(a: &Tensor, b: &Tensor) -> candle_core::Result<f32> {
+    if a.dims() != b.dims() {
+        candle_core::bail!("shape mismatch: replay {:?} vs eager {:?}", a.dims(), b.dims());
+    }
+    a.to_dtype(candle_core::DType::F32)?
+        .sub(&b.to_dtype(candle_core::DType::F32)?)?
+        .abs()?
+        .flatten_all()?
+        .max(0)?
+        .to_scalar::<f32>()
+}
+
 impl Loader for NormalLoader {
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn load_model_from_hf(
@@ -1814,34 +1840,64 @@ impl Pipeline for NormalPipeline {
                                 cap_result
                             } else if runner.has_graph(bs) {
                                 let t = std::time::Instant::now();
-                                // Hoisted out of the `match` scrutinee so the
-                                // mutable borrow of `runner` is unambiguously
-                                // over before `status_line()` is read below.
                                 let replayed = runner.replay(bs);
                                 match replayed {
-                                    Ok(_) => {
+                                    Ok(out) => {
                                         let dt = t.elapsed();
-                                        // The replayed logits are THROWN AWAY; the eager
-                                        // forward below produces this step's real output.
-                                        // Replay correctness needs static input buffers (2b)
-                                        // and a device-indexed KV write/read (2c), neither of
-                                        // which exists. So this is a latency measurement and
-                                        // nothing else — no token Arc has ever emitted came
-                                        // from a graph replay. Spelled out on every line,
-                                        // because a bare "REPLAY latency" reads like a working
-                                        // decode path in a log skim.
-                                        tracing::info!(
-                                            "ARC capture: REPLAY latency = {dt:?} — MEASUREMENT ONLY, \
-                                             output discarded, eager forward supplies this step's logits \
-                                             (replay correctness pending 2b/2c). {}",
-                                            runner.status_line()
-                                        );
+                                        if runner.needs_verification() {
+                                            // RUN-161 step 3. Turning replay
+                                            // output on is the one change here
+                                            // that can corrupt tokens SILENTLY:
+                                            // a graph reading a stale address
+                                            // returns plausible logits, not an
+                                            // error. So prove it against eager
+                                            // before trusting it, and use the
+                                            // eager result this step either way
+                                            // — it is already computed and it is
+                                            // the one we know is right.
+                                            let eager = self.model.forward(
+                                                &input_ids,
+                                                &seqlen_offsets,
+                                                context_lens.clone(),
+                                                position_ids.clone(),
+                                                paged_attn_meta
+                                                    .as_ref()
+                                                    .map(|(a, b)| (a.clone(), b)),
+                                                &flash_meta,
+                                            )?;
+                                            match max_abs_diff(&out, &eager) {
+                                                Ok(d) if d <= GRAPH_REPLAY_TOLERANCE => {
+                                                    tracing::info!(
+                                                        "ARC capture: replay matched eager \
+                                                         (max|Δ|={d:.3e}, replay={dt:?})"
+                                                    );
+                                                    runner.record_verification_pass();
+                                                }
+                                                Ok(d) => runner.record_verification_failure(
+                                                    &format!("max|Δ| = {d:.3e} exceeds {GRAPH_REPLAY_TOLERANCE:.3e}"),
+                                                ),
+                                                Err(e) => runner.record_verification_failure(
+                                                    &format!("could not compare outputs: {e}"),
+                                                ),
+                                            }
+                                            Some(eager)
+                                        } else if runner.replay_output_trusted() {
+                                            tracing::debug!(
+                                                "ARC capture: replay {dt:?} (output USED)"
+                                            );
+                                            Some(out)
+                                        } else {
+                                            // Verification failed earlier; the
+                                            // graph still replays but its output
+                                            // is not to be believed.
+                                            None
+                                        }
                                     }
                                     Err(e) => {
-                                        tracing::warn!("ARC capture: replay failed: {e}")
+                                        tracing::warn!("ARC capture: replay failed: {e}");
+                                        None
                                     }
                                 }
-                                None
                             } else {
                                 None
                             };
