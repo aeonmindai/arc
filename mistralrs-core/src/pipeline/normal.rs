@@ -1777,6 +1777,57 @@ impl Pipeline for NormalPipeline {
                                     }
                                 }
                             } else if runner.is_enabled() && !runner.has_graph(bs) {
+                                // ── PROBE, NOT A FIX ──────────────────────────
+                                // `ARC_GRAPH_PREWARM_SIZES=172032[,...]` seeds the
+                                // alloc cache with blocks of exactly these byte
+                                // sizes before capture begins, so an allocation
+                                // that would otherwise MISS the warm pool during
+                                // capture becomes a hit.
+                                //
+                                // This exists to TEST a hypothesis, not to ship:
+                                // if the surviving capture-time miss is what
+                                // corrupts the heap, pre-warming its size should
+                                // make the crash disappear. The real fix is that
+                                // the buffer stops being allocated per decode step
+                                // — this only hides the symptom, and hiding it is
+                                // the point of the experiment.
+                                //
+                                // Seeded BEFORE `set_capture_mode(true)` on
+                                // purpose: while capturing, a freed buffer parks
+                                // in `deferred` and is NOT servable, so seeding
+                                // inside capture would warm nothing.
+                                if let Some(spec) = std::env::var_os("ARC_GRAPH_PREWARM_SIZES") {
+                                    let spec = spec.to_string_lossy().to_string();
+                                    let dev = self.device();
+                                    let mut seeded = Vec::new();
+                                    for tok in spec.split(',').filter(|t| !t.trim().is_empty()) {
+                                        match tok.trim().parse::<usize>() {
+                                            Ok(n) if n > 0 => {
+                                                match Tensor::zeros(n, candle_core::DType::U8, &dev)
+                                                {
+                                                    // Dropping it immediately is the
+                                                    // whole mechanism: the buffer
+                                                    // returns to the cache's `free`
+                                                    // list at exactly `n` bytes.
+                                                    Ok(t) => {
+                                                        drop(t);
+                                                        seeded.push(n);
+                                                    }
+                                                    Err(e) => tracing::warn!(
+                                                        "ARC prewarm: could not seed {n} bytes: {e}"
+                                                    ),
+                                                }
+                                            }
+                                            _ => tracing::warn!(
+                                                "ARC prewarm: ignoring unparseable size {tok:?}"
+                                            ),
+                                        }
+                                    }
+                                    tracing::info!(
+                                        "ARC prewarm: seeded alloc cache with sizes {seeded:?} \
+                                         (PROBE — not a fix; the buffer still allocates per step)"
+                                    );
+                                }
                                 // CAPTURE: frees are deferred so every allocation
                                 // is a stable cache hit (no within-capture
                                 // aliasing, no unstable graph memory nodes).
