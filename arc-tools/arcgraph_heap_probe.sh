@@ -90,15 +90,25 @@ CTL_ON=$(MALLOC_CHECK_=3 MALLOC_PERTURB_=170 GLIBC_TUNABLES=glibc.malloc.check=3
 say "control WITHOUT tunables: $(echo "$CTL_OFF" | tr '\n' ' ')"
 say "control WITH    tunables: $(echo "$CTL_ON" | tr '\n' ' ')"
 
+# 🔴 The first version of this check grepped CTL_ON for "abort" — and the
+# control's own success sentinel is the literal string "NO_ABORT", so it matched
+# its own all-clear and declared the tunables working when both runs had printed
+# NO_ABORT rc=0. The guard against a false clean produced a false clean, by
+# substring. Detect the SENTINEL exactly, and require the two runs to DIFFER —
+# engagement is a behavioural difference, not the presence of a word.
+CTL_OFF_SENTINEL=$(printf '%s' "$CTL_OFF" | grep -c '^NO_ABORT$')
+CTL_ON_SENTINEL=$(printf '%s' "$CTL_ON" | grep -c '^NO_ABORT$')
 TUNABLES_ENGAGED=0
-if echo "$CTL_ON" | grep -qiE "corrupt|invalid|abort|free\(\)|malloc\(\)"; then
+if [ "$CTL_ON_SENTINEL" = "0" ] && [ "$CTL_OFF_SENTINEL" != "0" ]; then
     TUNABLES_ENGAGED=1
-    say "✅ tunables ENGAGE on this glibc (control aborted with a diagnostic)"
-elif [ "$(echo "$CTL_ON" | grep -c NO_ABORT)" = "0" ]; then
-    TUNABLES_ENGAGED=1
-    say "✅ tunables ENGAGE (control died without reaching its NO_ABORT print)"
+    say "✅ tunables ENGAGE: control reached NO_ABORT without them and did NOT with them"
+elif [ "$CTL_ON_SENTINEL" = "0" ] && [ "$CTL_OFF_SENTINEL" = "0" ]; then
+    say "⚠️ control aborted in BOTH configurations — glibc catches this overflow"
+    say "   unconditionally, so it cannot discriminate. Tunable engagement UNPROVEN."
 else
-    say "⚠️ tunables DO NOT ENGAGE on this glibc — the control completed normally."
+    say "⚠️ tunables DO NOT ENGAGE: the control printed NO_ABORT with them set."
+    say "   (MALLOC_CHECK_ is a no-op on glibc builds without malloc-check compiled in;"
+    say "   GLIBC_TUNABLES=glibc.malloc.check needs the same support.)"
     say "   Every heap result below is therefore UNPROVEN, not clean."
 fi
 
@@ -114,6 +124,11 @@ run_leg() { # $1 = name, $2 = extra env
     before=$(dmesg_count)
     step "leg $name"
     say "  env: $extra"
+    # The chat-template path is relative to the repo. cwd here is wherever the
+    # script was launched (/root), so BOTH legs died at startup with
+    # "Loading chat template failed: NotFound" and the verdict below still
+    # printed 0 diagnostics for each — a vacuous zero that read as "clean".
+    cd "$REPO" || { say "  cannot enter $REPO"; return 1; }
     # shellcheck disable=SC2086
     env $extra MALLOC_CHECK_=3 MALLOC_PERTURB_=170 GLIBC_TUNABLES=glibc.malloc.check=3 \
         "$BIN" serve -p "$PORT" -m "$SRC" -a deepseekv4 --from-uqff "$UQFF" \
@@ -142,6 +157,7 @@ run_leg() { # $1 = name, $2 = extra env
     local ntok
     ntok=$(python3 -c "import json;print(json.load(open('$LOGDIR/$name.response.json')).get('usage',{}).get('completion_tokens',0))" 2>/dev/null || echo 0)
     say "  completion_tokens=$ntok"
+    echo "${ntok:-0}" > "$LOGDIR/$name.tokens"
 
     # Did the process survive its own request?
     if kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -183,7 +199,22 @@ if [ "$TUNABLES_ENGAGED" != "1" ]; then
     say "⚠️ MALLOC tunables did not engage; treat the heap findings as UNPROVEN."
 fi
 say "Q1 SCOPE — does the corruption need capture?"
-say "  graphs_off glibc diagnostics: $(grep -ciE 'malloc_consolidate|free\(\):|malloc\(\):|corrupted|double free' "$LOGDIR/graphs_off.server.log" 2>/dev/null || echo 'n/a')"
-say "  graphs_on  glibc diagnostics: $(grep -ciE 'malloc_consolidate|free\(\):|malloc\(\):|corrupted|double free' "$LOGDIR/graphs_on.server.log" 2>/dev/null || echo 'n/a')"
+# A leg that never served a token has zero diagnostics for reasons that have
+# nothing to do with the heap. Report UNPROVEN, never 0.
+verdict_for() {
+    local name="$1" f="$LOGDIR/$1.server.log"
+    if [ ! -s "$f" ]; then echo "UNPROVEN (no log)"; return; fi
+    if ! grep -q "Loading model" "$f" 2>/dev/null && ! grep -q "Model loaded" "$f" 2>/dev/null; then
+        echo "UNPROVEN (server never loaded)"; return
+    fi
+    if [ "$(cat "$LOGDIR/$name.tokens" 2>/dev/null || echo 0)" = "0" ]; then
+        echo "UNPROVEN (leg served 0 tokens)"; return
+    fi
+    local n
+    n=$(grep -ciE 'malloc_consolidate|free\(\):|malloc\(\):|corrupted|double free' "$f" 2>/dev/null)
+    echo "${n:-0} glibc diagnostic(s) over $(cat "$LOGDIR/$name.tokens") tokens"
+}
+say "  graphs_off: $(verdict_for graphs_off)"
+say "  graphs_on : $(verdict_for graphs_on)"
 say "REMINDER: these are where corruption BECAME VISIBLE, never where it happened."
 say "RESULT: COMPLETE"
