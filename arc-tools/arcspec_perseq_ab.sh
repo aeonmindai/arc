@@ -99,18 +99,58 @@ say "ArcSpec per-sequence KV advance A/B — start"
 #       that works on every filesystem here (no flock(1) dependency).  The lock
 #       records who holds it and since when, so a stale one is diagnosable
 #       rather than mysterious.
+OWNER="arcspec"
+release_lock() {
+  if [ -f "$LOCK" ] && grep -q "^$OWNER pid=$$ " "$LOCK" 2>/dev/null; then
+    rm -f "$LOCK"
+  fi
+}
+# Is the current holder demonstrably gone? Owner-matched release is safe but
+# CANNOT self-heal: a lock whose owner died — or one created empty, with no
+# owner tag at all — is unremovable by every well-behaved participant and
+# deadlocks the box forever. That happened tonight: a size-0 lock appeared,
+# its presumed owner was dead, the H200 sat at 0% for six minutes, and the run
+# waiting on it would have aborted after 40 minutes without ever measuring.
+#
+# So reclaim, but only on EVIDENCE, and only after a grace period so a lock
+# caught mid-write is never stolen:
+#   * older than STALE_AFTER, AND
+#   * empty (no owner claim at all) or its named pid is dead, AND
+#   * the GPU is genuinely idle — no memory in use and no compute processes.
+# All three, because any one alone has a false positive.
+STALE_AFTER="${STALE_AFTER:-120}"
+lock_is_stale() {
+  [ -f "$LOCK" ] || return 1
+  local age holder pid used procs
+  age=$(( $(date +%s) - $(stat -c %Y "$LOCK" 2>/dev/null || echo 0) ))
+  [ "$age" -ge "$STALE_AFTER" ] || return 1
+  holder=$(cat "$LOCK" 2>/dev/null)
+  pid=$(printf '%s' "$holder" | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
+  if [ -n "$holder" ] && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    return 1                       # a live owner: not stale, full stop
+  fi
+  used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1)
+  procs=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | wc -l)
+  [ "${used:-1}" -lt 1024 ] && [ "${procs:-1}" -eq 0 ]
+}
 acquire_lock() {
   local waited=0
   while :; do
-    if ( set -o noclobber; echo "arcspec pid=$$ since=$(date -u +%FT%TZ)" > "$LOCK" ) 2>/dev/null; then
-      trap 'rm -f "$LOCK"' EXIT INT TERM
+    if ( set -o noclobber; echo "$OWNER pid=$$ started=$(date -u +%FT%TZ)" > "$LOCK" ) 2>/dev/null; then
+      trap 'release_lock' EXIT INT TERM
       say "lock: acquired $LOCK"
       return 0
+    fi
+    if lock_is_stale; then
+      say "lock: RECLAIMING stale lock (age>=${STALE_AFTER}s, owner absent or dead, GPU idle): '$(cat "$LOCK" 2>/dev/null)'"
+      rm -f "$LOCK"
+      continue
     fi
     if [ "$waited" -ge "$LOCK_WAIT" ]; then
       say "lock: HELD BY -> $(cat "$LOCK" 2>/dev/null)"
       return 1
     fi
+    [ "$waited" = 0 ] && say "lock: waiting for -> $(cat "$LOCK" 2>/dev/null)"
     sleep 15; waited=$((waited + 15))
   done
 }
