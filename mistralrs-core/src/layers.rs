@@ -2265,9 +2265,126 @@ std::thread_local! {
 }
 
 /// Set GPU positions for graph-mode RoPE. Call before graph-captured forward pass.
+///
+/// ⚠️ Handing a FRESH tensor here is only safe before capture. See
+/// [`set_graph_mode_positions_in_place`] for the replay-safe form and why the
+/// difference matters.
 #[cfg(feature = "cuda")]
 pub fn set_graph_mode_positions(positions: Option<Tensor>) {
     GRAPH_MODE_POSITIONS.with(|p| *p.borrow_mut() = positions);
+}
+
+/// RUN-161 step 2b — write the decode positions into a buffer at a **stable
+/// device address**, allocating it only on first use, and return it.
+///
+/// # Why a fixed address is the whole point
+///
+/// `cuStreamBeginCapture` records the device pointers the kernels are launched
+/// with. Whatever address the positions tensor had *at capture time* is baked
+/// into the graph. The previous call pattern —
+/// `set_graph_mode_positions(Some(Tensor::from_vec(..)))` — allocated a **new**
+/// tensor every decode step, so on replay the graph read the address of a
+/// tensor that had already been dropped: at best stale positions, at worst a
+/// freed buffer. That is exactly why `normal.rs` discarded the replayed logits
+/// and ran an eager forward for the real ones, and therefore why no token Arc
+/// has ever emitted came from a graph replay.
+///
+/// Writing in place keeps the address the graph baked in valid and current, so
+/// a replay reads *this* step's positions. `Tensor::slice_set` writes into the
+/// destination's existing storage (`candle-core/src/tensor_cat.rs:246`), which
+/// is what makes this an update rather than a reallocation.
+///
+/// The staging `from_vec` is still a fresh allocation, but a constant-size one:
+/// the alloc cache serves it from the warm pool, and it is the *source*, so it
+/// is never an address the graph depends on.
+#[cfg(feature = "cuda")]
+pub fn set_graph_mode_positions_in_place(
+    values: &[u32],
+    device: &candle_core::Device,
+) -> candle_core::Result<Tensor> {
+    GRAPH_MODE_POSITIONS.with(|p| {
+        let mut slot = p.borrow_mut();
+        // Reallocate only when the shape or device actually changes — a
+        // reallocation invalidates any graph already captured against it, so it
+        // must be rare and deliberate, not per-step.
+        let reuse = match slot.as_ref() {
+            Some(t) => {
+                t.dims() == [values.len()]
+                    && t.dtype() == candle_core::DType::U32
+                    && t.device().same_device(device)
+            }
+            None => false,
+        };
+        if !reuse {
+            *slot = Some(Tensor::zeros(
+                values.len(),
+                candle_core::DType::U32,
+                device,
+            )?);
+        }
+        let buf = slot
+            .as_ref()
+            .expect("graph-mode positions buffer was just ensured");
+        let src = Tensor::from_vec(values.to_vec(), values.len(), device)?;
+        buf.slice_set(&src, 0, 0)?;
+        Ok(buf.clone())
+    })
+}
+
+/// Non-cuda stub.
+#[cfg(not(feature = "cuda"))]
+pub fn set_graph_mode_positions_in_place(
+    _values: &[u32],
+    _device: &candle_core::Device,
+) -> candle_core::Result<Tensor> {
+    candle_core::bail!("graph-mode positions require the cuda feature")
+}
+
+/// RUN-161 step 2b — the token IDs half of the static input set.
+#[cfg(feature = "cuda")]
+std::thread_local! {
+    static GRAPH_MODE_INPUT_IDS: std::cell::RefCell<Option<Tensor>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Copy `input_ids` into a buffer at a **stable device address** and return it.
+///
+/// Same reasoning as [`set_graph_mode_positions_in_place`]: the captured graph
+/// bakes the pointer it was launched with, so every decode step must present
+/// the token IDs at the *same* address or a replay reads a dropped tensor.
+/// Positions alone are not enough — a replay that reads this step's positions
+/// and last step's token IDs is still wrong, just less obviously.
+///
+/// The copy is device-to-device (`input_ids` is already on the GPU), so this
+/// adds no host sync — unlike the `Tensor::from_vec` in the positions path,
+/// which has to cross from the host.
+#[cfg(feature = "cuda")]
+pub fn set_graph_mode_input_ids_in_place(input_ids: &Tensor) -> candle_core::Result<Tensor> {
+    let src = input_ids.contiguous()?;
+    GRAPH_MODE_INPUT_IDS.with(|p| {
+        let mut slot = p.borrow_mut();
+        let reuse = match slot.as_ref() {
+            Some(t) => {
+                t.dims() == src.dims()
+                    && t.dtype() == src.dtype()
+                    && t.device().same_device(src.device())
+            }
+            None => false,
+        };
+        if !reuse {
+            *slot = Some(Tensor::zeros(src.dims(), src.dtype(), src.device())?);
+        }
+        let buf = slot
+            .as_ref()
+            .expect("graph-mode input-ids buffer was just ensured");
+        buf.slice_set(&src, 0, 0)?;
+        Ok(buf.clone())
+    })
+}
+
+/// Non-cuda stub.
+#[cfg(not(feature = "cuda"))]
+pub fn set_graph_mode_input_ids_in_place(_input_ids: &Tensor) -> candle_core::Result<Tensor> {
+    candle_core::bail!("graph-mode input ids require the cuda feature")
 }
 
 /// Thread-local additive length mask for graph-mode fixed-capacity attention:

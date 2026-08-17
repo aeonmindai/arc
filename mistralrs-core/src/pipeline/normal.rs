@@ -1633,6 +1633,12 @@ impl Pipeline for NormalPipeline {
                 #[cfg(feature = "cuda")]
                 {
                     let probe = std::env::var_os("ARC_V4_CAPTURE_PROBE").is_some();
+                    // Shadowed (cuda-only) so step 2b can swap in the
+                    // address-stable buffer without making the outer
+                    // destructuring binding `mut`, which would warn on every
+                    // non-cuda build. Tensor::clone is an Arc bump.
+                    #[allow(unused_mut)]
+                    let mut input_ids = input_ids.clone();
                     let (bs, seq_len) = input_ids.dims2().unwrap_or((0, 0));
                     if !probe {
                         // The only CUDA-graph path structurally reachable from
@@ -1656,18 +1662,41 @@ impl Pipeline for NormalPipeline {
                         if let candle_core::Device::Cuda(cd) = self.device() {
                             cd.set_alloc_cache_enabled(true);
                         }
-                        // Set the graph-mode device position: drives RoPE +
-                        // the fixed-capacity KV write slot, and makes warmup
-                        // forwards take the shape-constant path so the cache
-                        // populates with capture-shape buffers. Fresh tensor
-                        // per step (eager, before capture) is fine for the
-                        // single-launch capture; replay needs a static buffer.
+                        // RUN-161 step 2b. Set the graph-mode device position:
+                        // drives RoPE + the fixed-capacity KV write slot, and
+                        // makes warmup forwards take the shape-constant path so
+                        // the cache populates with capture-shape buffers.
+                        //
+                        // This used to allocate a FRESH tensor every step, which
+                        // is fine up to and including the single-launch capture
+                        // and wrong for every replay after it: capture bakes the
+                        // device pointer, so a replay read an address whose
+                        // tensor had already been dropped. Writing in place keeps
+                        // the baked address valid and current.
                         let pos = seqlen_offsets.first().copied().unwrap_or(0) as u32;
                         let nb = bs.max(1);
                         let dev_for_pos = self.device();
-                        if let Ok(pt) = Tensor::from_vec(vec![pos; nb], (nb,), &dev_for_pos)
-                        {
-                            crate::layers::set_graph_mode_positions(Some(pt));
+                        // The token IDs must be address-stable for the same
+                        // reason. A replay reading this step's positions but
+                        // last step's ids is still wrong, just less visibly.
+                        match crate::layers::set_graph_mode_input_ids_in_place(&input_ids) {
+                            Ok(stable) => input_ids = stable,
+                            Err(e) => tracing::warn!(
+                                "ARC capture: could not stage input_ids at a stable address: {e}"
+                            ),
+                        }
+                        if let Err(e) = crate::layers::set_graph_mode_positions_in_place(
+                            &vec![pos; nb],
+                            &dev_for_pos,
+                        ) {
+                            tracing::warn!(
+                                "ARC capture: could not update graph-mode positions in place: {e}; \
+                                 replay would read stale positions, so capture is disabled for \
+                                 this run"
+                            );
+                            if let Some(r) = self.cuda_graph_runner.as_mut() {
+                                r.disable();
+                            }
                         }
                     }
                     let captured: Option<Tensor> =
