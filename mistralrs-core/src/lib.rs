@@ -174,7 +174,9 @@ pub use response::*;
 pub use sampler::{
     CustomLogitsProcessor, DrySamplingParams, SamplingParams, StopTokens, TopLogprob,
 };
-pub use scheduler::{DefaultSchedulerMethod, SchedulerConfig};
+pub use scheduler::{
+    sched_bucket_marker, sched_buckets, DefaultSchedulerMethod, SchedBuckets, SchedulerConfig,
+};
 pub use search::{SearchCallback, SearchFunctionParameters, SearchResult};
 use serde::Serialize;
 pub use speech_models::{utils as speech_utils, SpeechGenerationConfig, SpeechLoaderType};
