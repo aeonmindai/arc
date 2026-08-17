@@ -233,7 +233,7 @@ engine's PagedAttention arm (wave29-BC §4b). Both hold.
 
 ---
 
-### 5c-bis. The "three separate bails" are one cause seen three times, plus one the flag cannot fix
+### 5f. The "three separate bails" are one cause seen twice, plus one the flag cannot fix
 
 The profiler reported bails at `normal.rs:1554`, `normal.rs:1844`, and
 `pipeline/mod.rs:1088`. Reading them:
@@ -249,9 +249,9 @@ and the third is an unrelated, separately env-gated probe that the flag makes
 *worse*: `ARC_V4_CAPTURE_PROBE` drives `has_graph_mode_positions()`, and §5a
 shows the arm it feeds is shadowed once `paged_attn` is `Some`.
 
-### 5f. 🔴 THE LANDMINE — the flag makes `try_dedicated_decode` *reachable*, and it computes the wrong model
+### 5g. 🔴 THE LANDMINE — the flag makes `try_dedicated_decode` *reachable*, and it computes the wrong model
 
-This one cuts the other way from §5a–§5e and is the most important thing in this
+This one cuts the other way from §5a–§5f and is the most important thing in this
 document. `graph_wrapped_forward` (`pipeline/mod.rs:627-644`) tries the
 **DedicatedDecodePath** — the per-token Candle bypass the rental script calls
 *"the ACTIVE CUDA-graph decode path"* — before falling through to
@@ -358,9 +358,18 @@ about the mechanism.
 
 ## 8. HARDWARE
 
-**Box:** Runcrate `arc-w53-paged`, **A100 80GB PCIe**, 28 cores, 700 GB
-`/ephemeral`, **$1.49/hr**. Self-destruct armed (`sleep 10800; shutdown -h now`,
-`ARMED` confirmed) before any build, per the standing rule.
+**Box:** Runcrate `arc-w53-paged`, **A100 80GB PCIe** (81,920 MiB), 28 cores,
+700 GB `/ephemeral`, CUDA 12.8, **$1.49/hr**. Self-destruct armed
+(`sleep 10800; shutdown -h now`, `ARMED` confirmed) before any build, per the
+standing rule.
+
+**Timings (box clock, UTC 2026-08-17).** `runcrate instances create` → `running`
+≈ 20 min (slowest single step of the session). Script start 00:06 → toolchain
+00:07:07 → clone 00:07:57 → **`cargo build --release -p mistralrs-cli
+--features "cuda flash-attn"` finished in 11 m 05 s** (00:19:03), with the two
+downloads running alongside it and finishing first (**UQFF 74 GB in 6 m 21 s,
+source 160 GB in 8 m 26 s**, `UQFF_EXIT=0` / `SRC_EXIT=0`, no `hf_transfer`).
+Artifact gate passed: `uqff shards=8`, `residual=1293806700 B`, `src shards=46`.
 
 **Method:** one unattended script (`w53_probe.sh`, in this directory), polled by
 one on-box log read every 5 min. Both runs: `--max-seqs 1`, `--prefix-cache-n 0`,
