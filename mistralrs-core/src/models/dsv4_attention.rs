@@ -1417,6 +1417,10 @@ mod tests {
             compress_ratio: CompressRatio::Csa,
             sliding_window: window,
             raw_prefix: 0,
+            // Uniform batch: this fixture predates `row_q0` and builds every
+            // row at the same length, so `None` is the identity that preserves
+            // exactly what it asserted before the field existed.
+            row_q0: None,
         };
         let with_comp = dsv4_attention(&q, &k, &v, Some(&comp), None, &flash, &sdpa, cfg)?;
         let without_comp = dsv4_attention(&q, &k, &v, None, None, &flash, &sdpa, cfg)?;
