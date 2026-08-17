@@ -329,26 +329,48 @@ run_leg baseline || say "leg baseline did not complete"
 # warmup is the fix; a floor that will not move means it is not.
 CAPTURE_COMBOS="${CAPTURE_COMBOS:-4:1 8:3 16:6}"
 CAPTURE_WON=0
+LEGS_HEALTHY=0
 for combo in $CAPTURE_COMBOS; do
     w="${combo%%:*}"; d="${combo##*:}"
     say "--- capture attempt: ARC_GRAPH_WARMUP=$w ARC_GRAPH_DEFERRED_PASSES=$d ---"
     LEG_ENV="ARC_CAPTURE_STREAM=1 ARC_V4_CAPTURE_PROBE=1 ARC_CANDLE_ALLOC_CACHE=1 \
 ARC_GRAPH_WARMUP=$w ARC_GRAPH_DEFERRED_PASSES=$d \
 ARC_PROFILE=1 ARC_PROFILE_STEPS=12 ARC_PROFILE_OUT=$LOGDIR/profile ARC_PROFILE_LABEL=arcgraph_w${w}d${d}"
-    run_leg "capture_w${w}d${d}" || say "leg capture_w${w}d${d} did not complete"
+    if ! run_leg "capture_w${w}d${d}"; then
+        say "leg capture_w${w}d${d} did NOT complete — no verdict from this combo"
+        continue
+    fi
+    LEGS_HEALTHY=$((LEGS_HEALTHY + 1))
     slog="$LOGDIR/capture_w${w}d${d}.server.log"
     # Count ONLY misses after capture began. Misses during the deferred passes
     # are the passes doing their job — the candle warning does not distinguish
     # them, because `capturing` is set for both.
     misses=$(awk '/capture started for batch_size/{f=1} f && /MISS during capture/' "$slog" 2>/dev/null | wc -l | tr -d ' ')
-    launched=$(grep -c "captured + launched" "$slog" 2>/dev/null || echo 0)
+    # 🔴 `grep -c` prints "0" AND exits 1 when there are no matches, so the
+    # old `|| echo 0` appended a SECOND zero: `launched` became "0\n0", and the
+    # string test `[ "$launched" != "0" ]` was true. The sweep announced
+    # "CAPTURE SUCCEEDED" for a run in which nothing launched and no leg was
+    # even healthy. That is the exact failure this whole branch exists to
+    # remove — a success message asserted rather than measured — reintroduced
+    # in the harness that was supposed to check for it. Numeric comparison, no
+    # `|| echo`, and success additionally requires a healthy leg.
+    launched=$(grep -c "captured + launched" "$slog" 2>/dev/null)
+    launched=${launched:-0}
     say "RESULT w=$w d=$d: capture-time alloc misses=$misses, graphs launched=$launched"
-    if [ "${launched:-0}" != "0" ]; then
+    if [ "$launched" -ge 1 ] 2>/dev/null; then
         say "CAPTURE SUCCEEDED at w=$w d=$d — stopping the sweep"
         CAPTURE_WON=1
         break
     fi
 done
+if [ "$LEGS_HEALTHY" = "0" ]; then
+    # Nothing ran. Emitting "COMPLETE" with empty extraction sections would be
+    # a result-shaped hole — the reader sees headings and no numbers and has to
+    # infer failure. Say it outright.
+    say "NO CAPTURE LEG EVER BECAME HEALTHY — there is nothing to extract."
+    say "RESULT: UNANSWERED"
+    exit 2
+fi
 [ "$CAPTURE_WON" = "1" ] || say "NO COMBO IN [$CAPTURE_COMBOS] PRODUCED A LAUNCHABLE GRAPH"
 
 # --------------------------------------------------------------------------

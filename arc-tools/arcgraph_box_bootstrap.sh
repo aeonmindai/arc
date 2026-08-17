@@ -156,12 +156,14 @@ dl() { # $1 repo, $2 dest, $3 tag, $4.. extra args
     fi
 }
 
-# The source repo supplies config + tokenizer + chat template; `--from-uqff`
-# supplies every weight. The safetensors are therefore dead weight (149 GB of
-# it) — excluded. If a future loader turns out to need them this fails loudly at
-# model load rather than silently, which is the right direction.
-if [ ! -f "$SRC/config.json" ]; then
-    dl deepseek-ai/DeepSeek-V4-Flash "$SRC" src --exclude "*.safetensors" &
+# MEASURED 2026-08-17: excluding *.safetensors does NOT work, even with
+# `--from-uqff`. The loader enumerates model files before it ever consults the
+# UQFF and dies with:
+#   Error: Expected file with extension one of .safetensors, .pth, .pt, .bin.
+# The 149 GB is not optional. (It failed loudly at model load rather than
+# silently mis-loading, which is the one good thing about the attempt.)
+if [ ! -f "$SRC/config.json" ] || ! ls "$SRC"/*.safetensors >/dev/null 2>&1; then
+    dl deepseek-ai/DeepSeek-V4-Flash "$SRC" src &
     DL_SRC=$!
 else
     echo OK > "$LOGDIR/dl.src.done"; DL_SRC=""
