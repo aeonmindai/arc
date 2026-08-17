@@ -45,7 +45,12 @@ say "BIN=$BIN mtime=$(date -u -r $BIN +%H:%M:%S)"
 say "ref=$(cd /root/wt-ladder 2>/dev/null && git log --oneline -1 || echo unknown)"
 
 leg(){ # $1 name, $2 extra env
-  local n=$1 extra=$2 log=$L/$n.server.log
+  # NOT `local n=$1 extra=$2 log=$L/$n.server.log` — bash expands $n while the
+  # `local` builtin is still processing its own arguments, so under `set -u`
+  # that is "n: unbound variable" and the script dies before the first arm.
+  local n=$1
+  local extra=$2
+  local log=$L/$n.server.log
   say "=== arm $n (${extra:-<flag unset>}) ==="
   cd /root/wt-ladder || return 1
   # shellcheck disable=SC2086
