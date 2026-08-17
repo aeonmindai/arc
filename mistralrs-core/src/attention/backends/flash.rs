@@ -44,10 +44,43 @@
 //!    uncapped logits — wrong numbers, no error. Softcap now routes to FA2 when
 //!    FA2 is available and refuses the flash path entirely when it is not.
 //!
-//! # Dispatch order
+//! # Dispatch order — FA2 first, and why FA3 is NOT preferred
 //!
-//! FA3 is preferred whenever it *can* serve the shape (it is the tuned Hopper
-//! path); otherwise FA2; otherwise the caller falls back to non-flash SDPA.
+//! FA3 would be the natural Hopper default. It is not the default here, because
+//! `candle-flash-attn-v3` at the revision this workspace pins
+//! (`aeonmindai/candle` @ `d2d1d07`, `Cargo.toml:48-49`) is **broken for causal
+//! attention on both of its paths**. Verified in the pinned source, and
+//! described upstream in <https://github.com/huggingface/candle/pull/3606>
+//! (open since 2026-06-11):
+//!
+//! * **Dense causal → illegal memory access.** The causal/local non-varlen path
+//!   selects `DynamicPersistentTileScheduler`, which does
+//!   `atomicAdd(params.tile_count_semaphore, 1)`
+//!   (`hkernel/flash_fwd_launch_template.h:120` threads
+//!   `params.tile_count_semaphore` into the scheduler args). The Rust binding
+//!   zeroes `Flash_fwd_params` and **never allocates that counter** — `grep -r
+//!   tile_count_semaphore candle-flash-attn-v3/src/` returns **0 hits** while
+//!   the headers reference it throughout. The pointer stays NULL and every
+//!   dense causal call performs an illegal global atomic. Upstream measured
+//!   9/9 causal tests failing on an H200.
+//! * **Varlen causal → silently non-causal.** The varlen path (and only it)
+//!   clamps the window up before `is_causal` is derived
+//!   (`candle-flash-attn-v3/src/lib.rs:591`: `if window_size_right <
+//!   self.max_seqlen_k as i32 { window_size_right = self.max_seqlen_k as i32 }`).
+//!   `causal = true` encodes as `window_size_right = Some(0)`, so the clamp
+//!   rewrites it to full attention. No error, no warning — just wrong numbers.
+//!   Upstream measured 9/9 causal varlen tests returning the non-causal result.
+//!
+//! Causal attention is essentially all autoregressive LLM attention, so until
+//! the pinned candle carries those fixes, **preferring FA3 would be a crash or a
+//! correctness regression, not a speedup.** FA2 therefore serves every shape it
+//! can, and FA3 is reached only when explicitly opted into with
+//! `ARC_PREFER_FA3=1` (for A/B testing once the fork is patched) or when it is
+//! the only backend compiled in.
+//!
+//! When the fixes land in `aeonmindai/candle`, flipping the default is a
+//! one-line change to [`fa3_preferred`] plus a benchmark.
+//!
 //! [`cuda_flash_attn_supported`] is what `Sdpa::run_attention` consults so that
 //! an out-of-envelope shape never enters the flash path at all — previously an
 //! unsupported `head_dim` reached the backend and turned into a hard `bail!`
@@ -74,6 +107,31 @@ const FA3_HEAD_DIMS: [usize; 3] = [64, 128, 256];
 /// Maximum head dim accepted by FlashAttention-2 (`candle-flash-attn`):
 /// `if head_size_og > 256 { bail!(..) }`.
 const FA2_MAX_HEAD_DIM: usize = 256;
+
+/// Opt-in switch for preferring FlashAttention-3 over FlashAttention-2 when
+/// both are compiled in.
+///
+/// Defaults to **false**: the pinned `candle-flash-attn-v3` crashes on dense
+/// causal attention (NULL `tile_count_semaphore`) and silently computes
+/// non-causal attention on the varlen causal path. See the module docs and
+/// <https://github.com/huggingface/candle/pull/3606>. Flip this default only
+/// once the fork carries those fixes *and* a benchmark says FA3 is faster here.
+/// Always compiled (not `#[cfg]`-gated) so the default stays unit-testable on a
+/// host with no CUDA toolchain; only the both-backends dispatcher calls it.
+#[cfg_attr(
+    not(all(feature = "flash-attn", feature = "flash-attn-v3")),
+    allow(dead_code)
+)]
+pub(crate) fn fa3_preferred() -> bool {
+    use std::sync::OnceLock;
+    static PREFERRED: OnceLock<bool> = OnceLock::new();
+    *PREFERRED.get_or_init(|| {
+        matches!(
+            std::env::var("ARC_PREFER_FA3").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
 
 /// Would FlashAttention-2 accept this shape?
 ///
@@ -288,7 +346,10 @@ fn flash_attn_v3(
 // Dispatcher — one definition per feature combination
 // ---------------------------------------------------------------------------
 
-/// Both backends available: prefer FA3 where it is valid, else FA2.
+/// Both backends available.
+///
+/// FA2 serves everything unless FA3 is explicitly opted into — see the module
+/// docs for why FA3 is not the default despite Hopper being its target.
 #[cfg(all(feature = "flash-attn", feature = "flash-attn-v3"))]
 pub(crate) fn flash_attn(
     q: &Tensor,
@@ -298,7 +359,7 @@ pub(crate) fn flash_attn(
     sdpa_params: &SdpaParams,
 ) -> Result<Tensor> {
     let head_dim = q.dim(candle_core::D::Minus1)?;
-    if fa3_accepts(head_dim, sdpa_params.softcap) {
+    if fa3_preferred() && fa3_accepts(head_dim, sdpa_params.softcap) {
         flash_attn_v3(q, k, v, flash_params, sdpa_params)
     } else {
         flash_attn_v2(q, k, v, flash_params, sdpa_params)
@@ -328,6 +389,23 @@ pub(crate) fn flash_attn(
     flash_params: Option<&crate::pipeline::text_models_inputs_processor::FlashParams>,
     sdpa_params: &SdpaParams,
 ) -> Result<Tensor> {
+    // FA3 is the only backend here, so there is nothing to fall back to. Warn
+    // once about the known causal defects rather than degrading silently — a
+    // build that enables `flash-attn-v3` alone has asked for exactly this.
+    {
+        use std::sync::Once;
+        static WARNED: Once = Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "Built with `flash-attn-v3` only. The pinned candle-flash-attn-v3 \
+                 crashes on dense causal attention (unallocated tile_count_semaphore) \
+                 and silently computes NON-causal attention on the varlen causal path \
+                 (huggingface/candle#3606). Add `--features flash-attn` so causal \
+                 shapes fall back to FlashAttention-2."
+            );
+        });
+    }
+
     let head_dim = q.dim(candle_core::D::Minus1)?;
     if !fa3_accepts(head_dim, sdpa_params.softcap) {
         candle_core::bail!(
@@ -410,6 +488,23 @@ mod tests {
         assert!(!cuda_flash_attn_supported(128, 64, 64, None));
         // DeepSeek-V4's shape, for the record: symmetric, but far past the cap.
         assert!(!cuda_flash_attn_supported(512, 512, 512, None));
+    }
+
+    /// FA3 must not be preferred by default: the pinned `candle-flash-attn-v3`
+    /// crashes on dense causal attention and silently drops causality on the
+    /// varlen path (huggingface/candle#3606). This test is the tripwire — if it
+    /// starts failing, someone flipped the default, and that is only correct
+    /// once the candle fork carries the fixes.
+    #[test]
+    fn fa3_is_not_preferred_by_default() {
+        // Guard against a stray env var in the test environment making this
+        // vacuous: only assert the default when the opt-in is absent.
+        if std::env::var_os("ARC_PREFER_FA3").is_none() {
+            assert!(
+                !fa3_preferred(),
+                "FA3 must stay opt-in while candle#3606 is unfixed in the pinned fork"
+            );
+        }
     }
 
     /// The build-level predicate must agree with whichever backends are actually
