@@ -1028,6 +1028,76 @@ pub(crate) fn set_ragged_lead_pad(lead_pad: Option<Vec<usize>>) {
     RAGGED_LEAD_PAD.with(|r| *r.borrow_mut() = lead_pad);
 }
 
+thread_local! {
+    /// `seq id -> the dead prefix its per-sequence cache still carries`.
+    ///
+    /// 🔑 This is what makes the strip LAZY. `clone_out_cache` runs on every
+    /// decode token, but the per-sequence caches it writes are only ever READ
+    /// again when batch membership changes (`engine/mod.rs`: `pre_op` is `In`
+    /// only when `last_completion_ids != current_completion_ids`) — in between,
+    /// the forward runs off the batched cache the pipeline still holds. So
+    /// dropping each row's dead prefix on every step was doing
+    /// `O(B x layers x 2)` device copies per token for data nobody looks at
+    /// (~2,200 copies/token at B=47).
+    ///
+    /// Instead `clone_out_cache` records the prefix here — no tensor work — and
+    /// `clone_in_cache` pays for it once, on the membership change that
+    /// actually re-reads those caches.
+    static PENDING_LEAD_PAD: std::cell::RefCell<std::collections::HashMap<usize, usize>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn record_pending_lead_pad(seq_id: usize, lead: usize) {
+    PENDING_LEAD_PAD.with(|m| {
+        let mut m = m.borrow_mut();
+        if lead == 0 {
+            m.remove(&seq_id);
+        } else {
+            m.insert(seq_id, lead);
+        }
+    });
+}
+
+fn take_pending_lead_pad(seq_id: usize) -> usize {
+    PENDING_LEAD_PAD.with(|m| m.borrow_mut().remove(&seq_id).unwrap_or(0))
+}
+
+/// Drop a stale dead prefix from one sequence's own cache, re-anchoring its live
+/// run at column 0 the way `SingleCache` requires.
+///
+/// Called from `clone_in_cache` for each sequence that carries one, i.e. once
+/// per membership change rather than once per token.
+fn strip_pending_lead_pad(
+    seq: &mut crate::sequence::Sequence,
+    modify_draft_cache: bool,
+) -> Result<()> {
+    let seq_id = *seq.id();
+    let lead = take_pending_lead_pad(seq_id);
+    if lead == 0 {
+        return Ok(());
+    }
+    let cache = if modify_draft_cache {
+        seq.normal_draft_cache()
+    } else {
+        seq.normal_cache()
+    };
+    for slot in cache.iter_mut().flatten() {
+        if let KvCache::Normal { k, v } = slot {
+            for sc in [k, v] {
+                let Some(ad) = sc.all_data.as_ref() else {
+                    continue;
+                };
+                let keep = sc.current_seq_len.saturating_sub(lead);
+                let kept = ad.narrow(sc.dim, lead, keep)?.contiguous()?;
+                sc.all_data = Some(kept);
+                sc.current_seq_len = keep;
+                sc.capacity_seq_len = keep;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The current cohort's per-row dead prefix, if it is ragged.
 pub(crate) fn ragged_lead_pad() -> Option<Vec<usize>> {
     RAGGED_LEAD_PAD.with(|r| r.borrow().clone())
@@ -1346,6 +1416,15 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
         //     right now, without mutating anything if the answer is no".
         // The capability is pinned directly by
         // `the_capability_predicate_is_what_the_scheduler_reads`.
+        // Pay the deferred strip now, once, on the membership change that is
+        // about to re-read these caches. Until this runs, a row that was part of
+        // a front-aligned cohort still carries its dead prefix and reports a
+        // length that includes it — so this must happen BEFORE any length is
+        // compared or any alignment decided.
+        for seq in seqs.iter_mut() {
+            strip_pending_lead_pad(seq, modify_draft_cache)?;
+        }
+
         let can_be_ragged = batch_can_be_ragged(seqs, modify_draft_cache);
         set_ragged_decode_supported(can_be_ragged);
 
@@ -1633,8 +1712,14 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
         // including the compressor-history slots.
         let _prof = arc_profiler::span("clone_out_cache");
         // The cohort's dead prefix, if `clone_in_cache` front-aligned it. Read
-        // once rather than per layer per sequence.
+        // once rather than per layer per sequence, and recorded per sequence so
+        // the strip can be deferred to the next membership change.
         let ragged_lead = ragged_lead_pad();
+        if let Some(leads) = ragged_lead.as_ref() {
+            for (seq_i, seq) in seqs.iter().enumerate() {
+                record_pending_lead_pad(*seq.id(), leads[seq_i]);
+            }
+        }
         debug_assert!(
             ragged_lead.as_ref().is_none_or(|l| l.len() == seqs.len()),
             "ragged lead_pad must have one entry per sequence in the batch"
@@ -1708,35 +1793,30 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                         //
                         // `lead == 0` for every row of a uniform batch, which is
                         // the identity — no narrow, no copy, no behaviour change.
-                        let lead = ragged_lead.as_ref().map_or(0, |l| l[seq_i]);
-                        let (k, v, len, cap) = if lead == 0 {
-                            (k, v, cache_k.current_seq_len, cache_k.capacity_seq_len)
-                        } else {
-                            let keep = cache_k.current_seq_len.saturating_sub(lead);
-                            let k = k
-                                .narrow(cache_k.dim, lead, keep)
-                                .and_then(|t| t.contiguous())
-                                .expect("kv-cache: dropping a row's dead prefix (K)");
-                            let v = v
-                                .narrow(cache_v.dim, lead, keep)
-                                .and_then(|t| t.contiguous())
-                                .expect("kv-cache: dropping a row's dead prefix (V)");
-                            (k, v, keep, keep)
-                        };
+                        // The prefix is RECORDED, not dropped — see
+                        // `PENDING_LEAD_PAD`. This function runs on every
+                        // decode token, but what it writes is only re-read on a
+                        // membership change, so paying `O(B x layers x 2)`
+                        // device copies per token here was work for data nobody
+                        // looks at. `clone_in_cache` strips it once, when it
+                        // matters.
+                        //
+                        // `lead == 0` for every row of a uniform batch, so this
+                        // is the identity there and the map stays empty.
                         *seq_cache = Some(KvCache::Normal {
                             k: SingleCache {
                                 all_data: Some(k),
                                 dim: cache_k.dim,
-                                current_seq_len: len,
+                                current_seq_len: cache_k.current_seq_len,
                                 max_seq_len: cache_k.max_seq_len,
-                                capacity_seq_len: cap,
+                                capacity_seq_len: cache_k.capacity_seq_len,
                             },
                             v: SingleCache {
                                 all_data: Some(v),
                                 dim: cache_v.dim,
-                                current_seq_len: len,
+                                current_seq_len: cache_v.current_seq_len,
                                 max_seq_len: cache_v.max_seq_len,
-                                capacity_seq_len: cap,
+                                capacity_seq_len: cache_v.capacity_seq_len,
                             },
                         });
                     }
