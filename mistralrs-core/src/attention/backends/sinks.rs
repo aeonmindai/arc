@@ -78,6 +78,41 @@ fn sinks_attn_regular(
     let hd = q.dim(candle_core::D::Minus1)?;
     let flash_sinks_ok = matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256);
 
+    // Name the backend, once per process.
+    //
+    // WHY THIS LINE EXISTS. Expert parallelism was priced on the belief that
+    // building with NCCL silently disables flash attention for V4, via
+    // `attention/mod.rs`'s `use_nccl() => naive_sdpa` gate — which would make
+    // any EP=2-vs-EP=1 comparison a comparison of two different attention
+    // kernels, and the measurement worthless. Reading the dispatch says
+    // otherwise for V4: `sdpa_params.sinks` is `Some` (V4 loads `attn_sink`),
+    // so `Sdpa::run_attention` diverts here on its FIRST line and the
+    // `use_nccl()` gate — which lives in `run_attention_noflash` — is never
+    // reached. Flash was never reachable at head_dim 512 in any case
+    // (`FA2_MAX_HEAD_DIM` is 256; FA3 takes {64,128,256}; `flash_sinks_ok`
+    // above takes {64..256}).
+    //
+    // That is a code read. Before anyone spends $9.22/hr on a 2xH100 pair to
+    // measure EP, this turns it into an observation: the log says which path
+    // the model on the box actually took. Emitted once, off the hot path.
+    {
+        static NAMED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        NAMED.get_or_init(|| {
+            tracing::info!(
+                target: "arc_attention_backend",
+                "ARC_ATTN_BACKEND: sinks_attn head_dim={hd} flash_sinks_ok={flash_sinks_ok} \
+                 device={:?} => {} (the `use_nccl() => naive_sdpa` gate in \
+                 `run_attention_noflash` is NOT on this path)",
+                q.device().location(),
+                if flash_sinks_ok {
+                    "fused flash-sinks kernel"
+                } else {
+                    "unfused matmul + softmax_with_sinks"
+                },
+            );
+        });
+    }
+
     #[cfg(feature = "cuda")]
     if q.device().is_cuda() && flash_sinks_ok {
         return mistralrs_paged_attn::flash_attn_sinks(

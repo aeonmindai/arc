@@ -229,6 +229,32 @@ impl Sdpa {
         let k = repeat_kv(k.clone(), sdpa_params.n_kv_groups)?;
         let v = repeat_kv(v.clone(), sdpa_params.n_kv_groups)?;
 
+        // The other half of `ARC_ATTN_BACKEND` (see `backends/sinks.rs`). If a
+        // model reaches THIS gate, `use_nccl()` really can divert it onto
+        // `naive_sdpa` and an EP measurement taken against it would be
+        // comparing two attention kernels. For V4 this line must never appear —
+        // its `sinks` divert happens earlier — so its presence or absence is
+        // the assertion, not a comment claiming so.
+        {
+            static NAMED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            NAMED.get_or_init(|| {
+                tracing::info!(
+                    target: "arc_attention_backend",
+                    "ARC_ATTN_BACKEND: run_attention_noflash REACHED head_dim={head_dim} \
+                     use_nccl={} mask_rank2={} => {}",
+                    mistralrs_quant::distributed::use_nccl(),
+                    mask.is_some_and(|x| x.rank() == 2),
+                    if mask.is_some_and(|x| x.rank() == 2)
+                        || mistralrs_quant::distributed::use_nccl()
+                    {
+                        "naive_sdpa"
+                    } else {
+                        "cublaslt/naive dispatch below"
+                    },
+                );
+            });
+        }
+
         if mask.is_some_and(|x| x.rank() == 2) || mistralrs_quant::distributed::use_nccl() {
             return naive_sdpa(
                 &q.contiguous()?,
