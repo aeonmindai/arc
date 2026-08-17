@@ -13,6 +13,10 @@ pub mod encoder_cache;
 pub mod kv_cache_manager;
 pub(crate) mod layers;
 mod scheduler;
+/// Segment tables: a read primitive that is a list of runs, not one run.
+pub mod segment;
+/// Block allocation over segment tables (multi-region KV).
+pub mod segmented_allocator;
 pub const _PAD_SLOT_ID: i64 = -1;
 
 pub use cache_engine::{CacheConfig, CacheEngine, PagedCacheType};
