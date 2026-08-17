@@ -92,6 +92,64 @@ impl SingleCache {
     /// constant-offset narrow, so the attention shape is identical every decode
     /// step -> the caching allocator hits and the graph replays. Slots beyond
     /// the current length are stale/zero and must be masked by the caller.
+    /// Pre-grow the buffer to the capacity the cache can never exceed, once.
+    ///
+    /// Split out of [`Self::append_graph`] so the contract is testable on any
+    /// host: `append_graph` writes through `write_kv_inplace`, which is
+    /// CUDA-only, and a rule this load-bearing should not be verifiable only on
+    /// a rented GPU.
+    ///
+    /// The sizing used to be `read_capacity.max(capacity_seq_len)`, allocated
+    /// only when the buffer was absent. Both halves are wrong for capture: the
+    /// size TRACKED CACHE GROWTH, and an already-grown buffer was reused and
+    /// kept growing underneath the graph. Measured on an H200, that produced
+    /// allocations missing the warm pool *during capture* at 122880 / 172032 /
+    /// 262144 bytes for warmups of 4 / 8 / 16 — sizes that never repeat, so no
+    /// finite warmup pre-warms them, and each becomes an unstable graph memory
+    /// node. Candle calls that a correctness bug; the process died inside
+    /// `cuGraphInstantiate` with no Rust-level error.
+    ///
+    /// So remove the GROWTH rather than chase it with more warmup: allocate
+    /// once at a capacity the cache can never exceed, and the buffer's size and
+    /// address are fixed for the life of the run. Existing history is copied
+    /// forward, so it is lossless.
+    ///
+    /// Scope is deliberately narrow — `append_graph` is only reachable in graph
+    /// mode, which is opt-in behind three gates, so ordinary serving (which
+    /// uses `append`) keeps incremental growth and pays nothing.
+    fn pregrow_for_graph(&mut self, src: &Tensor, read_capacity: usize) -> Result<()> {
+        let need = self
+            .max_seq_len
+            .max(read_capacity)
+            .max(self.capacity_seq_len);
+        let must_grow = match self.all_data.as_ref() {
+            Some(ad) => ad.dim(self.dim)? < need,
+            None => true,
+        };
+        if !must_grow {
+            return Ok(());
+        }
+        let mut shape = src.dims().to_vec();
+        shape[self.dim] = need;
+        let grown = Tensor::zeros(shape, src.dtype(), src.device())?;
+        // Carry existing tokens across. `narrow` from offset 0 along the seq
+        // dim of a contiguous buffer is itself contiguous, which `slice_set`
+        // requires. Dropping them would silently lose context — a worse
+        // failure than the one being fixed.
+        if let Some(old) = self.all_data.as_ref() {
+            if self.current_seq_len > 0 {
+                let head = old.narrow(self.dim, 0, self.current_seq_len)?;
+                grown.slice_set(&head, self.dim, 0)?;
+            }
+        }
+        self.all_data = Some(grown);
+        // Keep the bookkeeping honest: `try_set_len` and the cache managers
+        // compare against `capacity_seq_len`, and a buffer bigger than the
+        // number it advertises is a trap for the next reader.
+        self.capacity_seq_len = need;
+        Ok(())
+    }
+
     pub fn append_graph(
         &mut self,
         src: &Tensor,
@@ -110,20 +168,12 @@ impl SingleCache {
                 "append_graph is decode-only (src seq len must be 1, got {seq_len})"
             );
         }
-        // Buffer must be at least `read_capacity` along the seq dim. Reuse the
-        // existing (eager-populated) all_data so past K/V is present; only
-        // allocate if absent.
         // Same preallocation correction `append` performs. Without it the
         // graph path inherits the engine's dense [B,H,cap,head_dim] buffer and
         // a 1-wide V4 marker cannot be written into it.
         self.reconcile_preallocation(src)?;
-        let need = read_capacity.max(self.capacity_seq_len);
-        if self.all_data.is_none() {
-            let mut shape = src.dims().to_vec();
-            shape[self.dim] = need;
-            let ad = Tensor::zeros(shape, src.dtype(), src.device())?;
-            self.all_data = Some(ad);
-        }
+
+        self.pregrow_for_graph(src, read_capacity)?;
         let ad = self.all_data.as_ref().unwrap();
         // Device-slot write of the new token; `write_kv_inplace` uses the
         // buffer's real capacity from all_data's dims, so the slot is correct.
@@ -418,6 +468,84 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("layout changed mid-sequence"), "{msg}");
         assert!(msg.contains('7'), "the message must name how many tokens are at risk: {msg}");
+        Ok(())
+    }
+
+    /// PRE-GROW: the graph buffer must be allocated at the capacity the cache
+    /// can never exceed, so its size is FIXED for the life of the run.
+    ///
+    /// The old code sized it `read_capacity.max(capacity_seq_len)`, which moved
+    /// with cache growth — measured on an H200 as capture-time allocation
+    /// misses of 122880 / 172032 / 262144 bytes at warmups of 4 / 8 / 16. Sizes
+    /// that never repeat cannot be pre-warmed by any amount of warmup, and each
+    /// is an unstable graph memory node.
+    ///
+    /// Mutation: restore `let need = read_capacity.max(self.capacity_seq_len)`
+    /// and the asserted capacity drops to 128, failing this test.
+    #[test]
+    fn append_graph_pregrows_to_final_capacity_not_current_growth() -> Result<()> {
+        let dev = Device::Cpu;
+        // max_seq_len 4096, currently grown to only 120.
+        let mut cache = SingleCache::new(2, 4096, 120);
+        let src = Tensor::zeros((1, 1, 1, 8), DType::F32, &dev)?;
+
+        // read_capacity is the fixed window the graph reads, far below max.
+        cache.pregrow_for_graph(&src, 128)?;
+
+        assert_eq!(
+            cache.all_data.as_ref().unwrap().dim(2)?,
+            4096,
+            "the buffer must be pre-grown to max_seq_len, not to read_capacity \
+             or to however far the cache happens to have grown"
+        );
+        assert_eq!(
+            cache.capacity_seq_len, 4096,
+            "capacity_seq_len must track the real buffer — a buffer bigger than \
+             the number it advertises is a trap for the next reader"
+        );
+        // Pre-growing must not disturb what the graph reads: the window is
+        // still `read_capacity` wide, taken from the front of the buffer.
+        let window = cache.all_data.as_ref().unwrap().narrow(2, 0, 128)?;
+        assert_eq!(window.dim(2)?, 128, "the graph must still read a fixed-width window");
+        Ok(())
+    }
+
+    /// Pre-growing must be LOSSLESS: a cache that already holds tokens keeps
+    /// them. Growing by reallocation and forgetting to copy would silently
+    /// drop context — a far worse failure than the one being fixed.
+    #[test]
+    fn pregrow_carries_existing_tokens_across() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut cache = SingleCache::new(2, 512, 4);
+        // Seed a small buffer holding two distinct tokens.
+        let seeded = Tensor::cat(
+            &[
+                Tensor::full(7f32, (1, 1, 1, 2), &dev)?,
+                Tensor::full(9f32, (1, 1, 1, 2), &dev)?,
+                Tensor::zeros((1, 1, 2, 2), DType::F32, &dev)?,
+            ],
+            2,
+        )?;
+        cache.all_data = Some(seeded);
+        cache.current_seq_len = 2;
+        cache.capacity_seq_len = 4;
+
+        let src = Tensor::zeros((1, 1, 1, 2), DType::F32, &dev)?;
+        cache.pregrow_for_graph(&src, 8)?;
+
+        assert_eq!(cache.all_data.as_ref().unwrap().dim(2)?, 512, "must pre-grow");
+        let kept = cache
+            .all_data
+            .as_ref()
+            .unwrap()
+            .narrow(2, 0, 2)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert_eq!(
+            kept,
+            vec![7.0, 7.0, 9.0, 9.0],
+            "pre-growing must carry existing tokens across, not zero them"
+        );
         Ok(())
     }
 }
