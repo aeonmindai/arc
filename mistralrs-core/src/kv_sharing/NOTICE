@@ -1,0 +1,57 @@
+Attribution for mistralrs-core/src/kv_sharing/
+=============================================
+
+This directory contains work derived from SGLang.
+
+    SGLang
+    Copyright 2023-2024 SGLang Team
+    Licensed under the Apache License, Version 2.0
+    https://github.com/sgl-project/sglang
+    Source consulted: python/sglang/srt/mem_cache/radix_cache.py
+                      python/sglang/srt/mem_cache/evict_policy.py
+    Revision:         c5251a98a9d499d600beb557835ac5874e0c3f36
+
+A copy of the Apache License, Version 2.0 may be obtained at
+http://www.apache.org/licenses/LICENSE-2.0
+
+
+What is derived, and how
+------------------------
+
+ADAPTED (algorithm reimplemented in Rust from the Python source; the control
+flow follows SGLang, the data structures and types do not):
+
+  radix.rs :: RadixTree::shared_len
+      <- radix_cache.py:147-176  (RadixKey.match)
+  radix.rs :: RadixTree::match_prefix_with
+      <- radix_cache.py:645-669  (RadixCache._match_prefix_helper)
+  radix.rs :: RadixTree::split_node
+      <- radix_cache.py:671-691  (RadixCache._split_node)
+  radix.rs :: RadixTree::insert
+      <- radix_cache.py:701-753  (RadixCache._insert_helper)
+  radix.rs :: RadixTree::evict_while
+      <- radix_cache.py:560-587  (RadixCache.evict)
+  radix.rs :: RadixTree::lock / unlock
+      <- radix_cache.py:589-623  (inc_lock_ref / dec_lock_ref)
+  radix.rs :: RadixTree::refresh_leaf_status
+      <- radix_cache.py:783-796  (RadixCache._update_leaf_status)
+  evict.rs :: LruScorer
+      <- evict_policy.py:16-18   (LRUStrategy)
+
+VERBATIM: none. No source file, function body, or contiguous block of code from
+SGLang was copied into this repository. SGLang's implementation is Python with
+parent pointers, `defaultdict` children and `torch.Tensor` values; this is an
+arena-indexed Rust tree generic over the key symbol and the payload.
+
+OURS (no SGLang counterpart):
+
+  layout.rs                     per-block KV element widths; byte accounting is
+                                a property of the block, not a global constant
+  content.rs                    verified 128-bit content identity, and the
+                                cross-prefix reuse meter
+  evict.rs :: ValueAwareScorer  eviction by measured recompute cost x reuse
+                                probability x staleness. Every SGLang strategy
+                                is a function of time or hit count only.
+  radix.rs :: subsumption dedup on insert, TreeStats instrumentation, generic
+                                Symbol key so one tree serves both the token
+                                and the block-hash substrate

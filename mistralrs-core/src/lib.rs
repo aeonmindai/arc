@@ -60,6 +60,7 @@ mod diffusion_models;
 pub mod distributed;
 mod gguf;
 pub mod harmony;
+pub mod kv_sharing;
 pub mod layers;
 mod layers_masker;
 mod layers_utils;
