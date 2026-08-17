@@ -224,6 +224,7 @@ impl CausalMasker {
         tgt_len: usize,
         past_kv_len: usize,
         live: &[usize],
+        sliding_window: Option<usize>,
         dtype: DType,
         device: &Device,
     ) -> Result<Tensor> {
@@ -244,8 +245,18 @@ impl CausalMasker {
             let lead = past_kv_len - l;
             for i in 0..tgt_len {
                 let last = past_kv_len + i;
+                // A sliding window is expressed in ABSOLUTE positions, and this
+                // buffer is shifted by `lead`, so the window's low edge has to
+                // be shifted with it: key `j` sits at absolute position
+                // `j - lead`, the query at `l + i`, so the window admits
+                // `j > last - w`. Applied on top of the dead prefix, never
+                // instead of it.
+                let start = match sliding_window {
+                    Some(w) => lead.max((last + 1).saturating_sub(w)),
+                    None => lead,
+                };
                 for j in 0..k_len {
-                    data.push(if j < lead || j > last {
+                    data.push(if j < start || j > last {
                         f32::NEG_INFINITY
                     } else {
                         0.0
@@ -254,6 +265,49 @@ impl CausalMasker {
             }
         }
         Tensor::from_vec(data, (b_sz, 1, tgt_len, k_len), device)?.to_dtype(dtype)
+    }
+
+    /// The ragged mask this batch needs, if `clone_in_cache` front-aligned it.
+    ///
+    /// Shared by [`Self::make_causal_mask_matrix`] and
+    /// [`Self::make_sliding_window_causal_mask_matrix`] — a model reaching only
+    /// one of them must not be the difference between a masked dead prefix and
+    /// an unmasked one. That was not hypothetical: Qwen2 routes through the
+    /// sliding-window entry point (its `Config` reads `sliding_window` and,
+    /// unlike Qwen3, ignores `use_sliding_window`, so the window is `Some`
+    /// even when HF says it is off), and with the check in only the plain entry
+    /// point every ragged decode batch on that model attended its zero-filled
+    /// prefix — measured as short, early-terminating generations.
+    fn ragged_mask_from_channel(
+        &self,
+        input_ids: &Tensor,
+        past_kv_len: usize,
+        sliding_window: Option<usize>,
+        dtype: DType,
+    ) -> Result<Option<Tensor>> {
+        let (b_sz, tgt_len) = input_ids.dims2()?;
+        let Some(lead_pad) = crate::kv_cache::ragged_lead_pad() else {
+            return Ok(None);
+        };
+        if lead_pad.len() != b_sz || !lead_pad.iter().any(|l| *l > 0) {
+            return Ok(None);
+        }
+        let Some(live) = lead_pad
+            .iter()
+            .map(|l| past_kv_len.checked_sub(*l))
+            .collect::<Option<Vec<usize>>>()
+        else {
+            return Ok(None);
+        };
+        Ok(Some(self.make_left_padded_causal_mask(
+            b_sz,
+            tgt_len,
+            past_kv_len,
+            &live,
+            sliding_window,
+            dtype,
+            input_ids.device(),
+        )?))
     }
 
     pub fn make_causal_mask_matrix(
@@ -277,6 +331,7 @@ impl CausalMasker {
                 tgt_len,
                 past_kv_len,
                 live,
+                None,
                 dtype,
                 input_ids.device(),
             )?));
@@ -284,34 +339,15 @@ impl CausalMasker {
 
         // 🔑 The same thing, learned from the batch rather than from the cache
         // argument. `NormalCacheManager::clone_in_cache` front-aligns a ragged
-        // cohort and publishes each row's dead prefix; every model reaches this
-        // function already, so picking it up here is what makes ragged dense
-        // decode work WITHOUT threading a new argument through all forty-odd
-        // model forwards. (Threading it would not have been enough anyway —
-        // `Sdpa::run_attention`'s flash branch takes no mask argument, so the
-        // mask has to be routed to the bias path too; see
+        // cohort and publishes each row's dead prefix; every model reaches one
+        // of the two mask entry points already, so picking it up there is what
+        // makes ragged dense decode work WITHOUT threading a new argument
+        // through all forty-odd model forwards. (Threading it would not have
+        // been enough anyway — `Sdpa::run_attention`'s flash branch takes no
+        // mask argument, so the mask has to be routed to the bias path too; see
         // `attention::mask_must_be_applied_as_bias`.)
-        //
-        // `live[i] = past_kv_len - lead_pad[i]`, recovered from the cache's own
-        // current length so it stays correct as the cohort grows between
-        // `clone_in_cache` calls.
-        if let Some(lead_pad) = crate::kv_cache::ragged_lead_pad() {
-            if lead_pad.len() == b_sz && lead_pad.iter().any(|l| *l > 0) {
-                if let Some(live) = lead_pad
-                    .iter()
-                    .map(|l| past_kv_len.checked_sub(*l))
-                    .collect::<Option<Vec<usize>>>()
-                {
-                    return Ok(Some(self.make_left_padded_causal_mask(
-                        b_sz,
-                        tgt_len,
-                        past_kv_len,
-                        &live,
-                        dtype,
-                        input_ids.device(),
-                    )?));
-                }
-            }
+        if let Some(m) = self.ragged_mask_from_channel(input_ids, past_kv_len, None, dtype)? {
+            return Ok(Some(m));
         }
 
         if tgt_len == 1 {
@@ -453,6 +489,20 @@ impl CausalMasker {
         let (_b_sz, tgt_len) = input_ids.dims2()?;
         let sliding_window = sliding_window.unwrap();
 
+        // 🔑 BEFORE both early returns, exactly as in `make_causal_mask_matrix`.
+        // A model that reaches this entry point rather than that one must not
+        // thereby lose its ragged mask — Qwen2 is such a model, and losing it
+        // meant every ragged decode batch attended a zero-filled dead prefix.
+        // The window is applied on top of the prefix, not instead of it.
+        if let Some(m) = self.ragged_mask_from_channel(
+            input_ids,
+            cache.get_past_kv_len()?,
+            Some(sliding_window),
+            dtype,
+        )? {
+            return Ok(Some(m));
+        }
+
         // Avoid materializing large sliding-window masks when flash-attn on CUDA.
         if tgt_len > 1 && crate::using_flash_attn() && input_ids.device().is_cuda() {
             return Ok(Some(Tensor::zeros((1, 1), dtype, input_ids.device())?));
@@ -584,7 +634,7 @@ mod ragged_mask_tests {
         // 2, so row 1 carries a 4-wide dead prefix. Two query rows.
         let live = [6usize, 2];
         let m = CausalMasker
-            .make_left_padded_causal_mask(2, 2, 6, &live, DType::F32, &device)
+            .make_left_padded_causal_mask(2, 2, 6, &live, None, DType::F32, &device)
             .unwrap();
         assert_eq!(m.dims(), &[2, 1, 2, 8]);
         let rows = mask_rows(&m);
@@ -620,7 +670,7 @@ mod ragged_mask_tests {
     fn a_fully_live_ragged_mask_is_the_ordinary_causal_mask() {
         let device = Device::Cpu;
         let m = CausalMasker
-            .make_left_padded_causal_mask(2, 3, 4, &[4, 4], DType::F32, &device)
+            .make_left_padded_causal_mask(2, 3, 4, &[4, 4], None, DType::F32, &device)
             .unwrap();
         let rows = mask_rows(&m);
         for (r, row) in rows.iter().enumerate() {
@@ -680,6 +730,62 @@ mod ragged_mask_tests {
                 .is_none(),
             "a cohort with no dead prefix must stay on the unmasked fast path"
         );
+
+        crate::kv_cache::set_ragged_lead_pad(None);
+    }
+
+    /// 🔑 THE ONE THAT WAS MISSING, and it cost a measured run.
+    ///
+    /// A model that reaches `make_sliding_window_causal_mask_matrix` instead of
+    /// `make_causal_mask_matrix` must still get its ragged mask. Qwen2 is such
+    /// a model — its `Config` reads `sliding_window` and, unlike Qwen3, ignores
+    /// `use_sliding_window`, so Qwen2.5-0.5B loads with `Some(32768)` even
+    /// though its HF config says the window is off.
+    ///
+    /// With the channel checked in only the plain entry point, this returned
+    /// `None` at `tgt_len == 1` and every ragged decode batch attended its
+    /// zero-filled dead prefix. It did not error: it produced wrong tokens,
+    /// which showed up as generations terminating early — 433 of 512 requested
+    /// tokens at B=8, with ZERO reported errors. Only the completeness guard
+    /// caught it.
+    #[test]
+    fn the_sliding_window_entry_point_also_honours_the_ragged_channel() {
+        let device = Device::Cpu;
+        let ids = Tensor::zeros((2, 1), DType::U32, &device).unwrap();
+        let offsets: &[usize] = &[5, 5];
+
+        crate::kv_cache::set_ragged_lead_pad(Some(vec![0, 4]));
+        let m = CausalMasker
+            .make_sliding_window_causal_mask_matrix(&ids, &offsets, Some(32768), DType::F32, 1)
+            .unwrap()
+            .expect("a ragged cohort must get a mask through the SWA entry point too");
+        assert_eq!(m.dims(), &[2, 1, 1, 6]);
+        let rows = mask_rows(&m);
+        assert!(
+            rows[1][..4].iter().all(|x| *x == f32::NEG_INFINITY),
+            "row 1's dead prefix must be masked on the SWA path as well"
+        );
+        assert!(rows[1][4..].iter().all(|x| *x == 0.0));
+
+        // And the window is applied ON TOP of the dead prefix, not instead of
+        // it: with w=2 the query at absolute position 5 may see absolute 4..=5,
+        // which for row 0 (lead 0) is columns 4..=5.
+        let m = CausalMasker
+            .make_sliding_window_causal_mask_matrix(&ids, &offsets, Some(2), DType::F32, 1)
+            .unwrap()
+            .expect("ragged + window");
+        let rows = mask_rows(&m);
+        assert!(
+            rows[0][..4].iter().all(|x| *x == f32::NEG_INFINITY),
+            "the window must still bite on a fully-live row"
+        );
+        assert!(rows[0][4..].iter().all(|x| *x == 0.0));
+        for (i, row) in rows.iter().enumerate() {
+            assert!(
+                row.iter().any(|x| *x == 0.0),
+                "row {i} is entirely masked, which is a softmax NaN"
+            );
+        }
 
         crate::kv_cache::set_ragged_lead_pad(None);
     }

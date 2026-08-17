@@ -1784,6 +1784,12 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
         _modify_draft_cache: bool,
         load_preallocated_cache: bool,
     ) {
+        // The cohort this described is being torn down. Leaving the dead prefix
+        // published would hand it to whatever batch runs next — a prompt step
+        // takes `CacheInstruction::Reset`, i.e. this function, and would then
+        // build a ragged mask from another cohort's geometry.
+        set_ragged_lead_pad(None);
+
         if seqs.iter().any(|seq| seq.preallocated_cache().is_none()) {
             for layer in pipeline.cache().normal().0.iter_mut() {
                 layer.reset();
