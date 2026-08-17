@@ -291,8 +291,41 @@ run_leg baseline || say "leg baseline did not complete"
 # LEG B — all three capture gates on, plus the profiler's three time channels.
 # ARC_NO_DEDICATED_DECODE is left OFF deliberately so the architecture guard's
 # refusal line is exercised on the real V4 model.
-LEG_ENV="ARC_CAPTURE_STREAM=1 ARC_V4_CAPTURE_PROBE=1 ARC_CANDLE_ALLOC_CACHE=1 ARC_PROFILE=1 ARC_PROFILE_STEPS=12 ARC_PROFILE_OUT=$LOGDIR/profile ARC_PROFILE_LABEL=arcgraph_capture"
-run_leg capture || say "leg capture did not complete"
+#
+# WARMUP SWEEP. The first run captured successfully and then died at
+# instantiate/launch, preceded by four "[alloc-cache] MISS during capture"
+# sizes (131072, 135168, 16896, 132). A miss during capture becomes an unstable
+# graph memory node, which is exactly the documented MMU-fault-on-launch path.
+#
+# The open question is whether MORE warmup can drive that to zero at all. If
+# the missing sizes track context length, then capture at kv_len = N+1 will
+# always see a size the pass at kv_len = N never allocated, and NO finite
+# warmup fixes it — the real fix is shape-constant buffers (RUN-161 step 2b).
+# So sweep, and let the miss count answer it. A monotone fall toward zero means
+# warmup is the fix; a floor that will not move means it is not.
+CAPTURE_COMBOS="${CAPTURE_COMBOS:-4:1 8:3 16:6}"
+CAPTURE_WON=0
+for combo in $CAPTURE_COMBOS; do
+    w="${combo%%:*}"; d="${combo##*:}"
+    say "--- capture attempt: ARC_GRAPH_WARMUP=$w ARC_GRAPH_DEFERRED_PASSES=$d ---"
+    LEG_ENV="ARC_CAPTURE_STREAM=1 ARC_V4_CAPTURE_PROBE=1 ARC_CANDLE_ALLOC_CACHE=1 \
+ARC_GRAPH_WARMUP=$w ARC_GRAPH_DEFERRED_PASSES=$d \
+ARC_PROFILE=1 ARC_PROFILE_STEPS=12 ARC_PROFILE_OUT=$LOGDIR/profile ARC_PROFILE_LABEL=arcgraph_w${w}d${d}"
+    run_leg "capture_w${w}d${d}" || say "leg capture_w${w}d${d} did not complete"
+    slog="$LOGDIR/capture_w${w}d${d}.server.log"
+    # Count ONLY misses after capture began. Misses during the deferred passes
+    # are the passes doing their job — the candle warning does not distinguish
+    # them, because `capturing` is set for both.
+    misses=$(awk '/capture started for batch_size/{f=1} f && /MISS during capture/' "$slog" 2>/dev/null | wc -l | tr -d ' ')
+    launched=$(grep -c "captured + launched" "$slog" 2>/dev/null || echo 0)
+    say "RESULT w=$w d=$d: capture-time alloc misses=$misses, graphs launched=$launched"
+    if [ "${launched:-0}" != "0" ]; then
+        say "CAPTURE SUCCEEDED at w=$w d=$d — stopping the sweep"
+        CAPTURE_WON=1
+        break
+    fi
+done
+[ "$CAPTURE_WON" = "1" ] || say "NO COMBO IN [$CAPTURE_COMBOS] PRODUCED A LAUNCHABLE GRAPH"
 
 # --------------------------------------------------------------------------
 # 5. Extract. Every line below is the answer to a specific question.
@@ -313,6 +346,14 @@ step "EXTRACTED NUMBERS"
   echo
   echo "---------------- architecture guard (the other half of the PR) ----------------"
   grep -hE "Dedicated decode path declined|Decode path extraction FAILED|Decode path: .* layers extracted" "$LOGDIR"/*.server.log 2>/dev/null | sort -u
+  echo
+  echo "---------------- alloc-cache misses DURING capture (the warmup gap) ----------------"
+  for f in "$LOGDIR"/capture_*.server.log; do
+    [ -f "$f" ] || continue
+    echo "  $(basename "$f"):"
+    awk '/capture started for batch_size/{f=1} f && /MISS during capture/' "$f" 2>/dev/null \
+      | sed 's/^/    /' | sort -u
+  done
   echo
   echo "---------------- profiler artifacts ----------------"
   ls -la "$LOGDIR/profile" 2>/dev/null || echo "  (no profile written — ARC_PROFILE_STEPS may not have been reached)"

@@ -68,9 +68,18 @@ pub use weights::{
 /// Try to create a CUDA graph runner for the given device.
 #[cfg(feature = "cuda")]
 pub fn try_init_graph_runner(device: &candle_core::Device) -> Option<CudaGraphRunner> {
-    // 4 eager warmup decode steps: with the candle caching allocator on, these
+    // Eager warmup decode steps: with the candle caching allocator on, these
     // populate the cache so the captured forward is allocation-free (RUN-161).
-    match CudaGraphRunner::new(device, 4) {
+    //
+    // 4 was a hardcoded guess and it is measurably not enough for V4 — a capture
+    // still hit four unwarmed allocation sizes. Tunable via ARC_GRAPH_WARMUP so
+    // "how much warmup is enough" can be measured rather than assumed; the
+    // default is unchanged so no existing behaviour shifts silently.
+    let warmup = std::env::var("ARC_GRAPH_WARMUP")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(4);
+    match CudaGraphRunner::new(device, warmup) {
         Ok(runner) => {
             // D18. The old line here was `info!("CUDA graph runner initialized")`,
             // emitted unconditionally — including immediately after the runner
@@ -81,7 +90,9 @@ pub fn try_init_graph_runner(device: &candle_core::Device) -> Option<CudaGraphRu
             if runner.capture_possible() {
                 tracing::info!(
                     "ArcGraph: runner initialized on a capturable stream — capture WILL be \
-                     attempted after warmup. {}",
+                     attempted after {} warmup step(s) + {} deferred-free pass(es). {}",
+                    warmup,
+                    runner.deferred_passes_remaining(),
                     runner.status_line()
                 );
             } else {

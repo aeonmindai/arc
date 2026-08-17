@@ -51,13 +51,26 @@ pub struct CudaGraphRunner {
     /// [`CudaGraphRunner::status_line`]. A runner that constructed, logged
     /// "initialized", and then did nothing reports `captured=0 replayed=0`.
     replays: u64,
-    /// RUN-161: the deferred-free warmup pass has run. After the eager warmups
-    /// (which only fill the alloc cache to peak-live), exactly one forward must
-    /// run with the device in capture mode so the cache grows to the FULL
-    /// per-forward allocation count (every alloc distinct, frees deferred).
+    /// RUN-161: deferred-free warmup passes still owed. After the eager warmups
+    /// (which only fill the alloc cache to peak-live), forwards must run with
+    /// the device in capture mode so the cache grows to the FULL per-forward
+    /// allocation count (every alloc distinct, frees deferred).
     /// Generic: the caller toggles the device's capture mode; the runner just
-    /// tracks that the pass is owed. See `try_take_deferred_pass`.
-    deferred_pass_done: bool,
+    /// tracks how many passes are owed. See `try_take_deferred_pass`.
+    ///
+    /// This was a `bool` — exactly one pass. That is only sufficient if the
+    /// per-forward allocation set is the SAME at every decode step. It is not
+    /// obviously so: a single pass runs at kv_len = N and capture then runs at
+    /// kv_len = N+1, so any buffer whose size tracks context length is a size
+    /// the cache has never seen, and it becomes an unstable graph memory node.
+    /// A measured V4 capture showed four distinct sizes missing at capture time
+    /// (131072, 135168, 16896, 132 bytes) after the single pass had run.
+    /// Making the count tunable turns "how many passes are enough?" into a
+    /// measurement instead of an assumption — and if no finite number drives
+    /// the miss count to zero, that is itself the answer: the sizes are
+    /// context-dependent and the real fix is shape-constant buffers, not more
+    /// warmup.
+    deferred_passes_remaining: u32,
 }
 
 #[cfg(feature = "cuda")]
@@ -68,6 +81,23 @@ unsafe impl Sync for CudaGraphRunner {}
 #[cfg(feature = "cuda")]
 impl CudaGraphRunner {
     pub fn new(device: &Device, warmup_steps: u32) -> candle_core::Result<Self> {
+        Self::new_with_passes(device, warmup_steps, Self::default_deferred_passes())
+    }
+
+    /// Number of deferred-free warmup passes, from `ARC_GRAPH_DEFERRED_PASSES`
+    /// (default 1, the historical behaviour). See `deferred_passes_remaining`.
+    pub fn default_deferred_passes() -> u32 {
+        std::env::var("ARC_GRAPH_DEFERRED_PASSES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(1)
+    }
+
+    pub fn new_with_passes(
+        device: &Device,
+        warmup_steps: u32,
+        deferred_passes: u32,
+    ) -> candle_core::Result<Self> {
         let Device::Cuda(cuda_dev) = device else {
             candle_core::bail!("CudaGraphRunner requires a CUDA device");
         };
@@ -105,7 +135,7 @@ impl CudaGraphRunner {
                 enabled: false,
                 warmup_remaining: 0,
                 replays: 0,
-                deferred_pass_done: false,
+                deferred_passes_remaining: 0,
             });
         }
 
@@ -124,7 +154,7 @@ impl CudaGraphRunner {
             enabled: true,
             warmup_remaining: warmup_steps,
             replays: 0,
-            deferred_pass_done: false,
+            deferred_passes_remaining: deferred_passes,
         })
     }
 
@@ -174,12 +204,17 @@ impl CudaGraphRunner {
     /// ... `set_capture_mode(false)`) to grow the free pool to the full
     /// per-forward allocation count. Generic across models.
     pub fn try_take_deferred_pass(&mut self) -> bool {
-        if self.enabled && self.warmup_remaining == 0 && !self.deferred_pass_done {
-            self.deferred_pass_done = true;
+        if self.enabled && self.warmup_remaining == 0 && self.deferred_passes_remaining > 0 {
+            self.deferred_passes_remaining -= 1;
             true
         } else {
             false
         }
+    }
+
+    /// Deferred-free passes still owed before capture may begin.
+    pub fn deferred_passes_remaining(&self) -> u32 {
+        self.deferred_passes_remaining
     }
 
     pub fn tick_warmup(&mut self) -> bool {
