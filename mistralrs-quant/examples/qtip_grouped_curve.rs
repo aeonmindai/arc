@@ -76,7 +76,7 @@
 use candle_core::{DType, Device, Result, Tensor};
 use mistralrs_quant::{
     qtip_expected_distinct_experts, Qtip2bLayer, QtipMode, QuantMethod, QTIP_GATHER_GEMV_MAX_PAIRS,
-    QTIP_GROUPED_TILE_K, QTIP_GROUPED_TILE_M, QTIP_ONDEVICE_MOE_MAX_TOKENS_ENV,
+    QTIP_GROUPED_TILE_K, QTIP_ONDEVICE_MOE_MAX_TOKENS_ENV,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -452,7 +452,7 @@ fn tile_m_for_device() -> Result<usize> {
     }
     #[cfg(not(feature = "cuda"))]
     {
-        Ok(QTIP_GROUPED_TILE_M)
+        Ok(mistralrs_quant::QTIP_GROUPED_TILE_M)
     }
 }
 
