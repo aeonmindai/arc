@@ -1966,8 +1966,8 @@ impl IsqPipelineMixin for MtpSpeculativePipeline {
 }
 
 impl CacheManagerMixin for MtpSpeculativePipeline {
-    fn clone_in_cache(&self, seqs: &mut [&mut Sequence]) {
-        get_mut_arcmutex!(self.target).clone_in_cache(seqs);
+    fn clone_in_cache(&self, seqs: &mut [&mut Sequence]) -> candle_core::Result<()> {
+        get_mut_arcmutex!(self.target).clone_in_cache(seqs)
     }
     fn clone_out_cache(&self, seqs: &mut [&mut Sequence]) {
         get_mut_arcmutex!(self.target).clone_out_cache(seqs);
@@ -2246,7 +2246,7 @@ impl Pipeline for MtpSpeculativePipeline {
         // PRE-cache instruction: clone-in / reset, matching what
         // `Pipeline::step` does internally for the target alone.
         match pre_op {
-            CacheInstruction::In => self.clone_in_cache(input_seqs),
+            CacheInstruction::In => self.clone_in_cache(input_seqs)?,
             CacheInstruction::Nothing => (),
             CacheInstruction::Reset {
                 reset_non_granular,
@@ -3599,7 +3599,7 @@ mod tests {
         }
     }
     impl CacheManagerMixin for StubPipeline {
-        fn clone_in_cache(&self, _seqs: &mut [&mut Sequence]) {
+        fn clone_in_cache(&self, _seqs: &mut [&mut Sequence]) -> candle_core::Result<()> {
             unreachable!("StubPipeline: clone_in_cache not reachable")
         }
         fn clone_out_cache(&self, _seqs: &mut [&mut Sequence]) {

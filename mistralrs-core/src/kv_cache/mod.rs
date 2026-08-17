@@ -26,12 +26,19 @@ pub use turboquant_cache::TurboQuantCache;
 pub use xs_rolling::{XsRollingCache, XS_TAIL_MARGIN_TOKENS};
 
 pub trait CacheManager<T: CacheManagerMixin + MetadataMixin + ?Sized> {
+    /// Build one dense batched cache from `seqs`' per-sequence caches.
+    ///
+    /// Fallible on purpose: a batch whose sequences disagree about their cache
+    /// length cannot be represented as one dense cache, and the only honest
+    /// answer is to refuse. Returning `Err` here lets `Pipeline::step`'s caller
+    /// fail the *requests* (`handle_pipeline_forward_error!`) instead of
+    /// panicking the engine task and orphaning every other in-flight sequence.
     fn clone_in_cache(
         &self,
         pipeline: &T,
         seqs: &mut [&mut crate::sequence::Sequence],
         modify_draft_cache: bool,
-    );
+    ) -> Result<()>;
     fn clone_out_cache(&self, pipeline: &T, seqs: &mut [&mut Sequence], modify_draft_cache: bool);
     fn set_none_cache(
         &self,
@@ -344,12 +351,29 @@ pub struct NormalCacheManager;
 /// shared offset. Two sequences at different lengths therefore write to the
 /// wrong slot and attend over the wrong window.
 ///
-/// It fails silently rather than loudly because `NormalCache::CACHE_GROW_SIZE`
-/// is 512: two sequences 100 tokens apart still have identical `all_data`
-/// shapes, so the `slice_set` in `clone_in_cache` succeeds. Only
-/// `current_seq_len` differs. The scheduler upholds the invariant by bucketing
-/// on `seq.len()` (`scheduler/default_scheduler.rs`); this check exists so a
-/// future scheduler change fails loudly instead of emitting wrong tokens.
+/// On a homogeneous K/V-only model it fails *silently* rather than loudly,
+/// because `NormalCache::CACHE_GROW_SIZE` is 512: two sequences 100 tokens
+/// apart still have identical `all_data` shapes, so the `slice_set` in
+/// `clone_in_cache` succeeds and only `current_seq_len` differs.
+///
+/// 🔑 On DeepSeek V4 it does not fail silently — it *panics*, and that is the
+/// wave51-CB serving crash. V4's cache vector is not homogeneous: 43 K/V
+/// entries are followed by 41 [`KvCache::XsRolling`] entries, and the two
+/// tensors `clone_in_cache` batches for those are
+/// `comp.all_data` (`[B, comp.capacity_seq_len, head_dim]`, seq dim **1**) and
+/// `tail` (`[B, tokens - base, hidden]`, seq dim **1**). `slice_set` along dim
+/// 0 requires an exact match on every other dim, so:
+///
+/// * the `tail` width is `tokens - base`, an **exact, unquantised** function of
+///   the token count — **one token of divergence is enough to panic**, at
+///   `clone_in_cache`'s `batch_v.slice_set` line, and
+/// * the `comp` capacity steps 64 → 576 → 1088 (init 64 rows, then
+///   `CACHE_GROW_SIZE` blocks), so two sequences either side of one growth
+///   boundary panic at the `batch_k.slice_set` line with `576 <> 64`.
+///
+/// The scheduler upholds a *weaker* invariant than that: it buckets on
+/// [`crate::sequence::Sequence::cache_bucket_len`], which reads **cache slot 0
+/// only** — for V4, the layer-0 K/V cache — and is blind to slots 43..83.
 pub(crate) fn first_mismatched_cache_len(
     seqs: &mut [&mut crate::sequence::Sequence],
     modify_draft_cache: bool,
@@ -357,26 +381,34 @@ pub(crate) fn first_mismatched_cache_len(
     if seqs.len() < 2 {
         return None;
     }
-    let lens: Vec<Vec<Option<usize>>> = seqs
-        .iter_mut()
-        .map(|seq| {
-            let cache = if modify_draft_cache {
-                seq.normal_draft_cache()
-            } else {
-                seq.normal_cache()
-            };
-            cache
-                .iter()
-                .map(|slot| slot.as_ref().map(KvCache::current_seq_len))
-                .collect()
-        })
-        .collect();
+    // One allocation for the whole check, not one per sequence: this now runs
+    // in release on every batched decode step.
+    let template: Vec<Option<usize>> = {
+        let cache = if modify_draft_cache {
+            seqs[0].normal_draft_cache()
+        } else {
+            seqs[0].normal_cache()
+        };
+        cache
+            .iter()
+            .map(|slot| slot.as_ref().map(KvCache::current_seq_len))
+            .collect()
+    };
 
-    let template = &lens[0];
-    for (i, other) in lens.iter().enumerate().skip(1) {
+    for (i, seq) in seqs.iter_mut().enumerate().skip(1) {
+        let cache = if modify_draft_cache {
+            seq.normal_draft_cache()
+        } else {
+            seq.normal_cache()
+        };
         for (layer, expected) in template.iter().enumerate() {
-            let (Some(expected), Some(got)) = (*expected, other.get(layer).copied().flatten())
-            else {
+            let (Some(expected), Some(got)) = (
+                *expected,
+                cache
+                    .get(layer)
+                    .and_then(|s| s.as_ref())
+                    .map(KvCache::current_seq_len),
+            ) else {
                 continue;
             };
             if expected != got {
@@ -387,116 +419,269 @@ pub(crate) fn first_mismatched_cache_len(
     None
 }
 
+/// Which of a cache slot's two batched tensors is *preallocation slack* and
+/// which is *content*.
+///
+/// `clone_in_cache` builds one dense tensor per side and `slice_set`s each
+/// sequence in along dim 0, which demands an exact match on every other dim.
+/// Two different things can make those dims disagree, and they need opposite
+/// treatment:
+///
+/// * **Slack** — `SingleCache::all_data` is `capacity_seq_len` wide along its
+///   own `dim`, grown in `CACHE_GROW_SIZE` blocks and *never shrunk*. Two
+///   sequences at the identical length can still hold different capacities
+///   (capacity tracks the sequence's peak, so any rollback — MTP verify, a
+///   prefix-cache truncation — leaves it high). The extra width holds nothing:
+///   `current_seq_len` is what says how much is real. Zero-padding the short
+///   one up to the batch maximum is therefore exact, and it is what makes the
+///   K/V and `comp` halves as slack-tolerant as they were always assumed to be.
+/// * **Content** — `XsRollingCache::tail` is `tokens - base` wide and every
+///   column is live compressor input; `TurboQuantCache`'s `current_data` is
+///   narrowed to the current length. A disagreement there is a genuinely ragged
+///   batch. Padding it would fabricate history, so it is refused.
+struct BatchSrc {
+    k: Tensor,
+    v: Tensor,
+    /// Dim along which `k` is slack, when it is.
+    k_slack_dim: Option<usize>,
+    /// Dim along which `v` is slack, when it is.
+    v_slack_dim: Option<usize>,
+}
+
+impl BatchSrc {
+    fn of(cache: &KvCache) -> Result<Self> {
+        Ok(match cache {
+            KvCache::Normal { k, v } => Self {
+                k: k.all_data.clone().ok_or_else(|| {
+                    candle_core::Error::msg("kv-cache: normal K half not materialised")
+                })?,
+                v: v.all_data.clone().ok_or_else(|| {
+                    candle_core::Error::msg("kv-cache: normal V half not materialised")
+                })?,
+                k_slack_dim: Some(k.dim),
+                v_slack_dim: Some(v.dim),
+            },
+            KvCache::Rotating { k, v } => Self {
+                k: k.all_data.clone().ok_or_else(|| {
+                    candle_core::Error::msg("kv-cache: rotating K half not materialised")
+                })?,
+                v: v.all_data.clone().ok_or_else(|| {
+                    candle_core::Error::msg("kv-cache: rotating V half not materialised")
+                })?,
+                k_slack_dim: Some(k.dim),
+                v_slack_dim: Some(v.dim),
+            },
+            KvCache::TurboQuant(tq) => Self {
+                k: tq.k.current_data()?.ok_or_else(|| {
+                    candle_core::Error::msg("kv-cache: turboquant K half not materialised")
+                })?,
+                v: tq.v.current_data()?.ok_or_else(|| {
+                    candle_core::Error::msg("kv-cache: turboquant V half not materialised")
+                })?,
+                k_slack_dim: None,
+                v_slack_dim: None,
+            },
+            // Compressed rows batch like K (a grown capacity buffer), the raw
+            // tail like V (live content). Both are materialised by
+            // `XsRollingCache::advance`, so a sequence that has been cloned out
+            // at least once always has them.
+            KvCache::XsRolling(xs) => Self {
+                k: xs.comp.all_data.clone().ok_or_else(|| {
+                    candle_core::Error::msg("xs rolling cache: compressed rows not materialised")
+                })?,
+                v: xs.tail.clone().ok_or_else(|| {
+                    candle_core::Error::msg("xs rolling cache: raw tail not materialised")
+                })?,
+                k_slack_dim: Some(xs.comp.dim),
+                v_slack_dim: None,
+            },
+        })
+    }
+}
+
+/// Zero-extend `src` along `dim` to `width`. Used only for preallocation slack
+/// (see [`BatchSrc`]), so the added columns are never read.
+fn pad_slack(src: &Tensor, dim: usize, width: usize) -> Result<Tensor> {
+    if src.dims()[dim] == width {
+        return Ok(src.clone());
+    }
+    let mut shape = src.dims().to_vec();
+    shape[dim] = width;
+    let grown = Tensor::zeros(shape, src.dtype(), src.device())?;
+    grown.slice_set(&src.contiguous()?, dim, 0)?;
+    Ok(grown)
+}
+
+/// Reconcile one side of one layer across the batch.
+///
+/// Returns the dims every sequence's tensor must have once slack is padded, or
+/// an error naming the sequence and the dim that is genuinely incompatible —
+/// which is the diagnostic the raw candle `shape mismatch on dim 1, 18 <> 22`
+/// never gave.
+fn reconcile_batch_dims(
+    per_seq: &[&Tensor],
+    slack_dim: Option<usize>,
+    side: &str,
+    layer: usize,
+) -> Result<Vec<usize>> {
+    let mut dims = per_seq[0].dims().to_vec();
+    if let Some(d) = slack_dim {
+        for t in per_seq {
+            dims[d] = dims[d].max(t.dims()[d]);
+        }
+    }
+    for (i, t) in per_seq.iter().enumerate() {
+        if t.rank() != dims.len() {
+            candle_core::bail!(
+                "kv-cache: cannot batch cache slot {layer} ({side} half): seqs[0] is rank {} \
+                 {:?}, seqs[{i}] is rank {} {:?}",
+                dims.len(),
+                dims,
+                t.rank(),
+                t.dims()
+            );
+        }
+        for (d, (want, got)) in dims.iter().zip(t.dims()).enumerate() {
+            if d == 0 || Some(d) == slack_dim {
+                continue;
+            }
+            if want != got {
+                candle_core::bail!(
+                    "kv-cache: cannot batch cache slot {layer} ({side} half) — the batch is \
+                     ragged on dim {d}: seqs[0] is {want} wide, seqs[{i}] is {got}. This dim \
+                     is the sequence's live state, not preallocation slack, so the two \
+                     sequences are at genuinely different points and cannot share one dense \
+                     cache. (On DeepSeek V4 the `xs` rolling tail is `tokens - base` wide, so \
+                     this means the batch's token counts diverged — see \
+                     `first_mismatched_cache_len`.)"
+                );
+            }
+        }
+        if dims[0] != t.dims()[0] {
+            candle_core::bail!(
+                "kv-cache: cannot batch cache slot {layer} ({side} half): seqs[0] has batch \
+                 dim {}, seqs[{i}] has {}",
+                dims[0],
+                t.dims()[0]
+            );
+        }
+    }
+    Ok(dims)
+}
+
+/// The contract [`NormalCacheManager::clone_in_cache`] needs from a batch,
+/// checked **in release**.
+///
+/// wave51-CB: this was a `debug_assert!`, so the H200 binary that served the
+/// `qtip2b` artifact carried no check at all. What it got instead was
+/// `slice_set`'s `shape mismatch on dim 1, …` — a panic, on the engine task,
+/// which took every other in-flight request down with it.
+pub(crate) fn ensure_uniform_batch_cache_lens(
+    seqs: &mut [&mut crate::sequence::Sequence],
+    modify_draft_cache: bool,
+) -> Result<()> {
+    match first_mismatched_cache_len(seqs, modify_draft_cache) {
+        None => Ok(()),
+        Some((layer, expected, got, i)) => candle_core::bail!(
+            "kv-cache: sequences in one batch must share current_seq_len — seqs[0] is the \
+             template for the whole dense batched cache, and every sequence's new K/V is \
+             written at that one offset. Cache slot {layer}: seqs[0] holds {expected} \
+             position(s), seqs[{i}] holds {got}. The scheduler buckets on \
+             `Sequence::cache_bucket_len`, which reads cache slot 0 only, so a model whose \
+             cache vector carries non-K/V slots (DeepSeek V4's 41 `XsRolling` compressor \
+             histories) can reach here with slot 0 in agreement and a later slot not."
+        ),
+    }
+}
+
 impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCacheManager {
     fn clone_in_cache(
         &self,
         pipeline: &T,
         seqs: &mut [&mut crate::sequence::Sequence],
         modify_draft_cache: bool,
-    ) {
-        // Loud failure for the silent-corruption path described on
-        // `first_mismatched_cache_len`. Debug-only: the check walks every
-        // sequence's whole cache vector, which is not free on the hot decode
-        // path, and the scheduler is what actually enforces the invariant.
-        debug_assert!(
-            first_mismatched_cache_len(seqs, modify_draft_cache).is_none(),
-            "clone_in_cache: sequences in one batch must share current_seq_len \
-             (seqs[0] is the template for the whole dense batched cache, and \
-             SingleCache::append writes every sequence at that one offset) — \
-             mismatch: {:?}",
-            first_mismatched_cache_len(seqs, modify_draft_cache)
-        );
+    ) -> Result<()> {
+        // 🔑 wave56-CG: this was a `debug_assert!`, i.e. absent from the release
+        // binary that served on the H200. It now runs in release, and it
+        // returns rather than panics, so a batch the scheduler should never
+        // have formed costs the requests in it and not the engine task.
+        ensure_uniform_batch_cache_lens(seqs, modify_draft_cache)?;
 
         let mut new_k_cache = Vec::new();
         let mut new_v_cache = Vec::new();
 
         for layer in 0..pipeline.get_metadata().num_hidden_layers {
-            // Preallocate combined k and v caches across all sequences, avoiding Tensor::cat copies
             let batch_len = seqs.len();
-            // Use the first sequence as template
-            let (first_k, first_v) = {
+
+            // `seqs[0]` still decides whether the slot exists at all — a model
+            // that shares this layer's cache (gemma3n) has no tensor for anyone.
+            {
                 let src_cache = if modify_draft_cache {
                     seqs[0].normal_draft_cache()
                 } else {
                     seqs[0].normal_cache()
                 };
-                let Some(cache) = src_cache.get(layer).unwrap().as_ref() else {
-                    // This is hit in gemma3n for the shared kv cache
+                if src_cache.get(layer).and_then(|s| s.as_ref()).is_none() {
                     new_k_cache.push(None);
                     new_v_cache.push(None);
                     continue;
-                };
-                match cache {
-                    KvCache::Normal { k, v } => {
-                        (k.all_data.clone().unwrap(), v.all_data.clone().unwrap())
-                    }
-                    KvCache::Rotating { k, v } => {
-                        (k.all_data.clone().unwrap(), v.all_data.clone().unwrap())
-                    }
-                    KvCache::TurboQuant(tq) => {
-                        // Dequantize for cache cloning
-                        (
-                            tq.k.current_data().unwrap().unwrap(),
-                            tq.v.current_data().unwrap().unwrap(),
-                        )
-                    }
-                    // Compressed rows batch like K, the raw tail like V.
-                    // Both are materialised by `XsRollingCache::advance`, so a
-                    // sequence that has been cloned out at least once always
-                    // has them.
-                    KvCache::XsRolling(xs) => (
-                        xs.comp
-                            .all_data
-                            .clone()
-                            .expect("xs rolling cache: compressed rows not materialised"),
-                        xs.tail
-                            .clone()
-                            .expect("xs rolling cache: raw tail not materialised"),
-                    ),
                 }
-            };
-            // Build dims for batched cache
-            let mut dims_k = first_k.dims().to_vec();
-            let mut dims_v = first_v.dims().to_vec();
-            dims_k[0] *= batch_len;
-            dims_v[0] *= batch_len;
-            let batch_k = Tensor::zeros(dims_k.clone(), first_k.dtype(), first_k.device()).unwrap();
-            let batch_v = Tensor::zeros(dims_v.clone(), first_v.dtype(), first_v.device()).unwrap();
-            // Fill each sequence's cache slice
-            for (i, seq) in seqs.iter_mut().enumerate() {
+            }
+
+            // Gather every sequence's two tensors for this slot up front, so
+            // the batch's shape is decided by the whole batch instead of by
+            // `seqs[0]` alone. `None` marks a sequence with no slot here; it is
+            // skipped, exactly as before.
+            let mut srcs: Vec<Option<BatchSrc>> = Vec::with_capacity(batch_len);
+            for seq in seqs.iter_mut() {
                 let src_cache = if modify_draft_cache {
                     seq.normal_draft_cache()
                 } else {
                     seq.normal_cache()
                 };
-                let Some(cache) = src_cache.get(layer).unwrap().as_ref() else {
+                match src_cache.get(layer).and_then(|s| s.as_ref()) {
+                    Some(cache) => srcs.push(Some(BatchSrc::of(cache)?)),
+                    None => srcs.push(None),
+                }
+            }
+
+            let present: Vec<&BatchSrc> = srcs.iter().flatten().collect();
+            let k_slack = present[0].k_slack_dim;
+            let v_slack = present[0].v_slack_dim;
+            let ks: Vec<&Tensor> = present.iter().map(|s| &s.k).collect();
+            let vs: Vec<&Tensor> = present.iter().map(|s| &s.v).collect();
+
+            // Slack dims widen to the batch maximum; every other dim must
+            // already agree, and says so by name if it does not.
+            let one_k = reconcile_batch_dims(&ks, k_slack, "K", layer)?;
+            let one_v = reconcile_batch_dims(&vs, v_slack, "V", layer)?;
+
+            let mut dims_k = one_k.clone();
+            let mut dims_v = one_v.clone();
+            dims_k[0] *= batch_len;
+            dims_v[0] *= batch_len;
+            let batch_k = Tensor::zeros(dims_k, present[0].k.dtype(), present[0].k.device())?;
+            let batch_v = Tensor::zeros(dims_v, present[0].v.dtype(), present[0].v.device())?;
+
+            for (i, src) in srcs.iter().enumerate() {
+                let Some(src) = src else {
                     // Skip for shared kv cache layers in models like gemma3n
                     continue;
                 };
-                let (src_k, src_v) = match cache {
-                    KvCache::Normal { k, v } => {
-                        (k.all_data.clone().unwrap(), v.all_data.clone().unwrap())
-                    }
-                    KvCache::Rotating { k, v } => {
-                        (k.all_data.clone().unwrap(), v.all_data.clone().unwrap())
-                    }
-                    KvCache::TurboQuant(tq) => (
-                        tq.k.current_data().unwrap().unwrap(),
-                        tq.v.current_data().unwrap().unwrap(),
-                    ),
-                    KvCache::XsRolling(xs) => (
-                        xs.comp
-                            .all_data
-                            .clone()
-                            .expect("xs rolling cache: compressed rows not materialised"),
-                        xs.tail
-                            .clone()
-                            .expect("xs rolling cache: raw tail not materialised"),
-                    ),
+                let src_k = match k_slack {
+                    Some(d) => pad_slack(&src.k, d, one_k[d])?,
+                    None => src.k.clone(),
                 };
-                let offset = i * first_k.dims()[0];
-                batch_k.slice_set(&src_k, 0, offset).unwrap();
-                batch_v.slice_set(&src_v, 0, offset).unwrap();
+                let src_v = match v_slack {
+                    Some(d) => pad_slack(&src.v, d, one_v[d])?,
+                    None => src.v.clone(),
+                };
+                // Each side is offset by its OWN batch dim. They are always
+                // equal in practice (both sides of a slot describe the same
+                // sequences), but the old code reused the K offset for V, which
+                // would have silently mis-placed the V half if they ever were not.
+                batch_k.slice_set(&src_k, 0, i * one_k[0])?;
+                batch_v.slice_set(&src_v, 0, i * one_v[0])?;
             }
             new_k_cache.push(Some(batch_k));
             new_v_cache.push(Some(batch_v));
@@ -533,27 +718,40 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 });
                 continue;
             };
+            // 🔑 The batched buffer may be WIDER than `seqs[0]`'s was: slack
+            // dims are widened to the batch maximum above. `capacity_seq_len`
+            // must describe the buffer that now exists, not the one the
+            // template happened to carry — `SingleCache::append` reallocates
+            // from `capacity_seq_len`, so a stale (small) value would try to
+            // `slice_set` a wide buffer into a narrow one on the next growth.
+            let k_cache = k_cache.map(|x| x.contiguous()).transpose()?;
+            let v_cache = v_cache.map(|x| x.contiguous()).transpose()?;
             match cache_ref {
                 KvCache::Normal { k: old_k, .. } => {
                     let template_cache_dim = old_k.dim;
                     let template_cache_csl = old_k.current_seq_len;
                     let template_cache_msl = old_k.max_seq_len;
-                    let template_cache_capsl = old_k.capacity_seq_len;
+                    // dim 0 is the batch dim (it was multiplied by
+                    // `batch_len` above), so only a real seq dim is read back.
+                    let capacity = match (template_cache_dim, k_cache.as_ref()) {
+                        (0, _) | (_, None) => old_k.capacity_seq_len,
+                        (d, Some(x)) => x.dims()[d],
+                    };
 
                     caches.push(KvCache::Normal {
                         k: SingleCache {
-                            all_data: k_cache.map(|x| x.contiguous().unwrap()),
+                            all_data: k_cache,
                             dim: template_cache_dim,
                             current_seq_len: template_cache_csl,
                             max_seq_len: template_cache_msl,
-                            capacity_seq_len: template_cache_capsl,
+                            capacity_seq_len: capacity,
                         },
                         v: SingleCache {
-                            all_data: v_cache.map(|x| x.contiguous().unwrap()),
+                            all_data: v_cache,
                             dim: template_cache_dim,
                             current_seq_len: template_cache_csl,
                             max_seq_len: template_cache_msl,
-                            capacity_seq_len: template_cache_capsl,
+                            capacity_seq_len: capacity,
                         },
                     });
                 }
@@ -562,24 +760,29 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     let template_cache_csl = old_k.current_seq_len;
                     let template_cache_msl = old_k.max_seq_len;
                     let template_cache_offset = old_k.offset;
-                    let template_cache_capsl = old_k.capacity_seq_len;
+                    // dim 0 is the batch dim (it was multiplied by
+                    // `batch_len` above), so only a real seq dim is read back.
+                    let capacity = match (template_cache_dim, k_cache.as_ref()) {
+                        (0, _) | (_, None) => old_k.capacity_seq_len,
+                        (d, Some(x)) => x.dims()[d],
+                    };
 
                     caches.push(KvCache::Rotating {
                         k: RotatingCache {
-                            all_data: k_cache.map(|x| x.contiguous().unwrap()),
+                            all_data: k_cache,
                             dim: template_cache_dim,
                             current_seq_len: template_cache_csl,
                             max_seq_len: template_cache_msl,
                             offset: template_cache_offset,
-                            capacity_seq_len: template_cache_capsl,
+                            capacity_seq_len: capacity,
                         },
                         v: RotatingCache {
-                            all_data: v_cache.map(|x| x.contiguous().unwrap()),
+                            all_data: v_cache,
                             dim: template_cache_dim,
                             current_seq_len: template_cache_csl,
                             max_seq_len: template_cache_msl,
                             offset: template_cache_offset,
-                            capacity_seq_len: template_cache_capsl,
+                            capacity_seq_len: capacity,
                         },
                     });
                 }
@@ -589,18 +792,25 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 KvCache::XsRolling(xs) => {
                     // Everything except the two buffers (token count, base,
                     // completed-row count, ratio) is per-batch metadata taken
-                    // from the seq0 template, exactly like the Normal arm's
-                    // `current_seq_len`. The scheduler guarantees a uniform
-                    // length across the batch; a mismatch there is the silent
-                    // failure the debug assert on this function guards.
+                    // from the seq0 template. That is only sound because
+                    // `ensure_uniform_batch_cache_lens` has already established
+                    // that every sequence agrees on `tokens` for this slot —
+                    // which is exactly what makes `tail` (`tokens - base` wide)
+                    // batchable at all.
                     let mut rebuilt = (**xs).clone();
-                    rebuilt.comp.all_data = k_cache.map(|x| x.contiguous().unwrap());
-                    rebuilt.tail = v_cache.map(|x| x.contiguous().unwrap());
+                    if let Some(k) = k_cache.as_ref() {
+                        if rebuilt.comp.dim != 0 {
+                            rebuilt.comp.capacity_seq_len = k.dims()[rebuilt.comp.dim];
+                        }
+                    }
+                    rebuilt.comp.all_data = k_cache;
+                    rebuilt.tail = v_cache;
                     caches.push(KvCache::XsRolling(Box::new(rebuilt)));
                 }
             }
         }
         *pipeline.cache().normal() = NormalCache(caches);
+        Ok(())
     }
     fn clone_out_cache(&self, pipeline: &T, seqs: &mut [&mut Sequence], modify_draft_cache: bool) {
         let all_cache = pipeline.cache().normal();
@@ -1067,7 +1277,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for FullCach
         pipeline: &T,
         seqs: &mut [&mut crate::sequence::Sequence],
         modify_draft_cache: bool,
-    ) {
+    ) -> Result<()> {
         if modify_draft_cache {
             clone_in_cache(
                 pipeline.get_metadata().num_hidden_layers,
@@ -1075,7 +1285,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for FullCach
                 seqs,
                 SeqCache::Draft,
             );
-            return;
+            return Ok(());
         }
         clone_in_cache(
             pipeline.get_metadata().num_hidden_layers,
@@ -1098,6 +1308,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for FullCach
                 .get_scalings_cache()
                 .clone_from(seqs[0].scaling_cache());
         }
+        Ok(())
     }
 
     fn clone_out_cache(
@@ -1174,7 +1385,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
         pipeline: &T,
         seqs: &mut [&mut crate::sequence::Sequence],
         modify_draft_cache: bool,
-    ) {
+    ) -> Result<()> {
         let mut hybrid_cache = pipeline.cache().hybrid();
         let num_layers = hybrid_cache.num_layers();
 
@@ -1229,7 +1440,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
                             seq.id()
                         );
                         hybrid_cache.set_state_indices(None);
-                        return;
+                        return Ok(());
                     }
                 }
                 if let Ok(state_indices) = Tensor::from_vec(indices, (seqs.len(),), &device) {
@@ -1309,6 +1520,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
             // For recurrent layers: No copying needed!
             // The pool is accessed directly via state_indices during forward.
         }
+        Ok(())
     }
 
     fn clone_out_cache(&self, pipeline: &T, seqs: &mut [&mut Sequence], modify_draft_cache: bool) {
@@ -1582,7 +1794,7 @@ mod clone_in_cache_invariant_tests {
     }
 
     impl CacheManagerMixin for StubPipeline {
-        fn clone_in_cache(&self, _seqs: &mut [&mut Sequence]) {
+        fn clone_in_cache(&self, _seqs: &mut [&mut Sequence]) -> Result<()> {
             unreachable!("tests drive NormalCacheManager directly")
         }
         fn clone_out_cache(&self, _seqs: &mut [&mut Sequence]) {
@@ -1622,24 +1834,314 @@ mod clone_in_cache_invariant_tests {
     }
 
     /// The guard as actually installed: `clone_in_cache` must refuse a
-    /// length-mismatched batch loudly.
+    /// length-mismatched batch, **in release**, by returning an error.
     ///
-    /// Mutation check: delete the `debug_assert!` at the top of
-    /// `clone_in_cache` and this test fails — without it the function walks on
-    /// and panics on `all_data.unwrap()` with a message that says nothing about
-    /// sequence lengths, which is exactly the diagnostic gap being closed.
+    /// 🔑 This test used to be `#[cfg(debug_assertions)]` +
+    /// `#[should_panic]`, because the guard it covered was a `debug_assert!`.
+    /// That is the wave51-CB hole in one line: the check existed in CI and
+    /// **did not exist in the binary that served on the H200**, where the same
+    /// batch instead reached `slice_set` and panicked the engine task. Both
+    /// halves are now fixed — the check runs in release, and it returns rather
+    /// than panics — so the test runs in every profile and asserts a value.
     ///
-    /// `debug_assertions`-gated because `debug_assert!` compiles out of release
-    /// test builds; a `--release` run would otherwise fail on the wrong panic.
+    /// Mutation check: delete the `ensure_uniform_batch_cache_lens(..)?` call
+    /// at the top of `clone_in_cache` and this test fails.
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "must share current_seq_len")]
     fn clone_in_cache_refuses_a_length_mismatched_batch() {
         let pipeline = StubPipeline::new(4);
         let mut a = seq_with_cache_len(0, 4, 100);
         let mut b = seq_with_cache_len(1, 4, 200);
         let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
-        NormalCacheManager.clone_in_cache(&pipeline, &mut seqs, false);
+        let err = NormalCacheManager
+            .clone_in_cache(&pipeline, &mut seqs, false)
+            .expect_err("a length-mismatched batch must be refused")
+            .to_string();
+        assert!(err.contains("must share current_seq_len"), "got: {err}");
+        assert!(err.contains("100") && err.contains("200"), "got: {err}");
+    }
+
+    // =====================================================================
+    // wave56-CG — the two `clone_in_cache` panics wave51-CB hit on the H200,
+    // on a PRODUCTION-shaped fixture.
+    //
+    // DOCTRINE D12: `slot()` above is deliberately `all_data: None`, which is
+    // exactly the fixture shape that let both of these ship. Everything below
+    // builds its caches the way the engine does — a preallocated K/V buffer,
+    // and `XsRolling` state produced by running `XsRollingCache::advance`
+    // itself — so the tensors can, and do, disagree.
+    // =====================================================================
+
+    /// DeepSeek V4's K/V slot as the engine hands it over: the preallocated
+    /// `[1, 1, capacity, head_dim]` activation-dtype buffer that
+    /// `set_none_cache` installs *before* the first append.
+    fn v4_kv_slot(capacity: usize, head_dim: usize, current_seq_len: usize) -> KvCache {
+        let dev = candle_core::Device::Cpu;
+        let mk = || SingleCache {
+            all_data: Some(
+                Tensor::zeros(
+                    (1usize, 1usize, capacity, head_dim),
+                    candle_core::DType::F32,
+                    &dev,
+                )
+                .unwrap(),
+            ),
+            dim: 2,
+            current_seq_len,
+            capacity_seq_len: capacity,
+            max_seq_len: 4096,
+        };
+        KvCache::Normal { k: mk(), v: mk() }
+    }
+
+    const XS_HIDDEN: usize = 8;
+    const XS_HEAD_DIM: usize = 4;
+
+    /// Advance an `XsRollingCache` by `t` tokens through the real `advance` —
+    /// the same call the V4 attention layer makes — so `tail`, `base` and
+    /// `comp.capacity_seq_len` are whatever production computes.
+    fn feed_xs(state: &mut XsRollingCache, t: usize) {
+        let dev = candle_core::Device::Cpu;
+        let ratio = state.ratio;
+        let xs = Tensor::zeros((1usize, t, XS_HIDDEN), candle_core::DType::F32, &dev).unwrap();
+        state
+            .advance(&xs, |w| {
+                let rows = w.dim(1)? / ratio;
+                Tensor::zeros((1usize, rows, XS_HEAD_DIM), w.dtype(), w.device())
+            })
+            .unwrap();
+    }
+
+    fn xs_state(ratio: usize, span_groups: usize) -> XsRollingCache {
+        XsRollingCache::new(ratio, span_groups, XS_HEAD_DIM, 4096)
+    }
+
+    /// A sequence carrying exactly `slots` — a V4-shaped heterogeneous cache
+    /// vector (K/V entries first, then the compressor histories).
+    fn seq_with_slots(id: usize, tokens: usize, slots: Vec<KvCache>) -> Sequence {
+        let mut seq = seq_with_cache_len(id, slots.len(), tokens);
+        let cache = seq.normal_cache();
+        cache.clear();
+        for slot in slots {
+            cache.push(Some(slot));
+        }
+        seq
+    }
+
+    /// What `clone_in_cache` used to do, verbatim: allocate the batched buffer
+    /// from `seqs[0]`'s dims and `slice_set` every other sequence into it. Kept
+    /// so each test below can show that its fixture really does reproduce the
+    /// panic seen on hardware, rather than asserting against a guard that
+    /// nothing would have tripped (D12).
+    fn legacy_batch_error(seq0: &Tensor, seq1: &Tensor) -> String {
+        let mut dims = seq0.dims().to_vec();
+        dims[0] *= 2;
+        let batched = Tensor::zeros(dims, seq0.dtype(), seq0.device()).expect("batch alloc");
+        batched.slice_set(seq0, 0, 0).expect("seq0 always fits");
+        match batched.slice_set(seq1, 0, seq0.dims()[0]) {
+            Ok(()) => String::from("<no error>"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// wave51-CB section 4.1 — `kv_cache/mod.rs:498`, `shape mismatch on dim 1,
+    /// 576 <> 64`, on the ORDINARY decode path. Two deaths in ~1,300 GSM8K
+    /// requests; zero in the 505-request batch sweep.
+    ///
+    /// The two numbers are not a head dim and a step count. They are two
+    /// `XsRollingCache::comp` **capacities**: `init_rows = 64`, and
+    /// `64 + CACHE_GROW_SIZE` = 576 after one growth. The mechanism, and why
+    /// the sweep never saw it:
+    ///
+    /// * `comp` holds one row per `ratio` tokens, so a CSA layer (`ratio = 4`)
+    ///   crosses 64 rows at 260 tokens. The sweep's sequences were ~132 tokens
+    ///   — every buffer in it was 64 wide, so they always matched. GSM8K
+    ///   generated up to 2048.
+    /// * `SingleCache::reset` clears `current_seq_len` and `all_data` but
+    ///   **not `capacity_seq_len`**, and the next `append` re-allocates at that
+    ///   retained capacity. V4's attention layer resets the compressor slot at
+    ///   the start of every prompt (`seqlen_offsets.iter().all(|&o| o == 0)`),
+    ///   so a prompt batch scheduled after a long-context batch inherits a
+    ///   576-wide buffer for brand-new sequences while one scheduled after a
+    ///   short batch gets 64.
+    ///
+    /// So two sequences at the **identical length** can hold different-width
+    /// compressed-row buffers. The scheduler cannot prevent it: it agrees on
+    /// every length there is to bucket on. The extra width is preallocation
+    /// slack holding nothing, so the fix is to widen the batch to fit, not to
+    /// refuse.
+    #[test]
+    fn xs_comp_capacity_slack_does_not_kill_the_batch() {
+        // seqs[0]: grew past the 64-row boundary, was reset at a prompt
+        // boundary, and is now short again — capacity 576, length 256.
+        let mut grown = xs_state(4, 2);
+        feed_xs(&mut grown, 264); // 66 rows > 64 -> capacity grows to 576
+        assert_eq!(grown.comp.capacity_seq_len, 576);
+        grown.reset();
+        feed_xs(&mut grown, 256);
+
+        // seqs[1]: a fresh sequence that reached the same length — capacity 64.
+        let mut fresh = xs_state(4, 2);
+        feed_xs(&mut fresh, 256);
+
+        // --- Fixture discrimination (D12) -------------------------------
+        // The lengths AGREE, so this is not the ragged-batch failure; it is
+        // purely a capacity disagreement, and it must be reproduced as one.
+        assert_eq!(grown.current_seq_len(), fresh.current_seq_len());
+        assert_eq!(grown.comp.current_seq_len(), fresh.comp.current_seq_len());
+        let grown_k = grown.comp.all_data.clone().unwrap();
+        let fresh_k = fresh.comp.all_data.clone().unwrap();
+        assert_eq!(
+            (grown_k.dims()[1], fresh_k.dims()[1]),
+            (576, 64),
+            "fixture cannot discriminate: the two compressed-row buffers must \
+             straddle exactly one CACHE_GROW_SIZE boundary"
+        );
+        assert_eq!(
+            legacy_batch_error(&grown_k, &fresh_k),
+            "shape mismatch on dim 1, 576 <> 64",
+            "the fixture must reproduce the exact panic wave51-CB saw at \
+             kv_cache/mod.rs:498"
+        );
+
+        // --- The fix ----------------------------------------------------
+        let pipeline = StubPipeline::new(2);
+        let mut a = seq_with_slots(
+            0,
+            256,
+            vec![v4_kv_slot(512, 8, 256), KvCache::XsRolling(Box::new(grown))],
+        );
+        let mut b = seq_with_slots(
+            1,
+            256,
+            vec![v4_kv_slot(512, 8, 256), KvCache::XsRolling(Box::new(fresh))],
+        );
+        let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
+        NormalCacheManager
+            .clone_in_cache(&pipeline, &mut seqs, false)
+            .expect("capacity slack is not a ragged batch; it must be padded, not refused");
+
+        let batched = pipeline.cache().normal();
+        let KvCache::XsRolling(xs) = &batched.0[1] else {
+            panic!("slot 1 must stay an XsRolling entry")
+        };
+        let k = xs.comp.all_data.as_ref().unwrap();
+        assert_eq!(
+            k.dims(),
+            &[2, 576, XS_HEAD_DIM],
+            "batched to the widest buffer"
+        );
+        assert_eq!(
+            xs.comp.capacity_seq_len, 576,
+            "capacity_seq_len must describe the buffer that now exists — \
+             SingleCache::append reallocates from it, and a stale 64 would try \
+             to slice a 576-wide buffer into a 64-wide one"
+        );
+        assert_eq!(
+            xs.comp.current_seq_len, 64,
+            "row count is unchanged by padding"
+        );
+    }
+
+    /// wave51-CB section 3.2 — `kv_cache/mod.rs:499`, `shape mismatch on dim 1,
+    /// 18 <> 22`, and `19 <> 23` on a second run. MTP at B=8, reproduced from a
+    /// clean engine; B=1 is fine.
+    ///
+    /// Line 499 is the **V** half, which for an `XsRolling` slot is `xs.tail` —
+    /// `[B, tokens - base, hidden]`. Unlike every other tensor
+    /// `clone_in_cache` batches, its width is not a `CACHE_GROW_SIZE`-quantised
+    /// capacity but an **exact function of the token count**, so *one* token of
+    /// divergence is enough. For V4's HCA layers (`ratio = 128`,
+    /// `span_groups = 1`, `margin = XS_TAIL_MARGIN_TOKENS = 16`) the width is
+    /// `T - 128 * floor((T - 16) / 128)`, which gives 18 at T=274 and 22 at
+    /// T=278 — the observed pair, four tokens apart.
+    ///
+    /// Four is what batched MTP produces: `mtp_pipeline.rs` commits between 1
+    /// and `depth + 1` tokens per sequence while the shared cache advances by
+    /// the batch minimum ("each sequence's surplus stays committed as TOKENS"),
+    /// and `Sequence::cache_bucket_len` deliberately buckets on the *cache*
+    /// length so the ragged cohort stays whole. Those two decisions are jointly
+    /// unsound the moment a cache slot's batched width tracks tokens.
+    ///
+    /// This is a genuinely ragged batch: the two sequences hold different
+    /// compressor history and cannot share one dense buffer. It must be
+    /// refused, by name — never papered over, and never a panic on the engine
+    /// task.
+    #[test]
+    fn ragged_xs_tail_is_refused_by_name_not_panicked() {
+        let mut short = xs_state(128, 1);
+        feed_xs(&mut short, 274);
+        let mut long = xs_state(128, 1);
+        feed_xs(&mut long, 278);
+
+        // --- Fixture discrimination (D12) -------------------------------
+        let short_v = short.tail.clone().unwrap();
+        let long_v = long.tail.clone().unwrap();
+        assert_eq!(
+            (short_v.dims()[1], long_v.dims()[1]),
+            (18, 22),
+            "fixture cannot discriminate: it must land on the exact tail widths \
+             wave51-CB reported"
+        );
+        assert_eq!(
+            short.comp.all_data.as_ref().unwrap().dims()[1],
+            long.comp.all_data.as_ref().unwrap().dims()[1],
+            "the K half must AGREE, or this test would be reproducing the \
+             capacity bug instead of the ragged-tail one (:499, not :498)"
+        );
+        assert_eq!(
+            legacy_batch_error(&short_v, &long_v),
+            "shape mismatch on dim 1, 18 <> 22",
+            "the fixture must reproduce the exact panic wave51-CB saw at \
+             kv_cache/mod.rs:499"
+        );
+
+        // --- The fix ----------------------------------------------------
+        let pipeline = StubPipeline::new(2);
+        let mut a = seq_with_slots(
+            0,
+            274,
+            vec![v4_kv_slot(512, 8, 274), KvCache::XsRolling(Box::new(short))],
+        );
+        let mut b = seq_with_slots(
+            1,
+            278,
+            vec![v4_kv_slot(512, 8, 278), KvCache::XsRolling(Box::new(long))],
+        );
+        let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
+        let err = NormalCacheManager
+            .clone_in_cache(&pipeline, &mut seqs, false)
+            .expect_err("a ragged batch must be refused, not batched and not panicked")
+            .to_string();
+        assert!(
+            err.contains("must share current_seq_len"),
+            "the refusal must name the invariant, got: {err}"
+        );
+        assert!(
+            err.contains("274") && err.contains("278"),
+            "the refusal must name BOTH lengths so the operator can see which \
+             sequences diverged, got: {err}"
+        );
+    }
+
+    /// The ragged-tail refusal must not depend on the K/V slots noticing
+    /// first: on V4 the K/V halves are `[1, 1, capacity, head_dim]`, whose
+    /// dim-1 is the head count, so they batch happily at *any* pair of lengths.
+    /// Cache slot 0 agreeing is precisely the state the scheduler guarantees
+    /// and `clone_in_cache` used to trust.
+    #[test]
+    fn kv_slots_alone_cannot_see_the_divergence() {
+        let a = v4_kv_slot(512, 8, 274);
+        let b = v4_kv_slot(512, 8, 278);
+        let (KvCache::Normal { k: ka, .. }, KvCache::Normal { k: kb, .. }) = (&a, &b) else {
+            unreachable!()
+        };
+        assert_eq!(
+            legacy_batch_error(ka.all_data.as_ref().unwrap(), kb.all_data.as_ref().unwrap()),
+            "<no error>",
+            "V4's K/V buffers batch fine across a 4-token divergence — which is \
+             why the panic only ever appeared on the compressor slots, and why \
+             a slot-0 check can never catch it"
+        );
     }
 
     /// A single sequence is trivially self-consistent, and a mismatch below

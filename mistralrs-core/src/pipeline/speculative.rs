@@ -324,28 +324,30 @@ impl IsqPipelineMixin for SpeculativePipeline {
 }
 
 impl CacheManagerMixin for SpeculativePipeline {
-    fn clone_in_cache(&self, seqs: &mut [&mut Sequence]) {
+    fn clone_in_cache(&self, seqs: &mut [&mut Sequence]) -> candle_core::Result<()> {
         {
             let draft = get_mut_arcmutex!(self.draft);
             if matches!(draft.cache(), EitherCache::Hybrid(_)) {
                 // Use draft-specific recurrent slots and keep sequence-owned
                 // recurrent_state_idx reserved for the target pipeline.
                 let originals = self.swap_in_draft_recurrent_indices(seqs);
-                HybridCacheManager.clone_in_cache(&*draft, seqs, true);
+                let res = HybridCacheManager.clone_in_cache(&*draft, seqs, true);
                 self.capture_draft_recurrent_indices(seqs);
                 Self::restore_recurrent_indices(seqs, originals);
+                res?;
             } else {
-                NormalCacheManager.clone_in_cache(&*draft, seqs, true);
+                NormalCacheManager.clone_in_cache(&*draft, seqs, true)?;
             }
         }
         {
             let target = get_mut_arcmutex!(self.target);
             if matches!(target.cache(), EitherCache::Hybrid(_)) {
-                HybridCacheManager.clone_in_cache(&*target, seqs, false);
+                HybridCacheManager.clone_in_cache(&*target, seqs, false)?;
             } else {
-                NormalCacheManager.clone_in_cache(&*target, seqs, false);
+                NormalCacheManager.clone_in_cache(&*target, seqs, false)?;
             }
         }
+        Ok(())
     }
     fn clone_out_cache(&self, seqs: &mut [&mut Sequence]) {
         {
@@ -498,7 +500,7 @@ impl Pipeline for SpeculativePipeline {
         let (paged_attn_metadata, post_op) = match backend_metadata {
             CacheBackendMetadata::DefaultInstructions { pre_op, post_op } => {
                 match pre_op {
-                    CacheInstruction::In => self.clone_in_cache(input_seqs),
+                    CacheInstruction::In => self.clone_in_cache(input_seqs)?,
                     CacheInstruction::Nothing => (),
                     CacheInstruction::Reset {
                         reset_non_granular,
@@ -515,7 +517,7 @@ impl Pipeline for SpeculativePipeline {
             }
             CacheBackendMetadata::PagedAttention { metadata } => {
                 // Speculative decoding relies on clone_in/out for hybrid recurrent slots.
-                self.clone_in_cache(input_seqs);
+                self.clone_in_cache(input_seqs)?;
                 (Some(metadata), None)
             }
         };

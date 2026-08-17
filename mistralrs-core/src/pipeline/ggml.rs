@@ -485,7 +485,7 @@ impl IsqPipelineMixin for GGMLPipeline {
 }
 
 impl CacheManagerMixin for GGMLPipeline {
-    fn clone_in_cache(&self, seqs: &mut [&mut Sequence]) {
+    fn clone_in_cache(&self, seqs: &mut [&mut Sequence]) -> candle_core::Result<()> {
         FullCacheManager.clone_in_cache(self, seqs, false)
     }
     fn clone_out_cache(&self, seqs: &mut [&mut Sequence]) {
