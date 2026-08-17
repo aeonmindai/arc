@@ -60,6 +60,34 @@ pub(crate) fn sinks_attn(
     sinks_attn_regular(q, k, v, sinks, mask, sdpa_params, window_size)
 }
 
+/// Is the fused head_dim=512 sinks path enabled? `ARC_FLASH_512=0|false|off|no`
+/// falls back to the unfused matmul + softmax_with_sinks path V4 ran before.
+///
+/// This exists so a fused-vs-unfused comparison is **one binary, one variable**.
+/// Comparing two binaries is how a pin A/B ended up measuring a different
+/// allocation population than the hypothesis was about — the arms differed in
+/// more ways than the one under test.
+///
+/// Named once per process at info, so an A/B can ASSERT it actually got two
+/// different behaviours rather than two identical arms reporting no difference.
+/// A flag whose name is wrong is indistinguishable from a flag that costs
+/// nothing.
+fn flash_512_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = !matches!(
+            std::env::var("ARC_FLASH_512").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        );
+        tracing::info!(
+            target: "arcflash",
+            "fused head_dim=512 sinks path is {} (ARC_FLASH_512)",
+            if on { "FUSED" } else { "UNFUSED" }
+        );
+        on
+    })
+}
+
 /// Non-varlen sinks attention: Q [B, H, q_len, D], K/V [B, kv_H, kv_len, D]
 #[allow(unused_variables)]
 fn sinks_attn_regular(
@@ -84,7 +112,8 @@ fn sinks_attn_regular(
     // `sdpa_with_sinks.metal` instantiates only {64,80,96,128,256}. Routing a
     // 512 head there turns a working unfused fallback into a hard
     // CompilationError. Each backend now advertises its own set.
-    let flash_sinks_ok_cuda = matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256 | 512);
+    let flash_sinks_ok_cuda = matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256)
+        || (hd == 512 && flash_512_enabled());
     let flash_sinks_ok_metal = matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256);
     #[cfg(not(feature = "cuda"))]
     let _ = flash_sinks_ok_cuda;
@@ -155,7 +184,8 @@ fn sinks_attn_varlen(
     // `sdpa_with_sinks.metal` instantiates only {64,80,96,128,256}. Routing a
     // 512 head there turns a working unfused fallback into a hard
     // CompilationError. Each backend now advertises its own set.
-    let flash_sinks_ok_cuda = matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256 | 512);
+    let flash_sinks_ok_cuda = matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256)
+        || (hd == 512 && flash_512_enabled());
     let flash_sinks_ok_metal = matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256);
     #[cfg(not(feature = "cuda"))]
     let _ = flash_sinks_ok_cuda;
