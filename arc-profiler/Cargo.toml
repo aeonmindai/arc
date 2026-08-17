@@ -1,0 +1,24 @@
+[package]
+name = "arc-profiler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Hierarchical host/device/sync profiler for the Arc token path"
+license = "Apache-2.0"
+
+[dependencies]
+candle-core.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tracing.workspace = true
+
+[features]
+default = []
+cuda = ["candle-core/cuda"]
+
+# Turns a run's JSON tree(s) into one self-contained interactive HTML page.
+# Deliberately a separate binary: the report is a *view* of the JSON, and the
+# JSON is the durable artifact. Never needs a GPU.
+[[bin]]
+name = "arc-profile-report"
+path = "src/bin/arc_profile_report.rs"

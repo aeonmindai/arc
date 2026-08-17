@@ -199,10 +199,31 @@ build_from_source() {
             cc_major=$(echo "$cuda_cc" | cut -c1)
             info "CUDA detected (compute ${cc_major}.x)"
 
-            # FlashAttention
+            # FlashAttention.
+            #
+            # Hopper previously selected `flash-attn-v3` ALONE. That shipped a
+            # broken configuration two ways over:
+            #
+            #  1. The pinned candle-flash-attn-v3 is broken for CAUSAL
+            #     attention — dense causal hits an unallocated
+            #     tile_count_semaphore (illegal memory access) and varlen causal
+            #     silently runs full NON-causal attention. See
+            #     huggingface/candle#3606 and the module docs in
+            #     mistralrs-core/src/attention/backends/flash.rs. Causal
+            #     attention is essentially all autoregressive LLM attention.
+            #  2. FA3 accepts only head_dim 64/128/256 and has no softcap
+            #     kernel, so head_dim-80/96/192 models (many vision encoders,
+            #     MLA variants) and Gemma-2-style softcap models had no working
+            #     backend at all.
+            #
+            # We therefore enable BOTH and let the runtime dispatcher use FA2,
+            # which is correct across the whole envelope. FA3 stays compiled in
+            # so it can be A/B'd with ARC_PREFER_FA3=1 once the fork is patched.
+            #
+            # Cost: enabling both roughly doubles the nvcc portion of the build.
             if [ "$cuda_cc" = "90" ]; then
-                features="$features flash-attn-v3"
-                info "Hopper GPU — enabling flash-attn-v3"
+                features="$features flash-attn flash-attn-v3"
+                info "Hopper GPU — enabling flash-attn (+ flash-attn-v3, opt-in via ARC_PREFER_FA3=1)"
             elif [ "$cuda_cc" -ge 80 ] 2>/dev/null; then
                 features="$features flash-attn"
                 info "Ampere+ GPU — enabling flash-attn"

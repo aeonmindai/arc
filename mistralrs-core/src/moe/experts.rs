@@ -560,14 +560,31 @@ impl MoEExperts {
         let (local_ids, topk_weights) = self.ep.localize(topk_ids, &topk_weights)?;
         let topk_ids = &local_ids;
 
+        // Exactly one of the three runs; the other two are declared unreachable
+        // so the report shows which expert backend this build actually took
+        // instead of leaving three silent zeros.
         let mut ys = match &self.backend {
             MoEExpertsBackendImpl::Fused(weights) => {
+                arc_profiler::mark_unreachable(
+                    "experts.fast",
+                    "MoEExpertsBackend::select chose Fused (CUDA, unquantised experts)",
+                    "moe/experts.rs:103",
+                );
+                let _s = arc_profiler::device_span("experts.fused");
                 self.forward_fused(xs, &topk_weights, topk_ids, weights, is_prefill)?
             }
             MoEExpertsBackendImpl::Fast(weights) => {
+                arc_profiler::mark_unreachable(
+                    "experts.fused",
+                    "MoEExpertsBackend::select chose Fast (CUDA/Metal with ISQ or prequantised \
+                     experts) — this is the qtip2b serving path",
+                    "moe/experts.rs:97",
+                );
+                let _s = arc_profiler::device_span("experts.fast");
                 self.forward_fast(xs, &topk_weights, topk_ids, weights)?
             }
             MoEExpertsBackendImpl::Slow(weights) => {
+                let _s = arc_profiler::device_span("experts.slow");
                 self.forward_slow(xs, &topk_weights, topk_ids, weights)?
             }
         };
@@ -577,6 +594,7 @@ impl MoEExperts {
         // `y_r = Σ_{j owned by r} w[t,j] · Expert_{g[t,j]}(x[t])`. Both are the
         // same collective on the same communicator.
         if self.world_size > 1 {
+            let _s = arc_profiler::device_span("experts.all_reduce");
             ys = self.all_reduce.sum_all_reduce(&ys)?;
         }
 
@@ -712,12 +730,16 @@ impl MoEExperts {
                 .unsqueeze(1)?
                 .expand((num_tokens, self.num_experts_per_tok, hidden_dim))?
                 .contiguous()?;
-            let gate = weights
-                .fused_gate_proj
-                .gather_forward_autocast(&xs, topk_ids)?;
-            let up = weights
-                .fused_up_proj
-                .gather_forward_autocast(&xs, topk_ids)?;
+            let gate = {
+                let _s = arc_profiler::device_span("experts.gate_proj");
+                weights
+                    .fused_gate_proj
+                    .gather_forward_autocast(&xs, topk_ids)?
+            };
+            let up = {
+                let _s = arc_profiler::device_span("experts.up_proj");
+                weights.fused_up_proj.gather_forward_autocast(&xs, topk_ids)?
+            };
             crate::models::deepseek4::v4_stat_dbg(&gate, "exp.gate");
             crate::models::deepseek4::v4_stat_dbg(&up, "exp.up");
             // RUN-161 collapse localization: cross-token cosine at each expert
@@ -737,11 +759,17 @@ impl MoEExperts {
             // (see [`swiglu_clamp`]) — NOT `inference/model.py:596-606`, which
             // this comment used to cite and which contains no clamp anywhere
             // (audit §"Prior-art corrections").
-            let prod = self.swiglu(&gate, &up)?;
+            let prod = {
+                let _s = arc_profiler::device_span("experts.swiglu");
+                self.swiglu(&gate, &up)?
+            };
             crate::models::deepseek4::v4_stat_dbg(&prod, "exp.prod");
-            let down = weights
-                .fused_down_proj
-                .gather_forward_autocast(&prod, topk_ids)?;
+            let down = {
+                let _s = arc_profiler::device_span("experts.down_proj");
+                weights
+                    .fused_down_proj
+                    .gather_forward_autocast(&prod, topk_ids)?
+            };
             crate::models::deepseek4::v4_stat_dbg(&down, "exp.down");
             crate::models::deepseek4::v4_collapse_dbg(&prod, "exp.prod", 0);
             crate::models::deepseek4::v4_collapse_dbg(&down, "exp.down", 0);
@@ -765,6 +793,7 @@ impl MoEExperts {
                 .reshape((num_tokens, self.num_experts_per_tok, hidden_dim))?
         };
 
+        let _s = arc_profiler::device_span("experts.weighted_sum");
         ys.to_dtype(DType::F32)?
             .broadcast_mul(&topk_weights.unsqueeze(D::Minus1)?)?
             .sum(D::Minus2)?

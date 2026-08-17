@@ -1,0 +1,1714 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arc profile</title>
+<!--
+  arc-profiler report template.
+
+  SELF-CONTAINED BY CONTRACT: no external CSS, JS, fonts, images, CDN or fetch.
+  Opens from a laptop with no network. Vanilla JS only.
+
+  INJECTION CONTRACT
+  The Rust side replaces the placeholder token (an empty-array literal preceded
+  by a block comment reading __ARC_PROFILE_DATA__) with a JSON array of Profile
+  objects. That token is marked "DATA INJECTION POINT" in the script below and
+  occurs EXACTLY ONCE in this file by design, so a plain `str::replace` is safe.
+  Nothing else in this file may reproduce those bytes -- the prose above and the
+  empty-state markup deliberately spell the asterisks as entities to avoid it.
+
+  Two things the emitter must also do:
+    1. Escape any "<" + "/script" sequence inside the JSON (e.g. as "<\/script").
+    2. Emit finite numbers only; NaN and Infinity are not valid JSON.
+-->
+<style>
+/* ==========================================================================
+   Theme tokens. Light on bare :root, dark redefined under prefers-color-scheme.
+   Every colour used anywhere resolves through one of these.
+   ========================================================================== */
+:root{
+  --bg:            #f4f6f9;
+  --panel:         #ffffff;
+  --panel-2:       #eef1f5;
+  --panel-3:       #e4e9f0;
+  --fg:            #12161c;
+  --fg-dim:        #55606f;
+  --fg-faint:      #838f9f;
+  --border:        #d5dce5;
+  --border-strong: #b0bbc9;
+  --accent:        #1d4ed8;
+  --accent-soft:   #dbe6fe;
+
+  /* span kinds --------------------------------------------------------- */
+  --host-fill:   #cfe0fa;  --host-line:   #2b5fb8;  --host-dot:  #3b76d8;
+  --device-fill: #c8ecdd;  --device-line: #0d7a58;  --device-dot:#12a67a;
+  --sync-fill:   #fadfba;  --sync-line:   #9a5c07;  --sync-dot:  #d8880f;
+  --root-fill:   #dee4ec;  --root-line:   #4a5566;  --root-dot:  #6b7787;
+  --bar-text:    #12161c;
+
+  --stripe:      rgba(20,28,40,.16);
+  --warn-bg:     #fdf1e0;  --warn-fg:#7d4405;  --warn-border:#e2ab68;
+  --bad-bg:      #fdecea;  --bad-fg: #97231a;  --bad-border: #e79b93;
+  --good-bg:     #e6f6ee;  --good-fg:#0f6d49;  --good-border:#8fcfb3;
+
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --ui:   system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --shadow: 0 1px 2px rgba(16,24,40,.07), 0 1px 6px rgba(16,24,40,.04);
+  --radius: 7px;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:            #0d1117;
+    --panel:         #151b23;
+    --panel-2:       #1c242e;
+    --panel-3:       #232d39;
+    --fg:            #e8edf4;
+    --fg-dim:        #9fadbf;
+    --fg-faint:      #6d7c8e;
+    --border:        #2b3542;
+    --border-strong: #3d4a5a;
+    --accent:        #6ea1ff;
+    --accent-soft:   #1c2b47;
+
+    --host-fill:   #24406c;  --host-line:   #8ab4f8;  --host-dot:  #6b9cf0;
+    --device-fill: #17503f;  --device-line: #6fdcb4;  --device-dot:#37bd91;
+    --sync-fill:   #573a10;  --sync-line:   #f0bb63;  --sync-dot:  #d99a2b;
+    --root-fill:   #2a323d;  --root-line:   #9dabbc;  --root-dot:  #8593a5;
+    --bar-text:    #eaf0f7;
+
+    --stripe:      rgba(215,228,245,.18);
+    --warn-bg:     #3a2a10;  --warn-fg:#f3c684;  --warn-border:#6d5220;
+    --bad-bg:      #3a1c19;  --bad-fg: #f7a79d;  --bad-border: #6e3029;
+    --good-bg:     #102f24;  --good-fg:#78d7ab;  --good-border:#215442;
+    --shadow: 0 1px 2px rgba(0,0,0,.4);
+  }
+}
+
+/* ==========================================================================
+   Base
+   ========================================================================== */
+*{box-sizing:border-box}
+html,body{max-width:100%}
+body{
+  margin:0; padding:0;
+  background:var(--bg);            /* explicit: never inherit the host's ground */
+  color:var(--fg);
+  font-family:var(--ui);
+  font-size:13px; line-height:1.45;
+  overflow-x:hidden;               /* wide content scrolls inside its own box */
+  -webkit-text-size-adjust:100%;
+}
+a{color:var(--accent)}
+h1,h2,h3{margin:0; font-weight:650; letter-spacing:-.01em}
+h1{font-size:15px}
+h2{font-size:12.5px; text-transform:uppercase; letter-spacing:.07em; color:var(--fg-dim)}
+code,.mono,.num{font-family:var(--mono); font-variant-numeric:tabular-nums}
+.num{text-align:right; white-space:nowrap}
+.dim{color:var(--fg-dim)}
+.faint{color:var(--fg-faint)}
+.nowrap{white-space:nowrap}
+
+#wrap{max-width:1900px; margin:0 auto; padding:12px clamp(8px,1.6vw,20px) 60px}
+
+/* ---- panels -------------------------------------------------------------- */
+.panel{
+  background:var(--panel); border:1px solid var(--border);
+  border-radius:var(--radius); box-shadow:var(--shadow);
+  margin:0 0 12px; padding:11px 13px 13px; min-width:0;
+}
+.panel > header{
+  display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  margin:0 0 9px; padding:0 0 7px; border-bottom:1px solid var(--border);
+}
+.panel > header .spacer{flex:1 1 auto}
+.grid2{display:grid; grid-template-columns:repeat(auto-fit,minmax(330px,1fr)); gap:12px; align-items:start}
+.grid2 > *{min-width:0}
+
+/* ---- controls ------------------------------------------------------------ */
+button, select, input[type=text], input[type=search]{
+  font-family:inherit; font-size:12px; color:var(--fg);
+  background:var(--panel-2); border:1px solid var(--border-strong);
+  border-radius:5px; padding:4px 9px; line-height:1.4;
+}
+button{cursor:pointer}
+button:hover:not(:disabled), select:hover{background:var(--panel-3)}
+button:disabled{opacity:.45; cursor:not-allowed}
+button.on{background:var(--accent); border-color:var(--accent); color:#fff}
+@media (prefers-color-scheme: dark){ button.on{color:#0d1117} }
+:focus-visible{outline:2px solid var(--accent); outline-offset:1px}
+.seg{display:inline-flex; border:1px solid var(--border-strong); border-radius:5px; overflow:hidden}
+.seg button{border:0; border-radius:0; border-right:1px solid var(--border-strong)}
+.seg button:last-child{border-right:0}
+.ctl{display:flex; align-items:center; gap:6px; flex-wrap:wrap}
+label.lbl{font-size:11px; color:var(--fg-dim); text-transform:uppercase; letter-spacing:.05em}
+
+/* ---- chips / badges ------------------------------------------------------ */
+.chip{
+  display:inline-block; padding:1px 7px; border-radius:999px; font-size:11px;
+  background:var(--panel-2); border:1px solid var(--border); color:var(--fg-dim);
+  font-family:var(--mono); white-space:nowrap;
+}
+.badge{display:inline-block; padding:0 5px; border-radius:3px; font-size:10px; font-weight:700;
+       letter-spacing:.04em; text-transform:uppercase; border:1px solid transparent; white-space:nowrap}
+.badge.k-host  {background:var(--host-fill);   color:var(--host-line);   border-color:var(--host-line)}
+.badge.k-device{background:var(--device-fill); color:var(--device-line); border-color:var(--device-line)}
+.badge.k-sync  {background:var(--sync-fill);   color:var(--sync-line);   border-color:var(--sync-line)}
+.badge.k-root  {background:var(--root-fill);   color:var(--root-line);   border-color:var(--root-line)}
+.badge.unreach {background:transparent; color:var(--fg-faint); border-color:var(--border-strong); border-style:dashed}
+
+/* ---- callouts ------------------------------------------------------------ */
+.callout{border:1px solid var(--border); border-radius:6px; padding:8px 11px; margin:0 0 10px; font-size:12.5px}
+.callout.warn{background:var(--warn-bg); color:var(--warn-fg); border-color:var(--warn-border)}
+.callout.bad {background:var(--bad-bg);  color:var(--bad-fg);  border-color:var(--bad-border)}
+.callout.good{background:var(--good-bg); color:var(--good-fg); border-color:var(--good-border)}
+.callout b{font-weight:700}
+
+/* ---- key/value grid ------------------------------------------------------ */
+.kv{display:grid; grid-template-columns:auto 1fr; gap:2px 12px; align-items:baseline; font-size:12px}
+.kv dt{color:var(--fg-dim); white-space:nowrap}
+.kv dd{margin:0; font-family:var(--mono); overflow-wrap:anywhere}
+.kv dd.empty{font-family:var(--ui); color:var(--fg-faint)}
+
+/* ==========================================================================
+   Icicle chart
+   ========================================================================== */
+#chartOuter{position:relative; min-width:0}
+#chart{position:relative; width:100%; overflow:hidden; user-select:none;
+       background:var(--panel-2); border:1px solid var(--border); border-radius:5px}
+#chart:focus{outline:2px solid var(--accent); outline-offset:1px}
+.bar{
+  position:absolute; height:19px; overflow:hidden;
+  border:1px solid var(--root-line); border-radius:2px;
+  font-size:11px; line-height:17px; padding:0 3px;
+  color:var(--bar-text); white-space:nowrap; cursor:pointer;
+  background:var(--root-fill);
+}
+.bar.k-host  {background:var(--host-fill);   border-color:var(--host-line)}
+.bar.k-device{background:var(--device-fill); border-color:var(--device-line)}
+.bar.k-sync  {background:var(--sync-fill);   border-color:var(--sync-line)}
+.bar.k-root  {background:var(--root-fill);   border-color:var(--root-line)}
+/* zero-in-this-metric: hatched 45deg stub, muted */
+.bar.stub{
+  background-color:var(--panel-3); border-color:var(--border-strong); color:var(--fg-faint);
+  background-image:repeating-linear-gradient(45deg, transparent 0 3px, var(--stripe) 3px 6px);
+}
+/* provably-not-taken: hatched the OTHER way + dashed border. Deliberately
+   distinguishable from "zero because it was fast". */
+.bar.unreach{
+  background-color:transparent; border-style:dashed; border-color:var(--border-strong);
+  color:var(--fg-faint);
+  background-image:repeating-linear-gradient(-45deg, transparent 0 4px, var(--stripe) 4px 8px);
+}
+.bar.ctx{opacity:.62}
+.bar.sel{outline:2px solid var(--accent); outline-offset:-1px; z-index:3}
+.bar.hot{filter:brightness(1.08) saturate(1.15); z-index:2}
+.bar .lbl{pointer-events:none}
+.bar .mk{opacity:.75; font-weight:700}
+
+#legend{display:flex; gap:12px; flex-wrap:wrap; font-size:11px; color:var(--fg-dim); margin-top:8px}
+#legend .li{display:flex; align-items:center; gap:5px}
+#legend .sw{width:13px; height:13px; border-radius:3px; border:1px solid var(--border-strong); display:inline-block}
+#legend .sw.host{background:var(--host-fill); border-color:var(--host-line)}
+#legend .sw.device{background:var(--device-fill); border-color:var(--device-line)}
+#legend .sw.sync{background:var(--sync-fill); border-color:var(--sync-line)}
+#legend .sw.root{background:var(--root-fill); border-color:var(--root-line)}
+#legend .sw.stub{background-color:var(--panel-3);
+  background-image:repeating-linear-gradient(45deg,transparent 0 3px,var(--stripe) 3px 6px)}
+#legend .sw.unreach{background-color:transparent; border-style:dashed;
+  background-image:repeating-linear-gradient(-45deg,transparent 0 4px,var(--stripe) 4px 8px)}
+
+#crumbs{display:flex; flex-wrap:wrap; align-items:center; gap:3px; font-size:11.5px; font-family:var(--mono);
+        margin:0 0 7px; min-height:20px}
+#crumbs button{padding:1px 6px; font-size:11.5px; font-family:var(--mono); background:transparent; border-color:transparent}
+#crumbs button:hover{background:var(--panel-2); border-color:var(--border)}
+#crumbs button.cur{background:var(--accent-soft); border-color:var(--accent); color:var(--fg)}
+#crumbs .sepr{color:var(--fg-faint)}
+#metricHint{font-size:11.5px; color:var(--fg-dim); margin:7px 0 0}
+
+/* ---- tooltip ------------------------------------------------------------- */
+#tip{
+  position:fixed; z-index:99; pointer-events:none; display:none;
+  max-width:min(460px,92vw); padding:8px 10px;
+  background:var(--panel); color:var(--fg);
+  border:1px solid var(--border-strong); border-radius:6px;
+  box-shadow:0 6px 22px rgba(0,0,0,.28); font-size:11.5px;
+}
+#tip .tpath{font-family:var(--mono); font-weight:700; overflow-wrap:anywhere; margin-bottom:4px}
+#tip table{border-collapse:collapse; width:100%; font-family:var(--mono); font-variant-numeric:tabular-nums}
+#tip td{padding:1px 0}
+#tip td.k{color:var(--fg-dim); padding-right:10px; white-space:nowrap; font-family:var(--ui)}
+#tip td.v{text-align:right; white-space:nowrap}
+#tip td.x{text-align:right; white-space:nowrap; color:var(--fg-faint); padding-left:10px}
+#tip .sect{color:var(--fg-faint); font-size:10px; text-transform:uppercase; letter-spacing:.06em; padding-top:5px}
+#tip .warnline{margin-top:5px; padding:4px 6px; border-radius:4px; background:var(--warn-bg);
+               color:var(--warn-fg); border:1px solid var(--warn-border); font-family:var(--ui)}
+#tip .noteline{margin-top:5px; font-style:italic; color:var(--fg-dim)}
+
+/* ==========================================================================
+   Tables
+   ========================================================================== */
+.tblwrap{overflow-x:auto; max-width:100%; border:1px solid var(--border); border-radius:5px}
+.tblwrap.tall{max-height:62vh; overflow-y:auto}
+table.dt{border-collapse:separate; border-spacing:0; width:100%; font-size:11.5px}
+table.dt th, table.dt td{padding:3px 8px; border-bottom:1px solid var(--border); white-space:nowrap}
+table.dt th{
+  position:sticky; top:0; z-index:2; background:var(--panel-2);
+  text-align:left; font-weight:650; color:var(--fg-dim); cursor:pointer;
+  border-bottom:1px solid var(--border-strong); font-size:11px;
+}
+table.dt th.n, table.dt td.n{text-align:right; font-family:var(--mono); font-variant-numeric:tabular-nums}
+table.dt th.grp{background:var(--panel-3)}
+table.dt tbody tr:hover{background:var(--panel-2)}
+table.dt tbody tr.sel{background:var(--accent-soft)}
+table.dt tbody tr{cursor:pointer}
+table.dt td.g-dev{background:color-mix(in srgb, var(--device-fill) 26%, transparent)}
+table.dt td.g-sync{background:color-mix(in srgb, var(--sync-fill) 26%, transparent)}
+table.dt td.g-busy{background:color-mix(in srgb, var(--host-fill) 22%, transparent)}
+table.dt th.arrow::after{content:" \25B4"; color:var(--accent)}
+table.dt th.arrow.desc::after{content:" \25BE"}
+/* two-row header (comparison table): stack the sticky rows instead of
+   letting the second one park on top of the first */
+#cmpWrap thead tr:nth-child(2) th{top:23px}
+td.pathcell{font-family:var(--mono); max-width:min(46vw,540px); overflow:hidden; text-overflow:ellipsis}
+td.pathcell .ind{color:var(--fg-faint)}
+.tag{font-size:9.5px; color:var(--fg-faint); border:1px solid var(--border); border-radius:3px;
+     padding:0 3px; margin-left:4px; font-family:var(--ui); vertical-align:1px}
+.miss{color:var(--fg-faint)}
+.dlt-pos{color:var(--bad-fg)}
+.dlt-neg{color:var(--good-fg)}
+.tblnote{font-size:11px; color:var(--fg-dim); margin:6px 0 0}
+
+/* ==========================================================================
+   Host / device / sync summary bar
+   ========================================================================== */
+.sumrow{display:grid; grid-template-columns:92px 1fr; gap:8px; align-items:center; margin-bottom:6px}
+.sumrow .rl{font-size:11px; color:var(--fg-dim); text-align:right; white-space:nowrap}
+.track{position:relative; height:22px; background:var(--panel-2); border:1px solid var(--border);
+       border-radius:4px; overflow:hidden; display:flex}
+.track .seg2{height:100%; overflow:hidden; font-size:10px; line-height:20px; padding:0 4px;
+             color:var(--bar-text); white-space:nowrap; border-right:1px solid rgba(128,128,128,.35)}
+.track .seg2:last-child{border-right:0}
+.seg2.busy{background:var(--host-fill)}
+.seg2.sync{background:var(--sync-fill)}
+.seg2.other{background:var(--panel-3);
+  background-image:repeating-linear-gradient(45deg,transparent 0 3px,var(--stripe) 3px 6px); color:var(--fg-faint)}
+.seg2.dev{background:var(--device-fill)}
+.readout{font-family:var(--mono); font-size:12px; margin-top:9px; padding:7px 9px;
+         background:var(--panel-2); border:1px solid var(--border); border-radius:5px; overflow-wrap:anywhere}
+
+/* ==========================================================================
+   Misc
+   ========================================================================== */
+#jsonBox{width:100%; min-height:150px; max-height:44vh; font-family:var(--mono); font-size:11px;
+  background:var(--panel-2); color:var(--fg); border:1px solid var(--border-strong);
+  border-radius:5px; padding:7px; resize:vertical; white-space:pre; overflow:auto}
+.empty-state{text-align:center; padding:56px 20px; color:var(--fg-dim)}
+.empty-state h1{font-size:20px; margin-bottom:8px; color:var(--fg)}
+.empty-state code{background:var(--panel-2); border:1px solid var(--border); border-radius:4px; padding:2px 6px}
+ul.plain{margin:4px 0 0; padding-left:18px}
+ul.plain li{margin:2px 0}
+.hidden{display:none !important}
+.srow{display:flex; gap:10px; flex-wrap:wrap; align-items:center}
+.stat{background:var(--panel-2); border:1px solid var(--border); border-radius:5px; padding:5px 9px; min-width:104px}
+.stat .sv{font-family:var(--mono); font-size:14px; font-variant-numeric:tabular-nums}
+.stat .sk{font-size:10px; color:var(--fg-dim); text-transform:uppercase; letter-spacing:.05em}
+@media (max-width:760px){
+  .sumrow{grid-template-columns:1fr}
+  .sumrow .rl{text-align:left}
+}
+</style>
+</head>
+<body>
+<div id="wrap">
+
+  <!-- ==================== empty state ==================== -->
+  <div id="emptyState" class="empty-state hidden">
+    <h1>No profile data embedded</h1>
+    <p>This page is the arc-profiler report <strong>template</strong>. It renders once a run is
+       baked into it.</p>
+    <!-- asterisks written as &#42; so these bytes are NOT a second injection target -->
+    <p class="faint">The emitter replaces <code>/&#42;__ARC_PROFILE_DATA__&#42;/[]</code> with a JSON
+       array of <code>arc-profile/1</code> objects.</p>
+  </div>
+
+  <!-- ==================== app ==================== -->
+  <div id="app" class="hidden">
+
+    <div class="panel" id="topbar">
+      <header>
+        <h1>Arc token-path profile</h1>
+        <span class="chip" id="schemaChip"></span>
+        <div class="spacer"></div>
+        <div class="ctl">
+          <label class="lbl" for="runSel">Run</label>
+          <select id="runSel"></select>
+          <button id="cmpBtn" title="Side-by-side comparison across runs, keyed by node path">Compare runs</button>
+        </div>
+      </header>
+      <div id="runChips" class="srow"></div>
+    </div>
+
+    <div id="banners"></div>
+
+    <div class="grid2">
+      <!-- ---------- run metadata ---------- -->
+      <section class="panel" id="metaPanel">
+        <header><h2>Run</h2></header>
+        <dl class="kv" id="runKv"></dl>
+        <div id="runNotes"></div>
+      </section>
+
+      <!-- ---------- totals + derived ---------- -->
+      <section class="panel" id="totalsPanel">
+        <header><h2>Totals &amp; per-token</h2></header>
+        <dl class="kv" id="totalsKv"></dl>
+        <header style="margin-top:11px"><h2>Instrumentation overhead</h2></header>
+        <dl class="kv" id="ovhKv"></dl>
+      </section>
+    </div>
+
+    <!-- ---------- host / device / sync ---------- -->
+    <section class="panel" id="summaryPanel">
+      <header><h2>Where the wall clock went</h2></header>
+      <div id="sumBars"></div>
+      <div class="readout" id="readout"></div>
+      <p class="tblnote" id="sumNote"></p>
+    </section>
+
+    <!-- ---------- icicle ---------- -->
+    <section class="panel" id="chartPanel">
+      <header>
+        <h2>Icicle</h2>
+        <div class="ctl">
+          <label class="lbl">Metric</label>
+          <div class="seg" id="metricSeg">
+            <button data-m="wall">wall</button>
+            <button data-m="device">device</button>
+            <button data-m="sync">sync</button>
+            <button data-m="busy_self">busy&nbsp;self</button>
+          </div>
+        </div>
+        <div class="spacer"></div>
+        <div class="ctl">
+          <button id="zoomOutBtn" title="Zoom out one level">&#8593; Out</button>
+          <button id="resetBtn" title="Reset zoom (Esc)">Reset</button>
+        </div>
+      </header>
+      <div id="crumbs"></div>
+      <div id="chartOuter">
+        <div id="chart" tabindex="0" role="tree"
+             aria-label="Span tree icicle chart. Arrow keys move selection, Enter zooms, Escape resets."></div>
+      </div>
+      <div id="legend"></div>
+      <p id="metricHint"></p>
+    </section>
+
+    <!-- ---------- node table ---------- -->
+    <section class="panel" id="tablePanel">
+      <header>
+        <h2>Nodes</h2>
+        <div class="ctl">
+          <input type="search" id="filterInp" placeholder="filter by path substring&hellip;" size="26"
+                 autocomplete="off" spellcheck="false">
+          <button id="clearFilter" title="Clear filter">&times;</button>
+        </div>
+        <div class="spacer"></div>
+        <span class="chip" id="tblCount"></span>
+      </header>
+      <div class="tblwrap tall" id="tblWrap">
+        <table class="dt" id="nodeTbl">
+          <thead><tr id="nodeHead"></tr></thead>
+          <tbody id="nodeBody"></tbody>
+        </table>
+      </div>
+      <p class="tblnote">Click a row to zoom the icicle to that span. <code>wall</code> on a
+        <span class="badge k-device">device</span> span is <em>launch cost only</em> &mdash; the GPU
+        time is in the device columns.</p>
+    </section>
+
+    <!-- ---------- comparison ---------- -->
+    <section class="panel hidden" id="comparePanel">
+      <header>
+        <h2>Run comparison</h2>
+        <div class="ctl" id="cmpRunPicks"></div>
+        <div class="spacer"></div>
+        <div class="ctl">
+          <input type="search" id="cmpFilterInp" placeholder="filter by path&hellip;" size="20"
+                 autocomplete="off" spellcheck="false">
+          <button id="cmpClose">Close</button>
+        </div>
+      </header>
+      <div class="tblwrap tall" id="cmpWrap"></div>
+      <p class="tblnote" id="cmpNote"></p>
+    </section>
+
+    <!-- ---------- health ---------- -->
+    <section class="panel" id="healthPanel">
+      <header><h2>Profile health</h2></header>
+      <div id="healthBody"></div>
+    </section>
+
+    <!-- ---------- JSON ---------- -->
+    <section class="panel" id="jsonPanel">
+      <header>
+        <h2>JSON</h2>
+        <div class="ctl">
+          <button id="jsonNodeBtn">Selected node</button>
+          <button id="jsonSubtreeBtn">Selected subtree</button>
+          <button id="jsonRunBtn">This run</button>
+          <button id="jsonAllBtn">All runs</button>
+          <div class="spacer"></div>
+          <button id="jsonCopyBtn" class="on">Copy to clipboard</button>
+        </div>
+        <div class="spacer"></div>
+        <span class="chip" id="jsonStatus"></span>
+      </header>
+      <textarea id="jsonBox" readonly spellcheck="false"
+                aria-label="JSON export. Select all and copy; file downloads are blocked in some viewers."></textarea>
+      <p class="tblnote">Deliberately a text box, not a download link &mdash; <code>&lt;a download&gt;</code>
+        is inert inside sandboxed viewers. Click the box to select everything.</p>
+    </section>
+
+  </div><!-- /#app -->
+</div><!-- /#wrap -->
+
+<div id="tip" role="tooltip"></div>
+
+<script>
+'use strict';
+/* ===========================================================================
+ * DATA INJECTION POINT — the next line is replaced verbatim by the Rust
+ * emitter. Do not reformat it.
+ * ======================================================================== */
+const RUNS = /*__ARC_PROFILE_DATA__*/[];
+
+/* ===========================================================================
+ * 0. Small utilities
+ * ======================================================================== */
+const $  = (id) => document.getElementById(id);
+const NF = new Intl.NumberFormat('en-US');
+
+/** Integer with thousands separators. */
+function int(v){ return Number.isFinite(v) ? NF.format(Math.round(v)) : '—'; }
+
+/** Significant-ish decimals: wider magnitudes get fewer decimals. */
+function sig(x){
+  const a = Math.abs(x);
+  if (a >= 1000) return NF.format(Math.round(x));
+  if (a >= 100)  return x.toFixed(1);
+  if (a >= 10)   return x.toFixed(2);
+  return x.toFixed(3);
+}
+
+/** Human-scaled duration from nanoseconds. Never lies about magnitude. */
+function ns(v){
+  if (v === null || v === undefined || !Number.isFinite(v)) return '—';
+  const a = Math.abs(v);
+  if (a === 0)   return '0';
+  if (a < 1e3)   return NF.format(Math.round(v)) + ' ns';
+  if (a < 1e6)   return sig(v / 1e3) + ' µs';
+  if (a < 1e9)   return sig(v / 1e6) + ' ms';
+  return sig(v / 1e9) + ' s';
+}
+/** Exact nanoseconds, grouped. */
+function nsExact(v){ return Number.isFinite(v) ? NF.format(Math.round(v)) + ' ns' : '—'; }
+
+function pct(v, dp){
+  if (!Number.isFinite(v)) return '—';
+  return v.toFixed(dp === undefined ? 2 : dp) + '%';
+}
+/** Division that yields NaN (rendered as an em dash) instead of Infinity. */
+function div(a, b){ return (Number.isFinite(a) && Number.isFinite(b) && b !== 0) ? a / b : NaN; }
+function num(v){ return Number.isFinite(v) ? v : 0; }
+
+function esc(s){
+  return String(s === null || s === undefined ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+function clamp(v, lo, hi){ return v < lo ? lo : (v > hi ? hi : v); }
+
+/* ===========================================================================
+ * 1. Metric definitions
+ *
+ *  Every metric needs an INCLUSIVE value (subtree total) to lay out the icicle
+ *  and a SELF value for readouts.
+ *   - wall / device / sync arrive inclusive from the emitter.
+ *   - busy_self is self-only by definition, so we roll it up ourselves.
+ * ======================================================================== */
+const METRICS = {
+  wall: {
+    key:'wall', label:'wall', title:'Wall clock',
+    incl:(n)=>num(n.wall_ns), self:(n)=>num(n.wall_self_ns),
+    hint:'Wall clock spent inside the span on the host, summed over all calls. ' +
+         'On a device span this is the LAUNCH cost only — the kernel runs asynchronously.'
+  },
+  device: {
+    key:'device', label:'device', title:'GPU execution',
+    incl:(n)=>num(n.device_ns), self:(n)=>num(n.device_self_ns),
+    hint:'GPU execution time measured with CUDA events. Independent of wall: a device span ' +
+         'can show microseconds of wall and milliseconds of device. Spans with no GPU work ' +
+         'render as hatched stubs, not as nothing.'
+  },
+  sync: {
+    key:'sync', label:'sync', title:'Host blocked on GPU',
+    incl:(n)=>num(n.sync_ns), self:(n)=>num(n._syncSelf),
+    hint:'Wall time the host spent blocked waiting for the GPU. This is dead host time: ' +
+         'it is inside wall, and it is the part you remove by overlapping work.'
+  },
+  busy_self: {
+    key:'busy_self', label:'busy self', title:'Host genuinely computing',
+    incl:(n)=>num(n._busyIncl), self:(n)=>num(n.busy_self_ns),
+    hint:'Host time actually computing at each node (wall_self − sync), rolled up over the ' +
+         'subtree for layout. This is the only channel where a wide bar means "real CPU work here".'
+  }
+};
+
+/* ===========================================================================
+ * 2. Profile preparation — build tree, roll up derived values.
+ *    Defensive throughout: malformed / partial profiles must render, not throw.
+ * ======================================================================== */
+const PREP = new Map(); // run index -> prepared model
+
+function prepare(idx){
+  if (PREP.has(idx)) return PREP.get(idx);
+  const raw = RUNS[idx] || {};
+  const nodes = Array.isArray(raw.nodes) ? raw.nodes.slice() : [];
+
+  // ---- index by id (first wins on duplicate ids) -------------------------
+  const byId = new Map();
+  for (const n of nodes) if (!byId.has(n.id)) byId.set(n.id, n);
+
+  // ---- reset link fields -------------------------------------------------
+  for (const n of nodes){ n._kids = []; n._up = null; }
+
+  // ---- link via explicit children arrays, then via parent pointers -------
+  const claimed = new Set();
+  for (const n of nodes){
+    const ch = Array.isArray(n.children) ? n.children : [];
+    for (const cid of ch){
+      const c = byId.get(cid);
+      if (!c || c === n || claimed.has(cid)) continue;
+      claimed.add(cid); c._up = n; n._kids.push(c);
+    }
+  }
+  for (const n of nodes){
+    if (n._up === null && n.parent !== null && n.parent !== undefined && !claimed.has(n.id)){
+      const p = byId.get(n.parent);
+      if (p && p !== n){ claimed.add(n.id); n._up = p; p._kids.push(n); }
+    }
+  }
+
+  // ---- roots -------------------------------------------------------------
+  let roots = nodes.filter(n => n._up === null);
+  if (roots.length === 0 && nodes.length){       // pathological cycle: cut one edge
+    const n0 = nodes[0];
+    if (n0._up){ n0._up._kids = n0._up._kids.filter(k => k !== n0); n0._up = null; }
+    roots = [n0];
+  }
+
+  let root;
+  if (roots.length === 1){
+    root = roots[0];
+  } else if (roots.length === 0){
+    root = synthRoot([]);                        // completely empty profile
+    nodes.push(root); byId.set(root.id, root);
+  } else {
+    root = synthRoot(roots);                     // several detached trees
+    for (const r of roots) r._up = root;
+    nodes.unshift(root);
+    byId.set(root.id, root);
+  }
+
+  // ---- DFS: cut cycles, assign display depth, collect order --------------
+  const all = [];
+  const seen = new Set();
+  (function walk(n, depth){
+    if (seen.has(n)) return;
+    seen.add(n);
+    n._depth = depth;
+    all.push(n);
+    n._kids = n._kids.filter(k => !seen.has(k));
+    for (const k of n._kids) walk(k, depth + 1);
+  })(root, 0);
+  // any node the DFS never reached (broken links) still belongs in the table
+  for (const n of nodes){
+    if (!seen.has(n)){ n._depth = Number.isFinite(n.depth) ? n.depth : 0; n._detached = true; all.push(n); }
+  }
+
+  // ---- post-order roll-ups ----------------------------------------------
+  (function rollup(n){
+    let busyKids = 0, syncKids = 0;
+    for (const k of n._kids){ rollup(k); busyKids += num(k._busyIncl); syncKids += num(k.sync_ns); }
+    n._busyIncl = num(n.busy_self_ns) + busyKids;
+    n._syncSelf = Math.max(0, num(n.sync_ns) - syncKids);
+  })(root);
+  for (const n of all){
+    if (n._busyIncl === undefined) n._busyIncl = num(n.busy_self_ns);
+    if (n._syncSelf === undefined) n._syncSelf = num(n.sync_ns);
+  }
+
+  // ---- per-node derived table columns -----------------------------------
+  const rootWall = num(root.wall_ns);
+  let maxDepth = 0;
+  for (const n of all){
+    n._meanWall = div(num(n.wall_ns), num(n.calls));
+    n._pctRoot  = rootWall > 0 ? (num(n.wall_ns) / rootWall) * 100 : NaN;
+    n._path     = (n.path !== null && n.path !== undefined && n.path !== '') ? String(n.path)
+                : (n.name !== undefined ? String(n.name) : ('#' + n.id));
+    n._name     = (n.name !== null && n.name !== undefined && n.name !== '') ? String(n.name) : n._path;
+    n._kind     = ['root','host','device','sync'].indexOf(n.kind) >= 0 ? n.kind : 'host';
+    n._unreach  = n.reachable === false;
+    if (n._depth > maxDepth) maxDepth = n._depth;
+  }
+
+  const model = {
+    idx, raw,
+    schema: raw.schema || 'unknown',
+    run:    raw.run || {},
+    totals: raw.totals || {},
+    ovh:    raw.overhead || {},
+    rec:    raw.reconciliation || null,
+    unreachable: Array.isArray(raw.unreachable) ? raw.unreachable : [],
+    nodes, byId, all, root, maxDepth, rootWall,
+    hasDevice: all.some(n => num(n.device_ns) > 0),
+    hasSync:   all.some(n => num(n.sync_ns) > 0)
+  };
+  PREP.set(idx, model);
+  return model;
+}
+
+let SYNTH_ID = -1;
+function synthRoot(children){
+  const r = {
+    id: SYNTH_ID--, parent:null, name:'(profile)', path:'(profile)', depth:0, kind:'root',
+    calls: 0, wall_ns:0, wall_self_ns:0, device_ns:0, device_self_ns:0,
+    sync_ns:0, busy_self_ns:0, min_wall_ns:0, max_wall_ns:0,
+    reachable:true, children:[], _kids: children.slice(), _up:null, _synth:true
+  };
+  for (const c of children){
+    r.wall_ns   += num(c.wall_ns);
+    r.device_ns += num(c.device_ns);
+    r.sync_ns   += num(c.sync_ns);
+    r.calls     += num(c.calls);
+  }
+  r.note = children.length > 1
+    ? 'Synthetic root: this profile had ' + children.length + ' detached top-level spans.'
+    : undefined;
+  return r;
+}
+
+/* ===========================================================================
+ * 3. Application state
+ * ======================================================================== */
+const S = {
+  run: 0,
+  metric: 'wall',
+  zoomId: null,
+  selId: null,
+  sortKey: 'wall_ns',
+  sortDir: -1,          // -1 desc, +1 asc
+  filter: '',
+  compare: false,
+  cmpSel: new Set(),
+  cmpFilter: ''
+};
+
+function M(){ return prepare(S.run); }
+function metric(){ return METRICS[S.metric] || METRICS.wall; }
+function nodeById(id){ const m = M(); return m.byId.has(id) ? m.byId.get(id) : m.root; }
+function zoomNode(){ const m = M(); return (S.zoomId !== null && m.byId.has(S.zoomId)) ? m.byId.get(S.zoomId) : m.root; }
+function selNode(){ const m = M(); return (S.selId !== null && m.byId.has(S.selId)) ? m.byId.get(S.selId) : m.root; }
+function ancestry(n){ const out = []; let c = n, guard = 0; while (c && guard++ < 512){ out.unshift(c); c = c._up; } return out; }
+
+/* ===========================================================================
+ * 4. Boot
+ * ======================================================================== */
+function boot(){
+  if (!Array.isArray(RUNS) || RUNS.length === 0){
+    $('emptyState').classList.remove('hidden');
+    return;
+  }
+  $('app').classList.remove('hidden');
+  wireControls();
+  selectRun(0, true);
+}
+
+function selectRun(idx, initial){
+  S.run = clamp(idx, 0, RUNS.length - 1);
+  const m = M();
+  S.zoomId = m.root.id;
+  S.selId  = m.root.id;
+  S.sortKey = 'wall_ns'; S.sortDir = -1;
+  if (initial){
+    S.cmpSel = new Set([S.run]);
+    if (RUNS.length > 1) S.cmpSel.add(S.run === 0 ? 1 : 0);
+  }
+  renderAll();
+}
+
+function renderAll(){
+  renderRunSelector();
+  renderBanners();
+  renderMeta();
+  renderTotals();
+  renderSummary();
+  renderMetricSeg();
+  renderChart();
+  renderTableHead();
+  renderTableBody();
+  renderHealth();
+  renderCompare();
+  showJson('node');
+}
+
+/* ===========================================================================
+ * 5. Controls wiring
+ * ======================================================================== */
+function wireControls(){
+  const sel = $('runSel');
+  sel.addEventListener('change', () => selectRun(parseInt(sel.value, 10) || 0, false));
+
+  $('metricSeg').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-m]');
+    if (!b) return;
+    S.metric = b.getAttribute('data-m');
+    renderMetricSeg(); renderChart();
+  });
+
+  $('resetBtn').addEventListener('click', () => { S.zoomId = M().root.id; renderChart(); });
+  $('zoomOutBtn').addEventListener('click', () => {
+    const z = zoomNode();
+    S.zoomId = z._up ? z._up.id : M().root.id;
+    renderChart();
+  });
+
+  // chart interaction ------------------------------------------------------
+  const chart = $('chart');
+  chart.addEventListener('mousemove', onChartMove);
+  chart.addEventListener('mouseleave', hideTip);
+  chart.addEventListener('click', (e) => {
+    const bar = e.target.closest('.bar');
+    if (!bar) return;
+    const id = parseInt(bar.getAttribute('data-id'), 10);
+    S.selId = id; S.zoomId = id;
+    renderChart(); syncTableSelection(); showJson('node');
+    chart.focus({ preventScroll:true });
+  });
+
+  // table ------------------------------------------------------------------
+  let ft = null;
+  $('filterInp').addEventListener('input', (e) => {
+    clearTimeout(ft);
+    const v = e.target.value;
+    ft = setTimeout(() => { S.filter = v.trim().toLowerCase(); renderTableBody(); }, 90);
+  });
+  $('clearFilter').addEventListener('click', () => {
+    $('filterInp').value = ''; S.filter = ''; renderTableBody();
+  });
+  $('nodeHead').addEventListener('click', (e) => {
+    const th = e.target.closest('th[data-k]');
+    if (!th) return;
+    const k = th.getAttribute('data-k');
+    if (S.sortKey === k) S.sortDir = -S.sortDir;
+    else { S.sortKey = k; S.sortDir = (COLS.find(c => c.k === k) || {}).num ? -1 : 1; }
+    renderTableHead(); renderTableBody();
+  });
+  $('nodeBody').addEventListener('click', (e) => {
+    const tr = e.target.closest('tr[data-id]');
+    if (!tr) return;
+    const id = parseInt(tr.getAttribute('data-id'), 10);
+    S.selId = id; S.zoomId = id;
+    renderChart(); syncTableSelection(); showJson('node');
+  });
+  $('nodeBody').addEventListener('mouseover', (e) => {
+    const tr = e.target.closest('tr[data-id]');
+    if (!tr) return;
+    highlightBar(parseInt(tr.getAttribute('data-id'), 10));
+  });
+  $('nodeBody').addEventListener('mouseout', () => highlightBar(null));
+
+  // compare ----------------------------------------------------------------
+  $('cmpBtn').addEventListener('click', () => {
+    S.compare = !S.compare;
+    $('comparePanel').classList.toggle('hidden', !S.compare);
+    $('cmpBtn').classList.toggle('on', S.compare);
+    if (S.compare) renderCompare();
+  });
+  $('cmpClose').addEventListener('click', () => {
+    S.compare = false;
+    $('comparePanel').classList.add('hidden');
+    $('cmpBtn').classList.remove('on');
+  });
+  let cft = null;
+  $('cmpFilterInp').addEventListener('input', (e) => {
+    clearTimeout(cft);
+    const v = e.target.value;
+    cft = setTimeout(() => { S.cmpFilter = v.trim().toLowerCase(); renderCompare(); }, 90);
+  });
+
+  // JSON -------------------------------------------------------------------
+  $('jsonNodeBtn')   .addEventListener('click', () => showJson('node'));
+  $('jsonSubtreeBtn').addEventListener('click', () => showJson('subtree'));
+  $('jsonRunBtn')    .addEventListener('click', () => showJson('run'));
+  $('jsonAllBtn')    .addEventListener('click', () => showJson('all'));
+  $('jsonCopyBtn')   .addEventListener('click', copyJson);
+  $('jsonBox').addEventListener('focus', function(){ this.select(); });
+
+  // keyboard ---------------------------------------------------------------
+  document.addEventListener('keydown', onKey);
+
+  // resize -----------------------------------------------------------------
+  let raf = 0;
+  window.addEventListener('resize', () => {
+    cancelAnimationFrame(raf);
+    raf = requestAnimationFrame(renderChart);
+  });
+}
+
+function onKey(e){
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+  if (e.key === 'Escape'){ S.zoomId = M().root.id; renderChart(); e.preventDefault(); return; }
+
+  const cur = selNode();
+  let next = null;
+  if (e.key === 'ArrowUp')    next = cur._up || null;
+  else if (e.key === 'ArrowDown') next = cur._kids[0] || null;
+  else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight'){
+    const sib = cur._up ? cur._up._kids : [cur];
+    const i = sib.indexOf(cur);
+    next = sib[i + (e.key === 'ArrowRight' ? 1 : -1)] || null;
+  } else if (e.key === 'Enter'){
+    S.zoomId = cur.id; renderChart(); e.preventDefault(); return;
+  } else return;
+
+  e.preventDefault();
+  if (!next) return;
+  S.selId = next.id;
+  // keep the selection inside the visible subtree without stealing the zoom
+  if (!isVisible(next)) S.zoomId = (next._up ? next._up.id : M().root.id);
+  renderChart(); syncTableSelection(); showJson('node');
+}
+
+function isVisible(n){
+  const z = zoomNode();
+  let c = n, g = 0;
+  while (c && g++ < 512){ if (c === z) return true; c = c._up; }
+  c = z; g = 0;
+  while (c && g++ < 512){ if (c === n) return true; c = c._up; }   // ancestors render as context
+  return false;
+}
+
+/* ===========================================================================
+ * 6. Header: run selector + chips
+ * ======================================================================== */
+function renderRunSelector(){
+  const sel = $('runSel');
+  sel.innerHTML = RUNS.map((r, i) => {
+    const run = (r && r.run) || {};
+    const lbl = run.label || ('run ' + i);
+    const extra = run.requested_batch !== undefined ? (' · B=' + run.requested_batch) : '';
+    return '<option value="' + i + '"' + (i === S.run ? ' selected' : '') + '>' +
+           esc(lbl + extra) + '</option>';
+  }).join('');
+  sel.disabled = RUNS.length < 2;
+  $('cmpBtn').disabled = RUNS.length < 2;
+  $('cmpBtn').title = RUNS.length < 2
+    ? 'Only one run embedded — nothing to compare against'
+    : 'Side-by-side comparison across runs, keyed by node path';
+
+  const m = M();
+  $('schemaChip').textContent = m.schema;
+
+  const run = m.run, t = m.totals;
+  const chips = [
+    ['model',   run.model],
+    ['arch',    run.architecture],
+    ['gpu',     run.gpu_name],
+    ['device',  run.device],
+    ['commit',  run.commit],
+    ['batch',   run.requested_batch],
+    ['steps',   Number.isFinite(t.steps) ? int(t.steps) : run.steps],
+    ['tokens',  Number.isFinite(t.tokens) ? int(t.tokens) : run.tokens]
+  ];
+  $('runChips').innerHTML = chips
+    .filter(c => c[1] !== undefined && c[1] !== null && c[1] !== '')
+    .map(c => '<span class="chip">' + esc(c[0]) + ' ' + esc(c[1]) + '</span>').join('');
+}
+
+/* ===========================================================================
+ * 7. Banners (overhead + hard data problems)
+ * ======================================================================== */
+function renderBanners(){
+  const m = M(), o = m.ovh || {};
+  const out = [];
+  const op = o.enabled_overhead_pct;
+
+  if (Number.isFinite(op) && op > 5){
+    out.push('<div class="callout warn"><b>Instrumentation overhead ' + pct(op) +
+      ' &mdash; this profile is materially measuring itself.</b> At ' +
+      sig(num(o.enabled_ns_per_span)) + ' ns per span &times; ' +
+      sig(num(o.spans_per_step)) + ' spans/step, more than a twentieth of the wall clock ' +
+      'is the profiler. Treat absolute wall numbers as inflated and shapes as approximate; ' +
+      're-run at a shallower <code>profile_depth</code> before drawing conclusions.</div>');
+  }
+  if (!m.hasDevice){
+    out.push('<div class="callout"><b>No GPU time recorded in this run.</b> Every ' +
+      '<code>device_ns</code> is zero, so the <em>device</em> metric will render as hatched stubs ' +
+      'throughout. Either this was a CPU-only run or CUDA event capture was not enabled.</div>');
+  }
+  if (m.root._synth){
+    out.push('<div class="callout bad"><b>Synthetic root.</b> The node list had no single root, ' +
+      'so a container span was fabricated to render the tree. Totals shown on it are sums, ' +
+      'not measurements.</div>');
+  }
+  $('banners').innerHTML = out.join('');
+}
+
+/* ===========================================================================
+ * 8. Run metadata panel
+ * ======================================================================== */
+function kvRows(rows){
+  return rows.map(r => {
+    const v = r[1];
+    const missing = (v === null || v === undefined || v === '');
+    return '<dt>' + esc(r[0]) + '</dt><dd class="' + (missing ? 'empty' : '') + '"' +
+      (r[2] ? ' title="' + esc(r[2]) + '"' : '') + '>' +
+      (missing ? 'not recorded' : (r[3] ? v : esc(v))) + '</dd>';
+  }).join('');
+}
+
+function renderMeta(){
+  const m = M(), r = m.run;
+  const started = Number.isFinite(r.started_unix_ms)
+    ? new Date(r.started_unix_ms).toISOString().replace('T',' ').replace(/\.\d+Z$/,'Z')
+    : null;
+  const feats = Array.isArray(r.build_features) && r.build_features.length
+    ? r.build_features.map(f => '<span class="chip">' + esc(f) + '</span>').join(' ')
+    : null;
+
+  $('runKv').innerHTML = kvRows([
+    ['label',        r.label],
+    ['started',      started],
+    ['commit',       r.commit],
+    ['host',         r.host],
+    ['model',        r.model],
+    ['artifact',     r.artifact],
+    ['architecture', r.architecture],
+    ['device',       r.device],
+    ['gpu',          r.gpu_name],
+    ['driver',       r.driver],
+    ['cuda runtime', r.cuda_runtime],
+    ['features',     feats, '', true],
+    ['batch',        Number.isFinite(r.requested_batch) ? int(r.requested_batch) : r.requested_batch],
+    ['steps',        Number.isFinite(r.steps) ? int(r.steps) : r.steps],
+    ['tokens',       Number.isFinite(r.tokens) ? int(r.tokens) : r.tokens],
+    ['warmup steps', Number.isFinite(r.warmup_steps) ? int(r.warmup_steps) : r.warmup_steps],
+    ['profile depth',Number.isFinite(r.profile_depth) ? int(r.profile_depth) : r.profile_depth],
+    ['unroll layers',r.unroll_layers === undefined ? null : String(!!r.unroll_layers)],
+    ['spans',        int(m.all.length)]
+  ]);
+
+  const notes = Array.isArray(r.notes) ? r.notes.filter(Boolean) : [];
+  $('runNotes').innerHTML = notes.length
+    ? '<h2 style="margin-top:11px">Notes</h2><ul class="plain">' +
+      notes.map(n => '<li>' + esc(n) + '</li>').join('') + '</ul>'
+    : '';
+}
+
+/* ===========================================================================
+ * 9. Totals + per-token derived + overhead
+ * ======================================================================== */
+function renderTotals(){
+  const m = M(), t = m.totals, r = m.run;
+  const steps  = Number.isFinite(t.steps)  ? t.steps  : num(r.steps);
+  const tokens = Number.isFinite(t.tokens) ? t.tokens : num(r.tokens);
+  const wall   = num(t.wall_ns), dev = num(t.device_ns);
+  const sync   = num(t.sync_ns), busy = num(t.busy_host_ns);
+
+  const perTokWall = div(wall, tokens);
+  const tps = div(tokens, wall / 1e9);
+
+  $('totalsKv').innerHTML = kvRows([
+    ['wall',            ns(wall)   + '  (' + nsExact(wall)  + ')'],
+    ['device (GPU)',    ns(dev)    + '  (' + nsExact(dev)   + ')'],
+    ['sync (blocked)',  ns(sync)   + '  (' + nsExact(sync)  + ')'],
+    ['busy host',       ns(busy)   + '  (' + nsExact(busy)  + ')'],
+    ['steps',           int(steps)],
+    ['tokens',          int(tokens)],
+    ['wall / step',     ns(div(wall, steps))],
+    ['wall / token',    ns(perTokWall)],
+    ['device / token',  ns(div(dev, tokens))],
+    ['sync / token',    ns(div(sync, tokens))],
+    ['throughput',      Number.isFinite(tps) ? sig(tps) + ' tok/s' : null],
+    ['gpu / wall',      pct(div(dev, wall) * 100),  'device_ns as a share of wall_ns. >100% means kernels overlapped host work.'],
+    ['blocked / wall',  pct(div(sync, wall) * 100), 'Share of the wall clock the host spent stalled on the GPU.'],
+    ['root span wall',  ns(m.rootWall) + '  (' + esc(m.root._path) + ')']
+  ]);
+
+  const o = m.ovh || {};
+  const op = o.enabled_overhead_pct;
+  const ovhBad = Number.isFinite(op) && op > 5;
+  $('ovhKv').innerHTML = kvRows([
+    ['per span (on)',  Number.isFinite(o.enabled_ns_per_span)  ? sig(o.enabled_ns_per_span)  + ' ns' : null],
+    ['per span (off)', Number.isFinite(o.disabled_ns_per_span) ? sig(o.disabled_ns_per_span) + ' ns' : null],
+    ['spans / step',   Number.isFinite(o.spans_per_step)       ? sig(o.spans_per_step)             : null],
+    ['overhead',       Number.isFinite(op)
+        ? '<span style="color:var(--' + (ovhBad ? 'warn-fg' : 'good-fg') + ')">' + pct(op) +
+          (ovhBad ? ' — material' : ' — acceptable') + '</span>'
+        : null, '', true]
+  ]);
+}
+
+/* ===========================================================================
+ * 10. Host / device / sync summary bar
+ *
+ *  One stacked bar over the wall clock (busy | blocked | unattributed) and,
+ *  beneath it on the same axis, the GPU total. The plain-English readout is
+ *  the whole point of the exercise, so it gets its own box.
+ * ======================================================================== */
+function renderSummary(){
+  const m = M(), t = m.totals;
+  const wall = num(t.wall_ns) || m.rootWall;
+  const dev  = num(t.device_ns);
+  let   sync = num(t.sync_ns);
+  let   busy = num(t.busy_host_ns);
+
+  // fall back to the tree if the totals block is thin
+  if (busy === 0) busy = num(m.root._busyIncl);
+  if (sync === 0) sync = num(m.root.sync_ns);
+
+  const other = Math.max(0, wall - busy - sync);
+  const axis  = Math.max(wall, dev, busy + sync, 1);
+  const w = (v) => (Math.max(0, v) / axis * 100).toFixed(4) + '%';
+
+  const segs = [];
+  if (busy  > 0) segs.push('<div class="seg2 busy"  style="width:' + w(busy)  + '" title="host busy: '  + nsExact(busy)  + '">busy ' + ns(busy) + '</div>');
+  if (sync  > 0) segs.push('<div class="seg2 sync"  style="width:' + w(sync)  + '" title="blocked on GPU: ' + nsExact(sync) + '">blocked ' + ns(sync) + '</div>');
+  if (other > 0) segs.push('<div class="seg2 other" style="width:' + w(other) + '" title="unattributed wall: ' + nsExact(other) + '">unattributed ' + ns(other) + '</div>');
+  if (!segs.length) segs.push('<div class="seg2 other" style="width:100%">no host breakdown recorded</div>');
+
+  $('sumBars').innerHTML =
+    '<div class="sumrow"><div class="rl">host wall</div><div class="track">' + segs.join('') + '</div></div>' +
+    '<div class="sumrow"><div class="rl">GPU</div><div class="track">' +
+      (dev > 0
+        ? '<div class="seg2 dev" style="width:' + w(dev) + '" title="GPU executing: ' + nsExact(dev) + '">executing ' + ns(dev) + '</div>'
+        : '<div class="seg2 other" style="width:100%">no GPU time recorded</div>') +
+    '</div></div>';
+
+  $('readout').textContent =
+    'host busy ' + ns(busy) +
+    ' · host blocked on GPU ' + ns(sync) +
+    ' · GPU executing ' + ns(dev) +
+    ' over a ' + ns(wall) + ' wall';
+
+  const bits = [];
+  bits.push('Both rows share one axis (' + ns(axis) + ' full width).');
+  if (dev > wall) bits.push('GPU total exceeds the wall clock — kernels overlapped host work across steps.');
+  if (other > 0)  bits.push(ns(other) + ' of wall is unattributed: time inside the root span that no ' +
+                            'child span claimed as busy or blocked.');
+  if (wall > 0)   bits.push('The host was stalled for ' + pct(div(sync, wall) * 100) + ' of the run.');
+  $('sumNote').textContent = bits.join(' ');
+}
+
+/* ===========================================================================
+ * 11. Icicle chart
+ * ======================================================================== */
+const ROW_H   = 20;    // px per depth row (bar is 19px + 1px gutter)
+const STUB_PX = 7;     // width given to a zero-valued node so it stays visible
+const CULL_PX = 0.4;   // below this a node (and its subtree) is not emitted
+
+function renderMetricSeg(){
+  const btns = $('metricSeg').querySelectorAll('button[data-m]');
+  for (const b of btns) b.classList.toggle('on', b.getAttribute('data-m') === S.metric);
+  const md = metric();
+  const m = M();
+  let extra = '';
+  if (S.metric === 'device' && !m.hasDevice) extra = ' — this run recorded no GPU time, so every node is a stub.';
+  if (S.metric === 'sync'   && !m.hasSync)   extra = ' — this run recorded no blocking syncs, so every node is a stub.';
+  $('metricHint').textContent = md.hint + extra;
+}
+
+let BAR_INDEX = new Map();   // node id -> bar element (rebuilt each layout)
+let HOT_ID = null;
+
+function renderChart(){
+  const m = M(), md = metric();
+  const chart = $('chart');
+  const W = Math.max(120, chart.clientWidth || chart.parentElement.clientWidth || 900);
+
+  const z = zoomNode();
+  const ancestors = ancestry(z);                     // [root, ..., z]
+  const placed = [];
+
+  // ancestors above the zoom target: full width, dimmed, clickable to go back
+  for (let i = 0; i < ancestors.length - 1; i++) placed.push({ n: ancestors[i], x: 0, w: W, row: i, ctx: true });
+  place(z, 0, W, ancestors.length - 1, placed, md);
+
+  let maxRow = 0;
+  for (const p of placed) if (p.row > maxRow) maxRow = p.row;
+  chart.style.height = ((maxRow + 1) * ROW_H + 2) + 'px';
+
+  const selId = selNode().id;
+  const html = new Array(placed.length);
+  for (let i = 0; i < placed.length; i++){
+    const p = placed[i], n = p.n;
+    const v = md.incl(n);
+    const cls = ['bar', 'k-' + n._kind];
+    if (v <= 0)   cls.push('stub');
+    if (n._unreach) cls.push('unreach');
+    if (p.ctx)    cls.push('ctx');
+    if (n.id === selId) cls.push('sel');
+
+    let label = '';
+    if (p.w >= 30){
+      const mark = n._unreach ? '<span class="mk">⊘ </span>' : '';
+      const tail = p.w >= 118 ? '  <span class="faint">' + esc(ns(v)) + '</span>' : '';
+      label = '<span class="lbl">' + mark + esc(n._name) + tail + '</span>';
+    }
+    // Clamp to the container. Sub-pixel slots are floored to 1px for visibility,
+    // and float accumulation across a wide row can nudge the last child past the
+    // right edge; without this its right border would be shaved off by the
+    // overflow:hidden and the bar would read as open-ended.
+    const bx = Math.max(0, Math.min(p.x, W - 1));
+    const bw = Math.max(1, Math.min(p.w - 1, W - bx));
+    html[i] = '<div class="' + cls.join(' ') + '" data-id="' + n.id + '" style="left:' +
+      bx.toFixed(2) + 'px;top:' + (p.row * ROW_H) + 'px;width:' +
+      bw.toFixed(2) + 'px">' + label + '</div>';
+  }
+  chart.innerHTML = html.join('');
+
+  BAR_INDEX = new Map();
+  const bars = chart.children;
+  for (let i = 0; i < bars.length; i++){
+    BAR_INDEX.set(parseInt(bars[i].getAttribute('data-id'), 10), bars[i]);
+  }
+
+  renderCrumbs(ancestors);
+  renderLegend(placed.length, m.all.length);
+  $('zoomOutBtn').disabled = !z._up;
+  $('resetBtn').disabled   = (z === m.root);
+}
+
+/**
+ * Recursive placement. Children are laid out proportionally against
+ * max(parentValue, sum(children)) so a reconciliation violation cannot make a
+ * row overflow its parent — it just leaves the parent fully packed.
+ */
+function place(n, x, w, row, out, md){
+  out.push({ n, x, w, row });
+  if (w < 1 || !n._kids.length) return;
+
+  const kids = n._kids;
+  const vals = new Array(kids.length);
+  let sum = 0, zeros = 0;
+  for (let i = 0; i < kids.length; i++){
+    const v = Math.max(0, md.incl(kids[i]));
+    vals[i] = v; sum += v;
+    if (v <= 0) zeros++;
+  }
+  const parentVal = Math.max(0, md.incl(n));
+  const denom = Math.max(parentVal, sum);
+
+  // reserve a visible stub for every zero-valued child, but never more space
+  // than exists — a wide row of stubs must not overflow its parent.
+  const stub  = Math.min(STUB_PX, w / kids.length);
+  const avail = Math.max(0, w - zeros * stub);
+
+  let cx = x;
+  for (let i = 0; i < kids.length; i++){
+    const cw = vals[i] <= 0 ? stub : (denom > 0 ? (vals[i] / denom) * avail : 0);
+    if (cw >= CULL_PX) place(kids[i], cx, cw, row + 1, out, md);
+    cx += cw;
+  }
+}
+
+function renderCrumbs(ancestors){
+  const parts = ancestors.map((n, i) => {
+    const cur = (i === ancestors.length - 1);
+    return '<button data-id="' + n.id + '"' + (cur ? ' class="cur"' : '') + '>' + esc(n._name) + '</button>';
+  });
+  $('crumbs').innerHTML = parts.join('<span class="sepr">›</span>');
+}
+$('crumbs').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-id]');
+  if (!b) return;
+  S.zoomId = parseInt(b.getAttribute('data-id'), 10);
+  renderChart();
+});
+
+function renderLegend(shown, total){
+  const md = metric();
+  const items = [
+    ['host',   'host — CPU-side span'],
+    ['device', 'device — GPU work (wall = launch only)'],
+    ['sync',   'sync — host blocked on GPU'],
+    ['root',   'root'],
+    ['stub',   'zero ' + md.label + ' — measured, but empty on this channel'],
+    ['unreach','unreachable — code path provably not taken']
+  ];
+  $('legend').innerHTML =
+    items.map(i => '<span class="li"><span class="sw ' + i[0] + '"></span>' + esc(i[1]) + '</span>').join('') +
+    '<span class="li faint">' + int(shown) + ' of ' + int(total) +
+    ' spans drawn (narrower than a pixel are culled; zoom in to reveal)</span>';
+}
+
+function highlightBar(id){
+  if (HOT_ID !== null && BAR_INDEX.has(HOT_ID)) BAR_INDEX.get(HOT_ID).classList.remove('hot');
+  HOT_ID = null;
+  if (id !== null && BAR_INDEX.has(id)){ BAR_INDEX.get(id).classList.add('hot'); HOT_ID = id; }
+}
+
+/* ---- tooltip -------------------------------------------------------------- */
+function onChartMove(e){
+  const bar = e.target.closest('.bar');
+  if (!bar){ hideTip(); return; }
+  const id = parseInt(bar.getAttribute('data-id'), 10);
+  const n = nodeById(id);
+  const tip = $('tip');
+  if (tip.dataset.for !== String(id)){
+    tip.innerHTML = tipHtml(n);
+    tip.dataset.for = String(id);
+  }
+  tip.style.display = 'block';
+  const r = tip.getBoundingClientRect();
+  const pad = 12;
+  let x = e.clientX + 14, y = e.clientY + 16;
+  if (x + r.width  > window.innerWidth  - pad) x = Math.max(pad, e.clientX - r.width  - 14);
+  if (y + r.height > window.innerHeight - pad) y = Math.max(pad, e.clientY - r.height - 14);
+  tip.style.left = x + 'px';
+  tip.style.top  = y + 'px';
+}
+function hideTip(){ const t = $('tip'); t.style.display = 'none'; t.dataset.for = ''; }
+
+function tipHtml(n){
+  const rows = [];
+  const line = (k, v, x) =>
+    '<tr><td class="k">' + k + '</td><td class="v">' + v + '</td><td class="x">' + (x || '') + '</td></tr>';
+  const sect = (s) => '<tr><td class="sect" colspan="3">' + s + '</td></tr>';
+
+  rows.push(line('calls', int(n.calls), ''));
+  rows.push(line('mean wall / call', ns(n._meanWall), ''));
+  rows.push(line('min / max wall', ns(n.min_wall_ns) + ' / ' + ns(n.max_wall_ns), ''));
+
+  rows.push(sect('time channels (total &middot; self)'));
+  rows.push(line('wall',   ns(n.wall_ns)   + ' &middot; ' + ns(n.wall_self_ns),   nsExact(n.wall_ns)));
+  rows.push(line('device', ns(n.device_ns) + ' &middot; ' + ns(n.device_self_ns), nsExact(n.device_ns)));
+  rows.push(line('sync',   ns(n.sync_ns)   + ' &middot; ' + ns(n._syncSelf),      nsExact(n.sync_ns)));
+  rows.push(line('busy self', ns(n.busy_self_ns) + ' &middot; roll-up ' + ns(n._busyIncl), nsExact(n.busy_self_ns)));
+  rows.push(line('% of root wall', pct(n._pctRoot), ''));
+
+  const g = n.geom;
+  if (g && typeof g === 'object'){
+    rows.push(sect('geometry'));
+    rows.push(line('b &times; t', int(g.b) + ' × ' + int(g.t), ''));
+    rows.push(line('tokens', int(g.tokens), ''));
+  }
+
+  let warn = '';
+  // The single most dangerous misreading this tool can permit.
+  if (n._kind === 'device' && num(n.device_ns) > 0){
+    const ratio = div(num(n.device_ns), num(n.wall_ns));
+    warn = '<div class="warnline">The <b>wall</b> figure here is host launch cost only. ' +
+      'The GPU ran for ' + ns(n.device_ns) +
+      (Number.isFinite(ratio) ? ' — <b>' + sig(ratio) + '×</b> the wall shown' : '') +
+      ', asynchronously.</div>';
+  } else if (n._kind === 'sync'){
+    warn = '<div class="warnline">A sync span is pure waiting: its wall <b>is</b> its sync. ' +
+      'Nothing computed here on either side.</div>';
+  } else if (n._unreach){
+    warn = '<div class="warnline">Not reached in this configuration. Zero here means ' +
+      '<b>never ran</b>, not "ran fast".</div>';
+  } else if (num(n.wall_ns) === 0 && !n._unreach){
+    warn = '<div class="warnline">Reachable and measured, but below the timer floor. ' +
+      'Zero here means <b>fast</b>, not "skipped".</div>';
+  }
+
+  const note = (n.note !== undefined && n.note !== null && n.note !== '')
+    ? '<div class="noteline">' + esc(n.note) + '</div>' : '';
+
+  return '<div class="tpath">' + esc(n._path) + '</div>' +
+    '<div style="margin-bottom:5px"><span class="badge k-' + n._kind + '">' + esc(n._kind) + '</span> ' +
+    (n._unreach ? '<span class="badge unreach">unreachable</span> ' : '') +
+    '<span class="faint">depth ' + int(n._depth) + '</span></div>' +
+    '<table>' + rows.join('') + '</table>' + warn + note;
+}
+
+/* ===========================================================================
+ * 12. Node table
+ * ======================================================================== */
+const COLS = [
+  { k:'_path',          label:'Path',        num:false, cls:'pathcell',
+    tip:'Fully-qualified span path.' },
+  { k:'_kind',          label:'Kind',        num:false,
+    tip:'root / host / device / sync.' },
+  { k:'calls',          label:'Calls',       num:true, fmt:int,
+    tip:'Times this span was entered across the whole run.' },
+  { k:'wall_ns',        label:'Wall',        num:true, fmt:ns, grp:'',
+    tip:'Total wall clock inside the span. On a device span this is LAUNCH cost only.' },
+  { k:'wall_self_ns',   label:'Wall self',   num:true, fmt:ns, grp:'',
+    tip:'Wall excluding children.' },
+  { k:'device_ns',      label:'Device',      num:true, fmt:ns, grp:'g-dev',
+    tip:'GPU execution time from CUDA events. Not comparable to wall.' },
+  { k:'device_self_ns', label:'Device self', num:true, fmt:ns, grp:'g-dev',
+    tip:'GPU time excluding children.' },
+  { k:'sync_ns',        label:'Sync',        num:true, fmt:ns, grp:'g-sync',
+    tip:'Wall spent blocked waiting on the GPU.' },
+  { k:'busy_self_ns',   label:'Busy self',   num:true, fmt:ns, grp:'g-busy',
+    tip:'wall_self − sync: host time genuinely computing here.' },
+  { k:'_pctRoot',       label:'% root wall', num:true, fmt:(v)=>pct(v),
+    tip:'Share of the root span wall clock.' },
+  { k:'_meanWall',      label:'Mean/call',   num:true, fmt:ns,
+    tip:'wall / calls.' },
+  { k:'min_wall_ns',    label:'Min',         num:true, fmt:ns,
+    tip:'Fastest single call (wall).' },
+  { k:'max_wall_ns',    label:'Max',         num:true, fmt:ns,
+    tip:'Slowest single call (wall).' }
+];
+
+function renderTableHead(){
+  $('nodeHead').innerHTML = COLS.map(c => {
+    const cls = [c.num ? 'n' : '', c.grp ? 'grp' : ''];
+    if (c.k === S.sortKey) cls.push('arrow', S.sortDir < 0 ? 'desc' : '');
+    return '<th data-k="' + c.k + '" class="' + cls.filter(Boolean).join(' ') + '" title="' +
+      esc(c.tip || '') + '">' + esc(c.label) + '</th>';
+  }).join('');
+}
+
+function tableRows(){
+  const m = M();
+  let rows = m.all;
+  if (S.filter) rows = rows.filter(n => n._path.toLowerCase().indexOf(S.filter) >= 0);
+
+  const k = S.sortKey, dir = S.sortDir;
+  const col = COLS.find(c => c.k === k) || COLS[3];
+  rows = rows.slice().sort((a, b) => {
+    let av = a[k], bv = b[k];
+    if (col.num){
+      av = Number.isFinite(av) ? av : -Infinity;
+      bv = Number.isFinite(bv) ? bv : -Infinity;
+      return (av - bv) * dir;
+    }
+    return String(av).localeCompare(String(bv)) * dir;
+  });
+  return rows;
+}
+
+function renderTableBody(){
+  const m = M();
+  const rows = tableRows();
+  const selId = selNode().id;
+  const buf = new Array(rows.length);
+
+  for (let i = 0; i < rows.length; i++){
+    const n = rows[i];
+    const tds = new Array(COLS.length);
+    for (let c = 0; c < COLS.length; c++){
+      const col = COLS[c];
+      const cls = [col.num ? 'n' : '', col.cls || '', col.grp || ''].filter(Boolean).join(' ');
+      let v;
+      if (col.k === '_path'){
+        v = '<span class="ind">' + '·'.repeat(Math.min(12, n._depth)) + '</span>' + esc(n._path) +
+            (n._unreach ? '<span class="tag">unreachable</span>' : '') +
+            (n.note ? '<span class="tag" title="' + esc(n.note) + '">note</span>' : '');
+      } else if (col.k === '_kind'){
+        v = '<span class="badge k-' + n._kind + '">' + esc(n._kind) + '</span>';
+      } else {
+        const raw = n[col.k];
+        v = col.fmt ? col.fmt(raw) : esc(raw);
+        // guard against reading a device span's launch wall as its GPU time
+        if (col.k === 'wall_ns' && n._kind === 'device' && num(n.device_ns) > 0){
+          v += '<span class="tag" title="launch cost only; GPU time is in the Device column">launch</span>';
+        }
+        if (col.k === 'device_ns' && num(raw) === 0 && n._unreach){
+          v = '<span class="miss">not reached</span>';
+        }
+      }
+      tds[c] = '<td class="' + cls + '">' + v + '</td>';
+    }
+    buf[i] = '<tr data-id="' + n.id + '"' + (n.id === selId ? ' class="sel"' : '') + '>' +
+             tds.join('') + '</tr>';
+  }
+
+  // one innerHTML assignment keeps ~2k rows comfortably under a frame
+  $('nodeBody').innerHTML = buf.join('');
+  $('tblCount').textContent = S.filter
+    ? int(rows.length) + ' of ' + int(m.all.length) + ' spans'
+    : int(m.all.length) + ' spans';
+}
+
+function syncTableSelection(){
+  const body = $('nodeBody');
+  const prev = body.querySelector('tr.sel');
+  if (prev) prev.classList.remove('sel');
+  const tr = body.querySelector('tr[data-id="' + selNode().id + '"]');
+  if (tr){
+    tr.classList.add('sel');
+    const wrap = $('tblWrap');
+    const top = tr.offsetTop, bot = top + tr.offsetHeight;
+    if (top < wrap.scrollTop + 26 || bot > wrap.scrollTop + wrap.clientHeight){
+      wrap.scrollTop = Math.max(0, top - wrap.clientHeight / 2);
+    }
+  }
+}
+
+/* ===========================================================================
+ * 13. Run comparison
+ * ======================================================================== */
+function renderCompare(){
+  if (!S.compare) return;
+
+  // run pickers ------------------------------------------------------------
+  $('cmpRunPicks').innerHTML = RUNS.map((r, i) => {
+    const lbl = ((r && r.run) || {}).label || ('run ' + i);
+    return '<button class="cmp-pick' + (S.cmpSel.has(i) ? ' on' : '') + '" data-i="' + i + '">' +
+      esc(lbl) + '</button>';
+  }).join('');
+
+  const sel = Array.from(S.cmpSel).sort((a, b) => a - b);
+  if (sel.length < 2){
+    $('cmpWrap').innerHTML = '<div style="padding:14px" class="dim">Select at least two runs above.</div>';
+    $('cmpNote').textContent = '';
+    return;
+  }
+
+  const models = sel.map(prepare);
+  // path -> per-slot cell. Duplicate paths inside one run are summed and flagged.
+  const map = new Map();
+  models.forEach((m, slot) => {
+    const tokens = Number.isFinite(m.totals.tokens) ? m.totals.tokens : num(m.run.tokens);
+    for (const n of m.all){
+      let e = map.get(n._path);
+      if (!e){ e = { path:n._path, kind:n._kind, depth:n._depth, cells:new Array(models.length).fill(null) }; map.set(n._path, e); }
+      const c = e.cells[slot];
+      if (c){ c.wall += num(n.wall_ns); c.device += num(n.device_ns); c.dups++; }
+      else e.cells[slot] = { wall:num(n.wall_ns), device:num(n.device_ns), dups:1, tokens };
+    }
+  });
+
+  let entries = Array.from(map.values());
+  if (S.cmpFilter) entries = entries.filter(e => e.path.toLowerCase().indexOf(S.cmpFilter) >= 0);
+  for (const e of entries){
+    for (const c of e.cells) if (c) c.perTok = div(c.wall, c.tokens);
+  }
+  // sort by the base run's wall, descending; rows missing from the base sink
+  entries.sort((a, b) => {
+    const av = a.cells[0] ? a.cells[0].wall : -1;
+    const bv = b.cells[0] ? b.cells[0].wall : -1;
+    return bv - av;
+  });
+
+  const baseLabel = models[0].run.label || ('run ' + sel[0]);
+  const head1 = ['<th rowspan="2">Path</th>', '<th rowspan="2">Kind</th>'];
+  const head2 = [];
+  models.forEach((m, i) => {
+    const lbl = m.run.label || ('run ' + sel[i]);
+    const span = i === 0 ? 3 : 5;
+    head1.push('<th colspan="' + span + '" class="grp" style="text-align:center">' +
+      esc(lbl) + (i === 0 ? ' <span class="faint">(base)</span>' : '') + '</th>');
+    head2.push('<th class="n">wall</th><th class="n">device</th><th class="n">wall/tok</th>');
+    if (i > 0) head2.push('<th class="n">Δ wall/tok</th><th class="n">Δ %</th>');
+  });
+
+  const body = entries.map(e => {
+    const tds = ['<td class="pathcell">' + esc(e.path) + '</td>',
+                 '<td><span class="badge k-' + e.kind + '">' + esc(e.kind) + '</span></td>'];
+    const base = e.cells[0];
+    e.cells.forEach((c, i) => {
+      if (!c){
+        // Missing is missing. Never render it as zero.
+        tds.push('<td class="n miss">—</td><td class="n miss">—</td><td class="n miss">—</td>');
+        if (i > 0) tds.push('<td class="n miss">—</td><td class="n miss">—</td>');
+        return;
+      }
+      const dup = c.dups > 1 ? '<span class="tag" title="' + c.dups +
+        ' spans share this path in this run; summed">×' + c.dups + '</span>' : '';
+      tds.push('<td class="n">' + ns(c.wall) + dup + '</td>',
+               '<td class="n">' + ns(c.device) + '</td>',
+               '<td class="n">' + ns(c.perTok) + '</td>');
+      if (i > 0){
+        if (!base){
+          tds.push('<td class="n miss">—</td><td class="n miss">—</td>');
+        } else {
+          const d  = c.perTok - base.perTok;
+          const dp = div(d, base.perTok) * 100;
+          const cls = !Number.isFinite(d) ? '' : (d > 0 ? 'dlt-pos' : (d < 0 ? 'dlt-neg' : ''));
+          const sgn = Number.isFinite(d) && d > 0 ? '+' : '';
+          tds.push('<td class="n ' + cls + '">' + (Number.isFinite(d) ? sgn + ns(d) : '—') + '</td>',
+                   '<td class="n ' + cls + '">' + (Number.isFinite(dp) ? sgn + dp.toFixed(1) + '%' : '—') + '</td>');
+        }
+      }
+    });
+    return '<tr>' + tds.join('') + '</tr>';
+  }).join('');
+
+  $('cmpWrap').innerHTML =
+    '<table class="dt"><thead><tr>' + head1.join('') + '</tr><tr>' + head2.join('') +
+    '</tr></thead><tbody>' + body + '</tbody></table>';
+
+  $('cmpNote').textContent =
+    'Keyed by node path. Deltas are per-token wall against ' + baseLabel +
+    '; positive (red) means slower per token. "—" means the span does not exist in that run — ' +
+    'it is never rendered as zero. ' + int(entries.length) + ' paths shown.';
+}
+
+$('cmpRunPicks').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-i]');
+  if (!b) return;
+  const i = parseInt(b.getAttribute('data-i'), 10);
+  if (S.cmpSel.has(i)){ if (S.cmpSel.size > 1) S.cmpSel.delete(i); }
+  else S.cmpSel.add(i);
+  renderCompare();
+});
+
+/* ===========================================================================
+ * 14. Health panel — always visible, never behind a click.
+ *     "checked and clean" must be distinguishable from "never checked".
+ * ======================================================================== */
+function renderHealth(){
+  const m = M(), rec = m.rec;
+  const out = [];
+
+  if (!rec){
+    out.push('<div class="callout bad"><b>No reconciliation block in this profile.</b> ' +
+      'Parent/child time consistency was <em>never checked</em> — that is not the same as clean. ' +
+      'Treat the tree as unverified.</div>');
+  } else {
+    const tol  = Number.isFinite(rec.tolerance_pct) ? rec.tolerance_pct : null;
+    const vs   = Array.isArray(rec.violations) ? rec.violations : [];
+    const mis  = num(rec.misnested_spans);
+    const unres= num(rec.unresolved_device_spans);
+
+    if (vs.length === 0 && mis === 0 && unres === 0){
+      out.push('<div class="callout good"><b>Checked and clean.</b> Every parent reconciles with ' +
+        'its children within ' + (tol === null ? 'the configured tolerance' : pct(tol)) +
+        '; 0 misnested spans; 0 unresolved device spans.</div>');
+    } else {
+      out.push('<div class="callout warn"><b>' + int(vs.length) + ' reconciliation violation' +
+        (vs.length === 1 ? '' : 's') + '</b> at a tolerance of ' +
+        (tol === null ? 'unspecified' : pct(tol)) + ', ' + int(mis) + ' misnested span' +
+        (mis === 1 ? '' : 's') + ', ' + int(unres) + ' unresolved device span' +
+        (unres === 1 ? '' : 's') + '. Numbers below the affected nodes may not add up.</div>');
+    }
+
+    out.push('<div class="srow" style="margin-bottom:10px">' +
+      stat('tolerance', tol === null ? '—' : pct(tol)) +
+      stat('violations', int(vs.length)) +
+      stat('misnested', int(mis)) +
+      stat('unresolved device', int(unres)) +
+      '</div>');
+
+    if (vs.length){
+      out.push('<h2 style="margin:10px 0 5px">Violations</h2><div class="tblwrap"><table class="dt">' +
+        '<thead><tr><th>Path</th><th>Channel</th><th class="n">Parent</th><th class="n">Children</th>' +
+        '<th class="n">Excess</th></tr></thead><tbody>' +
+        vs.map(v =>
+          '<tr><td class="pathcell">' + esc(v.path) + '</td>' +
+          '<td>' + esc(v.channel || 'wall') + '</td>' +
+          '<td class="n">' + ns(v.parent_wall_ns) + '</td>' +
+          '<td class="n">' + ns(v.children_wall_ns) + '</td>' +
+          '<td class="n">' + pct(v.excess_pct, 1) + '</td></tr>').join('') +
+        '</tbody></table></div>');
+    }
+  }
+
+  // unreachable ------------------------------------------------------------
+  const un = m.unreachable;
+  out.push('<h2 style="margin:12px 0 5px">Unreachable code paths</h2>');
+  if (!un.length){
+    out.push('<p class="dim" style="margin:0">None declared. Every instrumented span in this ' +
+      'configuration is on a live path.</p>');
+  } else {
+    out.push('<p class="tblnote" style="margin:0 0 5px">These spans exist in the binary but are ' +
+      'provably not taken in this configuration. Their zeros mean <em>never ran</em>, not ' +
+      '<em>ran fast</em>; they are hatched in the icicle.</p>');
+    out.push('<div class="tblwrap"><table class="dt"><thead><tr>' +
+      '<th>Path</th><th>Reason</th><th>Site</th></tr></thead><tbody>' +
+      un.map(u => '<tr><td class="pathcell">' + esc(u.path) + '</td><td>' + esc(u.reason) +
+        '</td><td class="mono">' + esc(u.site) + '</td></tr>').join('') +
+      '</tbody></table></div>');
+  }
+
+  $('healthBody').innerHTML = out.join('');
+}
+function stat(k, v){
+  return '<div class="stat"><div class="sk">' + esc(k) + '</div><div class="sv">' + v + '</div></div>';
+}
+
+/* ===========================================================================
+ * 15. JSON export (textarea + clipboard; no <a download>, which is inert
+ *     inside sandboxed viewers)
+ * ======================================================================== */
+function cleanNode(n){
+  // strip the private fields we hung off the node during preparation
+  const o = {};
+  for (const k in n){
+    if (!Object.prototype.hasOwnProperty.call(n, k)) continue;
+    if (k.charAt(0) === '_') continue;
+    o[k] = n[k];
+  }
+  return o;
+}
+
+function showJson(what){
+  const m = M();
+  let obj, label;
+  if (what === 'node'){
+    const n = selNode();
+    obj = cleanNode(n); label = 'node ' + n._path;
+  } else if (what === 'subtree'){
+    const n = selNode(), acc = [];
+    (function w(x){ acc.push(cleanNode(x)); x._kids.forEach(w); })(n);
+    obj = acc; label = 'subtree ' + n._path + ' (' + acc.length + ' spans)';
+  } else if (what === 'run'){
+    obj = m.raw; label = 'run ' + (m.run.label || S.run);
+  } else {
+    obj = RUNS; label = 'all ' + RUNS.length + ' run' + (RUNS.length === 1 ? '' : 's');
+  }
+  let txt;
+  try { txt = JSON.stringify(obj, null, 2); }
+  catch (err){ txt = '/* could not serialise: ' + String(err) + ' */'; }
+  $('jsonBox').value = txt;
+  $('jsonStatus').textContent = label + ' · ' + int(txt.length) + ' chars';
+}
+
+function copyJson(){
+  const box = $('jsonBox');
+  box.focus(); box.select();
+  const done = (ok) => {
+    $('jsonStatus').textContent = ok ? 'copied to clipboard' : 'copy blocked — press Ctrl/Cmd+C';
+    setTimeout(() => showJsonStatusRestore(), 1800);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(box.value).then(() => done(true), () => legacyCopy(done));
+  } else legacyCopy(done);
+}
+function legacyCopy(done){
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch (e){ ok = false; }
+  done(ok);
+}
+function showJsonStatusRestore(){
+  const len = $('jsonBox').value.length;
+  $('jsonStatus').textContent = int(len) + ' chars';
+}
+
+/* ===========================================================================
+ * 16. Go
+ * ======================================================================== */
+try { boot(); }
+catch (err){
+  // A broken profile must still explain itself rather than showing a blank page.
+  document.getElementById('app').classList.add('hidden');
+  const es = document.getElementById('emptyState');
+  es.classList.remove('hidden');
+  es.innerHTML = '<h1>Could not render this profile</h1><p class="dim">' +
+    esc(String(err && err.stack ? err.stack : err)) + '</p>';
+}
+</script>
+</body>
+</html>
