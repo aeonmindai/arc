@@ -76,6 +76,38 @@ say()  { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$STATUS"; }
 step() { say "=== $* ==="; }
 env_fail() { say "ENV_FAIL: $*"; say "RESULT: UNANSWERED"; exit 2; }
 
+
+# Assert the GPU holds EXACTLY our server and nobody else, or abort.
+#
+# A one-off check before a run is not enough on a shared box: a neighbour can
+# arrive mid-leg, and a V4 load shows near-zero VRAM for much of it, so
+# "compute-apps empty" sampled during someone's load is indistinguishable from
+# "free". Sampling cannot fix that — only bracketing can. So every leg asserts
+# occupancy on the way in AND on the way out, and a stranger appearing aborts
+# the run rather than yielding a contaminated number.
+# (Convergent with the batch-invariance chain, which hit the same problem from
+# the other side and arrived at the same answer.)
+assert_sole_occupant() {
+    local phase="$1" mypid="$2"
+    local pids
+    pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d ' ' | grep -v '^$' | sort -u)
+    local strangers=""
+    for p in $pids; do
+        [ "$p" = "$mypid" ] && continue
+        # A child of our own server (worker//loader) is not a stranger.
+        if [ -n "$mypid" ] && [ "$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')" = "$mypid" ]; then
+            continue
+        fi
+        strangers="$strangers $p"
+    done
+    if [ -n "$strangers" ]; then
+        say "🔴 EXCLUSIVITY VIOLATED at $phase: foreign compute process(es)$strangers on the GPU"
+        say "   Any timing from this leg is contaminated. Aborting rather than reporting it."
+        return 1
+    fi
+    return 0
+}
+
 SERVER_PID=""
 cleanup() {
     if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -296,6 +328,10 @@ banking a number of unknown origin (see stderr in $LOGDIR/run.log)"
         return 1
     fi
     say "leg $name: provenance ok (running rev $ARC_RUNNING_REV)"
+    if ! assert_sole_occupant "start of leg $name" "$SERVER_PID"; then
+        cleanup; SERVER_PID=""
+        return 1
+    fi
     say "leg $name: healthy, generating $GEN_TOKENS tokens at b=1"
 
     local t0 t1 resp ntok
@@ -310,6 +346,12 @@ banking a number of unknown origin (see stderr in $LOGDIR/run.log)"
 w=$t1-$t0
 n=$ntok
 print(f'{n/w:.2f}' if w>0 and n>0 else 'n/a')")"
+    # Closing bracket: a neighbour that arrived DURING the leg invalidates it
+    # just as thoroughly as one that was there at the start.
+    if ! assert_sole_occupant "end of leg $name" "$SERVER_PID"; then
+        cleanup; SERVER_PID=""
+        return 1
+    fi
 
     cleanup; SERVER_PID=""
     sleep 5
