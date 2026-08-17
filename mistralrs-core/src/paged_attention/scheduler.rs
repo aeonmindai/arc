@@ -32,6 +32,83 @@ type BucketKey = (usize, bool, usize);
 /// Allow sequences to wait for 64 scheduling passes before warning of deprivation.
 const WAITING_TIMEOUT: usize = 64;
 
+/// How a decode (completion) batch is admitted.
+///
+/// # The defect [`Bucketed`] encodes
+///
+/// [`DecodeAdmission::Bucketed`] partitions the running set by KV length, runs
+/// the single **shortest** bucket, and preempts every sequence in every other
+/// bucket. Preemption here is not "wait a step" — [`PagedAttentionScheduler::_preempt`]
+/// calls `kv_cache_manager.free(seq_id)`, so the losers **lose their KV blocks
+/// and must be re-prefilled**. With `B` sequences spread over `D` distinct
+/// lengths, `B / D` decode per step and the remainder are re-prefilled; in real
+/// serving, lengths always diverge, because users arrive at different times with
+/// different prompts and generate different numbers of tokens.
+///
+/// # Why it is unnecessary on this path
+///
+/// Everything the decode forward consumes is *already* addressed per sequence.
+/// Each row contributes exactly one token, so there is no padding to be ragged
+/// about, and the KV lives in the block pool rather than in one dense
+/// `[B, H, L, D]` tensor:
+///
+/// | what | where | form |
+/// |---|---|---|
+/// | input ids | `pipeline/inputs_processor.rs` `make_completion_chunk` | `[B, 1]` — one token per row, no padding |
+/// | causal mask | `layers_masker.rs` `make_causal_mask_matrix` | `None`, taken because `tgt_len == 1` |
+/// | RoPE offsets | `layers.rs` `RotaryEmbedding::forward` | per-sequence loop; only the `len() == 1` fast path narrows |
+/// | block tables | `make_completion_chunk` | one table per sequence |
+/// | context lens | `make_completion_chunk` | `seq.len()` per sequence |
+/// | flash varlen | `make_completion_chunk` | `seqlens_k[i] = 1 + start_pos_i`, then cumsum |
+/// | CUDA-graph buffers | `arc-cuda-graph/src/buffers.rs` | `context_lens: [padded_bs] u32`; `max_context_len` is a scalar arg, not a shape |
+///
+/// The comment the bucketing shipped with — that equal lengths are "required for
+/// correct flash attention varlen operation (avoiding soundness issues with
+/// padding)" — has it backwards. Varlen is the mechanism *for* unequal lengths;
+/// `seqlens_k` is built per sequence precisely so that they may differ. The
+/// constraint being defended is the **dense** cache's
+/// (`kv_cache/mod.rs` `clone_in_cache` templates one batch cache off `seqs[0]`),
+/// which is the `DefaultScheduler`'s substrate, not this one.
+///
+/// This is also what vLLM and SGLang do: neither partitions a decode batch by KV
+/// length. SGLang's `prepare_for_decode` is a vectorized `seq_lens + 1` over the
+/// whole running set, with FlashInfer reading `kv_indptr = cumsum(seq_lens)`.
+///
+/// # Speculative decode is not reachable here
+///
+/// Ragged decode assumes one token per row. Nothing on this path produces more:
+/// `MtpSpeculativePipeline` does not support paged attention
+/// (`pipeline/mtp_pipeline.rs`), and `mistralrs/src/speculative.rs` builds a
+/// `SchedulerConfig::DefaultScheduler`. A batch reaching this scheduler's decode
+/// phase is always plain one-token-per-sequence decode.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DecodeAdmission {
+    /// Partition by KV length, run the shortest bucket, preempt (and free the KV
+    /// blocks of) the rest. The pre-change path, kept verbatim.
+    Bucketed,
+    /// Every running sequence decodes in one forward, whatever its KV length.
+    Ragged,
+}
+
+impl DecodeAdmission {
+    /// Decide, naming any refusal.
+    ///
+    /// Returns the rule and, when it is [`Self::Bucketed`], the reason **by
+    /// name**. A scheduler that quietly reverted to length bucketing would be
+    /// indistinguishable from one that was never fixed, which is the failure
+    /// mode `memory/mission/KERNEL_RULES.md` D18 exists to prevent — so the
+    /// refusal is a value the caller is obliged to handle, not an absence.
+    pub(crate) fn decide() -> (Self, Option<String>) {
+        match std::env::var("ARC_SCHED_BUCKETED_DECODE").as_deref() {
+            Ok("1") => (
+                Self::Bucketed,
+                Some("ARC_SCHED_BUCKETED_DECODE=1".to_string()),
+            ),
+            _ => (Self::Ragged, None),
+        }
+    }
+}
+
 pub struct PagedAttentionSchedulerOutput {
     /// Either ALL prompt or ALL completion.
     pub scheduled: Vec<Arc<Mutex<Sequence>>>,
@@ -56,11 +133,29 @@ pub struct PagedAttentionScheduler {
     seq_block_hashes: HashMap<usize, Vec<BlockHash>>,
     /// Per-sequence waitlist counter for starvation detection.
     waiting_counts: HashMap<usize, usize>,
+    /// Whether a decode batch may hold rows of differing KV length.
+    /// See [`DecodeAdmission`].
+    decode_admission: DecodeAdmission,
 }
 
 impl PagedAttentionScheduler {
     pub fn new(config: PagedAttentionSchedulerConfig, cache_config: CacheConfig) -> Self {
+        let (decode_admission, refusal) = DecodeAdmission::decide();
+        match &refusal {
+            // D18: a refusal must name itself. A scheduler that quietly reverted
+            // to length bucketing would look identical to one never fixed.
+            Some(reason) => info!(
+                "ArcSched: ragged decode admission REFUSED by {reason}. Decode batches are \
+                 partitioned by KV length; every sequence outside the shortest bucket is \
+                 preempted and its KV blocks freed."
+            ),
+            None => info!(
+                "ArcSched: ragged decode admission granted. Every running sequence decodes \
+                 each step whatever its KV length."
+            ),
+        }
         Self {
+            decode_admission,
             waiting: VecDeque::new(),
             running: VecDeque::new(),
             kv_cache_manager: Arc::new(tokio::sync::Mutex::new(KVCacheManager::new(
@@ -373,10 +468,20 @@ impl PagedAttentionScheduler {
         }
         self.running = running;
 
-        // Bucket running completions by sequence length
-        let running_for_bucket = std::mem::take(&mut self.running);
-        let bucketed = self.bucket_and_preempt_sequences(running_for_bucket);
-        self.running = bucketed;
+        // Admit the decode batch. See `DecodeAdmission` for why the ragged rule
+        // is sound here and what the bucketed rule costs.
+        match self.decode_admission {
+            DecodeAdmission::Bucketed => {
+                // Pre-change path, verbatim.
+                let running_for_bucket = std::mem::take(&mut self.running);
+                let bucketed = self.bucket_and_preempt_sequences(running_for_bucket);
+                self.running = bucketed;
+            }
+            // `self.running` already holds every sequence that reserved a token
+            // slot above, so the whole admitted batch is the batch that runs.
+            // Nothing is bucketed and nothing is preempted for a length reason.
+            DecodeAdmission::Ragged => {}
+        }
 
         self.running
             .iter()
@@ -534,5 +639,236 @@ impl Scheduler for PagedAttentionScheduler {
     }
     fn set_prefix_caching_enabled(&mut self, enabled: bool) {
         self.set_prefix_caching_enabled_sync(enabled);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        paged_attention::cache_engine::PagedCacheType,
+        sampler::{Logprobs, Sampler},
+        sequence::{SeqStepType, SequenceGroup, SequenceRecognizer},
+    };
+    use std::time::Duration;
+    use tokio::sync::Mutex as TokioMutex;
+
+    /// A running sequence of exactly `n_toks` tokens. The scheduler reads only
+    /// `len()`, `id()`, `is_prompt()`, `images()`, `token_offset()` and state.
+    fn seq_of_len(id: usize, n_toks: usize) -> Sequence {
+        let (dummy_sender, _rx) = tokio::sync::mpsc::channel(1);
+        let dummy_sampler = Sampler::new(
+            None, 0, None, None, None, None, None, -1, 0.0, 0.0, None, vec![],
+        )
+        .unwrap();
+        let group = Arc::new(TokioMutex::new(SequenceGroup::new(1, false, false, None)));
+        Sequence::new_waiting(
+            vec![1u32; n_toks],
+            String::new(),
+            id,
+            0,
+            1,
+            dummy_sender,
+            dummy_sampler,
+            vec![],
+            vec![],
+            None,
+            false,
+            false,
+            group,
+            0,
+            0,
+            SequenceRecognizer::None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            SeqStepType::PromptAndDecode,
+            None,
+            None,
+            None,
+            false,
+            vec![],
+        )
+    }
+
+    fn decode_one(seq: &mut Sequence) {
+        seq.add_token(
+            Logprobs {
+                token: 7,
+                logprob: 0.0,
+                bytes: Some("a".to_string()),
+                top_logprobs: None,
+            },
+            b"a".to_vec(),
+            &None,
+        );
+    }
+
+    /// A scheduler with a KV pool far larger than any fixture needs, so that
+    /// nothing here is ever preempted for a *memory* reason — the only pressure
+    /// under test is length divergence.
+    fn scheduler_with(admission: DecodeAdmission) -> PagedAttentionScheduler {
+        let mut sched = PagedAttentionScheduler::new(
+            PagedAttentionSchedulerConfig { max_num_seqs: 256 },
+            CacheConfig {
+                block_size: 16,
+                num_gpu_blocks: 8192,
+                cache_type: PagedCacheType::Auto,
+            },
+        );
+        sched.decode_admission = admission;
+        // Isolate scheduling from prefix-cache reuse.
+        sched.set_prefix_caching_enabled_sync(false);
+        sched
+    }
+
+    /// Admit `n` sequences of equal prompt length (so the *prompt* bucketing,
+    /// which this change deliberately leaves alone, admits all of them), then
+    /// diverge their KV lengths the way generation does: sequence `i` has
+    /// decoded `i` extra tokens, giving `n` distinct lengths.
+    fn admit_then_diverge(
+        sched: &mut PagedAttentionScheduler,
+        n: usize,
+        logger: &IntervalLogger,
+    ) -> Vec<usize> {
+        for i in 0..n {
+            sched.add_seq(seq_of_len(i, 64));
+        }
+        let out = sched.schedule(logger);
+        assert_eq!(
+            out.scheduled.len(),
+            n,
+            "precondition: uniform prompts must all be admitted"
+        );
+        for (i, seq) in sched.running.iter().enumerate() {
+            let mut g = get_mut_arcmutex!(seq);
+            g.set_state(SequenceState::RunningCompletion);
+            for _ in 0..i {
+                decode_one(&mut g);
+            }
+        }
+        sched.running.iter().map(|s| *get_mut_arcmutex!(s).id()).collect()
+    }
+
+    /// THE regression test: `B` sequences at `B` distinct KV lengths must all
+    /// decode in a single forward.
+    #[test]
+    fn ragged_decode_runs_the_whole_admitted_batch() {
+        for n in [8usize, 32, 128] {
+            let logger = IntervalLogger::new(Duration::from_secs(3600), None);
+            let mut sched = scheduler_with(DecodeAdmission::Ragged);
+            admit_then_diverge(&mut sched, n, &logger);
+
+            let out = sched.schedule(&logger);
+            assert_eq!(
+                out.scheduled.len(),
+                n,
+                "B={n} at {n} distinct KV lengths: only {} of {n} decoded",
+                out.scheduled.len()
+            );
+            assert_eq!(sched.waiting.len(), 0, "B={n}: nothing may be waitlisted");
+        }
+    }
+
+    /// The negative control, and the size of the defect: the same fixture under
+    /// the pre-change rule runs `B / D` — one sequence, at any batch size.
+    #[test]
+    fn bucketed_decode_shatters_the_batch_to_one() {
+        for n in [8usize, 32, 128] {
+            let logger = IntervalLogger::new(Duration::from_secs(3600), None);
+            let mut sched = scheduler_with(DecodeAdmission::Bucketed);
+            admit_then_diverge(&mut sched, n, &logger);
+
+            let out = sched.schedule(&logger);
+            assert_eq!(
+                out.scheduled.len(),
+                1,
+                "B={n} over {n} distinct lengths is B/D = 1 under the bucketed rule"
+            );
+        }
+    }
+
+    /// Bucketing does not merely idle the sequences it drops — it frees their KV
+    /// blocks, so they must be re-prefilled. This is what makes the defect worse
+    /// than the equivalent one on the dense path, and it is the reason the fix
+    /// is not merely a batching optimization.
+    #[test]
+    fn bucketed_decode_frees_the_kv_of_every_sequence_it_drops() {
+        let logger = IntervalLogger::new(Duration::from_secs(3600), None);
+        let mut sched = scheduler_with(DecodeAdmission::Bucketed);
+        let ids = admit_then_diverge(&mut sched, 8, &logger);
+
+        for id in &ids {
+            assert!(
+                get_mut_arcmutex!(sched.kv_cache_manager)
+                    .get_block_ids(*id)
+                    .is_some(),
+                "precondition: sequence {id} holds blocks before the decode step"
+            );
+        }
+
+        let out = sched.schedule(&logger);
+        let survivor = *get_mut_arcmutex!(out.scheduled[0]).id();
+
+        let dropped: Vec<usize> = ids.iter().copied().filter(|i| *i != survivor).collect();
+        assert_eq!(dropped.len(), 7, "one bucket survives, seven are dropped");
+        for id in dropped {
+            assert!(
+                get_mut_arcmutex!(sched.kv_cache_manager)
+                    .get_block_ids(id)
+                    .is_none(),
+                "sequence {id} was dropped for a length reason and kept its blocks — \
+                 update this test if preemption stops freeing KV"
+            );
+        }
+    }
+
+    /// No regression at B=1: one sequence is one bucket, so both rules schedule
+    /// it, every step, identically.
+    #[test]
+    fn b1_is_untouched_by_either_rule() {
+        for admission in [DecodeAdmission::Ragged, DecodeAdmission::Bucketed] {
+            let logger = IntervalLogger::new(Duration::from_secs(3600), None);
+            let mut sched = scheduler_with(admission);
+            admit_then_diverge(&mut sched, 1, &logger);
+
+            for step in 0..8 {
+                let out = sched.schedule(&logger);
+                assert_eq!(
+                    out.scheduled.len(),
+                    1,
+                    "{admission:?} step {step}: B=1 must always decode"
+                );
+                assert_eq!(sched.waiting.len(), 0, "{admission:?} step {step}");
+                let mut g = get_mut_arcmutex!(sched.running[0]);
+                decode_one(&mut g);
+            }
+        }
+    }
+
+    /// D18: a refusal is a named value, never a silent absence.
+    #[test]
+    fn the_refusal_names_itself() {
+        // `decide` reads the process environment, so assert on the mapping it
+        // implements rather than mutating a global under a parallel harness.
+        let (granted, reason) = (DecodeAdmission::Ragged, Option::<String>::None);
+        assert!(reason.is_none(), "a grant carries no refusal reason");
+        assert_eq!(granted, DecodeAdmission::Ragged);
+
+        let (rule, reason) = DecodeAdmission::decide();
+        match std::env::var("ARC_SCHED_BUCKETED_DECODE").as_deref() {
+            Ok("1") => {
+                assert_eq!(rule, DecodeAdmission::Bucketed);
+                assert_eq!(reason.as_deref(), Some("ARC_SCHED_BUCKETED_DECODE=1"));
+            }
+            _ => {
+                assert_eq!(rule, DecodeAdmission::Ragged, "ragged decode is the default");
+                assert!(reason.is_none());
+            }
+        }
     }
 }

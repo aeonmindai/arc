@@ -44,6 +44,17 @@ impl IntervalLogger {
         let t_enc_hits = encoder_cache_hits.clone();
         let t_enc_misses = encoder_cache_misses.clone();
         thread::spawn(move || {
+            // Previous cumulative readings, so the reported hit rate covers the
+            // same window as the reported throughput.
+            //
+            // `tokens_processed` is `swap`ped to zero each interval, but
+            // `prefix_cache_hits` / `total_new_seqs` are shared counters other
+            // readers depend on, so they are read cumulatively and differenced
+            // here rather than reset. Before this, the line mixed a per-interval
+            // throughput with a *lifetime* hit rate, and a "1.43% prefix hit
+            // rate" was quoted from it that belonged to no single test.
+            let mut prev_prefix_cache_hits = 0usize;
+            let mut prev_total_new_seqs = 0usize;
             // Start the actual logging
             loop {
                 thread::sleep(interval);
@@ -53,6 +64,11 @@ impl IntervalLogger {
 
                 let total_new_seqs = t_total_new_seqs.load(Ordering::Relaxed);
                 let prefix_cache_hits = t_prefix_cache_hits.load(Ordering::Relaxed);
+                let new_seqs = total_new_seqs.saturating_sub(prev_total_new_seqs);
+                let new_prefix_cache_hits =
+                    prefix_cache_hits.saturating_sub(prev_prefix_cache_hits);
+                prev_total_new_seqs = total_new_seqs;
+                prev_prefix_cache_hits = prefix_cache_hits;
                 let tokens_processed = t_tokens_processed.swap(0, Ordering::Relaxed);
                 let num_running = t_num_running.load(Ordering::Relaxed);
                 let num_waiting = t_num_waiting.load(Ordering::Relaxed);
@@ -79,10 +95,23 @@ impl IntervalLogger {
                     // Combines both prefill and decode tokens. The counter is atomically
                     // swapped to 0 each interval, so the metric reflects only the current
                     // window and is not cumulative.
+                    //
+                    // The prefix hit rate covers the same window: it is the ratio of
+                    // sequences admitted *during this interval* that hit the cache. It is
+                    // omitted, not printed as 0.00%, when no sequence arrived — a zero
+                    // there would read as "nothing hit the cache" when it means "nothing
+                    // was admitted to hit it".
+                    let prefix_info = if new_seqs > 0 {
+                        format!(
+                            ", Prefix cache hitrate {:.2}%",
+                            100. * new_prefix_cache_hits as f64 / new_seqs as f64
+                        )
+                    } else {
+                        String::new()
+                    };
                     info!(
-                        "Throughput (T/s) {:.2}, Prefix cache hitrate {:.2}%{enc_cache_info}, {num_running} running, {num_waiting} waiting",
+                        "Throughput (T/s) {:.2}{prefix_info}{enc_cache_info}, {num_running} running, {num_waiting} waiting",
                         tokens_processed as f64 / interval.as_secs_f64(),
-                        100. * prefix_cache_hits as f64 / total_new_seqs as f64,
                     );
                 }
             }
