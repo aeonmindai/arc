@@ -9,17 +9,23 @@ Every claim is CONFIRMED (code read, `file:line`) or MEASURED (on the box).
 
 ## 0. The one-paragraph answer
 
-**The arm is reachable, the two objections on record do not bind, and the KV
-hazards do not bind either — but flipping the flag is a net LOSS, not a win.**
-Enabling it turns off V4's only CUDA-graph decode arm (they are arms of the same
-`match`), turns off MTP, adds a full O(context) gather per layer per decode step,
-and still does not reach GPU-autonomous decode because
-`AutonomousDecodeRunner::capture` has no caller anywhere in the workspace. The
-mission's causal chain — *flag false ⇒ `cache_config` None ⇒ CUDA graphs never
-run* — has the right first link and the wrong second one: `cache_config` gates
-only the **tier-3 autonomous decode loop**, and that loop has a second, harder
-gate behind it. The tier-1/2 graph capture at `normal.rs:1554` never depended on
-`cache_config` at all.
+**Settled on hardware. The flag works, `cache_config` becomes `Some`, and V4
+then produces ZERO tokens — it dies on the first forward.** Both objections on
+record are inapplicable (they are about `PagedAttention::forward` and
+`flashinfer_mla_decode`, neither of which V4 calls) and both KV-layout hazards
+are inapplicable too (the paged arm materialises a full `v = k.copy()`, so PR
+#63's 1-wide marker and PR #72's U8 codes never reach `reshape_and_cache`).
+The actual blocker is new: **`cache_write_and_gather` misreads
+`context_lens`** — the inputs processor emits a *flattened list of absolute slot
+indices*, `build_cu_seqlens_kv_from_context_lens` reads it as *per-sequence
+lengths*, and the gather returns zero rows on the dummy run
+(`dsv4_attention: 1 query rows against only 0 keys`) and walks off the buffer on
+the first real request (`CUDA_ERROR_ILLEGAL_ADDRESS`). RUN-167 wired this arm
+and it has never once executed, so the contract was never checked. **And even if
+it were fixed, the flag is still a net loss at b=1**: it shadows V4's only
+CUDA-graph decode arm, disables MTP, doubles KV bytes/token, adds an O(context)
+gather per layer per step, and does *not* reach GPU-autonomous decode because
+`AutonomousDecodeRunner::capture` has no caller anywhere in the workspace.
 
 ---
 
@@ -423,7 +429,110 @@ Benign warnings present in both legs, already known: `toktrie_hf_tokenizers:
 missing char: ｜`, and `GPU radix top-k sampling failed; falling back to CPU:
 tensor_device_ptr: unsupported dtype I32`.
 
-<!-- RESULT B -->
+### 8b. RUN B — flag ON. **TOKENS_IDENTICAL = NO. It produces zero tokens.**
+
+The opt-in fired and paged attention really did come up:
+
+```
+INFO mistralrs_quant::utils::log: ARC_V4_PAGED_ATTN=1: V4 PagedAttention arm ENABLED (experiment). ...
+INFO mistralrs_core::paged_attention: Allocating 2048 MB for PagedAttention KV cache per GPU
+INFO mistralrs_core::paged_attention: PagedAttention KV cache type is BF16
+INFO mistralrs_core::paged_attention: Using PagedAttention with block size 32 and 762 GPU blocks: available context length is 24384 tokens
+```
+
+⇒ **`cache_config` becomes `Some`. Confirmed on hardware.** The model loaded
+(43 layers, 80 GB, BF16), the server bound the port, and then:
+
+```
+INFO  mistralrs_core: Beginning dummy run.
+ERROR mistralrs_core::engine: step - Model failed with error:
+      dsv4_attention: 1 query rows against only 0 keys (raw_prefix 0 + 0 given)
+INFO  mistralrs_core: Dummy run completed in 0.158961407s.
+INFO  mistralrs::commands::serve: Server listening on http://0.0.0.0:1234
+ERROR mistralrs_core::engine: step - Model failed with error:
+      CublasError(CUBLAS_STATUS_INTERNAL_ERROR)
+thread '<unnamed>' (35854) panicked at mistralrs-core/src/pipeline/inputs_processor.rs:538:57:
+called `Result::unwrap()` on an `Err` value:
+      DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, "an illegal memory access was encountered")
+```
+
+Client side — the engine thread died on request 1, so requests 2 and 3 never ran:
+
+```
+[on] p0 tok=-1 fin=error :: HTTPERROR {"message":"CublasError(CUBLAS_STATUS_INTERNAL_ERROR)", ... "prompt_tokens":17 ...}
+[on] p1 tok=-1 fin=error :: HTTPERROR {"message":"channel closed"}
+[on] p2 tok=-1 fin=error :: HTTPERROR {"message":"channel closed"}
+TOKENS_IDENTICAL=NO
+```
+
+### 8c. Root cause — a `context_lens` contract mismatch, and it is NOT either objection on record
+
+**The first error is the informative one, and it is exactly reproducible from
+the code.**
+
+**(i) `dsv4_attention: 1 query rows against only 0 keys` — CONFIRMED.**
+`inputs_processor.rs:285-289`, in the per-sequence loop that builds
+`PagedAttentionInputMetadata`:
+```rust
+if block_ids.is_none() {
+    // Will be None during profiling.
+    slot_mappings.push([_PAD_SLOT_ID].repeat(new_len));
+    continue;                       // <-- skips paged_attn_context_lens AND block_tables
+}
+```
+On the dummy/profiling run there are no allocated blocks, so the `continue`
+leaves **`context_lens` and `block_tables` empty** while `slot_mappings` gets
+`_PAD_SLOT_ID`. `cache_write_and_gather` then writes to a pad slot (a no-op in
+the kernel), builds `cu_seqlens_kv` from an empty `context_lens` (cumsum of a
+single 0), and `gather_kv_cache` returns **zero rows**. `dsv4_attention` is
+handed `t_k = 0` against `t_q = 1` and says so. The error text matches the
+mechanism exactly.
+
+**(ii) `CUDA_ERROR_ILLEGAL_ADDRESS` on the first real request — STRONGLY
+SUSPECTED, same family.** `context_lens` is not a vector of per-sequence
+lengths at all. `inputs_processor.rs:300-302` fills it per token —
+`for i in slot_start..slot_end { ctxt_len.push(i); }` — i.e. **absolute slot
+indices**, and `:399-408` then pads and **`.reshape(((),))` flattens it** to
+`[batch * max_context_len]`. But
+`build_cu_seqlens_kv_from_context_lens` (`paged_attention/mod.rs:59-78`) reads
+it as `[batch]` per-sequence lengths: it takes `dim(0)` as the batch size,
+prepends a zero and cumsums. Fed a flattened list of *indices*, the cumsum
+produces offsets far past the end of the gathered buffer, and
+`gather_kv_cache` indexes out of bounds — which is what an illegal address on
+the very first real forward looks like. That shape is the one
+`PagedAttention::forward`'s vLLM-style kernel expects; `cache_write_and_gather`
+is Arc's own RUN-167 addition and assumes a different one.
+
+**⇒ The blocker is neither objection on record, and neither KV-layout hazard.
+It is that `cache_write_and_gather` has never once been executed, so its
+`context_lens` contract was never checked against what the inputs processor
+actually produces.** The BACKLOG "wired but dead" entry nine is now cleared, in
+the direction of *dead and broken*.
+
+### 8d. The pre-registered prediction (§7b) was REFUTED
+
+I predicted prompt 0 would match and prompts 1–2 would diverge via the `xs`
+cross-request leak. **Wrong.** Nothing got far enough to leak anything: the arm
+fails on the very first forward, before the compressor history is ever reused.
+The `xs` leak may well still be real — it is untested, not disproven — but it is
+behind a failure that fires much earlier. Recording this as a miss.
+
+### 8e. Cost and teardown
+
+Box `arc-w53-paged` **deleted** (`runcrate ps` → `No instances found`; the
+unrelated `arc-s15-measure` H200 was also gone by then, so nothing was left
+running). Balance $29.44 → **$27.16 = $2.28**, which covers this A100 *and* the
+overlap with the other session's H200; the A100's own share is **≈$1.2–1.5** on
+~50 min at $1.49/hr. **Budget was $8.**
+
+### 8f. Two things this run establishes that were not the question
+
+1. **qtip2b serves fine on an 80 GB A100.** RUNBOOK_8 ruled the A100 out for
+   this artifact on KV arithmetic. At b=1 it loads cold in **90 s** and decodes
+   at **10.6 tok/s**, with all 43 layers on one card. A b=1 correctness A/B does
+   not need a $4.85/hr H200; it needs $1.49/hr and about an hour.
+2. **`--from-uqff` + source-overlay is reproducible unattended.** Build
+   11 m 05 s, 234 GB of downloads in ≈8 m alongside it, zero `Applying ISQ`.
 
 
 ---
