@@ -84,6 +84,16 @@ impl KvCache {
         Self::TurboQuant(Box::new(TurboQuantCache::new(config)))
     }
 
+    /// Fallible [`Self::new_turboquant`]: reports the geometries TurboQuant
+    /// cannot serve instead of panicking inside a model constructor.
+    pub fn try_new_turboquant(
+        config: &mistralrs_quant::turboquant::TurboQuantConfig,
+    ) -> std::result::Result<Self, String> {
+        Ok(Self::TurboQuant(Box::new(TurboQuantCache::try_new(
+            config,
+        )?)))
+    }
+
     /// The variant's name, for diagnostics that have to say which slot refused.
     pub fn kind_name(&self) -> &'static str {
         match self {
@@ -308,14 +318,188 @@ pub enum NormalCacheType {
     SlidingWindow { window: usize },
 }
 
-/// Global TurboQuant config. When set, NormalCache::new creates TurboQuant caches.
+/// Global TurboQuant geometry for the **eager** (non-paged) KV cache.
+///
+/// `0` in either slot means "off". Packed as two atomics rather than a
+/// `Mutex<Option<..>>` because [`NormalCache::new`] runs on the model-build
+/// path for every layer of every model.
+///
+/// # Why this is a global at all
+///
+/// `NormalCache::new` is called from inside ~30 model constructors
+/// (`models/llama.rs:453`, `models/qwen2.rs:443`, …) which take no cache
+/// configuration. Threading a config through all of them is the right
+/// long-term shape; the global is what makes the feature reachable without
+/// touching every upstream model file, which the fork's merge policy
+/// discourages.
 static TURBOQUANT_HEAD_DIM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static TURBOQUANT_V_HEAD_DIM: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
-/// Enable TurboQuant for all new NormalCache instances.
-/// Set head_dim > 0 to enable, 0 to disable.
-#[allow(dead_code)] // TurboQuant config setter; not yet wired into the active path
+/// Enable TurboQuant for all subsequently-created [`NormalCache`]s, with equal
+/// K and V widths.
 pub fn set_turboquant_head_dim(head_dim: usize) {
-    TURBOQUANT_HEAD_DIM.store(head_dim, std::sync::atomic::Ordering::SeqCst);
+    set_turboquant_kv_head_dims(head_dim, head_dim);
+}
+
+/// Enable TurboQuant with independent K and V widths.
+///
+/// Set either to `0` to disable. Unlike the original gate this accepts **any**
+/// width TurboQuant can serve — `{64, 128, 256}` was a codebook-table limit,
+/// not a mathematical one (see `mistralrs_quant::turboquant::generate`), and
+/// non-powers-of-two are handled by block decomposition
+/// (`mistralrs_quant::turboquant::layout`).
+///
+/// The geometry is *not* validated here; [`NormalCache::new`] validates and
+/// falls back to a plain cache with a warning, because it is the only place
+/// that can still produce a working cache if the geometry is unsupported.
+pub fn set_turboquant_kv_head_dims(k_head_dim: usize, v_head_dim: usize) {
+    TURBOQUANT_HEAD_DIM.store(k_head_dim, std::sync::atomic::Ordering::SeqCst);
+    TURBOQUANT_V_HEAD_DIM.store(v_head_dim, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Disable TurboQuant for subsequently-created [`NormalCache`]s.
+pub fn clear_turboquant_head_dim() {
+    set_turboquant_kv_head_dims(0, 0);
+}
+
+/// Why the eager KV cache did or did not end up TurboQuant-compressed.
+///
+/// Returned by [`resolve_eager_turboquant`] so the loader can log one honest
+/// line instead of the caller guessing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EagerTurboQuantDecision {
+    /// Compress, with these `(k_head_dim, v_head_dim)`.
+    Enabled(usize, usize),
+    /// Leave the cache uncompressed, for this reason.
+    Disabled(String),
+}
+
+/// Decide whether the **eager** KV cache should use TurboQuant for a model
+/// with this geometry.
+///
+/// # Why this is opt-in and PagedAttention's TurboQuant is not
+///
+/// The paged path has a fused kernel (`turbo_paged_attention.cu`) that reads
+/// packed blocks directly, so compression there is a straight memory win. The
+/// eager path has no such kernel: `TurboQuantSingleCache::current_data`
+/// reconstructs every compressed token on the host and ships it back to the
+/// device once per layer per decode step. That is a decode-time cost no
+/// measurement has yet justified, so enabling it is a deliberate act, set by
+/// `ARC_TURBOQUANT_KV=1`.
+///
+/// This is the same discipline the V4 FP8 KV path settled on
+/// (`ARC_V4_FP8_KV`, `models/deepseek4.rs:2405`) after a default-on KV change
+/// shipped unmeasured.
+///
+/// `paged` short-circuits everything: with PagedAttention active the KV lives
+/// in the paged cache and `NormalCache` is not the cache being used, so
+/// setting the global would only risk compressing something else.
+pub fn resolve_eager_turboquant(
+    k_head_dim: usize,
+    v_head_dim: usize,
+    standard_layout: bool,
+    paged: bool,
+    env_value: Option<&str>,
+) -> EagerTurboQuantDecision {
+    use EagerTurboQuantDecision::*;
+    let requested = match env_value.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(v) if matches!(v.as_str(), "1" | "true" | "on" | "yes") => true,
+        Some(v) if matches!(v.as_str(), "0" | "false" | "off" | "no" | "") => {
+            return Disabled("ARC_TURBOQUANT_KV is set to off".to_string())
+        }
+        Some(v) => {
+            return Disabled(format!(
+                "ARC_TURBOQUANT_KV={v:?} is not a recognised boolean; expected 1/0"
+            ))
+        }
+        None => false,
+    };
+    if !requested {
+        return Disabled(
+            "not requested (set ARC_TURBOQUANT_KV=1 to compress the eager KV cache)".to_string(),
+        );
+    }
+    if paged {
+        return Disabled(
+            "PagedAttention is active; KV compression there is selected with \
+             --pa-cache-type, not ARC_TURBOQUANT_KV"
+                .to_string(),
+        );
+    }
+    if !standard_layout {
+        return Disabled(
+            "this model does not use the standard [B, H, T, D] KV layout; its K and V \
+             halves are not independent head vectors"
+                .to_string(),
+        );
+    }
+    match mistralrs_quant::turboquant::TurboQuantConfig::try_new(k_head_dim, v_head_dim) {
+        Ok(_) => Enabled(k_head_dim, v_head_dim),
+        Err(e) => Disabled(e),
+    }
+}
+
+/// Apply [`resolve_eager_turboquant`] to the process-wide gate, reading
+/// `ARC_TURBOQUANT_KV` from the environment. Returns the decision so the
+/// caller can log it.
+///
+/// Must be called **before** the model is constructed: model constructors call
+/// [`NormalCache::new`], which reads the gate.
+pub fn configure_eager_turboquant(
+    k_head_dim: usize,
+    v_head_dim: usize,
+    standard_layout: bool,
+    paged: bool,
+) -> EagerTurboQuantDecision {
+    let env = std::env::var("ARC_TURBOQUANT_KV").ok();
+    let decision = resolve_eager_turboquant(
+        k_head_dim,
+        v_head_dim,
+        standard_layout,
+        paged,
+        env.as_deref(),
+    );
+    match &decision {
+        EagerTurboQuantDecision::Enabled(k, v) => set_turboquant_kv_head_dims(*k, *v),
+        EagerTurboQuantDecision::Disabled(_) => clear_turboquant_head_dim(),
+    }
+    decision
+}
+
+/// Warn once per process that the eager cache is staying uncompressed.
+///
+/// Once, not per layer: this runs inside every model constructor, and 60
+/// identical warnings would bury the one line that matters.
+fn warn_turboquant_unsupported(reason: &str) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(
+            "TurboQuant KV was requested but this model's cache geometry cannot be \
+             compressed, so the eager KV cache stays uncompressed: {reason}"
+        );
+    });
+}
+
+/// The currently-configured `(k_head_dim, v_head_dim)`, or `None` when off.
+pub fn turboquant_head_dims() -> Option<(usize, usize)> {
+    let k = TURBOQUANT_HEAD_DIM.load(std::sync::atomic::Ordering::SeqCst);
+    let v = TURBOQUANT_V_HEAD_DIM.load(std::sync::atomic::Ordering::SeqCst);
+    (k > 0 && v > 0).then_some((k, v))
+}
+
+/// Build the TurboQuant config for the ambient geometry, or explain why the
+/// eager cache must stay uncompressed.
+///
+/// Returns `Ok(None)` when TurboQuant is simply off, `Err` when it is on but
+/// the geometry cannot be served — which the caller turns into a warning plus
+/// a plain cache, never into silent compression of something unsupported.
+fn turboquant_config_from_globals(
+) -> std::result::Result<Option<mistralrs_quant::turboquant::TurboQuantConfig>, String> {
+    let Some((k, v)) = turboquant_head_dims() else {
+        return Ok(None);
+    };
+    mistralrs_quant::turboquant::TurboQuantConfig::try_new(k, v).map(Some)
 }
 
 impl NormalCache {
@@ -323,23 +507,33 @@ impl NormalCache {
     pub const CACHE_GROW_SIZE: usize = 512;
 
     pub fn new(len: usize, max_seq_len: usize) -> Arc<Mutex<Self>> {
-        let head_dim = TURBOQUANT_HEAD_DIM.load(std::sync::atomic::Ordering::SeqCst);
-        if head_dim > 0 && (head_dim == 64 || head_dim == 128 || head_dim == 256) {
-            let config = mistralrs_quant::turboquant::TurboQuantConfig::new(head_dim);
-            Arc::new(Mutex::new(Self(vec![
-                KvCache::new_turboquant(&config);
-                len
-            ])))
-        } else {
-            Arc::new(Mutex::new(Self(vec![
-                KvCache::new_normal(
-                    2,
-                    max_seq_len,
-                    Self::CACHE_GROW_SIZE
-                );
-                len
-            ])))
+        match turboquant_config_from_globals() {
+            Ok(Some(config)) => match KvCache::try_new_turboquant(&config) {
+                Ok(proto) => return Arc::new(Mutex::new(Self(vec![proto; len]))),
+                Err(e) => warn_turboquant_unsupported(&e),
+            },
+            Ok(None) => {}
+            Err(e) => warn_turboquant_unsupported(&e),
         }
+        Self::new_plain(len, max_seq_len)
+    }
+
+    /// A [`NormalCache`] of plain [`KvCache::Normal`] slots, ignoring the
+    /// ambient TurboQuant setting.
+    ///
+    /// Models whose attention depends on the two halves of a slot being
+    /// independent dense buffers — DeepSeek-V4's fused-MQA V marker is the
+    /// live example, see `models/deepseek4.rs::require_normal_kv_slot` — must
+    /// use this rather than [`Self::new`].
+    pub fn new_plain(len: usize, max_seq_len: usize) -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self(vec![
+            KvCache::new_normal(
+                2,
+                max_seq_len,
+                Self::CACHE_GROW_SIZE
+            );
+            len
+        ])))
     }
 
     pub fn new_sliding(
@@ -368,12 +562,30 @@ impl NormalCache {
     }
 
     pub fn from_types(types: Vec<NormalCacheType>) -> Arc<Mutex<Self>> {
+        // Sliding-window layers stay `Rotating` regardless: `TurboQuantCache`
+        // has no windowing, so compressing them would silently drop the
+        // rotation. Only the full-attention layers of a mixed model are
+        // eligible.
+        let turbo = match turboquant_config_from_globals() {
+            Ok(cfg) => cfg.and_then(|c| match KvCache::try_new_turboquant(&c) {
+                Ok(proto) => Some(proto),
+                Err(e) => {
+                    warn_turboquant_unsupported(&e);
+                    None
+                }
+            }),
+            Err(e) => {
+                warn_turboquant_unsupported(&e);
+                None
+            }
+        };
         let mut caches = Vec::new();
         for ty in types {
             match ty {
-                NormalCacheType::Normal { max_seq_len } => {
-                    caches.push(KvCache::new_normal(2, max_seq_len, Self::CACHE_GROW_SIZE));
-                }
+                NormalCacheType::Normal { max_seq_len } => match &turbo {
+                    Some(proto) => caches.push(proto.clone()),
+                    None => caches.push(KvCache::new_normal(2, max_seq_len, Self::CACHE_GROW_SIZE)),
+                },
                 NormalCacheType::SlidingWindow { window } => {
                     caches.push(KvCache::new_rotating(2, window, Self::CACHE_GROW_SIZE));
                 }
@@ -835,6 +1047,107 @@ pub(crate) fn ensure_uniform_batch_cache_lens(
     }
 }
 
+/// Reconcile the one quantity [`ensure_uniform_batch_cache_lens`] cannot see:
+/// [`XsRollingCache::base`].
+///
+/// Uniform `current_seq_len` is **not** sufficient for `tail` (which is
+/// `tokens - base` wide) to batch, because `base` tracks the sequence's
+/// *high-water* length rather than its current one: `set_len` narrows the tail
+/// without moving `base`, and `advance` never lowers it. Two sequences at an
+/// identical token count can therefore hold tails of different width — see
+/// [`XsRollingCache::trim_tail_to`] for the ways that happens.
+///
+/// This needs no speculative decoding to reach. `prefix_cacher.rs` calls
+/// `set_len` on every stored layer, so a sequence restored from a prefix-cache
+/// entry that was stored at a greater length holds a narrower tail than one that
+/// arrived directly — and `clone_in_cache` then batches the two with
+/// `slice_set`, which demands an exact dim match. That is a second, independent
+/// route into the same `shape mismatch on dim 1, …` failure that
+/// `ensure_uniform_batch_cache_lens` was added to close, and it is on the
+/// **plain decode path**.
+///
+/// Raising every member to the batch maximum is lossless by construction: the
+/// member already sitting at `base_max` proves no future compressed row needs a
+/// token below it. `trim_tail_to` refuses rather than silently dropping history
+/// if that were ever untrue.
+///
+/// # 🔴 Why this is gated on `xs_per_seq`, and why that is not a port
+///
+/// `base` means two different things either side of `ARC_V4_XS_PER_SEQ`, and
+/// the reconciliation is *required* on one path and a *regression* on the other.
+///
+/// **Flag off** — `tail` is `tokens - base` wide, so `base` IS the physical left
+/// edge of the buffer. `BatchSrc::of` sets `v_slack_dim: None`, meaning
+/// `reconcile_batch_dims` demands the widths match exactly. Divergent `base` at
+/// equal `tokens` is then the 4-vs-132 `slice_set` failure PR #93 exists to fix,
+/// it is reachable on ordinary decode through the prefix cacher, and this
+/// function runs exactly as it always has.
+///
+/// **Flag on** — `tail` is `[B, W, hidden]` and **end-anchored**, with
+/// `base[i] >= tokens[i] - W`. `base` is now a *logical resume point*, decoupled
+/// from the buffer: `BatchSrc::of` sets `v_slack_dim: Some(1)` with
+/// `v_slack_at_front: true`, so a narrower row is front-padded up to the batch
+/// maximum and the columns it gains sit ahead of its own `base` — never read.
+/// The widths already agree, so the reconciliation buys nothing.
+///
+/// And it is not merely redundant there, it is **harmful**. Trimming every row
+/// to `base_max` raises the shortest-reach row's rollback floor to the batch's,
+/// which turns a per-sequence quantity into a batch-wide scalar. That is the
+/// same shape as the cohort min-rollback PR #92 removed, and as the
+/// dead-prefix-counted-as-content trap #102, #103 and #104 each caught
+/// independently. This is the last layer that still holds one; running it under
+/// the flag would put it back.
+///
+/// `xs_per_seq` is a parameter rather than a read of
+/// [`xs_per_sequence_enabled`] inside so that "which path reconciles" is itself
+/// testable — the two branches agree on every batch either one can serve, so no
+/// numeric test could tell which ran.
+fn reconcile_xs_bases(
+    seqs: &mut [&mut crate::sequence::Sequence],
+    layer: usize,
+    modify_draft_cache: bool,
+    xs_per_seq: bool,
+) -> Result<()> {
+    if xs_per_seq {
+        return Ok(());
+    }
+    let mut base_max = 0usize;
+    let mut any = false;
+    for seq in seqs.iter_mut() {
+        let cache = if modify_draft_cache {
+            seq.normal_draft_cache()
+        } else {
+            seq.normal_cache()
+        };
+        if let Some(KvCache::XsRolling(xs)) = cache.get(layer).and_then(|s| s.as_ref()) {
+            // `resumable_from()` is `base.iter().max()`, which for the
+            // single-row per-sequence caches this function sees is `base[0]` —
+            // the same value the pre-#95 field read gave.
+            base_max = base_max.max(xs.resumable_from());
+            any = true;
+        }
+    }
+    if !any || base_max == 0 {
+        return Ok(());
+    }
+    for (i, seq) in seqs.iter_mut().enumerate() {
+        let cache = if modify_draft_cache {
+            seq.normal_draft_cache()
+        } else {
+            seq.normal_cache()
+        };
+        if let Some(KvCache::XsRolling(xs)) = cache.get_mut(layer).and_then(|s| s.as_mut()) {
+            xs.trim_tail_to(base_max).map_err(|e| {
+                candle_core::Error::msg(format!(
+                    "kv-cache: cannot reconcile cache slot {layer} of seqs[{i}] to the batch's \
+                     retained-window start {base_max}: {e}"
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
 impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCacheManager {
     fn clone_in_cache(
         &self,
@@ -848,12 +1161,16 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
         // have formed costs the requests in it and not the engine task.
         ensure_uniform_batch_cache_lens(seqs, modify_draft_cache)?;
 
+        let _prof = arc_profiler::span("clone_in_cache");
         let xs_per_seq = xs_per_sequence_enabled();
         let mut new_k_cache = Vec::new();
         let mut new_v_cache = Vec::new();
         let mut xs_row_lens: Vec<Option<(Vec<usize>, Vec<usize>)>> =
             vec![None; pipeline.get_metadata().num_hidden_layers];
 
+        // `num_hidden_layers` here is the *cache vector* length, not 43: V4
+        // appends one `XsRolling` compressor-history slot per CSA/HCA layer
+        // after the KV entries, so this loop runs 43 + n_compressed times.
         for layer in 0..pipeline.get_metadata().num_hidden_layers {
             let batch_len = seqs.len();
 
@@ -871,6 +1188,12 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     continue;
                 }
             }
+
+            // `tail` is content, not slack, so it cannot be padded — but it
+            // *can* be trimmed to a common start, which is lossless. Do that
+            // before gathering, so the batch's widths agree by construction
+            // rather than by luck.
+            reconcile_xs_bases(seqs, layer, modify_draft_cache, xs_per_seq)?;
 
             // Gather every sequence's two tensors for this slot up front, so
             // the batch's shape is decided by the whole batch instead of by
@@ -919,9 +1242,18 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
             let mut dims_v = one_v.clone();
             dims_k[0] *= batch_len;
             dims_v[0] *= batch_len;
-            let batch_k = Tensor::zeros(dims_k, present[0].k.dtype(), present[0].k.device())?;
-            let batch_v = Tensor::zeros(dims_v, present[0].v.dtype(), present[0].v.device())?;
+            let (batch_k, batch_v) = {
+                // Two fresh device allocations per layer, every step.
+                let _s = arc_profiler::device_span("clone_in.alloc");
+                (
+                    Tensor::zeros(dims_k, present[0].k.dtype(), present[0].k.device())?,
+                    Tensor::zeros(dims_v, present[0].v.dtype(), present[0].v.device())?,
+                )
+            };
 
+            // Fill each sequence's cache slice: two device copies per sequence
+            // per layer, i.e. O(B x layers) copies per token.
+            let _prof_fill = arc_profiler::device_span("clone_in.slice_set");
             for (i, src) in srcs.iter().enumerate() {
                 let Some(src) = src else {
                     // Skip for shared kv cache layers in models like gemma3n
@@ -942,6 +1274,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 batch_k.slice_set(&src_k, 0, i * one_k[0])?;
                 batch_v.slice_set(&src_v, 0, i * one_v[0])?;
             }
+            drop(_prof_fill);
             new_k_cache.push(Some(batch_k));
             new_v_cache.push(Some(batch_v));
         }
@@ -1082,6 +1415,11 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
         Ok(())
     }
     fn clone_out_cache(&self, pipeline: &T, seqs: &mut [&mut Sequence], modify_draft_cache: bool) {
+        // Runs on EVERY decode step: `post_op` is `CacheInstruction::Out`
+        // unconditionally (`engine/mod.rs:397-404`), so the batched cache is
+        // split back into B per-sequence caches once per token, per layer,
+        // including the compressor-history slots.
+        let _prof = arc_profiler::span("clone_out_cache");
         let all_cache = pipeline.cache().normal();
         for layer in 0..pipeline.get_metadata().num_hidden_layers {
             let cache = all_cache.0.get(layer).unwrap();
@@ -1112,11 +1450,16 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 ),
             };
 
-            let k_caches = k_cache.chunk(seqs.len(), 0).unwrap();
-            debug_assert_eq!(k_caches.len(), seqs.len());
-            let v_caches = v_cache.chunk(seqs.len(), 0).unwrap();
-            debug_assert_eq!(v_caches.len(), seqs.len());
+            let (k_caches, v_caches) = {
+                let _s = arc_profiler::device_span("clone_out.chunk");
+                let k_caches = k_cache.chunk(seqs.len(), 0).unwrap();
+                debug_assert_eq!(k_caches.len(), seqs.len());
+                let v_caches = v_cache.chunk(seqs.len(), 0).unwrap();
+                debug_assert_eq!(v_caches.len(), seqs.len());
+                (k_caches, v_caches)
+            };
 
+            let _prof_rebuild = arc_profiler::span("clone_out.rebuild_per_seq");
             for (seq_i, seq) in seqs.iter_mut().enumerate() {
                 let output_cache = if modify_draft_cache {
                     seq.normal_draft_cache()
@@ -2705,5 +3048,504 @@ mod clone_in_cache_invariant_tests {
             first_mismatched_cache_len(&mut seqs, false),
             Some((2, 100, 101, 1))
         );
+    }
+
+    /// Equal `current_seq_len` is NOT sufficient for `tail` to batch.
+    ///
+    /// This is the second, independent route into the `shape mismatch on dim 1`
+    /// failure that `ensure_uniform_batch_cache_lens` closed only half of — and
+    /// it needs **no MTP whatsoever**. `prefix_cacher` calls `set_len` on every
+    /// stored layer, so a sequence restored from an entry stored at a greater
+    /// length holds a narrower tail than one that reached the same token count
+    /// directly.
+    ///
+    /// Mutation check: delete the `reconcile_xs_bases` call from
+    /// `clone_in_cache` and this test fails on the `clone_in_cache` line with
+    /// `shape mismatch on dim 1, 4 <> 132`.
+    #[test]
+    fn xs_base_divergence_at_equal_lengths_is_reconciled_not_refused() {
+        // Restored from a prefix-cache entry stored at 300 tokens, truncated to
+        // 260 — `base` stays at canonical(300), which is past canonical(260).
+        let mut restored = xs_state(128, 1);
+        feed_xs(&mut restored, 300);
+        assert_eq!(
+            restored.resumable_from(),
+            256,
+            "canonical(300) for ratio 128, margin 16"
+        );
+        restored.set_len(260).unwrap();
+
+        // Reached 260 directly.
+        let mut direct = xs_state(128, 1);
+        feed_xs(&mut direct, 260);
+        assert_eq!(
+            direct.resumable_from(),
+            128,
+            "canonical(260) sits a group lower"
+        );
+
+        // --- Fixture discrimination (D12) -------------------------------
+        assert_eq!(
+            (restored.current_seq_len(), direct.current_seq_len()),
+            (260, 260),
+            "the LENGTHS must agree, or this test is reproducing the ragged-length \
+             failure instead of the base one — `ensure_uniform_batch_cache_lens` \
+             would catch that and never reach the tensor"
+        );
+        assert_eq!(
+            (
+                restored.tail.as_ref().unwrap().dims()[1],
+                direct.tail.as_ref().unwrap().dims()[1]
+            ),
+            (4, 132),
+            "and the WIDTHS must disagree, or there is nothing to reconcile"
+        );
+        assert_eq!(
+            legacy_batch_error(
+                restored.tail.as_ref().unwrap(),
+                direct.tail.as_ref().unwrap()
+            ),
+            "shape mismatch on dim 1, 4 <> 132",
+            "uniform lengths still panic the legacy batcher — this is a second, \
+             independent way into the slice_set shape mismatch"
+        );
+
+        // --- The fix ----------------------------------------------------
+        let pipeline = StubPipeline::new(2);
+        let mut a = seq_with_slots(
+            0,
+            260,
+            vec![
+                v4_kv_slot(512, 8, 260),
+                KvCache::XsRolling(Box::new(restored)),
+            ],
+        );
+        let mut b = seq_with_slots(
+            1,
+            260,
+            vec![
+                v4_kv_slot(512, 8, 260),
+                KvCache::XsRolling(Box::new(direct)),
+            ],
+        );
+        let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
+        NormalCacheManager
+            .clone_in_cache(&pipeline, &mut seqs, false)
+            .expect("equal lengths with unequal retained windows must reconcile");
+
+        let batched = pipeline.cache().normal();
+        let KvCache::XsRolling(xs) = &batched.0[1] else {
+            panic!("slot 1 must stay an XsRolling entry")
+        };
+        assert_eq!(
+            xs.resumable_from(),
+            256,
+            "trimmed to the batch's largest retained start"
+        );
+        assert_eq!(xs.tail.as_ref().unwrap().dims(), &[2, 4, XS_HIDDEN]);
+    }
+
+    /// 🔴 **The test that discriminates between gating `reconcile_xs_bases` and
+    /// porting it.**
+    ///
+    /// Same fixture as
+    /// `xs_base_divergence_at_equal_lengths_is_reconciled_not_refused` — equal
+    /// `tokens`, divergent `base`, widths 4 vs 132 — but with
+    /// `ARC_V4_XS_PER_SEQ` **on**. Two things must both hold:
+    ///
+    /// 1. the batch assembles (the front-padded, end-anchored tail reconciles
+    ///    the widths without anyone trimming anything); and
+    /// 2. **each sequence keeps its OWN `base`** when the batch is split back
+    ///    out — 256 stays 256 and 128 stays 128.
+    ///
+    /// 🔑 (2) is the whole point, and it is asserted separately from (1) because
+    /// the two failure modes are different — verified by running both
+    /// mutations, not assumed:
+    ///
+    /// * **Trim the tensors too** (an unconditional `reconcile_xs_bases`, i.e.
+    ///   "port it"): the batched tail comes out `[2, 4, …]` instead of
+    ///   `[2, 132, …]`, so the *width* assertion catches it. The shorter row
+    ///   loses 128 tokens of rollback reach, and so does the longer one.
+    /// * **Reconcile only the logical `base`** (flatten `xs_rows`' `base` to
+    ///   `base_max` and leave the front-padded tensors alone — the more likely
+    ///   mistake once `base` is per-row): every shape is *exactly right*, which
+    ///   is all `clone_in_cache` checks, and the shorter row's rollback floor is
+    ///   silently raised from 128 to 256. **Only reading the per-row `base` back
+    ///   out catches this one** — it fails here with `[256, 256]` against
+    ///   `[256, 128]` after passing every width assertion above.
+    ///
+    /// The second is the same failure mode as the cohort min-rollback #92
+    /// removed and the padding traps #102/#103/#104 each caught: a batch-wide
+    /// scalar standing in for a per-row quantity, invisible to every check that
+    /// looks at shapes.
+    #[test]
+    fn per_row_xs_bases_survive_a_batch_round_trip_and_are_not_flattened() {
+        xs_rolling::test_override::with(true, || {
+            let mut restored = xs_state(128, 1);
+            feed_xs(&mut restored, 300);
+            restored.set_len(260).unwrap();
+            let mut direct = xs_state(128, 1);
+            feed_xs(&mut direct, 260);
+
+            // --- Fixture discrimination (D12): this must be the BASE
+            // divergence, not the length one, and the widths must really
+            // disagree — otherwise there is nothing for either rule to do.
+            assert_eq!(
+                (restored.resumable_from(), direct.resumable_from()),
+                (256, 128),
+                "the two rows must start at different resume points"
+            );
+            assert_eq!(
+                (restored.current_seq_len(), direct.current_seq_len()),
+                (260, 260),
+                "...at the SAME token count, or `ensure_uniform_batch_cache_lens` \
+                 refuses before any of this is reached"
+            );
+            assert_eq!(
+                (
+                    restored.tail.as_ref().unwrap().dims()[1],
+                    direct.tail.as_ref().unwrap().dims()[1]
+                ),
+                (4, 132),
+                "...and holding different-width tails, or the reconciliation is \
+                 vacuous either way"
+            );
+
+            let pipeline = StubPipeline::new(2);
+            let mut a = seq_with_slots(
+                0,
+                260,
+                vec![
+                    v4_kv_slot(512, 8, 260),
+                    KvCache::XsRolling(Box::new(restored)),
+                ],
+            );
+            let mut b = seq_with_slots(
+                1,
+                260,
+                vec![
+                    v4_kv_slot(512, 8, 260),
+                    KvCache::XsRolling(Box::new(direct)),
+                ],
+            );
+
+            // (1) It assembles — the end-anchored tail front-pads to the batch
+            //     maximum, and no trim was needed to get there.
+            {
+                let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
+                NormalCacheManager
+                    .clone_in_cache(&pipeline, &mut seqs, false)
+                    .expect("an end-anchored ragged tail must batch without trimming");
+            }
+            {
+                let batched = pipeline.cache().normal();
+                let KvCache::XsRolling(xs) = &batched.0[1] else {
+                    panic!("slot 1 must stay an XsRolling entry")
+                };
+                assert_eq!(
+                    xs.tail.as_ref().unwrap().dims(),
+                    &[2, 132, XS_HIDDEN],
+                    "the narrow row is front-padded up to the batch maximum, not \
+                     trimmed down to it"
+                );
+                let (tokens, base) = xs.row_lens();
+                assert_eq!(tokens, &[260, 260]);
+                assert_eq!(
+                    base,
+                    &[256, 128],
+                    "🔴 the BATCHED cache must carry both resume points. A \
+                     `base_max` flattening reads [256, 256] here and every shape \
+                     check above still passes."
+                );
+            }
+
+            // (2) And each sequence gets its own back.
+            {
+                let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
+                NormalCacheManager.clone_out_cache(&pipeline, &mut seqs, false);
+            }
+            let got: Vec<usize> = [&mut a, &mut b]
+                .iter_mut()
+                .map(|seq| match seq.normal_cache()[1].as_ref() {
+                    Some(KvCache::XsRolling(xs)) => xs.resumable_from(),
+                    _ => panic!("slot 1 must split back out as an XsRolling entry"),
+                })
+                .collect();
+            assert_eq!(
+                got,
+                vec![256, 128],
+                "🔴 each sequence must keep its OWN resume point. Getting \
+                 [256, 256] means the batch-wide `base_max` was written back \
+                 into the shorter row, raising its rollback floor by 128 tokens \
+                 — correct-looking, right-shaped, and wrong."
+            );
+        });
+    }
+
+    /// `trim_tail_to` refuses a multi-row cache rather than reading `base[0]`.
+    ///
+    /// A scalar `new_base` cannot describe a trim of rows sitting at different
+    /// resume points, and proceeding would return a right-shaped tensor — which
+    /// is exactly what the caller checks — so it must say so (D18).
+    #[test]
+    fn trimming_a_batched_xs_cache_by_one_scalar_is_refused() {
+        xs_rolling::test_override::with(true, || {
+            let mut restored = xs_state(128, 1);
+            feed_xs(&mut restored, 300);
+            restored.set_len(260).unwrap();
+            let mut direct = xs_state(128, 1);
+            feed_xs(&mut direct, 260);
+
+            let pipeline = StubPipeline::new(2);
+            let mut a = seq_with_slots(
+                0,
+                260,
+                vec![
+                    v4_kv_slot(512, 8, 260),
+                    KvCache::XsRolling(Box::new(restored)),
+                ],
+            );
+            let mut b = seq_with_slots(
+                1,
+                260,
+                vec![
+                    v4_kv_slot(512, 8, 260),
+                    KvCache::XsRolling(Box::new(direct)),
+                ],
+            );
+            let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
+            NormalCacheManager
+                .clone_in_cache(&pipeline, &mut seqs, false)
+                .unwrap();
+
+            let mut batched = pipeline.cache().normal().0.clone();
+            let KvCache::XsRolling(xs) = &mut batched[1] else {
+                panic!("slot 1 must stay an XsRolling entry")
+            };
+            assert_eq!(xs.rows(), 2, "precondition: this cache is batched");
+            let err = xs
+                .trim_tail_to(256)
+                .expect_err("a scalar trim of a two-row cache must refuse")
+                .to_string();
+            assert!(
+                err.contains("single-row") && err.contains("2 rows"),
+                "the refusal must name why it cannot answer, got: {err}"
+            );
+        });
+    }
+
+    /// 🔴 `trim_tail_to` must drop the raw rows from the **front**.
+    ///
+    /// It raises `base`, so the tokens it discards are the OLDEST ones and the
+    /// surviving window is the *suffix* of what was there. Narrowing from column
+    /// 0 instead keeps the right *number* of columns holding the wrong tokens —
+    /// every length, width and shape assertion in this file still passes, and
+    /// the sequence silently resumes from history that is `drop` tokens stale.
+    ///
+    /// The other tests here feed zero-filled `xs`, so content is
+    /// indistinguishable and none of them can see this. This one feeds a ramp
+    /// (token `t` carries the value `t`) and reads the actual numbers back.
+    #[test]
+    fn trimming_the_retained_window_drops_the_oldest_rows_not_the_newest() {
+        use candle_core::IndexOp;
+        let dev = candle_core::Device::Cpu;
+        let mut state = xs_state(128, 1);
+        // Token `t` is the constant `t` across its hidden dim, so a column's
+        // identity is readable straight off the tensor.
+        // `f32::from(u16)` rather than `t as f32`: lossless by the type, so the
+        // exact float comparisons below are exact by construction and not by a
+        // range argument the reader has to make.
+        let n = 260usize;
+        let tok = |t: usize| f32::from(u16::try_from(t).expect("fixture is < 65536"));
+        let ramp: Vec<f32> = (0..n)
+            .flat_map(|t| std::iter::repeat_n(tok(t), XS_HIDDEN))
+            .collect();
+        let xs = Tensor::from_vec(ramp, (1usize, n, XS_HIDDEN), &dev).unwrap();
+        state
+            .advance(&xs, |w| {
+                let rows = w.dim(1)? / 128;
+                Tensor::zeros((1usize, rows, XS_HEAD_DIM), w.dtype(), w.device())
+            })
+            .unwrap();
+
+        let base_before = state.resumable_from();
+        let first_before: f32 = state
+            .tail
+            .as_ref()
+            .unwrap()
+            .i((0, 0, 0))
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert_eq!(
+            first_before,
+            tok(base_before),
+            "precondition: column 0 holds token `base`, so the fixture can tell \
+             the two ends apart"
+        );
+
+        let new_base = base_before + 4;
+        state.trim_tail_to(new_base).unwrap();
+
+        let tail = state.tail.as_ref().unwrap();
+        assert_eq!(
+            tail.dims()[1],
+            260 - new_base,
+            "precondition: the WIDTH is right either way — that is exactly why a \
+             width assertion cannot see this bug"
+        );
+        let first_after: f32 = tail.i((0, 0, 0)).unwrap().to_scalar().unwrap();
+        let last_after: f32 = tail
+            .i((0, tail.dims()[1] - 1, 0))
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert_eq!(
+            (first_after, last_after),
+            (tok(new_base), tok(n - 1)),
+            "the retained window must be the SUFFIX [new_base, tokens). Getting \
+             ({base_before}, ..) means the narrow ran from column 0 and the \
+             sequence would resume from stale history at the right width."
+        );
+    }
+
+    /// `trim_tail_to` is lossless only up to what the compressor still needs,
+    /// and must refuse — by name — past it, rather than silently dropping the
+    /// rows the next compressed row is built from.
+    #[test]
+    fn trimming_the_retained_window_past_what_the_compressor_needs_is_refused() {
+        let mut state = xs_state(4, 2);
+        feed_xs(&mut state, 260);
+        let needs_from = state.compressor_needs_from();
+        assert!(
+            needs_from >= state.resumable_from(),
+            "an untouched cache always retains what it needs"
+        );
+        assert!(
+            state.trim_tail_to(needs_from).is_ok(),
+            "trimming to exactly the needed start is the lossless boundary"
+        );
+        let err = state
+            .trim_tail_to(needs_from + 1)
+            .expect_err("one token past it drops history the next row is built from")
+            .to_string();
+        assert!(
+            err.contains("next compressed row is built from"),
+            "the refusal must name what it would have destroyed, got: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod turboquant_gate_tests {
+    use super::EagerTurboQuantDecision::*;
+    use super::*;
+
+    fn reason(d: &EagerTurboQuantDecision) -> String {
+        match d {
+            Enabled(k, v) => panic!("expected Disabled, got Enabled({k}, {v})"),
+            Disabled(r) => r.clone(),
+        }
+    }
+
+    /// The head dims the shipped gate accepted, and the ones it silently
+    /// refused. Every one of these must now be accepted — that is the whole
+    /// change.
+    #[test]
+    fn every_real_head_dim_is_accepted_when_requested() {
+        for d in [64usize, 80, 96, 112, 128, 192, 256, 512] {
+            assert_eq!(
+                resolve_eager_turboquant(d, d, true, false, Some("1")),
+                Enabled(d, d),
+                "head_dim {d} was refused"
+            );
+        }
+        // Asymmetric K/V, which the paged path still cannot do.
+        assert_eq!(
+            resolve_eager_turboquant(192, 128, true, false, Some("1")),
+            Enabled(192, 128)
+        );
+    }
+
+    /// MUTATION GUARD — the refusals must each name their own mechanism, so a
+    /// silent fallback is impossible to mistake for success.
+    #[test]
+    fn each_refusal_names_its_own_mechanism() {
+        // Off by default: the eager path has no fused kernel.
+        assert!(
+            reason(&resolve_eager_turboquant(128, 128, true, false, None))
+                .contains("ARC_TURBOQUANT_KV=1")
+        );
+        // Explicitly off.
+        assert!(
+            reason(&resolve_eager_turboquant(128, 128, true, false, Some("0")))
+                .contains("set to off")
+        );
+        // A garbage value is refused rather than treated as truthy.
+        assert!(reason(&resolve_eager_turboquant(
+            128,
+            128,
+            true,
+            false,
+            Some("yes-please")
+        ))
+        .contains("not a recognised boolean"));
+        // Paged wins: the KV is not in a NormalCache at all.
+        assert!(
+            reason(&resolve_eager_turboquant(128, 128, true, true, Some("1")))
+                .contains("PagedAttention")
+        );
+        // MLA-style layouts have no independent K/V head vectors.
+        assert!(
+            reason(&resolve_eager_turboquant(128, 128, false, false, Some("1")))
+                .contains("standard")
+        );
+        // A width narrower than one rotation block — V4's 1-wide V marker.
+        assert!(
+            reason(&resolve_eager_turboquant(512, 1, true, false, Some("1")))
+                .contains("narrower than one rotation block")
+        );
+    }
+
+    /// `new_plain` must ignore the gate entirely, because V4 depends on it,
+    /// and `new` must take the branch at head dims the old gate refused.
+    #[test]
+    fn gate_selects_the_right_slot_kind() {
+        // Serialise: the gate is process-wide.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        set_turboquant_kv_head_dims(128, 128);
+        let plain = NormalCache::new_plain(3, 4096);
+        for slot in plain.lock().unwrap().0.iter() {
+            assert!(
+                matches!(slot, KvCache::Normal { .. }),
+                "new_plain produced a compressed slot"
+            );
+        }
+        // 128 was allowed by the old gate; 512 was not.
+        for d in [128usize, 512] {
+            set_turboquant_kv_head_dims(d, d);
+            let c = NormalCache::new(2, 4096);
+            for slot in c.lock().unwrap().0.iter() {
+                assert!(
+                    matches!(slot, KvCache::TurboQuant(_)),
+                    "head_dim {d}: NormalCache::new did not take the TurboQuant branch"
+                );
+            }
+        }
+        // An unsupported geometry falls back rather than panicking.
+        set_turboquant_kv_head_dims(512, 1);
+        let c = NormalCache::new(2, 4096);
+        for slot in c.lock().unwrap().0.iter() {
+            assert!(matches!(slot, KvCache::Normal { .. }));
+        }
+        clear_turboquant_head_dim();
+        assert_eq!(turboquant_head_dims(), None);
+        // With the gate off, `new` is `new_plain`.
+        let c = NormalCache::new(2, 4096);
+        for slot in c.lock().unwrap().0.iter() {
+            assert!(matches!(slot, KvCache::Normal { .. }));
+        }
     }
 }

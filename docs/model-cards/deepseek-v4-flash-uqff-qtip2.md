@@ -1,10 +1,24 @@
+---
+tags:
+  - uqff
+  - mistral.rs
+  - arc
+  - qtip2
+base_model: deepseek-ai/DeepSeek-V4-Flash
+base_model_relation: quantized
+---
+
 # DeepSeek-V4-Flash — Arc UQFF (qtip2)
 
-Repository: **`aeonmind/DeepSeek-V4-Flash-UQFF-qtip2`** (currently **private**)
+Repository: **`aeonmind/DeepSeek-V4-Flash-UQFF-qtip2`** (**public**)
 
-A ~1.9 bits/param **qtip2** quantization of DeepSeek-V4-Flash (284 B total /
+A **2.09 bits/param** **qtip2** quantization of DeepSeek-V4-Flash (284 B total /
 13 B active), produced by [Arc](https://github.com/aeonmindai/arc) and
 distributed in Arc/mistral.rs's **UQFF** format.
+
+> **Retraction.** Earlier revisions of this card said "~1.9 bits/param". That
+> was arithmetic over a **68 GB estimate** of the artifact, not over the artifact.
+> The measured size is 74.19 GB ⇒ **2.09 bits/param**. Do not quote 1.9.
 
 > **This is not a standalone model, despite appearances.** The repository ships
 > a `config.json` and a tokenizer, which makes it *look* self-contained. It is
@@ -31,7 +45,7 @@ cargo install --path mistralrs-cli --features "cuda flash-attn"
 > **Do not add the `cudnn` feature.** A same-box A/B on V4 measured it as a
 > large decode regression, not a speedup. The measurement is kept in Arc's
 > internal record; no throughput numbers are quoted on this card (see
-> [Known limitations §2](#2-no-throughput-figures-are-published-here)).
+> [Known limitations §2](#2-no-throughput-figures-are-published-on-this-artifact)).
 
 ### The command
 
@@ -139,16 +153,24 @@ repository runnable on its own.
 | Search | **Viterbi beam, W = 256** |
 | Objective | **MSE** |
 | Rotation | **Hadamard-128** |
-| Effective rate | **≈ 1.9 bits/param** |
+| Effective rate | **2.09 bits/param** [derived from the measured 74.19 GB over 284 B params] |
 
 The bake header emitted for this artifact was
 `mode=viterbi search=viterbi-beam(W=256) objective=mse rotation=hadamard-128`.
 
-Beam W = 256 is Arc's default and is what this artifact used. Exhaustive Viterbi
-measures very slightly *better* on fixture quality (wins 8/9 fixture cells,
-+0.0013…+0.0021 cos on `fp4_dequant`); beam is shipped knowingly because it is
-faster at equal-or-near quality. Beam width has almost no effect on bake time
-(W = 256 vs W = 32 differ ~1%), so there is no reason to bake narrower.
+Beam W = 256 is Arc's default and is what this artifact used. **Exhaustive
+Viterbi is the better search on quality** — it wins **8 of 9 fixture cells**
+(+0.0013…+0.0021 cos on `fp4_dequant`) — and it is roughly **2×** the bake time
+(~510 s/layer against the beam's 241 s/layer on an H200, both [measured] pre-PR-#40).
+**Beam is shipped knowingly for speed, at a declared quality cost**, not because
+the two are equal. Do not restate this as "no quality cost".
+
+*(An earlier revision added "beam width has almost no effect on bake time
+(W = 256 vs W = 32 differ ~1%)". That is **unverified** and it conflicts with the
+in-tree width sweep in
+[QUANTIZATION_PERFORMANCE.md](../engineering/QUANTIZATION_PERFORMANCE.md#the-beams-architectural-ceiling--measured-not-projected),
+where kernel time rises 410.9 → 1011.1 ms from W = 32 to W = 256. Treat the
+width/bake-time relation as unsettled.)*
 
 ---
 
@@ -156,10 +178,10 @@ faster at equal-or-near quality. Beam width has almost no effect on bake time
 
 | | |
 |---|---|
-| Measured resident footprint, load only | **75.7 GB of an 80 GB A100** |
-| ⇒ Practical minimum | **≥ 96 GB** of VRAM |
-| Comfortable | **141 GB H200** (~59 GB left for KV after weights + reserve) |
-| Load time | **12.94 s** for 517 tensors |
+| Resident footprint, load only | **75.7 GB of an 80 GB A100** [measured] |
+| ⇒ Practical minimum | **≥ 96 GB** of VRAM [derived from the above] |
+| Comfortable | **141 GB H200** (~59 GB left for KV after weights + reserve) [derived] |
+| Load time | **12.94 s** for 517 tensors [measured] |
 
 **An 80 GB A100 technically loads it and then has ~4 GB left.** That is not
 enough KV cache for useful context or batching. Treat 80 GB as "it fits, you
@@ -195,31 +217,59 @@ and the layer silently falls back to dense-over-compressed attention.
 * Until you are on an Arc build carrying that fix, the sparse indexer path is
   unavailable with this artifact and the warning above is expected.
 
-### 2. No throughput figures are published here
+### 2. No throughput figures are published on *this* artifact
 
-Arc's serving throughput at batch is **currently poor and under active repair**.
-Nothing about tokens/s, latency, or cost-per-token belongs on this card until it
-has been measured on the published artifact under a stated protocol. Do not infer
-performance from the size or the load time.
+Arc's end-to-end batched serving **has since been measured** (1×H200, 0 errors
+across 505 requests) — but it was measured on the **`qtip2b`** rung, a *different*
+artifact from the `qtip2` one this card describes. Those numbers live in
+[BENCHMARKS.md](../BENCHMARKS.md) and belong to `qtip2b`; quoting them here would
+attribute another artifact's measurement to this one.
 
-### 3. Quality numbers are provisional
+So: nothing about tokens/s, latency, or cost-per-token is stated on this card.
+Do not infer performance from the size or the load time, and do not import the
+`qtip2b` figures.
 
-The only quality measurement Arc has for a qtip2 V4-Flash bake is **GSM8K 87.0%**
-— and it is **provisional**, because the decode math changed after it was taken
-(a missing SwiGLU clamp on the shared expert path and a YaRN layer-set fix both
-landed afterwards and both alter decode output). It has not been re-measured.
+*(Superseded: an earlier revision of this section said Arc's serving throughput at
+batch was "currently poor and under active repair" and that nothing had been
+measured. The second half is no longer true — see above.)*
 
-* Protocol for that 87.0%: **n = 100, 0-shot chat, greedy, 2048-token cap,
-  seed 161**; 2 degenerate, 9 truncated; ±6.6 pp.
-* It was measured on a *different* bake (session-3 GPU-Viterbi), **not on this
+### 3. One quality measurement exists on this artifact, on a small sample
+
+**GSM8K = 96.0%** (96/100, ±3.8 pp), **0 degenerate, 0 truncated**, mean
+completion 148.5 tokens.
+
+* Protocol: **n = 100, 0-shot chat, t = 0, 2048-token cap, seed 161**, measured
+  **on this artifact** (2026-08-15, 1×H200).
+* **n = 100 is a small sample.** The ±3.8 pp is the binomial interval at that
+  n; treat it as such. The full 1,319-problem set has not been run **on this
   artifact**.
+* An earlier **87.0%** figure is **retired, not beaten**: it came from a
+  different bake on superseded decode math (a missing SwiGLU clamp on the
+  shared-expert path and a YaRN layer-set fix both landed after it). It is not
+  a comparable baseline and no delta should be quoted against it.
 * The published DeepSeek V4-Flash-Base reference figure of **90.8** is
   **8-shot** — a different and easier protocol. The two are not comparable.
 
-### 4. The repository is private
+**The full-set number belongs to the other rung.** GSM8K **1270/1319 = 96.3%
+± 1.0 pp** (full test set, 0-shot, 0 degenerate / 0 truncated / 0 errors, mean
+157.8 tokens) was measured 2026-08-17 on the **`qtip2b`** artifact — see
+[BENCHMARKS.md](../BENCHMARKS.md) and
+[the `qtip2b` card](deepseek-v4-flash-uqff-qtip2b.md). **It is not a
+measurement of this card's bake**, and the two should not be conflated: this
+card's 96.0% is n=100 on `qtip2`; that 96.3% is n=1319 on `qtip2b`.
 
-It cannot be downloaded without access. Nothing on this card works until that
-changes, and making it public is a publication decision, not a technical one.
+### 4. This card supersedes an earlier auto-generated one
+
+Until 2026-08-16 this repository carried the default UQFF card, whose example
+was:
+
+```
+mistralrs run -m aeonmind/DeepSeek-V4-Flash-UQFF-qtip2 --from-uqff qtip2-0.uqff
+```
+
+**That command does not work** — it points `-m` at the overlay instead of the
+source checkpoint and produces the `DummyLayer not replaced` error documented
+above. Use the two-flag form in [How to run it](#how-to-run-it).
 
 ### 5. Bake-side caveats
 
@@ -243,12 +293,15 @@ Every number on this card, with how it was obtained.
 | Tensors restored | 517 | Load log, A100, 2026-08-15 |
 | Load time | 12.94 s | Measured on the same A100 that baked it, 2026-08-15 |
 | Resident on load | 75.7 GB of 80 GB | Measured, A100, 2026-08-15 |
-| Bits/param | ≈ 1.9 | 74.19 GB over 284 B params |
+| Bits/param | **2.09** [derived] | 74.19 GB × 8 over 284 B params. ⚠️ The former "≈ 1.9" is **retracted** — it divided a **68 GB estimate**, not the artifact |
 | Bake config | beam W=256 / hadamard-128 / mse | Bake header string, read off the box |
-| Bake cost | 43 layers @ 370–376 s/layer on a \$1.49/hr A100, completed 04:44:51Z 2026-08-15 | Differenced consecutive layer markers (never a running average) |
+| Bake cost | 43 layers @ 370–376 s/layer on a \$1.49/hr A100, completed 04:44:51Z 2026-08-15 [measured] | Differenced consecutive layer markers (never a running average) |
+| Beam vs exhaustive | exhaustive wins **8 of 9** fixture cells; beam ships for speed [measured] | Fixture sweep in [QUANTIZATION_PERFORMANCE.md](../engineering/QUANTIZATION_PERFORMANCE.md); the quality cost is declared, not absent |
 | Indexer shape mismatch | expected `[256,512]`, got `[256,4096]`, every CSA layer | Load log, this artifact |
-| GSM8K 87.0% | **PROVISIONAL**, superseded math, different bake | n=100, 0-shot chat, greedy, 2048-cap, seed 161 |
-| Throughput (any form) | **not published** | Not measured on this artifact. The `cudnn` warning above is a build-flag direction, deliberately stated without numbers |
+| GSM8K 96.0% | 96/100, ±3.8 pp, 0 degenerate, 0 truncated [measured] | n=100, 0-shot chat, t=0, 2048-cap, seed 161, **on this artifact**, 1×H200, 2026-08-15 |
+| GSM8K 87.0% | **SUPERSEDED** — do not quote as current | n=100, 0-shot chat, greedy, 2048-cap, seed 161; superseded decode math, different bake |
+| GSM8K 96.3% (1270/1319, ±1.0 pp) | **[measured]** 2026-08-17, full test set — **belongs to `qtip2b`, not this artifact** | Reference model's 90.8 is **8-shot**, so it is **not** like-for-like. Do not conflate with this card's n=100 96.0% |
+| Throughput (any form) | **not published on this artifact** | Batched serving is measured on **`qtip2b`** ([BENCHMARKS.md](../BENCHMARKS.md)), a different artifact. The `cudnn` warning above is a build-flag direction, deliberately stated without numbers |
 
 ---
 
