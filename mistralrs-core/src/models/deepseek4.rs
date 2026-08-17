@@ -7276,6 +7276,248 @@ mod tests {
         Ok(())
     }
 
+    /// **Batched ragged accept must leave every V4 cache slot at one length.**
+    ///
+    /// The single-sequence rollback above proves `truncate_cache_by` honours a
+    /// drop. What it cannot see is the batched case wave51-CB actually died on:
+    /// B = 8, `--mtp-depth 3`, **different accept lengths per sequence in the
+    /// same step**. There the drop is not `n_proposed - commit_len` for one
+    /// sequence, it is `w - min_i(u_i + accepted_i)` for the whole cohort
+    /// (`plan_batch_step`), and the thing that has to survive is not one
+    /// sequence's rows but the property that lets the cohort stay a cohort:
+    /// **every slot of the shared cache reports the same length**.
+    ///
+    /// This drives many steps of ragged acceptance through the production
+    /// arithmetic and requires that property after each one — on a cache with
+    /// both compressor shapes, so a rule that happens to work at `ratio = 4`
+    /// cannot pass by accident at `ratio = 128` (the HCA layers, whose tail is
+    /// the tensor that panicked).
+    #[test]
+    fn batched_ragged_accept_keeps_every_v4_cache_slot_in_lockstep() -> Result<()> {
+        let device = Device::Cpu;
+        let (hidden, head_dim) = (32usize, 16usize);
+        let c4 = rolling_test_compressor(4, hidden, head_dim, &device)?;
+        let c128 = rolling_test_compressor(128, hidden, head_dim, &device)?;
+        let xs = rolling_test_xs(1024, hidden, &device)?;
+
+        // `--mtp-depth 3` — the run that crashed.
+        let w = 4usize;
+        // Accept patterns for a B=4 cohort, deliberately ragged: full accept,
+        // partial, zero, and a mix. Each row is one step.
+        let steps: &[[usize; 4]] = &[
+            [3, 0, 1, 2],
+            [0, 0, 0, 0],
+            [3, 3, 3, 3],
+            [1, 3, 0, 2],
+            [2, 1, 3, 0],
+            [0, 2, 2, 1],
+            [3, 1, 0, 3],
+        ];
+
+        // One cache carrying BOTH compressor ratios, so `ratio = 128` (the HCA
+        // tail that panicked) is exercised in the same batch as `ratio = 4`.
+        let cache = v4_shaped_cache(2, &[(4, c4.coff), (128, c128.coff)], head_dim, 4096);
+        let compressors = [&c4, &c128];
+        let feed = |from: usize, t: usize| -> Result<()> {
+            let EitherCache::Normal(normal) = &cache else {
+                unreachable!()
+            };
+            let mut guard = normal.lock().unwrap();
+            let mut xs_seen = 0usize;
+            for entry in &mut *guard.0 {
+                match entry {
+                    KvCache::XsRolling(state) => {
+                        let slice = xs.narrow(1, from, t)?;
+                        state.advance(&slice, |win| compressors[xs_seen].forward_from_xs(win))?;
+                        xs_seen += 1;
+                    }
+                    _ => {
+                        let kv = Tensor::zeros((1, 1, t, 4), DType::F32, &device)?;
+                        entry.append(&kv, &kv)?;
+                    }
+                }
+            }
+            Ok(())
+        };
+
+        // Prefill past the ratio-128 boundary so the HCA tail is in the
+        // interesting regime (a `base` of 256, an 18-ish tail) rather than
+        // trivially equal to the whole history.
+        let mut cache_len = 272usize;
+        feed(0, cache_len)?;
+        assert_eq!(cache_lens(&cache), vec![cache_len; 4], "fixture desync");
+
+        // Each sequence's uncached committed tail. Starts at 1 (plain decode).
+        let mut uncached = vec![1usize; 4];
+        let mut saw_a_ragged_step = false;
+
+        for accepted in steps {
+            // The window a sequence can actually draft into is `w - u`, so an
+            // accept count is capped by it — mirror the fast path's own bound.
+            let accepted: Vec<usize> = accepted
+                .iter()
+                .zip(&uncached)
+                .map(|(a, u)| (*a).min(w - u))
+                .collect();
+            let plan = crate::pipeline::plan_batch_step(&uncached, &accepted, w);
+            if accepted.iter().any(|a| *a != accepted[0]) {
+                saw_a_ragged_step = true;
+            }
+
+            // The verify forward: every sequence feeds the same `w` slots.
+            feed(cache_len, w)?;
+            assert_eq!(
+                cache_lens(&cache),
+                vec![cache_len + w; 4],
+                "the verify forward must advance every slot by the full window"
+            );
+
+            // The production rollback, then the lockstep postcondition.
+            if plan.n_drop > 0 {
+                crate::pipeline::truncate_cache_by(&cache, plan.n_drop)?;
+            }
+            let want = cache_len + plan.keep;
+            crate::pipeline::enforce_shared_cache_lockstep(&cache, want)?;
+
+            assert_eq!(
+                cache_lens(&cache),
+                vec![want; 4],
+                "ragged accept {accepted:?} from uncached {uncached:?} left the K/V and \
+                 compressor slots at different lengths — this is the state that surfaces one \
+                 step later as `shape mismatch on dim 1, 18 <> 22`"
+            );
+
+            // The compressor rows must still be the from-scratch answer for
+            // BOTH ratios: a lockstep that is only true of the lengths, while
+            // the rows drifted, would be worthless.
+            for (i, (ratio, compressor)) in [(4usize, &c4), (128usize, &c128)].iter().enumerate() {
+                let t_trunc = (want / ratio) * ratio;
+                let expect = compressor.forward_from_xs(&xs.narrow(1, 0, t_trunc)?)?;
+                let got = compressed_rows_of(&cache, 2 + i)?.expect("rows exist past 272 tokens");
+                assert_eq!(got.dim(1)?, expect.dim(1)?, "ratio {ratio}: row count");
+                assert!(
+                    max_abs_diff(&got, &expect)? <= 1e-5,
+                    "ratio {ratio}: the rows after a ragged batched step are not the \
+                     from-scratch answer at {t_trunc} tokens"
+                );
+            }
+
+            uncached = plan.next_uncached.clone();
+            assert!(
+                uncached.iter().all(|u| (1..=w).contains(u)),
+                "the window invariant broke: {uncached:?} outside 1..={w}"
+            );
+            cache_len = want;
+        }
+
+        assert!(
+            saw_a_ragged_step,
+            "every step accepted uniformly — the ragged case, which is the one that breaks, \
+             was never exercised"
+        );
+        Ok(())
+    }
+
+    /// **Mutation: a slot that drifts out of lockstep must fail loudly.**
+    ///
+    /// This is the D12 pairing for the test above. Break the invariant by hand
+    /// — one compressor slot that advanced with the forward while the rollback
+    /// missed it (a slot ahead), and one that never advanced at all (a slot
+    /// behind) — and require that `enforce_shared_cache_lockstep` repairs the
+    /// first and *refuses* the second by name.
+    ///
+    /// Without this, the test above would pass just as well against a function
+    /// whose body was `Ok(())`.
+    #[test]
+    fn a_cache_slot_that_drifts_out_of_lockstep_is_repaired_or_named() -> Result<()> {
+        let device = Device::Cpu;
+        let (hidden, head_dim) = (32usize, 16usize);
+        let c128 = rolling_test_compressor(128, hidden, head_dim, &device)?;
+        let xs = rolling_test_xs(1024, hidden, &device)?;
+
+        let build = |xs_tokens: usize, kv_tokens: usize| -> Result<EitherCache> {
+            let cache = v4_shaped_cache(2, &[(128, c128.coff)], head_dim, 4096);
+            let EitherCache::Normal(normal) = &cache else {
+                unreachable!()
+            };
+            {
+                let mut guard = normal.lock().unwrap();
+                for entry in &mut *guard.0 {
+                    match entry {
+                        KvCache::XsRolling(state) => {
+                            state.advance(&xs.narrow(1, 0, xs_tokens)?, |win| {
+                                c128.forward_from_xs(win)
+                            })?;
+                        }
+                        _ => {
+                            let kv = Tensor::zeros((1, 1, kv_tokens, 4), DType::F32, &device)?;
+                            entry.append(&kv, &kv)?;
+                        }
+                    }
+                }
+            }
+            Ok(cache)
+        };
+
+        // --- Fixture discrimination (D12) --------------------------------
+        // 274 vs 278 is the exact pair wave51-CB reported, and the widths it
+        // produces are the exact pair in the panic message.
+        let ahead = build(278, 274)?;
+        assert_eq!(
+            cache_lens(&ahead),
+            vec![274, 274, 278],
+            "the fixture must actually be out of lockstep, or the repair below \
+             proves nothing"
+        );
+        {
+            let EitherCache::Normal(normal) = &ahead else {
+                unreachable!()
+            };
+            let guard = normal.lock().unwrap();
+            let KvCache::XsRolling(state) = &guard.0[2] else {
+                unreachable!()
+            };
+            assert_eq!(
+                state.tail.as_ref().unwrap().dim(1)?,
+                22,
+                "at 278 tokens the HCA tail is 22 wide — the right-hand number in \
+                 `shape mismatch on dim 1, 18 <> 22`"
+            );
+        }
+
+        // A slot that ran AHEAD is rolled back — lossless, the window re-feeds.
+        crate::pipeline::enforce_shared_cache_lockstep(&ahead, 274)?;
+        assert_eq!(cache_lens(&ahead), vec![274; 3]);
+        {
+            let EitherCache::Normal(normal) = &ahead else {
+                unreachable!()
+            };
+            let guard = normal.lock().unwrap();
+            let KvCache::XsRolling(state) = &guard.0[2] else {
+                unreachable!()
+            };
+            assert_eq!(
+                state.tail.as_ref().unwrap().dim(1)?,
+                18,
+                "and it lands on 18 — the left-hand number, which is what makes the \
+                 two batchable"
+            );
+        }
+
+        // A slot that fell BEHIND cannot be repaired: the positions it is
+        // missing were never written. It must say so.
+        let behind = build(270, 274)?;
+        assert_eq!(cache_lens(&behind), vec![274, 274, 270]);
+        let err = crate::pipeline::enforce_shared_cache_lockstep(&behind, 274)
+            .expect_err("a slot that never advanced must not be silently accepted")
+            .to_string();
+        assert!(
+            err.contains("cache slot 2") && err.contains("270") && err.contains("274"),
+            "the refusal must name the slot and both lengths, got: {err}"
+        );
+        Ok(())
+    }
+
     /// The MTP rollback bound and the retained-tail margin are two constants in
     /// two places that must stay ordered. `--mtp-depth` is clap-capped at 8
     /// (`mistralrs-cli/src/args/mod.rs`), a rejection rolls back at most that

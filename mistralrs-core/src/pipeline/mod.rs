@@ -104,10 +104,13 @@ pub use mtp_pipeline::{
     set_mtp_load_depth, set_mtp_uqff_bake, try_wrap_pipeline_with_mtp, verify_proposed,
     MtpAcceptance, MtpDecodeKit, MtpHiddenCapture, MtpSpeculativePipeline, VerifyResult,
 };
-/// The MTP rejection rollback, reachable from the V4 model's own tests so the
-/// cache it truncates (K/V **and** `XsRolling` entries) is the real one.
+/// The MTP rejection rollback and the batched-step arithmetic around it,
+/// reachable from the V4 model's own tests so the cache they act on (K/V **and**
+/// `XsRolling` entries) is the real one.
 #[cfg(test)]
-pub(crate) use mtp_pipeline::{n_cache_positions_to_drop, truncate_cache_by};
+pub(crate) use mtp_pipeline::{
+    enforce_shared_cache_lockstep, n_cache_positions_to_drop, plan_batch_step, truncate_cache_by,
+};
 pub use speculative::{SpeculativeConfig, SpeculativeLoader, SpeculativePipeline};
 pub use speech::{SpeechLoader, SpeechPipeline};
 use std::any::Any;

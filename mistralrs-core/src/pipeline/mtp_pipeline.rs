@@ -1857,6 +1857,52 @@ pub(crate) fn truncate_cache_by(cache: &EitherCache, n_drop: usize) -> Result<()
     Ok(())
 }
 
+/// Every slot of the shared cache must leave a fused step at the same length.
+///
+/// `truncate_cache_by` drops `n_drop` from whatever each slot happens to hold,
+/// which restores lockstep only if the slots entered the step in lockstep. V4's
+/// cache is heterogeneous — 43 K/V slots followed by 41 `XsRolling` compressor
+/// histories, the latter advanced by the model rather than by
+/// `SingleCache::append` — so "they all advanced by `w`" is an assumption, and
+/// it is exactly the assumption whose failure surfaces one step later as
+/// `clone_in_cache`'s `shape mismatch on dim 1, 18 <> 22`: the mismatch is
+/// invisible on the KV slots (dim 1 there is the head count) and fatal on the
+/// compressor tail (dim 1 there is `tokens - base`).
+///
+/// So it is asserted, in release, at the one place the answer is known: a slot
+/// that ran ahead is rolled back to `expected` (lossless — the window re-feeds
+/// those positions), and a slot that fell *behind* is a real defect and says so,
+/// because nothing here can fabricate the positions it is missing.
+pub(crate) fn enforce_shared_cache_lockstep(cache: &EitherCache, expected: usize) -> Result<()> {
+    let EitherCache::Normal(normal) = cache else {
+        return Ok(());
+    };
+    let mut guard = normal.lock().unwrap();
+    for (slot, cache) in guard.0.iter_mut().enumerate() {
+        let cur = cache.current_seq_len();
+        if cur == expected {
+            continue;
+        }
+        if cur < expected {
+            candle_core::bail!(
+                "MTP: cache slot {slot} fell behind the batch after the verify rollback — it \
+                 holds {cur} positions where every other slot holds {expected}. A slot that did \
+                 not advance with the forward cannot be repaired here; the positions it is \
+                 missing were never written. (On DeepSeek V4 slots past the K/V entries are \
+                 `XsRolling` compressor histories advanced by the model, not by \
+                 `SingleCache::append`.)"
+            );
+        }
+        cache.set_len(expected).map_err(|e| {
+            candle_core::Error::msg(format!(
+                "MTP: cache slot {slot} ran ahead of the batch ({cur} vs {expected}) and could \
+                 not be rolled back into lockstep: {e}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 /// How many trailing KV-cache positions to drop after an MTP verify forward.
 ///
 /// Invariant to restore (what plain decode maintains): entering a decode
@@ -1967,6 +2013,35 @@ impl IsqPipelineMixin for MtpSpeculativePipeline {
 
 impl CacheManagerMixin for MtpSpeculativePipeline {
     fn clone_in_cache(&self, seqs: &mut [&mut Sequence]) -> candle_core::Result<()> {
+        // ---- Lockstep, one step earlier than the fused step's own rollback ----
+        //
+        // The fused step already resolves ragged acceptance by rolling the ONE
+        // shared cache to `min_i(u_i + accepted_i)` and letting each sequence's
+        // surplus stay committed as TOKENS. That keeps a cohort uniform for as
+        // long as it stays one cohort. It does not cover a cohort that arrives
+        // ragged — a sequence rejoining from the waitlist, one restored from a
+        // prefix-cache entry, or two buckets coalescing — because
+        // `Sequence::cache_bucket_len` buckets on cache slot 0 only and V4's
+        // 41 `XsRolling` slots are invisible to it.
+        //
+        // Applying the same rollback here makes the cohort uniform instead of
+        // refusing it. It is lossless for exactly the reason the in-step
+        // rollback is: the next window feeds `toks[cache_len..]` as real tokens
+        // before any draft, so every dropped position is recomputed. The bound
+        // is `window()`; past it `align_batch_cache_lens` refuses by name rather
+        // than serve a sequence from a hole.
+        //
+        // Skipped entirely when the batch already agrees, which is the common
+        // case — the check is metadata-only.
+        if seqs.len() > 1 && crate::kv_cache::first_mismatched_cache_len(seqs, false).is_some() {
+            let aligned = crate::kv_cache::align_batch_cache_lens(seqs, false, self.window())?;
+            tracing::debug!(
+                target: "mtp_speculative",
+                aligned,
+                batch = seqs.len(),
+                "MTP: rolled a ragged cohort back to the batch-minimum cache length"
+            );
+        }
         get_mut_arcmutex!(self.target).clone_in_cache(seqs)
     }
     fn clone_out_cache(&self, seqs: &mut [&mut Sequence]) {
@@ -2518,6 +2593,11 @@ impl Pipeline for MtpSpeculativePipeline {
         if plan.n_drop > 0 {
             truncate_normal_cache(self, plan.n_drop)?;
         }
+        // The postcondition the next `clone_in_cache` depends on, checked where
+        // the answer is known rather than discovered as a shape mismatch a step
+        // later. `clone_out_cache` copies this state onto every sequence, so
+        // lockstep here IS the cohort staying batchable.
+        enforce_shared_cache_lockstep(&self.target_cache, cache_len + plan.keep)?;
 
         // ---- Commit ----
         for i in 0..batch {
@@ -3998,6 +4078,83 @@ mod tests {
     /// sequences that accepted fewer drafts would carry K/V for tokens they
     /// never committed, and their next tail underflows. The equivalence test
     /// above must fail on it, or it is not testing the rollback at all.
+    /// **The batched-MTP acceptance ceiling, stated as arithmetic.**
+    ///
+    /// `plan_batch_step` advances the ONE dense cache by `keep = min_i(u_i +
+    /// a_i)` and lets each sequence's surplus stay committed as tokens, so
+    /// `next_u_i = u_i + a_i + 1 - keep`. The moment the batch contains a single
+    /// sequence that rejects its first draft (`u = 1, a = 0`), `keep = 1` and
+    /// that collapses to **`next_u_i = u_i + a_i`** — monotonically
+    /// non-decreasing. A sequence's uncached tail therefore ratchets upward
+    /// until it hits the window `w = depth + 1`, at which point it drafts
+    /// `w - u = 0` tokens, accepts 0, and stays there forever.
+    ///
+    /// ⇒ **A sequence that accepts well is exactly the one that stops
+    /// drafting.** At B = 1 this cannot happen (`keep = u + a`, so `next_u` is
+    /// always 1, which is why the only acceptance number ever measured —
+    /// `tok_per_step = 1.8387` — was taken at B = 1). At large B the probability
+    /// that *no* sequence rejects immediately is `p^B`, so `keep = 1` is
+    /// effectively certain and every sequence saturates.
+    ///
+    /// This is a property of one dense cache carrying one length, not of the
+    /// draft head: the cache can only advance by the amount every member can
+    /// vouch for. It is pinned here because it bounds what any amount of
+    /// draft-quality work can buy at batch, and because a future change that
+    /// claims to lift it has to break this test to prove it did.
+    #[test]
+    fn one_laggard_ratchets_every_other_sequences_tail_to_the_window() {
+        let depth = 3usize;
+        let w = depth + 1;
+        // Sequence 0 is the laggard: it never accepts anything, so it holds
+        // `keep` at 1 for the whole batch. Sequences 1..4 accept everything
+        // they are allowed to draft.
+        let b = 5usize;
+        let mut uncached = vec![1usize; b];
+
+        let mut saturated_at = None;
+        for step in 0..16 {
+            let accepted: Vec<usize> = uncached
+                .iter()
+                .enumerate()
+                .map(|(i, u)| if i == 0 { 0 } else { w - u })
+                .collect();
+            let plan = plan_batch_step(&uncached, &accepted, w);
+            assert_eq!(plan.keep, 1, "one laggard pins the shared advance at 1");
+            uncached = plan.next_uncached;
+            if saturated_at.is_none() && uncached[1..].iter().all(|u| *u == w) {
+                saturated_at = Some(step);
+            }
+        }
+
+        let step = saturated_at.expect(
+            "the good sequences must saturate — if they do not, the min-rollback ceiling has \
+             been lifted and this test is the place to say how",
+        );
+        assert!(
+            step <= 2,
+            "saturation took {step} steps; the collapse is supposed to be immediate"
+        );
+        // The state it is stuck in: full tail, zero drafts, zero acceptance.
+        for (i, u) in uncached.iter().enumerate().skip(1) {
+            assert_eq!(*u, w, "seqs[{i}] must be pinned at the window width");
+            assert_eq!(w - u, 0, "seqs[{i}] drafts nothing, so MTP buys it nothing");
+        }
+
+        // And the control: at B = 1 the same accept pattern never saturates,
+        // because `keep` tracks the single sequence's own extent.
+        let mut solo = vec![1usize];
+        for _ in 0..16 {
+            let accepted = vec![w - solo[0]];
+            let plan = plan_batch_step(&solo, &accepted, w);
+            solo = plan.next_uncached;
+            assert_eq!(
+                solo[0], 1,
+                "at B=1 the tail must stay at 1, so the sequence always drafts the full depth \
+                 — this is the asymmetry between the measured B=1 number and batch"
+            );
+        }
+    }
+
     #[test]
     fn batched_rollback_mutation_max_instead_of_min_is_caught() {
         fn bad_plan(uncached: &[usize], accepted: &[usize], w: usize) -> BatchStepPlan {

@@ -594,6 +594,159 @@ pub(crate) fn ensure_uniform_batch_cache_lens(
     }
 }
 
+/// Roll every sequence's cache down to the batch's shortest slot, so a ragged
+/// cohort can share one dense batched cache.
+///
+/// # Why this is sound *only* for a speculative caller
+///
+/// Dropping cache positions is lossless **iff** the caller re-feeds the tokens
+/// they covered in the very next forward. Plain decode does not: it feeds
+/// `toks[len - 1..]`, exactly one token, so a sequence rolled back by 3 would
+/// attend over a hole and answer from a truncated prefix — silently.
+///
+/// Batched MTP does. Its window is `w = depth + 1` slots wide and it feeds
+/// `toks[cache_len..]` as *real* tokens before any draft
+/// (`mtp_pipeline.rs`'s window invariant), so a sequence whose cache is `u`
+/// positions behind its committed tokens recomputes exactly those `u` positions
+/// next step, for any `u` in `1..=w`. That is the same mechanism the fused step
+/// already relies on when it rolls the shared cache to `min_i(u_i + accepted_i)`
+/// and lets each sequence's surplus "stay committed as TOKENS": this function is
+/// that rollback applied one step earlier, to sequences that arrived ragged
+/// instead of diverging inside the step.
+///
+/// `max_uncached` is that bound. A sequence that would end up more than
+/// `max_uncached` positions behind is refused by name rather than quietly served
+/// from a hole — the fast path's own `window_ok` check would have rejected it a
+/// moment later anyway, and refusing here keeps the reason attached.
+///
+/// Returns the length every slot of every sequence now reports.
+pub(crate) fn align_batch_cache_lens(
+    seqs: &mut [&mut crate::sequence::Sequence],
+    modify_draft_cache: bool,
+    max_uncached: usize,
+) -> Result<usize> {
+    if seqs.is_empty() {
+        return Ok(0);
+    }
+    // The target is the shortest populated slot anywhere in the batch: any
+    // longer choice would need a sequence to fabricate positions it does not
+    // hold.
+    let mut target = usize::MAX;
+    for seq in seqs.iter_mut() {
+        let cache = if modify_draft_cache {
+            seq.normal_draft_cache()
+        } else {
+            seq.normal_cache()
+        };
+        for slot in cache.iter().flatten() {
+            target = target.min(slot.current_seq_len());
+        }
+    }
+    if target == usize::MAX {
+        // No populated slot anywhere — nothing to align (a fresh batch).
+        return Ok(0);
+    }
+
+    // Validate the whole batch before mutating any of it: `try_set_len` does
+    // not mutate, so a batch that cannot be aligned is left exactly as it was
+    // and the caller can fail the requests without having half-truncated
+    // anyone. Same two-loop discipline as `prefix_cacher::take_matching_cache`.
+    for (i, seq) in seqs.iter_mut().enumerate() {
+        let tokens = seq.len();
+        let cache = if modify_draft_cache {
+            seq.normal_draft_cache()
+        } else {
+            seq.normal_cache()
+        };
+        let uncached = tokens.saturating_sub(target);
+        if uncached > max_uncached {
+            candle_core::bail!(
+                "kv-cache: cannot align this batch — seqs[{i}] holds {tokens} committed tokens \
+                 against a batch-minimum cache length of {target}, i.e. {uncached} uncached \
+                 positions, and the speculative window only re-feeds {max_uncached}. Rolling it \
+                 back would leave a hole in its context. (This batch should have been split by \
+                 the scheduler; `Sequence::cache_bucket_len` reads cache slot 0 only.)"
+            );
+        }
+        for (layer, slot) in cache.iter().enumerate() {
+            let Some(slot) = slot else { continue };
+            if slot.current_seq_len() == target {
+                continue;
+            }
+            slot.try_set_len(target).map_err(|e| {
+                candle_core::Error::msg(format!(
+                    "kv-cache: cannot align cache slot {layer} of seqs[{i}] from {} to {target} \
+                     positions: {e}",
+                    slot.current_seq_len()
+                ))
+            })?;
+        }
+    }
+
+    for seq in seqs.iter_mut() {
+        let cache = if modify_draft_cache {
+            seq.normal_draft_cache()
+        } else {
+            seq.normal_cache()
+        };
+        for slot in cache.iter_mut().flatten() {
+            if slot.current_seq_len() != target {
+                slot.set_len(target)?;
+            }
+        }
+    }
+    Ok(target)
+}
+
+/// Reconcile the one quantity `ensure_uniform_batch_cache_lens` cannot see:
+/// [`XsRollingCache::base`].
+///
+/// Uniform `tokens` is *not* sufficient for `tail` (`tokens - base` wide) to
+/// batch, because `base` tracks the sequence's high-water length rather than its
+/// current one — see [`XsRollingCache::trim_tail_to`] for the three ways two
+/// sequences at the same length come to hold different `base`. Raising every
+/// member to the batch maximum is lossless and makes the widths agree by
+/// construction, which is what lets a ragged MTP cohort stay one batch instead of
+/// being refused.
+fn reconcile_xs_bases(
+    seqs: &mut [&mut crate::sequence::Sequence],
+    layer: usize,
+    modify_draft_cache: bool,
+) -> Result<()> {
+    let mut base_max = 0usize;
+    let mut any = false;
+    for seq in seqs.iter_mut() {
+        let cache = if modify_draft_cache {
+            seq.normal_draft_cache()
+        } else {
+            seq.normal_cache()
+        };
+        if let Some(KvCache::XsRolling(xs)) = cache.get(layer).and_then(|s| s.as_ref()) {
+            base_max = base_max.max(xs.base);
+            any = true;
+        }
+    }
+    if !any || base_max == 0 {
+        return Ok(());
+    }
+    for (i, seq) in seqs.iter_mut().enumerate() {
+        let cache = if modify_draft_cache {
+            seq.normal_draft_cache()
+        } else {
+            seq.normal_cache()
+        };
+        if let Some(KvCache::XsRolling(xs)) = cache.get_mut(layer).and_then(|s| s.as_mut()) {
+            xs.trim_tail_to(base_max).map_err(|e| {
+                candle_core::Error::msg(format!(
+                    "kv-cache: cannot reconcile cache slot {layer} of seqs[{i}] to the batch's \
+                     retained-window start {base_max}: {e}"
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
 impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCacheManager {
     fn clone_in_cache(
         &self,
@@ -627,6 +780,12 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     continue;
                 }
             }
+
+            // `tail` is content, not slack, so it cannot be padded — but it
+            // *can* be trimmed to a common start, which is lossless. Do that
+            // before gathering, so the batch's widths agree by construction
+            // rather than by luck.
+            reconcile_xs_bases(seqs, layer, modify_draft_cache)?;
 
             // Gather every sequence's two tensors for this slot up front, so
             // the batch's shape is decided by the whole batch instead of by
@@ -2063,9 +2222,17 @@ mod clone_in_cache_invariant_tests {
     /// unsound the moment a cache slot's batched width tracks tokens.
     ///
     /// This is a genuinely ragged batch: the two sequences hold different
-    /// compressor history and cannot share one dense buffer. It must be
-    /// refused, by name — never papered over, and never a panic on the engine
-    /// task.
+    /// compressor history and cannot share one dense buffer. On the
+    /// **non-speculative** contract it must be refused, by name — never papered
+    /// over, and never a panic on the engine task. Plain decode feeds
+    /// `toks[len - 1..]`, one token, so it has no way to make good a rolled-back
+    /// position and a "helpful" alignment here would serve the request from a
+    /// hole.
+    ///
+    /// 🔑 wave59-CJ: that is now only half the story, and the other half is
+    /// `ragged_xs_tail_is_aligned_for_a_speculative_caller` below. Batched MTP
+    /// *does* re-feed, so it may roll the batch into lockstep instead — which is
+    /// what makes MTP run at B > 1 rather than have its cohorts refused.
     #[test]
     fn ragged_xs_tail_is_refused_by_name_not_panicked() {
         let mut short = xs_state(128, 1);
@@ -2120,6 +2287,214 @@ mod clone_in_cache_invariant_tests {
             err.contains("274") && err.contains("278"),
             "the refusal must name BOTH lengths so the operator can see which \
              sequences diverged, got: {err}"
+        );
+    }
+
+    /// The same fixture the test above refuses, put through the path a batched
+    /// MTP step uses. **This is the wave59-CJ fix**: the cohort is rolled back
+    /// into lockstep and then batches, instead of costing every request in it.
+    ///
+    /// The two sequences are exactly the pair wave51-CB died on — 274 and 278
+    /// tokens, tails 18 and 22 wide. `--mtp-depth 3` gives `w = 4`, so the
+    /// 4-token surplus is precisely what the next window re-feeds
+    /// (`toks[cache_len..]` are real tokens, drafts only fill what is left).
+    #[test]
+    fn ragged_xs_tail_is_aligned_for_a_speculative_caller() {
+        let mut short = xs_state(128, 1);
+        feed_xs(&mut short, 274);
+        let mut long = xs_state(128, 1);
+        feed_xs(&mut long, 278);
+
+        // --- Fixture discrimination (D12) -------------------------------
+        // Same fixture, same panic, as the refusal test — otherwise this would
+        // be proving alignment on a batch that never needed it.
+        assert_eq!(
+            legacy_batch_error(
+                short.tail.as_ref().unwrap(),
+                long.tail.as_ref().unwrap()
+            ),
+            "shape mismatch on dim 1, 18 <> 22",
+            "the fixture must reproduce the exact panic wave51-CB saw"
+        );
+
+        let pipeline = StubPipeline::new(2);
+        let mut a = seq_with_slots(
+            0,
+            274,
+            vec![v4_kv_slot(512, 8, 274), KvCache::XsRolling(Box::new(short))],
+        );
+        let mut b = seq_with_slots(
+            1,
+            278,
+            vec![v4_kv_slot(512, 8, 278), KvCache::XsRolling(Box::new(long))],
+        );
+        let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
+
+        // `w = depth + 1 = 4` for `--mtp-depth 3`, the run that crashed.
+        let aligned = align_batch_cache_lens(&mut seqs, false, 4)
+            .expect("a 4-token surplus is inside the speculative window");
+        assert_eq!(aligned, 274, "the batch aligns to its shortest slot");
+
+        NormalCacheManager
+            .clone_in_cache(&pipeline, &mut seqs, false)
+            .expect("an aligned cohort must batch");
+
+        let batched = pipeline.cache().normal();
+        let KvCache::XsRolling(xs) = &batched.0[1] else {
+            panic!("slot 1 must stay an XsRolling entry")
+        };
+        assert_eq!(xs.current_seq_len(), 274);
+        assert_eq!(
+            xs.tail.as_ref().unwrap().dims(),
+            &[2, 18, XS_HIDDEN],
+            "both tails must reconcile onto the shorter sequence's width"
+        );
+
+        // The surplus is NOT lost — it is still committed as tokens, and comes
+        // back as a longer uncached tail. That is the whole contract.
+        assert_eq!(b.len(), 278, "committed tokens are untouched by the rollback");
+        assert_eq!(a.len(), 274);
+    }
+
+    /// The bound is real, and it is the thing that keeps the alignment honest.
+    /// A sequence more than one window behind cannot re-feed what the rollback
+    /// drops, so it must be refused rather than served from a hole.
+    #[test]
+    fn align_batch_cache_lens_refuses_past_the_speculative_window() {
+        let mut short = xs_state(128, 1);
+        feed_xs(&mut short, 274);
+        let mut long = xs_state(128, 1);
+        feed_xs(&mut long, 283);
+
+        let mut a = seq_with_slots(
+            0,
+            274,
+            vec![v4_kv_slot(512, 8, 274), KvCache::XsRolling(Box::new(short))],
+        );
+        let mut b = seq_with_slots(
+            1,
+            283,
+            vec![v4_kv_slot(512, 8, 283), KvCache::XsRolling(Box::new(long))],
+        );
+        let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
+
+        let err = align_batch_cache_lens(&mut seqs, false, 4)
+            .expect_err("9 uncached positions cannot be re-fed by a 4-wide window")
+            .to_string();
+        assert!(
+            err.contains("9 uncached") && err.contains("re-feeds 4"),
+            "the refusal must name the surplus and the window, got: {err}"
+        );
+        // Validation must not have mutated anything (the two-loop discipline).
+        assert_eq!(
+            b.normal_cache()[0].as_ref().unwrap().current_seq_len(),
+            283,
+            "a refused alignment must leave the batch exactly as it was"
+        );
+    }
+
+    /// The divergence `ensure_uniform_batch_cache_lens` **cannot** see: two
+    /// sequences at the identical token count whose tails are different widths
+    /// because `base` tracks the high-water length, not the current one.
+    ///
+    /// This is not hypothetical and it is not MTP-specific — it is what a
+    /// prefix-cache hit produces. `prefix_cacher.rs:434` calls `set_len` on
+    /// every stored layer, and `XsRollingCache::set_len` narrows the tail
+    /// without moving `base`, so a sequence restored from an entry stored at a
+    /// greater length holds a *narrower* tail than one that reached the same
+    /// point directly.
+    #[test]
+    fn xs_base_divergence_at_equal_lengths_is_reconciled_not_refused() {
+        // Restored from a prefix-cache entry stored at 400 tokens, truncated
+        // to 260 — `base` stays at canonical(400) = 384... which is past 260,
+        // so the realistic version is a shallower store: 300 -> 260.
+        let mut restored = xs_state(128, 1);
+        feed_xs(&mut restored, 300);
+        assert_eq!(restored.base, 256, "canonical(300) for ratio 128, margin 16");
+        restored.set_len(260).unwrap();
+
+        // Reached 260 directly.
+        let mut direct = xs_state(128, 1);
+        feed_xs(&mut direct, 260);
+        assert_eq!(direct.base, 128, "canonical(260) sits a group lower");
+
+        // --- Fixture discrimination (D12) -------------------------------
+        assert_eq!(
+            (restored.current_seq_len(), direct.current_seq_len()),
+            (260, 260),
+            "the LENGTHS must agree, or this test is reproducing the ragged-length \
+             failure instead of the base one — `ensure_uniform_batch_cache_lens` \
+             would catch that and never reach the tensor"
+        );
+        assert_eq!(
+            (
+                restored.tail.as_ref().unwrap().dims()[1],
+                direct.tail.as_ref().unwrap().dims()[1]
+            ),
+            (4, 132),
+            "and the WIDTHS must disagree, or there is nothing to reconcile"
+        );
+        assert_eq!(
+            legacy_batch_error(
+                restored.tail.as_ref().unwrap(),
+                direct.tail.as_ref().unwrap()
+            ),
+            "shape mismatch on dim 1, 4 <> 132",
+            "uniform lengths still panic the legacy batcher — this is a second, \
+             independent way into kv_cache/mod.rs:499"
+        );
+
+        // --- The fix ----------------------------------------------------
+        let pipeline = StubPipeline::new(2);
+        let mut a = seq_with_slots(
+            0,
+            260,
+            vec![
+                v4_kv_slot(512, 8, 260),
+                KvCache::XsRolling(Box::new(restored)),
+            ],
+        );
+        let mut b = seq_with_slots(
+            1,
+            260,
+            vec![v4_kv_slot(512, 8, 260), KvCache::XsRolling(Box::new(direct))],
+        );
+        let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
+        NormalCacheManager
+            .clone_in_cache(&pipeline, &mut seqs, false)
+            .expect("equal lengths with unequal retained windows must reconcile");
+
+        let batched = pipeline.cache().normal();
+        let KvCache::XsRolling(xs) = &batched.0[1] else {
+            panic!("slot 1 must stay an XsRolling entry")
+        };
+        assert_eq!(xs.base, 256, "trimmed to the batch's largest retained start");
+        assert_eq!(xs.tail.as_ref().unwrap().dims(), &[2, 4, XS_HIDDEN]);
+    }
+
+    /// Trimming is only lossless because the member already at `base_max`
+    /// proves nothing below it is needed. If that stops being true the trim
+    /// must refuse, not silently drop the compressor's inputs.
+    #[test]
+    fn trimming_the_retained_window_past_what_the_compressor_needs_is_refused() {
+        let mut state = xs_state(4, 2);
+        feed_xs(&mut state, 260);
+        let needs_from = state.compressor_needs_from();
+        assert!(
+            needs_from >= state.base,
+            "an untouched cache always retains what it needs"
+        );
+        assert!(
+            state.trim_tail_to(needs_from).is_ok(),
+            "trimming to exactly the needed start is the lossless boundary"
+        );
+        let err = state
+            .trim_tail_to(needs_from + 1)
+            .expect_err("one token past it drops history the next row is built from")
+            .to_string();
+        assert!(
+            err.contains("next compressed row is built from"),
+            "the refusal must name what it would have destroyed, got: {err}"
         );
     }
 
