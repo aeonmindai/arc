@@ -14,6 +14,10 @@ mod rotating_cache;
 mod single_cache;
 pub mod turboquant_cache;
 mod xs_rolling;
+/// Thread-local `ARC_V4_XS_PER_SEQ` override, so a test outside this module can
+/// exercise both sides of the flag (the production read is a `OnceLock`).
+#[cfg(test)]
+pub(crate) use xs_rolling::test_override as xs_per_seq_test_override;
 
 pub use full_cache::{EitherCache, LayerCaches};
 pub use hybrid_cache::{
