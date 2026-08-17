@@ -7,7 +7,9 @@ use candle_core::{DType, Device, Result, Tensor};
 mod backends;
 
 #[allow(unused)]
-pub(crate) use backends::{flash_attn, maybe_synchronize, naive_sdpa, sinks_attn};
+pub(crate) use backends::{
+    cuda_flash_attn_supported, flash_attn, maybe_synchronize, naive_sdpa, sinks_attn,
+};
 
 /// Chunk size for attention computation to avoid OOM on long sequences
 pub(crate) const ATTENTION_CHUNK_SIZE: usize = 1024;
@@ -138,8 +140,20 @@ impl Sdpa {
         let (_, _, _, k_head_dim) = k.dims4()?;
         let (_, _, _, v_head_dim) = v.dims4()?;
 
+        // The CUDA flash kernels accept a bounded envelope of shapes: FA2 takes
+        // any head_dim that is a multiple of 8 up to 256, FA3 takes only
+        // {64, 128, 256} and has no softcap kernel. Asking for anything else
+        // used to enter the flash path and hard-`bail!` inside candle; now it
+        // degrades to non-flash SDPA, which has no such restriction. See
+        // `backends::flash` for the envelope and its provenance.
+        //
+        // (The CPU branch below is a separate, unrestricted implementation and
+        // is deliberately not gated on this predicate.)
         let can_use_flash = q.device().is_cpu()
-            || q.device().is_cuda() && crate::using_flash_attn() && q.dtype() != DType::F32;
+            || q.device().is_cuda()
+                && crate::using_flash_attn()
+                && q.dtype() != DType::F32
+                && cuda_flash_attn_supported(head_dim, k_head_dim, v_head_dim, sdpa_params.softcap);
 
         if can_use_flash {
             // flash-attn expects (b_sz, seq_len, nheads, head_dim)

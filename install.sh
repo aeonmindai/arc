@@ -199,10 +199,22 @@ build_from_source() {
             cc_major=$(echo "$cuda_cc" | cut -c1)
             info "CUDA detected (compute ${cc_major}.x)"
 
-            # FlashAttention
+            # FlashAttention.
+            #
+            # On Hopper we enable BOTH backends, not just v3. FlashAttention-3
+            # only accepts head_dim 64, 128 or 256 and has no softcap kernel
+            # (see candle-flash-attn-v3's own bail!s, mirrored in
+            # mistralrs-core/src/attention/backends/flash.rs). FA2 covers every
+            # multiple of 8 up to 256 plus softcap. With both compiled in, the
+            # runtime dispatcher picks FA3 where it is valid and FA2 otherwise,
+            # so head_dim-80/96/192 models (many vision encoders, MLA variants)
+            # and softcap models (Gemma-2 style) keep a fused kernel instead of
+            # falling back to unfused SDPA.
+            #
+            # Cost: enabling both roughly doubles the nvcc portion of the build.
             if [ "$cuda_cc" = "90" ]; then
-                features="$features flash-attn-v3"
-                info "Hopper GPU — enabling flash-attn-v3"
+                features="$features flash-attn flash-attn-v3"
+                info "Hopper GPU — enabling flash-attn-v3 (+ flash-attn fallback)"
             elif [ "$cuda_cc" -ge 80 ] 2>/dev/null; then
                 features="$features flash-attn"
                 info "Ampere+ GPU — enabling flash-attn"
