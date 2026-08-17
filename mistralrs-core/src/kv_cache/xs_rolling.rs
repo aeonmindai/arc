@@ -296,10 +296,20 @@ pub fn xs_pin_window_enabled() -> bool {
     }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        !matches!(
+        let on = !matches!(
             std::env::var("ARC_V4_XS_PIN_WINDOW").as_deref(),
             Ok("0") | Ok("false") | Ok("off") | Ok("no")
-        )
+        );
+        // Named once per process, so an A/B that means to compare pinned
+        // against unpinned can ASSERT it got two different builds of behaviour
+        // rather than two identical arms reporting a 1.000x ratio. A flag whose
+        // name is wrong is indistinguishable from a flag that costs nothing.
+        tracing::info!(
+            target: "xs_rolling",
+            "xs rolling window is {} (ARC_V4_XS_PIN_WINDOW)",
+            if on { "PINNED" } else { "RESIZING" }
+        );
+        on
     })
 }
 

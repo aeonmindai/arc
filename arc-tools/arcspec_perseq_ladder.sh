@@ -494,6 +494,20 @@ PYEOF
   echo "  per_seq_steps final, ON:  $(grep -o 'per_seq_steps=[0-9]*' "$OUT/server.ON.log" 2>/dev/null | tail -1) (want >0)"
   echo "  per_seq_steps final, OFF: $(grep -o 'per_seq_steps=[0-9]*' "$OUT/server.OFF.log" 2>/dev/null | tail -1) (want =0)"
   echo "  'xs rolling cache' errors ON=$(grep -c 'xs rolling cache' "$OUT/server.ON.log" 2>/dev/null || echo 0) OFF=$(grep -c 'xs rolling cache' "$OUT/server.OFF.log" 2>/dev/null || echo 0) (want 0/0)"
+  echo
+  echo "  -- window pin engagement (a wrong flag name would make ON and ON_UNPINNED"
+  echo "     the same build and report a free pin from two identical arms) --"
+  for a in OFF ON ON_UNPINNED; do
+    echo "    $a: $(grep -m1 -o 'xs rolling window is [A-Z]*' "$OUT/server.$a.log" 2>/dev/null || echo 'NOT LOGGED')"
+  done
+  pin_on=$(grep -c 'xs rolling window is PINNED' "$OUT/server.ON.log" 2>/dev/null || echo 0)
+  pin_off=$(grep -c 'xs rolling window is RESIZING' "$OUT/server.ON_UNPINNED.log" 2>/dev/null || echo 0)
+  if [ "$pin_on" -ge 1 ] && [ "$pin_off" -ge 1 ]; then
+    echo "    => the two arms are genuinely different builds of behaviour"
+  else
+    echo "    => ⚠️ PIN A/B IS VOID: ON pinned=$pin_on, ON_UNPINNED resizing=$pin_off."
+    echo "       Any ON-vs-ON_UNPINNED ratio below is a comparison of one thing with itself."
+  fi
   python3 "$OUT/report.py" "$OUT" "$BATCHES" "$REGIMES"
 } | tee "$OUT/summary.txt"
 
