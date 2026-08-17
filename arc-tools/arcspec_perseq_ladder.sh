@@ -500,13 +500,27 @@ PYEOF
   for a in OFF ON ON_UNPINNED; do
     echo "    $a: $(grep -m1 -o 'xs rolling window is [A-Z]*' "$OUT/server.$a.log" 2>/dev/null || echo 'NOT LOGGED')"
   done
+  # ⚠️ Read from the LOG, never from the binary. BOTH mode strings are compiled
+  # in unconditionally, so `strings <binary> | grep RESIZING` would succeed in
+  # every arm and prove nothing. Only the runtime line says which branch a
+  # process actually took. `RUST_LOG=info` is set once in `run_arm`, shared by
+  # every arm, so no arm can have this line filtered out while another keeps it.
+  #
+  # ⚠️ The default direction matters here: unset means PINNED
+  # (`xs_rolling.rs`, ARC_V4_XS_PIN_WINDOW is off only for 0|false|off|no). So
+  # the TREATMENT is the default and the CONTROL is the one carrying the flag —
+  # which means a typo in the flag name yields a control that silently ran the
+  # treatment, and a perfectly clean-looking 1.000x.
   pin_on=$(grep -c 'xs rolling window is PINNED' "$OUT/server.ON.log" 2>/dev/null || echo 0)
   pin_off=$(grep -c 'xs rolling window is RESIZING' "$OUT/server.ON_UNPINNED.log" 2>/dev/null || echo 0)
-  if [ "$pin_on" -ge 1 ] && [ "$pin_off" -ge 1 ]; then
-    echo "    => the two arms are genuinely different builds of behaviour"
+  ctrl_leaked=$(grep -c 'xs rolling window is PINNED' "$OUT/server.ON_UNPINNED.log" 2>/dev/null || echo 0)
+  if [ "$pin_on" -ge 1 ] && [ "$pin_off" -ge 1 ] && [ "$ctrl_leaked" -eq 0 ]; then
+    echo "    => VALID: ON took the pinned path, ON_UNPINNED took the resizing path."
+    echo "       The control reached the resizing branch; it did not silently run the treatment."
   else
-    echo "    => ⚠️ PIN A/B IS VOID: ON pinned=$pin_on, ON_UNPINNED resizing=$pin_off."
-    echo "       Any ON-vs-ON_UNPINNED ratio below is a comparison of one thing with itself."
+    echo "    => ⚠️ PIN A/B IS VOID: ON pinned=$pin_on, ON_UNPINNED resizing=$pin_off,"
+    echo "       control-leaked-to-pinned=$ctrl_leaked."
+    echo "       Any ON-vs-ON_UNPINNED ratio below compares one thing with itself. Do not read it."
   fi
   python3 "$OUT/report.py" "$OUT" "$BATCHES" "$REGIMES"
 } | tee "$OUT/summary.txt"
