@@ -335,6 +335,41 @@ jobs:
           echo "LIBRARY_PATH=${CUDA_ROOT}/lib64/stubs:${CUDA_ROOT}/lib64:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=${CUDA_ROOT}/lib64/stubs:${CUDA_ROOT}/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
+      # The half of the wgmma question that does NOT need a GPU.
+      #
+      # `wgmma.mma_async`'s register-A form takes either 7 or 8 operands after
+      # the destination — whether an `imm-trans-a` precedes `imm-trans-b` is
+      # exactly what PTX ISA 9.7.16.5.2 would say if its body were not
+      # truncated in the published HTML. ptxas knows, and ptxas runs here for
+      # free: `-arch=sm_90a` compiles device code to SASS at build time, so a
+      # wrong arity is a hard error on this runner rather than a wasted rental.
+      #
+      # The DESCRIPTOR still needs hardware (a wrong one returns wrong numbers,
+      # not an error) — that is wave66 on the box. This step settles arity and
+      # keeps the probe compiling; it does not claim to settle the encoding.
+      - name: Settle the wgmma operand arity with ptxas (no GPU)
+        run: |
+          set -uo pipefail
+          SRC=arc-tools/probe/arctarget_wgmma_desc_probe.cu
+          ACCEPTED=""
+          for ta in 0 1; do
+            if nvcc -arch=sm_90a -std=c++17 -O3 -DWGMMA_HAS_TRANS_A=$ta \
+                 -c -o /tmp/probe_ta$ta.o "$SRC" > /tmp/nvcc_ta$ta.log 2>&1; then
+              echo "ACCEPTED WGMMA_HAS_TRANS_A=$ta"
+              ACCEPTED="${ACCEPTED:+$ACCEPTED,}$ta"
+            else
+              echo "REJECTED WGMMA_HAS_TRANS_A=$ta:"
+              grep -i -m3 error /tmp/nvcc_ta$ta.log || tail -5 /tmp/nvcc_ta$ta.log
+            fi
+          done
+          # Neither compiling means the probe source is broken, and the box run
+          # would burn a rental to discover it. Fail here instead.
+          if [ -z "$ACCEPTED" ]; then
+            echo "FAIL: the wgmma descriptor probe compiles under neither operand arity"
+            exit 1
+          fi
+          echo "PROBE_ARITY_ACCEPTED=$ACCEPTED"
+
       - name: Install build deps
         run: |
           sudo apt-get update

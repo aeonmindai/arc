@@ -11,28 +11,65 @@
 // wrong in any field does not fault: it reads the wrong bytes and the kernel
 // returns WRONG NUMBERS. On the moat kernel, silently.
 //
-// So the encoding is not written from documentation here. This probe builds a
-// tile whose correct product is known, sweeps every plausible descriptor
-// encoding, and reports which ones reproduce the reference exactly. The
-// hardware answers the question; we only read the answer.
+// Verified 2026-08-17 against docs.nvidia.com/cuda/parallel-thread-execution:
+// PTX ISA sections 9.7.16.5.1.2.2 ("Matrix Descriptor Format") and 9.7.16.5.2
+// ("wgmma.mma_async") are listed in the table of contents but their bodies are
+// TRUNCATED in the published HTML. The bit table and the operand order are not
+// obtainable from the doc. So they are not written from documentation here.
+//
+// WHAT THIS SWEEPS (gen 2)
+// ------------------------
+// The first cut of this probe swept only the two byte-offset fields, with the
+// B tile fixed n-contiguous and `imm-trans-b` fixed at 0. That can only ever
+// return NO_ENCODING_MATCHED if either of those two fixed choices is the wrong
+// one, which costs a whole box round-trip to learn nothing. This version puts
+// all four unknowns in the sweep:
+//
+//   1. `imm-trans-b`      -> 0 and 1
+//   2. B smem layout      -> n-contiguous (s[k*N+n]) and k-contiguous (s[n*K+k])
+//   3. leading-dim offset -> 10 candidate field values
+//   4. stride offset      -> 10 candidate field values
+//
+// = 400 wgmma issues, one kernel launch per (layout, trans_b) pair.
+//
+// It also settles the instruction ARITY, which is the other thing the truncated
+// doc will not say: the register-A form takes either
+//   d, a, b-desc, scale-d, imm-scale-a, imm-scale-b, imm-trans-b        (7)
+// or the same with an `imm-trans-a` before it                           (8).
+// `-DWGMMA_HAS_TRANS_A=0/1` selects; the runner tries both and reports which
+// one ptxas accepted. A wrong arity is a COMPILE error, which is loud — unlike
+// a wrong descriptor, which is not. That asymmetry is why arity is settled by
+// the compiler and the descriptor by the hardware.
+//
+// THE POISON POOL
+// ---------------
+// The B tile is 256 bytes. Placed alone in shared memory, a descriptor with a
+// wrong stride can walk off it into whatever happens to be there and — with
+// enough zeros around — still reproduce the reference. So the tile is embedded
+// at the front of an 8 KB pool pre-filled with a large nonzero sentinel: any
+// read outside the tile perturbs the sum, and the comparison is bit-exact
+// rather than tolerance-based. A tolerance is how a wrong descriptor sneaks
+// through.
 //
 // WHAT IT PROVES / DOES NOT PROVE
 // -------------------------------
-//   * PROVES (on the card it runs on): which descriptor field encoding makes
-//     wgmma read the tile we think it is reading, for swizzle mode 0 and a
-//     K-major B operand.
+//   * PROVES (on the card it runs on): which descriptor field encoding, B
+//     layout and trans_b make wgmma read the tile we think it is reading, for
+//     swizzle mode 0.
 //   * DOES NOT PROVE anything about sm_100a `tcgen05`, which takes no register
 //     operands at all and has its own descriptor. Blackwell is compile-checked
-//     separately (see arctarget_tcgen05_compile_probe.cu); we do not rent
-//     Blackwell today, and a compile pass is not a measurement.
+//     separately; we do not rent Blackwell today, and a compile pass is not a
+//     measurement.
+//   * DOES NOT cover swizzled modes (1/2/3). The keystone kernel's decode
+//     stage writes its own smem tile, so it can choose to be unswizzled.
 //
 // D18: every terminal outcome prints a line. "No candidate matched" is a
 // result, not silence, and the mma.sync control must pass before any wgmma
 // result is believed — two wrong runs that agree are not evidence.
 //
 // Build (on a Hopper box):
-//   nvcc -arch=sm_90a -std=c++17 -O3 -o wgmma_desc_probe \
-//        arctarget_wgmma_desc_probe.cu
+//   nvcc -arch=sm_90a -std=c++17 -O3 -DWGMMA_HAS_TRANS_A=0 \
+//        -o wgmma_desc_probe arctarget_wgmma_desc_probe.cu
 //
 // Exit codes: 0 = a unique encoding was identified · 1 = probe answered
 // negatively (no candidate, or ambiguous) · 2 = could not run (no device,
@@ -44,7 +81,11 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
-// m64n8k16: A is 64x16 bf16, B is 16x8 bf16 (K-major), D is 64x8 f32.
+#ifndef WGMMA_HAS_TRANS_A
+#define WGMMA_HAS_TRANS_A 0
+#endif
+
+// m64n8k16: A is 64x16 bf16, B is 16x8 bf16, D is 64x8 f32.
 static constexpr int M = 64;
 static constexpr int N = 8;
 static constexpr int K = 16;
@@ -57,6 +98,32 @@ static constexpr int WG_THREADS = 128;  // one warpgroup
 // resulting field value directly.
 static constexpr uint32_t CAND[] = {0, 1, 2, 4, 8, 16, 32, 64, 128, 256};
 static constexpr int NCAND = sizeof(CAND) / sizeof(CAND[0]);
+
+// Shared pool, in bf16 elements. The 128-element (256 B) B tile sits at the
+// front; the rest is POISON.
+static constexpr int POOL = 4096;
+static constexpr float POISON = 64.0f;
+
+// Deterministic, small-magnitude, exactly representable in bf16 so the
+// comparison can be bit-exact.
+__device__ __host__ __forceinline__ float a_val(int m, int k) {
+    return (float)(((m * 7 + k * 3) % 9) - 4);
+}
+__device__ __host__ __forceinline__ float b_val(int k, int n) {
+    return (float)(((k * 5 + n * 11) % 7) - 3);
+}
+
+// LAYOUT 0: n-contiguous, s[k*N + n].   LAYOUT 1: k-contiguous, s[n*K + k].
+// Both place the tile inside the first 128 elements of the pool.
+template <int LAYOUT>
+__device__ __host__ __forceinline__ int b_index(int k, int n) {
+    return LAYOUT == 0 ? (k * N + n) : (n * K + k);
+}
+
+__device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
+    return (uint32_t)__bfloat16_as_ushort(__float2bfloat16(lo)) |
+           ((uint32_t)__bfloat16_as_ushort(__float2bfloat16(hi)) << 16);
+}
 
 __device__ __forceinline__ uint64_t make_desc(const void* smem_ptr,
                                               uint32_t lbo_field,
@@ -77,25 +144,35 @@ __device__ __forceinline__ uint64_t make_desc(const void* smem_ptr,
     return d;
 }
 
+// The operand tail after the b-descriptor. Arity is what the compiler decides;
+// see the header note.
+#if WGMMA_HAS_TRANS_A
+#define WGMMA_TAIL(tb) "p, 1, 1, 0, " #tb ";\n"
+#else
+#define WGMMA_TAIL(tb) "p, 1, 1, " #tb ";\n"
+#endif
+
 // One wgmma with A from registers and B from a shared-memory descriptor.
 // Register-A halves the unknowns: if the result is wrong, the descriptor is
 // the only thing it can be.
-__device__ __forceinline__ void wgmma_m64n8k16_regA(float (&d)[4],
-                                                    const uint32_t (&a)[4],
-                                                    uint64_t b_desc) {
-    asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
-    asm volatile(
-        "{\n"
-        "  .reg .pred p;\n"
-        "  setp.ne.b32 p, 1, 0;\n"
-        "  wgmma.mma_async.sync.aligned.m64n8k16.f32.bf16.bf16 "
-        "  {%0,%1,%2,%3}, {%4,%5,%6,%7}, %8, p, 1, 1, 0;\n"
-        "}\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(b_desc));
-    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
-    asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
-}
+#define DEFINE_WGMMA_REGA(TB)                                                  \
+    __device__ __forceinline__ void wgmma_m64n8k16_regA_##TB(                  \
+        float (&d)[4], const uint32_t (&a)[4], uint64_t b_desc) {              \
+        asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");              \
+        asm volatile(                                                          \
+            "{\n"                                                              \
+            "  .reg .pred p;\n"                                                \
+            "  setp.ne.b32 p, 1, 0;\n"                                         \
+            "  wgmma.mma_async.sync.aligned.m64n8k16.f32.bf16.bf16 "           \
+            "  {%0,%1,%2,%3}, {%4,%5,%6,%7}, %8, " WGMMA_TAIL(TB)              \
+            "}\n"                                                              \
+            : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])                   \
+            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(b_desc));        \
+        asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");       \
+        asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");       \
+    }
+DEFINE_WGMMA_REGA(0)
+DEFINE_WGMMA_REGA(1)
 
 // The control: the mma.sync path the Ampere kernel already ships and that we
 // trust. If this disagrees with the CPU reference, the harness is broken and
@@ -109,29 +186,20 @@ __device__ __forceinline__ void mma_m16n8k16(float* c, const uint32_t* a,
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
-__device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
-    return (uint32_t)__bfloat16_as_ushort(__float2bfloat16(lo)) |
-           ((uint32_t)__bfloat16_as_ushort(__float2bfloat16(hi)) << 16);
-}
-
-// Deterministic, small-magnitude, exactly representable in bf16 so the
-// comparison can be bit-exact rather than tolerance-based: a tolerance is how
-// a wrong descriptor sneaks through.
-__device__ __host__ __forceinline__ float a_val(int m, int k) {
-    return (float)(((m * 7 + k * 3) % 9) - 4);
-}
-__device__ __host__ __forceinline__ float b_val(int k, int n) {
-    return (float)(((k * 5 + n * 11) % 7) - 3);
-}
-
+template <int LAYOUT, int TRANS_B>
 __global__ void probe_kernel(float* __restrict__ out_wgmma,  // [NCAND*NCAND][M*N]
                              float* __restrict__ out_mma,    // [M*N]
                              int base_offset, int swizzle) {
-    // B tile, K-major: 16 k-rows x 8 n-columns of bf16 = 256 B.
-    __shared__ __align__(128) __nv_bfloat16 s_b[K * N];
+    __shared__ __align__(128) __nv_bfloat16 s_pool[POOL];
     const int tid = threadIdx.x;
+
+    // Poison first, tile second: a descriptor that walks off the tile reads a
+    // large nonzero sentinel and cannot accidentally reproduce the reference.
+    for (int i = tid; i < POOL; i += WG_THREADS) s_pool[i] = __float2bfloat16(POISON);
+    __syncthreads();
     for (int i = tid; i < K * N; i += WG_THREADS) {
-        s_b[i] = __float2bfloat16(b_val(i / N, i % N));
+        const int k = i / N, n = i % N;
+        s_pool[b_index<LAYOUT>(k, n)] = __float2bfloat16(b_val(k, n));
     }
     __syncthreads();
 
@@ -148,13 +216,15 @@ __global__ void probe_kernel(float* __restrict__ out_wgmma,  // [NCAND*NCAND][M*
     a[2] = pack_bf16(a_val(row0 + g, tig * 2 + 8), a_val(row0 + g, tig * 2 + 9));
     a[3] = pack_bf16(a_val(row0 + g + 8, tig * 2 + 8), a_val(row0 + g + 8, tig * 2 + 9));
 
-    // ---- control: mma.sync over the same data ----
+    // ---- control: mma.sync over the same shared-memory bytes ----
     {
         float c[4] = {0.f, 0.f, 0.f, 0.f};
-        const uint32_t b0 = pack_bf16((float)__bfloat162float(s_b[(tig * 2) * N + g]),
-                                      (float)__bfloat162float(s_b[(tig * 2 + 1) * N + g]));
-        const uint32_t b1 = pack_bf16((float)__bfloat162float(s_b[(tig * 2 + 8) * N + g]),
-                                      (float)__bfloat162float(s_b[(tig * 2 + 9) * N + g]));
+        const uint32_t b0 =
+            pack_bf16(__bfloat162float(s_pool[b_index<LAYOUT>(tig * 2, g)]),
+                      __bfloat162float(s_pool[b_index<LAYOUT>(tig * 2 + 1, g)]));
+        const uint32_t b1 =
+            pack_bf16(__bfloat162float(s_pool[b_index<LAYOUT>(tig * 2 + 8, g)]),
+                      __bfloat162float(s_pool[b_index<LAYOUT>(tig * 2 + 9, g)]));
         mma_m16n8k16(c, a, b0, b1);
         out_mma[(row0 + g) * N + tig * 2] = c[0];
         out_mma[(row0 + g) * N + tig * 2 + 1] = c[1];
@@ -166,9 +236,13 @@ __global__ void probe_kernel(float* __restrict__ out_wgmma,  // [NCAND*NCAND][M*
     for (int li = 0; li < NCAND; ++li) {
         for (int si = 0; si < NCAND; ++si) {
             float d[4] = {0.f, 0.f, 0.f, 0.f};
-            const uint64_t desc =
-                make_desc(&s_b[0], CAND[li], CAND[si], (uint32_t)base_offset, (uint32_t)swizzle);
-            wgmma_m64n8k16_regA(d, a, desc);
+            const uint64_t desc = make_desc(&s_pool[0], CAND[li], CAND[si],
+                                            (uint32_t)base_offset, (uint32_t)swizzle);
+            if constexpr (TRANS_B == 0) {
+                wgmma_m64n8k16_regA_0(d, a, desc);
+            } else {
+                wgmma_m64n8k16_regA_1(d, a, desc);
+            }
             float* o = out_wgmma + (size_t)(li * NCAND + si) * (M * N);
             o[(row0 + g) * N + tig * 2] = d[0];
             o[(row0 + g) * N + tig * 2 + 1] = d[1];
@@ -189,7 +263,79 @@ static void host_reference(float* ref) {
     }
 }
 
+struct ConfigResult {
+    int matches = 0;
+    int best_hits = -1;
+    int best_idx = -1;
+    bool ran = false;
+};
+
+// Returns 0 on success, 2 if the configuration could not be run at all.
+template <int LAYOUT, int TRANS_B>
+static int run_config(const char* layout_name, const float* ref, float* d_wgmma,
+                      float* d_mma, float* h_wgmma, float* h_mma, ConfigResult& out) {
+    const int variants = NCAND * NCAND;
+    cudaMemset(d_wgmma, 0, (size_t)variants * M * N * sizeof(float));
+    cudaMemset(d_mma, 0, (size_t)M * N * sizeof(float));
+
+    probe_kernel<LAYOUT, TRANS_B>
+        <<<1, WG_THREADS>>>(d_wgmma, d_mma, /*base_offset=*/0, /*swizzle=*/0);
+    // D18 #8: cudaDeviceSynchronize() returns success for a kernel that never
+    // launched. The launch error lives in cudaGetLastError and must be read.
+    cudaError_t launch_err = cudaGetLastError();
+    cudaError_t sync_err = cudaDeviceSynchronize();
+    if (launch_err != cudaSuccess || sync_err != cudaSuccess) {
+        printf("PROBE_CONFIG layout=%s trans_b=%d STATUS=LAUNCH_FAILED launch=%s sync=%s\n",
+               layout_name, TRANS_B, cudaGetErrorString(launch_err),
+               cudaGetErrorString(sync_err));
+        return 2;
+    }
+
+    cudaMemcpy(h_mma, d_mma, (size_t)M * N * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_wgmma, d_wgmma, (size_t)variants * M * N * sizeof(float),
+               cudaMemcpyDeviceToHost);
+
+    int control_bad = 0;
+    for (int i = 0; i < M * N; ++i)
+        if (h_mma[i] != ref[i]) ++control_bad;
+    printf("PROBE_CONTROL_MMA_SYNC layout=%s trans_b=%d %s mismatches=%d/%d\n", layout_name,
+           TRANS_B, control_bad ? "FAIL" : "PASS", control_bad, M * N);
+    if (control_bad) {
+        // The harness disagrees with arithmetic we already trust; nothing the
+        // wgmma sweep says for this config can be believed.
+        printf("PROBE_CONFIG layout=%s trans_b=%d STATUS=HARNESS_INVALID\n", layout_name,
+               TRANS_B);
+        return 2;
+    }
+
+    out.ran = true;
+    for (int v = 0; v < variants; ++v) {
+        const float* o = h_wgmma + (size_t)v * M * N;
+        int hits = 0;
+        for (int i = 0; i < M * N; ++i)
+            if (o[i] == ref[i]) ++hits;
+        if (hits > out.best_hits) {
+            out.best_hits = hits;
+            out.best_idx = v;
+        }
+        if (hits == M * N) {
+            ++out.matches;
+            printf("PROBE_MATCH layout=%s trans_b=%d lbo_field=%u sbo_field=%u "
+                   "base_offset=0 swizzle=0\n",
+                   layout_name, TRANS_B, CAND[v / NCAND], CAND[v % NCAND]);
+        }
+    }
+    printf("PROBE_BEST_PARTIAL layout=%s trans_b=%d lbo_field=%u sbo_field=%u hits=%d/%d\n",
+           layout_name, TRANS_B, CAND[out.best_idx / NCAND], CAND[out.best_idx % NCAND],
+           out.best_hits, M * N);
+    printf("PROBE_CONFIG layout=%s trans_b=%d matches=%d of %d\n", layout_name, TRANS_B,
+           out.matches, variants);
+    return 0;
+}
+
 int main() {
+    printf("PROBE_ARITY_BUILT WGMMA_HAS_TRANS_A=%d\n", WGMMA_HAS_TRANS_A);
+
     int dev_count = 0;
     if (cudaGetDeviceCount(&dev_count) != cudaSuccess || dev_count == 0) {
         printf("PROBE_STATUS=NO_DEVICE\n");
@@ -212,70 +358,50 @@ int main() {
         printf("PROBE_STATUS=ALLOC_FAILED\n");
         return 2;
     }
-    cudaMemset(d_wgmma, 0, (size_t)variants * M * N * sizeof(float));
-    cudaMemset(d_mma, 0, (size_t)M * N * sizeof(float));
-
-    probe_kernel<<<1, WG_THREADS>>>(d_wgmma, d_mma, /*base_offset=*/0, /*swizzle=*/0);
-    // D18 #8: cudaDeviceSynchronize() returns success for a kernel that never
-    // launched. The launch error lives in cudaGetLastError and must be read.
-    cudaError_t launch_err = cudaGetLastError();
-    cudaError_t sync_err = cudaDeviceSynchronize();
-    if (launch_err != cudaSuccess || sync_err != cudaSuccess) {
-        printf("PROBE_STATUS=LAUNCH_FAILED launch=%s sync=%s\n",
-               cudaGetErrorString(launch_err), cudaGetErrorString(sync_err));
-        return 2;
-    }
 
     float ref[M * N];
     host_reference(ref);
     float* h_mma = (float*)malloc((size_t)M * N * sizeof(float));
     float* h_wgmma = (float*)malloc((size_t)variants * M * N * sizeof(float));
-    cudaMemcpy(h_mma, d_mma, (size_t)M * N * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_wgmma, d_wgmma, (size_t)variants * M * N * sizeof(float),
-               cudaMemcpyDeviceToHost);
-
-    int control_bad = 0;
-    for (int i = 0; i < M * N; ++i)
-        if (h_mma[i] != ref[i]) ++control_bad;
-    printf("PROBE_CONTROL_MMA_SYNC=%s mismatches=%d/%d\n", control_bad ? "FAIL" : "PASS",
-           control_bad, M * N);
-    if (control_bad) {
-        // The harness disagrees with arithmetic we already trust; nothing the
-        // wgmma sweep says can be believed.
-        printf("PROBE_STATUS=HARNESS_INVALID\n");
+    if (!h_mma || !h_wgmma) {
+        printf("PROBE_STATUS=ALLOC_FAILED host\n");
         return 2;
     }
 
-    int matches = 0, best_hits = -1, best_idx = -1;
-    for (int v = 0; v < variants; ++v) {
-        const float* o = h_wgmma + (size_t)v * M * N;
-        int hits = 0;
-        for (int i = 0; i < M * N; ++i)
-            if (o[i] == ref[i]) ++hits;
-        if (hits > best_hits) {
-            best_hits = hits;
-            best_idx = v;
-        }
-        if (hits == M * N) {
-            ++matches;
-            printf("PROBE_MATCH lbo_field=%u sbo_field=%u base_offset=0 swizzle=0\n",
-                   CAND[v / NCAND], CAND[v % NCAND]);
-        }
+    ConfigResult r[4];
+    int hard_fail = 0;
+    hard_fail |= run_config<0, 0>("n_contiguous", ref, d_wgmma, d_mma, h_wgmma, h_mma, r[0]);
+    hard_fail |= run_config<0, 1>("n_contiguous", ref, d_wgmma, d_mma, h_wgmma, h_mma, r[1]);
+    hard_fail |= run_config<1, 0>("k_contiguous", ref, d_wgmma, d_mma, h_wgmma, h_mma, r[2]);
+    hard_fail |= run_config<1, 1>("k_contiguous", ref, d_wgmma, d_mma, h_wgmma, h_mma, r[3]);
+
+    int total_matches = 0, configs_ran = 0;
+    for (const auto& c : r) {
+        total_matches += c.matches;
+        configs_ran += c.ran ? 1 : 0;
     }
-    printf("PROBE_BEST_PARTIAL lbo_field=%u sbo_field=%u hits=%d/%d\n",
-           CAND[best_idx / NCAND], CAND[best_idx % NCAND], best_hits, M * N);
-    printf("PROBE_MATCH_COUNT=%d of %d candidates\n", matches, variants);
+    printf("PROBE_TOTAL matches=%d across %d/4 configs that ran\n", total_matches, configs_ran);
 
     free(h_mma);
     free(h_wgmma);
     cudaFree(d_wgmma);
     cudaFree(d_mma);
 
-    if (matches == 1) {
+    // "Could not run" outranks any verdict: an environment that failed to
+    // answer must never be reported as an answer (D18 rule 2).
+    if (configs_ran == 0) {
+        printf("PROBE_STATUS=COULD_NOT_RUN\n");
+        return 2;
+    }
+    if (hard_fail) {
+        printf("PROBE_STATUS=PARTIAL_ENVIRONMENT_FAILURE ran=%d/4\n", configs_ran);
+        return 2;
+    }
+    if (total_matches == 1) {
         printf("PROBE_STATUS=UNIQUE_ENCODING_IDENTIFIED\n");
         return 0;
     }
-    if (matches == 0) {
+    if (total_matches == 0) {
         // Either the bit layout in make_desc is wrong, or the accumulator
         // fragment layout assumed above is. The partial-hit count separates
         // them: a wrong accumulator layout still reproduces the right VALUES
@@ -284,7 +410,8 @@ int main() {
         printf("PROBE_STATUS=NO_ENCODING_MATCHED\n");
         return 1;
     }
-    printf("PROBE_STATUS=AMBIGUOUS (several encodings agree; widen the tile so "
-           "the offsets can be distinguished)\n");
+    printf("PROBE_STATUS=AMBIGUOUS (%d encodings agree; the 16x8 tile cannot "
+           "distinguish them — widen N so both offsets bind)\n",
+           total_matches);
     return 1;
 }
