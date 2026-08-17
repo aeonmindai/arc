@@ -3946,6 +3946,12 @@ impl DeepSeekV4 {
         )>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
+        // ONE device span for the whole model forward. Its `device_ns` is the
+        // GPU stream time of the step's real work, which is the denominator
+        // every host-side cost below has to be read against: 156 ms of host
+        // overhead means something different against a 100 ms forward than
+        // against a 700 ms one.
+        let _prof_fwd = arc_profiler::device_span("model_forward");
         let xs_embed = self.embed_tokens.forward(input_ids)?;
         let cache = &mut self.cache.normal().0;
         let attention_mask = CausalMasker.make_causal_mask_matrix(

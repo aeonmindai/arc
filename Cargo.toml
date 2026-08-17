@@ -16,6 +16,7 @@ members = [
     "mistralrs-macros",
     # Arc additions
     "arc-engine",
+    "arc-profiler",
     "arc-turbo",
     "arc-cli",
     "arc-cuda-graph",

@@ -637,6 +637,14 @@ fn front_pad_single(sc: &mut SingleCache, target_len: usize) -> Result<usize> {
         sc.current_seq_len = target_len;
         return Ok(0);
     }
+    // Only the padding branch is counted, so `calls` on this node is literally
+    // "how many row x slot x half buffers were re-materialised this step" — the
+    // number that separates a per-slot padding cost from one large rebuild.
+    // A HOST span deliberately: this runs up to `rows * 43 * 2` times per step
+    // and two `cudaEventRecord`s per call would be a device-side cost of the
+    // same order as the thing being measured. The stream time of the region is
+    // taken once, at `front_align_batch`.
+    let _prof_pad = arc_profiler::span("kv.front_pad_grow");
     let Some(ad) = sc.all_data.as_ref() else {
         candle_core::bail!("kv-cache: front_pad on a slot whose buffer is not materialised");
     };
@@ -778,6 +786,13 @@ pub(crate) fn front_align_batch(
     seqs: &mut [&mut crate::sequence::Sequence],
     modify_draft_cache: bool,
 ) -> Result<Vec<usize>> {
+    // ONE device span for the whole front-alignment region. `device_ns` here is
+    // the stream time of every `Tensor::zeros` + `slice_set` the padding
+    // issues; `wall - sync - device` is what the host spent allocating and
+    // launching while the GPU had nothing to do. Those two readings are the
+    // difference between "the copies are the cost" and "issuing them is the
+    // cost", and they have opposite fixes.
+    let _prof_align = arc_profiler::device_span("cache.front_align");
     let mut target = 0usize;
     for seq in seqs.iter_mut() {
         let cache = if modify_draft_cache {
@@ -930,6 +945,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
         // have formed costs the requests in it and not the engine task.
         ensure_uniform_batch_cache_lens(seqs, modify_draft_cache)?;
 
+        let _prof = arc_profiler::span("clone_in_cache");
         let xs_per_seq = xs_per_sequence_enabled();
         let mut new_k_cache = Vec::new();
         let mut new_v_cache = Vec::new();
@@ -1001,9 +1017,15 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
             let mut dims_v = one_v.clone();
             dims_k[0] *= batch_len;
             dims_v[0] *= batch_len;
-            let batch_k = Tensor::zeros(dims_k, present[0].k.dtype(), present[0].k.device())?;
-            let batch_v = Tensor::zeros(dims_v, present[0].v.dtype(), present[0].v.device())?;
+            let (batch_k, batch_v) = {
+                let _s = arc_profiler::device_span("clone_in.alloc");
+                (
+                    Tensor::zeros(dims_k, present[0].k.dtype(), present[0].k.device())?,
+                    Tensor::zeros(dims_v, present[0].v.dtype(), present[0].v.device())?,
+                )
+            };
 
+            let _prof_fill = arc_profiler::device_span("clone_in.slice_set");
             for (i, src) in srcs.iter().enumerate() {
                 let Some(src) = src else {
                     // Skip for shared kv cache layers in models like gemma3n
@@ -1164,6 +1186,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
         Ok(())
     }
     fn clone_out_cache(&self, pipeline: &T, seqs: &mut [&mut Sequence], modify_draft_cache: bool) {
+        let _prof = arc_profiler::span("clone_out_cache");
         let all_cache = pipeline.cache().normal();
         for layer in 0..pipeline.get_metadata().num_hidden_layers {
             let cache = all_cache.0.get(layer).unwrap();

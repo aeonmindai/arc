@@ -1293,6 +1293,30 @@ impl Loader for NormalLoader {
             }
         };
 
+        // Bind the profiler's device timer to the device the model actually
+        // runs on, and stamp the provenance a report is worthless without.
+        // Both are no-ops unless `ARC_PROFILE=1`. Without `attach_device` every
+        // device span resolves to nothing and the device column would be a
+        // column of zeros that reads like "the GPU was idle".
+        arc_profiler::attach_device(&device);
+        // `ARC_PROFILE_SELFTEST=1`: prove on this box, before any real
+        // measurement, that device time comes from CUDA events and not from
+        // launch timing. The verdict goes into the report's notes either way.
+        arc_profiler::maybe_selftest(&device);
+        arc_profiler::set_meta(|h| {
+            h.model = self.model_id.clone();
+            h.build_features = vec![
+                #[cfg(feature = "cuda")]
+                "cuda".to_string(),
+                #[cfg(feature = "flash-attn")]
+                "flash-attn".to_string(),
+                #[cfg(feature = "cudnn")]
+                "cudnn".to_string(),
+                #[cfg(feature = "metal")]
+                "metal".to_string(),
+            ];
+        });
+
         Ok(Arc::new(Mutex::new(NormalPipeline {
             model,
             tokenizer: tokenizer.into(),
