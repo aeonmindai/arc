@@ -28,7 +28,7 @@ Forked from [mistral.rs](https://github.com/EricLBuehler/mistral.rs). Apache 2.0
 | Feature | What it does |
 |---|---|
 | **QTIP 2-bit weights** | Cornell ICLR'25 — trellis quantization with Hadamard incoherence rotation. 8× weight compression vs FP16. Two rungs: `qtip2` (LUT) and `qtip2b` (computed codebook), the latter being what Arc serves. Works on any model. |
-| **TurboQuant KV** *(experimental, off by default)* | Zandieh et al. (Google Research, [arXiv:2504.19874](https://arxiv.org/abs/2504.19874), ICLR'26) — Arc Rust implementation of WHT + Lloyd-Max KV coding. **Not on any default path and never measured.** Eager KV is opt-in via `ARC_TURBOQUANT_KV=1`; the paged kernel exists at head_dim 128 only; there is no kernel at head_dim 512, so DeepSeek V4 cannot use it. |
+| **TurboQuant KV** *(experimental, never measured)* | Zandieh et al. (Google Research, [arXiv:2504.19874](https://arxiv.org/abs/2504.19874), ICLR'26) — Arc Rust implementation of WHT + Lloyd-Max KV coding. **No TurboQuant forward pass has ever been benchmarked.** The paged kernels are instantiated at head_dim 64/128/256/512, but only 128 has ever executed on hardware, and only 128 is reachable without asking — the paged default routes onto TurboQuant at head_dim 128 only, and 64/256/512 require an explicit `--pa-cache-type turboquant`. Eager KV is opt-in via `ARC_TURBOQUANT_KV=1`. |
 | **TD-MoE Tucker + whitening** | Whitened Tucker decomposition of the MoE expert pool. The **"lossless 20%"** figure is the **paper's** (NeurIPS'25), not ours — *published, not reproduced by us*. Works on any MoE. |
 | **ArcAttention/Indexer** — sparse attention | DeepSeek V4's Lightning Indexer with FlashMLASparse CUDA kernels (MIT, ported from sgl-project) for top-k attention. Dense O(n²) → sparse O(n·k). |
 | **ArcGraph** — GPU-autonomous decode | Full decode loop (forward + sample + EOS check) on GPU. Zero CPU sync per token. Works on any model. |
@@ -75,7 +75,7 @@ KV cache bytes per token @ 32K context:
 
 Each layer compresses a different axis, and in principle the wins multiply.
 
-**Read the block above as arithmetic, because that is all it is.** Exactly one line of it has been measured end-to-end: 284B → **~74 GB** of weights at 2.09 bits/param (V4 Flash trellis bake, serving on one H200 — see [Results](#results)). The KV lines are bytes-per-token ratios; **no TurboQuant forward pass has ever been benchmarked**, TurboQuant is off by default, and it has no kernel at V4's head_dim of 512. The xKV pool is not implemented.
+**Read the block above as arithmetic, because that is all it is.** Exactly one line of it has been measured end-to-end: 284B → **~74 GB** of weights at 2.09 bits/param (V4 Flash trellis bake, serving on one H200 — see [Results](#results)). The KV lines are bytes-per-token ratios; **no TurboQuant forward pass has ever been benchmarked**, and the paged kernels now cover V4's head_dim of 512 without anyone having run one. The xKV pool is not implemented.
 
 For long context (1M+ tokens), the bottleneck shifts from weights to attention compute + KV bandwidth. Arc handles that via FlashMLASparse (CUDA kernel, MIT-licensed, ported from sgl-project), turning dense attention's O(n²) into sparse top-k O(n·k) on models with native sparse-attention training (DeepSeek V3.2+ family) and via top-k attention + sink preservation on the rest.
 
@@ -126,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
         .with_paged_attn(|| PagedAttentionConfig::new(
             None,
             Default::default(),
-            PagedCacheType::Auto, // TurboQuant is opt-in; see note below
+            PagedCacheType::Auto, // opts *out* of TurboQuant; see note below
         ))?
         .build()
         .await?;
@@ -138,7 +138,9 @@ async fn main() -> anyhow::Result<()> {
 
 Python bindings: `pip install mistralrs-cuda`.
 
-> **TurboQuant is not the default anywhere.** Requesting `PagedCacheType::TurboQuant` only works at head_dim 128; off-envelope it falls back to `Auto` with a warning, and an explicit `--pa-cache-type turboquant` is a hard error. The eager KV path is opt-in via `ARC_TURBOQUANT_KV=1`.
+> **TurboQuant *is* the paged default at head_dim 128 — correcting an earlier claim here that it "is not the default anywhere," which was wrong when written.** `defaults::PAGED_CACHE_TYPE` is `PagedCacheType::TurboQuant`, so leaving `--pa-cache-type` unset on CUDA gives a standard-layout head_dim-128 model TurboQuant KV with no flag, and **silently drops prefix caching**, which no TurboQuant variant supports. Pass `--pa-cache-type auto` (or `PagedCacheType::Auto`) to opt out.
+>
+> Every other geometry falls back to `Auto` with a warning: MLA layouts, uninstantiated head dims, and the instantiated-but-unmeasured widths 64/256/512. Those three are reachable only by asking for them — `--pa-cache-type turboquant` is accepted at any instantiated width and is a hard error off that set. **None of this has a measured serving run behind it at any width, 128 included.** The eager KV path is separate and opt-in via `ARC_TURBOQUANT_KV=1`.
 
 ## Supported Models
 
@@ -246,7 +248,7 @@ Built on [mistral.rs](https://github.com/EricLBuehler/mistral.rs) by Eric Buehle
 
 Compression and inference techniques composed from published research:
 
-- **TurboQuant** — Zandieh et al., Google Research, ICLR'26 ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)). Arc provides the Rust implementation, runtime Lloyd-Max codebook generation for arbitrary block dimensions, and the non-power-of-two head_dim layout decomposition. Experimental, off by default.
+- **TurboQuant** — Zandieh et al., Google Research, ICLR'26 ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)). Arc provides the Rust implementation, runtime Lloyd-Max codebook generation for arbitrary block dimensions, and the non-power-of-two head_dim layout decomposition. Experimental and never measured; on by default on the paged path at head_dim 128 (see [Quick Start](#quick-start)).
 - **QTIP** — Cornell-RelaxML, ICLR'25
 - **TEAL** — ICLR'25 Spotlight
 - **SCMoE** — Shi et al., NeurIPS'24 ([arXiv:2405.14507](https://arxiv.org/abs/2405.14507))
