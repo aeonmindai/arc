@@ -14,7 +14,8 @@ mistral.rs is a blazing-fast LLM inference engine written in Rust. It supports t
 cargo build --release
 
 # With CUDA support (Linux)
-# cudnn feature: −62% decode on V4 (5.45 vs 14.58 tok/s), see session-4 — do not add it
+# cudnn feature: −62% decode on V4 (5.45 vs 14.58 tok/s, session-4 b=1 numbers —
+# both since superseded, but the A/B conclusion stands) — do not add it
 cargo build --release --features "cuda flash-attn"
 
 # With Metal support (macOS)
@@ -69,6 +70,36 @@ When integrating a new model, make sure it respects all of the varbuilder `.pp` 
 You should also look for a model.safetensors.index.json file for the model at hand to verify correct structure.
 
 ## Architecture Overview
+
+### Named systems — read this first
+
+Arc is organised as named systems, and **no subsystem may be left without an
+absolute parent system name**. Before adding anything, find its parent. The full
+tree (every subsystem, what it does, where it lives, what is shipped vs planned
+vs nonexistent) is **`memory/mission/TAXONOMY.md`** — keep it current.
+
+```
+Arc
+├── ArcServe      front door: HTTP/OpenAI, CLI, SDKs, MCP
+├── ArcInfer      the runtime: request → tokens
+│   ├── ArcSched      serving loop, admission, batching policy
+│   ├── ArcKV         KV memory: ArcKV/Share (radix), Paged, Dense, Xs, Fp8
+│   ├── ArcAttention  attention math + kernel dispatch
+│   ├── ArcSpec       speculative decoding (MTP, EAGLE-3)
+│   ├── ArcMoE        MoE serving, routing, TD-MoE
+│   ├── ArcGraph      GPU-autonomous decode
+│   ├── ArcSample     sampling
+│   └── ArcBoost      training-free serving-side quality
+├── ArcModels     architecture support — NEW MODELS LAND HERE
+├── ArcQuant      QTIP (weights), TurboQuant (KV), ArcBake (offline pipeline)
+├── ArcKernels    GPU substrate — ArcTarget is where NEW GPUs LAND
+├── ArcFormat     UQFF + the ArcOverlay serving convention
+├── ArcLab        profiler, benchmarks, ops tooling
+└── ArcGate       correctness gates + release discipline
+```
+
+New module docs should state their parent on the first line, e.g.
+`//! Parent system: ArcInfer / ArcKV`.
 
 ### Workspace Structure
 - `mistralrs-core/` - Core inference engine, model implementations, pipelines

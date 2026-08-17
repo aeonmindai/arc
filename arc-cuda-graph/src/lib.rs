@@ -1,5 +1,8 @@
 //! Arc GPU-Autonomous Decode
 //!
+//! **Parent system: ArcInfer/ArcGraph** (see `memory/mission/TAXONOMY.md`).
+//! Its kernels are owned by ArcKernels/Decode.
+//!
 //! Dedicated decode path that bypasses Candle entirely.
 //! Model loads normally through Candle (NULL stream).
 //! Decode runs on a non-blocking stream with cuBLASLt + custom kernels.

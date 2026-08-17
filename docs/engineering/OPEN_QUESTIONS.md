@@ -144,18 +144,37 @@ These are cheap, decided, and blocked only on someone doing them.
 ## 3. Not measured — do not claim
 
 These are the honest gaps. Each has been asserted at some point in conversation
-and none of them is backed by a measurement.
+and none of them is backed by a measurement — **except the first, which was
+measured on 2026-08-17 and is kept, struck through, so the gap and its closure
+both stay on the record.**
 
-- **Full-serving batched throughput.** Aggregate tokens/s at batch, per-user
-  tokens/s *at that batch*, and TTFT under load have **never been measured**. This
-  is the number the whole fleet-economics argument rests on. What exists is a
-  kernel-level microbenchmark showing step time flat at ~63.5 ms from B=16→64
-  [measured] ⇒ ~1,006 aggregate tok/s ⇒ ~15.7 tok/s per user at B=64 [derived] —
-  a *kernel* result, not a serving result.
+- ~~**Full-serving batched throughput.**~~ **— MEASURED, 2026-08-17. This entry
+  is closed.** End-to-end through the OpenAI-compatible server on the published
+  `qtip2b` artifact, 1×H200, **0 errors across 505 requests** [measured]:
+
+  | B | 1 | 8 | 16 | 32 | 64 | 128 | 256 |
+  |---|---|---|---|---|---|---|---|
+  | **decode aggregate tok/s** | 18.27 | 41.43 | 54.75 | 74.52 | 91.46 | 106.36 | **111.69** |
+  | per-user p50 tok/s | 17.99 | 5.67 | 3.97 | 2.87 | 1.82 | 1.09 | 0.53 |
+
+  Cost per million tokens falls from **\$73.74 at B=1 to \$12.06 at B=256**
+  (the intermediate rows are in [BENCHMARKS.md](../BENCHMARKS.md)), and
+  aggregate rises **monotonically** through B=256. **What the kernel-level
+  microbenchmark predicted was wrong by an order of magnitude, and the record
+  keeps it:** step time flat at ~63.5 ms from B=16→64 [measured-kernel] was read
+  as ~1,006 aggregate tok/s ⇒ ~15.7 tok/s per user at B=64 [derived]. Serving
+  measured **91.46 aggregate / 1.82 per-user** at B=64 — ~11× below the kernel
+  derivation. **A kernel-level figure is not a serving figure**, and this is the
+  cleanest evidence in this document of how far apart the two can land.
+  **Still unmeasured on this axis:** TTFT under load has never been reported
+  here, and the per-user column is the honest weak spot, not a win.
 - **An in-class baseline.** Without a same-box, same-model comparison against an
   established serving stack, any $/Mtok figure floats free. Comparisons must be
   in-class (same silicon class, same model, same sharding); a comparison against a
-  different generation of hardware is not evidence.
+  different generation of hardware is not evidence. **This bullet is now the
+  binding one:** the serving numbers above exist, so **\$12.06/Mtok is a real
+  measurement that is still Arc-versus-Arc** — no side-by-side against SGLang,
+  vLLM or anything else has ever been run.
 - **MTP (speculative) acceptance rate.** Three sessions attempted it and collected
   empty files because the logger had no call site; that is fixed, but the number
   has still never been produced. Any acceptance figure predating the draft-seeding
@@ -196,15 +215,31 @@ These numbers were honestly measured. They are **stale**, because the code they
 measured has since changed in ways confirmed to alter output. They must be
 re-measured before republication, and quoted meanwhile only with their vintage.
 
+- ~~**Task accuracy (GSM8K 87.0 %, n=100 …)**~~ **— RE-MEASURED, 2026-08-17.
+  Superseded, not merely stale.** The current figure is **GSM8K 1270/1319 =
+  96.3 % ± 1.0 pp** on the **full** test set, **0-shot**, with **0 degenerate /
+  0 truncated / 0 errors** and mean completion 157.8 tokens [measured, on the
+  published `qtip2b` artifact]. **The reference model's published 90.8 is
+  8-shot** — a different and easier protocol — so **96.3 is not a like-for-like
+  win over it**; state that every time the number is used. Retire the
+  "provisional / re-measure pending" framing on the 87.0 %: the re-measurement
+  has happened.
+
+  **The perplexity half of this entry is still provisional.** Below is the
+  original entry, kept as written for the history — it is now correct only for
+  perplexity (12.50 ± 3.46, never re-measured) and for the long-context caveat.
+
 - **Task accuracy (GSM8K 87.0 %, n=100, 0-shot chat, greedy *decoding*, 2048-token
-  cap, ±6.6 pp) and perplexity (12.50 ± 3.46 on a 70-chunk corpus)** were both
+  cap, ±6.6 pp) — SUPERSEDED, see above — and perplexity (12.50 ± 3.46 on a
+  70-chunk corpus) — still provisional** were both
   measured before two math fixes:
   - a **SwiGLU clamp** was missing on 4 of 5 expert paths — *including the shared
     expert, which every token traverses in every layer*. Fixture magnitude when it
     bites: clamped 0.7311 vs unclamped 14.8996 = **20.4×** [measured on a fixture].
-    Expected direction is neutral-to-better, but that is **unmeasured on the real
+    Expected direction is neutral-to-better, but that was **unmeasured on the real
     model**; whatever it lands at is the first number measured on math that matches
-    the reference implementation.
+    the reference implementation. **It has since landed: the full-set 96.3 % above
+    is that first number** [measured, 2026-08-17]. The expected direction held.
   - **YaRN** rope scaling was being applied to layers that should not receive it.
     Little effect at a 2048-token cap; it matters at long context, so the
     **long-context results are provisional too**.
@@ -215,7 +250,10 @@ re-measured before republication, and quoted meanwhile only with their vintage.
 
 Speed numbers are effectively unaffected by the above (an elementwise clamp), but
 they were taken on the older tree; re-baseline opportunistically rather than
-retracting.
+retracting. **Serving speed has since been re-baselined** — see §3's closed
+throughput entry — so any decode figure predating it (notably the **14.58 tok/s**
+b=1 number that appears in the `cudnn` A/B) is a **vintage**, not a current
+value.
 
 ---
 
