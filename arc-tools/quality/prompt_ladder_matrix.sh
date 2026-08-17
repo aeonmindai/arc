@@ -45,12 +45,23 @@ CELL_TIMEOUT="${CELL_TIMEOUT:-420}"
 LOCK="${LOCK:-/root/locks/gpu.lock}"
 LOCK_WAIT="${LOCK_WAIT:-5400}"
 
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROBE="${PROBE:-$SELF_DIR/ladder_probe.py}"
+
 mkdir -p "$OUT" "$(dirname "$LOCK")"
 STATUS="$OUT/status.txt"; : > "$STATUS"
 say(){ printf "[%s] %s\n" "$(date -u +%H:%M:%S)" "$*" | tee -a "$STATUS"; }
 die_env(){ say "VOID[$1] $2"; say "RESULT=VOID (environment) — not a measurement"; exit 2; }
 
 say "ladder start ref=$REF out=$OUT"
+# Assert the tools exist BEFORE taking the lock or building. A launcher that
+# prints a PID for a missing script is not a launch, and the only trace is one
+# line in a log nobody tails — the same shape as a server that never started.
+[ -r "$PROBE" ] || die_env PROBE_MISSING "no ladder_probe.py at $PROBE (set PROBE=/path)"
+command -v cargo >/dev/null 2>&1 || die_env CARGO "cargo not on PATH"
+[ -d "$REPO/.git" ] || die_env REPO "no git repo at $REPO"
+[ -f "$MODEL/config.json" ] || die_env MODEL "no model at $MODEL"
+[ -f "$UQFF" ] || die_env UQFF "no uqff artifact at $UQFF"
 
 # ------------------------------------------------------------------ the lock
 # Queue behind whoever holds the GPU. `set -o noclobber` makes the create
@@ -145,7 +156,11 @@ run_config(){
     esac
     say "  provenance OK: server revision $logged == built $SHORT"
 
-    python3 "$WT/arc-tools/quality/ladder_probe.py" \
+    # The probe comes from THIS script's own directory, never from the
+    # worktree. The worktree is checked out at $REF — the code under test —
+    # and the measurement tool is not part of what is being measured. Reading
+    # it from $WT would also simply fail whenever $REF predates the tool.
+    python3 "$PROBE" \
         --base-url "http://127.0.0.1:$PORT" \
         --words "$WORDS" --batches "$BATCHES" \
         --cell-timeout "$CELL_TIMEOUT" --config "$label" \
