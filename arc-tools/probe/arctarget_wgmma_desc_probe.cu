@@ -70,7 +70,8 @@
 // result is believed — two wrong runs that agree are not evidence.
 //
 // Build (on a Hopper box):
-//   nvcc -arch=sm_90a -std=c++17 -O3 -DWGMMA_HAS_TRANS_A=0 \
+//   nvcc -gencode arch=compute_90a,code=sm_90a -std=c++17 -O3 \
+//        -DWGMMA_HAS_TRANS_A=0 \
 //        -o wgmma_desc_probe arctarget_wgmma_desc_probe.cu
 //
 // Exit codes: 0 = a unique encoding was identified · 1 = probe answered
@@ -187,10 +188,17 @@ DEFINE_WGMMA_REGA(1)
 // The control: the mma.sync path the Ampere kernel already ships and that we
 // trust. If this disagrees with the CPU reference, the harness is broken and
 // no wgmma verdict means anything.
+//
+// The type list is `.f32.bf16.bf16.f32` — dtype, atype, btype AND ctype. It
+// carried only three types until ptxas rejected it with "Unexpected
+// instruction types specified for 'mma'". Worth stating because this is the
+// CONTROL: it is the instruction that decides whether any wgmma verdict can be
+// believed, so a silently malformed one would have taken the whole probe down
+// with it.
 __device__ __forceinline__ void mma_m16n8k16(float* c, const uint32_t* a,
                                              uint32_t b0, uint32_t b1) {
     asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16 "
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));

@@ -80,10 +80,27 @@ say "INFO  nvcc: $(nvcc --version | tail -2 | head -1)"
 say "INFO  gpu:  $(nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader 2>/dev/null | head -1)"
 
 # The probe needs sm_90a specifically: `wgmma` does not exist on plain sm_90.
-if ! nvcc --list-gpu-code 2>/dev/null | tr -d ' ' | grep -qx sm_90a; then
-  envr "toolkit cannot target sm_90a — wgmma is unreachable from this CUDA"
-  done_and_exit
-fi
+#
+# This used to grep `nvcc --list-gpu-code` for `sm_90a`. That check is worthless
+# — the listing never prints the `a` variants at all (CUDA 12.9 shows `sm_90`,
+# `sm_100`, `sm_103` and no arch-specific forms), so it would have reported
+# "toolkit cannot target sm_90a" on a toolkit that can. The inverse also bit us:
+# `-arch=sm_90a` was accepted without complaint and then produced a
+# `compute_90` intermediate, so ptxas rejected wgmma as "not supported on
+# .target 'sm_90'".
+#
+# So: emit PTX and read its `.target` back. Ask the tool what it DID, not what
+# it claims to support.
+echo '__global__ void k(){}' > "$WORK/tgt.cu"
+nvcc -gencode arch=compute_90a,code=sm_90a -ptx -o "$WORK/tgt.ptx" "$WORK/tgt.cu" \
+     > "$WORK/tgt.log" 2>&1 || true
+PTX_TARGET=$(grep -m1 '^\.target' "$WORK/tgt.ptx" 2>/dev/null || echo "<none>")
+say "PROBE_PTX_TARGET=$PTX_TARGET"
+case "$PTX_TARGET" in
+  *sm_90a*) pass "toolkit emits sm_90a — wgmma is assemblable" ;;
+  *) envr "asked for compute_90a, got '$PTX_TARGET' — wgmma unreachable from this CUDA"
+     done_and_exit ;;
+esac
 
 # --- 1. get the source without touching the shared working tree -------------
 if [ -d "$REPO/.git" ]; then
@@ -108,7 +125,8 @@ ARITY_OK=""
 BIN=""
 for HAS_TRANS_A in 0 1; do
   out="$WORK/probe_ta$HAS_TRANS_A"
-  if nvcc -arch=sm_90a -std=c++17 -O3 -DWGMMA_HAS_TRANS_A=$HAS_TRANS_A \
+  if nvcc -gencode arch=compute_90a,code=sm_90a -std=c++17 -O3 \
+       -DWGMMA_HAS_TRANS_A=$HAS_TRANS_A \
        -o "$out" "$WORK/probe.cu" > "$WORK/nvcc_ta$HAS_TRANS_A.log" 2>&1; then
     say "INFO  compiled with WGMMA_HAS_TRANS_A=$HAS_TRANS_A"
     if [ -z "$ARITY_OK" ]; then ARITY_OK=$HAS_TRANS_A; BIN="$out"; fi

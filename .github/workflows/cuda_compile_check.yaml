@@ -351,9 +351,29 @@ jobs:
         run: |
           set -uo pipefail
           SRC=arc-tools/probe/arctarget_wgmma_desc_probe.cu
+
+          # PROVE the virtual arch, do not infer it. The first run passed
+          # `-arch=sm_90a`, nvcc did not complain, and ptxas then rejected the
+          # wgmma with "not supported on .target 'sm_90'" over an intermediate
+          # named `...compute_90.ptx` — the `a` had quietly not survived. And
+          # `nvcc --list-gpu-code` never prints the `a` variants at all, so
+          # grepping it for `sm_90a` (which the wave65 gate and the box runner
+          # both did) tests nothing. The only trustworthy check is to emit PTX
+          # and read its `.target` line back.
+          echo "--- what this toolkit actually targets ---"
+          echo '__global__ void k(){}' > /tmp/tgt.cu
+          nvcc -gencode arch=compute_90a,code=sm_90a -ptx -o /tmp/tgt.ptx /tmp/tgt.cu 2>&1 || true
+          TARGET=$(grep -m1 '^\.target' /tmp/tgt.ptx 2>/dev/null || echo "<none>")
+          echo "PROBE_PTX_TARGET=$TARGET"
+          case "$TARGET" in
+            *sm_90a*) echo "OK: this toolkit emits sm_90a — wgmma is reachable" ;;
+            *) echo "FAIL: asked for compute_90a and got '$TARGET'; wgmma cannot be assembled here"
+               exit 1 ;;
+          esac
+
           ACCEPTED=""
           for ta in 0 1; do
-            if nvcc -arch=sm_90a -std=c++17 -O3 -DWGMMA_HAS_TRANS_A=$ta \
+            if nvcc -gencode arch=compute_90a,code=sm_90a -std=c++17 -O3 -DWGMMA_HAS_TRANS_A=$ta \
                  -c -o /tmp/probe_ta$ta.o "$SRC" > /tmp/nvcc_ta$ta.log 2>&1; then
               echo "ACCEPTED WGMMA_HAS_TRANS_A=$ta"
               ACCEPTED="${ACCEPTED:+$ACCEPTED,}$ta"
