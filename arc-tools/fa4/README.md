@@ -4,11 +4,37 @@
 
 FA4 is written in **CuTeDSL** and JIT-compiled at runtime through `cute.compile()`. It exposes **no C or C++ API**, so Arc cannot link it the way `candle-flash-attn` (FA2) and `candle-flash-attn-v3` (FA3) link their C++ kernels. The property that makes FA4 trivial for vLLM and SGLang — they are Python — is exactly what makes it hard here.
 
-## Scope — read this before writing a release note
+## Scope — two deliverables, and they must never be conflated in a claim
 
-**FA4 is a fleet-wide lever, never a DeepSeek-V4 one.** V4 sets `SdpaParams::sinks` on all 43 layers (`deepseek4.rs:1188-1197`), `run_attention` returns into `sinks_attn` at `attention/mod.rs:133` **before** the flash branch, and `sinks.rs:78` gates the fused sinks kernel on `head_dim ∈ {64,80,96,112,128,192,256}` — V4's is **512**. No V4 layer reaches any FlashAttention kernel of any generation, and no build flag changes that. FA2/FA3 cap head_dim at 256 as well.
+**1. Vanilla FA4 binding (head_dim ≤ 256) — fleet-wide, NOT a V4 lever.**
+V4 sets `SdpaParams::sinks` on all 43 layers (`deepseek4.rs:1188-1197`), `run_attention` returns into `sinks_attn` at `attention/mod.rs:133` **before** the flash branch, and `sinks.rs:78` gates the fused sinks kernel on `head_dim ∈ {64,80,96,112,128,192,256}` — V4's is **512**. No V4 layer reaches a stock FlashAttention kernel of any generation. FA2/FA3 cap head_dim at 256 too. Value here is the Llama/Qwen/Mistral-class GQA majority.
 
-Value, if any, is for the head_dim ≤ 256 majority: Llama/Qwen/Mistral-class GQA models.
+**2. FA4 extended to MLA — head_dim 512, MQA, with sinks — IS V4's fused kernel.**
+This is the single largest identified V4 speed lever. V4 today runs unfused matmul + `softmax_with_sinks` on all 43 layers. Extending the CuTeDSL schedule to d=512 is what produces that kernel, and it is why the durable substrate was chosen over a per-arch hand-written one.
+
+**Keep these separated in every PR, doc, and release note.** Deliverable 1 makes no V4 claim. V4 value appears only at rung 3 and above.
+
+## Why CuTeDSL and not FlashMLA
+
+Hand-written CUDA (FlashMLA) is sm90-locked: adopting it means re-porting *and* re-applying our extras (sinks, N-region reads) at every hardware generation, permanently downstream of someone else's release cadence. CuTeDSL retargets because tile shapes are parameters. This is a product decision — the durable substrate over the fast patch — recorded here so it is not re-litigated, and revisited only if **rung 1 fails**.
+
+## The ladder
+
+Each rung is independently testable. Build in order.
+
+| Rung | What | V4? |
+|---|---|---|
+| **1** | **THE GATE.** `export_to_c()` → linkable `.o` with `__tvm_ffi_<name>`, callable from Rust, no Python at runtime. | — |
+| 2 | Vanilla FA4 callable from Arc at head_dim 64/128, output matching the Python reference. Proves the binding independently of kernel novelty. | no |
+| 3 | Extend to **head_dim 512 with MQA**. The wall is ~228 KB SM shared memory against a ~320 KB naive tile budget at d=512. The exploit V4 hands us and stock FA cannot assume: **64 query heads, 1 KV head** — load K/V once, reuse across all heads. Study `absorbed_mqa_decode` (`dsv4_attention.rs:125`), which already avoids materialising 512-wide K/V per head at `t_q == 1`. | **yes** |
+| 4 | **Attention sinks in the softmax.** No FA and no FlashMLA release has this. The sink is a **per-head scalar in the denominator — zero cache bytes**, not a KV region. | **yes** |
+| 5 | **N-region read.** V4 reads 2 regions: raw sliding window (128) ++ compressed KV (ratio 4 = CSA, 128 = HCA; ratio 0 = window-only on layers **{0,1,43}** — 43, not 42; layer 42 is CSA). Must compose with PR #90's segment allocator, whose finding is that the existing gather kernel treats **a segment as a row**, needing zero `.cu` changes. Read `memory/mission/wave61-CL-segment-allocator.md` first. | **yes** |
+| 6 | Wire into `dsv4_attention` and measure against the unfused `softmax_with_sinks` baseline. **That delta is the deliverable number.** | **yes** |
+
+### Not starting cold
+
+- `arc-cuda-graph/src/cuda/flashmlasparse/{indexer_score.cu,topk_radix.cu}` — a port of SGLang's FlashMLASparse (`fp8_paged_mqa_logits` family, sm90 decode sparse), specialised to BF16. That is the sparse-selection half; it also documents the V4Indexer contract and interface shape.
+- Dao-AILab discussion **#1474**, *"How to Extend FlashAttention to Nearly Infinite HeadDim and Achieve Fully Fused MLA?"* — upstream is asking exactly the rung-3 question and it is unanswered. Read before designing rung 3; solving it is genuinely novel and worth upstreaming.
 
 ## Nothing like this exists yet
 
@@ -74,15 +100,34 @@ python3 arc-tools/fa4/fa4_probe.py --json /tmp/fa4_probe.json
 
 `--quick` runs two benchmark shapes instead of six; `--skip-bench` skips section 6.
 
-## The gate before any Rust is written
+## Rung 1 — run this first, alone
 
-The probe's section-5 verdict decides the binding design:
+```bash
+bash arc-tools/fa4/rung1_gate.sh 2>&1 | tee /tmp/arc_fa4_rung1/gate.log
+```
 
-- `USE_ROUTE3_EXPORT_TO_C__no_python_at_runtime` → build a normal `build.rs` + FFI crate against the exported `.o`. This is the good outcome.
-- `USE_CUBIN_AOT__cuModuleLoadData_from_rust` → bake-time cubin export plus a driver-API launcher; needs the kernel param layout resolved, which is the expensive part.
-- `NO_CUBIN_ACCESS_ON_THIS_VERSION__investigate` → stop and re-scope.
+Bootstraps pip/numpy/`nvidia-cutlass-dsl`, exports a trivial `@cute.jit` kernel, describes the resulting ABI, then generates a Rust harness, links it against the `.o`, runs it, and `ldd`s it. Four checks:
 
-**No Rust FA4 code should land before that verdict exists.** Wiring a feature flag whose implementation is `unimplemented!()` is precisely the "wired but dead code" category the BACKLOG already tracks.
+| | Check | Meaning |
+|---|---|---|
+| C1 | Rust links the `.o` and resolves `__tvm_ffi_<name>` | callable |
+| C2 | the symbol is a TEXT symbol | real code, not a stub |
+| C3 | the linked binary has **no** `libpython` | no Python at runtime |
+| C4 | the binary runs to completion | usable |
+
+Send back `/tmp/arc_fa4_rung1/manifest.json`, `/tmp/arc_fa4_rung1/link_verdict.json`, and `rustc.log` if the link failed.
+
+**Verdicts:**
+
+- `GATE_PASSES__export_to_c_is_linkable_from_rust_without_python` → the substrate bet is sound; start rung 2.
+- `LINKS_BUT_DRAGS_PYTHON__investigate` → determine whether `libpython` comes from the harness or the runtime `.so`.
+- `GATE_FAILS__no_rust_callable_object` / `NO_OBJECT__GATE_FAILS` → **STOP AND REPORT IMMEDIATELY.** FlashMLA-per-arch becomes the only road and the substrate decision gets revisited on this evidence.
+
+The probe assumes nothing about the API surface: `export_to_c` is tried in four argument shapes and `dump_to_object` in two, each outcome recorded separately, and the generated header is dumped **verbatim** — the header is the ABI contract, and reading it beats guessing at it. One run yields everything needed to design rung 2 whether it passes or fails.
+
+The exported kernel is a trivial no-op **on purpose**: rung 1 tests the toolchain, not the kernel, so DSL-syntax drift surfaces loudly instead of being mistaken for an export failure. Stage C takes the symbol's *address* rather than calling it — invoking needs the TVM FFI argument pack, which is rung 2; `nm` type `T` already proves it is code.
+
+**No Rust FA4 code lands before this verdict exists.** A feature flag whose implementation is `unimplemented!()` is precisely the "wired but dead code" debt the BACKLOG tracks.
 
 ## Related
 
