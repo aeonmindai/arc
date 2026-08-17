@@ -13,6 +13,7 @@ mod hybrid_cache;
 mod rotating_cache;
 mod single_cache;
 pub mod turboquant_cache;
+mod v4_turbo;
 mod xs_rolling;
 
 pub use full_cache::{EitherCache, LayerCaches};
@@ -23,6 +24,7 @@ pub use hybrid_cache::{
 pub use rotating_cache::RotatingCache;
 pub use single_cache::SingleCache;
 pub use turboquant_cache::TurboQuantCache;
+pub use v4_turbo::{V4TurboKCache, V4_TURBO_TAIL_MARGIN_TOKENS};
 pub use xs_rolling::{XsRollingCache, XS_TAIL_MARGIN_TOKENS};
 
 pub trait CacheManager<T: CacheManagerMixin + MetadataMixin + ?Sized> {
@@ -65,6 +67,11 @@ pub enum KvCache {
     /// and reports its length in tokens so the generic truncation paths keep
     /// working.
     XsRolling(Box<XsRollingCache>),
+    /// DeepSeek V4's fused MQA keys in TurboQuant form (see [`V4TurboKCache`]).
+    /// Like [`Self::XsRolling`] it is two regions with one boundary, reports
+    /// its length in tokens, and is advanced through its own `append` rather
+    /// than the generic K/V one.
+    V4Turbo(Box<V4TurboKCache>),
 }
 
 impl KvCache {
@@ -101,6 +108,8 @@ impl KvCache {
             Self::TurboQuant(tq) => tq.k.current_data(),
             // The compressed rows are this entry's "keys".
             Self::XsRolling(xs) => xs.comp.current_data(),
+            // The packed records are this entry's "keys".
+            Self::V4Turbo(t) => t.codes.current_data(),
         }
     }
 
@@ -111,6 +120,8 @@ impl KvCache {
             Self::TurboQuant(tq) => tq.v.current_data(),
             // The retained raw tail is this entry's "values".
             Self::XsRolling(xs) => Ok(xs.tail.clone()),
+            // The retained dense window is this entry's "values".
+            Self::V4Turbo(t) => Ok(t.tail.clone()),
         }
     }
 
@@ -160,6 +171,11 @@ impl KvCache {
                 "KvCache::append: the V4 xs rolling cache is advanced through \
                  `XsRollingCache::advance`, not the K/V append path"
             ),
+            Self::V4Turbo(_) => candle_core::bail!(
+                "KvCache::append: the V4 TurboQuant key cache is advanced through \
+                 `V4TurboKCache::append`, which returns the dense span and its base — the \
+                 generic two-tensor append cannot express that"
+            ),
         };
         let k = match out_k {
             None => {
@@ -167,7 +183,7 @@ impl KvCache {
                 match self {
                     Self::Normal { k, .. } => shape[k.dim] = 0,
                     Self::Rotating { k, .. } => shape[k.dim] = 0,
-                    Self::TurboQuant(_) | Self::XsRolling(_) => unreachable!(),
+                    Self::TurboQuant(_) | Self::XsRolling(_) | Self::V4Turbo(_) => unreachable!(),
                 }
                 Tensor::zeros(shape, k.dtype(), k.device())?
             }
@@ -179,7 +195,7 @@ impl KvCache {
                 match self {
                     Self::Normal { v, .. } => shape[v.dim] = 0,
                     Self::Rotating { v, .. } => shape[v.dim] = 0,
-                    Self::TurboQuant(_) | Self::XsRolling(_) => unreachable!(),
+                    Self::TurboQuant(_) | Self::XsRolling(_) | Self::V4Turbo(_) => unreachable!(),
                 }
                 Tensor::zeros(shape, v.dtype(), v.device())?
             }
@@ -194,6 +210,7 @@ impl KvCache {
             Self::Rotating { k, .. } => k.current_seq_len(),
             Self::TurboQuant(tq) => tq.current_seq_len(),
             Self::XsRolling(xs) => xs.current_seq_len(),
+            Self::V4Turbo(t) => t.current_seq_len(),
         }
     }
 
@@ -212,6 +229,9 @@ impl KvCache {
             }
             Self::XsRolling(xs) => {
                 xs.reset();
+            }
+            Self::V4Turbo(t) => {
+                t.reset();
             }
         }
     }
@@ -235,6 +255,7 @@ impl KvCache {
                 Ok(())
             }
             Self::XsRolling(xs) => xs.set_len(len),
+            Self::V4Turbo(t) => t.set_len(len),
         }
     }
 
@@ -255,6 +276,7 @@ impl KvCache {
                 Ok(())
             }
             Self::XsRolling(xs) => xs.try_set_len(len),
+            Self::V4Turbo(t) => t.try_set_len(len),
         }
     }
 
@@ -707,6 +729,19 @@ impl BatchSrc {
                 k_slack_dim: Some(xs.comp.dim),
                 v_slack_dim: None,
             },
+            // Same split as `XsRolling`, and for the same reason: the packed
+            // records are a grown capacity buffer, the dense tail is live
+            // content whose width IS the sequence's position in its window.
+            KvCache::V4Turbo(t) => Self {
+                k: t.codes.all_data.clone().ok_or_else(|| {
+                    candle_core::Error::msg("v4 turboquant kv cache: code buffer not materialised")
+                })?,
+                v: t.tail.clone().ok_or_else(|| {
+                    candle_core::Error::msg("v4 turboquant kv cache: dense tail not materialised")
+                })?,
+                k_slack_dim: Some(t.codes.dim),
+                v_slack_dim: None,
+            },
         })
     }
 }
@@ -1101,6 +1136,21 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     rebuilt.tail = v_cache;
                     caches.push(KvCache::XsRolling(Box::new(rebuilt)));
                 }
+                KvCache::V4Turbo(t) => {
+                    // As for `XsRolling`: everything but the two buffers is
+                    // per-batch metadata from the seq0 template, sound only
+                    // because `ensure_uniform_batch_cache_lens` has already
+                    // established that every sequence agrees on `tokens` here
+                    // — which is what makes the `tokens - base` wide dense tail
+                    // batchable at all.
+                    let mut rebuilt = (**t).clone();
+                    if let Some(k) = k_cache.as_ref() {
+                        rebuilt.codes.capacity_seq_len = k.dims()[rebuilt.codes.dim];
+                    }
+                    rebuilt.codes.all_data = k_cache;
+                    rebuilt.tail = v_cache;
+                    caches.push(KvCache::V4Turbo(Box::new(rebuilt)));
+                }
             }
         }
         *pipeline.cache().normal() = NormalCache(caches);
@@ -1139,6 +1189,15 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     xs.tail
                         .clone()
                         .expect("xs rolling cache: raw tail not materialised"),
+                ),
+                KvCache::V4Turbo(t) => (
+                    t.codes
+                        .all_data
+                        .clone()
+                        .expect("v4 turboquant kv cache: code buffer not materialised"),
+                    t.tail
+                        .clone()
+                        .expect("v4 turboquant kv cache: dense tail not materialised"),
                 ),
             };
 
@@ -1216,6 +1275,12 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                         per_seq.comp.all_data = Some(k);
                         per_seq.tail = Some(v);
                         *seq_cache = Some(KvCache::XsRolling(Box::new(per_seq)));
+                    }
+                    KvCache::V4Turbo(t) => {
+                        let mut per_seq = (**t).clone();
+                        per_seq.codes.all_data = Some(k);
+                        per_seq.tail = Some(v);
+                        *seq_cache = Some(KvCache::V4Turbo(Box::new(per_seq)));
                     }
                 }
             }
@@ -1305,6 +1370,14 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 // a reset rather than a panic so a future reordering degrades
                 // to "start empty", which is always safe for this entry.
                 KvCache::XsRolling(_) => {
+                    layer.reset();
+                }
+                // Unreachable for the same reason as `XsRolling`: the V4
+                // TurboQuant slot has no preallocated KV-shaped buffer (its
+                // code records are a different width and dtype from the dense
+                // keys this preallocation is sized for). Reset rather than
+                // panic, so a future reordering degrades to "start empty".
+                KvCache::V4Turbo(_) => {
                     layer.reset();
                 }
                 KvCache::Normal { k, .. } => {

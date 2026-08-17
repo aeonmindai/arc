@@ -146,7 +146,10 @@ pub use pipeline::text_models_inputs_processor::FlashParams as TextFlashParams;
 /// The cache entry types are needed by integration tests that drive the
 /// per-sequence cache dance (`clone_in_cache` / `clone_out_cache`) by hand
 /// against a bare `NormalModel`, without standing up a whole pipeline.
-pub use kv_cache::{KvCache, SingleCache, XsRollingCache, XS_TAIL_MARGIN_TOKENS};
+pub use kv_cache::{
+    KvCache, SingleCache, V4TurboKCache, XsRollingCache, V4_TURBO_TAIL_MARGIN_TOKENS,
+    XS_TAIL_MARGIN_TOKENS,
+};
 pub use request::{
     ApproximateUserLocation, Constraint, DetokenizationRequest, ImageGenerationResponseFormat,
     LlguidanceGrammar, MessageContent, NormalRequest, ReasoningEffort, Request, RequestMessage,
