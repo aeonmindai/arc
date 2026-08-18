@@ -27,6 +27,21 @@ OUT=$LOG/$TAG
 rm -rf "$OUT"; mkdir -p "$OUT"
 [ -f /root/arcenv.sh ] && source /root/arcenv.sh
 
+# Everything this script prints goes to a file AS IT HAPPENS, not at exit.
+#
+# A sibling chain piped its run through `| tail -60`, which buffers until EOF,
+# and spent twenty minutes unable to distinguish "working" from "hung" except
+# via ps and nvidia-smi. That matters more here than there: the control arm is
+# EXPECTED to die, and "died the way the defect dies" has to be separable from
+# "died on load" while it is happening, not reconstructed from a truncated
+# buffer afterwards.
+#
+# LAUNCH CONVENTION -- do NOT pipe this script through tail/head/less:
+#   setsid nohup arc-tools/arcgraph_stride_ab.sh <bin> <tag> <port> \
+#     </dev/null >/root/arcgraph-stride-logs/<tag>.run.log 2>&1 &
+# then poll  tail -n 40 /root/arcgraph-stride-logs/<tag>/run.log
+exec > >(tee -a "$OUT/run.log") 2>&1
+
 say() { echo "[$(date -u +%T)] $*"; }
 
 # ---- 0. Prove the binary. A stale binary yields a clean flat result that is

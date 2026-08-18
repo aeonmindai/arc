@@ -45,6 +45,45 @@ Parent system: ArcInfer / ArcGraph (capture) + ArcKV (paged metadata staging).
 Written BEFORE any hardware run, commit-timestamped. The point is that the result
 cannot select its own interpretation afterwards.
 
+## COST, PRICED BEFORE I CLAIM THE CARD
+
+Written so an overrun is a surprise I can *name*, not one I discover. A sibling
+chain overran tonight on a figure already recorded in FACTS that it had read the
+same day; the point of this section is that I cannot do the same quietly.
+
+| leg | expected | what makes it long |
+|---|---|---|
+| CUDA compile, warm `target/` | **12–25 min** | `pipeline/mod.rs` is in mistralrs-core, so core + server-core + cli all relink. No `.cu` file was touched, so nvcc should be fully cached. |
+| CUDA compile, cold `target/` | **45–60 min** | kernels compile from scratch |
+| control arm | **2–4 min** | qwen05 is 0.5B; ~40–90 s to load + 8 GB paged cache, then ladder 1,8,32 @ 64 tokens. Expected to DIE at B=8, so it ends *early*, not late. |
+| M2 (revert growth) | **3–6 min** rebuild + **3 min** arm | only arc-cuda-graph changes; cost is the binary relink |
+| M1 (revert pitched copy) | **3–6 min** rebuild + **4 min** arm | expected to SERVE, so the full ladder runs |
+
+**Total expected: ~35–50 min warm, ~70–90 min cold.**
+
+**TRIPWIRES — if any of these trips I say so immediately rather than absorbing it:**
+- first CUDA compile past **30 min** warm / **60 min** cold
+- any single arm past **8 min**
+- control arm reaching B=32 alive (it was supposed to die at B=8 — that is
+  outcome S3, CANNOT ANSWER, and I stop rather than reinterpret)
+
+**Is there a re-derivation tax hiding in MY run, as there was in theirs?**
+Yes, and it is small but I should name it rather than be surprised by it: every
+arm restarts the server with the dedicated path LIVE, so each start pays
+`extract_model_weights` — `1 + 7*num_layers` `dequantize_w()` calls plus 2
+discarded probes. On a 0.5B model that is seconds, not minutes. It is only
+ruinous at V4 scale, which is the separate startup-tax item.
+
+**Piggyback measurement, zero extra card time.** That same tax is the "free
+money" item I was asked to quantify and have so far only derived from source.
+My arms start with the path ON; `schedfix_run.sh`'s arms start with it OFF, on
+the same box and model. Diffing process-start → `/v1/models` ready across the
+two logs gives the startup delta as a measured number for free. Recording the
+intent here so the comparison is pre-registered rather than fished for
+afterwards: I expect a **small positive delta at 0.5B** (seconds), and a null or
+negative result would mean my source-derived account of the extraction cost is
+wrong and needs re-deriving, not re-asserting.
+
 ## The defect, stated as a claim that can be wrong
 
 `DedicatedDecodePath` copies the per-step paged-attention block table into a
