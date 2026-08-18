@@ -108,38 +108,75 @@ pub struct SdpaParams {
     pub sinks: Option<Tensor>,
 }
 
-/// Does this mask have to be applied as an additive bias rather than handed to
-/// a flash kernel?
+/// Does this mask carry information the CUDA flash path would silently discard?
 ///
 /// # Why this predicate has to exist
 ///
 /// `flash_attn(&q, &k, &v, flash_params, sdpa_params)` — the CUDA branch of
 /// [`Sdpa::run_attention`] — **takes no mask argument at all**. Anything the
-/// caller passed in `mask` is silently DISCARDED there. The flash kernels'
-/// only masking knobs are `causal` and `window_size_left/right`, and all three
-/// are *batch-scalar*: one value for the whole batch.
+/// caller passed in `mask` is DISCARDED there, with no error. The flash
+/// kernels' only masking knobs are `causal` and `window_size_left/right`, and
+/// all three are *batch-scalar*: one value for the whole batch. So no mask
+/// whose content is not exactly "causal" or "windowed" is expressible there.
 ///
-/// So a mask that VARIES ACROSS THE BATCH is inexpressible on that path. The
-/// one such mask in this tree is
-/// [`crate::layers_masker::CausalMasker::make_left_padded_causal_mask`], the
-/// `[B, 1, 1, k]` mask a **left-aligned ragged decode batch** needs to kill
-/// each row's zero-filled dead prefix. A zero K row is not a masked row — it
-/// scores logit 0 and takes real softmax weight — so entering the flash path
-/// with it would serve every short sequence from padding, silently.
+/// # Why rank >= 3, and not "any mask"
 ///
-/// # Why it is scoped to `seq_len == 1`
+/// Rank is a proxy for *batch- or head-varying*, which is exactly the class
+/// flash's batch-scalar knobs cannot express. Every mask in this tree that is
+/// currently dropped and must not be has rank >= 3 — verified by reading each
+/// producer, 2026-08-18:
+/// * `CausalMasker::expand_mask` — the `[B, 1, q, k]` (siglip) and
+///   `[B, H, q, k]` (idefics3) **PAD patch** masks of a variable-resolution
+///   image batch. Dropping them makes every real patch take softmax weight from
+///   its own image's padding.
+/// * the conformer audio encoder's T5 **relative attention bias**
+///   (`vision_models/conformer/encoder.rs:93-101`) — not a mask at all but a
+///   learned additive logit bias, and it is passed on EVERY forward
+///   (`encoder.rs:641-648`), not only when padding exists.
+/// * mllama's aspect-ratio padding mask (`vision_models/mllama/vision.rs:650`)
+///   — rank 3 when `bs == 1`, rank 4 otherwise. A rank-4-only predicate misses
+///   the first, which is why this is `>= 3`.
+/// * `CausalMasker::make_left_padded_causal_mask` — the `[B, 1, 1, k]` ragged
+///   decode mask. A zero K row is not a masked row: it scores logit 0 and takes
+///   real softmax weight.
 ///
-/// Deliberately narrow, so this cannot change any batch that works today:
-/// * a **uniform** decode batch has `mask == None` and is untouched;
-/// * **prefill** (`seq_len > 1`) is untouched, including the 4-D padding masks
-///   the vision encoders build with `CausalMasker::expand_mask`. Those are
-///   *also* being dropped on the flash path today — a separate pre-existing
-///   defect, filed rather than fixed here, because widening this predicate to
-///   cover them would move every vision encoder off flash in the same change.
-fn mask_must_be_applied_as_bias(seq_len: usize, mask_dims: Option<&[usize]>) -> bool {
+/// Conversely every rank-2 mask that reaches the CUDA flash path is redundant
+/// with a knob flash already has, so diverting it would cost throughput for no
+/// correctness gain:
+/// * `make_causal_mask_matrix` / `make_sliding_window_causal_mask_matrix` never
+///   return a real rank-2 mask there at all — they return the `[1, 1]` sentinel,
+///   gated on `using_flash_attn() && device.is_cuda()`.
+/// * the `*_as_attn_bias` producers do build real rank-2 masks, and reach flash
+///   from exactly one place, `vision_models/gemma3/text.rs:591`. Gemma-3 also
+///   sets `sdpa_params.sliding_window` per layer (`gemma3/text.rs:145`), so
+///   causality and the window are both already carried. (`gpt_oss.rs:782` uses
+///   the same producers but never gets here: `sdpa_params.sinks` is `Some`, so
+///   `run_attention` short-circuits into `sinks_attn` first.)
+///
+/// # Honest limit — what this leaves behind
+///
+/// `make_chunked_mask_matrix` builds a rank-2 **chunked** mask
+/// (`vision_models/llama4/text.rs:694`) which flash cannot express either, and
+/// which this predicate therefore still lets be dropped. Fixing it means moving
+/// Llama-4 text off flash, a throughput trade that should be measured on a box
+/// before it is shipped. Filed rather than bundled in here, precisely so it is
+/// not an unmeasured regression smuggled in behind a correctness fix.
+///
+/// # Scope
+///
+/// The caller applies this **only to the CUDA conjunct**. The CPU branch of
+/// `can_use_flash` routes to `cpu::run_flash_attn_cpu`, which *does* take
+/// `mask` and honours it, so diverting it would be a pointless slowdown.
+///
+/// This supersedes the narrower `seq_len == 1 && rank 4 && dims[0] > 1` form on
+/// `feat/dense-ragged-decode` (PR #122): every input that predicate diverts,
+/// this one diverts too. Kept under the same name deliberately, so the two
+/// collide textually at merge and a human reconciles them rather than one
+/// silently winning.
+pub(crate) fn mask_must_be_applied_as_bias(mask_dims: Option<&[usize]>) -> bool {
     match mask_dims {
-        Some(dims) => seq_len == 1 && dims.len() == 4 && dims[0] > 1,
         None => false,
+        Some(dims) => dims.len() >= 3,
     }
 }
 
@@ -185,18 +222,17 @@ impl Sdpa {
         //
         // (The CPU branch below is a separate, unrestricted implementation and
         // is deliberately not gated on this predicate.)
+        //
+        // The mask predicate is on the CUDA conjunct ONLY: `flash_attn` takes no
+        // mask argument and would drop it, whereas the CPU branch's
+        // `run_flash_attn_cpu` takes `mask` and honours it. See
+        // `mask_must_be_applied_as_bias`.
         let can_use_flash = q.device().is_cpu()
             || q.device().is_cuda()
                 && crate::using_flash_attn()
                 && q.dtype() != DType::F32
-                && cuda_flash_attn_supported(head_dim, k_head_dim, v_head_dim, sdpa_params.softcap);
-
-        // A batch-varying mask cannot be expressed by any flash kernel, and the
-        // flash call below does not even take a mask — see
-        // `mask_must_be_applied_as_bias`. Route it to the bias path or serve
-        // from zero-filled keys.
-        let can_use_flash =
-            can_use_flash && !mask_must_be_applied_as_bias(seq_len, mask.map(|m| m.dims()));
+                && cuda_flash_attn_supported(head_dim, k_head_dim, v_head_dim, sdpa_params.softcap)
+                && !mask_must_be_applied_as_bias(mask.map(|m| m.dims()));
 
         if can_use_flash {
             // flash-attn expects (b_sz, seq_len, nheads, head_dim)
@@ -520,34 +556,117 @@ mod dispatch_tests {
 mod bias_dispatch_tests {
     use super::mask_must_be_applied_as_bias;
 
-    /// 🔑 The mask a left-aligned ragged decode batch needs — `[B, 1, 1, k]`
-    /// with `B > 1` — must NOT reach the flash path, because `flash_attn` takes
-    /// no mask argument and would drop it, serving every short row from its
-    /// zero-filled dead prefix.
+    /// Every shape below is the shape a named call site actually produces. They
+    /// are not illustrative: if one of these reaches the CUDA flash path, that
+    /// model's mask is dropped and the output is silently wrong.
+    ///
+    /// Mutation check (run 2026-08-18): make the predicate `false` for `Some(_)`
+    /// — master's behaviour — and all seven rows here fail, naming the site.
     #[test]
-    fn a_ragged_decode_mask_must_go_to_the_bias_path() {
-        assert!(mask_must_be_applied_as_bias(1, Some(&[8, 1, 1, 500])));
-        assert!(mask_must_be_applied_as_bias(1, Some(&[2, 1, 1, 6])));
+    fn every_real_masked_call_site_goes_to_the_bias_path() {
+        for (site, dims) in [
+            // siglip.rs:512-518 — CausalMasker::expand_mask -> [bs, 1, q, k].
+            // PAD patches of a variable-resolution image batch.
+            ("siglip expand_mask", &[4usize, 1, 64, 64][..]),
+            // idefics3/vision.rs:484-505 — expand_mask, then broadcast to
+            // [bs, num_heads, q, k].
+            ("idefics3 expand_mask", &[4, 16, 64, 64][..]),
+            // A single image still has PAD patches inside a fixed patch grid,
+            // so bs == 1 must divert too. `dims[0] > 1` would miss this.
+            ("siglip, batch of one", &[1, 1, 64, 64][..]),
+            // conformer/encoder.rs:93-101 — T5 relative attention bias, a
+            // LEARNED additive logit bias, passed on EVERY forward
+            // (encoder.rs:641-648), not just when padding exists.
+            ("conformer relative bias", &[1, 8, 100, 100][..]),
+            // mllama/vision.rs:650-662 — aspect-ratio padding mask. Rank 3 when
+            // bs == 1 (no unsqueeze), rank 4 otherwise. A rank-4-only predicate
+            // would miss the first of these.
+            ("mllama, bs == 1", &[1, 1601, 1601][..]),
+            ("mllama, bs > 1", &[2, 1, 1601, 1601][..]),
+            // layers_masker.rs:221-256 — make_left_padded_causal_mask, the
+            // ragged decode mask (PR #122's case). Subsumed here.
+            ("ragged decode", &[8, 1, 1, 500][..]),
+        ] {
+            assert!(
+                mask_must_be_applied_as_bias(Some(dims)),
+                "{site}: mask {dims:?} carries information no flash kernel can \
+                 express, so it must not reach the flash path"
+            );
+        }
     }
 
-    /// Everything that works today must be untouched. Each of these would be a
-    /// behaviour change if the predicate fired, and two of them (the `[1, 1]`
-    /// placeholder and the rank-2 causal mask) would push a working prefill
-    /// onto non-flash SDPA.
+    /// Everything that must STAY on flash. Diverting any of these would be an
+    /// unmeasured throughput regression for no correctness gain.
+    ///
+    /// Mutation check (run 2026-08-18): relax the predicate to `Some(_) => true`
+    /// and this fires — that over-wide version is the one I rejected, because it
+    /// moves Gemma-3 text off flash to fix a bug in a different model.
     #[test]
     fn nothing_that_works_today_is_diverted() {
-        // Uniform decode: no mask at all.
-        assert!(!mask_must_be_applied_as_bias(1, None));
-        // The flash placeholder `Tensor::zeros((1, 1))` from `layers_masker`.
-        assert!(!mask_must_be_applied_as_bias(4, Some(&[1, 1])));
-        assert!(!mask_must_be_applied_as_bias(1, Some(&[1, 1])));
-        // Ordinary rank-2 causal mask.
-        assert!(!mask_must_be_applied_as_bias(7, Some(&[7, 7])));
-        // Vision-encoder padding masks: 4-D and batched, but prefill-shaped.
-        // Dropped on the flash path today; deliberately out of this predicate's
-        // scope so this change cannot move every encoder off flash at once.
-        assert!(!mask_must_be_applied_as_bias(64, Some(&[4, 1, 64, 64])));
-        // A batch of ONE cannot be ragged — nothing to mask per row.
-        assert!(!mask_must_be_applied_as_bias(1, Some(&[1, 1, 1, 500])));
+        // Uniform decode / a genuinely bidirectional encoder: no mask at all.
+        assert!(!mask_must_be_applied_as_bias(None));
+        // The `Tensor::zeros((1, 1))` sentinel `layers_masker` returns *because*
+        // flash applies causality itself. It carries no information.
+        assert!(!mask_must_be_applied_as_bias(Some(&[1, 1])));
+        // gemma3/text.rs:591 — a real rank-2 causal / SWA bias. Redundant on
+        // flash: causality comes from the `causal` flag and the window from
+        // `sdpa_params.sliding_window`, which gemma3 sets per layer.
+        assert!(!mask_must_be_applied_as_bias(Some(&[7, 7])));
+        assert!(!mask_must_be_applied_as_bias(Some(&[512, 512])));
+    }
+
+    /// The documented limit, pinned so it cannot be forgotten: a rank-2 CHUNKED
+    /// mask (`make_chunked_mask_matrix`, used by `llama4/text.rs:694`) is also
+    /// inexpressible on flash, and this predicate deliberately does NOT divert
+    /// it — that fix needs a measured throughput number first.
+    ///
+    /// If this assertion ever flips, the limit has been closed and the doc
+    /// comment's "Honest limit" section must go with it.
+    #[test]
+    fn the_chunked_rank2_mask_is_a_known_and_deliberate_gap() {
+        assert!(
+            !mask_must_be_applied_as_bias(Some(&[512, 512])),
+            "llama4's chunked mask is rank 2 and is still dropped on flash — \
+             documented, filed, not silently fixed"
+        );
+    }
+
+    /// This predicate must be at least as strict as the one it supersedes on
+    /// `feat/dense-ragged-decode` (PR #122): `seq_len == 1 && rank 4 &&
+    /// dims[0] > 1`. Anything that one diverts, this one must divert.
+    #[test]
+    fn supersedes_the_pr122_predicate() {
+        fn pr122(seq_len: usize, mask_dims: Option<&[usize]>) -> bool {
+            match mask_dims {
+                Some(dims) => seq_len == 1 && dims.len() == 4 && dims[0] > 1,
+                None => false,
+            }
+        }
+        for dims in [
+            &[8usize, 1, 1, 500][..],
+            &[2, 1, 1, 6][..],
+            &[1, 1][..],
+            &[7, 7][..],
+            &[4, 1, 64, 64][..],
+            &[1, 1, 1, 500][..],
+        ] {
+            if pr122(1, Some(dims)) {
+                assert!(
+                    mask_must_be_applied_as_bias(Some(dims)),
+                    "{dims:?}: PR #122 diverts this; the wider predicate must too"
+                );
+            }
+        }
+        // And it is STRICTLY wider — at least one input differs, or the two
+        // would be the same predicate and this fix would be a no-op.
+        let vision = &[4usize, 1, 64, 64][..];
+        assert!(
+            !pr122(64, Some(vision)),
+            "sanity: PR #122 leaves this on flash"
+        );
+        assert!(
+            mask_must_be_applied_as_bias(Some(vision)),
+            "the vision padding mask is exactly what widening buys"
+        );
     }
 }

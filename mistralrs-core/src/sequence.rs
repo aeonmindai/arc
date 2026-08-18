@@ -1020,6 +1020,31 @@ impl Sequence {
         self.responder.clone()
     }
 
+    /// Has this sequence's client gone away?
+    ///
+    /// `true` once the matching `Receiver` has been dropped or closed — which
+    /// is what happens when the HTTP handler's future is aborted on a client
+    /// disconnect, timeout, or cancel.
+    ///
+    /// # Why this has to be polled rather than discovered on send
+    ///
+    /// The engine used to learn about a departed client only by *failing to
+    /// send to it*: `sampling.rs` cancels a sequence when
+    /// `maybe_send_streaming_response` returns `Err`. That covers streaming and
+    /// nothing else — `maybe_send_streaming_response` returns `Ok(())` without
+    /// sending at all when `is_streaming` is false (`sequence.rs`, both arms are
+    /// gated on it). A **non-streaming** request sends nothing until it is
+    /// finished, so its client can vanish at token 1 and the engine will keep
+    /// decoding to `max_tokens`, holding a scheduler slot and its KV the whole
+    /// way, and emitting no warning: the only "disconnected" warning in the tree
+    /// (`utils::send_response_or_log`) is on the error path.
+    ///
+    /// `Sender::is_closed` is a relaxed atomic load — cheap enough to check
+    /// every scheduling pass.
+    pub fn client_is_gone(&self) -> bool {
+        self.responder.is_closed()
+    }
+
     pub fn creation_time(&self) -> u64 {
         self.creation_time
     }
