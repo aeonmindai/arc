@@ -87,13 +87,27 @@ impl Engine {
                 .as_ref()
                 .is_some_and(|ch_t| ch_t.has_chat_template())
         {
+            // Name the model and what is actually missing. The old message said
+            // only "a model which does not have a chat template", which forced
+            // the reader to work out WHICH model and WHERE the template should
+            // have come from -- and it cost a chain a session.
+            let model_name = get_mut_arcmutex!(self.pipeline).name();
             request
-                    .response
-                    .send(Response::ValidationError(
-                        "Received messages for a model which does not have a chat template. Either use a different model or pass a single string as the prompt".into(),
-                    ))
-                    .await
-                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
+                .response
+                .send(Response::ValidationError(
+                    format!(
+                        "Model `{model_name}` has no chat template, so it cannot serve \
+                         `/v1/chat/completions` (messages). The checkpoint supplied no \
+                         `chat_template` field in `tokenizer_config.json`, no \
+                         `chat_template.json`, and no processor config template. \
+                         Either pass one explicitly (`--chat-template <file.jinja>` or \
+                         `--jinja-explicit`), or call `/v1/completions` with a single \
+                         `prompt` string instead of `messages`."
+                    )
+                    .into(),
+                ))
+                .await
+                .unwrap_or_else(|_| warn!("Receiver disconnected"));
             return;
         }
 

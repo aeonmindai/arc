@@ -7,11 +7,10 @@ use candle_core::Device;
 use mistralrs_core::{
     get_auto_device_map_params, get_model_dtype, get_tgt_non_granular_index, paged_attn_supported,
     parse_isq_value, set_mtp_load_depth, try_wrap_pipeline_with_mtp, AutoDeviceMapParams,
-    DefaultSchedulerMethod,
-    DeviceLayerMapMetadata, DeviceMapMetadata, DeviceMapSetting, Loader, LoaderBuilder,
-    McpClientConfig, MemoryGpuConfig, MistralRsBuilder, ModelLoaderConfig, ModelSelected,
-    PagedAttentionConfig, PagedCacheType, SchedulerConfig, SearchCallback, SearchEmbeddingModel,
-    TokenSource,
+    DefaultSchedulerMethod, DeviceLayerMapMetadata, DeviceMapMetadata, DeviceMapSetting, Loader,
+    LoaderBuilder, McpClientConfig, MemoryGpuConfig, MistralRsBuilder, ModelLoaderConfig,
+    ModelSelected, PagedAttentionConfig, PagedCacheType, SchedulerConfig, SearchCallback,
+    SearchEmbeddingModel, TokenSource,
 };
 use tracing::{info, warn};
 

@@ -531,6 +531,21 @@ pub(crate) fn get_chat_template(
         return template;
     };
 
+    // Loud at startup beats loud per-request: whether a checkpoint ships a chat
+    // template is a static property, and a server that will reject every
+    // `/v1/chat/completions` request should say so once, at load, rather than
+    // only when a customer's first request arrives. This is deliberately a
+    // WARNING and not a hard failure: a template-less checkpoint is still
+    // perfectly serveable via `/v1/completions` with a raw prompt string, so
+    // refusing to start would break a legitimate deployment.
+    warn!(
+        "NO CHAT TEMPLATE. This model will REJECT every `/v1/chat/completions` \
+         request (messages) with a 422. Checked: `chat_template` in \
+         `tokenizer_config.json`, `chat_template.json`, processor config, and \
+         any explicit override. `/v1/completions` with a single `prompt` string \
+         still works. To enable chat, pass `--chat-template <file.jinja>`."
+    );
+
     match &template.chat_template {
         Some(_) => template,
         None => {
