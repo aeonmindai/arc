@@ -99,6 +99,12 @@ class Row:
         self.t_start = self.t_first = self.t_end = None
         self.tokens = 0
         self.error = None
+        # `stop` = the model chose to end. `length` = it hit max_tokens.
+        # Anything else, or None, = it was cut. Token counts ALONE cannot tell
+        # these apart, and they support opposite conclusions -- a short row is
+        # either normal sampling or a correctness bug. Not recording this cost a
+        # follow-up GPU run to answer a question the log should have carried.
+        self.finish_reason = None
 
 
 def stream_one(port: int, row: Row, max_tokens: int, timeout: int):
@@ -153,6 +159,8 @@ def stream_one(port: int, row: Row, max_tokens: int, timeout: int):
                         if row.t_first is None:
                             row.t_first = time.time()
                         row.tokens += 1
+                    if choice.get("finish_reason"):
+                        row.finish_reason = choice["finish_reason"]
     except Exception as exc:  # noqa: BLE001 - a dead row is itself a datum
         row.error = f"{type(exc).__name__}: {exc}"
     row.t_end = time.time()
@@ -218,6 +226,14 @@ def sweep_one(args, batch: int, log_offset: int):
         "rows_failed": [f"row{r.idx}: {r.error}" for r in rows if r.error]
         + [f"row{r.idx}: returned 0 tokens with no error" for r in rows if not r.error and r.tokens == 0],
         "tokens_per_row": [r.tokens for r in rows],
+        # Only rows that did NOT run to max_tokens are listed -- a wall of
+        # "length" carries no information, but a `stop` next to a short count
+        # says the model ended it, and a `null` says it was cut.
+        "short_rows": {
+            str(r.idx): {"tokens": r.tokens, "finish_reason": r.finish_reason}
+            for r in rows
+            if r.tokens < args.tokens
+        },
         "tokens_exact": sorted(set(r.tokens for r in ok)) == [args.tokens],
         "total_tokens": total_tokens,
         "aggregate_tok_s": round(aggregate, 2),
