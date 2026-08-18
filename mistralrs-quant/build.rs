@@ -49,10 +49,15 @@ fn main() -> Result<(), String> {
     println!("cargo::rustc-check-cfg=cfg(has_qtip_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_mxfp4_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_mxfp4_wmma_kernels)");
-    // SageAttention SM89/SM90/SM100 INT8 + FP8 kernels (vendored from
-    // SageAttention upstream). When the compiled GPU compute cap is high
-    // enough, the kernels are linked in; otherwise the Rust side falls back
-    // to the software path.
+    // ⚠ SageAttention SM89/SM90/SM100: these three cfgs are emitted but the
+    // kernels they name are NOT built and the cfgs are NOT read anywhere.
+    // `src/sage_cuda/kernels/` sits outside this crate's `kernels/*/*.cu` glob
+    // and is additionally excluded below; the second `KernelBuilder` the
+    // comment here used to promise does not exist, `src/sage_cuda/` contains no
+    // Rust at all, and no `#[cfg(has_sage_sm...)]` appears in any source file.
+    // Kept only so the arch matrix reads honestly: raising the compute cap
+    // currently changes nothing about SageAttention. Removing the dead path is
+    // tracked separately — do not read these as arch support.
     println!("cargo::rustc-check-cfg=cfg(has_sage_sm89_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_sage_sm90_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_sage_sm100_kernels)");
@@ -81,6 +86,20 @@ fn main() -> Result<(), String> {
 
         let build_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
+        // ArcTarget (D16): which architectures this archive is built for.
+        //
+        // cudaforge derives exactly ONE `-gencode` from `CUDA_COMPUTE_CAP` or
+        // the build box's `nvidia-smi`, so left alone this crate ships SASS for
+        // whatever card happened to be in the machine. `ARC_CUDA_ARCHS`
+        // (e.g. `80,90,100,103`) makes the arch list authoritative instead:
+        // the first target becomes cudaforge's, the rest are appended, and the
+        // produced archive is verified with `cuobjdump` below. Unset keeps the
+        // old single-arch autodetect, because each extra architecture is a full
+        // recompile of every `.cu` and that is not worth paying on a rental
+        // that only ever runs one card.
+        let requested_archs = arc_target::build::requested_archs()
+            .unwrap_or_else(|e| panic!("ArcTarget: invalid ARC_CUDA_ARCHS: {e}"));
+
         let mut builder = cudaforge::KernelBuilder::new()
             .source_glob("kernels/*/*.cu")
             .out_dir(build_dir.clone())
@@ -97,7 +116,23 @@ fn main() -> Result<(), String> {
             .arg("--compiler-options")
             .arg("-fPIC");
 
-        let compute_cap = builder.get_compute_cap().unwrap_or(80);
+        if let Some(archs) = &requested_archs {
+            let (primary, extra) = arc_target::build::split_primary(archs)
+                .unwrap_or_else(|e| panic!("ArcTarget: {e}"));
+            builder = builder.compute_cap_arch(&primary);
+            for gencode in extra {
+                builder = builder.arg(&gencode);
+            }
+        }
+
+        // The cfg gates below say "kernels for this capability exist in the
+        // archive", so with an explicit arch list they follow the HIGHEST
+        // architecture built, not the build box's card. Without one they follow
+        // the single autodetected target, as before.
+        let compute_cap = match &requested_archs {
+            Some(archs) => archs.iter().map(|a| a.cc()).max().unwrap_or(80) as usize,
+            None => builder.get_compute_cap().unwrap_or(80),
+        };
         // ======== Handle optional kernel compilation via rustc-cfg flags
         let cc_over_80 = compute_cap >= 80;
         let cc_over_89 = compute_cap >= 89;
@@ -160,8 +195,14 @@ fn main() -> Result<(), String> {
             build_dir.join("libmistralrsquant.a")
         };
         builder
-            .build_lib(out_file)
+            .build_lib(&out_file)
             .expect("Build mistral quant lib failed!");
+        // ArcTarget: prove the cubins exist. nvcc exiting 0 does not mean the
+        // architectures were emitted — on 2026-08-17 a request for 90,100,103
+        // compiled clean and produced an sm_90a-only archive. This fails the
+        // build instead, and records what was actually observed for the
+        // runtime dispatch to check the device against.
+        arc_target::build::verify_and_export(&out_file, requested_archs.as_deref());
         println!("cargo:rustc-link-search={}", build_dir.display());
         println!("cargo:rustc-link-lib=mistralrsquant");
         println!("cargo:rustc-link-lib=dylib=cudart");

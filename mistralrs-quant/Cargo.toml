@@ -13,6 +13,7 @@ license.workspace = true
 homepage.workspace = true
 
 [dependencies]
+arc-target.workspace = true
 candle-core.workspace = true
 candle-nn.workspace = true
 half.workspace = true
@@ -73,3 +74,6 @@ cuda-13000 = []
 
 [build-dependencies]
 cudaforge = { workspace = true, optional = true }
+# Not optional: the arch matrix and its verification must exist even when the
+# `cuda` feature is off, so a non-CUDA build cannot silently skip the gate.
+arc-target.workspace = true

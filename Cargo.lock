@@ -217,6 +217,7 @@ name = "arc-cuda-graph"
 version = "0.7.1-alpha.1"
 dependencies = [
  "anyhow",
+ "arc-target",
  "candle-core",
  "cudaforge",
  "float8",
@@ -251,6 +252,10 @@ dependencies = [
  "serde_json",
  "tracing",
 ]
+
+[[package]]
+name = "arc-target"
+version = "0.7.1-alpha.1"
 
 [[package]]
 name = "arc-turbo"
@@ -3826,6 +3831,7 @@ dependencies = [
 name = "mistralrs-quant"
 version = "0.7.1-alpha.1"
 dependencies = [
+ "arc-target",
  "byteorder",
  "candle-core",
  "candle-metal-kernels",

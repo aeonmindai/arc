@@ -1,0 +1,15 @@
+[package]
+name = "arc-target"
+version.workspace = true
+edition.workspace = true
+description = "ArcTarget: the GPU architecture matrix Arc builds for and dispatches on."
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+
+# Deliberately dependency-free: this crate is used as a `[build-dependencies]`
+# entry by every CUDA-compiling crate in the workspace AND as a normal
+# dependency by the runtime dispatch, so a dependency here would be paid twice
+# and would have to build on a GPU-less release runner.
+[dependencies]

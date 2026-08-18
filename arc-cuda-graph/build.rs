@@ -19,6 +19,14 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/cuda/flashmlasparse/indexer_score.cu");
     println!("cargo:rerun-if-changed=src/cuda/flashmlasparse/topk_radix.cu");
 
+    // ArcTarget (D16): this crate had no architecture handling at all, while
+    // `src/cuda/sampling_kernel.cu` names sm_89 / sm_90 / sm_100 as its
+    // targets — so the file claimed three architectures and the build produced
+    // one. `ARC_CUDA_ARCHS` makes the list authoritative and the archive is
+    // verified against it after the build.
+    let requested_archs = arc_target::build::requested_archs()
+        .unwrap_or_else(|e| panic!("ArcTarget: invalid ARC_CUDA_ARCHS: {e}"));
+
     let mut builder = cudaforge::KernelBuilder::new()
         .source_glob("src/cuda/*.cu")
         .source_glob("src/cuda/flashmlasparse/*.cu")
@@ -34,6 +42,15 @@ fn main() -> Result<()> {
         .arg("--compiler-options")
         .arg("-fPIC");
 
+    if let Some(archs) = &requested_archs {
+        let (primary, extra) =
+            arc_target::build::split_primary(archs).unwrap_or_else(|e| panic!("ArcTarget: {e}"));
+        builder = builder.compute_cap_arch(&primary);
+        for gencode in extra {
+            builder = builder.arg(&gencode);
+        }
+    }
+
     if let Some(cuda_nvcc_flags_env) = CUDA_NVCC_FLAGS {
         builder = builder.arg("--compiler-options");
         builder = builder.arg(cuda_nvcc_flags_env);
@@ -47,8 +64,9 @@ fn main() -> Result<()> {
         build_dir.join("libarccudagraph.a")
     };
     builder
-        .build_lib(out_file)
+        .build_lib(&out_file)
         .expect("Build arc-cuda-graph kernels failed!");
+    arc_target::build::verify_and_export(&out_file, requested_archs.as_deref());
 
     println!("cargo:rustc-link-search={}", build_dir.display());
     println!("cargo:rustc-link-lib=arccudagraph");

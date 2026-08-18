@@ -16,6 +16,9 @@ use pertensor_fp8::pertensor_fp8_linear_b;
 mod metal_kernels;
 
 mod afq;
+/// ArcTarget: which GPU architecture this binary was built for, and which one
+/// it is running on.
+pub mod arc_target;
 mod bitsandbytes;
 mod blockwise_fp8;
 pub mod calibration;
