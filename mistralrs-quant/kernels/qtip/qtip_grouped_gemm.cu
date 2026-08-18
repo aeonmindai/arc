@@ -117,6 +117,28 @@
 // is itself evidence the win is ops-per-decoded-weight and not tiling or
 // bandwidth. Handicap vs the GEMV: 1.76x -> 1.12x.
 //
+// `variant=2` adds one `ldmatrix.x4` in place of the four `LDS.32` A-fragment
+// loads (and an explicit packed convert that turns out to be a no-op, above).
+// MEASURED the same way: **+3.27% / +3.25% over variant 1**, +41.6% / +41.3%
+// cumulative over the baseline, bit-identical throughout.
+//
+// ✅ THE COST MODEL IS NOW CONFIRMED IN BOTH DIRECTIONS by per-thread SASS
+// instruction counts (total 896 -> 696 -> 672 for v0/v1/v2):
+//   v1->v2: instructions -3.4%, measured time -3.3% — with the bank conflicts
+//           gone, time tracks instruction count nearly 1:1, so the kernel is
+//           genuinely instruction-issue-bound.
+//   v0->v1: instructions -22.3%, measured time -39.4%. The EXCESS over the
+//           instruction cut is the bank conflicts, which burn cycles without
+//           burning instructions — an independent confirmation of the Phase 1
+//           mechanism. (BREV 32 -> 5 confirms the reversal amortization.)
+//
+// ⏭️ NEXT LEVER, with evidence rather than a guess: IMAD = 115 per thread
+// iteration in variant 2, but only ~32 are the codeword's `state * mult`. The
+// other ~83 — 12% of all remaining instructions — are shared-memory ADDRESS
+// ARITHMETIC recomputed inside the kf/f loops. Hoisting the row base pointers
+// out and walking them with immediate offsets is the largest identified item
+// left, bigger than anything variant 2 touched.
+//
 //   1. s_x row stride 64 -> QG_X_STRIDE elements (128 -> 144 B). At a 128 B
 //      stride the bank index (byte/4)%32 = (g*32 + ...)%32 is INDEPENDENT of
 //      the mma row g = lane>>2, so all eight g-values collide: every A-fragment
@@ -264,6 +286,14 @@ __device__ __forceinline__ uint32_t q2b_pack2<__half>(float lo, float hi) {
 // to report a timing unless variant 2's output is byte-for-byte equal to the
 // baseline's, over millions of output bytes, with the grouped launch counters
 // proving both kernels actually ran. Believe the artefact.
+//
+// 🔴 AND THE ARTEFACT SAYS THIS ONE BOUGHT NOTHING. `cuobjdump -sass` gives
+// F2FP = 24 in variants 0, 1 AND 2 alike: **nvcc was already fusing the two
+// scalar converts + shift + or into one `F2FP.PACK_AB`.** The explicit vector
+// convert is kept because it states the intent and cannot regress if the
+// compiler's pattern match changes, but it is worth ZERO instructions today.
+// The prediction that it would save ~1.5 ops/weight was made by costing C++
+// source as though it mapped 1:1 to SASS. Disassemble first, then predict.
 template <typename T>
 __device__ __forceinline__ uint32_t q2b_pack2_fast(float lo, float hi);
 
