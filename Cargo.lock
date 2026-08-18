@@ -243,6 +243,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-profiler"
+version = "0.7.1-alpha.1"
+dependencies = [
+ "candle-core",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "arc-turbo"
 version = "0.7.1-alpha.1"
 dependencies = [
@@ -3643,6 +3653,7 @@ dependencies = [
  "anyhow",
  "apodize",
  "arc-cuda-graph",
+ "arc-profiler",
  "arc-turbo",
  "as-any",
  "async-trait",

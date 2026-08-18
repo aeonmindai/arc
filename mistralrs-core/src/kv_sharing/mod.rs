@@ -1,8 +1,11 @@
 //! Radix-tree KV sharing.
 //!
+//! **Parent system: ArcInfer/ArcKV — this module is `ArcKV/Share`**
+//! (see `memory/mission/TAXONOMY.md`). That is the product name this doc
+//! previously said was "deliberately not decided here"; it is decided now.
+//!
 //! Replaces Arc's linear-scan prefix cache with a radix tree, and adds three
-//! things the reference implementation does not have. Internal name only —
-//! the public/product name is deliberately not decided here.
+//! things the reference implementation does not have.
 //!
 //! # Layout
 //!

@@ -12,8 +12,13 @@ arithmetic, find the source, and tell a measurement from a projection.
 |---|---|
 | [QUANTIZATION_PERFORMANCE.md](QUANTIZATION_PERFORMANCE.md) | Where the trellis bake's time goes, what was optimized, the measured architectural ceiling, and the four predictions that failed |
 | [HARDWARE_LESSONS.md](HARDWARE_LESSONS.md) | What it costs to run this on rented GPUs: driver/toolkit gates, bad-box detection, the `cudnn` regression, thread policy, and the bake OOM |
-| [TESTING_DISCIPLINE.md](TESTING_DISCIPLINE.md) | Seven tests found passing while verifying nothing, the mechanism of each, and the practices adopted in response |
+| [TESTING_DISCIPLINE.md](TESTING_DISCIPLINE.md) | Seven tests found passing while verifying nothing, the mechanism of each, and the practices adopted in response — this is the charter of the **ArcGate** system |
 | [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) | What is deferred and why, and the honest list of what has not been measured |
+
+Arc's subsystems are organised under named parent systems (ArcInfer, ArcQuant,
+ArcKernels, ArcGate, …). The full tree, including what is shipped versus planned
+versus nonexistent, is in
+[`memory/mission/TAXONOMY.md`](../../memory/mission/TAXONOMY.md).
 
 ## Evidence grades
 

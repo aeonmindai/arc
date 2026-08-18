@@ -70,8 +70,9 @@ pub fn fwht_inplace(data: &mut [f32]) {
 
 /// Apply the full TurboQuant rotation: D·H·D (sign flip, Hadamard, sign flip).
 ///
-/// This transforms arbitrary input vectors into vectors whose coordinates
-/// follow Beta(d/2, d/2), enabling optimal scalar quantization.
+/// This transforms arbitrary input vectors into vectors whose coordinates follow
+/// the `S^{d-1}` coordinate marginal — density `∝ (1 - x²)^((d-3)/2)` on [-1, 1],
+/// i.e. `(x+1)/2 ~ Beta((d-1)/2, (d-1)/2)` — enabling optimal scalar quantization.
 ///
 /// `signs` should be generated once via `generate_signs()` and reused.
 pub fn rotate_forward(data: &mut [f32], signs: &[f32]) {
