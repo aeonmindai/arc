@@ -87,8 +87,8 @@ use std::time::Instant;
 
 use device::{DeviceTimer, EventHandle, NullTimer};
 pub use report::{
-    Geometry, Node, NodeKind, Overhead, Profile, Reconciliation, RunHeader, Totals, Unreachable,
-    Violation, SCHEMA,
+    Ambiguity, Geometry, Node, NodeKind, Overhead, Profile, Reconciliation, RunHeader, Totals,
+    Unreachable, Verdict, Violation, SCHEMA,
 };
 use tree::{Registry, NO_PARENT};
 
@@ -901,6 +901,28 @@ pub fn snapshot() -> Profile {
         },
     };
     profile.reconciliation.violations = profile.recheck(RECONCILE_TOLERANCE_PCT);
+
+    // Tell the reader the name-collision hazard exists BEFORE they write a name
+    // match, not after they publish the zero it returns. Prefill and decode are
+    // separate subtrees by design, so most names below the split appear twice,
+    // and the prefill copy is registered first — with `calls == 0` in a
+    // decode-only window.
+    let dupes = profile.duplicate_names();
+    if !dupes.is_empty() {
+        let worst: Vec<String> = dupes
+            .iter()
+            .take(3)
+            .map(|(name, paths)| format!("{name} x{}", paths.len()))
+            .collect();
+        profile.run.notes.push(format!(
+            "{} span names appear on more than one node ({}{}) — prefill and decode are \
+             separate subtrees. Select by path or by `branch`; matching on `name` returns the \
+             first registration, which is the prefill copy. See `Profile::resolve_in`.",
+            dupes.len(),
+            worst.join(", "),
+            if dupes.len() > 3 { ", ..." } else { "" }
+        ));
+    }
     profile
 }
 

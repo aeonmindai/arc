@@ -213,6 +213,27 @@ impl PrefixCacheManagerV2 {
             self.caches.observe_prefill(toks, elapsed_ns);
         }
 
+        // 🔑 THE READER THAT WOULD BE POISONED. A sequence that was part of a
+        // front-aligned ragged cohort still carries its zero-filled dead prefix
+        // until the next `clone_in_cache` strips it — and for a sequence that
+        // has just FINISHED there is no next `clone_in_cache`. Storing it here
+        // would put padding into the prefix cache and hand it to every future
+        // request that matches this prefix, which is a wrong answer that
+        // outlives the request that produced it.
+        //
+        // `clone_out_cache` deliberately defers the strip (it runs per token,
+        // for data only re-read on a membership change), so the deferral is
+        // paid here instead — at the read, where it is one sequence rather than
+        // `O(B x layers)` per step. A no-op for every non-ragged sequence.
+        if let Err(e) = crate::kv_cache::strip_pending_lead_pad(seq, false) {
+            tracing::warn!(
+                "prefix cache: refusing to store sequence {} — could not drop its ragged \
+                 dead prefix ({e}). Storing it would cache zero-filled K/V as content.",
+                seq.id()
+            );
+            return;
+        }
+
         let cache = seq.normal_cache().to_vec();
 
         // Key the entry by the token prefix the cache ACTUALLY covers.
@@ -615,6 +636,46 @@ mod tests {
             cache.push(Some(preallocated_slot(512, cache_len, 128, dtype)));
         }
         seq
+    }
+
+    /// 🔑 A sequence that finished out of a front-aligned RAGGED cohort must not
+    /// put its zero-filled dead prefix into the prefix cache.
+    ///
+    /// `clone_out_cache` defers the strip — it runs per token, for data only
+    /// re-read on a membership change — and a sequence that has just FINISHED
+    /// never gets that membership change. So without the strip at this reader,
+    /// the padding is stored and handed to every future request matching this
+    /// prefix: a wrong answer that outlives the request that produced it, and
+    /// one `--prefix-cache-n 0` hides completely.
+    ///
+    /// Pre-fix this stores `cache_len` positions of which the first `lead` are
+    /// zeros, and the entry is keyed as if all of them were real.
+    #[test]
+    fn a_finished_ragged_sequence_does_not_poison_the_prefix_cache() {
+        let mut m = PrefixCacheManagerV2::new(16, false, false);
+        let base: Vec<u32> = (0..64).collect();
+        let mut seq = seq_with(base.clone(), base.len(), 4, DType::BF16);
+
+        // The sequence was row 1 of a cohort front-aligned to 64: 4 dead
+        // columns at the front, 60 real positions behind them.
+        crate::kv_cache::test_support::set_pending_lead_pad(*seq.id(), 4);
+
+        m.add_sequence(&mut seq, None);
+
+        for layer in seq.normal_cache().iter().flatten() {
+            assert_eq!(
+                layer.current_seq_len(),
+                60,
+                "the dead prefix must be dropped before the cache is read, leaving the \
+                 row's 60 REAL positions — storing 64 would cache 4 zero-filled K/V rows \
+                 as content"
+            );
+        }
+        assert_eq!(
+            m.share_stats().entries,
+            1,
+            "and it must still be stored, just correctly"
+        );
     }
 
     /// End to end through the real manager: store a finished sequence, then

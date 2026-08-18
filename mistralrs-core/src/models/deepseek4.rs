@@ -1542,6 +1542,7 @@ impl Attention {
             compress_ratio: self.compress_ratio,
             sliding_window: self.sliding_window,
             raw_prefix: 0,
+            row_q0: None,
         };
         // Faithful V4: the compressed (distant-context) KV, with compress-θ
         // RoPE at the strided compressed positions. `dsv4_attention` runs a
@@ -1700,6 +1701,14 @@ impl Attention {
                     &self.sdpa_params,
                     super::dsv4_attention::Dsv4AttentionConfig {
                         raw_prefix,
+                        // The dense path is the only one whose K/V rows are a
+                        // left-aligned ragged cohort (`front_pad_kv_cache`).
+                        // PagedAttention keeps per-request block tables, and
+                        // the graph-decode arm reads a FIXED window whose
+                        // columns are device slots, not absolute positions —
+                        // neither can be masked from `seqlen_offsets`, so both
+                        // keep `row_q0: None` and behave exactly as before.
+                        row_q0: ragged_row_q0(seqlen_offsets),
                         ..dsv4_cfg
                     },
                 )?
@@ -2465,6 +2474,40 @@ fn append_graph_kv_mqa(
 ///
 /// Resolved once: `deepseek4` used to scan the environment per timer call and
 /// paid ~390 `getenv`s per forward for it (wave33).
+/// The per-row absolute query positions [`super::dsv4_attention`] needs when
+/// the dense batch is a **left-aligned ragged** cohort, or `None` when it is
+/// not — which is every request today, because the flag defaults off.
+///
+/// `seqlen_offsets[i]` is already row `i`'s own past length: the engine threads
+/// it to every attention call so RoPE places the row's queries at their true
+/// absolute positions. That makes it exactly the `q0` V4's *compressed* branch
+/// needs and the `lead` its dead prefix needs, so no new value is plumbed —
+/// what changes is that `dsv4_attention` stops collapsing the vector to the
+/// single position it inferred from the cache width.
+///
+/// Gated on `ARC_MTP_PER_SEQ_KV` rather than on a flag of its own:
+/// [`crate::kv_cache::front_align_batch`] is the only producer of a ragged
+/// dense batch and it runs exclusively under `KvAdvance::PerSequence`, which
+/// that flag authorizes. With it off no batch is ever left-aligned, so the
+/// offsets would be uniform and `dsv4_attention` would take its scalar path
+/// anyway — the gate makes that a guarantee instead of a coincidence.
+///
+/// Resolved once, for the reason [`v4_fp8_kv_enabled`] documents: this is on
+/// the per-layer path, and a `getenv` per layer per step is ~43 per forward.
+fn ragged_row_q0(seqlen_offsets: &[usize]) -> Option<&[usize]> {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(crate::pipeline::mtp_pipeline::per_sequence_kv_requested);
+    ragged_row_q0_from(enabled, seqlen_offsets)
+}
+
+/// The decision itself, separated from the process-wide [`OnceLock`] so it can
+/// be tested against both settings rather than against whatever the test
+/// runner's environment happened to be (`ragged_row_q0_is_opt_in`). Same shape
+/// as [`fp8_kv_enabled_from`], for the same reason.
+fn ragged_row_q0_from(enabled: bool, seqlen_offsets: &[usize]) -> Option<&[usize]> {
+    enabled.then_some(seqlen_offsets)
+}
+
 fn v4_fp8_kv_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -3376,22 +3419,46 @@ impl MtpBlock {
         cache: &mut KvCache,
         input_ids: &Tensor,
     ) -> Result<Tensor> {
-        let cached = cache.current_seq_len();
-        if cached != start_pos {
-            candle_core::bail!(
-                "MTP draft KV desync: cache holds {cached} entries but the step starts at \
-                 absolute position {start_pos}. Draft-KV slot k must be absolute position k \
-                 (see MtpBlock::new_draft_cache)."
-            );
-        }
+        self.forward_tokens_rows(fused, &[start_pos], cache, input_ids)
+    }
+
+    /// [`Self::forward_tokens`] for a batch whose rows sit at **different**
+    /// absolute positions.
+    ///
+    /// `start_pos` is one position per row, or a single shared one. The draft
+    /// KV must already be a **left-aligned** cohort — every row's live run
+    /// shifted to end at `max(start_pos)`, which is exactly what
+    /// [`crate::kv_cache::front_pad_kv_cache`] produces — so the one shared
+    /// append offset `SingleCache::append` writes at is simultaneously correct
+    /// for all of them.
+    ///
+    /// 🔑 Nothing new is plumbed to make the ragged case correct. `start_pos`
+    /// *is* `seqlen_offsets`, the vector `DecoderLayer::forward` already threads
+    /// to RoPE and (via `ragged_row_q0`) to `dsv4_attention`'s per-row `row_q0`,
+    /// which masks each row's dead prefix. What changed is that this function
+    /// stops collapsing it to one element.
+    ///
+    /// A **single-element** `start_pos` is the pre-change path verbatim: RoPE
+    /// takes its `seqlen_offsets.len() == 1` fast branch rather than the per-row
+    /// loop, and `resolve_ragged_rows` filters a one-element vector that equals
+    /// the batch's end column back to `None`. So the uniform group — every group
+    /// with per-sequence KV advance off — differs from the old code by control
+    /// flow, not by a tolerance.
+    pub fn forward_tokens_rows(
+        &self,
+        fused: &Tensor,
+        start_pos: &[usize],
+        cache: &mut KvCache,
+        input_ids: &Tensor,
+    ) -> Result<Tensor> {
+        draft_step_end_column(start_pos, fused.dim(0)?, cache.current_seq_len())?;
         let in_device = fused.device().clone();
         let xs = fused.to_device(&self.device)?;
         let ids = input_ids.to_device(&self.device)?;
-        let seqlen_offsets = [start_pos];
         let out = self.layer.forward(
             &xs,
             None,
-            &seqlen_offsets,
+            start_pos,
             cache,
             // MTP block is a Standard layer (`COMPRESS_RATIO_NEXTN_LAYER = 0`)
             // — no compressor, no xs history.
@@ -3412,6 +3479,18 @@ impl MtpBlock {
         input_ids: &Tensor,
     ) -> Result<Tensor> {
         self.forward_tokens(fused, pos, cache, input_ids)
+    }
+
+    /// [`Self::forward_step`] for a group whose rows sit at different absolute
+    /// positions — the single-token wrapper over [`Self::forward_tokens_rows`].
+    pub fn forward_step_rows(
+        &self,
+        fused: &Tensor,
+        pos: &[usize],
+        cache: &mut KvCache,
+        input_ids: &Tensor,
+    ) -> Result<Tensor> {
+        self.forward_tokens_rows(fused, pos, cache, input_ids)
     }
 
     /// ISQ handles for the block's quantizable projections: attention
@@ -3441,6 +3520,56 @@ impl MtpBlock {
         }
         tensors
     }
+}
+
+/// The shared end column a draft step's rows must present, or why this group is
+/// not one an MTP-block forward can run.
+///
+/// A dense `KvCache` appends at ONE offset, so a group can only share a forward
+/// when every row's live run ENDS at the same column — which is exactly what
+/// `kv_cache::front_pad_kv_cache` arranges and what makes the batch maximum
+/// `max(start_pos)` the cache's own `current_seq_len`. Each refusal below is a
+/// layout the caller believes in and the cache does not, and guessing would be
+/// a wrong answer nothing downstream catches:
+///
+/// * no positions at all — nothing to place the queries at;
+/// * a vector that is neither `1` nor `b_sz` wide — the caller and the tensor
+///   disagree about how many rows there are, and `seqlen_offsets` would be
+///   indexed past its end or silently applied to the wrong row;
+/// * a cache whose width is not the rows' shared end column — either the group
+///   was never left-aligned, or a row is *ahead* of the buffer it is drafting
+///   into, so its RoPE position and its draft-KV slot mean different things.
+///
+/// Extracted from [`MtpBlock::forward_tokens_rows`] so the three refusals can be
+/// exercised without standing up a 43-layer model — the same reason
+/// `dsv4_attention::resolve_ragged_rows` is a free function.
+pub(crate) fn draft_step_end_column(
+    start_pos: &[usize],
+    b_sz: usize,
+    cached: usize,
+) -> Result<usize> {
+    let Some(&end) = start_pos.iter().max() else {
+        candle_core::bail!(
+            "MTP draft step was given no absolute position at all; it needs one per row (or a \
+             single shared one)."
+        );
+    };
+    if start_pos.len() != 1 && start_pos.len() != b_sz {
+        candle_core::bail!(
+            "MTP draft step: {} absolute position(s) for a batch of {b_sz}. Pass one per row, \
+             or a single shared one.",
+            start_pos.len()
+        );
+    }
+    if cached != end {
+        candle_core::bail!(
+            "MTP draft KV desync: cache holds {cached} entries but the step's rows end at \
+             absolute position {end}. Draft-KV slot k must be absolute position k, and a ragged \
+             group must be left-aligned to its widest row first (see MtpBlock::new_draft_cache \
+             and kv_cache::front_pad_kv_cache)."
+        );
+    }
+    Ok(end)
 }
 
 /// V4 MTP head.
@@ -4056,10 +4185,17 @@ impl DeepSeekV4 {
         // `hc_mult` stream axis (audit finding 5(b), separately owned), so we
         // capture the post-`hc_head`, pre-`norm` `[B, T, hidden]` state — the
         // same tensor in the "pre-norm" sense, one collapse later.
+        //
+        // 🔑 The capture is tagged with `seqlen_offsets` — the WHOLE vector, not
+        // `seqlen_offsets[0]`. Row `i` of this block covers absolute positions
+        // `[seqlen_offsets[i], seqlen_offsets[i] + T)`, so collapsing it to row
+        // 0's offset made every other row's draft-KV extend read the leading
+        // row's idea of where it is. Under the cohort rule the rows agree and
+        // `MtpHiddenCapture::store_rows` folds them straight back to one shared
+        // offset, which is byte-identical to what the collapse produced.
         if let Some(mtp) = &self.mtp_head {
             if mtp.hidden_capture.is_armed() {
-                mtp.hidden_capture
-                    .store(seqlen_offsets.first().copied().unwrap_or(0), &xs);
+                mtp.hidden_capture.store_rows(seqlen_offsets, &xs);
             }
         }
 
@@ -5033,6 +5169,28 @@ mod kv_footprint_tests {
         assert!(
             !fp8_kv_enabled_from(Some("1"), true),
             "ARC_V4_CAPTURE_PROBE must veto it: write_kv_inplace has no U8 arm"
+        );
+    }
+
+    /// The per-row ragged mask is **opt-in**, and off it hands
+    /// `dsv4_attention` nothing at all — not a uniform vector it would have to
+    /// recognise, but `None`, so the scalar path is taken structurally.
+    ///
+    /// Tests [`ragged_row_q0_from`] rather than [`ragged_row_q0`] for the same
+    /// reason `v4_fp8_kv_is_opt_in` does: the latter is a `OnceLock`.
+    #[test]
+    fn ragged_row_q0_is_opt_in() {
+        let offsets = [10usize, 8, 5];
+        assert!(
+            ragged_row_q0_from(false, &offsets).is_none(),
+            "with per-sequence KV advance off no batch is ever left-aligned, so the model must \
+             not be handed per-row positions at all"
+        );
+        assert_eq!(
+            ragged_row_q0_from(true, &offsets),
+            Some(&offsets[..]),
+            "on, the row positions are `seqlen_offsets` verbatim — the value the engine already \
+             threads for RoPE, not a new one"
         );
     }
 
@@ -6070,6 +6228,7 @@ mod tests {
             compress_ratio: CompressRatio::Csa,
             sliding_window: 4,
             raw_prefix: 0,
+            row_q0: None,
         };
 
         // Compressed KV (precomputed by `Attention::compressed_kv` in the real
@@ -6197,6 +6356,7 @@ mod tests {
             compress_ratio: CompressRatio::Standard,
             sliding_window: 1024,
             raw_prefix: 0,
+            row_q0: None,
         };
 
         // Correct: sequence 0 attends over its own 3 keys.
@@ -6340,6 +6500,7 @@ mod tests {
             compress_ratio: CompressRatio::Hca,
             sliding_window: 8,
             raw_prefix: 0,
+            row_q0: None,
         };
 
         // Compressed KV: T_c = t_k / ratio = 1 entry, shape [B, 1, T_c, D].
@@ -6426,6 +6587,7 @@ mod tests {
             compress_ratio: CompressRatio::Standard,
             sliding_window: 4,
             raw_prefix: 0,
+            row_q0: None,
         };
 
         // Standard layers must bypass the compressed branch entirely: even if
@@ -7029,6 +7191,383 @@ mod tests {
         Ok(())
     }
 
+    // ---------------------------------------------------------------------
+    // wave63-CO: per-row `xs` state.
+    //
+    // The claim these execute is the keystone one: a batched compressor cache
+    // whose rows sit at DIFFERENT token counts advances each row exactly as if
+    // that sequence had been run alone. Until this landed, `tokens`/`base` were
+    // one number for the whole batch, so no sequence could advance its
+    // compressed KV independently — the blocker PR #90 §6, PR #92 §5.1 and
+    // wave29-BC §4b each arrived at from a different direction.
+    // ---------------------------------------------------------------------
+
+    /// Assemble one batched `XsRollingCache` from per-sequence ones exactly as
+    /// `NormalCacheManager::clone_in_cache` does: the START-anchored compressed
+    /// buffers are zero-extended to the widest capacity and stacked on dim 0,
+    /// the END-anchored raw windows are **front**-padded to the widest and
+    /// stacked, and the row lengths are the concatenation of the sequences'
+    /// own — not `seqs[0]`'s repeated.
+    fn batch_xs(per_seq: &[XsRollingCache]) -> Result<XsRollingCache> {
+        let width = |t: &Tensor| t.dim(1);
+        let cap = per_seq
+            .iter()
+            .map(|x| width(x.comp.all_data.as_ref().unwrap()))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .unwrap();
+        let w = per_seq
+            .iter()
+            .map(|x| width(x.tail.as_ref().unwrap()))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .unwrap();
+        let pad = |t: &Tensor, to: usize, at_front: bool| -> Result<Tensor> {
+            let have = t.dim(1)?;
+            if have == to {
+                return t.contiguous();
+            }
+            let mut shape = t.dims().to_vec();
+            shape[1] = to;
+            let z = Tensor::zeros(shape, t.dtype(), t.device())?;
+            z.slice_set(&t.contiguous()?, 1, if at_front { to - have } else { 0 })?;
+            Ok(z)
+        };
+        let mut comps = Vec::new();
+        let mut tails = Vec::new();
+        for x in per_seq {
+            comps.push(pad(x.comp.all_data.as_ref().unwrap(), cap, false)?);
+            tails.push(pad(x.tail.as_ref().unwrap(), w, true)?);
+        }
+        let mut out = per_seq[0].clone();
+        out.comp.all_data = Some(Tensor::cat(&comps, 0)?.contiguous()?);
+        out.comp.capacity_seq_len = cap;
+        out.tail = Some(Tensor::cat(&tails, 0)?.contiguous()?);
+        let tokens: Vec<usize> = per_seq.iter().map(|x| x.row_lens().0[0]).collect();
+        let base: Vec<usize> = per_seq.iter().map(|x| x.row_lens().1[0]).collect();
+        out.comp.current_seq_len = tokens.iter().copied().max().unwrap() / out.ratio;
+        out.set_row_lens(tokens, base)?;
+        Ok(out)
+    }
+
+    /// Run `lens.len()` sequences to their own token counts on one stream,
+    /// batch them, advance the batch by `t_new` of each row's OWN next tokens,
+    /// and require every row to equal the same sequence advanced alone.
+    fn ragged_batch_matches_b1(ratio: usize, lens: &[usize], t_new: usize) -> Result<()> {
+        let device = Device::Cpu;
+        let (hidden, head_dim) = (32usize, 16usize);
+        let compressor = rolling_test_compressor(ratio, hidden, head_dim, &device)?;
+        // A DIFFERENT stream per row. Sharing one stream would make every row's
+        // compressed block `j` cover the identical tokens, so a bug that read
+        // or wrote the wrong row would be invisible.
+        let total = lens.iter().copied().max().unwrap() + t_new + 8;
+        let streams = per_row_streams(lens.len(), total, hidden, &device)?;
+
+        let mut refs: Vec<XsRollingCache> = Vec::new();
+        for (i, &l) in lens.iter().enumerate() {
+            let mut s = XsRollingCache::new(ratio, compressor.coff, head_dim, 4096);
+            s.advance(&streams[i].narrow(1, 0, l)?, |w| {
+                compressor.forward_from_xs(w)
+            })?;
+            refs.push(s);
+        }
+        let mut batched = batch_xs(&refs)?;
+        assert_eq!(
+            batched.rows_uniform(),
+            lens.iter().all(|&l| l == lens[0]),
+            "the fixture must exercise the path it claims to"
+        );
+
+        // Row `i` gets ITS OWN next tokens, which is what a real batch of
+        // independent sequences hands the compressor.
+        let parts = lens
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| streams[i].narrow(1, l, t_new))
+            .collect::<Result<Vec<_>>>()?;
+        let xs_new = Tensor::cat(&parts, 0)?;
+        let got = batched
+            .advance(&xs_new, |w| compressor.forward_from_xs(w))?
+            .expect("a batch past one full group has compressed rows");
+
+        for (i, &l) in lens.iter().enumerate() {
+            let want = refs[i]
+                .advance(&streams[i].narrow(1, l, t_new)?, |w| {
+                    compressor.forward_from_xs(w)
+                })?
+                .expect("the reference is past one full group too");
+            let live = (l + t_new) / ratio;
+            assert!(live > 0, "fixture must complete at least one block");
+            let mine = got.narrow(0, i, 1)?.narrow(1, 0, live)?;
+            let theirs = want.narrow(1, 0, live)?;
+            assert_eq!(
+                max_abs_diff(&mine, &theirs)?,
+                0.0,
+                "row {i} (at {l} + {t_new} tokens) diverged from the same sequence run at B=1 \
+                 over its {live} live compressed block(s)"
+            );
+            assert_eq!(
+                (batched.row_lens().0[i], batched.row_lens().1[i]),
+                (refs[i].row_lens().0[0], refs[i].row_lens().1[0]),
+                "row {i}'s token count / resume point must equal the B=1 reference's"
+            );
+        }
+        // Non-degenerate: distinct rows must actually hold distinct values, or
+        // an implementation that broadcast one row everywhere would pass.
+        if lens.len() > 1 {
+            let a = got.narrow(0, 0, 1)?;
+            let b = got.narrow(0, 1, 1)?;
+            assert!(
+                max_abs_diff(&a, &b)? > 1e-6,
+                "the fixture's rows are indistinguishable, so this proves nothing"
+            );
+        }
+        Ok(())
+    }
+
+    /// `n` deterministic, mutually distinct compressor-input streams.
+    fn per_row_streams(n: usize, t: usize, hidden: usize, device: &Device) -> Result<Vec<Tensor>> {
+        (0..n)
+            .map(|row| {
+                let data: Vec<f32> = (0..t * hidden)
+                    .map(|i| ((i as f32) * 0.017 + 0.3 + row as f32 * 1.7).cos() * 0.8)
+                    .collect();
+                Tensor::from_vec(data, (1, t, hidden), device)
+            })
+            .collect()
+    }
+
+    /// 🔑 The keystone claim, on the CSA compressor (ratio 4, overlapping): four
+    /// rows at four different residues mod `ratio` — the worst case, since the
+    /// window geometry is a function of the residue — advance token-identically
+    /// to four B=1 runs. Three of the four complete a new block at three
+    /// different window offsets and land on the same absolute block; the fourth
+    /// completes none and must be left untouched.
+    #[test]
+    fn batched_ragged_xs_is_token_identical_to_the_b1_reference_csa() -> Result<()> {
+        ragged_batch_matches_b1(4, &[37, 38, 39, 40], 3)
+    }
+
+    /// 🔑 The case the `slot_mapping` indirection exists for: two rows that are
+    /// at the SAME residue mod `ratio` — so they share one compressor call —
+    /// but a whole block apart, so their outputs must land on **different**
+    /// `comp` columns. Under MTP this is the common case, not the exotic one:
+    /// the verify window is `depth + 1`, and a CSA layer's ratio is 4, so two
+    /// sequences a full window apart share a residue on most steps.
+    ///
+    /// Without the per-row destination — with one shared append offset, which
+    /// is all `SingleCache::append` can express — both rows would write the
+    /// same column and one of them would read the other's history.
+    #[test]
+    fn two_rows_one_compressor_call_two_destinations() -> Result<()> {
+        ragged_batch_matches_b1(4, &[39, 43, 40, 41], 1)
+    }
+
+    /// The same on HCA (ratio 128, non-overlapping), where a step's rows almost
+    /// all complete NO block and the scatter must write only the one that does.
+    #[test]
+    fn batched_ragged_xs_is_token_identical_to_the_b1_reference_hca() -> Result<()> {
+        ragged_batch_matches_b1(128, &[1022, 1023, 1024, 1025], 3)
+    }
+
+    /// The control the ragged tests need: a UNIFORM batch takes the untouched
+    /// scalar path and is also token-identical. If this ever failed, the
+    /// "flag off is byte-identical" claim would be false and the ragged
+    /// result above would be unattributable.
+    #[test]
+    fn a_uniform_batch_still_matches_the_b1_reference() -> Result<()> {
+        ragged_batch_matches_b1(4, &[40, 40, 40, 40], 3)
+    }
+
+    /// One step is not enough: a per-row `base` that drifts by one token per
+    /// step would still look right on step 1. Run the ragged batch and the B=1
+    /// references in lockstep for 24 steps, re-batching each time — which is
+    /// what the engine's `clone_in`/`clone_out` pair does — and require exact
+    /// agreement at every step.
+    #[test]
+    fn a_ragged_batch_stays_token_identical_across_many_steps() -> Result<()> {
+        let device = Device::Cpu;
+        let (hidden, head_dim, ratio) = (32usize, 16usize, 4usize);
+        let compressor = rolling_test_compressor(ratio, hidden, head_dim, &device)?;
+        // Rows 1 and 3 sit at the same residue mod `ratio` a block apart, so on
+        // every fourth step they share one compressor call and must land on two
+        // different `comp` columns.
+        let mut lens = [30usize, 31, 33, 35];
+        let streams = per_row_streams(lens.len(), 200, hidden, &device)?;
+
+        let mut refs: Vec<XsRollingCache> = Vec::new();
+        for (i, &l) in lens.iter().enumerate() {
+            let mut s = XsRollingCache::new(ratio, compressor.coff, head_dim, 4096);
+            s.advance(&streams[i].narrow(1, 0, l)?, |w| {
+                compressor.forward_from_xs(w)
+            })?;
+            refs.push(s);
+        }
+
+        for step in 0..24 {
+            let mut batched = batch_xs(&refs)?;
+            assert!(!batched.rows_uniform(), "step {step} lost its raggedness");
+            let parts = lens
+                .iter()
+                .enumerate()
+                .map(|(i, &l)| streams[i].narrow(1, l, 1))
+                .collect::<Result<Vec<_>>>()?;
+            let got = batched
+                .advance(&Tensor::cat(&parts, 0)?, |w| compressor.forward_from_xs(w))?
+                .unwrap();
+            for (i, l) in lens.iter_mut().enumerate() {
+                let want = refs[i]
+                    .advance(&streams[i].narrow(1, *l, 1)?, |w| {
+                        compressor.forward_from_xs(w)
+                    })?
+                    .unwrap();
+                *l += 1;
+                let live = *l / ratio;
+                assert_eq!(
+                    max_abs_diff(
+                        &got.narrow(0, i, 1)?.narrow(1, 0, live)?,
+                        &want.narrow(1, 0, live)?
+                    )?,
+                    0.0,
+                    "step {step}, row {i}: the batched compressor history left the B=1 reference"
+                );
+                assert_eq!(batched.row_lens().0[i], refs[i].row_lens().0[0]);
+                assert_eq!(batched.row_lens().1[i], refs[i].row_lens().1[0]);
+            }
+            // The retained window must stay bounded even though it is now the
+            // widest row's — otherwise the ragged path quietly reintroduces the
+            // unbounded raw history this cache exists to delete.
+            let bound = compressor.coff * ratio + batched.margin + (lens[3] - lens[0]);
+            assert!(
+                batched.tail.as_ref().unwrap().dim(1)? <= bound,
+                "step {step}: the shared window grew past {bound}"
+            );
+        }
+        Ok(())
+    }
+
+    /// 🔑 The MTP path in full: a sequence that has been rolled back keeps its
+    /// `base` where it was (`set_len` moves `tokens`, never `base`), so when it
+    /// is batched next to a neighbour the retention floor computed from its new
+    /// token count sits BELOW what it actually holds. Clamping to `base` is
+    /// what keeps it honest — without it the row would come out of the batch
+    /// claiming to be resumable from further back than it is, and the rollback
+    /// it should later refuse would succeed and resume the compressor from a
+    /// gap. That is the exact failure this cache exists to make impossible, and
+    /// it is invisible to any single-step or rollback-free fixture.
+    #[test]
+    fn a_rolled_back_row_keeps_its_own_resume_point_through_a_batch() -> Result<()> {
+        let device = Device::Cpu;
+        let (hidden, head_dim, ratio) = (32usize, 16usize, 4usize);
+        let compressor = rolling_test_compressor(ratio, hidden, head_dim, &device)?;
+        let streams = per_row_streams(2, 64, hidden, &device)?;
+
+        let mut rolled = XsRollingCache::new(ratio, compressor.coff, head_dim, 4096);
+        rolled.advance(&streams[0].narrow(1, 0, 40)?, |w| {
+            compressor.forward_from_xs(w)
+        })?;
+        let base_at_40 = rolled.row_lens().1[0];
+        rolled.set_len(36)?;
+        assert_eq!(
+            rolled.row_lens().1[0],
+            base_at_40,
+            "the fixture needs `set_len` to leave `base` above the natural floor"
+        );
+
+        let mut other = XsRollingCache::new(ratio, compressor.coff, head_dim, 4096);
+        other.advance(&streams[1].narrow(1, 0, 38)?, |w| {
+            compressor.forward_from_xs(w)
+        })?;
+
+        let mut refs = vec![rolled, other];
+        let mut batched = batch_xs(&refs)?;
+        let parts = [streams[0].narrow(1, 36, 2)?, streams[1].narrow(1, 38, 2)?];
+        let got = batched
+            .advance(&Tensor::cat(&parts, 0)?, |w| compressor.forward_from_xs(w))?
+            .unwrap();
+
+        for (i, (start, stream)) in [(36usize, &streams[0]), (38, &streams[1])]
+            .into_iter()
+            .enumerate()
+        {
+            let want = refs[i]
+                .advance(&stream.narrow(1, start, 2)?, |w| {
+                    compressor.forward_from_xs(w)
+                })?
+                .unwrap();
+            let live = (start + 2) / ratio;
+            assert_eq!(
+                max_abs_diff(
+                    &got.narrow(0, i, 1)?.narrow(1, 0, live)?,
+                    &want.narrow(1, 0, live)?
+                )?,
+                0.0,
+                "row {i} diverged from the B=1 reference after a rollback"
+            );
+            assert_eq!(
+                batched.row_lens().1[i],
+                refs[i].row_lens().1[0],
+                "row {i}'s resume point must not be loosened by being batched — a lower `base` \
+                 lets a rollback succeed that would resume the compressor from a gap"
+            );
+        }
+        Ok(())
+    }
+
+    /// The inverse of `batch_xs`: splitting a batched row back out must restore
+    /// the per-sequence invariant `window width == tokens - base`, taking that
+    /// row's share from the END of the shared window. Taking it from the front
+    /// would hand the row somebody else's older tokens under its own `base`.
+    #[test]
+    fn splitting_a_batched_row_restores_the_per_sequence_window() -> Result<()> {
+        let device = Device::Cpu;
+        let (hidden, head_dim, ratio) = (32usize, 16usize, 4usize);
+        let compressor = rolling_test_compressor(ratio, hidden, head_dim, &device)?;
+        let lens = [37usize, 40];
+        let streams = per_row_streams(2, 64, hidden, &device)?;
+        let mut refs: Vec<XsRollingCache> = Vec::new();
+        for (i, &l) in lens.iter().enumerate() {
+            let mut s = XsRollingCache::new(ratio, compressor.coff, head_dim, 4096);
+            s.advance(&streams[i].narrow(1, 0, l)?, |w| {
+                compressor.forward_from_xs(w)
+            })?;
+            refs.push(s);
+        }
+        let batched = batch_xs(&refs)?;
+        let shared = batched.tail.as_ref().unwrap().dim(1)?;
+        assert!(
+            refs.iter()
+                .any(|r| r.tail.as_ref().unwrap().dim(1).unwrap() < shared),
+            "the fixture must have a row narrower than the shared window"
+        );
+
+        let comps = batched.comp.all_data.as_ref().unwrap().chunk(2, 0)?;
+        let tails = batched.tail.as_ref().unwrap().chunk(2, 0)?;
+        for i in 0..2 {
+            let out = batched.split_row(i, comps[i].clone(), tails[i].clone())?;
+            let (tok, base) = (out.row_lens().0[0], out.row_lens().1[0]);
+            assert_eq!(
+                (tok, base),
+                (refs[i].row_lens().0[0], refs[i].row_lens().1[0])
+            );
+            assert_eq!(
+                out.tail.as_ref().unwrap().dim(1)?,
+                tok - base,
+                "a per-sequence cache's window is exactly `tokens - base` wide"
+            );
+            assert_eq!(
+                max_abs_diff(out.tail.as_ref().unwrap(), refs[i].tail.as_ref().unwrap())?,
+                0.0,
+                "row {i}'s retained raw tokens must be its own, taken from the END of the \
+                 shared window"
+            );
+            assert_eq!(out.comp.current_seq_len(), refs[i].comp.current_seq_len());
+        }
+        Ok(())
+    }
+
     /// A rollback of up to `margin` tokens must be accepted and resumable at
     /// EVERY length — including the ones that cross a group boundary, where
     /// the rolled-back group's compressed row has to be rebuilt from the start
@@ -7426,5 +7965,54 @@ mod tests {
              window, and that rollback HARD-ERRORS mid-decode.",
             crate::XS_TAIL_MARGIN_TOKENS
         );
+    }
+
+    /// 🔑 The MTP draft step's own precondition, and the three layouts it must
+    /// refuse rather than guess at.
+    ///
+    /// A dense `KvCache` appends at ONE offset, so a group shares a forward only
+    /// when every row's live run ends at the same column. The scalar form —
+    /// `&[pos]` — is the pre-change path exactly: `max` of a one-element slice
+    /// is that element, so the check reduces to the old `cached != start_pos`
+    /// character for character.
+    #[test]
+    fn the_draft_step_end_column_is_the_batch_maximum_and_refuses_every_other_layout() {
+        // Scalar: the pre-change behaviour, at any batch size.
+        assert_eq!(draft_step_end_column(&[7], 1, 7).unwrap(), 7);
+        assert_eq!(draft_step_end_column(&[7], 4, 7).unwrap(), 7);
+        let err = draft_step_end_column(&[7], 1, 6).unwrap_err().to_string();
+        assert!(
+            err.contains("desync") && err.contains("6") && err.contains("7"),
+            "a cache that is not at the step's position must say both numbers; got {err}"
+        );
+
+        // Ragged: the end column is the batch maximum, which is what
+        // `front_pad_kv_cache` left the cache at.
+        assert_eq!(draft_step_end_column(&[7, 4, 6], 3, 7).unwrap(), 7);
+        let err = draft_step_end_column(&[7, 4, 6], 3, 6)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("left-aligned"),
+            "a group that was never left-aligned must be told so; got {err}"
+        );
+
+        // A row AHEAD of the buffer it is drafting into: `max` exceeds `cached`,
+        // so its RoPE position and its draft-KV slot would mean different things.
+        assert!(draft_step_end_column(&[7, 9], 2, 7).is_err());
+
+        // Arity: neither 1 nor `b_sz`.
+        let err = draft_step_end_column(&[7, 4], 3, 7)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("2 absolute position(s) for a batch of 3"),
+            "a positions vector that does not describe the batch must refuse rather than be \
+             indexed past its end; got {err}"
+        );
+        assert!(draft_step_end_column(&[7, 7, 7, 7], 3, 7).is_err());
+
+        // No positions at all.
+        assert!(draft_step_end_column(&[], 1, 0).is_err());
     }
 }
