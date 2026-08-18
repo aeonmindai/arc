@@ -306,7 +306,13 @@ def main():
                 f"B={b}: achieved running width {res['achieved_running_peak']} "
                 f"< declared minimum {expect[i]}"
             )
-        time.sleep(2)
+        # The engine logs every 5s and only when the window saw tokens
+        # (`engine/logger.rs`), and `num_running` is sampled instantaneously at
+        # log time. Settle longer than one interval so the window covering this
+        # batch is flushed before the next batch's lines mix into it -- and so a
+        # short batch cannot end with zero telemetry, which the sweep would
+        # (correctly) refuse to call a measurement.
+        time.sleep(7)
 
     # The beacon fires ONCE per process, so it cannot be required per-B (B=1 is
     # uniform by construction and must NOT engage it). Require it across the
