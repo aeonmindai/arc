@@ -3104,6 +3104,57 @@ mod clone_in_cache_invariant_tests {
         assert!(err.contains("100") && err.contains("200"), "got: {err}");
     }
 
+    /// 🔑 INERTNESS. On a UNIFORM batch this whole change must do nothing.
+    ///
+    /// Asserted rather than assumed, because a measured −9.7% on the B=32
+    /// *uniform* cell is unexplained and "uniform means `lead == 0`, so the path
+    /// is inert" was reasoning, not evidence. If any of these three counters is
+    /// non-zero on a uniform cohort, the path is NOT inert and that is where the
+    /// regression lives.
+    #[test]
+    fn a_uniform_batch_leaves_every_ragged_mechanism_untouched() {
+        let pipeline = StubPipeline::new(2);
+        let mut a = seq_with_cache_len(0, 2, 5);
+        let mut b = seq_with_cache_len(1, 2, 5);
+        for seq in [&mut a, &mut b] {
+            let cache = seq.normal_cache();
+            cache.clear();
+            for l in 0..2 {
+                cache.push(Some(materialised_slot(5, 8, (l * 100) as f32)));
+            }
+        }
+        set_ragged_lead_pad(None);
+        PENDING_LEAD_PAD.with(|m| m.borrow_mut().clear());
+
+        let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
+        NormalCacheManager
+            .clone_in_cache(&pipeline, &mut seqs, false)
+            .expect("a uniform batch must batch");
+
+        assert_eq!(
+            ragged_lead_pad(),
+            None,
+            "a uniform cohort must publish NO dead prefix — a Some(vec![0,0]) here would send \
+             every uniform decode through the ragged mask path and off the flash kernel"
+        );
+        assert_eq!(
+            PENDING_LEAD_PAD.with(|m| m.borrow().len()),
+            0,
+            "a uniform cohort must leave no deferred strip work"
+        );
+        // And the mask builder must decline, which is what keeps uniform decode
+        // on the unmasked fast path.
+        let ids = Tensor::zeros((2, 1), candle_core::DType::U32, &Device::Cpu).unwrap();
+        let offsets: &[usize] = &[5, 5];
+        assert!(
+            crate::layers_masker::CausalMasker
+                .make_causal_mask_matrix(&ids, &offsets, candle_core::DType::F32, 1)
+                .unwrap()
+                .is_none(),
+            "a uniform cohort must still get NO mask at tgt_len == 1"
+        );
+    }
+
     /// 🔑 `batch_can_be_ragged` is the predicate the SCHEDULER acts on, so it
     /// needs a test of its own.
     ///

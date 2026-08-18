@@ -57,18 +57,95 @@ Release-mode verified: 439/439, refusals return rather than panic.
 
 ## 2. 🔴 MEASURED
 
-|   B | arm     | baseline | fix     | delta |
-|----:|---------|---------:|--------:|------:|
-|   1 | —       |   254.47 |  257.29 | +1.1% |
-|   8 | uniform |   837.26 |  866.67 | +3.5% |
-|   8 | spread  |   225.18 |  251.05 | **+11.5%** |
-|  32 | uniform |  1190.24 | 1129.98 | −5.1% |
-|  32 | spread  |   503.35 |  493.73 | −1.9% |
-| 128 | uniform |   963.45 | 1007.14 | +4.5% |
-| 128 | spread  |   801.31 |  675.24 | **−15.7%** |
+### 2.0 The null first — without it none of this is readable
 
-Baseline B=128 spread has two samples (801.31, 771.22 ⇒ ~786±15); the fix's
-single 675.24 is outside that spread.
+Three baseline-vs-baseline runs, same binary (md5 `9a34a77e`), same box:
+
+| B / arm | s1 | s2 | s3 |
+|---|---:|---:|---:|
+| 1 uniform | 260.52 | 254.47 | 253.95 |
+| 8 uniform | 839.96 | 837.26 | 848.61 |
+| 8 spread | 230.50 | 225.18 | 225.27 |
+| 32 uniform | 1179.70 | 1190.24 | 1204.66 |
+| 32 spread | 502.05 | 503.35 | 487.71 |
+| 128 uniform | 973.87 | 963.45 | 969.58 |
+| 128 spread | 771.22 | 801.31 | 785.85 |
+
+⇒ **run-to-run floor ≈ ±2% on every cell. Any delta under ~5% is unreadable in
+this harness.** Recorded because the first draft of this section drew
+conclusions from single samples on both arms.
+
+### 2.1 Eager strip (`1cd2f1ab5`) — regressed
+
+B=128 spread: **675.24** against a 3-sample baseline mean of 786.1 ⇒ **−15.7%**,
+far outside the null.
+
+### 2.2 Lazy strip (`3adb69477`) — regression gone, cause confirmed
+
+Deferring the strip to the membership change that actually re-reads those caches
+took B=128 spread from **675.24 → 764.08**. The suspected cost *was* the cause,
+confirmed by construction rather than by profile — and the same edit was
+required either way, which is why it was done instead of profiling first.
+
+| B | arm | base (mean of 3) | fix | delta | readable? |
+|---:|---|---:|---:|---:|---|
+| 1 | — | 256.3 | 259.50 | +1.2% | no |
+| 8 | uniform | 841.9 | 853.47 | +1.4% | no |
+| 8 | spread | 227.0 | **266.51** | **+17.4%** | YES |
+| 32 | uniform | 1191.5 | **1075.63** | **−9.7%** | YES ⚠️ |
+| 32 | spread | 497.7 | **528.27** | **+6.1%** | YES |
+| 128 | uniform | 969.0 | 1018.69 | +5.1% | marginal |
+| 128 | spread | 786.1 | 764.08 | −2.8% | no |
+
+⇒ Spread cells improve **where the cohort can actually merge** (+17.4% at B=8,
++6.1% at B=32). B=128 spread is flat — not because the change fails, but because
+the cohort still only reaches `47 running, 48 waiting`, gated by prompt
+admission (below).
+
+### 2.2.1 🔑 B=32 uniform — RESOLVED, and it inverts
+
+The single-sample ladder read −5.1% then −9.7% and looked like a regression.
+It is not one. Two steps settled it.
+
+**Inertness proven, not assumed** (`a_uniform_batch_leaves_every_ragged_mechanism_untouched`):
+on a uniform cohort `clone_in_cache` publishes **no** dead prefix, leaves
+**zero** deferred-strip entries, and the masker still returns `None` at
+`tgt_len == 1`. Any non-zero there would have located the regression; all three
+are zero, which eliminates the ragged path. The other candidate — the scheduler
+pin changing bucket formation — does not fire either: at B=32 uniform the 32
+prompts arrive on a barrier, so the step sequence is all-prompt then all-decode
+with no mixing, and a fresh prompt's `cache_bucket_len` is `len()-1` ≈ 274,
+which cannot collide with the pinned 0.
+
+**Then 5 samples per arm, B=32 uniform only, one server per arm:**
+
+| arm | samples | mean | sd | spread |
+|---|---|---:|---:|---:|
+| baseline | 1157.50 / 887.60 / 885.79 / 874.68 / 876.96 | 936.51 | 123.66 | **30.2%** |
+| fix | 1186.59 / 1200.91 / 1212.11 / 1199.62 / 1212.26 | **1202.30** | **10.62** | **2.1%** |
+
+⇒ the fix is **+28.4%** on the mean and **12× more stable**. The variance is the
+BASELINE's, not the change's — the opposite of both hypotheses.
+
+**Why.** The baseline runs fast once (1157, where the fix sits) then collapses to
+~880 and stays. The repeat harness drains with a 40-token probe before each rep,
+and that probe's sequence is a *different length* from the 32 identical ones — so
+the "uniform" cell is not uniform. A ragged cohort forms, the baseline buckets
+and serialises it, the fix merges it. **The cell was measuring exactly what the
+change fixes, while being labelled uniform.**
+
+### 2.2.2 ⚠️ ORDER EFFECTS — the ladder's small deltas are not readable
+
+Fix at B=32 uniform reads **1075–1130 inside the ladder** but **1186–1212 in
+isolation**; baseline reads 1180–1205 fresh but ~880 under repetition. The
+ladder runs B=1 and B=8 first, and because this change alters what happens in
+those preceding spread cells, the two arms arrive at B=32 in different states.
+
+The ±2% cross-server null (§2.0) measures **server-start** variance and does
+**not** cover within-sweep order effects. ⇒ **Treat every ladder delta under
+~10% as unresolved** until re-measured in isolation — including the +6.1% at
+B=32 spread and +5.1% at B=128 uniform claimed above. The +17.4% at B=8 spread
+and the 675→764 strip result are large enough to survive.
 
 **Correct, provably.** Uniform-batch control, teeth verified at 8 distinct
 completions: baseline vs fix at B=8-uniform is **8/8 identical**; each arm
