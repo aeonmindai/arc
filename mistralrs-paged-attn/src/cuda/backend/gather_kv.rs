@@ -155,7 +155,16 @@ pub fn gather_kv_cache(
             Storage::Cuda(s) => s,
             _ => candle_core::bail!("block_table must be a cuda tensor"),
         };
-        let (bt_ptr, _bt_guard) = slice_ptr(bt_s.as_cuda_slice::<u32>()?, bt_l.start_offset());
+        // Must branch on the runtime dtype, exactly as `cu_seq_lens` does
+        // below: `as_cuda_slice::<T>` type-checks `T` against the storage's
+        // dtype rather than reinterpreting bytes, so a hardcoded `::<u32>()`
+        // fails on the I32 block tables that the guard at line 28 explicitly
+        // admits. Latent today only because every in-repo producer emits U32.
+        let (bt_ptr, _bt_guard) = if block_table.dtype() == DType::I32 {
+            slice_ptr(bt_s.as_cuda_slice::<i32>()?, bt_l.start_offset())
+        } else {
+            slice_ptr(bt_s.as_cuda_slice::<u32>()?, bt_l.start_offset())
+        };
 
         let (cu_s, cu_l) = cu_seq_lens.storage_and_layout();
         let cu_s = match &*cu_s {

@@ -44,6 +44,9 @@ impl IntervalLogger {
         let t_enc_hits = encoder_cache_hits.clone();
         let t_enc_misses = encoder_cache_misses.clone();
         thread::spawn(move || {
+            // Cumulative GPU-sampler counters as of the previous tick, so we
+            // can report this window's delta rather than a since-boot total.
+            let mut prev_sampler = (0u64, 0u64, 0u64);
             // Start the actual logging
             loop {
                 thread::sleep(interval);
@@ -56,6 +59,28 @@ impl IntervalLogger {
                 let tokens_processed = t_tokens_processed.swap(0, Ordering::Relaxed);
                 let num_running = t_num_running.load(Ordering::Relaxed);
                 let num_waiting = t_num_waiting.load(Ordering::Relaxed);
+
+                // GPU sampler health for this window. A CPU fallback costs a
+                // full-logits D2H + full-vocab sort per sequence per step, so
+                // it belongs next to the throughput number it explains —
+                // previously it was only a per-token WARN and was missed.
+                let sampler_now = crate::sampler::gpu_sampling_health::stats();
+                let sampler_info = {
+                    let d_ok = sampler_now.0.saturating_sub(prev_sampler.0);
+                    let d_declined = sampler_now.1.saturating_sub(prev_sampler.1);
+                    let d_failed = sampler_now.2.saturating_sub(prev_sampler.2);
+                    prev_sampler = sampler_now;
+                    if d_failed > 0 {
+                        format!(
+                            ", SAMPLER ON CPU SLOW PATH: {d_failed} GPU top-k failures this \
+                             interval (vs {d_ok} on GPU)"
+                        )
+                    } else if d_declined > 0 && d_ok == 0 {
+                        format!(", sampler CPU path: {d_declined} GPU top-k declined (by config)")
+                    } else {
+                        String::new()
+                    }
+                };
 
                 if total_new_seqs != 0 && tokens_processed != 0 {
                     let enc_cache_info =
@@ -80,7 +105,7 @@ impl IntervalLogger {
                     // swapped to 0 each interval, so the metric reflects only the current
                     // window and is not cumulative.
                     info!(
-                        "Throughput (T/s) {:.2}, Prefix cache hitrate {:.2}%{enc_cache_info}, {num_running} running, {num_waiting} waiting",
+                        "Throughput (T/s) {:.2}, Prefix cache hitrate {:.2}%{enc_cache_info}, {num_running} running, {num_waiting} waiting{sampler_info}",
                         tokens_processed as f64 / interval.as_secs_f64(),
                         100. * prefix_cache_hits as f64 / total_new_seqs as f64,
                     );
@@ -117,6 +142,7 @@ impl IntervalLogger {
         if let Some(ref misses) = self.encoder_cache_misses {
             misses.store(0, Ordering::Relaxed);
         }
+        crate::sampler::gpu_sampling_health::reset();
     }
 
     pub fn add_tokens_processed(&self, num_tokens: usize) {
