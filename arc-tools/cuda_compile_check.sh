@@ -75,8 +75,8 @@ fi
 step "2/5 compile Arc CUDA kernels (mistralrs-quant + arc-cuda-graph) [features: cuda]"
 # `--lib`: build.rs runs nvcc on every .cu, but no binary is linked. Keeps this
 # step GPU-less-safe (arc-cuda-graph's gemv_bench bin would otherwise link -lcuda).
-cargo build -p mistralrs-quant --lib --features cuda 2>&1 | tail -5 || fail "mistralrs-quant cuda kernels did not compile"
-cargo build -p arc-cuda-graph --lib --features cuda 2>&1 | tail -5 || fail "arc-cuda-graph cuda kernels did not compile"
+cargo build -p mistralrs-quant --lib --features cuda 2>&1 | tail -40 || fail "mistralrs-quant --features cuda FAILED. This step does TWO things: nvcc compiles the .cu files, then rustc type-checks the cuda-gated Rust. A 'Compiling N of N kernels' line above means the KERNELS were fine and the RUST did not compile -- read the rustc errors, not the nvcc output."
+cargo build -p arc-cuda-graph --lib --features cuda 2>&1 | tail -40 || fail "arc-cuda-graph --features cuda FAILED (nvcc kernels AND/OR cuda-gated Rust -- see above)"
 ok "Arc CUDA kernels compiled for sm_${CUDA_COMPUTE_CAP}"
 
 step "3/5 compile-check CUDA-gated tests (--no-run)"

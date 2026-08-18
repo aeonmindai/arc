@@ -89,6 +89,35 @@ pub use grouped::{
     ExpertBpwTable, TrellisBpw, GROUPED_TILE_K as QTIP_GROUPED_TILE_K,
     GROUPED_TILE_M as QTIP_GROUPED_TILE_M, GROUPED_TILE_N as QTIP_GROUPED_TILE_N,
 };
+
+/// The grouped GEMM's m-tile on **this** device.
+///
+/// D16 made the schedule arch-dependent (16 pairs per m-tile on Ampere, 64 on
+/// SM90+), so any harness that models the kernel's weight traffic has to ask
+/// rather than assume: the amortization a benchmark may legitimately claim is
+/// bounded by this number, and using the wrong one silently mis-states the
+/// grouped path's advantage in whichever direction the guess went.
+/// Reports the arch witness too, because a harness that reads `tile_m` off a
+/// binary with no SM90 device code would be modelling a kernel that cannot
+/// run on this device (D18 #12).
+#[cfg(feature = "cuda")]
+pub fn qtip_grouped_tile_m() -> candle_core::Result<usize> {
+    let (mut major, mut minor, mut tile_m, mut witness) = (0i32, 0i32, 0i32, 0i32);
+    let rc = unsafe {
+        ffi::qtip2b_grouped_query_schedule(&mut major, &mut minor, &mut tile_m, &mut witness)
+    };
+    if rc != 0 {
+        candle_core::bail!("qtip grouped tile query failed (rc={rc})");
+    }
+    if major >= 9 && witness < 900 {
+        candle_core::bail!(
+            "qtip grouped tile query: device is sm_{major}{minor} but this binary carries \
+             no SM90 device code (arch witness {witness}); the SM90 m-tile it reports \
+             could never be the one that runs. Rebuild with ARC_CUDA_ARCHS including 90."
+        );
+    }
+    Ok(tile_m as usize)
+}
 #[allow(unused_imports)]
 pub use viterbi::{
     hessian_row_weights, quantize_row, viterbi_quantize_row, TrellisSearch, HESSIAN_SIGMA_REG,

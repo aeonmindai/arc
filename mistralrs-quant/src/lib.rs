@@ -105,6 +105,11 @@ pub use qtip::{
     TrellisSearch, QTIP2B_MCG_MULT, QTIP_GATHER_GEMV_MAX_PAIRS, QTIP_GROUPED_TILE_K,
     QTIP_GROUPED_TILE_M, QTIP_GROUPED_TILE_N, QTIP_ONDEVICE_MOE_MAX_TOKENS_ENV,
 };
+// D16: the grouped GEMM's m-tile is arch-dependent, so harnesses must query the
+// device rather than assume the Ampere constant. The query is a CUDA FFI call,
+// so it only exists on the cuda build.
+#[cfg(feature = "cuda")]
+pub use qtip::qtip_grouped_tile_m;
 pub use td_moe_factored::TuckerFactoredLayer;
 pub use unquantized::UnquantLinear;
 pub use utils::bake_budget::{
