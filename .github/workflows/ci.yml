@@ -23,13 +23,29 @@ name: Continuous integration
 # this. `cuda_compile_check.yaml` has carried the identical block for a while;
 # this is the same shape deliberately, not a new policy.
 #
-# The `head_ref || run_id` idiom is load-bearing: on `pull_request`, `head_ref`
-# is the source branch, so a new push cancels that PR's own in-flight run. On
-# `push`, `schedule` and `workflow_dispatch`, `head_ref` is empty and the
-# fallback `run_id` is unique per run — so master pushes and scheduled runs are
-# never cancelled by each other, only PR iterations are.
+# The `head_ref || run_id` idiom was load-bearing and is now SPLIT, deliberately.
+#
+# On `pull_request`, `head_ref` is the source branch, so a new push cancels that
+# PR's own in-flight run. That is unchanged, and it is why the key still leads
+# with `head_ref`: every PR keeps its own independent group, and a merge to
+# master can never cancel a different branch's checks.
+#
+# What changed is the `push` case. `head_ref` is empty there, and the old
+# `run_id` fallback is unique per run, so master pushes never collapsed — by
+# design, per the comment this replaces, so that each master commit kept its own
+# CI record. Keying on `github.ref` instead puts every push to the same branch
+# in one group.
+#
+# ⚠️ THIS REVERSES A DOCUMENTED DECISION. The cost is real: the superseded runs
+# carried per-commit master results, which is CI-side bisect evidence. See the
+# PR body for why that record was worth less in practice than it sounds, and for
+# the incident that motivated this.
+#
+# `schedule` and `workflow_dispatch` also have an empty `head_ref`; they key on
+# `github.ref` too, so a scheduled run and a push to the same branch share a
+# group. That is intended — they build the same commit.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:

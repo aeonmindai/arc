@@ -135,8 +135,11 @@ on:
 
 # Widening the trigger to "**/*.rs" makes this workflow run on most PRs, so
 # stop paying for superseded runs on the same ref.
+# Split for the same reason as `ci.yml` — see the long note there and the PR
+# body. `head_ref` keeps each PR in its own group; `github.ref` collapses
+# superseded pushes to the same branch instead of leaving one run per commit.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 # Bound codegen parallelism so a large CUDA lib build fits a small hosted
