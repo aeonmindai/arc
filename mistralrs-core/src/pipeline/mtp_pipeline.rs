@@ -1300,30 +1300,47 @@ impl MtpSpeculativePipeline {
     /// How this pipeline advances the KV cache after a verify, decided once.
     ///
     /// Default [`KvAdvance::Cohort`]. `ARC_MTP_PER_SEQ_KV=1` asks for
-    /// [`KvAdvance::PerSequence`]; it is granted only when **both** of these
-    /// hold, and the reason it was refused is logged by name so a run that
-    /// asked for it never silently gets the ceiling instead:
+    /// [`KvAdvance::PerSequence`]; it is granted only when **all three** of
+    /// these hold, and the reason it was refused is logged by name so a run
+    /// that asked for it never silently gets the ceiling instead:
     ///
     /// 1. every cache slot can carry its own length
-    ///    ([`cache_supports_per_sequence_advance`]);
-    /// 2. the target model masks a left-aligned ragged batch's dead prefix
-    ///    ([`Self::target_masks_ragged_batches`]).
+    ///    ([`cache_supports_per_sequence_advance`]) — cleared for V4 by
+    ///    wave63-CO under `ARC_V4_XS_PER_SEQ`;
+    /// 2. the target model masks a left-aligned ragged batch's dead prefix AND
+    ///    its start-anchored compressed columns
+    ///    ([`model_masks_ragged_batches`]) — cleared for V4 by the per-row
+    ///    `row_q0` in `dsv4_attention`;
+    /// 3. the MTP **draft** chain can carry rows at different absolute
+    ///    positions ([`draft_chain_carries_per_sequence_positions`]) — **still
+    ///    refused**, and now the only one.
     ///
-    /// (2) is not decoration. Per-sequence lengths in one dense buffer mean
-    /// `front_pad_kv_cache` zero-fills ahead of the shorter rows, and a zero K
-    /// row is **not** a masked row — it scores logit 0 and takes real softmax
-    /// weight. Serving from those columns would be a wrong answer nothing
-    /// downstream catches, which is the exact failure this project already paid
-    /// for once with FP8 KV. Refusing is the only correct behaviour until a
-    /// model threads [`crate::layers_masker::RaggedKvLens`].
+    /// This pipeline's own step arithmetic used to be (3). It no longer is:
+    /// every quantity in [`Self::step`] now comes from `cache_lens[i]`
+    /// ([`resolve_row_cache_lens`]), the verify window routes
+    /// `seqlen_offsets[i]` per row, and the per-sequence commit strips the dead
+    /// prefix ([`crate::kv_cache::drop_dead_prefix`]) so a row's recorded length
+    /// is its own rather than the batch's padding.
+    ///
+    /// None of these is decoration. Per-sequence lengths in one dense buffer
+    /// mean `front_pad_kv_cache` zero-fills ahead of the shorter rows, and a
+    /// zero K row is **not** a masked row — it scores logit 0 and takes real
+    /// softmax weight. Serving from those columns would be a wrong answer
+    /// nothing downstream catches, which is the exact failure this project
+    /// already paid for once with FP8 KV.
+    ///
+    /// (3) is worth stating explicitly because granting the mode on (1) and (2)
+    /// alone would mean every ragged row silently stopped drafting — the group
+    /// loop drops any row whose seed is not at the group's chain start — so MTP
+    /// would report a healthy `accept_rate` over chains it never proposed. A
+    /// mode that is inert is bad; a mode that is inert *and* still reports is
+    /// D18's "the absence of a signal read as a specific signal".
     pub(crate) fn kv_advance(&self) -> KvAdvance {
         *self.kv_advance.get_or_init(|| {
             if !per_sequence_kv_requested() {
                 return KvAdvance::Cohort;
             }
-            let refusal = cache_supports_per_sequence_advance(&self.target_cache)
-                .err()
-                .or_else(|| self.target_masks_ragged_batches().err());
+            let refusal = per_sequence_refusal(&self.target_cache);
             match refusal {
                 None => {
                     tracing::info!(
@@ -1343,31 +1360,6 @@ impl MtpSpeculativePipeline {
                 }
             }
         })
-    }
-
-    /// Whether the target model applies a per-row mask over a left-aligned
-    /// ragged batch's dead prefix.
-    ///
-    /// **No model in the tree does yet**, and this says so rather than
-    /// pretending. The plumbing that would flip it is exactly one wire:
-    /// `clone_in_cache` already computes `lead_pad` per sequence
-    /// ([`crate::kv_cache::front_align_batch`]) and
-    /// [`crate::layers_masker::CausalMasker::make_left_padded_causal_mask`]
-    /// already turns that into the `[B, 1, t_q, k]` additive mask a model wants
-    /// — what is missing is carrying it from the pipeline through
-    /// `inputs_processor` into the model forward, where today the mask is
-    /// rebuilt from `seqlen_offsets` alone.
-    ///
-    /// It is stated as a capability rather than hardcoded at the call site so
-    /// that the model that adds the wire overrides one thing, here.
-    fn target_masks_ragged_batches(&self) -> std::result::Result<(), String> {
-        Err(
-            "no model in this tree threads a ragged-batch mask into its forward yet, so the \
-             zero-filled dead prefix a left-aligned per-sequence cache leaves would be attended \
-             as real keys (a zero K row scores logit 0 and takes softmax weight). See \
-             `MtpSpeculativePipeline::target_masks_ragged_batches`."
-                .to_string(),
-        )
     }
 
     /// Snapshot of this pipeline's MTP acceptance counters.
@@ -1632,6 +1624,37 @@ impl MtpSpeculativePipeline {
             .kit
             .extend_draft_cache(cache, lo, &hidden_slice, &next_tokens)?;
         Ok(true)
+    }
+
+    /// `clone_in_cache`, keeping the one thing it computes and throws away.
+    ///
+    /// Under [`KvAdvance::PerSequence`] the cohort arriving here is genuinely
+    /// ragged, so it is left-aligned first: every sequence's live K/V is shifted
+    /// to END at the batch maximum, which makes `SingleCache::append`'s one
+    /// shared write offset simultaneously correct for all of them. The dense
+    /// batching below is then completely unchanged.
+    ///
+    /// 🔑 The returned `lead_pad[i]` is the **only** record that row `i`'s share
+    /// of the batched buffer starts `lead_pad[i]` columns in. Once
+    /// `front_pad_single` has run, the slot's own `current_seq_len` is the
+    /// batch's width for every row — the per-row length is gone. Discarding this
+    /// vector is therefore what forced every downstream quantity onto one shared
+    /// `cache_len`; keeping it is what lets [`resolve_row_cache_lens`] hand it
+    /// straight back.
+    ///
+    /// Off the per-sequence path it is `vec![0; seqs.len()]` and no tensor is
+    /// touched, exactly as before.
+    fn clone_in_cache_reporting_lead(
+        &self,
+        seqs: &mut [&mut Sequence],
+    ) -> candle_core::Result<Vec<usize>> {
+        let lead_pad = if self.kv_advance() == KvAdvance::PerSequence {
+            crate::kv_cache::front_align_batch(seqs, false)?
+        } else {
+            vec![0; seqs.len()]
+        };
+        get_mut_arcmutex!(self.target).clone_in_cache(seqs)?;
+        Ok(lead_pad)
     }
 
     /// Log the "draft KV could not be primed, drafting skipped" explanation
@@ -1929,6 +1952,203 @@ pub(crate) fn cache_supports_per_sequence_advance(
     Ok(())
 }
 
+/// The whole of [`MtpSpeculativePipeline::kv_advance`]'s decision: the three
+/// capability checks, composed in order, or `None` when all three pass.
+///
+/// Composed here rather than inline in `kv_advance` so that "which checks are
+/// required" is itself testable — dropping one is otherwise invisible, because
+/// `kv_advance` needs a whole target pipeline to call.
+///
+/// Order matters only for which reason gets reported. Each check is
+/// independent, and each has been the *last* one at some point: (1) fell to
+/// wave63-CO, (2) to the per-row `row_q0`, (3) to this wave's per-row step
+/// arithmetic, and (4) is where it stands now.
+pub(crate) fn per_sequence_refusal(cache: &EitherCache) -> Option<String> {
+    cache_supports_per_sequence_advance(cache)
+        .err()
+        .or_else(|| model_masks_ragged_batches(cache).err())
+        .or_else(|| draft_chain_carries_per_sequence_positions().err())
+}
+
+/// Whether the model behind this cache masks a left-aligned ragged batch, or
+/// why it does not. The cache-inspecting half of
+/// [`MtpSpeculativePipeline::kv_advance`]'s second check, split out so it is
+/// testable without standing up a whole target pipeline — the same shape
+/// [`cache_supports_per_sequence_advance`] has.
+///
+/// The discriminator is the `XsRolling` compressor slot. DeepSeek V4 is the
+/// only architecture in the tree that allocates any, and it is exactly the
+/// architecture whose attention now takes a per-row `row_q0`.
+pub(crate) fn model_masks_ragged_batches(cache: &EitherCache) -> std::result::Result<(), String> {
+    let EitherCache::Normal(normal) = cache else {
+        return Err(
+            "the target is on PagedAttention; this dense-cache mask is not what it needs"
+                .to_string(),
+        );
+    };
+    let is_v4 = normal
+        .lock()
+        .unwrap()
+        .0
+        .iter()
+        .any(|slot| matches!(slot, crate::kv_cache::KvCache::XsRolling(_)));
+    if is_v4 {
+        return Ok(());
+    }
+    Err(
+        "the target has no `XsRolling` compressor slots, so it is not DeepSeek V4 and no other \
+         model in this tree threads a ragged-batch mask into its forward. The zero-filled dead \
+         prefix a left-aligned per-sequence cache leaves would be attended as real keys (a zero \
+         K row scores logit 0 and takes softmax weight). See \
+         `MtpSpeculativePipeline::target_masks_ragged_batches`."
+            .to_string(),
+    )
+}
+
+/// Per-row committed KV lengths for one fused step, or `None` when the batch
+/// shares one — which is every batch that was not built by
+/// [`crate::kv_cache::front_align_batch`] under per-sequence advance.
+///
+/// `lead_pad[i]` is the dead prefix that call left ahead of row `i`, so
+/// `cache_len - lead_pad[i]` is row `i`'s own committed KV length: the batched
+/// buffer's width is the batch **maximum**, and every row was padded up to it.
+/// No value is invented here — the vector already existed and was being
+/// discarded by `clone_in_cache`.
+///
+/// 🔑 Returning `None` for a uniform batch is a **dispatch, not an
+/// optimisation**. `None` runs the pre-change scalar arithmetic verbatim, so
+/// every B=1 request and every batch built with the flag off is byte-identical
+/// by control flow rather than by a number some test happened to observe. It is
+/// a separate function for the reason PR #100's `resolve_ragged_rows` is: the
+/// two branches agree exactly on their common domain, so no numeric test can
+/// say which one ran.
+///
+/// The two refusals describe the same invariant from opposite sides.
+/// `front_align_batch` pads every row **up to** the batch maximum, so no lead
+/// can exceed the width and at least one row must have no lead at all. A batch
+/// that is ragged in some other way is not the layout this step knows how to
+/// unpick, and guessing would be a wrong answer nothing downstream catches.
+pub(crate) fn resolve_row_cache_lens(
+    enabled: bool,
+    cache_len: usize,
+    lead_pad: &[usize],
+) -> Result<Option<Vec<usize>>> {
+    if !enabled || lead_pad.iter().all(|&l| l == 0) {
+        return Ok(None);
+    }
+    if let Some(&over) = lead_pad.iter().find(|&&l| l > cache_len) {
+        candle_core::bail!(
+            "MTP per-sequence step: a dead prefix of {over} column(s) is wider than the \
+             {cache_len}-column batched cache it was padded into, so the pipeline's idea of this \
+             batch's layout and `front_align_batch`'s disagree"
+        );
+    }
+    if !lead_pad.contains(&0) {
+        candle_core::bail!(
+            "MTP per-sequence step: every row of this batch carries a dead prefix ({lead_pad:?}), \
+             so none of them sits at the shared end column {cache_len}. `front_align_batch` pads \
+             UP TO the batch maximum, so at least one row must have no prefix — this is not the \
+             left-aligned cohort the per-row arithmetic is defined for"
+        );
+    }
+    Ok(Some(lead_pad.iter().map(|&l| cache_len - l).collect()))
+}
+
+/// The window invariant, per row.
+///
+/// `uncached[i]` is the committed tail sequence `i` has not yet put in its KV,
+/// and `ok` is whether every row is in a state this fast path produced. Both
+/// used to be computed from ONE shared `cache_len` — the *batched* buffer's
+/// width, which left-alignment makes `max_j L_j` rather than any row's length —
+/// which made them wrong in two different ways the moment the rows diverged:
+///
+/// * `toks_i.len() - cache_len` saturated to **0** for every row but the
+///   longest, so `ok` failed on every ragged step and per-sequence advance
+///   would have been *reachable but inert*;
+/// * `cache_len` then indexed the verify window (`toks[cache_len..]`), a
+///   **panic** site the saturation was the only thing hiding.
+///
+/// Both close by taking row `i`'s own length. `ok` also guarantees the slice is
+/// in range: `uncached[i] >= 1` means `cache_lens[i] < tok_lens[i]`.
+pub(crate) fn plan_step_window(cache_lens: &[usize], tok_lens: &[usize], w: usize) -> StepWindow {
+    let uncached: Vec<usize> = cache_lens
+        .iter()
+        .zip(tok_lens)
+        .map(|(&c, &t)| t.saturating_sub(c))
+        .collect();
+    let ok = cache_lens
+        .iter()
+        .zip(&uncached)
+        .all(|(&c, &u)| c + u >= 2 && (1..=w).contains(&u));
+    StepWindow { uncached, ok }
+}
+
+/// [`plan_step_window`]'s answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StepWindow {
+    pub uncached: Vec<usize>,
+    pub ok: bool,
+}
+
+/// Which rows of a batch may draft together: those needing the same number of
+/// drafts (`w - u`) **and** sitting at the same absolute chain start.
+///
+/// Both halves are forced by the draft path, not chosen: one batched MTP-block
+/// forward takes ONE `pos` (`MtpBlock::forward_step`, used as the RoPE position
+/// and the draft-KV slot) and `batch_draft_caches` refuses rows of differing
+/// length. Named so the cost of the second half is something a test can state
+/// rather than something a benchmark discovers — see
+/// [`draft_chain_carries_per_sequence_positions`].
+pub(crate) const fn draft_group_key(uncached: usize, cache_len: usize) -> (usize, usize) {
+    (uncached, cache_len + uncached - 2)
+}
+
+/// Whether the **MTP draft chain** can carry a batch whose rows sit at
+/// different absolute positions.
+///
+/// It cannot, and this is the blocker that remains after the fused step's own
+/// arithmetic. It is stated separately, and named, because each of the three
+/// previous waves believed the one it removed was the last.
+///
+/// The target's time base is now per-row end to end: the cache carries its own
+/// length per row (wave63-CO), `dsv4_attention` masks a left-aligned cohort
+/// (PR #100), and this step derives every quantity from `cache_lens[i]` and
+/// routes `seqlen_offsets[i]` per row. The **draft** KV is a second, independent
+/// time base, and it is still keyed on one scalar in four places:
+///
+/// * `MtpHiddenCapture::store(seqlen_offsets.first(), ..)`
+///   (`deepseek4.rs`) records row 0's absolute position for the whole capture,
+///   so `extend_draft_kv_row`'s `off` describes only the leading row;
+/// * `propose_chain_batched(.., start_pos, ..)` takes ONE `start_pos` for the
+///   group and hands `start_pos + i` to `MtpBlock::forward_step`, whose `pos` is
+///   both the RoPE position and the draft-KV slot;
+/// * `batch_draft_caches` refuses rows whose `current_seq_len` differs, which
+///   under per-sequence advance is all of them;
+/// * so the fused step can only group rows that share an absolute chain start.
+///   That grouping is now explicit and correct — see the `(u, chain_start)` key
+///   in [`MtpSpeculativePipeline::step`] — but with `u_i ≡ 1` and every row at
+///   its own length it degenerates to one group per sequence, i.e. `B` single-row
+///   MTP-block forwards per chain step instead of `<= depth + 1` batched ones.
+///
+/// Correct and `B`x slower is not a mode worth granting, and granting it would
+/// also hide the real fix, which is a per-row `pos` in `MtpBlock::forward_step`
+/// (a positions vector for RoPE plus a per-row draft-KV slot) and a per-row
+/// capture offset. That is a **model** change, in `deepseek4`, which is why it
+/// is not in the PR that fixed the pipeline arithmetic.
+pub(crate) fn draft_chain_carries_per_sequence_positions() -> std::result::Result<(), String> {
+    Err(
+        "the MTP draft chain keys on ONE absolute position for a whole group: \
+         `MtpHiddenCapture::store` records row 0's offset for the entire capture, \
+         `propose_chain_batched` takes a single `start_pos` and passes `start_pos + i` to \
+         `MtpBlock::forward_step` as both the RoPE position and the draft-KV slot, and \
+         `batch_draft_caches` refuses rows of differing length. Rows at different positions can \
+         only be grouped one-per-sequence, which is correct but costs B single-row block \
+         forwards per chain step. See \
+         `MtpSpeculativePipeline::draft_chain_carries_per_sequence_positions`."
+            .to_string(),
+    )
+}
+
 /// Greedy argmax over a 1-D logits tensor — returns the token ID.
 fn argmax_token(logits: &Tensor) -> Result<u32> {
     // logits shape [vocab]
@@ -2217,15 +2437,13 @@ impl CacheManagerMixin for MtpSpeculativePipeline {
     /// unchanged, and `ensure_uniform_batch_cache_lens` passes for the same
     /// reason it always did.
     ///
-    /// `front_align_batch` returns each row's dead prefix. It is discarded here
-    /// only because [`MtpSpeculativePipeline::kv_advance`] refuses to enter
-    /// this mode until a model consumes that mask; the moment one does, this is
-    /// where the mask is born.
+    /// `front_align_batch` returns each row's dead prefix, which is the only
+    /// record anywhere of how much of the batched buffer is padding rather than
+    /// this row's own KV. The fused step needs it, so it calls
+    /// [`MtpSpeculativePipeline::clone_in_cache_reporting_lead`] directly; this
+    /// trait entry point is for every other caller and discards it.
     fn clone_in_cache(&self, seqs: &mut [&mut Sequence]) -> candle_core::Result<()> {
-        if self.kv_advance() == KvAdvance::PerSequence {
-            let _lead_pad = crate::kv_cache::front_align_batch(seqs, false)?;
-        }
-        get_mut_arcmutex!(self.target).clone_in_cache(seqs)
+        self.clone_in_cache_reporting_lead(seqs).map(|_| ())
     }
     fn clone_out_cache(&self, seqs: &mut [&mut Sequence]) {
         get_mut_arcmutex!(self.target).clone_out_cache(seqs);
@@ -2503,8 +2721,19 @@ impl Pipeline for MtpSpeculativePipeline {
 
         // PRE-cache instruction: clone-in / reset, matching what
         // `Pipeline::step` does internally for the target alone.
+        //
+        // `lead_pad[i]` is how many columns of the batched buffer are padding
+        // ahead of row `i` rather than that row's own K/V — see
+        // [`Self::clone_in_cache_reporting_lead`]. It is all-zero unless this
+        // step assembled the batch itself, which is why a ragged cohort can only
+        // be unpicked on the `In` arm.
+        let mut lead_pad = vec![0usize; input_seqs.len()];
+        let mut assembled_here = false;
         match pre_op {
-            CacheInstruction::In => self.clone_in_cache(input_seqs)?,
+            CacheInstruction::In => {
+                lead_pad = self.clone_in_cache_reporting_lead(input_seqs)?;
+                assembled_here = true;
+            }
             CacheInstruction::Nothing => (),
             CacheInstruction::Reset {
                 reset_non_granular,
@@ -2532,22 +2761,57 @@ impl Pipeline for MtpSpeculativePipeline {
 
         // ---- The window invariant ----
         //
-        // `cache_len` (C) is shared by the whole batch — the scheduler buckets
-        // on it (`scheduler/default_scheduler.rs`) and `clone_in_cache` builds
-        // one dense batched cache from it. Each sequence's committed length is
-        // `C + u`, where `u` is its uncached committed tail; plain decode holds
-        // `u == 1`. `w = depth + 1` is the fixed window width every sequence
-        // feeds: `u` real tokens, then `w - u` drafts.
+        // `cache_len` (C) is the width of the one dense batched buffer
+        // `clone_in_cache` built. Under the cohort rule it is also every
+        // sequence's committed length, and `cache_lens` is `C` repeated. Under
+        // per-sequence advance it is only the batch **maximum**: row `i` was
+        // padded up to it and owns `C - lead_pad[i]` of it, which is what
+        // `cache_lens[i]` carries.
+        //
+        // Each sequence's committed length is `cache_lens[i] + u_i`, where `u`
+        // is its uncached committed tail; plain decode holds `u == 1`.
+        // `w = depth + 1` is the fixed window width every sequence feeds: `u`
+        // real tokens, then `w - u` drafts.
         let w = self.window();
         let batch = input_seqs.len();
         let cache_len = current_normal_cache_len(self);
-        let uncached: Vec<usize> = input_seqs
-            .iter()
-            .map(|s| s.get_toks().len().saturating_sub(cache_len))
-            .collect();
-        let window_ok = cache_len + uncached.iter().copied().min().unwrap_or(0) >= 2
-            && uncached.iter().all(|u| (1..=w).contains(u));
+        // Per-sequence advance needs the batched buffer split back into each
+        // sequence's own storage before the lengths can diverge, and that is
+        // what `CacheInstruction::Out` does. It also needs this step to have
+        // assembled the batch, because that is the only place `lead_pad` comes
+        // from. Any other pair leaves the batched cache in the pipeline, where
+        // there is no per-sequence length to set, so those steps take the cohort
+        // rule — correctly, and without a mid-run state that no other path knows
+        // how to read.
+        let per_seq_advance = assembled_here
+            && matches!(post_op, CacheInstruction::Out)
+            && self.kv_advance() == KvAdvance::PerSequence;
+        let row_cache_lens = resolve_row_cache_lens(per_seq_advance, cache_len, &lead_pad)?;
+        let cache_lens: Vec<usize> = match &row_cache_lens {
+            Some(rows) => rows.clone(),
+            None => vec![cache_len; batch],
+        };
+        let tok_lens: Vec<usize> = input_seqs.iter().map(|s| s.get_toks().len()).collect();
+        let StepWindow {
+            uncached,
+            ok: window_ok,
+        } = plan_step_window(&cache_lens, &tok_lens, w);
         if !window_ok {
+            // 🔴 A left-aligned batch cannot be handed to the target's own
+            // decode: that path builds no mask at all at `t_q == 1`
+            // (`layers_masker.rs:285`), so every row's dead prefix would be
+            // attended as real keys — a zero K row scores logit 0 and takes
+            // softmax weight. Deferring is only safe for a batch that is not
+            // padded, so a padded one refuses instead.
+            if row_cache_lens.is_some() {
+                candle_core::bail!(
+                    "MTP per-sequence step: this batch is left-aligned (dead prefixes \
+                     {lead_pad:?}) but its window invariant does not hold (uncached tails \
+                     {uncached:?} against a window of {w}). Deferring to the target's own decode \
+                     would attend the dead prefix as real keys, because that path builds no mask \
+                     at `t_q == 1`."
+                );
+            }
             // Not a state this fast path produced — a cache reset, a
             // prefix-cache hit, a chunked prefill. The target's own bookkeeping
             // is authoritative there, so defer (the PRE op is already applied).
@@ -2594,26 +2858,43 @@ impl Pipeline for MtpSpeculativePipeline {
             .map(|id| self.checkout_draft_kv(*id))
             .collect();
 
-        // ---- Draft, grouped by uncached-tail length ----
+        // ---- Draft, grouped by (uncached-tail length, absolute chain start) ----
         //
         // Within a group every sequence sits at the SAME absolute chain start
-        // `C + u - 2` (because they share `C`) and needs the SAME number of
-        // drafts `w - u`, so one batched MTP-block forward per chain step
-        // drafts for all of them. `u` ranges over `[1, w]`, so a batch splits
-        // into at most `depth + 1` groups no matter how large it is — the draft
-        // cost stays a small multiple of one single-layer forward, not a
-        // multiple of the batch size.
+        // `cache_lens[i] + u - 2` and needs the SAME number of drafts `w - u`,
+        // so one batched MTP-block forward per chain step drafts for all of
+        // them: `MtpBlock::forward_step` takes ONE `pos`, used both as the RoPE
+        // position and as the draft-KV slot, and `batch_draft_caches` refuses
+        // rows of differing length.
+        //
+        // When the batch shares `cache_len` — every batch today — the chain
+        // start is a function of `u` alone, so this partitions and iterates
+        // exactly as the `u`-keyed map it replaces: `u` ranges over `[1, w]`, so
+        // a batch splits into at most `depth + 1` groups no matter how large it
+        // is, and the draft cost stays a small multiple of one single-layer
+        // forward rather than a multiple of the batch size.
+        //
+        // 🔴 It is stated as a pair anyway because under per-sequence advance it
+        // is NOT a function of `u`: rows sit at their own lengths, so the
+        // partition degenerates to one group per sequence. That is correct and
+        // `B`x slower, and it is exactly what
+        // [`draft_chain_carries_per_sequence_positions`] refuses the mode over.
+        // Keying on `u` alone there would not be slow, it would be silent: a row
+        // whose seed is not at the group's chain start is skipped, so it would
+        // stop drafting with no signal but a falling `tok_per_step`.
         let mut drafts: Vec<Vec<u32>> = vec![Vec::new(); batch];
-        let mut groups: std::collections::BTreeMap<usize, Vec<usize>> =
+        let mut groups: std::collections::BTreeMap<(usize, usize), Vec<usize>> =
             std::collections::BTreeMap::new();
         for (i, &u) in uncached.iter().enumerate() {
             if u < w {
-                groups.entry(u).or_default().push(i);
+                groups
+                    .entry(draft_group_key(u, cache_lens[i]))
+                    .or_default()
+                    .push(i);
             }
         }
-        for (u, members) in groups {
+        for ((u, chain_start), members) in groups {
             let n_draft = w - u;
-            let chain_start = cache_len + u - 2;
             let mut rows: Vec<usize> = Vec::with_capacity(members.len());
             let mut seeds: Vec<Tensor> = Vec::with_capacity(members.len());
             let mut last_toks: Vec<u32> = Vec::with_capacity(members.len());
@@ -2714,15 +2995,30 @@ impl Pipeline for MtpSpeculativePipeline {
         // other direction, skipping the final draft forward because the
         // draft-extend it must run anyway already produced that token
         // (`eagle_worker.py:871-873`).
+        //
+        // 🔑 `seqlen_offsets[i]` is where the model places row `i`'s queries —
+        // for RoPE, and (on DeepSeek V4) as the per-row `row_q0` that masks a
+        // left-aligned cohort's dead prefix and its start-anchored compressed
+        // columns. A shared `prefill_window` collapses it to one scalar, which
+        // is right only when the rows share a length. When they do not, each row
+        // carries its own and the shared component is zero — the vector the
+        // model needs is the one this step already computed.
         for (i, seq) in input_seqs.iter_mut().enumerate() {
             let toks = seq.get_toks();
-            let mut window: Vec<u32> = toks[cache_len..].to_vec();
+            let mut window: Vec<u32> = toks[cache_lens[i]..].to_vec();
             window.extend(drafts[i].iter().copied());
             let pad = *window.last().expect("uncached tail is at least 1 token");
             window.resize(w, pad);
-            seq.set_prefill_toks(window);
+            match row_cache_lens {
+                Some(_) => seq.set_prefill_toks_at(window, cache_lens[i]),
+                None => seq.set_prefill_toks(window),
+            }
         }
-        let verify = run_target_forward_batch(self, input_seqs, Some((w, cache_len))).await;
+        let shared_offset = match row_cache_lens {
+            Some(_) => 0,
+            None => cache_len,
+        };
+        let verify = run_target_forward_batch(self, input_seqs, Some((w, shared_offset))).await;
         for seq in input_seqs.iter_mut() {
             seq.reset_prefill_toks();
         }
@@ -2773,15 +3069,10 @@ impl Pipeline for MtpSpeculativePipeline {
         // on the way out and its next uncached tail is 1 — the B=1 invariant,
         // at every batch size.
         let n_accepted: Vec<usize> = accepted.iter().map(Vec::len).collect();
-        // Per-sequence advance needs the batched buffer split back into each
-        // sequence's own storage before the lengths can diverge, and that is
-        // what `CacheInstruction::Out` does. Any other POST op leaves the
-        // batched cache in the pipeline, where there is no per-sequence length
-        // to set, so those steps take the cohort rule — correctly, and without
-        // a mid-run state that no other path knows how to read.
-        let advance = match post_op {
-            CacheInstruction::Out => self.kv_advance(),
-            _ => KvAdvance::Cohort,
+        let advance = if per_seq_advance {
+            KvAdvance::PerSequence
+        } else {
+            KvAdvance::Cohort
         };
         let per_sequence_commit = match advance {
             KvAdvance::Cohort => {
@@ -2920,11 +3211,31 @@ impl Pipeline for MtpSpeculativePipeline {
         // here, in the same scope that computed it, from a plain `Vec` indexed
         // by the batch row — and there is no reduction across `input_seqs` in
         // it, which is the whole difference from the cohort path.
+        //
+        // 🔑 And the length recorded is this row's OWN, not the batch's width.
+        // `clone_out_cache` hands each row the batched buffer verbatim, dead
+        // prefix included, so the prefix is stripped first
+        // (`drop_dead_prefix` — the inverse of `front_pad_kv_cache`). Recording
+        // `cache_len + c_i` instead would count `lead_pad[i]` padding columns as
+        // this sequence's content, and the next `front_align_batch` would pad
+        // relative to that: the prefix would compound every step, growing
+        // linearly rather than tracking the `sqrt(steps)` spread of the
+        // sequences themselves, and the rows would silently re-converge onto one
+        // length — the cohort barrier this whole path exists to remove,
+        // reappearing as padding.
         if let Some(committed) = per_sequence_commit {
             for (i, c) in committed.iter().enumerate() {
-                let target = cache_len + c;
+                let lead = lead_pad[i];
+                let target = cache_lens[i] + c;
                 for slot in input_seqs[i].normal_cache().iter_mut().flatten() {
                     let kind = slot.kind_name();
+                    if let Err(e) = crate::kv_cache::drop_dead_prefix(slot, lead) {
+                        candle_core::bail!(
+                            "MTP per-sequence advance: stripping the {lead}-column dead prefix \
+                             failed on a {kind} slot for batch row {i} ({e}). Continuing would \
+                             record that padding as the sequence's own length."
+                        );
+                    }
                     if let Err(e) = slot.set_len(target) {
                         candle_core::bail!(
                             "MTP per-sequence advance: set_len({target}) refused on a {kind} slot \
@@ -4251,6 +4562,297 @@ mod tests {
             err.contains("slot 1") && err.contains("XsRolling"),
             "the refusal must name which slot and which kind; got {err}"
         );
+    }
+
+    /// The **mask** capability, which this wave moves. A V4 target passes it
+    /// now (`dsv4_attention` takes a per-row `row_q0`); a plain-`Normal` target
+    /// still does not, and must say so rather than inherit V4's answer.
+    ///
+    /// Paired with the refusal that remains, so the pair reads as one
+    /// statement: the mask is no longer the blocker, and something else is.
+    #[test]
+    fn the_mask_capability_passes_for_v4_and_still_refuses_for_everyone_else() {
+        use crate::kv_cache::{EitherCache, KvCache, NormalCache, XsRollingCache};
+        use std::sync::{Arc, Mutex};
+
+        let v4_shaped = EitherCache::Normal(Arc::new(Mutex::new(NormalCache(vec![
+            KvCache::new_normal(2, 4096, 512),
+            KvCache::XsRolling(Box::new(XsRollingCache::new(4, 2, 64, 2048))),
+        ]))));
+        assert!(
+            model_masks_ragged_batches(&v4_shaped).is_ok(),
+            "a V4 target threads the per-row `row_q0` into `dsv4_attention`, so the ragged mask \
+             is no longer what blocks it"
+        );
+
+        let plain = EitherCache::Normal(Arc::new(Mutex::new(NormalCache(vec![
+            KvCache::new_normal(2, 4096, 512),
+            KvCache::new_normal(2, 4096, 512),
+        ]))));
+        let err = model_masks_ragged_batches(&plain).unwrap_err();
+        assert!(
+            err.contains("XsRolling") && err.contains("dead"),
+            "a non-V4 target must still refuse, and name why; got {err}"
+        );
+    }
+
+    /// 🔴 **The refusal moved; it did not disappear.** With all three
+    /// previously-named blockers cleared — the cache carries per-row lengths
+    /// (wave63-CO), V4's attention masks a ragged cohort (PR #100), and this
+    /// step's arithmetic is per-row — a V4 target must STILL be refused, and the
+    /// reason must now name the MTP **draft** chain, which is a second and
+    /// independent time base.
+    ///
+    /// This is the test that stops the remaining check from being quietly
+    /// dropped, and the assertions that it no longer names the cleared ones are
+    /// what make "the refusal moved" a claim a test can fail.
+    #[test]
+    fn a_fully_capable_v4_cache_is_still_refused_and_now_names_the_draft_chain() {
+        use crate::kv_cache::{EitherCache, KvCache, NormalCache, XsRollingCache};
+        use std::sync::{Arc, Mutex};
+
+        let v4 = EitherCache::Normal(Arc::new(Mutex::new(NormalCache(vec![
+            KvCache::new_normal(2, 4096, 512),
+            KvCache::XsRolling(Box::new(XsRollingCache::new(4, 2, 64, 2048))),
+        ]))));
+
+        // Force the cache capability ON, thread-locally, so checks (1) and (2)
+        // both pass and check (3) is the only thing left standing.
+        let refusal = crate::kv_cache::xs_per_seq_test_override::with(true, || {
+            assert!(
+                cache_supports_per_sequence_advance(&v4).is_ok(),
+                "precondition: with ARC_V4_XS_PER_SEQ on, a V4 cache carries per-row lengths"
+            );
+            assert!(
+                model_masks_ragged_batches(&v4).is_ok(),
+                "precondition: V4's attention now masks a ragged cohort"
+            );
+            per_sequence_refusal(&v4)
+        });
+
+        let why = refusal.expect(
+            "per-sequence advance must STILL be refused: the MTP draft chain keys a whole group \
+             on one absolute position, so rows at their own lengths can only be grouped \
+             one-per-sequence",
+        );
+        assert!(
+            why.contains("draft") && why.contains("forward_step"),
+            "the refusal must name the draft chain and the scalar `pos` it turns on, not a \
+             blocker that is already cleared; got {why}"
+        );
+        assert!(
+            !why.contains("XsRolling"),
+            "the refusal still names the compressor slot, so the flag is not reaching the \
+             cache and wave63-CO changed nothing; got {why}"
+        );
+        assert!(
+            !why.contains("window_ok") && !why.contains("cache_len"),
+            "the refusal still names the fused step's shared `cache_len`, which THIS wave \
+             removed — so it changed nothing; got {why}"
+        );
+    }
+
+    /// 🔑 The dispatch, pinned directly. A uniform batch — every B=1 request,
+    /// every batch built with the flag off — must return `None`, because `None`
+    /// is what runs the pre-change scalar arithmetic verbatim.
+    ///
+    /// ⚠️ This is the mutation PR #100 warned about and caught the hard way:
+    /// routing a uniform batch down the per-row path is **numerically
+    /// invisible**, since `cache_lens` would just be `cache_len` repeated. It is
+    /// still a real defect — it flips `set_prefill_toks_at` on for every decode,
+    /// builds a `[B]` offsets vector per forward, and sends `dsv4_attention` a
+    /// `row_q0` it has to re-check on all 43 layers. Only a test of the dispatch
+    /// itself can see it.
+    #[test]
+    fn a_uniform_batch_never_reaches_the_per_row_step_arithmetic() {
+        assert_eq!(
+            resolve_row_cache_lens(true, 40, &[0, 0, 0, 0]).unwrap(),
+            None,
+            "no row carries a dead prefix, so the batch is uniform and must take the scalar path"
+        );
+        assert_eq!(
+            resolve_row_cache_lens(true, 40, &[]).unwrap(),
+            None,
+            "an empty batch is uniform"
+        );
+        assert_eq!(
+            resolve_row_cache_lens(true, 40, &[0, 7, 0, 3]).unwrap(),
+            Some(vec![40, 33, 40, 37]),
+            "a row's own length is the batch width minus its dead prefix"
+        );
+    }
+
+    /// The per-row route is opt-in on the same flag that authorizes the only
+    /// producer of a ragged batch. With it off, even a batch that somehow
+    /// carries leads takes the scalar path — the gate is a guarantee, not a
+    /// coincidence.
+    #[test]
+    fn the_per_row_step_arithmetic_is_opt_in() {
+        assert_eq!(
+            resolve_row_cache_lens(false, 40, &[0, 7, 0, 3]).unwrap(),
+            None,
+            "with per-sequence advance off, nothing may take the per-row path"
+        );
+    }
+
+    /// `front_align_batch` pads every row UP TO the batch maximum, so no lead
+    /// can exceed the width and at least one row must have none. A vector that
+    /// breaks either half is not the layout this arithmetic is defined for, and
+    /// guessing would be a wrong answer nothing downstream catches.
+    #[test]
+    fn a_batch_that_is_not_a_left_aligned_cohort_is_refused_by_name() {
+        let err = resolve_row_cache_lens(true, 10, &[0, 12])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("wider than") && err.contains("disagree"),
+            "a lead past the batch width must say whose bookkeeping disagrees; got {err}"
+        );
+
+        let err = resolve_row_cache_lens(true, 10, &[2, 3])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("every row") && err.contains("end column"),
+            "a batch with no row at the shared end column must say so; got {err}"
+        );
+    }
+
+    /// 🔴 Defect 1, pinned as arithmetic. Fed the batched buffer's width, a
+    /// ragged cohort's uncached tails saturate to 0 for every row but the
+    /// longest, `window_ok` fails, and every ragged step defers — per-sequence
+    /// advance would be reachable but inert. Fed each row's own length, every
+    /// tail is 1, which is the B=1 invariant at every batch size.
+    ///
+    /// ⚠️ Arithmetic on the plan function, not a hardware measurement (D14).
+    #[test]
+    fn per_row_lengths_are_what_keep_a_ragged_cohorts_tails_inside_the_window() {
+        let w = 4usize;
+        // Three rows at 40/33/37 committed tokens, each one token ahead of its
+        // own cache — the steady state per-sequence advance produces.
+        let rows = [40usize, 33, 37];
+        let tok_lens: Vec<usize> = rows.iter().map(|r| r + 1).collect();
+        let cache_len = 40usize;
+
+        let shared = plan_step_window(&[cache_len; 3], &tok_lens, w);
+        assert_eq!(
+            shared.uncached,
+            vec![1, 0, 0],
+            "the shared width saturates every row but the longest"
+        );
+        assert!(
+            !shared.ok,
+            "which trips the window invariant, so the fused step would defer on every ragged step"
+        );
+
+        let per_row = plan_step_window(&rows, &tok_lens, w);
+        assert_eq!(per_row.uncached, vec![1, 1, 1]);
+        assert!(per_row.ok, "each row's own length puts every tail at 1");
+    }
+
+    /// 🔴 Defect 2, pinned as arithmetic: `toks[cache_lens[i]..]` is a panic
+    /// site unless `ok` guarantees the slice is in range. It does, for every
+    /// row, and that guarantee is the ONLY thing standing between the verify
+    /// window and an index past the end.
+    ///
+    /// ⚠️ Arithmetic on the plan function, not a hardware measurement (D14).
+    #[test]
+    fn the_window_invariant_is_what_keeps_the_verify_slice_in_range() {
+        let w = 4usize;
+        for cache_lens in [
+            vec![10usize, 10, 10],
+            vec![10usize, 7, 9],
+            vec![3usize, 3, 3],
+        ] {
+            for extra in [0usize, 1, 2, 4, 5] {
+                let tok_lens: Vec<usize> = cache_lens.iter().map(|c| c + extra).collect();
+                let plan = plan_step_window(&cache_lens, &tok_lens, w);
+                if plan.ok {
+                    for (i, &c) in cache_lens.iter().enumerate() {
+                        assert!(
+                            c < tok_lens[i],
+                            "ok must imply row {i}'s slice start {c} is inside its {} tokens",
+                            tok_lens[i]
+                        );
+                    }
+                }
+            }
+        }
+        // A cache longer than the sequence — what the shared width looks like to
+        // a short row — must never be reported ok.
+        assert!(
+            !plan_step_window(&[12, 12], &[13, 9], w).ok,
+            "a row whose cache claims more positions than it has tokens is not a state this \
+             fast path produced"
+        );
+    }
+
+    /// 🔴 The evidence behind the refusal that remains. Drafting groups on
+    /// `(u, chain_start)` because one MTP-block forward carries one absolute
+    /// position; on a batch that shares a length that is a function of `u`
+    /// alone, so the partition is unchanged and bounded by `depth + 1`. Under
+    /// per-sequence advance `u ≡ 1` and every row is at its own length, so the
+    /// partition degenerates to one group per sequence — `B` single-row block
+    /// forwards per chain step.
+    ///
+    /// Correct, and `B`x slower. That is why the mode is refused rather than
+    /// granted, and this is the arithmetic that says so.
+    ///
+    /// ⚠️ A count of groups, not a hardware measurement (D14).
+    #[test]
+    fn the_draft_group_partition_collapses_when_the_rows_carry_their_own_lengths() {
+        use std::collections::BTreeSet;
+        let count = |uncached: &[usize], cache_lens: &[usize]| -> usize {
+            uncached
+                .iter()
+                .zip(cache_lens)
+                .map(|(&u, &c)| draft_group_key(u, c))
+                .collect::<BTreeSet<_>>()
+                .len()
+        };
+
+        // The cohort batch: one shared width, tails spread over the window.
+        let uncached = [1usize, 2, 1, 3, 2, 1, 4, 1];
+        let shared = [40usize; 8];
+        assert_eq!(
+            count(&uncached, &shared),
+            4,
+            "sharing a width makes the chain start a function of `u`, so the partition is \
+             bounded by the window and one batched forward drafts for the whole group"
+        );
+
+        // The per-sequence batch: every tail is 1 (the point of the mode), every
+        // row is at its own length.
+        let per_seq_lens = [40usize, 33, 37, 31, 39, 35, 30, 38];
+        let ones = [1usize; 8];
+        assert_eq!(
+            count(&ones, &per_seq_lens),
+            8,
+            "with rows at their own lengths the partition is one group per sequence — the draft \
+             chain's shared absolute position, which is what `per_sequence_refusal` names"
+        );
+    }
+
+    /// The two window rules coincide on a uniform batch, which is the other
+    /// half of "flag off is byte-identical": the extracted function must not
+    /// have changed what the inline expression decided.
+    #[test]
+    fn the_window_invariant_is_unchanged_for_a_uniform_batch() {
+        let w = 4usize;
+        for cache_len in [0usize, 1, 2, 9] {
+            for tails in [vec![1usize, 1], vec![1, 4], vec![0, 1], vec![5, 1]] {
+                let tok_lens: Vec<usize> = tails.iter().map(|t| cache_len + t).collect();
+                let plan = plan_step_window(&[cache_len; 2], &tok_lens, w);
+                let legacy = cache_len + tails.iter().copied().min().unwrap_or(0) >= 2
+                    && tails.iter().all(|u| (1..=w).contains(u));
+                assert_eq!(
+                    plan.ok, legacy,
+                    "cache_len {cache_len}, tails {tails:?}: the per-row rule must agree with the \
+                     scalar one it replaced"
+                );
+                assert_eq!(plan.uncached, tails);
+            }
+        }
     }
 
     /// The plan functions agree on the one thing they must: the slots a

@@ -1542,6 +1542,7 @@ impl Attention {
             compress_ratio: self.compress_ratio,
             sliding_window: self.sliding_window,
             raw_prefix: 0,
+            row_q0: None,
         };
         // Faithful V4: the compressed (distant-context) KV, with compress-θ
         // RoPE at the strided compressed positions. `dsv4_attention` runs a
@@ -1700,6 +1701,14 @@ impl Attention {
                     &self.sdpa_params,
                     super::dsv4_attention::Dsv4AttentionConfig {
                         raw_prefix,
+                        // The dense path is the only one whose K/V rows are a
+                        // left-aligned ragged cohort (`front_pad_kv_cache`).
+                        // PagedAttention keeps per-request block tables, and
+                        // the graph-decode arm reads a FIXED window whose
+                        // columns are device slots, not absolute positions —
+                        // neither can be masked from `seqlen_offsets`, so both
+                        // keep `row_q0: None` and behave exactly as before.
+                        row_q0: ragged_row_q0(seqlen_offsets),
                         ..dsv4_cfg
                     },
                 )?
@@ -2465,6 +2474,40 @@ fn append_graph_kv_mqa(
 ///
 /// Resolved once: `deepseek4` used to scan the environment per timer call and
 /// paid ~390 `getenv`s per forward for it (wave33).
+/// The per-row absolute query positions [`super::dsv4_attention`] needs when
+/// the dense batch is a **left-aligned ragged** cohort, or `None` when it is
+/// not — which is every request today, because the flag defaults off.
+///
+/// `seqlen_offsets[i]` is already row `i`'s own past length: the engine threads
+/// it to every attention call so RoPE places the row's queries at their true
+/// absolute positions. That makes it exactly the `q0` V4's *compressed* branch
+/// needs and the `lead` its dead prefix needs, so no new value is plumbed —
+/// what changes is that `dsv4_attention` stops collapsing the vector to the
+/// single position it inferred from the cache width.
+///
+/// Gated on `ARC_MTP_PER_SEQ_KV` rather than on a flag of its own:
+/// [`crate::kv_cache::front_align_batch`] is the only producer of a ragged
+/// dense batch and it runs exclusively under `KvAdvance::PerSequence`, which
+/// that flag authorizes. With it off no batch is ever left-aligned, so the
+/// offsets would be uniform and `dsv4_attention` would take its scalar path
+/// anyway — the gate makes that a guarantee instead of a coincidence.
+///
+/// Resolved once, for the reason [`v4_fp8_kv_enabled`] documents: this is on
+/// the per-layer path, and a `getenv` per layer per step is ~43 per forward.
+fn ragged_row_q0(seqlen_offsets: &[usize]) -> Option<&[usize]> {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(crate::pipeline::mtp_pipeline::per_sequence_kv_requested);
+    ragged_row_q0_from(enabled, seqlen_offsets)
+}
+
+/// The decision itself, separated from the process-wide [`OnceLock`] so it can
+/// be tested against both settings rather than against whatever the test
+/// runner's environment happened to be (`ragged_row_q0_is_opt_in`). Same shape
+/// as [`fp8_kv_enabled_from`], for the same reason.
+fn ragged_row_q0_from(enabled: bool, seqlen_offsets: &[usize]) -> Option<&[usize]> {
+    enabled.then_some(seqlen_offsets)
+}
+
 fn v4_fp8_kv_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -5036,6 +5079,28 @@ mod kv_footprint_tests {
         );
     }
 
+    /// The per-row ragged mask is **opt-in**, and off it hands
+    /// `dsv4_attention` nothing at all — not a uniform vector it would have to
+    /// recognise, but `None`, so the scalar path is taken structurally.
+    ///
+    /// Tests [`ragged_row_q0_from`] rather than [`ragged_row_q0`] for the same
+    /// reason `v4_fp8_kv_is_opt_in` does: the latter is a `OnceLock`.
+    #[test]
+    fn ragged_row_q0_is_opt_in() {
+        let offsets = [10usize, 8, 5];
+        assert!(
+            ragged_row_q0_from(false, &offsets).is_none(),
+            "with per-sequence KV advance off no batch is ever left-aligned, so the model must \
+             not be handed per-row positions at all"
+        );
+        assert_eq!(
+            ragged_row_q0_from(true, &offsets),
+            Some(&offsets[..]),
+            "on, the row positions are `seqlen_offsets` verbatim — the value the engine already \
+             threads for RoPE, not a new one"
+        );
+    }
+
     /// A non-`Normal` KV slot must be refused loudly rather than silently
     /// quantizing or windowing a 1-wide marker.
     #[test]
@@ -6070,6 +6135,7 @@ mod tests {
             compress_ratio: CompressRatio::Csa,
             sliding_window: 4,
             raw_prefix: 0,
+            row_q0: None,
         };
 
         // Compressed KV (precomputed by `Attention::compressed_kv` in the real
@@ -6197,6 +6263,7 @@ mod tests {
             compress_ratio: CompressRatio::Standard,
             sliding_window: 1024,
             raw_prefix: 0,
+            row_q0: None,
         };
 
         // Correct: sequence 0 attends over its own 3 keys.
@@ -6340,6 +6407,7 @@ mod tests {
             compress_ratio: CompressRatio::Hca,
             sliding_window: 8,
             raw_prefix: 0,
+            row_q0: None,
         };
 
         // Compressed KV: T_c = t_k / ratio = 1 entry, shape [B, 1, T_c, D].
@@ -6426,6 +6494,7 @@ mod tests {
             compress_ratio: CompressRatio::Standard,
             sliding_window: 4,
             raw_prefix: 0,
+            row_q0: None,
         };
 
         // Standard layers must bypass the compressed branch entirely: even if
