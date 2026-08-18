@@ -53,6 +53,7 @@ pub use model_selected::ModelSelected;
 pub use toml_selector::{get_toml_selected_model_device_map_params, get_toml_selected_model_dtype};
 
 mod amoe;
+pub mod arc_arena;
 pub mod arc_boost;
 mod attention;
 mod diagnostics;

@@ -1580,6 +1580,11 @@ impl Pipeline for NormalPipeline {
                 {
                     let probe = std::env::var_os("ARC_V4_CAPTURE_PROBE").is_some();
                     let (bs, seq_len) = input_ids.dims2().unwrap_or((0, 0));
+                    // ArcInfer/ArcGraph: switch the static decode arena on once
+                    // decode has started (never during load -- see arc_arena).
+                    if seq_len == 1 {
+                        crate::arc_arena::on_decode_step(&self.device());
+                    }
                     if !probe {
                         // The only CUDA-graph path structurally reachable from
                         // a plain V4 run, and it is gated off by default. Say so
@@ -1786,6 +1791,8 @@ impl Pipeline for NormalPipeline {
                 flash_meta_full.as_ref().unwrap_or(&flash_meta),
             )?,
         };
+        #[cfg(feature = "cuda")]
+        crate::arc_arena::logits_fingerprint(&logits);
         if return_raw_logits {
             Ok(ForwardInputsResult::RawLogits { logits })
         } else {
