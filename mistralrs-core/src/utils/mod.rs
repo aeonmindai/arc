@@ -10,6 +10,33 @@ pub(crate) mod tokens;
 pub(crate) mod unvarbuilder;
 pub(crate) mod varbuilder_utils;
 
+/// Hand a response to its client, without suspending the caller when the
+/// client's channel has room.
+///
+/// The engine dispatches responses one sequence at a time from inside the decode
+/// loop, holding the pipeline mutex. A bare `Sender::send(..).await` makes every
+/// one of those an await point on the engine task, so any single slow client sits
+/// on the critical path of every other client's *compute*. `try_send` is a plain
+/// push and covers the whole steady state (the server's per-request channel is
+/// 10,000 deep); only a genuinely full channel falls back to the awaiting send,
+/// which is exactly where backpressure belongs.
+///
+/// Ordering is unchanged. A sequence produces at most one response per engine
+/// step and steps are sequential, so the per-client sequence of responses is the
+/// same as before — this only changes whether the engine parks while pushing it.
+pub async fn send_fast(
+    responder: &tokio::sync::mpsc::Sender<crate::response::Response>,
+    response: crate::response::Response,
+) -> Result<(), tokio::sync::mpsc::error::SendError<crate::response::Response>> {
+    use tokio::sync::mpsc::error::{SendError, TrySendError};
+    match responder.try_send(response) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(response)) => responder.send(response).await,
+        Err(TrySendError::Closed(response)) => Err(SendError(response)),
+    }
+}
+
+#[doc(hidden)]
 /// Deliver a terminal error response to one sequence's client, tolerating a
 /// client that has already gone away.
 ///
@@ -28,7 +55,6 @@ pub(crate) mod varbuilder_utils;
 /// departed client therefore escalated one failed request into a dead engine
 /// and orphaned every other sequence in flight. Error *reporting* is the one
 /// path that must not be able to fail loudly.
-#[doc(hidden)]
 pub async fn send_response_or_log(
     responder: &tokio::sync::mpsc::Sender<crate::response::Response>,
     response: crate::response::Response,
@@ -39,6 +65,92 @@ pub async fn send_response_or_log(
             "Receiver for sequence {seq_id} disconnected before its error response could be \
              delivered; dropping the response. The engine is unaffected."
         );
+    }
+}
+
+#[cfg(test)]
+mod send_fast_tests {
+    use super::send_fast;
+    use crate::response::Response;
+    use futures::FutureExt;
+
+    /// The whole point of `send_fast`: on the steady-state path it must complete
+    /// without ever yielding, so the engine loop never parks while dispatching a
+    /// response to a client that has room.
+    ///
+    /// `now_or_never` polls exactly once. If the future is not ready after that
+    /// single poll it returns `None` — which is precisely "this awaited".
+    ///
+    /// Mutation check: replace the `try_send` fast path with a plain
+    /// `responder.send(response).await` and this assertion still passes (tokio's
+    /// `send` is also ready when there is room), so the *discriminating* case is
+    /// the full-channel test below, which is where the two shapes differ.
+    #[test]
+    fn a_client_with_room_is_served_without_suspending() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Response>(4);
+
+        let done = send_fast(&tx, Response::ValidationError("chunk".into())).now_or_never();
+
+        assert!(
+            done.is_some(),
+            "send_fast suspended on a channel with room; the engine would park here"
+        );
+        assert!(done.unwrap().is_ok());
+        assert!(
+            rx.try_recv().is_ok(),
+            "the response must actually have been delivered, not merely not-awaited"
+        );
+    }
+
+    /// Backpressure is preserved: a genuinely full channel still blocks the
+    /// sender, and the message survives the fallback rather than being dropped.
+    #[tokio::test]
+    async fn a_full_channel_still_applies_backpressure_and_keeps_the_message() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Response>(1);
+        tx.send(Response::ValidationError("first".into()))
+            .await
+            .unwrap();
+
+        // Fixture discrimination (D12): the channel must really be full, or this
+        // test would pass for a fast path that was never exercised.
+        assert!(
+            send_fast(&tx, Response::ValidationError("second".into()))
+                .now_or_never()
+                .is_none(),
+            "fixture cannot discriminate: the channel must be full here"
+        );
+
+        let drainer = tokio::spawn(async move {
+            let first = rx.recv().await;
+            let second = rx.recv().await;
+            (first, second)
+        });
+        send_fast(&tx, Response::ValidationError("second".into()))
+            .await
+            .expect("the fallback send must succeed once the receiver drains");
+        drop(tx);
+
+        let (first, second) = drainer.await.unwrap();
+        assert!(
+            matches!(first, Some(Response::ValidationError(ref s)) if s.to_string() == "first")
+        );
+        assert!(
+            matches!(second, Some(Response::ValidationError(ref s)) if s.to_string() == "second")
+        );
+    }
+
+    /// A departed client is an error, not a hang — and the undelivered response
+    /// comes back with it, matching `Sender::send`'s contract.
+    #[test]
+    fn a_departed_client_returns_the_message() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Response>(4);
+        drop(rx);
+
+        let err = send_fast(&tx, Response::ValidationError("orphan".into()))
+            .now_or_never()
+            .expect("a closed channel must not suspend")
+            .expect_err("a closed channel must be an error");
+        assert!(matches!(err.0, Response::ValidationError(ref s) if s.to_string() == "orphan"));
     }
 }
 
@@ -245,51 +357,46 @@ macro_rules! handle_pipeline_forward_error {
                     }
                 }
                 for seq in $seq_slice.iter_mut() {
-                    // Step 2: Respond with all groups
-                    let group = seq.get_mut_group();
-
-                    if group.is_chat {
-                        let partial_completion_response = ChatCompletionResponse {
-                            id: seq.id().to_string(),
-                            choices: group.get_choices().to_vec(),
-                            created: seq.creation_time(),
-                            model: pipeline_name.clone(),
-                            system_fingerprint: SYSTEM_FINGERPRINT.to_string(),
-                            object: "chat.completion".to_string(),
-                            usage: group.get_usage(),
-                            vote: None,
-                        };
-
-                        $crate::utils::send_response_or_log(
-                            &seq.responder(),
+                    // Step 2: Respond with all groups. The group lock is taken
+                    // to BUILD the payload and dropped before the send await —
+                    // the guard is `!Send`, so the old shape does not compile.
+                    let response = {
+                        let group = seq.get_mut_group();
+                        if group.is_chat {
                             Response::ModelError(
                                 e.to_string(),
-                                partial_completion_response
-                            ),
-                            *seq.id(),
-                        )
-                        .await;
-                    } else {
-                        let partial_completion_response = CompletionResponse {
-                            id: seq.id().to_string(),
-                            choices: group.get_completion_choices().to_vec(),
-                            created: seq.creation_time(),
-                            model: pipeline_name.clone(),
-                            system_fingerprint: SYSTEM_FINGERPRINT.to_string(),
-                            object: "text_completion".to_string(),
-                            usage: group.get_usage(),
-                        };
-
-                        $crate::utils::send_response_or_log(
-                            &seq.responder(),
+                                ChatCompletionResponse {
+                                    id: seq.id().to_string(),
+                                    choices: group.get_choices().to_vec(),
+                                    created: seq.creation_time(),
+                                    model: pipeline_name.clone(),
+                                    system_fingerprint: SYSTEM_FINGERPRINT.to_string(),
+                                    object: "chat.completion".to_string(),
+                                    usage: group.get_usage(),
+                                    vote: None,
+                                },
+                            )
+                        } else {
                             Response::CompletionModelError(
                                 e.to_string(),
-                                partial_completion_response
-                            ),
-                            *seq.id(),
-                        )
-                        .await;
-                    }
+                                CompletionResponse {
+                                    id: seq.id().to_string(),
+                                    choices: group.get_completion_choices().to_vec(),
+                                    created: seq.creation_time(),
+                                    model: pipeline_name.clone(),
+                                    system_fingerprint: SYSTEM_FINGERPRINT.to_string(),
+                                    object: "text_completion".to_string(),
+                                    usage: group.get_usage(),
+                                },
+                            )
+                        }
+                    };
+                    $crate::utils::send_response_or_log(
+                        &seq.responder(),
+                        response,
+                        *seq.id(),
+                    )
+                    .await;
                 }
                 for seq in $seq_slice.iter_mut() {
                     // Step 3: Set state - This cannot be done in Step 2 as `group` is locking the refcell
@@ -314,16 +421,28 @@ macro_rules! handle_pipeline_forward_error {
     };
 }
 
+/// Acquire the sequence's [`crate::sequence::SequenceGroup`].
+///
+/// This used to be a `try_lock` in a bare `loop` with `std::thread::yield_now()`
+/// — a spin. Two things were wrong with it. It burns a core whenever the lock is
+/// actually contended, and `std::thread::yield_now()` yields the *OS thread*,
+/// not the tokio task, so a spinner could not let a suspended lock holder on the
+/// same worker run at all. The group is now a `std::sync::Mutex`, so this is a
+/// real blocking acquire that parks instead of spinning.
+///
+/// The guard is `!Send`, which is deliberate: it makes "hold the group lock
+/// across an `.await`" a compile error rather than a latent hazard.
+///
+/// Poisoning is recovered rather than propagated: a `SequenceGroup` is plain
+/// accumulator data with no invariant a panic could break, and turning a panic
+/// in one request into a permanent hang for the engine loop is strictly worse.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! get_mut_group {
     ($this:expr) => {
-        loop {
-            if let Ok(inner) = $this.group.try_lock() {
-                break inner;
-            }
-            // Yield to allow other threads to make progress and release the lock.
-            std::thread::yield_now();
+        match $this.group.lock() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
         }
     };
 }

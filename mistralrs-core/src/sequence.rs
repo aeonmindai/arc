@@ -21,13 +21,10 @@ use std::{
     fmt::Display,
     hash::{DefaultHasher, Hash, Hasher},
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, MutexGuard, RwLock},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{
-    mpsc::{error::SendError, Sender},
-    Mutex, MutexGuard,
-};
+use tokio::sync::mpsc::Sender;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum StopReason {
@@ -1156,15 +1153,17 @@ impl Sequence {
             0
         };
 
+        // One acquisition, five fields. This used to re-lock per field, which
+        // was five acquisitions per call on a lock taken several times per token
+        // per sequence.
+        let mut group = get_mut_group!(self);
         if let Some(ts) = self.prompt_timestamp {
-            get_mut_group!(self).total_completion_time = now - ts;
-            get_mut_group!(self).total_prompt_time = prompt_time_ms;
+            group.total_completion_time = now - ts;
+            group.total_prompt_time = prompt_time_ms;
         }
-
-        get_mut_group!(self).total_time = now - self.timestamp;
-
-        get_mut_group!(self).total_prompt_toks = self.prompt_len;
-        get_mut_group!(self).total_toks = self.len();
+        group.total_time = now - self.timestamp;
+        group.total_prompt_toks = self.prompt_len;
+        group.total_toks = self.len();
     }
 
     pub fn add_image_choice_to_group(&self, choice: ImageChoice) {
@@ -1577,140 +1576,107 @@ impl SequenceGroup {
         }
     }
 
-    pub async fn maybe_send_chat_done_response(
-        &self,
-        response: ChatCompletionResponse,
-        sender: Sender<Response>,
-    ) -> Result<(), SendError<Response>> {
-        if self.choices.len() == self.n_choices {
-            sender.send(Response::Done(response)).await?;
-        }
+    // ---------------------------------------------------------------------
+    // Response construction.
+    //
+    // These were `async fn`s that took `&self` and `.await`ed the client's
+    // `Sender` inside. Every caller reached them through the group `MutexGuard`,
+    // so the group lock was held across the send — one client's backpressure
+    // could stall the engine loop while it owned a lock other work needed.
+    //
+    // They are now plain constructors: they decide whether the group is
+    // complete and, if so, hand back the `Response`. The caller drops the guard
+    // and then dispatches. With the group behind a `std::sync::Mutex` the guard
+    // is `!Send`, so the old shape no longer compiles.
+    // ---------------------------------------------------------------------
 
-        Ok(())
+    /// The terminal chat response, once every choice in the group has landed.
+    pub fn chat_done_response(&self, response: ChatCompletionResponse) -> Option<Response> {
+        (self.choices.len() == self.n_choices).then_some(Response::Done(response))
     }
 
-    pub async fn maybe_send_raw_done_response(
-        &self,
-        sender: Sender<Response>,
-    ) -> Result<(), SendError<Response>> {
-        if self.raw_choices.len() == self.n_choices {
-            assert_eq!(self.raw_choices.len(), 1);
-            let (logits_chunks, tokens) = self.raw_choices[0].clone();
-            sender
-                .send(Response::Raw {
-                    logits_chunks,
-                    tokens,
-                })
-                .await?;
-        }
-
-        Ok(())
+    /// The terminal completion response, once every choice in the group has landed.
+    pub fn completion_done_response(&self, response: CompletionResponse) -> Option<Response> {
+        (self.completion_choices.len() == self.n_choices)
+            .then_some(Response::CompletionDone(response))
     }
 
-    pub async fn maybe_send_embedding_done_response(
-        &self,
-        sender: Sender<Response>,
-    ) -> Result<(), SendError<Response>> {
-        if self.embedding_choices.len() == self.n_choices {
-            assert_eq!(self.embedding_choices.len(), 1);
-            let embeddings = self.embedding_choices[0].clone();
-            let prompt_tokens = self.total_prompt_toks;
-            let total_tokens = self.total_toks;
-            sender
-                .send(Response::Embeddings {
-                    embeddings,
-                    prompt_tokens,
-                    total_tokens,
-                })
-                .await?;
+    pub fn raw_done_response(&self) -> Option<Response> {
+        if self.raw_choices.len() != self.n_choices {
+            return None;
         }
-
-        Ok(())
+        assert_eq!(self.raw_choices.len(), 1);
+        let (logits_chunks, tokens) = self.raw_choices[0].clone();
+        Some(Response::Raw {
+            logits_chunks,
+            tokens,
+        })
     }
 
-    pub async fn maybe_send_image_gen_response(
-        &self,
-        response: ImageGenerationResponse,
-        sender: Sender<Response>,
-    ) -> Result<(), SendError<Response>> {
-        if self.image_choices.len() == self.n_choices {
-            sender.send(Response::ImageGeneration(response)).await?;
+    pub fn embedding_done_response(&self) -> Option<Response> {
+        if self.embedding_choices.len() != self.n_choices {
+            return None;
         }
-
-        Ok(())
+        assert_eq!(self.embedding_choices.len(), 1);
+        Some(Response::Embeddings {
+            embeddings: self.embedding_choices[0].clone(),
+            prompt_tokens: self.total_prompt_toks,
+            total_tokens: self.total_toks,
+        })
     }
 
-    pub async fn maybe_send_speech_response(
-        &self,
-        sender: Sender<Response>,
-    ) -> Result<(), SendError<Response>> {
+    pub fn image_gen_response(&self, response: ImageGenerationResponse) -> Option<Response> {
+        (self.image_choices.len() == self.n_choices).then_some(Response::ImageGeneration(response))
+    }
+
+    pub fn speech_response(&self) -> Option<Response> {
         assert_eq!(self.speech_pcms.len(), 1);
-
         let (pcm, rate, channels) = self.speech_pcms[0].clone();
-        sender
-            .send(Response::Speech {
-                pcm,
-                rate,
-                channels,
-            })
-            .await?;
-
-        Ok(())
+        Some(Response::Speech {
+            pcm,
+            rate,
+            channels,
+        })
     }
 
-    pub async fn maybe_send_streaming_response(
+    /// The streaming chunk for this step, taking the buffered chunks with it.
+    ///
+    /// Returns `None` when this group still owes chunks from sibling choices, or
+    /// when the request is not streaming — in both cases nothing is sent, which
+    /// is what the previous `maybe_send_streaming_response` did.
+    pub fn take_streaming_response(
         &mut self,
         seq: &Sequence,
         model: String,
         usage_opt: Option<Usage>,
-    ) -> Result<(), Box<SendError<Response>>> {
-        if self.chat_streaming_chunks.len() == self.n_choices && self.is_streaming {
-            let mut swap_streaming_chunks = vec![];
-
-            std::mem::swap(&mut swap_streaming_chunks, &mut self.chat_streaming_chunks);
-
-            seq.responder()
-                .send(Response::Chunk(ChatCompletionChunkResponse {
-                    id: seq.id.to_string(),
-                    choices: swap_streaming_chunks,
-                    created: seq.creation_time() as u128,
-                    model: model.clone(),
-                    system_fingerprint: SYSTEM_FINGERPRINT.to_string(),
-                    object: "chat.completion.chunk".to_string(),
-                    usage: usage_opt,
-                }))
-                .await?;
-        } else if self.completion_streaming_chunks.len() == self.n_choices && self.is_streaming {
-            let mut swap_streaming_chunks = vec![];
-
-            std::mem::swap(
-                &mut swap_streaming_chunks,
-                &mut self.completion_streaming_chunks,
-            );
-
-            seq.responder()
-                .send(Response::CompletionChunk(CompletionChunkResponse {
-                    id: seq.id.to_string(),
-                    choices: swap_streaming_chunks,
-                    created: seq.creation_time() as u128,
-                    model: model.clone(),
-                    system_fingerprint: SYSTEM_FINGERPRINT.to_string(),
-                    object: "text_completion".to_string(),
-                }))
-                .await?;
+    ) -> Option<Response> {
+        if !self.is_streaming {
+            return None;
         }
-        Ok(())
-    }
-
-    pub async fn maybe_send_completion_done_response(
-        &self,
-        response: CompletionResponse,
-        sender: Sender<Response>,
-    ) -> Result<(), Box<SendError<Response>>> {
-        if self.completion_choices.len() == self.n_choices {
-            sender.send(Response::CompletionDone(response)).await?;
+        if self.chat_streaming_chunks.len() == self.n_choices {
+            let choices = std::mem::take(&mut self.chat_streaming_chunks);
+            Some(Response::Chunk(ChatCompletionChunkResponse {
+                id: seq.id.to_string(),
+                choices,
+                created: seq.creation_time() as u128,
+                model,
+                system_fingerprint: SYSTEM_FINGERPRINT.to_string(),
+                object: "chat.completion.chunk".to_string(),
+                usage: usage_opt,
+            }))
+        } else if self.completion_streaming_chunks.len() == self.n_choices {
+            let choices = std::mem::take(&mut self.completion_streaming_chunks);
+            Some(Response::CompletionChunk(CompletionChunkResponse {
+                id: seq.id.to_string(),
+                choices,
+                created: seq.creation_time() as u128,
+                model,
+                system_fingerprint: SYSTEM_FINGERPRINT.to_string(),
+                object: "text_completion".to_string(),
+            }))
+        } else {
+            None
         }
-        Ok(())
     }
 }
 
@@ -1858,7 +1824,7 @@ mod tests {
         // The strong chain reports first and becomes the group's best
         // (-0.05); it is never culled by its own threshold.
         assert_eq!(strong.check_confidence_early_stop(), None);
-        let best = group.try_lock().unwrap().best_confidence.unwrap();
+        let best = group.lock().unwrap().best_confidence.unwrap();
         assert!((best - (-0.05)).abs() < 1e-5, "best = {best}");
 
         // The weak chain (-1.0) is far below best/frac = -0.1: culled.
@@ -1872,5 +1838,79 @@ mod tests {
         let lowest = weak.confidence().lowest_group().unwrap();
         assert!((mean - (-1.0)).abs() < 1e-5, "mean = {mean}");
         assert!((lowest - (-1.0)).abs() < 1e-5, "lowest = {lowest}");
+    }
+
+    fn chunk(index: usize) -> ChunkChoice {
+        ChunkChoice {
+            delta: crate::Delta {
+                content: Some("tok".to_string()),
+                role: "assistant".to_string(),
+                tool_calls: None,
+                reasoning_content: None,
+            },
+            index,
+            finish_reason: None,
+            logprobs: None,
+        }
+    }
+
+    /// `take_streaming_response` replaced the `async fn
+    /// maybe_send_streaming_response` that used to `.await` the client's channel
+    /// with the group `MutexGuard` still held. The gating it inherited must be
+    /// preserved exactly: nothing is emitted until every choice in the group has
+    /// buffered a chunk for this step, and emitting drains the buffer so the next
+    /// step starts empty.
+    #[test]
+    fn a_streaming_chunk_waits_for_every_sibling_choice_then_drains() {
+        let group = Arc::new(Mutex::new(SequenceGroup::new(2, true, true, None)));
+        let a = dummy_seq("q", group.clone(), 0);
+        let b = dummy_seq("q", group.clone(), 1);
+
+        // One of two choices has reported: nothing goes out yet.
+        a.add_streaming_chunk_choice_to_group(chunk(0));
+        assert!(
+            group
+                .lock()
+                .unwrap()
+                .take_streaming_response(&a, "m".into(), None)
+                .is_none(),
+            "a half-filled group must not emit — the sibling's chunk would be lost"
+        );
+
+        // Both have reported: one Chunk carrying both choices.
+        b.add_streaming_chunk_choice_to_group(chunk(1));
+        let response = group
+            .lock()
+            .unwrap()
+            .take_streaming_response(&a, "m".into(), None)
+            .expect("a complete group must emit");
+        match response {
+            Response::Chunk(c) => assert_eq!(c.choices.len(), 2),
+            _ => panic!("expected a chat chunk"),
+        }
+
+        // The buffer is drained, so the next step does not re-send this one.
+        assert!(
+            group
+                .lock()
+                .unwrap()
+                .take_streaming_response(&a, "m".into(), None)
+                .is_none(),
+            "the emitted chunks must have been taken, not copied"
+        );
+    }
+
+    /// A non-streaming group never produces a streaming chunk, however many
+    /// chunks happen to be buffered.
+    #[test]
+    fn a_non_streaming_group_emits_no_chunk() {
+        let group = Arc::new(Mutex::new(SequenceGroup::new(1, false, true, None)));
+        let seq = dummy_seq("q", group.clone(), 0);
+        seq.add_streaming_chunk_choice_to_group(chunk(0));
+        assert!(group
+            .lock()
+            .unwrap()
+            .take_streaming_response(&seq, "m".into(), None)
+            .is_none());
     }
 }
