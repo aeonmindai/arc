@@ -75,8 +75,9 @@
 
 use candle_core::{DType, Device, Result, Tensor};
 use mistralrs_quant::{
-    qtip_expected_distinct_experts, Qtip2bLayer, QtipMode, QuantMethod, QTIP_GATHER_GEMV_MAX_PAIRS,
-    QTIP_GROUPED_TILE_K, QTIP_GROUPED_TILE_M, QTIP_ONDEVICE_MOE_MAX_TOKENS_ENV,
+    grouped_launch_counts, qtip_expected_distinct_experts, set_grouped_variant, Qtip2bLayer,
+    QtipMode, QuantMethod, QTIP_GATHER_GEMV_MAX_PAIRS, QTIP_GROUPED_TILE_K, QTIP_GROUPED_TILE_M,
+    QTIP_GROUPED_VARIANT_BASELINE, QTIP_GROUPED_VARIANT_TUNED, QTIP_ONDEVICE_MOE_MAX_TOKENS_ENV,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -664,6 +665,258 @@ fn report_verdict(
 }
 
 // ---------------------------------------------------------------------------
+// `--ab`: grouped kernel variant A/B with an INTERLEAVED null control
+// ---------------------------------------------------------------------------
+//
+// ONE BINARY, ONE VARIABLE. Both kernel variants are compiled into this
+// binary; `set_grouped_variant` picks per launch. The arms are separated by a
+// RUNTIME fact — `grouped_launch_counts()` — not by which build ran.
+//
+// A null control gives the floor for THAT RUN, not "the floor": measured
+// across four runs on this fleet it moved ~4x (0.67 / 2.45 / 2.54 / 1.30 %).
+// So the sequence is `U F U N` repeated, every arm is differenced against its
+// TEMPORAL NEIGHBOUR, and the treatment must beat the null's spread by >=2x.
+// `N` is the baseline kernel run in the treatment's slot: any difference it
+// shows is pure instrument.
+
+/// Bar for calling the tuned variant real: the mean paired effect must exceed
+/// the largest null effect this same run produced, by this factor.
+const AB_MARGIN_OVER_NULL: f64 = 2.0;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Arm {
+    /// Baseline kernel in the baseline slot.
+    U,
+    /// Tuned kernel in the treatment slot.
+    F,
+    /// Baseline kernel in the TREATMENT slot — the run's own floor.
+    N,
+}
+
+impl Arm {
+    fn variant(self) -> i32 {
+        match self {
+            Arm::F => QTIP_GROUPED_VARIANT_TUNED,
+            Arm::U | Arm::N => QTIP_GROUPED_VARIANT_BASELINE,
+        }
+    }
+    fn tag(self) -> &'static str {
+        match self {
+            Arm::U => "U",
+            Arm::F => "F",
+            Arm::N => "N",
+        }
+    }
+}
+
+/// Time one arm, and PROVE from the runtime counters that the kernel we asked
+/// for is the kernel that ran.
+///
+/// Three states, not two: `Ok(secs)` measured, `Err` for a real failure, and
+/// an explicit bail when the counters cannot answer (no launches at all means
+/// `gather_forward` went somewhere else entirely and the timing is of some
+/// other code path).
+#[allow(clippy::too_many_arguments)]
+fn time_arm(
+    dev: &Device,
+    layer: &Arc<dyn QuantMethod>,
+    arm: Arm,
+    a: &Tensor,
+    idx_sets: &[Tensor],
+    iters: usize,
+) -> Result<f64> {
+    set_grouped_variant(arm.variant());
+    let want = arm.variant() as usize;
+    let other = 1 - want;
+
+    for r in 0..4usize {
+        let _ = layer.gather_forward(a, &idx_sets[r % idx_sets.len()])?;
+    }
+    dev.synchronize()?;
+
+    let before = grouped_launch_counts();
+    let t = Instant::now();
+    for i in 0..iters {
+        let _ = layer.gather_forward(a, &idx_sets[i % idx_sets.len()])?;
+    }
+    dev.synchronize()?;
+    let secs = t.elapsed().as_secs_f64() / iters as f64;
+    let after = grouped_launch_counts();
+
+    let ran = after[want] - before[want];
+    let stray = after[other] - before[other];
+    if ran != iters as u64 {
+        candle_core::bail!(
+            "arm {}: asked for grouped variant {want} and the runtime counter advanced by {ran}, \
+             not {iters}. The variant switch did not take (or gather_forward left the grouped \
+             kernel), so this timing is NOT the kernel it is labeled with.",
+            arm.tag()
+        );
+    }
+    if stray != 0 {
+        candle_core::bail!(
+            "arm {}: {stray} launches of grouped variant {other} happened inside this arm's \
+             timing window. The two arms are not separated.",
+            arm.tag()
+        );
+    }
+    Ok(secs)
+}
+
+/// The tuned variant is a pure re-routing of the same decode — same weights,
+/// same k-order, same f32 accumulators — so its output must be BIT-IDENTICAL,
+/// not merely close. Checked before any timing.
+///
+/// D12: the check is handed a case it must reject (a different routing draw),
+/// so "identical" cannot be an artifact of comparing a tensor with itself.
+fn assert_variants_bit_identical(
+    dev: &Device,
+    layer: &Arc<dyn QuantMethod>,
+    a: &Tensor,
+    idx_sets: &[Tensor],
+) -> Result<()> {
+    let bytes = |t: &Tensor| -> Result<Vec<u8>> {
+        let f = t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        Ok(f.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect())
+    };
+
+    set_grouped_variant(QTIP_GROUPED_VARIANT_BASELINE);
+    let base = bytes(&layer.gather_forward(a, &idx_sets[0])?)?;
+    set_grouped_variant(QTIP_GROUPED_VARIANT_TUNED);
+    let tuned = bytes(&layer.gather_forward(a, &idx_sets[0])?)?;
+    dev.synchronize()?;
+
+    // Negative control: a different routing draw MUST produce different bytes,
+    // or this comparison could not have detected a wrong kernel either.
+    set_grouped_variant(QTIP_GROUPED_VARIANT_BASELINE);
+    let elsewhere = bytes(&layer.gather_forward(a, &idx_sets[1 % idx_sets.len()])?)?;
+    if elsewhere == base {
+        candle_core::bail!(
+            "PARITY CHECK IS BLIND: two DIFFERENT routing draws produced byte-identical output, \
+             so byte-equality cannot distinguish the tuned kernel from a wrong one."
+        );
+    }
+
+    let diff = base
+        .iter()
+        .zip(tuned.iter())
+        .filter(|(x, y)| x != y)
+        .count();
+    if diff != 0 {
+        candle_core::bail!(
+            "tuned grouped variant is NOT bit-identical to the baseline: {diff}/{} bytes differ. \
+             The pair-reversal is a pure bit permutation, so ANY difference is a bug, not a \
+             tolerance question.",
+            base.len()
+        );
+    }
+    println!(
+        "parity OK: tuned == baseline byte-for-byte over {} output bytes; a different routing \
+         draw differs (control has teeth).",
+        base.len()
+    );
+    Ok(())
+}
+
+fn mean(v: &[f64]) -> f64 {
+    v.iter().sum::<f64>() / v.len() as f64
+}
+
+fn run_ab(dev: &Device, cfg: &Cfg, act_dtype: DType, b: usize, rounds: usize) -> Result<()> {
+    let shapes = ab_shapes(cfg.small);
+    assert_coverage_headroom(cfg.experts, &[b])?;
+
+    for s in &shapes {
+        assert_cuda_paths_reachable(s.k, act_dtype)?;
+        assert_defeats_l2(cfg.experts, bytes_per_expert(s))?;
+
+        let w =
+            Tensor::randn(0f32, 0.02f32, (cfg.experts, s.n, s.k), dev)?.to_dtype(DType::BF16)?;
+        let layer = Qtip2bLayer::quantize_with_mode(&w, None, dev, QtipMode::Viterbi)?;
+        drop(w);
+
+        let (idx_sets, mean_distinct, mean_tiles, pairs) = build_routing(dev, b, cfg.experts)?;
+        assert_routing_matches_model(b, cfg.experts, mean_distinct)?;
+        let a = Tensor::randn(0f32, 1f32, (b, TOPK, s.k), dev)?.to_dtype(act_dtype)?;
+
+        println!(
+            "\n[{}] N={} K={} E={} B={b} pairs={} E(B)={mean_distinct:.1} m-tiles={mean_tiles:.1}",
+            s.name, s.n, s.k, cfg.experts, pairs as usize
+        );
+        assert_variants_bit_identical(dev, &layer, &a, &idx_sets)?;
+
+        // U F U N, repeated. Every treatment slot is differenced against the
+        // U that immediately precedes it.
+        let seq = [Arm::U, Arm::F, Arm::U, Arm::N];
+        let mut treat: Vec<f64> = Vec::new();
+        let mut null: Vec<f64> = Vec::new();
+        let mut last_u: Option<f64> = None;
+
+        for round in 0..rounds {
+            for arm in seq {
+                let secs = time_arm(dev, &layer, arm, &a, &idx_sets, cfg.iters)?;
+                let unit = secs / mean_tiles * 1e6;
+                let rel = last_u.map(|u| (u - secs) / u * 100.0);
+                println!(
+                    "  r{round} [{}] {:>9.1} us/call | {:>6.2} us/m-tile{}",
+                    arm.tag(),
+                    secs * 1e6,
+                    unit,
+                    match rel {
+                        Some(p) if arm != Arm::U => format!(" | vs prev U: {p:+.2}%"),
+                        _ => String::new(),
+                    }
+                );
+                match arm {
+                    Arm::U => last_u = Some(secs),
+                    Arm::F => {
+                        if let Some(u) = last_u {
+                            treat.push((u - secs) / u * 100.0);
+                        }
+                    }
+                    Arm::N => {
+                        if let Some(u) = last_u {
+                            null.push((u - secs) / u * 100.0);
+                        }
+                    }
+                }
+            }
+        }
+
+        if treat.is_empty() || null.is_empty() {
+            candle_core::bail!("--ab produced no paired differences; raise --rounds");
+        }
+        let t_mean = mean(&treat);
+        let t_spread = treat.iter().cloned().fold(f64::MIN, f64::max)
+            - treat.iter().cloned().fold(f64::MAX, f64::min);
+        let n_worst = null.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        println!(
+            "  -- {} paired diffs: TREATMENT mean {:+.2}% (spread {:.2}pp), NULL worst |{:.2}|% --",
+            s.name, t_mean, t_spread, n_worst
+        );
+        if t_mean > n_worst * AB_MARGIN_OVER_NULL {
+            println!(
+                "  VERDICT [{}]: tuned is FASTER by {:+.2}% — clears this run's own floor \
+                 ({:.2}%) by {:.1}x.",
+                s.name,
+                t_mean,
+                n_worst,
+                t_mean / n_worst.max(1e-9)
+            );
+        } else {
+            println!(
+                "  VERDICT [{}]: {:+.2}% does NOT clear this run's null floor ({:.2}%) by the \
+                 required {AB_MARGIN_OVER_NULL}x. Report it as a scoping result with the next \
+                 lever named — never as a verdict on the kernel.",
+                s.name, t_mean, n_worst
+            );
+        }
+    }
+    set_grouped_variant(QTIP_GROUPED_VARIANT_BASELINE);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Driver
 // ---------------------------------------------------------------------------
 
@@ -672,6 +925,10 @@ struct Cfg {
     iters: usize,
     batches: Vec<usize>,
     small: bool,
+    /// `Some(B)` runs the kernel-variant A/B at batch B instead of the curve.
+    ab: Option<usize>,
+    /// `U F U N` repetitions in `--ab`.
+    rounds: usize,
 }
 
 fn parse_args() -> Result<Cfg> {
@@ -680,6 +937,8 @@ fn parse_args() -> Result<Cfg> {
         iters: 200,
         batches: vec![1, 8, 16, 32, 52, 64, 128],
         small: false,
+        ab: None,
+        rounds: 3,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -709,17 +968,26 @@ fn parse_args() -> Result<Cfg> {
                 cfg.small = true;
                 i += 1;
             }
+            "--ab" => {
+                cfg.ab = Some(need(i)?.parse().map_err(candle_core::Error::wrap)?);
+                i += 2;
+            }
+            "--rounds" => {
+                cfg.rounds = need(i)?.parse().map_err(candle_core::Error::wrap)?;
+                i += 2;
+            }
             other => candle_core::bail!(
-                "unknown flag {other}; accepted: --experts N --iters N --batches a,b,c --small"
+                "unknown flag {other}; accepted: --experts N --iters N --batches a,b,c --small \
+                 --ab B --rounds N"
             ),
         }
     }
     Ok(cfg)
 }
 
-fn run(dev: &Device, cfg: &Cfg, act_dtype: DType, cap: &str) -> Result<()> {
-    let cuda = matches!(dev, Device::Cuda(_));
-    let shapes = if cfg.small {
+/// V4-Flash's two MoE GEMM shapes (or tiny stand-ins for the CPU guard run).
+fn ab_shapes(small: bool) -> Vec<Shape> {
+    if small {
         vec![
             Shape {
                 name: "gate/up",
@@ -749,7 +1017,12 @@ fn run(dev: &Device, cfg: &Cfg, act_dtype: DType, cap: &str) -> Result<()> {
                 calls_per_layer: 1.0,
             },
         ]
-    };
+    }
+}
+
+fn run(dev: &Device, cfg: &Cfg, act_dtype: DType, cap: &str) -> Result<()> {
+    let cuda = matches!(dev, Device::Cuda(_));
+    let shapes = ab_shapes(cfg.small);
 
     // Prove the guards can still fail BEFORE trusting any of them (D12), then
     // run them against this configuration — all before any GPU time is spent
@@ -869,6 +1142,20 @@ fn main() -> Result<()> {
 
     match Device::new_cuda(0) {
         Ok(dev) => {
+            if let Some(b) = cfg.ab {
+                println!(
+                    "=== qtip2b grouped-GEMM KERNEL VARIANT A/B at B={b} \
+                     (U F U N x {}, {} iters/arm, top-{TOPK}, Viterbi+rotation) ===\n\
+                     Instrument: wall clock across {} synchronized gather_forward calls — the \
+                     SAME instrument that produced the wave38 crossover table, so the numbers are \
+                     comparable to it and NOT to any device-timer span.\n",
+                    cfg.rounds, cfg.iters, cfg.iters
+                );
+                // The guards still have to prove they can fail before any
+                // number is printed, even in --ab.
+                assert_guards_have_teeth()?;
+                return run_ab(&dev, &cfg, DType::BF16, b, cfg.rounds);
+            }
             println!(
                 "=== qtip2b grouped-GEMM vs fused gather-GEMV batch curve \
                  (H200 peak {:.1} TB/s, top-{TOPK}, Viterbi+rotation) ===\n",

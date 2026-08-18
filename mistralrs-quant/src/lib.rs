@@ -99,11 +99,13 @@ pub use qtip::tune::{
     QTIP2B_GEMV_VARIANT_LEGACY,
 };
 pub use qtip::{
-    gpu_quantize_cpu_fallback_count, hessian_row_weights, qtip_expected_distinct_experts,
-    viterbi_quantize_row, ExpertBpwTable, Qtip2bLayer, QtipBakeConfig, QtipCodebook, QtipLayer,
-    QtipMode, QtipPackedView, QtipRotation, QtipSearchDetail, QtipSearchStamp, TrellisBpw,
-    TrellisSearch, QTIP2B_MCG_MULT, QTIP_GATHER_GEMV_MAX_PAIRS, QTIP_GROUPED_TILE_K,
-    QTIP_GROUPED_TILE_M, QTIP_GROUPED_TILE_N, QTIP_ONDEVICE_MOE_MAX_TOKENS_ENV,
+    gpu_quantize_cpu_fallback_count, grouped_launch_counts, grouped_variant, hessian_row_weights,
+    qtip_expected_distinct_experts, set_grouped_variant, viterbi_quantize_row, ExpertBpwTable,
+    Qtip2bLayer, QtipBakeConfig, QtipCodebook, QtipLayer, QtipMode, QtipPackedView, QtipRotation,
+    QtipSearchDetail, QtipSearchStamp, TrellisBpw, TrellisSearch, QTIP2B_MCG_MULT,
+    QTIP_GATHER_GEMV_MAX_PAIRS, QTIP_GROUPED_TILE_K, QTIP_GROUPED_TILE_M, QTIP_GROUPED_TILE_N,
+    QTIP_GROUPED_VARIANT_BASELINE, QTIP_GROUPED_VARIANT_ENV, QTIP_GROUPED_VARIANT_TUNED,
+    QTIP_ONDEVICE_MOE_MAX_TOKENS_ENV,
 };
 pub use td_moe_factored::TuckerFactoredLayer;
 pub use unquantized::UnquantLinear;

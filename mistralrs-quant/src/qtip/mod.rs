@@ -86,8 +86,10 @@ pub use gather_policy::{
     ONDEVICE_MOE_MAX_TOKENS_ENV as QTIP_ONDEVICE_MOE_MAX_TOKENS_ENV,
 };
 pub use grouped::{
-    ExpertBpwTable, TrellisBpw, GROUPED_TILE_K as QTIP_GROUPED_TILE_K,
-    GROUPED_TILE_M as QTIP_GROUPED_TILE_M, GROUPED_TILE_N as QTIP_GROUPED_TILE_N,
+    grouped_launch_counts, grouped_variant, set_grouped_variant, ExpertBpwTable, TrellisBpw,
+    GROUPED_TILE_K as QTIP_GROUPED_TILE_K, GROUPED_TILE_M as QTIP_GROUPED_TILE_M,
+    GROUPED_TILE_N as QTIP_GROUPED_TILE_N, QTIP_GROUPED_VARIANT_BASELINE,
+    QTIP_GROUPED_VARIANT_ENV, QTIP_GROUPED_VARIANT_TUNED,
 };
 #[allow(unused_imports)]
 pub use viterbi::{
