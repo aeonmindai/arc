@@ -36,11 +36,14 @@
 //
 // 1. THIS CRATE COMPILES WITH `--use_fast_math` (mistralrs-quant/build.rs), so
 //    a bare `a / b` here would be `div.approx.f32` while candle-kernels (no
-//    fast math) emits IEEE `div.rn.f32`, and `-ftz=true` would flush denormals
-//    candle keeps. Every float operation below is therefore an explicit
-//    `__f*_rn` intrinsic, which the CUDA Math API defines as IEEE-754 and
-//    unaffected by `-prec-div`/`-ftz`/`-fmad`. `fabsf`/`fmaxf` are avoided in
-//    favour of integer ops on the bit pattern for the same reason.
+//    fast math) emits IEEE `div.rn.f32`. The `__f*_rn` intrinsics are NOT a
+//    sufficient answer — checked against the emitted PTX, nvcc 13.1 rewrites
+//    them to `mul.rn.ftz.f32` / `div.rn.ftz.f32` / `add.rn.ftz.f32` under fast
+//    math, which flushes denormals candle keeps. Every float operation below is
+//    therefore INLINE PTX (`arc_fmul`/`arc_fadd`/`arc_fdiv`), which no
+//    optimisation flag rewrites; `fabsf`/`fmaxf` are avoided in favour of
+//    integer ops on the bit pattern for the same reason. The audit is one line:
+//    `nvcc -ptx ... | grep -c '\.ftz\.f32'` must be 0.
 // 2. The E4M3 rounding is a transcription of NVIDIA's
 //    `__nv_cvt_double_to_fp8(x, __NV_SATFINITE, __NV_E4M3)` (cuda_fp8.hpp),
 //    which is *also* what the Rust `float8` crate ports in `convert_to_fp8`
@@ -72,6 +75,38 @@ namespace arc {
 //                 (inline `cvt.rn.bf16.f32`, immune to -ftz).
 //   f32 -> f16  : likewise `__float2half` (inline `cvt.rn.f16.f32`).
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// IEEE f32 ops as inline PTX.
+//
+// MEASURED, not assumed: `--use_fast_math` (this crate's build.rs) rewrites the
+// `__fmul_rn`/`__fadd_rn`/`__fdiv_rn` intrinsics to their `.ftz` forms — nvcc
+// 13.1 emitted `mul.rn.ftz.f32` / `div.rn.ftz.f32` / `add.rn.ftz.f32` for them.
+// The rounding mode survives, but denormal flush-to-zero does not match
+// candle-kernels, which compiles WITHOUT fast math and emits `div.rn.f32`.
+//
+// The difference happens to be unobservable here (`scale` is floored at 1e-12,
+// and E4M3's smallest denormal is 2^-9, so any f32 denormal is quantized to
+// zero either way) — but bit-parity should not rest on a chain of reasoning
+// about where denormals cannot reach. Inline PTX is never rewritten by
+// optimisation flags, so these ops are IEEE non-ftz by construction, and
+// `grep -c '\.ftz\.f32'` over the emitted PTX is a one-line audit of that.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float arc_fmul(float a, float b) {
+  float r;
+  asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+__device__ __forceinline__ float arc_fadd(float a, float b) {
+  float r;
+  asm("add.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+__device__ __forceinline__ float arc_fdiv(float a, float b) {
+  float r;
+  asm("div.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+
 template <typename T> __device__ __forceinline__ float arc_to_f32(T v);
 template <> __device__ __forceinline__ float arc_to_f32<__nv_bfloat16>(__nv_bfloat16 v) {
   return __bfloat162float(v);
@@ -98,12 +133,12 @@ template <> __device__ __forceinline__ float arc_from_f32<float>(float v) { retu
 // `affine(mul, add)` to `x * mul + add` with `mul`/`add` first narrowed to the
 // tensor dtype. `x * 1.0f` is exact, so the second affine is exactly an add,
 // and FMA contraction of `x * mul + 0.0f` is exactly the multiply. Both are
-// therefore reproduced by one `__fmul_rn` and one `__fadd_rn`.
+// therefore reproduced by one `arc_fmul` and one `arc_fadd` (inline PTX, see above).
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ float arc_kv_block_scale(float amax) {
   const float inv_max = (float)(1.0 / ARC_KV_E4M3_MAX);
   const float eps = (float)1e-12;
-  return __fadd_rn(__fmul_rn(amax, inv_max), eps);
+  return arc_fadd(arc_fmul(amax, inv_max), eps);
 }
 
 // ---------------------------------------------------------------------------
@@ -218,7 +253,7 @@ __global__ void arc_kv_fp8_quantize_kernel(
 
       for (int e = lane; e < block_w; e += ARC_KV_WARP) {
         const float v = arc_to_f32<T>(krow[base + e]);
-        crow[base + e] = arc_f32_to_e4m3_code(__fdiv_rn(v, scale));
+        crow[base + e] = arc_f32_to_e4m3_code(arc_fdiv(v, scale));
       }
       // `amax` IS one of the block's own elements, so narrowing it back to the
       // activation dtype is exact - that is what lets dequant rebuild the
@@ -270,7 +305,7 @@ __global__ void arc_kv_fp8_dequantize_kernel(
       const float amax = arc_to_f32<T>(srow[rope_dim + blk]);
       const float scale = arc_kv_block_scale(amax);
       for (int e = lane; e < block_w; e += ARC_KV_WARP) {
-        orow[base + e] = arc_from_f32<T>(__fmul_rn(lut[crow[base + e]], scale));
+        orow[base + e] = arc_from_f32<T>(arc_fmul(lut[crow[base + e]], scale));
       }
     }
 
@@ -419,7 +454,7 @@ __global__ void arc_kv_fp8_quantize_mutant_kernel(
       const float scale = arc_kv_block_scale(amax);
       for (int e = lane; e < block_w; e += ARC_KV_WARP) {
         const float v = arc_to_f32<T>(krow[base + e]);
-        crow[base + e] = arc_f32_to_e4m3_code_truncating(__fdiv_rn(v, scale));
+        crow[base + e] = arc_f32_to_e4m3_code_truncating(arc_fdiv(v, scale));
       }
       if (lane == 0) {
         srow[rope_dim + blk] = arc_from_f32<T>(amax);
