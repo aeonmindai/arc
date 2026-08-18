@@ -175,6 +175,30 @@ changes. Carry the prefix per sequence and strip lazily at `clone_in`, moving an
 **D21:** a scope result, not a verdict. Correct, limiter provably removed, named
 reason it does not yet pay. Not ranked down.
 
+## 2.3 ✅ The deferred-strip gap is CLOSED (was merge-blocking)
+
+Deferring the strip left a window: between `clone_out_cache` and the next
+`clone_in_cache` a sequence still carries its zero-filled dead prefix and
+reports a length that includes it. For a sequence that has just **finished**
+there is no next `clone_in_cache` — so `PrefixCacheManagerV2::add_sequence`
+would store the padding and hand it to every future request matching that
+prefix. **A wrong answer that outlives the request that produced it**, and one
+`--prefix-cache-n 0` hides completely.
+
+Closed at the reader rather than the writer: `add_sequence` strips the pending
+prefix before `seq.normal_cache().to_vec()`. That is one sequence at a read,
+instead of `O(B × layers)` every token at the write — the deferral is kept and
+its only unsafe consumer is paid off precisely. On failure it **refuses to
+store** rather than storing padding.
+
+`clone_out_cache` cannot do this itself: it runs *before* sampling
+(`pipeline/mod.rs:976`), so at that point no sequence knows whether it has
+finished.
+
+Pinned by `a_finished_ragged_sequence_does_not_poison_the_prefix_cache`, seen
+red by mutation — with the strip removed it reports `left: 64, right: 60`, i.e.
+four zero-filled K/V rows being cached as content.
+
 ## 3. 🔴 The defect the completeness guard caught
 
 The first dense fix run returned **433/512 tokens at B=8 spread, 1518/2048 at

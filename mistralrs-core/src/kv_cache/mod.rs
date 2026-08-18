@@ -1062,12 +1062,22 @@ fn take_pending_lead_pad(seq_id: usize) -> usize {
     PENDING_LEAD_PAD.with(|m| m.borrow_mut().remove(&seq_id).unwrap_or(0))
 }
 
+/// Test-only entry points for the deferred-strip bookkeeping, so tests outside
+/// this module can build a sequence in the state a front-aligned cohort leaves
+/// behind without making the real setters public.
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) fn set_pending_lead_pad(seq_id: usize, lead: usize) {
+        super::record_pending_lead_pad(seq_id, lead);
+    }
+}
+
 /// Drop a stale dead prefix from one sequence's own cache, re-anchoring its live
 /// run at column 0 the way `SingleCache` requires.
 ///
 /// Called from `clone_in_cache` for each sequence that carries one, i.e. once
 /// per membership change rather than once per token.
-fn strip_pending_lead_pad(
+pub(crate) fn strip_pending_lead_pad(
     seq: &mut crate::sequence::Sequence,
     modify_draft_cache: bool,
 ) -> Result<()> {
