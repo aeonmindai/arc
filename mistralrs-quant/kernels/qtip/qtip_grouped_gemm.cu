@@ -106,6 +106,17 @@
 // deficit). `variant=1` (tuned) is bit-identical in output and differs only
 // in how the same weights are reached:
 //
+// ✅ MEASURED 2026-08-18, H200, E=256 top-6, B=128, U F U N x3 interleaved
+// against a null control, both variants compiled in and the arm proved from
+// the RUNTIME launch counters (not the build):
+//     gate/up 2048x4096   8.16 -> 4.95 us/m-tile   +39.37%  (null 0.09%)
+//     down    4096x2048   8.10 -> 4.91 us/m-tile   +39.40%  (null 0.18%)
+// Output bit-identical to the baseline over 6.29 M / 12.58 M bytes. The two
+// shapes are transposes with identical weight counts and identical decode
+// work but different access patterns everywhere else, so agreement to 0.03pp
+// is itself evidence the win is ops-per-decoded-weight and not tiling or
+// bandwidth. Handicap vs the GEMV: 1.76x -> 1.12x.
+//
 //   1. s_x row stride 64 -> QG_X_STRIDE elements (128 -> 144 B). At a 128 B
 //      stride the bank index (byte/4)%32 = (g*32 + ...)%32 is INDEPENDENT of
 //      the mma row g = lane>>2, so all eight g-values collide: every A-fragment
