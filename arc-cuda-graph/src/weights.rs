@@ -610,6 +610,16 @@ pub fn tensor_device_ptr(tensor: &Tensor) -> candle_core::Result<u64> {
                 // fed with (radix top-k `seq_lens`, `CudaSampler` token ids and
                 // keep-list scratch). Candle's `Tensor::from_vec(Vec<i32>, …)`
                 // produces it, so leaving it out disabled those paths wholesale.
+                //
+                // Concretely, from #130: `CudaSampler::sample` REQUIRES
+                // `token_ids` to be I32 (`sampling_cuda.rs:347`) and allocates
+                // an I32 `keep_idx_scratch` (`:298`). Both resolve through this
+                // function, so before I32 was listed both fell to the catch-all
+                // `bail!` and `CudaSampler::sample()` returned `unsupported
+                // dtype I32` on EVERY call — the replay-safe top-k/top-p
+                // sampler could never run on a GPU. Its test suite is a CPU
+                // simulator (`gpu_algorithm_simulate`), which by construction
+                // cannot observe that.
                 DType::I32 => {
                     let s = cuda_storage.as_cuda_slice::<i32>()?;
                     let (p, _) = s.device_ptr(s.stream());

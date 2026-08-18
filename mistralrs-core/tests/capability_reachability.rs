@@ -196,17 +196,20 @@ static REGISTRY: &[Capability] = &[
             accepted_in: &["mistralrs-core/src/sampler.rs"],
             honoured_in: &["arc-cuda-graph/src/autonomous.rs"],
         },
-        // `AutonomousDecodeConfig` (autonomous.rs:70-82) carries temperature,
-        // top_p, both penalties and `greedy` — and neither top_k nor min_p. A
-        // request setting them would have them silently dropped the moment this
-        // path is reached. It is not reached today (`mark_unreachable(
-        // "cuda_graph.autonomous_decode", ...)`), which is the only reason this
-        // is not already a user-visible defect.
-        status: Status::Tracked {
-            reason: "AutonomousDecodeConfig has no top_k field at all; the path is itself \
-                     unreachable today, so this is latent rather than live. Fix before \
-                     GPU-autonomous decode is switched on.",
-        },
+        // Was Tracked with the reason "AutonomousDecodeConfig has no top_k
+        // field at all". #130 gave it one: `AutonomousDecodeConfig::top_k`
+        // (autonomous.rs:82), plumbed into `sampling_cpu::SamplingConfig` at
+        // autonomous.rs:643 and consumed by `self.sampler.sample(..)`. So the
+        // promise is now honoured where it is made, and the status follows the
+        // code.
+        //
+        // The gate flagged this itself, on the rebase, with "PROMOTE ME" —
+        // the same way the greedy/logit-bias entry above was promoted. That is
+        // the mechanism working, not a test to be silenced.
+        //
+        // `min_p` is a separate entry below and stays Tracked: it still has no
+        // field on `AutonomousDecodeConfig`.
+        status: Status::Live,
     },
     Capability {
         name: "sampling: min_p survives onto the GPU-autonomous decode path",

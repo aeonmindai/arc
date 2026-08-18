@@ -3021,6 +3021,16 @@ impl Pipeline for NormalPipeline {
                 top_p,
                 frequency_penalty,
                 presence_penalty,
+                // mistral.rs uses <=0 to mean "disabled"; the fused sampler
+                // spells that -1 (`sampling_cpu.rs:16`).
+                top_k: {
+                    let tk = first_sampler.top_k();
+                    if tk <= 0 {
+                        -1
+                    } else {
+                        tk as i32
+                    }
+                },
                 greedy,
             };
 

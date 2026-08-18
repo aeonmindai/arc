@@ -209,6 +209,59 @@ extern "C" {
         cfg: SamplingParams,
         stream: CUstream,
     );
+
+    // Hybrid: exact enumeration while the nucleus is small, threshold
+    // bisection past a fixed budget, chosen block-uniformly ON DEVICE so a
+    // captured graph never has to ask the host which branch to take.
+    //
+    // MEASURED, H200, vocab=129280, host+GPU verified exclusive before and
+    // after (support width -> legacy / hybrid us):
+    //   1 -> 134.9/166.6 | 8 -> 503.0/624.2 | 64 -> 3127.8/4178.5
+    //   512 -> 24320.7/4185.0 | 4096 -> 205125.2/4187.3
+    //   12928 -> 664200.0/4188.5
+    // Costs +24% on the peaked distributions real models produce (32 us, i.e.
+    // 0.05% of a 66.68 ms V4 decode step) and removes a 664 ms cliff -- 158x
+    // at the diffuse tail, where the enumerating sampler is ~10x an entire
+    // decode step for a single token.
+    pub fn arc_launch_sampler_f32_hybrid(
+        logits: *const f32,
+        freq_counts: *const u32,
+        rng_state: *mut u64,
+        token_ids: *mut i32,
+        probs_scratch: *mut f32,
+        keep_idx_scratch: *mut i32,
+        keep_p_scratch: *mut f32,
+        vocab: i32,
+        batch: i32,
+        cfg: SamplingParams,
+        stream: CUstream,
+    );
+    pub fn arc_launch_sampler_bf16_hybrid(
+        logits: *const std::ffi::c_void,
+        freq_counts: *const u32,
+        rng_state: *mut u64,
+        token_ids: *mut i32,
+        probs_scratch: *mut f32,
+        keep_idx_scratch: *mut i32,
+        keep_p_scratch: *mut f32,
+        vocab: i32,
+        batch: i32,
+        cfg: SamplingParams,
+        stream: CUstream,
+    );
+    pub fn arc_launch_sampler_f16_hybrid(
+        logits: *const std::ffi::c_void,
+        freq_counts: *const u32,
+        rng_state: *mut u64,
+        token_ids: *mut i32,
+        probs_scratch: *mut f32,
+        keep_idx_scratch: *mut i32,
+        keep_p_scratch: *mut f32,
+        vocab: i32,
+        batch: i32,
+        cfg: SamplingParams,
+        stream: CUstream,
+    );
 }
 
 /// Raw device pointer for a CUDA tensor, byte-offset aware.
@@ -311,6 +364,15 @@ impl CudaSampler {
         })
     }
 
+    /// Bind the sampler to `stream`.
+    ///
+    /// `new()` picks up the device-default stream. Anything that is going to
+    /// be **captured** into a CUDA graph must launch on the capture stream, or
+    /// the sampler's kernels are simply not recorded into the graph.
+    pub fn set_stream(&mut self, stream: CUstream) {
+        self.stream = stream;
+    }
+
     /// Run the sampler. Logits: [batch, vocab] of the configured dtype.
     /// `freq_counts`: optional [batch, vocab] u32 token-count tensor (one per
     /// batch row); pass `None` when no penalties are needed.
@@ -370,7 +432,7 @@ impl CudaSampler {
 
         unsafe {
             match self.dtype {
-                DType::F32 => arc_launch_sampler_f32(
+                DType::F32 => arc_launch_sampler_f32_hybrid(
                     logits_ptr as *const f32,
                     freq_ptr,
                     rng_ptr,
@@ -383,7 +445,7 @@ impl CudaSampler {
                     params,
                     self.stream,
                 ),
-                DType::BF16 => arc_launch_sampler_bf16(
+                DType::BF16 => arc_launch_sampler_bf16_hybrid(
                     logits_ptr,
                     freq_ptr,
                     rng_ptr,
@@ -396,7 +458,7 @@ impl CudaSampler {
                     params,
                     self.stream,
                 ),
-                DType::F16 => arc_launch_sampler_f16(
+                DType::F16 => arc_launch_sampler_f16_hybrid(
                     logits_ptr,
                     freq_ptr,
                     rng_ptr,
