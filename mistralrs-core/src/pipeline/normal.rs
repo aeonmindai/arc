@@ -1819,7 +1819,7 @@ impl Pipeline for NormalPipeline {
                                                 }
                                             }
                                             _ => tracing::warn!(
-                                                "ARC prewarm: ignoring unparseable size {tok:?}"
+                                                "ARC prewarm: ignoring unparsable size {tok:?}"
                                             ),
                                         }
                                     }
