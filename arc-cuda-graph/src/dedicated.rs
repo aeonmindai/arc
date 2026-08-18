@@ -441,9 +441,39 @@ impl DedicatedDecodePath {
         Ok(())
     }
 
+    /// Ensure the activation buffers can hold at least `batch_size` rows.
+    ///
+    /// Grow-only, and it MUST actually grow. The previous version returned early
+    /// whenever any buffers existed, so every buffer was sized from the first
+    /// batch size the process ever decoded and never resized. Since
+    /// `decode_forward` then took its row count from the buffers, a server whose
+    /// first decode was a single request computed one row forever: every later
+    /// sequence in a batch got stale rows, and `wrap_f32_logits` copied
+    /// `batch_size * vocab * 4` bytes out of a `1 * vocab * 4` allocation.
+    ///
+    /// `ensure_staging` immediately below already had the correct shape — free,
+    /// invalidate the captured graph, reallocate. This mirrors it.
     fn ensure_buffers(&mut self, batch_size: usize) -> candle_core::Result<()> {
-        if self.buffers.is_some() {
-            return Ok(());
+        if let Some(ref b) = self.buffers {
+            if b.capacity >= batch_size {
+                return Ok(());
+            }
+        }
+
+        // Growing moves every activation pointer, and a captured graph baked
+        // both the old addresses and the old row count. Drop it first, then
+        // drain in-flight work before the pointers it references go away.
+        if let Some(exec) = self.graph_exec.take() {
+            unsafe {
+                cuGraphExecDestroy(exec);
+            }
+            tracing::info!("Decode buffers grown → graph invalidated");
+        }
+        if let Some(old) = self.buffers.take() {
+            unsafe {
+                cudaStreamSynchronize(self.stream);
+                Self::free_decode_buffers(&old);
+            }
         }
 
         let cfg = &self.weights.config;
@@ -486,7 +516,7 @@ impl DedicatedDecodePath {
             cos_table: self.cos_table,
             sin_table: self.sin_table,
             is_neox: self.weights.config.is_gpt_neox,
-            batch_size: bs,
+            capacity: bs,
             sm_count: {
                 // Query SM count from the active CUDA device. Used by GEMV
                 // dispatch to pick the wide vs original kernel without
@@ -516,9 +546,56 @@ impl DedicatedDecodePath {
             + bs * cfg.vocab_size * bf16)
             / 1_048_576;
 
-        tracing::info!("Decode buffers allocated: ~{total_mb} MB for batch_size={bs}");
+        tracing::info!("Decode buffers allocated: ~{total_mb} MB for capacity={bs} rows");
         self.buffers = Some(buffers);
         Ok(())
+    }
+
+    /// Prove the invariant `decode_forward` depends on, rather than trusting it.
+    ///
+    /// `ensure_buffers` is called immediately before this on both step paths, so
+    /// a failure here means the grow path silently did not grow. Returning an
+    /// Err makes the engine surface it; the previous code had no check at all
+    /// and simply launched kernels for more rows than were allocated.
+    fn assert_capacity(buffers: &DecodeBuffers, batch_size: usize) -> candle_core::Result<()> {
+        if buffers.capacity < batch_size {
+            candle_core::bail!(
+                "dedicated decode: buffer capacity {} < batch_size {batch_size} after \
+                 ensure_buffers — refusing to launch out of bounds",
+                buffers.capacity,
+            );
+        }
+        Ok(())
+    }
+
+    /// Free the activation buffers. Deliberately does NOT touch `cos_table` /
+    /// `sin_table`: those are owned by the path itself (they are only *copied*
+    /// into `DecodeBuffers`) and are freed in `Drop`. Freeing them here would
+    /// leave the next `ensure_buffers` handing dangling RoPE tables to every
+    /// kernel.
+    unsafe fn free_decode_buffers(b: &DecodeBuffers) {
+        for ptr in [
+            b.hidden_a,
+            b.hidden_b,
+            b.normed,
+            b.residual,
+            b.qkv,
+            b.attn_out,
+            b.attn_out_f32,
+            b.o_proj_out,
+            b.gate,
+            b.up,
+            b.mlp_act,
+            b.down_out,
+            b.logits,
+            b.logits_f32,
+            b.token_ids,
+            b.positions,
+        ] {
+            if ptr != 0 {
+                cudaFree(ptr);
+            }
+        }
     }
 
     /// Allocate staging buffers for paged attention metadata.
@@ -706,6 +783,7 @@ impl DedicatedDecodePath {
         self.ensure_staging(batch_size, max_possible_blocks)?;
         self.cache_kv_info(paged_attn);
         let buffers = self.buffers.as_ref().unwrap();
+        Self::assert_capacity(buffers, batch_size)?;
         let t1 = std::time::Instant::now();
 
         unsafe {
@@ -729,15 +807,15 @@ impl DedicatedDecodePath {
 
             if let Some(exec) = self.graph_exec {
                 if batch_size != self.captured_batch_size {
-                    decode_forward(&self.weights, buffers, &staged, self.stream);
+                    decode_forward(&self.weights, buffers, &staged, batch_size, self.stream);
                 } else {
                     let s = cuGraphLaunch(exec, self.stream);
                     if s != CUDA_SUCCESS {
-                        decode_forward(&self.weights, buffers, &staged, self.stream);
+                        decode_forward(&self.weights, buffers, &staged, batch_size, self.stream);
                     }
                 }
             } else {
-                decode_forward(&self.weights, buffers, &staged, self.stream);
+                decode_forward(&self.weights, buffers, &staged, batch_size, self.stream);
             }
             let t3 = std::time::Instant::now();
             cudaStreamSynchronize(self.stream);
@@ -783,6 +861,7 @@ impl DedicatedDecodePath {
         self.cache_kv_info(paged_attn);
 
         let buffers = self.buffers.as_ref().unwrap();
+        Self::assert_capacity(buffers, batch_size)?;
         let t_after_setup = std::time::Instant::now();
 
         unsafe {
@@ -817,7 +896,7 @@ impl DedicatedDecodePath {
                         self.captured_batch_size,
                         batch_size
                     );
-                    decode_forward(&self.weights, buffers, &staged, self.stream);
+                    decode_forward(&self.weights, buffers, &staged, batch_size, self.stream);
                 } else if self.step_count > 0 && self.step_count % 5000 == 0 {
                     // Periodic per-kernel profile so we can see steady-state hotspots.
                     // profile_forward is decode_forward with CUDA event timing — same compute,
@@ -826,18 +905,19 @@ impl DedicatedDecodePath {
                         &self.weights,
                         buffers,
                         &staged,
+                        batch_size,
                         self.stream,
                     );
                 } else {
                     let s = cuGraphLaunch(exec, self.stream);
                     if s != CUDA_SUCCESS {
                         tracing::warn!("cuGraphLaunch failed ({s}), falling back to eager");
-                        decode_forward(&self.weights, buffers, &staged, self.stream);
+                        decode_forward(&self.weights, buffers, &staged, batch_size, self.stream);
                     }
                 }
             } else if self.capture_failed {
                 // Eager mode — still fast (no Candle overhead, just kernel launch costs)
-                decode_forward(&self.weights, buffers, &staged, self.stream);
+                decode_forward(&self.weights, buffers, &staged, batch_size, self.stream);
             } else if self.eager_steps < 2 {
                 // Profile on first eager step
                 if self.eager_steps == 1 {
@@ -845,11 +925,12 @@ impl DedicatedDecodePath {
                         &self.weights,
                         buffers,
                         &staged,
+                        batch_size,
                         self.stream,
                     );
                 }
                 self.eager_steps += 1;
-                decode_forward(&self.weights, buffers, &staged, self.stream);
+                decode_forward(&self.weights, buffers, &staged, batch_size, self.stream);
                 if self.eager_steps == 2 {
                     tracing::info!(
                         "Dedicated decode: eager warmup done, will attempt capture next step"
@@ -863,9 +944,9 @@ impl DedicatedDecodePath {
                 if s != CUDA_SUCCESS {
                     tracing::warn!("cuStreamBeginCapture failed ({s}), disabling capture");
                     self.capture_failed = true;
-                    decode_forward(&self.weights, buffers, &staged, self.stream);
+                    decode_forward(&self.weights, buffers, &staged, batch_size, self.stream);
                 } else {
-                    decode_forward(&self.weights, buffers, &staged, self.stream);
+                    decode_forward(&self.weights, buffers, &staged, batch_size, self.stream);
 
                     let mut graph: CUgraph = std::ptr::null_mut();
                     let s = cuStreamEndCapture(self.stream, &mut graph);
@@ -875,7 +956,7 @@ impl DedicatedDecodePath {
                             cuGraphDestroy(graph);
                         }
                         self.capture_failed = true;
-                        decode_forward(&self.weights, buffers, &staged, self.stream);
+                        decode_forward(&self.weights, buffers, &staged, batch_size, self.stream);
                     } else {
                         let mut exec: CUgraphExec = std::ptr::null_mut();
                         let s = cuGraphInstantiate_v2(
@@ -890,7 +971,13 @@ impl DedicatedDecodePath {
                         if s != CUDA_SUCCESS || exec.is_null() {
                             tracing::warn!("cuGraphInstantiate failed ({s}), disabling capture");
                             self.capture_failed = true;
-                            decode_forward(&self.weights, buffers, &staged, self.stream);
+                            decode_forward(
+                                &self.weights,
+                                buffers,
+                                &staged,
+                                batch_size,
+                                self.stream,
+                            );
                         } else {
                             let s = cuGraphLaunch(exec, self.stream);
                             if s != CUDA_SUCCESS {
@@ -899,7 +986,13 @@ impl DedicatedDecodePath {
                                 );
                                 cuGraphExecDestroy(exec);
                                 self.capture_failed = true;
-                                decode_forward(&self.weights, buffers, &staged, self.stream);
+                                decode_forward(
+                                    &self.weights,
+                                    buffers,
+                                    &staged,
+                                    batch_size,
+                                    self.stream,
+                                );
                             } else {
                                 self.graph_exec = Some(exec);
                                 self.captured_batch_size = batch_size;
@@ -1038,28 +1131,10 @@ impl Drop for DedicatedDecodePath {
                 cudaFree(self.staging_slot_mappings);
             }
             if let Some(ref b) = self.buffers {
-                for ptr in [
-                    b.hidden_a,
-                    b.hidden_b,
-                    b.normed,
-                    b.residual,
-                    b.qkv,
-                    b.attn_out,
-                    b.attn_out_f32,
-                    b.o_proj_out,
-                    b.gate,
-                    b.up,
-                    b.mlp_act,
-                    b.down_out,
-                    b.logits,
-                    b.logits_f32,
-                    b.token_ids,
-                    b.positions,
-                ] {
-                    if ptr != 0 {
-                        cudaFree(ptr);
-                    }
-                }
+                // Same list `ensure_buffers` uses when it grows. Sharing the
+                // helper keeps the two from drifting apart — a buffer added to
+                // one list and not the other leaks or double-frees.
+                Self::free_decode_buffers(b);
             }
             cuStreamDestroy_v2(self.stream);
         }
@@ -1106,7 +1181,10 @@ mod block_table_stride_tests {
     fn flat_copy_mislays_every_row_after_the_first() {
         // Qwen2.5-0.5B shaped: 32k positions, 32-token blocks, short context.
         let cap = capacity(32768, 32, 2);
-        assert_eq!(cap, 1024, "capacity is derived from max_position_embeddings");
+        assert_eq!(
+            cap, 1024,
+            "capacity is derived from max_position_embeddings"
+        );
 
         // Sequence 0 always agrees — which is precisely why batch_size == 1
         // cannot observe this defect and the B=8 cell can.
@@ -1150,12 +1228,84 @@ mod block_table_stride_tests {
         );
     }
 
+    /// The buffer-capacity policy, as arithmetic. `ensure_buffers` used to
+    /// return early whenever buffers existed, so `alloc` was the FIRST batch
+    /// size forever and every later row was out of bounds.
+    fn grow_only(current: Option<usize>, requested: usize) -> usize {
+        match current {
+            Some(c) if c >= requested => c,
+            _ => requested,
+        }
+    }
+
+    /// What the OLD code did: allocate once, never revisit.
+    fn pin_forever(current: Option<usize>, requested: usize) -> usize {
+        current.unwrap_or(requested)
+    }
+
+    #[test]
+    fn old_policy_pins_capacity_below_the_served_batch() {
+        // A server whose first decode is a single request, then a batch of 8.
+        let mut cap = None;
+        for b in [1usize, 1, 8, 32] {
+            cap = Some(pin_forever(cap, b));
+        }
+        assert_eq!(cap, Some(1), "old policy never grew past the first batch");
+
+        // logits_f32 was sized from that capacity while wrap_f32_logits copied
+        // the REAL batch. Qwen2.5-0.5B vocab.
+        let vocab = 151_936usize;
+        let pinned_capacity = cap.unwrap();
+        let served_batch = 8usize;
+        let allocated = pinned_capacity * vocab * 4;
+        let copied = served_batch * vocab * 4;
+        assert!(copied > allocated);
+        assert_eq!(
+            copied - allocated,
+            4_254_208,
+            "the over-read at B=8 with capacity pinned to 1"
+        );
+    }
+
+    #[test]
+    fn grow_only_policy_always_covers_the_served_batch() {
+        let mut cap: Option<usize> = None;
+        for b in [1usize, 1, 8, 32, 4, 32, 2] {
+            cap = Some(grow_only(cap, b));
+            assert!(
+                cap.unwrap() >= b,
+                "capacity {cap:?} must cover every served batch size, including {b}"
+            );
+        }
+        // Grow-only: a later smaller batch must NOT shrink and re-alloc, which
+        // would thrash the captured graph on every scheduler dip.
+        assert_eq!(cap, Some(32));
+    }
+
+    #[test]
+    fn growth_is_monotonic_so_the_graph_is_invalidated_at_most_once_per_high_water_mark() {
+        let mut cap: Option<usize> = None;
+        let mut reallocs = 0;
+        for b in [1usize, 2, 2, 8, 4, 8, 8, 32, 1] {
+            let before = cap;
+            cap = Some(grow_only(cap, b));
+            if before != cap {
+                reallocs += 1;
+            }
+        }
+        // 1 -> 2 -> 8 -> 32: four allocations for nine steps, not nine.
+        assert_eq!(reallocs, 4);
+    }
+
     #[test]
     fn pitched_copy_preconditions_hold() {
         // cudaMemcpy2DAsync requires dpitch >= width and spitch >= width.
-        for &(max_pos, block_size, actual) in
-            &[(32768usize, 32usize, 2usize), (4096, 16, 1), (1024, 16, 64), (128, 16, 64)]
-        {
+        for &(max_pos, block_size, actual) in &[
+            (32768usize, 32usize, 2usize),
+            (4096, 16, 1),
+            (1024, 16, 64),
+            (128, 16, 64),
+        ] {
             let cap = capacity(max_pos, block_size, actual);
             let width = actual * 4;
             let dpitch = cap * 4;

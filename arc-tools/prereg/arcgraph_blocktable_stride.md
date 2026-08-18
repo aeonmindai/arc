@@ -1,5 +1,45 @@
 # PRE-REGISTERED — ArcGraph block-table stride defect
 
+> ## AMENDMENT, written before any run — the stride defect is MASKED today
+>
+> After registering the below I checked what `decode_forward` uses for its row
+> count and found `let bs = buffers.batch_size`, i.e. the capacity pinned by the
+> first `ensure_buffers` call. In ordinary serving the first decode is a single
+> request, so `num_seqs` is pinned to 1 and **`seq_idx` never exceeds 0 — which
+> makes the stride defect below unobservable in exactly the runs that reproduce.**
+>
+> The same pin fires a different defect at batch > 1: `wrap_f32_logits`
+> (`pipeline/mod.rs`) copies `batch_size * vocab * 4` bytes out of a buffer
+> allocated `capacity * vocab * 4`. For qwen05 at B=8 with capacity 1 that is
+> 4,861,952 bytes read from a 607,744-byte allocation — **4,254,208 bytes past the
+> end** — and the `cudaMemcpy` return was discarded. A D2D copy whose source
+> leaves its allocation returns `cudaErrorInvalidValue` = **"invalid argument"**,
+> which then gets reported by the next `cudaGetLastError()` in the process: the
+> only one in the captured forward is `reshape_and_cache_kernel.cu:140`. That is
+> the reported mode-3 string, at the reported file and line, by misattribution.
+>
+> **So my predicted outcome shifts against my own first fix: S2 ("stride fix
+> alone still dies") is now MORE likely than S1.** Recorded here before the box.
+>
+> Both defects are now fixed together (`ensure_buffers` grows and invalidates the
+> graph; `decode_forward` takes the real batch size; the stride copy is pitched).
+> The mutation protocol below therefore has TWO arms, and they must be run
+> separately or the result cannot attribute:
+>   M1. revert ONLY the pitched copy → should still serve at B=8, because the
+>       capacity fix leaves `num_seqs` correct but the stride is what breaks once
+>       `seq_idx > 0` is actually reached. If B=8 dies with M1, the stride defect
+>       was load-bearing after all and S1/S2 must be re-read.
+>   M2. revert ONLY the `ensure_buffers` growth → should die at B=8 again with
+>       `invalid argument`. This is the arm that proves the capacity fix was the
+>       necessary one.
+>
+> The severity also changes: this is not a graph bug. `PAGED_ATTN_CUDA = true`
+> and `ARC_NO_DEDICATED_DECODE` is an opt-OUT, so the path is **default-on in
+> production** for dense models on CUDA — and default-OFF in every measurement
+> harness on the boxes (`schedfix_run.sh`, `w53_probe.sh` both export it). Nothing
+> measured exercised it; nothing that exercised it was measured.
+
+
 Parent system: ArcInfer / ArcGraph (capture) + ArcKV (paged metadata staging).
 
 Written BEFORE any hardware run, commit-timestamped. The point is that the result

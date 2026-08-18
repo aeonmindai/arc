@@ -547,7 +547,20 @@ fn wrap_f32_logits(
         // Allocate F32 tensor and D2D copy (no BF16→F32 cast needed)
         let fresh = Tensor::zeros(shape, DType::F32, device)?;
         let fresh_ptr = arc_cuda_graph::tensor_device_ptr(&fresh)?;
-        cudaMemcpy(fresh_ptr as *mut _, ptr as *const _, elem_count * 4, 3);
+        let rc = cudaMemcpy(fresh_ptr as *mut _, ptr as *const _, elem_count * 4, 3);
+        // Discarding this return is how a 4 MB over-read of `logits_f32` became
+        // someone else's error message two decode steps later: the runtime
+        // latches the error and the next `cudaGetLastError()` anywhere in the
+        // process reports it against an unrelated kernel. The *fix* for the
+        // over-read is that `ensure_buffers` now grows, so `batch_size` never
+        // exceeds the allocated row capacity; this check is here so that if it
+        // ever does again, it is named here rather than blamed elsewhere.
+        if rc != 0 {
+            candle_core::bail!(
+                "wrap_f32_logits: cudaMemcpy D2D of {elem_count} f32 \
+                 (batch_size={batch_size}, vocab_size={vocab_size}) failed with cudaError {rc}"
+            );
+        }
         Ok(fresh)
     }
 }
