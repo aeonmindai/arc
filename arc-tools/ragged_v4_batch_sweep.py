@@ -138,7 +138,17 @@ def stream_one(port: int, row: Row, max_tokens: int, timeout: int):
                 except json.JSONDecodeError:
                     continue
                 for choice in chunk.get("choices", []):
-                    piece = (choice.get("delta") or {}).get("content")
+                    # `/v1/completions` streams `choices[].text`
+                    # (`CompletionChunkChoice`); `/v1/chat/completions` streams
+                    # `choices[].delta.content` (`ChunkChoice`). Accept both, so
+                    # the counter can never silently read zero off the wrong
+                    # field again -- which is exactly how the second GPU session
+                    # was spent: the URL and payload were switched to the
+                    # completions endpoint but this parser was left reading
+                    # `delta.content`, so every chunk was discarded.
+                    piece = choice.get("text")
+                    if piece is None:
+                        piece = (choice.get("delta") or {}).get("content")
                     if piece:
                         if row.t_first is None:
                             row.t_first = time.time()
