@@ -28,6 +28,20 @@ extern "C" {
         kind: u32,
         stream: CUstream,
     ) -> u32;
+    /// Pitched 2-D copy. Required wherever the destination row stride differs
+    /// from the source row stride — see `stage_paged_attn`.
+    /// `cudaError_t cudaMemcpy2DAsync(void*, size_t dpitch, const void*,
+    ///  size_t spitch, size_t width, size_t height, cudaMemcpyKind, cudaStream_t)`
+    fn cudaMemcpy2DAsync(
+        dst: *mut std::ffi::c_void,
+        dpitch: usize,
+        src: *const std::ffi::c_void,
+        spitch: usize,
+        width: usize,
+        height: usize,
+        kind: u32,
+        stream: CUstream,
+    ) -> u32;
 }
 
 /// The dedicated decode path: owns its own non-blocking stream, buffers, and cuBLAS.
@@ -570,11 +584,29 @@ impl DedicatedDecodePath {
     /// Uses the ACTUAL per-step sizes, not the staging capacity.
     unsafe fn stage_paged_attn(&self, paged_attn: &PagedAttentionState, batch_size: usize) {
         let actual_blocks = paged_attn.max_num_blocks_per_seq as usize;
-        // block_tables: [batch, actual_blocks] i32/u32
-        cudaMemcpyAsync(
+        // block_tables: source is [batch, actual_blocks]; the staging buffer is
+        // read by the kernel as [batch, staging_max_blocks_per_seq] because
+        // `staged_paged_attn` reports the CAPACITY as `max_num_blocks_per_seq`
+        // (it must: the captured graph bakes that value, and the actual per-step
+        // block count grows with context, which would invalidate the graph).
+        //
+        // The two strides are different integers, so this MUST be a pitched
+        // copy. A single flat copy of `batch * actual_blocks * 4` bytes lays the
+        // rows out at the SOURCE stride; the kernel then reads sequence i at
+        // `i * capacity` (pagedattention.cuh:229) and, for every i >= 1, picks up
+        // uninitialised memory and uses it as a physical KV block index —
+        // `key_cache + garbage * kv_block_stride` — i.e. a wild device read.
+        // Invisible at batch_size == 1 (both strides agree at offset 0), fatal
+        // from batch_size == 2 up.
+        let dst_pitch = self.staging_max_blocks_per_seq * 4;
+        let src_pitch = actual_blocks * 4;
+        cudaMemcpy2DAsync(
             self.staging_block_tables as *mut _,
+            dst_pitch,
             paged_attn.block_tables as *const _,
-            batch_size * actual_blocks * 4,
+            src_pitch,
+            src_pitch, // width in bytes actually carried per row
+            batch_size,
             3, // D2D
             self.stream,
         );
@@ -1030,6 +1062,109 @@ impl Drop for DedicatedDecodePath {
                 }
             }
             cuStreamDestroy_v2(self.stream);
+        }
+    }
+}
+
+/// Regression guard for the block-table staging stride.
+///
+/// `stage_paged_attn` writes the staging buffer and `paged_attention_v1` reads
+/// it. The kernel indexes sequence `i` at `i * max_num_blocks_per_seq`
+/// (`pagedattention.cuh:229`), and `staged_paged_attn` reports the staging
+/// CAPACITY there — it must, because a captured graph bakes that value while the
+/// real per-step block count grows with context.
+///
+/// So the copy MUST be pitched. These tests run without CUDA: they model the two
+/// layouts as index arithmetic and pin the fact that a flat copy mislays every
+/// row after the first. If someone "simplifies" `cudaMemcpy2DAsync` back to a
+/// single flat `cudaMemcpyAsync`, the first test here states exactly what breaks.
+#[cfg(test)]
+mod block_table_stride_tests {
+    /// Where a FLAT copy of `batch * actual * 4` bytes actually puts row `i`.
+    fn flat_copy_row_offset(seq_idx: usize, actual_blocks: usize) -> usize {
+        seq_idx * actual_blocks
+    }
+
+    /// Where the kernel LOOKS for row `i` (pagedattention.cuh:229), given the
+    /// value `staged_paged_attn` reports as `max_num_blocks_per_seq`.
+    fn kernel_row_offset(seq_idx: usize, reported_max_blocks: usize) -> usize {
+        seq_idx * reported_max_blocks
+    }
+
+    /// Where a PITCHED copy with `dpitch = capacity` puts row `i`.
+    fn pitched_copy_row_offset(seq_idx: usize, capacity: usize) -> usize {
+        seq_idx * capacity
+    }
+
+    /// Realistic staging capacity: `(max_position_embeddings / block_size)
+    /// .max(actual_blocks)` — see `run_step`.
+    fn capacity(max_position_embeddings: usize, block_size: usize, actual: usize) -> usize {
+        (max_position_embeddings / block_size.max(1)).max(actual)
+    }
+
+    #[test]
+    fn flat_copy_mislays_every_row_after_the_first() {
+        // Qwen2.5-0.5B shaped: 32k positions, 32-token blocks, short context.
+        let cap = capacity(32768, 32, 2);
+        assert_eq!(cap, 1024, "capacity is derived from max_position_embeddings");
+
+        // Sequence 0 always agrees — which is precisely why batch_size == 1
+        // cannot observe this defect and the B=8 cell can.
+        assert_eq!(flat_copy_row_offset(0, 2), kernel_row_offset(0, cap));
+
+        // Every later sequence does not.
+        for seq_idx in 1..8 {
+            assert_ne!(
+                flat_copy_row_offset(seq_idx, 2),
+                kernel_row_offset(seq_idx, cap),
+                "seq {seq_idx}: a flat copy writes at {} but the kernel reads at {} \
+                 — the read lands in uninitialised memory and is used as a \
+                 physical KV block index",
+                flat_copy_row_offset(seq_idx, 2),
+                kernel_row_offset(seq_idx, cap),
+            );
+        }
+    }
+
+    #[test]
+    fn pitched_copy_agrees_with_the_kernel_for_every_sequence() {
+        let cap = capacity(32768, 32, 2);
+        for seq_idx in 0..8 {
+            assert_eq!(
+                pitched_copy_row_offset(seq_idx, cap),
+                kernel_row_offset(seq_idx, cap),
+                "the destination pitch must be the same number the kernel is told"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_one_cannot_discriminate() {
+        // Stated as a test so no one reads a green B=1 run as evidence.
+        let cap = capacity(32768, 32, 2);
+        assert_eq!(
+            flat_copy_row_offset(0, 2),
+            kernel_row_offset(0, cap),
+            "at batch_size == 1 the buggy and fixed layouts are byte-identical; \
+             a passing B=1 measurement says nothing about this defect"
+        );
+    }
+
+    #[test]
+    fn pitched_copy_preconditions_hold() {
+        // cudaMemcpy2DAsync requires dpitch >= width and spitch >= width.
+        for &(max_pos, block_size, actual) in
+            &[(32768usize, 32usize, 2usize), (4096, 16, 1), (1024, 16, 64), (128, 16, 64)]
+        {
+            let cap = capacity(max_pos, block_size, actual);
+            let width = actual * 4;
+            let dpitch = cap * 4;
+            let spitch = actual * 4;
+            assert!(
+                dpitch >= width,
+                "capacity {cap} must cover actual {actual} (max() in run_step guarantees it)"
+            );
+            assert!(spitch >= width);
         }
     }
 }
