@@ -56,6 +56,12 @@ FILLER = (
 # The engine's own telemetry line (`engine/logger.rs:108`).
 RUNNING_RE = re.compile(r"(\d+) running, (\d+) waiting")
 
+# Printed once by `dsv4_attention` the first time it masks a ragged cohort per
+# row. Its ABSENCE means per-row masking never ran: the rows were uniform, the
+# gate was off, or the binary is stale. A throughput table without it describes
+# something other than ragged decode, so the sweep refuses to pass without it.
+BEACON = "ARC-RAGGED-MASK-ENGAGED"
+
 # The release-mode postcondition that fires when a batch reached the dense
 # forward without having been made uniform (`kv_cache/mod.rs`). If this appears,
 # the ragged path is MALFORMED, not merely slow.
@@ -197,6 +203,7 @@ def sweep_one(args, batch: int, log_offset: int):
         "achieved_running_peak": max(top) if top else 0,
         "achieved_running_p90": round(statistics.median(top), 1) if top else 0,
         "telemetry_samples": len(observed),
+        "ragged_mask_engaged": BEACON in log_text,
         "poison": sorted({p for p in POISON if p in log_text}),
     }, log_offset
 
@@ -301,6 +308,20 @@ def main():
             )
         time.sleep(2)
 
+    # The beacon fires ONCE per process, so it cannot be required per-B (B=1 is
+    # uniform by construction and must NOT engage it). Require it across the
+    # whole run, scanning the entire log rather than the sweep's tail: a warmup
+    # request may have engaged it before the first window opened.
+    whole_log, _ = read_log_tail(args.log, 0)
+    beacon_seen = BEACON in whole_log
+    widened = [r for r in results if r["batch"] > 1 and r["achieved_running_peak"] > 1]
+    if widened and not beacon_seen:
+        failures.append(
+            "the engine ran multi-row decode batches but dsv4_attention NEVER masked a "
+            "ragged cohort per row -- the binary is stale, the gate is off, or the pool "
+            "was uniform. This run does not measure ragged decode."
+        )
+    print(f"\nragged mask engaged (beacon seen): {beacon_seen}")
     print("\nrequested_B  achieved_peak  achieved_p90  aggregate_tok/s  per_user_tok/s  exact")
     for r in results:
         print(

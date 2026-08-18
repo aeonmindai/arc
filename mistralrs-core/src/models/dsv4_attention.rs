@@ -557,6 +557,23 @@ pub fn dsv4_attention(
     // raw branch does not.
     let row_q0 = resolve_ragged_rows(cfg.row_q0, q0, b_sz)?;
 
+    // Engagement beacon, once per process. A ragged serving run that never
+    // prints this did NOT exercise per-row masking, however good its
+    // throughput table looks — the rows were uniform, or the gate was off, and
+    // the number describes something else. House rule: a green must prove work
+    // happened. This is also the string a release binary is checked for, so a
+    // stale build cannot be mistaken for the change under test.
+    if row_q0.is_some() {
+        static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!(
+                target: "arc_ragged",
+                "ARC-RAGGED-MASK-ENGAGED: dsv4_attention is masking a left-aligned ragged \
+                 cohort per row (b={b_sz}, q0={q0})"
+            );
+        }
+    }
+
     // ---- Raw working-set narrowing ----------------------------------------
     // Only the trailing `t_q + window - 1` raw keys are reachable by ANY query
     // row in this block: row `r` sits at absolute position `q0 + r` and attends
