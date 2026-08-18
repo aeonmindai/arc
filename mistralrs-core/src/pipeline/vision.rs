@@ -770,6 +770,7 @@ impl Loader for VisionLoader {
                     None,
                     None,
                     None,
+                    None,
                 )?;
                 let _ = model.forward(
                     &inputs.input,

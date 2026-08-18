@@ -102,6 +102,24 @@ pub(crate) struct Registry {
 /// because the registry would have to hold 4 billion nodes first.
 pub(crate) const NO_PARENT: u32 = u32::MAX;
 
+/// The name of `id`'s ancestor that sits directly under the root — `prompt` or
+/// `decode` on this engine — or `None` for the root itself.
+///
+/// This is what makes a span name resolvable. Prefill and decode are separate
+/// subtrees by design, so every name below the split exists twice; without the
+/// branch recorded on the node, a consumer's only handle is the dotted path,
+/// and the natural `find(|n| n.name == ..)` silently returns the prefill copy.
+fn branch_of(nodes: &[NodeAcc], id: u32) -> Option<String> {
+    let mut cur = id;
+    loop {
+        let parent = nodes.get(cur as usize)?.parent?;
+        if nodes.get(parent as usize)?.parent.is_none() {
+            return Some(nodes.get(cur as usize)?.name.clone());
+        }
+        cur = parent;
+    }
+}
+
 impl Registry {
     #[inline]
     pub fn lookup(&self, parent: u32, name: &str) -> Option<u32> {
@@ -206,6 +224,7 @@ impl Registry {
                     t: n.geom_t.load(Relaxed),
                     tokens: n.tokens.load(Relaxed),
                 },
+                branch: branch_of(&self.nodes, n.id),
                 reachable: n.reachable.load(Relaxed),
                 note: n.note.read().ok().and_then(|g| g.clone()),
                 children: n.children.clone(),

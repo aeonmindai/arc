@@ -20,9 +20,26 @@ use mistralrs_quant::{QtipLayer, QtipMode, QtipRotation};
 fn cos(a: &Tensor, b: &Tensor) -> f64 {
     let a = a.flatten_all().unwrap().to_dtype(DType::F32).unwrap();
     let b = b.flatten_all().unwrap().to_dtype(DType::F32).unwrap();
-    let dot = (&a * &b).unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap() as f64;
-    let na = (&a * &a).unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap().sqrt() as f64;
-    let nb = (&b * &b).unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap().sqrt() as f64;
+    let dot = (&a * &b)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .to_scalar::<f32>()
+        .unwrap() as f64;
+    let na = (&a * &a)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .to_scalar::<f32>()
+        .unwrap()
+        .sqrt() as f64;
+    let nb = (&b * &b)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .to_scalar::<f32>()
+        .unwrap()
+        .sqrt() as f64;
     dot / (na * nb + 1e-12)
 }
 
@@ -64,7 +81,10 @@ fn main() -> candle_core::Result<()> {
         let yv = lv.forward(&x_bf16)?;
         let sv = cos(&y_ref, &yv);
 
-        println!("{name:12}  matmul cos:  no-rot={sg:.4}  rot={sv:.4}   (delta {:+.4})", sv - sg);
+        println!(
+            "{name:12}  matmul cos:  no-rot={sg:.4}  rot={sv:.4}   (delta {:+.4})",
+            sv - sg
+        );
         sg_m += sg;
         sv_m += sv;
     }
