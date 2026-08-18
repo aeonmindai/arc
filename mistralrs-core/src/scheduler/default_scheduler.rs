@@ -359,6 +359,23 @@ impl<Backer: FcfsBacker> BucketingManager<Backer> for FixedBucketingManager {
                     {
                         len = k;
                         self.steps_since_prompt = 0;
+                        // 🔑 ENGAGEMENT, logged once. A run where the floor
+                        // never fires and a run where the floor is not on the
+                        // code path at all produce the SAME numbers, and this
+                        // chain has already published one set of those: five
+                        // cells measured with PagedAttention live, so
+                        // `DefaultScheduler` — this whole file — never
+                        // executed. "No effect" must be distinguishable from
+                        // "never ran", by a positive signal rather than by the
+                        // absence of a negative one.
+                        static FIRED: std::sync::Once = std::sync::Once::new();
+                        FIRED.call_once(|| {
+                            tracing::info!(
+                                "ARC prefill floor: forced a prompt bucket after {} passes \
+                                 (ARC_PREFILL_FLOOR_STEPS={floor}); logged once",
+                                floor
+                            );
+                        });
                     } else {
                         self.steps_since_prompt += 1;
                     }
@@ -491,15 +508,27 @@ impl<Backer: FcfsBacker> DefaultScheduler<Backer> {
             // admitted and must not be counted against the cap, or a cohort
             // mid-prefill would be re-queued behind itself.
             let is_new_prefill = seq.is_waiting();
-            if self.sequence_fits(&running, &seq)
-                && (!is_new_prefill || admitted_to_prefill < cap)
-            {
+            let capped = is_new_prefill && admitted_to_prefill >= cap;
+            if self.sequence_fits(&running, &seq) && !capped {
                 if is_new_prefill {
                     seq.set_state(SequenceState::RunningPrompt);
                     admitted_to_prefill += 1;
                 }
                 running.push(seq);
             } else {
+                if capped {
+                    // Same reason as the floor: a cap that held nothing back
+                    // and a cap that was never on the code path are the same
+                    // number otherwise.
+                    static HELD: std::sync::Once = std::sync::Once::new();
+                    HELD.call_once(|| {
+                        tracing::info!(
+                            "ARC prefill cap: held a waiting sequence back at {} admitted \
+                             this iteration (ARC_PREFILL_MAX_SEQS); logged once",
+                            admitted_to_prefill
+                        );
+                    });
+                }
                 new_waiting.add(seq);
             }
         }
