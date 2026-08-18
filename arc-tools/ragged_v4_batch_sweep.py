@@ -102,9 +102,14 @@ class Row:
 
 
 def stream_one(port: int, row: Row, max_tokens: int, timeout: int):
+    # `/v1/completions`, NOT `/v1/chat/completions`. The V4 checkpoint ships no
+    # chat template ("No chat template will be used. Only prompts will be
+    # accepted, not messages" at load), so the chat endpoint would reject every
+    # row and the sweep would measure nothing. The completion endpoint takes the
+    # raw prompt and is what the serving path under test actually needs.
     payload = {
         "model": "default",
-        "messages": [{"role": "user", "content": make_prompt(row.words)}],
+        "prompt": make_prompt(row.words),
         "max_tokens": max_tokens,
         # Temperature > 1e-7 AND top_p < 1.0 is what selects the real sampler
         # path rather than argmax/sample_fast (`sampler.rs`); measuring the
@@ -114,7 +119,7 @@ def stream_one(port: int, row: Row, max_tokens: int, timeout: int):
         "stream": True,
     }
     req = urllib.request.Request(
-        f"http://127.0.0.1:{port}/v1/chat/completions",
+        f"http://127.0.0.1:{port}/v1/completions",
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
     )
@@ -194,7 +199,14 @@ def sweep_one(args, batch: int, log_offset: int):
         "distinct_prompt_lengths": len(set(words)),
         "wall_s": round(wall, 2),
         "rows_ok": len(ok),
-        "rows_failed": [f"row{r.idx}: {r.error}" for r in rows if r.error],
+        # A row that raised is a failure -- and so is a row that returned
+        # cleanly with NOTHING, which is how a protocol mismatch presents (the
+        # first run of this sweep hit exactly that: 200 OK, immediate [DONE],
+        # zero tokens, no exception). Counting only `r.error` let those rows
+        # vanish from both lists, which is the silent-success shape the house
+        # rules forbid. Both are named here.
+        "rows_failed": [f"row{r.idx}: {r.error}" for r in rows if r.error]
+        + [f"row{r.idx}: returned 0 tokens with no error" for r in rows if not r.error and r.tokens == 0],
         "tokens_per_row": [r.tokens for r in rows],
         "tokens_exact": sorted(set(r.tokens for r in ok)) == [args.tokens],
         "total_tokens": total_tokens,
@@ -222,6 +234,26 @@ def preflight(args):
 
     if not os.path.exists(args.log):
         problems.append(f"engine log {args.log} does not exist -- engagement is unprovable")
+
+    # One real generation before committing the card to a full sweep. The first
+    # run of this sweep spent a whole GPU session discovering at the END that
+    # every row returned 200 OK and zero tokens, because V4 ships no chat
+    # template and the request went to `/v1/chat/completions`. A five-token
+    # probe would have caught it in one second, so it now runs first and the
+    # sweep refuses to start without it.
+    if not problems:
+        probe = Row(-1, 12)
+        stream_one(args.port, probe, 5, 60)
+        if probe.error:
+            problems.append(f"probe generation raised: {probe.error}")
+        elif probe.tokens == 0:
+            problems.append(
+                "probe generation returned 200 OK with ZERO tokens -- the endpoint or payload "
+                "shape is wrong for this model (V4 ships no chat template, so `messages` is "
+                "rejected and only `prompt` works). Nothing would be measured."
+            )
+        else:
+            print(f"probe OK: {probe.tokens} tokens in {probe.t_end - probe.t_start:.2f}s")
 
     if args.pid:
         try:
