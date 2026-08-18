@@ -11,11 +11,20 @@
 # Counted with arc-tools/kv_fp8_count_per_step.py, which pins the step count
 # from the trace and was first validated against the recorded baseline (it
 # reproduces 44.09 D2H/step and 9,131.5 launches/step).
+#
+# LOCK DISCIPLINE — this script takes /root/locks/bench.lock ITSELF, per leg,
+# and holds it ONLY across the traced run. Do NOT wrap this script in `flock`:
+# that holds the card through nsys report export and the counting, both of which
+# are pure CPU on files already written. Measured on this box, a chain doing
+# exactly that held the lock with 13-17 waiters queued while the GPU read
+# `0 %, 0 MiB, 78.28 W`.
 set -u
 OUT=${OUT:-/root/kvfp8}
 BASE=${BASE:-/root/budget-chain}
 BIN=${BIN:-/root/arc-wt/fp8-target/release/mistralrs}
 DUR=${DUR:-280}
+LOCK=${LOCK:-/root/locks/bench.lock}
+LOCKWAIT=${LOCKWAIT:-5400}
 GEN=${GEN:-3000}
 export PATH=/usr/local/cuda-13.1/bin:$PATH
 export LD_LIBRARY_PATH=/usr/local/cuda/compat:${LD_LIBRARY_PATH:-}
@@ -36,12 +45,16 @@ wait_for_vram() {
   done
 }
 
+exec 9>"$LOCK"
 for arm in before:cpu after:fused; do
   A=${arm%%:*}
   M=${arm##*:}
   echo "=== leg $A (ARC_KV_FP8_MODE=$M) $(date -u +%T) ==="
-  wait_for_vram 100000
   rm -f "$OUT/$A".nsys-rep "$OUT/$A".sqlite
+  # LOCK HELD ONLY HERE: VRAM wait + the traced run. Released the instant the
+  # bench exits, before any report export.
+  flock -w "$LOCKWAIT" 9 || { echo "FATAL_LOCK_TIMEOUT after ${LOCKWAIT}s"; exit 2; }
+  wait_for_vram 100000
   ARC_KV_FP8_MODE=$M nsys profile --trace=cuda --sample=none --cpuctxsw=none \
     --cuda-memory-usage=false --duration="$DUR" --kill=sigterm \
     --force-overwrite=true --output="$OUT/$A" \
@@ -50,7 +63,8 @@ for arm in before:cpu after:fused; do
     --prompt-len 64 --gen-len "$GEN" --iterations 1 --warmup 0 \
     >"$OUT/$A.nsys.log" 2>&1
   RC=$?
-  echo "NSYS_RC=$RC"
+  flock -u 9
+  echo "NSYS_RC=$RC (lock released $(date -u +%T); export below is CPU-only)"
   # 143 = SIGTERM, which is how --kill ends the window and is EXPECTED.
   [ "$RC" = "139" ] && { echo "FATAL_TARGET_SIGSEGV"; exit 2; }
   grep -qi "out of memory" "$OUT/$A.nsys.log" && { echo "FATAL_OOM $A"; exit 2; }
