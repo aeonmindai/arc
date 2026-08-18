@@ -1238,6 +1238,10 @@ pub mod text_models_inputs_processor {
                 None,
                 None,
                 None,
+                // `row_offsets` — master gained this parameter after this test
+                // was written. `None` is what this test means: it exercises the
+                // per-row `context_lens` narrowing, not per-row RoPE placement.
+                None,
             )
             .expect("CPU prompt chunk must build");
 
@@ -1273,6 +1277,8 @@ pub mod text_models_inputs_processor {
                 false,
                 None,
                 None,
+                None,
+                // `row_offsets` — see the sibling test above.
                 None,
             )
             .expect("CPU prompt chunk must build");
