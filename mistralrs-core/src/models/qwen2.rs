@@ -26,6 +26,12 @@ use crate::{
 };
 
 serde_default_fn!(bool, word_emb_default, false);
+// `Qwen2Config` upstream defaults, verified 2026-08-18 against
+// transformers/src/transformers/models/qwen2/configuration_qwen2.py (main):
+//   use_sliding_window: bool = False
+//   max_window_layers: int = 28
+serde_default_fn!(bool, use_sliding_window_default, false);
+serde_default_fn!(usize, max_window_layers_default, 28);
 
 #[derive(Debug, Clone, serde::Deserialize, Default, serde::Serialize)]
 pub struct Config {
@@ -36,13 +42,53 @@ pub struct Config {
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     pub max_position_embeddings: usize,
-    pub sliding_window: Option<usize>,
+    /// The **declared** window from `config.json`. This is NOT the window in
+    /// effect: shipped Qwen2 configs carry a real number here *and*
+    /// `use_sliding_window: false` (Qwen2.5-7B-Instruct-1M declares
+    /// `sliding_window: 32768` with the flag off and a 1,010,000 context).
+    /// Never read this field directly — go through
+    /// [`Config::sliding_window_for_layer`] or
+    /// [`Config::effective_sliding_window`], which apply the same gate
+    /// transformers applies in `Qwen2Config.__post_init__`.
+    #[serde(rename = "sliding_window")]
+    pub declared_sliding_window: Option<usize>,
+    #[serde(default = "use_sliding_window_default")]
+    pub use_sliding_window: bool,
+    #[serde(default = "max_window_layers_default")]
+    pub max_window_layers: usize,
     pub rope_theta: f64,
     pub rms_norm_eps: f64,
     pub hidden_act: Activation,
     pub quantization_config: Option<QuantizedConfig>,
     #[serde(default = "word_emb_default")]
     pub tie_word_embeddings: bool,
+}
+
+impl Config {
+    /// The sliding window actually in effect for `layer_idx`, or `None` for
+    /// full attention.
+    ///
+    /// Mirrors `Qwen2Config.__post_init__`:
+    /// `self.sliding_window = self.sliding_window if self.use_sliding_window else None`,
+    /// then `"sliding_attention" if self.sliding_window is not None and
+    /// i >= self.max_window_layers else "full_attention"`.
+    ///
+    /// The same shape already ships three times over in this tree
+    /// (`qwen3.rs`, `qwen3_moe.rs`, `embedding_models/qwen3_embedding.rs`).
+    pub fn sliding_window_for_layer(&self, layer_idx: usize) -> Option<usize> {
+        if self.use_sliding_window && layer_idx >= self.max_window_layers {
+            self.declared_sliding_window
+        } else {
+            None
+        }
+    }
+
+    /// The window in effect for the model as a whole — `Some` only if at least
+    /// one layer is actually windowed. Used where a single model-wide value is
+    /// required (the causal mask, KV-cache sizing, PagedAttention metadata).
+    pub fn effective_sliding_window(&self) -> Option<usize> {
+        (0..self.num_hidden_layers).find_map(|i| self.sliding_window_for_layer(i))
+    }
 }
 
 struct Attention {
@@ -63,6 +109,7 @@ impl Attention {
         rotary_emb: Arc<RotaryEmbedding>,
         cfg: &Config,
         vb: ShardedVarBuilder,
+        layer_idx: usize,
         paged_attn: Option<PagedAttention>,
         comm: &Arc<mistralrs_quant::Comm>,
     ) -> Result<Self> {
@@ -127,7 +174,7 @@ impl Attention {
                 ),
                 softcap: None,
                 softmax_scale: 1.0 / (head_dim as f32).sqrt(),
-                sliding_window: cfg.sliding_window,
+                sliding_window: cfg.sliding_window_for_layer(layer_idx),
                 sinks: None,
             },
         })
@@ -264,6 +311,7 @@ impl DecoderLayer {
             rotary_emb,
             cfg,
             mapper.set_device(layer_idx, vb.pp("self_attn"), loading_isq),
+            layer_idx,
             paged_attn,
             comm,
         )?;
@@ -438,7 +486,7 @@ impl Model {
             layers,
             norm,
             lm_head,
-            sliding_window: cfg.sliding_window,
+            sliding_window: cfg.effective_sliding_window(),
             device: normal_loading_metadata.real_device,
             cache: EitherCache::Normal(NormalCache::new(
                 cfg.num_hidden_layers,
@@ -452,7 +500,7 @@ impl Model {
                 num_attn_heads: cfg.num_attention_heads / mapper.get_comm_for(0)?.world_size(),
                 num_kv_heads: (cfg.num_key_value_heads / mapper.get_comm_for(0)?.world_size())
                     .max(1),
-                sliding_window: cfg.sliding_window,
+                sliding_window: cfg.effective_sliding_window(),
                 k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
                 v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
                 kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
@@ -771,5 +819,271 @@ impl AnyMoeBaseModelMixin for Model {
     }
     fn amoe_supported(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layers_masker::NotACache;
+
+    /// Verbatim `config.json` of `Qwen/Qwen2.5-7B-Instruct-1M`, fetched
+    /// 2026-08-18 from
+    /// `https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-1M/raw/main/config.json`.
+    ///
+    /// This is the config that makes the bug lethal rather than latent: it
+    /// declares `sliding_window: 32768` with `use_sliding_window: false` and a
+    /// `max_position_embeddings` of 1,010,000. Reading the declared window
+    /// clamps attention — and the PagedAttention KV budget — to 32k on a model
+    /// shipped for 1M context, silently and with no error.
+    const QWEN25_7B_1M_CONFIG: &str = r#"{
+      "architectures": ["Qwen2ForCausalLM"],
+      "attention_dropout": 0.0,
+      "bos_token_id": 151643,
+      "eos_token_id": 151645,
+      "hidden_act": "silu",
+      "hidden_size": 3584,
+      "initializer_range": 0.02,
+      "intermediate_size": 18944,
+      "max_position_embeddings": 1010000,
+      "max_window_layers": 28,
+      "model_type": "qwen2",
+      "num_attention_heads": 28,
+      "num_hidden_layers": 28,
+      "num_key_value_heads": 4,
+      "rms_norm_eps": 1e-05,
+      "rope_scaling": null,
+      "rope_theta": 10000000.0,
+      "sliding_window": 32768,
+      "tie_word_embeddings": false,
+      "torch_dtype": "bfloat16",
+      "transformers_version": "4.47.1",
+      "use_cache": true,
+      "use_sliding_window": false,
+      "vocab_size": 152064
+    }"#;
+
+    fn cfg_with(
+        sliding_window: Option<usize>,
+        use_sliding_window: bool,
+        max_window_layers: usize,
+        num_hidden_layers: usize,
+    ) -> Config {
+        Config {
+            vocab_size: 32,
+            hidden_size: 8,
+            intermediate_size: 16,
+            num_hidden_layers,
+            num_attention_heads: 2,
+            num_key_value_heads: 2,
+            max_position_embeddings: 64,
+            declared_sliding_window: sliding_window,
+            use_sliding_window,
+            max_window_layers,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+            hidden_act: Activation::Silu,
+            quantization_config: None,
+            tie_word_embeddings: false,
+        }
+    }
+
+    /// Reproduces the mask call `Model::forward_embed` makes:
+    /// `CausalMasker.make_sliding_window_causal_mask_matrix(input_ids, cache,
+    /// self.sliding_window, dtype, num_attn_heads)`, where `self.sliding_window`
+    /// is whatever `Model::new` stored.
+    ///
+    /// `input_ids` values are irrelevant *by construction*: the masker reads
+    /// only `input_ids.dims2()` and `input_ids.device()`, never the token
+    /// values, so a zero fill erases nothing this test depends on.
+    fn masked_entries_at_swa_entry_point(window: Option<usize>, tgt_len: usize) -> usize {
+        let input_ids = Tensor::zeros((1, tgt_len), DType::U32, &Device::Cpu).unwrap();
+        let mask = CausalMasker
+            .make_sliding_window_causal_mask_matrix(&input_ids, &NotACache, window, DType::F32, 2)
+            .unwrap()
+            .expect("tgt_len > 1 must produce a real mask on CPU");
+        mask.flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .filter(|v| v.is_infinite() && v.is_sign_negative())
+            .count()
+    }
+
+    /// A shipped Qwen2 config declares a window *and* turns it off. The
+    /// declared number must never reach attention.
+    ///
+    /// Mutation check (run 2026-08-18): make `sliding_window_for_layer` return
+    /// `self.declared_sliding_window` unconditionally — master's behaviour —
+    /// and this reports `effective must be None, got Some(32768)`.
+    #[test]
+    fn qwen2_declared_window_is_not_the_effective_window() {
+        let cfg: Config = serde_json::from_str(QWEN25_7B_1M_CONFIG)
+            .expect("the shipped Qwen2.5-7B-Instruct-1M config must still parse");
+
+        assert_eq!(
+            cfg.declared_sliding_window,
+            Some(32768),
+            "fixture guard: this config must still declare a window, or the test proves nothing"
+        );
+        assert!(
+            !cfg.use_sliding_window,
+            "fixture guard: this config must still have the flag OFF"
+        );
+        assert_eq!(cfg.max_position_embeddings, 1_010_000);
+
+        let effective = cfg.effective_sliding_window();
+        assert_eq!(
+            effective, None,
+            "declared = {:?}, use_sliding_window = {}, max_window_layers = {} => effective must be None, got {:?}",
+            cfg.declared_sliding_window,
+            cfg.use_sliding_window,
+            cfg.max_window_layers,
+            effective
+        );
+
+        for layer_idx in 0..cfg.num_hidden_layers {
+            assert_eq!(
+                cfg.sliding_window_for_layer(layer_idx),
+                None,
+                "layer {layer_idx} of {} must be full attention",
+                cfg.num_hidden_layers
+            );
+        }
+    }
+
+    /// `use_sliding_window: false` must not merely be *recorded* — it has to
+    /// change what the mask erases at the SWA entry point.
+    ///
+    /// Numbers are exact and printed: for `tgt_len = 8` an 8x8 causal mask
+    /// forbids the 28 strictly-upper-triangular pairs; a window of 4
+    /// additionally forbids the 6 pairs with `j + 4 < i`, i.e. 34.
+    ///
+    /// Mutation check (run 2026-08-18): pass `declared_sliding_window` instead
+    /// of `effective_sliding_window()` and the flag-off case reports 34.
+    #[test]
+    fn qwen2_flag_off_reaches_the_swa_entry_point_and_erases_nothing_extra() {
+        const TGT_LEN: usize = 8;
+        const CAUSAL_ONLY: usize = 28;
+        const CAUSAL_PLUS_WINDOW_4: usize = 34;
+
+        let baseline_causal = masked_entries_at_swa_entry_point(None, TGT_LEN);
+        assert_eq!(
+            baseline_causal, CAUSAL_ONLY,
+            "sanity: a windowless mask over {TGT_LEN} tokens must forbid exactly {CAUSAL_ONLY} pairs, got {baseline_causal}"
+        );
+
+        let window_applied = masked_entries_at_swa_entry_point(Some(4), TGT_LEN);
+        assert_eq!(
+            window_applied, CAUSAL_PLUS_WINDOW_4,
+            "sanity: a window of 4 must forbid {CAUSAL_PLUS_WINDOW_4} pairs (> {CAUSAL_ONLY}), got {window_applied} — if these two are equal the assertions below cannot discriminate"
+        );
+
+        // Flag OFF, window declared: master fed `Some(4)` in here.
+        let off = cfg_with(Some(4), false, 0, 2);
+        let off_masked = masked_entries_at_swa_entry_point(off.effective_sliding_window(), TGT_LEN);
+        assert_eq!(
+            off_masked, CAUSAL_ONLY,
+            "use_sliding_window=false with declared window {:?}: mask forbade {off_masked} pairs, must forbid {CAUSAL_ONLY} (windowed = {CAUSAL_PLUS_WINDOW_4})",
+            off.declared_sliding_window
+        );
+
+        // Flag ON: the window must still be honoured, or the fix over-corrects.
+        let on = cfg_with(Some(4), true, 0, 2);
+        let on_masked = masked_entries_at_swa_entry_point(on.effective_sliding_window(), TGT_LEN);
+        assert_eq!(
+            on_masked, CAUSAL_PLUS_WINDOW_4,
+            "use_sliding_window=true with declared window {:?}: mask forbade {on_masked} pairs, must forbid {CAUSAL_PLUS_WINDOW_4}",
+            on.declared_sliding_window
+        );
+    }
+
+    /// `max_window_layers` is the second gate transformers applies, and it is
+    /// per layer. Every shipped Qwen2 config surveyed on 2026-08-18 has
+    /// `max_window_layers == num_hidden_layers`, which makes *every* layer full
+    /// attention even if the flag were flipped on.
+    #[test]
+    fn qwen2_max_window_layers_gates_per_layer() {
+        let cfg = cfg_with(Some(4), true, 1, 3);
+        assert_eq!(cfg.sliding_window_for_layer(0), None, "layer 0 < 1");
+        assert_eq!(cfg.sliding_window_for_layer(1), Some(4), "layer 1 >= 1");
+        assert_eq!(cfg.sliding_window_for_layer(2), Some(4), "layer 2 >= 1");
+        assert_eq!(cfg.effective_sliding_window(), Some(4));
+
+        // max_window_layers == num_hidden_layers: no layer is ever windowed.
+        let none_windowed = cfg_with(Some(4), true, 3, 3);
+        for layer_idx in 0..3 {
+            assert_eq!(
+                none_windowed.sliding_window_for_layer(layer_idx),
+                None,
+                "max_window_layers=3, num_hidden_layers=3: layer {layer_idx} must be full attention"
+            );
+        }
+        assert_eq!(none_windowed.effective_sliding_window(), None);
+    }
+
+    /// Defaults must match `Qwen2Config` upstream (`use_sliding_window=False`,
+    /// `max_window_layers=28`) so a config.json that omits them behaves the way
+    /// transformers behaves — off.
+    #[test]
+    fn qwen2_missing_flag_defaults_to_off_like_transformers() {
+        let json = r#"{
+          "vocab_size": 32, "hidden_size": 8, "intermediate_size": 16,
+          "num_hidden_layers": 2, "num_attention_heads": 2, "num_key_value_heads": 2,
+          "max_position_embeddings": 64, "sliding_window": 4096,
+          "rope_theta": 10000.0, "rms_norm_eps": 1e-6, "hidden_act": "silu"
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.declared_sliding_window, Some(4096));
+        assert!(!cfg.use_sliding_window, "upstream default is False");
+        assert_eq!(cfg.max_window_layers, 28, "upstream default is 28");
+        assert_eq!(cfg.effective_sliding_window(), None);
+    }
+
+    /// No call site outside the two gate methods may read the declared window.
+    ///
+    /// The field was renamed from `sliding_window` precisely so the compiler
+    /// would surface every existing reader; this keeps a *new* reader from
+    /// being added without the gate.
+    ///
+    /// Mutation check (run 2026-08-18): restoring the loader's
+    /// `cfg.declared_sliding_window` made this fire with
+    /// `1 ungated read(s) ... ["sliding_window: cfg.declared_sliding_window"]`.
+    #[test]
+    fn declared_window_has_no_ungated_readers() {
+        let accessor = concat!(".", "declared_", "sliding_window");
+        for (name, src) in [
+            ("models/qwen2.rs", include_str!("qwen2.rs")),
+            (
+                "pipeline/loaders/normal_loaders.rs",
+                include_str!("../pipeline/loaders/normal_loaders.rs"),
+            ),
+        ] {
+            // Drop each file's own `#[cfg(test)]` tail so fixtures don't self-trip.
+            let body = src.split("#[cfg(test)]").next().unwrap();
+            // Third state: if an earlier `#[cfg(test)]` ever truncates the body
+            // above the code this guards, say "cannot answer" rather than pass
+            // vacuously.
+            assert!(
+                body.contains("effective_sliding_window"),
+                "{name}: guard cannot answer — the non-test body it kept ({} of {} bytes) no longer contains the gated call site",
+                body.len(),
+                src.len()
+            );
+            let ungated: Vec<String> = body
+                .match_indices(accessor)
+                .filter(|(pos, _)| !body[..*pos].ends_with("self"))
+                .map(|(pos, _)| {
+                    let start = body[..pos].rfind('\n').map_or(0, |i| i + 1);
+                    body[start..pos + accessor.len()].trim().to_string()
+                })
+                .collect();
+            assert!(
+                ungated.is_empty(),
+                "{name}: {} ungated read(s) of the declared window (must go through sliding_window_for_layer / effective_sliding_window): {ungated:?}",
+                ungated.len()
+            );
+        }
     }
 }

@@ -282,6 +282,43 @@ impl<Backer: FcfsBacker> DefaultScheduler<Backer> {
         // Filter out all done sequences
         let running = std::mem::take(&mut self.running);
         let mut waiting = std::mem::take(&mut self.waiting);
+
+        // REAP ABANDONED SEQUENCES — must run before the `is_running` filter,
+        // because an abandoned sequence IS still running: nothing has marked it
+        // done. See `Sequence::client_is_gone` for why the engine cannot learn
+        // this by failing to send.
+        //
+        // Left unreaped, one abandoned request costs three things: a scheduler
+        // slot, its KV block until `max_tokens`, and — because
+        // `bucket_and_waitlist_seqs_waiting` partitions on `cache_bucket_len` —
+        // a whole BUCKET pinned at a length nothing real needs, which degrades
+        // the batch shape for every live request.
+        //
+        // Only `running` is swept. An abandoned sequence sitting in `waiting`
+        // holds no KV, and is promoted to `running` by this same call, so it is
+        // reaped on the next pass — one scheduling cycle later, at no risk to
+        // the waiting list's ordering.
+        let abandoned: Vec<usize> = running
+            .iter()
+            .filter(|seq| seq.is_running() && seq.client_is_gone())
+            .map(|seq| *seq.id())
+            .collect();
+        if !abandoned.is_empty() {
+            for seq in running
+                .iter()
+                .filter(|s| s.is_running() && s.client_is_gone())
+            {
+                seq.set_state(SequenceState::Done(StopReason::Canceled));
+            }
+            tracing::warn!(
+                "Reaped {} sequence(s) whose client had already disconnected: ids {abandoned:?}. \
+                 Their scheduler slots and KV are released now rather than at max_tokens. \
+                 {} sequence(s) remain running.",
+                abandoned.len(),
+                running.len() - abandoned.len(),
+            );
+        }
+
         let mut running = running
             .into_iter()
             .filter(|seq| seq.is_running())
@@ -431,15 +468,34 @@ mod tests {
         sampler::{Logprobs, Sampler},
         sequence::{SeqStepType, SequenceGroup, SequenceRecognizer},
     };
+    use std::cell::RefCell;
     use std::time::Duration;
     use tokio::sync::Mutex;
 
-    /// Minimal running-completion sequence of exactly `n_toks` tokens.
+    thread_local! {
+        /// Keeps every fixture sequence's `Receiver` alive for the duration of
+        /// the test.
+        ///
+        /// 🔑 This is load-bearing, and its absence was a silent fixture bug.
+        /// `seq_of_len` used to write `let (dummy_sender, _rx) = channel(1);`,
+        /// and `_rx` is a real binding that drops when the helper returns — so
+        /// **every sequence the suite built already had a closed responder**,
+        /// i.e. modelled a client that had already disconnected. Nothing
+        /// noticed, because nothing looked. The moment `schedule()` learned to
+        /// reap abandoned sequences, `scheduler_runs_the_whole_admitted_batch`
+        /// cancelled all 64 of its own fixtures.
+        static LIVE_CLIENTS: RefCell<Vec<tokio::sync::mpsc::Receiver<crate::response::Response>>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    /// Minimal running-completion sequence of exactly `n_toks` tokens, with a
+    /// **live** client attached (see `LIVE_CLIENTS`).
     /// Mirrors `sequence::tests::dummy_seq` / `pipeline::amoe::new_dummy_seq`:
     /// no model, no engine — the scheduler only reads `len()`, `is_running()`,
     /// `images()`, `token_offset()` and the urgency counter.
     fn seq_of_len(id: usize, n_toks: usize) -> Sequence {
-        let (dummy_sender, _rx) = tokio::sync::mpsc::channel(1);
+        let (dummy_sender, rx) = tokio::sync::mpsc::channel(1);
+        LIVE_CLIENTS.with(|k| k.borrow_mut().push(rx));
         let dummy_sampler = Sampler::new(
             None,
             0,
@@ -632,6 +688,109 @@ mod tests {
         assert_eq!(
             select_running_bucket(&seq_buckets, &HashMap::new(), true),
             short_key
+        );
+    }
+
+    /// A sequence whose client is gone but which nothing has marked done —
+    /// exactly the state observed on the box: `N running` against a single live
+    /// connection, zero disconnect warnings, persisting into the next run.
+    ///
+    /// The sequence is deliberately left `RunningCompletion`: an abandoned
+    /// sequence IS still running, which is why the pre-existing
+    /// `filter(|seq| seq.is_running())` never removed it.
+    fn abandoned_seq_of_len(id: usize, n_toks: usize) -> Sequence {
+        let seq = seq_of_len(id, n_toks);
+        // Drop this sequence's receiver, and only this one's.
+        LIVE_CLIENTS.with(|k| {
+            k.borrow_mut().pop();
+        });
+        assert!(
+            seq.client_is_gone(),
+            "fixture guard: the abandoned sequence must actually have a closed \
+             responder, or this test proves nothing"
+        );
+        assert!(
+            seq.is_running(),
+            "fixture guard: it must still be RUNNING — that is the whole defect"
+        );
+        seq
+    }
+
+    /// Mutation check (run 2026-08-18): delete the reap block in `schedule()`
+    /// and this reports `3 running` — the phantom rows survive, exactly as on
+    /// master.
+    #[test]
+    fn a_sequence_whose_client_left_is_reaped_and_a_live_one_is_not() {
+        let mut sched: DefaultScheduler<VecDeque<Sequence>> = DefaultScheduler::new(
+            DefaultSchedulerMethod::Fixed(NonZeroUsize::new(128).unwrap()),
+        );
+        sched.add_seq(seq_of_len(0, 100));
+        sched.add_seq(abandoned_seq_of_len(1, 100));
+        sched.add_seq(seq_of_len(2, 100));
+        assert_eq!(
+            Scheduler::running_len(&sched),
+            3,
+            "all three are admitted before any scheduling pass"
+        );
+
+        let logger = IntervalLogger::new(Duration::from_secs(3600), None);
+        {
+            let _ = DefaultScheduler::schedule(&mut sched, &logger);
+        }
+
+        let survivors: Vec<usize> = sched.running.iter().map(|s| *s.id()).collect();
+        assert_eq!(
+            Scheduler::running_len(&sched),
+            2,
+            "the abandoned sequence must be gone; running = {survivors:?}"
+        );
+        assert_eq!(
+            survivors,
+            vec![0, 2],
+            "and it must be the ABANDONED one that went, not an arbitrary row"
+        );
+    }
+
+    /// The interaction with length bucketing, which is why this is not merely
+    /// untidy: `bucket_and_waitlist_seqs_waiting` partitions on
+    /// `cache_bucket_len`, so a phantom sequence at a stale length keeps a
+    /// bucket alive that nothing real needs, and the running set is one bucket.
+    ///
+    /// Here two live sequences sit at length 100 and one abandoned sequence at
+    /// 500. Unreaped, the scheduler sees two buckets and must waitlist one of
+    /// them; reaped, there is a single bucket and both live rows run.
+    ///
+    /// Mutation check (run 2026-08-18): delete the reap and this fails with
+    /// `1 live sequence(s) running` — the phantom wins the bucket.
+    #[test]
+    fn a_phantom_sequence_no_longer_pins_a_bucket() {
+        let mut sched: DefaultScheduler<VecDeque<Sequence>> = DefaultScheduler::new(
+            DefaultSchedulerMethod::Fixed(NonZeroUsize::new(128).unwrap()),
+        );
+        sched.add_seq(seq_of_len(0, 100));
+        sched.add_seq(seq_of_len(1, 100));
+        sched.add_seq(abandoned_seq_of_len(2, 500));
+
+        let logger = IntervalLogger::new(Duration::from_secs(3600), None);
+        {
+            let _ = DefaultScheduler::schedule(&mut sched, &logger);
+        }
+
+        let running: Vec<usize> = sched.running.iter().map(|s| *s.id()).collect();
+        assert_eq!(
+            running.len(),
+            2,
+            "both live sequences must run together: {running:?} — a phantom at a \
+             stale length must not split the batch into two buckets"
+        );
+        assert!(
+            !running.contains(&2),
+            "the phantom must not be running: {running:?}"
+        );
+        assert_eq!(
+            Scheduler::waiting_len(&sched),
+            0,
+            "and nothing real should have been waitlisted behind it"
         );
     }
 }

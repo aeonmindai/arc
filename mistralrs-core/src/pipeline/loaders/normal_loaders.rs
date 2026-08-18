@@ -1877,7 +1877,11 @@ impl DeviceMappedModelLoader for Qwen2Loader {
             hidden_size: cfg.hidden_size,
             num_kv_heads: cfg.num_key_value_heads,
             num_attn_heads: cfg.num_attention_heads,
-            sliding_window: cfg.sliding_window,
+            // NOT the declared window: this value reaches
+            // `GeneralMetadata.sliding_window` -> `PagedAttentionMeta`, so a
+            // declared-but-disabled window would cap the KV budget on a model
+            // that has no window at all.
+            sliding_window: cfg.effective_sliding_window(),
             k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
             v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
             kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,

@@ -104,9 +104,59 @@ pub enum RequestMessage {
     },
 }
 
+/// A **permanently closed** `Sender`, used as the serde default for the
+/// `#[serde(skip)]` response channels.
+///
+/// The receiver is dropped before this returns — with `_`, so it drops
+/// immediately rather than at end of scope — which means every sender this
+/// hands out is closed from birth and every `send` on it fails.
+///
+/// That is deliberate: a `Request` only ever gets deserialized on the daemon
+/// side of a distributed run, and both daemon replicators **replace this field
+/// with a live channel** before forwarding the request
+/// (`distributed.rs`, `Request::Normal`/`Tokenize`/`Detokenize` arms in both
+/// `ipc` and `ring` loops, each of which also holds its `Receiver` across the
+/// `recv().await`). Nothing is supposed to run with this sender still attached.
+///
+/// # Why the closed-ness is now load-bearing, not incidental
+///
+/// `Sequence::client_is_gone` is `responder.is_closed()`, and
+/// `DefaultScheduler::schedule` cancels any running sequence for which that is
+/// true. So a request that reaches the scheduler still holding this placeholder
+/// is reaped on its first scheduling pass instead of decoding to `max_tokens`
+/// for nobody — which is the behaviour we want, and only works because this
+/// sender reports itself closed.
+///
+/// **Do not "fix" this by keeping the receiver alive** (`_rx`, `std::mem::forget`,
+/// leaking it into a static). That would make an unreplaced placeholder look
+/// like a live client, and the sequence would silently occupy a scheduler slot
+/// and its KV to completion. `default_responder_is_closed_from_birth` pins it.
 fn default_responder<T>() -> Sender<T> {
     let (sender, _) = tokio::sync::mpsc::channel(1);
     sender
+}
+
+#[cfg(test)]
+mod default_responder_tests {
+    use super::default_responder;
+    use crate::response::Response;
+
+    /// See `default_responder`'s docs: the reap in `DefaultScheduler::schedule`
+    /// depends on this sender reporting itself closed.
+    ///
+    /// Mutation check (run 2026-08-18): change `default_responder` to hold its
+    /// receiver (`let (sender, _rx) = ...; std::mem::forget(_rx);`) and this
+    /// fails — which is precisely the state that would let a request with an
+    /// unreplaced placeholder responder run to `max_tokens` unnoticed.
+    #[test]
+    fn default_responder_is_closed_from_birth() {
+        let sender = default_responder::<Response>();
+        assert!(
+            sender.is_closed(),
+            "the serde placeholder responder must report itself closed, or an \
+             unreplaced one becomes an undetectable phantom sequence"
+        );
+    }
 }
 
 #[cfg_attr(feature = "pyo3_macros", pyo3::pyclass(eq, eq_int))]
