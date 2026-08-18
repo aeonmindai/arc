@@ -297,7 +297,11 @@ pub(crate) fn state_from_reversed_2b(r: &[u32; GROUPED_REV_WORDS], ts: usize) ->
     let bit = GROUPED_REV_BIT_BASE - 2 * ts as i32;
     let (q, sh) = ((bit >> 5) as usize, (bit & 31) as u32);
     let lo = r[q];
-    let hi = if q + 1 < GROUPED_REV_WORDS { r[q + 1] } else { 0 };
+    let hi = if q + 1 < GROUPED_REV_WORDS {
+        r[q + 1]
+    } else {
+        0
+    };
     let f = if sh == 0 {
         lo
     } else {
@@ -459,11 +463,9 @@ mod tests {
         for c in 0..len / GROUPED_TILE_K {
             let staged = stage_chunk(&packed, c);
             let r = reverse_staged_row_2b_with(&staged, pair_reverse_32);
-            let mut state: u32 = 0;
-            for t in 0..(c + 1) * GROUPED_TILE_K {
-                state = ((state << 2) | syms[t] as u32) & 0xFFFF;
-            }
-            // Recompute forward within the chunk so every ts is covered.
+            // `window_state_2b` is itself property-tested against the
+            // sequential recurrence above, so comparing to it covers every
+            // chunk-local ts including chunk 0's zero-filled warm-up.
             for ts in 0..GROUPED_TILE_K {
                 let t = c * GROUPED_TILE_K + ts;
                 let want = window_state_2b(&packed, t);
@@ -476,8 +478,7 @@ mod tests {
             }
         }
         assert_eq!(
-            checked,
-            len,
+            checked, len,
             "the sweep must cover every symbol, or a broken region could hide"
         );
     }
@@ -520,7 +521,10 @@ mod tests {
         );
         for ts in 0..GROUPED_TILE_K {
             let t = GROUPED_TILE_K + ts;
-            assert_eq!(state_from_reversed_2b(&good, ts), window_state_2b(&packed, t));
+            assert_eq!(
+                state_from_reversed_2b(&good, ts),
+                window_state_2b(&packed, t)
+            );
         }
     }
 }

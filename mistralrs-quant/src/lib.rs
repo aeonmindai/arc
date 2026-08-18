@@ -56,14 +56,14 @@ pub use safetensors::{attach_rename_rules, Shard, ShardedSafeTensors, ShardedVar
 
 pub use afq::{AfqBits, AfqGroupSize, AfqLayer};
 pub use bitsandbytes::{BnbLinear, BnbQuantParams, BnbQuantType};
+pub use blockwise_fp8::{
+    blockwise_fp8_moe, fp8_blockwise_dequantize, fp8_blockwise_quantize,
+    mx_int4_blockwise_dequantize, BlockwiseFP8Linear,
+};
 pub use calibration::{
     CalibAccumulator, CalibLayerData, CalibOptions, CalibrationArtifact, CalibrationMeta,
     ExpertCalibData, ExpertStatus, GramBlocks, GramLayout, GramMode, LayerCalibStats,
     CALIB_COLLECTOR_VERSION, CALIB_EXTENSION, CALIB_FORMAT_VERSION,
-};
-pub use blockwise_fp8::{
-    blockwise_fp8_moe, fp8_blockwise_dequantize, fp8_blockwise_quantize,
-    mx_int4_blockwise_dequantize, BlockwiseFP8Linear,
 };
 pub use distributed::{
     layers::{
@@ -99,13 +99,13 @@ pub use qtip::tune::{
     QTIP2B_GEMV_VARIANT_LEGACY,
 };
 pub use qtip::{
-    gpu_quantize_cpu_fallback_count, grouped_launch_counts, grouped_variant, hessian_row_weights,
-    qtip_expected_distinct_experts, set_grouped_variant, viterbi_quantize_row, ExpertBpwTable,
-    Qtip2bLayer, QtipBakeConfig, QtipCodebook, QtipLayer, QtipMode, QtipPackedView, QtipRotation,
-    QtipSearchDetail, QtipSearchStamp, TrellisBpw, TrellisSearch, QTIP2B_MCG_MULT,
-    QTIP_GATHER_GEMV_MAX_PAIRS, QTIP_GROUPED_TILE_K, QTIP_GROUPED_TILE_M, QTIP_GROUPED_TILE_N,
-    QTIP_GROUPED_VARIANT_BASELINE, QTIP_GROUPED_VARIANT_ENV, QTIP_GROUPED_VARIANT_TUNED,
-    QTIP_ONDEVICE_MOE_MAX_TOKENS_ENV,
+    bake_cache, gpu_quantize_cpu_fallback_count, grouped_launch_counts, grouped_variant,
+    hessian_row_weights, qtip_expected_distinct_experts, set_grouped_variant, viterbi_quantize_row,
+    BakeCacheError, BakeKey, ExpertBpwTable, Qtip2bLayer, QtipBakeConfig, QtipCodebook, QtipLayer,
+    QtipMode, QtipPackedView, QtipRotation, QtipSearchDetail, QtipSearchStamp, TrellisBpw,
+    TrellisSearch, QTIP2B_MCG_MULT, QTIP_GATHER_GEMV_MAX_PAIRS, QTIP_GROUPED_TILE_K,
+    QTIP_GROUPED_TILE_M, QTIP_GROUPED_TILE_N, QTIP_GROUPED_VARIANT_BASELINE,
+    QTIP_GROUPED_VARIANT_ENV, QTIP_GROUPED_VARIANT_TUNED, QTIP_ONDEVICE_MOE_MAX_TOKENS_ENV,
 };
 pub use td_moe_factored::TuckerFactoredLayer;
 pub use unquantized::UnquantLinear;

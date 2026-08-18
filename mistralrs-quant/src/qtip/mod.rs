@@ -55,6 +55,7 @@ use crate::{
     QuantizedSerdeType, ShardedVarBuilder,
 };
 
+pub mod bake_cache;
 #[cfg(test)]
 mod bake_memory_tests;
 #[cfg(test)]
@@ -80,6 +81,7 @@ pub use bitshift::{Qtip2bLayer, QTIP2B_MCG_MULT};
 // structural pair ceiling, the env var that selects the path, and the tile
 // geometry that decides whether the grouped kernel is reachable at all.
 // Exported rather than re-derived so a harness cannot drift from the dispatch.
+pub use bake_cache::{BakeCacheError, BakeKey};
 pub use gather_policy::{
     expected_distinct_experts as qtip_expected_distinct_experts,
     GATHER_GEMV_MAX_PAIRS as QTIP_GATHER_GEMV_MAX_PAIRS,
@@ -88,8 +90,8 @@ pub use gather_policy::{
 pub use grouped::{
     grouped_launch_counts, grouped_variant, set_grouped_variant, ExpertBpwTable, TrellisBpw,
     GROUPED_TILE_K as QTIP_GROUPED_TILE_K, GROUPED_TILE_M as QTIP_GROUPED_TILE_M,
-    GROUPED_TILE_N as QTIP_GROUPED_TILE_N, QTIP_GROUPED_VARIANT_BASELINE,
-    QTIP_GROUPED_VARIANT_ENV, QTIP_GROUPED_VARIANT_TUNED,
+    GROUPED_TILE_N as QTIP_GROUPED_TILE_N, QTIP_GROUPED_VARIANT_BASELINE, QTIP_GROUPED_VARIANT_ENV,
+    QTIP_GROUPED_VARIANT_TUNED,
 };
 #[allow(unused_imports)]
 pub use viterbi::{

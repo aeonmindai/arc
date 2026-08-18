@@ -75,9 +75,10 @@
 
 use candle_core::{DType, Device, Result, Tensor};
 use mistralrs_quant::{
-    grouped_launch_counts, qtip_expected_distinct_experts, set_grouped_variant, Qtip2bLayer,
-    QtipMode, QuantMethod, QTIP_GATHER_GEMV_MAX_PAIRS, QTIP_GROUPED_TILE_K, QTIP_GROUPED_TILE_M,
-    QTIP_GROUPED_VARIANT_BASELINE, QTIP_GROUPED_VARIANT_TUNED, QTIP_ONDEVICE_MOE_MAX_TOKENS_ENV,
+    bake_cache, grouped_launch_counts, qtip_expected_distinct_experts, set_grouped_variant,
+    BakeCacheError, BakeKey, Qtip2bLayer, QtipMode, QuantMethod, QTIP_GATHER_GEMV_MAX_PAIRS,
+    QTIP_GROUPED_TILE_K, QTIP_GROUPED_TILE_M, QTIP_GROUPED_VARIANT_BASELINE,
+    QTIP_GROUPED_VARIANT_TUNED, QTIP_ONDEVICE_MOE_MAX_TOKENS_ENV,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -683,6 +684,73 @@ fn report_verdict(
 /// the largest null effect this same run produced, by this factor.
 const AB_MARGIN_OVER_NULL: f64 = 2.0;
 
+/// Weight-draw seed. Part of the bake-cache key, so a cached fixture can only
+/// be served to a run that would have drawn the same weights.
+const WEIGHT_SEED: u64 = 0x5EED_BA4E_0000_2B00;
+
+/// Deterministic weight draw for a shape. `Tensor::randn` is NOT reproducible
+/// across runs, and a cached fixture must correspond to weights the caller
+/// could have re-derived — otherwise the cache key is a lie.
+fn deterministic_weights(dev: &Device, e: usize, n: usize, k: usize) -> Result<Tensor> {
+    let mut rng = Rng(WEIGHT_SEED ^ ((n as u64) << 32) ^ k as u64);
+    let total = e * n * k;
+    let mut v = Vec::with_capacity(total);
+    for _ in 0..total {
+        // Box-Muller off two uniforms, scaled to the 0.02 sigma the curve used.
+        let u1 = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+        let u2 = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+        let r = (-2.0 * (u1.max(1e-12)).ln()).sqrt();
+        v.push((0.02 * r * (std::f64::consts::TAU * u2).cos()) as f32);
+    }
+    Tensor::from_vec(v, (e, n, k), dev)?.to_dtype(DType::BF16)
+}
+
+/// Get this shape's baked layer, from the cache when the stamp agrees.
+///
+/// THREE outcomes, never two: a cache hit, a loud miss that falls through to
+/// a real bake, and a stamp MISMATCH that is an environment failure — a
+/// fixture that is wrong but plausible produces a clean, confident,
+/// meaningless A/B, which is worse than not running.
+fn bake_or_load(dev: &Device, cfg: &Cfg, s: &Shape) -> Result<Arc<dyn QuantMethod>> {
+    let key = BakeKey {
+        experts: cfg.experts,
+        n: s.n,
+        k: s.k,
+        seed: WEIGHT_SEED ^ ((s.n as u64) << 32) ^ s.k as u64,
+        mode: QtipMode::Viterbi,
+    };
+    if let Some(dir) = &cfg.bake_cache {
+        match bake_cache::load(std::path::Path::new(dir), &key, dev) {
+            Ok(l) => {
+                println!("  bake cache HIT  {}", key.stamp());
+                return Ok(Arc::new(l) as Arc<dyn QuantMethod>);
+            }
+            Err(BakeCacheError::Miss) => {
+                println!("  bake cache MISS {} — baking (minutes)", key.stamp());
+            }
+            Err(e) => candle_core::bail!("{e}"),
+        }
+    }
+
+    let w = deterministic_weights(dev, cfg.experts, s.n, s.k)?;
+    // The PRODUCTION door: D4 refuses `Greedy` here in every build.
+    let layer = Qtip2bLayer::quantize_with_mode(&w, None, dev, QtipMode::Viterbi)?;
+    drop(w);
+
+    if let Some(dir) = &cfg.bake_cache {
+        // Store, reload, and require the WHOLE payload back byte-for-byte
+        // before any later run is allowed to depend on this file.
+        let (path, n) =
+            bake_cache::store_and_verify(std::path::Path::new(dir), &key, layer.as_ref(), dev)?;
+        println!(
+            "  bake cached -> {} ({} payload bytes, round trip byte-identical)",
+            path.display(),
+            n
+        );
+    }
+    Ok(layer)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Arm {
     /// Baseline kernel in the baseline slot.
@@ -780,10 +848,37 @@ fn assert_variants_bit_identical(
         Ok(f.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect())
     };
 
-    set_grouped_variant(QTIP_GROUPED_VARIANT_BASELINE);
-    let base = bytes(&layer.gather_forward(a, &idx_sets[0])?)?;
-    set_grouped_variant(QTIP_GROUPED_VARIANT_TUNED);
-    let tuned = bytes(&layer.gather_forward(a, &idx_sets[0])?)?;
+    // 🔴 THE HOLE THIS CLOSES (found on hardware, 2026-08-18). The first
+    // version of this function had a negative control — a different routing
+    // draw must produce different bytes — and it PASSED while comparing the
+    // fused gather-GEMV to itself, because `--ab` had not disabled the GEMV
+    // and `gather_forward` never reached the grouped kernel at all. A
+    // negative control proves the comparison is sensitive to its INPUTS; it
+    // says nothing about WHICH CODE PATH produced them. So the launch
+    // counters gate the parity claim too, not just the timing.
+    let counted = |want: i32, f: &dyn Fn() -> Result<Tensor>| -> Result<Vec<u8>> {
+        set_grouped_variant(want);
+        let before = grouped_launch_counts();
+        let out = f()?;
+        let after = grouped_launch_counts();
+        let idx = want as usize;
+        if after[idx] - before[idx] != 1 || after[1 - idx] != before[1 - idx] {
+            candle_core::bail!(
+                "parity check never reached grouped variant {want}: launches went {before:?} -> \
+                 {after:?}. gather_forward took some OTHER path (fused GEMV or the CPU \
+                 reference), so a byte-identical result here would prove nothing about the \
+                 grouped kernel."
+            );
+        }
+        bytes(&out)
+    };
+
+    let base = counted(QTIP_GROUPED_VARIANT_BASELINE, &|| {
+        layer.gather_forward(a, &idx_sets[0])
+    })?;
+    let tuned = counted(QTIP_GROUPED_VARIANT_TUNED, &|| {
+        layer.gather_forward(a, &idx_sets[0])
+    })?;
     dev.synchronize()?;
 
     // Negative control: a different routing draw MUST produce different bytes,
@@ -826,14 +921,21 @@ fn run_ab(dev: &Device, cfg: &Cfg, act_dtype: DType, b: usize, rounds: usize) ->
     let shapes = ab_shapes(cfg.small);
     assert_coverage_headroom(cfg.experts, &[b])?;
 
+    // 🔴 REACHING THE KERNEL UNDER TEST IS A STEP, NOT AN ASSUMPTION.
+    // `gather_forward` (bitshift.rs:1800) takes the FUSED GEMV whenever
+    // `n_tokens <= ondevice_max_tokens` and the pair count fits, and only
+    // falls through to the grouped GEMM below that. The curve harness knows
+    // this — `Path::Grouped::select()` sets exactly this var — and the first
+    // `--ab` run on hardware timed the GEMV for all 24 arms because I did not.
+    // Read per call (bitshift.rs:1800), so setting it here is enough.
+    std::env::set_var("ARC_NO_QTIP_ONDEVICE_MOE", "1");
+    std::env::remove_var("ARC_NO_QTIP_GROUPED_MOE");
+
     for s in &shapes {
         assert_cuda_paths_reachable(s.k, act_dtype)?;
         assert_defeats_l2(cfg.experts, bytes_per_expert(s))?;
 
-        let w =
-            Tensor::randn(0f32, 0.02f32, (cfg.experts, s.n, s.k), dev)?.to_dtype(DType::BF16)?;
-        let layer = Qtip2bLayer::quantize_with_mode(&w, None, dev, QtipMode::Viterbi)?;
-        drop(w);
+        let layer = bake_or_load(dev, cfg, s)?;
 
         let (idx_sets, mean_distinct, mean_tiles, pairs) = build_routing(dev, b, cfg.experts)?;
         assert_routing_matches_model(b, cfg.experts, mean_distinct)?;
@@ -929,6 +1031,10 @@ struct Cfg {
     ab: Option<usize>,
     /// `U F U N` repetitions in `--ab`.
     rounds: usize,
+    /// Directory holding cached Viterbi bakes. The bake is ~95% of a run's
+    /// GPU time and is byte-identical every time, so caching it is what makes
+    /// repeated kernel sweeps affordable.
+    bake_cache: Option<String>,
 }
 
 fn parse_args() -> Result<Cfg> {
@@ -939,6 +1045,7 @@ fn parse_args() -> Result<Cfg> {
         small: false,
         ab: None,
         rounds: 3,
+        bake_cache: None,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -976,9 +1083,13 @@ fn parse_args() -> Result<Cfg> {
                 cfg.rounds = need(i)?.parse().map_err(candle_core::Error::wrap)?;
                 i += 2;
             }
+            "--bake-cache" => {
+                cfg.bake_cache = Some(need(i)?);
+                i += 2;
+            }
             other => candle_core::bail!(
                 "unknown flag {other}; accepted: --experts N --iters N --batches a,b,c --small \
-                 --ab B --rounds N"
+                 --ab B --rounds N --bake-cache DIR"
             ),
         }
     }
