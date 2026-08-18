@@ -76,7 +76,16 @@ pub struct DecodeBuffers {
     pub sin_table: u64, // [max_seq_len, head_dim/2]
     pub is_neox: bool,
 
-    pub batch_size: usize,
+    /// Allocated ROW CAPACITY of every activation buffer above — **not** the
+    /// batch size of the current step. `ensure_buffers` only ever grows it.
+    ///
+    /// The row count a forward should actually compute is passed to
+    /// `decode_forward` / `profile_forward` explicitly, because the two diverge
+    /// the moment the served batch size changes. Reading the capacity as if it
+    /// were the batch size is what made every sequence after the first read
+    /// stale staging metadata, and made `wrap_f32_logits` copy more rows out of
+    /// `logits_f32` than were ever allocated.
+    pub capacity: usize,
     /// Streaming-multiprocessor count for the active CUDA device. Queried at
     /// init via cudaDeviceGetAttribute(MultiProcessorCount). Used by GEMV
     /// dispatch to pick the wide vs original kernel without hardcoding GPU shape.
@@ -163,6 +172,7 @@ pub unsafe fn profile_forward(
     weights: &ModelWeights,
     buffers: &DecodeBuffers,
     paged_attn: &PagedAttentionState,
+    batch_size: usize,
     stream: CUstream,
 ) {
     extern "C" {
@@ -177,8 +187,15 @@ pub unsafe fn profile_forward(
         fn cudaEventDestroy(event: *mut std::ffi::c_void) -> u32;
     }
 
+    if batch_size > buffers.capacity {
+        tracing::error!(
+            "profile_forward refused: batch_size={batch_size} exceeds buffer capacity={}",
+            buffers.capacity
+        );
+        return;
+    }
     let cfg = &weights.config;
-    let bs = buffers.batch_size as u64;
+    let bs = batch_size as u64;
     let hs = cfg.hidden_size as u64;
     let hs_z = cfg.hidden_size;
     let inter_z = cfg.intermediate_size;
@@ -672,14 +689,34 @@ pub unsafe fn profile_forward(
 /// Run the full decode forward pass for one step.
 /// Pure kernel launches — no cuBLAS, no allocations, graph-capturable.
 #[cfg(feature = "cuda")]
+/// `batch_size` is the number of sequences THIS step must compute. It is not
+/// `buffers.capacity`: the buffers are grow-only, so capacity is an upper bound
+/// and is routinely larger. Every kernel below is launched for `batch_size`
+/// rows, and `stage_paged_attn` refreshed exactly that many rows of block
+/// tables / context lens / slot mappings.
+///
+/// The caller MUST have called `ensure_buffers(batch_size)` first. This function
+/// refuses rather than launching out of bounds if that did not happen.
 pub unsafe fn decode_forward(
     weights: &ModelWeights,
     buffers: &DecodeBuffers,
     paged_attn: &PagedAttentionState,
+    batch_size: usize,
     stream: CUstream,
 ) {
+    if batch_size > buffers.capacity {
+        // Launching anyway would write `batch_size` rows into buffers sized for
+        // `capacity`. Refuse loudly; `run_step` turns this into an Err before it
+        // can become a silently-wrong token.
+        tracing::error!(
+            "decode_forward refused: batch_size={batch_size} exceeds buffer capacity={} \
+             — ensure_buffers was not called for this batch size",
+            buffers.capacity
+        );
+        return;
+    }
     let cfg = &weights.config;
-    let bs = buffers.batch_size as u64;
+    let bs = batch_size as u64;
     let hs = cfg.hidden_size as u64;
     let hs_z = cfg.hidden_size;
     let inter_z = cfg.intermediate_size;

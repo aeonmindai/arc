@@ -14,6 +14,10 @@ mod rotating_cache;
 mod single_cache;
 pub mod turboquant_cache;
 mod xs_rolling;
+/// Thread-local `ARC_V4_XS_PER_SEQ` override, so a test outside this module can
+/// exercise both sides of the flag (the production read is a `OnceLock`).
+#[cfg(test)]
+pub(crate) use xs_rolling::test_override as xs_per_seq_test_override;
 
 pub use full_cache::{EitherCache, LayerCaches};
 pub use hybrid_cache::{
@@ -23,7 +27,7 @@ pub use hybrid_cache::{
 pub use rotating_cache::RotatingCache;
 pub use single_cache::SingleCache;
 pub use turboquant_cache::TurboQuantCache;
-pub use xs_rolling::{XsRollingCache, XS_TAIL_MARGIN_TOKENS};
+pub use xs_rolling::{xs_per_sequence_enabled, XsRollingCache, XS_TAIL_MARGIN_TOKENS};
 
 pub trait CacheManager<T: CacheManagerMixin + MetadataMixin + ?Sized> {
     /// Build one dense batched cache from `seqs`' per-sequence caches.
@@ -119,17 +123,25 @@ impl KvCache {
     ///   wrong rows, and the wrap point is not a function of the length.
     /// * **`TurboQuant` — no.** Content is quantized blocks with their own
     ///   grouping; a row shift is not a block shift.
-    /// * **`XsRolling` — no, and this is the one that blocks DeepSeek V4.** It
-    ///   carries *two* time bases (completed compressed rows on `comp`, raw
-    ///   rows for `[base, tokens)` on `tail`) plus scalar `tokens`/`base` that
-    ///   are one number for the whole batch. Per-sequence advance needs those
-    ///   to be per-row, needs `advance` to append a **different number of rows
-    ///   per sequence** — which one shared append offset cannot express — and
-    ///   needs the compressor to fire per row. That is the same gap
-    ///   `wave61-CL` §6 names ("the compressor's `xs` history has no block
-    ///   table") and `wave29-BC` §4b ruled its own project.
+    /// * **`XsRolling` — yes, under `ARC_V4_XS_PER_SEQ`.** It carries *two*
+    ///   time bases (completed compressed rows on `comp`, the retained raw
+    ///   window on `tail`), and until wave63-CO both were governed by a single
+    ///   `tokens`/`base` pair for the whole batch — the keystone gap
+    ///   `wave61-CL` §6 ("the compressor's `xs` history has no block table"),
+    ///   PR #92 §5.1 and `wave29-BC` §4b all landed on. They are now per-row:
+    ///   `comp` stays start-anchored and takes a `slot_mapping`-shaped scatter
+    ///   so each row appends at its own column, and `tail` is end-anchored so
+    ///   the one shared append offset serves every row — the same
+    ///   left-alignment trick [`front_pad_kv_cache`] uses for K/V. The flag
+    ///   gates only whether the engine may *build* such a batch; with it off
+    ///   nothing produces more than one row of state and every path is
+    ///   byte-identical to before.
     pub fn supports_per_sequence_len(&self) -> bool {
-        matches!(self, Self::Normal { .. })
+        match self {
+            Self::Normal { .. } => true,
+            Self::XsRolling(_) => xs_per_sequence_enabled(),
+            Self::Rotating { .. } | Self::TurboQuant(_) => false,
+        }
     }
 
     pub fn k(&self) -> Result<Option<Tensor>> {
@@ -628,6 +640,23 @@ pub(crate) fn first_mismatched_cache_len(
     seqs: &mut [&mut crate::sequence::Sequence],
     modify_draft_cache: bool,
 ) -> Option<(usize, usize, usize, usize)> {
+    first_mismatched_cache_len_inner(seqs, modify_draft_cache, xs_per_sequence_enabled())
+}
+
+/// [`first_mismatched_cache_len`] with the `xs` capability passed explicitly,
+/// so the skip can be exercised without latching a process-wide env read.
+///
+/// `xs_per_seq` exempts [`KvCache::XsRolling`] slots: once those carry a token
+/// count per batch row the whole reason for this check — that one dense
+/// `slice_set` demands identical dims — no longer applies to them.
+/// `clone_in_cache` reconciles their two buffers itself (front-padding the
+/// end-anchored raw window, zero-extending the start-anchored compressed one)
+/// and refuses, by name, any batch it genuinely cannot represent.
+pub(crate) fn first_mismatched_cache_len_inner(
+    seqs: &mut [&mut crate::sequence::Sequence],
+    modify_draft_cache: bool,
+    xs_per_seq: bool,
+) -> Option<(usize, usize, usize, usize)> {
     if seqs.len() < 2 {
         return None;
     }
@@ -641,7 +670,10 @@ pub(crate) fn first_mismatched_cache_len(
         };
         cache
             .iter()
-            .map(|slot| slot.as_ref().map(KvCache::current_seq_len))
+            .map(|slot| match slot.as_ref() {
+                Some(KvCache::XsRolling(_)) if xs_per_seq => None,
+                other => other.map(KvCache::current_seq_len),
+            })
             .collect()
     };
 
@@ -696,10 +728,19 @@ struct BatchSrc {
     k_slack_dim: Option<usize>,
     /// Dim along which `v` is slack, when it is.
     v_slack_dim: Option<usize>,
+    /// `v`'s content is anchored at its END, so widening it to the batch
+    /// maximum has to pad at the FRONT — the same left-alignment
+    /// [`front_pad_kv_cache`] applies to a ragged K/V cohort, here applied to
+    /// [`XsRollingCache::tail`]. Meaningless unless `v_slack_dim` is set.
+    v_slack_at_front: bool,
+    /// `(tokens, base)` per batch row, for an [`KvCache::XsRolling`] slot.
+    /// Carried alongside the tensors because the batched cache's row lengths
+    /// are the concatenation of its sequences', not `seqs[0]`'s repeated.
+    xs_rows: Option<(Vec<usize>, Vec<usize>)>,
 }
 
 impl BatchSrc {
-    fn of(cache: &KvCache) -> Result<Self> {
+    fn of(cache: &KvCache, xs_per_seq: bool) -> Result<Self> {
         Ok(match cache {
             KvCache::Normal { k, v } => Self {
                 k: k.all_data.clone().ok_or_else(|| {
@@ -710,6 +751,8 @@ impl BatchSrc {
                 })?,
                 k_slack_dim: Some(k.dim),
                 v_slack_dim: Some(v.dim),
+                v_slack_at_front: false,
+                xs_rows: None,
             },
             KvCache::Rotating { k, v } => Self {
                 k: k.all_data.clone().ok_or_else(|| {
@@ -720,6 +763,8 @@ impl BatchSrc {
                 })?,
                 k_slack_dim: Some(k.dim),
                 v_slack_dim: Some(v.dim),
+                v_slack_at_front: false,
+                xs_rows: None,
             },
             KvCache::TurboQuant(tq) => Self {
                 k: tq.k.current_data()?.ok_or_else(|| {
@@ -730,21 +775,36 @@ impl BatchSrc {
                 })?,
                 k_slack_dim: None,
                 v_slack_dim: None,
+                v_slack_at_front: false,
+                xs_rows: None,
             },
-            // Compressed rows batch like K (a grown capacity buffer), the raw
-            // tail like V (live content). Both are materialised by
-            // `XsRollingCache::advance`, so a sequence that has been cloned out
-            // at least once always has them.
-            KvCache::XsRolling(xs) => Self {
-                k: xs.comp.all_data.clone().ok_or_else(|| {
-                    candle_core::Error::msg("xs rolling cache: compressed rows not materialised")
-                })?,
-                v: xs.tail.clone().ok_or_else(|| {
-                    candle_core::Error::msg("xs rolling cache: raw tail not materialised")
-                })?,
-                k_slack_dim: Some(xs.comp.dim),
-                v_slack_dim: None,
-            },
+            // Compressed rows batch like K (a grown capacity buffer, and
+            // start-anchored: column `j` is absolute block `j` for every row).
+            // The raw tail is live content — with `ARC_V4_XS_PER_SEQ` off its
+            // width is an exact function of the token count and any
+            // disagreement is a genuinely ragged batch that must be refused;
+            // with it on the tail is end-anchored, so a narrower row is
+            // front-padded up to the batch maximum and the tokens it gains are
+            // ahead of its own `base`, i.e. never read. Both buffers are
+            // materialised by `XsRollingCache::advance`, so a sequence that has
+            // been cloned out at least once always has them.
+            KvCache::XsRolling(xs) => {
+                let (tokens, base) = xs.row_lens();
+                Self {
+                    k: xs.comp.all_data.clone().ok_or_else(|| {
+                        candle_core::Error::msg(
+                            "xs rolling cache: compressed rows not materialised",
+                        )
+                    })?,
+                    v: xs.tail.clone().ok_or_else(|| {
+                        candle_core::Error::msg("xs rolling cache: raw tail not materialised")
+                    })?,
+                    k_slack_dim: Some(xs.comp.dim),
+                    v_slack_dim: if xs_per_seq { Some(1) } else { None },
+                    v_slack_at_front: true,
+                    xs_rows: Some((tokens.to_vec(), base.to_vec())),
+                }
+            }
         })
     }
 }
@@ -765,6 +825,17 @@ impl BatchSrc {
 /// The dead prefix does **not** grow without bound: `lead_pad_i` is
 /// `max_j L_j - L_i`, and sequences in one batch accept at statistically the
 /// same rate, so the spread is a `sqrt(steps)` random walk, not a linear one.
+///
+/// ⚠️ That last sentence is only true if the prefix is **taken back out** on
+/// the way to the per-sequence caches. `current_seq_len` here counts the dead
+/// columns as live (it has to — this is where the shared append offset comes
+/// from), so a caller that records this length as the sequence's own makes the
+/// next `front_align_batch` pad relative to an already-padded length and the
+/// prefix accumulates **linearly**. [`drop_dead_prefix`] is the inverse that
+/// keeps the claim honest, and
+/// `MtpSpeculativePipeline::step`'s per-sequence commit is the caller that
+/// applies it. `the_dead_prefix_does_not_accumulate_across_steps` pins the
+/// difference, with the un-stripped variant as its negative control.
 fn front_pad_single(sc: &mut SingleCache, target_len: usize) -> Result<usize> {
     let live = sc.current_seq_len;
     if target_len < live {
@@ -805,6 +876,22 @@ fn front_pad_single(sc: &mut SingleCache, target_len: usize) -> Result<usize> {
 /// [`front_pad_single`] over both halves of a slot. Refuses any variant that
 /// cannot carry its own length ([`KvCache::supports_per_sequence_len`]).
 pub(crate) fn front_pad_kv_cache(cache: &mut KvCache, target_len: usize) -> Result<usize> {
+    // 🔑 An `XsRolling` slot is *already* per-row and must NOT be flattened to
+    // one length here. Its compressed rows are start-anchored (column `j` is
+    // absolute block `j` for every row, so there is nothing to shift) and its
+    // raw window is end-anchored and reconciled at batch-assembly time by
+    // `clone_in_cache`. Writing `target_len` into it would destroy exactly the
+    // per-row token counts this whole path exists to preserve.
+    if matches!(cache, KvCache::XsRolling(_)) {
+        if !xs_per_sequence_enabled() {
+            candle_core::bail!(
+                "kv-cache: front_pad is only defined for a `Normal` slot; this one is an \
+                 `XsRolling` and `ARC_V4_XS_PER_SEQ` is off. See \
+                 `KvCache::supports_per_sequence_len`."
+            );
+        }
+        return Ok(0);
+    }
     let KvCache::Normal { k, v } = cache else {
         candle_core::bail!(
             "kv-cache: front_pad is only defined for a `Normal` slot; this one is a `{}`. See \
@@ -819,6 +906,73 @@ pub(crate) fn front_pad_kv_cache(cache: &mut KvCache, target_len: usize) -> Resu
         "the two halves of one slot describe the same positions"
     );
     Ok(lead_k)
+}
+
+/// Drop the `lead` dead columns [`front_pad_single`] put ahead of one
+/// `SingleCache`'s live run, so the run is left-anchored at column 0 again and
+/// `current_seq_len` counts only positions that hold real K/V.
+fn drop_front_single(sc: &mut SingleCache, lead: usize) -> Result<()> {
+    if lead == 0 {
+        return Ok(());
+    }
+    if lead > sc.current_seq_len {
+        candle_core::bail!(
+            "kv-cache: cannot drop a {lead}-column dead prefix from a slot that holds only {} \
+             position(s) — the caller's idea of this row's padding and the slot's own length \
+             disagree",
+            sc.current_seq_len
+        );
+    }
+    let Some(ad) = sc.all_data.as_ref() else {
+        candle_core::bail!("kv-cache: drop_dead_prefix on a slot whose buffer is not materialised");
+    };
+    let have = ad.dims()[sc.dim];
+    if have < sc.current_seq_len {
+        candle_core::bail!(
+            "kv-cache: slot claims {} live position(s) but its buffer is only {have} wide",
+            sc.current_seq_len
+        );
+    }
+    let kept = have - lead;
+    sc.all_data = Some(ad.narrow(sc.dim, lead, kept)?.contiguous()?);
+    sc.capacity_seq_len = kept;
+    sc.current_seq_len -= lead;
+    Ok(())
+}
+
+/// The inverse of [`front_pad_kv_cache`]: take a row's dead prefix back out
+/// once the dense batched forward that needed it is over.
+///
+/// 🔑 This is what stops the prefix from accumulating. Left-alignment is the
+/// only way a ragged cohort can share one append offset, but the length it
+/// leaves behind (`lead + live`) is not the sequence's own length. Recording
+/// *that* as the per-sequence length makes the next `front_align_batch` pad
+/// relative to it, so every step adds another `max_j c_j - c_i` columns and the
+/// buffer grows linearly in steps rather than tracking the `sqrt(steps)` spread
+/// of the sequences themselves. Stripping the prefix restores the invariant
+/// every other part of the cache assumes — that a slot's live run starts at
+/// column 0 — which is exactly what `front_pad_single`'s `narrow(dim, 0, live)`
+/// requires the next time round.
+///
+/// `lead == 0` (every B=1 request, every uniform batch) is a no-op that touches
+/// no tensor. An `XsRolling` slot is likewise untouched: `front_pad_kv_cache`
+/// never gave it a prefix — its compressed rows are start-anchored and its raw
+/// window is re-anchored per row by `XsRollingCache::split_row`.
+pub(crate) fn drop_dead_prefix(cache: &mut KvCache, lead: usize) -> Result<()> {
+    if matches!(cache, KvCache::XsRolling(_)) || lead == 0 {
+        return Ok(());
+    }
+    let KvCache::Normal { k, v } = cache else {
+        candle_core::bail!(
+            "kv-cache: drop_dead_prefix is only defined for a `Normal` slot; this one is a `{}`. \
+             Nothing front-pads it, so nothing should be stripping it either. See \
+             `KvCache::supports_per_sequence_len`.",
+            cache.kind_name()
+        );
+    };
+    drop_front_single(k, lead)?;
+    drop_front_single(v, lead)?;
+    Ok(())
 }
 
 /// Left-align a whole ragged cohort so every sequence's live K/V ends at the
@@ -854,25 +1008,284 @@ pub(crate) fn front_align_batch(
         } else {
             seq.normal_cache()
         };
+        // The dead prefix is a property of the K/V run, so it is read from a
+        // K/V slot. `XsRolling` slots front-pad to nothing (they are already
+        // per-row) and would otherwise overwrite a real `lead` with 0 — on
+        // DeepSeek V4, whose 41 compressor slots come LAST, that silently
+        // reported "no padding" for every sequence.
         let mut lead = 0usize;
         for slot in cache.iter_mut().flatten() {
-            lead = front_pad_kv_cache(slot, target)?;
+            let is_xs = matches!(slot, KvCache::XsRolling(_));
+            let got = front_pad_kv_cache(slot, target)?;
+            if !is_xs {
+                lead = got;
+            }
         }
         lead_pads.push(lead);
     }
     Ok(lead_pads)
 }
 
-/// Zero-extend `src` along `dim` to `width`. Used only for preallocation slack
-/// (see [`BatchSrc`]), so the added columns are never read.
-fn pad_slack(src: &Tensor, dim: usize, width: usize) -> Result<Tensor> {
-    if src.dims()[dim] == width {
+thread_local! {
+    /// `lead_pad[i]` — the dead, zero-filled columns at the FRONT of row `i` of
+    /// the batched dense cache, left there by [`front_align_batch`].
+    ///
+    /// This is the channel that lets `CausalMasker` learn a batch is ragged
+    /// **without threading an argument through all forty-odd model forwards**.
+    /// Same shape as the existing `layers::set_graph_mode_positions`.
+    ///
+    /// 🔑 It holds the dead prefix and NOT the live lengths, because the prefix
+    /// is the part that stays constant. `clone_in_cache` runs only when batch
+    /// membership CHANGES (`engine/mod.rs`: `pre_op` is `In` only when
+    /// `last_completion_ids != current_completion_ids`, `Nothing` otherwise),
+    /// while the batched cache keeps growing by one column per row per step.
+    /// So a stored `live` would go stale on the very next token, whereas
+    /// `lead_pad` stays true for as long as the cohort is intact — and the
+    /// masker recovers `live[i] = past_kv_len - lead_pad[i]` from the cache's
+    /// own current length.
+    ///
+    /// `None` — the overwhelmingly common case — means the batch is uniform and
+    /// every path behaves exactly as it always has.
+    static RAGGED_LEAD_PAD: std::cell::RefCell<Option<Vec<usize>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Whether THIS pipeline's cache can carry per-sequence lengths, decided once
+/// after the model is loaded (`engine/mod.rs`) and read by the scheduler.
+///
+/// Default **off**: a build that never calls the setter behaves exactly as it
+/// always has. The scheduler cannot work this out for itself — it never sees
+/// the model — and the answer is a property of the cache variants
+/// ([`KvCache::supports_per_sequence_len`]), so it is decided where both are
+/// visible and published here. Same shape as `xs_per_sequence_enabled`.
+static RAGGED_DECODE_SUPPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_ragged_decode_supported(on: bool) {
+    RAGGED_DECODE_SUPPORTED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// May the scheduler admit a decode batch whose sequences differ in length?
+pub fn ragged_decode_supported() -> bool {
+    #[cfg(test)]
+    if let Some(on) = ragged_decode_test_override::current() {
+        return on;
+    }
+    RAGGED_DECODE_SUPPORTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Test-only override for [`ragged_decode_supported`].
+///
+/// The production flag is process-global because there is one pipeline per
+/// process. `cargo test` is the exception: it runs tests in parallel threads in
+/// ONE process, so a test that flips the global changes what every concurrently
+/// running test sees. That is not hypothetical — it made the pre-existing
+/// `scheduler_runs_the_whole_admitted_batch` fail while passing under
+/// `--test-threads=1`, which is exactly the shape of a bug that looks like a
+/// real regression and is not.
+///
+/// Thread-local, mirroring `xs_rolling::test_override`.
+#[cfg(test)]
+pub(crate) mod ragged_decode_test_override {
+    use std::cell::Cell;
+
+    thread_local! {
+        static STATE: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn current() -> Option<bool> {
+        STATE.with(|s| s.get())
+    }
+
+    /// Run `f` with ragged decode forced to `on`, on this thread only.
+    pub(crate) fn with<R>(on: bool, f: impl FnOnce() -> R) -> R {
+        let prev = STATE.with(|s| s.replace(Some(on)));
+        let out = f();
+        STATE.with(|s| s.set(prev));
+        out
+    }
+}
+
+pub(crate) fn set_ragged_lead_pad(lead_pad: Option<Vec<usize>>) {
+    RAGGED_LEAD_PAD.with(|r| *r.borrow_mut() = lead_pad);
+}
+
+thread_local! {
+    /// `seq id -> the dead prefix its per-sequence cache still carries`.
+    ///
+    /// 🔑 This is what makes the strip LAZY. `clone_out_cache` runs on every
+    /// decode token, but the per-sequence caches it writes are only ever READ
+    /// again when batch membership changes (`engine/mod.rs`: `pre_op` is `In`
+    /// only when `last_completion_ids != current_completion_ids`) — in between,
+    /// the forward runs off the batched cache the pipeline still holds. So
+    /// dropping each row's dead prefix on every step was doing
+    /// `O(B x layers x 2)` device copies per token for data nobody looks at
+    /// (~2,200 copies/token at B=47).
+    ///
+    /// Instead `clone_out_cache` records the prefix here — no tensor work — and
+    /// `clone_in_cache` pays for it once, on the membership change that
+    /// actually re-reads those caches.
+    static PENDING_LEAD_PAD: std::cell::RefCell<std::collections::HashMap<usize, usize>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn record_pending_lead_pad(seq_id: usize, lead: usize) {
+    PENDING_LEAD_PAD.with(|m| {
+        let mut m = m.borrow_mut();
+        if lead == 0 {
+            m.remove(&seq_id);
+        } else {
+            m.insert(seq_id, lead);
+        }
+    });
+}
+
+fn take_pending_lead_pad(seq_id: usize) -> usize {
+    PENDING_LEAD_PAD.with(|m| m.borrow_mut().remove(&seq_id).unwrap_or(0))
+}
+
+/// Test-only entry points for the deferred-strip bookkeeping, so tests outside
+/// this module can build a sequence in the state a front-aligned cohort leaves
+/// behind without making the real setters public.
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) fn set_pending_lead_pad(seq_id: usize, lead: usize) {
+        super::record_pending_lead_pad(seq_id, lead);
+    }
+}
+
+/// Drop a stale dead prefix from one sequence's own cache, re-anchoring its live
+/// run at column 0 the way `SingleCache` requires.
+///
+/// Called from `clone_in_cache` for each sequence that carries one, i.e. once
+/// per membership change rather than once per token.
+pub(crate) fn strip_pending_lead_pad(
+    seq: &mut crate::sequence::Sequence,
+    modify_draft_cache: bool,
+) -> Result<()> {
+    let seq_id = *seq.id();
+    let lead = take_pending_lead_pad(seq_id);
+    if lead == 0 {
+        return Ok(());
+    }
+    let cache = if modify_draft_cache {
+        seq.normal_draft_cache()
+    } else {
+        seq.normal_cache()
+    };
+    for slot in cache.iter_mut().flatten() {
+        if let KvCache::Normal { k, v } = slot {
+            for sc in [k, v] {
+                let Some(ad) = sc.all_data.as_ref() else {
+                    continue;
+                };
+                let keep = sc.current_seq_len.saturating_sub(lead);
+                let kept = ad.narrow(sc.dim, lead, keep)?.contiguous()?;
+                sc.all_data = Some(kept);
+                sc.current_seq_len = keep;
+                sc.capacity_seq_len = keep;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The current cohort's per-row dead prefix, if it is ragged.
+pub(crate) fn ragged_lead_pad() -> Option<Vec<usize>> {
+    RAGGED_LEAD_PAD.with(|r| r.borrow().clone())
+}
+
+/// Can this batch be front-aligned instead of refused?
+///
+/// Every slot of every sequence has to be able to carry its own length. A
+/// `Rotating` or `TurboQuant` slot cannot ([`KvCache::supports_per_sequence_len`]),
+/// and `XsRolling` only when `ARC_V4_XS_PER_SEQ` is on — so a model carrying one
+/// keeps the old exact-length bucketing rather than getting a wrong answer.
+pub(crate) fn batch_can_be_ragged(
+    seqs: &mut [&mut crate::sequence::Sequence],
+    modify_draft_cache: bool,
+) -> bool {
+    seqs.iter_mut().all(|seq| {
+        let cache = if modify_draft_cache {
+            seq.normal_draft_cache()
+        } else {
+            seq.normal_cache()
+        };
+        cache
+            .iter()
+            .flatten()
+            .all(KvCache::supports_per_sequence_len)
+    })
+}
+
+/// Would [`front_align_batch`] succeed on every slot, checked **before any of
+/// them is mutated**?
+///
+/// 🔑 This exists because `front_align_batch` pads in place, sequence by
+/// sequence and slot by slot. If it bailed halfway — an unmaterialised buffer,
+/// or a row whose padded capacity would exceed its `max_seq_len` — it would
+/// return `Err` having already rewritten the rows ahead of the failure. The
+/// blanket refusal it replaced (`ensure_uniform_batch_cache_lens` first, ask
+/// questions never) mutated **nothing** on the way out, and that property is
+/// part of what makes a refusal safe: the engine can fail those requests
+/// without the surviving sequences carrying a half-aligned cache.
+///
+/// So alignment is only attempted when it is known to complete. When this
+/// returns `false` the batch falls through to the original refusal, unmutated,
+/// exactly as before.
+fn front_align_would_succeed(
+    seqs: &mut [&mut crate::sequence::Sequence],
+    modify_draft_cache: bool,
+) -> bool {
+    let mut target = 0usize;
+    for seq in seqs.iter_mut() {
+        let cache = if modify_draft_cache {
+            seq.normal_draft_cache()
+        } else {
+            seq.normal_cache()
+        };
+        for slot in cache.iter().flatten() {
+            target = target.max(slot.current_seq_len());
+        }
+    }
+    seqs.iter_mut().all(|seq| {
+        let cache = if modify_draft_cache {
+            seq.normal_draft_cache()
+        } else {
+            seq.normal_cache()
+        };
+        cache.iter().flatten().all(|slot| match slot {
+            // Already per-row; `front_pad_kv_cache` returns Ok(0) untouched.
+            KvCache::XsRolling(_) => xs_per_sequence_enabled(),
+            KvCache::Normal { k, v } => [k, v].into_iter().all(|sc| {
+                if sc.current_seq_len == target {
+                    return true; // lead == 0, nothing to move
+                }
+                sc.all_data.is_some() && sc.capacity_seq_len.max(target) <= sc.max_seq_len
+            }),
+            // `supports_per_sequence_len` is false for these, so
+            // `batch_can_be_ragged` already refused; belt and braces.
+            KvCache::Rotating { .. } | KvCache::TurboQuant(_) => false,
+        })
+    })
+}
+
+/// Zero-extend `src` along `dim` to `width`, at the front when the content is
+/// end-anchored. Used only for preallocation slack and for the end-anchored
+/// `xs` window (see [`BatchSrc`]), so the added columns are never read.
+fn pad_slack(src: &Tensor, dim: usize, width: usize, at_front: bool) -> Result<Tensor> {
+    let have = src.dims()[dim];
+    if have == width {
         return Ok(src.clone());
+    }
+    if have > width {
+        candle_core::bail!("kv-cache: cannot pad a {have}-wide slot down to {width} on dim {dim}");
     }
     let mut shape = src.dims().to_vec();
     shape[dim] = width;
     let grown = Tensor::zeros(shape, src.dtype(), src.device())?;
-    grown.slice_set(&src.contiguous()?, dim, 0)?;
+    let offset = if at_front { width - have } else { 0 };
+    grown.slice_set(&src.contiguous()?, dim, offset)?;
     Ok(grown)
 }
 
@@ -981,11 +1394,47 @@ pub(crate) fn ensure_uniform_batch_cache_lens(
 /// member already sitting at `base_max` proves no future compressed row needs a
 /// token below it. `trim_tail_to` refuses rather than silently dropping history
 /// if that were ever untrue.
+///
+/// # 🔴 Why this is gated on `xs_per_seq`, and why that is not a port
+///
+/// `base` means two different things either side of `ARC_V4_XS_PER_SEQ`, and
+/// the reconciliation is *required* on one path and a *regression* on the other.
+///
+/// **Flag off** — `tail` is `tokens - base` wide, so `base` IS the physical left
+/// edge of the buffer. `BatchSrc::of` sets `v_slack_dim: None`, meaning
+/// `reconcile_batch_dims` demands the widths match exactly. Divergent `base` at
+/// equal `tokens` is then the 4-vs-132 `slice_set` failure PR #93 exists to fix,
+/// it is reachable on ordinary decode through the prefix cacher, and this
+/// function runs exactly as it always has.
+///
+/// **Flag on** — `tail` is `[B, W, hidden]` and **end-anchored**, with
+/// `base[i] >= tokens[i] - W`. `base` is now a *logical resume point*, decoupled
+/// from the buffer: `BatchSrc::of` sets `v_slack_dim: Some(1)` with
+/// `v_slack_at_front: true`, so a narrower row is front-padded up to the batch
+/// maximum and the columns it gains sit ahead of its own `base` — never read.
+/// The widths already agree, so the reconciliation buys nothing.
+///
+/// And it is not merely redundant there, it is **harmful**. Trimming every row
+/// to `base_max` raises the shortest-reach row's rollback floor to the batch's,
+/// which turns a per-sequence quantity into a batch-wide scalar. That is the
+/// same shape as the cohort min-rollback PR #92 removed, and as the
+/// dead-prefix-counted-as-content trap #102, #103 and #104 each caught
+/// independently. This is the last layer that still holds one; running it under
+/// the flag would put it back.
+///
+/// `xs_per_seq` is a parameter rather than a read of
+/// [`xs_per_sequence_enabled`] inside so that "which path reconciles" is itself
+/// testable — the two branches agree on every batch either one can serve, so no
+/// numeric test could tell which ran.
 fn reconcile_xs_bases(
     seqs: &mut [&mut crate::sequence::Sequence],
     layer: usize,
     modify_draft_cache: bool,
+    xs_per_seq: bool,
 ) -> Result<()> {
+    if xs_per_seq {
+        return Ok(());
+    }
     let mut base_max = 0usize;
     let mut any = false;
     for seq in seqs.iter_mut() {
@@ -995,7 +1444,10 @@ fn reconcile_xs_bases(
             seq.normal_cache()
         };
         if let Some(KvCache::XsRolling(xs)) = cache.get(layer).and_then(|s| s.as_ref()) {
-            base_max = base_max.max(xs.base);
+            // `resumable_from()` is `base.iter().max()`, which for the
+            // single-row per-sequence caches this function sees is `base[0]` —
+            // the same value the pre-#95 field read gave.
+            base_max = base_max.max(xs.resumable_from());
             any = true;
         }
     }
@@ -1027,15 +1479,77 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
         seqs: &mut [&mut crate::sequence::Sequence],
         modify_draft_cache: bool,
     ) -> Result<()> {
+        // A ragged cohort CAN share one dense cache, as long as every row's
+        // live K/V is made to END at the same column — then
+        // `SingleCache::append`'s one shared write offset is simultaneously
+        // correct for all of them. `front_align_batch` buys that; the price is
+        // a dead prefix per row, which attention MUST mask, because a zero K
+        // row is not a masked row (it scores logit 0 and takes softmax weight).
+        // The prefix is published on `RAGGED_LEAD_PAD` and picked up by
+        // `CausalMasker::make_causal_mask_matrix`.
+        //
+        // Refused rather than aligned when any slot cannot carry its own length
+        // (`Rotating`, `TurboQuant`, or `XsRolling` with `ARC_V4_XS_PER_SEQ`
+        // off) — those models keep the old exact-length bucketing.
+        // Publish the capability from the one place that always holds the real
+        // cache. Deciding this at engine construction would be a guess: the
+        // scheduler never sees the model, and the cache slots are not
+        // necessarily allocated yet. Deciding it here cannot be wrong — the
+        // cost is that the very first cohort is still bucketed, after which the
+        // scheduler has the answer. PagedAttention never reaches this function,
+        // so its scheduler is unaffected.
+        // Two checks, deliberately overlapping, with DIFFERENT jobs — noted
+        // because a mutation test showed that deleting this one alone changes
+        // no behaviour, `front_align_would_succeed` having independently
+        // refused the same batches.
+        //   * this one answers "can this MODEL ever take ragged decode", and is
+        //     what the scheduler reads to stop bucketing;
+        //   * `front_align_would_succeed` answers "can THIS batch be aligned
+        //     right now, without mutating anything if the answer is no".
+        // The capability is pinned directly by
+        // `the_capability_predicate_is_what_the_scheduler_reads`.
+        // Pay the deferred strip now, once, on the membership change that is
+        // about to re-read these caches. Until this runs, a row that was part of
+        // a front-aligned cohort still carries its dead prefix and reports a
+        // length that includes it — so this must happen BEFORE any length is
+        // compared or any alignment decided.
+        for seq in seqs.iter_mut() {
+            strip_pending_lead_pad(seq, modify_draft_cache)?;
+        }
+
+        let can_be_ragged = batch_can_be_ragged(seqs, modify_draft_cache);
+        set_ragged_decode_supported(can_be_ragged);
+
+        // Alignment is attempted only when it is known to complete, so the
+        // refusal path below stays NON-MUTATING exactly as it was before this
+        // change — see `front_align_would_succeed`. There is therefore no exit
+        // between here and `slice_set` that leaves a half-aligned batch.
+        if first_mismatched_cache_len(seqs, modify_draft_cache).is_some()
+            && can_be_ragged
+            && front_align_would_succeed(seqs, modify_draft_cache)
+        {
+            let lead_pad = front_align_batch(seqs, modify_draft_cache)?;
+            set_ragged_lead_pad(Some(lead_pad));
+        } else {
+            set_ragged_lead_pad(None);
+        }
+
         // 🔑 wave56-CG: this was a `debug_assert!`, i.e. absent from the release
         // binary that served on the H200. It now runs in release, and it
         // returns rather than panics, so a batch the scheduler should never
         // have formed costs the requests in it and not the engine task.
+        //
+        // Still a hard postcondition: front-alignment must have MADE the batch
+        // uniform. A cohort that could not be aligned still fails here rather
+        // than silently writing every sequence's K/V to the wrong slot.
         ensure_uniform_batch_cache_lens(seqs, modify_draft_cache)?;
 
         let _prof = arc_profiler::span("clone_in_cache");
+        let xs_per_seq = xs_per_sequence_enabled();
         let mut new_k_cache = Vec::new();
         let mut new_v_cache = Vec::new();
+        let mut xs_row_lens: Vec<Option<(Vec<usize>, Vec<usize>)>> =
+            vec![None; pipeline.get_metadata().num_hidden_layers];
 
         // `num_hidden_layers` here is the *cache vector* length, not 43: V4
         // appends one `XsRolling` compressor-history slot per CSA/HCA layer
@@ -1062,7 +1576,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
             // *can* be trimmed to a common start, which is lossless. Do that
             // before gathering, so the batch's widths agree by construction
             // rather than by luck.
-            reconcile_xs_bases(seqs, layer, modify_draft_cache)?;
+            reconcile_xs_bases(seqs, layer, modify_draft_cache, xs_per_seq)?;
 
             // Gather every sequence's two tensors for this slot up front, so
             // the batch's shape is decided by the whole batch instead of by
@@ -1076,7 +1590,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     seq.normal_cache()
                 };
                 match src_cache.get(layer).and_then(|s| s.as_ref()) {
-                    Some(cache) => srcs.push(Some(BatchSrc::of(cache)?)),
+                    Some(cache) => srcs.push(Some(BatchSrc::of(cache, xs_per_seq)?)),
                     None => srcs.push(None),
                 }
             }
@@ -1084,6 +1598,21 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
             let present: Vec<&BatchSrc> = srcs.iter().flatten().collect();
             let k_slack = present[0].k_slack_dim;
             let v_slack = present[0].v_slack_dim;
+            let v_front = present[0].v_slack_at_front;
+            // The batched slot's row lengths are every sequence's, in batch
+            // order — not `seqs[0]`'s repeated. `None` for a non-`xs` slot.
+            let xs_rows: Option<(Vec<usize>, Vec<usize>)> = present[0].xs_rows.as_ref().map(|_| {
+                let mut tokens = Vec::with_capacity(present.len());
+                let mut base = Vec::with_capacity(present.len());
+                for s in &present {
+                    if let Some((t, b)) = s.xs_rows.as_ref() {
+                        tokens.extend_from_slice(t);
+                        base.extend_from_slice(b);
+                    }
+                }
+                (tokens, base)
+            });
+            xs_row_lens[layer] = xs_rows;
             let ks: Vec<&Tensor> = present.iter().map(|s| &s.k).collect();
             let vs: Vec<&Tensor> = present.iter().map(|s| &s.v).collect();
 
@@ -1114,11 +1643,11 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     continue;
                 };
                 let src_k = match k_slack {
-                    Some(d) => pad_slack(&src.k, d, one_k[d])?,
+                    Some(d) => pad_slack(&src.k, d, one_k[d], false)?,
                     None => src.k.clone(),
                 };
                 let src_v = match v_slack {
-                    Some(d) => pad_slack(&src.v, d, one_v[d])?,
+                    Some(d) => pad_slack(&src.v, d, one_v[d], v_front)?,
                     None => src.v.clone(),
                 };
                 // Each side is offset by its OWN batch dim. They are always
@@ -1236,13 +1765,13 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     caches.push(KvCache::TurboQuant(tq.clone()));
                 }
                 KvCache::XsRolling(xs) => {
-                    // Everything except the two buffers (token count, base,
-                    // completed-row count, ratio) is per-batch metadata taken
-                    // from the seq0 template. That is only sound because
-                    // `ensure_uniform_batch_cache_lens` has already established
-                    // that every sequence agrees on `tokens` for this slot —
-                    // which is exactly what makes `tail` (`tokens - base` wide)
-                    // batchable at all.
+                    // `ratio`, `span_groups`, `margin` and `head_dim` are model
+                    // constants and come from the seq0 template. The token
+                    // counts do NOT: they are every sequence's own, in batch
+                    // order, so the batched slot carries the raggedness instead
+                    // of flattening it onto seqs[0]'s numbers. With
+                    // `ARC_V4_XS_PER_SEQ` off every sequence agrees anyway and
+                    // this is the same vector repeated.
                     let mut rebuilt = (**xs).clone();
                     if let Some(k) = k_cache.as_ref() {
                         if rebuilt.comp.dim != 0 {
@@ -1251,6 +1780,16 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     }
                     rebuilt.comp.all_data = k_cache;
                     rebuilt.tail = v_cache;
+                    if let Some((tokens, base)) = xs_row_lens[layer_idx].take() {
+                        // `comp` is start-anchored, so the batched slot holds
+                        // the LONGEST row's completed blocks; a shorter row's
+                        // surplus columns are stale and are excluded by the
+                        // compressed branch's own causality threshold at that
+                        // row's absolute position.
+                        rebuilt.comp.current_seq_len =
+                            tokens.iter().copied().max().unwrap_or(0) / rebuilt.ratio;
+                        rebuilt.set_row_lens(tokens, base)?;
+                    }
                     caches.push(KvCache::XsRolling(Box::new(rebuilt)));
                 }
             }
@@ -1264,6 +1803,19 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
         // split back into B per-sequence caches once per token, per layer,
         // including the compressor-history slots.
         let _prof = arc_profiler::span("clone_out_cache");
+        // The cohort's dead prefix, if `clone_in_cache` front-aligned it. Read
+        // once rather than per layer per sequence, and recorded per sequence so
+        // the strip can be deferred to the next membership change.
+        let ragged_lead = ragged_lead_pad();
+        if let Some(leads) = ragged_lead.as_ref() {
+            for (seq_i, seq) in seqs.iter().enumerate() {
+                record_pending_lead_pad(*seq.id(), leads[seq_i]);
+            }
+        }
+        debug_assert!(
+            ragged_lead.as_ref().is_none_or(|l| l.len() == seqs.len()),
+            "ragged lead_pad must have one entry per sequence in the batch"
+        );
         let all_cache = pipeline.cache().normal();
         for layer in 0..pipeline.get_metadata().num_hidden_layers {
             let cache = all_cache.0.get(layer).unwrap();
@@ -1319,6 +1871,30 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                         k: cache_k,
                         v: cache_v,
                     } => {
+                        // 🔑 Hand this row back its OWN length, not the batch's.
+                        //
+                        // On a front-aligned ragged cohort the row's real run is
+                        // the SUFFIX `[lead, current_seq_len)` — the columns
+                        // ahead of it are the zero-filled dead prefix. Copying
+                        // the shared `current_seq_len` here (which is what this
+                        // did unconditionally) would hand the sequence a cache
+                        // that claims the pad as content, and the next prefill
+                        // or re-batch of that sequence would read it as real.
+                        // `SingleCache` is start-anchored, so the prefix has to
+                        // be dropped, not just excluded by a length.
+                        //
+                        // `lead == 0` for every row of a uniform batch, which is
+                        // the identity — no narrow, no copy, no behaviour change.
+                        // The prefix is RECORDED, not dropped — see
+                        // `PENDING_LEAD_PAD`. This function runs on every
+                        // decode token, but what it writes is only re-read on a
+                        // membership change, so paying `O(B x layers x 2)`
+                        // device copies per token here was work for data nobody
+                        // looks at. `clone_in_cache` strips it once, when it
+                        // matters.
+                        //
+                        // `lead == 0` for every row of a uniform batch, so this
+                        // is the identity there and the map stays empty.
                         *seq_cache = Some(KvCache::Normal {
                             k: SingleCache {
                                 all_data: Some(k),
@@ -1364,9 +1940,9 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                         *seq_cache = Some(KvCache::TurboQuant(tq.clone()));
                     }
                     KvCache::XsRolling(xs) => {
-                        let mut per_seq = (**xs).clone();
-                        per_seq.comp.all_data = Some(k);
-                        per_seq.tail = Some(v);
+                        let per_seq = xs
+                            .split_row(seq_i, k, v)
+                            .expect("xs rolling cache: splitting a batched row back out");
                         *seq_cache = Some(KvCache::XsRolling(Box::new(per_seq)));
                     }
                 }
@@ -1380,6 +1956,12 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
         _modify_draft_cache: bool,
         load_preallocated_cache: bool,
     ) {
+        // The cohort this described is being torn down. Leaving the dead prefix
+        // published would hand it to whatever batch runs next — a prompt step
+        // takes `CacheInstruction::Reset`, i.e. this function, and would then
+        // build a ragged mask from another cohort's geometry.
+        set_ragged_lead_pad(None);
+
         if seqs.iter().any(|seq| seq.preallocated_cache().is_none()) {
             for layer in pipeline.cache().normal().0.iter_mut() {
                 layer.reset();
@@ -2095,9 +2677,9 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
 #[cfg(test)]
 mod clone_in_cache_invariant_tests {
     use super::*;
-    use candle_core::Device;
     use crate::sampler::Sampler;
     use crate::sequence::{SeqStepType, SequenceGroup, SequenceRecognizer};
+    use candle_core::Device;
     use tokio::sync::Mutex as TokioMutex;
 
     /// A cache slot whose only interesting property is its `current_seq_len`.
@@ -2230,7 +2812,10 @@ mod clone_in_cache_invariant_tests {
         let mut slot = materialised_slot(5, 16, 100.0);
         let before = rows(&slot)[..5].to_vec();
         let lead = front_pad_kv_cache(&mut slot, 9).unwrap();
-        assert_eq!(lead, 4, "a 5-row run inside a 9-wide target has a 4-row prefix");
+        assert_eq!(
+            lead, 4,
+            "a 5-row run inside a 9-wide target has a 4-row prefix"
+        );
         assert_eq!(slot.current_seq_len(), 9);
         let after = rows(&slot);
         assert!(
@@ -2295,9 +2880,156 @@ mod clone_in_cache_invariant_tests {
         }
     }
 
-    /// The slot that blocks DeepSeek V4 refuses **by name**. A silent success
-    /// here would corrupt the compressor's distant-context branch, which
-    /// nothing downstream checks.
+    /// 🔑 The inverse round-trip. Front padding then stripping must return the
+    /// slot to exactly what it was — same rows, same length — because that is
+    /// the only reason a per-sequence length recorded after a dense batched
+    /// forward means what it says.
+    #[test]
+    fn dropping_the_dead_prefix_inverts_front_pad() {
+        let mut slot = materialised_slot(5, 16, 100.0);
+        let before = rows(&slot)[..5].to_vec();
+        let lead = front_pad_kv_cache(&mut slot, 9).unwrap();
+        assert_eq!(lead, 4);
+        drop_dead_prefix(&mut slot, lead).unwrap();
+        assert_eq!(
+            slot.current_seq_len(),
+            5,
+            "after the strip the slot's length is its OWN live run again, not the batch's width"
+        );
+        assert_eq!(
+            rows(&slot)[..5],
+            before[..],
+            "the live run must survive the round trip bit-for-bit"
+        );
+    }
+
+    /// 🔴 The claim `front_pad_single`'s doc makes — that the dead prefix
+    /// tracks the `sqrt(steps)` spread of the sequences rather than growing
+    /// linearly — is a property of the code, not of the batch. It holds only
+    /// because the prefix is stripped on the way out.
+    ///
+    /// The fixture is a two-row cohort that diverges by a fixed 2 positions
+    /// every step, which is the *worst* case for the spread and still must not
+    /// compound. The negative control is the same loop with the strip removed:
+    /// that is the pre-change behaviour, and it grows without bound.
+    ///
+    /// ⚠️ Arithmetic on real tensors, not a hardware measurement (D14).
+    #[test]
+    fn the_dead_prefix_does_not_accumulate_across_steps() {
+        // One "step": pad both rows up to the batch max, pretend the forward
+        // appended `w`, keep `commit` of it, then (optionally) strip.
+        let run = |strip: bool, steps: usize| -> (Vec<usize>, Vec<Vec<f32>>) {
+            let w = 4usize;
+            let mut slots = [
+                materialised_slot(4, 512, 1.0),
+                materialised_slot(4, 512, 2.0),
+            ];
+            let commits = [3usize, 1];
+            for _ in 0..steps {
+                let target = slots
+                    .iter()
+                    .map(|s| s.current_seq_len())
+                    .max()
+                    .expect("two slots");
+                let leads: Vec<usize> = slots
+                    .iter_mut()
+                    .map(|s| front_pad_kv_cache(s, target).unwrap())
+                    .collect();
+                for (i, slot) in slots.iter_mut().enumerate() {
+                    // The batched forward writes `w` new positions for every row.
+                    slot.set_len(target + w).unwrap();
+                    if strip {
+                        drop_dead_prefix(slot, leads[i]).unwrap();
+                        // The slot's OWN length after the strip, deliberately
+                        // not recomputed here: `target + w - lead`. Deriving it
+                        // in the test instead would let a strip that moves no
+                        // data and updates no length still look right.
+                        let live = slot.current_seq_len() - w;
+                        slot.set_len(live + commits[i]).unwrap();
+                    } else {
+                        slot.set_len(target + commits[i]).unwrap();
+                    }
+                }
+            }
+            (
+                slots.iter().map(|s| s.current_seq_len()).collect(),
+                slots.iter().map(|s| rows(s)[..4].to_vec()).collect(),
+            )
+        };
+
+        // 4 committed to start, then `n` steps of 3 and 1 accepted tokens. The
+        // slow row's true length is `4 + n`; anything above that is padding
+        // being counted as content.
+        for n in [6usize, 12] {
+            let (lens, heads) = run(true, n);
+            assert_eq!(
+                lens,
+                vec![4 + n * 3, 4 + n],
+                "with the strip, each row's recorded length is exactly the tokens it committed"
+            );
+            assert_eq!(
+                heads,
+                vec![vec![1.0, 2.0, 3.0, 4.0], vec![2.0, 3.0, 4.0, 5.0]],
+                "and the live run is back at column 0 holding its own K/V — the pad/strip pair \
+                 has to be an identity on content, or the length is right about the wrong rows"
+            );
+        }
+        // Negative control — the pre-change behaviour. The error is the slow
+        // row's recorded length minus its true one, and it must grow with the
+        // step count rather than settling.
+        let err_at = |n: usize| run(false, n).0[1] - (4 + n);
+        assert_eq!(
+            (err_at(6), err_at(12)),
+            (10, 22),
+            "without the strip the slow row is inflated, and doubling the steps must roughly \
+             double the inflation — that is the linear accumulation, not a `sqrt(steps)` spread"
+        );
+        assert!(
+            err_at(12) >= 2 * err_at(6) - 2,
+            "the inflation must scale with the step count, not saturate"
+        );
+    }
+
+    /// A strip wider than the live run means the caller's per-row padding and
+    /// the slot disagree. Silently clamping would leave the sequence reading
+    /// another row's K/V, so it refuses by name (D18).
+    #[test]
+    fn dropping_more_dead_prefix_than_the_slot_holds_is_refused() {
+        let mut slot = materialised_slot(5, 16, 1.0);
+        let err = drop_dead_prefix(&mut slot, 6).unwrap_err().to_string();
+        assert!(
+            err.contains("dead prefix") && err.contains("disagree"),
+            "the refusal must say whose bookkeeping disagrees; got {err}"
+        );
+    }
+
+    /// A zero-width strip is the B=1 path and the uniform-batch path. It must
+    /// not reallocate or perturb anything.
+    #[test]
+    fn dropping_a_zero_width_dead_prefix_is_a_no_op() {
+        let mut slot = materialised_slot(7, 16, 3.0);
+        let before = rows(&slot);
+        drop_dead_prefix(&mut slot, 0).unwrap();
+        assert_eq!(rows(&slot), before);
+        assert_eq!(slot.current_seq_len(), 7);
+    }
+
+    /// The compressor slot is never front-padded, so it must never be
+    /// stripped either — its per-row token counts are the state the whole
+    /// path exists to carry.
+    #[test]
+    fn dropping_the_dead_prefix_leaves_an_xs_slot_untouched() {
+        xs_rolling::test_override::with(true, || {
+            let mut xs = KvCache::XsRolling(Box::new(XsRollingCache::new(4, 2, 64, 2048)));
+            let before = xs.current_seq_len();
+            drop_dead_prefix(&mut xs, 3).unwrap();
+            assert_eq!(xs.current_seq_len(), before);
+        });
+    }
+
+    /// With `ARC_V4_XS_PER_SEQ` off the slot that blocks DeepSeek V4 refuses
+    /// **by name**. A silent success here would corrupt the compressor's
+    /// distant-context branch, which nothing downstream checks.
     #[test]
     fn front_pad_refuses_a_slot_that_cannot_carry_its_own_length() {
         let mut xs = KvCache::XsRolling(Box::new(XsRollingCache::new(4, 2, 64, 2048)));
@@ -2306,6 +3038,142 @@ mod clone_in_cache_invariant_tests {
         assert!(
             err.contains("XsRolling") && err.contains("supports_per_sequence_len"),
             "the refusal must name the slot kind and where the rule lives; got {err}"
+        );
+    }
+
+    /// 🔑 With the flag ON, an `XsRolling` slot must be left **alone** by front
+    /// padding: its compressed rows are start-anchored (nothing to shift) and
+    /// its per-row token counts are the state this whole path exists to carry.
+    /// Writing `target_len` into it — which is what `front_pad_single` does to
+    /// every other slot — would flatten exactly that away.
+    #[test]
+    fn front_pad_leaves_a_per_row_xs_slot_untouched() {
+        xs_rolling::test_override::with(true, || {
+            let mut xs = KvCache::XsRolling(Box::new(XsRollingCache::new(4, 2, 64, 2048)));
+            assert!(xs.supports_per_sequence_len());
+            let before = xs.current_seq_len();
+            assert_eq!(front_pad_kv_cache(&mut xs, 32).unwrap(), 0);
+            assert_eq!(
+                xs.current_seq_len(),
+                before,
+                "front padding must not rewrite the compressor slot's token count"
+            );
+        });
+    }
+
+    /// 🔑 On DeepSeek V4 the 41 compressor slots come **last**, so a loop that
+    /// keeps whatever the final slot returned reports "no dead prefix" for
+    /// every sequence — and the caller then builds no mask for a batch that
+    /// needs one. The lead has to come from a K/V slot.
+    #[test]
+    fn front_align_reads_the_dead_prefix_from_a_kv_slot_not_a_trailing_xs_one() {
+        xs_rolling::test_override::with(true, || {
+            let mut a = seq_with_cache_len(0, 1, 1);
+            let mut b = seq_with_cache_len(1, 1, 1);
+            for (seq, live) in [(&mut a, 5usize), (&mut b, 8)] {
+                let cache = seq.normal_cache();
+                cache.clear();
+                cache.push(Some(materialised_slot(live, 16, 10.0)));
+                // …then the compressor slot, exactly where V4 puts it.
+                cache.push(Some(KvCache::XsRolling(Box::new(XsRollingCache::new(
+                    4, 2, 64, 2048,
+                )))));
+            }
+            let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
+            assert_eq!(
+                front_align_batch(&mut seqs, false).unwrap(),
+                vec![3, 0],
+                "the trailing compressor slot must not overwrite the K/V run's dead prefix"
+            );
+        });
+    }
+
+    /// The compressor slot stops being the reason per-sequence MTP advance is
+    /// refused. That refusal is `cache_supports_per_sequence_advance`'s first
+    /// failing slot, and it named `XsRolling` in every V4 cache until now.
+    #[test]
+    fn a_v4_shaped_cache_no_longer_refuses_per_sequence_lengths() {
+        let v4 = vec![
+            materialised_slot(8, 16, 1.0),
+            KvCache::XsRolling(Box::new(XsRollingCache::new(4, 2, 64, 2048))),
+        ];
+        assert!(
+            !v4.iter().all(KvCache::supports_per_sequence_len),
+            "with the flag off the compressor slot must still decline"
+        );
+        xs_rolling::test_override::with(true, || {
+            assert!(
+                v4.iter().all(KvCache::supports_per_sequence_len),
+                "with the flag on every slot of a V4-shaped cache carries its own length"
+            );
+        });
+    }
+
+    /// The uniformity precondition exists because one dense `slice_set` demands
+    /// identical dims. Once the compressor slots carry per-row token counts
+    /// that reason is gone for them — and only for them: a ragged K/V slot must
+    /// still be caught.
+    #[test]
+    fn the_uniformity_check_exempts_xs_slots_and_nothing_else() {
+        let build = |a_kv: usize, b_kv: usize, a_xs: usize, b_xs: usize| {
+            let mut a = seq_with_cache_len(0, 1, 1);
+            let mut b = seq_with_cache_len(1, 1, 1);
+            for (seq, kv, xs_tokens) in [(&mut a, a_kv, a_xs), (&mut b, b_kv, b_xs)] {
+                let cache = seq.normal_cache();
+                cache.clear();
+                cache.push(Some(slot(kv)));
+                let mut x = XsRollingCache::new(4, 2, 64, 2048);
+                x.assign_row_lens(vec![xs_tokens], vec![0]);
+                cache.push(Some(KvCache::XsRolling(Box::new(x))));
+            }
+            (a, b)
+        };
+
+        // Ragged ONLY on the compressor slot.
+        let (mut a, mut b) = build(8, 8, 8, 11);
+        let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
+        assert_eq!(
+            first_mismatched_cache_len_inner(&mut seqs, false, false).map(|m| m.0),
+            Some(1),
+            "with the flag off a ragged compressor slot is still a refusal"
+        );
+        assert_eq!(
+            first_mismatched_cache_len_inner(&mut seqs, false, true),
+            None,
+            "with per-row state the compressor slot is allowed to disagree"
+        );
+
+        // Ragged on the K/V slot: never exempt, under either flag.
+        let (mut c, mut d) = build(8, 9, 8, 8);
+        let mut seqs: Vec<&mut Sequence> = vec![&mut c, &mut d];
+        assert_eq!(
+            first_mismatched_cache_len_inner(&mut seqs, false, true).map(|m| m.0),
+            Some(0),
+            "the exemption must be for compressor slots only"
+        );
+    }
+
+    /// The end-anchored pad is the `xs` window's half of the left-alignment
+    /// trick: a narrower row's live tokens must finish at the same column as
+    /// everyone else's, so the one shared append offset serves them all.
+    #[test]
+    fn end_anchored_padding_puts_the_live_run_at_the_back() {
+        let src = Tensor::from_vec(vec![1.0f32, 2.0, 3.0], (1, 3, 1), &Device::Cpu).unwrap();
+        let back = pad_slack(&src, 1, 5, true).unwrap();
+        assert_eq!(
+            back.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![0.0, 0.0, 1.0, 2.0, 3.0],
+            "an end-anchored window pads at the FRONT"
+        );
+        let front = pad_slack(&src, 1, 5, false).unwrap();
+        assert_eq!(
+            front.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![1.0, 2.0, 3.0, 0.0, 0.0],
+            "a start-anchored buffer still pads at the back"
+        );
+        assert!(
+            pad_slack(&src, 1, 2, true).is_err(),
+            "padding is never a truncation"
         );
     }
 
@@ -2437,18 +3305,248 @@ mod clone_in_cache_invariant_tests {
     ///
     /// Mutation check: delete the `ensure_uniform_batch_cache_lens(..)?` call
     /// at the top of `clone_in_cache` and this test fails.
+    ///
+    /// ⚠️ **The contract narrowed, deliberately.** A length-mismatched batch is
+    /// now FRONT-ALIGNED rather than refused whenever every slot can carry its
+    /// own length — that is the whole point of ragged decode. The guard this
+    /// test exists for is unchanged for every cache that *cannot*, which is
+    /// what it now covers: a `Rotating` slot
+    /// ([`KvCache::supports_per_sequence_len`] is `false`) must still be
+    /// refused, in release, by returning an error rather than reaching
+    /// `slice_set` and panicking the engine task.
     #[test]
-    fn clone_in_cache_refuses_a_length_mismatched_batch() {
-        let pipeline = StubPipeline::new(4);
-        let mut a = seq_with_cache_len(0, 4, 100);
-        let mut b = seq_with_cache_len(1, 4, 200);
+    fn clone_in_cache_refuses_a_length_mismatched_batch_it_cannot_align() {
+        let pipeline = StubPipeline::new(2);
+        let rotating = |len: usize| {
+            let mut c = KvCache::new_rotating(2, 4096, 8);
+            if let KvCache::Rotating { k, v } = &mut c {
+                k.current_seq_len = len;
+                v.current_seq_len = len;
+            }
+            c
+        };
+        let mut a = seq_with_cache_len(0, 2, 100);
+        let mut b = seq_with_cache_len(1, 2, 200);
+        for (seq, len) in [(&mut a, 100usize), (&mut b, 200)] {
+            let cache = seq.normal_cache();
+            cache.clear();
+            for _ in 0..2 {
+                cache.push(Some(rotating(len)));
+            }
+        }
         let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
         let err = NormalCacheManager
             .clone_in_cache(&pipeline, &mut seqs, false)
-            .expect_err("a length-mismatched batch must be refused")
+            .expect_err("a batch that cannot be front-aligned must still be refused")
             .to_string();
         assert!(err.contains("must share current_seq_len"), "got: {err}");
         assert!(err.contains("100") && err.contains("200"), "got: {err}");
+    }
+
+    /// 🔑 INERTNESS. On a UNIFORM batch this whole change must do nothing.
+    ///
+    /// Asserted rather than assumed, because a measured −9.7% on the B=32
+    /// *uniform* cell is unexplained and "uniform means `lead == 0`, so the path
+    /// is inert" was reasoning, not evidence. If any of these three counters is
+    /// non-zero on a uniform cohort, the path is NOT inert and that is where the
+    /// regression lives.
+    #[test]
+    fn a_uniform_batch_leaves_every_ragged_mechanism_untouched() {
+        let pipeline = StubPipeline::new(2);
+        let mut a = seq_with_cache_len(0, 2, 5);
+        let mut b = seq_with_cache_len(1, 2, 5);
+        for seq in [&mut a, &mut b] {
+            let cache = seq.normal_cache();
+            cache.clear();
+            for l in 0..2 {
+                cache.push(Some(materialised_slot(5, 8, (l * 100) as f32)));
+            }
+        }
+        set_ragged_lead_pad(None);
+        PENDING_LEAD_PAD.with(|m| m.borrow_mut().clear());
+
+        let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
+        NormalCacheManager
+            .clone_in_cache(&pipeline, &mut seqs, false)
+            .expect("a uniform batch must batch");
+
+        assert_eq!(
+            ragged_lead_pad(),
+            None,
+            "a uniform cohort must publish NO dead prefix — a Some(vec![0,0]) here would send \
+             every uniform decode through the ragged mask path and off the flash kernel"
+        );
+        assert_eq!(
+            PENDING_LEAD_PAD.with(|m| m.borrow().len()),
+            0,
+            "a uniform cohort must leave no deferred strip work"
+        );
+        // And the mask builder must decline, which is what keeps uniform decode
+        // on the unmasked fast path.
+        let ids = Tensor::zeros((2, 1), candle_core::DType::U32, &Device::Cpu).unwrap();
+        let offsets: &[usize] = &[5, 5];
+        assert!(
+            crate::layers_masker::CausalMasker
+                .make_causal_mask_matrix(&ids, &offsets, candle_core::DType::F32, 1)
+                .unwrap()
+                .is_none(),
+            "a uniform cohort must still get NO mask at tgt_len == 1"
+        );
+    }
+
+    /// 🔑 `batch_can_be_ragged` is the predicate the SCHEDULER acts on, so it
+    /// needs a test of its own.
+    ///
+    /// Found by mutation: replacing the call with `true` inside
+    /// `clone_in_cache` left the whole suite green, because
+    /// `front_align_would_succeed` independently refuses the same batches. The
+    /// alignment decision is therefore double-covered, but the *capability* —
+    /// which is published to the scheduler and decides whether it stops
+    /// bucketing at all — was covered by nothing.
+    #[test]
+    fn the_capability_predicate_is_what_the_scheduler_reads() {
+        let mut normal = seq_with_cache_len(0, 2, 4);
+        {
+            let cache = normal.normal_cache();
+            cache.clear();
+            for l in 0..2 {
+                cache.push(Some(materialised_slot(4, 8, (l * 100) as f32)));
+            }
+        }
+        assert!(
+            batch_can_be_ragged(&mut [&mut normal], false),
+            "a cache of Normal slots must report that it can carry per-sequence lengths"
+        );
+
+        let mut rotating = seq_with_cache_len(1, 2, 4);
+        {
+            let cache = rotating.normal_cache();
+            cache.clear();
+            for _ in 0..2 {
+                cache.push(Some(KvCache::new_rotating(2, 4096, 8)));
+            }
+        }
+        assert!(
+            !batch_can_be_ragged(&mut [&mut rotating], false),
+            "a Rotating slot cannot carry its own length, so the scheduler must keep bucketing"
+        );
+
+        // One bad slot in one sequence is enough to disqualify the cohort.
+        assert!(
+            !batch_can_be_ragged(&mut [&mut normal, &mut rotating], false),
+            "capability is a property of the WHOLE batch, not of its first sequence"
+        );
+    }
+
+    /// 🔑 A refusal must leave the batch EXACTLY as it found it.
+    ///
+    /// The blanket refusal this change replaced ran before anything was
+    /// touched. `front_align_batch` pads in place, row by row and slot by slot,
+    /// so a naive "align, then assert" would return `Err` having already
+    /// rewritten the rows ahead of whichever one failed — and the engine would
+    /// fail those requests while the surviving sequences carried a half-aligned
+    /// cache. `front_align_would_succeed` is what keeps that from happening.
+    ///
+    /// The fixture is the exact shape that bails midway: sequence 0's slots are
+    /// materialised and paddable, sequence 1's are not (`all_data: None`, which
+    /// is what `slot()` builds). Alignment must never start.
+    #[test]
+    fn a_refusal_does_not_leave_a_half_aligned_batch() {
+        let pipeline = StubPipeline::new(2);
+        let mut a = seq_with_cache_len(0, 2, 5);
+        let mut b = seq_with_cache_len(1, 2, 3);
+        {
+            let cache = a.normal_cache();
+            cache.clear();
+            for l in 0..2 {
+                cache.push(Some(materialised_slot(5, 8, (l * 100) as f32)));
+            }
+        }
+        // `b` keeps the unmaterialised `slot(3)` from the helper.
+
+        let before: Vec<usize> = [&mut a, &mut b]
+            .iter_mut()
+            .flat_map(|s| {
+                s.normal_cache()
+                    .iter()
+                    .flatten()
+                    .map(KvCache::current_seq_len)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(before, vec![5, 5, 3, 3], "fixture: ragged and mixed");
+
+        set_ragged_lead_pad(None);
+        let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
+        let err = NormalCacheManager
+            .clone_in_cache(&pipeline, &mut seqs, false)
+            .expect_err("an unpaddable batch must be refused")
+            .to_string();
+        assert!(err.contains("must share current_seq_len"), "got: {err}");
+        drop(seqs);
+
+        let after: Vec<usize> = [&mut a, &mut b]
+            .iter_mut()
+            .flat_map(|s| {
+                s.normal_cache()
+                    .iter()
+                    .flatten()
+                    .map(KvCache::current_seq_len)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            after, before,
+            "the refusal mutated the batch; a half-aligned cache survived a failed step"
+        );
+        assert_eq!(
+            ragged_lead_pad(),
+            None,
+            "a refused batch must not publish a dead prefix for the masker to trust"
+        );
+    }
+
+    /// 🔑 The other side of that contract: a ragged batch whose slots CAN carry
+    /// their own lengths is front-aligned and accepted, and the per-row dead
+    /// prefix is published for the masker.
+    ///
+    /// Without the publication step the batch would run with a zero-filled
+    /// prefix that nothing masks — a zero K row scores logit 0 and takes real
+    /// softmax weight, so it would be a silent wrong answer rather than a
+    /// visible failure.
+    #[test]
+    fn clone_in_cache_front_aligns_a_ragged_batch_it_can_carry() {
+        let pipeline = StubPipeline::new(2);
+        let mut a = seq_with_cache_len(0, 2, 5);
+        let mut b = seq_with_cache_len(1, 2, 3);
+        for (seq, live) in [(&mut a, 5usize), (&mut b, 3)] {
+            let cache = seq.normal_cache();
+            cache.clear();
+            for l in 0..2 {
+                cache.push(Some(materialised_slot(live, 8, (l * 100) as f32)));
+            }
+        }
+        set_ragged_lead_pad(None);
+        let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
+        NormalCacheManager
+            .clone_in_cache(&pipeline, &mut seqs, false)
+            .expect("a ragged batch of Normal slots must be front-aligned, not refused");
+
+        assert_eq!(
+            ragged_lead_pad(),
+            Some(vec![0, 2]),
+            "the longer row has no dead prefix; the 3-long row carries 5-3 = 2"
+        );
+        // NOT asserted here: `ragged_decode_supported()`. It is a process-global
+        // written by every `clone_in_cache`, so a concurrently running test
+        // clobbers it and the assertion is racy — which it duly was, failing in
+        // the full suite and passing when filtered. The capability itself is
+        // pure and is asserted directly instead.
+        assert!(
+            batch_can_be_ragged(&mut seqs, false),
+            "a batch of Normal slots must be reported as carryable"
+        );
+        set_ragged_lead_pad(None);
     }
 
     // =====================================================================
@@ -2777,7 +3875,8 @@ mod clone_in_cache_invariant_tests {
         let mut restored = xs_state(128, 1);
         feed_xs(&mut restored, 300);
         assert_eq!(
-            restored.base, 256,
+            restored.resumable_from(),
+            256,
             "canonical(300) for ratio 128, margin 16"
         );
         restored.set_len(260).unwrap();
@@ -2785,7 +3884,11 @@ mod clone_in_cache_invariant_tests {
         // Reached 260 directly.
         let mut direct = xs_state(128, 1);
         feed_xs(&mut direct, 260);
-        assert_eq!(direct.base, 128, "canonical(260) sits a group lower");
+        assert_eq!(
+            direct.resumable_from(),
+            128,
+            "canonical(260) sits a group lower"
+        );
 
         // --- Fixture discrimination (D12) -------------------------------
         assert_eq!(
@@ -2841,10 +3944,275 @@ mod clone_in_cache_invariant_tests {
             panic!("slot 1 must stay an XsRolling entry")
         };
         assert_eq!(
-            xs.base, 256,
+            xs.resumable_from(),
+            256,
             "trimmed to the batch's largest retained start"
         );
         assert_eq!(xs.tail.as_ref().unwrap().dims(), &[2, 4, XS_HIDDEN]);
+    }
+
+    /// 🔴 **The test that discriminates between gating `reconcile_xs_bases` and
+    /// porting it.**
+    ///
+    /// Same fixture as
+    /// `xs_base_divergence_at_equal_lengths_is_reconciled_not_refused` — equal
+    /// `tokens`, divergent `base`, widths 4 vs 132 — but with
+    /// `ARC_V4_XS_PER_SEQ` **on**. Two things must both hold:
+    ///
+    /// 1. the batch assembles (the front-padded, end-anchored tail reconciles
+    ///    the widths without anyone trimming anything); and
+    /// 2. **each sequence keeps its OWN `base`** when the batch is split back
+    ///    out — 256 stays 256 and 128 stays 128.
+    ///
+    /// 🔑 (2) is the whole point, and it is asserted separately from (1) because
+    /// the two failure modes are different — verified by running both
+    /// mutations, not assumed:
+    ///
+    /// * **Trim the tensors too** (an unconditional `reconcile_xs_bases`, i.e.
+    ///   "port it"): the batched tail comes out `[2, 4, …]` instead of
+    ///   `[2, 132, …]`, so the *width* assertion catches it. The shorter row
+    ///   loses 128 tokens of rollback reach, and so does the longer one.
+    /// * **Reconcile only the logical `base`** (flatten `xs_rows`' `base` to
+    ///   `base_max` and leave the front-padded tensors alone — the more likely
+    ///   mistake once `base` is per-row): every shape is *exactly right*, which
+    ///   is all `clone_in_cache` checks, and the shorter row's rollback floor is
+    ///   silently raised from 128 to 256. **Only reading the per-row `base` back
+    ///   out catches this one** — it fails here with `[256, 256]` against
+    ///   `[256, 128]` after passing every width assertion above.
+    ///
+    /// The second is the same failure mode as the cohort min-rollback #92
+    /// removed and the padding traps #102/#103/#104 each caught: a batch-wide
+    /// scalar standing in for a per-row quantity, invisible to every check that
+    /// looks at shapes.
+    #[test]
+    fn per_row_xs_bases_survive_a_batch_round_trip_and_are_not_flattened() {
+        xs_rolling::test_override::with(true, || {
+            let mut restored = xs_state(128, 1);
+            feed_xs(&mut restored, 300);
+            restored.set_len(260).unwrap();
+            let mut direct = xs_state(128, 1);
+            feed_xs(&mut direct, 260);
+
+            // --- Fixture discrimination (D12): this must be the BASE
+            // divergence, not the length one, and the widths must really
+            // disagree — otherwise there is nothing for either rule to do.
+            assert_eq!(
+                (restored.resumable_from(), direct.resumable_from()),
+                (256, 128),
+                "the two rows must start at different resume points"
+            );
+            assert_eq!(
+                (restored.current_seq_len(), direct.current_seq_len()),
+                (260, 260),
+                "...at the SAME token count, or `ensure_uniform_batch_cache_lens` \
+                 refuses before any of this is reached"
+            );
+            assert_eq!(
+                (
+                    restored.tail.as_ref().unwrap().dims()[1],
+                    direct.tail.as_ref().unwrap().dims()[1]
+                ),
+                (4, 132),
+                "...and holding different-width tails, or the reconciliation is \
+                 vacuous either way"
+            );
+
+            let pipeline = StubPipeline::new(2);
+            let mut a = seq_with_slots(
+                0,
+                260,
+                vec![
+                    v4_kv_slot(512, 8, 260),
+                    KvCache::XsRolling(Box::new(restored)),
+                ],
+            );
+            let mut b = seq_with_slots(
+                1,
+                260,
+                vec![
+                    v4_kv_slot(512, 8, 260),
+                    KvCache::XsRolling(Box::new(direct)),
+                ],
+            );
+
+            // (1) It assembles — the end-anchored tail front-pads to the batch
+            //     maximum, and no trim was needed to get there.
+            {
+                let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
+                NormalCacheManager
+                    .clone_in_cache(&pipeline, &mut seqs, false)
+                    .expect("an end-anchored ragged tail must batch without trimming");
+            }
+            {
+                let batched = pipeline.cache().normal();
+                let KvCache::XsRolling(xs) = &batched.0[1] else {
+                    panic!("slot 1 must stay an XsRolling entry")
+                };
+                assert_eq!(
+                    xs.tail.as_ref().unwrap().dims(),
+                    &[2, 132, XS_HIDDEN],
+                    "the narrow row is front-padded up to the batch maximum, not \
+                     trimmed down to it"
+                );
+                let (tokens, base) = xs.row_lens();
+                assert_eq!(tokens, &[260, 260]);
+                assert_eq!(
+                    base,
+                    &[256, 128],
+                    "🔴 the BATCHED cache must carry both resume points. A \
+                     `base_max` flattening reads [256, 256] here and every shape \
+                     check above still passes."
+                );
+            }
+
+            // (2) And each sequence gets its own back.
+            {
+                let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
+                NormalCacheManager.clone_out_cache(&pipeline, &mut seqs, false);
+            }
+            let got: Vec<usize> = [&mut a, &mut b]
+                .iter_mut()
+                .map(|seq| match seq.normal_cache()[1].as_ref() {
+                    Some(KvCache::XsRolling(xs)) => xs.resumable_from(),
+                    _ => panic!("slot 1 must split back out as an XsRolling entry"),
+                })
+                .collect();
+            assert_eq!(
+                got,
+                vec![256, 128],
+                "🔴 each sequence must keep its OWN resume point. Getting \
+                 [256, 256] means the batch-wide `base_max` was written back \
+                 into the shorter row, raising its rollback floor by 128 tokens \
+                 — correct-looking, right-shaped, and wrong."
+            );
+        });
+    }
+
+    /// `trim_tail_to` refuses a multi-row cache rather than reading `base[0]`.
+    ///
+    /// A scalar `new_base` cannot describe a trim of rows sitting at different
+    /// resume points, and proceeding would return a right-shaped tensor — which
+    /// is exactly what the caller checks — so it must say so (D18).
+    #[test]
+    fn trimming_a_batched_xs_cache_by_one_scalar_is_refused() {
+        xs_rolling::test_override::with(true, || {
+            let mut restored = xs_state(128, 1);
+            feed_xs(&mut restored, 300);
+            restored.set_len(260).unwrap();
+            let mut direct = xs_state(128, 1);
+            feed_xs(&mut direct, 260);
+
+            let pipeline = StubPipeline::new(2);
+            let mut a = seq_with_slots(
+                0,
+                260,
+                vec![
+                    v4_kv_slot(512, 8, 260),
+                    KvCache::XsRolling(Box::new(restored)),
+                ],
+            );
+            let mut b = seq_with_slots(
+                1,
+                260,
+                vec![
+                    v4_kv_slot(512, 8, 260),
+                    KvCache::XsRolling(Box::new(direct)),
+                ],
+            );
+            let mut seqs: Vec<&mut Sequence> = vec![&mut a, &mut b];
+            NormalCacheManager
+                .clone_in_cache(&pipeline, &mut seqs, false)
+                .unwrap();
+
+            let mut batched = pipeline.cache().normal().0.clone();
+            let KvCache::XsRolling(xs) = &mut batched[1] else {
+                panic!("slot 1 must stay an XsRolling entry")
+            };
+            assert_eq!(xs.rows(), 2, "precondition: this cache is batched");
+            let err = xs
+                .trim_tail_to(256)
+                .expect_err("a scalar trim of a two-row cache must refuse")
+                .to_string();
+            assert!(
+                err.contains("single-row") && err.contains("2 rows"),
+                "the refusal must name why it cannot answer, got: {err}"
+            );
+        });
+    }
+
+    /// 🔴 `trim_tail_to` must drop the raw rows from the **front**.
+    ///
+    /// It raises `base`, so the tokens it discards are the OLDEST ones and the
+    /// surviving window is the *suffix* of what was there. Narrowing from column
+    /// 0 instead keeps the right *number* of columns holding the wrong tokens —
+    /// every length, width and shape assertion in this file still passes, and
+    /// the sequence silently resumes from history that is `drop` tokens stale.
+    ///
+    /// The other tests here feed zero-filled `xs`, so content is
+    /// indistinguishable and none of them can see this. This one feeds a ramp
+    /// (token `t` carries the value `t`) and reads the actual numbers back.
+    #[test]
+    fn trimming_the_retained_window_drops_the_oldest_rows_not_the_newest() {
+        use candle_core::IndexOp;
+        let dev = candle_core::Device::Cpu;
+        let mut state = xs_state(128, 1);
+        // Token `t` is the constant `t` across its hidden dim, so a column's
+        // identity is readable straight off the tensor.
+        // `f32::from(u16)` rather than `t as f32`: lossless by the type, so the
+        // exact float comparisons below are exact by construction and not by a
+        // range argument the reader has to make.
+        let n = 260usize;
+        let tok = |t: usize| f32::from(u16::try_from(t).expect("fixture is < 65536"));
+        let ramp: Vec<f32> = (0..n)
+            .flat_map(|t| std::iter::repeat_n(tok(t), XS_HIDDEN))
+            .collect();
+        let xs = Tensor::from_vec(ramp, (1usize, n, XS_HIDDEN), &dev).unwrap();
+        state
+            .advance(&xs, |w| {
+                let rows = w.dim(1)? / 128;
+                Tensor::zeros((1usize, rows, XS_HEAD_DIM), w.dtype(), w.device())
+            })
+            .unwrap();
+
+        let base_before = state.resumable_from();
+        let first_before: f32 = state
+            .tail
+            .as_ref()
+            .unwrap()
+            .i((0, 0, 0))
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert_eq!(
+            first_before,
+            tok(base_before),
+            "precondition: column 0 holds token `base`, so the fixture can tell \
+             the two ends apart"
+        );
+
+        let new_base = base_before + 4;
+        state.trim_tail_to(new_base).unwrap();
+
+        let tail = state.tail.as_ref().unwrap();
+        assert_eq!(
+            tail.dims()[1],
+            260 - new_base,
+            "precondition: the WIDTH is right either way — that is exactly why a \
+             width assertion cannot see this bug"
+        );
+        let first_after: f32 = tail.i((0, 0, 0)).unwrap().to_scalar().unwrap();
+        let last_after: f32 = tail
+            .i((0, tail.dims()[1] - 1, 0))
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert_eq!(
+            (first_after, last_after),
+            (tok(new_base), tok(n - 1)),
+            "the retained window must be the SUFFIX [new_base, tokens). Getting \
+             ({base_before}, ..) means the narrow ran from column 0 and the \
+             sequence would resume from stale history at the right width."
+        );
     }
 
     /// `trim_tail_to` is lossless only up to what the compressor still needs,
@@ -2856,7 +4224,7 @@ mod clone_in_cache_invariant_tests {
         feed_xs(&mut state, 260);
         let needs_from = state.compressor_needs_from();
         assert!(
-            needs_from >= state.base,
+            needs_from >= state.resumable_from(),
             "an untouched cache always retains what it needs"
         );
         assert!(
