@@ -2680,7 +2680,6 @@ mod clone_in_cache_invariant_tests {
     use crate::sampler::Sampler;
     use crate::sequence::{SeqStepType, SequenceGroup, SequenceRecognizer};
     use candle_core::Device;
-    use tokio::sync::Mutex as TokioMutex;
 
     /// A cache slot whose only interesting property is its `current_seq_len`.
     /// `all_data` stays `None` — `first_mismatched_cache_len` reads lengths,
@@ -2726,7 +2725,9 @@ mod clone_in_cache_invariant_tests {
             vec![],
         )
         .unwrap();
-        let group = Arc::new(TokioMutex::new(SequenceGroup::new(1, false, false, None)));
+        let group = Arc::new(std::sync::Mutex::new(SequenceGroup::new(
+            1, false, false, None,
+        )));
         let mut seq = Sequence::new_waiting(
             vec![1u32; current_seq_len.max(1)],
             String::new(),

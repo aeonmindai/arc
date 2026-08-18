@@ -24,10 +24,42 @@ use crate::{
 
 use super::CacheConfig;
 
-/// Bucket key: (sequence length, has_images && is_prompt, token_offset)
-/// We bucket sequences by these criteria to ensure all sequences in a batch have the same
-/// length, avoiding padding issues with flash attention varlen.
+/// Bucket key: (length, has_images && is_prompt, token_offset).
+///
+/// The length component is **conditional** — see [`LengthRule`]. Everything a
+/// batch must genuinely agree on is in the other two components.
 type BucketKey = (usize, bool, usize);
+
+/// Does sequence length participate in the bucket key for this leg?
+///
+/// # Why this is a choice and not a constant
+///
+/// The original rule (upstream #1746) put `seq.len()` in the key on **both**
+/// legs, with the stated reason "required for correct flash attention varlen
+/// operation (avoiding soundness issues with padding)". Traced end to end, that
+/// reason holds on exactly one of the four cases:
+///
+/// | leg | what runs | ragged-safe? |
+/// |---|---|---|
+/// | decode, non-MLA | `paged_attention()` — `pagedattention.cuh` | ✅ per-seq `context_lens[seq_idx]` (`:138`), per-seq block count (`:144`), per-seq key mask (`:288`) |
+/// | decode, MLA | `mla_decode_forward` — flashinfer | ✅ per-seq `paged_kv_indptr`/`last_page_len`; `get_length(i)` (`flashinfer/page.cuh:478`) |
+/// | prefill, no prefix hit | flash varlen over the **padded** chunk | ✅ `cu_seqlens_q/k` are built from the same padded widths (`inputs_processor.rs:270`), so the layout is self-consistent; end-padding is unreachable under causal masking and `reshape_and_cache` skips `slot < 0` (`reshape_and_cache_kernel.cu:45`) |
+/// | prefill, prefix hit | flash varlen, Q **padded** vs K **packed** | ❌ `PagedAttention::forward` swaps in `cu_seqlens_kv` (real gathered lengths) while keeping `cumulative_seqlens_q` (padded widths). The per-row causal offset `seqlen_k - seqlen_q` is then wrong by that row's pad width |
+///
+/// **No flash-varlen call happens on either decode path at all** — a decode
+/// step is `tgt_len == 1`, `CausalMasker::make_causal_mask_matrix` returns
+/// `None` there, and `PagedAttention::forward` therefore skips `Sdpa` entirely
+/// and goes straight to the paged kernel. Bucketing decode by length bought
+/// nothing and cost the batch: with `B` sequences at `D` distinct lengths the
+/// running set collapses to `B / D`, which is the measured `1 running, 7
+/// waiting` at `B=8` on spread traffic.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LengthRule {
+    /// Lengths must match exactly. Only the prefix-hit prefill needs this.
+    MustMatch,
+    /// Lengths are free to differ; the kernels below take per-sequence lengths.
+    Free,
+}
 
 /// Allow sequences to wait for 64 scheduling passes before warning of deprivation.
 const WAITING_TIMEOUT: usize = 64;
@@ -108,17 +140,20 @@ impl PagedAttentionScheduler {
         }
     }
 
-    /// Bucket sequences by (length, has_images && is_prompt, token_offset).
-    /// Returns the bucket with the shortest sequence length; sequences from other buckets
-    /// are preempted (blocks freed, state set to Waiting, added to waiting queue).
+    /// Partition sequences on what they must agree on to share one forward
+    /// pass, run the bucket with the shortest sequences, and preempt the rest
+    /// (blocks freed, state set to Waiting, pushed back onto the waiting queue).
     ///
-    /// This ensures all sequences in a batch have the same length, which is required for
-    /// correct flash attention varlen operation (avoiding soundness issues with padding).
+    /// `rule` decides whether length is part of that agreement — see
+    /// [`LengthRule`] for the per-leg derivation. Under [`LengthRule::Free`]
+    /// the length component is pinned to `0`, so a batch that differs *only* in
+    /// length forms a single bucket and nothing is preempted.
     ///
-    /// Also removes preempted sequences from self.running.
+    /// Also removes preempted sequences from `self.running`.
     fn bucket_and_preempt_sequences(
         &mut self,
         sequences: VecDeque<Arc<Mutex<Sequence>>>,
+        rule: LengthRule,
     ) -> VecDeque<Arc<Mutex<Sequence>>> {
         if sequences.len() <= 1 {
             return sequences;
@@ -131,10 +166,12 @@ impl PagedAttentionScheduler {
             // Use effective length for prompts so sequences with different
             // prefix cache hits land in separate buckets. The causal offset
             // (seqlen_k - seqlen_q) is only correct when all Qs are the same.
-            let effective_len = if seq_guard.is_prompt() {
-                seq_guard.len().saturating_sub(seq_guard.prefix_cache_len())
-            } else {
-                seq_guard.len()
+            let effective_len = match rule {
+                LengthRule::Free => 0,
+                LengthRule::MustMatch if seq_guard.is_prompt() => {
+                    seq_guard.len().saturating_sub(seq_guard.prefix_cache_len())
+                }
+                LengthRule::MustMatch => seq_guard.len(),
             };
             let key: BucketKey = (
                 effective_len,
@@ -307,9 +344,25 @@ impl PagedAttentionScheduler {
         self.waiting.extend(for_waiting_again);
 
         if !scheduled.is_empty() {
-            // Bucket scheduled prompts by sequence length to ensure all sequences in a batch
-            // have the same length (required for correct flash attention varlen operation).
-            let scheduled = self.bucket_and_preempt_sequences(scheduled);
+            // A prefill batch is right-padded to its max length
+            // (`inputs_processor.rs::make_prompt_chunk`), and `cu_seqlens_q/k`
+            // are built from those SAME padded widths — so with no prefix hit
+            // the flash-varlen call is self-consistent and ragged prompts are
+            // fine. What is not fine is the prefix-hit path: there
+            // `PagedAttention::forward` swaps `cumulative_seqlens_k` for the
+            // packed `cu_seqlens_kv` (real gathered lengths) while leaving
+            // `cumulative_seqlens_q` padded, so each row's causal offset
+            // `seqlen_k - seqlen_q` is short by that row's pad width. Until Q
+            // is packed to match, those batches still need equal query lengths.
+            let any_prefix_hit = scheduled
+                .iter()
+                .any(|seq| get_mut_arcmutex!(seq).prefix_cache_len() > 0);
+            let rule = if any_prefix_hit {
+                LengthRule::MustMatch
+            } else {
+                LengthRule::Free
+            };
+            let scheduled = self.bucket_and_preempt_sequences(scheduled, rule);
 
             // Rebuild num_cached_tokens from the bucketed sequences.
             // prefix_cache_len was set per-sequence above, so this stays aligned
@@ -373,9 +426,18 @@ impl PagedAttentionScheduler {
         }
         self.running = running;
 
-        // Bucket running completions by sequence length
+        // Decode does NOT bucket by length. Every sequence contributes exactly
+        // one query token, so the batch is unpadded by construction, the mask
+        // is `None` (`CausalMasker::make_causal_mask_matrix` returns `None` at
+        // `tgt_len == 1`), and `PagedAttention::forward` therefore never calls
+        // `Sdpa` / flash-varlen at all — it goes straight to the paged kernel,
+        // whose whole contract is per-sequence `context_lens` + block tables
+        // (`pagedattention.cuh:138,144,288`; MLA: `flashinfer/page.cuh:478`).
+        // RoPE takes the per-sequence branch when the offsets differ
+        // (`layers.rs:1624`). Keeping length in the key here collapsed the
+        // running set to `B / distinct lengths` for no correctness gain.
         let running_for_bucket = std::mem::take(&mut self.running);
-        let bucketed = self.bucket_and_preempt_sequences(running_for_bucket);
+        let bucketed = self.bucket_and_preempt_sequences(running_for_bucket, LengthRule::Free);
         self.running = bucketed;
 
         self.running
@@ -534,5 +596,226 @@ impl Scheduler for PagedAttentionScheduler {
     }
     fn set_prefix_caching_enabled(&mut self, enabled: bool) {
         self.set_prefix_caching_enabled_sync(enabled);
+    }
+}
+
+#[cfg(test)]
+mod bucketing_tests {
+    use super::*;
+    use crate::paged_attention::{cache_engine::PagedCacheType, CacheConfig};
+    use crate::sampler::{Logprobs, Sampler};
+    use crate::sequence::{SeqStepType, SequenceGroup, SequenceRecognizer};
+    use std::time::Duration;
+
+    const BLOCK_SIZE: usize = 16;
+
+    /// Minimal sequence of exactly `n_toks` tokens, waiting to be admitted.
+    /// Mirrors `scheduler::default_scheduler::tests::seq_of_len`: no model, no
+    /// engine — the paged scheduler only reads `id()`, `len()`, `get_toks()`,
+    /// `is_prompt()`, `images()`, `token_offset()` and `prefix_cache_len()`.
+    fn seq_of_len(id: usize, n_toks: usize) -> Sequence {
+        let (dummy_sender, _rx) = tokio::sync::mpsc::channel(1);
+        let dummy_sampler = Sampler::new(
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            -1,
+            0.0,
+            0.0,
+            None,
+            vec![],
+        )
+        .unwrap();
+        let group = Arc::new(tokio::sync::Mutex::new(SequenceGroup::new(
+            1, false, false, None,
+        )));
+        // Distinct token content per sequence: identical prompts would share
+        // block hashes and hand every sequence a prefix-cache hit, which is a
+        // different treatment from the one under test.
+        let toks: Vec<u32> = (0..n_toks).map(|i| (id * 4096 + i + 1) as u32).collect();
+        Sequence::new_waiting(
+            toks,
+            String::new(),
+            id,
+            0,
+            1,
+            dummy_sender,
+            dummy_sampler,
+            vec![],
+            vec![],
+            None,
+            false,
+            false,
+            group,
+            0,
+            0,
+            SequenceRecognizer::None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            SeqStepType::PromptAndDecode,
+            None,
+            None,
+            None,
+            false,
+            vec![],
+        )
+    }
+
+    fn decode_one(seq: &mut Sequence) {
+        seq.add_token(
+            Logprobs {
+                token: 7,
+                logprob: 0.0,
+                bytes: Some("a".to_string()),
+                top_logprobs: None,
+            },
+            b"a".to_vec(),
+            &None,
+        );
+    }
+
+    fn scheduler(max_num_seqs: usize, num_gpu_blocks: usize) -> PagedAttentionScheduler {
+        let mut s = PagedAttentionScheduler::new(
+            PagedAttentionSchedulerConfig { max_num_seqs },
+            CacheConfig {
+                block_size: BLOCK_SIZE,
+                num_gpu_blocks,
+                cache_type: PagedCacheType::Auto,
+            },
+        );
+        // Prefix caching off: this test is about length bucketing, and a hit
+        // would move sequences onto the `MustMatch` leg that is deliberately
+        // retained.
+        s.set_prefix_caching_enabled_sync(false);
+        s
+    }
+
+    /// 🔑 THE REGRESSION. Eight sequences at eight DIFFERENT lengths must all
+    /// decode in the same step.
+    ///
+    /// Before the `LengthRule` split this asserts FALSE by construction: the
+    /// decode leg put `seq.len()` in the bucket key and ran exactly one bucket,
+    /// so the running set was `B / distinct lengths` = `8 / 8` = **1** — the
+    /// measured `1 running, 7 waiting` on an H200 at B=8 with spread prompts.
+    ///
+    /// Three states, not two: the guards below separate *cannot-answer*
+    /// (nothing admitted, or the batch never reached the decode leg — an
+    /// environment failure) from *fail* (a decode step ran short) from *pass*.
+    #[test]
+    fn decode_runs_every_admitted_sequence_at_mixed_lengths() {
+        const N: usize = 8;
+        // Spread 50..500 — the exact ladder the H200 A/B used.
+        const LENS: [usize; N] = [50, 114, 179, 243, 307, 371, 436, 500];
+
+        // Ample budget: sum(LENS) = 2200 tokens => ~138 blocks at block_size 16.
+        let mut sched = scheduler(N, 512);
+        for (i, len) in LENS.iter().enumerate() {
+            sched.add_seq(seq_of_len(i, *len));
+        }
+
+        let logger = IntervalLogger::new(Duration::from_secs(3600), None);
+
+        // Drive until decode. Prompts are returned first; a sequence decodes
+        // only once every admitted prompt has run.
+        let mut decode_widths: Vec<usize> = Vec::new();
+        let mut prompt_steps = 0usize;
+        for _ in 0..64 {
+            let out = PagedAttentionScheduler::schedule(&mut sched, &logger);
+            if out.scheduled.is_empty() {
+                continue;
+            }
+            let is_prompt = get_mut_arcmutex!(out.scheduled[0]).is_prompt();
+            if is_prompt {
+                prompt_steps += 1;
+            } else {
+                decode_widths.push(out.scheduled.len());
+            }
+            for seq in out.scheduled.iter() {
+                let mut guard = get_mut_arcmutex!(seq);
+                decode_one(&mut guard);
+            }
+            if decode_widths.len() >= 3 {
+                break;
+            }
+        }
+
+        // CANNOT-ANSWER guards. Green without these could mean "no decode step
+        // ever ran", which is not "every decode step was full".
+        assert!(
+            prompt_steps > 0,
+            "ENVFAIL: no prompt step ever ran — the sequences were never admitted, \
+             so this test measured nothing"
+        );
+        assert!(
+            decode_widths.len() >= 3,
+            "ENVFAIL: only {} decode step(s) in 64 scheduler passes; the batch never \
+             reached steady-state decode, so the widths are not a result",
+            decode_widths.len()
+        );
+
+        assert!(
+            decode_widths.iter().all(|w| *w == N),
+            "decode ran at widths {decode_widths:?}, expected every step to carry all {N} \
+             sequences. `running bucket = B / distinct lengths` is back."
+        );
+        assert_eq!(
+            sched.waiting_len(),
+            0,
+            "no sequence may be parked on the waiting queue purely for having a \
+             different length"
+        );
+    }
+
+    /// The retained rule still bites. `LengthRule::MustMatch` must partition a
+    /// mixed-length batch and preempt everything outside the shortest bucket —
+    /// otherwise the prefix-hit prefill (padded Q vs packed K) would be served
+    /// with a wrong per-row causal offset.
+    ///
+    /// This is the mutation guard for the test above: if
+    /// `bucket_and_preempt_sequences` stopped bucketing altogether, this fails.
+    #[test]
+    fn must_match_still_partitions_and_preempts() {
+        let mut sched = scheduler(4, 512);
+        let seqs: VecDeque<Arc<Mutex<Sequence>>> = [10usize, 10, 33, 77]
+            .iter()
+            .enumerate()
+            .map(|(i, len)| {
+                let s = seq_of_len(i, *len);
+                s.set_state(SequenceState::RunningCompletion);
+                Arc::new(Mutex::new(s))
+            })
+            .collect();
+        for s in &seqs {
+            sched.running.push_back(s.clone());
+        }
+
+        let free = sched.bucket_and_preempt_sequences(seqs.clone(), LengthRule::Free);
+        assert_eq!(
+            free.len(),
+            4,
+            "LengthRule::Free must keep a mixed-length batch whole"
+        );
+
+        let matched = sched.bucket_and_preempt_sequences(seqs, LengthRule::MustMatch);
+        assert_eq!(
+            matched.len(),
+            2,
+            "LengthRule::MustMatch must select only the shortest-length bucket \
+             (the two sequences of length 10)"
+        );
+        assert_eq!(
+            sched.waiting_len(),
+            2,
+            "the two off-bucket sequences must be preempted onto the waiting queue"
+        );
     }
 }

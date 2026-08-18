@@ -8,14 +8,20 @@
 //! This is the `arc` binary — a wrapper around the mistral.rs CLI that adds Arc
 //! branding, the `validate` pre-flight command, and the AgentPerf bench suite.
 //!
-//! ⚠️ **TurboQuant is the *nominal* PagedAttention default only.**
+//! ⚠️ **TurboQuant is the real PagedAttention default, within a narrow
+//! envelope.** A standard-layout model with head_dim 128 gets TurboQuant KV
+//! with no flag set, and silently loses prefix caching with it.
 //! `PagedCacheType::resolve_for_model` falls back to the unquantized `auto`
-//! cache — with a warning — for any model TurboQuant cannot support, which
-//! means every MLA model and every head_dim other than 128. Requesting it
+//! cache — with a warning — for everything else, which means every MLA model
+//! and every other head_dim, so in practice few models take it. Requesting it
 //! explicitly turns that fallback into a hard error instead. The eager
 //! (non-paged) KV path is separately opt-in via `ARC_TURBOQUANT_KV=1`.
-//! In practice almost no model runs TurboQuant today, and none has been
-//! measured with it.
+//!
+//! ⚠️ **It has been measured, once, narrowly.** Qwen3-32B served end-to-end on
+//! a B200 at 55 tok/s with correct output (2026-04-06, `4eba13905`). That is
+//! b=1, one card, one model, head_dim 128, and it did not isolate TurboQuant
+//! from the rest of the decode path. **No quality evaluation exists** at any
+//! preset, and compression ratios quoted for it are format arithmetic.
 //!
 //! Usage:
 //!   arc serve -m <model_id>                          # Start serving
@@ -36,11 +42,16 @@ use std::time::Duration;
 /// Arc — A high-performance LLM inference engine with TurboQuant compression.
 ///
 /// Built on mistral.rs. Arc picks the KV cache format, device map and
-/// quantisation for the model you load and logs what it resolved on startup.
+/// quantisation for the model you load, and logs what it actually resolved on
+/// startup via the `ArcServe:` line. Quality under TurboQuant has never been
+/// evaluated — it is not "lossless".
 //
 // The second line used to read "Defaults to TurboQuant 3.5-bit KV cache
 // (lossless)" — the same unconditional claim removed from the runtime banner.
-// It is decided per model at load time, so `--help` cannot state it.
+// It is decided per model at load time, so `--help` cannot state it. The
+// not-lossless correction is #111's and is kept; the *default* is stated on
+// `--pa-cache-type` itself (see `mistralrs-cli/src/args/paged_attn.rs`), which
+// is where it can be said accurately.
 #[derive(Parser)]
 #[command(name = "arc", version, about, long_about = None)]
 #[command(

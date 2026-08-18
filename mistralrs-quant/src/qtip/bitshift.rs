@@ -1704,6 +1704,48 @@ impl Qtip2bLayer {
     pub fn expert_bpw(&self) -> Option<&ExpertBpwTable> {
         self.expert_bpw.as_ref()
     }
+
+    /// The expert-parallel slice: keep only `ids` out of this stack.
+    ///
+    /// `rotation_signs` is **shared** across the stack (the rotation is a
+    /// function of `K_in`, identical for every expert) and `mcg_mult` defines
+    /// the computed codebook, so both are replicated rather than sliced —
+    /// wave44-BV §4.1. Only `blocks`, `row_scales` and the per-expert
+    /// bit-width table carry an expert axis.
+    ///
+    /// This is the rung V4 is served on, so this is the slice that makes
+    /// expert parallelism reach the published `qtip2b` artifact.
+    pub fn select_experts_concrete(&self, ids: &[usize]) -> candle_core::Result<Self> {
+        let Some(num_experts) = self.num_experts else {
+            candle_core::bail!(
+                "Qtip2bLayer::select_experts: this layer is a plain 2-D linear, not an expert stack"
+            );
+        };
+        if ids.len() > num_experts {
+            candle_core::bail!(
+                "Qtip2bLayer::select_experts: asked for {} experts out of {num_experts}",
+                ids.len()
+            );
+        }
+        let expert_bpw = self
+            .expert_bpw
+            .as_ref()
+            .map(|t| t.select(ids))
+            .transpose()?;
+        Ok(Self {
+            blocks: super::select_experts_dim0(&self.blocks, ids)?,
+            row_scales: super::select_experts_dim0(&self.row_scales, ids)?,
+            bias: self.bias.clone(),
+            in_features: self.in_features,
+            num_experts: Some(ids.len()),
+            rotation_signs: self.rotation_signs.clone(),
+            rotation_block: self.rotation_block,
+            mcg_mult: self.mcg_mult,
+            expert_bpw,
+            search: self.search,
+            search_detail: self.search_detail,
+        })
+    }
 }
 
 impl QuantMethod for Qtip2bLayer {
@@ -1841,6 +1883,10 @@ impl QuantMethod for Qtip2bLayer {
 
     fn quantized_act_type(&self) -> Option<DType> {
         None
+    }
+
+    fn select_experts(&self, ids: &[usize]) -> Result<Arc<dyn QuantMethod>> {
+        Ok(Arc::new(self.select_experts_concrete(ids)?))
     }
 
     fn add_delta_w(&self, _delta: &Tensor) -> Result<Arc<dyn QuantMethod>> {

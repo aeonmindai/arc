@@ -1128,6 +1128,15 @@ impl Loader for NormalLoader {
             )?;
         }
 
+        // Expert parallelism: a UQFF artifact holds every expert, so the shard
+        // could not be applied at construction. Narrow the deserialized expert
+        // stacks now, before anything can run a forward. A no-op when EP is
+        // off or the experts were already sliced at load.
+        let narrowed = model.apply_pending_expert_parallel_slice()?;
+        if narrowed > 0 {
+            info!("Expert parallelism: narrowed {narrowed} expert-stacked layers to this rank's shard.");
+        }
+
         // Run any registered post-load hooks (e.g. Arc's TD-MoE compressor).
         // Hooks are no-ops when nothing has been registered.
         crate::pipeline::post_load_hooks::run_post_load_hooks(&mut *model)
@@ -1264,6 +1273,40 @@ impl Loader for NormalLoader {
         #[cfg(feature = "cuda")]
         let _decode_weights = if std::env::var_os("ARC_NO_DEDICATED_DECODE").is_some() {
             tracing::info!("Dedicated decode path extraction skipped (ARC_NO_DEDICATED_DECODE set).");
+            None
+        } else if {
+            // ARCHITECTURE GUARD, deliberately evaluated BEFORE the block below.
+            //
+            // `extract_model_weights` re-checks this — that is the real contract
+            // and must hold for every caller — but checking it only there would
+            // mean a model we are about to refuse has already paid for two full
+            // BF16 `dequantize_w()` calls (lm_head, and whatever sits at index
+            // 5). On a model that barely fits VRAM those are exactly the
+            // allocations whose failures the CUDA allocator caches and
+            // fragments the pool with — the reason ARC_NO_DEDICATED_DECODE
+            // exists at all. A refusal that lands after the damage is not a
+            // refusal. `get_layers()` here is cheap: it collects references and
+            // dequantizes nothing.
+            let num_layers = model.config().num_layers;
+            let (layers_mut, _) = model.get_layers();
+            let tags: Vec<Option<usize>> = layers_mut.iter().map(|(_, idx)| *idx).collect();
+            match arc_cuda_graph::check_dense_layer_inventory(&tags, num_layers) {
+                Ok(()) => false,
+                Err(e) => {
+                    tracing::warn!(
+                        "Dedicated decode path declined (by design), before any weight was \
+                         dequantized: {e}"
+                    );
+                    arc_profiler::mark_unreachable(
+                        "decode.dedicated",
+                        "the dense decode path refused this architecture; decode runs on the \
+                         standard Candle path",
+                        "normal.rs:1268",
+                    );
+                    true
+                }
+            }
+        } {
             None
         } else {
             let cfg = model.config().clone();

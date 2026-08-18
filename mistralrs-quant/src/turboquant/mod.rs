@@ -40,13 +40,21 @@ use serde::{Deserialize, Serialize};
 /// weights so errors cancel out.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TurboQuantPreset {
-    /// Default: 4-bit keys, 3-bit values (3.5 bits avg). Lossless quality.
-    /// LongBench 50.06 = identical to FP16 50.06 on Llama-3.1-8B.
+    /// Default: 4-bit keys, 3-bit values (3.5 bits avg).
+    ///
+    /// Quality: the paper reports LongBench 50.06, identical to FP16's 50.06,
+    /// on Llama-3.1-8B — **that is Zandieh et al.'s number on their model, not
+    /// ours**. Arc has run no quality evaluation under any preset, so "lossless"
+    /// is a published claim we have not reproduced and must not restate as our
+    /// own. This preset is the one that has served on hardware (Qwen3-32B,
+    /// B200, 55 tok/s, correct output, `4eba13905`); the other two never have.
     #[default]
     Default,
-    /// Balanced: 3-bit keys, 3-bit values (3.0 bits avg). ~0.1% quality loss.
+    /// Balanced: 3-bit keys, 3-bit values (3.0 bits avg). ~0.1% quality loss
+    /// \[paper's figure, not reproduced by Arc]. Never executed on hardware.
     Balanced,
-    /// Aggressive: 3-bit keys, 2-bit values (2.5 bits avg). ~1.2% quality loss.
+    /// Aggressive: 3-bit keys, 2-bit values (2.5 bits avg). ~1.2% quality loss
+    /// \[paper's figure, not reproduced by Arc]. Never executed on hardware.
     /// Opt-in only for cost-sensitive deployments.
     Aggressive,
 }
@@ -100,7 +108,8 @@ impl TurboQuantPreset {
 impl std::fmt::Display for TurboQuantPreset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Default => write!(f, "turboquant (K4/V3, 3.5-bit, lossless)"),
+            // No "lossless": Arc has never evaluated quality under this preset.
+            Self::Default => write!(f, "turboquant (K4/V3, 3.5-bit)"),
             Self::Balanced => write!(f, "turboquant-3 (K3/V3, 3.0-bit)"),
             Self::Aggressive => write!(f, "turboquant-aggressive (K3/V2, 2.5-bit)"),
         }

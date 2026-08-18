@@ -117,7 +117,7 @@ Each technique is filed under one or more domains. Domains and their headline nu
 
 ### 4. TurboQuant K4/V3 KV cache (Domain 2)
 
-**What it does:** Walsh-Hadamard rotation + Lloyd-Max codebook quantization on K (4-bit) and V (3-bit), with FP16 recent window. Lossless on LongBench.
+**What it does:** Walsh-Hadamard rotation + Lloyd-Max codebook quantization on K (4-bit) and V (3-bit), with FP16 recent window. Lossless on LongBench *per the paper, on the paper's model* — Arc has not reproduced that.
 
 **Why:** This is your own shipped work. Don't break it. Stack other techniques on top.
 
@@ -125,15 +125,37 @@ Each technique is filed under one or more domains. Domains and their headline nu
 
 **Code reference:** Arc's own `mistralrs-quant/src/turboquant/` + `arc-turbo/`.
 
-**Implementation status: NOT shipped — experimental and off by default.** The
-algorithm, codebooks and WHT are implemented and unit-tested, but: the eager KV
-path is opt-in via `ARC_TURBOQUANT_KV=1`; the paged kernel exists at **head_dim
-128 only** and auto-falls back to the unquantized cache for everything else
-(including every MLA model); there is **no kernel at head_dim 512**, so
-DeepSeek V4 cannot use it at all; and the prefix cache auto-disables under it.
-**No TurboQuant serving run has ever been measured.** The "4.27×" figure that
-circulated in this repo was format arithmetic — bytes per token at 3.5 bits
-versus BF16 — never a forward pass. Retracted 2026-08-17.
+**Implementation status: shipped as the paged default, inside a narrow
+envelope.** An earlier revision of this section read *"NOT shipped —
+experimental and off by default"* and *"No TurboQuant serving run has ever been
+measured."* **Both halves were false**, and are corrected here.
+
+*Shipped, not opt-in:* `defaults::PAGED_CACHE_TYPE` is
+`PagedCacheType::TurboQuant` and `--pa-cache-type` has no clap default, so a
+standard-layout **head_dim-128** model on CUDA takes TurboQuant K4/V3 with no
+flag — and loses prefix caching, which no preset supports. Everything else
+auto-falls back to the unquantized cache with a warning (every MLA model
+included), and there is **no kernel at head_dim 512**, so DeepSeek V4 does not
+take it. The *eager* KV path is a different path and is genuinely opt-in via
+`ARC_TURBOQUANT_KV=1`.
+
+*Measured:* the paged K4/V3 path served **Qwen3-32B on a B200 at 55 tok/s with
+correct output** on 2026-04-06 (commit `4eba13905`; harness
+`deploy/modal_b200.py`, `gpu="B200"`, `--pa-cache-type turboquant`). Eight CUDA
+correctness defects were found and fixed against that hardware on 2026-04-02 —
+a V-cache stride mismatch (`143b5ab20`) and a Q·K warp-reduction deadlock
+(`fd0074792`) among them. Those are hardware findings; they are not obtainable
+without running.
+
+*Not measured, and not to be dressed up:* that run was **b=1, one card, one
+model, head_dim 128, `Default` preset**, and the "46% over Candle baseline"
+recorded alongside it compares Arc's whole dedicated decode path with Candle's
+— **it isolates nothing about TurboQuant**. There is no A/B against an
+unquantized cache, and **no quality evaluation at any preset**. The "4.27×"
+figure that circulated in this repo remains format arithmetic — bytes per token
+at 3.5 bits versus BF16, never a forward pass. Retracted 2026-08-17, and it
+stays retracted. The same applies to the **1,026 → 260 B/token** figure quoted
+for the V4 path: design arithmetic over code that has never run.
 
 ### 5. YOCO (You Only Cache Once) (Domain 2)
 
@@ -347,9 +369,9 @@ Phase 1 — Validate the foundation (months 1–2):
 1. NVFP4 hardware path verified on B200
 2. QTIP integrated, perplexity matches paper on Llama-3
 3. TD-MoE implemented at model load, perplexity matches paper on Mixtral
-4. TurboQuant reaches a real serving path: a kernel beyond head_dim 128, then
-   the first measured A/B (quality + throughput) — today it is off by default
-   and unmeasured
+4. TurboQuant widens beyond head_dim 128, and gets its first **A/B** (quality +
+   throughput against an unquantized cache) — today it is the paged default at
+   128 and has served on a B200, but nothing isolates it and nothing scores it
 
 Phase 2 — Per-token speed (months 2–4):
 5. Turbo Sparse fine-tune pipeline running; first MoE model converted

@@ -125,3 +125,57 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod client_liveness_tests {
+    use super::create_response_channel;
+
+    /// The one link in the phantom-sequence fix that no scheduler unit test can
+    /// reach: does the engine-side `Sender` actually observe a departed client?
+    ///
+    /// `Sequence::client_is_gone` is `responder.is_closed()`, and the whole
+    /// reap in `DefaultScheduler::schedule` rests on that being `true` once the
+    /// HTTP handler is gone. A handler's future is aborted on client disconnect,
+    /// which drops every local it owns — including the `Receiver` this creates.
+    /// This pins that channel's semantics rather than assuming them.
+    ///
+    /// Mutation check (run 2026-08-18): replace the `drop(rx)` with
+    /// `std::mem::forget(rx)` and the second assertion fails — which is exactly
+    /// the shape of the bug, a client that is gone but whose channel still looks
+    /// open.
+    #[test]
+    fn dropping_the_handlers_receiver_closes_the_engines_sender() {
+        let (tx, rx) = create_response_channel(None);
+        assert!(
+            !tx.is_closed(),
+            "while the handler holds its Receiver the client is present"
+        );
+
+        // What axum does to a handler future when the client goes away.
+        drop(rx);
+
+        assert!(
+            tx.is_closed(),
+            "once the handler's Receiver is dropped the engine MUST be able to \
+             see it — otherwise the scheduler's reap can never fire and \
+             abandoned sequences run to max_tokens"
+        );
+    }
+
+    /// A buffered-but-unread channel is NOT a departed client. The engine must
+    /// not reap a slow reader — backpressure is not abandonment.
+    #[tokio::test]
+    async fn a_slow_client_that_is_not_reading_is_not_treated_as_gone() {
+        let (tx, _rx) = create_response_channel(Some(1));
+        assert!(!tx.is_closed());
+        // Fill the single buffer slot; nobody is calling recv().
+        tx.try_send(mistralrs_core::Response::InternalError(Box::new(
+            std::io::Error::other("filler"),
+        )))
+        .expect("first send fits in the buffer");
+        assert!(
+            !tx.is_closed(),
+            "a full buffer means a slow reader, not a departed one"
+        );
+    }
+}

@@ -298,12 +298,15 @@ pub mod text_models_inputs_processor {
 
                 context_lens.push((0, padded.len()));
             } else {
-                context_lens.push((
-                    padded
-                        .len()
-                        .saturating_sub(last_n_context_len.map(|(a, _)| a).unwrap_or(1)),
-                    last_n_context_len.map(|(a, _)| a).unwrap_or(1),
-                ));
+                // 🔑 `new_len`, NOT `padded.len()`. `padded.len()` is the batch
+                // max, so on a ragged batch every short row would read its
+                // logits out of the right-hand PADDING — same wrong row for
+                // every sequence. `extract_logits` (`pipeline/mod.rs`) already
+                // narrows per row, so the per-row start is honoured.
+                // Uniform batches are unaffected: there `new_len ==
+                // padded.len()` for every row, so this is the identity.
+                let n = last_n_context_len.map(|(a, _)| a).unwrap_or(1);
+                context_lens.push((new_len.saturating_sub(n), n));
             }
 
             if flash_attn {
@@ -1195,6 +1198,91 @@ pub mod text_models_inputs_processor {
 
         fn get_type(&self) -> InputsProcessorType {
             InputsProcessorType::Text
+        }
+    }
+
+    #[cfg(test)]
+    mod ragged_prefill_tests {
+        use super::*;
+
+        /// 🔑 A right-padded ragged prefill must read each row's logits from
+        /// that row's own LAST REAL TOKEN.
+        ///
+        /// `make_prompt_chunk` pads every row to the batch max, so a shared
+        /// logit index is the PADDING for every row but the longest. Pre-fix
+        /// this returns `(max_len - 1, 1)` for all three rows — the same wrong
+        /// column three times. `extract_logits` (`pipeline/mod.rs`) narrows per
+        /// row, so honouring the per-row start needs nothing else.
+        ///
+        /// Reachable in production the moment a prefill batch is ragged. The
+        /// schedulers' exact-cache-length bucketing normally makes
+        /// `max_len == this row's len`, but a prefix-cache hit defeats that:
+        /// the hit moves the bucket key onto the matched length, so two
+        /// requests behind the same system prelude with different user-message
+        /// lengths share one ragged prefill — and every row but the longest
+        /// then samples its first token from a pad column.
+        #[test]
+        fn ragged_prefill_reads_each_row_at_its_own_last_real_token() {
+            let a: Vec<u32> = vec![1; 5];
+            let b: Vec<u32> = vec![2; 3];
+            let c: Vec<u32> = vec![3; 8];
+            let toks: Vec<&[u32]> = vec![&a, &b, &c];
+
+            let out = make_prompt_chunk::<u32>(
+                0,
+                toks,
+                &[0, 1, 2],
+                &Device::Cpu,
+                None,
+                false,
+                None,
+                None,
+                None,
+                // `row_offsets` — master gained this parameter after this test
+                // was written. `None` is what this test means: it exercises the
+                // per-row `context_lens` narrowing, not per-row RoPE placement.
+                None,
+            )
+            .expect("CPU prompt chunk must build");
+
+            // Teeth: the fixture must actually be ragged, or this asserts
+            // nothing. A batch of equal lengths passes either way.
+            assert_eq!(
+                out.input.dims(),
+                &[3, 8],
+                "fixture must right-pad to the batch max (8), else the test is vacuous"
+            );
+
+            assert_eq!(
+                out.context_lens,
+                vec![(4, 1), (2, 1), (7, 1)],
+                "each row must be narrowed at its own last real token \
+                 (5-1, 3-1, 8-1), not at the shared padded width"
+            );
+        }
+
+        /// The uniform case is the identity — the fix cannot move a batch that
+        /// the old bucketing would have produced.
+        #[test]
+        fn uniform_prefill_is_unchanged() {
+            let a: Vec<u32> = vec![1; 6];
+            let b: Vec<u32> = vec![2; 6];
+            let toks: Vec<&[u32]> = vec![&a, &b];
+            let out = make_prompt_chunk::<u32>(
+                0,
+                toks,
+                &[0, 1],
+                &Device::Cpu,
+                None,
+                false,
+                None,
+                None,
+                None,
+                // `row_offsets` — see the sibling test above.
+                None,
+            )
+            .expect("CPU prompt chunk must build");
+            assert_eq!(out.context_lens, vec![(5, 1), (5, 1)]);
         }
     }
 
