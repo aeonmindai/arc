@@ -582,4 +582,56 @@ extern "C" {
         mult: u32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
+
+    // ----- LUT-rung grouped GEMM (kernels/qtip/qtip_grouped_gemm_lut.cu) -----
+    //
+    // The K=4/V=2 twin of the two launchers above, for the rung `QtipLayer`
+    // (and therefore `qtip2-*.uqff`) actually ships. Identical tile geometry,
+    // pipeline and output contract; the B-fragment decode reconstructs the
+    // trellis state from a 16-bit NIBBLE window instead of a 2-bit-pair one.
+    //
+    // Routing is shared: call `launch_qtip2b_moe_route` first, exactly as the
+    // qtip2b path does — it depends only on the routing indices.
+    //
+    // `d_lut` is the `[2^16 * 2]` f32 reproduction table. `cb_mult == 0`
+    // (`CB_MULT_GAUSSIAN_LUT`) selects the stored-table gather; nonzero
+    // selects the computed MCG codebook decoded in registers. `d_y`
+    // ([n_pairs, n_rows]) must be zero-initialized.
+    pub(crate) fn launch_qtip_lut_grouped_gemm_bf16(
+        d_packed: *const u8,
+        d_row_scales: *const f32,
+        d_lut: *const f32,
+        d_x_rotated: *const bf16,
+        d_sorted_pairs: *const u32,
+        d_tile_expert: *const u32,
+        d_tile_row_start: *const u32,
+        d_offsets: *const u32,
+        d_num_tiles: *const u32,
+        d_y: *mut bf16,
+        n_rows: i32,
+        packed_per_row: i32,
+        in_features: i32,
+        max_m_tiles: i32,
+        cb_mult: u32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
+    pub(crate) fn launch_qtip_lut_grouped_gemm_f16(
+        d_packed: *const u8,
+        d_row_scales: *const f32,
+        d_lut: *const f32,
+        d_x_rotated: *const f16,
+        d_sorted_pairs: *const u32,
+        d_tile_expert: *const u32,
+        d_tile_row_start: *const u32,
+        d_offsets: *const u32,
+        d_num_tiles: *const u32,
+        d_y: *mut f16,
+        n_rows: i32,
+        packed_per_row: i32,
+        in_features: i32,
+        max_m_tiles: i32,
+        cb_mult: u32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
 }

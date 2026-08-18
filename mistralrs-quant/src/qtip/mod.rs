@@ -3563,6 +3563,70 @@ impl QuantMethod for QtipLayer {
                     // (RUN-161)
                     return self.gather_forward_cuda_ondevice(a, indices);
                 }
+                // Prefill regime: the LUT-rung trellis grouped GEMM. Tokens
+                // sorted by expert on-device, then a persistent tensor-core
+                // tile loop over the ragged groups, so each woken expert's
+                // packed bytes are staged once per m-tile instead of once per
+                // (token, slot) pair.
+                //
+                // This rung shipped without it for one wrong reason: its state
+                // update `state = ((state << 4) | sym) & 0xFFFF` LOOKS
+                // sequential. It is not — the state at symbol `t` is just the
+                // last four nibbles, i.e. a 16-bit window over the packed
+                // stream, exactly as the qtip2b rung's state is a window over
+                // its 2-bit stream. Random-access decode is what makes a
+                // grouped GEMM reachable, and it was always available here.
+                //
+                // Below this, `gather_forward_cuda` stays as the fallback: it
+                // is the only path that handles F32 activations and shapes
+                // whose `in_features` is not a multiple of the k-chunk.
+                let grouped_disabled = std::env::var("ARC_NO_QTIP_GROUPED_MOE").is_ok();
+                if !grouped_disabled
+                    && matches!(a.dtype(), DType::BF16 | DType::F16)
+                    && self.in_features.is_multiple_of(grouped::GROUPED_TILE_K)
+                {
+                    let total_pairs = n_tokens * n_experts_per_tok;
+                    let a_flat = a.reshape((total_pairs, cols))?.contiguous()?;
+                    let a_rotated = if self.rotation_block >= 2 {
+                        match &self.rotation_signs {
+                            Some(signs) => {
+                                cuda_ops::rotate_x_cuda(&a_flat, signs, self.rotation_block)?
+                            }
+                            None => candle_core::bail!(
+                                "QtipLayer::gather_forward: rotation_block={} but rotation_signs is None",
+                                self.rotation_block
+                            ),
+                        }
+                    } else {
+                        a_flat
+                    };
+                    let idx = indices
+                        .reshape((total_pairs,))?
+                        .to_dtype(DType::U32)?
+                        .contiguous()?;
+                    let out_flat = cuda_ops::grouped_gemm_lut_cuda(
+                        &self.blocks,
+                        &self.row_scales,
+                        &self.lut,
+                        &a_rotated,
+                        &idx,
+                        self.in_features,
+                        self.codebook,
+                    )?;
+                    let mut out = out_flat.reshape((
+                        n_tokens,
+                        n_experts_per_tok,
+                        self.rows_per_expert()?,
+                    ))?;
+                    if out.dtype() != a.dtype() {
+                        out = out.to_dtype(a.dtype())?;
+                    }
+                    if let Some(bias) = &self.bias {
+                        out = out.broadcast_add(&bias.to_dtype(out.dtype())?)?;
+                    }
+                    return Ok(out);
+                }
+
                 // The per-expert dequantize below materializes weights to HBM.
                 gather_policy::log_lut_gather_fallback_once(
                     n_tokens,
