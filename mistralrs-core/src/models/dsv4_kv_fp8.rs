@@ -48,6 +48,7 @@
 
 use candle_core::{DType, Device, Result, Tensor, D};
 use float8::F8E4M3;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 /// Block width of the activation quantizer, matching the reference's
@@ -61,13 +62,31 @@ const E4M3_MAX: f64 = 448.0;
 /// Which arithmetic produces the E4M3 code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KvQuantMode {
+    /// One fused device kernel per direction (`ArcQuant`,
+    /// `mistralrs_quant::arc_kvquant`). **The default.** Bit-identical to
+    /// [`Self::CpuExact`] — see that kernel's header for how each arithmetic
+    /// step is pinned to the candle op it replaces — but it is one launch
+    /// instead of ~11, and it removes the blocking device→host copy entirely.
+    ///
+    /// Falls back to [`Self::CpuExact`] when the tensor is not on CUDA, which
+    /// is what keeps the CPU unit tests below meaningful.
+    FusedDevice,
     /// Exact E4M3 via candle's CPU cast (candle has no CUDA `F8E4M3` cast —
     /// "named symbol not found"), at the price of one device sync per layer.
+    /// `ARC_KV_FP8_MODE=cpu`.
     CpuExact,
     /// On-device float arithmetic that reproduces E4M3's value grid with
     /// round-half-away-from-zero instead of round-half-to-even. Removes the
     /// sync; the FP8-trained model tolerates the sub-ULP-of-FP8 difference.
     /// `ARC_GPU_ACT_QUANT=1`. (RUN-161 throughput.)
+    ///
+    /// **Kept reachable, but it is NOT the fix and must not be shipped as one.**
+    /// Measured on H200 at B=1 it is *slower* than the sync it removes
+    /// (interleaved A1 66.99 / B1 67.71 / A2 68.05 / B2 70.30 ms/token, with
+    /// `kv_fp8_quant` 73.49 → 134.18 µs/call): it trades one blocking copy for
+    /// ~19 extra elementwise launches per layer, and this machine is bottlenecked
+    /// on op count, not on kernel speed. That measurement is the reason
+    /// [`Self::FusedDevice`] is one kernel rather than a chain of candle ops.
     GpuApprox,
 }
 
@@ -79,13 +98,38 @@ impl KvQuantMode {
     pub(crate) fn from_env() -> Self {
         static MODE: OnceLock<KvQuantMode> = OnceLock::new();
         *MODE.get_or_init(|| {
-            if std::env::var_os("ARC_GPU_ACT_QUANT").is_some() {
-                Self::GpuApprox
-            } else {
-                Self::CpuExact
+            match std::env::var("ARC_KV_FP8_MODE")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "cpu" | "cpu_exact" => Self::CpuExact,
+                "gpu" | "gpu_approx" => Self::GpuApprox,
+                "fused" | "fused_device" => Self::FusedDevice,
+                _ if std::env::var_os("ARC_GPU_ACT_QUANT").is_some() => Self::GpuApprox,
+                _ => Self::FusedDevice,
             }
         })
     }
+}
+
+/// How many times the fused device kernels actually ran.
+///
+/// D18/D33: a parity test that passes while these stay at zero has proved
+/// nothing — it compared the candle path to itself. Every test that asserts the
+/// fused path is correct also asserts these moved, and the fused path is the
+/// only thing that touches them.
+static FUSED_QUANT_CALLS: AtomicU64 = AtomicU64::new(0);
+static FUSED_DEQUANT_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of `quantize_k` calls served by the fused device kernel.
+pub(crate) fn fused_quantize_calls() -> u64 {
+    FUSED_QUANT_CALLS.load(Ordering::Relaxed)
+}
+
+/// Number of `V4PackedK::dequant` calls served by the fused device kernel.
+pub(crate) fn fused_dequantize_calls() -> u64 {
+    FUSED_DEQUANT_CALLS.load(Ordering::Relaxed)
 }
 
 /// The 256 E4M3 values, indexed by code byte. Entry `i` is exactly what
@@ -165,7 +209,42 @@ impl V4PackedK {
     ///
     /// Bit-identical to what the pre-packing `act_quant_kv_nope` stored — see
     /// the module docs and `kv_fp8_roundtrip_is_bit_exact_vs_reference`.
+    ///
+    /// Served by the fused device kernel when it can be (default), and by the
+    /// candle op chain otherwise. The two produce the same bits, so the choice
+    /// is invisible to callers; it is exposed to tests through
+    /// [`Self::dequant_with`] so parity can be checked *between* them.
     pub(crate) fn dequant(&self, out_dtype: DType) -> Result<Tensor> {
+        self.dequant_with(KvQuantMode::from_env(), out_dtype)
+    }
+
+    /// [`Self::dequant`] with the path chosen explicitly.
+    pub(crate) fn dequant_with(&self, mode: KvQuantMode, out_dtype: DType) -> Result<Tensor> {
+        if mode == KvQuantMode::FusedDevice
+            && out_dtype == self.side.dtype()
+            && mistralrs_quant::arc_kvquant::kv_fp8_fused_available(self.codes.device())
+        {
+            let nope = self.codes.dim(D::Minus1)?;
+            let lut = e4m3_lut(self.codes.device())?;
+            let out = mistralrs_quant::arc_kvquant::kv_fp8_dequantize(
+                &self.codes,
+                &self.side,
+                &lut,
+                self.rope_dim,
+                KV_QUANT_BLOCK,
+            )?;
+            debug_assert_eq!(out.dim(D::Minus1)?, nope + self.rope_dim);
+            FUSED_DEQUANT_CALLS.fetch_add(1, Ordering::Relaxed);
+            return Ok(out);
+        }
+        self.dequant_candle(out_dtype)
+    }
+
+    /// The candle op chain: ~13 launches, and the reference the fused kernel is
+    /// pinned against. Kept because it is the only implementation that runs on
+    /// CPU, and because a fused kernel with nothing to compare to is not a
+    /// verified kernel.
+    fn dequant_candle(&self, out_dtype: DType) -> Result<Tensor> {
         let (b, h, t, nope) = self.codes.dims4()?;
         let n_blocks = nope / KV_QUANT_BLOCK;
         let dev = self.codes.device();
@@ -222,6 +301,24 @@ pub(crate) fn quantize_k(
     }
     let n_blocks = nope / KV_QUANT_BLOCK;
 
+    // The whole point of this module's rewrite: one launch, no device→host
+    // round trip, and therefore nothing that blocks CUDA graph capture. Falls
+    // through to the candle chain on CPU (and on any dtype the kernel does not
+    // carry), which is what the parity tests compare against.
+    if mode == KvQuantMode::FusedDevice
+        && mistralrs_quant::arc_kvquant::kv_fp8_fused_available(k.device())
+        && matches!(k.dtype(), DType::BF16 | DType::F16 | DType::F32)
+    {
+        let (codes, side) =
+            mistralrs_quant::arc_kvquant::kv_fp8_quantize(k, rope_dim, KV_QUANT_BLOCK)?;
+        FUSED_QUANT_CALLS.fetch_add(1, Ordering::Relaxed);
+        return Ok(Some(V4PackedK {
+            codes,
+            side,
+            rope_dim,
+        }));
+    }
+
     let k_nope = k.narrow(D::Minus1, 0, nope)?;
     let k_rope = k.narrow(D::Minus1, nope, rope_dim)?;
 
@@ -233,7 +330,10 @@ pub(crate) fn quantize_k(
     let scaled = kb.broadcast_div(&scale)?;
 
     let codes = match mode {
-        KvQuantMode::CpuExact => e4m3_codes_cpu(&scaled)?,
+        // `FusedDevice` only reaches here when the kernel could not serve the
+        // call (CPU tensor, or a dtype it does not carry). The exact path is
+        // the right fallback: it is what `FusedDevice` is bit-identical to.
+        KvQuantMode::FusedDevice | KvQuantMode::CpuExact => e4m3_codes_cpu(&scaled)?,
         KvQuantMode::GpuApprox => e4m3_codes_arith(&scaled)?,
     }
     .reshape((b, h, t, nope))?;
@@ -486,6 +586,139 @@ mod tests {
             bits(&reference_act_quant_kv_nope(&k, 64, false)?)?,
             bits(&k)?,
             "declining and passing through must agree"
+        );
+        Ok(())
+    }
+
+    /// **The fused-kernel bit-parity proof, on hardware.**
+    ///
+    /// D14: this test is meaningless without a GPU, so it exits 2 (environment
+    /// failure) rather than passing when there is no CUDA device — a green run
+    /// with no device would be exactly the silent success this project has been
+    /// bitten by 13 times.
+    ///
+    /// D33: three independent quantities have to agree, and the mutant below
+    /// proves the comparison can fail.
+    ///
+    /// 1. `codes`/`side` bytes: fused kernel vs the candle chain + CPU cast.
+    /// 2. The reconstructed key tensor, computed **crosswise** — fused-quant
+    ///    then candle-dequant against candle-quant then fused-dequant — so a
+    ///    matching error would have to be present in both halves of two
+    ///    different implementations.
+    /// 3. The full round trip against `reference_act_quant_kv_nope`, the
+    ///    verbatim pre-packing implementation, run entirely on CPU.
+    ///
+    /// Plus the engagement assertion D18 demands: the fused call counters must
+    /// move, and must move only for the fused arm. A parity check on this exact
+    /// subsystem has already passed vacuously by comparing an implementation to
+    /// itself; only a launch counter caught it.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn kv_fp8_fused_is_bit_identical_to_cpu_exact() -> Result<()> {
+        const HEAD_DIM: usize = 512;
+        const ROPE: usize = 64;
+
+        let dev = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("ENVFAIL: kv_fp8 fused parity needs a CUDA device: {e}");
+                std::process::exit(2);
+            }
+        };
+
+        let k_cpu = fixture(2, 9, HEAD_DIM)?;
+        let k = k_cpu.to_device(&dev)?;
+
+        let q0 = fused_quantize_calls();
+        let packed_cpu = quantize_k(&k, ROPE, KvQuantMode::CpuExact)?.unwrap();
+        assert_eq!(
+            fused_quantize_calls(),
+            q0,
+            "CpuExact must not reach the fused kernel — if it does, the two arms \
+             are the same code and this test proves nothing"
+        );
+        let packed_fused = quantize_k(&k, ROPE, KvQuantMode::FusedDevice)?.unwrap();
+        assert_eq!(
+            fused_quantize_calls(),
+            q0 + 1,
+            "the fused arm did not reach the kernel: it silently fell back, so \
+             any equality below is the candle path compared with itself"
+        );
+
+        // (1) The stored bytes.
+        let codes_cpu: Vec<u8> = packed_cpu.codes.flatten_all()?.to_vec1()?;
+        let codes_fused: Vec<u8> = packed_fused.codes.flatten_all()?.to_vec1()?;
+        assert_eq!(
+            codes_fused, codes_cpu,
+            "fused E4M3 codes differ from candle's CPU cast"
+        );
+        assert_eq!(
+            bits(&packed_fused.side.to_device(&Device::Cpu)?)?,
+            bits(&packed_cpu.side.to_device(&Device::Cpu)?)?,
+            "fused `side` (rope tail + block amax) differs from the candle chain"
+        );
+
+        // (2) Crosswise reconstruction: each half of one implementation against
+        // the other half of the other.
+        let d0 = fused_dequantize_calls();
+        let fused_then_candle = packed_fused.dequant_candle(DType::BF16)?;
+        assert_eq!(
+            fused_dequantize_calls(),
+            d0,
+            "dequant_candle must not reach the fused kernel"
+        );
+        let candle_then_fused = packed_cpu.dequant_with(KvQuantMode::FusedDevice, DType::BF16)?;
+        assert_eq!(
+            fused_dequantize_calls(),
+            d0 + 1,
+            "the fused dequant silently fell back — nothing was tested"
+        );
+        assert_eq!(
+            bits(&candle_then_fused.to_device(&Device::Cpu)?)?,
+            bits(&fused_then_candle.to_device(&Device::Cpu)?)?,
+            "fused dequant differs from the candle dequant chain"
+        );
+
+        // (3) Against the verbatim pre-packing implementation, on CPU.
+        let reference = reference_act_quant_kv_nope(&k_cpu, ROPE, false)?;
+        assert_eq!(
+            bits(&candle_then_fused.to_device(&Device::Cpu)?)?,
+            bits(&reference)?,
+            "the fused round trip does not reproduce what the pre-packing \
+             implementation stored"
+        );
+
+        // D33: the comparison above must be able to fail. Same kernel, same
+        // scale, same layout, same reduction — only round-to-nearest-even
+        // replaced by truncation.
+        let (mutant_codes, mutant_side) =
+            mistralrs_quant::arc_kvquant::kv_fp8_quantize_mutant_for_test(
+                &k.contiguous()?,
+                ROPE,
+                KV_QUANT_BLOCK,
+            )?;
+        let mutant_codes: Vec<u8> = mutant_codes.flatten_all()?.to_vec1()?;
+        assert_eq!(
+            bits(&mutant_side.to_device(&Device::Cpu)?)?,
+            bits(&packed_cpu.side.to_device(&Device::Cpu)?)?,
+            "the mutant must differ ONLY in the rounding — if `side` differs too \
+             it is not isolating the property under test"
+        );
+        assert_ne!(
+            mutant_codes, codes_cpu,
+            "the negative control produced identical codes: this parity test \
+             cannot fail and therefore proves nothing (D33)"
+        );
+        let differing = mutant_codes
+            .iter()
+            .zip(codes_cpu.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            differing * 20 > codes_cpu.len(),
+            "the negative control only perturbed {differing}/{} codes; a \
+             comparison that weak could pass on luck",
+            codes_cpu.len()
         );
         Ok(())
     }
