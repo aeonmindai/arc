@@ -380,7 +380,7 @@ impl Engine {
             }
         };
 
-        let group = Arc::new(tokio::sync::Mutex::new(SequenceGroup::new(
+        let group = Arc::new(std::sync::Mutex::new(SequenceGroup::new(
             request.sampling_params.n_choices,
             request.is_streaming,
             is_chat,

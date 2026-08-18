@@ -275,7 +275,9 @@ main() {
     echo "  arc serve --ui -m Qwen/Qwen3-4B   # Server with web UI"
     echo "  arc bench -m Qwen/Qwen3-4B        # Benchmark"
     echo ""
-    printf "${BLUE}TurboQuant 3.5-bit KV cache compression is enabled by default.${NC}\n"
+    printf "${BLUE}TurboQuant 3.5-bit KV cache compression is enabled by default on supported models${NC}\n"
+    printf "${BLUE}(standard KV layout, head_dim 128). It disables prefix caching while active —${NC}\n"
+    printf "${BLUE}pass --pa-cache-type auto for an unquantized KV cache.${NC}\n"
     echo ""
 }
 

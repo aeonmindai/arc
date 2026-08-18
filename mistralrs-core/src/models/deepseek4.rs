@@ -110,7 +110,7 @@ use crate::{
         DeepSeekV2RotaryEmbedding, Mlp, RmsNorm,
     },
     layers_masker::{masked_fill, PastKvLenCache},
-    moe::{MoEExperts, MoEExpertsConfig},
+    moe::{ExpertParallelPlan, ExpertPlacement, MoEExperts, MoEExpertsConfig},
     ops::{SplitOp, TopKLastDimOp, TopKOutput},
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
@@ -137,6 +137,7 @@ serde_default_fn!(bool, tie_word_embeddings, false);
 serde_default_fn!(usize, default_head_dim, 512);
 serde_default_fn!(usize, default_num_kv_heads, 1);
 serde_default_fn!(usize, default_num_hash_layers, 3);
+serde_default_fn!(usize, default_ep_size, 1);
 serde_default_fn!(usize, default_hc_mult, 4);
 serde_default_fn!(f32, default_hc_eps, 1.0e-6);
 serde_default_fn!(usize, default_hc_sinkhorn_iters, 20);
@@ -304,6 +305,17 @@ pub struct DeepSeekV4Config {
     /// Audit §0 + §5 line 458.
     #[serde(default = "default_num_hash_layers", alias = "n_hash_layers")]
     pub(crate) num_hash_layers: usize,
+    /// Expert-parallel world size: how many ranks the `n_routed_experts`
+    /// routed experts are split across. `1` (the default, and what the
+    /// published V4 Flash `config.json` carries) is plain replication and is
+    /// bit-for-bit the pre-EP path.
+    ///
+    /// Published in the HF config as `ep_size`; overridable at run time with
+    /// `ARC_EP_SIZE` (see [`DeepSeekV4Config::effective_ep_size`]). This field
+    /// was deserialized and never read anywhere in the workspace until
+    /// wave60-CK — the twelfth "wired but never invoked" case in this repo.
+    #[serde(default = "default_ep_size")]
+    pub(crate) ep_size: usize,
     /// mHC multiplier: parallel residual streams (V4: 4). Audit §0 + §5.
     #[serde(default = "default_hc_mult")]
     pub(crate) hc_mult: usize,
@@ -349,6 +361,20 @@ fn default_index_topk() -> usize {
 }
 
 impl DeepSeekV4Config {
+    /// The expert-parallel world size actually in force.
+    ///
+    /// `ARC_EP_SIZE` wins over the config so a run can be sharded without
+    /// editing a published `config.json`; an unparsable value is ignored
+    /// rather than silently treated as 1, because "EP quietly turned itself
+    /// off" is exactly the failure this whole path exists to avoid — it is
+    /// reported at plan-construction time by the world-size check instead.
+    pub fn effective_ep_size(&self) -> usize {
+        match std::env::var("ARC_EP_SIZE") {
+            Ok(v) => v.parse::<usize>().unwrap_or(self.ep_size).max(1),
+            Err(_) => self.ep_size.max(1),
+        }
+    }
+
     /// Returns the compress ratio for layer `layer_idx`, or 0 (standard) if
     /// the index is out of bounds. Audit §1 layer-to-pattern mapping.
     pub fn layer_compress_ratio(&self, layer_idx: usize) -> i32 {
@@ -2122,6 +2148,95 @@ impl MoeGate {
     }
 }
 
+/// How the routed experts are distributed over the expert-parallel ranks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EpPlacementMode {
+    /// Rank `r` owns `[r·E/N, (r+1)·E/N)`. The only placement that slices the
+    /// checkpoint at load time rather than after it.
+    Contiguous,
+    /// Bin-pack by measured per-expert load. For V4's first `num_hash_layers`
+    /// layers the load is a **closed-form property of the tokenizer**: those
+    /// layers route by `gate.tid2eid`, a fixed token-id → expert table, so
+    /// their distribution can be computed exactly, offline, with no GPU.
+    /// Score-routed layers have no such table and fall back to contiguous.
+    BalancedFromHashTable,
+}
+
+impl EpPlacementMode {
+    /// `ARC_EP_PLACEMENT=balanced` opts into the tid2eid-derived placement.
+    fn from_env() -> Self {
+        match std::env::var("ARC_EP_PLACEMENT").as_deref() {
+            Ok("balanced") => Self::BalancedFromHashTable,
+            _ => Self::Contiguous,
+        }
+    }
+}
+
+/// Per-expert token counts implied by a V4 hash-routing table.
+///
+/// `tid2eid` is `[vocab_size, top_k]` (I64): token id → the `top_k` experts it
+/// is routed to, unconditionally, in the first `num_hash_layers` layers
+/// (`deepseek4.rs` `MoeGate::tid2eid`, reference `inference/model.py`
+/// `Gate.hash = layer_id < n_hash_layers`). With a uniform token distribution
+/// the per-expert load is just the number of table entries naming that expert.
+///
+/// This is the offline distribution wave44-BV §3.2 flagged as "free to check
+/// and nobody has".
+fn tid2eid_expert_loads(tid2eid: &Tensor, num_experts: usize) -> Result<Vec<f64>> {
+    let rows = tid2eid.to_dtype(DType::I64)?.to_vec2::<i64>()?;
+    let mut loads = vec![0.0f64; num_experts];
+    for row in &rows {
+        for &e in row {
+            if e < 0 {
+                candle_core::bail!("gate.tid2eid holds a negative expert id ({e})");
+            }
+            let e = e as usize;
+            if e >= num_experts {
+                candle_core::bail!(
+                    "gate.tid2eid names expert {e}, but this layer has {num_experts} experts"
+                );
+            }
+            loads[e] += 1.0;
+        }
+    }
+    Ok(loads)
+}
+
+/// Build this rank's expert-parallel view of one MoE layer.
+///
+/// Refuses rather than degrades: an `ep_size` that does not match the
+/// communicator's world size, or an expert count that does not divide, is an
+/// error. wave44-BV §1.6: "a device list on the wrong kind of run is an error,
+/// not a silent no-op".
+fn build_expert_parallel_plan(
+    cfg: &DeepSeekV4Config,
+    n_routed_experts: usize,
+    comm: &Arc<mistralrs_quant::Comm>,
+    device: &Device,
+    tid2eid: Option<&Tensor>,
+) -> Result<ExpertParallelPlan> {
+    let ep_size = cfg.effective_ep_size();
+    if ep_size <= 1 {
+        return Ok(ExpertParallelPlan::single(n_routed_experts));
+    }
+    if comm.world_size() != ep_size {
+        candle_core::bail!(
+            "expert parallelism: ep_size is {ep_size} but the communicator's world size is {} — \
+             stage 1 requires one rank per expert shard (attention stays data-parallel, so there \
+             is no second axis to split). Launch with {ep_size} ranks or set ARC_EP_SIZE=1.",
+            comm.world_size()
+        );
+    }
+    let placement = match (EpPlacementMode::from_env(), tid2eid) {
+        (EpPlacementMode::BalancedFromHashTable, Some(table)) => {
+            let loads = tid2eid_expert_loads(table, n_routed_experts)?;
+            ExpertPlacement::balanced(&loads, ep_size)?
+        }
+        _ => ExpertPlacement::contiguous(n_routed_experts, ep_size)?,
+    };
+    ExpertParallelPlan::new(Arc::new(placement), comm.rank(), device)
+}
+
 struct Moe {
     experts: MoEExperts,
     shared_experts: Option<Mlp>,
@@ -2157,7 +2272,24 @@ impl Moe {
             moe_intermediate_size: cfg.moe_intermediate_size,
         };
 
-        let experts = MoEExperts::new(
+        // The gate is built first because the expert→rank placement can be
+        // derived from its hash-routing table (V4's first `num_hash_layers`
+        // layers), and the experts must be loaded already sharded.
+        let gate = MoeGate::new(
+            cfg,
+            mapper.set_device(layer_idx, vb.pp("gate"), false),
+            n_routed_experts,
+            layer_idx,
+        )?;
+        let ep = build_expert_parallel_plan(
+            cfg,
+            n_routed_experts,
+            comm,
+            &layer_device,
+            gate.tid2eid.as_ref(),
+        )?;
+
+        let experts = MoEExperts::new_expert_parallel(
             &moe_cfg,
             mapper.set_device(layer_idx, vb.clone(), loading_isq),
             layer_device,
@@ -2165,6 +2297,7 @@ impl Moe {
             loading_isq,
             &cfg.quantization_config,
             cfg.hidden_act,
+            &ep,
         )?;
 
         let shared_experts = if let Some(n_shared_experts) = n_shared_experts {
@@ -2189,12 +2322,6 @@ impl Moe {
         } else {
             None
         };
-        let gate = MoeGate::new(
-            cfg,
-            mapper.set_device(layer_idx, vb.pp("gate"), false),
-            n_routed_experts,
-            layer_idx,
-        )?;
         Ok(Self {
             experts,
             shared_experts,
@@ -4219,6 +4346,22 @@ impl DeepSeekV4 {
 }
 
 impl IsqModel for DeepSeekV4 {
+    /// Apply the deferred expert-parallel slice to every MoE layer.
+    ///
+    /// Under EP the routed experts are meant to be split across ranks, but a
+    /// UQFF artifact holds all of them, so `MoEExperts` records the subset and
+    /// refuses to run until this narrows the deserialized stacks. Returns how
+    /// many quantized layers were narrowed (3 per MoE layer: gate, up, down).
+    fn apply_pending_expert_parallel_slice(&mut self) -> Result<usize> {
+        let mut narrowed = 0usize;
+        for layer in self.layers.iter_mut() {
+            if let MoeOrMlp::Moe(moe) = &mut layer.moe_or_mlp {
+                narrowed += moe.experts.apply_pending_expert_subset()?;
+            }
+        }
+        Ok(narrowed)
+    }
+
     fn get_layers(
         &mut self,
     ) -> (
@@ -7370,6 +7513,35 @@ mod tests {
     #[test]
     fn batched_ragged_xs_is_token_identical_to_the_b1_reference_hca() -> Result<()> {
         ragged_batch_matches_b1(128, &[1022, 1023, 1024, 1025], 3)
+    }
+
+    /// 🔑 The case the H200 died on, and the one every fixture above misses:
+    /// a row whose ENTIRE history is shorter than the batched window.
+    ///
+    /// The window a batch allocates is its greediest row's retained run — 23
+    /// columns for these token counts — so the 9-token row is front-padded by
+    /// 14 columns that stand for tokens before token 0. Every fixture above
+    /// uses rows long enough (37..43, 1022..1025, 30..35) that this never
+    /// happens, which is why they stayed green while `ARC_V4_XS_PER_SEQ=1` at
+    /// B=8 returned one token and `finish_reason: None` for every request:
+    /// `row 3 holds 9 tokens, fewer than the 11-wide retained window`.
+    ///
+    /// The trigger is prompt-length diversity, not generation length — so this
+    /// fails harder under real heterogeneous arrivals than under any
+    /// uniform-prompt benchmark.
+    #[test]
+    fn a_row_shorter_than_the_batched_window_is_token_identical_csa() -> Result<()> {
+        // Retained runs 9 / 22 / 23 / 20 → a 23-wide window; three distinct
+        // residues mod 4, so three compressor calls, and row 3 completes no
+        // block at all.
+        ragged_batch_matches_b1(4, &[9, 22, 39, 40], 3)
+    }
+
+    /// The same on HCA, where `ratio` is 128 and the retained run can reach
+    /// `ratio + margin`: a 129-token row sits inside a 143-wide window.
+    #[test]
+    fn a_row_shorter_than_the_batched_window_is_token_identical_hca() -> Result<()> {
+        ragged_batch_matches_b1(128, &[129, 143, 1024, 1150], 3)
     }
 
     /// The control the ragged tests need: a UNIFORM batch takes the untouched

@@ -397,7 +397,7 @@ impl AnyMoePipelineMixin for AnyMoePipeline {
         )
         .map_err(candle_core::Error::msg)?;
 
-        let dummy_group = Arc::new(tokio::sync::Mutex::new(SequenceGroup::new(
+        let dummy_group = Arc::new(std::sync::Mutex::new(SequenceGroup::new(
             1, false, false, None,
         )));
 
@@ -575,7 +575,7 @@ fn new_dummy_seq(
     (tokens, prompt): (Vec<u32>, String),
     dummy_sender: tokio::sync::mpsc::Sender<Response>,
     dummy_sampler: Sampler,
-    dummy_group: Arc<tokio::sync::Mutex<SequenceGroup>>,
+    dummy_group: Arc<std::sync::Mutex<SequenceGroup>>,
     images: Option<Vec<DynamicImage>>,
     eos_toks: Vec<u32>,
 ) -> Sequence {

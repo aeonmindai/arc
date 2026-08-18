@@ -41,6 +41,10 @@ mod metal;
 mod model_loader;
 mod moe;
 mod ops;
+pub use moe::{
+    balancedness, expected_distinct_experts, weight_read_imbalance_bound, Balancedness,
+    BalancednessCounter, ExpertParallelPlan, ExpertPlacement,
+};
 pub use model_loader::{
     get_auto_device_map_params, get_model_dtype, get_tgt_non_granular_index, LoaderBuilder,
 };

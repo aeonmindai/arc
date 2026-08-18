@@ -1,10 +1,6 @@
 use candle_core::{Result, Tensor};
-use mistralrs_quant::MatMul;
 
-use crate::{
-    attention::{repeat_kv, SdpaParams},
-    pipeline::text_models_inputs_processor::FlashParams,
-};
+use crate::{attention::SdpaParams, pipeline::text_models_inputs_processor::FlashParams};
 
 /// Fused attention with per-head sinks.
 ///
@@ -112,8 +108,8 @@ fn sinks_attn_regular(
     // `sdpa_with_sinks.metal` instantiates only {64,80,96,128,256}. Routing a
     // 512 head there turns a working unfused fallback into a hard
     // CompilationError. Each backend now advertises its own set.
-    let flash_sinks_ok_cuda = matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256)
-        || (hd == 512 && flash_512_enabled());
+    let flash_sinks_ok_cuda =
+        matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256) || (hd == 512 && flash_512_enabled());
     let flash_sinks_ok_metal = matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256);
     #[cfg(not(feature = "cuda"))]
     let _ = flash_sinks_ok_cuda;
@@ -122,6 +118,7 @@ fn sinks_attn_regular(
 
     #[cfg(feature = "cuda")]
     if q.device().is_cuda() && flash_sinks_ok_cuda {
+        crate::attention::arcflash::note(crate::attention::arcflash::Path::VendorSinks);
         return mistralrs_paged_attn::flash_attn_sinks(
             q,
             k,
@@ -134,6 +131,7 @@ fn sinks_attn_regular(
 
     #[cfg(feature = "metal")]
     if q.device().is_metal() && flash_sinks_ok_metal {
+        crate::attention::arcflash::note(crate::attention::arcflash::Path::VendorSinks);
         return mistralrs_quant::flash_attn_sinks_metal(
             q,
             k,
@@ -144,7 +142,8 @@ fn sinks_attn_regular(
         );
     }
 
-    // CPU fallback: unfused matmul + softmax_with_sinks
+    // ArcFlash/Tile — the head_dim the vendor sinks kernel does not take.
+    // DeepSeek-V4's 512 is the whole reason this arm exists.
     sinks_attn_cpu(q, k, v, sinks, mask, sdpa_params)
 }
 
@@ -184,8 +183,8 @@ fn sinks_attn_varlen(
     // `sdpa_with_sinks.metal` instantiates only {64,80,96,128,256}. Routing a
     // 512 head there turns a working unfused fallback into a hard
     // CompilationError. Each backend now advertises its own set.
-    let flash_sinks_ok_cuda = matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256)
-        || (hd == 512 && flash_512_enabled());
+    let flash_sinks_ok_cuda =
+        matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256) || (hd == 512 && flash_512_enabled());
     let flash_sinks_ok_metal = matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256);
     #[cfg(not(feature = "cuda"))]
     let _ = flash_sinks_ok_cuda;
@@ -271,7 +270,21 @@ fn varlen_causal_mask(
     Tensor::from_vec(data, (1, 1, q_len, kv_len), device)?.to_dtype(dtype)
 }
 
-/// CPU fallback: unfused matmul + softmax_with_sinks
+/// Sinks attention on **ArcFlash/Tile** — the path every DeepSeek-V4 layer
+/// takes, because head_dim 512 is outside the fused sinks kernel's
+/// `{64,80,96,112,128,192,256}`.
+///
+/// This used to `repeat_kv` K and V to all `n_kv_groups` heads and materialize
+/// the full `[B, H, Tq, Tk]` score matrix twice. At V4's shape (MQA,
+/// `n_kv_groups = 64`, head_dim 512) that is ~856 MB for one layer at
+/// `Tk ≈ 1400` — which is why long prompts died rather than merely slowed.
+/// `union_attention` folds the expansion into a reshape and bounds the scores
+/// to one query tile; the numbers are unchanged (see `arcflash.rs`, and
+/// `fold_matches_repeat_kv_across_gqa_ratios` which pins it against exactly the
+/// implementation this replaced).
+///
+/// `sinks` arrives shaped `[1, n_heads, 1, 1]` from V4 (the layout the fused
+/// kernel wants); `union_attention` flattens and casts it to the logits dtype.
 fn sinks_attn_cpu(
     q: &Tensor,
     k: &Tensor,
@@ -280,18 +293,7 @@ fn sinks_attn_cpu(
     mask: Option<&Tensor>,
     sdpa_params: &SdpaParams,
 ) -> Result<Tensor> {
-    let k = repeat_kv(k.clone(), sdpa_params.n_kv_groups)?;
-    let v = repeat_kv(v.clone(), sdpa_params.n_kv_groups)?;
-
-    let att = MatMul.matmul_affine_mul(q, &k.t()?, sdpa_params.softmax_scale.into())?;
-    // R1: `softmax_with_sinks` expects sinks shaped [num_heads] AND matching the
-    // logits dtype. V4 pre-shapes sinks as [1, n_heads, 1, 1] in F32 (for the
-    // flash kernel), so flatten + cast to the logits dtype here. Then cast the
-    // softmax result back to V's dtype before the value matmul.
-    let sinks = sinks.flatten_all()?.to_dtype(att.dtype())?;
-    let att = mistralrs_quant::softmax_with_sinks(&att, &sinks, mask)?;
-    let att = att.to_dtype(v.dtype())?;
-    MatMul.matmul(&att, &v)
+    crate::attention::arcflash::union_attention(q, k, v, mask, Some(sinks), sdpa_params)
 }
 
 /// CPU fallback for varlen: per-sequence unfused loop.

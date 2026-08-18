@@ -220,6 +220,7 @@ dependencies = [
  "arc-profiler",
  "candle-core",
  "cudaforge",
+ "float8",
  "half",
  "mistralrs-paged-attn",
  "mistralrs-quant",

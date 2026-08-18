@@ -145,7 +145,7 @@ def _build_request(prompt_text, args):
             "prompt": qlib.encode_chat(prompt_text),
             "max_tokens": args.max_tokens,
             "temperature": args.temperature,
-            "top_p": 1.0,
+            "top_p": args.top_p,
             "stop": [qlib.eos_token],
         }
         url = qlib.URL
@@ -158,7 +158,7 @@ def _build_request(prompt_text, args):
             ],
             "max_tokens": args.max_tokens,
             "temperature": args.temperature,
-            "top_p": 1.0,
+            "top_p": args.top_p,
         }
         url = qlib.CHAT_URL
     if not args.no_stream:
@@ -627,6 +627,16 @@ def main(argv=None):
                          "full concurrency; 0 = report only, never fail "
                          "(default: %(default)s)")
     ap.add_argument("--temperature", type=float, default=0.0)
+    # top_p is NOT cosmetic: it selects which sampler path the server takes.
+    # mistralrs-core/src/sampler.rs `needs_sort = top_k > 0 || (0 < top_p < 1)`.
+    # At the defaults here (temperature 0 => argmax, top_p 1.0 => no sort) the
+    # big-vocab GPU radix top-k path is never entered, so a sweep run at the
+    # defaults cannot observe any change to it. Use --temperature 1.0
+    # --top-p 0.95 (the measured-good chat.py setting) to exercise the
+    # production sampled path.
+    ap.add_argument("--top-p", dest="top_p", type=float, default=1.0,
+                    help="nucleus cutoff. <1.0 puts the server on the "
+                         "top-p sampling path (default: %(default)s)")
     ap.add_argument("--timeout", type=int, default=900, help="per-request timeout (s)")
     ap.add_argument("--label", default="batch", help="tag for the results file")
     ap.add_argument("--out", default=None)
@@ -828,7 +838,8 @@ def main(argv=None):
             "endpoint": endpoint, "stream": not args.no_stream,
             "mode": mode, "batches": batches,
             "max_tokens": args.max_tokens, "warmup_tokens": args.warmup_tokens,
-            "temperature": args.temperature, "prompt_tokens_est": prompt_est,
+            "temperature": args.temperature, "top_p": args.top_p,
+            "prompt_tokens_est": prompt_est,
         }),
         "summary": summary,
         "per_b": per_b,

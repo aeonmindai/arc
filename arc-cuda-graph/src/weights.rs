@@ -301,7 +301,47 @@ pub struct DecodeConfig {
     pub is_gpt_neox: bool,
 }
 
+/// Whether [`tensor_device_ptr`] can produce a device pointer for `dt`.
+///
+/// This is the single source of truth for the dispatch table below and is
+/// deliberately *not* CUDA-gated so the coverage test runs on any host.
+///
+/// The table is exactly candle's `cuda_dtype!` instantiations
+/// (`candle-core/src/cuda_backend/mod.rs`): `u8, u32, i16, i32, i64, f16,
+/// bf16, f32, f64, float8::F8E4M3`. The MX dummy formats (`F6E2M3`,
+/// `F6E3M2`, `F4`, `F8E8M0`) have no `CudaDType` impl, so `as_cuda_slice`
+/// can never yield them — and candle reports `size_in_bytes() == 0` for the
+/// sub-byte ones, which would make the `start_offset() * size_in_bytes()`
+/// byte-offset arithmetic below silently wrong for a view.
+///
+/// History: `I32` was missing here, which took out **every** consumer that
+/// passes an `int32_t` buffer to a kernel — the GPU radix top-k sampler
+/// (`seq_lens`), the fused `CudaSampler` (`token_ids`, `keep_idx_scratch`)
+/// and the V4 indexer's `score_and_topk_*`. The sampler's failure surfaced
+/// only as a per-token `WARN … falling back to CPU`, so it ran the slow path
+/// on every decode step in production. Widen this table, never the callers.
+pub const fn device_ptr_supports_dtype(dt: candle_core::DType) -> bool {
+    use candle_core::DType;
+    matches!(
+        dt,
+        DType::U8
+            | DType::U32
+            | DType::I16
+            | DType::I32
+            | DType::I64
+            | DType::BF16
+            | DType::F16
+            | DType::F32
+            | DType::F64
+            | DType::F8E4M3
+    )
+}
+
 /// Extract raw u64 device pointer from a Candle tensor (any dtype).
+///
+/// The dtype dispatch below must stay in lockstep with
+/// [`device_ptr_supports_dtype`] — `device_ptr_covers_every_storable_dtype`
+/// in this module's tests enforces it.
 #[cfg(feature = "cuda")]
 pub fn tensor_device_ptr(tensor: &Tensor) -> candle_core::Result<u64> {
     use candle_core::cuda::cudarc::driver::DevicePtr;
@@ -334,8 +374,27 @@ pub fn tensor_device_ptr(tensor: &Tensor) -> candle_core::Result<u64> {
                     let (p, _) = s.device_ptr(s.stream());
                     p
                 }
+                // I32 is what every `int32_t*` kernel argument in this crate is
+                // fed with (radix top-k `seq_lens`, `CudaSampler` token ids and
+                // keep-list scratch). Candle's `Tensor::from_vec(Vec<i32>, …)`
+                // produces it, so leaving it out disabled those paths wholesale.
+                DType::I32 => {
+                    let s = cuda_storage.as_cuda_slice::<i32>()?;
+                    let (p, _) = s.device_ptr(s.stream());
+                    p
+                }
+                DType::I16 => {
+                    let s = cuda_storage.as_cuda_slice::<i16>()?;
+                    let (p, _) = s.device_ptr(s.stream());
+                    p
+                }
                 DType::I64 => {
                     let s = cuda_storage.as_cuda_slice::<i64>()?;
+                    let (p, _) = s.device_ptr(s.stream());
+                    p
+                }
+                DType::F64 => {
+                    let s = cuda_storage.as_cuda_slice::<f64>()?;
                     let (p, _) = s.device_ptr(s.stream());
                     p
                 }
@@ -344,13 +403,22 @@ pub fn tensor_device_ptr(tensor: &Tensor) -> candle_core::Result<u64> {
                     let (p, _) = s.device_ptr(s.stream());
                     p
                 }
+                // NOT `as_cuda_slice::<u8>()`: candle stores this as
+                // `CudaStorageSlice::F8E4M3(CudaSlice<float8::F8E4M3>)`, and
+                // `as_cuda_slice::<T>` matches the storage variant by `T`, so
+                // asking for `u8` here returned `UnexpectedDType { expected:
+                // U8, got: F8E4M3 }` for every FP8 tensor — same class of
+                // defect as the missing I32 arm, on the FP8 KV-cache path.
                 DType::F8E4M3 => {
-                    // F8E4M3 is stored as u8 in cudarc
-                    let s = cuda_storage.as_cuda_slice::<u8>()?;
+                    let s = cuda_storage.as_cuda_slice::<float8::F8E4M3>()?;
                     let (p, _) = s.device_ptr(s.stream());
                     p
                 }
-                dt => candle_core::bail!("tensor_device_ptr: unsupported dtype {dt:?}"),
+                dt => candle_core::bail!(
+                    "tensor_device_ptr: unsupported dtype {dt:?} (sub-byte dtypes have \
+                     size_in_bytes()==0 so the offset arithmetic is undefined; every other \
+                     dtype belongs in this table — see device_ptr_supports_dtype)"
+                ),
             };
             Ok(base_ptr + offset_bytes as u64)
         }
@@ -542,8 +610,8 @@ fn extract_layer_idx(name: &str) -> Option<usize> {
 mod dense_shape_tests {
     use super::{check_dense_layer_inventory, DenseShapeError, DENSE_PROJS_PER_LAYER};
 
-    /// Exactly what `llama.rs:570-584` emits: the untagged lm_head, then
-    /// `q, k, v, o` plus the MLP's `gate, up, down` for each layer.
+    /// Exactly what `llama.rs` emits: the untagged lm_head, then `q, k, v, o`
+    /// plus the MLP's `gate, up, down` for each layer.
     fn dense_tags(num_layers: usize) -> Vec<Option<usize>> {
         let mut tags = vec![None];
         for i in 0..num_layers {
@@ -559,9 +627,9 @@ mod dense_shape_tests {
         assert_eq!(check_dense_layer_inventory(&dense_tags(1), 1), Ok(()));
     }
 
-    /// The case this guard exists for. `deepseek4.rs:4085-4145` emits, per
-    /// layer, `wq_a, wq_b, wkv, wo_a, wo_b` (+ optional compressor gate) and
-    /// then every expert's three projections — and afterwards appends
+    /// The case this guard exists for. `deepseek4.rs` emits, per layer,
+    /// `wq_a, wq_b, wkv, wo_a, wo_b` (+ optional compressor gate) and then
+    /// every expert's three projections — and afterwards appends
     /// `mtp.h_proj`, `mtp.e_proj` and the whole MTP block as *untagged*
     /// entries. Both the untagged count and the per-layer count are wrong.
     #[test]
@@ -607,8 +675,69 @@ mod dense_shape_tests {
         );
     }
 
-    /// THE MUTATION THAT MATTERS (D12). A guard written as a total-length check
-    /// — `tags.len() == 1 + num_layers * 7`, the obvious cheap version — passes
+    /// Mixtral, from the real emission order rather than a synthetic shape.
+    /// `mistralrs-core/src/models/mixtral.rs:686-698` pushes, per layer:
+    /// `q, k, v, o`, then `block_sparse_moe.gate`, then `w1, w2, w3` for every
+    /// expert. Mixtral-8x7B has 8 experts, so 4 + 1 + 24 = 29 — not 7.
+    #[test]
+    fn mixtral_8x7b_shaped_inventory_is_rejected() {
+        const EXPERTS: usize = 8;
+        const PER_LAYER: usize = 4 + 1 + 3 * EXPERTS; // q,k,v,o + gate + w1/w2/w3
+        assert_eq!(PER_LAYER, 29, "derived from mixtral.rs:686-698");
+
+        let mut tags = vec![None];
+        tags.extend(std::iter::repeat_n(Some(0), PER_LAYER));
+        tags.extend(std::iter::repeat_n(Some(1), PER_LAYER));
+        assert_eq!(
+            check_dense_layer_inventory(&tags, 2),
+            Err(DenseShapeError::LayerProjCountMismatch {
+                layer: 0,
+                found: PER_LAYER,
+                expected: DENSE_PROJS_PER_LAYER,
+            })
+        );
+    }
+
+    /// Phi-2 is the *under*-count case, and it is qualitatively worse than a
+    /// mis-assignment. `mistralrs-core/src/models/phi2.rs:621-636` pushes
+    /// `q, k, v, dense` plus `Mlp::get_isq_layers()` — which is `[fc1, fc2]`
+    /// (`phi2.rs:125-127`) — so **6** entries per layer, not 7.
+    ///
+    /// With 6 emitted and 7 assumed, `extract_model_weights`'s
+    /// `layers[1 + i * 7 + k]` mis-assigns from layer 1 on *and then walks off
+    /// the end of the vector entirely*: for a 32-layer Phi-2 the inventory has
+    /// `1 + 32*6 = 193` entries (max index 192) while the last read is
+    /// `1 + 31*7 + 6 = 224`. The guard turns an index-out-of-bounds panic into
+    /// a named refusal.
+    #[test]
+    fn phi2_shaped_inventory_is_rejected_before_it_runs_off_the_end() {
+        const PER_LAYER: usize = 4 + 2; // q,k,v,dense + fc1,fc2
+        const NUM_LAYERS: usize = 32; // Phi-2
+        let mut tags = vec![None];
+        for i in 0..NUM_LAYERS {
+            tags.extend(std::iter::repeat_n(Some(i), PER_LAYER));
+        }
+
+        // The arithmetic the refusal is protecting, asserted rather than asserted-about.
+        let last_read = 1 + (NUM_LAYERS - 1) * DENSE_PROJS_PER_LAYER + (DENSE_PROJS_PER_LAYER - 1);
+        assert!(
+            last_read >= tags.len(),
+            "fixture must actually overrun: last read {last_read} vs len {}",
+            tags.len()
+        );
+
+        assert_eq!(
+            check_dense_layer_inventory(&tags, NUM_LAYERS),
+            Err(DenseShapeError::LayerProjCountMismatch {
+                layer: 0,
+                found: PER_LAYER,
+                expected: DENSE_PROJS_PER_LAYER,
+            })
+        );
+    }
+
+    /// THE MUTATION THAT MATTERS. A guard written as a total-length check —
+    /// `tags.len() == 1 + num_layers * 7`, the obvious cheap version — passes
     /// this input, because 8 + 6 == 14 == 2 * 7. The extractor would then read
     /// layer 1's projections starting one slot late and silently mis-assign
     /// every pointer from there on. Only a per-layer histogram catches it.
@@ -747,6 +876,83 @@ mod cpu_anchor_tests {
         let v = anchor.to_vec2::<f32>().expect("tensor should be readable");
         assert_eq!(v.len(), 4);
         assert_eq!(v[0].len(), 8);
+    }
+
+    /// Every dtype a Candle CUDA tensor can actually hold must be resolvable
+    /// to a device pointer.
+    ///
+    /// `tensor_device_ptr`'s dispatch is a `match` on `DType`; a missing arm
+    /// is invisible until a kernel argument happens to use that dtype at
+    /// runtime, at which point the caller either hard-errors or — worse —
+    /// swallows it into a fallback. That is exactly how the missing `I32` arm
+    /// disabled the GPU radix top-k sampler for every decode step in
+    /// production while only emitting a per-token WARN.
+    ///
+    /// The `_dtype_is_exhaustive` match below is the tripwire: adding a
+    /// variant to candle's `DType` breaks compilation here, forcing a
+    /// decision about `tensor_device_ptr` instead of shipping another gap.
+    #[test]
+    fn device_ptr_covers_every_storable_dtype() {
+        use super::device_ptr_supports_dtype;
+
+        // Exhaustive over candle's DType — compilation fails if upstream adds
+        // a variant. `true` == candle has a `cuda_dtype!` impl for it, so
+        // `as_cuda_slice` can return it and `tensor_device_ptr` must handle it.
+        fn has_cuda_slice_impl(dt: DType) -> bool {
+            match dt {
+                DType::U8
+                | DType::U32
+                | DType::I16
+                | DType::I32
+                | DType::I64
+                | DType::BF16
+                | DType::F16
+                | DType::F32
+                | DType::F64
+                | DType::F8E4M3 => true,
+                // MX dummy formats: raw-byte storage, no `CudaDType` impl.
+                DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => false,
+            }
+        }
+
+        const ALL: &[DType] = &[
+            DType::U8,
+            DType::U32,
+            DType::I16,
+            DType::I32,
+            DType::I64,
+            DType::BF16,
+            DType::F16,
+            DType::F32,
+            DType::F64,
+            DType::F8E4M3,
+            DType::F6E2M3,
+            DType::F6E3M2,
+            DType::F4,
+            DType::F8E8M0,
+        ];
+
+        for &dt in ALL {
+            assert_eq!(
+                device_ptr_supports_dtype(dt),
+                has_cuda_slice_impl(dt),
+                "tensor_device_ptr dtype coverage drifted for {dt:?}: candle \
+                 {} a CudaSlice for it",
+                if has_cuda_slice_impl(dt) {
+                    "can produce"
+                } else {
+                    "cannot produce"
+                }
+            );
+        }
+
+        // The specific regression: I32 buffers back every `int32_t*` kernel
+        // argument in this crate.
+        assert!(
+            device_ptr_supports_dtype(DType::I32),
+            "I32 must be supported — radix top-k `seq_lens`, CudaSampler \
+             `token_ids` and `keep_idx_scratch` are all I32"
+        );
     }
 }
 

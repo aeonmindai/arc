@@ -65,6 +65,7 @@ pub mod bitshift;
 mod codebook_tests;
 #[cfg(feature = "cuda")]
 mod cuda_ops;
+pub(crate) mod device_guard;
 #[cfg(feature = "cuda")]
 mod ffi;
 pub(crate) mod gather_policy;
@@ -3402,6 +3403,73 @@ impl QtipLayer {
     }
 }
 
+/// Keep only `ids` (ascending, in range) along a tensor's leading dimension.
+///
+/// Shared by both trellis rungs' expert-parallel slice. Contiguous id runs —
+/// the `ExpertPlacement::contiguous` case — take `narrow`, which avoids
+/// building an index tensor on the device.
+pub(crate) fn select_experts_dim0(t: &Tensor, ids: &[usize]) -> candle_core::Result<Tensor> {
+    let e = t.dim(0)?;
+    if ids.is_empty() {
+        candle_core::bail!("expert slice: cannot keep zero experts");
+    }
+    for w in ids.windows(2) {
+        if w[0] >= w[1] {
+            candle_core::bail!("expert slice: ids must be strictly ascending, got {w:?}");
+        }
+    }
+    if ids[ids.len() - 1] >= e {
+        candle_core::bail!(
+            "expert slice: id {} is out of range for a {e}-expert stack",
+            ids[ids.len() - 1]
+        );
+    }
+    if ids.windows(2).all(|w| w[1] == w[0] + 1) {
+        return t.narrow(0, ids[0], ids.len())?.contiguous();
+    }
+    let idx = Tensor::from_vec(
+        ids.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+        (ids.len(),),
+        t.device(),
+    )?;
+    t.index_select(&idx, 0)?.contiguous()
+}
+
+impl QtipLayer {
+    /// The expert-parallel slice: keep only `ids` out of this stack.
+    ///
+    /// `lut` and `rotation_signs` are **shared** across the stack (the
+    /// rotation is a function of `K_in`, identical for every expert), so they
+    /// are replicated rather than sliced — exactly as wave44-BV §4.1
+    /// describes. Only `blocks` and `row_scales` carry an expert axis.
+    pub fn select_experts_concrete(&self, ids: &[usize]) -> candle_core::Result<Self> {
+        let Some(num_experts) = self.num_experts else {
+            candle_core::bail!(
+                "QtipLayer::select_experts: this layer is a plain 2-D linear, not an expert stack"
+            );
+        };
+        if ids.len() > num_experts {
+            candle_core::bail!(
+                "QtipLayer::select_experts: asked for {} experts out of {num_experts}",
+                ids.len()
+            );
+        }
+        Ok(Self {
+            blocks: select_experts_dim0(&self.blocks, ids)?,
+            row_scales: select_experts_dim0(&self.row_scales, ids)?,
+            lut: self.lut.clone(),
+            bias: self.bias.clone(),
+            in_features: self.in_features,
+            num_experts: Some(ids.len()),
+            rotation_signs: self.rotation_signs.clone(),
+            rotation_block: self.rotation_block,
+            search: self.search,
+            search_detail: self.search_detail,
+            codebook: self.codebook,
+        })
+    }
+}
+
 impl QuantMethod for QtipLayer {
     fn new(method: QuantMethodConfig) -> candle_core::Result<Self>
     where
@@ -3590,6 +3658,10 @@ impl QuantMethod for QtipLayer {
 
     fn quantized_act_type(&self) -> Option<DType> {
         None
+    }
+
+    fn select_experts(&self, ids: &[usize]) -> Result<Arc<dyn QuantMethod>> {
+        Ok(Arc::new(self.select_experts_concrete(ids)?))
     }
 
     fn add_delta_w(&self, _delta: &Tensor) -> Result<Arc<dyn QuantMethod>> {

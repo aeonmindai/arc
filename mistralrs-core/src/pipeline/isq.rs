@@ -499,6 +499,20 @@ pub struct UqffSourceWeights<'a> {
 }
 
 pub trait IsqModel {
+    /// Apply any deferred expert-parallel slice to this model's MoE layers,
+    /// returning how many quantized layers were narrowed.
+    ///
+    /// A UQFF artifact holds **every** expert, so under expert parallelism the
+    /// shard cannot be applied while constructing the layer — only after
+    /// `load_from_artifacts` has deserialized it. Models that do not shard
+    /// experts return 0. Called unconditionally after load; the MoE layers
+    /// themselves refuse to run while a slice is still pending, so a model
+    /// that forgets to override this fails loudly instead of quietly placing
+    /// the whole expert set on every rank.
+    fn apply_pending_expert_parallel_slice(&mut self) -> candle_core::Result<usize> {
+        Ok(0)
+    }
+
     /// Corresponds to `IsqOrganization::Default`
     #[allow(clippy::type_complexity)]
     fn get_layers(

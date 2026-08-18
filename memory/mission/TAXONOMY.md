@@ -229,13 +229,37 @@ coding. Presets Default (K4/V3), Balanced (K3/V3), Aggressive (K3/V2).
 | TurboQuant/Cache | `arc-turbo/src/cache.rs` — packed indices + norms + FP16 recent window |
 | TurboQuant/Kernels | `kernels/turboquant/turbo_wht.cu`, `mistralrs-paged-attn/.../turbo_paged_attention.cu` |
 
-> 🔴 **TurboQuant is NOT on any default path, and has NEVER been measured.**
-> Eager KV is opt-in (`ARC_TURBOQUANT_KV=1`, default off). The paged kernel
-> exists at **head_dim 128 only**; the ambient default auto-falls back to `Auto`
-> with a warning and an explicit request hard-errors off-envelope. **No kernel
-> exists at head_dim 512, so V4 cannot use it.** The prefix cache auto-disables
-> under TurboQuant. The former "4.27× measured end-to-end" is **format
-> arithmetic, never a forward pass** — retracted 2026-08-17.
+> 🔵 **CORRECTED 2026-08-17 — this box previously read "TurboQuant is NOT on
+> any default path, and has NEVER been measured." Both halves were false.**
+> Jish caught it. Read the replacement carefully; it is deliberately split.
+>
+> **It IS the paged default.** `defaults::PAGED_CACHE_TYPE` is
+> `PagedCacheType::TurboQuant` and `--pa-cache-type` carries no clap default, so
+> a standard-layout **head_dim-128** model on CUDA takes K4/V3 with no flag and
+> `cache_type_explicit = false`. `turboquant_stays_on_supported_geometry` in
+> `cache_engine.rs` asserts exactly this. Off that envelope the default
+> auto-falls back to `Auto` with a warning, and an explicit request hard-errors
+> instead. The prefix cache auto-disables under TurboQuant, so default-path
+> users lose prefix reuse silently. Only the **eager** path is opt-in
+> (`ARC_TURBOQUANT_KV=1`, default off). **No kernel exists at head_dim 512, so
+> V4 does not take it.**
+>
+> **It HAS been measured — narrowly.** `4eba13905` (2026-04-06): *"55 tok/s
+> with TurboQuant = 46% over Candle baseline"*, **B200**, correct output.
+> Harness `deploy/modal_b200.py` names the model: `MODEL="Qwen/Qwen3-32B"`,
+> `gpu="B200"`, `--pa-cache-type turboquant`. wave61 recorded this commit and
+> still concluded "never measured"; the model it called "unstated" was one file
+> away. Eight CUDA correctness defects were fixed against that hardware on
+> 2026-04-02 (`143b5ab20` V-cache stride, `fd0074792` Q·K warp deadlock).
+>
+> **What is still genuinely unmeasured, and must not be inflated:** the run was
+> b=1, one card, one model, head_dim 128, `Default` preset. The "46%" compares
+> Arc's whole dedicated decode path with Candle's and **isolates nothing about
+> TurboQuant** — there is no A/B against an unquantized cache. There is **no
+> quality evaluation at any preset**. The former "4.27× measured end-to-end" is
+> **format arithmetic, never a forward pass** — retracted 2026-08-17 and it
+> stays retracted; likewise the **1,026 → 260 B/token** V4 figure, which is
+> design arithmetic over code that has never run.
 >
 > **Codebook density:** `∝ (1-x²)^((d-3)/2)`, i.e. `(x+1)/2 ~ Beta((d-1)/2,
 > (d-1)/2)`. The old "Beta(d/2, d/2)" prose was off by a half in both shape
@@ -244,9 +268,10 @@ coding. Presets Default (K4/V3), Balanced (K3/V3), Aggressive (K3/V2).
 >
 > **In flight:** PR #94 (CUDA kernels at head_dim 64/128/256/**512**, Hopper +
 > Blackwell) and PR #98 (TurboQuant KV storage for V4, `V4CachedK`). If those
-> land, the "head_dim 128 only" and "V4 cannot use it" statements above become
-> stale — **re-check this section before quoting it**, and note that a kernel
-> existing still would not make it *measured*.
+> land, the "head_dim 128 only" and "V4 does not take it" statements above
+> become stale — **re-check this section before quoting it**. A kernel existing
+> does not make *that width* measured: 64/256/512 would be compiled and unrun,
+> and only head_dim 128 has hardware behind it.
 
 ### 4.3 ArcBake — the offline pipeline *(named here)*
 

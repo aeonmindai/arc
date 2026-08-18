@@ -11,6 +11,9 @@ candle-core.workspace = true
 mistralrs-quant.workspace = true
 mistralrs-paged-attn.workspace = true
 half.workspace = true
+# Needed by `weights::tensor_device_ptr`: candle stores FP8 tensors as
+# `CudaSlice<float8::F8E4M3>`, and `as_cuda_slice::<T>` dispatches on `T`.
+float8.workspace = true
 tracing.workspace = true
 # So ArcGraph can record its OWN unreachability in the profile tree. A graph
 # node reporting 0 ns because it never ran must not read like one that ran

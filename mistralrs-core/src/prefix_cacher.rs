@@ -579,7 +579,6 @@ mod tests {
         use crate::sampler::Sampler;
         use crate::sequence::{SeqStepType, SequenceGroup, SequenceRecognizer};
         use std::sync::Arc;
-        use tokio::sync::Mutex as TokioMutex;
 
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let sampler = Sampler::new(
@@ -597,7 +596,9 @@ mod tests {
             vec![],
         )
         .unwrap();
-        let group = Arc::new(TokioMutex::new(SequenceGroup::new(1, false, false, None)));
+        let group = Arc::new(std::sync::Mutex::new(SequenceGroup::new(
+            1, false, false, None,
+        )));
         let mut seq = Sequence::new_waiting(
             tokens,
             String::new(),
