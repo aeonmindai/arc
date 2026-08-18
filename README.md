@@ -28,7 +28,7 @@ Forked from [mistral.rs](https://github.com/EricLBuehler/mistral.rs). Apache 2.0
 | Feature | What it does |
 |---|---|
 | **QTIP 2-bit weights** | Cornell ICLR'25 — trellis quantization with Hadamard incoherence rotation. 8× weight compression vs FP16. Two rungs: `qtip2` (LUT) and `qtip2b` (computed codebook), the latter being what Arc serves. Works on any model. |
-| **TurboQuant KV** *(experimental, off by default)* | Zandieh et al. (Google Research, [arXiv:2504.19874](https://arxiv.org/abs/2504.19874), ICLR'26) — Arc Rust implementation of WHT + Lloyd-Max KV coding. **Not on any default path and never measured.** Eager KV is opt-in via `ARC_TURBOQUANT_KV=1`; the paged kernel exists at head_dim 128 only; there is no kernel at head_dim 512, so DeepSeek V4 cannot use it. |
+| **TurboQuant KV** *(paged default at head_dim 128)* | Zandieh et al. (Google Research, [arXiv:2504.19874](https://arxiv.org/abs/2504.19874), ICLR'26) — Arc Rust implementation of WHT + Lloyd-Max KV coding. **On by default on the paged path**: a standard-layout head_dim-128 model on CUDA gets K4/V3 KV with no flag, and loses prefix caching with it (`--pa-cache-type auto` opts out). Every other geometry falls back to `auto` with a warning; there is no kernel at head_dim 512, so DeepSeek V4 does not take it. Served end-to-end on a B200 at **55 tok/s with correct output**; **quality has never been evaluated**. Eager (non-paged) KV is a separate path, opt-in via `ARC_TURBOQUANT_KV=1`. |
 | **TD-MoE Tucker + whitening** | Whitened Tucker decomposition of the MoE expert pool. The **"lossless 20%"** figure is the **paper's** (NeurIPS'25), not ours — *published, not reproduced by us*. Works on any MoE. |
 | **ArcAttention/Indexer** — sparse attention | DeepSeek V4's Lightning Indexer with FlashMLASparse CUDA kernels (MIT, ported from sgl-project) for top-k attention. Dense O(n²) → sparse O(n·k). |
 | **ArcGraph** — GPU-autonomous decode | Full decode loop (forward + sample + EOS check) on GPU. Zero CPU sync per token. Works on any model. |
@@ -53,7 +53,9 @@ Validated as of Aug 2026 (DeepSeek V4 Flash, 284B / 13B-active MoE, single H200 
 | Long-context correctness | **Measured** | 5/5 coherence + 4/4 needle recall (ablation matrix in BENCHMARKS.md) |
 | qtip2b bitshift-trellis format | **Measured** | CUDA↔CPU bit-for-bit parity, 20/20 tests on H200 |
 | Batched MoE kernel crossover | **Measured-kernel** | Grouped GEMM overtakes GEMV at **B=64** and keeps climbing (527 tok/s at B=128) while GEMV is flat (315→317). MoE-GEMM path only |
-| TurboQuant KV | **Never measured** | A "4.27× KV compression" figure appeared here previously. It was **format arithmetic — bytes per token at 3.5 bits vs BF16 — and was never produced by a forward pass.** Retracted 2026-08-17 |
+| TurboQuant KV — serving | **Measured, narrowly** | K4/V3 paged KV served **Qwen3-32B on a B200 at 55 tok/s with correct output** (2026-04-06, commit `4eba13905`; harness `deploy/modal_b200.py`). Scope: b=1, one card, one model, head_dim 128, `Default` preset. The same commit records "46% over Candle baseline", but that compares Arc's whole dedicated decode path against Candle's — **it does not isolate TurboQuant**, and no A/B against an unquantized cache has ever been run |
+| TurboQuant KV — compression ratio | **Never measured** | A "4.27× KV compression" figure appeared here previously. It was **format arithmetic — bytes per token at 3.5 bits vs BF16 — and was never produced by a forward pass.** Retracted 2026-08-17, and it stays retracted |
+| TurboQuant KV — quality | **Never measured** | No perplexity, GSM8K, LongBench or any other evaluation has been run under any TurboQuant preset, at any width. The paper's "lossless" LongBench result is **Zandieh et al.'s, on their model** — published, not reproduced by us |
 
 Per-user speed is the honest weak spot: at B=128 each user sees 1.09 tok/s, and Arc is **overhead-bound rather than bandwidth-bound** today — 111.69 tok/s is low single-digit % of the H200's 4.8 TB/s. One named contributor is a GPU→CPU sampler fallback firing on every token. Saturated-batch floors and per-node replica math are arithmetic, not measurement, and live in [docs/FLEET.md](docs/FLEET.md) explicitly marked projected. **No side-by-side run against SGLang, vLLM or any other engine has ever been performed**, so every $/Mtok figure is Arc-versus-Arc.
 
@@ -75,7 +77,9 @@ KV cache bytes per token @ 32K context:
 
 Each layer compresses a different axis, and in principle the wins multiply.
 
-**Read the block above as arithmetic, because that is all it is.** Exactly one line of it has been measured end-to-end: 284B → **~74 GB** of weights at 2.09 bits/param (V4 Flash trellis bake, serving on one H200 — see [Results](#results)). The KV lines are bytes-per-token ratios; **no TurboQuant forward pass has ever been benchmarked**, TurboQuant is off by default, and it has no kernel at V4's head_dim of 512. The xKV pool is not implemented.
+**Read the block above as arithmetic, because that is all it is.** The weight line is measured end-to-end: 284B → **~74 GB** at 2.09 bits/param (V4 Flash trellis bake, serving on one H200 — see [Results](#results)). **The KV lines are not.** They are bytes-per-token ratios computed from the packed format; no run has ever produced a measured KV compression figure, and the "4.27×" once published here is retracted.
+
+What *has* run: the TurboQuant K4/V3 paged path served Qwen3-32B on a B200 end-to-end with correct output (see [Results](#results)) — so "no TurboQuant forward pass has ever been benchmarked", which this section previously asserted, was false. What that run does **not** establish is any of the ratios above, or any quality number. TurboQuant is the paged default at head_dim 128; it has no kernel at V4's head_dim of 512. The xKV pool is not implemented.
 
 For long context (1M+ tokens), the bottleneck shifts from weights to attention compute + KV bandwidth. Arc handles that via FlashMLASparse (CUDA kernel, MIT-licensed, ported from sgl-project), turning dense attention's O(n²) into sparse top-k O(n·k) on models with native sparse-attention training (DeepSeek V3.2+ family) and via top-k attention + sink preservation on the rest.
 
@@ -126,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
         .with_paged_attn(|| PagedAttentionConfig::new(
             None,
             Default::default(),
-            PagedCacheType::Auto, // TurboQuant is opt-in; see note below
+            PagedCacheType::Auto, // opts *out* of the TurboQuant default; see note below
         ))?
         .build()
         .await?;
@@ -138,7 +142,11 @@ async fn main() -> anyhow::Result<()> {
 
 Python bindings: `pip install mistralrs-cuda`.
 
-> **TurboQuant is not the default anywhere.** Requesting `PagedCacheType::TurboQuant` only works at head_dim 128; off-envelope it falls back to `Auto` with a warning, and an explicit `--pa-cache-type turboquant` is a hard error. The eager KV path is opt-in via `ARC_TURBOQUANT_KV=1`.
+> **TurboQuant *is* the paged default** — correcting an earlier note here that read "TurboQuant is not the default anywhere", which was false when written. `defaults::PAGED_CACHE_TYPE` is `PagedCacheType::TurboQuant` and `--pa-cache-type` carries no clap default, so leaving it unset on CUDA (where PagedAttention is itself on by default) gives a standard-layout head_dim-128 model TurboQuant K4/V3 KV with nothing asked for — and **silently drops prefix caching**, which no TurboQuant preset supports. Pass `--pa-cache-type auto`, or `PagedCacheType::Auto` as above, to opt out.
+>
+> Off that envelope — MLA layouts, any other head_dim — the default falls back to `Auto` with a warning, while an explicit `--pa-cache-type turboquant` is a hard error instead. The eager (non-paged) KV path is separate and genuinely opt-in via `ARC_TURBOQUANT_KV=1`.
+>
+> **Provenance:** this path has served a real model on real hardware — Qwen3-32B, B200, 55 tok/s, correct output — but at b=1, one width, one preset, with **no quality evaluation and no A/B against an unquantized cache**. See [Results](#results) before relying on it.
 
 ## Supported Models
 
@@ -246,7 +254,7 @@ Built on [mistral.rs](https://github.com/EricLBuehler/mistral.rs) by Eric Buehle
 
 Compression and inference techniques composed from published research:
 
-- **TurboQuant** — Zandieh et al., Google Research, ICLR'26 ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)). Arc provides the Rust implementation, runtime Lloyd-Max codebook generation for arbitrary block dimensions, and the non-power-of-two head_dim layout decomposition. Experimental, off by default.
+- **TurboQuant** — Zandieh et al., Google Research, ICLR'26 ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)). Arc provides the Rust implementation, runtime Lloyd-Max codebook generation for arbitrary block dimensions, and the non-power-of-two head_dim layout decomposition. On by default on the paged path at head_dim 128 (see [Quick Start](#quick-start)); served on a B200, quality never evaluated.
 - **QTIP** — Cornell-RelaxML, ICLR'25
 - **TEAL** — ICLR'25 Spotlight
 - **SCMoE** — Shi et al., NeurIPS'24 ([arXiv:2405.14507](https://arxiv.org/abs/2405.14507))

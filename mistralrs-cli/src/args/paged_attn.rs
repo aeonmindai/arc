@@ -41,13 +41,22 @@ pub struct PagedAttentionOptions {
     #[arg(long = "pa-block-size")]
     pub block_size: Option<usize>,
 
-    /// KV cache quantization type: turboquant (K4/V3, 3.5-bit, experimental),
-    /// turboquant-3 (K3/V3), turboquant-aggressive (K3/V2), auto, f8e4m3.
-    /// If unset, defaults to turboquant with auto-fallback to `auto` for models
-    /// TurboQuant cannot support — which is every MLA model and every head_dim
-    /// other than 128, so most models get `auto`. Setting it explicitly makes
-    /// an unsupported model a hard error instead. TurboQuant has no measured
-    /// serving run behind it; quality is not established.
+    /// KV cache quantization type: turboquant (K4/V3, 3.5-bit), turboquant-3
+    /// (K3/V3), turboquant-aggressive (K3/V2), auto, f8e4m3.
+    /// UNSET MEANS TURBOQUANT, NOT `auto`. On a standard-layout model with
+    /// head_dim 128 (with PagedAttention on, which is the CUDA default) leaving
+    /// this flag off gives you TurboQuant KV and, with it, no prefix caching.
+    /// Pass `auto` to opt out. Every other geometry — MLA layouts and every
+    /// other head_dim — auto-falls back to `auto` with a warning, so those
+    /// models are unaffected. Setting the flag explicitly turns that fallback
+    /// into a hard error instead.
+    /// Provenance: TurboQuant K4/V3 has one end-to-end serving run behind it —
+    /// Qwen3-32B on a B200, 55 tok/s with correct output (2026-04-06). That run
+    /// was b=1, head_dim 128, on Blackwell, and it did not isolate TurboQuant
+    /// from the rest of the decode path. There is no A/B against an
+    /// unquantized cache and no quality evaluation at any preset, so treat
+    /// quality as unestablished; `turboquant-3` and `turboquant-aggressive`
+    /// have never run at all.
     #[arg(long = "pa-cache-type", value_parser = parse_cache_type)]
     #[serde(default)]
     pub cache_type: Option<PagedCacheType>,

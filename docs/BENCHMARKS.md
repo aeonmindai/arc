@@ -689,15 +689,30 @@ page.** No lab cluster, no reserved capacity.
   quoting the comparison**; we state both because hiding either would flatter
   us. The perplexity and long-context rows *do* still carry the pre-#35
   vintage and have not been re-run.
-- 🔴 **TurboQuant KV has never been measured on a GPU, on any model.** The
-  **4.27×** "KV compression / Qwen3-32B on one H100 / 39K→169K context" figure
-  that this page previously carried as measured is **retracted**: it is
-  **format arithmetic** — bytes per token at 3.5 bits versus BF16 — and **was
-  never produced by a forward pass on any hardware**. No TurboQuant measurement
-  exists anywhere in this repo's record. Additionally: TurboQuant is **off by
-  default** (opt-in via `ARC_TURBOQUANT_KV=1`), its paged kernel exists at
-  **head_dim 128 only**, and **there is no head_dim-512 kernel — so DeepSeek V4
-  Flash cannot use TurboQuant at all**, independent of the MLA fallback.
+- 🔴 **The TurboQuant "4.27×" is retracted, and stays retracted.** The
+  "KV compression / Qwen3-32B on one H100 / 39K→169K context" figure this page
+  once carried as measured is **format arithmetic** — bytes per token at 3.5
+  bits versus BF16 (`8 KV heads × 128`: 4096 B/layer dense → 960 B/layer
+  packed) — and **was never produced by a forward pass on any hardware**.
+- 🔵 **But "TurboQuant has never been measured on a GPU, on any model" — which
+  this bullet used to say — was itself false, and is corrected here.** Commit
+  **`4eba13905` (2026-04-06)** records *"55 tok/s with TurboQuant = 46% over
+  Candle baseline"* on a **B200**; the harness is `deploy/modal_b200.py`
+  (`gpu="B200"`, `MODEL="Qwen/Qwen3-32B"`,
+  `mistralrs serve --pa-cache-type turboquant`). Eight CUDA correctness fixes
+  landed against that hardware on 2026-04-02 (V-cache stride mismatch
+  `143b5ab20`; Q·K warp-reduction deadlock `fd0074792`). **Scope, stated
+  plainly:** b=1, one card, one model, head_dim 128, `Default` preset; the
+  "46%" is Arc's whole dedicated decode path versus Candle's and **isolates
+  nothing about TurboQuant**; context length and quality were never recorded,
+  and **no quality evaluation exists at any preset**. A narrow measurement is
+  still a measurement — do not relabel it "unmeasured" again.
+- **TurboQuant is the paged *default*** at head_dim 128 on a standard KV layout
+  (`defaults::PAGED_CACHE_TYPE`; `--pa-cache-type` has no clap default), and it
+  disables prefix caching while active. The **eager** path is the opt-in one
+  (`ARC_TURBOQUANT_KV=1`). **There is no head_dim-512 kernel — so DeepSeek V4
+  Flash does not use TurboQuant**, independent of the MLA fallback, which is
+  why the V4 numbers on this page were taken without it.
 - 🔴 **The fused head_dim-512 attention kernel does not exist.** There is no
   such kernel anywhere in the tree — only feasibility probes under
   `arc-tools/fa4/`. Nothing on this page depends on one, and no number here may

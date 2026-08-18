@@ -132,7 +132,7 @@ Backend registry: `code/06_foundation/sglang/python/sglang/srt/layers/attention/
 
 | Technique | Paper PDF | Code repo | Status |
 |---|---|---|---|
-| **TurboQuant (Arc's own)** | `02_turboquant_kv/turboquant_arc_iclr2026.pdf` | (your own private code; not in this dir) | ⚠ **in Arc, OFF by default — not "shipped"** (see note below) |
+| **TurboQuant (Arc's own)** | `02_turboquant_kv/turboquant_arc_iclr2026.pdf` | (your own private code; not in this dir) | ✓ **shipped — paged default at head_dim 128**; served on a B200; quality never evaluated (see note below) |
 | **QuaRot (rotation-based)** | `02_turboquant_kv/quarot_rotation_quantization.pdf` | `code/02_kv_compression/quarot/` | ✓ SPCL |
 | **SpinQuant** | `02_turboquant_kv/spinquant_learned_rotations.pdf` | `code/02_kv_compression/spinquant/` | ✓ Meta |
 | **KIVI (2-bit lossless)** | `02_turboquant_kv/kivi_2bit_kv_cache.pdf` | `code/02_kv_compression/kivi/` | ✓ Jy-yuan |
@@ -144,19 +144,27 @@ Backend registry: `code/06_foundation/sglang/python/sglang/srt/layers/attention/
 | **InfiniGen (KV offload)** | `12_long_context/infinigen_kv_offload.pdf` | `code/02_kv_compression/infinigen/` | ✓ SNU Comparch |
 | **DuoAttention (per-head)** | `16_underexploited/duo_attention.pdf` | `code/03_per_token_speed/duo_attention/` | ✓ MIT Han Lab |
 
-> ⚠️ **Correction — TurboQuant is not shipped in Arc.** An earlier revision of
-> this row read "✓ shipped in Arc". It is not on any default path:
+> 🔵 **Correction, twice over.** This row first read "✓ shipped in Arc"; a
+> 2026-08-17 revision over-corrected it to "not shipped — OFF by default — no
+> forward pass has ever been benchmarked". **The over-correction was wrong in
+> both halves** and is reverted here. What is actually true:
 >
-> - The eager KV path is **opt-in via `ARC_TURBOQUANT_KV=1`**, default **off**
->   (`mistralrs-core/src/kv_cache/mod.rs`).
-> - The paged kernel exists at **head_dim 128 only**. Off-envelope requests fall
->   back to `Auto` with a warning.
-> - There is **no kernel at head_dim 512**, so **DeepSeek V4 cannot use
->   TurboQuant at all**.
-> - **No TurboQuant forward pass has ever been benchmarked.** The compression
->   ratio sometimes quoted for it (bytes/token at 3.5 bits vs BF16) is **format
->   arithmetic, not a measurement** — it has never been produced by a forward
->   pass. Never present it as measured.
+> - **It is the paged default.** `defaults::PAGED_CACHE_TYPE` is
+>   `PagedCacheType::TurboQuant`; a standard-layout head_dim-128 model on CUDA
+>   takes it with no flag. It disables prefix caching while active.
+> - The **eager** KV path is the opt-in one — `ARC_TURBOQUANT_KV=1`, default
+>   **off** (`mistralrs-core/src/kv_cache/mod.rs`).
+> - The paged kernel is instantiated at **head_dim 128 only** on master.
+>   Off-envelope requests fall back to `Auto` with a warning. There is **no
+>   kernel at head_dim 512**, so **DeepSeek V4 does not use TurboQuant**.
+> - **A forward pass has been benchmarked:** `4eba13905` (2026-04-06), 55 tok/s
+>   with correct output on a **B200**, serving Qwen3-32B through
+>   `deploy/modal_b200.py`. Narrow — b=1, one card, one model, head_dim 128,
+>   `Default` preset — and the "46% over Candle baseline" alongside it compares
+>   whole decode paths, isolating nothing about TurboQuant.
+> - **Still unmeasured:** the compression ratio (bytes/token at 3.5 bits vs
+>   BF16 is **format arithmetic**, never produced by a forward pass — never
+>   present it as measured), and **quality at any preset**.
 >
 > Read every "✓" in the Status columns of this document as **"the reference code
 > is cloned and present here"**, which is what it means everywhere else in the
@@ -224,7 +232,7 @@ Backend registry: `code/06_foundation/sglang/python/sglang/srt/layers/attention/
 | Mixture of Depths (DeepMind) | DeepMind research, no public release | Reimplement from paper |
 | Differential Transformer | In `unilm/Diff-Transformer/` ✓ | (have it) |
 | YOCO | In `unilm/YOCO/` ✓ | (have it) |
-| TurboQuant (Arc's own) | Lives in Arc's private codebase | (own) — **off by default, head_dim 128 kernel only, never benchmarked**; see the correction under Domain 2 |
+| TurboQuant (Arc's own) | Lives in Arc's private codebase | (own) — **paged default at head_dim 128, benchmarked once on a B200; compression ratio and quality unmeasured**; see the correction under Domain 2 |
 | Apprentice Mode | Not yet validated by any paper | Killed from roadmap |
 
 ## Repo size summary

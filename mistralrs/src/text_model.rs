@@ -99,7 +99,11 @@ impl PagedAttentionMetaBuilder {
         self
     }
 
-    /// Set the paged cache data type. Defaults to `PagedCacheType::TurboQuant` (3.5-bit, lossless).
+    /// Set the paged cache data type. Defaults to `PagedCacheType::TurboQuant`
+    /// (K4/V3, 3.5-bit) — **not** to `Auto`. On a standard-layout head_dim-128
+    /// model that means quantized KV and no prefix caching unless you pass
+    /// `PagedCacheType::Auto` here. Quality under TurboQuant has never been
+    /// evaluated by Arc; it is not "lossless" on our evidence.
     ///
     /// Calling this marks the cache type as an explicit choice: a model the
     /// type cannot support will hard-error at load time instead of
