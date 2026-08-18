@@ -184,6 +184,62 @@ fn build_rs_consults_the_expected_count_file() {
     );
 }
 
+/// Every `.cuh` beneath the kernel root, at any depth.
+fn discover_kernel_headers() -> Vec<std::path::PathBuf> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "cuh") {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(
+        &manifest_dir().join(build_rs_str_const("KERNEL_GLOB_ROOT")),
+        &mut out,
+    );
+    out.sort();
+    out
+}
+
+/// An edited `.cuh` must invalidate cudaforge's per-kernel build cache.
+///
+/// cudaforge decides whether to recompile a `.cu` from that file's own content
+/// hash, its GPU arch, and the hash of the nvcc args — it never hashes headers.
+/// So editing a header used to leave every object "up to date" and the OLD code
+/// linked in, which means a benchmark measures code that is not the code that
+/// was edited. build.rs folds a hash of all headers into the nvcc args to force
+/// the rebuild; delete that and this goes red.
+#[test]
+fn build_rs_invalidates_the_build_cache_when_a_header_changes() {
+    assert!(
+        BUILD_RS.contains("-DARC_KERNEL_HEADERS_HASH="),
+        "build.rs no longer passes a header hash to nvcc. Without it, cudaforge's \
+         cache keys only on the `.cu`, so an edited `.cuh` leaves the OLD kernel \
+         compiled in and the build still reports success."
+    );
+    // Match the CALL, not the name: `fn kernel_headers_hash() -> ...` also
+    // contains the identifier, so `contains()` alone would stay green after the
+    // call site was deleted.
+    assert!(
+        BUILD_RS.contains("kernel_headers_hash();"),
+        "build.rs no longer CALLS `kernel_headers_hash()`; defining it is not enough"
+    );
+
+    // Non-vacuity: a hash over an empty set is constant and guards nothing.
+    let headers = discover_kernel_headers();
+    assert!(
+        !headers.is_empty(),
+        "no `.cuh` found under the kernel root -- the header guard would be vacuous"
+    );
+}
+
 /// `kernels/*/*.cu` does not recurse. A kernel at `kernels/a/b/c.cu` is
 /// silently skipped by the glob, which is the same class of bug one level down.
 #[test]

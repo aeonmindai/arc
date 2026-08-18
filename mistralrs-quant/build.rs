@@ -80,6 +80,65 @@ fn discover_kernel_sources() -> Vec<std::path::PathBuf> {
     found
 }
 
+/// FNV-1a, folded over bytes. Not cryptographic — this only needs to change
+/// when the header bytes change, which FNV-1a does reliably.
+#[cfg(feature = "cuda")]
+fn fnv1a(hash: &mut u64, bytes: &[u8]) {
+    for b in bytes {
+        *hash ^= *b as u64;
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+}
+
+/// Every `.cuh` beneath the kernel root, at any depth. Unlike the `.cu` glob,
+/// headers legitimately nest, so this recurses.
+#[cfg(feature = "cuda")]
+fn collect_kernel_headers(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_kernel_headers(&path, out);
+        } else if path.extension().is_some_and(|e| e == "cuh") {
+            out.push(path);
+        }
+    }
+}
+
+/// Hash the path and contents of every CUDA header under the kernel root.
+///
+/// THIS IS LOAD-BEARING FOR CORRECTNESS, not an optimisation. cudaforge's
+/// incremental cache decides whether to recompile a `.cu` from that file's own
+/// content hash, its GPU arch, and the hash of the nvcc args (`CacheEntry`,
+/// cudaforge 0.1.5 `src/hash.rs`) — it NEVER hashes headers, and its
+/// `collect_headers` helper is exported but never called. So editing e.g.
+/// `kernels/qtip/qtip_codebook.cuh` left every object file "up to date": the
+/// build printed `All kernels up-to-date, skipping compilation` and silently
+/// kept the OLD codebook linked in. A benchmark run after such a build measures
+/// code that is not the code you edited, and reports it as a result.
+///
+/// Folding this hash into the nvcc args changes `args_hash`, which makes
+/// `needs_rebuild` return true for every kernel whenever any header changes.
+/// Blunt (one header edit rebuilds all kernels) and deliberately so: a stale
+/// kernel is a wrong measurement, and headers change far less often than `.cu`s.
+#[cfg(feature = "cuda")]
+fn kernel_headers_hash() -> (usize, u64) {
+    let mut headers = Vec::new();
+    collect_kernel_headers(std::path::Path::new(KERNEL_GLOB_ROOT), &mut headers);
+    headers.sort();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for header in &headers {
+        fnv1a(&mut hash, header.to_string_lossy().as_bytes());
+        match std::fs::read(header) {
+            Ok(bytes) => fnv1a(&mut hash, &bytes),
+            Err(e) => panic!("cannot read CUDA header {}: {e}", header.display()),
+        }
+    }
+    (headers.len(), hash)
+}
+
 /// Read the expected count: first line that is neither blank nor a `#` comment.
 #[cfg(feature = "cuda")]
 fn read_expected_kernel_count() -> usize {
@@ -270,6 +329,27 @@ fn main() -> Result<(), String> {
         excluded_files.push("sm89_*.cu");
         excluded_files.push("sage_*.cu");
         builder = builder.exclude(&excluded_files);
+
+        // ── Make an edited `.cuh` actually rebuild the kernels that use it. ──
+        // cudaforge never hashes headers, so without this an edited header
+        // leaves every object "up to date" and the OLD code linked in — a
+        // silently wrong binary, and a benchmark run on it is a wrong number
+        // reported as a result. Folding the header hash into the nvcc args
+        // changes `args_hash`, which is one of the three things cudaforge's
+        // `needs_rebuild` compares. Guarded by
+        // `tests/cuda_kernel_build_guard.rs` — do not remove.
+        let (header_count, header_hash) = kernel_headers_hash();
+        if header_count == 0 {
+            panic!(
+                "no `.cuh` headers found under `{KERNEL_GLOB_ROOT}/` — the header-staleness \
+                 guard would be vacuous. If the headers really are gone, remove the guard \
+                 deliberately rather than letting it pass over an empty set."
+            );
+        }
+        builder = builder.arg(&format!("-DARC_KERNEL_HEADERS_HASH=0x{header_hash:016x}"));
+        println!(
+            "cargo:warning=mistralrs-quant: header guard OK -- {header_count} `.cuh` under `{KERNEL_GLOB_ROOT}/`, hash 0x{header_hash:016x}"
+        );
 
         // https://github.com/EricLBuehler/mistral.rs/issues/286
         if let Some(cuda_nvcc_flags_env) = CUDA_NVCC_FLAGS {
