@@ -132,12 +132,35 @@
 //           burning instructions — an independent confirmation of the Phase 1
 //           mechanism. (BREV 32 -> 5 confirms the reversal amortization.)
 //
-// ⏭️ NEXT LEVER, with evidence rather than a guess: IMAD = 115 per thread
-// iteration in variant 2, but only ~32 are the codeword's `state * mult`. The
-// other ~83 — 12% of all remaining instructions — are shared-memory ADDRESS
-// ARITHMETIC recomputed inside the kf/f loops. Hoisting the row base pointers
-// out and walking them with immediate offsets is the largest identified item
-// left, bigger than anything variant 2 touched.
+// 🔴 THE "ADDRESS ARITHMETIC" LEVER DOES NOT EXIST. It was written here as
+// the obvious next step — IMAD = 115 per thread iteration, only ~32 of them
+// the codeword's `state * mult`, so surely ~83 were smem address math the
+// kf/f loops recomputed. A variant 3 was built that hoists every shared base
+// pointer out of both loops and keeps the index math in 32 bits. It produces
+// **BYTE-IDENTICAL SASS to variant 2** — total 672, IMAD 115, every count the
+// same. nvcc had already hoisted the invariants and already narrowed the
+// shared-memory addressing; the `(size_t)` casts cost nothing.
+//
+// The IMAD breakdown says what those 115 really are:
+//     IMAD=54  IMAD.MOV.U32=31  IMAD.WIDE.U32=10  IMAD.SHL.U32=6
+//     IMAD.MOV=4  IMAD.WIDE=3  IMAD.U32=3  IMAD.IADD=2  IMAD.HI.U32=2
+// On Turing+ `IMAD.MOV` IS the register-move idiom, so **~35 of them are MOVs,
+// not arithmetic**, and only 13 are 64-bit WIDE (genuine global-pointer math,
+// which legitimately needs 64 bits). Of the ~59 true multiplies, ~32 are the
+// codeword. There was never a 12% address-arithmetic target to hit.
+//
+// ⏭️ WHAT IS ACTUALLY LEFT. Per thread iteration, 32 decodes cost ~160
+// essential instructions (IMAD + LOP3 + 2 cvt + FADD each) out of 672. The
+// rest is the window extraction (LOP3 86, SHF 49), the scale (FMUL 32), the
+// pack (F2FP 24), the fragment shuffling (~35 MOVs) and 22 smem accesses.
+// **The kernel is now close to its instruction-count floor FOR THIS FORMAT.**
+// The two remaining levers are therefore NOT kernel tuning:
+//   * drop the per-weight scale FMUL into the epilogue — one op per weight,
+//     but it changes rounding from bf16(w*s) to bf16(w)*s and would break the
+//     bit-identical gate that makes these variants checkable;
+//   * decode FEWER SYMBOLS PER WEIGHT — a V=4 trellis. That is a FORMAT
+//     change and a re-bake, i.e. the moat, not the kernel.
+// Any further large grouped-GEMM gain has to come from the byte format.
 //
 //   1. s_x row stride 64 -> QG_X_STRIDE elements (128 -> 144 B). At a 128 B
 //      stride the bank index (byte/4)%32 = (g*32 + ...)%32 is INDEPENDENT of
