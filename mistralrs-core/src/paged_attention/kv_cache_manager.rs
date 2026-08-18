@@ -10,9 +10,47 @@
 //! - `cache_blocks`: Cache newly-full blocks after computation.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
+
+use crate::kv_sharing::KvBlockLayout;
 
 use super::block_hash::BlockHash;
 use super::block_pool::BlockPool;
+use super::segment::{SegmentPlan, SegmentTable};
+use super::segmented_allocator::SegmentedAllocator;
+
+/// `ARC_SEGMENTED_KV=1` routes per-request block tracking through
+/// [`SegmentedAllocator`] instead of the flat `Vec<usize>` per request.
+///
+/// **Default OFF.** With it off, not one line of the legacy path changes: the
+/// segmented allocator is never constructed and `req_to_blocks` is the same
+/// `HashMap` it has always been.
+///
+/// With it on, a dense model runs on the *degenerate* one-`Dense`-segment
+/// table, which flattens to byte-identical block tables and slot mappings
+/// (pinned by `degenerate_path_matches_the_legacy_manager_step_for_step` in
+/// [`super::segmented_allocator`]). That is deliberate: it makes the new
+/// allocator measurable on real hardware with a model that already works,
+/// before any multi-region model depends on it.
+static SEGMENTED_KV: LazyLock<bool> = LazyLock::new(|| {
+    matches!(
+        std::env::var("ARC_SEGMENTED_KV").as_deref(),
+        Ok("1") | Ok("true")
+    )
+});
+
+/// Whether the segmented allocator is enabled for this process.
+pub fn segmented_kv_enabled() -> bool {
+    *SEGMENTED_KV
+}
+
+/// Per-request block tracking. Two shapes, one pool.
+enum Tracking {
+    /// One contiguous run per request — the shipped path.
+    Flat(HashMap<usize, RequestBlocks>),
+    /// An ordered list of runs per request.
+    Segmented(Box<SegmentedAllocator>),
+}
 
 /// Result of `get_computed_blocks`: cached block IDs and how many tokens they cover.
 #[derive(Debug)]
@@ -49,7 +87,14 @@ pub struct KVCacheManager {
     /// types (e.g., full + sliding window) use different group IDs per manager.
     kv_cache_group_ids: Vec<u32>,
     /// Per-request block tracking.
-    req_to_blocks: HashMap<usize, RequestBlocks>,
+    tracking: Tracking,
+    /// Byte layout charged to a request's blocks in segmented mode.
+    ///
+    /// Neutral by default — this type is not told the model's geometry at
+    /// construction, and inventing one would make the byte report wrong in a
+    /// way nobody could see. Callers that know the geometry set it with
+    /// [`KVCacheManager::set_kv_layout`].
+    kv_layout: KvBlockLayout,
 }
 
 impl KVCacheManager {
@@ -65,12 +110,94 @@ impl KVCacheManager {
         enable_caching: bool,
         kv_cache_group_ids: Vec<u32>,
     ) -> Self {
+        Self::with_segmentation(
+            num_gpu_blocks,
+            block_size,
+            enable_caching,
+            kv_cache_group_ids,
+            segmented_kv_enabled(),
+        )
+    }
+
+    /// As [`KVCacheManager::new`], with the segmented allocator forced on or
+    /// off instead of read from `ARC_SEGMENTED_KV`. Tests use this so they do
+    /// not depend on process environment.
+    pub fn with_segmentation(
+        num_gpu_blocks: usize,
+        block_size: usize,
+        enable_caching: bool,
+        kv_cache_group_ids: Vec<u32>,
+        segmented: bool,
+    ) -> Self {
+        // Announce the backing, once per manager. This is the only way an
+        // operator (or a validation script) can tell the segmented path
+        // actually engaged: without it, a binary built *without* this change
+        // silently ignores `ARC_SEGMENTED_KV`, runs the control twice, and
+        // reports a perfect 1.00x ratio with identical output — a fake pass
+        // that looks exactly like a real one. Assert on this line, not on the
+        // environment variable.
+        if segmented {
+            tracing::info!(
+                "KV cache backing: SEGMENTED allocator (ARC_SEGMENTED_KV). \
+                 Per-request block tracking is a list of runs; dense models \
+                 run the degenerate 1-segment case."
+            );
+        }
         Self {
             block_pool: BlockPool::new(num_gpu_blocks, enable_caching, block_size),
             block_size,
             enable_caching,
             kv_cache_group_ids,
-            req_to_blocks: HashMap::new(),
+            tracking: if segmented {
+                Tracking::Segmented(Box::new(SegmentedAllocator::new(block_size)))
+            } else {
+                Tracking::Flat(HashMap::new())
+            },
+            kv_layout: KvBlockLayout::default(),
+        }
+    }
+
+    /// Whether this manager is tracking requests as segment tables.
+    pub fn is_segmented(&self) -> bool {
+        matches!(self.tracking, Tracking::Segmented(_))
+    }
+
+    /// Set the byte layout charged to newly allocated blocks. Only affects
+    /// accounting, never allocation or addressing.
+    pub fn set_kv_layout(&mut self, layout: KvBlockLayout) {
+        self.kv_layout = layout;
+    }
+
+    /// The segment table for a request, when segmented. `None` in flat mode.
+    pub fn segment_table(&self, request_id: usize) -> Option<&SegmentTable> {
+        match &self.tracking {
+            Tracking::Flat(_) => None,
+            Tracking::Segmented(alloc) => alloc.table(request_id),
+        }
+    }
+
+    /// A kernel-ready multi-region read plan for `request_ids`.
+    ///
+    /// `stride` is the block-table row width; pass the same
+    /// `max_blocks_per_seq` the legacy path uses to get identical padding.
+    /// `None` in flat mode — a flat manager has nothing to say about regions.
+    pub fn segment_plan(
+        &self,
+        request_ids: &[usize],
+        stride: Option<usize>,
+    ) -> Option<SegmentPlan> {
+        match &self.tracking {
+            Tracking::Flat(_) => None,
+            Tracking::Segmented(alloc) => Some(alloc.plan(request_ids, stride)),
+        }
+    }
+
+    /// Device bytes held by all requests, each region at its own layout.
+    /// `None` in flat mode, which has no per-region layout to charge.
+    pub fn allocated_bytes(&self) -> Option<u64> {
+        match &self.tracking {
+            Tracking::Flat(_) => None,
+            Tracking::Segmented(alloc) => Some(alloc.bytes()),
         }
     }
 
@@ -189,7 +316,27 @@ impl KVCacheManager {
     ) -> Option<Vec<usize>> {
         let num_required_blocks = num_tokens.div_ceil(self.block_size);
 
-        if let Some(req) = self.req_to_blocks.get(&request_id) {
+        let layout = self.kv_layout;
+        let enable_caching = self.enable_caching;
+        let Self {
+            block_pool,
+            tracking,
+            ..
+        } = self;
+        let req_to_blocks = match tracking {
+            Tracking::Segmented(alloc) => {
+                return alloc.allocate_dense(
+                    block_pool,
+                    request_id,
+                    num_tokens,
+                    computed_blocks,
+                    layout,
+                );
+            }
+            Tracking::Flat(map) => map,
+        };
+
+        if let Some(req) = req_to_blocks.get(&request_id) {
             // Running request — just need to allocate additional blocks
             let num_existing = req.block_ids.len();
             let num_new_blocks = num_required_blocks.saturating_sub(num_existing);
@@ -198,8 +345,8 @@ impl KVCacheManager {
                 return Some(Vec::new());
             }
 
-            let new_block_ids = self.block_pool.get_new_blocks(num_new_blocks)?;
-            self.req_to_blocks
+            let new_block_ids = block_pool.get_new_blocks(num_new_blocks)?;
+            req_to_blocks
                 .get_mut(&request_id)
                 .unwrap()
                 .block_ids
@@ -214,28 +361,28 @@ impl KVCacheManager {
         // Count evictable blocks among computed blocks (blocks with ref_cnt == 0
         // that are in the free list — touching them will remove them from the
         // free list, so we need to account for this in the capacity check).
-        let num_evictable = if self.enable_caching {
+        let num_evictable = if enable_caching {
             computed_blocks
                 .iter()
-                .filter(|&&id| self.block_pool.block_ref_cnt(id) == 0)
+                .filter(|&&id| block_pool.block_ref_cnt(id) == 0)
                 .count()
         } else {
             0
         };
 
         let total_needed = num_new_blocks + num_evictable;
-        if total_needed > self.block_pool.num_free_blocks() {
+        if total_needed > block_pool.num_free_blocks() {
             return None;
         }
 
         // Touch the computed blocks (increment ref_cnt, remove from free list)
-        if !computed_blocks.is_empty() && self.enable_caching {
-            self.block_pool.touch(computed_blocks);
+        if !computed_blocks.is_empty() && enable_caching {
+            block_pool.touch(computed_blocks);
         }
 
         // Allocate new blocks
         let new_block_ids = if num_new_blocks > 0 {
-            self.block_pool
+            block_pool
                 .get_new_blocks(num_new_blocks)
                 .expect("Should have enough blocks after capacity check")
         } else {
@@ -247,7 +394,7 @@ impl KVCacheManager {
         all_block_ids.extend_from_slice(computed_blocks);
         all_block_ids.extend_from_slice(&new_block_ids);
 
-        self.req_to_blocks.insert(
+        req_to_blocks.insert(
             request_id,
             RequestBlocks {
                 block_ids: all_block_ids,
@@ -263,10 +410,20 @@ impl KVCacheManager {
     /// Blocks are freed in reverse order so that tail blocks (most specific)
     /// are evicted first when the free list is used for LRU eviction.
     pub fn free(&mut self, request_id: usize) {
-        if let Some(req) = self.req_to_blocks.remove(&request_id) {
-            // Free in reverse order for LRU eviction priority
-            let reversed: Vec<usize> = req.block_ids.into_iter().rev().collect();
-            self.block_pool.free_blocks(&reversed);
+        let Self {
+            block_pool,
+            tracking,
+            ..
+        } = self;
+        match tracking {
+            Tracking::Segmented(alloc) => alloc.free(block_pool, request_id),
+            Tracking::Flat(map) => {
+                if let Some(req) = map.remove(&request_id) {
+                    // Free in reverse order for LRU eviction priority
+                    let reversed: Vec<usize> = req.block_ids.into_iter().rev().collect();
+                    block_pool.free_blocks(&reversed);
+                }
+            }
         }
     }
 
@@ -277,8 +434,23 @@ impl KVCacheManager {
     pub fn trim_request_to_num_tokens(&mut self, request_id: usize, num_tokens: usize) {
         let num_required_blocks = num_tokens.div_ceil(self.block_size);
 
+        let Self {
+            block_pool,
+            tracking,
+            ..
+        } = self;
+        let map = match tracking {
+            // A trim is a rollback of the one Dense region. Per-request, so
+            // one sequence trimming cannot shorten another's allocation.
+            Tracking::Segmented(alloc) => {
+                alloc.rollback(block_pool, request_id, 0, num_tokens);
+                return;
+            }
+            Tracking::Flat(map) => map,
+        };
+
         let mut removed_blocks = {
-            let Some(req) = self.req_to_blocks.get_mut(&request_id) else {
+            let Some(req) = map.get_mut(&request_id) else {
                 return;
             };
 
@@ -297,7 +469,7 @@ impl KVCacheManager {
 
         // Free in reverse order for LRU eviction priority.
         removed_blocks.reverse();
-        self.block_pool.free_blocks(&removed_blocks);
+        block_pool.free_blocks(&removed_blocks);
     }
 
     /// Cache newly-full blocks after tokens are computed.
@@ -319,19 +491,42 @@ impl KVCacheManager {
             return;
         }
 
-        let req = match self.req_to_blocks.get_mut(&request_id) {
+        let block_size = self.block_size;
+        let group_ids = self.kv_cache_group_ids.clone();
+        let Self {
+            block_pool,
+            tracking,
+            ..
+        } = self;
+        let map = match tracking {
+            Tracking::Segmented(alloc) => {
+                // Segment 0 is the Dense region; its group id is 0, which is
+                // what `kv_cache_group_ids` is for every single-group model.
+                alloc.cache_region_blocks(
+                    block_pool,
+                    request_id,
+                    0,
+                    block_hashes,
+                    num_computed_tokens,
+                );
+                return;
+            }
+            Tracking::Flat(map) => map,
+        };
+
+        let req = match map.get_mut(&request_id) {
             Some(r) => r,
             None => return,
         };
 
-        let num_full_blocks = num_computed_tokens / self.block_size;
+        let num_full_blocks = num_computed_tokens / block_size;
         if req.num_cached_blocks >= num_full_blocks {
             return;
         }
 
         // Cache each full block for each group ID
-        for &group_id in &self.kv_cache_group_ids {
-            self.block_pool.cache_full_blocks(
+        for group_id in group_ids {
+            block_pool.cache_full_blocks(
                 &req.block_ids,
                 block_hashes,
                 req.num_cached_blocks,
@@ -343,32 +538,61 @@ impl KVCacheManager {
         req.num_cached_blocks = num_full_blocks;
     }
 
-    /// Get the block IDs allocated for a request.
+    /// Get the block IDs allocated for a request, as one contiguous run.
+    ///
+    /// In segmented mode this is only meaningful for a **degenerate** table
+    /// (one `Dense` region anchored at token 0). A multi-region request has no
+    /// single run, and concatenating its segments would be read by the caller
+    /// as one — silently gathering the compressed region as if it were more
+    /// window. So this returns `None` rather than lie, and callers still on
+    /// the one-run contract must move to
+    /// [`KVCacheManager::segment_plan`].
     pub fn get_block_ids(&self, request_id: usize) -> Option<&[usize]> {
-        self.req_to_blocks
-            .get(&request_id)
-            .map(|r| r.block_ids.as_slice())
+        match &self.tracking {
+            Tracking::Flat(map) => map.get(&request_id).map(|r| r.block_ids.as_slice()),
+            Tracking::Segmented(alloc) => {
+                let table = alloc.table(request_id)?;
+                if !table.is_degenerate() {
+                    return None;
+                }
+                Some(table.segments()[0].block_ids.as_slice())
+            }
+        }
     }
 
-    /// Get the number of blocks allocated for a request.
+    /// Get the number of blocks allocated for a request, across all regions.
     pub fn num_blocks_for_request(&self, request_id: usize) -> usize {
-        self.req_to_blocks
-            .get(&request_id)
-            .map(|r| r.block_ids.len())
-            .unwrap_or(0)
+        match &self.tracking {
+            Tracking::Flat(map) => map.get(&request_id).map(|r| r.block_ids.len()).unwrap_or(0),
+            Tracking::Segmented(alloc) => alloc
+                .table(request_id)
+                .map(|t| t.total_blocks())
+                .unwrap_or(0),
+        }
     }
 
     /// Check if a request has allocated blocks.
     pub fn has_request(&self, request_id: usize) -> bool {
-        self.req_to_blocks.contains_key(&request_id)
+        match &self.tracking {
+            Tracking::Flat(map) => map.contains_key(&request_id),
+            Tracking::Segmented(alloc) => alloc.has_request(request_id),
+        }
     }
 
-    /// Get the number of cached blocks for a request.
+    /// Get the number of cached blocks for a request. In segmented mode this
+    /// reports the `Dense` region, matching what the flat path counts.
     pub fn num_cached_blocks(&self, request_id: usize) -> usize {
-        self.req_to_blocks
-            .get(&request_id)
-            .map(|r| r.num_cached_blocks)
-            .unwrap_or(0)
+        match &self.tracking {
+            Tracking::Flat(map) => map
+                .get(&request_id)
+                .map(|r| r.num_cached_blocks)
+                .unwrap_or(0),
+            Tracking::Segmented(alloc) => alloc
+                .table(request_id)
+                .and_then(|t| t.segment(0))
+                .map(|s| s.num_cached_blocks)
+                .unwrap_or(0),
+        }
     }
 
     /// Reset the prefix cache. Only succeeds if all blocks are free.
@@ -391,7 +615,13 @@ impl KVCacheManager {
         start_token: usize,
         num_tokens: usize,
     ) -> Option<Vec<i64>> {
-        let req = self.req_to_blocks.get(&request_id)?;
+        let map = match &self.tracking {
+            Tracking::Segmented(alloc) => {
+                return alloc.slot_mapping(request_id, 0, start_token, num_tokens)
+            }
+            Tracking::Flat(map) => map,
+        };
+        let req = map.get(&request_id)?;
         let mut slots = Vec::with_capacity(num_tokens);
 
         for token_pos in start_token..start_token + num_tokens {
@@ -413,12 +643,16 @@ impl KVCacheManager {
     /// Build the block table for a request (for the paged attention kernel).
     ///
     /// Returns the block IDs in sequence order, padded to `max_blocks` with 0.
+    ///
+    /// In segmented mode this is the degenerate case only, for the same reason
+    /// [`KVCacheManager::get_block_ids`] is — a one-run block table cannot
+    /// address a union of regions.
     pub fn get_block_table(&self, request_id: usize, max_blocks: usize) -> Option<Vec<i32>> {
-        let req = self.req_to_blocks.get(&request_id)?;
+        let block_ids = self.get_block_ids(request_id)?;
         let mut table = Vec::with_capacity(max_blocks);
 
         #[allow(clippy::cast_possible_truncation)]
-        for &block_id in &req.block_ids {
+        for &block_id in block_ids {
             table.push(block_id as i32);
         }
 
@@ -635,6 +869,84 @@ mod tests {
         let computed = mgr.get_computed_blocks(&hashes, 8);
         assert_eq!(computed.num_computed_tokens, 4);
         assert_eq!(computed.block_ids.len(), 1);
+    }
+
+    /// Same trace, both backings, timed.
+    ///
+    /// ⚠️ **This measures host-side allocator bookkeeping and NOTHING ELSE.**
+    /// It is not a throughput result, it is not a GPU result, and it must
+    /// never be reported as validation of the segmented path (D14). Its only
+    /// job is to catch the segmented backing becoming *algorithmically* worse
+    /// than the flat one — a `Vec` scan where there was a `HashMap`, an
+    /// allocation per decode step, that class of thing.
+    ///
+    /// Run: `cargo test -p mistralrs-core --lib --release
+    /// segmented_backing_allocator_overhead -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing benchmark; run explicitly"]
+    #[allow(clippy::cast_precision_loss)] // reporting a ratio, not computing one
+    fn segmented_backing_allocator_overhead() {
+        use std::time::Instant;
+
+        const SEQS: usize = 64;
+        const PROMPT: usize = 512;
+        const DECODE: usize = 256;
+        const BLOCK: usize = 16;
+        const BLOCKS: usize = 1 << 16;
+
+        fn drive(segmented: bool) -> (u128, usize) {
+            let mut mgr =
+                KVCacheManager::with_segmentation(BLOCKS, BLOCK, true, vec![0], segmented);
+            let t0 = Instant::now();
+            let mut sink = 0usize;
+            for id in 0..SEQS {
+                mgr.allocate_slots(id, PROMPT, &[]).expect("prompt fits");
+            }
+            for step in 1..=DECODE {
+                for id in 0..SEQS {
+                    mgr.allocate_slots(id, PROMPT + step, &[])
+                        .expect("decode fits");
+                    sink += mgr.num_blocks_for_request(id);
+                    if let Some(t) = mgr.get_block_table(id, 64) {
+                        sink += t.len();
+                    }
+                    if let Some(s) = mgr.get_slot_mapping(id, PROMPT + step - 1, 1) {
+                        sink += s.len();
+                    }
+                }
+            }
+            for id in 0..SEQS {
+                mgr.free(id);
+            }
+            (t0.elapsed().as_nanos(), sink)
+        }
+
+        // Warm both, then measure, so allocator warmup is not attributed to
+        // whichever ran first.
+        let _ = drive(false);
+        let _ = drive(true);
+        let (flat_ns, a) = drive(false);
+        let (seg_ns, b) = drive(true);
+        assert_eq!(a, b, "both backings must do the same amount of work");
+
+        let ops = (SEQS * DECODE) as u128;
+        println!(
+            "host-side allocator, {SEQS} seqs x {DECODE} decode steps (NOT a GPU result):\n  \
+             flat      {flat_ns:>10} ns total, {:>6} ns/step-seq\n  \
+             segmented {seg_ns:>10} ns total, {:>6} ns/step-seq\n  \
+             ratio     {:.2}x",
+            flat_ns / ops,
+            seg_ns / ops,
+            seg_ns as f64 / flat_ns as f64
+        );
+        // Deliberately loose: this exists to catch a complexity regression,
+        // not to police jitter on a shared CI box.
+        assert!(
+            seg_ns < flat_ns.saturating_mul(4),
+            "segmented backing is {:.2}x the flat one — that is a complexity \
+             change, not noise",
+            seg_ns as f64 / flat_ns as f64
+        );
     }
 
     #[test]

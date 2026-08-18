@@ -171,12 +171,25 @@ impl<Backer: FcfsBacker> BucketingManager<Backer> for FixedBucketingManager {
         // Now, get the sequences with the smallest sequence lengths, and allow them to catch up.
         let mut seq_buckets: HashMap<BucketKey, Vec<Sequence>> = HashMap::new();
         let mut seq_priorities: HashMap<BucketKey, f64> = HashMap::new();
+        let ragged_decode = crate::kv_cache::ragged_decode_supported();
         for seq in running {
             // The cache length, not the token count — see
             // `Sequence::cache_bucket_len`. Identical partition for every
             // non-speculative path; the one that keeps a batched MTP cohort
             // whole when its accept lengths differ.
-            let len = seq.cache_bucket_len();
+            //
+            // 🔑 Pinned to 0 for DECODE when this pipeline's cache can carry
+            // per-sequence lengths, so a cohort that differs only in length
+            // forms a single bucket and nothing is preempted.
+            // `clone_in_cache` then front-aligns it and `CausalMasker` masks
+            // each row's dead prefix. PROMPTS keep the exact-length key: a
+            // prefill batch is right-padded and its `cu_seqlens` are built from
+            // those padded widths, which is a different mechanism.
+            let len = if ragged_decode && !seq.is_prompt() {
+                0
+            } else {
+                seq.cache_bucket_len()
+            };
             match seq_buckets.get_mut(&(
                 len,
                 seq.images().is_some() && seq.is_prompt(),
@@ -508,6 +521,90 @@ mod tests {
     fn bucket_of(len: usize, n: usize, id_base: usize) -> (BucketKey, Vec<Sequence>) {
         let seqs = (0..n).map(|i| seq_of_len(id_base + i, len)).collect();
         ((len, false, 0), seqs)
+    }
+
+    /// 🔑 The dense equivalent of the paged regression: eight sequences at
+    /// eight DIFFERENT cache lengths must all decode in one step once the
+    /// pipeline's cache is known to carry per-sequence lengths.
+    ///
+    /// Before the `ragged_decode_supported` gate this asserts FALSE by
+    /// construction — `select_running_bucket` runs exactly one bucket, and the
+    /// coalescence override cannot rescue a spread cohort: for B=8 at 8
+    /// distinct lengths with gap ~64, `(8-1)*64 = 448 > 1*256`, so it is
+    /// refused and the split is permanent. That is the measured
+    /// `16 running, 80 waiting` shape at B=128.
+    ///
+    /// The flag is restored at the end so this cannot leak into other tests in
+    /// the same binary — it is process-global by design (the scheduler never
+    /// sees the model).
+    #[test]
+    fn decode_runs_the_whole_ragged_cohort_when_the_cache_can_carry_it() {
+        use crate::kv_cache::ragged_decode_test_override as flag;
+        const N: usize = 8;
+        let lens = [50usize, 114, 179, 243, 307, 371, 436, 500];
+        let logger = IntervalLogger::new(Duration::from_secs(3600), None);
+
+        let width_with = |on: bool| {
+            flag::with(on, || {
+                let mut sched: DefaultScheduler<VecDeque<Sequence>> = DefaultScheduler::new(
+                    DefaultSchedulerMethod::Fixed(NonZeroUsize::new(128).unwrap()),
+                );
+                for (i, l) in lens.iter().enumerate() {
+                    sched.add_seq(seq_of_len(i, *l));
+                }
+                DefaultScheduler::schedule(&mut sched, &logger)
+                    .completion
+                    .into_vec()
+                    .len()
+            })
+        };
+
+        let off_width = width_with(false);
+        let on_width = width_with(true);
+
+        // Teeth: if the OFF arm already ran the whole cohort, the fixture is not
+        // ragged and the ON arm proves nothing.
+        assert!(
+            off_width < N,
+            "fixture is not ragged: the OFF arm already scheduled {off_width}/{N}, so this \
+             test cannot detect the change"
+        );
+        assert_eq!(
+            on_width, N,
+            "a ragged decode cohort must run whole; got {on_width}/{N}"
+        );
+    }
+
+    /// A PROMPT batch keeps the exact-length key even with the flag on. Prefill
+    /// is right-padded and its `cu_seqlens` are built from those padded widths
+    /// — a different mechanism from the decode one, and not covered by the
+    /// front-alignment this flag enables.
+    #[test]
+    fn prompts_keep_their_exact_length_buckets() {
+        use crate::kv_cache::ragged_decode_test_override as flag;
+        let logger = IntervalLogger::new(Duration::from_secs(3600), None);
+
+        let width = flag::with(true, || {
+            let mut sched: DefaultScheduler<VecDeque<Sequence>> = DefaultScheduler::new(
+                DefaultSchedulerMethod::Fixed(NonZeroUsize::new(128).unwrap()),
+            );
+            for (i, l) in [37usize, 91, 155].iter().enumerate() {
+                // Waiting, not running: `schedule` promotes the waiting queue to
+                // `RunningPrompt` itself, and `add_seq` routes on `is_running()`.
+                let seq = seq_of_len(i, *l);
+                seq.set_state(SequenceState::Waiting);
+                sched.add_seq(seq);
+            }
+            DefaultScheduler::schedule(&mut sched, &logger)
+                .prompt
+                .into_vec()
+                .len()
+        });
+
+        assert_eq!(
+            width, 1,
+            "three prompts of different lengths must still be bucketed apart; got {width}"
+        );
     }
 
     /// THE regression test.

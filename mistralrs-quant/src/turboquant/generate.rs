@@ -22,12 +22,15 @@
 //!     f_d(x) ∝ (1 - x²)^((d-3)/2),      x ∈ [-1, 1]
 //! ```
 //!
-//! i.e. `(x+1)/2 ~ Beta((d-1)/2, (d-1)/2)`. The module doc on
-//! [`super::codebook`] says "Beta(d/2, d/2)"; that is off by one half in both
-//! shape parameters. The exponent above is the one that reproduces the shipped
-//! tables — see `generator_reproduces_shipped_tables` in this file, which pins
-//! `mse_per_coord` to the shipped constants to 1e-9 for all nine
-//! `(dim, bits)` pairs. `(d-2)/2` and `(d-1)/2` were both tried and both miss.
+//! i.e. `(x+1)/2 ~ Beta((d-1)/2, (d-1)/2)`. The exponent above is the one that
+//! reproduces the shipped tables — see `generator_reproduces_shipped_tables` in
+//! this file, which pins `mse_per_coord` to the shipped constants to 1e-9 for
+//! all nine `(dim, bits)` pairs. `(d-2)/2` and `(d-1)/2` were both tried as the
+//! exponent and both miss.
+//!
+//! (Until 2026-08-17 the module doc on [`super::codebook`] read "Beta(d/2, d/2)",
+//! off by one half in both shape parameters. The tables were always correct; only
+//! the prose was wrong. Both modules now state the same density.)
 //!
 //! # The algorithm
 //!

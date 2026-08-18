@@ -41,11 +41,13 @@ pub struct PagedAttentionOptions {
     #[arg(long = "pa-block-size")]
     pub block_size: Option<usize>,
 
-    /// KV cache quantization type: turboquant (K4/V3, 3.5-bit, lossless, default),
+    /// KV cache quantization type: turboquant (K4/V3, 3.5-bit, experimental),
     /// turboquant-3 (K3/V3), turboquant-aggressive (K3/V2), auto, f8e4m3.
-    /// If unset, defaults to turboquant with auto-fallback to `auto` for
-    /// models TurboQuant cannot support; setting it explicitly makes an
-    /// unsupported model a hard error instead.
+    /// If unset, defaults to turboquant with auto-fallback to `auto` for models
+    /// TurboQuant cannot support — which is every MLA model and every head_dim
+    /// other than 128, so most models get `auto`. Setting it explicitly makes
+    /// an unsupported model a hard error instead. TurboQuant has no measured
+    /// serving run behind it; quality is not established.
     #[arg(long = "pa-cache-type", value_parser = parse_cache_type)]
     #[serde(default)]
     pub cache_type: Option<PagedCacheType>,

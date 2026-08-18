@@ -1,7 +1,21 @@
 //! Arc — A high-performance LLM inference engine.
 //!
-//! Arc extends mistral.rs with TurboQuant KV cache compression, delivering
-//! 2.2x memory reduction at zero quality loss (3.5-bit default, K4/V3).
+//! **Parent system: ArcServe/SDK** (see `memory/mission/TAXONOMY.md`). This crate
+//! is the Rust façade — it re-exports `mistralrs_core`, `mistralrs_quant` and
+//! `arc_turbo`, and hosts the Tier-A research modules listed below.
+//!
+//! Arc extends mistral.rs with QTIP 2-bit trellis weight quantization (the
+//! `qtip2b` rung is what Arc serves), the V4 architecture, a radix KV sharing
+//! tree, and a GPU-autonomous decode path.
+//!
+//! ⚠️ **TurboQuant KV compression is experimental and off by default.** The
+//! eager path is opt-in via `ARC_TURBOQUANT_KV=1`; the paged kernel exists at
+//! head_dim 128 only; there is no kernel at head_dim 512, so DeepSeek V4 cannot
+//! use it. No TurboQuant serving measurement exists — any compression ratio
+//! quoted for it is format arithmetic, not a measured forward pass.
+//!
+//! ⚠️ Several modules here are **Tier A**: standalone, tested, and NOT wired
+//! into the engine loop (`sarathi`, `expert_affinity`, `magicdec`, `yoco`).
 //!
 //! # Architecture
 //!

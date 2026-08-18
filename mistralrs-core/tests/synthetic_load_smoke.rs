@@ -773,8 +773,13 @@ fn v4_mtp_draft_depends_on_the_target_hidden_state_not_only_the_token() {
         .take()
         .expect("an armed MTP kit must capture the target's hidden states");
     assert_eq!(
-        start_pos, 0,
+        start_pos.row(0),
+        Some(0),
         "the capture must be tagged with the absolute position of its first row"
+    );
+    assert!(
+        start_pos.describes(1),
+        "a one-row forward's capture must describe one row"
     );
     assert_eq!(
         captured.dims(),
@@ -1647,6 +1652,14 @@ mod v4_compress {
     /// and a corrupted compressed row barely moves the logits, which is
     /// exactly the sensitivity a compressor test must not be run at.
     pub fn config_json_with_window(sliding_window: usize) -> String {
+        config_json_with(sliding_window, MAX_POSITION_EMBEDDINGS)
+    }
+
+    /// Same fixture with both the window and the position ceiling chosen by
+    /// the caller. The ceiling is what `NormalCache`/`XsRollingCache` size
+    /// themselves from, so a length sweep has to raise it or it measures the
+    /// fixture's own cap instead of the model.
+    pub fn config_json_with(sliding_window: usize, max_position_embeddings: usize) -> String {
         serde_json::json!({
             "architectures": ["DeepseekV4ForCausalLM"],
             "vocab_size": VOCAB_SIZE,
@@ -1665,7 +1678,7 @@ mod v4_compress {
             "moe_layer_freq": 1,
             "first_k_dense_replace": 0,
             "hidden_act": "silu",
-            "max_position_embeddings": MAX_POSITION_EMBEDDINGS,
+            "max_position_embeddings": max_position_embeddings,
             "rms_norm_eps": RMS_NORM_EPS,
             "tie_word_embeddings": false,
             "rope_theta": ROPE_THETA,
@@ -1695,6 +1708,20 @@ fn v4c_load() -> Box<dyn NormalModel + Send + Sync> {
 }
 
 fn v4c_load_with_window(sliding_window: usize) -> Box<dyn NormalModel + Send + Sync> {
+    v4c_load_from_config(&v4_compress::config_json_with_window(sliding_window))
+}
+
+fn v4c_load_with(
+    sliding_window: usize,
+    max_position_embeddings: usize,
+) -> Box<dyn NormalModel + Send + Sync> {
+    v4c_load_from_config(&v4_compress::config_json_with(
+        sliding_window,
+        max_position_embeddings,
+    ))
+}
+
+fn v4c_load_from_config(config: &str) -> Box<dyn NormalModel + Send + Sync> {
     let device = Device::Cpu;
     let tensors =
         v4_compress::weights(&device).expect("V4 compress fixture construction must not fail");
@@ -1702,7 +1729,7 @@ fn v4c_load_with_window(sliding_window: usize) -> Box<dyn NormalModel + Send + S
     let loader = DeepSeekV4Loader;
     loader
         .load(
-            &v4_compress::config_json_with_window(sliding_window),
+            config,
             vb,
             make_metadata(&device),
             AttentionImplementation::Eager,
@@ -1999,6 +2026,53 @@ fn v4c_solo_run(
 /// and the ratio-128 (HCA) boundary DURING DECODE — every one of them a row
 /// the rolling state must build from its retained tail plus the previous
 /// group, not from raw history it no longer has.
+/// **CPU unit test — not a GPU claim.** Prefill and then decode through the
+/// real V4 dispatch at lengths that bracket every length-dependent threshold
+/// the V4 attention path has: the 128-token sliding window, the CSA (ratio 4)
+/// and HCA (ratio 128) compressed-block boundaries, and
+/// `NormalCache::CACHE_GROW_SIZE` (512) — the point where both the KV cache and
+/// the `XsRollingCache` row buffer must reallocate mid-sequence.
+///
+/// Session-8 measured V4 serving a 9-word and a 198-word prompt and then dying
+/// (connection refused) on a ~1,055-word one. This is the CPU half of that
+/// question: does the *model* path carry a length threshold, independent of the
+/// box? A failure here is a real defect and names it; a pass narrows the
+/// hardware death to allocation/throughput rather than shape or masking, which
+/// is the difference between "fix the model" and "fix the box".
+#[test]
+fn v4_long_prompt_prefill_and_decode_sweep() {
+    let device = Device::Cpu;
+    // 4096-token ceiling so the sweep measures the model, not the fixture cap.
+    let mut model = v4c_load_with(v4_compress::SLIDING_WINDOW, 4096);
+    // 127/129 bracket the sliding window; 511/513 bracket CACHE_GROW_SIZE;
+    // 1400 is the ~1,055-word prompt that killed the server (~1.33 tok/word).
+    for &t in &[127usize, 129, 511, 513, 1400] {
+        v4c_reset(&mut model);
+        let ids: Vec<u32> = (0..t)
+            .map(|i| (i % v4_compress::VOCAB_SIZE) as u32)
+            .collect();
+        let ids_t = Tensor::from_vec(ids, (1, t), &device).unwrap();
+        let logits = v4c_step(&*model, &ids_t, 0)
+            .unwrap_or_else(|e| panic!("V4 prefill of {t} tokens failed: {e}"));
+        assert_finite(&logits, &format!("v4 prefill T={t}"));
+        // Decode past the prefill: here the cached-K read-back, the rolling
+        // compressor state and the absolute-position arithmetic all have to
+        // agree about a context far longer than the window.
+        for step in 0..4 {
+            let tok = Tensor::from_vec(
+                vec![((t + step) % v4_compress::VOCAB_SIZE) as u32],
+                (1, 1),
+                &device,
+            )
+            .unwrap();
+            let logits = v4c_step(&*model, &tok, t + step).unwrap_or_else(|e| {
+                panic!("V4 decode step {step} after a {t}-token prefill failed: {e}")
+            });
+            assert_finite(&logits, &format!("v4 decode T={t} step={step}"));
+        }
+    }
+}
+
 #[test]
 fn v4_rolling_xs_decode_matches_whole_history_prefill() {
     let device = Device::Cpu;

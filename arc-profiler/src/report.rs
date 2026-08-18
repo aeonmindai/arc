@@ -96,6 +96,24 @@ pub struct Node {
 
     pub geom: Geometry,
 
+    /// Name of the ancestor that is a direct child of the root — on this engine
+    /// `prompt` or `decode`. `None` for the root itself.
+    ///
+    /// # Why this is a field and not something you parse out of `path`
+    ///
+    /// The step tree splits prefill and decode into separate subtrees on
+    /// purpose, so **every span name below the split exists twice**. Selecting a
+    /// span by NAME therefore has two answers, and the obvious
+    /// `nodes.iter().find(|n| n.name == "mla_attn")` returns whichever comes
+    /// first — the prefill node, which has `calls == 0` in a decode-only window.
+    /// A consumer then reads zero for attention and concludes the kernel is
+    /// free.
+    ///
+    /// That has happened. Use [`Profile::resolve_in`] rather than matching on
+    /// `name`; [`Profile::resolve`] refuses outright when a name is ambiguous.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+
     /// `false` when the code path exists but is provably not taken in this
     /// configuration. A zero from an unreached node and a zero from a fast
     /// node are different answers and must not look the same.
@@ -207,11 +225,158 @@ pub struct Profile {
     pub reconciliation: Reconciliation,
 }
 
+/// What a node's numbers actually mean — the three ways a zero happens, kept
+/// apart.
+///
+/// Two independent chains hand-rolled this distinction in one night before
+/// either found it expressed in the schema, so it is now one call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// `reachable == false`: the code path exists and is provably not taken in
+    /// this configuration. Its zero is a structural fact.
+    Unreachable,
+    /// Reachable, registered, but never entered in the recorded window — e.g.
+    /// the `prompt` subtree in a window that contained only decode steps. Its
+    /// zero is missing data, **not** a measurement of zero, and it is the shape
+    /// that masquerades as "this is free".
+    NotEnteredThisWindow,
+    /// Entered, but every call landed below the timer's resolution.
+    BelowTimerFloor,
+    /// Entered and timed.
+    Measured,
+}
+
+impl Node {
+    /// Which of the three zeros — or a real measurement — this node carries.
+    ///
+    /// Prefer this over testing `calls == 0` or `wall_ns == 0` by hand: those
+    /// two tests answer different questions and neither answers "did this run".
+    pub fn verdict(&self) -> Verdict {
+        if !self.reachable {
+            Verdict::Unreachable
+        } else if self.calls == 0 {
+            Verdict::NotEnteredThisWindow
+        } else if self.wall_ns == 0 && self.device_ns == 0 {
+            Verdict::BelowTimerFloor
+        } else {
+            Verdict::Measured
+        }
+    }
+}
+
+/// A span name that does not identify one node.
+#[derive(Debug, Clone)]
+pub struct Ambiguity {
+    pub name: String,
+    /// `(branch, path, calls)` for every node carrying the name.
+    pub candidates: Vec<(Option<String>, String, u64)>,
+}
+
+impl std::fmt::Display for Ambiguity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.candidates.is_empty() {
+            return write!(f, "no span named `{}` in this profile", self.name);
+        }
+        writeln!(
+            f,
+            "span name `{}` does not identify one node — it appears in {} places:",
+            self.name,
+            self.candidates.len()
+        )?;
+        for (branch, path, calls) in &self.candidates {
+            writeln!(
+                f,
+                "  [{}] {}  calls={}",
+                branch.as_deref().unwrap_or("-"),
+                path,
+                calls
+            )?;
+        }
+        write!(
+            f,
+            "Select by full path (`Profile::node`) or by branch \
+             (`Profile::resolve_in(\"decode\", ..)`). Matching on `name` alone returns \
+             whichever node was registered first, which is the prefill one — and its \
+             `calls` is 0 in a decode-only window."
+        )
+    }
+}
+
+impl std::error::Error for Ambiguity {}
+
 impl Profile {
     /// Look a node up by its dotted path. Used by every test in this crate and
     /// by anyone reading a profile programmatically.
     pub fn node(&self, path: &str) -> Option<&Node> {
         self.nodes.iter().find(|n| n.path == path)
+    }
+
+    /// Every node carrying `name`, in registration order.
+    ///
+    /// Returns a `Vec` rather than an `Option` because the honest answer to
+    /// "where is `mla_attn`" is usually *two* places.
+    pub fn nodes_named(&self, name: &str) -> Vec<&Node> {
+        self.nodes.iter().filter(|n| n.name == name).collect()
+    }
+
+    /// The one node named `name` — or an error naming every candidate.
+    ///
+    /// This is the call that refuses to guess. `resolve("mla_attn")` on a
+    /// profile containing both a prefill and a decode step **fails**, and the
+    /// message tells the caller which branch to ask for and what each one's
+    /// `calls` is.
+    pub fn resolve(&self, name: &str) -> Result<&Node, Ambiguity> {
+        let found = self.nodes_named(name);
+        match found.len() {
+            1 => Ok(found[0]),
+            _ => Err(self.ambiguity(name, &found)),
+        }
+    }
+
+    /// The one node named `name` under the top-level branch `branch`
+    /// (`"decode"` / `"prompt"` on this engine).
+    pub fn resolve_in(&self, branch: &str, name: &str) -> Result<&Node, Ambiguity> {
+        let found: Vec<&Node> = self
+            .nodes
+            .iter()
+            .filter(|n| n.name == name && n.branch.as_deref() == Some(branch))
+            .collect();
+        match found.len() {
+            1 => Ok(found[0]),
+            _ => Err(self.ambiguity(name, &found)),
+        }
+    }
+
+    fn ambiguity(&self, name: &str, found: &[&Node]) -> Ambiguity {
+        let from = if found.is_empty() {
+            self.nodes_named(name)
+        } else {
+            found.to_vec()
+        };
+        Ambiguity {
+            name: name.to_string(),
+            candidates: from
+                .iter()
+                .map(|n| (n.branch.clone(), n.path.clone(), n.calls))
+                .collect(),
+        }
+    }
+
+    /// Span names that appear on more than one node, with their paths.
+    ///
+    /// Surfaced in `run.notes` so a reader is told the hazard exists before
+    /// they write a name match, rather than after they publish a zero.
+    pub fn duplicate_names(&self) -> Vec<(String, Vec<String>)> {
+        let mut seen: Vec<(String, Vec<String>)> = Vec::new();
+        for n in &self.nodes {
+            match seen.iter_mut().find(|(name, _)| *name == n.name) {
+                Some((_, paths)) => paths.push(n.path.clone()),
+                None => seen.push((n.name.clone(), vec![n.path.clone()])),
+            }
+        }
+        seen.retain(|(_, paths)| paths.len() > 1);
+        seen
     }
 
     pub fn root(&self) -> Option<&Node> {

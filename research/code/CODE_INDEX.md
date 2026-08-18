@@ -89,6 +89,21 @@ Backend registry: `code/06_foundation/sglang/python/sglang/srt/layers/attention/
 | `mistralrs-core/src/models/glm_moe.rs` (covers GLM-4.5+, GLM-5.x) | `sglang/python/sglang/srt/models/glm4_moe.py` | 1.5 weeks |
 | `mistralrs-quant/src/dsv4/` (CSA + HCA) | `sglang/python/sglang/srt/layers/attention/dsv4/*.py` | 2-3 weeks (TileLang kernel → port to Triton/CUDA or emit CPU reference for Tier A) |
 
+> ⚠️ **What Arc actually runs for V4 attention today — read before assuming the
+> kernel row above is done.**
+>
+> - **There is no fused head_dim-512 attention kernel in the tree.** Only
+>   feasibility probes exist. Do not describe one as shipped.
+> - **V4 cannot use FlashAttention.** Sinks are set on **all 43 layers**, and the
+>   fused flash-with-sinks kernels support head_dim ∈ **{64, 80, 96, 112, 128,
+>   192, 256}** only (`mistralrs-core/src/attention/backends/sinks.rs:79`). V4's
+>   head_dim is **512**, so it runs the **unfused matmul + `softmax_with_sinks`**
+>   path.
+> - **Expert parallelism is not implemented** — `Comm::Dummy`, world_size 1.
+>
+> Also **not in the tree, and never to be described as shipped**: LDLQ, EoRA, a
+> KV segment allocator, and the xKV cross-layer pool.
+
 ---
 
 ## Domain 1: Weight compression (`01_weight_compression/`)
@@ -117,7 +132,7 @@ Backend registry: `code/06_foundation/sglang/python/sglang/srt/layers/attention/
 
 | Technique | Paper PDF | Code repo | Status |
 |---|---|---|---|
-| **TurboQuant (Arc's own)** | `02_turboquant_kv/turboquant_arc_iclr2026.pdf` | (your own private code; not in this dir) | ✓ shipped in Arc |
+| **TurboQuant (Arc's own)** | `02_turboquant_kv/turboquant_arc_iclr2026.pdf` | (your own private code; not in this dir) | ⚠ **in Arc, OFF by default — not "shipped"** (see note below) |
 | **QuaRot (rotation-based)** | `02_turboquant_kv/quarot_rotation_quantization.pdf` | `code/02_kv_compression/quarot/` | ✓ SPCL |
 | **SpinQuant** | `02_turboquant_kv/spinquant_learned_rotations.pdf` | `code/02_kv_compression/spinquant/` | ✓ Meta |
 | **KIVI (2-bit lossless)** | `02_turboquant_kv/kivi_2bit_kv_cache.pdf` | `code/02_kv_compression/kivi/` | ✓ Jy-yuan |
@@ -128,6 +143,24 @@ Backend registry: `code/06_foundation/sglang/python/sglang/srt/layers/attention/
 | **Quest (query-aware KV)** | `12_long_context/quest_query_aware_kv_selection.pdf` | `code/02_kv_compression/quest/` | ✓ MIT Han Lab |
 | **InfiniGen (KV offload)** | `12_long_context/infinigen_kv_offload.pdf` | `code/02_kv_compression/infinigen/` | ✓ SNU Comparch |
 | **DuoAttention (per-head)** | `16_underexploited/duo_attention.pdf` | `code/03_per_token_speed/duo_attention/` | ✓ MIT Han Lab |
+
+> ⚠️ **Correction — TurboQuant is not shipped in Arc.** An earlier revision of
+> this row read "✓ shipped in Arc". It is not on any default path:
+>
+> - The eager KV path is **opt-in via `ARC_TURBOQUANT_KV=1`**, default **off**
+>   (`mistralrs-core/src/kv_cache/mod.rs`).
+> - The paged kernel exists at **head_dim 128 only**. Off-envelope requests fall
+>   back to `Auto` with a warning.
+> - There is **no kernel at head_dim 512**, so **DeepSeek V4 cannot use
+>   TurboQuant at all**.
+> - **No TurboQuant forward pass has ever been benchmarked.** The compression
+>   ratio sometimes quoted for it (bytes/token at 3.5 bits vs BF16) is **format
+>   arithmetic, not a measurement** — it has never been produced by a forward
+>   pass. Never present it as measured.
+>
+> Read every "✓" in the Status columns of this document as **"the reference code
+> is cloned and present here"**, which is what it means everywhere else in the
+> file. It is **not** a statement that Arc ships the technique.
 
 ## Domain 3: Per-token speed (`03_per_token_speed/`)
 
@@ -191,7 +224,7 @@ Backend registry: `code/06_foundation/sglang/python/sglang/srt/layers/attention/
 | Mixture of Depths (DeepMind) | DeepMind research, no public release | Reimplement from paper |
 | Differential Transformer | In `unilm/Diff-Transformer/` ✓ | (have it) |
 | YOCO | In `unilm/YOCO/` ✓ | (have it) |
-| TurboQuant (Arc's own) | Lives in Arc's private codebase | (own) |
+| TurboQuant (Arc's own) | Lives in Arc's private codebase | (own) — **off by default, head_dim 128 kernel only, never benchmarked**; see the correction under Domain 2 |
 | Apprentice Mode | Not yet validated by any paper | Killed from roadmap |
 
 ## Repo size summary
