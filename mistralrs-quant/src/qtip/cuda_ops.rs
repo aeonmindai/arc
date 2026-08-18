@@ -1988,6 +1988,10 @@ pub(crate) fn grouped_gemm_2b_cuda(
         );
     }
 
+    // Kernel variant is resolved PER LAUNCH (never memoized): a mode switch
+    // that silently fails to take is what voided the last grouped microbench.
+    let variant = super::grouped::grouped_variant();
+
     macro_rules! grouped_dtype {
         ($T:ty, $launch:expr) => {{
             let (x_ptr, _x_guard) =
@@ -1996,6 +2000,7 @@ pub(crate) fn grouped_gemm_2b_cuda(
             // routing (out-of-range router ids) are never written.
             let out_buf = dev.alloc_zeros::<$T>(n_pairs * n_rows)?;
             let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
+            super::grouped::note_grouped_launch(variant);
             unsafe {
                 $launch(
                     blocks_ptr as *const _,
@@ -2012,6 +2017,7 @@ pub(crate) fn grouped_gemm_2b_cuda(
                     num_symbols as i32,
                     max_m_tiles as i32,
                     mcg_mult,
+                    variant,
                     dev.cuda_stream().cu_stream(),
                 );
             }

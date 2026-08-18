@@ -729,3 +729,141 @@ fn selftest_ratio_discriminates_a_launch_timer_from_an_event_timer() {
         "a launch-timing profiler must fail the same threshold"
     );
 }
+
+// ── The name-collision trap ────────────────────────────────────────────────
+//
+// A profile carries TWO `mla_attn` nodes, one per step branch. A consumer that
+// selects by name gets the prefill one — `calls == 0` in a decode-only window —
+// and reads zero for the busiest kernel in the engine. That happened to a
+// downstream chain, and the guard that caught it reported "unreached node" when
+// the truth was "wrong node". These are different diagnoses with different
+// fixes, so both are pinned here.
+
+/// Build the shape that causes it: `step` -> {`prompt`, `decode`}, each with the
+/// same leaf name, only the decode side entered.
+fn two_branch_profile() -> Profile {
+    // Step 1 enters the PREFILL branch, so `step.prompt.mla_attn` is registered
+    // first — the registration order that makes the naive name match return it.
+    {
+        let _step = step_scope("step");
+        let _p = span("prompt");
+        let _a = span("mla_attn");
+    }
+    // Every later step is decode-only, which is the ordinary steady-state
+    // window: the prompt subtree exists in the tree and is never entered again.
+    for _ in 0..3 {
+        let _step = step_scope("step");
+        let _d = span("decode");
+        let _a = span("mla_attn");
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    snapshot()
+}
+
+#[test]
+fn a_span_name_below_the_branch_split_does_not_identify_one_node() {
+    let _g = guard();
+    let p = two_branch_profile();
+    let named = p.nodes_named("mla_attn");
+    assert_eq!(
+        named.len(),
+        2,
+        "the fixture must reproduce the collision, not paper over it"
+    );
+    // The naive selection returns the PREFILL node — this is the bug, asserted
+    // so a registration-order change cannot quietly hide it.
+    assert_eq!(
+        named[0].branch.as_deref(),
+        Some("prompt"),
+        "the first name match is the prefill copy, which is the trap"
+    );
+    let decode_calls = p.resolve_in("decode", "mla_attn").unwrap().calls;
+    assert!(
+        decode_calls > named[0].calls,
+        "the decode node is the one carrying the work ({decode_calls} vs {})",
+        named[0].calls
+    );
+}
+
+#[test]
+fn resolve_refuses_an_ambiguous_name_and_names_every_candidate() {
+    let _g = guard();
+    let p = two_branch_profile();
+    let err = p
+        .resolve("mla_attn")
+        .expect_err("an ambiguous name must not resolve to a guess");
+    assert_eq!(err.candidates.len(), 2);
+    let msg = err.to_string();
+    // The message has to be actionable: which branches, and what each one's
+    // call count is, so the reader can see the zero is the wrong node.
+    assert!(msg.contains("decode"), "message names the branches: {msg}");
+    assert!(msg.contains("prompt"), "message names the branches: {msg}");
+    assert!(msg.contains("calls="), "message carries call counts: {msg}");
+    assert!(
+        msg.contains("resolve_in"),
+        "message says what to do instead"
+    );
+}
+
+#[test]
+fn resolve_in_returns_the_branch_asked_for() {
+    let _g = guard();
+    let p = two_branch_profile();
+    let dec = p.resolve_in("decode", "mla_attn").expect("decode side");
+    assert!(dec.calls > 0, "the decode node is the one that ran");
+    assert_eq!(dec.branch.as_deref(), Some("decode"));
+    let pre = p.resolve_in("prompt", "mla_attn").expect("prompt side");
+    assert!(
+        pre.calls < dec.calls,
+        "prefill ran once, decode ran every step"
+    );
+    assert_eq!(pre.branch.as_deref(), Some("prompt"));
+}
+
+#[test]
+fn the_three_zeros_are_different_answers() {
+    let _g = guard();
+    // A node that is registered and never entered — the exact shape of the
+    // prompt subtree in a decode-only window.
+    {
+        let _step = step_scope("step");
+        let _d = span("decode");
+    }
+    mark_unreachable(
+        "paged_attention",
+        "supports_paged_attention() is false",
+        "mod.rs:1",
+    );
+    let p = snapshot();
+    let never = p
+        .nodes
+        .iter()
+        .find(|n| !n.reachable)
+        .expect("an unreachable node was declared");
+    assert_eq!(never.verdict(), Verdict::Unreachable);
+    let ran = p.resolve_in("decode", "decode").ok();
+    assert!(ran.is_none() || ran.unwrap().verdict() != Verdict::Unreachable);
+}
+
+#[test]
+fn the_report_warns_about_colliding_names_before_anyone_reads_one() {
+    let _g = guard();
+    let p = two_branch_profile();
+    assert!(
+        p.run
+            .notes
+            .iter()
+            .any(|n| n.contains("more than one node") && n.contains("branch")),
+        "a profile with colliding names must say so in its notes: {:?}",
+        p.run.notes
+    );
+}
+
+#[test]
+fn the_root_has_no_branch_and_a_branch_node_names_itself() {
+    let _g = guard();
+    let p = two_branch_profile();
+    assert_eq!(p.root().expect("root").branch, None);
+    let d = p.node("step.decode").expect("decode branch node");
+    assert_eq!(d.branch.as_deref(), Some("decode"));
+}

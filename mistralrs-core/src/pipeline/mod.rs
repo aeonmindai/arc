@@ -102,7 +102,8 @@ pub use mtp_pipeline::{
     mtp_acceptance, mtp_acceptance_by_batch, mtp_acceptance_marker, mtp_acceptance_markers,
     mtp_load_depth, mtp_uqff_bake, record_mtp_batch_step, record_mtp_step, reset_mtp_acceptance,
     set_mtp_load_depth, set_mtp_uqff_bake, try_wrap_pipeline_with_mtp, verify_proposed,
-    MtpAcceptance, MtpDecodeKit, MtpHiddenCapture, MtpSpeculativePipeline, VerifyResult,
+    CaptureOffsets, MtpAcceptance, MtpDecodeKit, MtpHiddenCapture, MtpSpeculativePipeline,
+    VerifyResult,
 };
 /// The MTP rejection rollback, reachable from the V4 model's own tests so the
 /// cache it truncates (K/V **and** `XsRolling` entries) is the real one.
@@ -547,7 +548,20 @@ fn wrap_f32_logits(
         // Allocate F32 tensor and D2D copy (no BF16→F32 cast needed)
         let fresh = Tensor::zeros(shape, DType::F32, device)?;
         let fresh_ptr = arc_cuda_graph::tensor_device_ptr(&fresh)?;
-        cudaMemcpy(fresh_ptr as *mut _, ptr as *const _, elem_count * 4, 3);
+        let rc = cudaMemcpy(fresh_ptr as *mut _, ptr as *const _, elem_count * 4, 3);
+        // Discarding this return is how a 4 MB over-read of `logits_f32` became
+        // someone else's error message two decode steps later: the runtime
+        // latches the error and the next `cudaGetLastError()` anywhere in the
+        // process reports it against an unrelated kernel. The *fix* for the
+        // over-read is that `ensure_buffers` now grows, so `batch_size` never
+        // exceeds the allocated row capacity; this check is here so that if it
+        // ever does again, it is named here rather than blamed elsewhere.
+        if rc != 0 {
+            candle_core::bail!(
+                "wrap_f32_logits: cudaMemcpy D2D of {elem_count} f32 \
+                 (batch_size={batch_size}, vocab_size={vocab_size}) failed with cudaError {rc}"
+            );
+        }
         Ok(fresh)
     }
 }
@@ -707,6 +721,41 @@ pub trait Pipeline:
             return None;
         }
         let batch_size = token_ids.len();
+
+        // REFUSE batch > 1. The dedicated decode path is structurally batch-1
+        // only: every projection in `decode_forward` (qkv, o_proj, gate, up,
+        // down, lm_head) is a GEMV whose launcher takes no batch dimension --
+        // e.g. `arc_launch_gemv_bf16_f32out(weight, input, output, M, K,
+        // stream)` grids over output rows, not over sequences. Only the
+        // elementwise and attention kernels ever saw `bs`. So at batch > 1,
+        // sequences 1..N-1 read uninitialised rows of every activation buffer
+        // and sample from garbage logits.
+        //
+        // MEASURED on H200 (qwen05, paged, 2026-08-18), same binary, one
+        // variable -- the env var below:
+        //   path ON : B=8 -> 71/512 tokens, B=32 -> 95/2048
+        //   path OFF: B=8 -> 512/512,       B=32 -> 2048/2048
+        // 71 = 64 + 7*1 and 95 = 64 + 31*1: sequence 0 emits its full 64
+        // tokens, every other sequence emits exactly one and stops. Two batch
+        // sizes agreeing on 64+(B-1) is a structural signature -- a bandwidth
+        // or scheduling problem cannot produce it; only "one sequence computed,
+        // the rest garbage" can.
+        //
+        // Falling through to Candle is proven-good: that is exactly what the
+        // OFF arm above measures. This guard is the correctness fix; batching
+        // the GEMVs is the performance work it makes safe to attempt.
+        if batch_size > 1 {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "Dedicated decode path refused for batch_size={batch_size}: its GEMVs are \
+                     batch-1 only. Falling back to the Candle paged path (correct, slower). \
+                     This refusal is permanent for multi-sequence batches."
+                );
+            }
+            return None;
+        }
 
         // Extract KV cache pointers from CacheEngine
         let kv_cache = cache_engine.get_kv_cache();
