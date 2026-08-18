@@ -267,6 +267,20 @@ impl DeviceMapSetting {
                     ));
                 }
 
+                // Enable NVLink peer-to-peer between every pair of CUDA
+                // devices this map touches.
+                //
+                // Neither candle nor cudarc ever calls `cuCtxEnablePeerAccess`,
+                // and without it "peer-to-peer copies are staged through the
+                // host, which entails a performance penalty" (CUDA Programming
+                // Guide, Multi-GPU Systems). Every cross-device
+                // `Tensor::to_device` — including the hidden-state handoff the
+                // existing layer-wise pipeline map already performs at each
+                // boundary, and every expert-parallel exchange — pays that
+                // penalty until this runs. Non-fatal by construction: a pair
+                // that cannot peer is reported, not an error.
+                report_peer_access(&combined);
+
                 Ok(Box::new(LayerDeviceMapper {
                     mappings: combined,
                     nm_device: device.clone(),
@@ -276,6 +290,45 @@ impl DeviceMapSetting {
                 candle_core::bail!(".into_mapper does not work on Auto device map, convert it to a Map with DeviceMappedModelLoader::get_device_layers")
             }
         }
+    }
+}
+
+/// Distinct devices in `mappings`, in first-seen order.
+fn unique_devices(mappings: &[Device]) -> Vec<Device> {
+    let mut out: Vec<Device> = Vec::new();
+    for d in mappings {
+        if !out.iter().any(|seen| seen.same_device(d)) {
+            out.push(d.clone());
+        }
+    }
+    out
+}
+
+/// Turn on CUDA peer access across the mapped devices and log the outcome.
+///
+/// Deliberately swallows failures into a warning: peer access is a
+/// *performance* property, and a fabric that cannot do it (PCIe without ACS
+/// relaxation, mismatched IOMMU) must still serve. What it must NOT do is stay
+/// silent — a run that is quietly staging every cross-GPU copy through host
+/// RAM looks identical to a healthy one except in the numbers, which is
+/// exactly the class of failure this repo keeps paying for.
+fn report_peer_access(mappings: &[Device]) {
+    let devices = unique_devices(mappings);
+    if devices.iter().filter(|d| d.is_cuda()).count() < 2 {
+        return;
+    }
+    match mistralrs_quant::enable_peer_access(&devices) {
+        Ok(report) => {
+            if report.all_peered() {
+                once_log_info(report.summary());
+            } else {
+                tracing::warn!("{}", report.summary());
+            }
+        }
+        Err(e) => tracing::warn!(
+            "Could not enable CUDA peer access ({e}); cross-GPU copies will be staged \
+             through host RAM."
+        ),
     }
 }
 

@@ -8,13 +8,14 @@
 
 use candle_core::{DType, Device, Result, Tensor, D};
 use mistralrs_quant::{
-    FusedExperts, MatMul, PackedExperts, QuantMethod, QuantizedConfig, ShardedVarBuilder,
-    SumAllReduce,
+    ExpertSubset, FusedExperts, MatMul, PackedExperts, QuantMethod, QuantizedConfig,
+    ShardedVarBuilder, SumAllReduce,
 };
 use std::sync::Arc;
 
 use crate::cuda::moe;
 use crate::layers::Activation;
+use crate::moe::expert_parallel::ExpertParallelPlan;
 use crate::moe::shard;
 
 /// Apply the trained DeepSeek V4 SwiGLU clamp to the **pre-activation** gate
@@ -148,6 +149,18 @@ pub struct MoEExperts {
     swiglu_limit: Option<f32>,
     all_reduce: SumAllReduce,
     world_size: usize,
+    /// This rank's expert-parallel view. `ExpertParallelPlan::single` (the
+    /// default) is the pre-EP behaviour: `localize` is the identity, so the
+    /// forward is bit-for-bit unchanged.
+    ep: ExpertParallelPlan,
+    /// Set when the expert weights arrive from a UQFF artifact, which holds
+    /// **every** expert: the slice cannot happen at construction, so it must be
+    /// applied after `load_from_artifacts`. While this is `Some`, the layer
+    /// holds all `E` experts while claiming to own `E / ep_size`, so
+    /// [`Self::forward`] refuses to run rather than silently placing the whole
+    /// expert set on every card — a capacity bug that would otherwise show up
+    /// only as "EP bought nothing".
+    pending_expert_subset: Option<ExpertSubset>,
 }
 
 enum MoEExpertsBackendImpl {
@@ -179,10 +192,38 @@ impl MoEExperts {
             backend,
             quantization_config,
             act,
+            &ExpertParallelPlan::single(cfg.num_experts),
+        )
+    }
+
+    /// Create MoEExperts with automatic backend selection, sharding the routed
+    /// experts across the ranks described by `ep`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_expert_parallel(
+        cfg: &MoEExpertsConfig,
+        vb: ShardedVarBuilder,
+        layer_device: Device,
+        comm: &Arc<mistralrs_quant::Comm>,
+        loading_isq: bool,
+        quantization_config: &Option<QuantizedConfig>,
+        act: Activation,
+        ep: &ExpertParallelPlan,
+    ) -> Result<Self> {
+        let backend = MoEExpertsBackend::select(&layer_device, loading_isq, quantization_config);
+        Self::new_with_backend(
+            cfg,
+            vb,
+            layer_device,
+            comm,
+            backend,
+            quantization_config,
+            act,
+            ep,
         )
     }
 
     /// Create MoEExperts with explicit backend selection
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_backend(
         cfg: &MoEExpertsConfig,
         vb: ShardedVarBuilder,
@@ -191,18 +232,39 @@ impl MoEExperts {
         backend: MoEExpertsBackend,
         quantization_config: &Option<QuantizedConfig>,
         act: Activation,
+        ep: &ExpertParallelPlan,
     ) -> Result<Self> {
+        if ep.placement().num_experts() != cfg.num_experts {
+            candle_core::bail!(
+                "expert parallelism: plan covers {} experts but this layer has {}",
+                ep.placement().num_experts(),
+                cfg.num_experts
+            );
+        }
+        let subset = if ep.is_enabled() {
+            ExpertSubset::owned(cfg.num_experts, ep.owned_experts().to_vec())?
+        } else {
+            ExpertSubset::all(cfg.num_experts)
+        };
+
         let experts_vb = vb.pp("experts").set_device(layer_device.clone());
 
         // Detect format: stacked has "gate_up_proj", per-expert has "0.gate_proj"
         let is_stacked = experts_vb.contains_tensor("gate_up_proj");
+        // The UQFF path builds placeholder layers here and fills them in after
+        // `load_from_artifacts`, so the expert slice has to be applied later.
+        let deferred_slice = ep.is_enabled() && mistralrs_quant::loading_from_uqff();
 
         let backend_impl = match backend {
             MoEExpertsBackend::Fused => {
                 if is_stacked {
-                    MoEExpertsBackendImpl::Fused(Self::load_fused_stacked(cfg, experts_vb, comm)?)
+                    MoEExpertsBackendImpl::Fused(Self::load_fused_stacked(
+                        cfg, experts_vb, comm, &subset,
+                    )?)
                 } else {
-                    MoEExpertsBackendImpl::Fused(Self::load_fused_standard(cfg, experts_vb, comm)?)
+                    MoEExpertsBackendImpl::Fused(Self::load_fused_standard(
+                        cfg, experts_vb, comm, &subset,
+                    )?)
                 }
             }
             MoEExpertsBackend::Fast => {
@@ -211,12 +273,14 @@ impl MoEExperts {
                         cfg,
                         vb,
                         quantization_config,
+                        &subset,
                     )?)
                 } else {
                     MoEExpertsBackendImpl::Fast(Self::load_fast_standard(
                         cfg,
                         vb,
                         quantization_config,
+                        &subset,
                     )?)
                 }
             }
@@ -225,6 +289,7 @@ impl MoEExperts {
                 experts_vb,
                 comm,
                 quantization_config,
+                &subset,
             )?),
         };
 
@@ -235,6 +300,8 @@ impl MoEExperts {
             swiglu_limit: cfg.swiglu_limit,
             all_reduce: SumAllReduce::new(comm),
             world_size: comm.world_size(),
+            ep: ep.clone(),
+            pending_expert_subset: deferred_slice.then_some(subset),
         })
     }
 
@@ -243,28 +310,36 @@ impl MoEExperts {
         cfg: &MoEExpertsConfig,
         experts_vb: ShardedVarBuilder,
         comm: &Arc<mistralrs_quant::Comm>,
+        subset: &ExpertSubset,
     ) -> Result<FusedExpertsWeights> {
-        let num_experts = cfg.num_experts;
-        let mut gate_up_experts = Vec::with_capacity(num_experts);
-        let mut down_experts = Vec::with_capacity(num_experts);
+        // EP and TP split this layer on different axes and stage 1 does not
+        // combine them: under EP each rank owns whole experts, so the
+        // intermediate dimension stays whole. See `PackedExperts::new`.
+        let (tp_world, tp_rank) = if subset.is_all() {
+            (comm.world_size(), comm.rank())
+        } else {
+            (1, 0)
+        };
+        let mut gate_up_experts = Vec::with_capacity(subset.len());
+        let mut down_experts = Vec::with_capacity(subset.len());
 
-        for i in 0..num_experts {
+        for i in subset.ids().iter().copied() {
             let expert_vb = experts_vb.pp(i.to_string());
             // n x k format
             let gate_expert = expert_vb.pp("gate_proj").get_with_hints(
                 (cfg.moe_intermediate_size, cfg.hidden_size),
                 "weight",
-                shard(0, comm.rank(), comm.world_size()),
+                shard(0, tp_rank, tp_world),
             )?;
             let up_expert = expert_vb.pp("up_proj").get_with_hints(
                 (cfg.moe_intermediate_size, cfg.hidden_size),
                 "weight",
-                shard(0, comm.rank(), comm.world_size()),
+                shard(0, tp_rank, tp_world),
             )?;
             let down_expert = expert_vb.pp("down_proj").get_with_hints(
                 (cfg.hidden_size, cfg.moe_intermediate_size),
                 "weight",
-                shard(1, comm.rank(), comm.world_size()),
+                shard(1, tp_rank, tp_world),
             )?;
             // Pack gate_proj and up_proj
             let gate_up_expert = Tensor::cat(&[&gate_expert, &up_expert], 0)?;
@@ -290,8 +365,15 @@ impl MoEExperts {
         cfg: &MoEExpertsConfig,
         experts_vb: ShardedVarBuilder,
         comm: &Arc<mistralrs_quant::Comm>,
+        subset: &ExpertSubset,
     ) -> Result<FusedExpertsWeights> {
         let num_experts = cfg.num_experts;
+        // See `load_fused_standard`: EP owns whole experts, so TP is off.
+        let (tp_world, tp_rank) = if subset.is_all() {
+            (comm.world_size(), comm.rank())
+        } else {
+            (1, 0)
+        };
 
         // Stacked format has two conventions:
         // Convention A: [num_experts, hidden, inter*2] (CUDA kernel format)
@@ -301,14 +383,14 @@ impl MoEExperts {
             .get_with_hints(
                 (num_experts, cfg.hidden_size, cfg.moe_intermediate_size * 2),
                 "gate_up_proj",
-                shard(2, comm.rank(), comm.world_size()),
+                shard(2, tp_rank, tp_world),
             )
             .or_else(|_| {
                 experts_vb
                     .get_with_hints(
                         (num_experts, cfg.moe_intermediate_size * 2, cfg.hidden_size),
                         "gate_up_proj",
-                        shard(1, comm.rank(), comm.world_size()),
+                        shard(1, tp_rank, tp_world),
                     )
                     .and_then(|t| t.transpose(1, 2)?.contiguous())
             })?;
@@ -317,17 +399,21 @@ impl MoEExperts {
             .get_with_hints(
                 (num_experts, cfg.moe_intermediate_size, cfg.hidden_size),
                 "down_proj",
-                shard(1, comm.rank(), comm.world_size()),
+                shard(1, tp_rank, tp_world),
             )
             .or_else(|_| {
                 experts_vb
                     .get_with_hints(
                         (num_experts, cfg.hidden_size, cfg.moe_intermediate_size),
                         "down_proj",
-                        shard(2, comm.rank(), comm.world_size()),
+                        shard(2, tp_rank, tp_world),
                     )
                     .and_then(|t| t.transpose(1, 2)?.contiguous())
             })?;
+
+        // Expert parallelism: keep only this rank's slice of the expert axis.
+        let gate_up_w = subset.select_dim0(&gate_up_w)?;
+        let down_w = subset.select_dim0(&down_w)?;
 
         let w_size_n = gate_up_w.dim(2)? / 2;
 
@@ -344,6 +430,7 @@ impl MoEExperts {
         cfg: &MoEExpertsConfig,
         vb: ShardedVarBuilder,
         quantization_config: &Option<QuantizedConfig>,
+        subset: &ExpertSubset,
     ) -> Result<FastExpertsWeights> {
         let FusedExperts {
             fused_gate_proj,
@@ -352,7 +439,7 @@ impl MoEExperts {
         } = FusedExperts::new(
             cfg.hidden_size,
             cfg.moe_intermediate_size,
-            cfg.num_experts,
+            subset,
             quantization_config,
             vb,
         )?;
@@ -369,6 +456,7 @@ impl MoEExperts {
         cfg: &MoEExpertsConfig,
         vb: ShardedVarBuilder,
         quantization_config: &Option<QuantizedConfig>,
+        subset: &ExpertSubset,
     ) -> Result<FastExpertsWeights> {
         // FusedExperts auto-detects stacked format
         let FusedExperts {
@@ -378,7 +466,7 @@ impl MoEExperts {
         } = FusedExperts::new(
             cfg.hidden_size,
             cfg.moe_intermediate_size,
-            cfg.num_experts,
+            subset,
             quantization_config,
             vb,
         )?;
@@ -396,9 +484,10 @@ impl MoEExperts {
         experts_vb: ShardedVarBuilder,
         comm: &Arc<mistralrs_quant::Comm>,
         quantization_config: &Option<QuantizedConfig>,
+        subset: &ExpertSubset,
     ) -> Result<SlowExpertsWeights> {
         let experts = PackedExperts::new(
-            cfg.num_experts,
+            subset,
             cfg.hidden_size,
             cfg.moe_intermediate_size,
             quantization_config,
@@ -454,6 +543,23 @@ impl MoEExperts {
         // Prefill = processing multiple tokens; Decode = single token generation
         let is_prefill = seq_len > 1;
 
+        if let Some(pending) = &self.pending_expert_subset {
+            candle_core::bail!(
+                "expert parallelism: this layer still holds all {} experts — the UQFF expert \
+                 slice down to {} was never applied. Running would put the whole expert set on \
+                 every rank, so EP would silently buy nothing.",
+                pending.global(),
+                pending.len()
+            );
+        }
+
+        // Expert parallelism: rewrite the global expert ids to this rank's
+        // local ids and zero the weight of every slot this rank does not own.
+        // The unowned slots stay in place (pinned to local expert 0) so every
+        // rank runs identical shapes and the combine below is a plain sum.
+        let (local_ids, topk_weights) = self.ep.localize(topk_ids, &topk_weights)?;
+        let topk_ids = &local_ids;
+
         // Exactly one of the three runs; the other two are declared unreachable
         // so the report shows which expert backend this build actually took
         // instead of leaving three silent zeros.
@@ -483,13 +589,40 @@ impl MoEExperts {
             }
         };
 
-        // Apply all-reduce for tensor parallelism
+        // The combine. Under tensor parallelism this sums the intermediate
+        // shards; under expert parallelism it sums the per-rank partials
+        // `y_r = Σ_{j owned by r} w[t,j] · Expert_{g[t,j]}(x[t])`. Both are the
+        // same collective on the same communicator.
         if self.world_size > 1 {
             let _s = arc_profiler::device_span("experts.all_reduce");
             ys = self.all_reduce.sum_all_reduce(&ys)?;
         }
 
         ys.reshape((b_size, seq_len, hidden_dim))
+    }
+
+    /// This rank's expert-parallel view.
+    pub fn expert_parallel(&self) -> &ExpertParallelPlan {
+        &self.ep
+    }
+
+    /// Apply the deferred UQFF expert slice, after `load_from_artifacts` has
+    /// replaced the placeholder layers with the deserialized ones.
+    ///
+    /// Returns the number of layers narrowed. Clears the guard in
+    /// [`Self::forward`]; until it is called, an expert-parallel layer loaded
+    /// from a UQFF refuses to run.
+    pub fn apply_pending_expert_subset(&mut self) -> Result<usize> {
+        let Some(subset) = self.pending_expert_subset.take() else {
+            return Ok(0);
+        };
+        let mut narrowed = 0usize;
+        for layer in self.get_isq_layers() {
+            let sliced = layer.select_experts(&subset.ids())?;
+            *layer = sliced;
+            narrowed += 1;
+        }
+        Ok(narrowed)
     }
 
     /// Fused CUDA kernel forward pass
@@ -777,6 +910,7 @@ impl MoEExperts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::moe::expert_parallel::ExpertPlacement;
     use candle_core::Device;
     use mistralrs_quant::safetensors::ShardedSafeTensors;
     use std::collections::HashMap;
@@ -882,6 +1016,7 @@ mod tests {
             backend,
             &None,
             Activation::Silu,
+            &ExpertParallelPlan::single(num_experts),
         )
         .expect("experts load")
     }
@@ -1018,6 +1153,306 @@ mod tests {
             all_close(&unlimited.swiglu(&gate, &up).unwrap(), UNCLAMPED),
             "limitless fast activation stage changed"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Expert parallelism
+    //
+    // These are UNIT tests of the sharding contract, run in-process with one
+    // `MoEExperts` per simulated rank and the combine done by the test. They
+    // do NOT validate expert parallelism: the question EP exists to answer is
+    // per-collective latency on a real NVLink fabric, and nothing on a CPU can
+    // speak to that. What they do establish is that the arithmetic is right,
+    // so a hardware run measures speed rather than debugging correctness.
+    // ---------------------------------------------------------------------
+
+    /// Stacked expert weights where **every expert computes something
+    /// different**: expert `e` projects onto a gate pre-activation of
+    /// `gate_pre[e]`, with `up = 1` and an identity `down`.
+    ///
+    /// Per-expert distinctness is the whole point (DOCTRINE D12): with
+    /// identical experts, routing to the wrong one — the exact failure the
+    /// global→local remap could introduce — would be invisible.
+    fn distinct_stacked_experts_vb(
+        gate_pre: &[f32],
+        hidden: usize,
+        inter: usize,
+        device: &Device,
+    ) -> ShardedVarBuilder {
+        assert_eq!(hidden, inter, "identity down_proj requires hidden == inter");
+        let num_experts = gate_pre.len();
+        let mut gate_up = Vec::with_capacity(num_experts * hidden * inter * 2);
+        for &g in gate_pre {
+            for _ in 0..hidden {
+                for _ in 0..inter {
+                    gate_up.push(g / hidden as f32);
+                }
+                for _ in 0..inter {
+                    gate_up.push(1.0 / hidden as f32);
+                }
+            }
+        }
+        let mut down = Vec::with_capacity(num_experts * inter * hidden);
+        for _ in 0..num_experts {
+            for i in 0..inter {
+                for h in 0..hidden {
+                    down.push(if i == h { 1.0f32 } else { 0.0 });
+                }
+            }
+        }
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "experts.gate_up_proj".to_string(),
+            Tensor::from_vec(gate_up, (num_experts, hidden, inter * 2), device).unwrap(),
+        );
+        tensors.insert(
+            "experts.down_proj".to_string(),
+            Tensor::from_vec(down, (num_experts, inter, hidden), device).unwrap(),
+        );
+        wrap(tensors, device)
+    }
+
+    const EP_GATES: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    const EP_HIDDEN: usize = 2;
+    const EP_TOP_K: usize = 2;
+
+    fn ep_experts(plan: &ExpertParallelPlan) -> MoEExperts {
+        let device = cpu();
+        let vb = distinct_stacked_experts_vb(&EP_GATES, EP_HIDDEN, EP_HIDDEN, &device);
+        let cfg = MoEExpertsConfig {
+            num_experts: EP_GATES.len(),
+            num_experts_per_tok: EP_TOP_K,
+            hidden_size: EP_HIDDEN,
+            moe_intermediate_size: EP_HIDDEN,
+            swiglu_limit: None,
+        };
+        MoEExperts::new_with_backend(
+            &cfg,
+            vb,
+            device,
+            &comm(&cpu()),
+            MoEExpertsBackend::Slow,
+            &None,
+            Activation::Silu,
+            plan,
+        )
+        .expect("experts load")
+    }
+
+    /// Three tokens, top-2 routing chosen so every token touches BOTH halves
+    /// of the expert set — a routing that stayed inside one rank would make
+    /// the combine untested.
+    fn ep_routing() -> (Tensor, Tensor, Tensor) {
+        let device = cpu();
+        let xs = Tensor::ones((1, 3, EP_HIDDEN), DType::F32, &device).unwrap();
+        let ids = Tensor::from_vec(vec![0u32, 2, 1, 3, 3, 0], (3, EP_TOP_K), &device).unwrap();
+        let w = Tensor::from_vec(
+            vec![0.6f32, 0.4, 0.25, 0.75, 0.5, 0.5],
+            (3, EP_TOP_K),
+            &device,
+        )
+        .unwrap();
+        (xs, w, ids)
+    }
+
+    fn flat(t: &Tensor) -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f32>())
+            .unwrap()
+    }
+
+    /// Sum the per-rank partials, as the combine collective does.
+    fn ep_combined(placement: &Arc<ExpertPlacement>) -> Vec<f32> {
+        let (xs, w, ids) = ep_routing();
+        let mut total: Option<Vec<f32>> = None;
+        for rank in 0..placement.ep_size() {
+            let plan = ExpertParallelPlan::new(placement.clone(), rank, &cpu()).expect("plan");
+            let partial = flat(&ep_experts(&plan).forward(&xs, w.clone(), &ids).unwrap());
+            total = Some(match total {
+                None => partial,
+                Some(acc) => acc.iter().zip(&partial).map(|(a, b)| a + b).collect(),
+            });
+        }
+        total.expect("at least one rank")
+    }
+
+    fn ep_reference() -> Vec<f32> {
+        let (xs, w, ids) = ep_routing();
+        let plan = ExpertParallelPlan::single(EP_GATES.len());
+        flat(&ep_experts(&plan).forward(&xs, w, &ids).unwrap())
+    }
+
+    /// Close enough that no argmax can flip. `MatMul::matmul` downcasts CPU
+    /// matmuls to F16 (`mistralrs-quant/src/lib.rs`), so ~5e-4 relative is the
+    /// floor even for two runs of the SAME code; the EP re-association adds
+    /// nothing on top of that.
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// **The acceptance test for the sharding contract**: EP=2's combined
+    /// output equals EP=1's.
+    ///
+    /// Not a claim about expert parallelism's value — that is a hardware
+    /// question. A claim that sharding the experts and summing the partials
+    /// reproduces the unsharded arithmetic, which is the precondition for any
+    /// hardware run to be measuring speed rather than a bug.
+    #[test]
+    fn ep2_reproduces_ep1_output() {
+        let reference = ep_reference();
+        let placement = Arc::new(ExpertPlacement::contiguous(EP_GATES.len(), 2).unwrap());
+        let combined = ep_combined(&placement);
+        assert!(
+            max_abs_diff(&reference, &combined) < 1e-3,
+            "EP=2 diverged from EP=1:\n  ep1 = {reference:?}\n  ep2 = {combined:?}"
+        );
+        // The fixture must actually be capable of showing a difference.
+        assert!(
+            reference.iter().any(|v| v.abs() > 0.1),
+            "fixture cannot discriminate: the reference output is ~zero"
+        );
+    }
+
+    /// The same, with a **permuted** placement (rank 0 owns experts 1 and 3).
+    /// Permutation is what the tid2eid-derived balanced placement produces, and
+    /// it exercises the global→local remap non-trivially: local index 0 on
+    /// rank 0 is global expert 1, so an implementation that forgot to remap
+    /// would compute the wrong expert and this test would catch it.
+    #[test]
+    fn ep2_reproduces_ep1_under_a_permuted_placement() {
+        let reference = ep_reference();
+        let placement =
+            Arc::new(ExpertPlacement::from_expert_to_rank(vec![1, 0, 1, 0], 2).unwrap());
+        assert!(!placement.is_contiguous());
+        let combined = ep_combined(&placement);
+        assert!(
+            max_abs_diff(&reference, &combined) < 1e-3,
+            "permuted EP=2 diverged from EP=1:\n  ep1 = {reference:?}\n  ep2 = {combined:?}"
+        );
+    }
+
+    /// EP=4 — one expert per rank — is the sharpest version of the same
+    /// contract, and pins that the partition holds when every rank owns
+    /// exactly one expert.
+    #[test]
+    fn ep4_reproduces_ep1_output() {
+        let reference = ep_reference();
+        let placement = Arc::new(ExpertPlacement::contiguous(EP_GATES.len(), 4).unwrap());
+        let combined = ep_combined(&placement);
+        assert!(
+            max_abs_diff(&reference, &combined) < 1e-3,
+            "EP=4 diverged from EP=1:\n  ep1 = {reference:?}\n  ep4 = {combined:?}"
+        );
+    }
+
+    /// **Mutation proof — dropping a rank's contribution.** This is the
+    /// failure mode the whole EP suite exists for: the result stays finite and
+    /// fluent, it is simply missing terms. If `ep2_reproduces_ep1_output`
+    /// could pass without a working combine, this assertion would fail.
+    #[test]
+    fn dropping_one_ranks_partial_changes_the_answer() {
+        let reference = ep_reference();
+        let placement = Arc::new(ExpertPlacement::contiguous(EP_GATES.len(), 2).unwrap());
+        let (xs, w, ids) = ep_routing();
+        let rank0 = ExpertParallelPlan::new(placement, 0, &cpu()).unwrap();
+        let only_rank0 = flat(&ep_experts(&rank0).forward(&xs, w, &ids).unwrap());
+
+        assert!(
+            only_rank0.iter().all(|v| v.is_finite()),
+            "a dropped rank must still look plausible — that is why it is dangerous"
+        );
+        assert!(
+            max_abs_diff(&reference, &only_rank0) > 1e-2,
+            "rank 0 alone matched the full result, so the combine is untested:\n  \
+             ep1 = {reference:?}\n  r0 = {only_rank0:?}"
+        );
+    }
+
+    /// **Mutation proof — a broken expert→device map.** Running rank 0's
+    /// placement on both ranks double-counts rank 0's experts and drops
+    /// rank 1's. It must not reproduce EP=1.
+    #[test]
+    fn a_placement_that_is_not_a_partition_changes_the_answer() {
+        let reference = ep_reference();
+        let placement = Arc::new(ExpertPlacement::contiguous(EP_GATES.len(), 2).unwrap());
+        let (xs, w, ids) = ep_routing();
+        let rank0 = ExpertParallelPlan::new(placement, 0, &cpu()).unwrap();
+        let partial = flat(&ep_experts(&rank0).forward(&xs, w.clone(), &ids).unwrap());
+        let doubled: Vec<f32> = partial.iter().map(|v| v * 2.0).collect();
+        assert!(
+            max_abs_diff(&reference, &doubled) > 1e-2,
+            "double-counting one rank matched the correct answer, so the partition \
+             property is not being tested"
+        );
+    }
+
+    /// **Mutation proof — skipping the global→local remap.** Feeding a rank
+    /// the raw global ids (what an implementation that sharded the weights but
+    /// forgot to renumber the routing would do) selects the wrong experts.
+    #[test]
+    fn skipping_the_global_to_local_remap_changes_the_answer() {
+        let placement = Arc::new(ExpertPlacement::contiguous(EP_GATES.len(), 2).unwrap());
+        let (xs, w, ids) = ep_routing();
+
+        let rank1 = ExpertParallelPlan::new(placement, 1, &cpu()).unwrap();
+        let correct = flat(&ep_experts(&rank1).forward(&xs, w.clone(), &ids).unwrap());
+
+        // Same rank-1 weights, but routed with the global ids clamped into
+        // range instead of remapped — i.e. the remap silently skipped.
+        let unmapped_ids = Tensor::from_vec(
+            ids.flatten_all()
+                .unwrap()
+                .to_vec1::<u32>()
+                .unwrap()
+                .into_iter()
+                .map(|g| g % 2)
+                .collect::<Vec<u32>>(),
+            ids.shape().clone(),
+            &cpu(),
+        )
+        .unwrap();
+        let single = ExpertParallelPlan::single(EP_GATES.len());
+        let two_expert_cfg_experts = ep_experts(&single);
+        let unmapped = flat(
+            &two_expert_cfg_experts
+                .forward(&xs, w, &unmapped_ids)
+                .unwrap(),
+        );
+        assert!(
+            max_abs_diff(&correct, &unmapped) > 1e-2,
+            "the remap makes no difference on this fixture, so it is not being tested"
+        );
+    }
+
+    /// A UQFF-loaded expert-parallel layer must refuse to run until the
+    /// deferred slice is applied. Silently running would put all 256 experts
+    /// on every card and EP would appear to work while buying nothing.
+    #[test]
+    fn a_pending_uqff_expert_slice_refuses_to_run() {
+        let placement = Arc::new(ExpertPlacement::contiguous(EP_GATES.len(), 2).unwrap());
+        let plan = ExpertParallelPlan::new(placement, 0, &cpu()).unwrap();
+        let mut experts = ep_experts(&plan);
+        experts.pending_expert_subset =
+            Some(ExpertSubset::owned(EP_GATES.len(), vec![0, 1]).unwrap());
+
+        let (xs, w, ids) = ep_routing();
+        let err = experts.forward(&xs, w.clone(), &ids).unwrap_err();
+        assert!(
+            format!("{err}").contains("was never applied"),
+            "unexpected error: {err}"
+        );
+
+        // Applying the slice clears the refusal. (These weights were already
+        // narrowed at load, so `select_experts` is not exercised here — that
+        // path belongs to the quantized layers; see `QtipLayer` /
+        // `Qtip2bLayer::select_experts_concrete`.)
+        experts.pending_expert_subset = None;
+        assert!(experts.forward(&xs, w, &ids).is_ok());
     }
 
     /// The clamp must not change the output dtype: the down projection is fed

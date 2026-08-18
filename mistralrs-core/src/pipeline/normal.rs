@@ -1128,6 +1128,15 @@ impl Loader for NormalLoader {
             )?;
         }
 
+        // Expert parallelism: a UQFF artifact holds every expert, so the shard
+        // could not be applied at construction. Narrow the deserialized expert
+        // stacks now, before anything can run a forward. A no-op when EP is
+        // off or the experts were already sliced at load.
+        let narrowed = model.apply_pending_expert_parallel_slice()?;
+        if narrowed > 0 {
+            info!("Expert parallelism: narrowed {narrowed} expert-stacked layers to this rank's shard.");
+        }
+
         // Run any registered post-load hooks (e.g. Arc's TD-MoE compressor).
         // Hooks are no-ops when nothing has been registered.
         crate::pipeline::post_load_hooks::run_post_load_hooks(&mut *model)

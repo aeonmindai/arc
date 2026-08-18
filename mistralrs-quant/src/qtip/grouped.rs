@@ -197,6 +197,25 @@ impl ExpertBpwTable {
     pub fn is_uniform_2bit(&self) -> bool {
         self.bpw.iter().all(|b| matches!(b, TrellisBpw::B2))
     }
+
+    /// The expert-parallel slice: the bit-width classes of `ids`, in order.
+    ///
+    /// This has to travel with the weight slice rather than be rebuilt as a
+    /// uniform table — a mixed-precision stack (4-bit hot experts) would
+    /// otherwise be silently re-declared as uniform 2-bit and mis-dispatched.
+    pub fn select(&self, ids: &[usize]) -> candle_core::Result<Self> {
+        let mut bpw = Vec::with_capacity(ids.len());
+        for &e in ids {
+            let Some(&b) = self.bpw.get(e) else {
+                candle_core::bail!(
+                    "ExpertBpwTable::select: expert {e} is out of range for {} experts",
+                    self.bpw.len()
+                );
+            };
+            bpw.push(b);
+        }
+        Ok(Self { bpw })
+    }
 }
 
 // ---------------------------------------------------------------------------

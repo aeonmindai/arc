@@ -270,6 +270,63 @@ mod nccl {
     unsafe impl Send for NcclComm {}
 }
 
+/// What the ring backend's all-reduce actually computes, and at which world
+/// sizes that is a complete sum.
+///
+/// This module exists because of a bug that shipped: `RingComm::from_device`
+/// accepted **any power-of-two `world_size`**, while `ring_ops::SumAllReduce`
+/// performs exactly **one** exchange — send right, read left — and returns
+/// `xs + delta`. At `world_size == 2` that is the full sum. At 4, 8 or 16 it
+/// silently returns `self + left neighbour`: wrong numerics, no error, a
+/// plausible-looking tensor. Nothing caught it because the only tests asserted
+/// that the collective *ran*.
+///
+/// The lesson generalises past the ring: a collective is correct only if its
+/// result equals the true sum over **every** rank, and that is what the tests
+/// below assert. Expert parallelism's combine is exactly such a sum — every
+/// routing slot is owned by exactly one rank, so a collective that drops one
+/// rank's contribution produces a fluent, wrong model rather than a crash.
+pub mod ring_algebra {
+    /// Exchange rounds performed by `ring_ops::SumAllReduce::sum_all_reduce`.
+    /// A complete ring all-reduce needs `world_size - 1` of them.
+    pub const RING_ALL_REDUCE_EXCHANGES: usize = 1;
+
+    /// Does the ring backend's single-exchange all-reduce produce a **complete**
+    /// sum at this world size?
+    ///
+    /// This is the predicate `RingComm::from_device` gates on. It is defined
+    /// here, outside the `ring` feature, so it is tested in every build —
+    /// including the ones CI actually runs.
+    pub fn ring_all_reduce_is_complete(world_size: usize) -> bool {
+        world_size <= RING_ALL_REDUCE_EXCHANGES + 1
+    }
+
+    /// Faithful model of the ring backend's collective: after `exchanges`
+    /// rounds of "send my ORIGINAL value right, add what arrives from the
+    /// left", rank `r` holds `Σ_{i=0}^{exchanges} values[(r - i) mod N]`.
+    ///
+    /// Note the model sends the *original* value each round, not the running
+    /// accumulator — that is what the implementation does (it writes `x` and
+    /// reads into a fresh buffer), and it is why extra rounds would not have
+    /// rescued it either.
+    pub fn simulate_ring_all_reduce(values: &[f64], exchanges: usize) -> Vec<f64> {
+        let n = values.len();
+        (0..n)
+            .map(|r| {
+                (0..=exchanges)
+                    .map(|i| values[(r + n - (i % n)) % n])
+                    .sum::<f64>()
+            })
+            .collect()
+    }
+
+    /// The sum every rank must end up holding.
+    pub fn true_all_reduce(values: &[f64]) -> Vec<f64> {
+        let total: f64 = values.iter().sum();
+        vec![total; values.len()]
+    }
+}
+
 // Ring backend implementation
 #[cfg(feature = "ring")]
 mod ring {
@@ -316,7 +373,7 @@ mod ring {
             // (self + left neighbour) with no error, which is a wrong-numerics bug
             // rather than a failure. Reject it here until the ring is a real
             // reduce-scatter + all-gather.
-            if config.world_size > 2 {
+            if !super::ring_algebra::ring_all_reduce_is_complete(config.world_size) {
                 candle_core::bail!(
                     "Ring backend currently implements a single-exchange all-reduce, which is \
                      only correct for world_size == 2 (got {}). Use the NCCL backend for larger \
@@ -1109,5 +1166,204 @@ mod dummy_ops {
         pub fn all_gather(&self, xs: &Tensor) -> Result<Tensor> {
             Ok(xs.clone())
         }
+    }
+}
+
+#[cfg(test)]
+mod collective_correctness_tests {
+    use super::ring_algebra::*;
+
+    /// **The test that would have caught the shipped bug.** It asserts the
+    /// collective's RESULT equals the true sum, not that it ran.
+    ///
+    /// At world_size 2 the single exchange is a complete all-reduce; at 4 and
+    /// 8 it is not, and the gap is silent — every rank holds a finite,
+    /// plausible number that is simply missing terms.
+    #[test]
+    fn single_exchange_ring_is_a_complete_sum_only_at_world_size_two() {
+        let two = vec![1.0, 10.0];
+        assert_eq!(
+            simulate_ring_all_reduce(&two, RING_ALL_REDUCE_EXCHANGES),
+            true_all_reduce(&two),
+            "world_size 2 must be a complete all-reduce"
+        );
+
+        for values in [
+            vec![1.0, 10.0, 100.0, 1000.0],
+            vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0],
+        ] {
+            let got = simulate_ring_all_reduce(&values, RING_ALL_REDUCE_EXCHANGES);
+            let want = true_all_reduce(&values);
+            assert_ne!(
+                got,
+                want,
+                "world_size {} cannot be a complete sum with one exchange — if this passes, \
+                 the exchange count changed and the guard must change with it",
+                values.len()
+            );
+            // And say exactly what it computes instead: self + left neighbour.
+            let n = values.len();
+            let expected_partial: Vec<f64> = (0..n)
+                .map(|r| values[r] + values[(r + n - 1) % n])
+                .collect();
+            assert_eq!(got, expected_partial);
+        }
+    }
+
+    /// The guard `RingComm::from_device` gates on must agree with what the
+    /// collective actually computes — at EVERY world size, not just the two
+    /// that were tried. A guard that disagreed with the algebra is how the
+    /// original bug survived review.
+    #[test]
+    fn the_construction_guard_agrees_with_the_algebra() {
+        // From world_size 2 up: the ring is never constructed below that
+        // (`RingComm::from_device` bails at `world_size < 2` before the
+        // completeness check), and a one-rank "ring" would read its own value
+        // as its left neighbour, which the model faithfully reproduces and
+        // which is not a case the guard is responsible for.
+        for world_size in 2..=16usize {
+            let values: Vec<f64> = (0..world_size).map(|i| (i + 1) as f64).collect();
+            let complete = simulate_ring_all_reduce(&values, RING_ALL_REDUCE_EXCHANGES)
+                == true_all_reduce(&values);
+            assert_eq!(
+                ring_all_reduce_is_complete(world_size),
+                complete,
+                "guard and algebra disagree at world_size {world_size}"
+            );
+        }
+    }
+
+    /// A complete ring all-reduce needs `world_size - 1` exchanges. Asserting
+    /// this pins the fix's shape: the guard may only be relaxed by adding
+    /// rounds (or switching to NCCL), never by widening the accepted sizes.
+    #[test]
+    fn completeness_requires_world_size_minus_one_exchanges() {
+        let values = vec![1.0, 10.0, 100.0, 1000.0];
+        for exchanges in 0..values.len() {
+            let complete = simulate_ring_all_reduce(&values, exchanges) == true_all_reduce(&values);
+            assert_eq!(
+                complete,
+                exchanges >= values.len() - 1,
+                "{exchanges} exchanges at world_size {}",
+                values.len()
+            );
+        }
+    }
+
+    /// Expert parallelism's combine is a sum over ranks in which every routing
+    /// slot is owned by exactly one rank. This asserts the property that makes
+    /// it safe — and, in the second half, that dropping any single rank's
+    /// contribution is detectable. That is the mutation this suite exists for:
+    /// a combine that silently omits a rank produces a fluent, wrong model,
+    /// not a crash.
+    #[test]
+    fn an_expert_parallel_combine_that_drops_a_rank_is_detectable() {
+        let slots = [1.0f64, 2.0, 3.0, 4.0];
+        let owner = [0usize, 1, 0, 1];
+        let partial = |rank: usize| -> f64 {
+            slots
+                .iter()
+                .zip(owner.iter())
+                .filter(|(_, &o)| o == rank)
+                .map(|(v, _)| v)
+                .sum()
+        };
+        let combined: f64 = (0..2).map(partial).sum();
+        assert_eq!(combined, slots.iter().sum::<f64>());
+
+        // Mutation: drop rank 1. The result stays finite and plausible — which
+        // is precisely why it needs an equality assertion, not a smoke test.
+        let dropped = partial(0);
+        assert!(dropped.is_finite());
+        assert_ne!(dropped, slots.iter().sum::<f64>());
+    }
+}
+
+#[cfg(test)]
+mod dummy_comm_pinning_tests {
+    use super::*;
+    use candle_core::Device;
+
+    /// 🔑 **`DummyComm` must report world size 1 no matter what it was built
+    /// with, and this is load-bearing rather than cosmetic.**
+    ///
+    /// `dummy_ops::SumAllReduce::sum_all_reduce` is `Ok(xs.clone())` — a
+    /// silent no-op. Under expert parallelism each rank computes only the
+    /// partial sum of the experts it owns, so a no-op "all-reduce" yields a
+    /// model that is fluent and **wrong**, with nothing downstream to catch it.
+    ///
+    /// The only thing standing between a mis-built binary (no `nccl` feature,
+    /// launched with 2 ranks) and that outcome is
+    /// `build_expert_parallel_plan`'s `comm.world_size() != ep_size` bail —
+    /// and that bail only fires because `DummyComm` **discards** the
+    /// `rank`/`world_size` it was constructed with and hardcodes `0`/`1`.
+    ///
+    /// That discard reads like a bug. Someone will eventually "fix" it to
+    /// honour its constructor arguments, which is exactly the change that
+    /// re-arms the no-op all-reduce — silently, because every test still
+    /// passes and the model still speaks. This test is the tripwire: make
+    /// `DummyComm` honest about its arguments and this fails, loudly, with
+    /// the reason.
+    ///
+    /// See `MoEExperts::forward` (`if self.world_size > 1 { all_reduce }`) and
+    /// `deepseek4::build_expert_parallel_plan`.
+    #[test]
+    fn dummy_comm_pins_world_size_to_one_so_the_no_op_all_reduce_is_unreachable() {
+        for (rank, world_size) in [(0, 1), (1, 2), (3, 8), (7, 64)] {
+            let comm = Comm::from_device(Id::Dummy, &Device::Cpu, rank, world_size)
+                .expect("a dummy comm constructs on CPU");
+
+            assert_eq!(
+                comm.world_size(),
+                1,
+                "DummyComm reported world_size {} when built with {world_size}. Its \
+                 `sum_all_reduce` is `Ok(xs.clone())`, so any world_size > 1 makes the \
+                 expert-parallel combine a SILENT NO-OP and every rank serves a partial \
+                 sum as if it were the whole. The `ep_size != world_size` bail in \
+                 `build_expert_parallel_plan` depends on this staying 1.",
+                comm.world_size()
+            );
+            assert_eq!(
+                comm.rank(),
+                0,
+                "DummyComm reported rank {} when built with {rank}; a non-zero rank on a \
+                 comm that cannot communicate would let a rank select an expert shard it \
+                 will never be able to combine.",
+                comm.rank()
+            );
+        }
+    }
+
+    /// The consequence, stated as the arithmetic rather than as a comment: a
+    /// no-op combine returns one rank's partial sum, which is finite,
+    /// plausible, and missing terms — the same shape as the ring bug above.
+    ///
+    /// This is what the `world_size != ep_size` bail is protecting against, so
+    /// it is asserted rather than described.
+    #[test]
+    fn a_no_op_combine_returns_a_plausible_partial_sum_not_an_error() {
+        // Two ranks, four experts, contiguous placement: rank 0 owns {0,1}.
+        let expert_out = [1.0f64, 2.0, 4.0, 8.0];
+        let owner = [0usize, 0, 1, 1];
+        let partial = |rank: usize| -> f64 {
+            expert_out
+                .iter()
+                .zip(owner.iter())
+                .filter(|(_, &o)| o == rank)
+                .map(|(v, _)| v)
+                .sum()
+        };
+
+        let correct: f64 = expert_out.iter().sum();
+        let no_op = partial(0); // what `Ok(xs.clone())` leaves rank 0 holding
+
+        assert!(
+            no_op.is_finite() && no_op > 0.0,
+            "the failure is not a NaN or a crash — that is the whole problem"
+        );
+        assert_ne!(
+            no_op, correct,
+            "a no-op all-reduce must differ from the true combine, or this test proves nothing"
+        );
     }
 }
