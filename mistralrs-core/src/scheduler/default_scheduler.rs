@@ -72,6 +72,45 @@ pub trait BucketingManager<Backer: FcfsBacker>: Send + Sync {
 // Bucket by that metric for images because if we are not a prompt, then this doesn't apply
 type BucketKey = (usize, bool, usize);
 
+/// How many waiting sequences may be admitted to **prefill** in one engine
+/// iteration. `None` (the default, and the historical behaviour) means "all of
+/// them", which is where head-of-line blocking comes from.
+///
+/// # Why this exists
+///
+/// A prompt step is uninterruptible: `Engine::run`'s prompt branch calls
+/// `pipeline.step(.., is_prompt = true, ..)` once, holding the pipeline mutex
+/// for the whole prefill, and every scheduled sequence goes straight from
+/// `RunningPrompt` to `RunningCompletion`. There is no partially-prefilled
+/// state — `Sequence::set_token_offset` has no callers in this tree — so a
+/// prompt cannot yield mid-flight. Admitting K prompts therefore stops decode
+/// for as long as prefilling all K takes.
+///
+/// Measured on an H200 (2026-08-17, `qtip2b`, MTP depth 3, profiler PR #113):
+/// at K=32 with 256-word prompts, **ONE prompt step took 43.2 s — 50.3% of the
+/// profiled window** — and at K=128 prefill ran ~120 s while the client
+/// received **zero tokens for 70 s**.
+///
+/// Capping admission is the *request-level* half of chunked prefill: it does
+/// not split an individual prompt (that needs the token-level cursor described
+/// in `get_prompt_input`), but it bounds how much prefill can accumulate in one
+/// uninterruptible step, so decode gets a turn between groups. It trades
+/// time-to-first-token for the last-admitted requests against decode
+/// availability for everyone already running, and **both numbers have to be
+/// reported** — see `arc-tools`.
+///
+/// Read once from `ARC_PREFILL_MAX_SEQS`; unset or `0` reproduces the previous
+/// admission exactly, expression for expression.
+fn prefill_admission_cap() -> Option<usize> {
+    static CAP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("ARC_PREFILL_MAX_SEQS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+    })
+}
+
 /// Horizon, in decode steps, over which a coalescing choice must pay for itself.
 ///
 /// See [`select_running_bucket`]. Sized as roughly one completion: a choice that
@@ -156,7 +195,61 @@ fn select_running_bucket(
     }
 }
 
-struct FixedBucketingManager;
+/// How many consecutive iterations prompt buckets may be passed over before one
+/// is forced to run. `None` (the default) is the historical behaviour: prompts
+/// win a step only by out-scoring every decode bucket on priority.
+///
+/// # Why a floor is needed as well as a cap
+///
+/// `ARC_PREFILL_MAX_SEQS` bounds how much prefill may enter ONE uninterruptible
+/// step. It is a throttle, and on its own it cannot make prompts run — that is
+/// a different failure in the opposite direction.
+///
+/// `select_running_bucket` takes the bucket with the highest SUMMED priority
+/// (`scheduling_urgency + log2(len)` per sequence). Once a large decode cohort
+/// exists, its sum dominates any prompt bucket: at 47 decoding sequences the
+/// decode bucket scores ~47·log2(L) before urgency, while a fresh prompt bucket
+/// starts near zero and has to accumulate urgency for hundreds of steps to
+/// catch up. Prompts starve behind decode.
+///
+/// That is the ceiling `feat/dense-ragged-decode` hit. With the decode limiter
+/// removed its cohort climbs `16 running, 112 waiting` → `47 running, 48
+/// waiting` and **stops**, with 48 sequences admitted and never prefilled.
+/// Capping admission cannot lift it; only guaranteeing prompts a turn can.
+///
+/// Read once from `ARC_PREFILL_FLOOR_STEPS`; unset or `0` reproduces the
+/// previous selection exactly.
+fn prefill_starvation_floor() -> Option<usize> {
+    static FLOOR: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        std::env::var("ARC_PREFILL_FLOOR_STEPS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+    })
+}
+
+#[derive(Default)]
+struct FixedBucketingManager {
+    /// Iterations since a prompt bucket last ran. Lives on the manager because
+    /// the scheduler owns it for the life of the engine; a free function cannot
+    /// carry it.
+    steps_since_prompt: usize,
+    /// The floor, resolved ONCE at construction rather than read from a global
+    /// on every selection — so a test can build a manager with a floor and
+    /// exercise the arithmetic, instead of racing a process-global `OnceLock`
+    /// that another test in the same binary may already have latched.
+    floor: Option<usize>,
+}
+
+impl FixedBucketingManager {
+    fn new() -> Self {
+        Self {
+            steps_since_prompt: 0,
+            floor: prefill_starvation_floor(),
+        }
+    }
+}
 
 impl<Backer: FcfsBacker> BucketingManager<Backer> for FixedBucketingManager {
     /// Move the sequences into buckets, and run the ones with the shortest lengths.
@@ -239,7 +332,40 @@ impl<Backer: FcfsBacker> BucketingManager<Backer> for FixedBucketingManager {
         } else {
             // Set the winning bucket to be the running ones, and the rest to be waiting (but their
             // states are not changed!). See `select_running_bucket` for why the choice matters.
-            let len = select_running_bucket(&seq_buckets, &seq_priorities, discrete);
+            let mut len = select_running_bucket(&seq_buckets, &seq_priorities, discrete);
+
+            // Anti-starvation floor. Applied AFTER the ordinary choice and only
+            // when that choice was not already a prompt bucket, so with the
+            // floor unset — or before it expires — the selection is the
+            // pre-change one, key for key.
+            if let Some(floor) = self.floor.filter(|_| !discrete) {
+                let is_prompt_bucket = |k: &BucketKey| {
+                    seq_buckets
+                        .get(k)
+                        .and_then(|v| v.first())
+                        .is_some_and(Sequence::is_prompt)
+                };
+                if is_prompt_bucket(&len) {
+                    self.steps_since_prompt = 0;
+                } else if self.steps_since_prompt >= floor {
+                    // Take the SHORTEST waiting prompt bucket: it is the one
+                    // that costs least to clear and the one most likely to
+                    // merge with the running cohort afterwards.
+                    if let Some(k) = seq_buckets
+                        .keys()
+                        .filter(|k| is_prompt_bucket(k))
+                        .min_by_key(|(l, _, _)| *l)
+                        .copied()
+                    {
+                        len = k;
+                        self.steps_since_prompt = 0;
+                    } else {
+                        self.steps_since_prompt += 1;
+                    }
+                } else {
+                    self.steps_since_prompt += 1;
+                }
+            }
             let highest_priority_seqs = seq_buckets
                 .remove(&len)
                 .unwrap()
@@ -268,7 +394,7 @@ pub struct DefaultScheduler<Backer: FcfsBacker> {
 impl<Backer: FcfsBacker> DefaultScheduler<Backer> {
     pub fn new(method: DefaultSchedulerMethod) -> Self {
         let bucketing_manager: Box<dyn BucketingManager<_>> = match method {
-            DefaultSchedulerMethod::Fixed(_) => Box::new(FixedBucketingManager),
+            DefaultSchedulerMethod::Fixed(_) => Box::new(FixedBucketingManager::new()),
         };
         Self {
             running: Vec::new(),
@@ -311,11 +437,21 @@ impl<Backer: FcfsBacker> DefaultScheduler<Backer> {
                 };
             }
             (_, 0) => {
-                for seq in waiting.into_iter() {
-                    seq.set_state(SequenceState::RunningPrompt);
-                    self.running.push(seq);
+                // Cold start: nothing is decoding, so nothing is starved by a
+                // large prefill — but the cap still applies, because the group
+                // admitted here is exactly the group that will be decoding when
+                // the next group arrives.
+                let cap = prefill_admission_cap().unwrap_or(usize::MAX);
+                let mut held = Backer::new();
+                for (i, seq) in waiting.into_iter().enumerate() {
+                    if i < cap {
+                        seq.set_state(SequenceState::RunningPrompt);
+                        self.running.push(seq);
+                    } else {
+                        held.add(seq);
+                    }
                 }
-                self.waiting = Backer::new();
+                self.waiting = held;
                 let running = std::mem::take(&mut self.running);
                 self.running = self.bucket_and_waitlist_seqs(running);
                 logger.set_num_running(self.running.len());
@@ -348,10 +484,19 @@ impl<Backer: FcfsBacker> DefaultScheduler<Backer> {
 
         // If the waiting sequence will fit, add it. Otherwise remove it
         let mut new_waiting = Backer::new();
+        let cap = prefill_admission_cap().unwrap_or(usize::MAX);
+        let mut admitted_to_prefill = 0usize;
         for seq in waiting.into_iter() {
-            if self.sequence_fits(&running, &seq) {
-                if seq.is_waiting() {
+            // A sequence that is already running its prompt is not *newly*
+            // admitted and must not be counted against the cap, or a cohort
+            // mid-prefill would be re-queued behind itself.
+            let is_new_prefill = seq.is_waiting();
+            if self.sequence_fits(&running, &seq)
+                && (!is_new_prefill || admitted_to_prefill < cap)
+            {
+                if is_new_prefill {
                     seq.set_state(SequenceState::RunningPrompt);
+                    admitted_to_prefill += 1;
                 }
                 running.push(seq);
             } else {
@@ -502,6 +647,79 @@ mod tests {
         );
         seq.set_state(SequenceState::RunningCompletion);
         seq
+    }
+
+
+    /// A sequence the scheduler has admitted but not yet prefilled.
+    fn prompt_of_len(id: usize, n_toks: usize) -> Sequence {
+        let seq = seq_of_len(id, n_toks);
+        seq.set_state(SequenceState::RunningPrompt);
+        seq
+    }
+
+    /// How many of `steps` iterations gave a prompt bucket the step, with the
+    /// given floor. One decode bucket of 47 at length 500 against one prompt.
+    fn prompt_steps_won(floor: Option<usize>, steps: usize) -> usize {
+        let mut mgr = FixedBucketingManager {
+            steps_since_prompt: 0,
+            floor,
+        };
+        let mut won = 0usize;
+        for _ in 0..steps {
+            let mut running: Vec<Sequence> = (0..47).map(|i| seq_of_len(i, 500)).collect();
+            running.push(prompt_of_len(47, 300));
+            let out = <FixedBucketingManager as BucketingManager<VecDeque<Sequence>>>::
+                bucket_and_waitlist_seqs_waiting(&mut mgr, running, VecDeque::new(), false);
+            if out.running.iter().any(|s| s.is_prompt()) {
+                won += 1;
+            }
+        }
+        won
+    }
+
+    /// 🔑 The ceiling `feat/dense-ragged-decode` hit, reproduced in the
+    /// scheduler alone and on CPU: with a large decode cohort running, a prompt
+    /// bucket never wins a step, so admitted-but-unprefilled sequences stay
+    /// unprefilled. That is why the cohort stops at `47 running, 48 waiting`.
+    ///
+    /// `select_running_bucket` takes the highest SUMMED priority, so 47
+    /// sequences at length 500 outscore one fresh prompt by ~47x before urgency
+    /// is counted at all.
+    #[test]
+    fn a_prompt_starves_behind_a_large_decode_cohort() {
+        let won = prompt_steps_won(None, 24);
+        assert_eq!(
+            won, 0,
+            "with no floor a prompt must never win a step behind a 47-sequence cohort; \
+             it won {won}/24, so this fixture is not reproducing the ceiling"
+        );
+    }
+
+    /// And the floor lifts exactly that, at the rate asked for.
+    ///
+    /// Teeth: the assertion is an equality on the count, not `> 0` — a floor
+    /// that fired every step would also pass `> 0` while destroying decode.
+    #[test]
+    fn the_floor_gives_prompts_a_turn_without_giving_them_every_turn() {
+        let steps = 24;
+        let won = prompt_steps_won(Some(4), steps);
+        // Fires on the 5th iteration and every 5th after: floor+1 cadence.
+        let expected = steps / 5;
+        assert_eq!(
+            won, expected,
+            "floor=4 must yield one prompt step in every 5, got {won}/{steps}"
+        );
+        assert!(
+            won < steps,
+            "a floor that took every step would starve decode instead"
+        );
+    }
+
+    /// The knob off is the previous selection, key for key — asserted against
+    /// the same fixture rather than argued.
+    #[test]
+    fn the_floor_unset_reproduces_the_previous_selection() {
+        assert_eq!(prompt_steps_won(None, 12), 0);
     }
 
     /// Advance a scheduled sequence by one decoded token, as the engine would.
