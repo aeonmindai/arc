@@ -3540,18 +3540,48 @@ impl QuantMethod for QtipLayer {
                 // the kernel's real structural limit (grid.y = n_pairs <=
                 // 65535). See `gather_policy` for the arithmetic.
                 let num_experts = self.num_experts_count();
-                let use_ondevice = match gather_policy::ondevice_max_tokens_override() {
-                    Some(cap) => {
-                        n_tokens <= cap
-                            && n_tokens.saturating_mul(n_experts_per_tok)
-                                <= gather_policy::GATHER_GEMV_MAX_PAIRS
-                    }
-                    None => gather_policy::lut_fused_gather_preferred(
-                        n_tokens,
-                        n_experts_per_tok,
-                        num_experts,
-                    ),
-                };
+                let grouped_disabled = std::env::var("ARC_NO_QTIP_GROUPED_MOE").is_ok();
+                // Is the grouped GEMM actually usable for this call?
+                let grouped_available = !grouped_disabled
+                    && matches!(a.dtype(), DType::BF16 | DType::F16)
+                    && self.in_features.is_multiple_of(grouped::GROUPED_TILE_K);
+
+                // Prefer the grouped GEMM over the fused gather-GEMV for every
+                // non-decode call.
+                //
+                // `lut_fused_gather_preferred`'s 16x traffic ratio answers the
+                // question "GEMV or dequantize-materialize?" — a choice between
+                // two paths that both scale with (token, slot) PAIRS. Now that a
+                // third path exists whose cost tracks DISTINCT EXPERTS, that
+                // boundary no longer describes the decision being made: measured
+                // per expert matmul on an H200, grouped beats the fused GEMV at
+                // N=128 (1.15x) and by N=512 the gap is 3.98x. Leaving the old
+                // boundary in place made the grouped kernel unreachable below
+                // ~683 tokens, which is where most prefill actually lives — the
+                // end-to-end A/B showed exactly 1.00x at N=128 and N=512 while
+                // N=1024 moved 2.41x.
+                //
+                // The decode regime stays fused UNCONDITIONALLY: that is the
+                // RUN-161 floor, not a performance choice (see
+                // `gather_policy`). An explicit `ARC_QTIP_ONDEVICE_MOE_MAX_TOKENS`
+                // override also still wins, so a harness can pin the GEMV arm.
+                let grouped_preferred = grouped_available
+                    && n_tokens > DECODE_REGIME_MAX_TOKENS
+                    && gather_policy::ondevice_max_tokens_override().is_none();
+
+                let use_ondevice = !grouped_preferred
+                    && match gather_policy::ondevice_max_tokens_override() {
+                        Some(cap) => {
+                            n_tokens <= cap
+                                && n_tokens.saturating_mul(n_experts_per_tok)
+                                    <= gather_policy::GATHER_GEMV_MAX_PAIRS
+                        }
+                        None => gather_policy::lut_fused_gather_preferred(
+                            n_tokens,
+                            n_experts_per_tok,
+                            num_experts,
+                        ),
+                    };
                 let ondevice_disabled = std::env::var("ARC_NO_QTIP_ONDEVICE_MOE").is_ok();
                 if !ondevice_disabled && use_ondevice {
                     // On-device ONLY, propagate its error. The host fallback
@@ -3580,11 +3610,7 @@ impl QuantMethod for QtipLayer {
                 // Below this, `gather_forward_cuda` stays as the fallback: it
                 // is the only path that handles F32 activations and shapes
                 // whose `in_features` is not a multiple of the k-chunk.
-                let grouped_disabled = std::env::var("ARC_NO_QTIP_GROUPED_MOE").is_ok();
-                if !grouped_disabled
-                    && matches!(a.dtype(), DType::BF16 | DType::F16)
-                    && self.in_features.is_multiple_of(grouped::GROUPED_TILE_K)
-                {
+                if grouped_available {
                     let total_pairs = n_tokens * n_experts_per_tok;
                     let a_flat = a.reshape((total_pairs, cols))?.contiguous()?;
                     let a_rotated = if self.rotation_block >= 2 {
