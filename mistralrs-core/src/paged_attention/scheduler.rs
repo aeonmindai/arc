@@ -630,7 +630,14 @@ mod bucketing_tests {
             vec![],
         )
         .unwrap();
-        let group = Arc::new(tokio::sync::Mutex::new(SequenceGroup::new(
+        // `std::sync::Mutex`, not tokio's. `Sequence::new_waiting` takes
+        // `Arc<std::sync::Mutex<SequenceGroup>>` (`sequence.rs` imports `Mutex`
+        // from `std::sync`), and every other fixture in the tree agrees —
+        // `prefix_cacher.rs`, `pipeline/amoe.rs`, `scheduler/default_scheduler.rs`,
+        // `kv_cache/mod.rs`. This one said `tokio::sync::Mutex` because it was
+        // written against the signature as it stood before PR #115 removed the
+        // await-under-lock dispatch. See the note above this module's tests.
+        let group = Arc::new(std::sync::Mutex::new(SequenceGroup::new(
             1, false, false, None,
         )));
         // Distinct token content per sequence: identical prompts would share
