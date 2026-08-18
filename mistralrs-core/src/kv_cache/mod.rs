@@ -1195,6 +1195,18 @@ pub(crate) fn ragged_lead_pad() -> Option<Vec<usize>> {
     RAGGED_LEAD_PAD.with(|r| r.borrow().clone())
 }
 
+/// Is the current cohort front-aligned? The same question [`ragged_lead_pad`]
+/// answers, without cloning the vector to answer it.
+///
+/// Exists because the model's per-row masking gate
+/// (`deepseek4::ragged_row_q0`) has to ask it once per layer per step — ~43
+/// times per forward — where allocating a `Vec` to look at `is_some()` would be
+/// pure waste. This is a `Cell`-cheap thread-local read, which is why that gate
+/// can afford to be *derived* rather than cached in a `OnceLock`.
+pub(crate) fn ragged_lead_pad_is_set() -> bool {
+    RAGGED_LEAD_PAD.with(|r| r.borrow().is_some())
+}
+
 /// Can this batch be front-aligned instead of refused?
 ///
 /// Every slot of every sequence has to be able to carry its own length. A

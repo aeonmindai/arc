@@ -2612,27 +2612,46 @@ fn append_graph_kv_mqa(
 /// what changes is that `dsv4_attention` stops collapsing the vector to the
 /// single position it inferred from the cache width.
 ///
-/// Gated on `ARC_MTP_PER_SEQ_KV` rather than on a flag of its own:
-/// [`crate::kv_cache::front_align_batch`] is the only producer of a ragged
-/// dense batch and it runs exclusively under `KvAdvance::PerSequence`, which
-/// that flag authorizes. With it off no batch is ever left-aligned, so the
-/// offsets would be uniform and `dsv4_attention` would take its scalar path
-/// anyway — the gate makes that a guarantee instead of a coincidence.
+/// Gated on **the layout itself** — `kv_cache::ragged_lead_pad_is_set()` — and
+/// deliberately NOT on an environment flag.
 ///
-/// Resolved once, for the reason [`v4_fp8_kv_enabled`] documents: this is on
-/// the per-layer path, and a `getenv` per layer per step is ~43 per forward.
+/// It used to read `ARC_MTP_PER_SEQ_KV`, justified by a claim that was false at
+/// that SHA: that [`crate::kv_cache::front_align_batch`] "runs exclusively
+/// under `KvAdvance::PerSequence`". It does not. `clone_in_cache` front-aligns
+/// whenever [`crate::kv_cache::batch_can_be_ragged`] passes and the lengths
+/// mismatch, and that predicate consults `ARC_V4_XS_PER_SEQ` — a *different*
+/// flag. So the two could diverge, and the divergence was silent and wrong:
+///
+/// * `ARC_V4_XS_PER_SEQ=1` alone ⇒ the engine front-aligns a ragged V4 cohort
+///   and publishes its dead prefix, but this function returned `None`, so
+///   [`super::dsv4_attention`] took the scalar path. Its caller mask is
+///   raw-only, and `compose_caller_mask` pads **neutral zeros** across the
+///   compressed columns — so a short row attends compressed blocks it has not
+///   produced. Wrong logits, no error, no panic.
+///
+/// Deriving the gate from `RAGGED_LEAD_PAD` removes the second flag rather than
+/// checking it: that thread-local is set by the *only* producer of this layout,
+/// on the same thread, immediately before the forward that reads it, and
+/// cleared on cohort teardown (`set_none_cache`). It is therefore true exactly
+/// when per-row masking is required — under MTP per-sequence advance and under
+/// plain ragged dense decode alike — and it cannot be turned on independently
+/// of the layout it describes. `the_row_q0_gate_tracks_the_cache_layout` and
+/// `the_row_q0_gate_is_not_an_environment_flag` pin both directions.
+///
+/// Not a `OnceLock` (unlike [`v4_fp8_kv_enabled`]) because the answer is
+/// per-batch, not per-process. The cost that motivated caching was the `getenv`
+/// — ~43 per forward; [`crate::kv_cache::ragged_lead_pad_is_set`] is a
+/// thread-local `is_some()` with no allocation, so the reason to cache is gone.
 fn ragged_row_q0(seqlen_offsets: &[usize]) -> Option<&[usize]> {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ENABLED.get_or_init(crate::pipeline::mtp_pipeline::per_sequence_kv_requested);
-    ragged_row_q0_from(enabled, seqlen_offsets)
+    ragged_row_q0_from(crate::kv_cache::ragged_lead_pad_is_set(), seqlen_offsets)
 }
 
-/// The decision itself, separated from the process-wide [`OnceLock`] so it can
-/// be tested against both settings rather than against whatever the test
-/// runner's environment happened to be (`ragged_row_q0_is_opt_in`). Same shape
+/// The decision itself, separated from the thread-local read so it can be
+/// tested against both settings rather than against whatever the test runner's
+/// ambient cohort state happened to be (`ragged_row_q0_is_opt_in`). Same shape
 /// as [`fp8_kv_enabled_from`], for the same reason.
-fn ragged_row_q0_from(enabled: bool, seqlen_offsets: &[usize]) -> Option<&[usize]> {
-    enabled.then_some(seqlen_offsets)
+fn ragged_row_q0_from(front_aligned: bool, seqlen_offsets: &[usize]) -> Option<&[usize]> {
+    front_aligned.then_some(seqlen_offsets)
 }
 
 fn v4_fp8_kv_enabled() -> bool {
@@ -5335,6 +5354,88 @@ mod kv_footprint_tests {
             "on, the row positions are `seqlen_offsets` verbatim — the value the engine already \
              threads for RoPE, not a new one"
         );
+    }
+
+    /// 🔑 The anti-divergence test. Exercises the REAL [`ragged_row_q0`], not
+    /// the `_from` helper, because what is under test is *which question the
+    /// gate asks* — and only the real function asks it.
+    ///
+    /// This goes RED the moment anyone re-gates `ragged_row_q0` on an
+    /// environment flag. The gate must track `RAGGED_LEAD_PAD`, which is the
+    /// published fact "this cohort was front-aligned". A flag can be set while
+    /// the layout is uniform, or — the dangerous direction — the layout can be
+    /// ragged while the flag is unset, which is exactly the silent-corruption
+    /// window this test closes: `ARC_V4_XS_PER_SEQ=1` with `ARC_MTP_PER_SEQ_KV`
+    /// unset used to front-align the cohort and then mask it as if uniform, so
+    /// short rows attended compressed blocks they had never produced.
+    #[test]
+    fn the_row_q0_gate_tracks_the_cache_layout() {
+        use crate::kv_cache::set_ragged_lead_pad;
+
+        let offsets = [10usize, 8, 5];
+
+        // Prove the test is not passing for the wrong reason. If the runner's
+        // environment happens to carry the OLD gate's flag, a gate still wired
+        // to it would pass the `Some` assertion below without tracking the
+        // layout at all — so refuse to draw a conclusion from that run.
+        assert!(
+            !crate::pipeline::mtp_pipeline::per_sequence_kv_requested(),
+            "ARC_MTP_PER_SEQ_KV is set in this test process, so this test cannot distinguish a \
+             layout-derived gate from the flag-derived one it exists to forbid. Unset it."
+        );
+
+        set_ragged_lead_pad(None);
+        assert!(
+            ragged_row_q0(&offsets).is_none(),
+            "no cohort was front-aligned, so the model must take the scalar path structurally"
+        );
+
+        set_ragged_lead_pad(Some(vec![0, 2, 5]));
+        assert_eq!(
+            ragged_row_q0(&offsets),
+            Some(&offsets[..]),
+            "the cohort IS front-aligned and carries a dead prefix, so per-row masking is \
+             mandatory — regardless of any environment flag. Returning `None` here is the \
+             silent-corruption bug: `compose_caller_mask` would pad neutral zeros across the \
+             compressed columns and the short rows would attend blocks they have not produced"
+        );
+
+        // Teardown publishes `None` (`set_none_cache`); the gate must follow it
+        // back down rather than latching, or the next uniform batch inherits a
+        // dead cohort's geometry.
+        set_ragged_lead_pad(None);
+        assert!(
+            ragged_row_q0(&offsets).is_none(),
+            "the gate latched: it must be re-derived per batch, never cached in a `OnceLock`"
+        );
+    }
+
+    /// The producer and the consumer must agree by construction, not by
+    /// coincidence. [`crate::kv_cache::ragged_lead_pad_is_set`] is the exact
+    /// predicate the gate is allowed to consult, and it must agree with
+    /// [`crate::kv_cache::ragged_lead_pad`] — the value the mask builder reads —
+    /// in both directions. A gate derived from one and a mask built from the
+    /// other is the class of bug this whole test pair exists to forbid.
+    #[test]
+    fn the_row_q0_gate_is_not_an_environment_flag() {
+        use crate::kv_cache::{ragged_lead_pad, ragged_lead_pad_is_set, set_ragged_lead_pad};
+
+        let offsets = [7usize, 4];
+        for pad in [None, Some(vec![0usize, 3]), None, Some(vec![0usize, 0])] {
+            set_ragged_lead_pad(pad.clone());
+            assert_eq!(
+                ragged_lead_pad_is_set(),
+                ragged_lead_pad().is_some(),
+                "the cheap predicate disagreed with the value the masker reads"
+            );
+            assert_eq!(
+                ragged_row_q0(&offsets).is_some(),
+                ragged_lead_pad_is_set(),
+                "the per-row gate and the published layout must be the same bit; any other \
+                 source (an env flag, a `OnceLock`) can drift from it"
+            );
+        }
+        set_ragged_lead_pad(None);
     }
 
     /// A non-`Normal` KV slot must be refused loudly rather than silently
