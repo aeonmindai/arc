@@ -97,6 +97,29 @@ def main():
     for name, c, k in sorted(agreeing, key=lambda t: -t[1])[:6]:
         print(f"   {c:>9,d} = {k:>4d} x steps   {name[:52]}")
 
+    # ---- CUDA API calls per step. `cuMemcpyDtoHAsync_v2` is the one that
+    # matters here and it is NOT visible as a "sync": `*Synchronize*` is 0.0
+    # calls/step in this workload. An "async" copy costing ~109 us of host time
+    # is a pageable-memory staged copy, i.e. blocking, and a CUDA graph cannot
+    # record one.
+    api = collections.Counter()
+    try:
+        for (n,) in cur.execute(
+                "SELECT nameId FROM CUPTI_ACTIVITY_KIND_RUNTIME WHERE start>=?",
+                (win0,)):
+            api[strings.get(n, str(n))] += 1
+    except sqlite3.Error:
+        print("(no CUPTI_ACTIVITY_KIND_RUNTIME table; API counts unavailable)")
+        return
+    watch = ("cuMemcpyDtoHAsync_v2", "cuLaunchKernel", "cuMemAllocAsync",
+             "cuMemFreeAsync", "cuMemcpyHtoDAsync_v2", "cuMemsetD8Async")
+    print("CUDA API per step:")
+    for name in watch:
+        print(f"   {api.get(name, 0) / steps:10.2f}/step  {name}")
+    syncs = sum(c for n, c in api.items() if "Synchronize" in n)
+    print(f"   {syncs / steps:10.2f}/step  ALL *Synchronize* "
+          f"(this is why counting syncs finds nothing)")
+
 
 if __name__ == "__main__":
     main()
