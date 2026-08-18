@@ -120,7 +120,10 @@ on:
       - "Cargo.lock"
       - ".github/workflows/cuda_compile_check.yaml"
   pull_request:
-    branches: [master]
+    # D18 #11: was [master], so stacked PRs never got the nvcc lane — the one
+    # lane that catches cuda-gated Rust, which a macOS `cargo check`
+    # structurally cannot type-check. Match every base branch.
+    branches: ['**']
     paths:
       - "**/*.rs"
       - "**/*.cu"

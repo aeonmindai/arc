@@ -1,5 +1,12 @@
 //! Arc benchmark harness.
 //!
+//! **Parent system: ArcLab/Bench** (see `memory/mission/TAXONOMY.md`).
+//!
+//! The harness is vendor-abstracted and drives any OpenAI-compatible server, so
+//! side-by-side runs against other engines are *supported* — but **no such run
+//! has ever been performed**, and no third-party performance number belongs in
+//! this repo until one is.
+//!
 //! `arc-bench` provides:
 //!
 //! 1. A reusable JSON schema for **AA-AgentPerf trajectories** —

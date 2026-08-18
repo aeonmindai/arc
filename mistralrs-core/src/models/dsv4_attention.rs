@@ -9,7 +9,8 @@
 //! V4 attention is a **single online softmax over a union of key sets**, not a
 //! learned gate and not a blend of separate softmaxes:
 //!
-//! - **Standard (`compress_ratio == 0`, layers 0/1/42 + MTP)**: sliding-window
+//! - **Standard (`compress_ratio == 0`, layers 0 and 1 plus slot 43, the MTP
+//!   block — NOT layer 42, which is CSA)**: sliding-window
 //!   attention over the last `window` raw tokens + `attn_sink`. NOT dense
 //!   causal! Both production references window ratio-0 layers exactly like the
 //!   raw branch of CSA/HCA, just with no compressed branch:
@@ -24,7 +25,7 @@
 //!   window-trained heads key/query relative distances they never saw in
 //!   training; on hardware this collapsed generation into repetition loops the
 //!   moment the context crossed 128 tokens, regardless of the compressed
-//!   branch (`ARC_V4_WINDOW_ONLY` made no difference — layers 0/1/42 were the
+//!   branch (`ARC_V4_WINDOW_ONLY` made no difference — layers 0/1/43 were the
 //!   ones polluting the stream).
 //! - **CSA (`compress_ratio == 4`) / HCA (`compress_ratio == 128`)**: one
 //!   softmax over `[raw sliding-window KV ++ compressed KV]`, plus the per-head
@@ -75,7 +76,7 @@
 //! `sinks_attn`'s varlen backend, which has no mask parameter (see the routing
 //! comment in `attention/backends/sinks.rs`).
 
-use candle_core::{DType, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
 use mistralrs_quant::MatMul;
 
 use super::deepseek4::CompressRatio;
@@ -255,6 +256,131 @@ fn compose_caller_mask(
     local.broadcast_add(&caller.contiguous()?)
 }
 
+/// Does this call need the per-row treatment, and is the vector it was handed
+/// coherent with the layout that treatment assumes?
+///
+/// Returning `None` for a **uniform** batch is the load-bearing part, and it is
+/// a dispatch, not an optimisation: `None` sends [`dsv4_attention`] down the
+/// pre-change scalar path verbatim, so every B=1 request, every prefill and
+/// every batch built with per-sequence KV advance off runs the same characters
+/// it always did. That is what makes flag-off byte-identity structural rather
+/// than a number a test happened to observe — and it is why this is a separate
+/// function: the two branches agree bit-for-bit on their common domain, so no
+/// numeric test can tell you which one ran (a mutation that routed uniform
+/// batches down the ragged path survived every other test in this module).
+///
+/// The two refusals both describe the *same* invariant from opposite sides:
+/// [`crate::kv_cache::front_align_batch`] pads every row up to the batch
+/// maximum, so `q0` is that maximum — no row may exceed it, and at least one
+/// row must reach it. A batch that is ragged in some other way is not the
+/// layout this module knows how to mask, and guessing would be a wrong answer
+/// nothing downstream catches.
+fn resolve_ragged_rows(rows: Option<&[usize]>, q0: usize, b_sz: usize) -> Result<Option<&[usize]>> {
+    let Some(rows) = rows.filter(|rows| rows.iter().any(|&r| r != q0)) else {
+        return Ok(None);
+    };
+    if rows.len() != b_sz {
+        return Err(candle_core::Error::Msg(format!(
+            "dsv4_attention: {} per-row query positions for a batch of {b_sz}",
+            rows.len()
+        )));
+    }
+    if let Some(&ahead) = rows.iter().find(|&&r| r > q0) {
+        return Err(candle_core::Error::Msg(format!(
+            "dsv4_attention: row at absolute query position {ahead} is AHEAD of the batch's \
+             shared end column {q0}. Under left-alignment the longest row defines that column, \
+             so `q0` is the batch maximum by construction — a larger value means the caller's \
+             per-row lengths and the cache layout disagree, and masking from them would be \
+             silently wrong"
+        )));
+    }
+    if rows.iter().copied().max() != Some(q0) {
+        return Err(candle_core::Error::Msg(format!(
+            "dsv4_attention: no row sits at the batch's shared end column {q0} (the furthest is \
+             {:?}), so this batch is not the left-aligned cohort `front_pad_kv_cache` produces. \
+             Per-row masking is only defined for that layout",
+            rows.iter().copied().max()
+        )));
+    }
+    Ok(Some(rows))
+}
+
+/// The `[b, 1, t_q, t_k + t_c]` additive mask a **left-aligned ragged** cohort
+/// needs, from the rank-2 uniform validity the batch leader would have used.
+///
+/// `rows[i]` is row `i`'s own absolute position for query row 0 and `q0` is the
+/// batch's (the maximum, see [`Dsv4AttentionConfig::row_q0`]), so
+/// `lead_i = q0 - rows[i]` is exactly the dead prefix
+/// [`crate::kv_cache::front_pad_kv_cache`] left ahead of that row. Two
+/// corrections, one per time base:
+///
+/// * **raw** (end-anchored): the window/causality comparison is already right
+///   for every row — shifting a row's queries and keys together preserves their
+///   difference — so all that is wrong is the dead prefix, and cache column `c`
+///   is dead for row `i` iff `c < lead_i`. Row `i`'s own position sits at
+///   column `q0 + r >= lead_i` for every `r`, so no row is ever fully masked
+///   and softmax cannot produce a NaN row.
+/// * **compressed** (start-anchored): column `b` is absolute block `b` for
+///   every row, so the threshold is rebuilt from `rows[i] + r` rather than
+///   `q0 + r`. The batch-wide value is an *over*-estimate, which is why this
+///   correction only ever removes columns.
+///
+/// Only `b` host values cross to the device (the leads and the positions); the
+/// `[b, 1, t_q, ·]` masks themselves are built on-device by broadcast.
+#[allow(clippy::too_many_arguments)]
+fn ragged_union_mask(
+    rows: &[usize],
+    q0: usize,
+    valid: &Tensor,
+    raw_base: usize,
+    t_k: usize,
+    ratio: usize,
+    dtype: DType,
+    dev: &Device,
+) -> Result<Tensor> {
+    let b_sz = rows.len();
+    let (t_q, n_keys) = valid.dims2()?;
+    let t_c = n_keys - t_k;
+
+    // Raw half: kill each row's dead prefix, keep the shared window/causality.
+    let lead = rows.iter().map(|&r| (q0 - r) as f32).collect::<Vec<_>>();
+    let lead = Tensor::from_vec(lead, (b_sz, 1, 1, 1), dev)?;
+    let kp = Tensor::arange(raw_base as u32, (raw_base + t_k) as u32, dev)?
+        .to_dtype(DType::F32)?
+        .reshape((1, 1, 1, t_k))?;
+    let live = kp.broadcast_ge(&lead)?; // [b, 1, 1, t_k] (u8)
+    let raw = valid
+        .narrow(1, 0, t_k)?
+        .reshape((1, 1, t_q, t_k))?
+        .broadcast_mul(&live)?
+        .contiguous()?; // [b, 1, t_q, t_k]
+
+    let valid = if t_c == 0 {
+        raw
+    } else {
+        let qp = Tensor::from_vec(
+            rows.iter().map(|&r| r as f32).collect::<Vec<_>>(),
+            (b_sz, 1, 1, 1),
+            dev,
+        )?
+        .broadcast_add(
+            &Tensor::arange(0u32, t_q as u32, dev)?
+                .to_dtype(DType::F32)?
+                .reshape((1, 1, t_q, 1))?,
+        )?; // [b, 1, t_q, 1] — row `i`'s query `r` at `rows[i] + r`
+        let threshold = ((qp + 1.0)? / ratio as f64)?.floor()?;
+        let bp = Tensor::arange(0u32, t_c as u32, dev)?
+            .to_dtype(DType::F32)?
+            .reshape((1, 1, 1, t_c))?;
+        let comp = bp.broadcast_lt(&threshold)?.contiguous()?; // [b, 1, t_q, t_c]
+        Tensor::cat(&[&raw, &comp], 3)?
+    };
+
+    let zeros = Tensor::zeros((b_sz, 1, t_q, n_keys), dtype, dev)?;
+    let neg_inf = Tensor::full(f32::NEG_INFINITY, (b_sz, 1, t_q, n_keys), dev)?.to_dtype(dtype)?;
+    valid.contiguous()?.where_cond(&zeros, &neg_inf)
+}
+
 /// The span of raw keys any query row in this block can reach, as
 /// `(base, len)` into the full raw cache `[0, t_k_full)`.
 ///
@@ -274,9 +400,42 @@ pub(crate) fn raw_keep_span(t_q: usize, window: usize, t_k_full: usize) -> (usiz
     (t_k_full - keep, keep)
 }
 
+/// The `SdpaParams::sliding_window` a V4 layer may declare, given the key axis
+/// [`dsv4_attention`] actually hands to the backend.
+///
+/// `sinks_attn` forwards `sdpa_params.sliding_window` to the fused flash-sinks
+/// kernels as `window_size`, and those kernels apply it as a bottom-right
+/// aligned *relative-distance* window over the key axis they are given. So the
+/// only correct value is the one that describes that axis:
+///
+/// * **Standard** (`compress_ratio == 0`): the axis is the raw sliding-window
+///   span and nothing else, so a relative-distance window of `sliding_window`
+///   selects exactly the set this module's own mask selects — `Some(window)`.
+/// * **CSA / HCA**: the axis is the concatenation `[raw sliding-window KV ++
+///   compressed KV]`. Relative distance across it is meaningless — compressed
+///   entry `j` stands for absolute position `j * ratio`, arbitrarily far back,
+///   not `t_k - j` — so *any* window applied to it deletes exactly the
+///   distant-context keys the compressed branch exists to supply. `None`.
+///
+/// Reference audit §1(e) found this inverted: Standard declared `None` and the
+/// compressed ratios declared `Some(128)`. It was inert only because
+/// `flash_sinks_ok` rejects `head_dim = 512` (`attention/backends/sinks.rs`),
+/// which is the head dim every V4 layer uses — i.e. it is a landmine that arms
+/// itself the moment a 512-wide flash-sinks kernel lands, and silently, because
+/// the fused path takes no mask to disagree with.
+pub(crate) fn sdpa_sliding_window(
+    compress_ratio: CompressRatio,
+    sliding_window: usize,
+) -> Option<usize> {
+    match compress_ratio {
+        CompressRatio::Standard => Some(sliding_window),
+        CompressRatio::Csa | CompressRatio::Hca => None,
+    }
+}
+
 /// Per-call configuration for V4 hybrid attention.
 #[derive(Debug, Clone, Copy)]
-pub struct Dsv4AttentionConfig {
+pub struct Dsv4AttentionConfig<'a> {
     /// Per-layer compress ratio (0/4/128 → `Standard`/`Csa`/`Hca`).
     pub compress_ratio: CompressRatio,
     /// Sliding-window size for the always-on local branch (V4 default 128).
@@ -300,6 +459,40 @@ pub struct Dsv4AttentionConfig {
     /// `raw_prefix` above [`raw_keep_span`]'s base is a hard error, not a
     /// silent truncation.
     pub raw_prefix: usize,
+    /// Per-batch-row absolute position of query row 0, when the batch is a
+    /// **left-aligned ragged** cohort (`front_pad_kv_cache`). `None` — every
+    /// path but the dense per-sequence-MTP decode — means every row shares the
+    /// single position this module has always inferred from the cache width,
+    /// and the code below is then character-for-character what it was.
+    ///
+    /// It exists because left-alignment preserves one of V4's two time bases
+    /// and breaks the other:
+    ///
+    /// * the **raw** window is end-anchored, so shifting a row's live run right
+    ///   by `lead` shifts its queries *and* its keys by the same `lead`. Both
+    ///   the causal and the sliding-window comparison are differences of the
+    ///   two, so both are invariant — in cache-column space the batch-wide
+    ///   position is exactly right, for every row. What left-alignment *does*
+    ///   add is a dead prefix of `lead` zero columns; those are killed here too
+    ///   (`row < lead` is not a live key), so this module needs no help from
+    ///   the caller's mask to be correct.
+    /// * the **compressed** blocks are start-anchored — column `b` is absolute
+    ///   block `b` for every row — so their threshold `b < (q_abs + 1) / ratio`
+    ///   needs each row's *own* `q_abs`. Fed the batch-wide one it is too
+    ///   **permissive**: a row that has advanced less would see compressed
+    ///   blocks covering tokens it has not generated. That is a wrong answer,
+    ///   not a slow one, which is why this is a hard blocker rather than a
+    ///   pessimisation.
+    ///
+    /// The value is `seqlen_offsets[i]` — the per-row past length the engine
+    /// already threads to every attention call for RoPE. No new plumbing
+    /// carries it; the raggedness was already in the arguments.
+    ///
+    /// A row may not be *ahead* of the batch (`row_q0[i] > q0` is rejected):
+    /// under left-alignment the longest row defines the shared end column, so
+    /// `q0` is the maximum by construction and a larger value means the caller
+    /// and the cache disagree about the layout.
+    pub row_q0: Option<&'a [usize]>,
 }
 
 /// V4 hybrid attention dispatch — a single softmax over the union of the raw
@@ -314,7 +507,7 @@ pub fn dsv4_attention(
     attention_mask: Option<&Tensor>,
     flash_params: &FlashParams,
     sdpa_params: &SdpaParams,
-    cfg: Dsv4AttentionConfig,
+    cfg: Dsv4AttentionConfig<'_>,
 ) -> Result<Tensor> {
     // ---- Standard layers: sliding-window + sink, same raw branch as CSA/HCA
     // (see module docs — the reference SWA-onlys ratio-0 layers; dense causal
@@ -333,7 +526,7 @@ pub fn dsv4_attention(
         compressed_kv
     };
 
-    let (_b, _h, t_q, _d) = q.dims4()?;
+    let (b_sz, _h, t_q, _d) = q.dims4()?;
     let t_k_given = k.dim(2)?;
     // `k` spans absolute positions `[raw_prefix, t_k_full)`; `raw_prefix == 0`
     // (every path but packed-KV decode) makes this the cache length, exactly as
@@ -353,6 +546,16 @@ pub fn dsv4_attention(
              (raw_prefix {} + {t_k_given} given)",
             cfg.raw_prefix
         )))?;
+
+    // ---- Left-aligned ragged cohort: does any row sit behind the batch? ----
+    // Dispatching on "every row is at `q0`" rather than on the flag is what
+    // makes flag-off byte-identity **structural**: a uniform batch — which is
+    // every B=1 request, every prefill, and every batch the engine builds with
+    // per-sequence KV advance off — takes `None` here and not one line below
+    // this point differs from the pre-change code. See
+    // [`Dsv4AttentionConfig::row_q0`] for why the two branches need it and the
+    // raw branch does not.
+    let row_q0 = resolve_ragged_rows(cfg.row_q0, q0, b_sz)?;
 
     // ---- Raw working-set narrowing ----------------------------------------
     // Only the trailing `t_q + window - 1` raw keys are reachable by ANY query
@@ -437,11 +640,29 @@ pub fn dsv4_attention(
 
     // Boolean validity → additive mask (0 / -inf), broadcast over batch+heads.
     let n_keys = valid.dim(1)?;
-    let zeros = Tensor::zeros((t_q, n_keys), q.dtype(), dev)?;
-    let neg_inf = Tensor::full(f32::NEG_INFINITY, (t_q, n_keys), dev)?.to_dtype(q.dtype())?;
-    let mask = valid
-        .where_cond(&zeros, &neg_inf)?
-        .reshape((1, 1, t_q, n_keys))?;
+    let mask = match row_q0 {
+        // Uniform batch: verbatim the pre-change code.
+        None => {
+            let zeros = Tensor::zeros((t_q, n_keys), q.dtype(), dev)?;
+            let neg_inf =
+                Tensor::full(f32::NEG_INFINITY, (t_q, n_keys), dev)?.to_dtype(q.dtype())?;
+            valid
+                .where_cond(&zeros, &neg_inf)?
+                .reshape((1, 1, t_q, n_keys))?
+        }
+        // Ragged cohort: `[b, 1, t_q, n_keys]`, because the compressed
+        // threshold and the dead prefix are both per-row.
+        Some(rows) => ragged_union_mask(
+            rows,
+            q0,
+            &valid,
+            raw_base,
+            t_k,
+            cfg.compress_ratio.ratio(),
+            q.dtype(),
+            dev,
+        )?,
+    };
 
     // Fold in whatever the caller knows that this module cannot see: padding
     // columns in a ragged batch, the graph-decode length mask, custom bias.
@@ -662,6 +883,7 @@ mod tests {
             compress_ratio: CompressRatio::Standard,
             sliding_window: window,
             raw_prefix: 0,
+            row_q0: None,
         };
         let actual = dsv4_attention(&q, &k, &v, None, None, &flash, &sdpa, cfg)?;
 
@@ -708,6 +930,7 @@ mod tests {
             compress_ratio: CompressRatio::Standard,
             sliding_window: t,
             raw_prefix: 0,
+            row_q0: None,
         };
         let actual = dsv4_attention(&q, &k, &v, None, None, &flash, &sdpa, cfg)?;
 
@@ -763,6 +986,7 @@ mod tests {
                 compress_ratio: CompressRatio::Standard,
                 sliding_window: window,
                 raw_prefix: 0,
+                row_q0: None,
             };
             let actual = dsv4_attention(&q, &k, &v, None, None, &flash, &sdpa, cfg)?;
 
@@ -849,6 +1073,7 @@ mod tests {
                     compress_ratio: ratio,
                     sliding_window: window,
                     raw_prefix: 0,
+                    row_q0: None,
                 },
             )?;
 
@@ -869,6 +1094,7 @@ mod tests {
                     compress_ratio: ratio,
                     sliding_window: window,
                     raw_prefix: base,
+                    row_q0: None,
                 },
             )?;
 
@@ -917,6 +1143,7 @@ mod tests {
                 compress_ratio: CompressRatio::Standard,
                 sliding_window: 16,
                 raw_prefix: 4,
+                row_q0: None,
             },
         )
         .unwrap_err();
@@ -966,6 +1193,7 @@ mod tests {
                 compress_ratio: CompressRatio::Csa,
                 sliding_window: window,
                 raw_prefix: 0,
+                row_q0: None,
             };
             let out = dsv4_attention(&q, &k, &v, Some(&comp), None, &flash, &sdpa, cfg)?;
             let out_v: Vec<f32> = out.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
@@ -1089,6 +1317,7 @@ mod tests {
             compress_ratio: CompressRatio::Csa,
             sliding_window: t, // window covers everything → windowed == causal
             raw_prefix: 0,
+            row_q0: None,
         };
         let actual = dsv4_attention(&q, &k, &v, None, None, &flash, &sdpa, cfg)?;
 
@@ -1118,11 +1347,96 @@ mod tests {
             compress_ratio: CompressRatio::Csa,
             sliding_window: 4,
             raw_prefix: 0,
+            row_q0: None,
         };
         let out = dsv4_attention(&q, &k, &v, Some(&comp), None, &flash, &sdpa, cfg)?;
         assert_eq!(out.dims(), &[b, h, t_q, d]);
         let data: Vec<f32> = out.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
         assert!(data.iter().all(|x| x.is_finite()));
+        Ok(())
+    }
+
+    /// Audit §1(e): `SdpaParams::sliding_window` must describe the key axis
+    /// this module hands the backend, and it was inverted.
+    ///
+    /// `sinks_attn` passes it to the fused flash-sinks kernels as
+    /// `window_size`, a bottom-right-aligned relative-distance window over
+    /// that axis. Two claims, both checked here rather than asserted:
+    ///
+    /// 1. the orientation itself — Standard is the only ratio whose key axis
+    ///    *is* the raw sliding window;
+    /// 2. that declaring a window on CSA is not harmless: at a decode position
+    ///    past the window the union axis is wider than `sliding_window`, so a
+    ///    relative-distance window over it necessarily deletes columns — and
+    ///    the columns it deletes carry signal, which the output difference
+    ///    against the same call with no compressed branch measures.
+    ///
+    /// Inert today only because `flash_sinks_ok` rejects `head_dim = 512`
+    /// (`attention/backends/sinks.rs`), the head dim every V4 layer uses. A
+    /// 512-wide flash-sinks kernel arms it, silently, because the fused path
+    /// takes no mask that could disagree.
+    #[test]
+    fn sdpa_sliding_window_describes_the_key_axis_the_dispatch_builds() -> Result<()> {
+        // (1) Orientation.
+        assert_eq!(
+            sdpa_sliding_window(CompressRatio::Standard, 128),
+            Some(128),
+            "Standard's key axis is the raw sliding window and nothing else"
+        );
+        assert_eq!(
+            sdpa_sliding_window(CompressRatio::Csa, 128),
+            None,
+            "CSA's key axis is [raw ++ compressed]; a relative-distance window \
+             over it deletes distant-context keys"
+        );
+        assert_eq!(sdpa_sliding_window(CompressRatio::Hca, 128), None);
+
+        // (2) What a window on CSA would delete, and whether it matters.
+        let device = Device::Cpu;
+        let (b, h, d) = (1, 2, 16);
+        let window = 4usize;
+        let (t_k, t_q, t_c) = (32usize, 1usize, 8usize);
+        let q = mk(b, h, t_q, d, 0.1, &device)?;
+        let k = mk(b, 1, t_k, d, 0.2, &device)?;
+        let v = mk(b, 1, t_k, d, 0.3, &device)?;
+        let comp = mk(b, 1, t_c, d, 0.05, &device)?;
+
+        // The union axis this module builds for that call: the reachable raw
+        // span (`raw_keep_span`) followed by every compressed row.
+        let (_, raw_keep) = raw_keep_span(t_q, window, t_k);
+        let union_width = raw_keep + t_c;
+        assert!(
+            union_width > window,
+            "a {window}-wide relative-distance window over a {union_width}-wide \
+             union axis must delete columns; the premise of this test"
+        );
+
+        let (sdpa, _sinks) = sdpa_params_with_sinks(d, h, &device)?;
+        let flash = empty_flash_params();
+        let cfg = Dsv4AttentionConfig {
+            compress_ratio: CompressRatio::Csa,
+            sliding_window: window,
+            raw_prefix: 0,
+            // Uniform batch: this fixture predates `row_q0` and builds every
+            // row at the same length, so `None` is the identity that preserves
+            // exactly what it asserted before the field existed.
+            row_q0: None,
+        };
+        let with_comp = dsv4_attention(&q, &k, &v, Some(&comp), None, &flash, &sdpa, cfg)?;
+        let without_comp = dsv4_attention(&q, &k, &v, None, None, &flash, &sdpa, cfg)?;
+        let diff = (with_comp - without_comp)?
+            .abs()?
+            .max_all()?
+            .to_dtype(DType::F32)?
+            .to_scalar::<f32>()?;
+        // The CPU MatMul F16 noise floor this module budgets elsewhere is
+        // ~1e-3; anything above that is signal, not rounding.
+        assert!(
+            diff > 1e-2,
+            "the compressed columns a union-axis window would delete carry no \
+             signal (max |Δ| = {diff}); if this ever holds, the fixture stopped \
+             exercising the compressed branch and the test is vacuous"
+        );
         Ok(())
     }
 
@@ -1214,6 +1528,7 @@ mod tests {
             compress_ratio: CompressRatio::Hca,
             sliding_window: 128,
             raw_prefix: 0,
+            row_q0: None,
         };
         let out = dsv4_attention(&q, &k, &v, Some(&comp), None, &flash, &sdpa, cfg)?;
         assert_eq!(out.dims(), &[b, h, t_q, d]);
@@ -1257,6 +1572,7 @@ mod tests {
             compress_ratio: CompressRatio::Csa,
             sliding_window: window,
             raw_prefix: 0,
+            row_q0: None,
         };
 
         // The engine pads every sequence to the batch max and reports PADDED
@@ -1332,6 +1648,7 @@ mod tests {
             compress_ratio: CompressRatio::Csa,
             sliding_window: window, // window >= t, so ONLY causality is on trial
             raw_prefix: 0,
+            row_q0: None,
         };
         let padded = vec![t as u32; b];
         let flash = varlen_flash_params(&padded, &padded, &device);
@@ -1420,6 +1737,7 @@ mod tests {
             compress_ratio: CompressRatio::Csa,
             sliding_window: window,
             raw_prefix: 0,
+            row_q0: None,
         };
         let padded = vec![t as u32; b];
         let flash = varlen_flash_params(&padded, &padded, &device);
@@ -1498,6 +1816,7 @@ mod tests {
             // overlap, which is what makes the double counting observable.
             sliding_window: t,
             raw_prefix: 0,
+            row_q0: None,
         };
         // Rank-4 causal mask (what `CausalMasker` hands the layer), raw width.
         let caller = left_padded_causal_mask(&[0], t, &device)?;
@@ -1658,6 +1977,7 @@ mod tests {
             compress_ratio: CompressRatio::Standard,
             sliding_window: window,
             raw_prefix: 0,
+            row_q0: None,
         };
 
         let (base, keep) = raw_keep_span(1, window, t_k);
@@ -1702,6 +2022,7 @@ mod tests {
             compress_ratio: CompressRatio::Standard,
             sliding_window: 4,
             raw_prefix: 0,
+            row_q0: None,
         };
         let bad = Tensor::zeros((1, 1, t, t + 3), DType::F32, &device)?;
         let err = dsv4_attention(&q, &k, &v, None, Some(&bad), &flash, &sdpa, cfg).unwrap_err();
@@ -1719,6 +2040,488 @@ mod tests {
             max_abs_diff(&flat(&with_dummy), &flat(&without)),
             0.0,
             "the flash-attn placeholder mask changed the result"
+        );
+        Ok(())
+    }
+
+    // =======================================================================
+    // LEFT-ALIGNED RAGGED COHORT (per-sequence MTP KV advance, PR #92/#95)
+    // =======================================================================
+
+    /// Lay `rows[i]` (`[1, kv, live_i, d]`) into a **left-aligned** batched
+    /// buffer of width `t_k_full`: `t_k_full - live_i` zero columns, then the
+    /// row's real content. This is what `front_pad_kv_cache` produces, zeros
+    /// and all — and a zero K row is not a masked row, which is the whole
+    /// reason the dead prefix has to be masked rather than tolerated.
+    fn left_align_rows(rows: &[Tensor], t_k_full: usize, dev: &Device) -> Result<Tensor> {
+        let mut padded = Vec::with_capacity(rows.len());
+        for row in rows {
+            let (_, kv, live, d) = row.dims4()?;
+            let lead = t_k_full - live;
+            padded.push(if lead == 0 {
+                row.clone()
+            } else {
+                let zeros = Tensor::zeros((1, kv, lead, d), row.dtype(), dev)?;
+                Tensor::cat(&[&zeros, row], 2)?
+            });
+        }
+        Tensor::cat(&padded.iter().collect::<Vec<_>>(), 0)
+    }
+
+    /// The shared ragged fixture: three rows with DIFFERENT committed pasts,
+    /// each with its own input stream, left-aligned into one buffer.
+    ///
+    /// The numbers are chosen so all three degeneracy traps are open — see the
+    /// assertions in [`ragged_cohort_matches_each_row_run_alone`], which run
+    /// before anything else and fail loudly if a later edit closes one.
+    struct RaggedFixture {
+        lens: Vec<usize>,
+        t_q: usize,
+        window: usize,
+        t_c: usize,
+        h: usize,
+        d: usize,
+        padded: usize,
+        t_k_full: usize,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        comp: Tensor,
+        k_rows: Vec<Tensor>,
+        v_rows: Vec<Tensor>,
+    }
+
+    fn ragged_fixture(dev: &Device) -> Result<RaggedFixture> {
+        let (h, d, window, t_q, t_c) = (2usize, 16usize, 10usize, 2usize, 4usize);
+        let lens = vec![10usize, 8, 5];
+        let b = lens.len();
+        let padded = *lens.iter().max().unwrap();
+        let t_k_full = padded + t_q;
+
+        // Every row gets its OWN stream. One shared stream would make block `j`
+        // cover identical tokens on every row and hide any row mix-up — the
+        // exact fixture defect PR #95 found in its first three mutations.
+        let mut k_rows = Vec::with_capacity(b);
+        let mut v_rows = Vec::with_capacity(b);
+        for (i, &l) in lens.iter().enumerate() {
+            k_rows.push(mk(1, 1, l + t_q, d, 0.13 + 0.05 * i as f32, dev)?);
+            v_rows.push(mk(1, 1, l + t_q, d, 0.21 + 0.05 * i as f32, dev)?);
+        }
+        Ok(RaggedFixture {
+            q: mk(b, h, t_q, d, 0.09, dev)?,
+            comp: mk(b, 1, t_c, d, 0.04, dev)?,
+            k: left_align_rows(&k_rows, t_k_full, dev)?,
+            v: left_align_rows(&v_rows, t_k_full, dev)?,
+            k_rows,
+            v_rows,
+            lens,
+            t_q,
+            window,
+            t_c,
+            h,
+            d,
+            padded,
+            t_k_full,
+        })
+    }
+
+    impl RaggedFixture {
+        fn leads(&self) -> Vec<usize> {
+            self.lens.iter().map(|&l| self.padded - l).collect()
+        }
+        fn cfg(&self) -> Dsv4AttentionConfig<'_> {
+            Dsv4AttentionConfig {
+                compress_ratio: CompressRatio::Csa,
+                sliding_window: self.window,
+                raw_prefix: 0,
+                row_q0: None,
+            }
+        }
+        /// The same call the engine makes for a left-aligned cohort: row `i`'s
+        /// own absolute query position is its committed past `lens[i]`, which
+        /// is precisely what `seqlen_offsets[i]` already carries.
+        fn ragged_cfg(&self) -> Dsv4AttentionConfig<'_> {
+            Dsv4AttentionConfig {
+                row_q0: Some(&self.lens),
+                ..self.cfg()
+            }
+        }
+    }
+
+    /// **The dispatch itself**, pinned directly — because no numeric test can
+    /// pin it. The two branches of [`dsv4_attention`]'s mask build agree
+    /// bit-for-bit on a uniform batch, so a mutation that routes uniform
+    /// batches down the ragged path is numerically invisible and survived
+    /// every other test in this module. It is still a real defect: it would
+    /// build a `[b, 1, t_q, n_keys]` mask and two extra host→device copies on
+    /// every layer of every B=1 decode step, and it would end the structural
+    /// flag-off guarantee.
+    #[test]
+    fn a_uniform_batch_never_reaches_the_ragged_path() -> Result<()> {
+        // Uniform, at the batch's shared end column: not ragged, whatever the
+        // value is.
+        for (q0, b) in [(0usize, 1usize), (7, 1), (7, 4), (128, 3)] {
+            let rows = vec![q0; b];
+            assert!(
+                resolve_ragged_rows(Some(&rows), q0, b)?.is_none(),
+                "q0={q0} b={b}: a uniform vector must dispatch to the scalar path, not merely \
+                 compute the same numbers on the ragged one"
+            );
+        }
+        // Absent entirely — every path but per-sequence MTP.
+        assert!(resolve_ragged_rows(None, 12, 3)?.is_none());
+        // Genuinely ragged, and coherent: taken.
+        let ragged = [12usize, 10, 7];
+        assert_eq!(
+            resolve_ragged_rows(Some(&ragged), 12, 3)?,
+            Some(&ragged[..]),
+            "a cohort with rows behind the leader is exactly what the ragged path is for"
+        );
+        Ok(())
+    }
+
+    /// 🔑 **THE claim.** Every row of a left-aligned ragged cohort must produce
+    /// exactly what that row produces run ALONE with its dead prefix simply
+    /// absent — which is the definition of "the batch changed nothing".
+    ///
+    /// Both of V4's time bases are on trial and they fail in opposite
+    /// directions:
+    ///
+    /// * the **raw** window is end-anchored, so left-alignment shifts a row's
+    ///   queries and keys together and the window/causality comparison is
+    ///   already right — what it adds is `lead_i` zero columns that score
+    ///   logit 0 and take real softmax weight;
+    /// * the **compressed** blocks are start-anchored, so the batch-wide
+    ///   threshold `b < (q0 + r + 1) / ratio` is too **permissive** for a row
+    ///   that has advanced less: it would attend blocks covering tokens that
+    ///   row has not generated.
+    ///
+    /// The second is why a `[B, 1, t_q, k]` K/V mask over the raw columns —
+    /// everything PR #92 built — is not sufficient on its own.
+    #[test]
+    fn ragged_cohort_matches_each_row_run_alone() -> Result<()> {
+        let device = Device::Cpu;
+        let f = ragged_fixture(&device)?;
+        let ratio = CompressRatio::Csa.ratio();
+
+        // ---- Non-degeneracy FIRST (D12). A fixture where every row lands on
+        // the same compressed column proves nothing; PR #95 shipped three
+        // surviving mutations before noticing exactly that.
+        let thresholds: Vec<Vec<usize>> = f
+            .lens
+            .iter()
+            .map(|&l| (0..f.t_q).map(|r| (l + r + 1) / ratio).collect())
+            .collect();
+        assert!(
+            thresholds.iter().any(|t| *t != thresholds[0]),
+            "degenerate fixture: every row sees the same compressed blocks, so the per-row \
+             threshold is never exercised and this test would pass with the fix deleted"
+        );
+        assert!(
+            thresholds.iter().flatten().copied().min().unwrap() < f.t_c,
+            "degenerate fixture: no row is short enough for a compressed block to be masked"
+        );
+        let (raw_base, _) = raw_keep_span(f.t_q, f.window, f.t_k_full);
+        assert!(
+            f.leads().iter().any(|&lead| lead > raw_base),
+            "degenerate fixture: every dead prefix falls outside the retained raw span, so the \
+             raw-side correction is never exercised"
+        );
+
+        let (sdpa, _sinks) = sdpa_params_with_sinks(f.d, f.h, &device)?;
+        let flash = empty_flash_params();
+        let batched = dsv4_attention(
+            &f.q,
+            &f.k,
+            &f.v,
+            Some(&f.comp),
+            None,
+            &flash,
+            &sdpa,
+            f.ragged_cfg(),
+        )?;
+        assert_eq!(batched.dims(), &[f.lens.len(), f.h, f.t_q, f.d]);
+        assert!(
+            flat(&batched).iter().all(|x| x.is_finite()),
+            "a row was fully masked — softmax produced a NaN row"
+        );
+
+        let mut solos: Vec<Vec<f32>> = Vec::new();
+        for (i, &l) in f.lens.iter().enumerate() {
+            let qi = f.q.narrow(0, i, 1)?.contiguous()?;
+            let ci = f.comp.narrow(0, i, 1)?.contiguous()?;
+            // Run alone: no dead prefix exists, so `q0` is inferred as `l` and
+            // the compressed threshold is right by construction.
+            let solo = dsv4_attention(
+                &qi,
+                &f.k_rows[i],
+                &f.v_rows[i],
+                Some(&ci),
+                None,
+                &flash,
+                &sdpa,
+                f.cfg(),
+            )?;
+            let got = flat(&batched.narrow(0, i, 1)?.contiguous()?);
+            let want = flat(&solo);
+            // Batch-3 and batch-1 GEMMs tile — and therefore round —
+            // differently on `MatMul`'s F16 CPU path; same documented noise
+            // floor as `union_decode_matches_scalar_reference`.
+            let diff = max_abs_diff(&got, &want);
+            assert!(
+                diff < 1.5e-3,
+                "row {i} (committed past {l}, dead prefix {}) differs between the ragged cohort \
+                 and its solo run (max abs diff {diff})",
+                f.padded - l
+            );
+            solos.push(want);
+        }
+
+        // Teeth: the rows must be grossly distinguishable, or the agreement
+        // above is the vacuous kind.
+        assert!(
+            max_abs_diff(&solos[0], &solos[2]) > 1e-2,
+            "fixture rows are too similar for the equality assertions to have teeth"
+        );
+        Ok(())
+    }
+
+    /// The negative control for the test above: fed the batch-wide position —
+    /// i.e. with the per-row `q0` deleted — the shorter rows must DISAGREE
+    /// with their solo runs.
+    ///
+    /// Without this, `ragged_cohort_matches_each_row_run_alone` cannot
+    /// distinguish "the fix works" from "the fixture never needed it".
+    #[test]
+    fn without_the_per_row_q0_the_shorter_rows_are_wrong() -> Result<()> {
+        let device = Device::Cpu;
+        let f = ragged_fixture(&device)?;
+        let (sdpa, _sinks) = sdpa_params_with_sinks(f.d, f.h, &device)?;
+        let flash = empty_flash_params();
+
+        // `row_q0: None` is exactly the pre-change behaviour: one scalar `q0`
+        // inferred from the cache width, applied to every row.
+        let batched = dsv4_attention(
+            &f.q,
+            &f.k,
+            &f.v,
+            Some(&f.comp),
+            None,
+            &flash,
+            &sdpa,
+            f.cfg(),
+        )?;
+        let mut worst = 0f32;
+        for i in 0..f.lens.len() {
+            let qi = f.q.narrow(0, i, 1)?.contiguous()?;
+            let ci = f.comp.narrow(0, i, 1)?.contiguous()?;
+            let solo = dsv4_attention(
+                &qi,
+                &f.k_rows[i],
+                &f.v_rows[i],
+                Some(&ci),
+                None,
+                &flash,
+                &sdpa,
+                f.cfg(),
+            )?;
+            worst = worst.max(max_abs_diff(
+                &flat(&batched.narrow(0, i, 1)?.contiguous()?),
+                &flat(&solo),
+            ));
+        }
+        assert!(
+            worst > 1e-2,
+            "the batch-wide position produced the right answer anyway (max abs diff {worst}), so \
+             this fixture cannot detect the bug the per-row `q0` fixes"
+        );
+        Ok(())
+    }
+
+    /// **Flag-off byte-identity, asserted as well as dispatched.** A uniform
+    /// batch — every B=1 request, every prefill, every batch the engine builds
+    /// with per-sequence KV advance off — must produce bit-identical output
+    /// whether or not the per-row vector is supplied.
+    ///
+    /// The guarantee is structural (`dsv4_attention` dispatches on "does any
+    /// row differ from `q0`" and the uniform branch is the pre-change code
+    /// verbatim), so this asserts EXACT equality, not a tolerance. B=1 is
+    /// included on purpose: it is the only regime with a solid measurement and
+    /// it must not move.
+    #[test]
+    fn a_uniform_row_q0_is_bit_identical_to_none() -> Result<()> {
+        let device = Device::Cpu;
+        let (h, d) = (2usize, 16usize);
+        let (sdpa, _sinks) = sdpa_params_with_sinks(d, h, &device)?;
+        let flash = empty_flash_params();
+        let mut checked = 0usize;
+        for (ratio, t_c) in [
+            (CompressRatio::Standard, 0usize),
+            (CompressRatio::Csa, 3),
+            (CompressRatio::Hca, 2),
+        ] {
+            for b in [1usize, 3] {
+                for (t_k, t_q) in [(12usize, 12usize), (12, 1), (12, 4)] {
+                    for window in [4usize, 10, 32] {
+                        let q = mk(b, h, t_q, d, 0.09, &device)?;
+                        let k = mk(b, 1, t_k, d, 0.19, &device)?;
+                        let v = mk(b, 1, t_k, d, 0.29, &device)?;
+                        let comp = (t_c > 0)
+                            .then(|| mk(b, 1, t_c, d, 0.04, &device))
+                            .transpose()?;
+                        let cfg = Dsv4AttentionConfig {
+                            compress_ratio: ratio,
+                            sliding_window: window,
+                            raw_prefix: 0,
+                            row_q0: None,
+                        };
+                        let rows = vec![t_k - t_q; b];
+                        let with = dsv4_attention(
+                            &q,
+                            &k,
+                            &v,
+                            comp.as_ref(),
+                            None,
+                            &flash,
+                            &sdpa,
+                            Dsv4AttentionConfig {
+                                row_q0: Some(&rows),
+                                ..cfg
+                            },
+                        )?;
+                        let without =
+                            dsv4_attention(&q, &k, &v, comp.as_ref(), None, &flash, &sdpa, cfg)?;
+                        assert_eq!(
+                            max_abs_diff(&flat(&with), &flat(&without)),
+                            0.0,
+                            "{ratio:?} b={b} t_k={t_k} t_q={t_q} window={window}: a uniform \
+                             per-row vector changed the result, so flag-off is NOT byte-identical"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked >= 54, "only {checked} configurations exercised");
+        Ok(())
+    }
+
+    /// **The dead prefix cannot vote.** Fill each row's zero-filled prefix with
+    /// loud, distinctive keys and values; no row's output may move by a single
+    /// bit. A `-inf` logit gives an exactly-zero softmax weight, so this is an
+    /// exact-equality assertion, not a tolerance.
+    ///
+    /// This is the FP8-KV failure mode restated: serving from a zero-filled
+    /// prefix is a wrong answer nothing downstream catches.
+    #[test]
+    fn the_dead_prefix_cannot_influence_its_row() -> Result<()> {
+        let device = Device::Cpu;
+        let f = ragged_fixture(&device)?;
+        let leads = f.leads();
+        let (sdpa, _sinks) = sdpa_params_with_sinks(f.d, f.h, &device)?;
+        let flash = empty_flash_params();
+
+        let clean = dsv4_attention(
+            &f.q,
+            &f.k,
+            &f.v,
+            Some(&f.comp),
+            None,
+            &flash,
+            &sdpa,
+            f.ragged_cfg(),
+        )?;
+
+        let (kp, vp) = perturb_keys(&f.k, &f.v, |i, j| j < leads[i])?;
+        let perturbed = dsv4_attention(
+            &f.q,
+            &kp,
+            &vp,
+            Some(&f.comp),
+            None,
+            &flash,
+            &sdpa,
+            f.ragged_cfg(),
+        )?;
+        assert_eq!(
+            max_abs_diff(&flat(&perturbed), &flat(&clean)),
+            0.0,
+            "the zero-filled dead prefix took softmax weight — a zero K row is not a masked row"
+        );
+
+        // Negative control: the SAME perturbation one column later — the first
+        // genuinely live column of the longest-padded row — must move the
+        // output by O(1), or the probe above is vacuous.
+        let last = leads.len() - 1;
+        let (kc, vc) = perturb_keys(&f.k, &f.v, |i, j| i == last && j == leads[last])?;
+        let control = dsv4_attention(
+            &f.q,
+            &kc,
+            &vc,
+            Some(&f.comp),
+            None,
+            &flash,
+            &sdpa,
+            f.ragged_cfg(),
+        )?;
+        assert!(
+            max_abs_diff(&flat(&control), &flat(&clean)) > 1e-2,
+            "perturbing a LIVE key did not move the output, so the dead-prefix probe proves nothing"
+        );
+        Ok(())
+    }
+
+    /// A row cannot be **ahead** of the cohort, and the vector must describe
+    /// the batch it is handed. Both are caller/cache disagreements that would
+    /// otherwise mask from the wrong geometry silently.
+    #[test]
+    fn an_inconsistent_row_q0_vector_is_refused() -> Result<()> {
+        let device = Device::Cpu;
+        let f = ragged_fixture(&device)?;
+        let (sdpa, _sinks) = sdpa_params_with_sinks(f.d, f.h, &device)?;
+        let flash = empty_flash_params();
+        let call = |rows: &[usize]| {
+            dsv4_attention(
+                &f.q,
+                &f.k,
+                &f.v,
+                Some(&f.comp),
+                None,
+                &flash,
+                &sdpa,
+                Dsv4AttentionConfig {
+                    row_q0: Some(rows),
+                    ..f.cfg()
+                },
+            )
+        };
+
+        // `q0` is the batch maximum by construction (left-alignment ends every
+        // row at the same column), so a larger value is incoherent.
+        let ahead = vec![f.padded + 1, f.lens[1], f.lens[2]];
+        let err = call(&ahead).unwrap_err().to_string();
+        assert!(
+            err.contains("AHEAD of the batch"),
+            "expected an ahead-of-batch refusal, got: {err}"
+        );
+
+        // Wrong width: silently zipping a short vector against the batch would
+        // mask row 2 from row 0's geometry.
+        let short = vec![f.lens[0], f.lens[1]];
+        let err = call(&short).unwrap_err().to_string();
+        assert!(
+            err.contains("per-row query positions for a batch of"),
+            "expected a batch-width refusal, got: {err}"
+        );
+
+        // Ragged, but with NO row at the shared end column: not the layout
+        // `front_pad_kv_cache` produces, so the geometry this module would mask
+        // from does not hold.
+        let floating: Vec<usize> = f.lens.iter().map(|l| l - 1).collect();
+        let err = call(&floating).unwrap_err().to_string();
+        assert!(
+            err.contains("no row sits at the batch's shared end column"),
+            "expected a not-left-aligned refusal, got: {err}"
         );
         Ok(())
     }

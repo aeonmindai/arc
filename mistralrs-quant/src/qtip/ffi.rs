@@ -562,6 +562,9 @@ extern "C" {
         num_symbols: i32,
         max_m_tiles: i32,
         mult: u32,
+        // 0 = baseline (the kernel as first measured), 1 = tuned. Both
+        // variants are compiled in; selection is per launch, never per build.
+        variant: i32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
@@ -580,6 +583,9 @@ extern "C" {
         num_symbols: i32,
         max_m_tiles: i32,
         mult: u32,
+        // 0 = baseline (the kernel as first measured), 1 = tuned. Both
+        // variants are compiled in; selection is per launch, never per build.
+        variant: i32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 }
