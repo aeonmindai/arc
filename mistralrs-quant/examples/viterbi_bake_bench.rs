@@ -20,7 +20,10 @@ use mistralrs_quant::{QtipLayer, QtipMode};
 use std::time::Instant;
 
 fn env_usize(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(d)
 }
 
 fn main() -> candle_core::Result<()> {
@@ -50,7 +53,10 @@ fn main() -> candle_core::Result<()> {
     let secs = t0.elapsed().as_secs_f64();
 
     let td = Instant::now();
-    let deq = layer.dequantize_w()?.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+    let deq = layer
+        .dequantize_w()?
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?;
     let dequant_s = td.elapsed().as_secs_f64();
 
     // Quality vs original FP weights: cosine similarity of the full tensors.
@@ -64,8 +70,8 @@ fn main() -> candle_core::Result<()> {
     let checksum = a.abs()?.sum_all()?.to_scalar::<f32>()? as f64;
 
     let full_gate = secs * (2048.0 / n as f64); // extrapolate this projection to N=2048
-    // down [256,7168,2048]: 3.5x gate rows but 0.29x per-row (num_symbols
-    // 1024 vs 3584) -> ~1x a gate projection. So layer ~= gate+up+down ~= 3x.
+                                                // down [256,7168,2048]: 3.5x gate rows but 0.29x per-row (num_symbols
+                                                // 1024 vs 3584) -> ~1x a gate projection. So layer ~= gate+up+down ~= 3x.
     let full_layer = 3.0 * full_gate;
     println!("  QUANTIZE(bake): {secs:.2}s   [dequant-only(not bake): {dequant_s:.2}s]   QUALITY cos(deq,fp)={cos:.5}   checksum={checksum:.6e}");
     println!(

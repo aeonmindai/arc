@@ -773,8 +773,13 @@ fn v4_mtp_draft_depends_on_the_target_hidden_state_not_only_the_token() {
         .take()
         .expect("an armed MTP kit must capture the target's hidden states");
     assert_eq!(
-        start_pos, 0,
+        start_pos.row(0),
+        Some(0),
         "the capture must be tagged with the absolute position of its first row"
+    );
+    assert!(
+        start_pos.describes(1),
+        "a one-row forward's capture must describe one row"
     );
     assert_eq!(
         captured.dims(),
