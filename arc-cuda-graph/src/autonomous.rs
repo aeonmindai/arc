@@ -229,7 +229,7 @@ impl AutonomousDecodeRunner {
         // Construct a complete DecodeBuffers struct by cloning the relevant
         // fields. DecodeBuffers fields are u64/usize/bool/i32 — all Copy — so
         // this is a cheap byte copy.
-        let bs = decode_buffers_template.batch_size;
+        let bs = decode_buffers_template.capacity;
         let sm_count = decode_buffers_template.sm_count;
         let buffers = crate::decode_forward::DecodeBuffers {
             hidden_a: decode_buffers_template.hidden_a,
@@ -254,7 +254,7 @@ impl AutonomousDecodeRunner {
             cos_table: decode_buffers_template.cos_table,
             sin_table: decode_buffers_template.sin_table,
             is_neox: decode_buffers_template.is_neox,
-            batch_size: bs,
+            capacity: bs,
             sm_count,
         };
 
@@ -273,7 +273,7 @@ impl AutonomousDecodeRunner {
             // `weights` is borrowed by `capture_via_decode_forward` and stored
             // in `weights_ptr`; the closure is dropped before this fn returns.
             unsafe {
-                crate::decode_forward::decode_forward(&*weights_ptr, &buffers, &paged, stream);
+                crate::decode_forward::decode_forward(&*weights_ptr, &buffers, &paged, bs, stream);
                 // Cast F32 logits → BF16 into the runner's pre-allocated
                 // logits_buf so the sampling kernels (which only support BF16)
                 // can consume them.

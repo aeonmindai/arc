@@ -638,7 +638,10 @@ mod cuda_afq3_tests {
             let (wq_c, s_c, b_c) = afq_quantize_op(&w_cpu, gs, bits)?;
 
             // --- bit-identical check on packed codes (u32) ---
-            let wq_g_v = wq_g.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u32>()?;
+            let wq_g_v = wq_g
+                .to_device(&Device::Cpu)?
+                .flatten_all()?
+                .to_vec1::<u32>()?;
             let wq_c_v = wq_c.flatten_all()?.to_vec1::<u32>()?;
             assert_eq!(wq_g_v.len(), wq_c_v.len(), "packed length mismatch");
             let mism = wq_g_v
@@ -649,12 +652,28 @@ mod cuda_afq3_tests {
             let total = wq_g_v.len();
 
             // scales / biases identical?
-            let sg = s_g.to_device(&Device::Cpu)?.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+            let sg = s_g
+                .to_device(&Device::Cpu)?
+                .flatten_all()?
+                .to_dtype(DType::F32)?
+                .to_vec1::<f32>()?;
             let sc = s_c.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-            let s_mism = sg.iter().zip(sc.iter()).filter(|(a, b)| (*a - *b).abs() > 1e-6).count();
-            let bg = b_g.to_device(&Device::Cpu)?.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+            let s_mism = sg
+                .iter()
+                .zip(sc.iter())
+                .filter(|(a, b)| (*a - *b).abs() > 1e-6)
+                .count();
+            let bg = b_g
+                .to_device(&Device::Cpu)?
+                .flatten_all()?
+                .to_dtype(DType::F32)?
+                .to_vec1::<f32>()?;
             let bc = b_c.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-            let b_mism = bg.iter().zip(bc.iter()).filter(|(a, b)| (*a - *b).abs() > 1e-6).count();
+            let b_mism = bg
+                .iter()
+                .zip(bc.iter())
+                .filter(|(a, b)| (*a - *b).abs() > 1e-6)
+                .count();
 
             // --- round-trip quality ---
             let dq_g = afq_dequantize_op(&wq_g, &s_g, &b_g, gs, bits)?.to_device(&Device::Cpu)?;
@@ -668,7 +687,10 @@ mod cuda_afq3_tests {
                  cos(orig,gpu)={cos_orig_g:.6} cos(orig,cpu)={cos_orig_c:.6} cos(gpu,cpu)={cos_gc:.6}"
             );
 
-            assert_eq!(mism, 0, "GPU packing not bit-identical to CPU ({mism}/{total})");
+            assert_eq!(
+                mism, 0,
+                "GPU packing not bit-identical to CPU ({mism}/{total})"
+            );
             assert_eq!(s_mism, 0, "scales differ");
             assert_eq!(b_mism, 0, "biases differ");
             assert!(cos_gc > 0.99999, "gpu/cpu dequant cos too low: {cos_gc}");
@@ -1925,7 +1947,10 @@ mod cuda_backend {
                 );
             }
             let rhs_indices = _rhs_indices.unwrap();
-            let idx = rhs_indices.to_dtype(DType::U32)?.flatten_all()?.contiguous()?;
+            let idx = rhs_indices
+                .to_dtype(DType::U32)?
+                .flatten_all()?
+                .contiguous()?;
             let p = idx.dims1()?;
             let k = x.dim(D::Minus1)?;
             // Every row of x (all dims but the last) maps to exactly one index.
@@ -1942,8 +1967,8 @@ mod cuda_backend {
             let w_sel = w.index_select(&idx, 0)?;
             let s_sel = scales.index_select(&idx, 0)?;
             let b_sel = biases.index_select(&idx, 0)?;
-            let w_deq = afq_dequantize_op(&w_sel, &s_sel, &b_sel, group_size, bits)?
-                .to_dtype(x.dtype())?;
+            let w_deq =
+                afq_dequantize_op(&w_sel, &s_sel, &b_sel, group_size, bits)?.to_dtype(x.dtype())?;
             let x_flat = x.reshape((p, 1, k))?.contiguous()?;
             let prod = if transpose {
                 x_flat.matmul(&w_deq.transpose(D::Minus1, D::Minus2)?.contiguous()?)?
