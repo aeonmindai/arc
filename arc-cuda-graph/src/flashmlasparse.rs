@@ -924,4 +924,68 @@ mod tests {
         assert_eq!(got, want, "radix top-k must select the largest `topk` rows");
         Ok(())
     }
+
+    /// THE REGRESSION. Every supported `topk` must be correct at a REAL
+    /// vocabulary width, not just the 4096 used above.
+    ///
+    /// `topk_radix_kernel<kTopK>` was launched with `blockDim = kTopK` while it
+    /// initialises and cumsum-scans a `RADIX + 1 = 257` entry shared histogram
+    /// via `if (tx < RADIX + 1)` / `if (tx < RADIX)`. For `kTopK < 257` the
+    /// histogram tail is never zeroed and never scanned, so the suffix sum -- and
+    /// therefore the threshold bin -- is wrong. Two consequences, and the quiet
+    /// one is worse:
+    ///
+    ///   * `kTopK = 64` over a row of >= 32768: enough indices clear the bogus
+    ///     threshold to overrun the UNBOUNDED `output[atomicAdd(&s_counter,1)]`
+    ///     write into `__shared__ int32_t s_topk_indices[kTopK]` -- an illegal
+    ///     memory access that poisons the CUDA context for the whole process.
+    ///     (`s_input_idx` next to it IS bounds-checked; this write was not.)
+    ///   * `kTopK = 128` / `256`: also below 257, so also scanning a partial
+    ///     histogram. These do NOT crash -- they can return the WRONG candidate
+    ///     set silently, which no downstream quality regression would ever trace
+    ///     back to this kernel.
+    ///
+    /// The kernel only ever ran at `topk = 512` (V4's `index_topk`) until the
+    /// sampler began dispatching small `k_sel`, so neither surfaced before. The
+    /// 4096-length test above cannot catch either case: the crash needs a long
+    /// row, and the partial scan needs enough bins occupied to go wrong.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn radix_topk_is_correct_at_full_vocab_for_every_supported_k() -> Result<()> {
+        use candle_core::Device;
+
+        let Ok(cuda) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        // DeepSeek-V4-Flash vocabulary. The crash needs len >= 32768.
+        let len = 129_280usize;
+
+        for &topk in SUPPORTED_TOPK {
+            // Bulk: a narrow, dense band -- what real logits look like. It
+            // collapses most of the vocab into very few coarse radix bins.
+            let mut scores: Vec<f32> = (0..len)
+                .map(|i| -2.0 + ((i * 7919) % 1000) as f32 / 2000.0)
+                .collect();
+            // Plant exactly `topk` unambiguous winners at scattered indices.
+            let mut want: Vec<u32> = Vec::with_capacity(topk);
+            for j in 0..topk {
+                let idx = (j * 1013 + 17) % len;
+                scores[idx] = 100.0 + j as f32;
+                want.push(idx as u32);
+            }
+            want.sort_unstable();
+
+            let t = Tensor::from_vec(scores, (1, len), &cuda)?;
+            let idx = radix_topk_rows_f32(&t, topk)?;
+            assert_eq!(idx.dims(), &[1, topk]);
+
+            let mut got: Vec<u32> = idx.reshape((topk,))?.to_vec1()?;
+            got.sort_unstable();
+            assert_eq!(
+                got, want,
+                "radix top-k returned the wrong candidate set at topk={topk}, len={len}"
+            );
+        }
+        Ok(())
+    }
 }
