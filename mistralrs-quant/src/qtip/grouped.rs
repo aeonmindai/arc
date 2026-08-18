@@ -60,9 +60,17 @@ pub const QTIP_GROUPED_VARIANT_BASELINE: i32 = 0;
 /// the pair-swap out of the per-weight decode. Mirrors
 /// `QTIP_GROUPED_VARIANT_TUNED`.
 pub const QTIP_GROUPED_VARIANT_TUNED: i32 = 1;
+/// Variant 1 plus two instruction-level collapses, both bit-exact: one packed
+/// f32->16-bit convert in place of `q2b_pack2`'s two scalar converts + shift +
+/// or, and one `ldmatrix.x4` in place of the four `LDS.32` A-fragment loads.
+/// `ldmatrix` is only conflict-free here BECAUSE variant 1 already padded the
+/// staged activation stride to 144 B. Mirrors `QTIP_GROUPED_VARIANT_LDST`.
+pub const QTIP_GROUPED_VARIANT_LDST: i32 = 2;
+/// Number of selectable variants; also the launch-counter array length.
+pub const QTIP_GROUPED_VARIANT_COUNT: usize = 3;
 
-/// Env override for [`grouped_variant`]. Accepts `baseline`/`0` or
-/// `tuned`/`1`. Latched on first read, then overridable in-process by
+/// Env override for [`grouped_variant`]. Accepts `baseline`/`0`, `tuned`/`1`
+/// or `ldst`/`2`. Latched on first read, then overridable in-process by
 /// [`set_grouped_variant`].
 pub const QTIP_GROUPED_VARIANT_ENV: &str = "ARC_QTIP_GROUPED_VARIANT";
 
@@ -77,7 +85,8 @@ static GROUPED_VARIANT: std::sync::atomic::AtomicI32 =
 /// silently fails to take would otherwise produce a table of one kernel
 /// measured twice — the exact defect that voided the previous grouped-GEMM
 /// microbench (FACTS, wave35-BM).
-static GROUPED_LAUNCHES: [std::sync::atomic::AtomicU64; 2] = [
+static GROUPED_LAUNCHES: [std::sync::atomic::AtomicU64; QTIP_GROUPED_VARIANT_COUNT] = [
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
 ];
@@ -101,6 +110,7 @@ pub fn grouped_variant() -> i32 {
     let init = match std::env::var(QTIP_GROUPED_VARIANT_ENV) {
         Ok(s) => match s.trim().to_ascii_lowercase().as_str() {
             "tuned" | "1" => QTIP_GROUPED_VARIANT_TUNED,
+            "ldst" | "2" => QTIP_GROUPED_VARIANT_LDST,
             _ => QTIP_GROUPED_VARIANT_BASELINE,
         },
         Err(_) => QTIP_GROUPED_VARIANT_BASELINE,
@@ -123,14 +133,16 @@ pub(crate) fn note_grouped_launch(variant: i32) {
     }
 }
 
-/// Launches so far, `[baseline, tuned]`. A harness that reports a per-variant
-/// timing MUST show this counter advancing on the variant it claims to have
-/// measured, or the number describes some other kernel.
-pub fn grouped_launch_counts() -> [u64; 2] {
-    [
-        GROUPED_LAUNCHES[0].load(std::sync::atomic::Ordering::Relaxed),
-        GROUPED_LAUNCHES[1].load(std::sync::atomic::Ordering::Relaxed),
-    ]
+/// Launches so far, indexed by variant id. A harness that reports a
+/// per-variant timing MUST show this counter advancing on the variant it
+/// claims to have measured, and NOT advancing on the others, or the number
+/// describes some other kernel.
+pub fn grouped_launch_counts() -> [u64; QTIP_GROUPED_VARIANT_COUNT] {
+    let mut out = [0u64; QTIP_GROUPED_VARIANT_COUNT];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = GROUPED_LAUNCHES[i].load(std::sync::atomic::Ordering::Relaxed);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -480,6 +492,91 @@ mod tests {
         assert_eq!(
             checked, len,
             "the sweep must cover every symbol, or a broken region could hide"
+        );
+    }
+
+    /// The `ldmatrix.x4` address formula in `q2b_ldmatrix_x4` is a DERIVATION,
+    /// and it is the part of variant 2 most likely to be silently wrong — a
+    /// wrong lane->address map still loads real data, still runs, and just
+    /// computes the wrong GEMM. The PTX ISA's `ldmatrix` section is truncated
+    /// in the published HTML, so the derivation could not be read off a doc.
+    ///
+    /// This simulates the instruction from its two structural rules and
+    /// asserts the result lands exactly on the `mma.m16n8k16` A fragment:
+    ///   * `.x4` sub-matrix `i` takes its 8 row addresses from lanes `8i..8i+7`;
+    ///   * within an 8x8 `.b16` matrix, lane `l` receives row `l/4`,
+    ///     columns `(l%4)*2 .. +1`.
+    ///
+    /// The A fragment it must reproduce (g = lane>>2, tig = lane&3):
+    ///
+    /// ```text
+    /// a0 = (row g,   k 2tig..+1)    a1 = (row g+8, k 2tig..+1)
+    /// a2 = (row g,   k 2tig+8..9)   a3 = (row g+8, k 2tig+8..9)
+    /// ```
+    #[test]
+    fn ldmatrix_x4_address_map_lands_on_the_mma_a_fragment() {
+        const X_STRIDE: usize = 72; // variant 1's padded stride, in elements
+        let elem = |row: usize, k: usize| row * 1000 + k;
+
+        for kb in [0usize, 16, 32, 48] {
+            // What each lane hands the instruction (q2b_ldmatrix_x4's caller).
+            let addr = |lane: usize| (lane & 15) * X_STRIDE + kb + if lane >= 16 { 8 } else { 0 };
+
+            let mut got = [[0usize; 2]; 32 * 4];
+            for sub in 0..4usize {
+                let row_start: Vec<usize> = (0..8).map(|r| addr(sub * 8 + r)).collect();
+                for lane in 0..32usize {
+                    let base = row_start[lane / 4];
+                    for (c, slot) in got[lane * 4 + sub].iter_mut().enumerate() {
+                        let off = base + (lane % 4) * 2 + c;
+                        *slot = elem(off / X_STRIDE, off % X_STRIDE);
+                    }
+                }
+            }
+
+            for lane in 0..32usize {
+                let (g, tig) = (lane >> 2, lane & 3);
+                let want = [
+                    [elem(g, kb + tig * 2), elem(g, kb + tig * 2 + 1)],
+                    [elem(g + 8, kb + tig * 2), elem(g + 8, kb + tig * 2 + 1)],
+                    [elem(g, kb + tig * 2 + 8), elem(g, kb + tig * 2 + 9)],
+                    [elem(g + 8, kb + tig * 2 + 8), elem(g + 8, kb + tig * 2 + 9)],
+                ];
+                for (i, w) in want.iter().enumerate() {
+                    assert_eq!(
+                        &got[lane * 4 + i],
+                        w,
+                        "ldmatrix.x4 register a{i} for lane {lane} (g={g}, tig={tig}, kb={kb}) \
+                         does not land on the mma A fragment"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `ldmatrix` is only safe here BECAUSE variant 1 padded the staged
+    /// activation stride. At the original 128 B stride every row of a phase
+    /// lands on ONE bank; the check must show that difference, or it is not
+    /// evidence for the padded stride.
+    #[test]
+    fn ldmatrix_phase_is_conflict_free_only_at_the_padded_stride() {
+        let distinct_banks = |stride_elems: usize| -> usize {
+            let mut seen = std::collections::HashSet::new();
+            for row in 0..8usize {
+                seen.insert(((row * stride_elems * 2) / 4) % 32);
+            }
+            seen.len()
+        };
+        assert_eq!(
+            distinct_banks(64),
+            1,
+            "the ORIGINAL 64-element (128 B) stride must be shown to collide, or this test is \
+             not evidence that the padding is what makes ldmatrix safe"
+        );
+        assert_eq!(
+            distinct_banks(72),
+            8,
+            "variant 1's 72-element (144 B) stride must spread one ldmatrix phase over 8 banks"
         );
     }
 

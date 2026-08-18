@@ -190,6 +190,7 @@ constexpr uint32_t QG_INVALID_PAIR = 0xFFFFFFFFu;
 // `QTIP_GROUPED_VARIANT_BASELINE` / `_TUNED` (src/qtip/grouped.rs).
 constexpr int QTIP_GROUPED_VARIANT_BASELINE = 0;
 constexpr int QTIP_GROUPED_VARIANT_TUNED    = 1;
+constexpr int QTIP_GROUPED_VARIANT_LDST     = 2;
 // Persistent-CTA grid cap (see tuning notes).
 constexpr int QG_MAX_GRID = 1024;
 
@@ -244,6 +245,69 @@ template <>
 __device__ __forceinline__ uint32_t q2b_pack2<__half>(float lo, float hi) {
     return (uint32_t)__half_as_ushort(__float2half_rn(lo)) |
            ((uint32_t)__half_as_ushort(__float2half_rn(hi)) << 16);
+}
+
+// ---------------------------------------------------------------------------
+// Variant 2: pack two f32 into one 16-bit-pair register in ONE conversion.
+//
+// `q2b_pack2` above costs four instructions per pair — two scalar converts, a
+// shift and an or — which is ~2 ops per decoded weight, the second largest
+// per-weight item after the codeword itself. `__floats2bfloat162_rn` /
+// `__floats2half2_rn` are the vector converts for exactly this, and both carry
+// the SAME round-to-nearest-even the scalar forms use, so the packed result is
+// bit-identical.
+//
+// ⚠️ "Should be bit-identical" is not evidence. The PTX ISA sections for
+// `cvt.rn.bf16x2.f32` and `ldmatrix` are TRUNCATED in the published HTML (the
+// same gap the wgmma work hit), so the rounding equivalence is NOT taken from
+// a doc we could read. It is taken from the hardware: the A/B harness refuses
+// to report a timing unless variant 2's output is byte-for-byte equal to the
+// baseline's, over millions of output bytes, with the grouped launch counters
+// proving both kernels actually ran. Believe the artefact.
+template <typename T>
+__device__ __forceinline__ uint32_t q2b_pack2_fast(float lo, float hi);
+
+template <>
+__device__ __forceinline__ uint32_t q2b_pack2_fast<__nv_bfloat16>(float lo, float hi) {
+    const __nv_bfloat162 p = __floats2bfloat162_rn(lo, hi);  // .x = lo, .y = hi
+    uint32_t r;
+    memcpy(&r, &p, sizeof(r));
+    return r;
+}
+
+template <>
+__device__ __forceinline__ uint32_t q2b_pack2_fast<__half>(float lo, float hi) {
+    const __half2 p = __floats2half2_rn(lo, hi);
+    uint32_t r;
+    memcpy(&r, &p, sizeof(r));
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// Variant 2: the whole A fragment in ONE instruction.
+//
+// The four `a[i]` are four LDS.32 in variants 0/1. `ldmatrix.x4` fetches all
+// four 8x8 b16 sub-matrices in a single LDSM. The mapping is exact, not
+// approximate — for `mma.m16n8k16` the A fragment is
+//     a0 = (row g,   k 2tig..+1)   a1 = (row g+8, k 2tig..+1)
+//     a2 = (row g,   k 2tig+8..9)  a3 = (row g+8, k 2tig+8..9)
+// and `ldmatrix.x4` returns sub-matrix i in register i, with each sub-matrix
+// distributed as `lane -> row lane/4, cols (lane%4)*2 .. +1`. Sub-matrix 0 is
+// rows 0-7 x k 0-7, 1 is rows 8-15 x k 0-7, 2 is rows 0-7 x k 8-15, 3 is rows
+// 8-15 x k 8-15 — so register i lands on a[i] with no shuffling, provided
+// lane l supplies the address of
+//     s_x[(l & 15)][kb + (l >= 16 ? 8 : 0)]
+//
+// Bank behaviour: ldmatrix resolves 8 rows per phase, and at variant 1's
+// 144 B stride the eight addresses of a phase sit at word (36*row) => banks
+// (4*row) % 32 = 0,4,...,28 — eight distinct banks, conflict-free. At the
+// ORIGINAL 128 B stride all eight would collide on one bank, so this
+// instruction is only safe *because* the Phase 1 padding is already there.
+__device__ __forceinline__ void q2b_ldmatrix_x4(const void* smem_row, uint32_t* a) {
+    const uint32_t addr = (uint32_t)__cvta_generic_to_shared(smem_row);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+                 : "r"(addr));
 }
 
 // Decode the weight at chunk-local symbol `ts` from a staged 32-byte packed
@@ -441,7 +505,7 @@ __device__ __forceinline__ void q2b_stage_chunk(
     }
 }
 
-template <typename T, bool TUNED>
+template <typename T, int VARIANT>
 __global__ void __launch_bounds__(QG_THREADS)
 qtip2b_grouped_gemm_kernel(
     const uint8_t*  __restrict__ packed,         // [E, n_rows, packed_per_row]
@@ -461,6 +525,8 @@ qtip2b_grouped_gemm_kernel(
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     // Staged strides differ per variant (bank-conflict fix); everything else
     // about the layout, the tile geometry and the math is identical.
+    constexpr bool TUNED = VARIANT >= QTIP_GROUPED_VARIANT_TUNED;
+    constexpr bool LDST  = VARIANT >= QTIP_GROUPED_VARIANT_LDST;
     constexpr int X_STRIDE  = TUNED ? QG_X_STRIDE_T : QG_TILE_K;
     constexpr int WP_STRIDE = TUNED ? QG_WP_STRIDE_T : QG_WP_STRIDE;
     static_assert(X_STRIDE * sizeof(T) % 16 == 0, "cp.async needs 16 B aligned x rows");
@@ -559,10 +625,17 @@ qtip2b_grouped_gemm_kernel(
                 const int kb = kf * 16;
                 const T* s_x_buf = &s_x[buf][0];
                 uint32_t a[4];
-                a[0] = *reinterpret_cast<const uint32_t*>(&s_x_buf[(size_t)(g    ) * X_STRIDE + kb + tig * 2    ]);
-                a[1] = *reinterpret_cast<const uint32_t*>(&s_x_buf[(size_t)(g + 8) * X_STRIDE + kb + tig * 2    ]);
-                a[2] = *reinterpret_cast<const uint32_t*>(&s_x_buf[(size_t)(g    ) * X_STRIDE + kb + tig * 2 + 8]);
-                a[3] = *reinterpret_cast<const uint32_t*>(&s_x_buf[(size_t)(g + 8) * X_STRIDE + kb + tig * 2 + 8]);
+                if constexpr (LDST) {
+                    // One LDSM instead of four LDS.32. Lane l addresses
+                    // row (l & 15), k-half (l >= 16); see q2b_ldmatrix_x4.
+                    q2b_ldmatrix_x4(
+                        &s_x_buf[(size_t)(lane & 15) * X_STRIDE + kb + ((lane >= 16) ? 8 : 0)], a);
+                } else {
+                    a[0] = *reinterpret_cast<const uint32_t*>(&s_x_buf[(size_t)(g    ) * X_STRIDE + kb + tig * 2    ]);
+                    a[1] = *reinterpret_cast<const uint32_t*>(&s_x_buf[(size_t)(g + 8) * X_STRIDE + kb + tig * 2    ]);
+                    a[2] = *reinterpret_cast<const uint32_t*>(&s_x_buf[(size_t)(g    ) * X_STRIDE + kb + tig * 2 + 8]);
+                    a[3] = *reinterpret_cast<const uint32_t*>(&s_x_buf[(size_t)(g + 8) * X_STRIDE + kb + tig * 2 + 8]);
+                }
                 #pragma unroll
                 for (int f = 0; f < 2; ++f) {
                     const uint8_t* srow = &s_wp[buf][(warp * 16 + f * 8 + g) * WP_STRIDE];
@@ -581,8 +654,14 @@ qtip2b_grouped_gemm_kernel(
                         w2 = q2b_decode_smem(srow, kb + tig * 2 + 8, mult) * s;
                         w3 = q2b_decode_smem(srow, kb + tig * 2 + 9, mult) * s;
                     }
-                    const uint32_t b0 = q2b_pack2<T>(w0, w1);
-                    const uint32_t b1 = q2b_pack2<T>(w2, w3);
+                    uint32_t b0, b1;
+                    if constexpr (LDST) {
+                        b0 = q2b_pack2_fast<T>(w0, w1);
+                        b1 = q2b_pack2_fast<T>(w2, w3);
+                    } else {
+                        b0 = q2b_pack2<T>(w0, w1);
+                        b1 = q2b_pack2<T>(w2, w3);
+                    }
                     q2b_mma16816<T>::run(acc[f], a, b0, b1);
                 }
             }
@@ -666,18 +745,28 @@ void launch_qtip2b_moe_route(
         const int grid =                                                       \
             (int)(max_tiles < (long)QG_MAX_GRID ? max_tiles : (long)QG_MAX_GRID); \
         if (grid <= 0) return;                                                 \
-        if (variant == QTIP_GROUPED_VARIANT_TUNED) {                           \
-            qtip2b_grouped_gemm_kernel<T, true>                                \
+        switch (variant) {                                                     \
+        case QTIP_GROUPED_VARIANT_LDST:                                        \
+            qtip2b_grouped_gemm_kernel<T, QTIP_GROUPED_VARIANT_LDST>           \
                 <<<grid, QG_THREADS, 0, stream>>>(                             \
                     d_packed, d_row_scales, d_x_rotated, d_sorted_pairs,       \
                     d_tile_expert, d_tile_row_start, d_offsets, d_num_tiles,   \
                     d_y, n_rows, packed_per_row, num_symbols, mult);           \
-        } else {                                                               \
-            qtip2b_grouped_gemm_kernel<T, false>                               \
+            break;                                                             \
+        case QTIP_GROUPED_VARIANT_TUNED:                                       \
+            qtip2b_grouped_gemm_kernel<T, QTIP_GROUPED_VARIANT_TUNED>          \
                 <<<grid, QG_THREADS, 0, stream>>>(                             \
                     d_packed, d_row_scales, d_x_rotated, d_sorted_pairs,       \
                     d_tile_expert, d_tile_row_start, d_offsets, d_num_tiles,   \
                     d_y, n_rows, packed_per_row, num_symbols, mult);           \
+            break;                                                             \
+        default:                                                               \
+            qtip2b_grouped_gemm_kernel<T, QTIP_GROUPED_VARIANT_BASELINE>       \
+                <<<grid, QG_THREADS, 0, stream>>>(                             \
+                    d_packed, d_row_scales, d_x_rotated, d_sorted_pairs,       \
+                    d_tile_expert, d_tile_row_start, d_offsets, d_num_tiles,   \
+                    d_y, n_rows, packed_per_row, num_symbols, mult);           \
+            break;                                                             \
         }                                                                      \
     }
 

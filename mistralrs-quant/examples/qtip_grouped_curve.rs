@@ -78,7 +78,7 @@ use mistralrs_quant::{
     bake_cache, grouped_launch_counts, qtip_expected_distinct_experts, set_grouped_variant,
     BakeCacheError, BakeKey, Qtip2bLayer, QtipMode, QuantMethod, QTIP_GATHER_GEMV_MAX_PAIRS,
     QTIP_GROUPED_TILE_K, QTIP_GROUPED_TILE_M, QTIP_GROUPED_VARIANT_BASELINE,
-    QTIP_GROUPED_VARIANT_TUNED, QTIP_ONDEVICE_MOE_MAX_TOKENS_ENV,
+    QTIP_GROUPED_VARIANT_COUNT, QTIP_ONDEVICE_MOE_MAX_TOKENS_ENV,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -753,19 +753,23 @@ fn bake_or_load(dev: &Device, cfg: &Cfg, s: &Shape) -> Result<Arc<dyn QuantMetho
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Arm {
-    /// Baseline kernel in the baseline slot.
+    /// Control kernel in the control slot.
     U,
-    /// Tuned kernel in the treatment slot.
+    /// Treatment kernel in the treatment slot.
     F,
-    /// Baseline kernel in the TREATMENT slot — the run's own floor.
+    /// CONTROL kernel in the TREATMENT slot — the run's own floor.
     N,
 }
 
 impl Arm {
-    fn variant(self) -> i32 {
+    /// Which kernel variant this arm launches. `N` deliberately launches the
+    /// CONTROL variant while occupying the treatment slot: any difference it
+    /// shows is pure instrument, measured in this run rather than assumed
+    /// from another.
+    fn variant(self, base: i32, test: i32) -> i32 {
         match self {
-            Arm::F => QTIP_GROUPED_VARIANT_TUNED,
-            Arm::U | Arm::N => QTIP_GROUPED_VARIANT_BASELINE,
+            Arm::F => test,
+            Arm::U | Arm::N => base,
         }
     }
     fn tag(self) -> &'static str {
@@ -792,10 +796,12 @@ fn time_arm(
     a: &Tensor,
     idx_sets: &[Tensor],
     iters: usize,
+    base: i32,
+    test: i32,
 ) -> Result<f64> {
-    set_grouped_variant(arm.variant());
-    let want = arm.variant() as usize;
-    let other = 1 - want;
+    let v = arm.variant(base, test);
+    set_grouped_variant(v);
+    let want = v as usize;
 
     for r in 0..4usize {
         let _ = layer.gather_forward(a, &idx_sets[r % idx_sets.len()])?;
@@ -812,7 +818,10 @@ fn time_arm(
     let after = grouped_launch_counts();
 
     let ran = after[want] - before[want];
-    let stray = after[other] - before[other];
+    let stray: u64 = (0..QTIP_GROUPED_VARIANT_COUNT)
+        .filter(|i| *i != want)
+        .map(|i| after[i] - before[i])
+        .sum();
     if ran != iters as u64 {
         candle_core::bail!(
             "arm {}: asked for grouped variant {want} and the runtime counter advanced by {ran}, \
@@ -823,8 +832,8 @@ fn time_arm(
     }
     if stray != 0 {
         candle_core::bail!(
-            "arm {}: {stray} launches of grouped variant {other} happened inside this arm's \
-             timing window. The two arms are not separated.",
+            "arm {}: {stray} launches of OTHER grouped variants happened inside this arm's \
+             timing window ({before:?} -> {after:?}). The arms are not separated.",
             arm.tag()
         );
     }
@@ -842,6 +851,8 @@ fn assert_variants_bit_identical(
     layer: &Arc<dyn QuantMethod>,
     a: &Tensor,
     idx_sets: &[Tensor],
+    base: i32,
+    test: i32,
 ) -> Result<()> {
     let bytes = |t: &Tensor| -> Result<Vec<u8>> {
         let f = t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
@@ -862,7 +873,11 @@ fn assert_variants_bit_identical(
         let out = f()?;
         let after = grouped_launch_counts();
         let idx = want as usize;
-        if after[idx] - before[idx] != 1 || after[1 - idx] != before[1 - idx] {
+        let stray: u64 = (0..QTIP_GROUPED_VARIANT_COUNT)
+            .filter(|i| *i != idx)
+            .map(|i| after[i] - before[i])
+            .sum();
+        if after[idx] - before[idx] != 1 || stray != 0 {
             candle_core::bail!(
                 "parity check never reached grouped variant {want}: launches went {before:?} -> \
                  {after:?}. gather_forward took some OTHER path (fused GEMV or the CPU \
@@ -873,42 +888,39 @@ fn assert_variants_bit_identical(
         bytes(&out)
     };
 
-    let base = counted(QTIP_GROUPED_VARIANT_BASELINE, &|| {
-        layer.gather_forward(a, &idx_sets[0])
-    })?;
-    let tuned = counted(QTIP_GROUPED_VARIANT_TUNED, &|| {
-        layer.gather_forward(a, &idx_sets[0])
-    })?;
+    let ctrl = counted(base, &|| layer.gather_forward(a, &idx_sets[0]))?;
+    let treat = counted(test, &|| layer.gather_forward(a, &idx_sets[0]))?;
     dev.synchronize()?;
 
     // Negative control: a different routing draw MUST produce different bytes,
     // or this comparison could not have detected a wrong kernel either.
-    set_grouped_variant(QTIP_GROUPED_VARIANT_BASELINE);
+    set_grouped_variant(base);
     let elsewhere = bytes(&layer.gather_forward(a, &idx_sets[1 % idx_sets.len()])?)?;
-    if elsewhere == base {
+    if elsewhere == ctrl {
         candle_core::bail!(
             "PARITY CHECK IS BLIND: two DIFFERENT routing draws produced byte-identical output, \
              so byte-equality cannot distinguish the tuned kernel from a wrong one."
         );
     }
 
-    let diff = base
+    let diff = ctrl
         .iter()
-        .zip(tuned.iter())
+        .zip(treat.iter())
         .filter(|(x, y)| x != y)
         .count();
     if diff != 0 {
         candle_core::bail!(
-            "tuned grouped variant is NOT bit-identical to the baseline: {diff}/{} bytes differ. \
-             The pair-reversal is a pure bit permutation, so ANY difference is a bug, not a \
-             tolerance question.",
-            base.len()
+            "grouped variant {test} is NOT bit-identical to variant {base}: {diff}/{} bytes \
+             differ. Every shipped variant is a pure re-routing to the same weights — the \
+             pair-reversal is a bit permutation and the packed converts carry the same \
+             round-to-nearest-even — so ANY difference is a bug, not a tolerance question.",
+            ctrl.len()
         );
     }
     println!(
-        "parity OK: tuned == baseline byte-for-byte over {} output bytes; a different routing \
-         draw differs (control has teeth).",
-        base.len()
+        "parity OK: variant {test} == variant {base} byte-for-byte over {} output bytes; a \
+         different routing draw differs (control has teeth).",
+        ctrl.len()
     );
     Ok(())
 }
@@ -918,6 +930,13 @@ fn mean(v: &[f64]) -> f64 {
 }
 
 fn run_ab(dev: &Device, cfg: &Cfg, act_dtype: DType, b: usize, rounds: usize) -> Result<()> {
+    let (base_v, test_v) = (cfg.base_variant, cfg.test_variant);
+    if base_v == test_v {
+        candle_core::bail!(
+            "--base-variant and --test-variant are both {base_v}: the treatment and control \
+             arms would be the same kernel and every difference reported would be instrument."
+        );
+    }
     let shapes = ab_shapes(cfg.small);
     assert_coverage_headroom(cfg.experts, &[b])?;
 
@@ -945,7 +964,7 @@ fn run_ab(dev: &Device, cfg: &Cfg, act_dtype: DType, b: usize, rounds: usize) ->
             "\n[{}] N={} K={} E={} B={b} pairs={} E(B)={mean_distinct:.1} m-tiles={mean_tiles:.1}",
             s.name, s.n, s.k, cfg.experts, pairs as usize
         );
-        assert_variants_bit_identical(dev, &layer, &a, &idx_sets)?;
+        assert_variants_bit_identical(dev, &layer, &a, &idx_sets, base_v, test_v)?;
 
         // U F U N, repeated. Every treatment slot is differenced against the
         // U that immediately precedes it.
@@ -956,7 +975,7 @@ fn run_ab(dev: &Device, cfg: &Cfg, act_dtype: DType, b: usize, rounds: usize) ->
 
         for round in 0..rounds {
             for arm in seq {
-                let secs = time_arm(dev, &layer, arm, &a, &idx_sets, cfg.iters)?;
+                let secs = time_arm(dev, &layer, arm, &a, &idx_sets, cfg.iters, base_v, test_v)?;
                 let unit = secs / mean_tiles * 1e6;
                 let rel = last_u.map(|u| (u - secs) / u * 100.0);
                 println!(
@@ -1031,6 +1050,10 @@ struct Cfg {
     ab: Option<usize>,
     /// `U F U N` repetitions in `--ab`.
     rounds: usize,
+    /// Control kernel variant for `--ab` (default 0 = baseline).
+    base_variant: i32,
+    /// Treatment kernel variant for `--ab` (default 1 = tuned).
+    test_variant: i32,
     /// Directory holding cached Viterbi bakes. The bake is ~95% of a run's
     /// GPU time and is byte-identical every time, so caching it is what makes
     /// repeated kernel sweeps affordable.
@@ -1046,6 +1069,8 @@ fn parse_args() -> Result<Cfg> {
         ab: None,
         rounds: 3,
         bake_cache: None,
+        base_variant: 0,
+        test_variant: 1,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -1087,9 +1112,17 @@ fn parse_args() -> Result<Cfg> {
                 cfg.bake_cache = Some(need(i)?);
                 i += 2;
             }
+            "--base-variant" => {
+                cfg.base_variant = need(i)?.parse().map_err(candle_core::Error::wrap)?;
+                i += 2;
+            }
+            "--test-variant" => {
+                cfg.test_variant = need(i)?.parse().map_err(candle_core::Error::wrap)?;
+                i += 2;
+            }
             other => candle_core::bail!(
                 "unknown flag {other}; accepted: --experts N --iters N --batches a,b,c --small \
-                 --ab B --rounds N --bake-cache DIR"
+                 --ab B --rounds N --bake-cache DIR --base-variant N --test-variant N"
             ),
         }
     }
@@ -1255,12 +1288,13 @@ fn main() -> Result<()> {
         Ok(dev) => {
             if let Some(b) = cfg.ab {
                 println!(
-                    "=== qtip2b grouped-GEMM KERNEL VARIANT A/B at B={b} \
+                    "=== qtip2b grouped-GEMM KERNEL VARIANT A/B at B={b}: control=variant {} vs \
+                     treatment=variant {} \
                      (U F U N x {}, {} iters/arm, top-{TOPK}, Viterbi+rotation) ===\n\
                      Instrument: wall clock across {} synchronized gather_forward calls — the \
                      SAME instrument that produced the wave38 crossover table, so the numbers are \
                      comparable to it and NOT to any device-timer span.\n",
-                    cfg.rounds, cfg.iters, cfg.iters
+                    cfg.base_variant, cfg.test_variant, cfg.rounds, cfg.iters, cfg.iters
                 );
                 // The guards still have to prove they can fail before any
                 // number is printed, even in --ab.
