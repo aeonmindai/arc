@@ -222,7 +222,11 @@ else
   echo "asan:     on (row allocated at exactly packed_bytes_per_row)"
 fi
 echo
-"${CXX}" -std=c++17 -O1 -g -Wall -Wextra -Werror "${SAN[@]}" \
+# `${SAN[@]+...}` and not `${SAN[@]}`: under `set -u`, expanding an EMPTY array
+# is an unbound-variable error in bash <= 4.3 (macOS ships 3.2), so the
+# no-sanitizer fallback would abort the gate on exactly the runners that need
+# it. Caught by forcing the fallback, not by reading the script.
+"${CXX}" -std=c++17 -O1 -g -Wall -Wextra -Werror ${SAN[@]+"${SAN[@]}"} \
          -I "${KDIR}" -o "${OUT}/qtip_pack_host_check" \
          "${OUT}/qtip_pack_host_check.cpp"
 "${OUT}/qtip_pack_host_check"
