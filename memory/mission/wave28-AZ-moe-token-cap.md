@@ -80,7 +80,7 @@ because the grouped kernel exists on the *other* rung (§4).
 ## 2. The true limit — arithmetic
 
 Launch geometry, both gather-GEMV kernels
-(`qtip_gather_gemv.cu:437-441`, `qtip_bitshift.cu:548-562`):
+(`qtip_gather_gemv.cu:390-397`, `qtip_bitshift.cu:548-562`):
 
 ```
 grid  = (ceil(n_rows / (WARPS_PER_BLOCK * ROWS_PER_WARP)), n_pairs, 1)
@@ -92,7 +92,7 @@ with `WARPS_PER_BLOCK = 8`, `ROWS_PER_WARP = 2` ⇒ `ROWS_PER_BLOCK = 16`.
 
 | candidate bound | value | depends on tokens? |
 |---|---|---|
-| shared memory / block | `16 * packed_per_row` B. V4 gate/up `K=4096` ⇒ `packed_per_row = 4096/4 = 1024` B ⇒ **16 KiB**, under the 48 KiB staging threshold | **no** — weight shape only. Over 48 KiB the launcher passes `stage_packed = 0` and reads from global: degradation, not failure (`qtip_gather_gemv.cu:435-436`) |
+| shared memory / block | `16 * packed_per_row` B. V4 gate/up `K=4096` ⇒ `packed_per_row = 4096/4 = 1024` B ⇒ **16 KiB**, under the 48 KiB staging threshold | **no** — weight shape only. Over 48 KiB the launcher passes `stage_packed = 0` and reads from global: degradation, not failure (`qtip_gather_gemv.cu:391-392`) |
 | registers / thread | `ROWS_PER_WARP = 2` accumulators + 2 row pointers + 2 scales + `GROUP = 4` `float2` staged activations + trellis state; `__launch_bounds__(256)` caps allocation | **no** — all compile-time |
 | occupancy | more pairs ⇒ more blocks ⇒ strictly better | **no** |
 | **`grid.y`** | **65535** (CUDA C Programming Guide, "Technical Specifications per Compute Capability"; unchanged for every CC ≥ 2.0) | **yes** |
