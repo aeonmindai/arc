@@ -331,35 +331,51 @@ using G_K8V4L12_LUT = Geom<8, 4, 12, CB_LUT_BF16>;      // 32 KB bf16 LUT
                                                  mult, s_lut);                 \
     }
 
+// NG LADDER: 4 / 8 / 12.
+//
+// The first census run used 8/16/24 and hit a HARD 4096-instruction ceiling:
+// census_g1_ng24, g1b_ng24, g1h_ng24 and g1w_ng24 all reported EXACTLY 4096 on
+// both sm_80 and sm_90, while g2_ng24 came in at 4048 on sm_80 and reported
+// clean. Four different kernel bodies landing on the same power of two is a
+// clamp, not a coincidence -- beyond it the unroller stops and the count stops
+// tracking NG, which destroys the differential. The linearity check caught it
+// (92.56% divergence on g1) and the numbers were discarded.
+//
+// NG=12 keeps the largest body (g1, ~250 inst/group) near 3,000 -- comfortably
+// clear of the ceiling -- while still giving an 8-group lever arm.
+#define NG_LO 4
+#define NG_MID 8
+#define NG_HI 12
+
 // --- Geometry 1: shipped K4/V2/L16, computed codebook, replay, no hoist ------
-CENSUS_KERNEL(g1_ng8, G_K4V2L16_CB, 8, 2, false, WIN_REPLAY)
-CENSUS_KERNEL(g1_ng16, G_K4V2L16_CB, 16, 2, false, WIN_REPLAY)
-CENSUS_KERNEL(g1_ng24, G_K4V2L16_CB, 24, 2, false, WIN_REPLAY)
+CENSUS_KERNEL(g1_ng4, G_K4V2L16_CB, NG_LO, 2, false, WIN_REPLAY)
+CENSUS_KERNEL(g1_ng8, G_K4V2L16_CB, NG_MID, 2, false, WIN_REPLAY)
+CENSUS_KERNEL(g1_ng12, G_K4V2L16_CB, NG_HI, 2, false, WIN_REPLAY)
 
 // --- Geometry 2: K4/V2/L13, 32 KB bf16 LUT, replay, no hoist -----------------
-CENSUS_KERNEL(g2_ng8, G_K4V2L13_LUT, 8, 2, false, WIN_REPLAY)
-CENSUS_KERNEL(g2_ng16, G_K4V2L13_LUT, 16, 2, false, WIN_REPLAY)
-CENSUS_KERNEL(g2_ng24, G_K4V2L13_LUT, 24, 2, false, WIN_REPLAY)
+CENSUS_KERNEL(g2_ng4, G_K4V2L13_LUT, NG_LO, 2, false, WIN_REPLAY)
+CENSUS_KERNEL(g2_ng8, G_K4V2L13_LUT, NG_MID, 2, false, WIN_REPLAY)
+CENSUS_KERNEL(g2_ng12, G_K4V2L13_LUT, NG_HI, 2, false, WIN_REPLAY)
 
 // --- Geometry 3: K8/V4/L12, 32 KB bf16 LUT, replay, no hoist -----------------
-CENSUS_KERNEL(g3_ng8, G_K8V4L12_LUT, 8, 2, false, WIN_REPLAY)
-CENSUS_KERNEL(g3_ng16, G_K8V4L12_LUT, 16, 2, false, WIN_REPLAY)
-CENSUS_KERNEL(g3_ng24, G_K8V4L12_LUT, 24, 2, false, WIN_REPLAY)
+CENSUS_KERNEL(g3_ng4, G_K8V4L12_LUT, NG_LO, 2, false, WIN_REPLAY)
+CENSUS_KERNEL(g3_ng8, G_K8V4L12_LUT, NG_MID, 2, false, WIN_REPLAY)
+CENSUS_KERNEL(g3_ng12, G_K8V4L12_LUT, NG_HI, 2, false, WIN_REPLAY)
 
 // --- Lever #2: row-scale hoist ----------------------------------------------
-CENSUS_KERNEL(g1h_ng8, G_K4V2L16_CB, 8, 2, true, WIN_REPLAY)
-CENSUS_KERNEL(g1h_ng24, G_K4V2L16_CB, 24, 2, true, WIN_REPLAY)
-CENSUS_KERNEL(g3h_ng8, G_K8V4L12_LUT, 8, 2, true, WIN_REPLAY)
-CENSUS_KERNEL(g3h_ng24, G_K8V4L12_LUT, 24, 2, true, WIN_REPLAY)
+CENSUS_KERNEL(g1h_ng4, G_K4V2L16_CB, NG_LO, 2, true, WIN_REPLAY)
+CENSUS_KERNEL(g1h_ng12, G_K4V2L16_CB, NG_HI, 2, true, WIN_REPLAY)
+CENSUS_KERNEL(g3h_ng4, G_K8V4L12_LUT, NG_LO, 2, true, WIN_REPLAY)
+CENSUS_KERNEL(g3h_ng12, G_K8V4L12_LUT, NG_HI, 2, true, WIN_REPLAY)
 
 // --- Lever #3: random-access window in place of the warm-up replay -----------
-CENSUS_KERNEL(g1w_ng8, G_K4V2L16_CB, 8, 2, false, WIN_PRMT)
-CENSUS_KERNEL(g1w_ng24, G_K4V2L16_CB, 24, 2, false, WIN_PRMT)
-CENSUS_KERNEL(g1b_ng8, G_K4V2L16_CB, 8, 2, false, WIN_BREV)
-CENSUS_KERNEL(g1b_ng24, G_K4V2L16_CB, 24, 2, false, WIN_BREV)
-CENSUS_KERNEL(g3w_ng8, G_K8V4L12_LUT, 8, 2, false, WIN_PRMT)
-CENSUS_KERNEL(g3w_ng24, G_K8V4L12_LUT, 24, 2, false, WIN_PRMT)
+CENSUS_KERNEL(g1w_ng4, G_K4V2L16_CB, NG_LO, 2, false, WIN_PRMT)
+CENSUS_KERNEL(g1w_ng12, G_K4V2L16_CB, NG_HI, 2, false, WIN_PRMT)
+CENSUS_KERNEL(g1b_ng4, G_K4V2L16_CB, NG_LO, 2, false, WIN_BREV)
+CENSUS_KERNEL(g1b_ng12, G_K4V2L16_CB, NG_HI, 2, false, WIN_BREV)
+CENSUS_KERNEL(g3w_ng4, G_K8V4L12_LUT, NG_LO, 2, false, WIN_PRMT)
+CENSUS_KERNEL(g3w_ng12, G_K8V4L12_LUT, NG_HI, 2, false, WIN_PRMT)
 
 // --- Both levers stacked on the best geometry --------------------------------
-CENSUS_KERNEL(g3wh_ng8, G_K8V4L12_LUT, 8, 2, true, WIN_PRMT)
-CENSUS_KERNEL(g3wh_ng24, G_K8V4L12_LUT, 24, 2, true, WIN_PRMT)
+CENSUS_KERNEL(g3wh_ng4, G_K8V4L12_LUT, NG_LO, 2, true, WIN_PRMT)
+CENSUS_KERNEL(g3wh_ng12, G_K8V4L12_LUT, NG_HI, 2, true, WIN_PRMT)

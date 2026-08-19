@@ -30,6 +30,16 @@ MAX_BLOCKS_PER_SM = 32
 REG_ALLOC_GRAN = 8         # registers are allocated in units of 8 per thread
 STATIC_SMEM_LIMIT = 48 * 1024
 
+# Register-blocking factor compiled into every census kernel. Each of the ROWS
+# rows runs its own independent trellis chain over the shared activations, so a
+# group decodes WEIGHTS_PER_GROUP * ROWS weights, not WEIGHTS_PER_GROUP.
+ROWS = 2
+
+# NG ladder and the observed hard ceiling. Past ~4096 instructions the unroller
+# clamps and the count stops tracking NG, silently breaking the differential.
+STEP = 4          # NG spacing (4 -> 8 -> 12)
+SATURATION = 4000  # refuse to report any count at or above this
+
 # An instruction line looks like `/*0a10*/   IMAD R5, R2, R3, R4 ;`
 # An encoding line looks like     `/* 0x000fe200078e00ff */`  -- note the space.
 INSN_RE = re.compile(r"^\s*/\*[0-9a-f]{4}\*/\s+(\S.*?);")
@@ -121,7 +131,7 @@ GEOMS = [
     ("g3", 8, 4, 12, 8, "K8/V4/L12 bf16 LUT"),
 ]
 
-# Lever variants: prefix -> label. Each has _ng8 and _ng24 only.
+# Lever variants: prefix -> label. Each has _ng4 and _ng12 only.
 LEVERS = [
     ("g1h", "g1", "SHIPPED + row-scale hoist (lever 2)"),
     ("g1w", "g1", "SHIPPED + PRMT window (lever 3)"),
@@ -187,22 +197,28 @@ def main():
 
     results = {}
     for pre, K, V, L, wpg, label in GEOMS:
-        n8, n16, n24 = c(f"{pre}_ng8"), c(f"{pre}_ng16"), c(f"{pre}_ng24")
-        if None in (n8, n16, n24):
+        n4, n8, n12 = c(f"{pre}_ng4"), c(f"{pre}_ng8"), c(f"{pre}_ng12")
+        if None in (n4, n8, n12):
             print(f"  {label}: MISSING KERNELS")
             continue
-        d1 = (n16 - n8) / (8 * wpg)     # first half-difference
-        d2 = (n24 - n16) / (8 * wpg)    # second half-difference
-        ipw = (n24 - n8) / (16 * wpg)
+        # WEIGHTS per group = weights_per_group * ROWS. ROWS is real work: each
+        # of the ROWS rows decodes its own independent trellis chain over the
+        # same activations. Omitting it understates the denominator and inflates
+        # inst/weight by exactly ROWS (this bug made the first run 2x too high).
+        wpg_eff = wpg * ROWS
+        d1 = (n8 - n4) / (STEP * wpg_eff)    # first half-difference
+        d2 = (n12 - n8) / (STEP * wpg_eff)   # second half-difference
+        ipw = (n12 - n4) / (2 * STEP * wpg_eff)
         lin = abs(d2 - d1) / max(d1, 1e-9) * 100.0
         bpw = K / V
         blo = BUDGET_LO_AT_2BPW * bpw / 2.0
         bhi = BUDGET_HI_AT_2BPW * bpw / 2.0
-        verdict = "OK" if lin < 1.0 else "NOT STEADY"
+        sat = max(n4, n8, n12) >= SATURATION
+        verdict = "SATURATED" if sat else ("OK" if lin < 1.0 else "NOT STEADY")
         results[pre] = dict(ipw=ipw, bpw=bpw, blo=blo, bhi=bhi, lin=lin,
-                            label=label, over=ipw / bhi)
+                            label=label, over=ipw / bhi, ok=(not sat and lin < 1.0))
         print(f"{label:<32}{bpw:>5.2f}{blo:>6.2f}-{bhi:<6.2f}{ipw:>10.3f}"
-              f"{lin:>10.2f}%{verdict:>10}")
+              f"{lin:>10.2f}%{verdict:>11}")
 
     # ---- levers ------------------------------------------------------------
     print()
@@ -210,13 +226,15 @@ def main():
     print("LEVERS  (MEASURED, same differential; delta vs its own baseline)")
     print("=" * 78)
     for pre, base, label in LEVERS:
-        n8, n24 = c(f"{pre}_ng8"), c(f"{pre}_ng24")
-        if None in (n8, n24) or base not in results:
+        n4, n12 = c(f"{pre}_ng4"), c(f"{pre}_ng12")
+        if None in (n4, n12) or base not in results:
             continue
-        wpg = 8
-        ipw = (n24 - n8) / (16 * wpg)
+        wpg_eff = 8 * ROWS
+        ipw = (n12 - n4) / (2 * STEP * wpg_eff)
+        sat = max(n4, n12) >= SATURATION
         delta = ipw - results[base]["ipw"]
-        print(f"{label:<44}{ipw:>9.3f} inst/wt   {delta:+7.3f} vs {base}")
+        flag = "  <-- SATURATED, DISCARD" if sat else ""
+        print(f"{label:<44}{ipw:>9.3f} inst/wt   {delta:+7.3f} vs {base}{flag}")
 
     # ---- shared memory + occupancy ----------------------------------------
     print()
@@ -227,7 +245,7 @@ def main():
           f"{'blk/SM':>8}{'warps':>7}{'occ%':>7}  limiter")
     print("-" * 78)
     for pre, K, V, L, wpg, label in GEOMS:
-        k = f"census_{pre}_ng24"
+        k = f"census_{pre}_ng12"
         p = ptx.get(k)
         if not p:
             continue
