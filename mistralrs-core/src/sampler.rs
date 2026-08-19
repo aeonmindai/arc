@@ -1725,6 +1725,7 @@ mod tests {
                 min_p,
                 nsigma,
                 vec![],
+                None,
             )
             .unwrap()
         };
@@ -1784,6 +1785,7 @@ mod tests {
             vec![std::sync::Arc::new(
                 |logits: &candle_core::Tensor, _: &[u32]| Ok(logits.clone()),
             )],
+            None,
         )
         .unwrap();
         assert!(with_processor.is_greedy());
