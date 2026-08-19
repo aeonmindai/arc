@@ -24,16 +24,39 @@ use std::collections::HashMap;
 #[cfg(feature = "cuda")]
 struct CapturedGraph {
     exec: CUgraphExec,
-    output: Tensor,
+    /// `Option` so [`Drop`] can release it BEFORE the pool dies. Its storage was
+    /// allocated from `pool` during capture, and dropping it returns that
+    /// pointer to the device alloc cache — which must then be drained while the
+    /// pool is still alive.
+    output: Option<Tensor>,
     /// Private memory pool for this graph's allocations
     pool: CUmemoryPool,
+    /// Needed to drain the alloc cache before `pool` is destroyed.
+    device: Device,
 }
 
 #[cfg(feature = "cuda")]
 impl Drop for CapturedGraph {
     fn drop(&mut self) {
+        // ORDER IS THE FIX. Previously this destroyed the exec and the pool and
+        // left `output` to drop afterwards (fields drop after the Drop body),
+        // which returned a private-pool pointer to the device alloc cache
+        // AFTER that pool no longer existed. The cache then handed it out again.
+        //
+        // 1. exec first: once it is destroyed no replay can reference the
+        //    captured addresses, so freeing them is safe.
         unsafe {
             cuGraphExecDestroy(self.exec);
+        }
+        // 2. release the captured output so its storage reaches the cache.
+        drop(self.output.take());
+        // 3. drain the cache while the pool is STILL ALIVE, so every buffer
+        //    allocated from it is freed into the pool that owns it.
+        if let Device::Cuda(cd) = &self.device {
+            cd.drain_alloc_cache_and_free();
+        }
+        // 4. only now is the pool unreferenced.
+        unsafe {
             cuMemPoolDestroy(self.pool);
         }
     }
@@ -41,18 +64,50 @@ impl Drop for CapturedGraph {
 
 #[cfg(feature = "cuda")]
 pub struct CudaGraphRunner {
+    /// Kept so every pool-destroying path can drain the alloc cache first.
+    device: Device,
     stream: CUstream,
     device_ordinal: CUdevice,
     graphs: HashMap<usize, CapturedGraph>,
     enabled: bool,
     warmup_remaining: u32,
-    /// RUN-161: the deferred-free warmup pass has run. After the eager warmups
-    /// (which only fill the alloc cache to peak-live), exactly one forward must
-    /// run with the device in capture mode so the cache grows to the FULL
-    /// per-forward allocation count (every alloc distinct, frees deferred).
+    /// Successful `replay()` calls. Together with `graphs.len()` this is the
+    /// only honest answer to "did ArcGraph do anything this run" — see
+    /// [`CudaGraphRunner::status_line`]. A runner that constructed, logged
+    /// "initialized", and then did nothing reports `captured=0 replayed=0`.
+    replays: u64,
+    /// Replays still owed a side-by-side eager comparison before the graph's
+    /// output is trusted as this step's logits.
+    ///
+    /// Turning replay output ON is the one change in this subsystem that can
+    /// corrupt tokens silently: a graph reading a stale address returns
+    /// plausible logits, not an error. So the first `verify_remaining` replays
+    /// run the eager forward too and compare; only after they agree does the
+    /// replay output get used on its own. Set by `ARC_GRAPH_VERIFY_REPLAYS`
+    /// (default 3); 0 means trust immediately and is not recommended.
+    verify_remaining: u32,
+    /// Set once a verification has failed — latches replay off permanently.
+    verify_failed: bool,
+    /// RUN-161: deferred-free warmup passes still owed. After the eager warmups
+    /// (which only fill the alloc cache to peak-live), forwards must run with
+    /// the device in capture mode so the cache grows to the FULL per-forward
+    /// allocation count (every alloc distinct, frees deferred).
     /// Generic: the caller toggles the device's capture mode; the runner just
-    /// tracks that the pass is owed. See `try_take_deferred_pass`.
-    deferred_pass_done: bool,
+    /// tracks how many passes are owed. See `try_take_deferred_pass`.
+    ///
+    /// This was a `bool` — exactly one pass. That is only sufficient if the
+    /// per-forward allocation set is the SAME at every decode step. It is not
+    /// obviously so: a single pass runs at kv_len = N and capture then runs at
+    /// kv_len = N+1, so any buffer whose size tracks context length is a size
+    /// the cache has never seen, and it becomes an unstable graph memory node.
+    /// A measured V4 capture showed four distinct sizes missing at capture time
+    /// (131072, 135168, 16896, 132 bytes) after the single pass had run.
+    /// Making the count tunable turns "how many passes are enough?" into a
+    /// measurement instead of an assumption — and if no finite number drives
+    /// the miss count to zero, that is itself the answer: the sizes are
+    /// context-dependent and the real fix is shape-constant buffers, not more
+    /// warmup.
+    deferred_passes_remaining: u32,
 }
 
 #[cfg(feature = "cuda")]
@@ -63,20 +118,64 @@ unsafe impl Sync for CudaGraphRunner {}
 #[cfg(feature = "cuda")]
 impl CudaGraphRunner {
     pub fn new(device: &Device, warmup_steps: u32) -> candle_core::Result<Self> {
+        Self::new_with_passes(device, warmup_steps, Self::default_deferred_passes())
+    }
+
+    /// Number of deferred-free warmup passes, from `ARC_GRAPH_DEFERRED_PASSES`
+    /// (default 1, the historical behaviour). See `deferred_passes_remaining`.
+    pub fn default_deferred_passes() -> u32 {
+        std::env::var("ARC_GRAPH_DEFERRED_PASSES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(1)
+    }
+
+    pub fn new_with_passes(
+        device: &Device,
+        warmup_steps: u32,
+        deferred_passes: u32,
+    ) -> candle_core::Result<Self> {
         let Device::Cuda(cuda_dev) = device else {
             candle_core::bail!("CudaGraphRunner requires a CUDA device");
         };
         let stream = cuda_dev.cuda_stream().cu_stream();
 
         if stream.is_null() {
-            tracing::warn!("CUDA graph: NULL stream, capture disabled");
+            // Not a bug in this crate, and not a lost stream: candle's
+            // `BackendDevice::new` binds `CudaContext::default_stream()`, which
+            // is the legacy default stream (handle 0). `cuStreamBeginCapture`
+            // rejects it by CUDA's own rules, so capture is genuinely
+            // impossible on this device — permanently, for this process.
+            //
+            // The remedy is a *launch-time* decision, so name it here: the
+            // operator reading this line is the only one who can act on it.
+            tracing::warn!(
+                "ArcGraph INERT: candle is on the legacy default (NULL) stream, which CUDA \
+                 forbids capturing. No CUDA graph will be captured or replayed for the life of \
+                 this process, and decode will run entirely eagerly. To enable capture, restart \
+                 with ARC_CAPTURE_STREAM=1 (server_builder init_device -> \
+                 Device::new_cuda_with_stream, a real capturable stream). Note capture also \
+                 requires ARC_V4_CAPTURE_PROBE=1 and ARC_CANDLE_ALLOC_CACHE=1; all three are \
+                 unset by default."
+            );
+            arc_profiler::mark_unreachable(
+                "cuda_graph.capture",
+                "candle is on the legacy default (NULL) stream; cuStreamBeginCapture is refused, \
+                 so no graph is captured or replayed. Set ARC_CAPTURE_STREAM=1 to bind a \
+                 capturable stream.",
+                "arc-cuda-graph/src/graph.rs:71",
+            );
             return Ok(Self {
+                device: device.clone(),
                 stream,
                 device_ordinal: 0,
                 graphs: HashMap::new(),
                 enabled: false,
                 warmup_remaining: 0,
-                deferred_pass_done: false,
+                replays: 0,
+                verify_remaining: 0,
+                verify_failed: false,
+                deferred_passes_remaining: 0,
             });
         }
 
@@ -89,17 +188,75 @@ impl CudaGraphRunner {
         tracing::info!("CUDA graph: non-null stream on device {ordinal}, capture enabled");
 
         Ok(Self {
+            device: device.clone(),
             stream,
             device_ordinal: ordinal,
             graphs: HashMap::new(),
             enabled: true,
             warmup_remaining: warmup_steps,
-            deferred_pass_done: false,
+            replays: 0,
+            verify_remaining: Self::default_verify_replays(),
+            verify_failed: false,
+            deferred_passes_remaining: deferred_passes,
         })
+    }
+
+    /// Free every cached buffer while the private pool is still alive.
+    ///
+    /// MUST precede every `cuMemPoolDestroy`. Allocations that miss the cache
+    /// during capture come from the private pool (`cuMemAllocAsync` draws from
+    /// the device's current default pool), and the cache records no pool
+    /// provenance — so a pointer outliving its pool is handed out again and
+    /// eventually freed into a pool that no longer exists. That is the host
+    /// heap corruption.
+    fn drain_alloc_cache(&self) {
+        if let Device::Cuda(cd) = &self.device {
+            cd.drain_alloc_cache_and_free();
+        }
     }
 
     pub fn is_enabled(&self) -> bool {
         self.enabled && self.warmup_remaining == 0
+    }
+
+    /// Whether capture is physically possible on this device — i.e. the stream
+    /// is capturable and no capture attempt has failed and latched `enabled`
+    /// off.
+    ///
+    /// Distinct from [`is_enabled`](Self::is_enabled), which additionally
+    /// requires warmup to have finished. Callers reporting *status* want this
+    /// one; callers deciding whether to capture *now* want `is_enabled`.
+    pub fn capture_possible(&self) -> bool {
+        self.enabled
+    }
+
+    /// Graphs actually captured and instantiated, keyed by batch size.
+    pub fn graphs_captured(&self) -> usize {
+        self.graphs.len()
+    }
+
+    /// Successful graph replays so far.
+    pub fn replays(&self) -> u64 {
+        self.replays
+    }
+
+    /// The one line that distinguishes a working ArcGraph from an inert one.
+    ///
+    /// D18: "CUDA graph runner initialized" is emitted by a runner that will
+    /// never capture anything, so it carries no information. This does:
+    /// `captured=0 replayed=0` is a subsystem that did nothing, and says so in
+    /// terms nobody can mistake for success.
+    pub fn status_line(&self) -> String {
+        format!(
+            "ARCGRAPH STATUS: capture_possible={} captured={} replayed={} \
+output_trusted={} verify_remaining={} verify_failed={}",
+            self.enabled,
+            self.graphs.len(),
+            self.replays,
+            self.replay_output_trusted(),
+            self.verify_remaining,
+            self.verify_failed
+        )
     }
 
     /// Returns `true` exactly once, after warmup completes and before the graph
@@ -108,12 +265,61 @@ impl CudaGraphRunner {
     /// ... `set_capture_mode(false)`) to grow the free pool to the full
     /// per-forward allocation count. Generic across models.
     pub fn try_take_deferred_pass(&mut self) -> bool {
-        if self.enabled && self.warmup_remaining == 0 && !self.deferred_pass_done {
-            self.deferred_pass_done = true;
+        if self.enabled && self.warmup_remaining == 0 && self.deferred_passes_remaining > 0 {
+            self.deferred_passes_remaining -= 1;
             true
         } else {
             false
         }
+    }
+
+    /// How many replays must be proven against an eager forward before the
+    /// graph's output is trusted. `ARC_GRAPH_VERIFY_REPLAYS`, default 3.
+    pub fn default_verify_replays() -> u32 {
+        std::env::var("ARC_GRAPH_VERIFY_REPLAYS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(3)
+    }
+
+    /// Does this replay still owe a side-by-side eager comparison?
+    pub fn needs_verification(&self) -> bool {
+        !self.verify_failed && self.verify_remaining > 0
+    }
+
+    /// May the replay's output be used as the step's real logits?
+    pub fn replay_output_trusted(&self) -> bool {
+        !self.verify_failed && self.verify_remaining == 0
+    }
+
+    /// Record one replay that matched the eager forward.
+    pub fn record_verification_pass(&mut self) {
+        if self.verify_remaining > 0 {
+            self.verify_remaining -= 1;
+            if self.verify_remaining == 0 {
+                tracing::info!(
+                    "ArcGraph: replay output VERIFIED against eager; graph output is now used \
+                     as the real logits. {}",
+                    self.status_line()
+                );
+            }
+        }
+    }
+
+    /// Record a replay that did NOT match. Latches replay output off for good.
+    pub fn record_verification_failure(&mut self, detail: &str) {
+        self.verify_failed = true;
+        tracing::error!(
+            "ArcGraph: replay output DIVERGED from the eager forward ({detail}). Graph output \
+             will NOT be used; every step falls back to eager. This is a correctness stop, not a \
+             performance one — a graph that returns plausible-but-wrong logits is worse than no \
+             graph."
+        );
+    }
+
+    /// Deferred-free passes still owed before capture may begin.
+    pub fn deferred_passes_remaining(&self) -> u32 {
+        self.deferred_passes_remaining
     }
 
     pub fn tick_warmup(&mut self) -> bool {
@@ -133,18 +339,40 @@ impl CudaGraphRunner {
     }
 
     /// Replay a previously captured graph. Returns the output tensor.
-    pub fn replay(&self, batch_size: usize) -> candle_core::Result<Tensor> {
+    ///
+    /// Takes `&mut self` so a successful replay is counted — see
+    /// [`status_line`](Self::status_line). Without the count there is no way to
+    /// tell a runner that replayed from one that only initialised.
+    pub fn replay(&mut self, batch_size: usize) -> candle_core::Result<Tensor> {
         let captured = self.graphs.get(&batch_size).ok_or_else(|| {
             candle_core::Error::Msg(format!("No graph for batch_size={batch_size}"))
         })?;
-        unsafe {
+        let sync = unsafe {
             let s = cuGraphLaunch(captured.exec, self.stream);
             if s != CUDA_SUCCESS {
                 candle_core::bail!("cuGraphLaunch failed: {s}");
             }
-            cudaStreamSynchronize(self.stream);
+            // A fault DURING graph execution is asynchronous: the launch above
+            // returns SUCCESS and only the sync reports it. Discarding this
+            // return (the previous behaviour) turned an illegal access into a
+            // silently poisoned context and an output tensor full of whatever
+            // was in the buffer. `end_capture_and_cache` already checks its
+            // first launch this way; replay must too, or every replay after the
+            // first is unchecked.
+            cudaStreamSynchronize(self.stream)
+        };
+        if sync != CUDA_SUCCESS {
+            candle_core::bail!(
+                "graph replay sync failed (async fault during graph execution, \
+                 batch_size={batch_size}): cudaError {sync}"
+            );
         }
-        Ok(captured.output.clone())
+        let out = captured
+            .output
+            .clone()
+            .ok_or_else(|| candle_core::Error::Msg("captured graph has no output".into()))?;
+        self.replays += 1;
+        Ok(out)
     }
 
     /// Create a private memory pool for graph capture.
@@ -178,6 +406,11 @@ impl CudaGraphRunner {
             )
         };
         if s != CUDA_SUCCESS {
+            // No drain needed: this pool was created but never installed as the
+            // device default (`cuDeviceSetMemPool` has not succeeded), so
+            // `cuMemAllocAsync` cannot have served anything from it and the
+            // alloc cache holds no pointer into it. Draining here would flush a
+            // healthy cache for nothing.
             unsafe {
                 cuMemPoolDestroy(pool);
             }
@@ -200,6 +433,11 @@ impl CudaGraphRunner {
         let mut original_pool: CUmemoryPool = std::ptr::null_mut();
         let s = unsafe { cuDeviceGetMemPool(&mut original_pool, self.device_ordinal) };
         if s != CUDA_SUCCESS {
+            // No drain needed: this pool was created but never installed as the
+            // device default (`cuDeviceSetMemPool` has not succeeded), so
+            // `cuMemAllocAsync` cannot have served anything from it and the
+            // alloc cache holds no pointer into it. Draining here would flush a
+            // healthy cache for nothing.
             unsafe {
                 cuMemPoolDestroy(graph_pool);
             }
@@ -209,6 +447,11 @@ impl CudaGraphRunner {
         // Install private pool
         let s = unsafe { cuDeviceSetMemPool(self.device_ordinal, graph_pool) };
         if s != CUDA_SUCCESS {
+            // No drain needed: this pool was created but never installed as the
+            // device default (`cuDeviceSetMemPool` has not succeeded), so
+            // `cuMemAllocAsync` cannot have served anything from it and the
+            // alloc cache holds no pointer into it. Draining here would flush a
+            // healthy cache for nothing.
             unsafe {
                 cuMemPoolDestroy(graph_pool);
             }
@@ -227,6 +470,7 @@ impl CudaGraphRunner {
         let s = unsafe { cuStreamBeginCapture_v2(self.stream, CUstreamCaptureMode::RELAXED) };
         if s != CUDA_SUCCESS {
             // Restore original pool before bailing
+            self.drain_alloc_cache();
             unsafe {
                 cuDeviceSetMemPool(self.device_ordinal, original_pool);
             }
@@ -261,6 +505,7 @@ impl CudaGraphRunner {
         let mut graph: CUgraph = std::ptr::null_mut();
         let s = unsafe { cuStreamEndCapture(self.stream, &mut graph) };
         if s != CUDA_SUCCESS {
+            self.drain_alloc_cache();
             unsafe {
                 cuDeviceSetMemPool(self.device_ordinal, original_pool);
                 cuMemPoolDestroy(graph_pool);
@@ -286,6 +531,7 @@ impl CudaGraphRunner {
             cuGraphDestroy(graph);
         }
         if s != CUDA_SUCCESS {
+            self.drain_alloc_cache();
             unsafe {
                 cuDeviceSetMemPool(self.device_ordinal, original_pool);
                 cuMemPoolDestroy(graph_pool);
@@ -298,6 +544,7 @@ impl CudaGraphRunner {
         // allocated/backed here at the capture-time addresses).
         let s = unsafe { cuGraphLaunch(exec, self.stream) };
         if s != CUDA_SUCCESS {
+            self.drain_alloc_cache();
             unsafe {
                 cuDeviceSetMemPool(self.device_ordinal, original_pool);
                 cuGraphExecDestroy(exec);
@@ -338,6 +585,7 @@ impl CudaGraphRunner {
             cuDeviceSetMemPool(self.device_ordinal, original_pool);
         }
         if sync != CUDA_SUCCESS {
+            self.drain_alloc_cache();
             unsafe {
                 cuGraphExecDestroy(exec);
                 cuMemPoolDestroy(graph_pool);
@@ -348,16 +596,19 @@ impl CudaGraphRunner {
             );
         }
 
-        tracing::info!("CUDA graph: captured + launched for batch_size={batch_size}");
-
         let result = output.clone();
         self.graphs.insert(
             batch_size,
             CapturedGraph {
                 exec,
-                output,
+                output: Some(output),
                 pool: graph_pool,
+                device: self.device.clone(),
             },
+        );
+        tracing::info!(
+            "CUDA graph: captured + launched for batch_size={batch_size} — {}",
+            self.status_line()
         );
         Ok(result)
     }
@@ -371,6 +622,11 @@ impl CudaGraphRunner {
                 cuGraphDestroy(graph);
             }
             cuDeviceSetMemPool(self.device_ordinal, original_pool);
+        }
+        // Drain before the pool dies: an aborted capture may already have
+        // allocated from it, and those pointers are in the cache.
+        self.drain_alloc_cache();
+        unsafe {
             cuMemPoolDestroy(graph_pool);
         }
     }

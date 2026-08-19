@@ -92,6 +92,66 @@ impl SingleCache {
     /// constant-offset narrow, so the attention shape is identical every decode
     /// step -> the caching allocator hits and the graph replays. Slots beyond
     /// the current length are stale/zero and must be masked by the caller.
+    /// Pin the graph buffer's capacity so it cannot change again for the run.
+    ///
+    /// # The mechanism this fixes
+    ///
+    /// Capture-time allocation misses were the KV cache **reallocating as it
+    /// grows**. Measured on an H200: sizes 122880 / 172032 / 262144 bytes at
+    /// warmups of 4 / 8 / 16, which decompose as `512 x {120,168,256} x 2`
+    /// with 512 = V4's `head_dim` and 2 = BF16 — so 120/168/256 are cache
+    /// capacities. Capture always lands one growth beyond whatever the warmups
+    /// covered, which is why no finite warmup ever reached zero misses and why
+    /// raising it merely sampled more growth points. Each miss is an unstable
+    /// graph memory node; candle calls that a correctness bug, and the process
+    /// died inside `cuGraphInstantiate` with no Rust-level error.
+    ///
+    /// # Why this pins rather than pre-grows to `max_seq_len`
+    ///
+    /// The obvious fix — allocate at the capacity the cache can never exceed —
+    /// is a trap here. `max_seq_len` is `cfg.max_position_embeddings`, and for
+    /// DeepSeek V4 that is **1,048,576**. At `head_dim` 512 in BF16 across 43
+    /// layers that is ~46 GB of extra VRAM, which would OOM the very box this
+    /// runs on and is simply fatal on an 80 GB card. Growth is the problem, not
+    /// smallness, so the buffer is PINNED at whatever it legitimately needs on
+    /// the first graph append — which happens during warmup, several steps
+    /// before capture, so the size is warm in the alloc cache by then — and any
+    /// later attempt to change it is refused rather than silently invalidating
+    /// a captured graph.
+    ///
+    /// A refusal is the correct failure: the caller disables capture and falls
+    /// back to eager, which is slow and right, instead of replaying a graph
+    /// whose buffer moved underneath it, which is fast and wrong.
+    fn pregrow_for_graph(&mut self, src: &Tensor, read_capacity: usize) -> Result<()> {
+        let need = read_capacity.max(self.capacity_seq_len);
+        match self.all_data.as_ref() {
+            Some(ad) => {
+                let have = ad.dim(self.dim)?;
+                if have < need {
+                    candle_core::bail!(
+                        "graph KV buffer would have to grow from {have} to {need} slots \
+                         mid-run. Growing it now would move the address a captured graph \
+                         has already baked in, so capture must be abandoned rather than \
+                         replayed against a moved buffer. Raise the window or shorten the \
+                         sequence."
+                    );
+                }
+                Ok(())
+            }
+            None => {
+                let mut shape = src.dims().to_vec();
+                shape[self.dim] = need;
+                self.all_data = Some(Tensor::zeros(shape, src.dtype(), src.device())?);
+                // Keep the bookkeeping honest: `try_set_len` and the cache
+                // managers compare against `capacity_seq_len`, and a buffer
+                // that differs from the number it advertises is a trap for the
+                // next reader.
+                self.capacity_seq_len = need;
+                Ok(())
+            }
+        }
+    }
+
     pub fn append_graph(
         &mut self,
         src: &Tensor,
@@ -110,16 +170,12 @@ impl SingleCache {
                 "append_graph is decode-only (src seq len must be 1, got {seq_len})"
             );
         }
-        // Buffer must be at least `read_capacity` along the seq dim. Reuse the
-        // existing (eager-populated) all_data so past K/V is present; only
-        // allocate if absent.
-        let need = read_capacity.max(self.capacity_seq_len);
-        if self.all_data.is_none() {
-            let mut shape = src.dims().to_vec();
-            shape[self.dim] = need;
-            let ad = Tensor::zeros(shape, src.dtype(), src.device())?;
-            self.all_data = Some(ad);
-        }
+        // Same preallocation correction `append` performs. Without it the
+        // graph path inherits the engine's dense [B,H,cap,head_dim] buffer and
+        // a 1-wide V4 marker cannot be written into it.
+        self.reconcile_preallocation(src)?;
+
+        self.pregrow_for_graph(src, read_capacity)?;
         let ad = self.all_data.as_ref().unwrap();
         // Device-slot write of the new token; `write_kv_inplace` uses the
         // buffer's real capacity from all_data's dims, so the slot is correct.
@@ -150,6 +206,42 @@ impl SingleCache {
                 .all(|(i, (a, s))| i == self.dim || a == s)
     }
 
+    /// Discard a preallocated buffer that `src` cannot be written into.
+    ///
+    /// Shared by [`Self::append`] and [`Self::append_graph`] **so the two
+    /// cannot drift**. The graph path not having this was wave48-BY
+    /// reappearing in a path that did not exist when wave48-BY was fixed: the
+    /// engine preallocates from `ModelConfigMetadata::{k_head_dim,v_head_dim}`
+    /// and `activation_dtype`, which assumes dense activation-precision K and V
+    /// at the declared head width, and V4's V half is a 1-wide marker
+    /// (`V4_V_MARKER_WIDTH` — V *is* K for fused MQA). Measured on an H200:
+    /// `append_graph V half failed (k=[1,1,1,512], v=[1,1,1,1]) : kv-write:
+    /// src [1,1,1,1] incompatible with cache [1,1,512,512]`, on the engine's
+    /// own dummy run.
+    ///
+    /// An empty cache's buffer holds nothing, so discarding it is lossless —
+    /// the pre-grow is kept, only dtype and width are corrected. A NON-empty
+    /// cache is real corruption and is raised, never papered over.
+    fn reconcile_preallocation(&mut self, src: &Tensor) -> Result<()> {
+        if self.preallocation_fits(src) {
+            return Ok(());
+        }
+        if self.current_seq_len != 0 {
+            let ad = self.all_data.as_ref().expect("mismatch implies a buffer");
+            candle_core::bail!(
+                "kv-cache: cannot append {:?} {:?} into a cache already holding {} \
+                 token(s) as {:?} {:?} — the layout changed mid-sequence",
+                src.dtype(),
+                src.dims(),
+                self.current_seq_len,
+                ad.dtype(),
+                ad.dims()
+            );
+        }
+        self.all_data = None;
+        Ok(())
+    }
+
     pub fn append(&mut self, src: &Tensor) -> Result<()> {
         let seq_len = src.dim(self.dim)?;
 
@@ -178,21 +270,7 @@ impl SingleCache {
         // cache is a different matter: the tokens already in it were written in
         // some other layout, so a disagreement there is real corruption and is
         // raised rather than papered over.
-        if !self.preallocation_fits(src) {
-            if self.current_seq_len != 0 {
-                let ad = self.all_data.as_ref().expect("mismatch implies a buffer");
-                candle_core::bail!(
-                    "kv-cache: cannot append {:?} {:?} into a cache already holding {} \
-                     token(s) as {:?} {:?} — the layout changed mid-sequence",
-                    src.dtype(),
-                    src.dims(),
-                    self.current_seq_len,
-                    ad.dtype(),
-                    ad.dims()
-                );
-            }
-            self.all_data = None;
-        }
+        self.reconcile_preallocation(src)?;
 
         // This doesn't seem very idiomatic but because the creation can fail, it's tricky to use
         // self.all_data.get_or_insert_with.
@@ -341,6 +419,176 @@ mod tests {
         // And the tokens already cached are untouched.
         assert_eq!(cache.current_seq_len, 1);
         assert_eq!(cache.all_data.as_ref().unwrap().dtype(), DType::BF16);
+        Ok(())
+    }
+
+    /// wave48-BY, in the CUDA-graph path. The engine preallocates the KV buffer
+    /// from `ModelConfigMetadata::v_head_dim` — dense, activation-precision, at
+    /// the declared head width — and installs it as `all_data` before the first
+    /// append (`CacheInstruction::Reset { load_preallocated_cache: true }`).
+    /// V4's V half is a 1-wide marker, so that buffer does not fit.
+    ///
+    /// `append` has corrected this since wave48-BY; `append_graph` was written
+    /// later and did not, which is why V4 capture died on the engine's own
+    /// dummy run with
+    ///   `kv-write: src [1,1,1,1] incompatible with cache [1,1,512,512]`.
+    ///
+    /// Mutation: drop the `reconcile_preallocation` call from `append_graph`
+    /// and this fails with exactly that message.
+    #[test]
+    fn append_graph_corrects_a_preallocated_buffer_of_the_wrong_width() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut cache = SingleCache::new(2, 4096, 512);
+        // What the engine installs: dense V at the declared head width.
+        cache.all_data = Some(Tensor::zeros((1, 1, 512, 512), DType::F32, &dev)?);
+        assert_eq!(cache.current_seq_len, 0, "fixture must be an EMPTY preallocation");
+
+        // What V4 actually writes: a 1-wide marker.
+        let marker = Tensor::zeros((1, 1, 1, 1), DType::F32, &dev)?;
+        cache.reconcile_preallocation(&marker)?;
+        assert!(
+            cache.all_data.is_none(),
+            "an ill-fitting EMPTY preallocation must be discarded so it can be \
+             reallocated at the marker's width"
+        );
+        Ok(())
+    }
+
+    /// The other half of the contract: a NON-empty cache is real corruption and
+    /// must be raised, never silently discarded — that would drop live tokens.
+    #[test]
+    fn reconcile_refuses_to_discard_a_cache_holding_tokens() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut cache = SingleCache::new(2, 4096, 512);
+        cache.all_data = Some(Tensor::zeros((1, 1, 512, 512), DType::F32, &dev)?);
+        cache.current_seq_len = 7; // pretend seven tokens are already written
+
+        let marker = Tensor::zeros((1, 1, 1, 1), DType::F32, &dev)?;
+        let err = cache
+            .reconcile_preallocation(&marker)
+            .expect_err("a populated cache must not be silently discarded");
+        let msg = err.to_string();
+        assert!(msg.contains("layout changed mid-sequence"), "{msg}");
+        assert!(msg.contains('7'), "the message must name how many tokens are at risk: {msg}");
+        Ok(())
+    }
+
+    /// The graph buffer is PINNED on first use and never resized after.
+    ///
+    /// Pre-growing to `max_seq_len` was the obvious fix and is a trap: V4's
+    /// `max_position_embeddings` is 1,048,576, which at head_dim 512 in BF16
+    /// across 43 layers is ~46 GB of extra VRAM — it would OOM the box it runs
+    /// on. Growth is the defect, not smallness.
+    ///
+    /// Mutation: allow the `Some(ad)` arm to reallocate instead of bailing and
+    /// `growth_after_pinning_is_refused` fails.
+    #[test]
+    fn first_graph_append_pins_the_capacity() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut cache = SingleCache::new(2, 1_048_576, 120);
+        let src = Tensor::zeros((1, 1, 1, 8), DType::F32, &dev)?;
+
+        cache.pregrow_for_graph(&src, 128)?;
+
+        let cap = cache.all_data.as_ref().unwrap().dim(2)?;
+        assert_eq!(
+            cap, 128,
+            "must pin at what the graph legitimately needs (read_capacity vs \
+             current growth), NOT at max_seq_len — 1M slots here would be ~46 GB"
+        );
+        assert_eq!(
+            cache.capacity_seq_len, 128,
+            "capacity_seq_len must track the real buffer"
+        );
+        Ok(())
+    }
+
+    /// Once pinned, a later demand for more slots must be REFUSED, not served
+    /// by reallocating — reallocating moves an address a captured graph has
+    /// already baked in. Falling back to eager is slow and right; replaying
+    /// against a moved buffer is fast and wrong.
+    #[test]
+    fn growth_after_pinning_is_refused() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut cache = SingleCache::new(2, 1_048_576, 0);
+        let src = Tensor::zeros((1, 1, 1, 8), DType::F32, &dev)?;
+
+        cache.pregrow_for_graph(&src, 128)?;
+        assert_eq!(cache.all_data.as_ref().unwrap().dim(2)?, 128);
+
+        // A wider window now would require a bigger buffer.
+        let err = cache
+            .pregrow_for_graph(&src, 4096)
+            .expect_err("growing a pinned graph buffer must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("would have to grow from 128 to 4096"), "{msg}");
+        assert!(
+            msg.contains("capture must be abandoned"),
+            "the message must say what the caller should do: {msg}"
+        );
+        // And the buffer must be untouched by the failed attempt.
+        assert_eq!(cache.all_data.as_ref().unwrap().dim(2)?, 128);
+        Ok(())
+    }
+
+    /// A pinned buffer that is already big enough is reused silently — the
+    /// steady state on every decode step after the first.
+    #[test]
+    fn a_sufficient_pinned_buffer_is_reused() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut cache = SingleCache::new(2, 1_048_576, 0);
+        let src = Tensor::zeros((1, 1, 1, 8), DType::F32, &dev)?;
+        cache.pregrow_for_graph(&src, 128)?;
+        let before = cache.all_data.as_ref().unwrap().dim(2)?;
+        for _ in 0..5 {
+            cache.pregrow_for_graph(&src, 128)?;
+        }
+        assert_eq!(cache.all_data.as_ref().unwrap().dim(2)?, before);
+        Ok(())
+    }
+
+    /// THE PROPERTY THAT MATTERS IS AVAILABILITY, NOT A WELL-WORDED ERROR.
+    ///
+    /// When the pinned graph buffer refuses to grow, `normal.rs` drops graph
+    /// mode and retries the forward eagerly. That fallback is only real if the
+    /// EAGER path can serve the very demand the graph path just refused —
+    /// otherwise the retry fails too and the request dies anyway, which is an
+    /// availability regression traded for a memory saving, and a quiet one:
+    /// it fires on a sequence longer than whatever the buffer was pinned at,
+    /// i.e. on real traffic rather than in tests.
+    ///
+    /// So assert the fallback has somewhere to go.
+    ///
+    /// Mutation: give `append` the same pin (make it bail when
+    /// `all_data` is Some and too small) and this fails — which is exactly the
+    /// state that would make the eager retry in `normal.rs` useless.
+    #[test]
+    fn the_eager_path_still_serves_what_the_pinned_graph_refuses() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut cache = SingleCache::new(2, 1_048_576, 0);
+        let src = Tensor::zeros((1, 1, 1, 8), DType::F32, &dev)?;
+
+        // Pin small, then demand more than the pin: the graph path refuses.
+        cache.pregrow_for_graph(&src, 128)?;
+        assert!(
+            cache.pregrow_for_graph(&src, 4096).is_err(),
+            "precondition: the pinned graph buffer must refuse to grow"
+        );
+
+        // The eager path must still be able to serve that sequence. It has no
+        // pin — it grows — so the retry in `normal.rs` completes the request.
+        for _ in 0..200 {
+            cache.append(&src)?;
+        }
+        assert_eq!(
+            cache.current_seq_len, 200,
+            "the eager path must keep accepting tokens past the graph's pin, or \
+             the fallback is not a fallback"
+        );
+        assert!(
+            cache.all_data.as_ref().unwrap().dim(2)? >= 200,
+            "and it must have grown the buffer to hold them"
+        );
         Ok(())
     }
 }

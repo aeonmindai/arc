@@ -237,14 +237,39 @@ say "preflight passed; CUDA_HOME=${CUDA_HOME:-unset} LD_LIBRARY_PATH=${LD_LIBRAR
 # in CLAUDE.md. Asserted rather than merely omitted, because a stray
 # CARGO_BUILD_* or a .cargo/config could reintroduce it.
 FEATURES="cuda flash-attn"
-case "$FEATURES" in *cudnn*) env_fail "cudnn is in the feature set; banned (-62% decode on V4)";; esac
-BIN="$REPO/target/release/mistralrs"
+# 🔴 FIXED 2026-08-17 — THIS BLOCK MEASURED A BINARY IT DID NOT BUILD.
+# It was:
+#     BIN="$REPO/target/release/mistralrs"
+#     cargo build --release --features "$FEATURES" -p arc-cli
+#     [ -x "$BIN" ] || env_fail
+# `arc-cli` builds a binary called **`arc`**; **`mistralrs`** is built by
+# `mistralrs-cli`, which arc-cli does not depend on. So the build never
+# produced `$BIN`, and the existence check happily passed against whatever
+# binary was already sitting at that path — on a shared box, another chain's
+# commit. Every number this script produced came from an unverified binary.
+# It fails silently and in the direction of "no effect", because a stale binary
+# yields a clean flat result indistinguishable from an honest negative.
+# See arc-tools/lib/build_and_verify.sh for the full account.
+# shellcheck disable=SC1090,SC1091
+source "$REPO/arc-tools/lib/build_and_verify.sh" \
+    || env_fail "arc-tools/lib/build_and_verify.sh missing from this checkout"
 if [ "$ARC_PC_SKIP_BUILD" != "1" ]; then
-    step "build: cargo build --release --features \"$FEATURES\" (never cudnn)"
-    cargo build --release --features "$FEATURES" -p arc-cli >>"$LOGDIR/prefill_curve.build.log" 2>&1 \
-        || env_fail "build failed; see $LOGDIR/prefill_curve.build.log"
+    step "build+verify: -p mistralrs-cli --features \"$FEATURES\" (never cudnn)"
+    arc_build_and_verify \
+        --package mistralrs-cli --bin mistralrs --features "$FEATURES" \
+        --log "$LOGDIR/prefill_curve.build.log" \
+        || env_fail "build/verify failed; see $LOGDIR/prefill_curve.build.log"
+    BIN="$ARC_VERIFIED_BIN"
+else
+    # Explicitly skipping the build means explicitly accepting an unverified
+    # binary. Say so in the log rather than letting it pass as normal.
+    BIN="$REPO/target/release/mistralrs"
+    say "⚠️ ARC_PC_SKIP_BUILD=1 — measuring $BIN WITHOUT a freshness check. \
+Its provenance is unknown; do not bank a number from this run as attributable \
+to any commit."
 fi
 [ -x "$BIN" ] || env_fail "$BIN missing or not executable"
+say "BIN = $BIN"
 
 # ---------------------------------------------------------------------------
 # 3. Model presence + GPU exclusivity
@@ -297,6 +322,15 @@ for _ in $(seq 1 180); do
     sleep 10
 done
 [ "$HEALTHY" = "1" ] || env_fail "server never became healthy; tail of $SERVERLOG: $(tail -5 "$SERVERLOG" 2>/dev/null | tr '\n' ' ')"
+# PROVENANCE — assert the RUNNING server is the commit we built. The marker
+# check above proves the feature is present; only this proves it is the right
+# build. Skipped only when the operator explicitly opted out of the build.
+if [ "$ARC_PC_SKIP_BUILD" != "1" ]; then
+    arc_assert_running_revision --log "$SERVERLOG" --timeout-s 60 \
+        || env_fail "provenance assertion failed: the running server is not the commit that was \
+built. Refusing to bank numbers of unknown origin."
+    say "provenance ok — running rev $ARC_RUNNING_REV"
+fi
 
 # ---------------------------------------------------------------------------
 # 5. GATE 3 — coherence canary (D18)

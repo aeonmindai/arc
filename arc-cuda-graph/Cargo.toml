@@ -15,13 +15,18 @@ half.workspace = true
 # `CudaSlice<float8::F8E4M3>`, and `as_cuda_slice::<T>` dispatches on `T`.
 float8.workspace = true
 tracing.workspace = true
+# So ArcGraph can record its OWN unreachability in the profile tree. A graph
+# node reporting 0 ns because it never ran must not read like one that ran
+# instantly — `mark_unreachable` is exactly that distinction. No cycle:
+# arc-profiler depends only on candle-core/serde/tracing.
+arc-profiler = { path = "../arc-profiler" }
 
 [build-dependencies]
 cudaforge = { workspace = true, optional = true }
 anyhow.workspace = true
 
 [features]
-cuda = ["dep:cudaforge", "candle-core/cuda", "mistralrs-paged-attn/cuda", "mistralrs-quant/cuda"]
+cuda = ["dep:cudaforge", "candle-core/cuda", "mistralrs-paged-attn/cuda", "mistralrs-quant/cuda", "arc-profiler/cuda"]
 
 # Standalone GEMV bench harness — runs kernel variants on real-sized tensors
 # without loading the model. Lets us iterate kernel parameters in seconds

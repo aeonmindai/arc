@@ -10,10 +10,11 @@ use super::{
     IsqPipelineMixin, MetadataMixin, ModelCategory, PreProcessingMixin,
 };
 use super::{
-    AutoNormalLoader, DeepSeekV2Loader, DeepSeekV3Loader, DeepSeekV4Loader, GLM4Loader, GLM4MoeLiteLoader,
-    GLM4MoeLoader, Gemma2Loader, GemmaLoader, GptOssLoader, GraniteMoeHybridLoader, LlamaLoader,
-    MistralLoader, MixtralLoader, NormalLoaderType, Phi2Loader, Phi3Loader, Phi3_5MoELoader,
-    Qwen2Loader, Qwen3Loader, Qwen3MoELoader, Qwen3NextLoader, SmolLm3Loader, Starcoder2Loader,
+    AutoNormalLoader, DeepSeekV2Loader, DeepSeekV3Loader, DeepSeekV4Loader, GLM4Loader,
+    GLM4MoeLiteLoader, GLM4MoeLoader, Gemma2Loader, GemmaLoader, GptOssLoader,
+    GraniteMoeHybridLoader, LlamaLoader, MistralLoader, MixtralLoader, NormalLoaderType,
+    Phi2Loader, Phi3Loader, Phi3_5MoELoader, Qwen2Loader, Qwen3Loader, Qwen3MoELoader,
+    Qwen3NextLoader, SmolLm3Loader, Starcoder2Loader,
 };
 use crate::amoe::AnyMoeExpertType;
 use crate::attention::ATTENTION_CHUNK_SIZE;
@@ -278,6 +279,36 @@ impl NormalLoaderBuilder {
     }
 }
 
+/// Tolerance for accepting a CUDA-graph replay's logits as equal to the eager
+/// forward's. The two run the SAME kernels on the SAME inputs in the SAME
+/// order, so they should agree bit-for-bit; this is deliberately tight rather
+/// than a "close enough" band, because the failure this guards against —
+/// a graph reading a stale device address — produces plausible logits, not
+/// wildly wrong ones. A loose tolerance would wave exactly that through.
+#[cfg(feature = "cuda")]
+const GRAPH_REPLAY_TOLERANCE: f32 = 1e-4;
+
+/// Max absolute elementwise difference between two logit tensors.
+///
+/// Costs one device→host sync of a single scalar, and only runs on the handful
+/// of verification steps, never on the trusted path.
+#[cfg(feature = "cuda")]
+fn max_abs_diff(a: &Tensor, b: &Tensor) -> candle_core::Result<f32> {
+    if a.dims() != b.dims() {
+        candle_core::bail!(
+            "shape mismatch: replay {:?} vs eager {:?}",
+            a.dims(),
+            b.dims()
+        );
+    }
+    a.to_dtype(candle_core::DType::F32)?
+        .sub(&b.to_dtype(candle_core::DType::F32)?)?
+        .abs()?
+        .flatten_all()?
+        .max(0)?
+        .to_scalar::<f32>()
+}
+
 impl Loader for NormalLoader {
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn load_model_from_hf(
@@ -423,7 +454,9 @@ impl Loader for NormalLoader {
                                 QuantizedSerdeType::F8Q8 => IsqType::F8Q8.pack_factor(dtype),
                                 QuantizedSerdeType::Mxfp4 => IsqType::MXFP4.pack_factor(dtype),
                                 QuantizedSerdeType::Nvfp4 => IsqType::NVFP4.pack_factor(dtype),
-                                QuantizedSerdeType::Qtip => IsqType::QtipBitshift2.pack_factor(dtype),
+                                QuantizedSerdeType::Qtip => {
+                                    IsqType::QtipBitshift2.pack_factor(dtype)
+                                }
                                 QuantizedSerdeType::Qtip2b => IsqType::Qtip2b.pack_factor(dtype),
                                 QuantizedSerdeType::TdMoeTucker => 1,
                             };
@@ -1229,11 +1262,9 @@ impl Loader for NormalLoader {
                 let kv_cache = cache_engine.get_kv_cache();
                 let norms: Vec<(candle_core::Tensor, candle_core::Tensor)> = kv_cache
                     .iter()
-                    .filter_map(|(_, _, kn, vn)| {
-                        match (kn, vn) {
-                            (Some(k), Some(v)) => Some((k.clone(), v.clone())),
-                            _ => None,
-                        }
+                    .filter_map(|(_, _, kn, vn)| match (kn, vn) {
+                        (Some(k), Some(v)) => Some((k.clone(), v.clone())),
+                        _ => None,
                     })
                     .collect();
                 if !norms.is_empty() {
@@ -1272,7 +1303,9 @@ impl Loader for NormalLoader {
         // ARC_NO_DEDICATED_DECODE=1 to reclaim that headroom. Default unchanged.
         #[cfg(feature = "cuda")]
         let _decode_weights = if std::env::var_os("ARC_NO_DEDICATED_DECODE").is_some() {
-            tracing::info!("Dedicated decode path extraction skipped (ARC_NO_DEDICATED_DECODE set).");
+            tracing::info!(
+                "Dedicated decode path extraction skipped (ARC_NO_DEDICATED_DECODE set)."
+            );
             None
         } else if {
             // ARCHITECTURE GUARD, deliberately evaluated BEFORE the block below.
@@ -1314,7 +1347,8 @@ impl Loader for NormalLoader {
             let residuals = model.residual_tensors();
             // get_layers requires &mut self — call after residuals is collected
             let (layers_mut, _) = model.get_layers();
-            let layers_ref: Vec<_> = layers_mut.iter()
+            let layers_ref: Vec<_> = layers_mut
+                .iter()
                 .map(|(l, idx)| (l as &std::sync::Arc<dyn mistralrs_quant::QuantMethod>, *idx))
                 .collect();
             // Infer intermediate_size and vocab_size from weight shapes
@@ -1323,20 +1357,25 @@ impl Loader for NormalLoader {
 
             // gate_proj is at index 1 + 4 (5th projection in first layer: q,k,v,o,gate)
             let gate_idx = if layers_ref.len() > 5 { 5 } else { 0 };
-            let gate_w = layers_ref.get(gate_idx).and_then(|(l, _)| l.dequantize_w().ok());
+            let gate_w = layers_ref
+                .get(gate_idx)
+                .and_then(|(l, _)| l.dequantize_w().ok());
             let intermediate_size = gate_w.as_ref().map(|w| w.dims()[0]).unwrap_or(0);
 
             // Read rms_norm_eps and rope_theta from the raw config JSON (model-agnostic)
             let config_json: serde_json::Value = serde_json::from_str(&config).unwrap_or_default();
-            let rms_norm_eps = config_json.get("rms_norm_eps")
+            let rms_norm_eps = config_json
+                .get("rms_norm_eps")
                 .or_else(|| config_json.get("layer_norm_epsilon"))
                 .or_else(|| config_json.get("layer_norm_eps"))
                 .and_then(|v| v.as_f64())
                 .unwrap_or(1e-6) as f32;
-            let rope_theta = config_json.get("rope_theta")
+            let rope_theta = config_json
+                .get("rope_theta")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(10000.0) as f32;
-            let has_qk_norm = config_json.get("qk_norm")
+            let has_qk_norm = config_json
+                .get("qk_norm")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
@@ -1360,7 +1399,28 @@ impl Loader for NormalLoader {
                     Some(w)
                 }
                 Err(e) => {
-                    tracing::warn!("Decode path extraction failed: {e}");
+                    // Two very different things land here and they must not read
+                    // the same. A refusal from the architecture guard is the
+                    // system working: the dense decode path cannot describe this
+                    // model, so it declines rather than computing the wrong one.
+                    // Anything else is a genuine fault.
+                    let refused = e
+                        .to_string()
+                        .contains("dedicated decode path does not support this architecture");
+                    if refused {
+                        tracing::info!("Dedicated decode path declined (by design): {e}");
+                        arc_profiler::mark_unreachable(
+                            "decode.dedicated",
+                            "the dense decode path refused this architecture; decode runs on the \
+                             standard Candle path",
+                            "normal.rs:1318",
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Decode path extraction FAILED (not a refusal — this is a fault): {e}. \
+                             Decode falls back to the standard Candle path."
+                        );
+                    }
                     None
                 }
             }
@@ -1622,6 +1682,12 @@ impl Pipeline for NormalPipeline {
                 #[cfg(feature = "cuda")]
                 {
                     let probe = std::env::var_os("ARC_V4_CAPTURE_PROBE").is_some();
+                    // Shadowed (cuda-only) so step 2b can swap in the
+                    // address-stable buffer without making the outer
+                    // destructuring binding `mut`, which would warn on every
+                    // non-cuda build. Tensor::clone is an Arc bump.
+                    #[allow(unused_mut)]
+                    let mut input_ids = input_ids.clone();
                     let (bs, seq_len) = input_ids.dims2().unwrap_or((0, 0));
                     if !probe {
                         // The only CUDA-graph path structurally reachable from
@@ -1645,163 +1711,336 @@ impl Pipeline for NormalPipeline {
                         if let candle_core::Device::Cuda(cd) = self.device() {
                             cd.set_alloc_cache_enabled(true);
                         }
-                        // Set the graph-mode device position: drives RoPE +
-                        // the fixed-capacity KV write slot, and makes warmup
-                        // forwards take the shape-constant path so the cache
-                        // populates with capture-shape buffers. Fresh tensor
-                        // per step (eager, before capture) is fine for the
-                        // single-launch capture; replay needs a static buffer.
+                        // RUN-161 step 2b. Set the graph-mode device position:
+                        // drives RoPE + the fixed-capacity KV write slot, and
+                        // makes warmup forwards take the shape-constant path so
+                        // the cache populates with capture-shape buffers.
+                        //
+                        // This used to allocate a FRESH tensor every step, which
+                        // is fine up to and including the single-launch capture
+                        // and wrong for every replay after it: capture bakes the
+                        // device pointer, so a replay read an address whose
+                        // tensor had already been dropped. Writing in place keeps
+                        // the baked address valid and current.
                         let pos = seqlen_offsets.first().copied().unwrap_or(0) as u32;
                         let nb = bs.max(1);
                         let dev_for_pos = self.device();
-                        if let Ok(pt) = Tensor::from_vec(vec![pos; nb], (nb,), &dev_for_pos)
-                        {
-                            crate::layers::set_graph_mode_positions(Some(pt));
+                        // The token IDs must be address-stable for the same
+                        // reason. A replay reading this step's positions but
+                        // last step's ids is still wrong, just less visibly.
+                        match crate::layers::set_graph_mode_input_ids_in_place(&input_ids) {
+                            Ok(stable) => input_ids = stable,
+                            Err(e) => tracing::warn!(
+                                "ARC capture: could not stage input_ids at a stable address: {e}"
+                            ),
+                        }
+                        if let Err(e) = crate::layers::set_graph_mode_positions_in_place(
+                            &vec![pos; nb],
+                            &dev_for_pos,
+                        ) {
+                            tracing::warn!(
+                                "ARC capture: could not update graph-mode positions in place: {e}; \
+                                 replay would read stale positions, so capture is disabled for \
+                                 this run"
+                            );
+                            if let Some(r) = self.cuda_graph_runner.as_mut() {
+                                r.disable();
+                            }
                         }
                     }
-                    let captured: Option<Tensor> =
-                        if probe && seq_len == 1 && self.cuda_graph_runner.is_some() {
-                            // Own the runner locally so `self.model.forward` is
-                            // free of the runner's borrow; restore before return.
-                            let mut runner = self.cuda_graph_runner.take().unwrap();
-                            let result = if runner.tick_warmup() {
-                                None
-                            } else if runner.is_enabled()
-                                && !runner.has_graph(bs)
-                                && runner.try_take_deferred_pass()
-                            {
-                                // RUN-161 deferred-free pass (generic): one eager
-                                // forward with the caching allocator in capture
-                                // mode so the free pool grows to the FULL
-                                // per-forward alloc count (eager warmups only
-                                // reach peak-live; capture needs every alloc
-                                // distinct). Output is this step's logits (eager).
-                                if let candle_core::Device::Cuda(cd) = self.device() {
-                                    cd.set_capture_mode(true);
-                                }
-                                let t_eager = std::time::Instant::now();
-                                let out = self.model.forward(
-                                    &input_ids,
-                                    &seqlen_offsets,
-                                    context_lens.clone(),
-                                    position_ids.clone(),
-                                    paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
-                                    &flash_meta,
-                                );
-                                let _ = self.device().synchronize();
-                                tracing::info!(
-                                    "ARC capture: EAGER forward (sync'd) = {:?}",
-                                    t_eager.elapsed()
-                                );
-                                if let candle_core::Device::Cuda(cd) = self.device() {
-                                    cd.set_capture_mode(false);
-                                }
-                                match out {
-                                    Ok(o) => {
-                                        tracing::info!(
+                    let captured: Option<Tensor> = if probe
+                        && seq_len == 1
+                        && self.cuda_graph_runner.is_some()
+                    {
+                        // Own the runner locally so `self.model.forward` is
+                        // free of the runner's borrow; restore before return.
+                        let mut runner = self.cuda_graph_runner.take().unwrap();
+                        let result = if runner.tick_warmup() {
+                            None
+                        } else if runner.is_enabled()
+                            && !runner.has_graph(bs)
+                            && runner.try_take_deferred_pass()
+                        {
+                            // RUN-161 deferred-free pass (generic): one eager
+                            // forward with the caching allocator in capture
+                            // mode so the free pool grows to the FULL
+                            // per-forward alloc count (eager warmups only
+                            // reach peak-live; capture needs every alloc
+                            // distinct). Output is this step's logits (eager).
+                            if let candle_core::Device::Cuda(cd) = self.device() {
+                                cd.set_capture_mode(true);
+                            }
+                            let t_eager = std::time::Instant::now();
+                            let out = self.model.forward(
+                                &input_ids,
+                                &seqlen_offsets,
+                                context_lens.clone(),
+                                position_ids.clone(),
+                                paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
+                                &flash_meta,
+                            );
+                            let _ = self.device().synchronize();
+                            tracing::info!(
+                                "ARC capture: EAGER forward (sync'd) = {:?}",
+                                t_eager.elapsed()
+                            );
+                            if let candle_core::Device::Cuda(cd) = self.device() {
+                                cd.set_capture_mode(false);
+                            }
+                            match out {
+                                Ok(o) => {
+                                    tracing::info!(
                                             "ARC capture: deferred-free warmup pass done (cache grown to full per-forward count)"
                                         );
-                                        Some(o)
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "ARC capture: deferred pass forward errored: {e}; eager"
-                                        );
-                                        None
-                                    }
+                                    Some(o)
                                 }
-                            } else if runner.is_enabled() && !runner.has_graph(bs) {
-                                // CAPTURE: frees are deferred so every allocation
-                                // is a stable cache hit (no within-capture
-                                // aliasing, no unstable graph memory nodes).
-                                if let candle_core::Device::Cuda(cd) = self.device() {
-                                    cd.set_capture_mode(true);
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "ARC capture: deferred pass forward errored: {e}; eager"
+                                    );
+                                    None
                                 }
-                                let cl = context_lens.clone();
-                                let pid = position_ids.clone();
-                                let cap_result = match runner.begin_capture(bs) {
-                                    Ok((gp, op)) => {
-                                        match self.model.forward(
-                                            &input_ids,
-                                            &seqlen_offsets,
-                                            cl,
-                                            pid,
-                                            paged_attn_meta
-                                                .as_ref()
-                                                .map(|(a, b)| (a.clone(), b)),
-                                            &flash_meta,
-                                        ) {
-                                            Ok(output) => {
-                                                tracing::info!(
-                                                    "ARC capture: V4 forward RECORDED (bs={bs}); instantiating + launching"
-                                                );
-                                                match runner
-                                                    .end_capture_and_cache(bs, output, gp, op)
-                                                {
-                                                    Ok(out) => {
-                                                        tracing::info!(
-                                                            "ARC capture: graph CAPTURED + launched OK"
-                                                        );
-                                                        Some(out)
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::warn!(
-                                                            "ARC capture: instantiate/launch failed: {e}; eager"
-                                                        );
-                                                        None
-                                                    }
+                            }
+                        } else if runner.is_enabled() && !runner.has_graph(bs) {
+                            // ── PROBE, NOT A FIX ──────────────────────────
+                            // `ARC_GRAPH_PREWARM_SIZES=172032[,...]` seeds the
+                            // alloc cache with blocks of exactly these byte
+                            // sizes before capture begins, so an allocation
+                            // that would otherwise MISS the warm pool during
+                            // capture becomes a hit.
+                            //
+                            // This exists to TEST a hypothesis, not to ship:
+                            // if the surviving capture-time miss is what
+                            // corrupts the heap, pre-warming its size should
+                            // make the crash disappear. The real fix is that
+                            // the buffer stops being allocated per decode step
+                            // — this only hides the symptom, and hiding it is
+                            // the point of the experiment.
+                            //
+                            // Seeded BEFORE `set_capture_mode(true)` on
+                            // purpose: while capturing, a freed buffer parks
+                            // in `deferred` and is NOT servable, so seeding
+                            // inside capture would warm nothing.
+                            if let Some(spec) = std::env::var_os("ARC_GRAPH_PREWARM_SIZES") {
+                                let spec = spec.to_string_lossy().to_string();
+                                let dev = self.device();
+                                let mut seeded = Vec::new();
+                                for tok in spec.split(',').filter(|t| !t.trim().is_empty()) {
+                                    match tok.trim().parse::<usize>() {
+                                        Ok(n) if n > 0 => {
+                                            match Tensor::zeros(n, candle_core::DType::U8, &dev) {
+                                                // Dropping it immediately is the
+                                                // whole mechanism: the buffer
+                                                // returns to the cache's `free`
+                                                // list at exactly `n` bytes.
+                                                Ok(t) => {
+                                                    drop(t);
+                                                    seeded.push(n);
                                                 }
-                                            }
-                                            Err(e) => {
-                                                runner.cancel_capture(gp, op);
-                                                tracing::warn!(
-                                                    "ARC capture: forward errored DURING capture (likely a host sync): {e}; eager"
-                                                );
-                                                None
+                                                Err(e) => tracing::warn!(
+                                                    "ARC prewarm: could not seed {n} bytes: {e}"
+                                                ),
                                             }
                                         }
+                                        _ => tracing::warn!(
+                                            "ARC prewarm: ignoring unparsable size {tok:?}"
+                                        ),
                                     }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "ARC capture: begin_capture failed: {e}; eager"
-                                        );
+                                }
+                                tracing::info!(
+                                    "ARC prewarm: seeded alloc cache with sizes {seeded:?} \
+                                         (PROBE — not a fix; the buffer still allocates per step)"
+                                );
+                            }
+                            // CAPTURE: frees are deferred so every allocation
+                            // is a stable cache hit (no within-capture
+                            // aliasing, no unstable graph memory nodes).
+                            if let candle_core::Device::Cuda(cd) = self.device() {
+                                cd.set_capture_mode(true);
+                            }
+                            let cl = context_lens.clone();
+                            let pid = position_ids.clone();
+                            let cap_result = match runner.begin_capture(bs) {
+                                Ok((gp, op)) => {
+                                    match self.model.forward(
+                                        &input_ids,
+                                        &seqlen_offsets,
+                                        cl,
+                                        pid,
+                                        paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
+                                        &flash_meta,
+                                    ) {
+                                        Ok(output) => {
+                                            tracing::info!(
+                                                    "ARC capture: V4 forward RECORDED (bs={bs}); instantiating + launching"
+                                                );
+                                            match runner.end_capture_and_cache(bs, output, gp, op) {
+                                                Ok(out) => {
+                                                    tracing::info!(
+                                                        "ARC capture: graph CAPTURED + launched OK"
+                                                    );
+                                                    Some(out)
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                            "ARC capture: instantiate/launch failed: {e}; eager"
+                                                        );
+                                                    None
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            runner.cancel_capture(gp, op);
+                                            tracing::warn!(
+                                                    "ARC capture: forward errored DURING capture (likely a host sync): {e}; eager"
+                                                );
+                                            None
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("ARC capture: begin_capture failed: {e}; eager");
+                                    None
+                                }
+                            };
+                            // Safe ONLY because every pool-destroying path in
+                            // `graph.rs` now drains the alloc cache before
+                            // `cuMemPoolDestroy`. This call moves `deferred`
+                            // into the reusable `free` list; before the drain
+                            // ordering existed, on an error path that moved
+                            // pointers whose private pool had ALREADY been
+                            // destroyed straight into the list the allocator
+                            // serves from. On the success path the pool is
+                            // still alive (owned by `CapturedGraph`), so the
+                            // pointers are valid and reuse is correct.
+                            if let candle_core::Device::Cuda(cd) = self.device() {
+                                cd.set_capture_mode(false);
+                            }
+                            cap_result
+                        } else if runner.has_graph(bs) {
+                            let t = std::time::Instant::now();
+                            let replayed = runner.replay(bs);
+                            match replayed {
+                                Ok(out) => {
+                                    let dt = t.elapsed();
+                                    if runner.needs_verification() {
+                                        // RUN-161 step 3. Turning replay
+                                        // output on is the one change here
+                                        // that can corrupt tokens SILENTLY:
+                                        // a graph reading a stale address
+                                        // returns plausible logits, not an
+                                        // error. So prove it against eager
+                                        // before trusting it, and use the
+                                        // eager result this step either way
+                                        // — it is already computed and it is
+                                        // the one we know is right.
+                                        let eager = self.model.forward(
+                                            &input_ids,
+                                            &seqlen_offsets,
+                                            context_lens.clone(),
+                                            position_ids.clone(),
+                                            paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
+                                            &flash_meta,
+                                        )?;
+                                        match max_abs_diff(&out, &eager) {
+                                                Ok(d) if d <= GRAPH_REPLAY_TOLERANCE => {
+                                                    tracing::info!(
+                                                        "ARC capture: replay matched eager \
+                                                         (max|Δ|={d:.3e}, replay={dt:?})"
+                                                    );
+                                                    runner.record_verification_pass();
+                                                }
+                                                Ok(d) => runner.record_verification_failure(
+                                                    &format!("max|Δ| = {d:.3e} exceeds {GRAPH_REPLAY_TOLERANCE:.3e}"),
+                                                ),
+                                                Err(e) => runner.record_verification_failure(
+                                                    &format!("could not compare outputs: {e}"),
+                                                ),
+                                            }
+                                        Some(eager)
+                                    } else if runner.replay_output_trusted() {
+                                        tracing::debug!("ARC capture: replay {dt:?} (output USED)");
+                                        Some(out)
+                                    } else {
+                                        // Verification failed earlier; the
+                                        // graph still replays but its output
+                                        // is not to be believed.
                                         None
                                     }
-                                };
-                                if let candle_core::Device::Cuda(cd) = self.device() {
-                                    cd.set_capture_mode(false);
                                 }
-                                cap_result
-                            } else if runner.has_graph(bs) {
-                                let t = std::time::Instant::now();
-                                match runner.replay(bs) {
-                                    Ok(_) => tracing::info!(
-                                        "ARC capture: REPLAY latency = {:?} (output discarded; correctness pending 2b/2c)",
-                                        t.elapsed()
-                                    ),
-                                    Err(e) => {
-                                        tracing::warn!("ARC capture: replay failed: {e}")
-                                    }
+                                Err(e) => {
+                                    tracing::warn!("ARC capture: replay failed: {e}");
+                                    None
                                 }
-                                None
-                            } else {
-                                None
-                            };
-                            self.cuda_graph_runner = Some(runner);
-                            result
+                            }
                         } else {
                             None
                         };
+                        self.cuda_graph_runner = Some(runner);
+                        result
+                    } else {
+                        None
+                    };
                     match captured {
                         Some(o) => o,
-                        None => self.model.forward(
-                            &input_ids,
-                            &seqlen_offsets,
-                            context_lens,
-                            position_ids,
-                            paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
-                            &flash_meta,
-                        )?,
+                        None => {
+                            let attempt = self.model.forward(
+                                &input_ids,
+                                &seqlen_offsets,
+                                context_lens.clone(),
+                                position_ids.clone(),
+                                paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
+                                &flash_meta,
+                            );
+                            match attempt {
+                                Ok(o) => o,
+                                // AVAILABILITY. This forward runs with graph-mode
+                                // positions SET, so it takes V4's graph KV arm —
+                                // which can legitimately refuse (the pinned graph
+                                // buffer must not be resized under a captured
+                                // graph). Propagating that `?` would KILL THE
+                                // REQUEST, and it would do so on real traffic: the
+                                // trigger is a sequence longer than whatever the
+                                // buffer was pinned at. Trading a user's answer for
+                                // a memory saving is a worse bug than the one the
+                                // pin fixes, and a quieter one — the OOM it
+                                // replaced at least failed loudly at startup.
+                                //
+                                // So degrade instead: drop graph mode, disable the
+                                // runner for the rest of the process, and retry
+                                // eagerly. `append` (the eager path) has no pin and
+                                // grows normally, so the retry succeeds and the user
+                                // still gets an answer — slower, and correct.
+                                Err(e) if crate::layers::has_graph_mode_positions() => {
+                                    tracing::warn!(
+                                        "ARC capture: graph-mode forward failed ({e}); falling back                                          to eager for this and every later step so the request still                                          completes. CUDA graphs are now OFF for this process."
+                                    );
+                                    crate::layers::set_graph_mode_positions(None);
+                                    if let Some(r) = self.cuda_graph_runner.as_mut() {
+                                        r.disable();
+                                    }
+                                    // THE CACHE WAS NEVER DRAINED. `set_alloc_cache_enabled(true)`
+                                    // is called once at the start of capture and nothing ever
+                                    // called it with `false`, so every buffer it ever held —
+                                    // including private-pool allocations from every capture —
+                                    // was retained for the process lifetime. Now that graphs are
+                                    // off for good, the cache buys nothing and its buffers are
+                                    // returned to the driver.
+                                    if let candle_core::Device::Cuda(cd) = self.device() {
+                                        cd.set_alloc_cache_enabled(false);
+                                    }
+                                    self.model.forward(
+                                        &input_ids,
+                                        &seqlen_offsets,
+                                        context_lens,
+                                        position_ids,
+                                        paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
+                                        &flash_meta,
+                                    )?
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
                     }
                 }
                 #[cfg(not(feature = "cuda"))]
@@ -1938,7 +2177,8 @@ impl Pipeline for NormalPipeline {
 
             // Vocab size comes from the dedicated decode path (it has the
             // model config we extracted at load time).
-            let vocab_size = self.dedicated_decode
+            let vocab_size = self
+                .dedicated_decode
                 .as_ref()
                 .map(|d| d.weights().config.vocab_size)
                 .unwrap_or(0);
@@ -1987,7 +2227,8 @@ impl Pipeline for NormalPipeline {
                 greedy,
             };
 
-            self.autonomous_runner = arc_cuda_graph::try_init_autonomous_runner(&device, config.clone());
+            self.autonomous_runner =
+                arc_cuda_graph::try_init_autonomous_runner(&device, config.clone());
             if self.autonomous_runner.is_none() {
                 tracing::warn!(
                     "autonomous_decode: try_init_autonomous_runner returned None; falling back"
@@ -2037,9 +2278,7 @@ impl Pipeline for NormalPipeline {
                     &padded_ctx_lens,
                     &padded_slots,
                 ) {
-                    tracing::warn!(
-                        "autonomous_decode: prime_for_step failed: {e}; falling back"
-                    );
+                    tracing::warn!("autonomous_decode: prime_for_step failed: {e}; falling back");
                     self.autonomous_runner = None;
                     return Ok(None);
                 }
@@ -2071,7 +2310,9 @@ impl Pipeline for NormalPipeline {
                 "autonomous_decode: runner allocated (batch={}, max_tokens={}, vocab={}). \
                  Graph capture is deferred until the dedicated decode path's KV cache \
                  layer pointers are populated (happens after first prompt step).",
-                bs, config.max_tokens, vocab_size,
+                bs,
+                config.max_tokens,
+                vocab_size,
             );
             return Ok(None);
         }
@@ -2108,9 +2349,7 @@ impl Pipeline for NormalPipeline {
             &padded_ctx_lens,
             &padded_slots,
         ) {
-            tracing::warn!(
-                "autonomous_decode (replay): prime_for_step failed: {e}; falling back"
-            );
+            tracing::warn!("autonomous_decode (replay): prime_for_step failed: {e}; falling back");
             return Ok(None);
         }
         match runner.run_decode_loop() {

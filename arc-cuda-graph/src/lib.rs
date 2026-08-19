@@ -68,15 +68,44 @@ pub use weights::{
 /// Try to create a CUDA graph runner for the given device.
 #[cfg(feature = "cuda")]
 pub fn try_init_graph_runner(device: &candle_core::Device) -> Option<CudaGraphRunner> {
-    // 4 eager warmup decode steps: with the candle caching allocator on, these
+    // Eager warmup decode steps: with the candle caching allocator on, these
     // populate the cache so the captured forward is allocation-free (RUN-161).
-    match CudaGraphRunner::new(device, 4) {
+    //
+    // 4 was a hardcoded guess and it is measurably not enough for V4 — a capture
+    // still hit four unwarmed allocation sizes. Tunable via ARC_GRAPH_WARMUP so
+    // "how much warmup is enough" can be measured rather than assumed; the
+    // default is unchanged so no existing behaviour shifts silently.
+    let warmup = std::env::var("ARC_GRAPH_WARMUP")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(4);
+    match CudaGraphRunner::new(device, warmup) {
         Ok(runner) => {
-            tracing::info!("CUDA graph runner initialized");
+            // D18. The old line here was `info!("CUDA graph runner initialized")`,
+            // emitted unconditionally — including immediately after the runner
+            // had logged that capture was disabled and it would do nothing. A
+            // success message that a dead subsystem also prints is worse than
+            // no message: it reads as confirmation. Report the state, not the
+            // constructor's return.
+            if runner.capture_possible() {
+                tracing::info!(
+                    "ArcGraph: runner initialized on a capturable stream — capture WILL be \
+                     attempted after {} warmup step(s) + {} deferred-free pass(es). {}",
+                    warmup,
+                    runner.deferred_passes_remaining(),
+                    runner.status_line()
+                );
+            } else {
+                tracing::warn!(
+                    "ArcGraph: runner initialized but INERT — it will not capture or replay \
+                     anything (see the preceding line for why). {}",
+                    runner.status_line()
+                );
+            }
             Some(runner)
         }
         Err(e) => {
-            tracing::warn!("CUDA graph runner unavailable: {e}");
+            tracing::warn!("ArcGraph: runner unavailable, decode runs eagerly: {e}");
             None
         }
     }
@@ -105,8 +134,29 @@ pub fn try_init_autonomous_runner(
     }
     match AutonomousDecodeRunner::new(config, device) {
         Ok(runner) => {
-            tracing::info!(
-                "Autonomous decode runner allocated (graph capture deferred until first decode)"
+            // D18, second instance in this file. This used to read "graph
+            // capture deferred until first decode", which is not true: the only
+            // entry point into the capture chain is
+            // `AutonomousDecodeRunner::capture` / `capture_via_decode_forward`,
+            // and NOTHING in the workspace calls either. `pipeline/mod.rs:614`
+            // is a *comment* saying a pipeline must call it; no pipeline does.
+            // So `is_captured()` is permanently false, every `run_decode_loop`
+            // returns `Ok(None)`, and decode always falls back step-by-step.
+            // "Deferred until first decode" describes a wait that never ends.
+            // Say what is actually true, at a level that does not read as
+            // progress.
+            tracing::warn!(
+                "ArcAutonomous: buffers allocated but the runner is INERT — its capture entry \
+                 point (AutonomousDecodeRunner::capture) has no caller in the workspace, so the \
+                 graph is never captured, is_captured() stays false, and every decode falls back \
+                 to the step-by-step path. Allocating this runner buys nothing until a pipeline \
+                 calls capture()."
+            );
+            arc_profiler::mark_unreachable(
+                "decode.autonomous",
+                "AutonomousDecodeRunner::capture has no call site in the workspace; the graph is \
+                 never captured and run_decode_loop always returns None",
+                "arc-cuda-graph/src/lib.rs:120",
             );
             Some(runner)
         }
