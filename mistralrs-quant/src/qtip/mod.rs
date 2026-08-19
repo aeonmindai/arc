@@ -72,9 +72,9 @@ pub(crate) mod gather_policy;
 #[cfg(test)]
 mod greedy_ban_tests;
 pub mod grouped;
-pub mod k8v4l12;
 #[cfg(test)]
 mod search_bench;
+pub mod trellis_v4l12;
 pub mod tune;
 mod viterbi;
 pub use bitshift::{Qtip2bLayer, QTIP2B_MCG_MULT};

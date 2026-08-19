@@ -28,7 +28,7 @@ use crate::utils::slice_ptr;
 
 use super::device_guard::ensure_same_cuda_device;
 use super::ffi;
-use super::k8v4l12::RowScaleHoist;
+use super::trellis_v4l12::{RowScaleHoist, Rung};
 use super::QtipCodebook;
 
 /// Returns true when the layer parameters live on CUDA *and* the kernels
@@ -363,39 +363,45 @@ pub(crate) fn fused_gemv_cuda(
     Ok(Tensor::from((Storage::Cuda(res), out_shape)))
 }
 
-/// Fused decode + gemv at **K=8 / V=4 / L=12** — the shared-memory-table rung.
+/// Fused decode + gemv for the **V=4 / L=12** family — the shared-memory-table
+/// rung, with K supplied by the caller's [`Rung`].
 ///
-/// The K=4/V=2 sibling of this function is [`fused_gemv_cuda`]. Same 2 bits per
-/// weight, same `x_rotated` contract, same `[1, n_rows]` output. Three things
-/// differ, and all three are checked here rather than assumed:
+/// The K=4/V=2/L=16 sibling of this function is [`fused_gemv_cuda`]. Same
+/// `x_rotated` contract, same `[1, n_rows]` output. Four things differ, and all
+/// four are checked here rather than assumed:
 ///
 /// * `lut` is **BF16** and must hold exactly `2^12 × 4 = 16,384` values
-///   (32,768 B). That size is the reason the rung exists — it fits static
+///   (32,768 B). That size is the reason the family exists — it fits static
 ///   shared memory — so a wrong-sized table is a wrong-geometry artifact and is
 ///   refused, not indexed.
-/// * `packed_per_row == num_symbols`: at K=8 a symbol is a byte, with no nibble
-///   packing. The K=4 path's `num_symbols / 2` does not apply.
+/// * `blocks` rows must be `ceil(num_symbols · K / 8)` bytes. At K=9 that is
+///   not a whole number of symbols per byte, so the K=4 path's
+///   `num_symbols / 2` and the K=8 path's `num_symbols` are both wrong.
+/// * `rung` selects the symbol width. An unsupported K never reaches the
+///   kernel, whose `default:` arm returns without launching and would leave `y`
+///   holding whatever it held.
 /// * `hoist` selects the row-scale policy. [`RowScaleHoist::Off`] is what the
 ///   CPU parity reference pins; [`RowScaleHoist::On`] reassociates the sum and
 ///   is therefore not bit-comparable.
 ///
 /// There is deliberately no codebook selector: the computed `sum2` codebook is
-/// V=2-specific, so this rung is table-only.
-pub(crate) fn fused_gemv_k8v4l12_cuda(
+/// V=2-specific, so this family is table-only.
+pub(crate) fn fused_gemv_v4l12_cuda(
     blocks: &Tensor,
     row_scales: &Tensor,
     lut: &Tensor,
     x_rotated: &Tensor,
     in_features: usize,
+    rung: Rung,
     hoist: RowScaleHoist,
 ) -> Result<Tensor> {
-    use super::k8v4l12;
+    use super::trellis_v4l12 as v4l12;
 
-    const OP: &str = "QTIP k8v4l12 fused gemv CUDA";
+    const OP: &str = "QTIP v4l12 fused gemv CUDA";
 
     let n_rows = row_scales.dim(0)?;
     let packed_per_row = blocks.dim(1)?;
-    let num_symbols = k8v4l12::num_symbols(in_features);
+    let num_symbols = rung.num_symbols(in_features);
 
     if blocks.dtype() != DType::U8 {
         candle_core::bail!("{OP}: blocks dtype must be U8, got {:?}", blocks.dtype());
@@ -406,9 +412,9 @@ pub(crate) fn fused_gemv_k8v4l12_cuda(
             row_scales.dtype()
         );
     }
-    // The table's dtype IS the rung. An F32 table here means a K=4/V=2
-    // artifact reached a K=8/V=4 launcher, which would decode 65,536 states'
-    // worth of f32 as 16,384 bf16 and produce plausible garbage.
+    // The table's dtype IS the family. An F32 table here means a K=4/V=2
+    // artifact reached a V=4 launcher, which would decode 65,536 states' worth
+    // of f32 as 16,384 bf16 and produce plausible garbage.
     if lut.dtype() != DType::BF16 {
         candle_core::bail!(
             "{OP}: table dtype must be BF16 at this geometry, got {:?}. An F32 table is the \
@@ -416,31 +422,33 @@ pub(crate) fn fused_gemv_k8v4l12_cuda(
             lut.dtype()
         );
     }
-    if lut.elem_count() != k8v4l12::LUT_ENTRIES {
+    if lut.elem_count() != v4l12::LUT_ENTRIES {
         candle_core::bail!(
             "{OP}: table has {} values, expected {} (2^{} × {} = {} B)",
             lut.elem_count(),
-            k8v4l12::LUT_ENTRIES,
-            k8v4l12::L,
-            k8v4l12::V,
-            k8v4l12::LUT_BYTES
+            v4l12::LUT_ENTRIES,
+            v4l12::L,
+            v4l12::V,
+            v4l12::LUT_BYTES
         );
     }
-    if in_features % k8v4l12::V as usize != 0 {
+    if !in_features.is_multiple_of(v4l12::V as usize) {
         candle_core::bail!(
             "{OP}: in_features {in_features} must be a multiple of V={} (each symbol decodes \
              to V weights)",
-            k8v4l12::V
+            v4l12::V
         );
     }
-    // K=8 puts exactly one symbol in a byte. If these disagree the caller is
-    // holding a K=4-packed row.
-    if packed_per_row != num_symbols {
+    // `ceil(num_symbols * K / 8)`, the general form. If these disagree the
+    // caller is holding a row packed at a different K — and since the table,
+    // the state width and the activation indexing are all K-independent, the
+    // row length is the ONLY thing that can catch it.
+    let want_bytes = rung.packed_bytes(num_symbols);
+    if packed_per_row != want_bytes {
         candle_core::bail!(
-            "{OP}: blocks row is {packed_per_row} B but in_features={in_features} needs \
-             {num_symbols} symbols. At K=8 a symbol is one byte — a row of {} B would be \
-             K=4/V=2 nibble packing.",
-            num_symbols / 2
+            "{OP}: blocks row is {packed_per_row} B but K={} with in_features={in_features} \
+             ({num_symbols} symbols) needs {want_bytes} packed bytes",
+            rung.k()
         );
     }
     if !blocks.layout().is_contiguous()
@@ -449,7 +457,6 @@ pub(crate) fn fused_gemv_k8v4l12_cuda(
     {
         candle_core::bail!("{OP}: blocks/scales/table must be contiguous");
     }
-
     let x_2d = match x_rotated.dims() {
         [k] if *k == in_features => x_rotated.unsqueeze(0)?,
         [b, k] if *b == 1 && *k == in_features => x_rotated.clone(),
@@ -517,7 +524,7 @@ pub(crate) fn fused_gemv_k8v4l12_cuda(
             let out_buf = dev.alloc_zeros::<bf16>(n_rows)?;
             let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
             unsafe {
-                ffi::launch_qtip_fused_gemv_k8_v4_l12_bf16(
+                ffi::launch_qtip_fused_gemv_v4_l12_bf16(
                     blocks_ptr as *const _,
                     scales_ptr as *const _,
                     lut_ptr as *const _,
@@ -526,6 +533,7 @@ pub(crate) fn fused_gemv_k8v4l12_cuda(
                     n_rows as i32,
                     packed_per_row as i32,
                     num_symbols as i32,
+                    rung.k() as i32,
                     hoist_abi,
                     dev.cuda_stream().cu_stream(),
                 );
@@ -539,7 +547,7 @@ pub(crate) fn fused_gemv_k8v4l12_cuda(
             let out_buf = dev.alloc_zeros::<f16>(n_rows)?;
             let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
             unsafe {
-                ffi::launch_qtip_fused_gemv_k8_v4_l12_f16(
+                ffi::launch_qtip_fused_gemv_v4_l12_f16(
                     blocks_ptr as *const _,
                     scales_ptr as *const _,
                     lut_ptr as *const _,
@@ -548,6 +556,7 @@ pub(crate) fn fused_gemv_k8v4l12_cuda(
                     n_rows as i32,
                     packed_per_row as i32,
                     num_symbols as i32,
+                    rung.k() as i32,
                     hoist_abi,
                     dev.cuda_stream().cu_stream(),
                 );
@@ -561,7 +570,7 @@ pub(crate) fn fused_gemv_k8v4l12_cuda(
             let out_buf = dev.alloc_zeros::<f32>(n_rows)?;
             let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
             unsafe {
-                ffi::launch_qtip_fused_gemv_k8_v4_l12_f32(
+                ffi::launch_qtip_fused_gemv_v4_l12_f32(
                     blocks_ptr as *const _,
                     scales_ptr as *const _,
                     lut_ptr as *const _,
@@ -570,6 +579,7 @@ pub(crate) fn fused_gemv_k8v4l12_cuda(
                     n_rows as i32,
                     packed_per_row as i32,
                     num_symbols as i32,
+                    rung.k() as i32,
                     hoist_abi,
                     dev.cuda_stream().cu_stream(),
                 );

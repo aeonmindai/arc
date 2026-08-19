@@ -1,0 +1,421 @@
+// Parent system: ArcKernels (rung owner: ArcQuant / QTIP)
+//
+// Fused QTIP decode + gemv for the **V=4 / L=12** family, with the whole
+// reproduction table staged in shared memory as bf16 and **K as a template
+// parameter over symbol extraction only**.
+//
+// WHAT IS FIXED AND WHAT VARIES
+// -----------------------------
+// L=12 and V=4 fix the table at 2^12 x 4 bf16 = 32,768 B, which is under the
+// 48 KiB static __shared__ limit, so it is staged once per block with NO
+// `cudaFuncSetAttribute` opt-in and every lookup is an LDS. **The table does
+// not read K at all** -- confirmed by a codebook sweep at fixed L=12/V=4 --
+// so K moves without the table, its size, its layout, or the activation
+// indexing moving with it.
+//
+// K changes symbol extraction and nothing else:
+//
+//     K=8   2.00 bpw   a symbol IS a byte      1 byte  read, no shift/mask
+//     K=9   2.25 bpw   spans a byte boundary   2 bytes read + shift + mask
+//     K=10  2.50 bpw   spans a byte boundary   2-3 bytes read + shift + mask
+//
+// WHY THIS FAMILY EXISTS AT ALL
+// -----------------------------
+// The shipped K=4/V=2/L=16 rung's table is 2^16 x 2 **f32** = 524,288 B. That
+// does not fit shared memory at any occupancy, so every decoded symbol pays a
+// dependent, data-scattered load to L2 -- measured at 388 GB/s, ~8% of H200
+// HBM, and it is the decode limiter. That is the *shipped default* path:
+// `QtipCodebook::DEFAULT` is `Gaussian`, which gathers from the stored table.
+// (`qtip/mod.rs`'s claim that "the GPU decode paths compute instead" holds only
+// for the `Mcg` codebook, which is not the default.) Killing that gather is
+// what the 32 KiB table is for.
+//
+// WHICH K SHIPS
+// -------------
+// K=8 is the **control**: byte-aligned, and the geometry whose compiled-probe
+// figures (5.375 inst/weight, 4.375 with the row-scale hoist, against 15.125
+// for the shipped rung) anchor the comparison. It is not expected to be the K
+// that ships -- CPU sweeps put K=8/V=4/L=12 at Delta w_cos -0.00698 (random
+// codebook) / -0.00307 (converged trellis-Lloyd) against a +/-0.0008 threshold,
+// and no codebook design recovered it. **K=9 at 2.25 bpw measured +0.00402.**
+//
+// MEASUREMENT STATUS -- READ BEFORE QUOTING A NUMBER
+// -------------------------------------------------
+// **This file has never been compiled with nvcc and never run on a GPU by its
+// author. Its instruction count is UNESTABLISHED at every K.** The probe
+// figures above came from a standalone compiled probe, not from this kernel.
+// Establish it with `nvcc -cubin -arch=sm_90` plus unroll differencing on the
+// inner loop before it is quoted anywhere. Hand-counting C++ undercounts SASS
+// by ~2.05x on this kernel family, so a count that was not compiled is not a
+// count.
+//
+// THE TAIL CLAMP IS A REMOVABLE COST -- DO NOT READ IT AS THE ALIGNMENT PENALTY
+// ---------------------------------------------------------------------------
+// `QtipSymExtract<K>` reads a COMPILE-TIME count of bytes (MAX_BYTES) so the
+// loop unrolls with no data-dependent branch. For a symbol near the end of a
+// row that can address past the row, so the byte index is clamped to the last
+// valid byte. This is safe -- see the correctness note on the clamp below --
+// but it costs an extra `min` per byte read, and it would **disappear entirely
+// if the row stride were padded by MAX_BYTES-1 bytes**. A K=9 or K=10 SASS
+// measurement that includes the clamp is an UPPER BOUND on the alignment
+// penalty, not the penalty. Padding is a format decision that is deliberately
+// not taken here while K is unsettled.
+//
+// PARITY
+// ------
+// `mistralrs-quant/src/qtip/trellis_v4l12.rs::Rung::gemv_row(.., Off)` is the
+// reference, and the correspondence is operation for operation:
+//
+//     w   = __fmul_rn(cb, scale)   <->  let w = cb * scale;
+//     acc = fmaf(w, x, acc)        <->  acc = w.mul_add(x, acc);
+//
+// `__fmul_rn` rather than `*` because build.rs compiles this directory with
+// `--use_fast_math`, which implies `-fmad=true`; a bare `cb * scale` feeding
+// the FMA's multiplicand is not contractible today, but writing the intent is
+// what `qtip_exact_fp.cuh` exists for and costs nothing. bf16 -> f32 widening
+// is exact on both sides, and `fmaf` and Rust's `f32::mul_add` are both the
+// single-rounding fused op.
+//
+// The row-scale hoist (`ROW_SCALE_HOIST`) is the ONE thing that breaks this.
+// It reassociates the sum -- `sum (cb*s)*x` becomes `s * sum cb*x` -- so it is
+// a separate template parameter and the parity gate runs with it off.
+//
+// SM80+ (uses __nv_bfloat16). Gated by `has_qtip_kernels` in build.rs.
+
+#include <cstdint>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+namespace {
+
+// ---- fixed geometry: the table --------------------------------------------
+
+constexpr uint32_t QV4_L           = 12;
+constexpr uint32_t QV4_V           = 4;
+constexpr uint32_t QV4_STATE_MASK  = (1u << QV4_L) - 1u;   // 0xFFF
+constexpr uint32_t QV4_LUT_STATES  = 1u << QV4_L;          // 4096
+constexpr uint32_t QV4_LUT_ENTRIES = QV4_LUT_STATES * QV4_V; // 16384
+
+static_assert(QV4_LUT_ENTRIES * sizeof(__nv_bfloat16) == 32768,
+              "the V=4/L=12 table must be exactly 32 KiB; that is the property that lets it "
+              "live in static shared memory without a cudaFuncSetAttribute opt-in");
+static_assert(QV4_LUT_ENTRIES * sizeof(__nv_bfloat16) <= 48 * 1024,
+              "static __shared__ is capped at 48 KiB per block");
+
+// ---- the K seam ------------------------------------------------------------
+//
+// Everything K-dependent lives here. The table path below never sees K.
+
+template <int K>
+struct QtipSymExtract {
+    static_assert(K >= 2 && K <= 16, "K must fit the 3-byte extraction window");
+
+    // Bytes one extraction may touch, worst case over the bit offset:
+    // ceil((7 + K) / 8). 2 at K=9, 3 at K=10.
+    static constexpr int MAX_BYTES = (7 + K + 7) / 8;
+
+    // Symbol t occupies bits [t*K, t*K + K), LSB-first: bit j lives in byte
+    // j/8 at bit position j%8. Same convention the shipped K=4/V=2 rung uses
+    // (symbol 2b is the low nibble of byte b), pinned on the Rust side by
+    // `the_bit_layout_matches_the_shipped_k4_rungs_nibble_order`.
+    __device__ __forceinline__ static uint32_t get(
+        const uint8_t* __restrict__ row, int t, int row_bytes
+    ) {
+        const int bit = t * K;
+        const int b0  = bit >> 3;
+        const int off = bit & 7;
+        uint32_t w = 0u;
+        #pragma unroll
+        for (int i = 0; i < MAX_BYTES; ++i) {
+            // CLAMP, and why it is correct rather than merely safe: byte i
+            // contributes bits [8i, 8i+8) of `w`, and the mask below keeps
+            // only bits [off, off+K). Any byte beyond ceil((off+K)/8) lands
+            // entirely above that window, so substituting a different (valid,
+            // in-row) byte cannot change the result. It therefore reads real
+            // memory and yields the identical symbol.
+            const int idx = min(b0 + i, row_bytes - 1);
+            w |= (uint32_t)__ldg(row + idx) << (8 * i);
+        }
+        return (w >> off) & ((1u << K) - 1u);
+    }
+};
+
+// The byte-aligned control. A symbol IS a byte: one LDG, no shift, no mask, no
+// clamp. This is the floor every other K is measured against, so it is a real
+// specialisation rather than a lucky path through the general code.
+template <>
+struct QtipSymExtract<8> {
+    static constexpr int MAX_BYTES = 1;
+    __device__ __forceinline__ static uint32_t get(
+        const uint8_t* __restrict__ row, int t, int /*row_bytes*/
+    ) {
+        return (uint32_t)__ldg(row + t);
+    }
+};
+
+// ---- dtype helpers ---------------------------------------------------------
+
+template <typename T>
+__device__ __forceinline__ T from_f32(float v);
+
+template <>
+__device__ __forceinline__ float from_f32<float>(float v) {
+    return v;
+}
+template <>
+__device__ __forceinline__ __half from_f32<__half>(float v) {
+    return __float2half_rn(v);
+}
+template <>
+__device__ __forceinline__ __nv_bfloat16 from_f32<__nv_bfloat16>(float v) {
+    return __float2bfloat16(v);
+}
+
+template <typename T>
+__device__ __forceinline__ float to_f32(T v);
+
+template <>
+__device__ __forceinline__ float to_f32<float>(float v) {
+    return v;
+}
+template <>
+__device__ __forceinline__ float to_f32<__half>(__half v) {
+    return __half2float(v);
+}
+template <>
+__device__ __forceinline__ float to_f32<__nv_bfloat16>(__nv_bfloat16 v) {
+    return __bfloat162float(v);
+}
+
+// Warp-level XOR-shuffle sum reduction.
+__device__ __forceinline__ float warp_reduce_sum(float v) {
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        v += __shfl_xor_sync(0xFFFFFFFFu, v, off);
+    }
+    return v;
+}
+
+// Stage the whole 32 KiB table into shared memory, cooperatively.
+//
+// K-independent, like everything else that touches the table. 16-byte loads
+// when the source pointer allows it (a freshly materialized [4096, 4] tensor is
+// cudaMalloc-aligned, so this is the normal case), with a scalar fallback so a
+// view with a nonzero element offset degrades in speed rather than faulting.
+// Caller issues the __syncthreads().
+__device__ __forceinline__ void stage_lut(
+    __nv_bfloat16* __restrict__ lut_s, const __nv_bfloat16* __restrict__ lut_g, int threads
+) {
+    const int tid = threadIdx.x;
+    if ((reinterpret_cast<uintptr_t>(lut_g) & 0xFu) == 0u) {
+        constexpr int N_VEC = (int)(QV4_LUT_ENTRIES * sizeof(__nv_bfloat16) / sizeof(uint4)); // 2048
+        const uint4* src = reinterpret_cast<const uint4*>(lut_g);
+        uint4*       dst = reinterpret_cast<uint4*>(lut_s);
+        for (int i = tid; i < N_VEC; i += threads) {
+            dst[i] = src[i];
+        }
+    } else {
+        for (int i = tid; i < (int)QV4_LUT_ENTRIES; i += threads) {
+            lut_s[i] = lut_g[i];
+        }
+    }
+}
+
+// Fused decode + gemv. `y[row] = sum_k W[row,k] * x[k]`, with W reconstructed
+// on the fly from `packed`, `row_scales` and the staged table. `x` must
+// already be in the QTIP-rotated frame (the caller applies
+// `launch_qtip_rotate_x_*` first, exactly as for the K=4 rung).
+//
+// Grid:  (n_blocks, 1, 1)  -- each block walks rows blockIdx.x, +gridDim.x, ...
+// Block: (THREADS, 1, 1)
+//
+// The grid-stride over rows is what makes the staging pay. Staging costs
+// 32 KiB of L2->SMEM per BLOCK, not per row, so with a grid sized to fill the
+// device the cost is bounded by the grid rather than by n_rows. One block per
+// row would stage 32 KiB to do (in_features/4) bytes of packed work -- 32x
+// overhead at in_features=4096.
+template <typename T, int THREADS, int K, bool ROW_SCALE_HOIST>
+__global__ void __launch_bounds__(THREADS)
+qtip_fused_gemv_v4_l12_kernel(
+    const uint8_t*       __restrict__ packed,      // [n_rows, packed_per_row]
+    const float*         __restrict__ row_scales,  // [n_rows]
+    const __nv_bfloat16* __restrict__ lut,         // [2^L * V] bf16, 32 KiB
+    const T*             __restrict__ x,           // [k_in], k_in == num_symbols*V
+    T*                   __restrict__ y,           // [n_rows]
+    int n_rows,
+    int packed_per_row,
+    int num_symbols
+) {
+    // 32,768 B. Plus warp_sums below; total static shared is
+    // 32768 + (THREADS/32)*4 B, still far under the 48 KiB cap.
+    __shared__ __align__(16) __nv_bfloat16 lut_s[QV4_LUT_ENTRIES];
+    constexpr int N_WARPS = THREADS / 32;
+    static_assert(THREADS % 32 == 0, "THREADS must be a multiple of warp size");
+    __shared__ float warp_sums[N_WARPS];
+
+    // Prior symbols consumed before a thread decodes its own slice: ceil(L/K).
+    // 2 at every supported K. One more than strictly required -- the state that
+    // decodes symbol t keeps only L-K bits of s_{t-1}, and those are supplied
+    // by symbol t-1 -- but it matches `qtip_gemv.cu`'s definition at K=4/L=16,
+    // and the Rust side pins both facts.
+    constexpr int WARMUP_SYMS = (QV4_L + K - 1) / K;
+    static_assert(WARMUP_SYMS * K >= (int)QV4_L,
+                  "warmup must shift at least L bits through the state register");
+
+    stage_lut(lut_s, lut, THREADS);
+    __syncthreads();
+
+    const int tid     = threadIdx.x;
+    const int lane    = tid & 31;
+    const int warp_id = tid >> 5;
+
+    // Each thread takes a contiguous slice of the row's symbols.
+    const int sym_per_thread = (num_symbols + THREADS - 1) / THREADS;
+    const int sym_start_raw  = tid * sym_per_thread;
+    const int sym_end        = min(num_symbols, sym_start_raw + sym_per_thread);
+
+    for (int row = blockIdx.x; row < n_rows; row += gridDim.x) {
+        const uint8_t* row_packed = packed + (size_t)row * packed_per_row;
+        const float    scale      = __ldg(row_scales + row);
+
+        float acc = 0.0f;
+
+        if (sym_start_raw < num_symbols) {
+            // ---- Warmup ----
+            // Threads i>0 replay WARMUP_SYMS prior symbols to seed the state;
+            // their decoded weights belong to the previous thread's slice and
+            // are NOT accumulated. Thread 0 starts from the true initial state
+            // 0. A thread starting inside the first WARMUP_SYMS symbols walks
+            // from 0, which is exact rather than approximate for the same
+            // reason.
+            uint32_t state = 0u;
+            if (sym_start_raw > 0) {
+                const int warm_start = max(0, sym_start_raw - WARMUP_SYMS);
+                for (int t = warm_start; t < sym_start_raw; ++t) {
+                    const uint32_t sym =
+                        QtipSymExtract<K>::get(row_packed, t, packed_per_row);
+                    state = ((state << K) | sym) & QV4_STATE_MASK;
+                }
+            }
+
+            // ---- Decode ----
+            // One symbol -> one 8-byte table entry -> four weights. The only
+            // K-dependent step is the extraction; everything below is shared.
+            for (int sym_idx = sym_start_raw; sym_idx < sym_end; ++sym_idx) {
+                const uint32_t sym =
+                    QtipSymExtract<K>::get(row_packed, sym_idx, packed_per_row);
+                state = ((state << K) | sym) & QV4_STATE_MASK;
+
+                // `lut_s` is 16-byte aligned and the entry is 4 bf16, so this
+                // address is 8-byte aligned for every state -- the layout that
+                // makes an LDS.64 (and an mma.m16n8k16.bf16 B-operand pair)
+                // possible. Whether the compiler actually fuses the four 2-byte
+                // reads into one 8-byte load is a codegen outcome to be
+                // confirmed with `nvcc -cubin`, NOT something this comment
+                // asserts.
+                const __nv_bfloat16* c = &lut_s[(size_t)state * QV4_V];
+                const int x_off = sym_idx * (int)QV4_V;
+
+                #pragma unroll
+                for (int v = 0; v < (int)QV4_V; ++v) {
+                    const float cb = __bfloat162float(c[v]);
+                    const float xv = to_f32<T>(__ldg(x + x_off + v));
+                    if constexpr (ROW_SCALE_HOIST) {
+                        acc = fmaf(cb, xv, acc);
+                    } else {
+                        acc = fmaf(__fmul_rn(cb, scale), xv, acc);
+                    }
+                }
+            }
+        }
+
+        // ---- Block reduction ----
+        acc = warp_reduce_sum(acc);
+        // The grid-stride loop reuses warp_sums every iteration, so a warp
+        // that races ahead must not overwrite a value warp 0 has not read yet.
+        __syncthreads();
+        if (lane == 0) warp_sums[warp_id] = acc;
+        __syncthreads();
+
+        if (warp_id == 0) {
+            float v = (lane < N_WARPS) ? warp_sums[lane] : 0.0f;
+            v = warp_reduce_sum(v);
+            if (lane == 0) {
+                y[row] = from_f32<T>(ROW_SCALE_HOIST ? (v * scale) : v);
+            }
+        }
+    }
+}
+
+// Blocks resident at once. Staging is 32 KiB of L2->SMEM per block, so this
+// caps total staging traffic at 64 MiB regardless of how many rows the layer
+// has. Sized to oversubscribe any current datacentre part (H100 has 132 SMs)
+// without making the cap the thing that limits parallelism.
+constexpr int QV4_MAX_BLOCKS = 2048;
+
+} // anonymous namespace
+
+// ============================================================================
+// extern "C" launchers
+// ============================================================================
+
+extern "C" {
+
+// `k` selects the symbol width; `row_scale_hoist` is 0 for the bit-exact
+// per-weight scale (the policy the parity gate pins) and nonzero for the
+// hoisted one. Both are ints and not enums so the ABI is unambiguous across
+// the FFI boundary; `Rung::k()` and `RowScaleHoist::as_abi` on the Rust side
+// are the only things that produce them.
+//
+// An unsupported `k` returns WITHOUT launching, so `y` keeps whatever it held.
+// The Rust launcher validates `k` before calling and a source guard
+// (`the_rust_model_and_the_cuda_kernel_agree_on_their_shared_constants`)
+// asserts that every K the Rust side advertises has a case here — a missing
+// case would otherwise be a silent all-zeros layer.
+#define QTIP_V4L12_LAUNCH_K(T, K_VAL, HOIST)                                       \
+    qtip_fused_gemv_v4_l12_kernel<T, THREADS, K_VAL, HOIST>                        \
+        <<<blocks, THREADS, 0, stream>>>(                                          \
+            d_packed, d_row_scales, d_lut, d_x_rotated, d_y,                       \
+            n_rows, packed_per_row, num_symbols)
+
+#define QTIP_V4L12_GEMV_LAUNCHER(NAME, T)                                          \
+    void NAME(const uint8_t*       d_packed,                                       \
+              const float*         d_row_scales,                                   \
+              const __nv_bfloat16* d_lut,                                          \
+              const T*             d_x_rotated,                                    \
+              T*                   d_y,                                            \
+              int n_rows,                                                          \
+              int packed_per_row,                                                  \
+              int num_symbols,                                                     \
+              int k,                                                               \
+              int row_scale_hoist,                                                 \
+              cudaStream_t stream) {                                               \
+        constexpr int THREADS = 128;                                               \
+        if (n_rows <= 0 || num_symbols <= 0 || packed_per_row <= 0) return;        \
+        const int blocks = n_rows < QV4_MAX_BLOCKS ? n_rows : QV4_MAX_BLOCKS;      \
+        if (row_scale_hoist != 0) {                                                \
+            switch (k) {                                                           \
+                case 8:  QTIP_V4L12_LAUNCH_K(T, 8,  true); break;                  \
+                case 9:  QTIP_V4L12_LAUNCH_K(T, 9,  true); break;                  \
+                case 10: QTIP_V4L12_LAUNCH_K(T, 10, true); break;                  \
+                default: return;                                                   \
+            }                                                                      \
+        } else {                                                                   \
+            switch (k) {                                                           \
+                case 8:  QTIP_V4L12_LAUNCH_K(T, 8,  false); break;                 \
+                case 9:  QTIP_V4L12_LAUNCH_K(T, 9,  false); break;                 \
+                case 10: QTIP_V4L12_LAUNCH_K(T, 10, false); break;                 \
+                default: return;                                                   \
+            }                                                                      \
+        }                                                                          \
+    }
+
+QTIP_V4L12_GEMV_LAUNCHER(launch_qtip_fused_gemv_v4_l12_bf16, __nv_bfloat16)
+QTIP_V4L12_GEMV_LAUNCHER(launch_qtip_fused_gemv_v4_l12_f16,  __half)
+QTIP_V4L12_GEMV_LAUNCHER(launch_qtip_fused_gemv_v4_l12_f32,  float)
+
+#undef QTIP_V4L12_GEMV_LAUNCHER
+#undef QTIP_V4L12_LAUNCH_K
+
+} // extern "C"

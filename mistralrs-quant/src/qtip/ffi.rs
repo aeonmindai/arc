@@ -223,22 +223,26 @@ extern "C" {
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
-    // ----- Fused decode + gemv at K=8 / V=4 / L=12 -----
+    // ----- Fused decode + gemv for the V=4 / L=12 family -----
     //
-    // Same 2 bits per weight as the K=4/V=2 launchers above (`bpw = K/V`), a
-    // different decode cost. `d_lut` is **bf16, not f32**, and holds
-    // `2^12 × 4 = 16,384` values = 32,768 B — small enough that the kernel
-    // stages the whole table in static shared memory per block. There is no
-    // `cb_mult` here: this rung has no computed-codebook twin, because the
-    // computed `sum2` construction is V=2-specific
-    // (`kernels/qtip/qtip_codebook.cuh::qtip_cb_pair_from_x0`).
+    // `d_lut` is **bf16, not f32**, and holds `2^12 × 4 = 16,384` values =
+    // 32,768 B — small enough that the kernel stages the whole table in static
+    // shared memory per block. There is no `cb_mult` here: this family has no
+    // computed-codebook twin, because the computed `sum2` construction is
+    // V=2-specific (`kernels/qtip/qtip_codebook.cuh::qtip_cb_pair_from_x0`).
+    //
+    // `k` is the symbol width — the ONLY thing that varies within the family.
+    // 8 (byte-aligned control, 2.00 bpw), 9 (2.25 bpw) or 10 (2.50 bpw). The
+    // kernel dispatches it to a template instantiation; an unsupported value
+    // returns without launching, so the Rust side validates first via
+    // `trellis_v4l12::Rung`.
     //
     // `row_scale_hoist` is 0 for the bit-exact per-weight scale (what the
     // parity gate pins) and nonzero to hoist the scale out of the
-    // accumulation. Produced only by `k8v4l12::RowScaleHoist::as_abi`.
+    // accumulation. Produced only by `RowScaleHoist::as_abi`.
     //
     // `x_rotated` must already be in the QTIP-rotated frame, as for K=4.
-    pub(crate) fn launch_qtip_fused_gemv_k8_v4_l12_bf16(
+    pub(crate) fn launch_qtip_fused_gemv_v4_l12_bf16(
         d_packed: *const u8,
         d_row_scales: *const f32,
         d_lut: *const bf16,
@@ -247,11 +251,12 @@ extern "C" {
         n_rows: i32,
         packed_per_row: i32,
         num_symbols: i32,
+        k: i32,
         row_scale_hoist: i32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
-    pub(crate) fn launch_qtip_fused_gemv_k8_v4_l12_f16(
+    pub(crate) fn launch_qtip_fused_gemv_v4_l12_f16(
         d_packed: *const u8,
         d_row_scales: *const f32,
         d_lut: *const bf16,
@@ -260,11 +265,12 @@ extern "C" {
         n_rows: i32,
         packed_per_row: i32,
         num_symbols: i32,
+        k: i32,
         row_scale_hoist: i32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
-    pub(crate) fn launch_qtip_fused_gemv_k8_v4_l12_f32(
+    pub(crate) fn launch_qtip_fused_gemv_v4_l12_f32(
         d_packed: *const u8,
         d_row_scales: *const f32,
         d_lut: *const bf16,
@@ -273,6 +279,7 @@ extern "C" {
         n_rows: i32,
         packed_per_row: i32,
         num_symbols: i32,
+        k: i32,
         row_scale_hoist: i32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
