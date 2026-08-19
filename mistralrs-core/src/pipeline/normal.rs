@@ -98,6 +98,91 @@ pub struct NormalPipeline {
     autonomous_runner: Option<arc_cuda_graph::AutonomousDecodeRunner>,
 }
 
+/// What a forward pass should do with candle's caching allocator before it
+/// runs. See [`alloc_cache_action`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AllocCacheAction {
+    /// Turn the cache on. Frees start being recycled instead of returned to
+    /// the driver.
+    Enable,
+    /// Return every held buffer to the driver and turn the cache off.
+    DrainAndDisable,
+    /// Already in the right state; touch nothing.
+    Leave,
+}
+
+/// Decide whether candle's caching allocator should be on for this forward.
+///
+/// # Why this is not simply "on"
+///
+/// The cache (fork `88d86a2`, `candle-core/src/cuda_backend/device.rs:42`) is
+/// keyed on **exact byte count** — `free: HashMap<usize, Vec<CUdeviceptr>>`,
+/// looked up with `free.get_mut(&bytes)`. No bucketing, no smallest-fit, no
+/// splitting. It also has **no capacity bound and no eviction**: the only ways
+/// memory goes back to the driver are `set_alloc_cache_enabled(false)` and
+/// `drain_alloc_cache_and_free()`.
+///
+/// Those two facts together decide the policy:
+///
+/// * **Decode wants it on.** A decode step allocates the same shapes 43 times
+///   over (once per layer), and the shapes that do not depend on KV length —
+///   hidden states, MLP and expert intermediates — repeat step after step.
+///   Exact-size keying is a perfect fit for that traffic.
+/// * **Prefill must drain it.** Prefill shapes scale with prompt length, are
+///   large, and are hit once. Leaving the cache on across a prefill parks
+///   those buffers for the process lifetime under a byte-size key nothing will
+///   ever request again. That is the failure mode `ARC_NO_DEDICATED_DECODE`
+///   already exists to work around, and it is why this returns
+///   [`AllocCacheAction::DrainAndDisable`] rather than `Leave` on `seq_len != 1`.
+///
+/// # The measurement this is waiting on
+///
+/// Buffers whose size tracks KV length — the causal mask most obviously —
+/// change size every decode step, so each step files one more never-reused
+/// entry. That is bounded by `O(context^2)` bytes in the worst case and is
+/// *not* bounded by this policy. It is small at short context (a `[1,1,1,kv]`
+/// BF16 mask over 4k tokens sums to ~16 MB) and is not small at 128k.
+///
+/// The fixed-capacity graph-mode path (`deepseek4.rs:4344-4353`, which swaps
+/// the growing causal mask for `graph_mode_length_mask` at
+/// `cfg_full.sliding_window`) removes that growth entirely, but it is reached
+/// only under `ARC_V4_CAPTURE_PROBE`. Until the shape-invariance work lands,
+/// `ARC_CANDLE_ALLOC_CACHE=0` is the kill switch, and the long-context
+/// high-water mark is the number a GPU run should falsify this with.
+///
+/// # Contract
+///
+/// * `seq_len` — the forward's sequence length. `1` is decode.
+/// * `enabled` — what candle reports *now* (`alloc_cache_enabled()`), so the
+///   action is idempotent and we never drain a cache that is already off.
+/// * `killed` — `ARC_CANDLE_ALLOC_CACHE=0` was set.
+///
+/// Pure, so the policy is testable without a GPU — which matters, because the
+/// allocator itself has no tests at all in either repo.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn alloc_cache_action(
+    seq_len: usize,
+    enabled: bool,
+    killed: bool,
+) -> AllocCacheAction {
+    let want = !killed && seq_len == 1;
+    match (want, enabled) {
+        (true, false) => AllocCacheAction::Enable,
+        (false, true) => AllocCacheAction::DrainAndDisable,
+        _ => AllocCacheAction::Leave,
+    }
+}
+
+/// `ARC_CANDLE_ALLOC_CACHE=0` turns the caching allocator off entirely.
+///
+/// Any other value — and *unset* — leaves the default policy in force. The
+/// variable used to be the on-switch, so the value `1` the ops scripts pass
+/// (`arc-tools/arcgraph_heap_probe.sh:191`) still means what it always meant.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn alloc_cache_killed() -> bool {
+    std::env::var("ARC_CANDLE_ALLOC_CACHE").is_ok_and(|v| v == "0")
+}
+
 /// A loader for a "normal" (non-quantized) model.
 pub struct NormalLoader {
     inner: Box<dyn NormalModelLoader>,
@@ -1702,15 +1787,31 @@ impl Pipeline for NormalPipeline {
                             "normal.rs:1554",
                         );
                     }
-                    // Enable the candle caching allocator for graph-capture
-                    // safety (RUN-161). Idempotent; gated so it's off during
-                    // model load and only active for decode. Warmup decode
-                    // forwards populate the cache before capture.
-                    if probe && seq_len == 1 && std::env::var_os("ARC_CANDLE_ALLOC_CACHE").is_some()
-                    {
-                        if let candle_core::Device::Cuda(cd) = self.device() {
-                            cd.set_alloc_cache_enabled(true);
+                    // Candle's caching allocator, driven by `alloc_cache_action`.
+                    //
+                    // This used to be `probe && seq_len == 1 && env(...)`, which
+                    // made a general-purpose allocator reachable only when the
+                    // V4 capture probe was also on. The cache recycles frees for
+                    // ANY decode step — it is not capture machinery — and the
+                    // three stacked default-off gates meant the ~11k allocations
+                    // per token were a disabled feature rather than a missing
+                    // one. It is now on for decode by default and drained on
+                    // prefill; see `alloc_cache_action` for why prefill must
+                    // drain rather than coast.
+                    if let candle_core::Device::Cuda(cd) = self.device() {
+                        match alloc_cache_action(
+                            seq_len,
+                            cd.alloc_cache_enabled(),
+                            alloc_cache_killed(),
+                        ) {
+                            AllocCacheAction::Enable => cd.set_alloc_cache_enabled(true),
+                            AllocCacheAction::DrainAndDisable => {
+                                cd.set_alloc_cache_enabled(false)
+                            }
+                            AllocCacheAction::Leave => {}
                         }
+                    }
+                    if probe && seq_len == 1 {
                         // RUN-161 step 2b. Set the graph-mode device position:
                         // drives RoPE + the fixed-capacity KV write slot, and
                         // makes warmup forwards take the shape-constant path so
@@ -2526,5 +2627,88 @@ impl AnyMoePipelineMixin for NormalPipeline {
     }
     fn amoe_supported(&self) -> bool {
         self.model.amoe_supported()
+    }
+}
+
+/// The caching-allocator policy's contract.
+///
+/// The allocator itself has **no tests at all** — not in this repo, and not in
+/// the candle fork that implements it (`grep -rn "alloc_cache" --include="*.rs"`
+/// over `candle-core` finds only `cuda_backend/device.rs` and
+/// `cuda_backend/mod.rs`, with no `#[cfg(test)]` in either). Everything that
+/// observes it needs a GPU, so nothing observes it in CI.
+///
+/// The decision of *when* it is on does not need a GPU, so it is tested here.
+#[cfg(test)]
+mod alloc_cache_policy_tests {
+    use super::{alloc_cache_action, AllocCacheAction};
+
+    /// The change this policy exists to make: a decode step turns the cache on
+    /// without any capture probe being involved.
+    #[test]
+    fn decode_enables_the_cache() {
+        assert_eq!(
+            alloc_cache_action(1, false, false),
+            AllocCacheAction::Enable
+        );
+    }
+
+    /// Prefill must hand its buffers back. They are large, they are keyed by an
+    /// exact byte size no later request will ask for, and nothing evicts them.
+    #[test]
+    fn prefill_drains_the_cache() {
+        assert_eq!(
+            alloc_cache_action(512, true, false),
+            AllocCacheAction::DrainAndDisable
+        );
+    }
+
+    /// Called once per forward, so it must be a no-op in the steady state
+    /// rather than re-enabling (or re-draining) every step.
+    #[test]
+    fn steady_state_touches_nothing() {
+        assert_eq!(alloc_cache_action(1, true, false), AllocCacheAction::Leave);
+        assert_eq!(
+            alloc_cache_action(512, false, false),
+            AllocCacheAction::Leave
+        );
+    }
+
+    /// The kill switch has to work from either state, including turning off a
+    /// cache that a previous step already enabled — otherwise setting it
+    /// mid-run would leave the buffers stranded.
+    #[test]
+    fn kill_switch_disables_and_drains_from_either_state() {
+        assert_eq!(
+            alloc_cache_action(1, true, true),
+            AllocCacheAction::DrainAndDisable
+        );
+        assert_eq!(alloc_cache_action(1, false, true), AllocCacheAction::Leave);
+    }
+
+    /// A prompt that happens to be one token long is a prefill by every other
+    /// measure, but it allocates decode-shaped buffers, so the policy keys on
+    /// the shape it will actually see. Pinned so the equivalence is deliberate.
+    #[test]
+    fn one_token_prompt_is_treated_as_decode() {
+        assert_eq!(
+            alloc_cache_action(1, false, false),
+            AllocCacheAction::Enable
+        );
+    }
+
+    /// A zero-length forward is not decode. Guards against `seq_len == 0`
+    /// (which `dims2().unwrap_or((0, 0))` produces on a shape error) quietly
+    /// enabling the cache.
+    #[test]
+    fn degenerate_zero_length_forward_does_not_enable() {
+        assert_eq!(
+            alloc_cache_action(0, false, false),
+            AllocCacheAction::Leave
+        );
+        assert_eq!(
+            alloc_cache_action(0, true, false),
+            AllocCacheAction::DrainAndDisable
+        );
     }
 }
