@@ -979,7 +979,7 @@ pub mod text_models_inputs_processor {
     ///    scheduler chunk" misreads what the number is for.
     pub(crate) fn prefill_chunk_size() -> Option<usize> {
         // A test override, when one is installed on THIS thread, wins outright
-        // and never touches the process environment. See `PrefillChunkGuard`
+        // and never touches the process environment. See `PrefillChunkSizeGuard`
         // for why the obvious `set_var` version cannot work here.
         #[cfg(test)]
         if let Some(injected) = test_chunk_override() {
@@ -1038,10 +1038,10 @@ pub mod text_models_inputs_processor {
     /// `Drop` also survives `--test-threads=1`, where libtest reuses one thread
     /// and a bare thread-local set would leak to the next test.
     #[cfg(test)]
-    pub(crate) struct PrefillChunkGuard(Option<Option<usize>>);
+    pub(crate) struct PrefillChunkSizeGuard(Option<Option<usize>>);
 
     #[cfg(test)]
-    impl PrefillChunkGuard {
+    impl PrefillChunkSizeGuard {
         pub(crate) fn set(chunk: Option<usize>) -> Self {
             let previous = TEST_CHUNK.with(|c| c.replace(Some(chunk)));
             Self(previous)
@@ -1049,7 +1049,7 @@ pub mod text_models_inputs_processor {
     }
 
     #[cfg(test)]
-    impl Drop for PrefillChunkGuard {
+    impl Drop for PrefillChunkSizeGuard {
         fn drop(&mut self) {
             let previous = self.0;
             TEST_CHUNK.with(|c| c.set(previous));
@@ -1663,7 +1663,7 @@ mod prefill_chunk_tests {
 
 #[cfg(test)]
 mod cursor_reaches_every_path_tests {
-    use super::text_models_inputs_processor::{make_prompt_chunk, PrefillChunkGuard};
+    use super::text_models_inputs_processor::{make_prompt_chunk, PrefillChunkSizeGuard};
     use candle_core::Device;
 
     /// 🔑 THE STRUCTURAL GATE for chunked prefill.
@@ -1691,9 +1691,9 @@ mod cursor_reaches_every_path_tests {
         // Injected, not `std::env::set_var`. The environment is process-global
         // and `prefill_chunk_size` latches its answer in a `OnceLock`, so the
         // env version contaminated sibling tests and could not be undone — see
-        // `PrefillChunkGuard`. `_guard` restores the previous value on drop,
+        // `PrefillChunkSizeGuard`. `_guard` restores the previous value on drop,
         // including on assertion panic.
-        let _guard = PrefillChunkGuard::set(Some(4));
+        let _guard = PrefillChunkSizeGuard::set(Some(4));
         let toks: Vec<u32> = (0..20u32).collect();
         let dev = Device::Cpu;
 
@@ -1741,7 +1741,7 @@ mod cursor_reaches_every_path_tests {
         let ambient = prefill_chunk_size();
 
         {
-            let _guard = PrefillChunkGuard::set(Some(7));
+            let _guard = PrefillChunkSizeGuard::set(Some(7));
             assert_eq!(
                 prefill_chunk_size(),
                 Some(7),
@@ -1749,7 +1749,7 @@ mod cursor_reaches_every_path_tests {
             );
             {
                 // Nesting must restore the OUTER override, not clear it.
-                let _inner = PrefillChunkGuard::set(Some(9));
+                let _inner = PrefillChunkSizeGuard::set(Some(9));
                 assert_eq!(prefill_chunk_size(), Some(9));
             }
             assert_eq!(
