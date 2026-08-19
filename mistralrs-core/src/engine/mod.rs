@@ -522,6 +522,21 @@ impl Engine {
                             scheduled.prompt.iter().map(|s| s.len()).max().unwrap_or(1),
                         );
                         let _pprompt = arc_profiler::span("prompt");
+                        // Is this the LAST chunk of every prompt in the cohort?
+                        // They share a cursor (the bucket key includes
+                        // `token_offset`), so one answer covers the batch.
+                        let chunk =
+                            crate::pipeline::text_models_inputs_processor::prefill_chunk_size();
+                        let cursor = scheduled.prompt[0].token_offset();
+                        let final_chunk = match chunk {
+                            Some(c) => scheduled
+                                .prompt
+                                .iter()
+                                .all(|s| cursor + c >= s.get_toks().len()),
+                            None => true,
+                        };
+                        let _chunk_guard =
+                            (!final_chunk).then(crate::pipeline::mark_prefill_intermediate);
                         let prompt_exec_time = {
                             let mut pipeline = {
                                 let _s = arc_profiler::span("pipeline.lock");
@@ -590,7 +605,27 @@ impl Engine {
                             .sum();
                         self.logger.add_tokens_processed(total_processed_tokens);
 
+                        if !final_chunk {
+                            // Not done prefilling: advance the cursor and leave
+                            // every row in `RunningPrompt`. The scheduler's
+                            // bucket key includes `token_offset`, so the cohort
+                            // stays together across chunks, and the loop returns
+                            // to the top — which is the whole point, because
+                            // that is where decode gets its turn.
+                            let c = chunk.unwrap_or(0);
+                            for seq in scheduled.prompt.iter_mut() {
+                                seq.set_token_offset(cursor + c);
+                            }
+                            self.logger.add_tokens_processed(c * scheduled.prompt.len());
+                            continue 'lp;
+                        }
                         for seq in scheduled.prompt.iter_mut() {
+                            // Prefill is finished, so the cursor must go back to
+                            // zero: it is part of the bucket key, and a decode
+                            // cohort carrying stale per-row offsets would shatter
+                            // into one bucket per offset — the exact pathology
+                            // `feat/dense-ragged-decode` removes.
+                            seq.set_token_offset(0);
                             match seq.sequence_stepping_type() {
                                 SeqStepType::OneShot => {
                                     seq.set_state(SequenceState::Done(StopReason::GeneratedImage))

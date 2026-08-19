@@ -242,6 +242,42 @@ static REGISTRY: &[Capability] = &[
 static DEAD_SYMBOL_BASELINE: &[(&str, &str)] = &[
     // (workspace-relative file, symbol)
     //
+    // 🔴 THE CHUNKED-PREFILL SAMPLING HOLE — read this before enabling
+    // `ARC_PREFILL_CHUNK`. This entry is option 3, taken deliberately, and it
+    // records an INCOMPLETE FEATURE rather than a harmless spare part.
+    //
+    // The flag is written and never read. `engine/mod.rs:539` computes whether
+    // this prefill step is the last chunk of its cohort and, when it is not,
+    // installs `mark_prefill_intermediate()`. Nothing anywhere calls
+    // `prefill_chunk_is_intermediate()` to consult it — its own doc comment
+    // says it is "read by `Pipeline::step`'s sampling stage", and that reader
+    // does not exist.
+    //
+    // So with chunking on, every intermediate chunk still reaches
+    // `sample_causal_gen` and emits a token mid-prompt. A 2048-token prompt at
+    // C=512 would produce four tokens nobody asked for before the prompt is
+    // even finished.
+    //
+    // Not wired here on purpose. Suppressing the sample means deciding what the
+    // sequence does instead — it must not advance, must not emit, and must stay
+    // in `RunningPrompt` — across four `sample_causal_gen` call sites
+    // (`mod.rs:1118`, `mod.rs:1346`, `amoe.rs:279`, `mtp_pipeline.rs:3202`).
+    // That is generation behaviour, and it is not trustworthy until it has run
+    // on a card. This session had no GPU.
+    //
+    // Why it is safe to sit here meanwhile: the hole is unreachable by default.
+    // `prefill_chunk_size()` returns `None` unless `ARC_PREFILL_CHUNK` is set,
+    // and it must stay unset regardless — chunking is measured NEGATIVE until
+    // the QTIP expert gather is fixed (71.3% of an N=128 prefill step, billed
+    // per step, so chunking pays it ceil(N/C) times).
+    //
+    // ⇒ Whoever turns chunking on owns finishing this first. Delete this entry
+    //   in the same PR that adds the reader.
+    (
+        "mistralrs-core/src/pipeline/mod.rs",
+        "prefill_chunk_is_intermediate",
+    ),
+    //
     // A fused SiLU·mul·down GEMV kernel that is compiled into
     // `libarccudagraph.a` on every CUDA build and launched by nothing. Declared
     // twice (`gemv_ffi.rs:32` and here) and called from neither.

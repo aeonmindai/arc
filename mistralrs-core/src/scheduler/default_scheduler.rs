@@ -82,9 +82,15 @@ type BucketKey = (usize, bool, usize);
 /// `pipeline.step(.., is_prompt = true, ..)` once, holding the pipeline mutex
 /// for the whole prefill, and every scheduled sequence goes straight from
 /// `RunningPrompt` to `RunningCompletion`. There is no partially-prefilled
-/// state — `Sequence::set_token_offset` has no callers in this tree — so a
-/// prompt cannot yield mid-flight. Admitting K prompts therefore stops decode
-/// for as long as prefilling all K takes.
+/// state — `Sequence::token_offset` was write-once (set by the prefill-prompt
+/// restore builder and never advanced; there was no setter at all), so it read
+/// 0 on every live path and a prompt could not yield mid-flight. Admitting K
+/// prompts therefore stops decode for as long as prefilling all K takes.
+///
+/// (This PR adds `Sequence::set_token_offset` and advances it per chunk, so
+/// the mid-flight yield now exists — but only when `ARC_PREFILL_CHUNK` is set,
+/// which it should not be yet; see `prefill_chunk_size` for why. Unset, the
+/// paragraph above still describes the shipped behaviour exactly.)
 ///
 /// Measured on an H200 (2026-08-17, `qtip2b`, MTP depth 3, profiler PR #113):
 /// at K=32 with 256-word prompts, **ONE prompt step took 43.2 s — 50.3% of the
