@@ -825,8 +825,21 @@ impl QtipGeometry {
         in_features / self.v() as usize
     }
 
-    /// Packed bytes in a row of `in_features` weights:
-    /// `ceil(num_symbols · K / 8)`.
+    /// Bytes of a row that actually hold symbols, governed by the bit rate.
+    ///
+    /// **Not the row stride.** [`QtipGeometry::packed_len`] is what a tensor is
+    /// allocated at and what this format validates; it additionally carries
+    /// tail padding and a round-up to 4 for the V=4/L=12 family. Conflating
+    /// them is how a bits-per-weight claim ends up four bytes wrong.
+    pub fn data_bytes(self, in_features: usize) -> usize {
+        match self {
+            QtipGeometry::K4V2L16 => self.num_symbols(in_features) / 2,
+            QtipGeometry::TrellisV4L12 { rung } => rung.data_bytes(rung.num_symbols(in_features)),
+        }
+    }
+
+    /// The allocated length of a row of `in_features` weights — the tensor's
+    /// last dimension, and what this format validates.
     ///
     /// **Delegated, not restated.** `num_symbols / (8 / K)` is wrong at K=9 —
     /// there is no whole number of symbols per byte — and divides by zero, so
@@ -7537,8 +7550,11 @@ mod tests {
         for k in trellis_v4l12::K_SUPPORTED {
             let geo = QtipGeometry::trellis_v4l12(k)?;
             let packed_per_row = geo.packed_len(k_in);
-            // Sanity: the row length really does track K.
-            assert_eq!(packed_per_row, (k_in / 4 * k as usize).div_ceil(8));
+            // Sanity: the DATA length tracks K, and the allocated stride is
+            // that plus the padding the unclamped extraction relies on.
+            assert_eq!(geo.data_bytes(k_in), (k_in / 4 * k as usize).div_ceil(8));
+            assert!(packed_per_row >= geo.data_bytes(k_in));
+            assert!(packed_per_row - geo.data_bytes(k_in) <= 4);
 
             let blocks_data: Vec<u8> = (0..(n * packed_per_row))
                 .map(|i| (i * 37 % 251) as u8)
@@ -7720,8 +7736,10 @@ mod tests {
         assert_eq!(k10.bpw_x100(), 250);
         for k_in in [512usize, 4096, 7168] {
             assert!(k9.packed_len(k_in) > k8.packed_len(k_in));
-            // Exactly the bit-rate ratio, to the byte.
-            assert_eq!(k9.packed_len(k_in) * 8, k8.packed_len(k_in) * 9);
+            // Exactly the bit-rate ratio, to the byte — on DATA bytes. The
+            // stride is only approximately in that ratio, because K=9 pads for
+            // its multi-byte extraction and K=8 does not.
+            assert_eq!(k9.data_bytes(k_in) * 8, k8.data_bytes(k_in) * 9);
             // The whole family shares one table regardless of K.
             assert_eq!(k9.lut_values(), k8.lut_values());
             assert_eq!(k9.lut_dtype(), k8.lut_dtype());
@@ -7738,20 +7756,34 @@ mod tests {
     #[test]
     fn packed_len_uses_the_ceiling_where_it_is_observable() {
         let k9 = QtipGeometry::trellis_v4l12(9).unwrap();
-        // in_features=36 -> 9 symbols -> 81 bits -> 11 bytes, not 10.
+        // in_features=36 -> 9 symbols -> 81 bits -> 11 DATA bytes, not 10.
         assert_eq!(k9.num_symbols(36), 9);
-        assert_eq!(k9.packed_len(36), 11);
-        // in_features=4 -> 1 symbol -> 9 bits -> 2 bytes, not 1.
-        assert_eq!(k9.packed_len(4), 2);
+        assert_eq!(k9.data_bytes(36), 11);
+        // in_features=4 -> 1 symbol -> 9 bits -> 2 data bytes, not 1.
+        assert_eq!(k9.data_bytes(4), 2);
         let k10 = QtipGeometry::trellis_v4l12(10).unwrap();
-        // 3 symbols -> 30 bits -> 4 bytes, not 3.
-        assert_eq!(k10.packed_len(12), 4);
-        // ...and it agrees with the rung that owns the formula.
+        // 3 symbols -> 30 bits -> 4 data bytes, not 3.
+        assert_eq!(k10.data_bytes(12), 4);
+        // The stride is the data plus tail padding, rounded up to 4.
+        assert_eq!(k9.packed_len(36), 12);
+        assert_eq!(k9.packed_len(4), 4);
+        assert_eq!(k10.packed_len(12), 8);
+        // ...and both agree with the rung that owns the formulas.
         for k in trellis_v4l12::K_SUPPORTED {
             let g = QtipGeometry::trellis_v4l12(k).unwrap();
             let r = trellis_v4l12::Rung::new(k).unwrap();
             for k_in in [4usize, 12, 36, 100, 260, 4096] {
-                assert_eq!(g.packed_len(k_in), r.packed_len(k_in), "K={k} k_in={k_in}");
+                let n = r.num_symbols(k_in);
+                assert_eq!(
+                    g.packed_len(k_in),
+                    r.row_stride(n),
+                    "K={k} k_in={k_in} stride"
+                );
+                assert_eq!(
+                    g.data_bytes(k_in),
+                    r.data_bytes(n),
+                    "K={k} k_in={k_in} data"
+                );
             }
         }
     }
