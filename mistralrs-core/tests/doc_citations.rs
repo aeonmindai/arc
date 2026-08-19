@@ -101,12 +101,28 @@ const CITED_EXTS: &[&str] = &[
     "rs", "cu", "cuh", "h", "hpp", "toml", "py", "sh", "yaml", "yml", "json", "metal", "md",
 ];
 
-/// Files searched when asking "does this symbol exist anywhere?". Prose (`.md`)
-/// is excluded on purpose: a symbol surviving only in documentation is exactly
-/// the rot this is looking for.
+/// Files searched when asking "does this symbol exist anywhere?" — the question
+/// behind [`Kind::SymbolRot`], the one verdict with no waiver path.
+///
+/// Because a *false* rot report cannot be waived, this list errs wide: it names
+/// every textual extension tracked in the repo, not just the ones a Rust symbol
+/// is likely to live in. Adding a new text format and forgetting it here would
+/// manifest as an unfixable red lane.
+///
+/// It is an allowlist rather than "everything that is not `.md`" because the
+/// repo tracks 166 PDFs, several of them 20-30 MB; reading those to look for an
+/// identifier would dominate the runtime for no possible hit.
+///
+/// `.md` is the one text format deliberately left out: a symbol surviving only
+/// in prose is precisely the rot this is looking for.
 const CODE_EXTS: &[&str] = &[
-    "rs", "cu", "cuh", "h", "hpp", "toml", "py", "sh", "yaml", "yml", "json", "metal",
+    "rs", "cu", "cuh", "h", "hpp", "c", "cc", "cpp", "toml", "py", "sh", "bash", "yaml", "yml",
+    "json", "jsonl", "metal", "js", "ts", "jinja", "patch", "html", "css", "txt", "cfg", "ini",
 ];
+
+/// Files larger than this are skipped by the whole-repo symbol search, so a
+/// large generated or vendored blob cannot dominate the runtime.
+const MAX_SEARCHED_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Directories never indexed.
 const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".venv", "__pycache__"];
@@ -630,6 +646,11 @@ impl Repo {
     fn symbol_exists_anywhere(&mut self, sym: &str) -> bool {
         let code: Vec<usize> = (0..self.files.len())
             .filter(|&i| has_ext(&self.files[i], CODE_EXTS))
+            .filter(|&i| {
+                fs::metadata(self.root.join(&self.files[i]))
+                    .map(|m| m.len() <= MAX_SEARCHED_BYTES)
+                    .unwrap_or(false)
+            })
             .collect();
         for i in code {
             if !self.symbol_lines(i, sym).is_empty() {
