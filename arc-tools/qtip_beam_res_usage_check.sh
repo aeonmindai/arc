@@ -30,7 +30,13 @@
 #   2. A KERNEL-COUNT assertion per source. `qtip_beam.cu` must yield 4 beam
 #      kernels (2 geometries x 2 codebooks); if the K=8/V=4/L=12 instantiation
 #      were ever dropped, a "no spill" result would be about a kernel that no
-#      longer exists.
+#      longer exists. `qtip2b_beam.cu` yields 1: that rung has no stored-LUT
+#      path at all (the codebook is always computed from `mult`), so its kernel
+#      is not templated on the codebook the way the LUT rung's is.
+#
+# Note on the negative control: nvcc reports its spill as `STACK:1024`, not
+# `LOCAL:`. That is why the verdict below tests BOTH fields — a LOCAL-only check
+# would have called the control clean and disarmed the whole gate.
 #
 # NO GPU REQUIRED: nvcc + cuobjdump only.
 #
@@ -115,10 +121,10 @@ echo
 # ---------------------------------------------------------------------------
 # 1. The shipped beam kernels.
 #    qtip_beam.cu   : 2 geometries (K4/V2/L16, K8/V4/L12) x 2 codebooks = 4
-#    qtip2b_beam.cu : 1 geometry   (K2/V1/L16)            x 2 codebooks = 2
+#    qtip2b_beam.cu : 1 kernel — computed codebook only, so no codebook template
 # ---------------------------------------------------------------------------
 SOURCES=(qtip_beam.cu qtip2b_beam.cu)
-EXPECT=(4 2)
+EXPECT=(4 1)
 
 fail=0
 for i in "${!SOURCES[@]}"; do

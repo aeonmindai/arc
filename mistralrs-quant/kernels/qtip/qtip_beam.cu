@@ -210,8 +210,10 @@ struct QbShape {
     static_assert(MAX_GROUPS <= GROUPS,
                   "every live group must have a lane team in the block");
     // `cand[]` MUST stay in registers; see the spill note on
-    // QB_MIN_BLOCKS_PER_SM. 16 is what both shipped geometries produce and what
-    // `cuobjdump -res-usage` has been checked at.
+    // QB_MIN_BLOCKS_PER_SM. 16 is what both shipped geometries produce, and it
+    // is the number `cuobjdump -res-usage` has been checked at (LOCAL:0,
+    // REG<=62). A geometry that would push it higher must be measured before it
+    // is trusted, not reasoned about — hence the ceiling rather than a comment.
     static_assert(CAND >= 1 && CAND <= 16,
                   "cand[] must stay small enough to live in registers");
     // `keep_mask` is a 32-bit bitset over `cand[]`.
@@ -224,17 +226,29 @@ struct QbShape {
 
 // Blocks per SM this kernel is compiled to fit.
 //
-// MEASURED, not assumed: `cuobjdump -res-usage` on the pre-wave16 kernel
-// reported `REG:80 STACK:0 SHARED:38992 LOCAL:0` for sm_90a. 256 threads x 80
-// registers = 20,480 per block, and 65,536 / 20,480 = 3 blocks/SM — 24 of 64
-// warps, 37.5% occupancy, **register-limited** (shared memory would allow 5:
-// 3 x 38,992 B is 114 KiB of the 228 KiB an SM has). The bake drew 261 W of
-// 700 W = 37% of TDP against that 37.5% occupancy, which is an independent
-// check on the kernel being latency-bound rather than throughput-bound.
+// 4 caps registers at 65,536 / 4 / 256 = 64 per thread and buys 32 warps
+// instead of the 24 that 3 blocks give (+33% occupancy, which for a
+// latency-bound kernel is a ~1.33x throughput term).
 //
-// Raising this to 4 caps registers at 65,536 / 4 / 256 = 64 per thread and buys
-// 32 warps instead of 24 (+33% occupancy, which for a latency-bound kernel is a
-// ~1.33x throughput term). Shared memory still fits: 4 x ~39 KiB = 156 KiB.
+// MEASURED, `cuobjdump -res-usage`, sm_80, CUDA 12.4, build.rs's exact flags
+// (arc-tools/qtip_beam_res_usage_check.sh, which CI now runs on every PR):
+//
+//     K=8/V=4/L=12  LUT       REG:62 STACK:0 SHARED:19696 LOCAL:0
+//     K=8/V=4/L=12  computed  REG:59 STACK:0 SHARED:19696 LOCAL:0
+//     K=4/V=2/L=16  LUT       REG:60 STACK:0 SHARED:38000 LOCAL:0
+//     K=4/V=2/L=16  computed  REG:60 STACK:0 SHARED:38000 LOCAL:0
+//
+// All four are inside the 64-register budget with NO spill, so the occupancy
+// is real at both geometries. Both SHARED figures are exactly what the
+// declarations above sum to (37,996 -> 38,000 and 19,696), which is an
+// independent check that the K=4 layout did not move when the geometry became
+// a template parameter. Shared memory is not the constraint either way:
+// 4 x 38,000 B is 148 KiB of the 228 KiB an SM has.
+//
+// (The older `REG:80 ... SHARED:38992` line this note used to quote was a
+// pre-wave16 measurement of a kernel that no longer exists — wave16/wave17
+// rewrote the selection and the scan buffers. It is superseded by the table
+// above, not contradicted by it.)
 //
 // ⚠ THE FAILURE MODE IS SILENT. `__launch_bounds__` does not refuse to compile
 // when it cannot reach the register budget — it SPILLS to local memory, and a
