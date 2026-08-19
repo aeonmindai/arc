@@ -73,6 +73,77 @@ family at **~70% issue efficiency** ⇒ **1.13**. **Honest band: 1.13 – 1.41 i
 the full 16,602.** But **Jish is right that 1,477 is wrong**: the answer is **~3,600 free,
 ~6,300 for a re-bake, ~9,700–12,300 with kernel work = 15–19× over today's 659.**
 
+---
+
+## 🟢 §1.3b — THE LADDER IS NOW COMPILED, NOT ESTIMATED (2026-08-19). Everything above is superseded.
+
+`nvcc -cubin -std=c++17 -arch=sm_90 -lineinfo -Xptxas -v`, **CUDA 12.4.131** — the version the in-tree
+anchors were produced with. Block = 256 threads = 8 warps. `bpw = K/V`, so **all three are 2 bpw and
+share one budget** — the error that produced the retracted K4/V4 claim cannot recur here.
+
+⚠️ **These are decode INNER-LOOP counts**, obtained by differencing two unroll depths so prologue and
+epilogue cancel. They **exclude** serving scaffolding (expert gather, shared staging, tail guards).
+**Geometry-to-geometry ratios are apples-to-apples; absolute values are NOT comparable to the shipped
+35.52 whole-kernel figure.**
+
+| geometry | bpw | budget | **sm_90** | **sm_80** | static smem | >48 KB? | regs | spill | blk/SM | warps | occ |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| K4/V2/L16 computed (**SHIPPED**) | 2.0 | 1.13–1.41 | **15.125**‡ | 14.812‡ | 0 B | no | 32 | 0 | 8 | 64 | **100%** |
+| K4/V2/L13 bf16 LUT | 2.0 | 1.13–1.41 | **11.250**‡ | **10.250** | 32,768 B | **no** | 48 | 0 | 5 | 40 | 62.5% |
+| K8/V4/L12 bf16 LUT | 2.0 | 1.13–1.41 | **5.375** | **4.625** | 32,768 B | **no** | 48 | 0 | 5 | 40 | 62.5% |
+| **K8/V4/L12 + row-scale hoist** | 2.0 | 1.13–1.41 | **4.375** | **3.625** | 32,768 B | **no** | 52 | 0 | 5 | 40 | 62.5% |
+
+‡ two-point differential; the third point saturated against a hard **4096-instruction unroller
+ceiling**, so linearity is unverified for those two rows only. **The K8/V4/L12 rows are clean 3-point
+with 0.00% linearity on both arches** — the headline does not depend on the pending re-run.
+
+**THE HEADLINE: 15.125 → 4.375 inst/wt = 3.46× fewer instructions per weight, COMPILED.**
+Still **3.1–3.9× short of the 1.13–1.41 budget on sm_90** (2.6–3.2× on sm_80) — and that is the inner
+loop alone. **D1: that is scope, not a sentence.**
+
+**Both LUT geometries land at exactly 32,768 B — under the 48 KB static limit, so NO
+`cudaFuncSetAttribute` opt-in is needed.** The "5 blocks/SM" prediction was right; the "20/64 warps =
+31%" prediction was **wrong** — it is 40/64 = **62.5%**, and **the limiter is REGISTERS, not shared
+memory.** The `TILE_N` 64→256 claim remains **untested** (that is the grouped GEMM, not compiled).
+
+### Levers, measured
+- **Lever 2 (row-scale hoist): −1.000 inst/wt exactly**, as the source predicted.
+- **Lever 3 (random-access window): a REGRESSION at K=8 (+0.375).** At K=8 warm-up is only `L/K = 2`
+  byte-aligned symbols — cheaper than reconstructing the window. **Its value is confined to K=4**,
+  where warm-up is 4 nibble-extracted symbols. That row is pending re-run.
+- **Lever 1: scope corrected AGAIN.** "There is no runtime LUT on the GPU at all" is **true only of
+  `qtip_gather_gemv.cu`**. `qtip_gemv.cu:266` still selects the stored Gaussian LUT when
+  `cb_mult == 0` — **and that is the shipped default** (`QtipCodebook::DEFAULT = Gaussian`,
+  `mod.rs:570`). **The in-tree doc at `mod.rs:596-598` is broader than the code supports.**
+
+### 🔴 §1.6 IS RETRACTED — the re-bake is ~8× MORE expensive, not cheaper
+**Both prior censuses were wrong, in opposite directions.** The "identical at 1.05 M transitions/step"
+model computed a *per-step* quantity, never multiplied by step count (which changes with V), and
+described a naive Viterbi **the code does not implement** — `qtip_quantize.cu:273-282` collapses the
+per-state reduction to a **per-prefix** one.
+
+The other census was right that K8/V4/L12 makes the *exhaustive* search far cheaper — and in fact
+**understated it** (backtrace traffic falls **512×**, not 32×). **But it does not matter: exhaustive
+is not the production baker.** Measured on A100: `qtip2b` beam W=256 = **213 s/layer**; exhaustive =
+**8,257 s/layer** (98.6 h ≈ $147). And `FACTS.md` says the beam kernel is *"issue/latency-bound
+(sm=100%, mem=1%)"* — **not** bandwidth-bound, which was the premise.
+
+On the beam path cost is `T × W × 2^K = (n/V) × W × 2^K` (`qtip_beam.cu:312`). K4/V2 → K8/V4
+multiplies candidates **16×** and halves timesteps ⇒ **~8× more expensive: ~213 → ~1,700 s/layer
+≈ 20 h ≈ $30 on A100.** The measured anchor agrees in direction — K2/V1 beat K4/V2 by 1.74×,
+attributed to "¼ the candidates/atomics more than pay for V=1's 2× timesteps".
+
+**⇒ K8/V4/L12's serving win must be PAID FOR with a ~8× more expensive bake. Affordable, but it
+inverts the recommendation.** Mitigation: W=256 on a 4,096-state trellis is far weaker pruning than on
+65,536 states, so W could likely shrink at L=12 — though even W=64 leaves it ~2× worse.
+
+### Why this does NOT move the b=1 number
+**B=1 is deliberately absent from the projection — it is not derivable from inst/wt.**
+`BUDGET_V4_B1.md` measures b=1 at **49% GPU-idle and launch-bound**, with the trellis GEMV only **29%
+of kernel time**, so a decode-kernel cut moves **≲15% of b=1 wall time.**
+**The format work pays at high concurrency; getting the CPU out of the loop pays at b=1. They are
+complementary, not substitutes.**
+
 ### 1.4 The levers — **three claimed, ONE survives intact.** Corrected 2026-08-19 by source read.
 
 1. ~~**Fold the nibble-reverse permutation into the LUT at load time.**~~ **DEAD — there is no
