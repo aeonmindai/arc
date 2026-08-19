@@ -1319,13 +1319,18 @@ impl Attention {
         let t_c = comp.dim(2)?;
         // Compressed entry j sits at absolute position j*ratio. Apply the
         // layer's (compress-θ) RoPE to the last qk_rope_head_dim dims there.
-        // NOTE: builds a small arange each call (a host/device sync); fine on
-        // the correctness-first dense path — the long-context sparse-gather
-        // kernel is the place to precompute this.
+        //
+        // This used to build the positions with `Tensor::arange` on every call.
+        // That is a host round trip on the hot path AND — decisively — the
+        // reason CUDA-graph capture of the V4 decode forward SIGSEGV'd on its
+        // first launch: `arange` uploads a transient host `Vec`, and a captured
+        // `cuMemcpyHtoDAsync` records the host POINTER, not the bytes, so the
+        // graph re-read a freed `Vec` and handed garbage indices straight to
+        // the `index_select` on the next line. `compress_positions` serves a
+        // zero-copy view of a table built once, outside capture; see its doc
+        // comment for the full mechanism.
         let dev = comp.device();
-        let positions = (Tensor::arange(0u32, t_c as u32, dev)?.to_dtype(DType::F32)?
-            * (ratio as f64))?
-        .to_dtype(DType::U32)?;
+        let positions = crate::layers::compress_positions(t_c, ratio, dev)?;
         self.rotary_emb
             .forward_at_positions(&comp, self.cfg.qk_rope_head_dim, &positions)
     }
