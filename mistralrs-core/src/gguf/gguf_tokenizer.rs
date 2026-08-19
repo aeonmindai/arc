@@ -372,9 +372,153 @@ impl TryFrom<Normalizer<'_>> for NormalizerWrapper {
 
 #[cfg(test)]
 mod tests {
+    use super::{bpe_tokenizer, unigram_tokenizer, PropsGGUF};
     use anyhow::Result;
     use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
     use tokenizers::Tokenizer;
+
+    // ── Hermetic tests ───────────────────────────────────────────────────
+    //
+    // These are the default lane. They build a tiny `PropsGGUF` by hand and
+    // call the conversion functions in this module directly, so they touch no
+    // network and no cache.
+    //
+    // They exist because the `test_encode_decode_*` tests below never actually
+    // reached this module's code: both of the tokenizers they compare are
+    // *downloaded* tokenizer.json files, so what they assert is that two
+    // pre-baked artifacts agree — not that `unigram_tokenizer` /
+    // `bpe_tokenizer` assemble the right thing. The decoder/normalizer chains
+    // those two functions wire up are the part of this file that is easy to
+    // get wrong and expensive to get wrong silently, so they get real coverage
+    // that runs on every PR.
+
+    /// A minimal `PropsGGUF`, with slot 0 = unk, 1 = bos, 2 = eos.
+    fn props(
+        model: &str,
+        tokens: &[&str],
+        scores: Option<Vec<f32>>,
+        merges: Option<&[&str]>,
+    ) -> PropsGGUF {
+        PropsGGUF {
+            model: model.to_string(),
+            tokens: tokens.iter().map(|s| (*s).to_string()).collect(),
+            added_tokens: None,
+            scores,
+            merges: merges.map(|m| m.iter().map(|s| (*s).to_string()).collect()),
+            unk: Some(0),
+            bos: Some(1),
+            eos: 2,
+        }
+    }
+
+    /// The SentencePiece normalizer and decoder must compose to the identity.
+    ///
+    /// On the way in: prepend `▁`, then space → `▁`. On the way out: `▁` →
+    /// space, then **strip exactly one leading space**. Drop that strip (or
+    /// strip the wrong end) and every single decode silently gains a leading
+    /// space — which is exactly the class of bug the downloaded-artifact test
+    /// below cannot see, because both of its artifacts already have the
+    /// decoder baked in.
+    #[test]
+    fn unigram_normalizer_and_decoder_roundtrip_to_identity() -> Result<()> {
+        let p = props(
+            "llama",
+            &["<unk>", "<s>", "</s>", "▁hello", "▁world"],
+            Some(vec![0.0, 0.0, 0.0, -1.0, -1.0]),
+            None,
+        );
+
+        let (tokenizer, _) = unigram_tokenizer(&p)?;
+
+        let encoded = tokenizer
+            .encode_fast("hello world", false)
+            .map_err(anyhow::Error::msg)?;
+        // `encode_fast` encodes with `OffsetType::None` and so leaves
+        // `get_tokens()` as empty strings — assert on ids, resolved by name so
+        // the expectation still reads as tokens.
+        let id = |t: &str| tokenizer.token_to_id(t).expect("token is in the vocab");
+        assert_eq!(encoded.get_ids(), [id("▁hello"), id("▁world")]);
+
+        let decoded = tokenizer
+            .decode(encoded.get_ids(), true)
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(decoded, "hello world");
+
+        Ok(())
+    }
+
+    /// `scores` is required for unigram and its absence must be a typed error,
+    /// not an index panic on a partially-built vocab.
+    #[test]
+    fn unigram_without_scores_is_an_error() {
+        let p = props("llama", &["<unk>", "<s>", "</s>"], None, None);
+        assert!(unigram_tokenizer(&p).is_err());
+    }
+
+    /// Byte-level BPE must roundtrip, merges included.
+    ///
+    /// `hello` exercises the merge table (`h e` → `he`, `l l` → `ll`); the
+    /// space before `world` exercises the `Ġ` byte-level mapping, which is the
+    /// half that silently eats or doubles spaces when the pre-tokenizer and
+    /// decoder are configured with mismatched `add_prefix_space`.
+    #[test]
+    fn bpe_roundtrips_through_merges_and_bytelevel_spaces() -> Result<()> {
+        let p = props(
+            "gpt2",
+            &[
+                "<unk>", "<s>", "</s>", "h", "e", "l", "o", "Ġ", "w", "r", "d", "he", "ll",
+            ],
+            None,
+            Some(&["h e", "l l"]),
+        );
+
+        let (tokenizer, _) = bpe_tokenizer(&p)?;
+
+        let encoded = tokenizer
+            .encode_fast("hello world", false)
+            .map_err(anyhow::Error::msg)?;
+        // See the unigram test: `encode_fast` does not populate token strings.
+        let id = |t: &str| tokenizer.token_to_id(t).expect("token is in the vocab");
+        assert_eq!(
+            encoded.get_ids(),
+            ["he", "ll", "o", "Ġ", "w", "o", "r", "l", "d"].map(id)
+        );
+
+        let decoded = tokenizer
+            .decode(encoded.get_ids(), true)
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(decoded, "hello world");
+
+        Ok(())
+    }
+
+    /// `merges` is required for BPE and its absence must be a typed error.
+    #[test]
+    fn bpe_without_merges_is_an_error() {
+        let p = props("gpt2", &["<unk>", "<s>", "</s>"], None, None);
+        assert!(bpe_tokenizer(&p).is_err());
+    }
+
+    // ── Network tests ────────────────────────────────────────────────────
+    //
+    // Everything below downloads ~3.5 MB (llama) / ~18 MB (gpt2) of
+    // tokenizer.json from huggingface.co **at test time**, so it fails
+    // whenever the network hiccups — `test_encode_decode_llama` took down
+    // PR #139's CI with `tls connection init failed ... Connection reset by
+    // peer` while its sibling passed in the same run.
+    //
+    // A unit test that depends on a live third-party host is a permanent
+    // source of false red, and false reds get acted on. So these are
+    // `#[ignore]`d out of the default lane rather than left to flake. They are
+    // NOT vacuous and they are NOT dead: the assertions are untouched and
+    // still run, on demand, with
+    //
+    //     cargo test -p mistralrs-core --lib gguf_tokenizer -- --ignored
+    //
+    // Vendoring the fixtures instead was considered and rejected: the four
+    // files total ~21.6 MB (tokenizer_gpt2.json alone is 9.1 MB), which is not
+    // a reasonable thing to put in git to satisfy a test that — see above —
+    // does not exercise this module's code in the first place.
 
     #[allow(dead_code)]
     #[derive(Debug)]
@@ -476,6 +620,8 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "network: downloads ~3.5 MB of tokenizers from huggingface.co at test time. \
+                Run with `cargo test -p mistralrs-core --lib gguf_tokenizer -- --ignored`."]
     fn test_encode_decode_llama() -> Result<()> {
         use rand::rng;
         use rand::seq::SliceRandom;
@@ -518,6 +664,8 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "network: downloads ~18 MB of tokenizers from huggingface.co at test time. \
+                Run with `cargo test -p mistralrs-core --lib gguf_tokenizer -- --ignored`."]
     fn test_encode_decode_gpt2() -> Result<()> {
         use rand::rng;
         use rand::seq::SliceRandom;
