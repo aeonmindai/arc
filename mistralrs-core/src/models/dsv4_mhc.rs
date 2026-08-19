@@ -290,10 +290,12 @@ impl V4MHCLayerParams {
         // statistic (`sqr -> fast_sum -> affine -> affine -> recip -> sqrt ->
         // bmul`) plus 11 for the three scoring blocks — all on 24 floats once
         // the reduction is done, twice per layer, 43 layers. At b=1 that is
-        // ~1,460 of the step's ~7,900 kernel launches, i.e. pure launch
-        // overhead. `cuda/hc_fused.cu` is bit-identical to this chain by
+        // ~1,460 of the decode step's measured 7,494 kernel launches, i.e. pure
+        // launch overhead. `cuda/hc_fused.cu` is bit-identical to this chain by
         // construction, not by tolerance; the eager path stays reachable via
-        // `ARC_HC_FUSED=0` so the two can be A/B'd from one binary.
+        // `ARC_HC_FUSED=0` so the two can be A/B'd from one binary — and they
+        // were: flipping it moves 1,803 launches/step and 8.04 ms/token while
+        // leaving 6 greedy completions and their 768 logprobs bit-identical.
         let on_cuda = crate::cuda::hc_fused::usable(&x_flat);
         let shapes_ok = x_flat.is_contiguous()
             && mixes_raw.is_contiguous()
