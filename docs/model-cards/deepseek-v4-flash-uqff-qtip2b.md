@@ -226,6 +226,38 @@ mismatch and then serves nothing. **No MTP number above b=1 exists** — it is
 unmeasurable today, not zero. Do not enable `--mtp-depth` with batching on this
 artifact.
 
+### 3. `--v4-ragged-decode` — per-user decode collapses because the scheduler buckets by length
+
+The per-user row in §2 is not only the batch tax. V4's loader reports
+`supports_paged_attention() == false`, so it never reaches the PagedAttention
+scheduler and never saw the ragged-batching fix that landed there. It runs on
+`DefaultScheduler`, which **buckets decode by sequence length and runs one
+bucket per step**: a batch of B sequences sitting at B distinct lengths decodes
+approximately one at a time, and the rest are moved back to waiting.
+
+`--v4-ragged-decode` (equivalently `ARC_V4_XS_PER_SEQ=1`, or `v4_ragged_decode`
+in a config file) admits them together — the shared KV cache is front-aligned
+and each row's dead prefix is masked.
+
+```bash
+mistralrs serve -p 1234 -m <SOURCE_DIR> --from-uqff <UQFF_DIR>/qtip2b-1.uqff \
+  --max-seqs 32 --v4-ragged-decode
+```
+
+**It is off by default and that is deliberate.** Two things are missing, and
+both are stated rather than hidden:
+
+* **No GPU has ever run it.** The mechanism has CPU identity tests (each row
+  compared against the same sequence advanced alone) but the A/B on a box is
+  outstanding — `memory/mission/wave63-CO-xs-per-sequence.md` §6.
+* It requires V4's **per-row query-position gate to follow the published cache
+  layout**. A ragged cohort masked from one shared query position leaves the
+  compressed branch too permissive: shorter rows attend compressed blocks they
+  have not reached, which is a wrong answer with no error and no panic.
+
+Turning it on logs a `WARN` naming both. **No throughput figure for this flag
+on this artifact exists** — the numbers in §2 were all taken with it off.
+
 ### 4. The V4 sparse indexer
 
 On CSA layers this artifact may log an indexer shape mismatch and fall back to

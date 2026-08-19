@@ -21,13 +21,10 @@ use std::{
     fmt::Display,
     hash::{DefaultHasher, Hash, Hasher},
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, MutexGuard, RwLock},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{
-    mpsc::{error::SendError, Sender},
-    Mutex, MutexGuard,
-};
+use tokio::sync::mpsc::Sender;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum StopReason {
@@ -437,9 +434,31 @@ pub struct Sequence {
 
     // Prefix caching
     prefill_prompt_toks: Option<Vec<u32>>,
+    /// This sequence's OWN absolute position for the first token of
+    /// [`Self::prefill_prompt_toks`], when the batch it is in does not share
+    /// one.
+    ///
+    /// `None` — always, unless a caller set it with
+    /// [`Self::set_prefill_toks_at`] — means the batch shares
+    /// `input_seqs[0].token_offset()`, which is what every path did before and
+    /// still does. It exists because a left-aligned ragged cohort
+    /// ([`crate::kv_cache::front_align_batch`]) has no shared offset to collapse
+    /// to: row `i`'s queries start at its own committed KV length, and RoPE and
+    /// DeepSeek V4's per-row `row_q0` both read that from `seqlen_offsets`.
+    ///
+    /// Cleared by [`Self::reset_prefill_toks`] together with the window itself,
+    /// so an offset can never outlive the tokens it describes.
+    prefill_seqlen_offset: Option<usize>,
     /// Number of tokens at the start of the prompt that are cached (KV already computed).
     /// These tokens should be skipped during prefill.
     prefix_cache_len: usize,
+    /// Has this sequence's prefill already been published to the prefix cache
+    /// (and its measured prefill cost already fed to the eviction scorer)?
+    ///
+    /// Set by `PrefixCacheManagerV2::add_prefilled_sequence`, read by
+    /// `add_sequence` so the same prefill measurement is not observed twice
+    /// when the sequence later finishes and stores its full payload.
+    prefill_published: bool,
 
     // Cache
     normal_cache: Vec<Option<KvCache>>,
@@ -575,7 +594,9 @@ impl Sequence {
             creation_time,
             recognizer,
             prefill_prompt_toks: None,
+            prefill_seqlen_offset: None,
             prefix_cache_len: 0,
+            prefill_published: false,
             suffix,
             prefix,
             cumulative_logprob: 0.,
@@ -716,6 +737,19 @@ impl Sequence {
         self.prompt = new;
     }
 
+    /// Advance (or reset) this sequence's **prefill cursor**: how many of its
+    /// prompt tokens have already been fed to the model.
+    ///
+    /// The field existed but nothing moved it — it was only ever set once, by
+    /// the prefill-prompt restore builder — so `token_offset()` was 0 on every
+    /// live path and `make_prompt_chunk`'s `chunk_offset_toks` was dead
+    /// plumbing. The engine now advances it per chunk and resets it to 0 when
+    /// the prompt completes, because it is part of the scheduler's bucket key
+    /// and a decode cohort carrying stale offsets would shatter.
+    pub fn set_token_offset(&mut self, offset: usize) {
+        self.token_offset = offset;
+    }
+
     pub fn token_offset(&self) -> usize {
         self.token_offset
     }
@@ -729,6 +763,16 @@ impl Sequence {
     /// Set the number of prefix tokens that are cached.
     pub fn set_prefix_cache_len(&mut self, len: usize) {
         self.prefix_cache_len = len;
+    }
+
+    /// Has this sequence's prefill already been published to the prefix cache?
+    pub fn prefill_published(&self) -> bool {
+        self.prefill_published
+    }
+
+    /// Mark this sequence's prefill as published. See [`Self::prefill_published`].
+    pub fn set_prefill_published(&mut self) {
+        self.prefill_published = true;
     }
 
     /// Override the maximum generation length.
@@ -847,9 +891,28 @@ impl Sequence {
         self.prefill_prompt_toks = Some(toks)
     }
 
+    /// [`Self::set_prefill_toks`] for a sequence whose batch has **no shared**
+    /// absolute position: `offset` is this row's own, and it replaces the
+    /// batch-wide `token_offset` in `seqlen_offsets`.
+    ///
+    /// Only the fused MTP step's left-aligned ragged path calls this. Every
+    /// other caller uses [`Self::set_prefill_toks`] and leaves the offset
+    /// `None`, which is the pre-change behaviour verbatim — see
+    /// `inputs_processor::resolve_row_offsets`, where the dispatch lives.
+    pub fn set_prefill_toks_at(&mut self, toks: Vec<u32>, offset: usize) {
+        self.prefill_prompt_toks = Some(toks);
+        self.prefill_seqlen_offset = Some(offset);
+    }
+
+    /// This row's own absolute position for its prefill window, if it has one.
+    pub fn prefill_seqlen_offset(&self) -> Option<usize> {
+        self.prefill_seqlen_offset
+    }
+
     /// Remove the prefill tokens.
     pub fn reset_prefill_toks(&mut self) {
-        self.prefill_prompt_toks = None
+        self.prefill_prompt_toks = None;
+        self.prefill_seqlen_offset = None;
     }
 
     /// Internal api to add one raw token.
@@ -988,6 +1051,31 @@ impl Sequence {
         self.responder.clone()
     }
 
+    /// Has this sequence's client gone away?
+    ///
+    /// `true` once the matching `Receiver` has been dropped or closed — which
+    /// is what happens when the HTTP handler's future is aborted on a client
+    /// disconnect, timeout, or cancel.
+    ///
+    /// # Why this has to be polled rather than discovered on send
+    ///
+    /// The engine used to learn about a departed client only by *failing to
+    /// send to it*: `sampling.rs` cancels a sequence when
+    /// `maybe_send_streaming_response` returns `Err`. That covers streaming and
+    /// nothing else — `maybe_send_streaming_response` returns `Ok(())` without
+    /// sending at all when `is_streaming` is false (`sequence.rs`, both arms are
+    /// gated on it). A **non-streaming** request sends nothing until it is
+    /// finished, so its client can vanish at token 1 and the engine will keep
+    /// decoding to `max_tokens`, holding a scheduler slot and its KV the whole
+    /// way, and emitting no warning: the only "disconnected" warning in the tree
+    /// (`utils::send_response_or_log`) is on the error path.
+    ///
+    /// `Sender::is_closed` is a relaxed atomic load — cheap enough to check
+    /// every scheduling pass.
+    pub fn client_is_gone(&self) -> bool {
+        self.responder.is_closed()
+    }
+
     pub fn creation_time(&self) -> u64 {
         self.creation_time
     }
@@ -1121,15 +1209,17 @@ impl Sequence {
             0
         };
 
+        // One acquisition, five fields. This used to re-lock per field, which
+        // was five acquisitions per call on a lock taken several times per token
+        // per sequence.
+        let mut group = get_mut_group!(self);
         if let Some(ts) = self.prompt_timestamp {
-            get_mut_group!(self).total_completion_time = now - ts;
-            get_mut_group!(self).total_prompt_time = prompt_time_ms;
+            group.total_completion_time = now - ts;
+            group.total_prompt_time = prompt_time_ms;
         }
-
-        get_mut_group!(self).total_time = now - self.timestamp;
-
-        get_mut_group!(self).total_prompt_toks = self.prompt_len;
-        get_mut_group!(self).total_toks = self.len();
+        group.total_time = now - self.timestamp;
+        group.total_prompt_toks = self.prompt_len;
+        group.total_toks = self.len();
     }
 
     pub fn add_image_choice_to_group(&self, choice: ImageChoice) {
@@ -1542,140 +1632,107 @@ impl SequenceGroup {
         }
     }
 
-    pub async fn maybe_send_chat_done_response(
-        &self,
-        response: ChatCompletionResponse,
-        sender: Sender<Response>,
-    ) -> Result<(), SendError<Response>> {
-        if self.choices.len() == self.n_choices {
-            sender.send(Response::Done(response)).await?;
-        }
+    // ---------------------------------------------------------------------
+    // Response construction.
+    //
+    // These were `async fn`s that took `&self` and `.await`ed the client's
+    // `Sender` inside. Every caller reached them through the group `MutexGuard`,
+    // so the group lock was held across the send — one client's backpressure
+    // could stall the engine loop while it owned a lock other work needed.
+    //
+    // They are now plain constructors: they decide whether the group is
+    // complete and, if so, hand back the `Response`. The caller drops the guard
+    // and then dispatches. With the group behind a `std::sync::Mutex` the guard
+    // is `!Send`, so the old shape no longer compiles.
+    // ---------------------------------------------------------------------
 
-        Ok(())
+    /// The terminal chat response, once every choice in the group has landed.
+    pub fn chat_done_response(&self, response: ChatCompletionResponse) -> Option<Response> {
+        (self.choices.len() == self.n_choices).then_some(Response::Done(response))
     }
 
-    pub async fn maybe_send_raw_done_response(
-        &self,
-        sender: Sender<Response>,
-    ) -> Result<(), SendError<Response>> {
-        if self.raw_choices.len() == self.n_choices {
-            assert_eq!(self.raw_choices.len(), 1);
-            let (logits_chunks, tokens) = self.raw_choices[0].clone();
-            sender
-                .send(Response::Raw {
-                    logits_chunks,
-                    tokens,
-                })
-                .await?;
-        }
-
-        Ok(())
+    /// The terminal completion response, once every choice in the group has landed.
+    pub fn completion_done_response(&self, response: CompletionResponse) -> Option<Response> {
+        (self.completion_choices.len() == self.n_choices)
+            .then_some(Response::CompletionDone(response))
     }
 
-    pub async fn maybe_send_embedding_done_response(
-        &self,
-        sender: Sender<Response>,
-    ) -> Result<(), SendError<Response>> {
-        if self.embedding_choices.len() == self.n_choices {
-            assert_eq!(self.embedding_choices.len(), 1);
-            let embeddings = self.embedding_choices[0].clone();
-            let prompt_tokens = self.total_prompt_toks;
-            let total_tokens = self.total_toks;
-            sender
-                .send(Response::Embeddings {
-                    embeddings,
-                    prompt_tokens,
-                    total_tokens,
-                })
-                .await?;
+    pub fn raw_done_response(&self) -> Option<Response> {
+        if self.raw_choices.len() != self.n_choices {
+            return None;
         }
-
-        Ok(())
+        assert_eq!(self.raw_choices.len(), 1);
+        let (logits_chunks, tokens) = self.raw_choices[0].clone();
+        Some(Response::Raw {
+            logits_chunks,
+            tokens,
+        })
     }
 
-    pub async fn maybe_send_image_gen_response(
-        &self,
-        response: ImageGenerationResponse,
-        sender: Sender<Response>,
-    ) -> Result<(), SendError<Response>> {
-        if self.image_choices.len() == self.n_choices {
-            sender.send(Response::ImageGeneration(response)).await?;
+    pub fn embedding_done_response(&self) -> Option<Response> {
+        if self.embedding_choices.len() != self.n_choices {
+            return None;
         }
-
-        Ok(())
+        assert_eq!(self.embedding_choices.len(), 1);
+        Some(Response::Embeddings {
+            embeddings: self.embedding_choices[0].clone(),
+            prompt_tokens: self.total_prompt_toks,
+            total_tokens: self.total_toks,
+        })
     }
 
-    pub async fn maybe_send_speech_response(
-        &self,
-        sender: Sender<Response>,
-    ) -> Result<(), SendError<Response>> {
+    pub fn image_gen_response(&self, response: ImageGenerationResponse) -> Option<Response> {
+        (self.image_choices.len() == self.n_choices).then_some(Response::ImageGeneration(response))
+    }
+
+    pub fn speech_response(&self) -> Option<Response> {
         assert_eq!(self.speech_pcms.len(), 1);
-
         let (pcm, rate, channels) = self.speech_pcms[0].clone();
-        sender
-            .send(Response::Speech {
-                pcm,
-                rate,
-                channels,
-            })
-            .await?;
-
-        Ok(())
+        Some(Response::Speech {
+            pcm,
+            rate,
+            channels,
+        })
     }
 
-    pub async fn maybe_send_streaming_response(
+    /// The streaming chunk for this step, taking the buffered chunks with it.
+    ///
+    /// Returns `None` when this group still owes chunks from sibling choices, or
+    /// when the request is not streaming — in both cases nothing is sent, which
+    /// is what the previous `maybe_send_streaming_response` did.
+    pub fn take_streaming_response(
         &mut self,
         seq: &Sequence,
         model: String,
         usage_opt: Option<Usage>,
-    ) -> Result<(), Box<SendError<Response>>> {
-        if self.chat_streaming_chunks.len() == self.n_choices && self.is_streaming {
-            let mut swap_streaming_chunks = vec![];
-
-            std::mem::swap(&mut swap_streaming_chunks, &mut self.chat_streaming_chunks);
-
-            seq.responder()
-                .send(Response::Chunk(ChatCompletionChunkResponse {
-                    id: seq.id.to_string(),
-                    choices: swap_streaming_chunks,
-                    created: seq.creation_time() as u128,
-                    model: model.clone(),
-                    system_fingerprint: SYSTEM_FINGERPRINT.to_string(),
-                    object: "chat.completion.chunk".to_string(),
-                    usage: usage_opt,
-                }))
-                .await?;
-        } else if self.completion_streaming_chunks.len() == self.n_choices && self.is_streaming {
-            let mut swap_streaming_chunks = vec![];
-
-            std::mem::swap(
-                &mut swap_streaming_chunks,
-                &mut self.completion_streaming_chunks,
-            );
-
-            seq.responder()
-                .send(Response::CompletionChunk(CompletionChunkResponse {
-                    id: seq.id.to_string(),
-                    choices: swap_streaming_chunks,
-                    created: seq.creation_time() as u128,
-                    model: model.clone(),
-                    system_fingerprint: SYSTEM_FINGERPRINT.to_string(),
-                    object: "text_completion".to_string(),
-                }))
-                .await?;
+    ) -> Option<Response> {
+        if !self.is_streaming {
+            return None;
         }
-        Ok(())
-    }
-
-    pub async fn maybe_send_completion_done_response(
-        &self,
-        response: CompletionResponse,
-        sender: Sender<Response>,
-    ) -> Result<(), Box<SendError<Response>>> {
-        if self.completion_choices.len() == self.n_choices {
-            sender.send(Response::CompletionDone(response)).await?;
+        if self.chat_streaming_chunks.len() == self.n_choices {
+            let choices = std::mem::take(&mut self.chat_streaming_chunks);
+            Some(Response::Chunk(ChatCompletionChunkResponse {
+                id: seq.id.to_string(),
+                choices,
+                created: seq.creation_time() as u128,
+                model,
+                system_fingerprint: SYSTEM_FINGERPRINT.to_string(),
+                object: "chat.completion.chunk".to_string(),
+                usage: usage_opt,
+            }))
+        } else if self.completion_streaming_chunks.len() == self.n_choices {
+            let choices = std::mem::take(&mut self.completion_streaming_chunks);
+            Some(Response::CompletionChunk(CompletionChunkResponse {
+                id: seq.id.to_string(),
+                choices,
+                created: seq.creation_time() as u128,
+                model,
+                system_fingerprint: SYSTEM_FINGERPRINT.to_string(),
+                object: "text_completion".to_string(),
+            }))
+        } else {
+            None
         }
-        Ok(())
     }
 }
 
@@ -1706,6 +1763,7 @@ mod tests {
             0.0,
             None,
             vec![],
+            None,
         )
         .unwrap();
         Sequence::new_waiting(
@@ -1823,7 +1881,7 @@ mod tests {
         // The strong chain reports first and becomes the group's best
         // (-0.05); it is never culled by its own threshold.
         assert_eq!(strong.check_confidence_early_stop(), None);
-        let best = group.try_lock().unwrap().best_confidence.unwrap();
+        let best = group.lock().unwrap().best_confidence.unwrap();
         assert!((best - (-0.05)).abs() < 1e-5, "best = {best}");
 
         // The weak chain (-1.0) is far below best/frac = -0.1: culled.
@@ -1837,5 +1895,79 @@ mod tests {
         let lowest = weak.confidence().lowest_group().unwrap();
         assert!((mean - (-1.0)).abs() < 1e-5, "mean = {mean}");
         assert!((lowest - (-1.0)).abs() < 1e-5, "lowest = {lowest}");
+    }
+
+    fn chunk(index: usize) -> ChunkChoice {
+        ChunkChoice {
+            delta: crate::Delta {
+                content: Some("tok".to_string()),
+                role: "assistant".to_string(),
+                tool_calls: None,
+                reasoning_content: None,
+            },
+            index,
+            finish_reason: None,
+            logprobs: None,
+        }
+    }
+
+    /// `take_streaming_response` replaced the `async fn
+    /// maybe_send_streaming_response` that used to `.await` the client's channel
+    /// with the group `MutexGuard` still held. The gating it inherited must be
+    /// preserved exactly: nothing is emitted until every choice in the group has
+    /// buffered a chunk for this step, and emitting drains the buffer so the next
+    /// step starts empty.
+    #[test]
+    fn a_streaming_chunk_waits_for_every_sibling_choice_then_drains() {
+        let group = Arc::new(Mutex::new(SequenceGroup::new(2, true, true, None)));
+        let a = dummy_seq("q", group.clone(), 0);
+        let b = dummy_seq("q", group.clone(), 1);
+
+        // One of two choices has reported: nothing goes out yet.
+        a.add_streaming_chunk_choice_to_group(chunk(0));
+        assert!(
+            group
+                .lock()
+                .unwrap()
+                .take_streaming_response(&a, "m".into(), None)
+                .is_none(),
+            "a half-filled group must not emit — the sibling's chunk would be lost"
+        );
+
+        // Both have reported: one Chunk carrying both choices.
+        b.add_streaming_chunk_choice_to_group(chunk(1));
+        let response = group
+            .lock()
+            .unwrap()
+            .take_streaming_response(&a, "m".into(), None)
+            .expect("a complete group must emit");
+        match response {
+            Response::Chunk(c) => assert_eq!(c.choices.len(), 2),
+            _ => panic!("expected a chat chunk"),
+        }
+
+        // The buffer is drained, so the next step does not re-send this one.
+        assert!(
+            group
+                .lock()
+                .unwrap()
+                .take_streaming_response(&a, "m".into(), None)
+                .is_none(),
+            "the emitted chunks must have been taken, not copied"
+        );
+    }
+
+    /// A non-streaming group never produces a streaming chunk, however many
+    /// chunks happen to be buffered.
+    #[test]
+    fn a_non_streaming_group_emits_no_chunk() {
+        let group = Arc::new(Mutex::new(SequenceGroup::new(1, false, true, None)));
+        let seq = dummy_seq("q", group.clone(), 0);
+        seq.add_streaming_chunk_choice_to_group(chunk(0));
+        assert!(group
+            .lock()
+            .unwrap()
+            .take_streaming_response(&seq, "m".into(), None)
+            .is_none());
     }
 }

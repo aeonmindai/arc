@@ -9,19 +9,30 @@ use std::path::PathBuf;
 #[derive(Args, Clone, Deserialize)]
 pub struct ModelSourceOptions {
     /// HuggingFace model ID or local path to model directory
-    #[arg(short = 'm', long)]
+    #[arg(short = 'm', long, help_heading = "Model")]
     pub model_id: String,
 
     /// Path to local tokenizer.json file
-    #[arg(short = 't', long)]
+    ///
+    /// Hidden: resolved from the model repo. Only needed when a local
+    /// directory is missing its tokenizer.
+    #[arg(short = 't', long, hide = true)]
     pub tokenizer: Option<PathBuf>,
 
     /// Model architecture (auto-detected if not specified)
-    #[arg(short = 'a', long, value_parser = parse_arch)]
+    ///
+    /// Hidden: detection from `config.json` is authoritative, and this is
+    /// silently dropped on the `auto`, `vision`, `embedding`, `diffusion` and
+    /// `speech` paths — so setting it mostly does nothing, and where it does
+    /// work an incorrect value mis-loads the weights.
+    #[arg(short = 'a', long, value_parser = parse_arch, hide = true)]
     pub arch: Option<NormalLoaderType>,
 
     /// Model data type
-    #[arg(long, default_value = "auto", value_parser = parse_dtype)]
+    ///
+    /// Hidden: `auto` reads the dtype the checkpoint was trained in. Forcing
+    /// f16 on a bf16 model degrades quality with no error.
+    #[arg(long, default_value = "auto", value_parser = parse_dtype, hide = true)]
     #[serde(default)]
     pub dtype: ModelDType,
 }
@@ -29,21 +40,34 @@ pub struct ModelSourceOptions {
 /// Format options for model loading
 #[derive(Args, Clone, Default, Deserialize)]
 pub struct FormatOptions {
-    /// Model format: plain (safetensors), gguf, or ggml
-    /// Auto-detected if not specified
-    #[arg(long, value_enum)]
+    /// Model format: plain (safetensors), gguf, or ggml.
+    /// Defaults to `plain`; `-f/--quantized-file` is ignored unless this is
+    /// set to `gguf` or `ggml`.
+    //
+    // This previously claimed "Auto-detected if not specified". There is no
+    // detection: every consumer does `format.unwrap_or(ModelFormat::Plain)`,
+    // so a user passing only `-f model.gguf` silently loaded the plain path.
+    //
+    // Hidden: Arc's own path is safetensors + UQFF/ISQ. The GGUF/GGML loaders
+    // are inherited from upstream and stay fully supported via `--help-all`.
+    #[arg(long, value_enum, hide = true)]
     pub format: Option<ModelFormat>,
 
     /// Quantized model filename(s) for GGUF/GGML (semicolon-separated for multiple)
-    #[arg(short = 'f', long)]
+    ///
+    /// Hidden: inert unless `--format gguf|ggml` is also passed.
+    #[arg(short = 'f', long, hide = true)]
     pub quantized_file: Option<String>,
 
     /// Model ID for tokenizer when using quantized format
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub tok_model_id: Option<String>,
 
     /// GQA value for GGML models
-    #[arg(long, default_value_t = 1)]
+    ///
+    /// Hidden: GGML-only, and a wrong value produces garbage tokens rather
+    /// than an error.
+    #[arg(long, default_value_t = 1, hide = true)]
     #[serde(default = "default_gqa")]
     pub gqa: usize,
 }
@@ -65,45 +89,53 @@ pub enum ModelFormat {
 #[derive(Args, Clone, Default, Deserialize)]
 pub struct AdapterOptions {
     /// LoRA adapter model ID(s), semicolon-separated for multiple
-    #[arg(long)]
+    ///
+    /// Hidden: fully supported, but a minority serving shape. See `--help-all`.
+    #[arg(long, hide = true)]
     pub lora: Option<String>,
 
     /// X-LoRA adapter model ID
-    #[arg(long, conflicts_with = "lora")]
+    #[arg(long, conflicts_with = "lora", hide = true)]
     pub xlora: Option<String>,
 
     /// X-LoRA ordering JSON file
-    #[arg(long, requires = "xlora")]
+    #[arg(long, requires = "xlora", hide = true)]
     pub xlora_order: Option<PathBuf>,
 
-    /// Target non-granular index for X-LoRA
-    #[arg(long, requires = "xlora")]
+    /// Target non-granular index for X-LoRA.
+    ///
+    /// Hidden: an X-LoRA scaling-granularity cutoff that also silently forces
+    /// `max_seqs = 1`. Developer/ablation knob, not a serving control.
+    #[arg(long, requires = "xlora", hide = true)]
     pub tgt_non_granular_index: Option<usize>,
 }
 
 /// Quantization options
 #[derive(Args, Clone, Default, Deserialize)]
 pub struct QuantizationOptions {
-    /// In-situ quantization level (e.g., "4", "8", "q4_0", "q4_1", etc.)
-    #[arg(long = "isq")]
+    /// Quantize the weights on load (e.g. "4", "8", "q4k"). Omit to serve the
+    /// checkpoint as-is, or use --from-uqff for a pre-baked Arc artifact.
+    #[arg(long = "isq", help_heading = "Model")]
     pub in_situ_quant: Option<String>,
 
-    /// UQFF file(s) to load from. Shards are auto-discovered: specifying the first
-    /// shard (e.g., q4k-0.uqff) automatically finds q4k-1.uqff, etc. Use semicolons
-    /// to separate different quantizations (e.g., "q4k-0.uqff;q8_0-0.uqff").
-    #[arg(long)]
+    /// Load a pre-baked Arc UQFF artifact. Shards are auto-discovered:
+    /// naming the first (q4k-0.uqff) picks up q4k-1.uqff and so on.
+    #[arg(long, help_heading = "Model")]
     pub from_uqff: Option<String>,
 
     /// ISQ organization strategy: default or moqe
-    #[arg(long)]
+    ///
+    /// Hidden: `moqe` quantizes only expert layers. It must agree with how the
+    /// artifact was baked, and a mismatch is not detected.
+    #[arg(long, hide = true)]
     pub isq_organization: Option<IsqOrganization>,
 
     /// imatrix file for enhanced quantization
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub imatrix: Option<PathBuf>,
 
     /// Calibration file for imatrix generation
-    #[arg(long, conflicts_with = "imatrix")]
+    #[arg(long, conflicts_with = "imatrix", hide = true)]
     pub calibration_file: Option<PathBuf>,
 }
 
@@ -111,30 +143,45 @@ pub struct QuantizationOptions {
 #[derive(Args, Clone, Default, Deserialize)]
 pub struct DeviceOptions {
     /// Force CPU-only execution
-    #[arg(long)]
+    #[arg(long, help_heading = "Hardware")]
     #[serde(default)]
     pub cpu: bool,
 
-    /// Device layer mapping (format: ORD:NUM;... e.g., "0:10;1:20")
-    /// Omit for automatic device mapping
-    #[arg(short = 'n', long, value_delimiter = ';')]
+    /// Pin layers to specific GPUs (ORD:NUM;... e.g. "0:10;1:20").
+    /// Omit to let Arc plan the device map.
+    #[arg(short = 'n', long, value_delimiter = ';', help_heading = "Hardware")]
     pub device_layers: Option<Vec<String>>,
 
     /// Topology YAML file for device mapping
-    #[arg(long)]
+    ///
+    /// Hidden: a per-layer device/dtype plan. Superseded by automatic mapping
+    /// for every supported deployment, and silently ignored for diffusion and
+    /// speech models.
+    #[arg(long, hide = true)]
     pub topology: Option<PathBuf>,
 
     /// Custom HuggingFace cache directory
-    #[arg(long)]
+    ///
+    /// Hidden: prefer the standard HF_HOME environment variable.
+    #[arg(long, hide = true)]
     pub hf_cache: Option<PathBuf>,
 
     /// Max sequence length for automatic device mapping
-    #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_SEQ_LEN)]
+    ///
+    /// Hidden — and this is the single most misread flag in the CLI. It is a
+    /// *device-map planning hint*, NOT the runtime context limit; raising it
+    /// does not let conversations grow, it only changes how layers are split
+    /// across GPUs. Use --pa-context-len to size the KV cache.
+    #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_SEQ_LEN, hide = true)]
     #[serde(default = "default_max_seq_len")]
     pub max_seq_len: usize,
 
     /// Max batch size for automatic device mapping
-    #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE)]
+    ///
+    /// Hidden: another planning hint, defaulting to 1 while --max-seqs
+    /// defaults to 32. The two are unrelated and the mismatch invites
+    /// "tuning" that does nothing.
+    #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE, hide = true)]
     #[serde(default = "default_max_batch_size")]
     pub max_batch_size: usize,
 }
@@ -143,15 +190,15 @@ pub struct DeviceOptions {
 #[derive(Args, Clone, Default, Deserialize)]
 pub struct VisionOptions {
     /// Maximum edge length for image resizing (aspect ratio preserved)
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub max_edge: Option<u32>,
 
     /// Maximum number of images per request
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub max_num_images: Option<usize>,
 
     /// Maximum image dimension for device mapping
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub max_image_length: Option<usize>,
 }
 

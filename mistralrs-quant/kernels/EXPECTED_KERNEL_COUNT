@@ -1,0 +1,31 @@
+# Parent system: ArcGate (build-time correctness gate for ArcKernels)
+#
+# The number of CUDA kernel sources matching `kernels/*/*.cu`, the glob that
+# `build.rs` hands to `cudaforge::KernelBuilder::source_glob`.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# A glob is evaluated only when the build script RUNS, and a build script that
+# emits any `rerun-if-changed` is re-run ONLY for the paths it named. cudaforge
+# names one path per *already-resolved* source, so a kernel that does not exist
+# yet can never be named. The historical result: adding `kernels/<d>/<new>.cu`
+# did not re-run `build.rs`, the glob was never re-evaluated, the kernel was
+# never compiled -- and the build was still green, because `extern "C"` decls
+# fail only at LINK time and an rlib build does not link.
+#
+# `build.rs` now watches the `kernels` directory, so the script does re-run.
+# This file is the second half: it turns "the discovered set changed" from a
+# silent no-op into a hard build error, so a kernel cannot go missing quietly.
+#
+# IF THE BUILD TOLD YOU TO COME HERE
+# ----------------------------------
+# You added or removed a `kernels/*/*.cu`. Confirm the new list in the panic
+# message is what you meant, then set the number below to match.
+#
+# NOTE: this is the count the GLOB discovers, before cudaforge applies its
+# `exclude` patterns. It is therefore independent of compute capability. The
+# "Compiling N of M kernels" line in the build log shows the post-exclusion M
+# (this count minus the 5 `*_dummy.cu` / `dummy_*.cu` stubs on an SM >= 80
+# build), and that line is the engagement counter for a CUDA build: a CUDA
+# build that "succeeded" without it moving has not built what you think it did.
+39

@@ -8,27 +8,31 @@ use std::path::PathBuf;
 #[derive(Args, Clone, Deserialize)]
 pub struct ServerOptions {
     /// HTTP server port
-    #[arg(short = 'p', long, default_value_t = 1234)]
+    #[arg(short = 'p', long, default_value_t = 1234, help_heading = "Serving")]
     #[serde(default = "default_port")]
     pub port: u16,
 
-    /// Bind address
-    #[arg(long, default_value = "0.0.0.0")]
+    /// Bind address. Defaults to all interfaces.
+    #[arg(long, default_value = "0.0.0.0", help_heading = "Serving")]
     #[serde(default = "default_host")]
     pub host: String,
 
     /// MCP protocol server port (enables MCP if set)
-    #[arg(long)]
+    ///
+    /// Hidden: not implemented in this binary — see the error it raises.
+    #[arg(long, hide = true)]
     #[serde(default)]
     pub mcp_port: Option<u16>,
 
     /// MCP client configuration file path
-    #[arg(long)]
+    ///
+    /// Hidden: not implemented in this binary — see the error it raises.
+    #[arg(long, hide = true)]
     #[serde(default)]
     pub mcp_config: Option<PathBuf>,
 
     /// Serve the built-in web UI at /ui
-    #[arg(long)]
+    #[arg(long, help_heading = "Serving")]
     #[serde(default)]
     pub ui: bool,
 }

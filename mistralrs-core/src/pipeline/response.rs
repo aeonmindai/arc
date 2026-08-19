@@ -55,17 +55,19 @@ pub async fn send_image_responses(
         };
         seq.add_image_choice_to_group(choice);
 
-        let group = seq.get_mut_group();
-        group
-            .maybe_send_image_gen_response(
-                ImageGenerationResponse {
-                    created: seq.creation_time() as u128,
-                    data: group.get_image_choices().to_vec(),
-                },
-                seq.responder(),
-            )
-            .await
-            .map_err(candle_core::Error::msg)?;
+        // Build under the group lock, dispatch after releasing it.
+        let response = {
+            let group = seq.get_mut_group();
+            group.image_gen_response(ImageGenerationResponse {
+                created: seq.creation_time() as u128,
+                data: group.get_image_choices().to_vec(),
+            })
+        };
+        if let Some(response) = response {
+            crate::utils::send_fast(&seq.responder(), response)
+                .await
+                .map_err(candle_core::Error::msg)?;
+        }
 
         seq.set_state(SequenceState::Done(StopReason::GeneratedImage));
     }
@@ -93,11 +95,12 @@ pub async fn send_speech_responses(
     {
         seq.add_speech_pcm_to_group(pcm.clone(), *rate, *channel);
 
-        let group = seq.get_mut_group();
-        group
-            .maybe_send_speech_response(seq.responder())
-            .await
-            .map_err(candle_core::Error::msg)?;
+        let response = seq.get_mut_group().speech_response();
+        if let Some(response) = response {
+            crate::utils::send_fast(&seq.responder(), response)
+                .await
+                .map_err(candle_core::Error::msg)?;
+        }
 
         seq.set_state(SequenceState::Done(StopReason::GeneratedSpeech));
     }
@@ -120,11 +123,12 @@ pub async fn send_raw_responses(
 
     seq.add_raw_choice_to_group(logits_chunks);
 
-    let group = seq.get_mut_group();
-    group
-        .maybe_send_raw_done_response(seq.responder())
-        .await
-        .map_err(candle_core::Error::msg)?;
+    let response = seq.get_mut_group().raw_done_response();
+    if let Some(response) = response {
+        crate::utils::send_fast(&seq.responder(), response)
+            .await
+            .map_err(candle_core::Error::msg)?;
+    }
 
     seq.set_state(SequenceState::Done(StopReason::Length(0)));
 
@@ -142,11 +146,12 @@ pub async fn send_embedding_responses(
     for (seq, embeddings) in input_seqs.iter_mut().zip(embedings) {
         seq.add_embedding_choice_to_group(embeddings);
 
-        let group = seq.get_mut_group();
-        group
-            .maybe_send_embedding_done_response(seq.responder())
-            .await
-            .map_err(candle_core::Error::msg)?;
+        let response = seq.get_mut_group().embedding_done_response();
+        if let Some(response) = response {
+            crate::utils::send_fast(&seq.responder(), response)
+                .await
+                .map_err(candle_core::Error::msg)?;
+        }
 
         seq.set_state(SequenceState::Done(StopReason::Length(0)));
     }

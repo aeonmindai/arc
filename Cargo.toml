@@ -44,11 +44,16 @@ rust-version = "1.88"
 # RUN-161: forked candle for the opt-in CUDA caching allocator (graph-capture-safe).
 # Default-off; identical to upstream c3bb5bf when ARC_CANDLE_ALLOC_CACHE unset.
 # Fork of huggingface/candle 0.9.2 (rev c3bb5bf), mirrored to the org for CI.
-candle-core = { git = "https://github.com/aeonmindai/candle.git", branch = "run-161-cuda-graph-capture" }
-candle-nn = { git = "https://github.com/aeonmindai/candle.git", branch = "run-161-cuda-graph-capture" }
-candle-flash-attn-v3 = { git = "https://github.com/aeonmindai/candle.git", branch = "run-161-cuda-graph-capture" }
-candle-flash-attn = { git = "https://github.com/aeonmindai/candle.git", branch = "run-161-cuda-graph-capture" }
-candle-metal-kernels = { git = "https://github.com/aeonmindai/candle.git", branch = "run-161-cuda-graph-capture" }
+# PINNED TO AN EXPLICIT REV, not a branch. This change depends on
+# `drain_alloc_cache_and_free` (fork commit 88d86a20), and a moving branch
+# pointer has broken CI on this repo before — a path/branch dependency that
+# advances under a merged PR turns a green build into a red one with no commit
+# here to blame.
+candle-core = { git = "https://github.com/aeonmindai/candle.git", rev = "88d86a2019ee552923b217284e89847d2785dcdf" }
+candle-nn = { git = "https://github.com/aeonmindai/candle.git", rev = "88d86a2019ee552923b217284e89847d2785dcdf" }
+candle-flash-attn-v3 = { git = "https://github.com/aeonmindai/candle.git", rev = "88d86a2019ee552923b217284e89847d2785dcdf" }
+candle-flash-attn = { git = "https://github.com/aeonmindai/candle.git", rev = "88d86a2019ee552923b217284e89847d2785dcdf" }
+candle-metal-kernels = { git = "https://github.com/aeonmindai/candle.git", rev = "88d86a2019ee552923b217284e89847d2785dcdf" }
 
 axum = "0.8.8"
 anyhow = "1.0.100"

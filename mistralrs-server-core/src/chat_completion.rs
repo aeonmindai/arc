@@ -34,7 +34,10 @@ use crate::{
         ChatCompletionRequest, Grammar, JsonSchemaResponseFormat, MessageInnerContent,
         ResponseFormat,
     },
-    streaming::{base_create_streamer, get_keep_alive_interval, BaseStreamer, DoneState},
+    streaming::{
+        base_create_streamer, get_keep_alive_interval, sse_error_event, sse_error_kind,
+        BaseStreamer, DoneState,
+    },
     types::{ExtractedMistralRsState, OnChunkCallback, OnDoneCallback, SharedMistralRsState},
     util::{parse_audio_url, parse_image_url, sanitize_error_message, validate_model_name},
 };
@@ -124,20 +127,22 @@ impl futures::Stream for ChatCompletionStreamer {
                     );
                     // Done now, just need to send the [DONE]
                     self.done_state = DoneState::SendingDone;
-                    Poll::Ready(Some(Ok(Event::default().data(msg))))
+                    Poll::Ready(Some(Ok(sse_error_event(sse_error_kind::MODEL, msg))))
                 }
                 Response::ValidationError(e) => {
                     self.done_state = DoneState::SendingDone;
-                    Poll::Ready(Some(Ok(
-                        Event::default().data(sanitize_error_message(e.as_ref()))
-                    )))
+                    Poll::Ready(Some(Ok(sse_error_event(
+                        sse_error_kind::INVALID_REQUEST,
+                        sanitize_error_message(e.as_ref()),
+                    ))))
                 }
                 Response::InternalError(e) => {
                     MistralRs::maybe_log_error(self.state.clone(), &*e);
                     self.done_state = DoneState::SendingDone;
-                    Poll::Ready(Some(Ok(
-                        Event::default().data(sanitize_error_message(e.as_ref()))
-                    )))
+                    Poll::Ready(Some(Ok(sse_error_event(
+                        sse_error_kind::INTERNAL,
+                        sanitize_error_message(e.as_ref()),
+                    ))))
                 }
                 Response::Chunk(mut response) => {
                     if response.choices.iter().all(|x| x.finish_reason.is_some()) {

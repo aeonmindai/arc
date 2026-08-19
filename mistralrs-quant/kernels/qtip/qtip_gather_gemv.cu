@@ -138,151 +138,80 @@ __device__ __forceinline__ float2 gg_codeword(uint32_t state, unsigned int mult)
     return qtip_decode_state(state);
 }
 
-// One block per (output row, pair). Reads the pair's expert id on-device,
-// offsets into that expert's packed rows / scales, and accumulates
-// y[pair, row] = sum_k W_expert[row,k] * x[pair,k].
+// ---------------------------------------------------------------------------
+// OPTIMISED warp kernel (trellis chain). Bit-identical to the baseline: it
+// computes exactly the same `state` sequence and the same codewords in the same
+// order, and touches the accumulator with the same fmaf sequence.
 //
-// Grid:  (n_rows, n_pairs, 1)
-// Block: (THREADS, 1, 1)
-template <typename T, int THREADS>
-__global__ void __launch_bounds__(THREADS)
-qtip_gather_gemv_v2_k4_l16_kernel(
-    const uint8_t*  __restrict__ packed,      // [E, n_rows, packed_per_row]
-    const float*    __restrict__ row_scales,  // [E, n_rows]
-    const float*    __restrict__ lut,         // [2^L * V]
-    const T*        __restrict__ x,           // [n_pairs, k_in]  (rotated)
-    const uint32_t* __restrict__ indices,     // [n_pairs]
-    T*              __restrict__ y,           // [n_pairs, n_rows]
-    int n_rows,
-    int packed_per_row,
-    int num_symbols,
-    int n_pairs,
-    int num_experts
-) {
-    const int row  = blockIdx.x;
-    const int pair = blockIdx.y;
-    if (row >= n_rows || pair >= n_pairs) return;
+// What the SASS said (sm_90, --use_fast_math, the crate's real flags):
+//   * the main loop is fully unrolled to GROUP*ROWS_PER_WARP = 8 symbol decodes
+//   * 16 x LD.E.U8 per iteration -- *generic* byte loads, not LDS. `stage_packed`
+//     is a RUNTIME int, so `rp[r]` is a runtime-selected shared-or-global
+//     pointer and the compiler must emit generic loads with a full 64-bit
+//     address chain (LEA.HI.X.SX32 x12, IMAD.SHL.U32 x12, IMAD.X x6, IADD3 x23).
+//     The shared-staging optimisation was being defeated at the ISA level.
+//   * HALF of those 16 byte loads are the warm-up replay, which produces no
+//     weights at all: 4 symbols replayed per GROUP=4 symbols decoded, per row.
+//
+// The three fixes, all bit-identical:
+//   (A) `STAGED` becomes a template parameter -> LDS with 32-bit addressing.
+//   (B) The L=16 state is just the last 4 nibbles of the stream, so the whole
+//       warm-up replay is a WINDOW LOAD: one 16-bit read per 4 symbols covers
+//       both the warm-up nibbles and the decoded nibbles. 8 scattered byte
+//       loads/row-group -> 2 aligned u16 loads, and the replay's per-symbol
+//       load+extract+shift chain collapses to a nibble reversal.
+//   (C) the GROUP activations are one 128-bit load instead of GROUP 32-bit ones.
+// ---------------------------------------------------------------------------
 
-    const uint32_t expert = __ldg(indices + pair);
-    // Defensive: an out-of-range expert id (shouldn't happen from a correct
-    // router) writes 0 rather than reading out of bounds.
-    if (expert >= (uint32_t)num_experts) {
-        if (threadIdx.x == 0) y[(size_t)pair * n_rows + row] = gg_from_f32<T>(0.0f);
-        return;
-    }
-
-    const int tid     = threadIdx.x;
-    const int lane    = tid & 31;
-    const int warp_id = tid >> 5;
-    constexpr int N_WARPS = THREADS / 32;
-    static_assert(THREADS % 32 == 0, "THREADS must be a multiple of warp size");
-
-    const size_t expert_row = (size_t)expert * n_rows + row;
-    const uint8_t* row_packed = packed + expert_row * packed_per_row;
-    const float scale = __ldg(row_scales + expert_row);
-    const T* x_pair = x + (size_t)pair * num_symbols * QTIP_V;
-
-    const int sym_per_thread = (num_symbols + THREADS - 1) / THREADS;
-    const int sym_start_raw  = tid * sym_per_thread;
-    const int sym_end        = min(num_symbols, sym_start_raw + sym_per_thread);
-
-    float acc = 0.0f;
-
-    if (sym_start_raw < num_symbols) {
-        uint32_t state = 0;
-        int sym_idx = sym_start_raw;
-
-        if (tid > 0) {
-            int warm_start = max(0, sym_start_raw - (int)QTIP_WARMUP_SYMS);
-            for (int t = warm_start; t < sym_start_raw; ++t) {
-                int byte_idx = t >> 1;
-                uint8_t byte = __ldg(row_packed + byte_idx);
-                uint32_t sym = (t & 1) ? ((byte >> 4) & 0x0F) : (byte & 0x0F);
-                state = ((state << QTIP_K) | sym) & QTIP_STATE_MASK;
-            }
-        }
-
-        while (sym_idx < sym_end) {
-            int byte_idx = sym_idx >> 1;
-            uint8_t byte = __ldg(row_packed + byte_idx);
-
-            bool do_lo = ((sym_idx & 1) == 0);
-            uint32_t sym_lo = byte & 0x0F;
-            uint32_t sym_hi = (byte >> 4) & 0x0F;
-
-            if (do_lo) {
-                state = ((state << QTIP_K) | sym_lo) & QTIP_STATE_MASK;
-                const float* lut_p = lut + (size_t)state * QTIP_V;
-                float w0 = __ldg(lut_p)     * scale;
-                float w1 = __ldg(lut_p + 1) * scale;
-                int x_off = sym_idx * (int)QTIP_V;
-                float x0 = gg_to_f32<T>(__ldg(x_pair + x_off + 0));
-                float x1 = gg_to_f32<T>(__ldg(x_pair + x_off + 1));
-                acc = fmaf(w0, x0, acc);
-                acc = fmaf(w1, x1, acc);
-                ++sym_idx;
-                if (sym_idx >= sym_end) break;
-            }
-
-            state = ((state << QTIP_K) | sym_hi) & QTIP_STATE_MASK;
-            const float* lut_p_hi = lut + (size_t)state * QTIP_V;
-            float w0 = __ldg(lut_p_hi)     * scale;
-            float w1 = __ldg(lut_p_hi + 1) * scale;
-            int x_off = sym_idx * (int)QTIP_V;
-            float x0 = gg_to_f32<T>(__ldg(x_pair + x_off + 0));
-            float x1 = gg_to_f32<T>(__ldg(x_pair + x_off + 1));
-            acc = fmaf(w0, x0, acc);
-            acc = fmaf(w1, x1, acc);
-            ++sym_idx;
-        }
-    }
-
-    acc = gg_warp_reduce_sum(acc);
-
-    __shared__ float warp_sums[N_WARPS];
-    if (lane == 0) warp_sums[warp_id] = acc;
-    __syncthreads();
-
-    if (warp_id == 0) {
-        float v = (lane < N_WARPS) ? warp_sums[lane] : 0.0f;
-        v = gg_warp_reduce_sum(v);
-        if (lane == 0) {
-            y[(size_t)pair * n_rows + row] = gg_from_f32<T>(v);
-        }
-    }
+// Unpack one 32-bit word holding two 16-bit activations. Register-only: the
+// vectorised path already has the bytes in registers, and `__ldg` on a stack
+// address is illegal (CUDA "operation not supported on global/shared address
+// space") -- that is exactly the bug the first draft of this had.
+__device__ __forceinline__ float2 gg_unpack2(unsigned int w, const __nv_bfloat16*) {
+    return make_float2(__bfloat162float(__ushort_as_bfloat16((unsigned short)(w & 0xFFFFu))),
+                       __bfloat162float(__ushort_as_bfloat16((unsigned short)(w >> 16))));
+}
+__device__ __forceinline__ float2 gg_unpack2(unsigned int w, const __half*) {
+    return make_float2(__half2float(__ushort_as_half((unsigned short)(w & 0xFFFFu))),
+                       __half2float(__ushort_as_half((unsigned short)(w >> 16))));
+}
+__device__ __forceinline__ float2 gg_unpack2(unsigned int, const float*) {
+    return make_float2(0.0f, 0.0f);   // never taken; float uses the scalar path
 }
 
-// Warp-per-row strided decode + shared-memory LUT (RUN-161 rewrite v4). One WARP
-// computes one output row; its 32 lanes decode symbols STRIDED (lane i -> i,
-// i+32, ...), each symbol's L-bit state recovered independently by replaying the
-// last QTIP_WARMUP_SYMS symbols. The strided/independent form is deliberate:
-// H200 ncu showed this kernel is bound by long_scoreboard (global LOAD LATENCY
-// on the per-symbol LUT gather, ~49 cyc/issue) and lg_throttle (~28). Strided
-// gives memory-level parallelism (many independent loads in flight) that hides
-// latency; the contiguous-segment variant serialized the state->LUT-address
-// chain and tanked inst/cyc from 0.7 to 0.15.
-//
-// THE win here: stage the LUT (2^L * V floats = 2 KB at L=8) into SHARED memory
-// once per block. Every per-symbol weight lookup then hits shared (short
-// scoreboard, ~tens of cyc) instead of global (long scoreboard, hundreds), and
-// the global LUT load that drove lg_throttle disappears. Plus paired loads:
-// float2 LUT (both weights, one access) and gg_load2 x (x0,x1, one load).
-//
-// Grid:  (ceil(n_rows / (WARPS_PER_BLOCK*ROWS_PER_WARP)), n_pairs, 1)
-// Block: (WARPS_PER_BLOCK * 32, 1, 1)
-// Shared: (2^L * V) floats
-//
-// RUN-161 rewrite v5: REGISTER BLOCKING over output rows (ROWS_PER_WARP). One
-// warp now decodes ROWS_PER_WARP rows of the SAME expert. The activation x_pair
-// is identical for every row of an expert, so each lane loads its GROUP of x
-// ONCE per group-step and reuses it across all R rows -> R independent decode
-// streams in flight. ncu on v4 showed the kernel at inst/cyc 0.71 (of 4), sm
-// 66%, NOT bandwidth-bound (dram 2-4%): the limiter is issue/latency, not FLOPs
-// or bytes. Roofline says a b=1 GEMV SHOULD be memory-bound here (~10 ops/weight
-// vs a ~10^4 op/weight compute budget). R independent rows give the ILP to hide
-// long_scoreboard (warm-up global reads) + wait (state-carry dep) and push
-// inst/cyc up toward peak, where memory finally becomes the wall.
-template <typename T, int WARPS_PER_BLOCK, int ROWS_PER_WARP, bool COMPUTED_CB>
+// Load the GROUP activation pairs. For 16-bit T, GROUP pairs are GROUP*4 bytes,
+// and base = lane*GROUP + m*32*GROUP keeps that 16-byte aligned, so it is
+// GROUP/4 x LDG.E.128 instead of GROUP x LDG.E.32.
+template <typename T, int GROUP>
+__device__ __forceinline__ void gg_load_group(const T* p, bool vec_ok, float2* out) {
+    if constexpr (sizeof(T) == 2 && (GROUP % 4) == 0) {
+        if (vec_ok) {
+            #pragma unroll
+            for (int q = 0; q < GROUP / 4; ++q) {
+                const uint4 v = __ldg(reinterpret_cast<const uint4*>(p) + q);
+                out[4 * q + 0] = gg_unpack2(v.x, (const T*)nullptr);
+                out[4 * q + 1] = gg_unpack2(v.y, (const T*)nullptr);
+                out[4 * q + 2] = gg_unpack2(v.z, (const T*)nullptr);
+                out[4 * q + 3] = gg_unpack2(v.w, (const T*)nullptr);
+            }
+            return;
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < GROUP; ++j) out[j] = gg_load2(p + j * (int)QTIP_V);
+}
+
+// Nibble reversal of the low 16 bits: the packed stream stores symbol t of a
+// little-endian u16 at bit 4*(t mod 4), while the trellis state holds the OLDEST
+// symbol in the HIGH nibble. Same value the replay loop produced, 4 ops instead
+// of 4 loads + 4 extracts + 4 shift/or/mask.
+__device__ __forceinline__ uint32_t gg_state_from_window(uint32_t h) {
+    const uint32_t a = ((h & 0x0F0Fu) << 4) | ((h >> 4) & 0x0F0Fu);
+    return ((a & 0x00FFu) << 8) | ((a >> 8) & 0x00FFu);
+}
+
+template <typename T, int WARPS_PER_BLOCK, int ROWS_PER_WARP, bool COMPUTED_CB,
+          bool STAGED, int GROUP>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32)
 qtip_gather_gemv_warp_kernel(
     const uint8_t*  __restrict__ packed,
@@ -296,26 +225,11 @@ qtip_gather_gemv_warp_kernel(
     int num_symbols,
     int n_pairs,
     int num_experts,
-    int stage_packed,  // 1 => block's packed rows staged to shared (set by launcher)
     unsigned int cb_mult
 ) {
-    // Shared layout: [LUT floats][packed bytes for this block's rows].
-    //   - LUT staged when it fits (L=8 -> 2 KB; L>=~13 falls back to global LUT).
-    //   - RUN-161 v6: PACKED WEIGHT STAGING. ncu on v5 showed the dominant stall
-    //     is long_scoreboard ~5.85 (global latency on the per-symbol + warm-up
-    //     packed byte reads) -- NOT the LUT (now shared) and NOT bandwidth (dram
-    //     4%). So bulk-copy this block's ROWS_PER_BLOCK packed rows into shared
-    //     ONCE (coalesced, large transactions = near-peak for that traffic), then
-    //     every warm-up replay + per-symbol read hits shared. This converts the
-    //     scattered, warm-up-amplified global loads into cheap shared reads and
-    //     collapses long_scoreboard. The global weight bytes are read exactly
-    //     once instead of ~1.5x (warm-up) and fully coalesced.
     constexpr int ROWS_PER_BLOCK = WARPS_PER_BLOCK * ROWS_PER_WARP;
-    // RUN-161: shared memory now holds ONLY the staged packed weight bytes. The
-    // codebook is computed in-register (qtip_decode_state), so the former
-    // 512 KB global LUT and its dead shared-staging are gone entirely.
     extern __shared__ float s_mem[];
-    (void)lut;  // codebook now computed in-register; param kept for ABI stability
+    (void)lut;
 
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -326,9 +240,8 @@ qtip_gather_gemv_warp_kernel(
     const uint32_t expert = __ldg(indices + pair);
     const bool invalid = expert >= (uint32_t)num_experts;
 
-    // ---- stage packed weight rows (coalesced bulk copy) ----
     uint8_t* s_packed = reinterpret_cast<uint8_t*>(s_mem);
-    if (stage_packed && !invalid) {
+    if (STAGED && !invalid) {
         const int n_block_rows = min(ROWS_PER_BLOCK, n_rows - row0_block);
         const long total = (long)n_block_rows * packed_per_row;
         const uint8_t* __restrict__ g =
@@ -336,8 +249,8 @@ qtip_gather_gemv_warp_kernel(
         for (long i = threadIdx.x; i < total; i += WARPS_PER_BLOCK * 32) {
             s_packed[i] = __ldg(g + i);
         }
+        __syncthreads();
     }
-    if (stage_packed && !invalid) __syncthreads();
 
     const int row0 = row0_block + warp * ROWS_PER_WARP;
     if (invalid) {
@@ -351,28 +264,27 @@ qtip_gather_gemv_warp_kernel(
         return;
     }
 
-    // Per-row backing: packed pointer (shared if staged, else global) + scale.
-    // Out-of-range rows get scale 0 so their accumulator stays 0 (not written).
-    const uint8_t* rp[ROWS_PER_WARP];
+    // Per-row backing. STAGED is compile-time, so the shared form is a 32-bit
+    // shared offset (LDS) and the global form a 64-bit pointer (LDG) -- neither
+    // is a generic pointer, which is what removes the address chain.
+    const uint8_t* rp_g[ROWS_PER_WARP];
+    unsigned int   rp_s[ROWS_PER_WARP];
     float scl[ROWS_PER_WARP];
     #pragma unroll
     for (int r = 0; r < ROWS_PER_WARP; ++r) {
         const int row = row0 + r;
         const bool ok = row < n_rows;
         const size_t er = (size_t)expert * n_rows + (ok ? row : 0);
-        rp[r]  = stage_packed ? (s_packed + (size_t)(warp * ROWS_PER_WARP + r) * packed_per_row)
-                              : (packed + er * packed_per_row);
-        scl[r] = ok ? __ldg(row_scales + er) : 0.0f;
+        rp_g[r] = packed + er * packed_per_row;
+        rp_s[r] = (unsigned int)((warp * ROWS_PER_WARP + r) * packed_per_row);
+        scl[r]  = ok ? __ldg(row_scales + er) : 0.0f;
     }
     const T* __restrict__ x_pair = x + (size_t)pair * num_symbols * QTIP_V;
+    const bool xvec = ((reinterpret_cast<uintptr_t>(x_pair) & 15u) == 0u);
 
-    // Grouped-strided decode (GROUP=4: H200 sweep G=1/2/4/8 -> 137/233/325/266
-    // GB/s at R=1). Each lane does GROUP contiguous symbols per step, groups
-    // strided by 32*GROUP. x for the group is loaded ONCE and reused across all
-    // ROWS_PER_WARP rows; the R rows' decode chains are mutually independent,
-    // providing the ILP that hides warm-up/state-carry latency.
-    constexpr int GROUP = 4;
     const int gstride = 32 * GROUP;
+    // u16 chunks spanning warm-up (QTIP_WARMUP_SYMS nibbles) + GROUP nibbles.
+    constexpr int NH = (QTIP_WARMUP_SYMS + GROUP + 3) / 4;
 
     float acc[ROWS_PER_WARP];
     #pragma unroll
@@ -380,36 +292,58 @@ qtip_gather_gemv_warp_kernel(
 
     for (int base = lane * GROUP; base < num_symbols; base += gstride) {
         const int gend = min(base + GROUP, num_symbols);
-        // Load this lane's GROUP of activations once (shared by all R rows).
         float2 xg[GROUP];
-        #pragma unroll
-        for (int j = 0; j < GROUP; ++j) {
-            const int s = base + j;
-            if (s < gend) xg[j] = gg_load2(x_pair + s * (int)QTIP_V);
-        }
+        gg_load_group<T, GROUP>(x_pair + base * (int)QTIP_V,
+                                xvec && (base + GROUP <= num_symbols), xg);
+
+        // Fast path: a full group with a full warm-up window in range.
+        const bool fast = (base >= (int)QTIP_WARMUP_SYMS) && (base + GROUP <= num_symbols);
         #pragma unroll
         for (int r = 0; r < ROWS_PER_WARP; ++r) {
-            const uint8_t* row_packed = rp[r];
             const float scale = scl[r];
-            // Warm up the masked L-bit state at `base` for this row.
             uint32_t state = 0u;
-            const int w0 = base > (int)QTIP_WARMUP_SYMS ? base - (int)QTIP_WARMUP_SYMS : 0;
-            for (int t = w0; t < base; ++t) {
-                const uint8_t b = row_packed[t >> 1];
-                const uint32_t sym = (t & 1) ? ((b >> 4) & 0x0F) : (b & 0x0F);
-                state = ((state << QTIP_K) | sym) & QTIP_STATE_MASK;
-            }
             float a = acc[r];
-            #pragma unroll
-            for (int j = 0; j < GROUP; ++j) {
-                const int s = base + j;
-                if (s >= gend) break;
-                const uint8_t b = row_packed[s >> 1];
-                const uint32_t sym = (s & 1) ? ((b >> 4) & 0x0F) : (b & 0x0F);
-                state = ((state << QTIP_K) | sym) & QTIP_STATE_MASK;
-                const float2 w = gg_codeword<COMPUTED_CB>(state, cb_mult);
-                a = fmaf(w.x * scale, xg[j].x, a);
-                a = fmaf(w.y * scale, xg[j].y, a);
+            if (fast) {
+                const int b0 = (base - (int)QTIP_WARMUP_SYMS) >> 1;  // even byte index
+                uint32_t h[NH];
+                #pragma unroll
+                for (int q = 0; q < NH; ++q) {
+                    if (STAGED) {
+                        h[q] = *reinterpret_cast<const unsigned short*>(s_packed + rp_s[r] + b0 + 2 * q);
+                    } else {
+                        h[q] = __ldg(reinterpret_cast<const unsigned short*>(rp_g[r] + b0 + 2 * q));
+                    }
+                }
+                state = gg_state_from_window(h[0]);
+                #pragma unroll
+                for (int j = 0; j < GROUP; ++j) {
+                    const int t = (int)QTIP_WARMUP_SYMS + j;   // nibble index in the window
+                    const uint32_t sym = (h[t >> 2] >> (4 * (t & 3))) & 0x0Fu;
+                    state = ((state << QTIP_K) | sym) & QTIP_STATE_MASK;
+                    const float2 w = gg_codeword<COMPUTED_CB>(state, cb_mult);
+                    a = fmaf(w.x * scale, xg[j].x, a);
+                    a = fmaf(w.y * scale, xg[j].y, a);
+                }
+            } else {
+                // General path -- identical arithmetic to the original.
+                const uint8_t* row_packed = STAGED ? (s_packed + rp_s[r]) : rp_g[r];
+                const int w0 = base > (int)QTIP_WARMUP_SYMS ? base - (int)QTIP_WARMUP_SYMS : 0;
+                for (int t = w0; t < base; ++t) {
+                    const uint8_t b = row_packed[t >> 1];
+                    const uint32_t sym = (t & 1) ? ((b >> 4) & 0x0F) : (b & 0x0F);
+                    state = ((state << QTIP_K) | sym) & QTIP_STATE_MASK;
+                }
+                #pragma unroll
+                for (int j = 0; j < GROUP; ++j) {
+                    const int s = base + j;
+                    if (s >= gend) break;
+                    const uint8_t b = row_packed[s >> 1];
+                    const uint32_t sym = (s & 1) ? ((b >> 4) & 0x0F) : (b & 0x0F);
+                    state = ((state << QTIP_K) | sym) & QTIP_STATE_MASK;
+                    const float2 w = gg_codeword<COMPUTED_CB>(state, cb_mult);
+                    a = fmaf(w.x * scale, xg[j].x, a);
+                    a = fmaf(w.y * scale, xg[j].y, a);
+                }
             }
             acc[r] = a;
         }
@@ -431,9 +365,10 @@ qtip_gather_gemv_warp_kernel(
 
 extern "C" {
 
-// `cb_mult == 0` selects the RUN-161 in-register Gaussian (bit-faithful to the
-// stored 512 KiB LUT it replaced); nonzero selects the computed sum2 codebook
-// with that MCG multiplier. See qtip_codebook.cuh.
+#ifndef GG_GROUP
+#define GG_GROUP 4
+#endif
+
 #define QTIP_GATHER_GEMV_LAUNCHER(NAME, T)                                            \
     void NAME(const uint8_t*  d_packed,                                               \
               const float*    d_row_scales,                                           \
@@ -449,26 +384,35 @@ extern "C" {
               unsigned int cb_mult,                                                   \
               cudaStream_t    stream) {                                               \
         constexpr int WARPS_PER_BLOCK = 8;                                            \
-        constexpr int ROWS_PER_WARP = 2;  /* register-blocking: rows/warp (x reused) */ \
+        constexpr int ROWS_PER_WARP = 2;                                              \
+        constexpr int GRP = GG_GROUP;                                                 \
         constexpr int ROWS_PER_BLOCK = WARPS_PER_BLOCK * ROWS_PER_WARP;               \
-        /* RUN-161: codebook is computed in-register, so shared memory only ever      \
-           stages the packed weight bytes (no LUT term anymore). */                   \
         const size_t packed_smem = (size_t)ROWS_PER_BLOCK * packed_per_row;           \
         const bool   stage_packed = packed_smem <= 48 * 1024;                         \
         const size_t SHMEM = stage_packed ? packed_smem : 0;                          \
         dim3 grid((n_rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, n_pairs, 1);        \
         if (cb_mult != 0u) {                                                          \
-            qtip_gather_gemv_warp_kernel<T, WARPS_PER_BLOCK, ROWS_PER_WARP, true>     \
-                <<<grid, WARPS_PER_BLOCK * 32, SHMEM, stream>>>(                      \
-                    d_packed, d_row_scales, d_lut, d_x_rotated, d_indices, d_y,       \
-                    n_rows, packed_per_row, num_symbols, n_pairs, num_experts,        \
-                    stage_packed ? 1 : 0, cb_mult);                                   \
+            if (stage_packed)                                                         \
+                qtip_gather_gemv_warp_kernel<T, WARPS_PER_BLOCK, ROWS_PER_WARP, true, true, GRP>   \
+                    <<<grid, WARPS_PER_BLOCK * 32, SHMEM, stream>>>(                  \
+                        d_packed, d_row_scales, d_lut, d_x_rotated, d_indices, d_y,   \
+                        n_rows, packed_per_row, num_symbols, n_pairs, num_experts, cb_mult); \
+            else                                                                      \
+                qtip_gather_gemv_warp_kernel<T, WARPS_PER_BLOCK, ROWS_PER_WARP, true, false, GRP>  \
+                    <<<grid, WARPS_PER_BLOCK * 32, SHMEM, stream>>>(                  \
+                        d_packed, d_row_scales, d_lut, d_x_rotated, d_indices, d_y,   \
+                        n_rows, packed_per_row, num_symbols, n_pairs, num_experts, cb_mult); \
         } else {                                                                      \
-            qtip_gather_gemv_warp_kernel<T, WARPS_PER_BLOCK, ROWS_PER_WARP, false>    \
-                <<<grid, WARPS_PER_BLOCK * 32, SHMEM, stream>>>(                      \
-                    d_packed, d_row_scales, d_lut, d_x_rotated, d_indices, d_y,       \
-                    n_rows, packed_per_row, num_symbols, n_pairs, num_experts,        \
-                    stage_packed ? 1 : 0, 0u);                                        \
+            if (stage_packed)                                                         \
+                qtip_gather_gemv_warp_kernel<T, WARPS_PER_BLOCK, ROWS_PER_WARP, false, true, GRP>  \
+                    <<<grid, WARPS_PER_BLOCK * 32, SHMEM, stream>>>(                  \
+                        d_packed, d_row_scales, d_lut, d_x_rotated, d_indices, d_y,   \
+                        n_rows, packed_per_row, num_symbols, n_pairs, num_experts, 0u); \
+            else                                                                      \
+                qtip_gather_gemv_warp_kernel<T, WARPS_PER_BLOCK, ROWS_PER_WARP, false, false, GRP> \
+                    <<<grid, WARPS_PER_BLOCK * 32, SHMEM, stream>>>(                  \
+                        d_packed, d_row_scales, d_lut, d_x_rotated, d_indices, d_y,   \
+                        n_rows, packed_per_row, num_symbols, n_pairs, num_experts, 0u); \
         }                                                                             \
     }
 

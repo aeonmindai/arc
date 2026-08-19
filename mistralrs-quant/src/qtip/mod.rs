@@ -55,6 +55,7 @@ use crate::{
     QuantizedSerdeType, ShardedVarBuilder,
 };
 
+pub mod bake_cache;
 #[cfg(test)]
 mod bake_memory_tests;
 #[cfg(test)]
@@ -64,6 +65,7 @@ pub mod bitshift;
 mod codebook_tests;
 #[cfg(feature = "cuda")]
 mod cuda_ops;
+pub(crate) mod device_guard;
 #[cfg(feature = "cuda")]
 mod ffi;
 pub(crate) mod gather_policy;
@@ -80,14 +82,18 @@ pub use bitshift::{Qtip2bLayer, QTIP2B_MCG_MULT};
 // structural pair ceiling, the env var that selects the path, and the tile
 // geometry that decides whether the grouped kernel is reachable at all.
 // Exported rather than re-derived so a harness cannot drift from the dispatch.
+pub use bake_cache::{BakeCacheError, BakeKey};
 pub use gather_policy::{
     expected_distinct_experts as qtip_expected_distinct_experts,
     GATHER_GEMV_MAX_PAIRS as QTIP_GATHER_GEMV_MAX_PAIRS,
     ONDEVICE_MOE_MAX_TOKENS_ENV as QTIP_ONDEVICE_MOE_MAX_TOKENS_ENV,
 };
 pub use grouped::{
-    ExpertBpwTable, TrellisBpw, GROUPED_TILE_K as QTIP_GROUPED_TILE_K,
-    GROUPED_TILE_M as QTIP_GROUPED_TILE_M, GROUPED_TILE_N as QTIP_GROUPED_TILE_N,
+    grouped_launch_counts, grouped_variant, set_grouped_variant, ExpertBpwTable, TrellisBpw,
+    GROUPED_TILE_K as QTIP_GROUPED_TILE_K, GROUPED_TILE_M as QTIP_GROUPED_TILE_M,
+    GROUPED_TILE_N as QTIP_GROUPED_TILE_N, QTIP_GROUPED_VARIANT_BASELINE,
+    QTIP_GROUPED_VARIANT_COUNT, QTIP_GROUPED_VARIANT_ENV, QTIP_GROUPED_VARIANT_LDST,
+    QTIP_GROUPED_VARIANT_TUNED,
 };
 #[allow(unused_imports)]
 pub use viterbi::{
@@ -3397,6 +3403,73 @@ impl QtipLayer {
     }
 }
 
+/// Keep only `ids` (ascending, in range) along a tensor's leading dimension.
+///
+/// Shared by both trellis rungs' expert-parallel slice. Contiguous id runs —
+/// the `ExpertPlacement::contiguous` case — take `narrow`, which avoids
+/// building an index tensor on the device.
+pub(crate) fn select_experts_dim0(t: &Tensor, ids: &[usize]) -> candle_core::Result<Tensor> {
+    let e = t.dim(0)?;
+    if ids.is_empty() {
+        candle_core::bail!("expert slice: cannot keep zero experts");
+    }
+    for w in ids.windows(2) {
+        if w[0] >= w[1] {
+            candle_core::bail!("expert slice: ids must be strictly ascending, got {w:?}");
+        }
+    }
+    if ids[ids.len() - 1] >= e {
+        candle_core::bail!(
+            "expert slice: id {} is out of range for a {e}-expert stack",
+            ids[ids.len() - 1]
+        );
+    }
+    if ids.windows(2).all(|w| w[1] == w[0] + 1) {
+        return t.narrow(0, ids[0], ids.len())?.contiguous();
+    }
+    let idx = Tensor::from_vec(
+        ids.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+        (ids.len(),),
+        t.device(),
+    )?;
+    t.index_select(&idx, 0)?.contiguous()
+}
+
+impl QtipLayer {
+    /// The expert-parallel slice: keep only `ids` out of this stack.
+    ///
+    /// `lut` and `rotation_signs` are **shared** across the stack (the
+    /// rotation is a function of `K_in`, identical for every expert), so they
+    /// are replicated rather than sliced — exactly as wave44-BV §4.1
+    /// describes. Only `blocks` and `row_scales` carry an expert axis.
+    pub fn select_experts_concrete(&self, ids: &[usize]) -> candle_core::Result<Self> {
+        let Some(num_experts) = self.num_experts else {
+            candle_core::bail!(
+                "QtipLayer::select_experts: this layer is a plain 2-D linear, not an expert stack"
+            );
+        };
+        if ids.len() > num_experts {
+            candle_core::bail!(
+                "QtipLayer::select_experts: asked for {} experts out of {num_experts}",
+                ids.len()
+            );
+        }
+        Ok(Self {
+            blocks: select_experts_dim0(&self.blocks, ids)?,
+            row_scales: select_experts_dim0(&self.row_scales, ids)?,
+            lut: self.lut.clone(),
+            bias: self.bias.clone(),
+            in_features: self.in_features,
+            num_experts: Some(ids.len()),
+            rotation_signs: self.rotation_signs.clone(),
+            rotation_block: self.rotation_block,
+            search: self.search,
+            search_detail: self.search_detail,
+            codebook: self.codebook,
+        })
+    }
+}
+
 impl QuantMethod for QtipLayer {
     fn new(method: QuantMethodConfig) -> candle_core::Result<Self>
     where
@@ -3540,18 +3613,48 @@ impl QuantMethod for QtipLayer {
                 // the kernel's real structural limit (grid.y = n_pairs <=
                 // 65535). See `gather_policy` for the arithmetic.
                 let num_experts = self.num_experts_count();
-                let use_ondevice = match gather_policy::ondevice_max_tokens_override() {
-                    Some(cap) => {
-                        n_tokens <= cap
-                            && n_tokens.saturating_mul(n_experts_per_tok)
-                                <= gather_policy::GATHER_GEMV_MAX_PAIRS
-                    }
-                    None => gather_policy::lut_fused_gather_preferred(
-                        n_tokens,
-                        n_experts_per_tok,
-                        num_experts,
-                    ),
-                };
+                let grouped_disabled = std::env::var("ARC_NO_QTIP_GROUPED_MOE").is_ok();
+                // Is the grouped GEMM actually usable for this call?
+                let grouped_available = !grouped_disabled
+                    && matches!(a.dtype(), DType::BF16 | DType::F16)
+                    && self.in_features.is_multiple_of(grouped::GROUPED_TILE_K);
+
+                // Prefer the grouped GEMM over the fused gather-GEMV for every
+                // non-decode call.
+                //
+                // `lut_fused_gather_preferred`'s 16x traffic ratio answers the
+                // question "GEMV or dequantize-materialize?" — a choice between
+                // two paths that both scale with (token, slot) PAIRS. Now that a
+                // third path exists whose cost tracks DISTINCT EXPERTS, that
+                // boundary no longer describes the decision being made: measured
+                // per expert matmul on an H200, grouped beats the fused GEMV at
+                // N=128 (1.15x) and by N=512 the gap is 3.98x. Leaving the old
+                // boundary in place made the grouped kernel unreachable below
+                // ~683 tokens, which is where most prefill actually lives — the
+                // end-to-end A/B showed exactly 1.00x at N=128 and N=512 while
+                // N=1024 moved 2.41x.
+                //
+                // The decode regime stays fused UNCONDITIONALLY: that is the
+                // RUN-161 floor, not a performance choice (see
+                // `gather_policy`). An explicit `ARC_QTIP_ONDEVICE_MOE_MAX_TOKENS`
+                // override also still wins, so a harness can pin the GEMV arm.
+                let grouped_preferred = grouped_available
+                    && n_tokens > DECODE_REGIME_MAX_TOKENS
+                    && gather_policy::ondevice_max_tokens_override().is_none();
+
+                let use_ondevice = !grouped_preferred
+                    && match gather_policy::ondevice_max_tokens_override() {
+                        Some(cap) => {
+                            n_tokens <= cap
+                                && n_tokens.saturating_mul(n_experts_per_tok)
+                                    <= gather_policy::GATHER_GEMV_MAX_PAIRS
+                        }
+                        None => gather_policy::lut_fused_gather_preferred(
+                            n_tokens,
+                            n_experts_per_tok,
+                            num_experts,
+                        ),
+                    };
                 let ondevice_disabled = std::env::var("ARC_NO_QTIP_ONDEVICE_MOE").is_ok();
                 if !ondevice_disabled && use_ondevice {
                     // On-device ONLY, propagate its error. The host fallback
@@ -3563,6 +3666,66 @@ impl QuantMethod for QtipLayer {
                     // (RUN-161)
                     return self.gather_forward_cuda_ondevice(a, indices);
                 }
+                // Prefill regime: the LUT-rung trellis grouped GEMM. Tokens
+                // sorted by expert on-device, then a persistent tensor-core
+                // tile loop over the ragged groups, so each woken expert's
+                // packed bytes are staged once per m-tile instead of once per
+                // (token, slot) pair.
+                //
+                // This rung shipped without it for one wrong reason: its state
+                // update `state = ((state << 4) | sym) & 0xFFFF` LOOKS
+                // sequential. It is not — the state at symbol `t` is just the
+                // last four nibbles, i.e. a 16-bit window over the packed
+                // stream, exactly as the qtip2b rung's state is a window over
+                // its 2-bit stream. Random-access decode is what makes a
+                // grouped GEMM reachable, and it was always available here.
+                //
+                // Below this, `gather_forward_cuda` stays as the fallback: it
+                // is the only path that handles F32 activations and shapes
+                // whose `in_features` is not a multiple of the k-chunk.
+                if grouped_available {
+                    let total_pairs = n_tokens * n_experts_per_tok;
+                    let a_flat = a.reshape((total_pairs, cols))?.contiguous()?;
+                    let a_rotated = if self.rotation_block >= 2 {
+                        match &self.rotation_signs {
+                            Some(signs) => {
+                                cuda_ops::rotate_x_cuda(&a_flat, signs, self.rotation_block)?
+                            }
+                            None => candle_core::bail!(
+                                "QtipLayer::gather_forward: rotation_block={} but rotation_signs is None",
+                                self.rotation_block
+                            ),
+                        }
+                    } else {
+                        a_flat
+                    };
+                    let idx = indices
+                        .reshape((total_pairs,))?
+                        .to_dtype(DType::U32)?
+                        .contiguous()?;
+                    let out_flat = cuda_ops::grouped_gemm_lut_cuda(
+                        &self.blocks,
+                        &self.row_scales,
+                        &self.lut,
+                        &a_rotated,
+                        &idx,
+                        self.in_features,
+                        self.codebook,
+                    )?;
+                    let mut out = out_flat.reshape((
+                        n_tokens,
+                        n_experts_per_tok,
+                        self.rows_per_expert()?,
+                    ))?;
+                    if out.dtype() != a.dtype() {
+                        out = out.to_dtype(a.dtype())?;
+                    }
+                    if let Some(bias) = &self.bias {
+                        out = out.broadcast_add(&bias.to_dtype(out.dtype())?)?;
+                    }
+                    return Ok(out);
+                }
+
                 // The per-expert dequantize below materializes weights to HBM.
                 gather_policy::log_lut_gather_fallback_once(
                     n_tokens,
@@ -3585,6 +3748,10 @@ impl QuantMethod for QtipLayer {
 
     fn quantized_act_type(&self) -> Option<DType> {
         None
+    }
+
+    fn select_experts(&self, ids: &[usize]) -> Result<Arc<dyn QuantMethod>> {
+        Ok(Arc::new(self.select_experts_concrete(ids)?))
     }
 
     fn add_delta_w(&self, _delta: &Tensor) -> Result<Arc<dyn QuantMethod>> {

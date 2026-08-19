@@ -5,13 +5,106 @@ on:
     branches: 
       - master
   pull_request:
-    branches: 
-      - master
+    # D18 #11: this was `- master`, so a PR whose BASE was another PR's branch
+    # (a stack) matched nothing here and ran zero lanes. The only workflow
+    # without a branch filter is analysis.yaml (`pull_request_target`), so such
+    # a PR showed exactly one check — `comment` — and read as green while
+    # nothing had been compiled, tested, linted or nvcc'd. Six PRs sat in that
+    # state. Match every base branch; stacked PRs are normal here.
+    branches:
+      - '**'
   workflow_dispatch:
 
 name: Continuous integration
 
+# Widening the trigger above multiplies this workflow across every stacked PR,
+# so it must stop paying for superseded runs on the same ref — `ci.yml` is 12
+# jobs, the largest multiplier in the repo, and was the only workflow without
+# this. `cuda_compile_check.yaml` has carried the identical block for a while;
+# this is the same shape deliberately, not a new policy.
+#
+# The `head_ref || run_id` idiom was load-bearing and is now SPLIT, deliberately.
+#
+# On `pull_request`, `head_ref` is the source branch, so a new push cancels that
+# PR's own in-flight run. That is unchanged, and it is why the key still leads
+# with `head_ref`: every PR keeps its own independent group, and a merge to
+# master can never cancel a different branch's checks.
+#
+# What changed is the `push` case. `head_ref` is empty there, and the old
+# `run_id` fallback is unique per run, so master pushes never collapsed — by
+# design, per the comment this replaces, so that each master commit kept its own
+# CI record. Keying on `github.ref` instead puts every push to the same branch
+# in one group.
+#
+# ⚠️ THIS REVERSES A DOCUMENTED DECISION. The cost is real: the superseded runs
+# carried per-commit master results, which is CI-side bisect evidence. See the
+# PR body for why that record was worth less in practice than it sounds, and for
+# the incident that motivated this.
+#
+# `schedule` and `workflow_dispatch` also have an empty `head_ref`; they key on
+# `github.ref` too, so a scheduled run and a push to the same branch share a
+# group. That is intended — they build the same commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # WHY THIS LANE EXISTS
+  # --------------------
+  # Widening the `pull_request` branch filter above makes the real lanes RUN on
+  # a stacked PR. It does not make the stack itself visible, and the stack is
+  # the thing that produced the incident: five PRs (#109, #113, #114, #116,
+  # #121) were based on other PRs' branches, so they ran zero lanes, displayed
+  # only `comment`, and read as green while nothing had been compiled, tested,
+  # linted or nvcc'd.
+  #
+  # The trigger fix and this lane answer two different questions:
+  #
+  #   trigger fix  -> "did the lanes run?"        (they now do)
+  #   this lane    -> "did they run against the
+  #                    code that will actually
+  #                    land on master?"           (only if base == master)
+  #
+  # The second is not implied by the first. A stacked PR's lanes compile
+  # head-merged-into-*another PR's branch*. That base can still change or be
+  # rebased under it, so a green there is a green about a tree that may never
+  # exist. Worse, it is green on code whose parent has not itself been proven —
+  # the stack inherits its base's unreviewed state and reports success anyway.
+  #
+  # So: refuse. A PR that does not target `master` is red until it is rebased.
+  # This is deliberately a HARD failure and not a warning — the whole class of
+  # defect being fixed is "an absence that reads as a pass", and a warning is
+  # another absence.
+  #
+  # It is a lane of `ci.yml` rather than its own workflow on purpose: `CI
+  # complete` is the single required status check in branch protection, and it
+  # aggregates this job's `needs`. A separate workflow would not be required by
+  # branch protection and could be merged straight past.
+  base-branch:
+    name: Base branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse a pull request that does not target master
+        # `push`, `schedule` and `workflow_dispatch` have an empty `base_ref`.
+        # The step is skipped for them, but the JOB still succeeds, so
+        # `ci-complete`'s lane count is the same number on every event type.
+        if: github.event_name == 'pull_request'
+        env:
+          # Via env, never interpolated into the script: a branch name is
+          # attacker-controlled text and `${{ }}` inside `run:` is substituted
+          # before the shell sees it.
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          echo "head: ${HEAD_REF}"
+          echo "base: ${BASE_REF}"
+          if [ "${BASE_REF}" != "master" ]; then
+            echo "::error::This PR targets '${BASE_REF}', not 'master'. Its lanes compile the head merged into another PR's branch, which is not the tree that will land. Rebase onto master and retarget the PR. (Stacked PRs used to run ZERO lanes and display only 'comment' — an absence that read as a pass. This lane exists so that state is red instead of blank.)"
+            exit 1
+          fi
+          echo "Base is master."
+
   check:
     name: Check
     runs-on: ${{ matrix.os }}
@@ -153,6 +246,64 @@ jobs:
         with:
           command: check
           args: --workspace
+
+  # D18 #11 GUARD — the job that makes "green" mean something.
+  #
+  # Fixing the `pull_request` branch filter above stops THIS instance, but the
+  # class of defect is "the real lanes did not run and their absence read as a
+  # pass". A branch filter is only one way to reach that state; a skipped job,
+  # a renamed job, a matrix that expands to nothing, or a `paths:` filter that
+  # excludes everything all reproduce it exactly.
+  #
+  # So: this job depends on every substantive lane, runs even when they fail or
+  # are skipped (`if: always()`), and fails unless each one actually SUCCEEDED.
+  # `skipped` and `cancelled` are failures here — that is the entire point.
+  # It also asserts the lane COUNT, so silently deleting a lane trips it rather
+  # than quietly shrinking what green covers.
+  #
+  # Make THIS the required status check in branch protection. It is the only
+  # job whose non-success is unambiguous, and unlike the individual lanes it
+  # cannot pass by not existing.
+  ci-complete:
+    name: CI complete
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - base-branch
+      - check
+      - check-metal
+      - test
+      - fmt
+      - clippy
+      - docs
+      - typos
+      - msrv
+    steps:
+      - name: Assert every lane ran and succeeded
+        env:
+          # Passed via env, not interpolated into the script, so a lane result
+          # can never be shell-injected.
+          LANE_RESULTS: ${{ join(needs.*.result, ' ') }}
+          # 9 = the 8 build/test/hygiene lanes + `base-branch`. Bumped from 8
+          # when `base-branch` was added; this number is asserted below
+          # precisely so that adding or dropping a lane cannot happen silently.
+          EXPECTED_LANES: '9'
+        run: |
+          set -euo pipefail
+          echo "lane results: ${LANE_RESULTS}"
+          n=0
+          for r in ${LANE_RESULTS}; do
+            n=$((n + 1))
+            if [ "${r}" != "success" ]; then
+              echo "::error::A CI lane reported '${r}'. Refusing to report green."
+              exit 1
+            fi
+          done
+          if [ "${n}" -ne "${EXPECTED_LANES}" ]; then
+            echo "::error::Expected ${EXPECTED_LANES} lanes, saw ${n}. The job set drifted — update ci-complete's needs list deliberately, do not let green shrink silently."
+            exit 1
+          fi
+          echo "All ${n} lanes succeeded."
 
   # run `mlc` (`cargo install mlc`)
   # markdown-link-check:

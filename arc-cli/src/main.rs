@@ -8,14 +8,20 @@
 //! This is the `arc` binary — a wrapper around the mistral.rs CLI that adds Arc
 //! branding, the `validate` pre-flight command, and the AgentPerf bench suite.
 //!
-//! ⚠️ **TurboQuant is the *nominal* PagedAttention default only.**
+//! ⚠️ **TurboQuant is the real PagedAttention default, within a narrow
+//! envelope.** A standard-layout model with head_dim 128 gets TurboQuant KV
+//! with no flag set, and silently loses prefix caching with it.
 //! `PagedCacheType::resolve_for_model` falls back to the unquantized `auto`
-//! cache — with a warning — for any model TurboQuant cannot support, which
-//! means every MLA model and every head_dim other than 128. Requesting it
+//! cache — with a warning — for everything else, which means every MLA model
+//! and every other head_dim, so in practice few models take it. Requesting it
 //! explicitly turns that fallback into a hard error instead. The eager
 //! (non-paged) KV path is separately opt-in via `ARC_TURBOQUANT_KV=1`.
-//! In practice almost no model runs TurboQuant today, and none has been
-//! measured with it.
+//!
+//! ⚠️ **It has been measured, once, narrowly.** Qwen3-32B served end-to-end on
+//! a B200 at 55 tok/s with correct output (2026-04-06, `4eba13905`). That is
+//! b=1, one card, one model, head_dim 128, and it did not isolate TurboQuant
+//! from the rest of the decode path. **No quality evaluation exists** at any
+//! preset, and compression ratios quoted for it are format arithmetic.
 //!
 //! Usage:
 //!   arc serve -m <model_id>                          # Start serving
@@ -35,11 +41,21 @@ use std::time::Duration;
 
 /// Arc — A high-performance LLM inference engine with TurboQuant compression.
 ///
-/// Built on mistral.rs. Defaults to TurboQuant 3.5-bit KV cache (lossless).
+/// Built on mistral.rs. Arc picks the KV cache format, device map and
+/// quantisation for the model you load, and logs what it actually resolved on
+/// startup via the `ArcServe:` line. Quality under TurboQuant has never been
+/// evaluated — it is not "lossless".
+//
+// The second line used to read "Defaults to TurboQuant 3.5-bit KV cache
+// (lossless)" — the same unconditional claim removed from the runtime banner.
+// It is decided per model at load time, so `--help` cannot state it. The
+// not-lossless correction is #111's and is kept; the *default* is stated on
+// `--pa-cache-type` itself (see `mistralrs-cli/src/args/paged_attn.rs`), which
+// is where it can be said accurately.
 #[derive(Parser)]
 #[command(name = "arc", version, about, long_about = None)]
 #[command(
-    after_help = "Arc inference engine by Aeonmind, LLC\nhttps://runcrate.ai/arc\nPowered by mistral.rs + TurboQuant (ICLR 2026)"
+    after_help = "Run `--help-all` on any subcommand for the complete flag set.\n\nArc inference engine by Aeonmind, LLC\nhttps://runcrate.ai/arc\nPowered by mistral.rs + TurboQuant (ICLR 2026)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -81,7 +97,11 @@ enum Commands {
         #[arg(long, default_value_t = 2)]
         slo_tier: u8,
         /// Use the offline mock vendor — no GPU required.
-        #[arg(long)]
+        ///
+        /// Hidden: emits a fully-formed results artifact containing synthetic
+        /// numbers. It exists for harness tests; surfacing it in `--help`
+        /// invites publishing mock throughput as if it were measured.
+        #[arg(long, hide = true)]
         mock: bool,
         /// Cap on concurrent users explored by the scheduler.
         #[arg(long, default_value_t = 256)]
@@ -130,7 +150,11 @@ enum Commands {
         #[arg(long)]
         arch: Option<String>,
         /// (schema mode) For V4: assume LoRA o_proj layout instead of the default Either fallback.
-        #[arg(long, default_value = "either")]
+        ///
+        /// Hidden: a weight-schema assumption used to A/B checkpoint layouts.
+        /// The `either` default accepts both, so overriding it can only make
+        /// validation stricter than the loader actually is.
+        #[arg(long, default_value = "either", hide = true)]
         o_proj: String,
 
         // --- HBM-mode flags (RUN-191) ---
@@ -153,9 +177,17 @@ enum Commands {
 }
 
 fn main() {
-    // Print Arc banner
+    // Print Arc banner.
+    //
+    // D18: the banner states identity only. It must NOT name a subsystem as
+    // active — this process has not loaded a model yet, so it cannot know
+    // which cache type, attention backend, or MoE path will be resolved. The
+    // previous banner claimed "TurboQuant 3.5-bit KV cache compression
+    // (lossless, default)" unconditionally; that line was false for every MLA
+    // model and every head_dim != 128 (i.e. almost every model), and
+    // "lossless" was never measured at all. The engine now reports what it
+    // actually resolved, after load, via the ArcServe startup summary.
     eprintln!("Arc inference engine v{}", env!("CARGO_PKG_VERSION"));
-    eprintln!("TurboQuant 3.5-bit KV cache compression (lossless, default)");
     eprintln!("Aeonmind, LLC | https://runcrate.ai/arc");
     eprintln!();
 
@@ -164,6 +196,39 @@ fn main() {
     //
     // In production, this will be a proper clap integration that reuses
     // the mistralrs-cli command definitions. For now, exec the upstream binary.
+    // `--help-all` un-hides arc's own debug flags. Subcommands that forward to
+    // the mistralrs binary pass the flag straight through, so it means the
+    // same thing everywhere.
+    if std::env::args().any(|a| a == "--help-all")
+        && !matches!(
+            std::env::args().nth(1).as_deref(),
+            Some("serve") | Some("run")
+        )
+    {
+        fn unhide_all(cmd: clap::Command) -> clap::Command {
+            cmd.mut_args(|a| a.hide(false)).mut_subcommands(unhide_all)
+        }
+        // Descend to the subcommand named on the command line so
+        // `arc bench --help-all` shows bench's flags, not the root's.
+        let mut cmd = unhide_all(<Cli as clap::CommandFactory>::command());
+        for token in std::env::args().skip(1) {
+            if token.starts_with('-') {
+                continue;
+            }
+            let matched = cmd
+                .get_subcommands()
+                .find(|s| s.get_name() == token)
+                .cloned();
+            match matched {
+                Some(sub) => cmd = sub,
+                None => break,
+            }
+        }
+        cmd.print_long_help().ok();
+        println!();
+        return;
+    }
+
     let cli = Cli::parse();
 
     let (subcmd, args) = match cli.command {
@@ -326,9 +391,17 @@ fn extract_arc_flags(args: Vec<String>) -> (HashMap<String, String>, Vec<String>
                     std::process::exit(2);
                 }
             }
+            // `--td-moe-calibration` is retired: it set ARC_TD_MOE_CALIBRATION,
+            // which arc-engine parsed and then bound to an unread parameter. It
+            // never influenced an output. Accept-and-warn for one release so
+            // existing invocations keep running instead of failing on an
+            // unknown flag; use `--calib <path>` for real calibration.
             "--td-moe-calibration" => {
-                if let Some(val) = args.get(i + 1) {
-                    env_vars.insert("ARC_TD_MOE_CALIBRATION".into(), val.clone());
+                if args.get(i + 1).is_some() {
+                    eprintln!(
+                        "WARNING: --td-moe-calibration is deprecated and has no effect \
+                         (it never had one); use --calib <path.arccalib>"
+                    );
                     i += 2;
                     continue;
                 } else {
@@ -353,8 +426,11 @@ fn extract_arc_flags(args: Vec<String>) -> (HashMap<String, String>, Vec<String>
                     i += 1;
                     continue;
                 }
-                if let Some(rest) = arg.strip_prefix("--td-moe-calibration=") {
-                    env_vars.insert("ARC_TD_MOE_CALIBRATION".into(), rest.to_string());
+                if arg.strip_prefix("--td-moe-calibration=").is_some() {
+                    eprintln!(
+                        "WARNING: --td-moe-calibration is deprecated and has no effect \
+                         (it never had one); use --calib <path.arccalib>"
+                    );
                     i += 1;
                     continue;
                 }

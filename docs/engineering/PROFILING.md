@@ -344,6 +344,48 @@ Each node:
 }
 ```
 
+### 🔴 Selecting a span by NAME is ambiguous — and it fails toward zero
+
+A profile contains **two** of most span names, because prefill and decode are
+separate subtrees by design (§4):
+
+```
+step.prompt.pipeline.step.forward.model.layers.layer.mla_attn    calls=0
+step.decode.pipeline.step.forward.model.layers.layer.mla_attn    calls=2752
+```
+
+The obvious `nodes.iter().find(|n| n.name == "mla_attn")` returns the **prefill**
+node, because it was registered first. In a decode-only window that node has
+`calls == 0`, so a consumer measuring decode attention reads **zero** and
+concludes the busiest kernel in the engine is free. This has happened.
+
+Each node therefore carries `branch` — the name of its ancestor directly under
+the root (`prompt` / `decode`), `None` for the root — and the crate offers three
+calls, none of which will guess:
+
+| call | answers |
+|---|---|
+| `Profile::node("step.decode…mla_attn")` | exact path, unchanged |
+| `Profile::resolve_in("decode", "mla_attn")` | the one node in that branch |
+| `Profile::resolve("mla_attn")` | **errors** when the name is ambiguous, listing every candidate with its `branch` and `calls` |
+| `Profile::nodes_named("mla_attn")` | all of them, when you want both |
+
+Any profile with colliding names says so in `run.notes`, before anyone reads a
+number off one.
+
+### The three zeros are different answers — `Node::verdict()`
+
+`calls == 0` and `wall_ns == 0` answer different questions, and neither answers
+"did this run". Two independent chains hand-rolled this distinction in one night
+before either found it in the schema, so it is now one call:
+
+| `Verdict` | means |
+|---|---|
+| `Unreachable` | `reachable == false` — provably not taken in this configuration, with a `file.rs:LINE` in `unreachable[]` |
+| `NotEnteredThisWindow` | reachable, registered, never entered in the recorded window — **missing data, not a measurement of zero**, and the shape that masquerades as "this is free" |
+| `BelowTimerFloor` | entered; every call landed under the timer's resolution |
+| `Measured` | entered and timed |
+
 `Profile::recheck(tolerance_pct)` re-derives the reconciliation check from the
 node table **alone**, so a consumer can re-verify a JSON someone hands them
 without trusting the writer. The crate's own tests use that path rather than the
@@ -439,6 +481,15 @@ ARC_PROFILE=1 ARC_PROFILE_SELFTEST=1 \
   ./target/release/mistralrs run -m $SRC -a deepseekv4 \
     --from-uqff $UQFF/qtip2-0.uqff 2>&1 | tee selftest.log
 # Look for:  "device selftest: launch_wall=... device=... ratio=...x — PASS/FAIL"
+#
+# 🔴 Before the `device::timer_for` fix this line read "NOT RUN (no CUDA event
+# timer attached)" on EVERY run, on a perfectly good CUDA device: a NULL
+# `CUstream` is CUDA's legacy default stream, not "no stream", and the
+# `!stream.is_null()` guard rejected it and fell through to `NullTimer`. Device
+# and sync were structurally unmeasurable for the whole life of the crate up to
+# that point. Measured after the fix on an H200: ratio 24.6x-44.2x PASS,
+# `unresolved_device_spans: 0`. If you are reading an older profile, its device
+# and sync columns are unmeasured — treat them as absent, not as zero.
 # ratio > 10  => CUDA events are measuring execution.   PROCEED.
 # ratio ~ 1   => STOP. The device column is void; report the ratio and stop.
 # "NOT RUN"   => no CUDA timer attached; device columns will be unmeasured.

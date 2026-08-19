@@ -26,6 +26,9 @@ use std::path::PathBuf;
 #[command(name = "mistralrs")]
 #[command(version, about, long_about = None)]
 #[command(propagate_version = true)]
+// `--help` shows the flags a deployment actually chooses between; Arc decides
+// the rest. Every other flag still works and is listed by `--help-all`, whose
+// hint text is applied to every subcommand in `main::with_help_all_hint`.
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -200,19 +203,26 @@ pub enum CacheCommand {
 #[derive(clap::Args, Clone, Default)]
 pub struct DefaultModelOptions {
     /// HuggingFace model ID or local path to model directory
-    #[arg(short = 'm', long)]
+    #[arg(short = 'm', long, help_heading = "Model")]
     pub model_id: Option<String>,
 
     /// Path to local tokenizer.json file
-    #[arg(short = 't', long)]
+    ///
+    /// Hidden: see `--help-all`.
+    #[arg(short = 't', long, hide = true)]
     pub tokenizer: Option<PathBuf>,
 
     /// Model architecture (auto-detected if not specified)
-    #[arg(short = 'a', long, value_parser = parse_arch)]
+    ///
+    /// Hidden: detection is authoritative; this is silently dropped on the
+    /// `auto` path, which is the path this struct serves.
+    #[arg(short = 'a', long, value_parser = parse_arch, hide = true)]
     pub arch: Option<mistralrs_core::NormalLoaderType>,
 
     /// Model data type
-    #[arg(long, default_value = "auto", value_parser = parse_dtype)]
+    ///
+    /// Hidden: `auto` matches the checkpoint; forcing it degrades silently.
+    #[arg(long, default_value = "auto", value_parser = parse_dtype, hide = true)]
     pub dtype: mistralrs_core::ModelDType,
 
     #[command(flatten)]
@@ -391,18 +401,24 @@ pub enum ModelType {
 #[derive(clap::Args, Clone, Deserialize)]
 pub struct GlobalOptions {
     /// Random seed for reproducibility
-    #[arg(long, global = true)]
+    ///
+    /// Hidden: a reproducibility aid for evaluation runs, not a serving knob.
+    #[arg(long, global = true, hide = true)]
     #[serde(default)]
     pub seed: Option<u64>,
 
     /// Log all requests and responses to this file
-    #[arg(long, short, global = true)]
+    #[arg(long, short, global = true, help_heading = "Diagnostics")]
     #[serde(default)]
     pub log: Option<PathBuf>,
 
     /// Token source for HuggingFace authentication.
     /// Formats: `literal:<token>`, `env:<var>`, `path:<file>`, `cache`, `none`
-    #[arg(long, default_value = "cache", global = true, value_parser = parse_token_source)]
+    ///
+    /// Hidden: `arc login` populates the default `cache` source, which is the
+    /// right answer for every deployment that is not injecting a token by
+    /// another route.
+    #[arg(long, default_value = "cache", global = true, value_parser = parse_token_source, hide = true)]
     #[serde(default = "default_token_source")]
     pub token_source: TokenSource,
 }
@@ -410,38 +426,49 @@ pub struct GlobalOptions {
 /// Runtime options for inference
 #[derive(clap::Args, Clone, Deserialize)]
 pub struct RuntimeOptions {
-    /// Maximum concurrent sequences
-    #[arg(long, default_value_t = 32)]
+    /// How many requests may run concurrently.
+    #[arg(long, default_value_t = 32, help_heading = "Serving")]
     #[serde(default = "default_max_seqs")]
     pub max_seqs: usize,
 
     /// Disable KV cache entirely
-    #[arg(long)]
+    ///
+    /// Hidden: an ablation switch. Turning it on costs orders of magnitude of
+    /// decode throughput and reports no error.
+    #[arg(long, hide = true)]
     #[serde(default)]
     pub no_kv_cache: bool,
 
     /// Number of prefix caches to hold (0 to disable)
-    #[arg(long, default_value_t = 16)]
+    ///
+    /// Hidden: Arc sizes this. `0` silently disables prefix reuse, which looks
+    /// like a mysterious throughput regression rather than a setting.
+    #[arg(long, default_value_t = 16, hide = true)]
     #[serde(default = "default_prefix_cache_n")]
     pub prefix_cache_n: usize,
 
-    /// Custom chat template file (.json or .jinja)
-    #[arg(long, short)]
+    /// Override the model's chat template (.json or .jinja).
+    #[arg(long, short, help_heading = "Model")]
     #[serde(default)]
     pub chat_template: Option<PathBuf>,
 
     /// Explicit JINJA template override
-    #[arg(long, short)]
+    ///
+    /// Hidden: second spelling of --chat-template; a wrong template produces
+    /// fluent nonsense rather than an error.
+    #[arg(long, short, hide = true)]
     #[serde(default)]
     pub jinja_explicit: Option<PathBuf>,
 
     /// Enable web search (requires embedding model)
-    #[arg(long)]
+    ///
+    /// Hidden: an optional tool integration rather than a serving control.
+    #[arg(long, hide = true)]
     #[serde(default)]
     pub enable_search: bool,
 
     /// Search embedding model to use
-    #[arg(long, requires = "enable_search")]
+    #[arg(long, requires = "enable_search", hide = true)]
     #[serde(default)]
     pub search_embedding_model: Option<SearchEmbeddingModelArg>,
 
@@ -452,9 +479,29 @@ pub struct RuntimeOptions {
     /// model exposes an MTP head (currently DeepSeek V4 / V4 Flash). For models
     /// without an MTP head, a warning is logged and decode falls back to the
     /// non-speculative target. Recommended starting value for V4 Flash: 4.
-    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=8))]
+    ///
+    /// Hidden: speculative decoding is Arc's call to make per model, and a
+    /// model without an MTP head only warns before falling back — so the flag
+    /// can appear to work while changing nothing.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=8), hide = true)]
     #[serde(default)]
     pub mtp_depth: u8,
+
+    /// Let DeepSeek V4 decode a batch whose sequences are at different lengths.
+    ///
+    /// V4 does not use PagedAttention, so it runs on `DefaultScheduler`, which
+    /// by default buckets decode by sequence length and runs one bucket per
+    /// step — a batch of B sequences at B distinct lengths decodes one at a
+    /// time. This admits them together, front-aligning the shared KV cache and
+    /// masking each row's dead prefix.
+    ///
+    /// **Off by default.** The mechanism is covered by CPU identity tests but
+    /// has never been run on a GPU; turning it on is a change to what the
+    /// engine serves, not a probe. Equivalent to `ARC_V4_XS_PER_SEQ=1`, which
+    /// remains supported.
+    #[arg(long)]
+    #[serde(default)]
+    pub v4_ragged_decode: bool,
 }
 
 /// Search embedding model options
@@ -513,6 +560,7 @@ impl Default for RuntimeOptions {
             enable_search: false,
             search_embedding_model: None,
             mtp_depth: 0,
+            v4_ragged_decode: false,
         }
     }
 }

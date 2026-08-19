@@ -1,10 +1,6 @@
 use candle_core::{Result, Tensor};
-use mistralrs_quant::MatMul;
 
-use crate::{
-    attention::{repeat_kv, SdpaParams},
-    pipeline::text_models_inputs_processor::FlashParams,
-};
+use crate::{attention::SdpaParams, pipeline::text_models_inputs_processor::FlashParams};
 
 /// Fused attention with per-head sinks.
 ///
@@ -60,6 +56,34 @@ pub(crate) fn sinks_attn(
     sinks_attn_regular(q, k, v, sinks, mask, sdpa_params, window_size)
 }
 
+/// Is the fused head_dim=512 sinks path enabled? `ARC_FLASH_512=0|false|off|no`
+/// falls back to the unfused matmul + softmax_with_sinks path V4 ran before.
+///
+/// This exists so a fused-vs-unfused comparison is **one binary, one variable**.
+/// Comparing two binaries is how a pin A/B ended up measuring a different
+/// allocation population than the hypothesis was about — the arms differed in
+/// more ways than the one under test.
+///
+/// Named once per process at info, so an A/B can ASSERT it actually got two
+/// different behaviours rather than two identical arms reporting no difference.
+/// A flag whose name is wrong is indistinguishable from a flag that costs
+/// nothing.
+fn flash_512_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = !matches!(
+            std::env::var("ARC_FLASH_512").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        );
+        tracing::info!(
+            target: "arcflash",
+            "fused head_dim=512 sinks path is {} (ARC_FLASH_512)",
+            if on { "FUSED" } else { "UNFUSED" }
+        );
+        on
+    })
+}
+
 /// Non-varlen sinks attention: Q [B, H, q_len, D], K/V [B, kv_H, kv_len, D]
 #[allow(unused_variables)]
 fn sinks_attn_regular(
@@ -71,15 +95,70 @@ fn sinks_attn_regular(
     sdpa_params: &SdpaParams,
     window_size: usize,
 ) -> Result<Tensor> {
-    // R1: the CUDA/Metal flash-sinks kernels only support head_dim in
-    // {64,80,96,112,128,192,256}. V4 uses head_dim=512, which falls through
-    // to the unfused matmul + softmax_with_sinks path below (GPU-capable via
+    // The CUDA flash-sinks kernel now also instantiates head_dim=512 (V4:
+    // symmetric 512/512, MQA). METAL DOES NOT — its kernel still stops at 256
+    // (`metal/backend/paged_attention.rs:121`), so the Metal branch below is
+    // guarded separately and a 512 head on Metal still takes the unfused
+    // matmul + softmax_with_sinks path (GPU-capable via
     // SoftmaxWithSinks::cuda_fwd, same math as the old "cpu" fallback).
     let hd = q.dim(candle_core::D::Minus1)?;
-    let flash_sinks_ok = matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256);
+    // ⚠️ TWO BACKENDS, TWO ENVELOPES — this was ONE shared flag, and widening it
+    // for CUDA silently widened it for Metal too. Metal's sinks kernel stops at
+    // 256: `metal_kernels/mod.rs:3025` errors on any other head_dim, and
+    // `sdpa_with_sinks.metal` instantiates only {64,80,96,128,256}. Routing a
+    // 512 head there turns a working unfused fallback into a hard
+    // CompilationError. Each backend now advertises its own set.
+    let flash_sinks_ok_cuda =
+        matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256) || (hd == 512 && flash_512_enabled());
+    let flash_sinks_ok_metal = matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256);
+    #[cfg(not(feature = "cuda"))]
+    let _ = flash_sinks_ok_cuda;
+    #[cfg(not(feature = "metal"))]
+    let _ = flash_sinks_ok_metal;
+
+    // Name the backend, once per process.
+    //
+    // WHY THIS LINE EXISTS. Expert parallelism was priced on the belief that
+    // building with NCCL silently disables flash attention for V4, via
+    // `attention/mod.rs`'s `use_nccl() => naive_sdpa` gate — which would make
+    // any EP=2-vs-EP=1 comparison a comparison of two different attention
+    // kernels, and the measurement worthless. Reading the dispatch says
+    // otherwise for V4: `sdpa_params.sinks` is `Some` (V4 loads `attn_sink`),
+    // so `Sdpa::run_attention` diverts here on its FIRST line and the
+    // `use_nccl()` gate — which lives in `run_attention_noflash` — is never
+    // reached. Which of the two arms below a 512 head takes is itself a
+    // per-backend question (`flash_sinks_ok_cuda` admits 512 only under
+    // `flash_512_enabled()`; Metal's kernel stops at 256), which is one more
+    // reason to log the answer rather than argue it.
+    //
+    // That is a code read. Before anyone spends $9.22/hr on a 2xH100 pair to
+    // measure EP, this turns it into an observation: the log says which path
+    // the model on the box actually took. Emitted once, off the hot path.
+    {
+        static NAMED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        NAMED.get_or_init(|| {
+            let fused = (q.device().is_cuda() && flash_sinks_ok_cuda)
+                || (q.device().is_metal() && flash_sinks_ok_metal);
+            tracing::info!(
+                target: "arc_attention_backend",
+                "ARC_ATTN_BACKEND: sinks_attn head_dim={hd} \
+                 flash_sinks_ok_cuda={flash_sinks_ok_cuda} \
+                 flash_sinks_ok_metal={flash_sinks_ok_metal} \
+                 device={:?} => {} (the `use_nccl()` gate in \
+                 `run_attention_noflash` is NOT on this path)",
+                q.device().location(),
+                if fused {
+                    "fused flash-sinks kernel"
+                } else {
+                    "ArcFlash/Tile — unfused matmul + softmax_with_sinks"
+                },
+            );
+        });
+    }
 
     #[cfg(feature = "cuda")]
-    if q.device().is_cuda() && flash_sinks_ok {
+    if q.device().is_cuda() && flash_sinks_ok_cuda {
+        crate::attention::arcflash::note(crate::attention::arcflash::Path::VendorSinks);
         return mistralrs_paged_attn::flash_attn_sinks(
             q,
             k,
@@ -91,7 +170,8 @@ fn sinks_attn_regular(
     }
 
     #[cfg(feature = "metal")]
-    if q.device().is_metal() && flash_sinks_ok {
+    if q.device().is_metal() && flash_sinks_ok_metal {
+        crate::attention::arcflash::note(crate::attention::arcflash::Path::VendorSinks);
         return mistralrs_quant::flash_attn_sinks_metal(
             q,
             k,
@@ -102,7 +182,8 @@ fn sinks_attn_regular(
         );
     }
 
-    // CPU fallback: unfused matmul + softmax_with_sinks
+    // ArcFlash/Tile — the head_dim the vendor sinks kernel does not take.
+    // DeepSeek-V4's 512 is the whole reason this arm exists.
     sinks_attn_cpu(q, k, v, sinks, mask, sdpa_params)
 }
 
@@ -136,10 +217,22 @@ fn sinks_attn_varlen(
 
     // R1: head_dim guard (see sinks_attn_regular).
     let hd = q.dim(candle_core::D::Minus1)?;
-    let flash_sinks_ok = matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256);
+    // ⚠️ TWO BACKENDS, TWO ENVELOPES — this was ONE shared flag, and widening it
+    // for CUDA silently widened it for Metal too. Metal's sinks kernel stops at
+    // 256: `metal_kernels/mod.rs:3025` errors on any other head_dim, and
+    // `sdpa_with_sinks.metal` instantiates only {64,80,96,128,256}. Routing a
+    // 512 head there turns a working unfused fallback into a hard
+    // CompilationError. Each backend now advertises its own set.
+    let flash_sinks_ok_cuda =
+        matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256) || (hd == 512 && flash_512_enabled());
+    let flash_sinks_ok_metal = matches!(hd, 64 | 80 | 96 | 112 | 128 | 192 | 256);
+    #[cfg(not(feature = "cuda"))]
+    let _ = flash_sinks_ok_cuda;
+    #[cfg(not(feature = "metal"))]
+    let _ = flash_sinks_ok_metal;
 
     #[cfg(feature = "cuda")]
-    if device.is_cuda() && flash_sinks_ok {
+    if device.is_cuda() && flash_sinks_ok_cuda {
         return mistralrs_paged_attn::flash_attn_sinks_varlen(
             q,
             &k_packed,
@@ -153,7 +246,7 @@ fn sinks_attn_varlen(
     }
 
     #[cfg(feature = "metal")]
-    if device.is_metal() && flash_sinks_ok {
+    if device.is_metal() && flash_sinks_ok_metal {
         return mistralrs_quant::flash_attn_sinks_varlen_metal(
             q,
             &k_packed,
@@ -217,7 +310,21 @@ fn varlen_causal_mask(
     Tensor::from_vec(data, (1, 1, q_len, kv_len), device)?.to_dtype(dtype)
 }
 
-/// CPU fallback: unfused matmul + softmax_with_sinks
+/// Sinks attention on **ArcFlash/Tile** — the path every DeepSeek-V4 layer
+/// takes, because head_dim 512 is outside the fused sinks kernel's
+/// `{64,80,96,112,128,192,256}`.
+///
+/// This used to `repeat_kv` K and V to all `n_kv_groups` heads and materialize
+/// the full `[B, H, Tq, Tk]` score matrix twice. At V4's shape (MQA,
+/// `n_kv_groups = 64`, head_dim 512) that is ~856 MB for one layer at
+/// `Tk ≈ 1400` — which is why long prompts died rather than merely slowed.
+/// `union_attention` folds the expansion into a reshape and bounds the scores
+/// to one query tile; the numbers are unchanged (see `arcflash.rs`, and
+/// `fold_matches_repeat_kv_across_gqa_ratios` which pins it against exactly the
+/// implementation this replaced).
+///
+/// `sinks` arrives shaped `[1, n_heads, 1, 1]` from V4 (the layout the fused
+/// kernel wants); `union_attention` flattens and casts it to the logits dtype.
 fn sinks_attn_cpu(
     q: &Tensor,
     k: &Tensor,
@@ -226,18 +333,7 @@ fn sinks_attn_cpu(
     mask: Option<&Tensor>,
     sdpa_params: &SdpaParams,
 ) -> Result<Tensor> {
-    let k = repeat_kv(k.clone(), sdpa_params.n_kv_groups)?;
-    let v = repeat_kv(v.clone(), sdpa_params.n_kv_groups)?;
-
-    let att = MatMul.matmul_affine_mul(q, &k.t()?, sdpa_params.softmax_scale.into())?;
-    // R1: `softmax_with_sinks` expects sinks shaped [num_heads] AND matching the
-    // logits dtype. V4 pre-shapes sinks as [1, n_heads, 1, 1] in F32 (for the
-    // flash kernel), so flatten + cast to the logits dtype here. Then cast the
-    // softmax result back to V's dtype before the value matmul.
-    let sinks = sinks.flatten_all()?.to_dtype(att.dtype())?;
-    let att = mistralrs_quant::softmax_with_sinks(&att, &sinks, mask)?;
-    let att = att.to_dtype(v.dtype())?;
-    MatMul.matmul(&att, &v)
+    crate::attention::arcflash::union_attention(q, k, v, mask, Some(sinks), sdpa_params)
 }
 
 /// CPU fallback for varlen: per-sequence unfused loop.

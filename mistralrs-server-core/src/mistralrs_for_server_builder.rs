@@ -7,11 +7,10 @@ use candle_core::Device;
 use mistralrs_core::{
     get_auto_device_map_params, get_model_dtype, get_tgt_non_granular_index, paged_attn_supported,
     parse_isq_value, set_mtp_load_depth, try_wrap_pipeline_with_mtp, AutoDeviceMapParams,
-    DefaultSchedulerMethod,
-    DeviceLayerMapMetadata, DeviceMapMetadata, DeviceMapSetting, Loader, LoaderBuilder,
-    McpClientConfig, MemoryGpuConfig, MistralRsBuilder, ModelLoaderConfig, ModelSelected,
-    PagedAttentionConfig, PagedCacheType, SchedulerConfig, SearchCallback, SearchEmbeddingModel,
-    TokenSource,
+    DefaultSchedulerMethod, DeviceLayerMapMetadata, DeviceMapMetadata, DeviceMapSetting, Loader,
+    LoaderBuilder, McpClientConfig, MemoryGpuConfig, MistralRsBuilder, ModelLoaderConfig,
+    ModelSelected, PagedAttentionConfig, PagedCacheType, SchedulerConfig, SearchCallback,
+    SearchEmbeddingModel, TokenSource,
 };
 use tracing::{info, warn};
 
@@ -114,6 +113,9 @@ pub mod defaults {
     /// MTP speculative-decode depth. `0` disables MTP wrapping (default —
     /// preserves backward compatibility for users not opting in).
     pub const MTP_DEPTH: usize = 0;
+    /// Per-sequence ragged decode for DeepSeek V4. `false` (default) keeps the
+    /// shipped behaviour: the scheduler buckets decode by sequence length.
+    pub const V4_RAGGED_DECODE: bool = false;
 }
 
 /// A builder for creating a mistral.rs instance with configured options for the mistral.rs server.
@@ -257,6 +259,12 @@ pub struct MistralRsForServerBuilder {
     /// head (currently DeepSeek V4 only). Models without an MTP head log a
     /// warning and fall back to non-speculative decode.
     mtp_depth: usize,
+
+    /// Per-sequence ragged decode for DeepSeek V4 (`--v4-ragged-decode`).
+    ///
+    /// `false` (default) keeps the shipped behaviour. See
+    /// [`MistralRsForServerBuilder::with_v4_ragged_decode`].
+    v4_ragged_decode: bool,
 }
 
 impl Default for MistralRsForServerBuilder {
@@ -291,6 +299,7 @@ impl Default for MistralRsForServerBuilder {
             paged_cache_type: defaults::PAGED_CACHE_TYPE,
             paged_cache_type_explicit: false,
             mtp_depth: defaults::MTP_DEPTH,
+            v4_ragged_decode: defaults::V4_RAGGED_DECODE,
         }
     }
 }
@@ -619,6 +628,55 @@ impl MistralRsForServerBuilder {
         self
     }
 
+    /// Enables **per-sequence ragged decode** for DeepSeek V4.
+    ///
+    /// V4's loader reports `supports_paged_attention() == false`, so it never
+    /// reaches the PagedAttention scheduler and never saw the ragged-batching
+    /// fix that landed there. It runs on `DefaultScheduler`, which has a ragged
+    /// path of its own — gated on `kv_cache::ragged_decode_supported()`, which
+    /// for V4 comes down to whether its `XsRolling` compressor slots may carry
+    /// a per-row length. This turns that on.
+    ///
+    /// With it **off** (the default) the scheduler buckets decode by sequence
+    /// length and runs one bucket per step, so a batch of B sequences at B
+    /// distinct lengths decodes one at a time.
+    ///
+    /// **Default `false`, deliberately.** The mechanism is CPU-test-covered but
+    /// has never run on a GPU (`memory/mission/wave63-CO-xs-per-sequence.md` §6
+    /// records the outstanding A/B), and D14 bans a CPU-only correctness
+    /// verdict. Flip the default once that A/B has run, not before.
+    ///
+    /// `ARC_V4_XS_PER_SEQ=1` remains a fallback for the first read, so existing
+    /// scripts keep working; this is the surface new callers should use.
+    pub fn with_v4_ragged_decode(mut self, on: bool) -> Self {
+        self.v4_ragged_decode = on;
+        self
+    }
+
+    /// Latch the per-sequence `xs` capability before the engine can read it.
+    ///
+    /// Called from every `build*` path, next to `set_mtp_load_depth`, for the
+    /// same reason: the value has to be settled before anything downstream asks
+    /// for it, and a mid-run change would split one batch's behaviour between
+    /// its slots.
+    ///
+    /// A losing race is warned about, not fatal — the run is still coherent,
+    /// it just is not the configuration that was asked for, and saying so beats
+    /// either killing the process or serving a different setting in silence.
+    ///
+    /// A free function taking the `bool` rather than a `&self` method: the
+    /// `build*` bodies have already partially moved `self` by the point they
+    /// reach it, and a `Copy` field read is legal there where a whole-`self`
+    /// borrow is not.
+    fn apply_v4_ragged_decode(on: bool) {
+        if let Err(latched) = mistralrs_core::request_xs_per_sequence(on) {
+            tracing::warn!(
+                "V4 ragged decode was requested as {on} but is already latched to {latched} \
+                 (an earlier build, or ARC_V4_XS_PER_SEQ read first). Serving {latched}."
+            );
+        }
+    }
+
     /// Sets the MCP client configuration.
     pub fn with_mcp_config(mut self, mcp_config: McpClientConfig) -> Self {
         self.mcp_client_config = Some(mcp_config);
@@ -671,7 +729,7 @@ impl MistralRsForServerBuilder {
         let device = if let Some(device) = self.device {
             device
         } else {
-            init_device(self.cpu, self.seed)?
+            init_device(self.cpu, self.seed, self.paged_attn.unwrap_or(false))?
         };
 
         let mapper = init_mapper(&self.num_device_layers, &auto_device_map_params);
@@ -713,6 +771,7 @@ impl MistralRsForServerBuilder {
         // whether to load the full `mtp.0.*` decoder block (~3GB at FP8;
         // skipped entirely when `--mtp-depth 0`).
         set_mtp_load_depth(self.mtp_depth);
+        Self::apply_v4_ragged_decode(self.v4_ragged_decode);
 
         let pipeline: LoadedPipeline = loader.load_model_from_hf(
             None,
@@ -737,6 +796,21 @@ impl MistralRsForServerBuilder {
         // without an MTP head log a warning and continue with the bare target.
         // The helper is a no-op when `mtp_depth == 0`.
         let pipeline = try_wrap_pipeline_with_mtp(pipeline, self.mtp_depth);
+
+        // Report the resolved subsystem state now that every auto-fallback has
+        // run — see `log_arcserve_summary` for why this reads the pipeline back
+        // instead of restating the requested configuration.
+        {
+            let meta = pipeline.lock().await.get_metadata();
+            log_arcserve_summary(
+                meta.cache_config
+                    .as_ref()
+                    .map(|c| (c.cache_type, c.num_gpu_blocks, c.block_size)),
+                meta.no_kv_cache,
+                meta.no_prefix_cache,
+                self.max_seqs,
+            );
+        }
 
         let scheduler_config = init_scheduler_config(&cache_config, &pipeline, self.max_seqs).await;
 
@@ -800,7 +874,7 @@ impl MistralRsForServerBuilder {
         let device = if let Some(device) = self.device {
             device
         } else {
-            init_device(self.cpu, self.seed)?
+            init_device(self.cpu, self.seed, self.paged_attn.unwrap_or(false))?
         };
 
         // Create the first model's pipeline
@@ -853,6 +927,7 @@ impl MistralRsForServerBuilder {
 
         // Declare the MTP draft depth BEFORE load (see `build_single_model`).
         set_mtp_load_depth(self.mtp_depth);
+        Self::apply_v4_ragged_decode(self.v4_ragged_decode);
 
         let pipeline: LoadedPipeline = loader.load_model_from_hf(
             None,
@@ -972,6 +1047,7 @@ impl MistralRsForServerBuilder {
             // Declare the MTP draft depth BEFORE load (see
             // `build_single_model`).
             set_mtp_load_depth(self.mtp_depth);
+            Self::apply_v4_ragged_decode(self.v4_ragged_decode);
 
             let pipeline: LoadedPipeline = loader.load_model_from_hf(
                 None,
@@ -1077,9 +1153,61 @@ impl MistralRsForServerBuilder {
     }
 }
 
+/// Whether ArcGraph's capture stream is on when `ARC_CAPTURE_STREAM` is unset.
+///
+/// **Still `false`, deliberately.** Steps 2b (address-stable inputs) and 3
+/// (replay output used, gated behind a verified eager comparison) have landed,
+/// but no hardware run has yet shown a replay whose logits match eager. Turning
+/// this on before that evidence exists would repeat wave49-BZ / PR #76 exactly:
+/// `ARC_V4_FP8_KV` shipped defaulted-on without ever running on a GPU and every
+/// V4 forward died for a day.
+///
+/// It is a named constant rather than a literal so flipping it is one line plus
+/// the test below, once `ARC_GRAPH_VERIFY_REPLAYS` has passed on real hardware.
+const CAPTURE_STREAM_DEFAULT: bool = false;
+
+/// Should candle bind a capturable (non-default) CUDA stream?
+///
+/// ArcGraph cannot capture on the legacy default stream — CUDA forbids it — so
+/// without this the runner initialises and then does nothing. But a non-default
+/// stream is not free: it conflicts with **NCCL**, and with **PagedAttention**'s
+/// device expectations (`device_map::get_all_similar_devices`). It also changes
+/// behaviour for every non-graph user, because `new_cuda_with_stream` disables
+/// cudarc event tracking and binds a persistent cuBLAS workspace.
+///
+/// Hence a decision, not a constant:
+/// * `ARC_CAPTURE_STREAM=1` — force on, even under paged attention. The
+///   operator's explicit choice wins; that is what an escape hatch is for.
+/// * `ARC_CAPTURE_STREAM=0` — force off. Needed because the default may flip.
+/// * unset — [`CAPTURE_STREAM_DEFAULT`], and only when neither NCCL nor paged
+///   attention is in play.
+///
+/// `paged_attn_requested` is the *requested* setting, not the resolved one:
+/// `configure_paged_attn` runs after the device is chosen and takes the device
+/// as input, so the resolved value is not available here and depending on it
+/// would be circular.
+pub(crate) fn use_capture_stream(
+    env_override: Option<&str>,
+    nccl: bool,
+    paged_attn_requested: bool,
+) -> bool {
+    match env_override {
+        Some("1") => true,
+        Some("0") => false,
+        // Anything else set (including "") is treated as unset rather than as
+        // truthy: `ARC_V4_FP8_KV` shipped as `!(v == "0")`, so *unset* meant
+        // *on*, and that is the bug that killed every V4 forward for a day.
+        _ => CAPTURE_STREAM_DEFAULT && !nccl && !paged_attn_requested,
+    }
+}
+
 // TODO: replace with best device?
 /// Initializes the device to be used for computation, optionally forcing CPU usage and setting a seed.
-fn init_device(force_cpu: bool, seed: Option<u64>) -> Result<candle_core::Device> {
+fn init_device(
+    force_cpu: bool,
+    seed: Option<u64>,
+    paged_attn_requested: bool,
+) -> Result<candle_core::Device> {
     #[cfg(feature = "metal")]
     let device = if force_cpu {
         Device::Cpu
@@ -1092,7 +1220,11 @@ fn init_device(force_cpu: bool, seed: Option<u64>) -> Result<candle_core::Device
         Device::Cpu
     } else if mistralrs_core::distributed::use_nccl() {
         Device::Cpu
-    } else if std::env::var_os("ARC_CAPTURE_STREAM").is_some() {
+    } else if use_capture_stream(
+        std::env::var("ARC_CAPTURE_STREAM").ok().as_deref(),
+        false, // the NCCL arm above already returned
+        paged_attn_requested,
+    ) {
         // CUDA-graph capture (RUN-161 Step 2) needs candle to run on a
         // non-default, *capturable* stream. Upstream candle's `new_cuda`
         // (via `cuda_if_available`) binds the legacy default stream (NULL),
@@ -1153,6 +1285,60 @@ fn init_mapper(
     } else {
         DeviceMapSetting::Auto(auto_device_map_params.clone())
     }
+}
+
+/// Logs the **resolved** state of every Arc subsystem a user can be surprised by,
+/// after the model is loaded and every auto-fallback has already run.
+///
+/// D18: a subsystem may only be named here if it is actually active *for this
+/// model on this device*. Requested-but-not-engaged states are reported as
+/// `off`, with the reason, rather than being silently omitted or optimistically
+/// claimed. Two concrete regressions motivated this:
+///
+///  * `arc-cli` printed "TurboQuant 3.5-bit KV cache compression (lossless,
+///    default)" as a fixed banner string before any model was loaded — false
+///    for every MLA model and every `head_dim != 128`, which is nearly all of
+///    them, and "lossless" was never measured.
+///  * `arc_cuda_graph` logged "runner initialized" immediately after
+///    "capture disabled".
+///
+/// The rule this encodes: read the resolved value back out of the loaded
+/// pipeline; never restate the requested value as if it were the outcome.
+fn log_arcserve_summary(
+    resolved_cache: Option<(PagedCacheType, usize, usize)>,
+    no_kv_cache: bool,
+    no_prefix_cache: bool,
+    max_seqs: usize,
+) {
+    // KV cache: report what `resolve_for_model` actually settled on, not what
+    // `defaults::PAGED_CACHE_TYPE` asked for.
+    let kv = match resolved_cache {
+        Some((cache_type, num_gpu_blocks, block_size)) => {
+            let name = match cache_type {
+                PagedCacheType::Auto => "unquantized",
+                PagedCacheType::F8E4M3 => "fp8-e4m3",
+                PagedCacheType::TurboQuant => "turboquant K4/V3",
+                PagedCacheType::TurboQuant3 => "turboquant K3/V3",
+                PagedCacheType::TurboQuantAggressive => "turboquant K3/V2",
+            };
+            format!("paged ({name}, {num_gpu_blocks} blocks x {block_size} tokens)")
+        }
+        None if no_kv_cache => "disabled (--no-kv-cache)".to_string(),
+        None => "eager (paged attention off)".to_string(),
+    };
+
+    // Prefix caching is switched off downstream by the engine for any cache
+    // type that cannot be gathered; say so here rather than letting the user
+    // infer it from a throughput number.
+    let prefix = if no_prefix_cache {
+        "off"
+    } else if resolved_cache.is_some_and(|(t, _, _)| !t.supports_prefix_cache()) {
+        "off (cache type cannot be gathered)"
+    } else {
+        "on"
+    };
+
+    info!("ArcServe: kv-cache={kv}, prefix-cache={prefix}, max-seqs={max_seqs}");
 }
 
 /// Logs hardware feature information and the model's sampling strategy and kind.
@@ -1311,5 +1497,64 @@ pub fn get_search_embedding_model(
         Some(search_embedding_model.unwrap_or_default())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod capture_stream_tests {
+    use super::{use_capture_stream, CAPTURE_STREAM_DEFAULT};
+
+    /// The default is OFF and must stay OFF until a hardware run shows a replay
+    /// whose logits match eager. This test is the tripwire for that flip: change
+    /// `CAPTURE_STREAM_DEFAULT` and this fails, forcing whoever does it to say
+    /// what evidence they have.
+    #[test]
+    fn default_is_off_until_hardware_proves_replay() {
+        assert!(!CAPTURE_STREAM_DEFAULT, "flipping this needs a measured replay-vs-eager match");
+        assert!(!use_capture_stream(None, false, false));
+    }
+
+    #[test]
+    fn explicit_one_forces_on_even_under_paged_attn_or_nccl() {
+        // The operator's explicit choice wins — that is what an escape hatch is
+        // for. They may be measuring exactly that interaction.
+        assert!(use_capture_stream(Some("1"), false, false));
+        assert!(use_capture_stream(Some("1"), true, false));
+        assert!(use_capture_stream(Some("1"), false, true));
+    }
+
+    #[test]
+    fn explicit_zero_forces_off() {
+        assert!(!use_capture_stream(Some("0"), false, false));
+    }
+
+    /// THE wave49-BZ / PR #76 BUG IN TEST FORM. `ARC_V4_FP8_KV` shipped as
+    /// `!(v == "0")`, so *unset* meant *on*, and every V4 forward died for a
+    /// day. An experiment flag must never be able to turn itself on.
+    ///
+    /// Mutation: widen the fallthrough to `env_override.is_some()` and every row
+    /// here fails.
+    #[test]
+    fn only_exactly_one_enables_nothing_else_is_truthy() {
+        for v in ["", "true", "yes", "on", " 1", "1 ", "TRUE", "2"] {
+            assert!(
+                !use_capture_stream(Some(v), false, false),
+                "{v:?} must not enable the capture stream"
+            );
+        }
+    }
+
+    /// Once the default flips, NCCL and paged attention must still veto it —
+    /// a non-default stream conflicts with both.
+    #[test]
+    fn nccl_and_paged_attn_veto_the_default() {
+        // Written against the predicate rather than the current constant, so it
+        // keeps its meaning after the flip.
+        fn defaulted(nccl: bool, paged: bool) -> bool {
+            use_capture_stream(None, nccl, paged)
+        }
+        assert!(!defaulted(true, false));
+        assert!(!defaulted(false, true));
+        assert!(!defaulted(true, true));
     }
 }

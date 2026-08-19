@@ -848,20 +848,20 @@ d:"The fast O(d log d) way to apply that rotation, instead of an O(d²) dense ma
 a:"A folding trick that shuffles the deck in one motion rather than card by card.",
 arc:"**Shipped — it is the rotation step inside TurboQuant** (`mistralrs-quant/src/turboquant/wht.rs`), and the reason TurboQuant does not need explicit outlier channels.",gap:0,lev:0},
 
-{t:"TurboQuant",g:"Compression",o:"arc",s:["kv","bake"],st:"off",m:["size","agg"],k:"KV cache compression lloyd-max ICLR 2026 K4V3 arc headline",
+{t:"TurboQuant",g:"Compression",o:"arc",s:["kv","bake"],st:"shipped",m:["size","agg"],k:"KV cache compression lloyd-max ICLR 2026 K4V3 arc headline",
 d:"Arc's own KV cache compression: rotate with a Walsh-Hadamard transform, then quantize each coordinate against a Lloyd-Max codebook fitted to the resulting Gaussian.",
 a:"Flattening the crowd so everyone fits in standard-size seats, instead of building one enormous seat for the tallest person.",
-arc:"**Arc's headline innovation, and the honest status is uncomfortable: shipped as the default `PagedCacheType`, but it does not run on V4-Flash.** It lives on the PagedAttention path, and V4 reports `supports_paged_attention=false`; its CUDA kernels are specialized for head dims 64/128/256 and V4's is 512. **Every V4 number on this page was measured without it.** It was validated at 4.27× on Qwen3-32B/H100. Also: it disables prefix caching while active (PR #4), and no LongBench run was ever done.",gap:4,lev:4},
+arc:"**Arc's headline innovation, and the honest status is uncomfortable: shipped as the default `PagedCacheType`, but it does not run on V4-Flash.** It lives on the PagedAttention path, and V4 reports `supports_paged_attention=false`; its CUDA kernels are specialized for head dims 64/128/256 and V4's is 512. **Every V4 number on this page was measured without it.** What it *has* behind it: one end-to-end serving run — Qwen3-32B on a B200, 55 tok/s, correct output (`4eba13905`, 2026-04-06). What it does **not**: the 4.27× once quoted as 'validated on Qwen3-32B/H100' is **format arithmetic, retracted** — no run has ever produced a KV compression figure — and no LongBench or other quality eval was ever done. Also: it disables prefix caching while active (PR #4).",gap:4,lev:4},
 
-{t:"TurboQuant K4/V3 (3.5-bit)",g:"Compression",o:"arc",s:["kv"],st:"off",m:["size","agg"],k:"default preset 4-bit keys 3-bit values lossless 2.2x",
+{t:"TurboQuant K4/V3 (3.5-bit)",g:"Compression",o:"arc",s:["kv"],st:"shipped",m:["size","agg"],k:"default preset 4-bit keys 3-bit values lossless 2.2x",
 d:"The production default: 4-bit keys, 3-bit values, 116 bytes per token per head against a 256-byte baseline.",
 a:"The setting the manufacturer ships, because it is the one that does not lose anything.",
-arc:"Shipped as the default preset, **2.2× compression at zero quality loss** on the original evaluation. Not reachable on V4 today.",gap:0,lev:0},
+arc:"The default preset, and the only one that has ever executed on hardware (Qwen3-32B, B200, 55 tok/s, correct output). The **2.2× is format arithmetic**, not a measured ratio, and **'zero quality loss' is the paper's result on the paper's model** — Arc has run no quality evaluation. Not reachable on V4 today.",gap:0,lev:0},
 
 {t:"TurboQuant K3/V3 and K3/V2",g:"Compression",o:"arc",s:["kv"],st:"off",m:["size"],k:"balanced aggressive preset 2.56x 4.1x longbench",
 d:"The balanced (3.0-bit, 2.56×) and aggressive (2.5-bit, 4.1×) presets.",
 a:"Turning the compression dial past the point the manufacturer recommends, on purpose.",
-arc:"Both shipped as presets; ~0.1% and ~1.2% LongBench loss respectively. Same V4 reachability caveat.",gap:0,lev:0},
+arc:"Both shipped as presets, and **neither has ever executed on hardware** — they are never a default anywhere, so nothing selects them without an explicit `--pa-cache-type`. The ~0.1% and ~1.2% LongBench losses are **the paper's figures**, not Arc measurements. Same V4 reachability caveat.",gap:0,lev:0},
 
 {t:"Lloyd-Max codebook",g:"Compression",o:"ind",s:["kv"],st:"shipped",m:["size","qual"],k:"optimal scalar quantizer centroids boundaries",
 d:"The provably optimal set of quantization levels for a known distribution — which is exactly what the rotation gives you.",

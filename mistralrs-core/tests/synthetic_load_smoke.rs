@@ -773,8 +773,13 @@ fn v4_mtp_draft_depends_on_the_target_hidden_state_not_only_the_token() {
         .take()
         .expect("an armed MTP kit must capture the target's hidden states");
     assert_eq!(
-        start_pos, 0,
+        start_pos.row(0),
+        Some(0),
         "the capture must be tagged with the absolute position of its first row"
+    );
+    assert!(
+        start_pos.describes(1),
+        "a one-row forward's capture must describe one row"
     );
     assert_eq!(
         captured.dims(),
@@ -2967,4 +2972,308 @@ fn glm5_synthetic_load_smoke() {
         "GLM-5 logits shape mismatch — Glm4Moe lm_head contract drift?",
     );
     assert_finite(&logits, "GLM-5 / GLM-4.5 (GLM4Moe-backed)");
+}
+
+// ===========================================================================
+// V4 WINDOWED RAW-KV STORE (`ARC_V4_KV_WINDOW`)
+// ===========================================================================
+//
+// Parent system: ArcInfer / ArcKV.
+//
+// V4 keeps `head_dim` K plus a 1-wide V marker per token per layer
+// (`V4_V_MARKER_WIDTH`) — 1026 B/token/layer, 44,118 B/token across 43
+// layers. Every layer, at every compress ratio, reads only the trailing
+// `t_q + sliding_window - 1` of them (`dsv4_attention::raw_keep_span`); the
+// distant context is served by the compressor, which reads hidden states from
+// a SEPARATE `XsRolling` slot and never touches raw K. So the raw store above
+// the window is provably dead weight, and `SingleCache::retain_window` drops
+// it.
+//
+// These three tests are the whole safety argument, in the order it has to be
+// made:
+//
+//   1. `..._is_blind_to_keys_outside_the_window` — the *teeth*. On the FULL
+//      store, corrupting a key inside the window must move the logits and
+//      corrupting one outside it must not. If the fixture were degenerate
+//      (the all-zeros `v4::synthetic_v4_weights`, where every token has the
+//      same embedding and therefore the same K) the first half is unfalsifiable
+//      and this test fails. It also establishes the invariant directly, on the
+//      real model, rather than by reading `raw_keep_span`.
+//   2. `..._is_output_identical` — the guard. Same schedule with the window on
+//      and off, bit-identical logits at every step, with the eviction asserted
+//      so it cannot pass by never having windowed.
+//   3. `..._past_the_reachable_span_is_refused` — over-eviction is a loud
+//      error, not a truncated window.
+//
+// The fixture is `v4_compress`, which carries all three layer classes
+// (Standard / CSA ratio-4 / HCA ratio-128) with `patterned` weights.
+
+/// `set_v4_kv_window` is process-wide. Poison-tolerant, like `MTP_GATE_LOCK`.
+static V4_KV_WINDOW_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn v4_kv_window_guard() -> std::sync::MutexGuard<'static, ()> {
+    V4_KV_WINDOW_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// Window small enough that compaction is reached in a test-sized run:
+/// `SingleCache` compacts once the absolute length passes
+/// `window + RETAIN_WINDOW_MARGIN + RETAIN_WINDOW_CHUNK`.
+const V4W_WINDOW: usize = 16;
+const V4W_PREFILL_T: usize = 40;
+
+/// Total length, chosen to pass the first compaction boundary with margin.
+fn v4w_decode_steps() -> usize {
+    let first_compaction =
+        V4W_WINDOW + mistralrs_core::RETAIN_WINDOW_MARGIN + mistralrs_core::RETAIN_WINDOW_CHUNK;
+    first_compaction + 10 - V4W_PREFILL_T
+}
+
+fn v4w_prompt() -> Vec<u32> {
+    (0..V4W_PREFILL_T)
+        .map(|i| ((i * 17 + 3) % v4_compress::VOCAB_SIZE) as u32)
+        .collect()
+}
+
+fn v4w_next(step: usize) -> u32 {
+    ((step * 29 + 11) % v4_compress::VOCAB_SIZE) as u32
+}
+
+fn v4w_load() -> Box<dyn NormalModel + Send + Sync> {
+    v4c_load_with(V4W_WINDOW, 1024)
+}
+
+/// Prefill + `steps` single-token decodes, returning every step's last-token
+/// logits.
+fn v4w_run(model: &(dyn NormalModel + Send + Sync), steps: usize) -> Vec<Vec<f32>> {
+    let device = Device::Cpu;
+    let prompt = v4w_prompt();
+    let ids = Tensor::from_vec(prompt, (1, V4W_PREFILL_T), &device).unwrap();
+    let mut out = vec![v4c_row(&v4c_step(model, &ids, 0).expect("V4 prefill"), 0)];
+    for s in 0..steps {
+        let ids = Tensor::from_vec(vec![v4w_next(s)], (1, 1), &device).unwrap();
+        let logits = v4c_step(model, &ids, V4W_PREFILL_T + s).expect("V4 decode");
+        out.push(v4c_row(&logits, 0));
+    }
+    out
+}
+
+/// Index of the first `KvCache::Normal` (raw K/V) slot — V4 layer 0, the
+/// Standard (ratio-0) layer. The `XsRolling` compressor slots come after the
+/// K/V ones (`DeepSeekV4::new`).
+const V4W_KV_LAYER: usize = 0;
+
+/// Overwrite physical rows `[from, to)` of layer `V4W_KV_LAYER`'s stored K
+/// with a value nothing in the fixture would produce. Returns the layer's
+/// cached length so the caller can name its ranges against it.
+fn v4w_corrupt_keys(model: &mut Box<dyn NormalModel + Send + Sync>, from: usize, to: usize) {
+    let mut cache = model.cache_mut().normal();
+    let KvCache::Normal { k, .. } = &mut cache.0[V4W_KV_LAYER] else {
+        panic!("V4 KV slot {V4W_KV_LAYER} is not Normal");
+    };
+    let ad = k.all_data.as_ref().expect("cache materialised by the run");
+    let mut shape = ad.dims().to_vec();
+    shape[k.dim] = to - from;
+    let poison = Tensor::full(40.0f32, shape, ad.device())
+        .unwrap()
+        .to_dtype(ad.dtype())
+        .unwrap();
+    ad.slice_set(&poison, k.dim, from).unwrap();
+}
+
+/// The layer's cached length.
+fn v4w_cached_len(model: &mut Box<dyn NormalModel + Send + Sync>) -> usize {
+    model.cache_mut().normal().0[V4W_KV_LAYER].current_seq_len()
+}
+
+/// Plain bit-identity, with the compared quantity named. `v4c_assert_bit_identical`
+/// carries batch-mate-leak wording that would misdescribe a store-layout
+/// divergence.
+fn v4w_assert_identical(actual: &[f32], expected: &[f32], what: &str) {
+    assert_eq!(actual.len(), expected.len(), "{what}: logit width changed");
+    let diff = v4c_max_diff(actual, expected);
+    assert!(
+        diff == 0.0,
+        "{what}: the windowed KV store is NOT output-identical to the full one \
+         (max abs diff {diff}). Both paths hand `dsv4_attention` the same values \
+         for the same columns, so any divergence is a real one — check \
+         `raw_prefix` against `SingleCache::first_cached`."
+    );
+}
+
+/// **The teeth.** Corrupting a raw key the sliding window can still reach must
+/// change the answer; corrupting one it cannot must not.
+///
+/// The second half is the correctness argument for windowing, established on
+/// the real model instead of by reading the mask. The FIRST half is what makes
+/// the identity guard below non-vacuous: on a degenerate fixture (equal K for
+/// every position, or zero output weights) both halves would pass trivially,
+/// and an identity assertion would prove nothing.
+#[test]
+fn v4_attention_is_blind_to_keys_outside_the_window() {
+    let _gate = v4_kv_window_guard();
+    mistralrs_core::set_v4_kv_window(false);
+
+    let steps = 4usize;
+    let baseline = {
+        let model = v4w_load();
+        v4w_run(model.as_ref(), steps + 1)
+    };
+
+    let ids = Tensor::from_vec(vec![v4w_next(steps)], (1, 1), &Device::Cpu).unwrap();
+
+    // (a) The whole out-of-window prefix — EXACTLY the set `retain_window`
+    // evicts. The next query reaches back `1 + V4W_WINDOW - 1` raw keys, so
+    // every one of these is `-inf` on every row.
+    let mut model = v4w_load();
+    let _ = v4w_run(model.as_ref(), steps);
+    let live = v4w_cached_len(&mut model);
+    v4w_corrupt_keys(&mut model, 0, live - V4W_WINDOW);
+    let after_distant = v4c_row(
+        &v4c_step(model.as_ref(), &ids, V4W_PREFILL_T + steps)
+            .expect("decode after distant poison"),
+        0,
+    );
+    v4c_assert_bit_identical(
+        &after_distant,
+        &baseline[steps + 1],
+        "corrupting every key OUTSIDE the sliding window moved the logits — the \
+         window mask is not doing what `raw_keep_span` claims, and evicting \
+         those keys would NOT be an identity",
+    );
+
+    // (b) The window itself, the complement of (a). Same fixture, same
+    // schedule, same number of poisoned rows' worth of magnitude — the ONLY
+    // difference is which side of the window boundary they sit on.
+    let mut model = v4w_load();
+    let _ = v4w_run(model.as_ref(), steps);
+    v4w_corrupt_keys(&mut model, live - V4W_WINDOW, live);
+    let after_near = v4c_row(
+        &v4c_step(model.as_ref(), &ids, V4W_PREFILL_T + steps).expect("decode after nearby poison"),
+        0,
+    );
+    let moved = v4c_max_diff(&after_near, &baseline[steps + 1]);
+    let tol = v4c_tol(&baseline[steps + 1]);
+    assert!(
+        moved > 10.0 * tol,
+        "corrupting every key INSIDE the sliding window moved the logits by only \
+         {moved} (tolerance {tol}): this fixture cannot see the keys it is being \
+         asked to reason about, so the identity guard built on it is vacuous"
+    );
+}
+
+/// **The guard.** The windowed store must be output-identical to the full one,
+/// across prefill and a decode run long enough to compact at least once.
+///
+/// Bit-identical, not close: both paths hand `dsv4_attention` the same values
+/// for the same columns, so any divergence is a real one.
+#[test]
+fn v4_windowed_kv_store_is_output_identical() {
+    let _gate = v4_kv_window_guard();
+    let steps = v4w_decode_steps();
+
+    mistralrs_core::set_v4_kv_window(false);
+    let full = {
+        let mut model = v4w_load();
+        let out = v4w_run(model.as_ref(), steps);
+        let cache = model.cache_mut().normal();
+        assert_eq!(
+            cache.0[V4W_KV_LAYER].first_cached(),
+            0,
+            "the window is off; nothing may have been evicted"
+        );
+        out
+    };
+
+    mistralrs_core::set_v4_kv_window(true);
+    let (windowed, first_cached, resident, total) = {
+        let mut model = v4w_load();
+        let out = v4w_run(model.as_ref(), steps);
+        let cache = model.cache_mut().normal();
+        let slot = &cache.0[V4W_KV_LAYER];
+        let KvCache::Normal { k, .. } = slot else {
+            panic!("V4 KV slot is not Normal");
+        };
+        (
+            out,
+            slot.first_cached(),
+            k.physical_seq_len(),
+            slot.current_seq_len(),
+        )
+    };
+    mistralrs_core::set_v4_kv_window(false);
+
+    // Without this the identity below could hold because nothing was ever
+    // windowed — the exact way the pre-existing `v4_e2e` guards went vacuous.
+    assert!(
+        first_cached > 0,
+        "the run never reached a compaction boundary ({total} tokens, window \
+         {V4W_WINDOW}); this guard has no teeth"
+    );
+    assert!(
+        resident < total,
+        "the windowed store retained the whole sequence ({resident} of {total})"
+    );
+    assert!(
+        resident >= V4W_WINDOW,
+        "the windowed store dropped below its own attention window: {resident} < {V4W_WINDOW}"
+    );
+
+    assert_eq!(full.len(), windowed.len());
+    for (step, (a, b)) in full.iter().zip(windowed.iter()).enumerate() {
+        v4w_assert_identical(
+            b,
+            a,
+            &format!("windowed vs full KV store, step {step} of {steps}"),
+        );
+    }
+}
+
+/// Retaining LESS than the reachable span is refused by name, not answered
+/// with a silently truncated window.
+///
+/// Driven by evicting past what the policy would, because the policy itself
+/// cannot produce this state — which is the point: if some future caller
+/// mis-sizes the retention, the failure is an error at the first forward, not
+/// a quietly wrong distribution.
+#[test]
+fn v4_over_eviction_past_the_reachable_span_is_refused() {
+    let _gate = v4_kv_window_guard();
+    mistralrs_core::set_v4_kv_window(true);
+
+    let mut model = v4w_load();
+    let _ = v4w_run(model.as_ref(), 4);
+    {
+        let mut cache = model.cache_mut().normal();
+        for slot in cache.0.iter_mut() {
+            let KvCache::Normal { k, v } = slot else {
+                continue;
+            };
+            // Keep far fewer rows than `1 + window - 1` — the span the next
+            // decode step reaches over.
+            let keep = 2usize;
+            for sc in [k, v] {
+                let ad = sc.all_data.as_ref().unwrap().clone();
+                let physical = sc.physical_seq_len();
+                let kept = ad
+                    .narrow(sc.dim, physical - keep, keep)
+                    .unwrap()
+                    .contiguous()
+                    .unwrap();
+                sc.all_data = Some(kept);
+                sc.capacity_seq_len = keep;
+                sc.first_cached = sc.current_seq_len - keep;
+            }
+        }
+    }
+    let ids = Tensor::from_vec(vec![v4w_next(4)], (1, 1), &Device::Cpu).unwrap();
+    let err = v4c_step(model.as_ref(), &ids, V4W_PREFILL_T + 4)
+        .expect_err("a store capped below the reachable span must be refused")
+        .to_string();
+    mistralrs_core::set_v4_kv_window(false);
+    assert!(
+        err.contains("are NOT") || err.contains("too small for"),
+        "expected a loud unreachable-prefix refusal, got: {err}"
+    );
 }

@@ -201,8 +201,36 @@ impl PagedAttention {
                 .get(&device.location())
                 .unwrap();
 
-            // For TurboQuant prefix cache, gather and dequantize is not yet supported.
-            // Fall through to standard gather for now.
+            // 🔑 The other half of the TurboQuant / prefix-cache conflict, and
+            // the half that is reached only if the first half is bypassed.
+            //
+            // `Engine::new` disables prefix caching whenever the cache type is
+            // TurboQuant (`engine/mod.rs:246`), so this branch should be
+            // unreachable under a TurboQuant cache. "Should be" is not a
+            // guarantee: `num_cached_tokens` is set by the paged scheduler, not
+            // by the engine flag, so any future path that populates it without
+            // consulting `supports_prefix_cache` lands here. What used to
+            // happen then was a *fall-through* to the standard gather — which
+            // reads packed 4-bit/3-bit codebook indices as if they were
+            // activation-precision K/V, ignores the norms entirely, and would
+            // surface (if at all) as a dtype complaint from three frames down.
+            //
+            // Refuse by name instead. This is a diagnostic, not a fix: the fix
+            // is a dequantize-on-gather kernel, and until it exists the honest
+            // behaviour is to say which two features collided.
+            if self.is_turboquant() {
+                candle_core::bail!(
+                    "PagedAttention: a prefix-cache hit reached the gather path with a \
+                     TurboQuant KV cache, which cannot serve one — the blocks are packed \
+                     codebook indices whose norms live in separate tensors, and \
+                     `gather_kv_cache` has neither a dequantize path nor a norms argument. \
+                     Prefix caching is supposed to have been disabled at startup for this \
+                     cache type (`engine/mod.rs`, `PagedCacheType::prefix_cache_conflict`); \
+                     reaching here means something populated `num_cached_tokens` without \
+                     consulting it. Run with `--pa-cache-type auto` to use prefix caching."
+                );
+            }
+
             let (k_gathered, v_gathered) = mistralrs_paged_attn::gather_kv_cache(
                 key_cache.as_ref().unwrap(),
                 value_cache.as_ref().unwrap(),

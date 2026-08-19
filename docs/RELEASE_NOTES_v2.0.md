@@ -37,22 +37,36 @@ The release is built on five pieces:
    `--isq qtip2`; qtip2b is the rung the batched-serving path (grouped-GEMM,
    autotuned GEMV) is built around.
 
-3. **TurboQuant KV cache (K4/V3, 3.5-bit average) — implemented, never
-   measured.** Arc's Rust implementation of Zandieh et al. (ICLR'26) with a
+3. **TurboQuant KV cache (K4/V3, 3.5-bit average) — shipped as the paged
+   default; served once on hardware; compression ratio and quality still
+   unmeasured.** Arc's Rust implementation of Zandieh et al. (ICLR'26) with a
    fused-kernel attention path.
 
-   🔴 **Retraction.** Earlier drafts of these notes described **"4.27× context
+   🔴 **Retraction, unchanged.** Earlier drafts described **"4.27× context
    capacity, measured end-to-end (Qwen3-32B on one H100, 39K → 169K tokens)"**.
-   That was wrong. **4.27× is format arithmetic** — bytes per token at 3.5 bits
-   versus BF16 — and **was never produced by a forward pass on any GPU**. No
-   TurboQuant measurement exists anywhere in this repo's record, on any model.
-   The ratio is retained below only as **[projected]**.
+   **4.27× is format arithmetic** — bytes per token at 3.5 bits versus BF16 —
+   and **was never produced by a forward pass on any GPU**. Retained below only
+   as **[projected]**.
 
-   Ship state: TurboQuant is **off by default** (opt-in via
-   `ARC_TURBOQUANT_KV=1`); the paged kernel exists at **head_dim 128 only**;
-   there is **no head_dim-512 kernel**, so **DeepSeek V4 Flash cannot use
-   TurboQuant at all**, independently of the fact that MLA models fall back to
-   the standard KV path.
+   🔵 **Counter-correction (2026-08-17).** The retraction above used to carry a
+   further sentence — *"No TurboQuant measurement exists anywhere in this
+   repo's record, on any model"* — and **that was false**. Commit
+   `4eba13905` (2026-04-06): **55 tok/s with TurboQuant on a B200**, correct
+   output, serving Qwen3-32B through `deploy/modal_b200.py`. Eight CUDA
+   correctness defects were found on that hardware on 2026-04-02. **What it
+   covers:** b=1, one card, one model, head_dim 128, `Default` preset. **What
+   it does not:** the "46% over Candle baseline" in the same commit compares
+   Arc's whole dedicated decode path against Candle's and isolates nothing
+   about TurboQuant; there is no A/B against an unquantized cache, and **no
+   quality evaluation at any preset**. The ratio stays retracted; the run does
+   not.
+
+   Ship state: TurboQuant **is the paged default** at head_dim 128 on a
+   standard KV layout (`defaults::PAGED_CACHE_TYPE`), and disables prefix
+   caching while active; `--pa-cache-type auto` opts out. The *eager* path is
+   the opt-in one (`ARC_TURBOQUANT_KV=1`). There is **no head_dim-512 kernel**,
+   so **DeepSeek V4 Flash does not use TurboQuant**, independently of the fact
+   that MLA models fall back to the standard KV path.
 
 4. **Arc Boost (tier 1).** Serve-time quality orchestration: top-nsigma
    sampling, confidence-weighted voting, and reasoning-budget policy. The
@@ -124,7 +138,9 @@ arithmetic — never a measurement.
 | MoE kernel crossover | gemv **flat** 315 → 317 tok/s (B=64 → B=128); grouped GEMM **climbs** 322 → 527. Crossover at **B=64** | Measured (kernel) |
 | Grouped-GEMM batch curve | Flat ~63.5 ms/step B=16→64 | Measured (kernel; expert path only) |
 | …its tok/s and $/Mtok | ~1,006 aggregate tok/s ⇒ ≈$1.36/Mtok at $4.92/hr | **Projected** — arithmetic on the step floor; the served figures are 91.46 tok/s / $14.73/Mtok at B=64 |
-| TurboQuant KV | 4.27× context (Qwen3-32B, 1×H100, 39K → 169K) | 🔴 **Projected — retracted as measured.** Format arithmetic (3.5 bits vs BF16 bytes/token); **never run on a GPU, on any model** |
+| TurboQuant KV — compression | 4.27× context (Qwen3-32B, 1×H100, 39K → 169K) | 🔴 **Projected — retracted as measured.** Format arithmetic (3.5 bits vs BF16 bytes/token); **no run has ever produced a KV compression figure** |
+| TurboQuant KV — serving | 55 tok/s, correct output (Qwen3-32B, 1×B200, b=1) | 🔵 **Measured** — `4eba13905`, 2026-04-06, harness `deploy/modal_b200.py`. Narrow: one card, one model, head_dim 128, `Default` preset, no A/B isolating TurboQuant |
+| TurboQuant KV — quality | — | 🔴 **Never measured** at any preset or width. The paper's "lossless" LongBench result is Zandieh et al.'s, on their model |
 
 ## Known limitations
 
@@ -168,8 +184,10 @@ short version:
 - **One model family validated.** Every V4 number is DeepSeek V4 Flash;
   other architectures inherit mistral.rs support but have not had the same
   measurement treatment. **TurboQuant KV's 4.27× is not a measurement on any
-  model** (see the retraction above) — and V4 could not use TurboQuant even if
-  it were: no head_dim-512 kernel exists.
+  model** (see the retraction above) — and V4 does not use TurboQuant anyway:
+  no head_dim-512 kernel exists. TurboQuant's one hardware result is on a
+  *different* model family entirely (Qwen3-32B on a B200), which is exactly why
+  it must not be read as a V4 number.
 - **GSM8K is the full 1,319-problem test set**, 0-shot chat, seed 161,
   2048-token cap, 0 degenerate / 0 truncated / 0 errors. The published
   base-model 90.8 is **8-shot EM**, a different and easier protocol — state

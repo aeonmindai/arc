@@ -18,7 +18,15 @@ pub const TURBOQUANT_HEAD_DIM: usize = 128;
 pub enum PagedCacheType {
     Auto,
     F8E4M3,
-    /// TurboQuant default: 4-bit keys, 3-bit values (3.5 bits avg). Lossless quality.
+    /// TurboQuant default: 4-bit keys, 3-bit values (3.5 bits avg).
+    ///
+    /// This is the `#[default]`, and it is the default the server actually
+    /// resolves to (`defaults::PAGED_CACHE_TYPE`) when `--pa-cache-type` is
+    /// left unset — so a standard-layout head_dim-128 model on CUDA gets it
+    /// without asking. It has one end-to-end serving run behind it (Qwen3-32B
+    /// on a B200, 55 tok/s, correct output, 2026-04-06); it has **no quality
+    /// evaluation** at any width. Earlier revisions of this comment read
+    /// "Lossless quality" — that was never measured and has been removed.
     #[default]
     TurboQuant,
     /// TurboQuant balanced: 3-bit keys, 3-bit values (3.0 bits avg).
@@ -50,10 +58,46 @@ impl PagedCacheType {
     }
 
     /// Whether prefix caching can be used with this cache type. TurboQuant
-    /// blocks are packed U8; `gather_kv_cache` cannot dequantize them yet, so
-    /// a prefix-cache hit would fail at runtime.
+    /// blocks are packed 4-bit K / 3-bit V codebook indices with the
+    /// per-token norms held in separate tensors
+    /// (`turbo_paged_attention.cuh:15-19`); `gather_kv_cache` has no dequantize
+    /// path and no norms argument, so a prefix-cache hit cannot be served.
     pub fn supports_prefix_cache(&self) -> bool {
         !self.is_turboquant()
+    }
+
+    /// The user-facing account of the TurboQuant / prefix-cache conflict, or
+    /// `None` when there is no conflict.
+    ///
+    /// 🔑 Two things Arc sells cannot both be switched on, and until this
+    /// existed the loser was chosen for the user in one line of `tracing::warn`
+    /// that named **neither flag**. That matters more here than it would
+    /// elsewhere, because **TurboQuant is what an untouched command line
+    /// resolves to**: `--pa-cache-type` unset means TurboQuant, not `auto`
+    /// (`mistralrs-cli/src/args/paged_attn.rs:44-53`), PagedAttention is the
+    /// CUDA default, and `--prefix-cache-n` defaults to 16
+    /// (`mistralrs-cli/src/args/mod.rs:425`). So the default configuration is
+    /// the conflicting one, and the message has to say which flag produced it
+    /// and which flag it silently overrode.
+    ///
+    /// `prefix_cache_n` is carried so the message can distinguish "you asked
+    /// for prefix caching and lost it" from the degenerate case where prefix
+    /// caching was off anyway — there is nothing to warn about in the latter.
+    pub fn prefix_cache_conflict(&self, prefix_cache_n: usize) -> Option<String> {
+        if self.supports_prefix_cache() || prefix_cache_n == 0 {
+            return None;
+        }
+        Some(format!(
+            "PagedAttention KV cache type is `{self}` (TurboQuant) and prefix caching was \
+             requested with `--prefix-cache-n {prefix_cache_n}`. These are mutually exclusive \
+             today: TurboQuant blocks are packed codebook indices with their norms in separate \
+             tensors, and `gather_kv_cache` has no dequantize-on-gather path, so a prefix-cache \
+             hit cannot be served. PREFIX CACHING IS NOW DISABLED for this run; the compressed \
+             KV cache is kept. Note that `--pa-cache-type` unset means TurboQuant, NOT `auto` — \
+             if you would rather keep prefix caching, pass `--pa-cache-type auto` (or \
+             `f8e4m3`); if you would rather keep the compressed cache and silence this, pass \
+             `--prefix-cache-n 0`."
+        ))
     }
 
     /// Whether the TurboQuant kernels support this model's KV geometry.
@@ -129,6 +173,22 @@ impl PagedCacheType {
             }
             _ => None,
         }
+    }
+}
+
+/// Renders as the exact `--pa-cache-type` spelling, so a diagnostic that names
+/// the active cache type names a value the user can actually pass back.
+/// Round-tripped against [`FromStr`] by
+/// `every_cache_type_renders_as_the_flag_value_that_parses_back`.
+impl std::fmt::Display for PagedCacheType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::F8E4M3 => "f8e4m3",
+            Self::TurboQuant => "turboquant",
+            Self::TurboQuant3 => "turboquant-3",
+            Self::TurboQuantAggressive => "turboquant-aggressive",
+        })
     }
 }
 
@@ -629,5 +689,69 @@ mod cache_type_tests {
         }
         assert!(PagedCacheType::Auto.supports_prefix_cache());
         assert!(PagedCacheType::F8E4M3.supports_prefix_cache());
+    }
+
+    /// 🔴 The conflict must be LOUD, and loud means actionable: it has to name
+    /// the flag that produced the compressed cache, the flag whose feature was
+    /// taken away, and which of the two lost — otherwise an operator whose
+    /// prefix cache silently vanished has nothing to act on.
+    ///
+    /// This is the DEFAULT configuration, not an exotic one: `--pa-cache-type`
+    /// unset resolves to TurboQuant, PagedAttention is the CUDA default, and
+    /// `--prefix-cache-n` defaults to 16.
+    #[test]
+    fn the_conflict_names_both_flags_and_says_which_one_lost() {
+        for t in TURBO_TYPES {
+            let msg = t
+                .prefix_cache_conflict(16)
+                .expect("a TurboQuant cache with prefix caching on IS a conflict");
+            assert!(
+                msg.contains("--pa-cache-type"),
+                "must name the flag that selected the compressed cache; got {msg:?}"
+            );
+            assert!(
+                msg.contains("--prefix-cache-n"),
+                "must name the flag whose feature was overridden; got {msg:?}"
+            );
+            assert!(
+                msg.contains("PREFIX CACHING IS NOW DISABLED"),
+                "must say which of the two lost; got {msg:?}"
+            );
+            assert!(
+                msg.contains(&t.to_string()),
+                "must name the active cache type by its own flag value; got {msg:?}"
+            );
+        }
+    }
+
+    /// No conflict where there is none. A cache type that supports prefix
+    /// caching is silent, and so is `--prefix-cache-n 0` — nothing was taken
+    /// away, so warning would be noise that trains operators to ignore it.
+    #[test]
+    fn no_conflict_is_reported_when_nothing_was_actually_disabled() {
+        for t in [PagedCacheType::Auto, PagedCacheType::F8E4M3] {
+            assert!(t.prefix_cache_conflict(16).is_none());
+        }
+        for t in TURBO_TYPES {
+            assert!(
+                t.prefix_cache_conflict(0).is_none(),
+                "prefix caching was already off; there is nothing to warn about"
+            );
+        }
+    }
+
+    /// The rendered name must be a value the user can hand back to
+    /// `--pa-cache-type`, or the diagnostic's advice is unusable.
+    #[test]
+    fn every_cache_type_renders_as_the_flag_value_that_parses_back() {
+        for t in [
+            PagedCacheType::Auto,
+            PagedCacheType::F8E4M3,
+            PagedCacheType::TurboQuant,
+            PagedCacheType::TurboQuant3,
+            PagedCacheType::TurboQuantAggressive,
+        ] {
+            assert_eq!(t.to_string().parse::<PagedCacheType>().unwrap(), t);
+        }
     }
 }

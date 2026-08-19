@@ -80,7 +80,7 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 //
 // Template params:
 //   scalar_t : __half, __nv_bfloat16, or float
-//   HEAD_DIM : actual head dimension (64, 80, 96, 112, 128, 192, 256)
+//   HEAD_DIM : actual head dimension (64, 80, 96, 112, 128, 192, 256, 512)
 //   BR       : number of warps per block (= number of Q rows per block)
 //   BC       : KV tile size (number of KV positions per shared-memory tile)
 //
@@ -96,7 +96,7 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 //   Pass 2: one rescale of accumulators, then accumulate V from v_smem
 // ---------------------------------------------------------------------------
 
-template <typename scalar_t, int HEAD_DIM, int BR, int BC>
+template <typename scalar_t, typename smem_t, int HEAD_DIM, int BR, int BC>
 __launch_bounds__(BR *WARP_SIZE) __global__ void flash_attn_sinks_kernel(
     const scalar_t *__restrict__ Q,  // [B, num_heads, q_len, D]
     const scalar_t *__restrict__ K,  // [B, num_kv_heads, kv_len, D]
@@ -113,8 +113,11 @@ __launch_bounds__(BR *WARP_SIZE) __global__ void flash_attn_sinks_kernel(
   constexpr int BLOCK_SIZE = BR * WARP_SIZE;
 
   // Shared memory for K and V tiles (float32 avoids bank conflicts)
-  __shared__ float k_smem[BC * D_PAD];
-  __shared__ float v_smem[BC * D_PAD];
+  // smem_t is `float` for every head_dim that fits comfortably, and
+  // `scalar_t` (bf16/f16) at 512 — halving tile bytes so BC can double
+  // within the same ~32 KB. See the dispatch for why.
+  __shared__ smem_t k_smem[BC * D_PAD];
+  __shared__ smem_t v_smem[BC * D_PAD];
 
   const int warp_id = threadIdx.x / WARP_SIZE;
   const int lane_id = threadIdx.x % WARP_SIZE;
@@ -186,20 +189,20 @@ __launch_bounds__(BR *WARP_SIZE) __global__ void flash_attn_sinks_kernel(
     for (int idx = threadIdx.x; idx < BC * D_PAD; idx += BLOCK_SIZE) {
       const int kj = idx / D_PAD;
       const int kd = idx % D_PAD;
-      k_smem[idx] =
+      k_smem[idx] = from_float<smem_t>(
           (kj < tile_len && kd < HEAD_DIM)
               ? to_float(__ldg(&K[kv_base + (tile_start + kj) * HEAD_DIM + kd]))
-              : 0.0f;
+              : 0.0f);
     }
 
     // --- Cooperatively load V tile into shared memory ---
     for (int idx = threadIdx.x; idx < BC * D_PAD; idx += BLOCK_SIZE) {
       const int vj = idx / D_PAD;
       const int vd = idx % D_PAD;
-      v_smem[idx] =
+      v_smem[idx] = from_float<smem_t>(
           (vj < tile_len && vd < HEAD_DIM)
               ? to_float(__ldg(&V[kv_base + (tile_start + vj) * HEAD_DIM + vd]))
-              : 0.0f;
+              : 0.0f);
     }
     __syncthreads();
 
@@ -228,7 +231,7 @@ __launch_bounds__(BR *WARP_SIZE) __global__ void flash_attn_sinks_kernel(
         float dot = 0.0f;
 #pragma unroll
         for (int i = 0; i < EPT; i++) {
-          dot += q_reg[i] * k_smem[j * D_PAD + i * WARP_SIZE + lane_id];
+          dot += q_reg[i] * to_float(k_smem[j * D_PAD + i * WARP_SIZE + lane_id]);
         }
         dot = warp_reduce_sum(dot);
 
@@ -258,7 +261,7 @@ __launch_bounds__(BR *WARP_SIZE) __global__ void flash_attn_sinks_kernel(
 
 #pragma unroll
           for (int i = 0; i < EPT; i++) {
-            o_acc[i] += p * v_smem[j * D_PAD + i * WARP_SIZE + lane_id];
+            o_acc[i] += p * to_float(v_smem[j * D_PAD + i * WARP_SIZE + lane_id]);
           }
         }
       }
@@ -308,7 +311,7 @@ __launch_bounds__(BR *WARP_SIZE) __global__ void flash_attn_sinks_kernel(
 // Block: (BR * WARP_SIZE)
 // ---------------------------------------------------------------------------
 
-template <typename scalar_t, int HEAD_DIM, int BR, int BC>
+template <typename scalar_t, typename smem_t, int HEAD_DIM, int BR, int BC>
 __launch_bounds__(BR *WARP_SIZE) __global__ void flash_attn_sinks_varlen_kernel(
     const scalar_t *__restrict__ Q,  // [B, num_heads, max_q_len, D]
     const scalar_t *__restrict__ K,  // [total_kv, num_kv_heads, D]
@@ -325,8 +328,11 @@ __launch_bounds__(BR *WARP_SIZE) __global__ void flash_attn_sinks_varlen_kernel(
   constexpr int EPT = D_PAD / WARP_SIZE;
   constexpr int BLOCK_SIZE = BR * WARP_SIZE;
 
-  __shared__ float k_smem[BC * D_PAD];
-  __shared__ float v_smem[BC * D_PAD];
+  // smem_t is `float` for every head_dim that fits comfortably, and
+  // `scalar_t` (bf16/f16) at 512 — halving tile bytes so BC can double
+  // within the same ~32 KB. See the dispatch for why.
+  __shared__ smem_t k_smem[BC * D_PAD];
+  __shared__ smem_t v_smem[BC * D_PAD];
 
   const int warp_id = threadIdx.x / WARP_SIZE;
   const int lane_id = threadIdx.x % WARP_SIZE;
@@ -406,26 +412,26 @@ __launch_bounds__(BR *WARP_SIZE) __global__ void flash_attn_sinks_varlen_kernel(
     for (int idx = threadIdx.x; idx < BC * D_PAD; idx += BLOCK_SIZE) {
       const int kj = idx / D_PAD;
       const int kd = idx % D_PAD;
-      k_smem[idx] =
+      k_smem[idx] = from_float<smem_t>(
           (kj < tile_len && kd < HEAD_DIM)
               ? to_float(__ldg(&K[((kv_start + tile_start + kj) * num_kv_heads +
                                    kv_head_idx) *
                                       HEAD_DIM +
                                   kd]))
-              : 0.0f;
+              : 0.0f);
     }
 
     // --- Cooperatively load V tile from packed layout ---
     for (int idx = threadIdx.x; idx < BC * D_PAD; idx += BLOCK_SIZE) {
       const int vj = idx / D_PAD;
       const int vd = idx % D_PAD;
-      v_smem[idx] =
+      v_smem[idx] = from_float<smem_t>(
           (vj < tile_len && vd < HEAD_DIM)
               ? to_float(__ldg(&V[((kv_start + tile_start + vj) * num_kv_heads +
                                    kv_head_idx) *
                                       HEAD_DIM +
                                   vd]))
-              : 0.0f;
+              : 0.0f);
     }
     __syncthreads();
 
@@ -450,7 +456,7 @@ __launch_bounds__(BR *WARP_SIZE) __global__ void flash_attn_sinks_varlen_kernel(
         float dot = 0.0f;
 #pragma unroll
         for (int i = 0; i < EPT; i++) {
-          dot += q_reg[i] * k_smem[j * D_PAD + i * WARP_SIZE + lane_id];
+          dot += q_reg[i] * to_float(k_smem[j * D_PAD + i * WARP_SIZE + lane_id]);
         }
         dot = warp_reduce_sum(dot);
 
@@ -478,7 +484,7 @@ __launch_bounds__(BR *WARP_SIZE) __global__ void flash_attn_sinks_varlen_kernel(
 
 #pragma unroll
           for (int i = 0; i < EPT; i++) {
-            o_acc[i] += p * v_smem[j * D_PAD + i * WARP_SIZE + lane_id];
+            o_acc[i] += p * to_float(v_smem[j * D_PAD + i * WARP_SIZE + lane_id]);
           }
         }
       }
@@ -527,8 +533,8 @@ void flash_attn_sinks_launch(const void *Q, const void *K, const void *V,
   const dim3 grid(num_heads, batch_size, (q_len + BR - 1) / BR);
   const dim3 block(WARP_SIZE * BR);
 
-#define LAUNCH_KERNEL(D, BC_VAL)                                               \
-  flash_attn_sinks_kernel<scalar_t, D, BR, BC_VAL>                             \
+#define LAUNCH_KERNEL_T(SMEM_T, D, BC_VAL)                                     \
+  flash_attn_sinks_kernel<scalar_t, SMEM_T, D, BR, BC_VAL>                             \
       <<<grid, block, 0, stream>>>(reinterpret_cast<const scalar_t *>(Q),      \
                                    reinterpret_cast<const scalar_t *>(K),      \
                                    reinterpret_cast<const scalar_t *>(V),      \
@@ -536,6 +542,9 @@ void flash_attn_sinks_launch(const void *Q, const void *K, const void *V,
                                    scale, q_len, kv_len, num_heads,            \
                                    num_kv_heads, window_size);                 \
   FA_CUDA_CHECK(cudaGetLastError())
+// Existing head_dims keep float tiles: `to_float`/`from_float` on float are
+// identity, so those paths are unchanged.
+#define LAUNCH_KERNEL(D, BC_VAL) LAUNCH_KERNEL_T(float, D, BC_VAL)
 
   switch (head_dim) {
   case 64:
@@ -559,14 +568,52 @@ void flash_attn_sinks_launch(const void *Q, const void *K, const void *V,
   case 256:
     LAUNCH_KERNEL(256, 16);
     break;
+  // head_dim 512 (DeepSeek-V4: symmetric 512/512, MQA num_kv_heads=1).
+  //
+  // BC=8 continues the series the table already follows: shared memory is
+  // 2 * BC * D_PAD * sizeof(float), and every existing case holds it at ~32 KB
+  // by HALVING BC as HEAD_DIM DOUBLES — 64/BC=64, 128/BC=32, 256/BC=16 are all
+  // exactly 32.0 KB. 512/BC=8 is 2*8*512*4 = 32768 B, identical. That is under
+  // the 48 KB default per-block limit, so this needs no opt-in shared memory,
+  // no dynamic allocation, and no launch-config change.
+  //
+  // ⚠️ FEASIBILITY IS NOT PERFORMANCE. BC=8 means only 8 KV positions per tile,
+  // so V4's sliding_window=128 becomes 16 sequential tiles per query row. This
+  // is expected to WORK; whether it beats the unfused path it replaces is a
+  // separate, measured question. If it loses, the lever held in reserve is
+  // storing the tiles as scalar_t rather than float (the float32 choice above
+  // is for bank-conflict avoidance) — that would allow BC=16 at 512 in the same
+  // 32 KB and double the arithmetic intensity.
+  case 512:
+    // BC=16 with **scalar_t** tiles, not BC=8 with float.
+    //
+    // MEASURED (H200, mla_attn span, 320 tokens, null-control floor 0.67%):
+    // BC=8/float was 564.82 us/invocation against the unfused path's 547.52 —
+    // a 3.2% REGRESSION, cleanly resolved. Cause: 8 KV positions per tile means
+    // V4's 128-key window costs 16 sequential tiles per query row, which is the
+    // low arithmetic intensity flagged as the risk before any measurement.
+    //
+    // Storing tiles as scalar_t halves their bytes, so BC doubles inside the
+    // same budget: 2 * 16 * 512 * 2 = 32768 B — identical to every other case.
+    // The window now costs 8 tiles instead of 16.
+    //
+    // ⚠️ NOT FREE, AND THE DIRECTION IS NOT ASSUMED. The float32 tiles are a
+    // deliberate bank-conflict avoidance (see the header). 2-byte elements can
+    // reintroduce conflicts; if those cost more than halving the tile count
+    // saves, this is SLOWER than BC=8/float and that is the real answer.
+    // Measured against the UNFUSED path, never against BC=8 — comparing a
+    // change to a change measures nothing.
+    LAUNCH_KERNEL_T(scalar_t, 512, 16);
+    break;
   default:
     fprintf(stderr,
             "flash_attn_sinks: unsupported head_dim=%d. "
-            "Supported: 64, 80, 96, 112, 128, 192, 256\n",
+            "Supported: 64, 80, 96, 112, 128, 192, 256, 512\n",
             head_dim);
     break;
   }
 #undef LAUNCH_KERNEL
+#undef LAUNCH_KERNEL_T
 }
 
 // ---------------------------------------------------------------------------
@@ -619,8 +666,8 @@ void flash_attn_sinks_varlen_launch(
   const dim3 grid(num_heads, batch_size, (max_q_len + BR - 1) / BR);
   const dim3 block(WARP_SIZE * BR);
 
-#define LAUNCH_VARLEN_KERNEL(D, BC_VAL)                                        \
-  flash_attn_sinks_varlen_kernel<scalar_t, D, BR, BC_VAL>                      \
+#define LAUNCH_VARLEN_KERNEL_T(SMEM_T, D, BC_VAL)                              \
+  flash_attn_sinks_varlen_kernel<scalar_t, SMEM_T, D, BR, BC_VAL>                      \
       <<<grid, block, 0, stream>>>(                                            \
           reinterpret_cast<const scalar_t *>(Q),                               \
           reinterpret_cast<const scalar_t *>(K),                               \
@@ -628,6 +675,7 @@ void flash_attn_sinks_varlen_launch(
           reinterpret_cast<scalar_t *>(O), sinks, cu_seqlens_q, cu_seqlens_k,  \
           scale, max_q_len, num_heads, num_kv_heads, window_size);             \
   FA_CUDA_CHECK(cudaGetLastError())
+#define LAUNCH_VARLEN_KERNEL(D, BC_VAL) LAUNCH_VARLEN_KERNEL_T(float, D, BC_VAL)
 
   switch (head_dim) {
   case 64:
@@ -651,14 +699,19 @@ void flash_attn_sinks_varlen_launch(
   case 256:
     LAUNCH_VARLEN_KERNEL(256, 16);
     break;
+  // See the dense switch for why scalar_t tiles at BC=16.
+  case 512:
+    LAUNCH_VARLEN_KERNEL_T(scalar_t, 512, 16);
+    break;
   default:
     fprintf(stderr,
             "flash_attn_sinks_varlen: unsupported head_dim=%d. "
-            "Supported: 64, 80, 96, 112, 128, 192, 256\n",
+            "Supported: 64, 80, 96, 112, 128, 192, 256, 512\n",
             head_dim);
     break;
   }
 #undef LAUNCH_VARLEN_KERNEL
+#undef LAUNCH_VARLEN_KERNEL_T
 }
 
 // ---------------------------------------------------------------------------

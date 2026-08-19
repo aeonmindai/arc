@@ -169,6 +169,42 @@ pub fn verify_proposed(proposed: &[u32], target: &[u32]) -> VerifyResult {
     }
 }
 
+/// [`verify_proposed`] with the accept/reject decision forced to a configured
+/// accept length — the **debug** harness for pricing acceptance without a
+/// better draft head.
+///
+/// The schedule comes from [`mistralrs_core::SyntheticAcceptance`], which is the
+/// same type the live serving path consults at its own accept/reject site
+/// (`mistralrs-core/src/pipeline/mtp_pipeline.rs`, under
+/// [`mistralrs_core::SIMULATE_ACC_LEN_ENV`]). One schedule, two doors: this one
+/// so the behaviour is testable as a pure function, that one so a real run
+/// exercises the KV-rollback and ragged-verify paths at accept patterns the
+/// current 0.42-acceptance drafter almost never produces.
+///
+/// # The limit, stated plainly
+///
+/// **The drafter still runs at full cost.** Only the accept/reject decision is
+/// synthetic. This prices *acceptance* — "what would throughput be if the head
+/// were good enough to hit `acc_len`" — and NOT drafter removal.
+///
+/// **The accepted tokens are the draft's, not the target's.** They are committed
+/// whether or not they match, so any text produced under this flag is not the
+/// model's output and must not be scored or published. The rejection still
+/// carries the target's real token at the rejected slot, so lengths and
+/// corrections stay well-formed.
+pub fn verify_proposed_simulated(
+    proposed: &[u32],
+    target: &[u32],
+    sim: &mistralrs_core::SyntheticAcceptance,
+) -> VerifyResult {
+    let n = proposed.len().min(target.len());
+    let k = sim.next_accept_len().min(n);
+    VerifyResult {
+        accepted: proposed[..k].to_vec(),
+        rejection: (k < n).then(|| (k, target[k])),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +300,135 @@ mod tests {
         assert!(res.accepted.is_empty());
         assert!(res.rejection.is_none());
         assert_eq!(res.commit_len(), 0);
+    }
+
+    use mistralrs_core::SyntheticAcceptance;
+
+    /// Run `steps` synthetic verifies at depth `depth` where **every** proposal
+    /// mismatches the target, and return the committed length of each step.
+    ///
+    /// Total mismatch is the point: it is the case the real verifier scores 0
+    /// on, so any commit length above 1 here can only have come from the
+    /// harness. A harness that quietly fell back to the real comparison would
+    /// return all 1s.
+    fn simulated_commit_lens(acc_len: f64, depth: usize, steps: usize) -> Vec<usize> {
+        let sim = SyntheticAcceptance::new(acc_len).expect("acc_len >= 1.0");
+        let proposed: Vec<u32> = (0..depth as u32).map(|i| 1000 + i).collect();
+        let target: Vec<u32> = (0..depth as u32).map(|i| 2000 + i).collect();
+        (0..steps)
+            .map(|_| verify_proposed_simulated(&proposed, &target, &sim).commit_len())
+            .collect()
+    }
+
+    /// A fractional accept length is realised **exactly** in the mean, not by
+    /// rounding — otherwise 2.85 and 3.0 would be the same experiment.
+    #[test]
+    fn a_fractional_accept_length_is_hit_exactly_in_the_mean() {
+        const STEPS: usize = 1000;
+        // SGLang's DeepSeek V4 CI floor, and the number this harness exists to
+        // price: `acc_length > 2.85` at depth 3.
+        for &acc_len in &[1.0, 1.5, 1.8387, 2.85, 3.0] {
+            let lens = simulated_commit_lens(acc_len, 4, STEPS);
+            let mean = lens.iter().sum::<usize>() as f64 / STEPS as f64;
+            assert!(
+                (mean - acc_len).abs() < 0.01,
+                "acc_len={acc_len} produced mean {mean}"
+            );
+        }
+
+        // The schedule is deterministic: same flag, same sequence, so a timing
+        // A/B is not confounded by the harness itself.
+        assert_eq!(
+            simulated_commit_lens(2.85, 4, 40),
+            simulated_commit_lens(2.85, 4, 40)
+        );
+
+        // …and it dithers rather than rounding: 2.85 must produce BOTH of the
+        // neighbouring integers. Rounding to 3 would pass the mean test above
+        // only by accident and fail here.
+        let lens = simulated_commit_lens(2.85, 4, 40);
+        assert!(lens.contains(&2) && lens.contains(&3), "{lens:?}");
+    }
+
+    /// The harness overrides the decision, and every proposal mismatching is
+    /// the case that proves it.
+    #[test]
+    fn the_harness_accepts_tokens_the_real_verifier_would_reject() {
+        let proposed = vec![10, 20, 30];
+        let target = vec![91, 92, 93];
+
+        // Ground truth: the real verifier accepts nothing here.
+        let real = verify_proposed(&proposed, &target);
+        assert!(real.accepted.is_empty());
+        assert_eq!(real.commit_len(), 1);
+
+        // Forced to accept 2 drafts per step (acc_len 3.0).
+        let sim = SyntheticAcceptance::new(3.0).unwrap();
+        let forced = verify_proposed_simulated(&proposed, &target, &sim);
+        assert_eq!(
+            forced.accepted,
+            vec![10, 20],
+            "the accepted tokens are the DRAFT's — which is exactly why text \
+             produced under this flag is not the model's output"
+        );
+        assert_eq!(
+            forced.rejection,
+            Some((2, 93)),
+            "the correction must still be the TARGET's real token, so lengths \
+             and the committed stream stay well-formed"
+        );
+        assert_eq!(forced.commit_len(), 3);
+    }
+
+    /// The schedule is clamped by what the step could actually verify, and the
+    /// harness does not compensate afterwards — the reported number stays the
+    /// one that happened.
+    #[test]
+    fn the_schedule_is_clamped_by_the_chain_and_not_compensated() {
+        // acc_len 5.0 wants 4 accepted drafts, but the chain is only 2 long, so
+        // every step saturates at 2.
+        //
+        // `commit_len()` reports 2, not 3: with the whole chain accepted there
+        // is no rejection, and this type deliberately counts only what the
+        // *verifier* resolved. The pipeline adds the target's bonus token on
+        // top, which is where its `committed = 1 + accepted` comes from. The
+        // two counts differ by exactly that token and only when nothing was
+        // rejected.
+        let lens = simulated_commit_lens(5.0, 2, 20);
+        assert!(
+            lens.iter().all(|&l| l == 2),
+            "a depth-2 chain cannot accept more than 2 drafts: {lens:?}"
+        );
+
+        // A chain of zero drafts commits nothing and cannot be rescued.
+        let sim = SyntheticAcceptance::new(4.0).unwrap();
+        let empty = verify_proposed_simulated(&[], &[], &sim);
+        assert!(empty.accepted.is_empty());
+        assert!(empty.rejection.is_none());
+        assert_eq!(empty.commit_len(), 0);
+    }
+
+    /// The flag refuses nonsense loudly rather than silently doing nothing — a
+    /// typo'd debug flag is how a GPU session gets paid for twice.
+    #[test]
+    fn the_flag_refuses_an_impossible_accept_length() {
+        // A step always commits the target's own token, so < 1.0 describes
+        // nothing that can happen.
+        assert!(SyntheticAcceptance::new(0.9).is_none());
+        assert!(SyntheticAcceptance::new(0.0).is_none());
+        assert!(SyntheticAcceptance::new(f64::NAN).is_none());
+        assert!(SyntheticAcceptance::new(f64::INFINITY).is_none());
+        assert!(SyntheticAcceptance::new(1.0).is_some());
+
+        // Unset / empty / unparsable all leave the real drafter measuring.
+        assert!(SyntheticAcceptance::from_env_value(None).is_none());
+        assert!(SyntheticAcceptance::from_env_value(Some("")).is_none());
+        assert!(SyntheticAcceptance::from_env_value(Some("  ")).is_none());
+        assert!(SyntheticAcceptance::from_env_value(Some("yes")).is_none());
+        assert!(SyntheticAcceptance::from_env_value(Some("0.5")).is_none());
+
+        let parsed = SyntheticAcceptance::from_env_value(Some(" 2.85 "))
+            .expect("a valid accept length parses");
+        assert!((parsed.acc_len() - 2.85).abs() < f64::EPSILON);
     }
 }

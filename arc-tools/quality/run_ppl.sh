@@ -17,7 +17,7 @@
 #   experts dequant to BF16 ~560GB. Absolute KLD vs FP8 needs a bigger box.)
 #
 # --sinkhorn-ab : instead of the ladder, run the qtip2 rung twice on the mini
-#   corpus with ARC_FUSED_SINKHORN unset/1 and diff per-chunk ppl strings —
+#   corpus with ARC_NO_FUSED_SINKHORN set/unset and diff per-chunk ppl strings —
 #   identical strings == bit-identical f32 forward (see parse_ppl.py).
 #
 # Env:
@@ -72,8 +72,20 @@ if [ "${1:-}" = "--sinkhorn-ab" ]; then
   # rides for free on this run instead of a separate ppl pass).
   DUMPARGS=""
   [ -n "${SINK_DUMP_OFF:-}" ] && DUMPARGS="--dump-logprobs $SINK_DUMP_OFF"
-  env -u ARC_FUSED_SINKHORN "$BIN" -m "$MODEL_DIR" -a deepseekv4 -f "$MINI_FILE" -u "$UQFF0" --chunk-size 1024 $DUMPARGS 2>&1 | tee "$RES/ppl_sink_off.log"
-  ARC_FUSED_SINKHORN=1     "$BIN" -m "$MODEL_DIR" -a deepseekv4 -f "$MINI_FILE" -u "$UQFF0" --chunk-size 1024 2>&1 | tee "$RES/ppl_sink_on.log"
+  # The engine reads ARC_NO_FUSED_SINKHORN (fused is the DEFAULT and is on
+  # unless that variable is set). This script used to toggle ARC_FUSED_SINKHORN,
+  # which was correct until commit 9387e2bc5 (2026-08-13) flipped BOTH the
+  # variable name and the default. From that commit until this fix, nothing
+  # read ARC_FUSED_SINKHORN, so `env -u ARC_FUSED_SINKHORN` disabled nothing
+  # and both arms ran fused-on — a tautological A/B.
+  #
+  # This does NOT invalidate the s2 "bit-identical 6/6" result in FACTS.md:
+  # that ran before the flip, on the opt-in gate this script drove correctly,
+  # and the same harness had previously returned a NEGATIVE result (s1: ppl
+  # drift + 4/6 token divergence), which a no-op A/B cannot produce. Only runs
+  # dated between 2026-08-13 and this fix are meaningless.
+  ARC_NO_FUSED_SINKHORN=1 "$BIN" -m "$MODEL_DIR" -a deepseekv4 -f "$MINI_FILE" -u "$UQFF0" --chunk-size 1024 $DUMPARGS 2>&1 | tee "$RES/ppl_sink_off.log"
+  env -u ARC_NO_FUSED_SINKHORN "$BIN" -m "$MODEL_DIR" -a deepseekv4 -f "$MINI_FILE" -u "$UQFF0" --chunk-size 1024 2>&1 | tee "$RES/ppl_sink_on.log"
   python3 "$HERE/parse_ppl.py" "$RES/ppl_sink_off.log" sink_off "$RES/ppl_sink_off.json" || fail "gate-off run failed"
   python3 "$HERE/parse_ppl.py" "$RES/ppl_sink_on.log"  sink_on  "$RES/ppl_sink_on.json"  || fail "gate-on run failed"
   python3 - "$RES/ppl_sink_off.json" "$RES/ppl_sink_on.json" <<'EOF'

@@ -41,6 +41,10 @@ mod metal;
 mod model_loader;
 mod moe;
 mod ops;
+pub use moe::{
+    balancedness, expected_distinct_experts, weight_read_imbalance_bound, Balancedness,
+    BalancednessCounter, ExpertParallelPlan, ExpertPlacement,
+};
 pub use model_loader::{
     get_auto_device_map_params, get_model_dtype, get_tgt_non_granular_index, LoaderBuilder,
 };
@@ -131,10 +135,12 @@ pub use pipeline::{
     MixtralLoader, Modalities, ModelKind, ModelPaths, MultimodalPromptPrefixer, NormalLoader,
     NormalLoaderBuilder, NormalLoaderType, NormalLoadingMetadata, NormalModel, NormalModelLoader,
     mtp_acceptance, mtp_acceptance_by_batch, mtp_acceptance_marker, mtp_acceptance_markers,
-    mtp_load_depth, mtp_uqff_bake, record_mtp_batch_step, record_mtp_step, reset_mtp_acceptance,
-    set_mtp_load_depth, set_mtp_uqff_bake, try_wrap_pipeline_with_mtp,
-    verify_proposed, MtpAcceptance, MtpDecodeKit, MtpHiddenCapture, MtpSpeculativePipeline,
-    NormalSpecificConfig, VerifyResult,
+    mtp_acceptance_position_lines, mtp_load_depth, mtp_uqff_bake, record_mtp_batch_step,
+    record_mtp_step, reset_mtp_acceptance, set_mtp_load_depth, set_mtp_uqff_bake,
+    synthetic_acceptance, try_wrap_pipeline_with_mtp, CaptureOffsets, verify_proposed,
+    verify_proposed_with, MtpAcceptance, MtpDecodeKit, MtpHiddenCapture, MtpSpeculativePipeline,
+    NormalSpecificConfig, SyntheticAcceptance, VerifyResult, MTP_MAX_TRACKED_POSITIONS,
+    SIMULATE_ACC_LEN_ENV,
     Phi2Loader, Phi3Loader, Phi3VLoader, Qwen2Loader, SpeculativeConfig, SpeculativeLoader,
     SpeculativePipeline, SpeechLoader, SpeechPipeline, Starcoder2Loader,
     SupportedModality, TokenSource, UqffFullSer, UqffSourceWeights, VisionLoader,
@@ -146,7 +152,14 @@ pub use pipeline::text_models_inputs_processor::FlashParams as TextFlashParams;
 /// The cache entry types are needed by integration tests that drive the
 /// per-sequence cache dance (`clone_in_cache` / `clone_out_cache`) by hand
 /// against a bare `NormalModel`, without standing up a whole pipeline.
-pub use kv_cache::{KvCache, SingleCache, XsRollingCache, XS_TAIL_MARGIN_TOKENS};
+pub use kv_cache::{
+    request_xs_per_sequence, xs_per_sequence_enabled, KvCache, SingleCache, XsRollingCache,
+    RETAIN_WINDOW_CHUNK, RETAIN_WINDOW_MARGIN, XS_TAIL_MARGIN_TOKENS,
+};
+/// DeepSeek V4's windowed raw-KV store (`ARC_V4_KV_WINDOW`). Public for the
+/// same reason `set_mtp_load_depth` is: the identity guard has to drive the
+/// same model both ways from one test binary.
+pub use models::deepseek4::{set_v4_kv_window, v4_kv_window_enabled};
 pub use request::{
     ApproximateUserLocation, Constraint, DetokenizationRequest, ImageGenerationResponseFormat,
     LlguidanceGrammar, MessageContent, NormalRequest, ReasoningEffort, Request, RequestMessage,

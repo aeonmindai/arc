@@ -19,6 +19,43 @@ use tokenizers::Tokenizer;
 static DRY_SEQUENCE_BREAKERS: LazyLock<Vec<String>> =
     LazyLock::new(|| ["\n", ":", "\"", "*"].map(String::from).to_vec());
 
+/// Health counters for the big-vocab GPU sampling path.
+///
+/// Falling back to the CPU sampler costs a full-logits-row D2H plus a
+/// full-vocab sort, **per sequence per decode step**. That is a throughput
+/// cliff, not a warning-level event — but it used to surface only as a
+/// per-token `tracing::warn!`, so a 100%-failure condition (the missing I32
+/// arm in `tensor_device_ptr`) shipped and ran in production unnoticed.
+///
+/// These counters exist so "we are on the slow path" is a number the interval
+/// logger prints, not something buried in a log nobody reads.
+pub mod gpu_sampling_health {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(super) static GPU_OK: AtomicU64 = AtomicU64::new(0);
+    /// The GPU path declined by design (`Ok(None)`) — e.g. `top_k` above the
+    /// kernel's dispatch cap. Expected, config-driven, not a defect.
+    pub(super) static DECLINED: AtomicU64 = AtomicU64::new(0);
+    /// The GPU path errored (`Err`). Always a defect.
+    pub(super) static FAILED: AtomicU64 = AtomicU64::new(0);
+
+    /// Cumulative `(gpu_ok, declined, failed)` since process start.
+    pub fn stats() -> (u64, u64, u64) {
+        (
+            GPU_OK.load(Ordering::Relaxed),
+            DECLINED.load(Ordering::Relaxed),
+            FAILED.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Reset all counters. Called after warmup so steady-state numbers are clean.
+    pub fn reset() {
+        GPU_OK.store(0, Ordering::Relaxed);
+        DECLINED.store(0, Ordering::Relaxed);
+        FAILED.store(0, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Stop sequences or ids.
 pub enum StopTokens {
@@ -219,8 +256,18 @@ pub struct Sampler {
     min_p: f64,
     top_nsigma: Option<f32>,
     logits_processors: Vec<Arc<dyn CustomLogitsProcessor>>,
-    /// Cached Gumbel noise tensor to avoid reallocating it.
-    gumbel_cache: Arc<Mutex<Option<Tensor>>>,
+    /// OpenAI `logit_bias`: token id -> additive bias on the raw logits.
+    logits_bias: Option<Arc<HashMap<u32, f32>>>,
+    /// `logits_bias` materialised as a dense vector on the device/dtype of the
+    /// logits it was last applied to.
+    ///
+    /// Caching is sound here in a way it is not for sampling noise: the dense
+    /// vector is a pure function of `logits_bias`, which is immutable for the
+    /// life of the `Sampler`, and it is rebuilt whenever the incoming logits'
+    /// device, dtype or vocab differs from the cached tensor's. Without it,
+    /// every decoded token would pay a host allocation plus an H2D copy of the
+    /// full vocabulary.
+    logits_bias_dense: Arc<Mutex<Option<Tensor>>>,
 }
 
 #[cfg_attr(feature = "pyo3_macros", pyclass)]
@@ -320,6 +367,7 @@ impl Sampler {
         min_p: f64,
         top_nsigma: Option<f32>,
         logits_processors: Vec<Arc<dyn CustomLogitsProcessor>>,
+        logits_bias: Option<HashMap<u32, f32>>,
     ) -> anyhow::Result<Self> {
         let temperature = if temperature.is_none_or(|v| v < 1e-7) {
             None
@@ -350,7 +398,8 @@ impl Sampler {
             min_p,
             top_nsigma,
             logits_processors,
-            gumbel_cache: Arc::new(Mutex::new(None)),
+            logits_bias: logits_bias.filter(|b| !b.is_empty()).map(Arc::new),
+            logits_bias_dense: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -396,6 +445,116 @@ impl Sampler {
     /// should refuse autonomous fast-path when this returns true.
     pub fn has_custom_logits_processors(&self) -> bool {
         !self.logits_processors.is_empty()
+    }
+
+    /// True when a penalty would rewrite the logits before the token is picked.
+    ///
+    /// Single source of truth for the condition: [`Self::sample`]'s GPU fast
+    /// path reads it as `!has_penalties()`, and [`Self::is_raw_argmax`] reads it
+    /// directly. Two copies of this expression could disagree, and the one that
+    /// disagreed would be a silent correctness bug rather than a slow path.
+    fn has_penalties(&self) -> bool {
+        self.frequency_penalty.unwrap_or(0.0) != 0.0
+            || self.presence_penalty.unwrap_or(0.0) != 0.0
+            || self.repetition_penalty.unwrap_or(1.0) != 1.0
+            || self.dry_params.is_some()
+    }
+
+    /// True when this sampler is exactly `argmax` over the model's **raw**
+    /// logits — no temperature, no penalties, no custom logits processors.
+    ///
+    /// This is the precondition for any fast path that substitutes its own
+    /// `argmax` for [`Self::sample`], which is what speculative verification
+    /// does: `MtpSpeculativePipeline` accepts a draft token when it equals
+    /// `argmax(target_logits)`, computed on the raw logits.
+    ///
+    /// [`Self::is_greedy`] alone is **not** that precondition. With
+    /// `temperature: None` and any penalty or processor set, [`Self::sample`]
+    /// still runs `apply_penalties` and every `logits_processor` *before*
+    /// `sample_argmax` (`sampler.rs`, the CPU path), so the token it returns can
+    /// differ from `argmax(raw)`. Top-k / top-p / min-p do **not** need gating:
+    /// they are only consulted on the `Some(temperature)` branch. Nor does
+    /// top-nσ: it masks tokens *below* the maximum, so the argmax is invariant
+    /// under it.
+    ///
+    /// **`logit_bias` also disqualifies**, and this is a merge hazard worth
+    /// naming: `is_raw_argmax` landed on master while `logit_bias` was in
+    /// flight, so neither author saw the interaction. [`Self::sample`] applies
+    /// the bias to the raw logits *first* (`self.apply_logits_bias(logits)?`,
+    /// the first statement of the sampling body), so with a bias set the token
+    /// `sample` returns is `argmax(logits + bias)`, which is not
+    /// `argmax(logits)`. A speculative verifier that trusted `is_raw_argmax`
+    /// here would accept draft tokens judged against unbiased logits while the
+    /// real sampler used biased ones — a silent, request-specific wrong-token
+    /// bug, not a slow path.
+    pub fn is_raw_argmax(&self) -> bool {
+        self.is_greedy()
+            && !self.has_penalties()
+            && !self.has_logits_bias()
+            && self.logits_processors.is_empty()
+    }
+
+    /// True if an OpenAI `logit_bias` map is set. Any sampling path that does
+    /// not route through [`Self::sample`] — notably the GPU-autonomous decode
+    /// sampler, which draws from the model's raw logits — must refuse the
+    /// request when this returns true, or the bias is silently dropped.
+    pub fn has_logits_bias(&self) -> bool {
+        self.logits_bias.is_some()
+    }
+
+    /// Apply the OpenAI `logit_bias` map: `logits[token] += bias`, on the raw
+    /// logits, before any filtering or sampling.
+    ///
+    /// Matches the reference implementations — vLLM's
+    /// `LogitBiasLogitsProcessor::apply` is `logits[slice] += bias_tensor` and
+    /// SGLang's is a single `logits.add_()` — including the absence of any
+    /// clamping of the biased value.
+    fn apply_logits_bias(&self, logits: Tensor) -> Result<Tensor> {
+        let Some(bias) = self.logits_bias.as_ref() else {
+            return Ok(logits);
+        };
+        let vocab = logits.dim(D::Minus1)?;
+
+        let mut guard = self
+            .logits_bias_dense
+            .lock()
+            .expect("could not lock logits_bias cache");
+        let dense = match guard.as_ref() {
+            // Reuse only against logits the cached tensor actually matches.
+            Some(cached)
+                if cached.device().same_device(logits.device())
+                    && cached.dtype() == logits.dtype()
+                    && cached.dims1().is_ok_and(|n| n == vocab) =>
+            {
+                cached.clone()
+            }
+            _ => {
+                let mut host = vec![0f32; vocab];
+                let mut out_of_range = 0usize;
+                for (token, b) in bias.iter() {
+                    match host.get_mut(*token as usize) {
+                        Some(slot) => *slot += *b,
+                        None => out_of_range += 1,
+                    }
+                }
+                if out_of_range > 0 {
+                    // Loud rather than silent: the caller asked to bias tokens
+                    // this model cannot emit. Runs at most once per sampler,
+                    // since the dense vector is then cached.
+                    tracing::warn!(
+                        "logit_bias: {out_of_range} token id(s) are outside the model's \
+                         vocabulary of {vocab} and were ignored"
+                    );
+                }
+                let dense =
+                    Tensor::from_vec(host, vocab, logits.device())?.to_dtype(logits.dtype())?;
+                *guard = Some(dense.clone());
+                dense
+            }
+        };
+        drop(guard);
+
+        logits.broadcast_add(&dense)
     }
 
     fn get_top_logprobs(&self, probs: &[f32]) -> Result<Vec<TopLogprob>> {
@@ -478,43 +637,68 @@ impl Sampler {
             probs = processor.apply(&probs, context)?;
         }
 
-        let context = Tensor::new(context, logits.device())?;
-        let mut counts = logits.zeros_like()?;
-        counts = counts.scatter_add(
-            &context,
-            &context.ones_like()?.to_dtype(counts.dtype())?,
-            D::Minus1,
-        )?;
+        // The penalty prologue — the context upload, the `counts` histogram and
+        // the `presence` mask — feeds nothing except the three `match` arms
+        // below. When no penalty is actually configured all three arms are
+        // no-ops, so every one of those tensors was computed and discarded.
+        //
+        // That was not a cheap nothing. It cost, per sequence per decoded
+        // token: one *blocking* H2D upload of the sequence's entire token
+        // history (`Tensor::new` on a CUDA device — CLAUDE.md pitfall #5 — and
+        // it grows as the sequence generates), plus roughly eight vocab-sized
+        // kernels (`zeros_like`, `ones_like`, `to_dtype`, `scatter_add`, `gt`,
+        // two more `*_like`, `where_cond`) and their allocations. At a 129K
+        // vocab that is ~3 MB of pointless device traffic and a full host
+        // round trip per sequence per token — on the *fast* path, the one
+        // taken by the common no-penalty request.
+        //
+        // Gate the whole prologue on a penalty being live. When one is, the
+        // computation and its order are untouched, so results are unchanged;
+        // when none is, the removed tensors had no consumer, so results are
+        // bit-identical.
+        let freq_active = matches!(self.frequency_penalty, Some(p) if p != 0.);
+        let pres_active = matches!(self.presence_penalty, Some(p) if p != 0.);
+        let rep_active = matches!(self.repetition_penalty, Some(p) if p != 1.);
 
-        let presence = counts
-            .gt(0.)?
-            .where_cond(&counts.ones_like()?, &counts.zeros_like()?)?;
+        if freq_active || pres_active || rep_active {
+            let context = Tensor::new(context, logits.device())?;
+            let mut counts = logits.zeros_like()?;
+            counts = counts.scatter_add(
+                &context,
+                &context.ones_like()?.to_dtype(counts.dtype())?,
+                D::Minus1,
+            )?;
 
-        match self.frequency_penalty {
-            Some(freq_penalty) if freq_penalty != 0. => {
-                probs = (probs - (freq_penalty as f64 * counts)?)?;
+            let presence = counts
+                .gt(0.)?
+                .where_cond(&counts.ones_like()?, &counts.zeros_like()?)?;
+
+            match self.frequency_penalty {
+                Some(freq_penalty) if freq_penalty != 0. => {
+                    probs = (probs - (freq_penalty as f64 * counts)?)?;
+                }
+                _ => (),
             }
-            _ => (),
-        }
 
-        match self.presence_penalty {
-            Some(pres_penalty) if pres_penalty != 0. => {
-                probs = (probs - (pres_penalty as f64 * &presence)?)?;
+            match self.presence_penalty {
+                Some(pres_penalty) if pres_penalty != 0. => {
+                    probs = (probs - (pres_penalty as f64 * &presence)?)?;
+                }
+                _ => (),
             }
-            _ => (),
-        }
 
-        match self.repetition_penalty {
-            Some(rep_penalty) if rep_penalty != 1. => {
-                let pos_mask = probs.gt(0.)?;
-                let scaled_pos = (&probs / (rep_penalty as f64))?;
-                let scaled_neg = (&probs * (rep_penalty as f64))?;
-                let modified = pos_mask.where_cond(&scaled_pos, &scaled_neg)?;
+            match self.repetition_penalty {
+                Some(rep_penalty) if rep_penalty != 1. => {
+                    let pos_mask = probs.gt(0.)?;
+                    let scaled_pos = (&probs / (rep_penalty as f64))?;
+                    let scaled_neg = (&probs * (rep_penalty as f64))?;
+                    let modified = pos_mask.where_cond(&scaled_pos, &scaled_neg)?;
 
-                let pres_mask = presence.gt(0.)?;
-                probs = pres_mask.where_cond(&modified, &probs)?;
+                    let pres_mask = presence.gt(0.)?;
+                    probs = pres_mask.where_cond(&modified, &probs)?;
+                }
+                _ => (),
             }
-            _ => (),
         }
 
         probs = candle_nn::ops::softmax_last_dim(&(probs / self.temperature.unwrap_or(1.))?)?;
@@ -561,20 +745,19 @@ impl Sampler {
 
         // Sample using the Gumbel-max trick fully on-device.
         let log_probs = probs.log()?;
-        // Generate cached Gumbel noise (-log(-log(u))) once.
+        // Draw Gumbel noise (-log(-log(u))) FRESH on every call. Caching it
+        // across calls is not an allocation optimisation, it is a correctness
+        // bug: a `Sampler` lives for one whole request, so reusing one noise
+        // draw makes `argmax(log_probs + gumbel)` a fixed ranking and every
+        // token of that request comes out identical.
         let gumbel = {
-            let mut guard = self.gumbel_cache.lock().unwrap();
-            if guard.is_none() {
-                let uniform = Tensor::rand(0f32, 1f32, log_probs.shape(), log_probs.device())?;
-                let noise = uniform
-                    .clamp(1e-20, 1.0)?
-                    .log()? // ln(u)
-                    .neg()? // -ln(u)
-                    .log()? // ln(-ln(u))
-                    .neg()?; // -ln(-ln(u))
-                *guard = Some(noise);
-            }
-            guard.as_ref().unwrap().clone()
+            let uniform = Tensor::rand(0f32, 1f32, log_probs.shape(), log_probs.device())?;
+            uniform
+                .clamp(1e-20, 1.0)?
+                .log()? // ln(u)
+                .neg()? // -ln(u)
+                .log()? // ln(-ln(u))
+                .neg()? // -ln(-ln(u))
         };
 
         let gumbel_logits = (&log_probs + &gumbel)?;
@@ -651,14 +834,20 @@ impl Sampler {
     /// Truncate a candidate set (token id, full-softmax prob) to the kept
     /// sampling distribution, replicating `sample_top_kp_min_p`'s semantics
     /// exactly: top-k first, then top-p (descending cumsum, the crossing
-    /// element kept), then min-p — with min-p skipped whenever top_p is
-    /// outside (0, 1), mirroring that function's early-return structure.
+    /// element kept), then min-p. Each filter is applied whenever its own
+    /// parameter is in range; min-p does not depend on top-p.
     ///
     /// `candidates` must contain the top `candidates.len()` tokens of the
     /// full distribution (any order). Returns `None` when exactness cannot
-    /// be guaranteed: a pure-top-p request (top_k <= 0) whose nucleus is not
-    /// fully contained in the candidate set (candidate mass < top_p). With
-    /// top_k > 0 containment is structural since the caller selects
+    /// be guaranteed, i.e. when the kept set is not provably closed inside
+    /// the candidate set:
+    /// - a pure-top-p request (top_k <= 0) whose nucleus is not fully
+    ///   contained in the candidates (candidate mass < top_p);
+    /// - a min-p request that neither top-k nor top-p has already closed,
+    ///   whose smallest candidate is still above the min-p threshold (so
+    ///   tokens outside the candidate set may also survive min-p).
+    ///
+    /// With top_k > 0 containment is structural since the caller selects
     /// `k_sel >= top_k` candidates.
     ///
     /// Returned pairs are sorted descending by probability.
@@ -672,6 +861,9 @@ impl Sampler {
         });
 
         // Top-k truncation (candidates are a superset: k_sel >= top_k).
+        // `top_k <= len` means the candidate set already is (or is truncated
+        // to) the exact top-k set, so no token outside it can survive.
+        let topk_closed = self.top_k > 0 && (self.top_k as usize) <= candidates.len();
         if self.top_k > 0 && (self.top_k as usize) < candidates.len() {
             candidates.truncate(self.top_k as usize);
         }
@@ -679,6 +871,7 @@ impl Sampler {
         let top_p = self.top_p as f32;
         let min_p = self.min_p as f32;
 
+        let mut closed = topk_closed;
         if top_p > 0.0 && top_p < 1.0 {
             if self.top_k <= 0 {
                 let mass: f32 = candidates.iter().map(|(_, p)| *p).sum();
@@ -697,14 +890,27 @@ impl Sampler {
                     true
                 }
             });
-            // CPU-path min-p (`min_p_threshold >= prob` is dropped). Only
-            // reached when top_p is in (0, 1) — `sample_top_kp_min_p`
-            // returns before min-p otherwise.
-            if min_p > 0.0 && min_p < 1.0 {
-                let max_p = candidates.first().map(|(_, p)| *p).unwrap_or(0.0);
-                let threshold = max_p * min_p;
-                candidates.retain(|(_, p)| *p > threshold);
+            // The nucleus is contained (mass check above, or structurally
+            // when top_k > 0), so the kept set is now closed.
+            closed = true;
+        }
+
+        // CPU-path min-p (`min_p_threshold >= prob` is dropped). Applied
+        // whenever min_p is in range, exactly as `sample_top_kp_min_p` does —
+        // independently of top_p.
+        if min_p > 0.0 && min_p < 1.0 {
+            let max_p = candidates.first().map(|(_, p)| *p).unwrap_or(0.0);
+            let threshold = max_p * min_p;
+            // If neither top-k nor top-p closed the set, the candidates are
+            // just the top `k_sel` of the vocabulary and tokens below the cut
+            // may still clear the min-p threshold. Only safe when the smallest
+            // candidate is already at/below the threshold (everything outside
+            // is <= it, hence also dropped); otherwise refuse and let the
+            // caller fall back to the exact full-vocab CPU path.
+            if !closed && candidates.last().is_some_and(|(_, p)| *p > threshold) {
+                return None;
             }
+            candidates.retain(|(_, p)| *p > threshold);
         }
 
         Some(candidates)
@@ -961,10 +1167,6 @@ impl Sampler {
         // Get sorted top-k indices with partial sort, zeroing out rest
         let idx_probs = partial_sort_top_k(probs, k, true);
 
-        if top_p <= 0.0 || top_p >= 1.0 {
-            return self.sample_multinomial(probs, return_logprobs, rng);
-        }
-
         // TOP P
 
         // top-p sampling (or "nucleus sampling") samples from the smallest set of
@@ -972,32 +1174,38 @@ impl Sampler {
         // have very low probabilities and are less likely to go "off the rails".
 
         // Clamp smaller probabilities to zero.
-        let mut cumsum = 0.;
-        for (index, prob) in &idx_probs {
-            if cumsum >= top_p {
-                probs[*index as usize] = 0.0;
-            } else {
-                cumsum += prob;
+        if top_p > 0.0 && top_p < 1.0 {
+            let mut cumsum = 0.;
+            for (index, prob) in &idx_probs {
+                if cumsum >= top_p {
+                    probs[*index as usize] = 0.0;
+                } else {
+                    cumsum += prob;
+                }
             }
         }
-
-        if min_p <= 0.0 || min_p >= 1.0 {
-            return self.sample_multinomial(probs, return_logprobs, rng);
-        }
-
-        // Get max_p from first sorted element
-        let max_p = idx_probs.first().map(|(_, p)| *p).unwrap_or(0.0);
 
         // MIN P
 
         // min-p sampling samples from the tokens whose prob are greater than
         // (max prob of token in dist) * min_p
+        //
+        // This filter is INDEPENDENT of top-p: `top_p = 1.0, min_p = 0.1` is a
+        // valid, common request. This block used to sit behind an early return
+        // taken whenever top_p was outside (0, 1), which silently discarded the
+        // caller's min_p.
+        if min_p > 0.0 && min_p < 1.0 {
+            // Get max_p from first sorted element. Top-p never zeroes the
+            // argmax (its cumsum starts below top_p), so this is the max of
+            // the surviving set either way.
+            let max_p = idx_probs.first().map(|(_, p)| *p).unwrap_or(0.0);
 
-        // Clamp smaller probabilities to zero.
-        let min_p_threshold = max_p * min_p;
-        for (index, prob) in &idx_probs {
-            if min_p_threshold >= *prob {
-                probs[*index as usize] = 0.0;
+            // Clamp smaller probabilities to zero.
+            let min_p_threshold = max_p * min_p;
+            for (index, prob) in &idx_probs {
+                if min_p_threshold >= *prob {
+                    probs[*index as usize] = 0.0;
+                }
             }
         }
 
@@ -1198,6 +1406,10 @@ impl Sampler {
         sample_speculative: bool,
         multiple_sequences: bool,
     ) -> Result<Logprobs> {
+        // `logit_bias` is defined as added to the model's raw logits *prior to
+        // sampling*, so it runs before every filter — including top-nσ, whose
+        // threshold is computed from the raw logits.
+        let logits = self.apply_logits_bias(logits)?;
         // Top-nσ runs first, on the raw logits, so every downstream path
         // (GPU fast path, GPU radix top-k, CPU) sees the filtered set.
         let logits = match self.top_nsigma {
@@ -1209,10 +1421,7 @@ impl Sampler {
         // no logprobs, no speculative sampling) we can stay entirely on GPU
         // and ship a single u32 token back. This skips the ~5.9 ms/token
         // CPU pipeline (D2H 152K logits + softmax + topk/topp + multinomial).
-        let no_penalties = self.frequency_penalty.unwrap_or(0.0) == 0.0
-            && self.presence_penalty.unwrap_or(0.0) == 0.0
-            && self.repetition_penalty.unwrap_or(1.0) == 1.0
-            && self.dry_params.is_none();
+        let no_penalties = !self.has_penalties();
         let trivial = !sample_speculative
             && !return_logprobs
             && self.logits_processors.is_empty()
@@ -1274,11 +1483,38 @@ impl Sampler {
             // guaranteed (Ok(None)) or on any GPU error.
             #[cfg(feature = "cuda")]
             if logits.device().is_cuda() {
+                use std::sync::atomic::Ordering;
                 match self.sample_fast_topk_gpu(&logits, rng.clone()) {
-                    Ok(Some(result)) => return Ok(result),
-                    Ok(None) => {}
+                    Ok(Some(result)) => {
+                        gpu_sampling_health::GPU_OK.fetch_add(1, Ordering::Relaxed);
+                        return Ok(result);
+                    }
+                    Ok(None) => {
+                        gpu_sampling_health::DECLINED.fetch_add(1, Ordering::Relaxed);
+                    }
                     Err(e) => {
-                        tracing::warn!("GPU radix top-k sampling failed; falling back to CPU: {e}");
+                        // Loud once, then rare. The first failure is an ERROR
+                        // because it means every subsequent token pays a
+                        // full-vocab D2H + CPU sort; after that we back off to
+                        // powers of two so a persistent fault stays visible
+                        // without emitting one line per token (the previous
+                        // behaviour: ~10 lines/s at B=256, which reads as
+                        // noise and got ignored for exactly that reason).
+                        let prior = gpu_sampling_health::FAILED.fetch_add(1, Ordering::Relaxed);
+                        if prior == 0 {
+                            tracing::error!(
+                                "GPU radix top-k sampling FAILED — every sampled token now \
+                                 falls back to the CPU sampler (full-vocab D2H + sort per \
+                                 sequence per step). This is a throughput regression, not a \
+                                 transient. Cause: {e}"
+                            );
+                        } else if (prior + 1).is_power_of_two() {
+                            tracing::warn!(
+                                "GPU radix top-k sampling still failing: {} CPU fallbacks so \
+                                 far. Cause: {e}",
+                                prior + 1
+                            );
+                        }
                     }
                 }
             }
@@ -1291,6 +1527,21 @@ impl Sampler {
             logits = processor.apply(&logits, context)?;
         }
         let next_token = if sample_speculative {
+            // NOTE: this branch is an ARGMAX at every temperature.
+            // `sample_speculative_top_kp_min_p` finishes with `argmax_f32`, and
+            // dividing by a positive temperature is monotonic, so the
+            // `Some(temperature)` arm below selects exactly the same token as
+            // the greedy arm — it only rescales the reported logprob. There is
+            // no stochastic draw here and never was.
+            //
+            // That is why speculative *verification* (accept iff the draft
+            // token equals this one) is lossless for greedy decoding only, and
+            // why `pipeline::sampling::sample_target_sequence_speculative`
+            // refuses to speculate when the sequence is not greedy rather than
+            // shipping greedy tokens for a request that asked for sampling.
+            // Correct temperature speculation needs rejection sampling
+            // (`min(1, p/q)` accept + `max(0, p-q)` residual redraw), which is
+            // not implemented.
             match self.temperature {
                 None => self.sample_speculative_top_kp_min_p(
                     logits,
@@ -1358,6 +1609,7 @@ mod tests {
             0.05,
             None,
             vec![],
+            None,
         )
         .unwrap();
         let logits = Tensor::arange(0f32, 1024f32, &Device::Cpu).unwrap();
@@ -1399,6 +1651,7 @@ mod tests {
             0.05,
             None,
             vec![],
+            None,
         )
         .unwrap();
         let logits = Tensor::arange(0f32, 1024f32, &Device::Cpu).unwrap();
@@ -1437,6 +1690,7 @@ mod tests {
             0.0,  // min_p
             None, // top_nsigma
             vec![],
+            None,
         )
         .unwrap();
         assert!(s_greedy.is_greedy());
@@ -1460,6 +1714,7 @@ mod tests {
             0.0,
             None,
             vec![],
+            None,
         )
         .unwrap();
         assert!(!s_topp.is_greedy());
@@ -1469,6 +1724,100 @@ mod tests {
         assert_eq!(s_topp.frequency_penalty(), Some(0.1));
         assert_eq!(s_topp.presence_penalty(), Some(0.2));
         assert_eq!(s_topp.top_nsigma(), None);
+    }
+
+    /// `is_raw_argmax` is the precondition for substituting an external
+    /// `argmax(raw logits)` for [`Sampler::sample`] — which is exactly what
+    /// speculative verification does.
+    ///
+    /// It is **strictly stronger than `is_greedy`**, and the gap is the point:
+    /// with `temperature: None` and a penalty (or a logits processor), `sample`
+    /// runs `apply_penalties` and every processor *before* `sample_argmax`, so
+    /// the token it returns is `argmax(modified)`, not `argmax(raw)`.
+    #[test]
+    fn is_raw_argmax_is_stronger_than_is_greedy() {
+        let mk = |temperature, freq, pres, rep, top_k, top_p, min_p, nsigma| {
+            super::Sampler::new(
+                temperature,
+                0,
+                None,
+                freq,
+                pres,
+                rep,
+                None,
+                top_k,
+                top_p,
+                min_p,
+                nsigma,
+                vec![],
+                None,
+            )
+            .unwrap()
+        };
+
+        // Plain greedy: both hold.
+        let plain = mk(None, None, None, None, -1, 1.0, 0.0, None);
+        assert!(plain.is_greedy());
+        assert!(plain.is_raw_argmax());
+
+        // temperature > 0: neither.
+        let hot = mk(Some(0.7), None, None, None, -1, 1.0, 0.0, None);
+        assert!(!hot.is_greedy());
+        assert!(!hot.is_raw_argmax());
+
+        // The gap: greedy, but the logits get rewritten first.
+        for (freq, pres, rep) in [
+            (Some(0.5), None, None),
+            (None, Some(0.5), None),
+            (None, None, Some(1.1)),
+        ] {
+            let penalised = mk(None, freq, pres, rep, -1, 1.0, 0.0, None);
+            assert!(penalised.is_greedy(), "still temperature-free");
+            assert!(
+                !penalised.is_raw_argmax(),
+                "a penalty rewrites the logits before argmax, so argmax(raw) is a \
+                 different token"
+            );
+        }
+
+        // Identity penalties are not penalties.
+        let identity = mk(None, Some(0.0), Some(0.0), Some(1.0), -1, 1.0, 0.0, None);
+        assert!(identity.is_raw_argmax());
+
+        // top-k / top-p / min-p are only consulted on the `Some(temperature)`
+        // branch, so they cannot move a greedy argmax…
+        let filtered = mk(None, None, None, None, 40, 0.95, 0.05, None);
+        assert!(filtered.is_raw_argmax());
+
+        // …and top-nσ masks only tokens BELOW the maximum, so the argmax is
+        // invariant under it too.
+        let nsigma = mk(None, None, None, None, -1, 1.0, 0.0, Some(1.5));
+        assert!(nsigma.is_raw_argmax());
+
+        // A custom logits processor runs before argmax on the CPU path.
+        let with_processor = super::Sampler::new(
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            -1,
+            1.0,
+            0.0,
+            None,
+            vec![std::sync::Arc::new(
+                |logits: &candle_core::Tensor, _: &[u32]| Ok(logits.clone()),
+            )],
+            None,
+        )
+        .unwrap();
+        assert!(with_processor.is_greedy());
+        assert!(
+            !with_processor.is_raw_argmax(),
+            "a processor may rewrite the logits, and the sampler cannot know it did not"
+        );
     }
 
     /// Build a sampler with only temperature + top-nσ active (no top-k/p/min-p,
@@ -1488,6 +1837,7 @@ mod tests {
             0.0,
             top_nsigma,
             vec![],
+            None,
         )
         .unwrap()
     }
@@ -1633,6 +1983,7 @@ mod tests {
                 0.0,
                 None,
                 vec![],
+                None,
             )
             .unwrap()
         };
@@ -1668,6 +2019,445 @@ mod tests {
             sample(&mk(None, Some(2.0), None)),
             1,
             "presence_penalty must break the loop"
+        );
+    }
+
+    /// `sample_fast` (the on-device Gumbel-max path) must draw fresh noise on
+    /// every call.
+    ///
+    /// Regression: the noise tensor was drawn once and cached on the `Sampler`,
+    /// then cloned for every subsequent call. A `Sampler` is constructed once
+    /// per request (`engine/add_request.rs`), so `argmax(log_probs + gumbel)`
+    /// with a frozen `gumbel` collapsed to a fixed ranking — every token of a
+    /// request was the same token, at any temperature.
+    ///
+    /// Discriminator: a flat distribution over 64 tokens at temperature 1.0.
+    /// Correct sampling covers essentially the whole support in 512 draws;
+    /// frozen noise yields exactly one distinct token.
+    #[test]
+    fn sample_fast_draws_fresh_gumbel_noise_per_call() {
+        use super::Sampler;
+        use candle_core::{Device, Tensor};
+        use std::collections::HashSet;
+
+        const VOCAB: usize = 64;
+        const DRAWS: usize = 512;
+
+        // Uniform logits: every token has probability 1/64.
+        let logits = Tensor::from_vec(vec![0f32; VOCAB], VOCAB, &Device::Cpu).unwrap();
+        // temperature=1.0, top_k/top_p/min_p disabled so no sort runs and the
+        // draw is a pure Gumbel-max over the full support.
+        let sampler = Sampler::new(
+            Some(1.0),
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            -1,
+            1.0,
+            0.0,
+            None,
+            vec![],
+            None,
+        )
+        .unwrap();
+
+        let mut seen = HashSet::new();
+        for _ in 0..DRAWS {
+            let token = sampler
+                .sample_fast(logits.clone(), &[0u32], false, -1, 1.0, 0.0)
+                .unwrap()
+                .token;
+            assert!((token as usize) < VOCAB);
+            seen.insert(token);
+        }
+
+        // Expected distinct count for 512 uniform draws over 64 tokens is
+        // ~64.0 (P(any token missed) ~ 3e-4). Frozen noise gives 1.
+        assert!(
+            seen.len() >= VOCAB * 3 / 4,
+            "sample_fast covered only {} of {VOCAB} tokens in {DRAWS} draws from a flat \
+             distribution — Gumbel noise is not being redrawn per call",
+            seen.len()
+        );
+    }
+
+    /// `min_p` must be applied whenever it is in (0, 1), independently of
+    /// `top_p`.
+    ///
+    /// Regression: `sample_top_kp_min_p` returned early whenever `top_p` was
+    /// outside (0, 1) — before the min-p block — so `top_p = 1.0, min_p = 0.5`
+    /// (a perfectly ordinary request) applied no min-p at all and the tail the
+    /// caller paid to exclude stayed samplable.
+    ///
+    /// Discriminator: softmax([4, 0, 0, 0]) = [0.9479, 0.0174, 0.0174, 0.0174].
+    /// min_p = 0.5 puts the threshold at 0.474, so only token 0 survives and
+    /// every draw must be 0. With min-p skipped, ~5.2% of draws land on 1..3;
+    /// over 400 draws the probability of seeing none of them is ~5e-10.
+    #[test]
+    fn min_p_applies_when_top_p_is_disabled() {
+        use super::Sampler;
+        use candle_core::{Device, Tensor};
+        use rand::SeedableRng;
+        use rand_isaac::Isaac64Rng;
+        use std::sync::{Arc, Mutex};
+
+        const DRAWS: usize = 400;
+        let raw = vec![4.0f32, 0.0, 0.0, 0.0];
+        let logits = || Tensor::from_vec(raw.clone(), 4, &Device::Cpu).unwrap();
+
+        // temperature 1.0, top_k disabled, top_p disabled (1.0), min_p = 0.5.
+        let mk = |min_p: f64| {
+            Sampler::new(
+                Some(1.0),
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                -1,
+                1.0,
+                min_p,
+                None,
+                vec![],
+                None,
+            )
+            .unwrap()
+        };
+
+        let draw = |sampler: &Sampler| {
+            // One shared rng so the stream advances across draws.
+            let rng = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(0xA11CE)));
+            let mut tail_hits = 0usize;
+            for _ in 0..DRAWS {
+                let token = sampler
+                    .sample(logits(), &[0u32], false, rng.clone(), false, false)
+                    .unwrap()
+                    .token;
+                if token != 0 {
+                    tail_hits += 1;
+                }
+            }
+            tail_hits
+        };
+
+        // Control: with min_p off the tail is reachable, so the fixture is live
+        // and the assertion below is not vacuous.
+        assert!(
+            draw(&mk(0.0)) > 0,
+            "fixture is inert: the tail was never sampled even with min_p disabled"
+        );
+
+        assert_eq!(
+            draw(&mk(0.5)),
+            0,
+            "min_p = 0.5 with top_p = 1.0 must exclude every token below \
+             0.5 * max_prob; the tail was still sampled, so min_p was skipped"
+        );
+    }
+
+    /// `sample(.., sample_speculative = true, ..)` is an ARGMAX at every
+    /// temperature — it never draws.
+    ///
+    /// `sample_speculative_top_kp_min_p` ends in `argmax_f32`, and dividing by
+    /// a positive temperature is monotonic, so the `Some(temperature)` arm
+    /// picks the same token as the greedy arm. This is the property that makes
+    /// accept-on-token-equality verification valid for greedy decoding only,
+    /// and it is why `pipeline::sampling::sample_target_sequence_speculative`
+    /// refuses to speculate above temperature 0.
+    ///
+    /// The test is a guard: if this branch is ever made stochastic without
+    /// also implementing the `min(1, p/q)` accept test and the `max(0, p-q)`
+    /// residual redraw, verification silently stops reproducing the target
+    /// distribution — and this fails first.
+    #[test]
+    fn speculative_branch_is_argmax_at_any_temperature() {
+        use super::Sampler;
+        use candle_core::{Device, Tensor};
+        use rand::SeedableRng;
+        use rand_isaac::Isaac64Rng;
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+
+        // Softmax at temperature 2.0 is [0.343, 0.267, 0.208, 0.162]: a real
+        // draw spreads over all four, an argmax never leaves token 0.
+        let raw = vec![3.0f32, 2.5, 2.0, 1.5];
+        let logits = || Tensor::from_vec(raw.clone(), 4, &Device::Cpu).unwrap();
+        let rng = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(4242)));
+
+        for temperature in [Some(0.5), Some(1.0), Some(2.0), None] {
+            let sampler = Sampler::new(
+                temperature,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                -1,
+                1.0,
+                0.0,
+                None,
+                vec![],
+                None,
+            )
+            .unwrap();
+            for _ in 0..64 {
+                let token = sampler
+                    .sample(logits(), &[1u32], false, rng.clone(), true, false)
+                    .unwrap()
+                    .token;
+                assert_eq!(
+                    token, 0,
+                    "speculative sampling at temperature {temperature:?} returned {token}; it \
+                     must be a deterministic argmax, or verification-by-equality is invalid"
+                );
+            }
+        }
+
+        // Control: the same sampler WITHOUT the speculative flag does draw, so
+        // the assertion above is about the speculative branch and not about a
+        // degenerate fixture.
+        let stochastic = Sampler::new(
+            Some(2.0),
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            -1,
+            1.0,
+            0.0,
+            None,
+            vec![],
+            None,
+        )
+        .unwrap();
+        let mut seen = HashSet::new();
+        for _ in 0..64 {
+            seen.insert(
+                stochastic
+                    .sample(logits(), &[1u32], false, rng.clone(), false, false)
+                    .unwrap()
+                    .token,
+            );
+        }
+        assert!(
+            seen.len() > 1,
+            "fixture is degenerate: non-speculative sampling never varied"
+        );
+    }
+
+    /// Build a `logit_bias` sampler over a 4-token vocabulary.
+    #[cfg(test)]
+    fn bias_sampler(
+        temperature: Option<f64>,
+        bias: Option<std::collections::HashMap<u32, f32>>,
+    ) -> super::Sampler {
+        super::Sampler::new(
+            temperature,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            -1,
+            1.0,
+            0.0,
+            None,
+            vec![],
+            bias,
+        )
+        .unwrap()
+    }
+
+    /// `logit_bias` must actually reach sampling.
+    ///
+    /// Regression: `SamplingParams::logits_bias` was written by every API
+    /// surface and read by none — `Sampler` had no field for it, `Sampler::new`
+    /// no parameter, and `Sampler::sample` no bias term. A request setting it
+    /// got 200 OK and completely unbiased output.
+    ///
+    /// Greedy over raw logits `[0, 0, 0, 5]` selects token 3. A +100 bias on
+    /// token 1 must move that to 1; a -100 bias on token 3 must move it off 3.
+    #[test]
+    fn logit_bias_shifts_the_selected_token() {
+        use candle_core::{Device, Tensor};
+        use rand::SeedableRng;
+        use rand_isaac::Isaac64Rng;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let raw = vec![0.0f32, 0.0, 0.0, 5.0];
+        let logits = || Tensor::from_vec(raw.clone(), 4, &Device::Cpu).unwrap();
+        let rng = || Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(0)));
+        let sample = |s: &super::Sampler| {
+            s.sample(logits(), &[0u32], false, rng(), false, false)
+                .unwrap()
+                .token
+        };
+
+        // Control: no bias, greedy picks the raw argmax.
+        assert_eq!(sample(&bias_sampler(None, None)), 3);
+
+        // Positive bias promotes a token that was not the argmax.
+        assert_eq!(
+            sample(&bias_sampler(None, Some(HashMap::from([(1u32, 100.0f32)])))),
+            1,
+            "a +100 logit_bias on token 1 must make it the argmax"
+        );
+
+        // Negative bias demotes the argmax.
+        assert_ne!(
+            sample(&bias_sampler(
+                None,
+                Some(HashMap::from([(3u32, -100.0f32)]))
+            )),
+            3,
+            "a -100 logit_bias on token 3 must stop it being selected"
+        );
+
+        // The bias is applied before the temperature branch too, so a dominant
+        // bias pins a stochastic sampler onto the biased token.
+        let hot = bias_sampler(Some(1.0), Some(HashMap::from([(1u32, 100.0f32)])));
+        let shared_rng = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(99)));
+        for _ in 0..64 {
+            assert_eq!(
+                hot.sample(logits(), &[0u32], false, shared_rng.clone(), false, false)
+                    .unwrap()
+                    .token,
+                1,
+                "logit_bias must apply on the temperature path as well"
+            );
+        }
+    }
+
+    /// The dense-bias cache is keyed on the incoming logits, so the same
+    /// `Sampler` used against two vocabulary sizes must bias both correctly
+    /// rather than reuse a stale vector (or fail a broadcast).
+    #[test]
+    fn logit_bias_cache_revalidates_on_vocab_change() {
+        use candle_core::{Device, Tensor};
+        use rand::SeedableRng;
+        use rand_isaac::Isaac64Rng;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let sampler = bias_sampler(None, Some(HashMap::from([(1u32, 100.0f32)])));
+        let rng = || Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(0)));
+
+        let small = Tensor::from_vec(vec![0.0f32, 0.0, 0.0, 5.0], 4, &Device::Cpu).unwrap();
+        assert_eq!(
+            sampler
+                .sample(small, &[0u32], false, rng(), false, false)
+                .unwrap()
+                .token,
+            1
+        );
+
+        let mut big_raw = vec![0.0f32; 9];
+        big_raw[8] = 5.0;
+        let big = Tensor::from_vec(big_raw, 9, &Device::Cpu).unwrap();
+        assert_eq!(
+            sampler
+                .sample(big, &[0u32], false, rng(), false, false)
+                .unwrap()
+                .token,
+            1,
+            "the cached bias vector must be rebuilt for a different vocab size"
+        );
+    }
+
+    /// Token ids past the end of the vocabulary are dropped with a warning
+    /// rather than panicking or corrupting the distribution.
+    #[test]
+    fn logit_bias_ignores_out_of_vocab_ids() {
+        use candle_core::{Device, Tensor};
+        use rand::SeedableRng;
+        use rand_isaac::Isaac64Rng;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let sampler = bias_sampler(
+            None,
+            Some(HashMap::from([(999u32, 100.0f32), (1u32, 100.0f32)])),
+        );
+        let logits = Tensor::from_vec(vec![0.0f32, 0.0, 0.0, 5.0], 4, &Device::Cpu).unwrap();
+        let rng = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(0)));
+        assert_eq!(
+            sampler
+                .sample(logits, &[0u32], false, rng, false, false)
+                .unwrap()
+                .token,
+            1,
+            "an out-of-vocab id must be ignored, leaving the in-range bias effective"
+        );
+    }
+
+    /// `has_logits_bias` is what the GPU-autonomous decode path checks before
+    /// taking a fast path that never applies the bias.
+    #[test]
+    fn has_logits_bias_reports_the_map() {
+        use std::collections::HashMap;
+
+        assert!(!bias_sampler(None, None).has_logits_bias());
+        assert!(
+            !bias_sampler(None, Some(HashMap::new())).has_logits_bias(),
+            "an empty map is not a bias and must not disable the GPU fast path"
+        );
+        assert!(bias_sampler(None, Some(HashMap::from([(1u32, 1.0f32)]))).has_logits_bias());
+    }
+
+    /// A biased sampler is greedy but is **not** raw-argmax.
+    ///
+    /// This is the interaction the merge of this PR with master's
+    /// `is_raw_argmax` created: both landed in the same place in `sampler.rs`
+    /// and neither author saw the other. `sample` applies the bias to the raw
+    /// logits before choosing, so `argmax(raw)` and what `sample` returns can
+    /// differ — which is exactly what speculative verification compares. If
+    /// `is_raw_argmax` ever answers `true` with a bias set, a spec-decode run
+    /// silently emits tokens the user's `logit_bias` was supposed to have
+    /// changed.
+    #[test]
+    fn a_biased_sampler_is_greedy_but_not_raw_argmax() {
+        use candle_core::{Device, Tensor};
+        use rand::SeedableRng;
+        use rand_isaac::Isaac64Rng;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let biased = bias_sampler(None, Some(HashMap::from([(0u32, 100.0f32)])));
+        assert!(biased.is_greedy(), "no temperature is set, so it is greedy");
+        assert!(
+            !biased.is_raw_argmax(),
+            "a logit_bias rewrites the logits before the pick, so this sampler is \
+             NOT argmax over the raw logits and no fast path may substitute one"
+        );
+
+        // And demonstrate the divergence the flag is protecting, so the flag is
+        // not just asserted against itself: raw argmax here is token 3, but the
+        // bias moves the answer to token 0.
+        let raw = vec![0.0f32, 0.0, 0.0, 5.0];
+        let logits = Tensor::from_vec(raw.clone(), 4, &Device::Cpu).unwrap();
+        let rng = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(0)));
+        let picked = biased
+            .sample(logits, &[0u32], false, rng, false, false)
+            .unwrap()
+            .token;
+        let raw_argmax = 3u32;
+        assert_eq!(
+            picked, 0,
+            "the +100 bias on token 0 must win over the raw maximum at token 3"
+        );
+        assert_ne!(
+            picked, raw_argmax,
+            "if these ever agree this test proves nothing — pick a fixture where \
+             the bias actually changes the answer"
         );
     }
 }
@@ -1748,6 +2538,7 @@ mod topk_parity_tests {
             min_p,
             None,
             vec![],
+            None,
         )
         .unwrap()
     }
@@ -1769,7 +2560,8 @@ mod topk_parity_tests {
         (0, 0.9, 0.0),     // pure top-p (nucleus containment via peaked logits)
         (100, 0.95, 0.05), // top-k + top-p + min-p
         (64, 0.3, 0.0),    // aggressive top-p
-        (50, 0.0, 0.2),    // top_p out of (0,1): CPU skips top-p AND min-p
+        (50, 0.0, 0.2),    // top_p out of (0,1): top-p skipped, min-p still runs
+        (64, 1.0, 0.5),    // top_p disabled: min-p must still run
     ];
 
     /// Same kept set + same probabilities as the CPU path's in-place zeroing.
@@ -1870,6 +2662,43 @@ mod topk_parity_tests {
     /// (return None) rather than truncate the distribution: near-uniform
     /// logits over 4096 tokens put ~25% of the mass in the top 1024, well
     /// under top_p=0.9.
+    /// `top_p = 1.0, min_p > 0` must still truncate on the candidate path.
+    ///
+    /// Regression: min-p sat inside the `top_p in (0,1)` branch here too (to
+    /// mirror `sample_top_kp_min_p`'s early return), so a top-k + min-p
+    /// request returned the untouched top-k set. Hand-built candidates make
+    /// the expected kept set exact.
+    #[test]
+    fn min_p_applies_to_candidates_when_top_p_disabled() {
+        // Descending, and the smallest candidate is far under the threshold so
+        // the containment guard is satisfied.
+        let candidates = vec![(3u32, 0.90f32), (0, 0.06), (7, 0.03), (5, 0.01)];
+        // top_k = 4 (== candidate count, so top-k closes the set), top_p = 1.0
+        // (disabled), min_p = 0.5 => threshold 0.45, only 0.90 survives.
+        let sampler = make_sampler(4, 1.0, 0.5);
+        assert_eq!(
+            sampler.truncate_topk_candidates(candidates).unwrap(),
+            vec![(3u32, 0.90f32)],
+            "min_p must be applied even though top_p is 1.0"
+        );
+    }
+
+    /// min-p on a set that neither top-k nor top-p closed must refuse rather
+    /// than truncate against an incomplete candidate list: the smallest
+    /// candidate is above the min-p threshold, so tokens below the radix cut
+    /// could also clear it.
+    #[test]
+    fn min_p_uncontained_candidates_fall_back() {
+        let candidates = vec![(0u32, 0.30f32), (1, 0.28), (2, 0.26)];
+        // top_k disabled, top_p disabled: nothing closes the set. Threshold is
+        // 0.5 * 0.30 = 0.15 and the smallest candidate (0.26) is above it.
+        let sampler = make_sampler(-1, 1.0, 0.5);
+        assert!(
+            sampler.truncate_topk_candidates(candidates).is_none(),
+            "uncontained min-p must trigger the CPU fallback, not silent truncation"
+        );
+    }
+
     #[test]
     fn pure_topp_fat_nucleus_falls_back() {
         let logits: Vec<f32> = (0..VOCAB).map(|i| (i % 17) as f32 * 1e-3).collect();
@@ -1880,5 +2709,119 @@ mod topk_parity_tests {
             sampler.truncate_topk_candidates(candidates).is_none(),
             "fat nucleus must trigger the CPU fallback, not silent truncation"
         );
+    }
+
+    /// Tests for the `sample_fast` penalty-prologue gate.
+    ///
+    /// `sample_fast` used to upload the sequence's whole token history to the
+    /// device and build a `counts` histogram + `presence` mask on *every* call,
+    /// then discard all of it unless a penalty was configured. The prologue is
+    /// now gated. These two tests pin the only way that gate can be wrong: the
+    /// guard's notion of "no penalty is active" must agree exactly with the
+    /// `match` arms it is skipping.
+    ///
+    /// Both use a sharply peaked logit vector so the on-device Gumbel-max draw
+    /// is deterministic — the winning margin (20+ logits) is far outside the
+    /// range Gumbel noise can overturn.
+    mod sample_fast_penalty_gate {
+        use crate::sampler::Sampler;
+        use candle_core::{Device, Tensor};
+
+        const VOCAB: usize = 8;
+
+        /// logits[2] is the clear winner; logits[1] is the runner-up.
+        fn logits() -> Tensor {
+            let mut v = vec![0f32; VOCAB];
+            v[1] = 30.0;
+            v[2] = 60.0;
+            Tensor::from_vec(v, VOCAB, &Device::Cpu).unwrap()
+        }
+
+        /// Token 2 occurs five times, so a frequency penalty bites it hard.
+        fn context() -> Vec<u32> {
+            vec![2, 2, 2, 2, 2]
+        }
+
+        fn sampler(
+            frequency_penalty: Option<f32>,
+            presence_penalty: Option<f32>,
+            repetition_penalty: Option<f32>,
+        ) -> Sampler {
+            Sampler::new(
+                None,
+                0,
+                None,
+                frequency_penalty,
+                presence_penalty,
+                repetition_penalty,
+                None,
+                0,   // top_k off  -> no fast_sort_asc
+                1.0, // top_p off  -> no fast_cumsum
+                0.0, // min_p off
+                None,
+                vec![],
+                None, // logits_bias — added by #151 after #160 wrote this fixture
+            )
+            .unwrap()
+        }
+
+        fn sampled_token(s: &Sampler) -> u32 {
+            s.sample_fast(logits(), &context(), false, 0, 1.0, 0.0)
+                .unwrap()
+                .token
+        }
+
+        /// Penalties set to their *neutral* values (0.0 / 0.0 / 1.0) must be
+        /// indistinguishable from penalties left unset. Before the gate both
+        /// spellings built the prologue and then took no `match` arm; after the
+        /// gate both skip it. If the guard's neutral test ever drifts from the
+        /// arms' (`!= 0.` / `!= 1.`), this is what catches it.
+        #[test]
+        fn neutral_penalties_behave_exactly_like_unset_penalties() {
+            let unset = sampled_token(&sampler(None, None, None));
+            let neutral = sampled_token(&sampler(Some(0.0), Some(0.0), Some(1.0)));
+            assert_eq!(
+                unset, 2,
+                "with no penalty active the peaked logit must win outright"
+            );
+            assert_eq!(
+                neutral, unset,
+                "neutral penalty values must not change the sampled token"
+            );
+        }
+
+        /// The complement: a genuinely active penalty must still be applied.
+        /// This is the regression the gate could plausibly introduce — skipping
+        /// the prologue when it was actually needed. Token 2 carries a 30-logit
+        /// lead; five occurrences at a penalty of 10.0 subtract 50, so token 1
+        /// must take over.
+        #[test]
+        fn an_active_frequency_penalty_is_still_applied() {
+            assert_eq!(
+                sampled_token(&sampler(Some(10.0), None, None)),
+                1,
+                "an active frequency penalty must still suppress the repeated token"
+            );
+        }
+
+        /// Presence and repetition penalties independently keep the prologue
+        /// alive — the guard is an OR, and each disjunct must work on its own.
+        #[test]
+        fn presence_and_repetition_penalties_each_keep_the_prologue_alive() {
+            // Presence subtracts a flat 40 from any token already seen,
+            // dropping token 2 from 60 to 20, below token 1's 30.
+            assert_eq!(
+                sampled_token(&sampler(None, Some(40.0), None)),
+                1,
+                "an active presence penalty must still suppress the seen token"
+            );
+            // Repetition divides positive logits of seen tokens by 3.0,
+            // dropping token 2 from 60 to 20, again below token 1's 30.
+            assert_eq!(
+                sampled_token(&sampler(None, None, Some(3.0))),
+                1,
+                "an active repetition penalty must still suppress the seen token"
+            );
+        }
     }
 }

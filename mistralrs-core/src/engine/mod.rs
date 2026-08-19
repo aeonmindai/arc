@@ -243,20 +243,28 @@ impl Engine {
             || get_mut_arcmutex!(pipeline).get_metadata().no_prefix_cache
             || prefix_cache_n == 0;
 
-        // TurboQuant packs KV blocks as U8; `gather_kv_cache` cannot
-        // dequantize them yet, so a prefix-cache hit would fail at runtime.
-        // Run without prefix reuse until dequant-on-gather lands.
-        if !no_prefix_cache
-            && get_mut_arcmutex!(pipeline)
+        // 🔑 TurboQuant and prefix caching are mutually exclusive today, and
+        // this is where one of them is switched off on the user's behalf.
+        //
+        // Say so in full. The previous message named neither flag, so a run
+        // that lost prefix caching gave the operator nothing to act on — and
+        // this is not an exotic configuration: `--pa-cache-type` unset means
+        // TurboQuant (`mistralrs-cli/src/args/paged_attn.rs:44-53`),
+        // PagedAttention is the CUDA default, and `--prefix-cache-n` defaults
+        // to 16, so the DEFAULT command line lands here.
+        //
+        // `prefix_cache_conflict` returns `None` when `prefix_cache_n == 0`,
+        // i.e. when nothing was actually taken away.
+        if !no_prefix_cache {
+            let conflict = get_mut_arcmutex!(pipeline)
                 .get_metadata()
                 .cache_config
                 .as_ref()
-                .is_some_and(|c| !c.cache_type.supports_prefix_cache())
-        {
-            tracing::warn!(
-                "TurboQuant KV cache is active: disabling prefix caching (gathering packed TurboQuant blocks is not supported yet). Multi-turn serving works, without prefix reuse."
-            );
-            no_prefix_cache = true;
+                .and_then(|c| c.cache_type.prefix_cache_conflict(prefix_cache_n));
+            if let Some(conflict) = conflict {
+                tracing::warn!("{conflict}");
+                no_prefix_cache = true;
+            }
         }
 
         let search_pipeline = match search_embedding_model {
@@ -514,6 +522,21 @@ impl Engine {
                             scheduled.prompt.iter().map(|s| s.len()).max().unwrap_or(1),
                         );
                         let _pprompt = arc_profiler::span("prompt");
+                        // Is this the LAST chunk of every prompt in the cohort?
+                        // They share a cursor (the bucket key includes
+                        // `token_offset`), so one answer covers the batch.
+                        let chunk =
+                            crate::pipeline::text_models_inputs_processor::prefill_chunk_size();
+                        let cursor = scheduled.prompt[0].token_offset();
+                        let final_chunk = match chunk {
+                            Some(c) => scheduled
+                                .prompt
+                                .iter()
+                                .all(|s| cursor + c >= s.get_toks().len()),
+                            None => true,
+                        };
+                        let _chunk_guard =
+                            (!final_chunk).then(crate::pipeline::mark_prefill_intermediate);
                         let prompt_exec_time = {
                             let mut pipeline = {
                                 let _s = arc_profiler::span("pipeline.lock");
@@ -582,7 +605,27 @@ impl Engine {
                             .sum();
                         self.logger.add_tokens_processed(total_processed_tokens);
 
+                        if !final_chunk {
+                            // Not done prefilling: advance the cursor and leave
+                            // every row in `RunningPrompt`. The scheduler's
+                            // bucket key includes `token_offset`, so the cohort
+                            // stays together across chunks, and the loop returns
+                            // to the top — which is the whole point, because
+                            // that is where decode gets its turn.
+                            let c = chunk.unwrap_or(0);
+                            for seq in scheduled.prompt.iter_mut() {
+                                seq.set_token_offset(cursor + c);
+                            }
+                            self.logger.add_tokens_processed(c * scheduled.prompt.len());
+                            continue 'lp;
+                        }
                         for seq in scheduled.prompt.iter_mut() {
+                            // Prefill is finished, so the cursor must go back to
+                            // zero: it is part of the bucket key, and a decode
+                            // cohort carrying stale per-row offsets would shatter
+                            // into one bucket per offset — the exact pathology
+                            // `feat/dense-ragged-decode` removes.
+                            seq.set_token_offset(0);
                             match seq.sequence_stepping_type() {
                                 SeqStepType::OneShot => {
                                     seq.set_state(SequenceState::Done(StopReason::GeneratedImage))
@@ -602,6 +645,51 @@ impl Engine {
                             seq.prompt_timestamp = Some(now);
                             seq.total_prompt_time = Some(prompt_exec_time.as_millis());
                             seq.step_start_instant = None;
+                        }
+
+                        // 🔑 Publish each prompt's KV NOW, while its request is
+                        // still generating.
+                        //
+                        // Until this ran, `prefix_cacher.add_sequence` had two
+                        // callers and both sat inside `if let Some(reason) =
+                        // is_done` (`pipeline/sampling.rs:264`, `:423`), so a
+                        // 2,048-token system prompt stayed invisible to every
+                        // other request for the whole generation that followed
+                        // it — tens of seconds during which each arrival paid
+                        // the full prefill again.
+                        //
+                        // Here rather than in `sampling.rs` because this is the
+                        // one place that knows a *prompt* step just completed,
+                        // and it has already stamped `total_prompt_time`, which
+                        // is the measured cost the eviction scorer wants. A
+                        // `OneShot` sequence is skipped: it was just set to
+                        // `Done`, has no continuation, and the finish path
+                        // stores it anyway.
+                        {
+                            let mut prefix_cacher = get_mut_arcmutex!(self.prefix_cacher);
+                            let pipeline = get_mut_arcmutex!(self.pipeline);
+                            let is_hybrid = !self.no_kv_cache && pipeline.cache().is_hybrid();
+                            for seq in scheduled.prompt.iter_mut() {
+                                if !matches!(
+                                    seq.sequence_stepping_type(),
+                                    SeqStepType::PromptAndDecode
+                                ) {
+                                    continue;
+                                }
+                                let recurrent_snapshots = if is_hybrid {
+                                    seq.recurrent_state_idx().and_then(|idx| {
+                                        pipeline.cache().hybrid().snapshot_recurrent_state(idx).ok()
+                                    })
+                                } else {
+                                    None
+                                };
+                                prefix_cacher.add_prefilled_sequence(seq, recurrent_snapshots);
+                            }
+                            if let Err(e) = prefix_cacher.evict_caches() {
+                                tracing::warn!(
+                                    "prefix cache: eviction after prefill publication failed: {e}"
+                                );
+                            }
                         }
                         last_completion_ids = vec![];
                     }

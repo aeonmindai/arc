@@ -25,6 +25,35 @@ use crate::{
 
 use super::{search_request, Engine, TERMINATE_ALL_NEXT_STEP};
 
+/// Build the `Response::InternalError` payload for a failed preallocated-KV-cache
+/// allocation, **preserving the underlying driver error**.
+///
+/// Why this is not just `"Failed to allocate preallocated KV cache."`: a GPU
+/// kernel that faults *poisons the CUDA context*, after which the **next** CUDA
+/// call fails — and the next call is very often this allocation. So this site is
+/// a habitual false accuser. It once reported a KV-cache problem while the real
+/// fault was `CUDA_ERROR_ILLEGAL_INSTRUCTION` in the sampler's radix top-k
+/// kernel, three layers upstream in a different crate; the fixed string sent two
+/// debugging chains to the wrong file, one of them to code it had just patched.
+///
+/// candle's `Error::Cuda` is `#[error(transparent)]`, so interpolating `{e}`
+/// reproduces the `DriverError` text verbatim. Never substitute a constant for
+/// the driver's own words.
+///
+/// Guarded by `kv_cache_alloc_error_preserves_the_driver_error` below.
+fn preallocated_kv_cache_error(
+    which: &str,
+    shape: (usize, usize, usize, usize),
+    e: &candle_core::Error,
+) -> String {
+    format!(
+        "Failed to allocate preallocated {which} KV cache (shape {shape:?}): {e} \
+         -- NOTE: a CUDA fault poisons the context, so this allocation may be \
+         reporting an EARLIER kernel's failure rather than an out-of-memory \
+         condition. Check the driver error above before suspecting the KV cache."
+    )
+}
+
 impl Engine {
     pub async fn handle_request(self: Arc<Self>, request: Request) {
         match request {
@@ -87,13 +116,27 @@ impl Engine {
                 .as_ref()
                 .is_some_and(|ch_t| ch_t.has_chat_template())
         {
+            // Name the model and what is actually missing. The old message said
+            // only "a model which does not have a chat template", which forced
+            // the reader to work out WHICH model and WHERE the template should
+            // have come from -- and it cost a chain a session.
+            let model_name = get_mut_arcmutex!(self.pipeline).name();
             request
-                    .response
-                    .send(Response::ValidationError(
-                        "Received messages for a model which does not have a chat template. Either use a different model or pass a single string as the prompt".into(),
-                    ))
-                    .await
-                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
+                .response
+                .send(Response::ValidationError(
+                    format!(
+                        "Model `{model_name}` has no chat template, so it cannot serve \
+                         `/v1/chat/completions` (messages). The checkpoint supplied no \
+                         `chat_template` field in `tokenizer_config.json`, no \
+                         `chat_template.json`, and no processor config template. \
+                         Either pass one explicitly (`--chat-template <file.jinja>` or \
+                         `--jinja-explicit`), or call `/v1/completions` with a single \
+                         `prompt` string instead of `messages`."
+                    )
+                    .into(),
+                ))
+                .await
+                .unwrap_or_else(|_| warn!("Receiver disconnected"));
             return;
         }
 
@@ -380,7 +423,7 @@ impl Engine {
             }
         };
 
-        let group = Arc::new(tokio::sync::Mutex::new(SequenceGroup::new(
+        let group = Arc::new(std::sync::Mutex::new(SequenceGroup::new(
             request.sampling_params.n_choices,
             request.is_streaming,
             is_chat,
@@ -402,6 +445,7 @@ impl Engine {
             minp,
             request.sampling_params.top_nsigma,
             request.logits_processors.unwrap_or_default(),
+            request.sampling_params.logits_bias.clone(),
         );
         let sampler = handle_seq_error!(sampler, request.response);
 
@@ -482,13 +526,11 @@ impl Engine {
                         Tensor::zeros(k_shape, dtype, &get_mut_arcmutex!(self.pipeline).device());
                     match k_seq_cache {
                         Ok(x) => x,
-                        Err(_) => {
+                        Err(e) => {
                             request
                                 .response
                                 .send(Response::InternalError(
-                                    "Failed to allocate preallocated KV cache."
-                                        .to_string()
-                                        .into(),
+                                    preallocated_kv_cache_error("K", k_shape, &e).into(),
                                 ))
                                 .await
                                 .unwrap_or_else(|_| warn!("Receiver disconnected"));
@@ -503,13 +545,11 @@ impl Engine {
                         Tensor::zeros(v_shape, dtype, &get_mut_arcmutex!(self.pipeline).device());
                     match v_seq_cache {
                         Ok(x) => x,
-                        Err(_) => {
+                        Err(e) => {
                             request
                                 .response
                                 .send(Response::InternalError(
-                                    "Failed to allocate preallocated KV cache."
-                                        .to_string()
-                                        .into(),
+                                    preallocated_kv_cache_error("V", v_shape, &e).into(),
                                 ))
                                 .await
                                 .unwrap_or_else(|_| warn!("Receiver disconnected"));
@@ -647,14 +687,21 @@ impl Engine {
                 );
             }
 
-            let prefill_cache = handle_seq_error!(
-                get_mut_arcmutex!(self.prefix_cacher).search_for_matching_cache(
+            let prefill_cache = {
+                let mut prefix_cacher = get_mut_arcmutex!(self.prefix_cacher);
+                let found = prefix_cacher.search_for_matching_cache(
                     seq.get_toks(),
                     seq.image_hashes(),
                     seq.audio_hashes(),
-                ),
-                request.response
-            );
+                );
+                // Publish the sharing counters here, at the lookup that moved
+                // them, so what `bench`/`serve`/interactive print is consistent
+                // with the request that produced it. Before this, `share_stats`
+                // had zero consumers outside `prefix_cacher.rs` and no Arc run
+                // could report whether the cache hit.
+                self.logger.set_share_stats(prefix_cacher.share_stats());
+                handle_seq_error!(found, request.response)
+            };
 
             seq = match prefill_cache.clone() {
                 Some(MatchingCache::Normal {
@@ -801,5 +848,58 @@ impl Engine {
             .send(Ok(txt))
             .await
             .expect("Sender disconnected unexpectedly!");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preallocated_kv_cache_error;
+
+    /// The driver's own words must survive into the user-visible message.
+    ///
+    /// This is the regression test for a real misdiagnosis: the old message was
+    /// the fixed string "Failed to allocate preallocated KV cache.", which threw
+    /// the `DriverError` away. Because a faulting kernel poisons the CUDA
+    /// context, the *next* allocation is the one that reports — so the fixed
+    /// string blamed the KV cache for a fault in the sampler's top-k kernel and
+    /// cost two investigations. Restore that constant and this test goes red.
+    #[test]
+    fn kv_cache_alloc_error_preserves_the_driver_error() {
+        // What candle hands us after a poisoned context: `Error::Cuda` is
+        // `#[error(transparent)]`, so its Display IS the driver error's text.
+        let driver_text = "DriverError(CUDA_ERROR_ILLEGAL_INSTRUCTION) in topk_radix_kernel";
+        let err = candle_core::Error::Cuda(driver_text.into());
+
+        let msg = preallocated_kv_cache_error("K", (1, 8, 256, 128), &err);
+
+        assert!(
+            msg.contains(driver_text),
+            "the driver error was discarded. The message must carry the cause, \
+             not a fixed string -- a poisoned CUDA context makes this allocation \
+             report faults that happened elsewhere.\ngot: {msg}"
+        );
+        // The cause must not be the ONLY thing: keep the site identifiable and
+        // keep the shape, which distinguishes a real OOM from a poisoned context.
+        assert!(msg.contains("KV cache"), "message no longer names the site: {msg}");
+        assert!(
+            msg.contains("(1, 8, 256, 128)"),
+            "message no longer reports the failed shape: {msg}"
+        );
+        // And it must warn the reader not to trust the attribution.
+        assert!(
+            msg.contains("EARLIER kernel"),
+            "message no longer warns that the real fault may be upstream: {msg}"
+        );
+    }
+
+    /// Proves the test above is not vacuous: a message built the OLD way fails it.
+    #[test]
+    fn the_old_fixed_string_would_fail_the_guard() {
+        let legacy = "Failed to allocate preallocated KV cache.".to_string();
+        let driver_text = "DriverError(CUDA_ERROR_ILLEGAL_INSTRUCTION) in topk_radix_kernel";
+        assert!(
+            !legacy.contains(driver_text),
+            "the legacy message somehow carries the cause; this control is broken"
+        );
     }
 }

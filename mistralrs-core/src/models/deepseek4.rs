@@ -110,7 +110,7 @@ use crate::{
         DeepSeekV2RotaryEmbedding, Mlp, RmsNorm,
     },
     layers_masker::{masked_fill, PastKvLenCache},
-    moe::{MoEExperts, MoEExpertsConfig},
+    moe::{ExpertParallelPlan, ExpertPlacement, MoEExperts, MoEExpertsConfig},
     ops::{SplitOp, TopKLastDimOp, TopKOutput},
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
@@ -137,6 +137,7 @@ serde_default_fn!(bool, tie_word_embeddings, false);
 serde_default_fn!(usize, default_head_dim, 512);
 serde_default_fn!(usize, default_num_kv_heads, 1);
 serde_default_fn!(usize, default_num_hash_layers, 3);
+serde_default_fn!(usize, default_ep_size, 1);
 serde_default_fn!(usize, default_hc_mult, 4);
 serde_default_fn!(f32, default_hc_eps, 1.0e-6);
 serde_default_fn!(usize, default_hc_sinkhorn_iters, 20);
@@ -304,6 +305,17 @@ pub struct DeepSeekV4Config {
     /// Audit §0 + §5 line 458.
     #[serde(default = "default_num_hash_layers", alias = "n_hash_layers")]
     pub(crate) num_hash_layers: usize,
+    /// Expert-parallel world size: how many ranks the `n_routed_experts`
+    /// routed experts are split across. `1` (the default, and what the
+    /// published V4 Flash `config.json` carries) is plain replication and is
+    /// bit-for-bit the pre-EP path.
+    ///
+    /// Published in the HF config as `ep_size`; overridable at run time with
+    /// `ARC_EP_SIZE` (see [`DeepSeekV4Config::effective_ep_size`]). This field
+    /// was deserialized and never read anywhere in the workspace until
+    /// wave60-CK — the twelfth "wired but never invoked" case in this repo.
+    #[serde(default = "default_ep_size")]
+    pub(crate) ep_size: usize,
     /// mHC multiplier: parallel residual streams (V4: 4). Audit §0 + §5.
     #[serde(default = "default_hc_mult")]
     pub(crate) hc_mult: usize,
@@ -349,6 +361,20 @@ fn default_index_topk() -> usize {
 }
 
 impl DeepSeekV4Config {
+    /// The expert-parallel world size actually in force.
+    ///
+    /// `ARC_EP_SIZE` wins over the config so a run can be sharded without
+    /// editing a published `config.json`; an unparsable value is ignored
+    /// rather than silently treated as 1, because "EP quietly turned itself
+    /// off" is exactly the failure this whole path exists to avoid — it is
+    /// reported at plan-construction time by the world-size check instead.
+    pub fn effective_ep_size(&self) -> usize {
+        match std::env::var("ARC_EP_SIZE") {
+            Ok(v) => v.parse::<usize>().unwrap_or(self.ep_size).max(1),
+            Err(_) => self.ep_size.max(1),
+        }
+    }
+
     /// Returns the compress ratio for layer `layer_idx`, or 0 (standard) if
     /// the index is out of bounds. Audit §1 layer-to-pattern mapping.
     pub fn layer_compress_ratio(&self, layer_idx: usize) -> i32 {
@@ -1542,6 +1568,7 @@ impl Attention {
             compress_ratio: self.compress_ratio,
             sliding_window: self.sliding_window,
             raw_prefix: 0,
+            row_q0: None,
         };
         // Faithful V4: the compressed (distant-context) KV, with compress-θ
         // RoPE at the strided compressed positions. `dsv4_attention` runs a
@@ -1628,18 +1655,34 @@ impl Attention {
                 // Use ONLY the fixed-width graph mask (matches the C-wide K).
                 // The eager `attention_mask` is kv_len-wide (growing) and would
                 // both mismatch the fixed window and break shape-constancy.
-                // `dsv4_attention` now folds whatever it is handed into its own
-                // union mask (it used to discard it), so wiring
-                // `set_graph_mode_mask` is all that remains for this path: until
-                // then `graph_mode_mask()` is `None` and the unwritten tail slots
-                // are attended as zero-padding (finite, not yet correct).
-                let gmask = crate::layers::graph_mode_mask();
+                // `dsv4_attention` folds whatever it is handed into its own
+                // union mask.
+                //
+                // 🔴 REFUSED, not defaulted. Of the `cap` slots read back, only
+                // `position + 1` were ever written; the rest are the zeros the
+                // buffer was allocated with. A zero K row is NOT a masked row —
+                // it scores logit 0 and takes `exp(0)/Z` of the softmax weight,
+                // diluting every real key and contributing its zero V. This arm
+                // previously ran with `graph_mode_mask() == None` and called the
+                // result "finite, not yet correct"; a finite wrong answer is the
+                // failure mode nothing downstream catches, so it now errors.
+                // `DeepSeekV4::forward` publishes the mask once per step.
+                let gmask = crate::layers::graph_mode_mask().ok_or_else(|| {
+                    candle_core::Error::Msg(
+                        "V4 graph-mode decode: the fixed-capacity length mask is unset. \
+                         Reading a constant window of which only `position + 1` slots are \
+                         written and attending the rest as zero-padding is a wrong answer, \
+                         not a degraded one. `DeepSeekV4::forward` must call \
+                         `layers::set_graph_mode_mask` whenever graph-mode positions are set."
+                            .into(),
+                    )
+                })?;
                 super::dsv4_attention::dsv4_attention(
                     &q,
                     &k_full,
                     &k_full,
                     compressed_kv.as_ref(),
-                    gmask.as_ref(),
+                    Some(&gmask),
                     flash_params,
                     &self.sdpa_params,
                     dsv4_cfg,
@@ -1654,25 +1697,50 @@ impl Attention {
                         kv_cache,
                         &k,
                         k_packed.as_ref().filter(|_| v4_fp8_kv_enabled()),
+                        v4_kv_retain_rows(self.sliding_window),
                     )?
                 };
-                // Reconstruct only what any query row in this block can reach.
-                // Dense storage stays whole (`raw_prefix = 0`) so
-                // `dsv4_attention` narrows exactly as it did before; packed
-                // storage narrows here, because the narrowing is what keeps the
-                // dequant O(window) rather than O(context).
-                let t_k_full = cached.seq_len()?;
-                let (raw_prefix, keep) = match &cached {
-                    V4CachedK::Dense(_) => (0, t_k_full),
-                    V4CachedK::Packed(_) => super::dsv4_attention::raw_keep_span(
-                        seq_len,
-                        self.sliding_window.max(1),
-                        t_k_full,
-                    ),
+                // Two independent prefixes meet here, and they compose:
+                //
+                //  * `store_base` — what the CACHE no longer holds, because
+                //    `retain_window` evicted it. `0` unless
+                //    `ARC_V4_KV_WINDOW` is on, and then the whole point: it is
+                //    the absolute position of the retained run's first row.
+                //  * the read-side narrowing — what this call chooses not to
+                //    RECONSTRUCT, because no query row in this block can reach
+                //    it (`raw_keep_span`). Packed storage does it here so the
+                //    FP8 dequant stays O(window); dense storage leaves it to
+                //    `dsv4_attention`, which narrows a view for free.
+                //
+                // `raw_prefix` is the absolute position of `k_cached[.., 0, ..]`
+                // either way, which is exactly what `dsv4_attention` defines it
+                // to be. With the window off and dense storage this is `0` and
+                // the whole cache, i.e. character-for-character the old call.
+                let store_base = kv_cache.first_cached();
+                let t_k_full = store_base + cached.seq_len()?;
+                let (raw_base, keep) = super::dsv4_attention::raw_keep_span(
+                    seq_len,
+                    self.sliding_window.max(1),
+                    t_k_full,
+                );
+                let (span_base, span_len, raw_prefix) = match &cached {
+                    V4CachedK::Dense(_) => (0, cached.seq_len()?, store_base),
+                    V4CachedK::Packed(_) => {
+                        let rel = raw_base.checked_sub(store_base).ok_or_else(|| {
+                            candle_core::Error::Msg(format!(
+                                "V4 KV window: rows in this block reach back to absolute key \
+                                 {raw_base}, but the store was capped at {store_base}. The \
+                                 retained window is too small for a {seq_len}-row block at \
+                                 sliding_window {}.",
+                                self.sliding_window
+                            ))
+                        })?;
+                        (rel, keep, raw_base)
+                    }
                 };
                 let k_cached = {
                     let _s = arc_profiler::device_span("kv_cache_span");
-                    cached.span(raw_prefix, keep, k.dtype())?
+                    cached.span(span_base, span_len, k.dtype())?
                 };
                 // Cache read-back. Diff vs prefill's freshly-computed K splits a
                 // cache-storage bug (old rows differ) from a new-token position
@@ -1700,6 +1768,14 @@ impl Attention {
                     &self.sdpa_params,
                     super::dsv4_attention::Dsv4AttentionConfig {
                         raw_prefix,
+                        // The dense path is the only one whose K/V rows are a
+                        // left-aligned ragged cohort (`front_pad_kv_cache`).
+                        // PagedAttention keeps per-request block tables, and
+                        // the graph-decode arm reads a FIXED window whose
+                        // columns are device slots, not absolute positions —
+                        // neither can be masked from `seqlen_offsets`, so both
+                        // keep `row_q0: None` and behave exactly as before.
+                        row_q0: ragged_row_q0(seqlen_offsets),
                         ..dsv4_cfg
                     },
                 )?
@@ -1825,7 +1901,25 @@ impl Attention {
 /// and adds support for `ScoringFunc::SqrtSoftplus` (V4 default — audit §0
 /// + §5).
 struct MoeGate {
+    /// Router weight exactly as it appears in the checkpoint:
+    /// `[n_routed_experts, hidden_size]`, checkpoint dtype.
+    ///
+    /// Kept **only** so `residual_tensors` can write it back into UQFF under
+    /// its original name/shape/dtype. It is deliberately not used by
+    /// `forward` — see [`Self::weight_t_f32`].
     weight: Tensor,
+    /// The same router weight, pre-transposed and pre-promoted to F32 at load
+    /// time — i.e. exactly the operand `forward`'s GEMM consumes, materialised
+    /// once instead of once per layer per decode step.
+    ///
+    /// Stored as `weight.t()?.to_dtype(F32)?`, shape
+    /// `[hidden_size, n_routed_experts]`. `forward` used to build this inline
+    /// on every call; because `.t()` is non-contiguous that was a *strided*
+    /// cast — reading the BF16 weight and writing a fresh F32 buffer, per
+    /// layer, per token. The weight is a constant, so all of it was redundant.
+    /// vLLM likewise keeps the router weight in fp32 from load
+    /// (`router/gate_linear.py:66-68`).
+    weight_t_f32: Tensor,
     cfg: DeepSeekV4Config,
     top_k: usize,
     n_routed_experts: usize,
@@ -1848,6 +1942,21 @@ impl MoeGate {
         layer_idx: usize,
     ) -> Result<Self> {
         let weight = vb.get((n_routed_experts, cfg.hidden_size), "weight")?;
+        // Hoist the router GEMM's operand out of the decode loop. This is the
+        // exact same expression `forward` used to evaluate per call
+        // (`weight.t()?.to_dtype(F32)?`) — same input, same deterministic
+        // conversion, same resulting layout — just evaluated once at load.
+        // Deliberately NOT followed by `.contiguous()`: adding one would give
+        // the GEMM a different operand layout than it sees today (relevant
+        // when the checkpoint is already F32 and `to_dtype` short-circuits to
+        // the transposed view), which could change cuBLAS kernel selection and
+        // therefore accumulation order.
+        //
+        // Cost: the F32 copy is resident for the life of the model rather than
+        // being reallocated every step — +4.19 MB per MoE layer, ~180 MB over
+        // 43 layers (0.13% of an H200). `weight` itself is retained unchanged
+        // for UQFF serialization, which is why both live here.
+        let weight_t_f32 = weight.t()?.to_dtype(DType::F32)?;
         let top_k = cfg.num_experts_per_tok.unwrap_or(6);
         // Hash routing: layers `< num_hash_layers` ship a fixed token-id ->
         // expert table (`gate.tid2eid`, [vocab_size, top_k]) and NO bias. Load
@@ -1913,6 +2022,7 @@ impl MoeGate {
         }
         Ok(Self {
             weight,
+            weight_t_f32,
             cfg: cfg.clone(),
             top_k,
             n_routed_experts,
@@ -1924,13 +2034,14 @@ impl MoeGate {
     fn forward(&self, xs: &Tensor, input_ids: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
         let (bs, seq_len, h) = xs.dims3()?;
         let xs = xs.reshape(((), h))?;
-        // The router GEMM re-casts `self.weight` to F32 on every call — a
-        // per-layer, per-token dequant of a constant. Named so the report can
-        // price it rather than leaving it inside an opaque `moe` bucket.
+        // `weight_t_f32` is already transposed and already F32 (built once in
+        // `new`), so the GEMM's weight operand costs nothing here. Only the
+        // activation cast below remains, and that one is real work — `xs` is a
+        // fresh per-token tensor, not a constant.
         let logits = {
             let _s = arc_profiler::device_span("gate.router_gemm");
             xs.to_dtype(DType::F32)?
-                .broadcast_matmul(&self.weight.t()?.to_dtype(DType::F32)?)?
+                .broadcast_matmul(&self.weight_t_f32)?
         };
         let _prof_score = arc_profiler::device_span("gate.scoring");
         let scores = match self.cfg.scoring_func {
@@ -2113,6 +2224,95 @@ impl MoeGate {
     }
 }
 
+/// How the routed experts are distributed over the expert-parallel ranks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EpPlacementMode {
+    /// Rank `r` owns `[r·E/N, (r+1)·E/N)`. The only placement that slices the
+    /// checkpoint at load time rather than after it.
+    Contiguous,
+    /// Bin-pack by measured per-expert load. For V4's first `num_hash_layers`
+    /// layers the load is a **closed-form property of the tokenizer**: those
+    /// layers route by `gate.tid2eid`, a fixed token-id → expert table, so
+    /// their distribution can be computed exactly, offline, with no GPU.
+    /// Score-routed layers have no such table and fall back to contiguous.
+    BalancedFromHashTable,
+}
+
+impl EpPlacementMode {
+    /// `ARC_EP_PLACEMENT=balanced` opts into the tid2eid-derived placement.
+    fn from_env() -> Self {
+        match std::env::var("ARC_EP_PLACEMENT").as_deref() {
+            Ok("balanced") => Self::BalancedFromHashTable,
+            _ => Self::Contiguous,
+        }
+    }
+}
+
+/// Per-expert token counts implied by a V4 hash-routing table.
+///
+/// `tid2eid` is `[vocab_size, top_k]` (I64): token id → the `top_k` experts it
+/// is routed to, unconditionally, in the first `num_hash_layers` layers
+/// (`deepseek4.rs` `MoeGate::tid2eid`, reference `inference/model.py`
+/// `Gate.hash = layer_id < n_hash_layers`). With a uniform token distribution
+/// the per-expert load is just the number of table entries naming that expert.
+///
+/// This is the offline distribution wave44-BV §3.2 flagged as "free to check
+/// and nobody has".
+fn tid2eid_expert_loads(tid2eid: &Tensor, num_experts: usize) -> Result<Vec<f64>> {
+    let rows = tid2eid.to_dtype(DType::I64)?.to_vec2::<i64>()?;
+    let mut loads = vec![0.0f64; num_experts];
+    for row in &rows {
+        for &e in row {
+            if e < 0 {
+                candle_core::bail!("gate.tid2eid holds a negative expert id ({e})");
+            }
+            let e = e as usize;
+            if e >= num_experts {
+                candle_core::bail!(
+                    "gate.tid2eid names expert {e}, but this layer has {num_experts} experts"
+                );
+            }
+            loads[e] += 1.0;
+        }
+    }
+    Ok(loads)
+}
+
+/// Build this rank's expert-parallel view of one MoE layer.
+///
+/// Refuses rather than degrades: an `ep_size` that does not match the
+/// communicator's world size, or an expert count that does not divide, is an
+/// error. wave44-BV §1.6: "a device list on the wrong kind of run is an error,
+/// not a silent no-op".
+fn build_expert_parallel_plan(
+    cfg: &DeepSeekV4Config,
+    n_routed_experts: usize,
+    comm: &Arc<mistralrs_quant::Comm>,
+    device: &Device,
+    tid2eid: Option<&Tensor>,
+) -> Result<ExpertParallelPlan> {
+    let ep_size = cfg.effective_ep_size();
+    if ep_size <= 1 {
+        return Ok(ExpertParallelPlan::single(n_routed_experts));
+    }
+    if comm.world_size() != ep_size {
+        candle_core::bail!(
+            "expert parallelism: ep_size is {ep_size} but the communicator's world size is {} — \
+             stage 1 requires one rank per expert shard (attention stays data-parallel, so there \
+             is no second axis to split). Launch with {ep_size} ranks or set ARC_EP_SIZE=1.",
+            comm.world_size()
+        );
+    }
+    let placement = match (EpPlacementMode::from_env(), tid2eid) {
+        (EpPlacementMode::BalancedFromHashTable, Some(table)) => {
+            let loads = tid2eid_expert_loads(table, n_routed_experts)?;
+            ExpertPlacement::balanced(&loads, ep_size)?
+        }
+        _ => ExpertPlacement::contiguous(n_routed_experts, ep_size)?,
+    };
+    ExpertParallelPlan::new(Arc::new(placement), comm.rank(), device)
+}
+
 struct Moe {
     experts: MoEExperts,
     shared_experts: Option<Mlp>,
@@ -2148,7 +2348,24 @@ impl Moe {
             moe_intermediate_size: cfg.moe_intermediate_size,
         };
 
-        let experts = MoEExperts::new(
+        // The gate is built first because the expert→rank placement can be
+        // derived from its hash-routing table (V4's first `num_hash_layers`
+        // layers), and the experts must be loaded already sharded.
+        let gate = MoeGate::new(
+            cfg,
+            mapper.set_device(layer_idx, vb.pp("gate"), false),
+            n_routed_experts,
+            layer_idx,
+        )?;
+        let ep = build_expert_parallel_plan(
+            cfg,
+            n_routed_experts,
+            comm,
+            &layer_device,
+            gate.tid2eid.as_ref(),
+        )?;
+
+        let experts = MoEExperts::new_expert_parallel(
             &moe_cfg,
             mapper.set_device(layer_idx, vb.clone(), loading_isq),
             layer_device,
@@ -2156,6 +2373,7 @@ impl Moe {
             loading_isq,
             &cfg.quantization_config,
             cfg.hidden_act,
+            &ep,
         )?;
 
         let shared_experts = if let Some(n_shared_experts) = n_shared_experts {
@@ -2180,12 +2398,6 @@ impl Moe {
         } else {
             None
         };
-        let gate = MoeGate::new(
-            cfg,
-            mapper.set_device(layer_idx, vb.pp("gate"), false),
-            n_routed_experts,
-            layer_idx,
-        )?;
         Ok(Self {
             experts,
             shared_experts,
@@ -2387,6 +2599,64 @@ impl V4CachedK {
     }
 }
 
+/// Process-wide state of the V4 windowed KV store. `0` = not yet resolved
+/// (consult `ARC_V4_KV_WINDOW`), `1` = off, `2` = on.
+///
+/// An atomic rather than a `OnceLock` so [`set_v4_kv_window`] can drive both
+/// settings from one process — the identity guard in
+/// `tests/synthetic_load_smoke.rs` has to run the SAME model both ways, and a
+/// `OnceLock` would silently measure whichever the test binary latched first.
+/// Same shape, and the same reason, as `set_mtp_load_depth`.
+static V4_KV_WINDOW: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Turn V4's windowed KV store on or off for every subsequently-appended slot.
+///
+/// **Opt-in, default off** (`ARC_V4_KV_WINDOW=1`). With it off, V4's KV cache
+/// grows for the whole context exactly as it always has and not one byte of
+/// any other model's cache moves.
+///
+/// It is opt-in for the reason written on [`v4_fp8_kv_enabled`] one screen up:
+/// the last KV-storage change to ship default-on without a GPU behind it
+/// (`ARC_V4_FP8_KV`, wave43-BU) killed every request on the first V4 forward
+/// that met a real device. The saving here is arithmetic and the identity is
+/// pinned on CPU; the *decode-time* cost of the compaction copy is not, and
+/// until an A/B has run, the default is the layout that has actually served.
+pub fn set_v4_kv_window(on: bool) {
+    V4_KV_WINDOW.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether V4 should cap its raw KV store at the attention window.
+pub fn v4_kv_window_enabled() -> bool {
+    match V4_KV_WINDOW.load(std::sync::atomic::Ordering::SeqCst) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var("ARC_V4_KV_WINDOW").is_ok_and(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                )
+            });
+            set_v4_kv_window(on);
+            on
+        }
+    }
+}
+
+/// How many trailing raw rows a V4 KV slot must retain, given its attention
+/// window — or `None` when the store is uncapped.
+///
+/// `window + margin`, and the margin is not slack: after the compaction that
+/// precedes an append, the slot holds exactly `retain` rows, and the forward
+/// that follows reaches back `t_q + window - 1`
+/// ([`super::dsv4_attention::raw_keep_span`]) over the `retain + t_q` rows
+/// that then exist. That is satisfied for any `retain >= window - 1`; the
+/// margin is what additionally survives an MTP verify rollback, which lowers
+/// `current_seq_len` by up to `--mtp-depth` without giving any rows back.
+pub(crate) fn v4_kv_retain_rows(sliding_window: usize) -> Option<usize> {
+    v4_kv_window_enabled().then(|| sliding_window.max(1) + crate::kv_cache::RETAIN_WINDOW_MARGIN)
+}
+
 /// Append V4's fused K/V. `packed` is the quantized form of `k`, already
 /// filtered by the caller: `Some` stores the FP8 codes, `None` stores `k` dense
 /// beside a 1-wide marker. Returns the full cached sequence in whichever layout
@@ -2401,8 +2671,15 @@ fn append_kv_mqa(
     kv_cache: &mut KvCache,
     k: &Tensor,
     packed: Option<&V4PackedK>,
+    retain: Option<usize>,
 ) -> Result<V4CachedK> {
     require_normal_kv_slot(kv_cache)?;
+    // Re-armed per append rather than at cache construction: `NormalCache` is
+    // built by `NormalCache::new_plain(len, max_seq_len)` from inside
+    // `DeepSeekV4::new`, which has no way to hand a per-layer window to a
+    // constructor shared with thirty other models. A `usize` store per layer
+    // per step is free next to the append it precedes.
+    kv_cache.set_retain_window(retain);
     match packed {
         Some(p) => {
             let (codes, side) = kv_cache.append(&p.codes, &p.side)?;
@@ -2442,6 +2719,12 @@ fn append_graph_kv_mqa(
              the U8 code cache."
         );
     }
+    // The eager arm arms the retention policy on every append; the graph arm
+    // must disarm it, because `write_kv_inplace` addresses an ABSOLUTE device
+    // slot and a compacted buffer's column 0 is not absolute 0. Clearing the
+    // policy is enough for a slot that has not yet evicted; one that HAS is a
+    // real incompatibility and `SingleCache::append_graph` says so by name.
+    kv_cache.set_retain_window(None);
     let marker = v4_v_marker(k)?;
     let (k_full, _marker_full) = kv_cache.append_graph(k, &marker, position, cap)?;
     Ok(k_full)
@@ -2465,6 +2748,40 @@ fn append_graph_kv_mqa(
 ///
 /// Resolved once: `deepseek4` used to scan the environment per timer call and
 /// paid ~390 `getenv`s per forward for it (wave33).
+/// The per-row absolute query positions [`super::dsv4_attention`] needs when
+/// the dense batch is a **left-aligned ragged** cohort, or `None` when it is
+/// not — which is every request today, because the flag defaults off.
+///
+/// `seqlen_offsets[i]` is already row `i`'s own past length: the engine threads
+/// it to every attention call so RoPE places the row's queries at their true
+/// absolute positions. That makes it exactly the `q0` V4's *compressed* branch
+/// needs and the `lead` its dead prefix needs, so no new value is plumbed —
+/// what changes is that `dsv4_attention` stops collapsing the vector to the
+/// single position it inferred from the cache width.
+///
+/// Gated on `ARC_MTP_PER_SEQ_KV` rather than on a flag of its own:
+/// [`crate::kv_cache::front_align_batch`] is the only producer of a ragged
+/// dense batch and it runs exclusively under `KvAdvance::PerSequence`, which
+/// that flag authorizes. With it off no batch is ever left-aligned, so the
+/// offsets would be uniform and `dsv4_attention` would take its scalar path
+/// anyway — the gate makes that a guarantee instead of a coincidence.
+///
+/// Resolved once, for the reason [`v4_fp8_kv_enabled`] documents: this is on
+/// the per-layer path, and a `getenv` per layer per step is ~43 per forward.
+fn ragged_row_q0(seqlen_offsets: &[usize]) -> Option<&[usize]> {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(crate::pipeline::mtp_pipeline::per_sequence_kv_requested);
+    ragged_row_q0_from(enabled, seqlen_offsets)
+}
+
+/// The decision itself, separated from the process-wide [`OnceLock`] so it can
+/// be tested against both settings rather than against whatever the test
+/// runner's environment happened to be (`ragged_row_q0_is_opt_in`). Same shape
+/// as [`fp8_kv_enabled_from`], for the same reason.
+fn ragged_row_q0_from(enabled: bool, seqlen_offsets: &[usize]) -> Option<&[usize]> {
+    enabled.then_some(seqlen_offsets)
+}
+
 fn v4_fp8_kv_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -3376,22 +3693,46 @@ impl MtpBlock {
         cache: &mut KvCache,
         input_ids: &Tensor,
     ) -> Result<Tensor> {
-        let cached = cache.current_seq_len();
-        if cached != start_pos {
-            candle_core::bail!(
-                "MTP draft KV desync: cache holds {cached} entries but the step starts at \
-                 absolute position {start_pos}. Draft-KV slot k must be absolute position k \
-                 (see MtpBlock::new_draft_cache)."
-            );
-        }
+        self.forward_tokens_rows(fused, &[start_pos], cache, input_ids)
+    }
+
+    /// [`Self::forward_tokens`] for a batch whose rows sit at **different**
+    /// absolute positions.
+    ///
+    /// `start_pos` is one position per row, or a single shared one. The draft
+    /// KV must already be a **left-aligned** cohort — every row's live run
+    /// shifted to end at `max(start_pos)`, which is exactly what
+    /// [`crate::kv_cache::front_pad_kv_cache`] produces — so the one shared
+    /// append offset `SingleCache::append` writes at is simultaneously correct
+    /// for all of them.
+    ///
+    /// 🔑 Nothing new is plumbed to make the ragged case correct. `start_pos`
+    /// *is* `seqlen_offsets`, the vector `DecoderLayer::forward` already threads
+    /// to RoPE and (via `ragged_row_q0`) to `dsv4_attention`'s per-row `row_q0`,
+    /// which masks each row's dead prefix. What changed is that this function
+    /// stops collapsing it to one element.
+    ///
+    /// A **single-element** `start_pos` is the pre-change path verbatim: RoPE
+    /// takes its `seqlen_offsets.len() == 1` fast branch rather than the per-row
+    /// loop, and `resolve_ragged_rows` filters a one-element vector that equals
+    /// the batch's end column back to `None`. So the uniform group — every group
+    /// with per-sequence KV advance off — differs from the old code by control
+    /// flow, not by a tolerance.
+    pub fn forward_tokens_rows(
+        &self,
+        fused: &Tensor,
+        start_pos: &[usize],
+        cache: &mut KvCache,
+        input_ids: &Tensor,
+    ) -> Result<Tensor> {
+        draft_step_end_column(start_pos, fused.dim(0)?, cache.current_seq_len())?;
         let in_device = fused.device().clone();
         let xs = fused.to_device(&self.device)?;
         let ids = input_ids.to_device(&self.device)?;
-        let seqlen_offsets = [start_pos];
         let out = self.layer.forward(
             &xs,
             None,
-            &seqlen_offsets,
+            start_pos,
             cache,
             // MTP block is a Standard layer (`COMPRESS_RATIO_NEXTN_LAYER = 0`)
             // — no compressor, no xs history.
@@ -3412,6 +3753,18 @@ impl MtpBlock {
         input_ids: &Tensor,
     ) -> Result<Tensor> {
         self.forward_tokens(fused, pos, cache, input_ids)
+    }
+
+    /// [`Self::forward_step`] for a group whose rows sit at different absolute
+    /// positions — the single-token wrapper over [`Self::forward_tokens_rows`].
+    pub fn forward_step_rows(
+        &self,
+        fused: &Tensor,
+        pos: &[usize],
+        cache: &mut KvCache,
+        input_ids: &Tensor,
+    ) -> Result<Tensor> {
+        self.forward_tokens_rows(fused, pos, cache, input_ids)
     }
 
     /// ISQ handles for the block's quantizable projections: attention
@@ -3441,6 +3794,56 @@ impl MtpBlock {
         }
         tensors
     }
+}
+
+/// The shared end column a draft step's rows must present, or why this group is
+/// not one an MTP-block forward can run.
+///
+/// A dense `KvCache` appends at ONE offset, so a group can only share a forward
+/// when every row's live run ENDS at the same column — which is exactly what
+/// `kv_cache::front_pad_kv_cache` arranges and what makes the batch maximum
+/// `max(start_pos)` the cache's own `current_seq_len`. Each refusal below is a
+/// layout the caller believes in and the cache does not, and guessing would be
+/// a wrong answer nothing downstream catches:
+///
+/// * no positions at all — nothing to place the queries at;
+/// * a vector that is neither `1` nor `b_sz` wide — the caller and the tensor
+///   disagree about how many rows there are, and `seqlen_offsets` would be
+///   indexed past its end or silently applied to the wrong row;
+/// * a cache whose width is not the rows' shared end column — either the group
+///   was never left-aligned, or a row is *ahead* of the buffer it is drafting
+///   into, so its RoPE position and its draft-KV slot mean different things.
+///
+/// Extracted from [`MtpBlock::forward_tokens_rows`] so the three refusals can be
+/// exercised without standing up a 43-layer model — the same reason
+/// `dsv4_attention::resolve_ragged_rows` is a free function.
+pub(crate) fn draft_step_end_column(
+    start_pos: &[usize],
+    b_sz: usize,
+    cached: usize,
+) -> Result<usize> {
+    let Some(&end) = start_pos.iter().max() else {
+        candle_core::bail!(
+            "MTP draft step was given no absolute position at all; it needs one per row (or a \
+             single shared one)."
+        );
+    };
+    if start_pos.len() != 1 && start_pos.len() != b_sz {
+        candle_core::bail!(
+            "MTP draft step: {} absolute position(s) for a batch of {b_sz}. Pass one per row, \
+             or a single shared one.",
+            start_pos.len()
+        );
+    }
+    if cached != end {
+        candle_core::bail!(
+            "MTP draft KV desync: cache holds {cached} entries but the step's rows end at \
+             absolute position {end}. Draft-KV slot k must be absolute position k, and a ragged \
+             group must be left-aligned to its widest row first (see MtpBlock::new_draft_cache \
+             and kv_cache::front_pad_kv_cache)."
+        );
+    }
+    Ok(end)
 }
 
 /// V4 MTP head.
@@ -3920,6 +4323,35 @@ impl DeepSeekV4 {
             let _s = arc_profiler::device_span("embed");
             self.embed_tokens.forward(input_ids)?
         };
+
+        // RUN-161 2c: publish the fixed-capacity decode window's length mask.
+        //
+        // 🔑 Built HERE, and nowhere earlier, for two reasons that both bite:
+        //
+        //  1. **Replay safety.** `normal.rs` sets the graph-mode *positions*
+        //     before `self.model.forward` — i.e. outside the capture region. A
+        //     mask computed there would be a constant folded into the recorded
+        //     graph, correct for the captured token and wrong for every replayed
+        //     one. Computed here it is a device-side compare against the
+        //     position buffer, so a replay that mutates that buffer in place
+        //     re-derives the right mask with no recapture.
+        //  2. **`cap` is a model fact.** `ModelConfigMetadata::sliding_window`
+        //     is `None` for V4 (it is not a uniform-window model), so the
+        //     pipeline cannot supply the width. `cfg_full.sliding_window` can.
+        //
+        // Once per step, not once per layer: all 43 layers read the same window
+        // width, and the graph path is single-device.
+        if crate::layers::has_graph_mode_positions() {
+            match crate::layers::graph_mode_positions() {
+                Some(pos) => {
+                    let cap = self.cfg_full.sliding_window.max(1);
+                    let mask = crate::layers::graph_mode_length_mask(&pos, cap, xs_embed.dtype())?;
+                    crate::layers::set_graph_mode_mask(Some(mask));
+                }
+                None => crate::layers::set_graph_mode_mask(None),
+            }
+        }
+
         let cache = &mut self.cache.normal().0;
         let _prof_mask = arc_profiler::span("causal_mask");
         let attention_mask = CausalMasker.make_causal_mask_matrix(
@@ -4056,10 +4488,17 @@ impl DeepSeekV4 {
         // `hc_mult` stream axis (audit finding 5(b), separately owned), so we
         // capture the post-`hc_head`, pre-`norm` `[B, T, hidden]` state — the
         // same tensor in the "pre-norm" sense, one collapse later.
+        //
+        // 🔑 The capture is tagged with `seqlen_offsets` — the WHOLE vector, not
+        // `seqlen_offsets[0]`. Row `i` of this block covers absolute positions
+        // `[seqlen_offsets[i], seqlen_offsets[i] + T)`, so collapsing it to row
+        // 0's offset made every other row's draft-KV extend read the leading
+        // row's idea of where it is. Under the cohort rule the rows agree and
+        // `MtpHiddenCapture::store_rows` folds them straight back to one shared
+        // offset, which is byte-identical to what the collapse produced.
         if let Some(mtp) = &self.mtp_head {
             if mtp.hidden_capture.is_armed() {
-                mtp.hidden_capture
-                    .store(seqlen_offsets.first().copied().unwrap_or(0), &xs);
+                mtp.hidden_capture.store_rows(seqlen_offsets, &xs);
             }
         }
 
@@ -4083,6 +4522,22 @@ impl DeepSeekV4 {
 }
 
 impl IsqModel for DeepSeekV4 {
+    /// Apply the deferred expert-parallel slice to every MoE layer.
+    ///
+    /// Under EP the routed experts are meant to be split across ranks, but a
+    /// UQFF artifact holds all of them, so `MoEExperts` records the subset and
+    /// refuses to run until this narrows the deserialized stacks. Returns how
+    /// many quantized layers were narrowed (3 per MoE layer: gate, up, down).
+    fn apply_pending_expert_parallel_slice(&mut self) -> Result<usize> {
+        let mut narrowed = 0usize;
+        for layer in self.layers.iter_mut() {
+            if let MoeOrMlp::Moe(moe) = &mut layer.moe_or_mlp {
+                narrowed += moe.experts.apply_pending_expert_subset()?;
+            }
+        }
+        Ok(narrowed)
+    }
+
     fn get_layers(
         &mut self,
     ) -> (
@@ -4566,7 +5021,7 @@ mod kv_footprint_tests {
                 )?,
                 None => None,
             };
-            append_kv_mqa(&mut slot, &k, packed.as_ref())?;
+            append_kv_mqa(&mut slot, &k, packed.as_ref(), None)?;
         }
         let KvCache::Normal { k, v } = &slot else {
             panic!("V4 slot must be KvCache::Normal");
@@ -4711,7 +5166,7 @@ mod kv_footprint_tests {
                     .into_iter()
                     .map(|v| v.to_bits()),
             );
-            let cached = append_kv_mqa(&mut slot, &k, Some(&packed))?;
+            let cached = append_kv_mqa(&mut slot, &k, Some(&packed), None)?;
             assert!(matches!(cached, V4CachedK::Packed(_)));
             assert_eq!(cached.seq_len()?, t + 1);
         }
@@ -4770,7 +5225,7 @@ mod kv_footprint_tests {
                 .collect();
             expected.extend(row.iter().copied());
             let k = Tensor::from_vec(row, (1, 1, 1, head_dim), &dev)?;
-            let cached = append_kv_mqa(&mut slot, &k, None)?;
+            let cached = append_kv_mqa(&mut slot, &k, None, None)?;
             assert!(matches!(cached, V4CachedK::Dense(_)));
             let materialised = cached.span(0, cached.seq_len()?, DType::F32)?;
             assert_eq!(materialised.dims(), &[1, 1, (t + 1) as usize, head_dim]);
@@ -4779,6 +5234,7 @@ mod kv_footprint_tests {
         let cached = append_kv_mqa(
             &mut slot,
             &Tensor::zeros((1, 1, 1, head_dim), DType::F32, &dev)?,
+            None,
             None,
         )?;
         let got: Vec<f32> = cached
@@ -4837,6 +5293,8 @@ mod kv_footprint_tests {
                 current_seq_len: 0,
                 max_seq_len: 4096,
                 capacity_seq_len: capacity,
+                first_cached: 0,
+                retain_window: None,
             },
             v: SingleCache {
                 all_data: Some(Tensor::zeros(shape, DType::BF16, &dev)?),
@@ -4844,6 +5302,8 @@ mod kv_footprint_tests {
                 current_seq_len: 0,
                 max_seq_len: 4096,
                 capacity_seq_len: capacity,
+                first_cached: 0,
+                retain_window: None,
             },
         })
     }
@@ -4915,7 +5375,7 @@ mod kv_footprint_tests {
                     .into_iter()
                     .map(|v| v.to_bits()),
             );
-            let cached = append_kv_mqa(&mut slot, &k, Some(&packed))?;
+            let cached = append_kv_mqa(&mut slot, &k, Some(&packed), None)?;
             assert!(matches!(cached, V4CachedK::Packed(_)));
             assert_eq!(cached.seq_len()?, t + 1);
         }
@@ -4980,7 +5440,7 @@ mod kv_footprint_tests {
                     .into_iter()
                     .map(|v| v.to_bits()),
             );
-            let cached = append_kv_mqa(&mut slot, &k, None)?;
+            let cached = append_kv_mqa(&mut slot, &k, None, None)?;
             assert!(matches!(cached, V4CachedK::Dense(_)));
         }
 
@@ -5036,6 +5496,28 @@ mod kv_footprint_tests {
         );
     }
 
+    /// The per-row ragged mask is **opt-in**, and off it hands
+    /// `dsv4_attention` nothing at all — not a uniform vector it would have to
+    /// recognise, but `None`, so the scalar path is taken structurally.
+    ///
+    /// Tests [`ragged_row_q0_from`] rather than [`ragged_row_q0`] for the same
+    /// reason `v4_fp8_kv_is_opt_in` does: the latter is a `OnceLock`.
+    #[test]
+    fn ragged_row_q0_is_opt_in() {
+        let offsets = [10usize, 8, 5];
+        assert!(
+            ragged_row_q0_from(false, &offsets).is_none(),
+            "with per-sequence KV advance off no batch is ever left-aligned, so the model must \
+             not be handed per-row positions at all"
+        );
+        assert_eq!(
+            ragged_row_q0_from(true, &offsets),
+            Some(&offsets[..]),
+            "on, the row positions are `seqlen_offsets` verbatim — the value the engine already \
+             threads for RoPE, not a new one"
+        );
+    }
+
     /// A non-`Normal` KV slot must be refused loudly rather than silently
     /// quantizing or windowing a 1-wide marker.
     #[test]
@@ -5043,7 +5525,7 @@ mod kv_footprint_tests {
         let dev = Device::Cpu;
         let mut rotating = KvCache::new_rotating(2, 16, NormalCache::CACHE_GROW_SIZE);
         let k = Tensor::zeros((1, 1, 1, 8), DType::F32, &dev)?;
-        let err = append_kv_mqa(&mut rotating, &k, None).unwrap_err();
+        let err = append_kv_mqa(&mut rotating, &k, None, None).unwrap_err();
         assert!(
             err.to_string().contains("Rotating"),
             "expected a loud slot-type error, got: {err}"
@@ -6070,6 +6552,7 @@ mod tests {
             compress_ratio: CompressRatio::Csa,
             sliding_window: 4,
             raw_prefix: 0,
+            row_q0: None,
         };
 
         // Compressed KV (precomputed by `Attention::compressed_kv` in the real
@@ -6197,6 +6680,7 @@ mod tests {
             compress_ratio: CompressRatio::Standard,
             sliding_window: 1024,
             raw_prefix: 0,
+            row_q0: None,
         };
 
         // Correct: sequence 0 attends over its own 3 keys.
@@ -6340,6 +6824,7 @@ mod tests {
             compress_ratio: CompressRatio::Hca,
             sliding_window: 8,
             raw_prefix: 0,
+            row_q0: None,
         };
 
         // Compressed KV: T_c = t_k / ratio = 1 entry, shape [B, 1, T_c, D].
@@ -6426,6 +6911,7 @@ mod tests {
             compress_ratio: CompressRatio::Standard,
             sliding_window: 4,
             raw_prefix: 0,
+            row_q0: None,
         };
 
         // Standard layers must bypass the compressed branch entirely: even if
@@ -7029,6 +7515,412 @@ mod tests {
         Ok(())
     }
 
+    // ---------------------------------------------------------------------
+    // wave63-CO: per-row `xs` state.
+    //
+    // The claim these execute is the keystone one: a batched compressor cache
+    // whose rows sit at DIFFERENT token counts advances each row exactly as if
+    // that sequence had been run alone. Until this landed, `tokens`/`base` were
+    // one number for the whole batch, so no sequence could advance its
+    // compressed KV independently — the blocker PR #90 §6, PR #92 §5.1 and
+    // wave29-BC §4b each arrived at from a different direction.
+    // ---------------------------------------------------------------------
+
+    /// Assemble one batched `XsRollingCache` from per-sequence ones exactly as
+    /// `NormalCacheManager::clone_in_cache` does: the START-anchored compressed
+    /// buffers are zero-extended to the widest capacity and stacked on dim 0,
+    /// the END-anchored raw windows are **front**-padded to the widest and
+    /// stacked, and the row lengths are the concatenation of the sequences'
+    /// own — not `seqs[0]`'s repeated.
+    fn batch_xs(per_seq: &[XsRollingCache]) -> Result<XsRollingCache> {
+        let width = |t: &Tensor| t.dim(1);
+        let cap = per_seq
+            .iter()
+            .map(|x| width(x.comp.all_data.as_ref().unwrap()))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .unwrap();
+        let w = per_seq
+            .iter()
+            .map(|x| width(x.tail.as_ref().unwrap()))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .unwrap();
+        let pad = |t: &Tensor, to: usize, at_front: bool| -> Result<Tensor> {
+            let have = t.dim(1)?;
+            if have == to {
+                return t.contiguous();
+            }
+            let mut shape = t.dims().to_vec();
+            shape[1] = to;
+            let z = Tensor::zeros(shape, t.dtype(), t.device())?;
+            z.slice_set(&t.contiguous()?, 1, if at_front { to - have } else { 0 })?;
+            Ok(z)
+        };
+        let mut comps = Vec::new();
+        let mut tails = Vec::new();
+        for x in per_seq {
+            comps.push(pad(x.comp.all_data.as_ref().unwrap(), cap, false)?);
+            tails.push(pad(x.tail.as_ref().unwrap(), w, true)?);
+        }
+        let mut out = per_seq[0].clone();
+        out.comp.all_data = Some(Tensor::cat(&comps, 0)?.contiguous()?);
+        out.comp.capacity_seq_len = cap;
+        out.tail = Some(Tensor::cat(&tails, 0)?.contiguous()?);
+        let tokens: Vec<usize> = per_seq.iter().map(|x| x.row_lens().0[0]).collect();
+        let base: Vec<usize> = per_seq.iter().map(|x| x.row_lens().1[0]).collect();
+        out.comp.current_seq_len = tokens.iter().copied().max().unwrap() / out.ratio;
+        out.set_row_lens(tokens, base)?;
+        Ok(out)
+    }
+
+    /// Run `lens.len()` sequences to their own token counts on one stream,
+    /// batch them, advance the batch by `t_new` of each row's OWN next tokens,
+    /// and require every row to equal the same sequence advanced alone.
+    fn ragged_batch_matches_b1(ratio: usize, lens: &[usize], t_new: usize) -> Result<()> {
+        let device = Device::Cpu;
+        let (hidden, head_dim) = (32usize, 16usize);
+        let compressor = rolling_test_compressor(ratio, hidden, head_dim, &device)?;
+        // A DIFFERENT stream per row. Sharing one stream would make every row's
+        // compressed block `j` cover the identical tokens, so a bug that read
+        // or wrote the wrong row would be invisible.
+        let total = lens.iter().copied().max().unwrap() + t_new + 8;
+        let streams = per_row_streams(lens.len(), total, hidden, &device)?;
+
+        let mut refs: Vec<XsRollingCache> = Vec::new();
+        for (i, &l) in lens.iter().enumerate() {
+            let mut s = XsRollingCache::new(ratio, compressor.coff, head_dim, 4096);
+            s.advance(&streams[i].narrow(1, 0, l)?, |w| {
+                compressor.forward_from_xs(w)
+            })?;
+            refs.push(s);
+        }
+        let mut batched = batch_xs(&refs)?;
+        assert_eq!(
+            batched.rows_uniform(),
+            lens.iter().all(|&l| l == lens[0]),
+            "the fixture must exercise the path it claims to"
+        );
+
+        // Row `i` gets ITS OWN next tokens, which is what a real batch of
+        // independent sequences hands the compressor.
+        let parts = lens
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| streams[i].narrow(1, l, t_new))
+            .collect::<Result<Vec<_>>>()?;
+        let xs_new = Tensor::cat(&parts, 0)?;
+        let got = batched
+            .advance(&xs_new, |w| compressor.forward_from_xs(w))?
+            .expect("a batch past one full group has compressed rows");
+
+        for (i, &l) in lens.iter().enumerate() {
+            let want = refs[i]
+                .advance(&streams[i].narrow(1, l, t_new)?, |w| {
+                    compressor.forward_from_xs(w)
+                })?
+                .expect("the reference is past one full group too");
+            let live = (l + t_new) / ratio;
+            assert!(live > 0, "fixture must complete at least one block");
+            let mine = got.narrow(0, i, 1)?.narrow(1, 0, live)?;
+            let theirs = want.narrow(1, 0, live)?;
+            assert_eq!(
+                max_abs_diff(&mine, &theirs)?,
+                0.0,
+                "row {i} (at {l} + {t_new} tokens) diverged from the same sequence run at B=1 \
+                 over its {live} live compressed block(s)"
+            );
+            assert_eq!(
+                (batched.row_lens().0[i], batched.row_lens().1[i]),
+                (refs[i].row_lens().0[0], refs[i].row_lens().1[0]),
+                "row {i}'s token count / resume point must equal the B=1 reference's"
+            );
+        }
+        // Non-degenerate: distinct rows must actually hold distinct values, or
+        // an implementation that broadcast one row everywhere would pass.
+        if lens.len() > 1 {
+            let a = got.narrow(0, 0, 1)?;
+            let b = got.narrow(0, 1, 1)?;
+            assert!(
+                max_abs_diff(&a, &b)? > 1e-6,
+                "the fixture's rows are indistinguishable, so this proves nothing"
+            );
+        }
+        Ok(())
+    }
+
+    /// `n` deterministic, mutually distinct compressor-input streams.
+    fn per_row_streams(n: usize, t: usize, hidden: usize, device: &Device) -> Result<Vec<Tensor>> {
+        (0..n)
+            .map(|row| {
+                let data: Vec<f32> = (0..t * hidden)
+                    .map(|i| ((i as f32) * 0.017 + 0.3 + row as f32 * 1.7).cos() * 0.8)
+                    .collect();
+                Tensor::from_vec(data, (1, t, hidden), device)
+            })
+            .collect()
+    }
+
+    /// 🔑 The keystone claim, on the CSA compressor (ratio 4, overlapping): four
+    /// rows at four different residues mod `ratio` — the worst case, since the
+    /// window geometry is a function of the residue — advance token-identically
+    /// to four B=1 runs. Three of the four complete a new block at three
+    /// different window offsets and land on the same absolute block; the fourth
+    /// completes none and must be left untouched.
+    #[test]
+    fn batched_ragged_xs_is_token_identical_to_the_b1_reference_csa() -> Result<()> {
+        ragged_batch_matches_b1(4, &[37, 38, 39, 40], 3)
+    }
+
+    /// 🔑 The case the `slot_mapping` indirection exists for: two rows that are
+    /// at the SAME residue mod `ratio` — so they share one compressor call —
+    /// but a whole block apart, so their outputs must land on **different**
+    /// `comp` columns. Under MTP this is the common case, not the exotic one:
+    /// the verify window is `depth + 1`, and a CSA layer's ratio is 4, so two
+    /// sequences a full window apart share a residue on most steps.
+    ///
+    /// Without the per-row destination — with one shared append offset, which
+    /// is all `SingleCache::append` can express — both rows would write the
+    /// same column and one of them would read the other's history.
+    #[test]
+    fn two_rows_one_compressor_call_two_destinations() -> Result<()> {
+        ragged_batch_matches_b1(4, &[39, 43, 40, 41], 1)
+    }
+
+    /// The same on HCA (ratio 128, non-overlapping), where a step's rows almost
+    /// all complete NO block and the scatter must write only the one that does.
+    #[test]
+    fn batched_ragged_xs_is_token_identical_to_the_b1_reference_hca() -> Result<()> {
+        ragged_batch_matches_b1(128, &[1022, 1023, 1024, 1025], 3)
+    }
+
+    /// 🔑 The case the H200 died on, and the one every fixture above misses:
+    /// a row whose ENTIRE history is shorter than the batched window.
+    ///
+    /// The window a batch allocates is its greediest row's retained run — 23
+    /// columns for these token counts — so the 9-token row is front-padded by
+    /// 14 columns that stand for tokens before token 0. Every fixture above
+    /// uses rows long enough (37..43, 1022..1025, 30..35) that this never
+    /// happens, which is why they stayed green while `ARC_V4_XS_PER_SEQ=1` at
+    /// B=8 returned one token and `finish_reason: None` for every request:
+    /// `row 3 holds 9 tokens, fewer than the 11-wide retained window`.
+    ///
+    /// The trigger is prompt-length diversity, not generation length — so this
+    /// fails harder under real heterogeneous arrivals than under any
+    /// uniform-prompt benchmark.
+    #[test]
+    fn a_row_shorter_than_the_batched_window_is_token_identical_csa() -> Result<()> {
+        // Retained runs 9 / 22 / 23 / 20 → a 23-wide window; three distinct
+        // residues mod 4, so three compressor calls, and row 3 completes no
+        // block at all.
+        ragged_batch_matches_b1(4, &[9, 22, 39, 40], 3)
+    }
+
+    /// The same on HCA, where `ratio` is 128 and the retained run can reach
+    /// `ratio + margin`: a 129-token row sits inside a 143-wide window.
+    #[test]
+    fn a_row_shorter_than_the_batched_window_is_token_identical_hca() -> Result<()> {
+        ragged_batch_matches_b1(128, &[129, 143, 1024, 1150], 3)
+    }
+
+    /// The control the ragged tests need: a UNIFORM batch takes the untouched
+    /// scalar path and is also token-identical. If this ever failed, the
+    /// "flag off is byte-identical" claim would be false and the ragged
+    /// result above would be unattributable.
+    #[test]
+    fn a_uniform_batch_still_matches_the_b1_reference() -> Result<()> {
+        ragged_batch_matches_b1(4, &[40, 40, 40, 40], 3)
+    }
+
+    /// One step is not enough: a per-row `base` that drifts by one token per
+    /// step would still look right on step 1. Run the ragged batch and the B=1
+    /// references in lockstep for 24 steps, re-batching each time — which is
+    /// what the engine's `clone_in`/`clone_out` pair does — and require exact
+    /// agreement at every step.
+    #[test]
+    fn a_ragged_batch_stays_token_identical_across_many_steps() -> Result<()> {
+        let device = Device::Cpu;
+        let (hidden, head_dim, ratio) = (32usize, 16usize, 4usize);
+        let compressor = rolling_test_compressor(ratio, hidden, head_dim, &device)?;
+        // Rows 1 and 3 sit at the same residue mod `ratio` a block apart, so on
+        // every fourth step they share one compressor call and must land on two
+        // different `comp` columns.
+        let mut lens = [30usize, 31, 33, 35];
+        let streams = per_row_streams(lens.len(), 200, hidden, &device)?;
+
+        let mut refs: Vec<XsRollingCache> = Vec::new();
+        for (i, &l) in lens.iter().enumerate() {
+            let mut s = XsRollingCache::new(ratio, compressor.coff, head_dim, 4096);
+            s.advance(&streams[i].narrow(1, 0, l)?, |w| {
+                compressor.forward_from_xs(w)
+            })?;
+            refs.push(s);
+        }
+
+        for step in 0..24 {
+            let mut batched = batch_xs(&refs)?;
+            assert!(!batched.rows_uniform(), "step {step} lost its raggedness");
+            let parts = lens
+                .iter()
+                .enumerate()
+                .map(|(i, &l)| streams[i].narrow(1, l, 1))
+                .collect::<Result<Vec<_>>>()?;
+            let got = batched
+                .advance(&Tensor::cat(&parts, 0)?, |w| compressor.forward_from_xs(w))?
+                .unwrap();
+            for (i, l) in lens.iter_mut().enumerate() {
+                let want = refs[i]
+                    .advance(&streams[i].narrow(1, *l, 1)?, |w| {
+                        compressor.forward_from_xs(w)
+                    })?
+                    .unwrap();
+                *l += 1;
+                let live = *l / ratio;
+                assert_eq!(
+                    max_abs_diff(
+                        &got.narrow(0, i, 1)?.narrow(1, 0, live)?,
+                        &want.narrow(1, 0, live)?
+                    )?,
+                    0.0,
+                    "step {step}, row {i}: the batched compressor history left the B=1 reference"
+                );
+                assert_eq!(batched.row_lens().0[i], refs[i].row_lens().0[0]);
+                assert_eq!(batched.row_lens().1[i], refs[i].row_lens().1[0]);
+            }
+            // The retained window must stay bounded even though it is now the
+            // widest row's — otherwise the ragged path quietly reintroduces the
+            // unbounded raw history this cache exists to delete.
+            let bound = compressor.coff * ratio + batched.margin + (lens[3] - lens[0]);
+            assert!(
+                batched.tail.as_ref().unwrap().dim(1)? <= bound,
+                "step {step}: the shared window grew past {bound}"
+            );
+        }
+        Ok(())
+    }
+
+    /// 🔑 The MTP path in full: a sequence that has been rolled back keeps its
+    /// `base` where it was (`set_len` moves `tokens`, never `base`), so when it
+    /// is batched next to a neighbour the retention floor computed from its new
+    /// token count sits BELOW what it actually holds. Clamping to `base` is
+    /// what keeps it honest — without it the row would come out of the batch
+    /// claiming to be resumable from further back than it is, and the rollback
+    /// it should later refuse would succeed and resume the compressor from a
+    /// gap. That is the exact failure this cache exists to make impossible, and
+    /// it is invisible to any single-step or rollback-free fixture.
+    #[test]
+    fn a_rolled_back_row_keeps_its_own_resume_point_through_a_batch() -> Result<()> {
+        let device = Device::Cpu;
+        let (hidden, head_dim, ratio) = (32usize, 16usize, 4usize);
+        let compressor = rolling_test_compressor(ratio, hidden, head_dim, &device)?;
+        let streams = per_row_streams(2, 64, hidden, &device)?;
+
+        let mut rolled = XsRollingCache::new(ratio, compressor.coff, head_dim, 4096);
+        rolled.advance(&streams[0].narrow(1, 0, 40)?, |w| {
+            compressor.forward_from_xs(w)
+        })?;
+        let base_at_40 = rolled.row_lens().1[0];
+        rolled.set_len(36)?;
+        assert_eq!(
+            rolled.row_lens().1[0],
+            base_at_40,
+            "the fixture needs `set_len` to leave `base` above the natural floor"
+        );
+
+        let mut other = XsRollingCache::new(ratio, compressor.coff, head_dim, 4096);
+        other.advance(&streams[1].narrow(1, 0, 38)?, |w| {
+            compressor.forward_from_xs(w)
+        })?;
+
+        let mut refs = vec![rolled, other];
+        let mut batched = batch_xs(&refs)?;
+        let parts = [streams[0].narrow(1, 36, 2)?, streams[1].narrow(1, 38, 2)?];
+        let got = batched
+            .advance(&Tensor::cat(&parts, 0)?, |w| compressor.forward_from_xs(w))?
+            .unwrap();
+
+        for (i, (start, stream)) in [(36usize, &streams[0]), (38, &streams[1])]
+            .into_iter()
+            .enumerate()
+        {
+            let want = refs[i]
+                .advance(&stream.narrow(1, start, 2)?, |w| {
+                    compressor.forward_from_xs(w)
+                })?
+                .unwrap();
+            let live = (start + 2) / ratio;
+            assert_eq!(
+                max_abs_diff(
+                    &got.narrow(0, i, 1)?.narrow(1, 0, live)?,
+                    &want.narrow(1, 0, live)?
+                )?,
+                0.0,
+                "row {i} diverged from the B=1 reference after a rollback"
+            );
+            assert_eq!(
+                batched.row_lens().1[i],
+                refs[i].row_lens().1[0],
+                "row {i}'s resume point must not be loosened by being batched — a lower `base` \
+                 lets a rollback succeed that would resume the compressor from a gap"
+            );
+        }
+        Ok(())
+    }
+
+    /// The inverse of `batch_xs`: splitting a batched row back out must restore
+    /// the per-sequence invariant `window width == tokens - base`, taking that
+    /// row's share from the END of the shared window. Taking it from the front
+    /// would hand the row somebody else's older tokens under its own `base`.
+    #[test]
+    fn splitting_a_batched_row_restores_the_per_sequence_window() -> Result<()> {
+        let device = Device::Cpu;
+        let (hidden, head_dim, ratio) = (32usize, 16usize, 4usize);
+        let compressor = rolling_test_compressor(ratio, hidden, head_dim, &device)?;
+        let lens = [37usize, 40];
+        let streams = per_row_streams(2, 64, hidden, &device)?;
+        let mut refs: Vec<XsRollingCache> = Vec::new();
+        for (i, &l) in lens.iter().enumerate() {
+            let mut s = XsRollingCache::new(ratio, compressor.coff, head_dim, 4096);
+            s.advance(&streams[i].narrow(1, 0, l)?, |w| {
+                compressor.forward_from_xs(w)
+            })?;
+            refs.push(s);
+        }
+        let batched = batch_xs(&refs)?;
+        let shared = batched.tail.as_ref().unwrap().dim(1)?;
+        assert!(
+            refs.iter()
+                .any(|r| r.tail.as_ref().unwrap().dim(1).unwrap() < shared),
+            "the fixture must have a row narrower than the shared window"
+        );
+
+        let comps = batched.comp.all_data.as_ref().unwrap().chunk(2, 0)?;
+        let tails = batched.tail.as_ref().unwrap().chunk(2, 0)?;
+        for i in 0..2 {
+            let out = batched.split_row(i, comps[i].clone(), tails[i].clone())?;
+            let (tok, base) = (out.row_lens().0[0], out.row_lens().1[0]);
+            assert_eq!(
+                (tok, base),
+                (refs[i].row_lens().0[0], refs[i].row_lens().1[0])
+            );
+            assert_eq!(
+                out.tail.as_ref().unwrap().dim(1)?,
+                tok - base,
+                "a per-sequence cache's window is exactly `tokens - base` wide"
+            );
+            assert_eq!(
+                max_abs_diff(out.tail.as_ref().unwrap(), refs[i].tail.as_ref().unwrap())?,
+                0.0,
+                "row {i}'s retained raw tokens must be its own, taken from the END of the \
+                 shared window"
+            );
+            assert_eq!(out.comp.current_seq_len(), refs[i].comp.current_seq_len());
+        }
+        Ok(())
+    }
+
     /// A rollback of up to `margin` tokens must be accepted and resumable at
     /// EVERY length — including the ones that cross a group boundary, where
     /// the rolled-back group's compressed row has to be rebuilt from the start
@@ -7426,5 +8318,109 @@ mod tests {
              window, and that rollback HARD-ERRORS mid-decode.",
             crate::XS_TAIL_MARGIN_TOKENS
         );
+    }
+
+    /// 🔑 The MTP draft step's own precondition, and the three layouts it must
+    /// refuse rather than guess at.
+    ///
+    /// A dense `KvCache` appends at ONE offset, so a group shares a forward only
+    /// when every row's live run ends at the same column. The scalar form —
+    /// `&[pos]` — is the pre-change path exactly: `max` of a one-element slice
+    /// is that element, so the check reduces to the old `cached != start_pos`
+    /// character for character.
+    #[test]
+    fn the_draft_step_end_column_is_the_batch_maximum_and_refuses_every_other_layout() {
+        // Scalar: the pre-change behaviour, at any batch size.
+        assert_eq!(draft_step_end_column(&[7], 1, 7).unwrap(), 7);
+        assert_eq!(draft_step_end_column(&[7], 4, 7).unwrap(), 7);
+        let err = draft_step_end_column(&[7], 1, 6).unwrap_err().to_string();
+        assert!(
+            err.contains("desync") && err.contains("6") && err.contains("7"),
+            "a cache that is not at the step's position must say both numbers; got {err}"
+        );
+
+        // Ragged: the end column is the batch maximum, which is what
+        // `front_pad_kv_cache` left the cache at.
+        assert_eq!(draft_step_end_column(&[7, 4, 6], 3, 7).unwrap(), 7);
+        let err = draft_step_end_column(&[7, 4, 6], 3, 6)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("left-aligned"),
+            "a group that was never left-aligned must be told so; got {err}"
+        );
+
+        // A row AHEAD of the buffer it is drafting into: `max` exceeds `cached`,
+        // so its RoPE position and its draft-KV slot would mean different things.
+        assert!(draft_step_end_column(&[7, 9], 2, 7).is_err());
+
+        // Arity: neither 1 nor `b_sz`.
+        let err = draft_step_end_column(&[7, 4], 3, 7)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("2 absolute position(s) for a batch of 3"),
+            "a positions vector that does not describe the batch must refuse rather than be \
+             indexed past its end; got {err}"
+        );
+        assert!(draft_step_end_column(&[7, 7, 7, 7], 3, 7).is_err());
+
+        // No positions at all.
+        assert!(draft_step_end_column(&[], 1, 0).is_err());
+    }
+
+    /// Pins the two-field router-weight contract introduced when the F32
+    /// re-cast was hoisted out of `MoeGate::forward`.
+    ///
+    /// `forward` consumes `weight_t_f32`, which must be *exactly*
+    /// `weight.t().to_dtype(F32)` — the expression it replaced — so the GEMM
+    /// is bit-identical. `weight` itself must keep the checkpoint's shape and
+    /// dtype, because `residual_tensors` serializes it straight back into
+    /// UQFF under the name `weight`; if a future refactor drops it or swaps in
+    /// the transposed copy, the artifact silently changes format.
+    #[test]
+    fn moe_gate_router_weight_is_hoisted_without_changing_the_uqff_tensor() -> Result<()> {
+        let device = Device::Cpu;
+        let hidden = 8;
+        let n_routed_experts = 4;
+        let cfg = compressor_test_cfg(hidden);
+
+        // Distinct, exactly-BF16-representable values so the comparison below
+        // isolates layout/dtype handling rather than rounding.
+        let weight_f32 = Tensor::from_vec(
+            (0..n_routed_experts * hidden)
+                .map(|i| (i as f32) * 0.25 - 3.0)
+                .collect::<Vec<_>>(),
+            (n_routed_experts, hidden),
+            &device,
+        )?;
+        let mut map = std::collections::HashMap::new();
+        map.insert("weight".to_string(), weight_f32.to_dtype(DType::BF16)?);
+        let vb = vb_from_map(map, DType::BF16, &device);
+
+        // layer_idx 10 >= default num_hash_layers (3), so no `tid2eid` lookup.
+        let gate = MoeGate::new(&cfg, vb, n_routed_experts, 10)?;
+
+        // UQFF-facing tensor: untouched checkpoint shape and dtype.
+        assert_eq!(gate.weight.dims(), &[n_routed_experts, hidden]);
+        assert_eq!(gate.weight.dtype(), DType::BF16);
+
+        // GEMM-facing operand: transposed and promoted, ready to use.
+        assert_eq!(gate.weight_t_f32.dims(), &[hidden, n_routed_experts]);
+        assert_eq!(gate.weight_t_f32.dtype(), DType::F32);
+
+        // And it is bit-identical to the per-call expression it replaced.
+        let want: Vec<f32> = gate
+            .weight
+            .t()?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
+        let got: Vec<f32> = gate.weight_t_f32.flatten_all()?.to_vec1()?;
+        assert_eq!(
+            got, want,
+            "hoisted router operand must equal `weight.t().to_dtype(F32)` exactly"
+        );
+        Ok(())
     }
 }

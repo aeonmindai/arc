@@ -127,19 +127,19 @@ pub struct QuantizeDeviceOptions {
     pub device_layers: Option<Vec<String>>,
 
     /// Topology YAML file for device mapping
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub topology: Option<PathBuf>,
 
     /// Custom HuggingFace cache directory
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub hf_cache: Option<PathBuf>,
 
     /// Max sequence length for automatic device mapping
-    #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_SEQ_LEN)]
+    #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_SEQ_LEN, hide = true)]
     pub max_seq_len: usize,
 
     /// Max batch size for automatic device mapping
-    #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE)]
+    #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE, hide = true)]
     pub max_batch_size: usize,
 
     /// CUDA devices to spread the bake across, e.g. `--bake-devices 0,1,2,3`.
@@ -230,19 +230,19 @@ pub struct QuantizeDefaultOptions {
     pub device_layers: Option<Vec<String>>,
 
     /// Topology YAML file for device mapping
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub topology: Option<PathBuf>,
 
     /// Custom HuggingFace cache directory
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub hf_cache: Option<PathBuf>,
 
     /// Max sequence length for automatic device mapping
-    #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_SEQ_LEN)]
+    #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_SEQ_LEN, hide = true)]
     pub max_seq_len: usize,
 
     /// Max batch size for automatic device mapping
-    #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE)]
+    #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE, hide = true)]
     pub max_batch_size: usize,
 
     /// CUDA devices to spread the bake across, e.g. `--bake-devices 0,1,2,3`.

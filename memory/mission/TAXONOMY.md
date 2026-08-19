@@ -21,6 +21,47 @@ rename would be reckless. Migration proposal is the last section.
 
 ---
 
+## 🔵 SESSION-8 CORRECTIONS (2026-08-19) — four claims in this file were wrong
+
+Each is fixed **in place** below; they are listed here only so a reader who
+already quoted the old text knows to re-read.
+
+1. **Expert parallelism IS on master, and it has TWO doors.** The old
+   `ArcMoE/EP 🔵 "NOT ON MASTER"` row was stale — PR #89 merged (`610c4506b`),
+   feature `fce33ae22`. Its replacements were wrong in both directions: EP is
+   neither "env-gated only" (`ep_size` is a serde `config.json` field,
+   `deepseek4.rs:317-318`) nor "a config field, not an env var" (`ARC_EP_SIZE`
+   overrides it in `effective_ep_size()`, `:371-375`). **Both doors are real.**
+   The gap is a missing CLI/server flag, not a missing feature. *(§2.5)*
+2. **`CrossPrefixMeter` is not dead** — it records in production; only its
+   readout is test-only. *(§2.2)*
+3. **head_dim 512 is not the blocker — 448 is.** 512 compiles; the failure is
+   `vec_size 14 % 8 ≠ 0` at 448. *(§2.3)*
+4. **The prefix-cache-disable is narrower than written** — CUDA **and**
+   PagedAttention **and** standard layout **and** head_dim 128. V4 is MLA, so it
+   does **not** apply to the flagship. *(§4.2)*
+
+**Arc has never run a forward pass on more than one GPU.** EP, the pipeline
+shard and every multi-GPU claim in this file are code-complete and unrun. Write
+"code-complete, never run", never "supported".
+
+**Companions, both on branch `docs/census-session8` until it merges:**
+`memory/mission/CENSUS_SESSION8.md` (the complete Arc/SGLang/vLLM census, zero
+GPU hours) and `memory/mission/LADDER_POST_CENSUS.md` (the GPU ladder reordered
+by it). **Read the census before quoting any ceiling out of this file.**
+
+> 📁 **WHERE THE MISSION RECORD LIVES.** `00_RESUME_HERE.md`, `FACTS.md`,
+> `KERNEL_RULES.md`, `COMPETITIVE_TEARDOWN.md` and this file are the record. The
+> **live, agent-writable copies** are in the agent memory directory
+> (`~/.claude/projects/-Users-jish-Documents-GitHub-arc/memory/mission/`); the
+> copies in this repo are the **durable mirror**, synced **2026-08-19**. They had
+> already drifted once — the repo's TurboQuant box was correct and the live one
+> was a revision behind, which is exactly the failure this note exists to make
+> visible. **When they disagree, reconcile before quoting either; re-sync in the
+> same PR as any mission-record change.**
+
+---
+
 ## THE TREE
 
 ```
@@ -89,7 +130,7 @@ it: ArcKV/Share.**
 |---|---|---|
 | **ArcKV/Share** | radix-tree KV sharing, generic over key symbol (token ids *or* block hashes) and payload | `mistralrs-core/src/kv_sharing/mod.rs`, `radix.rs` |
 | ArcKV/Share/Evict | `EvictionScorer`; `LruScorer` baseline and **`ValueAwareScorer`** — recompute cost × reuse probability × staleness. The named differentiator: every SGLang policy is a function of time or hit count only | `kv_sharing/evict.rs` |
-| ArcKV/Share/Content | `ContentDigest`/`Fnv1a128`/`ContentIndex`, `CrossPrefixMeter` measuring reuse the tree *misses*; refuses causally-invalid cross-prefix hits | `kv_sharing/content.rs` |
+| ArcKV/Share/Content | `ContentDigest`/`Fnv1a128`/`ContentIndex`, `CrossPrefixMeter` measuring reuse the tree *misses*; refuses causally-invalid cross-prefix hits. ⚠️ **It RECORDS in production — only the READOUT is test-only.** An earlier "`CrossPrefixMeter` is dead" claim is **wrong** and must not be repeated: a metric with no reader is not a metric that does not run | `kv_sharing/content.rs` |
 | ArcKV/Share/Layout | `KvElemType` + `KvBlockLayout` — element width is a **per-block** property, so BF16 and FP8 blocks coexist with exact byte accounting | `kv_sharing/layout.rs` |
 | ArcKV/Paged | `BlockPool` (O(1) free list), `BlockHash` (chained content hash), `KVCacheManager`, `CacheEngine`, `PagedCacheType`, `EncoderCacheManager` | `mistralrs-core/src/paged_attention/` |
 | ArcKV/Dense | `KvCache`/`NormalCache`/`SingleCache`/`RotatingCache`/`HybridCache`; clone-in/clone-out dense batch cache | `mistralrs-core/src/kv_cache/` |
@@ -116,6 +157,13 @@ it: ArcKV/Share.**
 > layers, so dispatch takes the sinks branch before flash is considered; and the
 > sinks gate excludes head_dim 512, which is what V4 uses. V4 runs the **unfused
 > matmul + `softmax_with_sinks`** path. Any doc implying otherwise is wrong.
+>
+> 🔵 **CORRECTED 2026-08-19 — "head_dim 512 is the blocker" is INVERTED.**
+> **512 compiles.** The width that fails is **448**, on `vec_size 14 % 8 ≠ 0`.
+> The dispatch-order sentence above stands on its own and is unaffected; what is
+> retracted is the *kernel-instantiation* half — do not cite 512 as an
+> instantiation ceiling, and do not plan work around removing a cap that is not
+> there. **The 448 record is the real constraint.**
 
 ### 2.4 ArcSpec — speculative decoding *(named here; was unnamed)*
 
@@ -142,7 +190,34 @@ it: ArcKV/Share.**
 | ArcMoE/TD | **TD-MoE** Tucker decomposition of stacked experts, installed as a post-ISQ hook | `arc-engine/src/td_moe.rs`, `td_moe_loader.rs`, `mistralrs-quant/src/td_moe_factored/` |
 | ArcMoE/Sparse | dReLU activation sparsity stats — Tier A | `arc-engine/src/turbo_sparse.rs` |
 | ArcMoE/AnyMoE | training-time MoE adapters over a dense model — orthogonal to serving | `mistralrs-core/src/amoe/` |
-| ArcMoE/EP 🔵 | **NOT ON MASTER — open in PR #89** (stage 0 + stage 1, EP=2). Today `Comm::Dummy(rank=0, world_size=1)` and `SumAllReduce` = clone; the only live multi-GPU path is layer-wise pipeline sharding | `mistralrs-quant/src/distributed/` |
+| ArcMoE/EP ⚠️ | ✅ **ON MASTER since PR #89 merged** (`610c4506b`; feature commit `fce33ae22`) — stage 0 + stage 1, EP=2. `Moe::new` calls `build_expert_parallel_plan` (`deepseek4.rs:2227`, called at `:2300`) → `MoEExperts::new_expert_parallel` (`:2308`). **TWO doors, both real; neither is the CLI.** (1) **`ep_size` is a deserialized `config.json` field** — `#[serde(default = "default_ep_size")]` at `:317-318`, default `1` at `:140` — so a checkpoint whose `config.json` carries `ep_size: 2` shards with **no environment variable set**. (2) **`ARC_EP_SIZE` overrides that field at run time** — `effective_ep_size()` at `:371-375` reads the env var first and falls back to the config field, and `ARC_EP_PLACEMENT=balanced` (`:2184`) picks the placement. **What is missing is a CLI/server flag** (`grep -rn 'ep_size\|expert_parallel' mistralrs-cli/ mistralrs-server-core/` → nothing), **not a config door.** Dark by default only because the published V4-Flash `config.json` carries `ep_size: 1` and `effective_ep_size() <= 1` returns `ExpertParallelPlan::single` (`:2236`). `ep_size != comm.world_size()` is an error, not a degrade (`:2238-2242`). Weight-read imbalance is hard-bounded at **+5.05%** at B=128 (`expert_parallel.rs:18-19`), which is why stage 1 ships without EPLB | `mistralrs-core/src/moe/expert_parallel.rs` (847 lines), `mistralrs-core/src/models/deepseek4.rs`, `mistralrs-quant/src/distributed/` |
+
+> 🔴 **ARC HAS NEVER RUN A FORWARD PASS ON MORE THAN ONE GPU.** EP, the
+> layer-wise pipeline shard, `SumAllReduce` and every multi-GPU number in this
+> file are **code-complete and unrun**. At `world_size=1` the code still takes
+> `Comm::Dummy(rank=0)` and `SumAllReduce` = clone, so *"the EP tests pass"*
+> certifies the single-rank degenerate case only.
+> ⇒ **Say "code-complete, never run." Never "supported."**
+>
+> **The corollary for EPLB / expert placement is a SCOPE, not a verdict (D21):**
+> on **one** card there is one rank owning all 256 experts, so cross-rank
+> balancing has nothing to balance, and at B=128 ~244 distinct experts ×
+> 6.29 MB = **1.53 GB/layer against a 60 MB L2 — 25× over**, so no permutation
+> improves reuse either. **It pays the moment `ep_size > 1`.** Build the
+> rebalancer *when* the second card runs.
+>
+> ⚠️ **This row has now been wrong in BOTH directions — do not restore either.**
+> *"NOT ON MASTER"* was stale by a merge (fixed in #140). #140 then replaced it
+> with *"env-gated only … `ARC_EP_SIZE` … the only door"*, and a session-8 draft
+> swung the other way with *"`ep_size` is a `config.json` field, **not** an env
+> var"*. Both halves are wrong: the cited file contradicts each of them three
+> lines from the other — `ep_size` is a serde field (`:317`) that
+> `effective_ep_size` falls back to (`:374`) *after* consulting `ARC_EP_SIZE`
+> (`:372`). **Both doors exist; the CLI is the one that does not.** Before
+> marking a subsystem 🔵 or writing "env-only"/"not an env var", (a) `git
+> merge-base --is-ancestor` the PR's merge commit, and (b) read the struct
+> *and* the `std::env::var` call — an env var that *overrides* a config field
+> neither replaces it nor is replaced by it.
 
 ### 2.6 ArcGraph — GPU-autonomous decode
 
@@ -229,13 +304,42 @@ coding. Presets Default (K4/V3), Balanced (K3/V3), Aggressive (K3/V2).
 | TurboQuant/Cache | `arc-turbo/src/cache.rs` — packed indices + norms + FP16 recent window |
 | TurboQuant/Kernels | `kernels/turboquant/turbo_wht.cu`, `mistralrs-paged-attn/.../turbo_paged_attention.cu` |
 
-> 🔴 **TurboQuant is NOT on any default path, and has NEVER been measured.**
-> Eager KV is opt-in (`ARC_TURBOQUANT_KV=1`, default off). The paged kernel
-> exists at **head_dim 128 only**; the ambient default auto-falls back to `Auto`
-> with a warning and an explicit request hard-errors off-envelope. **No kernel
-> exists at head_dim 512, so V4 cannot use it.** The prefix cache auto-disables
-> under TurboQuant. The former "4.27× measured end-to-end" is **format
-> arithmetic, never a forward pass** — retracted 2026-08-17.
+> 🔵 **CORRECTED 2026-08-17 — this box previously read "TurboQuant is NOT on
+> any default path, and has NEVER been measured." Both halves were false.**
+> Jish caught it. Read the replacement carefully; it is deliberately split.
+>
+> **It IS the paged default.** `defaults::PAGED_CACHE_TYPE` is
+> `PagedCacheType::TurboQuant` and `--pa-cache-type` carries no clap default, so
+> a standard-layout **head_dim-128** model on CUDA takes K4/V3 with no flag and
+> `cache_type_explicit = false`. `turboquant_stays_on_supported_geometry` in
+> `cache_engine.rs` asserts exactly this. Off that envelope the default
+> auto-falls back to `Auto` with a warning, and an explicit request hard-errors
+> instead. The prefix cache auto-disables under TurboQuant, so default-path
+> users lose prefix reuse silently — ⚠️ **NARROWED 2026-08-19: that requires
+> CUDA AND PagedAttention AND standard layout AND head_dim 128. V4 is MLA, so
+> "the default config silently disables prefix caching" does NOT apply to the
+> flagship.** It is a real defect on the head_dim-128 fleet and a
+> non-event on V4; a doc that states it unqualified is over-claiming. Only the
+> **eager** path is opt-in
+> (`ARC_TURBOQUANT_KV=1`, default off). **No kernel exists at head_dim 512, so
+> V4 does not take it.**
+>
+> **It HAS been measured — narrowly.** `4eba13905` (2026-04-06): *"55 tok/s
+> with TurboQuant = 46% over Candle baseline"*, **B200**, correct output.
+> Harness `deploy/modal_b200.py` names the model: `MODEL="Qwen/Qwen3-32B"`,
+> `gpu="B200"`, `--pa-cache-type turboquant`. wave61 recorded this commit and
+> still concluded "never measured"; the model it called "unstated" was one file
+> away. Eight CUDA correctness defects were fixed against that hardware on
+> 2026-04-02 (`143b5ab20` V-cache stride, `fd0074792` Q·K warp deadlock).
+>
+> **What is still genuinely unmeasured, and must not be inflated:** the run was
+> b=1, one card, one model, head_dim 128, `Default` preset. The "46%" compares
+> Arc's whole dedicated decode path with Candle's and **isolates nothing about
+> TurboQuant** — there is no A/B against an unquantized cache. There is **no
+> quality evaluation at any preset**. The former "4.27× measured end-to-end" is
+> **format arithmetic, never a forward pass** — retracted 2026-08-17 and it
+> stays retracted; likewise the **1,026 → 260 B/token** V4 figure, which is
+> design arithmetic over code that has never run.
 >
 > **Codebook density:** `∝ (1-x²)^((d-3)/2)`, i.e. `(x+1)/2 ~ Beta((d-1)/2,
 > (d-1)/2)`. The old "Beta(d/2, d/2)" prose was off by a half in both shape
@@ -244,9 +348,10 @@ coding. Presets Default (K4/V3), Balanced (K3/V3), Aggressive (K3/V2).
 >
 > **In flight:** PR #94 (CUDA kernels at head_dim 64/128/256/**512**, Hopper +
 > Blackwell) and PR #98 (TurboQuant KV storage for V4, `V4CachedK`). If those
-> land, the "head_dim 128 only" and "V4 cannot use it" statements above become
-> stale — **re-check this section before quoting it**, and note that a kernel
-> existing still would not make it *measured*.
+> land, the "head_dim 128 only" and "V4 does not take it" statements above
+> become stale — **re-check this section before quoting it**. A kernel existing
+> does not make *that width* measured: 64/256/512 would be compiled and unrun,
+> and only head_dim 128 has hardware behind it.
 
 ### 4.3 ArcBake — the offline pipeline *(named here)*
 
@@ -289,6 +394,19 @@ MXFP4, AFQ, blockwise-FP8, bitsandbytes, GGUF/GGML. `mistralrs-quant/src/`.
 > walking 1..N-1, so no stock CUTLASS grouped GEMM can read them. Score any
 > upstream kernel on *"can it read our bytes"*, never on *"can it express our
 > attention shape"*.
+>
+> 🔵 **NARROWED 2026-08-19 — "there is no runtime LUT on the GPU."** True only
+> of `qtip_gather_gemv.cu`. **`qtip_gemv.cu:266` still selects a stored Gaussian
+> LUT when `cb_mult == 0`, and that is the SHIPPED DEFAULT**
+> (`QtipCodebook::DEFAULT = Gaussian`, `mod.rs:570`). The in-tree doc at
+> `mod.rs:596-598` is broader than the code supports. A lever that "does not
+> exist" on one kernel may be the live path on another — **name the file.**
+>
+> ⚠️ **The shipped `qtip2` artifact cannot reach the grouped GEMM at all.**
+> Above 8 tokens it dequantizes every distinct expert to BF16 in HBM —
+> **16 traffic units against the grouped path's 1**. Every grouped-GEMM
+> throughput number in this file and in `FACTS.md` **assumes a kernel we do not
+> ship**. Say so whenever one is quoted.
 
 ## 6. ArcFormat — the artifact *(named here)*
 
@@ -302,7 +420,7 @@ MXFP4, AFQ, blockwise-FP8, bitsandbytes, GGUF/GGML. `mistralrs-quant/src/`.
 
 | Subsystem | Does | Lives in |
 |---|---|---|
-| ArcLab/Profiler | hierarchical span tree; **three structurally distinct time channels — wall / device (CUDA events) / sync (host blocked)**. Built because a 4-bucket split could not locate a 150× gap. JSON is the durable artifact | `arc-profiler/` |
+| ArcLab/Profiler | hierarchical span tree; **three structurally distinct time channels — wall / device (CUDA events) / sync (host blocked)**. Built because a 4-bucket split could not locate a 150× gap. JSON is the durable artifact. ⚠️ **`mark_unreachable` — the registry that is supposed to list dark features — is ITSELF DARK:** inert unless `ARC_PROFILE=1`, and **4 of its 6 `site` strings have drifted** away from the code they name. The instrument for finding switched-off code is switched off, with stale labels | `arc-profiler/` |
 | ArcLab/Bench | **AA-AgentPerf**: recorded multi-turn agentic-coding trajectories replayed against any `Vendor` with tool responses injected for determinism; SLO tiers, ramp-then-binary-search for max passing concurrency | `arc-bench/`, `arc-cli/src/bench/` |
 | ArcLab/Ops | **no Rust** — shell/Python: `preflight.sh`, `cuda_compile_check.sh`, rental playbooks, quality gates (ppl, GSM8K, longctx, coherence), bake drivers, harvest | `arc-tools/` |
 | ArcLab/Validate | `arc validate --target-hbm` pre-flight HBM residency; offline weight-schema check | `arc-cli/src/validate.rs`, `arc-engine/src/weight_schema.rs` |

@@ -50,10 +50,13 @@ impl FlashAttnSinks {
             || head_dim == 112
             || head_dim == 128
             || head_dim == 192
-            || head_dim == 256)
+            || head_dim == 256
+            // V4: symmetric 512/512, MQA. BC=8 keeps smem at the same ~32 KB
+            // every other case uses (see flash_attn_sinks.cu).
+            || head_dim == 512)
         {
             candle::bail!(
-                "flash_attn_sinks: head_dim must be one of 64, 80, 96, 112, 128, 192, 256, got {head_dim}"
+                "flash_attn_sinks: head_dim must be one of 64, 80, 96, 112, 128, 192, 256, 512, got {head_dim}"
             );
         }
 
@@ -188,10 +191,13 @@ impl FlashAttnSinksVarlen {
             || head_dim == 112
             || head_dim == 128
             || head_dim == 192
-            || head_dim == 256)
+            || head_dim == 256
+            // V4: symmetric 512/512, MQA. BC=8 keeps smem at the same ~32 KB
+            // every other case uses (see flash_attn_sinks.cu).
+            || head_dim == 512)
         {
             candle::bail!(
-                "flash_attn_sinks_varlen: head_dim must be one of 64, 80, 96, 112, 128, 192, 256, got {head_dim}"
+                "flash_attn_sinks_varlen: head_dim must be one of 64, 80, 96, 112, 128, 192, 256, 512, got {head_dim}"
             );
         }
 

@@ -95,12 +95,12 @@ pub struct CalibrateCollectionOptions {
     pub gram: GramModeArg,
 
     /// Block width for `--gram block`.
-    #[arg(long, default_value_t = 128)]
+    #[arg(long, default_value_t = 128, hide = true)]
     pub gram_block: usize,
 
     /// Maximum `in_features` for `--gram full`; wider layers fall back to
     /// diagonal-only (and are still emitted).
-    #[arg(long, default_value_t = 4096)]
+    #[arg(long, default_value_t = 4096, hide = true)]
     pub gram_max_dim: usize,
 
     /// Also collect per-expert statistics for MoE expert stacks. This
@@ -111,7 +111,7 @@ pub struct CalibrateCollectionOptions {
 
     /// Experts routed fewer than this many rows are flagged `insufficient` in
     /// the artifact so consumers can fall back to layer-global statistics.
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, default_value_t = 32, hide = true)]
     pub min_expert_tokens: u64,
 
     /// ISQ organization determining which layers are calibrated: `default` (all
@@ -134,19 +134,19 @@ pub struct CalibrateDeviceOptions {
     pub device_layers: Option<Vec<String>>,
 
     /// Topology YAML file for device mapping
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub topology: Option<PathBuf>,
 
     /// Custom HuggingFace cache directory
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub hf_cache: Option<PathBuf>,
 
     /// Max sequence length for automatic device mapping
-    #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_SEQ_LEN)]
+    #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_SEQ_LEN, hide = true)]
     pub max_seq_len: usize,
 
     /// Max batch size for automatic device mapping
-    #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE)]
+    #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE, hide = true)]
     pub max_batch_size: usize,
 }
 

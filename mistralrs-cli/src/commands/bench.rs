@@ -81,6 +81,7 @@ pub async fn run_bench(
         .with_interactive_mode(false)
         .with_prefix_cache_n(0) // Disable prefix cache for benchmarking
         .with_mtp_depth(runtime.mtp_depth as usize)
+        .with_v4_ragged_decode(runtime.v4_ragged_decode)
         .set_paged_attn(paged_attn)
         .with_cpu(cpu)
         .with_seed_optional(global.seed)
@@ -188,7 +189,41 @@ pub async fn run_bench(
     // out of the same process, with no second run and no second rental.
     report_mtp_acceptance(runtime.mtp_depth as usize);
 
+    // ArcKV/Share: whether the prefix cache hit, on the same greppable
+    // convention. Without this line a prefill number is uninterpretable — it
+    // could be a cold-cache measurement, a warm-cache one, or (as `bench`
+    // itself configures) a measurement with the cache switched off entirely.
+    report_prefix_cache(&mistralrs);
+
     Ok(())
+}
+
+/// Print the `SHARE[...]` marker for this run, or say plainly that the prefix
+/// cache produced no measurement.
+///
+/// Same shape and the same reason as [`report_mtp_acceptance`]: an absent
+/// number must not read as a zero. `run_bench` builds the engine with
+/// `--prefix-cache-n 0`, so on an unmodified `mistralrs bench` invocation this
+/// prints the `WARN[SHARE]` arm — which is the finding, not a defect in the
+/// reporting: every `bench` prefill figure Arc has ever published was taken
+/// with prefix caching off, and nothing said so.
+fn report_prefix_cache(mistralrs: &Arc<mistralrs_core::MistralRs>) {
+    let Ok(logger) = mistralrs.get_logger(None) else {
+        return;
+    };
+    match logger.share_stats() {
+        Some(stats) if stats.was_consulted() => {
+            println!("SHARE[prefix] {}", stats.summary());
+        }
+        _ => {
+            println!(
+                "WARN[SHARE] the prefix cache was never consulted in this run (`mistralrs \
+                 bench` builds the engine with --prefix-cache-n 0). Prefill throughput and \
+                 TTFT above are cold-path numbers: they are UNMEASURED with respect to \
+                 caching — do not read them as a 0% hit rate."
+            );
+        }
+    }
 }
 
 /// Print the `MTP[agg] …` marker for this process, or say plainly that no
@@ -207,6 +242,16 @@ fn report_mtp_acceptance(mtp_depth: usize) {
         // run whose batch size moved is a number about no particular batch.
         for marker in markers {
             println!("{marker}");
+        }
+        // The per-position breakdown, alongside the aggregate rather than
+        // instead of it. `accept_rate` is one scalar over the whole chain, and
+        // the same scalar is produced by a flat per-position profile (a
+        // target/draft distribution mismatch) and by a falling one (the draft
+        // compounding on its own hidden state) — which are different defects
+        // with different fixes. Printing only the scalar is what made the
+        // measured 0.4194 undiagnosable without a second GPU rental.
+        for line in mistralrs_core::mtp_acceptance_position_lines() {
+            println!("{line}");
         }
         return;
     }

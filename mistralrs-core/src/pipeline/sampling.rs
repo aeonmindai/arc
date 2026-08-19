@@ -86,15 +86,15 @@ pub(crate) async fn finish_or_add_toks_to_seq(
 
     // Handle streaming requests.
     //
-    // `get_mut_group()` expands the `get_mut_group!` busy-wait
-    // (`utils/mod.rs:227-237`): `try_lock` in a bare `loop` with `yield_now()`
-    // and no backoff. A streaming decode step takes it nine times per token per
-    // sequence — five of those from `update_time_info()` re-locking to write
-    // five fields — against one `SequenceGroup` mutex shared by the whole
-    // request. This span is the first one that counts it.
-    let group_is_streaming = {
-        let _s = arc_profiler::span("group_lock.is_streaming");
-        seq.get_mut_group().is_streaming
+    // `get_mut_group()` is now a blocking `std::sync::Mutex` acquire, not the
+    // `try_lock` + `std::thread::yield_now()` spin it used to be. Both flags are
+    // read under one acquisition rather than two separate ones a few lines
+    // apart; the group's mode cannot change mid-request, so this is also the
+    // more honest read.
+    let (group_is_streaming, group_is_chat) = {
+        let _s = arc_profiler::span("group_lock.mode");
+        let group = seq.get_mut_group();
+        (group.is_streaming, group.is_chat)
     };
     if group_is_streaming {
         let mut tool_use_still_possible = false;
@@ -116,7 +116,7 @@ pub(crate) async fn finish_or_add_toks_to_seq(
             if send {
                 let delta_result = seq.get_delta();
                 if let Some(delta) = crate::handle_seq_error_ok!(delta_result, seq.responder()) {
-                    if seq.get_mut_group().is_chat {
+                    if group_is_chat {
                         // Check if we're in Harmony mode or think tag mode and use parsed content
                         let (content_delta, reasoning_delta) = if seq.is_harmony_mode() {
                             // In Harmony mode, use the parsed final content and reasoning
@@ -214,32 +214,40 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                 }
             }
 
-            // Send usage on final chunk.
-            let usage_opt = if is_done.is_some() {
-                let usage = seq.get_mut_group().get_usage();
-                seq.get_mut_group().total_prompt_toks = 0;
-                seq.get_mut_group().total_toks = 0;
-                Some(usage)
-            } else {
-                None
+            // Build the chunk and release the group lock BEFORE dispatching it.
+            // Usage on the final chunk is read under the same acquisition that
+            // resets the counters and takes the buffered chunks, instead of the
+            // four separate ones this used to be.
+            let response = {
+                let _s = arc_profiler::span("group_lock.take_response");
+                let mut group = seq.get_mut_group();
+                let usage_opt = if is_done.is_some() {
+                    let usage = group.get_usage();
+                    group.total_prompt_toks = 0;
+                    group.total_toks = 0;
+                    Some(usage)
+                } else {
+                    None
+                };
+                group.take_streaming_response(seq, this.name().clone(), usage_opt)
             };
 
-            // The serial dispatch loop: one `responder.send().await` per
-            // sequence, awaited in turn, with the pipeline mutex held for all
-            // of them. Sequential (not `join_all`), so a span across this await
-            // nests correctly.
-            let _s = arc_profiler::span("response.send");
-            if seq
-                .get_mut_group()
-                .maybe_send_streaming_response(seq, this.name().clone(), usage_opt)
-                .await
-                .is_err()
-            {
-                // If we can't send the response, cancel the sequence
-                seq.set_state(crate::sequence::SequenceState::Done(
-                    crate::sequence::StopReason::Canceled,
-                ));
-                this.reset_non_granular_state();
+            // Dispatch with the group lock dropped. `send_fast` pushes without
+            // awaiting whenever the client's channel has room, so one slow
+            // client no longer sits on the engine's critical path — and the
+            // pipeline mutex is no longer held across a suspension point here.
+            if let Some(response) = response {
+                let _s = arc_profiler::span("response.send");
+                if crate::utils::send_fast(&seq.responder(), response)
+                    .await
+                    .is_err()
+                {
+                    // If we can't send the response, cancel the sequence
+                    seq.set_state(crate::sequence::SequenceState::Done(
+                        crate::sequence::StopReason::Canceled,
+                    ));
+                    this.reset_non_granular_state();
+                }
             }
         }
 
@@ -328,7 +336,7 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                 }
             };
 
-            if seq.get_mut_group().is_chat {
+            if group_is_chat {
                 // In Harmony or think tag mode, use parsed content and tool calls
                 let (text_new, tool_calls, reasoning_content) = if seq.is_harmony_mode() {
                     let final_content = seq.get_harmony_final_content();
@@ -419,38 +427,34 @@ pub(crate) async fn finish_or_add_toks_to_seq(
             // Ensure timing info is synced to group before sending response
             seq.update_time_info();
 
-            let group = seq.get_mut_group();
-            if group.is_chat {
-                group
-                    .maybe_send_chat_done_response(
-                        crate::ChatCompletionResponse {
-                            id: seq.id().to_string(),
-                            choices: group.get_choices().to_vec(),
-                            created: seq.creation_time(),
-                            model: pipeline_name,
-                            system_fingerprint: crate::SYSTEM_FINGERPRINT.to_string(),
-                            object: "chat.completion".to_string(),
-                            usage: group.get_usage(),
-                            vote: None,
-                        },
-                        seq.responder(),
-                    )
-                    .await
-                    .map_err(candle_core::Error::msg)?;
-            } else {
-                group
-                    .maybe_send_completion_done_response(
-                        crate::CompletionResponse {
-                            id: seq.id().to_string(),
-                            choices: group.get_completion_choices().to_vec(),
-                            created: seq.creation_time(),
-                            model: pipeline_name,
-                            system_fingerprint: crate::SYSTEM_FINGERPRINT.to_string(),
-                            object: "text_completion".to_string(),
-                            usage: group.get_usage(),
-                        },
-                        seq.responder(),
-                    )
+            // Build under the lock, dispatch after dropping it.
+            let response = {
+                let group = seq.get_mut_group();
+                if group.is_chat {
+                    group.chat_done_response(crate::ChatCompletionResponse {
+                        id: seq.id().to_string(),
+                        choices: group.get_choices().to_vec(),
+                        created: seq.creation_time(),
+                        model: pipeline_name,
+                        system_fingerprint: crate::SYSTEM_FINGERPRINT.to_string(),
+                        object: "chat.completion".to_string(),
+                        usage: group.get_usage(),
+                        vote: None,
+                    })
+                } else {
+                    group.completion_done_response(crate::CompletionResponse {
+                        id: seq.id().to_string(),
+                        choices: group.get_completion_choices().to_vec(),
+                        created: seq.creation_time(),
+                        model: pipeline_name,
+                        system_fingerprint: crate::SYSTEM_FINGERPRINT.to_string(),
+                        object: "text_completion".to_string(),
+                        usage: group.get_usage(),
+                    })
+                }
+            };
+            if let Some(response) = response {
+                crate::utils::send_fast(&seq.responder(), response)
                     .await
                     .map_err(candle_core::Error::msg)?;
             }
@@ -654,6 +658,28 @@ pub struct SpeculativeSample {
 }
 
 /// Async sample without modifying sequence (except for the constraint).
+///
+/// # Verification is greedy-only
+///
+/// A draft token is accepted iff it is *equal* to the token the target model
+/// produces at that slot. That test is lossless exactly when both models are
+/// decoding greedily: argmax of the target alone equals argmax via
+/// draft-then-verify.
+///
+/// It is **not** correct for `temperature > 0`. The distribution-preserving
+/// test is rejection sampling — accept the draft with probability
+/// `min(1, p(x)/q(x))` and, on rejection, redraw from the normalised residual
+/// `max(0, p(x) - q(x))` — and neither the accept test nor the residual draw
+/// exists here. Accepting on token equality instead would emit whatever
+/// `Sampler::sample(.., sample_speculative = true, ..)` returns, which is an
+/// argmax at any temperature (see `Sampler::sample_speculative_top_kp_min_p`),
+/// i.e. greedy output for a request that asked for sampling.
+///
+/// So when the sequence is not greedy we refuse to speculate: draw one token
+/// from the target the ordinary (stochastic) way and reject every draft. The
+/// caller already handles a short accept list — it narrows the caches by
+/// `gamma - accepted.len()` — so this degrades to plain non-speculative
+/// decode, with correct output and no speedup.
 pub async fn sample_target_sequence_speculative(
     logits: Tensor,
     seq: &mut Sequence,
@@ -669,6 +695,23 @@ pub async fn sample_target_sequence_speculative(
             llg.rollback(n_toks).map_err(candle_core::Error::msg)?;
         }
         SequenceRecognizer::None => {}
+    }
+
+    if !seq.sampler().is_greedy() {
+        let Some(first) = logits.chunk(n_toks, 1)?.into_iter().next() else {
+            return Ok(Vec::new());
+        };
+        let sample = sample_sequence(
+            first,
+            seq,
+            return_logprobs,
+            rng,
+            true,
+            false, // NOT speculative: a real draw from the target distribution
+            false,
+        )
+        .await?;
+        return Ok(vec![SpeculativeSample { sample }]);
     }
 
     let mut sampled = Vec::new();
@@ -694,4 +737,192 @@ pub async fn sample_target_sequence_speculative(
         }
     }
     Ok(sampled)
+}
+
+#[cfg(test)]
+mod speculative_verification_tests {
+    use super::*;
+    use crate::sampler::Sampler;
+    use crate::sequence::{SeqStepType, SequenceGroup};
+    use candle_core::Device;
+    use rand::SeedableRng;
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+
+    const VOCAB: usize = 32;
+    const GAMMA: usize = 4;
+    /// The token every slot's logits peak at, so greedy verification accepts
+    /// the whole draft.
+    const PEAK: u32 = 7;
+
+    thread_local! {
+        /// Keeps each fixture sequence's `Receiver` alive; a dropped receiver
+        /// models a disconnected client and would silently change behaviour.
+        static LIVE_CLIENTS: RefCell<Vec<tokio::sync::mpsc::Receiver<crate::response::Response>>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    /// Minimal sequence carrying `sampler`. `sample_target_sequence_speculative`
+    /// only reads the sampler, the token history and the (absent) recognizer.
+    fn seq_with(sampler: Sampler) -> Sequence {
+        let (dummy_sender, rx) = tokio::sync::mpsc::channel(1);
+        LIVE_CLIENTS.with(|k| k.borrow_mut().push(rx));
+        let group = Arc::new(std::sync::Mutex::new(SequenceGroup::new(
+            1, false, false, None,
+        )));
+        Sequence::new_waiting(
+            vec![1u32; 4],
+            String::new(),
+            0,
+            0,
+            1,
+            dummy_sender,
+            sampler,
+            vec![],
+            vec![],
+            None,
+            false,
+            false,
+            group,
+            0,
+            0,
+            SequenceRecognizer::None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            SeqStepType::PromptAndDecode,
+            None,
+            None,
+            None,
+            false,
+            vec![],
+        )
+    }
+
+    fn sampler_with(temperature: Option<f64>) -> Sampler {
+        Sampler::new(
+            temperature,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            -1,  // top_k disabled
+            1.0, // top_p disabled
+            0.0, // min_p disabled
+            None,
+            vec![],
+            None,
+        )
+        .unwrap()
+    }
+
+    /// `(1, GAMMA, VOCAB)` logits. `peak = true` puts a dominant spike on
+    /// `PEAK` in every slot; `peak = false` is flat (uniform).
+    fn logits(peak: bool) -> Tensor {
+        let mut raw = vec![0f32; GAMMA * VOCAB];
+        if peak {
+            for slot in 0..GAMMA {
+                raw[slot * VOCAB + PEAK as usize] = 20.0;
+            }
+        }
+        Tensor::from_vec(raw, (1, GAMMA, VOCAB), &Device::Cpu).unwrap()
+    }
+
+    fn drafts(token: u32) -> Vec<SpeculativeSample> {
+        (0..GAMMA)
+            .map(|_| SpeculativeSample {
+                sample: Logprobs {
+                    token,
+                    logprob: 0.0,
+                    top_logprobs: None,
+                    bytes: None,
+                },
+            })
+            .collect()
+    }
+
+    /// Greedy speculation is lossless, so a draft that matches the target's
+    /// argmax in every slot must still be accepted in full. This is the
+    /// control: it pins that the temperature refusal below does not disable
+    /// speculative decoding outright.
+    #[tokio::test]
+    async fn greedy_speculation_accepts_a_matching_draft() {
+        let mut seq = seq_with(sampler_with(None));
+        let rng = Arc::new(std::sync::Mutex::new(Isaac64Rng::seed_from_u64(0)));
+        let accepted =
+            sample_target_sequence_speculative(logits(true), &mut seq, false, rng, &drafts(PEAK))
+                .await
+                .unwrap();
+
+        assert_eq!(
+            accepted.len(),
+            GAMMA,
+            "greedy verification must accept a draft that matches the target argmax"
+        );
+        assert!(accepted.iter().all(|s| s.sample.token == PEAK));
+    }
+
+    /// With `temperature > 0` the accept-on-equality test is not rejection
+    /// sampling, so speculation must be refused: exactly one token, drawn from
+    /// the target the ordinary way, and every draft rejected.
+    ///
+    /// Discriminator: the logits peak hard on `PEAK`, and the speculative
+    /// sampling branch is an argmax at any temperature, so without the refusal
+    /// all GAMMA drafts are accepted deterministically.
+    #[tokio::test]
+    async fn temperature_speculation_is_refused() {
+        let mut seq = seq_with(sampler_with(Some(1.0)));
+        let rng = Arc::new(std::sync::Mutex::new(Isaac64Rng::seed_from_u64(0)));
+        let accepted =
+            sample_target_sequence_speculative(logits(true), &mut seq, false, rng, &drafts(PEAK))
+                .await
+                .unwrap();
+
+        assert_eq!(
+            accepted.len(),
+            1,
+            "temperature > 0 must fall back to non-speculative decode (1 token, all drafts \
+             rejected); accepting {} means tokens were verified by equality rather than by \
+             rejection sampling",
+            accepted.len()
+        );
+    }
+
+    /// The one token the refusal path returns must be a real draw from the
+    /// target distribution, not the argmax the speculative branch produces.
+    ///
+    /// Discriminator: a flat distribution over 32 tokens. A genuine draw
+    /// spreads over the support; the speculative branch's `argmax_f32` returns
+    /// token 0 every single time.
+    #[tokio::test]
+    async fn temperature_fallback_token_is_sampled_not_argmaxed() {
+        let mut seen = HashSet::new();
+        let rng = Arc::new(std::sync::Mutex::new(Isaac64Rng::seed_from_u64(0xC0FFEE)));
+        for _ in 0..200 {
+            let mut seq = seq_with(sampler_with(Some(1.0)));
+            let accepted = sample_target_sequence_speculative(
+                logits(false),
+                &mut seq,
+                false,
+                rng.clone(),
+                &drafts(0),
+            )
+            .await
+            .unwrap();
+            assert_eq!(accepted.len(), 1);
+            seen.insert(accepted[0].sample.token);
+        }
+        assert!(
+            seen.len() > VOCAB / 2,
+            "the fallback covered only {} of {VOCAB} tokens over 200 draws from a flat \
+             distribution — it is returning an argmax, not a sample",
+            seen.len()
+        );
+    }
 }

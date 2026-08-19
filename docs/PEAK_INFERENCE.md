@@ -2,9 +2,19 @@
 
 > **This document is a PLAN, not a results page.** Every tok/s figure *for this
 > plan* is a **[target]** or a **[projected]** roofline. **Nothing in this plan
-> has been run.** No B200 has ever been rented for this project, and
+> has been run.** No B200 has ever been *rented* for this project, and
 > `deploy/benchmark.py` — cited below as the measurement harness — **does not
-> exist in the tree**. The only **[measured]** numbers quoted anywhere below are
+> exist in the tree**.
+>
+> ⚠️ **"Never rented" is not "never ran", and conflating the two erased a real
+> result.** Arc did execute on a B200 in April 2026, on **Modal**, via
+> `deploy/modal_b200.py` (which *is* in the tree). That is where the
+> **55 tok/s TurboQuant** figure in [Phase 4](#phase-4-turboquant-kernel-optimization-context-scaling)
+> comes from. It left no rental line in the budget, so audits reading for
+> rentals concluded no B200 evidence existed and repeatedly relabelled the run
+> "unmeasured". None of it is a baseline for *this* plan — different model
+> configuration, different objective — but it is not nothing, and it is not
+> unmeasured. The only **[measured]** numbers quoted anywhere below are
 > Arc's DeepSeek-V4-on-H200 results, imported from
 > [BENCHMARKS.md](BENCHMARKS.md) purely to keep this document from inventing a
 > baseline; they are a different model on a different card and do not transfer
@@ -315,17 +325,33 @@ For QKV fusion: modify model forward pass to concatenate weight matrices at load
 
 ## Phase 4: TurboQuant Kernel Optimization (context scaling)
 
-> 🔴 **Status before reading this phase.** **TurboQuant has never been measured
-> on a GPU, on any model.** The **4.27×** context figure quoted elsewhere in
-> this repo (Qwen3-32B, 39K → 169K) is **format arithmetic** — bytes per token
-> at 3.5 bits versus BF16 — and was **never produced by a forward pass**.
-> Anywhere it reads as measured, it is retracted. **[projected]**
+> 🔴 **Status before reading this phase.** The **4.27×** context figure quoted
+> elsewhere in this repo (Qwen3-32B, 39K → 169K) is **format arithmetic** —
+> bytes per token at 3.5 bits versus BF16 — and was **never produced by a
+> forward pass**. Anywhere it reads as measured, it is retracted. **[projected]**
 >
-> Ship state: TurboQuant is **off by default** (opt-in via
-> `ARC_TURBOQUANT_KV=1`); the paged kernel exists at **head_dim 128 only**; and
-> **there is no head_dim-512 kernel, so DeepSeek V4 Flash cannot use TurboQuant
-> at all.** The optimizations below are therefore work on a path that has no
-> measured baseline — producing one is a prerequisite, not a formality.
+> 🔵 **Correction (2026-08-17).** This box previously opened *"TurboQuant has
+> never been measured on a GPU, on any model."* **That was false.** Commit
+> `4eba13905` (2026-04-06) records **55 tok/s with TurboQuant on a B200**,
+> serving Qwen3-32B via `deploy/modal_b200.py`, with correct output
+> **[measured]**. So this phase does have a baseline — just a very narrow one:
+> b=1, one card, one model, head_dim 128, `Default` preset, and the "46% over
+> Candle baseline" in that commit compares Arc's whole dedicated decode path
+> against Candle's rather than isolating TurboQuant. **No quality evaluation
+> exists at any preset.** Widening and isolating that baseline is the work;
+> producing one from nothing is not.
+>
+> ⚠️ **This B200 evidence does not license the target at the top of this
+> document.** That run was Qwen3-32B under TurboQuant on Arc's dedicated decode
+> path — not the BF16 120 tok/s target this plan is written against, and not a
+> competitor comparison. The "no B200 has ever been rented" note in the header
+> is about **rentals**; this ran on **Modal**, which is why it left no rental
+> line in the budget and was missed by every later audit.
+>
+> Ship state: TurboQuant is the **paged default** at head_dim 128 on a standard
+> KV layout — not off by default; the separate *eager* path is the opt-in one
+> (`ARC_TURBOQUANT_KV=1`). **There is no head_dim-512 kernel, so DeepSeek V4
+> Flash does not use TurboQuant at all.**
 
 Once the BF16 baseline hits 120 tok/s, TurboQuant's KV cache compression is
 *intended* to provide the scaling advantage at long contexts and high batch

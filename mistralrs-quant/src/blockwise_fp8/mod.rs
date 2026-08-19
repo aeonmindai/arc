@@ -77,7 +77,25 @@ impl QuantMethod for BlockwiseFP8Linear {
         // Try to use native FP8 GEMM kernel on CUDA
         #[cfg(feature = "cuda")]
         {
-            if matches!(x.device(), candle_core::Device::Cuda(_))
+            // Parent system: ArcKernels.
+            //
+            // `fp8_matmul_tiled` is a SCALAR CUDA-core GEMM: one `float acc`
+            // per thread over `acc += s_input[ty][k] * s_weight[tx][k]`, with
+            // no tensor-core instruction anywhere in it. That is a reasonable
+            // shape for the decode regime (few rows, launch-dominated) and
+            // roughly two orders of magnitude off peak for prefill, where M is
+            // 512-2048 rows and the work is a real GEMM.
+            //
+            // The dequantize + cuBLASLt path that already exists below this
+            // block was previously unreachable on CUDA: the condition consulted
+            // only the device and whether the kernels were compiled, never the
+            // token count. `ARC_FP8_CUBLAS_MIN_M` makes it reachable above a
+            // row threshold. UNSET keeps the shipped behaviour exactly, so the
+            // A/B runs from a single binary.
+            let m_rows: usize = x.dims().iter().rev().skip(1).product();
+            let prefer_cublas = m_rows >= arc_fp8_cublas_min_m();
+            if !prefer_cublas
+                && matches!(x.device(), candle_core::Device::Cuda(_))
                 && ffi::HAVE_BLOCKWISE_GEMM_KERNELS
             {
                 // Handle batched inputs by flattening to 2D
@@ -527,4 +545,33 @@ pub fn blockwise_fp8_linear_b(
         bias,
         dequant_dtype: vb.dtype(),
     }))
+}
+
+/// Parent system: ArcKernels.
+///
+/// Row threshold at or above which a blockwise-FP8 linear prefers the
+/// dequantize + cuBLASLt path over the scalar `fp8_matmul_tiled` kernel.
+///
+/// Measured on an H200 against DeepSeek-V4-Flash at 512 prompt tokens: the
+/// cuBLASLt path is 27x faster on the MLA `q_proj`/`o_proj` projections
+/// (706.1 -> 26.2 ms/step) and 21x on the shared expert (253.2 -> 11.9), for
+/// 1.513x on prefill TTFT end to end. The default is set to that measured
+/// point rather than to an interpolated crossover.
+///
+/// The decode regime is untouched: it has its own dedicated `fp8_gemv_warp`
+/// kernel for M <= 4 and never reaches this threshold.
+///
+/// `ARC_FP8_CUBLAS_MIN_M` overrides; a value above any real batch restores
+/// the previous always-native dispatch.
+#[cfg(feature = "cuda")]
+fn arc_fp8_cublas_min_m() -> usize {
+    use std::sync::OnceLock;
+    const DEFAULT_MIN_M: usize = 512;
+    static CACHE: OnceLock<usize> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("ARC_FP8_CUBLAS_MIN_M")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_MIN_M)
+    })
 }

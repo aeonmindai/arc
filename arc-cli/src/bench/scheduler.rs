@@ -122,6 +122,16 @@ struct PhaseState {
     /// Measurements from the *whole* phase (warmup + steady). Used for
     /// the running TUI display.
     all_results: Vec<RequestResult>,
+    /// How many requests returned an error. A failed request is still pushed
+    /// as an `ok: false` datum so the rates stay honest, but the count is what
+    /// lets the phase tell "slow" apart from "nothing worked".
+    failed: u64,
+    /// The first request error, with its full cause chain. Without this the
+    /// scheduler recorded a failure as a zeroed `RequestResult` and threw the
+    /// reason away — so a run in which every request died (a poisoned CUDA
+    /// context, a dead server) produced a complete-looking table of zeros
+    /// rather than an error. Absence must not be recorded as a value.
+    first_error: Option<String>,
 }
 
 /// The scheduler. It owns a vendor (behind an Arc so concurrent requests
@@ -291,16 +301,29 @@ impl Scheduler {
                     let r = vendor.run_request(&prompt, max_tokens).await;
                     active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     let now = Instant::now();
-                    let result = match r {
-                        Ok(rr) => rr,
-                        Err(_) => RequestResult {
-                            ttft: Duration::ZERO,
-                            total: Duration::ZERO,
-                            output_tokens: 0,
-                            ok: false,
-                        },
+                    let (result, failure) = match r {
+                        Ok(rr) => (rr, None),
+                        // Keep the zeroed datum so the success/failure rates
+                        // stay honest, but NEVER discard the cause: this is the
+                        // only place the reason a benchmark request died is
+                        // still in hand.
+                        Err(e) => (
+                            RequestResult {
+                                ttft: Duration::ZERO,
+                                total: Duration::ZERO,
+                                output_tokens: 0,
+                                ok: false,
+                            },
+                            Some(format!("{e:#}")),
+                        ),
                     };
                     let mut s = state.lock().await;
+                    if let Some(cause) = failure {
+                        s.failed += 1;
+                        if s.first_error.is_none() {
+                            s.first_error = Some(cause);
+                        }
+                    }
                     s.all_results.push(result);
                     if now >= warmup_deadline && now <= phase_deadline {
                         s.steady_state_results.push(result);
@@ -388,6 +411,26 @@ impl Scheduler {
 
         // Build the final phase record from steady-state samples.
         let final_state = state.lock().await;
+
+        // A phase in which NOTHING succeeded is not a slow measurement, it is
+        // an absent one. Reporting it as a record yields a full table of zeros
+        // — a plausible-looking result that contains no measurement at all,
+        // which is how a dead run gets written up as a finding. Fail loudly,
+        // and carry the cause we captured rather than a summary of it.
+        let succeeded = final_state.all_results.iter().filter(|r| r.ok).count();
+        if succeeded == 0 {
+            let cause = final_state
+                .first_error
+                .clone()
+                .unwrap_or_else(|| "no request completed and no error was recorded".to_string());
+            anyhow::bail!(
+                "bench phase {phase_index} (K={k}, {kind}) produced no successful request: \
+                 {attempts} attempted, {failed} failed. This is not a measurement -- \
+                 refusing to report it as one. First error: {cause}",
+                attempts = final_state.all_results.len(),
+                failed = final_state.failed,
+            );
+        }
         let speeds: Vec<f64> = final_state
             .steady_state_results
             .iter()
@@ -559,5 +602,84 @@ mod tests {
         // Saturation should be in a reasonable neighbourhood of the
         // true crossover.
         assert!((32..=64).contains(&s), "noisy result out of band: {s}");
+    }
+
+    // ---------------------------------------------------------------------
+    // A failed request must not be recorded as a silent zero.
+    // ---------------------------------------------------------------------
+
+    /// Vendor whose every request fails with a distinctive, layered cause.
+    struct AlwaysFailsVendor;
+
+    #[async_trait::async_trait]
+    impl Vendor for AlwaysFailsVendor {
+        fn name(&self) -> &str {
+            "always-fails"
+        }
+        async fn run_request(&self, _prompt: &str, _max_tokens: u32) -> Result<RequestResult> {
+            Err(
+                anyhow::anyhow!("DriverError(CUDA_ERROR_ILLEGAL_INSTRUCTION)")
+                    .context("engine returned InternalError"),
+            )
+        }
+    }
+
+    fn fast_cfg() -> SchedulerConfig {
+        SchedulerConfig {
+            max_users: 1,
+            warmup: Duration::from_millis(10),
+            steady_state: Duration::from_millis(40),
+            max_tokens_per_request: 8,
+            bisect_min_gap: 1,
+        }
+    }
+
+    /// A phase in which every request fails must FAIL, and must carry the
+    /// driver's own words out with it.
+    ///
+    /// Before this, `Err(_)` was mapped to a zeroed `RequestResult { ok: false }`
+    /// and the cause was dropped on the floor, so a run where nothing worked
+    /// produced a full table of zeros — a plausible-looking result containing
+    /// no measurement. Same class as the KV-cache message that replaced a
+    /// `DriverError` with a fixed string.
+    #[tokio::test]
+    async fn a_phase_where_every_request_fails_is_an_error_not_a_row_of_zeros() {
+        let tier = SloTier::from_id(1).unwrap();
+        let sched = Scheduler::new(Arc::new(AlwaysFailsVendor), fast_cfg(), tier);
+        let err = sched
+            .run_phase(0, 1, "test")
+            .await
+            .expect_err("a phase with zero successful requests must not return a PhaseRecord");
+        let msg = format!("{err:#}");
+
+        assert!(
+            msg.contains("no successful request"),
+            "error must say the phase produced no measurement: {msg}"
+        );
+        assert!(
+            msg.contains("CUDA_ERROR_ILLEGAL_INSTRUCTION"),
+            "the request's own cause must survive into the phase error, not be \
+             replaced by a summary: {msg}"
+        );
+        assert!(
+            msg.contains("engine returned InternalError"),
+            "the full cause chain must survive, not just the innermost error: {msg}"
+        );
+    }
+
+    /// Control: the assertion above discriminates. A vendor that works yields a
+    /// record, so the test is not passing merely because everything errors.
+    #[tokio::test]
+    async fn a_phase_with_working_requests_still_returns_a_record() {
+        let vendor = Arc::new(crate::bench::vendor::MockVendor::new(
+            crate::bench::vendor::MockVendorConfig::default(),
+        ));
+        let tier = SloTier::from_id(1).unwrap();
+        let sched = Scheduler::new(vendor, fast_cfg(), tier);
+        let rec = sched
+            .run_phase(0, 1, "test")
+            .await
+            .expect("a phase with successful requests must return a record");
+        assert_eq!(rec.concurrent_users, 1);
     }
 }

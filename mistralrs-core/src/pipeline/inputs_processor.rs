@@ -188,8 +188,36 @@ pub mod text_models_inputs_processor {
         pub seq_indices: Vec<usize>,
     }
 
+    /// The per-row absolute offsets a batch needs, or `None` when it shares
+    /// one — which is every batch except the fused MTP step's left-aligned
+    /// ragged cohort.
+    ///
+    /// 🔑 Returning `None` for a batch that shares an offset is a **dispatch,
+    /// not an optimisation**: `None` sends [`make_prompt_chunk`] down the
+    /// pre-change scalar code verbatim, so every prompt, every decode and every
+    /// batch built with per-sequence KV advance off produces the characters it
+    /// always did. Split out as its own function for the reason PR #100's
+    /// `resolve_ragged_rows` was: the two branches agree exactly on their
+    /// common domain, so no numeric test can tell you which one ran, and a
+    /// mutation that routes a uniform batch down the per-row path is invisible
+    /// to everything except a test of the dispatch itself.
+    pub(crate) fn resolve_row_offsets(
+        per_seq: &[Option<usize>],
+        shared: usize,
+    ) -> Option<Vec<usize>> {
+        if !per_seq.iter().any(Option::is_some) {
+            return None;
+        }
+        Some(per_seq.iter().map(|o| o.unwrap_or(shared)).collect())
+    }
+
     // chunk_offset_toks is the number of tokens by which the tokens are offset,
     // chunk_offset_toks / prompt_chunksize = number of batches
+    //
+    // row_offsets: when provided, replaces `chunk_offset_toks` per sequence —
+    // the batch is a left-aligned ragged cohort with no shared absolute
+    // position (see `resolve_row_offsets`). `None` is the shared-offset path
+    // and is bit-for-bit what it always was.
     //
     // prefix_cache_lens: when provided, indicates how many tokens per sequence are already
     // cached in the paged KV cache. Only new (non-cached) tokens will be included in the
@@ -206,7 +234,51 @@ pub mod text_models_inputs_processor {
         mut paged_attn_metadata: Option<&mut PagedAttentionMeta>,
         mapper: Option<&dyn DeviceMapper>,
         prefix_cache_lens: Option<&[usize]>,
+        row_offsets: Option<&[usize]>,
     ) -> Result<InputMetadata> {
+        if let Some(offsets) = row_offsets {
+            if offsets.len() != seq_ids.len() {
+                anyhow::bail!(
+                    "inputs processor: {} per-row absolute offsets for a batch of {}",
+                    offsets.len(),
+                    seq_ids.len()
+                );
+            }
+        }
+        // ── The prefill cursor is applied HERE, and only here ─────────────
+        // Every path that builds prompt inputs reaches this function:
+        // `get_prompt_input`, and — bypassing it entirely — `normal.rs` and
+        // `vision.rs`, which call this directly. `NormalPipeline` is the second
+        // of those, which is what DeepSeek-V4 is.
+        //
+        // Applying the cursor in a CALLER is how this was written first, and it
+        // made the feature inert on exactly the path that matters: a GPU run
+        // reported `prompt_tokens = 2892` at chunk 512 with **zero** chunks fed.
+        // One place it can be wired means it cannot be wired in only one place.
+        let toks: Vec<&[T]> = match prefill_chunk_size().filter(|_| !return_raw_logits) {
+            Some(c) => toks
+                .iter()
+                .map(|t| {
+                    let (start, end) = chunk_window(t.len(), chunk_offset_toks, c);
+                    if start > 0 {
+                        // D32 engagement, logged once: a run where chunking did
+                        // nothing and a run where chunking was never on the code
+                        // path are otherwise the same numbers.
+                        static CHUNKED: std::sync::Once = std::sync::Once::new();
+                        CHUNKED.call_once(|| {
+                            tracing::info!(
+                                "ARC prefill chunk: fed tokens [{start}, {end}) of a \
+                                 {}-token prompt (ARC_PREFILL_CHUNK={c}); logged once",
+                                t.len()
+                            );
+                        });
+                    }
+                    &t[start..end]
+                })
+                .collect(),
+            None => toks,
+        };
+
         // Determine effective tokens per sequence after prefix cache trimming
         let effective_lens: Vec<usize> = toks
             .iter()
@@ -234,6 +306,9 @@ pub mod text_models_inputs_processor {
         let has_any_cache_hit = prefix_cache_lens.is_some_and(|lens| lens.iter().any(|&l| l > 0));
         for (seq_idx, (seq_id, ctxt)) in seq_ids.iter().zip(&toks).enumerate() {
             let cached = prefix_cache_lens.map_or(0, |lens| lens[seq_idx]);
+            // This row's own absolute start, which is the shared
+            // `chunk_offset_toks` for every batch that has one.
+            let chunk_offset_toks = row_offsets.map_or(chunk_offset_toks, |o| o[seq_idx]);
             let full_prompt_len = ctxt.len();
             // The new (non-cached) tokens to process
             let new_toks = &ctxt[cached..];
@@ -257,12 +332,15 @@ pub mod text_models_inputs_processor {
 
                 context_lens.push((0, padded.len()));
             } else {
-                context_lens.push((
-                    padded
-                        .len()
-                        .saturating_sub(last_n_context_len.map(|(a, _)| a).unwrap_or(1)),
-                    last_n_context_len.map(|(a, _)| a).unwrap_or(1),
-                ));
+                // 🔑 `new_len`, NOT `padded.len()`. `padded.len()` is the batch
+                // max, so on a ragged batch every short row would read its
+                // logits out of the right-hand PADDING — same wrong row for
+                // every sequence. `extract_logits` (`pipeline/mod.rs`) already
+                // narrows per row, so the per-row start is honoured.
+                // Uniform batches are unaffected: there `new_len ==
+                // padded.len()` for every row, so this is the identity.
+                let n = last_n_context_len.map(|(a, _)| a).unwrap_or(1);
+                context_lens.push((new_len.saturating_sub(n), n));
             }
 
             if flash_attn {
@@ -838,6 +916,158 @@ pub mod text_models_inputs_processor {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Tokens of each prompt fed per engine iteration, or `None` for "all of
+    /// it" — the historical behaviour, and where head-of-line blocking comes
+    /// from.
+    ///
+    /// Read once.
+    ///
+    /// # 🔴 DO NOT SET THIS YET. Sizing guidance from other systems does not
+    /// # transfer, and following it makes Arc's prefill several times worse.
+    ///
+    /// An earlier revision of this comment carried Sarathi-Serve's numbers
+    /// verbatim — *"512 is the practical floor, 2048 near-free"*. Those come
+    /// from a system whose per-prompt-token cost is roughly **30× lower than
+    /// ours**, so they are not advice here, they are a trap. Arc's own
+    /// arithmetic:
+    ///
+    /// **Chunking does not reduce FLOPs.** It is latency shaping only: it
+    /// splits one uninterruptible prefill into `ceil(N/C)` interruptible ones
+    /// so decode can run between them. Whatever a prefill step charges *per
+    /// step* gets multiplied by `ceil(N/C)`.
+    ///
+    /// **Arc's prefill step is dominated by a per-step charge.** The QTIP MoE
+    /// expert gather is **71.3% of an N=128 prefill step** (profiler and nsys
+    /// agreeing to 0.2%; `memory/mission/BUDGET_V4_PREFILL.md`), and it is
+    /// billed per step because each step re-reads the packed expert weights
+    /// regardless of how many tokens it is serving. Chunking therefore pays it
+    /// `ceil(N/C)` times. At the current measured **2.880 ms/prompt-token**
+    /// (N=2048, post-PR #133 + #138), a 2048-token prompt at `C=512` is 4
+    /// steps: **~4.4 s of expert gather against ~1.1 s unchunked.**
+    ///
+    /// **And small shapes are already worse per token, not better.** Measured
+    /// ms/prompt-token by prompt length: **11.98 (N=128) · 11.48 (512) ·
+    /// 11.81 (1024) · 8.23 (2048)** — i.e. N=128 costs **~1.46× more per
+    /// token** than N=2048. There is no efficiency floor to fall back onto;
+    /// the curve points the wrong way.
+    ///
+    /// ⇒ **The gate: chunking is NEGATIVE until the expert gather is fixed.**
+    /// Leave this unset. It exists so the cursor plumbing is exercised and
+    /// ready, not because a value is currently worth setting.
+    ///
+    /// # When it does become affordable
+    ///
+    /// Size it by *chunk wall time*, not by copying a token count. SGLang runs
+    /// 8192 at ~0.0975 ms/prompt-token — 29.5× cheaper than Arc — so Arc's
+    /// equal-wall-time equivalent of their 8192 is **~277 tokens**, not 8192.
+    ///
+    /// Two hard constraints, both verified against sglang `main`
+    /// (`python/sglang/srt/server_args.py`, fetched 2026-08-19):
+    ///
+    /// 1. **`C` must be a multiple of the KV block size.** Otherwise every
+    ///    chunk boundary lands mid-block and the trailing partial block is
+    ///    never hashed, so it cannot be prefix-cached — see
+    ///    `paged_attention/block_hash.rs::compute_block_hashes`, which hashes
+    ///    only `tokens.len() / block_size` full blocks. SGLang enforces the
+    ///    same rule outright: `assert chunked_prefill_size % page_size == 0`.
+    /// 2. **Their number is a MoE parameter, not a scheduler knob.**
+    ///    `chunked_prefill_size` is what sizes their MoE all-to-all dispatch
+    ///    buffer — it is returned verbatim by
+    ///    `_required_mori_dispatch_tokens_per_rank` ("max tokens a single rank
+    ///    dispatches through MoRI in one forward") and
+    ///    `_required_pplx_dispatch_tokens_per_rank`. Reading 8192 as "a good
+    ///    scheduler chunk" misreads what the number is for.
+    pub(crate) fn prefill_chunk_size() -> Option<usize> {
+        // A test override, when one is installed on THIS thread, wins outright
+        // and never touches the process environment. See `PrefillChunkSizeGuard`
+        // for why the obvious `set_var` version cannot work here.
+        #[cfg(test)]
+        if let Some(injected) = test_chunk_override() {
+            return injected;
+        }
+        static C: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        *C.get_or_init(|| {
+            std::env::var("ARC_PREFILL_CHUNK")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|n| *n > 0)
+        })
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        /// `None` = no override on this thread; `Some(v)` = force `v`.
+        static TEST_CHUNK: std::cell::Cell<Option<Option<usize>>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    #[cfg(test)]
+    fn test_chunk_override() -> Option<Option<usize>> {
+        TEST_CHUNK.with(|c| c.get())
+    }
+
+    /// Injects a prefill chunk size for the duration of one test, and removes it
+    /// again on drop.
+    ///
+    /// # Why not `std::env::set_var`
+    ///
+    /// The first version of the test below did exactly that, and it is unsound
+    /// **twice over**:
+    ///
+    /// 1. **Tests share one process.** libtest runs them on parallel threads of
+    ///    a single process, and the environment is process-global, so a bare
+    ///    `set_var` leaks into whatever sibling happens to be running. That is
+    ///    the contamination that produced the two Windows failures; passing on
+    ///    Linux was scheduling luck, not correctness.
+    ///
+    /// 2. **A mutex would not have been enough, because of the `OnceLock`
+    ///    above.** `prefill_chunk_size` caches its answer process-wide on first
+    ///    call. So the paired `remove_var` never undoes anything: whichever
+    ///    value was read first is latched for the rest of the binary. If any
+    ///    other test reached the function first, this test sees `None` and
+    ///    fails; if this test got there first, *every later test in the process*
+    ///    silently runs with `chunk = 4`. Serialising the mutation only reorders
+    ///    that race — it cannot fix it.
+    ///
+    /// So the value is injected instead of read from the environment. The
+    /// override is a `thread_local`, which gives per-test isolation with no lock
+    /// at all, and the reset is `Drop` rather than a trailing statement so it
+    /// still happens when an assertion panics — the original `remove_var` sat
+    /// *after* the `assert_eq!` and would have been skipped on failure, leaving
+    /// the contamination behind precisely when things were already going wrong.
+    /// `Drop` also survives `--test-threads=1`, where libtest reuses one thread
+    /// and a bare thread-local set would leak to the next test.
+    #[cfg(test)]
+    pub(crate) struct PrefillChunkSizeGuard(Option<Option<usize>>);
+
+    #[cfg(test)]
+    impl PrefillChunkSizeGuard {
+        pub(crate) fn set(chunk: Option<usize>) -> Self {
+            let previous = TEST_CHUNK.with(|c| c.replace(Some(chunk)));
+            Self(previous)
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for PrefillChunkSizeGuard {
+        fn drop(&mut self) {
+            let previous = self.0;
+            TEST_CHUNK.with(|c| c.set(previous));
+        }
+    }
+
+    /// The `[start, end)` slice of a prompt of length `len` that chunk-cursor
+    /// `offset` selects, given chunk size `chunk`.
+    ///
+    /// Clamped at both ends: a cohort shares one cursor, so a shorter prompt in
+    /// a mixed batch runs out of tokens before its neighbours and must yield an
+    /// empty window rather than panic on the slice.
+    pub(crate) fn chunk_window(len: usize, offset: usize, chunk: usize) -> (usize, usize) {
+        let start = offset.min(len);
+        let end = offset.saturating_add(chunk).min(len);
+        (start, end.max(start))
+    }
+
     pub(crate) fn get_prompt_input<T: WithDType + std::fmt::Debug>(
         toks: Vec<&[T]>,
         input_seqs: &[&mut Sequence],
@@ -848,6 +1078,39 @@ pub mod text_models_inputs_processor {
         mapper: Option<&dyn DeviceMapper>,
     ) -> Result<InnerInputProcessorOutput> {
         let offset = input_seqs[0].token_offset();
+        // ── Chunked prefill ───────────────────────────────────────────────
+        // `offset` is this cohort's prefill cursor. With chunking on, only
+        // `[offset, offset + chunk)` of each prompt is fed this step; the rest
+        // is fed by later steps, and `offset` is what makes the positions,
+        // RoPE offsets and `cu_seqlens` come out right for every chunk after
+        // the first.
+        //
+        // 🔴 THE THING THAT WILL BITE WHOEVER TOUCHES THIS. On CUDA with
+        // flash-attn, `CausalMasker::make_causal_mask_matrix` returns a **1x1
+        // dummy tensor** — no real mask is ever built (`layers_masker.rs`,
+        // "Avoid materializing large sliding-window masks"). So a chunk's
+        // causality rests ENTIRELY on the flash kernel reading
+        // `cumulative_seqlens_q` (chunk width) against `cumulative_seqlens_k`
+        // (chunk width + offset) and aligning the causal diagonal to the
+        // BOTTOM-RIGHT of that rectangle, which is FlashAttention >= 2.1
+        // semantics. A top-left alignment silently lets every query in chunk
+        // k>0 attend nothing but its own chunk, or attend the future — wrong
+        // logits, no error, and only the second chunk onward is affected.
+        //
+        // `make_prompt_chunk` already builds exactly that pair, so the wiring
+        // is correct by construction; what cannot be proven from here is that
+        // the kernel honours it. That is what the one-shot-vs-chunked token
+        // identity test exists for, and it is the acceptance gate for this
+        // feature — not a nice-to-have.
+        // A left-aligned ragged cohort has no shared absolute position, so each
+        // row carries its own. `None` — every other batch — keeps `offset`.
+        let row_offsets = resolve_row_offsets(
+            &input_seqs
+                .iter()
+                .map(|s| s.prefill_seqlen_offset())
+                .collect::<Vec<_>>(),
+            offset,
+        );
         // Collect prefix cache lens when paged attention is in use
         let prefix_cache_lens: Vec<usize> =
             input_seqs.iter().map(|s| s.prefix_cache_len()).collect();
@@ -866,6 +1129,7 @@ pub mod text_models_inputs_processor {
             } else {
                 None
             },
+            row_offsets.as_deref(),
         )
         .map(|inputs| InnerInputProcessorOutput {
             inputs,
@@ -1145,5 +1409,362 @@ pub mod text_models_inputs_processor {
         fn get_type(&self) -> InputsProcessorType {
             InputsProcessorType::Text
         }
+    }
+
+    #[cfg(test)]
+    mod ragged_prefill_tests {
+        use super::*;
+
+        /// 🔑 A right-padded ragged prefill must read each row's logits from
+        /// that row's own LAST REAL TOKEN.
+        ///
+        /// `make_prompt_chunk` pads every row to the batch max, so a shared
+        /// logit index is the PADDING for every row but the longest. Pre-fix
+        /// this returns `(max_len - 1, 1)` for all three rows — the same wrong
+        /// column three times. `extract_logits` (`pipeline/mod.rs`) narrows per
+        /// row, so honouring the per-row start needs nothing else.
+        ///
+        /// Reachable in production the moment a prefill batch is ragged. The
+        /// schedulers' exact-cache-length bucketing normally makes
+        /// `max_len == this row's len`, but a prefix-cache hit defeats that:
+        /// the hit moves the bucket key onto the matched length, so two
+        /// requests behind the same system prelude with different user-message
+        /// lengths share one ragged prefill — and every row but the longest
+        /// then samples its first token from a pad column.
+        #[test]
+        fn ragged_prefill_reads_each_row_at_its_own_last_real_token() {
+            let a: Vec<u32> = vec![1; 5];
+            let b: Vec<u32> = vec![2; 3];
+            let c: Vec<u32> = vec![3; 8];
+            let toks: Vec<&[u32]> = vec![&a, &b, &c];
+
+            let out = make_prompt_chunk::<u32>(
+                0,
+                toks,
+                &[0, 1, 2],
+                &Device::Cpu,
+                None,
+                false,
+                None,
+                None,
+                None,
+                // `row_offsets` — master gained this parameter after this test
+                // was written. `None` is what this test means: it exercises the
+                // per-row `context_lens` narrowing, not per-row RoPE placement.
+                None,
+            )
+            .expect("CPU prompt chunk must build");
+
+            // Teeth: the fixture must actually be ragged, or this asserts
+            // nothing. A batch of equal lengths passes either way.
+            assert_eq!(
+                out.input.dims(),
+                &[3, 8],
+                "fixture must right-pad to the batch max (8), else the test is vacuous"
+            );
+
+            assert_eq!(
+                out.context_lens,
+                vec![(4, 1), (2, 1), (7, 1)],
+                "each row must be narrowed at its own last real token \
+                 (5-1, 3-1, 8-1), not at the shared padded width"
+            );
+        }
+
+        /// The uniform case is the identity — the fix cannot move a batch that
+        /// the old bucketing would have produced.
+        #[test]
+        fn uniform_prefill_is_unchanged() {
+            let a: Vec<u32> = vec![1; 6];
+            let b: Vec<u32> = vec![2; 6];
+            let toks: Vec<&[u32]> = vec![&a, &b];
+            let out = make_prompt_chunk::<u32>(
+                0,
+                toks,
+                &[0, 1],
+                &Device::Cpu,
+                None,
+                false,
+                None,
+                None,
+                None,
+                // `row_offsets` — see the sibling test above.
+                None,
+            )
+            .expect("CPU prompt chunk must build");
+            assert_eq!(out.context_lens, vec![(5, 1), (5, 1)]);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{make_prompt_chunk, resolve_row_offsets};
+        use crate::device_map::DummyDeviceMapper;
+        use candle_core::Device;
+
+        /// 🔑 The wire itself: what the model actually receives. `positions` is
+        /// `seqlen_offsets`, which is where RoPE places each row's queries and —
+        /// on DeepSeek V4 — the per-row `row_q0` that masks a left-aligned
+        /// cohort. A per-row vector in must produce a per-row vector out.
+        #[test]
+        fn per_row_offsets_reach_seqlen_offsets_and_a_shared_one_still_does_not() {
+            let mapper = DummyDeviceMapper {
+                nm_device: Device::Cpu,
+            };
+            let window: Vec<u32> = vec![7, 8, 9, 10];
+            let toks: Vec<&[u32]> = vec![&window, &window, &window];
+            let run = |row_offsets: Option<&[usize]>, shared: usize| -> Vec<usize> {
+                make_prompt_chunk(
+                    shared,
+                    toks.clone(),
+                    &[0, 1, 2],
+                    &Device::Cpu,
+                    Some((window.len(), 0)),
+                    false,
+                    None,
+                    Some(&mapper),
+                    None,
+                    row_offsets,
+                )
+                .unwrap()
+                .positions
+            };
+
+            assert_eq!(
+                run(None, 40),
+                vec![40, 40, 40],
+                "with no per-row offsets the batch shares one, exactly as it always did"
+            );
+            assert_eq!(
+                run(Some(&[40, 33, 37]), 40),
+                vec![40, 33, 37],
+                "each row's own absolute position must survive to `seqlen_offsets`"
+            );
+        }
+
+        /// A per-row vector that does not describe this batch is a caller bug
+        /// that would silently mis-place two rows' queries. It refuses.
+        #[test]
+        fn a_per_row_offset_vector_of_the_wrong_width_is_refused() {
+            let mapper = DummyDeviceMapper {
+                nm_device: Device::Cpu,
+            };
+            let window: Vec<u32> = vec![7, 8];
+            let err = make_prompt_chunk(
+                0,
+                vec![&window, &window, &window],
+                &[0, 1, 2],
+                &Device::Cpu,
+                Some((2, 0)),
+                false,
+                None,
+                Some(&mapper),
+                None,
+                Some(&[1, 2]),
+            )
+            .err()
+            .expect("a per-row vector that does not describe this batch must be refused")
+            .to_string();
+            assert!(
+                err.contains("per-row absolute offsets") && err.contains("batch of 3"),
+                "the refusal must name both widths; got {err}"
+            );
+        }
+
+        /// 🔑 The dispatch, pinned directly. Every batch that has ever existed
+        /// carries no per-row override, and must return `None` — because `None`
+        /// is what runs `make_prompt_chunk`'s pre-change scalar code verbatim.
+        ///
+        /// ⚠️ Routing a batch that happens to agree down the per-row path is
+        /// **numerically invisible** (the vector would be the shared offset
+        /// repeated), so only a test of the dispatch itself can see that
+        /// mutation. Same trap PR #100 documented for `resolve_ragged_rows`.
+        #[test]
+        fn a_batch_with_no_per_row_offset_takes_the_shared_path() {
+            assert_eq!(resolve_row_offsets(&[None, None, None], 17), None);
+            assert_eq!(resolve_row_offsets(&[], 17), None);
+        }
+
+        /// One row carrying its own position is enough to make the batch
+        /// per-row; the rest fall back to the shared offset rather than to zero,
+        /// which is what keeps a partially-overridden batch coherent.
+        #[test]
+        fn a_row_with_its_own_offset_makes_the_whole_batch_per_row() {
+            assert_eq!(
+                resolve_row_offsets(&[Some(40), Some(33), Some(37)], 17),
+                Some(vec![40, 33, 37])
+            );
+            assert_eq!(
+                resolve_row_offsets(&[Some(40), None], 17),
+                Some(vec![40, 17]),
+                "a row without its own offset keeps the batch's, not 0"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod prefill_chunk_tests {
+    use super::text_models_inputs_processor::chunk_window;
+
+    /// The windows a cursor walks must TILE the prompt: no token fed twice, none
+    /// skipped, and the walk must terminate. A gap is a hole in the KV cache
+    /// that nothing downstream would report — the model would simply attend
+    /// over positions that were never written.
+    #[test]
+    fn chunk_windows_tile_the_prompt_exactly() {
+        for len in [1usize, 7, 64, 255, 256, 257, 1024] {
+            for chunk in [1usize, 8, 64, 256, 512] {
+                let mut offset = 0usize;
+                let mut seen = 0usize;
+                let mut steps = 0usize;
+                loop {
+                    let (a, b) = chunk_window(len, offset, chunk);
+                    assert_eq!(a, seen, "gap or overlap at offset {offset} (len {len})");
+                    seen = b;
+                    steps += 1;
+                    assert!(steps <= len + 2, "walk did not terminate (len {len})");
+                    if offset + chunk >= len {
+                        break;
+                    }
+                    offset += chunk;
+                }
+                assert_eq!(seen, len, "walk covered {seen} of {len} tokens");
+            }
+        }
+    }
+
+    /// A cohort shares one cursor, so a shorter prompt runs out first. It must
+    /// yield an empty window, not panic and not wrap.
+    #[test]
+    fn a_short_prompt_in_a_mixed_cohort_yields_an_empty_window() {
+        let (a, b) = chunk_window(10, 64, 64);
+        assert_eq!(
+            (a, b),
+            (10, 10),
+            "start must clamp to len and end must not precede it"
+        );
+        assert!(b >= a);
+    }
+
+    /// Teeth: the tiling test must be able to fail. An off-by-one cursor — the
+    /// classic way to write this — is caught.
+    #[test]
+    fn the_tiling_check_catches_an_off_by_one_walk() {
+        let len = 100usize;
+        let chunk = 32usize;
+        let (a, _) = chunk_window(len, chunk - 1, chunk);
+        assert_ne!(
+            a, chunk,
+            "advancing the cursor by chunk-1 must NOT look like a correct walk"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cursor_reaches_every_path_tests {
+    use super::text_models_inputs_processor::{make_prompt_chunk, PrefillChunkSizeGuard};
+    use candle_core::Device;
+
+    /// 🔑 THE STRUCTURAL GATE for chunked prefill.
+    ///
+    /// `make_prompt_chunk` is the ONE function every prompt-input path reaches:
+    /// `get_prompt_input` calls it, and so do `normal.rs:962` and
+    /// `vision.rs:763` — **directly, bypassing `get_prompt_input` entirely**.
+    /// `NormalPipeline` is the second of those, which is what DeepSeek-V4 is,
+    /// which is the model that matters.
+    ///
+    /// So the cursor must be honoured HERE, not in one caller. If it is applied
+    /// in a caller instead, this test fails and the feature is inert on
+    /// whichever path did not get patched — which is exactly what a $1.60 GPU
+    /// run discovered after the code looked correct and its own unit tests were
+    /// green (`prompt_tokens = 2892`, chunk 512, six chunks expected, zero
+    /// observed).
+    ///
+    /// This is the class of defect `wave64-CP §3` named — *"a new channel wired
+    /// into one of two dispatch paths"* — hit for the third time in one session,
+    /// and the first time by an author who had read and quoted the warning.
+    /// Documentation did not prevent it. A test that fails on CPU, with no card,
+    /// does.
+    #[test]
+    fn a_non_zero_cursor_feeds_only_its_chunk_on_every_path() {
+        // Injected, not `std::env::set_var`. The environment is process-global
+        // and `prefill_chunk_size` latches its answer in a `OnceLock`, so the
+        // env version contaminated sibling tests and could not be undone — see
+        // `PrefillChunkSizeGuard`. `_guard` restores the previous value on drop,
+        // including on assertion panic.
+        let _guard = PrefillChunkSizeGuard::set(Some(4));
+        let toks: Vec<u32> = (0..20u32).collect();
+        let dev = Device::Cpu;
+
+        // Cursor 8 with chunk 4 must feed tokens [8, 12) — four of them — not
+        // the whole 20-token prompt.
+        let out = make_prompt_chunk(
+            8,
+            vec![&toks[..]],
+            &[0],
+            &dev,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("make_prompt_chunk must build inputs for a mid-prompt cursor");
+
+        let width = out.input.dims().last().copied().unwrap_or(0);
+        assert_eq!(
+            width, 4,
+            "a cursor of 8 with chunk 4 must feed a 4-token window; got {width}. \
+             If this is 20, the cursor is being applied in a CALLER rather than \
+             here, so every path that calls `make_prompt_chunk` directly \
+             (normal.rs, vision.rs) is silently unchunked."
+        );
+    }
+
+    /// The override must not outlive its guard — otherwise the fix reproduces
+    /// the bug it replaces.
+    ///
+    /// The `set_var` version this replaces could not pass this test at all: its
+    /// `remove_var` cleared the environment, but `prefill_chunk_size` had
+    /// already latched the value in a `OnceLock`, so the chunk stayed at 4 for
+    /// the rest of the process. A guard that cannot be shown restoring is the
+    /// same class of unverified guard as one that cannot be shown failing.
+    #[test]
+    fn the_injected_chunk_does_not_outlive_its_guard() {
+        use super::text_models_inputs_processor::prefill_chunk_size;
+
+        // Whatever this process ambiently resolves to — normally `None`, since
+        // `ARC_PREFILL_CHUNK` is unset and must stay unset (chunking is
+        // measured NEGATIVE until the expert gather is fixed).
+        let ambient = prefill_chunk_size();
+
+        {
+            let _guard = PrefillChunkSizeGuard::set(Some(7));
+            assert_eq!(
+                prefill_chunk_size(),
+                Some(7),
+                "an installed guard must be what `prefill_chunk_size` returns"
+            );
+            {
+                // Nesting must restore the OUTER override, not clear it.
+                let _inner = PrefillChunkSizeGuard::set(Some(9));
+                assert_eq!(prefill_chunk_size(), Some(9));
+            }
+            assert_eq!(
+                prefill_chunk_size(),
+                Some(7),
+                "dropping a nested guard must restore the enclosing override, not wipe it"
+            );
+        }
+
+        assert_eq!(
+            prefill_chunk_size(),
+            ambient,
+            "the override leaked past its guard — every later test in this \
+             process now runs with a chunk size it never asked for, which is \
+             exactly the contamination the `set_var` version caused"
+        );
     }
 }

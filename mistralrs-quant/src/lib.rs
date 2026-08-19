@@ -21,6 +21,7 @@ mod bitsandbytes;
 mod blockwise_fp8;
 pub mod calibration;
 pub mod cublaslt;
+pub mod cuda_peer;
 pub mod distributed;
 mod dummy;
 pub mod f8q8;
@@ -57,19 +58,20 @@ pub use safetensors::{attach_rename_rules, Shard, ShardedSafeTensors, ShardedVar
 
 pub use afq::{AfqBits, AfqGroupSize, AfqLayer};
 pub use bitsandbytes::{BnbLinear, BnbQuantParams, BnbQuantType};
+pub use blockwise_fp8::{
+    blockwise_fp8_moe, fp8_blockwise_dequantize, fp8_blockwise_quantize,
+    mx_int4_blockwise_dequantize, BlockwiseFP8Linear,
+};
 pub use calibration::{
     CalibAccumulator, CalibLayerData, CalibOptions, CalibrationArtifact, CalibrationMeta,
     ExpertCalibData, ExpertStatus, GramBlocks, GramLayout, GramMode, LayerCalibStats,
     CALIB_COLLECTOR_VERSION, CALIB_EXTENSION, CALIB_FORMAT_VERSION,
 };
-pub use blockwise_fp8::{
-    blockwise_fp8_moe, fp8_blockwise_dequantize, fp8_blockwise_quantize,
-    mx_int4_blockwise_dequantize, BlockwiseFP8Linear,
-};
+pub use cuda_peer::{enable_peer_access, PeerAccessReport, PeerAccessStatus, PeerPair};
 pub use distributed::{
     layers::{
-        compute_kv_shard, compute_n_kv_groups, ColumnParallelLayer, FusedExperts, PackedExperts,
-        ReplicatedLayer, RowParallelLayer,
+        compute_kv_shard, compute_n_kv_groups, ColumnParallelLayer, ExpertSubset, FusedExperts,
+        PackedExperts, ReplicatedLayer, RowParallelLayer,
     },
     socket::{Client, Server},
     BarrierLike, Comm, Id, RingConfig, SumAllReduce,
@@ -100,11 +102,14 @@ pub use qtip::tune::{
     QTIP2B_GEMV_VARIANT_LEGACY,
 };
 pub use qtip::{
-    gpu_quantize_cpu_fallback_count, hessian_row_weights, qtip_expected_distinct_experts,
-    viterbi_quantize_row, ExpertBpwTable, Qtip2bLayer, QtipBakeConfig, QtipCodebook, QtipLayer,
+    bake_cache, gpu_quantize_cpu_fallback_count, grouped_launch_counts, grouped_variant,
+    hessian_row_weights, qtip_expected_distinct_experts, set_grouped_variant, viterbi_quantize_row,
+    BakeCacheError, BakeKey, ExpertBpwTable, Qtip2bLayer, QtipBakeConfig, QtipCodebook, QtipLayer,
     QtipMode, QtipPackedView, QtipRotation, QtipSearchDetail, QtipSearchStamp, TrellisBpw,
     TrellisSearch, QTIP2B_MCG_MULT, QTIP_GATHER_GEMV_MAX_PAIRS, QTIP_GROUPED_TILE_K,
-    QTIP_GROUPED_TILE_M, QTIP_GROUPED_TILE_N, QTIP_ONDEVICE_MOE_MAX_TOKENS_ENV,
+    QTIP_GROUPED_TILE_M, QTIP_GROUPED_TILE_N, QTIP_GROUPED_VARIANT_BASELINE,
+    QTIP_GROUPED_VARIANT_COUNT, QTIP_GROUPED_VARIANT_ENV, QTIP_GROUPED_VARIANT_LDST,
+    QTIP_GROUPED_VARIANT_TUNED, QTIP_ONDEVICE_MOE_MAX_TOKENS_ENV,
 };
 pub use td_moe_factored::TuckerFactoredLayer;
 pub use unquantized::UnquantLinear;
@@ -1419,6 +1424,26 @@ pub trait QuantMethod: Send + Sync + Debug + QuantizedSerde {
     fn gather_forward(&self, _a: &Tensor, _indices: &Tensor) -> Result<Tensor> {
         candle_core::bail!(
             "{} does not support `gather_forward`. Please raise an issue.",
+            self.name()
+        )
+    }
+
+    /// Keep only the experts named by `ids` (ascending global indices) out of
+    /// an expert-stacked weight, returning a layer that holds `ids.len()`
+    /// experts indexed `0..ids.len()`.
+    ///
+    /// This is the **expert-parallel slice**. It exists as a post-load
+    /// operation because a UQFF artifact holds every expert: the shard cannot
+    /// be applied while constructing the layer, only after
+    /// `load_from_artifacts` has deserialized it.
+    ///
+    /// The default refuses, loudly and by name. Silently returning `self`
+    /// would leave every rank holding the whole expert set while believing it
+    /// had been sharded — EP would appear to work and buy nothing.
+    fn select_experts(&self, _ids: &[usize]) -> Result<Arc<dyn QuantMethod>> {
+        candle_core::bail!(
+            "{} does not support the expert-parallel slice (`select_experts`). \
+             Run with ep_size = 1, or add the slice for this quantization.",
             self.name()
         )
     }

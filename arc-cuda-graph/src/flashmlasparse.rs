@@ -205,6 +205,59 @@ mod cuda_impl {
         Ok(cuda_dev.cuda_stream().cu_stream())
     }
 
+    /// A constant `[n_rows]` I32 buffer filled with `len`, cached per
+    /// `(device, n_rows, len)`.
+    ///
+    /// The topk kernel takes a per-row valid length; in the dense case every
+    /// row has the same one, so the buffer's contents are a pure function of
+    /// the key. Building it with `Tensor::from_vec` on each call meant a host
+    /// allocation plus an H2D copy **per sampled token** once
+    /// `radix_topk_rows_f32` started being used by the sampler — precisely the
+    /// hot-loop `from_vec` that CLAUDE.md pitfall #5 forbids. The cache is a
+    /// handful of `n_rows * 4`-byte buffers, kept for the life of the thread.
+    ///
+    /// Thread-local rather than a global mutex: decode runs on the engine
+    /// thread, so this costs a `RefCell` borrow and a scan of a short vector,
+    /// with no lock and no `Send`/`Sync` obligations on `Tensor`.
+    ///
+    /// Only `radix_topk_rows_f32` uses this, and deliberately so: its key is
+    /// constant across decode steps (`n_rows = 1`, `len = vocab`), so it hits
+    /// from the second token on. The `score_and_topk_*` indexer callers pass
+    /// `len = t_c`, which grows by one per decoded token — caching on a
+    /// monotonically growing key would accumulate a buffer per token and leak,
+    /// and there the 4-byte H2D is noise next to the `[b, t_q, t_c]` F32
+    /// scores tensor those functions allocate anyway. The cap below is a
+    /// backstop in case a future caller varies the key.
+    fn seq_lens_full(device: &Device, n_rows: usize, len: usize) -> Result<Tensor> {
+        // Enough for the sampler's single key plus a handful of concurrent
+        // shapes; small enough that a growing-key caller can never leak.
+        const CACHE_CAP: usize = 8;
+        use std::cell::RefCell;
+        // Named so the `thread_local!` type does not trip `clippy::type_complexity`.
+        type SeqLensEntry = (candle_core::DeviceLocation, usize, usize, Tensor);
+        thread_local! {
+            static CACHE: RefCell<Vec<SeqLensEntry>> = const { RefCell::new(Vec::new()) };
+        }
+        let loc = device.location();
+        if let Some(hit) = CACHE.with(|c| {
+            c.borrow()
+                .iter()
+                .find(|(l, r, n, _)| *l == loc && *r == n_rows && *n == len)
+                .map(|(_, _, _, t)| t.clone())
+        }) {
+            return Ok(hit);
+        }
+        let tensor = Tensor::from_vec(vec![len as i32; n_rows], (n_rows,), device)?;
+        CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.len() >= CACHE_CAP {
+                c.clear();
+            }
+            c.push((loc, n_rows, len, tensor.clone()));
+        });
+        Ok(tensor)
+    }
+
     /// Logits-and-topk fused dispatch.
     ///
     /// Inputs (all on the same CUDA device):
@@ -284,7 +337,9 @@ mod cuda_impl {
         let scores = Tensor::zeros((b, t_q, t_c), DType::F32, &device)?;
         let n_rows = (b * t_q) as i32;
         // seq_lens: fill with `t_c` — every row has the same valid length
-        // (we don't have per-row T_c in the simple dense case).
+        // (we don't have per-row T_c in the simple dense case). Not cached:
+        // `t_c` grows every decode step, so a cache would never hit and would
+        // leak one buffer per token. See `seq_lens_full`.
         let seq_lens_vec: Vec<i32> = vec![t_c as i32; n_rows as usize];
         let seq_lens = Tensor::from_vec(seq_lens_vec, (n_rows as usize,), &device)?;
         let out = Tensor::zeros((b, t_q, topk), DType::U32, &device)?;
@@ -440,11 +495,10 @@ mod cuda_impl {
         let stream = cuda_stream(&device)?;
 
         let scores_c = scores.contiguous()?;
-        // Every row has the same valid length in the dense case. (The
-        // Tensor::from_vec H2D is one tiny transfer per call; callers invoke
-        // this once per sampled token, not inside a model forward.)
-        let seq_lens_vec: Vec<i32> = vec![len as i32; n_rows];
-        let seq_lens = Tensor::from_vec(seq_lens_vec, (n_rows,), &device)?;
+        // Every row has the same valid length in the dense case. Cached: this
+        // is called once per sampled token, so a fresh H2D per call would be a
+        // hot-loop host round trip.
+        let seq_lens = seq_lens_full(&device, n_rows, len)?;
         let out = Tensor::zeros((n_rows, topk), DType::U32, &device)?;
 
         let sc_ptr = cuda_tensor_ptr(&scores_c)? as *const c_void;
@@ -868,6 +922,70 @@ mod tests {
         got.sort_unstable();
         let want: Vec<u32> = (0..topk as u32).collect();
         assert_eq!(got, want, "radix top-k must select the largest `topk` rows");
+        Ok(())
+    }
+
+    /// THE REGRESSION. Every supported `topk` must be correct at a REAL
+    /// vocabulary width, not just the 4096 used above.
+    ///
+    /// `topk_radix_kernel<kTopK>` was launched with `blockDim = kTopK` while it
+    /// initialises and cumsum-scans a `RADIX + 1 = 257` entry shared histogram
+    /// via `if (tx < RADIX + 1)` / `if (tx < RADIX)`. For `kTopK < 257` the
+    /// histogram tail is never zeroed and never scanned, so the suffix sum -- and
+    /// therefore the threshold bin -- is wrong. Two consequences, and the quiet
+    /// one is worse:
+    ///
+    ///   * `kTopK = 64` over a row of >= 32768: enough indices clear the bogus
+    ///     threshold to overrun the UNBOUNDED `output[atomicAdd(&s_counter,1)]`
+    ///     write into `__shared__ int32_t s_topk_indices[kTopK]` -- an illegal
+    ///     memory access that poisons the CUDA context for the whole process.
+    ///     (`s_input_idx` next to it IS bounds-checked; this write was not.)
+    ///   * `kTopK = 128` / `256`: also below 257, so also scanning a partial
+    ///     histogram. These do NOT crash -- they can return the WRONG candidate
+    ///     set silently, which no downstream quality regression would ever trace
+    ///     back to this kernel.
+    ///
+    /// The kernel only ever ran at `topk = 512` (V4's `index_topk`) until the
+    /// sampler began dispatching small `k_sel`, so neither surfaced before. The
+    /// 4096-length test above cannot catch either case: the crash needs a long
+    /// row, and the partial scan needs enough bins occupied to go wrong.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn radix_topk_is_correct_at_full_vocab_for_every_supported_k() -> Result<()> {
+        use candle_core::Device;
+
+        let Ok(cuda) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        // DeepSeek-V4-Flash vocabulary. The crash needs len >= 32768.
+        let len = 129_280usize;
+
+        for &topk in SUPPORTED_TOPK {
+            // Bulk: a narrow, dense band -- what real logits look like. It
+            // collapses most of the vocab into very few coarse radix bins.
+            let mut scores: Vec<f32> = (0..len)
+                .map(|i| -2.0 + ((i * 7919) % 1000) as f32 / 2000.0)
+                .collect();
+            // Plant exactly `topk` unambiguous winners at scattered indices.
+            let mut want: Vec<u32> = Vec::with_capacity(topk);
+            for j in 0..topk {
+                let idx = (j * 1013 + 17) % len;
+                scores[idx] = 100.0 + j as f32;
+                want.push(idx as u32);
+            }
+            want.sort_unstable();
+
+            let t = Tensor::from_vec(scores, (1, len), &cuda)?;
+            let idx = radix_topk_rows_f32(&t, topk)?;
+            assert_eq!(idx.dims(), &[1, topk]);
+
+            let mut got: Vec<u32> = idx.reshape((topk,))?.to_vec1()?;
+            got.sort_unstable();
+            assert_eq!(
+                got, want,
+                "radix top-k returned the wrong candidate set at topk={topk}, len={len}"
+            );
+        }
         Ok(())
     }
 }
