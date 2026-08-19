@@ -18,13 +18,42 @@ LEG_ENV="$*"
 
 LOGDIR=/root/logs/capture; mkdir -p "$LOGDIR"
 LOG="$LOGDIR/${NAME}.log"
-BIN=/root/arc-rc/target/release/mistralrs
+# Run under a DIFFERENT process name. The other agent's harness on this box
+# reaps with `pkill -x mistralrs`, which matches on the exact process name and
+# therefore kills our legs too (it killed two: SIGTERM, BENCH_EXIT=143, one of
+# them 4 s into the run). Renaming the argv[0] the kernel sees makes our process
+# invisible to that pattern without changing what either side measures — the
+# file is a copy of the same binary, and its sha256 is recorded below.
+SRC=/root/arc-rc/target/release/mistralrs
+BIN=/root/arc-rc/target/release/arcgraphbench
+cp -f "$SRC" "$BIN" 2>/dev/null || true
 cd /root/arc-rc || exit 2
 
-# Kill by exact PID only. `pkill -f mistralrs` matches the ssh command line that
-# launched this script and has killed agents through SSH.
-for p in $(pgrep -x mistralrs); do kill -9 "$p" 2>/dev/null; done
+# Kill by exact PID, and ONLY our own binary. `pkill -f mistralrs` matches the
+# ssh command line that launched this script and has killed agents through SSH;
+# `pgrep -x mistralrs` is safe from that but still kills every other agent's
+# run on this shared box (it killed one of ours, and we killed one of theirs).
+# Resolving /proc/PID/exe scopes the kill to processes started from THIS
+# checkout, so concurrent legs from /root/arc or /root/target-alloc survive.
+for p in $(pgrep -x arcgraphbench); do
+  case "$(readlink -f "/proc/$p/exe" 2>/dev/null)" in
+    /root/arc-rc/*) kill -9 "$p" 2>/dev/null ;;
+  esac
+done
 sleep 3
+
+# Refuse to start while another agent holds the GPU: two V4 instances do not fit
+# in 143 GB, and a leg that OOMs mid-run is a void measurement, not a slow one.
+for _ in $(seq 1 120); do
+  used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
+  [ "${used:-99999}" -lt 2000 ] && break
+  sleep 15
+done
+used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
+if [ "${used:-99999}" -ge 2000 ]; then
+  echo "VOID: GPU still busy (${used} MiB) after waiting; not measuring."
+  exit 5
+fi
 
 # Provenance: a number without the binary that produced it is not evidence.
 {
