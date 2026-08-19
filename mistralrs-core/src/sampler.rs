@@ -1406,6 +1406,21 @@ impl Sampler {
             logits = processor.apply(&logits, context)?;
         }
         let next_token = if sample_speculative {
+            // NOTE: this branch is an ARGMAX at every temperature.
+            // `sample_speculative_top_kp_min_p` finishes with `argmax_f32`, and
+            // dividing by a positive temperature is monotonic, so the
+            // `Some(temperature)` arm below selects exactly the same token as
+            // the greedy arm — it only rescales the reported logprob. There is
+            // no stochastic draw here and never was.
+            //
+            // That is why speculative *verification* (accept iff the draft
+            // token equals this one) is lossless for greedy decoding only, and
+            // why `pipeline::sampling::sample_target_sequence_speculative`
+            // refuses to speculate when the sequence is not greedy rather than
+            // shipping greedy tokens for a request that asked for sampling.
+            // Correct temperature speculation needs rejection sampling
+            // (`min(1, p/q)` accept + `max(0, p-q)` residual redraw), which is
+            // not implemented.
             match self.temperature {
                 None => self.sample_speculative_top_kp_min_p(
                     logits,
@@ -2010,6 +2025,97 @@ mod tests {
             0,
             "min_p = 0.5 with top_p = 1.0 must exclude every token below \
              0.5 * max_prob; the tail was still sampled, so min_p was skipped"
+        );
+    }
+
+    /// `sample(.., sample_speculative = true, ..)` is an ARGMAX at every
+    /// temperature — it never draws.
+    ///
+    /// `sample_speculative_top_kp_min_p` ends in `argmax_f32`, and dividing by
+    /// a positive temperature is monotonic, so the `Some(temperature)` arm
+    /// picks the same token as the greedy arm. This is the property that makes
+    /// accept-on-token-equality verification valid for greedy decoding only,
+    /// and it is why `pipeline::sampling::sample_target_sequence_speculative`
+    /// refuses to speculate above temperature 0.
+    ///
+    /// The test is a guard: if this branch is ever made stochastic without
+    /// also implementing the `min(1, p/q)` accept test and the `max(0, p-q)`
+    /// residual redraw, verification silently stops reproducing the target
+    /// distribution — and this fails first.
+    #[test]
+    fn speculative_branch_is_argmax_at_any_temperature() {
+        use super::Sampler;
+        use candle_core::{Device, Tensor};
+        use rand::SeedableRng;
+        use rand_isaac::Isaac64Rng;
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+
+        // Softmax at temperature 2.0 is [0.343, 0.267, 0.208, 0.162]: a real
+        // draw spreads over all four, an argmax never leaves token 0.
+        let raw = vec![3.0f32, 2.5, 2.0, 1.5];
+        let logits = || Tensor::from_vec(raw.clone(), 4, &Device::Cpu).unwrap();
+        let rng = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(4242)));
+
+        for temperature in [Some(0.5), Some(1.0), Some(2.0), None] {
+            let sampler = Sampler::new(
+                temperature,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                -1,
+                1.0,
+                0.0,
+                None,
+                vec![],
+            )
+            .unwrap();
+            for _ in 0..64 {
+                let token = sampler
+                    .sample(logits(), &[1u32], false, rng.clone(), true, false)
+                    .unwrap()
+                    .token;
+                assert_eq!(
+                    token, 0,
+                    "speculative sampling at temperature {temperature:?} returned {token}; it \
+                     must be a deterministic argmax, or verification-by-equality is invalid"
+                );
+            }
+        }
+
+        // Control: the same sampler WITHOUT the speculative flag does draw, so
+        // the assertion above is about the speculative branch and not about a
+        // degenerate fixture.
+        let stochastic = Sampler::new(
+            Some(2.0),
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            -1,
+            1.0,
+            0.0,
+            None,
+            vec![],
+        )
+        .unwrap();
+        let mut seen = HashSet::new();
+        for _ in 0..64 {
+            seen.insert(
+                stochastic
+                    .sample(logits(), &[1u32], false, rng.clone(), false, false)
+                    .unwrap()
+                    .token,
+            );
+        }
+        assert!(
+            seen.len() > 1,
+            "fixture is degenerate: non-speculative sampling never varied"
         );
     }
 }
