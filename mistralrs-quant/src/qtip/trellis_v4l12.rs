@@ -24,9 +24,15 @@
 //!
 //! # Why this is a parameter and not a constant
 //!
-//! K=8 was built first and is now the **control**: it is the geometry whose
-//! compiled-probe figures (5.375 inst/weight, 4.375 with the row-scale hoist,
-//! vs 15.125 for the shipped K=4/V=2/L=16 rung) anchor the comparison.
+//! K=8 was built first and is now the **control**.
+//!
+//! ⚠️ **Its headline figures are currently UNREPRODUCED.** The 5.375
+//! inst/weight (4.375 with the row-scale hoist) that this family was justified
+//! by came from an early probe, and the census rig's own K=8 replay control has
+//! **not** reproduced them. Until it does, treat 5.375 / 4.375 as provisional —
+//! including the 15.125-for-the-shipped-rung comparison they anchor. What is
+//! *not* in doubt is the quality evidence (CPU sweeps) and the clamp-vs-padding
+//! difference (a same-mode kernel difference, see [`Rung::row_stride`]).
 //!
 //! It is not expected to be the geometry that ships. Two CPU quality sweeps put
 //! K=8/V=4/L=12 at **Δw_cos −0.00698** (random codebook) and **−0.00307**
@@ -39,23 +45,30 @@
 //!
 //! So K=9 must be a *specialisation*, not a rewrite. Hence [`Rung`].
 //!
-//! # The one thing that could still kill K=9
+//! # The alignment penalty, and what is actually known about it
 //!
 //! K=8 is byte-aligned; K=9 is not. A 9-bit field spans a byte boundary, so
 //! extraction costs a second byte read, a shift and a mask where K=8 costs one
-//! `LDG`. **Whether that penalty eats the 3.46× is UNMEASURED here.** A SASS
-//! pass over the compiled kernel is what answers it.
+//! `LDG`.
 //!
-//! Two things about that measurement, so it is not misread:
+//! **What is decided:** rows are padded rather than tail-clamped. Compiled at
+//! sm_90 by full-kernel differencing, the clamp cost **+1.126 inst/weight at
+//! K=9 and +1.125 at K=10** — two independent geometries agreeing to 0.1%. That
+//! survives scrutiny because it is a *difference between two kernels in the same
+//! mode*, so it does not depend on a baseline. See [`Rung::row_stride`].
 //!
-//! 1. Nothing in this module or `kernels/qtip/qtip_gemv_v4l12.cu` has been
-//!    compiled with `nvcc` or run on a GPU by the author. Every instruction
-//!    count here is unestablished, at every K.
-//! 2. The kernel's multi-byte read **clamps its byte index** so it cannot run
-//!    past the last row. That clamp is a real per-symbol cost and it is
-//!    *removable* — padding the row stride by `MAX_BYTES − 1` bytes deletes it.
-//!    A K=9 measurement that includes the clamp is therefore an upper bound on
-//!    the alignment penalty, not the penalty itself.
+//! **What is NOT decided, and must not be quoted:** the absolute per-route
+//! figures (funnel 5.625, padded 6.312 at K=9 / 6.250 at K=10, clamped 7.438 /
+//! 7.375) are **provisional**. The rig's isolated micro-census was withdrawn as
+//! invalid — its K=8 aligned control measured 100% non-linear, because K=8's
+//! symbols are contiguous bytes that ptxas merges into wider `LDG`s while
+//! K=9's `(9t)>>3` indices cannot merge, so every "vs K=8" per-symbol delta was
+//! against a moving baseline. The full-kernel rig that produced the numbers
+//! above has **not yet reproduced the K=8 control's published 5.375 / 4.375**,
+//! so it is not validated end to end either.
+//!
+//! And nothing in this module or `kernels/qtip/qtip_gemv_v4l12.cu` has been
+//! compiled with `nvcc` or run on a GPU by its author, at any K.
 //!
 //! # Bit layout — this is format
 //!
@@ -222,7 +235,7 @@ pub const K_SUPPORTED: [u32; 3] = [8, 9, 10];
 #[derive(Debug, Clone, Copy)]
 pub struct Row<'a> {
     /// The packed symbol bitstream. Must be at least
-    /// [`Rung::packed_bytes`]`(num_symbols)` long.
+    /// [`Rung::row_stride`]`(num_symbols)` long.
     pub packed: &'a [u8],
     /// How many symbols `packed` holds. Explicit because it cannot be
     /// recovered from the byte length at a non-byte-aligned K.
@@ -335,19 +348,80 @@ impl Rung {
         in_features / V as usize
     }
 
-    /// Packed bytes holding `num_symbols` symbols: `ceil(num_symbols · K / 8)`.
+    /// Bytes that actually hold symbols: `ceil(num_symbols · K / 8)`.
     ///
     /// The general form, not `num_symbols / (8 / K)`. At K=9 there is no whole
     /// number of symbols per byte and the naive form divides by zero.
+    ///
+    /// **This is not the row stride.** See [`Rung::row_stride`].
     #[inline]
-    pub fn packed_bytes(self, num_symbols: usize) -> usize {
+    pub fn data_bytes(self, num_symbols: usize) -> usize {
         (num_symbols * self.k as usize).div_ceil(8)
     }
 
-    /// Packed bytes in a row of `in_features` weights.
+    /// The allocated length of one packed row — **data bytes plus padding**.
+    ///
+    /// # Why rows are padded
+    ///
+    /// A multi-byte extraction reads a compile-time count of bytes
+    /// ([`Rung::max_bytes_per_symbol`]), so a symbol near the end of a row can
+    /// address past the symbol data. The kernel used to clamp the byte index
+    /// instead. **Measured, and the clamp lost:** compiled at sm_90 with
+    /// full-kernel differencing, the clamp costs **+1.126 inst/weight at K=9
+    /// and +1.125 at K=10** (padded 6.312 → clamped 7.438, and 6.250 → 7.375),
+    /// i.e. **≈+4.50 instructions per extraction**. Two independent geometries
+    /// agreeing to 0.1% is what makes that number trustworthy — it is a
+    /// difference between two kernels in the same mode, so it survives the
+    /// baseline problem that invalidated the per-symbol route figures.
+    ///
+    /// Padding costs **at most 4 bytes per row**: 0.35% at `in_features=4096`,
+    /// 0.20% at 7168. That is the trade.
+    ///
+    /// # Why 4-byte alignment and not just `MAX_BYTES − 1`
+    ///
+    /// Tail safety alone needs only `MAX_BYTES − 1` extra bytes. Rounding the
+    /// stride up to a multiple of 4 additionally makes **every row base 4-byte
+    /// aligned** (the allocation base is at least 256-byte aligned), which is
+    /// what the cheapest measured extraction route — the funnel route, 5.625
+    /// inst/weight at both K=9 and K=10 — requires. The stride is *format*: it
+    /// is what the UQFF validates and what a bake must emit, and changing it
+    /// twice is the expensive outcome. So it is chosen once, to support both.
+    ///
+    /// # The byte-aligned control is untouched
+    ///
+    /// When `max_bytes_per_symbol() == 1` there is no tail overrun to pad
+    /// against and no multi-byte funnel to align for, so the stride is exactly
+    /// the data. K=8 therefore keeps byte-for-byte the layout it was probed
+    /// with — pinned by
+    /// [`tests::the_byte_aligned_control_is_not_padded`].
+    #[inline]
+    pub fn row_stride(self, num_symbols: usize) -> usize {
+        let data = self.data_bytes(num_symbols);
+        let max_bytes = self.max_bytes_per_symbol();
+        if max_bytes <= 1 {
+            data
+        } else {
+            (data + max_bytes - 1).next_multiple_of(4)
+        }
+    }
+
+    /// Bytes of padding at the end of a row: `row_stride − data_bytes`.
+    ///
+    /// **Must be zero-filled.** They are part of the artifact, so a bake that
+    /// left them uninitialised would produce a different file every run and
+    /// break any checksum over the payload. [`Rung::pack`] zeroes them and
+    /// [`tests::padding_bytes_are_zero`] pins it.
+    #[inline]
+    pub fn pad_bytes(self, num_symbols: usize) -> usize {
+        self.row_stride(num_symbols) - self.data_bytes(num_symbols)
+    }
+
+    /// The allocated length of a row holding `in_features` weights.
+    ///
+    /// This is the tensor's last dimension and what the UQFF validates.
     #[inline]
     pub fn packed_len(self, in_features: usize) -> usize {
-        self.packed_bytes(self.num_symbols(in_features))
+        self.row_stride(self.num_symbols(in_features))
     }
 
     /// Bytes a single extraction may touch, worst case over the bit offsets
@@ -448,7 +522,7 @@ impl Rung {
     /// Extract symbol `t` from a packed row.
     ///
     /// Bits `[t·K, t·K + K)`, LSB-first — see the module docs. Reads exactly
-    /// the bytes those bits fall in, so a row of [`Rung::packed_bytes`] length
+    /// the bytes those bits fall in, so a row of [`Rung::row_stride`] length
     /// is always in bounds.
     #[inline]
     pub fn extract(self, packed: &[u8], t: usize) -> u32 {
@@ -468,7 +542,10 @@ impl Rung {
     /// Exists so tests can build fixtures at any K, and so the round-trip is
     /// something that can be asserted rather than assumed.
     pub fn pack(self, syms: &[u32]) -> Vec<u8> {
-        let mut out = vec![0u8; self.packed_bytes(syms.len())];
+        // Allocated at the row STRIDE, so the tail padding exists and is zero.
+        // The kernel reads a compile-time byte count with no clamp and relies
+        // on those bytes being there.
+        let mut out = vec![0u8; self.row_stride(syms.len())];
         let mask = (1u64 << self.k) - 1;
         for (t, &s) in syms.iter().enumerate() {
             let bit = t * self.k as usize;
@@ -505,11 +582,14 @@ impl Rung {
                 lut.len()
             ));
         }
-        let want = self.packed_bytes(num_symbols);
+        let want = self.row_stride(num_symbols);
         if packed.len() < want {
             return Err(format!(
-                "qtip v4l12 K={}: {num_symbols} symbols need {want} packed bytes, got {}",
+                "qtip v4l12 K={}: {num_symbols} symbols need a {want}-byte row ({} data + {} \
+                 padding), got {}",
                 self.k,
+                self.data_bytes(num_symbols),
+                self.pad_bytes(num_symbols),
                 packed.len()
             ));
         }
@@ -933,32 +1013,46 @@ mod tests {
     }
 
     #[test]
-    fn packed_size_follows_the_bit_rate_at_every_k() {
+    fn data_bytes_follow_the_bit_rate_at_every_k() {
+        // The BIT RATE governs `data_bytes`, not `row_stride` — the stride
+        // additionally carries tail padding and a round-up to 4. Keeping the
+        // two apart is the point of having two functions: a bpw claim about
+        // the stride would be off by up to 4 bytes and would drift with K.
         for r in rungs() {
             for k_in in [512usize, 1024, 4096, 7168] {
                 let n_sym = r.num_symbols(k_in);
                 // num_symbols depends only on V, never on K.
                 assert_eq!(n_sym, k_in / V as usize);
                 // ceil, not floor: at K=9 a row rarely lands on a byte.
-                assert_eq!(r.packed_len(k_in), (n_sym * r.k() as usize).div_ceil(8));
-                // ...and the packed size is the bit rate, to the byte.
+                assert_eq!(r.data_bytes(n_sym), (n_sym * r.k() as usize).div_ceil(8));
+                // ...and the data size is the bit rate, to the byte.
                 let bits = k_in * r.bpw_x100() as usize;
-                assert_eq!(r.packed_len(k_in), bits.div_ceil(800));
+                assert_eq!(r.data_bytes(n_sym), bits.div_ceil(800));
+                // The stride is what a tensor is allocated at, and it is never
+                // smaller and never more than 4 bytes larger.
+                let stride = r.packed_len(k_in);
+                assert!(stride >= r.data_bytes(n_sym));
+                assert!(stride - r.data_bytes(n_sym) <= 4);
             }
         }
     }
 
     #[test]
     fn the_control_and_the_quality_winner_differ_in_packed_size() {
-        // K=8 is 2.00 bpw and K=9 is 2.25, so a K=9 row is 12.5% larger. This
-        // is a real format difference — unlike K=8 vs the shipped K=4/V=2 rung,
-        // where both are 2 bpw and the byte counts are identical. Worth
-        // asserting: it means a K=9 artifact cannot be silently read as either.
+        // K=8 is 2.00 bpw and K=9 is 2.25, so a K=9 row holds 12.5% more data.
+        // A real format difference — unlike K=8 vs the shipped K=4/V=2 rung,
+        // where both are 2 bpw and the byte counts are identical. It means a
+        // K=9 artifact cannot be silently read as either.
+        //
+        // The 9/8 ratio is exact on DATA bytes. It is only approximate on the
+        // stride, because K=9 pads and K=8 does not — so the rate claim is
+        // made where it is true.
         let k8 = Rung::new(8).unwrap();
         let k9 = Rung::new(9).unwrap();
         for k_in in [512usize, 4096, 7168] {
+            let (n8, n9) = (k8.num_symbols(k_in), k9.num_symbols(k_in));
+            assert_eq!(k9.data_bytes(n9) * 8, k8.data_bytes(n8) * 9);
             assert!(k9.packed_len(k_in) > k8.packed_len(k_in));
-            assert_eq!(k9.packed_len(k_in) * 8, k8.packed_len(k_in) * 9);
         }
     }
 
@@ -971,7 +1065,7 @@ mod tests {
                 for seed in 0..4u64 {
                     let syms = fixture_symbols(n, seed, r.k());
                     let packed = r.pack(&syms);
-                    assert_eq!(packed.len(), r.packed_bytes(n), "K={} n={n}", r.k());
+                    assert_eq!(packed.len(), r.row_stride(n), "K={} n={n}", r.k());
                     for (t, &want) in syms.iter().enumerate() {
                         assert_eq!(
                             r.extract(&packed, t),
@@ -1285,7 +1379,13 @@ mod tests {
             let err = r
                 .decode_row_into(Row::new(&packed, 40, 1.0), &lut, &mut out)
                 .unwrap_err();
-            assert!(err.contains("packed bytes"), "K={}: {err}", r.k());
+            assert!(
+                err.contains("-byte row") && err.contains("padding"),
+                "K={}: the refusal must name the stride and its padding, since a row that is \
+                 merely data-length is an out-of-bounds read for the kernel, not a slow path: \
+                 {err}",
+                r.k()
+            );
         }
     }
 
@@ -1459,6 +1559,26 @@ mod tests {
                         )
                         .unwrap();
                     let l1 = l1_magnitude(r, &packed, n_sym, scale, &lut, &x).max(1e-6);
+                    // NON-DEGENERACY FIRST. `0 == 0` satisfies any agreement
+                    // bound, so a decoder that returned all zeros would pass
+                    // this test with room to spare. The census agent's rig hit
+                    // exactly this shape — it reported 0.000 inst/weight with
+                    // verdict "OK", because its linearity check read
+                    // |d2-d1|/d1, which is 0.00% when every count is equal.
+                    // The guard passed hardest when the instrument was most
+                    // broken. Check that there IS something before checking
+                    // that it agrees.
+                    assert!(
+                        l1 > 1e-3,
+                        "K={} n_sym={n_sym}: L1 magnitude {l1:e} — the decode produced \
+                         essentially nothing, so the agreement bound below is vacuous",
+                        r.k()
+                    );
+                    assert!(
+                        modelled != 0.0 || scalar != 0.0,
+                        "K={} n_sym={n_sym}: both sides are exactly zero; agreement is vacuous",
+                        r.k()
+                    );
                     assert!(
                         (modelled - scalar).abs() <= 1e-5 * l1,
                         "K={} n_sym={n_sym} seed {seed}: model {modelled:e} vs scalar \
@@ -1592,6 +1712,107 @@ mod tests {
                 r.extractions_per_weight_x10000(1024),
                 "the warmup tax must not depend on K"
             );
+        }
+    }
+
+    #[test]
+    fn the_row_stride_pads_for_the_tail_and_for_4_byte_alignment() {
+        // The format decision, stated as numbers. Tail safety alone needs
+        // MAX_BYTES-1; the round-up to 4 additionally makes every row base
+        // 4-byte aligned, which the cheapest measured extraction route needs.
+        // Chosen once because the stride is format and changing it twice is
+        // the expensive outcome.
+        for r in rungs() {
+            for n_sym in [1usize, 32, 128, 256, 1024, 1792] {
+                let data = r.data_bytes(n_sym);
+                let stride = r.row_stride(n_sym);
+                assert!(stride >= data, "stride must cover the data");
+                if r.max_bytes_per_symbol() > 1 {
+                    // Enough room for the last symbol's compile-time read.
+                    assert!(
+                        stride >= data + r.max_bytes_per_symbol() - 1,
+                        "K={} n={n_sym}: stride {stride} leaves the last symbol's \
+                         {}-byte read short of {data}+{}",
+                        r.k(),
+                        r.max_bytes_per_symbol(),
+                        r.max_bytes_per_symbol() - 1
+                    );
+                    // Every row base is 4-byte aligned (the allocation base is
+                    // at least 256-byte aligned), which is the funnel route's
+                    // precondition.
+                    assert!(
+                        stride.is_multiple_of(4),
+                        "K={} n={n_sym}: stride {stride} is not a multiple of 4, so row bases \
+                         are not 4-byte aligned and the funnel route is unavailable",
+                        r.k()
+                    );
+                }
+                assert_eq!(r.pad_bytes(n_sym), stride - data);
+            }
+        }
+        // At realistic widths the overhead is negligible: exactly 4 bytes.
+        let k9 = Rung::new(9).unwrap();
+        assert_eq!(k9.data_bytes(1024), 1152);
+        assert_eq!(k9.row_stride(1024), 1156);
+        assert_eq!(k9.pad_bytes(1024), 4);
+        let k10 = Rung::new(10).unwrap();
+        assert_eq!(k10.data_bytes(1024), 1280);
+        assert_eq!(k10.row_stride(1024), 1284);
+    }
+
+    #[test]
+    fn the_byte_aligned_control_is_not_padded() {
+        // K=8 reads one byte per symbol: no tail overrun to pad against, no
+        // multi-byte funnel to align for. It keeps byte-for-byte the layout it
+        // was probed with, so the padding decision cannot perturb the control.
+        let r = Rung::CONTROL;
+        assert_eq!(r.max_bytes_per_symbol(), 1);
+        for n_sym in [1usize, 7, 32, 129, 1024, 1792] {
+            assert_eq!(r.row_stride(n_sym), r.data_bytes(n_sym), "n={n_sym}");
+            assert_eq!(r.pad_bytes(n_sym), 0);
+        }
+        for k_in in [512usize, 1024, 4096, 7168] {
+            assert_eq!(r.packed_len(k_in), k_in / 4);
+        }
+    }
+
+    #[test]
+    fn padding_bytes_are_zero() {
+        // The padding is part of the artifact. Uninitialised padding would
+        // make a bake non-reproducible and break any checksum over the payload.
+        for r in rungs() {
+            for n in [1usize, 33, 256] {
+                let syms = fixture_symbols(n, 3, r.k());
+                let packed = r.pack(&syms);
+                assert_eq!(packed.len(), r.row_stride(n));
+                let data = r.data_bytes(n);
+                for (i, b) in packed[data..].iter().enumerate() {
+                    assert_eq!(*b, 0, "K={} n={n}: padding byte {i} is {b}", r.k());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_extraction_reads_inside_the_padded_row_without_a_clamp() {
+        // The precondition the kernel now relies on, checked directly: for
+        // every symbol, the compile-time MAX_BYTES read starting at its first
+        // byte must land inside the row stride. If this ever fails, the kernel
+        // is doing an out-of-bounds read, not taking a slow path.
+        for r in rungs() {
+            let mb = r.max_bytes_per_symbol();
+            for n in [1usize, 2, 3, 33, 128, 1024] {
+                let stride = r.row_stride(n);
+                for t in 0..n {
+                    let b0 = (t * r.k() as usize) / 8;
+                    assert!(
+                        b0 + mb <= stride,
+                        "K={} n={n}: symbol {t} reads bytes [{b0}, {}) past a {stride}-byte row",
+                        r.k(),
+                        b0 + mb
+                    );
+                }
+            }
         }
     }
 
@@ -1752,6 +1973,10 @@ mod tests {
                 "reachable-offset bytes-per-symbol bound",
             ),
             (
+                "w |= (uint32_t)__ldg(row + b0 + i) << (8 * i);".to_string(),
+                "unclamped extraction (rows are padded instead)",
+            ),
+            (
                 "const int sym_per_thread = (num_symbols + 31) / 32;".to_string(),
                 "one warp per row (the warmup-tax fix)",
             ),
@@ -1818,6 +2043,16 @@ mod tests {
         // a `warp_sums` array comes back, the model's single butterfly is no
         // longer what the kernel does and the bit-exact gate would be comparing
         // against the wrong tree.
+        // The tail clamp is gone and must stay gone: it cost a measured
+        // +1.126 inst/weight at K=9 and +1.125 at K=10, and the row padding
+        // exists precisely to make it unnecessary. Reintroducing it would
+        // silently pay for padding twice.
+        assert!(
+            !src.contains("min(b0 + i"),
+            "the extraction regained a tail clamp. Rows are padded to \
+             `row_stride = align_up(data + MAX_BYTES - 1, 4)` so the clamp is unnecessary, and \
+             it measured +1.126 inst/weight at K=9."
+        );
         assert!(
             !src.contains("__shared__ float warp_sums"),
             "the kernel regained a cross-warp reduction; `gemv_row_gpu_model` models ONE warp \
@@ -1896,7 +2131,7 @@ mod tests {
                 (5, 516),
             ] {
                 let n_sym = r.num_symbols(in_features);
-                let row_bytes = r.packed_bytes(n_sym);
+                let row_bytes = r.row_stride(n_sym);
                 let mut packed = Vec::with_capacity(n_rows * row_bytes);
                 let mut scales = Vec::with_capacity(n_rows);
                 for row in 0..n_rows {
@@ -1965,7 +2200,7 @@ mod tests {
         let r = Rung::CONTROL;
         let (n_rows, in_features) = (4usize, 256usize);
         let n_sym = r.num_symbols(in_features);
-        let row_bytes = r.packed_bytes(n_sym);
+        let row_bytes = r.row_stride(n_sym);
         let packed: Vec<u8> = (0..(n_rows * row_bytes))
             .map(|i| (i * 37 % 251) as u8)
             .collect();

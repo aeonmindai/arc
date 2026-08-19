@@ -443,12 +443,17 @@ pub(crate) fn fused_gemv_v4l12_cuda(
     // caller is holding a row packed at a different K — and since the table,
     // the state width and the activation indexing are all K-independent, the
     // row length is the ONLY thing that can catch it.
-    let want_bytes = rung.packed_bytes(num_symbols);
+    let want_bytes = rung.row_stride(num_symbols);
     if packed_per_row != want_bytes {
         candle_core::bail!(
             "{OP}: blocks row is {packed_per_row} B but K={} with in_features={in_features} \
-             ({num_symbols} symbols) needs {want_bytes} packed bytes",
-            rung.k()
+             ({num_symbols} symbols) needs a {want_bytes}-byte stride ({} data + {} padding). \
+             The kernel reads a compile-time byte count with NO clamp — the padding is what \
+             makes the last symbol's read in-bounds, so a short row is an out-of-bounds read, \
+             not a slow path.",
+            rung.k(),
+            rung.data_bytes(num_symbols),
+            rung.pad_bytes(num_symbols)
         );
     }
     if !blocks.layout().is_contiguous()

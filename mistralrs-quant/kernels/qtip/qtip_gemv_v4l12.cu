@@ -32,34 +32,54 @@
 //
 // WHICH K SHIPS
 // -------------
-// K=8 is the **control**: byte-aligned, and the geometry whose compiled-probe
-// figures (5.375 inst/weight, 4.375 with the row-scale hoist, against 15.125
-// for the shipped rung) anchor the comparison. It is not expected to be the K
-// that ships -- CPU sweeps put K=8/V=4/L=12 at Delta w_cos -0.00698 (random
-// codebook) / -0.00307 (converged trellis-Lloyd) against a +/-0.0008 threshold,
-// and no codebook design recovered it. **K=9 at 2.25 bpw measured +0.00402.**
+// K=8 is the **control**: byte-aligned, and the geometry the early probe
+// figures were taken on. It is not expected to be the K that ships -- CPU
+// sweeps put K=8/V=4/L=12 at Delta w_cos -0.00698 (random codebook) / -0.00307
+// (converged trellis-Lloyd) against a +/-0.0008 threshold, and no codebook
+// design recovered it. **K=9 at 2.25 bpw measured +0.00402.**
+//
+// WARNING: the control's own 5.375 / 4.375 inst/weight have NOT been
+// reproduced by the census rig, so they are provisional, as is the 15.125
+// figure for the shipped rung that they are compared against.
 //
 // MEASUREMENT STATUS -- READ BEFORE QUOTING A NUMBER
 // -------------------------------------------------
 // **This file has never been compiled with nvcc and never run on a GPU by its
-// author. Its instruction count is UNESTABLISHED at every K.** The probe
-// figures above came from a standalone compiled probe, not from this kernel.
-// Establish it with `nvcc -cubin -arch=sm_90` plus unroll differencing on the
-// inner loop before it is quoted anywhere. Hand-counting C++ undercounts SASS
-// by ~2.05x on this kernel family, so a count that was not compiled is not a
-// count.
+// author. Its instruction count is UNESTABLISHED at every K.**
 //
-// THE TAIL CLAMP IS A REMOVABLE COST -- DO NOT READ IT AS THE ALIGNMENT PENALTY
-// ---------------------------------------------------------------------------
+// The absolute per-route figures circulating for this family (funnel 5.625,
+// padded 6.312 at K=9 / 6.250 at K=10, clamped 7.438 / 7.375) are PROVISIONAL:
+// the rig that produced them has not yet reproduced the K=8 control's published
+// 5.375 / 4.375, so it is not validated end to end. An earlier isolated
+// micro-census was withdrawn outright -- its K=8 control measured 100%
+// non-linear, because K=8's contiguous-byte symbols let ptxas merge loads while
+// K=9's (9t)>>3 indices cannot, making every "vs K=8" per-symbol delta a
+// comparison against a moving baseline.
+//
+// The ONE number here that does not depend on a baseline is the clamp-vs-pad
+// delta, because it is a difference between two kernels in the same mode. That
+// is why the padding decision was taken on it and nothing else was.
+//
+// Hand-counting C++ undercounts SASS by ~2.05x on this kernel family, so a
+// count that was not compiled is not a count.
+//
+// ROWS ARE PADDED; THERE IS NO TAIL CLAMP
+// ---------------------------------------
 // `QtipSymExtract<K>` reads a COMPILE-TIME count of bytes (MAX_BYTES) so the
-// loop unrolls with no data-dependent branch. For a symbol near the end of a
-// row that can address past the row, so the byte index is clamped to the last
-// valid byte. This is safe -- see the correctness note on the clamp below --
-// but it costs an extra `min` per byte read, and it would **disappear entirely
-// if the row stride were padded by MAX_BYTES-1 bytes**. A K=9 or K=10 SASS
-// measurement that includes the clamp is an UPPER BOUND on the alignment
-// penalty, not the penalty. Padding is a format decision that is deliberately
-// not taken here while K is unsettled.
+// loop unrolls with no data-dependent branch and no clamp. That requires the
+// row to be at least `row_stride = align_up(data_bytes + MAX_BYTES - 1, 4)`
+// bytes, which the format now guarantees and the Rust launcher enforces.
+//
+// This was a measured decision, not a preference. Full-kernel differencing at
+// sm_90 put the clamped variant at +1.126 inst/weight over the padded one at
+// K=9 and +1.125 at K=10 -- two independent geometries agreeing to 0.1%. The
+// padding costs at most 4 bytes per row (0.35% at in_features=4096).
+//
+// The round-up to 4 is not for tail safety, which needs only MAX_BYTES-1. It
+// makes every row base 4-byte aligned, which is what the cheapest measured
+// route -- the funnel route, 5.625 inst/weight at both K=9 and K=10 -- needs.
+// The stride is format, and changing it twice is the expensive outcome, so it
+// is chosen once to support both.
 //
 // PARITY
 // ------
@@ -127,8 +147,24 @@ struct QtipSymExtract {
     // j/8 at bit position j%8. Same convention the shipped K=4/V=2 rung uses
     // (symbol 2b is the low nibble of byte b), pinned on the Rust side by
     // `the_bit_layout_matches_the_shipped_k4_rungs_nibble_order`.
+    // PRECONDITION: the row is at least `Rung::row_stride(num_symbols)` bytes,
+    // i.e. the symbol data plus MAX_BYTES-1 bytes of zero padding, rounded up
+    // to a multiple of 4. The Rust launcher refuses anything shorter.
+    //
+    // That precondition is what deletes the tail clamp this loop used to
+    // carry, and the clamp was NOT cheap: measured at sm_90 by full-kernel
+    // differencing, it cost +1.126 inst/weight at K=9 and +1.125 at K=10
+    // (~+4.50 per extraction). Two independent geometries agreeing to 0.1% is
+    // why that number is trusted — it is a difference between two kernels in
+    // the same mode, so it survives the baseline problem that invalidated the
+    // isolated per-symbol route figures.
+    //
+    // Reading into the padding is harmless as well as in-bounds: byte i
+    // contributes bits [8i, 8i+8) of `w`, and the mask keeps only bits
+    // [off, off+K), so any byte beyond ceil((off+K)/8) lands entirely above
+    // the window and cannot change the symbol.
     __device__ __forceinline__ static uint32_t get(
-        const uint8_t* __restrict__ row, int t, int row_bytes
+        const uint8_t* __restrict__ row, int t
     ) {
         const int bit = t * K;
         const int b0  = bit >> 3;
@@ -136,14 +172,7 @@ struct QtipSymExtract {
         uint32_t w = 0u;
         #pragma unroll
         for (int i = 0; i < MAX_BYTES; ++i) {
-            // CLAMP, and why it is correct rather than merely safe: byte i
-            // contributes bits [8i, 8i+8) of `w`, and the mask below keeps
-            // only bits [off, off+K). Any byte beyond ceil((off+K)/8) lands
-            // entirely above that window, so substituting a different (valid,
-            // in-row) byte cannot change the result. It therefore reads real
-            // memory and yields the identical symbol.
-            const int idx = min(b0 + i, row_bytes - 1);
-            w |= (uint32_t)__ldg(row + idx) << (8 * i);
+            w |= (uint32_t)__ldg(row + b0 + i) << (8 * i);
         }
         return (w >> off) & ((1u << K) - 1u);
     }
@@ -156,7 +185,7 @@ template <>
 struct QtipSymExtract<8> {
     static constexpr int MAX_BYTES = 1;
     __device__ __forceinline__ static uint32_t get(
-        const uint8_t* __restrict__ row, int t, int /*row_bytes*/
+        const uint8_t* __restrict__ row, int t
     ) {
         return (uint32_t)__ldg(row + t);
     }
@@ -336,7 +365,7 @@ qtip_fused_gemv_v4_l12_kernel(
                 const int warm_start = max(0, sym_start_raw - WARMUP_SYMS);
                 for (int t = warm_start; t < sym_start_raw; ++t) {
                     const uint32_t sym =
-                        QtipSymExtract<K>::get(row_packed, t, packed_per_row);
+                        QtipSymExtract<K>::get(row_packed, t);
                     state = ((state << K) | sym) & QV4_STATE_MASK;
                 }
             }
@@ -346,7 +375,7 @@ qtip_fused_gemv_v4_l12_kernel(
             // K-dependent step is the extraction; everything below is shared.
             for (int sym_idx = sym_start_raw; sym_idx < sym_end; ++sym_idx) {
                 const uint32_t sym =
-                    QtipSymExtract<K>::get(row_packed, sym_idx, packed_per_row);
+                    QtipSymExtract<K>::get(row_packed, sym_idx);
                 state = ((state << K) | sym) & QV4_STATE_MASK;
 
                 // `lut_s` is 16-byte aligned and the entry is 4 bf16, so this
