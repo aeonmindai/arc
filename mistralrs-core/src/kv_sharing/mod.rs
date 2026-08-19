@@ -96,6 +96,74 @@ impl ShareStats {
     pub fn bytes_saved(&self) -> u64 {
         self.tree.bytes_saved_by_dedup
     }
+
+    /// Has this cache been consulted at all?
+    ///
+    /// 🔑 The distinction this exists for: a run that never looked the cache up
+    /// and a run that looked it up and missed both report a 0% hit rate, and
+    /// they mean opposite things. A prefill measurement taken with the cache
+    /// switched off is not a cold-cache measurement of a working cache — it is
+    /// not a measurement of the cache at all — and until [`Self::summary`] said
+    /// so, no Arc run could tell the two apart.
+    pub fn was_consulted(&self) -> bool {
+        self.tree.lookups > 0
+    }
+
+    /// One-line human summary, for `bench`, `serve` and interactive output.
+    ///
+    /// Reports the **token-weighted** hit rate first, because that is the one
+    /// that predicts prefill time: a 1-token match on an 800-token prompt is a
+    /// request-level "hit" that saves nothing. The request-level rate follows it
+    /// for comparison, and the cross-prefix figure is labelled as the upper
+    /// bound on an unbuilt feature rather than as reuse we have.
+    pub fn summary(&self) -> String {
+        if !self.was_consulted() {
+            return format!(
+                "never consulted ({} entries held) — no prefill number from this run says \
+                 anything about prefix caching",
+                self.entries
+            );
+        }
+        let reused = self.tree.symbols_reused;
+        let offered = reused + self.tree.symbols_computed;
+        let mut out = format!(
+            "{:.2}% of prompt tokens served from cache ({reused}/{offered}), \
+             {:.2}% of prompts hit ({}/{}), {} not re-stored, {} entries",
+            100.0 * self.tree.symbol_hit_rate(),
+            100.0 * self.tree.request_hit_rate(),
+            self.tree.hits,
+            self.tree.lookups,
+            fmt_bytes(self.bytes_saved()),
+            self.entries,
+        );
+        if self.cross_prefix.tokens_seen > 0 {
+            out.push_str(&format!(
+                "; cross-prefix duplicate tokens {:.2}% (lower-bound meter; an UPPER bound on \
+                 what a position-independent reuse path could add, not reuse we have)",
+                100.0 * self.cross_prefix.unreachable_share(),
+            ));
+        }
+        out
+    }
+}
+
+/// Bytes at a human scale. Binary units, two decimals, so a 0-byte and a
+/// 24-MiB saving do not both render as "0".
+fn fmt_bytes(bytes: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let b = bytes as f64;
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    if b >= GIB {
+        format!("{:.2} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.2} MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.2} KiB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// Sequence-substrate KV sharing: a radix tree over token ids whose payloads
@@ -323,6 +391,87 @@ mod tests {
             tag,
             media_ok: true,
         }
+    }
+
+    /// The distinction Issue #82 is misframed on: "we have no prefix cache" vs
+    /// "we cannot see whether it hit". A cache that was never consulted must
+    /// NOT render as a 0% hit rate, because a 0% hit rate is a claim about
+    /// traffic and this one is a claim about wiring.
+    #[test]
+    fn a_cache_that_was_never_consulted_says_so_instead_of_reporting_zero_percent() {
+        let c: SharedPrefixCache<Elem> = SharedPrefixCache::new();
+        let stats = c.stats();
+        assert!(!stats.was_consulted());
+        let s = stats.summary();
+        assert!(
+            s.contains("never consulted"),
+            "an unconsulted cache must name itself as such; got {s:?}"
+        );
+        assert!(
+            !s.contains("0.00% of prompt tokens"),
+            "reporting 0% would assert the cache missed, which is a different claim; got {s:?}"
+        );
+    }
+
+    /// The number the summary exists to carry: tokens actually served from
+    /// cache, token-weighted. Driven through the real tree, so a summary that
+    /// read a counter nothing increments would fail here.
+    #[test]
+    fn the_summary_reports_the_measured_token_hit_rate_not_a_placeholder() {
+        let mut c: SharedPrefixCache<Elem> = SharedPrefixCache::new();
+        let prefix: Vec<u32> = (0..80).collect();
+        c.insert(&prefix, e("stored"), KvBlockLayout::default());
+
+        // 100 offered tokens, 80 of them covered by the stored prefix.
+        let mut query = prefix.clone();
+        query.extend(80..100);
+        let hit = c.lookup(&query, |_| true).expect("the prefix must match");
+        assert_eq!(hit.matched_tokens, 80);
+
+        let stats = c.stats();
+        assert!(stats.was_consulted());
+        assert_eq!(stats.tokens_not_recomputed(), 80);
+        assert!(
+            (stats.tree.symbol_hit_rate() - 0.8).abs() < 1e-9,
+            "80 of 100 offered tokens were served: {:?}",
+            stats.tree
+        );
+        let s = stats.summary();
+        assert!(
+            s.contains("80.00% of prompt tokens served from cache (80/100)"),
+            "the summary must carry the measured rate and its terms; got {s:?}"
+        );
+        assert!(
+            s.contains("100.00% of prompts hit (1/1)"),
+            "and the request-level rate beside it; got {s:?}"
+        );
+    }
+
+    /// A miss is a measurement too, and must be distinguishable from the
+    /// unconsulted case above.
+    #[test]
+    fn a_lookup_that_missed_reports_zero_percent_rather_than_never_consulted() {
+        let mut c: SharedPrefixCache<Elem> = SharedPrefixCache::new();
+        c.insert(&[1, 2, 3], e("stored"), KvBlockLayout::default());
+        assert!(c.lookup(&[7, 8, 9], |_| true).is_none());
+
+        let stats = c.stats();
+        assert!(stats.was_consulted());
+        let s = stats.summary();
+        assert!(
+            s.contains("0.00% of prompt tokens served from cache (0/3)"),
+            "a real miss must report as a miss; got {s:?}"
+        );
+        assert!(!s.contains("never consulted"), "got {s:?}");
+    }
+
+    #[test]
+    fn bytes_render_at_a_human_scale() {
+        assert_eq!(fmt_bytes(0), "0 B");
+        assert_eq!(fmt_bytes(512), "512 B");
+        assert_eq!(fmt_bytes(2048), "2.00 KiB");
+        assert_eq!(fmt_bytes(3 * 1024 * 1024), "3.00 MiB");
+        assert_eq!(fmt_bytes(5 * 1024 * 1024 * 1024), "5.00 GiB");
     }
 
     #[test]

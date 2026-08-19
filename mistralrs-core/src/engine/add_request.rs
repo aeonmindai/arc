@@ -647,14 +647,21 @@ impl Engine {
                 );
             }
 
-            let prefill_cache = handle_seq_error!(
-                get_mut_arcmutex!(self.prefix_cacher).search_for_matching_cache(
+            let prefill_cache = {
+                let mut prefix_cacher = get_mut_arcmutex!(self.prefix_cacher);
+                let found = prefix_cacher.search_for_matching_cache(
                     seq.get_toks(),
                     seq.image_hashes(),
                     seq.audio_hashes(),
-                ),
-                request.response
-            );
+                );
+                // Publish the sharing counters here, at the lookup that moved
+                // them, so what `bench`/`serve`/interactive print is consistent
+                // with the request that produced it. Before this, `share_stats`
+                // had zero consumers outside `prefix_cacher.rs` and no Arc run
+                // could report whether the cache hit.
+                self.logger.set_share_stats(prefix_cacher.share_stats());
+                handle_seq_error!(found, request.response)
+            };
 
             seq = match prefill_cache.clone() {
                 Some(MatchingCache::Normal {

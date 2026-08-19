@@ -1,11 +1,22 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use tracing::info;
+
+use crate::kv_sharing::ShareStats;
+
+/// The `ArcKV/Share` counters, as last published by the engine.
+///
+/// `None` means the prefix cache has not been consulted **once** in this
+/// process — which is what `--prefix-cache-n 0` and every `mistralrs bench`
+/// run before this change looked like from the outside, and is not the same
+/// statement as a 0% hit rate. Consumers must render the two differently; see
+/// [`ShareStats::summary`].
+type SharedShareStats = Arc<Mutex<Option<ShareStats>>>;
 
 pub struct IntervalLogger {
     enable_logging: Arc<AtomicBool>,
@@ -16,6 +27,12 @@ pub struct IntervalLogger {
     num_waiting: Arc<AtomicUsize>,
     encoder_cache_hits: Option<Arc<AtomicUsize>>,
     encoder_cache_misses: Option<Arc<AtomicUsize>>,
+    /// 🔑 The whole point of this field: `PrefixCacheManagerV2` has computed a
+    /// token-weighted hit rate, tokens-not-recomputed, bytes saved and a
+    /// cross-prefix reuse meter since it was written, and **nothing outside
+    /// `prefix_cacher.rs` ever read them**. Every Arc prefill measurement was
+    /// therefore uninterpretable: it could not say whether the cache hit.
+    share_stats: SharedShareStats,
 }
 
 impl IntervalLogger {
@@ -43,6 +60,8 @@ impl IntervalLogger {
         };
         let t_enc_hits = encoder_cache_hits.clone();
         let t_enc_misses = encoder_cache_misses.clone();
+        let share_stats: SharedShareStats = Arc::new(Mutex::new(None));
+        let t_share_stats = share_stats.clone();
         thread::spawn(move || {
             // Cumulative GPU-sampler counters as of the previous tick, so we
             // can report this window's delta rather than a since-boot total.
@@ -109,6 +128,18 @@ impl IntervalLogger {
                         tokens_processed as f64 / interval.as_secs_f64(),
                         100. * prefix_cache_hits as f64 / total_new_seqs as f64,
                     );
+
+                    // The request-level rate above answers "did some prefix
+                    // match"; this answers "how much prefill did that avoid",
+                    // which is the number a prefill measurement needs beside it.
+                    let share = t_share_stats.lock().ok().and_then(|s| *s);
+                    match share {
+                        Some(s) => info!("ArcKV/Share: {}", s.summary()),
+                        None => info!(
+                            "ArcKV/Share: prefix cache not consulted this process — prefill \
+                             numbers from this run say nothing about caching"
+                        ),
+                    }
                 }
             }
         });
@@ -122,6 +153,7 @@ impl IntervalLogger {
             num_waiting,
             encoder_cache_hits,
             encoder_cache_misses,
+            share_stats,
         }
     }
 
@@ -130,6 +162,12 @@ impl IntervalLogger {
     }
 
     /// Reset all counters to zero. Call after warmup/dummy runs to get clean stats.
+    ///
+    /// Deliberately does **not** clear the `ArcKV/Share` mirror: it is a view of
+    /// the radix tree's own process-lifetime counters, which this type does not
+    /// own and cannot zero. Blanking the mirror would report "never consulted"
+    /// about a cache that had been, which is the one confusion the mirror
+    /// exists to remove.
     pub fn reset(&self) {
         self.prefix_cache_hits.store(0, Ordering::Relaxed);
         self.tokens_processed.store(0, Ordering::Relaxed);
@@ -174,11 +212,114 @@ impl IntervalLogger {
         )
     }
 
+    /// Publish the `ArcKV/Share` counters. Called by the engine wherever it
+    /// already holds the prefix cache, so the snapshot is consistent with the
+    /// lookup that produced it.
+    pub fn set_share_stats(&self, stats: ShareStats) {
+        if let Ok(mut slot) = self.share_stats.lock() {
+            *slot = Some(stats);
+        }
+    }
+
+    /// The last published `ArcKV/Share` counters, or `None` if the prefix cache
+    /// has not been consulted at all in this process.
+    pub fn share_stats(&self) -> Option<ShareStats> {
+        self.share_stats.lock().ok().and_then(|s| *s)
+    }
+
+    /// The line `bench`, `serve` and interactive all print, so they cannot
+    /// disagree about what "the cache hit" means.
+    ///
+    /// The `None` case is deliberately not rendered as 0%: a run that never
+    /// consulted the cache (`--prefix-cache-n 0`, which is what `mistralrs
+    /// bench` sets) has made no measurement of it at all.
+    pub fn share_stats_line(&self) -> String {
+        match self.share_stats() {
+            Some(s) => s.summary(),
+            None => "prefix cache not consulted (disabled, or no request reached it) — no \
+                     prefill number from this run measures caching"
+                .to_string(),
+        }
+    }
+
     /// Return cumulative encoder cache (hits, misses), or `None` if no encoder cache exists.
     pub fn encoder_cache_stats(&self) -> Option<(usize, usize)> {
         match (&self.encoder_cache_hits, &self.encoder_cache_misses) {
             (Some(h), Some(m)) => Some((h.load(Ordering::Relaxed), m.load(Ordering::Relaxed))),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kv_sharing::{KvBlockLayout, SharedPrefixCache};
+
+    /// A long interval so the background thread never ticks during the test.
+    fn quiet_logger() -> IntervalLogger {
+        IntervalLogger::new(Duration::from_secs(3600), None)
+    }
+
+    /// The failure this whole change is about: before it, every consumer read
+    /// `prefix_cache_stats()` — a request counter — and there was no way to ask
+    /// whether the cache had been consulted at all. A fresh logger must say
+    /// "not consulted", not "0%".
+    #[test]
+    fn a_logger_that_was_never_published_to_reports_not_consulted() {
+        let logger = quiet_logger();
+        assert!(logger.share_stats().is_none());
+        let line = logger.share_stats_line();
+        assert!(
+            line.contains("not consulted"),
+            "an unpublished logger must not imply a measured miss; got {line:?}"
+        );
+    }
+
+    /// End to end through the real tree: counters move, the engine publishes,
+    /// the CLI-facing line carries the measured token-weighted rate.
+    #[test]
+    fn a_published_snapshot_carries_the_measured_token_hit_rate() {
+        let mut cache: SharedPrefixCache<()> = SharedPrefixCache::new();
+        let prefix: Vec<u32> = (0..40).collect();
+        cache.insert(&prefix, (), KvBlockLayout::default());
+        let mut query = prefix.clone();
+        query.extend(40..50);
+        assert!(cache.lookup(&query, |_| true).is_some());
+
+        let logger = quiet_logger();
+        logger.set_share_stats(cache.stats());
+
+        let stats = logger.share_stats().expect("published");
+        assert_eq!(stats.tokens_not_recomputed(), 40);
+        let line = logger.share_stats_line();
+        assert!(
+            line.contains("80.00% of prompt tokens served from cache (40/50)"),
+            "the line must carry the tree's own measured rate; got {line:?}"
+        );
+        assert!(!line.contains("not consulted"), "got {line:?}");
+    }
+
+    /// `reset()` clears the request counters it owns and must NOT blank the
+    /// share mirror, whose counters live in the tree and are not resettable
+    /// from here — blanking it would report "never consulted" about a cache
+    /// that had been.
+    #[test]
+    fn reset_clears_request_counters_but_not_the_share_mirror() {
+        let mut cache: SharedPrefixCache<()> = SharedPrefixCache::new();
+        cache.insert(&[1, 2, 3], (), KvBlockLayout::default());
+        assert!(cache.lookup(&[1, 2, 3, 4], |_| true).is_some());
+
+        let logger = quiet_logger();
+        logger.add_new_sequence();
+        logger.add_prefix_cache_hit();
+        logger.set_share_stats(cache.stats());
+
+        logger.reset();
+        assert_eq!(logger.prefix_cache_stats(), (0, 0));
+        assert!(
+            logger.share_stats().is_some(),
+            "the share mirror must survive a counter reset"
+        );
     }
 }

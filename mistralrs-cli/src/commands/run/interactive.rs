@@ -375,6 +375,10 @@ async fn text_interactive_mode(
                         prefix_hits, prefix_total
                     );
                 }
+                // The turn count above says a prefix matched; this says how
+                // much prefill that avoided, which is the number the multi-turn
+                // claim actually rests on.
+                println!("Prefix cache (ArcKV/Share): {}", logger.share_stats_line());
             }
         }
         let mut assistant_message: IndexMap<String, Either<String, Vec<IndexMap<String, Value>>>> =
@@ -705,6 +709,10 @@ async fn vision_interactive_mode(
                         prefix_hits, prefix_total
                     );
                 }
+                // The turn count above says a prefix matched; this says how
+                // much prefill that avoided, which is the number the multi-turn
+                // claim actually rests on.
+                println!("Prefix cache (ArcKV/Share): {}", logger.share_stats_line());
                 if let Some((hits, misses)) = logger.encoder_cache_stats() {
                     let turn_hits = hits - prev_encoder_hits;
                     let turn_lookups = (hits + misses) - (prev_encoder_hits + prev_encoder_misses);
