@@ -367,3 +367,60 @@ jobs:
       # These still only EXECUTE on a real GPU.
       - name: Type-check CUDA-gated tests (no codegen, no run)
         run: cargo check --workspace --features cuda --tests
+
+  # ---------------------------------------------------------------------------
+  # SASS CENSUS (manual dispatch only)
+  #
+  # Converts the QTIP trellis geometry ladder from estimates into measurements.
+  # `nvcc -cubin` performs DEVICE-ONLY codegen: no host compile, no link, no
+  # driver, no GPU -- exactly the same reason the two jobs above work on a
+  # GPU-less runner. cuobjdump then disassembles the cubin to SASS and the
+  # script counts instructions per kernel.
+  #
+  # Why this must be measured and not reasoned about: hand-counting from C++
+  # undercounts SASS by ~2.05x on this kernel family (a census subagent made
+  # that error and had its answer retracted). The static-SASS instrument itself
+  # is validated in-tree -- 35.06 static vs 35.52 ncu on the GEMV (1.3%), and
+  # instruction count tracking measured time ~1:1 on the grouped GEMM
+  # (qtip_grouped_gemm.cu:125-133).
+  #
+  # `if:` keeps this off every PR. It is an instrument, not a gate -- it has no
+  # pass/fail, it prints a table. Run it with:
+  #     gh workflow run cuda_compile_check.yaml --ref <branch>
+  # ---------------------------------------------------------------------------
+  sass-census:
+    name: QTIP geometry SASS census (no GPU)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install CUDA toolkit (no driver, no GPU)
+        uses: Jimver/cuda-toolkit@v0.2.35
+        id: cuda-toolkit
+        with:
+          cuda: "12.4.1"
+          method: "local"
+          linux-local-args: '["--toolkit"]'
+
+      - name: Toolchain provenance
+        run: |
+          which nvcc cuobjdump
+          nvcc --version
+          cuobjdump --version
+
+      # sm_90 is the H100/H200 target the in-tree anchors were produced on.
+      # sm_80 is compiled too so the geometry conclusions can be checked for
+      # arch-sensitivity (LDS width and PRMT availability differ in cost).
+      - name: SASS census (sm_90)
+        run: python3 arc-tools/sass_census/run_census.py --arch sm_90 | tee census_sm90.txt
+
+      - name: SASS census (sm_80)
+        run: python3 arc-tools/sass_census/run_census.py --arch sm_80 | tee census_sm80.txt
+
+      - name: Upload census
+        uses: actions/upload-artifact@v4
+        with:
+          name: qtip-sass-census
+          path: census_sm*.txt
