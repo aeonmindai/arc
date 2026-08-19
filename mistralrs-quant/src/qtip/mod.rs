@@ -3634,13 +3634,15 @@ impl QuantMethod for QtipLayer {
                 //
                 // Gating on `n_tokens > DECODE_REGIME_MAX_TOKENS` instead put
                 // the kernel to work at n=9, where V4's top-6-of-256 routing
-                // wakes ~136 experts for 54 pairs and the 16-row tile is ~9%
-                // full. Measured cost of that: aggregate 34.19 tok/s at B=8 ->
-                // 5.99 at B=32, i.e. widening the batch 4x made serving 5.7x
-                // worse (nsys, 97a65d643). The kernel is fine; it was switched
-                // on ~2 orders of magnitude too early. Full tiles arrive at
-                // ~683 tokens for this routing shape. See `gather_policy` §4
-                // for the table and the derivation.
+                // wakes ~54 experts for 54 pairs and the 16-row tile holds one
+                // useful row — ~2 orders of magnitude below where the kernel
+                // amortizes. Full tiles arrive at ~683 tokens for this routing
+                // shape.
+                //
+                // This fix does NOT explain the B=32 aggregate-throughput
+                // collapse it was filed against; that attribution is retracted
+                // and the measurement is in `gather_policy` §4. Do not re-derive
+                // it from this comment.
                 //
                 // The decode regime stays fused UNCONDITIONALLY: that is the
                 // RUN-161 floor, not a performance choice (see

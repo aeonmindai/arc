@@ -142,14 +142,34 @@
 //! and the in-tree end-to-end A/B brackets exactly that curve: **1.00× at
 //! N=128 and N=512, 2.41× at N=1024**.
 //!
-//! **This is a measured regression, not a hypothetical.** Shipping the gate as
-//! a raw `n_tokens > DECODE_REGIME_MAX_TOKENS` switched the grouped kernel on
-//! at n=9, i.e. onto a tile that is ~9% full, and cost 5.7× end to end:
-//! aggregate **34.19 tok/s at B=8 → 5.99 tok/s at B=32** on an exclusive H200
-//! (nsys, `97a65d643`; the kernel itself ran 7,888 µs/call, 133× above its own
-//! bandwidth bound, at 3.5% memory-controller utilisation and 48.2%
-//! unallocated warps — saturated doing nothing). The kernel was fine; it was
-//! switched on roughly two orders of magnitude too early.
+//! Shipping the gate as a raw `n_tokens > DECODE_REGIME_MAX_TOKENS` switched
+//! the grouped kernel on at n=9 — onto a tile that is ~9% full, roughly two
+//! orders of magnitude below where it amortizes. That is indefensible on its
+//! own terms and is why the gate is now a fill.
+//!
+//! ⚠️ **What this fix is NOT, so nobody re-derives a false attribution from
+//! it.** It was filed against an apparent 5.7× end-to-end collapse — aggregate
+//! 34.19 tok/s at B=8 against 5.99 at B=32 (nsys, exclusive H200,
+//! `97a65d643`). **That attribution is retracted.** Re-measured on the same box
+//! and instrument with the gate fixed (`89ec93140`):
+//!
+//! * At B=32 the grouped kernel was never running on 32-token decode steps at
+//!   all. It was running on **1,572-token prefill chunks at 230% tile fill** —
+//!   the right side of its own boundary. The dispatch log
+//!   ([`log_grouped_gemm_engaged_once`]) says so directly.
+//! * The B=32 leg executed roughly **4–6 decode steps in an 18 s window**; the
+//!   rest was prefill, with sequences still being admitted when the leg ended.
+//!   The B=8 leg was in flat steady state. The two windows were not comparable.
+//! * B=8 is unchanged by the fix, as it must be (36.80 → 37.60 tok/s at matched
+//!   depth), and B=32 aggregate did **not** recover.
+//! * The kernel's distance from its bandwidth bound is **not** explained by
+//!   tile emptiness either: with decode routed away, its prefill-only mean rose
+//!   to 15,600 µs/call **at 230% fill**, still ~60× above bound with DRAM read
+//!   at 1.9%. That is a separate, unsolved defect.
+//!
+//! The B=32 number is V4's prefill cost (`memory/mission/BUDGET_V4_PREFILL.md`)
+//! surfacing through a harness that declares steady state on decode-cohort
+//! width alone.
 //!
 //! So the gate is [`grouped_gemm_tiles_amortize`]: **switch only once each
 //! woken expert draws at least `GROUPED_TILE_M` pairs**, i.e. once an average
