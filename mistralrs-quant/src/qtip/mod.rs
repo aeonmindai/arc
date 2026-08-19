@@ -3613,18 +3613,48 @@ impl QuantMethod for QtipLayer {
                 // the kernel's real structural limit (grid.y = n_pairs <=
                 // 65535). See `gather_policy` for the arithmetic.
                 let num_experts = self.num_experts_count();
-                let use_ondevice = match gather_policy::ondevice_max_tokens_override() {
-                    Some(cap) => {
-                        n_tokens <= cap
-                            && n_tokens.saturating_mul(n_experts_per_tok)
-                                <= gather_policy::GATHER_GEMV_MAX_PAIRS
-                    }
-                    None => gather_policy::lut_fused_gather_preferred(
-                        n_tokens,
-                        n_experts_per_tok,
-                        num_experts,
-                    ),
-                };
+                let grouped_disabled = std::env::var("ARC_NO_QTIP_GROUPED_MOE").is_ok();
+                // Is the grouped GEMM actually usable for this call?
+                let grouped_available = !grouped_disabled
+                    && matches!(a.dtype(), DType::BF16 | DType::F16)
+                    && self.in_features.is_multiple_of(grouped::GROUPED_TILE_K);
+
+                // Prefer the grouped GEMM over the fused gather-GEMV for every
+                // non-decode call.
+                //
+                // `lut_fused_gather_preferred`'s 16x traffic ratio answers the
+                // question "GEMV or dequantize-materialize?" — a choice between
+                // two paths that both scale with (token, slot) PAIRS. Now that a
+                // third path exists whose cost tracks DISTINCT EXPERTS, that
+                // boundary no longer describes the decision being made: measured
+                // per expert matmul on an H200, grouped beats the fused GEMV at
+                // N=128 (1.15x) and by N=512 the gap is 3.98x. Leaving the old
+                // boundary in place made the grouped kernel unreachable below
+                // ~683 tokens, which is where most prefill actually lives — the
+                // end-to-end A/B showed exactly 1.00x at N=128 and N=512 while
+                // N=1024 moved 2.41x.
+                //
+                // The decode regime stays fused UNCONDITIONALLY: that is the
+                // RUN-161 floor, not a performance choice (see
+                // `gather_policy`). An explicit `ARC_QTIP_ONDEVICE_MOE_MAX_TOKENS`
+                // override also still wins, so a harness can pin the GEMV arm.
+                let grouped_preferred = grouped_available
+                    && n_tokens > DECODE_REGIME_MAX_TOKENS
+                    && gather_policy::ondevice_max_tokens_override().is_none();
+
+                let use_ondevice = !grouped_preferred
+                    && match gather_policy::ondevice_max_tokens_override() {
+                        Some(cap) => {
+                            n_tokens <= cap
+                                && n_tokens.saturating_mul(n_experts_per_tok)
+                                    <= gather_policy::GATHER_GEMV_MAX_PAIRS
+                        }
+                        None => gather_policy::lut_fused_gather_preferred(
+                            n_tokens,
+                            n_experts_per_tok,
+                            num_experts,
+                        ),
+                    };
                 let ondevice_disabled = std::env::var("ARC_NO_QTIP_ONDEVICE_MOE").is_ok();
                 if !ondevice_disabled && use_ondevice {
                     // On-device ONLY, propagate its error. The host fallback
@@ -3636,6 +3666,66 @@ impl QuantMethod for QtipLayer {
                     // (RUN-161)
                     return self.gather_forward_cuda_ondevice(a, indices);
                 }
+                // Prefill regime: the LUT-rung trellis grouped GEMM. Tokens
+                // sorted by expert on-device, then a persistent tensor-core
+                // tile loop over the ragged groups, so each woken expert's
+                // packed bytes are staged once per m-tile instead of once per
+                // (token, slot) pair.
+                //
+                // This rung shipped without it for one wrong reason: its state
+                // update `state = ((state << 4) | sym) & 0xFFFF` LOOKS
+                // sequential. It is not — the state at symbol `t` is just the
+                // last four nibbles, i.e. a 16-bit window over the packed
+                // stream, exactly as the qtip2b rung's state is a window over
+                // its 2-bit stream. Random-access decode is what makes a
+                // grouped GEMM reachable, and it was always available here.
+                //
+                // Below this, `gather_forward_cuda` stays as the fallback: it
+                // is the only path that handles F32 activations and shapes
+                // whose `in_features` is not a multiple of the k-chunk.
+                if grouped_available {
+                    let total_pairs = n_tokens * n_experts_per_tok;
+                    let a_flat = a.reshape((total_pairs, cols))?.contiguous()?;
+                    let a_rotated = if self.rotation_block >= 2 {
+                        match &self.rotation_signs {
+                            Some(signs) => {
+                                cuda_ops::rotate_x_cuda(&a_flat, signs, self.rotation_block)?
+                            }
+                            None => candle_core::bail!(
+                                "QtipLayer::gather_forward: rotation_block={} but rotation_signs is None",
+                                self.rotation_block
+                            ),
+                        }
+                    } else {
+                        a_flat
+                    };
+                    let idx = indices
+                        .reshape((total_pairs,))?
+                        .to_dtype(DType::U32)?
+                        .contiguous()?;
+                    let out_flat = cuda_ops::grouped_gemm_lut_cuda(
+                        &self.blocks,
+                        &self.row_scales,
+                        &self.lut,
+                        &a_rotated,
+                        &idx,
+                        self.in_features,
+                        self.codebook,
+                    )?;
+                    let mut out = out_flat.reshape((
+                        n_tokens,
+                        n_experts_per_tok,
+                        self.rows_per_expert()?,
+                    ))?;
+                    if out.dtype() != a.dtype() {
+                        out = out.to_dtype(a.dtype())?;
+                    }
+                    if let Some(bias) = &self.bias {
+                        out = out.broadcast_add(&bias.to_dtype(out.dtype())?)?;
+                    }
+                    return Ok(out);
+                }
+
                 // The per-expert dequantize below materializes weights to HBM.
                 gather_policy::log_lut_gather_fallback_once(
                     n_tokens,
