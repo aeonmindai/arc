@@ -176,13 +176,17 @@ static REGISTRY: &[Capability] = &[
             ],
             honoured_in: &["mistralrs-core/src/sampler.rs"],
         },
-        // On `cca5e5c6e` the field occurs in `sampler.rs` exactly twice — the
-        // declaration and its `None` default — and is never read. The OpenAI
-        // endpoints accept `logit_bias` and silently drop it.
-        status: Status::Tracked {
-            reason: "dead wire on master; PR #151 implements it. When that lands this entry \
-                     goes red asking to be promoted to Live — which is the point.",
-        },
+        // On `cca5e5c6e` the field occurred in `sampler.rs` exactly twice — the
+        // declaration and its `None` default — and was never read. The OpenAI
+        // endpoints accepted `logit_bias` and silently dropped it.
+        //
+        // PROMOTED by this PR, which is the transition the entry was written to
+        // demand. `logits_bias` is now read at `sampler.rs:401`
+        // (`has_logits_bias`) and `:502` (`apply_logits_bias`), and `sample`
+        // applies it to the raw logits before any filtering. The gate flagged
+        // this itself — it went red on the rebase asking to be promoted, which
+        // is exactly the behaviour its own reason string predicted.
+        status: Status::Live,
     },
     Capability {
         name: "sampling: top_k survives onto the GPU-autonomous decode path",
