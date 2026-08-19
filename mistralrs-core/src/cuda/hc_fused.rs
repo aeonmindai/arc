@@ -60,7 +60,12 @@ mod cuda_impl {
             candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
             _ => candle::bail!("hc_fused: {what} must be on CUDA"),
         };
-        Ok(s.slice(l.start_offset()..).device_ptr(s.stream()).0 as *const std::ffi::c_void)
+        // Bind before returning: `device_ptr` hands back a (ptr, guard) pair
+        // whose guard borrows `s`, so the pointer must be extracted in its own
+        // statement rather than in tail position. Same shape as
+        // `sinkhorn::sinkhorn_normalize_cuda`.
+        let ptr = s.slice(l.start_offset()..).device_ptr(s.stream()).0 as *const std::ffi::c_void;
+        Ok(ptr)
     }
 
     /// Fused `hc_pre` middle section: the RMS statistic, its broadcast into
@@ -150,14 +155,13 @@ mod cuda_impl {
             );
         }
 
-        let wrap = |buf, shape| {
-            let st = candle::CudaStorage::wrap_cuda_slice(buf, dev.clone());
-            Tensor::from((candle::Storage::Cuda(st), shape))
-        };
+        let pre_st = candle::CudaStorage::wrap_cuda_slice(pre_buf, dev.clone());
+        let post_st = candle::CudaStorage::wrap_cuda_slice(post_buf, dev.clone());
+        let comb_st = candle::CudaStorage::wrap_cuda_slice(comb_buf, dev.clone());
         Ok((
-            wrap(pre_buf, (n, hc)),
-            wrap(post_buf, (n, hc)),
-            wrap(comb_buf, (n, hc, hc)),
+            Tensor::from((candle::Storage::Cuda(pre_st), (n, hc))),
+            Tensor::from((candle::Storage::Cuda(post_st), (n, hc))),
+            Tensor::from((candle::Storage::Cuda(comb_st), (n, hc, hc))),
         ))
     }
 
