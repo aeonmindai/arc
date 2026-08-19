@@ -2525,4 +2525,195 @@ mod tests {
         );
         Ok(())
     }
+
+    // ---- RUN-161 2c: the graph-decode fixed-capacity window ----------------
+
+    /// The graph-decode arm's exact geometry, on CPU.
+    ///
+    /// `deepseek4.rs` reads back a constant `cap`-wide window of the KV buffer
+    /// after writing the new token at the device-held `position`. Slots
+    /// `0..=position` hold real K/V; `position+1..cap` are the zeros the buffer
+    /// was allocated with and have never been written.
+    fn graph_window(
+        b: usize,
+        cap: usize,
+        d: usize,
+        position: usize,
+        dev: &Device,
+    ) -> Result<(Tensor, Tensor)> {
+        let written = position + 1;
+        let live = mk(b, 1, written, d, 0.37, dev)?;
+        let tail = Tensor::zeros((b, 1, cap - written, d), DType::F32, dev)?;
+        Ok((Tensor::cat(&[&live, &tail], 2)?.contiguous()?, live))
+    }
+
+    /// 🔴 THE GUARD. A zero K row is **not** a masked row: it scores logit 0
+    /// and takes `exp(0)/Z` of the softmax weight, so it dilutes every real key
+    /// and contributes its zero V to the output.
+    ///
+    /// This test asserts three things at once, and the third is what makes the
+    /// first two worth having:
+    ///
+    ///  1. with the length mask, the fixed-`cap` window is **bit-identical** to
+    ///     attending only the `position+1` slots that were actually written —
+    ///     i.e. the mask makes the graph arm agree with the eager arm;
+    ///  2. without it, the result **differs** — so the same test cannot pass on
+    ///     a build where `set_graph_mode_mask` is never called. A guard that
+    ///     survives its own feature being unwired is worthless;
+    ///  3. the unmasked answer is *finite*, which is exactly why this was never
+    ///     caught: nothing downstream sees a NaN, it just quietly answers the
+    ///     wrong question.
+    #[test]
+    fn a_masked_tail_and_a_zero_tail_are_different_answers() -> Result<()> {
+        let dev = Device::Cpu;
+        let (b, h, d, cap, position) = (1usize, 4usize, 16usize, 12usize, 5usize);
+        let q = mk(b, h, 1, d, 0.11, &dev)?;
+        let (k_window, k_written) = graph_window(b, cap, d, position, &dev)?;
+
+        let sdpa = sdpa_params(d, h);
+        let flash = empty_flash_params();
+        // The graph arm sets `sliding_window == cap`, which is what forces the
+        // dense path and makes every written slot reachable.
+        let cfg = || Dsv4AttentionConfig {
+            compress_ratio: CompressRatio::Standard,
+            sliding_window: cap,
+            raw_prefix: 0,
+            row_q0: None,
+        };
+
+        // Reference: the eager arm — only the written slots exist at all.
+        let reference =
+            dsv4_attention(&q, &k_written, &k_written, None, None, &flash, &sdpa, cfg())?;
+
+        // The defect: fixed window, no mask. Finite, and wrong.
+        let unmasked = dsv4_attention(&q, &k_window, &k_window, None, None, &flash, &sdpa, cfg())?;
+        assert!(
+            unmasked
+                .flatten_all()?
+                .to_vec1::<f32>()?
+                .iter()
+                .all(|x| x.is_finite()),
+            "the unmasked answer is finite — that is precisely why a zero tail went unnoticed"
+        );
+
+        // The fix: the same window, plus the length mask built from `position`.
+        let positions = Tensor::from_vec(vec![position as u32; b], (b,), &dev)?;
+        let gmask = crate::layers::graph_mode_length_mask(&positions, cap, DType::F32)?;
+        let masked = dsv4_attention(
+            &q,
+            &k_window,
+            &k_window,
+            None,
+            Some(&gmask),
+            &flash,
+            &sdpa,
+            cfg(),
+        )?;
+
+        let r = reference.flatten_all()?.to_vec1::<f32>()?;
+        let m = masked.flatten_all()?.to_vec1::<f32>()?;
+        let u = unmasked.flatten_all()?.to_vec1::<f32>()?;
+
+        let max_dev = |a: &[f32], c: &[f32]| {
+            a.iter()
+                .zip(c)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max)
+        };
+        assert!(
+            max_dev(&m, &r) < 1e-6,
+            "a masked tail must equal an absent tail; max deviation {}",
+            max_dev(&m, &r)
+        );
+        assert!(
+            max_dev(&u, &r) > 1e-4,
+            "an unmasked zero tail must NOT equal an absent tail — if it does, this test \
+             would pass with the mask unwired and pins nothing. max deviation {}",
+            max_dev(&u, &r)
+        );
+        Ok(())
+    }
+
+    /// Same claim on the deployment configuration: MQA + attention sinks, which
+    /// routes through `absorbed_mqa_decode` / `softmax_with_sinks` rather than
+    /// `Sdpa`. The mask has to survive that branch too.
+    #[test]
+    fn the_length_mask_survives_the_absorbed_sink_decode_branch() -> Result<()> {
+        let dev = Device::Cpu;
+        let (b, h, d, cap, position) = (1usize, 4usize, 16usize, 12usize, 5usize);
+        let q = mk(b, h, 1, d, 0.11, &dev)?;
+        let (k_window, k_written) = graph_window(b, cap, d, position, &dev)?;
+        let (sdpa, _sinks) = sdpa_params_with_sinks(d, h, &dev)?;
+        let flash = empty_flash_params();
+        let cfg = || Dsv4AttentionConfig {
+            compress_ratio: CompressRatio::Standard,
+            sliding_window: cap,
+            raw_prefix: 0,
+            row_q0: None,
+        };
+
+        let reference =
+            dsv4_attention(&q, &k_written, &k_written, None, None, &flash, &sdpa, cfg())?;
+        let positions = Tensor::from_vec(vec![position as u32; b], (b,), &dev)?;
+        let gmask = crate::layers::graph_mode_length_mask(&positions, cap, DType::F32)?;
+        let masked = dsv4_attention(
+            &q,
+            &k_window,
+            &k_window,
+            None,
+            Some(&gmask),
+            &flash,
+            &sdpa,
+            cfg(),
+        )?;
+        let unmasked = dsv4_attention(&q, &k_window, &k_window, None, None, &flash, &sdpa, cfg())?;
+
+        let r = reference.flatten_all()?.to_vec1::<f32>()?;
+        let m = masked.flatten_all()?.to_vec1::<f32>()?;
+        let u = unmasked.flatten_all()?.to_vec1::<f32>()?;
+        let max_dev = |a: &[f32], c: &[f32]| {
+            a.iter()
+                .zip(c)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max)
+        };
+        assert!(
+            max_dev(&m, &r) < 1e-6,
+            "masked != absent: {}",
+            max_dev(&m, &r)
+        );
+        assert!(
+            max_dev(&u, &r) > 1e-4,
+            "unmasked == absent would make this test vacuous: {}",
+            max_dev(&u, &r)
+        );
+        Ok(())
+    }
+
+    /// A batch whose rows sit at different positions: one mask per row, not one
+    /// scalar for the cohort. `graph_mode_positions` is `[B]`, so this is the
+    /// shape the arm actually gets.
+    #[test]
+    fn the_length_mask_is_per_row() -> Result<()> {
+        let dev = Device::Cpu;
+        let cap = 8usize;
+        let positions = Tensor::from_vec(vec![2u32, 5u32], (2,), &dev)?;
+        let mask = crate::layers::graph_mode_length_mask(&positions, cap, DType::F32)?;
+        assert_eq!(mask.dims(), &[2, 1, 1, cap]);
+        let v = mask.flatten_all()?.to_vec1::<f32>()?;
+        for (row, &pos) in [2usize, 5usize].iter().enumerate() {
+            for slot in 0..cap {
+                let got = v[row * cap + slot];
+                if slot <= pos {
+                    assert_eq!(got, 0.0, "row {row} slot {slot} was written; must be 0");
+                } else {
+                    assert!(
+                        got.is_infinite() && got.is_sign_negative(),
+                        "row {row} slot {slot} was never written; must be -inf, got {got}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 }

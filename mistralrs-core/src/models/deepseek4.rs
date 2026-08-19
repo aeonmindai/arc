@@ -1655,18 +1655,34 @@ impl Attention {
                 // Use ONLY the fixed-width graph mask (matches the C-wide K).
                 // The eager `attention_mask` is kv_len-wide (growing) and would
                 // both mismatch the fixed window and break shape-constancy.
-                // `dsv4_attention` now folds whatever it is handed into its own
-                // union mask (it used to discard it), so wiring
-                // `set_graph_mode_mask` is all that remains for this path: until
-                // then `graph_mode_mask()` is `None` and the unwritten tail slots
-                // are attended as zero-padding (finite, not yet correct).
-                let gmask = crate::layers::graph_mode_mask();
+                // `dsv4_attention` folds whatever it is handed into its own
+                // union mask.
+                //
+                // 🔴 REFUSED, not defaulted. Of the `cap` slots read back, only
+                // `position + 1` were ever written; the rest are the zeros the
+                // buffer was allocated with. A zero K row is NOT a masked row —
+                // it scores logit 0 and takes `exp(0)/Z` of the softmax weight,
+                // diluting every real key and contributing its zero V. This arm
+                // previously ran with `graph_mode_mask() == None` and called the
+                // result "finite, not yet correct"; a finite wrong answer is the
+                // failure mode nothing downstream catches, so it now errors.
+                // `DeepSeekV4::forward` publishes the mask once per step.
+                let gmask = crate::layers::graph_mode_mask().ok_or_else(|| {
+                    candle_core::Error::Msg(
+                        "V4 graph-mode decode: the fixed-capacity length mask is unset. \
+                         Reading a constant window of which only `position + 1` slots are \
+                         written and attending the rest as zero-padding is a wrong answer, \
+                         not a degraded one. `DeepSeekV4::forward` must call \
+                         `layers::set_graph_mode_mask` whenever graph-mode positions are set."
+                            .into(),
+                    )
+                })?;
                 super::dsv4_attention::dsv4_attention(
                     &q,
                     &k_full,
                     &k_full,
                     compressed_kv.as_ref(),
-                    gmask.as_ref(),
+                    Some(&gmask),
                     flash_params,
                     &self.sdpa_params,
                     dsv4_cfg,
@@ -4176,6 +4192,35 @@ impl DeepSeekV4 {
             let _s = arc_profiler::device_span("embed");
             self.embed_tokens.forward(input_ids)?
         };
+
+        // RUN-161 2c: publish the fixed-capacity decode window's length mask.
+        //
+        // 🔑 Built HERE, and nowhere earlier, for two reasons that both bite:
+        //
+        //  1. **Replay safety.** `normal.rs` sets the graph-mode *positions*
+        //     before `self.model.forward` — i.e. outside the capture region. A
+        //     mask computed there would be a constant folded into the recorded
+        //     graph, correct for the captured token and wrong for every replayed
+        //     one. Computed here it is a device-side compare against the
+        //     position buffer, so a replay that mutates that buffer in place
+        //     re-derives the right mask with no recapture.
+        //  2. **`cap` is a model fact.** `ModelConfigMetadata::sliding_window`
+        //     is `None` for V4 (it is not a uniform-window model), so the
+        //     pipeline cannot supply the width. `cfg_full.sliding_window` can.
+        //
+        // Once per step, not once per layer: all 43 layers read the same window
+        // width, and the graph path is single-device.
+        if crate::layers::has_graph_mode_positions() {
+            match crate::layers::graph_mode_positions() {
+                Some(pos) => {
+                    let cap = self.cfg_full.sliding_window.max(1);
+                    let mask = crate::layers::graph_mode_length_mask(&pos, cap, xs_embed.dtype())?;
+                    crate::layers::set_graph_mode_mask(Some(mask));
+                }
+                None => crate::layers::set_graph_mode_mask(None),
+            }
+        }
+
         let cache = &mut self.cache.normal().0;
         let _prof_mask = arc_profiler::span("causal_mask");
         let attention_mask = CausalMasker.make_causal_mask_matrix(
