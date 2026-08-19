@@ -444,6 +444,52 @@ mod tests {
         }
     }
 
+    /// Source-level tripwires, mirroring `sinkhorn::tests`: the IEEE
+    /// intrinsics and the fast-math `#error` guard must stay in hc_fused.cu,
+    /// fast-math approximations must stay out, and build.rs must keep the file
+    /// out of the `--use_fast_math` glob and in the `--fmad=false` builder.
+    /// Getting this wiring wrong is silent — the kernel still runs, it just
+    /// stops being bit-identical — so the `#error` guard is the hard stop and
+    /// these string checks catch it on CPU CI too.
+    #[test]
+    fn kernel_source_and_build_wiring_guards() {
+        let cu = include_str!("hc_fused.cu");
+        assert!(
+            cu.contains("#if defined(__USE_FAST_MATH__)") && cu.contains("#error"),
+            "hc_fused.cu lost its fast-math #error guard"
+        );
+        for required in ["__fadd_rn", "__fmul_rn", "candle_recip", "candle_sigmoid"] {
+            assert!(cu.contains(required), "hc_fused.cu lost required token {required}");
+        }
+        for forbidden in ["__expf(", "__logf(", "__fdividef(", "rsqrtf(", "__frsqrt_rn("] {
+            assert!(
+                !cu.contains(forbidden),
+                "hc_fused.cu contains {forbidden}, which is not what candle-kernels computes"
+            );
+        }
+
+        let build = include_str!("../../build.rs");
+        let exclude = build
+            .split(".exclude(&[")
+            .nth(1)
+            .and_then(|s| s.split("])").next())
+            .expect("build.rs no longer calls .exclude(&[..]) on the fast-math builder");
+        assert!(
+            exclude.contains("\"hc_fused.cu\""),
+            "build.rs no longer excludes hc_fused.cu from the fast-math builder \
+             (exclude list is: {exclude})"
+        );
+        assert!(
+            build.contains(r#""src/cuda/hc_fused.cu""#),
+            "build.rs no longer feeds hc_fused.cu to the IEEE (no-fast-math) builder"
+        );
+        assert!(
+            build.contains("--fmad=false"),
+            "build.rs lost --fmad=false, so nvcc may contract mul+add into an FMA and break \
+             bit-identity with candle's unfused op chain"
+        );
+    }
+
     #[test]
     fn candle_reduce_block_dim_matches_fast_reduce() {
         // cuda_backend/mod.rs: usize::min(1024, el_to_sum_per_block).next_power_of_two()
