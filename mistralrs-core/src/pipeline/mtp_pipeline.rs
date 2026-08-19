@@ -2342,7 +2342,7 @@ impl SyntheticAcceptance {
         })
     }
 
-    /// Parse the flag's value. `None` when unset, empty, or unparseable —
+    /// Parse the flag's value. `None` when unset, empty, or unparsable —
     /// with a warning in the last two cases, because a typo'd debug flag that
     /// silently does nothing is how a session gets measured twice.
     pub fn from_env_value(value: Option<&str>) -> Option<Self> {

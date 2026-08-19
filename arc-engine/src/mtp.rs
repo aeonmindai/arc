@@ -420,7 +420,7 @@ mod tests {
         assert!(SyntheticAcceptance::new(f64::INFINITY).is_none());
         assert!(SyntheticAcceptance::new(1.0).is_some());
 
-        // Unset / empty / unparseable all leave the real drafter measuring.
+        // Unset / empty / unparsable all leave the real drafter measuring.
         assert!(SyntheticAcceptance::from_env_value(None).is_none());
         assert!(SyntheticAcceptance::from_env_value(Some("")).is_none());
         assert!(SyntheticAcceptance::from_env_value(Some("  ")).is_none());
