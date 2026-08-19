@@ -388,7 +388,16 @@ __device__ __forceinline__ void census_body(
     // Fully unrolled over NG groups -- the knob the differential varies.
     // `lane + 1` keeps every index non-negative at g == 0 without costing an
     // instruction (it folds into the address immediate).
-#pragma unroll
+    //
+    // THE COUNT IS LOAD-BEARING. A bare `#pragma unroll` is a HINT, and nvcc
+    // 12.4.131 declined it for every WIN_REPLAY kernel: g1/g3/g4/g5 each came
+    // back with byte-identical SASS at NG = 4, 8 and 12 (200 inst for g3 at all
+    // three on sm_90, 176 on sm_80), i.e. the loop was re-rolled and code size
+    // stopped tracking NG. The differential then reads exactly zero, which is
+    // not a small error -- it is no signal at all. WIN_SEQ was unaffected
+    // because its loop-carried trellis state blocks re-rolling. Naming the
+    // count makes it a directive rather than a suggestion.
+#pragma unroll NG
     for (int g = 0; g < NG; ++g) {
         const int base = (MODE == WIN_SEQ) ? (slice + g * GS) : ((lane + 1 + g * 32) * GS);
 
@@ -640,7 +649,7 @@ __device__ __forceinline__ void extract_body(const uint8_t* __restrict__ packed,
     const uint8_t* p = packed + (size_t)blockIdx.x * ppr;
     const int base = (int)threadIdx.x * NS;
     uint32_t acc = 0u;
-#pragma unroll
+#pragma unroll NS
     for (int s = 0; s < NS; ++s) {
         acc ^= census_sym_ext<K, EXT>(p, base + s, ppr);
     }
@@ -654,9 +663,9 @@ __device__ __forceinline__ void extract_body(const uint8_t* __restrict__ packed,
         extract_body<K, EXT, NS>(packed, out, ppr);                            \
     }
 
-#define NS_LO 8
-#define NS_MID 16
-#define NS_HI 24
+#define NS_LO 32
+#define NS_MID 64
+#define NS_HI 96
 
 // K=8, byte-aligned -- the control every delta is taken against.
 EXTRACT_KERNEL(k8_ns8, 8, EXT_NATIVE, NS_LO)

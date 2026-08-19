@@ -40,6 +40,16 @@ ROWS = 2
 STEP = 4          # NG spacing (4 -> 8 -> 12)
 SATURATION = 4000  # refuse to report any count at or above this
 
+# NO SIGNAL. If code size does not grow with the unroll knob, the loop was
+# re-rolled and the differential measures nothing. This is NOT hypothetical and
+# it is NOT caught by the linearity check: when n_lo == n_mid == n_hi both
+# half-differences are 0, so |d2-d1|/d1 evaluates to 0.00% and prints "OK".
+# Run 32262762701 reported 0.000 inst/weight as "OK" for all five WIN_REPLAY
+# geometries -- including the K=8 control that is supposed to prove the rig.
+# A guard that passes hardest when the instrument is most broken is worse than
+# no guard, so growth is now checked before anything else.
+MIN_GROWTH = 0.5   # inst per unit of the knob, below which there is no signal
+
 # An instruction line looks like `/*0a10*/   IMAD R5, R2, R3, R4 ;`
 # An encoding line looks like     `/* 0x000fe200078e00ff */`  -- note the space.
 INSN_RE = re.compile(r"^\s*/\*[0-9a-f]{4}\*/\s+(\S.*?);")
@@ -281,10 +291,24 @@ def main():
             blo = BUDGET_LO_AT_2BPW * bpw / 2.0
             bhi = BUDGET_HI_AT_2BPW * bpw / 2.0
             sat = max(n4, n8, n12) >= SATURATION
-            verdict = "SATURATED" if sat else ("OK" if lin < 1.0 else "NOT STEADY")
+            growth = (n12 - n4) / (2 * STEP)
+            if growth < MIN_GROWTH:
+                # Re-rolled: SASS is the same size at every NG.
+                verdict = "NO SIGNAL"
+            elif sat:
+                verdict = "SATURATED"
+            elif lin >= 1.0:
+                verdict = "NOT STEADY"
+            else:
+                verdict = "OK"
             results[pre] = dict(ipw=ipw, bpw=bpw, blo=blo, bhi=bhi, lin=lin,
                                 label=label, over=ipw / bhi,
-                                ok=(not sat and lin < 1.0))
+                                ok=(verdict == "OK"))
+            if verdict != "OK":
+                print(f"{label:<32}{bpw:>5.2f}{blo:>6.2f}-{bhi:<6.2f}"
+                      f"{'--':>10}{'--':>11}{verdict:>10}   "
+                      f"(raw {n4}/{n8}/{n12} -- NOT REPORTABLE)")
+                continue
             print(f"{label:<32}{bpw:>5.2f}{blo:>6.2f}-{bhi:<6.2f}{ipw:>10.3f}"
                   f"{lin:>10.2f}%{verdict:>11}")
 
@@ -346,23 +370,41 @@ def main():
         ips = (n24_ - n8_) / (2 * NS_STEP)
         lin = abs(d2 - d1) / max(abs(d1), 1e-9) * 100.0
         sat = max(n8_, n16_, n24_) >= SATURATION
-        ext_res[pre] = dict(ips=ips, lin=lin, sat=sat, K=K, label=label)
+        growth = (n24_ - n8_) / (2 * NS_STEP)
+        ok = growth >= MIN_GROWTH and not sat and lin < 1.0
+        ext_res[pre] = dict(ips=ips, lin=lin, sat=sat, K=K, label=label, ok=ok,
+                            raw=(n8_, n16_, n24_),
+                            why=("NO SIGNAL" if growth < MIN_GROWTH else
+                                 "SATURATED" if sat else
+                                 "NOT STEADY" if lin >= 1.0 else "OK"))
 
     if "k8" not in ext_res:
         print("  FATAL: the K=8 aligned control is missing; no delta is reportable")
+    elif not ext_res["k8"]["ok"]:
+        print(f"  FATAL: the K=8 aligned control is {ext_res['k8']['why']} "
+              f"(raw {ext_res['k8']['raw']}). Every 'vs K=8' delta below is")
+        print("  taken against an invalid baseline and MUST NOT be quoted.")
     for pre, K, label in EXTRACTS:
         if pre not in ext_res:
             print(f"  {label}: MISSING KERNELS")
             continue
         e = ext_res[pre]
         regs = ptx.get(f"extract_{pre}_ns24", {}).get("regs", "?")
-        d = e["ips"] - ext_res["k8"]["ips"] if "k8" in ext_res else float("nan")
+        base_ok = ext_res.get("k8", {}).get("ok", False)
+        if not base_ok:
+            # A delta against an invalid baseline is a number someone will
+            # quote. Do not print one -- a warning above a plausible figure is
+            # not a guard.
+            print(f"{label:<34}{e['ips']:>10.3f}{'--':>9}{e['lin']:>7.2f}%"
+                  f"{str(regs):>6}{'--':>9}{'--':>7}"
+                  f"   (no valid K=8 baseline)")
+            continue
+        d = e["ips"] - ext_res["k8"]["ips"]
         # A per-symbol penalty D lands on inst/weight scaled by how many
         # extractions each weight costs -- 0.5 in WIN_REPLAY, 0.25 in WIN_SEQ.
         pr = d * EXTRACTS_PER_WEIGHT["replay"]
         ps = d * EXTRACTS_PER_WEIGHT["seq"]
-        flag = ("  <-- SATURATED" if e["sat"]
-                else ("" if e["lin"] < 1.0 else "  <-- NOT STEADY"))
+        flag = "" if e["ok"] else f"  <-- {e['why']}, NOT REPORTABLE (raw {e['raw']})"
         print(f"{label:<34}{e['ips']:>10.3f}{d:>+9.3f}{e['lin']:>7.2f}%{str(regs):>6}"
               f"{pr:>+9.3f}{ps:>+7.3f}{flag}")
 
@@ -390,6 +432,10 @@ def main():
     for K, padded, clamped in PAD_VS_CLAMP:
         if padded not in ext_res or clamped not in ext_res:
             print(f"K={K:<8} MISSING ({padded} or {clamped} did not compile)")
+            continue
+        if not (ext_res[padded]["ok"] and ext_res[clamped]["ok"]):
+            print(f"K={K:<8} NOT REPORTABLE ({padded}={ext_res[padded]['why']}, "
+                  f"{clamped}={ext_res[clamped]['why']})")
             continue
         p_, c_ = ext_res[padded]["ips"], ext_res[clamped]["ips"]
         d = c_ - p_
@@ -427,6 +473,10 @@ def main():
     for label, e, lv, ctrl, mode in checks:
         if e not in ext_res or lv not in levers or ctrl not in levers:
             print(f"{label:<40}{'MISSING':>11}")
+            continue
+        if not ext_res[e]["ok"] or not ext_res.get("k8", {}).get("ok"):
+            print(f"{label:<40}{'--':>11}{'--':>10}{'N/A':>10}  "
+                  f"(isolated route or its K=8 baseline not reportable)")
             continue
         pred = (ext_res[e]["ips"] - ext_res["k8"]["ips"]) * EXTRACTS_PER_WEIGHT[mode]
         obs = levers[lv]["ipw"] - levers[ctrl]["ipw"]
