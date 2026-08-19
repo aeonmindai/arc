@@ -12,11 +12,10 @@
 //
 //     K=4 / V=2 / L=16   2.00 bpw, the shipped rung; 15.125 decode inst/weight
 //     K=8 / V=4 / L=12   2.00 bpw at 4.375 decode inst/weight
-//     K=9 / V=4 / L=12   2.25 bpw — THE BAKE TARGET. K=8/V=4/L=12 is quality-
-//                        CLOSED (-0.00698 with a random codebook, -0.00307 with
-//                        a converged trellis-Lloyd one, against a +-0.0008 ship
-//                        band, over six codebook designs); K=9 measures
-//                        +0.00402, 5x better than the shipped control.
+//     K=9 / V=4 / L=12   2.25 bpw — THE BAKE TARGET. K=8/V=4/L=12 is
+//                        quality-CLOSED and K=9 is not; the sweep, its six
+//                        codebook designs and the Dw_cos figures are recorded
+//                        once, in `qtip/trellis_v4l12.rs`'s module docs.
 //
 // The K=8 rung is NOT reachable by bumping the constants. Three things in this
 // kernel are shaped by `2^(L-K)` and `2^K`, and at K=8/L=12 all three invert:

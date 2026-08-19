@@ -19,9 +19,14 @@
 //
 //     K=9 / V=4 / L=12   2.25 bits/weight, same 32,768 B codebook, same decode
 //                        shape. This is the rung the encoder is being taught to
-//                        bake; K=8/V=4/L=12 is quality-CLOSED (measured
-//                        -0.00698 random / -0.00307 trellis-Lloyd against a
-//                        +-0.0008 ship band).
+//                        bake; K=8/V=4/L=12 is quality-CLOSED (Dw_cos -0.00698
+//                        with a random codebook and -0.00307 with a converged
+//                        trellis-Lloyd one, against a +-0.0008 ship band, over
+//                        six codebook designs — trellis freedom binds, not
+//                        codebook coverage). K=9 measures +0.00402. Those
+//                        numbers and the sweep behind them live in
+//                        `qtip/trellis_v4l12.rs`'s module docs; do not restate
+//                        them anywhere else.
 //
 // Before this header each kernel restated `K`/`L`/`V` as its own local
 // `constexpr`, and every one of those restatements assumed K=4 somewhere else
