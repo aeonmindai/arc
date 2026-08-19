@@ -185,32 +185,88 @@ impl PrefixCacheManagerV2 {
         self.caches.stats()
     }
 
+    /// Publish a **still-running** sequence's KV as soon as its prefill is
+    /// done, instead of waiting for the request to finish generating.
+    ///
+    /// 🔴 The defect this exists for: [`Self::add_sequence`] has exactly two
+    /// callers, both inside `if let Some(reason) = is_done`
+    /// (`pipeline/sampling.rs:264`, `:423`), while the lookup happens at
+    /// admission (`engine/add_request.rs:650`). So a prompt's KV became visible
+    /// only when the request that computed it *completed* — for a 2,048-token
+    /// system prompt with a long generation that is tens of seconds after the
+    /// KV existed, and every request that arrived in that window paid the full
+    /// prefill again. SGLang publishes per chunk (`radix_cache.py:516`
+    /// `cache_unfinished_req`); vLLM publishes per step (`block_pool.py:225`).
+    ///
+    /// Publishing here is safe against the producing sequence continuing to
+    /// write, because the payload only ever *claims* tokens that are already
+    /// written and `SingleCache::append` only ever writes **forward** of them
+    /// (`kv_cache/single_cache.rs:227`). Every other mutation of a sequence's
+    /// cache — `strip_pending_lead_pad`, `front_pad_kv_cache`, a capacity grow,
+    /// and `clone_in_cache`'s per-step rebatch — allocates a **new** tensor and
+    /// leaves the old buffer's contents untouched, so a published snapshot is
+    /// never rewritten under a reader.
+    ///
+    /// The entry is a NEW element, not a mutation of an existing one: the
+    /// payload is a snapshot of tensors at one instant, there is no in-place
+    /// update path in the radix tree, and half of a longer payload is not a
+    /// valid payload (`kv_sharing/radix.rs:429`). When the same sequence later
+    /// finishes, its full-length payload is inserted as a second, deeper node;
+    /// both are valid and `match_prefix_with` picks whichever covers the query.
+    pub fn add_prefilled_sequence(
+        &mut self,
+        seq: &mut Sequence,
+        recurrent_snapshots: Option<Vec<RecurrentStateSnapshot>>,
+    ) {
+        if self.store(seq, recurrent_snapshots) {
+            seq.set_prefill_published();
+        }
+    }
+
     /// This always keeps the cache on the device.
     pub fn add_sequence(
         &mut self,
         seq: &mut Sequence,
         recurrent_snapshots: Option<Vec<RecurrentStateSnapshot>>,
     ) {
+        self.store(seq, recurrent_snapshots);
+    }
+
+    /// The one body behind [`Self::add_sequence`] and
+    /// [`Self::add_prefilled_sequence`], so a partial entry cannot drift from a
+    /// final one on the key cap or the ragged guard. Returns whether an attempt
+    /// to store was actually made (i.e. the guards let it through).
+    fn store(
+        &mut self,
+        seq: &mut Sequence,
+        recurrent_snapshots: Option<Vec<RecurrentStateSnapshot>>,
+    ) -> bool {
         // Do not cache if prefix caching disabled
         if self.no_prefix_cache {
-            return;
+            return false;
         }
 
         // For paged attention, prefix caching is handled by the KVCacheManager.
         // PrefixCacheManagerV2 only handles non-paged attention caching.
         if self.has_paged_attention {
-            return;
+            return false;
         }
 
         // Feed the eviction scorer a MEASURED cost. `total_prompt_time` is set
         // by the engine from the real prefill duration
         // (`engine/mod.rs:523`, `:1015`); when it is absent or rounds to zero
         // milliseconds the observation is dropped rather than guessed at.
-        if let (Some(ms), toks) = (seq.total_prompt_time, seq.prompt_tokens()) {
-            let elapsed_ns = u64::try_from(ms)
-                .unwrap_or(u64::MAX)
-                .saturating_mul(1_000_000);
-            self.caches.observe_prefill(toks, elapsed_ns);
+        //
+        // Observed at most ONCE per sequence: publishing at prefill completion
+        // and again at request completion would feed the scorer the same
+        // measurement twice and double `cost_samples`.
+        if !seq.prefill_published() {
+            if let (Some(ms), toks) = (seq.total_prompt_time, seq.prompt_tokens()) {
+                let elapsed_ns = u64::try_from(ms)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(1_000_000);
+                self.caches.observe_prefill(toks, elapsed_ns);
+            }
         }
 
         // 🔑 THE READER THAT WOULD BE POISONED. A sequence that was part of a
@@ -225,13 +281,22 @@ impl PrefixCacheManagerV2 {
         // for data only re-read on a membership change), so the deferral is
         // paid here instead — at the read, where it is one sequence rather than
         // `O(B x layers)` per step. A no-op for every non-ragged sequence.
+        //
+        // This guard covers the mid-flight publication too, and that is why the
+        // two paths share this body: a partially-written entry is exactly the
+        // hazard it exists for. A sequence that has just PREFILLED out of a
+        // front-aligned ragged cohort carries the same zero-filled dead prefix
+        // as one that has just finished, and here the strip is not merely
+        // deferred but *earlier* than `clone_in_cache` would have paid it —
+        // which is equivalent, because `take_pending_lead_pad` removes the
+        // record and the later `clone_in_cache` then finds `lead == 0`.
         if let Err(e) = crate::kv_cache::strip_pending_lead_pad(seq, false) {
             tracing::warn!(
                 "prefix cache: refusing to store sequence {} — could not drop its ragged \
                  dead prefix ({e}). Storing it would cache zero-filled K/V as content.",
                 seq.id()
             );
-            return;
+            return false;
         }
 
         let cache = seq.normal_cache().to_vec();
@@ -252,6 +317,12 @@ impl PrefixCacheManagerV2 {
         // reach `len - 1` while the cache stops at `len - u`. Capping the
         // key at `cache_len + 1` restores the guard's arithmetic exactly,
         // and is a no-op whenever `u == 1`.
+        //
+        // The cap is what makes a PARTIAL entry safe as well: a sequence
+        // published mid-flight is keyed by the prefix its cache actually
+        // covers, so it can no more over-claim than a finished one can. It is
+        // read from the live cache rather than from any notion of "how far
+        // this request has got", so it is true whenever it is taken.
         let cache_len = seq.cache_bucket_len();
         let toks = seq.get_toks();
         let key_len = toks.len().min(cache_len + 1);
@@ -268,6 +339,7 @@ impl PrefixCacheManagerV2 {
         // key, so the second copy was not stored. Those bytes show up in
         // `share_stats().bytes_saved()`.
         let _ = self.caches.insert(&key, element, layout);
+        true
     }
 
     /// Evict the caches. This will evict the first k seqs such that the number of sequences on device after the copy is
@@ -712,6 +784,108 @@ mod tests {
         }
         let stats = m.share_stats();
         assert_eq!(stats.tokens_not_recomputed(), 64);
+    }
+
+    /// 🔴 THE DISCRIMINATOR. Two concurrent requests behind one cold system
+    /// prompt: the second must see the first's KV as soon as the first's
+    /// PREFILL is done, not when the first request finishes generating.
+    ///
+    /// Before `add_prefilled_sequence`, `add_sequence` was reachable only from
+    /// inside `if let Some(reason) = is_done` (`pipeline/sampling.rs:264`,
+    /// `:423`), so nothing at all was published while a request ran and this
+    /// lookup returned `None` — K requests on one 2,048-token system prompt
+    /// each paid the full 5.90 s prefill instead of `5.90 s + (K-1) x eps`.
+    #[test]
+    fn a_shared_prefix_is_visible_before_the_producing_request_finishes() {
+        let mut m = PrefixCacheManagerV2::new(16, false, false);
+        let system: Vec<u32> = (0..64).collect();
+
+        // Request A: the 64-token system prompt plus its own 2-token question,
+        // one step past prefill — 66 tokens of KV, and the token it just
+        // sampled appended but not yet cached (`cache_len == len - 1`, the
+        // invariant `add_sequence`'s key cap is built on).
+        let mut a_toks = system.clone();
+        a_toks.extend([700, 701, 900]);
+        let mut a = seq_with(a_toks, 66, 4, DType::BF16);
+        m.add_prefilled_sequence(&mut a, None);
+        assert!(
+            a.prefill_published(),
+            "the sequence must record that its prefill was published, so the \
+             measured prefill cost is not observed twice when it finishes"
+        );
+
+        // A has NOT finished — `add_sequence` was never called for it.
+        // Request B shares the system prompt and diverges after it.
+        let mut b_toks = system.clone();
+        b_toks.extend([800, 801]);
+        let hit = m
+            .search_for_matching_cache(&b_toks, None, None)
+            .unwrap()
+            .expect(
+                "a concurrent request sharing the 64-token system prompt must be \
+                 served from the still-running request's prefill",
+            );
+        let MatchingCache::Normal { offset, toks, .. } = hit;
+        assert_eq!(
+            offset, 64,
+            "the whole shared system prompt must be reused, not recomputed"
+        );
+        assert_eq!(toks, vec![800, 801], "only B's own tokens are left to run");
+    }
+
+    /// A partial entry must not over-claim any more than a final one can. The
+    /// key is capped at what the cache covers, so a query that shares more
+    /// tokens than the producing sequence had computed at publication time is
+    /// served the covered prefix — never the uncomputed remainder.
+    #[test]
+    fn a_partial_entry_never_serves_more_than_it_had_computed() {
+        let mut m = PrefixCacheManagerV2::new(16, false, false);
+        let base: Vec<u32> = (0..64).collect();
+        // Published while only 40 of the 64 tokens were in the cache.
+        let mut seq = seq_with(base.clone(), 40, 2, DType::BF16);
+        m.add_prefilled_sequence(&mut seq, None);
+
+        let mut query = base.clone();
+        query.push(900);
+        let hit = m.search_for_matching_cache(&query, None, None).unwrap();
+        match hit {
+            None => {}
+            Some(MatchingCache::Normal { offset, normal, .. }) => {
+                assert!(
+                    offset <= 40,
+                    "a partial entry served {offset} tokens from a 40-token cache"
+                );
+                for layer in normal.iter().flatten() {
+                    assert!(layer.current_seq_len() <= 40);
+                }
+            }
+        }
+    }
+
+    /// The ragged dead-prefix guard covers the mid-flight publication too — a
+    /// partially-written entry is exactly the hazard it exists for, so the two
+    /// paths share one body rather than the new one bypassing it.
+    #[test]
+    fn a_prefilled_ragged_sequence_does_not_poison_the_prefix_cache() {
+        let mut m = PrefixCacheManagerV2::new(16, false, false);
+        let base: Vec<u32> = (0..64).collect();
+        let mut seq = seq_with(base.clone(), base.len(), 4, DType::BF16);
+
+        // Row 1 of a cohort front-aligned to 64: 4 dead columns at the front.
+        crate::kv_cache::test_support::set_pending_lead_pad(*seq.id(), 4);
+
+        m.add_prefilled_sequence(&mut seq, None);
+
+        for layer in seq.normal_cache().iter().flatten() {
+            assert_eq!(
+                layer.current_seq_len(),
+                60,
+                "the dead prefix must be dropped before a mid-flight entry is \
+                 stored — storing 64 would publish 4 zero-filled K/V rows as \
+                 content to every later request matching this prefix"
+            );
+        }
+        assert_eq!(m.share_stats().entries, 1);
     }
 
     /// The over-claim guard, on a production-shaped cache. A key longer than

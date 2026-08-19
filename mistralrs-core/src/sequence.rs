@@ -452,6 +452,13 @@ pub struct Sequence {
     /// Number of tokens at the start of the prompt that are cached (KV already computed).
     /// These tokens should be skipped during prefill.
     prefix_cache_len: usize,
+    /// Has this sequence's prefill already been published to the prefix cache
+    /// (and its measured prefill cost already fed to the eviction scorer)?
+    ///
+    /// Set by `PrefixCacheManagerV2::add_prefilled_sequence`, read by
+    /// `add_sequence` so the same prefill measurement is not observed twice
+    /// when the sequence later finishes and stores its full payload.
+    prefill_published: bool,
 
     // Cache
     normal_cache: Vec<Option<KvCache>>,
@@ -589,6 +596,7 @@ impl Sequence {
             prefill_prompt_toks: None,
             prefill_seqlen_offset: None,
             prefix_cache_len: 0,
+            prefill_published: false,
             suffix,
             prefix,
             cumulative_logprob: 0.,
@@ -742,6 +750,16 @@ impl Sequence {
     /// Set the number of prefix tokens that are cached.
     pub fn set_prefix_cache_len(&mut self, len: usize) {
         self.prefix_cache_len = len;
+    }
+
+    /// Has this sequence's prefill already been published to the prefix cache?
+    pub fn prefill_published(&self) -> bool {
+        self.prefill_published
+    }
+
+    /// Mark this sequence's prefill as published. See [`Self::prefill_published`].
+    pub fn set_prefill_published(&mut self) {
+        self.prefill_published = true;
     }
 
     /// Override the maximum generation length.

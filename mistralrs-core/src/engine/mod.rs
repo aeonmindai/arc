@@ -603,6 +603,51 @@ impl Engine {
                             seq.total_prompt_time = Some(prompt_exec_time.as_millis());
                             seq.step_start_instant = None;
                         }
+
+                        // 🔑 Publish each prompt's KV NOW, while its request is
+                        // still generating.
+                        //
+                        // Until this ran, `prefix_cacher.add_sequence` had two
+                        // callers and both sat inside `if let Some(reason) =
+                        // is_done` (`pipeline/sampling.rs:264`, `:423`), so a
+                        // 2,048-token system prompt stayed invisible to every
+                        // other request for the whole generation that followed
+                        // it — tens of seconds during which each arrival paid
+                        // the full prefill again.
+                        //
+                        // Here rather than in `sampling.rs` because this is the
+                        // one place that knows a *prompt* step just completed,
+                        // and it has already stamped `total_prompt_time`, which
+                        // is the measured cost the eviction scorer wants. A
+                        // `OneShot` sequence is skipped: it was just set to
+                        // `Done`, has no continuation, and the finish path
+                        // stores it anyway.
+                        {
+                            let mut prefix_cacher = get_mut_arcmutex!(self.prefix_cacher);
+                            let pipeline = get_mut_arcmutex!(self.pipeline);
+                            let is_hybrid = !self.no_kv_cache && pipeline.cache().is_hybrid();
+                            for seq in scheduled.prompt.iter_mut() {
+                                if !matches!(
+                                    seq.sequence_stepping_type(),
+                                    SeqStepType::PromptAndDecode
+                                ) {
+                                    continue;
+                                }
+                                let recurrent_snapshots = if is_hybrid {
+                                    seq.recurrent_state_idx().and_then(|idx| {
+                                        pipeline.cache().hybrid().snapshot_recurrent_state(idx).ok()
+                                    })
+                                } else {
+                                    None
+                                };
+                                prefix_cacher.add_prefilled_sequence(seq, recurrent_snapshots);
+                            }
+                            if let Err(e) = prefix_cacher.evict_caches() {
+                                tracing::warn!(
+                                    "prefix cache: eviction after prefill publication failed: {e}"
+                                );
+                            }
+                        }
                         last_completion_ids = vec![];
                     }
 
