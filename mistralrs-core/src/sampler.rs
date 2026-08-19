@@ -435,6 +435,39 @@ impl Sampler {
         !self.logits_processors.is_empty()
     }
 
+    /// True when a penalty would rewrite the logits before the token is picked.
+    ///
+    /// Single source of truth for the condition: [`Self::sample`]'s GPU fast
+    /// path reads it as `!has_penalties()`, and [`Self::is_raw_argmax`] reads it
+    /// directly. Two copies of this expression could disagree, and the one that
+    /// disagreed would be a silent correctness bug rather than a slow path.
+    fn has_penalties(&self) -> bool {
+        self.frequency_penalty.unwrap_or(0.0) != 0.0
+            || self.presence_penalty.unwrap_or(0.0) != 0.0
+            || self.repetition_penalty.unwrap_or(1.0) != 1.0
+            || self.dry_params.is_some()
+    }
+
+    /// True when this sampler is exactly `argmax` over the model's **raw**
+    /// logits — no temperature, no penalties, no custom logits processors.
+    ///
+    /// This is the precondition for any fast path that substitutes its own
+    /// `argmax` for [`Self::sample`], which is what speculative verification
+    /// does: `MtpSpeculativePipeline` accepts a draft token when it equals
+    /// `argmax(target_logits)`, computed on the raw logits.
+    ///
+    /// [`Self::is_greedy`] alone is **not** that precondition. With
+    /// `temperature: None` and any penalty or processor set, [`Self::sample`]
+    /// still runs `apply_penalties` and every `logits_processor` *before*
+    /// `sample_argmax` (`sampler.rs`, the CPU path), so the token it returns can
+    /// differ from `argmax(raw)`. Top-k / top-p / min-p do **not** need gating:
+    /// they are only consulted on the `Some(temperature)` branch. Nor does
+    /// top-nσ: it masks tokens *below* the maximum, so the argmax is invariant
+    /// under it.
+    pub fn is_raw_argmax(&self) -> bool {
+        self.is_greedy() && !self.has_penalties() && self.logits_processors.is_empty()
+    }
+
     fn get_top_logprobs(&self, probs: &[f32]) -> Result<Vec<TopLogprob>> {
         let k = self.top_n_logprobs.min(probs.len());
         if k == 0 {
@@ -1246,10 +1279,7 @@ impl Sampler {
         // no logprobs, no speculative sampling) we can stay entirely on GPU
         // and ship a single u32 token back. This skips the ~5.9 ms/token
         // CPU pipeline (D2H 152K logits + softmax + topk/topp + multinomial).
-        let no_penalties = self.frequency_penalty.unwrap_or(0.0) == 0.0
-            && self.presence_penalty.unwrap_or(0.0) == 0.0
-            && self.repetition_penalty.unwrap_or(1.0) == 1.0
-            && self.dry_params.is_none();
+        let no_penalties = !self.has_penalties();
         let trivial = !sample_speculative
             && !return_logprobs
             && self.logits_processors.is_empty()
@@ -1533,6 +1563,98 @@ mod tests {
         assert_eq!(s_topp.frequency_penalty(), Some(0.1));
         assert_eq!(s_topp.presence_penalty(), Some(0.2));
         assert_eq!(s_topp.top_nsigma(), None);
+    }
+
+    /// `is_raw_argmax` is the precondition for substituting an external
+    /// `argmax(raw logits)` for [`Sampler::sample`] — which is exactly what
+    /// speculative verification does.
+    ///
+    /// It is **strictly stronger than `is_greedy`**, and the gap is the point:
+    /// with `temperature: None` and a penalty (or a logits processor), `sample`
+    /// runs `apply_penalties` and every processor *before* `sample_argmax`, so
+    /// the token it returns is `argmax(modified)`, not `argmax(raw)`.
+    #[test]
+    fn is_raw_argmax_is_stronger_than_is_greedy() {
+        let mk = |temperature, freq, pres, rep, top_k, top_p, min_p, nsigma| {
+            super::Sampler::new(
+                temperature,
+                0,
+                None,
+                freq,
+                pres,
+                rep,
+                None,
+                top_k,
+                top_p,
+                min_p,
+                nsigma,
+                vec![],
+            )
+            .unwrap()
+        };
+
+        // Plain greedy: both hold.
+        let plain = mk(None, None, None, None, -1, 1.0, 0.0, None);
+        assert!(plain.is_greedy());
+        assert!(plain.is_raw_argmax());
+
+        // temperature > 0: neither.
+        let hot = mk(Some(0.7), None, None, None, -1, 1.0, 0.0, None);
+        assert!(!hot.is_greedy());
+        assert!(!hot.is_raw_argmax());
+
+        // The gap: greedy, but the logits get rewritten first.
+        for (freq, pres, rep) in [
+            (Some(0.5), None, None),
+            (None, Some(0.5), None),
+            (None, None, Some(1.1)),
+        ] {
+            let penalised = mk(None, freq, pres, rep, -1, 1.0, 0.0, None);
+            assert!(penalised.is_greedy(), "still temperature-free");
+            assert!(
+                !penalised.is_raw_argmax(),
+                "a penalty rewrites the logits before argmax, so argmax(raw) is a \
+                 different token"
+            );
+        }
+
+        // Identity penalties are not penalties.
+        let identity = mk(None, Some(0.0), Some(0.0), Some(1.0), -1, 1.0, 0.0, None);
+        assert!(identity.is_raw_argmax());
+
+        // top-k / top-p / min-p are only consulted on the `Some(temperature)`
+        // branch, so they cannot move a greedy argmax…
+        let filtered = mk(None, None, None, None, 40, 0.95, 0.05, None);
+        assert!(filtered.is_raw_argmax());
+
+        // …and top-nσ masks only tokens BELOW the maximum, so the argmax is
+        // invariant under it too.
+        let nsigma = mk(None, None, None, None, -1, 1.0, 0.0, Some(1.5));
+        assert!(nsigma.is_raw_argmax());
+
+        // A custom logits processor runs before argmax on the CPU path.
+        let with_processor = super::Sampler::new(
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            -1,
+            1.0,
+            0.0,
+            None,
+            vec![std::sync::Arc::new(
+                |logits: &candle_core::Tensor, _: &[u32]| Ok(logits.clone()),
+            )],
+        )
+        .unwrap();
+        assert!(with_processor.is_greedy());
+        assert!(
+            !with_processor.is_raw_argmax(),
+            "a processor may rewrite the logits, and the sampler cannot know it did not"
+        );
     }
 
     /// Build a sampler with only temperature + top-nσ active (no top-k/p/min-p,
