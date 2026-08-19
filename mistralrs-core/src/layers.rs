@@ -2705,7 +2705,17 @@ pub fn graph_ring_slot(positions: &Tensor, capacity: usize) -> Result<Tensor> {
     // bake: `capacity` is fixed for the life of the run. Only the position is
     // allowed to vary between replays, and it is read from device memory.
     let blocks = p.affine(1.0 / capacity as f64, 0.0)?.floor()?;
-    (p - (blocks * capacity as f64)?)?.to_dtype(DType::U32)
+    let rem = (&p - (blocks * capacity as f64)?)?;
+    // `1.0 / capacity` is exact in binary only when `capacity` is a power of
+    // two (V4's `sliding_window` is 128, so it is — but this must not depend on
+    // that). Otherwise `p * (1/capacity)` can round just below an integer at
+    // `p` an exact multiple of `capacity`, the `floor` loses a block, and the
+    // remainder comes out as `capacity` — one slot PAST the window, i.e. an
+    // out-of-bounds KV write. The rounding error is bounded by well under one
+    // ulp of the quotient, so the remainder is in `[0, capacity]` and a single
+    // correction is exact for every input.
+    let over = rem.ge(capacity as f64)?.to_dtype(DType::F32)?;
+    (rem - (over * capacity as f64)?)?.to_dtype(DType::U32)
 }
 
 /// Check if graph-mode positions are set.
