@@ -2842,7 +2842,10 @@ impl QtipLayer {
         let n = scales_data.len();
         let k_in = self.in_features;
         let num_symbols = rung.num_symbols(k_in);
-        let packed_per_row = rung.packed_bytes(num_symbols);
+        // The allocated STRIDE, not the data length: rows carry tail padding
+        // so the kernel's compile-time-width extraction needs no clamp, and
+        // that padding is part of what the artifact stores.
+        let packed_per_row = rung.row_stride(num_symbols);
         if blocks_data.len() != n * packed_per_row {
             candle_core::bail!(
                 "QtipLayer[{}]: blocks hold {} B but {n} rows × {packed_per_row} B = {}",
@@ -7761,7 +7764,7 @@ mod tests {
         let geo = QtipGeometry::trellis_v4l12(9)?;
         let rung = trellis_v4l12::Rung::new(9).map_err(candle_core::Error::Msg)?;
         let n_sym = rung.num_symbols(k_in);
-        let row_bytes = rung.packed_bytes(n_sym);
+        let row_bytes = rung.row_stride(n_sym);
 
         let mut packed = Vec::with_capacity(n * row_bytes);
         for row in 0..n {
@@ -7819,7 +7822,7 @@ mod tests {
 
         let rung = trellis_v4l12::Rung::new(9).unwrap();
         let n_sym = rung.num_symbols(k_in);
-        let row_bytes = rung.packed_bytes(n_sym);
+        let row_bytes = rung.row_stride(n_sym);
         let lut = trellis_v4l12::gaussian_lut_bf16();
         for row in 0..n {
             let mut want = vec![0f32; k_in];
