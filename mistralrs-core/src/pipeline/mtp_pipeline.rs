@@ -52,8 +52,15 @@
 //!
 //! # Constraints (this module)
 //!
-//! - **Greedy only**: argmax sampling for proposals. Stochastic temperature
-//!   sampling requires probability-comparison verification (follow-up).
+//! - **Greedy only, and now enforced**: proposals are argmax, and verification
+//!   accepts a draft when it equals the target's `argmax(raw logits)`. That is
+//!   lossless only for a request whose sampler *is* that argmax, so any other
+//!   request — `temperature > 0`, a repetition/frequency/presence/DRY penalty,
+//!   a custom logits processor — **drafts nothing** and decodes through the
+//!   real sampler ([`seq_may_draft`]). Before that gate existed, such a request
+//!   silently received greedy tokens (with `logprob: 0.0`) at every accepted
+//!   draft position, which DOCTRINE D4 bans. Serving `temperature > 0` *with*
+//!   MTP needs probability-comparison acceptance (follow-up).
 //! - **MTP transformer block**: V4 ships a full decoder layer (attention +
 //!   MoE) at `mtp.0.*`. It is loaded only when `--mtp-depth > 0`
 //!   ([`set_mtp_load_depth`]) — ~3GB at FP8, ~800MB after qtip2 ISQ — and
@@ -1380,6 +1387,11 @@ pub struct MtpSpeculativePipeline {
     /// Latches so the "drafting skipped, draft KV unprimed" explanation is
     /// logged once per process rather than once per token.
     warned_unprimed: std::sync::atomic::AtomicBool,
+    /// The same latch for the sampling gate ("this request is not greedy, so it
+    /// gets no drafts"). Separate from [`Self::warned_unprimed`] because the two
+    /// have different causes and different fixes, and a shared latch would let
+    /// whichever fired first hide the other.
+    warned_non_greedy: std::sync::atomic::AtomicBool,
     /// How this pipeline advances the KV cache after a verify. Latched on the
     /// first fast-path step (the cache's slot kinds are fixed by then) so the
     /// decision and its reason are logged once, not once per token.
@@ -1453,6 +1465,7 @@ impl MtpSpeculativePipeline {
             draft_kv: std::sync::Mutex::new(std::collections::HashMap::new()),
             draft_kv_clock: AtomicUsize::new(0),
             warned_unprimed: std::sync::atomic::AtomicBool::new(false),
+            warned_non_greedy: std::sync::atomic::AtomicBool::new(false),
             kv_advance: std::sync::OnceLock::new(),
         })
     }
@@ -1485,6 +1498,7 @@ impl MtpSpeculativePipeline {
             draft_kv: std::sync::Mutex::new(std::collections::HashMap::new()),
             draft_kv_clock: AtomicUsize::new(0),
             warned_unprimed: std::sync::atomic::AtomicBool::new(false),
+            warned_non_greedy: std::sync::atomic::AtomicBool::new(false),
             kv_advance: std::sync::OnceLock::new(),
         }
     }
@@ -1885,6 +1899,31 @@ impl MtpSpeculativePipeline {
 
     /// Log the "draft KV could not be primed, drafting skipped" explanation
     /// once per process.
+    /// Say once that a request is being served without MTP because its sampler
+    /// is not a plain argmax.
+    ///
+    /// The defect this gate fixes was invisible: `temperature > 0` requests were
+    /// silently getting greedy tokens at every accepted draft position. A silent
+    /// *refusal* would only move the silence, so the reason is stated — once per
+    /// process, because this runs on the decode hot path.
+    fn warn_non_greedy_once(&self, seq_id: usize) {
+        if !self
+            .warned_non_greedy
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(
+                target: "mtp_speculative",
+                "MTP drafting disabled for sequence {seq_id} (and any other request like it): \
+                 its sampler is not a plain argmax over raw logits — temperature > 0, a \
+                 repetition/frequency/presence/DRY penalty, or a custom logits processor. MTP \
+                 verification accepts a draft when it equals argmax(target logits), so \
+                 committing it would substitute GREEDY decode at every accepted position, \
+                 which DOCTRINE D4 bans. Skipping is lossless; this request decodes at plain \
+                 target speed with its own sampling settings intact."
+            );
+        }
+    }
+
     fn warn_unprimed_once(&self, reason: &str) {
         if !self
             .warned_unprimed
@@ -2343,6 +2382,60 @@ pub(crate) const fn draft_group_key(
     } else {
         (uncached, cache_len + uncached - 2)
     }
+}
+
+/// Whether this sequence's **own sampler** admits MTP drafting.
+///
+/// MTP's verifier accepts a draft token when it equals the target's
+/// `argmax(raw_logits)`, and commits it directly. That is lossless for exactly
+/// one kind of request: one whose sampler *is* `argmax` over raw logits. For
+/// any other — `temperature > 0`, a repetition/frequency/presence/DRY penalty,
+/// a custom logits processor — the sampler would have picked a different token,
+/// so committing the draft silently substitutes greedy decode at every accepted
+/// position (with `logprob: 0.0` besides).
+///
+/// DOCTRINE **D4 bans greedy decoding**, so that substitution is a doctrine
+/// violation happening invisibly, in production, to any `temperature > 0`
+/// request.
+///
+/// Refusing to draft is the lossless answer, and it is refused **per sequence,
+/// not per batch**: sampling parameters are fixed for a sequence but batch
+/// composition is not, and the fast path's own contract is that every condition
+/// gating it is static for a sequence — "a sequence that once entered the fast
+/// path cannot be handed to the target mid-run with an uncached tail it would
+/// misread". A batch-level gate would break exactly that, because a
+/// `temperature > 0` arrival would eject a greedy sequence that is already
+/// carrying a multi-token uncached tail. A per-sequence refusal is just the
+/// `drafts[i].is_empty()` state the draft KV already produces whenever it cannot
+/// prime, which every downstream step already handles.
+pub(crate) fn seq_may_draft(seq: &mut Sequence) -> bool {
+    seq.sampler().is_raw_argmax()
+}
+
+/// Partition the rows that may draft into groups that can share one batched
+/// MTP-block forward.
+///
+/// Split out of the step so the sampling gate is provable without standing up a
+/// pipeline: a row with `may_draft[i] == false` must appear in **no** group, and
+/// therefore leaves the drafting section with `drafts[i]` empty.
+pub(crate) fn draft_groups(
+    uncached: &[usize],
+    cache_lens: &[usize],
+    may_draft: &[bool],
+    w: usize,
+    per_seq_advance: bool,
+) -> std::collections::BTreeMap<(usize, usize), Vec<usize>> {
+    let mut groups: std::collections::BTreeMap<(usize, usize), Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (i, &u) in uncached.iter().enumerate() {
+        if u < w && may_draft[i] {
+            groups
+                .entry(draft_group_key(u, cache_lens[i], per_seq_advance))
+                .or_default()
+                .push(i);
+        }
+    }
+    groups
 }
 
 /// Row `i`'s absolute chain start: the position of the pair
@@ -3219,17 +3312,21 @@ impl Pipeline for MtpSpeculativePipeline {
         // silent: a row whose seed is not at the group's chain start is dropped
         // by the seed check below, so it would stop drafting with no signal but
         // a falling `tok_per_step`.
+        //
+        // 🔴 `may_draft[i]` is the sampling gate. A sequence whose sampler is
+        // not a plain argmax over raw logits drafts NOTHING — see
+        // [`seq_may_draft`]. It stays in the batch, feeds its uncached tail plus
+        // padding into the same window, and takes its one token out of
+        // `sample_sequence` at the bottom of this function, which is plain
+        // decode with that request's own temperature and penalties.
         let mut drafts: Vec<Vec<u32>> = vec![Vec::new(); batch];
-        let mut groups: std::collections::BTreeMap<(usize, usize), Vec<usize>> =
-            std::collections::BTreeMap::new();
-        for (i, &u) in uncached.iter().enumerate() {
-            if u < w {
-                groups
-                    .entry(draft_group_key(u, cache_lens[i], per_seq_advance))
-                    .or_default()
-                    .push(i);
+        let may_draft: Vec<bool> = input_seqs.iter_mut().map(|s| seq_may_draft(s)).collect();
+        for (i, allowed) in may_draft.iter().enumerate() {
+            if !allowed {
+                self.warn_non_greedy_once(seq_ids[i]);
             }
         }
+        let groups = draft_groups(&uncached, &cache_lens, &may_draft, w, per_seq_advance);
         for ((u, _), members) in groups {
             let n_draft = w - u;
             let mut rows: Vec<usize> = Vec::with_capacity(members.len());
@@ -3485,9 +3582,21 @@ impl Pipeline for MtpSpeculativePipeline {
         };
 
         // ---- Commit ----
+        //
+        // Accepted drafts are emitted directly, bypassing `sample_sequence`.
+        // That is only sound because [`seq_may_draft`] refused to draft for any
+        // sequence whose sampler is not `argmax(raw logits)`: such a sequence
+        // has `accepted[i].is_empty()` here, so this loop is a no-op for it and
+        // its single token comes out of the real sampler below. Widening the
+        // gate without also widening this emission is how the greedy
+        // substitution came back.
         for i in 0..batch {
             let u = uncached[i];
             let n_acc = accepted[i].len();
+            debug_assert!(
+                n_acc == 0 || may_draft[i],
+                "a sequence that may not draft must never have an accepted draft to commit"
+            );
             let seq = &mut input_seqs[i];
             for &tok in &accepted[i] {
                 let lp = crate::sampler::Logprobs {
@@ -3666,9 +3775,14 @@ impl MistralRsBuilder {
 /// - If the target does NOT advertise an MTP head, an `info!` warning is logged
 ///   and the original `target` is returned unwrapped (lossless fallback).
 ///
-/// The wrapper itself preserves greedy-decode equivalence with the bare target:
-/// MTP accept/reject is lossless by construction, so cos-sim against the
-/// non-MTP path is identical for the same prompt + same sampling seed.
+/// The wrapper is output-equivalent to the bare target for **every** request,
+/// not only greedy ones. For a request whose sampler is `argmax(raw logits)`,
+/// MTP accept/reject is lossless by construction. For any other request —
+/// `temperature > 0`, a penalty, a custom logits processor — the wrapper
+/// declines to draft ([`seq_may_draft`]) and every token comes out of
+/// `sample_sequence` exactly as it would without MTP. Wrapping therefore never
+/// changes what a request receives; it only changes how fast a greedy one
+/// receives it.
 ///
 /// # Arguments
 ///
@@ -4696,6 +4810,199 @@ mod tests {
         fn mtp_decode_kit(&self) -> Option<MtpDecodeKit> {
             self.kit.clone()
         }
+    }
+
+    /// Build a `Sequence` whose sampler carries exactly the settings under
+    /// test. Mirrors `pipeline::amoe::new_dummy_seq` — no model, no engine.
+    fn seq_with_sampler(sampler: crate::sampler::Sampler) -> Sequence {
+        use crate::sequence::{SequenceGroup, SequenceRecognizer};
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let group = Arc::new(std::sync::Mutex::new(SequenceGroup::new(
+            1, false, false, None,
+        )));
+        Sequence::new_waiting(
+            vec![1, 2, 3],
+            "test".to_string(),
+            0,
+            0,
+            1,
+            tx,
+            sampler,
+            vec![],
+            vec![],
+            None,
+            false,
+            false,
+            group,
+            0,
+            0,
+            SequenceRecognizer::None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            crate::sequence::SeqStepType::PromptAndDecode,
+            None,
+            None,
+            None,
+            false,
+            vec![],
+        )
+    }
+
+    /// A sampler with everything off except the one knob under test.
+    fn sampler_with(
+        temperature: Option<f64>,
+        frequency_penalty: Option<f32>,
+        presence_penalty: Option<f32>,
+        repetition_penalty: Option<f32>,
+    ) -> crate::sampler::Sampler {
+        crate::sampler::Sampler::new(
+            temperature,
+            0,
+            None,
+            frequency_penalty,
+            presence_penalty,
+            repetition_penalty,
+            None,
+            -1,
+            1.0,
+            0.0,
+            None,
+            vec![],
+        )
+        .expect("Sampler::new with plain settings must succeed")
+    }
+
+    /// **The doctrine violation this gate closes (D4: greedy decoding is
+    /// banned).**
+    ///
+    /// A `temperature > 0` request must not take the MTP path. Accepted drafts
+    /// are committed straight to the sequence with `logprob: 0.0`, bypassing
+    /// `sample_sequence` entirely — so if such a request were allowed to draft,
+    /// it would receive **greedy** tokens at every accepted position while its
+    /// caller believed it had asked for sampling.
+    #[test]
+    fn a_temperature_request_does_not_take_the_mtp_path() {
+        // Greedy: drafts.
+        let mut greedy = seq_with_sampler(sampler_with(None, None, None, None));
+        assert!(
+            seq_may_draft(&mut greedy),
+            "a plain greedy request is exactly what MTP verification is lossless for"
+        );
+
+        // temperature > 0: must not draft.
+        for temperature in [0.1, 0.7, 1.0, 2.0] {
+            let mut hot = seq_with_sampler(sampler_with(Some(temperature), None, None, None));
+            assert!(
+                !seq_may_draft(&mut hot),
+                "temperature={temperature} must not draft: MTP would commit argmax tokens \
+                 through a path that never calls the sampler"
+            );
+        }
+
+        // temperature below the sampler's own greedy threshold (1e-7) IS
+        // greedy — `Sampler::new` folds it to `None` — so it may draft. Reading
+        // the raw request field instead of the sampler's effective setting
+        // would wrongly refuse here.
+        let mut effectively_greedy = seq_with_sampler(sampler_with(Some(1e-9), None, None, None));
+        assert!(
+            seq_may_draft(&mut effectively_greedy),
+            "a temperature the sampler itself folds to greedy must still draft"
+        );
+
+        // The same defect, same shape: with any penalty the sampler rewrites
+        // the logits before its own argmax, so argmax(raw) is not what the
+        // request would have got.
+        for (freq, pres, rep) in [
+            (Some(0.5), None, None),
+            (None, Some(0.5), None),
+            (None, None, Some(1.1)),
+        ] {
+            let mut penalised = seq_with_sampler(sampler_with(None, freq, pres, rep));
+            assert!(
+                !seq_may_draft(&mut penalised),
+                "greedy + a penalty is still not argmax over RAW logits"
+            );
+        }
+
+        // A zero/identity penalty is not a penalty.
+        let mut identity = seq_with_sampler(sampler_with(None, Some(0.0), Some(0.0), Some(1.0)));
+        assert!(
+            seq_may_draft(&mut identity),
+            "an identity penalty must not cost a request its speculative decode"
+        );
+    }
+
+    /// The gate has to reach the drafting partition, not just exist: a sequence
+    /// that may not draft must appear in **no** draft group, which is what
+    /// leaves `drafts[i]` empty and routes its token through `sample_sequence`.
+    #[test]
+    fn a_sequence_that_may_not_draft_is_in_no_draft_group() {
+        const W: usize = 3;
+        // Three sequences, identical in every way the partition cares about
+        // (same uncached tail, same cache length) so the ONLY thing that can
+        // separate them is the sampling gate.
+        let uncached = vec![1usize, 1, 1];
+        let cache_lens = vec![10usize, 10, 10];
+
+        let all_greedy = draft_groups(&uncached, &cache_lens, &[true, true, true], W, false);
+        let members: Vec<usize> = all_greedy.values().flatten().copied().collect();
+        assert_eq!(
+            members,
+            vec![0, 1, 2],
+            "with every sequence greedy, all three draft together"
+        );
+
+        let middle_hot = draft_groups(&uncached, &cache_lens, &[true, false, true], W, false);
+        let members: Vec<usize> = middle_hot.values().flatten().copied().collect();
+        assert_eq!(
+            members,
+            vec![0, 2],
+            "the non-greedy sequence must be in no group at all — and the greedy \
+             sequences beside it must keep drafting, so one hot request does not \
+             cost the whole batch its speculative decode"
+        );
+
+        let none = draft_groups(&uncached, &cache_lens, &[false, false, false], W, false);
+        assert!(
+            none.is_empty(),
+            "an all-non-greedy batch produces no draft groups"
+        );
+
+        // A row already at the full window still cannot draft, gate or no gate —
+        // the pre-existing `u < w` rule is unchanged.
+        let full = draft_groups(&[W], &[10], &[true], W, false);
+        assert!(full.is_empty(), "u == w leaves no room for a draft");
+    }
+
+    /// What a non-drafting sequence's accounting looks like: `proposed == 0`,
+    /// so it contributes nothing to `accept_rate` and exactly one token per
+    /// step — plain decode, which is the definition of "did not take the MTP
+    /// path".
+    #[test]
+    fn a_non_drafting_sequence_accounts_as_plain_decode() {
+        let stat = MtpAcceptance::from_fused_verify(0, 0);
+        assert_eq!(stat.proposed, 0);
+        assert_eq!(stat.accepted, 0);
+        assert_eq!(
+            stat.drafted_steps, 0,
+            "a step with no proposals is not a draft"
+        );
+        assert_eq!(stat.committed, 1, "exactly the token the sampler produced");
+        assert_eq!(
+            stat.rate(),
+            None,
+            "a request that never drafted has no acceptance rate — 0/0 is not 0%"
+        );
+        assert_eq!(
+            stat.tokens_per_step(),
+            Some(1.0),
+            "the plain-decode multiplier"
+        );
     }
 
     /// `try_wrap_pipeline_with_mtp` with `mtp_depth == 0` is a perfect no-op:
