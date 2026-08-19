@@ -474,9 +474,23 @@ mod tests {
         }
 
         let build = include_str!("../../build.rs");
+        // The exclude list grows as more bit-identity-critical kernels are
+        // added (hc_fused.cu joined it), so match on the list's CONTENTS rather
+        // than on its exact spelling — otherwise this guard fails for the one
+        // reason that is not a regression, and gets "fixed" by weakening it.
+        let exclude = build
+            .split(".exclude(&[")
+            .nth(1)
+            .and_then(|s| s.split("])").next())
+            .expect("build.rs no longer calls .exclude(&[..]) on the fast-math builder");
         assert!(
-            build.contains(r#".exclude(&["sinkhorn.cu"])"#),
-            "build.rs no longer excludes sinkhorn.cu from the fast-math builder"
+            exclude.contains("\"sinkhorn.cu\""),
+            "build.rs no longer excludes sinkhorn.cu from the fast-math builder \
+             (exclude list is: {exclude})"
+        );
+        assert!(
+            build.contains(r#""src/cuda/sinkhorn.cu""#),
+            "build.rs no longer feeds sinkhorn.cu to the IEEE (no-fast-math) builder"
         );
         assert!(
             build.contains("--fmad=false"),
