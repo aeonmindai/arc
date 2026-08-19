@@ -100,10 +100,10 @@ pub(crate) use processing::{
 use rand_isaac::Isaac64Rng;
 pub use mtp_pipeline::{
     mtp_acceptance, mtp_acceptance_by_batch, mtp_acceptance_marker, mtp_acceptance_markers,
-    mtp_load_depth, mtp_uqff_bake, record_mtp_batch_step, record_mtp_step, reset_mtp_acceptance,
-    set_mtp_load_depth, set_mtp_uqff_bake, try_wrap_pipeline_with_mtp, verify_proposed,
-    CaptureOffsets, MtpAcceptance, MtpDecodeKit, MtpHiddenCapture, MtpSpeculativePipeline,
-    VerifyResult,
+    mtp_acceptance_position_lines, mtp_load_depth, mtp_uqff_bake, record_mtp_batch_step,
+    record_mtp_step, reset_mtp_acceptance, set_mtp_load_depth, set_mtp_uqff_bake,
+    try_wrap_pipeline_with_mtp, verify_proposed, CaptureOffsets, MtpAcceptance, MtpDecodeKit,
+    MtpHiddenCapture, MtpSpeculativePipeline, VerifyResult, MTP_MAX_TRACKED_POSITIONS,
 };
 /// The MTP rejection rollback, reachable from the V4 model's own tests so the
 /// cache it truncates (K/V **and** `XsRolling` entries) is the real one.

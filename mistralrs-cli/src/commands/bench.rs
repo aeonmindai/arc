@@ -208,6 +208,16 @@ fn report_mtp_acceptance(mtp_depth: usize) {
         for marker in markers {
             println!("{marker}");
         }
+        // The per-position breakdown, alongside the aggregate rather than
+        // instead of it. `accept_rate` is one scalar over the whole chain, and
+        // the same scalar is produced by a flat per-position profile (a
+        // target/draft distribution mismatch) and by a falling one (the draft
+        // compounding on its own hidden state) — which are different defects
+        // with different fixes. Printing only the scalar is what made the
+        // measured 0.4194 undiagnosable without a second GPU rental.
+        for line in mistralrs_core::mtp_acceptance_position_lines() {
+            println!("{line}");
+        }
         return;
     }
     if mtp_depth > 0 {
