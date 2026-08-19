@@ -2265,6 +2265,173 @@ pub fn verify_proposed(proposed: &[u32], target: &[u32]) -> VerifyResult {
     }
 }
 
+/// The debug env var that forces a synthetic accept length.
+///
+/// Named for what it does, and long enough that nobody sets it by accident.
+pub const SIMULATE_ACC_LEN_ENV: &str = "ARC_MTP_SIMULATE_ACC_LEN";
+
+/// **Debug-only.** Forces the accept/reject decision to a configured accept
+/// length instead of comparing draft tokens against the target's argmax.
+///
+/// # What this measures, and what it does NOT
+///
+/// **The drafter still runs at full cost.** Every draft forward, every draft-KV
+/// extend, every verify forward happens exactly as it would in a real run — only
+/// the accept/reject *decision* is synthetic. So this prices **acceptance**: it
+/// answers "what would Arc's throughput be if the draft head were good enough to
+/// hit `acc_len`", holding the drafter's cost fixed. It does **not** price
+/// removing the drafter, and it is not an upper bound on any design that makes
+/// drafting cheaper.
+///
+/// **The output text is garbage.** Draft tokens are committed whether or not
+/// they match the target, so the generated text is not the model's output and
+/// must never be scored, published, or compared for quality. Only timing and the
+/// KV bookkeeping are meaningful.
+///
+/// The second thing it buys is a defect probe: forcing accept lengths across the
+/// whole range drives the KV-rollback and ragged-verify paths (per-sequence
+/// advance, cohort min-rollback, the length-budget clamp) at accept patterns a
+/// real 0.42-acceptance drafter almost never produces — the region wave51 caught
+/// panicking.
+///
+/// # Units
+///
+/// `acc_len` is **committed tokens per MTP step**, matching the `acc_length`
+/// that speculative-decoding CI floors are quoted in (SGLang's DeepSeek V4 gate
+/// is `acc_length > 2.85`), and matching Arc's own `tok_per_step` on the
+/// marker line. It is *one more* than the number of accepted drafts, because a
+/// step always commits the target's own correction-or-bonus token. `acc_len =
+/// 1.0` means "accept nothing", which is plain decode.
+///
+/// Fractional targets are realised exactly, not by rounding: step `n` accepts
+/// `floor(m*n) - floor(m*(n-1))` drafts for `m = acc_len - 1`, so the running
+/// mean converges to `m` from a deterministic, reproducible sequence with no
+/// RNG. `ARC_MTP_SIMULATE_ACC_LEN=2.85` at depth 3 therefore alternates 1 and 2
+/// accepted drafts in the exact proportion that averages 1.85.
+///
+/// When a step cannot commit what the schedule asked for — the chain is shorter
+/// than the request, or the sequence's length budget binds — it commits what it
+/// can and the harness does **not** compensate on later steps. The reported
+/// `tok_per_step` is then what actually happened, which is the number worth
+/// having.
+///
+/// Prior art for the mechanism (an env-gated synthetic accept length that leaves
+/// the drafter running): SGLang's `SGLANG_SIMULATE_ACC_LEN`
+/// (`spec_utils.py:396-437`) and vLLM's `rejection_sample_method: synthetic`
+/// (`config/speculative.py:80,219-288`). The units and the dithering above are
+/// Arc's own and are specified here rather than inherited.
+#[derive(Debug)]
+pub struct SyntheticAcceptance {
+    /// Target accepted **drafts** per step: `acc_len - 1`.
+    mean_accepted: f64,
+    /// Steps handed out so far. The schedule is a pure function of this, so two
+    /// runs with the same flag produce the same accept sequence.
+    steps: AtomicUsize,
+}
+
+impl SyntheticAcceptance {
+    /// Build a harness for a target accept length in committed tokens per step.
+    ///
+    /// Returns `None` for a length below 1.0 or a non-finite one: a step always
+    /// commits at least the target's own token, so `acc_len < 1.0` describes
+    /// nothing that can happen and is a typo, not a request.
+    pub fn new(acc_len: f64) -> Option<Self> {
+        (acc_len.is_finite() && acc_len >= 1.0).then(|| Self {
+            mean_accepted: acc_len - 1.0,
+            steps: AtomicUsize::new(0),
+        })
+    }
+
+    /// Parse the flag's value. `None` when unset, empty, or unparsable —
+    /// with a warning in the last two cases, because a typo'd debug flag that
+    /// silently does nothing is how a session gets measured twice.
+    pub fn from_env_value(value: Option<&str>) -> Option<Self> {
+        let raw = value.map(str::trim).filter(|v| !v.is_empty())?;
+        match raw.parse::<f64>().ok().and_then(Self::new) {
+            Some(sim) => Some(sim),
+            None => {
+                tracing::warn!(
+                    target: "mtp_speculative",
+                    "{SIMULATE_ACC_LEN_ENV}={raw:?} is not a valid accept length \
+                     (expected a finite number >= 1.0, in committed tokens per step). \
+                     Synthetic acceptance stays OFF and this run measures the real drafter."
+                );
+                None
+            }
+        }
+    }
+
+    /// The target accept length this harness was configured with, in committed
+    /// tokens per step.
+    pub fn acc_len(&self) -> f64 {
+        self.mean_accepted + 1.0
+    }
+
+    /// How many drafts the next step should accept, before clamping to what the
+    /// step actually proposed.
+    #[allow(clippy::cast_precision_loss)] // step counts; >2^53 steps is not a case
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // floor of a >=0 f64
+    pub fn next_accept_len(&self) -> usize {
+        let n = self.steps.fetch_add(1, Ordering::Relaxed);
+        let cum = |k: usize| (self.mean_accepted * k as f64).floor() as usize;
+        cum(n + 1) - cum(n)
+    }
+}
+
+/// [`verify_proposed`], with the accept/reject decision optionally replaced by a
+/// synthetic accept length.
+///
+/// `sim: None` is exactly `verify_proposed` — the same call, not a copy of it,
+/// so the real path cannot drift from the tested one.
+///
+/// With `sim: Some(_)` the first `k` proposals are accepted **whether or not
+/// they match the target**, where `k` is the schedule's next value clamped to
+/// what this step could actually verify. The rejection, when there is one,
+/// still carries the target's real token at that slot, so the correction the
+/// caller commits is a real token and every downstream length invariant holds.
+pub fn verify_proposed_with(
+    proposed: &[u32],
+    target: &[u32],
+    sim: Option<&SyntheticAcceptance>,
+) -> VerifyResult {
+    let Some(sim) = sim else {
+        return verify_proposed(proposed, target);
+    };
+    let n = proposed.len().min(target.len());
+    let k = sim.next_accept_len().min(n);
+    VerifyResult {
+        accepted: proposed[..k].to_vec(),
+        rejection: (k < n).then(|| (k, target[k])),
+    }
+}
+
+/// The process-wide synthetic-acceptance harness, or `None` in a normal run.
+///
+/// Read once into a `OnceLock`: this is consulted on every verify, which is the
+/// decode hot path, and it must not do an env lookup per token.
+pub fn synthetic_acceptance() -> Option<&'static SyntheticAcceptance> {
+    static SIM: std::sync::OnceLock<Option<SyntheticAcceptance>> = std::sync::OnceLock::new();
+    SIM.get_or_init(|| {
+        let sim = SyntheticAcceptance::from_env_value(
+            std::env::var(SIMULATE_ACC_LEN_ENV).ok().as_deref(),
+        );
+        if let Some(sim) = sim.as_ref() {
+            tracing::warn!(
+                target: "mtp_speculative",
+                "SYNTHETIC MTP ACCEPTANCE IS ON ({SIMULATE_ACC_LEN_ENV}={:.4}). Draft tokens \
+                 are committed WITHOUT being checked against the target, so THE GENERATED \
+                 TEXT IS NOT THE MODEL'S OUTPUT — do not score it, publish it, or compare it \
+                 for quality. The drafter still runs at full cost, so this prices ACCEPTANCE \
+                 only, not drafter removal. Timing and KV bookkeeping are the measurements \
+                 this run can support.",
+                sim.acc_len(),
+            );
+        }
+        sim
+    })
+    .as_ref()
+}
+
 /// What one fused batched MTP step does to the shared cache, given each
 /// sequence's uncached tail and how many of its drafts the target accepted.
 ///
@@ -3786,6 +3953,7 @@ impl Pipeline for MtpSpeculativePipeline {
             .to_vec2::<u32>()?;
 
         // ---- Accept / reject, per sequence ----
+        let sim = synthetic_acceptance();
         let mut accepted: Vec<Vec<u32>> = Vec::with_capacity(batch);
         let mut valid_extent: Vec<usize> = Vec::with_capacity(batch);
         let mut per_seq_stats: Vec<MtpAcceptance> = Vec::with_capacity(batch);
@@ -3796,7 +3964,14 @@ impl Pipeline for MtpSpeculativePipeline {
             // what draft `j` proposed. Row `u - 1 + d` is the bonus token that
             // a fully accepted chain earns.
             let targets: Vec<u32> = (0..d).map(|j| arg[i][window_verify_row(u, j)]).collect();
-            let result = verify_proposed(&drafts[i], &targets);
+            // `sim` is `None` in every normal run, in which case this call IS
+            // `verify_proposed`. Under `ARC_MTP_SIMULATE_ACC_LEN` it forces the
+            // configured accept length instead — see [`SyntheticAcceptance`]
+            // for what that does and does not measure. The override sits HERE,
+            // at the live accept/reject site, precisely so the KV rollback and
+            // ragged-verify paths below run for real at accept patterns a
+            // 0.42-acceptance drafter would take a rented GPU-hour to produce.
+            let result = verify_proposed_with(&drafts[i], &targets, sim);
             let mut n_acc = result.accepted.len();
             // Never commit past the sequence's own length budget.
             if n_acc + 1 > budgets[i] {
@@ -4846,6 +5021,132 @@ mod tests {
         assert_eq!(r.accepted, vec![10, 20]);
         assert_eq!(r.rejection, Some((2, 99)));
         assert_eq!(r.commit_len(), 3);
+    }
+
+    /// `verify_proposed_with(.., None)` must be the real verifier, not a copy
+    /// of it — otherwise every normal run would be exercising a second
+    /// implementation that the accept/reject tests never see.
+    #[test]
+    fn the_synthetic_wrapper_is_the_real_verifier_when_off() {
+        for (proposed, target) in [
+            (vec![1u32, 2, 3], vec![1u32, 2, 3]),
+            (vec![1, 2, 3], vec![1, 9, 3]),
+            (vec![1, 2, 3], vec![9, 2, 3]),
+            (vec![1, 2, 3], vec![1, 2]),
+            (vec![], vec![1, 2]),
+        ] {
+            let real = verify_proposed(&proposed, &target);
+            let wrapped = verify_proposed_with(&proposed, &target, None);
+            assert_eq!(
+                real.accepted, wrapped.accepted,
+                "{proposed:?} vs {target:?}"
+            );
+            assert_eq!(
+                real.rejection, wrapped.rejection,
+                "{proposed:?} vs {target:?}"
+            );
+        }
+    }
+
+    /// The synthetic path forces the accept length at the **live** accept/reject
+    /// site's own call, so a run under `ARC_MTP_SIMULATE_ACC_LEN` drives the KV
+    /// rollback and ragged-verify code below it at accept patterns the current
+    /// 0.42-acceptance drafter almost never produces.
+    ///
+    /// The discriminator is a total mismatch: the real verifier scores 0 on it,
+    /// so any accepted token can only have come from the harness.
+    #[test]
+    fn the_synthetic_wrapper_forces_the_configured_accept_length() {
+        let proposed = vec![10u32, 20, 30];
+        let target = vec![91u32, 92, 93];
+        assert!(
+            verify_proposed(&proposed, &target).accepted.is_empty(),
+            "premise: the real verifier accepts nothing here"
+        );
+
+        // acc_len 2.85 => 1.85 accepted drafts per step, dithered 1/2/2/2/1/…
+        let sim = SyntheticAcceptance::new(2.85).expect("2.85 >= 1.0");
+        let mut total_accepted = 0usize;
+        const STEPS: usize = 200;
+        for _ in 0..STEPS {
+            let r = verify_proposed_with(&proposed, &target, Some(&sim));
+            // Whatever it accepts, it accepts the DRAFT's tokens…
+            assert_eq!(r.accepted, proposed[..r.accepted.len()].to_vec());
+            // …and the correction is still the TARGET's real token, so the
+            // pipeline's length bookkeeping downstream stays well-formed.
+            if let Some((pos, tok)) = r.rejection {
+                assert_eq!(tok, target[pos]);
+            }
+            total_accepted += r.accepted.len();
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let mean_accepted = total_accepted as f64 / STEPS as f64;
+        assert!(
+            (mean_accepted - 1.85).abs() < 0.01,
+            "acc_len 2.85 means 1.85 accepted drafts per step, got {mean_accepted}"
+        );
+    }
+
+    /// The other half of what the harness buys: it drives the **KV-rollback**
+    /// planners into ragged states.
+    ///
+    /// A real 0.42-acceptance drafter at depth 2 almost never produces a batch
+    /// where the accept lengths spread across the whole range — which is why
+    /// the ragged-verify path was able to sit broken (wave51) behind a
+    /// measurement that looked fine. Forcing the accept length gets there
+    /// without a rented GPU-hour: here the same schedule the flag installs feeds
+    /// both planners, and both must keep their invariants at every pattern it
+    /// generates.
+    #[test]
+    fn a_forced_accept_length_drives_the_rollback_planners_into_ragged_states() {
+        const W: usize = 4;
+        let uncached = vec![1usize, 2, 1, 3];
+        let sim = SyntheticAcceptance::new(2.85).expect("2.85 >= 1.0");
+
+        let mut seen_ragged = false;
+        for _ in 0..200 {
+            // Each sequence takes the schedule's next value, clamped to the
+            // drafts its own window had room for — exactly the clamp the live
+            // site applies.
+            let accepted: Vec<usize> = uncached
+                .iter()
+                .map(|&u| sim.next_accept_len().min(W - u))
+                .collect();
+
+            let valid_extent: Vec<usize> =
+                uncached.iter().zip(&accepted).map(|(u, a)| u + a).collect();
+            if valid_extent.iter().min() != valid_extent.iter().max() {
+                seen_ragged = true;
+            }
+
+            let cohort = plan_batch_step(&uncached, &accepted, W);
+            assert_eq!(
+                cohort.keep,
+                *valid_extent.iter().min().expect("non-empty batch"),
+                "the cohort keeps the length every sequence can prove"
+            );
+            assert_eq!(cohort.n_drop, W - cohort.keep);
+            for (i, &next) in cohort.next_uncached.iter().enumerate() {
+                assert_eq!(
+                    next,
+                    valid_extent[i] - cohort.keep + 1,
+                    "sequence {i}'s surplus must come back as next step's tail"
+                );
+                assert!((1..=W).contains(&next), "tail {next} is outside [1, {W}]");
+            }
+
+            let per_seq = plan_per_sequence_step(&uncached, &accepted, W);
+            assert_eq!(per_seq.committed, valid_extent);
+            assert!(
+                per_seq.next_uncached.iter().all(|&t| t == 1),
+                "per-sequence advance holds the B=1 invariant at every accept pattern"
+            );
+        }
+        assert!(
+            seen_ragged,
+            "the schedule must actually produce differing accept lengths — a \
+             harness that never goes ragged probes nothing"
+        );
     }
 
     /// `verify_proposed` accepts everything when all match.
