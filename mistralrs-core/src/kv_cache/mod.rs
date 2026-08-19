@@ -27,7 +27,9 @@ pub use hybrid_cache::{
 pub use rotating_cache::RotatingCache;
 pub use single_cache::SingleCache;
 pub use turboquant_cache::TurboQuantCache;
-pub use xs_rolling::{xs_per_sequence_enabled, XsRollingCache, XS_TAIL_MARGIN_TOKENS};
+pub use xs_rolling::{
+    request_xs_per_sequence, xs_per_sequence_enabled, XsRollingCache, XS_TAIL_MARGIN_TOKENS,
+};
 
 pub trait CacheManager<T: CacheManagerMixin + MetadataMixin + ?Sized> {
     /// Build one dense batched cache from `seqs`' per-sequence caches.

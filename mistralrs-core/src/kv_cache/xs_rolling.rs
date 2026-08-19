@@ -142,8 +142,71 @@ use super::{NormalCache, SingleCache};
 /// compressed layer (128 KB/layer/seq at V4's `hidden = 4096`).
 pub const XS_TAIL_MARGIN_TOKENS: usize = 16;
 
-/// `ARC_V4_XS_PER_SEQ=1` — allow the engine to *build* a batched `xs` cache
-/// whose rows sit at different token counts. **Default OFF.**
+/// The process-wide latch behind [`xs_per_sequence_enabled`].
+///
+/// Latched, not a live cell, and that is deliberate: a mid-run change would
+/// split one batch's behaviour between its slots. Written either by
+/// [`request_xs_per_sequence`] (the CLI/config surface) or, if nothing asked
+/// first, by the first read falling back to the environment.
+static XS_PER_SEQ: OnceLock<bool> = OnceLock::new();
+
+/// Ask for the per-sequence `xs` path before the engine starts serving.
+///
+/// This is the **supported** surface — `mistralrs {run,serve,bench} --v4-ragged-decode`
+/// and the `v4_ragged_decode` config key both land here, via
+/// `MistralRsForServerBuilder`. `ARC_V4_XS_PER_SEQ` still works as a fallback for
+/// the first read, so existing scripts are unaffected, but a runtime capability
+/// that can only be reached through an undocumented environment variable is
+/// indistinguishable from one that does not exist — which is how the ×3.25
+/// ragged-batching result stayed off the shipped configuration.
+///
+/// Returns `Err(already)` if the value was already latched (by an earlier call,
+/// or by a read that fell back to the environment) and disagrees. Callers should
+/// warn rather than fail: the run is still coherent, it just isn't the
+/// configuration that was asked for.
+pub fn request_xs_per_sequence(on: bool) -> std::result::Result<(), bool> {
+    let out = latch_bool(&XS_PER_SEQ, on);
+    if on && out.is_ok() {
+        // Loud on the way in, once. This is a change to what the engine
+        // serves, and the two things it is NOT are worth more than a doc
+        // comment nobody reads at 3am:
+        //   * it has never run on a GPU (`wave63-CO-xs-per-sequence.md` §6);
+        //   * V4's per-row attention mask gate must follow the cache layout for
+        //     the compressed branch to be masked correctly under this flag.
+        tracing::warn!(
+            "V4 ragged decode is ON (--v4-ragged-decode / ARC_V4_XS_PER_SEQ). The scheduler \
+             will admit decode batches whose sequences are at different lengths. This path \
+             has CPU identity coverage but NO GPU validation, and it requires the per-row \
+             query-position gate to follow the published cache layout rather than a second \
+             flag. Do not run it in production without both."
+        );
+    }
+    out
+}
+
+/// The latch semantics, over a caller-supplied cell.
+///
+/// Separated from [`XS_PER_SEQ`] so the rules can be tested against a fresh
+/// cell: latching the process-global from a test would decide the value for
+/// every other test in the binary — including `xs_per_sequence_defaults_off`,
+/// which exists to pin that it is `false`.
+fn latch_bool(cell: &OnceLock<bool>, on: bool) -> std::result::Result<(), bool> {
+    match cell.set(on) {
+        Ok(()) => Ok(()),
+        // Already latched. Agreeing is not an error — two build paths asking
+        // for the same thing is normal; only a genuine disagreement is worth
+        // telling the caller about.
+        Err(_) => match cell.get().copied() {
+            Some(latched) if latched == on => Ok(()),
+            Some(latched) => Err(latched),
+            None => unreachable!("`set` only fails when the cell is already initialised"),
+        },
+    }
+}
+
+/// May the engine *build* a batched `xs` cache whose rows sit at different token
+/// counts? **Default OFF** — see `request_xs_per_sequence` for how to turn it on
+/// and the PR that added the flag for why the default is not `true`.
 ///
 /// The mechanism itself ([`XsRollingCache::advance`]'s ragged path,
 /// [`XsRollingCache::set_row_lens`]) is always compiled and always available;
@@ -153,14 +216,19 @@ pub const XS_TAIL_MARGIN_TOKENS: usize = 16;
 /// off nothing in the engine can create more than one row's worth of state, so
 /// every path takes the uniform branch and is byte-identical to what shipped
 /// before this change.
+///
+/// ⚠️ It is also what authorizes `dsv4_attention`'s per-row query positions
+/// (`models::deepseek4::v4_ragged_rows_enabled_from`). The two must open
+/// together: this flag is a *producer* of left-aligned ragged batches, and a
+/// ragged batch masked from one shared query position lets every shorter row
+/// attend compressed blocks it has not reached.
 pub fn xs_per_sequence_enabled() -> bool {
     #[cfg(test)]
     match test_override::current() {
         Some(on) => return on,
         None => {}
     }
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
+    *XS_PER_SEQ.get_or_init(|| {
         matches!(
             std::env::var("ARC_V4_XS_PER_SEQ").as_deref(),
             Ok("1") | Ok("true") | Ok("TRUE")
@@ -1424,6 +1492,52 @@ mod tests {
         assert!(err.contains("only 11 wide"), "{err}");
         // …and the refusal must not have half-applied.
         assert_eq!(xs.row_lens().0, &[14, 13, 12, 9]);
+    }
+
+    /// The CLI/config surface latches the capability, and a second request for
+    /// the same value is not an error — every `build*` path calls it, and two
+    /// of them asking for the same thing is normal operation.
+    #[test]
+    fn requesting_the_same_value_twice_is_not_a_disagreement() {
+        let cell = OnceLock::new();
+        assert_eq!(latch_bool(&cell, true), Ok(()));
+        assert_eq!(latch_bool(&cell, true), Ok(()));
+        assert_eq!(cell.get().copied(), Some(true));
+    }
+
+    /// A genuine disagreement is reported with the value that actually won, so
+    /// the caller can say which configuration is being served rather than
+    /// assuming its own.
+    ///
+    /// It does not panic and does not overwrite: a mid-run change would split
+    /// one batch's behaviour between its slots, which is the failure the latch
+    /// exists to prevent.
+    #[test]
+    fn a_conflicting_request_loses_and_says_what_won() {
+        let cell = OnceLock::new();
+        assert_eq!(latch_bool(&cell, false), Ok(()));
+        assert_eq!(
+            latch_bool(&cell, true),
+            Err(false),
+            "the later request must lose and be told the latched value"
+        );
+        assert_eq!(
+            cell.get().copied(),
+            Some(false),
+            "and must not have overwritten it"
+        );
+    }
+
+    /// The environment fallback is the *first read*, not a permanent override:
+    /// a request that gets there first wins, which is what makes
+    /// `--v4-ragged-decode` a real surface rather than a suggestion.
+    #[test]
+    fn an_explicit_request_beats_the_environment_fallback() {
+        let cell = OnceLock::new();
+        assert_eq!(latch_bool(&cell, true), Ok(()));
+        // The read path is `get_or_init(env)`, so with the cell already set the
+        // env closure is never consulted.
+        assert!(*cell.get_or_init(|| false));
     }
 
     /// The flag is OFF unless explicitly asked for. Read once, latched, so a

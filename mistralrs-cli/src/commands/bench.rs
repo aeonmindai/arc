@@ -81,6 +81,7 @@ pub async fn run_bench(
         .with_interactive_mode(false)
         .with_prefix_cache_n(0) // Disable prefix cache for benchmarking
         .with_mtp_depth(runtime.mtp_depth as usize)
+        .with_v4_ragged_decode(runtime.v4_ragged_decode)
         .set_paged_attn(paged_attn)
         .with_cpu(cpu)
         .with_seed_optional(global.seed)

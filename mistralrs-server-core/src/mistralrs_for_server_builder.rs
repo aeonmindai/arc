@@ -114,6 +114,9 @@ pub mod defaults {
     /// MTP speculative-decode depth. `0` disables MTP wrapping (default —
     /// preserves backward compatibility for users not opting in).
     pub const MTP_DEPTH: usize = 0;
+    /// Per-sequence ragged decode for DeepSeek V4. `false` (default) keeps the
+    /// shipped behaviour: the scheduler buckets decode by sequence length.
+    pub const V4_RAGGED_DECODE: bool = false;
 }
 
 /// A builder for creating a mistral.rs instance with configured options for the mistral.rs server.
@@ -257,6 +260,12 @@ pub struct MistralRsForServerBuilder {
     /// head (currently DeepSeek V4 only). Models without an MTP head log a
     /// warning and fall back to non-speculative decode.
     mtp_depth: usize,
+
+    /// Per-sequence ragged decode for DeepSeek V4 (`--v4-ragged-decode`).
+    ///
+    /// `false` (default) keeps the shipped behaviour. See
+    /// [`MistralRsForServerBuilder::with_v4_ragged_decode`].
+    v4_ragged_decode: bool,
 }
 
 impl Default for MistralRsForServerBuilder {
@@ -291,6 +300,7 @@ impl Default for MistralRsForServerBuilder {
             paged_cache_type: defaults::PAGED_CACHE_TYPE,
             paged_cache_type_explicit: false,
             mtp_depth: defaults::MTP_DEPTH,
+            v4_ragged_decode: defaults::V4_RAGGED_DECODE,
         }
     }
 }
@@ -619,6 +629,55 @@ impl MistralRsForServerBuilder {
         self
     }
 
+    /// Enables **per-sequence ragged decode** for DeepSeek V4.
+    ///
+    /// V4's loader reports `supports_paged_attention() == false`, so it never
+    /// reaches the PagedAttention scheduler and never saw the ragged-batching
+    /// fix that landed there. It runs on `DefaultScheduler`, which has a ragged
+    /// path of its own — gated on `kv_cache::ragged_decode_supported()`, which
+    /// for V4 comes down to whether its `XsRolling` compressor slots may carry
+    /// a per-row length. This turns that on.
+    ///
+    /// With it **off** (the default) the scheduler buckets decode by sequence
+    /// length and runs one bucket per step, so a batch of B sequences at B
+    /// distinct lengths decodes one at a time.
+    ///
+    /// **Default `false`, deliberately.** The mechanism is CPU-test-covered but
+    /// has never run on a GPU (`memory/mission/wave63-CO-xs-per-sequence.md` §6
+    /// records the outstanding A/B), and D14 bans a CPU-only correctness
+    /// verdict. Flip the default once that A/B has run, not before.
+    ///
+    /// `ARC_V4_XS_PER_SEQ=1` remains a fallback for the first read, so existing
+    /// scripts keep working; this is the surface new callers should use.
+    pub fn with_v4_ragged_decode(mut self, on: bool) -> Self {
+        self.v4_ragged_decode = on;
+        self
+    }
+
+    /// Latch the per-sequence `xs` capability before the engine can read it.
+    ///
+    /// Called from every `build*` path, next to `set_mtp_load_depth`, for the
+    /// same reason: the value has to be settled before anything downstream asks
+    /// for it, and a mid-run change would split one batch's behaviour between
+    /// its slots.
+    ///
+    /// A losing race is warned about, not fatal — the run is still coherent,
+    /// it just is not the configuration that was asked for, and saying so beats
+    /// either killing the process or serving a different setting in silence.
+    ///
+    /// A free function taking the `bool` rather than a `&self` method: the
+    /// `build*` bodies have already partially moved `self` by the point they
+    /// reach it, and a `Copy` field read is legal there where a whole-`self`
+    /// borrow is not.
+    fn apply_v4_ragged_decode(on: bool) {
+        if let Err(latched) = mistralrs_core::request_xs_per_sequence(on) {
+            tracing::warn!(
+                "V4 ragged decode was requested as {on} but is already latched to {latched} \
+                 (an earlier build, or ARC_V4_XS_PER_SEQ read first). Serving {latched}."
+            );
+        }
+    }
+
     /// Sets the MCP client configuration.
     pub fn with_mcp_config(mut self, mcp_config: McpClientConfig) -> Self {
         self.mcp_client_config = Some(mcp_config);
@@ -713,6 +772,7 @@ impl MistralRsForServerBuilder {
         // whether to load the full `mtp.0.*` decoder block (~3GB at FP8;
         // skipped entirely when `--mtp-depth 0`).
         set_mtp_load_depth(self.mtp_depth);
+        Self::apply_v4_ragged_decode(self.v4_ragged_decode);
 
         let pipeline: LoadedPipeline = loader.load_model_from_hf(
             None,
@@ -853,6 +913,7 @@ impl MistralRsForServerBuilder {
 
         // Declare the MTP draft depth BEFORE load (see `build_single_model`).
         set_mtp_load_depth(self.mtp_depth);
+        Self::apply_v4_ragged_decode(self.v4_ragged_decode);
 
         let pipeline: LoadedPipeline = loader.load_model_from_hf(
             None,
@@ -972,6 +1033,7 @@ impl MistralRsForServerBuilder {
             // Declare the MTP draft depth BEFORE load (see
             // `build_single_model`).
             set_mtp_load_depth(self.mtp_depth);
+            Self::apply_v4_ragged_decode(self.v4_ragged_decode);
 
             let pipeline: LoadedPipeline = loader.load_model_from_hf(
                 None,
