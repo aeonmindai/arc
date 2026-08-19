@@ -351,7 +351,9 @@ fn main() -> Result<()> {
                 std::process::exit(2);
             }
             // Correctness: grouped must reproduce the materialize path.
-            if !(cos > 0.99) {
+            // NaN must FAIL, not pass — hence the explicit `is_nan` arm rather
+            // than a bare `cos <= 0.99`, which NaN silently satisfies as false.
+            if cos.is_nan() || cos <= 0.99 {
                 eprintln!(
                     "FATAL: grouped output does not match dequant at N={n} \
                      (cos={cos:.6}, max_rel={max_rel:.4}) — kernel is WRONG, not fast"
