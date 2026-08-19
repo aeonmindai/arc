@@ -489,6 +489,9 @@ pub struct XsRollingCache {
     /// materialise `comp.all_data` before the first group completes so the
     /// cache managers always have a tensor to batch.
     pub head_dim: usize,
+    /// Hold the retained raw tail at a CONSTANT width (see
+    /// [`Self::pin_tail_width`]). Off unless graph capture asks for it.
+    pin_tail: bool,
 }
 
 impl XsRollingCache {
@@ -521,7 +524,58 @@ impl XsRollingCache {
             span_groups,
             margin: XS_TAIL_MARGIN_TOKENS,
             head_dim,
+            pin_tail: false,
         }
+    }
+
+    /// The constant width the retained raw tail is held at under
+    /// [`Self::pin_tail_width`]: one row's full span plus the rollback margin.
+    ///
+    /// This is an upper bound on the width the unpinned policy ever chooses.
+    /// With `keep_from = ((tokens - margin)/ratio + 1 - span_groups) * ratio`,
+    /// writing `tokens - margin = q*ratio + r` gives a width of
+    /// `r + margin + (span_groups - 1) * ratio`, maximised at `r = ratio - 1`
+    /// as `span_groups * ratio + margin - 1`. So pinning here only ever
+    /// retains MORE than the compressor needs, never less.
+    pub fn graph_tail_width(&self) -> usize {
+        self.span_groups * self.ratio + self.margin
+    }
+
+    /// Hold the retained raw tail at [`Self::graph_tail_width`] columns instead
+    /// of letting it breathe with the sequence position.
+    ///
+    /// # Why capture needs this (RUN-161, measured)
+    ///
+    /// `advance_uniform` rebuilds the tail every step with
+    /// `Tensor::cat(&[tail, xs_new], 1)` and retains only what a future
+    /// compressed row can still consume. That width is a function of
+    /// `tokens % ratio`, so it MOVES: `ratio` distinct widths, cycling with
+    /// period `ratio`. Each new width is an allocation size the caching
+    /// allocator has never served, and an allocation that misses the warm pool
+    /// *during capture* becomes an unstable graph memory node — which is not a
+    /// slow graph but an invalid one, surfacing as `CUDA_ERROR_ILLEGAL_ADDRESS`
+    /// on the first `cuGraphLaunch`.
+    ///
+    /// Measured on an H200 (`compress_ratios` {4, 128}, `hidden` 4096, BF16, so
+    /// 8192 B/token): a single surviving capture-time miss of 327 680 B = 40
+    /// tokens, one token wider than the 319 488 B = 39 tokens missed on the
+    /// preceding warmup step. That is the ratio-128 (HCA) tail, which grows by
+    /// one token per step for 128 steps before it wraps — so no practical
+    /// warmup count can pre-cover it, which is exactly what earlier sessions
+    /// observed. (The ratio-4 (CSA) tail has only 4 distinct widths, which is
+    /// why the same defect once looked like "four unwarmed allocation sizes".)
+    ///
+    /// Pinned, the width stops being a function of position and the cat, the
+    /// narrow and the `contiguous` behind them all take one size for the life
+    /// of the run.
+    ///
+    /// Takes effect once the sequence is at least `graph_tail_width()` tokens
+    /// long; before that the history genuinely is shorter than the window and
+    /// the tail is still growing. Capture must therefore happen after that
+    /// point — with V4's HCA layers that is 144 tokens, which a prefill of any
+    /// realistic length already satisfies.
+    pub fn pin_tail_width(&mut self) {
+        self.pin_tail = true;
     }
 
     /// How many batch rows this cache currently describes.
@@ -1156,7 +1210,16 @@ impl XsRollingCache {
         let keep_from = ((rollback_floor / self.ratio + 1).saturating_sub(self.span_groups)
             * self.ratio)
             .max(win_start);
-        let new_base = keep_from.min(tokens_new);
+        // Under `pin_tail_width` the retention point is the FIXED-width one
+        // instead, so the tail (and the cat, narrow and contiguous that build
+        // it) keeps one shape for the whole run — a capture precondition, see
+        // `pin_tail_width`. `graph_tail_width()` is an upper bound on what the
+        // unpinned policy would keep, so this only ever retains more, never
+        // less; `.max(win_start)` covers the transition step, where the window
+        // in hand may still be narrower than the pinned width.
+        let pinned_base = (self.pin_tail && tokens_new >= self.graph_tail_width())
+            .then(|| (tokens_new - self.graph_tail_width()).max(win_start));
+        let new_base = pinned_base.unwrap_or(keep_from).min(tokens_new);
         self.tail = Some(
             window
                 .narrow(1, new_base - win_start, tokens_new - new_base)?

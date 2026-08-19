@@ -1522,10 +1522,52 @@ impl Attention {
                         .then(|| graph_comp_rows(self.compress_ratio.ratio()));
                         if let Some(rows) = graph_rows {
                             state.pin_comp_capacity(rows)?;
+                            // The compressed axis is not the only width that
+                            // moves with position: the retained RAW tail is
+                            // rebuilt per step at a width that cycles with
+                            // `tokens % ratio`, and a capture-time allocation
+                            // miss on one of those widths is an unstable graph
+                            // memory node — an illegal address on the first
+                            // launch, not a slow graph. Pin it too.
+                            state.pin_tail_width();
                         }
                         // Always advanced, including under the window-only
                         // ablation below: skipping it would drop the raw tail
                         // and leave a hole the next group cannot be built from.
+                        //
+                        // 🔴 ARCHITECTURAL LIMIT OF CAPTURE (RUN-161, measured).
+                        // This call cannot be served by a replayed graph, for
+                        // two independent reasons — neither of which more
+                        // warmup, a bigger alloc cache, or pinning a width can
+                        // reach:
+                        //
+                        //  1. `cuGraphLaunch` executes ONLY the recorded
+                        //     kernels. No host code runs. `advance` carries the
+                        //     compressor history in host-owned Rust state
+                        //     (`XsRollingCache::tail`, reassigned to a FRESH
+                        //     `Tensor` every step), so under replay the history
+                        //     simply stops advancing and the distant-context
+                        //     branch freezes at the capture step's content. The
+                        //     raw KV half does not have this problem because it
+                        //     writes through `write_kv_inplace` into one
+                        //     fixed-address buffer at a device-derived slot —
+                        //     a recorded kernel mutating stable memory.
+                        //  2. The compressor fires only on the 1-in-`ratio`
+                        //     steps that complete a block, so consecutive
+                        //     decode steps do not even execute the same set of
+                        //     kernels. With `compress_ratios` {4, 128} that is
+                        //     every 4th step. A graph is a fixed DAG and cannot
+                        //     express that branch.
+                        //
+                        // The fix is (1)'s pattern applied here: `tail` has to
+                        // become a fixed-capacity DEVICE ring advanced by a
+                        // recorded kernel, exactly like `SingleCache::
+                        // append_graph`, and (2) then needs either a
+                        // conditional graph node or one graph per phase.
+                        // Until then the compressed branch is correct under
+                        // capture only where it contributes nothing —
+                        // `ARC_V4_WINDOW_ONLY=1`, or a context shorter than one
+                        // `ratio` block.
                         let advanced =
                             state.advance(&xs3, |window| compressor.forward_from_xs(window))?;
                         match graph_rows {
