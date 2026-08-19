@@ -4489,13 +4489,13 @@ mod tests {
         // The real V4-Flash expert shapes: 2016 B and 576 B, both 4-aligned.
         assert!(packed_row_is_whole_bytes(1792, 9));
         assert!(packed_row_is_whole_bytes(512, 9));
-        assert_eq!(packed_bytes_per_row(1792, 9) % 4, 0);
-        assert_eq!(packed_bytes_per_row(512, 9) % 4, 0);
+        assert!(packed_bytes_per_row(1792, 9).is_multiple_of(4));
+        assert!(packed_bytes_per_row(512, 9).is_multiple_of(4));
         // Not whole bytes.
         assert!(!packed_row_is_whole_bytes(1793, 9));
         // Whole bytes (n % 8 == 0) but NOT a multiple of 4 bytes: 8*9/8 = 9 B.
         // This is the case a whole-bytes-only rule would have let through.
-        assert!(packed_bytes_per_row(8, 9) % 4 != 0);
+        assert!(!packed_bytes_per_row(8, 9).is_multiple_of(4));
         assert!(!packed_row_is_whole_bytes(8, 9));
         assert!(!packed_row_is_whole_bytes(24, 9));
         assert!(packed_row_is_whole_bytes(32, 9));
