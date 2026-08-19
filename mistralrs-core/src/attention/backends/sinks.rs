@@ -116,6 +116,46 @@ fn sinks_attn_regular(
     #[cfg(not(feature = "metal"))]
     let _ = flash_sinks_ok_metal;
 
+    // Name the backend, once per process.
+    //
+    // WHY THIS LINE EXISTS. Expert parallelism was priced on the belief that
+    // building with NCCL silently disables flash attention for V4, via
+    // `attention/mod.rs`'s `use_nccl() => naive_sdpa` gate — which would make
+    // any EP=2-vs-EP=1 comparison a comparison of two different attention
+    // kernels, and the measurement worthless. Reading the dispatch says
+    // otherwise for V4: `sdpa_params.sinks` is `Some` (V4 loads `attn_sink`),
+    // so `Sdpa::run_attention` diverts here on its FIRST line and the
+    // `use_nccl()` gate — which lives in `run_attention_noflash` — is never
+    // reached. Which of the two arms below a 512 head takes is itself a
+    // per-backend question (`flash_sinks_ok_cuda` admits 512 only under
+    // `flash_512_enabled()`; Metal's kernel stops at 256), which is one more
+    // reason to log the answer rather than argue it.
+    //
+    // That is a code read. Before anyone spends $9.22/hr on a 2xH100 pair to
+    // measure EP, this turns it into an observation: the log says which path
+    // the model on the box actually took. Emitted once, off the hot path.
+    {
+        static NAMED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        NAMED.get_or_init(|| {
+            let fused = (q.device().is_cuda() && flash_sinks_ok_cuda)
+                || (q.device().is_metal() && flash_sinks_ok_metal);
+            tracing::info!(
+                target: "arc_attention_backend",
+                "ARC_ATTN_BACKEND: sinks_attn head_dim={hd} \
+                 flash_sinks_ok_cuda={flash_sinks_ok_cuda} \
+                 flash_sinks_ok_metal={flash_sinks_ok_metal} \
+                 device={:?} => {} (the `use_nccl()` gate in \
+                 `run_attention_noflash` is NOT on this path)",
+                q.device().location(),
+                if fused {
+                    "fused flash-sinks kernel"
+                } else {
+                    "ArcFlash/Tile — unfused matmul + softmax_with_sinks"
+                },
+            );
+        });
+    }
+
     #[cfg(feature = "cuda")]
     if q.device().is_cuda() && flash_sinks_ok_cuda {
         crate::attention::arcflash::note(crate::attention::arcflash::Path::VendorSinks);

@@ -314,6 +314,27 @@ impl Sdpa {
         let (_, _, _, k_head_dim) = k.dims4()?;
         let (_, _, _, v_head_dim) = v.dims4()?;
 
+        // The other half of `ARC_ATTN_BACKEND` (see `backends/sinks.rs`). If a
+        // model reaches THIS function, its attention is decided by the
+        // ArcFlash/cuBLASLt dispatch below, where `use_nccl()` and a rank-2
+        // mask both steer the choice — so an EP measurement taken against it
+        // would be comparing two attention kernels. For V4 this line must never
+        // appear — its `sinks` divert happens earlier — so its presence or
+        // absence is the assertion, not a comment claiming so.
+        {
+            static NAMED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            NAMED.get_or_init(|| {
+                tracing::info!(
+                    target: "arc_attention_backend",
+                    "ARC_ATTN_BACKEND: run_attention_noflash REACHED head_dim={head_dim} \
+                     use_nccl={} mask_rank2={} (both steer the ArcFlash/cuBLASLt \
+                     dispatch below)",
+                    mistralrs_quant::distributed::use_nccl(),
+                    mask.is_some_and(|x| x.rank() == 2),
+                );
+            });
+        }
+
         // We can use Metal SDPA (vector/full) if the mask is the correct size and head dims match.
         // If the mask is provided, then softcapping isn't allowed - default back to naive SDPA
         // Softcapping is implemented for vector SDPA.

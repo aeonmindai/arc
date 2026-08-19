@@ -1281,7 +1281,8 @@ impl MtpAcceptance {
         format!(
             "MTP[{scope}] accept_rate={} accepted={} proposed={} steps={} drafted_steps={} \
              committed={} tok_per_step={} batch_steps={} mean_batch={} tok_per_batch_step={} \
-             p_pos={} accepted_pos={} reached_pos={} pos_over_cap={}",
+             p_pos={} accepted_pos={} reached_pos={} pos_over_cap={} \
+             per_seq_steps={}",
             fmt(self.rate()),
             self.accepted,
             self.proposed,
@@ -1296,6 +1297,7 @@ impl MtpAcceptance {
             list(&self.accepted_at[..extent]),
             list(&self.reached_at[..extent]),
             self.positions_over_cap,
+            mtp_per_seq_steps(),
         )
     }
 
@@ -1557,6 +1559,18 @@ impl AcceptanceTelemetry {
 /// is the sink that makes the number reachable from outside the pipeline
 /// without threading an accessor through the whole `Pipeline` trait.
 static GLOBAL_ACCEPTANCE: AcceptanceTelemetry = AcceptanceTelemetry::new();
+
+/// Decode steps on which per-sequence KV advance was actually applied.
+///
+/// The companion to the once-at-init "per-sequence KV advance is ON" line: that
+/// says the mode was *granted*, this says it *ran*. A run where the first is
+/// present and this is zero is a mode that is inert while reporting engaged.
+static PER_SEQ_STEPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Steps on which per-sequence KV advance was actually applied, process-wide.
+pub fn mtp_per_seq_steps() -> usize {
+    PER_SEQ_STEPS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Process-wide MTP acceptance counters, across every request and every
 /// pipeline instance. All zero when MTP never ran.
@@ -3633,6 +3647,29 @@ impl Pipeline for MtpSpeculativePipeline {
         let per_seq_advance = assembled_here
             && matches!(post_op, CacheInstruction::Out)
             && self.kv_advance() == KvAdvance::PerSequence;
+
+        // 🔑 PER-STEP engagement, as distinct from per-RUN engagement.
+        //
+        // `kv_advance()` logs "per-sequence KV advance is ON" once, at init,
+        // when the mode is GRANTED. That line has been this project's proof of
+        // a live treatment arm — and it does not prove the mode did anything,
+        // because `per_seq_advance` above is recomputed every step and can be
+        // false on every one of them while the grant stands.
+        //
+        // That gap is not hypothetical. A proposed optimisation (gate the
+        // cache re-assembly on `rows_uniform()`) would have made
+        // `assembled_here` false on every steady-state step, so this flag would
+        // have been false on every step, the mode would have been permanently
+        // inert — and the init line would still have said ON, the throughput
+        // chart would have looked like a clean win, and every engagement check
+        // we have would have passed. Counting the steps is what makes that
+        // visible.
+        //
+        // Reported on the `MTP[...]` marker as `per_seq_steps`, appended at the
+        // end so existing parsers that look up named fields are unaffected.
+        if per_seq_advance {
+            PER_SEQ_STEPS.fetch_add(1, Ordering::Relaxed);
+        }
         let row_cache_lens = resolve_row_cache_lens(per_seq_advance, cache_len, &lead_pad)?;
         let cache_lens: Vec<usize> = match &row_cache_lens {
             Some(rows) => rows.clone(),
