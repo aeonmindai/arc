@@ -636,6 +636,8 @@ mod tests {
                 current_seq_len: seq_len,
                 max_seq_len: 4096,
                 capacity_seq_len: capacity,
+                first_cached: 0,
+                retain_window: None,
             },
             v: crate::kv_cache::SingleCache {
                 all_data: Some(Tensor::zeros(shape, DType::BF16, &Device::Cpu).unwrap()),
@@ -643,6 +645,8 @@ mod tests {
                 current_seq_len: seq_len,
                 max_seq_len: 4096,
                 capacity_seq_len: capacity,
+                first_cached: 0,
+                retain_window: None,
             },
         }
     }

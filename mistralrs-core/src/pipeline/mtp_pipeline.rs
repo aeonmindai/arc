@@ -6802,6 +6802,8 @@ mod tests {
                 current_seq_len: live,
                 capacity_seq_len: capacity,
                 max_seq_len: 4096,
+                first_cached: 0,
+                retain_window: None,
             }
         };
         KvCache::Normal {

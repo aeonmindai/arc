@@ -25,7 +25,7 @@ pub use hybrid_cache::{
     RecurrentStateSnapshot,
 };
 pub use rotating_cache::RotatingCache;
-pub use single_cache::SingleCache;
+pub use single_cache::{SingleCache, RETAIN_WINDOW_CHUNK, RETAIN_WINDOW_MARGIN};
 pub use turboquant_cache::TurboQuantCache;
 pub use xs_rolling::{
     request_xs_per_sequence, xs_per_sequence_enabled, XsRollingCache, XS_TAIL_MARGIN_TOKENS,
@@ -138,11 +138,43 @@ impl KvCache {
     ///   gates only whether the engine may *build* such a batch; with it off
     ///   nothing produces more than one row of state and every path is
     ///   byte-identical to before.
+    /// * **`Normal` windowed — no.** `front_pad_kv_cache` shifts a row's live
+    ///   run right so every row's content ENDS at the same column, and the
+    ///   ragged mask then kills each row's dead prefix from
+    ///   `lead_i = q0 - row_q0[i]`, i.e. from POSITIONS. That identity holds
+    ///   only while a row's physical width equals its absolute length. Under
+    ///   [`SingleCache::retain_window`] it does not — two rows at different
+    ///   lengths sit at different points of the compaction cycle — so the
+    ///   dead-prefix kill would be off by each row's evicted prefix and
+    ///   attention would score rows nobody wrote. Reported as "cannot", which
+    ///   sends the batch back to exact-length bucketing (a throughput cost,
+    ///   named in the PR) rather than to a wrong answer.
     pub fn supports_per_sequence_len(&self) -> bool {
         match self {
-            Self::Normal { .. } => true,
+            Self::Normal { k, v } => k.first_cached == 0 && v.first_cached == 0,
             Self::XsRolling(_) => xs_per_sequence_enabled(),
             Self::Rotating { .. } | Self::TurboQuant(_) => false,
+        }
+    }
+
+    /// Absolute position of column 0 of this slot's stored K, i.e. how many
+    /// leading positions have been evicted. `0` for every non-windowed slot.
+    pub fn first_cached(&self) -> usize {
+        match self {
+            Self::Normal { k, .. } => k.first_cached,
+            _ => 0,
+        }
+    }
+
+    /// Ask a `Normal` slot to retain only the trailing `rows` positions,
+    /// compacting when it drifts a chunk past that. No-op on every other
+    /// variant — they have their own storage discipline and none of them is
+    /// reachable for the one model that wants this (see
+    /// `deepseek4::require_normal_kv_slot`).
+    pub fn set_retain_window(&mut self, rows: Option<usize>) {
+        if let Self::Normal { k, v } = self {
+            k.retain_window = rows;
+            v.retain_window = rows;
         }
     }
 
@@ -922,6 +954,20 @@ pub(crate) fn front_pad_kv_cache(cache: &mut KvCache, target_len: usize) -> Resu
             cache.kind_name()
         );
     };
+    // See `KvCache::supports_per_sequence_len`: a windowed slot's physical
+    // width is not its absolute length, so the position-derived dead prefix
+    // the ragged mask builds would be wrong by the evicted amount.
+    // `batch_can_be_ragged` already declined; this is the belt to those braces,
+    // and it is loud because a silent mis-align scores unwritten rows.
+    if k.first_cached != 0 || v.first_cached != 0 {
+        candle_core::bail!(
+            "kv-cache: front_pad on a WINDOWED slot (first_cached {}). Ragged batching masks \
+             each row's dead prefix from its absolute position, which only equals its physical \
+             width while the whole sequence is resident. See \
+             `KvCache::supports_per_sequence_len`.",
+            k.first_cached.max(v.first_cached)
+        );
+    }
     let lead_k = front_pad_single(k, target_len)?;
     let lead_v = front_pad_single(v, target_len)?;
     debug_assert_eq!(
@@ -1281,6 +1327,9 @@ fn front_align_would_succeed(
             // Already per-row; `front_pad_kv_cache` returns Ok(0) untouched.
             KvCache::XsRolling(_) => xs_per_sequence_enabled(),
             KvCache::Normal { k, v } => [k, v].into_iter().all(|sc| {
+                if sc.first_cached != 0 {
+                    return false; // windowed: `front_pad_kv_cache` refuses
+                }
                 if sc.current_seq_len == target {
                     return true; // lead == 0, nothing to move
                 }
@@ -1392,6 +1441,74 @@ pub(crate) fn ensure_uniform_batch_cache_lens(
              histories) can reach here with slot 0 in agreement and a later slot not."
         ),
     }
+}
+
+/// The second quantity a dense batched slot has only one of: how much of each
+/// sequence is physically resident ([`SingleCache::first_cached`]).
+///
+/// `clone_in_cache` describes the whole batched buffer with `seqs[0]`'s
+/// bookkeeping, so a cohort whose members have evicted different amounts would
+/// get one row's `first_cached` applied to everyone — and `first_cached` is
+/// what `dsv4_attention` is handed as `raw_prefix`, i.e. the absolute position
+/// of column 0. Wrong by `d` there means every key mask and every compressed
+/// causality threshold is off by `d` for that row: a wrong answer nothing
+/// downstream catches.
+///
+/// [`SingleCache::window_target_first_cached`] is a pure function of the
+/// absolute length, and [`ensure_uniform_batch_cache_lens`] has already made
+/// the lengths agree, so this holds by construction on every path that reaches
+/// here. It is checked anyway, because the one way it could stop holding —
+/// some future path that evicts on its own schedule — is invisible.
+pub(crate) fn ensure_uniform_batch_first_cached(
+    seqs: &mut [&mut crate::sequence::Sequence],
+    modify_draft_cache: bool,
+) -> Result<()> {
+    if seqs.len() < 2 {
+        return Ok(());
+    }
+    let template: Vec<Option<usize>> = {
+        let cache = if modify_draft_cache {
+            seqs[0].normal_draft_cache()
+        } else {
+            seqs[0].normal_cache()
+        };
+        cache
+            .iter()
+            .map(|slot| slot.as_ref().map(KvCache::first_cached))
+            .collect()
+    };
+    if template.iter().flatten().all(|&f| f == 0) {
+        // Every non-windowed batch, i.e. every model but V4 under
+        // `ARC_V4_KV_WINDOW`. No second walk.
+        return Ok(());
+    }
+    for (i, seq) in seqs.iter_mut().enumerate().skip(1) {
+        let cache = if modify_draft_cache {
+            seq.normal_draft_cache()
+        } else {
+            seq.normal_cache()
+        };
+        for (layer, expected) in template.iter().enumerate() {
+            let (Some(expected), Some(got)) = (
+                *expected,
+                cache
+                    .get(layer)
+                    .and_then(|s| s.as_ref())
+                    .map(KvCache::first_cached),
+            ) else {
+                continue;
+            };
+            if expected != got {
+                candle_core::bail!(
+                    "kv-cache: sequences in one batch must have evicted the same leading \
+                     positions — the dense batched slot carries ONE `first_cached`, and it is \
+                     the absolute position `dsv4_attention` masks from. Cache slot {layer}: \
+                     seqs[0] starts at {expected}, seqs[{i}] at {got}."
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Reconcile the one quantity [`ensure_uniform_batch_cache_lens`] cannot see:
@@ -1566,6 +1683,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
         // uniform. A cohort that could not be aligned still fails here rather
         // than silently writing every sequence's K/V to the wrong slot.
         ensure_uniform_batch_cache_lens(seqs, modify_draft_cache)?;
+        ensure_uniform_batch_first_cached(seqs, modify_draft_cache)?;
 
         let _prof = arc_profiler::span("clone_in_cache");
         let xs_per_seq = xs_per_sequence_enabled();
@@ -1705,6 +1823,8 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                         current_seq_len: 0,
                         max_seq_len: 0,
                         capacity_seq_len: 0,
+                        first_cached: 0,
+                        retain_window: None,
                     },
                     v: SingleCache {
                         all_data: None,
@@ -1712,6 +1832,8 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                         current_seq_len: 0,
                         max_seq_len: 0,
                         capacity_seq_len: 0,
+                        first_cached: 0,
+                        retain_window: None,
                     },
                 });
                 continue;
@@ -1736,6 +1858,14 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                         (d, Some(x)) => x.dims()[d],
                     };
 
+                    // The evicted prefix and the retention policy come from
+                    // the template like every other field, and
+                    // `ensure_uniform_batch_first_cached` has already refused
+                    // any cohort whose members disagree about the first —
+                    // seqs[0]'s value is therefore the whole batch's.
+                    let template_first_cached = old_k.first_cached;
+                    let template_retain = old_k.retain_window;
+
                     caches.push(KvCache::Normal {
                         k: SingleCache {
                             all_data: k_cache,
@@ -1743,6 +1873,8 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                             current_seq_len: template_cache_csl,
                             max_seq_len: template_cache_msl,
                             capacity_seq_len: capacity,
+                            first_cached: template_first_cached,
+                            retain_window: template_retain,
                         },
                         v: SingleCache {
                             all_data: v_cache,
@@ -1750,6 +1882,8 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                             current_seq_len: template_cache_csl,
                             max_seq_len: template_cache_msl,
                             capacity_seq_len: capacity,
+                            first_cached: template_first_cached,
+                            retain_window: template_retain,
                         },
                     });
                 }
@@ -1918,6 +2052,10 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                         //
                         // `lead == 0` for every row of a uniform batch, so this
                         // is the identity there and the map stays empty.
+                        // The batched slot compacted as one buffer, so every
+                        // row's evicted prefix advanced together; handing back
+                        // the batched `first_cached` is handing back each row's
+                        // own. `0` / `None` for every non-windowed model.
                         *seq_cache = Some(KvCache::Normal {
                             k: SingleCache {
                                 all_data: Some(k),
@@ -1925,6 +2063,8 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                                 current_seq_len: cache_k.current_seq_len,
                                 max_seq_len: cache_k.max_seq_len,
                                 capacity_seq_len: cache_k.capacity_seq_len,
+                                first_cached: cache_k.first_cached,
+                                retain_window: cache_k.retain_window,
                             },
                             v: SingleCache {
                                 all_data: Some(v),
@@ -1932,6 +2072,8 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                                 current_seq_len: cache_v.current_seq_len,
                                 max_seq_len: cache_v.max_seq_len,
                                 capacity_seq_len: cache_v.capacity_seq_len,
+                                first_cached: cache_v.first_cached,
+                                retain_window: cache_v.retain_window,
                             },
                         });
                     }
@@ -2075,6 +2217,8 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                             current_seq_len: 0,
                             max_seq_len: template_cache_msl,
                             capacity_seq_len: k_cache.dims()[template_cache_dim],
+                            first_cached: 0,
+                            retain_window: None,
                         },
                         v: SingleCache {
                             all_data: Some(v_cache.zeros_like().unwrap()),
@@ -2082,6 +2226,8 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                             current_seq_len: 0,
                             max_seq_len: template_cache_msl,
                             capacity_seq_len: k_cache.dims()[template_cache_dim],
+                            first_cached: 0,
+                            retain_window: None,
                         },
                     };
                     *layer = cache;
@@ -2717,6 +2863,8 @@ mod clone_in_cache_invariant_tests {
                 current_seq_len,
                 capacity_seq_len: 512,
                 max_seq_len: 4096,
+                first_cached: 0,
+                retain_window: None,
             },
             v: SingleCache {
                 all_data: None,
@@ -2724,6 +2872,8 @@ mod clone_in_cache_invariant_tests {
                 current_seq_len,
                 capacity_seq_len: 512,
                 max_seq_len: 4096,
+                first_cached: 0,
+                retain_window: None,
             },
         }
     }
@@ -2805,6 +2955,8 @@ mod clone_in_cache_invariant_tests {
                 current_seq_len: live,
                 capacity_seq_len: capacity,
                 max_seq_len: 4096,
+                first_cached: 0,
+                retain_window: None,
             }
         };
         KvCache::Normal {
@@ -3602,6 +3754,8 @@ mod clone_in_cache_invariant_tests {
             current_seq_len,
             capacity_seq_len: capacity,
             max_seq_len: 4096,
+            first_cached: 0,
+            retain_window: None,
         };
         KvCache::Normal { k: mk(), v: mk() }
     }

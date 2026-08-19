@@ -153,8 +153,12 @@ pub use pipeline::text_models_inputs_processor::FlashParams as TextFlashParams;
 /// against a bare `NormalModel`, without standing up a whole pipeline.
 pub use kv_cache::{
     request_xs_per_sequence, xs_per_sequence_enabled, KvCache, SingleCache, XsRollingCache,
-    XS_TAIL_MARGIN_TOKENS,
+    RETAIN_WINDOW_CHUNK, RETAIN_WINDOW_MARGIN, XS_TAIL_MARGIN_TOKENS,
 };
+/// DeepSeek V4's windowed raw-KV store (`ARC_V4_KV_WINDOW`). Public for the
+/// same reason `set_mtp_load_depth` is: the identity guard has to drive the
+/// same model both ways from one test binary.
+pub use models::deepseek4::{set_v4_kv_window, v4_kv_window_enabled};
 pub use request::{
     ApproximateUserLocation, Constraint, DetokenizationRequest, ImageGenerationResponseFormat,
     LlguidanceGrammar, MessageContent, NormalRequest, ReasoningEffort, Request, RequestMessage,
