@@ -407,6 +407,43 @@ fn gaussian_lut() -> Vec<f32> {
     lut
 }
 
+/// Trellis-geometry-parameterised twin of [`gaussian_lut`]: `2^l` states × `v`
+/// reproduction values each.
+///
+/// Box-Muller emits two normals per hash, so a state needs `ceil(v/2)` hashes.
+/// Hash `p` is salted by `p · 0x9E3779B9`; at `p = 0` the salt is zero, so
+/// `gaussian_lut_geo(L, V)` recomputes exactly the expression
+/// [`gaussian_lut`] evaluates. It is *not* wired into the production codebook:
+/// the shipped `gaussian_lut()` body above is left untouched so no artifact's
+/// codebook can move by so much as a ULP. `gaussian_lut_geo_matches_shipped_lut`
+/// pins how close the two compiled copies actually land.
+///
+/// Every entry is a standard normal for any `(l, v)`, so the unit-σ assumption
+/// behind [`QTIP_GAUSSIAN_SCALE_DIVISOR`] (`max|row| / 3`) holds unchanged
+/// across geometries — a geometry sweep does not silently move the scale
+/// policy underneath itself.
+#[cfg(test)]
+fn gaussian_lut_geo(l: u32, v: u32) -> Vec<f32> {
+    let n_states = 1usize << l;
+    let mut lut = Vec::with_capacity(n_states * v as usize);
+    for state in 0..(n_states as u32) {
+        let mut emitted = 0u32;
+        let mut pair = 0u32;
+        while emitted < v {
+            let (u1, u2) = hash_to_two_uniforms(state ^ pair.wrapping_mul(0x9E37_79B9));
+            let (g0, g1) = box_muller(u1, u2);
+            lut.push(g0);
+            emitted += 1;
+            if emitted < v {
+                lut.push(g1);
+                emitted += 1;
+            }
+            pair += 1;
+        }
+    }
+    lut
+}
+
 /// Splitmix-style hash to produce two well-distributed uniforms in (0, 1).
 fn hash_to_two_uniforms(state: u32) -> (f32, f32) {
     // Splitmix64-style mixing on a 64-bit value derived from state.
