@@ -426,6 +426,34 @@ output_trusted={} verify_remaining={} verify_failed={}",
         &mut self,
         batch_size: usize,
     ) -> candle_core::Result<(CUmemoryPool, CUmemoryPool)> {
+        // Refuse below the attention backend's synchronize floor.
+        //
+        // `maybe_synchronize` (mistralrs-core/src/attention/backends/naive.rs)
+        // issues a full device synchronize whenever free VRAM is under
+        // `CAPTURE_SYNC_HEADROOM_BYTES`, from an unconditional call site in
+        // `naive_sdpa` and in the cuBLASLt attention path — i.e. from inside
+        // the region being captured here. It skips that synchronize while
+        // capturing, because `cuCtxSynchronize` during capture is illegal;
+        // the consequence is that a graph recorded under pressure omits a
+        // synchronize the eager path performs at the same pressure.
+        //
+        // Refusing is the only option that keeps replay and eager identical.
+        // Checked before the private pool is created so a refusal costs
+        // nothing and leaks nothing.
+        {
+            let (free, _total) = candle_core::cuda::cudarc::driver::result::mem_get_info()
+                .map_err(|e| candle_core::Error::Msg(format!("cuMemGetInfo failed: {e}")))?;
+            if free < crate::CAPTURE_SYNC_HEADROOM_BYTES {
+                candle_core::bail!(
+                    "refusing CUDA-graph capture: {free} bytes free is below the {} byte \
+                     attention synchronize floor. Below it, `maybe_synchronize` synchronizes on \
+                     every attention call, and a graph captured here would replay without that \
+                     synchronize. This is a refusal, not a failure — decode continues eagerly.",
+                    crate::CAPTURE_SYNC_HEADROOM_BYTES
+                );
+            }
+        }
+
         // Create private pool
         let graph_pool = self.create_private_pool()?;
 
