@@ -28,6 +28,7 @@ use crate::utils::slice_ptr;
 
 use super::device_guard::ensure_same_cuda_device;
 use super::ffi;
+use super::k8v4l12::RowScaleHoist;
 use super::QtipCodebook;
 
 /// Returns true when the layer parameters live on CUDA *and* the kernels
@@ -357,6 +358,226 @@ pub(crate) fn fused_gemv_cuda(
             CudaStorage::wrap_cuda_slice(out_buf, dev.clone())
         }
         other => candle_core::bail!("QTIP fused gemv CUDA: unsupported x dtype {other:?}"),
+    };
+
+    Ok(Tensor::from((Storage::Cuda(res), out_shape)))
+}
+
+/// Fused decode + gemv at **K=8 / V=4 / L=12** — the shared-memory-table rung.
+///
+/// The K=4/V=2 sibling of this function is [`fused_gemv_cuda`]. Same 2 bits per
+/// weight, same `x_rotated` contract, same `[1, n_rows]` output. Three things
+/// differ, and all three are checked here rather than assumed:
+///
+/// * `lut` is **BF16** and must hold exactly `2^12 × 4 = 16,384` values
+///   (32,768 B). That size is the reason the rung exists — it fits static
+///   shared memory — so a wrong-sized table is a wrong-geometry artifact and is
+///   refused, not indexed.
+/// * `packed_per_row == num_symbols`: at K=8 a symbol is a byte, with no nibble
+///   packing. The K=4 path's `num_symbols / 2` does not apply.
+/// * `hoist` selects the row-scale policy. [`RowScaleHoist::Off`] is what the
+///   CPU parity reference pins; [`RowScaleHoist::On`] reassociates the sum and
+///   is therefore not bit-comparable.
+///
+/// There is deliberately no codebook selector: the computed `sum2` codebook is
+/// V=2-specific, so this rung is table-only.
+pub(crate) fn fused_gemv_k8v4l12_cuda(
+    blocks: &Tensor,
+    row_scales: &Tensor,
+    lut: &Tensor,
+    x_rotated: &Tensor,
+    in_features: usize,
+    hoist: RowScaleHoist,
+) -> Result<Tensor> {
+    use super::k8v4l12;
+
+    const OP: &str = "QTIP k8v4l12 fused gemv CUDA";
+
+    let n_rows = row_scales.dim(0)?;
+    let packed_per_row = blocks.dim(1)?;
+    let num_symbols = k8v4l12::num_symbols(in_features);
+
+    if blocks.dtype() != DType::U8 {
+        candle_core::bail!("{OP}: blocks dtype must be U8, got {:?}", blocks.dtype());
+    }
+    if row_scales.dtype() != DType::F32 {
+        candle_core::bail!(
+            "{OP}: row_scales dtype must be F32, got {:?}",
+            row_scales.dtype()
+        );
+    }
+    // The table's dtype IS the rung. An F32 table here means a K=4/V=2
+    // artifact reached a K=8/V=4 launcher, which would decode 65,536 states'
+    // worth of f32 as 16,384 bf16 and produce plausible garbage.
+    if lut.dtype() != DType::BF16 {
+        candle_core::bail!(
+            "{OP}: table dtype must be BF16 at this geometry, got {:?}. An F32 table is the \
+             K=4/V=2/L=16 rung's; these artifacts are not interchangeable.",
+            lut.dtype()
+        );
+    }
+    if lut.elem_count() != k8v4l12::LUT_ENTRIES {
+        candle_core::bail!(
+            "{OP}: table has {} values, expected {} (2^{} × {} = {} B)",
+            lut.elem_count(),
+            k8v4l12::LUT_ENTRIES,
+            k8v4l12::L,
+            k8v4l12::V,
+            k8v4l12::LUT_BYTES
+        );
+    }
+    if in_features % k8v4l12::V as usize != 0 {
+        candle_core::bail!(
+            "{OP}: in_features {in_features} must be a multiple of V={} (each symbol decodes \
+             to V weights)",
+            k8v4l12::V
+        );
+    }
+    // K=8 puts exactly one symbol in a byte. If these disagree the caller is
+    // holding a K=4-packed row.
+    if packed_per_row != num_symbols {
+        candle_core::bail!(
+            "{OP}: blocks row is {packed_per_row} B but in_features={in_features} needs \
+             {num_symbols} symbols. At K=8 a symbol is one byte — a row of {} B would be \
+             K=4/V=2 nibble packing.",
+            num_symbols / 2
+        );
+    }
+    if !blocks.layout().is_contiguous()
+        || !row_scales.layout().is_contiguous()
+        || !lut.layout().is_contiguous()
+    {
+        candle_core::bail!("{OP}: blocks/scales/table must be contiguous");
+    }
+
+    let x_2d = match x_rotated.dims() {
+        [k] if *k == in_features => x_rotated.unsqueeze(0)?,
+        [b, k] if *b == 1 && *k == in_features => x_rotated.clone(),
+        other => candle_core::bail!(
+            "{OP}: x_rotated must be [k_in] or [1, k_in]; got {other:?} (k_in={in_features})"
+        ),
+    };
+    let x_2d = x_2d.contiguous()?;
+
+    let dev = match blocks.device() {
+        candle_core::Device::Cuda(d) => d.clone(),
+        _ => candle_core::bail!("{OP}: blocks must live on CUDA"),
+    };
+    ensure_same_cuda_device(
+        OP,
+        "row_scales",
+        row_scales.device(),
+        "blocks",
+        blocks.device(),
+    )?;
+    ensure_same_cuda_device(OP, "lut", lut.device(), "blocks", blocks.device())?;
+    ensure_same_cuda_device(OP, "x_rotated", x_2d.device(), "blocks", blocks.device())?;
+
+    let out_shape = candle_core::Shape::from_dims(&[1, n_rows]);
+
+    let (blocks_storage, blocks_layout) = blocks.storage_and_layout();
+    let blocks_storage = match &*blocks_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("{OP}: blocks storage must be CUDA"),
+    };
+    let (scales_storage, scales_layout) = row_scales.storage_and_layout();
+    let scales_storage = match &*scales_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("{OP}: scales storage must be CUDA"),
+    };
+    let (lut_storage, lut_layout) = lut.storage_and_layout();
+    let lut_storage = match &*lut_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("{OP}: table storage must be CUDA"),
+    };
+    let (x_storage, x_layout) = x_2d.storage_and_layout();
+    let x_storage = match &*x_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("{OP}: x storage must be CUDA"),
+    };
+
+    let (blocks_ptr, _blocks_guard) = slice_ptr(
+        blocks_storage.as_cuda_slice::<u8>()?,
+        blocks_layout.start_offset(),
+    );
+    let (scales_ptr, _scales_guard) = slice_ptr(
+        scales_storage.as_cuda_slice::<f32>()?,
+        scales_layout.start_offset(),
+    );
+    let (lut_ptr, _lut_guard) = slice_ptr(
+        lut_storage.as_cuda_slice::<bf16>()?,
+        lut_layout.start_offset(),
+    );
+
+    let hoist_abi = hoist.as_abi();
+    let res = match x_2d.dtype() {
+        DType::BF16 => {
+            let (x_ptr, _x_guard) =
+                slice_ptr(x_storage.as_cuda_slice::<bf16>()?, x_layout.start_offset());
+            let out_buf = dev.alloc_zeros::<bf16>(n_rows)?;
+            let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
+            unsafe {
+                ffi::launch_qtip_fused_gemv_k8_v4_l12_bf16(
+                    blocks_ptr as *const _,
+                    scales_ptr as *const _,
+                    lut_ptr as *const _,
+                    x_ptr as *const _,
+                    out_ptr as *mut _,
+                    n_rows as i32,
+                    packed_per_row as i32,
+                    num_symbols as i32,
+                    hoist_abi,
+                    dev.cuda_stream().cu_stream(),
+                );
+            }
+            drop(out_guard);
+            CudaStorage::wrap_cuda_slice(out_buf, dev.clone())
+        }
+        DType::F16 => {
+            let (x_ptr, _x_guard) =
+                slice_ptr(x_storage.as_cuda_slice::<f16>()?, x_layout.start_offset());
+            let out_buf = dev.alloc_zeros::<f16>(n_rows)?;
+            let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
+            unsafe {
+                ffi::launch_qtip_fused_gemv_k8_v4_l12_f16(
+                    blocks_ptr as *const _,
+                    scales_ptr as *const _,
+                    lut_ptr as *const _,
+                    x_ptr as *const _,
+                    out_ptr as *mut _,
+                    n_rows as i32,
+                    packed_per_row as i32,
+                    num_symbols as i32,
+                    hoist_abi,
+                    dev.cuda_stream().cu_stream(),
+                );
+            }
+            drop(out_guard);
+            CudaStorage::wrap_cuda_slice(out_buf, dev.clone())
+        }
+        DType::F32 => {
+            let (x_ptr, _x_guard) =
+                slice_ptr(x_storage.as_cuda_slice::<f32>()?, x_layout.start_offset());
+            let out_buf = dev.alloc_zeros::<f32>(n_rows)?;
+            let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
+            unsafe {
+                ffi::launch_qtip_fused_gemv_k8_v4_l12_f32(
+                    blocks_ptr as *const _,
+                    scales_ptr as *const _,
+                    lut_ptr as *const _,
+                    x_ptr as *const _,
+                    out_ptr as *mut _,
+                    n_rows as i32,
+                    packed_per_row as i32,
+                    num_symbols as i32,
+                    hoist_abi,
+                    dev.cuda_stream().cu_stream(),
+                );
+            }
+            drop(out_guard);
+            CudaStorage::wrap_cuda_slice(out_buf, dev.clone())
+        }
+        other => candle_core::bail!("{OP}: unsupported x dtype {other:?}"),
     };
 
     Ok(Tensor::from((Storage::Cuda(res), out_shape)))
@@ -2257,10 +2478,14 @@ pub(crate) fn grouped_gemm_lut_cuda(
         scales_storage.as_cuda_slice::<f32>()?,
         scales_layout.start_offset(),
     );
-    let (lut_ptr, _lut_guard) =
-        slice_ptr(lut_storage.as_cuda_slice::<f32>()?, lut_layout.start_offset());
-    let (idx_ptr, _idx_guard) =
-        slice_ptr(idx_storage.as_cuda_slice::<u32>()?, idx_layout.start_offset());
+    let (lut_ptr, _lut_guard) = slice_ptr(
+        lut_storage.as_cuda_slice::<f32>()?,
+        lut_layout.start_offset(),
+    );
+    let (idx_ptr, _idx_guard) = slice_ptr(
+        idx_storage.as_cuda_slice::<u32>()?,
+        idx_layout.start_offset(),
+    );
 
     let (counts_ptr, _counts_guard) = slice_ptr(&counts, 0);
     let (offsets_ptr, _offsets_guard) = slice_ptr(&offsets, 0);

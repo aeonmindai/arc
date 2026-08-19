@@ -72,6 +72,7 @@ pub(crate) mod gather_policy;
 #[cfg(test)]
 mod greedy_ban_tests;
 pub mod grouped;
+pub mod k8v4l12;
 #[cfg(test)]
 mod search_bench;
 pub mod tune;
@@ -3712,11 +3713,8 @@ impl QuantMethod for QtipLayer {
                         self.in_features,
                         self.codebook,
                     )?;
-                    let mut out = out_flat.reshape((
-                        n_tokens,
-                        n_experts_per_tok,
-                        self.rows_per_expert()?,
-                    ))?;
+                    let mut out =
+                        out_flat.reshape((n_tokens, n_experts_per_tok, self.rows_per_expert()?))?;
                     if out.dtype() != a.dtype() {
                         out = out.to_dtype(a.dtype())?;
                     }

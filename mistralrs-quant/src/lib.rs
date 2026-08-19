@@ -93,6 +93,10 @@ pub use mxfp4::MXFP4Layer;
 pub use nvfp4::NVFP4Layer;
 pub use pending_layer::PendingIsqLayer;
 pub use pertensor_fp8::PerTensorFP8Linear;
+/// The K=8 / V=4 / L=12 decode rung: geometry, reproduction table, and the CPU
+/// reference the GPU kernel is held to. Same 2 bits per weight as the shipped
+/// K=4/V=2/L=16 rung — see the module docs for what actually changes.
+pub use qtip::k8v4l12;
 pub use qtip::tune::{
     gemv_num_variants as qtip2b_gemv_num_variants, gemv_variant_applicable,
     gemv_variant_desc as qtip2b_gemv_variant_desc,
