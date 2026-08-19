@@ -935,7 +935,14 @@ pub fn dsv4_attention(
                     None => {
                         let threshold =
                             Tensor::new(&[((q0 + 1) / ratio) as u32], dev)?.reshape((1, 1))?;
-                        Tensor::arange(0u32, t_c as u32, dev)?
+                        // The block indices come from the cached `(ratio,
+                        // device)` table at ratio 1, not `Tensor::arange`.
+                        // `compress_positions(t_c, 1, dev)` IS `[0, 1, …, t_c-1]`
+                        // in U32 — bit-identical to the `arange` it replaces —
+                        // but it is a zero-copy `narrow` view of a table built
+                        // once during warmup, so the per-layer host->device copy
+                        // goes away. See `layers::compress_positions`.
+                        crate::layers::compress_positions(t_c, 1, dev)?
                             .reshape((1, t_c))?
                             .broadcast_lt(&threshold)? // [1, t_c] (u8)
                     }
