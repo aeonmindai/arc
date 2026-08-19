@@ -103,6 +103,49 @@
 // `beam_w` entries, which fit in shared memory with room to spare. HBM traffic
 // per symbol position drops ~512x.
 //
+// WHAT A RUNG COSTS TO ENCODE — AND WHY `(n/V) * W * 2^K` IS NOT IT
+// -----------------------------------------------------------------
+// That formula predicts K=4 -> K=8 costs 8x MORE and produced the discredited
+// "~1,700 s/layer / 20 h / $30" figure. This kernel falsifies it in two lines
+// of its own source: the `& G::GROUP_MASK` in step 1a masks the predecessor to
+// `2^(L-K)`, so raising K SHRINKS the live group count by exactly the factor by
+// which it grows the alphabet, and `n_cand = ng * 2^K` at the end of step 2 is
+// therefore saturated at `2^L`. The candidate
+// count per timestep is 4096 at K=4/L=16 (256 groups x 16), at K=8/L=12
+// (16 x 256) and at K=9/L=12 (8 x 512) alike, and `cand[]` is 16 entries at all
+// three. `W` is not a factor either — measured, W=256 = 82.7 s/layer vs
+// W=32 = 83.6 s/layer, ~1% (FACTS.md:1320).
+//
+// What DOES move, per layer:
+//
+//   (a) timesteps.  `num_symbols = in_features / V`, so V=2 -> V=4 halves them.
+//   (b) candidates/timestep, cand[], radix passes, LUT bytes per ROW.  All
+//       invariant (see above; LUT is 2^K*V*4 B per group over 2^(L-K) groups,
+//       which is 65,536 B/timestep at both V=4 rungs against half as many
+//       timesteps as V=2's 32,768 B).
+//   (c) branch metric.  V=2 -> V=4 doubles the arithmetic per candidate, but a
+//       candidate's cost is dominated by its ~3.87 radix histogram passes and
+//       its compaction test, not by the metric — so this is a fraction of 2x.
+//   (d) K=8 -> K=9 at fixed V=4/L=12.  (a), (b) and (c) are ALL unchanged. Only
+//       the packer moves: one byte store per symbol becomes two byte
+//       read-modify-writes, in thread 0's serial backtrace, against an
+//       L1-resident row of <= 2 KiB.
+//
+// ⇒ From the measured anchor `qtip2` beam W=256 = 372.0 s/layer on an A100
+//   (FACTS.md:990; harness validated to 0.3% against the published V4 bake's
+//   370-376 s/layer, FACTS.md:993):
+//
+//       K=9/V=4/L=12  ~=  372.0 x 0.5 x [1.0 .. 1.4]  =  186-260 s/layer
+//
+//   i.e. the 2.25 bpw rung is CHEAPER to bake than the 2.00 bpw rung that
+//   ships, not 8x dearer. 43 layers ⇒ 2.2-3.1 h ⇒ $3.3-$4.6 at $1.49/hr, or
+//   1.1-1.6 h across two devices at the same total cost (`ARC_BAKE_DEVICES`,
+//   measured 1.97x on 2 GPUs, byte-identical — wave29-BD-rung-decision.md:431).
+//
+// ⚠ PROJECTED, NOT MEASURED. Nothing has run a V=4 bake. This is a division
+//   from a measured V=2 anchor by terms this file's own structure fixes; the
+//   only honest way to close it is to bake a layer and difference the markers.
+//
 // SHARED-MEMORY RESIDENCY (the claim wave13-AF was asked to test)
 // --------------------------------------------------------------
 // At beam_w = 256 the *beam* is 2 KiB (cost f32 + state u16 + parent u16).
