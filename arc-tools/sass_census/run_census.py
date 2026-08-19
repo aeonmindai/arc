@@ -157,6 +157,7 @@ LEVERS = [
     ("g4hf", "g4", "K9  replay + hoist [FUNNEL u32]"),
     ("g4hs", "g4", "K9  replay + hoist [SPLIT bit-plane]"),
     ("g5h", "g5", "K10 replay + hoist [B2 2-byte]"),
+    ("g5hc", "g5", "K10 replay + hoist [B2C tail-clamped]"),
     ("g5h3", "g5", "K10 replay + hoist [B3 generic 3-byte]"),
     ("g5hf", "g5", "K10 replay + hoist [FUNNEL u32]"),
     ("q3h", "q3", "K8  seq + hoist  <-- SERVING CONTROL"),
@@ -165,7 +166,16 @@ LEVERS = [
     ("q4hf", "q4", "K9  seq + hoist [FUNNEL u32]"),
     ("q4hs", "q4", "K9  seq + hoist [SPLIT bit-plane]"),
     ("q5h", "q5", "K10 seq + hoist [B2 2-byte]"),
+    ("q5hc", "q5", "K10 seq + hoist [B2C tail-clamped]"),
     ("q5hf", "q5", "K10 seq + hoist [FUNNEL u32]"),
+]
+
+# The one format decision still open on the serving side: pad the row stride by
+# MAX_BYTES-1 and read unclamped, or leave it unpadded and clamp every byte
+# index. These pairs are (K, padded route, clamped route).
+PAD_VS_CLAMP = [
+    (9, "k9b2", "k9b2c"),
+    (10, "k10b2", "k10b2c"),
 ]
 
 # Extraction isolation micro-census: prefix -> (K, label). Each has _ns8/16/24.
@@ -179,6 +189,7 @@ EXTRACTS = [
     ("k9fun", 9, "K=9 u32 pair + funnel shift"),
     ("k9split", 9, "K=9 byte plane + 1-bit plane"),
     ("k10b2", 10, "K=10 2-byte, padded stride"),
+    ("k10b2c", 10, "K=10 2-byte, tail-clamped"),
     ("k10b3", 10, "K=10 3-byte generic read"),
     ("k10fun", 10, "K=10 u32 pair + funnel shift"),
     ("k10split", 10, "K=10 byte plane + 2-bit plane"),
@@ -361,6 +372,36 @@ def main():
     print("above measured the same quantity independently; they are cross-checked")
     print("below. Two instruments agreeing is the evidence, not either one alone.")
 
+    # ---- the format decision ----------------------------------------------
+    # Isolated in its own section because it is the one question blocking the
+    # serving-side format: pad the row stride by MAX_BYTES-1 and read
+    # unclamped, or leave it unpadded and clamp. The clamp is pure overhead --
+    # both routes return the identical symbol (verified bit-exact on the host).
+    print()
+    print("=" * 78)
+    print("FORMAT DECISION: pad the row stride, or clamp every byte index?")
+    print("=" * 78)
+    print("MAX_BYTES = ceil((8 - gcd(K,8) + K)/8): K=8 -> 1, K=9 -> 2, K=10 -> 2.")
+    print("So padding costs MAX_BYTES-1 = 1 byte per ROW. What it buys:")
+    print()
+    print(f"{'':<10}{'padded':>10}{'clamped':>10}{'clamp cost':>12}"
+          f"{'  -> inst/weight at 0.25 / 0.375 / 0.50 extractions/wt'}")
+    print("-" * 78)
+    for K, padded, clamped in PAD_VS_CLAMP:
+        if padded not in ext_res or clamped not in ext_res:
+            print(f"K={K:<8} MISSING ({padded} or {clamped} did not compile)")
+            continue
+        p_, c_ = ext_res[padded]["ips"], ext_res[clamped]["ips"]
+        d = c_ - p_
+        print(f"K={K:<8}{p_:>10.3f}{c_:>10.3f}{d:>+12.3f}"
+              f"      {d*0.25:+.3f} / {d*0.375:+.3f} / {d*0.50:+.3f}")
+    print()
+    print("The three rightmost figures are the SAME clamp cost expressed as")
+    print("inst/weight at three amortisations: 0.25 = long contiguous slices,")
+    print("0.375 = a short-slice kernel paying its warm-up per row, 0.50 = the")
+    print("per-group re-seed. Multiply the clamp cost by YOUR shape's measured")
+    print("extractions/weight rather than quoting any one of them.")
+
     # ---- instrument cross-check -------------------------------------------
     print()
     print("=" * 78)
@@ -375,7 +416,9 @@ def main():
         ("K9 SPLIT vs K8, replay+hoist", "k9split", "g4hs", "g3h", "replay"),
         ("K10 B2 vs K8, replay+hoist", "k10b2", "g5h", "g3h", "replay"),
         ("K9 B2 vs K8, seq+hoist", "k9b2", "q4h", "q3h", "seq"),
+        ("K10 B2C vs K8, replay+hoist", "k10b2c", "g5hc", "g3h", "replay"),
         ("K9 B2C vs K8, seq+hoist", "k9b2c", "q4hc", "q3h", "seq"),
+        ("K10 B2C vs K8, seq+hoist", "k10b2c", "q5hc", "q3h", "seq"),
         ("K9 FUN vs K8, seq+hoist", "k9fun", "q4hf", "q3h", "seq"),
         ("K9 SPLIT vs K8, seq+hoist", "k9split", "q4hs", "q3h", "seq"),
         ("K10 B2 vs K8, seq+hoist", "k10b2", "q5h", "q3h", "seq"),

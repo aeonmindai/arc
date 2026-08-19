@@ -133,17 +133,23 @@ __device__ __forceinline__ uint32_t census_sym<8>(const uint8_t* __restrict__ p,
 // same discipline the PRMT/BREV pair below follows. Nothing here is
 // hand-counted.
 //
-//   EXT_B2    two byte loads.  Correct for K<=9 at any offset, and for K=10 as
-//             well: 10*t mod 8 is in {0,2,4,6}, so off+K <= 16 always. Reads
-//             one byte past the last symbol of a row, which is why it is the
-//             PADDED-STRIDE route.
+//   EXT_B2    two byte loads. The bytes a K-bit field can span is NOT
+//             ceil((7+K)/8): that maximises over all offsets 0..7, but the
+//             REACHABLE offsets of `K*t mod 8` are only the multiples of
+//             gcd(K,8), so the true bound is ceil((8 - gcd(K,8) + K)/8).
+//             K=8 -> 1, K=9 -> 2, K=10 -> 2. Two bytes is therefore exact for
+//             both new rungs, not merely sufficient for K=9. Reads up to
+//             MAX_BYTES-1 past the last symbol of a row, which is why this is
+//             the PADDED-STRIDE route.
 //   EXT_B2C   EXT_B2 with `min(idx, row_bytes-1)` on each byte index. This is
-//             what an unpadded format forces, and the clamp is a real,
-//             REMOVABLE cost -- pricing it separately is the point.
-//   EXT_B3    the generic ceil((K+7)/8) = 3-byte read, correct for any K<=17 at
-//             any offset. K=10's offset set makes this strictly redundant here;
-//             it is compiled so a defensively-written serving kernel can see
-//             what its generality costs.
+//             what an UNPADDED format forces, and the clamp is a real,
+//             REMOVABLE cost -- the B2C-minus-B2 delta is exactly what padding
+//             the row stride by MAX_BYTES-1 buys back, which is the open format
+//             decision on the serving side. Pricing it separately is the point.
+//   EXT_B3    the naive ceil((K+7)/8) = 3-byte read. Given the gcd bound above
+//             this is redundant for every K anyone has (8, 9, 10); it is
+//             compiled only so a defensively-written kernel can see what the
+//             unnecessary generality costs.
 //   EXT_FUN   one funnel shift over an aligned uint32 pair. Requires the row
 //             stride to be a multiple of 4 (a format decision, free to make).
 //   EXT_SPLIT two planes: the low 8 bits of every symbol stay byte-aligned, and
@@ -571,6 +577,8 @@ CENSUS_KERNEL_EXT(g4hf_ng4, G_K9V4L12_LUT, NG_LO, 2, true, WIN_REPLAY, EXT_FUN)
 CENSUS_KERNEL_EXT(g4hf_ng12, G_K9V4L12_LUT, NG_HI, 2, true, WIN_REPLAY, EXT_FUN)
 CENSUS_KERNEL_EXT(g4hs_ng4, G_K9V4L12_LUT, NG_LO, 2, true, WIN_REPLAY, EXT_SPLIT)
 CENSUS_KERNEL_EXT(g4hs_ng12, G_K9V4L12_LUT, NG_HI, 2, true, WIN_REPLAY, EXT_SPLIT)
+CENSUS_KERNEL_EXT(g5hc_ng4, G_K10V4L12_LUT, NG_LO, 2, true, WIN_REPLAY, EXT_B2C)
+CENSUS_KERNEL_EXT(g5hc_ng12, G_K10V4L12_LUT, NG_HI, 2, true, WIN_REPLAY, EXT_B2C)
 CENSUS_KERNEL_EXT(g5hf_ng4, G_K10V4L12_LUT, NG_LO, 2, true, WIN_REPLAY, EXT_FUN)
 CENSUS_KERNEL_EXT(g5hf_ng12, G_K10V4L12_LUT, NG_HI, 2, true, WIN_REPLAY, EXT_FUN)
 CENSUS_KERNEL_EXT(g5h3_ng4, G_K10V4L12_LUT, NG_LO, 2, true, WIN_REPLAY, EXT_B3)
@@ -603,6 +611,8 @@ CENSUS_KERNEL_EXT(q5_ng8, G_K10V4L12_LUT, NG_MID, 2, false, WIN_SEQ, EXT_B2)
 CENSUS_KERNEL_EXT(q5_ng12, G_K10V4L12_LUT, NG_HI, 2, false, WIN_SEQ, EXT_B2)
 CENSUS_KERNEL_EXT(q5h_ng4, G_K10V4L12_LUT, NG_LO, 2, true, WIN_SEQ, EXT_B2)
 CENSUS_KERNEL_EXT(q5h_ng12, G_K10V4L12_LUT, NG_HI, 2, true, WIN_SEQ, EXT_B2)
+CENSUS_KERNEL_EXT(q5hc_ng4, G_K10V4L12_LUT, NG_LO, 2, true, WIN_SEQ, EXT_B2C)
+CENSUS_KERNEL_EXT(q5hc_ng12, G_K10V4L12_LUT, NG_HI, 2, true, WIN_SEQ, EXT_B2C)
 CENSUS_KERNEL_EXT(q5hf_ng4, G_K10V4L12_LUT, NG_LO, 2, true, WIN_SEQ, EXT_FUN)
 CENSUS_KERNEL_EXT(q5hf_ng12, G_K10V4L12_LUT, NG_HI, 2, true, WIN_SEQ, EXT_FUN)
 
@@ -676,6 +686,9 @@ EXTRACT_KERNEL(k9split_ns24, 9, EXT_SPLIT, NS_HI)
 EXTRACT_KERNEL(k10b2_ns8, 10, EXT_B2, NS_LO)
 EXTRACT_KERNEL(k10b2_ns16, 10, EXT_B2, NS_MID)
 EXTRACT_KERNEL(k10b2_ns24, 10, EXT_B2, NS_HI)
+EXTRACT_KERNEL(k10b2c_ns8, 10, EXT_B2C, NS_LO)
+EXTRACT_KERNEL(k10b2c_ns16, 10, EXT_B2C, NS_MID)
+EXTRACT_KERNEL(k10b2c_ns24, 10, EXT_B2C, NS_HI)
 EXTRACT_KERNEL(k10b3_ns8, 10, EXT_B3, NS_LO)
 EXTRACT_KERNEL(k10b3_ns16, 10, EXT_B3, NS_MID)
 EXTRACT_KERNEL(k10b3_ns24, 10, EXT_B3, NS_HI)
