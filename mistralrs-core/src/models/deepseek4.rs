@@ -1697,25 +1697,50 @@ impl Attention {
                         kv_cache,
                         &k,
                         k_packed.as_ref().filter(|_| v4_fp8_kv_enabled()),
+                        v4_kv_retain_rows(self.sliding_window),
                     )?
                 };
-                // Reconstruct only what any query row in this block can reach.
-                // Dense storage stays whole (`raw_prefix = 0`) so
-                // `dsv4_attention` narrows exactly as it did before; packed
-                // storage narrows here, because the narrowing is what keeps the
-                // dequant O(window) rather than O(context).
-                let t_k_full = cached.seq_len()?;
-                let (raw_prefix, keep) = match &cached {
-                    V4CachedK::Dense(_) => (0, t_k_full),
-                    V4CachedK::Packed(_) => super::dsv4_attention::raw_keep_span(
-                        seq_len,
-                        self.sliding_window.max(1),
-                        t_k_full,
-                    ),
+                // Two independent prefixes meet here, and they compose:
+                //
+                //  * `store_base` — what the CACHE no longer holds, because
+                //    `retain_window` evicted it. `0` unless
+                //    `ARC_V4_KV_WINDOW` is on, and then the whole point: it is
+                //    the absolute position of the retained run's first row.
+                //  * the read-side narrowing — what this call chooses not to
+                //    RECONSTRUCT, because no query row in this block can reach
+                //    it (`raw_keep_span`). Packed storage does it here so the
+                //    FP8 dequant stays O(window); dense storage leaves it to
+                //    `dsv4_attention`, which narrows a view for free.
+                //
+                // `raw_prefix` is the absolute position of `k_cached[.., 0, ..]`
+                // either way, which is exactly what `dsv4_attention` defines it
+                // to be. With the window off and dense storage this is `0` and
+                // the whole cache, i.e. character-for-character the old call.
+                let store_base = kv_cache.first_cached();
+                let t_k_full = store_base + cached.seq_len()?;
+                let (raw_base, keep) = super::dsv4_attention::raw_keep_span(
+                    seq_len,
+                    self.sliding_window.max(1),
+                    t_k_full,
+                );
+                let (span_base, span_len, raw_prefix) = match &cached {
+                    V4CachedK::Dense(_) => (0, cached.seq_len()?, store_base),
+                    V4CachedK::Packed(_) => {
+                        let rel = raw_base.checked_sub(store_base).ok_or_else(|| {
+                            candle_core::Error::Msg(format!(
+                                "V4 KV window: rows in this block reach back to absolute key \
+                                 {raw_base}, but the store was capped at {store_base}. The \
+                                 retained window is too small for a {seq_len}-row block at \
+                                 sliding_window {}.",
+                                self.sliding_window
+                            ))
+                        })?;
+                        (rel, keep, raw_base)
+                    }
                 };
                 let k_cached = {
                     let _s = arc_profiler::device_span("kv_cache_span");
-                    cached.span(raw_prefix, keep, k.dtype())?
+                    cached.span(span_base, span_len, k.dtype())?
                 };
                 // Cache read-back. Diff vs prefill's freshly-computed K splits a
                 // cache-storage bug (old rows differ) from a new-token position
@@ -2574,6 +2599,64 @@ impl V4CachedK {
     }
 }
 
+/// Process-wide state of the V4 windowed KV store. `0` = not yet resolved
+/// (consult `ARC_V4_KV_WINDOW`), `1` = off, `2` = on.
+///
+/// An atomic rather than a `OnceLock` so [`set_v4_kv_window`] can drive both
+/// settings from one process — the identity guard in
+/// `tests/synthetic_load_smoke.rs` has to run the SAME model both ways, and a
+/// `OnceLock` would silently measure whichever the test binary latched first.
+/// Same shape, and the same reason, as `set_mtp_load_depth`.
+static V4_KV_WINDOW: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Turn V4's windowed KV store on or off for every subsequently-appended slot.
+///
+/// **Opt-in, default off** (`ARC_V4_KV_WINDOW=1`). With it off, V4's KV cache
+/// grows for the whole context exactly as it always has and not one byte of
+/// any other model's cache moves.
+///
+/// It is opt-in for the reason written on [`v4_fp8_kv_enabled`] one screen up:
+/// the last KV-storage change to ship default-on without a GPU behind it
+/// (`ARC_V4_FP8_KV`, wave43-BU) killed every request on the first V4 forward
+/// that met a real device. The saving here is arithmetic and the identity is
+/// pinned on CPU; the *decode-time* cost of the compaction copy is not, and
+/// until an A/B has run, the default is the layout that has actually served.
+pub fn set_v4_kv_window(on: bool) {
+    V4_KV_WINDOW.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether V4 should cap its raw KV store at the attention window.
+pub fn v4_kv_window_enabled() -> bool {
+    match V4_KV_WINDOW.load(std::sync::atomic::Ordering::SeqCst) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var("ARC_V4_KV_WINDOW").is_ok_and(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                )
+            });
+            set_v4_kv_window(on);
+            on
+        }
+    }
+}
+
+/// How many trailing raw rows a V4 KV slot must retain, given its attention
+/// window — or `None` when the store is uncapped.
+///
+/// `window + margin`, and the margin is not slack: after the compaction that
+/// precedes an append, the slot holds exactly `retain` rows, and the forward
+/// that follows reaches back `t_q + window - 1`
+/// ([`super::dsv4_attention::raw_keep_span`]) over the `retain + t_q` rows
+/// that then exist. That is satisfied for any `retain >= window - 1`; the
+/// margin is what additionally survives an MTP verify rollback, which lowers
+/// `current_seq_len` by up to `--mtp-depth` without giving any rows back.
+pub(crate) fn v4_kv_retain_rows(sliding_window: usize) -> Option<usize> {
+    v4_kv_window_enabled().then(|| sliding_window.max(1) + crate::kv_cache::RETAIN_WINDOW_MARGIN)
+}
+
 /// Append V4's fused K/V. `packed` is the quantized form of `k`, already
 /// filtered by the caller: `Some` stores the FP8 codes, `None` stores `k` dense
 /// beside a 1-wide marker. Returns the full cached sequence in whichever layout
@@ -2588,8 +2671,15 @@ fn append_kv_mqa(
     kv_cache: &mut KvCache,
     k: &Tensor,
     packed: Option<&V4PackedK>,
+    retain: Option<usize>,
 ) -> Result<V4CachedK> {
     require_normal_kv_slot(kv_cache)?;
+    // Re-armed per append rather than at cache construction: `NormalCache` is
+    // built by `NormalCache::new_plain(len, max_seq_len)` from inside
+    // `DeepSeekV4::new`, which has no way to hand a per-layer window to a
+    // constructor shared with thirty other models. A `usize` store per layer
+    // per step is free next to the append it precedes.
+    kv_cache.set_retain_window(retain);
     match packed {
         Some(p) => {
             let (codes, side) = kv_cache.append(&p.codes, &p.side)?;
@@ -2629,6 +2719,12 @@ fn append_graph_kv_mqa(
              the U8 code cache."
         );
     }
+    // The eager arm arms the retention policy on every append; the graph arm
+    // must disarm it, because `write_kv_inplace` addresses an ABSOLUTE device
+    // slot and a compacted buffer's column 0 is not absolute 0. Clearing the
+    // policy is enough for a slot that has not yet evicted; one that HAS is a
+    // real incompatibility and `SingleCache::append_graph` says so by name.
+    kv_cache.set_retain_window(None);
     let marker = v4_v_marker(k)?;
     let (k_full, _marker_full) = kv_cache.append_graph(k, &marker, position, cap)?;
     Ok(k_full)
@@ -4925,7 +5021,7 @@ mod kv_footprint_tests {
                 )?,
                 None => None,
             };
-            append_kv_mqa(&mut slot, &k, packed.as_ref())?;
+            append_kv_mqa(&mut slot, &k, packed.as_ref(), None)?;
         }
         let KvCache::Normal { k, v } = &slot else {
             panic!("V4 slot must be KvCache::Normal");
@@ -5070,7 +5166,7 @@ mod kv_footprint_tests {
                     .into_iter()
                     .map(|v| v.to_bits()),
             );
-            let cached = append_kv_mqa(&mut slot, &k, Some(&packed))?;
+            let cached = append_kv_mqa(&mut slot, &k, Some(&packed), None)?;
             assert!(matches!(cached, V4CachedK::Packed(_)));
             assert_eq!(cached.seq_len()?, t + 1);
         }
@@ -5129,7 +5225,7 @@ mod kv_footprint_tests {
                 .collect();
             expected.extend(row.iter().copied());
             let k = Tensor::from_vec(row, (1, 1, 1, head_dim), &dev)?;
-            let cached = append_kv_mqa(&mut slot, &k, None)?;
+            let cached = append_kv_mqa(&mut slot, &k, None, None)?;
             assert!(matches!(cached, V4CachedK::Dense(_)));
             let materialised = cached.span(0, cached.seq_len()?, DType::F32)?;
             assert_eq!(materialised.dims(), &[1, 1, (t + 1) as usize, head_dim]);
@@ -5138,6 +5234,7 @@ mod kv_footprint_tests {
         let cached = append_kv_mqa(
             &mut slot,
             &Tensor::zeros((1, 1, 1, head_dim), DType::F32, &dev)?,
+            None,
             None,
         )?;
         let got: Vec<f32> = cached
@@ -5196,6 +5293,8 @@ mod kv_footprint_tests {
                 current_seq_len: 0,
                 max_seq_len: 4096,
                 capacity_seq_len: capacity,
+                first_cached: 0,
+                retain_window: None,
             },
             v: SingleCache {
                 all_data: Some(Tensor::zeros(shape, DType::BF16, &dev)?),
@@ -5203,6 +5302,8 @@ mod kv_footprint_tests {
                 current_seq_len: 0,
                 max_seq_len: 4096,
                 capacity_seq_len: capacity,
+                first_cached: 0,
+                retain_window: None,
             },
         })
     }
@@ -5274,7 +5375,7 @@ mod kv_footprint_tests {
                     .into_iter()
                     .map(|v| v.to_bits()),
             );
-            let cached = append_kv_mqa(&mut slot, &k, Some(&packed))?;
+            let cached = append_kv_mqa(&mut slot, &k, Some(&packed), None)?;
             assert!(matches!(cached, V4CachedK::Packed(_)));
             assert_eq!(cached.seq_len()?, t + 1);
         }
@@ -5339,7 +5440,7 @@ mod kv_footprint_tests {
                     .into_iter()
                     .map(|v| v.to_bits()),
             );
-            let cached = append_kv_mqa(&mut slot, &k, None)?;
+            let cached = append_kv_mqa(&mut slot, &k, None, None)?;
             assert!(matches!(cached, V4CachedK::Dense(_)));
         }
 
@@ -5424,7 +5525,7 @@ mod kv_footprint_tests {
         let dev = Device::Cpu;
         let mut rotating = KvCache::new_rotating(2, 16, NormalCache::CACHE_GROW_SIZE);
         let k = Tensor::zeros((1, 1, 1, 8), DType::F32, &dev)?;
-        let err = append_kv_mqa(&mut rotating, &k, None).unwrap_err();
+        let err = append_kv_mqa(&mut rotating, &k, None, None).unwrap_err();
         assert!(
             err.to_string().contains("Rotating"),
             "expected a loud slot-type error, got: {err}"
