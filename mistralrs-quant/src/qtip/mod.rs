@@ -857,6 +857,64 @@ impl QtipGeometry {
         }
     }
 
+    /// What a fresh bake picks when `ARC_QTIP_GEOMETRY` says nothing.
+    ///
+    /// **`K4V2L16`, and the flip is this one line.** Deliberately not taken
+    /// here: nothing about the V=4/L=12 family has touched a GPU — its kernel
+    /// has never been compiled at any K — and the precedent for shipping a
+    /// CPU-validated storage change default-on is specific and bad. Its
+    /// arithmetic was proven and its device-time cost was not, and it killed
+    /// every request on the first V4 forward that met a real device. Ship the
+    /// path; leave the default alone. Pinned by
+    /// [`tests::the_new_geometry_is_not_the_default`].
+    pub const DEFAULT: Self = QtipGeometry::K4V2L16;
+
+    /// Read the geometry choice from the environment.
+    ///
+    /// `ARC_QTIP_GEOMETRY` is `k4v2l16` (the default) or `k<K>v4l12` for a K
+    /// this build implements — `k9v4l12` is the one worth asking for. Anything
+    /// else is refused rather than silently resolved, exactly as
+    /// [`QtipCodebook::from_env`] refuses: picking the wrong one changes what
+    /// every symbol in the artifact means.
+    pub fn from_env() -> Result<Self> {
+        match std::env::var("ARC_QTIP_GEOMETRY") {
+            Err(_) => Ok(Self::DEFAULT),
+            Ok(v) => Self::from_spec(&v),
+        }
+    }
+
+    /// The parse rule behind [`QtipGeometry::from_env`], as a pure function.
+    ///
+    /// Split out so it can be tested directly. Testing a *replica* of this rule
+    /// instead — which is what the first version of the test did — asserts only
+    /// that the replica behaves, and passes happily while the real reader
+    /// silently accepts an unsupported K (measured: mutation S7). Mutating the
+    /// process environment in a unit test races the other tests in the binary,
+    /// so the function is the seam, not the variable.
+    pub fn from_spec(spec: &str) -> Result<Self> {
+        match spec {
+            "" => Ok(Self::DEFAULT),
+            "k4v2l16" | "k4" | "shipped" => Ok(QtipGeometry::K4V2L16),
+            other => {
+                // `k<K>v4l12`, so a new K needs no new arm here — the family
+                // decides whether it has a decoder.
+                let parsed = other
+                    .strip_prefix('k')
+                    .and_then(|r| r.strip_suffix("v4l12"))
+                    .and_then(|k| k.parse::<u32>().ok());
+                match parsed {
+                    Some(k) => Self::trellis_v4l12(k),
+                    None => candle_core::bail!(
+                        "ARC_QTIP_GEOMETRY={other:?} is not a geometry. Use `k4v2l16` (the \
+                         default) or `k<K>v4l12` with K in {:?}. Refusing rather than guessing \
+                         — the choice changes what every symbol in the artifact means.",
+                        trellis_v4l12::K_SUPPORTED
+                    ),
+                }
+            }
+        }
+    }
+
     /// Short label for bake headers and error messages.
     pub fn tag(self) -> String {
         match self {
@@ -2717,6 +2775,9 @@ impl QtipLayer {
     // path (GPU-validated numerical parity); see arc-tools/CI_HYGIENE.md.
     #[allow(clippy::needless_range_loop)]
     fn dequantize_weights_rotated_f32(&self) -> Result<Vec<f32>> {
+        if let Some(rung) = self.v4l12_rung() {
+            return self.dequantize_weights_rotated_f32_v4l12(rung);
+        }
         let blocks_cpu = self.blocks.to_device(&Device::Cpu)?;
         let scales_cpu = self.row_scales.to_device(&Device::Cpu)?;
         let lut_cpu = self.lut.to_device(&Device::Cpu)?;
@@ -2755,6 +2816,56 @@ impl QtipLayer {
         Ok(out)
     }
 
+    /// CPU decode for the V=4/L=12 family, in the rotated frame and scaled.
+    ///
+    /// Separate from the K=4/V=2 body rather than a branch inside it: the
+    /// symbol extraction, the packed row length and the table's element type
+    /// all differ, and `trellis_v4l12::Rung` already owns that arithmetic and
+    /// is bit-exactly gated against the GPU kernel. Restating it here would be
+    /// a second implementation of a format.
+    fn dequantize_weights_rotated_f32_v4l12(&self, rung: trellis_v4l12::Rung) -> Result<Vec<f32>> {
+        if self.lut.dtype() != DType::BF16 {
+            candle_core::bail!(
+                "QtipLayer[{}]: table must be BF16, got {:?}",
+                self.geometry.tag(),
+                self.lut.dtype()
+            );
+        }
+        let blocks_cpu = self.blocks.to_device(&Device::Cpu)?.contiguous()?;
+        let scales_cpu = self.row_scales.to_device(&Device::Cpu)?.contiguous()?;
+        let lut_cpu = self.lut.to_device(&Device::Cpu)?.contiguous()?;
+
+        let blocks_data: Vec<u8> = blocks_cpu.flatten_all()?.to_vec1()?;
+        let scales_data: Vec<f32> = scales_cpu.flatten_all()?.to_vec1()?;
+        let lut_data: Vec<half::bf16> = lut_cpu.flatten_all()?.to_vec1()?;
+
+        let n = scales_data.len();
+        let k_in = self.in_features;
+        let num_symbols = rung.num_symbols(k_in);
+        let packed_per_row = rung.packed_bytes(num_symbols);
+        if blocks_data.len() != n * packed_per_row {
+            candle_core::bail!(
+                "QtipLayer[{}]: blocks hold {} B but {n} rows × {packed_per_row} B = {}",
+                self.geometry.tag(),
+                blocks_data.len(),
+                n * packed_per_row
+            );
+        }
+
+        let mut out = vec![0f32; n * k_in];
+        for row in 0..n {
+            let packed = &blocks_data[row * packed_per_row..(row + 1) * packed_per_row];
+            let dst = &mut out[row * k_in..(row + 1) * k_in];
+            rung.decode_row_into(
+                trellis_v4l12::Row::new(packed, num_symbols, scales_data[row]),
+                &lut_data,
+                dst,
+            )
+            .map_err(candle_core::Error::Msg)?;
+        }
+        Ok(out)
+    }
+
     fn dequantize_weights_f32(&self) -> Result<Vec<f32>> {
         let mut out = self.dequantize_weights_rotated_f32()?;
 
@@ -2781,6 +2892,26 @@ impl QtipLayer {
     }
 
     pub fn dequantize_weights(&self) -> Result<Tensor> {
+        // The V=4/L=12 family decodes on CPU (`dequantize_weights_rotated_f32`
+        // routes to it). There is no GPU dequantize kernel for the family and
+        // no 3-D path, so those two stay refused rather than falling through to
+        // a K=4 decoder.
+        if let Some(rung) = self.v4l12_rung() {
+            if self.num_experts.is_some() {
+                candle_core::bail!(
+                    "QtipLayer::dequantize_weights: geometry {} has no stacked-expert (3-D) \
+                     decode. Refusing rather than reading these symbols with the K=4/V=2 \
+                     expert path.",
+                    self.geometry.tag()
+                );
+            }
+            let _ = rung;
+            let out = self.dequantize_weights_f32()?;
+            let n = self.row_scales.dim(0)?;
+            return Tensor::from_vec(out, (n, self.in_features), &Device::Cpu)?
+                .to_device(self.blocks.device())?
+                .to_dtype(DType::BF16);
+        }
         self.require_k4v2l16("dequantize_weights")?;
         // 3-D stacked-expert path: iterate over experts and stack `[N, K_in]`
         // slices into `[E, N, K_in]`. We reuse the 2-D dequant per expert
@@ -2985,7 +3116,11 @@ impl QtipLayer {
         // CPU path below.
         #[cfg(feature = "cuda")]
         {
-            if cuda_ops::can_use_qtip_cuda(&self.blocks) {
+            // `forward_dequantize_cuda` is the K=4/V=2 CUDA path end to end —
+            // its dequantize kernel and its fused gemv both index a
+            // `[2^16, 2]` F32 table. A family layer must never reach it, and
+            // gets its own dispatch below.
+            if self.v4l12_rung().is_none() && cuda_ops::can_use_qtip_cuda(&self.blocks) {
                 if let Ok(mut result) = self.forward_dequantize_cuda(&x_2d, x.dtype(), n, k_in) {
                     if let Some(bias) = &self.bias {
                         result = result.broadcast_add(bias)?;
@@ -2996,6 +3131,29 @@ impl QtipLayer {
                         result = result.reshape(new_dims)?;
                     }
                     return Ok(result);
+                }
+            }
+        }
+
+        // V=4/L=12 CUDA single-token decode: the one GPU path the family has.
+        // Anything else — multi-token, or a shape the launcher refuses — falls
+        // through to the CPU decode below, which is correct and slow, rather
+        // than to a K=4 kernel, which would be fast and wrong.
+        #[cfg(feature = "cuda")]
+        {
+            if let Some(rung) = self.v4l12_rung() {
+                if cuda_ops::can_use_qtip_cuda(&self.blocks) && x_2d.dim(0)? == 1 {
+                    if let Ok(mut result) = self.forward_v4l12_gemv_cuda(&x_2d, x.dtype(), rung) {
+                        if let Some(bias) = &self.bias {
+                            result = result.broadcast_add(bias)?;
+                        }
+                        if orig_dims.len() > 2 {
+                            let mut new_dims = orig_dims[..orig_dims.len() - 1].to_vec();
+                            new_dims.push(result.dim(1)?);
+                            result = result.reshape(new_dims)?;
+                        }
+                        return Ok(result);
+                    }
                 }
             }
         }
@@ -3069,6 +3227,76 @@ impl QtipLayer {
     ///
     /// Returns `Err` if any precondition fails (e.g. unsupported dtype or
     /// block size) — the caller falls back to the CPU path.
+    /// V=4/L=12 single-token fused decode + gemv on CUDA.
+    ///
+    /// The family's only GPU path. Deliberately narrow: `n_tokens == 1`, the
+    /// shape the fused kernel exists for. Multi-token falls back to the CPU
+    /// decode rather than to a K=4 kernel — slow and right beats fast and
+    /// wrong, and there is no V=4 dequantize kernel to matmul against.
+    ///
+    /// The row-scale hoist is **off**: it is the one lever that costs
+    /// bit-exactness against the CPU reference, and nothing about this family
+    /// has been measured on a device, so there is no evidence to trade
+    /// exactness for.
+    #[cfg(feature = "cuda")]
+    fn forward_v4l12_gemv_cuda(
+        &self,
+        x_2d: &Tensor,
+        out_dtype: DType,
+        rung: trellis_v4l12::Rung,
+    ) -> Result<Tensor> {
+        if !matches!(out_dtype, DType::BF16 | DType::F16 | DType::F32) {
+            candle_core::bail!("QTIP v4l12 forward CUDA: unsupported out dtype {out_dtype:?}");
+        }
+        if self.num_experts.is_some() {
+            candle_core::bail!("QTIP v4l12 forward CUDA: no stacked-expert path");
+        }
+        if tune::spec_pin_gemm() {
+            candle_core::bail!("QTIP v4l12 forward CUDA: spec_pin_gemm pins off the fused path");
+        }
+        let k_in = self.in_features;
+        if x_2d.dim(1)? != k_in {
+            candle_core::bail!("QTIP v4l12 forward CUDA: x.dim(1) != in_features");
+        }
+
+        let x_rot_dtype = if matches!(x_2d.dtype(), DType::BF16 | DType::F16 | DType::F32) {
+            x_2d.dtype()
+        } else {
+            DType::BF16
+        };
+        let x_for_rot = if x_2d.dtype() == x_rot_dtype {
+            x_2d.contiguous()?
+        } else {
+            x_2d.to_dtype(x_rot_dtype)?.contiguous()?
+        };
+        let x_rotated = if self.rotation_block >= 2 {
+            let signs = match &self.rotation_signs {
+                Some(t) => t,
+                None => candle_core::bail!(
+                    "QtipLayer: rotation_block={} but rotation_signs is None",
+                    self.rotation_block
+                ),
+            };
+            cuda_ops::rotate_x_cuda(&x_for_rot, signs, self.rotation_block)?
+        } else {
+            x_for_rot
+        };
+
+        let y = cuda_ops::fused_gemv_v4l12_cuda(
+            &self.blocks,
+            &self.row_scales,
+            &self.lut,
+            &x_rotated,
+            k_in,
+            rung,
+            trellis_v4l12::RowScaleHoist::Off,
+        )?;
+        if y.dtype() != out_dtype {
+            return y.to_dtype(out_dtype);
+        }
+        Ok(y)
+    }
+
     #[cfg(feature = "cuda")]
     fn forward_dequantize_cuda(
         &self,
@@ -3902,7 +4130,12 @@ impl QuantMethod for QtipLayer {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.require_k4v2l16("forward")?;
+        // 2-D forward is wired for the V=4/L=12 family;
+        // `forward_dequantize` picks the family's paths and refuses the ones
+        // that have no kernel. 3-D stacks are refused there, as before.
+        if self.v4l12_rung().is_none() {
+            self.require_k4v2l16("forward")?;
+        }
         self.forward_dequantize(x)
     }
 
@@ -4280,15 +4513,22 @@ impl QtipLayer {
         match self.geometry {
             QtipGeometry::K4V2L16 => Ok(()),
             other => candle_core::bail!(
-                "QtipLayer::{op}: this layer was baked at geometry {}, and {op} only implements \
-                 K=4/V=2/L=16. The {} decode path is not wired into serving yet — the fused \
-                 GEMV kernel exists (`kernels/qtip/qtip_gemv_k8v4l12.cu`) but nothing dispatches \
-                 to it. Refusing rather than decoding these symbols as K=4/V=2, which would not \
-                 fault (both geometries are 2 bits per weight, so the packed byte count is the \
-                 same) and would silently serve wrong weights.",
-                other.tag(),
+                "QtipLayer::{op}: this layer was baked at geometry {}, and {op} implements only \
+                 K=4/V=2/L=16. There is no V=4/L=12 kernel behind this entry point — the family \
+                 has a fused decode+gemv kernel (`kernels/qtip/qtip_gemv_v4l12.cu`) and a CPU \
+                 decode, and nothing else. Refusing rather than decoding these symbols as \
+                 K=4/V=2: at 2 bits per weight the packed byte count is identical, so the \
+                 misread would not fault and would silently serve wrong weights.",
                 other.tag()
             ),
+        }
+    }
+
+    /// The decode rung when this layer belongs to the V=4/L=12 family.
+    fn v4l12_rung(&self) -> Option<trellis_v4l12::Rung> {
+        match self.geometry {
+            QtipGeometry::TrellisV4L12 { rung } => Some(rung),
+            QtipGeometry::K4V2L16 => None,
         }
     }
 
@@ -7456,68 +7696,31 @@ mod tests {
         Ok(())
     }
 
-    /// Every decode entry point must refuse a geometry it cannot decode.
+    /// Every decode entry point that has NO kernel for a geometry must refuse
+    /// it, rather than falling through to the K=4/V=2 decoder.
     ///
-    /// Stage 2 makes a K=8/V=4/L=12 artifact loadable. The decoders behind
-    /// these entry points all unpack nibbles and index a `[2^16, 2]` table, and
-    /// handed a K=8 row they would NOT fault — at 2 bits per weight the packed
-    /// byte count is identical and every index lands in bounds. They would
-    /// serve garbage. Without this test, "the format landed" would mean "the
-    /// engine now has a way to silently serve wrong weights".
+    /// The decoders behind these unpack nibbles and index a `[2^16, 2]` table,
+    /// and handed a V=4 row they would NOT fault — at 2 bpw the packed byte
+    /// count is identical and every index lands in bounds. They would serve
+    /// garbage.
+    ///
+    /// **Stage 3 narrowed this test on purpose.** `dequantize_weights` and
+    /// `forward` are now wired for the family (CPU decode, plus a CUDA
+    /// single-token fused gemv), so they are covered by
+    /// `a_k9_layer_forwards_instead_of_refusing` instead. What is left here is
+    /// what still has no kernel — and a half-wired dispatch that falls through
+    /// is worse than one that refuses, so this stays.
     #[test]
-    fn every_decode_entry_point_refuses_an_unsupported_geometry() -> Result<()> {
+    fn unwired_entry_points_refuse_an_unsupported_geometry() -> Result<()> {
         let device = Device::Cpu;
         let k_in = 64usize;
 
-        // 2-D entry points.
-        let mut two_d = geometry_fixture(&device)?;
-        // Sanity: all of these work at the geometry this build implements, so
-        // the refusals below are about the geometry and nothing else.
+        // Sanity at the geometry this build implements everywhere, so the
+        // refusals below are about the geometry and nothing else.
+        let two_d = geometry_fixture(&device)?;
         two_d.dequantize_weights()?;
-        let x = Tensor::zeros((1, k_in), DType::F32, &device)?;
-        two_d.forward(&x)?;
-        two_d.dequantize_w()?;
         assert!(two_d.qtip_packed().is_some());
 
-        two_d.geometry = k8();
-        for (what, res) in [
-            ("dequantize_weights", two_d.dequantize_weights().err()),
-            ("forward", two_d.forward(&x).err()),
-            ("dequantize_w", two_d.dequantize_w().err()),
-        ] {
-            let err = res.unwrap_or_else(|| panic!("{what} must refuse a k8v4l12 layer"));
-            let msg = err.to_string();
-            assert!(
-                msg.contains("k8v4l12") && msg.contains("Refusing"),
-                "{what}: refusal must name the geometry and say it is refusing: {msg}"
-            );
-            // The refusal must come from THIS entry point, not from something
-            // it happens to call. `forward` reaching an inner guard is still a
-            // refusal, but it is not evidence that `forward` checks — and an
-            // entry point that relies on a callee's guard breaks the moment the
-            // callee gains a fast path that skips it. (Measured: mutation G1
-            // removed `forward`'s own guard and every test stayed green.)
-            //
-            // `dequantize_w` is the one exception by construction: it is a
-            // one-line delegation to `dequantize_weights` and has no body to
-            // guard.
-            let expect_op = if what == "dequantize_w" {
-                "dequantize_weights"
-            } else {
-                what
-            };
-            assert!(
-                msg.contains(&format!("QtipLayer::{expect_op}:")),
-                "{what}: refusal came from elsewhere — expected `QtipLayer::{expect_op}:` in: {msg}"
-            );
-        }
-        assert!(
-            two_d.qtip_packed().is_none(),
-            "qtip_packed must hand out nothing — QtipPackedView carries no geometry, so a \
-             consumer would read the bytes as K=4/V=2 nibbles"
-        );
-
-        // 3-D entry points.
         let mut stack =
             QtipLayer::stack_experts(vec![geometry_fixture(&device)?, geometry_fixture(&device)?])?;
         stack.dequantize_expert(0)?;
@@ -7525,7 +7728,8 @@ mod tests {
         let idx = Tensor::zeros((1, 1), DType::U32, &device)?;
         stack.gather_forward(&a, &idx)?;
 
-        stack.geometry = k8();
+        // Now the family, on paths with no kernel.
+        stack.geometry = QtipGeometry::trellis_v4l12(8)?;
         for (what, res) in [
             ("dequantize_expert", stack.dequantize_expert(0).err()),
             ("gather_forward", stack.gather_forward(&a, &idx).err()),
@@ -7535,10 +7739,303 @@ mod tests {
             assert!(msg.contains("k8v4l12"), "{what}: {msg}");
             assert!(
                 msg.contains(&format!("QtipLayer::{what}:")),
-                "{what}: refusal came from elsewhere: {msg}"
+                "{what}: refusal came from elsewhere — an entry point that inherits a callee's \
+                 guard breaks the moment the callee gains a fast path: {msg}"
+            );
+        }
+
+        // `qtip_packed` carries no geometry, so it must hand out nothing.
+        let mut packed_view = geometry_fixture(&device)?;
+        packed_view.geometry = QtipGeometry::trellis_v4l12(8)?;
+        assert!(
+            packed_view.qtip_packed().is_none(),
+            "QtipPackedView has no geometry field; a consumer would read the bytes as K=4/V=2 \
+             nibbles"
+        );
+        Ok(())
+    }
+
+    /// Build a K=9 layer whose weights are known, so a forward can be checked
+    /// against an independent decode rather than against itself.
+    fn k9_layer(device: &Device, n: usize, k_in: usize) -> Result<(QtipLayer, Vec<u8>, Vec<f32>)> {
+        let geo = QtipGeometry::trellis_v4l12(9)?;
+        let rung = trellis_v4l12::Rung::new(9).map_err(candle_core::Error::Msg)?;
+        let n_sym = rung.num_symbols(k_in);
+        let row_bytes = rung.packed_bytes(n_sym);
+
+        let mut packed = Vec::with_capacity(n * row_bytes);
+        for row in 0..n {
+            let mut z = (row as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let syms: Vec<u32> = (0..n_sym)
+                .map(|_| {
+                    z ^= z << 13;
+                    z ^= z >> 7;
+                    z ^= z << 17;
+                    ((z >> 24) as u32) & 0x1FF
+                })
+                .collect();
+            packed.extend(rung.pack(&syms));
+        }
+        let scales: Vec<f32> = (0..n).map(|i| 0.013 + i as f32 * 0.002).collect();
+
+        let layer = QtipLayer {
+            blocks: Tensor::from_vec(packed.clone(), (n, row_bytes), device)?,
+            row_scales: Tensor::from_vec(scales.clone(), (n,), device)?,
+            lut: Tensor::from_slice(
+                &trellis_v4l12::gaussian_lut_bf16(),
+                (trellis_v4l12::LUT_STATES, trellis_v4l12::V as usize),
+                device,
+            )?,
+            bias: None,
+            in_features: k_in,
+            num_experts: None,
+            rotation_signs: None,
+            rotation_block: 0,
+            search: QtipSearchStamp::Trellis,
+            search_detail: QtipSearchDetail::Known {
+                beam_width: None,
+                hessian: false,
+            },
+            codebook: QtipCodebook::Gaussian,
+            geometry: geo,
+        };
+        Ok((layer, packed, scales))
+    }
+
+    /// **Stage 3, the point of it: a K=9 layer is SERVED, not refused.**
+    ///
+    /// Checked against an independent decode through `trellis_v4l12::Rung`,
+    /// not against the layer's own dequantize — otherwise a wrong decoder
+    /// would agree with itself.
+    #[test]
+    fn a_k9_layer_forwards_instead_of_refusing() -> Result<()> {
+        let device = Device::Cpu;
+        let (n, k_in) = (6usize, 128usize);
+        let (layer, packed, scales) = k9_layer(&device, n, k_in)?;
+
+        let w = layer.dequantize_weights()?.to_dtype(DType::F32)?;
+        assert_eq!(w.dims(), &[n, k_in]);
+        let got: Vec<f32> = w.flatten_all()?.to_vec1()?;
+
+        let rung = trellis_v4l12::Rung::new(9).unwrap();
+        let n_sym = rung.num_symbols(k_in);
+        let row_bytes = rung.packed_bytes(n_sym);
+        let lut = trellis_v4l12::gaussian_lut_bf16();
+        for row in 0..n {
+            let mut want = vec![0f32; k_in];
+            rung.decode_row_into(
+                trellis_v4l12::Row::new(
+                    &packed[row * row_bytes..(row + 1) * row_bytes],
+                    n_sym,
+                    scales[row],
+                ),
+                &lut,
+                &mut want,
+            )
+            .unwrap();
+            for i in 0..k_in {
+                // dequantize_weights returns BF16, so compare at BF16 precision.
+                let g = got[row * k_in + i];
+                let e = half::bf16::from_f32(want[i]).to_f32();
+                assert_eq!(g, e, "row {row} col {i}");
+            }
+        }
+
+        // ...and a real forward runs and matches x @ W^T. F32 on CPU: candle's
+        // CPU matmul has no BF16 kernel, which is a property of the shipped
+        // K=4 path too, not of this geometry.
+        let x: Vec<f32> = (0..k_in).map(|i| ((i as f32) * 0.07).sin()).collect();
+        let x_t = Tensor::from_vec(x, (1, k_in), &device)?;
+        let y = layer.forward(&x_t)?.to_dtype(DType::F32)?;
+        assert_eq!(y.dims(), &[1, n]);
+        let y_ref = x_t.matmul(&w.t()?)?;
+        let (yv, rv): (Vec<f32>, Vec<f32>) =
+            (y.flatten_all()?.to_vec1()?, y_ref.flatten_all()?.to_vec1()?);
+        for (a, b) in yv.iter().zip(rv.iter()) {
+            let denom = a.abs().max(b.abs()).max(1e-3);
+            assert!((a - b).abs() / denom < 1e-2, "forward {a} vs reference {b}");
+        }
+        Ok(())
+    }
+
+    /// A K=9 forward must NOT be the K=4 decoder quietly succeeding.
+    ///
+    /// Both geometries decode the same bytes without faulting, so "it returned
+    /// numbers" proves nothing. Decode the same packed bytes as K=4/V=2 and
+    /// require the answers to differ.
+    #[test]
+    fn the_k9_path_is_not_the_k4_decoder_in_disguise() -> Result<()> {
+        let device = Device::Cpu;
+        let (n, k_in) = (4usize, 128usize);
+        let (layer, _, _) = k9_layer(&device, n, k_in)?;
+        let k9_w: Vec<f32> = layer
+            .dequantize_weights()?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
+
+        // Same bytes, same scales, read as the shipped rung. A K=9 row is
+        // longer than a K=4 row of the same in_features, so trim to what the
+        // K=4 decoder expects — the point is that the SYMBOLS differ, not the
+        // lengths.
+        let k4_bytes = QtipGeometry::K4V2L16.packed_len(k_in);
+        let blocks: Vec<u8> = layer.blocks.flatten_all()?.to_vec1()?;
+        let row_bytes = blocks.len() / n;
+        let mut trimmed = Vec::with_capacity(n * k4_bytes);
+        for row in 0..n {
+            trimmed.extend_from_slice(&blocks[row * row_bytes..row * row_bytes + k4_bytes]);
+        }
+        let mut as_k4 = layer;
+        as_k4.geometry = QtipGeometry::K4V2L16;
+        as_k4.blocks = Tensor::from_vec(trimmed, (n, k4_bytes), &device)?;
+        as_k4.lut = Tensor::from_vec(gaussian_lut(), (1usize << L, V as usize), &device)?;
+        let k4_w: Vec<f32> = as_k4
+            .dequantize_weights()?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
+
+        assert_eq!(k9_w.len(), k4_w.len());
+        let differing = k9_w
+            .iter()
+            .zip(k4_w.iter())
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert!(
+            differing > k9_w.len() / 2,
+            "only {differing}/{} weights differ between the K=9 and K=4 readings of the same \
+             bytes — the K=9 path may be the K=4 decoder",
+            k9_w.len()
+        );
+        Ok(())
+    }
+
+    /// Paths the family has no kernel for must still refuse loudly, on a
+    /// WELL-FORMED family layer. A half-wired dispatch that falls through to a
+    /// K=4 path is worse than one that refuses.
+    #[test]
+    fn unwired_paths_still_refuse_for_a_well_formed_k9_layer() -> Result<()> {
+        let device = Device::Cpu;
+        let (layer, _, _) = k9_layer(&device, 4, 128)?;
+
+        assert!(
+            layer.qtip_packed().is_none(),
+            "QtipPackedView carries no geometry; a consumer would read K=9 bytes as nibbles"
+        );
+
+        let mut three_d = layer;
+        three_d.num_experts = Some(2);
+        for (what, err) in [
+            ("dequantize_expert", three_d.dequantize_expert(0).err()),
+            (
+                "gather_forward",
+                three_d
+                    .gather_forward(
+                        &Tensor::zeros((1, 1, 128), DType::F32, &device)?,
+                        &Tensor::zeros((1, 1), DType::U32, &device)?,
+                    )
+                    .err(),
+            ),
+            (
+                "dequantize_weights(3-D)",
+                three_d.dequantize_weights().err(),
+            ),
+        ] {
+            let e = err.unwrap_or_else(|| panic!("{what} must refuse a k9v4l12 layer"));
+            let msg = e.to_string();
+            assert!(
+                msg.contains("k9v4l12"),
+                "{what}: refusal must name the geometry: {msg}"
+            );
+            assert!(
+                msg.to_lowercase().contains("refus"),
+                "{what}: refusal must say it is refusing: {msg}"
             );
         }
         Ok(())
+    }
+
+    /// The two dispatch invariants that live behind `#[cfg(feature = "cuda")]`
+    /// and therefore cannot be exercised in a no-GPU lane.
+    ///
+    /// Both were mutated and both passed (S2, S5): a CUDA build is the only
+    /// thing that compiles them, and this crate's CI CUDA lane does not run
+    /// tests. So assert them over the source, the same way the kernel's
+    /// constants are asserted — a guard that only exists on hardware nobody
+    /// has is not a guard.
+    #[test]
+    fn the_cuda_dispatch_invariants_are_pinned_over_the_source() {
+        const SRC: &str = include_str!("mod.rs");
+        fn squeeze(s: &str) -> String {
+            s.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+        // SERVING CODE ONLY. `include_str!` pulls in this test module too, and
+        // the negative assertion below names the very string it forbids — so
+        // searching the whole file makes the guard fire on itself. (Second time
+        // this class of bug appeared here; the first was a barrier guard
+        // counting the word "__syncthreads" in a comment. A guard that matches
+        // its own text is not a guard.)
+        let serving = SRC
+            .split_once("#[cfg(test)]\nmod tests {")
+            .map(|(before, _)| before)
+            .expect("mod.rs must contain its test module");
+        let src = squeeze(serving);
+
+        // A family layer must never reach the K=4/V=2 CUDA path, whose
+        // dequantize kernel and fused gemv both index a [2^16, 2] F32 table.
+        assert!(
+            src.contains(&squeeze(
+                "if self.v4l12_rung().is_none() && cuda_ops::can_use_qtip_cuda(&self.blocks) {"
+            )),
+            "the K=4/V=2 CUDA forward path lost its geometry gate. A V=4 layer reaching it \
+             would be decoded as K=4/V=2 — in bounds, no fault, wrong weights."
+        );
+
+        // The family's CUDA path must ship with the row-scale hoist OFF: it is
+        // the one lever that costs bit-exactness against the CPU reference, and
+        // nothing here has been measured on a device.
+        assert!(
+            src.contains(&squeeze("trellis_v4l12::RowScaleHoist::Off,")),
+            "the family's CUDA gemv no longer passes RowScaleHoist::Off"
+        );
+        assert!(
+            !src.contains(&squeeze("trellis_v4l12::RowScaleHoist::On")),
+            "something in the serving path now asks for the row-scale hoist. It reassociates \
+             the sum and breaks bit-exactness against the CPU reference; there is no measured \
+             device-time evidence to trade that for."
+        );
+    }
+
+    /// **The new geometry must not be the default.** Nothing in the family has
+    /// touched a GPU; the kernel has never been compiled at any K.
+    #[test]
+    fn the_new_geometry_is_not_the_default() {
+        assert_eq!(QtipGeometry::DEFAULT, QtipGeometry::K4V2L16);
+        assert_eq!(QtipGeometry::default(), QtipGeometry::K4V2L16);
+        let device = Device::Cpu;
+        let layer = geometry_fixture(&device).unwrap();
+        assert_eq!(layer.geometry, QtipGeometry::K4V2L16);
+    }
+
+    /// The selection surface: `ARC_QTIP_GEOMETRY`, mirroring
+    /// `ARC_QTIP_CODEBOOK`. Refuses rather than guessing.
+    #[test]
+    fn the_geometry_env_surface_parses_and_refuses() {
+        // Parsing is exercised through the same rule the reader uses rather
+        // than by mutating the process environment, which races other tests in
+        // this binary.
+        // THE REAL RULE, not a replica of it. An earlier version of this test
+        // reimplemented the parse inline and passed while the real reader
+        // silently resolved an unsupported K to the default (mutation S7).
+        let parse = QtipGeometry::from_spec;
+        assert_eq!(parse("").unwrap(), QtipGeometry::K4V2L16);
+        assert_eq!(parse("k4v2l16").unwrap(), QtipGeometry::K4V2L16);
+        assert_eq!(parse("k9v4l12").unwrap().k(), 9);
+        assert_eq!(parse("k8v4l12").unwrap().k(), 8);
+        // A K with no decoder is refused, not clamped to a neighbour.
+        assert!(parse("k11v4l12").is_err());
+        assert!(parse("qtip9").is_err());
+        assert!(parse("k9").is_err());
     }
 
     /// A genuine V=4/L=12 payload round-trips at every K, tag and tensors both.
