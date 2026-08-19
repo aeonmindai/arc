@@ -183,6 +183,90 @@ pub(crate) fn alloc_cache_killed() -> bool {
     std::env::var("ARC_CANDLE_ALLOC_CACHE").is_ok_and(|v| v == "0")
 }
 
+/// Retention cap for the caching allocator, in bytes, or `None` to leave
+/// candle's own default (1 GiB) in force.
+///
+/// `ARC_ALLOC_CACHE_MAX_MB=0` means unbounded — the pre-bounding behaviour, kept
+/// reachable so the leak it causes can be A/B'd rather than argued about.
+/// Measured unbounded on V4: **+6.04 MiB per decoded token with no plateau**,
+/// against +0.057 MiB/token with the cache off entirely.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn alloc_cache_capacity_bytes() -> Option<usize> {
+    parse_alloc_cache_capacity(std::env::var("ARC_ALLOC_CACHE_MAX_MB").ok().as_deref())
+}
+
+/// Pure half of [`alloc_cache_capacity_bytes`], so the parse is testable.
+///
+/// `None` (unset, or unparseable) leaves candle's own default in force rather
+/// than silently picking a different one — a typo in an ops script must not
+/// quietly hand back the unbounded allocator this change exists to remove.
+pub(crate) fn parse_alloc_cache_capacity(raw: Option<&str>) -> Option<usize> {
+    let mb: usize = raw?.trim().parse().ok()?;
+    Some(if mb == 0 {
+        usize::MAX
+    } else {
+        mb.saturating_mul(1024 * 1024)
+    })
+}
+
+/// Emit the allocator's counters every `ARC_ALLOC_CACHE_STATS` decode steps.
+///
+/// The counters are what this cache has to be judged on. A green log — the
+/// server did not crash, the output looked fine — is not evidence that the
+/// cache is working: an earlier arena in this codebase reported "accounting OK"
+/// and bit-identical output across 52 steps while silently bypassing itself for
+/// every buffer under 128 bytes (`KERNEL_RULES.md:977-984`). What distinguishes
+/// a working bounded cache from that is arithmetic, and it is printed here:
+///
+/// * `alloc/step` — real `cuMemAllocAsync` calls per decode step. Low means the
+///   cache is absorbing the ~11 k allocations a step makes.
+/// * `free/step` — real `cuMemFreeAsync` calls per decode step. **Non-zero is
+///   the point.** The unbounded cache's was exactly zero, forever, which is why
+///   it grew without bound.
+/// * `held` — bytes retained right now, against the cap.
+#[cfg(feature = "cuda")]
+fn report_alloc_cache_step(cd: &candle_core::CudaDevice, seq_len: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let every = *EVERY.get_or_init(|| {
+        std::env::var("ARC_ALLOC_CACHE_STATS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    });
+    if every == 0 || seq_len != 1 {
+        return;
+    }
+    static STEP: AtomicU64 = AtomicU64::new(0);
+    static LAST_ALLOC: AtomicU64 = AtomicU64::new(0);
+    static LAST_FREE: AtomicU64 = AtomicU64::new(0);
+    static LAST_STEP: AtomicU64 = AtomicU64::new(0);
+    let step = STEP.fetch_add(1, Ordering::Relaxed) + 1;
+    if step % every != 0 {
+        return;
+    }
+    let s = cd.alloc_cache_stats();
+    let d_step = step - LAST_STEP.swap(step, Ordering::Relaxed);
+    let d_alloc = s.misses - LAST_ALLOC.swap(s.misses, Ordering::Relaxed);
+    let d_free = s.frees() - LAST_FREE.swap(s.frees(), Ordering::Relaxed);
+    let n = d_step.max(1) as f64;
+    tracing::info!(
+        "[alloc-cache] step {step}  alloc/step {:.1}  free/step {:.1}  \
+         hit-rate {:.4}  held {:.1} MiB / cap {}  high-water {:.1} MiB  sizes {}",
+        d_alloc as f64 / n,
+        d_free as f64 / n,
+        s.hits as f64 / (s.hits + s.misses).max(1) as f64,
+        s.cached_bytes as f64 / (1024.0 * 1024.0),
+        if s.capacity_bytes == usize::MAX {
+            "unbounded".to_string()
+        } else {
+            format!("{} MiB", s.capacity_bytes / (1024 * 1024))
+        },
+        s.high_water_bytes as f64 / (1024.0 * 1024.0),
+        s.size_classes,
+    );
+}
+
 /// A loader for a "normal" (non-quantized) model.
 pub struct NormalLoader {
     inner: Box<dyn NormalModelLoader>,
@@ -1804,12 +1888,18 @@ impl Pipeline for NormalPipeline {
                             cd.alloc_cache_enabled(),
                             alloc_cache_killed(),
                         ) {
-                            AllocCacheAction::Enable => cd.set_alloc_cache_enabled(true),
+                            AllocCacheAction::Enable => {
+                                cd.set_alloc_cache_enabled(true);
+                                if let Some(cap) = alloc_cache_capacity_bytes() {
+                                    cd.set_alloc_cache_capacity(cap);
+                                }
+                            }
                             AllocCacheAction::DrainAndDisable => {
                                 cd.set_alloc_cache_enabled(false)
                             }
                             AllocCacheAction::Leave => {}
                         }
+                        report_alloc_cache_step(cd, seq_len);
                     }
                     if probe && seq_len == 1 {
                         // RUN-161 step 2b. Set the graph-mode device position:
@@ -2709,6 +2799,52 @@ mod alloc_cache_policy_tests {
         assert_eq!(
             alloc_cache_action(0, true, false),
             AllocCacheAction::DrainAndDisable
+        );
+    }
+}
+
+/// The retention cap's parse.
+///
+/// The cap is the whole of the fix — candle's caching allocator had none, and
+/// retained 6.04 MiB per decoded token forever — so the way it is configured has
+/// to be unambiguous. In particular a typo must not fall back to "unbounded".
+#[cfg(test)]
+mod alloc_cache_capacity_tests {
+    use super::parse_alloc_cache_capacity;
+
+    #[test]
+    fn unset_leaves_candles_default_in_force() {
+        assert_eq!(parse_alloc_cache_capacity(None), None);
+    }
+
+    /// A typo is not a licence to run unbounded. `None` means "don't touch it",
+    /// and candle's default is bounded, so a bad value degrades to bounded.
+    #[test]
+    fn an_unparseable_value_does_not_become_unbounded() {
+        for bad in ["", "  ", "lots", "1GiB", "-1", "1.5"] {
+            assert_eq!(parse_alloc_cache_capacity(Some(bad)), None, "{bad:?}");
+        }
+    }
+
+    /// `0` is the documented escape hatch back to the old unbounded allocator,
+    /// kept reachable only so its leak can be re-measured rather than argued
+    /// about.
+    #[test]
+    fn zero_is_the_explicit_unbounded_opt_in() {
+        assert_eq!(parse_alloc_cache_capacity(Some("0")), Some(usize::MAX));
+    }
+
+    #[test]
+    fn megabytes_convert_and_do_not_overflow() {
+        assert_eq!(parse_alloc_cache_capacity(Some("1")), Some(1024 * 1024));
+        assert_eq!(
+            parse_alloc_cache_capacity(Some(" 512 ")),
+            Some(512 * 1024 * 1024)
+        );
+        assert_eq!(
+            parse_alloc_cache_capacity(Some(&usize::MAX.to_string())),
+            Some(usize::MAX),
+            "saturates instead of wrapping to a tiny cap"
         );
     }
 }
