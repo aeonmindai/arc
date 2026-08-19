@@ -45,11 +45,24 @@
 // `num_symbols / window`, and V=4 halves `num_symbols` exactly as the halved
 // window doubles it: 9472/32 == 4736/16 == 296 per row, unchanged.
 //
-// 🔑 FREED SHARED MEMORY, FOR THE SERVING PATH: at K=8/L=12 the group table is
-// 128 B instead of 32 KiB and the whole block drops from ~37.1 KiB to ~19.3
-// KiB. The ~32 KiB the direct-indexed table gives back is the same order as the
-// 32,768 B a 2^12 x V=4 fp16 serving LUT wants resident, and it is the budget
-// the layer-25 out-of-memory failure (FACTS.md:1330) was competing for.
+// 🔑 WHAT THIS GEOMETRY GIVES THE SERVING PATH — stated precisely, because the
+// obvious version of the claim is wrong. Shared memory is a PER-BLOCK resource:
+// this kernel giving some back does not hand a budget to a serving kernel that
+// never runs beside it. Two separate facts:
+//
+//   * This kernel's own block falls ~37.1 KiB -> ~19.3 KiB, because the
+//     direct-indexed group table goes 32 KiB -> 128 B. That is an encoder
+//     occupancy headroom result, nothing more.
+//   * The one that matters for serving is a property of the GEOMETRY, not of
+//     this file: the K=8/L=12 codebook is 2^12 x V=4 = 16,384 values, i.e.
+//     **32,768 B in fp16 — shared-memory resident**. The shipped K=4/L=16 LUT
+//     is 2^16 x V=2 f32 = 512 KiB and never could be; it is the "dependent,
+//     data-scattered trip to L2 on EVERY candidate" qtip_codebook.cuh opens by
+//     describing. A resident codebook removes that trip for the decode side.
+//
+// ⚠ NOT related to either: the layer-25 bake OOM (FACTS.md:1330). That was
+// DEVICE-allocator fragmentation with 72 GiB still free, worked around with
+// `ARC_QTIP_EXPERT_BATCH=8`. No shared-memory change touches it.
 //
 // WHY IT IS FASTER, MEASURED IN BYTES
 // -----------------------------------
