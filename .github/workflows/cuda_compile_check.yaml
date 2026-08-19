@@ -150,8 +150,25 @@ on:
 # Split for the same reason as `ci.yml` — see the long note there and the PR
 # body. `head_ref` keeps each PR in its own group; `github.ref` collapses
 # superseded pushes to the same branch instead of leaving one run per commit.
+# MANUAL DISPATCHES MUST NOT CANCEL EACH OTHER (measured 2026-08-19).
+#
+# The group below used to end in `${{ github.head_ref || github.ref }}`, which
+# for `workflow_dispatch` resolves to the branch and is therefore IDENTICAL for
+# every manual run on that branch. With `cancel-in-progress: true` the second
+# dispatch kills the first. That is correct for push/PR -- a newer commit
+# supersedes an older one -- but it is wrong for a manual dispatch, where the
+# two runs are deliberate and often measure different things.
+#
+# Not hypothetical: census run 32262762701 was created at 14:13:49Z and run
+# 32261447321 (a DIFFERENT commit, queued 13 minutes, carrying results the
+# newer run did not yet have) was cancelled at 14:13:51Z. Two seconds apart, no
+# other actor involved. The queue slot was simply lost.
+#
+# `github.run_id` is unique per run, so keying manual dispatches on it makes
+# each one its own group. push/pull_request keep the exact group string they
+# had, so their superseding behaviour is unchanged.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.head_ref || github.ref }}
   cancel-in-progress: true
 
 # Bound codegen parallelism so a large CUDA lib build fits a small hosted
