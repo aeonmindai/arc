@@ -132,6 +132,18 @@ on:
       - "Cargo.lock"
       - ".github/workflows/cuda_compile_check.yaml"
   workflow_dispatch:
+    inputs:
+      census_only:
+        description: >-
+          Run ONLY the SASS census job and skip the three heavy build jobs.
+          The census is an instrument, not a gate: it needs nvcc but no cargo
+          build, so on a saturated runner fleet it makes no sense to queue two
+          nvcc lib builds and a workspace type-check behind it just to read an
+          instruction table. Default false keeps manual dispatch behaving
+          exactly as it did before this input existed.
+        type: boolean
+        required: false
+        default: false
 
 # Widening the trigger to "**/*.rs" makes this workflow run on most PRs, so
 # stop paying for superseded runs on the same ref.
@@ -186,6 +198,10 @@ jobs:
   cuda-compile:
     name: nvcc compile (sm_${{ matrix.compute_cap }})
     runs-on: ubuntu-latest
+    # Skipped when a manual dispatch asks for the census alone (see the
+    # `census_only` input at the top). `github.event.inputs` is null on
+    # push/pull_request, so this reduces to `true` there.
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.census_only != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -296,6 +312,10 @@ jobs:
   cuda-typecheck:
     name: cargo check (cuda, workspace)
     runs-on: ubuntu-latest
+    # Skipped when a manual dispatch asks for the census alone (see the
+    # `census_only` input at the top). `github.event.inputs` is null on
+    # push/pull_request, so this reduces to `true` there.
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.census_only != 'true'
     env:
       # H100/Hopper — the V4 Flash rental target.
       CUDA_COMPUTE_CAP: "90"
