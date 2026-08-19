@@ -2271,10 +2271,19 @@ pub fn set_graph_mode_positions(positions: Option<Tensor>) {
 }
 
 /// Thread-local additive length mask for graph-mode fixed-capacity attention:
-/// `[*, sliding_window]`, 0 for valid (<= current position) slots and a large
-/// negative for the unwritten tail. Device-computed from the position so it's
-/// replay-safe. Unset -> the fixed-capacity attention runs without masking
-/// (finite but not yet correct; used to validate capture-launch). (RUN-161)
+/// `[B, 1, 1, capacity]`, 0 for valid (`slot <= position`) slots and `-inf` for
+/// the unwritten tail. Built by [`graph_mode_length_mask`] from the device-held
+/// position, so a CUDA-graph replay that mutates the position buffer in place
+/// gets the right mask without recapture. (RUN-161)
+///
+/// 🔴 An unset mask is **not** a benign default. The fixed-capacity decode arm
+/// reads a constant `sliding_window`-wide window of which only `position + 1`
+/// slots have been written; the rest are the `Tensor::zeros` the buffer was
+/// allocated with. **A zero K row is not a masked row** — it scores logit 0 and
+/// takes `exp(0)/Z` of the softmax weight, so it dilutes every real key and
+/// contributes its zero V to the output. The arm therefore now *refuses* to run
+/// with the mask unset (`models/deepseek4.rs`) rather than returning a finite,
+/// wrong answer.
 #[cfg(feature = "cuda")]
 std::thread_local! {
     static GRAPH_MODE_MASK: std::cell::RefCell<Option<Tensor>> = const { std::cell::RefCell::new(None) };
@@ -2295,6 +2304,76 @@ pub fn set_graph_mode_mask(_mask: Option<Tensor>) {}
 #[cfg(not(feature = "cuda"))]
 pub fn graph_mode_mask() -> Option<Tensor> {
     None
+}
+
+/// Cached `[1, capacity]` F32 slot-index vector for [`graph_mode_length_mask`].
+///
+/// `Tensor::arange` on a GPU device is a host-to-device copy — banned in a hot
+/// loop by `CLAUDE.md`, and worse than merely slow here: an H2D copy from
+/// pageable host memory **cannot be recorded into a CUDA graph**, so building
+/// the arange inside the capture region would abort the capture. Building it
+/// once, on the warmup steps that precede capture, keeps the per-step work to
+/// device-side compare/select kernels.
+///
+/// Keyed by capacity *and* device: a rebuild is only needed when either moves,
+/// which for one loaded model is never after the first step.
+#[allow(clippy::type_complexity)]
+std::thread_local! {
+    static GRAPH_MODE_SLOT_IDS: std::cell::RefCell<Option<(usize, Tensor)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The additive length mask the fixed-capacity graph-decode window needs.
+///
+/// * `positions` — the device-held `[B]` absolute position of each row's new
+///   token, i.e. the slot `write_kv_inplace` just wrote it to.
+/// * `capacity` — the constant window width the arm reads back
+///   (`sliding_window`), which is what makes the step shape-invariant.
+///
+/// Returns `[B, 1, 1, capacity]` in `dtype`: `0` on slots `0..=position`
+/// (written, real K/V) and `-inf` on `position+1..capacity` (never written).
+/// `dsv4_attention` folds it into its own union mask through
+/// `compose_caller_mask`, whose raw half is exactly `capacity` columns wide.
+///
+/// Every operation is device-side and derived from `positions`, which is what
+/// makes it replay-safe: a captured graph replays the compare against whatever
+/// the position buffer holds at replay time. A mask computed on the host before
+/// capture would be a constant baked into the graph and would be wrong on the
+/// second and every later token.
+///
+/// Not `#[cfg(feature = "cuda")]`: the arithmetic is device-agnostic, so it is
+/// exercised on CPU by the tests below and by
+/// `models::dsv4_attention`'s end-to-end guard.
+pub fn graph_mode_length_mask(positions: &Tensor, capacity: usize, dtype: DType) -> Result<Tensor> {
+    if capacity == 0 {
+        candle_core::bail!("graph_mode_length_mask: capacity must be non-zero");
+    }
+    let b = positions.dims1()?;
+    let dev = positions.device();
+
+    let slots = GRAPH_MODE_SLOT_IDS.with(|c| -> Result<Tensor> {
+        let mut c = c.borrow_mut();
+        if let Some((cap, t)) = c.as_ref() {
+            if *cap == capacity && t.device().same_device(dev) {
+                return Ok(t.clone());
+            }
+        }
+        let t = Tensor::arange(0u32, capacity as u32, dev)?
+            .to_dtype(DType::F32)?
+            .reshape((1, capacity))?;
+        *c = Some((capacity, t.clone()));
+        Ok(t)
+    })?;
+
+    let pos = positions.to_dtype(DType::F32)?.reshape((b, 1))?;
+    // `slot <= position`: the diagonal is always valid, so no row is fully
+    // masked and the softmax cannot produce NaN.
+    let valid = slots.broadcast_le(&pos)?; // [B, capacity], u8
+    let zeros = Tensor::zeros((b, capacity), dtype, dev)?;
+    let neg_inf = Tensor::full(f32::NEG_INFINITY, (b, capacity), dev)?.to_dtype(dtype)?;
+    valid
+        .where_cond(&zeros, &neg_inf)?
+        .reshape((b, 1, 1, capacity))
 }
 
 /// Check if graph-mode positions are set.
@@ -3320,5 +3399,86 @@ impl Module for ScaledEmbedding {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let embedding = Embedding::new(self.embedding.clone(), self.embedding.dim(D::Minus1)?);
         xs.apply(&embedding)? * self.scale
+    }
+}
+
+#[cfg(test)]
+mod graph_mode_mask_tests {
+    use super::*;
+
+    /// The mask's whole job: separate slots that were written from slots that
+    /// were merely allocated. `0` is additive-neutral; `-inf` removes the
+    /// column from the softmax entirely. **Not** a small negative — a large
+    /// finite penalty still leaves an unwritten slot voting.
+    #[test]
+    fn valid_slots_are_neutral_and_the_unwritten_tail_is_negative_infinity() -> Result<()> {
+        let dev = Device::Cpu;
+        let cap = 8usize;
+        for position in 0..cap {
+            let positions = Tensor::from_vec(vec![position as u32], (1,), &dev)?;
+            let mask = graph_mode_length_mask(&positions, cap, DType::F32)?;
+            assert_eq!(mask.dims(), &[1, 1, 1, cap]);
+            let v = mask.flatten_all()?.to_vec1::<f32>()?;
+            for (slot, got) in v.iter().enumerate() {
+                if slot <= position {
+                    assert_eq!(*got, 0.0, "position {position} slot {slot}");
+                } else {
+                    assert!(
+                        got.is_infinite() && got.is_sign_negative(),
+                        "position {position} slot {slot}: got {got}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The diagonal is always valid, so no row is fully masked and the softmax
+    /// cannot divide by zero. At `position == 0` exactly one slot survives.
+    #[test]
+    fn no_row_is_ever_fully_masked() -> Result<()> {
+        let dev = Device::Cpu;
+        let positions = Tensor::from_vec(vec![0u32, 0u32], (2,), &dev)?;
+        let mask = graph_mode_length_mask(&positions, 16, DType::F32)?;
+        let v = mask.flatten_all()?.to_vec1::<f32>()?;
+        for row in 0..2 {
+            let live = v[row * 16..(row + 1) * 16]
+                .iter()
+                .filter(|x| x.is_finite())
+                .count();
+            assert_eq!(live, 1, "row {row} must keep exactly its own written slot");
+        }
+        Ok(())
+    }
+
+    /// The cached slot-index vector must not leak across capacities. It is
+    /// keyed by `(capacity, device)` precisely so a model reload at a different
+    /// window width cannot silently reuse the wrong arange.
+    #[test]
+    fn the_cached_slot_vector_is_rebuilt_when_the_capacity_changes() -> Result<()> {
+        let dev = Device::Cpu;
+        let positions = Tensor::from_vec(vec![1u32], (1,), &dev)?;
+        assert_eq!(
+            graph_mode_length_mask(&positions, 4, DType::F32)?.dims(),
+            &[1, 1, 1, 4]
+        );
+        assert_eq!(
+            graph_mode_length_mask(&positions, 9, DType::F32)?.dims(),
+            &[1, 1, 1, 9]
+        );
+        // …and back again, which is the direction a cache keyed only on
+        // "is something cached" would get wrong.
+        assert_eq!(
+            graph_mode_length_mask(&positions, 4, DType::F32)?.dims(),
+            &[1, 1, 1, 4]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_zero_capacity_window_is_refused_rather_than_producing_an_empty_mask() {
+        let dev = Device::Cpu;
+        let positions = Tensor::from_vec(vec![0u32], (1,), &dev).unwrap();
+        assert!(graph_mode_length_mask(&positions, 0, DType::F32).is_err());
     }
 }
