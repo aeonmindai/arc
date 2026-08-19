@@ -684,14 +684,20 @@ impl Sampler {
     /// Truncate a candidate set (token id, full-softmax prob) to the kept
     /// sampling distribution, replicating `sample_top_kp_min_p`'s semantics
     /// exactly: top-k first, then top-p (descending cumsum, the crossing
-    /// element kept), then min-p — with min-p skipped whenever top_p is
-    /// outside (0, 1), mirroring that function's early-return structure.
+    /// element kept), then min-p. Each filter is applied whenever its own
+    /// parameter is in range; min-p does not depend on top-p.
     ///
     /// `candidates` must contain the top `candidates.len()` tokens of the
     /// full distribution (any order). Returns `None` when exactness cannot
-    /// be guaranteed: a pure-top-p request (top_k <= 0) whose nucleus is not
-    /// fully contained in the candidate set (candidate mass < top_p). With
-    /// top_k > 0 containment is structural since the caller selects
+    /// be guaranteed, i.e. when the kept set is not provably closed inside
+    /// the candidate set:
+    /// - a pure-top-p request (top_k <= 0) whose nucleus is not fully
+    ///   contained in the candidates (candidate mass < top_p);
+    /// - a min-p request that neither top-k nor top-p has already closed,
+    ///   whose smallest candidate is still above the min-p threshold (so
+    ///   tokens outside the candidate set may also survive min-p).
+    ///
+    /// With top_k > 0 containment is structural since the caller selects
     /// `k_sel >= top_k` candidates.
     ///
     /// Returned pairs are sorted descending by probability.
@@ -705,6 +711,9 @@ impl Sampler {
         });
 
         // Top-k truncation (candidates are a superset: k_sel >= top_k).
+        // `top_k <= len` means the candidate set already is (or is truncated
+        // to) the exact top-k set, so no token outside it can survive.
+        let topk_closed = self.top_k > 0 && (self.top_k as usize) <= candidates.len();
         if self.top_k > 0 && (self.top_k as usize) < candidates.len() {
             candidates.truncate(self.top_k as usize);
         }
@@ -712,6 +721,7 @@ impl Sampler {
         let top_p = self.top_p as f32;
         let min_p = self.min_p as f32;
 
+        let mut closed = topk_closed;
         if top_p > 0.0 && top_p < 1.0 {
             if self.top_k <= 0 {
                 let mass: f32 = candidates.iter().map(|(_, p)| *p).sum();
@@ -730,14 +740,27 @@ impl Sampler {
                     true
                 }
             });
-            // CPU-path min-p (`min_p_threshold >= prob` is dropped). Only
-            // reached when top_p is in (0, 1) — `sample_top_kp_min_p`
-            // returns before min-p otherwise.
-            if min_p > 0.0 && min_p < 1.0 {
-                let max_p = candidates.first().map(|(_, p)| *p).unwrap_or(0.0);
-                let threshold = max_p * min_p;
-                candidates.retain(|(_, p)| *p > threshold);
+            // The nucleus is contained (mass check above, or structurally
+            // when top_k > 0), so the kept set is now closed.
+            closed = true;
+        }
+
+        // CPU-path min-p (`min_p_threshold >= prob` is dropped). Applied
+        // whenever min_p is in range, exactly as `sample_top_kp_min_p` does —
+        // independently of top_p.
+        if min_p > 0.0 && min_p < 1.0 {
+            let max_p = candidates.first().map(|(_, p)| *p).unwrap_or(0.0);
+            let threshold = max_p * min_p;
+            // If neither top-k nor top-p closed the set, the candidates are
+            // just the top `k_sel` of the vocabulary and tokens below the cut
+            // may still clear the min-p threshold. Only safe when the smallest
+            // candidate is already at/below the threshold (everything outside
+            // is <= it, hence also dropped); otherwise refuse and let the
+            // caller fall back to the exact full-vocab CPU path.
+            if !closed && candidates.last().is_some_and(|(_, p)| *p > threshold) {
+                return None;
             }
+            candidates.retain(|(_, p)| *p > threshold);
         }
 
         Some(candidates)
@@ -994,10 +1017,6 @@ impl Sampler {
         // Get sorted top-k indices with partial sort, zeroing out rest
         let idx_probs = partial_sort_top_k(probs, k, true);
 
-        if top_p <= 0.0 || top_p >= 1.0 {
-            return self.sample_multinomial(probs, return_logprobs, rng);
-        }
-
         // TOP P
 
         // top-p sampling (or "nucleus sampling") samples from the smallest set of
@@ -1005,32 +1024,38 @@ impl Sampler {
         // have very low probabilities and are less likely to go "off the rails".
 
         // Clamp smaller probabilities to zero.
-        let mut cumsum = 0.;
-        for (index, prob) in &idx_probs {
-            if cumsum >= top_p {
-                probs[*index as usize] = 0.0;
-            } else {
-                cumsum += prob;
+        if top_p > 0.0 && top_p < 1.0 {
+            let mut cumsum = 0.;
+            for (index, prob) in &idx_probs {
+                if cumsum >= top_p {
+                    probs[*index as usize] = 0.0;
+                } else {
+                    cumsum += prob;
+                }
             }
         }
-
-        if min_p <= 0.0 || min_p >= 1.0 {
-            return self.sample_multinomial(probs, return_logprobs, rng);
-        }
-
-        // Get max_p from first sorted element
-        let max_p = idx_probs.first().map(|(_, p)| *p).unwrap_or(0.0);
 
         // MIN P
 
         // min-p sampling samples from the tokens whose prob are greater than
         // (max prob of token in dist) * min_p
+        //
+        // This filter is INDEPENDENT of top-p: `top_p = 1.0, min_p = 0.1` is a
+        // valid, common request. This block used to sit behind an early return
+        // taken whenever top_p was outside (0, 1), which silently discarded the
+        // caller's min_p.
+        if min_p > 0.0 && min_p < 1.0 {
+            // Get max_p from first sorted element. Top-p never zeroes the
+            // argmax (its cumsum starts below top_p), so this is the max of
+            // the surviving set either way.
+            let max_p = idx_probs.first().map(|(_, p)| *p).unwrap_or(0.0);
 
-        // Clamp smaller probabilities to zero.
-        let min_p_threshold = max_p * min_p;
-        for (index, prob) in &idx_probs {
-            if min_p_threshold >= *prob {
-                probs[*index as usize] = 0.0;
+            // Clamp smaller probabilities to zero.
+            let min_p_threshold = max_p * min_p;
+            for (index, prob) in &idx_probs {
+                if min_p_threshold >= *prob {
+                    probs[*index as usize] = 0.0;
+                }
             }
         }
 
@@ -1791,6 +1816,80 @@ mod tests {
             seen.len()
         );
     }
+
+    /// `min_p` must be applied whenever it is in (0, 1), independently of
+    /// `top_p`.
+    ///
+    /// Regression: `sample_top_kp_min_p` returned early whenever `top_p` was
+    /// outside (0, 1) — before the min-p block — so `top_p = 1.0, min_p = 0.5`
+    /// (a perfectly ordinary request) applied no min-p at all and the tail the
+    /// caller paid to exclude stayed samplable.
+    ///
+    /// Discriminator: softmax([4, 0, 0, 0]) = [0.9479, 0.0174, 0.0174, 0.0174].
+    /// min_p = 0.5 puts the threshold at 0.474, so only token 0 survives and
+    /// every draw must be 0. With min-p skipped, ~5.2% of draws land on 1..3;
+    /// over 400 draws the probability of seeing none of them is ~5e-10.
+    #[test]
+    fn min_p_applies_when_top_p_is_disabled() {
+        use super::Sampler;
+        use candle_core::{Device, Tensor};
+        use rand::SeedableRng;
+        use rand_isaac::Isaac64Rng;
+        use std::sync::{Arc, Mutex};
+
+        const DRAWS: usize = 400;
+        let raw = vec![4.0f32, 0.0, 0.0, 0.0];
+        let logits = || Tensor::from_vec(raw.clone(), 4, &Device::Cpu).unwrap();
+
+        // temperature 1.0, top_k disabled, top_p disabled (1.0), min_p = 0.5.
+        let mk = |min_p: f64| {
+            Sampler::new(
+                Some(1.0),
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                -1,
+                1.0,
+                min_p,
+                None,
+                vec![],
+            )
+            .unwrap()
+        };
+
+        let draw = |sampler: &Sampler| {
+            // One shared rng so the stream advances across draws.
+            let rng = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(0xA11CE)));
+            let mut tail_hits = 0usize;
+            for _ in 0..DRAWS {
+                let token = sampler
+                    .sample(logits(), &[0u32], false, rng.clone(), false, false)
+                    .unwrap()
+                    .token;
+                if token != 0 {
+                    tail_hits += 1;
+                }
+            }
+            tail_hits
+        };
+
+        // Control: with min_p off the tail is reachable, so the fixture is live
+        // and the assertion below is not vacuous.
+        assert!(
+            draw(&mk(0.0)) > 0,
+            "fixture is inert: the tail was never sampled even with min_p disabled"
+        );
+
+        assert_eq!(
+            draw(&mk(0.5)),
+            0,
+            "min_p = 0.5 with top_p = 1.0 must exclude every token below \
+             0.5 * max_prob; the tail was still sampled, so min_p was skipped"
+        );
+    }
 }
 
 /// CPU-parity tests for the GPU radix top-k sampling path.
@@ -1890,7 +1989,8 @@ mod topk_parity_tests {
         (0, 0.9, 0.0),     // pure top-p (nucleus containment via peaked logits)
         (100, 0.95, 0.05), // top-k + top-p + min-p
         (64, 0.3, 0.0),    // aggressive top-p
-        (50, 0.0, 0.2),    // top_p out of (0,1): CPU skips top-p AND min-p
+        (50, 0.0, 0.2),    // top_p out of (0,1): top-p skipped, min-p still runs
+        (64, 1.0, 0.5),    // top_p disabled: min-p must still run
     ];
 
     /// Same kept set + same probabilities as the CPU path's in-place zeroing.
@@ -1991,6 +2091,43 @@ mod topk_parity_tests {
     /// (return None) rather than truncate the distribution: near-uniform
     /// logits over 4096 tokens put ~25% of the mass in the top 1024, well
     /// under top_p=0.9.
+    /// `top_p = 1.0, min_p > 0` must still truncate on the candidate path.
+    ///
+    /// Regression: min-p sat inside the `top_p in (0,1)` branch here too (to
+    /// mirror `sample_top_kp_min_p`'s early return), so a top-k + min-p
+    /// request returned the untouched top-k set. Hand-built candidates make
+    /// the expected kept set exact.
+    #[test]
+    fn min_p_applies_to_candidates_when_top_p_disabled() {
+        // Descending, and the smallest candidate is far under the threshold so
+        // the containment guard is satisfied.
+        let candidates = vec![(3u32, 0.90f32), (0, 0.06), (7, 0.03), (5, 0.01)];
+        // top_k = 4 (== candidate count, so top-k closes the set), top_p = 1.0
+        // (disabled), min_p = 0.5 => threshold 0.45, only 0.90 survives.
+        let sampler = make_sampler(4, 1.0, 0.5);
+        assert_eq!(
+            sampler.truncate_topk_candidates(candidates).unwrap(),
+            vec![(3u32, 0.90f32)],
+            "min_p must be applied even though top_p is 1.0"
+        );
+    }
+
+    /// min-p on a set that neither top-k nor top-p closed must refuse rather
+    /// than truncate against an incomplete candidate list: the smallest
+    /// candidate is above the min-p threshold, so tokens below the radix cut
+    /// could also clear it.
+    #[test]
+    fn min_p_uncontained_candidates_fall_back() {
+        let candidates = vec![(0u32, 0.30f32), (1, 0.28), (2, 0.26)];
+        // top_k disabled, top_p disabled: nothing closes the set. Threshold is
+        // 0.5 * 0.30 = 0.15 and the smallest candidate (0.26) is above it.
+        let sampler = make_sampler(-1, 1.0, 0.5);
+        assert!(
+            sampler.truncate_topk_candidates(candidates).is_none(),
+            "uncontained min-p must trigger the CPU fallback, not silent truncation"
+        );
+    }
+
     #[test]
     fn pure_topp_fat_nucleus_falls_back() {
         let logits: Vec<f32> = (0..VOCAB).map(|i| (i % 17) as f32 * 1e-3).collect();
