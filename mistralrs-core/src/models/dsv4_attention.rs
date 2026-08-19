@@ -756,12 +756,13 @@ pub fn dsv4_attention(
     // valid, so no query row is fully masked (no softmax NaN). `kp` carries the
     // ABSOLUTE position of each retained key, so the comparison against `qp` is
     // unchanged by the narrowing above.
-    let kp = Tensor::arange(raw_base as u32, (raw_base + t_k) as u32, dev)?
-        .to_dtype(DType::F32)?
-        .reshape((1, t_k))?;
-    let qp = Tensor::arange(q0 as u32, (q0 + t_q) as u32, dev)?
-        .to_dtype(DType::F32)?
-        .reshape((t_q, 1))?;
+    //
+    // These are views into a cached device ramp, not `Tensor::arange`. `arange`
+    // is a host→device copy, and inside CUDA-graph capture the recorded memcpy
+    // holds the host pointer of a `Vec` that is already freed at launch time —
+    // see `layers::positions_f32`.
+    let kp = crate::layers::positions_f32(raw_base, t_k, dev)?.reshape((1, t_k))?;
+    let qp = crate::layers::positions_f32(q0, t_q, dev)?.reshape((t_q, 1))?;
     let causal = kp.broadcast_le(&qp)?;
     let lower = (&qp - window as f64)?;
     let in_window = kp.broadcast_gt(&lower)?;
@@ -783,9 +784,10 @@ pub fn dsv4_attention(
                 // so the two compose without double-counting.
                 Some(_) => Tensor::ones((t_q, t_c), DType::U8, dev)?,
                 None => {
-                    let bp = Tensor::arange(0u32, t_c as u32, dev)?
-                        .to_dtype(DType::F32)?
-                        .reshape((1, t_c))?;
+                    // A cached-ramp view, never `Tensor::arange`: inside capture
+                    // the recorded H2D memcpy holds the host pointer of a `Vec`
+                    // that is already freed at replay. See `layers::positions_f32`.
+                    let bp = crate::layers::positions_f32(0, t_c, dev)?.reshape((1, t_c))?;
                     let threshold = ((&qp + 1.0)? / ratio as f64)?.floor()?; // [t_q, 1]
                     bp.broadcast_lt(&threshold)? // [t_q, t_c] (u8)
                 }

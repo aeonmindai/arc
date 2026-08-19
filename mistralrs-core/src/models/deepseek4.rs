@@ -1319,11 +1319,18 @@ impl Attention {
         let t_c = comp.dim(2)?;
         // Compressed entry j sits at absolute position j*ratio. Apply the
         // layer's (compress-θ) RoPE to the last qk_rope_head_dim dims there.
-        // NOTE: builds a small arange each call (a host/device sync); fine on
-        // the correctness-first dense path — the long-context sparse-gather
-        // kernel is the place to precompute this.
+        //
+        // This used to build the positions with `Tensor::arange` on every call.
+        // That is a host round trip on the hot path AND — decisively — the
+        // reason CUDA-graph capture of the V4 decode forward SIGSEGV'd on its
+        // first launch: `arange` uploads a transient host `Vec`, and a captured
+        // `cuMemcpyHtoDAsync` records the host POINTER, not the bytes, so the
+        // graph re-read a freed `Vec` and handed garbage indices straight to
+        // the `index_select` on the next line. `compress_positions` serves a
+        // zero-copy view of a table built once, outside capture; see its doc
+        // comment for the full mechanism.
         let dev = comp.device();
-        let positions = compressed_row_positions(t_c, ratio, dev)?;
+        let positions = crate::layers::compress_positions(t_c, ratio, dev)?;
         self.rotary_emb
             .forward_at_positions(&comp, self.cfg.qk_rope_head_dim, &positions)
     }
@@ -2732,35 +2739,12 @@ fn append_kv_mqa(
     }
 }
 
-// Cached `[t_c]` U32 absolute positions of the compressed rows, keyed by row
-// count and ratio. Compressed row `j` sits at absolute position `j * ratio`,
-// which depends on nothing but `j` — so for a given (width, ratio) this vector
-// is a constant and rebuilding it per layer per step was pure waste.
-//
-// It is also a correctness precondition for capture, not just a saving:
-// `Tensor::arange` on a GPU device is an H2D copy from pageable host memory,
-// which cannot be recorded into a CUDA graph at all. Under fixed capacity the
-// width stops moving, so this hits from the second decode step onward and the
-// copy leaves the capture region for good.
-thread_local! {
-    static COMPRESSED_ROW_POSITIONS: std::cell::RefCell<Option<(usize, usize, Tensor)>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-fn compressed_row_positions(t_c: usize, ratio: usize, dev: &Device) -> Result<Tensor> {
-    COMPRESSED_ROW_POSITIONS.with(|c| -> Result<Tensor> {
-        let mut c = c.borrow_mut();
-        if let Some((w, r, t)) = c.as_ref() {
-            if *w == t_c && *r == ratio && t.device().same_device(dev) {
-                return Ok(t.clone());
-            }
-        }
-        let t = (Tensor::arange(0u32, t_c as u32, dev)?.to_dtype(DType::F32)? * (ratio as f64))?
-            .to_dtype(DType::U32)?;
-        *c = Some((t_c, ratio, t.clone()));
-        Ok(t)
-    })
-}
+// The compressed-row absolute positions (`j * ratio`) are served by
+// `layers::compress_positions`, which keeps one chunk-rounded table per
+// (ratio, device) and hands out `narrow` views of it. That form supersedes the
+// width-keyed cache that used to live here: it does not rebuild when `t_c`
+// moves within a chunk, so no `Tensor::arange` — an H2D copy whose recorded
+// host pointer dangles at replay — can ever land inside the capture region.
 
 /// The FIXED number of compressed rows the CUDA-graph decode arm reads back.
 ///
