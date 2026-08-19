@@ -1,10 +1,55 @@
-// QTIP beam-search trellis quantize kernel (LUT rung, K=4 / V=2 / L=16).
+// QTIP beam-search trellis quantize kernel (LUT rung).
 //
 // This is the GPU twin of `qtip/viterbi.rs::beam_quantize_row` (wave13-AD,
 // PR #29). It replaces the exhaustive prefix-grouped DP in `qtip_quantize.cu`
 // with a *pruned* dynamic program that keeps only the best `beam_w` states per
 // timestep, and it is BIT-IDENTICAL to the CPU beam at the same width — the
 // parity test in `qtip/mod.rs` compares packed bytes, not cosine similarity.
+//
+// GEOMETRY IS A TEMPLATE PARAMETER (see qtip_geom.cuh)
+// ---------------------------------------------------
+// Two rungs are compiled, both at 2 bits/weight:
+//
+//     K=4 / V=2 / L=16   the shipped rung; 15.125 decode instructions/weight
+//     K=8 / V=4 / L=12   the same rate at  4.375 decode instructions/weight
+//
+// The K=8 rung is NOT reachable by bumping the constants. Three things in this
+// kernel are shaped by `2^(L-K)` and `2^K`, and at K=8/L=12 all three invert:
+//
+//   * `2^(L-K)` groups falls 4096 -> 16, so "one thread per group" would leave
+//     240 of 256 threads idle;
+//   * `2^K` successors per group rises 16 -> 256, so a per-thread `cand[2^K]`
+//     register array becomes `cand[256]` — a GUARANTEED local-memory spill, and
+//     the spill is where the discredited "~1,700 s/layer" encode figure came
+//     from (see the res-usage note below);
+//   * the 32 KiB direct-indexed group table falls to 128 B, which is too small
+//     to keep doubling as the backtrace staging buffer.
+//
+// The fix for the first two is one change: **`LANES` threads co-operate on one
+// group** instead of one. `LANES = min(2^K, THREADS / 2^(L-K))`, so
+//
+//     K=4/L=16:  4096 groups >= 256 threads  ->  LANES = 1,  cand[16/1 ] = 16
+//     K=8/L=12:    16 groups                 ->  LANES = 16, cand[256/16] = 16
+//
+// The block stays fully occupied at both geometries and the register array
+// stays 16 entries at both — the candidate count per timestep is `2^L`-
+// saturated (`ng * 2^K = 4096`) either way, so the SAME work is simply
+// re-blocked. `LANES == 1` collapses every expression below to the shipped
+// code, which is why the K=4 rung stays byte-identical.
+//
+// The third is handled by sizing the shared scratch as
+// `max(2^(L-K) u64, STAGE_U64_MIN)`: at K=4 that is exactly the 4096-entry
+// group table that already staged the backtrace (no change at all), and at K=8
+// it is a 16 KiB stage over a 128 B table. That is not a smaller staging
+// budget in the terms that matter — the backtrace's dependent global loads are
+// `num_symbols / window`, and V=4 halves `num_symbols` exactly as the halved
+// window doubles it: 9472/32 == 4736/16 == 296 per row, unchanged.
+//
+// 🔑 FREED SHARED MEMORY, FOR THE SERVING PATH: at K=8/L=12 the group table is
+// 128 B instead of 32 KiB and the whole block drops from ~37.1 KiB to ~19.3
+// KiB. The ~32 KiB the direct-indexed table gives back is the same order as the
+// 32,768 B a 2^12 x V=4 fp16 serving LUT wants resident, and it is the budget
+// the layer-25 out-of-memory failure (FACTS.md:1330) was competing for.
 //
 // WHY IT IS FASTER, MEASURED IN BYTES
 // -----------------------------------
@@ -22,8 +67,8 @@
 //
 // The beam kernel moves, per (row, timestep):
 //     write trace       beam_w * 4 B = 1024 B at W=256   (global)
-//     read  LUT         n_groups * 128 B <= 32768 B      (L2-resident)
-//     read  weight      8 B
+//     read  LUT         n_groups * 2^K * V * 4 B         (L2-resident)
+//     read  weight      V * 4 B
 // The 512 KB cost ping-pong disappears entirely: the live state set is
 // `beam_w` entries, which fit in shared memory with room to spare. HBM traffic
 // per symbol position drops ~512x.
@@ -31,12 +76,12 @@
 // SHARED-MEMORY RESIDENCY (the claim wave13-AF was asked to test)
 // --------------------------------------------------------------
 // At beam_w = 256 the *beam* is 2 KiB (cost f32 + state u16 + parent u16).
-// It is not the beam that sets the shared-memory budget — it is the
-// 2^(L-K) = 4096-entry group-reduction table below, at 8 B/prefix = 32 KiB.
+// At K=4/L=16 it is not the beam that sets the shared-memory budget — it is
+// the 2^(L-K) = 4096-entry group-reduction table below, at 8 B/prefix = 32 KiB.
 // Total static shared memory is ~37.1 KiB at W=256, ~35.6 KiB at W=128 and
 // ~34.8 KiB at W=64: all three are comfortably inside the 48 KiB static
-// budget, all three keep costs and backtrace-of-the-live-set off HBM, and the
-// group table (not the beam) is what would have to shrink to go further.
+// budget. At K=8/L=12 the table is 128 B and the 16 KiB backtrace stage is the
+// budget instead, for ~19.3 KiB total.
 //
 // ALGORITHM (mirrors the Rust beam exactly)
 // -----------------------------------------
@@ -45,7 +90,7 @@
 // `g = p & ((1 << (L-K)) - 1)` — the same prefix-grouping the exhaustive
 // kernel exploits, applied to the beam instead of the whole state space.
 // Consequences:
-//   * All 16 successors of a group share one predecessor set, so the CPU's
+//   * All 2^K successors of a group share one predecessor set, so the CPU's
 //     "dedup by successor state, keep min predecessor cost, first-seen wins
 //     ties" collapses to ONE min per group. The CPU visits the beam in
 //     ascending state order, and all predecessors of a fixed successor share
@@ -54,7 +99,7 @@
 //     implements that rule exactly and is order-independent.
 //   * Distinct groups produce disjoint successor sets, so the expanded
 //     candidate list needs no deduplication at all: it is exactly
-//     `n_groups * 16` entries with pairwise-distinct states — hence pairwise
+//     `n_groups * 2^K` entries with pairwise-distinct states — hence pairwise
 //     distinct 48-bit selection keys.
 //
 // The CPU prunes with `select_nth_unstable_by((cost, state))` + `truncate`,
@@ -64,7 +109,10 @@
 // single candidate, which is the common case) followed by a deterministic
 // prefix-sum compaction. No sort is needed: nothing downstream depends on the
 // beam's order — the group reduction is an atomicMin, the final choice is an
-// argmin, and the backtrace follows explicit parent indices.
+// argmin, and the backtrace follows explicit parent indices. That last property
+// is what makes the `LANES > 1` re-blocking safe: splitting a group's
+// successors across `LANES` threads changes which beam SLOT a survivor lands
+// in, and nothing reads a slot index except as a parent pointer it also wrote.
 //
 // PARITY
 // ------
@@ -76,10 +124,13 @@
 // LAYOUT / LAUNCH
 // ---------------
 //   grid  = (rows_in_flight, 1, 1)      one block per row
-//   block = (QB_THREADS = 256, 1, 1)    thread t owns beam slot t and group t
+//   block = (QB_THREADS = 256, 1, 1)    thread t owns beam slot t; for the
+//                                       expansion it owns group `t / LANES`
+//                                       and that group's `2^K / LANES` symbols
 //   trace = [rows_in_flight, num_symbols, beam_w] u32, packed
 //           `(state << 16) | parent_slot`. 9.7 MB per row at W=256 and
-//           num_symbols=9472, against 620 MB for a per-state backtrace.
+//           num_symbols=9472 (K=4/V=2); half that at V=4, which halves
+//           `num_symbols` for the same row width.
 //
 // SM80+ (gated by `has_qtip_kernels` in build.rs; uses `__match_any_sync`,
 // which needs SM70+).
@@ -90,27 +141,73 @@
 #include "qtip_exact_fp.cuh"
 // Codebook selection (stored Gaussian LUT vs in-register sum2 code).
 #include "qtip_codebook.cuh"
+// K / V / L and the symbol packer.
+#include "qtip_geom.cuh"
 // Block primitives shared with the qtip2b beam (histogram / scan / radix bin).
 #include "qtip_beam_common.cuh"
 
 namespace {
 
-constexpr uint32_t QB_K           = 4;
-constexpr uint32_t QB_L           = 16;
-constexpr uint32_t QB_ALPHABET    = 1u << QB_K;              // 16
-constexpr uint32_t QB_GROUP_BITS  = QB_L - QB_K;             // 12
-constexpr uint32_t QB_GROUP_COUNT = 1u << QB_GROUP_BITS;     // 4096
-constexpr uint32_t QB_GROUP_MASK  = QB_GROUP_COUNT - 1u;     // 0x0FFF
-
-// One thread per beam slot AND per group; both are bounded by the beam width,
-// so the maximum supported width is the block size. 256 keeps the whole kernel
-// inside the 48 KiB static shared-memory budget (see the header) and matches
-// the W=256 that PR #29 measured quality-neutral against exhaustive Viterbi.
+// One thread per beam slot; both the beam width and the number of live groups
+// are bounded by the block size. 256 keeps the whole kernel inside the 48 KiB
+// static shared-memory budget (see the header) and matches the W=256 that
+// PR #29 measured quality-neutral against exhaustive Viterbi.
 constexpr int QB_THREADS  = 256;
 constexpr int QB_MAX_BEAM = QB_THREADS;
 constexpr int QB_WARPS    = QB_THREADS / 32;
 
 constexpr unsigned long long QB_KEY_MAX = ~0ull;
+
+// Block shape implied by a geometry. Every member collapses to the shipped
+// K=4/V=2/L=16 value when `LANES == 1`.
+template <class G>
+struct QbShape {
+    // Threads co-operating on ONE group. 1 when the trellis has at least as
+    // many groups as the block has threads (K=4/L=16: 4096 >= 256); otherwise
+    // the block is split evenly across the groups that exist (K=8/L=12: 16
+    // groups x 16 lanes).
+    static constexpr int LANES =
+        (G::GROUP_COUNT >= (uint32_t)QB_THREADS) ? 1 : (QB_THREADS / (int)G::GROUP_COUNT);
+    // Groups the block can expand in one pass.
+    static constexpr int GROUPS = QB_THREADS / LANES;
+    // Successors each thread evaluates — the `cand[]` register array. 16 at
+    // both shipped geometries; the spill landmine below is about THIS number.
+    static constexpr int CAND = (int)G::ALPHABET / LANES;
+    // Live groups are bounded by both the beam and the trellis.
+    static constexpr int MAX_GROUPS =
+        (QB_MAX_BEAM < (int)G::GROUP_COUNT) ? QB_MAX_BEAM : (int)G::GROUP_COUNT;
+
+    // Shared u64 scratch: the group-reduction table, which also stages the
+    // backtrace. `STAGE_U64_MIN` is the floor that keeps the staged walk worth
+    // doing once the group table is too small to serve as the stage — 2048 u64
+    // = 4096 u32 slots = a 16-timestep window at W=256, which at V=4 gives the
+    // same `num_symbols / window` dependent-load count as the K=4 rung's
+    // 32-timestep window at V=2.
+    static constexpr int STAGE_U64_MIN = 2048;
+    static constexpr int SCRATCH_U64 =
+        ((int)G::GROUP_COUNT > STAGE_U64_MIN) ? (int)G::GROUP_COUNT : STAGE_U64_MIN;
+
+    static_assert(QB_THREADS == 256, "the digit histogram is one bin per thread");
+    static_assert(QB_MAX_BEAM <= QB_THREADS, "one thread per beam slot");
+    static_assert(LANES >= 1 && LANES <= (int)G::ALPHABET,
+                  "a group cannot be split across more threads than it has successors");
+    static_assert((int)G::ALPHABET % LANES == 0,
+                  "the alphabet must divide evenly across a group's lanes");
+    static_assert(QB_THREADS % LANES == 0, "lanes must tile the block");
+    static_assert(MAX_GROUPS <= GROUPS,
+                  "every live group must have a lane team in the block");
+    // `cand[]` MUST stay in registers; see the spill note on
+    // QB_MIN_BLOCKS_PER_SM. 16 is what both shipped geometries produce and what
+    // `cuobjdump -res-usage` has been checked at.
+    static_assert(CAND >= 1 && CAND <= 16,
+                  "cand[] must stay small enough to live in registers");
+    // `keep_mask` is a 32-bit bitset over `cand[]`.
+    static_assert(CAND <= 32, "keep_mask is 32 bits wide");
+    // The backtrace stages trace windows in the shared scratch; a window must
+    // hold at least one full timestep or the staged walk cannot advance.
+    static_assert(QB_MAX_BEAM <= SCRATCH_U64 * 2,
+                  "shared scratch must stage at least one timestep of the trace");
+};
 
 // Blocks per SM this kernel is compiled to fit.
 //
@@ -128,30 +225,33 @@ constexpr unsigned long long QB_KEY_MAX = ~0ull;
 //
 // ⚠ THE FAILURE MODE IS SILENT. `__launch_bounds__` does not refuse to compile
 // when it cannot reach the register budget — it SPILLS to local memory, and a
-// spilled load inside the radix loop executes 16 x ~3.87 times per timestep,
-// which would cost more than the occupancy gains. The 32-bit selection above is
-// what is expected to free the 16 registers (it removes the 64-bit key
-// temporaries that were live across the whole radix), but register allocation
+// spilled load inside the radix loop executes 2^K/LANES x ~3.87 times per
+// timestep, which would cost more than the occupancy gains. Register allocation
 // is nvcc's scheduling decision and CANNOT be proven from source.
 //
 // REQUIRED CHECK after any change here, on the build box, no GPU needed:
 //     cuobjdump -res-usage <obj> | grep -A1 beam_kernel
-// `LOCAL:` must remain 0. If it is not, set QB_MIN_BLOCKS_PER_SM back to 3
-// (which reproduces today's measured allocation exactly and is a no-op) rather
-// than trading a real latency regression for a nominal occupancy gain.
+// `LOCAL:` must remain 0 — for EVERY geometry instantiated below, not just the
+// shipped one. This is not a formality: a `cand[]` that spills is precisely the
+// mis-scoping that produced the discredited "~1,700 s/layer / 20 h / $30"
+// K=8/L=12 encode estimate. `.github/workflows/cuda_compile_check.yaml` runs
+// this check on every PR so it cannot be skipped; if it ever fails, set
+// QB_MIN_BLOCKS_PER_SM back to 3 (which reproduces the measured allocation
+// exactly and is a no-op) rather than trading a real latency regression for a
+// nominal occupancy gain.
 //
-// Related landmine: `float cand[QB_ALPHABET]` must stay in registers, which
+// Related landmine: `unsigned int cand[CAND]` must stay in registers, which
 // requires EVERY loop indexing it to be fully unrolled. Weakening any of those
 // `#pragma unroll`s sends the array to local memory on its own.
 constexpr int QB_MIN_BLOCKS_PER_SM = 4;
 
-template <bool COMPUTED_CB>
+template <class G, bool COMPUTED_CB>
 __global__ void __launch_bounds__(QB_THREADS, QB_MIN_BLOCKS_PER_SM)
 qtip_quantize_rows_beam_kernel(
     const float*   __restrict__ weight,      // [n_rows, in_features]
     const float*   __restrict__ lut,         // [2^L * V] (unused when computed)
     const float*   __restrict__ row_scales,  // [n_rows]
-    uint8_t*       __restrict__ packed,      // [n_rows, num_symbols / 2]
+    uint8_t*       __restrict__ packed,      // [n_rows, num_symbols / (8/K)]
     uint32_t*      __restrict__ trace,       // [BATCH, num_symbols, beam_w]
     int in_features,
     int num_symbols,
@@ -159,14 +259,19 @@ qtip_quantize_rows_beam_kernel(
     int beam_w,
     unsigned int cb_mult
 ) {
-    // ~37.1 KiB at QB_MAX_BEAM = 256; the 48 KiB static limit is the gate.
-    __shared__ unsigned long long s_gmin[QB_GROUP_COUNT];   // 32 KiB
+    using QS = QbShape<G>;
+
+    // The group-reduction table occupies the first `2^(L-K)` entries; the whole
+    // array doubles as the backtrace staging buffer once the forward pass is
+    // done. ~37.1 KiB at K=4/L=16 (SCRATCH_U64 == GROUP_COUNT == 4096, exactly
+    // the shipped allocation), ~19.3 KiB at K=8/L=12.
+    __shared__ unsigned long long s_gmin[QS::SCRATCH_U64];
     __shared__ float          s_beam_cost  [QB_MAX_BEAM];
     __shared__ unsigned short s_beam_state [QB_MAX_BEAM];
     __shared__ unsigned short s_beam_parent[QB_MAX_BEAM];
-    __shared__ unsigned short s_grp_g      [QB_MAX_BEAM];
-    __shared__ float          s_grp_cost   [QB_MAX_BEAM];
-    __shared__ unsigned short s_grp_parent [QB_MAX_BEAM];
+    __shared__ unsigned short s_grp_g      [QS::MAX_GROUPS];
+    __shared__ float          s_grp_cost   [QS::MAX_GROUPS];
+    __shared__ unsigned short s_grp_parent [QS::MAX_GROUPS];
     __shared__ unsigned int   s_hist[256];
     // Two scan scratch buffers, alternated by `qb_scan_slot` (see
     // qb_block_excl_scan): consecutive scans never touch the same words, so no
@@ -183,19 +288,20 @@ qtip_quantize_rows_beam_kernel(
     __shared__ int            s_beam_n;
     __shared__ int            s_n_groups;
 
-    static_assert(QB_THREADS == 256, "the digit histogram is one bin per thread");
-    static_assert(QB_MAX_BEAM <= QB_THREADS, "one thread per beam slot / group");
-    // The backtrace stages trace windows in the (dead) group table; a window
-    // must hold at least one full timestep or the staged walk cannot advance.
-    static_assert(QB_MAX_BEAM <= QB_GROUP_COUNT * 2,
-                  "group table must stage at least one timestep of the trace");
-
     const int local_row = blockIdx.x;
     const int row       = row_offset + local_row;
     const int tid       = (int)threadIdx.x;
 
+    // Expansion identity: which group this thread serves, and which slice of
+    // that group's alphabet. At LANES == 1 this is `(tid, 0)` and every use
+    // below folds back to the shipped indexing.
+    const int lane_g = tid / QS::LANES;
+    const int lane_i = tid % QS::LANES;
+
+    const int pkd_per_row = qtip_packed_bytes_per_row<G>(num_symbols);
+
     const float* __restrict__ my_row = weight + (size_t)row * (size_t)in_features;
-    uint8_t*  __restrict__ my_pkd    = packed + (size_t)row * (size_t)(num_symbols / 2);
+    uint8_t*  __restrict__ my_pkd    = packed + (size_t)row * (size_t)pkd_per_row;
     uint32_t* __restrict__ my_trace  =
         trace + (size_t)local_row * (size_t)num_symbols * (size_t)beam_w;
 
@@ -203,8 +309,8 @@ qtip_quantize_rows_beam_kernel(
 
     // The group table is cleared once per row: every timestep releases exactly
     // the slots it claimed (one winner per non-empty group), so it re-enters
-    // each timestep all-empty without a 4096-entry memset.
-    for (int i = tid; i < (int)QB_GROUP_COUNT; i += QB_THREADS) {
+    // each timestep all-empty without a 2^(L-K)-entry memset.
+    for (int i = tid; i < (int)G::GROUP_COUNT; i += QB_THREADS) {
         s_gmin[i] = QB_KEY_MAX;
     }
     // The digit histogram is zeroed ONCE per row. Every radix pass clears its
@@ -218,8 +324,13 @@ qtip_quantize_rows_beam_kernel(
     __syncthreads();
 
     for (int t = 0; t < num_symbols; ++t) {
-        const float t0 = qtip_scaled_target_exact(my_row[(size_t)t * 2 + 0], inv_scale);
-        const float t1 = qtip_scaled_target_exact(my_row[(size_t)t * 2 + 1], inv_scale);
+        // The V targets this symbol must reproduce.
+        float tgt[G::V];
+        #pragma unroll
+        for (uint32_t v = 0; v < G::V; ++v) {
+            tgt[v] = qtip_scaled_target_exact(
+                my_row[(size_t)t * (size_t)G::V + (size_t)v], inv_scale);
+        }
 
         // ---- 1. Expansion frontier ------------------------------------------
         // t == 0: the decoder starts from state 0, so the reachable states are
@@ -244,7 +355,7 @@ qtip_quantize_rows_beam_kernel(
             const bool in_beam = (tid < bn);
             if (in_beam) {
                 const unsigned int st = (unsigned int)s_beam_state[tid];
-                my_g   = st & QB_GROUP_MASK;
+                my_g   = st & G::GROUP_MASK;
                 my_key = ((unsigned long long)qtip_total_order_key(s_beam_cost[tid]) << 16)
                        | (unsigned long long)st;
                 atomicMin(&s_gmin[my_g], my_key);
@@ -268,48 +379,59 @@ qtip_quantize_rows_beam_kernel(
             __syncthreads();
         }
 
-        // ---- 2. Expand: 16 successors per group, all distinct ----------------
+        // ---- 2. Expand: 2^K successors per group, all distinct ---------------
         const int  ng     = s_n_groups;
-        const bool active = (tid < ng);
+        const bool active = (lane_g < ng);
         unsigned int base_state = 0u;
+        // This thread's slice of its group's alphabet: symbols
+        // `lane_i, lane_i + LANES, lane_i + 2*LANES, ...`. Striding rather than
+        // blocking keeps the LANES lanes of a group reading CONSECUTIVE
+        // codebook entries, so the LUT path stays one coalesced run per group.
+        // At LANES == 1 the slice is `0, 1, .., 2^K-1` — the shipped order.
+        //
         // wave17-AF: the candidates are carried as their ORDERED u32 KEYS, not
         // as floats. `qtip_total_order_key` is a bijection, so this loses
-        // nothing, and it deletes a key rebuild (2 instructions x 16
+        // nothing, and it deletes a key rebuild (2 instructions x CAND
         // candidates) from every radix pass and from compaction — ~5 rebuilds
         // per timestep at the measured 3.87 passes. The float is recovered
         // exactly, once, for the survivors that reach the beam.
-        unsigned int cand[QB_ALPHABET];
+        unsigned int cand[QS::CAND];
         if (active) {
-            base_state = ((unsigned int)s_grp_g[tid]) << QB_K;
-            const float gcost = s_grp_cost[tid];
+            base_state = ((unsigned int)s_grp_g[lane_g]) << G::K;
+            const float gcost = s_grp_cost[lane_g];
             if (COMPUTED_CB) {
-                // The 16 successors are `base_state | j` for consecutive j, and
-                // base_state's low K bits are zero, so `(base_state|j)*mult ==
-                // base_state*mult + j*mult`: the MCG product advances by one
-                // folded constant per j — a single integer add, and no codebook
-                // memory traffic at all.
-                const unsigned int prod0 = base_state * cb_mult;
+                // The successors are `base_state | sym` for the strided `sym`
+                // above, and base_state's low K bits are zero, so
+                // `(base_state|sym)*mult == base_state*mult + sym*mult`: the MCG
+                // product advances by one folded constant per step — a single
+                // integer add, and no codebook memory traffic at all.
+                const unsigned int prod0 =
+                    (base_state + (unsigned int)lane_i) * cb_mult;
+                const unsigned int step = (unsigned int)QS::LANES * cb_mult;
                 #pragma unroll
-                for (int j = 0; j < (int)QB_ALPHABET; ++j) {
-                    const unsigned int x0 = prod0 + (unsigned int)j * cb_mult;
-                    const float2 c = qtip_cb_pair_from_x0(x0, cb_mult);
-                    const float err = qtip_decode_err_exact_lv(c.x, c.y, t0, t1);
-                    cand[j] = qtip_total_order_key(__fadd_rn(gcost, err));
+                for (int m = 0; m < QS::CAND; ++m) {
+                    const unsigned int x0 = prod0 + (unsigned int)m * step;
+                    const float err = qtip_cb_err_from_x0<G::V>(x0, cb_mult, tgt);
+                    cand[m] = qtip_total_order_key(__fadd_rn(gcost, err));
                 }
             } else {
-                // 16 consecutive states => one contiguous 128 B LUT run.
-                const float* __restrict__ lp = lut + (size_t)base_state * 2u;
+                // Consecutive states => one contiguous LUT run per group
+                // (2^K * V * 4 B), which the LANES lanes stride through.
+                const float* __restrict__ lp =
+                    lut + (size_t)(base_state + (unsigned int)lane_i) * (size_t)G::V;
                 #pragma unroll
-                for (int j = 0; j < (int)QB_ALPHABET; ++j) {
-                    const float err = qtip_decode_err_exact_lv(lp[2 * j + 0], lp[2 * j + 1], t0, t1);
-                    cand[j] = qtip_total_order_key(__fadd_rn(gcost, err));
+                for (int m = 0; m < QS::CAND; ++m) {
+                    const float* __restrict__ cp =
+                        lp + (size_t)m * (size_t)(QS::LANES * (int)G::V);
+                    const float err = qtip_decode_err_exact_vec<G::V>(cp, tgt);
+                    cand[m] = qtip_total_order_key(__fadd_rn(gcost, err));
                 }
             }
         } else {
             #pragma unroll
-            for (int j = 0; j < (int)QB_ALPHABET; ++j) cand[j] = 0u;
+            for (int m = 0; m < QS::CAND; ++m) cand[m] = 0u;
         }
-        const int n_cand = ng * (int)QB_ALPHABET;
+        const int n_cand = ng * (int)G::ALPHABET;
 
         // ---- 3. Select the beam_w smallest by (cost, state) ------------------
         if (n_cand <= beam_w) {
@@ -342,11 +464,11 @@ qtip_quantize_rows_beam_kernel(
                 exit_shift = shift;
 
                 #pragma unroll
-                for (int j = 0; j < (int)QB_ALPHABET; ++j) {
+                for (int m = 0; m < QS::CAND; ++m) {
                     unsigned int ck = 0u;
                     bool part = false;
                     if (active) {
-                        ck = cand[j];
+                        ck = cand[m];
                         // `shift == 24` makes the guard vacuous; the compiler
                         // folds it away in that unrolled iteration.
                         part = (shift == 24) ||
@@ -390,12 +512,13 @@ qtip_quantize_rows_beam_kernel(
                 for (int shift = 8; shift >= 0; shift -= 8) {
 
                     #pragma unroll
-                    for (int j = 0; j < (int)QB_ALPHABET; ++j) {
+                    for (int m = 0; m < QS::CAND; ++m) {
                         bool part = false;
                         unsigned int st = 0u;
                         if (active) {
-                            st = base_state | (unsigned int)j;
-                            part = (cand[j] == cost_prefix) &&
+                            st = base_state
+                               | (unsigned int)(lane_i + m * QS::LANES);
+                            part = (cand[m] == cost_prefix) &&
                                    ((shift == 8) ||
                                     ((st >> (shift + 8)) == (state_prefix >> (shift + 8))));
                         }
@@ -427,11 +550,13 @@ qtip_quantize_rows_beam_kernel(
         unsigned int keep_cnt  = 0u;
         if (active) {
             #pragma unroll
-            for (int j = 0; j < (int)QB_ALPHABET; ++j) {
-                const unsigned long long key = ((unsigned long long)cand[j] << 16)
-                    | (unsigned long long)(base_state | (unsigned int)j);
+            for (int m = 0; m < QS::CAND; ++m) {
+                const unsigned int st =
+                    base_state | (unsigned int)(lane_i + m * QS::LANES);
+                const unsigned long long key = ((unsigned long long)cand[m] << 16)
+                    | (unsigned long long)st;
                 if (key <= threshold) {
-                    keep_mask |= (1u << j);
+                    keep_mask |= (1u << m);
                     ++keep_cnt;
                 }
             }
@@ -442,14 +567,15 @@ qtip_quantize_rows_beam_kernel(
         // already captured every value the expansion needed), so the beam is
         // rewritten in place.
         if (active) {
-            const unsigned short parent = s_grp_parent[tid];
+            const unsigned short parent = s_grp_parent[lane_g];
             unsigned int p = base_slot;
             #pragma unroll
-            for (int j = 0; j < (int)QB_ALPHABET; ++j) {
-                if (keep_mask & (1u << j)) {
+            for (int m = 0; m < QS::CAND; ++m) {
+                if (keep_mask & (1u << m)) {
                     // Exact inverse; the bijection makes this the identical f32.
-                    s_beam_cost[p]   = qtip_key_to_float(cand[j]);
-                    s_beam_state[p]  = (unsigned short)(base_state | (unsigned int)j);
+                    s_beam_cost[p]   = qtip_key_to_float(cand[m]);
+                    s_beam_state[p]  = (unsigned short)(
+                        base_state | (unsigned int)(lane_i + m * QS::LANES));
                     s_beam_parent[p] = parent;
                     ++p;
                 }
@@ -492,14 +618,15 @@ qtip_quantize_rows_beam_kernel(
     // kernel's tail is so expensive. Instead reuse the now-dead group table as
     // a staging buffer: the whole block bulk-loads a window of timesteps
     // (coalesced), then thread 0 chases inside shared memory. 32 KiB stages 32
-    // timesteps at W=256, cutting the dependent global loads by that factor.
+    // timesteps at W=256 (K=4/V=2); the 16 KiB floor stages 16, against half as
+    // many timesteps at V=4 — the same dependent-load count either way.
     {
-        const int ppr = num_symbols / 2;
-        for (int i = tid; i < ppr; i += QB_THREADS) my_pkd[i] = 0u;
+        for (int i = tid; i < pkd_per_row; i += QB_THREADS) my_pkd[i] = 0u;
 
         uint32_t* s_stage = reinterpret_cast<uint32_t*>(s_gmin);
-        const int stage_slots = (int)(QB_GROUP_COUNT * (sizeof(unsigned long long) / sizeof(uint32_t)));
-        const int window = stage_slots / beam_w;   // >= 32 for beam_w <= 256
+        const int stage_slots =
+            (int)(QS::SCRATCH_U64 * (int)(sizeof(unsigned long long) / sizeof(uint32_t)));
+        const int window = stage_slots / beam_w;   // >= 16 for beam_w <= 256
 
         if (tid == 0) s_walk_slot = s_fin_slot;
         __syncthreads();
@@ -515,10 +642,8 @@ qtip_quantize_rows_beam_kernel(
                 unsigned int slot = s_walk_slot;
                 for (int t = t_hi; t >= t_lo; --t) {
                     const uint32_t e = s_stage[(size_t)(t - t_lo) * (size_t)beam_w + (size_t)slot];
-                    const unsigned int st  = e >> 16;
-                    const uint8_t      sym = (uint8_t)(st & (QB_ALPHABET - 1u));
-                    if ((t & 1) == 0) my_pkd[t / 2] |= sym;
-                    else              my_pkd[t / 2] |= (uint8_t)(sym << 4);
+                    const unsigned int st = e >> 16;
+                    qtip_pack_symbol<G>(my_pkd, t, st);
                     slot = e & 0xFFFFu;
                 }
                 s_walk_slot = slot;
@@ -528,24 +653,10 @@ qtip_quantize_rows_beam_kernel(
     }
 }
 
-} // anonymous namespace
-
-// ============================================================================
-// extern "C" launchers
-// ============================================================================
-
-extern "C" {
-
-// Largest beam width the kernel can run. The Rust side reads this and REFUSES
-// a wider beam rather than silently substituting one it can do — a bake must
-// never quietly change its search.
-int qtip_beam_max_width() { return QB_MAX_BEAM; }
-
-// Returns 0 on launch, -1 when `beam_w` is out of range (caller must not
-// silently fall back to a different search).
-// `cb_mult == 0` selects the stored Gaussian LUT; nonzero selects the computed
-// sum2 codebook with that MCG multiplier. See qtip_codebook.cuh.
-int launch_qtip_quantize_rows_beam_f32(
+// Launch one geometry. Split out so the ABI-level dispatch below is a plain
+// table and the codebook branch is not restated per geometry.
+template <class G>
+int qb_launch(
     const float*  d_weight,
     const float*  d_lut,
     const float*  d_row_scales,
@@ -561,15 +672,71 @@ int launch_qtip_quantize_rows_beam_f32(
 ) {
     if (beam_w < 1 || beam_w > QB_MAX_BEAM) return -1;
     if (cb_mult != 0u) {
-        qtip_quantize_rows_beam_kernel<true><<<n_rows, QB_THREADS, 0, stream>>>(
+        qtip_quantize_rows_beam_kernel<G, true><<<n_rows, QB_THREADS, 0, stream>>>(
             d_weight, d_lut, d_row_scales, d_packed, d_trace,
             in_features, num_symbols, row_offset, beam_w, cb_mult);
     } else {
-        qtip_quantize_rows_beam_kernel<false><<<n_rows, QB_THREADS, 0, stream>>>(
+        qtip_quantize_rows_beam_kernel<G, false><<<n_rows, QB_THREADS, 0, stream>>>(
             d_weight, d_lut, d_row_scales, d_packed, d_trace,
             in_features, num_symbols, row_offset, beam_w, 0u);
     }
     return 0;
+}
+
+} // anonymous namespace
+
+// ============================================================================
+// extern "C" launchers
+// ============================================================================
+
+extern "C" {
+
+// Largest beam width the kernel can run. The Rust side reads this and REFUSES
+// a wider beam rather than silently substituting one it can do — a bake must
+// never quietly change its search.
+int qtip_beam_max_width() { return QB_MAX_BEAM; }
+
+// Beam-quantize `n_rows` rows at the trellis geometry `(k_bits, v_dim, l_bits)`.
+//
+// The geometry is an ARGUMENT, not a compile-time assumption of the caller: the
+// Rust side passes `qtip::{K, V, L}` straight through, so the day those consts
+// change the bake follows without a second parameterisation to reconcile. An
+// unsupported triple is REFUSED (-2) rather than silently served by the nearest
+// compiled kernel — the failure mode that would produce a checkpoint whose
+// bytes mean something other than what its header claims.
+//
+// Returns 0 on launch, -1 when `beam_w` is out of range, -2 when the geometry
+// has no compiled kernel.
+// `cb_mult == 0` selects the stored Gaussian LUT; nonzero selects the computed
+// sum2 codebook with that MCG multiplier. See qtip_codebook.cuh.
+int launch_qtip_quantize_rows_beam_geom_f32(
+    const float*  d_weight,
+    const float*  d_lut,
+    const float*  d_row_scales,
+    uint8_t*      d_packed,
+    uint32_t*     d_trace,
+    int n_rows,
+    int in_features,
+    int num_symbols,
+    int row_offset,
+    int beam_w,
+    int k_bits,
+    int v_dim,
+    int l_bits,
+    unsigned int  cb_mult,
+    cudaStream_t  stream
+) {
+    if (k_bits == 4 && v_dim == 2 && l_bits == 16) {
+        return qb_launch<QtipGeomK4V2L16>(
+            d_weight, d_lut, d_row_scales, d_packed, d_trace,
+            n_rows, in_features, num_symbols, row_offset, beam_w, cb_mult, stream);
+    }
+    if (k_bits == 8 && v_dim == 4 && l_bits == 12) {
+        return qb_launch<QtipGeomK8V4L12>(
+            d_weight, d_lut, d_row_scales, d_packed, d_trace,
+            n_rows, in_features, num_symbols, row_offset, beam_w, cb_mult, stream);
+    }
+    return -2;
 }
 
 } // extern "C"

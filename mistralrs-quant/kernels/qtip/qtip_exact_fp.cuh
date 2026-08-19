@@ -82,6 +82,32 @@ __device__ __forceinline__ float qtip_decode_err_exact_lv(
     return __fadd_rn(__fmul_rn(d0, d0), __fmul_rn(d1, d1));
 }
 
+// V-generic form of the same metric, for rungs where the reproduction vector is
+// not two-dimensional (K=8/V=4/L=12). The Rust reference accumulates
+//
+//     let mut err = 0f32;
+//     for v in 0..V { let d = c[v] - target[v]; err += d * d; }
+//
+// which is a LEFT fold. `0.0 + x == x` exactly for every `x = d*d` (a square is
+// `+0.0` or larger, never `-0.0`), so seeding the accumulator with the v=0 term
+// instead of `0.0f` is the identical value and saves an add. At V == 2 the
+// expansion is `__fadd_rn(__fmul_rn(d0,d0), __fmul_rn(d1,d1))` — instruction for
+// instruction `qtip_decode_err_exact_lv` above, which is what keeps the K=4/V=2
+// rung byte-identical through this generalisation.
+template <uint32_t V>
+__device__ __forceinline__ float qtip_decode_err_exact_vec(
+    const float* __restrict__ c, const float* __restrict__ t
+) {
+    const float d0 = __fsub_rn(c[0], t[0]);
+    float acc = __fmul_rn(d0, d0);
+    #pragma unroll
+    for (uint32_t v = 1; v < V; ++v) {
+        const float d = __fsub_rn(c[v], t[v]);
+        acc = __fadd_rn(acc, __fmul_rn(d, d));
+    }
+    return acc;
+}
+
 // Total order over f32 matching Rust's `f32::total_cmp`, as an unsigned key:
 // ordering the keys ascending orders the floats by `total_cmp` ascending.
 // (`total_cmp` maps bits to i32 and flips the low 31 bits of negatives; adding

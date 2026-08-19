@@ -87,6 +87,40 @@ __device__ __forceinline__ float2 qtip_cb_pair_from_x0(unsigned int x0, unsigned
     return make_float2(qtip_cb_fold(x0), qtip_cb_fold(x1));
 }
 
+// V-generic branch metric straight from the FIRST MCG product
+// `x0 = state * mult`: the `V` codewords come from chaining the multiplier
+// `V-1` more times. The chain is what makes the construction V-dimensional at
+// all — `x1 = x0 * mult` is called out above as "what makes it V=2" — so
+// extending it to V=4 (the K=8/V=4/L=12 rung) is the same code with a longer
+// fold, not a new codebook.
+//
+// Generation and accumulation are FUSED on purpose. The obvious factoring
+// (produce `float c[V]`, then take the error) materialises a V-element local
+// array whose address escapes into the metric, and a local array that does not
+// get promoted to registers is a local-memory spill — the exact failure the
+// beam kernel's `cuobjdump -res-usage` gate exists to catch. Nothing here is
+// ever addressed.
+//
+// The V == 2 expansion is `d0 = fold(x0) - t[0]`, `d1 = fold(x0*mult) - t[1]`,
+// `__fadd_rn(d0*d0, d1*d1)` — operation for operation `qtip_cb_pair_from_x0`
+// followed by `qtip_decode_err_exact_lv`, which is what keeps the shipped rung
+// bit-identical through this generalisation.
+template <uint32_t V>
+__device__ __forceinline__ float qtip_cb_err_from_x0(
+    unsigned int x0, unsigned int mult, const float* __restrict__ t
+) {
+    unsigned int x = x0;
+    float d   = __fsub_rn(qtip_cb_fold(x), t[0]);
+    float acc = __fmul_rn(d, d);
+    #pragma unroll
+    for (uint32_t v = 1; v < V; ++v) {
+        x *= mult;                 // chained — this is what makes it V-dimensional
+        d   = __fsub_rn(qtip_cb_fold(x), t[v]);
+        acc = __fadd_rn(acc, __fmul_rn(d, d));
+    }
+    return acc;
+}
+
 // The V=2 codeword pair for trellis `state`. `mult` is the MCG multiplier
 // (`QTIP_MCG_V2_MULT` on the Rust side).
 __device__ __forceinline__ float2 qtip_cb_sum2(unsigned int state, unsigned int mult) {

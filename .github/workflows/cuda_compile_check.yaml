@@ -264,6 +264,16 @@ jobs:
       # Arc .cu file, but no binary is produced, so there is no final `-lcuda`
       # link (arc-cuda-graph ships a `gemv_bench` bin gated on `cuda` that would
       # otherwise link the driver lib, absent on a GPU-less runner).
+      # The QTIP beam kernels demand `cuobjdump -res-usage | LOCAL:0` in their
+      # own source and, until this step existed, nothing ran it. A spill is
+      # silent — `__launch_bounds__` spills rather than failing — and a spilled
+      # `cand[]` is exactly the mis-scoping behind the discredited
+      # "~1,700 s/layer" K=8/V=4/L=12 encode estimate. The script proves itself
+      # red on a negative control and asserts both geometries are present, so it
+      # cannot pass vacuously. nvcc + cuobjdump only; no GPU.
+      - name: QTIP beam spill gate (LOCAL:0, all geometries)
+        run: bash arc-tools/qtip_beam_res_usage_check.sh sm_${{ matrix.compute_cap }}
+
       - name: Compile QTIP CUDA kernels (mistralrs-quant)
         run: cargo build -p mistralrs-quant --lib --features cuda
 

@@ -889,8 +889,41 @@ pub(crate) fn beam_max_width() -> usize {
     }
 }
 
+/// The Rust trellis geometry as the kernels pack it: `(K << 16) | (V << 8) | L`.
+fn rust_geometry_word() -> i32 {
+    ((super::K as i32) << 16) | ((super::V as i32) << 8) | (super::L as i32)
+}
+
+/// Refuse a geometry the non-beam CUDA kernels were not compiled for.
+///
+/// `qtip_beam.cu` takes `(K, V, L)` as launch arguments and dispatches, so the
+/// beam follows `qtip::{K, V, L}` automatically. The exhaustive DP, the greedy
+/// walk and the scale refinement in `qtip_quantize.cu` do NOT: their prefix
+/// blocking and their two-symbols-per-byte packing are K=4/V=2/L=16 by
+/// construction. Without this check, moving the Rust consts would run those
+/// kernels over buffers a different rung sized — a silent corruption with no
+/// kernel error and no wrong-looking output shape.
+fn ensure_non_beam_geometry(what: &str) -> Result<()> {
+    let compiled = unsafe { ffi::qtip_exhaustive_geometry() };
+    let wanted = rust_geometry_word();
+    if compiled != wanted {
+        candle_core::bail!(
+            "QTIP quantize CUDA: {what} is compiled for K={}/V={}/L={}, but the Rust \
+             trellis geometry is K={}/V={}/L={}. Refusing to run: only the beam search \
+             (`kernels/qtip/qtip_beam.cu`) is geometry-parametric.",
+            (compiled >> 16) & 0xFF,
+            (compiled >> 8) & 0xFF,
+            compiled & 0xFF,
+            super::K,
+            super::V,
+            super::L,
+        );
+    }
+    Ok(())
+}
+
 /// One-shot quantize entry point. Returns `(packed_blocks, row_scales)`:
-/// * `packed_blocks` — `[n_rows, num_symbols / 2]` U8, two K=4 symbols per byte.
+/// * `packed_blocks` — `[n_rows, num_symbols / (8/K)]` U8, `8/K` symbols per byte.
 /// * `row_scales`    — `[n_rows]` F32, per-row scale.
 ///
 /// `weight_rotated_f32` should already be in the rotated frame (caller is
@@ -914,9 +947,15 @@ pub(crate) fn quantize_rows_cuda(
     }
     let (n_rows, k_in) = weight_rotated_f32.dims2()?;
     let num_symbols = k_in / super::V as usize;
-    if !num_symbols.is_multiple_of(2) {
+    // Symbols per packed byte, from the rung's K: 2 at K=4, 1 at K=8. Derived
+    // rather than written as `2` so the packing follows `qtip::K` the day it
+    // moves — `qtip_geom.cuh::SYMS_PER_BYTE` is the CUDA side of this number.
+    let syms_per_byte = 8 / super::K as usize;
+    if !num_symbols.is_multiple_of(syms_per_byte) {
         candle_core::bail!(
-            "QTIP quantize CUDA: num_symbols ({num_symbols}) must be even for K=4 packing"
+            "QTIP quantize CUDA: num_symbols ({num_symbols}) must be a multiple of \
+             {syms_per_byte} for K={} packing",
+            super::K
         );
     }
     if weight_rotated_f32.dtype() != DType::F32 {
@@ -947,7 +986,7 @@ pub(crate) fn quantize_rows_cuda(
     let row_scales = compute_row_scales_cuda(&weight_contig, codebook.scale_divisor())?;
 
     // Step 2: allocate packed output.
-    let packed_per_row = num_symbols / 2;
+    let packed_per_row = num_symbols / syms_per_byte;
     let packed_buf = dev.alloc_zeros::<u8>(n_rows * packed_per_row)?;
     let packed_shape = candle_core::Shape::from_dims(&[n_rows, packed_per_row]);
 
@@ -980,19 +1019,22 @@ pub(crate) fn quantize_rows_cuda(
         let (pkd_ptr, pkd_guard) = slice_ptr(&packed_buf, 0);
 
         match mode {
-            QtipMode::Greedy => unsafe {
-                ffi::launch_qtip_quantize_rows_greedy_f32(
-                    w_ptr as *const _,
-                    lut_ptr as *const _,
-                    rs_ptr as *const _,
-                    pkd_ptr as *mut _,
-                    n_rows as i32,
-                    k_in as i32,
-                    num_symbols as i32,
-                    cb_mult,
-                    dev.cuda_stream().cu_stream(),
-                );
-            },
+            QtipMode::Greedy => {
+                ensure_non_beam_geometry("the greedy quantize kernel")?;
+                unsafe {
+                    ffi::launch_qtip_quantize_rows_greedy_f32(
+                        w_ptr as *const _,
+                        lut_ptr as *const _,
+                        rs_ptr as *const _,
+                        pkd_ptr as *mut _,
+                        n_rows as i32,
+                        k_in as i32,
+                        num_symbols as i32,
+                        cb_mult,
+                        dev.cuda_stream().cu_stream(),
+                    );
+                }
+            }
             QtipMode::Viterbi if !matches!(search, TrellisSearch::Exhaustive) => {
                 // wave13-AF beam kernel. The live state set is `width` entries
                 // in shared memory, so there is NO cost ping-pong scratch at
@@ -1025,8 +1067,12 @@ pub(crate) fn quantize_rows_cuda(
                 let mut row_offset = 0usize;
                 while row_offset < n_rows {
                     let this_batch = rows_in_flight.min(n_rows - row_offset);
+                    // The geometry is passed, not assumed: the kernel is
+                    // templated on (K, V, L) and dispatches, so this call
+                    // follows `qtip::{K, V, L}` with no change here the day
+                    // they move to K=8/V=4/L=12.
                     let rc = unsafe {
-                        ffi::launch_qtip_quantize_rows_beam_f32(
+                        ffi::launch_qtip_quantize_rows_beam_geom_f32(
                             w_ptr as *const _,
                             lut_ptr as *const _,
                             rs_ptr as *const _,
@@ -1037,10 +1083,23 @@ pub(crate) fn quantize_rows_cuda(
                             num_symbols as i32,
                             row_offset as i32,
                             width as i32,
+                            super::K as i32,
+                            super::V as i32,
+                            super::L as i32,
                             cb_mult,
                             dev.cuda_stream().cu_stream(),
                         )
                     };
+                    if rc == -2 {
+                        candle_core::bail!(
+                            "QTIP quantize CUDA: no beam kernel is compiled for the trellis \
+                             geometry K={}/V={}/L={}. Add the geometry to the dispatch table \
+                             in `kernels/qtip/qtip_beam.cu` — never fall back to another rung.",
+                            super::K,
+                            super::V,
+                            super::L,
+                        );
+                    }
                     if rc != 0 {
                         candle_core::bail!(
                             "QTIP quantize CUDA: beam kernel refused width {width} (rc={rc})"
@@ -1053,6 +1112,7 @@ pub(crate) fn quantize_rows_cuda(
                 let _ = trace;
             }
             QtipMode::Viterbi => {
+                ensure_non_beam_geometry("the exhaustive Viterbi kernel")?;
                 // Allocate per-batch scratch. With prefix-grouped backtrace,
                 //   bt_bytes_per_row = num_symbols * 2^(L-K) = num_symbols * 4096
                 // Cap rows_in_flight so total <= VITERBI_MAX_SCRATCH_BYTES.
@@ -1119,6 +1179,7 @@ pub(crate) fn quantize_rows_cuda(
     // BUG: produces cos=0.628 at full-size N=2048 (kernel replay issue under
     // investigation). Gated behind ARC_QTIP_REFINE_SCALES=1 until fixed.
     if std::env::var("ARC_QTIP_REFINE_SCALES").as_deref() == Ok("1") {
+        ensure_non_beam_geometry("the scale-refinement kernel")?;
         let (w_storage, w_layout) = weight_contig.storage_and_layout();
         let w_storage = match &*w_storage {
             Storage::Cuda(s) => s,
