@@ -102,7 +102,8 @@ pub use qtip::tune::{
 };
 pub use qtip::{
     bake_cache, gpu_quantize_cpu_fallback_count, grouped_launch_counts, grouped_variant,
-    hessian_row_weights, qtip_expected_distinct_experts, set_grouped_variant, viterbi_quantize_row,
+    hessian_row_weights, qtip_expected_distinct_experts, qtip_expected_pairs_per_distinct_expert,
+    qtip_grouped_gemm_tile_fill, set_grouped_variant, viterbi_quantize_row,
     BakeCacheError, BakeKey, ExpertBpwTable, Qtip2bLayer, QtipBakeConfig, QtipCodebook, QtipLayer,
     QtipMode, QtipPackedView, QtipRotation, QtipSearchDetail, QtipSearchStamp, TrellisBpw,
     TrellisSearch, QTIP2B_MCG_MULT, QTIP_GATHER_GEMV_MAX_PAIRS, QTIP_GROUPED_TILE_K,
