@@ -545,43 +545,68 @@ impl Sampler {
             probs = processor.apply(&probs, context)?;
         }
 
-        let context = Tensor::new(context, logits.device())?;
-        let mut counts = logits.zeros_like()?;
-        counts = counts.scatter_add(
-            &context,
-            &context.ones_like()?.to_dtype(counts.dtype())?,
-            D::Minus1,
-        )?;
+        // The penalty prologue — the context upload, the `counts` histogram and
+        // the `presence` mask — feeds nothing except the three `match` arms
+        // below. When no penalty is actually configured all three arms are
+        // no-ops, so every one of those tensors was computed and discarded.
+        //
+        // That was not a cheap nothing. It cost, per sequence per decoded
+        // token: one *blocking* H2D upload of the sequence's entire token
+        // history (`Tensor::new` on a CUDA device — CLAUDE.md pitfall #5 — and
+        // it grows as the sequence generates), plus roughly eight vocab-sized
+        // kernels (`zeros_like`, `ones_like`, `to_dtype`, `scatter_add`, `gt`,
+        // two more `*_like`, `where_cond`) and their allocations. At a 129K
+        // vocab that is ~3 MB of pointless device traffic and a full host
+        // round trip per sequence per token — on the *fast* path, the one
+        // taken by the common no-penalty request.
+        //
+        // Gate the whole prologue on a penalty being live. When one is, the
+        // computation and its order are untouched, so results are unchanged;
+        // when none is, the removed tensors had no consumer, so results are
+        // bit-identical.
+        let freq_active = matches!(self.frequency_penalty, Some(p) if p != 0.);
+        let pres_active = matches!(self.presence_penalty, Some(p) if p != 0.);
+        let rep_active = matches!(self.repetition_penalty, Some(p) if p != 1.);
 
-        let presence = counts
-            .gt(0.)?
-            .where_cond(&counts.ones_like()?, &counts.zeros_like()?)?;
+        if freq_active || pres_active || rep_active {
+            let context = Tensor::new(context, logits.device())?;
+            let mut counts = logits.zeros_like()?;
+            counts = counts.scatter_add(
+                &context,
+                &context.ones_like()?.to_dtype(counts.dtype())?,
+                D::Minus1,
+            )?;
 
-        match self.frequency_penalty {
-            Some(freq_penalty) if freq_penalty != 0. => {
-                probs = (probs - (freq_penalty as f64 * counts)?)?;
+            let presence = counts
+                .gt(0.)?
+                .where_cond(&counts.ones_like()?, &counts.zeros_like()?)?;
+
+            match self.frequency_penalty {
+                Some(freq_penalty) if freq_penalty != 0. => {
+                    probs = (probs - (freq_penalty as f64 * counts)?)?;
+                }
+                _ => (),
             }
-            _ => (),
-        }
 
-        match self.presence_penalty {
-            Some(pres_penalty) if pres_penalty != 0. => {
-                probs = (probs - (pres_penalty as f64 * &presence)?)?;
+            match self.presence_penalty {
+                Some(pres_penalty) if pres_penalty != 0. => {
+                    probs = (probs - (pres_penalty as f64 * &presence)?)?;
+                }
+                _ => (),
             }
-            _ => (),
-        }
 
-        match self.repetition_penalty {
-            Some(rep_penalty) if rep_penalty != 1. => {
-                let pos_mask = probs.gt(0.)?;
-                let scaled_pos = (&probs / (rep_penalty as f64))?;
-                let scaled_neg = (&probs * (rep_penalty as f64))?;
-                let modified = pos_mask.where_cond(&scaled_pos, &scaled_neg)?;
+            match self.repetition_penalty {
+                Some(rep_penalty) if rep_penalty != 1. => {
+                    let pos_mask = probs.gt(0.)?;
+                    let scaled_pos = (&probs / (rep_penalty as f64))?;
+                    let scaled_neg = (&probs * (rep_penalty as f64))?;
+                    let modified = pos_mask.where_cond(&scaled_pos, &scaled_neg)?;
 
-                let pres_mask = presence.gt(0.)?;
-                probs = pres_mask.where_cond(&modified, &probs)?;
+                    let pres_mask = presence.gt(0.)?;
+                    probs = pres_mask.where_cond(&modified, &probs)?;
+                }
+                _ => (),
             }
-            _ => (),
         }
 
         probs = candle_nn::ops::softmax_last_dim(&(probs / self.temperature.unwrap_or(1.))?)?;
@@ -2260,5 +2285,118 @@ mod topk_parity_tests {
             sampler.truncate_topk_candidates(candidates).is_none(),
             "fat nucleus must trigger the CPU fallback, not silent truncation"
         );
+    }
+
+    /// Tests for the `sample_fast` penalty-prologue gate.
+    ///
+    /// `sample_fast` used to upload the sequence's whole token history to the
+    /// device and build a `counts` histogram + `presence` mask on *every* call,
+    /// then discard all of it unless a penalty was configured. The prologue is
+    /// now gated. These two tests pin the only way that gate can be wrong: the
+    /// guard's notion of "no penalty is active" must agree exactly with the
+    /// `match` arms it is skipping.
+    ///
+    /// Both use a sharply peaked logit vector so the on-device Gumbel-max draw
+    /// is deterministic — the winning margin (20+ logits) is far outside the
+    /// range Gumbel noise can overturn.
+    mod sample_fast_penalty_gate {
+        use crate::sampler::Sampler;
+        use candle_core::{Device, Tensor};
+
+        const VOCAB: usize = 8;
+
+        /// logits[2] is the clear winner; logits[1] is the runner-up.
+        fn logits() -> Tensor {
+            let mut v = vec![0f32; VOCAB];
+            v[1] = 30.0;
+            v[2] = 60.0;
+            Tensor::from_vec(v, VOCAB, &Device::Cpu).unwrap()
+        }
+
+        /// Token 2 occurs five times, so a frequency penalty bites it hard.
+        fn context() -> Vec<u32> {
+            vec![2, 2, 2, 2, 2]
+        }
+
+        fn sampler(
+            frequency_penalty: Option<f32>,
+            presence_penalty: Option<f32>,
+            repetition_penalty: Option<f32>,
+        ) -> Sampler {
+            Sampler::new(
+                None,
+                0,
+                None,
+                frequency_penalty,
+                presence_penalty,
+                repetition_penalty,
+                None,
+                0,   // top_k off  -> no fast_sort_asc
+                1.0, // top_p off  -> no fast_cumsum
+                0.0, // min_p off
+                None,
+                vec![],
+            )
+            .unwrap()
+        }
+
+        fn sampled_token(s: &Sampler) -> u32 {
+            s.sample_fast(logits(), &context(), false, 0, 1.0, 0.0)
+                .unwrap()
+                .token
+        }
+
+        /// Penalties set to their *neutral* values (0.0 / 0.0 / 1.0) must be
+        /// indistinguishable from penalties left unset. Before the gate both
+        /// spellings built the prologue and then took no `match` arm; after the
+        /// gate both skip it. If the guard's neutral test ever drifts from the
+        /// arms' (`!= 0.` / `!= 1.`), this is what catches it.
+        #[test]
+        fn neutral_penalties_behave_exactly_like_unset_penalties() {
+            let unset = sampled_token(&sampler(None, None, None));
+            let neutral = sampled_token(&sampler(Some(0.0), Some(0.0), Some(1.0)));
+            assert_eq!(
+                unset, 2,
+                "with no penalty active the peaked logit must win outright"
+            );
+            assert_eq!(
+                neutral, unset,
+                "neutral penalty values must not change the sampled token"
+            );
+        }
+
+        /// The complement: a genuinely active penalty must still be applied.
+        /// This is the regression the gate could plausibly introduce — skipping
+        /// the prologue when it was actually needed. Token 2 carries a 30-logit
+        /// lead; five occurrences at a penalty of 10.0 subtract 50, so token 1
+        /// must take over.
+        #[test]
+        fn an_active_frequency_penalty_is_still_applied() {
+            assert_eq!(
+                sampled_token(&sampler(Some(10.0), None, None)),
+                1,
+                "an active frequency penalty must still suppress the repeated token"
+            );
+        }
+
+        /// Presence and repetition penalties independently keep the prologue
+        /// alive — the guard is an OR, and each disjunct must work on its own.
+        #[test]
+        fn presence_and_repetition_penalties_each_keep_the_prologue_alive() {
+            // Presence subtracts a flat 40 from any token already seen,
+            // dropping token 2 from 60 to 20, below token 1's 30.
+            assert_eq!(
+                sampled_token(&sampler(None, Some(40.0), None)),
+                1,
+                "an active presence penalty must still suppress the seen token"
+            );
+            // Repetition divides positive logits of seen tokens by 3.0,
+            // dropping token 2 from 60 to 20, again below token 1's 30.
+            assert_eq!(
+                sampled_token(&sampler(None, None, Some(3.0))),
+                1,
+                "an active repetition penalty must still suppress the seen token"
+            );
+        }
     }
 }
