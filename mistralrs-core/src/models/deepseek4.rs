@@ -1412,11 +1412,18 @@ impl Attention {
         let t_c = comp.dim(2)?;
         // Compressed entry j sits at absolute position j*ratio. Apply the
         // layer's (compress-θ) RoPE to the last qk_rope_head_dim dims there.
-        // NOTE: builds a small arange each call (a host/device sync); fine on
-        // the correctness-first dense path — the long-context sparse-gather
-        // kernel is the place to precompute this.
+        //
+        // This used to build the positions with `Tensor::arange` on every call.
+        // That is a host round trip on the hot path AND — decisively — the
+        // reason CUDA-graph capture of the V4 decode forward SIGSEGV'd on its
+        // first launch: `arange` uploads a transient host `Vec`, and a captured
+        // `cuMemcpyHtoDAsync` records the host POINTER, not the bytes, so the
+        // graph re-read a freed `Vec` and handed garbage indices straight to
+        // the `index_select` on the next line. `compress_positions` serves a
+        // zero-copy view of a table built once, outside capture; see its doc
+        // comment for the full mechanism.
         let dev = comp.device();
-        let positions = compressed_row_positions(t_c, ratio, dev)?;
+        let positions = crate::layers::compress_positions(t_c, ratio, dev)?;
         self.rotary_emb
             .forward_at_positions(&comp, self.cfg.qk_rope_head_dim, &positions)
     }
@@ -2995,46 +3002,25 @@ fn append_kv_mqa(
     }
 }
 
-// Cached `[t_c]` U32 absolute positions of the compressed rows, keyed by row
-// count and ratio. Compressed row `j` sits at absolute position `j * ratio`,
-// which depends on nothing but `j` — so for a given (width, ratio) this vector
-// is a constant and rebuilding it per layer per step was pure waste.
+// The compressed-row positions used to live here as a SINGLE-slot thread-local
+// keyed on `(t_c, ratio, device)`. That slot is now `layers::compress_positions`
+// (a per-`(ratio, device)` table, chunk-rounded and served as a `narrow` view),
+// because a single slot THRASHES on V4: the model interleaves CSA (ratio 4) and
+// HCA (ratio 128) layers, so consecutive layers of the same step evicted each
+// other and the `arange_step` was paid again on every layer — including inside
+// the capture region, where it is a SIGSEGV and not merely a cost.
 //
-// It is also a correctness precondition for capture, not just a saving:
-// `Tensor::arange` on a GPU device is an H2D copy from pageable host memory,
-// which cannot be recorded into a CUDA graph at all. Under fixed capacity the
-// width stops moving, so this hits from the second decode step onward and the
-// copy leaves the capture region for good.
-thread_local! {
-    static COMPRESSED_ROW_POSITIONS: std::cell::RefCell<Option<(usize, usize, Tensor)>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-fn compressed_row_positions(t_c: usize, ratio: usize, dev: &Device) -> Result<Tensor> {
-    COMPRESSED_ROW_POSITIONS.with(|c| -> Result<Tensor> {
-        let mut c = c.borrow_mut();
-        if let Some((w, r, t)) = c.as_ref() {
-            if *w == t_c && *r == ratio && t.device().same_device(dev) {
-                return Ok(t.clone());
-            }
-        }
-        // `j * ratio` is integer arithmetic. It used to be laundered through
-        // float — `arange(u32) -> cast_u32_f32 -> affine(*ratio) ->
-        // cast_f32_u32` — three kernel launches to compute a strided range
-        // that `arange_step` produces directly. The thread-local above makes
-        // that free on a hit, but a miss (first token, or a window/device
-        // change) still paid it. The values are identical: the old chain's
-        // `fmaf(j, ratio, 0.0)` is exact for every `j * ratio` a sequence can
-        // reach (both operands and the product are integers well inside f32's
-        // exact range), and `to_dtype(U32)` truncated it back. `ratio` is
-        // 1 / 4 / 128 (`CompressRatio::ratio`), never 0, so `arange_step`'s
-        // zero-step bail is unreachable. Multiplied in usize so the product
-        // cannot wrap before the u32 narrowing.
-        let t = Tensor::arange_step(0u32, (t_c * ratio) as u32, ratio as u32, dev)?;
-        *c = Some((t_c, ratio, t.clone()));
-        Ok(t)
-    })
-}
+// The arithmetic argument that licensed `arange_step` in the first place is kept
+// here, because it is what makes the two spellings interchangeable: `j * ratio`
+// is integer arithmetic that used to be laundered through float — `arange(u32)
+// -> cast_u32_f32 -> affine(*ratio) -> cast_f32_u32`, three kernel launches to
+// compute a strided range `arange_step` produces directly. The values are
+// identical: the old chain's `fmaf(j, ratio, 0.0)` is exact for every `j * ratio`
+// a sequence can reach (both operands and the product are integers well inside
+// f32's exact range), and `to_dtype(U32)` truncated it back. `ratio` is 1 / 4 /
+// 128 (`CompressRatio::ratio`), never 0, so `arange_step`'s zero-step bail is
+// unreachable. Multiplied in usize so the product cannot wrap before the u32
+// narrowing.
 
 /// The FIXED number of compressed rows the CUDA-graph decode arm reads back.
 ///

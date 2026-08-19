@@ -2388,6 +2388,81 @@ impl Module for QLinear {
     }
 }
 
+// Cached strided-position tables for the V4 compressor, one per
+// `(ratio, device)`. Keyed that way because V4 mixes compression ratios across
+// layers (CSA and HCA); a single-slot cache would thrash and reintroduce a host
+// copy on every layer. See `compress_positions` for the rationale.
+std::thread_local! {
+    static COMPRESS_POSITIONS: std::cell::RefCell<Vec<(usize, Tensor)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Round a needed length up so the table is (re)built rarely — and therefore
+/// during warmup rather than during capture.
+const COMPRESS_POS_CHUNK: usize = 1024;
+
+/// `[t_c]` U32 tensor holding `[0, ratio, 2*ratio, …, (t_c-1)*ratio]`, served
+/// as a zero-copy view into a cached device table.
+///
+/// # Why this is not a `Tensor::arange`: that is a graph-capture HAZARD
+///
+/// `Tensor::arange` (and `from_vec`/`new`/`from_slice`) builds its data as a
+/// transient host `Vec` and uploads it through `CudaDevice::clone_htod`, which
+/// issues an **async** `cuMemcpyHtoDAsync` and returns. Outside capture that is
+/// merely a host round trip. **Inside `cuStreamBeginCapture` it is a
+/// correctness bug**: the copy is not executed, it is *recorded* — the graph
+/// stores the HOST POINTER and re-reads it on the first launch and on every
+/// replay. The `Vec` is freed as soon as the expression returns, so the graph
+/// copies freed host memory into the tensor.
+///
+/// That is exactly how V4 decode capture died: `compressed_kv_from_rows` built
+/// its strided positions with `arange`, and the first `cuGraphLaunch` filled
+/// them with garbage, so the very next op —
+/// `self.cos.index_select(&positions, 0)` in
+/// `DeepSeekV2RotaryEmbedding::forward_at_positions` — tripped candle's
+/// device-side bounds assert (`ids[id_i] < src_dim_size`, `T = __nv_bfloat16`
+/// for the bf16 cos table, `I = unsigned int` for the U32 positions) and the
+/// process took SIGSEGV. candle already documents this failure mode for kernel
+/// dims/strides and works around it in `CudaDevice::htod_info` by leaking the
+/// host source while capturing; nothing protects `clone_htod`, which is what
+/// `arange` uses.
+///
+/// The table is a pure function of `(ratio, capacity)` and its values never
+/// change, so it is built **once, outside capture** (warmup steps run long
+/// before `begin_capture`) and every decode step then takes a `narrow` view of
+/// it. No host memory is touched inside the captured region, and the base
+/// device address is stable across replays.
+pub fn compress_positions(t_c: usize, ratio: usize, device: &Device) -> Result<Tensor> {
+    if ratio == 0 {
+        candle_core::bail!("compress_positions: ratio must be non-zero");
+    }
+    COMPRESS_POSITIONS.with(|c| {
+        let mut cache = c.borrow_mut();
+        let hit = cache.iter().position(|(r, t)| {
+            *r == ratio && t.device().same_device(device) && t.dim(0).unwrap_or(0) >= t_c
+        });
+        let idx = match hit {
+            Some(i) => i,
+            None => {
+                // Drop any smaller/stale table for this (ratio, device) so the
+                // cache cannot grow without bound.
+                cache.retain(|(r, t)| !(*r == ratio && t.device().same_device(device)));
+                let cap = t_c.div_ceil(COMPRESS_POS_CHUNK) * COMPRESS_POS_CHUNK;
+                // The one `arange` — deliberately here and not in the forward.
+                let table = Tensor::arange_step(
+                    0u32,
+                    (cap * ratio) as u32,
+                    ratio as u32,
+                    device,
+                )?;
+                cache.push((ratio, table));
+                cache.len() - 1
+            }
+        };
+        cache[idx].1.narrow(0, 0, t_c)
+    })
+}
+
 /// Thread-local GPU positions tensor for CUDA graph mode.
 /// When set, `RotaryEmbedding::forward()` uses GPU-side gather instead of
 /// CPU-side `narrow()`, making the forward pass graph-capture compatible.
@@ -3666,6 +3741,59 @@ impl Module for ScaledEmbedding {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let embedding = Embedding::new(self.embedding.clone(), self.embedding.dim(D::Minus1)?);
         xs.apply(&embedding)? * self.scale
+    }
+}
+
+#[cfg(test)]
+mod compress_positions_tests {
+    use super::*;
+
+    /// The cache replaced `(arange(0..t_c).to_f32() * ratio).to_u32()`. The
+    /// values must be bit-identical to that expression, or every compressed
+    /// row silently rotates at the wrong absolute position — a quality bug no
+    /// test outside this one would catch.
+    #[test]
+    fn matches_the_arange_expression_it_replaced() -> Result<()> {
+        let dev = Device::Cpu;
+        for ratio in [1usize, 2, 4, 8, 32] {
+            for t_c in [1usize, 3, 17, 64] {
+                let want = (Tensor::arange(0u32, t_c as u32, &dev)?.to_dtype(DType::F32)?
+                    * (ratio as f64))?
+                .to_dtype(DType::U32)?
+                .to_vec1::<u32>()?;
+                let got = compress_positions(t_c, ratio, &dev)?.to_vec1::<u32>()?;
+                assert_eq!(got, want, "ratio={ratio} t_c={t_c}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Growth must reuse the table, not silently rebuild it every step —
+    /// rebuilding is the host copy this cache exists to remove, and doing it
+    /// inside capture is the crash it exists to prevent.
+    #[test]
+    fn a_longer_request_within_capacity_reuses_the_same_storage() -> Result<()> {
+        let dev = Device::Cpu;
+        let ratio = 4usize;
+        let first = compress_positions(1, ratio, &dev)?;
+        let grown = compress_positions(COMPRESS_POS_CHUNK, ratio, &dev)?;
+        // Same backing table => same length after the chunk round-up.
+        assert_eq!(first.dim(0)?, 1);
+        assert_eq!(grown.dim(0)?, COMPRESS_POS_CHUNK);
+        let entries = COMPRESS_POSITIONS.with(|c| c.borrow().len());
+        assert_eq!(entries, 1, "one (ratio, device) entry, not one per call");
+        // Distinct ratios must NOT evict each other: V4 interleaves CSA and HCA
+        // layers, so a single-slot cache would rebuild on every layer.
+        let _ = compress_positions(8, 32, &dev)?;
+        let _ = compress_positions(8, ratio, &dev)?;
+        let entries = COMPRESS_POSITIONS.with(|c| c.borrow().len());
+        assert_eq!(entries, 2, "ratios must coexist");
+        Ok(())
+    }
+
+    #[test]
+    fn zero_ratio_is_refused() {
+        assert!(compress_positions(4, 0, &Device::Cpu).is_err());
     }
 }
 
