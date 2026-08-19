@@ -243,20 +243,28 @@ impl Engine {
             || get_mut_arcmutex!(pipeline).get_metadata().no_prefix_cache
             || prefix_cache_n == 0;
 
-        // TurboQuant packs KV blocks as U8; `gather_kv_cache` cannot
-        // dequantize them yet, so a prefix-cache hit would fail at runtime.
-        // Run without prefix reuse until dequant-on-gather lands.
-        if !no_prefix_cache
-            && get_mut_arcmutex!(pipeline)
+        // 🔑 TurboQuant and prefix caching are mutually exclusive today, and
+        // this is where one of them is switched off on the user's behalf.
+        //
+        // Say so in full. The previous message named neither flag, so a run
+        // that lost prefix caching gave the operator nothing to act on — and
+        // this is not an exotic configuration: `--pa-cache-type` unset means
+        // TurboQuant (`mistralrs-cli/src/args/paged_attn.rs:44-53`),
+        // PagedAttention is the CUDA default, and `--prefix-cache-n` defaults
+        // to 16, so the DEFAULT command line lands here.
+        //
+        // `prefix_cache_conflict` returns `None` when `prefix_cache_n == 0`,
+        // i.e. when nothing was actually taken away.
+        if !no_prefix_cache {
+            let conflict = get_mut_arcmutex!(pipeline)
                 .get_metadata()
                 .cache_config
                 .as_ref()
-                .is_some_and(|c| !c.cache_type.supports_prefix_cache())
-        {
-            tracing::warn!(
-                "TurboQuant KV cache is active: disabling prefix caching (gathering packed TurboQuant blocks is not supported yet). Multi-turn serving works, without prefix reuse."
-            );
-            no_prefix_cache = true;
+                .and_then(|c| c.cache_type.prefix_cache_conflict(prefix_cache_n));
+            if let Some(conflict) = conflict {
+                tracing::warn!("{conflict}");
+                no_prefix_cache = true;
+            }
         }
 
         let search_pipeline = match search_embedding_model {
