@@ -322,6 +322,33 @@ impl<Backer: FcfsBacker> BucketingManager<Backer> for FixedBucketingManager {
                 }
             }
         }
+        // Engagement instrumentation, paired with the `ArcKV` line in
+        // `clone_in_cache`. That one reports the capability the model published;
+        // this one reports whether the scheduler ACTED on it. A ragged decode
+        // cohort must collapse to exactly ONE bucket — several buckets while
+        // `ragged_decode` is true means the gate resolved but the bucket key did
+        // not, which is a different defect from the flag never taking at all.
+        //
+        // Logged on transition for the same reason as the `ArcKV` line: this is
+        // once per scheduling decision. Oscillation is itself signal, so a
+        // flapping bucket count is deliberately allowed to emit.
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+            static DECISIONS: AtomicU64 = AtomicU64::new(0);
+            let n = DECISIONS.fetch_add(1, Ordering::Relaxed);
+            let buckets = seq_buckets.len() as u64;
+            let now = (buckets << 1) | u64::from(ragged_decode);
+            if LAST.swap(now, Ordering::Relaxed) != now {
+                tracing::info!(
+                    ragged_decode,
+                    buckets,
+                    seqs = seq_buckets.values().map(Vec::len).sum::<usize>(),
+                    decisions = n,
+                    "ArcSched: decode bucketing"
+                );
+            }
+        }
         let running = if seq_buckets.len() <= 1 {
             // Full steam ahead or have everything
             seq_buckets
