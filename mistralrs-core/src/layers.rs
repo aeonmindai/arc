@@ -3228,6 +3228,21 @@ impl Mlp {
         let Some(limit) = self.swiglu_limit else {
             return crate::ops::mul_and_act(gate, up, self.act);
         };
+        // Fused single-launch path — see `MoEExperts::swiglu` for the full
+        // note. One deliberate numeric change on THIS path: the old shared
+        // expert chain ran its silu through `ops::mul_and_act` ->
+        // mistralrs-quant `fused_glu_f32`, which is compiled with
+        // `--use_fast_math`, so its `expf` was the hardware approximation
+        // `ex2.approx.ftz.f32`. The fused kernel uses the accurate libdevice
+        // `expf`, making the SHARED expert bit-identical to the ROUTED experts
+        // and to the vLLM/SGLang reference, which it previously was not.
+        if matches!(self.act, Activation::Silu | Activation::Swish)
+            && !crate::cuda::swiglu_clamp::fused_swiglu_disabled()
+        {
+            if let Some(out) = crate::cuda::swiglu_clamp::swiglu_clamp_cuda(gate, up, limit)? {
+                return Ok(out);
+            }
+        }
         let out_dtype = gate.dtype();
         let (gate, up) = crate::moe::swiglu_clamp(gate, up, limit)?;
         crate::ops::mul_and_act(&gate, &up, self.act)?.to_dtype(out_dtype)

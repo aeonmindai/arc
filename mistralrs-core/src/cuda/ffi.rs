@@ -371,4 +371,31 @@ extern "C" {
         eps: f32,
         stream: i64,
     );
+    // Fused clamped-SwiGLU (cuda/swiglu_clamp.cu). Compiled by the dedicated
+    // IEEE (no fast-math) builder in build.rs — see the bit-identity contract
+    // in that file's header.
+    pub(crate) fn swiglu_clamp_bf16(
+        gate: *const c_void,
+        up: *const c_void,
+        out: *mut c_void,
+        n: u32,
+        limit: f32,
+        stream: i64,
+    );
+    pub(crate) fn swiglu_clamp_f16(
+        gate: *const c_void,
+        up: *const c_void,
+        out: *mut c_void,
+        n: u32,
+        limit: f32,
+        stream: i64,
+    );
+    pub(crate) fn swiglu_clamp_f32(
+        gate: *const c_void,
+        up: *const c_void,
+        out: *mut c_void,
+        n: u32,
+        limit: f32,
+        stream: i64,
+    );
 }
