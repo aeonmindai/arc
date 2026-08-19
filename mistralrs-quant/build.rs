@@ -40,6 +40,161 @@ fn cuda_version_from_build_system() -> (usize, usize) {
     }
 }
 
+/// The root of the CUDA kernel tree, relative to the package manifest dir.
+/// `build.rs` hands `cudaforge` the glob `{KERNEL_GLOB_ROOT}/*/*.cu`, and
+/// watches this directory so Cargo re-runs the script when that glob's result
+/// would change. Kept in sync by `tests/cuda_kernel_build_guard.rs`.
+#[cfg(feature = "cuda")]
+const KERNEL_GLOB_ROOT: &str = "kernels";
+
+/// Checked-in expected size of the discovered kernel set. See the file itself
+/// for why it exists.
+#[cfg(feature = "cuda")]
+const EXPECTED_KERNEL_COUNT_FILE: &str = "kernels/EXPECTED_KERNEL_COUNT";
+
+/// Enumerate exactly what `kernels/*/*.cu` matches: `.cu` files one directory
+/// level below the glob root. Deliberately mirrors the glob rather than
+/// recursing, so a kernel buried deeper (which the glob would silently skip)
+/// shows up as a count mismatch instead of vanishing.
+#[cfg(feature = "cuda")]
+fn discover_kernel_sources() -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let Ok(top) = std::fs::read_dir(KERNEL_GLOB_ROOT) else {
+        return found;
+    };
+    for entry in top.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Ok(inner) = std::fs::read_dir(entry.path()) else {
+            continue;
+        };
+        for file in inner.flatten() {
+            let path = file.path();
+            if path.extension().is_some_and(|e| e == "cu") {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// FNV-1a, folded over bytes. Not cryptographic — this only needs to change
+/// when the header bytes change, which FNV-1a does reliably.
+#[cfg(feature = "cuda")]
+fn fnv1a(hash: &mut u64, bytes: &[u8]) {
+    for b in bytes {
+        *hash ^= *b as u64;
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+}
+
+/// Every `.cuh` beneath the kernel root, at any depth. Unlike the `.cu` glob,
+/// headers legitimately nest, so this recurses.
+#[cfg(feature = "cuda")]
+fn collect_kernel_headers(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_kernel_headers(&path, out);
+        } else if path.extension().is_some_and(|e| e == "cuh") {
+            out.push(path);
+        }
+    }
+}
+
+/// Hash the path and contents of every CUDA header under the kernel root.
+///
+/// THIS IS LOAD-BEARING FOR CORRECTNESS, not an optimisation. cudaforge's
+/// incremental cache decides whether to recompile a `.cu` from that file's own
+/// content hash, its GPU arch, and the hash of the nvcc args (`CacheEntry`,
+/// cudaforge 0.1.5 `src/hash.rs`) — it NEVER hashes headers, and its
+/// `collect_headers` helper is exported but never called. So editing e.g.
+/// `kernels/qtip/qtip_codebook.cuh` left every object file "up to date": the
+/// build printed `All kernels up-to-date, skipping compilation` and silently
+/// kept the OLD codebook linked in. A benchmark run after such a build measures
+/// code that is not the code you edited, and reports it as a result.
+///
+/// Folding this hash into the nvcc args changes `args_hash`, which makes
+/// `needs_rebuild` return true for every kernel whenever any header changes.
+/// Blunt (one header edit rebuilds all kernels) and deliberately so: a stale
+/// kernel is a wrong measurement, and headers change far less often than `.cu`s.
+#[cfg(feature = "cuda")]
+fn kernel_headers_hash() -> (usize, u64) {
+    let mut headers = Vec::new();
+    collect_kernel_headers(std::path::Path::new(KERNEL_GLOB_ROOT), &mut headers);
+    headers.sort();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for header in &headers {
+        fnv1a(&mut hash, header.to_string_lossy().as_bytes());
+        match std::fs::read(header) {
+            Ok(bytes) => fnv1a(&mut hash, &bytes),
+            Err(e) => panic!("cannot read CUDA header {}: {e}", header.display()),
+        }
+    }
+    (headers.len(), hash)
+}
+
+/// Read the expected count: first line that is neither blank nor a `#` comment.
+#[cfg(feature = "cuda")]
+fn read_expected_kernel_count() -> usize {
+    let raw = std::fs::read_to_string(EXPECTED_KERNEL_COUNT_FILE).unwrap_or_else(|e| {
+        panic!("cannot read `mistralrs-quant/{EXPECTED_KERNEL_COUNT_FILE}`: {e}")
+    });
+    raw.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .and_then(|l| l.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "`mistralrs-quant/{EXPECTED_KERNEL_COUNT_FILE}` has no bare integer line; \
+                 it must contain the expected `{KERNEL_GLOB_ROOT}/*/*.cu` count"
+            )
+        })
+}
+
+/// Hard-fail the build when the discovered kernel set is not the expected size.
+///
+/// Cargo cannot tell you a kernel is missing: a glob that matches fewer files
+/// just... matches fewer files. Without this gate the only signal that a
+/// kernel was dropped is the `Compiling N of M kernels` line in the log, which
+/// nobody reads on a green build. Asserting the count turns a silent no-op
+/// into an error at the moment the mistake is made.
+#[cfg(feature = "cuda")]
+fn assert_kernel_set_intact() {
+    let discovered = discover_kernel_sources();
+    let expected = read_expected_kernel_count();
+    if discovered.len() != expected {
+        let listing = discovered
+            .iter()
+            .map(|p| format!("  {}", p.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        panic!(
+            "\n\
+             mistralrs-quant: CUDA kernel set changed.\n\
+             `{KERNEL_GLOB_ROOT}/*/*.cu` matched {} sources, but \
+             `{EXPECTED_KERNEL_COUNT_FILE}` expects {expected}.\n\n\
+             Discovered:\n{listing}\n\n\
+             If this change is intended, set the count in \
+             `mistralrs-quant/{EXPECTED_KERNEL_COUNT_FILE}` to {}.\n\
+             If it is NOT intended, a kernel is being silently dropped from the \
+             build -- check that it sits exactly one directory below \
+             `{KERNEL_GLOB_ROOT}/` (the glob does not recurse further).\n",
+            discovered.len(),
+            discovered.len(),
+        );
+    }
+    // Positive engagement signal: prove the gate ran, on green builds too.
+    println!(
+        "cargo:warning=mistralrs-quant: kernel-set guard OK -- {expected} sources under `{KERNEL_GLOB_ROOT}/*/*.cu`"
+    );
+}
+
 fn main() -> Result<(), String> {
     // Declare expected cfg values for check-cfg lint
     println!("cargo::rustc-check-cfg=cfg(has_marlin_kernels)");
@@ -63,6 +218,37 @@ fn main() -> Result<(), String> {
         const CUDA_NVCC_FLAGS: Option<&'static str> = option_env!("CUDA_NVCC_FLAGS");
 
         println!("cargo:rerun-if-changed=build.rs");
+
+        // ── Watch the kernel glob ROOT, not just its current contents. ──────
+        // The kernels below are discovered by `source_glob("kernels/*/*.cu")`,
+        // which is evaluated only when this script RUNS. Cargo re-runs a build
+        // script solely for paths it named via `rerun-if-changed`, and
+        // cudaforge names one path per *already-resolved* source — so a kernel
+        // that does not exist yet can never be named.
+        //
+        // Consequence before this line existed: adding `kernels/<d>/<new>.cu`
+        // did not re-run this script, the glob was never re-evaluated, the
+        // kernel was never compiled, and the build was STILL GREEN — `extern
+        // "C"` declarations fail only at link time and an rlib build does not
+        // link. Naming the directory makes Cargo re-run on any add / edit /
+        // delete anywhere beneath it (verified: a file-list trigger does not).
+        //
+        // STILL BROKEN, DELIBERATELY NOT FIXED HERE — edited `.cuh` headers.
+        // This line makes Cargo re-run the script for them, but cudaforge's
+        // incremental cache keys only on the `.cu`'s own content hash, gpu arch
+        // and args hash (`CacheEntry`, cudaforge 0.1.5 `src/hash.rs`); it never
+        // hashes headers — `collect_headers` is exported but never called. So
+        // touching e.g. `kernels/qtip/qtip_codebook.cuh` still yields "All
+        // kernels up-to-date, skipping compilation" and the OLD codebook stays
+        // linked in. Until that is fixed, `touch` the dependent `.cu` (or clear
+        // OUT_DIR) after editing a header, and check the `Compiling N of M`
+        // line actually moved. Tracked separately; the fix is to fold a hash of
+        // `kernels/**/*.cuh` into the nvcc args so `args_hash` changes.
+        //
+        // Guarded by `tests/cuda_kernel_build_guard.rs` — do not remove.
+        println!("cargo::rerun-if-changed={KERNEL_GLOB_ROOT}");
+        assert_kernel_set_intact();
+
         // SageAttention kernel sources — recompile if any change.
         println!("cargo:rerun-if-changed=src/sage_cuda/kernels/sm89_qk_int8_sv_f8_attn.cu");
         println!("cargo:rerun-if-changed=src/sage_cuda/kernels/sage_quant.cu");
@@ -143,6 +329,27 @@ fn main() -> Result<(), String> {
         excluded_files.push("sm89_*.cu");
         excluded_files.push("sage_*.cu");
         builder = builder.exclude(&excluded_files);
+
+        // ── Make an edited `.cuh` actually rebuild the kernels that use it. ──
+        // cudaforge never hashes headers, so without this an edited header
+        // leaves every object "up to date" and the OLD code linked in — a
+        // silently wrong binary, and a benchmark run on it is a wrong number
+        // reported as a result. Folding the header hash into the nvcc args
+        // changes `args_hash`, which is one of the three things cudaforge's
+        // `needs_rebuild` compares. Guarded by
+        // `tests/cuda_kernel_build_guard.rs` — do not remove.
+        let (header_count, header_hash) = kernel_headers_hash();
+        if header_count == 0 {
+            panic!(
+                "no `.cuh` headers found under `{KERNEL_GLOB_ROOT}/` — the header-staleness \
+                 guard would be vacuous. If the headers really are gone, remove the guard \
+                 deliberately rather than letting it pass over an empty set."
+            );
+        }
+        builder = builder.arg(&format!("-DARC_KERNEL_HEADERS_HASH=0x{header_hash:016x}"));
+        println!(
+            "cargo:warning=mistralrs-quant: header guard OK -- {header_count} `.cuh` under `{KERNEL_GLOB_ROOT}/`, hash 0x{header_hash:016x}"
+        );
 
         // https://github.com/EricLBuehler/mistral.rs/issues/286
         if let Some(cuda_nvcc_flags_env) = CUDA_NVCC_FLAGS {
