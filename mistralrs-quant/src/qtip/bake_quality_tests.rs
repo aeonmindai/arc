@@ -90,15 +90,15 @@ const GEO_CANDIDATE: Geo = Geo { l: 12, k: 8, v: 4 };
 /// Greedy trellis walk, geometry-parameterised. At [`GEO_SHIPPED`] this is
 /// byte-identical to [`greedy_quantize_row`] (pinned by
 /// `geo_pipeline_is_byte_identical_at_shipped_geometry`).
-fn greedy_quantize_row_geo(target: &[f32], lut: &[f32], geo: Geo) -> Vec<u8> {
+fn greedy_quantize_row_geo(target: &[f32], lut: &[f32], geo: Geo) -> Vec<u16> {
     let v = geo.v as usize;
     let mask = (1u32 << geo.l) - 1;
     let num_symbols = target.len() / v;
     let mut state: u32 = 0;
-    let mut syms = vec![0u8; num_symbols];
+    let mut syms = vec![0u16; num_symbols];
     for (t, sym_slot) in syms.iter_mut().enumerate() {
         let target_t = &target[t * v..(t + 1) * v];
-        let mut best_sym: u8 = 0;
+        let mut best_sym: u16 = 0;
         let mut best_err = f32::INFINITY;
         for sym in 0..geo.alphabet() as u32 {
             let next_state = ((state << geo.k) | sym) & mask;
@@ -110,7 +110,7 @@ fn greedy_quantize_row_geo(target: &[f32], lut: &[f32], geo: Geo) -> Vec<u8> {
             }
             if err < best_err {
                 best_err = err;
-                best_sym = sym as u8;
+                best_sym = sym as u16;
             }
         }
         state = ((state << geo.k) | best_sym as u32) & mask;
@@ -123,14 +123,14 @@ fn greedy_quantize_row_geo(target: &[f32], lut: &[f32], geo: Geo) -> Vec<u8> {
 /// dynamic program as `viterbi::exhaustive_quantize_row` (same group-min
 /// factorisation, same `0..alphabet` scan order, same strict-`<` tie-break) with
 /// `L`/`K`/`V` lifted from compile-time consts to `geo`.
-fn viterbi_quantize_row_geo(target_row: &[f32], lut: &[f32], geo: Geo) -> Vec<u8> {
+fn viterbi_quantize_row_geo(target_row: &[f32], lut: &[f32], geo: Geo) -> Vec<u16> {
     let v = geo.v as usize;
     let lut_size = geo.lut_size();
     let alphabet = geo.alphabet();
     let num_symbols = target_row.len() / v;
     assert!(num_symbols > 0, "need at least one symbol position");
     assert!(geo.l >= geo.k, "trellis needs L >= K");
-    assert!(geo.k <= 8, "symbols are packed as u8");
+    assert!(geo.k <= 16, "symbols are carried as u16");
     let shift = geo.l - geo.k;
 
     let dec_err = |s: usize, t: &[f32]| -> f32 {
@@ -146,7 +146,7 @@ fn viterbi_quantize_row_geo(target_row: &[f32], lut: &[f32], geo: Geo) -> Vec<u8
     let inf = f32::INFINITY;
     let mut prev_cost = vec![inf; lut_size];
     let mut curr_cost = vec![inf; lut_size];
-    let mut backtrace: Vec<Vec<u8>> = Vec::with_capacity(num_symbols);
+    let mut backtrace: Vec<Vec<u16>> = Vec::with_capacity(num_symbols);
 
     // t = 0: the decoder starts from state 0, so only s in [0, alphabet) is
     // reachable after shifting in sym_0.
@@ -161,7 +161,7 @@ fn viterbi_quantize_row_geo(target_row: &[f32], lut: &[f32], geo: Geo) -> Vec<u8
 
     for t in 1..num_symbols {
         let target_t = &target_row[t * v..(t + 1) * v];
-        let mut bt_t = vec![0u8; lut_size];
+        let mut bt_t = vec![0u16; lut_size];
         // Phase 1: min over the alphabet shared predecessors of each group.
         for g in 0..num_groups {
             let mut best_cost = inf;
@@ -180,7 +180,7 @@ fn viterbi_quantize_row_geo(target_row: &[f32], lut: &[f32], geo: Geo) -> Vec<u8
         for s in 0..lut_size {
             let g = s >> geo.k;
             curr_cost[s] = dec_err(s, target_t) + group_cost[g];
-            bt_t[s] = group_j[g] as u8;
+            bt_t[s] = group_j[g] as u16;
         }
         backtrace.push(bt_t);
         std::mem::swap(&mut prev_cost, &mut curr_cost);
@@ -196,42 +196,68 @@ fn viterbi_quantize_row_geo(target_row: &[f32], lut: &[f32], geo: Geo) -> Vec<u8
     }
 
     let sym_mask = (1usize << geo.k) - 1;
-    let mut symbols = vec![0u8; num_symbols];
+    let mut symbols = vec![0u16; num_symbols];
     let mut s = best_final;
-    symbols[num_symbols - 1] = (s & sym_mask) as u8;
+    symbols[num_symbols - 1] = (s & sym_mask) as u16;
     for t in (1..num_symbols).rev() {
         let j = backtrace[t - 1][s] as usize;
         let prev_s = (j << shift) | (s >> geo.k);
-        symbols[t - 1] = (prev_s & sym_mask) as u8;
+        symbols[t - 1] = (prev_s & sym_mask) as u16;
         s = prev_s;
     }
     symbols
 }
 
-/// Production packing: K=4 → two symbols per byte (low nibble first), K=8 →
-/// one symbol per byte. Both are the byte layout the matching decoder reads.
-fn pack_symbols_geo(symbols: &[u8], geo: Geo) -> Vec<u8> {
-    match geo.k {
-        4 => pack_symbols(symbols),
-        8 => symbols.to_vec(),
-        other => panic!("pack_symbols_geo: no byte layout defined for K={other}"),
+/// Packing: an LSB-first bitstream at `K` bits per symbol.
+///
+/// This is a strict generalisation of the two production layouts, not a new
+/// one: at K=4 symbol `t` occupies bits `4t..4t+4`, i.e. the low nibble of byte
+/// `t/2` for even `t` and the high nibble for odd `t` — exactly
+/// [`pack_symbols`]; at K=8 it is one symbol per byte. Both equalities are
+/// pinned byte-for-byte by `geo_pipeline_is_byte_identical_at_shipped_geometry`
+/// and `generic_bit_packing_reproduces_the_production_layouts`.
+///
+/// The stream length is `ceil(n_syms * K / 8)` bytes, so the packed size *is*
+/// the geometry's bit budget and a geometry that failed to reach the packer
+/// would show the wrong bits-per-weight (asserted in
+/// `probe_bits_for_decode_ladder`).
+fn pack_symbols_geo(symbols: &[u16], geo: Geo) -> Vec<u8> {
+    let k = geo.k as usize;
+    let total_bits = symbols.len() * k;
+    let mut packed = vec![0u8; total_bits.div_ceil(8)];
+    for (t, &s) in symbols.iter().enumerate() {
+        let mut val = (s as u32) & ((1u32 << k) - 1);
+        let mut bit = t * k;
+        let mut left = k;
+        while left > 0 {
+            let byte = bit / 8;
+            let off = bit % 8;
+            let take = left.min(8 - off);
+            packed[byte] |= ((val & ((1u32 << take) - 1)) as u8) << off;
+            val >>= take;
+            bit += take;
+            left -= take;
+        }
     }
+    packed
 }
 
 #[inline]
 fn unpack_symbol(packed: &[u8], t: usize, geo: Geo) -> u32 {
-    match geo.k {
-        4 => {
-            let byte = packed[t / 2];
-            (if t.is_multiple_of(2) {
-                byte & 0x0F
-            } else {
-                byte >> 4
-            }) as u32
-        }
-        8 => packed[t] as u32,
-        other => panic!("unpack_symbol: no byte layout defined for K={other}"),
+    let k = geo.k as usize;
+    let mut out = 0u32;
+    let mut bit = t * k;
+    let mut done = 0usize;
+    while done < k {
+        let byte = bit / 8;
+        let off = bit % 8;
+        let take = (k - done).min(8 - off);
+        let chunk = ((packed[byte] >> off) as u32) & ((1u32 << take) - 1);
+        out |= chunk << done;
+        bit += take;
+        done += take;
     }
+    out
 }
 
 fn decode_packed_geo(packed: &[u8], num_symbols: usize, lut: &[f32], geo: Geo) -> Vec<f32> {
@@ -1108,13 +1134,30 @@ fn geo_pipeline_is_byte_identical_at_shipped_geometry() {
             let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 3.0 };
             let target: Vec<f32> = rot.iter().map(|&v| v / scale).collect();
 
+            // The geo path carries symbols as u16 so K>8 geometries fit; at the
+            // shipped geometry every value is < 16, so the widening is lossless
+            // and the narrowed stream must equal production byte-for-byte.
+            let narrow = |s: &[u16]| -> Vec<u8> {
+                s.iter()
+                    .map(|&x| u8::try_from(x).expect("shipped-geometry symbol exceeds u8"))
+                    .collect()
+            };
+
             let v_prod = viterbi_quantize_row(&target, &lut);
             let v_geo = viterbi_quantize_row_geo(&target, geo_lut, GEO_SHIPPED);
-            assert_eq!(v_prod, v_geo, "{name} row {row}: geo Viterbi diverged");
+            assert_eq!(
+                v_prod,
+                narrow(&v_geo),
+                "{name} row {row}: geo Viterbi diverged"
+            );
 
             let g_prod = greedy_quantize_row(&target, &lut);
             let g_geo = greedy_quantize_row_geo(&target, geo_lut, GEO_SHIPPED);
-            assert_eq!(g_prod, g_geo, "{name} row {row}: geo greedy diverged");
+            assert_eq!(
+                g_prod,
+                narrow(&g_geo),
+                "{name} row {row}: geo greedy diverged"
+            );
 
             let p_prod = pack_symbols(&v_prod);
             let p_geo = pack_symbols_geo(&v_geo, GEO_SHIPPED);
@@ -1130,6 +1173,51 @@ fn geo_pipeline_is_byte_identical_at_shipped_geometry() {
                 s_prod.to_bits(),
                 s_geo.to_bits(),
                 "{name} row {row}: geo LS-refine diverged"
+            );
+        }
+    }
+}
+
+/// **Anti-silent-success guard 2b.** The generic LSB-first bit packer must
+/// reproduce the production K=4 nibble layout byte-for-byte, and must
+/// round-trip at every `K` the bits-for-decode sweep uses — including the
+/// non-byte-aligned ones (K=3, 5, 6, 10) and the 1.5-byte K=12. A packer that
+/// silently truncated to 8 bits would still round-trip at K<=8 and would
+/// corrupt exactly the geometries the sweep exists to judge.
+#[test]
+fn generic_bit_packing_reproduces_the_production_layouts() {
+    let mut rng = Rng::new(0xB17_1234);
+    // K=4 must equal `pack_symbols` on the production layout.
+    let syms4: Vec<u16> = (0..512).map(|_| (rng.next_u64() % 16) as u16).collect();
+    let narrow: Vec<u8> = syms4.iter().map(|&s| s as u8).collect();
+    assert_eq!(
+        pack_symbols(&narrow),
+        pack_symbols_geo(&syms4, Geo { l: 16, k: 4, v: 2 }),
+        "generic packer diverged from the production K=4 nibble layout"
+    );
+    // Every K in the sweep must round-trip, and the stream length must be
+    // exactly the bit budget.
+    for k in [3u32, 4, 5, 6, 8, 10, 12] {
+        let geo = Geo {
+            l: k.max(12),
+            k,
+            v: 2,
+        };
+        let n_syms = 512usize;
+        let syms: Vec<u16> = (0..n_syms)
+            .map(|_| (rng.next_u64() % (1u64 << k)) as u16)
+            .collect();
+        let packed = pack_symbols_geo(&syms, geo);
+        assert_eq!(
+            packed.len(),
+            (n_syms * k as usize).div_ceil(8),
+            "K={k}: packed length is not the bit budget"
+        );
+        for (t, &s) in syms.iter().enumerate() {
+            assert_eq!(
+                unpack_symbol(&packed, t, geo) as u16,
+                s,
+                "K={k}: symbol {t} did not round-trip"
             );
         }
     }
@@ -1330,6 +1418,347 @@ fn probe_geometry_delta_noise() {
         }
         println!("------");
     }
+}
+
+// ---------------------------------------------------------------------------
+// BITS-for-decode (wave: can a bigger bit budget buy a small, cheap table?)
+// ---------------------------------------------------------------------------
+//
+// Shortening the table at 2 bpw is closed: K8/V4/L12 costs -0.00698 w_cos with
+// a random codebook and -0.00307 with a converged trellis-Lloyd one, against a
+// +-0.0008 ship band, and the binding constraint was shown to be trellis
+// freedom rather than codebook coverage. This asks the other question: we ship
+// 2.008 bpw = 74.2 GB on a 141 GB H200, so ~3 bpw (~111 GB) still fits with
+// ~30 GB for KV. Does that extra bit buy back a geometry whose table is small
+// enough to live in shared memory?
+//
+// `bpw = K/V`, so the 3 bpw family is K3/V1, K6/V2, K12/V4 (and K9/V3, which
+// cannot tile a power-of-two row). A bf16 table is `2^L * V * 2` bytes and the
+// bar is 32,768 B — the size at which the whole codebook is a shared-memory
+// resident and a symbol lookup is one `LDS`, not a dependent scattered global
+// load (`qtip_gather_gemv.cu`: at L=16 the 512 KB LUT does not fit 48 KB
+// shared, which is today's disease).
+//
+// That bar and `L >= K` together cap each family:
+//   V=1 -> L <= 14, so K3/V1/L14 is the largest 3 bpw table (depth 4.67)
+//   V=2 -> L <= 13, so K6/V2/L13                          (depth 2.17)
+//   V=4 -> L <= 12, so K12/V4/L12                         (depth 1.00)
+// and depth 1.00 means `L == K`: `state = ((state << K) | sym) & ((1<<L)-1)`
+// shifts every previous bit out, so the state IS the symbol and the code is
+// MEMORYLESS — a plain 4096-entry 4-D VQ with no trellis at all. That is
+// asserted, not assumed, in `l_equals_k_is_a_memoryless_code`.
+
+/// Model bytes at a given geometry, from the shipped anchor: 2.008 bpw is
+/// 74.2 GB, and the 0.008 is per-block scale metadata that does not move with
+/// the trellis geometry.
+fn model_gb(geo: Geo) -> f64 {
+    let bpw = geo.k as f64 / geo.v as f64 + 0.008;
+    74.2 * bpw / 2.008
+}
+
+/// bf16 stored codebook size in bytes: `2^L * V * 2`.
+fn table_bytes(geo: Geo) -> usize {
+    geo.lut_size() * geo.v as usize * 2
+}
+
+/// **Anti-silent-success guard 4.** `L == K` is not a shallow trellis, it is
+/// *no* trellis: the state after each step must equal the symbol just emitted,
+/// independent of history. If this ever failed, the K12/V4/L12 row would be
+/// reporting a trellis that does not exist.
+#[test]
+fn l_equals_k_is_a_memoryless_code() {
+    for (l, k) in [(12u32, 12u32), (8, 8)] {
+        let mask = (1u32 << l) - 1;
+        for prev in [0u32, 1, 7, 4095, mask] {
+            for sym in [0u32, 1, 9, (1 << k) - 1] {
+                assert_eq!(
+                    ((prev << k) | sym) & mask,
+                    sym,
+                    "L={l}/K={k} is not memoryless: state depends on history"
+                );
+            }
+        }
+    }
+    // And the converse: at the shipped geometry history genuinely survives.
+    let mask = (1u32 << 16) - 1;
+    assert_ne!(((1u32 << 4) | 3) & mask, 3, "K4/L16 lost its history");
+}
+
+/// **The bits-for-decode evidence table.** Same control, same metric, same
+/// config as the two prior sweeps: Gaussian fixture, Gaussian (random) codebook
+/// via `gaussian_lut_geo`, exhaustive Viterbi, Hadamard rot=128, max/3 scale,
+/// n=48, k=2048, 5 weight draws, delta reported against K4/V2/L16.
+///
+/// Two of the rows are ANCHORS, not candidates: K8/V4/L12 and K4/V2/L13 were
+/// measured at -0.00698 and -0.00206 before the symbol path was widened to u16
+/// and the packer was generalised to arbitrary K. They must reproduce, or the
+/// widening moved the numbers and every other row is suspect.
+///
+/// Run: `cargo test -p mistralrs-quant --release probe_bits_for_decode_ladder
+/// -- --ignored --nocapture`
+#[test]
+#[ignore = "evidence-gathering probe (slow); run with --ignored --nocapture --release"]
+fn probe_bits_for_decode_ladder() {
+    let n = 48;
+    let k = 2048;
+    let sigma = 0.02;
+    let seeds = [1u64, 101, 202, 303, 404];
+    let base = Cfg {
+        viterbi: true,
+        rotation_block: 128,
+        policy: ScalePolicy::MaxOver3,
+        geo: GEO_SHIPPED,
+    };
+
+    // (geometry, role)
+    let rows = [
+        (
+            Geo { l: 12, k: 8, v: 4 },
+            "ANCHOR 2.0bpw (closed, -0.00698)",
+        ),
+        (
+            Geo { l: 13, k: 4, v: 2 },
+            "ANCHOR 2.0bpw (closed, -0.00206)",
+        ),
+        // 2.5 bpw — half the extra bit.
+        (Geo { l: 12, k: 10, v: 4 }, "2.5bpw V4"),
+        (Geo { l: 13, k: 5, v: 2 }, "2.5bpw V2"),
+        // 3 bpw — the three families, each at its largest table that clears
+        // the 32,768 B bar.
+        (Geo { l: 12, k: 12, v: 4 }, "3.0bpw V4 (MEMORYLESS, L==K)"),
+        (Geo { l: 13, k: 6, v: 2 }, "3.0bpw V2"),
+        (Geo { l: 12, k: 6, v: 2 }, "3.0bpw V2 (half table)"),
+        (Geo { l: 14, k: 3, v: 1 }, "3.0bpw V1"),
+        // Over the bar — diagnostics for the shape of the curve, NOT ship
+        // candidates: does buying trellis depth back with table size recover
+        // the loss?
+        (Geo { l: 13, k: 12, v: 4 }, "3.0bpw V4 OVER-BAR 64KB"),
+        (Geo { l: 14, k: 12, v: 4 }, "3.0bpw V4 OVER-BAR 128KB"),
+        (Geo { l: 14, k: 6, v: 2 }, "3.0bpw V2 OVER-BAR 64KB"),
+    ];
+
+    // ---- Guard: every geometry must reach the packer with its own bit rate.
+    // A K/V threaded into the search but not into the byte layout would give a
+    // quality number for a bit budget we are not actually paying.
+    {
+        // The target must be prepared exactly as `quantize_matrix` prepares it
+        // (rotate, then divide by max/3). Handing the search raw sigma=0.02
+        // weights against a unit-sigma codebook is a 50x scale mismatch under
+        // which the min-norm state wins at every step — which is precisely how
+        // this guard first fired.
+        let raw = gen_gaussian(1, k, sigma, 7);
+        let signs = generate_signs(QTIP_ROTATION_SEED, k);
+        let mut rot = raw.clone();
+        apply_block_rotation(&mut rot, &signs, 128);
+        let max_abs = rot.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        let inv = 3.0 / max_abs;
+        let w: Vec<f32> = rot.iter().map(|&v| v * inv).collect();
+        for (geo, _) in rows {
+            let lut = gaussian_lut_geo(geo.l, geo.v);
+            assert_eq!(
+                lut.len(),
+                geo.lut_size() * geo.v as usize,
+                "{}: codebook is not 2^L x V",
+                geo.label()
+            );
+            let syms = viterbi_quantize_row_geo(&w, &lut, geo);
+            assert_eq!(
+                syms.len(),
+                k / geo.v as usize,
+                "{}: wrong symbol count",
+                geo.label()
+            );
+            let distinct = syms.iter().collect::<std::collections::HashSet<_>>().len();
+            assert!(
+                distinct >= 4,
+                "{}: search emitted a near-constant symbol stream ({distinct} distinct)",
+                geo.label()
+            );
+            let packed = pack_symbols_geo(&syms, geo);
+            let bits_per_weight = packed.len() as f64 * 8.0 / k as f64;
+            let want = geo.k as f64 / geo.v as f64;
+            assert!(
+                (bits_per_weight - want).abs() < 1e-9,
+                "{}: packed stream is {bits_per_weight} bits/weight, geometry claims {want}",
+                geo.label()
+            );
+            // The decode the metric is computed from must replay the same
+            // symbols the search chose.
+            for (t, &s) in syms.iter().enumerate() {
+                assert_eq!(
+                    unpack_symbol(&packed, t, geo),
+                    s as u32,
+                    "{}: t={t}",
+                    geo.label()
+                );
+            }
+        }
+    }
+
+    // Control, once per seed.
+    let ctrl: Vec<(f64, f64, Vec<f32>)> = seeds
+        .iter()
+        .map(|&s| {
+            let w = gen_gaussian(n, k, sigma, s);
+            let w_hat = quantize_matrix(&w, n, k, base);
+            let m = evaluate(&w, &w_hat, n, k);
+            (m.weight_cos, m.matmul_cos, w_hat)
+        })
+        .collect();
+
+    println!(
+        "\n=== bits-for-decode ladder (gaussian, n={n}, k={k}, sigma={sigma}, viterbi+rot128+max/3, \
+         random Gaussian codebook, {} draws) ===",
+        seeds.len()
+    );
+    println!(
+        "control K4/V2/L16: w_cos {:.5}, table {} B, {:.1} GB",
+        ctrl.iter().map(|c| c.0).sum::<f64>() / seeds.len() as f64,
+        table_bytes(GEO_SHIPPED),
+        model_gb(GEO_SHIPPED)
+    );
+    println!(
+        "{:<24} | {:<32} | {:>4} | mean d(w_cos)  [min,max]        | mean d(mm_cos) | {:>8} | 32KB | {:>6}",
+        "geometry", "role", "bpw", "table B", "GB"
+    );
+    for (geo, role) in rows {
+        let mut dw = Vec::new();
+        let mut dm = Vec::new();
+        for (i, &s) in seeds.iter().enumerate() {
+            let w = gen_gaussian(n, k, sigma, s);
+            let w_hat = quantize_matrix(&w, n, k, Cfg { geo, ..base });
+            // Guard: this geometry's reconstruction must differ from the
+            // control's, or the row is a silent-success artifact.
+            let differing = ctrl[i]
+                .2
+                .iter()
+                .zip(w_hat.iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            assert!(
+                differing * 10 > w_hat.len(),
+                "{}: only {differing}/{} weights differ from the control",
+                geo.label(),
+                w_hat.len()
+            );
+            let m = evaluate(&w, &w_hat, n, k);
+            dw.push(m.weight_cos - ctrl[i].0);
+            dm.push(m.matmul_cos - ctrl[i].1);
+        }
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let lo = |v: &[f64]| v.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = |v: &[f64]| v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let tb = table_bytes(geo);
+        println!(
+            "{:<24} | {:<32} | {:>4.2} | {:+.5} [{:+.5},{:+.5}] | {:+.5}        | {:>8} | {:<4} | {:>6.1}",
+            geo.label(),
+            role,
+            geo.k as f64 / geo.v as f64,
+            mean(&dw),
+            lo(&dw),
+            hi(&dw),
+            mean(&dm),
+            tb,
+            if tb <= 32_768 { "YES" } else { "no" },
+            model_gb(geo)
+        );
+    }
+    println!("ship band is +-0.0008 d(w_cos); 141 GB card, KV needs the remainder");
+}
+
+/// **The price of quality in bits, at a FIXED decode shape.** Holding
+/// `L = 12, V = 4` fixed pins the codebook itself: `gaussian_lut_geo(12, 4)`
+/// does not read `K`, so every row below uses the *same 4096-entry, 4-D,
+/// 32,768 B table* and the *same* one-`LDS.64`-per-4-weights decode. The only
+/// thing that varies is how many bits index it, i.e. `bpw = K/4`.
+///
+/// This is the frontier the bits-vs-table-size question actually turns on: it
+/// prices w_cos in bits with the decode cost held constant, and it locates the
+/// cheapest bit budget that clears the +-0.0008 ship band.
+///
+/// H200 accounting uses the in-tree reserve: usable KV = 141 − model − 8 GB
+/// (`FACTS.md`: "141 − 74.2 − ~8 reserve ⇒ ~59 GB usable").
+///
+/// Run: `cargo test -p mistralrs-quant --release probe_bit_rate_frontier
+/// -- --ignored --nocapture`
+#[test]
+#[ignore = "evidence-gathering probe (slow); run with --ignored --nocapture --release"]
+fn probe_bit_rate_frontier() {
+    let n = 48;
+    let k = 2048;
+    let sigma = 0.02;
+    let seeds = [1u64, 101, 202, 303, 404];
+    let base = Cfg {
+        viterbi: true,
+        rotation_block: 128,
+        policy: ScalePolicy::MaxOver3,
+        geo: GEO_SHIPPED,
+    };
+
+    // Guard: the codebook must be K-invariant, or "fixed decode shape" is a lie.
+    let ref_lut = gaussian_lut_geo(12, 4);
+    for kk in 8..=12u32 {
+        let lut = gaussian_lut_geo(Geo { l: 12, k: kk, v: 4 }.l, 4);
+        assert_eq!(
+            lut, ref_lut,
+            "codebook moved with K={kk}; frontier is confounded"
+        );
+    }
+
+    let ctrl: Vec<(f64, Vec<f32>)> = seeds
+        .iter()
+        .map(|&s| {
+            let w = gen_gaussian(n, k, sigma, s);
+            let w_hat = quantize_matrix(&w, n, k, base);
+            (evaluate(&w, &w_hat, n, k).weight_cos, w_hat)
+        })
+        .collect();
+
+    println!(
+        "\n=== bit-rate frontier at FIXED L=12/V=4 (same 32,768 B table, same decode shape) ===\n\
+         control K4/V2/L16 @ 2.008 bpw: 74.2 GB model, {:.1} GB KV headroom",
+        141.0 - model_gb(GEO_SHIPPED) - 8.0
+    );
+    println!(
+        "{:<12} | {:>5} | mean d(w_cos)  [min,max]        | {:>7} | {:>8} | ship band",
+        "geometry", "bpw", "model GB", "KV GB"
+    );
+    for kk in 8..=12u32 {
+        let geo = Geo { l: 12, k: kk, v: 4 };
+        let mut dw = Vec::new();
+        for (i, &s) in seeds.iter().enumerate() {
+            let w = gen_gaussian(n, k, sigma, s);
+            let w_hat = quantize_matrix(&w, n, k, Cfg { geo, ..base });
+            let differing = ctrl[i]
+                .1
+                .iter()
+                .zip(w_hat.iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            assert!(
+                differing * 10 > w_hat.len(),
+                "{}: reconstruction matches the control",
+                geo.label()
+            );
+            dw.push(evaluate(&w, &w_hat, n, k).weight_cos - ctrl[i].0);
+        }
+        let mean = dw.iter().sum::<f64>() / dw.len() as f64;
+        let lo = dw.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = dw.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let gb = model_gb(geo);
+        println!(
+            "K{}/V4/L12   | {:>5.2} | {:+.5} [{:+.5},{:+.5}] | {:>7.1} | {:>8.1} | {}",
+            kk,
+            kk as f64 / 4.0,
+            mean,
+            lo,
+            hi,
+            gb,
+            141.0 - gb - 8.0,
+            if mean >= -0.0008 { "CLEARS" } else { "fails" }
+        );
+    }
+    assert_eq!(table_bytes(Geo { l: 12, k: 12, v: 4 }), 32_768);
 }
 
 // ---------------------------------------------------------------------------
