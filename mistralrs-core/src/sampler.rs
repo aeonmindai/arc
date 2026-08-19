@@ -256,8 +256,6 @@ pub struct Sampler {
     min_p: f64,
     top_nsigma: Option<f32>,
     logits_processors: Vec<Arc<dyn CustomLogitsProcessor>>,
-    /// Cached Gumbel noise tensor to avoid reallocating it.
-    gumbel_cache: Arc<Mutex<Option<Tensor>>>,
 }
 
 #[cfg_attr(feature = "pyo3_macros", pyclass)]
@@ -387,7 +385,6 @@ impl Sampler {
             min_p,
             top_nsigma,
             logits_processors,
-            gumbel_cache: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -598,20 +595,19 @@ impl Sampler {
 
         // Sample using the Gumbel-max trick fully on-device.
         let log_probs = probs.log()?;
-        // Generate cached Gumbel noise (-log(-log(u))) once.
+        // Draw Gumbel noise (-log(-log(u))) FRESH on every call. Caching it
+        // across calls is not an allocation optimisation, it is a correctness
+        // bug: a `Sampler` lives for one whole request, so reusing one noise
+        // draw makes `argmax(log_probs + gumbel)` a fixed ranking and every
+        // token of that request comes out identical.
         let gumbel = {
-            let mut guard = self.gumbel_cache.lock().unwrap();
-            if guard.is_none() {
-                let uniform = Tensor::rand(0f32, 1f32, log_probs.shape(), log_probs.device())?;
-                let noise = uniform
-                    .clamp(1e-20, 1.0)?
-                    .log()? // ln(u)
-                    .neg()? // -ln(u)
-                    .log()? // ln(-ln(u))
-                    .neg()?; // -ln(-ln(u))
-                *guard = Some(noise);
-            }
-            guard.as_ref().unwrap().clone()
+            let uniform = Tensor::rand(0f32, 1f32, log_probs.shape(), log_probs.device())?;
+            uniform
+                .clamp(1e-20, 1.0)?
+                .log()? // ln(u)
+                .neg()? // -ln(u)
+                .log()? // ln(-ln(u))
+                .neg()? // -ln(-ln(u))
         };
 
         let gumbel_logits = (&log_probs + &gumbel)?;
@@ -1732,6 +1728,67 @@ mod tests {
             sample(&mk(None, Some(2.0), None)),
             1,
             "presence_penalty must break the loop"
+        );
+    }
+
+    /// `sample_fast` (the on-device Gumbel-max path) must draw fresh noise on
+    /// every call.
+    ///
+    /// Regression: the noise tensor was drawn once and cached on the `Sampler`,
+    /// then cloned for every subsequent call. A `Sampler` is constructed once
+    /// per request (`engine/add_request.rs`), so `argmax(log_probs + gumbel)`
+    /// with a frozen `gumbel` collapsed to a fixed ranking — every token of a
+    /// request was the same token, at any temperature.
+    ///
+    /// Discriminator: a flat distribution over 64 tokens at temperature 1.0.
+    /// Correct sampling covers essentially the whole support in 512 draws;
+    /// frozen noise yields exactly one distinct token.
+    #[test]
+    fn sample_fast_draws_fresh_gumbel_noise_per_call() {
+        use super::Sampler;
+        use candle_core::{Device, Tensor};
+        use std::collections::HashSet;
+
+        const VOCAB: usize = 64;
+        const DRAWS: usize = 512;
+
+        // Uniform logits: every token has probability 1/64.
+        let logits = Tensor::from_vec(vec![0f32; VOCAB], VOCAB, &Device::Cpu).unwrap();
+        // temperature=1.0, top_k/top_p/min_p disabled so no sort runs and the
+        // draw is a pure Gumbel-max over the full support.
+        let sampler = Sampler::new(
+            Some(1.0),
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            -1,
+            1.0,
+            0.0,
+            None,
+            vec![],
+        )
+        .unwrap();
+
+        let mut seen = HashSet::new();
+        for _ in 0..DRAWS {
+            let token = sampler
+                .sample_fast(logits.clone(), &[0u32], false, -1, 1.0, 0.0)
+                .unwrap()
+                .token;
+            assert!((token as usize) < VOCAB);
+            seen.insert(token);
+        }
+
+        // Expected distinct count for 512 uniform draws over 64 tokens is
+        // ~64.0 (P(any token missed) ~ 3e-4). Frozen noise gives 1.
+        assert!(
+            seen.len() >= VOCAB * 3 / 4,
+            "sample_fast covered only {} of {VOCAB} tokens in {DRAWS} draws from a flat \
+             distribution — Gumbel noise is not being redrawn per call",
+            seen.len()
         );
     }
 }
