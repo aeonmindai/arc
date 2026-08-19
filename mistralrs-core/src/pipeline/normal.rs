@@ -2174,6 +2174,13 @@ impl Pipeline for NormalPipeline {
                 );
                 return Ok(None);
             }
+            if first_sampler.has_logits_bias() {
+                tracing::debug!(
+                    "autonomous_decode: logit_bias set; the GPU sampler draws from the \
+                     model's raw logits and would silently drop it — falling back"
+                );
+                return Ok(None);
+            }
 
             // Vocab size comes from the dedicated decode path (it has the
             // model config we extracted at load time).

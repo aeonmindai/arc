@@ -256,6 +256,18 @@ pub struct Sampler {
     min_p: f64,
     top_nsigma: Option<f32>,
     logits_processors: Vec<Arc<dyn CustomLogitsProcessor>>,
+    /// OpenAI `logit_bias`: token id -> additive bias on the raw logits.
+    logits_bias: Option<Arc<HashMap<u32, f32>>>,
+    /// `logits_bias` materialised as a dense vector on the device/dtype of the
+    /// logits it was last applied to.
+    ///
+    /// Caching is sound here in a way it is not for sampling noise: the dense
+    /// vector is a pure function of `logits_bias`, which is immutable for the
+    /// life of the `Sampler`, and it is rebuilt whenever the incoming logits'
+    /// device, dtype or vocab differs from the cached tensor's. Without it,
+    /// every decoded token would pay a host allocation plus an H2D copy of the
+    /// full vocabulary.
+    logits_bias_dense: Arc<Mutex<Option<Tensor>>>,
 }
 
 #[cfg_attr(feature = "pyo3_macros", pyclass)]
@@ -355,6 +367,7 @@ impl Sampler {
         min_p: f64,
         top_nsigma: Option<f32>,
         logits_processors: Vec<Arc<dyn CustomLogitsProcessor>>,
+        logits_bias: Option<HashMap<u32, f32>>,
     ) -> anyhow::Result<Self> {
         let temperature = if temperature.is_none_or(|v| v < 1e-7) {
             None
@@ -385,6 +398,8 @@ impl Sampler {
             min_p,
             top_nsigma,
             logits_processors,
+            logits_bias: logits_bias.filter(|b| !b.is_empty()).map(Arc::new),
+            logits_bias_dense: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -461,8 +476,85 @@ impl Sampler {
     /// they are only consulted on the `Some(temperature)` branch. Nor does
     /// top-nσ: it masks tokens *below* the maximum, so the argmax is invariant
     /// under it.
+    ///
+    /// **`logit_bias` also disqualifies**, and this is a merge hazard worth
+    /// naming: `is_raw_argmax` landed on master while `logit_bias` was in
+    /// flight, so neither author saw the interaction. [`Self::sample`] applies
+    /// the bias to the raw logits *first* (`self.apply_logits_bias(logits)?`,
+    /// the first statement of the sampling body), so with a bias set the token
+    /// `sample` returns is `argmax(logits + bias)`, which is not
+    /// `argmax(logits)`. A speculative verifier that trusted `is_raw_argmax`
+    /// here would accept draft tokens judged against unbiased logits while the
+    /// real sampler used biased ones — a silent, request-specific wrong-token
+    /// bug, not a slow path.
     pub fn is_raw_argmax(&self) -> bool {
-        self.is_greedy() && !self.has_penalties() && self.logits_processors.is_empty()
+        self.is_greedy()
+            && !self.has_penalties()
+            && !self.has_logits_bias()
+            && self.logits_processors.is_empty()
+    }
+
+    /// True if an OpenAI `logit_bias` map is set. Any sampling path that does
+    /// not route through [`Self::sample`] — notably the GPU-autonomous decode
+    /// sampler, which draws from the model's raw logits — must refuse the
+    /// request when this returns true, or the bias is silently dropped.
+    pub fn has_logits_bias(&self) -> bool {
+        self.logits_bias.is_some()
+    }
+
+    /// Apply the OpenAI `logit_bias` map: `logits[token] += bias`, on the raw
+    /// logits, before any filtering or sampling.
+    ///
+    /// Matches the reference implementations — vLLM's
+    /// `LogitBiasLogitsProcessor::apply` is `logits[slice] += bias_tensor` and
+    /// SGLang's is a single `logits.add_()` — including the absence of any
+    /// clamping of the biased value.
+    fn apply_logits_bias(&self, logits: Tensor) -> Result<Tensor> {
+        let Some(bias) = self.logits_bias.as_ref() else {
+            return Ok(logits);
+        };
+        let vocab = logits.dim(D::Minus1)?;
+
+        let mut guard = self
+            .logits_bias_dense
+            .lock()
+            .expect("could not lock logits_bias cache");
+        let dense = match guard.as_ref() {
+            // Reuse only against logits the cached tensor actually matches.
+            Some(cached)
+                if cached.device().same_device(logits.device())
+                    && cached.dtype() == logits.dtype()
+                    && cached.dims1().is_ok_and(|n| n == vocab) =>
+            {
+                cached.clone()
+            }
+            _ => {
+                let mut host = vec![0f32; vocab];
+                let mut out_of_range = 0usize;
+                for (token, b) in bias.iter() {
+                    match host.get_mut(*token as usize) {
+                        Some(slot) => *slot += *b,
+                        None => out_of_range += 1,
+                    }
+                }
+                if out_of_range > 0 {
+                    // Loud rather than silent: the caller asked to bias tokens
+                    // this model cannot emit. Runs at most once per sampler,
+                    // since the dense vector is then cached.
+                    tracing::warn!(
+                        "logit_bias: {out_of_range} token id(s) are outside the model's \
+                         vocabulary of {vocab} and were ignored"
+                    );
+                }
+                let dense =
+                    Tensor::from_vec(host, vocab, logits.device())?.to_dtype(logits.dtype())?;
+                *guard = Some(dense.clone());
+                dense
+            }
+        };
+        drop(guard);
+
+        logits.broadcast_add(&dense)
     }
 
     fn get_top_logprobs(&self, probs: &[f32]) -> Result<Vec<TopLogprob>> {
@@ -1289,6 +1381,10 @@ impl Sampler {
         sample_speculative: bool,
         multiple_sequences: bool,
     ) -> Result<Logprobs> {
+        // `logit_bias` is defined as added to the model's raw logits *prior to
+        // sampling*, so it runs before every filter — including top-nσ, whose
+        // threshold is computed from the raw logits.
+        let logits = self.apply_logits_bias(logits)?;
         // Top-nσ runs first, on the raw logits, so every downstream path
         // (GPU fast path, GPU radix top-k, CPU) sees the filtered set.
         let logits = match self.top_nsigma {
@@ -1488,6 +1584,7 @@ mod tests {
             0.05,
             None,
             vec![],
+            None,
         )
         .unwrap();
         let logits = Tensor::arange(0f32, 1024f32, &Device::Cpu).unwrap();
@@ -1529,6 +1626,7 @@ mod tests {
             0.05,
             None,
             vec![],
+            None,
         )
         .unwrap();
         let logits = Tensor::arange(0f32, 1024f32, &Device::Cpu).unwrap();
@@ -1567,6 +1665,7 @@ mod tests {
             0.0,  // min_p
             None, // top_nsigma
             vec![],
+            None,
         )
         .unwrap();
         assert!(s_greedy.is_greedy());
@@ -1590,6 +1689,7 @@ mod tests {
             0.0,
             None,
             vec![],
+            None,
         )
         .unwrap();
         assert!(!s_topp.is_greedy());
@@ -1710,6 +1810,7 @@ mod tests {
             0.0,
             top_nsigma,
             vec![],
+            None,
         )
         .unwrap()
     }
@@ -1855,6 +1956,7 @@ mod tests {
                 0.0,
                 None,
                 vec![],
+                None,
             )
             .unwrap()
         };
@@ -1931,6 +2033,7 @@ mod tests {
             0.0,
             None,
             vec![],
+            None,
         )
         .unwrap();
 
@@ -1993,6 +2096,7 @@ mod tests {
                 min_p,
                 None,
                 vec![],
+                None,
             )
             .unwrap()
         };
@@ -2071,6 +2175,7 @@ mod tests {
                 0.0,
                 None,
                 vec![],
+                None,
             )
             .unwrap();
             for _ in 0..64 {
@@ -2102,6 +2207,7 @@ mod tests {
             0.0,
             None,
             vec![],
+            None,
         )
         .unwrap();
         let mut seen = HashSet::new();
@@ -2116,6 +2222,215 @@ mod tests {
         assert!(
             seen.len() > 1,
             "fixture is degenerate: non-speculative sampling never varied"
+        );
+    }
+
+    /// Build a `logit_bias` sampler over a 4-token vocabulary.
+    #[cfg(test)]
+    fn bias_sampler(
+        temperature: Option<f64>,
+        bias: Option<std::collections::HashMap<u32, f32>>,
+    ) -> super::Sampler {
+        super::Sampler::new(
+            temperature,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            -1,
+            1.0,
+            0.0,
+            None,
+            vec![],
+            bias,
+        )
+        .unwrap()
+    }
+
+    /// `logit_bias` must actually reach sampling.
+    ///
+    /// Regression: `SamplingParams::logits_bias` was written by every API
+    /// surface and read by none — `Sampler` had no field for it, `Sampler::new`
+    /// no parameter, and `Sampler::sample` no bias term. A request setting it
+    /// got 200 OK and completely unbiased output.
+    ///
+    /// Greedy over raw logits `[0, 0, 0, 5]` selects token 3. A +100 bias on
+    /// token 1 must move that to 1; a -100 bias on token 3 must move it off 3.
+    #[test]
+    fn logit_bias_shifts_the_selected_token() {
+        use candle_core::{Device, Tensor};
+        use rand::SeedableRng;
+        use rand_isaac::Isaac64Rng;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let raw = vec![0.0f32, 0.0, 0.0, 5.0];
+        let logits = || Tensor::from_vec(raw.clone(), 4, &Device::Cpu).unwrap();
+        let rng = || Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(0)));
+        let sample = |s: &super::Sampler| {
+            s.sample(logits(), &[0u32], false, rng(), false, false)
+                .unwrap()
+                .token
+        };
+
+        // Control: no bias, greedy picks the raw argmax.
+        assert_eq!(sample(&bias_sampler(None, None)), 3);
+
+        // Positive bias promotes a token that was not the argmax.
+        assert_eq!(
+            sample(&bias_sampler(None, Some(HashMap::from([(1u32, 100.0f32)])))),
+            1,
+            "a +100 logit_bias on token 1 must make it the argmax"
+        );
+
+        // Negative bias demotes the argmax.
+        assert_ne!(
+            sample(&bias_sampler(
+                None,
+                Some(HashMap::from([(3u32, -100.0f32)]))
+            )),
+            3,
+            "a -100 logit_bias on token 3 must stop it being selected"
+        );
+
+        // The bias is applied before the temperature branch too, so a dominant
+        // bias pins a stochastic sampler onto the biased token.
+        let hot = bias_sampler(Some(1.0), Some(HashMap::from([(1u32, 100.0f32)])));
+        let shared_rng = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(99)));
+        for _ in 0..64 {
+            assert_eq!(
+                hot.sample(logits(), &[0u32], false, shared_rng.clone(), false, false)
+                    .unwrap()
+                    .token,
+                1,
+                "logit_bias must apply on the temperature path as well"
+            );
+        }
+    }
+
+    /// The dense-bias cache is keyed on the incoming logits, so the same
+    /// `Sampler` used against two vocabulary sizes must bias both correctly
+    /// rather than reuse a stale vector (or fail a broadcast).
+    #[test]
+    fn logit_bias_cache_revalidates_on_vocab_change() {
+        use candle_core::{Device, Tensor};
+        use rand::SeedableRng;
+        use rand_isaac::Isaac64Rng;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let sampler = bias_sampler(None, Some(HashMap::from([(1u32, 100.0f32)])));
+        let rng = || Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(0)));
+
+        let small = Tensor::from_vec(vec![0.0f32, 0.0, 0.0, 5.0], 4, &Device::Cpu).unwrap();
+        assert_eq!(
+            sampler
+                .sample(small, &[0u32], false, rng(), false, false)
+                .unwrap()
+                .token,
+            1
+        );
+
+        let mut big_raw = vec![0.0f32; 9];
+        big_raw[8] = 5.0;
+        let big = Tensor::from_vec(big_raw, 9, &Device::Cpu).unwrap();
+        assert_eq!(
+            sampler
+                .sample(big, &[0u32], false, rng(), false, false)
+                .unwrap()
+                .token,
+            1,
+            "the cached bias vector must be rebuilt for a different vocab size"
+        );
+    }
+
+    /// Token ids past the end of the vocabulary are dropped with a warning
+    /// rather than panicking or corrupting the distribution.
+    #[test]
+    fn logit_bias_ignores_out_of_vocab_ids() {
+        use candle_core::{Device, Tensor};
+        use rand::SeedableRng;
+        use rand_isaac::Isaac64Rng;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let sampler = bias_sampler(
+            None,
+            Some(HashMap::from([(999u32, 100.0f32), (1u32, 100.0f32)])),
+        );
+        let logits = Tensor::from_vec(vec![0.0f32, 0.0, 0.0, 5.0], 4, &Device::Cpu).unwrap();
+        let rng = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(0)));
+        assert_eq!(
+            sampler
+                .sample(logits, &[0u32], false, rng, false, false)
+                .unwrap()
+                .token,
+            1,
+            "an out-of-vocab id must be ignored, leaving the in-range bias effective"
+        );
+    }
+
+    /// `has_logits_bias` is what the GPU-autonomous decode path checks before
+    /// taking a fast path that never applies the bias.
+    #[test]
+    fn has_logits_bias_reports_the_map() {
+        use std::collections::HashMap;
+
+        assert!(!bias_sampler(None, None).has_logits_bias());
+        assert!(
+            !bias_sampler(None, Some(HashMap::new())).has_logits_bias(),
+            "an empty map is not a bias and must not disable the GPU fast path"
+        );
+        assert!(bias_sampler(None, Some(HashMap::from([(1u32, 1.0f32)]))).has_logits_bias());
+    }
+
+    /// A biased sampler is greedy but is **not** raw-argmax.
+    ///
+    /// This is the interaction the merge of this PR with master's
+    /// `is_raw_argmax` created: both landed in the same place in `sampler.rs`
+    /// and neither author saw the other. `sample` applies the bias to the raw
+    /// logits before choosing, so `argmax(raw)` and what `sample` returns can
+    /// differ — which is exactly what speculative verification compares. If
+    /// `is_raw_argmax` ever answers `true` with a bias set, a spec-decode run
+    /// silently emits tokens the user's `logit_bias` was supposed to have
+    /// changed.
+    #[test]
+    fn a_biased_sampler_is_greedy_but_not_raw_argmax() {
+        use candle_core::{Device, Tensor};
+        use rand::SeedableRng;
+        use rand_isaac::Isaac64Rng;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let biased = bias_sampler(None, Some(HashMap::from([(0u32, 100.0f32)])));
+        assert!(biased.is_greedy(), "no temperature is set, so it is greedy");
+        assert!(
+            !biased.is_raw_argmax(),
+            "a logit_bias rewrites the logits before the pick, so this sampler is \
+             NOT argmax over the raw logits and no fast path may substitute one"
+        );
+
+        // And demonstrate the divergence the flag is protecting, so the flag is
+        // not just asserted against itself: raw argmax here is token 3, but the
+        // bias moves the answer to token 0.
+        let raw = vec![0.0f32, 0.0, 0.0, 5.0];
+        let logits = Tensor::from_vec(raw.clone(), 4, &Device::Cpu).unwrap();
+        let rng = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(0)));
+        let picked = biased
+            .sample(logits, &[0u32], false, rng, false, false)
+            .unwrap()
+            .token;
+        let raw_argmax = 3u32;
+        assert_eq!(
+            picked, 0,
+            "the +100 bias on token 0 must win over the raw maximum at token 3"
+        );
+        assert_ne!(
+            picked, raw_argmax,
+            "if these ever agree this test proves nothing — pick a fixture where \
+             the bias actually changes the answer"
         );
     }
 }
@@ -2196,6 +2511,7 @@ mod topk_parity_tests {
             min_p,
             None,
             vec![],
+            None,
         )
         .unwrap()
     }

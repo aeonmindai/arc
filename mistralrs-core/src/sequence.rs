@@ -1750,6 +1750,7 @@ mod tests {
             0.0,
             None,
             vec![],
+            None,
         )
         .unwrap();
         Sequence::new_waiting(

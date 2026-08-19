@@ -817,6 +817,7 @@ mod speculative_verification_tests {
             0.0, // min_p disabled
             None,
             vec![],
+            None,
         )
         .unwrap()
     }

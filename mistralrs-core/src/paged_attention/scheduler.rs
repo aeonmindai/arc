@@ -628,6 +628,7 @@ mod bucketing_tests {
             0.0,
             None,
             vec![],
+            None,
         )
         .unwrap();
         // `std::sync::Mutex`, not tokio's. `Sequence::new_waiting` takes

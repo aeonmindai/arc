@@ -445,6 +445,7 @@ impl Engine {
             minp,
             request.sampling_params.top_nsigma,
             request.logits_processors.unwrap_or_default(),
+            request.sampling_params.logits_bias.clone(),
         );
         let sampler = handle_seq_error!(sampler, request.response);
 
