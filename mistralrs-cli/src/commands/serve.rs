@@ -24,6 +24,19 @@ pub async fn run_server(
 ) -> Result<()> {
     initialize_logging();
 
+    // `--mcp-port` / `--mcp-config` are declared on `ServerOptions` but this
+    // binary never reads them: MCP was wired in the older `mistralrs-server`
+    // binary and was not carried across to the unified CLI. Accepting them
+    // silently means a user asks for MCP, sees a clean startup, and gets no
+    // tools — a silent partial deployment. Fail loudly until they are wired.
+    if server.mcp_port.is_some() || server.mcp_config.is_some() {
+        anyhow::bail!(
+            "--mcp-port/--mcp-config are not implemented in this binary. MCP is supported \
+             by the Rust SDK (`MistralRsForServerBuilder::with_mcp_config`) but is not yet \
+             wired into `mistralrs serve`; these flags previously parsed and did nothing."
+        );
+    }
+
     // Convert our clean args to ModelSelected for the existing loader infrastructure
     let model_selected = convert_to_model_selected(&model_type)?;
 

@@ -798,6 +798,21 @@ impl MistralRsForServerBuilder {
         // The helper is a no-op when `mtp_depth == 0`.
         let pipeline = try_wrap_pipeline_with_mtp(pipeline, self.mtp_depth);
 
+        // Report the resolved subsystem state now that every auto-fallback has
+        // run — see `log_arcserve_summary` for why this reads the pipeline back
+        // instead of restating the requested configuration.
+        {
+            let meta = pipeline.lock().await.get_metadata();
+            log_arcserve_summary(
+                meta.cache_config
+                    .as_ref()
+                    .map(|c| (c.cache_type, c.num_gpu_blocks, c.block_size)),
+                meta.no_kv_cache,
+                meta.no_prefix_cache,
+                self.max_seqs,
+            );
+        }
+
         let scheduler_config = init_scheduler_config(&cache_config, &pipeline, self.max_seqs).await;
 
         let search_embedding_model =
@@ -1271,6 +1286,60 @@ fn init_mapper(
     } else {
         DeviceMapSetting::Auto(auto_device_map_params.clone())
     }
+}
+
+/// Logs the **resolved** state of every Arc subsystem a user can be surprised by,
+/// after the model is loaded and every auto-fallback has already run.
+///
+/// D18: a subsystem may only be named here if it is actually active *for this
+/// model on this device*. Requested-but-not-engaged states are reported as
+/// `off`, with the reason, rather than being silently omitted or optimistically
+/// claimed. Two concrete regressions motivated this:
+///
+///  * `arc-cli` printed "TurboQuant 3.5-bit KV cache compression (lossless,
+///    default)" as a fixed banner string before any model was loaded — false
+///    for every MLA model and every `head_dim != 128`, which is nearly all of
+///    them, and "lossless" was never measured.
+///  * `arc_cuda_graph` logged "runner initialized" immediately after
+///    "capture disabled".
+///
+/// The rule this encodes: read the resolved value back out of the loaded
+/// pipeline; never restate the requested value as if it were the outcome.
+fn log_arcserve_summary(
+    resolved_cache: Option<(PagedCacheType, usize, usize)>,
+    no_kv_cache: bool,
+    no_prefix_cache: bool,
+    max_seqs: usize,
+) {
+    // KV cache: report what `resolve_for_model` actually settled on, not what
+    // `defaults::PAGED_CACHE_TYPE` asked for.
+    let kv = match resolved_cache {
+        Some((cache_type, num_gpu_blocks, block_size)) => {
+            let name = match cache_type {
+                PagedCacheType::Auto => "unquantized",
+                PagedCacheType::F8E4M3 => "fp8-e4m3",
+                PagedCacheType::TurboQuant => "turboquant K4/V3",
+                PagedCacheType::TurboQuant3 => "turboquant K3/V3",
+                PagedCacheType::TurboQuantAggressive => "turboquant K3/V2",
+            };
+            format!("paged ({name}, {num_gpu_blocks} blocks x {block_size} tokens)")
+        }
+        None if no_kv_cache => "disabled (--no-kv-cache)".to_string(),
+        None => "eager (paged attention off)".to_string(),
+    };
+
+    // Prefix caching is switched off downstream by the engine for any cache
+    // type that cannot be gathered; say so here rather than letting the user
+    // infer it from a throughput number.
+    let prefix = if no_prefix_cache {
+        "off"
+    } else if resolved_cache.is_some_and(|(t, _, _)| !t.supports_prefix_cache()) {
+        "off (cache type cannot be gathered)"
+    } else {
+        "on"
+    };
+
+    info!("ArcServe: kv-cache={kv}, prefix-cache={prefix}, max-seqs={max_seqs}");
 }
 
 /// Logs hardware feature information and the model's sampling strategy and kind.
