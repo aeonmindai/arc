@@ -145,6 +145,9 @@ matmul.**
 > `sum2`'s 1,477 is also not the ceiling of the format work: the compiled ladder puts K8/V4/L12 at
 > **4.375 inst/wt**, and the honest read of the whole program is **~15–19× over today's 659 with
 > re-bake plus kernel work** — scope, not a promise, and priced at ~$30 of re-bake.
+> ⚠️ **That 4.375 is K=8, which is quality-closed at 2 bpw; the shippable rung is K=9 at 2.25 bpw
+> and its instruction count is UNMEASURED. Treat the 15–19× as a shape, not a number, until K9 is
+> compiled** (see below and `memory/mission/FRONTIER_BITS_FOR_DECODE.md`).
 **But the trellis tax is a LOW-CONCURRENCY tax that AMORTISES with B:** at B=256, `sum2` lands within
 **1.07×** of llm-d's 1,573-per-decode-GPU — **which takes 32 H200 + InfiniBand. Arc's claim is one
 card.** Path: measured 19.6 @B=32 → ×3.25 ragged (**MEASURED 18.83→61.22**) → ×1.82 MTP per-seq KV →
@@ -169,6 +172,13 @@ all three geometries **2 bpw**, so the scoring error cannot recur):
 
 **3.46× fewer instructions than shipped — and still 3.1–3.9× short of the budget.** Both LUTs fit
 the 48 KB static limit (no `cudaFuncSetAttribute`); occupancy **62.5%**, **register**-limited.
+🔴 **BUT NOT AT 2 bpw — the K8/V4/L12 rows are instruction counts for a geometry that is
+quality-CLOSED** (**−0.00698** `w_cos` vs a ±0.0008 band; nine codebook designs stop at −0.00307).
+**The 3.46×-shaped decode costs a quarter of a bit more: K9/V4/L12 at 2.25 bpw, +0.00402, same
+32,768 B table, same decode shape.** That moves the model to **83.4 GB of 141** — **the one-card
+wedge survives** (MXFP4 is 151 GB and does not fit at all) — but cuts KV headroom **58.8 → 49.6 GB**,
+**UNMEASURED as a batch/context effect**. ⚠️ **K9's inst/weight is UNMEASURED; do not quote 4.375
+for K9.** Full record: **`memory/mission/FRONTIER_BITS_FOR_DECODE.md`**.
 🔴 **And the re-bake gets ~8× MORE expensive, not cheaper** — the production baker is **beam**
 (213 s/layer A100), not exhaustive (8,257), and is issue-bound; `(n/V)×W×2^K` ⇒ **~1,700 s/layer
 ≈ 20 h ≈ $30**. **`L=16` remains the disease** (512 KB never fits shared, which is why RUN-161 went

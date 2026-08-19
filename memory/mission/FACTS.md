@@ -65,6 +65,11 @@ unroller ceiling**, so linearity is unverified **for those two rows only**. The
 headline does not depend on the pending re-run.
 
 - **HEADLINE: 15.125 → 4.375 = 3.46× fewer instructions per weight, COMPILED.**
+  🔴 **BUT NOT AT 2 bpw — SUPERSEDED SAME DAY, see §1b.** The geometry those
+  instruction counts were taken at, **K8/V4/L12, is quality-CLOSED**: −0.00698
+  `w_cos` against a ±0.0008 band, and **nine codebook designs cannot rescue it**.
+  The cheap decode is real but costs **0.25 bpw more** (K9/V4/L12). **Do not quote
+  4.375 for K9 — the kernel has never been compiled at any K but 8.**
 - **Still 3.1–3.9× short of the 1.13–1.41 budget on sm_90** (2.6–3.2× on sm_80),
   **and that is the inner loop alone** — it excludes serving scaffolding (expert
   gather, shared staging, tail guards). ⚠️ **Geometry-to-geometry ratios are
@@ -79,6 +84,57 @@ headline does not depend on the pending re-run.
   predicted. **The random-access window is a REGRESSION at K=8 (+0.375)** — at
   K=8 warm-up is only `L/K = 2` byte-aligned symbols, cheaper than reconstructing
   the window. **Its value is confined to K=4.**
+
+### 1b. THE QUALITY SIDE OF THAT SAME GEOMETRY — **the 3.46× is at 2.25 bpw, not 2.00**
+
+**Full record: `memory/mission/FRONTIER_BITS_FOR_DECODE.md`.** CPU only, zero GPU
+hours, every table re-run from scratch the day it was written. Control for all of
+it: **K4/V2/L16, `w_cos`, gaussian σ=0.02, exhaustive Viterbi, rot=128, max/3,
+n=48, k=2048, 5 draws.** Ship band **±0.0008**.
+
+| geometry | bpw | **Δ w_cos** | table B | model GB | **KV GB** | band |
+|---|---|---|---|---|---|---|
+| K8/V4/L12 | 2.00 | **−0.00698** | 32,768 | 74.2 | 58.8 | **fails, 8.7× out** |
+| **K9/V4/L12** | **2.25** | **+0.00402** | 32,768 | **83.4** | **49.6** | **CLEARS, 5.0× the band on the good side** |
+| K10/V4/L12 | 2.50 | +0.01166 | 32,768 | 92.7 | 40.3 | CLEARS |
+| K12/V4/L12 (L==K ⇒ memoryless) | 3.00 | +0.02057 | 32,768 | 111.2 | 21.8 | CLEARS |
+
+At fixed **L=12/V=4 the codebook does not read K** (asserted in the probe, not
+assumed), so the table stays **32,768 B** and the decode shape stays one
+`LDS.64` per 4 weights across every row. **Only the bit rate moves.**
+⚠️ **The price is CAPACITY — KV 58.8 → 49.6 GB, −15.6%, and its batch/context
+effect is UNMEASURED.** Anchor: `probe_bit_rate_frontier`, 6.63 s, branch
+`arcquant/designed-codebook` @ `269e95988`.
+
+- 🔴 **2 bpw is CLOSED, and the mechanism is measured.** Nine codebook designs at
+  K8/V4/L12 top out at **−0.00307** (converged trellis-Lloyd, 40 sweeps): random
+  −0.00714 · amplitude re-fit −0.00597 · **LBG + per-block Haar −0.00457** · LBG
+  set-partitioned −0.00877 · LBG clustered −0.00895 · **D4 lattice cosets
+  −0.01008** · LBG memoryless −0.01443. Means over 3 fixtures × 5 draws.
+- 🔑 **THE MECHANISM: trellis OFF ⇒ LBG HALVES the loss vs random (−0.01443 vs
+  −0.02905); trellis ON ⇒ the same LBG LOSES to random (−0.00877 vs −0.00714).**
+  ⇒ **the binding constraint is TRELLIS FREEDOM, not codebook coverage.** More
+  codebook design at 2 bpw is not worth an hour.
+- **Structural result: K8/V4 at depth L behaves exactly like K4/V2 at L−2**
+  (−0.00115/−0.00119 and −0.00325/−0.00320). ⇒ **`L/K` lookback is NOT the
+  predictor.** Quote this before re-deriving it.
+- **Runner-up, still live: K4/V2/L13 — 2.00 bpw, −0.00206, 32,768 B, compiled
+  11.250 inst/wt (1.34×).** Misses the band but costs **no extra bit and no KV**.
+- ⚠️ **UNMEASURED, do not soften:** K9's inst/weight (the kernel has never been
+  compiled at any K but the K=8 control) · the pad-vs-clamp delta · the
+  batch/context effect of 49.6 vs 58.8 GB · bf16 vs f32 codebook values.
+
+### 1c. 🔴 CONFIRMED FALSE — "the GPU decode paths compute the codebook"
+
+`materialize` (`mistralrs-quant/src/qtip/mod.rs:596-598`) claims the GPU decode
+paths compute the table instead of storing it. **True only for `Mcg`.**
+`QtipCodebook::DEFAULT` is `Gaussian` (`mistralrs-quant/src/qtip/mod.rs:570`), and
+on that path the kernel **gathers from the stored 512 KiB table**
+(`mistralrs-quant/kernels/qtip/qtip_gemv.cu:213-215`) — which does not fit 48 KB
+shared at any occupancy, so **every symbol lookup is a dependent, scattered global
+load**, the 388 GB/s ≈ 8%-of-HBM decode limiter already recorded below.
+🔑 **That is the disease the 32,768 B table exists to kill — a reason the L=12
+family matters that is independent of any instruction count.**
 
 ### 2. V4 KV OVER-RETENTION — **30–57×**, source-derived
 
