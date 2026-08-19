@@ -722,6 +722,7 @@ mod tests {
             0.0,
             None,
             vec![],
+            None,
         )
         .unwrap();
         let group = Arc::new(std::sync::Mutex::new(SequenceGroup::new(

@@ -5637,6 +5637,7 @@ mod tests {
             0.0,
             None,
             vec![],
+            None,
         )
         .expect("Sampler::new with plain settings must succeed")
     }

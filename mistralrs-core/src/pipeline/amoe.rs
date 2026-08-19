@@ -394,6 +394,7 @@ impl AnyMoePipelineMixin for AnyMoePipeline {
             0.0,
             None,
             vec![],
+            None,
         )
         .map_err(candle_core::Error::msg)?;
 
