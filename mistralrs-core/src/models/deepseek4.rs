@@ -1876,7 +1876,25 @@ impl Attention {
 /// and adds support for `ScoringFunc::SqrtSoftplus` (V4 default — audit §0
 /// + §5).
 struct MoeGate {
+    /// Router weight exactly as it appears in the checkpoint:
+    /// `[n_routed_experts, hidden_size]`, checkpoint dtype.
+    ///
+    /// Kept **only** so `residual_tensors` can write it back into UQFF under
+    /// its original name/shape/dtype. It is deliberately not used by
+    /// `forward` — see [`Self::weight_t_f32`].
     weight: Tensor,
+    /// The same router weight, pre-transposed and pre-promoted to F32 at load
+    /// time — i.e. exactly the operand `forward`'s GEMM consumes, materialised
+    /// once instead of once per layer per decode step.
+    ///
+    /// Stored as `weight.t()?.to_dtype(F32)?`, shape
+    /// `[hidden_size, n_routed_experts]`. `forward` used to build this inline
+    /// on every call; because `.t()` is non-contiguous that was a *strided*
+    /// cast — reading the BF16 weight and writing a fresh F32 buffer, per
+    /// layer, per token. The weight is a constant, so all of it was redundant.
+    /// vLLM likewise keeps the router weight in fp32 from load
+    /// (`router/gate_linear.py:66-68`).
+    weight_t_f32: Tensor,
     cfg: DeepSeekV4Config,
     top_k: usize,
     n_routed_experts: usize,
@@ -1899,6 +1917,21 @@ impl MoeGate {
         layer_idx: usize,
     ) -> Result<Self> {
         let weight = vb.get((n_routed_experts, cfg.hidden_size), "weight")?;
+        // Hoist the router GEMM's operand out of the decode loop. This is the
+        // exact same expression `forward` used to evaluate per call
+        // (`weight.t()?.to_dtype(F32)?`) — same input, same deterministic
+        // conversion, same resulting layout — just evaluated once at load.
+        // Deliberately NOT followed by `.contiguous()`: adding one would give
+        // the GEMM a different operand layout than it sees today (relevant
+        // when the checkpoint is already F32 and `to_dtype` short-circuits to
+        // the transposed view), which could change cuBLAS kernel selection and
+        // therefore accumulation order.
+        //
+        // Cost: the F32 copy is resident for the life of the model rather than
+        // being reallocated every step — +4.19 MB per MoE layer, ~180 MB over
+        // 43 layers (0.13% of an H200). `weight` itself is retained unchanged
+        // for UQFF serialization, which is why both live here.
+        let weight_t_f32 = weight.t()?.to_dtype(DType::F32)?;
         let top_k = cfg.num_experts_per_tok.unwrap_or(6);
         // Hash routing: layers `< num_hash_layers` ship a fixed token-id ->
         // expert table (`gate.tid2eid`, [vocab_size, top_k]) and NO bias. Load
@@ -1964,6 +1997,7 @@ impl MoeGate {
         }
         Ok(Self {
             weight,
+            weight_t_f32,
             cfg: cfg.clone(),
             top_k,
             n_routed_experts,
@@ -1975,13 +2009,14 @@ impl MoeGate {
     fn forward(&self, xs: &Tensor, input_ids: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
         let (bs, seq_len, h) = xs.dims3()?;
         let xs = xs.reshape(((), h))?;
-        // The router GEMM re-casts `self.weight` to F32 on every call — a
-        // per-layer, per-token dequant of a constant. Named so the report can
-        // price it rather than leaving it inside an opaque `moe` bucket.
+        // `weight_t_f32` is already transposed and already F32 (built once in
+        // `new`), so the GEMM's weight operand costs nothing here. Only the
+        // activation cast below remains, and that one is real work — `xs` is a
+        // fresh per-token tensor, not a constant.
         let logits = {
             let _s = arc_profiler::device_span("gate.router_gemm");
             xs.to_dtype(DType::F32)?
-                .broadcast_matmul(&self.weight.t()?.to_dtype(DType::F32)?)?
+                .broadcast_matmul(&self.weight_t_f32)?
         };
         let _prof_score = arc_profiler::device_span("gate.scoring");
         let scores = match self.cfg.scoring_func {
@@ -8231,5 +8266,60 @@ mod tests {
 
         // No positions at all.
         assert!(draft_step_end_column(&[], 1, 0).is_err());
+    }
+
+    /// Pins the two-field router-weight contract introduced when the F32
+    /// re-cast was hoisted out of `MoeGate::forward`.
+    ///
+    /// `forward` consumes `weight_t_f32`, which must be *exactly*
+    /// `weight.t().to_dtype(F32)` — the expression it replaced — so the GEMM
+    /// is bit-identical. `weight` itself must keep the checkpoint's shape and
+    /// dtype, because `residual_tensors` serializes it straight back into
+    /// UQFF under the name `weight`; if a future refactor drops it or swaps in
+    /// the transposed copy, the artifact silently changes format.
+    #[test]
+    fn moe_gate_router_weight_is_hoisted_without_changing_the_uqff_tensor() -> Result<()> {
+        let device = Device::Cpu;
+        let hidden = 8;
+        let n_routed_experts = 4;
+        let cfg = compressor_test_cfg(hidden);
+
+        // Distinct, exactly-BF16-representable values so the comparison below
+        // isolates layout/dtype handling rather than rounding.
+        let weight_f32 = Tensor::from_vec(
+            (0..n_routed_experts * hidden)
+                .map(|i| (i as f32) * 0.25 - 3.0)
+                .collect::<Vec<_>>(),
+            (n_routed_experts, hidden),
+            &device,
+        )?;
+        let mut map = std::collections::HashMap::new();
+        map.insert("weight".to_string(), weight_f32.to_dtype(DType::BF16)?);
+        let vb = vb_from_map(map, DType::BF16, &device);
+
+        // layer_idx 10 >= default num_hash_layers (3), so no `tid2eid` lookup.
+        let gate = MoeGate::new(&cfg, vb, n_routed_experts, 10)?;
+
+        // UQFF-facing tensor: untouched checkpoint shape and dtype.
+        assert_eq!(gate.weight.dims(), &[n_routed_experts, hidden]);
+        assert_eq!(gate.weight.dtype(), DType::BF16);
+
+        // GEMM-facing operand: transposed and promoted, ready to use.
+        assert_eq!(gate.weight_t_f32.dims(), &[hidden, n_routed_experts]);
+        assert_eq!(gate.weight_t_f32.dtype(), DType::F32);
+
+        // And it is bit-identical to the per-call expression it replaced.
+        let want: Vec<f32> = gate
+            .weight
+            .t()?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
+        let got: Vec<f32> = gate.weight_t_f32.flatten_all()?.to_vec1()?;
+        assert_eq!(
+            got, want,
+            "hoisted router operand must equal `weight.t().to_dtype(F32)` exactly"
+        );
+        Ok(())
     }
 }
