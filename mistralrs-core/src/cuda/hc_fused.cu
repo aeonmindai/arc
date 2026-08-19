@@ -5,13 +5,21 @@
 // ---------------------------------------------------------------------------
 // WHY
 // ---------------------------------------------------------------------------
-// At b=1 the V4 decode step is launch-bound, not bandwidth-bound: the measured
-// step issues ~7.9k `cuLaunchKernel` calls, of which the router region alone is
-// 3,259 (41.8%) spread over 86 contiguous spans -- exactly two per layer
-// (`mhc_attn_pre` and `mhc_ffn_pre`, 43 layers). Those spans operate on
-// `[1, 24]` / `[1, 4, 4]` / `[1, 256]` tensors: mean kernel duration 2.79 us,
-// 89% of them under 5 us. They are pure launch overhead wearing a kernel
-// costume.
+// At b=1 the V4 decode step is launch-bound, not bandwidth-bound. Measured on
+// an H200 at master ef581e9c8: 7,477.9 `cuLaunchKernel` calls per decode step
+// costing 18.976 ms/step of host time, of which the router region is 76 kernels
+// per layer (3,268/step, 43.7%) spread over 86 contiguous spans -- exactly two
+// per layer (`mhc_attn_pre` and `mhc_ffn_pre`, 43 layers). Those spans operate
+// on `[1, 24]` / `[1, 4, 4]` / `[1, 256]` tensors: mean kernel duration 2.72 us,
+// 89% of them under 5 us, 28.4% of all kernel time. They are pure launch
+// overhead wearing a kernel costume.
+//
+// MEASURED RESULT of this file plus the sinkhorn fix, same box, same binary,
+// toggled with ARC_HC_FUSED: 7,494.3 -> 5,691.0 launches/step (-24.1%),
+// 10,892.4 -> 8,918.5 allocations/step, 57.70 -> 49.66 ms/token
+// (17.3 -> 20.1 tok/s). The router region itself goes 76 -> 38 kernels/layer
+// and 0.207 -> 0.100 ms of GPU time. Generated tokens and logprobs are
+// bit-identical across the toggle (6 prompts, 768 logprob values, 0 mismatches).
 //
 // Two expressions dominate the count and are collapsed here:
 //
