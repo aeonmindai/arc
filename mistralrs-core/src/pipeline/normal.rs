@@ -1899,7 +1899,7 @@ impl Pipeline for NormalPipeline {
                             }
                             AllocCacheAction::Leave => {}
                         }
-                        report_alloc_cache_step(cd, seq_len);
+                        report_alloc_cache_step(&cd, seq_len);
                     }
                     if probe && seq_len == 1 {
                         // RUN-161 step 2b. Set the graph-mode device position:
