@@ -67,6 +67,12 @@ __device__ __forceinline__ uint32_t convert_to_uint32(float x) {
 // list + the radix histogram tables.
 // ---------------------------------------------------------------------------
 
+// Block size must cover the RADIX+1 (=257) histogram init and cumsum,
+// independent of kTopK. Launching kTopK<257 threads left the histogram
+// tail uninitialised and unscanned -> wrong threshold bin -> unbounded
+// write past __shared__ s_topk_indices[kTopK].
+template <int K> struct TopkBlock { static constexpr int value = (K < 256) ? 256 : K; };
+
 template <int kTopK>
 __device__ void radix_topk_impl(
     const float* __restrict__ input,
@@ -74,7 +80,7 @@ __device__ void radix_topk_impl(
     const uint32_t length
 ) {
     constexpr uint32_t RADIX = 256;
-    constexpr uint32_t kTopKBlockSize = kTopK;
+    constexpr uint32_t kTopKBlockSize = TopkBlock<kTopK>::value;
     // Dynamic SMEM partition: kSMEM bytes total (64 KB worth of indices).
     constexpr uint32_t kSMEM = 16 * 1024 * sizeof(uint32_t);
     constexpr uint32_t SMEM_INPUT_SIZE = kSMEM / (2 * sizeof(int32_t));
@@ -113,7 +119,7 @@ __device__ void radix_topk_impl(
     };
 
     // Stage 1: 8-bit coarse histogram across the full input.
-    if (tx < RADIX + 1) s_histogram[tx] = 0;
+    for (uint32_t hi = tx; hi < RADIX + 1; hi += kTopKBlockSize) s_histogram[hi] = 0;
     __syncthreads();
     for (uint32_t idx = tx; idx < length; idx += kTopKBlockSize) {
         const auto bin = convert_to_uint8(input[idx]);
@@ -135,14 +141,14 @@ __device__ void radix_topk_impl(
             const uint32_t bin = convert_to_uint8(input[idx]);
             if (bin > threshold_bin_stage1) {
                 const auto pos = ::atomicAdd(&s_counter, 1);
-                output[pos] = static_cast<int32_t>(idx);
+                if (pos < kTopK) output[pos] = static_cast<int32_t>(idx);
             }
         }
         __syncthreads();
         return;
     } else {
         __syncthreads();
-        if (tx < RADIX + 1) s_histogram[tx] = 0;
+        for (uint32_t hi = tx; hi < RADIX + 1; hi += kTopKBlockSize) s_histogram[hi] = 0;
         __syncthreads();
 
         for (uint32_t idx = tx; idx < length; idx += kTopKBlockSize) {
@@ -150,7 +156,7 @@ __device__ void radix_topk_impl(
             const uint32_t bin = convert_to_uint8(raw_input);
             if (bin > threshold_bin_stage1) {
                 const auto pos = ::atomicAdd(&s_counter, 1);
-                output[pos] = static_cast<int32_t>(idx);
+                if (pos < kTopK) output[pos] = static_cast<int32_t>(idx);
             } else if (bin == threshold_bin_stage1) {
                 const auto pos = ::atomicAdd(&s_num_input[0], 1);
                 if (pos < SMEM_INPUT_SIZE) {
@@ -190,14 +196,14 @@ __device__ void radix_topk_impl(
                 const auto bin = (convert_to_uint32(input[idx]) >> offset) & 0xFF;
                 if (bin > threshold_bin) {
                     const auto pos = ::atomicAdd(&s_counter, 1);
-                    output[pos] = static_cast<int32_t>(idx);
+                    if (pos < kTopK) output[pos] = static_cast<int32_t>(idx);
                 }
             }
             __syncthreads();
             return;
         } else {
             __syncthreads();
-            if (tx < RADIX + 1) s_histogram[tx] = 0;
+            for (uint32_t hi = tx; hi < RADIX + 1; hi += kTopKBlockSize) s_histogram[hi] = 0;
             __syncthreads();
             for (uint32_t i = tx; i < num_input; i += kTopKBlockSize) {
                 const auto idx = s_input_idx[r_idx][i];
@@ -206,11 +212,11 @@ __device__ void radix_topk_impl(
                 const auto bin = (convert_to_uint32(raw_input) >> offset) & 0xFF;
                 if (bin > threshold_bin) {
                     const auto pos = ::atomicAdd(&s_counter, 1);
-                    output[pos] = static_cast<int32_t>(idx);
+                    if (pos < kTopK) output[pos] = static_cast<int32_t>(idx);
                 } else if (bin == threshold_bin) {
                     if (round == 3) {
                         const auto pos = ::atomicAdd(&s_last_remain, -1);
-                        if (pos > 0) {
+                        if (pos > 0 && pos <= kTopK) {
                             output[kTopK - pos] = static_cast<int32_t>(idx);
                         }
                     } else {
@@ -252,7 +258,7 @@ __device__ __forceinline__ void naive_transform_topk(
 // ---------------------------------------------------------------------------
 
 template <int kTopK>
-__launch_bounds__(kTopK, 1)
+__launch_bounds__(TopkBlock<kTopK>::value, 1)
 __global__ void topk_radix_kernel(
     const float* __restrict__ scores,     // [N, score_stride]
     const int32_t* __restrict__ seq_lens, // [N] valid length per row
@@ -308,7 +314,7 @@ extern "C" void arc_flashmlasparse_topk(
                 (const void*)topk_radix_kernel<64>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 static_cast<int>(kSMEM_bytes));
-            topk_radix_kernel<64><<<n_rows, 64, kSMEM_bytes, stream>>>(
+            topk_radix_kernel<64><<<n_rows, TopkBlock<64>::value, kSMEM_bytes, stream>>>(
                 scores, seq_lens, out, score_stride);
             break;
         }
@@ -317,7 +323,7 @@ extern "C" void arc_flashmlasparse_topk(
                 (const void*)topk_radix_kernel<128>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 static_cast<int>(kSMEM_bytes));
-            topk_radix_kernel<128><<<n_rows, 128, kSMEM_bytes, stream>>>(
+            topk_radix_kernel<128><<<n_rows, TopkBlock<128>::value, kSMEM_bytes, stream>>>(
                 scores, seq_lens, out, score_stride);
             break;
         }
@@ -326,7 +332,7 @@ extern "C" void arc_flashmlasparse_topk(
                 (const void*)topk_radix_kernel<256>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 static_cast<int>(kSMEM_bytes));
-            topk_radix_kernel<256><<<n_rows, 256, kSMEM_bytes, stream>>>(
+            topk_radix_kernel<256><<<n_rows, TopkBlock<256>::value, kSMEM_bytes, stream>>>(
                 scores, seq_lens, out, score_stride);
             break;
         }
@@ -335,7 +341,7 @@ extern "C" void arc_flashmlasparse_topk(
                 (const void*)topk_radix_kernel<512>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 static_cast<int>(kSMEM_bytes));
-            topk_radix_kernel<512><<<n_rows, 512, kSMEM_bytes, stream>>>(
+            topk_radix_kernel<512><<<n_rows, TopkBlock<512>::value, kSMEM_bytes, stream>>>(
                 scores, seq_lens, out, score_stride);
             break;
         }
@@ -344,7 +350,7 @@ extern "C" void arc_flashmlasparse_topk(
                 (const void*)topk_radix_kernel<1024>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 static_cast<int>(kSMEM_bytes));
-            topk_radix_kernel<1024><<<n_rows, 1024, kSMEM_bytes, stream>>>(
+            topk_radix_kernel<1024><<<n_rows, TopkBlock<1024>::value, kSMEM_bytes, stream>>>(
                 scores, seq_lens, out, score_stride);
             break;
         }
