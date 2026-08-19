@@ -32,7 +32,8 @@
 
 use candle_core::{DType, Device, Result, Tensor};
 use mistralrs_quant::{
-    QtipCodebook, QtipLayer, QtipSearchDetail, QtipSearchStamp, QuantMethod, QTIP_GROUPED_TILE_K,
+    QtipCodebook, QtipGeometry, QtipLayer, QtipSearchDetail, QtipSearchStamp, QuantMethod,
+    QTIP_GROUPED_TILE_K,
 };
 use std::time::Instant;
 
@@ -138,6 +139,9 @@ fn build_layer(
         QtipSearchStamp::Unstamped,
         QtipSearchDetail::Unknown,
         QtipCodebook::Gaussian,
+        // This bench synthesises a `[65536, 2]` F32 table above; that is the
+        // K=4/V=2/L=16 geometry by construction.
+        QtipGeometry::K4V2L16,
     )
 }
 

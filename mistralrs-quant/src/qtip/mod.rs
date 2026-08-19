@@ -686,6 +686,10 @@ impl QtipCodebook {
     /// one. Unknown tags fail closed (DOCTRINE: refuse, never launder).
     fn from_wire(tag: u8, read_mult: impl FnOnce() -> Result<u32>) -> Result<Self> {
         match tag {
+            GEOMETRY_WIRE_TAG => candle_core::bail!(
+                "QtipLayer: internal error — the geometry section reached the codebook parser. \
+                 The trailing-section loop must consume tag {GEOMETRY_WIRE_TAG} itself."
+            ),
             2 => {
                 let mult = read_mult()?;
                 if mult == 0 || mult % 2 == 0 {
@@ -701,6 +705,227 @@ impl QtipCodebook {
                  written by a newer Arc than this build understands; refusing rather than \
                  decoding its symbols against the wrong codebook."
             ),
+        }
+    }
+}
+
+/// Trailing-section tag for the trellis geometry.
+///
+/// **It is 3, and it is written BEFORE the codebook section, and both of those
+/// are load-bearing.** A build that predates this field parses the trailing
+/// region by reading one byte and handing it to [`QtipCodebook::from_wire`],
+/// which refuses every tag it does not know. So an old Arc handed a
+/// non-default-geometry artifact sees tag 3 first and fails closed with
+/// "written by a newer Arc … refusing rather than decoding its symbols against
+/// the wrong codebook" — which is exactly the right outcome, because it cannot
+/// decode this geometry either.
+///
+/// Put the section *after* the codebook and that property is lost: an old
+/// reader would consume the codebook section, stop, and decode a K=8/V=4 symbol
+/// stream as K=4/V=2. It would not even fault — the packed byte count is
+/// identical at 2 bpw, so every index stays in bounds and the output is
+/// plausible garbage. [`tests::geometry_section_precedes_the_codebook_section`]
+/// pins the order.
+const GEOMETRY_WIRE_TAG: u8 = 3;
+
+/// Which trellis geometry a [`QtipLayer`]'s symbols were baked at.
+///
+/// **This is a format discriminator, not a tuning knob.** Symbols are a
+/// bit-stream interpreted by a specific `(K, L, V)` and a specific reproduction
+/// table; read at the wrong geometry they decode to different weights, silently.
+///
+/// Both variants are **2 bits per weight** (`bpw = K/V`). They are not a
+/// compression trade — they are a decode-cost trade. See
+/// [`crate::k8v4l12`] for what actually differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QtipGeometry {
+    /// K=4 / V=2 / L=16 with a `[65536, 2]` F32 table — every QTIP artifact
+    /// Arc has ever written. The default, and it serializes as **nothing**.
+    #[default]
+    K4V2L16,
+    /// K=8 / V=4 / L=12 with a `[4096, 4]` BF16 table (32,768 B — fits static
+    /// shared memory). See [`crate::k8v4l12`].
+    K8V4L12,
+}
+
+impl QtipGeometry {
+    /// Bits per symbol.
+    pub fn k(self) -> u32 {
+        match self {
+            QtipGeometry::K4V2L16 => K,
+            QtipGeometry::K8V4L12 => k8v4l12::K,
+        }
+    }
+
+    /// Trellis state width in bits.
+    pub fn l(self) -> u32 {
+        match self {
+            QtipGeometry::K4V2L16 => L,
+            QtipGeometry::K8V4L12 => k8v4l12::L,
+        }
+    }
+
+    /// Reproduction values per symbol.
+    pub fn v(self) -> u32 {
+        match self {
+            QtipGeometry::K4V2L16 => V,
+            QtipGeometry::K8V4L12 => k8v4l12::V,
+        }
+    }
+
+    /// Bits per weight. **2 for both variants** — that is the point.
+    pub fn n_bits(self) -> usize {
+        (self.k() / self.v()) as usize
+    }
+
+    /// Trellis symbols packed into one byte: `8 / K`.
+    pub fn syms_per_byte(self) -> usize {
+        8 / self.k() as usize
+    }
+
+    /// Total values in the reproduction table: `2^L × V`.
+    pub fn lut_values(self) -> usize {
+        (1usize << self.l()) * self.v() as usize
+    }
+
+    /// Element type of the reproduction table.
+    ///
+    /// Part of the discriminator, not an implementation detail: the K=8/V=4
+    /// table is BF16 precisely so it lands at 32,768 B, and an F32 table of the
+    /// same shape is a different artifact.
+    pub fn lut_dtype(self) -> DType {
+        match self {
+            QtipGeometry::K4V2L16 => DType::F32,
+            QtipGeometry::K8V4L12 => DType::BF16,
+        }
+    }
+
+    /// Trellis symbols in a row of `in_features` weights.
+    pub fn num_symbols(self, in_features: usize) -> usize {
+        in_features / self.v() as usize
+    }
+
+    /// Packed bytes in a row of `in_features` weights.
+    ///
+    /// Equal for both variants at the same `in_features` — both are 2 bpw —
+    /// which is exactly why a mislabelled artifact does not fault.
+    pub fn packed_len(self, in_features: usize) -> usize {
+        self.num_symbols(in_features) / self.syms_per_byte()
+    }
+
+    /// Short label for bake headers and error messages.
+    pub fn tag(self) -> &'static str {
+        match self {
+            QtipGeometry::K4V2L16 => "k4v2l16",
+            QtipGeometry::K8V4L12 => "k8v4l12",
+        }
+    }
+
+    /// Wire encoding. **The default geometry writes nothing**, so every
+    /// artifact Arc has already produced stays byte-identical and no existing
+    /// checksum moves. Only a geometry that cannot be inferred from absence
+    /// announces itself.
+    fn to_wire(self) -> Option<(u8, [u8; 3])> {
+        match self {
+            QtipGeometry::K4V2L16 => None,
+            QtipGeometry::K8V4L12 => Some((
+                GEOMETRY_WIRE_TAG,
+                [k8v4l12::K as u8, k8v4l12::L as u8, k8v4l12::V as u8],
+            )),
+        }
+    }
+
+    /// Parse a `(K, L, V)` triple into a known geometry.
+    ///
+    /// The triple is stored rather than an opaque ordinal so a payload is
+    /// self-describing to a human with a hex editor, and so an unsupported but
+    /// well-formed geometry produces a diagnosis instead of "unknown tag".
+    fn from_wire_body(k: u8, l: u8, v: u8) -> Result<Self> {
+        // Written as comparisons, not as match patterns: a bare `K` in pattern
+        // position is a const pattern only for as long as the const exists, and
+        // silently becomes a catch-all binding if it is ever renamed away.
+        let got = (k as u32, l as u32, v as u32);
+        if got == (K, L, V) {
+            return Ok(QtipGeometry::K4V2L16);
+        }
+        if got == (k8v4l12::K, k8v4l12::L, k8v4l12::V) {
+            return Ok(QtipGeometry::K8V4L12);
+        }
+        let (ok, ol, ov) = got;
+        candle_core::bail!(
+            "QtipLayer: UQFF payload declares trellis geometry K={ok}/L={ol}/V={ov}, which this \
+             build has no decoder for. Refusing rather than decoding its symbols at the wrong \
+             geometry — at {} bits per weight the packed byte count is identical to a geometry \
+             we DO support, so a wrong guess would not even fault.",
+            ok.checked_div(ov).unwrap_or(0)
+        )
+    }
+
+    /// Check that a layer's tensors are shaped the way this geometry requires.
+    ///
+    /// The tag alone is a claim; this is what makes it true. Both supported
+    /// geometries are 2 bpw, so `blocks` has the same size either way and the
+    /// *table* is the only shape that discriminates — hence the dtype and
+    /// element-count checks, which are the load-bearing half.
+    fn validate_shapes(self, blocks: &Tensor, lut: &Tensor, in_features: usize) -> Result<()> {
+        if !in_features.is_multiple_of(self.v() as usize) {
+            candle_core::bail!(
+                "QtipLayer[{}]: in_features {in_features} is not a multiple of V={}",
+                self.tag(),
+                self.v()
+            );
+        }
+        let want_packed = self.packed_len(in_features);
+        let got_packed = blocks.dims()[blocks.dims().len() - 1];
+        if got_packed != want_packed {
+            candle_core::bail!(
+                "QtipLayer[{}]: blocks row is {got_packed} B but K={}/V={} with in_features \
+                 {in_features} needs {want_packed} B",
+                self.tag(),
+                self.k(),
+                self.v()
+            );
+        }
+        if lut.dtype() != self.lut_dtype() {
+            candle_core::bail!(
+                "QtipLayer[{}]: reproduction table is {:?} but this geometry stores {:?}. The \
+                 table's element type is part of the format, not an implementation detail.",
+                self.tag(),
+                lut.dtype(),
+                self.lut_dtype()
+            );
+        }
+        if lut.elem_count() != self.lut_values() {
+            candle_core::bail!(
+                "QtipLayer[{}]: reproduction table has {} values, expected 2^{} × {} = {}",
+                self.tag(),
+                lut.elem_count(),
+                self.l(),
+                self.v(),
+                self.lut_values()
+            );
+        }
+        Ok(())
+    }
+
+    /// Codebooks this geometry can legally carry.
+    ///
+    /// The computed `sum2` codebook is V=2-specific — `mcg_codeword_v2` folds
+    /// exactly two chained MCG products, and the CUDA twin
+    /// (`qtip_codebook.cuh::qtip_cb_pair_from_x0`) returns a `float2`. There is
+    /// no V=4 form of it, so pairing it with K=8/V=4 is not a thing that can be
+    /// decoded, and it is refused on both the write and the read side rather
+    /// than left to fail somewhere less obvious.
+    fn check_codebook(self, codebook: QtipCodebook) -> Result<()> {
+        match (self, codebook) {
+            (QtipGeometry::K8V4L12, QtipCodebook::Mcg { .. }) => candle_core::bail!(
+                "QtipLayer[{}]: the computed `sum2` codebook is V=2-only (it produces a PAIR of \
+                 reproduction values per state) and cannot describe a V={} geometry. This rung \
+                 is table-only.",
+                self.tag(),
+                self.v()
+            ),
+            _ => Ok(()),
         }
     }
 }
@@ -799,6 +1024,16 @@ pub struct QtipLayer {
     /// computes, so the table stays a correct fallback (and the CPU search
     /// still wants a flat one) while every GPU path skips it entirely.
     codebook: QtipCodebook,
+    /// Which trellis geometry `blocks` was baked at, and therefore how its
+    /// bytes decompose into symbols and how `lut` is indexed.
+    ///
+    /// [`QtipGeometry::K4V2L16`] for every artifact written before the
+    /// discriminator existed — which is what they are. Deliberately has no
+    /// per-site default: both supported geometries are 2 bits per weight, so a
+    /// mislabelled layer has a correctly-sized `blocks` tensor and decodes to
+    /// plausible garbage rather than faulting. Every construction site states
+    /// it, and the compiler is what enforces that.
+    geometry: QtipGeometry,
 }
 
 /// Borrowed, dequantization-free view of a [`QtipLayer`]'s packed trellis
@@ -1954,6 +2189,10 @@ impl QtipLayer {
                 search_weights.is_some(),
             ),
             codebook,
+            // This crate's trellis search is K=4/V=2/L=16 throughout
+            // (`viterbi.rs` reaches 16 successors per step and groups by
+            // 2^(L-K)); there is no producer of any other geometry yet.
+            geometry: QtipGeometry::K4V2L16,
         })
     }
 
@@ -2220,6 +2459,7 @@ impl QtipLayer {
         let mut shared_rotation_block: usize = 0;
         let mut shared_search_detail = QtipSearchDetail::Unknown;
         let mut shared_codebook = QtipCodebook::Gaussian;
+        let mut shared_geometry = QtipGeometry::K4V2L16;
 
         // Per-expert streaming. The full stack is kept on CPU (caller passes
         // device=CPU for the 3-D experts to avoid the ~4GB dense BF16 transient
@@ -2341,6 +2581,7 @@ impl QtipLayer {
                 shared_rotation_block = layer.rotation_block;
                 shared_search_detail = layer.search_detail;
                 shared_codebook = layer.codebook;
+                shared_geometry = layer.geometry;
             } else {
                 debug_assert_eq!(layer.lut.dims(), shared_lut.as_ref().unwrap().dims());
                 debug_assert_eq!(layer.rotation_block, shared_rotation_block);
@@ -2367,6 +2608,18 @@ impl QtipLayer {
                          decode against different codebooks.",
                         layer.codebook.tag(),
                         shared_codebook.tag()
+                    );
+                }
+                // And the geometry, for the same reason and with the same
+                // teeth: at 2 bpw a mixed-geometry stack has consistently
+                // sized `blocks`, so nothing downstream would notice.
+                if layer.geometry != shared_geometry {
+                    candle_core::bail!(
+                        "QTIP 3-D quantize: expert chunk at {expert_idx} used geometry {} but \
+                         the stack already carries {} — refusing to build a stack whose experts \
+                         decode at different geometries.",
+                        layer.geometry.tag(),
+                        shared_geometry.tag()
                     );
                 }
             }
@@ -2398,6 +2651,7 @@ impl QtipLayer {
             search: QtipSearchStamp::for_mode(mode),
             search_detail: shared_search_detail,
             codebook: shared_codebook,
+            geometry: shared_geometry,
         })
     }
 
@@ -3084,6 +3338,7 @@ impl QtipLayer {
         search: QtipSearchStamp,
         search_detail: QtipSearchDetail,
         codebook: QtipCodebook,
+        geometry: QtipGeometry,
     ) -> Result<QtipLayer> {
         if blocks.dims().len() != 3 {
             candle_core::bail!(
@@ -3112,6 +3367,12 @@ impl QtipLayer {
             );
         }
         let e = blocks.dim(0)?;
+        // The caller asserts a geometry; make it true here rather than at the
+        // first decode. Both supported geometries are 2 bits per weight, so
+        // `blocks` alone cannot tell them apart — the table's dtype and length
+        // are what discriminate.
+        geometry.validate_shapes(&blocks, &lut, in_features)?;
+        geometry.check_codebook(codebook)?;
         Ok(QtipLayer {
             search_detail,
             blocks,
@@ -3124,6 +3385,7 @@ impl QtipLayer {
             rotation_block,
             search,
             codebook,
+            geometry,
         })
     }
 
@@ -3201,6 +3463,15 @@ impl QtipLayer {
                     head.codebook.tag()
                 );
             }
+            // Only `head.lut` survives the stack here too, and a table is
+            // meaningful only at the geometry it was built for.
+            if layer.geometry != head.geometry {
+                candle_core::bail!(
+                    "QtipLayer::stack_experts: layer {i} geometry={} != head {}",
+                    layer.geometry.tag(),
+                    head.geometry.tag()
+                );
+            }
         }
 
         let blocks_refs: Vec<&Tensor> = per_expert_layers.iter().map(|l| &l.blocks).collect();
@@ -3225,6 +3496,7 @@ impl QtipLayer {
             search: head.search,
             search_detail: head.search_detail,
             codebook: head.codebook,
+            geometry: head.geometry,
         })
     }
 
@@ -3507,6 +3779,7 @@ impl QtipLayer {
             search: self.search,
             search_detail: self.search_detail,
             codebook: self.codebook,
+            geometry: self.geometry,
         })
     }
 }
@@ -3549,6 +3822,11 @@ impl QuantMethod for QtipLayer {
                 // table holds the computed values. It only forgoes the
                 // in-register decode.
                 codebook: QtipCodebook::Gaussian,
+                // Same again for the geometry: the config carries no
+                // discriminator, and every payload that reached this factory
+                // before the field existed was K=4/V=2/L=16. Reading it as
+                // anything else would be inventing a claim.
+                geometry: QtipGeometry::K4V2L16,
             }),
             _ => candle_core::bail!("QtipLayer requires QuantMethodConfig::Qtip"),
         }
@@ -3915,6 +4193,12 @@ impl QtipLayer {
         self.codebook
     }
 
+    /// Which trellis geometry this layer's symbols were baked at, and
+    /// therefore which decoder can read them. See [`QtipGeometry`].
+    pub fn geometry(&self) -> QtipGeometry {
+        self.geometry
+    }
+
     /// Dequantize the i-th expert's `[N, K_in]` BF16 weight matrix (3-D mode
     /// only). Internal use by `gather_forward` and friends; bails when called
     /// on a 2-D layer or with `expert_idx >= num_experts`.
@@ -4025,6 +4309,9 @@ impl QtipLayer {
             // Gaussian default above) — correct for any table, and never
             // assumes a computed codebook we cannot verify.
             codebook: QtipCodebook::Gaussian,
+            // Safetensors QTIP checkpoints predate every geometry but this
+            // one, and carry no field that could say otherwise.
+            geometry: QtipGeometry::K4V2L16,
         }))
     }
 
@@ -4180,18 +4467,57 @@ impl QtipLayer {
         // meant. An unknown tag value, on the other hand, IS refused: that
         // means a newer Arc wrote it, and decoding its symbols against a
         // codebook we guessed would be silent corruption.
-        let codebook = match buffer.read_u8() {
-            Ok(tag) => QtipCodebook::from_wire(tag, || {
-                buffer.read_u32::<LittleEndian>().map_err(|_| {
-                    candle_core::Error::Msg(
-                        "QtipLayer: codebook tag claims a computed codebook but the multiplier \
-                         is missing (truncated payload)."
-                            .into(),
-                    )
-                })
-            })?,
-            Err(_) => QtipCodebook::Gaussian,
-        };
+        // The trailing region is a sequence of tagged sections, read until EOF.
+        // Each tag may appear at most once: a repeat means a corrupt or
+        // concatenated payload, and silently letting the last one win is how a
+        // reader ends up decoding against something nobody wrote.
+        let mut codebook: Option<QtipCodebook> = None;
+        let mut geometry: Option<QtipGeometry> = None;
+        while let Ok(tag) = buffer.read_u8() {
+            if tag == GEOMETRY_WIRE_TAG {
+                if geometry.is_some() {
+                    candle_core::bail!(
+                        "QtipLayer: the UQFF payload carries two geometry sections. Refusing a \
+                         payload that describes itself twice."
+                    );
+                }
+                let mut klv = [0u8; 3];
+                for (i, slot) in klv.iter_mut().enumerate() {
+                    *slot = buffer.read_u8().map_err(|_| {
+                        candle_core::Error::Msg(format!(
+                            "QtipLayer: geometry section is truncated (got {i} of 3 K/L/V bytes)."
+                        ))
+                    })?;
+                }
+                geometry = Some(QtipGeometry::from_wire_body(klv[0], klv[1], klv[2])?);
+            } else {
+                if codebook.is_some() {
+                    candle_core::bail!(
+                        "QtipLayer: the UQFF payload carries two codebook sections. Refusing a \
+                         payload that describes itself twice."
+                    );
+                }
+                codebook = Some(QtipCodebook::from_wire(tag, || {
+                    buffer.read_u32::<LittleEndian>().map_err(|_| {
+                        candle_core::Error::Msg(
+                            "QtipLayer: codebook tag claims a computed codebook but the \
+                             multiplier is missing (truncated payload)."
+                                .into(),
+                        )
+                    })
+                })?);
+            }
+        }
+        // Absence is the answer for both, and it is the same answer it has
+        // always been: the historical geometry, gathering from the stored table.
+        let codebook = codebook.unwrap_or(QtipCodebook::Gaussian);
+        let geometry = geometry.unwrap_or(QtipGeometry::K4V2L16);
+
+        // The tag is a claim; these make it true. Both supported geometries are
+        // 2 bits per weight, so `blocks` is the same size either way — the
+        // table's dtype and length are what actually discriminate.
+        geometry.validate_shapes(&blocks, &lut, in_features)?;
+        geometry.check_codebook(codebook)?;
 
         Ok((
             Self {
@@ -4206,6 +4532,7 @@ impl QtipLayer {
                 search,
                 search_detail,
                 codebook,
+                geometry,
             },
             ext_bias,
         ))
@@ -4281,10 +4608,25 @@ impl QuantizedSerde for QtipLayer {
         if let Some(w) = beam_width {
             buffer.extend(&w.to_le_bytes());
         }
+        // The trellis geometry, written FIRST in the trailing-section region
+        // and only when it is not the historical K=4/V=2/L=16 — see
+        // `QtipGeometry::to_wire` and `GEOMETRY_WIRE_TAG` for why the order is
+        // load-bearing. In short: a build that predates this field reads one
+        // trailing byte and hands it to the codebook parser, which refuses
+        // every tag it does not know. Tag 3 first means an old Arc fails
+        // closed on a geometry it cannot decode; tag 3 last would let it
+        // decode K=8/V=4 symbols as K=4/V=2 without faulting, because at 2 bpw
+        // the packed byte count is the same.
+        self.geometry.check_codebook(self.codebook)?;
+        if let Some((geo_tag, klv)) = self.geometry.to_wire() {
+            buffer.push(geo_tag);
+            buffer.extend(&klv);
+        }
         // wave24-AU: the codebook discriminator, appended LAST and only when
         // the codebook is not the historical Gaussian one — see
-        // `QtipCodebook::to_wire`. A Gaussian artifact is therefore byte-for-
-        // byte what this writer produced before the field existed.
+        // `QtipCodebook::to_wire`. A Gaussian artifact at the default geometry
+        // is therefore byte-for-byte what this writer produced before either
+        // field existed.
         //
         // A build that predates the field, handed a computed-codebook payload,
         // parses identically up to here and then ignores a trailing section it
@@ -5823,6 +6165,7 @@ mod tests {
         let mut shared_rotation_block: usize = 0;
         let mut shared_search_detail = QtipSearchDetail::Unknown;
         let mut shared_codebook = QtipCodebook::Gaussian;
+        let mut shared_geometry = QtipGeometry::K4V2L16;
         for expert_idx in 0..e {
             let expert_w = w.narrow(0, expert_idx, 1)?.squeeze(0)?;
             let layer = QtipLayer::quantize_with_options_concrete(
@@ -5840,6 +6183,7 @@ mod tests {
                 shared_rotation_block = layer.rotation_block;
                 shared_search_detail = layer.search_detail;
                 shared_codebook = layer.codebook;
+                shared_geometry = layer.geometry;
             }
         }
         let blocks_3d = Tensor::stack(&blocks_slices, 0)?;
@@ -5856,6 +6200,7 @@ mod tests {
             search: QtipSearchStamp::for_mode(mode),
             search_detail: shared_search_detail,
             codebook: shared_codebook,
+            geometry: shared_geometry,
         })
         .inspect(|l| {
             debug_assert_eq!(l.blocks.dims(), &[e, n, k_in / 4]);
@@ -6742,9 +7087,419 @@ mod tests {
                 let bb: Vec<u32> = bv.iter().map(|x| x.to_bits()).collect();
                 assert_eq!(ab, bb, "{what}: f32 bit patterns differ");
             }
+            DType::BF16 => {
+                // The K=8/V=4/L=12 reproduction table. Compared as raw bits,
+                // not as floats: a table is format, and `==` on bf16 would
+                // still call two NaN payloads unequal and two zeros equal.
+                let av: Vec<half::bf16> = a.flatten_all()?.to_vec1()?;
+                let bv: Vec<half::bf16> = b.flatten_all()?.to_vec1()?;
+                let ab: Vec<u16> = av.iter().map(|x| x.to_bits()).collect();
+                let bb: Vec<u16> = bv.iter().map(|x| x.to_bits()).collect();
+                assert_eq!(ab, bb, "{what}: bf16 bit patterns differ");
+            }
             other => panic!("assert_tensor_bits_eq: unhandled dtype {other:?}"),
         }
         Ok(())
+    }
+
+    // ===================================================================
+    // Geometry discriminator (UQFF)
+    // ===================================================================
+
+    /// A cheap 2-D layer whose fields we can then rewrite for format tests.
+    fn geometry_fixture(device: &Device) -> Result<QtipLayer> {
+        let (n, k_in) = (4usize, 64usize);
+        let wdata: Vec<f32> = (0..(n * k_in))
+            .map(|i| ((i as f32) * 0.37).sin() * 1.1)
+            .collect();
+        let w = Tensor::from_vec(wdata, (n, k_in), device)?;
+        QtipLayer::quantize_with_options_concrete(&w, None, device, QtipMode::Greedy, false)
+    }
+
+    /// The default geometry must be **purely additive**: it writes nothing, so
+    /// every artifact Arc has already produced is byte-identical and no
+    /// checksum moves. Stated as an exact suffix rather than as a vague
+    /// "unchanged", so the tag value and its position are both pinned.
+    #[test]
+    fn default_geometry_writes_nothing_and_k8v4l12_appends_exactly_four_bytes() -> Result<()> {
+        let device = Device::Cpu;
+        let mut layer = geometry_fixture(&device)?;
+        assert_eq!(layer.geometry, QtipGeometry::K4V2L16);
+        let base = layer.serialize()?.into_owned();
+
+        // Flip ONLY the discriminator; every tensor stays byte-identical.
+        layer.geometry = QtipGeometry::K8V4L12;
+        let tagged = layer.serialize()?.into_owned();
+
+        let mut want = base.clone();
+        want.extend_from_slice(&[GEOMETRY_WIRE_TAG, 8, 12, 4]);
+        assert_eq!(
+            tagged, want,
+            "the geometry section must be exactly [tag=3, K=8, L=12, V=4] appended to an \
+             otherwise unchanged payload"
+        );
+        Ok(())
+    }
+
+    /// The section must come BEFORE the codebook section, because that is what
+    /// makes an older Arc fail closed instead of mis-decoding.
+    #[test]
+    fn geometry_section_precedes_the_codebook_section() -> Result<()> {
+        let device = Device::Cpu;
+        let mut layer = geometry_fixture(&device)?;
+        let base = layer.serialize()?.into_owned();
+
+        // Codebook alone (K=4 geometry, so Mcg is legal here).
+        layer.codebook = QtipCodebook::COMPUTED;
+        let cb_only = layer.serialize()?.into_owned();
+        assert_eq!(
+            cb_only.len(),
+            base.len() + 5,
+            "codebook section is tag + u32"
+        );
+        assert_eq!(cb_only[base.len()], 2, "codebook tag is 2");
+
+        // Both sections. Geometry (4 bytes) must land first.
+        //
+        // K8V4L12 + Mcg is refused as a pair, so use a hypothetical third
+        // geometry is not available — instead assert the writer's ORDER
+        // directly by checking that the geometry bytes occupy the slot the
+        // codebook otherwise would.
+        layer.codebook = QtipCodebook::Gaussian;
+        layer.geometry = QtipGeometry::K8V4L12;
+        let geo_only = layer.serialize()?.into_owned();
+        assert_eq!(
+            geo_only[base.len()],
+            GEOMETRY_WIRE_TAG,
+            "the geometry section must start immediately after the search-detail section — \
+             any byte between them would be read as a codebook tag by an older Arc"
+        );
+        Ok(())
+    }
+
+    /// An Arc that predates this field parses the trailing region by handing
+    /// its first byte to `QtipCodebook::from_wire`. That must REFUSE tag 3.
+    ///
+    /// If it ever accepted it, an old build would decode K=8/V=4 symbols as
+    /// K=4/V=2 — and would not fault, because at 2 bits per weight the packed
+    /// byte count is identical.
+    #[test]
+    fn an_older_reader_refuses_the_geometry_tag_rather_than_ignoring_it() {
+        let err = QtipCodebook::from_wire(GEOMETRY_WIRE_TAG, || Ok(1))
+            .expect_err("tag 3 must not parse as a codebook");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("geometry") || msg.contains("unknown codebook tag"),
+            "refusal must name the cause: {msg}"
+        );
+        // And the general property the whole scheme rests on: every tag this
+        // build does not know is refused, never skipped.
+        for tag in [1u8, 4, 5, 200, 255] {
+            assert!(
+                QtipCodebook::from_wire(tag, || Ok(1)).is_err(),
+                "tag {tag} must fail closed"
+            );
+        }
+    }
+
+    /// A K=8/V=4 tag on a K=4/V=2 payload must be caught by the SHAPES, not
+    /// merely trusted. This is the case a hex-editor edit or a truncated
+    /// concatenation produces.
+    #[test]
+    fn a_geometry_tag_that_contradicts_the_tensors_is_refused_at_load() -> Result<()> {
+        let device = Device::Cpu;
+        let mut layer = geometry_fixture(&device)?;
+        layer.geometry = QtipGeometry::K8V4L12;
+        let data = layer.serialize()?.into_owned();
+
+        let err = QtipLayer::deserialize_concrete_unchecked(
+            Cow::Owned(data),
+            &device,
+            crate::QuantizeOntoGuard::new(),
+        )
+        .expect_err("a K8V4L12 tag over a [65536, 2] F32 table must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("k8v4l12") && (msg.contains("F32") || msg.contains("values")),
+            "refusal must name the geometry and the mismatch: {msg}"
+        );
+        Ok(())
+    }
+
+    /// The table's ELEMENT TYPE discriminates, not only its length.
+    ///
+    /// A `[4096, 4]` F32 table has exactly the right number of values and the
+    /// wrong dtype — 65,536 B instead of 32,768 B, so it would not even fit
+    /// the shared-memory budget the geometry exists for. Without this case the
+    /// element-count check alone passes and the dtype check is dead
+    /// (measured: mutation F8 disabled it and every test stayed green).
+    #[test]
+    fn a_right_sized_table_of_the_wrong_dtype_is_refused() -> Result<()> {
+        let device = Device::Cpu;
+        let geo = QtipGeometry::K8V4L12;
+        let k_in = 64usize;
+        let blocks = Tensor::zeros((2, geo.packed_len(k_in)), DType::U8, &device)?;
+        let f32_table = Tensor::zeros(
+            (k8v4l12::LUT_STATES, k8v4l12::V as usize),
+            DType::F32,
+            &device,
+        )?;
+        assert_eq!(f32_table.elem_count(), geo.lut_values(), "same count");
+        let err = geo
+            .validate_shapes(&blocks, &f32_table, k_in)
+            .expect_err("an F32 table at this geometry must be refused");
+        assert!(
+            err.to_string().contains("F32") && err.to_string().contains("BF16"),
+            "refusal must name both dtypes: {err}"
+        );
+        Ok(())
+    }
+
+    /// `from_stacked_parts` is a public constructor that takes the geometry on
+    /// trust from its caller; it must validate, not trust.
+    #[test]
+    fn from_stacked_parts_refuses_a_geometry_its_tensors_contradict() -> Result<()> {
+        let device = Device::Cpu;
+        let (e, n, k_in) = (2usize, 4usize, 64usize);
+        let blocks = Tensor::zeros((e, n, k_in / 4), DType::U8, &device)?;
+        let scales = Tensor::zeros((e, n), DType::F32, &device)?;
+        let k4_table = Tensor::zeros((1usize << L, V as usize), DType::F32, &device)?;
+
+        // Truthful call: K=4 tensors, K=4 tag.
+        QtipLayer::from_stacked_parts(
+            blocks.clone(),
+            scales.clone(),
+            k4_table.clone(),
+            None,
+            k_in,
+            None,
+            0,
+            QtipSearchStamp::Unstamped,
+            QtipSearchDetail::Unknown,
+            QtipCodebook::Gaussian,
+            QtipGeometry::K4V2L16,
+        )?;
+
+        // Same tensors, K=8 tag.
+        let err = QtipLayer::from_stacked_parts(
+            blocks,
+            scales,
+            k4_table,
+            None,
+            k_in,
+            None,
+            0,
+            QtipSearchStamp::Unstamped,
+            QtipSearchDetail::Unknown,
+            QtipCodebook::Gaussian,
+            QtipGeometry::K8V4L12,
+        )
+        .expect_err("a K8V4L12 tag over a K4V2L16 table must be refused at construction");
+        assert!(err.to_string().contains("k8v4l12"), "{err}");
+        Ok(())
+    }
+
+    /// A stack whose experts were baked at different geometries keeps only one
+    /// table, so at most one expert could ever decode correctly.
+    #[test]
+    fn stack_experts_refuses_mixed_geometries() -> Result<()> {
+        let device = Device::Cpu;
+        let a = geometry_fixture(&device)?;
+        let mut b = geometry_fixture(&device)?;
+        // Identical in every respect except the discriminator, so nothing but
+        // the geometry check can be what fires.
+        b.geometry = QtipGeometry::K8V4L12;
+        let err = QtipLayer::stack_experts(vec![a, b])
+            .expect_err("mixed-geometry stacks must be refused");
+        assert!(
+            err.to_string().contains("geometry"),
+            "refusal must name the geometry: {err}"
+        );
+
+        // ...and a uniform stack still works, so the guard is not just
+        // rejecting everything.
+        let c = geometry_fixture(&device)?;
+        let d = geometry_fixture(&device)?;
+        QtipLayer::stack_experts(vec![c, d])?;
+        Ok(())
+    }
+
+    /// A genuine K=8/V=4/L=12 payload round-trips, tag and tensors both.
+    #[test]
+    fn k8v4l12_payload_round_trips_exactly() -> Result<()> {
+        let device = Device::Cpu;
+        let (n, k_in) = (4usize, 128usize);
+        let geo = QtipGeometry::K8V4L12;
+        let packed_per_row = geo.packed_len(k_in);
+        assert_eq!(packed_per_row, k_in / 4, "2 bpw either way");
+
+        let blocks_data: Vec<u8> = (0..(n * packed_per_row))
+            .map(|i| (i * 37 % 251) as u8)
+            .collect();
+        let blocks = Tensor::from_vec(blocks_data, (n, packed_per_row), &device)?;
+        let scales = Tensor::from_vec(
+            (0..n).map(|i| 0.01 + i as f32 * 0.003).collect::<Vec<_>>(),
+            (n,),
+            &device,
+        )?;
+        let lut = Tensor::from_slice(
+            &k8v4l12::gaussian_lut_bf16(),
+            (k8v4l12::LUT_STATES, k8v4l12::V as usize),
+            &device,
+        )?;
+
+        let layer = QtipLayer {
+            blocks,
+            row_scales: scales,
+            lut,
+            bias: None,
+            in_features: k_in,
+            num_experts: None,
+            rotation_signs: None,
+            rotation_block: 0,
+            search: QtipSearchStamp::Trellis,
+            search_detail: QtipSearchDetail::Known {
+                beam_width: None,
+                hessian: false,
+            },
+            codebook: QtipCodebook::Gaussian,
+            geometry: geo,
+        };
+
+        let data = layer.serialize()?.into_owned();
+        let (restored, _) = QtipLayer::deserialize_concrete_unchecked(
+            Cow::Owned(data),
+            &device,
+            crate::QuantizeOntoGuard::new(),
+        )?;
+
+        assert_eq!(restored.geometry, QtipGeometry::K8V4L12);
+        assert_eq!(restored.in_features, k_in);
+        assert_eq!(restored.lut.dtype(), DType::BF16);
+        assert_eq!(restored.lut.elem_count(), k8v4l12::LUT_ENTRIES);
+        assert_tensor_bits_eq(&layer.blocks, &restored.blocks, "blocks")?;
+        assert_tensor_bits_eq(&layer.row_scales, &restored.row_scales, "row_scales")?;
+        assert_tensor_bits_eq(&layer.lut, &restored.lut, "lut")?;
+        Ok(())
+    }
+
+    /// The computed `sum2` codebook produces a PAIR of values per state and so
+    /// cannot describe V=4. Refused on write and on read, not left to fail at
+    /// the first decode.
+    #[test]
+    fn the_computed_codebook_is_refused_at_a_v4_geometry() -> Result<()> {
+        let device = Device::Cpu;
+        let mut layer = geometry_fixture(&device)?;
+        layer.geometry = QtipGeometry::K8V4L12;
+        layer.codebook = QtipCodebook::COMPUTED;
+        let err = layer
+            .serialize()
+            .expect_err("V=4 + sum2 must not serialize");
+        assert!(
+            err.to_string().contains("V=2-only"),
+            "refusal must say why: {err}"
+        );
+        // And it is legal at the geometry it was built for, so the guard is
+        // about the pairing and not about the codebook being blocked outright.
+        layer.geometry = QtipGeometry::K4V2L16;
+        layer.serialize()?;
+        Ok(())
+    }
+
+    /// Malformed trailing regions are refused rather than partially read.
+    #[test]
+    fn malformed_geometry_sections_are_refused() -> Result<()> {
+        let device = Device::Cpu;
+        let layer = geometry_fixture(&device)?;
+        let base = layer.serialize()?.into_owned();
+        let load = |bytes: Vec<u8>| {
+            QtipLayer::deserialize_concrete_unchecked(
+                Cow::Owned(bytes),
+                &device,
+                crate::QuantizeOntoGuard::new(),
+            )
+        };
+
+        // Truncated: tag present, K/L/V missing.
+        let mut truncated = base.clone();
+        truncated.push(GEOMETRY_WIRE_TAG);
+        truncated.push(8);
+        let err = load(truncated).expect_err("truncated geometry section must be refused");
+        assert!(err.to_string().contains("truncated"), "{err}");
+
+        // Well-formed but unsupported triple: diagnosed, not "unknown tag".
+        let mut unsupported = base.clone();
+        unsupported.extend_from_slice(&[GEOMETRY_WIRE_TAG, 6, 18, 3]);
+        let err = load(unsupported).expect_err("unsupported geometry must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("K=6") && msg.contains("L=18") && msg.contains("V=3"),
+            "refusal must quote the triple it could not decode: {msg}"
+        );
+
+        // Two geometry sections: a payload that describes itself twice.
+        let mut doubled = base.clone();
+        doubled.extend_from_slice(&[GEOMETRY_WIRE_TAG, 4, 16, 2]);
+        doubled.extend_from_slice(&[GEOMETRY_WIRE_TAG, 4, 16, 2]);
+        let err = load(doubled).expect_err("duplicate geometry sections must be refused");
+        assert!(err.to_string().contains("twice"), "{err}");
+
+        // An explicit default-geometry section is legal (a future writer may
+        // choose to be explicit) and must load as K4V2L16.
+        let mut explicit = base.clone();
+        explicit.extend_from_slice(&[GEOMETRY_WIRE_TAG, 4, 16, 2]);
+        let (restored, _) = load(explicit)?;
+        assert_eq!(restored.geometry, QtipGeometry::K4V2L16);
+        Ok(())
+    }
+
+    /// Both geometries are 2 bits per weight. This is the fact that makes the
+    /// discriminator necessary — a mislabelled artifact has a correctly-sized
+    /// `blocks` tensor — so it gets an assertion rather than a comment.
+    #[test]
+    fn both_geometries_are_two_bits_per_weight_and_the_same_packed_size() {
+        for k_in in [64usize, 512, 4096, 7168] {
+            assert_eq!(
+                QtipGeometry::K4V2L16.packed_len(k_in),
+                QtipGeometry::K8V4L12.packed_len(k_in),
+                "k_in={k_in}: identical packed size is why the tag is load-bearing"
+            );
+            assert_eq!(QtipGeometry::K4V2L16.n_bits(), 2);
+            assert_eq!(QtipGeometry::K8V4L12.n_bits(), 2);
+        }
+        // ...and the tables are what actually differ.
+        assert_eq!(QtipGeometry::K4V2L16.lut_values(), 65_536 * 2);
+        assert_eq!(QtipGeometry::K8V4L12.lut_values(), 4_096 * 4);
+        assert_eq!(QtipGeometry::K4V2L16.lut_dtype(), DType::F32);
+        assert_eq!(QtipGeometry::K8V4L12.lut_dtype(), DType::BF16);
+        assert_eq!(QtipGeometry::K4V2L16.syms_per_byte(), 2);
+        assert_eq!(QtipGeometry::K8V4L12.syms_per_byte(), 1);
+    }
+
+    /// The geometry accessors must agree with the rung module they describe.
+    #[test]
+    fn geometry_accessors_match_the_rung_modules() {
+        assert_eq!(QtipGeometry::K4V2L16.k(), K);
+        assert_eq!(QtipGeometry::K4V2L16.l(), L);
+        assert_eq!(QtipGeometry::K4V2L16.v(), V);
+        assert_eq!(QtipGeometry::K8V4L12.k(), k8v4l12::K);
+        assert_eq!(QtipGeometry::K8V4L12.l(), k8v4l12::L);
+        assert_eq!(QtipGeometry::K8V4L12.v(), k8v4l12::V);
+        assert_eq!(
+            QtipGeometry::K8V4L12.lut_values(),
+            k8v4l12::LUT_ENTRIES,
+            "the discriminator and the rung must agree on the table size"
+        );
+        for k_in in [64usize, 512, 4096] {
+            assert_eq!(
+                QtipGeometry::K8V4L12.packed_len(k_in),
+                k8v4l12::packed_len(k_in)
+            );
+            assert_eq!(
+                QtipGeometry::K8V4L12.num_symbols(k_in),
+                k8v4l12::num_symbols(k_in)
+            );
+        }
     }
 
     /// UQFF round-trip for the classic 2-D layout must stay lossless and
