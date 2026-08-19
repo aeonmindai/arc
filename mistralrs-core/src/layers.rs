@@ -2328,6 +2328,51 @@ pub fn compress_positions(t_c: usize, ratio: usize, device: &Device) -> Result<T
     })
 }
 
+// Cached `[0.0, 1.0, 2.0, …]` F32 ramps, one per device. Serves every absolute
+// position vector the V4 attention masks need. See `positions_f32`.
+std::thread_local! {
+    static IOTA_F32: std::cell::RefCell<Vec<Tensor>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Smallest ramp worth allocating: 32 KB of F32. Large enough that a typical
+/// run allocates once, at warmup, and never again — which is the point, since a
+/// rebuild *during* capture is the bug this exists to avoid.
+const IOTA_MIN_LEN: usize = 8192;
+
+/// `[len]` F32 tensor holding `[start, start+1, …, start+len-1]`, served as a
+/// view into a cached device ramp.
+///
+/// Replaces `Tensor::arange(start, start+len, dev)?.to_dtype(F32)` on the V4
+/// attention mask path. `arange` is a host→device copy, and inside CUDA-graph
+/// capture it is worse than slow: the recorded `cuMemcpyHtoDAsync` keeps the
+/// HOST pointer of a `Vec` that is freed the moment the expression returns, so
+/// every launch and replay fills the tensor from freed memory. See
+/// [`compress_positions`] for the full mechanism and the crash it produced.
+///
+/// The ramp grows by powers of two so rebuilds are rare and land during warmup.
+pub fn positions_f32(start: usize, len: usize, device: &Device) -> Result<Tensor> {
+    let end = start + len;
+    IOTA_F32.with(|c| {
+        let mut cache = c.borrow_mut();
+        let hit = cache
+            .iter()
+            .position(|t| t.device().same_device(device) && t.dim(0).unwrap_or(0) >= end);
+        let idx = match hit {
+            Some(i) => i,
+            None => {
+                cache.retain(|t| !t.device().same_device(device));
+                let cap = end.max(IOTA_MIN_LEN).next_power_of_two();
+                // The one `arange` — deliberately here and not in the forward.
+                let ramp = Tensor::arange(0u32, cap as u32, device)?.to_dtype(DType::F32)?;
+                cache.push(ramp);
+                cache.len() - 1
+            }
+        };
+        cache[idx].narrow(0, start, len)
+    })
+}
+
 /// Thread-local GPU positions tensor for CUDA graph mode.
 /// When set, `RotaryEmbedding::forward()` uses GPU-side gather instead of
 /// CPU-side `narrow()`, making the forward pass graph-capture compatible.
@@ -3644,6 +3689,38 @@ mod compress_positions_tests {
     #[test]
     fn zero_ratio_is_refused() {
         assert!(compress_positions(4, 0, &Device::Cpu).is_err());
+    }
+
+    /// `positions_f32` replaced `arange(start, start+len).to_f32()` at three
+    /// V4 attention-mask sites. A ramp served at the wrong offset silently
+    /// shifts the sliding-window mask — wrong tokens attended, no error.
+    #[test]
+    fn positions_f32_matches_the_arange_expression_it_replaced() -> Result<()> {
+        let dev = Device::Cpu;
+        for (start, len) in [(0usize, 1usize), (0, 7), (5, 1), (13, 128), (1000, 64)] {
+            let want = Tensor::arange(start as u32, (start + len) as u32, &dev)?
+                .to_dtype(DType::F32)?
+                .to_vec1::<f32>()?;
+            let got = positions_f32(start, len, &dev)?.to_vec1::<f32>()?;
+            assert_eq!(got, want, "start={start} len={len}");
+        }
+        Ok(())
+    }
+
+    /// The ramp must survive growth past its initial capacity, and a view of it
+    /// must still reshape (the three call sites all reshape immediately).
+    #[test]
+    fn positions_f32_grows_and_its_views_reshape() -> Result<()> {
+        let dev = Device::Cpu;
+        let short = positions_f32(0, 4, &dev)?;
+        assert_eq!(short.reshape((1, 4))?.dims(), &[1, 4]);
+        let past_min = IOTA_MIN_LEN + 3;
+        let long = positions_f32(past_min, 2, &dev)?;
+        assert_eq!(long.to_vec1::<f32>()?, vec![past_min as f32, past_min as f32 + 1.0]);
+        assert_eq!(long.reshape((2, 1))?.dims(), &[2, 1]);
+        // One ramp per device, not one per request.
+        assert_eq!(IOTA_F32.with(|c| c.borrow().len()), 1);
+        Ok(())
     }
 }
 
