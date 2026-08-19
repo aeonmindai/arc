@@ -142,7 +142,17 @@ it: ArcKV/Share.**
 | ArcMoE/TD | **TD-MoE** Tucker decomposition of stacked experts, installed as a post-ISQ hook | `arc-engine/src/td_moe.rs`, `td_moe_loader.rs`, `mistralrs-quant/src/td_moe_factored/` |
 | ArcMoE/Sparse | dReLU activation sparsity stats — Tier A | `arc-engine/src/turbo_sparse.rs` |
 | ArcMoE/AnyMoE | training-time MoE adapters over a dense model — orthogonal to serving | `mistralrs-core/src/amoe/` |
-| ArcMoE/EP ⚠️ | **ON MASTER since PR #89 merged** (`610c4506b`; feature commit `fce33ae22`) — stage 0 + stage 1, EP=2. `Moe::new` calls `build_expert_parallel_plan` (`deepseek4.rs:2211`, called at `:2284`) → `MoEExperts::new_expert_parallel` (`:2292`). **Dark by default: env-gated only, with NO CLI or server flag** — `ARC_EP_SIZE` (`deepseek4.rs:372`) and `ARC_EP_PLACEMENT=balanced` (`:2168`) are the only doors, and `effective_ep_size() <= 1` returns `ExpertParallelPlan::single`, so a default run never shards. `ep_size != comm.world_size()` is an error, not a degrade (`:2222`) | `mistralrs-core/src/moe/expert_parallel.rs` (847 lines), `mistralrs-core/src/models/deepseek4.rs`, `mistralrs-quant/src/distributed/` |
+| ArcMoE/EP ⚠️ | **ON MASTER since PR #89 merged** (`610c4506b`; feature commit `fce33ae22`) — stage 0 + stage 1, EP=2. `Moe::new` calls `build_expert_parallel_plan` (`deepseek4.rs:2227`, called at `:2300`) → `MoEExperts::new_expert_parallel` (`:2308`). **TWO doors, both real; neither is the CLI.** (1) **`ep_size` is a deserialized `config.json` field** — `#[serde(default = "default_ep_size")]` at `:317-318`, default `1` at `:140` — so a checkpoint whose `config.json` carries `ep_size: 2` shards with **no environment variable set**. (2) **`ARC_EP_SIZE` overrides that field at run time** — `effective_ep_size()` at `:371-375` reads the env var first and falls back to the config field, and `ARC_EP_PLACEMENT=balanced` (`:2184`) picks the placement. **What is missing is a CLI/server flag** (`grep -rn 'ep_size\|expert_parallel' mistralrs-cli/ mistralrs-server-core/` → nothing), **not a config door.** Dark by default only because the published V4-Flash `config.json` carries `ep_size: 1` and `effective_ep_size() <= 1` returns `ExpertParallelPlan::single` (`:2236`). `ep_size != comm.world_size()` is an error, not a degrade (`:2238-2242`) | `mistralrs-core/src/moe/expert_parallel.rs` (847 lines), `mistralrs-core/src/models/deepseek4.rs`, `mistralrs-quant/src/distributed/` |
+
+> ⚠️ **This row has now been wrong in BOTH directions — do not restore either.**
+> *"NOT ON MASTER"* was stale by a merge (fixed in #140). #140 then replaced it
+> with *"env-gated only … `ARC_EP_SIZE` … the only door"*, which its own cited
+> file contradicts three lines away: `ep_size` is a serde field (`:317`) that
+> `effective_ep_size` falls back to (`:374`). **Both doors exist.** Before
+> marking a subsystem 🔵 or writing "env-only", (a) `git merge-base
+> --is-ancestor` the PR's merge commit, and (b) read the struct, not just the
+> `std::env::var` call — an env var that *overrides* a config field is not the
+> only way in.
 
 ### 2.6 ArcGraph — GPU-autonomous decode
 
