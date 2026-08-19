@@ -10,9 +10,21 @@
 // 2 bits/weight:
 //
 //     K=4 / V=2 / L=16   the shipped LUT rung ("qtip2")
-//     K=8 / V=4 / L=12   the same rate, 3.46x fewer decode instructions per
-//                        weight (4.375 vs 15.125), because one symbol now
-//                        carries four weights instead of two
+//     K=8 / V=4 / L=12   the same rate at materially fewer decode instructions
+//                        per weight, because one symbol now carries four
+//                        weights instead of two
+//
+// ⚠ The ABSOLUTE inst/weight figures this header used to quote (4.375 vs
+// 15.125, "3.46x") are SUSPENDED and deliberately not restated. They came from
+// the SASS census's differential-over-unroll-depth method, whose K=8 replay
+// control failed to reproduce: `#pragma unroll` is a HINT, nvcc re-rolled the
+// loops, all three unroll depths returned identical counts, and the linearity
+// guard reads |d2-d1|/d1 — which is 0.00% precisely when all three are equal.
+// The guard passed hardest when the rig was most broken. What survives from
+// that census is the clamp DELTA (+1.126 at K=9, +1.125 at K=10), because a
+// difference between two kernels in the same mode cancels the re-rolling. The
+// direction "one symbol carries four weights, so fewer instructions per weight"
+// is structural and does not depend on the census; the ratio does.
 //
 // and raising K at fixed V=4/L=12 is the ONLY way to buy quality on this
 // family, because `bpw = K/V`:
@@ -125,9 +137,10 @@ struct QtipGeom {
     static_assert(V_ >= 1, "V is the reproduction-vector dimension");
 };
 
-// The shipped LUT rung. 2 bits/weight, 15.125 decode instructions/weight.
+// The shipped LUT rung. 2 bits/weight. (Its inst/weight absolute is suspended
+// with the rest of the census — see the header.)
 using QtipGeomK4V2L16 = QtipGeom<4, 2, 16>;
-// Same 2 bits/weight at 4.375 decode instructions/weight (3.46x fewer).
+// Same 2 bits/weight, fewer decode instructions per weight (absolute suspended).
 using QtipGeomK8V4L12 = QtipGeom<8, 4, 12>;
 // 2.25 bits/weight on the same table and the same decode shape. The rung the
 // quality sweep actually selected; K=8/V=4/L=12 is closed.

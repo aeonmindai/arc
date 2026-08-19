@@ -402,16 +402,46 @@ pub(crate) const fn packed_bytes_per_row(num_symbols: usize, k: u32) -> usize {
     (num_symbols * k as usize).div_ceil(8)
 }
 
-/// Does a row of `num_symbols` symbols at `k` bits occupy a whole number of
-/// bytes?
+/// Is a row of `num_symbols` symbols at `k` bits a whole number of bytes AND a
+/// multiple of 4 bytes?
 ///
-/// At K=4 this is exactly the shipped "num_symbols must be even" rule. It is
-/// kept at every rung because a partial trailing byte is a row stride the two
-/// sides can disagree about for free, and every real V4-Flash / Qwen expert
-/// shape satisfies it (`in_features` 7168 and 2048 give `num_symbols` 1792 and
-/// 512 at V=4, both multiples of 8). Refuse, never round.
+/// Whole bytes (`n*k % 8 == 0`) is, at K=4, exactly the shipped "num_symbols
+/// must be even" rule.
+///
+/// **The 4-byte part is what stops an out-of-bounds READ.** The serving side
+/// pads the packed row stride to 4 bytes and has deleted its tail clamp, so a
+/// decoder now reads a row as 4-byte units. `ceil(n*k/8)` — what
+/// [`packed_bytes_per_row`] returns, and what `Rung::packed_bytes` returned
+/// before the padding landed — is NOT a multiple of 4 in general: at K=9 it is
+/// `9*(n/8)`, which needs `n % 32 == 0`, not `n % 8 == 0`.
+///
+/// Refusing the misaligned shapes rather than padding them is deliberate. Where
+/// the bake is allowed to run, padded stride and unpadded stride are the SAME
+/// number, so the encoder cannot disagree with the decoder no matter which of
+/// the two definitions the serving side is on. Adopting the padding instead
+/// would mean guessing a layout owned by another change — and a wrong guess
+/// here is an OOB read, not a slow path.
+///
+/// **The 4-byte rule applies ONLY to the straddling rungs (`K % 8 != 0`).**
+/// K=4 and K=8 keep exactly the acceptance they ship with — tightening the
+/// rung that baked the published artifact, to protect a rung that does not
+/// exist yet, would be a regression traded for a hypothetical. Their strides
+/// are `n/2` and `n`, which the caller's own shapes already align.
+///
+/// Every real V4-Flash expert shape passes: `in_features` 7168 and 2048 give
+/// `num_symbols` 1792 and 512 at V=4, i.e. 2016 B and 576 B at K=9, both
+/// already 4-byte aligned. Refuse, never round.
 pub(crate) const fn packed_row_is_whole_bytes(num_symbols: usize, k: u32) -> bool {
-    (num_symbols * k as usize).is_multiple_of(8)
+    let bits = num_symbols * k as usize;
+    if !bits.is_multiple_of(8) {
+        return false;
+    }
+    if (8 % k as usize) == 0 {
+        // K divides 8: the shipped acceptance, unchanged.
+        return true;
+    }
+    // Straddling rung: the stride must also be a multiple of 4 bytes.
+    bits.is_multiple_of(32)
 }
 
 // The general formula must reproduce the shipped K=4 nibble packing and the
@@ -4445,15 +4475,37 @@ mod tests {
         }
     }
 
-    /// A partial trailing byte is refused, not rounded — at every rung.
+    /// A partial trailing byte is refused, not rounded — at every rung — and a
+    /// K=9 row that is not a multiple of 4 bytes is refused too.
+    ///
+    /// The serving side pads the packed row stride to 4 bytes and has deleted
+    /// its tail clamp, so a decoder reads a row in 4-byte units. `ceil(n*K/8)`
+    /// is `9*(n/8)` at K=9, which is a multiple of 4 only when `n % 32 == 0` —
+    /// so "whole bytes" alone would let the encoder emit a stride the decoder
+    /// reads past the end of. Refusing means padded and unpadded stride are the
+    /// same number wherever the bake runs, so the two sides cannot disagree.
     #[test]
-    fn a_row_that_is_not_whole_bytes_is_rejected() {
+    fn a_row_that_is_not_whole_bytes_or_not_4_byte_aligned_is_rejected() {
+        // The real V4-Flash expert shapes: 2016 B and 576 B, both 4-aligned.
         assert!(packed_row_is_whole_bytes(1792, 9));
         assert!(packed_row_is_whole_bytes(512, 9));
+        assert_eq!(packed_bytes_per_row(1792, 9) % 4, 0);
+        assert_eq!(packed_bytes_per_row(512, 9) % 4, 0);
+        // Not whole bytes.
         assert!(!packed_row_is_whole_bytes(1793, 9));
-        // K=4's rule was "num_symbols must be even"; this must still be it.
+        // Whole bytes (n % 8 == 0) but NOT a multiple of 4 bytes: 8*9/8 = 9 B.
+        // This is the case a whole-bytes-only rule would have let through.
+        assert!(packed_bytes_per_row(8, 9) % 4 != 0);
+        assert!(!packed_row_is_whole_bytes(8, 9));
+        assert!(!packed_row_is_whole_bytes(24, 9));
+        assert!(packed_row_is_whole_bytes(32, 9));
+
+        // K=4 and K=8 divide 8, so they keep EXACTLY the acceptance they ship
+        // with. Tightening them here would refuse rows the published bake
+        // accepts.
         for n in 0..64usize {
             assert_eq!(packed_row_is_whole_bytes(n, 4), n.is_multiple_of(2));
+            assert!(packed_row_is_whole_bytes(n, 8));
         }
     }
 

@@ -10,8 +10,11 @@
 // ---------------------------------------------------
 // Three rungs are compiled:
 //
-//     K=4 / V=2 / L=16   2.00 bpw, the shipped rung; 15.125 decode inst/weight
-//     K=8 / V=4 / L=12   2.00 bpw at 4.375 decode inst/weight
+//     K=4 / V=2 / L=16   2.00 bpw, the shipped rung
+//     K=8 / V=4 / L=12   2.00 bpw, fewer decode instructions per weight
+//                        (the ABSOLUTE inst/weight figures are SUSPENDED —
+//                        see qtip_geom.cuh; the census's unroll-differential
+//                        method did not reproduce its own K=8 control)
 //     K=9 / V=4 / L=12   2.25 bpw — THE BAKE TARGET. K=8/V=4/L=12 is
 //                        quality-CLOSED and K=9 is not; the sweep, its six
 //                        codebook designs and the Dw_cos figures are recorded
