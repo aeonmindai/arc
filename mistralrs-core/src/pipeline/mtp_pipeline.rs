@@ -923,6 +923,22 @@ fn split_draft_cache(batched: &KvCache, g: usize) -> Option<Vec<KvCache>> {
 /// output.
 const ACCEPTANCE_LOG_EVERY_PROPOSED: usize = 64;
 
+/// How many draft-chain positions the per-position acceptance breakdown keeps
+/// separate buckets for.
+///
+/// The chain is linear (`topk == 1`), so position `j` is the `j`-th token of the
+/// draft chain and the useful depth is small: DeepSeek V4 ships 1-3 MTP layers
+/// and SGLang's own shipped config for every DeepSeek arch is `(3, 1, 4)`
+/// (`server_args.py:7611-7627`). Eight buckets is well past anything a real
+/// checkpoint can drive, and it keeps [`MtpAcceptance`] `Copy` — which is what
+/// lets the whole struct live in a `BTreeMap` value and be folded with `add`.
+///
+/// A step that proposes MORE than this many drafts still accounts correctly in
+/// every aggregate field; only its positions `>= 8` go unbucketed, and
+/// [`MtpAcceptance::positions_over_cap`] counts those steps so the reader can
+/// tell rather than having to trust the arithmetic.
+pub const MTP_MAX_TRACKED_POSITIONS: usize = 8;
+
 /// Parse the `ARC_MTP_LOG_ACCEPTANCE` gate. **Default ON.**
 ///
 /// Off-by-default was how three GPU sessions measured MTP acceptance and came
@@ -993,6 +1009,68 @@ pub struct MtpAcceptance {
     /// At B=1 they are equal, which is exactly why a B=1 measurement cannot
     /// tell you whether MTP lifts a batched row (DOCTRINE D2).
     pub batch_steps: usize,
+    /// Per draft-chain position: how many times position `j` was **reached** —
+    /// the step proposed at least `j + 1` drafts *and* every earlier position
+    /// was accepted.
+    ///
+    /// This is the denominator the aggregate [`Self::rate`] does not have. In a
+    /// linear chain (`topk == 1`, which is what DeepSeek MTP is) position `j` is
+    /// only ever evaluated when the chain survived to it, so dividing
+    /// `accepted_at[j]` by `proposed` — or by the step count — answers no
+    /// question. `accepted_at[j] / reached_at[j]` is the per-position
+    /// conditional acceptance `p_j`, the `p` in `E[accepted] = Σ pʲ`.
+    pub reached_at: [usize; MTP_MAX_TRACKED_POSITIONS],
+    /// Per draft-chain position: how many of the [`Self::reached_at`]
+    /// evaluations at position `j` the verifier accepted.
+    ///
+    /// **This is the field the scalar [`Self::accepted`] could not answer.**
+    /// `Σ accepted_at == accepted` (exactly, whenever
+    /// [`Self::positions_over_cap`] is 0), so it is a refinement and not a
+    /// second, competing count. Reference shape: vLLM's
+    /// `vllm:spec_decode_num_accepted_tokens_per_pos`
+    /// (`v1/spec_decode/metrics.py:255`).
+    pub accepted_at: [usize; MTP_MAX_TRACKED_POSITIONS],
+    /// Steps that proposed more than [`MTP_MAX_TRACKED_POSITIONS`] drafts, and
+    /// whose positions beyond the cap therefore landed in no bucket.
+    ///
+    /// Zero for every depth a real checkpoint can drive. Carried anyway because
+    /// the `Σ accepted_at == accepted` invariant is what makes the breakdown
+    /// auditable, and an invariant with a silent exception is not one.
+    pub positions_over_cap: usize,
+}
+
+/// Fill the per-position tallies for one step.
+///
+/// `n_proposed` drafts went out, positions `0..reached` were evaluated, and
+/// positions `0..n_accepted` came back accepted. `reached` is `n_accepted`
+/// plus one when the chain was cut short by a rejection, and `n_accepted`
+/// exactly when it ran to the end of the proposal (nothing was evaluated past
+/// the last draft).
+fn position_tallies(
+    n_proposed: usize,
+    n_accepted: usize,
+    reached: usize,
+) -> (
+    [usize; MTP_MAX_TRACKED_POSITIONS],
+    [usize; MTP_MAX_TRACKED_POSITIONS],
+    usize,
+) {
+    let mut reached_at = [0usize; MTP_MAX_TRACKED_POSITIONS];
+    let mut accepted_at = [0usize; MTP_MAX_TRACKED_POSITIONS];
+    for slot in reached_at
+        .iter_mut()
+        .take(reached.min(MTP_MAX_TRACKED_POSITIONS))
+    {
+        *slot = 1;
+    }
+    for slot in accepted_at
+        .iter_mut()
+        .take(n_accepted.min(MTP_MAX_TRACKED_POSITIONS))
+    {
+        *slot = 1;
+    }
+    let over_cap = usize::from(n_proposed > MTP_MAX_TRACKED_POSITIONS);
+    (reached_at, accepted_at, over_cap)
 }
 
 impl MtpAcceptance {
@@ -1006,13 +1084,25 @@ impl MtpAcceptance {
     /// and "what we emitted" is precisely how a speculative decoder comes to
     /// report a multiplier it never delivered.
     pub fn from_verify(n_proposed: usize, result: &VerifyResult) -> Self {
+        let n_accepted = result.accepted.len();
+        // The verifier evaluated exactly the accepted prefix plus, if it
+        // rejected, the one position it rejected at. Taking it from `result`
+        // rather than from `n_proposed` is what keeps a short `target` slice
+        // (fewer target tokens than proposals) from being counted as a
+        // rejection at a position nothing ever looked at.
+        let reached = n_accepted + usize::from(result.rejection.is_some());
+        let (reached_at, accepted_at, positions_over_cap) =
+            position_tallies(n_proposed, n_accepted, reached);
         Self {
-            accepted: result.accepted.len(),
+            accepted: n_accepted,
             proposed: n_proposed,
             steps: 1,
             drafted_steps: usize::from(n_proposed > 0),
             committed: 1 + result.commit_len(),
             batch_steps: 0,
+            reached_at,
+            accepted_at,
+            positions_over_cap,
         }
     }
 
@@ -1023,7 +1113,24 @@ impl MtpAcceptance {
     /// Distinct from [`Self::from_verify`], which describes the two-forward
     /// shape: there `committed = 1 + commit_len` because `T0` came out of a
     /// *separate* target forward that this shape no longer runs.
+    ///
+    /// The per-position tallies are derived from the same two counts, so they
+    /// agree with the aggregate by construction: positions `0..n_accepted` were
+    /// accepted, and position `n_accepted` was reached-and-rejected whenever the
+    /// chain did not run to its end. That attribution also absorbs the
+    /// **length-budget clamp** at the call site (a chain truncated because the
+    /// sequence is `max_seq_len`-bound arrives here with a smaller
+    /// `n_accepted`): the clamped position is booked as a rejection, exactly as
+    /// the aggregate `accepted` books it, so `Σ accepted_at == accepted` still
+    /// holds and the two numbers can never tell different stories.
     pub fn from_fused_verify(n_proposed: usize, n_accepted: usize) -> Self {
+        let reached = if n_proposed == 0 {
+            0
+        } else {
+            (n_accepted + 1).min(n_proposed)
+        };
+        let (reached_at, accepted_at, positions_over_cap) =
+            position_tallies(n_proposed, n_accepted, reached);
         Self {
             accepted: n_accepted,
             proposed: n_proposed,
@@ -1031,6 +1138,9 @@ impl MtpAcceptance {
             drafted_steps: usize::from(n_proposed > 0),
             committed: 1 + n_accepted,
             batch_steps: 0,
+            reached_at,
+            accepted_at,
+            positions_over_cap,
         }
     }
 
@@ -1044,6 +1154,12 @@ impl MtpAcceptance {
             drafted_steps: 0,
             committed: 1,
             batch_steps: 0,
+            // No position was reached, so no position's denominator moves. This
+            // is the whole reason `reached_at` exists rather than a step count:
+            // a run that mostly declines to draft must not dilute `p_j`.
+            reached_at: [0; MTP_MAX_TRACKED_POSITIONS],
+            accepted_at: [0; MTP_MAX_TRACKED_POSITIONS],
+            positions_over_cap: 0,
         }
     }
 
@@ -1081,17 +1197,84 @@ impl MtpAcceptance {
         (self.batch_steps > 0).then(|| self.steps as f64 / self.batch_steps as f64)
     }
 
+    /// How many draft-chain positions this snapshot ever reached — the length
+    /// of the useful prefix of [`Self::reached_at`] / [`Self::accepted_at`].
+    ///
+    /// Zero when nothing was ever drafted.
+    pub fn tracked_extent(&self) -> usize {
+        self.reached_at
+            .iter()
+            .rposition(|&n| n > 0)
+            .map_or(0, |i| i + 1)
+    }
+
+    /// Per-position conditional acceptance `p_j = accepted_at[j] /
+    /// reached_at[j]`, one entry per position actually reached.
+    ///
+    /// **This is the number the aggregate rate cannot give you.** With the
+    /// chain's `E[accepted] = Σ_{i=1..depth} pⁱ`, a flat profile
+    /// (`p₀ ≈ p₁ ≈ …`) and a falling one (`p₀ ≫ p₁`) produce the same aggregate
+    /// `accept_rate` while meaning opposite things: flat is a target/draft
+    /// **distribution mismatch** at every position, falling is the draft
+    /// **compounding on its own hidden state** down the chain — and only the
+    /// second is a fix in the chain-feedback code.
+    #[allow(clippy::cast_precision_loss)] // counts; >2^53 tokens is not a case
+    pub fn per_position_rates(&self) -> Vec<f64> {
+        (0..self.tracked_extent())
+            .map(|j| self.accepted_at[j] as f64 / self.reached_at[j] as f64)
+            .collect()
+    }
+
+    /// The per-position fields as `(position, accepted, reached, p)` rows,
+    /// truncated to [`Self::tracked_extent`]. Empty when nothing was drafted.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn position_rows(&self) -> Vec<(usize, usize, usize, f64)> {
+        (0..self.tracked_extent())
+            .map(|j| {
+                (
+                    j,
+                    self.accepted_at[j],
+                    self.reached_at[j],
+                    self.accepted_at[j] as f64 / self.reached_at[j] as f64,
+                )
+            })
+            .collect()
+    }
+
     /// The machine-greppable one-liner, in the project's marker convention
     /// (`SPEED[...]`, `BATCH[...]`, `GSM8K[...]`).
     ///
     /// `scope` is `agg` for the process total or `req=<id>` for one request.
     /// Every raw count is on the line, so both ratios are auditable without
     /// trusting the formatter.
+    /// The per-position fields are **appended** to the existing key=value tail,
+    /// never substituted into it: the aggregate/`by-batch` separation the
+    /// runbooks already grep for (`accept_rate`, `tok_per_step`,
+    /// `drafted_steps`, `batch_steps`) is unchanged, so
+    /// `GPU_SESSION_RUNBOOK_8.md`'s expected output still parses.
     pub fn marker(&self, scope: &str) -> String {
         let fmt = |v: Option<f64>| v.map_or_else(|| "n/a".to_string(), |x| format!("{x:.4}"));
+        let list = |v: &[usize]| {
+            if v.is_empty() {
+                "n/a".to_string()
+            } else {
+                v.iter().map(usize::to_string).collect::<Vec<_>>().join(",")
+            }
+        };
+        let extent = self.tracked_extent();
+        let p_pos = if extent == 0 {
+            "n/a".to_string()
+        } else {
+            self.per_position_rates()
+                .iter()
+                .map(|p| format!("{p:.4}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         format!(
             "MTP[{scope}] accept_rate={} accepted={} proposed={} steps={} drafted_steps={} \
-             committed={} tok_per_step={} batch_steps={} mean_batch={} tok_per_batch_step={}",
+             committed={} tok_per_step={} batch_steps={} mean_batch={} tok_per_batch_step={} \
+             p_pos={} accepted_pos={} reached_pos={} pos_over_cap={}",
             fmt(self.rate()),
             self.accepted,
             self.proposed,
@@ -1102,7 +1285,45 @@ impl MtpAcceptance {
             self.batch_steps,
             fmt(self.mean_batch()),
             fmt(self.tokens_per_batch_step()),
+            p_pos,
+            list(&self.accepted_at[..extent]),
+            list(&self.reached_at[..extent]),
+            self.positions_over_cap,
         )
+    }
+
+    /// The per-position breakdown as human-readable lines, with the reading
+    /// instructions attached.
+    ///
+    /// Empty when nothing was drafted — the honest answer to "what is `p₁`" on a
+    /// run that never drafted is nothing, not `0.0`.
+    pub fn position_report_lines(&self) -> Vec<String> {
+        let rows = self.position_rows();
+        if rows.is_empty() {
+            return Vec::new();
+        }
+        let mut out = vec![
+            "MTP per-position acceptance (p_j = accepted at chain position j / times \
+             position j was reached):"
+                .to_string(),
+        ];
+        for (j, acc, reached, p) in rows {
+            out.push(format!("  pos {j}: p={p:.4} ({acc}/{reached})"));
+        }
+        out.push(
+            "  reading: flat p_j across positions => target/draft distribution mismatch; \
+             p_0 >> p_1 => the draft compounding on its own hidden state (a fix in the chain \
+             feedback). E[accepted] = sum_i p^i."
+                .to_string(),
+        );
+        if self.positions_over_cap > 0 {
+            out.push(format!(
+                "  WARN: {} step(s) proposed more than {} drafts; positions beyond the cap are \
+                 counted in the aggregate but not broken out here",
+                self.positions_over_cap, MTP_MAX_TRACKED_POSITIONS,
+            ));
+        }
+        out
     }
 
     /// The human-readable line the runbooks already grep for
@@ -1128,6 +1349,11 @@ impl MtpAcceptance {
         self.drafted_steps += other.drafted_steps;
         self.committed += other.committed;
         self.batch_steps += other.batch_steps;
+        for j in 0..MTP_MAX_TRACKED_POSITIONS {
+            self.reached_at[j] += other.reached_at[j];
+            self.accepted_at[j] += other.accepted_at[j];
+        }
+        self.positions_over_cap += other.positions_over_cap;
     }
 }
 
@@ -1147,6 +1373,13 @@ pub(crate) struct AcceptanceTelemetry {
     drafted_steps: AtomicUsize,
     committed: AtomicUsize,
     batch_steps: AtomicUsize,
+    /// Per draft-chain position, mirroring [`MtpAcceptance::reached_at`] /
+    /// [`MtpAcceptance::accepted_at`]. Plain relaxed counters like every other
+    /// field here: the accept/reject site is the only writer and a reader wants
+    /// the running total, not a consistent cut across positions.
+    reached_at: [AtomicUsize; MTP_MAX_TRACKED_POSITIONS],
+    accepted_at: [AtomicUsize; MTP_MAX_TRACKED_POSITIONS],
+    positions_over_cap: AtomicUsize,
     /// The same counters again, split by the batch size of the engine step
     /// that produced them.
     ///
@@ -1168,12 +1401,21 @@ impl AcceptanceTelemetry {
             drafted_steps: AtomicUsize::new(0),
             committed: AtomicUsize::new(0),
             batch_steps: AtomicUsize::new(0),
+            reached_at: [const { AtomicUsize::new(0) }; MTP_MAX_TRACKED_POSITIONS],
+            accepted_at: [const { AtomicUsize::new(0) }; MTP_MAX_TRACKED_POSITIONS],
+            positions_over_cap: AtomicUsize::new(0),
             by_batch: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
     /// Everything counted so far.
     fn snapshot(&self) -> MtpAcceptance {
+        let mut reached_at = [0usize; MTP_MAX_TRACKED_POSITIONS];
+        let mut accepted_at = [0usize; MTP_MAX_TRACKED_POSITIONS];
+        for j in 0..MTP_MAX_TRACKED_POSITIONS {
+            reached_at[j] = self.reached_at[j].load(Ordering::Relaxed);
+            accepted_at[j] = self.accepted_at[j].load(Ordering::Relaxed);
+        }
         MtpAcceptance {
             accepted: self.accepted.load(Ordering::Relaxed),
             proposed: self.proposed.load(Ordering::Relaxed),
@@ -1181,6 +1423,9 @@ impl AcceptanceTelemetry {
             drafted_steps: self.drafted_steps.load(Ordering::Relaxed),
             committed: self.committed.load(Ordering::Relaxed),
             batch_steps: self.batch_steps.load(Ordering::Relaxed),
+            reached_at,
+            accepted_at,
+            positions_over_cap: self.positions_over_cap.load(Ordering::Relaxed),
         }
     }
 
@@ -1217,6 +1462,11 @@ impl AcceptanceTelemetry {
         self.drafted_steps.store(0, Ordering::Relaxed);
         self.committed.store(0, Ordering::Relaxed);
         self.batch_steps.store(0, Ordering::Relaxed);
+        for j in 0..MTP_MAX_TRACKED_POSITIONS {
+            self.reached_at[j].store(0, Ordering::Relaxed);
+            self.accepted_at[j].store(0, Ordering::Relaxed);
+        }
+        self.positions_over_cap.store(0, Ordering::Relaxed);
         if let Ok(mut map) = self.by_batch.lock() {
             map.clear();
         }
@@ -1237,6 +1487,12 @@ impl AcceptanceTelemetry {
         self.drafted_steps
             .fetch_add(step.drafted_steps, Ordering::Relaxed);
         self.committed.fetch_add(step.committed, Ordering::Relaxed);
+        for j in 0..MTP_MAX_TRACKED_POSITIONS {
+            self.reached_at[j].fetch_add(step.reached_at[j], Ordering::Relaxed);
+            self.accepted_at[j].fetch_add(step.accepted_at[j], Ordering::Relaxed);
+        }
+        self.positions_over_cap
+            .fetch_add(step.positions_over_cap, Ordering::Relaxed);
         if every == 0 || step.proposed == 0 {
             return false;
         }
@@ -1258,6 +1514,13 @@ impl AcceptanceTelemetry {
             tracing::info!(target: "mtp_speculative", "{}", per_b.marker(&format!("b={b}")));
         }
         tracing::info!(target: "mtp_speculative", "{}", snap.report_line());
+        // The per-position breakdown, in prose, right where the aggregate rate
+        // is. This is the line the acceptance-gap diagnosis needs: the scalar
+        // above says 0.4194 and stops, and there is no way to tell a
+        // distribution mismatch from a compounding chain from a scalar.
+        for line in snap.position_report_lines() {
+            tracing::info!(target: "mtp_speculative", "{line}");
+        }
     }
 
     /// Accumulate, and emit the periodic report if this call crossed a
@@ -1333,6 +1596,15 @@ pub fn record_mtp_batch_step(batch_size: usize, per_seq: &[MtpAcceptance]) {
 
 /// Every machine-greppable MTP line for this process: the aggregate first,
 /// then one per observed batch size. Empty when MTP never ran.
+/// The per-position acceptance breakdown as human-readable lines, or empty when
+/// no MTP decode step ever drafted in this process.
+///
+/// Companion to [`mtp_acceptance_markers`], which carries the same numbers in
+/// `p_pos=` / `accepted_pos=` / `reached_pos=` on the machine-greppable line.
+pub fn mtp_acceptance_position_lines() -> Vec<String> {
+    mtp_acceptance().position_report_lines()
+}
+
 pub fn mtp_acceptance_markers() -> Vec<String> {
     let Some(agg) = mtp_acceptance_marker() else {
         return Vec::new();
@@ -3949,6 +4221,16 @@ mod tests {
     fn step_of(proposed: usize, accepted: usize) -> MtpAcceptance {
         assert!(accepted <= proposed);
         let correction = usize::from(accepted < proposed);
+        // Positions `0..accepted` were accepted; the chain reached one further
+        // whenever it was cut short — the same derivation `from_fused_verify`
+        // makes at the real accept/reject site.
+        let reached = if proposed == 0 {
+            0
+        } else {
+            (accepted + 1).min(proposed)
+        };
+        let (reached_at, accepted_at, positions_over_cap) =
+            position_tallies(proposed, accepted, reached);
         MtpAcceptance {
             accepted,
             proposed,
@@ -3956,7 +4238,17 @@ mod tests {
             drafted_steps: usize::from(proposed > 0),
             committed: 1 + accepted + correction,
             batch_steps: 0,
+            reached_at,
+            accepted_at,
+            positions_over_cap,
         }
+    }
+
+    /// Per-position tallies as a fixed-size array, for terse test expectations.
+    fn positions(v: &[usize]) -> [usize; MTP_MAX_TRACKED_POSITIONS] {
+        let mut out = [0usize; MTP_MAX_TRACKED_POSITIONS];
+        out[..v.len()].copy_from_slice(v);
+        out
     }
 
     /// Counters accumulate exactly what the verify site hands them, and the
@@ -3978,6 +4270,12 @@ mod tests {
                 // step 2: T0 + 2 accepted, no correction = 3
                 committed: 6,
                 batch_steps: 0,
+                // Both steps proposed 2 and reached both positions (step 1 was
+                // rejected AT position 1, which is still an evaluation).
+                reached_at: positions(&[2, 2]),
+                // Position 0 accepted in both steps, position 1 only in step 2.
+                accepted_at: positions(&[2, 1]),
+                positions_over_cap: 0,
             }
         );
         tel.reset();
@@ -4045,6 +4343,168 @@ mod tests {
         );
     }
 
+    /// **The case the scalar could not answer (DOCTRINE D33 — feed the check its
+    /// failing case).**
+    ///
+    /// Two runs at depth 3 over 100 steps, from known accept patterns, whose
+    /// **every existing aggregate field is bit-identical**: `accepted=100`,
+    /// `proposed=300`, `steps=100`, `drafted_steps=100`, `committed=300`,
+    /// `accept_rate=1/3`, `tok_per_step=3.0`.
+    ///
+    /// * `dies_at_1` — every step accepts exactly 1. The chain reaches position
+    ///   1 every step and is rejected there: `p = [1.00, 0.00]`.
+    /// * `all_or_nothing` — half the steps accept 2, half accept 0. The chain
+    ///   only reaches position 1 on the halves that cleared position 0:
+    ///   `p = [0.50, 1.00, 0.00]`.
+    ///
+    /// One is a chain that **compounds** (position 0 is perfect, the draft's own
+    /// hidden state kills position 1); the other is a **first-position**
+    /// distribution mismatch that the chain then survives. Different defects,
+    /// different fixes, and while `MtpAcceptance.accepted` was one `usize` they
+    /// were *indistinguishable in the telemetry* — which is why the measured
+    /// `accept_rate=0.4194` could not be attributed to either.
+    ///
+    /// The assertions fail if the per-position vector is dropped, flattened,
+    /// derived from the aggregate, or denominated in steps instead of
+    /// reach.
+    #[test]
+    fn per_position_acceptance_separates_profiles_the_aggregate_cannot() {
+        const STEPS: usize = 100;
+
+        let dies_at_1 = AcceptanceTelemetry::default();
+        for _ in 0..STEPS {
+            dies_at_1.record_gated(&step_of(3, 1), false);
+        }
+        let dies_at_1 = dies_at_1.snapshot();
+
+        let all_or_nothing = AcceptanceTelemetry::default();
+        for i in 0..STEPS {
+            all_or_nothing.record_gated(&step_of(3, if i % 2 == 0 { 2 } else { 0 }), false);
+        }
+        let all_or_nothing = all_or_nothing.snapshot();
+
+        // The premise: every pre-existing aggregate agrees. If this ever stops
+        // holding, the test is no longer testing what it claims.
+        assert_eq!(dies_at_1.accepted, all_or_nothing.accepted);
+        assert_eq!(dies_at_1.proposed, all_or_nothing.proposed);
+        assert_eq!(dies_at_1.steps, all_or_nothing.steps);
+        assert_eq!(dies_at_1.drafted_steps, all_or_nothing.drafted_steps);
+        assert_eq!(dies_at_1.committed, all_or_nothing.committed);
+        assert_eq!(dies_at_1.rate(), all_or_nothing.rate());
+        assert_eq!(
+            dies_at_1.tokens_per_step(),
+            all_or_nothing.tokens_per_step()
+        );
+        assert_eq!(dies_at_1.rate(), Some(1.0 / 3.0));
+        assert_eq!(dies_at_1.tokens_per_step(), Some(3.0));
+
+        // …and the per-position vectors do not.
+        assert_eq!(dies_at_1.accepted_at, positions(&[100, 0, 0]));
+        assert_eq!(dies_at_1.reached_at, positions(&[100, 100, 0]));
+        assert_eq!(dies_at_1.per_position_rates(), vec![1.0, 0.0]);
+
+        assert_eq!(all_or_nothing.accepted_at, positions(&[50, 50, 0]));
+        assert_eq!(all_or_nothing.reached_at, positions(&[100, 50, 50]));
+        assert_eq!(all_or_nothing.per_position_rates(), vec![0.5, 1.0, 0.0]);
+
+        assert_ne!(
+            dies_at_1.per_position_rates(),
+            all_or_nothing.per_position_rates(),
+            "two runs identical in every aggregate must be separable per \
+             position — that separation is the entire point of this field"
+        );
+
+        // The refinement invariants: the breakdown must not be a second,
+        // competing count.
+        for snap in [dies_at_1, all_or_nothing] {
+            assert_eq!(
+                snap.accepted_at.iter().sum::<usize>(),
+                snap.accepted,
+                "per-position accepted must sum to the aggregate"
+            );
+            assert_eq!(
+                snap.reached_at[0], snap.drafted_steps,
+                "every drafting step reaches position 0"
+            );
+            for j in 1..snap.tracked_extent() {
+                assert!(
+                    snap.reached_at[j] <= snap.accepted_at[j - 1],
+                    "a linear chain can only reach position {j} through position {}",
+                    j - 1
+                );
+            }
+            assert_eq!(snap.positions_over_cap, 0);
+        }
+    }
+
+    /// The per-position numbers must reach the two surfaces a GPU session
+    /// actually reads: the greppable `MTP[...]` marker and the prose report.
+    #[test]
+    fn per_position_acceptance_is_on_the_marker_and_the_report() {
+        let tel = AcceptanceTelemetry::default();
+        // 4 steps at depth 3: accept 3, 2, 1, 0.
+        // pos 0 reached 4x, accepted 3x  -> p = 0.75
+        // pos 1 reached 3x, accepted 2x  -> p = 0.6667
+        // pos 2 reached 2x, accepted 1x  -> p = 0.5
+        for accepted in [3, 2, 1, 0] {
+            tel.record_gated(&step_of(3, accepted), false);
+        }
+        let snap = tel.snapshot();
+        assert_eq!(snap.accepted_at, positions(&[3, 2, 1]));
+        assert_eq!(snap.reached_at, positions(&[4, 3, 2]));
+
+        let marker = snap.marker("agg");
+        // Appended, not substituted: every field the runbooks grep for is still
+        // on the line.
+        assert!(marker.contains("accept_rate="), "{marker}");
+        assert!(marker.contains("tok_per_step="), "{marker}");
+        assert!(marker.contains("drafted_steps=4"), "{marker}");
+        assert!(marker.contains("accepted_pos=3,2,1"), "{marker}");
+        assert!(marker.contains("reached_pos=4,3,2"), "{marker}");
+        assert!(marker.contains("p_pos=0.7500,0.6667,0.5000"), "{marker}");
+        assert!(marker.contains("pos_over_cap=0"), "{marker}");
+
+        let report = snap.position_report_lines().join("\n");
+        assert!(report.contains("pos 0: p=0.7500 (3/4)"), "{report}");
+        assert!(report.contains("pos 1: p=0.6667 (2/3)"), "{report}");
+        assert!(report.contains("pos 2: p=0.5000 (1/2)"), "{report}");
+
+        // A run that never drafted reports nothing per position rather than
+        // zeros — 0/0 is not 0%, the same rule `rate()` already follows.
+        let idle = AcceptanceTelemetry::default();
+        idle.record_gated(&MtpAcceptance::skipped_step(), false);
+        let idle = idle.snapshot();
+        assert_eq!(idle.tracked_extent(), 0);
+        assert!(idle.position_report_lines().is_empty());
+        assert!(idle.marker("agg").contains("p_pos=n/a"));
+    }
+
+    /// A chain deeper than the bucket cap still accounts correctly in every
+    /// aggregate, and says so instead of silently dropping the overflow.
+    #[test]
+    fn positions_beyond_the_cap_are_flagged_not_hidden() {
+        let deep = MTP_MAX_TRACKED_POSITIONS + 2;
+        let tel = AcceptanceTelemetry::default();
+        tel.record_gated(&step_of(deep, deep), false);
+        let snap = tel.snapshot();
+
+        assert_eq!(snap.accepted, deep, "the aggregate is exact regardless");
+        assert_eq!(snap.proposed, deep);
+        assert_eq!(snap.positions_over_cap, 1);
+        assert_eq!(snap.tracked_extent(), MTP_MAX_TRACKED_POSITIONS);
+        assert_eq!(
+            snap.accepted_at.iter().sum::<usize>(),
+            MTP_MAX_TRACKED_POSITIONS,
+            "only the first {} positions get buckets",
+            MTP_MAX_TRACKED_POSITIONS
+        );
+        assert!(snap
+            .position_report_lines()
+            .iter()
+            .any(|l| l.contains("WARN")));
+        assert!(snap.marker("agg").contains("pos_over_cap=1"));
+    }
+
     /// A step that drafted nothing is still a step. Without it `tok_per_step`
     /// would silently exclude the case the draft KV hits most often — drafting
     /// skipped because the cache could not be primed — and report a multiplier
@@ -4058,7 +4518,10 @@ mod tests {
             drafted_steps: 0,
             committed: 1,
             batch_steps: 0,
+            ..MtpAcceptance::default()
         };
+        // The literal above must stay the thing the pipeline actually records.
+        assert_eq!(skipped, MtpAcceptance::skipped_step());
         let tel = AcceptanceTelemetry::default();
         for _ in 0..10 {
             tel.record_gated(&skipped, false);
