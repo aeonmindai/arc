@@ -233,6 +233,19 @@ impl V4MHCLayerParams {
     /// - `y`:    `[B, T, hidden]` or `[N, hidden]`
     /// - `post`: `[B, T, hc_mult]` or `[N, hc_mult]`
     /// - `comb`: `[B, T, hc_mult, hc_mult]` or `[N, hc_mult, hc_mult]`
+    ///
+    /// ## dtype contract
+    ///
+    /// `y` is returned in the *input* dtype (BF16 in production) because it
+    /// feeds `input_layernorm` + attention/MLP, which run in the model dtype.
+    ///
+    /// `post` and `comb` are returned in **F32** — the dtype the sinkhorn /
+    /// sigmoid math already computed them in. They are consumed only by
+    /// [`hc_post`], which needs them in F32 anyway; casting them down to BF16
+    /// here and back up there was a pure round trip that cost four kernel
+    /// launches per call and *lost* mantissa bits. Keeping them in F32 removes
+    /// the launches and raises precision. `hc_post` still returns the residual
+    /// stack in the input dtype, so nothing downstream sees a dtype change.
     pub fn hc_pre(
         &self,
         residual: &Tensor,
@@ -319,8 +332,14 @@ impl V4MHCLayerParams {
         let comb = sinkhorn_normalize(&comb_pre, self.rt.hc_sinkhorn_iters, self.rt.hc_eps)?;
 
         // y = sum_i pre[..., i, None] * x[..., i, :]  →  [N, hidden]
+        // `x_flat` is already the F32 promotion of exactly these elements (it
+        // is `x` reshaped to [N, hc*h] then cast), so reshape it back rather
+        // than issuing a second BF16->F32 cast of the same buffer. Reshape of
+        // a contiguous tensor is metadata-only: no kernel, no allocation. The
+        // values are bit-identical — BF16->F32 is an exact widening.
+        let x_f32 = x_flat.reshape((n, hc, h))?; // [N, hc, h], F32
         let pre_b = pre.unsqueeze(D::Minus1)?; // [N, hc, 1]
-        let y = pre_b.broadcast_mul(&x.to_dtype(DType::F32)?)?.sum(1)?; // [N, hidden]
+        let y = pre_b.broadcast_mul(&x_f32)?.sum(1)?; // [N, hidden]
 
         // Restore leading dims.
         let mut y_shape = leading_dims.clone();
@@ -331,9 +350,11 @@ impl V4MHCLayerParams {
         comb_shape.push(hc);
         comb_shape.push(hc);
 
+        // `y` feeds layernorm + attention/MLP, so it goes back to the model
+        // dtype. `post` / `comb` stay F32 — see the dtype contract above.
         let y_out = y.reshape(y_shape)?.to_dtype(in_dtype)?;
-        let post_out = post.reshape(post_shape)?.to_dtype(in_dtype)?;
-        let comb_out = comb.reshape(comb_shape)?.to_dtype(in_dtype)?;
+        let post_out = post.reshape(post_shape)?;
+        let comb_out = comb.reshape(comb_shape)?;
         Ok((y_out, post_out, comb_out))
     }
 
@@ -347,7 +368,12 @@ impl V4MHCLayerParams {
     /// - `post`: `[B, T, hc_mult]` or `[N, hc_mult]`
     /// - `comb`: `[B, T, hc_mult, hc_mult]` or `[N, hc_mult, hc_mult]`
     ///
-    /// Returns the new residual stack with the same shape as `residual`.
+    /// `post` / `comb` arrive in F32 from [`hc_pre`]; the `to_dtype` calls
+    /// below are retained only for hand-constructed callers and short-circuit
+    /// to a clone (no kernel) on the production path.
+    ///
+    /// Returns the new residual stack with the same shape *and dtype* as `x`
+    /// (the branch output), i.e. the model dtype.
     pub fn hc_post(
         &self,
         x: &Tensor,
@@ -1682,6 +1708,118 @@ mod tests {
         assert!(
             max_err < 0.05,
             "4-D zero-params path diverged from standard residual: max_err={max_err}"
+        );
+        Ok(())
+    }
+
+    /// Pins the `hc_pre` -> `hc_post` dtype contract that removes the F32
+    /// round trip (430 kernel launches/token at 43 layers).
+    ///
+    /// With a BF16 residual — the production dtype — `hc_pre` must hand back
+    /// `post` / `comb` in **F32**, not BF16. Casting them down here and back
+    /// up inside `hc_post` was four launches per call whose only effect was
+    /// to discard mantissa bits. `y` and the `hc_post` output must still come
+    /// back in the model dtype, because they feed layernorm / attention and
+    /// the residual stack respectively.
+    #[test]
+    fn hc_pre_hands_post_and_comb_to_hc_post_in_f32() -> Result<()> {
+        let dev = Device::Cpu;
+        let hidden = 4;
+        let hc_mult = 4;
+        let mix_hc = (2 + hc_mult) * hc_mult;
+        let hc_dim = hc_mult * hidden;
+
+        // Non-trivial params so post/comb are not degenerate.
+        let params = make_layer_params(
+            hidden,
+            hc_mult,
+            Tensor::from_vec(
+                (0..mix_hc * hc_dim)
+                    .map(|i| ((i as f32) * 0.031).sin() * 0.4)
+                    .collect::<Vec<_>>(),
+                (mix_hc, hc_dim),
+                &dev,
+            )?,
+            Tensor::from_vec(
+                (0..mix_hc)
+                    .map(|i| ((i as f32) * 0.13).cos() * 0.2)
+                    .collect::<Vec<_>>(),
+                mix_hc,
+                &dev,
+            )?,
+            Tensor::from_vec(vec![0.9f32, 1.1, 0.7], 3, &dev)?,
+        );
+
+        let (b, t) = (2, 3);
+        let residual_f32 = Tensor::from_vec(
+            (0..b * t * hc_mult * hidden)
+                .map(|i| ((i as f32) * 0.047).sin() * 1.1)
+                .collect::<Vec<_>>(),
+            (b, t, hc_mult, hidden),
+            &dev,
+        )?;
+        let branch_f32 = Tensor::from_vec(
+            (0..b * t * hidden)
+                .map(|i| ((i as f32) * 0.067).cos() * 0.6)
+                .collect::<Vec<_>>(),
+            (b, t, hidden),
+            &dev,
+        )?;
+
+        let residual_bf16 = residual_f32.to_dtype(DType::BF16)?;
+        let branch_bf16 = branch_f32.to_dtype(DType::BF16)?;
+
+        let (y, post, comb) = params.attn_pre(&residual_bf16)?;
+
+        // The contract: post/comb stay in the dtype the sinkhorn/sigmoid math
+        // produced them in. If either of these flips back to BF16 the round
+        // trip has been reintroduced.
+        assert_eq!(
+            post.dtype(),
+            DType::F32,
+            "hc_pre must return `post` in F32, not round-trip it through the input dtype"
+        );
+        assert_eq!(
+            comb.dtype(),
+            DType::F32,
+            "hc_pre must return `comb` in F32, not round-trip it through the input dtype"
+        );
+        // `y` still feeds layernorm + attention, so it keeps the model dtype.
+        assert_eq!(
+            y.dtype(),
+            DType::BF16,
+            "hc_pre must return `y` in the input dtype"
+        );
+        assert_eq!(y.dims(), &[b, t, hidden]);
+        assert_eq!(post.dims(), &[b, t, hc_mult]);
+        assert_eq!(comb.dims(), &[b, t, hc_mult, hc_mult]);
+
+        // The residual stack that leaves hc_post is still the model dtype.
+        let out = params.mix_post_4d(&branch_bf16, &residual_bf16, &post, &comb)?;
+        assert_eq!(
+            out.dtype(),
+            DType::BF16,
+            "hc_post must return the model dtype"
+        );
+        assert_eq!(out.dims(), &[b, t, hc_mult, hidden]);
+
+        // Sanity: keeping post/comb in F32 tracks the all-F32 computation at
+        // least as closely as the old BF16 round trip did. Compare the BF16
+        // round trip's output against the pure-F32 reference; the only
+        // remaining error is the BF16 residual/branch inputs themselves.
+        let (_y_ref, post_ref, comb_ref) = params.attn_pre(&residual_f32)?;
+        let out_ref = params.mix_post_4d(&branch_f32, &residual_f32, &post_ref, &comb_ref)?;
+        let got: Vec<f32> = out.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let want: Vec<f32> = out_ref.flatten_all()?.to_vec1()?;
+        let mut max_err = 0f32;
+        for (g, w) in got.iter().zip(want.iter()) {
+            max_err = max_err.max((g - w).abs());
+        }
+        // BF16 carries ~8 mantissa bits; inputs of magnitude ~1 quantize to
+        // ~4e-3, and hc_post sums hc_mult=4 of them.
+        assert!(
+            max_err < 0.05,
+            "BF16 mHC round trip diverged from the F32 reference: max_err={max_err}"
         );
         Ok(())
     }
