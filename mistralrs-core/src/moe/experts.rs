@@ -510,6 +510,23 @@ impl MoEExperts {
         let Some(limit) = self.swiglu_limit else {
             return up.mul(&gate.apply(&self.act)?);
         };
+        // Fused single-launch path (cuda/swiglu_clamp.cu, ported from vLLM
+        // `silu_and_mul_clamp` / SGLang `silu_and_mul<kApplySwigluLimit>`).
+        // Bit-identical to the candle chain below; see that file's contract
+        // and the on-GPU A/B in cuda/swiglu_clamp.rs. Returns None whenever
+        // the call is not eligible, so every other shape/dtype/device keeps
+        // the old chain untouched.
+        //
+        // ARC_NO_FUSED_SWIGLU=1 forces the old chain — this is what the A/B
+        // measurement legs toggle, and it must stay a real escape hatch.
+        if matches!(self.act, Activation::Silu | Activation::Swish)
+            && !crate::cuda::swiglu_clamp::fused_swiglu_disabled()
+        {
+            if let Some(out) = crate::cuda::swiglu_clamp::swiglu_clamp_cuda(gate, up, limit)? {
+                crate::models::deepseek4::v4_stat_dbg(&out, "exp.prod_fused");
+                return Ok(out);
+            }
+        }
         let out_dtype = gate.dtype();
         let (gate, up) = swiglu_clamp(gate, up, limit)?;
         let act_gate = gate.apply(&self.act)?;
