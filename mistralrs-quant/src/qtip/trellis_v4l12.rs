@@ -126,12 +126,45 @@ const _: () = {
 };
 
 /// Threads per block the CUDA launcher uses. Mirrors `THREADS` in
-/// `kernels/qtip/qtip_gemv_v4l12.cu`; [`Rung::gemv_row_gpu_model`] is only a
-/// model of that kernel at this value.
+/// `kernels/qtip/qtip_gemv_v4l12.cu`.
+///
+/// This is a *block* size — it sets how fast the 32 KiB table is staged and how
+/// many rows a block works on at once. It is **not** how many threads share a
+/// row; see [`KERNEL_LANES_PER_ROW`].
 pub const KERNEL_THREADS: usize = 128;
 
 /// One warp.
 const WARP: usize = 32;
+
+/// Threads that share one output row: **one warp**.
+///
+/// Not `KERNEL_THREADS`, and the difference is worth real instructions. Every
+/// thread replays [`Rung::warmup_syms`] symbols before decoding its own slice,
+/// so the extraction cost per weight is
+///
+/// ```text
+///   (S + W) / (S · V)      S = symbols per lane, W = warmup, V = 4
+/// ```
+///
+/// against an ideal of `1/V`. The tax is `1 + W/S`, so it is set entirely by
+/// **slice length**, and slice length is `num_symbols / lanes_per_row`. Spreading
+/// a row across a whole 128-thread block makes slices short and the tax large:
+///
+/// | `in_features` | 128 lanes/row | 32 lanes/row |
+/// |---|---|---|
+/// | 4096 | S=8, **1.25×** | S=32, **1.06×** |
+/// | 1024 | S=2, **1.99×** | S=8, **1.24×** |
+/// | 512  | S=1, **2.98×** | S=4, **1.48×** |
+///
+/// So a warp owns a row and a block owns `KERNEL_THREADS / 32` rows at once.
+/// Same parallelism, four times the slice length. It also deletes the
+/// cross-warp reduction and both `__syncthreads` from the row loop, since a
+/// warp reduces with shuffles alone.
+///
+/// This is **K-independent**: it multiplies the extraction count at every K, so
+/// it scales the alignment penalty too. Pinned by
+/// [`tests::the_warmup_tax_is_bounded_by_slice_length`].
+pub const KERNEL_LANES_PER_ROW: usize = WARP;
 
 // ===========================================================================
 // The K parameter
@@ -288,19 +321,50 @@ impl Rung {
         self.packed_bytes(self.num_symbols(in_features))
     }
 
-    /// Bytes a single extraction may touch, worst case over the bit offset:
-    /// `ceil((7 + K) / 8)`.
+    /// Bytes a single extraction may touch, worst case over the bit offsets
+    /// that are actually **reachable**.
     ///
-    /// 1 at K=8 (the offset is always 0), 2 at K=9, 3 at K=10. Mirrors
-    /// `QtipSymExtract<K>::MAX_BYTES` in the kernel, and is the number the
-    /// row stride would have to be padded by to delete the kernel's tail clamp.
+    /// The bit offset of symbol `t` is `(t·K) mod 8`, which ranges over the
+    /// multiples of `gcd(K, 8)` and nothing else. The worst reachable offset is
+    /// therefore `8 − gcd(K, 8)`, not 7, and the bound is
+    /// `ceil((8 − gcd(K,8) + K) / 8)`.
+    ///
+    /// That distinction is not cosmetic. At **K=10** the offsets are only
+    /// `{0, 2, 4, 6}`, so `off + K ≤ 16` and **two bytes always suffice** — the
+    /// naive `ceil((7+K)/8)` says three and would have the kernel read, mask
+    /// and discard a wasted byte on every symbol. 1 at K=8, 2 at K=9, 2 at
+    /// K=10.
+    ///
+    /// Mirrors `QtipSymExtract<K>::MAX_BYTES` in the kernel, and is also the
+    /// number of bytes the row stride would have to be padded by to delete that
+    /// kernel's tail clamp.
     #[inline]
     pub fn max_bytes_per_symbol(self) -> usize {
-        if self.is_byte_aligned() {
-            self.k as usize / 8
-        } else {
-            (7 + self.k as usize).div_ceil(8)
+        let g = gcd8(self.k as usize);
+        (8 - g + self.k as usize).div_ceil(8)
+    }
+
+    /// Symbols each lane decodes when a row is split across
+    /// [`KERNEL_LANES_PER_ROW`] lanes.
+    #[inline]
+    pub fn syms_per_lane(self, num_symbols: usize) -> usize {
+        num_symbols.div_ceil(KERNEL_LANES_PER_ROW)
+    }
+
+    /// Symbol extractions per decoded weight, ×10,000, for a row of
+    /// `num_symbols` symbols split across [`KERNEL_LANES_PER_ROW`] lanes.
+    ///
+    /// The ideal is `1/V` = 0.25 (2500). The excess is the warmup replay: each
+    /// lane but the first re-extracts [`Rung::warmup_syms`] symbols it will not
+    /// accumulate. Reported as an integer so it can be asserted exactly.
+    pub fn extractions_per_weight_x10000(self, num_symbols: usize) -> usize {
+        if num_symbols == 0 {
+            return 0;
         }
+        let s = self.syms_per_lane(num_symbols);
+        let active = num_symbols.div_ceil(s);
+        let total = num_symbols + (active - 1) * self.warmup_syms();
+        total * 10_000 / (num_symbols * V as usize)
     }
 
     /// Extract symbol `t` from a packed row.
@@ -481,7 +545,7 @@ impl Rung {
     /// result may be compared to it with `==` on the bits rather than with a
     /// tolerance.
     ///
-    /// That distinction matters. A `threads`-way split reassociates the sum, so
+    /// That distinction matters. A 32-way split reassociates the sum, so
     /// the kernel cannot be bit-equal to a single-threaded dot product and
     /// never could be; a tolerance-based gate would then be hiding a real class
     /// of bug (a mis-seeded thread) behind a bound chosen for a benign one
@@ -491,7 +555,6 @@ impl Rung {
         row: Row<'_>,
         lut: &[bf16],
         x: &[f32],
-        threads: usize,
         hoist: RowScaleHoist,
     ) -> Result<f32, String> {
         let Row {
@@ -507,16 +570,12 @@ impl Rung {
                 x.len()
             ));
         }
-        if threads == 0 || !threads.is_multiple_of(WARP) {
-            return Err(format!(
-                "qtip v4l12: threads must be a nonzero multiple of {WARP}, got {threads}"
-            ));
-        }
+        // One warp owns the row; there is no cross-warp step to model because
+        // the kernel does not have one.
+        let sym_per_thread = self.syms_per_lane(num_symbols);
 
-        let sym_per_thread = num_symbols.div_ceil(threads);
-
-        // ---- per-thread accumulation ----
-        let mut per_thread = vec![0f32; threads];
+        // ---- per-lane accumulation ----
+        let mut per_thread = [0f32; WARP];
         for (tid, slot) in per_thread.iter_mut().enumerate() {
             let sym_start = tid * sym_per_thread;
             if sym_start >= num_symbols {
@@ -540,23 +599,8 @@ impl Rung {
             *slot = acc;
         }
 
-        // ---- warp butterflies ----
-        let n_warps = threads / WARP;
-        let mut warp_sums = vec![0f32; n_warps];
-        for (w, total) in warp_sums.iter_mut().enumerate() {
-            let mut lanes = [0f32; WARP];
-            lanes.copy_from_slice(&per_thread[w * WARP..(w + 1) * WARP]);
-            warp_butterfly_sum(&mut lanes);
-            *total = lanes[0];
-        }
-
-        // ---- cross-warp butterfly, performed by warp 0 ----
-        let mut lanes = [0f32; WARP];
-        for (lane, slot) in lanes.iter_mut().enumerate() {
-            if lane < n_warps {
-                *slot = warp_sums[lane];
-            }
-        }
+        // ---- the single warp butterfly ----
+        let mut lanes = per_thread;
         warp_butterfly_sum(&mut lanes);
 
         Ok(match hoist {
@@ -564,6 +608,19 @@ impl Rung {
             RowScaleHoist::On => lanes[0] * scale,
         })
     }
+}
+
+/// `gcd(k, 8)`. Small and total; `k` is a symbol width, never zero in practice,
+/// and 0 maps to 8 which is the mathematically correct `gcd(0, 8)`.
+const fn gcd8(k: usize) -> usize {
+    let mut a = k % 8;
+    let mut b = 8usize;
+    while a != 0 {
+        let t = b % a;
+        b = a;
+        a = t;
+    }
+    b
 }
 
 /// The XOR-shuffle butterfly the kernel's `warp_reduce_sum` performs.
@@ -785,15 +842,6 @@ mod tests {
             let err = Rung::new(k).unwrap_err();
             assert!(err.contains("not implemented"), "K={k}: {err}");
         }
-    }
-
-    #[test]
-    fn max_bytes_per_symbol_is_one_only_for_the_byte_aligned_control() {
-        // This is the alignment penalty, stated as a number. K=8 reads one
-        // byte; K=9 reads two; K=10 reads three in the worst case.
-        assert_eq!(Rung::new(8).unwrap().max_bytes_per_symbol(), 1);
-        assert_eq!(Rung::new(9).unwrap().max_bytes_per_symbol(), 2);
-        assert_eq!(Rung::new(10).unwrap().max_bytes_per_symbol(), 3);
     }
 
     #[test]
@@ -1260,13 +1308,7 @@ mod tests {
                 let scale = 0.0231f32 * (seed as f32 + 1.0);
                 for hoist in [RowScaleHoist::Off, RowScaleHoist::On] {
                     let modelled = r
-                        .gemv_row_gpu_model(
-                            Row::new(&packed, 1, scale),
-                            &lut,
-                            &x,
-                            KERNEL_THREADS,
-                            hoist,
-                        )
+                        .gemv_row_gpu_model(Row::new(&packed, 1, scale), &lut, &x, hoist)
                         .unwrap();
                     let scalar = r
                         .gemv_row(Row::new(&packed, 1, scale), &lut, &x, hoist)
@@ -1327,7 +1369,6 @@ mod tests {
                             Row::new(&packed, n_sym, scale),
                             &lut,
                             &x,
-                            KERNEL_THREADS,
                             RowScaleHoist::Off,
                         )
                         .unwrap();
@@ -1359,7 +1400,7 @@ mod tests {
         // coverage rather than as a float comparison, so it cannot be masked
         // by a tolerance.
         for n_sym in [1usize, 127, 128, 129, 1000, 1024, 4095] {
-            for threads in [WARP, 64, KERNEL_THREADS] {
+            for threads in [WARP] {
                 let per = n_sym.div_ceil(threads);
                 let mut covered = vec![0usize; n_sym];
                 for tid in 0..threads {
@@ -1384,11 +1425,12 @@ mod tests {
     }
 
     #[test]
-    fn the_gpu_model_is_deterministic_and_thread_count_sensitive() {
-        // Determinism is what lets the CUDA gate compare bits. Thread-count
-        // sensitivity is the anti-vacuity half: if the model returned the same
-        // bits for every split, it would not be modelling the reduction tree
-        // at all and the CUDA comparison would pass against a stub.
+    fn the_gpu_model_is_deterministic_and_actually_models_a_tree() {
+        // Determinism is what lets the CUDA gate compare bits. Differing from
+        // the sequential reference is the anti-vacuity half: if the model
+        // returned the same bits as `gemv_row`, it would not be modelling the
+        // 32-way reduction at all and the CUDA comparison would pass against a
+        // stub that just did a serial dot product.
         let lut = gaussian_lut_bf16();
         for r in rungs() {
             let n = 2048usize;
@@ -1397,22 +1439,10 @@ mod tests {
             let x = fixture_x(n * V as usize, 32);
             let scale = 0.0143f32;
             let a = r
-                .gemv_row_gpu_model(
-                    Row::new(&packed, n, scale),
-                    &lut,
-                    &x,
-                    KERNEL_THREADS,
-                    RowScaleHoist::Off,
-                )
+                .gemv_row_gpu_model(Row::new(&packed, n, scale), &lut, &x, RowScaleHoist::Off)
                 .unwrap();
             let b = r
-                .gemv_row_gpu_model(
-                    Row::new(&packed, n, scale),
-                    &lut,
-                    &x,
-                    KERNEL_THREADS,
-                    RowScaleHoist::Off,
-                )
+                .gemv_row_gpu_model(Row::new(&packed, n, scale), &lut, &x, RowScaleHoist::Off)
                 .unwrap();
             assert_eq!(
                 a.to_bits(),
@@ -1421,41 +1451,91 @@ mod tests {
                 r.k()
             );
 
-            let c = r
-                .gemv_row_gpu_model(
-                    Row::new(&packed, n, scale),
-                    &lut,
-                    &x,
-                    WARP,
-                    RowScaleHoist::Off,
-                )
+            let seq = r
+                .gemv_row(Row::new(&packed, n, scale), &lut, &x, RowScaleHoist::Off)
                 .unwrap();
             assert_ne!(
                 a.to_bits(),
-                c.to_bits(),
-                "K={}: identical bits at 32 and {KERNEL_THREADS} threads — the model is not \
-                 modelling the reduction tree",
+                seq.to_bits(),
+                "K={}: the 32-lane model returned the same bits as the sequential reference — \
+                 it is not modelling the reduction tree, and the CUDA gate would pass against \
+                 a serial stub",
                 r.k()
             );
         }
     }
 
     #[test]
-    fn the_gpu_model_rejects_a_thread_count_that_is_not_whole_warps() {
-        let lut = gaussian_lut_bf16();
+    fn the_warmup_tax_is_bounded_by_slice_length() {
+        // The reason a warp owns a row instead of a block. Extractions per
+        // weight are (S + W)/(S*V) against an ideal of 1/V = 0.25, so the tax
+        // is 1 + W/S, and S is num_symbols / lanes_per_row. Splitting a row
+        // across all 128 threads would quarter S and multiply the tax.
+        //
+        // Pinned as exact integers, because "we made it faster" is not a fact
+        // and these are.
         let r = Rung::CONTROL;
-        let syms = fixture_symbols(64, 1, 8);
-        let packed = r.pack(&syms);
-        let x = fixture_x(64 * V as usize, 2);
-        assert!(r
-            .gemv_row_gpu_model(Row::new(&packed, 64, 1.0), &lut, &x, 0, RowScaleHoist::Off)
-            .is_err());
-        assert!(r
-            .gemv_row_gpu_model(Row::new(&packed, 64, 1.0), &lut, &x, 48, RowScaleHoist::Off)
-            .is_err());
-        assert!(r
-            .gemv_row_gpu_model(Row::new(&packed, 64, 1.0), &lut, &x, 64, RowScaleHoist::Off)
-            .is_ok());
+        assert_eq!(KERNEL_LANES_PER_ROW, 32);
+        assert_eq!(r.warmup_syms(), 2);
+
+        // in_features = 4096 -> 1024 symbols -> S = 32
+        assert_eq!(r.syms_per_lane(1024), 32);
+        assert_eq!(r.extractions_per_weight_x10000(1024), 2651); // 1.06x ideal
+
+        // in_features = 1024 -> 256 symbols -> S = 8
+        assert_eq!(r.syms_per_lane(256), 8);
+        assert_eq!(r.extractions_per_weight_x10000(256), 3105); // 1.24x ideal
+
+        // in_features = 512 -> 128 symbols -> S = 4
+        assert_eq!(r.extractions_per_weight_x10000(128), 3710); // 1.48x ideal
+
+        // Splitting the same row across a whole 128-thread block would have
+        // been materially worse — this is the change stated as a number.
+        let s_block = 1024usize.div_ceil(KERNEL_THREADS);
+        assert_eq!(s_block, 8);
+        let tax_block = (s_block + r.warmup_syms()) * 10_000 / (s_block * V as usize);
+        assert_eq!(tax_block, 3125); // 1.25x ideal, vs 1.06x at one warp per row
+        assert!(tax_block > r.extractions_per_weight_x10000(1024));
+
+        // The tax is never below the ideal and always above it while W > 0.
+        for n in [32usize, 128, 256, 1024, 4096] {
+            let e = r.extractions_per_weight_x10000(n);
+            assert!(e > 2500, "n={n}: {e} must exceed the 0.25 ideal");
+            assert!(
+                e <= 7500,
+                "n={n}: {e} is worse than one extraction per symbol"
+            );
+        }
+        // ...and it is K-independent: the same tax multiplies every K, so it
+        // scales the alignment penalty rather than competing with it.
+        for rr in rungs() {
+            assert_eq!(
+                rr.extractions_per_weight_x10000(1024),
+                r.extractions_per_weight_x10000(1024),
+                "the warmup tax must not depend on K"
+            );
+        }
+    }
+
+    #[test]
+    fn the_reachable_offset_bound_saves_a_byte_at_k10() {
+        // `(t*K) mod 8` only ever takes the multiples of gcd(K, 8), so the
+        // worst reachable offset is 8 - gcd(K,8), not 7. At K=10 that is the
+        // difference between reading 2 bytes and 3 on EVERY symbol.
+        for (k, want) in [(8u32, 1usize), (9, 2), (10, 2)] {
+            let r = Rung::new(k).unwrap();
+            assert_eq!(r.max_bytes_per_symbol(), want, "K={k}");
+            // Prove the bound rather than trusting the formula: enumerate the
+            // reachable offsets and check none needs more bytes.
+            let mut worst = 0usize;
+            for t in 0..64usize {
+                let off = (t * k as usize) % 8;
+                worst = worst.max((off + k as usize).div_ceil(8));
+            }
+            assert_eq!(worst, want, "K={k}: enumerated worst case disagrees");
+        }
+        // The naive all-offsets bound would have said 3 at K=10.
+        assert_eq!((7 + 10usize).div_ceil(8), 3);
     }
 
     #[test]
@@ -1508,8 +1588,16 @@ mod tests {
                 "nonzero-means-hoist ABI",
             ),
             (
-                "static constexpr int MAX_BYTES = (7 + K + 7) / 8;".to_string(),
-                "worst-case bytes per symbol",
+                "static constexpr int MAX_BYTES = (8 - GCD8 + K + 7) / 8;".to_string(),
+                "reachable-offset bytes-per-symbol bound",
+            ),
+            (
+                "const int sym_per_thread = (num_symbols + 31) / 32;".to_string(),
+                "one warp per row (the warmup-tax fix)",
+            ),
+            (
+                "row += gridDim.x * N_WARPS".to_string(),
+                "grid stride over rows in units of warps",
             ),
         ];
         for (needle, what) in want {
@@ -1561,6 +1649,15 @@ mod tests {
         assert!(
             src.contains(&squeeze("struct QtipSymExtract<8>")),
             "the K=8 control lost its byte-aligned extraction specialisation"
+        );
+        // The warp-per-row shape removes the cross-warp reduction entirely. If
+        // a `warp_sums` array comes back, the model's single butterfly is no
+        // longer what the kernel does and the bit-exact gate would be comparing
+        // against the wrong tree.
+        assert!(
+            !src.contains("__shared__ float warp_sums"),
+            "the kernel regained a cross-warp reduction; `gemv_row_gpu_model` models ONE warp \
+             butterfly and would no longer be bit-exact"
         );
     }
 
@@ -1643,7 +1740,6 @@ mod tests {
                             Row::new(slice, n_sym, scales[row]),
                             &lut,
                             &x,
-                            KERNEL_THREADS,
                             RowScaleHoist::Off,
                         )
                         .expect("model");

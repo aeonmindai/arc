@@ -111,9 +111,17 @@ template <int K>
 struct QtipSymExtract {
     static_assert(K >= 2 && K <= 16, "K must fit the 3-byte extraction window");
 
-    // Bytes one extraction may touch, worst case over the bit offset:
-    // ceil((7 + K) / 8). 2 at K=9, 3 at K=10.
-    static constexpr int MAX_BYTES = (7 + K + 7) / 8;
+    // Bytes one extraction may touch, worst case over the bit offsets that are
+    // actually REACHABLE. The offset of symbol t is (t*K) mod 8, which ranges
+    // over the multiples of gcd(K, 8) and nothing else, so the worst reachable
+    // offset is 8 - gcd(K,8), not 7.
+    //
+    // At K=10 that is the difference between 2 bytes and 3: the offsets are
+    // only {0, 2, 4, 6}, so off + K <= 16 and two bytes always suffice. The
+    // naive ceil((7+K)/8) would have every symbol read, shift and discard a
+    // wasted third byte.
+    static constexpr int GCD8 = (K % 8 == 0) ? 8 : ((K % 4 == 0) ? 4 : ((K % 2 == 0) ? 2 : 1));
+    static constexpr int MAX_BYTES = (8 - GCD8 + K + 7) / 8;
 
     // Symbol t occupies bits [t*K, t*K + K), LSB-first: bit j lives in byte
     // j/8 at bit position j%8. Same convention the shipped K=4/V=2 rung uses
@@ -235,6 +243,27 @@ __device__ __forceinline__ void stage_lut(
 // device the cost is bounded by the grid rather than by n_rows. One block per
 // row would stage 32 KiB to do (in_features/4) bytes of packed work -- 32x
 // overhead at in_features=4096.
+// ONE WARP OWNS A ROW, and a block owns THREADS/32 rows at once.
+//
+// Not one block per row. Every lane replays WARMUP_SYMS symbols before decoding
+// its own slice, so extractions per weight are (S + W) / (S * V) against an
+// ideal of 1/V -- a tax of 1 + W/S set entirely by slice length S, and S is
+// num_symbols / lanes_per_row. Spreading a row across all 128 threads makes S
+// short and the tax large:
+//
+//     in_features   128 lanes/row      32 lanes/row
+//     4096          S=8,  1.25x        S=32, 1.06x
+//     1024          S=2,  1.99x        S=8,  1.24x
+//      512          S=1,  2.98x        S=4,  1.48x
+//
+// A warp per row is the same parallelism with four times the slice. It is also
+// strictly simpler: a warp reduces with shuffles alone, so the cross-warp
+// butterfly, the `warp_sums` shared array and BOTH `__syncthreads` disappear
+// from the row loop.
+//
+// This is K-INDEPENDENT -- it multiplies the extraction count at every K, so it
+// scales the alignment penalty by the same factor. It is not a substitute for
+// picking a good extraction route; it multiplies whichever one is picked.
 template <typename T, int THREADS, int K, bool ROW_SCALE_HOIST>
 __global__ void __launch_bounds__(THREADS)
 qtip_fused_gemv_v4_l12_kernel(
@@ -247,12 +276,13 @@ qtip_fused_gemv_v4_l12_kernel(
     int packed_per_row,
     int num_symbols
 ) {
-    // 32,768 B. Plus warp_sums below; total static shared is
-    // 32768 + (THREADS/32)*4 B, still far under the 48 KiB cap.
+    // 32,768 B, and that is the WHOLE static shared footprint of this kernel
+    // now that the cross-warp reduction is gone.
     __shared__ __align__(16) __nv_bfloat16 lut_s[QV4_LUT_ENTRIES];
     constexpr int N_WARPS = THREADS / 32;
     static_assert(THREADS % 32 == 0, "THREADS must be a multiple of warp size");
-    __shared__ float warp_sums[N_WARPS];
+    // No `warp_sums`: a warp owns a whole row, so the reduction never leaves
+    // the warp and there is nothing to hand across one.
 
     // Prior symbols consumed before a thread decodes its own slice: ceil(L/K).
     // 2 at every supported K. One more than strictly required -- the state that
@@ -270,12 +300,14 @@ qtip_fused_gemv_v4_l12_kernel(
     const int lane    = tid & 31;
     const int warp_id = tid >> 5;
 
-    // Each thread takes a contiguous slice of the row's symbols.
-    const int sym_per_thread = (num_symbols + THREADS - 1) / THREADS;
-    const int sym_start_raw  = tid * sym_per_thread;
+    // Each LANE takes a contiguous slice of its warp's row. Dividing by 32
+    // rather than by THREADS is the warmup-tax fix described above.
+    const int sym_per_thread = (num_symbols + 31) / 32;
+    const int sym_start_raw  = lane * sym_per_thread;
     const int sym_end        = min(num_symbols, sym_start_raw + sym_per_thread);
 
-    for (int row = blockIdx.x; row < n_rows; row += gridDim.x) {
+    for (int row = blockIdx.x * N_WARPS + warp_id; row < n_rows;
+         row += gridDim.x * N_WARPS) {
         const uint8_t* row_packed = packed + (size_t)row * packed_per_row;
         const float    scale      = __ldg(row_scales + row);
 
@@ -330,20 +362,13 @@ qtip_fused_gemv_v4_l12_kernel(
             }
         }
 
-        // ---- Block reduction ----
+        // ---- Warp reduction ----
+        // Shuffles only. No shared memory and no __syncthreads: warps in this
+        // block are working on DIFFERENT rows and never need to meet, which is
+        // the second thing a warp-per-row shape buys.
         acc = warp_reduce_sum(acc);
-        // The grid-stride loop reuses warp_sums every iteration, so a warp
-        // that races ahead must not overwrite a value warp 0 has not read yet.
-        __syncthreads();
-        if (lane == 0) warp_sums[warp_id] = acc;
-        __syncthreads();
-
-        if (warp_id == 0) {
-            float v = (lane < N_WARPS) ? warp_sums[lane] : 0.0f;
-            v = warp_reduce_sum(v);
-            if (lane == 0) {
-                y[row] = from_f32<T>(ROW_SCALE_HOIST ? (v * scale) : v);
-            }
+        if (lane == 0) {
+            y[row] = from_f32<T>(ROW_SCALE_HOIST ? (acc * scale) : acc);
         }
     }
 }
@@ -393,7 +418,9 @@ extern "C" {
               cudaStream_t stream) {                                               \
         constexpr int THREADS = 128;                                               \
         if (n_rows <= 0 || num_symbols <= 0 || packed_per_row <= 0) return;        \
-        const int blocks = n_rows < QV4_MAX_BLOCKS ? n_rows : QV4_MAX_BLOCKS;      \
+        constexpr int ROWS_PER_BLOCK = THREADS / 32;                               \
+        const int want = (n_rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;           \
+        const int blocks = want < QV4_MAX_BLOCKS ? want : QV4_MAX_BLOCKS;          \
         if (row_scale_hoist != 0) {                                                \
             switch (k) {                                                           \
                 case 8:  QTIP_V4L12_LAUNCH_K(T, 8,  true); break;                  \
