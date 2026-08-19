@@ -923,7 +923,8 @@ fn ensure_non_beam_geometry(what: &str) -> Result<()> {
 }
 
 /// One-shot quantize entry point. Returns `(packed_blocks, row_scales)`:
-/// * `packed_blocks` — `[n_rows, num_symbols / (8/K)]` U8, `8/K` symbols per byte.
+/// * `packed_blocks` — `[n_rows, ceil(num_symbols*K/8)]` U8; symbol `t` occupies
+///   bits `[t*K, t*K + K)`, LSB-first.
 /// * `row_scales`    — `[n_rows]` F32, per-row scale.
 ///
 /// `weight_rotated_f32` should already be in the rotated frame (caller is
@@ -947,15 +948,21 @@ pub(crate) fn quantize_rows_cuda(
     }
     let (n_rows, k_in) = weight_rotated_f32.dims2()?;
     let num_symbols = k_in / super::V as usize;
-    // Symbols per packed byte, from the rung's K: 2 at K=4, 1 at K=8. Derived
-    // rather than written as `2` so the packing follows `qtip::K` the day it
-    // moves — `qtip_geom.cuh::SYMS_PER_BYTE` is the CUDA side of this number.
-    let syms_per_byte = 8 / super::K as usize;
-    if !num_symbols.is_multiple_of(syms_per_byte) {
+    // The packed row is a bitstream: symbol `t` at bits `[t*K, t*K + K)`,
+    // LSB-first, `ceil(num_symbols*K/8)` bytes. `super::packed_bytes_per_row`
+    // is the single formula; `qtip_geom.cuh::qtip_packed_bytes_per_row` is its
+    // CUDA twin and `Rung::packed_bytes` is the serving side's.
+    //
+    // The previous `8 / super::K` form was a division by zero at K=9 — the
+    // rung the quality sweep selected — and would have panicked before the
+    // kernel was ever reached.
+    if !super::packed_row_is_whole_bytes(num_symbols, super::K) {
         candle_core::bail!(
-            "QTIP quantize CUDA: num_symbols ({num_symbols}) must be a multiple of \
-             {syms_per_byte} for K={} packing",
-            super::K
+            "QTIP quantize CUDA: num_symbols ({num_symbols}) x K={} is not a whole number \
+             of bytes ({} bits). Refusing rather than baking a row whose stride the decoder \
+             would have to guess.",
+            super::K,
+            num_symbols * super::K as usize,
         );
     }
     if weight_rotated_f32.dtype() != DType::F32 {
@@ -986,7 +993,7 @@ pub(crate) fn quantize_rows_cuda(
     let row_scales = compute_row_scales_cuda(&weight_contig, codebook.scale_divisor())?;
 
     // Step 2: allocate packed output.
-    let packed_per_row = num_symbols / syms_per_byte;
+    let packed_per_row = super::packed_bytes_per_row(num_symbols, super::K);
     let packed_buf = dev.alloc_zeros::<u8>(n_rows * packed_per_row)?;
     let packed_shape = candle_core::Shape::from_dims(&[n_rows, packed_per_row]);
 

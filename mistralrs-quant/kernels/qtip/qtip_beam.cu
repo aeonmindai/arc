@@ -8,10 +8,15 @@
 //
 // GEOMETRY IS A TEMPLATE PARAMETER (see qtip_geom.cuh)
 // ---------------------------------------------------
-// Two rungs are compiled, both at 2 bits/weight:
+// Three rungs are compiled:
 //
-//     K=4 / V=2 / L=16   the shipped rung; 15.125 decode instructions/weight
-//     K=8 / V=4 / L=12   the same rate at  4.375 decode instructions/weight
+//     K=4 / V=2 / L=16   2.00 bpw, the shipped rung; 15.125 decode inst/weight
+//     K=8 / V=4 / L=12   2.00 bpw at 4.375 decode inst/weight
+//     K=9 / V=4 / L=12   2.25 bpw — THE BAKE TARGET. K=8/V=4/L=12 is quality-
+//                        CLOSED (-0.00698 with a random codebook, -0.00307 with
+//                        a converged trellis-Lloyd one, against a +-0.0008 ship
+//                        band, over six codebook designs); K=9 measures
+//                        +0.00402, 5x better than the shipped control.
 //
 // The K=8 rung is NOT reachable by bumping the constants. Three things in this
 // kernel are shaped by `2^(L-K)` and `2^K`, and at K=8/L=12 all three invert:
@@ -30,17 +35,29 @@
 //
 //     K=4/L=16:  4096 groups >= 256 threads  ->  LANES = 1,  cand[16/1 ] = 16
 //     K=8/L=12:    16 groups                 ->  LANES = 16, cand[256/16] = 16
+//     K=9/L=12:     8 groups                 ->  LANES = 32, cand[512/32] = 16
 //
-// The block stays fully occupied at both geometries and the register array
-// stays 16 entries at both — the candidate count per timestep is `2^L`-
-// saturated (`ng * 2^K = 4096`) either way, so the SAME work is simply
+// The block stays fully occupied at all three geometries and the register array
+// stays 16 entries at all three — the candidate count per timestep is `2^L`-
+// saturated (`ng * 2^K = 4096`) every time, so the SAME work is simply
 // re-blocked. `LANES == 1` collapses every expression below to the shipped
 // code, which is why the K=4 rung stays byte-identical.
+//
+// 🔑 THAT INVARIANCE IS ALSO THE K=9 COST ARGUMENT. Going K=8 -> K=9 at fixed
+// V=4/L=12 changes NO per-timestep quantity in this kernel: same 4096
+// candidates, same cand[16], same ~3.87 radix passes over the same 32-bit cost
+// key, same V=4 branch metric, same `2^K * V * 4 B` of LUT per group over half
+// as many groups (65,536 B per timestep either way), same `beam_w` trace
+// words, and `num_symbols = in_features / V` is K-independent. The one term
+// that does move is the packer: one byte store per symbol at K=8 becomes two
+// byte read-modify-writes in thread 0's serial backtrace. So K=9 s/layer is
+// K=8 s/layer plus that term — see the encode-cost note below.
 //
 // The third is handled by sizing the shared scratch as
 // `max(2^(L-K) u64, STAGE_U64_MIN)`: at K=4 that is exactly the 4096-entry
 // group table that already staged the backtrace (no change at all), and at K=8
-// it is a 16 KiB stage over a 128 B table. That is not a smaller staging
+// (128 B table) and K=9 (64 B table) it is the same 16 KiB stage over a table
+// far too small to serve as one. That is not a smaller staging
 // budget in the terms that matter — the backtrace's dependent global loads are
 // `num_symbols / window`, and V=4 halves `num_symbols` exactly as the halved
 // window doubles it: 9472/32 == 4736/16 == 296 per row, unchanged.
@@ -210,10 +227,11 @@ struct QbShape {
     static_assert(MAX_GROUPS <= GROUPS,
                   "every live group must have a lane team in the block");
     // `cand[]` MUST stay in registers; see the spill note on
-    // QB_MIN_BLOCKS_PER_SM. 16 is what both shipped geometries produce, and it
-    // is the number `cuobjdump -res-usage` has been checked at (LOCAL:0,
-    // REG<=62). A geometry that would push it higher must be measured before it
-    // is trusted, not reasoned about — hence the ceiling rather than a comment.
+    // QB_MIN_BLOCKS_PER_SM. 16 is what all three instantiated geometries
+    // produce (K=4: 16/1, K=8: 256/16, K=9: 512/32), and it is the number
+    // `cuobjdump -res-usage` has been checked at (LOCAL:0, REG<=62). A geometry
+    // that would push it higher must be measured before it is trusted, not
+    // reasoned about — hence the ceiling rather than a comment.
     static_assert(CAND >= 1 && CAND <= 16,
                   "cand[] must stay small enough to live in registers");
     // `keep_mask` is a 32-bit bitset over `cand[]`.
@@ -760,6 +778,14 @@ int launch_qtip_quantize_rows_beam_geom_f32(
     }
     if (k_bits == 8 && v_dim == 4 && l_bits == 12) {
         return qb_launch<QtipGeomK8V4L12>(
+            d_weight, d_lut, d_row_scales, d_packed, d_trace,
+            n_rows, in_features, num_symbols, row_offset, beam_w, cb_mult, stream);
+    }
+    // 2.25 bpw. The caller must size `d_packed` as `ceil(num_symbols*9/8)` per
+    // row — `num_symbols / (8/K)` is a division by zero at this rung, which is
+    // why `qtip_packed_bytes_per_row` is no longer written that way.
+    if (k_bits == 9 && v_dim == 4 && l_bits == 12) {
+        return qb_launch<QtipGeomK9V4L12>(
             d_weight, d_lut, d_row_scales, d_packed, d_trace,
             n_rows, in_features, num_symbols, row_offset, beam_w, cb_mult, stream);
     }

@@ -385,6 +385,58 @@ const LUT_SIZE: usize = 1 << L;
 /// Symbol alphabet size: 2^K.
 const ALPHABET: usize = 1 << K;
 
+/// Packed bytes holding `num_symbols` trellis symbols at `k` bits per symbol:
+/// `ceil(num_symbols * k / 8)`.
+///
+/// The Rust twin of `kernels/qtip/qtip_geom.cuh::qtip_packed_bytes_per_row`,
+/// and the same rule as the serving side's `Rung::packed_bytes`. The encoder
+/// and the decoder must agree on the row stride byte for byte, so there is one
+/// formula and both sides use it.
+///
+/// **Not `num_symbols / (8 / k)`.** That form is only correct when `k` divides
+/// 8; at the K=9/V=4/L=12 rung `8 / 9 == 0` and it divides by zero. It agrees
+/// with this one wherever it is defined: at K=4 with `num_symbols` even
+/// (enforced by [`packed_row_is_whole_bytes`]) `(4n+7)/8 == n/2`, and at K=8
+/// `(8n+7)/8 == n`.
+pub(crate) const fn packed_bytes_per_row(num_symbols: usize, k: u32) -> usize {
+    (num_symbols * k as usize).div_ceil(8)
+}
+
+/// Does a row of `num_symbols` symbols at `k` bits occupy a whole number of
+/// bytes?
+///
+/// At K=4 this is exactly the shipped "num_symbols must be even" rule. It is
+/// kept at every rung because a partial trailing byte is a row stride the two
+/// sides can disagree about for free, and every real V4-Flash / Qwen expert
+/// shape satisfies it (`in_features` 7168 and 2048 give `num_symbols` 1792 and
+/// 512 at V=4, both multiples of 8). Refuse, never round.
+pub(crate) const fn packed_row_is_whole_bytes(num_symbols: usize, k: u32) -> bool {
+    (num_symbols * k as usize).is_multiple_of(8)
+}
+
+// The general formula must reproduce the shipped K=4 nibble packing and the
+// K=8 byte packing EXACTLY, at the real V4-Flash expert shapes — otherwise
+// re-pointing the bake at another rung silently resizes the artifact of the
+// rung that already shipped. Asserted at compile time so it holds in every
+// build, `cuda` feature or not, and so these `const fn`s have a use that does
+// not depend on which features are enabled.
+//
+//   in_features 7168 -> num_symbols 3584 (V=2) / 1792 (V=4)
+//   in_features 2048 -> num_symbols 1024 (V=2) /  512 (V=4)
+const _: () = {
+    // K=4/V=2/L=16, the shipped rung: identical to `num_symbols / 2`.
+    assert!(packed_bytes_per_row(3584, 4) == 3584 / 2);
+    assert!(packed_bytes_per_row(1024, 4) == 1024 / 2);
+    // K=8/V=4/L=12: identical to `num_symbols`.
+    assert!(packed_bytes_per_row(1792, 8) == 1792);
+    assert!(packed_bytes_per_row(512, 8) == 512);
+    // K=9/V=4/L=12: 9/8 of the K=8 row, exactly, at both shapes.
+    assert!(packed_bytes_per_row(1792, 9) == 1792 * 9 / 8);
+    assert!(packed_bytes_per_row(512, 9) == 512 * 9 / 8);
+    assert!(packed_row_is_whole_bytes(1792, 9));
+    assert!(packed_row_is_whole_bytes(512, 9));
+};
+
 pub(crate) const N_BITS: usize = 2;
 
 /// Per-state pseudo-random Gaussian LUT.
@@ -4260,6 +4312,150 @@ impl QuantizedSerde for QtipLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bitstream `kernels/qtip/qtip_geom.cuh::qtip_pack_symbol` writes in
+    /// its straddling branch, implemented independently here.
+    ///
+    /// Symbol `t` at bits `[t*K, t*K + K)`, LSB-first — the same rule as the
+    /// serving side's `Rung::pack`. This is a REFERENCE, not a wrapper: it
+    /// exists so the K=4 identity below compares two separately-written
+    /// packers rather than one packer against itself.
+    fn bitstream_pack(syms: &[u32], k: u32) -> Vec<u8> {
+        let mut out = vec![0u8; packed_bytes_per_row(syms.len(), k)];
+        let mask = (1u64 << k) - 1;
+        for (t, &s) in syms.iter().enumerate() {
+            let bit = t * k as usize;
+            let v = (u64::from(s) & mask) << (bit % 8);
+            let need = ((bit % 8) + k as usize).div_ceil(8);
+            for i in 0..need {
+                out[bit / 8 + i] |= ((v >> (8 * i)) & 0xFF) as u8;
+            }
+        }
+        out
+    }
+
+    /// The shipped K=4 nibble packer, verbatim from `cpu_reference_packed`.
+    fn nibble_pack_k4(syms: &[u32]) -> Vec<u8> {
+        let mut packed = vec![0u8; syms.len() / 2];
+        for (i, &sym) in syms.iter().enumerate() {
+            if i.is_multiple_of(2) {
+                packed[i / 2] = (sym & 0x0F) as u8;
+            } else {
+                packed[i / 2] |= ((sym & 0x0F) << 4) as u8;
+            }
+        }
+        packed
+    }
+
+    /// **The no-GPU half of "K=4/V=2/L=16 stays byte-identical".**
+    ///
+    /// `qtip_pack_symbol` stopped being "one byte per `8/K` symbols" and became
+    /// a bitstream so that K=9 — where a symbol straddles two bytes — can be
+    /// baked at all. That generalisation is only safe if the bitstream rule and
+    /// the nibble rule are the SAME bytes at K=4, which is a property of the
+    /// two rules and can be checked on the host with no CUDA toolchain and no
+    /// device.
+    ///
+    /// (The CUDA side does not even rely on this: the byte-aligned branch is
+    /// kept verbatim under `if constexpr`, so K=4 compiles from unchanged
+    /// source. This pins the rule the discarded branch would have produced, so
+    /// that collapsing the two later is a checked change rather than a hope.)
+    #[test]
+    fn the_bitstream_reproduces_the_shipped_k4_nibble_packing() {
+        let mut state = 0x1234_5678u32;
+        let syms: Vec<u32> = (0..4096)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 17) & 0x0F
+            })
+            .collect();
+        assert_eq!(bitstream_pack(&syms, 4), nibble_pack_k4(&syms));
+    }
+
+    /// K=8 is a plain byte store, and the bitstream must agree with that too.
+    #[test]
+    fn the_bitstream_is_a_byte_store_at_k8() {
+        let syms: Vec<u32> = (0..1792u32).map(|t| (t * 37) & 0xFF).collect();
+        let packed = bitstream_pack(&syms, 8);
+        assert_eq!(packed.len(), 1792);
+        assert!(packed
+            .iter()
+            .zip(syms.iter())
+            .all(|(&b, &s)| u32::from(b) == s));
+    }
+
+    /// K=9 round-trips through the bit rule the SERVING side extracts with.
+    ///
+    /// The encoder and `Rung::extract` must read the same bits at the same
+    /// offsets, so the extraction is written out here independently rather
+    /// than as `bitstream_pack`'s inverse-by-construction. Includes the last
+    /// symbol of the row, which is the one a wrong `packed_bytes` would run
+    /// off the end of.
+    #[test]
+    fn k9_symbols_land_where_the_decoder_looks_for_them() {
+        const K: u32 = 9;
+        let n = 1792usize; // V4-Flash gate/up: in_features 7168 at V=4.
+        let mut state = 0x9E37_79B9u32;
+        let syms: Vec<u32> = (0..n)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 13) & 0x1FF
+            })
+            .collect();
+        let packed = bitstream_pack(&syms, K);
+
+        assert_eq!(packed.len(), packed_bytes_per_row(n, K));
+        assert_eq!(packed.len(), n * 9 / 8, "9 bits/symbol, whole bytes");
+
+        for (t, &want) in syms.iter().enumerate() {
+            let bit = t * K as usize;
+            let (b0, off) = (bit / 8, (bit % 8) as u32);
+            let need = (off as usize + K as usize).div_ceil(8);
+            assert!(
+                b0 + need <= packed.len(),
+                "symbol {t} extraction runs past the packed row"
+            );
+            let mut w = 0u32;
+            for i in 0..need {
+                w |= u32::from(packed[b0 + i]) << (8 * i);
+            }
+            assert_eq!((w >> off) & 0x1FF, want, "symbol {t}");
+        }
+    }
+
+    /// The straddling bound is `ceil((8 - gcd(K,8) + K)/8)`, not
+    /// `ceil((7+K)/8)`: the reachable bit offsets are multiples of `gcd(K,8)`,
+    /// so 7 is not reachable at K=8 or K=10. Mirrors
+    /// `QtipGeom::MAX_BYTES_PER_SYMBOL`; an over-estimate would have the packer
+    /// touch a byte past the row.
+    #[test]
+    fn the_straddle_bound_is_exact_at_every_baked_k() {
+        for (k, want) in [(4u32, 1usize), (8, 1), (9, 2), (10, 2)] {
+            let reached: usize = (0..8usize)
+                .map(|t| ((t * k as usize) % 8 + k as usize).div_ceil(8))
+                .max()
+                .unwrap();
+            let g: usize = [8usize, 4, 2, 1]
+                .into_iter()
+                .find(|g| (k as usize).is_multiple_of(*g))
+                .unwrap();
+            let formula = (8 - g + k as usize).div_ceil(8);
+            assert_eq!(reached, want, "K={k}: reachable worst case");
+            assert_eq!(formula, want, "K={k}: gcd formula");
+        }
+    }
+
+    /// A partial trailing byte is refused, not rounded — at every rung.
+    #[test]
+    fn a_row_that_is_not_whole_bytes_is_rejected() {
+        assert!(packed_row_is_whole_bytes(1792, 9));
+        assert!(packed_row_is_whole_bytes(512, 9));
+        assert!(!packed_row_is_whole_bytes(1793, 9));
+        // K=4's rule was "num_symbols must be even"; this must still be it.
+        for n in 0..64usize {
+            assert_eq!(packed_row_is_whole_bytes(n, 4), n.is_multiple_of(2));
+        }
+    }
 
     /// Sanity: LUT has the right size and reasonable distribution.
     #[test]
