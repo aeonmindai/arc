@@ -397,6 +397,32 @@ pub trait MultimodalPromptPrefixer: Send + Sync {
     }
 }
 
+thread_local! {
+    /// Set by `Engine::run` around a prefill step that is NOT the last chunk of
+    /// its prompts, and read by `Pipeline::step`'s sampling stage.
+    static PREFILL_INTERMEDIATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Mark the step about to run as an intermediate prefill chunk. Returns a guard
+/// that clears the flag, so an early return or a panic inside the step cannot
+/// leave the next decode step believing it must not sample.
+pub(crate) fn mark_prefill_intermediate() -> PrefillChunkGuard {
+    PREFILL_INTERMEDIATE.with(|f| f.set(true));
+    PrefillChunkGuard
+}
+
+pub(crate) struct PrefillChunkGuard;
+
+impl Drop for PrefillChunkGuard {
+    fn drop(&mut self) {
+        PREFILL_INTERMEDIATE.with(|f| f.set(false));
+    }
+}
+
+pub(crate) fn prefill_chunk_is_intermediate() -> bool {
+    PREFILL_INTERMEDIATE.with(std::cell::Cell::get)
+}
+
 #[derive(Clone)]
 pub enum CacheBackendMetadata {
     DefaultInstructions {

@@ -737,6 +737,19 @@ impl Sequence {
         self.prompt = new;
     }
 
+    /// Advance (or reset) this sequence's **prefill cursor**: how many of its
+    /// prompt tokens have already been fed to the model.
+    ///
+    /// The field existed but nothing moved it — it was only ever set once, by
+    /// the prefill-prompt restore builder — so `token_offset()` was 0 on every
+    /// live path and `make_prompt_chunk`'s `chunk_offset_toks` was dead
+    /// plumbing. The engine now advances it per chunk and resets it to 0 when
+    /// the prompt completes, because it is part of the scheduler's bucket key
+    /// and a decode cohort carrying stale offsets would shatter.
+    pub fn set_token_offset(&mut self, offset: usize) {
+        self.token_offset = offset;
+    }
+
     pub fn token_offset(&self) -> usize {
         self.token_offset
     }
