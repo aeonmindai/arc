@@ -1541,6 +1541,30 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
         }
 
         let can_be_ragged = batch_can_be_ragged(seqs, modify_draft_cache);
+        // Engagement instrumentation. Without this, a run cannot distinguish
+        // "`ARC_V4_XS_PER_SEQ` was silently ignored" from "ragged decode did not
+        // help" — the two have identical throughput signatures and the second is
+        // a much more expensive conclusion to draw wrongly.
+        //
+        // Logged on TRANSITION, not per call: this runs once per batch build, so
+        // an unconditional line would emit thousands per measurement run and bury
+        // the signal. `resolutions` carries the call count so the span a state
+        // was held for is still recoverable from two adjacent lines.
+        {
+            use std::sync::atomic::{AtomicI8, AtomicU64, Ordering};
+            static LAST: AtomicI8 = AtomicI8::new(-1);
+            static RESOLUTIONS: AtomicU64 = AtomicU64::new(0);
+            let n = RESOLUTIONS.fetch_add(1, Ordering::Relaxed);
+            let now = i8::from(can_be_ragged);
+            if LAST.swap(now, Ordering::Relaxed) != now {
+                tracing::info!(
+                    batch_can_be_ragged = can_be_ragged,
+                    xs_per_seq_enabled = xs_per_sequence_enabled(),
+                    resolutions = n,
+                    "ArcKV: ragged-decode capability resolved"
+                );
+            }
+        }
         set_ragged_decode_supported(can_be_ragged);
 
         // Alignment is attempted only when it is known to complete, so the
