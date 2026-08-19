@@ -293,6 +293,16 @@ qtip_fused_gemv_v4_l12_kernel(
     static_assert(WARMUP_SYMS * K >= (int)QV4_L,
                   "warmup must shift at least L bits through the state register");
 
+    // With the gcd bound, TWO bytes is exact for every K anyone has: K=8 needs
+    // 1, K=9 and K=10 need 2. The general 3-byte path in QtipSymExtract is
+    // therefore unreachable for every supported rung, and exists only to price
+    // the unnecessary generality. A K that needs three (K=11, K=13, ...) is a
+    // real per-symbol cost increase, so it has to be an explicit decision here
+    // rather than something a new `case` quietly turns on.
+    static_assert(QtipSymExtract<K>::MAX_BYTES <= 2,
+                  "this K needs a 3-byte extraction window. That is a per-symbol cost increase "
+                  "on every weight; if it is intended, widen this assert deliberately.");
+
     stage_lut(lut_s, lut, THREADS);
     __syncthreads();
 

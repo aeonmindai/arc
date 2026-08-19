@@ -68,6 +68,35 @@
 //! which is exactly what this rule produces at K=4. Pinned by
 //! [`tests::the_bit_layout_matches_the_shipped_k4_rungs_nibble_order`].
 //!
+//! # How to read an inst/weight census number against this kernel
+//!
+//! The alignment census measures `inst/weight` as a **differential over unroll
+//! depth**. That cancels prologue and epilogue *exactly*, which is what makes
+//! it robust — and it is also precisely why it is **blind to per-row and
+//! per-block overhead**.
+//!
+//! Concretely: this kernel's move to one warp per row deleted a cross-warp
+//! butterfly, a `warp_sums` shared array, and **both `__syncthreads` from the
+//! row loop**. **None of that can ever appear in a census number.** The
+//! instrument can neither credit nor charge it.
+//!
+//! So a flat census result does **not** mean the reshape did nothing. What the
+//! census measures is steady-state inner-loop cost per weight; the reshape
+//! shows up there only *indirectly*, through the extraction rate it changes
+//! ([`Rung::extractions_per_weight_x10000`]). The barrier removal is a real
+//! change in a regime that instrument does not observe, and it will only
+//! surface in `ncu` or in wall-clock on a card.
+//!
+//! [`Rung::structural_per_row_overhead`] exists so that half has an accounting
+//! of its own — structural counts, taken from the source, never presented as
+//! instruction counts.
+//!
+//! And when the census does report a per-route cost, multiply it by **this
+//! rung's own extraction rate at the shape in question**
+//! ([`Rung::route_cost_per_weight_x10000`]), not by an illustrative endpoint.
+//! At `in_features=4096` this kernel runs at 0.2651 extractions per weight, not
+//! at 0.25 and not at 0.375.
+//!
 //! # The row-scale hoist
 //!
 //! [`RowScaleHoist`] is a separate switch from everything else because it is
@@ -335,6 +364,14 @@ impl Rung {
     /// and discard a wasted byte on every symbol. 1 at K=8, 2 at K=9, 2 at
     /// K=10.
     ///
+    /// **Two bytes is EXACT, not merely sufficient, for every K this family
+    /// implements.** K=8 needs 1 and K=9/K=10 need 2, so the general 3-byte
+    /// route is unreachable for any supported rung — it survives in the
+    /// template only to price the unnecessary generality. A K that needed
+    /// three (K=11, K=13, …) would have to be added deliberately; the kernel
+    /// `static_assert`s against instantiating one, and
+    /// [`tests::two_bytes_is_exact_for_every_supported_k`] pins it here.
+    ///
     /// Mirrors `QtipSymExtract<K>::MAX_BYTES` in the kernel, and is also the
     /// number of bytes the row stride would have to be padded by to delete that
     /// kernel's tail clamp.
@@ -349,6 +386,47 @@ impl Rung {
     #[inline]
     pub fn syms_per_lane(self, num_symbols: usize) -> usize {
         num_symbols.div_ceil(KERNEL_LANES_PER_ROW)
+    }
+
+    /// Convert a per-EXTRACTION cost into a per-WEIGHT cost at a given shape.
+    ///
+    /// The census reports route costs per symbol extraction. Turning that into
+    /// a per-weight number requires **this rung's actual extraction rate at
+    /// the shape in question**, which is what
+    /// [`Rung::extractions_per_weight_x10000`] gives. Quoting one of the
+    /// census's illustrative endpoints (0.25 / 0.375 / 0.50) instead would be
+    /// wrong for this kernel in both directions — it runs at 0.2651 at
+    /// `in_features=4096` and 0.3105 at 1024.
+    ///
+    /// `inst_per_extraction_x100` is the route cost ×100 (so 175 means 1.75
+    /// instructions per extraction). Result is ×10,000, matching
+    /// [`Rung::extractions_per_weight_x10000`].
+    pub fn route_cost_per_weight_x10000(
+        self,
+        num_symbols: usize,
+        inst_per_extraction_x100: usize,
+    ) -> usize {
+        self.extractions_per_weight_x10000(num_symbols) * inst_per_extraction_x100 / 100
+    }
+
+    /// Per-row work the census **cannot see**, as structural counts.
+    ///
+    /// Returns `(block_barriers, warp_butterflies, shared_roundtrips)` for one
+    /// output row.
+    ///
+    /// These are counts of *constructs in the source*, not instruction counts.
+    /// Nothing here has been compiled, and turning any of it into a cycle or
+    /// instruction figure requires `ncu` or a card. They exist because the
+    /// census's differential-over-unroll-depth method cancels exactly this
+    /// category, so the warp-per-row reshape would otherwise have no
+    /// accounting at all.
+    ///
+    /// Before the reshape (a row split across a whole block): `(2, 2, 2)` — two
+    /// `__syncthreads`, an intra-warp butterfly plus a cross-warp one, and a
+    /// `warp_sums` store and load. After: `(0, 1, 0)`.
+    pub fn structural_per_row_overhead(self) -> (usize, usize, usize) {
+        // A warp owns a row, so the reduction never leaves the warp.
+        (0, 1, 0)
     }
 
     /// Symbol extractions per decoded weight, ×10,000, for a row of
@@ -1518,6 +1596,88 @@ mod tests {
     }
 
     #[test]
+    fn two_bytes_is_exact_for_every_supported_k() {
+        // The gcd bound makes two bytes EXACT for K=9 and K=10, not just
+        // adequate — so the general 3-byte extraction route is dead code for
+        // every K anyone has. If a future K needs three, this test is where
+        // that becomes a deliberate decision rather than a silent cost.
+        for r in rungs() {
+            assert!(
+                r.max_bytes_per_symbol() <= 2,
+                "K={}: needs {} bytes per symbol. The 3-byte route is supposed to be \
+                 unreachable for every supported rung — adding a K that needs it is a real \
+                 cost decision, not a detail.",
+                r.k(),
+                r.max_bytes_per_symbol()
+            );
+        }
+        // ...and a K that WOULD need three exists, so the bound is not vacuous.
+        let g = gcd8(11);
+        assert_eq!(g, 1);
+        assert_eq!(
+            (8 - g + 11usize).div_ceil(8),
+            3,
+            "K=11 would need three bytes"
+        );
+    }
+
+    #[test]
+    fn the_per_row_overhead_the_census_cannot_see_is_accounted_separately() {
+        // The census measures inst/weight as a differential over unroll depth,
+        // which cancels prologue and epilogue exactly — and is therefore blind
+        // to everything counted here. A flat census number does NOT mean the
+        // warp-per-row reshape did nothing; the reshape's reduction half is
+        // invisible to that instrument by construction.
+        //
+        // Structural counts from the source, NOT instruction counts. Nothing
+        // here has been compiled.
+        let r = Rung::CONTROL;
+        let (barriers, butterflies, shared_roundtrips) = r.structural_per_row_overhead();
+        assert_eq!(
+            barriers, 0,
+            "a warp owns a row; nothing needs a block barrier"
+        );
+        assert_eq!(
+            butterflies, 1,
+            "one intra-warp butterfly, no cross-warp step"
+        );
+        assert_eq!(shared_roundtrips, 0, "no `warp_sums` store/load");
+
+        // What it was before the reshape, so the delta is on the record rather
+        // than in a commit message.
+        let (was_barriers, was_butterflies, was_shared) = (2usize, 2usize, 2usize);
+        assert!(barriers < was_barriers);
+        assert!(butterflies < was_butterflies);
+        assert!(shared_roundtrips < was_shared);
+
+        // It is K-independent, like the warmup tax.
+        for rr in rungs() {
+            assert_eq!(rr.structural_per_row_overhead(), (0, 1, 0));
+        }
+    }
+
+    #[test]
+    fn a_census_route_cost_is_multiplied_by_this_rungs_own_rate() {
+        // Pins the arithmetic the census result will be run through, so the
+        // step where an illustrative endpoint gets substituted for the real
+        // rate cannot happen silently.
+        let r = Rung::CONTROL;
+        // in_features=4096 -> 1024 symbols -> 0.2651 extractions/weight.
+        assert_eq!(r.extractions_per_weight_x10000(1024), 2651);
+        // A hypothetical 1.75 inst/extraction route costs 0.4639 inst/weight
+        // here — NOT 0.4375 (the 0.25 endpoint) and NOT 0.65625 (the 0.375 one).
+        assert_eq!(r.route_cost_per_weight_x10000(1024, 175), 4639);
+        assert_ne!(r.route_cost_per_weight_x10000(1024, 175), 2500 * 175 / 100);
+        assert_ne!(r.route_cost_per_weight_x10000(1024, 175), 3750 * 175 / 100);
+        // in_features=1024 -> 256 symbols -> 0.3105.
+        assert_eq!(r.extractions_per_weight_x10000(256), 3105);
+        assert_eq!(r.route_cost_per_weight_x10000(256, 175), 5433);
+        // A zero-cost route costs nothing; a 1.00 route is exactly the rate.
+        assert_eq!(r.route_cost_per_weight_x10000(1024, 0), 0);
+        assert_eq!(r.route_cost_per_weight_x10000(1024, 100), 2651);
+    }
+
+    #[test]
     fn the_reachable_offset_bound_saves_a_byte_at_k10() {
         // `(t*K) mod 8` only ever takes the multiples of gcd(K, 8), so the
         // worst reachable offset is 8 - gcd(K,8), not 7. At K=10 that is the
@@ -1599,6 +1759,10 @@ mod tests {
                 "row += gridDim.x * N_WARPS".to_string(),
                 "grid stride over rows in units of warps",
             ),
+            (
+                "static_assert(QtipSymExtract<K>::MAX_BYTES <= 2,".to_string(),
+                "compile-time refusal of a K needing a 3-byte window",
+            ),
         ];
         for (needle, what) in want {
             assert!(
@@ -1658,6 +1822,32 @@ mod tests {
             !src.contains("__shared__ float warp_sums"),
             "the kernel regained a cross-warp reduction; `gemv_row_gpu_model` models ONE warp \
              butterfly and would no longer be bit-exact"
+        );
+        // Exactly ONE `__syncthreads` STATEMENT in the whole kernel: the one
+        // after staging the table. Any barrier inside the row loop is per-row
+        // overhead that the inst/weight census cannot see, so it would never
+        // show up as a regression there — this is the only thing that watches
+        // for it.
+        //
+        // Comments are stripped first. Counting raw occurrences also counts the
+        // two places the header *describes* barriers, which made this guard
+        // report 2 against a kernel that has 1 — a false alarm whose obvious
+        // "fix" is to assert 2, at which point it would never catch a real
+        // barrier again.
+        let code_only: String = SRC
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let barriers = code_only.matches("__syncthreads();").count();
+        assert_eq!(
+            barriers, 1,
+            "expected exactly one __syncthreads statement (staging the table), found \
+             {barriers}. A barrier in the row loop is per-row cost that the \
+             unroll-differential census is blind to by construction."
         );
     }
 
