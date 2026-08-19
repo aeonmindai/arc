@@ -52,6 +52,7 @@ pub async fn run_server(
         .with_interactive_mode(false)
         .with_prefix_cache_n(runtime.prefix_cache_n)
         .with_mtp_depth(runtime.mtp_depth as usize)
+        .with_v4_ragged_decode(runtime.v4_ragged_decode)
         .set_paged_attn(paged_attn)
         .with_cpu(cpu)
         .with_enable_search(runtime.enable_search)

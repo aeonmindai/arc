@@ -455,6 +455,22 @@ pub struct RuntimeOptions {
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=8))]
     #[serde(default)]
     pub mtp_depth: u8,
+
+    /// Let DeepSeek V4 decode a batch whose sequences are at different lengths.
+    ///
+    /// V4 does not use PagedAttention, so it runs on `DefaultScheduler`, which
+    /// by default buckets decode by sequence length and runs one bucket per
+    /// step — a batch of B sequences at B distinct lengths decodes one at a
+    /// time. This admits them together, front-aligning the shared KV cache and
+    /// masking each row's dead prefix.
+    ///
+    /// **Off by default.** The mechanism is covered by CPU identity tests but
+    /// has never been run on a GPU; turning it on is a change to what the
+    /// engine serves, not a probe. Equivalent to `ARC_V4_XS_PER_SEQ=1`, which
+    /// remains supported.
+    #[arg(long)]
+    #[serde(default)]
+    pub v4_ragged_decode: bool,
 }
 
 /// Search embedding model options
@@ -513,6 +529,7 @@ impl Default for RuntimeOptions {
             enable_search: false,
             search_embedding_model: None,
             mtp_depth: 0,
+            v4_ragged_decode: false,
         }
     }
 }
