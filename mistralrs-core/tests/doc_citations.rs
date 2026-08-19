@@ -875,6 +875,9 @@ fn analyze(root: &Path, scan_roots: &[&str]) -> Census {
         docs.extend(found.into_iter().filter(|p| p.ends_with(".md")));
     }
     docs.sort();
+    // So a nested scan root ("memory" plus "memory/mission") counts each doc
+    // once instead of inflating the census and duplicating every finding.
+    docs.dedup();
 
     let mut census = Census {
         total: 0,
