@@ -290,20 +290,45 @@ struct QbShape {
 // instead of the 24 that 3 blocks give (+33% occupancy, which for a
 // latency-bound kernel is a ~1.33x throughput term).
 //
-// MEASURED, `cuobjdump -res-usage`, sm_80, CUDA 12.4, build.rs's exact flags
-// (arc-tools/qtip_beam_res_usage_check.sh, which CI now runs on every PR):
+// MEASURED, `cuobjdump -res-usage`, CUDA 12.4, build.rs's exact flags
+// (arc-tools/qtip_beam_res_usage_check.sh, which CI runs on every PR — the
+// table below is from run 32265671233, both matrix arches):
 //
-//     K=8/V=4/L=12  LUT       REG:62 STACK:0 SHARED:19696 LOCAL:0
-//     K=8/V=4/L=12  computed  REG:59 STACK:0 SHARED:19696 LOCAL:0
-//     K=4/V=2/L=16  LUT       REG:60 STACK:0 SHARED:38000 LOCAL:0
-//     K=4/V=2/L=16  computed  REG:60 STACK:0 SHARED:38000 LOCAL:0
+//                              sm_80                        sm_90
+//     K=9/V=4/L=12  LUT       REG:64 SHARED:19632 LOCAL:0   REG:64 SHARED:20656 LOCAL:0
+//     K=9/V=4/L=12  computed  REG:61 SHARED:19632 LOCAL:0   REG:63 SHARED:20656 LOCAL:0
+//     K=8/V=4/L=12  LUT       REG:62 SHARED:19696 LOCAL:0   REG:63 SHARED:20720 LOCAL:0
+//     K=8/V=4/L=12  computed  REG:59 SHARED:19696 LOCAL:0   REG:62 SHARED:20720 LOCAL:0
+//     K=4/V=2/L=16  LUT       REG:60 SHARED:38000 LOCAL:0   REG:63 SHARED:39024 LOCAL:0
+//     K=4/V=2/L=16  computed  REG:60 SHARED:38000 LOCAL:0   REG:63 SHARED:39024 LOCAL:0
 //
-// All four are inside the 64-register budget with NO spill, so the occupancy
-// is real at both geometries. Both SHARED figures are exactly what the
-// declarations above sum to (37,996 -> 38,000 and 19,696), which is an
-// independent check that the K=4 layout did not move when the geometry became
-// a template parameter. Shared memory is not the constraint either way:
-// 4 x 38,000 B is 148 KiB of the 228 KiB an SM has.
+// STACK:0 on all twelve. Every one is inside the 64-register budget with NO
+// spill, so the occupancy is real at all three geometries — `cand[]` stayed in
+// registers at K=9, where a naive `cand[2^K]` would have been 512 entries.
+//
+// Two things this table settles that no argument could:
+//
+//   * THE K=4 AND K=8 sm_80 NUMBERS ARE UNCHANGED from before K=9 existed
+//     (REG:62/59 SHARED:19696 and REG:60/60 SHARED:38000, to the byte). The
+//     shipped rung's register allocation and shared-memory layout did not move
+//     when the packer became a bitstream — which is a compiled fact about
+//     codegen, not an inference from the `if constexpr` keeping its source
+//     identical.
+//   * K=9's SHARED is exactly 64 B BELOW K=8's at both arches (19,632 vs
+//     19,696; 20,656 vs 20,720). That is the group table falling from 16
+//     entries to 8 at 8 B each — the predicted number, arrived at
+//     independently by the compiler.
+//
+// ⚠ ZERO REGISTER HEADROOM AT K=9/LUT. It lands on REG:64 at both arches,
+// which is exactly the cap `__launch_bounds__(256, 4)` imposes
+// (65,536 / 4 / 256). It did NOT spill, so 4 blocks/SM holds — but it is the
+// tightest of the six and the next register added to its hot path is a spill,
+// not a warning. Anything touching the K=9 expansion, the radix loop or the
+// packer must re-run the gate and read the number, not assume the margin that
+// K=8 (REG:62/59) still has.
+//
+// Shared memory is not the constraint at any geometry: 4 x 38,000 B is 148 KiB
+// of the 228 KiB an SM has.
 //
 // (The older `REG:80 ... SHARED:38992` line this note used to quote was a
 // pre-wave16 measurement of a kernel that no longer exists — wave16/wave17
@@ -323,9 +348,12 @@ struct QbShape {
 // mis-scoping that produced the discredited "~1,700 s/layer / 20 h / $30"
 // K=8/L=12 encode estimate. `.github/workflows/cuda_compile_check.yaml` runs
 // this check on every PR so it cannot be skipped; if it ever fails, set
-// QB_MIN_BLOCKS_PER_SM back to 3 (which reproduces the measured allocation
-// exactly and is a no-op) rather than trading a real latency regression for a
-// nominal occupancy gain.
+// QB_MIN_BLOCKS_PER_SM back to 3 rather than trading a real latency regression
+// for a nominal occupancy gain — that raises the cap to 65,536/3/256 = 85
+// registers, which every geometry in the table above clears with room. (It is
+// NOT necessarily allocation-preserving: with a looser cap nvcc is free to
+// take more registers than the 59-64 measured at 4 blocks. Re-run the gate and
+// read the numbers; do not assume the table still applies.)
 //
 // Related landmine: `unsigned int cand[CAND]` must stay in registers, which
 // requires EVERY loop indexing it to be fully unrolled. Weakening any of those
