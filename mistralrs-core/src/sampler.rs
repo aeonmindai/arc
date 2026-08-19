@@ -2760,6 +2760,7 @@ mod topk_parity_tests {
                 0.0, // min_p off
                 None,
                 vec![],
+                None, // logits_bias — added by #151 after #160 wrote this fixture
             )
             .unwrap()
         }
