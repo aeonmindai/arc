@@ -142,7 +142,7 @@ it: ArcKV/Share.**
 | ArcMoE/TD | **TD-MoE** Tucker decomposition of stacked experts, installed as a post-ISQ hook | `arc-engine/src/td_moe.rs`, `td_moe_loader.rs`, `mistralrs-quant/src/td_moe_factored/` |
 | ArcMoE/Sparse | dReLU activation sparsity stats — Tier A | `arc-engine/src/turbo_sparse.rs` |
 | ArcMoE/AnyMoE | training-time MoE adapters over a dense model — orthogonal to serving | `mistralrs-core/src/amoe/` |
-| ArcMoE/EP 🔵 | **NOT ON MASTER — open in PR #89** (stage 0 + stage 1, EP=2). Today `Comm::Dummy(rank=0, world_size=1)` and `SumAllReduce` = clone; the only live multi-GPU path is layer-wise pipeline sharding | `mistralrs-quant/src/distributed/` |
+| ArcMoE/EP ⚠️ | **ON MASTER since PR #89 merged** (`610c4506b`; feature commit `fce33ae22`) — stage 0 + stage 1, EP=2. `Moe::new` calls `build_expert_parallel_plan` (`deepseek4.rs:2211`, called at `:2284`) → `MoEExperts::new_expert_parallel` (`:2292`). **Dark by default: env-gated only, with NO CLI or server flag** — `ARC_EP_SIZE` (`deepseek4.rs:372`) and `ARC_EP_PLACEMENT=balanced` (`:2168`) are the only doors, and `effective_ep_size() <= 1` returns `ExpertParallelPlan::single`, so a default run never shards. `ep_size != comm.world_size()` is an error, not a degrade (`:2222`) | `mistralrs-core/src/moe/expert_parallel.rs` (847 lines), `mistralrs-core/src/models/deepseek4.rs`, `mistralrs-quant/src/distributed/` |
 
 ### 2.6 ArcGraph — GPU-autonomous decode
 
