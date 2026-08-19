@@ -101,9 +101,17 @@ Unresolved. The recommendation depends on it.**
 |---|---|
 | **Chunked prefill before 3.1** | ~3× negative; chunking multiplies steps, the gather is billed per step |
 | **Chase MTP acceptance before 0.1** | you cannot tell distribution mismatch from chain compounding; you would be renting a card to guess |
-| **Build EPLB for one card** | one card is one rank owning all 256 experts. At B=128, 1.53 GB/layer vs a 60 MB L2 — **25× over**; no permutation helps |
-| **Wire `expert_affinity`** | zero call sites, presumes an oracle for *next-step* routing that does not exist, ceiling 4.8% |
 | **Chase tree speculation** | **vLLM is chain-only too**, and SGLang's V4 recipe is `topk=1` — also a chain. Not table stakes |
+
+### Two Arc systems whose SCOPE is now known — these are not verdicts (D1)
+
+**D1: a scoping result is never a verdict.** Both of the following are novel Arc systems. Neither is
+ranked down; each has a measured bound and a named condition under which it becomes worth building.
+
+| system | measured bound today | what would make it pay |
+|---|---|---|
+| **EPLB / expert placement** | On **one** card there is one rank owning all 256 experts, so cross-rank balancing has nothing to balance. At B=128, ~244 distinct experts × 6.29 MB = **1.53 GB/layer against a 60 MB L2 — 25× over**, so no permutation improves reuse. Arc already hard-bounds imbalance at **+5.05%** (`expert_parallel.rs:18-19`) | **It pays the moment `ep_size > 1`.** EP is on master (`deepseek4.rs:2211`) but env-gated with no CLI flag, and **Arc has never run a forward pass on two GPUs**. Build the rebalancer *when* the second card runs — the reference gains (1.49× prefill / 2.54× decode) are multi-node numbers and are only reachable there |
+| **`expert_affinity`** | Zero call sites; presumes an oracle for *next-step* routing that does not exist; headroom is **4.8%** because 243.7 of 256 experts (95.2%) are already distinct at B=128 | Two conditions change it: (a) a **smaller effective batch**, where distinct-expert count falls and affinity has room; (b) a **real predictor** replacing the oracle — the closed-form `tid2eid_expert_loads` (`deepseek4.rs:2185`) already predicts load from the tokenizer with zero GPU for V4's 3 hash-routed layers. **Extending that to the other 40 is the thing to build**, and it is Arc-only — both references need a profiling pass |
 | **Copy SGLang's 8192 chunk** | no-op at N=2048, and their per-token cost is **29.5× lower**. Arc's equivalent is ~277 |
 | **Use `KvCache::Rotating` for 2.1** | undoes 1.1 and kills the graph arm |
 | **Quote their per-GPU totals as comparable** | `(input+output)/GPU` at 8192/1024 = a **9× multiplier**, on top of a TP≥4 divisor and a 2.97× spec multiplier |
