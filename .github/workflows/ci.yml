@@ -49,6 +49,62 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # WHY THIS LANE EXISTS
+  # --------------------
+  # Widening the `pull_request` branch filter above makes the real lanes RUN on
+  # a stacked PR. It does not make the stack itself visible, and the stack is
+  # the thing that produced the incident: five PRs (#109, #113, #114, #116,
+  # #121) were based on other PRs' branches, so they ran zero lanes, displayed
+  # only `comment`, and read as green while nothing had been compiled, tested,
+  # linted or nvcc'd.
+  #
+  # The trigger fix and this lane answer two different questions:
+  #
+  #   trigger fix  -> "did the lanes run?"        (they now do)
+  #   this lane    -> "did they run against the
+  #                    code that will actually
+  #                    land on master?"           (only if base == master)
+  #
+  # The second is not implied by the first. A stacked PR's lanes compile
+  # head-merged-into-*another PR's branch*. That base can still change or be
+  # rebased under it, so a green there is a green about a tree that may never
+  # exist. Worse, it is green on code whose parent has not itself been proven —
+  # the stack inherits its base's unreviewed state and reports success anyway.
+  #
+  # So: refuse. A PR that does not target `master` is red until it is rebased.
+  # This is deliberately a HARD failure and not a warning — the whole class of
+  # defect being fixed is "an absence that reads as a pass", and a warning is
+  # another absence.
+  #
+  # It is a lane of `ci.yml` rather than its own workflow on purpose: `CI
+  # complete` is the single required status check in branch protection, and it
+  # aggregates this job's `needs`. A separate workflow would not be required by
+  # branch protection and could be merged straight past.
+  base-branch:
+    name: Base branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse a pull request that does not target master
+        # `push`, `schedule` and `workflow_dispatch` have an empty `base_ref`.
+        # The step is skipped for them, but the JOB still succeeds, so
+        # `ci-complete`'s lane count is the same number on every event type.
+        if: github.event_name == 'pull_request'
+        env:
+          # Via env, never interpolated into the script: a branch name is
+          # attacker-controlled text and `${{ }}` inside `run:` is substituted
+          # before the shell sees it.
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          echo "head: ${HEAD_REF}"
+          echo "base: ${BASE_REF}"
+          if [ "${BASE_REF}" != "master" ]; then
+            echo "::error::This PR targets '${BASE_REF}', not 'master'. Its lanes compile the head merged into another PR's branch, which is not the tree that will land. Rebase onto master and retarget the PR. (Stacked PRs used to run ZERO lanes and display only 'comment' — an absence that read as a pass. This lane exists so that state is red instead of blank.)"
+            exit 1
+          fi
+          echo "Base is master."
+
   check:
     name: Check
     runs-on: ${{ matrix.os }}
@@ -213,6 +269,7 @@ jobs:
     runs-on: ubuntu-latest
     if: always()
     needs:
+      - base-branch
       - check
       - check-metal
       - test
@@ -227,7 +284,10 @@ jobs:
           # Passed via env, not interpolated into the script, so a lane result
           # can never be shell-injected.
           LANE_RESULTS: ${{ join(needs.*.result, ' ') }}
-          EXPECTED_LANES: '8'
+          # 9 = the 8 build/test/hygiene lanes + `base-branch`. Bumped from 8
+          # when `base-branch` was added; this number is asserted below
+          # precisely so that adding or dropping a lane cannot happen silently.
+          EXPECTED_LANES: '9'
         run: |
           set -euo pipefail
           echo "lane results: ${LANE_RESULTS}"
