@@ -506,10 +506,26 @@ fn ls_refine_scale(
 /// Quantize an `[n, k]` matrix under `cfg`, mirroring the production CPU
 /// pipeline op-for-op, and return the reconstruction in the ORIGINAL frame.
 fn quantize_matrix(w: &[f32], n: usize, k: usize, cfg: Cfg) -> Vec<f32> {
-    use rayon::prelude::*;
     // NOTE: the Gaussian codebook, NOT the `ARC_QTIP_CODEBOOK=mcg` computed
     // codebook the shipped artifact was baked with. See the module tests.
     let lut = gaussian_lut_geo(cfg.geo.l, cfg.geo.v);
+    quantize_matrix_with_lut(w, n, k, cfg, &lut)
+}
+
+/// [`quantize_matrix`] with the codebook supplied instead of generated, so a
+/// *designed* table can be measured against the pseudorandom Gaussian one on
+/// exactly the same pipeline. `quantize_matrix` is the `Book::Gaussian` case of
+/// this function and nothing else — the split is a pure refactor, pinned by
+/// `geo_pipeline_is_byte_identical_at_shipped_geometry` and by
+/// `designed_codebook_reaches_the_search`.
+fn quantize_matrix_with_lut(w: &[f32], n: usize, k: usize, cfg: Cfg, lut: &[f32]) -> Vec<f32> {
+    use rayon::prelude::*;
+    assert_eq!(
+        lut.len(),
+        cfg.geo.lut_size() * cfg.geo.v as usize,
+        "codebook is not 2^L x V for {}",
+        cfg.geo.label()
+    );
     let signs = if cfg.rotation_block >= 2 {
         generate_signs(QTIP_ROTATION_SEED, k)
     } else {
@@ -548,9 +564,9 @@ fn quantize_matrix(w: &[f32], n: usize, k: usize, cfg: Cfg) -> Vec<f32> {
             let target: Vec<f32> = rot.iter().map(|&v| v * inv).collect();
             // 3. Trellis search.
             let syms = if cfg.viterbi {
-                viterbi_quantize_row_geo(&target, &lut, cfg.geo)
+                viterbi_quantize_row_geo(&target, lut, cfg.geo)
             } else {
-                greedy_quantize_row_geo(&target, &lut, cfg.geo)
+                greedy_quantize_row_geo(&target, lut, cfg.geo)
             };
             let packed = pack_symbols_geo(&syms, cfg.geo);
             let num_symbols = k / cfg.geo.v as usize;
@@ -558,11 +574,11 @@ fn quantize_matrix(w: &[f32], n: usize, k: usize, cfg: Cfg) -> Vec<f32> {
             let final_scale = match cfg.policy {
                 ScalePolicy::MaxOver3 => search_scale,
                 ScalePolicy::MaxOver3LsRefine | ScalePolicy::RmsMatchedLsRefine => {
-                    ls_refine_scale_geo(&rot, &packed, num_symbols, &lut, search_scale, cfg.geo)
+                    ls_refine_scale_geo(&rot, &packed, num_symbols, lut, search_scale, cfg.geo)
                 }
             };
             // 5. Decode + un-rotate (D·H·D is involutory).
-            let mut recon: Vec<f32> = decode_packed_geo(&packed, num_symbols, &lut, cfg.geo)
+            let mut recon: Vec<f32> = decode_packed_geo(&packed, num_symbols, lut, cfg.geo)
                 .into_iter()
                 .map(|c| c * final_scale)
                 .collect();
@@ -1314,4 +1330,1042 @@ fn probe_geometry_delta_noise() {
         }
         println!("------");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Codebook DESIGN (wave: is the K8/V4/L12 loss a geometry limit or a
+// random-codebook limit?)
+// ---------------------------------------------------------------------------
+//
+// The geometry sweep drew every codebook at random (Box-Muller per state), so
+// at K8/V4/L12 it scattered 4096 points at random through 4-D space. That
+// bounds the loss of a *random* codebook at that geometry, not the geometry's
+// own limit. Everything below designs the table instead.
+//
+// Trellis block structure (the thing a design has to respect): from state `s`
+// the reachable next states are `((s << K) | j) & mask` for `j` in
+// `0..2^K`, i.e. the contiguous block `{ (g << K) | j }` with
+// `g = s mod 2^(L-K)`. So the table is `2^(L-K)` *blocks* of `2^K` entries,
+// block index `state >> K`, and the encoder picks one entry per block visit.
+// Each block must therefore be a good `2^K`-point V-dim quantizer on its own,
+// and the blocks should differ from each other or the trellis memory is dead.
+// At K8/V4/L12 that is 16 blocks x 256 entries; at K4/V2/L16, 4096 blocks x 16.
+
+/// A codebook *design*: the map from trellis state to its `V`-dimensional
+/// reproduction vector.
+///
+/// **Every variant here is a stored `2^L x V` table.** They all decode with the
+/// identical instruction sequence — one indexed load of `V` contiguous bf16 —
+/// so a design change costs nothing at inference time and only changes what the
+/// offline bake writes. At K8/V4/L12 the table is `4096 * 4 * 2 B = 32,768 B`,
+/// exactly the shared-memory budget that made the geometry worth 4.375 inst/wt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Book {
+    /// Box-Muller pseudorandom Gaussian, amplitude untouched: `QtipCodebook::
+    /// DEFAULT` and exactly what the geometry sweep measured. The control.
+    Gaussian,
+    /// Gaussian *shape*, amplitude re-fitted to the search targets. The
+    /// cheapest possible "design"; separates a pure scale-calibration win from
+    /// a real geometry win.
+    GaussianCalibrated,
+    /// Best memoryless `2^K`-point V-dim VQ (LBG on the search targets),
+    /// replicated into every block. All blocks identical => the trellis memory
+    /// is switched off on purpose. This is the "no shaping at all" floor.
+    LbgMemoryless,
+    /// One *random* block replicated into every block. The paired control for
+    /// [`Book::LbgMemoryless`]: with the trellis switched off, LBG must beat
+    /// random by a wide margin, or the LBG training is broken and every
+    /// "designed loses" row below is an artifact rather than a result.
+    GaussianMemoryless,
+    /// Two-stage LBG with Ungerboeck set partitioning: `2^K` coarse cells, each
+    /// split into `2^(L-K)` sub-centroids; block `g` collects the `g`-th
+    /// sub-centroid of every coarse cell. Each block is therefore a full-cover
+    /// `2^K`-point quantizer, and the `2^(L-K)` blocks are dithered variants of
+    /// one another — the textbook trellis-coded-quantizer construction.
+    LbgPartitioned,
+    /// One LBG `2^K`-point codebook, each block carrying a different random
+    /// 4-D rotation of it. Every block is therefore an *optimal-quality*
+    /// `2^K`-point VQ (unlike the random table's 256 scattered points) whose
+    /// reach is still the whole space (unlike the set partition, whose 16
+    /// alternatives for a symbol all sit inside one coarse cell). This is the
+    /// designed structure closest to what the random table accidentally has.
+    LbgRotated,
+    /// The same centroids, but each block is a contiguous clump of whole coarse
+    /// cells instead of a spread. **Negative control**: a partition that
+    /// destroys per-block coverage must measure clearly worse, which proves the
+    /// partition (not just the centroid values) reaches the search.
+    LbgClustered,
+    /// D4 — the densest packing and best known quantizer in 4 dimensions
+    /// (normalised second moment 0.076603 vs 1/12 for the cubic lattice) —
+    /// partitioned into its 16 cosets of 2*D4, which is exactly `2^(L-K)` at
+    /// K8/V4/L12. Intra-block minimum distance is doubled by construction.
+    D4Coset,
+    /// Generalized Lloyd with the *Viterbi trellis encoder* in the loop: encode
+    /// the training stream, then move each state's codeword to the centroid of
+    /// the targets that landed on it. This is the design that optimises the
+    /// thing actually being measured, so it upper-bounds the others.
+    TrellisLloyd,
+    /// The same generalized Lloyd, but started *from the random Gaussian table*
+    /// instead of from a designed one. This is the sharpest question available:
+    /// if the exact objective cannot be improved by gradient descent from the
+    /// random table, the random table is at a local optimum and there is no
+    /// design left to find.
+    TrellisLloydFromGaussian,
+}
+
+impl Book {
+    fn label(self) -> &'static str {
+        match self {
+            Book::Gaussian => "gaussian (random)",
+            Book::GaussianCalibrated => "gaussian + scale fit",
+            Book::LbgMemoryless => "LBG memoryless VQ",
+            Book::GaussianMemoryless => "random memoryless VQ",
+            Book::LbgRotated => "LBG + per-block rot",
+            Book::LbgPartitioned => "LBG set-partitioned",
+            Book::LbgClustered => "LBG clustered (neg)",
+            Book::D4Coset => "D4 lattice cosets",
+            Book::TrellisLloyd => "trellis Lloyd <- LBG",
+            Book::TrellisLloydFromGaussian => "trellis Lloyd <- random",
+        }
+    }
+    /// Whether the amplitude is re-fitted on held-out calibration data.
+    fn calibrated(self) -> bool {
+        !matches!(self, Book::Gaussian)
+    }
+}
+
+/// `(name, generator)` for the three weight fixtures, named so the array type
+/// stays readable.
+type Fixture = (&'static str, fn(usize, usize, f64, u64) -> Vec<f32>);
+
+/// Rotate and scale exactly as `quantize_matrix` steps 1-2 do, returning the
+/// stream of search targets the trellis actually sees. Codebooks are designed
+/// on **this** distribution, not on the raw weights — that is what "trained on
+/// the actual target distribution" has to mean here.
+fn search_targets(w: &[f32], n: usize, k: usize, rotation_block: usize) -> Vec<f32> {
+    let signs = if rotation_block >= 2 {
+        generate_signs(QTIP_ROTATION_SEED, k)
+    } else {
+        Vec::new()
+    };
+    let mut out = Vec::with_capacity(n * k);
+    for row in 0..n {
+        let mut rot = w[row * k..(row + 1) * k].to_vec();
+        if rotation_block >= 2 {
+            apply_block_rotation(&mut rot, &signs, rotation_block);
+        }
+        let max_abs = rot.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        let s = if max_abs == 0.0 { 1.0 } else { max_abs / 3.0 };
+        let inv = 1.0 / s;
+        out.extend(rot.iter().map(|&v| v * inv));
+    }
+    out
+}
+
+/// The codebook training stream: the mixture of all three fixtures, on seeds
+/// disjoint from every evaluation seed. One table ships for all weights, so one
+/// table is trained on all of them.
+fn codebook_training_targets(rows_per_fixture: usize, k: usize) -> Vec<f32> {
+    let sigma = 0.02;
+    let mut t = Vec::new();
+    for (i, gen) in [
+        gen_gaussian as fn(usize, usize, f64, u64) -> Vec<f32>,
+        gen_student_t,
+        gen_fp4_dequant,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let w = gen(rows_per_fixture, k, sigma, 90_001 + i as u64);
+        t.extend(search_targets(&w, rows_per_fixture, k, 128));
+    }
+    t
+}
+
+/// Held-out matrix for amplitude calibration: disjoint from both the training
+/// seeds and the evaluation seeds.
+fn calibration_matrix(n_per_fixture: usize, k: usize) -> (Vec<f32>, usize) {
+    let sigma = 0.02;
+    let mut w = Vec::new();
+    for (i, gen) in [
+        gen_gaussian as fn(usize, usize, f64, u64) -> Vec<f32>,
+        gen_student_t,
+        gen_fp4_dequant,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        w.extend(gen(n_per_fixture, k, sigma, 70_001 + i as u64));
+    }
+    (w, n_per_fixture * 3)
+}
+
+#[inline]
+fn nearest_centroid(cents: &[f32], v: usize, x: &[f32]) -> (usize, f32) {
+    let mut best = 0usize;
+    let mut best_d = f32::INFINITY;
+    for c in 0..cents.len() / v {
+        let off = c * v;
+        let mut d = 0f32;
+        for i in 0..v {
+            let t = cents[off + i] - x[i];
+            d += t * t;
+        }
+        if d < best_d {
+            best_d = d;
+            best = c;
+        }
+    }
+    (best, best_d)
+}
+
+/// Linde-Buzo-Gray / generalized Lloyd VQ design. Deterministic: the parallel
+/// accumulation collects per-chunk partials and folds them in index order, so
+/// the result does not depend on rayon's scheduling.
+fn lbg(train: &[f32], v: usize, ncent: usize, iters: usize, seed: u64) -> Vec<f32> {
+    use rayon::prelude::*;
+    let nvec = train.len() / v;
+    assert!(
+        nvec >= ncent * 8,
+        "LBG needs >= 8 training vectors per centroid (have {nvec} for {ncent})"
+    );
+    let mut rng = Rng::new(seed);
+    let mut cents = vec![0f32; ncent * v];
+    for c in 0..ncent {
+        let idx = (rng.next_u64() % nvec as u64) as usize;
+        cents[c * v..(c + 1) * v].copy_from_slice(&train[idx * v..(idx + 1) * v]);
+    }
+    let chunk = (nvec / 256).max(1024) * v;
+    for _ in 0..iters {
+        let partials: Vec<(Vec<f64>, Vec<u32>)> = train
+            .par_chunks(chunk)
+            .map(|ch| {
+                let mut s = vec![0f64; ncent * v];
+                let mut n = vec![0u32; ncent];
+                for x in ch.chunks_exact(v) {
+                    let (c, _) = nearest_centroid(&cents, v, x);
+                    n[c] += 1;
+                    for i in 0..v {
+                        s[c * v + i] += x[i] as f64;
+                    }
+                }
+                (s, n)
+            })
+            .collect();
+        let mut sums = vec![0f64; ncent * v];
+        let mut counts = vec![0u32; ncent];
+        for (s, n) in &partials {
+            for i in 0..sums.len() {
+                sums[i] += s[i];
+            }
+            for i in 0..counts.len() {
+                counts[i] += n[i];
+            }
+        }
+        let big = (0..ncent).max_by_key(|&i| counts[i]).unwrap_or(0);
+        for c in 0..ncent {
+            if counts[c] > 0 {
+                for i in 0..v {
+                    cents[c * v + i] = (sums[c * v + i] / counts[c] as f64) as f32;
+                }
+            } else {
+                // Empty cell: re-seed by splitting the most-populated one.
+                for i in 0..v {
+                    let jitter = ((rng.uniform() - 0.5) * 0.05) as f32;
+                    cents[c * v + i] =
+                        (sums[big * v + i] / counts[big].max(1) as f64) as f32 + jitter;
+                }
+            }
+        }
+    }
+    cents
+}
+
+/// Two-stage LBG: `ncoarse` cells, each refined into `nfine` sub-centroids.
+/// Returns `(coarse, fine)` with `fine[(c * nfine + f) * v ..]` the `f`-th
+/// sub-centroid of coarse cell `c`.
+fn two_stage_lbg(
+    train: &[f32],
+    v: usize,
+    ncoarse: usize,
+    nfine: usize,
+    seed: u64,
+) -> (Vec<f32>, Vec<f32>) {
+    use rayon::prelude::*;
+    let coarse = lbg(train, v, ncoarse, 30, seed);
+    // Bucket the training stream by coarse cell (deterministic order).
+    let assign: Vec<usize> = train
+        .par_chunks_exact(v)
+        .map(|x| nearest_centroid(&coarse, v, x).0)
+        .collect();
+    let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); ncoarse];
+    for (x, &c) in train.chunks_exact(v).zip(assign.iter()) {
+        buckets[c].extend_from_slice(x);
+    }
+    let fine: Vec<Vec<f32>> = buckets
+        .par_iter()
+        .enumerate()
+        .map(|(c, b)| {
+            if b.len() / v >= nfine * 8 {
+                lbg(
+                    b,
+                    v,
+                    nfine,
+                    20,
+                    seed ^ (0x5DEE_CE66u64.wrapping_mul(c as u64 + 1)),
+                )
+            } else {
+                // Too few samples to split honestly: jitter the coarse centroid
+                // deterministically so the block still differs from its peers.
+                let mut r = Rng::new(seed ^ (c as u64) << 17 ^ 0xB5);
+                let mut out = vec![0f32; nfine * v];
+                for f in 0..nfine {
+                    for i in 0..v {
+                        out[f * v + i] = coarse[c * v + i] + ((r.uniform() - 0.5) * 0.2) as f32;
+                    }
+                }
+                out
+            }
+        })
+        .collect();
+    (coarse, fine.into_iter().flatten().collect())
+}
+
+/// D4 = { x in Z^4 : sum(x) even }, partitioned into the 16 cosets of 2*D4.
+/// Each coset keeps its `2^K` smallest-norm points, so every trellis block is a
+/// sphere-bounded lattice quantizer with minimum distance 2*sqrt(2) (twice D4's
+/// own), while the union of blocks tiles at D4's density.
+fn d4_coset_lut(geo: Geo) -> Vec<f32> {
+    assert_eq!(geo.v, 4, "D4 is a 4-D lattice");
+    let per_block = 1usize << geo.k;
+    let nblocks = 1usize << (geo.l - geo.k);
+    assert_eq!(
+        nblocks, 16,
+        "the 2*D4 coset partition has exactly 16 classes"
+    );
+    // Coset label: x = b + 2y with b = x mod 2 (even weight, 8 patterns);
+    // x - x' in 2*D4  <=>  b == b' and sum(y) == sum(y') mod 2. 8 * 2 = 16.
+    let mut pat_idx = [usize::MAX; 16];
+    let mut np = 0usize;
+    for p in 0u32..16 {
+        if p.count_ones() % 2 == 0 {
+            pat_idx[p as usize] = np;
+            np += 1;
+        }
+    }
+    assert_eq!(np, 8);
+    let r = 12i32;
+    let mut cosets: Vec<Vec<(i64, [i32; 4])>> = vec![Vec::new(); nblocks];
+    for a in -r..=r {
+        for b in -r..=r {
+            for c in -r..=r {
+                for d in -r..=r {
+                    if (a + b + c + d) % 2 != 0 {
+                        continue;
+                    }
+                    let x = [a, b, c, d];
+                    let mut pat = 0u32;
+                    let mut ysum = 0i32;
+                    for (i, &xi) in x.iter().enumerate() {
+                        let bi = xi.rem_euclid(2);
+                        pat |= (bi as u32) << i;
+                        ysum += (xi - bi) / 2;
+                    }
+                    let label = pat_idx[pat as usize] * 2 + ysum.rem_euclid(2) as usize;
+                    let n2 = x.iter().map(|&v| (v as i64) * (v as i64)).sum::<i64>();
+                    cosets[label].push((n2, x));
+                }
+            }
+        }
+    }
+    let mut lut = vec![0f32; geo.lut_size() * geo.v as usize];
+    for (g, pts) in cosets.iter_mut().enumerate() {
+        // Deterministic: norm first, then lexicographic.
+        pts.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        assert!(
+            pts.len() >= per_block,
+            "coset {g} has only {} points, need {per_block}",
+            pts.len()
+        );
+        for (j, (_, x)) in pts.iter().take(per_block).enumerate() {
+            let state = (g << geo.k) | j;
+            for i in 0..4 {
+                lut[state * 4 + i] = x[i] as f32;
+            }
+        }
+    }
+    lut
+}
+
+/// Generalized Lloyd with the Viterbi trellis encoder in the loop: encode the
+/// training rows with the current table, then move each state's codeword to the
+/// centroid of the targets that landed on it. States with few visits are
+/// shrunk toward the initial table (ridge `lambda`) so a rarely-reached state
+/// cannot be driven by two samples.
+/// Returns the trained table and the per-sweep training MSE *before* that
+/// sweep's update. The trace is not decoration: if it does not fall, the
+/// descent is not running and a flat result would be a silent success rather
+/// than a converged optimum.
+fn trellis_lloyd(rows: &[&[f32]], geo: Geo, init: &[f32], iters: usize) -> (Vec<f32>, Vec<f64>) {
+    use rayon::prelude::*;
+    let v = geo.v as usize;
+    let n_states = geo.lut_size();
+    let mask = (1u32 << geo.l) - 1;
+    let lambda = 8.0f64;
+    let mut lut = init.to_vec();
+    let mut trace = Vec::with_capacity(iters + 1);
+    for it in 0..=iters {
+        let partials: Vec<(Vec<f64>, Vec<u32>, f64, u64)> = rows
+            .par_chunks(16)
+            .map(|chunk| {
+                let mut s = vec![0f64; n_states * v];
+                let mut n = vec![0u32; n_states];
+                let mut sse = 0f64;
+                let mut cnt = 0u64;
+                for row in chunk {
+                    let syms = viterbi_quantize_row_geo(row, &lut, geo);
+                    let mut state: u32 = 0;
+                    for (t, &sym) in syms.iter().enumerate() {
+                        state = ((state << geo.k) | sym as u32) & mask;
+                        let off = state as usize * v;
+                        n[state as usize] += 1;
+                        for i in 0..v {
+                            let x = row[t * v + i] as f64;
+                            s[off + i] += x;
+                            let d = x - lut[off + i] as f64;
+                            sse += d * d;
+                        }
+                        cnt += v as u64;
+                    }
+                }
+                (s, n, sse, cnt)
+            })
+            .collect();
+        let mut sums = vec![0f64; n_states * v];
+        let mut counts = vec![0u32; n_states];
+        let mut sse = 0f64;
+        let mut cnt = 0u64;
+        for (s, n, e, c) in &partials {
+            for i in 0..sums.len() {
+                sums[i] += s[i];
+            }
+            for i in 0..counts.len() {
+                counts[i] += n[i];
+            }
+            sse += e;
+            cnt += c;
+        }
+        trace.push(sse / cnt as f64);
+        if it == iters {
+            break;
+        }
+        for st in 0..n_states {
+            let w = counts[st] as f64;
+            for i in 0..v {
+                let ridge = init[st * v + i] as f64 * lambda;
+                lut[st * v + i] = ((sums[st * v + i] + ridge) / (w + lambda)) as f32;
+            }
+        }
+    }
+    (lut, trace)
+}
+
+/// Scale a table to unit RMS, so every design meets the `max|row|/3` policy on
+/// the same footing as the unit-sigma Gaussian LUT and the amplitude search
+/// below starts from a comparable place.
+fn normalize_rms(lut: &mut [f32]) {
+    let rms = (lut.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / lut.len() as f64).sqrt();
+    if rms > 0.0 {
+        let inv = (1.0 / rms) as f32;
+        for x in lut.iter_mut() {
+            *x *= inv;
+        }
+    }
+}
+
+/// Fit the table amplitude on held-out calibration data (coarse grid, then a
+/// fine pass around the winner). This is an offline bake decision, so it is
+/// legitimate to fit it — but it is fitted on seeds disjoint from every
+/// evaluation seed.
+fn calibrate_alpha(base: &[f32], geo: Geo, cal_w: &[f32], cal_n: usize, k: usize) -> f32 {
+    let cfg = Cfg {
+        viterbi: true,
+        rotation_block: 128,
+        policy: ScalePolicy::MaxOver3,
+        geo,
+    };
+    let score = |alpha: f32| -> f64 {
+        let lut: Vec<f32> = base.iter().map(|&c| c * alpha).collect();
+        let w_hat = quantize_matrix_with_lut(cal_w, cal_n, k, cfg, &lut);
+        cosine(cal_w, &w_hat)
+    };
+    let mut best_a = 1.0f32;
+    let mut best_s = f64::NEG_INFINITY;
+    for i in 0..=10 {
+        let a = 0.5 + 0.1 * i as f32;
+        let s = score(a);
+        if s > best_s {
+            best_s = s;
+            best_a = a;
+        }
+    }
+    let centre = best_a;
+    for i in -5i32..=5 {
+        let a = centre + 0.02 * i as f32;
+        if a <= 0.0 {
+            continue;
+        }
+        let s = score(a);
+        if s > best_s {
+            best_s = s;
+            best_a = a;
+        }
+    }
+    best_a
+}
+
+/// Build a designed codebook for `geo`. Returns the table and the fitted
+/// amplitude.
+///
+/// NOTE the LBG-based variants are only affordable where the table is small
+/// enough to train: at K8/V4/L12 it is 4096 states x 4 = 16,384 parameters,
+/// at K4/V2/L16 it is 131,072. That asymmetry is itself part of the answer —
+/// the design lever exists at the candidate geometry and barely exists at the
+/// shipped one.
+fn build_book(book: Book, geo: Geo, train: &[f32], k: usize, calibrate: bool) -> (Vec<f32>, f32) {
+    let v = geo.v as usize;
+    let per_block = 1usize << geo.k;
+    let nblocks = 1usize << (geo.l - geo.k);
+    let mut lut = match book {
+        Book::Gaussian | Book::GaussianCalibrated => gaussian_lut_geo(geo.l, geo.v),
+        Book::LbgMemoryless | Book::GaussianMemoryless => {
+            let c = if book == Book::LbgMemoryless {
+                lbg(train, v, per_block, 30, 0xC0DE_B00C)
+            } else {
+                // Block 0 of the random table: one 2^K-point random codebook.
+                gaussian_lut_geo(geo.l, geo.v)[..per_block * v].to_vec()
+            };
+            let mut lut = vec![0f32; geo.lut_size() * v];
+            for g in 0..nblocks {
+                for j in 0..per_block {
+                    let st = (g << geo.k) | j;
+                    lut[st * v..st * v + v].copy_from_slice(&c[j * v..j * v + v]);
+                }
+            }
+            lut
+        }
+        Book::LbgRotated => {
+            let c = lbg(train, v, per_block, 30, 0xC0DE_B00C);
+            let mut rng = Rng::new(0x5A17_0B0B);
+            let mut lut = vec![0f32; geo.lut_size() * v];
+            for g in 0..nblocks {
+                // Gram-Schmidt on a Gaussian matrix: a Haar-random rotation.
+                let mut r = vec![0f32; v * v];
+                for x in r.iter_mut() {
+                    *x = rng.normal() as f32;
+                }
+                for i in 0..v {
+                    for j in 0..i {
+                        let dot: f32 = (0..v).map(|t| r[i * v + t] * r[j * v + t]).sum();
+                        for t in 0..v {
+                            r[i * v + t] -= dot * r[j * v + t];
+                        }
+                    }
+                    let nrm: f32 = (0..v)
+                        .map(|t| r[i * v + t] * r[i * v + t])
+                        .sum::<f32>()
+                        .sqrt();
+                    for t in 0..v {
+                        r[i * v + t] /= nrm;
+                    }
+                }
+                for j in 0..per_block {
+                    let st = (g << geo.k) | j;
+                    for i in 0..v {
+                        lut[st * v + i] = (0..v).map(|t| r[i * v + t] * c[j * v + t]).sum::<f32>();
+                    }
+                }
+            }
+            lut
+        }
+        Book::LbgPartitioned | Book::LbgClustered => {
+            let (_, fine) = two_stage_lbg(train, v, per_block, nblocks, 0xC0DE_B00C);
+            let mut lut = vec![0f32; geo.lut_size() * v];
+            for coarse in 0..per_block {
+                for f in 0..nblocks {
+                    let src = (coarse * nblocks + f) * v;
+                    // Ungerboeck: block = fine index, slot = coarse index, so
+                    // every block holds one representative of every coarse cell.
+                    // Clustered: walk the centroid list in order, so a block is
+                    // a contiguous clump of whole coarse cells.
+                    let st = match book {
+                        Book::LbgPartitioned => (f << geo.k) | coarse,
+                        _ => coarse * nblocks + f,
+                    };
+                    lut[st * v..st * v + v].copy_from_slice(&fine[src..src + v]);
+                }
+            }
+            lut
+        }
+        Book::D4Coset => d4_coset_lut(geo),
+        Book::TrellisLloyd | Book::TrellisLloydFromGaussian => {
+            let mut init = if book == Book::TrellisLloydFromGaussian {
+                gaussian_lut_geo(geo.l, geo.v)
+            } else {
+                let (_, fine) = two_stage_lbg(train, v, per_block, nblocks, 0xC0DE_B00C);
+                let mut init = vec![0f32; geo.lut_size() * v];
+                for coarse in 0..per_block {
+                    for f in 0..nblocks {
+                        let src = (coarse * nblocks + f) * v;
+                        let st = (f << geo.k) | coarse;
+                        init[st * v..st * v + v].copy_from_slice(&fine[src..src + v]);
+                    }
+                }
+                init
+            };
+            normalize_rms(&mut init);
+            // Train at the amplitude the pipeline will actually use, otherwise
+            // the encoder in the loop is not the encoder being measured.
+            let mut alpha = 1.0f32;
+            if calibrate {
+                let (cw, cn) = calibration_matrix(4, k);
+                alpha = calibrate_alpha(&init, geo, &cw, cn, k);
+                for x in init.iter_mut() {
+                    *x *= alpha;
+                }
+            }
+            let rows: Vec<&[f32]> = train.chunks_exact(k).collect();
+            let (lut, trace) = trellis_lloyd(&rows, geo, &init, 8);
+            let fall = 1.0 - trace[trace.len() - 1] / trace[0];
+            println!(
+                "  {} training MSE {:.6} -> {:.6} ({:+.2}% over 8 sweeps)",
+                book.label(),
+                trace[0],
+                trace[trace.len() - 1],
+                -100.0 * fall
+            );
+            assert!(
+                trace[trace.len() - 1] <= trace[0],
+                "{}: generalized Lloyd increased the training MSE — the descent is broken",
+                book.label()
+            );
+            // Lloyd output is already at the trained amplitude; re-normalising
+            // or re-fitting it here would undo the thing that was optimised.
+            return (lut, alpha);
+        }
+    };
+    if !(calibrate && book.calibrated()) {
+        if book != Book::Gaussian {
+            normalize_rms(&mut lut);
+        }
+        return (lut, 1.0);
+    }
+    normalize_rms(&mut lut);
+    let (cal_w, cal_n) = calibration_matrix(4, k);
+    let alpha = calibrate_alpha(&lut, geo, &cal_w, cal_n, k);
+    for x in lut.iter_mut() {
+        *x *= alpha;
+    }
+    (lut, alpha)
+}
+
+/// **Anti-silent-success guard.** Every codebook design must produce a
+/// different table AND a different reconstruction. If `build_book` returned the
+/// same table twice (a partition bug, a copy-paste in the match) or the table
+/// never reached the search, every candidate would report the same delta and it
+/// would read as a clean result. Five guards failed on unfixed code today; this
+/// one is cheap enough to run unignored.
+#[test]
+fn designed_codebook_reaches_the_search() {
+    let k = 2048;
+    let geo = GEO_CANDIDATE;
+    let train = codebook_training_targets(24, k);
+    let books = [
+        Book::Gaussian,
+        Book::GaussianMemoryless,
+        Book::LbgMemoryless,
+        Book::LbgRotated,
+        Book::LbgPartitioned,
+        Book::LbgClustered,
+        Book::D4Coset,
+    ];
+    // Calibration off: this guard is about distinctness, and the amplitude
+    // search is the slow part.
+    let luts: Vec<(Book, Vec<f32>)> = books
+        .iter()
+        .map(|&b| (b, build_book(b, geo, &train, k, false).0))
+        .collect();
+    for (i, (bi, li)) in luts.iter().enumerate() {
+        assert_eq!(li.len(), geo.lut_size() * geo.v as usize);
+        assert!(
+            li.iter().all(|x| x.is_finite()),
+            "{} produced a non-finite codeword",
+            bi.label()
+        );
+        for (bj, lj) in luts.iter().skip(i + 1) {
+            let same = li.iter().zip(lj.iter()).filter(|(a, b)| a == b).count();
+            assert!(
+                same * 10 < li.len(),
+                "{} and {} are the same table ({same}/{} entries equal) — a design \
+                 is not reaching the codebook",
+                bi.label(),
+                bj.label(),
+                li.len()
+            );
+        }
+    }
+    // ...and the tables must move the reconstruction, not just the table.
+    let (n, kk) = (4usize, 512usize);
+    let w = gen_fp4_dequant(n, kk, 0.02, 13);
+    let cfg = Cfg {
+        viterbi: true,
+        rotation_block: 128,
+        policy: ScalePolicy::MaxOver3,
+        geo,
+    };
+    let recons: Vec<(Book, Vec<f32>)> = luts
+        .iter()
+        .map(|(b, l)| {
+            // Rebuild at kk: the table is k-independent, only its length matters.
+            (*b, quantize_matrix_with_lut(&w, n, kk, cfg, l))
+        })
+        .collect();
+    for (i, (bi, ri)) in recons.iter().enumerate() {
+        for (bj, rj) in recons.iter().skip(i + 1) {
+            let differing = ri.iter().zip(rj.iter()).filter(|(a, b)| a != b).count();
+            assert!(
+                differing * 10 > ri.len(),
+                "{} and {} reconstruct almost identically ({differing}/{} weights differ) \
+                 — the codebook parameter is not reaching the search",
+                bi.label(),
+                bj.label(),
+                ri.len()
+            );
+        }
+    }
+}
+
+/// **The answer table.** Does a *designed* codebook at K8/V4/L12 close the
+/// -0.0070 w_cos gap that the random-codebook geometry sweep measured?
+///
+/// Control, metric and config are deliberately identical to
+/// `probe_geometry_delta_noise`: Gaussian codebook at K4/V2/L16, Viterbi +
+/// Hadamard rot=128 + max/3, n=48, k=2048, 5 weight draws, `w_cos` as the tight
+/// metric. `Book::Gaussian` at K8/V4/L12 reproduces that sweep's -0.00698 row,
+/// which is the cross-check that this probe and that one are measuring the same
+/// thing.
+///
+/// Run: `cargo test -p mistralrs-quant --release probe_designed_codebook
+/// -- --ignored --nocapture`
+#[test]
+#[ignore = "evidence-gathering probe (slow); run with --ignored --nocapture --release"]
+fn probe_designed_codebook_at_k8v4l12() {
+    let n = 48;
+    let k = 2048;
+    let sigma = 0.02;
+    let seeds = [1u64, 101, 202, 303, 404];
+    let base = Cfg {
+        viterbi: true,
+        rotation_block: 128,
+        policy: ScalePolicy::MaxOver3,
+        geo: GEO_SHIPPED,
+    };
+
+    let t0 = std::time::Instant::now();
+    let train = codebook_training_targets(96, k);
+    println!(
+        "training stream: {} vectors of dim {} ({} per state at K8/V4/L12)",
+        train.len() / GEO_CANDIDATE.v as usize,
+        GEO_CANDIDATE.v,
+        train.len() / GEO_CANDIDATE.v as usize / GEO_CANDIDATE.lut_size()
+    );
+
+    let books = [
+        Book::Gaussian,
+        Book::GaussianCalibrated,
+        Book::GaussianMemoryless,
+        Book::LbgMemoryless,
+        Book::LbgRotated,
+        Book::LbgPartitioned,
+        Book::LbgClustered,
+        Book::D4Coset,
+        Book::TrellisLloyd,
+        Book::TrellisLloydFromGaussian,
+    ];
+    let mut built: Vec<(Geo, Book, Vec<f32>, f32)> = Vec::new();
+    for &b in &books {
+        let (lut, alpha) = build_book(b, GEO_CANDIDATE, &train, k, true);
+        println!(
+            "built {:<22} @ {} alpha={alpha:.3} ({:.1}s)",
+            b.label(),
+            GEO_CANDIDATE.label(),
+            t0.elapsed().as_secs_f64()
+        );
+        built.push((GEO_CANDIDATE, b, lut, alpha));
+    }
+    // Control-side headroom: the one design that is affordable at L=16 (the
+    // 131,072-parameter table cannot be LBG-trained on any sane budget).
+    {
+        let (lut, alpha) = build_book(Book::GaussianCalibrated, GEO_SHIPPED, &train, k, true);
+        println!(
+            "built {:<22} @ {} alpha={alpha:.3} ({:.1}s)",
+            Book::GaussianCalibrated.label(),
+            GEO_SHIPPED.label(),
+            t0.elapsed().as_secs_f64()
+        );
+        built.push((GEO_SHIPPED, Book::GaussianCalibrated, lut, alpha));
+    }
+    // The *other* geometry that fits 32,768 B of shared memory as a stored bf16
+    // table: K4/V2/L13 (8192 states x 2 x 2 B). Different rung, not a rescue of
+    // K8/V4/L12 — compiled at 11.250 inst/wt vs the shipped 15.125, so 1.34x
+    // rather than 3.46x. Priced here with the random codebook only, because it
+    // is nearly free to add and the ladder had no L13 row.
+    {
+        let geo13 = Geo { l: 13, k: 4, v: 2 };
+        assert_eq!(geo13.lut_size() * geo13.v as usize * 2, 32_768);
+        let (lut, alpha) = build_book(Book::Gaussian, geo13, &train, k, false);
+        built.push((geo13, Book::Gaussian, lut, alpha));
+    }
+
+    // Guard: no two candidate tables may be the same table.
+    for i in 0..built.len() {
+        for j in (i + 1)..built.len() {
+            if built[i].0 != built[j].0 {
+                continue;
+            }
+            let same = built[i]
+                .2
+                .iter()
+                .zip(built[j].2.iter())
+                .filter(|(a, b)| a == b)
+                .count();
+            assert!(
+                same * 10 < built[i].2.len(),
+                "{} and {} are the same table",
+                built[i].1.label(),
+                built[j].1.label()
+            );
+        }
+    }
+
+    println!(
+        "\n=== designed codebooks vs control (gaussian @ {}), {} draws, n={n} k={k} ===",
+        GEO_SHIPPED.label(),
+        seeds.len()
+    );
+    println!(
+        "geometry     | codebook               | alpha | fixture     | mean d(w_cos) [min,max]              | mean d(mm_cos)"
+    );
+
+    let fixtures: [Fixture; 3] = [
+        ("gaussian   ", gen_gaussian),
+        ("student_t4 ", gen_student_t),
+        ("fp4_dequant", gen_fp4_dequant),
+    ];
+
+    let mut overall: Vec<(Geo, Book, f64)> = Vec::new();
+    for (fname, gen) in fixtures {
+        // Control: the sweep's control, byte-for-byte the same call.
+        let ctrl: Vec<(f64, f64, Vec<f32>)> = seeds
+            .iter()
+            .map(|&s| {
+                let w = gen(n, k, sigma, s);
+                let w_hat = quantize_matrix(&w, n, k, base);
+                let m = evaluate(&w, &w_hat, n, k);
+                (m.weight_cos, m.matmul_cos, w_hat)
+            })
+            .collect();
+        for (geo, book, lut, alpha) in &built {
+            let cfg = Cfg { geo: *geo, ..base };
+            let mut dw = Vec::new();
+            let mut dm = Vec::new();
+            for (i, &s) in seeds.iter().enumerate() {
+                let w = gen(n, k, sigma, s);
+                let w_hat = quantize_matrix_with_lut(&w, n, k, cfg, lut);
+                // Guard: this candidate must not reproduce the control exactly.
+                if !(*geo == GEO_SHIPPED && *book == Book::Gaussian) {
+                    let differing = ctrl[i]
+                        .2
+                        .iter()
+                        .zip(w_hat.iter())
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    assert!(
+                        differing * 10 > w_hat.len(),
+                        "{} @ {} on {fname}: only {differing}/{} weights differ from the \
+                         control — the codebook is not reaching the search",
+                        book.label(),
+                        geo.label(),
+                        w_hat.len()
+                    );
+                }
+                let m = evaluate(&w, &w_hat, n, k);
+                dw.push(m.weight_cos - ctrl[i].0);
+                dm.push(m.matmul_cos - ctrl[i].1);
+            }
+            let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+            let lo = |v: &[f64]| v.iter().cloned().fold(f64::INFINITY, f64::min);
+            let hi = |v: &[f64]| v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            println!(
+                "{:<12} | {:<22} | {alpha:.3} | {fname} | {:+.5} [{:+.5},{:+.5}] | {:+.5}",
+                format!("K{}/V{}/L{}", geo.k, geo.v, geo.l),
+                book.label(),
+                mean(&dw),
+                lo(&dw),
+                hi(&dw),
+                mean(&dm)
+            );
+            overall.push((*geo, *book, mean(&dw)));
+        }
+        println!("------");
+    }
+
+    println!("\n=== mean d(w_cos) over all 3 fixtures x 5 draws (ship band is +-0.0008) ===");
+    for (geo, book, _) in built.iter().map(|(g, b, _, _)| (*g, *b, 0.0)) {
+        let vals: Vec<f64> = overall
+            .iter()
+            .filter(|(g, b, _)| *g == geo && *b == book)
+            .map(|(_, _, d)| *d)
+            .collect();
+        let m = vals.iter().sum::<f64>() / vals.len() as f64;
+        println!(
+            "K{}/V{}/L{:<2} {:<22} {:+.5}  {}",
+            geo.k,
+            geo.v,
+            geo.l,
+            book.label(),
+            m,
+            if m.abs() <= 0.0008 {
+                "INSIDE"
+            } else {
+                "outside"
+            }
+        );
+    }
+    println!("total {:.1}s", t0.elapsed().as_secs_f64());
+}
+
+/// **Is the best design converged, or merely unfinished?** `trellis Lloyd <-
+/// random` is the strongest candidate in `probe_designed_codebook_at_k8v4l12`
+/// and it was still descending after 8 sweeps, so reporting it as a floor would
+/// be reporting a budget rather than a limit. This runs the same descent with
+/// 4x the training data and 40 sweeps, evaluating the delta against the same
+/// control at intervals so the shape of the curve is visible rather than
+/// inferred, and re-fits the amplitude at the end.
+///
+/// Run: `cargo test -p mistralrs-quant --release probe_trellis_lloyd_convergence
+/// -- --ignored --nocapture`
+#[test]
+#[ignore = "evidence-gathering probe (slow); run with --ignored --nocapture --release"]
+fn probe_trellis_lloyd_convergence() {
+    let n = 48;
+    let k = 2048;
+    let sigma = 0.02;
+    let seeds = [1u64, 101, 202, 303, 404];
+    let geo = GEO_CANDIDATE;
+    let base = Cfg {
+        viterbi: true,
+        rotation_block: 128,
+        policy: ScalePolicy::MaxOver3,
+        geo: GEO_SHIPPED,
+    };
+    let cfg = Cfg { geo, ..base };
+    let t0 = std::time::Instant::now();
+
+    let train = codebook_training_targets(384, k);
+    let rows: Vec<&[f32]> = train.chunks_exact(k).collect();
+    println!(
+        "training stream: {} vectors, {} per state",
+        train.len() / geo.v as usize,
+        train.len() / geo.v as usize / geo.lut_size()
+    );
+
+    // Same starting point as the winning row: random table at its fitted
+    // amplitude.
+    let mut init = gaussian_lut_geo(geo.l, geo.v);
+    normalize_rms(&mut init);
+    let (cw, cn) = calibration_matrix(4, k);
+    let a0 = calibrate_alpha(&init, geo, &cw, cn, k);
+    for x in init.iter_mut() {
+        *x *= a0;
+    }
+    println!("init alpha {a0:.3}");
+
+    // Control, once.
+    let fixtures: [Fixture; 3] = [
+        ("gaussian   ", gen_gaussian),
+        ("student_t4 ", gen_student_t),
+        ("fp4_dequant", gen_fp4_dequant),
+    ];
+    let control: Vec<Vec<f64>> = fixtures
+        .iter()
+        .map(|(_, gen)| {
+            seeds
+                .iter()
+                .map(|&s| {
+                    let w = gen(n, k, sigma, s);
+                    evaluate(&w, &quantize_matrix(&w, n, k, base), n, k).weight_cos
+                })
+                .collect()
+        })
+        .collect();
+
+    let delta_of = |lut: &[f32]| -> f64 {
+        let mut all = Vec::new();
+        for (fi, (_, gen)) in fixtures.iter().enumerate() {
+            for (si, &s) in seeds.iter().enumerate() {
+                let w = gen(n, k, sigma, s);
+                let m = evaluate(&w, &quantize_matrix_with_lut(&w, n, k, cfg, lut), n, k);
+                all.push(m.weight_cos - control[fi][si]);
+            }
+        }
+        all.iter().sum::<f64>() / all.len() as f64
+    };
+
+    println!("\nsweeps | train MSE | mean d(w_cos) vs control | band +-0.0008");
+    let mut lut = init.clone();
+    let mut total = 0usize;
+    let mut prev;
+    for &step in &[0usize, 8, 8, 8, 8, 8] {
+        if step > 0 {
+            let (next, trace) = trellis_lloyd(&rows, geo, &lut, step);
+            // The ridge in `trellis_lloyd` pulls toward its own `init`, so
+            // restarting from the current table keeps the descent monotone
+            // rather than repeatedly re-anchoring on the original.
+            lut = next;
+            total += step;
+            prev = trace[trace.len() - 1];
+        } else {
+            let (_, trace) = trellis_lloyd(&rows, geo, &lut, 0);
+            prev = trace[0];
+        }
+        let d = delta_of(&lut);
+        println!(
+            "{total:>6} | {prev:.6}  | {d:+.5}                  | {}  ({:.0}s)",
+            if d.abs() <= 0.0008 {
+                "INSIDE"
+            } else {
+                "outside"
+            },
+            t0.elapsed().as_secs_f64()
+        );
+    }
+
+    // Best effort: re-fit the amplitude on the converged table.
+    let mut refit = lut.clone();
+    normalize_rms(&mut refit);
+    let a1 = calibrate_alpha(&refit, geo, &cw, cn, k);
+    for x in refit.iter_mut() {
+        *x *= a1;
+    }
+    let d_refit = delta_of(&refit);
+    println!(
+        "\nconverged + amplitude re-fit (alpha {a1:.3}): {d_refit:+.5}  {}",
+        if d_refit.abs() <= 0.0008 {
+            "INSIDE"
+        } else {
+            "outside"
+        }
+    );
+    println!("total {:.0}s", t0.elapsed().as_secs_f64());
 }
