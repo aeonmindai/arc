@@ -2748,6 +2748,58 @@ pub fn graph_mode_length_mask(positions: &Tensor, capacity: usize, dtype: DType)
         .reshape((b, 1, 1, capacity))
 }
 
+/// `positions mod capacity` — the RING slot a graph-mode decode writes its new
+/// K/V row into — computed entirely on the device.
+///
+/// # Why the graph KV buffer has to be a ring (RUN-161)
+///
+/// The graph decode arm reads a constant `capacity`-wide window (slots
+/// `0..capacity`) so the launch geometry never moves, but it used to *write* at
+/// the ABSOLUTE position. Those agree only while `position < capacity`: from
+/// token `capacity` onward the new row was written past the end of the window
+/// that is read, so the freshest key was invisible to attention and a stale row
+/// was attended in its place. The arm was therefore correct only below
+/// `sliding_window`.
+///
+/// A ring of exactly `capacity` slots is the natural fix, because `capacity`
+/// **is** `sliding_window`: the raw branch attends precisely the last
+/// `sliding_window` tokens, so a full ring holds exactly the right key set and
+/// never holds a key that should have been evicted.
+///
+/// ## Why permuting the keys is safe
+///
+/// A ring stores keys out of order. That is invariant for this attention:
+///  * softmax over keys is permutation-invariant, and K and V are written to
+///    the SAME slot, so key `i` stays paired with value `i`;
+///  * V4 rotates K *before* caching, so every stored row already carries its
+///    own absolute RoPE — no consumer re-derives a position from column index;
+///  * the validity mask stays [`graph_mode_length_mask`]'s `slot <= position`,
+///    which is already exactly right for a ring: while the ring is filling
+///    (`position < capacity`) slot `s` is written iff `s <= position`, and once
+///    it is full every slot is valid and the predicate is universally true.
+///
+/// ## Why this is not just `position % capacity` on the host
+///
+/// The host knows the position, but a host-resolved slot becomes a literal in
+/// the recorded kernel's arguments and every replay would then write to the
+/// capture step's slot — the same defect that made host-resolved RoPE offsets
+/// wrong (see `DeepSeekV2RotaryEmbedding::cos_sin_for`). Only `capacity` is
+/// baked, and it is a genuine compile-time-constant of the run.
+///
+/// F32 is exact for every integer below 2^24, and positions are bounded by
+/// `max_position_embeddings` (163 840 for V4), so the float round trip is exact.
+pub fn graph_ring_slot(positions: &Tensor, capacity: usize) -> Result<Tensor> {
+    if capacity == 0 {
+        candle_core::bail!("graph_ring_slot: capacity must be non-zero");
+    }
+    let p = positions.to_dtype(DType::F32)?;
+    // `affine`'s multiplier is a constant kernel argument, which is safe to
+    // bake: `capacity` is fixed for the life of the run. Only the position is
+    // allowed to vary between replays, and it is read from device memory.
+    let blocks = p.affine(1.0 / capacity as f64, 0.0)?.floor()?;
+    (p - (blocks * capacity as f64)?)?.to_dtype(DType::U32)
+}
+
 /// Check if graph-mode positions are set.
 #[cfg(feature = "cuda")]
 pub fn has_graph_mode_positions() -> bool {

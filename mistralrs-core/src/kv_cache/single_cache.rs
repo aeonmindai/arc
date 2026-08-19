@@ -326,9 +326,21 @@ impl SingleCache {
 
         self.pregrow_for_graph(src, read_capacity)?;
         let ad = self.all_data.as_ref().unwrap();
-        // Device-slot write of the new token; `write_kv_inplace` uses the
-        // buffer's real capacity from all_data's dims, so the slot is correct.
-        mistralrs_quant::kvwrite::write_kv_inplace(ad, src, position)?;
+        // RING write. The read below is a fixed `0..read_capacity` window, so
+        // writing at the ABSOLUTE position put every token from `read_capacity`
+        // onward OUTSIDE the window that is read: the freshest key became
+        // invisible and a stale row was attended in its place, making this arm
+        // correct only while the context was shorter than `sliding_window`.
+        //
+        // `read_capacity` IS `sliding_window` here, so a ring of that many
+        // slots holds exactly the key set the raw branch is defined to attend.
+        // The slot is derived on the DEVICE from the device position — a
+        // host-resolved `position % capacity` would be baked into the recorded
+        // kernel and every replay would write to the capture step's slot. See
+        // `layers::graph_ring_slot` for why permuting the keys is invariant
+        // here and why the existing length mask is already ring-correct.
+        let slot = crate::layers::graph_ring_slot(position, read_capacity)?;
+        mistralrs_quant::kvwrite::write_kv_inplace(ad, src, &slot)?;
         // Fixed-offset window -> constant shape for capture/replay.
         ad.narrow(self.dim, 0, read_capacity)
     }
