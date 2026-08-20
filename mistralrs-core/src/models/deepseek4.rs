@@ -2247,6 +2247,60 @@ impl MoeGate {
         })
     }
 
+    /// One-kernel spelling of the `gate.renormalize` chain.
+    /// `Ok(None)` means the caller must run `eager`.
+    fn fused_renorm(
+        &self,
+        topk_weight: &Tensor,
+        do_renorm: bool,
+        eager: &dyn Fn(&Tensor) -> Result<Tensor>,
+    ) -> Result<Option<Tensor>> {
+        use crate::cuda::hc_fused as seam;
+
+        if !seam::seam_on("ARC_SEAM_GATE") {
+            return Ok(None);
+        }
+        let decline = |reason: &str| -> Result<Option<Tensor>> {
+            seam::seam_declined(seam::SEAM_GATE, reason);
+            Ok(None)
+        };
+        if !topk_weight.device().is_cuda() {
+            return decline("device is not cuda");
+        }
+        if topk_weight.dtype() != DType::F32 {
+            return decline("topk_weight is not F32");
+        }
+        let Ok((n, k)) = topk_weight.dims2() else {
+            return decline("topk_weight is not rank 2");
+        };
+        if !matches!(k, 1 | 2 | 4 | 6 | 8) {
+            return decline("top_k outside the specialised set");
+        }
+        if !topk_weight.is_contiguous() {
+            return decline("topk_weight is not contiguous");
+        }
+        if n == 0 {
+            return decline("empty gate renorm");
+        }
+        // The scale is narrowed here exactly as candle's `affine` narrows it:
+        // `T::from_f64(routed_scaling_factor)`.
+        let out = seam::gate_renorm_cuda(
+            topk_weight,
+            1e-20f64 as f32,
+            self.cfg.routed_scaling_factor as f32,
+            do_renorm,
+        )?;
+
+        if seam::seam_ab_enabled() {
+            // Already F32 on both sides — nothing is narrowed here, so this
+            // comparison is the whole contract.
+            seam::ab_check("seam.gate_renorm", &out, &eager(topk_weight)?)?;
+        }
+
+        seam::seam_engaged(seam::SEAM_GATE);
+        Ok(Some(out))
+    }
+
     fn forward(&self, xs: &Tensor, input_ids: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
         let (bs, seq_len, h) = xs.dims3()?;
         let xs = xs.reshape(((), h))?;
@@ -2401,17 +2455,31 @@ impl MoeGate {
         // `"norm_topk_prob": true` with `sqrtsoftplus`, so this is taken —
         // identical to the previous scoring-function-derived condition.
         // Audit finding 21.
-        if self.cfg.norm_topk_prob
+        let do_renorm = self.cfg.norm_topk_prob
             && matches!(
                 self.cfg.scoring_func,
                 ScoringFunc::Sigmoid | ScoringFunc::SqrtSoftplus
-            )
-        {
-            let denominator = (topk_weight.sum_keepdim(D::Minus1)? + 1e-20)?;
-            topk_weight = topk_weight.broadcast_div(&denominator)?;
-        }
-
-        topk_weight = (topk_weight * self.cfg.routed_scaling_factor)?;
+            );
+        // FOUR launches over a [1, 6] tensor — `fast_sum`, `affine(+1e-20)`,
+        // `bdiv`, `affine(*routed_scaling_factor)` — once per MoE layer per
+        // token, i.e. 172 per decode forward for 6 divides and 6 multiplies.
+        // Collapsed to one; `arc_seam_gate_renorm_kernel` in cuda/hc_fused.cu
+        // replays candle's identity-padded reduction tree and the fmaf that
+        // `affine` compiles to. `ARC_F32SEAM=0` / `ARC_SEAM_GATE=0` restore the
+        // chain below.
+        let eager_renorm = |w: &Tensor| -> Result<Tensor> {
+            let w = if do_renorm {
+                let denominator = (w.sum_keepdim(D::Minus1)? + 1e-20)?;
+                w.broadcast_div(&denominator)?
+            } else {
+                w.clone()
+            };
+            w * self.cfg.routed_scaling_factor
+        };
+        topk_weight = match self.fused_renorm(&topk_weight, do_renorm, &eager_renorm)? {
+            Some(w) => w,
+            None => eager_renorm(&topk_weight)?,
+        };
         drop(_prof_renorm);
 
         // RUN-161 diagnostic: are the selected top-k routing weights peaked or
@@ -2685,11 +2753,13 @@ impl Moe {
         v4_stat_dbg(&y, "moe.routed");
         let li = self.layer_idx;
         v4_collapse_dbg(&y, &format!("L{li}.moe_routed"), 1);
-        v4_collapse_dbg(
-            &topk_idx.to_dtype(DType::F32).unwrap_or_else(|_| topk_idx.clone()),
-            &format!("L{li}.moe_topk_idx"),
-            0,
-        );
+        // `to_dtype` in ARGUMENT position is evaluated eagerly, so this debug
+        // telemetry was casting the U32 expert ids to F32 on every MoE layer of
+        // every forward — 43 `cast_u32_f32` launches per decoded token — even
+        // with `ARC_COLLAPSE` unset. `v4_collapse_dbg` already casts to F32
+        // internally, *behind* the env guard, so passing the ids through
+        // unchanged is the same telemetry for zero launches.
+        v4_collapse_dbg(&topk_idx, &format!("L{li}.moe_topk_idx"), 0);
 
         if let Some(ref shared_experts) = self.shared_experts {
             let _s = arc_profiler::device_span("moe.shared_expert");
@@ -2948,8 +3018,19 @@ fn compressed_row_positions(t_c: usize, ratio: usize, dev: &Device) -> Result<Te
                 return Ok(t.clone());
             }
         }
-        let t = (Tensor::arange(0u32, t_c as u32, dev)?.to_dtype(DType::F32)? * (ratio as f64))?
-            .to_dtype(DType::U32)?;
+        // `j * ratio` is integer arithmetic. It used to be laundered through
+        // float — `arange(u32) -> cast_u32_f32 -> affine(*ratio) ->
+        // cast_f32_u32` — three kernel launches to compute a strided range
+        // that `arange_step` produces directly. The thread-local above makes
+        // that free on a hit, but a miss (first token, or a window/device
+        // change) still paid it. The values are identical: the old chain's
+        // `fmaf(j, ratio, 0.0)` is exact for every `j * ratio` a sequence can
+        // reach (both operands and the product are integers well inside f32's
+        // exact range), and `to_dtype(U32)` truncated it back. `ratio` is
+        // 1 / 4 / 128 (`CompressRatio::ratio`), never 0, so `arange_step`'s
+        // zero-step bail is unreachable. Multiplied in usize so the product
+        // cannot wrap before the u32 narrowing.
+        let t = Tensor::arange_step(0u32, (t_c * ratio) as u32, ratio as u32, dev)?;
         *c = Some((t_c, ratio, t.clone()));
         Ok(t)
     })

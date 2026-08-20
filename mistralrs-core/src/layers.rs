@@ -3242,7 +3242,15 @@ impl Mlp {
             return crate::ops::mul_and_act(gate, up, self.act);
         };
         let out_dtype = gate.dtype();
-        let (gate, up) = crate::moe::swiglu_clamp(gate, up, limit)?;
+        // The shared-expert half of the 86 clamp calls per decode forward. Only
+        // the CLAMP is fused here, not the activation: `mul_and_act` below
+        // lands in `mistralrs_quant::fused_glu`, whose translation unit is
+        // built with `--use_fast_math`, so a no-fast-math kernel cannot
+        // reproduce its bits. See `crate::moe::fused_swiglu_clamp_split`.
+        let (gate, up) = match crate::moe::fused_swiglu_clamp_split(gate, up, limit, self.act)? {
+            Some(pair) => pair,
+            None => crate::moe::swiglu_clamp(gate, up, limit)?,
+        };
         crate::ops::mul_and_act(&gate, &up, self.act)?.to_dtype(out_dtype)
     }
 

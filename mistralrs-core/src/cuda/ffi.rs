@@ -440,6 +440,60 @@ extern "C" {
         dtype: i32,
         stream: i64,
     ) -> i32;
+    /// V4 clamped SwiGLU: `narrow(silu(min(gate, limit)) * clamp(up, -limit, limit))`.
+    /// Returns 0 on launch, non-zero if the `(in_dtype, out_dtype)` pair has no
+    /// specialisation — the caller must then use the eager chain.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn arc_seam_swiglu_clamp(
+        gate: *const c_void,
+        up: *const c_void,
+        out: *mut c_void,
+        limit: f32,
+        total: i64,
+        in_dtype: i32,
+        out_dtype: i32,
+        stream: i64,
+    ) -> i32;
+    /// The clamp half only, for the shared-expert site whose activation is a
+    /// fast-math `fused_glu` that a non-fast-math kernel cannot reproduce:
+    /// `gate_out = min(gate, limit)`, `up_out = clamp(up, -limit, limit)`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn arc_seam_swiglu_clamp_split(
+        gate: *const c_void,
+        up: *const c_void,
+        gate_out: *mut c_void,
+        up_out: *mut c_void,
+        limit: f32,
+        total: i64,
+        in_dtype: i32,
+        stream: i64,
+    ) -> i32;
+    /// MoE expert combine: `out[n, h] = narrow(tree_sum_k(ys[n, j, h] * w[n, j]))`.
+    /// Same return contract as above; `k` outside the specialised set refuses.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn arc_seam_moe_weighted_sum(
+        ys: *const c_void,
+        w: *const c_void,
+        out: *mut c_void,
+        k: i32,
+        h: i32,
+        total: i64,
+        in_dtype: i32,
+        out_dtype: i32,
+        stream: i64,
+    ) -> i32;
+    /// MoE gate weight renormalise + scale. Same return contract as above.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn arc_seam_gate_renorm(
+        w: *const c_void,
+        out: *mut c_void,
+        eps: f32,
+        scale: f32,
+        do_renorm: i32,
+        k: i32,
+        n: i64,
+        stream: i64,
+    ) -> i32;
     /// The whole `hc_post` re-expansion. Same return contract as above.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn hc_post_fused(

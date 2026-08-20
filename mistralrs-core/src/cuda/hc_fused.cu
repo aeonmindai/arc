@@ -495,6 +495,266 @@ __global__ void hc_post_fused_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// THE F32 SEAM (3 kernels below)
+// ---------------------------------------------------------------------------
+//
+// Everything above collapses chains that were *already* F32 end to end. The
+// three kernels below close the other half of the problem: expressions that
+// are BF16 on both sides but were spelled as "widen -> a few elementwise ops
+// in F32 -> narrow". Every entry and exit paid a `cast_*` launch and every
+// intermediate was a materialised F32 tensor. Measured on this H200 at
+// b424f5cd9 (agent/datamove-fuse), per decode forward:
+//
+//   cast_bf16_f32 356.7 | cast_f32_bf16 221.1 | bminimum_f32 172.0
+//   bmaximum_f32   86.0 | bmul_f32       94.4 | fast_sum_f32   98.8
+//
+// `bmaximum_f32 = 86.0` and `bminimum_f32 = 172.0` are exact, not approximate:
+// 86 = 2 x 43 layers is the number of `swiglu_clamp` calls per forward (one
+// routed-expert stage + one shared-expert stage per layer), and each contains
+// one `maximum` and two `minimum`. That fingerprint is what identified the
+// seam.
+//
+// A SECOND, INVISIBLE COST. `Tensor::minimum(f64)` / `maximum(f64)` build the
+// scalar operand as `Tensor::new(v, Cpu)?.to_dtype()?.to_device(cuda)?` on
+// every call (candle tensor.rs `binary_op_scalar!`). That is a 4-byte
+// host-to-device memcpy per clamp bound -- 3 per `swiglu_clamp`, 258 per
+// forward -- which never appears in a kernel histogram at all.
+//
+// BIT-IDENTITY. Same contract as the rest of this file: transcription, not
+// re-derivation. The op-by-op sources are quoted at each kernel. `ARC_SEAM_AB=1`
+// re-runs the candle chain next to each kernel and compares raw bits, and it
+// compares them at **F32, before the narrowing** -- a BF16-only comparison has
+// 8 mantissa bits and would swallow exactly the reassociation errors that
+// matter. `ARC_HC_AB_POISON=1` perturbs one element by 1 ULP and must make
+// every comparison fail; if it does not, the comparison is broken, not the
+// kernel.
+
+// V4 clamped SwiGLU: 8 launches + 3 H2D memcpys -> 1 kernel.
+//
+// Replaces verbatim, for the ROUTED experts (moe/experts.rs `swiglu` ->
+// `swiglu_clamp`):
+//   let gate = gate.to_dtype(F32)?.minimum(limit)?;          // cast + bminimum
+//   let up   = up.to_dtype(F32)?.clamp(-limit, limit)?;      // cast + bmaximum + bminimum
+//   let act  = gate.apply(&Silu)?;                           // usilu_f32
+//   up.mul(&act)?.to_dtype(out_dtype)                        // bmul + cast
+//
+// and for the SHARED expert (layers.rs `Mlp::gated_act`), whose middle two
+// launches are instead one `fused_glu_f32` (mistralrs-quant ops.cu:845-890):
+//   T activated = (T)glu_silu(a); output[i] = activated * b[i];
+//
+// The two spellings are the SAME VALUE, which is why one kernel serves both:
+//   * candle `usilu_f32` is `silu_fwd(x) = x / (static_cast<T>(1) + expg(-x))`
+//     (candle-kernels unary.cu:59-61, cuda_utils.cuh:148 `expg(float)=expf`);
+//   * `glu_silu(x)` is `x / (1.0f + expf(-x))` -- character for character the
+//     same expression;
+//   * the products differ only in operand order (`up * act` vs `act * up`),
+//     and IEEE multiplication is commutative bit-for-bit.
+//
+// `clamp(lo, hi)` is `maximum(lo)?.minimum(hi)` (candle tensor.rs:1176-1178),
+// and candle's `maxg`/`ming` for float are `fmaxf`/`fminf`
+// (cuda_utils.cuh:142-145) -- reproduced, not re-derived. The clamp bounds
+// arrive as f64 in Rust and are narrowed to f32 by candle's `to_dtype` before
+// the compare; `limit` is passed in already narrowed, so `-limit` here is the
+// same f32 the eager path compares against.
+//
+// TIN/TOUT are separate so `ARC_SEAM_AB=1` can ask for the F32 product that
+// the eager chain holds *before* its final cast, and compare there.
+template <typename TIN, typename TOUT>
+__global__ void arc_seam_swiglu_clamp_kernel(
+    const TIN *__restrict__ gate, // [total] model dtype
+    const TIN *__restrict__ up,   // [total] model dtype
+    TOUT *__restrict__ out,       // [total]
+    float limit,
+    long long total
+) {
+    const long long stride = (long long)blockDim.x * (long long)gridDim.x;
+    const float neg_limit = -limit;
+    for (long long i = (long long)blockIdx.x * (long long)blockDim.x + threadIdx.x;
+         i < total; i += stride) {
+        // BF16->F32 is an exact widening: these are the bits candle's
+        // `to_dtype(F32)` would have written to a temporary.
+        float g = hc_widen(gate[i]);
+        float u = hc_widen(up[i]);
+        g = fminf(g, limit);      // gate is clamped ONLY from above
+        u = fmaxf(u, neg_limit);  // up is clamped on both sides, max first
+        u = fminf(u, limit);
+        // silu_fwd: one add, one accurate-libdevice expf, one div.rn.f32.
+        // There is no mul+add pair here, so --fmad=false has nothing to
+        // forbid and the result does not depend on the contraction setting.
+        const float den = __fadd_rn(1.0f, expf(-g));
+        const float act = __fdiv_rn(g, den);
+        out[i] = hc_narrow<TOUT>(__fmul_rn(act, u));
+    }
+}
+
+// The clamp HALF of the same stage: 5 launches + 3 H2D memcpys -> 1 kernel,
+// two outputs, both F32.
+//
+// Why a second, weaker kernel exists. The SHARED expert's activation and
+// multiply are `mistralrs_quant::fused_glu`, and mistralrs-quant/build.rs:281
+// compiles that translation unit with `--use_fast_math`. Its `expf` is
+// therefore `__expf` (ex2.approx) and its `/` is div.approx, not the
+// `__nv_expf` + div.rn that candle-kernels' `usilu_f32` uses -- and fast math
+// also implies -ftz=true, which no intrinsic in a non-fast-math file can
+// reproduce per-op. So `arc_seam_swiglu_clamp_kernel` above is bit-identical to
+// the ROUTED chain and would NOT be bit-identical to the shared one. Rather
+// than fuse the shared site on a tolerance argument, only its provable half is
+// fused: the two widening casts, the `maximum` and the two `minimum`s, plus the
+// three host-to-device copies of the bounds. `fused_glu` then runs unchanged on
+// the F32 tensors it runs on today.
+//
+// `ARC_SEAM_AB=1` still evaluates the full fusion at the shared site and
+// reports whether the fast-math and IEEE spellings happen to agree; that
+// measurement decides whether the remaining 4 launches per shared call can ever
+// be taken, and it is a fact in the log rather than an assumption either way.
+template <typename TIN>
+__global__ void arc_seam_swiglu_clamp_split_kernel(
+    const TIN *__restrict__ gate,   // [total] model dtype
+    const TIN *__restrict__ up,     // [total] model dtype
+    float *__restrict__ gate_out,   // [total] F32, min(g, limit)
+    float *__restrict__ up_out,     // [total] F32, clamp(u, -limit, limit)
+    float limit,
+    long long total
+) {
+    const long long stride = (long long)blockDim.x * (long long)gridDim.x;
+    const float neg_limit = -limit;
+    for (long long i = (long long)blockIdx.x * (long long)blockDim.x + threadIdx.x;
+         i < total; i += stride) {
+        const float g = hc_widen(gate[i]);
+        float u = hc_widen(up[i]);
+        u = fmaxf(u, neg_limit);
+        u = fminf(u, limit);
+        gate_out[i] = fminf(g, limit);
+        up_out[i] = u;
+    }
+}
+
+// MoE expert combine: 4 launches -> 1.
+//
+// Replaces verbatim (moe/experts.rs `forward_fast`, the `experts.weighted_sum`
+// span):
+//   ys.to_dtype(F32)?                                   // cast_bf16_f32
+//     .broadcast_mul(&topk_weights.unsqueeze(-1)?)?     // bmul_f32
+//     .sum(D::Minus2)?                                  // fast_sum_f32
+//     .to_dtype(original_dtype)                         // cast_f32_bf16
+//
+// REDUCTION ORDER. `sum(D::Minus2)` on `[n, K, h]` gives dst_el = n*h and
+// el_to_sum_per_block = K, so candle's `FastReduce` picks
+// block_dim = min(1024, K).next_power_of_two() = P (cuda_backend/mod.rs:370).
+// For V4's K = 6 that is P = 8: threads 0..5 each take one element, threads
+// 6 and 7 take none and keep their zero-initialised accumulator, and the
+// pairwise tree then runs over all EIGHT slots. The sum is therefore
+//   ((0+a0)+(0+a4)) + ((0+a2)+0) + [ ((0+a1)+(0+a5)) + ((0+a3)+0) ]
+// which is neither the sequential sum nor the K=6 pairwise tree. The identity
+// padding is part of the answer and is replayed literally below, as is the
+// `shr[tid] = 0; shr[tid] += v` (it canonicalises -0.0f to +0.0f).
+template <typename TIN, typename TOUT, int K, int P>
+__global__ void arc_seam_moe_weighted_sum_kernel(
+    const TIN *__restrict__ ys,  // [n, K, h] model dtype
+    const float *__restrict__ w, // [n, K]    F32 routing weights
+    TOUT *__restrict__ out,      // [n, h]
+    int h,
+    long long total // n * h
+) {
+    const long long stride = (long long)blockDim.x * (long long)gridDim.x;
+    for (long long i = (long long)blockIdx.x * (long long)blockDim.x + threadIdx.x;
+         i < total; i += stride) {
+        const long long row = i / (long long)h;
+        const int col = (int)(i - row * (long long)h);
+        const float *wrow = w + row * K;
+        const TIN *yrow = ys + row * (long long)K * (long long)h + col;
+
+        float acc[P];
+#pragma unroll
+        for (int t = 0; t < P; ++t) {
+            if (t < K) {
+                // `broadcast_mul` is binary.cu `x * y` with x = ys, y = w.
+                acc[t] = __fadd_rn(
+                    0.0f,
+                    __fmul_rn(hc_widen(yrow[(long long)t * (long long)h]), wrow[t]));
+            } else {
+                acc[t] = 0.0f; // identity-padded lane: shr[tid] = 0, never added to
+            }
+        }
+#pragma unroll
+        for (int s = P >> 1; s > 0; s >>= 1) {
+#pragma unroll
+            for (int t = 0; t < P; ++t) {
+                if (t < s) {
+                    acc[t] = __fadd_rn(acc[t], acc[t + s]);
+                }
+            }
+        }
+        out[i] = hc_narrow<TOUT>(acc[0]);
+    }
+}
+
+// MoE gate weight renormalise + scale: 4 launches -> 1.
+//
+// Replaces verbatim (deepseek4.rs `MoeGate::forward`, spans `gate.renormalize`):
+//   let denominator = (topk_weight.sum_keepdim(D::Minus1)? + 1e-20)?;  // fast_sum + affine
+//   topk_weight = topk_weight.broadcast_div(&denominator)?;            // bdiv_f32
+//   topk_weight = (topk_weight * routed_scaling_factor)?;              // affine
+//
+// `sum_keepdim(D::Minus1)` on `[n, K]` gives el_to_sum_per_block = K, so the
+// same P = next_pow2(K) padded tree as above applies.
+//
+// `Tensor + f64` and `Tensor * f64` both lower to `affine(mul, add)`
+// (candle tensor.rs `bin_trait!`: Add -> affine(1., v), Mul -> affine(v, 0.)),
+// whose kernel body is `x * mul + add` (affine.cu:18) compiled by candle with
+// the DEFAULT -fmad=true, i.e. a single fmaf. Written as an explicit `fmaf`
+// here: an explicit fmaf is unaffected by this file's --fmad=false, which only
+// forbids *contraction* of a separate mul and add. `fmaf(x, scale, 0.0f)` is
+// deliberately not `x * scale` -- they differ in the sign of zero.
+template <int K, int P>
+__global__ void arc_seam_gate_renorm_kernel(
+    const float *__restrict__ w, // [n, K]
+    float *__restrict__ out,     // [n, K]
+    float eps,                   // the 1e-20 added to the denominator
+    float scale,                 // routed_scaling_factor
+    int do_renorm,               // cfg.norm_topk_prob && scoring in {sigmoid, sqrtsoftplus}
+    long long n
+) {
+    const long long stride = (long long)blockDim.x * (long long)gridDim.x;
+    for (long long row = (long long)blockIdx.x * (long long)blockDim.x + threadIdx.x;
+         row < n; row += stride) {
+        const float *wrow = w + row * K;
+        float *orow = out + row * K;
+
+        float v[K];
+#pragma unroll
+        for (int t = 0; t < K; ++t) {
+            v[t] = wrow[t];
+        }
+
+        float den = 0.0f;
+        if (do_renorm) {
+            float acc[P];
+#pragma unroll
+            for (int t = 0; t < P; ++t) {
+                acc[t] = (t < K) ? __fadd_rn(0.0f, v[t]) : 0.0f;
+            }
+#pragma unroll
+            for (int s = P >> 1; s > 0; s >>= 1) {
+#pragma unroll
+                for (int t = 0; t < P; ++t) {
+                    if (t < s) {
+                        acc[t] = __fadd_rn(acc[t], acc[t + s]);
+                    }
+                }
+            }
+            den = fmaf(acc[0], 1.0f, eps); // affine(1., 1e-20)
+        }
+
+#pragma unroll
+        for (int t = 0; t < K; ++t) {
+            const float x = do_renorm ? __fdiv_rn(v[t], den) : v[t];
+            orow[t] = fmaf(x, scale, 0.0f); // affine(routed_scaling_factor, 0.)
+        }
+    }
+}
+
 // 256 threads, grid capped so the grid-stride loop stays valid for any size.
 inline void hc_launch_dims(long long total, unsigned &blocks, int &block) {
     block = 256;
@@ -596,6 +856,156 @@ int hc_post_fused(
     }
     return 1;
 #undef HC_PF
+}
+
+// ---------------------------------------------------------------------------
+// F32-seam entry points.
+//
+// Deliberately fresh symbol names. A stale object file left in the archive by
+// an incremental build has already, once, satisfied a link with none of the
+// new code in it -- byte-identical output, green build, silent no-op. A name
+// that has never existed before turns that failure into a link error.
+// ---------------------------------------------------------------------------
+
+// `out = narrow( silu(min(gate, limit)) * clamp(up, -limit, limit) )`.
+// `in_dtype` is the dtype of gate/up; `out_dtype` is usually the same, and is
+// F32 only when the A/B harness asks for the pre-narrowing product.
+int arc_seam_swiglu_clamp(
+    const void *gate,
+    const void *up,
+    void *out,
+    float limit,
+    long long total,
+    int in_dtype,
+    int out_dtype,
+    long long stream
+) {
+    unsigned blocks;
+    int block;
+    hc_launch_dims(total, blocks, block);
+    cudaStream_t s = (cudaStream_t)stream;
+#define ARC_SWG(TIN, TOUT)                                                                 \
+    arc_seam_swiglu_clamp_kernel<TIN, TOUT><<<blocks, block, 0, s>>>(                       \
+        (const TIN *)gate, (const TIN *)up, (TOUT *)out, limit, total)
+    if (in_dtype == HC_DTYPE_BF16 && out_dtype == HC_DTYPE_BF16) {
+        ARC_SWG(__nv_bfloat16, __nv_bfloat16);
+        return 0;
+    }
+    if (in_dtype == HC_DTYPE_BF16 && out_dtype == HC_DTYPE_F32) {
+        ARC_SWG(__nv_bfloat16, float);
+        return 0;
+    }
+    if (in_dtype == HC_DTYPE_F32 && out_dtype == HC_DTYPE_F32) {
+        ARC_SWG(float, float);
+        return 0;
+    }
+    if (in_dtype == HC_DTYPE_F32 && out_dtype == HC_DTYPE_BF16) {
+        ARC_SWG(float, __nv_bfloat16);
+        return 0;
+    }
+    return 1;
+#undef ARC_SWG
+}
+
+// `gate_out = min(gate, limit)`, `up_out = clamp(up, -limit, limit)`, both F32.
+int arc_seam_swiglu_clamp_split(
+    const void *gate,
+    const void *up,
+    void *gate_out,
+    void *up_out,
+    float limit,
+    long long total,
+    int in_dtype,
+    long long stream
+) {
+    unsigned blocks;
+    int block;
+    hc_launch_dims(total, blocks, block);
+    cudaStream_t s = (cudaStream_t)stream;
+#define ARC_SWG_SPLIT(TIN)                                                                 \
+    arc_seam_swiglu_clamp_split_kernel<TIN><<<blocks, block, 0, s>>>(                       \
+        (const TIN *)gate, (const TIN *)up, (float *)gate_out, (float *)up_out, limit, total)
+    if (in_dtype == HC_DTYPE_BF16) {
+        ARC_SWG_SPLIT(__nv_bfloat16);
+        return 0;
+    }
+    if (in_dtype == HC_DTYPE_F32) {
+        ARC_SWG_SPLIT(float);
+        return 0;
+    }
+    return 1;
+#undef ARC_SWG_SPLIT
+}
+
+// `out[n, h] = narrow( tree_sum_K( ys[n, j, h] * w[n, j] ) )`.
+int arc_seam_moe_weighted_sum(
+    const void *ys,
+    const void *w,
+    void *out,
+    int k,
+    int h,
+    long long total,
+    int in_dtype,
+    int out_dtype,
+    long long stream
+) {
+    unsigned blocks;
+    int block;
+    hc_launch_dims(total, blocks, block);
+    cudaStream_t s = (cudaStream_t)stream;
+#define ARC_WS(TIN, TOUT, KV, PV)                                                          \
+    arc_seam_moe_weighted_sum_kernel<TIN, TOUT, KV, PV><<<blocks, block, 0, s>>>(           \
+        (const TIN *)ys, (const float *)w, (TOUT *)out, h, total)
+#define ARC_WS_K(TIN, TOUT)                                                                \
+    switch (k) {                                                                           \
+    case 1: ARC_WS(TIN, TOUT, 1, 1); return 0;                                             \
+    case 2: ARC_WS(TIN, TOUT, 2, 2); return 0;                                             \
+    case 4: ARC_WS(TIN, TOUT, 4, 4); return 0;                                             \
+    case 6: ARC_WS(TIN, TOUT, 6, 8); return 0;                                             \
+    case 8: ARC_WS(TIN, TOUT, 8, 8); return 0;                                             \
+    default: return 1;                                                                     \
+    }
+    if (in_dtype == HC_DTYPE_BF16 && out_dtype == HC_DTYPE_BF16) {
+        ARC_WS_K(__nv_bfloat16, __nv_bfloat16)
+    } else if (in_dtype == HC_DTYPE_BF16 && out_dtype == HC_DTYPE_F32) {
+        ARC_WS_K(__nv_bfloat16, float)
+    } else if (in_dtype == HC_DTYPE_F32 && out_dtype == HC_DTYPE_F32) {
+        ARC_WS_K(float, float)
+    } else if (in_dtype == HC_DTYPE_F32 && out_dtype == HC_DTYPE_BF16) {
+        ARC_WS_K(float, __nv_bfloat16)
+    }
+    return 1;
+#undef ARC_WS_K
+#undef ARC_WS
+}
+
+// `out[n, :] = affine( w[n, :] / (tree_sum_K(w[n, :]) + eps), scale )`.
+int arc_seam_gate_renorm(
+    const void *w,
+    void *out,
+    float eps,
+    float scale,
+    int do_renorm,
+    int k,
+    long long n,
+    long long stream
+) {
+    unsigned blocks;
+    int block;
+    hc_launch_dims(n, blocks, block);
+    cudaStream_t s = (cudaStream_t)stream;
+#define ARC_GR(KV, PV)                                                                     \
+    arc_seam_gate_renorm_kernel<KV, PV><<<blocks, block, 0, s>>>(                           \
+        (const float *)w, (float *)out, eps, scale, do_renorm, n)
+    switch (k) {
+    case 1: ARC_GR(1, 1); return 0;
+    case 2: ARC_GR(2, 2); return 0;
+    case 4: ARC_GR(4, 4); return 0;
+    case 6: ARC_GR(6, 8); return 0;
+    case 8: ARC_GR(8, 8); return 0;
+    default: return 1;
+    }
+#undef ARC_GR
 }
 
 } // extern "C"
