@@ -93,6 +93,10 @@ pub use mxfp4::MXFP4Layer;
 pub use nvfp4::NVFP4Layer;
 pub use pending_layer::PendingIsqLayer;
 pub use pertensor_fp8::PerTensorFP8Linear;
+pub use qtip::tcfrag::{
+    tcfrag_codeword, tcfrag_repack, tcfrag_repack_row, tcfrag_state, tcfrag_unpack_row,
+    tcfrag_words_per_row, TCFRAG_SYMS_PER_WORD,
+};
 pub use qtip::tune::{
     gemv_num_variants as qtip2b_gemv_num_variants, gemv_variant_applicable,
     gemv_variant_desc as qtip2b_gemv_variant_desc,

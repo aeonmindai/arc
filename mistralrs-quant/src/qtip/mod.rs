@@ -74,6 +74,7 @@ mod greedy_ban_tests;
 pub mod grouped;
 #[cfg(test)]
 mod search_bench;
+pub mod tcfrag;
 pub mod tune;
 mod viterbi;
 pub use bitshift::{Qtip2bLayer, QTIP2B_MCG_MULT};
