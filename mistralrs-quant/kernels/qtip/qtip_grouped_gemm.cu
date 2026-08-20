@@ -816,8 +816,11 @@ void launch_qtip2b_moe_route(
         if (grid <= 0) return;                                                 \
         switch (variant) {                                                     \
         case QTIP_GROUPED_VARIANT_DECODESTUB:                                  \
-            qtip2b_grouped_gemm_kernel<T, QTIP_GROUPED_VARIANT_DECODESTUB>      \
-                <<<grid, block, shmem, stream>>>(QG_ARGS);                      \
+            qtip2b_grouped_gemm_kernel<T, QTIP_GROUPED_VARIANT_DECODESTUB>     \
+                <<<grid, QG_THREADS, 0, stream>>>(                             \
+                    d_packed, d_row_scales, d_x_rotated, d_sorted_pairs,       \
+                    d_tile_expert, d_tile_row_start, d_offsets, d_num_tiles,   \
+                    d_y, n_rows, packed_per_row, num_symbols, mult);           \
             break;                                                             \
         case QTIP_GROUPED_VARIANT_LDST:                                        \
             qtip2b_grouped_gemm_kernel<T, QTIP_GROUPED_VARIANT_LDST>           \
