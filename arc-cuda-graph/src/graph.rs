@@ -580,6 +580,27 @@ output_trusted={} verify_remaining={} verify_failed={}",
         // and there is at most one capture per process.
         tracing::info!("ARC capture: [1/5] cuStreamEndCapture OK, graph recorded");
 
+        // How many host->device copies did this capture record, and did their
+        // sources get retained?
+        //
+        // A captured `cuMemcpyHtoDAsync` stores the HOST POINTER; the graph
+        // re-reads it on the first launch and on every replay. Every host-built
+        // tensor inside the captured region is therefore a dangling read once
+        // its transient `Vec` drops, and the driver's launch-time validation of
+        // an unmapped source region is what returns 700 SYNCHRONOUSLY from
+        // `cuGraphLaunch` on a context that `[1b]` has just proved clean.
+        //
+        // candle now retains those sources (`arc_capture_retain_host`). This
+        // line is the proof it happened: a run that reports `retained=0` has a
+        // fix that never fired, which is a different fact from "the capture had
+        // no H2D copies" only because the counter also reports the byte total.
+        // Never infer this from the absence of a fault.
+        let (htod_n, htod_bytes) = candle_core::cuda::arc_capture_htod_retained();
+        tracing::info!(
+            "ARC capture: [1a] capture-time H2D sources retained: {htod_n} copies, \
+             {htod_bytes} B (ARC_HTOD_TRACE=1 backtraces each one)"
+        );
+
         // Is the context ALREADY in error before the graph has ever run?
         //
         // `cuGraphLaunch` returned 700 SYNCHRONOUSLY on a capture with zero
