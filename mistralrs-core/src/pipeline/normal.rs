@@ -2367,7 +2367,7 @@ impl Pipeline for NormalPipeline {
                                                     for i in 0..n {
                                                         let d = max_abs_diff(&g[i], &e[i])
                                                             .unwrap_or(f32::NAN);
-                                                        if i < 6 || first.map_or(false, |f| i <= f + 2)
+                                                        if i < 12 || first.map_or(false, |f| i <= f + 2)
                                                         {
                                                             line.push_str(&format!(
                                                                 " L{i}={d:.2e}"
@@ -2385,7 +2385,7 @@ impl Pipeline for NormalPipeline {
                                                     // 2=mHC lift, 3+=layer
                                                     // (slot-3).
                                                     tracing::error!(
-                                                        "ARC BISECT: slots={n} first_diverging={:?} [0=mask 1=embed 2=lift 3+=L(n-3)]{line}",
+                                                        "ARC BISECT: slots={n} first_diverging={:?} [0=mask 1=embed 2=lift then per graph-arm layer: k, k_full, attn, layer_out]{line}",
                                                         first
                                                     );
                                                 }
