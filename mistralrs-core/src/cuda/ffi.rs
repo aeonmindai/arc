@@ -380,12 +380,22 @@ extern "C" {
     /// recombination, in one launch. Returns 0 on launch, non-zero if the
     /// (dtype, head_dim, rope_dim) triple is outside the specialised set — the
     /// caller must then run the eager chain rather than approximate.
+    ///
+    /// 🔴 UNVERIFIED — NOT MEASURED (arcgraph/rope-device-pos). v2 -> v3: the
+    /// `pos_offset: i32` scalar is gone. A host `usize` in a kernel parameter is
+    /// COPIED into a captured CUDA-graph node, so replays rotated at the capture
+    /// step's position. `positions` is a device `u32` array read per row inside
+    /// the kernel; `pos_stride_b` is 1 for a `[B]` buffer (graph decode, T == 1)
+    /// and 0 for a `[T]` buffer shared across the batch (eager). The rename
+    /// makes a half-applied patch a link error rather than a silent stack
+    /// misread.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn arc_qk_norm_rope_bf16_v2(
+    pub(crate) fn arc_qk_norm_rope_bf16_v3(
         q_in: *const c_void,
         k_in: *const c_void,
         cos_tab: *const c_void,
         sin_tab: *const c_void,
+        positions: *const c_void,
         q_out: *mut c_void,
         k_out: *mut c_void,
         n_heads: i32,
@@ -393,7 +403,7 @@ extern "C" {
         seq_len: i32,
         head_dim: i32,
         rope_dim: i32,
-        pos_offset: i32,
+        pos_stride_b: i32,
         dtype: i32,
         inv_n_bits: u32,
         zero_bits: u32,

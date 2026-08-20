@@ -3859,6 +3859,46 @@ mod compress_positions_tests {
         assert!(compress_positions(4, 0, &Device::Cpu).is_err());
     }
 
+    /// 🔴 UNVERIFIED ON GPU — NOT MEASURED (arcgraph/rope-device-pos). The
+    /// eager arm of `deepseek4::Attention::fused_qk_gate` now serves the fused
+    /// RoPE kernel's positions as
+    /// `compress_positions(pos_offset + T, 1, dev).narrow(0, pos_offset, T)`,
+    /// replacing a `const int pos_offset` kernel parameter that CUDA-graph
+    /// capture froze at the capture step.
+    ///
+    /// That substitution preserves the eager output ONLY if the vector is
+    /// exactly `pos_offset + t` — the kernel reads `cos_tab + positions[t] *
+    /// HALF_ROPE` where it used to read `cos_tab + (pos_offset + t) *
+    /// HALF_ROPE`, so an off-by-one ramp would rotate every eager token at the
+    /// wrong position with no error raised anywhere.
+    ///
+    /// This is the host-checkable half of "the eager path is unchanged". The
+    /// device half — that the kernel actually reads this buffer, and that the
+    /// bf16 outputs stay bit-identical — is `ARC_QK_VERIFY=1` on a GPU, and has
+    /// NOT been run.
+    #[test]
+    fn the_fused_rope_position_ramp_is_exactly_pos_offset_plus_t() -> Result<()> {
+        let dev = Device::Cpu;
+        // Includes the chunk boundary (1023/1024), where the cached table is
+        // rebuilt, and a prefill-sized T.
+        for (pos_offset, t) in [
+            (0usize, 1usize),
+            (0, 8),
+            (1, 1),
+            (7, 3),
+            (1023, 1),
+            (1024, 1),
+            (5000, 2048),
+        ] {
+            let got = compress_positions(pos_offset + t, 1, &dev)?
+                .narrow(0, pos_offset, t)?
+                .to_vec1::<u32>()?;
+            let want: Vec<u32> = (0..t).map(|i| (pos_offset + i) as u32).collect();
+            assert_eq!(got, want, "pos_offset={pos_offset} T={t}");
+        }
+        Ok(())
+    }
+
     /// `positions_f32` replaced `arange(start, start+len).to_f32()` at three
     /// V4 attention-mask sites. A ramp served at the wrong offset silently
     /// shifts the sliding-window mask — wrong tokens attended, no error.
