@@ -50,6 +50,15 @@ reordered by it, with Rung 0 (~3.75 sessions, **zero GPU hours**) gating
 everything above. **Both are on branch `docs/census-session8` until it merges.**
 Measured numbers → `FACTS.md` §2026-08-19. New rules → `KERNEL_RULES.md` top block.
 
+🎯 **`memory/mission/FRONTIER_BITS_FOR_DECODE.md`** — **THE BIT-RATE FRONTIER.
+Read it before quoting the 3.46× decode win, before proposing any codebook work
+at 2 bpw, and before choosing a geometry.** The cheap decode is real but is
+**NOT at 2 bpw**; the shipping geometry is **K9/V4/L12 at 2.25 bpw**. Carries the
+measured reason 2 bpw is closed (trellis freedom, not codebook coverage), the
+exact byte-extraction bound, the census's structural blind spot, and a
+`CONFIRMED FALSE` on the "GPU computes the codebook" comment. **CPU only, $0,
+every table re-run from scratch.**
+
 ## MEASURED this session — zero GPU hours, four results
 
 - **Trellis inst/weight, COMPILED** (`nvcc -cubin`, CUDA 12.4.131, inner loop by
@@ -61,6 +70,18 @@ Measured numbers → `FACTS.md` §2026-08-19. New rules → `KERNEL_RULES.md` to
   exactly **32,768 B**, under the 48 KB static limit, **no `cudaFuncSetAttribute`
   needed**; occupancy **62.5%** (not the predicted 31%) and
   **register-limited, not shared-limited**.
+  🔴 **AND THEN A FIFTH RESULT SUPERSEDED THE GEOMETRY, SAME DAY, SAME $0:**
+  **K8/V4/L12 is quality-CLOSED** — **−0.00698** `w_cos` against a **±0.0008**
+  band, and **nine codebook designs top out at −0.00307**, still 3.8× outside.
+  The 3.46×-shaped decode is available **for a quarter of a bit more**:
+  **K9/V4/L12, 2.25 bpw, +0.00402 — 5.0× the band on the GOOD side of the shipped
+  control** — at the **same 32,768 B table** and the **same decode shape**, since
+  at fixed L=12/V=4 **the codebook does not read K**. **The price is capacity: KV
+  58.8 → 49.6 GB, and that effect is UNMEASURED.** ⚠️ **Do not quote 4.375 for
+  K9 — the kernel has never been compiled at any K but 8.**
+  ✅ **The one-card wedge SURVIVES the extra quarter-bit:** 2.25 bpw ⇒ **83.4 GB
+  of 141**, still **1.8× under MXFP4's 151 GB**, which does not fit at all.
+  Full record + anchors: **`memory/mission/FRONTIER_BITS_FOR_DECODE.md`**.
 - **V4 KV over-retention:** 361.4 MB/seq → **6.35–11.96 MB/seq at 8k = 30–57×**;
   **B=32 @ 8k: 11.57 GB → 0.38 GB.** Compaction copies 1.12 rows per row stored.
 - **Launch reductions shipped:** 9,131 → **8,650/token** (−430 dead mHC casts,
@@ -581,6 +602,17 @@ K4/V2/L16 shipped **15.125** inst/wt (sm_90) → **K8/V4/L12 + row-scale hoist 4
 **3.46× fewer instructions per weight**, LUT exactly 32,768 B (fits static smem, no
 `cudaFuncSetAttribute`), occupancy 62.5% and **register-limited**. **Still 3.1–3.9× short of
 the 1.13–1.41 budget** — that is scope, not a sentence (D21). Full table: `FACTS.md` §2026-08-19.
+🔴 **THAT GEOMETRY IS QUALITY-CLOSED AT 2 bpw AND MUST NOT BE BAKED — the winning
+rung is K9/V4/L12 at 2.25 bpw.** K8/V4/L12 costs **−0.00698** `w_cos` (band
+±0.0008) and **nine codebook designs stop at −0.00307**; the measured reason is
+**trellis freedom, not codebook coverage** (trellis OFF, LBG halves the loss vs
+random; trellis ON, the same LBG loses to random). K9 buys **+0.00402** at the
+**same 32,768 B table and same decode shape** for **0.25 bpw**, costing **KV 58.8
+→ 49.6 GB (UNMEASURED as a batch/context effect)**. ⚠️ **K9's inst/weight is
+UNMEASURED — the kernel has never been compiled at any K but 8. Do not quote
+4.375 for K9.** Runner-up if capacity binds: **K4/V2/L13, 2.00 bpw, −0.00206,
+11.250 inst/wt (1.34×)** — misses the band, costs no bit and no KV.
+Full record: **`memory/mission/FRONTIER_BITS_FOR_DECODE.md`**.
 🔴 **PRICE IT HONESTLY: the re-bake gets ~8× MORE expensive, not cheaper.** The production
 baker is **beam, not exhaustive** (213 vs 8,257 s/layer on A100) and is **issue-bound**, so cost
 `(n/V)×W×2^K` ⇒ **~213 → ~1,700 s/layer ≈ 20 h ≈ $30**. Affordable — but it **inverts** the

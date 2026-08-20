@@ -40,6 +40,14 @@ claim that the full ceiling was one re-bake away.
 are not allowed a shared budget line. The compiled ladder is safe *because* all
 three of its geometries are 2 bpw.
 
+⚠️ **AND A LADDER THAT HOLDS bpw FIXED HAS NOT PICKED A WINNER — IT HAS ONLY
+PRICED ONE AXIS.** Holding all three geometries at 2 bpw made the instruction
+comparison valid and simultaneously hid the fact that **the cheapest of the three
+is quality-closed at that bit rate** (K8/V4/L12: −0.00698 `w_cos` vs a ±0.0008
+band). The winning rung turned out to be **off the ladder entirely**, at 2.25 bpw.
+⇒ **Price quality on the same sweep, or state in the same sentence that you have
+not.** `memory/mission/FRONTIER_BITS_FOR_DECODE.md`.
+
 ## 3. A DEPRECATED CLI THAT PRINTS HELP AND EXITS **0** IS SILENT SUCCESS IN A NEW COSTUME
 
 `huggingface-cli` → `hf`. The old binary still exists, still prints, still exits
