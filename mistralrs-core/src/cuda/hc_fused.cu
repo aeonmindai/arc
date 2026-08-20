@@ -529,6 +529,47 @@ __global__ void hc_post_fused_kernel(
 // matter. `ARC_HC_AB_POISON=1` perturbs one element by 1 ULP and must make
 // every comparison fail; if it does not, the comparison is broken, not the
 // kernel.
+//
+// ---------------------------------------------------------------------------
+// MEASURED RESULT -- arc-graph1 (H200), agent/f32-cast-fuse @ 9de64af,
+// ONE binary toggled with ARC_F32SEAM, 160-token greedy generation, nsys
+// `-t cuda`, every count a full GROUP BY over the exported sqlite, step count
+// pinned by two independent anchors that agree at 160 forwards.
+//
+//   per forward                     ARC_F32SEAM=0    =1        delta
+//   kernel launches                      4,622.5   3,891.5    -731.0  (-15.8%)
+//   cuMemcpyHtoDAsync                    1,450.9     762.9    -688.0  (-47.4%)
+//   cuMemAllocAsync                        205.4     196.7      -8.7
+//   ALL host-issued ops                  8,081.8   6,645.4  -1,436.4  (-17.8%)
+//
+// Per kernel, and every line is the arithmetic this file predicted:
+//   bminimum_f32   172.0 -> 0.0     bmaximum_f32    86.0 -> 0.0
+//   usilu_f32       43.0 -> 0.0     bdiv_f32        48.4 -> 5.4
+//   bmul_f32        94.4 -> 8.4     fast_sum_f32    98.8 -> 12.8
+//   cast_bf16_f32  356.8 -> 141.8   cast_f32_bf16  221.1 -> 135.1
+//   affine_f32     185.0 -> 99.0    + four new kernels at 43.0 each
+//
+// The 688 vanished host-to-device copies are NOT only the clamp bounds (258 of
+// them). candle uploads a dims/strides `info` array with every strided op, so
+// each removed launch took its bookkeeping copy with it -- 83.1 kB/forward of
+// ~57-byte uploads down to 54.9 kB.
+//
+// Decode, interleaved A-B-A-B because a single before/after on a shared box is
+// not evidence: 28.79 / 31.84 / 28.04 / 31.65 tok/s. The two controls agree to
+// 2.7%, the two treatments to 0.6%, and neither pair overlaps the other:
+// 35.20 -> 31.51 ms/token, 28.42 -> 31.75 tok/s (+11.7%). SM clock read
+// 1830 MHz DURING the measured request in all four legs (1830 is this card's
+// real load clock; sampling around a short warm reads the idle clock instead).
+//
+// Output identity: 320 greedy tokens, 1,141 characters, sha 6fec510d6ef723cb
+// in ALL FOUR legs -- byte-identical across the toggle.
+//
+// Bit-identity: 14,778 comparisons across the seven contract sites, ZERO
+// mismatching bits. The negative control fires at every one of them
+// (2,111/2,111 tensors, exactly one bad element each -- it detects a
+// single-element 1-ULP perturbation everywhere), so the clean leg is a result
+// rather than a silence.
+// ---------------------------------------------------------------------------
 
 // V4 clamped SwiGLU: 8 launches + 3 H2D memcpys -> 1 kernel.
 //
