@@ -19,6 +19,7 @@ sm_90 = H100/Hopper).
 |------|-------|------|------|---------|
 | 1. `cuda_compile_check.yaml` | GitHub Actions | No | Free, automatic | nvcc errors, FFI drift, `cuda`-feature Rust compile errors in the **library** crates — for sm_80 **and** sm_90. Does **not** compile `flash-attn` or link the CLI binaries (see gate 1b). |
 | 1b. `flash_attn_compile_check.yaml` | GitHub Actions | No | Free, manual | The `flash-attn` feature (candle-flash-attn nvcc compile) the rental uses but gate 1 omits — for the chosen arch (default sm_90). See "flash-attn coverage" below. |
+| 1c. `qtip_beam_res_usage_check.sh` | Step *inside* gate 1 | No | Free, automatic | **Local-memory spills in the QTIP beam kernels** — `cuobjdump -res-usage` must report `LOCAL:0 STACK:0`. Both beam kernels demand this check by name in their own source and nothing ran it before. See "the spill gate" below. |
 | 2. `colab_cuda_build_check.ipynb` | Google Colab | nvcc only | Free, manual | Same as gate 1, plus it *links the CLI binaries* (`cuda_compile_check.sh` step 4, `FEATURES=cuda`); also runtime tests **iff** Colab gives sm_80+ |
 | 3. `cuda_compile_check.sh` (GPU mode) + rental step 4b | Rental / sm_80+ box | Yes | Paid box | Kernel **runtime**: parity, the prefix-grouped Viterbi quantize kernel actually running, no hang |
 
@@ -29,6 +30,38 @@ can run them**. Runtime validation of the QTIP path genuinely requires an
 sm_80+ device — the paid rental, or a Colab Pro A100. We do not pretend
 otherwise. Everything *compilable* is validated for free; only *execution* of
 the sm_80 kernels needs the paid box.
+
+### The spill gate — a resource check, not a compile check (gate 1c)
+Compiling is not the only thing that can go silently wrong for free. Both beam
+kernels (`qtip_beam.cu`, `qtip2b_beam.cu`) keep a per-thread `cand[]` array in
+registers and raise `__launch_bounds__(256, 4)` to cap registers at 64.
+**`__launch_bounds__` does not refuse to compile when it cannot reach that
+budget — it SPILLS to local memory**, and a spilled load inside the radix loop
+runs ~`CAND x 3.87` times per timestep, costing more than the occupancy it
+bought. Both files name the check in their source ("`LOCAL:` must remain 0").
+Nothing ran it.
+
+`arc-tools/qtip_beam_res_usage_check.sh` runs it, with `build.rs`'s exact nvcc
+flags (a different flag set is a different register allocation, i.e. a
+measurement of a kernel we do not ship), for the matrix arch inside gate 1:
+
+```bash
+arc-tools/qtip_beam_res_usage_check.sh sm_90
+```
+
+It is built so it cannot pass vacuously — the failure mode of every resource
+gate that greps for a pattern:
+* a **negative control** kernel (a dynamically-indexed 256-float local array,
+  written to a temp dir, not part of the build) goes through the *same* parser,
+  and the script fails if that is not reported as a spill;
+* a **kernel-count assertion** per source, so a template instantiation that
+  quietly stopped being emitted cannot make "no spill" a statement about a
+  kernel that is no longer there.
+
+This is also the check that arbitrates encode-cost claims. Hand-counting C++
+undercounts SASS by ~2.05x on this kernel family; a spilled `cand[]` is exactly
+what produced the retracted "~1,700 s/layer" K=8/V=4/L=12 encode estimate. A
+number you did not compile is an estimate.
 
 ### flash-attn coverage — now free, one-click (gate 1b)
 The rental's step-4 build is `cargo build -p arc-cli -p mistralrs-cli --features

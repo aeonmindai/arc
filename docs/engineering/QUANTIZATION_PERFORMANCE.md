@@ -31,7 +31,7 @@ Every number below carries one of these labels. Nothing is stated without one.
   width-256 beam over the same trellis.
 - Reference model: DeepSeek-V4-Flash, 284 B total / 13 B active, 43 quantized
   MoE layers, **6.4 B parameters per layer** ⇒ 3.2e9 symbol positions per layer
-  at `V = 2`. [source-verified, `mistralrs-quant/kernels/qtip/qtip_beam.cu:11-25`]
+  at `V = 2`. [source-verified, `mistralrs-quant/kernels/qtip/qtip_beam.cu:67-79`]
 - Artifact: **74.18 GB** UQFF in **8 shards + residual** (15 files) ⇒ **2.09
   bits/param** over 284 B params. [measured, H200, reproduced 4×; size
   HF-API-verified on the published repo. Earlier revisions said "~68 GB /

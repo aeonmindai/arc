@@ -150,8 +150,16 @@ extern "C" {
     /// search.
     pub(crate) fn qtip_beam_max_width() -> i32;
 
-    /// Returns 0 on launch, -1 when `beam_w` is outside `1..=qtip_beam_max_width()`.
-    pub(crate) fn launch_qtip_quantize_rows_beam_f32(
+    /// Beam-quantize at the trellis geometry `(k_bits, v_dim, l_bits)`.
+    ///
+    /// The kernel is templated on the geometry and dispatches on these three
+    /// arguments, so the Rust side passes `qtip::{K, V, L}` straight through
+    /// and the bake follows the day those consts move to K=8/V=4/L=12.
+    ///
+    /// Returns 0 on launch, -1 when `beam_w` is outside
+    /// `1..=qtip_beam_max_width()`, -2 when no kernel is compiled for the
+    /// geometry (never a silent fallback to another rung).
+    pub(crate) fn launch_qtip_quantize_rows_beam_geom_f32(
         d_weight: *const f32,
         d_lut: *const f32,
         d_row_scales: *const f32,
@@ -162,9 +170,22 @@ extern "C" {
         num_symbols: i32,
         row_offset: i32,
         beam_w: i32,
+        k_bits: i32,
+        v_dim: i32,
+        l_bits: i32,
         cb_mult: u32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     ) -> i32;
+
+    /// The `(K, V, L)` triple `kernels/qtip/qtip_quantize.cu` is compiled for,
+    /// packed as `(K << 16) | (V << 8) | L`.
+    ///
+    /// The exhaustive DP, the greedy walk and the scale refinement in that file
+    /// are NOT geometry-parametric (their prefix blocking and nibble packing are
+    /// K=4/V=2/L=16 by construction). Comparing this against `qtip::{K, V, L}`
+    /// turns a rung change into a loud refusal instead of a silently corrupt
+    /// bake.
+    pub(crate) fn qtip_exhaustive_geometry() -> i32;
 
     pub(crate) fn launch_qtip_refine_scales_f32(
         d_weight: *const f32,

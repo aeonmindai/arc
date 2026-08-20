@@ -43,15 +43,39 @@
 #include "qtip_exact_fp.cuh"
 // Codebook selection (stored Gaussian LUT vs in-register sum2 code).
 #include "qtip_codebook.cuh"
+// K / V / L, defined once for the whole rung.
+#include "qtip_geom.cuh"
 
 namespace {
 
-constexpr uint32_t QTIP_K          = 4;
-constexpr uint32_t QTIP_L          = 16;
-constexpr uint32_t QTIP_V          = 2;
-constexpr uint32_t QTIP_STATE_MASK = (1u << QTIP_L) - 1u;
-constexpr uint32_t QTIP_ALPHABET   = 1u << QTIP_K;       // 16
-constexpr uint32_t QTIP_LUT_SIZE   = 1u << QTIP_L;       // 65536
+// The exhaustive / greedy / scale-refinement kernels in this file serve the
+// SHIPPED rung only.
+//
+// Unlike `qtip_beam.cu`, they are not geometry-templated: the exhaustive DP
+// blocks its forward pass as `2^(L-K)` prefixes x `2^K` suffixes with one
+// thread per prefix, which at K=8/L=12 inverts to 16 prefixes x 256 suffixes
+// and would idle 240 of 256 threads in phase A — the same re-blocking
+// `qtip_beam.cu` now does with lane teams, applied to a different loop nest.
+// That work is NOT done here, because the K=8/V=4/L=12 bake runs the beam.
+//
+// The static_asserts below pin every K=4/V=2 assumption this file still makes
+// (two symbols per packed byte, a two-component branch metric) to the geometry
+// type, so re-pointing `QG` at another rung fails to COMPILE rather than
+// silently emitting wrongly-packed bytes. `qtip_exhaustive_geometry()` exports
+// the same triple so the Rust side can refuse at runtime too.
+using QG = QtipGeomK4V2L16;
+
+constexpr uint32_t QTIP_K          = QG::K;              // 4
+constexpr uint32_t QTIP_L          = QG::L;              // 16
+constexpr uint32_t QTIP_V          = QG::V;              // 2
+constexpr uint32_t QTIP_STATE_MASK = QG::STATE_MASK;
+constexpr uint32_t QTIP_ALPHABET   = QG::ALPHABET;       // 16
+constexpr uint32_t QTIP_LUT_SIZE   = QG::LUT_SIZE;       // 65536
+
+static_assert(QG::SYMS_PER_BYTE == 2u,
+              "the packing in this file writes a low and a high nibble per byte");
+static_assert(QG::V == 2u,
+              "the branch metric in this file is the two-component qtip_decode_err_exact");
 
 // Branch metric with the codebook selected at compile time. The `false`
 // instantiation is exactly `qtip_decode_err_exact` (two LUT loads, then the
@@ -573,6 +597,20 @@ __global__ void qtip_refine_scales_kernel(
 // ============================================================================
 
 extern "C" {
+
+// The trellis geometry the kernels in THIS file are compiled for, packed as
+// `(K << 16) | (V << 8) | L`.
+//
+// The beam launcher in `qtip_beam.cu` takes its geometry as an argument and
+// refuses an unsupported triple. These kernels cannot: their prefix blocking
+// and their nibble packing are K=4/V=2/L=16 by construction (see the
+// static_asserts at the top of this file). Exporting the triple lets the Rust
+// side compare it against `qtip::{K, V, L}` and BAIL, instead of running a
+// K=4/V=2/L=16 DP over buffers another rung sized — which would corrupt the
+// bake silently, with no kernel error and no wrong-looking output shape.
+int qtip_exhaustive_geometry() {
+    return ((int)QTIP_K << 16) | ((int)QTIP_V << 8) | (int)QTIP_L;
+}
 
 // ----- Rotate weight rows -----------------------------------------------
 
