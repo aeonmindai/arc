@@ -1905,7 +1905,18 @@ impl Attention {
                     .ok_or_else(|| candle_core::Error::Msg("graph positions unset".into()))?
                     .to_dtype(candle_core::DType::U32)?;
                 let cap = self.sliding_window.max(1);
+                // Bisect slots, in execution order, per graph-arm layer:
+                //   k       — the new post-RoPE key, BEFORE it is written.
+                //             Diverges ⇒ the key itself is computed wrong
+                //             (RoPE / projections), upstream of the cache.
+                //   k_full  — the fixed window read back AFTER the write.
+                //             Clean `k` + dirty `k_full` ⇒ the write landed in
+                //             the wrong slot, or the wrong window is read.
+                //   attn    — clean `k`/`k_full` + dirty `attn` ⇒ the mask or
+                //             the compressed branch, not the KV ring.
+                crate::layers::arc_layer_trace_push(&k);
                 let k_full = append_graph_kv_mqa(kv_cache, &k, &position, cap)?;
+                crate::layers::arc_layer_trace_push(&k_full);
                 // Use ONLY the fixed-width graph mask (matches the C-wide K).
                 // The eager `attention_mask` is kv_len-wide (growing) and would
                 // both mismatch the fixed window and break shape-constancy.
@@ -1931,7 +1942,7 @@ impl Attention {
                             .into(),
                     )
                 })?;
-                super::dsv4_attention::dsv4_attention(
+                let graph_attn = super::dsv4_attention::dsv4_attention(
                     &q,
                     &k_full,
                     &k_full,
@@ -1951,7 +1962,9 @@ impl Attention {
                         graph_positions: Some(&position),
                         ..dsv4_cfg
                     },
-                )?
+                )?;
+                crate::layers::arc_layer_trace_push(&graph_attn);
+                graph_attn
             }
             None => {
                 // FP8 code storage is opt-in (`ARC_V4_FP8_KV=1`); unset stores
