@@ -1,0 +1,247 @@
+--- /root/candle88_mod.rs.orig	2026-08-20 07:27:30.592000000 +0000
++++ /root/.cargo/git/checkouts/candle-601b509b8bac78d2/88d86a2/candle-core/src/cuda_backend/mod.rs	2026-08-20 07:27:30.624000000 +0000
+@@ -69,42 +69,61 @@
+ /// on drop, which corrupts a captured graph (a reduction kernel then reads an
+ /// unstable info buffer -> MMU fault on launch). When caching is OFF this frees
+ /// normally (identical to upstream). (RUN-161)
+-pub struct InfoBuf<T> {
+-    slice: std::mem::ManuallyDrop<CudaSlice<T>>,
+-    device: CudaDevice,
++pub enum InfoBuf<T> {
++    /// Uploaded for this op alone; returns to the alloc cache (or frees) on drop.
++    Owned {
++        slice: std::mem::ManuallyDrop<CudaSlice<T>>,
++        device: CudaDevice,
++    },
++    /// A shared entry of the device descriptor cache (`ARC_DS_CACHE=1`). dims
++    /// and strides are read-only kernel INPUTS, so every op with the same layout
++    /// can read one buffer. The cache owns it for the life of the device, so
++    /// Drop here must neither free it nor hand it to the alloc cache.
++    Shared(std::sync::Arc<CudaSlice<T>>),
+ }
+ 
+ impl<T> InfoBuf<T> {
+     pub(crate) fn new(device: CudaDevice, slice: CudaSlice<T>) -> Self {
+-        Self {
++        InfoBuf::Owned {
+             slice: std::mem::ManuallyDrop::new(slice),
+             device,
+         }
+     }
++    pub(crate) fn shared(slice: std::sync::Arc<CudaSlice<T>>) -> Self {
++        InfoBuf::Shared(slice)
++    }
+     #[inline]
+     pub fn as_arg(&self) -> &CudaSlice<T> {
+-        &self.slice
++        match self {
++            InfoBuf::Owned { slice, .. } => slice,
++            InfoBuf::Shared(slice) => slice,
++        }
+     }
+ }
+ 
+ impl<T> std::ops::Deref for InfoBuf<T> {
+     type Target = CudaSlice<T>;
+     fn deref(&self) -> &CudaSlice<T> {
+-        &self.slice
++        self.as_arg()
+     }
+ }
+ 
+ impl<T> Drop for InfoBuf<T> {
+     fn drop(&mut self) {
+-        if !self.device.alloc_cache_enabled() {
+-            unsafe { std::mem::ManuallyDrop::drop(&mut self.slice) };
++        let (slice, device) = match self {
++            // Owned by the cache; outlives every op that reads it.
++            InfoBuf::Shared(_) => return,
++            InfoBuf::Owned { slice, device } => (slice, device),
++        };
++        if !device.alloc_cache_enabled() {
++            unsafe { std::mem::ManuallyDrop::drop(slice) };
+             return;
+         }
+-        let slice = unsafe { std::mem::ManuallyDrop::take(&mut self.slice) };
++        let slice = unsafe { std::mem::ManuallyDrop::take(slice) };
+         let bytes = slice.len() * std::mem::size_of::<T>();
+         let ptr = slice.leak();
+-        if !self.device.cache_put(bytes, ptr) {
+-            drop(unsafe { self.device.cuda_stream_ref().upgrade_device_ptr::<u8>(ptr, 0) });
++        if !device.cache_put(bytes, ptr) {
++            drop(unsafe { device.cuda_stream_ref().upgrade_device_ptr::<u8>(ptr, 0) });
+         }
+     }
+ }
+--- /root/candle88_device.rs.orig	2026-08-20 07:27:30.596000000 +0000
++++ /root/.cargo/git/checkouts/candle-601b509b8bac78d2/88d86a2/candle-core/src/cuda_backend/device.rs	2026-08-20 07:27:30.628000000 +0000
+@@ -26,6 +26,51 @@
+ struct CudaRng(cudarc::curand::CudaRng);
+ unsafe impl Send for CudaRng {}
+ 
++// ---------------------------------------------------------------------------
++// Device-resident layout-descriptor cache (`ARC_DS_CACHE=1`).
++//
++// Every strided candle op uploads its own dims+strides array immediately before
++// the launch. Measured on V4 / H200 with nsys over 160 decode forwards: 762.9
++// `cuMemcpyHtoDAsync` per forward, 72 bytes and 2.77 us of HOST time each —
++// 2.11 ms of a 35.9 ms step, second only to the launches themselves.
++//
++// The payload is an immutable kernel INPUT, so every op sharing a layout can
++// read one device buffer. The cache key IS the byte image of the payload, which
++// makes a hit bit-identical to the upload it replaces *by construction* rather
++// than by argument.
++// ---------------------------------------------------------------------------
++type DsCache = Arc<Mutex<HashMap<(std::any::TypeId, Vec<u8>), Arc<dyn std::any::Any + Send + Sync>>>>;
++
++/// Bound on distinct layouts held. Past this the cache declines and the caller
++/// falls back to the per-op upload, so an unusual workload cannot grow it
++/// without limit.
++const DS_CACHE_MAX: usize = 1 << 16;
++
++static DS_CACHE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++static DS_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++static DS_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++static DS_DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++fn ds_cache_enabled() -> bool {
++    *DS_CACHE_ON.get_or_init(|| {
++        let on = matches!(std::env::var("ARC_DS_CACHE").as_deref(), Ok("1"));
++        eprintln!("[arc-ds-cache] policy enabled={on}");
++        on
++    })
++}
++
++/// Engagement accounting in BOTH directions, by count rather than first-fire:
++/// "no failures" is not "no results", and a green leg must prove work happened.
++fn ds_cache_tick() {
++    use std::sync::atomic::Ordering::Relaxed;
++    let h = DS_HITS.load(Relaxed);
++    let m = DS_MISSES.load(Relaxed);
++    let d = DS_DECLINED.load(Relaxed);
++    if (h + m + d) % 50_000 == 0 {
++        eprintln!("[arc-ds-cache] ENGAGED hits={h} misses={m} declined={d}");
++    }
++}
++
+ pub struct ModuleStore {
+     mdls: [Option<Arc<cudarc::driver::CudaModule>>; kernels::ALL_IDS.len()],
+ }
+@@ -69,6 +114,8 @@
+     curand: Arc<Mutex<CudaRng>>,
+     seed_value: Arc<RwLock<u64>>,
+     pub(crate) alloc_cache: Arc<Mutex<AllocCache>>,
++    /// Shared, immutable dims+strides descriptors. See `DsCache`.
++    pub(crate) ds_cache: DsCache,
+ }
+ 
+ impl CudaDevice {
+@@ -350,6 +397,11 @@
+         &self,
+         src: &[T],
+     ) -> Result<super::InfoBuf<T>> {
++        if ds_cache_enabled() {
++            if let Some(shared) = self.ds_cache_lookup(src)? {
++                return Ok(super::InfoBuf::shared(shared));
++            }
++        }
+         let mut dst = unsafe { self.alloc::<T>(src.len())? };
+         if self.capture_mode() {
+             let leaked: &'static [T] = Vec::leak(src.to_vec());
+@@ -359,6 +411,80 @@
+         }
+         Ok(super::InfoBuf::new(self.clone(), dst))
+     }
++
++    /// Look up (or populate) the shared descriptor for `src`.
++    ///
++    /// Returns `None` when this payload must not be shared — a non-`usize`
++    /// element type, or the cache at its bound — and the caller then performs
++    /// the ordinary per-op upload. Restricting to `usize` keeps the key sound:
++    /// a type with padding would make the byte image depend on uninitialised
++    /// bytes, and every candle info payload is `usize` anyway.
++    fn ds_cache_lookup<T: cudarc::driver::DeviceRepr + Copy + 'static>(
++        &self,
++        src: &[T],
++    ) -> Result<Option<Arc<cudarc::driver::CudaSlice<T>>>> {
++        use std::sync::atomic::Ordering::Relaxed;
++        if std::any::TypeId::of::<T>() != std::any::TypeId::of::<usize>() {
++            DS_DECLINED.fetch_add(1, Relaxed);
++            ds_cache_tick();
++            return Ok(None);
++        }
++        // The key is the exact byte image of the payload, so a hit returns a
++        // buffer whose contents equal what the upload would have written.
++        let key_bytes = unsafe {
++            std::slice::from_raw_parts(src.as_ptr() as *const u8, std::mem::size_of_val(src))
++        }
++        .to_vec();
++        let key = (std::any::TypeId::of::<T>(), key_bytes);
++        {
++            let cache = self.ds_cache.lock().unwrap();
++            if let Some(v) = cache.get(&key) {
++                return match v.clone().downcast::<cudarc::driver::CudaSlice<T>>() {
++                    Ok(hit) => {
++                        DS_HITS.fetch_add(1, Relaxed);
++                        ds_cache_tick();
++                        Ok(Some(hit))
++                    }
++                    Err(_) => {
++                        DS_DECLINED.fetch_add(1, Relaxed);
++                        ds_cache_tick();
++                        Ok(None)
++                    }
++                };
++            }
++            if cache.len() >= DS_CACHE_MAX {
++                DS_DECLINED.fetch_add(1, Relaxed);
++                ds_cache_tick();
++                return Ok(None);
++            }
++        }
++        let mut dst = unsafe { self.alloc::<T>(src.len())? };
++        if self.capture_mode() {
++            let leaked: &'static [T] = Vec::leak(src.to_vec());
++            self.stream.memcpy_htod(leaked, &mut dst).w()?;
++        } else {
++            self.stream.memcpy_htod(src, &mut dst).w()?;
++        }
++        let fresh: Arc<cudarc::driver::CudaSlice<T>> = Arc::new(dst);
++        let mut cache = self.ds_cache.lock().unwrap();
++        // Another thread may have populated the same key meanwhile; whichever
++        // buffer is already in the map wins, and ours frees on drop.
++        let entry = cache
++            .entry(key)
++            .or_insert_with(|| fresh.clone() as Arc<dyn std::any::Any + Send + Sync>);
++        match entry.clone().downcast::<cudarc::driver::CudaSlice<T>>() {
++            Ok(winner) => {
++                DS_MISSES.fetch_add(1, Relaxed);
++                ds_cache_tick();
++                Ok(Some(winner))
++            }
++            Err(_) => {
++                DS_DECLINED.fetch_add(1, Relaxed);
++                ds_cache_tick();
++                Ok(None)
++            }
++        }
++    }
+ }
+ 
+ pub struct CudaFunc {
+@@ -542,6 +668,7 @@
+             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
+             seed_value: Arc::new(RwLock::new(299792458)),
+             alloc_cache: Arc::new(Mutex::new(AllocCache::default())),
++            ds_cache: Arc::new(Mutex::new(HashMap::new())),
+         })
+     }
+ }
+@@ -567,6 +694,7 @@
+             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
+             seed_value: Arc::new(RwLock::new(299792458)),
+             alloc_cache: Arc::new(Mutex::new(AllocCache::default())),
++            ds_cache: Arc::new(Mutex::new(HashMap::new())),
+         })
+     }
+ 
