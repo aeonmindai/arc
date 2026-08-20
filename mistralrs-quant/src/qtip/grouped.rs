@@ -67,7 +67,11 @@ pub const QTIP_GROUPED_VARIANT_TUNED: i32 = 1;
 /// staged activation stride to 144 B. Mirrors `QTIP_GROUPED_VARIANT_LDST`.
 pub const QTIP_GROUPED_VARIANT_LDST: i32 = 2;
 /// Number of selectable variants; also the launch-counter array length.
-pub const QTIP_GROUPED_VARIANT_COUNT: usize = 3;
+/// DIAGNOSTIC ONLY — produces wrong weights. Bounds the trellis decode's share
+/// of grouped-GEMM runtime. Selectable only by `ARC_QTIP_GROUPED_VARIANT=stub`.
+pub const QTIP_GROUPED_VARIANT_DECODESTUB: i32 = 3;
+
+pub const QTIP_GROUPED_VARIANT_COUNT: usize = 4;
 
 /// Env override for [`grouped_variant`]. Accepts `baseline`/`0`, `tuned`/`1`
 /// or `ldst`/`2`. Latched on first read, then overridable in-process by
@@ -86,6 +90,7 @@ static GROUPED_VARIANT: std::sync::atomic::AtomicI32 =
 /// measured twice — the exact defect that voided the previous grouped-GEMM
 /// microbench (FACTS, wave35-BM).
 static GROUPED_LAUNCHES: [std::sync::atomic::AtomicU64; QTIP_GROUPED_VARIANT_COUNT] = [
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -111,6 +116,15 @@ pub fn grouped_variant() -> i32 {
         Ok(s) => match s.trim().to_ascii_lowercase().as_str() {
             "tuned" | "1" => QTIP_GROUPED_VARIANT_TUNED,
             "ldst" | "2" => QTIP_GROUPED_VARIANT_LDST,
+            // Not reachable by "3": spelling it out keeps a stray numeric env
+            // value from silently selecting a wrong-numerics kernel.
+            "stub" => {
+                tracing::error!(
+                    "ARC_QTIP_GROUPED_VARIANT=stub: DIAGNOSTIC decode-stub kernel selected. \
+                     Weights are WRONG by construction; this measures decode share only."
+                );
+                QTIP_GROUPED_VARIANT_DECODESTUB
+            }
             _ => QTIP_GROUPED_VARIANT_BASELINE,
         },
         Err(_) => QTIP_GROUPED_VARIANT_BASELINE,

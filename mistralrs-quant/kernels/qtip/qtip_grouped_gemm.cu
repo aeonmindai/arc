@@ -236,6 +236,15 @@ constexpr uint32_t QG_INVALID_PAIR = 0xFFFFFFFFu;
 constexpr int QTIP_GROUPED_VARIANT_BASELINE = 0;
 constexpr int QTIP_GROUPED_VARIANT_TUNED    = 1;
 constexpr int QTIP_GROUPED_VARIANT_LDST     = 2;
+// DIAGNOSTIC ONLY. Variant 3 produces WRONG WEIGHTS by construction. It exists
+// to bound the trellis decode's share of this kernel's runtime: it reads the
+// SAME packed bytes through the same shared-memory path, keeps the loop
+// structure, the packing and the accumulate identical, and replaces only the
+// decode itself (window gather + BREV pair-reverse + IMAD state*mult + LOP3
+// mask/xor + 2x half->float + FADD) with one 2-bit symbol read and a convert.
+// baseline_time - stub_time is therefore a LOWER bound on what a free decode
+// would save. Never selectable except by ARC_QTIP_GROUPED_VARIANT=stub.
+constexpr int QTIP_GROUPED_VARIANT_DECODESTUB = 3;
 // Persistent-CTA grid cap (see tuning notes).
 constexpr int QG_MAX_GRID = 1024;
 
@@ -579,7 +588,8 @@ qtip2b_grouped_gemm_kernel(
     // Staged strides differ per variant (bank-conflict fix); everything else
     // about the layout, the tile geometry and the math is identical.
     constexpr bool TUNED = VARIANT >= QTIP_GROUPED_VARIANT_TUNED;
-    constexpr bool LDST  = VARIANT >= QTIP_GROUPED_VARIANT_LDST;
+    constexpr bool LDST  = (VARIANT == QTIP_GROUPED_VARIANT_LDST);
+    constexpr bool DECODE_STUB = (VARIANT == QTIP_GROUPED_VARIANT_DECODESTUB);
     constexpr int X_STRIDE  = TUNED ? QG_X_STRIDE_T : QG_TILE_K;
     constexpr int WP_STRIDE = TUNED ? QG_WP_STRIDE_T : QG_WP_STRIDE;
     static_assert(X_STRIDE * sizeof(T) % 16 == 0, "cp.async needs 16 B aligned x rows");
@@ -694,7 +704,13 @@ qtip2b_grouped_gemm_kernel(
                     const uint8_t* srow = &s_wp[buf][(warp * 16 + f * 8 + g) * WP_STRIDE];
                     const float s = sclB[f];
                     float w0, w1, w2, w3;
-                    if constexpr (TUNED) {
+                    if constexpr (DECODE_STUB) {
+                        // DIAGNOSTIC: same bytes, same loads, no trellis decode.
+                        w0 = (float)q2b_sym(srow, kb + tig * 2)     * s;
+                        w1 = (float)q2b_sym(srow, kb + tig * 2 + 1) * s;
+                        w2 = (float)q2b_sym(srow, kb + tig * 2 + 8) * s;
+                        w3 = (float)q2b_sym(srow, kb + tig * 2 + 9) * s;
+                    } else if constexpr (TUNED) {
                         uint32_t st[4];
                         q2b_states_rev(srow, kb + tig * 2, st);
                         w0 = q2b_decode(st[0], mult) * s;
@@ -799,6 +815,10 @@ void launch_qtip2b_moe_route(
             (int)(max_tiles < (long)QG_MAX_GRID ? max_tiles : (long)QG_MAX_GRID); \
         if (grid <= 0) return;                                                 \
         switch (variant) {                                                     \
+        case QTIP_GROUPED_VARIANT_DECODESTUB:                                  \
+            qtip2b_grouped_gemm_kernel<T, QTIP_GROUPED_VARIANT_DECODESTUB>      \
+                <<<grid, block, shmem, stream>>>(QG_ARGS);                      \
+            break;                                                             \
         case QTIP_GROUPED_VARIANT_LDST:                                        \
             qtip2b_grouped_gemm_kernel<T, QTIP_GROUPED_VARIANT_LDST>           \
                 <<<grid, QG_THREADS, 0, stream>>>(                             \
