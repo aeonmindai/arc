@@ -443,9 +443,10 @@ mod tests {
     /// Source-level tripwires on the kernel and its build wiring: the IEEE
     /// intrinsics and the fast-math `#error` guard must stay in sinkhorn.cu,
     /// fast-math approximations must stay out, and build.rs must keep
-    /// sinkhorn.cu out of the `--use_fast_math` glob (compiling it with
-    /// `--fmad=false` instead). The `#error` guard makes any wiring regression
-    /// a hard CUDA build failure; these string checks catch it on CPU CI too.
+    /// sinkhorn.cu in `IEEE_SOURCES` — the list the `--use_fast_math` glob
+    /// excludes and compiles with `--fmad=false` instead. `build.rs`'s own
+    /// `assert_ieee_kernel_flags` makes a wiring regression a hard build
+    /// failure; these string checks catch it on CPU CI too.
     #[test]
     fn kernel_source_and_build_wiring_guards() {
         let cu = include_str!("sinkhorn.cu");
@@ -474,9 +475,24 @@ mod tests {
         }
 
         let build = include_str!("../../build.rs");
+        // build.rs moved from a literal `.exclude(&["sinkhorn.cu"])` to a named
+        // `IEEE_SOURCES` list so a second kernel (swiglu_clamp.cu) could join
+        // the same contract. Assert the invariant at both ends rather than the
+        // old spelling: the fast-math builder still excludes that list, and
+        // sinkhorn.cu is still IN it.
         assert!(
-            build.contains(r#".exclude(&["sinkhorn.cu"])"#),
-            "build.rs no longer excludes sinkhorn.cu from the fast-math builder"
+            build.contains(".exclude(IEEE_SOURCES)"),
+            "build.rs no longer excludes IEEE_SOURCES from the fast-math builder"
+        );
+        let ieee_list = build
+            .split_once("const IEEE_SOURCES: &[&str] = &[")
+            .and_then(|(_, rest)| rest.split_once("];"))
+            .map(|(list, _)| list)
+            .expect("build.rs lost its IEEE_SOURCES declaration");
+        assert!(
+            ieee_list.contains("\"sinkhorn.cu\""),
+            "sinkhorn.cu dropped out of build.rs IEEE_SOURCES ({ieee_list}); it \
+             would be compiled with --use_fast_math"
         );
         assert!(
             build.contains("--fmad=false"),
