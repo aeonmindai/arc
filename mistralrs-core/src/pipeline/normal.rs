@@ -1767,6 +1767,12 @@ impl Pipeline for NormalPipeline {
                             // per-forward alloc count (eager warmups only
                             // reach peak-live; capture needs every alloc
                             // distinct). Output is this step's logits (eager).
+                            // Snapshot the allocator's size profile so we can see
+                            // whether this pass teaches it anything new.
+                            let demand_before = match self.device() {
+                                candle_core::Device::Cuda(cd) => cd.capture_alloc_demand(),
+                                _ => Vec::new(),
+                            };
                             if let candle_core::Device::Cuda(cd) = self.device() {
                                 cd.set_capture_mode(true);
                             }
@@ -1786,6 +1792,40 @@ impl Pipeline for NormalPipeline {
                             );
                             if let candle_core::Device::Cuda(cd) = self.device() {
                                 cd.set_capture_mode(false);
+                            }
+                            // Keep warming while the profile is still growing.
+                            // One pass is only enough if every decode step
+                            // allocates the same sizes; V4's compressor tail
+                            // cycles through `ratio` widths, so pass k presents a
+                            // size pass k-1 never did and the profile keeps
+                            // growing until the whole cycle has been walked. A
+                            // pass that adds nothing is the signal to stop — and
+                            // it costs one eager decode step to learn that.
+                            if let candle_core::Device::Cuda(cd) = self.device() {
+                                let demand_after = cd.capture_alloc_demand();
+                                if demand_after != demand_before {
+                                    let granted = runner.grant_extra_deferred_pass();
+                                    tracing::info!(
+                                        "ARC prewarm: warm pass grew the alloc profile to {} \
+                                         distinct sizes — {} (extra budget {}, {} pass(es) owed)",
+                                        demand_after.len(),
+                                        if granted {
+                                            "granting another pass"
+                                        } else {
+                                            "extra budget exhausted; the capture-miss assert \
+                                             decides from here"
+                                        },
+                                        runner.deferred_extra_budget(),
+                                        runner.deferred_passes_remaining(),
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        "ARC prewarm: alloc profile CONVERGED at {} distinct \
+                                         sizes ({} pass(es) still owed)",
+                                        demand_after.len(),
+                                        runner.deferred_passes_remaining(),
+                                    );
+                                }
                             }
                             match out {
                                 Ok(o) => {
@@ -1852,6 +1892,55 @@ impl Pipeline for NormalPipeline {
                                          (PROBE — not a fix; the buffer still allocates per step)"
                                 );
                             }
+                            // ── EXACT PRE-WARM ────────────────────────────
+                            // The warm passes leave the free pool holding
+                            // exactly what the steps they ran on asked for. The
+                            // step about to be CAPTURED is a different step: any
+                            // size whose demand is higher here, or that only
+                            // appears here, is served by `cuMemAllocAsync` from
+                            // the graph's private pool and becomes an unstable
+                            // graph memory node — CUDA_ERROR_ILLEGAL_ADDRESS on
+                            // the first cuGraphLaunch, and a poisoned context
+                            // (reported as glibc heap corruption) after it.
+                            //
+                            // So top every observed size up to its observed
+                            // demand plus slack. Slack is what covers a captured
+                            // step that allocates a little more of some size
+                            // than any warm step did; it is buffers, not bytes,
+                            // and the pool is ~315 MiB, so it is cheap.
+                            //
+                            // Must run with capture mode OFF: a buffer released
+                            // while capturing parks in `deferred` and cannot be
+                            // served, so seeding inside the window warms nothing.
+                            if let candle_core::Device::Cuda(cd) = self.device() {
+                                let slack = std::env::var("ARC_GRAPH_PREWARM_SLACK")
+                                    .ok()
+                                    .and_then(|v| v.parse::<usize>().ok())
+                                    .unwrap_or(4);
+                                let demand = cd.capture_alloc_demand();
+                                let want: usize = demand.iter().map(|(_, n)| n).sum();
+                                match cd.prewarm_alloc_cache(slack) {
+                                    Ok((sizes, buffers)) => tracing::info!(
+                                        "ARC prewarm: profile = {} distinct sizes / {want} \
+                                         allocations per captured forward; topped up {sizes} \
+                                         size(s) with {buffers} buffer(s) at slack={slack}",
+                                        demand.len(),
+                                    ),
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "ARC prewarm: could not top up the alloc cache: {e}. \
+                                             Capturing now would record unstable memory nodes, so \
+                                             capture is disabled for this run."
+                                        );
+                                        runner.disable();
+                                    }
+                                }
+                                // Scope the miss ledger to THIS capture. Without
+                                // the reset it would still carry the misses the
+                                // warm passes made on purpose, and those are
+                                // harmless — no graph is being recorded then.
+                                cd.reset_capture_misses();
+                            }
                             // CAPTURE: frees are deferred so every allocation
                             // is a stable cache hit (no within-capture
                             // aliasing, no unstable graph memory nodes).
@@ -1871,21 +1960,72 @@ impl Pipeline for NormalPipeline {
                                         &flash_meta,
                                     ) {
                                         Ok(output) => {
-                                            tracing::info!(
-                                                    "ARC capture: V4 forward RECORDED (bs={bs}); instantiating + launching"
+                                            // ── THE GATE ──────────────────
+                                            // Every allocation that missed the
+                                            // warm pool during this capture was
+                                            // served from the graph's private
+                                            // pool and recorded as a memory node
+                                            // whose address the first launch has
+                                            // to back. One is enough to fault.
+                                            // Refusing here is strictly better
+                                            // than instantiating: the fault is
+                                            // asynchronous and poisons the CUDA
+                                            // context, taking the process with
+                                            // it some allocations later.
+                                            let misses = match self.device() {
+                                                candle_core::Device::Cuda(cd) => {
+                                                    cd.capture_misses()
+                                                }
+                                                _ => Vec::new(),
+                                            };
+                                            if !misses.is_empty() {
+                                                let total: usize =
+                                                    misses.iter().map(|(_, n)| n).sum();
+                                                tracing::error!(
+                                                    "ARC capture: REFUSING to instantiate — \
+                                                     {total} allocation(s) missed the warm pool \
+                                                     during capture, at (bytes, count) {misses:?}. \
+                                                     Each is an unstable graph memory node. The \
+                                                     pre-warm profile did not cover this step, so \
+                                                     these sizes are step-dependent beyond the \
+                                                     warm cycle: the fix is a shape-constant \
+                                                     buffer at those sizes (or allocator \
+                                                     size-class bucketing), not more warmup. \
+                                                     Falling back to eager."
                                                 );
-                                            match runner.end_capture_and_cache(bs, output, gp, op) {
-                                                Ok(out) => {
-                                                    tracing::info!(
+                                                // Drop the captured output BEFORE
+                                                // cancelling: its storage may live
+                                                // in the private pool, and
+                                                // cancel_capture drains the alloc
+                                                // cache before destroying that
+                                                // pool. Dropping after the drain
+                                                // would file a dangling pointer
+                                                // into the free list — the exact
+                                                // use-after-free the drain exists
+                                                // to prevent.
+                                                drop(output);
+                                                runner.cancel_capture(gp, op);
+                                                runner.disable();
+                                                None
+                                            } else {
+                                                tracing::info!(
+                                                    "ARC capture: V4 forward RECORDED (bs={bs}), zero capture-time allocator misses; instantiating + launching"
+                                                );
+                                                match runner
+                                                    .end_capture_and_cache(bs, output, gp, op)
+                                                {
+                                                    Ok(out) => {
+                                                        tracing::info!(
                                                         "ARC capture: graph CAPTURED + launched OK"
                                                     );
-                                                    Some(out)
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(
+                                                        Some(out)
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
                                                             "ARC capture: instantiate/launch failed: {e}; eager"
                                                         );
-                                                    None
+                                                        None
+                                                    }
                                                 }
                                             }
                                         }
