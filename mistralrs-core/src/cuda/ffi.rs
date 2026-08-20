@@ -398,4 +398,16 @@ extern "C" {
         limit: f32,
         stream: i64,
     );
+    // Fused per-head Q RMSNorm (cuda/qnorm.cu). Also IEEE-built. Returns 0 on
+    // success, non-zero if the shape is outside the single-block regime.
+    pub(crate) fn qnorm_rms_bf16(
+        x: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        cols: u32,
+        inv_n_bits: u16,
+        eps_bits: u16,
+        f32_acc: i32,
+        stream: i64,
+    ) -> i32;
 }
