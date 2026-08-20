@@ -2666,6 +2666,48 @@ pub fn set_graph_mode_mask(mask: Option<Tensor>) {
     GRAPH_MODE_MASK.with(|m| *m.borrow_mut() = mask);
 }
 
+/// Per-layer output handles, for bisecting a CUDA-graph replay against eager.
+///
+/// The same-step probe proved the recorded graph is wired correctly (max|Δ| =
+/// 0 on the capture step), so a divergence one step later is a per-step input
+/// that must advance and does not. This finds WHICH one by finding the first
+/// layer whose output differs.
+///
+/// The mechanism relies on a property of capture: the tensors a captured
+/// forward produces are ordinary warm-pool buffers, and the recorded kernels
+/// write to **those addresses** on every replay. Holding a clone of each layer
+/// output therefore gives a live window onto the graph's own intermediates —
+/// after a replay, these handles contain the REPLAY's values. Holding them
+/// also keeps them out of the allocator's free list, so the eager forward that
+/// follows cannot land on top of them.
+///
+/// Handles only: `push` clones a `Tensor` (an `Arc` bump), so tracing costs no
+/// device work and is safe to run inside the capture region.
+thread_local! {
+    static ARC_LAYER_TRACE: std::cell::RefCell<Option<Vec<Tensor>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Start recording per-layer outputs, discarding any previous recording.
+pub fn arc_layer_trace_begin() {
+    ARC_LAYER_TRACE.with(|t| *t.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stop recording and take what was recorded.
+pub fn arc_layer_trace_take() -> Option<Vec<Tensor>> {
+    ARC_LAYER_TRACE.with(|t| t.borrow_mut().take())
+}
+
+/// Record one layer's output. No-op unless a trace is open, so the call sites
+/// in the model cost a thread-local read on the hot path and nothing else.
+pub fn arc_layer_trace_push(xs: &Tensor) {
+    ARC_LAYER_TRACE.with(|t| {
+        if let Some(v) = t.borrow_mut().as_mut() {
+            v.push(xs.clone());
+        }
+    });
+}
+
 #[cfg(feature = "cuda")]
 pub fn graph_mode_mask() -> Option<Tensor> {
     GRAPH_MODE_MASK.with(|m| m.borrow().clone())

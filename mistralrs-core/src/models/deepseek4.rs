@@ -4738,6 +4738,11 @@ impl DeepSeekV4 {
                 Some(pos) => {
                     let cap = self.cfg_full.sliding_window.max(1);
                     let mask = crate::layers::graph_mode_length_mask(&pos, cap, xs_embed.dtype())?;
+                    // Trace slot 0: does a REPLAY rebuild the right length mask
+                    // from the device position buffer, or is the mask the one
+                    // capture baked? Pushed before the layers so the bisect
+                    // reads mask → embed → lift → L0.. in execution order.
+                    crate::layers::arc_layer_trace_push(&mask);
                     crate::layers::set_graph_mode_mask(Some(mask));
                 }
                 None => crate::layers::set_graph_mode_mask(None),
@@ -4803,6 +4808,12 @@ impl DeepSeekV4 {
             };
             v4_nan_dbg(&xs_4d, "lift_3d_to_4d");
             v4_stat_dbg(&xs_4d, "lift_3d_to_4d");
+            // Trace slots 1 and 2: the embedding (i.e. did the token id reach
+            // the graph) and the mHC lift, both BEFORE any attention. A
+            // divergence that starts here is an input; one that starts at L0
+            // is inside the layer.
+            crate::layers::arc_layer_trace_push(&xs_embed);
+            crate::layers::arc_layer_trace_push(&xs_4d);
             let _prof_layers = arc_profiler::span("layers");
             for (i, layer) in self.layers.iter().enumerate() {
                 // Aggregated across all layers by default (calls = n_layers,
@@ -4826,6 +4837,7 @@ impl DeepSeekV4 {
                     Some(input_ids),
                 )?;
                 v4_stat_dbg(&xs_4d, &format!("L{i}"));
+                crate::layers::arc_layer_trace_push(&xs_4d);
             }
             drop(_prof_layers);
             let xs_4d = xs_4d.to_device(&self.device)?;
@@ -4854,6 +4866,7 @@ impl DeepSeekV4 {
                     flash_params,
                     Some(input_ids),
                 )?;
+                crate::layers::arc_layer_trace_push(&xs);
             }
             xs.to_device(&self.device)?
         };

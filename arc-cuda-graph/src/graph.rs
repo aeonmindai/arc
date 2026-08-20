@@ -367,6 +367,19 @@ output_trusted={} verify_remaining={} verify_failed={}",
                  batch_size={batch_size}): cudaError {sync}"
             );
         }
+        // 🔴 BOOBY TRAP — this is a CLONE OF THE CAPTURED OUTPUT TENSOR, i.e. a
+        // handle to storage the graph OVERWRITES on its next launch. It is not
+        // a snapshot. Two consequences the caller owns:
+        //
+        //  * every value this has ever returned aliases every other one, so
+        //    holding an "old" result and comparing it to a "new" one compares a
+        //    tensor with itself;
+        //  * a verification path that launches the graph again — even for a
+        //    diagnostic — silently rewrites the bytes it was about to grade.
+        //    `normal.rs` therefore takes its verdict from the tensor BEFORE any
+        //    extra launch. This nearly voided the probe that found it.
+        //
+        // Copy it if you need it to outlive the next launch.
         let out = captured
             .output
             .clone()
