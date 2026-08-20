@@ -1607,6 +1607,19 @@ impl DeepSeekV2RotaryEmbedding {
         }
     }
 
+    /// The full `[max_position_embeddings, rope_dim / 2]` cosine table.
+    ///
+    /// Exposed for `cuda::qk_norm_rope`, which addresses the table with a base
+    /// offset instead of materialising the `narrow` view `forward` takes.
+    pub fn cos(&self) -> &Tensor {
+        &self.cos
+    }
+
+    /// The full `[max_position_embeddings, rope_dim / 2]` sine table. See [`Self::cos`].
+    pub fn sin(&self) -> &Tensor {
+        &self.sin
+    }
+
     pub fn forward(
         &self,
         q: &Tensor,

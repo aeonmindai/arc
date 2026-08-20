@@ -375,6 +375,33 @@ extern "C" {
     // are compiled by build.rs's dedicated no-fast-math builder; see the
     // bit-identity contract at the top of that file.
     #[allow(clippy::too_many_arguments)]
+    /// Fused DeepSeek-V4 Q/K pre-attention block (`cuda/qk_norm_rope.cu`):
+    /// head transpose + per-head Q RMS-norm + adjacent-pair RoPE + NoPE/PE
+    /// recombination, in one launch. Returns 0 on launch, non-zero if the
+    /// (dtype, head_dim, rope_dim) triple is outside the specialised set — the
+    /// caller must then run the eager chain rather than approximate.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn arc_qk_norm_rope_bf16_v2(
+        q_in: *const c_void,
+        k_in: *const c_void,
+        cos_tab: *const c_void,
+        sin_tab: *const c_void,
+        q_out: *mut c_void,
+        k_out: *mut c_void,
+        n_heads: i32,
+        batch: i32,
+        seq_len: i32,
+        head_dim: i32,
+        rope_dim: i32,
+        pos_offset: i32,
+        dtype: i32,
+        inv_n_bits: u32,
+        zero_bits: u32,
+        one_bits: u32,
+        eps_bits: u32,
+        stream: i64,
+    ) -> i32;
+
     pub(crate) fn hc_pre_fused_f32(
         x_flat: *const c_void,
         mixes_raw: *const c_void,
