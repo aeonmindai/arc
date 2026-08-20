@@ -46,6 +46,29 @@ pub use sampling_cuda::{gpu_algorithm_simulate, SamplingParams, GPU_MAX_KEEP};
 /// must be unit-testable where CUDA cannot compile.
 pub use weights::{check_dense_layer_inventory, DenseShapeError, DENSE_PROJS_PER_LAYER};
 
+/// Free-VRAM floor for CUDA-graph capture, in bytes.
+///
+/// This is not a capture-cost estimate. It is
+/// `mistralrs-core/src/attention/backends/naive.rs`'s `SYNC_HEADROOM_BYTES`:
+/// the level below which `maybe_synchronize` issues a full
+/// `cuCtxSynchronize` from inside the attention backend, on every
+/// `naive_sdpa` and every cuBLASLt attention call.
+///
+/// Two independent reasons that number bounds capture:
+///
+/// 1. A `cuCtxSynchronize` **during** capture is illegal and fails the
+///    capture. `maybe_synchronize` skips it while capturing, so capture no
+///    longer dies — but that means
+/// 2. a graph captured below this floor **omits** a synchronize that every
+///    eager step at the same memory pressure performs. The replay and the
+///    eager path would then differ, nondeterministically, only under load.
+///
+/// So capture refuses to begin below it rather than record a graph that is
+/// valid only while there is headroom. NOT CUDA-gated, so the constant is
+/// visible to the compile-time assertion in `naive.rs` that pins the two
+/// definitions together.
+pub const CAPTURE_SYNC_HEADROOM_BYTES: usize = 4 * 1024 * 1024 * 1024;
+
 #[cfg(feature = "cuda")]
 pub use sampling_cuda::CudaSampler;
 
