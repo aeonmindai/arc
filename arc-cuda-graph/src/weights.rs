@@ -50,10 +50,16 @@ pub enum DenseShapeError {
     NoLayers,
     /// `get_layers()` did not lead with the untagged (`None`) lm_head.
     HeadNotFirst { first: Option<usize> },
-    /// More than one untagged entry. A dense model emits exactly one (lm_head).
-    /// V4 emits four or more: lm_head, `mtp.h_proj`, `mtp.e_proj`, and every
-    /// tensor of the MTP block.
-    ExtraUntaggedTensors { count: usize, positions: Vec<usize> },
+    /// An untagged entry sits at a position `extract_model_weights` reads as a
+    /// projection — anywhere in `1 ..= num_layers * DENSE_PROJS_PER_LAYER`.
+    ///
+    /// This is the only untagged entry that can hurt. An untagged tensor
+    /// *inside* the dense block displaces every projection after it, so the
+    /// positional read returns a tensor of the wrong role. Untagged tensors
+    /// appended *after* the block (V4's `mtp.h_proj`, `mtp.e_proj` and the MTP
+    /// block) are never dereferenced and are therefore not this guard's
+    /// business — see [`check_dense_layer_inventory`].
+    UntaggedInsideDenseBlock { position: usize, last_read: usize },
     /// A layer index at or beyond `num_layers`.
     LayerIndexOutOfRange { layer: usize, num_layers: usize },
     /// A layer did not contribute exactly [`DENSE_PROJS_PER_LAYER`] entries.
@@ -75,10 +81,14 @@ impl std::fmt::Display for DenseShapeError {
                 f,
                 "get_layers() must lead with the untagged lm_head, but entry 0 is tagged {first:?}"
             ),
-            Self::ExtraUntaggedTensors { count, positions } => write!(
+            Self::UntaggedInsideDenseBlock {
+                position,
+                last_read,
+            } => write!(
                 f,
-                "expected exactly 1 untagged (lm_head) entry, found {count} at positions {positions:?} \
-                 — extra untagged tensors mean auxiliary heads (e.g. MTP) the dense path cannot describe"
+                "an untagged entry sits at position {position}, inside the block the extractor reads \
+                 positionally (1..={last_read}) — it would be dereferenced as a projection and it \
+                 displaces every projection after it"
             ),
             Self::LayerIndexOutOfRange { layer, num_layers } => write!(
                 f,
@@ -107,13 +117,35 @@ impl std::error::Error for DenseShapeError {}
 ///
 /// 1. entry 0 is untagged (`None`) — the lm_head, which `extract_model_weights`
 ///    reads as `layers[0]`;
-/// 2. it is the *only* untagged entry;
+/// 2. no *other* untagged entry appears at a position the extractor reads,
+///    i.e. within `1 ..= num_layers * DENSE_PROJS_PER_LAYER`;
 /// 3. every layer index `0..num_layers` appears exactly
 ///    [`DENSE_PROJS_PER_LAYER`] times, and no index outside that range appears.
 ///
 /// Part 3 is what actually protects the positional indexing: the extractor
 /// reads `layers[1 + i * 7 + k]`, which is only meaningful when every layer
 /// contributed exactly seven entries in order.
+///
+/// # Part 2 is scoped to what is actually read
+///
+/// It used to demand that lm_head be the *only* untagged entry anywhere in the
+/// inventory. That is stricter than the extractor needs and it refused models
+/// the extractor would have described correctly.
+///
+/// `extract_model_weights` dereferences exactly `layers[0]` and
+/// `layers[1 + i * DENSE_PROJS_PER_LAYER + k]` for `i < num_layers` and
+/// `k < DENSE_PROJS_PER_LAYER`. The largest index it can reach is therefore
+/// `num_layers * DENSE_PROJS_PER_LAYER`. Entries past that are never touched,
+/// so an auxiliary head *appended after* the dense block — which is exactly
+/// where `deepseek4.rs:4580-4582` puts `mtp.h_proj`, `mtp.e_proj` and the MTP
+/// block — cannot corrupt anything. An untagged entry *inside* the block is a
+/// different matter and is still refused: it is read as a projection, and it
+/// displaces every projection after it.
+///
+/// This does not admit V4. V4 is refused by part 3 — its layers emit MLA
+/// projections plus 256 experts x 3, not seven — and that is the truthful
+/// reason. The old rule reported the MTP head instead, because it happened to
+/// be checked first, which named a consequence rather than the cause.
 ///
 /// Pure, and deliberately not CUDA-gated, so the contract is unit-testable on
 /// any host — including the macOS dev machines where `cargo check` does not
@@ -148,18 +180,26 @@ pub fn check_dense_layer_inventory(
         None => return Err(DenseShapeError::HeadNotFirst { first: None }),
     }
 
-    let untagged: Vec<usize> = tags
+    // The highest index `extract_model_weights` can reach:
+    // `1 + (num_layers - 1) * 7 + 6`. Positions past it are never dereferenced.
+    let last_read = num_layers * DENSE_PROJS_PER_LAYER;
+    if let Some(position) = tags
         .iter()
         .enumerate()
-        .filter_map(|(i, t)| t.is_none().then_some(i))
-        .collect();
-    if untagged.len() != 1 {
-        return Err(DenseShapeError::ExtraUntaggedTensors {
-            count: untagged.len(),
-            positions: untagged,
+        .skip(1)
+        .take(last_read)
+        .find_map(|(i, t)| t.is_none().then_some(i))
+    {
+        return Err(DenseShapeError::UntaggedInsideDenseBlock {
+            position,
+            last_read,
         });
     }
 
+    // Counted over the WHOLE inventory, not just the read window. This is what
+    // catches a layer that emitted more than seven entries: the excess spills
+    // past `last_read`, and a window-scoped count would see a truncated seven
+    // and wave a 256-expert MoE layer through.
     let mut per_layer = vec![0usize; num_layers];
     for &tag in tags {
         let Some(idx) = tag else { continue };
@@ -627,13 +667,20 @@ mod dense_shape_tests {
         assert_eq!(check_dense_layer_inventory(&dense_tags(1), 1), Ok(()));
     }
 
-    /// The case this guard exists for. `deepseek4.rs` emits, per layer,
-    /// `wq_a, wq_b, wkv, wo_a, wo_b` (+ optional compressor gate) and then
-    /// every expert's three projections — and afterwards appends
+    /// The case this guard exists for. `deepseek4.rs:4541-4600` emits, per
+    /// layer, `wq_a, wq_b, wkv, wo_a, wo_b` (+ optional compressor gate) and
+    /// then every expert's three projections — and afterwards appends
     /// `mtp.h_proj`, `mtp.e_proj` and the whole MTP block as *untagged*
-    /// entries. Both the untagged count and the per-layer count are wrong.
+    /// entries.
+    ///
+    /// The refusal must name the **layer shape**, not the MTP head. The MTP
+    /// entries are appended past every position the extractor reads and are
+    /// harmless; what makes V4 undescribable is that a layer emits MLA
+    /// projections and 3 x experts, which is not seven. Reporting the MTP head
+    /// named a coincidence of check order and sent the reader after the wrong
+    /// thing.
     #[test]
-    fn v4_shaped_inventory_is_rejected() {
+    fn v4_shaped_inventory_is_rejected_for_its_layer_shape() {
         let num_layers = 4;
         let experts = 8; // the real model has 256; 8 is enough to be un-dense
         let mut tags = vec![None]; // lm_head
@@ -643,20 +690,43 @@ mod dense_shape_tests {
             // MoE: three projections per expert
             tags.extend(std::iter::repeat_n(Some(i), experts * 3));
         }
-        // MTP head + block, all untagged
+        // MTP head + block, all untagged, all past `num_layers * 7`.
         tags.extend([None, None, None]);
 
         let err = check_dense_layer_inventory(&tags, num_layers)
             .expect_err("a V4-shaped inventory must be refused");
         assert_eq!(
             err,
-            DenseShapeError::ExtraUntaggedTensors {
-                count: 4,
-                positions: vec![0, tags.len() - 3, tags.len() - 2, tags.len() - 1],
+            DenseShapeError::LayerProjCountMismatch {
+                layer: 0,
+                found: 5 + experts * 3,
+                expected: DENSE_PROJS_PER_LAYER,
             }
         );
         // The message must name the reason; an operator reads this, not the enum.
-        assert!(err.to_string().contains("untagged"), "{err}");
+        assert!(err.to_string().contains("MoE or MLA"), "{err}");
+    }
+
+    /// The half of the old untagged rule that was load-bearing. An untagged
+    /// entry *inside* the read window is dereferenced as a projection and
+    /// displaces every projection after it, so it is still refused — and the
+    /// refusal names the position, because that is what the reader needs.
+    #[test]
+    fn untagged_entry_inside_the_dense_block_is_still_rejected() {
+        const NUM_LAYERS: usize = 3;
+        let mut tags = dense_tags(NUM_LAYERS);
+        // Splice an untagged tensor into the middle of layer 1's projections.
+        tags.insert(10, None);
+        let err = check_dense_layer_inventory(&tags, NUM_LAYERS)
+            .expect_err("an untagged entry inside the block must be refused");
+        assert_eq!(
+            err,
+            DenseShapeError::UntaggedInsideDenseBlock {
+                position: 10,
+                last_read: NUM_LAYERS * DENSE_PROJS_PER_LAYER,
+            }
+        );
+        assert!(err.to_string().contains("displaces"), "{err}");
     }
 
     /// A MoE model with no auxiliary heads still has the wrong per-layer count.
@@ -759,6 +829,28 @@ mod dense_shape_tests {
                 expected: DENSE_PROJS_PER_LAYER,
             })
         );
+    }
+
+    /// A dense model that also carries a trailing auxiliary head must be
+    /// ACCEPTED. `extract_model_weights` reads exactly `layers[0]` and
+    /// `layers[1 + i*7 + k]` for `i < num_layers, k < 7` — a maximum index of
+    /// `7 * num_layers`. Entries past that are never dereferenced, so refusing
+    /// a model because of them refuses a model the extractor would have
+    /// described correctly.
+    #[test]
+    fn dense_model_with_trailing_auxiliary_head_is_accepted() {
+        const NUM_LAYERS: usize = 4;
+        let mut tags = dense_tags(NUM_LAYERS);
+        let last_read = NUM_LAYERS * DENSE_PROJS_PER_LAYER;
+        assert_eq!(
+            tags.len() - 1,
+            last_read,
+            "fixture must be exactly the reads the extractor makes"
+        );
+        // MTP-style: h_proj, e_proj and a block, all untagged, all appended
+        // after every position the extractor reads.
+        tags.extend([None, None, None]);
+        assert_eq!(check_dense_layer_inventory(&tags, NUM_LAYERS), Ok(()));
     }
 
     #[test]
