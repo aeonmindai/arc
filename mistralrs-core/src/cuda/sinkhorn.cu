@@ -62,6 +62,7 @@
 
 #include <cuda_runtime.h>
 #include <math.h>
+#include <stdlib.h>
 
 #if defined(__USE_FAST_MATH__)
 #error "sinkhorn.cu must be compiled WITHOUT --use_fast_math: fast math rewrites expf to __expf and IEEE division to approximate reciprocals, breaking bit-identity with candle-kernels (which build with plain -O3). See the dedicated no-fast-math builder in mistralrs-core/build.rs."
@@ -257,6 +258,138 @@ __global__ void sinkhorn_normalize_f32_kernel(
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// WARP-BUTTERFLY PATH (default)
+// ---------------------------------------------------------------------------
+// The templated kernel above got the row/tree buffers into registers, but it
+// still stages the matrix through shared memory and pays TWO __syncthreads()
+// per iteration -- 40 barriers and ~80 shared round trips per call -- to move
+// each column to the thread that divides by it. With hc <= 16 every thread is
+// a lane of ONE warp, so none of that is needed: the column reduction is a
+// warp butterfly and the matrix never leaves registers.
+//
+//   MEASURED, H200 / nvcc 12.4 / sm_90, n=1 hc=4 iters=20, 86 calls per token:
+//     legacy (pre-ladder, runtime hc, 192 B stack)  30.578 us/call
+//     templated + shared/barriers (the kernel above)  9.935 us/call
+//     warp butterfly (this kernel)                    7.302 us/call   1.36x
+//
+// Bit-identity holds by construction. candle's level `s` is
+// `buf[t] = __fadd_rn(buf[t], buf[t + s])` for t < s; the butterfly gives lane
+// t `__fadd_rn(buf[t], buf[t ^ s])`, which IS that expression for t < s and its
+// commuted form for t >= s. IEEE-754 addition is commutative (only
+// associativity fails), so every lane ends each level holding bit-identical
+// values and lane 0 holds precisely candle's result. Lanes with row >= HC feed
+// 0.0f, which is exactly candle's `shr[tid] = 0` identity padding.
+//
+// KILL SWITCH: ARC_NO_SINKHORN_WARP=1 restores the templated shared-memory
+// kernel above. Default is this path (house policy: fast-by-default with a kill
+// switch, never opt-in). The two arms are distinguishable in a profile by
+// kernel name -- `arc_sinkhorn::warp_kernel<N>` vs the anonymous-namespace
+// `sinkhorn_normalize_f32_kernel<N>` -- so which arm ran is provable from nsys
+// output alone and cannot be faked by a stale object file.
+
+namespace arc_sinkhorn {
+
+template <int HC, int P>
+__device__ __forceinline__ void col_sums(
+    const float (&r)[HC],
+    float (&cs)[HC],
+    bool active,
+    unsigned mask,
+    float eps
+) {
+#pragma unroll
+    for (int c = 0; c < HC; ++c) {
+        float v = __fadd_rn(0.0f, active ? r[c] : 0.0f);
+#pragma unroll
+        for (int s = P >> 1; s > 0; s >>= 1) {
+            v = __fadd_rn(v, __shfl_xor_sync(mask, v, s));
+        }
+        cs[c] = __fadd_rn(v, eps);
+    }
+}
+
+// in/out: [n, HC, HC] row-major F32. One block per matrix, next_pow2(HC)
+// threads -- all lanes of a single warp, so no shared memory and no barriers.
+template <int HC>
+__global__ void warp_kernel(
+    const float* __restrict__ in,
+    float* __restrict__ out,
+    int n,
+    int iters,
+    float eps
+) {
+    const int batch = blockIdx.x;
+    const int row = threadIdx.x;
+    // Uniform across the block, so it cannot desynchronise the shuffles below.
+    if (batch >= n) return;
+
+    const int P = next_pow2_ce(HC);
+    const bool active = (row < HC);
+    const unsigned mask = (P >= 32) ? 0xffffffffu : ((1u << P) - 1u);
+
+    float r[HC];
+    if (active) {
+        const float* my_in = in + (size_t)batch * HC * HC + (size_t)row * HC;
+#pragma unroll
+        for (int j = 0; j < HC; ++j) r[j] = my_in[j];
+    } else {
+#pragma unroll
+        for (int j = 0; j < HC; ++j) r[j] = 0.0f;
+    }
+
+    // ---- 1. stable row softmax, then + eps (entirely within this lane) ----
+    const float m = candle_tree_max<HC>(r);
+#pragma unroll
+    for (int j = 0; j < HC; ++j) r[j] = expf(__fsub_rn(r[j], m));
+    const float rs = candle_tree_sum<HC>(r);
+#pragma unroll
+    for (int j = 0; j < HC; ++j) r[j] = __fadd_rn(__fdiv_rn(r[j], rs), eps);
+
+    // ---- 2. initial column normalize: x / (colsum + eps) ----
+    float cs[HC];
+    col_sums<HC, next_pow2_ce(HC)>(r, cs, active, mask, eps);
+#pragma unroll
+    for (int j = 0; j < HC; ++j) r[j] = __fdiv_rn(r[j], cs[j]);
+
+    // ---- 3. (iters - 1) more row->col passes ----
+    for (int it = 0; it < iters - 1; ++it) {
+        const float rsum = __fadd_rn(candle_tree_sum<HC>(r), eps);
+#pragma unroll
+        for (int j = 0; j < HC; ++j) r[j] = __fdiv_rn(r[j], rsum);
+        col_sums<HC, next_pow2_ce(HC)>(r, cs, active, mask, eps);
+#pragma unroll
+        for (int j = 0; j < HC; ++j) r[j] = __fdiv_rn(r[j], cs[j]);
+    }
+
+    if (active) {
+        float* my_out = out + (size_t)batch * HC * HC + (size_t)row * HC;
+#pragma unroll
+        for (int j = 0; j < HC; ++j) my_out[j] = r[j];
+    }
+}
+
+// Read once; getenv is not cheap and this is on the per-layer decode path.
+inline bool warp_disabled() {
+    static const bool disabled = [] {
+        const char* v = getenv("ARC_NO_SINKHORN_WARP");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    return disabled;
+}
+
+} // namespace arc_sinkhorn
+
+// Defined outside the namespace because it is expanded in `extern "C"` scope
+// below; `warp_kernel` has to be qualified there.
+#define SINKHORN_WARP_LAUNCH(HC_)                                                            \
+    case HC_:                                                                                \
+        arc_sinkhorn::warp_kernel<HC_>                                                       \
+            <<<dim3(n, 1, 1), dim3(next_pow2_ce(HC_), 1, 1), 0, (cudaStream_t)stream>>>(     \
+                (const float*)in, (float*)out, n, iters, eps);                               \
+        return;
+
+
 extern "C" {
 
 void sinkhorn_normalize_f32(
@@ -268,6 +401,31 @@ void sinkhorn_normalize_f32(
     float eps,
     long long stream
 ) {
+    if (!arc_sinkhorn::warp_disabled()) {
+        switch (hc) {
+            SINKHORN_WARP_LAUNCH(1)
+            SINKHORN_WARP_LAUNCH(2)
+            SINKHORN_WARP_LAUNCH(3)
+            SINKHORN_WARP_LAUNCH(4)
+            SINKHORN_WARP_LAUNCH(5)
+            SINKHORN_WARP_LAUNCH(6)
+            SINKHORN_WARP_LAUNCH(7)
+            SINKHORN_WARP_LAUNCH(8)
+            SINKHORN_WARP_LAUNCH(9)
+            SINKHORN_WARP_LAUNCH(10)
+            SINKHORN_WARP_LAUNCH(11)
+            SINKHORN_WARP_LAUNCH(12)
+            SINKHORN_WARP_LAUNCH(13)
+            SINKHORN_WARP_LAUNCH(14)
+            SINKHORN_WARP_LAUNCH(15)
+            SINKHORN_WARP_LAUNCH(16)
+        default:
+            // Unreachable (the Rust guard rejects hc > SINKHORN_MAX_HC); fall
+            // through to the templated kernel rather than leave `out` untouched.
+            break;
+        }
+    }
+
     dim3 grid(n, 1, 1);
     dim3 block(hc, 1, 1);
     switch (hc) {
@@ -295,5 +453,6 @@ void sinkhorn_normalize_f32(
     }
 }
 #undef SINKHORN_LAUNCH
+#undef SINKHORN_WARP_LAUNCH
 
 } // extern "C"
