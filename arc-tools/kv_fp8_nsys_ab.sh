@@ -49,13 +49,13 @@ exec 9>"$LOCK"
 for arm in before:cpu after:fused; do
   A=${arm%%:*}
   M=${arm##*:}
-  echo "=== leg $A (ARC_KV_FP8_MODE=$M) $(date -u +%T) ==="
+  echo "=== leg $A (ARC_KV_FP8_IMPL=$M) $(date -u +%T) ==="
   rm -f "$OUT/$A".nsys-rep "$OUT/$A".sqlite
   # LOCK HELD ONLY HERE: VRAM wait + the traced run. Released the instant the
   # bench exits, before any report export.
   flock -w "$LOCKWAIT" 9 || { echo "FATAL_LOCK_TIMEOUT after ${LOCKWAIT}s"; exit 2; }
   wait_for_vram 100000
-  ARC_KV_FP8_MODE=$M nsys profile --trace=cuda --sample=none --cpuctxsw=none \
+  ARC_KV_FP8_IMPL=$M nsys profile --trace=cuda --sample=none --cpuctxsw=none \
     --cuda-memory-usage=false --duration="$DUR" --kill=sigterm \
     --force-overwrite=true --output="$OUT/$A" \
     "$BIN" bench -m "$BASE/src" -a deepseekv4 \

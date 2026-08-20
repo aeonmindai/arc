@@ -73,7 +73,7 @@ pub(crate) enum KvQuantMode {
     FusedDevice,
     /// Exact E4M3 via candle's CPU cast (candle has no CUDA `F8E4M3` cast —
     /// "named symbol not found"), at the price of one device sync per layer.
-    /// `ARC_KV_FP8_MODE=cpu`.
+    /// `ARC_KV_FP8_IMPL=cpu`.
     CpuExact,
     /// On-device float arithmetic that reproduces E4M3's value grid with
     /// round-half-away-from-zero instead of round-half-to-even. Removes the
@@ -90,25 +90,94 @@ pub(crate) enum KvQuantMode {
     GpuApprox,
 }
 
+/// The legal values of `ARC_KV_FP8_IMPL`, for error messages and for the test
+/// that pins the table.
+pub(crate) const KV_FP8_IMPL_VALUES: &[&str] = &[
+    "fused",
+    "fused_device",
+    "cpu",
+    "cpu_exact",
+    "gpu",
+    "gpu_approx",
+];
+
 impl KvQuantMode {
+    /// Pure half of [`Self::from_env`], so the table can be tested without
+    /// mutating the process environment (which is racy across test threads and
+    /// `unsafe` since the 2024 edition).
+    ///
+    /// `raw` is the `ARC_KV_FP8_IMPL` value (`None` when unset); `legacy_gpu`
+    /// is whether the pre-existing `ARC_GPU_ACT_QUANT` is set. Returns the mode
+    /// and, when the input was not understood, the complaint to shout about it.
+    pub(crate) fn parse_impl(raw: Option<&str>, legacy_gpu: bool) -> (Self, Option<String>) {
+        let default = if legacy_gpu {
+            // Preserved from before this flag existed: `ARC_GPU_ACT_QUANT=1`
+            // selects the approximate on-device path. It only applies when
+            // `ARC_KV_FP8_IMPL` says nothing.
+            Self::GpuApprox
+        } else {
+            Self::FusedDevice
+        };
+        match raw.map(|s| s.trim()) {
+            None | Some("") => (default, None),
+            Some(v) => match v.to_ascii_lowercase().as_str() {
+                "cpu" | "cpu_exact" => (Self::CpuExact, None),
+                "gpu" | "gpu_approx" => (Self::GpuApprox, None),
+                "fused" | "fused_device" => (Self::FusedDevice, None),
+                // NOT `default`. Falling through to `default` here is how a
+                // typo used to select `GpuApprox` — the one variant documented
+                // as *not* bit-exact and "must not be shipped" — on any box
+                // that still had `ARC_GPU_ACT_QUANT` set from an earlier
+                // experiment. An unparsable value now lands on the bit-exact
+                // default and says so.
+                _ => (
+                    Self::FusedDevice,
+                    Some(format!(
+                        "ARC_KV_FP8_IMPL={v:?} is not a legal value (expected one of {}); \
+                         falling back to the default fused-device kernel. \
+                         NOTE: this flag selects WHICH ARITHMETIC produces the E4M3 code. \
+                         It has no 'off' — V4 is FP8-QAT and the quantize/dequantize round \
+                         trip is the model's numerics, not an optimisation. The flag that \
+                         gates FP8 KV *storage* is ARC_V4_FP8_KV.",
+                        KV_FP8_IMPL_VALUES.join(", ")
+                    )),
+                ),
+            },
+        }
+    }
+
     /// Resolved once per process: this is called per attention layer per
     /// forward, and `deepseek4` has already been bitten by per-call
     /// `std::env::var_os` in exactly that position (~390 environment scans per
     /// forward, wave33).
+    ///
+    /// Reads `ARC_KV_FP8_IMPL`. The former spelling `ARC_KV_FP8_MODE` is still
+    /// honoured — loudly — because renaming it silently would turn every
+    /// operator's muscle memory into a new silent failure, which is the same
+    /// disease the rename cures.
     pub(crate) fn from_env() -> Self {
         static MODE: OnceLock<KvQuantMode> = OnceLock::new();
         *MODE.get_or_init(|| {
-            match std::env::var("ARC_KV_FP8_MODE")
-                .unwrap_or_default()
-                .to_ascii_lowercase()
-                .as_str()
-            {
-                "cpu" | "cpu_exact" => Self::CpuExact,
-                "gpu" | "gpu_approx" => Self::GpuApprox,
-                "fused" | "fused_device" => Self::FusedDevice,
-                _ if std::env::var_os("ARC_GPU_ACT_QUANT").is_some() => Self::GpuApprox,
-                _ => Self::FusedDevice,
+            let legacy_gpu = std::env::var_os("ARC_GPU_ACT_QUANT").is_some();
+            let new = std::env::var("ARC_KV_FP8_IMPL").ok();
+            let old = std::env::var("ARC_KV_FP8_MODE").ok();
+            if old.is_some() {
+                // eprintln! as well as tracing: a rented box often runs before
+                // a subscriber is installed, and a deprecation nobody sees is
+                // not a deprecation.
+                let msg = "ARC_KV_FP8_MODE has been renamed ARC_KV_FP8_IMPL (it selects the \
+                           quantizer ARITHMETIC; it never had an 'off'). The old name still \
+                           works for now — please update.";
+                eprintln!("[arc-kv-fp8] {msg}");
+                tracing::warn!("{msg}");
             }
+            let raw = new.or(old);
+            let (mode, complaint) = Self::parse_impl(raw.as_deref(), legacy_gpu);
+            if let Some(c) = complaint {
+                eprintln!("[arc-kv-fp8] {c}");
+                tracing::error!("{c}");
+            }
+            mode
         })
     }
 }
@@ -738,5 +807,64 @@ mod tests {
         }
         assert_eq!(values[0], 0.0);
         assert_eq!(values[126], 448.0);
+    }
+
+    /// The parse table, pinned. Before this, `ARC_KV_FP8_MODE` had a bare
+    /// `_ => Self::FusedDevice` catch-all preceded by an
+    /// `_ if ARC_GPU_ACT_QUANT is set => Self::GpuApprox` arm, so a MISSPELLED
+    /// value on a box that still had `ARC_GPU_ACT_QUANT` exported silently
+    /// selected `GpuApprox` — the one variant this module documents as not
+    /// bit-exact and "must not be shipped as one".
+    #[test]
+    fn kv_fp8_impl_parse_table() {
+        use KvQuantMode::*;
+
+        // Unset: the bit-exact fused kernel, with and without trailing space.
+        assert_eq!(KvQuantMode::parse_impl(None, false).0, FusedDevice);
+        assert_eq!(KvQuantMode::parse_impl(Some(""), false).0, FusedDevice);
+        assert_eq!(KvQuantMode::parse_impl(Some("  "), false).0, FusedDevice);
+
+        // Every legal value round-trips, case- and whitespace-insensitively,
+        // and none of them complains.
+        for (raw, want) in [
+            ("fused", FusedDevice),
+            ("fused_device", FusedDevice),
+            ("FUSED", FusedDevice),
+            (" cpu ", CpuExact),
+            ("cpu_exact", CpuExact),
+            ("gpu", GpuApprox),
+            ("gpu_approx", GpuApprox),
+        ] {
+            let (got, complaint) = KvQuantMode::parse_impl(Some(raw), false);
+            assert_eq!(got, want, "{raw:?}");
+            assert!(complaint.is_none(), "{raw:?} should parse silently");
+        }
+
+        // Every value the error message advertises as legal really is legal.
+        for v in KV_FP8_IMPL_VALUES {
+            assert!(
+                KvQuantMode::parse_impl(Some(v), false).1.is_none(),
+                "{v:?} is advertised as legal but is rejected"
+            );
+        }
+
+        // The legacy var still selects GpuApprox, but only when the new flag
+        // is silent.
+        assert_eq!(KvQuantMode::parse_impl(None, true).0, GpuApprox);
+        assert_eq!(KvQuantMode::parse_impl(Some(""), true).0, GpuApprox);
+        assert_eq!(KvQuantMode::parse_impl(Some("cpu"), true).0, CpuExact);
+
+        // THE REGRESSION. A typo must be loud, and must NOT reach GpuApprox
+        // even with the legacy var set.
+        for legacy in [false, true] {
+            let (got, complaint) = KvQuantMode::parse_impl(Some("fusd"), legacy);
+            assert_eq!(got, FusedDevice, "typo must land on the bit-exact default");
+            let c = complaint.expect("a typo must produce a complaint");
+            assert!(c.contains("fusd"), "the complaint must quote the bad value");
+            assert!(
+                c.contains("ARC_V4_FP8_KV"),
+                "the complaint must name the flag that actually gates storage"
+            );
+        }
     }
 }
