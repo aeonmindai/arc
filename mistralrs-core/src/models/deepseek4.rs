@@ -1444,13 +1444,28 @@ impl Attention {
         // -> the model cannot attend -> word-salad output (RUN-161).
         let q = {
             let _s = arc_profiler::device_span("q_rmsnorm");
-            let inv_rms = q
-                .sqr()?
-                .mean_keepdim(candle_core::D::Minus1)?
-                .affine(1.0, self.cfg.rms_norm_eps)?
-                .recip()?
-                .sqrt()?;
-            q.broadcast_mul(&inv_rms)?
+            // Fused single-launch path (cuda/qnorm.cu, structural port of
+            // vLLM's rms_norm_kernel). Bit-identical to the seven-kernel chain
+            // below, BF16 accumulator included; see that file's contract and
+            // the on-GPU A/B in cuda/qnorm.rs. ARC_NO_FUSED_QNORM=1 forces the
+            // old chain, which is what the A/B measurement legs toggle.
+            let fused = if crate::cuda::qnorm::fused_qnorm_disabled() {
+                None
+            } else {
+                crate::cuda::qnorm::qnorm_rms_cuda(&q, self.cfg.rms_norm_eps)?
+            };
+            match fused {
+                Some(out) => out,
+                None => {
+                    let inv_rms = q
+                        .sqr()?
+                        .mean_keepdim(candle_core::D::Minus1)?
+                        .affine(1.0, self.cfg.rms_norm_eps)?
+                        .recip()?
+                        .sqrt()?;
+                    q.broadcast_mul(&inv_rms)?
+                }
+            }
         };
         v4_stat_dbg(&q, "attn.q_normed");
         v4_trace_dump(self.dbg_layer_idx, &q, "10_q_normed");

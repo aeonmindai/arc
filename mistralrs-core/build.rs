@@ -5,7 +5,7 @@ const CUDA_NVCC_FLAGS: Option<&'static str> = option_env!("CUDA_NVCC_FLAGS");
 /// which therefore must be compiled without `--use_fast_math`. Each carries a
 /// bit-identity contract in its file header.
 #[cfg(feature = "cuda")]
-const IEEE_SOURCES: &[&str] = &["sinkhorn.cu", "swiglu_clamp.cu"];
+const IEEE_SOURCES: &[&str] = &["sinkhorn.cu", "swiglu_clamp.cu", "qnorm.cu"];
 
 /// nvcc args for the normal (fast-math) `src/cuda/*.cu` builder.
 #[cfg(feature = "cuda")]
