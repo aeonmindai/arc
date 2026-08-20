@@ -94,7 +94,11 @@ impl std::fmt::Display for RateError {
 /// The denominator is what the engine PRODUCED, never what the caller asked
 /// for. There is deliberately no fallback: a run that produced nothing has no
 /// rate, and manufacturing one is exactly the bug this replaces.
-fn rate_from_produced(produced: usize, text_len: usize, elapsed_secs: f32) -> Result<f32, RateError> {
+fn rate_from_produced(
+    produced: usize,
+    text_len: usize,
+    elapsed_secs: f32,
+) -> Result<f32, RateError> {
     if (produced > 0) != (text_len > 0) {
         return Err(RateError::CounterDisagreement {
             tokens: produced,
@@ -241,9 +245,7 @@ pub async fn run_bench(
             // A prefill run still has to emit its one token; zero means the
             // forward pass did not produce a result.
             let _ = rate_from_produced(run.completion_tokens, run.text_len, elapsed.as_secs_f32())
-                .map_err(|e| {
-                    anyhow::anyhow!("prefill iteration {}: {e}", i + 1)
-                })?;
+                .map_err(|e| anyhow::anyhow!("prefill iteration {}: {e}", i + 1))?;
 
             // Record both tok/s and TTFT (latency in ms)
             let tok_per_sec = run.prompt_tokens as f32 / elapsed.as_secs_f32();
@@ -466,9 +468,10 @@ async fn run_single_bench(
         Some(Response::Done(r)) => Ok(BenchRun {
             completion_tokens: r.usage.completion_tokens,
             prompt_tokens: r.usage.prompt_tokens,
-            text_len: r.choices.first().map_or(0, |c| {
-                c.message.content.as_ref().map_or(0, String::len)
-            }),
+            text_len: r
+                .choices
+                .first()
+                .map_or(0, |c| c.message.content.as_ref().map_or(0, String::len)),
         }),
         Some(Response::InternalError(e)) => anyhow::bail!("Internal error: {e:?}"),
         Some(Response::ModelError(e, _)) => anyhow::bail!("Model error: {e}"),
@@ -596,7 +599,10 @@ mod tests {
     fn a_short_run_rates_over_produced_not_requested() {
         // Asked for 64, produced 7, took 1 s.
         let rate = rate_from_produced(7, 21, 1.0).expect("a 7-token run has a rate");
-        assert!((rate - 7.0).abs() < f32::EPSILON, "rate must be 7/1s, got {rate}");
+        assert!(
+            (rate - 7.0).abs() < f32::EPSILON,
+            "rate must be 7/1s, got {rate}"
+        );
         // The number the old code would have printed for the identical run:
         let legacy = legacy_rate_over_requested(64, 1.0);
         assert!(
