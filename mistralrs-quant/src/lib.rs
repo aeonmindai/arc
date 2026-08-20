@@ -16,6 +16,12 @@ use pertensor_fp8::pertensor_fp8_linear_b;
 mod metal_kernels;
 
 mod afq;
+pub mod arc_kvquant;
+// Not `#[cfg(feature = "cuda")]`: the allocation helpers inside are, but the
+// POLICY TABLE is host logic, and gating the whole module put its table beyond
+// reach of the free CPU test lane — the only lane that runs tests at all. See
+// the module header for why the default matters enough to pin with a test.
+mod arc_outbuf;
 mod bitsandbytes;
 mod blockwise_fp8;
 pub mod calibration;

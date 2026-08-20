@@ -278,57 +278,111 @@ impl V4MHCLayerParams {
         // Promote to F32, flatten to [N, hc*h].
         let x_flat = x.reshape((n, hc * h))?.to_dtype(DType::F32)?;
 
-        // rsqrt(mean(x^2) + eps)
-        let sq_mean = x_flat.sqr()?.mean_keepdim(D::Minus1)?;
-        let rsqrt = (sq_mean + self.rt.rms_norm_eps)?.recip()?.sqrt()?; // [N, 1]
-
-        // mixes = (x_flat @ fn^T) * rsqrt  →  [N, mix_hc]
         // Defensively cast weight tensors to F32 — try_load already produces F32,
         // but hand-constructed callers (tests, external integrators) may not.
         let hc_fn_f32 = hc_fn.to_dtype(DType::F32)?;
         let hc_scale_f32 = hc_scale.to_dtype(DType::F32)?;
         let hc_base_f32 = hc_base.to_dtype(DType::F32)?;
         let mixes_raw = x_flat.matmul(&hc_fn_f32.t()?)?;
-        let mixes = mixes_raw.broadcast_mul(&rsqrt)?;
 
-        // Slot indices in `mixes`:
-        //   pre  : [..,  0 .. hc)
-        //   post : [.., hc .. 2*hc)
-        //   comb : [.., 2*hc .. (2+hc)*hc)  reshape to [.., hc, hc]
-        let pre_block = mixes.narrow(D::Minus1, 0, hc)?;
-        let post_block = mixes.narrow(D::Minus1, hc, hc)?;
-        let comb_block = mixes
-            .narrow(D::Minus1, 2 * hc, hc * hc)?
-            .reshape((n, hc, hc))?;
+        // Everything from here to `comb_pre` is ONE fused kernel on CUDA. The
+        // eager chain below it is 18 launches — a 7-launch hand-decomposed RMS
+        // statistic (`sqr -> fast_sum -> affine -> affine -> recip -> sqrt ->
+        // bmul`) plus 11 for the three scoring blocks — all on 24 floats once
+        // the reduction is done, twice per layer, 43 layers. At b=1 that is
+        // ~1,460 of the decode step's measured 7,494 kernel launches, i.e. pure
+        // launch overhead. `cuda/hc_fused.cu` is bit-identical to this chain by
+        // construction, not by tolerance; the eager path stays reachable via
+        // `ARC_HC_FUSED=0` so the two can be A/B'd from one binary — and they
+        // were: flipping it moves 1,803 launches/step and 8.04 ms/token while
+        // leaving 6 greedy completions and their 768 logprobs bit-identical.
+        let on_cuda = crate::cuda::hc_fused::usable(&x_flat);
+        let shapes_ok = x_flat.is_contiguous()
+            && mixes_raw.is_contiguous()
+            && hc_scale_f32.is_contiguous()
+            && hc_base_f32.is_contiguous()
+            && hc_base_f32.dims1().map(|v| v == (2 + hc) * hc).unwrap_or(false)
+            && hc_scale_f32.dims1().map(|v| v == 3).unwrap_or(false);
+        if on_cuda && !shapes_ok {
+            // Falling back on CUDA is a silent 18-launch regression that looks
+            // exactly like "the fusion didn't help". Say so once rather than
+            // letting a layout change quietly undo the optimisation.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    "V4 mHC: fused hc_pre kernel unusable (x_flat contig={}, mixes contig={}, \
+                     scale contig={} dims={:?}, base contig={} dims={:?}) — falling back to the \
+                     18-launch eager chain.",
+                    x_flat.is_contiguous(),
+                    mixes_raw.is_contiguous(),
+                    hc_scale_f32.is_contiguous(),
+                    hc_scale_f32.dims(),
+                    hc_base_f32.is_contiguous(),
+                    hc_base_f32.dims(),
+                );
+            });
+        }
+        let fused = on_cuda && shapes_ok;
 
-        // hc_scale is [3]; hc_base is [mix_hc] split into three blocks.
-        let s_pre = hc_scale_f32.narrow(0, 0, 1)?;
-        let s_post = hc_scale_f32.narrow(0, 1, 1)?;
-        let s_comb = hc_scale_f32.narrow(0, 2, 1)?;
-        let b_pre = hc_base_f32.narrow(0, 0, hc)?;
-        let b_post = hc_base_f32.narrow(0, hc, hc)?;
-        let b_comb = hc_base_f32.narrow(0, 2 * hc, hc * hc)?.reshape((hc, hc))?;
+        let (pre, post, comb_pre) = if fused {
+            crate::cuda::hc_fused::hc_pre_fused_cuda(
+                &x_flat,
+                &mixes_raw,
+                &hc_scale_f32,
+                &hc_base_f32,
+                hc,
+                self.rt.rms_norm_eps,
+                self.rt.hc_eps,
+            )?
+        } else {
+            // rsqrt(mean(x^2) + eps)
+            let sq_mean = x_flat.sqr()?.mean_keepdim(D::Minus1)?;
+            let rsqrt = (sq_mean + self.rt.rms_norm_eps)?.recip()?.sqrt()?; // [N, 1]
 
-        // pre  = sigmoid(pre_block  * s_pre  + b_pre) + eps
-        let pre = candle_nn::ops::sigmoid(
-            &(pre_block.broadcast_mul(&s_pre)?.broadcast_add(&b_pre)?),
-        )?;
-        let pre = (pre + self.rt.hc_eps)?;
+            // mixes = (x_flat @ fn^T) * rsqrt  →  [N, mix_hc]
+            let mixes = mixes_raw.broadcast_mul(&rsqrt)?;
 
-        // post = 2 * sigmoid(post_block * s_post + b_post)
-        // NOTE: use affine() for the scalar *2 rather than a device-scalar
-        // Tensor::new(2f32, device) — the latter is a per-call CPU->GPU sync
-        // (CLAUDE.md pitfall #5) that breaks CUDA-graph capture of the decode
-        // forward. affine folds the constant into the kernel, no allocation.
-        let post_sig = candle_nn::ops::sigmoid(
-            &(post_block.broadcast_mul(&s_post)?.broadcast_add(&b_post)?),
-        )?;
-        let post = post_sig.affine(2.0, 0.0)?;
+            // Slot indices in `mixes`:
+            //   pre  : [..,  0 .. hc)
+            //   post : [.., hc .. 2*hc)
+            //   comb : [.., 2*hc .. (2+hc)*hc)  reshape to [.., hc, hc]
+            let pre_block = mixes.narrow(D::Minus1, 0, hc)?;
+            let post_block = mixes.narrow(D::Minus1, hc, hc)?;
+            let comb_block = mixes
+                .narrow(D::Minus1, 2 * hc, hc * hc)?
+                .reshape((n, hc, hc))?;
+
+            // hc_scale is [3]; hc_base is [mix_hc] split into three blocks.
+            let s_pre = hc_scale_f32.narrow(0, 0, 1)?;
+            let s_post = hc_scale_f32.narrow(0, 1, 1)?;
+            let s_comb = hc_scale_f32.narrow(0, 2, 1)?;
+            let b_pre = hc_base_f32.narrow(0, 0, hc)?;
+            let b_post = hc_base_f32.narrow(0, hc, hc)?;
+            let b_comb = hc_base_f32.narrow(0, 2 * hc, hc * hc)?.reshape((hc, hc))?;
+
+            // pre  = sigmoid(pre_block  * s_pre  + b_pre) + eps
+            let pre = candle_nn::ops::sigmoid(
+                &(pre_block.broadcast_mul(&s_pre)?.broadcast_add(&b_pre)?),
+            )?;
+            let pre = (pre + self.rt.hc_eps)?;
+
+            // post = 2 * sigmoid(post_block * s_post + b_post)
+            // NOTE: use affine() for the scalar *2 rather than a device-scalar
+            // Tensor::new(2f32, device) — the latter is a per-call CPU->GPU sync
+            // (CLAUDE.md pitfall #5) that breaks CUDA-graph capture of the decode
+            // forward. affine folds the constant into the kernel, no allocation.
+            let post_sig = candle_nn::ops::sigmoid(
+                &(post_block.broadcast_mul(&s_post)?.broadcast_add(&b_post)?),
+            )?;
+            let post = post_sig.affine(2.0, 0.0)?;
+
+            let comb_pre = comb_block
+                .broadcast_mul(&s_comb)?
+                .broadcast_add(&b_comb)?; // [N, hc, hc]
+            (pre, post, comb_pre)
+        };
 
         // comb = sinkhorn_normalize(comb_block * s_comb + b_comb)
-        let comb_pre = comb_block
-            .broadcast_mul(&s_comb)?
-            .broadcast_add(&b_comb)?; // [N, hc, hc]
         let comb = sinkhorn_normalize(&comb_pre, self.rt.hc_sinkhorn_iters, self.rt.hc_eps)?;
 
         // y = sum_i pre[..., i, None] * x[..., i, :]  →  [N, hidden]
@@ -338,8 +392,36 @@ impl V4MHCLayerParams {
         // a contiguous tensor is metadata-only: no kernel, no allocation. The
         // values are bit-identical — BF16->F32 is an exact widening.
         let x_f32 = x_flat.reshape((n, hc, h))?; // [N, hc, h], F32
-        let pre_b = pre.unsqueeze(D::Minus1)?; // [N, hc, 1]
-        let y = pre_b.broadcast_mul(&x_f32)?.sum(1)?; // [N, hidden]
+
+        // The eager spelling of the tail is THREE launches — a broadcast_mul
+        // over [N, hc, hidden], a `sum(1)` over the 4-element hc axis, and the
+        // narrowing cast — to compute a 4-term weighted average. Fused into one
+        // kernel that replays candle's `fast_sum` pairwise tree exactly; see
+        // `hc_y_combine_kernel` in cuda/hc_fused.cu for the order it replays and
+        // why it is not the sequential sum.
+        let eager_y = || -> Result<Tensor> {
+            let pre_b = pre.unsqueeze(D::Minus1)?; // [N, hc, 1]
+            pre_b
+                .broadcast_mul(&x_f32)?
+                .sum(1)? // [N, hidden] F32
+                .to_dtype(in_dtype)
+        };
+        // `fused` alone is not enough: the tail also has to NARROW to the model
+        // dtype, and only F32/BF16 rounding has been transcribed. An unlisted
+        // dtype takes the eager path rather than erroring or, worse, rounding
+        // differently.
+        let tail_fused = fused
+            && crate::cuda::hc_fused::fuse2_enabled()
+            && matches!(in_dtype, DType::F32 | DType::BF16);
+        let y_nd = if tail_fused {
+            let out = crate::cuda::hc_fused::hc_y_combine_cuda(&x_f32, &pre, in_dtype)?;
+            if crate::cuda::hc_fused::ab_enabled() {
+                crate::cuda::hc_fused::ab_check("hc_pre.y", &out, &eager_y()?)?;
+            }
+            out
+        } else {
+            eager_y()?
+        };
 
         // Restore leading dims.
         let mut y_shape = leading_dims.clone();
@@ -350,9 +432,10 @@ impl V4MHCLayerParams {
         comb_shape.push(hc);
         comb_shape.push(hc);
 
-        // `y` feeds layernorm + attention/MLP, so it goes back to the model
-        // dtype. `post` / `comb` stay F32 — see the dtype contract above.
-        let y_out = y.reshape(y_shape)?.to_dtype(in_dtype)?;
+        // `y` is already in the model dtype (both paths narrow it), so this
+        // reshape is metadata-only. `post` / `comb` stay F32 — see the dtype
+        // contract above.
+        let y_out = y_nd.reshape(y_shape)?;
         let post_out = post.reshape(post_shape)?;
         let comb_out = comb.reshape(comb_shape)?;
         Ok((y_out, post_out, comb_out))
@@ -371,6 +454,13 @@ impl V4MHCLayerParams {
     /// `post` / `comb` arrive in F32 from [`hc_pre`]; the `to_dtype` calls
     /// below are retained only for hand-constructed callers and short-circuit
     /// to a clone (no kernel) on the production path.
+    ///
+    /// On CUDA the whole body is ONE kernel (`hc_post_fused`), which is
+    /// bit-identical to the eager chain kept below it — verified on live decode
+    /// data, not argued: `ARC_HC_AB=1` compared 4,000 tensors with zero
+    /// mismatching bits, and the same comparison flags all 4,000 when
+    /// `ARC_HC_AB_POISON=1` perturbs one element by a single ULP. Opt out with
+    /// `ARC_HC_FUSE2=0`.
     ///
     /// Returns the new residual stack with the same shape *and dtype* as `x`
     /// (the branch output), i.e. the model dtype.
@@ -395,31 +485,58 @@ impl V4MHCLayerParams {
             ),
         };
 
-        let x_n = x.reshape((n, h))?.to_dtype(DType::F32)?;
-        let residual_n = residual
-            .reshape((n, hc, h))?
-            .to_dtype(DType::F32)?;
-        let post_n = post.reshape((n, hc))?.to_dtype(DType::F32)?;
-        let comb_n = comb.reshape((n, hc, hc))?.to_dtype(DType::F32)?;
+        let x_2d = x.reshape((n, h))?.contiguous()?;
+        let residual_3d = residual.reshape((n, hc, h))?.contiguous()?;
+        let post_2d = post.reshape((n, hc))?.to_dtype(DType::F32)?.contiguous()?;
+        let comb_3d = comb
+            .reshape((n, hc, hc))?
+            .to_dtype(DType::F32)?
+            .contiguous()?;
 
-        // term1 = post[..., :, None] * x[..., None, :]   →  [N, hc, h]
-        let term1 = post_n
-            .unsqueeze(D::Minus1)? // [N, hc, 1]
-            .broadcast_mul(&x_n.unsqueeze(1)?)?; // [N, hc, h]
+        // The eager spelling is SIX launches — two promoting casts, a
+        // broadcast_mul, a transpose that candle services with a real copy, the
+        // [hc,hc]x[hc,h] matmul, the add, and the narrowing cast — for four
+        // multiply-adds per output element. At b=1 that is 516 of the decode
+        // step's launches across the 86 mixing points.
+        //
+        // The fused kernel is bit-identical by construction: BF16->F32 widening
+        // is exact, the K=hc accumulation is the same sequential FMA a K=4 GEMM
+        // performs, and the narrowing uses candle's own `__float2bfloat16`.
+        // `ARC_HC_AB=1` checks that claim against this very chain on live data.
+        let eager = || -> Result<Tensor> {
+            let x_n = x_2d.to_dtype(DType::F32)?;
+            let residual_n = residual_3d.to_dtype(DType::F32)?;
+            // term1 = post[..., :, None] * x[..., None, :]   →  [N, hc, h]
+            let term1 = post_2d
+                .unsqueeze(D::Minus1)? // [N, hc, 1]
+                .broadcast_mul(&x_n.unsqueeze(1)?)?; // [N, hc, h]
+            // term2 = sum_j comb[..., j, k] * residual[..., j, :]
+            //         = einsum("njk,njh->nkh", comb, residual)
+            let term2 = comb_3d.transpose(1, 2)?.matmul(&residual_n)?; // [N, hc, h]
+            (term1 + term2)?.to_dtype(in_dtype)
+        };
 
-        // term2 = sum_j comb[..., j, k] * residual[..., j, :]
-        //         = einsum("njk,njh->nkh", comb, residual)
-        // Implementation: for each k, term2[n, k, h] = sum_j comb[n, j, k] * residual[n, j, h]
-        // Use matmul: comb.transpose(1,2) @ residual  →  [N, hc, h]
-        let term2 = comb_n.transpose(1, 2)?.matmul(&residual_n)?; // [N, hc, h]
+        let fused = crate::cuda::hc_fused::fuse2_enabled()
+            && crate::cuda::hc_fused::usable_model_dtype(&x_2d)
+            && x_2d.dtype() == residual_3d.dtype()
+            && crate::cuda::hc_fused::usable(&post_2d);
+        let out_n = if fused {
+            let out =
+                crate::cuda::hc_fused::hc_post_fused_cuda(&x_2d, &residual_3d, &post_2d, &comb_3d)?;
+            if crate::cuda::hc_fused::ab_enabled() {
+                crate::cuda::hc_fused::ab_check("hc_post", &out, &eager()?)?;
+            }
+            out
+        } else {
+            eager()?
+        };
 
-        let out_n = (term1 + term2)?;
-
-        // Restore shape.
+        // Restore shape. `out_n` is already in the model dtype on both paths, so
+        // this is metadata-only.
         let mut out_shape = leading_dims;
         out_shape.push(hc);
         out_shape.push(h);
-        out_n.reshape(out_shape)?.to_dtype(in_dtype)
+        out_n.reshape(out_shape)
     }
 
     /// Spec convenience wrapper: full attn-side round-trip for one decoder layer.

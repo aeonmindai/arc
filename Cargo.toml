@@ -49,11 +49,11 @@ rust-version = "1.88"
 # pointer has broken CI on this repo before — a path/branch dependency that
 # advances under a merged PR turns a green build into a red one with no commit
 # here to blame.
-candle-core = { git = "https://github.com/aeonmindai/candle.git", rev = "88d86a2019ee552923b217284e89847d2785dcdf" }
-candle-nn = { git = "https://github.com/aeonmindai/candle.git", rev = "88d86a2019ee552923b217284e89847d2785dcdf" }
-candle-flash-attn-v3 = { git = "https://github.com/aeonmindai/candle.git", rev = "88d86a2019ee552923b217284e89847d2785dcdf" }
-candle-flash-attn = { git = "https://github.com/aeonmindai/candle.git", rev = "88d86a2019ee552923b217284e89847d2785dcdf" }
-candle-metal-kernels = { git = "https://github.com/aeonmindai/candle.git", rev = "88d86a2019ee552923b217284e89847d2785dcdf" }
+candle-core = { git = "https://github.com/aeonmindai/candle.git", rev = "89ab14ef1216331a782539f533b99f6816708604" }
+candle-nn = { git = "https://github.com/aeonmindai/candle.git", rev = "89ab14ef1216331a782539f533b99f6816708604" }
+candle-flash-attn-v3 = { git = "https://github.com/aeonmindai/candle.git", rev = "89ab14ef1216331a782539f533b99f6816708604" }
+candle-flash-attn = { git = "https://github.com/aeonmindai/candle.git", rev = "89ab14ef1216331a782539f533b99f6816708604" }
+candle-metal-kernels = { git = "https://github.com/aeonmindai/candle.git", rev = "89ab14ef1216331a782539f533b99f6816708604" }
 
 axum = "0.8.8"
 anyhow = "1.0.100"

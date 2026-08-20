@@ -10,15 +10,15 @@ fn main() {
         println!("cargo:rerun-if-changed=build.rs");
         let build_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
-        // sinkhorn.cu is EXCLUDED from this fast-math builder and compiled
-        // separately below: it must be bit-identical to candle-kernels (which
-        // build with plain -O3, no fast math), and --use_fast_math rewrites
-        // expf -> __expf and IEEE division -> approximate reciprocals. The
-        // kernel source carries an `#error` guard against being re-globbed
-        // under fast math. See mistralrs-core/src/cuda/sinkhorn.cu.
+        // sinkhorn.cu, hc_fused.cu and qk_norm_rope.cu are EXCLUDED from this fast-math builder
+        // and compiled separately below: they must be bit-identical to
+        // candle-kernels (which build with plain -O3, no fast math), and
+        // --use_fast_math rewrites expf -> __expf and IEEE division ->
+        // approximate reciprocals. Both sources carry an `#error` guard against
+        // being re-globbed under fast math. See mistralrs-core/src/cuda/.
         let mut builder = cudaforge::KernelBuilder::new()
             .source_glob("src/cuda/*.cu")
-            .exclude(&["sinkhorn.cu"])
+            .exclude(&["sinkhorn.cu", "hc_fused.cu", "qk_norm_rope.cu"])
             .out_dir(&build_dir)
             .arg("-std=c++17")
             .arg("-O3")
@@ -63,14 +63,15 @@ fn main() {
         println!("cargo:rustc-link-search={}", build_dir.display());
         println!("cargo:rustc-link-lib=mistralrscuda");
 
-        // Dedicated IEEE (no fast math) builder for sinkhorn.cu — bit-identity
-        // with candle-kernels requires accurate expf + div.rn.f32; --fmad=false
-        // additionally forbids FMA contraction so rounding matches candle's
-        // unfused op chain exactly. Own subdirectory so its build cache never
-        // mixes with the fast-math builder's.
+        // Dedicated IEEE (no fast math) builder for the bit-identity-critical
+        // kernels — bit-identity with candle-kernels requires accurate
+        // expf/logf + div.rn.f32; --fmad=false additionally forbids FMA
+        // contraction so rounding matches candle's unfused op chain exactly.
+        // Own subdirectory so its build cache never mixes with the fast-math
+        // builder's.
         let sinkhorn_dir = build_dir.join("sinkhorn_ieee");
         let mut sinkhorn_builder = cudaforge::KernelBuilder::new()
-            .source_files(vec!["src/cuda/sinkhorn.cu"])
+            .source_files(vec!["src/cuda/sinkhorn.cu", "src/cuda/hc_fused.cu"])
             .out_dir(&sinkhorn_dir)
             .arg("-std=c++17")
             .arg("-O3")
@@ -94,6 +95,43 @@ fn main() {
             .expect("Build sinkhorn IEEE kernel failed!");
         println!("cargo:rustc-link-search={}", sinkhorn_dir.display());
         println!("cargo:rustc-link-lib=mistralrssinkhornieee");
+
+        // Third builder: qk_norm_rope.cu must be bit-identical to candle's
+        // `ropei`, and candle-kernels compiles with `-O3
+        // --expt-relaxed-constexpr -std=c++17` and the DEFAULT `-fmad=true`.
+        // Under those flags nvcc contracts one of the two products of
+        // `a*c - b*s` into an `fma.rn.bf16`, which rounds once instead of
+        // twice. Measured on an H200: with `--fmad=false` that element comes
+        // out -0.0625 and candle gives -0.064453125 (an exact tie resolved by
+        // round-half-to-even), so 306 of 4,096 RoPE outputs per layer differ.
+        // It therefore CANNOT join the IEEE builder above -- sinkhorn.cu and
+        // hc_fused.cu need `--fmad=false` to forbid contraction; this file
+        // needs contraction, because that is what it is reproducing. It stays
+        // out of the fast-math glob for the usual reason.
+        let qk_dir = build_dir.join("qk_candlematch");
+        let mut qk_builder = cudaforge::KernelBuilder::new()
+            .source_files(vec!["src/cuda/qk_norm_rope.cu"])
+            .out_dir(&qk_dir)
+            .arg("-std=c++17")
+            .arg("-O3")
+            .arg("--expt-relaxed-constexpr")
+            .arg("--verbose")
+            .arg("--compiler-options")
+            .arg("-fPIC");
+        if let Some(cuda_nvcc_flags_env) = CUDA_NVCC_FLAGS {
+            qk_builder = qk_builder.arg("--compiler-options");
+            qk_builder = qk_builder.arg(cuda_nvcc_flags_env);
+        }
+        let qk_out = if target.contains("msvc") {
+            qk_dir.join("mistralrsqkcandlematch.lib")
+        } else {
+            qk_dir.join("libmistralrsqkcandlematch.a")
+        };
+        qk_builder
+            .build_lib(qk_out)
+            .expect("Build qk_norm_rope kernel failed!");
+        println!("cargo:rustc-link-search={}", qk_dir.display());
+        println!("cargo:rustc-link-lib=mistralrsqkcandlematch");
 
         println!("cargo:rustc-link-lib=dylib=cudart");
 
