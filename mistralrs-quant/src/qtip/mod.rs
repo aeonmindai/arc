@@ -7978,7 +7978,13 @@ mod tests {
         // this class of bug appeared here; the first was a barrier guard
         // counting the word "__syncthreads" in a comment. A guard that matches
         // its own text is not a guard.)
-        let serving = SRC
+        // Normalise line endings first: on a Windows checkout `include_str!`
+        // yields CRLF, so a split pattern carrying a bare `\n` never matches
+        // and the guard dies in `expect` instead of asserting anything. Every
+        // assertion below goes through `squeeze`, which is already
+        // newline-agnostic — this split was the one place that was not.
+        let src_lf = SRC.replace("\r\n", "\n");
+        let serving = src_lf
             .split_once("#[cfg(test)]\nmod tests {")
             .map(|(before, _)| before)
             .expect("mod.rs must contain its test module");
