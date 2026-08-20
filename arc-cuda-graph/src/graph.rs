@@ -372,6 +372,14 @@ output_trusted={} verify_remaining={} verify_failed={}",
             .clone()
             .ok_or_else(|| candle_core::Error::Msg("captured graph has no output".into()))?;
         self.replays += 1;
+        // D18/D3: the replay count is the ONE number that separates a graph
+        // that serves from a graph that only records, and until now nothing
+        // printed it after capture — so every report of "replays served" was an
+        // inference. Emit it on a geometric-ish schedule: the first replay, the
+        // first ten, then every 100. Cost is a handful of lines per run.
+        if self.replays <= 10 || self.replays % 100 == 0 {
+            tracing::info!("ARCGRAPH REPLAY #{} — {}", self.replays, self.status_line());
+        }
         Ok(out)
     }
 
@@ -715,6 +723,12 @@ output_trusted={} verify_remaining={} verify_failed={}",
 #[cfg(feature = "cuda")]
 impl Drop for CudaGraphRunner {
     fn drop(&mut self) {
-        // CapturedGraph handles cleanup via its own Drop
+        // CapturedGraph handles cleanup via its own Drop.
+        //
+        // The final tally goes to stderr directly, NOT through `tracing`: a
+        // subscriber may already be torn down by the time the pipeline drops,
+        // and a status line that silently vanishes at exit is exactly the
+        // silent-success failure this line exists to prevent (D18).
+        eprintln!("ARCGRAPH FINAL {}", self.status_line());
     }
 }
