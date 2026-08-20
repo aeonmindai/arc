@@ -93,6 +93,10 @@ pub use mxfp4::MXFP4Layer;
 pub use nvfp4::NVFP4Layer;
 pub use pending_layer::PendingIsqLayer;
 pub use pertensor_fp8::PerTensorFP8Linear;
+/// The V=4 / L=12 decode family: a 32,768 B bf16 reproduction table with K as
+/// a parameter over symbol extraction. K=8 is the byte-aligned control at
+/// 2.00 bpw; K=9 (2.25 bpw) is the quality winner. See the module docs.
+pub use qtip::trellis_v4l12;
 pub use qtip::tune::{
     gemv_num_variants as qtip2b_gemv_num_variants, gemv_variant_applicable,
     gemv_variant_desc as qtip2b_gemv_variant_desc,

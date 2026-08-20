@@ -74,6 +74,7 @@ mod greedy_ban_tests;
 pub mod grouped;
 #[cfg(test)]
 mod search_bench;
+pub mod trellis_v4l12;
 pub mod tune;
 mod viterbi;
 pub use bitshift::{Qtip2bLayer, QTIP2B_MCG_MULT};
@@ -3732,11 +3733,8 @@ impl QuantMethod for QtipLayer {
                         self.in_features,
                         self.codebook,
                     )?;
-                    let mut out = out_flat.reshape((
-                        n_tokens,
-                        n_experts_per_tok,
-                        self.rows_per_expert()?,
-                    ))?;
+                    let mut out =
+                        out_flat.reshape((n_tokens, n_experts_per_tok, self.rows_per_expert()?))?;
                     if out.dtype() != a.dtype() {
                         out = out.to_dtype(a.dtype())?;
                     }
