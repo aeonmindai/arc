@@ -7,8 +7,12 @@
 //!
 //! | rung | over-cap path | what it does |
 //! |---|---|---|
-//! | LUT (`QtipLayer`, `--isq qtip2`) | `gather_forward_cuda` | D2H-syncs the router, dequantizes **every distinct expert** to BF16 in HBM, holds them all live, then one `index_select`+`matmul`+`index_add` per expert |
+//! | LUT (`QtipLayer`, `--isq qtip2`) | `lut_grouped_gemm_cuda`, else `gather_forward_cuda` | the grouped GEMM once its m-tiles amortize (§4); otherwise D2H-syncs the router, dequantizes **every distinct expert** to BF16 in HBM, holds them all live, then one `index_select`+`matmul`+`index_add` per expert |
 //! | bitshift (`Qtip2bLayer`, `--isq qtip2b`) | `grouped_gemm_2b_cuda` | sorts pairs by expert on-device and runs the persistent tensor-core tile loop — the *amortizing* kernel |
+//!
+//! **Both rungs now have a grouped GEMM, and both gate it on tile occupancy**
+//! ([`grouped_gemm_tiles_amortize`], §4) rather than on a token count — a raw
+//! count switched it on at ~9% tile fill and cost 5.7× end to end.
 //!
 //! So a single shared cap of 8 tokens was wrong for exactly one of them. The
 //! bitshift rung's cap is a genuine crossover between two good kernels. The
@@ -108,8 +112,81 @@
 //! so its cost is linear in tokens and it never realises the `E(B)`
 //! amortisation the fleet thesis needs (8B/E(B) = 4.07× at B=128). Raising the
 //! cap replaces a fallback that degrades with batch with a path that is merely
-//! *flat* per token. The amortising kernel is the grouped GEMM, and only the
-//! bitshift rung has one.
+//! *flat* per token. The amortising kernel is the grouped GEMM.
+//!
+//! # 4. When the grouped GEMM starts paying — **tile occupancy, not tokens**
+//!
+//! The grouped GEMM sorts the pairs by expert and walks
+//! `sum_e ceil(count_e / GROUPED_TILE_M)` m-tiles, staging that expert's packed
+//! bytes **once per m-tile**. Its entire advantage over the per-pair GEMV is
+//! therefore the average *tile fill*:
+//!
+//! ```text
+//! weight bytes(grouped) / weight bytes(GEMV) = 1 / fill
+//! fill = (pairs per WOKEN expert) / GROUPED_TILE_M
+//! pairs per woken expert = n*k / (E * (1 - (1 - k/E)^n))
+//! ```
+//!
+//! `n_tokens` alone does not determine fill — `top_k` and `num_experts` are in
+//! it too. At V4's `E = 256, k = 6` ([`expected_pairs_per_distinct_expert`]):
+//!
+//! ```text
+//!   n   pairs   woken experts   pairs/expert   tile fill
+//!   32    192          136.1          1.41        8.8%
+//!  128    768          243.7          3.15       19.7%
+//!  512   3072          256.0         12.00       75.0%
+//!  683   4098          256.0         16.01      100.0%
+//! 1024   6144          256.0         24.00      150.0%
+//! ```
+//!
+//! and the in-tree end-to-end A/B brackets exactly that curve: **1.00× at
+//! N=128 and N=512, 2.41× at N=1024**.
+//!
+//! Shipping the gate as a raw `n_tokens > DECODE_REGIME_MAX_TOKENS` switched
+//! the grouped kernel on at n=9 — onto a tile that is ~9% full, roughly two
+//! orders of magnitude below where it amortizes. That is indefensible on its
+//! own terms and is why the gate is now a fill.
+//!
+//! ⚠️ **What this fix is NOT, so nobody re-derives a false attribution from
+//! it.** It was filed against an apparent 5.7× end-to-end collapse — aggregate
+//! 34.19 tok/s at B=8 against 5.99 at B=32 (nsys, exclusive H200,
+//! `97a65d643`). **That attribution is retracted.** Re-measured on the same box
+//! and instrument with the gate fixed (`89ec93140`):
+//!
+//! * At B=32 the grouped kernel was never running on 32-token decode steps at
+//!   all. It was running on **1,572-token prefill chunks at 230% tile fill** —
+//!   the right side of its own boundary. The dispatch log
+//!   ([`log_grouped_gemm_engaged_once`]) says so directly.
+//! * The B=32 leg executed roughly **4–6 decode steps in an 18 s window**; the
+//!   rest was prefill, with sequences still being admitted when the leg ended.
+//!   The B=8 leg was in flat steady state. The two windows were not comparable.
+//! * B=8 is unchanged by the fix, as it must be (36.80 → 37.60 tok/s at matched
+//!   depth), and B=32 aggregate did **not** recover.
+//! * The kernel's distance from its bandwidth bound is **not** explained by
+//!   tile emptiness either: with decode routed away, its prefill-only mean rose
+//!   to 15,600 µs/call **at 230% fill**, still ~60× above bound with DRAM read
+//!   at 1.9%. That is a separate, unsolved defect.
+//!
+//! The B=32 number is V4's prefill cost (`memory/mission/BUDGET_V4_PREFILL.md`)
+//! surfacing through a harness that declares steady state on decode-cohort
+//! width alone.
+//!
+//! So the gate is [`grouped_gemm_tiles_amortize`]: **switch only once each
+//! woken expert draws at least `GROUPED_TILE_M` pairs**, i.e. once an average
+//! m-tile is full. That is the property the kernel actually needs, and it
+//! tracks `top_k`, `num_experts` and `GROUPED_TILE_M` automatically — a
+//! hardcoded token count rots the moment any of the three moves.
+//!
+//! Uniform routing is the **conservative** assumption here: a real router is
+//! skewed, which wakes *fewer* distinct experts and so fills tiles *more* than
+//! this predicts. The gate therefore errs toward switching late, never early.
+//!
+//! Note the two boundaries in this module currently coincide — the LUT rung's
+//! dequantize fallback is 16× traffic and `GROUPED_TILE_M` is 16 pairs, so both
+//! flip at `pairs per woken expert == 16` (~683 tokens at V4's routing). They
+//! are independent constants and `grouped_boundary_is_the_fused_gemv_boundary`
+//! pins the coincidence so a change to either is a loud test failure rather
+//! than a silent dispatch change.
 
 use candle_core::Result;
 
@@ -183,6 +260,77 @@ pub fn expected_distinct_experts(n_tokens: usize, top_k: usize, num_experts: usi
     let miss = 1.0 - (top_k as f64) / (num_experts as f64);
     let n = i32::try_from(n_tokens).unwrap_or(i32::MAX);
     (num_experts as f64) * (1.0 - miss.powi(n))
+}
+
+/// Expected `(token, slot)` pairs landing on each **woken** expert:
+/// `n*k / expected_distinct_experts(n, k, E)`.
+///
+/// This — not `n_tokens` — is what the grouped GEMM's m-tiles are filled from,
+/// so it is the quantity its dispatch gate is written in. Ranges from `1.0`
+/// (every pair wakes a fresh expert; every m-tile holds one useful row) up to
+/// `n*k/E` once every expert is woken.
+///
+/// Public so a benchmark can report the fill it actually measured at, instead
+/// of a token count that means nothing without `top_k` and `num_experts`.
+pub fn expected_pairs_per_distinct_expert(
+    n_tokens: usize,
+    top_k: usize,
+    num_experts: usize,
+) -> f64 {
+    let distinct = expected_distinct_experts(n_tokens, top_k, num_experts);
+    if distinct <= 0.0 {
+        return 0.0;
+    }
+    (n_tokens as f64) * (top_k as f64) / distinct
+}
+
+/// Average grouped-GEMM m-tile fill for this routing shape, in `[0, ∞)`:
+/// `expected_pairs_per_distinct_expert / GROUPED_TILE_M`. `1.0` means a
+/// typical m-tile is exactly full; `0.088` is V4 at 32 tokens.
+pub fn grouped_gemm_tile_fill(n_tokens: usize, top_k: usize, num_experts: usize) -> f64 {
+    expected_pairs_per_distinct_expert(n_tokens, top_k, num_experts)
+        / (super::grouped::GROUPED_TILE_M as f64)
+}
+
+/// **The grouped-GEMM dispatch gate.** Are its m-tiles full enough for the
+/// per-m-tile weight staging to amortize — i.e. does each woken expert draw at
+/// least `GROUPED_TILE_M` pairs?
+///
+/// See module §4 for the derivation and for the 5.7× regression that came from
+/// gating on a raw token count instead. Pure function of shapes: no device
+/// read, so it is safe inside a CUDA-graph capture.
+///
+/// Deliberately stated as a *fill* rather than a token threshold. A hardcoded
+/// number would have to be re-derived every time `top_k`, `num_experts` or
+/// `GROUPED_TILE_M` changes, and the last one that was not re-derived is the
+/// regression this replaces.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn grouped_gemm_tiles_amortize(
+    n_tokens: usize,
+    top_k: usize,
+    num_experts: usize,
+) -> bool {
+    expected_pairs_per_distinct_expert(n_tokens, top_k, num_experts)
+        >= super::grouped::GROUPED_TILE_M as f64
+}
+
+/// Smallest `n_tokens` at which [`grouped_gemm_tiles_amortize`] holds, for logs
+/// and tests. Pairs-per-woken-expert is monotone increasing in `n` (the
+/// numerator is linear, the woken-expert count saturates at `E`), so the
+/// predicate flips at most once and a scan finds it exactly.
+///
+/// Returns `None` when no token count reaches full tiles — `top_k == 0`, or a
+/// routing so wide that `E * GROUPED_TILE_M` pairs never fit inside `grid.y`.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn grouped_gemm_min_tokens(top_k: usize, num_experts: usize) -> Option<usize> {
+    if top_k == 0 || num_experts == 0 {
+        return None;
+    }
+    // Fill can only reach 1.0 once `n*k >= TILE_M * distinct`, and `distinct`
+    // is at most `num_experts`, so this bound is sufficient and the scan is at
+    // most a few thousand steps.
+    let hi = (super::grouped::GROUPED_TILE_M * num_experts).div_ceil(top_k) + 1;
+    (1..=hi).find(|&n| grouped_gemm_tiles_amortize(n, top_k, num_experts))
 }
 
 /// Largest token count the fused gather can take before `grid.y` overflows.
@@ -263,6 +411,36 @@ pub(crate) fn log_lut_gather_fallback_once(n_tokens: usize, top_k: usize, num_ex
              syncs the router to the host. Set {ONDEVICE_MOE_MAX_TOKENS_ENV} to move the \
              boundary. (warned once per process)",
             lut_fused_gather_max_tokens(top_k, num_experts),
+        );
+    });
+}
+
+/// Announce, once per process, that a rung engaged the trellis grouped GEMM —
+/// with the tile fill that decided it.
+///
+/// Which MoE kernel a run used is worth an order of magnitude of throughput and
+/// used to be invisible in the log. Both this and
+/// [`log_lut_gather_fallback_once`] exist so a results artifact can be read
+/// back to the dispatch that produced it.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn log_grouped_gemm_engaged_once(n_tokens: usize, top_k: usize, num_experts: usize) {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let fill = grouped_gemm_tile_fill(n_tokens, top_k, num_experts);
+        let boundary = grouped_gemm_min_tokens(top_k, num_experts);
+        tracing::info!(
+            "QTIP MoE: trellis grouped GEMM engaged at {n_tokens} tokens x top-{top_k} of \
+             {num_experts} experts — m-tiles {:.0}% full ({:.2} pairs per woken expert against \
+             GROUPED_TILE_M={}); the amortization boundary for this routing shape is {} tokens. \
+             (logged once per process)",
+            fill * 100.0,
+            expected_pairs_per_distinct_expert(n_tokens, top_k, num_experts),
+            super::grouped::GROUPED_TILE_M,
+            match boundary {
+                Some(n) => n.to_string(),
+                None => "unreachable".to_string(),
+            },
         );
     });
 }
@@ -436,5 +614,129 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("ctx"), "{msg}");
         assert!(msg.contains("65535"), "{msg}");
+    }
+
+    /// V4's routing (top-6 of 256) is the shape the 5.7× regression was
+    /// measured on. Pin the whole fill curve quoted in module §4 — these are
+    /// the numbers the gate is derived from, so if the formula drifts the
+    /// derivation in the docs stops being true.
+    #[test]
+    fn tile_fill_matches_the_v4_curve_in_the_module_docs() {
+        // (n_tokens, pairs per woken expert)
+        for (n, expected) in [
+            (32usize, 1.41f64),
+            (128, 3.15),
+            (512, 12.00),
+            (683, 16.01),
+            (1024, 24.00),
+        ] {
+            let got = expected_pairs_per_distinct_expert(n, 6, 256);
+            assert!(
+                (got - expected).abs() < 0.01,
+                "n={n}: pairs/woken expert {got:.4}, docs say {expected}"
+            );
+            let fill = grouped_gemm_tile_fill(n, 6, 256);
+            assert!(
+                (fill - got / 16.0).abs() < 1e-9,
+                "fill must be pairs-per-expert / GROUPED_TILE_M"
+            );
+        }
+    }
+
+    /// The regression itself, as an assertion: the grouped GEMM must NOT be
+    /// chosen at the batch widths a decode server actually runs at, and must
+    /// be chosen once tiles are full. 9 tokens is where the old raw
+    /// `n_tokens > DECODE_REGIME_MAX_TOKENS` gate flipped.
+    #[test]
+    fn grouped_gate_refuses_decode_widths_and_accepts_full_tiles() {
+        for n in [9usize, 16, 32, 64, 128, 256, 512] {
+            assert!(
+                !grouped_gemm_tiles_amortize(n, 6, 256),
+                "n={n}: tiles are {:.1}% full, the grouped GEMM must not be selected",
+                grouped_gemm_tile_fill(n, 6, 256) * 100.0
+            );
+        }
+        for n in [683usize, 1024, 4096] {
+            assert!(
+                grouped_gemm_tiles_amortize(n, 6, 256),
+                "n={n}: tiles are {:.1}% full, the grouped GEMM should be selected",
+                grouped_gemm_tile_fill(n, 6, 256) * 100.0
+            );
+        }
+        // The gate is a fill, not a token count: the SAME token count flips
+        // the other way when the routing shape changes. This is the property a
+        // hardcoded threshold cannot have.
+        assert!(
+            grouped_gemm_tiles_amortize(32, 6, 8),
+            "32 tokens x top-6 of only 8 experts fills every tile 4x over"
+        );
+    }
+
+    /// `grouped_gemm_min_tokens` must agree with the predicate it summarises,
+    /// exactly at the boundary, for every routing shape we might serve.
+    #[test]
+    fn grouped_min_tokens_is_the_exact_flip_point() {
+        for top_k in [1usize, 2, 6, 8, 16] {
+            for num_experts in [1usize, 8, 64, 128, 256, 1024] {
+                let n = grouped_gemm_min_tokens(top_k, num_experts)
+                    .unwrap_or_else(|| panic!("top_k={top_k} E={num_experts}: no flip point"));
+                assert!(
+                    grouped_gemm_tiles_amortize(n, top_k, num_experts),
+                    "top_k={top_k} E={num_experts}: predicate false at its own boundary {n}"
+                );
+                assert!(
+                    n == 1 || !grouped_gemm_tiles_amortize(n - 1, top_k, num_experts),
+                    "top_k={top_k} E={num_experts}: predicate already true below boundary {n}"
+                );
+            }
+        }
+        assert_eq!(grouped_gemm_min_tokens(6, 256), Some(683));
+    }
+
+    /// The two boundaries in this module are set by two INDEPENDENT constants
+    /// that happen to both be 16 — `DEQUANT_TRAFFIC_RATIO` and
+    /// `GROUPED_TILE_M`. While they agree, the LUT rung hands off from the
+    /// fused GEMV straight to the grouped GEMM with no window in which the
+    /// dequantize-materialize fallback runs. If either constant moves that
+    /// window opens silently; this test makes it loud instead.
+    #[test]
+    fn grouped_boundary_is_the_fused_gemv_boundary() {
+        assert_eq!(
+            DEQUANT_TRAFFIC_RATIO as usize,
+            super::super::grouped::GROUPED_TILE_M,
+            "the two dispatch boundaries have diverged: the LUT rung now has a token range \
+             where the fused GEMV has been left but the grouped GEMM's tiles are not full, \
+             so it falls through to the dequantize-materialize path. Re-derive both."
+        );
+        for top_k in [1usize, 2, 6, 8] {
+            for num_experts in [8usize, 64, 256, 1024] {
+                let boundary = grouped_gemm_min_tokens(top_k, num_experts).unwrap();
+                // Below the boundary: fused GEMV. At and above it: grouped.
+                // Both predicates include their own equality case, so the two
+                // may overlap by exactly one token count — the dispatcher
+                // evaluates `grouped_preferred` first, so grouped wins the tie.
+                // What must NEVER happen is a token count where both are false:
+                // that is a silent fall-through to the dequantize-materialize
+                // path, which is worse than either.
+                for n in [boundary.saturating_sub(1).max(1), boundary, boundary + 1] {
+                    if n <= super::super::DECODE_REGIME_MAX_TOKENS
+                        || n.saturating_mul(top_k) > GATHER_GEMV_MAX_PAIRS
+                    {
+                        continue;
+                    }
+                    assert!(
+                        lut_fused_gather_preferred(n, top_k, num_experts)
+                            || grouped_gemm_tiles_amortize(n, top_k, num_experts),
+                        "top_k={top_k} E={num_experts} n={n}: neither the fused GEMV nor the \
+                         grouped GEMM is preferred, so dispatch falls through to the \
+                         dequantize-materialize path"
+                    );
+                }
+                assert!(
+                    grouped_gemm_tiles_amortize(boundary, top_k, num_experts),
+                    "top_k={top_k} E={num_experts}: grouped must win at its own boundary"
+                );
+            }
+        }
     }
 }

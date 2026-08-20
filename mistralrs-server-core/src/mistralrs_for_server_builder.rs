@@ -668,7 +668,22 @@ impl MistralRsForServerBuilder {
     /// `build*` bodies have already partially moved `self` by the point they
     /// reach it, and a `Copy` field read is legal there where a whole-`self`
     /// borrow is not.
+    ///
+    /// **Only `true` latches.** `v4_ragged_decode` defaults to `false`, so
+    /// every build path reaches here — and latching that `false` closed the
+    /// door on `ARC_V4_XS_PER_SEQ` before the first read could ever consult it,
+    /// making the documented "equivalent to `ARC_V4_XS_PER_SEQ=1`" false for
+    /// every caller that did not also pass the flag. (Observed directly:
+    /// `batch_can_be_ragged=false xs_per_seq_enabled=false` in a run with the
+    /// environment variable set.) Not asking for the feature is not the same as
+    /// asking for it to be off, so the default now leaves the latch alone and
+    /// the environment fallback works as documented. A caller that genuinely
+    /// wants to force it off against the environment can still call
+    /// `mistralrs_core::request_xs_per_sequence(false)` itself.
     fn apply_v4_ragged_decode(on: bool) {
+        if !on {
+            return;
+        }
         if let Err(latched) = mistralrs_core::request_xs_per_sequence(on) {
             tracing::warn!(
                 "V4 ragged decode was requested as {on} but is already latched to {latched} \

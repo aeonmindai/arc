@@ -497,8 +497,14 @@ pub struct RuntimeOptions {
     ///
     /// **Off by default.** The mechanism is covered by CPU identity tests but
     /// has never been run on a GPU; turning it on is a change to what the
-    /// engine serves, not a probe. Equivalent to `ARC_V4_XS_PER_SEQ=1`, which
-    /// remains supported.
+    /// engine serves, not a probe.
+    ///
+    /// `ARC_V4_XS_PER_SEQ=1` is equivalent and still supported — but only
+    /// because *not* passing this flag no longer latches the capability off.
+    /// It used to: the builder called `with_v4_ragged_decode(false)` on every
+    /// path, which settled the latch before the environment fallback was ever
+    /// read, so the variable was silently dead. Passing the flag is the
+    /// reliable surface.
     #[arg(long)]
     #[serde(default)]
     pub v4_ragged_decode: bool,

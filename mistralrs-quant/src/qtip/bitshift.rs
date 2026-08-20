@@ -1826,22 +1826,38 @@ impl QuantMethod for Qtip2bLayer {
                 // On-device only, propagate errors (the CPU fallback would
                 // D2H-sync under graph capture and read garbage indices).
                 //
-                // This rung KEEPS the decode-shaped boundary while the LUT rung
-                // derives a much larger one, and the asymmetry is deliberate:
-                // above the boundary this rung goes to the trellis grouped GEMM
+                // Above this boundary the rung goes to the trellis grouped GEMM
                 // below — tokens sorted by expert on-device, each expert's bytes
-                // read once per tile — which is precisely the amortizing kernel
-                // the fleet math wants. Raising this cap would replace a kernel
-                // whose cost tracks the number of DISTINCT experts with one
-                // whose cost is linear in (token, slot) pairs. The LUT rung has
-                // no grouped kernel, so its over-boundary path is a
-                // dequantize-materialize loop and the same cap was pure loss
-                // there. See `super::gather_policy`.
-                let ondevice_max_tokens = super::gather_policy::ondevice_max_tokens_override()
-                    .unwrap_or(super::DECODE_REGIME_MAX_TOKENS);
+                // read once per m-tile — which is the amortizing kernel the
+                // fleet math wants. But it only amortizes when its m-tiles are
+                // FULL: it stages a woken expert's bytes once per
+                // `GROUPED_TILE_M` pairs, so at V4's top-6-of-256 routing a
+                // 9-token step wakes ~54 experts for 54 pairs and every 16-row
+                // tile carries one useful row. The gate is therefore the tile
+                // fill, not a token count — same predicate, same reasons, as
+                // the LUT rung; see `super::gather_policy` §4 for the
+                // derivation and for the 5.7x end-to-end regression the raw
+                // token gate caused there.
+                //
+                // `DECODE_REGIME_MAX_TOKENS` survives as a FLOOR (the RUN-161
+                // capture-safety rule), and an explicit
+                // `ARC_QTIP_ONDEVICE_MOE_MAX_TOKENS` still pins the GEMV arm
+                // outright so a harness can A/B the two kernels.
+                let ondevice_preferred = match super::gather_policy::ondevice_max_tokens_override()
+                {
+                    Some(cap) => n_tokens <= cap,
+                    None => {
+                        n_tokens <= super::DECODE_REGIME_MAX_TOKENS
+                            || !super::gather_policy::grouped_gemm_tiles_amortize(
+                                n_tokens,
+                                n_experts_per_tok,
+                                self.num_experts_count(),
+                            )
+                    }
+                };
                 let ondevice_disabled = std::env::var("ARC_NO_QTIP_ONDEVICE_MOE").is_ok();
                 if !ondevice_disabled
-                    && n_tokens <= ondevice_max_tokens
+                    && ondevice_preferred
                     && n_tokens.saturating_mul(n_experts_per_tok)
                         <= super::gather_policy::GATHER_GEMV_MAX_PAIRS
                 {
@@ -1862,6 +1878,11 @@ impl QuantMethod for Qtip2bLayer {
                         .is_multiple_of(super::grouped::GROUPED_TILE_K)
                     && self.expert_bpw.as_ref().is_none_or(|t| t.is_uniform_2bit())
                 {
+                    super::gather_policy::log_grouped_gemm_engaged_once(
+                        n_tokens,
+                        n_experts_per_tok,
+                        self.num_experts_count(),
+                    );
                     let total_pairs = n_tokens * n_experts_per_tok;
                     let out_flat = self.gather_forward_batched(
                         &a.reshape((total_pairs, cols))?,

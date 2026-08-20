@@ -85,6 +85,8 @@ pub use bitshift::{Qtip2bLayer, QTIP2B_MCG_MULT};
 pub use bake_cache::{BakeCacheError, BakeKey};
 pub use gather_policy::{
     expected_distinct_experts as qtip_expected_distinct_experts,
+    expected_pairs_per_distinct_expert as qtip_expected_pairs_per_distinct_expert,
+    grouped_gemm_tile_fill as qtip_grouped_gemm_tile_fill,
     GATHER_GEMV_MAX_PAIRS as QTIP_GATHER_GEMV_MAX_PAIRS,
     ONDEVICE_MOE_MAX_TOKENS_ENV as QTIP_ONDEVICE_MOE_MAX_TOKENS_ENV,
 };
@@ -3619,20 +3621,28 @@ impl QuantMethod for QtipLayer {
                     && matches!(a.dtype(), DType::BF16 | DType::F16)
                     && self.in_features.is_multiple_of(grouped::GROUPED_TILE_K);
 
-                // Prefer the grouped GEMM over the fused gather-GEMV for every
-                // non-decode call.
+                // Prefer the grouped GEMM over the fused gather-GEMV once — and
+                // only once — its m-tiles are full enough to amortize.
                 //
-                // `lut_fused_gather_preferred`'s 16x traffic ratio answers the
-                // question "GEMV or dequantize-materialize?" — a choice between
-                // two paths that both scale with (token, slot) PAIRS. Now that a
-                // third path exists whose cost tracks DISTINCT EXPERTS, that
-                // boundary no longer describes the decision being made: measured
-                // per expert matmul on an H200, grouped beats the fused GEMV at
-                // N=128 (1.15x) and by N=512 the gap is 3.98x. Leaving the old
-                // boundary in place made the grouped kernel unreachable below
-                // ~683 tokens, which is where most prefill actually lives — the
-                // end-to-end A/B showed exactly 1.00x at N=128 and N=512 while
-                // N=1024 moved 2.41x.
+                // The grouped kernel stages each woken expert's packed bytes
+                // ONCE PER M-TILE of `GROUPED_TILE_M` pairs. Its advantage over
+                // the per-pair GEMV is exactly the average tile fill, so the
+                // gate is a fill, not a token count:
+                //
+                //     pairs per woken expert >= GROUPED_TILE_M
+                //     pairs per woken expert = n*k / (E * (1 - (1 - k/E)^n))
+                //
+                // Gating on `n_tokens > DECODE_REGIME_MAX_TOKENS` instead put
+                // the kernel to work at n=9, where V4's top-6-of-256 routing
+                // wakes ~54 experts for 54 pairs and the 16-row tile holds one
+                // useful row — ~2 orders of magnitude below where the kernel
+                // amortizes. Full tiles arrive at ~683 tokens for this routing
+                // shape.
+                //
+                // This fix does NOT explain the B=32 aggregate-throughput
+                // collapse it was filed against; that attribution is retracted
+                // and the measurement is in `gather_policy` §4. Do not re-derive
+                // it from this comment.
                 //
                 // The decode regime stays fused UNCONDITIONALLY: that is the
                 // RUN-161 floor, not a performance choice (see
@@ -3640,7 +3650,12 @@ impl QuantMethod for QtipLayer {
                 // override also still wins, so a harness can pin the GEMV arm.
                 let grouped_preferred = grouped_available
                     && n_tokens > DECODE_REGIME_MAX_TOKENS
-                    && gather_policy::ondevice_max_tokens_override().is_none();
+                    && gather_policy::ondevice_max_tokens_override().is_none()
+                    && gather_policy::grouped_gemm_tiles_amortize(
+                        n_tokens,
+                        n_experts_per_tok,
+                        num_experts,
+                    );
 
                 let use_ondevice = !grouped_preferred
                     && match gather_policy::ondevice_max_tokens_override() {
@@ -3684,6 +3699,11 @@ impl QuantMethod for QtipLayer {
                 // is the only path that handles F32 activations and shapes
                 // whose `in_features` is not a multiple of the k-chunk.
                 if grouped_available {
+                    gather_policy::log_grouped_gemm_engaged_once(
+                        n_tokens,
+                        n_experts_per_tok,
+                        num_experts,
+                    );
                     let total_pairs = n_tokens * n_experts_per_tok;
                     let a_flat = a.reshape((total_pairs, cols))?.contiguous()?;
                     let a_rotated = if self.rotation_block >= 2 {
