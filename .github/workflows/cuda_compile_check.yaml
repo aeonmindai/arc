@@ -228,10 +228,41 @@ jobs:
           echo "LD_LIBRARY_PATH=${CUDA_ROOT}/lib64/stubs:${CUDA_ROOT}/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
       - name: Install build deps
+        # An apt hang here used to run to the 6-hour job ceiling: it burned a
+        # full runner slot AND surfaced in the rollup as an ordinary red X,
+        # indistinguishable from a real compile failure. That combination cost
+        # us twice — it manufactured false FAILUREs on #175-#180 and ate the
+        # capacity needed to disprove them.
+        #
+        # Two guards, deliberately separate:
+        #   * `timeout` per command, so a hang fails FAST *and* control returns
+        #     here so the annotation below can actually run;
+        #   * `timeout-minutes` as a hard backstop for a wedge `timeout` cannot
+        #     reach (it kills the step outright, so no annotation is possible —
+        #     that is why the inner timeouts exist and are shorter).
+        #
+        # `timeout` is invoked under `sudo` so it runs as root and signals
+        # apt-get directly, rather than signalling sudo and hoping it forwards.
+        timeout-minutes: 20
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential libssl-dev pkg-config
+          set -uo pipefail
+          env_fail() {
+            echo "::error title=ENVIRONMENT FAILURE::Install build deps $1 - this is NOT a code failure. Nothing was compiled. Re-run the job."
+            {
+              echo "### ENVIRONMENT FAILURE - not a code failure"
+              echo ""
+              echo "\`Install build deps\` $1."
+              echo ""
+              echo "**Nothing was compiled**, so this run says nothing about whether the code on this branch is correct."
+              echo "Do not read it as a red build. Re-run the job; if it recurs, the apt mirror or the runner image is at fault."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 2
+          }
+          sudo timeout 8m apt-get update \
+            || env_fail "timed out or failed in \`apt-get update\`"
+          sudo timeout 10m apt-get install -y --no-install-recommends \
+            build-essential libssl-dev pkg-config \
+            || env_fail "timed out or failed in \`apt-get install\`"
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -337,10 +368,41 @@ jobs:
           echo "LD_LIBRARY_PATH=${CUDA_ROOT}/lib64/stubs:${CUDA_ROOT}/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
       - name: Install build deps
+        # An apt hang here used to run to the 6-hour job ceiling: it burned a
+        # full runner slot AND surfaced in the rollup as an ordinary red X,
+        # indistinguishable from a real compile failure. That combination cost
+        # us twice — it manufactured false FAILUREs on #175-#180 and ate the
+        # capacity needed to disprove them.
+        #
+        # Two guards, deliberately separate:
+        #   * `timeout` per command, so a hang fails FAST *and* control returns
+        #     here so the annotation below can actually run;
+        #   * `timeout-minutes` as a hard backstop for a wedge `timeout` cannot
+        #     reach (it kills the step outright, so no annotation is possible —
+        #     that is why the inner timeouts exist and are shorter).
+        #
+        # `timeout` is invoked under `sudo` so it runs as root and signals
+        # apt-get directly, rather than signalling sudo and hoping it forwards.
+        timeout-minutes: 20
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential libssl-dev pkg-config
+          set -uo pipefail
+          env_fail() {
+            echo "::error title=ENVIRONMENT FAILURE::Install build deps $1 - this is NOT a code failure. Nothing was compiled. Re-run the job."
+            {
+              echo "### ENVIRONMENT FAILURE - not a code failure"
+              echo ""
+              echo "\`Install build deps\` $1."
+              echo ""
+              echo "**Nothing was compiled**, so this run says nothing about whether the code on this branch is correct."
+              echo "Do not read it as a red build. Re-run the job; if it recurs, the apt mirror or the runner image is at fault."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 2
+          }
+          sudo timeout 8m apt-get update \
+            || env_fail "timed out or failed in \`apt-get update\`"
+          sudo timeout 10m apt-get install -y --no-install-recommends \
+            build-essential libssl-dev pkg-config \
+            || env_fail "timed out or failed in \`apt-get install\`"
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
