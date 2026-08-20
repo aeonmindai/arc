@@ -542,22 +542,46 @@ output_trusted={} verify_remaining={} verify_failed={}",
             candle_core::bail!("cuStreamEndCapture failed: {s}");
         }
 
+        // Step markers. This sequence is five driver calls with no logging
+        // between them, and it has aborted the PROCESS inside that window
+        // (`malloc_consolidate(): invalid chunk size`) on a capture that
+        // recorded with zero allocator misses. A glibc abort leaves no CUDA
+        // error to read, so without a marker per call the only thing the log
+        // establishes is "somewhere in here" — which is not a located blocker.
+        // These are `info!` on purpose: they cost one line per captured graph,
+        // and there is at most one capture per process.
+        tracing::info!("ARC capture: [1/5] cuStreamEndCapture OK, graph recorded");
+
         // Instantiate (private pool still installed). RUN-161 2b:
         // AUTO_FREE_ON_LAUNCH (=1) so a graph with memory-alloc nodes can be
         // RE-launched (replayed) -- otherwise the 2nd launch fails with
-        // INVALID_VALUE. Harmless if the graph has no alloc nodes.
+        // INVALID_VALUE.
+        //
+        // It is NOT unconditionally harmless when the graph has no alloc nodes,
+        // which is now the normal case: the capture-miss gate refuses to reach
+        // this function unless every allocation was a cache hit, so a clean
+        // capture records no memory nodes at all and the flag governs nothing
+        // that exists. `ARC_GRAPH_AUTO_FREE=0` drops it so that can be
+        // ablated against the abort above rather than assumed innocent.
         const CU_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH: u64 = 1;
-        let mut exec: CUgraphExec = std::ptr::null_mut();
-        let s = unsafe {
-            cuGraphInstantiateWithFlags(
-                &mut exec,
-                graph,
-                CU_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
-            )
+        let auto_free = !matches!(
+            std::env::var("ARC_GRAPH_AUTO_FREE").as_deref(),
+            Ok("0") | Ok("false")
+        );
+        let flags = if auto_free {
+            CU_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH
+        } else {
+            0
         };
+        let mut exec: CUgraphExec = std::ptr::null_mut();
+        let s = unsafe { cuGraphInstantiateWithFlags(&mut exec, graph, flags) };
+        tracing::info!(
+            "ARC capture: [2/5] cuGraphInstantiateWithFlags(flags={flags}) returned {s}"
+        );
         unsafe {
             cuGraphDestroy(graph);
         }
+        tracing::info!("ARC capture: [3/5] cuGraphDestroy OK");
         if s != CUDA_SUCCESS {
             self.drain_alloc_cache();
             unsafe {
@@ -571,6 +595,7 @@ output_trusted={} verify_remaining={} verify_failed={}",
         // First launch (private pool still installed -> graph memory is
         // allocated/backed here at the capture-time addresses).
         let s = unsafe { cuGraphLaunch(exec, self.stream) };
+        tracing::info!("ARC capture: [4/5] first cuGraphLaunch returned {s}");
         if s != CUDA_SUCCESS {
             self.drain_alloc_cache();
             unsafe {
@@ -586,6 +611,7 @@ output_trusted={} verify_remaining={} verify_failed={}",
         // the CUDA context and the process dies later with no diagnostic.
         // cudaError: 700 = illegalAddress, 719 = launchFailure, 1 = invalidValue.
         let sync = unsafe { cudaStreamSynchronize(self.stream) };
+        tracing::info!("ARC capture: [5/5] first-launch cudaStreamSynchronize returned {sync}");
         // RUN-161 diagnostic: measure the TRUE clean graph replay latency here,
         // while the captured input tensors are still alive (no stale-input
         // fault). 10 back-to-back launch+sync, report the best. Compare to the
