@@ -100,7 +100,7 @@ try:
     else:
         clen=0; fin="NO_CHOICES"
 except Exception as e:
-    fin="UNPARSEABLE:%s"%type(e).__name__
+    fin="UNPARSABLE:%s"%type(e).__name__
 print("%s\tnostream\t%s\t%d\t%d\t%s\t%.3f"%(seq,http,tok,clen,fin,float(t1)-float(t0)))
 PY
 }
@@ -133,7 +133,7 @@ try:
             if t: deltas+=1; clen+=len(t)
             if c.get("finish_reason"): fin=str(c["finish_reason"])
 except Exception as e:
-    fin="UNPARSEABLE:%s"%type(e).__name__
+    fin="UNPARSABLE:%s"%type(e).__name__
 if not saw_done and fin=="NONE": fin="NO_DONE"
 # deltas is the stream's own token counter; clen is what the client received
 print("%s\tstream\t%s\t%d\t%d\t%s\t%.3f"%(seq,http,deltas,clen,fin,float(t1)-float(t0)))
