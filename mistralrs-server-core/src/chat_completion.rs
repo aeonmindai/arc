@@ -36,7 +36,7 @@ use crate::{
     },
     streaming::{
         base_create_streamer, get_keep_alive_interval, sse_error_event, sse_error_kind,
-        BaseStreamer, DoneState,
+        sse_stream_truncated_event, BaseStreamer, DoneState,
     },
     types::{ExtractedMistralRsState, OnChunkCallback, OnDoneCallback, SharedMistralRsState},
     util::{parse_audio_url, parse_image_url, sanitize_error_message, validate_model_name},
@@ -170,7 +170,16 @@ impl futures::Stream for ChatCompletionStreamer {
                 Response::Raw { .. } => unreachable!(),
                 Response::Embeddings { .. } => unreachable!(),
             },
-            Poll::Ready(None) => Poll::Ready(None),
+            // The channel closed while still Running — i.e. before any chunk
+            // carried a finish_reason. A terminal chunk would have moved the
+            // state machine to SendingDone and been handled above, so reaching
+            // here is always abnormal. Returning `None` made it an HTTP 200
+            // with no error and, on the paths that drop a sequence before it
+            // ever runs, no content: a zero-token success.
+            Poll::Ready(None) => {
+                self.done_state = DoneState::SendingDone;
+                Poll::Ready(Some(Ok(sse_stream_truncated_event())))
+            }
             Poll::Pending => Poll::Pending,
         }
     }
