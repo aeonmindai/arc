@@ -1620,6 +1620,47 @@ impl DeepSeekV2RotaryEmbedding {
         &self.sin
     }
 
+    /// The `[T, rope_dim/2]` cos/sin rows for this step, taken by **device
+    /// gather** when a CUDA graph is being captured or replayed and by host
+    /// `narrow` otherwise.
+    ///
+    /// # Why this exists (RUN-161)
+    ///
+    /// `narrow(0, seqlen_offsets[0], seq_len)` resolves the offset on the HOST.
+    /// Under `cuStreamBeginCapture` that offset is folded into the recorded
+    /// kernel's arguments — a base pointer plus a literal byte displacement —
+    /// so the graph rotates at *the position capture happened to see* on every
+    /// subsequent replay. Nothing errors; the tokens are simply rotated to the
+    /// wrong position, which measured as `max|Δ| ≈ 30` against the eager
+    /// forward and latched the correctness gate off, so every step silently
+    /// fell back to eager and capture-on equalled capture-off.
+    ///
+    /// `index_select` against [`graph_mode_positions`] reads the index from
+    /// DEVICE memory at a stable address, so a replay that mutates the position
+    /// buffer in place (see [`set_graph_mode_positions_in_place`]) rotates at
+    /// *this* step's position without recapture. The two paths are numerically
+    /// identical — `index_select` of `[p]` is `narrow(0, p, 1)` — so this is a
+    /// change of *when* the offset is resolved, not of what is computed.
+    ///
+    /// Decode-only: graph mode is `seq_len == 1` by construction, and prefill
+    /// (whose offsets are a contiguous run) is never captured.
+    fn cos_sin_for(&self, seqlen_offsets: &[usize], seq_len: usize) -> Result<(Tensor, Tensor)> {
+        #[cfg(feature = "cuda")]
+        if seq_len == 1 {
+            if let Some(positions) = graph_mode_positions() {
+                let positions = positions.to_dtype(DType::U32)?;
+                return Ok((
+                    self.cos.index_select(&positions, 0)?,
+                    self.sin.index_select(&positions, 0)?,
+                ));
+            }
+        }
+        Ok((
+            self.cos.narrow(0, seqlen_offsets[0], seq_len)?,
+            self.sin.narrow(0, seqlen_offsets[0], seq_len)?,
+        ))
+    }
+
     pub fn forward(
         &self,
         q: &Tensor,
@@ -1629,8 +1670,7 @@ impl DeepSeekV2RotaryEmbedding {
         let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
 
         if seqlen_offsets.len() == 1 {
-            let cos = self.cos.narrow(0, seqlen_offsets[0], seq_len)?;
-            let sin = self.sin.narrow(0, seqlen_offsets[0], seq_len)?;
+            let (cos, sin) = self.cos_sin_for(seqlen_offsets, seq_len)?;
             let q_embed = candle_nn::rotary_emb::rope_i(&q.contiguous()?, &cos, &sin)?;
             let k_embed = candle_nn::rotary_emb::rope_i(&k.contiguous()?, &cos, &sin)?;
             Ok((q_embed, k_embed))
@@ -1672,8 +1712,11 @@ impl DeepSeekV2RotaryEmbedding {
         let nope = head_dim - rope_dim;
         let x_nope = x.narrow(3, 0, nope)?;
         let rotated = if seqlen_offsets.len() == 1 {
-            let cos = self.cos.narrow(0, seqlen_offsets[0], seq_len)?;
-            let sin = self.sin.narrow(0, seqlen_offsets[0], seq_len)?.neg()?;
+            // Same host-offset trap as `forward`: under capture this `narrow`
+            // would freeze the de-rotation at the capture step's position while
+            // `forward` rotated at the replay's. See `cos_sin_for`.
+            let (cos, sin) = self.cos_sin_for(seqlen_offsets, seq_len)?;
+            let sin = sin.neg()?;
             let x_pe = x.narrow(3, nope, rope_dim)?.contiguous()?;
             candle_nn::rotary_emb::rope_i(&x_pe, &cos, &sin)?
         } else {
@@ -2266,6 +2309,126 @@ impl Module for QLinear {
     }
 }
 
+// Cached strided-position tables for the V4 compressor, one per
+// `(ratio, device)`. Keyed that way because V4 mixes compression ratios across
+// layers (CSA and HCA); a single-slot cache would thrash and reintroduce a host
+// copy on every layer. See `compress_positions` for the rationale.
+std::thread_local! {
+    static COMPRESS_POSITIONS: std::cell::RefCell<Vec<(usize, Tensor)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Round a needed length up so the table is (re)built rarely — and therefore
+/// during warmup rather than during capture.
+const COMPRESS_POS_CHUNK: usize = 1024;
+
+/// `[t_c]` U32 tensor holding `[0, ratio, 2*ratio, …, (t_c-1)*ratio]`, served
+/// as a zero-copy view into a cached device table.
+///
+/// # Why this is not a `Tensor::arange`: that is a graph-capture HAZARD
+///
+/// `Tensor::arange` (and `from_vec`/`new`/`from_slice`) builds its data as a
+/// transient host `Vec` and uploads it through `CudaDevice::clone_htod`, which
+/// issues an **async** `cuMemcpyHtoDAsync` and returns. Outside capture that is
+/// merely a host round trip. **Inside `cuStreamBeginCapture` it is a
+/// correctness bug**: the copy is not executed, it is *recorded* — the graph
+/// stores the HOST POINTER and re-reads it on the first launch and on every
+/// replay. The `Vec` is freed as soon as the expression returns, so the graph
+/// copies freed host memory into the tensor.
+///
+/// That is exactly how V4 decode capture died: `compressed_kv_from_rows` built
+/// its strided positions with `arange`, and the first `cuGraphLaunch` filled
+/// them with garbage, so the very next op —
+/// `self.cos.index_select(&positions, 0)` in
+/// `DeepSeekV2RotaryEmbedding::forward_at_positions` — tripped candle's
+/// device-side bounds assert (`ids[id_i] < src_dim_size`, `T = __nv_bfloat16`
+/// for the bf16 cos table, `I = unsigned int` for the U32 positions) and the
+/// process took SIGSEGV. candle already documents this failure mode for kernel
+/// dims/strides and works around it in `CudaDevice::htod_info` by leaking the
+/// host source while capturing; nothing protects `clone_htod`, which is what
+/// `arange` uses.
+///
+/// The table is a pure function of `(ratio, capacity)` and its values never
+/// change, so it is built **once, outside capture** (warmup steps run long
+/// before `begin_capture`) and every decode step then takes a `narrow` view of
+/// it. No host memory is touched inside the captured region, and the base
+/// device address is stable across replays.
+pub fn compress_positions(t_c: usize, ratio: usize, device: &Device) -> Result<Tensor> {
+    if ratio == 0 {
+        candle_core::bail!("compress_positions: ratio must be non-zero");
+    }
+    COMPRESS_POSITIONS.with(|c| {
+        let mut cache = c.borrow_mut();
+        let hit = cache.iter().position(|(r, t)| {
+            *r == ratio && t.device().same_device(device) && t.dim(0).unwrap_or(0) >= t_c
+        });
+        let idx = match hit {
+            Some(i) => i,
+            None => {
+                // Drop any smaller/stale table for this (ratio, device) so the
+                // cache cannot grow without bound.
+                cache.retain(|(r, t)| !(*r == ratio && t.device().same_device(device)));
+                let cap = t_c.div_ceil(COMPRESS_POS_CHUNK) * COMPRESS_POS_CHUNK;
+                // The one `arange` — deliberately here and not in the forward.
+                let table = Tensor::arange_step(
+                    0u32,
+                    (cap * ratio) as u32,
+                    ratio as u32,
+                    device,
+                )?;
+                cache.push((ratio, table));
+                cache.len() - 1
+            }
+        };
+        cache[idx].1.narrow(0, 0, t_c)
+    })
+}
+
+// Cached `[0.0, 1.0, 2.0, …]` F32 ramps, one per device. Serves every absolute
+// position vector the V4 attention masks need. See `positions_f32`.
+std::thread_local! {
+    static IOTA_F32: std::cell::RefCell<Vec<Tensor>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Smallest ramp worth allocating: 32 KB of F32. Large enough that a typical
+/// run allocates once, at warmup, and never again — which is the point, since a
+/// rebuild *during* capture is the bug this exists to avoid.
+const IOTA_MIN_LEN: usize = 8192;
+
+/// `[len]` F32 tensor holding `[start, start+1, …, start+len-1]`, served as a
+/// view into a cached device ramp.
+///
+/// Replaces `Tensor::arange(start, start+len, dev)?.to_dtype(F32)` on the V4
+/// attention mask path. `arange` is a host→device copy, and inside CUDA-graph
+/// capture it is worse than slow: the recorded `cuMemcpyHtoDAsync` keeps the
+/// HOST pointer of a `Vec` that is freed the moment the expression returns, so
+/// every launch and replay fills the tensor from freed memory. See
+/// [`compress_positions`] for the full mechanism and the crash it produced.
+///
+/// The ramp grows by powers of two so rebuilds are rare and land during warmup.
+pub fn positions_f32(start: usize, len: usize, device: &Device) -> Result<Tensor> {
+    let end = start + len;
+    IOTA_F32.with(|c| {
+        let mut cache = c.borrow_mut();
+        let hit = cache
+            .iter()
+            .position(|t| t.device().same_device(device) && t.dim(0).unwrap_or(0) >= end);
+        let idx = match hit {
+            Some(i) => i,
+            None => {
+                cache.retain(|t| !t.device().same_device(device));
+                let cap = end.max(IOTA_MIN_LEN).next_power_of_two();
+                // The one `arange` — deliberately here and not in the forward.
+                let ramp = Tensor::arange(0u32, cap as u32, device)?.to_dtype(DType::F32)?;
+                cache.push(ramp);
+                cache.len() - 1
+            }
+        };
+        cache[idx].narrow(0, start, len)
+    })
+}
+
 /// Thread-local GPU positions tensor for CUDA graph mode.
 /// When set, `RotaryEmbedding::forward()` uses GPU-side gather instead of
 /// CPU-side `narrow()`, making the forward pass graph-capture compatible.
@@ -2504,6 +2667,68 @@ pub fn graph_mode_length_mask(positions: &Tensor, capacity: usize, dtype: DType)
     valid
         .where_cond(&zeros, &neg_inf)?
         .reshape((b, 1, 1, capacity))
+}
+
+/// `positions mod capacity` — the RING slot a graph-mode decode writes its new
+/// K/V row into — computed entirely on the device.
+///
+/// # Why the graph KV buffer has to be a ring (RUN-161)
+///
+/// The graph decode arm reads a constant `capacity`-wide window (slots
+/// `0..capacity`) so the launch geometry never moves, but it used to *write* at
+/// the ABSOLUTE position. Those agree only while `position < capacity`: from
+/// token `capacity` onward the new row was written past the end of the window
+/// that is read, so the freshest key was invisible to attention and a stale row
+/// was attended in its place. The arm was therefore correct only below
+/// `sliding_window`.
+///
+/// A ring of exactly `capacity` slots is the natural fix, because `capacity`
+/// **is** `sliding_window`: the raw branch attends precisely the last
+/// `sliding_window` tokens, so a full ring holds exactly the right key set and
+/// never holds a key that should have been evicted.
+///
+/// ## Why permuting the keys is safe
+///
+/// A ring stores keys out of order. That is invariant for this attention:
+///  * softmax over keys is permutation-invariant, and K and V are written to
+///    the SAME slot, so key `i` stays paired with value `i`;
+///  * V4 rotates K *before* caching, so every stored row already carries its
+///    own absolute RoPE — no consumer re-derives a position from column index;
+///  * the validity mask stays [`graph_mode_length_mask`]'s `slot <= position`,
+///    which is already exactly right for a ring: while the ring is filling
+///    (`position < capacity`) slot `s` is written iff `s <= position`, and once
+///    it is full every slot is valid and the predicate is universally true.
+///
+/// ## Why this is not just `position % capacity` on the host
+///
+/// The host knows the position, but a host-resolved slot becomes a literal in
+/// the recorded kernel's arguments and every replay would then write to the
+/// capture step's slot — the same defect that made host-resolved RoPE offsets
+/// wrong (see `DeepSeekV2RotaryEmbedding::cos_sin_for`). Only `capacity` is
+/// baked, and it is a genuine compile-time-constant of the run.
+///
+/// F32 is exact for every integer below 2^24, and positions are bounded by
+/// `max_position_embeddings` (163 840 for V4), so the float round trip is exact.
+pub fn graph_ring_slot(positions: &Tensor, capacity: usize) -> Result<Tensor> {
+    if capacity == 0 {
+        candle_core::bail!("graph_ring_slot: capacity must be non-zero");
+    }
+    let p = positions.to_dtype(DType::F32)?;
+    // `affine`'s multiplier is a constant kernel argument, which is safe to
+    // bake: `capacity` is fixed for the life of the run. Only the position is
+    // allowed to vary between replays, and it is read from device memory.
+    let blocks = p.affine(1.0 / capacity as f64, 0.0)?.floor()?;
+    let rem = (&p - (blocks * capacity as f64)?)?;
+    // `1.0 / capacity` is exact in binary only when `capacity` is a power of
+    // two (V4's `sliding_window` is 128, so it is — but this must not depend on
+    // that). Otherwise `p * (1/capacity)` can round just below an integer at
+    // `p` an exact multiple of `capacity`, the `floor` loses a block, and the
+    // remainder comes out as `capacity` — one slot PAST the window, i.e. an
+    // out-of-bounds KV write. The rounding error is bounded by well under one
+    // ulp of the quotient, so the remainder is in `[0, capacity]` and a single
+    // correction is exact for every input.
+    let over = rem.ge(capacity as f64)?.to_dtype(DType::F32)?;
+    (rem - (over * capacity as f64)?)?.to_dtype(DType::U32)
 }
 
 /// Check if graph-mode positions are set.
@@ -3537,6 +3762,91 @@ impl Module for ScaledEmbedding {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let embedding = Embedding::new(self.embedding.clone(), self.embedding.dim(D::Minus1)?);
         xs.apply(&embedding)? * self.scale
+    }
+}
+
+#[cfg(test)]
+mod compress_positions_tests {
+    use super::*;
+
+    /// The cache replaced `(arange(0..t_c).to_f32() * ratio).to_u32()`. The
+    /// values must be bit-identical to that expression, or every compressed
+    /// row silently rotates at the wrong absolute position — a quality bug no
+    /// test outside this one would catch.
+    #[test]
+    fn matches_the_arange_expression_it_replaced() -> Result<()> {
+        let dev = Device::Cpu;
+        for ratio in [1usize, 2, 4, 8, 32] {
+            for t_c in [1usize, 3, 17, 64] {
+                let want = (Tensor::arange(0u32, t_c as u32, &dev)?.to_dtype(DType::F32)?
+                    * (ratio as f64))?
+                .to_dtype(DType::U32)?
+                .to_vec1::<u32>()?;
+                let got = compress_positions(t_c, ratio, &dev)?.to_vec1::<u32>()?;
+                assert_eq!(got, want, "ratio={ratio} t_c={t_c}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Growth must reuse the table, not silently rebuild it every step —
+    /// rebuilding is the host copy this cache exists to remove, and doing it
+    /// inside capture is the crash it exists to prevent.
+    #[test]
+    fn a_longer_request_within_capacity_reuses_the_same_storage() -> Result<()> {
+        let dev = Device::Cpu;
+        let ratio = 4usize;
+        let first = compress_positions(1, ratio, &dev)?;
+        let grown = compress_positions(COMPRESS_POS_CHUNK, ratio, &dev)?;
+        // Same backing table => same length after the chunk round-up.
+        assert_eq!(first.dim(0)?, 1);
+        assert_eq!(grown.dim(0)?, COMPRESS_POS_CHUNK);
+        let entries = COMPRESS_POSITIONS.with(|c| c.borrow().len());
+        assert_eq!(entries, 1, "one (ratio, device) entry, not one per call");
+        // Distinct ratios must NOT evict each other: V4 interleaves CSA and HCA
+        // layers, so a single-slot cache would rebuild on every layer.
+        let _ = compress_positions(8, 32, &dev)?;
+        let _ = compress_positions(8, ratio, &dev)?;
+        let entries = COMPRESS_POSITIONS.with(|c| c.borrow().len());
+        assert_eq!(entries, 2, "ratios must coexist");
+        Ok(())
+    }
+
+    #[test]
+    fn zero_ratio_is_refused() {
+        assert!(compress_positions(4, 0, &Device::Cpu).is_err());
+    }
+
+    /// `positions_f32` replaced `arange(start, start+len).to_f32()` at three
+    /// V4 attention-mask sites. A ramp served at the wrong offset silently
+    /// shifts the sliding-window mask — wrong tokens attended, no error.
+    #[test]
+    fn positions_f32_matches_the_arange_expression_it_replaced() -> Result<()> {
+        let dev = Device::Cpu;
+        for (start, len) in [(0usize, 1usize), (0, 7), (5, 1), (13, 128), (1000, 64)] {
+            let want = Tensor::arange(start as u32, (start + len) as u32, &dev)?
+                .to_dtype(DType::F32)?
+                .to_vec1::<f32>()?;
+            let got = positions_f32(start, len, &dev)?.to_vec1::<f32>()?;
+            assert_eq!(got, want, "start={start} len={len}");
+        }
+        Ok(())
+    }
+
+    /// The ramp must survive growth past its initial capacity, and a view of it
+    /// must still reshape (the three call sites all reshape immediately).
+    #[test]
+    fn positions_f32_grows_and_its_views_reshape() -> Result<()> {
+        let dev = Device::Cpu;
+        let short = positions_f32(0, 4, &dev)?;
+        assert_eq!(short.reshape((1, 4))?.dims(), &[1, 4]);
+        let past_min = IOTA_MIN_LEN + 3;
+        let long = positions_f32(past_min, 2, &dev)?;
+        assert_eq!(long.to_vec1::<f32>()?, vec![past_min as f32, past_min as f32 + 1.0]);
+        assert_eq!(long.reshape((2, 1))?.dims(), &[2, 1]);
+        // One ramp per device, not one per request.
+        assert_eq!(IOTA_F32.with(|c| c.borrow().len()), 1);
+        Ok(())
     }
 }
 

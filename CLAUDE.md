@@ -1,5 +1,30 @@
 # CLAUDE.md
 
+## ⛔ READ THIS BEFORE EVERY REPLY — Arc operating rules
+
+**Why Arc exists:** Runcrate rents GPUs. The wedge is **capacity per node** — one node
+serving 4–8× more multiplies a fleet without buying a card. **×4–8 credible, ~×1 shipped.**
+**The moat is the byte formats** (trellis weights, compressed KV), not any one kernel —
+which is why the GEMM and the attention kernel must be ours.
+
+1. **A scoping result is NEVER a verdict.** "Doesn't work yet" / "lower ceiling than hoped"
+   / "costs throughput here" ⇒ **build it and fix it**. Never rank a novel system down,
+   never turn one off as a conclusion. Report *scope*, not sentence. No limiting beliefs.
+2. **Get the box, get the number, THEN open the PR.** A PR saying "should help" is not
+   finished work. CPU-only validation is banned as a substitute for hardware.
+3. **A green result must prove work happened.** Silent success is the house fault (13+
+   instances). Assert engagement; environment failure exits 2, never 1; "no failures" ≠
+   "no results".
+4. **Don't re-apologise.** Fix the reflex, record it once, move on.
+5. **Main orchestrates.** Dispatch agents; don't do their work. Agents use
+   `~/.config/arc/bin/arcgpu`, never bare `runcrate`.
+
+Full rules + provenance: `~/.claude/projects/-Users-jish-Documents-GitHub-arc/memory/mission/`
+— `KERNEL_RULES.md` (D16–D21), `GPU_ACCESS_RULE.md` (D14–D15), `FACTS.md` (measured only),
+`CEILINGS.json` (physics vs implementation + anti-pessimism protocol).
+
+---
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview

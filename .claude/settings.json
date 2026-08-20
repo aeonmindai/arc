@@ -11,7 +11,6 @@
         ]
       }
     ],
-
     "PostToolUse": [
       {
         "matcher": "*",
@@ -23,7 +22,6 @@
         ]
       }
     ],
-
     "PostToolUseFailure": [
       {
         "matcher": "*",
@@ -35,7 +33,6 @@
         ]
       }
     ],
-
     "UserPromptSubmit": [
       {
         "hooks": [
@@ -44,9 +41,16 @@
             "command": ".claude/hooks/notify-app.sh"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/arc-rules.sh"
+          }
+        ]
       }
     ],
-
     "Stop": [
       {
         "hooks": [
@@ -57,7 +61,6 @@
         ]
       }
     ],
-
     "PermissionRequest": [
       {
         "hooks": [
@@ -68,7 +71,6 @@
         ]
       }
     ],
-
     "Notification": [
       {
         "hooks": [
@@ -79,7 +81,6 @@
         ]
       }
     ],
-
     "SessionStart": [
       {
         "hooks": [
@@ -90,7 +91,6 @@
         ]
       }
     ],
-
     "SessionEnd": [
       {
         "hooks": [
@@ -101,7 +101,6 @@
         ]
       }
     ],
-
     "SubagentStop": [
       {
         "hooks": [
@@ -112,7 +111,6 @@
         ]
       }
     ],
-
     "PreCompact": [
       {
         "hooks": [

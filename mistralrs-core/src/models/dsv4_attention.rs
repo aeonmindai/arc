@@ -433,6 +433,125 @@ pub(crate) fn sdpa_sliding_window(
     }
 }
 
+// ── Launch-geometry trace (ArcInfer / ArcGraph capture precondition) ────────
+//
+// A CUDA graph records the launch geometry of every kernel at capture time and
+// replays exactly that. A decode step is therefore capturable once, rather than
+// re-captured per token, only if its geometry is identical on every step — and
+// the geometry of every kernel on this path is a function of the tensor shapes
+// flowing through it (candle sizes its grids from element counts and dims).
+// Recording those shapes *is* recording the launch geometry, and diffing two
+// steps' recordings is the capture precondition — checkable with no GPU.
+//
+// Disarmed (`None`) unless a recording is open, so the shipping path pays one
+// thread-local read per call site and allocates nothing.
+thread_local! {
+    static LAUNCH_SHAPES: std::cell::RefCell<Option<Vec<(&'static str, Vec<usize>)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Note one launch-determining shape, if a recording is open.
+pub(crate) fn record_launch_shape(tag: &'static str, dims: &[usize]) {
+    LAUNCH_SHAPES.with(|s| {
+        if let Some(log) = s.borrow_mut().as_mut() {
+            log.push((tag, dims.to_vec()));
+        }
+    });
+}
+
+/// Run `f` and return its value alongside the launch geometry it issued.
+///
+/// The recording is closed before `f`'s error is propagated, so a failing call
+/// cannot leave the trace armed for the next one.
+pub(crate) fn trace_launch_shapes<T>(
+    f: impl FnOnce() -> Result<T>,
+) -> Result<(T, Vec<(&'static str, Vec<usize>)>)> {
+    LAUNCH_SHAPES.with(|s| *s.borrow_mut() = Some(Vec::new()));
+    let out = f();
+    let log = LAUNCH_SHAPES
+        .with(|s| s.borrow_mut().take())
+        .unwrap_or_default();
+    Ok((out?, log))
+}
+
+// Cached `[1, t_c]` block-index vector for `graph_compressed_mask`, keyed by
+// width and device.
+//
+// `Tensor::arange` on a GPU device is a host-to-device copy — banned in a hot
+// loop by `CLAUDE.md`, and fatal rather than merely slow here: an H2D copy from
+// pageable host memory *cannot be recorded into a CUDA graph*, so building it
+// inside the capture region would abort the capture outright. Built once, on
+// the warmup steps that precede capture.
+thread_local! {
+    static GRAPH_BLOCK_IDS: std::cell::RefCell<Option<(usize, Tensor)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The additive compressed-branch mask a fixed-capacity graph decode needs.
+///
+/// Returns `[B, 1, 1, t_k + t_c]` in `dtype`: `0` across the raw half — whose
+/// length masking is [`crate::layers::graph_mode_length_mask`]'s job, and
+/// double-masking it here would be redundant, not wrong — and on the compressed
+/// half `0` on blocks the row has completed, `-inf` on the rest.
+///
+/// Block `b` covers tokens `[b*ratio, (b+1)*ratio)`, so it is complete, and
+/// therefore attendable, exactly when `b < floor((position + 1) / ratio)`. That
+/// is the same threshold the eager path computes from `q0`; the difference is
+/// where the position comes from. Under fixed capacity the host has no honest
+/// `q0` (see [`Dsv4AttentionConfig::graph_positions`]), and a host-computed
+/// threshold would in any case be a constant folded into the recorded graph —
+/// right for the captured token, wrong for every replayed one. Every term here
+/// is a device-side compare against the position buffer, so a replay that
+/// mutates that buffer in place re-derives the right mask with no recapture.
+///
+/// A fully-masked compressed half is fine and expected early in a sequence
+/// (`position < ratio`): the raw half always keeps the diagonal, so no softmax
+/// row is empty and no NaN can arise.
+pub(crate) fn graph_compressed_mask(
+    positions: &Tensor,
+    t_k: usize,
+    t_c: usize,
+    ratio: usize,
+    dtype: DType,
+) -> Result<Tensor> {
+    if ratio == 0 {
+        candle_core::bail!(
+            "graph_compressed_mask: ratio must be non-zero (Standard layers have no \
+             compressed branch and must not reach here)"
+        );
+    }
+    let b = positions.dims1()?;
+    let dev = positions.device();
+    if t_c == 0 {
+        return Tensor::zeros((b, 1, 1, t_k), dtype, dev);
+    }
+
+    let blocks = GRAPH_BLOCK_IDS.with(|c| -> Result<Tensor> {
+        let mut c = c.borrow_mut();
+        if let Some((w, t)) = c.as_ref() {
+            if *w == t_c && t.device().same_device(dev) {
+                return Ok(t.clone());
+            }
+        }
+        let t = Tensor::arange(0u32, t_c as u32, dev)?
+            .to_dtype(DType::F32)?
+            .reshape((1, t_c))?;
+        *c = Some((t_c, t.clone()));
+        Ok(t)
+    })?;
+
+    let pos = positions.to_dtype(DType::F32)?.reshape((b, 1))?;
+    let threshold = ((pos + 1.0)? / ratio as f64)?.floor()?; // [B, 1]
+    let valid = blocks.broadcast_lt(&threshold)?; // [B, t_c] (u8)
+    let zeros = Tensor::zeros((b, t_c), dtype, dev)?;
+    let neg_inf = Tensor::full(f32::NEG_INFINITY, (b, t_c), dev)?.to_dtype(dtype)?;
+    let comp = valid
+        .where_cond(&zeros, &neg_inf)?
+        .reshape((b, 1, 1, t_c))?;
+    let raw = Tensor::zeros((b, 1, 1, t_k), dtype, dev)?;
+    Tensor::cat(&[&raw, &comp], 3)
+}
+
 /// Per-call configuration for V4 hybrid attention.
 #[derive(Debug, Clone, Copy)]
 pub struct Dsv4AttentionConfig<'a> {
@@ -493,6 +612,36 @@ pub struct Dsv4AttentionConfig<'a> {
     /// `q0` is the maximum by construction and a larger value means the caller
     /// and the cache disagree about the layout.
     pub row_q0: Option<&'a [usize]>,
+    /// Fixed-capacity graph decode: the device-held `[B]` absolute position of
+    /// each row's newest token. `None` — every path but the CUDA-graph decode
+    /// arm — leaves this module exactly as it was.
+    ///
+    /// # Why the compressed branch needs it and the raw branch does not
+    ///
+    /// Under graph capture both key sets are read back at a **constant width**
+    /// so the launch geometry never changes: the raw branch at `sliding_window`
+    /// slots, the compressed branch at a fixed row capacity. Constant width
+    /// means the host can no longer tell how much of either buffer is real —
+    /// `k.dim(2)` is the capacity, not the length — so `q0` (inferred from the
+    /// cache width) is a **constant**, and every host-derived position with it.
+    ///
+    /// * The **raw** branch survives that. Its mask is a difference of query and
+    ///   key positions, both shifted by the same constant, so causality and the
+    ///   window are unchanged; the caller's `graph_mode_length_mask` supplies
+    ///   the one thing the constant hides — where the written slots stop.
+    /// * The **compressed** branch does not. Its threshold
+    ///   `b < floor((q_abs + 1) / ratio)` is an *absolute* position, not a
+    ///   difference. Fed the constant `q0 = capacity - 1` it freezes at
+    ///   `floor(sliding_window / ratio)` — 32 blocks on CSA, **1** on HCA — for
+    ///   every token of every sequence, so the distant-context branch this
+    ///   module exists to provide silently stops growing. That is a wrong
+    ///   answer, not a slow one.
+    ///
+    /// So when this is `Some`, the threshold is recomputed on-device from these
+    /// positions. A captured graph replays the compare against whatever the
+    /// position buffer holds at replay time, which is what makes one recorded
+    /// graph correct for every later token.
+    pub graph_positions: Option<&'a Tensor>,
 }
 
 /// V4 hybrid attention dispatch — a single softmax over the union of the raw
@@ -607,12 +756,13 @@ pub fn dsv4_attention(
     // valid, so no query row is fully masked (no softmax NaN). `kp` carries the
     // ABSOLUTE position of each retained key, so the comparison against `qp` is
     // unchanged by the narrowing above.
-    let kp = Tensor::arange(raw_base as u32, (raw_base + t_k) as u32, dev)?
-        .to_dtype(DType::F32)?
-        .reshape((1, t_k))?;
-    let qp = Tensor::arange(q0 as u32, (q0 + t_q) as u32, dev)?
-        .to_dtype(DType::F32)?
-        .reshape((t_q, 1))?;
+    //
+    // These are views into a cached device ramp, not `Tensor::arange`. `arange`
+    // is a host→device copy, and inside CUDA-graph capture the recorded memcpy
+    // holds the host pointer of a `Vec` that is already freed at launch time —
+    // see `layers::positions_f32`.
+    let kp = crate::layers::positions_f32(raw_base, t_k, dev)?.reshape((1, t_k))?;
+    let qp = crate::layers::positions_f32(q0, t_q, dev)?.reshape((t_q, 1))?;
     let causal = kp.broadcast_le(&qp)?;
     let lower = (&qp - window as f64)?;
     let in_window = kp.broadcast_gt(&lower)?;
@@ -625,11 +775,23 @@ pub fn dsv4_attention(
             // Compressed branch mask: query r attends compressed block b iff
             // b < (q0+r+1)/ratio (causal over fully-completed ratio-blocks).
             let ratio = cfg.compress_ratio.ratio();
-            let bp = Tensor::arange(0u32, t_c as u32, dev)?
-                .to_dtype(DType::F32)?
-                .reshape((1, t_c))?;
-            let threshold = ((&qp + 1.0)? / ratio as f64)?.floor()?; // [t_q, 1]
-            let comp_valid = bp.broadcast_lt(&threshold)?; // [t_q, t_c] (u8)
+            let comp_valid = match cfg.graph_positions {
+                // Fixed-capacity graph decode: `qp` is derived from the buffer
+                // *capacity*, so this threshold would freeze at a constant (see
+                // `Dsv4AttentionConfig::graph_positions`). Leave the local half
+                // permissive and let the device-derived mask folded in below
+                // carry the real pattern — a `0` here is the additive identity,
+                // so the two compose without double-counting.
+                Some(_) => Tensor::ones((t_q, t_c), DType::U8, dev)?,
+                None => {
+                    // A cached-ramp view, never `Tensor::arange`: inside capture
+                    // the recorded H2D memcpy holds the host pointer of a `Vec`
+                    // that is already freed at replay. See `layers::positions_f32`.
+                    let bp = crate::layers::positions_f32(0, t_c, dev)?.reshape((1, t_c))?;
+                    let threshold = ((&qp + 1.0)? / ratio as f64)?.floor()?; // [t_q, 1]
+                    bp.broadcast_lt(&threshold)? // [t_q, t_c] (u8)
+                }
+            };
             let valid = Tensor::cat(&[&raw_valid, &comp_valid], 1)?;
             let k_cat = Tensor::cat(&[k, comp], 2)?.contiguous()?;
             let v_cat = Tensor::cat(&[v, comp], 2)?.contiguous()?;
@@ -637,6 +799,8 @@ pub fn dsv4_attention(
         }
         None => (k.clone(), v.clone(), raw_valid),
     };
+    record_launch_shape("k_cat", k_cat.dims());
+    record_launch_shape("v_cat", v_cat.dims());
 
     // Boolean validity → additive mask (0 / -inf), broadcast over batch+heads.
     let n_keys = valid.dim(1)?;
@@ -664,6 +828,25 @@ pub fn dsv4_attention(
         )?,
     };
 
+    // Fixed-capacity graph decode: the compressed half's block causality, whose
+    // absolute threshold the constant `q0` cannot express. Device-derived from
+    // the position buffer so a replay re-derives it instead of replaying a
+    // constant baked in at capture. Additive, so it composes with the local
+    // mask (whose compressed half was left permissive above) by broadcast add.
+    let mask = match (cfg.graph_positions, compressed_kv) {
+        (Some(positions), Some(comp)) => {
+            let gm = graph_compressed_mask(
+                positions,
+                t_k,
+                comp.dim(2)?,
+                cfg.compress_ratio.ratio(),
+                q.dtype(),
+            )?;
+            mask.broadcast_add(&gm)?
+        }
+        _ => mask,
+    };
+
     // Fold in whatever the caller knows that this module cannot see: padding
     // columns in a ragged batch, the graph-decode length mask, custom bias.
     // Dropping it (the pre-fix behavior) let one sequence's padding vote in
@@ -672,6 +855,7 @@ pub fn dsv4_attention(
         Some(caller) => compose_caller_mask(&mask, caller, t_q, t_k_full, raw_base, t_k)?,
         None => mask,
     };
+    record_launch_shape("mask", mask.dims());
 
     // ---- Absorbed-MLA decode (stage-2 perf) -------------------------------
     // Single-token decode with one KV head and sinks present (the deployment
@@ -681,8 +865,12 @@ pub fn dsv4_attention(
     // fixtures) on the flash-attn-capable Sdpa dispatch unchanged.
     if t_q == 1 && k_cat.dim(1)? == 1 && sdpa_params.sinks.is_some() && !absorbed_decode_disabled()
     {
+        record_launch_shape("absorbed_mqa_decode.q", q.dims());
+        record_launch_shape("absorbed_mqa_decode.k", k_cat.dims());
         return absorbed_mqa_decode(q, &k_cat, &v_cat, &mask, sdpa_params);
     }
+    record_launch_shape("sdpa.q", q.dims());
+    record_launch_shape("sdpa.k", k_cat.dims());
 
     // Always `Some(&mask)`: V4 owns its causality (raw window ∧ compressed
     // block-causality ∧ the caller's mask), and `sinks_attn` only takes the
@@ -884,6 +1072,7 @@ mod tests {
             sliding_window: window,
             raw_prefix: 0,
             row_q0: None,
+            graph_positions: None,
         };
         let actual = dsv4_attention(&q, &k, &v, None, None, &flash, &sdpa, cfg)?;
 
@@ -931,6 +1120,7 @@ mod tests {
             sliding_window: t,
             raw_prefix: 0,
             row_q0: None,
+            graph_positions: None,
         };
         let actual = dsv4_attention(&q, &k, &v, None, None, &flash, &sdpa, cfg)?;
 
@@ -987,6 +1177,7 @@ mod tests {
                 sliding_window: window,
                 raw_prefix: 0,
                 row_q0: None,
+                graph_positions: None,
             };
             let actual = dsv4_attention(&q, &k, &v, None, None, &flash, &sdpa, cfg)?;
 
@@ -1074,6 +1265,7 @@ mod tests {
                     sliding_window: window,
                     raw_prefix: 0,
                     row_q0: None,
+                    graph_positions: None,
                 },
             )?;
 
@@ -1095,6 +1287,7 @@ mod tests {
                     sliding_window: window,
                     raw_prefix: base,
                     row_q0: None,
+                    graph_positions: None,
                 },
             )?;
 
@@ -1144,6 +1337,7 @@ mod tests {
                 sliding_window: 16,
                 raw_prefix: 4,
                 row_q0: None,
+                graph_positions: None,
             },
         )
         .unwrap_err();
@@ -1194,6 +1388,7 @@ mod tests {
                 sliding_window: window,
                 raw_prefix: 0,
                 row_q0: None,
+                graph_positions: None,
             };
             let out = dsv4_attention(&q, &k, &v, Some(&comp), None, &flash, &sdpa, cfg)?;
             let out_v: Vec<f32> = out.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
@@ -1318,6 +1513,7 @@ mod tests {
             sliding_window: t, // window covers everything → windowed == causal
             raw_prefix: 0,
             row_q0: None,
+            graph_positions: None,
         };
         let actual = dsv4_attention(&q, &k, &v, None, None, &flash, &sdpa, cfg)?;
 
@@ -1348,6 +1544,7 @@ mod tests {
             sliding_window: 4,
             raw_prefix: 0,
             row_q0: None,
+            graph_positions: None,
         };
         let out = dsv4_attention(&q, &k, &v, Some(&comp), None, &flash, &sdpa, cfg)?;
         assert_eq!(out.dims(), &[b, h, t_q, d]);
@@ -1421,6 +1618,7 @@ mod tests {
             // row at the same length, so `None` is the identity that preserves
             // exactly what it asserted before the field existed.
             row_q0: None,
+            graph_positions: None,
         };
         let with_comp = dsv4_attention(&q, &k, &v, Some(&comp), None, &flash, &sdpa, cfg)?;
         let without_comp = dsv4_attention(&q, &k, &v, None, None, &flash, &sdpa, cfg)?;
@@ -1529,6 +1727,7 @@ mod tests {
             sliding_window: 128,
             raw_prefix: 0,
             row_q0: None,
+            graph_positions: None,
         };
         let out = dsv4_attention(&q, &k, &v, Some(&comp), None, &flash, &sdpa, cfg)?;
         assert_eq!(out.dims(), &[b, h, t_q, d]);
@@ -1573,6 +1772,7 @@ mod tests {
             sliding_window: window,
             raw_prefix: 0,
             row_q0: None,
+            graph_positions: None,
         };
 
         // The engine pads every sequence to the batch max and reports PADDED
@@ -1649,6 +1849,7 @@ mod tests {
             sliding_window: window, // window >= t, so ONLY causality is on trial
             raw_prefix: 0,
             row_q0: None,
+            graph_positions: None,
         };
         let padded = vec![t as u32; b];
         let flash = varlen_flash_params(&padded, &padded, &device);
@@ -1738,6 +1939,7 @@ mod tests {
             sliding_window: window,
             raw_prefix: 0,
             row_q0: None,
+            graph_positions: None,
         };
         let padded = vec![t as u32; b];
         let flash = varlen_flash_params(&padded, &padded, &device);
@@ -1817,6 +2019,7 @@ mod tests {
             sliding_window: t,
             raw_prefix: 0,
             row_q0: None,
+            graph_positions: None,
         };
         // Rank-4 causal mask (what `CausalMasker` hands the layer), raw width.
         let caller = left_padded_causal_mask(&[0], t, &device)?;
@@ -1978,6 +2181,7 @@ mod tests {
             sliding_window: window,
             raw_prefix: 0,
             row_q0: None,
+            graph_positions: None,
         };
 
         let (base, keep) = raw_keep_span(1, window, t_k);
@@ -2023,6 +2227,7 @@ mod tests {
             sliding_window: 4,
             raw_prefix: 0,
             row_q0: None,
+            graph_positions: None,
         };
         let bad = Tensor::zeros((1, 1, t, t + 3), DType::F32, &device)?;
         let err = dsv4_attention(&q, &k, &v, None, Some(&bad), &flash, &sdpa, cfg).unwrap_err();
@@ -2135,6 +2340,7 @@ mod tests {
                 sliding_window: self.window,
                 raw_prefix: 0,
                 row_q0: None,
+                graph_positions: None,
             }
         }
         /// The same call the engine makes for a left-aligned cohort: row `i`'s
@@ -2374,6 +2580,7 @@ mod tests {
                             sliding_window: window,
                             raw_prefix: 0,
                             row_q0: None,
+                            graph_positions: None,
                         };
                         let rows = vec![t_k - t_q; b];
                         let with = dsv4_attention(
@@ -2579,6 +2786,7 @@ mod tests {
             sliding_window: cap,
             raw_prefix: 0,
             row_q0: None,
+            graph_positions: None,
         };
 
         // Reference: the eager arm — only the written slots exist at all.
@@ -2650,6 +2858,7 @@ mod tests {
             sliding_window: cap,
             raw_prefix: 0,
             row_q0: None,
+            graph_positions: None,
         };
 
         let reference =
@@ -2714,6 +2923,209 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// The fixed-capacity graph decode configuration: constant-width raw window
+    /// and constant-width compressed buffer, with the true position carried on
+    /// device. This is the geometry `deepseek4.rs`'s graph arm presents.
+    fn graph_cfg(cap: usize, positions: &Tensor) -> Dsv4AttentionConfig<'_> {
+        Dsv4AttentionConfig {
+            compress_ratio: CompressRatio::Csa,
+            sliding_window: cap,
+            raw_prefix: 0,
+            row_q0: None,
+            graph_positions: Some(positions),
+        }
+    }
+
+    /// 🔴 THE CAPTURE PRECONDITION — the deliverable of this change.
+    ///
+    /// A CUDA graph records every kernel's launch geometry once and replays
+    /// exactly that. "Capture the decode step" is therefore only a win if the
+    /// step's geometry is the *same* at every sequence position: if it varies,
+    /// every token needs its own capture and capture costs more than it saves.
+    ///
+    /// This drives the real [`dsv4_attention`] decode path at two far-apart
+    /// positions and diffs the launch geometry it issued. Three assertions, and
+    /// the last two are what make the first worth having:
+    ///
+    ///  1. under the fixed-capacity graph configuration the two geometries are
+    ///     **identical** — the precondition holds;
+    ///  2. under the eager configuration (buffers that grow with the sequence,
+    ///     i.e. the shipping path) they **differ** — which is both the defect
+    ///     this change removes and the proof that the two positions chosen are
+    ///     far enough apart to be discriminating at all;
+    ///  3. the recording is **non-empty**. Without this a recorder that quietly
+    ///     wrote nothing would satisfy (1) vacuously — `[] == []` — and this
+    ///     test would pass hardest precisely when it measured nothing. That is
+    ///     the house fault this module is written to avoid.
+    #[test]
+    fn graph_decode_launch_geometry_is_invariant_across_sequence_length() -> Result<()> {
+        let dev = Device::Cpu;
+        let (b, h, d) = (1usize, 2usize, 8usize);
+        // The raw window and the compressed row buffer are both allocated once
+        // and never resized — the whole point.
+        let (cap, comp_cap, ratio) = (8usize, 6usize, 4usize);
+        let (p_early, p_late) = (5usize, 37usize);
+        let sdpa = sdpa_params(d, h);
+        let flash = empty_flash_params();
+
+        // Fixed-capacity arm: every buffer's width is a constant, and the only
+        // thing that changes between the two calls is the device position.
+        let graph_geometry = |position: usize| -> Result<Vec<(&'static str, Vec<usize>)>> {
+            let q = mk(b, h, 1, d, 0.11, &dev)?;
+            let k_window = mk(b, 1, cap, d, 0.37, &dev)?;
+            let comp = mk(b, 1, comp_cap, d, 0.23, &dev)?;
+            let positions = Tensor::from_vec(vec![position as u32; b], (b,), &dev)?;
+            let gmask = crate::layers::graph_mode_length_mask(&positions, cap, DType::F32)?;
+            let cfg = graph_cfg(cap, &positions);
+            let (_, log) = trace_launch_shapes(|| {
+                dsv4_attention(
+                    &q,
+                    &k_window,
+                    &k_window,
+                    Some(&comp),
+                    Some(&gmask),
+                    &flash,
+                    &sdpa,
+                    cfg,
+                )
+            })?;
+            Ok(log)
+        };
+
+        // Eager arm: the raw cache and the compressed rows both grow with the
+        // sequence, exactly as the shipping decode path has them.
+        let eager_geometry = |position: usize| -> Result<Vec<(&'static str, Vec<usize>)>> {
+            let q = mk(b, h, 1, d, 0.11, &dev)?;
+            let t_k = position + 1;
+            let k = mk(b, 1, t_k, d, 0.37, &dev)?;
+            let comp = mk(b, 1, t_k / ratio, d, 0.23, &dev)?;
+            let cfg = Dsv4AttentionConfig {
+                compress_ratio: CompressRatio::Csa,
+                sliding_window: cap,
+                raw_prefix: 0,
+                row_q0: None,
+                graph_positions: None,
+            };
+            let (_, log) = trace_launch_shapes(|| {
+                dsv4_attention(&q, &k, &k, Some(&comp), None, &flash, &sdpa, cfg)
+            })?;
+            Ok(log)
+        };
+
+        let g_early = graph_geometry(p_early)?;
+        let g_late = graph_geometry(p_late)?;
+
+        assert!(
+            !g_early.is_empty(),
+            "the launch-geometry recording is EMPTY — this test would then compare [] to [] \
+             and pass while measuring nothing. Either `record_launch_shape` is no longer \
+             called on the decode path or `trace_launch_shapes` is not arming the trace."
+        );
+        assert_eq!(
+            g_early, g_late,
+            "the decode step's launch geometry changed between position {p_early} and \
+             position {p_late}. A CUDA graph replays the geometry it recorded, so any \
+             dimension that moves with sequence length forces a re-capture every token and \
+             makes capture worthless.\n  at {p_early}: {g_early:?}\n  at {p_late}: {g_late:?}"
+        );
+
+        let e_early = eager_geometry(p_early)?;
+        let e_late = eager_geometry(p_late)?;
+        assert_ne!(
+            e_early, e_late,
+            "the EAGER path's geometry did not change between position {p_early} and \
+             position {p_late}. That is the defect this test exists to detect, so if it is \
+             absent here the test is not discriminating and its passing half proves nothing."
+        );
+        Ok(())
+    }
+
+    /// 🔴 The other half of fixed capacity, and a **wrong answer** rather than a
+    /// slow one.
+    ///
+    /// Once the buffers stop growing, `k.dim(2)` is the capacity, not the
+    /// length, so the `q0` this module infers from it is a constant. The raw
+    /// branch survives that (its mask is a *difference* of positions, so the
+    /// constant cancels), but the compressed branch's threshold
+    /// `b < floor((q_abs + 1) / ratio)` is an *absolute* position: fed the
+    /// constant it freezes at `floor(sliding_window / ratio)` blocks for every
+    /// token of every sequence — 32 on CSA, and **1** on HCA, where the window
+    /// and the ratio are both 128. The distant-context branch that the whole
+    /// compressed design exists to provide would silently stop growing.
+    ///
+    /// So the threshold must come from the device position, and it must *move*
+    /// with it. The final assertion is the one that matters: a mask that ignored
+    /// `positions` entirely would satisfy any single-position check.
+    #[test]
+    fn the_compressed_threshold_follows_the_device_position() -> Result<()> {
+        let dev = Device::Cpu;
+        let (t_k, t_c, ratio) = (8usize, 6usize, 4usize);
+
+        // `b < floor((position + 1) / ratio)`, capped by the buffer width.
+        for (position, complete) in [(0usize, 0usize), (3, 1), (7, 2), (23, 6), (100, 6)] {
+            let positions = Tensor::from_vec(vec![position as u32], (1,), &dev)?;
+            let m = graph_compressed_mask(&positions, t_k, t_c, ratio, DType::F32)?;
+            assert_eq!(m.dims(), &[1, 1, 1, t_k + t_c]);
+            let v = m.flatten_all()?.to_vec1::<f32>()?;
+            for (j, got) in v.iter().enumerate().take(t_k) {
+                assert_eq!(
+                    *got, 0.0,
+                    "raw column {j} must stay neutral — the length mask owns that half"
+                );
+            }
+            for slot in 0..t_c {
+                let got = v[t_k + slot];
+                if slot < complete {
+                    assert_eq!(
+                        got, 0.0,
+                        "at position {position}, block {slot} is complete and must be attendable"
+                    );
+                } else {
+                    assert!(
+                        got.is_infinite() && got.is_sign_negative(),
+                        "at position {position}, block {slot} covers tokens that do not exist \
+                         yet and must be -inf, got {got}"
+                    );
+                }
+            }
+        }
+
+        // Per row, not one scalar for the cohort: `graph_mode_positions` is `[B]`.
+        let positions = Tensor::from_vec(vec![3u32, 23u32], (2,), &dev)?;
+        let m = graph_compressed_mask(&positions, t_k, t_c, ratio, DType::F32)?;
+        assert_eq!(m.dims(), &[2, 1, 1, t_k + t_c]);
+        let v = m.flatten_all()?.to_vec1::<f32>()?;
+        let width = t_k + t_c;
+        assert_eq!(v[width + t_k], 0.0, "row 0 (pos 3) has block 0 complete");
+        assert!(
+            v[t_k + 1].is_infinite(),
+            "row 0 (pos 3) must NOT see block 1 — only one ratio-block has completed"
+        );
+        assert_eq!(
+            v[width + t_k + 5],
+            0.0,
+            "row 1 (pos 23) has all six blocks complete; if this is -inf the threshold is \
+             not being evaluated per row"
+        );
+
+        // 🔑 Non-vacuity: the pattern must MOVE with the position. A frozen
+        // threshold — precisely the defect — would make every check above pass
+        // for whichever position happened to match its constant.
+        let at = |p: u32| -> Result<Vec<f32>> {
+            let pos = Tensor::from_vec(vec![p], (1,), &dev)?;
+            graph_compressed_mask(&pos, t_k, t_c, ratio, DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()
+        };
+        assert_ne!(
+            at(3)?.iter().filter(|x| x.is_finite()).count(),
+            at(23)?.iter().filter(|x| x.is_finite()).count(),
+            "the compressed mask did not change between position 3 and position 23 — it is \
+             not reading the device position, which is the entire defect"
+        );
         Ok(())
     }
 }

@@ -1,0 +1,368 @@
+- generic [ref=f2e3]:
+  - generic [ref=f2e4]:
+    - banner [ref=f2e5]:
+      - heading "Arc token-path profile" [level=1] [ref=f2e6]
+      - generic [ref=f2e7]: arc-profile/1
+      - generic [ref=f2e8]:
+        - generic [ref=f2e9]: Run
+        - combobox "Run" [ref=f2e10]:
+          - option "B=1 · B=1" [selected]
+          - option "B=64 · B=64"
+          - option "B=256 cpu · B=256"
+          - option "single"
+        - button "Compare runs" [ref=f2e11] [cursor=pointer]
+    - generic [ref=f2e12]:
+      - generic [ref=f2e13]: model DeepSeek-V4-Flash
+      - generic [ref=f2e14]: arch deepseekv4
+      - generic [ref=f2e15]: gpu NVIDIA H200
+      - generic [ref=f2e16]: device cuda:0
+      - generic [ref=f2e17]: commit 46ea6948d
+      - generic [ref=f2e18]: batch 1
+      - generic [ref=f2e19]: steps 100
+      - generic [ref=f2e20]: tokens 100
+  - generic [ref=f2e22]:
+    - text: Instrumentation overhead 7.40% — this profile is materially measuring itself. At 48.00 ns per span × 812.0 spans/step, more than a twentieth of the wall clock is the profiler. Treat absolute wall numbers as inflated and shapes as approximate; re-run at a shallower
+    - code [ref=f2e23]: profile_depth
+    - text: before drawing conclusions.
+  - generic [ref=f2e24]:
+    - generic [ref=f2e25]:
+      - heading "Run" [level=2] [ref=f2e27]
+      - generic [ref=f2e28]:
+        - term [ref=f2e29]: label
+        - definition [ref=f2e30]: B=1
+        - term [ref=f2e31]: started
+        - definition [ref=f2e32]: 2025-08-15 23:20:00Z
+        - term [ref=f2e33]: commit
+        - definition [ref=f2e34]: 46ea6948d
+        - term [ref=f2e35]: host
+        - definition [ref=f2e36]: arc-h200-1
+        - term [ref=f2e37]: model
+        - definition [ref=f2e38]: DeepSeek-V4-Flash
+        - term [ref=f2e39]: artifact
+        - definition [ref=f2e40]: aeonmind/DeepSeek-V4-Flash-UQFF-qtip2b
+        - term [ref=f2e41]: architecture
+        - definition [ref=f2e42]: deepseekv4
+        - term [ref=f2e43]: device
+        - definition [ref=f2e44]: cuda:0
+        - term [ref=f2e45]: gpu
+        - definition [ref=f2e46]: NVIDIA H200
+        - term [ref=f2e47]: driver
+        - definition [ref=f2e48]: 550.54.15
+        - term [ref=f2e49]: cuda runtime
+        - definition [ref=f2e50]: "12.8"
+        - term [ref=f2e51]: features
+        - definition [ref=f2e52]:
+          - generic [ref=f2e53]: cuda
+          - generic [ref=f2e54]: flash-attn
+        - term [ref=f2e55]: batch
+        - definition [ref=f2e56]: "1"
+        - term [ref=f2e57]: steps
+        - definition [ref=f2e58]: "100"
+        - term [ref=f2e59]: tokens
+        - definition [ref=f2e60]: "100"
+        - term [ref=f2e61]: warmup steps
+        - definition [ref=f2e62]: "4"
+        - term [ref=f2e63]: profile depth
+        - definition [ref=f2e64]: "8"
+        - term [ref=f2e65]: unroll layers
+        - definition [ref=f2e66]: "false"
+        - term [ref=f2e67]: spans
+        - definition [ref=f2e68]: "8"
+      - generic [ref=f2e69]:
+        - heading "Notes" [level=2] [ref=f2e70]
+        - list [ref=f2e71]:
+          - listitem [ref=f2e72]: synthetic fixture
+    - generic [ref=f2e73]:
+      - heading "Totals & per-token" [level=2] [ref=f2e75]
+      - generic [ref=f2e76]:
+        - term [ref=f2e77]: wall
+        - definition [ref=f2e78]: 1.903 s (1,903,000,000 ns)
+        - term [ref=f2e79]: device (GPU)
+        - definition [ref=f2e80]: 88.00 ms (88,000,000 ns)
+        - term [ref=f2e81]: sync (blocked)
+        - definition [ref=f2e82]: 61.00 ms (61,000,000 ns)
+        - term [ref=f2e83]: busy host
+        - definition [ref=f2e84]: 1.842 s (1,842,000,000 ns)
+        - term [ref=f2e85]: steps
+        - definition [ref=f2e86]: "100"
+        - term [ref=f2e87]: tokens
+        - definition [ref=f2e88]: "100"
+        - term [ref=f2e89]: wall / step
+        - definition [ref=f2e90]: 19.03 ms
+        - term [ref=f2e91]: wall / token
+        - definition [ref=f2e92]: 19.03 ms
+        - term [ref=f2e93]: device / token
+        - definition [ref=f2e94]: 880.0 µs
+        - term [ref=f2e95]: sync / token
+        - definition [ref=f2e96]: 610.0 µs
+        - term [ref=f2e97]: throughput
+        - definition [ref=f2e98]: 52.55 tok/s
+        - term [ref=f2e99]: gpu / wall
+        - definition [ref=f2e100]: 4.62%
+        - term [ref=f2e101]: blocked / wall
+        - definition [ref=f2e102]: 3.21%
+        - term [ref=f2e103]: root span wall
+        - definition [ref=f2e104]: 1.903 s (step)
+      - heading "Instrumentation overhead" [level=2] [ref=f2e106]
+      - generic [ref=f2e107]:
+        - term [ref=f2e108]: per span (on)
+        - definition [ref=f2e109]: 48.00 ns
+        - term [ref=f2e110]: per span (off)
+        - definition [ref=f2e111]: 1.200 ns
+        - term [ref=f2e112]: spans / step
+        - definition [ref=f2e113]: "812.0"
+        - term [ref=f2e114]: overhead
+        - definition [ref=f2e115]: 7.40% — material
+  - generic [ref=f2e116]:
+    - heading "Where the wall clock went" [level=2] [ref=f2e118]
+    - generic [ref=f2e119]:
+      - generic [ref=f2e120]:
+        - generic [ref=f2e121]: host wall
+        - generic [ref=f2e122]:
+          - 'generic "host busy: 1,842,000,000 ns" [ref=f2e123]': busy 1.842 s
+          - 'generic "blocked on GPU: 61,000,000 ns" [ref=f2e124]': blocked 61.00 ms
+      - generic [ref=f2e125]:
+        - generic [ref=f2e126]: GPU
+        - 'generic "GPU executing: 88,000,000 ns" [ref=f2e128]': executing 88.00 ms
+    - generic [ref=f2e129]: host busy 1.842 s · host blocked on GPU 61.00 ms · GPU executing 88.00 ms over a 1.903 s wall
+    - paragraph [ref=f2e130]: Both rows share one axis (1.903 s full width). The host was stalled for 3.21% of the run.
+  - generic [ref=f2e131]:
+    - generic [ref=f2e132]:
+      - heading "Icicle" [level=2] [ref=f2e133]
+      - generic [ref=f2e134]:
+        - generic [ref=f2e135]: Metric
+        - generic [ref=f2e136]:
+          - button "wall" [ref=f2e137] [cursor=pointer]
+          - button "device" [ref=f2e138] [cursor=pointer]
+          - button "sync" [ref=f2e139] [cursor=pointer]
+          - button "busy self" [ref=f2e140] [cursor=pointer]
+      - generic [ref=f2e141]:
+        - button "↑ Out" [disabled] [ref=f2e142]
+        - button "Reset" [disabled] [ref=f2e143]
+    - button "step" [ref=f2e145] [cursor=pointer]
+    - tree "Span tree icicle chart. Arrow keys move selection, Enter zooms, Escape resets." [ref=f2e147]:
+      - generic [ref=f2e148] [cursor=pointer]: step 1.903 s
+      - generic [ref=f2e149] [cursor=pointer]: prepare_inputs
+      - generic [ref=f2e150] [cursor=pointer]: forward 951.5 ms
+      - generic [ref=f2e151] [cursor=pointer]
+      - generic [ref=f2e152] [cursor=pointer]
+      - generic [ref=f2e153] [cursor=pointer]: sample
+    - generic [ref=f2e154]:
+      - generic [ref=f2e155]: host — CPU-side span
+      - generic [ref=f2e157]: device — GPU work (wall = launch only)
+      - generic [ref=f2e159]: sync — host blocked on GPU
+      - generic [ref=f2e161]: root
+      - generic [ref=f2e163]: zero wall — measured, but empty on this channel
+      - generic [ref=f2e165]: unreachable — code path provably not taken
+      - generic [ref=f2e167]: 6 of 8 spans drawn (narrower than a pixel are culled; zoom in to reveal)
+    - paragraph [ref=f2e168]: Wall clock spent inside the span on the host, summed over all calls. On a device span this is the LAUNCH cost only — the kernel runs asynchronously.
+  - generic [ref=f2e169]:
+    - generic [ref=f2e170]:
+      - heading "Nodes" [level=2] [ref=f2e171]
+      - generic [ref=f2e172]:
+        - searchbox "filter by path substring…" [ref=f2e173]
+        - button "×" [ref=f2e174] [cursor=pointer]
+      - generic [ref=f2e175]: 8 spans
+    - table [ref=f2e177]:
+      - rowgroup [ref=f2e178]:
+        - row [ref=f2e179]:
+          - columnheader "Path" [ref=f2e180] [cursor=pointer]
+          - columnheader "Kind" [ref=f2e181] [cursor=pointer]
+          - columnheader "Calls" [ref=f2e182] [cursor=pointer]
+          - columnheader "Wall ▾" [ref=f2e183] [cursor=pointer]
+          - columnheader "Wall self" [ref=f2e184] [cursor=pointer]
+          - columnheader "Device" [ref=f2e185] [cursor=pointer]
+          - columnheader "Device self" [ref=f2e186] [cursor=pointer]
+          - columnheader "Sync" [ref=f2e187] [cursor=pointer]
+          - columnheader "Busy self" [ref=f2e188] [cursor=pointer]
+          - columnheader "% root wall" [ref=f2e189] [cursor=pointer]
+          - columnheader "Mean/call" [ref=f2e190] [cursor=pointer]
+          - columnheader "Min" [ref=f2e191] [cursor=pointer]
+          - columnheader "Max" [ref=f2e192] [cursor=pointer]
+      - rowgroup [ref=f2e193]:
+        - row [ref=f2e194] [cursor=pointer]:
+          - cell "step" [ref=f2e195]
+          - cell "root" [ref=f2e196]
+          - cell "100" [ref=f2e198]
+          - cell "1.903 s" [ref=f2e199]
+          - cell "95.15 ms" [ref=f2e200]
+          - cell "88.00 ms" [ref=f2e201]
+          - cell "0" [ref=f2e202]
+          - cell "0" [ref=f2e203]
+          - cell "95.15 ms" [ref=f2e204]
+          - cell "100.00%" [ref=f2e205]
+          - cell "19.03 ms" [ref=f2e206]
+          - cell "9.515 ms" [ref=f2e207]
+          - cell "38.06 ms" [ref=f2e208]
+        - row [ref=f2e209] [cursor=pointer]:
+          - cell "·step.forward" [ref=f2e210]
+          - cell "host" [ref=f2e211]
+          - cell "100" [ref=f2e213]
+          - cell "951.5 ms" [ref=f2e214]
+          - cell "47.58 ms" [ref=f2e215]
+          - cell "88.00 ms" [ref=f2e216]
+          - cell "0" [ref=f2e217]
+          - cell "0" [ref=f2e218]
+          - cell "47.58 ms" [ref=f2e219]
+          - cell "50.00%" [ref=f2e220]
+          - cell "9.515 ms" [ref=f2e221]
+          - cell "4.758 ms" [ref=f2e222]
+          - cell "19.03 ms" [ref=f2e223]
+        - row [ref=f2e224] [cursor=pointer]:
+          - cell "·step.prepare_inputs" [ref=f2e225]
+          - cell "host" [ref=f2e226]
+          - cell "100" [ref=f2e228]
+          - cell "190.3 ms" [ref=f2e229]
+          - cell "190.3 ms" [ref=f2e230]
+          - cell "0" [ref=f2e231]
+          - cell "0" [ref=f2e232]
+          - cell "0" [ref=f2e233]
+          - cell "190.3 ms" [ref=f2e234]
+          - cell "10.00%" [ref=f2e235]
+          - cell "1.903 ms" [ref=f2e236]
+          - cell "951.5 µs" [ref=f2e237]
+          - cell "3.806 ms" [ref=f2e238]
+        - row [ref=f2e239] [cursor=pointer]:
+          - cell "·step.sample" [ref=f2e240]
+          - cell "sync" [ref=f2e241]
+          - cell "100" [ref=f2e243]
+          - cell "61.00 ms" [ref=f2e244]
+          - cell "61.00 ms" [ref=f2e245]
+          - cell "0" [ref=f2e246]
+          - cell "0" [ref=f2e247]
+          - cell "61.00 ms" [ref=f2e248]
+          - cell "0" [ref=f2e249]
+          - cell "3.21%" [ref=f2e250]
+          - cell "610.0 µs" [ref=f2e251]
+          - cell "305.0 µs" [ref=f2e252]
+          - cell "1.220 ms" [ref=f2e253]
+        - row [ref=f2e254] [cursor=pointer]:
+          - cell "··step.forward.moe_gemm" [ref=f2e255]
+          - cell "device" [ref=f2e256]
+          - cell "3,200" [ref=f2e258]
+          - cell "61.00 µslaunch" [ref=f2e259]
+          - cell "61.00 µs" [ref=f2e260]
+          - cell "44.00 ms" [ref=f2e261]
+          - cell "44.00 ms" [ref=f2e262]
+          - cell "0" [ref=f2e263]
+          - cell "61.00 µs" [ref=f2e264]
+          - cell "0.00%" [ref=f2e265]
+          - cell "19 ns" [ref=f2e266]
+          - cell "9 ns" [ref=f2e267]
+          - cell "38 ns" [ref=f2e268]
+        - row [ref=f2e269] [cursor=pointer]:
+          - cell "··step.forward.attn_kernelnote" [ref=f2e270]
+          - cell "device" [ref=f2e271]
+          - cell "3,200" [ref=f2e273]
+          - cell "42.00 µslaunch" [ref=f2e274]
+          - cell "42.00 µs" [ref=f2e275]
+          - cell "44.00 ms" [ref=f2e276]
+          - cell "44.00 ms" [ref=f2e277]
+          - cell "0" [ref=f2e278]
+          - cell "42.00 µs" [ref=f2e279]
+          - cell "0.00%" [ref=f2e280]
+          - cell "13 ns" [ref=f2e281]
+          - cell "6 ns" [ref=f2e282]
+          - cell "26 ns" [ref=f2e283]
+        - row [ref=f2e284] [cursor=pointer]:
+          - cell "··step.forward.cuda_graph.replayunreachable" [ref=f2e285]
+          - cell "host" [ref=f2e286]
+          - cell "0" [ref=f2e288]
+          - cell "0" [ref=f2e289]
+          - cell "0" [ref=f2e290]
+          - cell "not reached" [ref=f2e291]
+          - cell "0" [ref=f2e292]
+          - cell "0" [ref=f2e293]
+          - cell "0" [ref=f2e294]
+          - cell "0.00%" [ref=f2e295]
+          - cell "—" [ref=f2e296]
+          - cell "0" [ref=f2e297]
+          - cell "0" [ref=f2e298]
+        - row [ref=f2e299] [cursor=pointer]:
+          - cell "···step.forward.cuda_graph.replay.launchunreachable" [ref=f2e300]
+          - cell "device" [ref=f2e301]
+          - cell "0" [ref=f2e303]
+          - cell "0" [ref=f2e304]
+          - cell "0" [ref=f2e305]
+          - cell "not reached" [ref=f2e306]
+          - cell "0" [ref=f2e307]
+          - cell "0" [ref=f2e308]
+          - cell "0" [ref=f2e309]
+          - cell "0.00%" [ref=f2e310]
+          - cell "—" [ref=f2e311]
+          - cell "0" [ref=f2e312]
+          - cell "0" [ref=f2e313]
+    - paragraph [ref=f2e314]:
+      - text: Click a row to zoom the icicle to that span.
+      - code [ref=f2e315]: wall
+      - text: on a
+      - generic [ref=f2e316]: device
+      - text: span is
+      - emphasis [ref=f2e317]: launch cost only
+      - text: — the GPU time is in the device columns.
+  - generic [ref=f2e318]:
+    - heading "Profile health" [level=2] [ref=f2e320]
+    - generic [ref=f2e321]:
+      - generic [ref=f2e322]: 1 reconciliation violation at a tolerance of 2.00%, 0 misnested spans, 2 unresolved device spans. Numbers below the affected nodes may not add up.
+      - generic [ref=f2e323]:
+        - generic [ref=f2e324]:
+          - generic [ref=f2e325]: tolerance
+          - generic [ref=f2e326]: 2.00%
+        - generic [ref=f2e327]:
+          - generic [ref=f2e328]: violations
+          - generic [ref=f2e329]: "1"
+        - generic [ref=f2e330]:
+          - generic [ref=f2e331]: misnested
+          - generic [ref=f2e332]: "0"
+        - generic [ref=f2e333]:
+          - generic [ref=f2e334]: unresolved device
+          - generic [ref=f2e335]: "2"
+      - heading "Violations" [level=2] [ref=f2e336]
+      - table [ref=f2e338]:
+        - rowgroup [ref=f2e339]:
+          - row [ref=f2e340]:
+            - columnheader "Path" [ref=f2e341] [cursor=pointer]
+            - columnheader "Channel" [ref=f2e342] [cursor=pointer]
+            - columnheader "Parent" [ref=f2e343] [cursor=pointer]
+            - columnheader "Children" [ref=f2e344] [cursor=pointer]
+            - columnheader "Excess" [ref=f2e345] [cursor=pointer]
+        - rowgroup [ref=f2e346]:
+          - row [ref=f2e347] [cursor=pointer]:
+            - cell "step.forward" [ref=f2e348]
+            - cell "wall" [ref=f2e349]
+            - cell "951.5 ms" [ref=f2e350]
+            - cell "1.009 s" [ref=f2e351]
+            - cell "3.1%" [ref=f2e352]
+      - heading "Unreachable code paths" [level=2] [ref=f2e353]
+      - paragraph [ref=f2e354]:
+        - text: These spans exist in the binary but are provably not taken in this configuration. Their zeros mean
+        - emphasis [ref=f2e355]: never ran
+        - text: ", not"
+        - emphasis [ref=f2e356]: ran fast
+        - text: ; they are hatched in the icicle.
+      - table [ref=f2e358]:
+        - rowgroup [ref=f2e359]:
+          - row [ref=f2e360]:
+            - columnheader "Path" [ref=f2e361] [cursor=pointer]
+            - columnheader "Reason" [ref=f2e362] [cursor=pointer]
+            - columnheader "Site" [ref=f2e363] [cursor=pointer]
+        - rowgroup [ref=f2e364]:
+          - row [ref=f2e365] [cursor=pointer]:
+            - cell "step.forward.cuda_graph.replay" [ref=f2e366]
+            - cell "cache_config is None on V4" [ref=f2e367]
+            - cell "normal.rs:1841" [ref=f2e368]
+  - generic [ref=f2e369]:
+    - generic [ref=f2e370]:
+      - heading "JSON" [level=2] [ref=f2e371]
+      - generic [ref=f2e372]:
+        - button "Selected node" [ref=f2e373] [cursor=pointer]
+        - button "Selected subtree" [ref=f2e374] [cursor=pointer]
+        - button "This run" [ref=f2e375] [cursor=pointer]
+        - button "All runs" [ref=f2e376] [cursor=pointer]
+        - button "Copy to clipboard" [ref=f2e377] [cursor=pointer]
+      - generic [ref=f2e378]: node step · 434 chars
+    - textbox "JSON export. Select all and copy; file downloads are blocked in some viewers." [ref=f2e379]: "{ \"id\": 0, \"parent\": null, \"name\": \"step\", \"path\": \"step\", \"depth\": 0, \"kind\": \"root\", \"calls\": 100, \"wall_ns\": 1903000000, \"wall_self_ns\": 95150000, \"device_ns\": 88000000, \"device_self_ns\": 0, \"sync_ns\": 0, \"busy_self_ns\": 95150000, \"min_wall_ns\": 9515000, \"max_wall_ns\": 38060000, \"geom\": { \"b\": 64, \"t\": 1, \"tokens\": 64 }, \"reachable\": true, \"children\": [ 1, 2, 5 ] }"
+    - paragraph [ref=f2e380]:
+      - text: Deliberately a text box, not a download link —
+      - code [ref=f2e381]: <a download>
+      - text: is inert inside sandboxed viewers. Click the box to select everything.

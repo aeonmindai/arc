@@ -246,8 +246,23 @@ qtip_gather_gemv_warp_kernel(
         const long total = (long)n_block_rows * packed_per_row;
         const uint8_t* __restrict__ g =
             packed + ((size_t)expert * n_rows + row0_block) * packed_per_row;
-        for (long i = threadIdx.x; i < total; i += WARPS_PER_BLOCK * 32) {
-            s_packed[i] = __ldg(g + i);
+        // Stage 16 B per thread per step instead of 1 B. `packed_per_row` is a
+        // multiple of 16 for every real rung shape (it is num_symbols/2 and
+        // num_symbols is a multiple of 32), and `g` inherits cudaMalloc's 256 B
+        // alignment through a multiple-of-packed_per_row offset, so the uint4
+        // view is aligned. The byte loop stays as the fallback for odd shapes.
+        if (((packed_per_row & 15) == 0) &&
+            ((reinterpret_cast<uintptr_t>(g) & 15u) == 0u)) {
+            const uint4* __restrict__ g4 = reinterpret_cast<const uint4*>(g);
+            uint4* s4 = reinterpret_cast<uint4*>(s_packed);
+            const int total4 = (int)(total >> 4);
+            for (int i = threadIdx.x; i < total4; i += WARPS_PER_BLOCK * 32) {
+                s4[i] = __ldg(g4 + i);
+            }
+        } else {
+            for (long i = threadIdx.x; i < total; i += WARPS_PER_BLOCK * 32) {
+                s_packed[i] = __ldg(g + i);
+            }
         }
         __syncthreads();
     }
@@ -290,64 +305,89 @@ qtip_gather_gemv_warp_kernel(
     #pragma unroll
     for (int r = 0; r < ROWS_PER_WARP; ++r) acc[r] = 0.0f;
 
-    for (int base = lane * GROUP; base < num_symbols; base += gstride) {
+    // (D) The `fast` test is per-LANE, not per-warp: only lane 0's first
+    //     iteration is ever slow. Leaving the general path inside the loop put a
+    //     BSSY/BSYNC divergence region, the `fast` ISETP and the general path's
+    //     per-symbol bounds test into EVERY iteration of the hot loop. Peeling it
+    //     out leaves a straight-line body. Bit-identical: the peeled loops visit
+    //     exactly the same `base` values, in order, and pick exactly the same
+    //     path for each -- `fast` is a pure function of `base`.
+    auto do_fast = [&](int base) {
+        float2 xg[GROUP];
+        gg_load_group<T, GROUP>(x_pair + base * (int)QTIP_V, xvec, xg);
+        const int b0 = (base - (int)QTIP_WARMUP_SYMS) >> 1;  // even byte index
+        // (E) Every row's window load is issued before any row's decode, so the
+        //     ROWS_PER_WARP window loads are in flight together.
+        uint32_t hh[ROWS_PER_WARP][NH];
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_WARP; ++r) {
+            #pragma unroll
+            for (int q = 0; q < NH; ++q) {
+                if (STAGED) {
+                    hh[r][q] = *reinterpret_cast<const unsigned short*>(s_packed + rp_s[r] + b0 + 2 * q);
+                } else {
+                    hh[r][q] = __ldg(reinterpret_cast<const unsigned short*>(rp_g[r] + b0 + 2 * q));
+                }
+            }
+        }
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_WARP; ++r) {
+            const float scale = scl[r];
+            uint32_t state = gg_state_from_window(hh[r][0]);
+            float a = acc[r];
+            #pragma unroll
+            for (int j = 0; j < GROUP; ++j) {
+                const int t = (int)QTIP_WARMUP_SYMS + j;   // nibble index in the window
+                const uint32_t sym = (hh[r][t >> 2] >> (4 * (t & 3))) & 0x0Fu;
+                state = ((state << QTIP_K) | sym) & QTIP_STATE_MASK;
+                const float2 w = gg_codeword<COMPUTED_CB>(state, cb_mult);
+                a = fmaf(w.x * scale, xg[j].x, a);
+                a = fmaf(w.y * scale, xg[j].y, a);
+            }
+            acc[r] = a;
+        }
+    };
+
+    // General path -- identical arithmetic to the original.
+    auto do_general = [&](int base) {
         const int gend = min(base + GROUP, num_symbols);
         float2 xg[GROUP];
         gg_load_group<T, GROUP>(x_pair + base * (int)QTIP_V,
                                 xvec && (base + GROUP <= num_symbols), xg);
-
-        // Fast path: a full group with a full warm-up window in range.
-        const bool fast = (base >= (int)QTIP_WARMUP_SYMS) && (base + GROUP <= num_symbols);
         #pragma unroll
         for (int r = 0; r < ROWS_PER_WARP; ++r) {
             const float scale = scl[r];
             uint32_t state = 0u;
             float a = acc[r];
-            if (fast) {
-                const int b0 = (base - (int)QTIP_WARMUP_SYMS) >> 1;  // even byte index
-                uint32_t h[NH];
-                #pragma unroll
-                for (int q = 0; q < NH; ++q) {
-                    if (STAGED) {
-                        h[q] = *reinterpret_cast<const unsigned short*>(s_packed + rp_s[r] + b0 + 2 * q);
-                    } else {
-                        h[q] = __ldg(reinterpret_cast<const unsigned short*>(rp_g[r] + b0 + 2 * q));
-                    }
-                }
-                state = gg_state_from_window(h[0]);
-                #pragma unroll
-                for (int j = 0; j < GROUP; ++j) {
-                    const int t = (int)QTIP_WARMUP_SYMS + j;   // nibble index in the window
-                    const uint32_t sym = (h[t >> 2] >> (4 * (t & 3))) & 0x0Fu;
-                    state = ((state << QTIP_K) | sym) & QTIP_STATE_MASK;
-                    const float2 w = gg_codeword<COMPUTED_CB>(state, cb_mult);
-                    a = fmaf(w.x * scale, xg[j].x, a);
-                    a = fmaf(w.y * scale, xg[j].y, a);
-                }
-            } else {
-                // General path -- identical arithmetic to the original.
-                const uint8_t* row_packed = STAGED ? (s_packed + rp_s[r]) : rp_g[r];
-                const int w0 = base > (int)QTIP_WARMUP_SYMS ? base - (int)QTIP_WARMUP_SYMS : 0;
-                for (int t = w0; t < base; ++t) {
-                    const uint8_t b = row_packed[t >> 1];
-                    const uint32_t sym = (t & 1) ? ((b >> 4) & 0x0F) : (b & 0x0F);
-                    state = ((state << QTIP_K) | sym) & QTIP_STATE_MASK;
-                }
-                #pragma unroll
-                for (int j = 0; j < GROUP; ++j) {
-                    const int s = base + j;
-                    if (s >= gend) break;
-                    const uint8_t b = row_packed[s >> 1];
-                    const uint32_t sym = (s & 1) ? ((b >> 4) & 0x0F) : (b & 0x0F);
-                    state = ((state << QTIP_K) | sym) & QTIP_STATE_MASK;
-                    const float2 w = gg_codeword<COMPUTED_CB>(state, cb_mult);
-                    a = fmaf(w.x * scale, xg[j].x, a);
-                    a = fmaf(w.y * scale, xg[j].y, a);
-                }
+            const uint8_t* row_packed = STAGED ? (s_packed + rp_s[r]) : rp_g[r];
+            const int w0 = base > (int)QTIP_WARMUP_SYMS ? base - (int)QTIP_WARMUP_SYMS : 0;
+            for (int t = w0; t < base; ++t) {
+                const uint8_t b = row_packed[t >> 1];
+                const uint32_t sym = (t & 1) ? ((b >> 4) & 0x0F) : (b & 0x0F);
+                state = ((state << QTIP_K) | sym) & QTIP_STATE_MASK;
+            }
+            #pragma unroll
+            for (int j = 0; j < GROUP; ++j) {
+                const int s = base + j;
+                if (s >= gend) break;
+                const uint8_t b = row_packed[s >> 1];
+                const uint32_t sym = (s & 1) ? ((b >> 4) & 0x0F) : (b & 0x0F);
+                state = ((state << QTIP_K) | sym) & QTIP_STATE_MASK;
+                const float2 w = gg_codeword<COMPUTED_CB>(state, cb_mult);
+                a = fmaf(w.x * scale, xg[j].x, a);
+                a = fmaf(w.y * scale, xg[j].y, a);
             }
             acc[r] = a;
         }
-    }
+    };
+
+    int base = lane * GROUP;
+    // leading partial warm-up window (lane 0 only, at most one iteration)
+    for (; base < num_symbols && base < (int)QTIP_WARMUP_SYMS; base += gstride) do_general(base);
+    // hot loop: straight-line, no divergence region
+    for (; base + GROUP <= num_symbols; base += gstride) do_fast(base);
+    // trailing partial group (runs only when num_symbols is not a multiple of gstride)
+    for (; base < num_symbols; base += gstride) do_general(base);
 
     #pragma unroll
     for (int r = 0; r < ROWS_PER_WARP; ++r) {

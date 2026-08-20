@@ -1,0 +1,2244 @@
+- generic [active] [ref=f8e1]:
+  - banner [ref=f8e2]:
+    - generic [ref=f8e3]:
+      - paragraph [ref=f8e4]: Arc · DeepSeek-V4-Flash · one H200
+      - heading "How an inference engine actually works — and which knob moves which number" [level=1] [ref=f8e5]
+      - paragraph [ref=f8e6]:
+        - text: "Two halves. First, the journey one token takes through the engine, drawn as a diagram, with a visible loop — because the loop is the whole story. Second, every term you will hear in this project, in plain English, tagged with which of the five metrics it actually moves and whether Arc has it today. Click any stage in the diagram to filter the matrix down to that stage. Search anything. Nothing here is invented: every number is tagged"
+        - code [ref=f8e7]: "[measured]"
+        - text: ","
+        - code [ref=f8e8]: "[physics]"
+        - text: or
+        - code [ref=f8e9]: "[projected]"
+        - text: ", and there are no competitor benchmark numbers we have not run ourselves."
+      - generic [ref=f8e10]:
+        - generic [ref=f8e11]:
+          - generic [ref=f8e12]: 74.19 GB
+          - text: artifact @ 2.09 bits/param [measured]
+        - generic [ref=f8e13]:
+          - generic [ref=f8e14]: 1 GPU
+          - text: where every published config we surveyed needs 4 [measured]
+        - generic [ref=f8e15]:
+          - generic [ref=f8e16]: 96.0%
+          - text: GSM8K, our 0-shot protocol, n=100 [measured]
+        - generic [ref=f8e17]:
+          - generic [ref=f8e18]: 111.7 tok/s
+          - text: aggregate @ B=256 · $12.06/Mtok [measured]
+        - generic [ref=f8e19]:
+          - generic [ref=f8e20]: ~16,600 tok/s
+          - text: aggregate ceiling @ B=256 [physics]
+        - generic [ref=f8e21]:
+          - generic [ref=f8e22]: 1,413 tok/s
+          - text: single-user ceiling [physics]
+  - main [ref=f8e23]:
+    - generic [ref=f8e24]:
+      - generic [ref=f8e25]:
+        - generic [ref=f8e26]: HALF 1
+        - heading "The journey of a token" [level=2] [ref=f8e27]
+      - paragraph [ref=f8e28]:
+        - text: Read it left to right, top to bottom. The dashed box in the middle is the part that repeats — once for
+        - emphasis [ref=f8e29]: every single output token
+        - text: . Almost everything hard about this engine lives inside that box.
+        - strong [ref=f8e30]: Click any stage
+        - text: to filter the term matrix below to the things that live there.
+      - img "Diagram of a token's journey through the inference engine, from request through prefill into the decode loop and out to the user" [ref=f8e32]:
+        - generic [ref=f8e33]: ① INTAKE — cheap, and where TTFT starts ticking
+        - button "Request in" [ref=f8e34] [cursor=pointer]:
+          - generic [ref=f8e37]: HTTP · prompt + params
+        - button "Tokenize" [ref=f8e38] [cursor=pointer]:
+          - generic [ref=f8e41]: text → token ids
+        - button "Scheduler" [ref=f8e42] [cursor=pointer]:
+          - generic [ref=f8e45]: who runs this step?
+        - button "Prefix cache lookup" [ref=f8e46] [cursor=pointer]:
+          - generic [ref=f8e48]: Prefix cache
+          - generic [ref=f8e49]: seen this opening before?
+        - generic [ref=f8e51]: ② PREFILL — the prompt, all at once
+        - button "Prefill" [ref=f8e52] [cursor=pointer]:
+          - generic [ref=f8e54]: PREFILL — the whole prompt in ONE pass
+          - generic [ref=f8e55]: Every prompt token is already known, so they all go through together.
+          - generic [ref=f8e56]: "COMPUTE-bound: each weight fetched does a lot of arithmetic."
+          - generic [ref=f8e57]: "This is your TTFT. Arc: 78 tok/s at B=1 → 157 at B=256 [measured]."
+        - button "KV cache" [ref=f8e58] [cursor=pointer]:
+          - generic [ref=f8e60]: KV CACHE — written once, read forever
+          - generic [ref=f8e61]: Each token's keys + values are kept so nothing is recomputed.
+          - generic [ref=f8e62]: It grows by one row per token, per user, per layer.
+          - generic [ref=f8e63]: How big this is decides how many users fit on the card.
+        - generic [ref=f8e64]: K,V
+        - generic [ref=f8e68]: ③ DECODE LOOP — EVERYTHING BELOW REPEATS ONCE PER OUTPUT TOKEN
+        - generic [ref=f8e69]: Only one new token exists per trip, so each weight fetched does almost no arithmetic. Decode is MEMORY-bound — the opposite of prefill, and it needs the opposite fixes.
+        - button "Attention" [ref=f8e70] [cursor=pointer]:
+          - generic [ref=f8e73]: Look back over every
+          - generic [ref=f8e74]: previous token — reads the
+          - generic [ref=f8e75]: whole KV cache, every step.
+        - button "MoE routing" [ref=f8e76] [cursor=pointer]:
+          - generic [ref=f8e78]: Route (MoE)
+          - generic [ref=f8e79]: Pick 6 of 256 experts —
+          - generic [ref=f8e80]: per token, per layer.
+          - generic [ref=f8e81]: A tiny net decides.
+        - button "Experts" [ref=f8e82] [cursor=pointer]:
+          - generic [ref=f8e85]: The actual matrix multiplies.
+          - generic [ref=f8e86]: 2-bit weights decoded on
+          - generic [ref=f8e87]: the fly. 49–64% of the step.
+        - button "Sample" [ref=f8e88] [cursor=pointer]:
+          - generic [ref=f8e91]: 129,280 scores in →
+          - generic [ref=f8e92]: exactly one token out.
+          - generic [ref=f8e93]: Greedy, or a weighted roll.
+        - generic [ref=f8e95]: ↺ one more token · the KV cache grows by one row · do the whole thing again
+        - generic [ref=f8e96]: At B=1 one trip reads ~3.4 GB of weights [physics]. At B=256 it reaches essentially the whole 74.19 GB artifact [measured] —
+        - generic [ref=f8e97]: and past that point every additional user is nearly free. That sentence is the entire fleet argument.
+        - generic [ref=f8e99]: EOS, a stop string, or max_tokens
+        - button "Detokenize" [ref=f8e100] [cursor=pointer]:
+          - generic [ref=f8e103]: token ids → text
+        - button "Stream out" [ref=f8e104] [cursor=pointer]:
+          - generic [ref=f8e107]: SSE, token by token
+        - generic [ref=f8e108]: KEY
+        - generic [ref=f8e109]: "— thin grey line: data moving forward, once."
+        - generic [ref=f8e110]: "— thick blue line: the loop. Everything expensive is paid once per trip around it."
+        - generic [ref=f8e111]: Boxes are clickable — each one filters the matrix below.
+      - generic [ref=f8e112]:
+        - button "Memory layer KV cache, the xs cache, paging, HBM bandwidth, roofline" [ref=f8e113] [cursor=pointer]:
+          - generic [ref=f8e114]: Memory layer
+          - text: KV cache, the
+          - code [ref=f8e115]: xs
+          - text: cache, paging, HBM bandwidth, roofline
+        - button "Execution layer CUDA graphs, launch overhead, GEMV / GEMM / grouped GEMM, stalls" [ref=f8e116] [cursor=pointer]:
+          - generic [ref=f8e117]: Execution layer
+          - text: CUDA graphs, launch overhead, GEMV / GEMM / grouped GEMM, stalls
+        - button "Compression layer QTIP, trellis, baking, codebooks, ISQ, UQFF, FP8" [ref=f8e118] [cursor=pointer]:
+          - generic [ref=f8e119]: Compression layer
+          - text: QTIP, trellis, baking, codebooks, ISQ, UQFF, FP8
+        - button "Parallelism layer Tensor, pipeline, expert and data parallel · NVLink vs PCIe" [ref=f8e120] [cursor=pointer]:
+          - generic [ref=f8e121]: Parallelism layer
+          - text: Tensor, pipeline, expert and data parallel · NVLink vs PCIe
+      - generic [ref=f8e122]:
+        - generic [ref=f8e123]: The one asymmetry to keep in your head
+        - text: Prefill is compute-bound. Decode is memory-bound. They need opposite fixes, and mixing them up has cost this project real money. Prefill already scales — server-instrumented prefill rises 4.8× from B=1 to B=64
+        - code [ref=f8e124]: "[measured]"
+        - text: . Decode does not, and every hard problem below is a decode problem. Batching is the one lever that turns decode's memory-bound shape into prefill's compute-bound shape — which is why aggregate throughput and per-user throughput pull in opposite directions, and why you must always say which one you mean.
+    - generic [ref=f8e125]:
+      - generic [ref=f8e126]:
+        - generic [ref=f8e127]: HALF 2
+        - heading "The term matrix" [level=2] [ref=f8e128]
+      - paragraph [ref=f8e129]:
+        - text: Every term, what it means without jargon, what it is
+        - emphasis [ref=f8e130]: like
+        - text: ", which of the five metrics it moves, and exactly where Arc stands on it today. Filter by metric or by status, search anything, or switch to the leverage ranking to see what is worth your attention right now."
+      - generic [ref=f8e131]:
+        - generic [ref=f8e132]:
+          - searchbox "Search terms" [ref=f8e133]
+          - group "View" [ref=f8e134]:
+            - button "Browse" [pressed] [ref=f8e135] [cursor=pointer]
+            - button "What should I care about" [ref=f8e136] [cursor=pointer]
+          - button "Clear all" [ref=f8e137] [cursor=pointer]
+        - generic [ref=f8e139]:
+          - generic [ref=f8e140]: Moves
+          - button "Aggregate throughput" [ref=f8e141] [cursor=pointer]
+          - button "Per-user throughput" [ref=f8e143] [cursor=pointer]
+          - button "TTFT" [ref=f8e145] [cursor=pointer]
+          - button "Model size" [ref=f8e147] [cursor=pointer]
+          - button "Quality" [ref=f8e149] [cursor=pointer]
+        - generic [ref=f8e152]:
+          - generic [ref=f8e153]: Arc has it
+          - button "Shipped" [ref=f8e154] [cursor=pointer]
+          - button "Built but off" [ref=f8e156] [cursor=pointer]
+          - button "Not built" [ref=f8e158] [cursor=pointer]
+          - button "Concept, nothing to ship" [ref=f8e160] [cursor=pointer]
+        - generic [ref=f8e162]: Showing 97 of 97 terms
+      - generic [ref=f8e164]:
+        - generic [ref=f8e165]:
+          - text: Pipeline
+          - generic [ref=f8e166]: 13 terms
+        - generic [ref=f8e167]:
+          - article [ref=f8e168]:
+            - generic [ref=f8e169]:
+              - heading "Tokenization" [level=3] [ref=f8e170]
+              - generic [ref=f8e171]: Shipped
+            - paragraph [ref=f8e172]: Turning the user's text into the integer ids the model actually reads. Roughly one token per four characters of English.
+            - paragraph [ref=f8e173]: "Like: Chopping a sentence into LEGO bricks the model has seen before."
+            - generic [ref=f8e174]:
+              - generic [ref=f8e175]: TTFT
+              - generic [ref=f8e176]: Quality
+            - paragraph [ref=f8e177]:
+              - text: "In Arc today Shipped, standard HF tokenizer. One real bug lived here: the tokenizer trie was silently"
+              - strong [ref=f8e178]: DELETING
+              - text: tokens whose bytes it could not resolve — the
+              - code [ref=f8e179]: ｜DSML｜
+              - text: warnings were never cosmetic, and the splice signature (
+              - code [ref=f8e180]: …####276000The total cost…
+              - text: ") is all over session-3 output. Fixed in PR #68. ⚠️"
+              - code [ref=f8e181]: ｜DSML｜
+              - text: is the delimiter every V4 tool call is built from, so
+              - strong [ref=f8e182]: V4 tool calling may still be broken
+              - text: — mechanism traced, never measured. One served request with
+              - code [ref=f8e183]: tools
+              - text: set settles it.
+          - article [ref=f8e184]:
+            - generic [ref=f8e185]:
+              - heading "Prefill" [level=3] [ref=f8e186]
+              - generic [ref=f8e187]: Shipped
+            - paragraph [ref=f8e188]: The whole prompt is pushed through the model in ONE pass, because every prompt token is already known.
+            - paragraph [ref=f8e189]: "Like: Reading the entire question before you start answering — you can take it in at a glance."
+            - generic [ref=f8e190]:
+              - generic [ref=f8e191]: TTFT
+              - generic [ref=f8e192]: Aggregate
+            - paragraph [ref=f8e193]:
+              - text: In Arc today
+              - strong [ref=f8e194]: Prefill has never been the problem.
+              - text: "It scales as designed: server-instrumented prefill rises"
+              - strong [ref=f8e195]: 4.8×
+              - text: from B=1→64
+              - code [ref=f8e196]: "[measured]"
+              - text: ", and in the latest sweep goes 78 tok/s at B=1 → 157 at B=256"
+              - code [ref=f8e197]: "[measured]"
+              - text: ". Use it as the discriminator: when the compute leg amortizes and the decode leg does not, the bug is in decode."
+          - article [ref=f8e198]:
+            - generic [ref=f8e199]:
+              - heading "Decode" [level=3] [ref=f8e200]
+              - generic [ref=f8e201]: Shipped
+            - paragraph [ref=f8e202]: Generating output ONE token at a time, each one depending on the last. Cannot be parallelised within a single request.
+            - paragraph [ref=f8e203]: "Like: Writing an answer word by word, where you must re-read everything you have written so far before each new word."
+            - generic [ref=f8e204]:
+              - generic [ref=f8e205]: Per-user
+              - generic [ref=f8e206]: Aggregate
+            - paragraph [ref=f8e207]:
+              - text: In Arc today
+              - strong [ref=f8e208]: This is the whole fight.
+              - text: b=1 decode is 16.27 tok/s
+              - code [ref=f8e209]: "[measured]"
+              - text: against a 1,413 tok/s ceiling
+              - code [ref=f8e210]: "[physics]"
+              - text: — 87×. Aggregate is 111.7 tok/s at B=256
+              - code [ref=f8e211]: "[measured]"
+              - text: against ~16,600
+              - code [ref=f8e212]: "[physics]"
+              - text: — ~149×.
+              - strong [ref=f8e213]: Every one of those gaps is implementation, not physics.
+              - text: "That is the good news: none of it is a law, all of it is code we control."
+          - article [ref=f8e214]:
+            - generic [ref=f8e215]:
+              - heading "Detokenization" [level=3] [ref=f8e216]
+              - generic [ref=f8e217]: Shipped
+            - paragraph [ref=f8e218]: Turning generated token ids back into the text the user reads.
+            - paragraph [ref=f8e219]: "Like: Gluing the LEGO bricks back into a sentence."
+            - generic [ref=f8e220]: Quality
+            - paragraph [ref=f8e222]:
+              - text: In Arc today Shipped — and it was silently corrupting output.
+              - code [ref=f8e223]: sampling.rs:38-48
+              - text: detokenizes every token through the trie, whose empty byte entries decode to
+              - strong [ref=f8e224]: nothing
+              - text: ", so a broken token id was deleted from the text and a stop-string could never match across the gap. Fixed in PR #68 by restoring the dropped bytes."
+          - article [ref=f8e225]:
+            - generic [ref=f8e226]:
+              - heading "Scheduling" [level=3] [ref=f8e227]
+              - generic [ref=f8e228]: Shipped
+            - paragraph [ref=f8e229]: Deciding, every single step, which of the waiting requests actually run in this batch.
+            - paragraph [ref=f8e230]: "Like: The maître d' deciding who gets seated this round."
+            - generic [ref=f8e231]:
+              - generic [ref=f8e232]: Aggregate
+              - generic [ref=f8e233]: TTFT
+            - paragraph [ref=f8e234]:
+              - text: "In Arc today Coalescing selector shipped (PR #54, ≈"
+              - strong [ref=f8e235]: 2×
+              - text: )
+              - code [ref=f8e236]: "[measured]"
+              - text: . Before it, B=64 logged
+              - strong [ref=f8e237]:
+                - code [ref=f8e238]: 32 running, 32 waiting
+              - text: — literally half the batch idle, a flat 2–2.5× loss, and the reason B=64 once scored *better* than B=32. V4 still takes the length-bucketing
+              - code [ref=f8e239]: DefaultScheduler
+              - text: (
+              - code [ref=f8e240]: default_scheduler.rs:128-168
+              - text: ) because paged attention reports false for it at
+              - code [ref=f8e241]: normal_loaders.rs:3231
+              - text: .
+          - article [ref=f8e242]:
+            - generic [ref=f8e243]:
+              - heading "Continuous batching" [level=3] [ref=f8e244]
+              - generic [ref=f8e245]: Shipped
+            - paragraph [ref=f8e246]: New requests join the running batch mid-flight instead of waiting for the current one to finish.
+            - paragraph [ref=f8e247]: "Like: A bus that lets people on at every stop instead of only at the depot."
+            - generic [ref=f8e248]:
+              - generic [ref=f8e249]: Aggregate
+              - generic [ref=f8e250]: TTFT
+            - paragraph [ref=f8e251]:
+              - text: "In Arc today Shipped, and verified rather than assumed:"
+              - code [ref=f8e252]: effective_B == B
+              - text: on all seven rows of the latest sweep, every concurrency verdict
+              - code [ref=f8e253]: pass
+              - text: ","
+              - strong [ref=f8e254]: 0 errors in 505 requests
+              - code [ref=f8e255]: "[measured]"
+              - text: .
+          - article [ref=f8e256]:
+            - generic [ref=f8e257]:
+              - heading "Batch size (B)" [level=3] [ref=f8e258]
+              - generic [ref=f8e259]: Concept
+            - paragraph [ref=f8e260]: How many user requests are being decoded at the same time. The single biggest dial on this page — and it trades aggregate against per-user.
+            - paragraph [ref=f8e261]: "Like: How many diners the kitchen cooks for in one round. More diners, more meals per hour, longer wait for yours."
+            - generic [ref=f8e262]:
+              - generic [ref=f8e263]: Aggregate
+              - generic [ref=f8e264]: Per-user
+              - generic [ref=f8e265]: TTFT
+              - generic [ref=f8e266]: Size
+            - paragraph [ref=f8e267]:
+              - text: In Arc today Sweeps run B=1…256. What caps B is
+              - strong [ref=f8e268]: memory, not compute
+              - text: ", and the ladder moved three times in one day: max B"
+              - strong [ref=f8e269]: 68 → 266
+              - text: (rolling
+              - code [ref=f8e270]: xs
+              - text: )
+              - strong [ref=f8e271]: → 493
+              - text: (KV dedup)
+              - strong [ref=f8e272]: → ~696
+              - text: (FP8 K, opt-in)
+              - code [ref=f8e273]: "[measured-by-design]"
+              - text: . ⚠️
+              - code [ref=f8e274]: "--max-seqs"
+              - strong [ref=f8e275]: defaults to 32
+              - text: — launch the server with it set at or above your largest B or you are silently measuring B=32.
+          - article [ref=f8e276]:
+            - generic [ref=f8e277]:
+              - heading "effective_B" [level=3] [ref=f8e278]
+              - generic [ref=f8e279]: Shipped
+            - paragraph [ref=f8e280]: The batch size that ACTUALLY ran concurrently, measured from overlapping decode windows — not the number you asked for.
+            - paragraph [ref=f8e281]: "Like: Counting the diners actually eating, not the number on the reservation."
+            - generic [ref=f8e282]: Aggregate
+            - paragraph [ref=f8e284]:
+              - text: In Arc today 🔑
+              - strong [ref=f8e285]: This check is the reason our numbers can be trusted.
+              - text: Because
+              - code [ref=f8e286]: "--max-seqs"
+              - text: "defaults to 32, a B=128 sweep against a default server is silently a B=32 sweep — and it still prints a plausible number: a run capped to B=2-of-8 reported"
+              - strong [ref=f8e287]: 190.01 tok/s vs a genuine B=16's 198.34, 4% apart and indistinguishable without this
+              - code [ref=f8e288]: "[measured]"
+              - text: ". Now asserted, mutation-tested on hardware, and the run exits non-zero on under-batching. ⚠️ Note the trap it replaced: *submit-window* overlap is a check that can never fail, because the launch barrier makes submissions overlap even under full serialization."
+          - article [ref=f8e289]:
+            - generic [ref=f8e290]:
+              - heading "Streaming" [level=3] [ref=f8e291]
+              - generic [ref=f8e292]: Shipped
+            - paragraph [ref=f8e293]: Sending each token to the user as it is produced, instead of waiting for the whole answer.
+            - paragraph [ref=f8e294]: "Like: Talking as you think, instead of writing the whole speech first."
+            - generic [ref=f8e295]: TTFT
+            - paragraph [ref=f8e297]: In Arc today Shipped (SSE, OpenAI-compatible). Costs nothing, and it is what makes TTFT the number the user actually feels rather than total completion time.
+          - article [ref=f8e298]:
+            - generic [ref=f8e299]:
+              - heading "Sampler (temperature, top-k, top-p)" [level=3] [ref=f8e300]
+              - generic [ref=f8e301]: Shipped
+            - paragraph [ref=f8e302]: Turning the model's score for every possible next token into one actual choice.
+            - paragraph [ref=f8e303]: "Like: A weighted dice roll over the model's shortlist. Temperature 0 means always take the favourite."
+            - generic [ref=f8e304]:
+              - generic [ref=f8e305]: Quality
+              - generic [ref=f8e306]: Per-user
+            - paragraph [ref=f8e307]:
+              - text: In Arc today Shipped, with two live facts worth carrying.
+              - strong [ref=f8e308]: Batched decode has NEVER used the GPU sampler
+              - text: — it is gated on
+              - code [ref=f8e309]: "!logits.device().is_cpu()"
+              - text: (
+              - code [ref=f8e310]: sampler.rs:1220
+              - text: ), a real open project. And every sweep we have ran at temperature 0, whose greedy path returns *above* the radix branch — which is why
+              - strong [ref=f8e311]: the “CPU sampler fallback” theory explained 0% of the throughput collapse
+              - text: despite being named confidently in a user-facing report. Name a suspect, then prove the path executes.
+          - article [ref=f8e312]:
+            - generic [ref=f8e313]:
+              - heading "Stop conditions (EOS, stop strings)" [level=3] [ref=f8e314]
+              - generic [ref=f8e315]: Shipped
+            - paragraph [ref=f8e316]: "How the engine knows to stop: a special end token, a caller-supplied string, or a token budget."
+            - paragraph [ref=f8e317]: "Like: The full stop at the end of the sentence."
+            - generic [ref=f8e318]:
+              - generic [ref=f8e319]: Quality
+              - generic [ref=f8e320]: Aggregate
+            - paragraph [ref=f8e321]:
+              - text: In Arc today EOS is safe — a plain id comparison (
+              - code [ref=f8e322]: sequence.rs:982-987
+              - text: ), the tokenizer trie is never consulted.
+              - strong [ref=f8e323]: Stop-STRING matching is not
+              - text: ": it rescans all completion bytes on every token, O(B·L²) ("
+              - code [ref=f8e324]: sequence.rs:1005
+              - text: ).
+              - strong [ref=f8e325]: Zero cost in every sweep we ran, because we set no stop strings — and a cliff waiting for the first customer who does.
+          - article [ref=f8e326]:
+            - generic [ref=f8e327]:
+              - heading "Chat template" [level=3] [ref=f8e328]
+              - generic [ref=f8e329]: Shipped
+            - paragraph [ref=f8e330]: The exact formatting — roles, special markers — that a chat model was trained to expect.
+            - paragraph [ref=f8e331]: "Like: The letterhead and salutation a formal letter needs, or it gets binned unread."
+            - generic [ref=f8e332]: Quality
+            - paragraph [ref=f8e334]:
+              - text: In Arc today Shipped,
+              - code [ref=f8e335]: chat_templates/deepseek_v4.json
+              - text: . Without
+              - code [ref=f8e336]: "--chat-template"
+              - text: the chat endpoint returns 422 — root cause of a lost hour in session 4, now in the runbook serve lines.
+          - article [ref=f8e337]:
+            - generic [ref=f8e338]:
+              - heading "Cold load / warm-up" [level=3] [ref=f8e339]
+              - generic [ref=f8e340]: Shipped
+            - paragraph [ref=f8e341]: The one-time cost of getting weights off disk into GPU memory before the first request is served.
+            - paragraph [ref=f8e342]: "Like: Preheating the oven. Once."
+            - generic [ref=f8e343]: TTFT
+            - paragraph [ref=f8e345]:
+              - text: In Arc today Cold load
+              - strong [ref=f8e346]: 2 m 11 s
+              - text: for the published artifact;
+              - strong [ref=f8e347]: 12.94 s for 517 tensors
+              - text: from a warm UQFF
+              - code [ref=f8e348]: "[measured]"
+              - text: . Post-load footprint 78,865 MiB of 143,771 MiB, peak resident at B=256 114,665 MiB
+              - code [ref=f8e349]: "[measured]"
+              - text: . ⚠️ On an 80 GB A100 the artifact alone occupies 75.7 GB, leaving ~4 GB for KV — which is why serving measurement has to happen on a 141 GB H200.
+        - generic [ref=f8e350]:
+          - text: Compression
+          - generic [ref=f8e351]: 18 terms
+        - generic [ref=f8e352]:
+          - article [ref=f8e353]:
+            - generic [ref=f8e354]:
+              - heading "Quantization" [level=3] [ref=f8e355]
+              - generic [ref=f8e356]: Shipped
+            - paragraph [ref=f8e357]: Storing each weight in fewer bits than the 16 it was trained in, so the model fits in less memory and moves fewer bytes per token.
+            - paragraph [ref=f8e358]: "Like: Re-encoding a lossless master as a high-quality MP3 — much smaller, and you have to prove nobody can hear the difference."
+            - generic [ref=f8e359]:
+              - generic [ref=f8e360]: Size
+              - generic [ref=f8e361]: Aggregate
+              - generic [ref=f8e362]: Per-user
+              - generic [ref=f8e363]: Quality
+            - paragraph [ref=f8e364]:
+              - text: In Arc today
+              - strong [ref=f8e365]: The reason V4-Flash runs on ONE GPU at all.
+              - text: 74.19 GB at 2.09 bits/param
+              - code [ref=f8e366]: "[measured]"
+              - text: ". Every published config of this model we surveyed needs 4× H200; the one W4A16 quant is 143 GB and its own card says TP=1 OOMs on a single 141 GB H200. ⚠️ Scope that honestly:"
+              - strong [ref=f8e367]: “none found in our survey”, not “none exists”.
+          - article [ref=f8e368]:
+            - generic [ref=f8e369]:
+              - heading "Bits per parameter (bpw)" [level=3] [ref=f8e370]
+              - generic [ref=f8e371]: Concept
+            - paragraph [ref=f8e372]: The average number of bits each weight costs. Sets both the file size and how many bytes must move per token — so it is a size number AND a speed number.
+            - paragraph [ref=f8e373]: "Like: The compression setting. Every bit you drop is a byte you never have to read, and a bit of accuracy you have to earn back somewhere else."
+            - generic [ref=f8e374]:
+              - generic [ref=f8e375]: Size
+              - generic [ref=f8e376]: Aggregate
+              - generic [ref=f8e377]: Per-user
+              - generic [ref=f8e378]: Quality
+            - paragraph [ref=f8e379]:
+              - text: In Arc today
+              - strong [ref=f8e380]: 2.09 bits/param
+              - code [ref=f8e381]: "[measured]"
+              - text: . ⚠️ “≈1.9 bits/param” was repeated in our own notes for weeks and was
+              - strong [ref=f8e382]: wrong
+              - text: — it divided by a 68 GB *estimate* instead of the real 74.19 GB. A reminder that a number is not measured just because it has been said often.
+          - article [ref=f8e383]:
+            - generic [ref=f8e384]:
+              - heading "QTIP" [level=3] [ref=f8e385]
+              - generic [ref=f8e386]: Shipped
+            - paragraph [ref=f8e387]: The 2-bit quantization family Arc ships. Weights are encoded as a PATH through a trellis rather than as independently rounded numbers.
+            - paragraph [ref=f8e388]: "Like: Instead of rounding each note of a melody separately, you pick the closest melody the instrument can actually play."
+            - generic [ref=f8e389]:
+              - generic [ref=f8e390]: Size
+              - generic [ref=f8e391]: Quality
+              - generic [ref=f8e392]: Per-user
+            - paragraph [ref=f8e393]:
+              - text: In Arc today Shipped and baked. Two rungs (
+              - code [ref=f8e394]: qtip2
+              - text: ","
+              - code [ref=f8e395]: qtip2b
+              - text: ). The published artifact header reads
+              - code [ref=f8e396]: mode=viterbi search=viterbi-beam(W=256) objective=mse rotation=hadamard-128
+              - code [ref=f8e397]: "[measured]"
+              - text: ", verified on the box rather than assumed."
+          - article [ref=f8e398]:
+            - generic [ref=f8e399]:
+              - heading "Trellis" [level=3] [ref=f8e400]
+              - generic [ref=f8e401]: Shipped
+            - paragraph [ref=f8e402]: A graph of allowed states across positions. The quantizer picks the best PATH through it, so each weight's code depends on its neighbours.
+            - paragraph [ref=f8e403]: "Like: A subway map where you must choose a whole route rather than teleport between stations. The constraint is exactly what buys you accuracy at 2 bits."
+            - generic [ref=f8e404]:
+              - generic [ref=f8e405]: Size
+              - generic [ref=f8e406]: Quality
+              - generic [ref=f8e407]: Per-user
+            - paragraph [ref=f8e408]:
+              - text: "In Arc today Shipped, and its cost is precisely located: decoding the trellis per symbol at inference time is what pins the decode GEMV near 15% of peak. ⇒"
+              - strong [ref=f8e409]: the ceiling is per-symbol decode serialization, so the fix is to decode FEWER SYMBOLS (computed codebook, wider geometry) — not to hide memory latency
+              - code [ref=f8e410]: "[measured, 98/98 kernel variants]"
+              - text: .
+          - article [ref=f8e411]:
+            - generic [ref=f8e412]:
+              - heading "Baking" [level=3] [ref=f8e413]
+              - generic [ref=f8e414]: Shipped
+            - paragraph [ref=f8e415]: The one-off, offline job that converts the full-precision checkpoint into Arc's compressed artifact.
+            - paragraph [ref=f8e416]: "Like: Developing the negatives. Slow, done once, and every print afterwards comes from it."
+            - generic [ref=f8e417]:
+              - generic [ref=f8e418]: Size
+              - generic [ref=f8e419]: Quality
+            - paragraph [ref=f8e420]:
+              - text: In Arc today
+              - strong [ref=f8e421]: Hours, not minutes — there is no 25-minute bake.
+              - text: "That figure came from a pre-PR#9 *greedy* binary, i.e. the banned method, and read as a speed win for days. Real:"
+              - code [ref=f8e422]: qtip2
+              - text: beam W=256 is
+              - strong [ref=f8e423]: 241 s/layer
+              - text: (H200) and
+              - strong [ref=f8e424]: 370–376 s/layer
+              - text: (A100);
+              - code [ref=f8e425]: qtip2b
+              - text: beam is
+              - strong [ref=f8e426]: 213 s/layer
+              - text: on A100 ⇒
+              - strong [ref=f8e427]: 2.55 h ≈ $3.80
+              - code [ref=f8e428]: "[measured]"
+              - text: . 💰 Bake
+              - code [ref=f8e429]: qtip2b
+              - text: on the
+              - strong [ref=f8e430]: A100, not the H200
+              - text: "— H200 wins wall-clock but loses dollars 2.1×, because the beam kernel is exactly the one that does not cash in H200 bandwidth. ⚠️ The artifact is buffered and written at the END: a killed bake loses everything, with no partial resume. ⚠️ Bake cost is a"
+              - strong [ref=f8e431]: product
+              - text: issue — customers bake too.
+          - article [ref=f8e432]:
+            - generic [ref=f8e433]:
+              - heading "ISQ (in-situ quantization)" [level=3] [ref=f8e434]
+              - generic [ref=f8e435]: Shipped
+            - paragraph [ref=f8e436]: Quantizing the model as it loads, in memory, instead of loading a pre-baked file.
+            - paragraph [ref=f8e437]: "Like: Compressing the photos while importing them, rather than importing an album that was already compressed."
+            - generic [ref=f8e438]:
+              - generic [ref=f8e439]: Size
+              - generic [ref=f8e440]: Quality
+            - paragraph [ref=f8e441]:
+              - text: In Arc today Shipped (
+              - code [ref=f8e442]: "--isq qtip2"
+              - text: "). Convenient for experiments and dangerous for claims: session 5's whole sweep came from an in-situ W=32 bake, so it measured the quantizer's speed but"
+              - strong [ref=f8e443]: did not validate the published artifact
+              - text: ", and no quality number could honestly be taken from it. That caveat has to ride with every ISQ measurement. ⚠️ Always bake with"
+              - code [ref=f8e444]: MISTRALRS_ISQ_SINGLETHREAD=1
+              - text: — 24 CPU threads thrashing one GPU cost 4–9 min/layer with no fallback warning.
+          - article [ref=f8e445]:
+            - generic [ref=f8e446]:
+              - heading "UQFF" [level=3] [ref=f8e447]
+              - generic [ref=f8e448]: Shipped
+            - paragraph [ref=f8e449]: Arc's on-disk format for a baked artifact — the shards you actually ship, publish and load.
+            - paragraph [ref=f8e450]: "Like: The pressed vinyl, as opposed to the studio session."
+            - generic [ref=f8e451]:
+              - generic [ref=f8e452]: Size
+              - generic [ref=f8e453]: TTFT
+            - paragraph [ref=f8e454]:
+              - text: "In Arc today Shipped:"
+              - strong [ref=f8e455]: 15 files, 74.19 GB, 8 shards + residual
+              - text: ", verified independently from the HF API, not from the uploader's claim"
+              - code [ref=f8e456]: "[measured]"
+              - text: . ⚠️
+              - strong [ref=f8e457]: It is an OVERLAY, not standalone
+              - text: —
+              - code [ref=f8e458]: "-m"
+              - text: must point at the SOURCE checkpoint;
+              - code [ref=f8e459]: residual.safetensors
+              - text: is only 1.7% of the artifact and carries no attention projections. It ships a
+              - code [ref=f8e460]: config.json
+              - text: "and tokenizer, which makes it *look* standalone: that is the trap."
+              - strong [ref=f8e461]: The published model card documents the FAILING form
+              - text: ", so a user following it cannot load the model. Packaging/doc defect, not corruption — fix before public release."
+          - article [ref=f8e462]:
+            - generic [ref=f8e463]:
+              - heading "Codebook (lookup vs computed)" [level=3] [ref=f8e464]
+              - generic [ref=f8e465]: Built · off
+            - paragraph [ref=f8e466]: The table mapping a trellis code back to an actual number. You can LOOK IT UP in memory, or COMPUTE it with arithmetic.
+            - paragraph [ref=f8e467]: "Like: A phone book versus a formula for the number. The formula needs no shelf space, and no trip to the shelf."
+            - generic [ref=f8e468]:
+              - generic [ref=f8e469]: Per-user
+              - generic [ref=f8e470]: Aggregate
+              - generic [ref=f8e471]: Size
+            - paragraph [ref=f8e472]:
+              - text: In Arc today 🔑
+              - strong [ref=f8e473]: "Merged (PR #46) but INERT until a bake activates it — none of its gain is in any number on this page."
+              - text: Measured
+              - strong [ref=f8e474]: 3.86–4.03×
+              - text: on the fused decode GEMV at k_in=7168 ⇒ ≈60% of peak
+              - code [ref=f8e475]: "[measured]"
+              - text: ", which"
+              - strong [ref=f8e476]: attacks the b=1 gap directly
+              - text: ", and ≈1.68× on bake time. Quality-neutral ("
+              - code [ref=f8e477]: sum2
+              - text: ": −0.0008 cos worst family, 5× smaller than a beam-width change already rejected). ⚠️ The"
+              - strong [ref=f8e478]: 1.81×
+              - text: figure came from the
+              - code [ref=f8e479]: split
+              - text: variant which is quality-NEGATIVE — do not cite it. ⚠️
+              - code [ref=f8e480]: ARC_QTIP_CODEBOOK
+              - text: /
+              - code [ref=f8e481]: ARC_QTIP_BEAM
+              - text: are read
+              - strong [ref=f8e482]: only
+              - text: by the
+              - code [ref=f8e483]: qtip2
+              - text: rung;
+              - code [ref=f8e484]: qtip2b
+              - text: "is computed-codebook by construction, so on the truck there is nothing to switch. Also found: the “shared” LUT is written"
+              - strong [ref=f8e485]: per layer
+              - text: ", ~90 MB duplicated."
+          - article [ref=f8e486]:
+            - generic [ref=f8e487]:
+              - heading "Viterbi" [level=3] [ref=f8e488]
+              - generic [ref=f8e489]: Shipped
+            - paragraph [ref=f8e490]: The exact algorithm for finding the single best path through a trellis. Optimal, and expensive.
+            - paragraph [ref=f8e491]: "Like: Checking every possible route through the city and taking the true shortest one."
+            - generic [ref=f8e492]:
+              - generic [ref=f8e493]: Quality
+              - generic [ref=f8e494]: Size
+            - paragraph [ref=f8e495]:
+              - text: "In Arc today Shipped and default since PR #9. Its full exhaustive form on"
+              - code [ref=f8e496]: qtip2b
+              - text: measured
+              - strong [ref=f8e497]: 8,257 s/layer
+              - text: on an A100 ⇒ 98.6 h ⇒
+              - strong [ref=f8e498]: $147 for one bake
+              - code [ref=f8e499]: "[measured]"
+              - text: . That number is why beam exists.
+          - article [ref=f8e500]:
+            - generic [ref=f8e501]:
+              - heading "Beam search" [level=3] [ref=f8e502]
+              - generic [ref=f8e503]: Shipped
+            - paragraph [ref=f8e504]: Viterbi, but keeping only the best W partial paths at each step instead of all of them.
+            - paragraph [ref=f8e505]: "Like: Keeping your 256 most promising routes instead of all 65,536 — almost always the same answer, a fraction of the work."
+            - generic [ref=f8e506]:
+              - generic [ref=f8e507]: Quality
+              - generic [ref=f8e508]: Size
+            - paragraph [ref=f8e509]:
+              - text: In Arc today Shipped on both rungs, and
+              - strong [ref=f8e510]: proven bit-exact against CPU on silicon
+              - text: (21/21 qtip CUDA tests; an unpruned W=256 beam IS the exhaustive DP, byte for byte)
+              - code [ref=f8e511]: "[measured]"
+              - text: . 🔑
+              - strong [ref=f8e512]: "Beam width barely affects bake time: W=256 is 82.7 s/layer vs W=32's 83.6 — about 1%"
+              - code [ref=f8e513]: "[measured]"
+              - text: ⇒
+              - strong [ref=f8e514]: ALWAYS BAKE W=256.
+              - text: Quality is free here, and a session that restarted at W=32 believing W drove bake time cost quality headroom and bought nothing.
+          - article [ref=f8e515]:
+            - generic [ref=f8e516]:
+              - heading "Exhaustive search" [level=3] [ref=f8e517]
+              - generic [ref=f8e518]: Shipped
+            - paragraph [ref=f8e519]: Evaluating every possible trellis state rather than pruning to a beam. A slightly better answer, for a great deal more time.
+            - paragraph [ref=f8e520]: "Like: Reading every book in the library instead of the 256 most likely ones."
+            - generic [ref=f8e521]: Quality
+            - paragraph [ref=f8e523]:
+              - text: In Arc today Shipped. It is genuinely
+              - strong [ref=f8e524]: better quality — wins 8 of 9 fixture cells, +0.0013…+0.0021 cosine, strictly lower weight NMSE everywhere
+              - code [ref=f8e525]: "[measured]"
+              - text: . We ship beam knowingly and declare the trade. ⚠️
+              - strong [ref=f8e526]: “Beam at no quality cost” was published and is RETRACTED
+              - text: — it was a single-fixture artifact. Exhaustive was rejected on
+              - strong [ref=f8e527]: speed
+              - text: ", not on quality."
+          - article [ref=f8e528]:
+            - generic [ref=f8e529]:
+              - heading "Greedy (BANNED)" [level=3] [ref=f8e530]
+              - generic [ref=f8e531]: Not built
+            - paragraph [ref=f8e532]: Picking the locally best code at each position with no lookahead. The fastest search, and the worst.
+            - paragraph [ref=f8e533]: "Like: Turning toward the destination at every junction, and ending up in a canal."
+            - generic [ref=f8e534]: Quality
+            - paragraph [ref=f8e536]:
+              - text: In Arc today 🚫
+              - strong [ref=f8e537]:
+                - text: Banned by doctrine D4 outside
+                - code [ref=f8e538]: cfg(test)
+                - text: ", and enforced in code"
+              - text: (
+              - code [ref=f8e539]: cuda_search_plan_never_substitutes_a_width
+              - text: "passes on hardware). Worth knowing why it is on this page:"
+              - strong [ref=f8e540]: every “~25 minute bake” figure in this project's history came from a pre-PR#9 greedy binary
+              - text: "— the exact quality downgrade that was forbidden — and was reported as a speed achievement for days. The ban also had a second, invisible cost: it"
+              - strong [ref=f8e541]: silently bricked the GEMV speed benchmarks
+              - text: ", whose fixtures called"
+              - code [ref=f8e542]: QtipMode::Greedy
+              - text: ", so a whole sweep was unrunnable on master for weeks."
+          - article [ref=f8e543]:
+            - generic [ref=f8e544]:
+              - heading "Hadamard rotation" [level=3] [ref=f8e545]
+              - generic [ref=f8e546]: Shipped
+            - paragraph [ref=f8e547]: Multiplying weights by a structured rotation before quantizing, so outliers get spread across the block instead of dominating it.
+            - paragraph [ref=f8e548]: "Like: Shaking a jar of mixed nuts so the big ones stop sitting on top. Everything quantizes more evenly afterwards."
+            - generic [ref=f8e549]:
+              - generic [ref=f8e550]: Quality
+              - generic [ref=f8e551]: Size
+            - paragraph [ref=f8e552]:
+              - text: In Arc today Shipped —
+              - code [ref=f8e553]: hadamard-128
+              - text: ", in the published artifact header"
+              - code [ref=f8e554]: "[measured]"
+              - text: . ⚠️ It flattens the
+              - strong [ref=f8e555]: diagonal only
+              - text: ; off-diagonal correlations survive and remain recoverable by error feedback (an unfired quality lever). ⚠️ Still
+              - strong [ref=f8e556]: MISSING on the indexer path
+              - text: —
+              - code [ref=f8e557]: rotate_activation
+              - text: plus compress-θ RoPE on the compressed indexer K — and that is what stands between the sparse attention path and going live.
+          - article [ref=f8e558]:
+            - generic [ref=f8e559]:
+              - heading "qtip2 vs qtip2b (the rungs)" [level=3] [ref=f8e560]
+              - generic [ref=f8e561]: Built · off
+            - paragraph [ref=f8e562]: Two trellis geometries. qtip2 is K=4/V=2 and carries the lookup codebook. qtip2b is K=2/V=1, computed by construction, and is the one that gets the fast BATCHED kernel.
+            - paragraph [ref=f8e563]: "Like: The van and the truck. The van is quicker off the line; the truck is the only one that keeps climbing when you load it up."
+            - generic [ref=f8e564]:
+              - generic [ref=f8e565]: Aggregate
+              - generic [ref=f8e566]: Per-user
+              - generic [ref=f8e567]: Size
+              - generic [ref=f8e568]: Quality
+            - paragraph [ref=f8e569]:
+              - text: In Arc today 🔑
+              - strong [ref=f8e570]:
+                - text: "The decision is made, by measurement: serve"
+                - code [ref=f8e571]: qtip2b
+                - text: .
+              - text: The gemv path is
+              - strong [ref=f8e572]: FLAT
+              - text: — 315 tok/s at B=64, 317 at B=128. Grouped
+              - strong [ref=f8e573]: CLIMBS
+              - text: — 322 at B=64,
+              - strong [ref=f8e574]: 527 at B=128
+              - code [ref=f8e575]: "[measured, MoE-GEMM floor only]"
+              - text: ". Jish: *“we'll not serve the van, we'll serve the truck.”*"
+              - code [ref=f8e576]: qtip2b
+              - text: "was written off as un-bakeable (≥984 s/layer, ≈11.75 h) until it grew a beam kernel (PR #74) — now"
+              - strong [ref=f8e577]: 213 s/layer, the cheapest rung to bake
+              - code [ref=f8e578]: "[measured]"
+              - text: ", and that “un-bakeable” verdict is retracted."
+              - strong [ref=f8e579]:
+                - text: The published artifact is still
+                - code [ref=f8e580]: qtip2
+                - text: .
+          - article [ref=f8e581]:
+            - generic [ref=f8e582]:
+              - heading "FP8 / E4M3" [level=3] [ref=f8e583]
+              - generic [ref=f8e584]: Built · off
+            - paragraph [ref=f8e585]: An 8-bit floating-point format — 4 exponent bits, 3 mantissa. Half the bytes of BF16 for values that never needed the precision.
+            - paragraph [ref=f8e586]: "Like: Storing a price as £12.50 rather than £12.4999999. The extra digits were not doing anything."
+            - generic [ref=f8e587]:
+              - generic [ref=f8e588]: Size
+              - generic [ref=f8e589]: Aggregate
+              - generic [ref=f8e590]: Per-user
+            - paragraph [ref=f8e591]:
+              - text: In Arc today FP8 blockwise GEMV is shipped. FP8
+              - strong [ref=f8e592]: KV storage
+              - text: is built,
+              - strong [ref=f8e593]: OPT-IN
+              - text: (
+              - code [ref=f8e594]: ARC_V4_FP8_KV=1
+              - text: ) and
+              - strong [ref=f8e595]: has never executed on CUDA
+              - text: . It is
+              - strong [ref=f8e596]: bit-exact by construction, not by approximation
+              - text: ":"
+              - code [ref=f8e597]: act_quant_kv_nope
+              - text: already E4M3-round-trips K's 448 nope dims in 64-wide blocks and then *widens back to BF16 and stores that* — so storing the codes instead is bitwise identical
+              - code [ref=f8e598]: "[measured-by-design]"
+              - text: . Worth 64,342 → 45,594 B/token ⇒ max B 493 → ~696. ⚠️ It shipped defaulted
+              - strong [ref=f8e599]: "ON"
+              - text: "without the GPU run its own design note demanded, and V4 could not serve at all for a day. Acceptance is cheap: greedy generation with the flag on vs off must produce identical tokens, ~15 min inside a rental that is already up."
+          - article [ref=f8e600]:
+            - generic [ref=f8e601]:
+              - heading "rANS (measured and REJECTED)" [level=3] [ref=f8e602]
+              - generic [ref=f8e603]: Not built
+            - paragraph [ref=f8e604]: Entropy coding — squeezing out the statistical redundancy left in an already-compressed file.
+            - paragraph [ref=f8e605]: "Like: Zipping a JPEG. There is nothing left to squeeze, and the zip header makes it bigger."
+            - generic [ref=f8e606]: Size
+            - paragraph [ref=f8e608]:
+              - text: In Arc today 🔴
+              - strong [ref=f8e609]: Measured on the real artifact (1.074 billion symbols) and REFUTED. Do not reopen without new evidence.
+              - text: Order-0 symbol entropy is
+              - strong [ref=f8e610]: 3.99987 of 4.0 bits ⇒ a 0.003% saving
+              - text: ; order-1 0.024%; order-2 0.259%. The per-row framing needed to keep random access costs
+              - strong [ref=f8e611]: +0.78% — 150–250× more than the entropy recovered.
+              - text: ⇒
+              - strong [ref=f8e612]: rANS makes the artifact BIGGER, before any decode cost.
+              - text: "That the trellis indices are already near-maximum-entropy is exactly what a good quantizer should produce. ✅ Real wins surfaced instead: F32"
+              - code [ref=f8e613]: row_scales
+              - text: → BF16 (~0.39%, free) and the per-layer duplicated LUT (~90 MB).
+          - article [ref=f8e614]:
+            - generic [ref=f8e615]:
+              - heading "Calibration / LDLQ error feedback" [level=3] [ref=f8e616]
+              - generic [ref=f8e617]: Not built
+            - paragraph [ref=f8e618]: Using a sample of real data during quantization, and pushing each block's rounding error forward into the next block instead of discarding it.
+            - paragraph [ref=f8e619]: "Like: A tailor fitting to the actual customer rather than to the average human — and remembering where the last seam ran long."
+            - generic [ref=f8e620]: Quality
+            - paragraph [ref=f8e622]:
+              - text: "In Arc today Not built. Named as an unfired quality lever precisely because rotation only flattens the diagonal: the off-diagonal correlations survive and stay recoverable. Would land as an"
+              - strong [ref=f8e623]: opt-in calibration pass for tenants who have data
+              - text: . Low priority while quality is already above target.
+          - article [ref=f8e624]:
+            - generic [ref=f8e625]:
+              - heading "Weight-only vs activation quantization" [level=3] [ref=f8e626]
+              - generic [ref=f8e627]: Shipped
+            - paragraph [ref=f8e628]: You can compress the stored weights, the numbers flowing through at runtime, or both. Weight-only is safe and standard; activation quantization is usually where accuracy goes to die.
+            - paragraph [ref=f8e629]: "Like: Compressing the cookbook versus compressing the ingredients."
+            - generic [ref=f8e630]:
+              - generic [ref=f8e631]: Size
+              - generic [ref=f8e632]: Per-user
+              - generic [ref=f8e633]: Quality
+            - paragraph [ref=f8e634]:
+              - text: In Arc today Arc's 2-bit is
+              - strong [ref=f8e635]: weight-only
+              - text: . Activations run BF16, with FP8 blockwise on some GEMV paths — and E4M3 round-tripping already happening inside
+              - code [ref=f8e636]: act_quant_kv_nope
+              - text: ", which is exactly what makes FP8 KV *storage* bit-exact rather than lossy. Worth knowing when comparing against a “W4A16” artifact: that name describes both halves."
+        - generic [ref=f8e637]:
+          - text: Attention
+          - generic [ref=f8e638]: 18 terms
+        - generic [ref=f8e639]:
+          - article [ref=f8e640]:
+            - generic [ref=f8e641]:
+              - heading "Attention" [level=3] [ref=f8e642]
+              - generic [ref=f8e643]: Shipped
+            - paragraph [ref=f8e644]: For each new token, mixing in information from every previous token, weighted by how relevant each one is.
+            - paragraph [ref=f8e645]: "Like: Re-reading the whole conversation before every word you say, and paying most attention to the parts that matter."
+            - generic [ref=f8e646]:
+              - generic [ref=f8e647]: Per-user
+              - generic [ref=f8e648]: Aggregate
+              - generic [ref=f8e649]: TTFT
+              - generic [ref=f8e650]: Quality
+            - paragraph [ref=f8e651]:
+              - text: "In Arc today Shipped. ⚠️ Its importance was badly mis-stated for a week: a stale b=1 profile taken on an abandoned"
+              - code [ref=f8e652]: cudnn
+              - text: build read
+              - code [ref=f8e653]: mla_attn 49% / moe 16%
+              - text: and made
+              - strong [ref=f8e654]: “attention is the frontier”
+              - text: the plan. The real profile
+              - strong [ref=f8e655]: at batch
+              - text: is
+              - code [ref=f8e656]: moe 49–64% / mla_attn 39%
+              - text: ", with MoE's share"
+              - strong [ref=f8e657]: growing
+              - text: with batch while everything else collapses
+              - code [ref=f8e658]: "[measured]"
+              - text: . Attention still matters — it is ~39% of decode and 81% of the per-token memory budget — but it is not the keystone.
+          - article [ref=f8e659]:
+            - generic [ref=f8e660]:
+              - heading "Dense / full attention" [level=3] [ref=f8e661]
+              - generic [ref=f8e662]: Shipped
+            - paragraph [ref=f8e663]: Every token attends to every previous token. Perfect recall, and cost that grows with the square of the sequence.
+            - paragraph [ref=f8e664]: "Like: Re-reading the entire book before every sentence you write."
+            - generic [ref=f8e665]:
+              - generic [ref=f8e666]: Per-user
+              - generic [ref=f8e667]: Quality
+              - generic [ref=f8e668]: Size
+            - paragraph [ref=f8e669]:
+              - text: In Arc today Shipped, and correct for most architectures.
+              - strong [ref=f8e670]: For V4-Flash it is actively wrong on the “standard” layers
+              - text: ": forcing dense-causal there ("
+              - code [ref=f8e671]: ARC_V4_STANDARD_DENSE=1
+              - text: ) drops long-context coherence
+              - strong [ref=f8e672]: 5/5 → 2/5
+              - code [ref=f8e673]: "[measured ablation]"
+              - text: ", because those layers then see relative distances beyond 128 that they were never trained on."
+          - article [ref=f8e674]:
+            - generic [ref=f8e675]:
+              - heading "Causal masking" [level=3] [ref=f8e676]
+              - generic [ref=f8e677]: Shipped
+            - paragraph [ref=f8e678]: Forbidding a token from seeing tokens that come after it, so that generation matches how the model was trained.
+            - paragraph [ref=f8e679]: "Like: Marking the exam so nobody can read ahead to the answers."
+            - generic [ref=f8e680]: Quality
+            - paragraph [ref=f8e682]:
+              - text: In Arc today Shipped — and a place we got burned badly.
+              - strong [ref=f8e683]: Batched prefill had NO causality
+              - text: ":"
+              - code [ref=f8e684]: sinks_attn_varlen
+              - text: passed a
+              - code [ref=f8e685]: None
+              - text: mask and the caller's
+              - code [ref=f8e686]: attention_mask
+              - text: was discarded on every live path. ⇒
+              - strong [ref=f8e687]: every batched-quality result taken before the fix is INVALID
+              - text: ", including anything using multi-sequence voting. Batch *throughput* numbers survived (identical kernel work); batched *outputs* did not"
+              - code [ref=f8e688]: "[measured]"
+              - text: ". Worth remembering as a shape: a bug can invalidate one axis of a measurement and leave another standing."
+          - article [ref=f8e689]:
+            - generic [ref=f8e690]:
+              - heading "Sliding window" [level=3] [ref=f8e691]
+              - generic [ref=f8e692]: Shipped
+            - paragraph [ref=f8e693]: Each token only attends to the last N tokens instead of all of them, so cost stops growing with sequence length.
+            - paragraph [ref=f8e694]: "Like: Only keeping the last page of the conversation in front of you."
+            - generic [ref=f8e695]:
+              - generic [ref=f8e696]: Size
+              - generic [ref=f8e697]: Per-user
+              - generic [ref=f8e698]: Quality
+            - paragraph [ref=f8e699]:
+              - text: In Arc today Shipped — window 128 on V4's standard layers (config at
+              - code [ref=f8e700]: deepseek4.rs:280-281
+              - text: "). Proven necessary by ablation, and proven *insufficient alone*: window + sink gives"
+              - strong [ref=f8e701]: 5/5 coherence but 0/4 needle recall
+              - code [ref=f8e702]: "[measured]"
+              - text: . Local fluency without long-range retrieval.
+          - article [ref=f8e703]:
+            - generic [ref=f8e704]:
+              - heading "Attention sink" [level=3] [ref=f8e705]
+              - generic [ref=f8e706]: Shipped
+            - paragraph [ref=f8e707]: Always keeping the first few tokens attendable, because models dump their excess attention mass there and fall apart without it.
+            - paragraph [ref=f8e708]: "Like: A lightning rod. Something has to absorb the charge, or it earths through your output."
+            - generic [ref=f8e709]: Quality
+            - paragraph [ref=f8e711]:
+              - text: In Arc today Shipped alongside the sliding window (
+              - code [ref=f8e712]: attn_sink
+              - text: field at
+              - code [ref=f8e713]: deepseek4.rs:908-914
+              - text: ", fed through"
+              - code [ref=f8e714]: SdpaParams.sinks
+              - text: ", kernel"
+              - code [ref=f8e715]: flash_attn_sinks.cu
+              - text: ). It is also
+              - strong [ref=f8e716]: part of why V4 cannot use the stock PagedAttention kernel
+              - text: — that kernel has no sink support at all.
+          - article [ref=f8e717]:
+            - generic [ref=f8e718]:
+              - heading "Sparse attention" [level=3] [ref=f8e719]
+              - generic [ref=f8e720]: Built · off
+            - paragraph [ref=f8e721]: Attending to a chosen SUBSET of previous tokens instead of all of them — picked by relevance rather than by position.
+            - paragraph [ref=f8e722]: "Like: Using the index of the book instead of re-reading every page."
+            - generic [ref=f8e723]:
+              - generic [ref=f8e724]: Per-user
+              - generic [ref=f8e725]: Aggregate
+              - generic [ref=f8e726]: Size
+              - generic [ref=f8e727]: Quality
+            - paragraph [ref=f8e728]:
+              - text: In Arc today 🟡
+              - strong [ref=f8e729]: V4's compressed/indexer path is Arc's sparse route, and it is NOT live.
+              - text: Still missing
+              - strong [ref=f8e730]:
+                - text: Hadamard
+                - code [ref=f8e731]: rotate_activation
+                - text: and compress-θ RoPE on the compressed indexer K
+              - code [ref=f8e732]: "[measured, wave28-BB]"
+              - text: — those two are the gate. ✅ The shape mismatch that looked like a corrupt artifact was a
+              - strong [ref=f8e733]: loader
+              - text: bug (the indexer kept a stale private copy of a fix already applied on the attention path — the fifth “N copies of one bug” case). Fixed by deleting the copy,
+              - strong [ref=f8e734]: no re-bake needed
+              - text: .
+          - article [ref=f8e735]:
+            - generic [ref=f8e736]:
+              - heading "MQA (multi-query attention)" [level=3] [ref=f8e737]
+              - generic [ref=f8e738]: Shipped
+            - paragraph [ref=f8e739]: All attention heads share ONE set of keys and values, so the KV cache is a fraction of the size.
+            - paragraph [ref=f8e740]: "Like: One shared filing cabinet for the whole office instead of one per desk."
+            - generic [ref=f8e741]:
+              - generic [ref=f8e742]: Size
+              - generic [ref=f8e743]: Per-user
+            - paragraph [ref=f8e744]:
+              - text: In Arc today 🔑
+              - strong [ref=f8e745]: V4-Flash is MQA — this was mis-stated as MLA in our own notes.
+              - text: Its fused
+              - code [ref=f8e746]: wkv
+              - text: makes K and V
+              - strong [ref=f8e747]: identical
+              - text: (
+              - code [ref=f8e748]: deepseek4.rs
+              - text: is literally
+              - code [ref=f8e749]: let v = k.copy()?
+              - text: "), which means storing them separately was wasting exactly half the KV cache. Dedup shipped: 1,026 → 590 B/token/layer, max B"
+              - strong [ref=f8e750]: 266 → 493
+              - code [ref=f8e751]: "[measured-by-design]"
+              - text: .
+          - article [ref=f8e752]:
+            - generic [ref=f8e753]:
+              - heading "GQA (grouped-query attention)" [level=3] [ref=f8e754]
+              - generic [ref=f8e755]: Shipped
+            - paragraph [ref=f8e756]: "The middle ground: heads share keys and values in groups. Most modern open models use it."
+            - paragraph [ref=f8e757]: "Like: One filing cabinet per team, rather than one per person or one for the whole building."
+            - generic [ref=f8e758]:
+              - generic [ref=f8e759]: Size
+              - generic [ref=f8e760]: Per-user
+            - paragraph [ref=f8e761]: In Arc today Supported in the engine for other architectures. Not the V4-Flash path — included so the term isn't a gap when you read someone else's engine docs.
+          - article [ref=f8e762]:
+            - generic [ref=f8e763]:
+              - heading "MLA (multi-head latent attention)" [level=3] [ref=f8e764]
+              - generic [ref=f8e765]: Shipped
+            - paragraph [ref=f8e766]: "DeepSeek's trick: store a small COMPRESSED latent per token and expand it back into keys and values on the fly."
+            - paragraph [ref=f8e767]: "Like: Keeping shorthand notes and expanding them when you need them, instead of filing full transcripts."
+            - generic [ref=f8e768]:
+              - generic [ref=f8e769]: Size
+              - generic [ref=f8e770]: Per-user
+            - paragraph [ref=f8e771]:
+              - text: In Arc today Shipped, including an
+              - strong [ref=f8e772]: absorbed-MLA decode
+              - text: path validated token-identical on 6/6 prompts
+              - code [ref=f8e773]: "[measured]"
+              - text: . ⚠️
+              - strong [ref=f8e774]: "Naming trap:"
+              - text: our profiler counter is called
+              - code [ref=f8e775]: mla_attn
+              - text: and reads 39% of decode at batch — but V4-Flash's KV geometry is MQA.
+              - strong [ref=f8e776]: Do not let a counter's name settle an architecture question
+              - text: ; that mix-up survived in our notes for days.
+          - article [ref=f8e777]:
+            - generic [ref=f8e778]:
+              - heading "CSA / HCA (compressed / hierarchical attention)" [level=3] [ref=f8e779]
+              - generic [ref=f8e780]: Shipped
+            - paragraph [ref=f8e781]: Folding a second, COMPRESSED set of keys into the same softmax as the local window, so one attention operation sees both near and far.
+            - paragraph [ref=f8e782]: "Like: Reading the last page in full and the chapter summaries for everything before it — in a single glance."
+            - generic [ref=f8e783]:
+              - generic [ref=f8e784]: Quality
+              - generic [ref=f8e785]: Size
+            - paragraph [ref=f8e786]:
+              - text: In Arc today Shipped in V4's layers (
+              - code [ref=f8e787]: dsv4_attention.rs
+              - text: ","
+              - code [ref=f8e788]: CompressRatio
+              - text: at
+              - code [ref=f8e789]: deepseek4.rs:470
+              - text: ": ratio 4 → CSA with top-k 512, ratio 128 → HCA). 🔑 It is also"
+              - strong [ref=f8e790]: the precise reason PagedAttention cannot be used here
+              - text: ": the stock kernel is"
+              - code [ref=f8e791]: DefaultAttention<false,false,false,false>
+              - text: — dense causal, ONE key set, no window, no sinks.
+          - article [ref=f8e792]:
+            - generic [ref=f8e793]:
+              - heading "Lightning Indexer" [level=3] [ref=f8e794]
+              - generic [ref=f8e795]: Built · off
+            - paragraph [ref=f8e796]: A small, cheap scorer that decides WHICH distant tokens are worth attending to — the gate that makes sparse attention actually pay.
+            - paragraph [ref=f8e797]: "Like: The index at the back of the book. Useless if nobody opens it."
+            - generic [ref=f8e798]:
+              - generic [ref=f8e799]: Per-user
+              - generic [ref=f8e800]: Aggregate
+              - generic [ref=f8e801]: Quality
+            - paragraph [ref=f8e802]:
+              - text: In Arc today 🟡
+              - strong [ref=f8e803]: Loaded from weights, never called.
+              - text: The struct and its forward exist (
+              - code [ref=f8e804]: models/dsv4_indexer.rs
+              - text: ) and are exercised only by tests; it is loaded for CSA layers and stored on the model — where the field carries an explicit
+              - strong [ref=f8e805]:
+                - code [ref=f8e806]: "#[allow(dead_code)]"
+              - text: ", and there is no"
+              - code [ref=f8e807]: self.indexer
+              - text: use anywhere in
+              - code [ref=f8e808]: deepseek4.rs
+              - text: or
+              - code [ref=f8e809]: dsv4_attention.rs
+              - text: . Its CUDA twin (
+              - code [ref=f8e810]: arc-cuda-graph/src/flashmlasparse.rs
+              - text: ","
+              - code [ref=f8e811]: indexer_score.cu
+              - text: ) is likewise unwired. ⚠️ It was one of three paths un-deaded by a single one-line fix (
+              - code [ref=f8e812]: cuda_tensor_ptr
+              - text: calling
+              - code [ref=f8e813]: as_cuda_slice::<u8>()
+              - text: unconditionally) —
+              - strong [ref=f8e814]: the sixth “wired, documented and dead” instance found in this codebase. Before trusting any instrumentation here, grep for its call site.
+          - article [ref=f8e815]:
+            - generic [ref=f8e816]:
+              - heading "FlashAttention (1 → 2 → 3)" [level=3] [ref=f8e817]
+              - generic [ref=f8e818]: Shipped
+            - paragraph [ref=f8e819]: Computing attention without ever writing the giant attention matrix to memory — it is tiled and kept in fast on-chip SRAM. FA2 improved the work partitioning across warps; FA3 adds Hopper-specific asynchrony and FP8.
+            - paragraph [ref=f8e820]: "Like: Doing long division in your head instead of writing every intermediate step onto paper you then have to fetch back."
+            - generic [ref=f8e821]:
+              - generic [ref=f8e822]: Per-user
+              - generic [ref=f8e823]: Aggregate
+              - generic [ref=f8e824]: TTFT
+              - generic [ref=f8e825]: Size
+            - paragraph [ref=f8e826]:
+              - text: In Arc today FA2 is what every measured session used (
+              - code [ref=f8e827]: "--features \"cuda flash-attn\""
+              - text: ","
+              - code [ref=f8e828]: flash_attn_varlen_windowed
+              - text: ).
+              - strong [ref=f8e829]:
+                - text: FA3 is wired behind a separate, mutually exclusive
+                - code [ref=f8e830]: flash-attn-v3
+                - text: feature and has not been measured here.
+              - text: "⚠️ Two live traps: adding"
+              - code [ref=f8e831]: cudnn
+              - text: costs
+              - strong [ref=f8e832]: −62% decode
+              - text: (5.45 vs 14.58 tok/s, same box, same bake) because it swaps the SDPA backend and bypasses flash-attn —
+              - strong [ref=f8e833]: do not add it
+              - text: ; and on the CUDA flash path
+              - code [ref=f8e834]: causal
+              - text: defaults to
+              - code [ref=f8e835]: seq_len > 1
+              - text: ", which silently breaks any encoder that needs bidirectional attention."
+          - article [ref=f8e836]:
+            - generic [ref=f8e837]:
+              - heading "PagedAttention" [level=3] [ref=f8e838]
+              - generic [ref=f8e839]: Built · off
+            - paragraph [ref=f8e840]: Storing the KV cache in fixed-size blocks like operating-system virtual memory, so a batch doesn't need one big contiguous slab per sequence.
+            - paragraph [ref=f8e841]: "Like: Hotel rooms instead of whole floors — you stop wasting the empty half of every booking."
+            - generic [ref=f8e842]:
+              - generic [ref=f8e843]: Aggregate
+              - generic [ref=f8e844]: Size
+              - generic [ref=f8e845]: TTFT
+            - paragraph [ref=f8e846]:
+              - text: In Arc today 🟡
+              - strong [ref=f8e847]: Built and tested. OFF for V4 by one line
+              - text: —
+              - code [ref=f8e848]: supports_paged_attention
+              - text: for the V4 loader returns
+              - code [ref=f8e849]: Ok(false)
+              - text: (
+              - code [ref=f8e850]: normal_loaders.rs:3231
+              - text: ", returning at"
+              - code [ref=f8e851]: :3275
+              - text: ), landed in a profiler commit.
+              - strong [ref=f8e852]: A probe is running.
+              - text: "Two independent blockers are verified in source: the MLA decode kernel fixes"
+              - code [ref=f8e853]: HEAD_DIM_CKV=512
+              - text: /
+              - code [ref=f8e854]: KPE=64
+              - text: as
+              - strong [ref=f8e855]: template
+              - text: arguments and a 448 instantiation
+              - strong [ref=f8e856]: does not compile
+              - text: (
+              - code [ref=f8e857]: static_assert(vec_size % 8 == 0)
+              - text: ); and it is dense-causal with one key set while every V4 layer is sliding-window + sink + CSA. ⚠️
+              - strong [ref=f8e858]: "It was called “the keystone unlocking three capabilities” and that was wrong twice: infeasible AND insufficient"
+              - text: — the
+              - code [ref=f8e859]: prime_for_step
+              - text: bridge does not exist either, so flipping the flag would not deliver graph decode. V4 uses it only as block KV *storage* via
+              - code [ref=f8e860]: cache_write_and_gather
+              - text: .
+              - strong [ref=f8e861]: It is fine and correct on other architectures.
+          - article [ref=f8e862]:
+            - generic [ref=f8e863]:
+              - heading "RadixAttention" [level=3] [ref=f8e864]
+              - generic [ref=f8e865]: Not built
+            - paragraph [ref=f8e866]: Sharing KV cache between requests that begin with the same text, using a radix TREE so any shared prefix is found automatically — not just exact matches.
+            - paragraph [ref=f8e867]: "Like: A shared filing system where two people researching the same topic reuse each other's notes, right down to the last common paragraph."
+            - generic [ref=f8e868]:
+              - generic [ref=f8e869]: TTFT
+              - generic [ref=f8e870]: Aggregate
+            - paragraph [ref=f8e871]:
+              - text: In Arc today 🔴
+              - strong [ref=f8e872]: Not built. A port with improvements is in flight.
+              - text: The only radix code in the tree is an unrelated GPU radix
+              - strong [ref=f8e873]: top-k sampler
+              - text: ;
+              - code [ref=f8e874]: radix_trie
+              - text: is a declared dependency in
+              - code [ref=f8e875]: Cargo.toml
+              - strong [ref=f8e876]: with no use site anywhere
+              - text: . Arc has a simpler prefix cache instead.
+              - strong [ref=f8e877]: This is the biggest unclaimed TTFT lever for realistic traffic
+              - text: ", where a system prompt repeats across every single request."
+          - article [ref=f8e878]:
+            - generic [ref=f8e879]:
+              - heading "Prefix caching" [level=3] [ref=f8e880]
+              - generic [ref=f8e881]: Built · off
+            - paragraph [ref=f8e882]: Remembering the KV cache for a prompt you have already processed, so an identical opening doesn't have to be prefilled again.
+            - paragraph [ref=f8e883]: "Like: Not re-reading the standing agenda at the start of every meeting."
+            - generic [ref=f8e884]:
+              - generic [ref=f8e885]: TTFT
+              - generic [ref=f8e886]: Aggregate
+            - paragraph [ref=f8e887]:
+              - text: In Arc today 🟡
+              - strong [ref=f8e888]:
+                - text: It exists (
+                - code [ref=f8e889]: prefix_cacher.rs
+                - text: ","
+                - code [ref=f8e890]: PrefixCacheManagerV2
+                - text: ), it is simpler than radix, and it is ON by default
+              - text: —
+              - code [ref=f8e891]: "--prefix-cache-n"
+              - text: defaults to 16. 🔴
+              - strong [ref=f8e892]:
+                - text: But it was explicitly disabled (
+                - code [ref=f8e893]: "--prefix-cache-n 0"
+                - text: ) in EVERY sweep we have ever run.
+              - text: ⇒
+              - strong [ref=f8e894]: every TTFT and throughput number on this page is the no-cache worst case
+              - text: ", and nobody has measured what turning it on is worth. A cache-key correctness fix landed recently (an entry is now keyed by the prefix its cache actually covers)."
+          - article [ref=f8e895]:
+            - generic [ref=f8e896]:
+              - heading "ArcAttention" [level=3] [ref=f8e897]
+              - generic [ref=f8e898]: Not built
+            - paragraph [ref=f8e899]: The named target for Arc's own attention path — the thing that would fold windowing, sinks, the compressed key set and paging into one kernel we control.
+            - paragraph [ref=f8e900]: "Like: The bespoke engine you build only after learning exactly why none of the off-the-shelf ones fit."
+            - generic [ref=f8e901]:
+              - generic [ref=f8e902]: Per-user
+              - generic [ref=f8e903]: Aggregate
+              - generic [ref=f8e904]: Size
+            - paragraph [ref=f8e905]:
+              - text: In Arc today 🔴
+              - strong [ref=f8e906]:
+                - text: A roadmap row in
+                - code [ref=f8e907]: arc-tools/M1_GATE.md
+                - text: (M4 column) and nothing else. Zero matches for
+                - code [ref=f8e908]: ArcAttention
+                - text: or
+                - code [ref=f8e909]: arc_attention
+                - text: in any
+                - code [ref=f8e910]: .rs
+                - text: or
+                - code [ref=f8e911]: .cu
+                - text: file.
+              - text: Listed here so it is never mistaken for something that exists. Everything under Attention above is the argument for why it might eventually need to.
+          - article [ref=f8e912]:
+            - generic [ref=f8e913]:
+              - heading "SDPA" [level=3] [ref=f8e914]
+              - generic [ref=f8e915]: Shipped
+            - paragraph [ref=f8e916]: “Scaled dot-product attention” — the standard interface the engine calls, which then dispatches to whichever backend is fastest.
+            - paragraph [ref=f8e917]: "Like: The plug socket. What is behind it changes; the shape does not."
+            - generic [ref=f8e918]:
+              - generic [ref=f8e919]: Per-user
+              - generic [ref=f8e920]: TTFT
+            - paragraph [ref=f8e921]:
+              - text: In Arc today Shipped.
+              - strong [ref=f8e922]:
+                - text: The dispatch behind it is exactly where the
+                - code [ref=f8e923]: cudnn
+                - text: regression hid
+              - text: ": same call, different backend, −62% decode. When a build flag changes performance and no code changed, look at what the interface dispatched to."
+          - article [ref=f8e924]:
+            - generic [ref=f8e925]:
+              - heading "RoPE / YaRN" [level=3] [ref=f8e926]
+              - generic [ref=f8e927]: Shipped
+            - paragraph [ref=f8e928]: How the model knows WHERE each token sits. RoPE rotates the query and key by position; YaRN stretches that scheme so a model trained short can run long.
+            - paragraph [ref=f8e929]: "Like: Seat numbers in a theatre. YaRN is how you renumber when you add rows the architect never drew."
+            - generic [ref=f8e930]: Quality
+            - paragraph [ref=f8e932]:
+              - text: "In Arc today Shipped, and it was wrong in two places:"
+              - strong [ref=f8e933]: YaRN was applied to ratio-0 layers
+              - text: "(the correct set is exactly {0, 1, 43} — an earlier audit's “0, 1, 42” was itself wrong), and the MTP block carried a stale RoPE table. Both fixed. ⚠️"
+              - strong [ref=f8e934]: These are why GSM8K 87.0%, the perplexity number and the long-context results are VOID rather than merely old.
+              - text: "⚠️ Related trap worth carrying: Mistral-native"
+              - code [ref=f8e935]: consolidated.safetensors
+              - text: stores Q/K with interleaved head dims, so it needs
+              - code [ref=f8e936]: is_gptx=false
+              - text: ; the wrong RoPE style gives cosine ~0.02 against reference — completely wrong output, no crash.
+        - generic [ref=f8e937]:
+          - text: Memory
+          - generic [ref=f8e938]: 8 terms
+        - generic [ref=f8e939]:
+          - article [ref=f8e940]:
+            - generic [ref=f8e941]:
+              - heading "KV cache" [level=3] [ref=f8e942]
+              - generic [ref=f8e943]: Shipped
+            - paragraph [ref=f8e944]: Every token's keys and values, kept so later tokens don't recompute them. It grows with every token, for every user, in every layer.
+            - paragraph [ref=f8e945]: "Like: The running transcript of the meeting. Cheap to append, and read out loud again before every new sentence."
+            - generic [ref=f8e946]:
+              - generic [ref=f8e947]: Size
+              - generic [ref=f8e948]: Aggregate
+              - generic [ref=f8e949]: Per-user
+            - paragraph [ref=f8e950]:
+              - text: In Arc today 88,064 B/token across 43 layers originally; deduped, then FP8-able down to 590 B/token/layer
+              - code [ref=f8e951]: "[measured-by-design]"
+              - text: .
+              - strong [ref=f8e952]: Post-#59 it is 81% of the per-token memory budget
+              - text: — it became the binding constraint the moment
+              - code [ref=f8e953]: xs
+              - text: stopped being one. ⚠️ The reference stores 584 B/token/layer, so we are now within a few bytes of it rather than 1.75× over.
+          - article [ref=f8e954]:
+            - generic [ref=f8e955]:
+              - 'heading "The `xs` compressor cache" [level=3] [ref=f8e956]'
+              - generic [ref=f8e957]: Shipped
+            - paragraph [ref=f8e958]: V4's context compressor kept a raw history buffer per sequence — separate from, and once far larger than, the KV cache itself.
+            - paragraph [ref=f8e959]: "Like: Keeping the full uncut recording as well as the transcript, when all anyone ever plays is the summary."
+            - generic [ref=f8e960]:
+              - generic [ref=f8e961]: Size
+              - generic [ref=f8e962]: Aggregate
+            - paragraph [ref=f8e963]:
+              - text: In Arc today 🔑
+              - strong [ref=f8e964]: Was 335,954 B/token — 3.8× the KV cache and 79% of all per-token memory.
+              - text: It was recomputed from a raw
+              - code [ref=f8e965]: "[B,T,hidden]"
+              - text: buffer every step, while the compressor only ever consumed a stride-
+              - code [ref=f8e966]: ratio
+              - text: "reduction of it. A rolling compressed state (PR #59) cut it"
+              - strong [ref=f8e967]: 60.7×
+              - text: ": 424,018 → 108,288 B/token, max batch"
+              - strong [ref=f8e968]: 68 → 266
+              - code [ref=f8e969]: "[measured-by-design]"
+              - text: .
+              - strong [ref=f8e970]: This single fix is what made B=128 and B=256 runnable at all
+              - text: — they were out of memory by 3.91× before it. A textbook case of the keystone being an accounting mistake rather than a kernel.
+          - article [ref=f8e971]:
+            - generic [ref=f8e972]:
+              - heading "Block tables / paging" [level=3] [ref=f8e973]
+              - generic [ref=f8e974]: Built · off
+            - paragraph [ref=f8e975]: The lookup table saying which physical KV block holds which logical position — the bookkeeping that makes non-contiguous caches possible.
+            - paragraph [ref=f8e976]: "Like: The page table in an operating system. Boring, and everything depends on it."
+            - generic [ref=f8e977]:
+              - generic [ref=f8e978]: Size
+              - generic [ref=f8e979]: Aggregate
+            - paragraph [ref=f8e980]:
+              - text: In Arc today Built inside
+              - code [ref=f8e981]: mistralrs-paged-attn
+              - text: (
+              - code [ref=f8e982]: cache_engine.rs
+              - text: ","
+              - code [ref=f8e983]: block_pool.rs
+              - text: ), unused on V4 because paged attention is off there. V4's only paged call site is
+              - code [ref=f8e984]: cache_write_and_gather
+              - text: —
+              - strong [ref=f8e985]: storage, with no head-size dispatch
+              - text: ", which is why the “head_dim=512” rationale that was once given for the flag was inapplicable."
+          - article [ref=f8e986]:
+            - generic [ref=f8e987]:
+              - heading "HBM bandwidth" [level=3] [ref=f8e988]
+              - generic [ref=f8e989]: Concept
+            - paragraph [ref=f8e990]: How many bytes per second the GPU can pull from its own memory. For decode, this is the speed limit — not the arithmetic rate.
+            - paragraph [ref=f8e991]: "Like: The width of the pipe. It does not matter how fast the tap turns if the pipe is the same."
+            - generic [ref=f8e992]:
+              - generic [ref=f8e993]: Per-user
+              - generic [ref=f8e994]: Aggregate
+            - paragraph [ref=f8e995]:
+              - text: "In Arc today H200:"
+              - strong [ref=f8e996]: 4.8 TB/s
+              - code [ref=f8e997]: "[physics]"
+              - text: . Every ceiling in
+              - code [ref=f8e998]: CEILINGS.json
+              - text: "is this number divided by bytes-per-step, and it is what makes the fleet case concrete: 74.19 GB ÷ 4.8 TB/s ="
+              - strong [ref=f8e999]: 15.4 ms/step
+              - text: at full expert coverage ⇒ ~16,600 tok/s aggregate at B=256
+              - code [ref=f8e1000]: "[physics]"
+              - text: . ⚠️ Quote
+              - strong [ref=f8e1001]: "% of peak"
+              - text: ", never raw GB/s, when comparing kernels across cards — an A30 reached a *higher* fraction of its peak than an H200 did on the same kernel."
+          - article [ref=f8e1002]:
+            - generic [ref=f8e1003]:
+              - heading "Memory-bound vs compute-bound" [level=3] [ref=f8e1004]
+              - generic [ref=f8e1005]: Concept
+            - paragraph [ref=f8e1006]: Whether you are waiting on bytes arriving or on arithmetic finishing. Decode is memory-bound; prefill is compute-bound. They need OPPOSITE fixes.
+            - paragraph [ref=f8e1007]: "Like: A chef waiting on deliveries versus a chef waiting on the oven. Buying a bigger oven does nothing for the first one."
+            - generic [ref=f8e1008]:
+              - generic [ref=f8e1009]: Per-user
+              - generic [ref=f8e1010]: Aggregate
+              - generic [ref=f8e1011]: TTFT
+            - paragraph [ref=f8e1012]:
+              - text: In Arc today
+              - strong [ref=f8e1013]: The single most useful asymmetry on this page.
+              - text: It is why prefill already scales 4.8× across a batch while decode does not
+              - code [ref=f8e1014]: "[measured]"
+              - text: "; why batching lifts aggregate but never per-user; and why “make the kernel do less arithmetic” is usually the wrong instinct during decode. It is also why the cp.async GEMV work failed:"
+              - strong [ref=f8e1015]: at ~15% of peak that kernel is not latency-bound, so hiding latency could not possibly pay
+              - text: — the premise was disproven, not merely unrealized.
+          - article [ref=f8e1016]:
+            - generic [ref=f8e1017]:
+              - heading "Roofline" [level=3] [ref=f8e1018]
+              - generic [ref=f8e1019]: Concept
+            - paragraph [ref=f8e1020]: "The simple upper bound: bytes you must move, divided by bandwidth. If you are far under it, the gap is your code."
+            - paragraph [ref=f8e1021]: "Like: The speed-limit sign. Being at 1% of it tells you nothing about the road and everything about your driving."
+            - generic [ref=f8e1022]:
+              - generic [ref=f8e1023]: Aggregate
+              - generic [ref=f8e1024]: Per-user
+            - paragraph [ref=f8e1025]:
+              - text: In Arc today ⚠️
+              - strong [ref=f8e1026]: We got this wrong twice, both times pessimistically.
+              - text: “0.2% of roofline” assumed all 74 GB is read every step even at small batch — at B=1 only ~3.4 GB moves, so the roofline itself was overstated ~8×. And a “b=1 ceiling of 560 tok/s” guessed the dense term at 7 GB when it is
+              - strong [ref=f8e1027]: 1.70 GB
+              - text: . 🟢
+              - strong [ref=f8e1028]: The real b=1 ceiling is 1,413 tok/s
+              - code [ref=f8e1029]: "[physics]"
+              - text: — which made a 640 tok/s target
+              - strong [ref=f8e1030]: conservative
+              - text: ", not ambitious. Recompute the bound before believing a gap."
+          - article [ref=f8e1031]:
+            - generic [ref=f8e1032]:
+              - heading "KV budget / max batch" [level=3] [ref=f8e1033]
+              - generic [ref=f8e1034]: Shipped
+            - paragraph [ref=f8e1035]: Total memory left after the weights, divided by memory per token, divided by context length. This — not the kernel — is what sets how many users fit.
+            - paragraph [ref=f8e1036]: "Like: How many people fit in the lifeboat after the engine is aboard."
+            - generic [ref=f8e1037]:
+              - generic [ref=f8e1038]: Size
+              - generic [ref=f8e1039]: Aggregate
+            - paragraph [ref=f8e1040]:
+              - text: "In Arc today On an H200: 141 − 74.2 − ~8 reserve ⇒"
+              - strong [ref=f8e1041]: ~59 GB usable
+              - text: "(earlier arithmetic said ~65 and was based on a 68 GB estimate). The ladder, three independent cuts: 424,018 → 108,288 → 64,342 B/token ⇒ max B"
+              - strong [ref=f8e1042]: 68 → 266 → 493
+              - text: ", and"
+              - strong [ref=f8e1043]: ~696
+              - text: with FP8 K
+              - code [ref=f8e1044]: "[measured-by-design]"
+              - text: . 🔑
+              - strong [ref=f8e1045]: This ladder, not the kernel, is what sets the fleet number
+              - text: — past expert saturation, aggregate is just B ÷ 15.4 ms.
+          - article [ref=f8e1046]:
+            - generic [ref=f8e1047]:
+              - heading "Context length" [level=3] [ref=f8e1048]
+              - generic [ref=f8e1049]: Shipped
+            - paragraph [ref=f8e1050]: How many tokens the model can hold at once. It multiplies every per-token memory cost, so it trades directly against batch size.
+            - paragraph [ref=f8e1051]: "Like: The length of the table. Everything you store per guest gets multiplied by it."
+            - generic [ref=f8e1052]:
+              - generic [ref=f8e1053]: Size
+              - generic [ref=f8e1054]: TTFT
+              - generic [ref=f8e1055]: Quality
+            - paragraph [ref=f8e1056]:
+              - text: In Arc today Long context validated
+              - strong [ref=f8e1057]: 5/5 coherence + 4/4 needle
+              - code [ref=f8e1058]: "[measured — provisional, YaRN changed afterwards]"
+              - text: ". The arithmetic that matters: at 2,048 tokens and 424,018 B/token one sequence cost ~868 MB and capped B near 68. Cut the per-token cost and the batch ceiling moves; that is the entire"
+              - code [ref=f8e1059]: xs
+              - text: story.
+        - generic [ref=f8e1060]:
+          - text: Execution
+          - generic [ref=f8e1061]: 9 terms
+        - generic [ref=f8e1062]:
+          - article [ref=f8e1063]:
+            - generic [ref=f8e1064]:
+              - heading "CUDA graphs" [level=3] [ref=f8e1065]
+              - generic [ref=f8e1066]: Built · off
+            - paragraph [ref=f8e1067]: Recording a whole sequence of GPU operations once and replaying it as a single unit, so the CPU stops re-issuing them every step.
+            - paragraph [ref=f8e1068]: "Like: Recording a dance routine instead of shouting every step from the sidelines, every night."
+            - generic [ref=f8e1069]:
+              - generic [ref=f8e1070]: Per-user
+              - generic [ref=f8e1071]: Aggregate
+            - paragraph [ref=f8e1072]:
+              - text: In Arc today 🔴
+              - strong [ref=f8e1073]: Unreachable on V4 today.
+              - text: The
+              - code [ref=f8e1074]: autonomous_decode
+              - text: path refuses on three distinct conditions before capture is even attempted (
+              - code [ref=f8e1075]: normal.rs
+              - text: "):"
+              - strong [ref=f8e1076]: (1)
+              - text: the dedicated decode path is unavailable — “Candle forward isn't graph-capturable”;
+              - strong [ref=f8e1077]: (2)
+              - text: custom logits processors are present, which the GPU sampler cannot run;
+              - strong [ref=f8e1078]: (3)
+              - code [ref=f8e1079]: top_nsigma
+              - text: is set, which it does not implement. It then also needs a
+              - code [ref=f8e1080]: cache_config
+              - text: ","
+              - strong [ref=f8e1081]:
+                - text: and that is the one downstream of
+                - code [ref=f8e1082]: supports_paged_attention=false
+              - text: . ⚠️ Flipping the paged flag would still not be enough — the
+              - code [ref=f8e1083]: prime_for_step
+              - text: bridge does not exist, so the runner never finishes a batch.
+              - strong [ref=f8e1084]: Reachable and useful for other models.
+              - text: "⚠️ And note:"
+              - strong [ref=f8e1085]: eight ranked host costs were found that graphs would not fix
+              - text: ", which is why the megakernel work stays correctly deferred."
+          - article [ref=f8e1086]:
+            - generic [ref=f8e1087]:
+              - heading "Kernel launch overhead" [level=3] [ref=f8e1088]
+              - generic [ref=f8e1089]: Concept
+            - paragraph [ref=f8e1090]: The fixed CPU cost of telling the GPU to do something — paid per operation, per layer, per step, whether the operation is huge or tiny.
+            - paragraph [ref=f8e1091]: "Like: The phone call before each delivery. Fine for one lorry; ruinous for a thousand envelopes."
+            - generic [ref=f8e1092]:
+              - generic [ref=f8e1093]: Per-user
+              - generic [ref=f8e1094]: Aggregate
+            - paragraph [ref=f8e1095]:
+              - text: In Arc today Real, and
+              - strong [ref=f8e1096]: repeatedly mis-blamed
+              - text: . The b=1 gap was confidently called “per-step host overhead” and that was
+              - strong [ref=f8e1097]: wrong
+              - text: ": the host-copy term contributes exactly zero at b=1 ("
+              - code [ref=f8e1098]: logits_on_cpu = len > 1
+              - text: is false there), and the profile shows
+              - code [ref=f8e1099]: forward_total 67.24 ms
+              - text: against a 61.5 ms step —
+              - strong [ref=f8e1100]: the step IS the forward
+              - text: . ⇒
+              - strong [ref=f8e1101]: b=1 is a GPU kernel-efficiency problem, and we already have a measured fix for it.
+              - text: Good news that was stated as bad news for a week.
+          - article [ref=f8e1102]:
+            - generic [ref=f8e1103]:
+              - heading "GEMV (matrix × vector)" [level=3] [ref=f8e1104]
+              - generic [ref=f8e1105]: Shipped
+            - paragraph [ref=f8e1106]: "The shape of the maths when you have exactly ONE token: a huge matrix times a single vector. Reads every weight, then does almost no arithmetic with it."
+            - paragraph [ref=f8e1107]: "Like: Driving an articulated lorry to collect one parcel. All of the fuel, none of the payload."
+            - generic [ref=f8e1108]: Per-user
+            - paragraph [ref=f8e1110]:
+              - text: In Arc today 🔴
+              - strong [ref=f8e1111]: Pinned at ~9.4–15% of peak — open and unacceptable.
+              - text: ⚠️ Quote the
+              - strong [ref=f8e1112]: percentage
+              - text: ", not the GB/s: an A30 reached"
+              - strong [ref=f8e1113]: 15.4%
+              - text: where the H200 reached
+              - strong [ref=f8e1114]: 9.4–9.7%
+              - text: on the same kernel ⇒
+              - strong [ref=f8e1115]: this is our implementation, not a format limit
+              - text: ", and the cheap box was not flattering us. (Another implementation of this format publishes ~80% of peak —"
+              - strong [ref=f8e1116]: their number, not one we have run.
+              - text: ) ✅ Autotune found
+              - strong [ref=f8e1117]: 2.3×
+              - text: (450–467 GB/s) and shipped it as the dispatch default. 🔴
+              - strong [ref=f8e1118]: "Gen-2 cp.async is DEAD: 98/98 variants measured, it loses 8–11%"
+              - text: ", and every structural axis measured negative (split-K, staged width, warp specialization −38%)."
+              - strong [ref=f8e1119]: The premise is disproven, not unrealized
+              - text: — the real ceiling is per-symbol trellis decode serialization.
+          - article [ref=f8e1120]:
+            - generic [ref=f8e1121]:
+              - heading "GEMM (matrix × matrix)" [level=3] [ref=f8e1122]
+              - generic [ref=f8e1123]: Shipped
+            - paragraph [ref=f8e1124]: The same weights multiplied by MANY tokens at once. Every weight byte you fetch does far more work.
+            - paragraph [ref=f8e1125]: "Like: The same lorry, fully loaded. Same fuel, forty times the payload."
+            - generic [ref=f8e1126]:
+              - generic [ref=f8e1127]: Aggregate
+              - generic [ref=f8e1128]: TTFT
+            - paragraph [ref=f8e1129]:
+              - text: "In Arc today This is why prefill is healthy while decode is not, and it is the entire mechanism behind the fleet thesis:"
+              - strong [ref=f8e1130]: batching is how you turn decode's GEMV shape into prefill's GEMM shape.
+              - text: Everything under MoE below is about whether the expert path is allowed to make that conversion.
+          - article [ref=f8e1131]:
+            - generic [ref=f8e1132]:
+              - heading "Grouped GEMM" [level=3] [ref=f8e1133]
+              - generic [ref=f8e1134]: Built · off
+            - paragraph [ref=f8e1135]: One kernel doing many differently-shaped matrix multiplies at once — necessary when 256 experts each receive a different, ragged handful of tokens.
+            - paragraph [ref=f8e1136]: "Like: One delivery run serving 256 shops with different order sizes, instead of 256 separate runs."
+            - generic [ref=f8e1137]: Aggregate
+            - paragraph [ref=f8e1139]:
+              - text: In Arc today 🔑
+              - strong [ref=f8e1140]:
+                - text: The keystone of the fleet claim. Built (
+                - code [ref=f8e1141]: qtip_grouped_gemm.cu
+                - text: ", 5/5 hardware parity), live on the"
+                - code [ref=f8e1142]: qtip2b
+                - text: rung — but the published artifact is
+                - code [ref=f8e1143]: qtip2
+                - text: ", so it is not what serves today."
+              - text: "It carries a real, stable per-unit handicap:"
+              - strong [ref=f8e1144]: 8.2 µs/unit vs gemv's 4.4 — 1.88×
+              - text: — which is exactly why the crossover sits at
+              - strong [ref=f8e1145]: B=64
+              - text: "and not lower. Past it:"
+              - strong [ref=f8e1146]: 1.66× at B=128 and still climbing while gemv is flat
+              - code [ref=f8e1147]: "[measured]"
+              - text: ". ✅ Worth noting: a blind prediction pre-committed to “dead if grouped never overtakes below B=68”, called crossover at 52 ± 15, and measured 64 — the first prediction in this program to survive contact with hardware."
+          - article [ref=f8e1148]:
+            - generic [ref=f8e1149]:
+              - heading "Host vs device time" [level=3] [ref=f8e1150]
+              - generic [ref=f8e1151]: Concept
+            - paragraph [ref=f8e1152]: Whether the CPU or the GPU is the one holding everything up. The answer is usually the opposite of the guess.
+            - paragraph [ref=f8e1153]: "Like: Is the kitchen slow, or is it the one waiter?"
+            - generic [ref=f8e1154]:
+              - generic [ref=f8e1155]: Aggregate
+              - generic [ref=f8e1156]: Per-user
+            - paragraph [ref=f8e1157]:
+              - text: In Arc today 🔴
+              - strong [ref=f8e1158]: "The clearest measurement in the whole program: at B=256 the server pegged 100% of ONE core of 44 while the GPU sat at 0–4% and 121 W of 700"
+              - code [ref=f8e1159]: "[measured]"
+              - text: . The same box at B=64/128 drew 420–476 W. That led to an
+              - strong [ref=f8e1160]: O(B²) host copy
+              - text: ":"
+              - code [ref=f8e1161]: Tensor::i()
+              - text: returns a *view* and
+              - code [ref=f8e1162]: to_device
+              - text: copies the *whole* storage, so the per-sequence logits D2H dragged all B×vocab elements, B times ⇒
+              - strong [ref=f8e1163]: 16.94 GB per step at B=256
+              - text: ", fixed to 66.2 MB. 🔑"
+              - strong [ref=f8e1164]: The shape was the proof, not just the code
+              - text: ": aggregate can only *plateau* under a linear step cost — only a quadratic term can make it *fall*, which is exactly what 128→256 did. ⚠️ A linear"
+              - strong [ref=f8e1165]: 24.26 ms/sequence
+              - text: term remains
+              - strong [ref=f8e1166]: UNATTRIBUTED
+              - text: — about 69 points of the B=64 step. Next hunt.
+          - article [ref=f8e1167]:
+            - generic [ref=f8e1168]:
+              - heading "Synchronisation stalls" [level=3] [ref=f8e1169]
+              - generic [ref=f8e1170]: Concept
+            - paragraph [ref=f8e1171]: The GPU idling because the CPU asked it for an answer and then waited — or because a lock is held while everyone else spins.
+            - paragraph [ref=f8e1172]: "Like: Everyone standing still because one person is reading the map."
+            - generic [ref=f8e1173]:
+              - generic [ref=f8e1174]: Per-user
+              - generic [ref=f8e1175]: Aggregate
+            - paragraph [ref=f8e1176]:
+              - text: In Arc today Two named mechanisms, both confirmed in source.
+              - strong [ref=f8e1177]:
+                - code [ref=f8e1178]: get_mut_group!
+                - text: is a
+                - code [ref=f8e1179]: try_lock
+                - text: +
+                - code [ref=f8e1180]: yield_now
+                - text: BUSY-WAIT
+              - text: taken 5× per token per sequence (
+              - code [ref=f8e1181]: utils/mod.rs:227-237
+              - text: ) —
+              - strong [ref=f8e1182]: this is the mechanism that converts lock contention into “100% of one core with the GPU idle”
+              - text: . And the post-sample loop
+              - code [ref=f8e1183]: .await
+              - text: s a send per sequence
+              - strong [ref=f8e1184]: on the engine task holding the pipeline mutex
+              - text: ", while sampling itself is rayon-parallel ⇒ 43 of 44 cores idle. ⚠️ Related standing rule: never call"
+              - code [ref=f8e1185]: Tensor::from_vec
+              - text: /
+              - code [ref=f8e1186]: arange
+              - text: with a GPU device inside a hot loop — it forces a CPU→GPU sync.
+          - article [ref=f8e1187]:
+            - generic [ref=f8e1188]:
+              - heading "Megakernel / fused decode" [level=3] [ref=f8e1189]
+              - generic [ref=f8e1190]: Not built
+            - paragraph [ref=f8e1191]: Collapsing a whole decode step into one giant kernel, so the GPU never hands control back to the CPU between layers.
+            - paragraph [ref=f8e1192]: "Like: One continuous production line instead of a thousand handoffs."
+            - generic [ref=f8e1193]: Per-user
+            - paragraph [ref=f8e1195]:
+              - text: In Arc today 🟡
+              - strong [ref=f8e1196]: Deliberately deferred, and correctly so
+              - text: — eight ranked host costs were found that are fixable now and need none of it, and the b=1 term turned out to be kernel efficiency rather than dispatch. This is what stands between today's b=1 and the 640 tok/s target *after* the cheaper wins are taken, not before.
+          - article [ref=f8e1197]:
+            - generic [ref=f8e1198]:
+              - heading "Autotuning / dispatch table" [level=3] [ref=f8e1199]
+              - generic [ref=f8e1200]: Shipped
+            - paragraph [ref=f8e1201]: Measuring many kernel variants on the real hardware and baking the winners into the dispatch table.
+            - paragraph [ref=f8e1202]: "Like: Trying every gear ratio on the actual track, then welding the winner in."
+            - generic [ref=f8e1203]:
+              - generic [ref=f8e1204]: Per-user
+              - generic [ref=f8e1205]: Aggregate
+            - paragraph [ref=f8e1206]:
+              - text: "In Arc today Shipped (PR #20): 43+ variants swept; winners"
+              - strong [ref=f8e1207]:
+                - text: v21
+                - code [ref=f8e1208]: w4_r2_i1_v2
+              - text: (gate/up) and
+              - strong [ref=f8e1209]:
+                - text: v6
+                - code [ref=f8e1210]: w8_r4_i1_v2
+              - text: (down) are the defaults, worth 2.3×. ⚠️ Dispatch is verified
+              - strong [ref=f8e1211]: at the ID level, not by timing
+              - text: — the test returns 21 without the table and fails with it, which proves the production path consults it. (An earlier “tuned” probe accidentally ran *without* the table applied, so the number it produced was untuned.) ⚠️ Deliberately
+              - strong [ref=f8e1212]: not
+              - text: "retuned from A30 data: retuning on the wrong silicon would regress the H200 defaults."
+        - generic [ref=f8e1213]:
+          - text: Speculation
+          - generic [ref=f8e1214]: 5 terms
+        - generic [ref=f8e1215]:
+          - article [ref=f8e1216]:
+            - generic [ref=f8e1217]:
+              - heading "Speculative decoding" [level=3] [ref=f8e1218]
+              - generic [ref=f8e1219]: Shipped
+            - paragraph [ref=f8e1220]: Guess several tokens cheaply, then check them all in ONE pass of the big model. Every guess that survives is a free token.
+            - paragraph [ref=f8e1221]: "Like: Finishing someone's sentence. When you are right you both save time; when you are wrong you lose only the breath."
+            - generic [ref=f8e1222]:
+              - generic [ref=f8e1223]: Per-user
+              - generic [ref=f8e1224]: Aggregate
+            - paragraph [ref=f8e1225]:
+              - text: In Arc today The one mechanism that gets more than one token out of a single memory-bound decode step — the bytes move once either way. Shipped for V4 via MTP; a generic
+              - code [ref=f8e1226]: speculative.rs
+              - text: path also exists for other models.
+          - article [ref=f8e1227]:
+            - generic [ref=f8e1228]:
+              - heading "MTP (multi-token prediction)" [level=3] [ref=f8e1229]
+              - generic [ref=f8e1230]: Shipped
+            - paragraph [ref=f8e1231]: The model's own built-in extra head that proposes the next-next token — a draft model you get for free, trained alongside the model.
+            - paragraph [ref=f8e1232]: "Like: A co-writer who already knows the author's voice, because they are the same person."
+            - generic [ref=f8e1233]:
+              - generic [ref=f8e1234]: Per-user
+              - generic [ref=f8e1235]: Aggregate
+            - paragraph [ref=f8e1236]:
+              - text: In Arc today 🟢
+              - strong [ref=f8e1237]: "Works at EVERY batch size as of PR #73."
+              - text: "Both earlier claims are now wrong: “B=1 only” and “mutually exclusive with PagedAttention”."
+              - strong [ref=f8e1238]: Jish was right to reject the exclusivity
+              - text: — it was an unimplemented branch, not an incompatibility, and
+              - strong [ref=f8e1239]: the guard has never fired.
+              - text: 🔑
+              - strong [ref=f8e1240]: It could never have helped before this
+              - text: ": the old shape ran TWO full target forwards per step, capping the multiplier at (depth+1)/2, so"
+              - code [ref=f8e1241]: "--mtp-depth 1"
+              - text: was *mathematically incapable* of beating no-MTP. ⚠️
+              - code [ref=f8e1242]: "--mtp-depth"
+              - strong [ref=f8e1243]: defaults to 0
+              - text: ", so the default serve does not load the block even though the artifact ships the tensors — which is why three separate sessions collected empty acceptance files and blamed the logger."
+          - article [ref=f8e1244]:
+            - generic [ref=f8e1245]:
+              - heading "Draft / verify" [level=3] [ref=f8e1246]
+              - generic [ref=f8e1247]: Shipped
+            - paragraph [ref=f8e1248]: "The two halves: something cheap DRAFTS k tokens; the real model VERIFIES them all in one pass and keeps the longest correct prefix."
+            - paragraph [ref=f8e1249]: "Like: An assistant drafts the paragraph; you read it once and keep everything up to the first thing you would have written differently."
+            - generic [ref=f8e1250]: Per-user
+            - paragraph [ref=f8e1252]:
+              - text: In Arc today Shipped. At topk == 1 — which is what DeepSeek MTP *is* — the rollback is
+              - strong [ref=f8e1253]: pure truncation with zero KV movement
+              - text: ", so paged KV would be a *better* substrate, not an incompatible one. ⚠️"
+              - strong [ref=f8e1254]: The real B=1 gate was never MTP, it was a cache constraint
+              - text: ":"
+              - code [ref=f8e1255]: single_cache.rs
+              - code [ref=f8e1256]: append
+              - text: does a
+              - code [ref=f8e1257]: slice_set
+              - text: with ONE offset for the whole batch. Solved by keeping *cache* lengths uniform while *token* lengths diverge, grouping drafts by uncached tail.
+          - article [ref=f8e1258]:
+            - generic [ref=f8e1259]:
+              - heading "Acceptance rate (k)" [level=3] [ref=f8e1260]
+              - generic [ref=f8e1261]: Shipped
+            - paragraph [ref=f8e1262]: How many tokens survive verification per step, on average. This IS the speedup multiplier — nothing else about speculation matters as much.
+            - paragraph [ref=f8e1263]: "Like: The proportion of your co-writer's sentences you keep unedited."
+            - generic [ref=f8e1264]:
+              - generic [ref=f8e1265]: Per-user
+              - generic [ref=f8e1266]: Aggregate
+            - paragraph [ref=f8e1267]:
+              - text: In Arc today 🟢
+              - strong [ref=f8e1268]: "The first acceptance measurement in this program's history: accept_rate ≈ 0.42, tok_per_step ≈ 1.84"
+              - text: (27 of 64 proposals; 59 tokens over 32 steps; per-request spread 0.35–0.50)
+              - code [ref=f8e1269]: "[measured]"
+              - text: . We had been projecting from k = 2. ⚠️
+              - strong [ref=f8e1270]: The sample is tiny — 32 steps.
+              - text: The reference publishes a non-simulated floor of
+              - strong [ref=f8e1271]: "2.30"
+              - text: "(*their* number, not one we have run). ⚠️ And it multiplies a base far below its own bound: 1.84 × the B=128 per-user ceiling of 68 ="
+              - strong [ref=f8e1272]: ~125 tok/s/user
+              - text: ", which still clears the 100 target —"
+              - strong [ref=f8e1273]: but MTP is a multiplier on whatever the base path achieves, and measured per-user at B=128 is ~60× under its ceiling. Fix the base first.
+          - article [ref=f8e1274]:
+            - generic [ref=f8e1275]:
+              - heading "EAGLE / Medusa" [level=3] [ref=f8e1276]
+              - generic [ref=f8e1277]: Built · off
+            - paragraph [ref=f8e1278]: Speculation schemes that draft from the big model's own hidden states (EAGLE) or from extra prediction heads bolted on (Medusa), rather than from a separate small model.
+            - paragraph [ref=f8e1279]: "Like: Different ways of hiring the co-writer: train one on your notes, or grow extra hands."
+            - generic [ref=f8e1280]:
+              - generic [ref=f8e1281]: Per-user
+              - generic [ref=f8e1282]: Aggregate
+            - paragraph [ref=f8e1283]:
+              - text: In Arc today 🟡
+              - strong [ref=f8e1284]:
+                - text: Modules exist in the tree —
+                - code [ref=f8e1285]: arc-engine/src/eagle3.rs
+                - text: ", alongside"
+                - code [ref=f8e1286]: magicdec.rs
+                - text: — but they are not the V4 path and none of them appear in any measured number.
+              - text: "MTP is V4's native equivalent and was correctly done first. Carry the names anyway: the acceptance-rate arithmetic above is identical for all of them, so an EAGLE claim should be read exactly the same way."
+        - generic [ref=f8e1287]:
+          - text: MoE
+          - generic [ref=f8e1288]: 8 terms
+        - generic [ref=f8e1289]:
+          - article [ref=f8e1290]:
+            - generic [ref=f8e1291]:
+              - heading "Mixture of Experts (MoE)" [level=3] [ref=f8e1292]
+              - generic [ref=f8e1293]: Shipped
+            - paragraph [ref=f8e1294]: The model contains many parallel sub-networks; each token only uses a few of them. Huge total capacity, small per-token cost.
+            - paragraph [ref=f8e1295]: "Like: A hospital with 256 specialists. Every patient sees six — the building is big, the appointment is short."
+            - generic [ref=f8e1296]:
+              - generic [ref=f8e1297]: Size
+              - generic [ref=f8e1298]: Aggregate
+              - generic [ref=f8e1299]: Per-user
+              - generic [ref=f8e1300]: Quality
+            - paragraph [ref=f8e1301]:
+              - text: "In Arc today V4-Flash:"
+              - strong [ref=f8e1302]: 284B total / 13B active, 256 routed experts + 1 shared, top-6, 43 layers
+              - code [ref=f8e1303]: "[measured from config]"
+              - text: ". The split that every ceiling is derived from: 1.084B params/expert and 6.496B dense params ⇒"
+              - strong [ref=f8e1304]: 1.697 GB dense + 6 × 0.2832 GB = 3.396 GB per token at B=1
+              - code [ref=f8e1305]: "[physics]"
+              - text: — which checks out exactly against 13e9 active params × 0.26125 B/param.
+          - article [ref=f8e1306]:
+            - generic [ref=f8e1307]:
+              - heading "Routing" [level=3] [ref=f8e1308]
+              - generic [ref=f8e1309]: Shipped
+            - paragraph [ref=f8e1310]: The small network deciding which experts each token goes to, at every layer.
+            - paragraph [ref=f8e1311]: "Like: Triage at the front desk. Fast, and it decides everything downstream."
+            - generic [ref=f8e1312]:
+              - generic [ref=f8e1313]: Quality
+              - generic [ref=f8e1314]: Aggregate
+            - paragraph [ref=f8e1315]:
+              - text: In Arc today Shipped (
+              - code [ref=f8e1316]: MoeGate
+              - text: ), with a fused Sinkhorn kernel validated
+              - strong [ref=f8e1317]: bit-identical perplexity and token-identical on 6/6
+              - text: before being made default-on
+              - code [ref=f8e1318]: "[measured]"
+              - text: . 🔑
+              - strong [ref=f8e1319]: Real-world routing CONCENTRATION has never been measured on this model, and it can only help us
+              - text: ": any concentration wakes *fewer* distinct experts, reads *fewer* bytes, and lands"
+              - strong [ref=f8e1320]: above
+              - text: the ceiling table.
+              - strong [ref=f8e1321]: Cheap, and unclaimed.
+          - article [ref=f8e1322]:
+            - generic [ref=f8e1323]:
+              - heading "Top-k (experts per token)" [level=3] [ref=f8e1324]
+              - generic [ref=f8e1325]: Shipped
+            - paragraph [ref=f8e1326]: How many experts each token is sent to. Higher k means better quality and more bytes read per token.
+            - paragraph [ref=f8e1327]: "Like: How many specialists each patient sees. Six opinions cost six appointments."
+            - generic [ref=f8e1328]:
+              - generic [ref=f8e1329]: Quality
+              - generic [ref=f8e1330]: Aggregate
+              - generic [ref=f8e1331]: Per-user
+            - paragraph [ref=f8e1332]:
+              - text: In Arc today ⚠️
+              - strong [ref=f8e1333]: V4-Flash is TOP-6, NOT top-8
+              - text: (
+              - code [ref=f8e1334]: num_experts_per_tok
+              - text: ", default 6). Our own notes used top-8 for days and"
+              - strong [ref=f8e1335]: overstated every amortization row
+              - text: — 4.07×/8.00× where the truth is 3.15×/6.01×.
+              - strong [ref=f8e1336]: Read the config, not the model family.
+          - article [ref=f8e1337]:
+            - generic [ref=f8e1338]:
+              - heading "Expert coverage / saturation" [level=3] [ref=f8e1339]
+              - generic [ref=f8e1340]: Concept
+            - paragraph [ref=f8e1341]: How many DISTINCT experts a batch wakes. Small batches wake few; large batches wake nearly all — and once you have woken all of them, extra users are almost free.
+            - paragraph [ref=f8e1342]: "Like: One patient occupies six specialists. 256 patients occupy the whole hospital — and the 257th costs nothing extra to keep the lights on."
+            - generic [ref=f8e1343]:
+              - generic [ref=f8e1344]: Aggregate
+              - generic [ref=f8e1345]: Per-user
+            - paragraph [ref=f8e1346]:
+              - text: In Arc today 🔑
+              - strong [ref=f8e1347]: The single most important shape on this page.
+              - code [ref=f8e1348]: E(B) = 256 × (1 − (1 − 6/256)^B)
+              - code [ref=f8e1349]: "[physics]"
+              - text: ⇒
+              - strong [ref=f8e1350]: 6 / 43.9 / 135.3 / 199.1 / 243.4 / 255.4
+              - text: distinct experts at B = 1/8/32/64/128/256. Weight amortization
+              - code [ref=f8e1351]: 6B / E(B)
+              - text: ": 1.0× / 1.09× / 1.42× / 1.93× /"
+              - strong [ref=f8e1352]: 3.15× / 6.01×
+              - text: . ⚠️
+              - strong [ref=f8e1353]: We nearly threw this away
+              - text: ": “MoE batch economics are structurally modest, ~1.57×” was written from data that stopped at B=32 — *the worst stretch of the curve* — and generalised into a structural ceiling."
+              - strong [ref=f8e1354]: Four more rows of the same formula refuted it.
+              - text: Never extrapolate a ceiling from the edge of the sampled range. ⚠️ Uniform routing *maximises* distinct experts, so these are
+              - strong [ref=f8e1355]: lower bounds on the ceiling
+              - text: ", not ceilings."
+          - article [ref=f8e1356]:
+            - generic [ref=f8e1357]:
+              - heading "Expert dedup / amortization" [level=3] [ref=f8e1358]
+              - generic [ref=f8e1359]: Not built
+            - paragraph [ref=f8e1360]: When many tokens in a batch want the same expert, reading that expert's weights ONCE instead of once per token.
+            - paragraph [ref=f8e1361]: "Like: One trip to the pharmacy for the whole ward's prescriptions."
+            - generic [ref=f8e1362]: Aggregate
+            - paragraph [ref=f8e1364]:
+              - text: In Arc today 🔴
+              - strong [ref=f8e1365]: OPEN — and it is exactly why aggregate stops collapsing but never starts scaling.
+              - text: Today it is
+              - strong [ref=f8e1366]: one GEMV per (token, expert) pair with no dedup
+              - text: ", which makes the path"
+              - strong [ref=f8e1367]: flat per token rather than amortizing
+              - text: ": per-token cost falls 61.5 → 32.6 ms from B=1→16 and is then"
+              - strong [ref=f8e1368]: flat within 1% across B=16/32/64
+              - code [ref=f8e1369]: "[measured]"
+              - text: . That flatness was *predicted* as the consequence of the gather-cap fix, and it arrived exactly as predicted.
+              - strong [ref=f8e1370]: The grouped kernel is the fix, it exists, and it is on the other rung.
+          - article [ref=f8e1371]:
+            - generic [ref=f8e1372]:
+              - heading "MoE token cap" [level=3] [ref=f8e1373]
+              - generic [ref=f8e1374]: Shipped
+            - paragraph [ref=f8e1375]: A hard limit on how many tokens the fused expert-gather kernel could handle in one launch. Above it, the code silently fell back to materializing full weights to memory.
+            - paragraph [ref=f8e1376]: "Like: A lift with a weight limit that, once exceeded, quietly makes everyone take the stairs — without telling them."
+            - generic [ref=f8e1377]: Aggregate
+            - paragraph [ref=f8e1379]:
+              - text: In Arc today 🔑
+              - strong [ref=f8e1380]: Was HARD-CAPPED AT 8 TOKENS/STEP
+              - text: on both rungs. The engine crossed it between B=16 (8 running) and B=32 (13 running) —
+              - strong [ref=f8e1381]: exactly where aggregate halved
+              - text: . Per-sequence step cost was 65.1 / 67.4 / 97.0 ms below the cap and
+              - strong [ref=f8e1382]: 197.2 ms above it
+              - text: ". ✅ Fixed (PR #56): the boundary is now derived rather than hardcoded, and"
+              - strong [ref=f8e1383]: the silent all-zero failure mode above the launch limit is now a hard error
+              - code [ref=f8e1384]: "[measured]"
+              - text: ". A good example of the pattern: the number looked like a mystery and was a constant."
+          - article [ref=f8e1385]:
+            - generic [ref=f8e1386]:
+              - heading "Shared expert" [level=3] [ref=f8e1387]
+              - generic [ref=f8e1388]: Shipped
+            - paragraph [ref=f8e1389]: One expert that every token goes through, in every layer, on top of the routed ones.
+            - paragraph [ref=f8e1390]: "Like: The GP everybody sees before the specialists."
+            - generic [ref=f8e1391]: Quality
+            - paragraph [ref=f8e1393]:
+              - text: In Arc today V4 is
+              - strong [ref=f8e1394]: 256 + 1
+              - text: ". This is why one small bug hurt so much: a"
+              - strong [ref=f8e1395]: SwiGLU clamp was missing on 4 of 5 expert paths, including the shared expert
+              - text: "— a path every token traverses in every layer, on every prior run. Fixture magnitude when it bites:"
+              - strong [ref=f8e1396]: 0.7311 clamped vs 14.8996 unclamped = 20.4×
+              - text: . That single omission is why GSM8K 87.0% and the perplexity number are
+              - strong [ref=f8e1397]: void rather than merely old
+              - text: .
+          - article [ref=f8e1398]:
+            - generic [ref=f8e1399]:
+              - heading "Expert parallelism (EP)" [level=3] [ref=f8e1400]
+              - generic [ref=f8e1401]: Not built
+            - paragraph [ref=f8e1402]: Splitting the 256 experts across N GPUs so each card only reads its own slice — the per-token byte cost divides.
+            - paragraph [ref=f8e1403]: "Like: Putting the specialists in different buildings; each building only pages its own staff."
+            - generic [ref=f8e1404]:
+              - generic [ref=f8e1405]: Per-user
+              - generic [ref=f8e1406]: Aggregate
+              - generic [ref=f8e1407]: Size
+            - paragraph [ref=f8e1408]:
+              - text: In Arc today 🔑
+              - strong [ref=f8e1409]: "Designed and costed (PR #70), not built."
+              - text: "Saturated per-user floor at B=128:"
+              - strong [ref=f8e1410]: 65 (N=1) → 126 (N=2) → 193 (N=4) → 303 (N=8)
+              - code [ref=f8e1411]: "[measured-by-design]"
+              - text: ⇒
+              - strong [ref=f8e1412]: two cards clear the 100 tok/s-per-user target at any batch; eight are not needed to start.
+              - text: ⚠️
+              - strong [ref=f8e1413]: NVLink-only
+              - text: — on PCIe/InfiniBand comms becomes 62% of the step and the N=8 win collapses 4.5× → 2.6×. The cost is
+              - strong [ref=f8e1414]: latency, not bandwidth
+              - text: ": 86 collectives/step ≈ 0.86 ms, three times the bandwidth term. ✅ Load imbalance is self-bounded here (+4.2% at B=128) because a GPU cannot read more experts than it owns — skip the balancer in stage 1, instrument for it. ⚠️ A projection of 543 tok/s at N=8 was"
+              - strong [ref=f8e1415]: wrong
+              - text: ": it assumed the dense term shards."
+              - strong [ref=f8e1416]: It is replicated on every card.
+        - generic [ref=f8e1417]:
+          - text: Parallelism
+          - generic [ref=f8e1418]: 4 terms
+        - generic [ref=f8e1419]:
+          - article [ref=f8e1420]:
+            - generic [ref=f8e1421]:
+              - heading "Tensor parallel (TP)" [level=3] [ref=f8e1422]
+              - generic [ref=f8e1423]: Shipped
+            - paragraph [ref=f8e1424]: Splitting each individual matrix across GPUs, so every card does part of every layer.
+            - paragraph [ref=f8e1425]: "Like: Four people each doing a quarter of every calculation, then comparing notes constantly."
+            - generic [ref=f8e1426]:
+              - generic [ref=f8e1427]: Per-user
+              - generic [ref=f8e1428]: Size
+            - paragraph [ref=f8e1429]:
+              - text: In Arc today Supported in the engine — and
+              - strong [ref=f8e1430]: the wrong choice for V4-Flash
+              - text: . Its K/V is one fused MQA head, so TP
+              - strong [ref=f8e1431]: duplicates the KV cache on every card
+              - text: ", and the KV cache is the binding constraint. ⇒"
+              - strong [ref=f8e1432]: expert parallelism plus data-parallel attention beats tensor parallel here
+              - text: ", which is not the usual answer and is worth being able to explain."
+          - article [ref=f8e1433]:
+            - generic [ref=f8e1434]:
+              - heading "Pipeline parallel (PP)" [level=3] [ref=f8e1435]
+              - generic [ref=f8e1436]: Shipped
+            - paragraph [ref=f8e1437]: Different GPUs hold different LAYERS; a token walks through the cards in turn.
+            - paragraph [ref=f8e1438]: "Like: An assembly line down a corridor of rooms."
+            - generic [ref=f8e1439]:
+              - generic [ref=f8e1440]: Size
+              - generic [ref=f8e1441]: Aggregate
+            - paragraph [ref=f8e1442]: In Arc today Available via device mapping. It adds latency per token and needs deep batching to keep every stage busy, so it is a fit-enabler rather than a throughput lever. Not the interesting axis for this model.
+          - article [ref=f8e1443]:
+            - generic [ref=f8e1444]:
+              - heading "Data parallel (DP)" [level=3] [ref=f8e1445]
+              - generic [ref=f8e1446]: Concept
+            - paragraph [ref=f8e1447]: N complete copies of the model, each serving different users. Throughput multiplies; nothing else changes.
+            - paragraph [ref=f8e1448]: "Like: Opening a second identical restaurant."
+            - generic [ref=f8e1449]: Aggregate
+            - paragraph [ref=f8e1451]:
+              - text: In Arc today The trivial baseline every other form of parallelism has to beat. For V4 the interesting design is
+              - strong [ref=f8e1452]: expert-parallel for the experts, data-parallel for attention
+              - text: — precisely because tensor parallel would duplicate the KV cache that data-parallel attention keeps naturally partitioned.
+          - article [ref=f8e1453]:
+            - generic [ref=f8e1454]:
+              - heading "NVLink vs PCIe" [level=3] [ref=f8e1455]
+              - generic [ref=f8e1456]: Concept
+            - paragraph [ref=f8e1457]: How fast two GPUs in a box can talk to each other. NVLink is a wide direct link; PCIe goes through the host and is far slower.
+            - paragraph [ref=f8e1458]: "Like: A door between two offices versus posting a letter across town."
+            - generic [ref=f8e1459]:
+              - generic [ref=f8e1460]: Per-user
+              - generic [ref=f8e1461]: Aggregate
+            - paragraph [ref=f8e1462]:
+              - text: In Arc today 🔑
+              - strong [ref=f8e1463]: "A hard preflight, not a detail: expert parallelism is NVLink-only."
+              - text: On PCIe or InfiniBand, comms becomes
+              - strong [ref=f8e1464]: 62% of the step
+              - text: and the whole N=8 win collapses from 4.5× to 2.6×
+              - code [ref=f8e1465]: "[measured-by-design]"
+              - text: .
+              - strong [ref=f8e1466]:
+                - text: Run
+                - code [ref=f8e1467]: nvidia-smi topo -m
+                - text: before believing any multi-GPU plan
+              - text: — the same code on the same GPUs gives a different answer depending on what is between them.
+        - generic [ref=f8e1468]:
+          - text: Metrics
+          - generic [ref=f8e1469]: 9 terms
+        - generic [ref=f8e1470]:
+          - article [ref=f8e1471]:
+            - generic [ref=f8e1472]:
+              - heading "TTFT (time to first token)" [level=3] [ref=f8e1473]
+              - generic [ref=f8e1474]: Concept
+            - paragraph [ref=f8e1475]: How long the user stares at nothing. Set by prefill, by queueing behind other requests, and by whether the prompt was cached.
+            - paragraph [ref=f8e1476]: "Like: How long before the waiter says anything at all."
+            - generic [ref=f8e1477]: TTFT
+            - paragraph [ref=f8e1479]:
+              - text: "In Arc today Measured, and it degrades hard with batch: p50"
+              - strong [ref=f8e1480]: 0.822 s at B=1 → 70.66 s at B=256
+              - text: (p95 130.4 s)
+              - code [ref=f8e1481]: "[measured]"
+              - text: . ⚠️
+              - strong [ref=f8e1482]: Every TTFT number we hold was taken with the prefix cache explicitly off
+              - text: ", so they are the no-cache worst case — and there is no measurement at all of what turning it on is worth. ⚠️ Also note TTFT and aggregate throughput trade against each other through B: the batch size that maximises tokens per dollar is not the one that keeps users happy."
+          - article [ref=f8e1483]:
+            - generic [ref=f8e1484]:
+              - heading "Aggregate throughput" [level=3] [ref=f8e1485]
+              - generic [ref=f8e1486]: Concept
+            - paragraph [ref=f8e1487]: Total tokens per second the box produces across ALL users at once. This is the fleet number — the one that decides how many GPUs a datacenter has to buy.
+            - paragraph [ref=f8e1488]: "Like: Meals served per hour by the whole kitchen."
+            - generic [ref=f8e1489]: Aggregate
+            - paragraph [ref=f8e1491]:
+              - text: In Arc today
+              - strong [ref=f8e1492]: 111.7 tok/s at B=256
+              - code [ref=f8e1493]: "[measured]"
+              - text: against a
+              - strong [ref=f8e1494]: ~16,600 tok/s
+              - text: ceiling
+              - code [ref=f8e1495]: "[physics]"
+              - text: — a
+              - strong [ref=f8e1496]: ~149× gap, all of it implementation
+              - text: ". The journey so far: 15.35 peak *at B=1* (aggregate actually"
+              - strong [ref=f8e1497]: fell
+              - text: with batch, the exact inverse of the thesis) → 30.65 at B=16 →
+              - strong [ref=f8e1498]: 111.7 at B=256
+              - code [ref=f8e1499]: "[measured]"
+              - text: . 🔑
+              - strong [ref=f8e1500]: The shape matters more than the number
+              - text: ": the fix that mattered most made aggregate stop *falling*, which is a different achievement from making it rise."
+          - article [ref=f8e1501]:
+            - generic [ref=f8e1502]:
+              - heading "Per-user throughput" [level=3] [ref=f8e1503]
+              - generic [ref=f8e1504]: Concept
+            - paragraph [ref=f8e1505]: Tokens per second that ONE user experiences. It falls as batch size rises — this is the fundamental trade every serving engine makes.
+            - paragraph [ref=f8e1506]: "Like: How fast your own meal arrives, versus how many meals the kitchen serves per hour."
+            - generic [ref=f8e1507]: Per-user
+            - paragraph [ref=f8e1509]:
+              - text: "In Arc today b=1:"
+              - strong [ref=f8e1510]: 16.27 tok/s
+              - code [ref=f8e1511]: "[measured]"
+              - text: against a
+              - strong [ref=f8e1512]: 1,413 tok/s
+              - text: ceiling
+              - code [ref=f8e1513]: "[physics]"
+              - text: ". ⚠️ Note the ceiling itself falls with batch: at B=256 the *saturated* per-user ceiling is only"
+              - strong [ref=f8e1514]: 65 tok/s
+              - code [ref=f8e1515]: "[physics]"
+              - text: — no engine on one card beats that, because the whole model must be read every step.
+              - strong [ref=f8e1516]: Two cards with expert parallelism reach 126 at B=128
+              - code [ref=f8e1517]: "[measured-by-design]"
+              - text: ", and MTP multiplies whatever the base is by ~1.84"
+              - code [ref=f8e1518]: "[measured]"
+              - text: .
+          - article [ref=f8e1519]:
+            - generic [ref=f8e1520]:
+              - heading "$/Mtok" [level=3] [ref=f8e1521]
+              - generic [ref=f8e1522]: Concept
+            - paragraph [ref=f8e1523]: Rental cost divided by tokens produced. The only metric a customer actually pays.
+            - paragraph [ref=f8e1524]: "Like: Cost per meal, not cost per hour of chef."
+            - generic [ref=f8e1525]: Aggregate
+            - paragraph [ref=f8e1527]:
+              - text: In Arc today
+              - strong [ref=f8e1528]: $12.06/Mtok at B=256
+              - code [ref=f8e1529]: "[measured]"
+              - text: "— an H200 at $4.85/hr ÷ (111.7 × 3600 ÷ 1e6). The ladder: $87.77 → $43.96 →"
+              - strong [ref=f8e1530]: $12.06
+              - code [ref=f8e1531]: "[measured]"
+              - text: . At the physics ceiling it is
+              - strong [ref=f8e1532]: $0.081
+              - code [ref=f8e1533]: "[physics]"
+              - text: . 🔑
+              - strong [ref=f8e1534]: The distance between $12.06 and $0.08 is entirely engineering
+              - text: — and every step toward it is compute that does not have to be bought and power that does not have to be burned.
+          - article [ref=f8e1535]:
+            - generic [ref=f8e1536]:
+              - heading "Latency (ITL / TPOT)" [level=3] [ref=f8e1537]
+              - generic [ref=f8e1538]: Concept
+            - paragraph [ref=f8e1539]: The gap between consecutive tokens once generation has started — “inter-token latency”, or “time per output token”. It is per-user throughput, inverted.
+            - paragraph [ref=f8e1540]: "Like: The pause between spoken words. Under about 50 ms nobody notices; over about 200 ms everybody does."
+            - generic [ref=f8e1541]:
+              - generic [ref=f8e1542]: Per-user
+              - generic [ref=f8e1543]: TTFT
+            - paragraph [ref=f8e1544]:
+              - text: "In Arc today We report it as per-user tok/s rather than milliseconds, but the conversion is the number a customer feels: b=1's 16.27 tok/s is"
+              - strong [ref=f8e1545]: ~61 ms per token
+              - code [ref=f8e1546]: "[measured]"
+              - text: . Worth quoting in ms when talking to anyone who has not spent a week in throughput tables.
+          - article [ref=f8e1547]:
+            - generic [ref=f8e1548]:
+              - heading "GSM8K" [level=3] [ref=f8e1549]
+              - generic [ref=f8e1550]: Shipped
+            - paragraph [ref=f8e1551]: A set of grade-school maths word problems. The standard check that a quantized model can still reason, not merely produce fluent text.
+            - paragraph [ref=f8e1552]: "Like: The maths test you give after the compression, to prove you did not compress away the arithmetic."
+            - generic [ref=f8e1553]: Quality
+            - paragraph [ref=f8e1555]:
+              - text: In Arc today 🟢
+              - strong [ref=f8e1556]: 96.0% (96/100, ±3.8pp, 0 degenerate, 0 truncated)
+              - text: on the published
+              - code [ref=f8e1557]: qtip2
+              - text: artifact
+              - code [ref=f8e1558]: "[measured]"
+              - text: ", on"
+              - strong [ref=f8e1559]: "our own protocol: 0-shot chat, greedy, seed 161, 2048-token cap"
+              - text: .
+              - strong [ref=f8e1560]:
+                - text: ~94% on
+                - code [ref=f8e1561]: qtip2b
+                - text: from a 1,319-problem run in progress
+              - code [ref=f8e1562]: "[measured, in flight]"
+              - text: . ⚠️
+              - strong [ref=f8e1563]: The reference publishes 90.8 — on 8-shot, a different and EASIER protocol. Not comparable, and we say so every single time.
+              - text: ⚠️ At n=100 the confidence interval is [90.1, 98.5], which
+              - strong [ref=f8e1564]: cannot statistically separate 96.0 from 90.8
+              - text: — which is exactly why the full-set run exists. 🔑
+              - strong [ref=f8e1565]: Quality is not the bottleneck. Throughput is.
+          - article [ref=f8e1566]:
+            - generic [ref=f8e1567]:
+              - heading "Perplexity" [level=3] [ref=f8e1568]
+              - generic [ref=f8e1569]: Shipped
+            - paragraph [ref=f8e1570]: How surprised the model is by real text. Lower is better, and it is sensitive enough to catch a broken quantizer before a task benchmark would.
+            - paragraph [ref=f8e1571]: "Like: A hearing test — it finds damage that a normal conversation would not reveal."
+            - generic [ref=f8e1572]: Quality
+            - paragraph [ref=f8e1574]:
+              - text: In Arc today
+              - strong [ref=f8e1575]: 12.50 ± 3.46
+              - text: on a 70-chunk wiki mini-corpus
+              - code [ref=f8e1576]: "[measured]"
+              - text: —
+              - strong [ref=f8e1577]: provisional
+              - text: ", taken before the SwiGLU/YaRN fix. ⚠️"
+              - strong [ref=f8e1578]: Not comparable to published full-wikitext numbers, and we never present it as one.
+              - text: "Its role is internal: the same rung read"
+              - strong [ref=f8e1579]: "58.85"
+              - text: before the Viterbi encoder fix, a 4.7× move into healthy range. That is what perplexity is for.
+          - article [ref=f8e1580]:
+            - generic [ref=f8e1581]:
+              - heading "Degenerate output detection" [level=3] [ref=f8e1582]
+              - generic [ref=f8e1583]: Shipped
+            - paragraph [ref=f8e1584]: Catching answers that collapse into a repeating loop — a failure quantization can cause, and one a raw accuracy score can hide.
+            - paragraph [ref=f8e1585]: "Like: Noticing that the record is skipping, rather than that the song is bad."
+            - generic [ref=f8e1586]: Quality
+            - paragraph [ref=f8e1588]:
+              - text: "In Arc today 🟢 A detector that was wrong in the *unflattering* direction: it false-positived on a"
+              - strong [ref=f8e1589]: correct
+              - text: answer because a 7-word phrase repeated once. Rebuilt as a union of word-cycle / char-cycle / 4-gram saturation at threshold 0.45 against a
+              - strong [ref=f8e1590]: measured
+              - text: separation (worst clean 0.574 vs best real loop 0.418),
+              - strong [ref=f8e1591]: 0 false positives on 350 archived completions
+              - text: ", and it catches two real loops the old one missed. ⇒"
+              - strong [ref=f8e1592]: 96.0%, 0 degenerate, 0 truncated.
+              - text: 🔑
+              - strong [ref=f8e1593]: It also declined to inflate the score
+              - text: by “fixing” an answer the model never actually computed — called fabrication, not extraction.
+              - strong [ref=f8e1594]: 96.0 stayed 96.0.
+          - article [ref=f8e1595]:
+            - generic [ref=f8e1596]:
+              - heading "Physics ceiling vs measured gap" [level=3] [ref=f8e1597]
+              - generic [ref=f8e1598]: Concept
+            - paragraph [ref=f8e1599]: The discipline of always quoting a measurement NEXT TO the bound physics imposes, so a bad number reads as work to do rather than as a verdict.
+            - paragraph [ref=f8e1600]: "Like: “We are doing 15 mph” means nothing until you know whether the limit is 20 or 200."
+            - generic [ref=f8e1601]:
+              - generic [ref=f8e1602]: Aggregate
+              - generic [ref=f8e1603]: Per-user
+              - generic [ref=f8e1604]: TTFT
+              - generic [ref=f8e1605]: Size
+              - generic [ref=f8e1606]: Quality
+            - paragraph [ref=f8e1607]:
+              - text: In Arc today 🔑
+              - strong [ref=f8e1608]: "The house rule: a measured number describes TODAY'S CODE. It is never evidence about what is POSSIBLE. Only physics bounds what is possible."
+              - text: "Before writing “not achievable”, four checks:"
+              - strong [ref=f8e1609]: (1)
+              - text: Is this a physics bound — bytes that must move, arithmetic that must happen — or an engineering task?
+              - strong [ref=f8e1610]: (2)
+              - text: Have I extrapolated past the edge of the sampled data? Compute four more rows before concluding a trend.
+              - strong [ref=f8e1611]: (3)
+              - text: Am I quoting a % of peak that another implementation already beats? Then it is a verdict on our kernel, not on the format.
+              - strong [ref=f8e1612]: (4)
+              - text: Is a worst-case assumption (like uniform routing) hiding in my model, and which way does it bias? ⚠️
+              - strong [ref=f8e1613]: This project has six recorded pessimism failures. Every one was caught by re-deriving from physics
+              - text: — and several had already been published.
+        - generic [ref=f8e1614]:
+          - text: Hardware
+          - generic [ref=f8e1615]: 5 terms
+        - generic [ref=f8e1616]:
+          - article [ref=f8e1617]:
+            - generic [ref=f8e1618]:
+              - heading "SM utilisation" [level=3] [ref=f8e1619]
+              - generic [ref=f8e1620]: Concept
+            - paragraph [ref=f8e1621]: "The percentage of the GPU's cores that are busy. Famously misleading: a core stalled waiting on a memory fetch still counts as busy."
+            - paragraph [ref=f8e1622]: "Like: Bums on seats. It tells you the room is full, not that anyone in it is working."
+            - generic [ref=f8e1623]:
+              - generic [ref=f8e1624]: Aggregate
+              - generic [ref=f8e1625]: Per-user
+            - paragraph [ref=f8e1626]:
+              - text: "In Arc today ⚠️ Our clearest example: during a bake"
+              - code [ref=f8e1627]: nvidia-smi
+              - text: showed
+              - strong [ref=f8e1628]:
+                - code [ref=f8e1629]: sm=100%
+                - text: with
+                - code [ref=f8e1630]: mem=1%
+                - text: at 261 W of 700
+              - text: —
+              - strong [ref=f8e1631]: resident but inefficient
+              - text: . And a main thread at 99.9% user time looks *identical* whether it is doing real work or spinning in a CUDA sync. Two live explanations existed and the argument could not choose between them.
+              - strong [ref=f8e1632]: Settle it with the fix, not with the argument.
+          - article [ref=f8e1633]:
+            - generic [ref=f8e1634]:
+              - heading "Power draw as a diagnostic" [level=3] [ref=f8e1635]
+              - generic [ref=f8e1636]: Concept
+            - paragraph [ref=f8e1637]: Watts tell you whether work is actually being retired. A GPU at 100% “utilisation” drawing low power is starved, not busy.
+            - paragraph [ref=f8e1638]: "Like: A car revving in neutral. The tachometer is high; you are not moving."
+            - generic [ref=f8e1639]:
+              - generic [ref=f8e1640]: Aggregate
+              - generic [ref=f8e1641]: Per-user
+            - paragraph [ref=f8e1642]:
+              - text: In Arc today 🔑
+              - strong [ref=f8e1643]: The most reliable cheap diagnostic we have, and it has settled several arguments.
+              - text: "B=256 host-bound:"
+              - strong [ref=f8e1644]: 121 W of 700
+              - text: ", while the same box at B=64/128 drew"
+              - strong [ref=f8e1645]: 420–476 W
+              - code [ref=f8e1646]: "[measured]"
+              - text: ". Bad-box lottery: 99% util at"
+              - strong [ref=f8e1647]: 132 W
+              - text: = starved on host↔device transfers ⇒ kill it and re-rent. A kernel A/B was corroborated by
+              - strong [ref=f8e1648]: 150 W vs 208 W
+              - text: at identical 100% util. ⚠️
+              - strong [ref=f8e1649]: Sample power in a LOOP while confirming util > 50%
+              - text: — a single early sample once declared a healthy 437 W box a failure, because the burn had not ramped yet.
+          - article [ref=f8e1650]:
+            - generic [ref=f8e1651]:
+              - heading "Occupancy" [level=3] [ref=f8e1652]
+              - generic [ref=f8e1653]: Concept
+            - paragraph [ref=f8e1654]: How many groups of threads a GPU core can keep in flight at once — its capacity to hide waiting.
+            - paragraph [ref=f8e1655]: "Like: How many pans the chef can watch simultaneously."
+            - generic [ref=f8e1656]:
+              - generic [ref=f8e1657]: Per-user
+              - generic [ref=f8e1658]: Aggregate
+            - paragraph [ref=f8e1659]:
+              - text: "In Arc today Named as one of two live explanations for the beam kernel's behaviour: either the serialized host work was the bottleneck, or the kernel was"
+              - strong [ref=f8e1660]: under-parallelized — occupying SMs without using them
+              - text: . Deliberately settled empirically rather than by argument, which is the right instinct whenever both stories predict the same
+              - code [ref=f8e1661]: nvidia-smi
+              - text: output.
+          - article [ref=f8e1662]:
+            - generic [ref=f8e1663]:
+              - heading "Single-GPU vs multi-GPU" [level=3] [ref=f8e1664]
+              - generic [ref=f8e1665]: Concept
+            - paragraph [ref=f8e1666]: Whether the model fits on one card at all. Below that line you compete on cost per token; above it you compete on whether it runs.
+            - paragraph [ref=f8e1667]: "Like: Whether the piano fits through the door. Nothing else matters until it does."
+            - generic [ref=f8e1668]:
+              - generic [ref=f8e1669]: Size
+              - generic [ref=f8e1670]: Per-user
+              - generic [ref=f8e1671]: Aggregate
+            - paragraph [ref=f8e1672]:
+              - text: In Arc today 🟢
+              - strong [ref=f8e1673]: "The proof already in hand: every published DeepSeek-V4-Flash config we surveyed needs 4× H200. Arc runs it on 1"
+              - code [ref=f8e1674]: "[measured]"
+              - text: — a 4× cut in silicon, power and embodied carbon for the same model, measured and published rather than projected. ⚠️
+              - strong [ref=f8e1675]: "Scope it honestly: “none found in our survey”, not “none exists on any engine.”"
+              - text: "What would refute it: any published single-GPU V4-Flash config, or any engine loading it in ≤141 GB."
+              - strong [ref=f8e1676]: We want to know if one exists
+              - text: — a claim we would rather not test is a claim doctrine forbids.
+          - article [ref=f8e1677]:
+            - generic [ref=f8e1678]:
+              - heading "Bandwidth / compute crossover" [level=3] [ref=f8e1679]
+              - generic [ref=f8e1680]: Concept
+            - paragraph [ref=f8e1681]: The batch size at which you stop waiting for bytes and start waiting for arithmetic. Past it, extra users are no longer nearly free.
+            - paragraph [ref=f8e1682]: "Like: The point where the delivery van is finally full and you need a second oven, not a second van."
+            - generic [ref=f8e1683]: Aggregate
+            - paragraph [ref=f8e1685]:
+              - text: In Arc today
+              - strong [ref=f8e1686]: B ≈ 415 on an H200
+              - text: for V4-Flash
+              - code [ref=f8e1687]: "[physics]"
+              - text: ". ⚠️ This is a correction to our own table: the far tail was"
+              - strong [ref=f8e1688]: bandwidth-only and ignored the FLOP bound
+              - text: ", so B=699 should read ~27,000 rather than 45,400, and B=512 sits near the crossover and should be treated as an upper bound. 🟢"
+              - strong [ref=f8e1689]: The 16,600 headline at B=256 is unaffected — it sits well below the crossover.
+              - text: "A useful habit: when a model gets *more* optimistic the further you extrapolate, check which bound you stopped modelling."
+  - contentinfo [ref=f8e1690]:
+    - paragraph [ref=f8e1691]:
+      - text: Sources. Every number traces to
+      - code [ref=f8e1692]: memory/mission/CEILINGS.json
+      - text: (physics bounds and the anti-pessimism protocol),
+      - code [ref=f8e1693]: memory/mission/FACTS.md
+      - text: (hardware-measured only, with provenance and retractions) and
+      - code [ref=f8e1694]: docs/BENCHMARKS.md
+      - text: .
+      - code [ref=f8e1695]: "[measured]"
+      - text: = ran on real hardware.
+      - code [ref=f8e1696]: "[physics]"
+      - text: = a bound reality imposes, derived from bytes and bandwidth.
+      - code [ref=f8e1697]: "[projected]"
+      - text: = arithmetic, not yet run.
+      - code [ref=f8e1698]: "[measured-by-design]"
+      - text: = the byte accounting is exact and verified in source, but the path has not executed on a GPU.
+    - paragraph [ref=f8e1699]:
+      - text: "House rule, and it is the important one: a measured number describes"
+      - emphasis [ref=f8e1700]: today's code
+      - text: . It is never evidence about what is
+      - emphasis [ref=f8e1701]: possible
+      - text: . Only physics bounds what is possible. Quote the gap and the bound in the same breath, so a bad number reads as work to do rather than as a verdict.
+    - paragraph [ref=f8e1702]: No competitor benchmarks appear on this page that we have not run ourselves. Where a reference project's own published figure is cited — the 90.8 8-shot GSM8K, the ~80%-of-peak GEMV, the 2.30 MTP acceptance floor — it is labelled as theirs, and as unverified by us.
+    - paragraph [ref=f8e1703]: "Keyboard: / search · Esc clear filters · Tab through diagram stages · Enter to filter by one."
