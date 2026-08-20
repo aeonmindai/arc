@@ -184,11 +184,13 @@ mod tests {
         assert_eq!(3072 / distinct_upper_bound(3072, 256), 12);
     }
 
-    /// MEASURED on H200, V4-Flash qtip2b, 2026-08-20 (ARC_MOE_BYTE_PROBE=1):
-    /// one expert is 2 MiB and a step is 129 gather invocations (43 layers x 3).
-    /// Expert bytes per step scale LINEARLY with the batch on the GEMV arm and
-    /// are FLAT on the grouped arm. This is a characterization test: if the
-    /// dispatch is fixed, it will fail here first and the numbers get updated.
+    /// MEASURED on H200, V4-Flash qtip2b (ARC_MOE_BYTE_PROBE=1): one expert is
+    /// 2 MiB and a step is 129 gather invocations (43 layers x 3). Expert bytes
+    /// per step scale LINEARLY with the batch on the GEMV arm and are FLAT on
+    /// the grouped arm -- which is why the dispatch gate was changed to select
+    /// grouped above the capture-safety floor. This pins the arithmetic that
+    /// motivated the fix; `default_gate_selects_the_flat_arm_above_the_floor`
+    /// below pins the dispatch that resulted from it.
     #[test]
     fn v4_expert_bytes_per_step_scale_with_batch_on_the_gemv_arm() {
         const PER_EXPERT: u64 = 2 * 1024 * 1024; // measured
@@ -218,6 +220,27 @@ mod tests {
         assert!((gemv_gib(512) / floor_gib(512) - 12.0).abs() < 0.01);
     }
 
+
+    /// The fix, as an assertion. The gate now selects the arm whose expert
+    /// bytes are FLAT in the batch, for every width above the capture-safety
+    /// floor. MEASURED aggregate at the shipped default: B=8 60.28, B=64
+    /// 156.61, B=256 193.46 tok/s, against 57.18 / 106.26 / 114.76 under the
+    /// old tile-fill gate.
+    #[test]
+    fn default_gate_selects_the_flat_arm_above_the_floor() {
+        use crate::qtip::gather_policy::grouped_gemm_preferred;
+        // At and below the floor the GEMV is mandatory (CUDA-graph capture
+        // safety) and measured a wash, so nothing is lost.
+        assert!(!grouped_gemm_preferred(8, 6, 256));
+        // Above it, every measured width favours the flat arm.
+        for n in [9usize, 12, 16, 24, 32, 64, 128, 256, 512] {
+            assert!(
+                grouped_gemm_preferred(n, 6, 256),
+                "n={n}: expert bytes on the GEMV arm are {}x the floor here",
+                (n * 6) / distinct_upper_bound(n * 6, 256).max(1)
+            );
+        }
+    }
     /// The grouped GEMM stages an expert once per TILE_M pairs, so at the same
     /// shape it must read strictly fewer bytes than the GEMV once the tiles
     /// fill — that is the whole claim the dispatch gate rests on.
