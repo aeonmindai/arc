@@ -29,20 +29,38 @@
 //!
 //! `ARC_UNINIT_OUT` selects the policy — one binary, three legs:
 //!
-//! | value      | behaviour              | purpose                          |
-//! |------------|------------------------|----------------------------------|
-//! | unset, `0` | `alloc_zeros`          | base leg (byte-identical to before) |
-//! | `1`        | uninitialised `alloc`  | the saving                       |
-//! | `poison`   | `alloc` + fill `0xFF`  | the correctness leg              |
+//! | value      | behaviour              | purpose                             |
+//! |------------|------------------------|-------------------------------------|
+//! | unset, `1` | uninitialised `alloc`  | **the default** — the saving        |
+//! | `0`        | `alloc_zeros`          | KILL SWITCH: byte-identical to before |
+//! | `poison`   | `alloc` + fill `0xFF`  | the correctness leg                 |
 //!
 //! `poison` pays the same memset, so it is not a timing leg. `0xFF` repeated is
 //! NaN in BF16, F16 and F32, so any element the kernel fails to write surfaces
 //! as NaN instead of a plausible zero. Output that stays bit-identical under
 //! poison is positive evidence of full coverage — evidence zeros can never give,
 //! because a zero-filled miss is indistinguishable from a correct zero.
+//!
+//! # Why the saving is the DEFAULT and not opt-in
+//!
+//! It shipped opt-in ("default off, so the unset binary is byte-identical to
+//! before"). That is the configuration nobody runs: the 2.57 ms is measured, so
+//! every published number would have described a binary no user gets. A flag
+//! here is a kill switch, not a feature request.
+//!
+//! Both preconditions are discharged above, statically, per kernel: the grid
+//! covers the whole allocation and the write is an unconditional `=`, not a
+//! `+=`, in every branch including the invalid-expert one. What remains is a
+//! *runtime* property no type-check can reach, which is exactly what `poison`
+//! is for — so run the poison leg on the first box, before quoting any timing
+//! number from this path. If it is ever not bit-identical, `ARC_UNINIT_OUT=0`
+//! restores the old behaviour without a rebuild.
 
+#[cfg(feature = "cuda")]
 use candle_core::cuda::cudarc::driver::{CudaSlice, DeviceRepr, ValidAsZeroBits};
+#[cfg(feature = "cuda")]
 use candle_core::{CudaDevice, Result};
+#[cfg(feature = "cuda")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
@@ -54,15 +72,27 @@ pub(crate) enum OutBufPolicy {
 }
 
 static POLICY: OnceLock<OutBufPolicy> = OnceLock::new();
+#[cfg(feature = "cuda")]
 static ENGAGED: AtomicU64 = AtomicU64::new(0);
 
+/// Pure half of [`policy`], so the table can be tested without mutating the
+/// process environment.
+pub(crate) fn parse_policy(raw: Option<&str>) -> OutBufPolicy {
+    match raw.map(str::trim) {
+        // KILL SWITCH: restores the pre-change zero fills.
+        Some("0") => OutBufPolicy::Zeroed,
+        Some("poison") | Some("POISON") => OutBufPolicy::Poison,
+        // Unset, "1", or anything else: the fast path. Unknown values land on
+        // the DEFAULT rather than on the slow leg, so a typo cannot silently
+        // cost 2.57 ms/step while looking like it was disabled on purpose.
+        _ => OutBufPolicy::Uninit,
+    }
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn policy() -> OutBufPolicy {
     *POLICY.get_or_init(|| {
-        let p = match std::env::var("ARC_UNINIT_OUT").as_deref() {
-            Ok("1") => OutBufPolicy::Uninit,
-            Ok("poison") => OutBufPolicy::Poison,
-            _ => OutBufPolicy::Zeroed,
-        };
+        let p = parse_policy(std::env::var("ARC_UNINIT_OUT").ok().as_deref());
         // Announced once, by name, in BOTH directions: a timing number from a
         // fast path that never ran is the house fault.
         eprintln!("[arc-uninit-out] policy={p:?}");
@@ -70,6 +100,7 @@ fn policy() -> OutBufPolicy {
     })
 }
 
+#[cfg(feature = "cuda")]
 fn tick() {
     let n = ENGAGED.fetch_add(1, Ordering::Relaxed) + 1;
     if n % 20_000 == 0 {
@@ -81,6 +112,7 @@ fn tick() {
 ///
 /// The caller is asserting full coverage. `ARC_UNINIT_OUT=poison` exists so that
 /// assertion stays testable rather than assumed.
+#[cfg(feature = "cuda")]
 pub(crate) fn alloc_out_fully_written<T: DeviceRepr + ValidAsZeroBits>(
     dev: &CudaDevice,
     len: usize,
@@ -111,6 +143,42 @@ pub(crate) fn alloc_out_fully_written<T: DeviceRepr + ValidAsZeroBits>(
                 })?;
             }
             Ok(slice)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_policy, OutBufPolicy};
+
+    /// The policy table, pinned — most of all its DEFAULT.
+    ///
+    /// This shipped as `_ => Zeroed` with the saving behind `ARC_UNINIT_OUT=1`,
+    /// which meant the measured 2.57 ms/step was unreachable for anyone who did
+    /// not know the magic word, and every published number described a binary
+    /// no user runs. If someone flips it back, this test says so.
+    #[test]
+    fn uninit_out_defaults_to_the_fast_path() {
+        // THE POINT: no flag set == the saving.
+        assert_eq!(parse_policy(None), OutBufPolicy::Uninit);
+        assert_eq!(parse_policy(Some("1")), OutBufPolicy::Uninit);
+        assert_eq!(parse_policy(Some("")), OutBufPolicy::Uninit);
+
+        // "0" is the kill switch, and the ONLY way back to the zero fills.
+        assert_eq!(parse_policy(Some("0")), OutBufPolicy::Zeroed);
+        assert_eq!(parse_policy(Some(" 0 ")), OutBufPolicy::Zeroed);
+
+        // The correctness leg stays reachable.
+        assert_eq!(parse_policy(Some("poison")), OutBufPolicy::Poison);
+        assert_eq!(parse_policy(Some("POISON")), OutBufPolicy::Poison);
+
+        // A typo must not silently buy the slow leg back.
+        for junk in ["yes", "true", "off", "zeroed", "2"] {
+            assert_eq!(
+                parse_policy(Some(junk)),
+                OutBufPolicy::Uninit,
+                "{junk:?} must fall to the default, not to Zeroed"
+            );
         }
     }
 }
