@@ -784,6 +784,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static AB_CMPS: AtomicU64 = AtomicU64::new(0);
 static AB_BAD_TENSORS: AtomicU64 = AtomicU64::new(0);
 static AB_BAD_ELEMS: AtomicU64 = AtomicU64::new(0);
+/// site -> (comparisons, tensors with any mismatching bit, mismatching elements)
+#[allow(clippy::type_complexity)]
+static AB_SITES: std::sync::Mutex<Option<std::collections::BTreeMap<String, (u64, u64, u64)>>> =
+    std::sync::Mutex::new(None);
 
 pub fn ab_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -851,6 +855,22 @@ pub fn ab_check(
     }
 
     let n = AB_CMPS.fetch_add(1, Ordering::Relaxed) + 1;
+    // PER-SITE accounting. The aggregate counters alone cannot answer the only
+    // question that matters — *which* comparison moved — and this file
+    // deliberately runs two comparisons that are MEASUREMENTS rather than
+    // contracts (IEEE silu vs the fast-math `fused_glu` the shared expert
+    // actually runs). Without a per-site table the verdict has to be inferred
+    // from a ratio, and an inferred verdict is not a verdict.
+    {
+        let mut g = AB_SITES.lock().unwrap_or_else(|e| e.into_inner());
+        let m = g.get_or_insert_with(std::collections::BTreeMap::new);
+        let e = m.entry(site.to_string()).or_insert((0u64, 0u64, 0u64));
+        e.0 += 1;
+        if bad > 0 {
+            e.1 += 1;
+            e.2 += bad;
+        }
+    }
     if bad > 0 {
         AB_BAD_TENSORS.fetch_add(1, Ordering::Relaxed);
         AB_BAD_ELEMS.fetch_add(bad, Ordering::Relaxed);
@@ -866,13 +886,23 @@ pub fn ab_check(
         }
     }
     if n % 1000 == 0 {
-        tracing::info!(
+        // `warn!`, not `info!`: the summary is the evidence, and it must not
+        // depend on the operator having remembered to raise RUST_LOG.
+        tracing::warn!(
             "HC_AB: {n} comparisons, {} tensors with mismatches, {} bad elements \
              (poison={})",
             AB_BAD_TENSORS.load(Ordering::Relaxed),
             AB_BAD_ELEMS.load(Ordering::Relaxed),
             ab_poison()
         );
+        let g = AB_SITES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = g.as_ref() {
+            for (site, (c, bt, be)) in m.iter() {
+                tracing::warn!(
+                    "HC_AB_SITE {site} comparisons={c} bad_tensors={bt} bad_elems={be}"
+                );
+            }
+        }
     }
     Ok(bad)
 }
