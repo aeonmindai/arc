@@ -322,6 +322,27 @@ impl candle::CustomOp1 for FlashAttnSinksVarlen {
 /// * `window_size` - Sliding window size (0 = full causal attention)
 ///
 /// Returns `[batch_size, num_heads, seq_len, head_dim]`
+/// # The `mask` parameter exists so that it cannot be forgotten
+///
+/// 🔴 This kernel has NO custom-mask support: causality is expressed only as a
+/// relative-distance `window_size`, decided inside the kernel. It previously
+/// took no mask argument at all, which meant a caller holding an explicit
+/// additive mask could hand it work and have the mask silently dropped -- and
+/// one did. `sinks_attn_regular` passed V4's dense `[t_q, n_keys]` mask over
+/// `[raw sliding-window KV ++ compressed KV]` to nothing, and the kernel ran a
+/// plain causal scan over an axis where relative distance is meaningless.
+///
+/// Measured on an H200 (output magnitude 0.1875): the fused result sat
+/// **60.3x closer** to an unmasked causal reference (max abs diff 0.0129) than
+/// to the masked one (0.7749), and that 0.7749 error was the same size as the
+/// mask's entire effect (0.7720). The mask was not approximated -- it was
+/// discarded.
+///
+/// The fix is this parameter, not a note asking callers to remember. A kernel
+/// that cannot honour a mask must REFUSE work that carries one, so the next
+/// caller gets a compile error (new argument) and then a hard runtime error,
+/// instead of silently wrong numbers. Callers that hold a mask must route to an
+/// implementation that applies it.
 #[allow(clippy::too_many_arguments)]
 pub fn flash_attn_sinks(
     q: &Tensor,
@@ -330,7 +351,17 @@ pub fn flash_attn_sinks(
     sinks: Option<&Tensor>,
     softmax_scale: f32,
     window_size: usize,
+    mask: Option<&Tensor>,
 ) -> Result<Tensor> {
+    if mask.is_some() {
+        candle_core::bail!(
+            "flash_attn_sinks: an explicit attention mask was supplied, and this kernel \
+             cannot honour one -- it expresses causality only as a relative-distance \
+             window_size. Refusing rather than silently computing unmasked attention. \
+             Route this call to the unfused path (`sinks_attn_cpu` / \
+             `arcflash::union_attention`), or give the kernel a custom-mask mode."
+        );
+    }
     let q = q.contiguous()?;
     let k = k.contiguous()?;
     let v = v.contiguous()?;

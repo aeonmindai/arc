@@ -156,8 +156,32 @@ fn sinks_attn_regular(
         });
     }
 
+    // 🔴 THE FUSED KERNEL CANNOT HONOUR AN EXPLICIT MASK, SO IT MUST NOT TAKE
+    // WORK THAT HAS ONE.
+    //
+    // This arm used to engage on head_dim alone and call the kernel without
+    // `mask`, so V4's dense `[t_q, n_keys]` mask over
+    // `[raw sliding-window KV ++ compressed KV]` (built in
+    // `models/dsv4_attention.rs`) was dropped on the floor and the kernel ran a
+    // plain causal scan over an axis where relative distance is meaningless --
+    // compressed entry `j` stands for absolute position `j * ratio`.
+    //
+    // ✅ MEASURED, H200, head_dim=512, output magnitude 0.1875:
+    //     max|fused - reference(causal only)| = 0.0129
+    //     max|fused - reference(masked)|      = 0.7749
+    //     max|ref(causal) - ref(masked)|      = 0.7720   <- the mask's whole effect
+    // The fused result sat 60.3x closer to the UNMASKED reference, and its error
+    // against the masked one was the same size as the mask's entire effect. The
+    // mask was discarded, not approximated. End to end this served
+    // `'orem, etc. etc. etc.'` where the unfused path served coherent text.
+    //
+    // `dsv4_attention.rs` predicted this exactly: "a landmine that arms itself
+    // the moment a 512-wide flash-sinks kernel lands, and silently, because the
+    // fused path takes no mask to disagree with." The kernel landed; the mask
+    // is now a parameter of `flash_attn_sinks` so it cannot be forgotten again,
+    // and this gate routes masked work to the path that applies it.
     #[cfg(feature = "cuda")]
-    if q.device().is_cuda() && flash_sinks_ok_cuda {
+    if q.device().is_cuda() && flash_sinks_ok_cuda && mask.is_none() {
         crate::attention::arcflash::note(crate::attention::arcflash::Path::VendorSinks);
         return mistralrs_paged_attn::flash_attn_sinks(
             q,
@@ -166,7 +190,23 @@ fn sinks_attn_regular(
             Some(sinks),
             sdpa_params.softmax_scale,
             window_size,
+            None,
         );
+    }
+    #[cfg(feature = "cuda")]
+    if q.device().is_cuda() && flash_sinks_ok_cuda && mask.is_some() {
+        // Loud once: this is a real performance loss (the fused kernel is 60%
+        // of prefill) taken deliberately to keep the answer correct.
+        static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        WARNED.get_or_init(|| {
+            tracing::warn!(
+                target: "arcflash",
+                "fused head_dim={hd} sinks kernel DECLINED: an explicit attention mask is \
+                 present and the kernel cannot honour one. Falling back to the unfused \
+                 masked path. This is correct-and-slower on purpose; giving the kernel a \
+                 custom-mask mode is what makes it fast again."
+            );
+        });
     }
 
     #[cfg(feature = "metal")]
@@ -536,6 +576,246 @@ mod tests {
             max_abs_diff(&flat(&got), &flat(&want)),
             0.0,
             "a masked call did not take the regular (mask-honoring) path"
+        );
+        Ok(())
+    }
+}
+
+/// The fused `head_dim=512` flash-sinks path takes no mask argument, so it
+/// cannot honour one. These tests turn that code-read into a measurement.
+///
+///   cargo test -p mistralrs-core --release --features "cuda flash-attn" fused_sinks -- --nocapture
+#[cfg(all(test, feature = "cuda"))]
+mod fused_sinks_mask_tests {
+    use super::*;
+    use candle_core::{DType, Device};
+
+    fn mk(dims: &[usize], seed: f32, dev: &Device) -> Result<Tensor> {
+        let n: usize = dims.iter().product();
+        let data: Vec<f32> = (0..n).map(|i| ((i as f32) * seed).sin()).collect();
+        Tensor::from_vec(data, dims, dev)?.to_dtype(DType::BF16)
+    }
+
+    fn to_f32(t: &Tensor) -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    fn max_abs(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+    }
+
+    /// Additive 0 / -inf mask [1, 1, q, k]: causal, and additionally only the
+    /// first `keep` keys are admissible. Two `keep` values give two genuinely
+    /// different admissible sets.
+    fn band_mask(q_len: usize, kv_len: usize, keep: usize, dev: &Device) -> Result<Tensor> {
+        let mut m = vec![0f32; q_len * kv_len];
+        for i in 0..q_len {
+            for j in 0..kv_len {
+                let causal_ok = j <= i + (kv_len - q_len);
+                if !causal_ok || j >= keep {
+                    m[i * kv_len + j] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        Tensor::from_vec(m, (1, 1, q_len, kv_len), dev)?.to_dtype(DType::BF16)
+    }
+
+    const B: usize = 1;
+    const H: usize = 8;
+    const KVH: usize = 1; // V4 is MQA
+    const QL: usize = 16;
+    const KL: usize = 48;
+    const D: usize = 512; // the head dim every V4 layer uses
+
+    /// 🔴 THE DEFECT. `sinks_attn_regular`'s CUDA arm calls
+    /// `flash_attn_sinks(q, k, v, Some(sinks), scale, window_size)` — the mask
+    /// is not an argument, so the fused output cannot depend on it.
+    ///
+    /// Compared by MAGNITUDE, not bit-equality: two implementations of the same
+    /// math never agree bit-for-bit (summation order moves the low bits), so
+    /// bit-inequality would prove nothing. A dropped mask is an O(1) error — it
+    /// mixes in values that should have carried zero weight.
+    #[test]
+    fn fused_sinks_512_ignores_the_mask() -> Result<()> {
+        // Environment failure is not a pass.
+        let dev = Device::new_cuda(0).expect("this test requires a CUDA device");
+
+        let q = mk(&[B, H, QL, D], 0.017, &dev)?;
+        let k = mk(&[B, KVH, KL, D], 0.023, &dev)?;
+        let v = mk(&[B, KVH, KL, D], 0.031, &dev)?;
+        let sinks = mk(&[H], 0.041, &dev)?;
+        let p = SdpaParams {
+            n_kv_groups: H / KVH,
+            softcap: None,
+            softmax_scale: 1.0 / (D as f32).sqrt(),
+            sliding_window: None,
+            sinks: None,
+        };
+
+        let mask_causal = band_mask(QL, KL, KL, &dev)?; // causal only
+        let mask_narrow = band_mask(QL, KL, 8, &dev)?; // causal AND only 8 keys
+
+        let ref_causal = to_f32(&crate::attention::arcflash::union_attention(
+            &q,
+            &k,
+            &v,
+            Some(&mask_causal),
+            Some(&sinks),
+            &p,
+        )?);
+        let ref_narrow = to_f32(&crate::attention::arcflash::union_attention(
+            &q,
+            &k,
+            &v,
+            Some(&mask_narrow),
+            Some(&sinks),
+            &p,
+        )?);
+
+        // The fused kernel, called exactly as the dispatch calls it.
+        let fused = to_f32(&mistralrs_paged_attn::flash_attn_sinks(
+            &q,
+            &k,
+            &v,
+            Some(&sinks),
+            p.softmax_scale,
+            0,
+            None, // deliberately probing what the kernel does with no mask
+        )?);
+
+        // NEGATIVE CONTROL: perturb the OUTPUT by one ULP at a known index.
+        // Perturbing a shared INPUT would move both paths together and could
+        // never detect a difference.
+        {
+            let mut probe = fused.clone();
+            assert_eq!(max_abs(&probe, &fused), 0.0, "self-comparison must be zero");
+            probe[7] = f32::from_bits(probe[7].to_bits().wrapping_add(1));
+            assert!(
+                max_abs(&probe, &fused) > 0.0,
+                "comparator is inert: a 1-ULP OUTPUT perturbation did not register"
+            );
+        }
+
+        let d_causal = max_abs(&fused, &ref_causal);
+        let d_narrow = max_abs(&fused, &ref_narrow);
+        let d_masks = max_abs(&ref_causal, &ref_narrow);
+        let scale = ref_causal.iter().fold(0f32, |m, x| m.max(x.abs()));
+
+        eprintln!(
+            "output magnitude ~{scale:.4}\n  \
+             max|fused - reference(causal only)| = {d_causal:.6}\n  \
+             max|fused - reference(masked)|      = {d_narrow:.6}\n  \
+             max|ref(causal) - ref(masked)|      = {d_masks:.6}   <- the mask's own effect"
+        );
+
+        assert!(
+            d_masks > 1e-3,
+            "the two masks did not change the reference ({d_masks}); test would be vacuous"
+        );
+
+        eprintln!(
+            "VERDICT: fused sits {:.1}x closer to the CAUSAL-ONLY reference than to the MASKED one",
+            d_narrow / d_causal.max(1e-9)
+        );
+
+        // This documents what the KERNEL does with no mask -- it is the
+        // baseline the fix is measured against, not a failure.
+        assert!(
+            d_narrow > d_causal * 10.0,
+            "expected the maskless kernel to track the causal-only reference"
+        );
+        Ok(())
+    }
+
+    /// THE FIX, PART 1 — the interface refuses.
+    ///
+    /// A kernel that cannot honour a mask must not silently accept work that
+    /// has one. `flash_attn_sinks` now takes `mask` precisely so it can reject
+    /// it, rather than relying on every caller to remember.
+    #[test]
+    fn fused_kernel_refuses_a_mask_instead_of_dropping_it() -> Result<()> {
+        let dev = Device::new_cuda(0).expect("this test requires a CUDA device");
+        let q = mk(&[B, H, QL, D], 0.017, &dev)?;
+        let k = mk(&[B, KVH, KL, D], 0.023, &dev)?;
+        let v = mk(&[B, KVH, KL, D], 0.031, &dev)?;
+        let sinks = mk(&[H], 0.041, &dev)?;
+        let mask = band_mask(QL, KL, 8, &dev)?;
+        let scale = 1.0 / (D as f32).sqrt();
+
+        let err =
+            mistralrs_paged_attn::flash_attn_sinks(&q, &k, &v, Some(&sinks), scale, 0, Some(&mask));
+        assert!(
+            err.is_err(),
+            "the kernel accepted a mask it cannot honour -- the silent-drop defect is back"
+        );
+
+        // ...and still works when there is genuinely no mask to honour.
+        assert!(
+            mistralrs_paged_attn::flash_attn_sinks(&q, &k, &v, Some(&sinks), scale, 0, None)
+                .is_ok(),
+            "refusing a mask must not break the maskless fast path"
+        );
+        Ok(())
+    }
+
+    /// THE FIX, PART 2 — the dispatch routes masked work to a path that
+    /// applies the mask, and the answer is right.
+    ///
+    /// This is the regression gate: it fails if anyone re-widens the fused arm
+    /// to swallow masked work.
+    #[test]
+    fn masked_sinks_attention_matches_the_masked_reference() -> Result<()> {
+        let dev = Device::new_cuda(0).expect("this test requires a CUDA device");
+        let q = mk(&[B, H, QL, D], 0.017, &dev)?;
+        let k = mk(&[B, KVH, KL, D], 0.023, &dev)?;
+        let v = mk(&[B, KVH, KL, D], 0.031, &dev)?;
+        let sinks = mk(&[H], 0.041, &dev)?;
+        let p = SdpaParams {
+            n_kv_groups: H / KVH,
+            softcap: None,
+            softmax_scale: 1.0 / (D as f32).sqrt(),
+            sliding_window: None,
+            sinks: None,
+        };
+        let mask = band_mask(QL, KL, 8, &dev)?;
+
+        let got = to_f32(&sinks_attn(&q, &k, &v, &sinks, Some(&mask), None, &p)?);
+        let want = to_f32(&crate::attention::arcflash::union_attention(
+            &q,
+            &k,
+            &v,
+            Some(&mask),
+            Some(&sinks),
+            &p,
+        )?);
+
+        // Negative control on the OUTPUT, not a shared input: a shared-input
+        // perturbation moves both sides together and can never fire.
+        {
+            let mut probe = got.clone();
+            assert_eq!(max_abs(&probe, &got), 0.0);
+            probe[7] = f32::from_bits(probe[7].to_bits().wrapping_add(1));
+            assert!(max_abs(&probe, &got) > 0.0, "comparator is inert");
+        }
+
+        let d = max_abs(&got, &want);
+        let scale = want.iter().fold(0f32, |m, x| m.max(x.abs()));
+        eprintln!(
+            "masked dispatch vs masked reference: max abs diff {d:.8} (magnitude {scale:.4})"
+        );
+        assert!(
+            d < 1e-3,
+            "masked sinks attention does not match the masked reference \
+             (max abs diff {d}, magnitude {scale}) -- the mask is being dropped again"
         );
         Ok(())
     }
