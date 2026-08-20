@@ -139,6 +139,56 @@ These are cheap, decided, and blocked only on someone doing them.
 | 4 | **Profiler stall attribution (`ncu`)** | Which of barriers / shared-memory atomics / scattered L2 dominates the beam kernel's stalls is still **inferred**, never measured. It decides what to attack next if anyone reopens the kernel. | One profiled launch |
 | 5 | ~~**What PR #40's kernel stack is actually worth on the shipped build**~~ **— RUN 2026-08-15. Answer: 1.33×** | Measured on the production toolchain (same A100, CUDA 12.8, same driver/model/data, immediately post-bake): pre-#40 520.3 s/layer vs `master` 391.9 s/layer. The previously published **≤1.21× "upper bound" was wrong, and wrong in the cautious direction** — nvcc 11.5 *under*-stated the gain, it did not flatter it. Full protocol and the retraction in [QUANTIZATION_PERFORMANCE.md](QUANTIZATION_PERFORMANCE.md#predictions-that-failed-and-why), items 2 and 5. **Still open:** it is the #37→`master` delta (#38–#41 all landed in between); #40's three parts were never separated; and it is an **A100** number, so every H200 per-layer figure derived from it is `[projected]`, not measured. | ~~Zero rental~~ **Done, ~$0.35** |
 
+### 2.1 The `#167` MoE dispatch gate — merged, unmeasured in the band it moved
+
+**Status: merged to master (`b2841f5eb`) 2026-08-20. Needs a hardware A/B before
+it is treated as settled. Requires a GPU; cannot be answered on CI.**
+
+**Why this is here.** #167 is the only one of the seven PRs merged in the
+2026-08-20 queue sweep that changes behaviour for a user who sets **no flags**.
+It landed on a green-CI gate, and **CI cannot see performance** — so its
+correctness as a *tuning* decision is untested. Recorded here so it stays a
+visible open question rather than becoming a merged assumption.
+
+**What changed.** The gate at `mistralrs-quant/src/qtip/bitshift.rs:1850` is now
+`n_tokens <= DECODE_REGIME_MAX_TOKENS || !gather_policy::grouped_gemm_tiles_amortize(...)`.
+
+| regime | before | after |
+|---|---|---|
+| b=1 decode (n=1) | fused gather GEMV | **unchanged** — `1 <= 8` short-circuits true on both sides |
+| full prefill (n≈2000) | grouped GEMM | **unchanged** — `expected_pairs_per_distinct_expert(2000,6,256) = 46.9 >= GROUPED_TILE_M(16)` |
+| **9 <= n <= 682** | grouped GEMM | **now prefers gather-GEMV** |
+
+`grouped_gemm_min_tokens(6,256) == 683`, so the middle band moved. That band is
+**batched decode at B>=9 and every prefill chunk under 683 tokens** — exactly
+where chunked prefill operates [derived, from the merged constants].
+
+**Why it may be a regression rather than a fix.** The gather-GEMV path it now
+prefers is a **no-dedup GEMV with 3.15x redundant reads**. In the 9-682 band we
+may have traded a poorly-amortized kernel for one that reads memory three times
+over. The new gate is the more *principled* one — actual m-tile occupancy beats a
+token-count proxy — but "more principled" and "faster here" are different claims,
+and only the first is established. Exposure is **performance, not correctness**:
+both paths compute the same thing; this is dispatch only.
+
+**The A/B that settles it** [not run]: batched decode at B = 16, 32, 64; prefill
+chunks at 128, 256, 512 tokens; gate-as-merged vs forced-grouped, same model and
+seeds.
+
+**Coupling with the open `#99`.** #99 (`perf/qtip-grouped-gemm-arch`) raises
+`GROUPED_TILE_M` to 64 on SM90+, moving this threshold roughly **4x**. The two are
+coupled, not independent. **#99 must make the gate read `grouped_tile_m_for_cc`
+rather than the `GROUPED_TILE_M` constant** — #167 writes
+`grouped_gemm_tiles_amortize` against the constant, so raising it per-arch without
+updating the gate makes the gate and the kernel disagree about tile size. That is
+a wrong-answer bug, not a perf bug.
+
+**Measurement caveat covering the whole sweep.** Every performance number attached
+to the seven PRs merged on 2026-08-20 was measured on that branch's own base,
+**not on current master**. None is a current fact; nothing may be quoted until
+re-measured against master on hardware. This includes the 15.0 -> 32.6 tok/s
+ladder figures carried by the still-open #185-#189.
+
 ---
 
 ## 3. Not measured — do not claim
