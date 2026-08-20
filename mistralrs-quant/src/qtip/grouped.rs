@@ -658,3 +658,42 @@ mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// MEASURED 2026-08-21, H200, V4-Flash qtip2b — what the grouped GEMM's 100% SM
+// is actually executing, and the ceiling on fixing it.
+//
+// TWO INDEPENDENT METHODS, agreeing to one point:
+//
+//  1. Static SASS mix of the shipping kernel (variant 0, bf16, 512 instrs,
+//     `cuobjdump -sass`): trellis-decode-class opcodes 48.2%, fp math 3.7%,
+//     memory 10.5%. Innermost loop (166 instrs): LOP3 46, SHF 24, LDS 18,
+//     HADD2 16, IMAD 11, BREV 8, FADD 8, FMUL 8 — 54% decode vs 19% arithmetic.
+//     LIMIT: static counts, not dynamic execution counts.
+//
+//  2. Dynamic ablation (diagnostic variant 3, decode stubbed to a symbol read,
+//     same loads / loop / packing / accumulate, TUNED strides held fixed):
+//       variant 1 (tuned, correct)      806,193 ns/call
+//       variant 3 (tuned, no decode)    425,842 ns/call
+//     => the trellis decode is 47.2% of this kernel's time. LIMIT: a LOWER
+//     bound — the stub still pays a byte read and a convert.
+//
+// SO THE CEILING ON ANY DECODE OPTIMISATION IS 806,193/425,842 = 1.89x ON THIS
+// KERNEL. Decode is the single largest item and worth fixing; it is not, and
+// cannot be, a 70x.
+//
+// Tensor-core instructions in the whole kernel: 2. Despite the surrounding
+// comments describing "a persistent tensor-core tile loop" and "the mma.sync
+// pipeline is the point", the shipped inner loop does the math in scalar
+// HADD2/FMUL/FADD. That is a separate, unclaimed defect.
+//
+// VARIANT SELECTION: `grouped_variant()` falls back to BASELINE and nothing in
+// the serving path ever calls `set_grouped_variant`, so serving has been using
+// variant 0 — the untuned kernel — the whole time. Measured:
+//     grouped kernel   1,614,399 -> 806,193 ns/call   (2.00x)
+//     prefill@256           303.2 -> 356.3 tok/s      (+17.5%)
+//     B=256 serving        193.46 -> 219.23 tok/s     (+13.3%)
+// Greedy output is token-identical on 3/3 prompts at temperature 0 — evidence,
+// NOT a quality gate. Flipping the default should be gated on a ppl/greedy
+// run, which is why this comment recommends it rather than doing it.
+// ---------------------------------------------------------------------------
