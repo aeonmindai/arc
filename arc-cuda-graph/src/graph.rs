@@ -108,6 +108,10 @@ pub struct CudaGraphRunner {
     /// context-dependent and the real fix is shape-constant buffers, not more
     /// warmup.
     deferred_passes_remaining: u32,
+    /// Deferred passes still available to `grant_extra_deferred_pass`. Counts
+    /// down independently of `deferred_passes_remaining` so that "keep warming
+    /// while the profile grows" cannot become an unbounded loop.
+    deferred_extra_budget: u32,
 }
 
 #[cfg(feature = "cuda")]
@@ -121,13 +125,40 @@ impl CudaGraphRunner {
         Self::new_with_passes(device, warmup_steps, Self::default_deferred_passes())
     }
 
-    /// Number of deferred-free warmup passes, from `ARC_GRAPH_DEFERRED_PASSES`
-    /// (default 1, the historical behaviour). See `deferred_passes_remaining`.
+    /// Number of deferred-free warmup passes, from `ARC_GRAPH_DEFERRED_PASSES`.
+    ///
+    /// Default 4, not the historical 1. One pass only suffices if every decode
+    /// step allocates the same set of sizes, and V4's does not: the rolling
+    /// compressor's retained tail is rebuilt at width `tokens - base`, and
+    /// `base` jumps a whole `ratio` at a group boundary while `tokens` climbs by
+    /// one, so the size cycles through `ratio` consecutive values (measured:
+    /// `4096 × {18,19,20,21}`). One pass warms one phase of that cycle; the
+    /// captured step lands on another phase and allocates a size the pool has
+    /// never held. `ratio` is 4 on the shipped V4 configuration.
+    ///
+    /// This is a floor, not the answer — `grant_extra_deferred_pass` keeps
+    /// extending while the observed size profile is still growing, so a model
+    /// with a longer cycle is covered without retuning this number.
+    /// See `deferred_passes_remaining`.
     pub fn default_deferred_passes() -> u32 {
         std::env::var("ARC_GRAPH_DEFERRED_PASSES")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(1)
+            .unwrap_or(4)
+    }
+
+    /// Upper bound on passes granted by `grant_extra_deferred_pass`, from
+    /// `ARC_GRAPH_DEFERRED_MAX` (default 24). The bound is what keeps a model
+    /// whose allocation sizes grow monotonically with context length from
+    /// warming forever: it will exhaust the budget, and the capture-miss assert
+    /// will then refuse the capture and name the sizes. That refusal is the
+    /// useful result — it says the fix is shape-constant buffers (or allocator
+    /// size-class bucketing), not more warmup.
+    pub fn default_deferred_max() -> u32 {
+        std::env::var("ARC_GRAPH_DEFERRED_MAX")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(24)
     }
 
     pub fn new_with_passes(
@@ -176,6 +207,7 @@ impl CudaGraphRunner {
                 verify_remaining: 0,
                 verify_failed: false,
                 deferred_passes_remaining: 0,
+                deferred_extra_budget: 0,
             });
         }
 
@@ -198,6 +230,7 @@ impl CudaGraphRunner {
             verify_remaining: Self::default_verify_replays(),
             verify_failed: false,
             deferred_passes_remaining: deferred_passes,
+            deferred_extra_budget: Self::default_deferred_max(),
         })
     }
 
@@ -271,6 +304,29 @@ output_trusted={} verify_remaining={} verify_failed={}",
         } else {
             false
         }
+    }
+
+    /// Ask for one more deferred-free warm pass, spending from a fixed budget.
+    /// Returns whether one was granted.
+    ///
+    /// The caller grants a pass whenever the last one taught the allocator a
+    /// size it had not seen, and stops when a pass adds nothing. That turns
+    /// "how many passes cover the allocation cycle?" from a constant that has
+    /// to be right into an observation that terminates on its own, while
+    /// `deferred_extra_budget` guarantees termination even when the sizes never
+    /// converge.
+    pub fn grant_extra_deferred_pass(&mut self) -> bool {
+        if self.deferred_extra_budget == 0 {
+            return false;
+        }
+        self.deferred_extra_budget -= 1;
+        self.deferred_passes_remaining += 1;
+        true
+    }
+
+    /// Deferred passes still available to `grant_extra_deferred_pass`.
+    pub fn deferred_extra_budget(&self) -> u32 {
+        self.deferred_extra_budget
     }
 
     /// How many replays must be proven against an eager forward before the

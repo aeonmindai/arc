@@ -44,16 +44,31 @@ rust-version = "1.88"
 # RUN-161: forked candle for the opt-in CUDA caching allocator (graph-capture-safe).
 # Default-off; identical to upstream c3bb5bf when ARC_CANDLE_ALLOC_CACHE unset.
 # Fork of huggingface/candle 0.9.2 (rev c3bb5bf), mirrored to the org for CI.
-# PINNED TO AN EXPLICIT REV, not a branch. This change depends on
-# `drain_alloc_cache_and_free` (fork commit 88d86a20), and a moving branch
-# pointer has broken CI on this repo before — a path/branch dependency that
-# advances under a merged PR turns a green build into a red one with no commit
-# here to blame.
-candle-core = { git = "https://github.com/aeonmindai/candle.git", rev = "89ab14ef1216331a782539f533b99f6816708604" }
-candle-nn = { git = "https://github.com/aeonmindai/candle.git", rev = "89ab14ef1216331a782539f533b99f6816708604" }
-candle-flash-attn-v3 = { git = "https://github.com/aeonmindai/candle.git", rev = "89ab14ef1216331a782539f533b99f6816708604" }
-candle-flash-attn = { git = "https://github.com/aeonmindai/candle.git", rev = "89ab14ef1216331a782539f533b99f6816708604" }
-candle-metal-kernels = { git = "https://github.com/aeonmindai/candle.git", rev = "89ab14ef1216331a782539f533b99f6816708604" }
+# PINNED TO AN EXPLICIT REV, not a branch. This tree needs BOTH lines of the
+# fork's allocator work, and a moving branch pointer has broken CI on this repo
+# before — a path/branch dependency that advances under a merged PR turns a
+# green build into a red one with no commit here to blame.
+#
+# The rev below is `arcgraph/bounded-alloc-plus-prewarm` (9586979db), which is
+# the MERGE of the two, and a strict superset of each:
+#
+#   * 89ab14ef (`perf/alloc-cache-bounded`) — `drain_alloc_cache_and_free`
+#     (88d86a20) plus the bounded caching allocator #213 depends on, its cap
+#     contract test, and "eviction must not run inside the capture window".
+#   * 1fa534db (`arcgraph/prewarm-profile`) — the capture-miss ledger and
+#     profile-driven pre-warm this file's pre-warm caller needs
+#     (`prewarm_alloc_cache`, `reset_capture_misses`, `capture_misses`).
+#
+# Those two revs had DIVERGED: 1fa534db is missing three commits 89ab14ef has.
+# Pinning straight to 1fa534db, as this change originally did, would therefore
+# have silently reverted the bounded allocator and the capture-window eviction
+# fix. Verified by `gh api repos/aeonmindai/candle/compare/...`: 9586979db is
+# ahead of 89ab14ef by 6 and of 1fa534db by 8, behind neither.
+candle-core = { git = "https://github.com/aeonmindai/candle.git", rev = "9586979db9031df6377f7dab1233c4548d976b76" }
+candle-nn = { git = "https://github.com/aeonmindai/candle.git", rev = "9586979db9031df6377f7dab1233c4548d976b76" }
+candle-flash-attn-v3 = { git = "https://github.com/aeonmindai/candle.git", rev = "9586979db9031df6377f7dab1233c4548d976b76" }
+candle-flash-attn = { git = "https://github.com/aeonmindai/candle.git", rev = "9586979db9031df6377f7dab1233c4548d976b76" }
+candle-metal-kernels = { git = "https://github.com/aeonmindai/candle.git", rev = "9586979db9031df6377f7dab1233c4548d976b76" }
 
 axum = "0.8.8"
 anyhow = "1.0.100"
