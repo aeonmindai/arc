@@ -2085,11 +2085,23 @@ impl MoeGate {
             // V4: sqrt(softplus(x)). Stable formulation:
             // softplus(x) = max(x, 0) + log(1 + exp(-|x|)).
             // Audit §8 P1 item 14.
+            //
+            // The eager form below is NINE kernel launches (`zeros_like`,
+            // `bmaximum`, `uabs`, `uneg`, `uexp`, `affine`, `ulog`, `badd`,
+            // `usqrt`) on a `[1, n_routed_experts]` = [1, 256] tensor, once per
+            // MoE layer per token. `cuda/hc_fused.cu` collapses it to one,
+            // bit-identically — this expression decides WHICH EXPERTS RUN, so
+            // the fused kernel transcribes candle's ops rather than
+            // re-deriving them. `ARC_HC_FUSED=0` restores the chain for A/B.
             ScoringFunc::SqrtSoftplus => {
-                let max0 = logits.maximum(&logits.zeros_like()?)?;
-                let abs = logits.abs()?;
-                let softplus = (max0 + ((abs.neg()?.exp()? + 1.0)?.log()?))?;
-                softplus.sqrt()?
+                if crate::cuda::hc_fused::usable(&logits) {
+                    crate::cuda::hc_fused::sqrt_softplus_cuda(&logits)?
+                } else {
+                    let max0 = logits.maximum(&logits.zeros_like()?)?;
+                    let abs = logits.abs()?;
+                    let softplus = (max0 + ((abs.neg()?.exp()? + 1.0)?.log()?))?;
+                    softplus.sqrt()?
+                }
             }
         };
         drop(_prof_score);

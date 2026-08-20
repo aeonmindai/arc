@@ -371,4 +371,32 @@ extern "C" {
         eps: f32,
         stream: i64,
     );
+    // cuda/hc_fused.cu — fused V4 router-region kernels. Like sinkhorn.cu these
+    // are compiled by build.rs's dedicated no-fast-math builder; see the
+    // bit-identity contract at the top of that file.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn hc_pre_fused_f32(
+        x_flat: *const c_void,
+        mixes_raw: *const c_void,
+        hc_scale: *const c_void,
+        hc_base: *const c_void,
+        pre: *mut c_void,
+        post: *mut c_void,
+        comb_pre: *mut c_void,
+        n: i32,
+        d: i32,
+        m: i32,
+        hc: i32,
+        block_dim: i32,
+        inv_d: f32,
+        rms_eps: f32,
+        hc_eps: f32,
+        stream: i64,
+    );
+    pub(crate) fn sqrt_softplus_f32(
+        inp: *const c_void,
+        out: *mut c_void,
+        numel: i64,
+        stream: i64,
+    );
 }
