@@ -692,7 +692,7 @@ checksum = "ade8366b8bd5ba243f0a58f036cc0ca8a2f069cff1a2351ef1cac6b083e16fc0"
 [[package]]
 name = "candle-core"
 version = "0.9.2"
-source = "git+https://github.com/aeonmindai/candle.git?rev=1fa534db8fecc9c281f74d2ea442bb0b8bb8e1ed#1fa534db8fecc9c281f74d2ea442bb0b8bb8e1ed"
+source = "git+https://github.com/aeonmindai/candle.git?rev=9211966e7654f2573bb16e77dde8fd056119b07c#9211966e7654f2573bb16e77dde8fd056119b07c"
 dependencies = [
  "accelerate-src",
  "byteorder",
@@ -723,7 +723,7 @@ dependencies = [
 [[package]]
 name = "candle-flash-attn"
 version = "0.9.2"
-source = "git+https://github.com/aeonmindai/candle.git?rev=1fa534db8fecc9c281f74d2ea442bb0b8bb8e1ed#1fa534db8fecc9c281f74d2ea442bb0b8bb8e1ed"
+source = "git+https://github.com/aeonmindai/candle.git?rev=9211966e7654f2573bb16e77dde8fd056119b07c#9211966e7654f2573bb16e77dde8fd056119b07c"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -734,7 +734,7 @@ dependencies = [
 [[package]]
 name = "candle-flash-attn-v3"
 version = "0.9.2"
-source = "git+https://github.com/aeonmindai/candle.git?rev=1fa534db8fecc9c281f74d2ea442bb0b8bb8e1ed#1fa534db8fecc9c281f74d2ea442bb0b8bb8e1ed"
+source = "git+https://github.com/aeonmindai/candle.git?rev=9211966e7654f2573bb16e77dde8fd056119b07c#9211966e7654f2573bb16e77dde8fd056119b07c"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -747,7 +747,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.9.2"
-source = "git+https://github.com/aeonmindai/candle.git?rev=1fa534db8fecc9c281f74d2ea442bb0b8bb8e1ed#1fa534db8fecc9c281f74d2ea442bb0b8bb8e1ed"
+source = "git+https://github.com/aeonmindai/candle.git?rev=9211966e7654f2573bb16e77dde8fd056119b07c#9211966e7654f2573bb16e77dde8fd056119b07c"
 dependencies = [
  "cudaforge",
 ]
@@ -755,7 +755,7 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.9.2"
-source = "git+https://github.com/aeonmindai/candle.git?rev=1fa534db8fecc9c281f74d2ea442bb0b8bb8e1ed#1fa534db8fecc9c281f74d2ea442bb0b8bb8e1ed"
+source = "git+https://github.com/aeonmindai/candle.git?rev=9211966e7654f2573bb16e77dde8fd056119b07c#9211966e7654f2573bb16e77dde8fd056119b07c"
 dependencies = [
  "half",
  "objc2",
@@ -769,7 +769,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.9.2"
-source = "git+https://github.com/aeonmindai/candle.git?rev=1fa534db8fecc9c281f74d2ea442bb0b8bb8e1ed#1fa534db8fecc9c281f74d2ea442bb0b8bb8e1ed"
+source = "git+https://github.com/aeonmindai/candle.git?rev=9211966e7654f2573bb16e77dde8fd056119b07c#9211966e7654f2573bb16e77dde8fd056119b07c"
 dependencies = [
  "accelerate-src",
  "candle-core",
@@ -788,7 +788,7 @@ dependencies = [
 [[package]]
 name = "candle-ug"
 version = "0.9.2"
-source = "git+https://github.com/aeonmindai/candle.git?rev=1fa534db8fecc9c281f74d2ea442bb0b8bb8e1ed#1fa534db8fecc9c281f74d2ea442bb0b8bb8e1ed"
+source = "git+https://github.com/aeonmindai/candle.git?rev=9211966e7654f2573bb16e77dde8fd056119b07c#9211966e7654f2573bb16e77dde8fd056119b07c"
 dependencies = [
  "ug",
  "ug-cuda",
