@@ -19,7 +19,7 @@
 //! `--use_fast_math`, and the `affine` scalars are narrowed to bf16 host-side
 //! by the same `half::bf16` code candle uses.
 //!
-//! Two switches, both read once and cached (`std::env::var` takes a global
+//! Three switches, all read once and cached (`std::env::var` takes a global
 //! lock and this is consulted on every layer of every step):
 //!
 //! - `ARC_QK_FUSED=0` restores the eager chain, so the A/B runs from ONE
@@ -27,6 +27,14 @@
 //! - `ARC_QK_VERIFY=1` runs BOTH paths at every layer and asserts the outputs
 //!   are bit-identical, with a negative control that proves the comparator is
 //!   live. See [`verify_enabled`].
+//! - `ARC_QK_REQUIRE_ENGAGED=1` exits 2 on the first decline. See
+//!   [`require_engaged`] — engagement is the precondition for anything on the
+//!   `arcgraph/rope-device-pos` branch meaning anything at all.
+//!
+//! Engagement is also announced on stderr unconditionally, once, as
+//! `[ARC QK ENGAGE]` or `[ARC QK DECLINE]`. **No line at all** means
+//! `fused_qk_gate` was never reached, which is a third, distinguishable state —
+//! not evidence of engagement.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -76,11 +84,37 @@ pub(crate) fn note_engaged(head_dim: usize, rope_dim: usize, n_heads: usize, dty
             "ArcAttention: fused qk_norm_rope ENGAGED (head_dim={head_dim}, rope_dim={rope_dim}, \
              n_heads={n_heads}, dtype={dtype}) — replacing 16 candle launches per layer with 1"
         );
+        // 🔴 D18 (silent success, 13+ instances). `tracing::info!` is invisible
+        // without a subscriber at INFO, so an engaged-vs-declined question was
+        // being answered by INFERENCE from output symptoms. This line goes to
+        // stderr unconditionally, greppable, because whether this kernel is the
+        // actor decides whether the device-position fix on this branch is the
+        // fix at all or is inert.
+        eprintln!(
+            "[ARC QK ENGAGE] qk_norm_rope ENGAGED head_dim={head_dim} rope_dim={rope_dim} \
+             n_heads={n_heads} dtype={dtype} — THE FUSED KERNEL IS THE ACTOR; the RoPE row \
+             comes from device positions (UNVERIFIED — NOT MEASURED)"
+        );
     }
     // Periodic proof of life for long runs; cheap (one relaxed load).
     if n > 0 && n % 100_000 == 0 {
         tracing::info!("ArcAttention: fused qk_norm_rope engaged {n} times");
     }
+}
+
+/// `ARC_QK_REQUIRE_ENGAGED=1` turns the FIRST decline into a hard environment
+/// failure (exit 2, never 1).
+///
+/// The point is not strictness for its own sake. The `pos_offset` diagnosis on
+/// this branch is only load-bearing if the fused kernel was the actor during
+/// the measured run; if it declined, the eager `cos_sin_for` path was, and this
+/// fix is inert. That question must be SETTLED, not assumed, before anyone
+/// reads a number from this branch — so the next session's first command runs
+/// with this set and reads the exit code.
+pub fn require_engaged() -> bool {
+    use std::sync::OnceLock;
+    static REQUIRED: OnceLock<bool> = OnceLock::new();
+    *REQUIRED.get_or_init(|| matches!(std::env::var("ARC_QK_REQUIRE_ENGAGED").as_deref(), Ok("1")))
 }
 
 pub(crate) fn note_declined(reason: &str) {
@@ -90,6 +124,23 @@ pub(crate) fn note_declined(reason: &str) {
             "ArcAttention: fused qk_norm_rope DECLINED ({reason}) — falling back to the eager \
              chain. This is correct but slow; the launch saving is not being taken."
         );
+        // Same reasoning as the ENGAGED line above, and this one matters more:
+        // a decline means the eager chain computed Q/K, so `pos_offset` was
+        // never in a kernel parameter and the CUDA-graph divergence measured at
+        // L0 has a DIFFERENT cause than this branch assumes.
+        eprintln!(
+            "[ARC QK DECLINE] qk_norm_rope DECLINED ({reason}) — THE EAGER CANDLE CHAIN IS THE \
+             ACTOR. The device-position fix on arcgraph/rope-device-pos is INERT for this run; \
+             the replay divergence is NOT `pos_offset`."
+        );
+    }
+    if require_engaged() {
+        eprintln!(
+            "[ARC QK DECLINE] ARC_QK_REQUIRE_ENGAGED=1 and the fused path declined ({reason}). \
+             Exiting 2 (environment failure, not a test failure) — a run whose engagement is \
+             assumed is worth nothing."
+        );
+        std::process::exit(2);
     }
 }
 
@@ -119,6 +170,34 @@ mod cuda_impl {
         Ok(ptr as *const std::ffi::c_void)
     }
 
+    /// Pull a contiguous U32 CUDA tensor's device pointer.
+    ///
+    /// 🔴 UNVERIFIED — NOT MEASURED (arcgraph/rope-device-pos). This exists so
+    /// the RoPE row index crosses the FFI as a DEVICE ADDRESS rather than a
+    /// host `usize`. `cuStreamBeginCapture` copies kernel parameters into the
+    /// graph node but re-reads pointers on every replay, which is the whole
+    /// difference between a position that advances and one frozen at capture.
+    ///
+    /// `start_offset` is honoured because the eager caller passes a `narrow`
+    /// view of a cached iota ramp — a zero-copy view whose offset is nonzero.
+    fn u32_ptr(t: &Tensor, what: &str) -> Result<*const std::ffi::c_void> {
+        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+        if t.dtype() != DType::U32 {
+            candle::bail!("qk_norm_rope: {what} must be U32, got {:?}", t.dtype());
+        }
+        if !t.is_contiguous() {
+            candle::bail!("qk_norm_rope: {what} must be contiguous");
+        }
+        let (s, l) = t.storage_and_layout();
+        let cuda = match &*s {
+            candle::Storage::Cuda(c) => c,
+            _ => candle::bail!("qk_norm_rope: {what} must be on CUDA"),
+        };
+        let sl = cuda.as_cuda_slice::<u32>()?;
+        let ptr = sl.slice(l.start_offset()..).device_ptr(sl.stream()).0;
+        Ok(ptr as *const std::ffi::c_void)
+    }
+
     /// Fused head-transpose + Q RMS-norm + RoPE + NoPE/PE recombination.
     ///
     /// - `q_in`  `[B, T, H * D]` or `[B, T, H, D]` BF16 contiguous — the raw
@@ -126,7 +205,16 @@ mod cuda_impl {
     ///   output addressing.
     /// - `k_in`  `[B, T, D]` or `[B, T, 1, D]` BF16 contiguous — post-`kv_norm`.
     /// - `cos` / `sin` `[max_pos, D_rope / 2]` BF16 contiguous — the FULL
-    ///   tables; `pos_offset` replaces candle's `narrow`.
+    ///   tables; `positions` replaces candle's `narrow`.
+    /// - `positions` U32 CUDA contiguous — the absolute RoPE row per output
+    ///   row, read as `positions[b * pos_stride_b + t]`. `[B]` with
+    ///   `pos_stride_b == 1` under graph decode (`T == 1`), `[T]` with
+    ///   `pos_stride_b == 0` in eager (shared across the batch).
+    ///
+    /// 🔴 UNVERIFIED — NOT MEASURED (arcgraph/rope-device-pos). This replaced a
+    /// `pos_offset: usize`. See `qk_norm_rope.cu`'s header for the mechanism;
+    /// the short version is that a captured graph copies scalars and re-reads
+    /// pointers, so only a pointer advances on replay.
     ///
     /// Returns `(q_out [B, H, T, D], k_out [B, 1, T, D])`.
     #[allow(clippy::too_many_arguments)]
@@ -135,13 +223,14 @@ mod cuda_impl {
         k_in: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
+        positions: &Tensor,
         n_heads: usize,
         batch: usize,
         seq_len: usize,
         head_dim: usize,
         rope_dim: usize,
         eps: f64,
-        pos_offset: usize,
+        pos_stride_b: usize,
     ) -> Result<(Tensor, Tensor)> {
         use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 
@@ -149,6 +238,7 @@ mod cuda_impl {
         let k_ptr = bf16_ptr(k_in, "k_in")?;
         let cos_ptr = bf16_ptr(cos, "cos")?;
         let sin_ptr = bf16_ptr(sin, "sin")?;
+        let pos_ptr = u32_ptr(positions, "positions")?;
 
         let dev = q_in.device().as_cuda_device()?;
         let stream = dev.cuda_stream().cu_stream() as i64;
@@ -168,11 +258,12 @@ mod cuda_impl {
         let k_buf = unsafe { dev.alloc::<half::bf16>(k_elems) }?;
 
         let rc = unsafe {
-            crate::cuda::ffi::arc_qk_norm_rope_bf16_v2(
+            crate::cuda::ffi::arc_qk_norm_rope_bf16_v3(
                 q_ptr,
                 k_ptr,
                 cos_ptr,
                 sin_ptr,
+                pos_ptr,
                 q_buf.device_ptr(q_buf.stream()).0 as *mut std::ffi::c_void,
                 k_buf.device_ptr(k_buf.stream()).0 as *mut std::ffi::c_void,
                 n_heads as i32,
@@ -180,7 +271,7 @@ mod cuda_impl {
                 seq_len as i32,
                 head_dim as i32,
                 rope_dim as i32,
-                pos_offset as i32,
+                pos_stride_b as i32,
                 1, // QK_DTYPE_BF16
                 inv_n,
                 zero,
@@ -222,13 +313,14 @@ pub fn qk_norm_rope_cuda(
     _k_in: &candle_core::Tensor,
     _cos: &candle_core::Tensor,
     _sin: &candle_core::Tensor,
+    _positions: &candle_core::Tensor,
     _n_heads: usize,
     _batch: usize,
     _seq_len: usize,
     _head_dim: usize,
     _rope_dim: usize,
     _eps: f64,
-    _pos_offset: usize,
+    _pos_stride_b: usize,
 ) -> candle_core::Result<(candle_core::Tensor, candle_core::Tensor)> {
     candle_core::bail!("qk_norm_rope_cuda requires the cuda feature")
 }

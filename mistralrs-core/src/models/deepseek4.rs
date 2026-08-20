@@ -1238,9 +1238,9 @@ impl Attention {
     /// Decide whether the fused `cuda::qk_norm_rope` kernel may replace the
     /// eager transpose + Q RMS-norm + RoPE chain for this call.
     ///
-    /// Returns `Some(pos_offset)` when every precondition for BIT-IDENTITY
-    /// holds, `None` otherwise. Each rejection is a real difference in what the
-    /// kernel would have to compute, not a convenience:
+    /// Returns `Some((positions, pos_stride_b))` when every precondition for
+    /// BIT-IDENTITY holds, `None` otherwise. Each rejection is a real difference
+    /// in what the kernel would have to compute, not a convenience:
     ///
     /// * **BF16 only.** In f32 the RoPE expression is FMA-contractible, and
     ///   candle-kernels builds with the default `-fmad=true` while this
@@ -1255,13 +1255,15 @@ impl Attention {
     ///   a second layout.
     ///
     /// A `None` here is logged once (see `note_declined`) so a permanently
-    /// disengaged fast path cannot masquerade as a working one.
+    /// disengaged fast path cannot masquerade as a working one — and, on this
+    /// branch, printed to stderr as `[ARC QK DECLINE]`, because whether this
+    /// gate opened decides whether the device-position fix is the fix at all.
     fn fused_qk_gate(
         &self,
         q_proj_out: &Tensor,
         kv_normed: &Tensor,
         seqlen_offsets: &[usize],
-    ) -> Option<usize> {
+    ) -> Option<(Tensor, usize)> {
         use crate::cuda::qk_norm_rope as qk;
         if !cfg!(feature = "cuda") || !qk::fused_enabled() {
             return None;
@@ -1325,7 +1327,73 @@ impl Attention {
             Ok((rows, cols)) if cols == rope_dim / 2 && rows >= pos_offset + qt => {}
             _ => decline!("RoPE table does not cover [pos_offset, pos_offset + T)"),
         }
-        Some(pos_offset)
+
+        // ── THE POSITION IS RESOLVED ON THE DEVICE, NEVER ON THE HOST ───────
+        //
+        // 🔴 UNVERIFIED — NOT MEASURED (arcgraph/rope-device-pos). This used to
+        // be `Some(pos_offset)`, a host `usize` that became a `const int` kernel
+        // parameter. `cuStreamBeginCapture` COPIES kernel parameters into the
+        // graph node, so every replay rotated Q and K at the CAPTURE step's
+        // position and wrote a structurally wrong key. `layers.rs:1633-1641`
+        // already documents the identical defect on the eager RoPE path at
+        // max|Δ| ≈ 30; the same-step probe measured 0.000e0 and the +1-step
+        // bisect 4.05e0 at L0 `k`, pre-write, which is the shape of exactly this
+        // fault. Nothing here is a claim that it is fixed — it is a claim about
+        // WHERE the number now comes from.
+        //
+        // Note this gate has no graph-mode check of its own and never did: the
+        // fused kernel is on the DEFAULT path (`ARC_QK_FUSED` is on unless set
+        // to 0), so it runs under capture whether or not anyone intended it to.
+        // That is why the graph-mode branch must come first and must decline
+        // rather than fall through — a fall-through would hand the ramp's
+        // capture-time `start_offset` to the graph and reinstate the bug in a
+        // new disguise.
+        if crate::layers::has_graph_mode_positions() && qt == 1 {
+            let positions = match crate::layers::graph_mode_positions() {
+                Some(p) => p,
+                None => decline!("graph-mode positions vanished between probe and read"),
+            };
+            // U32 required, not converted: `to_dtype` to a DIFFERENT dtype
+            // allocates a fresh tensor every step, and a captured graph would
+            // bake that step's address — the same class of bug one layer down.
+            // `set_graph_mode_positions_in_place` already produces U32 at a
+            // stable address, so anything else is a wiring error worth refusing.
+            if positions.dtype() != candle_core::DType::U32 {
+                decline!("graph-mode positions are not U32");
+            }
+            if !positions.is_contiguous() {
+                decline!("graph-mode positions are not contiguous");
+            }
+            if !positions.device().same_device(q_proj_out.device()) {
+                decline!("graph-mode positions are on another device");
+            }
+            match positions.dims1() {
+                Ok(n) if n == qb => {}
+                _ => decline!("graph-mode positions are not [B]"),
+            }
+            // [B], and T == 1 here, so `positions[b * 1 + 0]`.
+            return Some((positions, 1));
+        }
+
+        // Eager: one shared offset across the batch, so a `[T]` vector read with
+        // stride 0 over `b` serves every row. `compress_positions(_, 1, _)` is
+        // an integer iota, and a `narrow` of it is a ZERO-COPY view — no
+        // allocation, no host round trip, no extra launch on the hot path. The
+        // values are `pos_offset + t` exactly, i.e. the same row the captured
+        // scalar computed, which is what keeps the eager outputs byte-identical.
+        //
+        // The one `arange_step` inside `compress_positions` fires only when the
+        // cached table must grow (every 1024 positions) and CANNOT fire under
+        // capture: capture is graph-mode `T == 1`, which returned above.
+        match crate::layers::compress_positions(pos_offset + qt, 1, q_proj_out.device())
+            .and_then(|ramp| ramp.narrow(0, pos_offset, qt))
+        {
+            Ok(positions) => Some((positions, 0)),
+            Err(e) => {
+                qk::note_declined(&format!("could not serve device positions: {e}"));
+                None
+            }
+        }
     }
 
     /// Apply RoPE in-place to the last `qk_rope_head_dim` dims of each
@@ -1618,6 +1686,19 @@ impl Attention {
             self.kv_norm.forward(&kv_raw)?
         };
         v4_nan_dbg(&kv_normed, "attn.kv_norm");
+        // Bisect slot: the LAST tensor before the Q/K RoPE block. This is the
+        // one-line discriminator between the two remaining hypotheses for the
+        // structurally wrong key measured at L0 (max|Δ| 4.05e0, pre-write):
+        //
+        //   kv_normed 0.00e0 and k 4.05e0  ⇒ the fault is in RoPE — i.e. the
+        //     position — and the device-position change on this branch is the
+        //     right tree.
+        //   kv_normed ALREADY dirty        ⇒ the fault is `wkv` or `kv_norm`,
+        //     upstream of RoPE, and this branch is the wrong tree entirely.
+        //
+        // No-op unless `ARC_GRAPH_LAYER_BISECT=1` opened a trace; the cost on
+        // the hot path is one thread-local read.
+        crate::layers::arc_layer_trace_push(&kv_normed);
 
         // 3. Head transpose + per-head Q RMS-norm + RoPE + NoPE/PE recombine.
         //
@@ -1670,19 +1751,23 @@ impl Attention {
         let (q, k) = {
             let _s = arc_profiler::device_span("qk_norm_rope");
             match self.fused_qk_gate(&q_proj_out, &kv_normed, seqlen_offsets) {
-                Some(pos_offset) => {
+                Some((positions, pos_stride_b)) => {
                     let (q_f, k_f) = crate::cuda::qk_norm_rope::qk_norm_rope_cuda(
                         &q_proj_out,
                         &kv_normed,
                         self.rotary_emb.cos(),
                         self.rotary_emb.sin(),
+                        // 🔴 UNVERIFIED — NOT MEASURED. Device positions, not a
+                        // host `usize`: a captured graph copies scalar kernel
+                        // parameters and re-reads pointers. See `fused_qk_gate`.
+                        &positions,
                         self.num_attention_heads,
                         bs,
                         seq_len,
                         head_dim,
                         self.cfg.qk_rope_head_dim,
                         self.cfg.rms_norm_eps as f64,
-                        pos_offset,
+                        pos_stride_b,
                     )?;
                     crate::cuda::qk_norm_rope::note_engaged(
                         head_dim,
@@ -1905,10 +1990,14 @@ impl Attention {
                     .ok_or_else(|| candle_core::Error::Msg("graph positions unset".into()))?
                     .to_dtype(candle_core::DType::U32)?;
                 let cap = self.sliding_window.max(1);
-                // Bisect slots, in execution order, per graph-arm layer:
+                // Bisect slots, in execution order, per graph-arm layer. The
+                // first, `kv_normed`, is pushed in `Attention::forward` just
+                // above the Q/K RoPE block; the rest are here:
                 //   k       — the new post-RoPE key, BEFORE it is written.
-                //             Diverges ⇒ the key itself is computed wrong
-                //             (RoPE / projections), upstream of the cache.
+                //             Clean `kv_normed` + dirty `k` ⇒ the fault is
+                //             between them, i.e. RoPE / the position.
+                //             Dirty `kv_normed` ⇒ it is `wkv` or `kv_norm`
+                //             instead, and the RoPE work is the wrong tree.
                 //   k_full  — the fixed window read back AFTER the write.
                 //             Clean `k` + dirty `k_full` ⇒ the write landed in
                 //             the wrong slot, or the wrong window is read.

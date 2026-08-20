@@ -149,9 +149,29 @@ __device__ __forceinline__ __nv_bfloat16 qk_sqrt(__nv_bfloat16 a) { return hsqrt
 // Q out : [B, H, T, D] contiguous.
 // K out : [B, 1, T, D] contiguous.
 //
-// `cos`/`sin` are the FULL [max_pos, D_rope/2] tables; `pos_offset` is
-// `seqlen_offsets[0]`, i.e. candle's `self.cos.narrow(0, offset, seq_len)`
-// expressed as a base offset instead of a view.
+// `cos`/`sin` are the FULL [max_pos, D_rope/2] tables.
+//
+// 🔴 UNVERIFIED — NOT MEASURED (arcgraph/rope-device-pos). The position used to
+// arrive here as `const int pos_offset`, a HOST `usize` folded into a kernel
+// parameter. `cuStreamBeginCapture` COPIES kernel parameters into the graph
+// node, so every replay of a captured decode step rotated Q and K at the
+// *capture* step's position — the whole rope_dim tail mis-rotated, which is the
+// same defect `layers.rs::cos_sin_for` already documents at max|Δ| ≈ 30 and the
+// leading candidate for the structurally-wrong key measured at L0 (max|Δ| 4.05e0
+// pre-write, 0.000e0 on same-step replay). It is now a DEVICE POINTER, read
+// per row inside the kernel, mirroring what `cos_sin_for` already does
+// correctly with `index_select` off `GRAPH_MODE_POSITIONS`.
+//
+// `positions` is a device array of u32 absolute positions addressed as
+// `positions[b * pos_stride_b + t]`:
+//   * graph decode  — `GRAPH_MODE_POSITIONS`, shape [B], T == 1 by
+//                     construction, `pos_stride_b = 1`.
+//   * eager         — a zero-copy `narrow` of the cached iota ramp, shape [T],
+//                     shared across the batch, `pos_stride_b = 0`.
+// `pos_stride_b` stays a scalar deliberately: it is a LAYOUT constant fixed by
+// which buffer was passed, not a per-step value, so folding it into a graph
+// node is harmless. Graph mode always passes stride 1, at capture and at every
+// replay alike.
 // ---------------------------------------------------------------------------
 template <int HEAD_DIM, int ROPE_DIM>
 __global__ void qk_norm_rope_kernel(
@@ -159,6 +179,10 @@ __global__ void qk_norm_rope_kernel(
     const __nv_bfloat16 *__restrict__ k_in,
     const __nv_bfloat16 *__restrict__ cos_tab,
     const __nv_bfloat16 *__restrict__ sin_tab,
+    // DEVICE positions, not a host scalar. See the header block: a captured
+    // graph copies scalar parameters but re-reads pointers, so this is the one
+    // form that survives replay.
+    const unsigned int *__restrict__ positions,
     __nv_bfloat16 *__restrict__ q_out,
     __nv_bfloat16 *__restrict__ k_out,
     const int n_heads,
@@ -167,7 +191,7 @@ __global__ void qk_norm_rope_kernel(
     const __nv_bfloat16 zero,    // bf16(0.0)              -- affine add
     const __nv_bfloat16 one,     // bf16(1.0)              -- affine mul
     const __nv_bfloat16 eps,     // bf16(rms_norm_eps)     -- affine add
-    const int pos_offset) {
+    const int pos_stride_b) {    // 1 for [B] positions, 0 for [T] shared
     constexpr int NOPE = HEAD_DIM - ROPE_DIM;
     constexpr int HALF_ROPE = ROPE_DIM / 2;
 
@@ -240,10 +264,26 @@ __global__ void qk_norm_rope_kernel(
     //     dst[2i]   = src[2i] * c - src[2i+1] * s
     //     dst[2i+1] = src[2i] * s + src[2i+1] * c
     // all in T. `rope_idx` there resolves to `t * (ROPE_DIM/2) + j` against the
-    // narrowed table, i.e. `(pos_offset + t) * (ROPE_DIM/2) + j` against the
+    // narrowed table, i.e. `positions[b, t] * (ROPE_DIM/2) + j` against the
     // full one.
-    const __nv_bfloat16 *cos_row = cos_tab + (size_t)(pos_offset + t) * HALF_ROPE;
-    const __nv_bfloat16 *sin_row = sin_tab + (size_t)(pos_offset + t) * HALF_ROPE;
+    //
+    // 🔴 UNVERIFIED — NOT MEASURED. This load is the fix: the row index is
+    // resolved HERE, from device memory, on every launch and every graph
+    // replay. It used to be `pos_offset + t` with `pos_offset` a captured
+    // scalar. In the eager case `positions[t] == pos_offset + t` EXACTLY (the
+    // ramp is an integer iota narrowed at `pos_offset`), so the row read is the
+    // same row and the bf16 arithmetic below is untouched — the outputs are
+    // byte-identical, which `ARC_QK_VERIFY=1` proves at every layer.
+    //
+    // Range: unchecked, exactly as `pos_offset` was. An out-of-range device
+    // position reads past the table here just as it would trip candle's
+    // `index_select` bounds assert in the eager path; the host gate in
+    // `deepseek4.rs::fused_qk_gate` still validates the table covers the
+    // host-known offset, and the buffer is the same one `cos_sin_for`,
+    // `graph_mode_length_mask` and `dsv4_attention` already trust.
+    const unsigned int pos = positions[(size_t)b * (size_t)pos_stride_b + (size_t)t];
+    const __nv_bfloat16 *cos_row = cos_tab + (size_t)pos * HALF_ROPE;
+    const __nv_bfloat16 *sin_row = sin_tab + (size_t)pos * HALF_ROPE;
     for (int j = tid; j < HALF_ROPE; j += HEAD_DIM) {
         // The rotation reads the NORMALISED value, matching candle's order
         // (broadcast_mul happens before apply_rope_inplace splits the tensor).
@@ -275,11 +315,20 @@ extern "C" {
 // rope_dim) combination is outside the specialised set. A non-zero return means
 // the caller MUST fall back to the eager chain: producing a wrong answer from a
 // generic slow path would be worse than the launches it saves.
-int arc_qk_norm_rope_bf16_v2(
+// 🔴 UNVERIFIED — NOT MEASURED. Renamed v2 -> v3 because the ABI changed: the
+// `int pos_offset` scalar became a `const void *positions` device pointer plus
+// a `pos_stride_b` layout constant. The rename is deliberate — a stale object
+// file or a half-applied patch now fails at LINK time instead of silently
+// misreading a stack slot.
+int arc_qk_norm_rope_bf16_v3(
     const void *q_in,
     const void *k_in,
     const void *cos_tab,
     const void *sin_tab,
+    // Device u32 positions: [B] with pos_stride_b == 1 (graph decode), or [T]
+    // shared across the batch with pos_stride_b == 0 (eager). NEVER a host
+    // value — that is the whole point of this revision.
+    const void *positions,
     void *q_out,
     void *k_out,
     int n_heads,
@@ -287,7 +336,7 @@ int arc_qk_norm_rope_bf16_v2(
     int seq_len,
     int head_dim,
     int rope_dim,
-    int pos_offset,
+    int pos_stride_b,
     int dtype,
     // Widened from uint16_t to a full word each. The bf16 bit patterns are
     // carried in the low 16 bits. Sub-word arguments packed behind five other
@@ -299,6 +348,10 @@ int arc_qk_norm_rope_bf16_v2(
     unsigned int eps_bits,
     long long stream) {
     if (dtype != QK_DTYPE_BF16) return 1;
+    // A null positions pointer is not a fallback — there is no scalar path left
+    // to fall back to. Refuse so the caller runs the eager chain.
+    if (positions == nullptr) return 3;
+    if (pos_stride_b != 0 && pos_stride_b != 1) return 4;
 
     __nv_bfloat16 inv_n, zero, one, eps;
     unsigned short b;
@@ -312,11 +365,17 @@ int arc_qk_norm_rope_bf16_v2(
     static int probed = 0;
     if (!probed) {
         probed = 1;
+        // The position itself is deliberately NOT printed: it now lives in
+        // device memory and reading it here would mean a host sync, which is
+        // illegal inside `cuStreamBeginCapture`. The pointer and the stride are
+        // what identify the layout; the value is proven by the bisect.
         fprintf(stderr,
                 "[qk_norm_rope FFI] n_heads=%d batch=%d seq_len=%d head_dim=%d "
-                "rope_dim=%d pos_offset=%d dtype=%d inv_n=0x%04x zero=0x%04x "
-                "one=0x%04x eps=0x%04x\n",
-                n_heads, batch, seq_len, head_dim, rope_dim, pos_offset, dtype,
+                "rope_dim=%d positions=%p pos_stride_b=%d dtype=%d inv_n=0x%04x "
+                "zero=0x%04x one=0x%04x eps=0x%04x (position is DEVICE-resolved "
+                "-- UNVERIFIED, NOT MEASURED)\n",
+                n_heads, batch, seq_len, head_dim, rope_dim, positions,
+                pos_stride_b, dtype,
                 inv_n_bits & 0xFFFFu, zero_bits & 0xFFFFu, one_bits & 0xFFFFu,
                 eps_bits & 0xFFFFu);
         fflush(stderr);
@@ -329,8 +388,9 @@ int arc_qk_norm_rope_bf16_v2(
     qk_norm_rope_kernel<HD, RD><<<grid, HD, 0, s>>>(                            \
         (const __nv_bfloat16 *)q_in, (const __nv_bfloat16 *)k_in,               \
         (const __nv_bfloat16 *)cos_tab, (const __nv_bfloat16 *)sin_tab,         \
+        (const unsigned int *)positions,                                        \
         (__nv_bfloat16 *)q_out, (__nv_bfloat16 *)k_out, n_heads, seq_len,       \
-        inv_n, zero, one, eps, pos_offset)
+        inv_n, zero, one, eps, pos_stride_b)
 
     // Only shapes whose row length IS candle's fast_sum block width are
     // specialised -- see the bit-identity contract, point (1). V4 Flash is

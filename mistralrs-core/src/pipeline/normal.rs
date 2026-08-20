@@ -2329,9 +2329,18 @@ impl Pipeline for NormalPipeline {
                                                     // Slot map: 0=graph length
                                                     // mask, 1=embedding,
                                                     // 2=mHC lift, 3+=layer
-                                                    // (slot-3).
+                                                    // (slot-3), FIVE per
+                                                    // graph-arm layer since
+                                                    // `kv_normed` was added —
+                                                    // it is the discriminator
+                                                    // between a RoPE/position
+                                                    // fault and a wkv/kv_norm
+                                                    // one, so the label must
+                                                    // name it or the instrument
+                                                    // misreports which tensor
+                                                    // diverged first.
                                                     tracing::error!(
-                                                        "ARC BISECT: slots={n} first_diverging={:?} [0=mask 1=embed 2=lift then per graph-arm layer: k, k_full, attn, layer_out]{line}",
+                                                        "ARC BISECT: slots={n} first_diverging={:?} [0=mask 1=embed 2=lift then per graph-arm layer: kv_normed, k, k_full, attn, layer_out]{line}",
                                                         first
                                                     );
                                                 }
