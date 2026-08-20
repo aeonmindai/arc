@@ -697,3 +697,55 @@ mod tests {
 // NOT a quality gate. Flipping the default should be gated on a ppl/greedy
 // run, which is why this comment recommends it rather than doing it.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// THE B=256 PURE-DECODE KERNEL TABLE (H200, V4-Flash qtip2b, variant 0)
+//
+// METHOD: the server ran under `nsys --delay 330 --duration 25` so the capture
+// window opens long after model load and prefill and closes while all 256
+// sequences are still generating. Steady state asserted from the server's own
+// logger inside the window: "Throughput (T/s) 204.80 ... 256 running". A
+// whole-run profile is prefill-dominated and says nothing about a decode step;
+// this is why the earlier prefill-shaped profile was misleading.
+//
+//   share  launches/step  kernel
+//   45.0%          301    fp8_gemm::fp8_matmul_tiled          <-- largest
+//   25.0%          129    qtip2b_grouped_gemm_kernel (MoE)
+//   10.2%       22,794    ucopy_bf16
+//    5.3%            1    sm90_xmma_gemm
+//    5.0%       33,610    copy2d_bf16
+//    3.9%       33,054    rope_i_bf16
+//    0.8%       11,008    uneg_bf16
+//
+// SO THE MoE LANE IS FINISHED FOR THROUGHPUT. Amdahl on its 25.0%:
+//    tuned variant (2.00x, measured)                 1.14x   (measured 1.133x)
+//    + free decode (1.89x ceiling, measured)         1.23x
+//    + full tensor cores (16.3x more, computed)      1.33x
+// A PERFECT MoE kernel -- free decode AND full tensor-core rates -- buys 1.33x
+// at B=256 decode. `fp8_matmul_tiled` made free would buy 1.82x.
+//
+// WHY THE MoE KERNEL IS ON THE WRONG ROOFLINE (arithmetic bound, computed from
+// measured time + shapes anchored to the byte probe's 2 MiB/expert):
+//   per launch at n_tokens=256: 1536 pairs x 8,388,608 weights = 2.577e10 FLOP
+//     variant 0        1614 us ->  16.0 TFLOP/s
+//     tuned             806 us ->  32.0 TFLOP/s = 47.8% of scalar FP32 peak
+//     decode stubbed    426 us ->  60.5 TFLOP/s = 90.4% of scalar FP32 peak
+//   H200: scalar FP32 FMA ~67 TFLOP/s, dense BF16 tensor core ~989 TFLOP/s.
+// Decode-free, this kernel is essentially AT the scalar FP32 roofline. It is
+// not inefficient -- it is using the wrong one, and there are 2 tensor-core
+// instructions in the whole kernel. Tensor-core headroom beyond a free decode
+// is ~16.3x. LIMITS: 989 TFLOP/s is a published dense peak (real kernels reach
+// 60-80% of it); the SASS uses packed HADD2.F32, which may issue at 2x the
+// FP32 lane rate, in which case "90% of peak" is nearer 45%; and this bounds
+// arithmetic only -- it assumes a decode that can deliver operands in MMA
+// register layout, which is exactly TCFRAG's unverified claim.
+//
+// THE STRUCTURAL ANOMALY IS NOT THE MoE: ~100,000 launches per decode step, of
+// which rope_i_bf16 is 129 PER SEQUENCE PER STEP (= 43 layers x 3), i.e. RoPE
+// and the bf16 copies are launched per-sequence and never batched across the
+// cohort. 19.9% of step time for 99% of the launches. That is ArcKV/ArcAttention
+// territory, not ArcQuant.
+//
+// Step count is 18.56 from the MoE gather counter vs 20.00 from throughput
+// (window clipping partial steps), so per-step launch figures carry ~7%.
+// ---------------------------------------------------------------------------
