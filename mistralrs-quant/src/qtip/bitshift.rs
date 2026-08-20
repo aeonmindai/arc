@@ -1826,35 +1826,48 @@ impl QuantMethod for Qtip2bLayer {
                 // On-device only, propagate errors (the CPU fallback would
                 // D2H-sync under graph capture and read garbage indices).
                 //
-                // Above this boundary the rung goes to the trellis grouped GEMM
-                // below — tokens sorted by expert on-device, each expert's bytes
-                // read once per m-tile — which is the amortizing kernel the
-                // fleet math wants. But it only amortizes when its m-tiles are
-                // FULL: it stages a woken expert's bytes once per
-                // `GROUPED_TILE_M` pairs, so at V4's top-6-of-256 routing a
-                // 9-token step wakes ~54 experts for 54 pairs and every 16-row
-                // tile carries one useful row. The gate is therefore the tile
-                // fill, not a token count — same predicate, same reasons, as
-                // the LUT rung; see `super::gather_policy` §4 for the
-                // derivation and for the 5.7x end-to-end regression the raw
-                // token gate caused there.
+                // 🔴 TILE FILL WAS THE WRONG QUANTITY — RETRACTED ON MEASUREMENT.
+                //
+                // This gate used to also require `grouped_gemm_tiles_amortize`:
+                // switch to the grouped GEMM only once each woken expert draws
+                // `GROUPED_TILE_M` (=16) pairs. At V4's top-6-of-256 that needs
+                // `6n/256 >= 16`, i.e. **n >= 683** — a token count decode never
+                // reaches. The clause therefore pinned every decode step, and
+                // every batch up to 682, on the gather-GEMV arm.
+                //
+                // Two independent measurements retired it:
+                //   * decode, H200, V4-Flash qtip2b, clean rows only (>=97%
+                //     achieved concurrency, <7% derived-vs-measured spread):
+                //     grouped beats GEMV at B=48 (1.10x), 64 (1.14x), 80
+                //     (1.22x), 96 (1.29x), 128 (1.66x), 512 (1.51x).
+                //   * prefill, same gate over prompt lengths: +16% at 16
+                //     tokens, +27% at 32, +50% at 64, +78% at 128, +181% at 512.
+                // The gate's own justifying A/B ("1.00x at N=128 and N=512")
+                // does not reproduce.
+                //
+                // **A 7.5%-full tile still wins by 16%.** So fill is not the
+                // deciding quantity. The win is that the grouped kernel stages a
+                // woken expert's bytes ONCE PER M-TILE instead of once per
+                // (token, expert) pair — the GEMV arm's reads are exactly linear
+                // in `n_tokens`, measured at 12.00x redundancy at n=512, while
+                // the grouped arm holds flat at one pass over the expert set —
+                // and that it runs on tensor cores rather than a scalar GEMV.
+                // Occupancy was never the mechanism being traded against.
+                //
+                // What survives is `DECODE_REGIME_MAX_TOKENS` as a FLOOR: at
+                // n<=8 there genuinely is not enough work to group (b=1 measures
+                // 0.47x), and it is also the RUN-161 capture-safety rule.
+                // 9..=15 is UNMEASURED — bounded below by the n=8 floor and
+                // above by the +16% at n=16, so it rides with the grouped arm.
                 //
                 // `DECODE_REGIME_MAX_TOKENS` survives as a FLOOR (the RUN-161
                 // capture-safety rule), and an explicit
                 // `ARC_QTIP_ONDEVICE_MOE_MAX_TOKENS` still pins the GEMV arm
                 // outright so a harness can A/B the two kernels.
-                let ondevice_preferred = match super::gather_policy::ondevice_max_tokens_override()
-                {
-                    Some(cap) => n_tokens <= cap,
-                    None => {
-                        n_tokens <= super::DECODE_REGIME_MAX_TOKENS
-                            || !super::gather_policy::grouped_gemm_tiles_amortize(
-                                n_tokens,
-                                n_experts_per_tok,
-                                self.num_experts_count(),
-                            )
-                    }
-                };
+                let ondevice_preferred = super::gather_policy::prefer_gather_gemv(
+                    n_tokens,
+                    super::gather_policy::ondevice_max_tokens_override(),
+                );
                 let ondevice_disabled = std::env::var("ARC_NO_QTIP_ONDEVICE_MOE").is_ok();
                 if !ondevice_disabled
                     && ondevice_preferred

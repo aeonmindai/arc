@@ -139,8 +139,44 @@
 //! 1024   6144          256.0         24.00      150.0%
 //! ```
 //!
-//! and the in-tree end-to-end A/B brackets exactly that curve: **1.00× at
-//! N=128 and N=512, 2.41× at N=1024**.
+//! and the in-tree end-to-end A/B was said to bracket exactly that curve:
+//! **1.00× at N=128 and N=512, 2.41× at N=1024**.
+//!
+//! # 🔴 4a. THE TILE-FILL GATE IS RETRACTED — IT MEASURED THE WRONG QUANTITY
+//!
+//! **That A/B does not reproduce, and the model above is not what decides the
+//! winner.** Two independent measurements on landed master (H200, V4-Flash
+//! qtip2b) put the grouped GEMM ahead at every size either could test:
+//!
+//! ```text
+//! decode, clean rows only (>=97% achieved concurrency, <7% spread):
+//!   B=48 1.10x   B=64 1.14x   B=80 1.22x   B=96 1.29x   B=128 1.66x   B=512 1.51x
+//! prefill, over prompt length:
+//!   n=16 +16%    n=32 +27%    n=64 +50%    n=128 +78%   n=512 +181%
+//! ```
+//!
+//! At `n = 16` the tile is **7.5% full** and the grouped kernel still wins by
+//! 16%. A predicate that demands 100% fill therefore cannot be the right gate:
+//! it required `6n/256 >= 16`, i.e. **n >= 683**, which decode never reaches, so
+//! it pinned every decode step and every batch up to 682 on the GEMV arm. A
+//! profile of the shipped default confirmed the consequence directly —
+//! `qtip_gather_gemv_warp_kernel` at **57.6% of GPU time with 25× the launches**
+//! of the grouped kernel.
+//!
+//! **Why fill was the wrong quantity.** The ratio above counts only *weight*
+//! bytes and assumes the two kernels are otherwise alike. They are not. The
+//! grouped kernel stages a woken expert's bytes once per m-tile rather than once
+//! per (token, expert) pair — the GEMV arm's reads are exactly linear in
+//! `n_tokens`, measured at **12.00× redundancy at n=512**, while the grouped arm
+//! holds flat at one pass over the expert set — and it runs the tensor-core tile
+//! loop instead of a scalar per-pair GEMV. A partly-empty tile still buys both.
+//! Occupancy was never the mechanism being traded against.
+//!
+//! What survives is [`super::DECODE_REGIME_MAX_TOKENS`] as a floor: at `n <= 8`
+//! there is genuinely nothing to group (b=1 measures **0.47×**), and it is the
+//! RUN-161 capture-safety rule. `9..=15` is **unmeasured**, bounded below by
+//! that floor and above by the +16% at 16, and rides with the grouped arm.
+//! [`prefer_gather_gemv`] is the shipped decision and is unit-tested.
 //!
 //! Shipping the gate as a raw `n_tokens > DECODE_REGIME_MAX_TOKENS` switched
 //! the grouped kernel on at n=9 — onto a tile that is ~9% full, roughly two
@@ -305,6 +341,40 @@ pub fn grouped_gemm_tile_fill(n_tokens: usize, top_k: usize, num_experts: usize)
 /// `GROUPED_TILE_M` changes, and the last one that was not re-derived is the
 /// regression this replaces.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+/// Does the fused gather-GEMV arm win at this token count?
+///
+/// The pure half of the MoE dispatch in `bitshift.rs`, so the decision that
+/// actually ships can be tested without a GPU. It has to live here and be
+/// exercised by a test, because the dispatch itself sits inside a
+/// `#[cfg(feature = "cuda")]` block that a normal `cargo test` cannot compile —
+/// a non-CUDA lane will report a full green over code it never saw.
+///
+/// 🔴 This used to also consult [`grouped_gemm_tiles_amortize`]: switch to the
+/// grouped GEMM only once each woken expert fills an m-tile. At V4's
+/// top-6-of-256 that needs `6n/256 >= GROUPED_TILE_M`, i.e. **n >= 683**, a
+/// token count decode never reaches — so the clause pinned every decode step,
+/// and every batch up to 682, on the GEMV arm.
+///
+/// Two independent measurements retired it: decode at B=48..512 on an H200, and
+/// prefill over 16..512-token prompts. Grouped wins everywhere at and above 16,
+/// including **+16% on a tile that is only 7.5% full**.
+///
+/// **Tile fill was therefore the wrong quantity.** The grouped kernel wins
+/// because it stages each woken expert's bytes once per m-tile instead of once
+/// per (token, expert) pair — the GEMV arm's reads are exactly linear in
+/// `n_tokens` — and because it runs on tensor cores rather than a scalar GEMV.
+/// Occupancy was never the mechanism being traded against.
+///
+/// [`super::DECODE_REGIME_MAX_TOKENS`] survives as a FLOOR: below it there is
+/// genuinely nothing to group (b=1 measures 0.47x), and it is the RUN-161
+/// capture-safety rule besides.
+pub(crate) fn prefer_gather_gemv(n_tokens: usize, override_cap: Option<usize>) -> bool {
+    match override_cap {
+        Some(cap) => n_tokens <= cap,
+        None => n_tokens <= super::DECODE_REGIME_MAX_TOKENS,
+    }
+}
+
 pub(crate) fn grouped_gemm_tiles_amortize(
     n_tokens: usize,
     top_k: usize,
@@ -738,5 +808,57 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod crossover_tests {
+    use super::*;
+
+    /// The shipped dispatch: the GEMV arm only at or below the capture-safety
+    /// floor, and the grouped GEMM reachable at every batch size we measured.
+    #[test]
+    fn the_grouped_gemm_is_reachable_at_decode_batch_sizes() {
+        for n in [1, 2, 4, 8] {
+            assert!(
+                prefer_gather_gemv(n, None),
+                "n={n} is below the floor and must stay on the GEMV arm"
+            );
+        }
+        // Exactly the points measured on hardware, all of which the grouped
+        // kernel won: decode B=48 1.10x, 64 1.14x, 80 1.22x, 96 1.29x,
+        // 128 1.66x, 512 1.51x (clean rows: >=97% achieved concurrency, <7%
+        // derived-vs-measured spread), and prefill +16% as low as n=16.
+        for n in [16, 32, 48, 64, 80, 96, 128, 512] {
+            assert!(
+                !prefer_gather_gemv(n, None),
+                "n={n} must reach the grouped GEMM; it was measured faster there"
+            );
+        }
+    }
+
+    /// NON-VACUITY CONTROL, and the whole reason the clause was removed: the
+    /// retired tile-fill predicate would have sent every one of those token
+    /// counts to the GEMV arm. If this stops holding, the control is broken and
+    /// the test above proves nothing about the change.
+    #[test]
+    fn the_retired_tile_fill_clause_would_have_excluded_all_of_them() {
+        for n in [16, 32, 48, 64, 80, 96, 128, 512] {
+            assert!(
+                !grouped_gemm_tiles_amortize(n, 6, 256),
+                "control broken: the retired clause was supposed to reject n={n}"
+            );
+        }
+        // It only relented at 683 -- a token count decode never reaches, which
+        // is precisely why the grouped kernel was unreachable in serving.
+        assert_eq!(grouped_gemm_min_tokens(6, 256), Some(683));
+    }
+
+    /// The A/B override still pins the GEMV arm outright, so both kernels stay
+    /// comparable from one binary.
+    #[test]
+    fn the_override_still_pins_the_gemv_arm() {
+        assert!(prefer_gather_gemv(512, Some(1024)));
+        assert!(!prefer_gather_gemv(512, Some(256)));
     }
 }
