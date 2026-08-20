@@ -389,6 +389,17 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     /// How many replays past the capture step we are, for the same probe.
     static ARC_REPLAY_DISTANCE: std::cell::RefCell<u64> = const { std::cell::RefCell::new(0) };
+    /// Handles to the per-layer outputs the CAPTURED forward produced. The
+    /// recorded kernels write to these same addresses on every replay, so
+    /// after a replay these hold the replay's per-layer values and can be
+    /// bisected against an eager forward's. See `layers::arc_layer_trace_*`.
+    static ARC_GRAPH_LAYER_BUFS: std::cell::RefCell<Option<Vec<Tensor>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Is the per-layer graph-vs-eager bisect enabled?
+fn arc_layer_bisect() -> bool {
+    std::env::var("ARC_GRAPH_LAYER_BISECT").as_deref() == Ok("1")
 }
 
 fn max_abs_diff(a: &Tensor, b: &Tensor) -> candle_core::Result<f32> {
@@ -2080,6 +2091,13 @@ impl Pipeline for NormalPipeline {
                             }
                             let cl = context_lens.clone();
                             let pid = position_ids.clone();
+                            // Open the per-layer trace BEFORE capture begins so
+                            // the recorded forward's own layer outputs are the
+                            // handles we keep. Costs 43 Arc bumps, no device
+                            // work, so it is safe inside the capture region.
+                            if arc_layer_bisect() {
+                                crate::layers::arc_layer_trace_begin();
+                            }
                             let cap_result = match runner.begin_capture(bs) {
                                 Ok((gp, op)) => {
                                     match self.model.forward(
@@ -2149,6 +2167,18 @@ impl Pipeline for NormalPipeline {
                                                         tracing::info!(
                                                         "ARC capture: graph CAPTURED + launched OK"
                                                     );
+                                                        if arc_layer_bisect() {
+                                                            let bufs =
+                                                                crate::layers::arc_layer_trace_take();
+                                                            tracing::error!(
+                                                                "ARC BISECT: holding {} captured layer buffers",
+                                                                bufs.as_ref()
+                                                                    .map(|b| b.len())
+                                                                    .unwrap_or(0)
+                                                            );
+                                                            ARC_GRAPH_LAYER_BUFS
+                                                                .with(|c| *c.borrow_mut() = bufs);
+                                                        }
                                                         // ── SAME-STEP PROBE ─────────────
                                                         // Separates the two ways a graph can
                                                         // be wrong, which the replay-step
@@ -2302,6 +2332,16 @@ impl Pipeline for NormalPipeline {
                                         // eager result this step either way
                                         // — it is already computed and it is
                                         // the one we know is right.
+                                        // `out` above came from the replay, so
+                                        // the held capture-time layer handles
+                                        // now hold the REPLAY's per-layer
+                                        // values. Trace the eager forward and
+                                        // compare layer by layer: the first
+                                        // index that differs is the first layer
+                                        // reading a stale per-step input.
+                                        if arc_layer_bisect() {
+                                            crate::layers::arc_layer_trace_begin();
+                                        }
                                         let eager = self.model.forward(
                                             &input_ids,
                                             &seqlen_offsets,
@@ -2310,6 +2350,43 @@ impl Pipeline for NormalPipeline {
                                             paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
                                             &flash_meta,
                                         )?;
+                                        if arc_layer_bisect() {
+                                            let eager_layers =
+                                                crate::layers::arc_layer_trace_take();
+                                            ARC_GRAPH_LAYER_BUFS.with(|c| {
+                                                if let (Some(g), Some(e)) =
+                                                    (c.borrow().as_ref(), eager_layers.as_ref())
+                                                {
+                                                    let n = g.len().min(e.len());
+                                                    let mut first = None;
+                                                    let mut line = String::new();
+                                                    for i in 0..n {
+                                                        let d = max_abs_diff(&g[i], &e[i])
+                                                            .unwrap_or(f32::NAN);
+                                                        if i < 6 || first.map_or(false, |f| i <= f + 2)
+                                                        {
+                                                            line.push_str(&format!(
+                                                                " L{i}={d:.2e}"
+                                                            ));
+                                                        }
+                                                        if first.is_none()
+                                                            && !(d <= GRAPH_REPLAY_TOLERANCE)
+                                                        {
+                                                            first = Some(i);
+                                                            line.push_str("<<FIRST");
+                                                        }
+                                                    }
+                                                    // Slot map: 0=graph length
+                                                    // mask, 1=embedding,
+                                                    // 2=mHC lift, 3+=layer
+                                                    // (slot-3).
+                                                    tracing::error!(
+                                                        "ARC BISECT: slots={n} first_diverging={:?} [0=mask 1=embed 2=lift 3+=L(n-3)]{line}",
+                                                        first
+                                                    );
+                                                }
+                                            });
+                                        }
                                         // ── DISTANCE-FROM-CAPTURE PROBE ──
                                         // The same-step probe already proved
                                         // the graph is wired right (Δ=0 at the
