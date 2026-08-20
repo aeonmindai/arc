@@ -279,6 +279,185 @@ mod cuda_impl {
         }
     }
 
+    /// Fused V4 clamped SwiGLU: `narrow(silu(min(gate, limit)) * clamp(up, -limit, limit))`.
+    ///
+    /// Replaces the 8-launch (routed) / 7-launch (shared) chain in
+    /// `moe::experts::swiglu_clamp` + the activation stage that follows it,
+    /// plus the three 4-byte host-to-device copies candle makes for the clamp
+    /// bounds.
+    ///
+    /// - `gate`, `up`: same shape, same dtype (F32 or BF16), contiguous, CUDA
+    /// - `out_dtype`: normally `gate.dtype()`; F32 is used by the A/B harness
+    ///   to obtain the product *before* the narrowing, where a bitwise
+    ///   comparison is not swallowed by BF16's 8 mantissa bits.
+    pub fn swiglu_clamp_fused_cuda(
+        gate: &Tensor,
+        up: &Tensor,
+        limit: f32,
+        out_dtype: DType,
+    ) -> Result<Tensor> {
+        if gate.dims() != up.dims() {
+            candle::bail!(
+                "hc_fused: swiglu gate {:?} vs up {:?}",
+                gate.dims(),
+                up.dims()
+            );
+        }
+        if gate.dtype() != up.dtype() {
+            candle::bail!(
+                "hc_fused: swiglu gate is {:?} but up is {:?}",
+                gate.dtype(),
+                up.dtype()
+            );
+        }
+        let total = gate.elem_count();
+        if total == 0 {
+            candle::bail!("hc_fused: empty swiglu");
+        }
+        let in_tag = dtype_tag(gate.dtype())?;
+        let out_tag = dtype_tag(out_dtype)?;
+        let gate_ptr = any_ptr(gate, "swiglu gate")?;
+        let up_ptr = any_ptr(up, "swiglu up")?;
+        let dev = gate.device().as_cuda_device()?;
+        let stream = dev.cuda_stream().cu_stream() as i64;
+        let shape = gate.shape().clone();
+
+        #[allow(clippy::cast_possible_truncation)]
+        alloc_out(&dev, out_dtype, total, shape, |out| unsafe {
+            crate::cuda::ffi::arc_seam_swiglu_clamp(
+                gate_ptr, up_ptr, out, limit, total as i64, in_tag, out_tag, stream,
+            )
+        })
+    }
+
+    /// The clamp half of [`swiglu_clamp_fused_cuda`], returning
+    /// `(min(gate, limit), clamp(up, -limit, limit))` in F32.
+    ///
+    /// Used at the shared-expert site, whose activation is `fused_glu` compiled
+    /// with `--use_fast_math` (mistralrs-quant/build.rs:281) and therefore not
+    /// reproducible from this no-fast-math translation unit. See the kernel's
+    /// comment in `hc_fused.cu` for why the weaker fusion is the honest one
+    /// there.
+    pub fn swiglu_clamp_split_cuda(
+        gate: &Tensor,
+        up: &Tensor,
+        limit: f32,
+    ) -> Result<(Tensor, Tensor)> {
+        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+
+        if gate.dims() != up.dims() {
+            candle::bail!(
+                "hc_fused: swiglu-split gate {:?} vs up {:?}",
+                gate.dims(),
+                up.dims()
+            );
+        }
+        if gate.dtype() != up.dtype() {
+            candle::bail!("hc_fused: swiglu-split gate/up dtypes differ");
+        }
+        let total = gate.elem_count();
+        if total == 0 {
+            candle::bail!("hc_fused: empty swiglu-split");
+        }
+        let in_tag = dtype_tag(gate.dtype())?;
+        let gate_ptr = any_ptr(gate, "swiglu gate")?;
+        let up_ptr = any_ptr(up, "swiglu up")?;
+        let dev = gate.device().as_cuda_device()?;
+        let stream = dev.cuda_stream().cu_stream() as i64;
+        let shape = gate.shape().clone();
+
+        let g_buf = unsafe { dev.alloc::<f32>(total) }?;
+        let u_buf = unsafe { dev.alloc::<f32>(total) }?;
+        #[allow(clippy::cast_possible_truncation)]
+        let rc = unsafe {
+            crate::cuda::ffi::arc_seam_swiglu_clamp_split(
+                gate_ptr,
+                up_ptr,
+                g_buf.device_ptr(g_buf.stream()).0 as *mut std::ffi::c_void,
+                u_buf.device_ptr(u_buf.stream()).0 as *mut std::ffi::c_void,
+                limit,
+                total as i64,
+                in_tag,
+                stream,
+            )
+        };
+        if rc != 0 {
+            candle::bail!("hc_fused: swiglu-split dispatch refused (rc={rc})");
+        }
+        let g_st = candle::CudaStorage::wrap_cuda_slice(g_buf, dev.clone());
+        let u_st = candle::CudaStorage::wrap_cuda_slice(u_buf, dev.clone());
+        Ok((
+            Tensor::from((candle::Storage::Cuda(g_st), shape.clone())),
+            Tensor::from((candle::Storage::Cuda(u_st), shape)),
+        ))
+    }
+
+    /// Fused MoE expert combine: `out[n, h] = narrow(sum_j ys[n, j, h] * w[n, j])`,
+    /// replacing `to_dtype + broadcast_mul + sum(-2) + to_dtype` (4 launches).
+    ///
+    /// - `ys` `[n, k, h]` model dtype, contiguous
+    /// - `w`  `[n, k]`    F32, contiguous
+    pub fn moe_weighted_sum_cuda(ys: &Tensor, w: &Tensor, out_dtype: DType) -> Result<Tensor> {
+        let (n, k, h) = ys.dims3()?;
+        let (wn, wk) = w.dims2()?;
+        if wn != n || wk != k {
+            candle::bail!("hc_fused: weights are [{wn}, {wk}] but ys is [{n}, {k}, {h}]");
+        }
+        if n == 0 || h == 0 {
+            candle::bail!("hc_fused: empty weighted sum");
+        }
+        let in_tag = dtype_tag(ys.dtype())?;
+        let out_tag = dtype_tag(out_dtype)?;
+        let ys_ptr = any_ptr(ys, "ys")?;
+        let w_ptr = f32_ptr(w, "topk_weights")?;
+        let dev = ys.device().as_cuda_device()?;
+        let stream = dev.cuda_stream().cu_stream() as i64;
+        let total = (n * h) as i64;
+
+        #[allow(clippy::cast_possible_truncation)]
+        alloc_out(&dev, out_dtype, n * h, (n, h), |out| unsafe {
+            crate::cuda::ffi::arc_seam_moe_weighted_sum(
+                ys_ptr, w_ptr, out, k as i32, h as i32, total, in_tag, out_tag, stream,
+            )
+        })
+    }
+
+    /// Fused MoE gate renormalise + scale, replacing
+    /// `sum_keepdim + affine(+eps) + broadcast_div + affine(*scale)`
+    /// (4 launches).
+    ///
+    /// `w` is `[n, k]` F32 contiguous. `do_renorm == false` applies only the
+    /// scale, which is what the config-gated eager path does when
+    /// `norm_topk_prob` is off.
+    pub fn gate_renorm_cuda(
+        w: &Tensor,
+        eps: f32,
+        scale: f32,
+        do_renorm: bool,
+    ) -> Result<Tensor> {
+        let (n, k) = w.dims2()?;
+        if n == 0 || k == 0 {
+            candle::bail!("hc_fused: empty gate renorm");
+        }
+        let w_ptr = f32_ptr(w, "topk_weight")?;
+        let dev = w.device().as_cuda_device()?;
+        let stream = dev.cuda_stream().cu_stream() as i64;
+
+        #[allow(clippy::cast_possible_truncation)]
+        alloc_out(&dev, DType::F32, n * k, (n, k), |out| unsafe {
+            crate::cuda::ffi::arc_seam_gate_renorm(
+                w_ptr,
+                out,
+                eps,
+                scale,
+                i32::from(do_renorm),
+                k as i32,
+                n as i64,
+                stream,
+            )
+        })
+    }
+
     /// Fused `hc_pre` tail: `y = sum_i pre[i] * x_f32[i, :]`, narrowed to
     /// `out_dtype`. Replaces `broadcast_mul + sum(1) + to_dtype` (3 launches).
     ///
@@ -360,7 +539,48 @@ mod cuda_impl {
 }
 
 #[cfg(feature = "cuda")]
-pub use cuda_impl::{hc_post_fused_cuda, hc_pre_fused_cuda, hc_y_combine_cuda, sqrt_softplus_cuda};
+pub use cuda_impl::{
+    gate_renorm_cuda, hc_post_fused_cuda, hc_pre_fused_cuda, hc_y_combine_cuda,
+    moe_weighted_sum_cuda, sqrt_softplus_cuda, swiglu_clamp_fused_cuda, swiglu_clamp_split_cuda,
+};
+
+#[cfg(not(feature = "cuda"))]
+pub fn swiglu_clamp_split_cuda(
+    _gate: &candle_core::Tensor,
+    _up: &candle_core::Tensor,
+    _limit: f32,
+) -> candle_core::Result<(candle_core::Tensor, candle_core::Tensor)> {
+    candle_core::bail!("swiglu_clamp_split_cuda requires the cuda feature")
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn swiglu_clamp_fused_cuda(
+    _gate: &candle_core::Tensor,
+    _up: &candle_core::Tensor,
+    _limit: f32,
+    _out_dtype: candle_core::DType,
+) -> candle_core::Result<candle_core::Tensor> {
+    candle_core::bail!("swiglu_clamp_fused_cuda requires the cuda feature")
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn moe_weighted_sum_cuda(
+    _ys: &candle_core::Tensor,
+    _w: &candle_core::Tensor,
+    _out_dtype: candle_core::DType,
+) -> candle_core::Result<candle_core::Tensor> {
+    candle_core::bail!("moe_weighted_sum_cuda requires the cuda feature")
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn gate_renorm_cuda(
+    _w: &candle_core::Tensor,
+    _eps: f32,
+    _scale: f32,
+    _do_renorm: bool,
+) -> candle_core::Result<candle_core::Tensor> {
+    candle_core::bail!("gate_renorm_cuda requires the cuda feature")
+}
 
 #[cfg(not(feature = "cuda"))]
 pub fn hc_y_combine_cuda(
@@ -427,6 +647,119 @@ pub fn usable_model_dtype(t: &candle_core::Tensor) -> bool {
         && t.device().is_cuda()
         && matches!(t.dtype(), candle_core::DType::F32 | candle_core::DType::BF16)
         && fused_enabled()
+}
+
+// ---------------------------------------------------------------------------
+// The F32 seam — gates and engagement accounting
+// ---------------------------------------------------------------------------
+//
+// One master switch so the whole change can be A/B'd from a single binary
+// (`ARC_F32SEAM=0` restores every eager chain), plus one switch per site so a
+// site that turns out to cost bit-identity can be dropped without a rebuild.
+//
+// ENGAGEMENT IS REPORTED, NOT ASSUMED. A timing win from a fast path that never
+// ran is this codebase's most-repeated failure. Every site logs the first time
+// it engages AND the first time it declines, with the reason, and prints running
+// totals; "no DECLINED line" is then a fact in the log rather than an inference.
+
+/// `ARC_F32SEAM=0` restores every eager chain in the seam. Anything else keeps
+/// them fused.
+pub fn seam_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("ARC_F32SEAM").as_deref(), Ok("0")))
+}
+
+/// Per-site opt-out, e.g. `ARC_SEAM_SWIGLU=0`. Only consulted when the master
+/// switch is on.
+fn seam_site_enabled(var: &'static str) -> bool {
+    // Sites are few and fixed; a tiny linear scan of cached values beats a
+    // per-call `std::env::var` (which takes a global lock).
+    static CACHE: std::sync::OnceLock<Vec<(&'static str, bool)>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| {
+        ["ARC_SEAM_SWIGLU", "ARC_SEAM_WSUM", "ARC_SEAM_GATE"]
+            .into_iter()
+            .map(|v| (v, !matches!(std::env::var(v).as_deref(), Ok("0"))))
+            .collect()
+    });
+    cache
+        .iter()
+        .find(|(name, _)| *name == var)
+        .map(|(_, on)| *on)
+        .unwrap_or(true)
+}
+
+/// Whether a seam site should fuse: master on, this site on, CUDA build.
+pub fn seam_on(var: &'static str) -> bool {
+    cfg!(feature = "cuda") && seam_enabled() && seam_site_enabled(var)
+}
+
+/// `ARC_SEAM_AB=1` recomputes the eager chain beside every seam kernel and
+/// compares raw bits — at **F32**, before any narrowing, because a BF16
+/// comparison has 8 mantissa bits and would swallow the reassociation errors
+/// this is meant to catch. Shares `ARC_HC_AB_POISON=1` as its negative control.
+pub fn seam_ab_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("ARC_SEAM_AB").as_deref(), Ok("1")))
+}
+
+static SEAM_ENGAGED: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static SEAM_DECLINED: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Site indices into the counters above.
+pub const SEAM_SWIGLU: usize = 0;
+pub const SEAM_WSUM: usize = 1;
+pub const SEAM_GATE: usize = 2;
+pub const SEAM_SWIGLU_SPLIT: usize = 3;
+
+const SEAM_NAMES: [&str; 4] = [
+    "swiglu_clamp",
+    "moe_weighted_sum",
+    "gate_renorm",
+    "swiglu_clamp_split",
+];
+
+/// Record that a seam site fused. Logs the first one and then periodic totals.
+pub fn seam_engaged(site: usize) {
+    let prev = SEAM_ENGAGED[site].fetch_add(1, Ordering::Relaxed);
+    if prev == 0 {
+        tracing::warn!("arc-f32-seam ENGAGED site={}", SEAM_NAMES[site]);
+    } else if (prev + 1) % 10_000 == 0 {
+        tracing::warn!(
+            "arc-f32-seam site={} engaged={} declined={}",
+            SEAM_NAMES[site],
+            prev + 1,
+            SEAM_DECLINED[site].load(Ordering::Relaxed)
+        );
+    }
+}
+
+/// Record that a seam site fell back, and why. Logs the first one per site.
+pub fn seam_declined(site: usize, reason: &str) {
+    let prev = SEAM_DECLINED[site].fetch_add(1, Ordering::Relaxed);
+    if prev == 0 {
+        tracing::warn!(
+            "arc-f32-seam DECLINED site={} reason={reason}",
+            SEAM_NAMES[site]
+        );
+    }
+}
+
+/// `(engaged, declined)` totals for a site — used by tests and by the report.
+pub fn seam_counts(site: usize) -> (u64, u64) {
+    (
+        SEAM_ENGAGED[site].load(Ordering::Relaxed),
+        SEAM_DECLINED[site].load(Ordering::Relaxed),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -886,6 +1219,134 @@ pub(crate) mod reference {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod seam_tests {
+    use super::*;
+
+    /// Scalar replica of `arc_seam_moe_weighted_sum_kernel` /
+    /// `arc_seam_gate_renorm_kernel`'s reduction: the identity-padded pairwise
+    /// tree over `P = next_pow2(K)` slots.
+    fn seam_padded_tree(vals: &[f32]) -> f32 {
+        let p = vals.len().next_power_of_two();
+        let mut acc = vec![0.0f32; p];
+        for (t, v) in vals.iter().enumerate() {
+            acc[t] = 0.0f32 + v; // the `shr[tid] = 0; shr[tid] += v` of fast_sum
+        }
+        let mut s = p / 2;
+        while s > 0 {
+            for t in 0..s {
+                acc[t] += acc[t + s];
+            }
+            s >>= 1;
+        }
+        acc[0]
+    }
+
+    /// The seam kernels must reduce in candle's `fast_sum` order, which for
+    /// V4's `top_k = 6` is a tree over EIGHT slots, not six. This is the whole
+    /// bit-identity risk of the two reduction kernels, and it is checkable
+    /// without a GPU: `sinkhorn::reference::candle_tree_sum` is an independent
+    /// transcription of the same candle kernel, written for a different fusion.
+    #[test]
+    fn seam_reduction_replays_candle_fast_sum_including_the_padding_lanes() {
+        let mut seed = 0x5eedu64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (((seed >> 40) as f32) / ((1u32 << 24) as f32)) * 2.0 - 1.0
+        };
+        for _ in 0..2000 {
+            for k in [1usize, 2, 4, 6, 8] {
+                let vals: Vec<f32> = (0..k).map(|_| next()).collect();
+                assert_eq!(
+                    seam_padded_tree(&vals).to_bits(),
+                    crate::cuda::sinkhorn::reference::candle_tree_sum(&vals).to_bits(),
+                    "k={k} vals={vals:?}"
+                );
+            }
+        }
+    }
+
+    /// For `k = 6` the padded tree is NOT the sequential sum, and this pins the
+    /// exact association the kernel must reproduce. A kernel that summed
+    /// `a0..a5` left to right would pass a tolerance test and fail this one.
+    #[test]
+    fn k6_tree_is_not_the_sequential_sum() {
+        // The tree pairs a0 with a4, so the two large opposite-sign terms
+        // cancel exactly there while a left-to-right sum absorbs the small
+        // terms into 1e8 and loses them. 1.0 vs 4.0 — not a last-ulp
+        // difference, a catastrophic one.
+        let v = [1e8f32, 1.0, 1.0, 1.0, -1e8, 1.0];
+        let seq = v.iter().fold(0.0f32, |a, b| a + b);
+        let tree = seam_padded_tree(&v);
+        assert_ne!(
+            seq.to_bits(),
+            tree.to_bits(),
+            "if these ever agree this test has stopped discriminating"
+        );
+        // ((0+a0)+(0+a4)) + ((0+a2)+0)  +  ((0+a1)+(0+a5)) + ((0+a3)+0)
+        let lhs = (v[0] + v[4]) + v[2];
+        let rhs = (v[1] + v[5]) + v[3];
+        assert_eq!(tree.to_bits(), (lhs + rhs).to_bits());
+    }
+
+    /// `fmaf(x, scale, 0.0)` is what candle's `affine(mul, 0.)` compiles to and
+    /// is deliberately not `x * scale`: they disagree on the sign of zero, and
+    /// the gate renorm kernel writes the result of exactly this expression.
+    #[test]
+    fn affine_is_an_fma_not_a_multiply() {
+        let x = -0.0f32;
+        assert_ne!(
+            (x * 2.0f32).to_bits(),
+            x.mul_add(2.0, 0.0).to_bits(),
+            "the two spellings must still differ, or this guard proves nothing"
+        );
+        assert_eq!(x.mul_add(2.0, 0.0).to_bits(), 0.0f32.to_bits());
+    }
+
+    /// Engagement accounting must actually count, in both directions —
+    /// otherwise "no DECLINED line in the log" is not evidence of anything.
+    #[test]
+    fn seam_engagement_counters_move() {
+        let before = seam_counts(SEAM_GATE);
+        seam_engaged(SEAM_GATE);
+        seam_declined(SEAM_GATE, "unit test");
+        let after = seam_counts(SEAM_GATE);
+        assert_eq!(after.0, before.0 + 1);
+        assert_eq!(after.1, before.1 + 1);
+    }
+
+    /// The seam kernels must stay in the no-fast-math translation unit, and the
+    /// shared-expert site must stay on the weaker fusion for as long as
+    /// `fused_glu` is compiled with `--use_fast_math`. If that flag ever leaves
+    /// mistralrs-quant/build.rs, the full fusion becomes legal there and this
+    /// test is the reminder.
+    #[test]
+    fn seam_kernels_are_where_the_bit_identity_argument_says_they_are() {
+        let cu = include_str!("hc_fused.cu");
+        for sym in [
+            "arc_seam_swiglu_clamp_kernel",
+            "arc_seam_swiglu_clamp_split_kernel",
+            "arc_seam_moe_weighted_sum_kernel",
+            "arc_seam_gate_renorm_kernel",
+        ] {
+            assert!(cu.contains(sym), "{sym} left hc_fused.cu");
+        }
+        let build = include_str!("../../build.rs");
+        assert!(
+            build.contains("src/cuda/hc_fused.cu"),
+            "hc_fused.cu must stay in the dedicated no-fast-math builder"
+        );
+        let quant_build = include_str!("../../../mistralrs-quant/build.rs");
+        assert!(
+            quant_build.contains("--use_fast_math"),
+            "if mistralrs-quant stopped using fast math, fused_glu became \
+             reproducible and the shared expert can take the full fusion"
+        );
     }
 }
 
