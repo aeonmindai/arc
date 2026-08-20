@@ -211,10 +211,10 @@ step                                        engine/mod.rs — one scheduler iter
 │     │     │     │  ├─ kv_proj            [device]  fused wkv
 │     │     │     │  ├─ kv_norm            [device]
 │     │     │     │  ├─ rope               [device]
-│     │     │     │  ├─ kv_fp8_quant       [device]  opt-in, ARC_V4_FP8_KV=1
-│     │     │     │  ├─ kv_fp8_dequant     [device]
+│     │     │     │  ├─ kv_fp8_quant       [device]  ALWAYS (V4 is FP8-QAT), not opt-in
+│     │     │     │  ├─ kv_fp8_dequant     [device]  ALWAYS — pairs with the quant above
 │     │     │     │  ├─ compressed_kv_build[device]
-│     │     │     │  ├─ kv_cache_append    [device]
+│     │     │     │  ├─ kv_cache_append    [device]  FP8 *storage* here is ARC_V4_FP8_KV=1
 │     │     │     │  ├─ kv_cache_span      [device]
 │     │     │     │  ├─ sdpa               [device]  dsv4_attention (window ∧ compressed)
 │     │     │     │  ├─ inv_rope           [device]  NOT inside ARC_TIME_DECODE's timer
