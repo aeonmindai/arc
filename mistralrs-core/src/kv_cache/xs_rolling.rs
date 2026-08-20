@@ -853,6 +853,77 @@ impl XsRollingCache {
         self.comp.current_data()
     }
 
+    /// Pin the compressed buffer at `rows` columns so it is never resized again.
+    ///
+    /// The compressed-branch twin of [`crate::kv_cache::SingleCache::append_graph`]'s
+    /// pre-grow. A resize moves the device address a captured CUDA graph baked
+    /// in, so the width has to be fixed *before* the first row is written —
+    /// which is during the warmup decodes that precede capture. Raising the
+    /// capacity of a buffer that does not exist yet costs nothing:
+    /// `SingleCache::append` allocates at `capacity_seq_len` on first use.
+    ///
+    /// Idempotent, and refuses rather than reallocating once rows are live: a
+    /// silent regrow is precisely the failure this exists to prevent.
+    pub fn pin_comp_capacity(&mut self, rows: usize) -> Result<()> {
+        if rows > self.comp.max_seq_len() {
+            candle_core::bail!(
+                "xs rolling cache: cannot pin the compressed buffer at {rows} rows; the \
+                 cache's ceiling is {} rows (max_position_embeddings / ratio {})",
+                self.comp.max_seq_len(),
+                self.ratio
+            );
+        }
+        match self.comp.all_data() {
+            Some(ad) => {
+                let have = ad.dim(1)?;
+                if have < rows {
+                    candle_core::bail!(
+                        "xs rolling cache: the compressed buffer is already live at {have} \
+                         rows and cannot be widened to {rows} — growing it would move the \
+                         address a captured graph baked in. Pin it before the first row is \
+                         written (i.e. on a warmup step, before capture)."
+                    );
+                }
+                Ok(())
+            }
+            None => {
+                self.comp.capacity_seq_len = rows.max(self.comp.capacity_seq_len);
+                Ok(())
+            }
+        }
+    }
+
+    /// The compressed rows at a **fixed** width — the graph-decode read.
+    ///
+    /// Returns `[B, capacity, head_dim]`: the leading `tokens / ratio` columns
+    /// are the real completed blocks and the rest are the zeros the buffer was
+    /// allocated with. Those zeros are *not* attended: `comp` is start-anchored,
+    /// so column `j` is absolute block `j` for every row, and the compressed
+    /// branch's own causality threshold — `b < floor((position + 1) / ratio)`,
+    /// evaluated on device from the graph position by
+    /// [`crate::models::dsv4_attention::graph_compressed_mask`] — already excludes
+    /// every column past a row's own completed count. That is the same argument
+    /// that lets a ragged batch share one start-anchored buffer; fixed capacity
+    /// is the same trick applied along time instead of across rows.
+    ///
+    /// A constant-offset, constant-width narrow of a buffer that is never
+    /// resized mid-sequence, so the attention geometry is identical on every
+    /// decode step and one captured graph replays for all of them.
+    pub fn compressed_rows_fixed(&self, capacity: usize) -> Result<Option<Tensor>> {
+        let Some(ad) = self.comp.all_data() else {
+            return Ok(None);
+        };
+        let have = ad.dim(1)?;
+        if have < capacity {
+            candle_core::bail!(
+                "xs rolling cache: graph decode asked for a fixed {capacity}-row compressed \
+                 window but the buffer holds {have}. Call `pin_comp_capacity` before the \
+                 first row is written."
+            );
+        }
+        Ok(Some(ad.narrow(1, 0, capacity)?))
+    }
+
     /// Make this cache describe `b` batch rows. Broadcasting a single row is
     /// how a freshly built or freshly reset cache picks up the batch it is
     /// about to be advanced with.

@@ -1323,9 +1323,7 @@ impl Attention {
         // the correctness-first dense path — the long-context sparse-gather
         // kernel is the place to precompute this.
         let dev = comp.device();
-        let positions = (Tensor::arange(0u32, t_c as u32, dev)?.to_dtype(DType::F32)?
-            * (ratio as f64))?
-        .to_dtype(DType::U32)?;
+        let positions = compressed_row_positions(t_c, ratio, dev)?;
         self.rotary_emb
             .forward_at_positions(&comp, self.cfg.qk_rope_head_dim, &positions)
     }
@@ -1412,10 +1410,35 @@ impl Attention {
                             "xs rolling cache span must equal the compressor's group span"
                         );
                         let xs3 = xs.contiguous()?;
+                        // RUN-161 2c: under graph decode the compressed axis
+                        // must be as wide at token 1 as it will ever be, so pin
+                        // it before the first row lands. Done here, on every
+                        // warmup step, because `pin_comp_capacity` refuses once
+                        // rows are live — a regrow would move the address a
+                        // captured graph baked in.
+                        let graph_rows = (crate::layers::has_graph_mode_positions()
+                            && seq_len == 1
+                            && self.paged_attn.is_none())
+                        .then(|| graph_comp_rows(self.compress_ratio.ratio()));
+                        if let Some(rows) = graph_rows {
+                            state.pin_comp_capacity(rows)?;
+                        }
                         // Always advanced, including under the window-only
                         // ablation below: skipping it would drop the raw tail
                         // and leave a hole the next group cannot be built from.
-                        state.advance(&xs3, |window| compressor.forward_from_xs(window))?
+                        let advanced =
+                            state.advance(&xs3, |window| compressor.forward_from_xs(window))?;
+                        match graph_rows {
+                            // Fixed-width read: the same buffer, narrowed at a
+                            // constant offset to a constant width, so the
+                            // attention geometry does not move with the
+                            // sequence. `graph_compressed_mask` masks the
+                            // columns no block has reached yet.
+                            Some(rows) if advanced.is_some() => {
+                                state.compressed_rows_fixed(rows)?
+                            }
+                            _ => advanced,
+                        }
                     }
                     None => None,
                 }
@@ -1569,6 +1592,7 @@ impl Attention {
             sliding_window: self.sliding_window,
             raw_prefix: 0,
             row_q0: None,
+            graph_positions: None,
         };
         // Faithful V4: the compressed (distant-context) KV, with compress-θ
         // RoPE at the strided compressed positions. `dsv4_attention` runs a
@@ -1685,7 +1709,18 @@ impl Attention {
                     Some(&gmask),
                     flash_params,
                     &self.sdpa_params,
-                    dsv4_cfg,
+                    super::dsv4_attention::Dsv4AttentionConfig {
+                        // The compressed branch's block-causality threshold is
+                        // an ABSOLUTE position, and under fixed capacity the
+                        // `q0` inferred from the buffer width is a constant —
+                        // it would freeze the distant-context branch at
+                        // `floor(sliding_window / ratio)` blocks forever (one,
+                        // on HCA). Hand it the device position instead, so a
+                        // replay re-derives the threshold from whatever the
+                        // position buffer holds.
+                        graph_positions: Some(&position),
+                        ..dsv4_cfg
+                    },
                 )?
             }
             None => {
@@ -2695,6 +2730,61 @@ fn append_kv_mqa(
             Ok(V4CachedK::Dense(k_cached))
         }
     }
+}
+
+// Cached `[t_c]` U32 absolute positions of the compressed rows, keyed by row
+// count and ratio. Compressed row `j` sits at absolute position `j * ratio`,
+// which depends on nothing but `j` — so for a given (width, ratio) this vector
+// is a constant and rebuilding it per layer per step was pure waste.
+//
+// It is also a correctness precondition for capture, not just a saving:
+// `Tensor::arange` on a GPU device is an H2D copy from pageable host memory,
+// which cannot be recorded into a CUDA graph at all. Under fixed capacity the
+// width stops moving, so this hits from the second decode step onward and the
+// copy leaves the capture region for good.
+thread_local! {
+    static COMPRESSED_ROW_POSITIONS: std::cell::RefCell<Option<(usize, usize, Tensor)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn compressed_row_positions(t_c: usize, ratio: usize, dev: &Device) -> Result<Tensor> {
+    COMPRESSED_ROW_POSITIONS.with(|c| -> Result<Tensor> {
+        let mut c = c.borrow_mut();
+        if let Some((w, r, t)) = c.as_ref() {
+            if *w == t_c && *r == ratio && t.device().same_device(dev) {
+                return Ok(t.clone());
+            }
+        }
+        let t = (Tensor::arange(0u32, t_c as u32, dev)?.to_dtype(DType::F32)? * (ratio as f64))?
+            .to_dtype(DType::U32)?;
+        *c = Some((t_c, ratio, t.clone()));
+        Ok(t)
+    })
+}
+
+/// The FIXED number of compressed rows the CUDA-graph decode arm reads back.
+///
+/// Fixed capacity is what capture costs. A graph replays the launch geometry it
+/// recorded, so the compressed key axis has to be as wide on token 1 as it will
+/// ever be — which means choosing, up front, the longest context the graph is
+/// allowed to serve. `ARC_V4_GRAPH_MAX_CTX` is that choice (tokens, default
+/// 8192); the row count is it divided by the layer's compress ratio, so an HCA
+/// layer (ratio 128) pays 64 rows where a CSA layer (ratio 4) pays 2048.
+///
+/// Deliberately NOT `max_position_embeddings / ratio`: at V4's 163 840-token
+/// ceiling that is 40 960 compressed columns per layer per step, which would
+/// cost far more than the launch overhead capture is meant to remove. Beyond
+/// the pinned context the arm refuses (`compressed_rows_fixed` bails) rather
+/// than silently re-capturing or silently truncating the distant context —
+/// falling back to eager decode is a slower answer, truncation is a wrong one.
+fn graph_comp_rows(ratio: usize) -> usize {
+    const DEFAULT_GRAPH_CTX_TOKENS: usize = 8192;
+    let ctx = std::env::var("ARC_V4_GRAPH_MAX_CTX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_GRAPH_CTX_TOKENS);
+    ctx.div_ceil(ratio.max(1)).max(1)
 }
 
 /// [`append_kv_mqa`] for the CUDA-graph decode path: writes at the device-held
@@ -6553,6 +6643,7 @@ mod tests {
             sliding_window: 4,
             raw_prefix: 0,
             row_q0: None,
+            graph_positions: None,
         };
 
         // Compressed KV (precomputed by `Attention::compressed_kv` in the real
@@ -6681,6 +6772,7 @@ mod tests {
             sliding_window: 1024,
             raw_prefix: 0,
             row_q0: None,
+            graph_positions: None,
         };
 
         // Correct: sequence 0 attends over its own 3 keys.
@@ -6825,6 +6917,7 @@ mod tests {
             sliding_window: 8,
             raw_prefix: 0,
             row_q0: None,
+            graph_positions: None,
         };
 
         // Compressed KV: T_c = t_k / ratio = 1 entry, shape [B, 1, T_c, D].
@@ -6912,6 +7005,7 @@ mod tests {
             sliding_window: 4,
             raw_prefix: 0,
             row_q0: None,
+            graph_positions: None,
         };
 
         // Standard layers must bypass the compressed branch entirely: even if
