@@ -231,7 +231,7 @@ jobs:
         # An apt hang here used to run to the 6-hour job ceiling: it burned a
         # full runner slot AND surfaced in the rollup as an ordinary red X,
         # indistinguishable from a real compile failure. That combination cost
-        # us twice — it manufactured false FAILUREs on #175-#180 and ate the
+        # us twice — it manufactured false red marks on #175-#180 and ate the
         # capacity needed to disprove them.
         #
         # Two guards, deliberately separate:
@@ -371,7 +371,7 @@ jobs:
         # An apt hang here used to run to the 6-hour job ceiling: it burned a
         # full runner slot AND surfaced in the rollup as an ordinary red X,
         # indistinguishable from a real compile failure. That combination cost
-        # us twice — it manufactured false FAILUREs on #175-#180 and ate the
+        # us twice — it manufactured false red marks on #175-#180 and ate the
         # capacity needed to disprove them.
         #
         # Two guards, deliberately separate:
