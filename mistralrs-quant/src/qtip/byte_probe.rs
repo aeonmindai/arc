@@ -184,6 +184,40 @@ mod tests {
         assert_eq!(3072 / distinct_upper_bound(3072, 256), 12);
     }
 
+    /// MEASURED on H200, V4-Flash qtip2b, 2026-08-20 (ARC_MOE_BYTE_PROBE=1):
+    /// one expert is 2 MiB and a step is 129 gather invocations (43 layers x 3).
+    /// Expert bytes per step scale LINEARLY with the batch on the GEMV arm and
+    /// are FLAT on the grouped arm. This is a characterization test: if the
+    /// dispatch is fixed, it will fail here first and the numbers get updated.
+    #[test]
+    fn v4_expert_bytes_per_step_scale_with_batch_on_the_gemv_arm() {
+        const PER_EXPERT: u64 = 2 * 1024 * 1024; // measured
+        const INV_PER_STEP: u64 = 129; // measured: 43 layers x 3 gathers
+        const TOP_K: usize = 6;
+        const EXPERTS: usize = 256;
+        let gemv_gib = |n_tokens: usize| -> f64 {
+            let pairs = (n_tokens * TOP_K) as u64;
+            (INV_PER_STEP * pairs * PER_EXPERT) as f64 / (1024.0 * 1024.0 * 1024.0)
+        };
+        let floor_gib = |n_tokens: usize| -> f64 {
+            let distinct = distinct_upper_bound(n_tokens * TOP_K, EXPERTS) as u64;
+            (INV_PER_STEP * distinct * PER_EXPERT) as f64 / (1024.0 * 1024.0 * 1024.0)
+        };
+        // GEMV: linear in batch, 512x the users reads 512x the expert bytes.
+        for (n, want) in [(1usize, 1.5f64), (8, 12.1), (64, 96.8), (512, 774.0)] {
+            assert!(
+                (gemv_gib(n) - want).abs() < 0.1,
+                "n_tokens={n}: {:.1} GiB/step, expected {want}",
+                gemv_gib(n)
+            );
+        }
+        // Amortised floor saturates at the whole expert working set.
+        assert!((floor_gib(256) - 64.5).abs() < 0.1);
+        assert!((floor_gib(512) - 64.5).abs() < 0.1);
+        // The redundancy the fleet pays at B=512.
+        assert!((gemv_gib(512) / floor_gib(512) - 12.0).abs() < 0.01);
+    }
+
     /// The grouped GEMM stages an expert once per TILE_M pairs, so at the same
     /// shape it must read strictly fewer bytes than the GEMV once the tiles
     /// fill — that is the whole claim the dispatch gate rests on.
