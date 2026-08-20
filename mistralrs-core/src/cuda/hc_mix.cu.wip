@@ -1,0 +1,295 @@
+// Parent system: ArcInfer / ArcMoE  (V4 mHC hyper-connection parameter block)
+//
+// Two fusions for `V4MHCHead::hc_pre` (models/dsv4_mhc.rs), which runs 86 times
+// per decode token (43 layers x {attn, ffn}).
+//
+// ---------------------------------------------------------------------------
+// WHY: measured, H200 / nsys --cuda-graph-trace=node, b=1 decode, qtip2b rung
+// ---------------------------------------------------------------------------
+// hc_pre is spelled as ~20 eager candle ops on tensors of at most 16 K elements.
+// Every one is a separate launch, and at these sizes a launch IS the cost: the
+// profile puts affine_f32 at 155,587 instances for 2.5% of GPU time, i.e.
+// ~1.03 us per launch of which almost none is arithmetic.
+//
+// Per forward pass the profile counts 653 bmul_f32 and 271 fast_sum_f32; the
+// mHC block accounts for 516 and 172 of those respectively (79% / 63%). That is
+// the shared cause behind three of the four "tail" kernels — bmul_f32,
+// fast_sum_f32 and the f32<->bf16 casts are not four defects, they are the
+// un-fused mHC block seen from four different angles.
+//
+// This file collapses 14 of those launches into 2:
+//
+//   hc_mix_params_f32   11 -> 1   mixes*rsqrt, 3x scale-mul, 3x base-add,
+//                                 2x sigmoid, 2x affine
+//   hc_y_combine        3 -> 1    pre*x broadcast-mul, sum over hc, narrow
+//
+//   = 1,032 fewer launches per token out of the 8,309 the profile measures.
+//
+// ---------------------------------------------------------------------------
+// BIT-IDENTITY CONTRACT
+// ---------------------------------------------------------------------------
+// Same rules as sinkhorn.cu, and this file is compiled by the same dedicated
+// no-fast-math / --fmad=false builder in build.rs. Each candle op it replaces,
+// transcribed from the candle-kernels source it actually runs:
+//
+//   bmul_f32       binary.cu:59   `x * y`                 -> __fmul_rn
+//   badd_f32       binary.cu      `x + y`                 -> __fadd_rn
+//   affine_f32     affine.cu:32   `x * mul + add`         -> fmaf  (candle
+//                                 builds with the default -fmad=true, so nvcc
+//                                 DOES contract this into a single fma.rn;
+//                                 reproducing it needs an explicit fmaf, and
+//                                 an explicit fmaf still emits fma.rn under
+//                                 our --fmad=false.)
+//   usigmoid_f32   unary.cu:64    `recipg(1 + expg(-x))`  -> see sigmoid_candle
+//                                 below. Note recipg(float) is written
+//                                 `return 1.0 / a;` with a DOUBLE literal, so
+//                                 candle actually computes a double-precision
+//                                 reciprocal narrowed back to float. Writing
+//                                 1.0f / a here would NOT match.
+//   fast_sum_f32   reduce.cu      identity-padded pairwise tree with
+//                                 block_dim = next_pow2(len). For the sum over
+//                                 hc = 4 that is (a0+a2)+(a1+a3), never the
+//                                 sequential order.
+//   cast_f32_bf16  cast.cu:175    `static_cast<__nv_bfloat16>(x)` -> RN.
+//
+// `ARC_HC_MIX_AB=1` recomputes the eager chain beside each fused kernel and
+// compares bit patterns; `ARC_HC_MIX_AB_POISON=1` perturbs one element by one
+// ULP at a known index as the negative control (a bare XOR/parity check can
+// cancel; a single-element 1-ULP perturbation cannot).
+//
+// KILL SWITCHES, independent so each fusion can be A/B'd alone. Both default
+// ON (house policy: fast-by-default with a kill switch, never opt-in):
+//   ARC_NO_HC_MIX_FUSE=1   restores the eager parameter chain
+//   ARC_NO_HC_Y_FUSE=1     restores the eager y tail
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <math.h>
+#include <stdlib.h>
+
+#if defined(__USE_FAST_MATH__)
+#error "hc_mix.cu must be compiled WITHOUT --use_fast_math: fast math rewrites expf to __expf and IEEE division to approximate reciprocals, breaking bit-identity with candle-kernels. See the no-fast-math builder in mistralrs-core/build.rs."
+#endif
+
+#define HC_MIX_MAX_HC 16
+
+namespace arc_hc_mix {
+
+// candle unary.cu sigmoid_fwd -> recipg(static_cast<T>(1) + expg(-x))
+// with, for float, recipg(a) = `1.0 / a` (double literal => double divide).
+__device__ __forceinline__ float sigmoid_candle(float x) {
+    const float d = __fadd_rn(1.0f, expf(-x));
+    return (float)(1.0 / (double)d);
+}
+
+template <int V, int P = 1, bool Done = (P >= V)> struct NextPow2 {
+    enum { value = NextPow2<V, P * 2>::value };
+};
+template <int V, int P> struct NextPow2<V, P, true> {
+    enum { value = P };
+};
+
+template <int S, int N> struct TreeSumLevel {
+    __device__ __forceinline__ static void run(float (&b)[N]) {
+#pragma unroll
+        for (int t = 0; t < S; ++t) b[t] = __fadd_rn(b[t], b[t + S]);
+        TreeSumLevel<S / 2, N>::run(b);
+    }
+};
+template <int N> struct TreeSumLevel<0, N> {
+    __device__ __forceinline__ static void run(float (&)[N]) {}
+};
+
+// candle fast_sum order for a reduced length of HC.
+template <int HC> __device__ __forceinline__ float tree_sum(const float (&v)[HC]) {
+    float b[NextPow2<HC>::value];
+#pragma unroll
+    for (int t = 0; t < (int)NextPow2<HC>::value; ++t) {
+        b[t] = (t < HC) ? __fadd_rn(0.0f, v[t]) : 0.0f;
+    }
+    TreeSumLevel<NextPow2<HC>::value / 2, NextPow2<HC>::value>::run(b);
+    return b[0];
+}
+
+// ---------------------------------------------------------------------------
+// Kernel A — the parameter block.
+//
+//   mixes    = mixes_raw * rsqrt                      [n, (2+hc)*hc]
+//   pre      = sigmoid(mixes[0:hc]      * s0 + b0) + eps
+//   post     = sigmoid(mixes[hc:2hc]    * s1 + b1) * 2
+//   comb_pre =         mixes[2hc:]      * s2 + b2       reshaped [n, hc, hc]
+//
+// One thread per (row, slot); slot picks which of the three blocks it lands in.
+// ---------------------------------------------------------------------------
+template <int HC>
+__global__ void hc_mix_params_kernel(
+    const float* __restrict__ mixes_raw,
+    const float* __restrict__ rsqrt,
+    const float* __restrict__ scale,   // [3]
+    const float* __restrict__ base,    // [(2+HC)*HC]
+    float* __restrict__ pre,           // [n, HC]
+    float* __restrict__ post,          // [n, HC]
+    float* __restrict__ comb,          // [n, HC, HC]
+    int n,
+    float eps
+) {
+    const int MIX = (2 + HC) * HC;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n * MIX) return;
+    const int row = idx / MIX;
+    const int slot = idx - row * MIX;
+
+    // bmul_f32: mixes = mixes_raw * rsqrt (rsqrt broadcast over the row)
+    const float m = __fmul_rn(mixes_raw[idx], rsqrt[row]);
+
+    if (slot < HC) {
+        // bmul_f32 then badd_f32 (two separate candle kernels => no contraction)
+        const float v = __fadd_rn(__fmul_rn(m, scale[0]), base[slot]);
+        // usigmoid_f32, then affine_f32(1.0, eps)
+        pre[row * HC + slot] = fmaf(sigmoid_candle(v), 1.0f, eps);
+    } else if (slot < 2 * HC) {
+        const float v = __fadd_rn(__fmul_rn(m, scale[1]), base[slot]);
+        // usigmoid_f32, then affine_f32(2.0, 0.0)
+        post[row * HC + (slot - HC)] = fmaf(sigmoid_candle(v), 2.0f, 0.0f);
+    } else {
+        comb[row * HC * HC + (slot - 2 * HC)] =
+            __fadd_rn(__fmul_rn(m, scale[2]), base[slot]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel B — the y tail.
+//
+//   y[n, h] = narrow( sum_i pre[n, i] * x[n, i, h] )
+//
+// Replaces broadcast_mul over [n, hc, h] + sum(1) + to_dtype, and with them the
+// 64 KB f32 intermediate that the eager spelling writes and immediately reads
+// back. One thread per (n, h).
+// ---------------------------------------------------------------------------
+template <int HC, typename OUT>
+__global__ void hc_y_combine_kernel(
+    const float* __restrict__ x,     // [n, HC, h] F32
+    const float* __restrict__ pre,   // [n, HC]    F32
+    OUT* __restrict__ y,             // [n, h]
+    int n,
+    int h
+) {
+    const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long long)n * h) return;
+    const int row = (int)(idx / h);
+    const int col = (int)(idx - (long long)row * h);
+
+    const float* xr = x + (size_t)row * HC * h + col;
+    const float* pr = pre + (size_t)row * HC;
+
+    float t[HC];
+#pragma unroll
+    for (int i = 0; i < HC; ++i) {
+        // bmul_f32: lhs is the broadcast `pre`, rhs is x
+        t[i] = __fmul_rn(pr[i], xr[(size_t)i * h]);
+    }
+    // fast_sum_f32 over dim 1 (length HC)
+    const float s = tree_sum<HC>(t);
+    y[idx] = (OUT)s;   // cast_f32_bf16 / identity for F32
+}
+
+inline bool env_on(const char* name) {
+    const char* v = getenv(name);
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+
+} // namespace arc_hc_mix
+
+extern "C" {
+
+// Returns 1 if the fused parameter kernel ran, 0 if the caller must fall back.
+// Never silently leaves the outputs untouched: an unsupported hc returns 0 so
+// the Rust side runs the eager chain instead of shipping uninitialised memory.
+int hc_mix_params_f32(
+    const void* mixes_raw,
+    const void* rsqrt,
+    const void* scale,
+    const void* base,
+    void* pre,
+    void* post,
+    void* comb,
+    int n,
+    int hc,
+    float eps,
+    long long stream
+) {
+#define HC_MIX_LAUNCH(HC_)                                                                    \
+    case HC_: {                                                                               \
+        const int mix = (2 + HC_) * HC_;                                                       \
+        const int total = n * mix;                                                             \
+        const int blk = 256;                                                                   \
+        arc_hc_mix::hc_mix_params_kernel<HC_>                                                  \
+            <<<(total + blk - 1) / blk, blk, 0, (cudaStream_t)stream>>>(                      \
+                (const float*)mixes_raw, (const float*)rsqrt, (const float*)scale,            \
+                (const float*)base, (float*)pre, (float*)post, (float*)comb, n, eps);         \
+        return 1;                                                                              \
+    }
+    switch (hc) {
+        HC_MIX_LAUNCH(1)
+        HC_MIX_LAUNCH(2)
+        HC_MIX_LAUNCH(3)
+        HC_MIX_LAUNCH(4)
+        HC_MIX_LAUNCH(5)
+        HC_MIX_LAUNCH(6)
+        HC_MIX_LAUNCH(7)
+        HC_MIX_LAUNCH(8)
+        HC_MIX_LAUNCH(16)
+    default:
+        return 0;
+    }
+#undef HC_MIX_LAUNCH
+}
+
+// dtype: 0 = F32 output, 1 = BF16 output. Returns 1 on launch, 0 to fall back.
+int hc_y_combine(
+    const void* x,
+    const void* pre,
+    void* y,
+    int n,
+    int hc,
+    int h,
+    int dtype,
+    long long stream
+) {
+    const long long total = (long long)n * h;
+    const int blk = 256;
+    const int grid = (int)((total + blk - 1) / blk);
+#define HC_Y_LAUNCH(HC_)                                                                       \
+    case HC_:                                                                                  \
+        if (dtype == 0) {                                                                      \
+            arc_hc_mix::hc_y_combine_kernel<HC_, float>                                        \
+                <<<grid, blk, 0, (cudaStream_t)stream>>>(                                      \
+                    (const float*)x, (const float*)pre, (float*)y, n, h);                      \
+        } else if (dtype == 1) {                                                               \
+            arc_hc_mix::hc_y_combine_kernel<HC_, __nv_bfloat16>                                \
+                <<<grid, blk, 0, (cudaStream_t)stream>>>(                                      \
+                    (const float*)x, (const float*)pre, (__nv_bfloat16*)y, n, h);              \
+        } else {                                                                               \
+            return 0;                                                                          \
+        }                                                                                      \
+        return 1;
+    switch (hc) {
+        HC_Y_LAUNCH(1)
+        HC_Y_LAUNCH(2)
+        HC_Y_LAUNCH(3)
+        HC_Y_LAUNCH(4)
+        HC_Y_LAUNCH(5)
+        HC_Y_LAUNCH(6)
+        HC_Y_LAUNCH(7)
+        HC_Y_LAUNCH(8)
+        HC_Y_LAUNCH(16)
+    default:
+        return 0;
+    }
+#undef HC_Y_LAUNCH
+}
+
+int hc_mix_fuse_enabled(void) { return arc_hc_mix::env_on("ARC_NO_HC_MIX_FUSE") ? 0 : 1; }
+int hc_y_fuse_enabled(void) { return arc_hc_mix::env_on("ARC_NO_HC_Y_FUSE") ? 0 : 1; }
+
+} // extern "C"
