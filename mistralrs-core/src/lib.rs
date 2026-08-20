@@ -556,6 +556,11 @@ impl MistralRsBuilder {
     }
 }
 
+/// How long `Drop` waits for an engine thread to finish its own teardown before
+/// giving up and detaching it. Generous because the thread may be mid-step on a
+/// long prefill; bounded because a hung engine must not wedge process exit.
+const ENGINE_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl Drop for MistralRs {
     fn drop(&mut self) {
         // Terminate all engines
@@ -563,6 +568,53 @@ impl Drop for MistralRs {
             for (_, engine) in engines.iter() {
                 // Use try_send instead of blocking_send to avoid runtime panics
                 let _ = engine.sender.try_send(Request::Terminate);
+            }
+        }
+
+        // 🔴 …and then WAIT for them. This used to be fire-and-forget.
+        //
+        // `Request::Terminate` is asynchronous: it only asks. Before this join,
+        // `main` returned while the engine thread was still alive and still
+        // releasing device memory, CUDA graph execs and stream objects. libc
+        // `exit()` then ran CUDA's `atexit` handler concurrently with that
+        // thread. Two threads tearing down the same CUDA state with no ordering
+        // is a textbook `corrupted double-linked list` / SIGSEGV, which is
+        // exactly how this binary died — *after* printing valid results, so the
+        // exit code libelled good runs. One chain already discarded a good,
+        // expensive measurement because its harness gated on `rc == 0`.
+        //
+        // The handle had no `.join()` anywhere in the workspace; its only uses
+        // were `is_finished()` polls. Joining here is what makes CUDA objects
+        // get freed on a live, context-bound thread before `exit()` runs.
+        //
+        // Bounded and poll-based rather than a bare `join()`: a wedged engine
+        // must not be able to hang process exit forever, and `JoinHandle` has no
+        // timed join in std.
+        let handles: Vec<(String, JoinHandle<()>)> = match self.engines.write() {
+            Ok(mut engines) => engines
+                .drain()
+                .map(|(id, instance)| (id, instance.engine_handler))
+                .collect(),
+            Err(_) => return,
+        };
+
+        let deadline = std::time::Instant::now() + ENGINE_JOIN_TIMEOUT;
+        for (id, handle) in handles {
+            while !handle.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            if handle.is_finished() {
+                if handle.join().is_err() {
+                    tracing::warn!("Engine thread for `{id}` panicked during shutdown.");
+                }
+            } else {
+                // Detach rather than block forever. Say so: a silent detach here
+                // would reintroduce exactly the race this join exists to close.
+                tracing::warn!(
+                    "Engine thread for `{id}` did not finish within {:?}; detaching. \
+                     CUDA teardown may race with process exit.",
+                    ENGINE_JOIN_TIMEOUT
+                );
             }
         }
     }
