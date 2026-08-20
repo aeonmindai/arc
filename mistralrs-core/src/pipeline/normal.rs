@@ -197,7 +197,7 @@ pub(crate) fn alloc_cache_capacity_bytes() -> Option<usize> {
 
 /// Pure half of [`alloc_cache_capacity_bytes`], so the parse is testable.
 ///
-/// `None` (unset, or unparseable) leaves candle's own default in force rather
+/// `None` (unset, or unparsable) leaves candle's own default in force rather
 /// than silently picking a different one — a typo in an ops script must not
 /// quietly hand back the unbounded allocator this change exists to remove.
 pub(crate) fn parse_alloc_cache_capacity(raw: Option<&str>) -> Option<usize> {
@@ -2820,7 +2820,7 @@ mod alloc_cache_capacity_tests {
     /// A typo is not a licence to run unbounded. `None` means "don't touch it",
     /// and candle's default is bounded, so a bad value degrades to bounded.
     #[test]
-    fn an_unparseable_value_does_not_become_unbounded() {
+    fn an_unparsable_value_does_not_become_unbounded() {
         for bad in ["", "  ", "lots", "1GiB", "-1", "1.5"] {
             assert_eq!(parse_alloc_cache_capacity(Some(bad)), None, "{bad:?}");
         }
