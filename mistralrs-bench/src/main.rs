@@ -271,6 +271,26 @@ fn assert_results_are_measurements(results: &[BenchResult]) {
         }
     }
 
+    // Which MoE kernel actually ran? The grouped-GEMM variant is chosen at
+    // RUNTIME from an env var, so the binary cannot tell you which one you
+    // measured. `grouped.rs` states the rule outright: "a harness that reports a
+    // per-variant timing MUST show this counter advancing on the variant it
+    // claims to have measured, and NOT advancing on the others, or the number
+    // describes some other kernel." Nothing in the tree printed it, so every
+    // previous variant comparison was unproven. Print it beside the results.
+    let counts = mistralrs_quant::grouped_launch_counts();
+    let total: u64 = counts.iter().sum();
+    eprintln!(
+        "MoE grouped-GEMM launches by variant: {counts:?} (selected variant = {}, total = {total})",
+        mistralrs_quant::grouped_variant()
+    );
+    if total == 0 {
+        eprintln!(
+            "  -> grouped GEMM never launched: this measurement is the per-pair \
+             gather GEMV (or the dequantize fallback), NOT the grouped kernel."
+        );
+    }
+
     if !failures.is_empty() {
         eprintln!("\n=== BENCHMARK PRODUCED NO VALID MEASUREMENT ===");
         for f in &failures {
