@@ -31,6 +31,19 @@ pub fn fused_enabled() -> bool {
     *ENABLED.get_or_init(|| !matches!(std::env::var("ARC_HC_FUSED").as_deref(), Ok("0")))
 }
 
+/// `ARC_HC_FUSE2=0` disables ONLY the second-wave fusions — the `hc_pre`
+/// weighted-average tail and the whole of `hc_post` — while leaving the
+/// router-region kernels (`hc_pre_fused`, `sqrt_softplus`) on.
+///
+/// Separate from `ARC_HC_FUSED` on purpose: with one switch per wave, the
+/// contribution of THIS change is measurable from a single binary, so a
+/// before/after cannot be contaminated by a rebuild.
+pub fn fuse2_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !matches!(std::env::var("ARC_HC_FUSE2").as_deref(), Ok("0")))
+}
+
 /// candle's `FastReduce` block size for a reduction of `len` elements
 /// (`cuda_backend/mod.rs`: `usize::min(1024, el_to_sum_per_block)
 /// .next_power_of_two()`). The fused kernel must use exactly this, because the
@@ -195,10 +208,178 @@ mod cuda_impl {
             logits.shape().clone(),
         )))
     }
+
+    /// Tag matching `HC_DTYPE_*` in hc_fused.cu. Only the dtypes whose cast
+    /// semantics have been transcribed are accepted; anything else returns an
+    /// error so the caller falls back to the eager chain rather than silently
+    /// running a kernel that rounds differently.
+    fn dtype_tag(d: DType) -> Result<i32> {
+        match d {
+            DType::F32 => Ok(0),
+            DType::BF16 => Ok(1),
+            other => candle::bail!("hc_fused: unsupported dtype {other:?}"),
+        }
+    }
+
+    /// Device pointer for a contiguous CUDA tensor of a supported dtype.
+    fn any_ptr(t: &Tensor, what: &str) -> Result<*const std::ffi::c_void> {
+        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+        if !t.is_contiguous() {
+            candle::bail!("hc_fused: {what} must be contiguous");
+        }
+        let (s, l) = t.storage_and_layout();
+        let cuda = match &*s {
+            candle::Storage::Cuda(c) => c,
+            _ => candle::bail!("hc_fused: {what} must be on CUDA"),
+        };
+        // The (ptr, guard) pair borrows the slice, so bind before returning.
+        let ptr = match t.dtype() {
+            DType::F32 => {
+                let sl = cuda.as_cuda_slice::<f32>()?;
+                sl.slice(l.start_offset()..).device_ptr(sl.stream()).0
+            }
+            DType::BF16 => {
+                let sl = cuda.as_cuda_slice::<half::bf16>()?;
+                sl.slice(l.start_offset()..).device_ptr(sl.stream()).0
+            }
+            other => candle::bail!("hc_fused: {what} has unsupported dtype {other:?}"),
+        };
+        Ok(ptr as *const std::ffi::c_void)
+    }
+
+    /// Allocate an output buffer of `dtype` and wrap it as a `Tensor`.
+    fn alloc_out(
+        dev: &candle_core::CudaDevice,
+        dtype: DType,
+        elems: usize,
+        shape: impl Into<candle_core::Shape>,
+        run: impl FnOnce(*mut std::ffi::c_void) -> i32,
+    ) -> Result<Tensor> {
+        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+        match dtype {
+            DType::F32 => {
+                let buf = unsafe { dev.alloc::<f32>(elems) }?;
+                let rc = run(buf.device_ptr(buf.stream()).0 as *mut std::ffi::c_void);
+                if rc != 0 {
+                    candle::bail!("hc_fused: kernel dispatch refused (rc={rc})");
+                }
+                let st = candle::CudaStorage::wrap_cuda_slice(buf, dev.clone());
+                Ok(Tensor::from((candle::Storage::Cuda(st), shape.into())))
+            }
+            DType::BF16 => {
+                let buf = unsafe { dev.alloc::<half::bf16>(elems) }?;
+                let rc = run(buf.device_ptr(buf.stream()).0 as *mut std::ffi::c_void);
+                if rc != 0 {
+                    candle::bail!("hc_fused: kernel dispatch refused (rc={rc})");
+                }
+                let st = candle::CudaStorage::wrap_cuda_slice(buf, dev.clone());
+                Ok(Tensor::from((candle::Storage::Cuda(st), shape.into())))
+            }
+            other => candle::bail!("hc_fused: unsupported output dtype {other:?}"),
+        }
+    }
+
+    /// Fused `hc_pre` tail: `y = sum_i pre[i] * x_f32[i, :]`, narrowed to
+    /// `out_dtype`. Replaces `broadcast_mul + sum(1) + to_dtype` (3 launches).
+    ///
+    /// - `x_f32` `[n, hc, h]` F32 contiguous (the promoted residual stack)
+    /// - `pre`   `[n, hc]`    F32 contiguous
+    pub fn hc_y_combine_cuda(x_f32: &Tensor, pre: &Tensor, out_dtype: DType) -> Result<Tensor> {
+        let (n, hc, h) = x_f32.dims3()?;
+        let (pn, phc) = pre.dims2()?;
+        if pn != n || phc != hc {
+            candle::bail!("hc_fused: pre is [{pn}, {phc}] but x_f32 is [{n}, {hc}, {h}]");
+        }
+        if n == 0 || h == 0 {
+            candle::bail!("hc_fused: empty y-combine");
+        }
+        let tag = dtype_tag(out_dtype)?;
+        let x_ptr = f32_ptr(x_f32, "x_f32")?;
+        let pre_ptr = f32_ptr(pre, "pre")?;
+        let dev = x_f32.device().as_cuda_device()?;
+        let stream = dev.cuda_stream().cu_stream() as i64;
+        let total = (n * h) as i64;
+
+        #[allow(clippy::cast_possible_truncation)]
+        alloc_out(&dev, out_dtype, n * h, (n, h), |out| unsafe {
+            crate::cuda::ffi::hc_y_combine(
+                x_ptr, pre_ptr, out, hc as i32, h as i32, total, tag, stream,
+            )
+        })
+    }
+
+    /// Fused `hc_post`: the whole 6-launch re-expansion in one launch.
+    ///
+    /// - `x`        `[n, h]`      model dtype
+    /// - `residual` `[n, hc, h]`  model dtype
+    /// - `post`     `[n, hc]`     F32
+    /// - `comb`     `[n, hc, hc]` F32
+    pub fn hc_post_fused_cuda(
+        x: &Tensor,
+        residual: &Tensor,
+        post: &Tensor,
+        comb: &Tensor,
+    ) -> Result<Tensor> {
+        let (n, h) = x.dims2()?;
+        let (rn, hc, rh) = residual.dims3()?;
+        if rn != n || rh != h {
+            candle::bail!("hc_fused: residual [{rn}, {hc}, {rh}] vs x [{n}, {h}]");
+        }
+        if post.dims2()? != (n, hc) {
+            candle::bail!("hc_fused: post must be [{n}, {hc}], got {:?}", post.dims());
+        }
+        if comb.dims3()? != (n, hc, hc) {
+            candle::bail!("hc_fused: comb must be [{n}, {hc}, {hc}], got {:?}", comb.dims());
+        }
+        if x.dtype() != residual.dtype() {
+            candle::bail!(
+                "hc_fused: x is {:?} but residual is {:?}",
+                x.dtype(),
+                residual.dtype()
+            );
+        }
+        if n == 0 || h == 0 {
+            candle::bail!("hc_fused: empty hc_post");
+        }
+        let tag = dtype_tag(x.dtype())?;
+        let x_ptr = any_ptr(x, "x")?;
+        let res_ptr = any_ptr(residual, "residual")?;
+        let post_ptr = f32_ptr(post, "post")?;
+        let comb_ptr = f32_ptr(comb, "comb")?;
+        let dev = x.device().as_cuda_device()?;
+        let stream = dev.cuda_stream().cu_stream() as i64;
+        let total = (n * hc * h) as i64;
+
+        #[allow(clippy::cast_possible_truncation)]
+        alloc_out(&dev, x.dtype(), n * hc * h, (n, hc, h), |out| unsafe {
+            crate::cuda::ffi::hc_post_fused(
+                x_ptr, res_ptr, post_ptr, comb_ptr, out, hc as i32, h as i32, total, tag, stream,
+            )
+        })
+    }
 }
 
 #[cfg(feature = "cuda")]
-pub use cuda_impl::{hc_pre_fused_cuda, sqrt_softplus_cuda};
+pub use cuda_impl::{hc_post_fused_cuda, hc_pre_fused_cuda, hc_y_combine_cuda, sqrt_softplus_cuda};
+
+#[cfg(not(feature = "cuda"))]
+pub fn hc_y_combine_cuda(
+    _x_f32: &candle_core::Tensor,
+    _pre: &candle_core::Tensor,
+    _out_dtype: candle_core::DType,
+) -> candle_core::Result<candle_core::Tensor> {
+    candle_core::bail!("hc_y_combine_cuda requires the cuda feature")
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn hc_post_fused_cuda(
+    _x: &candle_core::Tensor,
+    _residual: &candle_core::Tensor,
+    _post: &candle_core::Tensor,
+    _comb: &candle_core::Tensor,
+) -> candle_core::Result<candle_core::Tensor> {
+    candle_core::bail!("hc_post_fused_cuda requires the cuda feature")
+}
 
 // Non-CUDA stubs so call sites need no `cfg`. They are never reached: every
 // caller gates on [`usable`], which is false without a CUDA device.
@@ -237,6 +418,139 @@ pub fn usable(t: &candle_core::Tensor) -> bool {
         && t.device().is_cuda()
         && t.dtype() == candle_core::DType::F32
         && fused_enabled()
+}
+
+/// Same gate as [`usable`] but for the model-dtype tensors (`hc_post`, the
+/// `hc_pre` tail), which are BF16 rather than F32.
+pub fn usable_model_dtype(t: &candle_core::Tensor) -> bool {
+    cfg!(feature = "cuda")
+        && t.device().is_cuda()
+        && matches!(t.dtype(), candle_core::DType::F32 | candle_core::DType::BF16)
+        && fused_enabled()
+}
+
+// ---------------------------------------------------------------------------
+// The on-GPU bitwise A/B — `ARC_HC_AB=1`
+// ---------------------------------------------------------------------------
+//
+// hc_fused.cu's header has cited "the final proof is the on-GPU A/B:
+// `ARC_HC_AB=1`" since the file was written. That A/B DID NOT EXIST — the
+// string appeared nowhere in the tree except that sentence. This is it.
+//
+// It recomputes the eager candle chain beside every fused kernel and compares
+// the two BIT FOR BIT (not by tolerance: -0.0 vs 0.0 and NaN payloads are
+// differences, and a f32 subtraction would hide both).
+//
+// `ARC_HC_AB_POISON=1` perturbs the fused tensor by exactly one ULP before the
+// comparison, so the check MUST go red. A guard that has never been observed
+// failing is not evidence of anything — this codebase has shipped fifteen that
+// passed on broken code, including the `#if defined(__USE_FAST_MATH__)` in
+// hc_fused.cu, which nvcc can never define (measured; see that file's header).
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static AB_CMPS: AtomicU64 = AtomicU64::new(0);
+static AB_BAD_TENSORS: AtomicU64 = AtomicU64::new(0);
+static AB_BAD_ELEMS: AtomicU64 = AtomicU64::new(0);
+
+pub fn ab_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("ARC_HC_AB").as_deref(), Ok("1")))
+}
+
+fn ab_poison() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("ARC_HC_AB_POISON").as_deref(), Ok("1")))
+}
+
+/// Raw bit patterns of a tensor, widened to u32 so BF16 and F32 share a path.
+fn bits_of(t: &candle_core::Tensor) -> candle_core::Result<Vec<u32>> {
+    let t = t.flatten_all()?.contiguous()?;
+    Ok(match t.dtype() {
+        candle_core::DType::F32 => t.to_vec1::<f32>()?.iter().map(|v| v.to_bits()).collect(),
+        candle_core::DType::BF16 => t
+            .to_vec1::<half::bf16>()?
+            .iter()
+            .map(|v| u32::from(v.to_bits()))
+            .collect(),
+        other => candle_core::bail!("hc_fused ab_check: unsupported dtype {other:?}"),
+    })
+}
+
+/// Compare a fused result against the eager one, bit for bit.
+///
+/// Returns the number of mismatching elements. Logs the first mismatch loudly
+/// and emits a periodic running total — the periodic line is deliberate: a
+/// silent A/B is indistinguishable from an A/B that never ran, which is the
+/// single most common way a green result in this repo has been wrong.
+pub fn ab_check(
+    site: &str,
+    fused: &candle_core::Tensor,
+    eager: &candle_core::Tensor,
+) -> candle_core::Result<u64> {
+    if fused.dims() != eager.dims() {
+        tracing::error!(
+            "HC_AB[{site}] SHAPE MISMATCH fused={:?} eager={:?}",
+            fused.dims(),
+            eager.dims()
+        );
+        AB_BAD_TENSORS.fetch_add(1, Ordering::Relaxed);
+        return Ok(u64::MAX);
+    }
+    let mut fb = bits_of(fused)?;
+    let eb = bits_of(eager)?;
+
+    if ab_poison() && !fb.is_empty() {
+        // Exactly one ULP up on the first element. If the comparison below
+        // still reports zero mismatches, the comparison is broken, not the
+        // kernel.
+        fb[0] = fb[0].wrapping_add(1);
+    }
+
+    let mut bad = 0u64;
+    let mut first: Option<(usize, u32, u32)> = None;
+    for (i, (a, b)) in fb.iter().zip(eb.iter()).enumerate() {
+        if a != b {
+            bad += 1;
+            if first.is_none() {
+                first = Some((i, *a, *b));
+            }
+        }
+    }
+
+    let n = AB_CMPS.fetch_add(1, Ordering::Relaxed) + 1;
+    if bad > 0 {
+        AB_BAD_TENSORS.fetch_add(1, Ordering::Relaxed);
+        AB_BAD_ELEMS.fetch_add(bad, Ordering::Relaxed);
+        if let Some((i, a, b)) = first {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::error!(
+                    "HC_AB[{site}] BITWISE MISMATCH: {bad}/{} elements differ; \
+                     first at [{i}] fused=0x{a:08x} eager=0x{b:08x}",
+                    fb.len()
+                );
+            });
+        }
+    }
+    if n % 1000 == 0 {
+        tracing::info!(
+            "HC_AB: {n} comparisons, {} tensors with mismatches, {} bad elements \
+             (poison={})",
+            AB_BAD_TENSORS.load(Ordering::Relaxed),
+            AB_BAD_ELEMS.load(Ordering::Relaxed),
+            ab_poison()
+        );
+    }
+    Ok(bad)
+}
+
+/// Running totals, for an end-of-run assertion.
+pub fn ab_totals() -> (u64, u64, u64) {
+    (
+        AB_CMPS.load(Ordering::Relaxed),
+        AB_BAD_TENSORS.load(Ordering::Relaxed),
+        AB_BAD_ELEMS.load(Ordering::Relaxed),
+    )
 }
 
 /// Scalar f32 replicas that pin the fused kernels' op ORDER and ROUNDING to
@@ -428,6 +742,151 @@ pub(crate) mod reference {
             })
             .collect()
     }
+
+    /// The **candle op chain** of the `hc_pre` tail:
+    /// `pre.unsqueeze(-1).broadcast_mul(x_f32).sum(1).to_dtype(BF16)`.
+    ///
+    /// `x_f32` is `[hc][h]` row-major for one row `n`. Returns the BF16 bit
+    /// patterns, because the narrowing is part of what has to match.
+    /// F32 result, BEFORE the narrowing cast. The order assertions have to be
+    /// made here: BF16 keeps 8 mantissa bits, so narrowing discards almost
+    /// every reassociation difference and a bf16-only comparison would pass on
+    /// a kernel summing in the wrong order. (It did — the vacuity test below
+    /// caught exactly that and this split is the fix.)
+    pub(crate) fn hc_y_combine_candle_replay_f32(
+        x_f32: &[f32],
+        pre: &[f32],
+        hc: usize,
+        h: usize,
+    ) -> Vec<f32> {
+        (0..h)
+            .map(|col| {
+                // broadcast_mul materialises [hc, h] first...
+                let prods: Vec<f32> = (0..hc).map(|t| pre[t] * x_f32[t * h + col]).collect();
+                // ...then `sum(1)` reduces the hc axis with block_dim =
+                // next_power_of_two(hc), which is candle_fast_sum's tree.
+                candle_fast_sum(&prods, super::candle_reduce_block_dim(hc))
+            })
+            .collect()
+    }
+
+    /// The **fused kernel** `hc_y_combine_kernel`, transcribed, before narrowing.
+    pub(crate) fn hc_y_combine_fused_replay_f32(
+        x_f32: &[f32],
+        pre: &[f32],
+        hc: usize,
+        h: usize,
+    ) -> Vec<f32> {
+        (0..h)
+            .map(|col| {
+                let mut acc = vec![0.0f32; hc];
+                for (t, a) in acc.iter_mut().enumerate() {
+                    // the `shr[tid] = 0` start is not a no-op for -0.0f
+                    *a = 0.0f32 + pre[t] * x_f32[t * h + col];
+                }
+                let mut s = hc / 2;
+                while s > 0 {
+                    for t in 0..s {
+                        acc[t] += acc[t + s];
+                    }
+                    s /= 2;
+                }
+                acc[0]
+            })
+            .collect()
+    }
+
+    /// Sequential `a0+a1+a2+a3` — what the kernel must NOT do. Exists only so
+    /// the vacuity test can show the comparison can tell the orders apart.
+    pub(crate) fn hc_y_combine_sequential_replay_f32(
+        x_f32: &[f32],
+        pre: &[f32],
+        hc: usize,
+        h: usize,
+    ) -> Vec<f32> {
+        (0..h)
+            .map(|col| {
+                let mut s = 0.0f32;
+                for t in 0..hc {
+                    s += pre[t] * x_f32[t * h + col];
+                }
+                s
+            })
+            .collect()
+    }
+
+    pub(crate) fn hc_y_combine_candle_replay(
+        x_f32: &[f32],
+        pre: &[f32],
+        hc: usize,
+        h: usize,
+    ) -> Vec<u16> {
+        hc_y_combine_candle_replay_f32(x_f32, pre, hc, h)
+            .into_iter()
+            .map(|s| half::bf16::from_f32(s).to_bits())
+            .collect()
+    }
+
+    /// The **fused kernel** `hc_y_combine_kernel`, transcribed.
+    pub(crate) fn hc_y_combine_fused_replay(
+        x_f32: &[f32],
+        pre: &[f32],
+        hc: usize,
+        h: usize,
+    ) -> Vec<u16> {
+        hc_y_combine_fused_replay_f32(x_f32, pre, hc, h)
+            .into_iter()
+            .map(|s| half::bf16::from_f32(s).to_bits())
+            .collect()
+    }
+
+    /// The **candle op chain** of `hc_post`, for one row `n`.
+    /// `x` is `[h]`, `residual` is `[hc][h]`, both already widened to f32.
+    pub(crate) fn hc_post_candle_replay(
+        x: &[f32],
+        residual: &[f32],
+        post: &[f32],
+        comb: &[f32],
+        hc: usize,
+        h: usize,
+    ) -> Vec<u16> {
+        let mut out = Vec::with_capacity(hc * h);
+        for k in 0..hc {
+            for (col, &xv) in x.iter().enumerate().take(h) {
+                let term1 = post[k] * xv;
+                // term2 = sum_j comb[j][k] * residual[j][col] — the K=hc GEMM.
+                let mut term2 = 0.0f32;
+                for j in 0..hc {
+                    term2 = comb[j * hc + k].mul_add(residual[j * h + col], term2);
+                }
+                out.push(half::bf16::from_f32(term1 + term2).to_bits());
+            }
+        }
+        out
+    }
+
+    /// The **fused kernel** `hc_post_fused_kernel`, transcribed.
+    pub(crate) fn hc_post_fused_replay(
+        x: &[f32],
+        residual: &[f32],
+        post: &[f32],
+        comb: &[f32],
+        hc: usize,
+        h: usize,
+    ) -> Vec<u16> {
+        let mut out = vec![0u16; hc * h];
+        for k in 0..hc {
+            for col in 0..h {
+                let t1 = post[k] * x[col];
+                let mut acc = 0.0f32;
+                for j in 0..hc {
+                    acc = comb[j * hc + k].mul_add(residual[j * h + col], acc);
+                }
+                out[k * h + col] = half::bf16::from_f32(t1 + acc).to_bits();
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -444,19 +903,35 @@ mod tests {
         }
     }
 
-    /// Source-level tripwires, mirroring `sinkhorn::tests`: the IEEE
-    /// intrinsics and the fast-math `#error` guard must stay in hc_fused.cu,
-    /// fast-math approximations must stay out, and build.rs must keep the file
-    /// out of the `--use_fast_math` glob and in the `--fmad=false` builder.
-    /// Getting this wiring wrong is silent — the kernel still runs, it just
-    /// stops being bit-identical — so the `#error` guard is the hard stop and
-    /// these string checks catch it on CPU CI too.
+    /// Source-level tripwires, mirroring `sinkhorn::tests`: the IEEE intrinsics
+    /// must stay in hc_fused.cu, fast-math approximations must stay out, and
+    /// build.rs must keep the file out of the `--use_fast_math` glob and in the
+    /// `--fmad=false` builder. Getting this wiring wrong is silent — the kernel
+    /// still runs, it just stops being bit-identical.
+    ///
+    /// NOTE ON WHAT ACTUALLY PROTECTS THIS FILE. The `#if
+    /// defined(__USE_FAST_MATH__)` `#error` in hc_fused.cu (and in sinkhorn.cu)
+    /// is DECORATIVE: nvcc 12.4 defines neither `__USE_FAST_MATH__` nor
+    /// `__FAST_MATH__` in either the host or the device pass, so it cannot fire.
+    /// Measured, not assumed —
+    ///     nvcc --use_fast_math -E -dM x.cu | grep -i fast   -> no output
+    ///     nvcc --use_fast_math -arch=sm_90 -c guard.cu      -> compiles clean
+    /// while `--use_fast_math` does reach the device pass (a float divide drops
+    /// from 3 MUFU/RCP instructions to 1). The real protection is the build.rs
+    /// wiring asserted below, plus the runtime `ARC_HC_AB=1` bitwise A/B, which
+    /// catches a mis-compiled build on the first token. The presence assertion
+    /// is kept only so the comment above the guard travels with it.
     #[test]
     fn kernel_source_and_build_wiring_guards() {
         let cu = include_str!("hc_fused.cu");
         assert!(
             cu.contains("#if defined(__USE_FAST_MATH__)") && cu.contains("#error"),
-            "hc_fused.cu lost its fast-math #error guard"
+            "hc_fused.cu lost its (decorative) fast-math #error guard"
+        );
+        assert!(
+            cu.contains("THE COMPILE-TIME FAST-MATH GUARD BELOW IS DEAD"),
+            "hc_fused.cu lost the note recording that the #error guard cannot fire; \
+             without it the next reader will trust a guard that has never been able to fail"
         );
         for required in ["__fadd_rn", "__fmul_rn", "candle_recip", "candle_sigmoid"] {
             assert!(cu.contains(required), "hc_fused.cu lost required token {required}");
@@ -634,5 +1109,100 @@ mod tests {
                  carrying that bug"
             );
         }
+    }
+
+    /// Inputs shaped like V4 decode: hc_mult = 4, one row, a slice of hidden.
+    fn y_combine_inputs(h: usize) -> (Vec<f32>, Vec<f32>) {
+        let hc = 4;
+        let mut r = Lcg(0x5eed_1234);
+        let x: Vec<f32> = (0..hc * h).map(|_| r.next_f32(-4.0, 4.0)).collect();
+        let pre: Vec<f32> = (0..hc).map(|_| r.next_f32(0.0, 1.0)).collect();
+        (x, pre)
+    }
+
+    #[test]
+    fn hc_y_combine_fused_is_bit_identical_to_candle_chain() {
+        let (hc, h) = (4usize, 257usize);
+        let (x, pre) = y_combine_inputs(h);
+        // Assert at F32, before the narrowing: BF16 keeps 8 mantissa bits and
+        // would hide an order difference (see the vacuity test below).
+        assert_eq!(
+            hc_y_combine_candle_replay_f32(&x, &pre, hc, h),
+            hc_y_combine_fused_replay_f32(&x, &pre, hc, h),
+            "fused y-combine diverged from the candle sum(1) chain in F32"
+        );
+        // ...and again after it, which is what the kernel actually stores.
+        assert_eq!(
+            hc_y_combine_candle_replay(&x, &pre, hc, h),
+            hc_y_combine_fused_replay(&x, &pre, hc, h),
+            "fused y-combine diverged after the BF16 narrowing"
+        );
+    }
+
+    /// The pairwise tree is the whole point: candle's `sum(1)` over hc = 4 gives
+    /// `(a0+a2)+(a1+a3)`, not `((a0+a1)+a2)+a3`.
+    ///
+    /// This test previously compared the two orders AFTER narrowing to BF16 and
+    /// FAILED — not because the kernel was wrong, but because 8 mantissa bits
+    /// swallow essentially every reassociation difference, which meant the
+    /// bit-identity test above would have passed on a kernel summing in the
+    /// wrong order. That is the failure this vacuity check exists to expose, and
+    /// the fix is to make the claim where it is observable: at F32.
+    #[test]
+    fn hc_y_combine_tree_order_is_not_vacuous() {
+        let (hc, h) = (4usize, 257usize);
+        let (x, pre) = y_combine_inputs(h);
+        let tree = hc_y_combine_candle_replay_f32(&x, &pre, hc, h);
+        let sequential = hc_y_combine_sequential_replay_f32(&x, &pre, hc, h);
+        let differing = tree
+            .iter()
+            .zip(sequential.iter())
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert!(
+            differing > 0,
+            "sequential summation produced bit-identical F32 output on all {h} elements, so \
+             the tree-order assertion proves nothing on this data"
+        );
+    }
+
+    fn post_inputs(h: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        let hc = 4;
+        let mut r = Lcg(0xabcd_ef01);
+        let x: Vec<f32> = (0..h).map(|_| r.next_f32(-3.0, 3.0)).collect();
+        let residual: Vec<f32> = (0..hc * h).map(|_| r.next_f32(-3.0, 3.0)).collect();
+        let post: Vec<f32> = (0..hc).map(|_| r.next_f32(0.0, 2.0)).collect();
+        let comb: Vec<f32> = (0..hc * hc).map(|_| r.next_f32(0.0, 1.0)).collect();
+        (x, residual, post, comb)
+    }
+
+    #[test]
+    fn hc_post_fused_is_bit_identical_to_candle_chain() {
+        let (hc, h) = (4usize, 193usize);
+        let (x, residual, post, comb) = post_inputs(h);
+        let a = hc_post_candle_replay(&x, &residual, &post, &comb, hc, h);
+        let b = hc_post_fused_replay(&x, &residual, &post, &comb, hc, h);
+        assert_eq!(a, b, "fused hc_post diverged from the candle term1+term2 chain");
+    }
+
+    /// `term2` transposes `comb` before the matmul. Reading `comb[k][j]` instead
+    /// of `comb[j][k]` is the single easiest way to get this kernel wrong while
+    /// keeping every shape valid, so prove the comparison would catch it.
+    #[test]
+    fn hc_post_guard_catches_a_transposed_comb() {
+        let (hc, h) = (4usize, 193usize);
+        let (x, residual, post, comb) = post_inputs(h);
+        let reference = hc_post_candle_replay(&x, &residual, &post, &comb, hc, h);
+        let mut transposed = vec![0.0f32; hc * hc];
+        for j in 0..hc {
+            for k in 0..hc {
+                transposed[j * hc + k] = comb[k * hc + j];
+            }
+        }
+        let mutated = hc_post_fused_replay(&x, &residual, &post, &transposed, hc, h);
+        assert!(
+            reference.iter().zip(mutated.iter()).any(|(a, b)| a != b),
+            "a transposed comb produced bit-identical output, so the hc_post assertion is vacuous"
+        );
     }
 }

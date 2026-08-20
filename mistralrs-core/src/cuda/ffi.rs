@@ -399,4 +399,32 @@ extern "C" {
         numel: i64,
         stream: i64,
     );
+    /// `y = sum_i pre[i] * x_f32[i, :]` narrowed to the model dtype.
+    /// Returns 0 on launch, non-zero if `(hc, dtype)` has no specialisation —
+    /// the caller must then use the eager chain.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn hc_y_combine(
+        x_f32: *const c_void,
+        pre: *const c_void,
+        y: *mut c_void,
+        hc: i32,
+        h: i32,
+        total: i64,
+        dtype: i32,
+        stream: i64,
+    ) -> i32;
+    /// The whole `hc_post` re-expansion. Same return contract as above.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn hc_post_fused(
+        x: *const c_void,
+        residual: *const c_void,
+        post: *const c_void,
+        comb: *const c_void,
+        out: *mut c_void,
+        hc: i32,
+        h: i32,
+        total: i64,
+        dtype: i32,
+        stream: i64,
+    ) -> i32;
 }
