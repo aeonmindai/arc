@@ -1884,6 +1884,15 @@ impl QuantMethod for Qtip2bLayer {
                         self.num_experts_count(),
                     );
                     let total_pairs = n_tokens * n_experts_per_tok;
+                    // Same accounting on the amortising arm, so the two paths
+                    // are comparable in the same units (ARC_MOE_BYTE_PROBE=1).
+                    super::byte_probe::record_grouped(
+                        total_pairs,
+                        self.rows_per_expert()?,
+                        self.blocks.dim(2)?,
+                        self.num_experts_count(),
+                        super::grouped::GROUPED_TILE_M,
+                    );
                     let out_flat = self.gather_forward_batched(
                         &a.reshape((total_pairs, cols))?,
                         &indices.reshape((total_pairs,))?,

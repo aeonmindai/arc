@@ -61,6 +61,10 @@ mod bake_memory_tests;
 #[cfg(test)]
 mod bake_quality_tests;
 pub mod bitshift;
+// Every call site is behind `#[cfg(feature = "cuda")]`, so a CPU-only build
+// sees the whole probe as dead. Same convention as `gather_policy`.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub mod byte_probe;
 #[cfg(test)]
 mod codebook_tests;
 #[cfg(feature = "cuda")]
