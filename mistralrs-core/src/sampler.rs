@@ -343,13 +343,58 @@ const GPU_RADIX_TOPK_SIZES: &[usize] = &[64, 128, 256, 512, 1024];
 
 /// Find the index of the maximum element in a slice. O(n) scan.
 #[inline]
+/// Index of the maximum value, resolving ties to the **lowest** index.
+///
+/// # Why this is not `max_by`
+///
+/// It was. `Iterator::max_by` is documented to return the **last** element when
+/// several compare equal, so on tied logits this returned the highest-indexed
+/// token — the opposite of the argmax convention every other implementation in
+/// the stack and outside it (numpy, PyTorch) follows, which is first-wins.
+///
+/// That is not academic here, because Arc has three greedy implementations and
+/// before this fix all three disagreed on ties:
+///
+/// | implementation | tie goes to |
+/// |---|---|
+/// | this, via `max_by` | **highest** index |
+/// | candle's `fast_argmax` (`candle-kernels/src/reduce.cu:475-521`) | **whichever thread id is lower**, which is not an index order at all |
+/// | `arc_greedy_kernel` (`arc-cuda-graph/src/cuda/sampling_kernel.cu:185-188`) | **lowest** index |
+///
+/// candle's is the subtle one: its per-thread scan keeps the first max within a
+/// thread's own stride, but the tree reduction compares values only and keeps
+/// the lower thread id on a tie. Thread `t` scans indices `t, t+B, t+2B, ...`,
+/// so a tie between thread 0 (holding index 128) and thread 5 (holding index 5)
+/// resolves to **128**. Deterministic, but arbitrary.
+///
+/// Ties are not rare at this vocabulary size. V4's logits arrive as BF16 —
+/// 8 mantissa bits, ~256 distinct values per binade — and the F32 cast in
+/// `sampling.rs` is exact, so every tie in the model's output survives into
+/// this function across 129,280 candidates.
+///
+/// Fixing the tie rule here is the half that can be proved without a GPU. It
+/// makes the CPU path agree with `arc_greedy_kernel`; candle's CUDA argmax
+/// still disagrees with both, which is a reason to move the GPU greedy path
+/// onto `arc_greedy_kernel` rather than a reason to leave this alone.
+///
+/// NaN is skipped rather than compared. A naive strict-`>` scan seeded with the
+/// first element would let a NaN at index 0 poison every later comparison
+/// (`v > NaN` is false for all `v`) and return 0 regardless of the real
+/// maximum. Empty and all-NaN inputs yield 0, the same fallback as before.
 fn argmax_f32(values: &[f32]) -> u32 {
-    values
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i as u32)
-        .unwrap_or(0)
+    let mut best_idx = 0u32;
+    let mut best: Option<f32> = None;
+    for (i, &v) in values.iter().enumerate() {
+        if v.is_nan() {
+            continue;
+        }
+        // Strictly greater, so the first of any tied run wins.
+        if best.is_none_or(|b| v > b) {
+            best = Some(v);
+            best_idx = i as u32;
+        }
+    }
+    best_idx
 }
 
 impl Sampler {
@@ -2823,5 +2868,67 @@ mod topk_parity_tests {
                 "an active repetition penalty must still suppress the seen token"
             );
         }
+    }
+}
+
+/// The greedy tie-break contract.
+///
+/// Arc has three greedy implementations and they did not agree with each other
+/// on tied logits. These tests pin the one that can be proved on any host; the
+/// divergence of the other two is documented on [`argmax_f32`].
+#[cfg(test)]
+mod argmax_tiebreak_tests {
+    use super::argmax_f32;
+
+    /// THE FIX. `Iterator::max_by` returns the **last** maximum on ties, so
+    /// this returned index 3 where the argmax convention — numpy, PyTorch, and
+    /// `arc_greedy_kernel` — returns 1.
+    #[test]
+    fn ties_resolve_to_the_lowest_index() {
+        assert_eq!(argmax_f32(&[1.0, 5.0, 3.0, 5.0, 2.0]), 1);
+    }
+
+    /// A run of identical maxima, which is what a BF16 logit vector actually
+    /// produces: one winner, chosen by position and nothing else.
+    #[test]
+    fn a_run_of_equal_maxima_picks_the_first() {
+        assert_eq!(argmax_f32(&[0.0, 9.0, 9.0, 9.0, 9.0]), 1);
+        assert_eq!(argmax_f32(&[9.0, 9.0, 9.0]), 0);
+    }
+
+    /// The ordinary case must not have moved.
+    #[test]
+    fn a_unique_maximum_is_unaffected() {
+        assert_eq!(argmax_f32(&[1.0, 2.0, 7.0, 3.0]), 2);
+        assert_eq!(argmax_f32(&[7.0, 2.0, 1.0]), 0);
+        assert_eq!(argmax_f32(&[1.0, 2.0, 7.0]), 2);
+    }
+
+    /// Every logit masked out. A fully `-inf` row is what a constraint mask
+    /// produces when it forbids everything, and it must still name a token
+    /// rather than depend on scan order.
+    #[test]
+    fn all_negative_infinity_returns_the_first_index() {
+        assert_eq!(
+            argmax_f32(&[f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY]),
+            0
+        );
+    }
+
+    /// A NaN must not win, and — the part a strict-`>` scan gets wrong when it
+    /// is seeded with element 0 — a NaN in front must not suppress the real
+    /// maximum behind it.
+    #[test]
+    fn nan_never_wins_and_never_poisons_the_scan() {
+        assert_eq!(argmax_f32(&[f32::NAN, 5.0, 2.0]), 1);
+        assert_eq!(argmax_f32(&[1.0, f32::NAN, 8.0]), 2);
+        assert_eq!(argmax_f32(&[f32::NAN, f32::NAN]), 0);
+    }
+
+    /// Degenerate inputs keep the old fallback.
+    #[test]
+    fn empty_and_single_inputs() {
+        assert_eq!(argmax_f32(&[]), 0);
+        assert_eq!(argmax_f32(&[42.0]), 0);
     }
 }
