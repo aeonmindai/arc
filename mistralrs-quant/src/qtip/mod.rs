@@ -3656,7 +3656,7 @@ impl QuantMethod for QtipLayer {
                 let grouped_preferred = grouped_available
                     && n_tokens > DECODE_REGIME_MAX_TOKENS
                     && gather_policy::ondevice_max_tokens_override().is_none()
-                    && gather_policy::grouped_gemm_tiles_amortize(
+                    && gather_policy::grouped_gemm_preferred(
                         n_tokens,
                         n_experts_per_tok,
                         num_experts,

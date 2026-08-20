@@ -1848,7 +1848,7 @@ impl QuantMethod for Qtip2bLayer {
                     Some(cap) => n_tokens <= cap,
                     None => {
                         n_tokens <= super::DECODE_REGIME_MAX_TOKENS
-                            || !super::gather_policy::grouped_gemm_tiles_amortize(
+                            || !super::gather_policy::grouped_gemm_preferred(
                                 n_tokens,
                                 n_experts_per_tok,
                                 self.num_experts_count(),
