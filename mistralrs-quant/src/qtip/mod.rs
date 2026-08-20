@@ -3689,14 +3689,19 @@ impl QuantMethod for QtipLayer {
                 // RUN-161 floor, not a performance choice (see
                 // `gather_policy`). An explicit `ARC_QTIP_ONDEVICE_MOE_MAX_TOKENS`
                 // override also still wins, so a harness can pin the GEMV arm.
+                // 🔴 The `grouped_gemm_tiles_amortize` conjunct is GONE — see
+                // `gather_policy` §4a. It demanded `6n/256 >= 16`, i.e.
+                // n >= 683, so on this rung too the grouped GEMM was
+                // unreachable in serving and every decode step ran the per-pair
+                // GEMV. Measured on THIS rung (qtip2 LUT, H200, V4-Flash),
+                // clean rows only: forcing the grouped path is 1.10x at B=48,
+                // 1.14x at 64, 1.22x at 80, 1.29x at 96, 1.66x at 128 and
+                // 1.51x at 512. Tile fill is not the deciding quantity; staging
+                // each woken expert once per m-tile instead of once per
+                // (token, slot) pair is.
                 let grouped_preferred = grouped_available
                     && n_tokens > DECODE_REGIME_MAX_TOKENS
-                    && gather_policy::ondevice_max_tokens_override().is_none()
-                    && gather_policy::grouped_gemm_tiles_amortize(
-                        n_tokens,
-                        n_experts_per_tok,
-                        num_experts,
-                    );
+                    && gather_policy::ondevice_max_tokens_override().is_none();
 
                 let use_ondevice = !grouped_preferred
                     && match gather_policy::ondevice_max_tokens_override() {
