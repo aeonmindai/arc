@@ -465,9 +465,9 @@ mod cuda_impl {
     /// - `pre`   `[n, hc]`    F32 contiguous
     pub fn hc_y_combine_cuda(x_f32: &Tensor, pre: &Tensor, out_dtype: DType) -> Result<Tensor> {
         let (n, hc, h) = x_f32.dims3()?;
-        let (pn, phc) = pre.dims2()?;
-        if pn != n || phc != hc {
-            candle::bail!("hc_fused: pre is [{pn}, {phc}] but x_f32 is [{n}, {hc}, {h}]");
+        let (pre_n, pre_hc) = pre.dims2()?;
+        if pre_n != n || pre_hc != hc {
+            candle::bail!("hc_fused: pre is [{pre_n}, {pre_hc}] but x_f32 is [{n}, {hc}, {h}]");
         }
         if n == 0 || h == 0 {
             candle::bail!("hc_fused: empty y-combine");
