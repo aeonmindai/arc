@@ -140,22 +140,101 @@ __global__ void fp8_matmul_tiled(const T *__restrict__ input,
 //   * block_size_x % 4 == 0 (a 4-wide group never straddles a scale block)
 // ============================================================================
 
-// UNROLL independent 128 B weight requests are issued per warp before any of
-// them is consumed. The original loop issued ONE and consumed it immediately,
-// so each warp had a single request in flight and the loop ran at global-load
-// latency, not at bandwidth -- which is why the memory controller sat at ~4%
-// while the card read "busy".
-//
-// The depth is set from a measured curve, not a guess: on this H200,
-// achieved bandwidth vs in-flight stage depth is 54.8% / 80.5% / 92.9% / 92.1%
-// of peak at 1 / 2 / 4 / 8 stages (arc-tools/bench/mlp_stage_depth_probe.cu).
-// It climbs 1.70x to 4 and SATURATES there, so 8 would cost registers and
-// occupancy for nothing.
-//
-// Accumulation order is UNCHANGED: sub-block u covers k_base + u*128 and the
-// consume loop walks u ascending, so `acc` sees exactly the original ascending
-// k sequence. That is deliberate -- it makes the result bit-comparable against
-// the pre-change kernel rather than merely close.
+template <typename T, int ROWS_PER_BLOCK, int MAX_BLOCKS_PER_SM>
+__global__ __launch_bounds__(ROWS_PER_BLOCK * 32, MAX_BLOCKS_PER_SM) void fp8_gemv_warp(
+    const T *__restrict__ input,               // [M, K]
+    const __nv_fp8_e4m3 *__restrict__ weight,  // [N, K] row-major
+    const float *__restrict__ weight_scale,    // [ceil(N/bs_y), ceil(K/bs_x)]
+    T *__restrict__ output,                    // [M, N]
+    int M, int N, int K, int scale_row_stride, int block_size_y,
+    int block_size_x) {
+  const int lane = threadIdx.x & 31;
+  const int n = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
+  const int m = blockIdx.y;
+  if (n >= N || m >= M)
+    return;
+
+  const __nv_fp8_e4m3 *w_row = weight + (size_t)n * K;
+  const T *in_row = input + (size_t)m * K;
+
+  // Scale row is constant for this output row.
+  const int scale_row_offset = (n / block_size_y) * scale_row_stride;
+
+  float acc = 0.0f;
+
+  // Main loop: each lane loads 4 FP8 weights (one 32-bit load) and 4 input
+  // values per iteration; the warp covers 128 K-elements per iteration.
+  const int K_aligned = (K / 128) * 128;
+  for (int k_base = 0; k_base < K_aligned; k_base += 128) {
+    const int k = k_base + lane * 4;
+
+    const uint32_t w4 = __ldg(reinterpret_cast<const uint32_t *>(&w_row[k]));
+
+    float i0, i1, i2, i3;
+    if constexpr (std::is_same_v<T, half>) {
+      const half2 h01 = __ldg(reinterpret_cast<const half2 *>(&in_row[k]));
+      const half2 h23 = __ldg(reinterpret_cast<const half2 *>(&in_row[k + 2]));
+      i0 = __half2float(h01.x);
+      i1 = __half2float(h01.y);
+      i2 = __half2float(h23.x);
+      i3 = __half2float(h23.y);
+    } else {
+      const __nv_bfloat162 b01 =
+          __ldg(reinterpret_cast<const __nv_bfloat162 *>(&in_row[k]));
+      const __nv_bfloat162 b23 =
+          __ldg(reinterpret_cast<const __nv_bfloat162 *>(&in_row[k + 2]));
+      i0 = __bfloat162float(b01.x);
+      i1 = __bfloat162float(b01.y);
+      i2 = __bfloat162float(b23.x);
+      i3 = __bfloat162float(b23.y);
+    }
+
+    __nv_fp8_e4m3 w0, w1, w2, w3;
+    w0.__x = (w4 >> 0) & 0xFF;
+    w1.__x = (w4 >> 8) & 0xFF;
+    w2.__x = (w4 >> 16) & 0xFF;
+    w3.__x = (w4 >> 24) & 0xFF;
+
+    const float scale =
+        __ldg(&weight_scale[scale_row_offset + k / block_size_x]);
+    acc += scale * (i0 * fp8_to_float(w0) + i1 * fp8_to_float(w1) +
+                    i2 * fp8_to_float(w2) + i3 * fp8_to_float(w3));
+  }
+
+  // Scalar remainder (K not a multiple of 128; still K % 4 == 0).
+  for (int k = K_aligned + lane; k < K; k += 32) {
+    float in_val;
+    if constexpr (std::is_same_v<T, half>) {
+      in_val = __half2float(__ldg(&in_row[k]));
+    } else {
+      in_val = __bfloat162float(__ldg(&in_row[k]));
+    }
+    __nv_fp8_e4m3 w;
+    w.__x = __ldg(reinterpret_cast<const uint8_t *>(&w_row[k]));
+    const float scale =
+        __ldg(&weight_scale[scale_row_offset + k / block_size_x]);
+    acc += scale * in_val * fp8_to_float(w);
+  }
+
+// Warp reduction using shuffle.
+#pragma unroll
+  for (int offset = 16; offset > 0; offset /= 2) {
+    acc += __shfl_down_sync(0xffffffff, acc, offset);
+  }
+
+  if (lane == 0) {
+    if constexpr (std::is_same_v<T, half>) {
+      output[(size_t)m * N + n] = __float2half(acc);
+    } else {
+      output[(size_t)m * N + n] = __float2bfloat16(acc);
+    }
+  }
+}
+
+#ifndef FP8_GEMV_MLP_ENABLE
+#define FP8_GEMV_MLP_ENABLE 1
+#endif
+
 #ifndef FP8_GEMV_MLP_UNROLL
 #define FP8_GEMV_MLP_UNROLL 4
 #endif
@@ -486,26 +565,35 @@ static void launch_fp8_gemv_impl(const T *input, const __nv_fp8_e4m3 *weight,
                                  int N, int K, int scale_row_stride,
                                  int block_size_y, int block_size_x,
                                  cudaStream_t stream) {
+  // Batch dispatch. At M==1 there are too few warps to cover global-load
+  // latency, so batching independent requests per warp is the whole win
+  // (+6.1% end-to-end at b=1, measured on master d7742670a). At M>1 the extra
+  // rows already supply that parallelism, so the restructured issue/consume
+  // loop buys nothing and costs ~1% -- measured, and it survived both a
+  // runtime M gate and a template split on U, which is what identified the
+  // restructure itself (not register pressure) as the cost. So M>1 keeps the
+  // ORIGINAL fused load-and-consume kernel, untouched.
+  const bool use_mlp = (FP8_GEMV_MLP_ENABLE != 0) && (M == 1);
   if (N < 8192) {
     dim3 grid(CEILDIV(N, 4), M);
-    if (M == 1)
+    if (use_mlp)
       fp8_gemm::fp8_gemv_warp_mlp<T, 4, 8, FP8_GEMV_MLP_UNROLL><<<grid, 4 * 32, 0, stream>>>(
           input, weight, weight_scale, output, M, N, K, scale_row_stride,
           block_size_y, block_size_x);
     else
-      fp8_gemm::fp8_gemv_warp_mlp<T, 4, 8, 1><<<grid, 4 * 32, 0, stream>>>(
-        input, weight, weight_scale, output, M, N, K, scale_row_stride,
-        block_size_y, block_size_x);
+      fp8_gemm::fp8_gemv_warp<T, 4, 8><<<grid, 4 * 32, 0, stream>>>(
+          input, weight, weight_scale, output, M, N, K, scale_row_stride,
+          block_size_y, block_size_x);
   } else {
     dim3 grid(N, M);
-    if (M == 1)
+    if (use_mlp)
       fp8_gemm::fp8_gemv_warp_mlp<T, 1, 16, FP8_GEMV_MLP_UNROLL><<<grid, 32, 0, stream>>>(
           input, weight, weight_scale, output, M, N, K, scale_row_stride,
           block_size_y, block_size_x);
     else
-      fp8_gemm::fp8_gemv_warp_mlp<T, 1, 16, 1><<<grid, 32, 0, stream>>>(
-        input, weight, weight_scale, output, M, N, K, scale_row_stride,
-        block_size_y, block_size_x);
+      fp8_gemm::fp8_gemv_warp<T, 1, 16><<<grid, 32, 0, stream>>>(
+          input, weight, weight_scale, output, M, N, K, scale_row_stride,
+          block_size_y, block_size_x);
   }
   CUDA_CHECK(cudaGetLastError());
 }
