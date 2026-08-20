@@ -16,6 +16,8 @@ use pertensor_fp8::pertensor_fp8_linear_b;
 mod metal_kernels;
 
 mod afq;
+#[cfg(feature = "cuda")]
+mod arc_outbuf;
 pub mod arc_kvquant;
 mod bitsandbytes;
 mod blockwise_fp8;

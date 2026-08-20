@@ -500,7 +500,7 @@ pub(crate) fn gather_gemv_cuda(
         DType::BF16 => {
             let (x_ptr, _x_guard) =
                 slice_ptr(x_storage.as_cuda_slice::<bf16>()?, x_layout.start_offset());
-            let out_buf = dev.alloc_zeros::<bf16>(n_out)?;
+            let out_buf = crate::arc_outbuf::alloc_out_fully_written::<bf16>(&dev, n_out)?;
             let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
             unsafe {
                 ffi::launch_qtip_gather_gemv_v2_k4_l16_bf16(
@@ -525,7 +525,7 @@ pub(crate) fn gather_gemv_cuda(
         DType::F16 => {
             let (x_ptr, _x_guard) =
                 slice_ptr(x_storage.as_cuda_slice::<f16>()?, x_layout.start_offset());
-            let out_buf = dev.alloc_zeros::<f16>(n_out)?;
+            let out_buf = crate::arc_outbuf::alloc_out_fully_written::<f16>(&dev, n_out)?;
             let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
             unsafe {
                 ffi::launch_qtip_gather_gemv_v2_k4_l16_f16(
@@ -550,7 +550,7 @@ pub(crate) fn gather_gemv_cuda(
         DType::F32 => {
             let (x_ptr, _x_guard) =
                 slice_ptr(x_storage.as_cuda_slice::<f32>()?, x_layout.start_offset());
-            let out_buf = dev.alloc_zeros::<f32>(n_out)?;
+            let out_buf = crate::arc_outbuf::alloc_out_fully_written::<f32>(&dev, n_out)?;
             let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
             unsafe {
                 ffi::launch_qtip_gather_gemv_v2_k4_l16_f32(
