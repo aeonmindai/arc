@@ -2370,6 +2370,11 @@ impl QtipLayer {
             // objective bit is false by construction, not by omission.
             search_detail: QtipSearchDetail::for_bake(mode, search, false),
             codebook,
+            // Same geometry as the CPU sibling above: the CUDA bake kernels are
+            // the K=4/V=2/L=16 trellis too, so a GPU-baked artifact must carry
+            // the identical wire tag. Omitting it here compiled fine without
+            // the `cuda` feature and only broke the CUDA lane.
+            geometry: QtipGeometry::K4V2L16,
         }))
     }
 
