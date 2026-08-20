@@ -160,7 +160,7 @@ __global__ void fp8_matmul_tiled(const T *__restrict__ input,
 #define FP8_GEMV_MLP_UNROLL 4
 #endif
 
-template <typename T, int ROWS_PER_BLOCK, int MAX_BLOCKS_PER_SM>
+template <typename T, int ROWS_PER_BLOCK, int MAX_BLOCKS_PER_SM, int U>
 __global__ __launch_bounds__(ROWS_PER_BLOCK * 32, MAX_BLOCKS_PER_SM) void fp8_gemv_warp_mlp(
     const T *__restrict__ input,               // [M, K]
     const __nv_fp8_e4m3 *__restrict__ weight,  // [N, K] row-major
@@ -182,10 +182,13 @@ __global__ __launch_bounds__(ROWS_PER_BLOCK * 32, MAX_BLOCKS_PER_SM) void fp8_ge
 
   float acc = 0.0f;
 
-  constexpr int U = FP8_GEMV_MLP_UNROLL;
   const int K_aligned = (K / 128) * 128;
 
   // Deep pass: U warp-iterations' worth of loads in flight at once.
+  // Batch gate: at M==1 there are too few warps to cover load latency, so
+  // per-warp MLP is the whole win (+6.1% measured at b=1 on master). At M>1
+  // the extra rows already supply that parallelism and the deep pass only
+  // costs registers -- measured -1.0% at B=8. So the deep pass is b=1 only.
   const int K_deep = (K / (128 * U)) * (128 * U);
   for (int k_base = 0; k_base < K_deep; k_base += 128 * U) {
     uint32_t w4v[U];
@@ -485,12 +488,22 @@ static void launch_fp8_gemv_impl(const T *input, const __nv_fp8_e4m3 *weight,
                                  cudaStream_t stream) {
   if (N < 8192) {
     dim3 grid(CEILDIV(N, 4), M);
-    fp8_gemm::fp8_gemv_warp_mlp<T, 4, 8><<<grid, 4 * 32, 0, stream>>>(
+    if (M == 1)
+      fp8_gemm::fp8_gemv_warp_mlp<T, 4, 8, FP8_GEMV_MLP_UNROLL><<<grid, 4 * 32, 0, stream>>>(
+          input, weight, weight_scale, output, M, N, K, scale_row_stride,
+          block_size_y, block_size_x);
+    else
+      fp8_gemm::fp8_gemv_warp_mlp<T, 4, 8, 1><<<grid, 4 * 32, 0, stream>>>(
         input, weight, weight_scale, output, M, N, K, scale_row_stride,
         block_size_y, block_size_x);
   } else {
     dim3 grid(N, M);
-    fp8_gemm::fp8_gemv_warp_mlp<T, 1, 16><<<grid, 32, 0, stream>>>(
+    if (M == 1)
+      fp8_gemm::fp8_gemv_warp_mlp<T, 1, 16, FP8_GEMV_MLP_UNROLL><<<grid, 32, 0, stream>>>(
+          input, weight, weight_scale, output, M, N, K, scale_row_stride,
+          block_size_y, block_size_x);
+    else
+      fp8_gemm::fp8_gemv_warp_mlp<T, 1, 16, 1><<<grid, 32, 0, stream>>>(
         input, weight, weight_scale, output, M, N, K, scale_row_stride,
         block_size_y, block_size_x);
   }
