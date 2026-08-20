@@ -57,6 +57,180 @@ pub(crate) fn swiglu_clamp(gate: &Tensor, up: &Tensor, limit: f32) -> Result<(Te
     Ok((gate, up))
 }
 
+/// The whole clamped-SwiGLU stage — [`swiglu_clamp`], the activation, the
+/// multiply and the narrow back to the model dtype — as ONE CUDA kernel.
+/// `Ok(None)` means the caller must run the eager chain.
+///
+/// # Why this exists
+///
+/// The eager spelling is a BF16 -> F32 -> BF16 round trip whose entire middle
+/// is elementwise. Per call it costs eight launches (two widening casts, a
+/// `minimum`, a `maximum`, a `minimum`, `usilu_f32`, `bmul_f32`, a narrowing
+/// cast) — seven for the shared expert, whose activation and multiply are one
+/// `fused_glu` — plus **three 4-byte host-to-device memcpys**, because
+/// candle's `minimum(f64)`/`maximum(f64)` materialise the bound with
+/// `Tensor::new(v, Cpu)?.to_device(cuda)?` on every call
+/// (`candle-core/src/tensor.rs`, `binary_op_scalar!`).
+///
+/// V4 runs this stage twice per layer (routed experts + shared expert) across
+/// 43 layers, so on the measured decode step it is 86 calls: 645 launches and
+/// 258 host-to-device copies to compute `silu(clamp(g)) * clamp(u)`. The
+/// per-op floor on this H200 is ~1.05 us inside a graph and ~2.6 us on a
+/// stream, independent of size, so essentially all of that is launch overhead.
+/// `bmaximum_f32 = 86.0/forward` in the kernel histogram is this stage's exact
+/// fingerprint — one `maximum` per call, no other producer.
+///
+/// # Bit-identity
+///
+/// The kernel transcribes the chain rather than re-deriving it; see
+/// `cuda/hc_fused.cu`, `arc_seam_swiglu_clamp_kernel`, for the op-by-op
+/// citations. The routed and shared spellings differ only in the operand order
+/// of the final multiply, which IEEE makes irrelevant. `ARC_SEAM_AB=1` proves
+/// it against **both** spellings on live data, comparing at F32 before the
+/// narrowing (a BF16 comparison has 8 mantissa bits and would swallow the
+/// reassociation errors this is meant to catch); `ARC_HC_AB_POISON=1` is the
+/// negative control that must make it fail.
+///
+/// Opt out with `ARC_F32SEAM=0` (whole seam) or `ARC_SEAM_SWIGLU=0` (this site).
+pub(crate) fn fused_swiglu_clamp(
+    gate: &Tensor,
+    up: &Tensor,
+    limit: f32,
+    act: Activation,
+    out_dtype: DType,
+) -> Result<Option<Tensor>> {
+    use crate::cuda::hc_fused as seam;
+
+    if !seam::seam_on("ARC_SEAM_SWIGLU") {
+        // The A/B leg, not a fallback: stay silent so the DECLINED lines below
+        // keep meaning "the fast path was wanted and refused".
+        return Ok(None);
+    }
+    // Only Silu is transcribed. `Swish` is `x * sigmoid(x)`, which rounds
+    // differently from `x / (1 + exp(-x))`, and the rest are not silu at all —
+    // an unlisted activation must take the eager path, not be approximated.
+    let refusal = if matches!(act, Activation::Silu) {
+        swiglu_fusion_refusal(gate, up, matches!(out_dtype, DType::F32 | DType::BF16))
+    } else {
+        Some("activation is not Silu")
+    };
+    if let Some(reason) = refusal {
+        seam::seam_declined(seam::SEAM_SWIGLU, reason);
+        return Ok(None);
+    }
+
+    let out = seam::swiglu_clamp_fused_cuda(gate, up, limit, out_dtype)?;
+
+    if seam::seam_ab_enabled() {
+        let (g, u) = swiglu_clamp(gate, up, limit)?;
+        // The routed spelling: `up.mul(&gate.apply(act))`.
+        let eager_routed = u.mul(&g.apply(&act)?)?;
+        // The shared spelling: `mul_and_act` -> `fused_glu`, activation cast
+        // back to T then multiplied in the other order.
+        let eager_shared = crate::ops::mul_and_act(&g, &u, act)?;
+        let fused_f32 = seam::swiglu_clamp_fused_cuda(gate, up, limit, DType::F32)?;
+        // CONTRACT: this site replaces the routed chain, so it must match it.
+        seam::ab_check("seam.swiglu.f32", &fused_f32, &eager_routed)?;
+        seam::ab_check("seam.swiglu.out", &out, &eager_routed.to_dtype(out_dtype)?)?;
+        // MEASUREMENT, not contract: the same value spelled with the fast-math
+        // `fused_glu` (mistralrs-quant is built with `--use_fast_math`). The
+        // routed site never used that spelling, so a difference here is not a
+        // regression — it is the number that says whether the shared-expert
+        // site could ever take the full fusion. Named `MEASURE.` so the verdict
+        // script can tell a measurement from a contract instead of failing the
+        // whole leg on it.
+        seam::ab_check(
+            "seam.MEASURE.ieee_silu_vs_fastmath_glu.at_routed",
+            &fused_f32,
+            &eager_shared,
+        )?;
+    }
+
+    seam::seam_engaged(seam::SEAM_SWIGLU);
+    Ok(Some(out))
+}
+
+/// Shared common gating for both swiglu fusions. `Err`-free: returns the
+/// decline reason, or `None` if the site may fuse.
+fn swiglu_fusion_refusal(gate: &Tensor, up: &Tensor, dt_ok: bool) -> Option<&'static str> {
+    if !gate.device().is_cuda() {
+        return Some("device is not cuda");
+    }
+    if gate.dtype() != up.dtype() {
+        return Some("gate and up dtypes differ");
+    }
+    if !matches!(gate.dtype(), DType::F32 | DType::BF16) || !dt_ok {
+        return Some("dtype outside {F32, BF16}");
+    }
+    if gate.dims() != up.dims() {
+        return Some("gate and up shapes differ");
+    }
+    if !gate.is_contiguous() || !up.is_contiguous() {
+        return Some("gate or up is not contiguous");
+    }
+    if gate.elem_count() == 0 {
+        return Some("empty tensor");
+    }
+    None
+}
+
+/// The **clamp half** of the SwiGLU stage as one kernel, for the shared expert.
+/// `Ok(None)` means the caller must run [`swiglu_clamp`].
+///
+/// The shared expert's activation and multiply are
+/// `mistralrs_quant::fused_glu`, whose translation unit is compiled with
+/// `--use_fast_math` (mistralrs-quant/build.rs:281). Its `expf` is `__expf`
+/// and its division is `div.approx`, so the full fusion — which reproduces
+/// candle's IEEE `usilu_f32` — would NOT be bit-identical here. Fusing it
+/// anyway would be trading the contract for four launches, so only the
+/// provable half is taken: two widening casts, `maximum`, two `minimum`s, and
+/// the three 4-byte host-to-device copies of the bounds, 5 launches + 3 copies
+/// down to 1 launch. `fused_glu` then runs on exactly the F32 tensors it runs
+/// on today.
+///
+/// Under `ARC_SEAM_AB=1` this ALSO evaluates the full fusion here and reports
+/// whether the fast-math and IEEE spellings agree bit for bit — the
+/// measurement that would license taking the other four launches.
+pub(crate) fn fused_swiglu_clamp_split(
+    gate: &Tensor,
+    up: &Tensor,
+    limit: f32,
+    act: Activation,
+) -> Result<Option<(Tensor, Tensor)>> {
+    use crate::cuda::hc_fused as seam;
+
+    if !seam::seam_on("ARC_SEAM_SWIGLU") {
+        return Ok(None);
+    }
+    if let Some(reason) = swiglu_fusion_refusal(gate, up, true) {
+        seam::seam_declined(seam::SEAM_SWIGLU_SPLIT, reason);
+        return Ok(None);
+    }
+
+    let (g, u) = seam::swiglu_clamp_split_cuda(gate, up, limit)?;
+
+    if seam::seam_ab_enabled() {
+        let (ge, ue) = swiglu_clamp(gate, up, limit)?;
+        seam::ab_check("seam.swiglu_split.gate", &g, &ge)?;
+        seam::ab_check("seam.swiglu_split.up", &u, &ue)?;
+        // The measurement that decides whether the full fusion is ever legal
+        // at this site: IEEE silu (this file's kernel) vs the fast-math
+        // `fused_glu` the shared expert actually runs today.
+        if matches!(act, Activation::Silu) {
+            let fused_full = seam::swiglu_clamp_fused_cuda(gate, up, limit, DType::F32)?;
+            let fastmath = crate::ops::mul_and_act(&ge, &ue, act)?;
+            seam::ab_check(
+                "seam.MEASURE.ieee_silu_vs_fastmath_glu.at_shared",
+                &fused_full,
+                &fastmath,
+            )?;
+        }
+    }
+
+    seam::seam_engaged(seam::SEAM_SWIGLU_SPLIT);
+    Ok(Some((g, u)))
+}
+
 /// Configuration for MoEExperts
 pub struct MoEExpertsConfig {
     pub num_experts: usize,
@@ -511,6 +685,13 @@ impl MoEExperts {
             return up.mul(&gate.apply(&self.act)?);
         };
         let out_dtype = gate.dtype();
+        // One kernel instead of eight launches and three host-to-device copies.
+        // The `exp.act_gate` statistic below is only reachable on the eager
+        // path, which `ARC_F32SEAM=0` restores — the fused kernel never
+        // materialises the intermediate the statistic reads.
+        if let Some(out) = fused_swiglu_clamp(gate, up, limit, self.act, out_dtype)? {
+            return Ok(out);
+        }
         let (gate, up) = swiglu_clamp(gate, up, limit)?;
         let act_gate = gate.apply(&self.act)?;
         crate::models::deepseek4::v4_stat_dbg(&act_gate, "exp.act_gate");
@@ -794,10 +975,84 @@ impl MoEExperts {
         };
 
         let _s = arc_profiler::device_span("experts.weighted_sum");
-        ys.to_dtype(DType::F32)?
-            .broadcast_mul(&topk_weights.unsqueeze(D::Minus1)?)?
-            .sum(D::Minus2)?
-            .to_dtype(original_dtype)
+        let eager = || -> Result<Tensor> {
+            ys.to_dtype(DType::F32)?
+                .broadcast_mul(&topk_weights.unsqueeze(D::Minus1)?)?
+                .sum(D::Minus2)?
+                .to_dtype(original_dtype)
+        };
+        // FOUR launches — widen, weight, reduce over the 6-element expert axis,
+        // narrow — to compute a 6-term weighted average, 43 times per decoded
+        // token. Collapsed to one; see `arc_seam_moe_weighted_sum_kernel` in
+        // cuda/hc_fused.cu, which replays candle's identity-padded `fast_sum`
+        // tree (K=6 reduces in a block of EIGHT, and the two padding lanes are
+        // part of the answer). `ARC_F32SEAM=0` / `ARC_SEAM_WSUM=0` restore this.
+        Ok(match self.fused_weighted_sum(&ys, topk_weights, original_dtype)? {
+            Some(out) => out,
+            None => eager()?,
+        })
+    }
+
+    /// One-kernel spelling of the `experts.weighted_sum` chain above.
+    /// `Ok(None)` means the caller must run the eager chain.
+    fn fused_weighted_sum(
+        &self,
+        ys: &Tensor,
+        topk_weights: &Tensor,
+        out_dtype: DType,
+    ) -> Result<Option<Tensor>> {
+        use crate::cuda::hc_fused as seam;
+
+        if !seam::seam_on("ARC_SEAM_WSUM") {
+            return Ok(None);
+        }
+        let decline = |reason: &str| -> Result<Option<Tensor>> {
+            seam::seam_declined(seam::SEAM_WSUM, reason);
+            Ok(None)
+        };
+        if !ys.device().is_cuda() {
+            return decline("device is not cuda");
+        }
+        let Ok((n, k, h)) = ys.dims3() else {
+            return decline("ys is not rank 3");
+        };
+        if topk_weights.dims() != [n, k] {
+            return decline("topk_weights shape does not match ys");
+        }
+        // The kernel is specialised on K because the accumulator must live in
+        // registers; an unlisted K refuses rather than spilling to local memory.
+        if !matches!(k, 1 | 2 | 4 | 6 | 8) {
+            return decline("num_experts_per_tok outside the specialised set");
+        }
+        if !matches!(ys.dtype(), DType::F32 | DType::BF16)
+            || !matches!(out_dtype, DType::F32 | DType::BF16)
+        {
+            return decline("dtype outside {F32, BF16}");
+        }
+        if topk_weights.dtype() != DType::F32 {
+            return decline("topk_weights is not F32");
+        }
+        if !ys.is_contiguous() || !topk_weights.is_contiguous() {
+            return decline("ys or topk_weights is not contiguous");
+        }
+        if n == 0 || h == 0 {
+            return decline("empty weighted sum");
+        }
+
+        let out = seam::moe_weighted_sum_cuda(ys, topk_weights, out_dtype)?;
+
+        if seam::seam_ab_enabled() {
+            let eager_f32 = ys
+                .to_dtype(DType::F32)?
+                .broadcast_mul(&topk_weights.unsqueeze(D::Minus1)?)?
+                .sum(D::Minus2)?;
+            let fused_f32 = seam::moe_weighted_sum_cuda(ys, topk_weights, DType::F32)?;
+            seam::ab_check("seam.wsum.f32", &fused_f32, &eager_f32)?;
+            seam::ab_check("seam.wsum.out", &out, &eager_f32.to_dtype(out_dtype)?)?;
+        }
+
+        seam::seam_engaged(seam::SEAM_WSUM);
+        Ok(Some(out))
     }
 
     /// Loop-based forward pass (quantized fallback)

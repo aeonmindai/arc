@@ -375,6 +375,33 @@ extern "C" {
     // are compiled by build.rs's dedicated no-fast-math builder; see the
     // bit-identity contract at the top of that file.
     #[allow(clippy::too_many_arguments)]
+    /// Fused DeepSeek-V4 Q/K pre-attention block (`cuda/qk_norm_rope.cu`):
+    /// head transpose + per-head Q RMS-norm + adjacent-pair RoPE + NoPE/PE
+    /// recombination, in one launch. Returns 0 on launch, non-zero if the
+    /// (dtype, head_dim, rope_dim) triple is outside the specialised set — the
+    /// caller must then run the eager chain rather than approximate.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn arc_qk_norm_rope_bf16_v2(
+        q_in: *const c_void,
+        k_in: *const c_void,
+        cos_tab: *const c_void,
+        sin_tab: *const c_void,
+        q_out: *mut c_void,
+        k_out: *mut c_void,
+        n_heads: i32,
+        batch: i32,
+        seq_len: i32,
+        head_dim: i32,
+        rope_dim: i32,
+        pos_offset: i32,
+        dtype: i32,
+        inv_n_bits: u32,
+        zero_bits: u32,
+        one_bits: u32,
+        eps_bits: u32,
+        stream: i64,
+    ) -> i32;
+
     pub(crate) fn hc_pre_fused_f32(
         x_flat: *const c_void,
         mixes_raw: *const c_void,
@@ -399,4 +426,86 @@ extern "C" {
         numel: i64,
         stream: i64,
     );
+    /// `y = sum_i pre[i] * x_f32[i, :]` narrowed to the model dtype.
+    /// Returns 0 on launch, non-zero if `(hc, dtype)` has no specialisation —
+    /// the caller must then use the eager chain.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn hc_y_combine(
+        x_f32: *const c_void,
+        pre: *const c_void,
+        y: *mut c_void,
+        hc: i32,
+        h: i32,
+        total: i64,
+        dtype: i32,
+        stream: i64,
+    ) -> i32;
+    /// V4 clamped SwiGLU: `narrow(silu(min(gate, limit)) * clamp(up, -limit, limit))`.
+    /// Returns 0 on launch, non-zero if the `(in_dtype, out_dtype)` pair has no
+    /// specialisation — the caller must then use the eager chain.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn arc_seam_swiglu_clamp(
+        gate: *const c_void,
+        up: *const c_void,
+        out: *mut c_void,
+        limit: f32,
+        total: i64,
+        in_dtype: i32,
+        out_dtype: i32,
+        stream: i64,
+    ) -> i32;
+    /// The clamp half only, for the shared-expert site whose activation is a
+    /// fast-math `fused_glu` that a non-fast-math kernel cannot reproduce:
+    /// `gate_out = min(gate, limit)`, `up_out = clamp(up, -limit, limit)`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn arc_seam_swiglu_clamp_split(
+        gate: *const c_void,
+        up: *const c_void,
+        gate_out: *mut c_void,
+        up_out: *mut c_void,
+        limit: f32,
+        total: i64,
+        in_dtype: i32,
+        stream: i64,
+    ) -> i32;
+    /// MoE expert combine: `out[n, h] = narrow(tree_sum_k(ys[n, j, h] * w[n, j]))`.
+    /// Same return contract as above; `k` outside the specialised set refuses.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn arc_seam_moe_weighted_sum(
+        ys: *const c_void,
+        w: *const c_void,
+        out: *mut c_void,
+        k: i32,
+        h: i32,
+        total: i64,
+        in_dtype: i32,
+        out_dtype: i32,
+        stream: i64,
+    ) -> i32;
+    /// MoE gate weight renormalise + scale. Same return contract as above.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn arc_seam_gate_renorm(
+        w: *const c_void,
+        out: *mut c_void,
+        eps: f32,
+        scale: f32,
+        do_renorm: i32,
+        k: i32,
+        n: i64,
+        stream: i64,
+    ) -> i32;
+    /// The whole `hc_post` re-expansion. Same return contract as above.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn hc_post_fused(
+        x: *const c_void,
+        residual: *const c_void,
+        post: *const c_void,
+        comb: *const c_void,
+        out: *mut c_void,
+        hc: i32,
+        h: i32,
+        total: i64,
+        dtype: i32,
+        stream: i64,
+    ) -> i32;
 }

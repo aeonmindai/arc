@@ -1235,6 +1235,99 @@ impl Attention {
         })
     }
 
+    /// Decide whether the fused `cuda::qk_norm_rope` kernel may replace the
+    /// eager transpose + Q RMS-norm + RoPE chain for this call.
+    ///
+    /// Returns `Some(pos_offset)` when every precondition for BIT-IDENTITY
+    /// holds, `None` otherwise. Each rejection is a real difference in what the
+    /// kernel would have to compute, not a convenience:
+    ///
+    /// * **BF16 only.** In f32 the RoPE expression is FMA-contractible, and
+    ///   candle-kernels builds with the default `-fmad=true` while this
+    ///   kernel's IEEE builder uses `--fmad=false`; the two would legitimately
+    ///   disagree in the last bit. bf16 operators are inline PTX and immune.
+    /// * **`head_dim` must equal candle's `fast_sum` block width** (i.e. be a
+    ///   power of two ≤ 1024), or the reduction tree — and therefore the
+    ///   rounding of the RMS statistic — has a different shape.
+    /// * **One shared position offset.** With per-sequence offsets candle takes
+    ///   its `Tensor::cat` path, which the kernel does not model.
+    /// * **A single KV head**, which is what makes K one extra row rather than
+    ///   a second layout.
+    ///
+    /// A `None` here is logged once (see `note_declined`) so a permanently
+    /// disengaged fast path cannot masquerade as a working one.
+    fn fused_qk_gate(
+        &self,
+        q_proj_out: &Tensor,
+        kv_normed: &Tensor,
+        seqlen_offsets: &[usize],
+    ) -> Option<usize> {
+        use crate::cuda::qk_norm_rope as qk;
+        if !cfg!(feature = "cuda") || !qk::fused_enabled() {
+            return None;
+        }
+        macro_rules! decline {
+            ($why:expr) => {{
+                qk::note_declined($why);
+                return None;
+            }};
+        }
+        if !q_proj_out.device().is_cuda() {
+            decline!("not a CUDA device");
+        }
+        if q_proj_out.dtype() != candle_core::DType::BF16
+            || kv_normed.dtype() != candle_core::DType::BF16
+        {
+            decline!("Q/KV are not BF16");
+        }
+        let cos = self.rotary_emb.cos();
+        let sin = self.rotary_emb.sin();
+        if cos.dtype() != candle_core::DType::BF16 || sin.dtype() != candle_core::DType::BF16 {
+            decline!("RoPE tables are not BF16");
+        }
+        if seqlen_offsets.len() != 1 {
+            decline!("per-sequence position offsets");
+        }
+        if self.num_kv_heads != 1 {
+            decline!("more than one KV head");
+        }
+        let head_dim = self.cfg.head_dim;
+        let rope_dim = self.cfg.qk_rope_head_dim;
+        // candle's FastReduce block width is `min(1024, n).next_power_of_two()`;
+        // the kernel's tree only matches when that equals the row length.
+        if head_dim > 1024 || !head_dim.is_power_of_two() {
+            decline!("head_dim is not candle's fast_sum block width");
+        }
+        if rope_dim == 0 || rope_dim % 2 != 0 || rope_dim > head_dim {
+            decline!("unusable rope_dim");
+        }
+        if !q_proj_out.is_contiguous() || !kv_normed.is_contiguous() {
+            decline!("Q/KV projection output is not contiguous");
+        }
+        if !cos.is_contiguous() || !sin.is_contiguous() {
+            decline!("RoPE tables are not contiguous");
+        }
+        // Shapes: q_proj_out is [B, T, n_heads * head_dim], kv_normed is
+        // [B, T, head_dim].
+        let (qb, qt, qh) = match q_proj_out.dims3() {
+            Ok(d) => d,
+            Err(_) => decline!("q_proj output is not 3-D"),
+        };
+        if qh != self.num_attention_heads * head_dim {
+            decline!("q_proj output width is not n_heads * head_dim");
+        }
+        match kv_normed.dims3() {
+            Ok((kb, kt, kh)) if kb == qb && kt == qt && kh == head_dim => {}
+            _ => decline!("kv_norm output shape does not match [B, T, head_dim]"),
+        }
+        let pos_offset = seqlen_offsets[0];
+        match cos.dims2() {
+            Ok((rows, cols)) if cols == rope_dim / 2 && rows >= pos_offset + qt => {}
+            _ => decline!("RoPE table does not cover [pos_offset, pos_offset + T)"),
+        }
+        Some(pos_offset)
+    }
+
     /// Apply RoPE in-place to the last `qk_rope_head_dim` dims of each
     /// Q-head and K-head's `head_dim`-vector. The first
     /// `qk_nope_head_dim` dims are left untouched. Audit §0 + §3.
@@ -1451,36 +1544,21 @@ impl Attention {
         drop(_prof_comp);
         // 1. Q projection (LoRA). [B, T, hidden] → [B, T, n_heads*head_dim]
         //    → reshape to [B, n_heads, T, head_dim]. Audit §3.
-        let q = {
+        let q_proj_out = {
             let _s = arc_profiler::device_span("q_proj");
             timed_mla(0, &mdev, || self.q.forward(xs))?
         };
-        v4_nan_dbg(&q, "attn.q_proj");
-        let q = q
-            .reshape((bs, seq_len, self.num_attention_heads, head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
-        // V4: per-head RMS-normalize Q over head_dim before RoPE. Reference
-        // inference/model.py:498 `q *= rsqrt(q.square().mean(-1)+eps)`. This is
-        // SEPARATE from q_norm (which normalizes q_lora_rank inside self.q).
-        // Missing it leaves Q ~30x too small -> near-uniform attention scores
-        // -> the model cannot attend -> word-salad output (RUN-161).
-        let q = {
-            let _s = arc_profiler::device_span("q_rmsnorm");
-            let inv_rms = q
-                .sqr()?
-                .mean_keepdim(candle_core::D::Minus1)?
-                .affine(1.0, self.cfg.rms_norm_eps)?
-                .recip()?
-                .sqrt()?;
-            q.broadcast_mul(&inv_rms)?
-        };
-        v4_stat_dbg(&q, "attn.q_normed");
-        v4_trace_dump(self.dbg_layer_idx, &q, "10_q_normed");
+        v4_nan_dbg(&q_proj_out, "attn.q_proj");
 
         // 2. K/V projection: single fused wkv. [B, T, hidden] → [B, T,
         //    head_dim] → kv_norm → reshape to [B, num_kv_heads=1, T,
         //    head_dim]. Audit §0 + §3.
+        //
+        // wave44: this block used to sit AFTER the Q RMS-norm. It is hoisted
+        // above it so the fused Q/K kernel below can take the Q rows and the K
+        // row in ONE launch. The two projections read only `xs` and neither
+        // reads the other's output, so no arithmetic moves — only the order in
+        // which two independent GEMMs are enqueued.
         let kv_raw = {
             let _s = arc_profiler::device_span("kv_proj");
             timed_mla(1, &mdev, || self.wkv.forward_autocast(xs))?
@@ -1491,16 +1569,119 @@ impl Attention {
             self.kv_norm.forward(&kv_raw)?
         };
         v4_nan_dbg(&kv_normed, "attn.kv_norm");
-        let k = kv_normed
-            .reshape((bs, seq_len, self.num_kv_heads, head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
 
-        // 3. RoPE applied in-place to the last qk_rope_head_dim dims of
-        //    each Q-head and K-head's head_dim-vector. Audit §0 + §3.
-        let (q, k) = {
+        // 3. Head transpose + per-head Q RMS-norm + RoPE + NoPE/PE recombine.
+        //
+        // The eager spelling below is SIXTEEN candle launches per layer, TEN of
+        // them pure data movement (`ucopy_bf16` / `copy2d_bf16`) materialising
+        // intermediates that only exist because the chain is expressed as
+        // separate ops: a transpose, a `broadcast_mul`, two `.contiguous()`
+        // narrows inside `rope_i`, and two two-input `cat`s. Their entire data
+        // footprint at decode is 64 KB of Q and 1 KB of K.
+        //
+        // `cuda::qk_norm_rope` does all of it in one launch of `n_heads + 1`
+        // blocks, bit-identically — the transpose becomes an output address,
+        // the split/`cat` becomes two write ranges of the same row, and the RMS
+        // statistic stays in a register. Toggle with `ARC_QK_FUSED=0`; prove
+        // with `ARC_QK_VERIFY=1`.
+        let eager_qk = |q_proj_out: &Tensor, kv_normed: &Tensor| -> Result<(Tensor, Tensor)> {
+            let q = q_proj_out
+                .reshape((bs, seq_len, self.num_attention_heads, head_dim))?
+                .transpose(1, 2)?
+                .contiguous()?;
+            // V4: per-head RMS-normalize Q over head_dim before RoPE. Reference
+            // inference/model.py:498 `q *= rsqrt(q.square().mean(-1)+eps)`. This is
+            // SEPARATE from q_norm (which normalizes q_lora_rank inside self.q).
+            // Missing it leaves Q ~30x too small -> near-uniform attention scores
+            // -> the model cannot attend -> word-salad output (RUN-161).
+            let q = {
+                let _s = arc_profiler::device_span("q_rmsnorm");
+                let inv_rms = q
+                    .sqr()?
+                    .mean_keepdim(candle_core::D::Minus1)?
+                    .affine(1.0, self.cfg.rms_norm_eps)?
+                    .recip()?
+                    .sqrt()?;
+                q.broadcast_mul(&inv_rms)?
+            };
+            v4_stat_dbg(&q, "attn.q_normed");
+            v4_trace_dump(self.dbg_layer_idx, &q, "10_q_normed");
+
+            let k = kv_normed
+                .reshape((bs, seq_len, self.num_kv_heads, head_dim))?
+                .transpose(1, 2)?
+                .contiguous()?;
+
+            // RoPE applied in-place to the last qk_rope_head_dim dims of
+            // each Q-head and K-head's head_dim-vector. Audit §0 + §3.
             let _s = arc_profiler::device_span("rope");
-            self.apply_rope_inplace(&q, &k, seqlen_offsets)?
+            self.apply_rope_inplace(&q, &k, seqlen_offsets)
+        };
+
+        let (q, k) = {
+            let _s = arc_profiler::device_span("qk_norm_rope");
+            match self.fused_qk_gate(&q_proj_out, &kv_normed, seqlen_offsets) {
+                Some(pos_offset) => {
+                    let (q_f, k_f) = crate::cuda::qk_norm_rope::qk_norm_rope_cuda(
+                        &q_proj_out,
+                        &kv_normed,
+                        self.rotary_emb.cos(),
+                        self.rotary_emb.sin(),
+                        self.num_attention_heads,
+                        bs,
+                        seq_len,
+                        head_dim,
+                        self.cfg.qk_rope_head_dim,
+                        self.cfg.rms_norm_eps as f64,
+                        pos_offset,
+                    )?;
+                    crate::cuda::qk_norm_rope::note_engaged(
+                        head_dim,
+                        self.cfg.qk_rope_head_dim,
+                        self.num_attention_heads,
+                        "bf16",
+                    );
+                    if crate::cuda::qk_norm_rope::verify_enabled() {
+                        let (q_e, k_e) = eager_qk(&q_proj_out, &kv_normed)?;
+                        // The eager NORMALISED Q (pre-RoPE), built on demand so
+                        // the rotation candle applied can be solved for exactly.
+                        let qn_for_diag = || -> Result<Tensor> {
+                            let qn = q_proj_out
+                                .reshape((bs, seq_len, self.num_attention_heads, head_dim))?
+                                .transpose(1, 2)?
+                                .contiguous()?;
+                            let inv_rms = qn
+                                .sqr()?
+                                .mean_keepdim(candle_core::D::Minus1)?
+                                .affine(1.0, self.cfg.rms_norm_eps)?
+                                .recip()?
+                                .sqrt()?;
+                            qn.broadcast_mul(&inv_rms)
+                        };
+                        // Run the row diagnostic on the FAILING call, not on
+                        // whichever call happened to be first: position 0 is
+                        // the identity rotation, so the first call agrees
+                        // trivially and describes nothing.
+                        if let Err(e) = crate::cuda::qk_norm_rope::verify_pair("q", &q_f, &q_e) {
+                            crate::cuda::qk_norm_rope::diagnose_row(
+                                &qn_for_diag()?,
+                                &q_e,
+                                &q_f,
+                                self.rotary_emb.cos(),
+                                self.rotary_emb.sin(),
+                                head_dim,
+                                self.cfg.qk_rope_head_dim,
+                                seqlen_offsets[0],
+                                seq_len,
+                            )?;
+                            return Err(e);
+                        }
+                        crate::cuda::qk_norm_rope::verify_pair("k", &k_f, &k_e)?;
+                    }
+                    (q_f, k_f)
+                }
+                None => eager_qk(&q_proj_out, &kv_normed)?,
+            }
         };
         v4_nan_dbg(&q, "attn.q_rope");
         v4_nan_dbg(&k, "attn.k_rope");
@@ -2066,6 +2247,60 @@ impl MoeGate {
         })
     }
 
+    /// One-kernel spelling of the `gate.renormalize` chain.
+    /// `Ok(None)` means the caller must run `eager`.
+    fn fused_renorm(
+        &self,
+        topk_weight: &Tensor,
+        do_renorm: bool,
+        eager: &dyn Fn(&Tensor) -> Result<Tensor>,
+    ) -> Result<Option<Tensor>> {
+        use crate::cuda::hc_fused as seam;
+
+        if !seam::seam_on("ARC_SEAM_GATE") {
+            return Ok(None);
+        }
+        let decline = |reason: &str| -> Result<Option<Tensor>> {
+            seam::seam_declined(seam::SEAM_GATE, reason);
+            Ok(None)
+        };
+        if !topk_weight.device().is_cuda() {
+            return decline("device is not cuda");
+        }
+        if topk_weight.dtype() != DType::F32 {
+            return decline("topk_weight is not F32");
+        }
+        let Ok((n, k)) = topk_weight.dims2() else {
+            return decline("topk_weight is not rank 2");
+        };
+        if !matches!(k, 1 | 2 | 4 | 6 | 8) {
+            return decline("top_k outside the specialised set");
+        }
+        if !topk_weight.is_contiguous() {
+            return decline("topk_weight is not contiguous");
+        }
+        if n == 0 {
+            return decline("empty gate renorm");
+        }
+        // The scale is narrowed here exactly as candle's `affine` narrows it:
+        // `T::from_f64(routed_scaling_factor)`.
+        let out = seam::gate_renorm_cuda(
+            topk_weight,
+            1e-20f64 as f32,
+            self.cfg.routed_scaling_factor as f32,
+            do_renorm,
+        )?;
+
+        if seam::seam_ab_enabled() {
+            // Already F32 on both sides — nothing is narrowed here, so this
+            // comparison is the whole contract.
+            seam::ab_check("seam.gate_renorm", &out, &eager(topk_weight)?)?;
+        }
+
+        seam::seam_engaged(seam::SEAM_GATE);
+        Ok(Some(out))
+    }
+
     fn forward(&self, xs: &Tensor, input_ids: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
         let (bs, seq_len, h) = xs.dims3()?;
         let xs = xs.reshape(((), h))?;
@@ -2220,17 +2455,31 @@ impl MoeGate {
         // `"norm_topk_prob": true` with `sqrtsoftplus`, so this is taken —
         // identical to the previous scoring-function-derived condition.
         // Audit finding 21.
-        if self.cfg.norm_topk_prob
+        let do_renorm = self.cfg.norm_topk_prob
             && matches!(
                 self.cfg.scoring_func,
                 ScoringFunc::Sigmoid | ScoringFunc::SqrtSoftplus
-            )
-        {
-            let denominator = (topk_weight.sum_keepdim(D::Minus1)? + 1e-20)?;
-            topk_weight = topk_weight.broadcast_div(&denominator)?;
-        }
-
-        topk_weight = (topk_weight * self.cfg.routed_scaling_factor)?;
+            );
+        // FOUR launches over a [1, 6] tensor — `fast_sum`, `affine(+1e-20)`,
+        // `bdiv`, `affine(*routed_scaling_factor)` — once per MoE layer per
+        // token, i.e. 172 per decode forward for 6 divides and 6 multiplies.
+        // Collapsed to one; `arc_seam_gate_renorm_kernel` in cuda/hc_fused.cu
+        // replays candle's identity-padded reduction tree and the fmaf that
+        // `affine` compiles to. `ARC_F32SEAM=0` / `ARC_SEAM_GATE=0` restore the
+        // chain below.
+        let eager_renorm = |w: &Tensor| -> Result<Tensor> {
+            let w = if do_renorm {
+                let denominator = (w.sum_keepdim(D::Minus1)? + 1e-20)?;
+                w.broadcast_div(&denominator)?
+            } else {
+                w.clone()
+            };
+            w * self.cfg.routed_scaling_factor
+        };
+        topk_weight = match self.fused_renorm(&topk_weight, do_renorm, &eager_renorm)? {
+            Some(w) => w,
+            None => eager_renorm(&topk_weight)?,
+        };
         drop(_prof_renorm);
 
         // RUN-161 diagnostic: are the selected top-k routing weights peaked or
@@ -2504,11 +2753,13 @@ impl Moe {
         v4_stat_dbg(&y, "moe.routed");
         let li = self.layer_idx;
         v4_collapse_dbg(&y, &format!("L{li}.moe_routed"), 1);
-        v4_collapse_dbg(
-            &topk_idx.to_dtype(DType::F32).unwrap_or_else(|_| topk_idx.clone()),
-            &format!("L{li}.moe_topk_idx"),
-            0,
-        );
+        // `to_dtype` in ARGUMENT position is evaluated eagerly, so this debug
+        // telemetry was casting the U32 expert ids to F32 on every MoE layer of
+        // every forward — 43 `cast_u32_f32` launches per decoded token — even
+        // with `ARC_COLLAPSE` unset. `v4_collapse_dbg` already casts to F32
+        // internally, *behind* the env guard, so passing the ids through
+        // unchanged is the same telemetry for zero launches.
+        v4_collapse_dbg(&topk_idx, &format!("L{li}.moe_topk_idx"), 0);
 
         if let Some(ref shared_experts) = self.shared_experts {
             let _s = arc_profiler::device_span("moe.shared_expert");
@@ -2767,8 +3018,19 @@ fn compressed_row_positions(t_c: usize, ratio: usize, dev: &Device) -> Result<Te
                 return Ok(t.clone());
             }
         }
-        let t = (Tensor::arange(0u32, t_c as u32, dev)?.to_dtype(DType::F32)? * (ratio as f64))?
-            .to_dtype(DType::U32)?;
+        // `j * ratio` is integer arithmetic. It used to be laundered through
+        // float — `arange(u32) -> cast_u32_f32 -> affine(*ratio) ->
+        // cast_f32_u32` — three kernel launches to compute a strided range
+        // that `arange_step` produces directly. The thread-local above makes
+        // that free on a hit, but a miss (first token, or a window/device
+        // change) still paid it. The values are identical: the old chain's
+        // `fmaf(j, ratio, 0.0)` is exact for every `j * ratio` a sequence can
+        // reach (both operands and the product are integers well inside f32's
+        // exact range), and `to_dtype(U32)` truncated it back. `ratio` is
+        // 1 / 4 / 128 (`CompressRatio::ratio`), never 0, so `arange_step`'s
+        // zero-step bail is unreachable. Multiplied in usize so the product
+        // cannot wrap before the u32 narrowing.
+        let t = Tensor::arange_step(0u32, (t_c * ratio) as u32, ratio as u32, dev)?;
         *c = Some((t_c, ratio, t.clone()));
         Ok(t)
     })
