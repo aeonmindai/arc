@@ -129,12 +129,20 @@ pub(crate) fn fused_swiglu_clamp(
         // back to T then multiplied in the other order.
         let eager_shared = crate::ops::mul_and_act(&g, &u, act)?;
         let fused_f32 = seam::swiglu_clamp_fused_cuda(gate, up, limit, DType::F32)?;
-        seam::ab_check("seam.swiglu.f32.routed", &fused_f32, &eager_routed)?;
-        seam::ab_check("seam.swiglu.f32.shared", &fused_f32, &eager_shared)?;
+        // CONTRACT: this site replaces the routed chain, so it must match it.
+        seam::ab_check("seam.swiglu.f32", &fused_f32, &eager_routed)?;
+        seam::ab_check("seam.swiglu.out", &out, &eager_routed.to_dtype(out_dtype)?)?;
+        // MEASUREMENT, not contract: the same value spelled with the fast-math
+        // `fused_glu` (mistralrs-quant is built with `--use_fast_math`). The
+        // routed site never used that spelling, so a difference here is not a
+        // regression — it is the number that says whether the shared-expert
+        // site could ever take the full fusion. Named `MEASURE.` so the verdict
+        // script can tell a measurement from a contract instead of failing the
+        // whole leg on it.
         seam::ab_check(
-            "seam.swiglu.out",
-            &out,
-            &eager_routed.to_dtype(out_dtype)?,
+            "seam.MEASURE.ieee_silu_vs_fastmath_glu.at_routed",
+            &fused_f32,
+            &eager_shared,
         )?;
     }
 
@@ -211,7 +219,11 @@ pub(crate) fn fused_swiglu_clamp_split(
         if matches!(act, Activation::Silu) {
             let fused_full = seam::swiglu_clamp_fused_cuda(gate, up, limit, DType::F32)?;
             let fastmath = crate::ops::mul_and_act(&ge, &ue, act)?;
-            seam::ab_check("seam.swiglu_split.ieee_vs_fastmath_glu", &fused_full, &fastmath)?;
+            seam::ab_check(
+                "seam.MEASURE.ieee_silu_vs_fastmath_glu.at_shared",
+                &fused_full,
+                &fastmath,
+            )?;
         }
     }
 
