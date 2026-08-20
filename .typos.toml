@@ -69,6 +69,11 @@ extend-ignore-re = [
 "ue" = "ue"
 "ba" = "ba"
 "ratatui" = "ratatui"
+# candle's (and numpy's) `Tensor::arange`. Already exempt as a bare Rust
+# identifier below, but it also appears as a *word inside* longer identifiers
+# — e.g. test names describing the arange expression they replaced — and
+# extend-identifiers only matches whole identifiers.
+"arange" = "arange"
 "optin" = "optin"
 
 [type.md.extend-identifiers]
