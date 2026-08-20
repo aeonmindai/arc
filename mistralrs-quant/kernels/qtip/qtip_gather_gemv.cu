@@ -88,54 +88,37 @@ __device__ __forceinline__ float2 gg_load2(const __nv_bfloat16* p) {
 }
 
 // ---------------------------------------------------------------------------
-// RUN-161: COMPUTED QTIP CODEBOOK (the "trellis is not instruction-bound" fix).
+// CODEBOOK DISPATCH — one ABI sentinel, ONE meaning.
 //
-// Each 16-bit trellis state decodes to V=2 Gaussian reproduction values. The
-// host bakes these with gaussian_lut() (mod.rs:174): splitmix64(state) -> two
-// uniforms -> Box-Muller. That is a PURE FUNCTION of `state`, so we evaluate it
-// inline in registers instead of gathering from the 512 KB global LUT.
+// `cb_mult == 0` (`CB_MULT_GAUSSIAN_LUT`, mod.rs:474) means "GATHER FROM THE
+// STORED TABLE" — in `qtip_gemv.cu`, in `qtip_grouped_gemm_lut.cu`, in the CPU
+// search, and now here. Nonzero is the MCG multiplier and selects the computed
+// sum2 code. `QtipCodebook::cuda_mult()` is the only producer of the value.
 //
-// Why this is THE lever: at L=16 the LUT is 2^16 * V * 4 = 512 KB, which does
-// NOT fit in 48 KB shared memory, so the prior "stage LUT to shared" path was
-// dead and every per-symbol weight lookup was a dependent, data-scattered
-// GLOBAL load. ncu attributed the kernel's stall to long_scoreboard (global
-// LOAD latency on exactly this gather). Computing the code in-register removes
-// that load entirely: ~a dozen integer/FP ops (cache- and bandwidth-free) per
-// weight, which is the QTIP-paper computed-code decode that reaches a large
-// fraction of HBM peak at M=1.
+// ↩️ RETRACTED (RUN-161's "compute the Gaussian in registers"): this kernel
+// used to answer `cb_mult == 0` with an INLINE BOX-MULLER
+// (splitmix64 -> two uniforms -> r*cos/r*sin) instead of reading `lut`, while
+// every other kernel gathered the table. Same sentinel, same artifact, two
+// different decoders — so PREFILL AND DECODE DISAGREED on the same weights.
 //
-// Bit-faithfulness: mirrors the host math exactly (same constants, same
-// operation order). Transcendentals (logf/sincosf) differ from the host libm
-// by <~1e-4 ULP-scale, far below quantization error — decode stays numerically
-// equivalent to the baked LUT it replaces.
-__device__ __forceinline__ float2 qtip_decode_state(uint32_t state) {
-    unsigned long long z = (unsigned long long)state * 0x9E3779B97F4A7C15ULL;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-    z ^= z >> 31;
-    const uint32_t hi = (uint32_t)(z >> 32);
-    const uint32_t lo = (uint32_t)(z & 0xFFFFFFFFu);
-    // Host denom = (u32::MAX as f32 + 2.0) == 2^32 exactly in f32.
-    const float denom = 4294967296.0f;
-    const float u1 = ((float)hi + 1.0f) / denom;
-    const float u2 = ((float)lo + 1.0f) / denom;
-    const float r = sqrtf(-2.0f * logf(u1));
-    const float theta = (2.0f * 3.14159265358979323846f) * u2;
-    float s, c;
-    sincosf(theta, &s, &c);
-    return make_float2(r * c, r * s);  // (g0, g1) == (lut[2*state], lut[2*state+1])
-}
-
-// Codebook dispatch for the decode loop. `COMPUTED_CB == false` keeps the
-// RUN-161 Gaussian-in-registers behaviour byte-for-byte; `true` is the sum2
-// code. `mult` is unused in the Gaussian arm (the Gaussian codebook has no
-// tunable constant — it is a pure function of the state).
+// The claim that justified it ("mirrors the host math exactly … bit-faithful,
+// differs by <~1e-4 ULP-scale") was FALSE: only 10.8% of values came back
+// bit-exact against `gaussian_lut()`. `logf`/`sincosf` under `--use_fast_math`
+// are not the host libm, and the error is a codeword error, not a rounding
+// error. The table in the artifact is ground truth; the kernel must read it.
+//
+// This costs the gather back on the `cb_mult == 0` path — that path is the
+// backward-compat one (`QtipCodebook::DEFAULT`, and mod.rs:4128's fallback for
+// any artifact predating the codebook tag). The shipped `qtip2b` rung passes a
+// nonzero `QTIP2B_MCG_MULT` and is unaffected. Removing the 512 KB dependent
+// gather is TCFRAG's job, and TCFRAG does it without changing what a codeword
+// decodes to.
+// ---------------------------------------------------------------------------
 template <bool COMPUTED_CB>
-__device__ __forceinline__ float2 gg_codeword(uint32_t state, unsigned int mult) {
-    if (COMPUTED_CB) {
-        return qtip_cb_sum2(state, mult);
-    }
-    return qtip_decode_state(state);
+__device__ __forceinline__ float2 gg_codeword(
+    const float* __restrict__ lut, uint32_t state, unsigned int mult
+) {
+    return qtip_cb_value_ldg<COMPUTED_CB>(lut, state, mult);
 }
 
 // ---------------------------------------------------------------------------
@@ -229,7 +212,8 @@ qtip_gather_gemv_warp_kernel(
 ) {
     constexpr int ROWS_PER_BLOCK = WARPS_PER_BLOCK * ROWS_PER_WARP;
     extern __shared__ float s_mem[];
-    (void)lut;
+    // `lut` is live on the COMPUTED_CB == false arm (see gg_codeword above).
+    // It used to be discarded here while the kernel computed Box-Muller.
 
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -340,7 +324,7 @@ qtip_gather_gemv_warp_kernel(
                 const int t = (int)QTIP_WARMUP_SYMS + j;   // nibble index in the window
                 const uint32_t sym = (hh[r][t >> 2] >> (4 * (t & 3))) & 0x0Fu;
                 state = ((state << QTIP_K) | sym) & QTIP_STATE_MASK;
-                const float2 w = gg_codeword<COMPUTED_CB>(state, cb_mult);
+                const float2 w = gg_codeword<COMPUTED_CB>(lut, state, cb_mult);
                 a = fmaf(w.x * scale, xg[j].x, a);
                 a = fmaf(w.y * scale, xg[j].y, a);
             }
@@ -373,7 +357,7 @@ qtip_gather_gemv_warp_kernel(
                 const uint8_t b = row_packed[s >> 1];
                 const uint32_t sym = (s & 1) ? ((b >> 4) & 0x0F) : (b & 0x0F);
                 state = ((state << QTIP_K) | sym) & QTIP_STATE_MASK;
-                const float2 w = gg_codeword<COMPUTED_CB>(state, cb_mult);
+                const float2 w = gg_codeword<COMPUTED_CB>(lut, state, cb_mult);
                 a = fmaf(w.x * scale, xg[j].x, a);
                 a = fmaf(w.y * scale, xg[j].y, a);
             }
