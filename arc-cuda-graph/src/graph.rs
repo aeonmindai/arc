@@ -596,10 +596,26 @@ output_trusted={} verify_remaining={} verify_failed={}",
         // no H2D copies" only because the counter also reports the byte total.
         // Never infer this from the absence of a fault.
         let (htod_n, htod_bytes) = candle_core::cuda::arc_capture_htod_retained();
+        let dtoh_n = candle_core::cuda::arc_capture_dtoh_count();
         tracing::info!(
             "ARC capture: [1a] capture-time H2D sources retained: {htod_n} copies, \
-             {htod_bytes} B (ARC_HTOD_TRACE=1 backtraces each one)"
+             {htod_bytes} B; capture-time D2H copies: {dtoh_n} \
+             (ARC_HTOD_TRACE=1 backtraces each one)"
         );
+        if dtoh_n > 0 {
+            // The destructive half of the same bug: a captured D2H writes into
+            // the caller's host `Vec`, which is freed long before the graph
+            // launches. candle redirects those writes to a leaked buffer so the
+            // heap survives, but the forward still wanted a host value it can
+            // never get from a graph -- so say so rather than let the eager/graph
+            // verification failure look like a numerics problem.
+            tracing::error!(
+                "ARC capture: {dtoh_n} device->host copies happened INSIDE the captured \
+                 region. A graph cannot serve a host readback; the sites must be moved out \
+                 of the forward or made device-resident. Re-run with ARC_HTOD_TRACE=1 to \
+                 name them."
+            );
+        }
 
         // Is the context ALREADY in error before the graph has ever run?
         //
