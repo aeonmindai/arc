@@ -552,6 +552,28 @@ output_trusted={} verify_remaining={} verify_failed={}",
         // and there is at most one capture per process.
         tracing::info!("ARC capture: [1/5] cuStreamEndCapture OK, graph recorded");
 
+        // Is the context ALREADY in error before the graph has ever run?
+        //
+        // `cuGraphLaunch` returned 700 SYNCHRONOUSLY on a capture with zero
+        // allocator misses. A synchronous illegal-address from a launch call is
+        // characteristic of a STICKY context error raised by earlier work, not
+        // of the launch itself — CUDA reports a real graph fault asynchronously,
+        // at the following sync. Nothing executes between begin_capture and
+        // here (capture records, it does not run), so a non-zero result on this
+        // line places the fault BEFORE capture — in the warmup forwards — and a
+        // zero places it in the graph. Without this the two are indistinguishable
+        // and the 700 gets blamed on whichever one is being worked on.
+        let pre = unsafe { cudaStreamSynchronize(self.stream) };
+        if pre == CUDA_SUCCESS {
+            tracing::info!("ARC capture: [1b] context CLEAN before instantiate");
+        } else {
+            tracing::error!(
+                "ARC capture: [1b] context ALREADY IN ERROR before instantiate (cudaError \
+                 {pre}). The fault happened during warmup, not in the graph; every later \
+                 CUDA call inherits it."
+            );
+        }
+
         // Instantiate (private pool still installed). RUN-161 2b:
         // AUTO_FREE_ON_LAUNCH (=1) so a graph with memory-alloc nodes can be
         // RE-launched (replayed) -- otherwise the 2nd launch fails with

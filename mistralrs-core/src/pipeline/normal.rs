@@ -2024,7 +2024,24 @@ impl Pipeline for NormalPipeline {
                                 paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
                                 &flash_meta,
                             );
-                            let _ = self.device().synchronize();
+                            // Do NOT discard this. `let _ =` here swallowed the
+                            // only place an ASYNCHRONOUS device fault in a warm
+                            // pass could ever be reported: the forward itself
+                            // returns Ok (kernels are launched, not awaited),
+                            // and the sync is what collects the fault. A
+                            // swallowed fault leaves a sticky context error, and
+                            // the next CUDA call to report it is the first
+                            // cuGraphLaunch — which is then blamed for a fault
+                            // it inherited.
+                            if let Err(e) = self.device().synchronize() {
+                                tracing::error!(
+                                    "ARC capture: warm-pass forward FAULTED at sync ({e}). The \
+                                     CUDA context is now sticky-errored and every later call, \
+                                     including the graph launch, will fail with it. Capture is \
+                                     disabled for this run."
+                                );
+                                runner.disable();
+                            }
                             tracing::info!(
                                 "ARC capture: EAGER forward (sync'd) = {:?}",
                                 t_eager.elapsed()
