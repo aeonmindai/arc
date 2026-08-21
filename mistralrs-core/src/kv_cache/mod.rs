@@ -2874,6 +2874,30 @@ mod clone_in_cache_invariant_tests {
     use crate::sequence::{SeqStepType, SequenceGroup, SequenceRecognizer};
     use candle_core::Device;
 
+    /// Run `f` with the xs window pin OFF.
+    ///
+    /// Three tests below assert the geometry of the *unpinned* retained window
+    /// — exact tail widths, and that column 0 holds token `base`. Both are
+    /// properties of the resizing policy specifically: #121's pin holds the
+    /// buffer at `span_groups * ratio + margin` and leaves real tokens sitting
+    /// ahead of `base`, so column 0 is no longer `base` and the widths are the
+    /// pinned constants instead.
+    ///
+    /// Since #121 the pin is the DEFAULT (`ARC_V4_XS_PIN_WINDOW` must be set to
+    /// `0` to turn it off), so these three have to ask for the mode they are
+    /// about. They are not thereby testing a dead path: `=0` is a supported
+    /// serving mode and is the control arm of #121's own A/B, so the
+    /// reconciliation contract they pin stays live. The pinned geometry is
+    /// covered separately by `xs_rolling`'s own tests and by
+    /// `deepseek4`'s pin A/B.
+    ///
+    /// Uses #121's `pin_test_override` — thread-local, not an env mutation,
+    /// because `cargo test` is multi-threaded and `xs_pin_window_enabled`
+    /// latches its env answer in a `OnceLock`.
+    fn unpinned<T>(f: impl FnOnce() -> T) -> T {
+        crate::kv_cache::xs_rolling::pin_test_override::with(false, f)
+    }
+
     /// A cache slot whose only interesting property is its `current_seq_len`.
     /// `all_data` stays `None` — `first_mismatched_cache_len` reads lengths,
     /// never tensors, which is exactly the point: `CACHE_GROW_SIZE = 512` means
@@ -4120,6 +4144,10 @@ mod clone_in_cache_invariant_tests {
     /// `shape mismatch on dim 1, 4 <> 132`.
     #[test]
     fn xs_base_divergence_at_equal_lengths_is_reconciled_not_refused() {
+        unpinned(xs_base_divergence_at_equal_lengths_is_reconciled_not_refused_inner);
+    }
+
+    fn xs_base_divergence_at_equal_lengths_is_reconciled_not_refused_inner() {
         // Restored from a prefix-cache entry stored at 300 tokens, truncated to
         // 260 — `base` stays at canonical(300), which is past canonical(260).
         let mut restored = xs_state(128, 1);
@@ -4236,6 +4264,10 @@ mod clone_in_cache_invariant_tests {
     /// looks at shapes.
     #[test]
     fn per_row_xs_bases_survive_a_batch_round_trip_and_are_not_flattened() {
+        unpinned(per_row_xs_bases_survive_a_batch_round_trip_and_are_not_flattened_inner);
+    }
+
+    fn per_row_xs_bases_survive_a_batch_round_trip_and_are_not_flattened_inner() {
         xs_rolling::test_override::with(true, || {
             let mut restored = xs_state(128, 1);
             feed_xs(&mut restored, 300);
@@ -4403,6 +4435,10 @@ mod clone_in_cache_invariant_tests {
     /// (token `t` carries the value `t`) and reads the actual numbers back.
     #[test]
     fn trimming_the_retained_window_drops_the_oldest_rows_not_the_newest() {
+        unpinned(trimming_the_retained_window_drops_the_oldest_rows_not_the_newest_inner);
+    }
+
+    fn trimming_the_retained_window_drops_the_oldest_rows_not_the_newest_inner() {
         use candle_core::IndexOp;
         let dev = candle_core::Device::Cpu;
         let mut state = xs_state(128, 1);

@@ -122,7 +122,7 @@ use crate::{
     utils::{progress::NiceProgressBar, unvarbuilder::UnVarBuilder},
 };
 
-use crate::kv_cache::{xs_rolling, XsRollingCache};
+use crate::kv_cache::XsRollingCache;
 
 use super::dsv4_kv_fp8::V4PackedK;
 use super::dsv4_mhc::V4MHCLayerParams;
@@ -5957,6 +5957,9 @@ mod kv_footprint_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests drive the pin override; importing it at module scope made
+    // it an unused import on every non-test build.
+    use crate::kv_cache::xs_rolling;
 
     /// The **verbatim** `config.json` published at
     /// <https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/resolve/main/config.json>

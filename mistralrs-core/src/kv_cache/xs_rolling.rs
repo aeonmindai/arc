@@ -804,8 +804,14 @@ impl XsRollingCache {
     }
 
     /// The width the retained raw window is pinned to — `span_groups * ratio +
-    /// margin`, the bound derived in [`xs_pin_window_enabled`] that
+    /// margin`, the bound derived in `xs_pin_window_enabled` that
     /// `tokens - base` provably never reaches.
+    ///
+    /// (Not an intra-doc link: `XsRollingCache` is re-exported from the crate
+    /// root but `xs_pin_window_enabled` is not, so rustdoc reads a public item
+    /// linking to a private one and warns. Exporting it alongside its exact
+    /// analogue `xs_per_sequence_enabled` would also close this, but that is an
+    /// API-surface change and not this PR's business.)
     ///
     /// A function of the layer's own geometry, so it does not grow with context
     /// length: 24 for V4's CSA layers, 144 for HCA. That is the whole point —
