@@ -546,9 +546,11 @@ pub async fn sample_and_add_toks(
 /// what the greedy host path returns (`sampler.rs:1490`), and `bytes` /
 /// `top_logprobs` are read only when `return_logprobs` is set, which this
 /// refuses.
+// `&mut` only because `Sequence::sampler()` takes `&mut self` (`sequence.rs:885`)
+// to hand back a clone of an `Arc`. Nothing here mutates the sequence.
 #[cfg(feature = "cuda")]
 fn device_loop_pre_sampled_token(
-    seq: &Sequence,
+    seq: &mut Sequence,
     return_logprobs: bool,
     sample_speculative: bool,
 ) -> Option<Logprobs> {
@@ -574,7 +576,7 @@ fn device_loop_pre_sampled_token(
 /// Without CUDA there is no device loop, so nothing is ever pre-sampled.
 #[cfg(not(feature = "cuda"))]
 fn device_loop_pre_sampled_token(
-    _seq: &Sequence,
+    _seq: &mut Sequence,
     _return_logprobs: bool,
     _sample_speculative: bool,
 ) -> Option<Logprobs> {
