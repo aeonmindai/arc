@@ -254,10 +254,18 @@ initializer" would send the next reader looking for a panic that is not there.*
 **(b) "The live b=1 trellis path" was true at `cc5487ad3` and is not true
 now.** The dispatch sites are the b=1 ones — dense single-token decode
 (`fused_gemv_2b_cuda`, `bitshift.rs:1423`, guarded by `n_tokens == 1`) and MoE
-on-device gather decode (`gather_gemv_2b_cuda`, `bitshift.rs:1712`) — and the
-`.cu` header itself claims *"the whole of the b=1 decode path"*. After #209 the
-default is OFF, so at `9c127a2b1` it carries **zero production traffic**. Phrase
-it as "was the default b=1 trellis path at `cc5487ad3`; now opt-in."
+on-device gather decode (`gather_gemv_2b_cuda`, `bitshift.rs:1712`). After #209
+the default is OFF, so at `9c127a2b1` it carries **zero production traffic**.
+Phrase it as "was the default b=1 trellis path at `cc5487ad3`; now opt-in."
+
+🔴 **And do not repeat the mis-quote #209 shipped.** Its merged doc comment
+argues that *"by that same header it owns 'the whole of the b=1 decode path'"* —
+but read the header: the phrase at `qtip2b_tcfrag.cu:19` is about
+**`qtip2b_gemv_tuned_kernel`**, the *shipped* kernel TCFRAG was written to
+replace, not about TCFRAG. The conclusion (that TCFRAG served b=1 by default at
+`cc5487ad3`) is right, and the dispatch sites above establish it independently —
+but **the quoted sentence does not say what it was cited as saying, and it is
+now on master saying it.** Worth a one-line follow-up on `cuda_ops.rs`.
 
 ### The decline evidence, and its limits
 
