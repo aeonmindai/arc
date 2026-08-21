@@ -244,11 +244,18 @@ pub fn xs_per_sequence_enabled() -> bool {
     })
 }
 
-/// `ARC_V4_XS_PIN_WINDOW` — hold the retained raw window at a **constant**
+/// `ARC_V4_XS_PIN_WINDOW=1` — hold the retained raw window at a **constant**
 /// width instead of re-narrowing it to `tokens - base` every step.
-/// **Default ON**; `=0` (also `false`/`off`/`no`) restores the resizing buffer.
+/// **Default OFF.** See [`xs_pin_window_enabled_from`] for the polarity, the
+/// reason, and the named measurement that flips this default back on.
 ///
-/// # Why this is on by default without a throughput measurement first
+/// # The argument that once made this default-ON, kept because it is still true
+///
+/// This shipped default-ON on #121's branch, on the reasoning below. The
+/// reasoning is sound as far as it goes — it is why the pin is *safe* — but it
+/// is an argument about correctness, and the default was also a claim about
+/// throughput, which is what was never measured on this tree. Correctness
+/// argument retained; default retracted.
 ///
 /// The usual rule on this project is measure-then-default-on, and it exists
 /// because FP8 KV shipped defaulted-on and broke every forward for a day. The
@@ -296,10 +303,7 @@ pub fn xs_pin_window_enabled() -> bool {
     }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = !matches!(
-            std::env::var("ARC_V4_XS_PIN_WINDOW").as_deref(),
-            Ok("0") | Ok("false") | Ok("off") | Ok("no")
-        );
+        let on = xs_pin_window_enabled_from(std::env::var("ARC_V4_XS_PIN_WINDOW").ok().as_deref());
         // Named once per process, so an A/B that means to compare pinned
         // against unpinned can ASSERT it got two different builds of behaviour
         // rather than two identical arms reporting a 1.000x ratio. A flag whose
@@ -311,6 +315,66 @@ pub fn xs_pin_window_enabled() -> bool {
         );
         on
     })
+}
+
+/// Pure half of [`xs_pin_window_enabled`], so the polarity is testable without
+/// mutating the process environment.
+///
+/// # Why the pin is OPT-IN
+///
+/// This shipped default-ON, with `=0` as the control arm, because that made the
+/// A/B guard meaningful. It is now default-OFF, `== Some("1")`, and the A/B
+/// carries the flag on its TREATMENT arm instead.
+///
+/// The width bound above is proved, and the pin is very probably a win. But
+/// "probably a win" is not the bar. It changes what the serving path retains —
+/// at V4's HCA geometry the window is held at 144 columns where the resizing
+/// policy keeps as few as 4 at some residues — and the +23.2% at uniform B=32
+/// that motivates it was measured on this change's own branch, against a tree
+/// that no longer exists. That is an unmeasured default, and unmeasured
+/// defaults are how this repo lost a week: TCFRAG was default-ON with
+/// "UNVERIFIED ON HARDWARE — NEVER RUN" in its own header and held 63 GB
+/// (#209), and the fused-512 attention path silently dropped the attention mask
+/// for four days at 12% agreement.
+///
+/// So: **unverified means default-off, and "unverified" means unmeasured, not
+/// new.**
+///
+/// # FLIP CONDITION — this default is meant to change
+///
+/// Off is a **temporary state with an owner**, not the finish line. Arc's
+/// larger problem is not unbuilt work, it is finished, correct, tested work
+/// left switched off — a complete GPU sampler with no callers, a fused decode
+/// path nobody enabled, 34 tok/s of landed work while master served 17. A flag
+/// that ships off with no named experiment behind it is how that happens, so
+/// here is the experiment.
+///
+/// * **Gate:** `ARC_V4_XS_PIN_WINDOW`, read at
+///   `mistralrs-core/src/kv_cache/xs_rolling.rs` in
+///   [`xs_pin_window_enabled_from`] (this function).
+/// * **The measurement that flips it:** one binary, uniform B=32 decode, same
+///   prompt and same seed, two arms — `ARC_V4_XS_PIN_WINDOW=1` against the flag
+///   unset. `arc-tools/arcspec_perseq_ladder.sh` already runs exactly this
+///   shape and asserts, from the per-process `xs rolling window is …` log line,
+///   that the two arms really differed. Pass = the pinned arm is faster on
+///   aggregate tok/s, with no change in generated tokens.
+/// * **What it was, on its own branch and not on this tree:** +23.2% at uniform
+///   B=32. That number was taken on #121 before rebase, against a tree that no
+///   longer exists. It is **not a current fact** and must not be quoted as one.
+/// * **On pass, the default flips to ON in the same change that records the
+///   number.** Leaving it off after the measurement succeeds is a failure
+///   state, not a safe one.
+///
+
+/// Nothing about CUDA-graph capture depends on this default: capture asks for
+/// the pin per-cache through [`XsRollingCache::pin_tail_width`], and
+/// `pin_is_on` honours that trigger independently of this flag.
+///
+/// Read by VALUE and not by presence — #212 converted 23 `ARC_*` flags because
+/// `var_os(..).is_some()` made `ARC_FOO=0` mean ON, which silently turns an A/B
+/// control arm into a second treatment arm.
+pub fn xs_pin_window_enabled_from(value: Option<&str>) -> bool {
+    value == Some("1")
 }
 
 /// Test-only override for [`xs_pin_window_enabled`], thread-local for the same
@@ -1919,5 +1983,62 @@ mod tests {
             !xs.supports_per_sequence_len(),
             "the override must not leak"
         );
+    }
+}
+
+#[cfg(test)]
+mod pin_gate_polarity_tests {
+    use super::*;
+
+    /// The pin is OFF unless explicitly asked for.
+    ///
+    /// It shipped default-ON in #121, which made the A/B's control arm the one
+    /// carrying `=0`. That is the wrong way round for something unmeasured on
+    /// this tree: the pin changes what serving retains (144 columns at V4's HCA
+    /// geometry, against as few as 4 at some residues under the resizing
+    /// policy), and its +23.2% at uniform B=32 was measured on #121's own
+    /// branch. Same lesson as #209's TCFRAG retirement.
+    ///
+    /// This is NOT a parking assertion. See `xs_pin_window_enabled_from`'s doc
+    /// comment for the single measurement that flips this default back on.
+    #[test]
+    fn the_pin_is_off_unless_explicitly_enabled() {
+        assert!(
+            !xs_pin_window_enabled_from(None),
+            "unset must mean OFF — the pin is unmeasured on the current tree"
+        );
+        assert!(xs_pin_window_enabled_from(Some("1")));
+    }
+
+    /// Read by VALUE. #212 converted 23 `ARC_*` flags because
+    /// `var_os(..).is_some()` made `ARC_FOO=0` mean ON — which turns an A/B's
+    /// control arm into a second treatment arm and reports a clean 1.000x.
+    #[test]
+    fn zero_means_off_and_so_does_every_other_value() {
+        for v in ["0", "", "false", "no", "off", "true", "yes", "on", "2", " 1"] {
+            assert!(
+                !xs_pin_window_enabled_from(Some(v)),
+                "{v:?} must not enable the pin; only the exact string \"1\" does"
+            );
+        }
+    }
+
+    /// Capture must not depend on the env default: it asks per-cache through
+    /// `pin_tail_width()`, and `pin_is_on` honours that trigger on its own.
+    /// If this regressed, CUDA-graph capture would silently go back to a
+    /// per-step-varying allocation size — which is not a slow graph but an
+    /// invalid one.
+    #[test]
+    fn capture_still_gets_a_constant_width_with_the_env_flag_off() {
+        pin_test_override::with(false, || {
+            let mut c = XsRollingCache::new(4, 2, 16, 64);
+            assert!(!c.pin_is_on(), "env off and pin_tail unset => not pinned");
+            c.pin_tail_width();
+            assert!(
+                c.pin_is_on(),
+                "capture's per-cache trigger must work with the env flag off"
+            );
+            assert_eq!(c.graph_tail_width(), c.window_capacity());
+        });
     }
 }

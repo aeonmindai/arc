@@ -119,6 +119,39 @@ static REGISTRY: &[Capability] = &[
         },
         status: Status::Live,
     },
+    // ── SHIPPED OFF, WITH A NAMED EXPERIMENT ────────────────────────────────
+    //
+    // The entry below is `Live` because the GATE is reached on every step —
+    // that is what this file checks, and it must not go dark. What is switched
+    // off is the gate's DEFAULT ANSWER, which no reachability check can see.
+    //
+    // Recording it here anyway, because "built, correct, tested, and switched
+    // off" is this repo's most expensive failure mode and this file is where
+    // someone goes looking for it. 26 pieces of finished work are parked that
+    // way right now, including a complete GPU sampler with zero callers; we
+    // shipped 34 tok/s of landed work while master served 17, for exactly this
+    // reason. A flag that ships off with no named experiment behind it is how
+    // that happens, so the experiment is named:
+    //
+    //   flag  ARC_V4_XS_PIN_WINDOW=1
+    //   gate  kv_cache/xs_rolling.rs :: xs_pin_window_enabled_from
+    //   test  arc-tools/arcspec_perseq_ladder.sh — ON vs ON_PINNED, uniform
+    //         B=32, one binary, same prompt and seed
+    //   pass  ON_PINNED faster on aggregate tok/s, generated tokens identical
+    //   was   +23.2% at uniform B=32 on #121's own pre-rebase branch — NOT a
+    //         current fact, do not quote it as one
+    //   then  the default flips to ON in the same change that records the
+    //         number. Leaving it off after a passing measurement is a failure
+    //         state, not the finish line.
+    Capability {
+        name: "xs window pin: built and tested, default OFF pending one measurement",
+        parent: "ArcInfer / ArcKV",
+        check: Check::Symbol {
+            symbol: "xs_pin_window_enabled",
+            defined_in: "mistralrs-core/src/kv_cache/xs_rolling.rs",
+        },
+        status: Status::Live,
+    },
     Capability {
         name: "ragged decode: per-row lengths on the xs cache",
         parent: "ArcInfer / ArcKV",

@@ -2883,12 +2883,17 @@ mod clone_in_cache_invariant_tests {
     /// ahead of `base`, so column 0 is no longer `base` and the widths are the
     /// pinned constants instead.
     ///
-    /// Since #121 the pin is the DEFAULT (`ARC_V4_XS_PIN_WINDOW` must be set to
-    /// `0` to turn it off), so these three have to ask for the mode they are
-    /// about. They are not thereby testing a dead path: `=0` is a supported
-    /// serving mode and is the control arm of #121's own A/B, so the
-    /// reconciliation contract they pin stays live. The pinned geometry is
-    /// covered separately by `xs_rolling`'s own tests and by
+    /// The pin is opt-in (`ARC_V4_XS_PIN_WINDOW=1`), so as things stand these
+    /// three would pass without asking. They ask anyway, deliberately: the
+    /// default is expected to flip to ON once the pin is measured on this tree
+    /// (see `xs_rolling::xs_pin_window_enabled_from`'s FLIP CONDITION), and a
+    /// test that depends on a default it does not name is a test that breaks on
+    /// the day someone flips it. Naming the mode makes these three immune to
+    /// that, in either direction.
+    ///
+    /// They are not testing a dead path either way: the resizing window is a
+    /// supported serving mode and is one arm of the pin A/B. The pinned
+    /// geometry is covered separately by `xs_rolling`'s own tests and by
     /// `deepseek4`'s pin A/B.
     ///
     /// Uses #121's `pin_test_override` — thread-local, not an env mutation,

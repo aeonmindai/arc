@@ -8225,10 +8225,16 @@ mod tests {
     }
 
     /// 🔑 Pinning the retained window must change the ALLOCATION and nothing
-    /// else. This is the evidence for defaulting `ARC_V4_XS_PIN_WINDOW` on
-    /// without a throughput number first: the two settings are run against the
-    /// same stream for 40 steps and required to agree EXACTLY, on the
-    /// compressed rows and on both time bases.
+    /// else. This is the evidence that the pin is SAFE — the two settings are
+    /// run against the same stream for 40 steps and required to agree EXACTLY,
+    /// on the compressed rows and on both time bases.
+    ///
+    /// It was once also offered as the evidence for defaulting
+    /// `ARC_V4_XS_PIN_WINDOW` on without a throughput number. It is not that:
+    /// it proves the pin changes no answer, which is necessary and not
+    /// sufficient. The flag is opt-in until the throughput number exists on
+    /// this tree — see `xs_rolling::xs_pin_window_enabled_from`'s FLIP
+    /// CONDITION for the experiment that settles it.
     ///
     /// The argument for why they must — every offset is derived from the row's
     /// own token count, so a wider buffer shifts `off` by exactly the widening

@@ -393,17 +393,23 @@ run_arm() {
 
 run_arm OFF || die "OFF arm failed"
 run_arm ON ARC_V4_XS_PER_SEQ=1 ARC_MTP_PER_SEQ_KV=1 || die "ON arm failed"
-# The third arm prices the window pin, which is ON by default in every arm
-# above. Same flags as ON, pin disabled — so ON vs ON_UNPINNED isolates one
-# change: whether the compressor's raw window is reallocated every decode step
-# on all 41 compressed layers, or held at its documented bound.
-run_arm ON_UNPINNED ARC_V4_XS_PER_SEQ=1 ARC_MTP_PER_SEQ_KV=1 ARC_V4_XS_PIN_WINDOW=0 \
-  || die "ON_UNPINNED arm failed"
+# The third arm prices the window pin, which is OPT-IN (default OFF) — so every
+# arm above is unpinned and this one is the treatment. Same flags as ON, pin
+# enabled, so ON vs ON_PINNED isolates one change: whether the compressor's raw
+# window is reallocated every decode step on all 41 compressed layers, or held
+# at its documented bound.
+#
+# This arm IS the experiment named in `xs_pin_window_enabled_from`'s FLIP
+# CONDITION. If ON_PINNED wins at uniform B=32 with identical generated tokens,
+# `ARC_V4_XS_PIN_WINDOW` defaults to ON and that doc comment is rewritten in the
+# same change that records the number.
+run_arm ON_PINNED ARC_V4_XS_PER_SEQ=1 ARC_MTP_PER_SEQ_KV=1 ARC_V4_XS_PIN_WINDOW=1 \
+  || die "ON_PINNED arm failed"
 
 cat > "$OUT/report.py" <<'PYEOF'
 import json, os, sys
 out, batches, regimes = sys.argv[1], sys.argv[2].split(), sys.argv[3].split()
-ARMS = ("OFF", "ON", "ON_UNPINNED")
+ARMS = ("OFF", "ON", "ON_PINNED")
 def cell(arm, regime, k):
     p = os.path.join(out, f"{arm}.{regime}.k{k}.cell.json")
     try:
@@ -446,12 +452,20 @@ for regime in regimes:
         print(f"        tok/bstep  {ratio('tok_per_batch_step')}")
         print(f"        bsteps/s   {ratio('batch_steps_per_s')}")
         print(f"        run_bucket {ratio('running_bucket_size')}")
-print("\n=== THE WINDOW PIN, isolated (ON vs ON_UNPINNED) ===")
+print("\n=== THE WINDOW PIN, isolated (ON = control, ON_PINNED = treatment) ===")
 print("Same per-seq flags in both; the only difference is whether the")
 print("compressor's raw window is reallocated every decode step on 41 layers.")
+print("Ratios are treatment/control, so >1.000x means the pin helped.")
+print("This is the number in ARC_V4_XS_PIN_WINDOW's FLIP CONDITION: if the")
+print("uniform B=32 row is >1.000x with identical output, the default flips ON.")
 for regime in regimes:
     for k in batches:
-        u, p_ = cell("ON_UNPINNED", regime, k), cell("ON", regime, k)
+        # `u` is the unpinned control, `p_` the pinned treatment; the pin is
+        # opt-in, so the DEFAULT arm (ON) is the control. This pairing was the
+        # other way round while the pin defaulted on — the ratio is
+        # treatment/control either way, and swapping the arms without swapping
+        # this would have silently inverted every number below.
+        u, p_ = cell("ON", regime, k), cell("ON_PINNED", regime, k)
         def r2(key):
             a, b = u.get(key), p_.get(key)
             if not a or not b:
@@ -495,9 +509,9 @@ PYEOF
   echo "  per_seq_steps final, OFF: $(grep -o 'per_seq_steps=[0-9]*' "$OUT/server.OFF.log" 2>/dev/null | tail -1) (want =0)"
   echo "  'xs rolling cache' errors ON=$(grep -c 'xs rolling cache' "$OUT/server.ON.log" 2>/dev/null || echo 0) OFF=$(grep -c 'xs rolling cache' "$OUT/server.OFF.log" 2>/dev/null || echo 0) (want 0/0)"
   echo
-  echo "  -- window pin engagement (a wrong flag name would make ON and ON_UNPINNED"
+  echo "  -- window pin engagement (a wrong flag name would make ON and ON_PINNED"
   echo "     the same build and report a free pin from two identical arms) --"
-  for a in OFF ON ON_UNPINNED; do
+  for a in OFF ON ON_PINNED; do
     echo "    $a: $(grep -m1 -o 'xs rolling window is [A-Z]*' "$OUT/server.$a.log" 2>/dev/null || echo 'NOT LOGGED')"
   done
   # ⚠️ Read from the LOG, never from the binary. BOTH mode strings are compiled
@@ -506,21 +520,23 @@ PYEOF
   # process actually took. `RUST_LOG=info` is set once in `run_arm`, shared by
   # every arm, so no arm can have this line filtered out while another keeps it.
   #
-  # ⚠️ The default direction matters here: unset means PINNED
-  # (`xs_rolling.rs`, ARC_V4_XS_PIN_WINDOW is off only for 0|false|off|no). So
-  # the TREATMENT is the default and the CONTROL is the one carrying the flag —
-  # which means a typo in the flag name yields a control that silently ran the
-  # treatment, and a perfectly clean-looking 1.000x.
-  pin_on=$(grep -c 'xs rolling window is PINNED' "$OUT/server.ON.log" 2>/dev/null || echo 0)
-  pin_off=$(grep -c 'xs rolling window is RESIZING' "$OUT/server.ON_UNPINNED.log" 2>/dev/null || echo 0)
-  ctrl_leaked=$(grep -c 'xs rolling window is PINNED' "$OUT/server.ON_UNPINNED.log" 2>/dev/null || echo 0)
-  if [ "$pin_on" -ge 1 ] && [ "$pin_off" -ge 1 ] && [ "$ctrl_leaked" -eq 0 ]; then
-    echo "    => VALID: ON took the pinned path, ON_UNPINNED took the resizing path."
-    echo "       The control reached the resizing branch; it did not silently run the treatment."
+  # ⚠️ The default direction matters here, and it INVERTED when the pin became
+  # opt-in: unset now means RESIZING (`xs_rolling.rs`,
+  # `xs_pin_window_enabled_from` is `== Some("1")`). So the CONTROL is the
+  # default and the TREATMENT is the one carrying the flag. A typo in the flag
+  # name now yields a treatment that silently ran the control — still a
+  # perfectly clean-looking 1.000x, which is why this check tests BOTH
+  # directions rather than inferring one from the other.
+  pin_off=$(grep -c 'xs rolling window is RESIZING' "$OUT/server.ON.log" 2>/dev/null || echo 0)
+  pin_on=$(grep -c 'xs rolling window is PINNED' "$OUT/server.ON_PINNED.log" 2>/dev/null || echo 0)
+  treat_leaked=$(grep -c 'xs rolling window is RESIZING' "$OUT/server.ON_PINNED.log" 2>/dev/null || echo 0)
+  if [ "$pin_off" -ge 1 ] && [ "$pin_on" -ge 1 ] && [ "$treat_leaked" -eq 0 ]; then
+    echo "    => VALID: ON took the resizing path, ON_PINNED took the pinned path."
+    echo "       The treatment reached the pinned branch; it did not silently run the control."
   else
-    echo "    => ⚠️ PIN A/B IS VOID: ON pinned=$pin_on, ON_UNPINNED resizing=$pin_off,"
-    echo "       control-leaked-to-pinned=$ctrl_leaked."
-    echo "       Any ON-vs-ON_UNPINNED ratio below compares one thing with itself. Do not read it."
+    echo "    => ⚠️ PIN A/B IS VOID: ON resizing=$pin_off, ON_PINNED pinned=$pin_on,"
+    echo "       treatment-leaked-to-resizing=$treat_leaked."
+    echo "       Any ON-vs-ON_PINNED ratio below compares one thing with itself. Do not read it."
   fi
   python3 "$OUT/report.py" "$OUT" "$BATCHES" "$REGIMES"
 } | tee "$OUT/summary.txt"
