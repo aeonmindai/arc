@@ -265,7 +265,7 @@ impl MoEExpertsBackend {
         // loop (Slow) to test whether the CUDA gather kernel is mis-dispatching
         // experts (collapse). If output stays collapsed under Slow, the bug is
         // in the shared dequant/quant, not the gather kernel.
-        if std::env::var_os("ARC_MOE_SLOW").is_some() {
+        if mistralrs_quant::env_flag_is_set("ARC_MOE_SLOW") {
             return Self::Slow;
         }
         let has_immediate_isq = mistralrs_quant::get_immediate_isq().is_some();

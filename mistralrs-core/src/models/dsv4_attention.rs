@@ -733,7 +733,7 @@ pub fn dsv4_attention(
     // here was the long-context collapse). ARC_V4_STANDARD_DENSE=1 restores
     // the pre-fix dense-causal behavior for on-GPU A/B triage only.
     if cfg.compress_ratio == CompressRatio::Standard
-        && std::env::var_os("ARC_V4_STANDARD_DENSE").is_some()
+        && mistralrs_quant::env_flag_is_set("ARC_V4_STANDARD_DENSE")
     {
         return Sdpa.run_attention(q, k, v, attention_mask, Some(flash_params), sdpa_params);
     }

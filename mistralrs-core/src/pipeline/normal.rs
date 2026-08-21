@@ -226,39 +226,23 @@ pub(crate) fn parse_alloc_cache_capacity(raw: Option<&str>) -> Option<usize> {
 /// is reported rather than silently bucketed — a typo in an ops script must not
 /// decide an experiment.
 ///
+/// # Why this is a re-export rather than a definition
+///
+/// That bug class was not confined to one flag: 23 more were found reading by
+/// presence across `mistralrs-core`, `mistralrs-quant` and `arc-cuda-graph`.
+/// The parser therefore lives in [`mistralrs_quant::env_flag`], the lowest
+/// crate in the workspace, so every one of those call sites can reach it — and,
+/// more importantly, so its polarity tests can *run*: several of the converted
+/// gates sit in `qtip::cuda_ops`, which is `#![cfg(feature = "cuda")]`, and a
+/// test written beside them executes on no machine without a GPU.
+///
 /// `1`, `true`, `yes`, `on` (any case, surrounding whitespace ignored) are yes.
 /// Unset, empty, `0`, `false`, `no`, `off` are no.
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-pub(crate) fn env_flag_is_set(name: &str) -> bool {
-    let raw = std::env::var(name).ok();
-    match env_flag_value(raw.as_deref()) {
-        Some(v) => v,
-        None => {
-            tracing::warn!(
-                "{name}={:?} is not a recognised on/off value (use 1/0) — treating it as OFF. \
-                 Note that {name} is an opt-OUT: 1 disables, 0 and unset leave it enabled.",
-                raw.unwrap_or_default()
-            );
-            false
-        }
-    }
-}
-
-/// Pure half of [`env_flag_is_set`], so the polarity is testable without
-/// mutating process environment.
-///
-/// `None` means "value present but not recognised" — the caller decides what to
-/// do with that, and must not silently fold it into `false`.
-pub(crate) fn env_flag_value(raw: Option<&str>) -> Option<bool> {
-    let Some(raw) = raw else {
-        return Some(false);
-    };
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "" | "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
-}
+// The sole consumer in this module (`ARC_NO_DEDICATED_DECODE`) is cuda-gated,
+// so the re-export is unused in a CPU build. Mirrors the `allow(dead_code)` the
+// definition carried for the same reason.
+#[cfg_attr(not(feature = "cuda"), allow(unused_imports))]
+pub(crate) use mistralrs_quant::env_flag_is_set;
 
 /// Emit the allocator's counters every `ARC_ALLOC_CACHE_STATS` decode steps.
 ///
@@ -1937,7 +1921,7 @@ impl Pipeline for NormalPipeline {
                 // replay and discard it, using eager for the real logits.
                 #[cfg(feature = "cuda")]
                 {
-                    let probe = std::env::var_os("ARC_V4_CAPTURE_PROBE").is_some();
+                    let probe = mistralrs_quant::env_flag_is_set("ARC_V4_CAPTURE_PROBE");
                     // Shadowed (cuda-only) so step 2b can swap in the
                     // address-stable buffer without making the outer
                     // destructuring binding `mut`, which would warn on every
@@ -3254,7 +3238,12 @@ mod alloc_cache_capacity_tests {
 /// process environment, which every test in the binary shares.
 #[cfg(test)]
 mod env_flag_polarity_tests {
-    use super::env_flag_value;
+    // The parser moved to `mistralrs-quant` so that every crate with a
+    // presence-tested flag could reach it, and so its tests could run without
+    // the `cuda` feature. These assertions are kept here, pointed at the shared
+    // parser: a second independent pin on the same table costs nothing, and
+    // this one sits next to `ARC_NO_DEDICATED_DECODE`, the flag that started it.
+    use mistralrs_quant::env_flag_value;
 
     /// THE REGRESSION. Under the old `var_os(..).is_some()` reading every one of
     /// these was "set" and therefore "yes". A presence test cannot tell them

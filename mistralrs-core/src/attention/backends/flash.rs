@@ -498,8 +498,11 @@ mod tests {
     #[test]
     fn fa3_is_not_preferred_by_default() {
         // Guard against a stray env var in the test environment making this
-        // vacuous: only assert the default when the opt-in is absent.
-        if std::env::var_os("ARC_PREFER_FA3").is_none() {
+        // vacuous: only assert the default when the opt-in is not ASKED FOR.
+        // Read by value, so a box that exports `ARC_PREFER_FA3=0` still runs
+        // the assertion — under the presence test it silently skipped it,
+        // which is a tripwire that quietly stopped being a tripwire.
+        if !mistralrs_quant::env_flag_is_set("ARC_PREFER_FA3") {
             assert!(
                 !fa3_preferred(),
                 "FA3 must stay opt-in while candle#3606 is unfixed in the pinned fork"

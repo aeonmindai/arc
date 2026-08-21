@@ -3382,7 +3382,7 @@ impl IsqModelLoader for DeepSeekV4Loader {
         // cost is kernel inefficiency, not bytes) and broke coherence (garbage out).
         // Re-enable only AFTER Phase D makes the forward memory-bound (and with
         // Viterbi + calibration for quality). q_norm/kv_norm/attn_sink excluded.
-        if std::env::var_os("ARC_QUANT_ATTENTION").is_some() {
+        if mistralrs_quant::env_flag_is_set("ARC_QUANT_ATTENTION") {
             data.extend([
                 Regex::new(r"layers\.(\d+)\.(self_)?attn\.(wq_a|q_a_proj)\.(weight|bias)$")?,
                 Regex::new(r"layers\.(\d+)\.(self_)?attn\.(wq_b|q_b_proj)\.(weight|bias)$")?,

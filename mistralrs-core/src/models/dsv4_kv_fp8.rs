@@ -158,7 +158,10 @@ impl KvQuantMode {
     pub(crate) fn from_env() -> Self {
         static MODE: OnceLock<KvQuantMode> = OnceLock::new();
         *MODE.get_or_init(|| {
-            let legacy_gpu = std::env::var_os("ARC_GPU_ACT_QUANT").is_some();
+            // Read by VALUE. `ARC_GPU_ACT_QUANT=0` now means what it says. Under
+            // the presence test it selected `GpuApprox` — the one variant this
+            // module documents as not bit-exact and "must not be shipped".
+            let legacy_gpu = mistralrs_quant::env_flag_is_set("ARC_GPU_ACT_QUANT");
             let new = std::env::var("ARC_KV_FP8_IMPL").ok();
             let old = std::env::var("ARC_KV_FP8_MODE").ok();
             if old.is_some() {

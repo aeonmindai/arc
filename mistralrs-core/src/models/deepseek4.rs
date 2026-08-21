@@ -414,7 +414,9 @@ impl DeepSeekV4Config {
         &self,
         compress_ratio: i32,
     ) -> Option<DeepSeekV2RopeScaling> {
-        if compress_ratio == 0 && std::env::var_os("ARC_YARN_ON_STANDARD_LAYERS").is_none() {
+        if compress_ratio == 0
+            && !mistralrs_quant::env_flag_is_set("ARC_YARN_ON_STANDARD_LAYERS")
+        {
             None
         } else {
             self.rope_scaling.clone()
@@ -1185,7 +1187,7 @@ impl Attention {
         // RUN-161 ablation: ARC_DISABLE_SINK=1 drops the attention sink to test
         // whether sink-mass domination (head_dim=512 falls into the unfused
         // softmax_with_sinks path on every layer) is collapsing attention output.
-        let sinks_for_sdpa = if std::env::var_os("ARC_DISABLE_SINK").is_some() {
+        let sinks_for_sdpa = if mistralrs_quant::env_flag_is_set("ARC_DISABLE_SINK") {
             None
         } else if let Some(ref s) = attn_sink {
             Some(s.reshape((1, cfg.num_attention_heads, 1, 1))?)
@@ -1837,7 +1839,7 @@ impl Attention {
         let compressed_kv = {
             let _s = arc_profiler::device_span("compressed_kv_build");
             match compressed_rows {
-                Some(rows) if std::env::var_os("ARC_V4_WINDOW_ONLY").is_none() => {
+                Some(rows) if !mistralrs_quant::env_flag_is_set("ARC_V4_WINDOW_ONLY") => {
                     Some(self.compressed_kv_from_rows(&rows)?)
                 }
                 _ => None,
@@ -2278,7 +2280,7 @@ impl MoeGate {
         // actually loaded for score-routed layers. If it is None on a
         // score-routed layer (layer_idx >= num_hash_layers), expert selection
         // ignores the trained bias and picks the wrong top-k → collapse.
-        if std::env::var_os("ARC_COLLAPSE").is_some() {
+        if mistralrs_quant::env_flag_is_set("ARC_COLLAPSE") {
             match &e_score_correction_bias {
                 Some(b) => {
                     let stats = b
@@ -2548,7 +2550,7 @@ impl MoeGate {
         // near-uniform? Near-uniform weights average 6 redundant experts and
         // amplify their shared common-mode (collapse). Log the spread of the
         // raw gate logits at the selected experts, and the final weight spread.
-        if std::env::var_os("ARC_COLLAPSE").is_some() {
+        if mistralrs_quant::env_flag_is_set("ARC_COLLAPSE") {
             if let Ok(topk_logits) = logits.gather(&topk_idx, 1) {
                 v4_stat_dbg(&topk_logits, "gate.topk_logits");
             }
@@ -2559,7 +2561,7 @@ impl MoeGate {
         // weights with a softmax over the selected experts' RAW logits (peaked
         // routing). If this restores coherence, the routing-weight uniformity is
         // the collapse root cause.
-        if std::env::var_os("ARC_SOFTMAX_ROUTE").is_some() {
+        if mistralrs_quant::env_flag_is_set("ARC_SOFTMAX_ROUTE") {
             if let Ok(topk_logits) = logits.gather(&topk_idx, 1) {
                 let sm = candle_nn::ops::softmax_last_dim(&topk_logits)?;
                 topk_weight =
@@ -2572,7 +2574,7 @@ impl MoeGate {
         // largest-weight expert per token (zeroes the rest) to test whether the
         // near-uniform top-6 averaging of redundant deep-layer experts is the
         // common-mode source.
-        if std::env::var_os("ARC_ROUTE_TOP1").is_some() {
+        if mistralrs_quant::env_flag_is_set("ARC_ROUTE_TOP1") {
             let max = topk_weight.max_keepdim(D::Minus1)?;
             let diff = topk_weight.broadcast_sub(&max)?;
             let mask = diff.ge(&diff.zeros_like()?)?.to_dtype(topk_weight.dtype())?;
@@ -2800,7 +2802,7 @@ impl Moe {
         // prompt tokens route to the SAME experts (routing collapse) or stay
         // diverse. If score-routed layers over-concentrate vs the hash layers,
         // the selection bias / scoring is wrong.
-        if std::env::var_os("ARC_COLLAPSE").is_some()
+        if mistralrs_quant::env_flag_is_set("ARC_COLLAPSE")
             && matches!(self.layer_idx, 1 | 4 | 7 | 14 | 20)
         {
             if let Ok(v) = topk_idx.to_dtype(DType::U32).and_then(|t| t.to_vec2::<u32>()) {
@@ -3192,7 +3194,7 @@ fn v4_fp8_kv_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         fp8_kv_enabled_from(
             std::env::var("ARC_V4_FP8_KV").ok().as_deref(),
-            std::env::var_os("ARC_V4_CAPTURE_PROBE").is_some(),
+            mistralrs_quant::env_flag_is_set("ARC_V4_CAPTURE_PROBE"),
         )
     })
 }
@@ -3321,7 +3323,7 @@ fn emit_decode_profile(input_ids: &Tensor, instrumented: bool) {
 pub(crate) fn decode_timing_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("ARC_TIME_DECODE").is_some())
+    *ENABLED.get_or_init(|| mistralrs_quant::env_flag_is_set("ARC_TIME_DECODE"))
 }
 
 #[inline]
@@ -3372,7 +3374,7 @@ pub(crate) fn v4_nan_dbg(t: &Tensor, tag: &str) {
     // Also emit magnitude stats under V4_STATS so the existing per-sub-op
     // probes double as a collapse/explosion localizer (RUN-161).
     v4_stat_dbg(t, tag);
-    if std::env::var_os("V4_NAN_DEBUG").is_none() {
+    if !mistralrs_quant::env_flag_is_set("V4_NAN_DEBUG") {
         return;
     }
     match t
@@ -3402,7 +3404,7 @@ pub(crate) fn v4_nan_dbg(t: &Tensor, tag: &str) {
 /// a representation collapse (values -> ~0 or constant) that produces a flat
 /// logit distribution. Used to bisect which layer/op collapses the hidden state.
 pub(crate) fn v4_stat_dbg(t: &Tensor, tag: &str) {
-    if std::env::var_os("V4_STATS").is_none() {
+    if !mistralrs_quant::env_flag_is_set("V4_STATS") {
         return;
     }
     match t
@@ -3434,7 +3436,7 @@ pub(crate) fn v4_stat_dbg(t: &Tensor, tag: &str) {
 /// positions have stopped differentiating (context collapse) — pinpointing the
 /// exact layer/op where contextual mixing dies, which whole-tensor std cannot.
 pub(crate) fn v4_collapse_dbg(t: &Tensor, tag: &str, pos_dim: usize) {
-    if std::env::var_os("ARC_COLLAPSE").is_none() {
+    if !mistralrs_quant::env_flag_is_set("ARC_COLLAPSE") {
         return;
     }
     let run = || -> Result<()> {
