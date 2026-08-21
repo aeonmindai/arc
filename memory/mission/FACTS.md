@@ -88,7 +88,7 @@ allocation whose width tracks context —
 `compressed_kv_from_rows` (`deepseek4.rs:1409`) →
 `forward_at_positions` (`layers.rs:1826`). Pool-held bytes read as used
 (`trim_cuda_memory_pools`, `memory_usage.rs:6-16`) and the trim runs once,
-post-ISQ (`normal.rs:1432`), never between requests.
+post-ISQ (`normal.rs:1465`), never between requests.
 
 Serve config: **`kv-cache=eager` (PagedAttention OFF), `prefix-cache=ON`,
 `max-seqs=32`.**
@@ -174,8 +174,8 @@ Zero-sync arm exists and is **unmeasured**: branch
 
 - **`mark_unreachable` (`arc-profiler/src/lib.rs:467`) is a no-op unless
   `ARC_PROFILE` is exactly `"1"`** (`arc-profiler/src/lib.rs:124`, latched once
-  per process). **Its 6 sites in `normal.rs` — `:1556`, `:1635`, `:1921`,
-  `:2404`, `:2474`, `:2602` — have been dark in ordinary runs, and their
+  per process). **Its 6 sites in `normal.rs` — `:1589`, `:1668`, `:1954`,
+  `:2690`, `:2760`, `:2888` — have been dark in ordinary runs, and their
   silence has been read as evidence.**
 - **`ci_cuda.yaml` gates nothing**: its whole `on:` block is
   `workflow_dispatch` (`ci_cuda.yaml:3`) on a self-hosted ARM64 GPU runner
@@ -187,7 +187,7 @@ Zero-sync arm exists and is **unmeasured**: branch
   `src/`. **Any past A/B that used `FLAG=0` as its "off" leg was never a
   comparison.** Precedent is on the record: `normal.rs:216`. Fix exists and is
   unused by these — `env_flag_is_set` (`normal.rs:232`), pinned by
-  `zero_and_its_spellings_are_off_not_merely_present` (`normal.rs:2977`).
+  `zero_and_its_spellings_are_off_not_merely_present` (`normal.rs:3263`).
   Sweep is **PR #212**, open.
 
 ### 🔴 RETRACTED 2026-08-21 — do not quote any of these

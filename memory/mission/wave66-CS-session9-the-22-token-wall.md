@@ -1,4 +1,4 @@
-# wave66-CS — V4 could not serve past ~22 tokens, because TCFRAG was holding 63 GB; every single-user throughput number this project has ever recorded was taken inside a crashing run
+# wave66-CS — V4 could not serve past ~22 tokens, because TCFRAG was holding 63 GB; and every single-user throughput number we have is a ≤30-token fragment
 
 Parent system: **ArcQuant** (the cause) / **ArcInfer / ArcKV** (where it bit),
 with findings in ArcGraph, ArcKernels and ArcGate. Originally filed under
@@ -14,8 +14,8 @@ open, each with an owner and a probe.
 
 ## Provenance — read this before quoting anything here
 
-**Every line number in this file was verified against master `f709872ab`**, not
-against the ref the work was done on. Master moved seven times over this
+**Every line number in this file was verified against master `fdf0b6c19`**, not
+against the ref the work was done on. Master moved eight times over this
 session:
 
 ```
@@ -25,21 +25,37 @@ cc5487ad3  TCFRAG-2B on the tensor cores                        (#203)   <- the 
 bb30559a5  register the V4 compressed-KV re-RoPE recompute      (#207)
 9c127a2b1  ARC_QTIP_TCFRAG opt-in                               (#209)   <- THE FIX for §1
 b91e9b6a7  wave65-CR: eviction cannot see baked addresses       (#211)
-f709872ab  fp8_gemv_wide                                        (#210)   <- master now
+f709872ab  fp8_gemv_wide                                        (#210)
+fdf0b6c19  land the CUDA-graph capture lane                     (#205)   <- master now
 ```
 
 The **serving measurements in §1 were taken at `cc5487ad3`**, on an H200. The
-**source claims in §2–§7 are read at `f709872ab`**. Where the two disagree — and
+**source claims in §2–§7 are read at `fdf0b6c19`**. Where the two disagree — and
 for TCFRAG they do, because #209 landed between them — both states are written
 out.
 
-⚠️ **Two citations rotted when #210 merged and are corrected here**, which is
-the whole reason this file re-verifies rather than trusts:
-`blockwise_fp8/ops.rs:1139 → :1179` and `:1140 → :1180`. The kernel's own lines
-survived only because #210 **appended** its 294 lines rather than inserting
-them — a fact worth knowing before assuming a green gate means correct
-citations. *(The gate checks that a line is **in range**, not that it is the
-**right** line.)*
+🔴 **THE CITATIONS IN THIS FILE ROTTED TWICE WHILE IT WAS BEING WRITTEN, AND
+THE GATE CAUGHT NEITHER TIME.** That is the single most useful thing on this
+page for anyone maintaining these docs.
+
+* When **#210** merged, the two GEMV dispatch citations in
+  `blockwise_fp8/ops.rs` each moved ~40 lines. The kernel's own lines survived
+  only because #210 **appended** its 294 lines rather than inserting them.
+* When **#205** merged it added **+292 lines to `normal.rs`, +275 to
+  `layers.rs`, +144 to `deepseek4.rs`** — moving **fifteen** citations here,
+  including every `mark_unreachable` site and the `return Ok(None)` that §4 is
+  built on.
+
+**In both cases `doc_citations` stayed green**, because it checks that a line is
+**in range**, not that it is the **right** line — and a citation with no
+backticked symbol before it gets no symbol check at all. **A green gate is not a
+verified citation.** Everything here was re-derived by grep against
+`fdf0b6c19`, twice.
+
+⚠️ And master's own code carries an instance: the self-referential site marker
+inside `mark_unreachable("cuda_graph.autonomous_decode.capture", …)` still reads
+`"normal.rs:2619"`, which #205 moved to **2905**. It is a string literal, so the
+gate cannot see it by design.
 
 Citations into **candle** carry a file and a symbol and **no line number** on
 purpose: candle is not vendored here, so a bare `device.rs` plus a line number
@@ -67,7 +83,9 @@ Per-token `memory.used`, one run:
 | **20** | **143,151** |
 | 22–30 | **OOM** |
 
-That is **≈11 MiB per generated token**, in ~32 MiB granules.
+That is **≈11.8 MiB per generated token** (224 MiB across the 19 intervals
+above), in ~32 MiB granules. The box separately reports **~12.8 MiB/step** —
+two instruments, same order, and neither is quoted as the other.
 
 ### It is a LEAK, not a fixed-size overrun
 
@@ -75,8 +93,8 @@ Three observations separate the two, and only the leak explanation survives all
 three:
 
 1. **The death token moves with available headroom.** 30 tokens with room, 25
-   without, **0 on a process already poisoned by §2**. A fixed-size overrun
-   would die at the same token every time.
+   without, **0 on a process whose TCFRAG `OnceLock` had already latched
+   `None`** (§2). A fixed-size overrun would die at the same token every time.
 2. **Memory is never released across requests.** One run ended at **142,959 MiB
    used and the next *started* there.** Nothing between requests gives it back.
 3. **The backtrace names an allocation that grows with context**, not a
@@ -110,7 +128,7 @@ Two mechanisms make retention permanent rather than transient:
 * **Freed bytes go into the CUDA async pool, and `cuMemGetInfo`/`nvidia-smi`
   count pool-held memory as used** — the tree says so itself at
   `trim_cuda_memory_pools` (`memory_usage.rs:6-16`). That trim runs **once**,
-  post-ISQ (`normal.rs:1432`), and **never between requests**. That is why run
+  post-ISQ (`normal.rs:1465`), and **never between requests**. That is why run
   N+1 starts at run N's high-water mark.
 
 ### ⛔ THE CONSEQUENCE — and it is TWO claims, which the first draft conflated
@@ -239,10 +257,10 @@ in the table at the end of this file.
   storage. One entry pins the whole B-row buffer. **Invisible at B=1** (the
   chunk is degenerate), so it is *not* the measured per-token leak.
 * The F8E4M3 dtype in the backtrace is worth one line of caution: V4's FP8 KV
-  **code storage** is opt-in — `v4_fp8_kv_enabled` (`deepseek4.rs:3149`) is
+  **code storage** is opt-in — `v4_fp8_kv_enabled` (`deepseek4.rs:3190`) is
   `var == Some("1") && !capture_probe` (`fp8_kv_enabled_from`,
-  `deepseek4.rs:3165`), and the caller filters on it (`append_kv_mqa`,
-  `deepseek4.rs:2968`). **Whether the failing run had `ARC_V4_FP8_KV=1` set is
+  `deepseek4.rs:3206`), and the caller filters on it (`append_kv_mqa`,
+  `deepseek4.rs:3030`). **Whether the failing run had `ARC_V4_FP8_KV=1` set is
   NOT established from the artefacts I have.** Either the run set it, or an
   F8E4M3 `cat` is reachable on a path we believe is off. **That is an open
   question with a cheap probe: re-run with the variable explicitly unset and
@@ -280,7 +298,7 @@ wrong direction**: a typo landed on the unverified side.
 **Fixed by PR #209, merged tonight** (branch commit `29fd0da`, merge
 `9c127a2b1` — note the merge is a combined diff, so `git show 9c127a2b1 --
 <path>` prints **nothing**; use the branch commit or `git diff bb30559a5
-9c127a2b1`). `tcfrag2b_enabled` (`cuda_ops.rs:1612`) now delegates to
+9c127a2b1`). `tcfrag2b_enabled` (`cuda_ops.rs:1627`) now delegates to
 `tcfrag2b_enabled_from` (`tcfrag2b.rs:272`), which is `value == Some("1")` —
 opt-in, and only that exact value. Polarity is pinned by a test,
 `tcfrag_gate_is_opt_in_and_only_literal_one_enables` (`tcfrag2b.rs:652`).
@@ -312,7 +330,7 @@ describing **`qtip2b_gemv_tuned_kernel`**, the *shipped* kernel TCFRAG was
 written to replace, not TCFRAG. The conclusion (that TCFRAG served b=1 by
 default at `cc5487ad3`) is right and the dispatch sites above establish it
 independently, so the fix is to **rest the sentence on the dispatch sites and
-drop the quotation** — done at `tcfrag2b_enabled` (`cuda_ops.rs:1601`), with a
+drop the quotation** — done at `tcfrag2b_enabled` (`cuda_ops.rs:1614`), with a
 note left in place so the quote is not reinstated. **It is the only non-`memory/`
 edit in this change.**
 
@@ -433,18 +451,18 @@ classifies in order to reject; it does not parameterise.
 
 ### And even for a model it *can* describe, capture is not wired
 
-`normal.rs:2619` is an **unconditional `return Ok(None)`** inside
-`autonomous_decode` (`normal.rs:2379`). The comment above it
-(`normal.rs:2568-2601`) is explicit: *"CAPTURE IS NOT WIRED. This return is
+`normal.rs:2905` is an **unconditional `return Ok(None)`** inside
+`autonomous_decode` (`normal.rs:2665`). The comment above it
+(`normal.rs:2855-2887`) is explicit: *"CAPTURE IS NOT WIRED. This return is
 unconditional, and it is guarding work that was described and never written —
 not a leftover."* The two missing pieces:
 
 1. **`has_cached_kv_info` has no definition anywhere in the workspace.**
    ⚠️ *Correction to the first report: it is not "zero occurrences" — there are
-   **three**, at `normal.rs:2370`, `normal.rs:2575` and `normal.rs:2604`, and
+   **three**, at `normal.rs:2656`, `normal.rs:2861` and `normal.rs:2890`, and
    all three are prose or a log string. `grep "fn has_cached_kv_info"` returns
    nothing.* And the comment that once claimed it had been added has **already
-   been corrected in-tree**: `normal.rs:2575` now reads *"The comment this
+   been corrected in-tree**: `normal.rs:2861` now reads *"The comment this
    replaces said it was 'added in the same change as the accessor below'. It was
    not — there is no such method on `DedicatedDecodePath` anywhere in the
    workspace."* Cite `:2575` as the refutation, not as the false claim.
@@ -515,7 +533,7 @@ The original form was `132 SM × 4 sched × 32 lanes × 1.98 GHz = 33.4 T inst/s
 🔴 **But 128 lanes/SM/clk is the FP32 warp-issue rate, not the INT32-ALU rate.**
 GH100's SM has 128 FP32 units and only **64 INT32**. An emulated signed `idiv`
 is IADD3/LOP3/SHF/ISETP-dominated — the 64-wide pipe. This repo already carries
-the right figure: `00_RESUME_HERE.md:729` reads *"~1.67e13 INT32-lane/s"*, and
+the right figure: `00_RESUME_HERE.md:748` reads *"~1.67e13 INT32-lane/s"*, and
 132 × 64 × 1.98e9 = 1.673e13 reproduces it exactly. On that roof the ceiling is
 **1.49 TB/s**.
 
@@ -528,7 +546,7 @@ the right figure: `00_RESUME_HERE.md:729` reads *"~1.67e13 INT32-lane/s"*, and
 ⚠️ **"45 instructions per 4 bytes" is DERIVED, not measured.** It back-solves
 from the PR's own prose ("15-20 instructions", "~40% of the loop body";
 17.5/0.40 ≈ 44). Self-consistent, but it is an estimate of an estimate, and
-`00_RESUME_HERE.md:725` states the house rule: *"prototype → disassemble →
+`00_RESUME_HERE.md:744` states the house rule: *"prototype → disassemble →
 confirm the instructions actually move → THEN predict."* **The probe that closes
 this is a `cuobjdump -sass` count of the `fp8_gemv_warp` inner loop**, with
 precedent tooling on branch `perf/qtip-sass-census`.
@@ -577,7 +595,7 @@ unsourced.
 ### (a) `mark_unreachable` is a no-op unless `ARC_PROFILE=1` — TRUE, **but not new**
 
 ⚠️ **Attribution first: this was already on the record.**
-`00_RESUME_HERE.md:231` has said since session 8 that *"`mark_unreachable` — the
+`00_RESUME_HERE.md:250` has said since session 8 that *"`mark_unreachable` — the
 registry for dark features — is ITSELF dark: inert unless `ARC_PROFILE=1`"*.
 **What is new here is the consequence, which nobody drew, and the exact site
 list.** Filing it as a fresh discovery would be its own kind of drift.
@@ -593,7 +611,7 @@ MHC "no output ≠ no execution" retraction, by a different road.
 
 ⚠️ *Correction: there are **6** call sites in `normal.rs` — `:1556`, `:1635`,
 `:1921`, `:2404`, `:2474`, `:2602` — not seven; the seventh grep hit
-(`normal.rs:2399`) is prose. Workspace-wide: 14 invocations, 11 of them
+(`normal.rs:2693`) is prose. Workspace-wide: 14 invocations, 11 of them
 non-test.*
 
 ### (b) `ci_cuda.yaml` gates nothing — TRUE
@@ -642,15 +660,15 @@ NULL-stream path.
 
 **21 distinct env flags are read presence-only** (`.is_some()` ×17,
 `.is_none()` ×9 across 26 sites). ⚠️ **But only 18 of the 21 are `ARC_*`** — the
-other three are legacy `V4_`-prefixed (`V4_NAN_DEBUG` `deepseek4.rs:3334`,
+other three are legacy `V4_`-prefixed (`V4_NAN_DEBUG` `deepseek4.rs:3375`,
 `V4_STATS` `:3364`, `V4_TRACE` `:3449`). Widening to the same bug class via
 `env::var(..).is_ok()/.is_err()` adds four more `ARC_*` names and reaches **22
 `ARC_*`**; restricting to shipping `src/` gives **16**. Either framing reaches
 "21+"; **do not attribute all 21 to `ARC_*`**.
 
 Representative sites, each with its flag on the cited line:
-`ARC_MOE_SLOW` (`experts.rs:268`) · `ARC_TIME_DECODE` (`deepseek4.rs:3283`) ·
-`ARC_SYNC_ISQ` (`isq.rs:34`) · `ARC_COLLAPSE` (`deepseek4.rs:2219`).
+`ARC_MOE_SLOW` (`experts.rs:268`) · `ARC_TIME_DECODE` (`deepseek4.rs:3324`) ·
+`ARC_SYNC_ISQ` (`isq.rs:34`) · `ARC_COLLAPSE` (`deepseek4.rs:2281`).
 
 > ⇒ **Any past A/B that used `FLAG=0` as its "off" leg was never a
 > comparison.** For the 13 `.is_some()` flags both arms ran with the feature
@@ -663,7 +681,7 @@ Representative sites, each with its flag on the cited line:
 **The canonical fix already exists in-tree and these 18 do not use it**:
 `env_flag_is_set` (`normal.rs:232`) over `env_flag_value` (`normal.rs:252`),
 pinned by `zero_and_its_spellings_are_off_not_merely_present`
-(`normal.rs:2977`), which asserts `["0","false","no","off","OFF"," 0 ","False",""]`
+(`normal.rs:3263`), which asserts `["0","false","no","off","OFF"," 0 ","False",""]`
 all read as OFF. **PR #212 (`arcgate/env-flag-value-semantics`) is the sweep and
 is open.**
 
@@ -716,7 +734,7 @@ before every `cuMemPoolDestroy`. **Neither survives capture being defaulted on**
 which is what PR #205 proposes.
 
 Those two are `drain_alloc_cache_and_free` (`graph.rs:56`) and
-`drain_alloc_cache` (`graph.rs:214`).
+`drain_alloc_cache` (`graph.rs:212`).
 
 ---
 

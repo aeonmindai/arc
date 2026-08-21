@@ -106,7 +106,7 @@ seven new retractions → `FACTS.md` §2026-08-21.
    `mark_unreachable` is itself dark was already recorded below (§TAXONOMY
    corrections). What was not: it is inert unless `ARC_PROFILE` is exactly
    `"1"` (`arc-profiler/src/lib.rs:467`), so **its six sites in `normal.rs` —
-   `:1556`, `:1635`, `:1921`, `:2404`, `:2474`, `:2602` — have been dark in
+   `:1589`, `:1668`, `:1954`, `:2690`, `:2760`, `:2888` — have been dark in
    every ordinary run, and we have been reading their silence as evidence.**
    Separately and newly: `ci_cuda.yaml` is `workflow_dispatch`-only
    (`ci_cuda.yaml:3`) on a self-hosted ARM64 GPU runner — **it gates nothing**;
