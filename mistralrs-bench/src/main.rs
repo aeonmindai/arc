@@ -10,6 +10,7 @@ use mistralrs_core::{
 };
 use std::fmt::Display;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc::channel;
 use tracing::{info, warn};
 
@@ -32,6 +33,13 @@ struct BenchResult {
     usages: Vec<Usage>,
     concurrency: usize,
     test_name: TestName,
+    /// Wall-clock seconds for the whole send->all-Done window, measured by the
+    /// client with no engine cooperation. This is the SECOND instrument: the
+    /// engine's own `Usage` numbers are only believable when they agree with a
+    /// clock that lives outside the engine.
+    wall_secs: f32,
+    /// Total prompt tokens the engine says it processed across all responses.
+    prompt_toks_seen: usize,
 }
 
 struct UncertainTokSec {
@@ -74,29 +82,41 @@ async fn run_bench(
     let sender = mistralrs.get_sender(None).unwrap();
     let (tx, mut rx) = channel(10_000);
 
-    let req = Request::Normal(Box::new(NormalRequest {
-        id: mistralrs.next_request_id(),
-        messages: prompt,
-        sampling_params: sampling_params.clone(),
-        response: tx,
-        return_logprobs: false,
-        is_streaming: false,
-        constraint: Constraint::None,
-        suffix: None,
-        tools: None,
-        tool_choice: None,
-        logits_processors: None,
-        return_raw_logits: false,
-        web_search_options: None,
-        model_id: None,
-        truncate_sequence: false,
-    }));
+    // 🔴 A fresh request id per send.
+    //
+    // This used to call `next_request_id()` exactly once and then `.clone()`
+    // the same `NormalRequest` for every concurrent copy and every repetition,
+    // so `concurrency * repetitions` sequences were in flight sharing ONE id.
+    // The id is the engine's handle for a sequence group; issuing duplicates
+    // means unrelated sequences alias each other in engine-side bookkeeping.
+    // A benchmark must not be the only caller in the system that does this.
+    let make_req = |id: usize| {
+        Request::Normal(Box::new(NormalRequest {
+            id,
+            messages: prompt.clone(),
+            sampling_params: sampling_params.clone(),
+            response: tx.clone(),
+            return_logprobs: false,
+            is_streaming: false,
+            constraint: Constraint::None,
+            suffix: None,
+            tools: None,
+            tool_choice: None,
+            logits_processors: None,
+            return_raw_logits: false,
+            web_search_options: None,
+            model_id: None,
+            truncate_sequence: false,
+        }))
+    };
 
     let mut usages = Vec::new();
+    let wall_start = Instant::now();
 
     for _ in 0..repetitions {
         for _ in 0..concurrency {
-            if sender.send(req.clone()).await.is_err() {
+            let req = make_req(mistralrs.next_request_id());
+            if sender.send(req).await.is_err() {
                 eprintln!("Receiver disconnected");
             }
         }
@@ -131,10 +151,15 @@ async fn run_bench(
         }
     }
 
+    let wall_secs = wall_start.elapsed().as_secs_f32();
+    let prompt_toks_seen = usages.iter().map(|u| u.prompt_tokens).sum();
+
     Ok(BenchResult {
         usages,
         concurrency,
         test_name,
+        wall_secs,
+        prompt_toks_seen,
     })
 }
 
@@ -186,6 +211,100 @@ fn get_ms_tok(result: &BenchResult) -> UncertainTokSec {
     UncertainTokSec { mean, std_dev }
 }
 
+/// A zero is not a measurement.
+///
+/// 🔴 This harness used to print `0.000±0.000` into a results table and exit 0.
+/// That is the house fault: a green result that proves no work happened. Every
+/// row is now required to carry evidence that the engine actually processed the
+/// tokens the row claims to be about, and a row that cannot is a hard stop.
+///
+/// Exits **2** (environment/instrument failure), never 1, so a caller can tell
+/// "the benchmark could not be run" apart from "the benchmark ran and regressed".
+fn assert_results_are_measurements(results: &[BenchResult]) {
+    let mut failures: Vec<String> = Vec::new();
+
+    for r in results {
+        let label = format!("{} @ concurrency {}", r.test_name, r.concurrency);
+
+        if r.usages.is_empty() {
+            failures.push(format!("{label}: no responses at all (0 usages collected)"));
+            continue;
+        }
+
+        for (i, u) in r.usages.iter().enumerate() {
+            let where_ = format!("{label}, response {i}");
+            match r.test_name {
+                TestName::Prompt(n) => {
+                    if u.prompt_tokens == 0 {
+                        failures.push(format!("{where_}: engine reported 0 prompt tokens"));
+                    } else if u.prompt_tokens != n {
+                        failures.push(format!(
+                            "{where_}: asked for {n} prompt tokens, engine processed {}",
+                            u.prompt_tokens
+                        ));
+                    }
+                    if u.total_prompt_time_sec <= 0.0 {
+                        failures.push(format!(
+                            "{where_}: prompt time is {:.6}s -- the prefill step was never timed",
+                            u.total_prompt_time_sec
+                        ));
+                    }
+                    if !u.avg_prompt_tok_per_sec.is_finite() || u.avg_prompt_tok_per_sec <= 0.0 {
+                        failures.push(format!(
+                            "{where_}: prompt rate is {} tok/s",
+                            u.avg_prompt_tok_per_sec
+                        ));
+                    }
+                }
+                TestName::Gen(_) => {
+                    if u.completion_tokens == 0 {
+                        failures.push(format!("{where_}: engine produced 0 completion tokens"));
+                    }
+                    if !u.avg_compl_tok_per_sec.is_finite() || u.avg_compl_tok_per_sec <= 0.0 {
+                        failures.push(format!(
+                            "{where_}: completion rate is {} tok/s",
+                            u.avg_compl_tok_per_sec
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Which MoE kernel actually ran? The grouped-GEMM variant is chosen at
+    // RUNTIME from an env var, so the binary cannot tell you which one you
+    // measured. `grouped.rs` states the rule outright: "a harness that reports a
+    // per-variant timing MUST show this counter advancing on the variant it
+    // claims to have measured, and NOT advancing on the others, or the number
+    // describes some other kernel." Nothing in the tree printed it, so every
+    // previous variant comparison was unproven. Print it beside the results.
+    let counts = mistralrs_quant::grouped_launch_counts();
+    let total: u64 = counts.iter().sum();
+    eprintln!(
+        "MoE grouped-GEMM launches by variant: {counts:?} (selected variant = {}, total = {total})",
+        mistralrs_quant::grouped_variant()
+    );
+    if total == 0 {
+        eprintln!(
+            "  -> grouped GEMM never launched: this measurement is the per-pair \
+             gather GEMV (or the dequantize fallback), NOT the grouped kernel."
+        );
+    }
+
+    if !failures.is_empty() {
+        eprintln!("\n=== BENCHMARK PRODUCED NO VALID MEASUREMENT ===");
+        for f in &failures {
+            eprintln!("  - {f}");
+        }
+        eprintln!(
+            "\n{} check(s) failed. A zero-token or zero-rate result is an instrument\n\
+             failure, not a score, so no table is printed. Exiting 2.",
+            failures.len()
+        );
+        std::process::exit(2);
+    }
+}
+
 fn print_usage(model: &str, device: &Device, results: Vec<BenchResult>) {
     let backend = match device {
         Device::Cpu => "CPU",
@@ -205,6 +324,11 @@ fn print_usage(model: &str, device: &Device, results: Vec<BenchResult>) {
                 (get_tok_s(&r).mean * r.concurrency as f32)
                     .cell()
                     .justify(Justify::Right),
+                // Second instrument: a clock outside the engine.
+                format!("{:.3}", r.wall_secs).cell().justify(Justify::Right),
+                format!("{:.1}", r.prompt_toks_seen as f32 / r.wall_secs)
+                    .cell()
+                    .justify(Justify::Right),
             ]
         })
         .collect();
@@ -222,6 +346,8 @@ fn print_usage(model: &str, device: &Device, results: Vec<BenchResult>) {
             "ms/t".cell().bold(true),
             "concurrency".cell().bold(true),
             "throughput/s".cell().bold(true),
+            "wall s".cell().bold(true),
+            "prompt t/s (wall)".cell().bold(true),
         ])
         .bold(true);
     print_stdout(table).expect("print table");
@@ -575,6 +701,7 @@ async fn main() -> anyhow::Result<()> {
             results.push(r);
         }
 
+        assert_results_are_measurements(&results);
         print_usage(&model_name, &device, results);
     }
 

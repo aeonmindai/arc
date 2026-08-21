@@ -537,6 +537,45 @@ impl Engine {
                         };
                         let _chunk_guard =
                             (!final_chunk).then(crate::pipeline::mark_prefill_intermediate);
+
+                        // Record prompt timing BEFORE step() so it is available if the
+                        // response is sent from inside step().
+                        //
+                        // 🔴 This is why `pp N` reported `0.000±0.000` for every prompt
+                        // benchmark. A prefill-only request (`max_len = 1`) finishes
+                        // *during* this prompt step: `pipeline/sampling.rs` calls
+                        // `seq.update_time_info()` and then `group.get_usage()` and
+                        // dispatches `Response::Done` from inside `step()`. But on this
+                        // (default, non-paged) path `prompt_timestamp` was only stamped
+                        // AFTER `step()` returned, ~100 lines below. So at the moment the
+                        // usage was built, `prompt_timestamp` was still `None`,
+                        // `update_time_info` skipped `group.total_prompt_time`
+                        // (`sequence.rs`, `if let Some(ts) = self.prompt_timestamp`), and
+                        // `get_usage` took the `total_prompt_time == 0` branch and
+                        // returned `avg_prompt_tok_per_sec: 0.0`. The harness then printed
+                        // that zero as if it were a measurement.
+                        //
+                        // The PagedAttention arm below already does exactly this, with
+                        // this same comment — the fix was simply never applied to the arm
+                        // that actually serves (PagedAttention is banned here: it shadows
+                        // the graph arm and measures zero tokens).
+                        //
+                        // `set_step_start_instant` gives `update_time_info` its in-flight
+                        // fallback (`start.elapsed()`) while the prompt step is running;
+                        // the post-step block below still overwrites `total_prompt_time`
+                        // with the precise `prompt_exec_time` for sequences that go on to
+                        // decode, so steady-state accounting is unchanged.
+                        {
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .expect("Time travel has occurred!")
+                                .as_millis();
+                            for seq in scheduled.prompt.iter_mut() {
+                                seq.prompt_timestamp = Some(now);
+                                seq.set_step_start_instant();
+                            }
+                        }
+
                         let prompt_exec_time = {
                             let mut pipeline = {
                                 let _s = arc_profiler::span("pipeline.lock");
