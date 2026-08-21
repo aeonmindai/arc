@@ -799,21 +799,28 @@ The ones that keep costing money:
 
 ## 9. READ ORDER (bounded — do not read everything)
 
-1. **This file** — the SESSION-8 CLOSE block at the top is not optional.
-2. **`CENSUS_SESSION8.md`** — the complete Arc/SGLang/vLLM census (zero GPU
+1. **This file** — the SESSION-9 BLOCKER block and the SESSION-8 CLOSE block at
+   the top are not optional.
+2. 🔴 **`wave66-CS-session9-the-22-token-wall.md`** — **before quoting any
+   single-user throughput number, and before proposing any decode
+   optimisation.** V4 does not serve past ~22 tokens; the seven session-9
+   findings; six retractions; and eight corrections to how they were first
+   reported.
+3. **`CENSUS_SESSION8.md`** — the complete Arc/SGLang/vLLM census (zero GPU
    hours) — and **`LADDER_POST_CENSUS.md`**, the GPU ladder reordered by it.
    **Read both before proposing any GPU spend.** *(Branch `docs/census-session8`
    until it merges.)*
-3. `STATUS.md` — **top entry only** (reverse-chron; the file is 70 KB).
-4. `FACTS.md` — only to look up a specific number. **Never reason from a number not in it.**
-   Start at **§2026-08-19**, which carries the compiled trellis ladder and the retraction table.
-5. `KERNEL_RULES.md` — when about to measure, build a kernel, or write a guard.
+4. `STATUS.md` — **top entry only** (reverse-chron; the file is 70 KB).
+5. `FACTS.md` — only to look up a specific number. **Never reason from a number not in it.**
+   Start at **§2026-08-21** (the blocker + six retractions), then **§2026-08-19**
+   for the compiled trellis ladder.
+6. `KERNEL_RULES.md` — when about to measure, build a kernel, or write a guard.
    **The top block is the session-8 close: seven rules, each paid for.**
-6. `TAXONOMY.md` — when naming anything or asking "what am I working on".
-7. `CEILINGS.json` — **before quoting any speed number or saying "not achievable"**.
+7. `TAXONOMY.md` — when naming anything or asking "what am I working on".
+8. `CEILINGS.json` — **before quoting any speed number or saying "not achievable"**.
    Separates PHYSICS bounds from IMPLEMENTATION gaps + the anti-pessimism protocol.
    ⚠️ **Its 16,600 at B=256 is a BANDWIDTH ceiling and assumes the format is free
    to decode.** It is a physics bound, not a target this build approaches — and it
    is **not** the capacity claim. See the headline block at the top of this file.
-8. `BACKLOG.md` — surfaced-not-shipped debt.
-9. `wave*-*.md` — per-agent deep logs, on demand only.
+9. `BACKLOG.md` — surfaced-not-shipped debt.
+10. `wave*-*.md` — per-agent deep logs, on demand only.
