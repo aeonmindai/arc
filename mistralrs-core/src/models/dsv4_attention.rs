@@ -580,7 +580,7 @@ pub(crate) fn graph_compressed_mask(
 ///
 /// The additive `[1, 1, t_q, t_k + t_c]` mask [`dsv4_attention`] builds on the
 /// uniform-batch, non-graph path is a pure function of these fields — the
-/// aranges, casts, compares and the 0/-inf conversion take nothing else as
+/// `arange` calls, casts, compares and the 0/-inf conversion take nothing else as
 /// input — so two calls with equal keys produce bit-identical tensors, and a
 /// cached one is an identity, not an approximation.
 #[derive(Clone, PartialEq, Eq, Debug)]
