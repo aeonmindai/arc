@@ -616,7 +616,7 @@ pub(crate) fn split_batched_logits_for_sampling(
         .iter()
         .enumerate()
         .filter(|(_, e)| !**e)
-        .map(|(i, _)| i as u32)
+        .map(|(i, _)| u32::try_from(i).expect("batch row index fits u32"))
         .collect();
     let idx = Tensor::from_vec(cpu_rows, n_cpu, logits.device())?;
     let host = logits.index_select(&idx, 0)?.to_device(&Device::Cpu)?;
