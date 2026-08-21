@@ -68,9 +68,22 @@ pub trait BucketingManager<Backer: FcfsBacker>: Send + Sync {
     ) -> BucketedSeqs<Backer>;
 }
 
-// (cache length, (has_imgs && is_prompt), sequence offset)
-// Bucket by that metric for images because if we are not a prompt, then this doesn't apply
-type BucketKey = (usize, bool, usize);
+// (cache length, (has_imgs && is_prompt), sequence offset, is_prompt)
+// Bucket by the image flag because if we are not a prompt, then it doesn't
+// apply.
+//
+// 🔑 `is_prompt` is a key component OF ITS OWN, not folded into the image
+// flag, because the ragged-decode sentinel collides without it: under
+// `ragged_decode_supported()` every decode sequence keys length 0, and a
+// 1-token prompt's `cache_bucket_len()` is `len() - 1 == 0` too — so a fresh
+// prompt silently merged into the pinned decode bucket, rode the
+// `seq_buckets.len() <= 1` fast path into the same scheduling pass, and
+// bypassed `select_running_bucket`, the floor's bookkeeping and the
+// one-bucket-per-step invariant. With prompt-ness in the key a bucket is
+// homogeneous by construction, which is also what lets the floor read
+// prompt-ness off the key instead of off whichever sequence happens to sit
+// first in the bucket.
+type BucketKey = (usize, bool, usize, bool);
 
 /// How many waiting sequences may be admitted to **prefill** in one engine
 /// iteration. `None` (the default, and the historical behaviour) means "all of
@@ -164,7 +177,7 @@ fn select_running_bucket(
 ) -> BucketKey {
     let min = *seq_buckets
         .keys()
-        .min_by_key(|(x, _, _)| *x)
+        .min_by_key(|(x, _, _, _)| *x)
         .expect("No sequence buckets.");
     if discrete {
         return min;
@@ -180,11 +193,15 @@ fn select_running_bucket(
     }
 
     // A merge only happens when the *whole* key matches, so the coalescing
-    // target must agree on the image flag and token offset too.
+    // target must agree on the image flag, token offset and prompt-ness too —
+    // a decode bucket must never idle itself to "catch up" to a prompt bucket,
+    // which runs by a different mechanism entirely.
     let Some(next_len) = seq_buckets
         .keys()
-        .filter(|(len, imgs, offset)| *len > min.0 && *imgs == min.1 && *offset == min.2)
-        .map(|(len, _, _)| *len)
+        .filter(|(len, imgs, offset, prompt)| {
+            *len > min.0 && *imgs == min.1 && *offset == min.2 && *prompt == min.3
+        })
+        .map(|(len, _, _, _)| *len)
         .min()
     else {
         return greedy;
@@ -233,7 +250,7 @@ const DEFAULT_PREFILL_FLOOR_STEPS: usize = 4;
 /// Capping admission cannot lift it; only guaranteeing prompts a turn can.
 ///
 /// Read once from `ARC_PREFILL_FLOOR_STEPS`, **by value**:
-/// * unset (or unparseable) → [`DEFAULT_PREFILL_FLOOR_STEPS`] — the floor is
+/// * unset (or unparsable) → [`DEFAULT_PREFILL_FLOOR_STEPS`] — the floor is
 ///   ON by default, because the starvation it lifts is the default behaviour;
 /// * `0` → `None`, the kill-switch: reproduces the pre-floor selection
 ///   exactly, key for key;
@@ -307,42 +324,26 @@ impl<Backer: FcfsBacker> BucketingManager<Backer> for FixedBucketingManager {
             } else {
                 seq.cache_bucket_len()
             };
-            match seq_buckets.get_mut(&(
+            // `is_prompt` closes the sentinel collision documented on
+            // `BucketKey`: a 1-token prompt also computes `len == 0` here.
+            let key: BucketKey = (
                 len,
                 seq.images().is_some() && seq.is_prompt(),
                 seq.token_offset(),
-            )) {
+                seq.is_prompt(),
+            );
+            match seq_buckets.get_mut(&key) {
                 Some(bucket) => {
                     if !discrete {
-                        *seq_priorities
-                            .get_mut(&(
-                                len,
-                                seq.images().is_some() && seq.is_prompt(),
-                                seq.token_offset(),
-                            ))
-                            .unwrap() += seq.compute_priority();
+                        *seq_priorities.get_mut(&key).unwrap() += seq.compute_priority();
                     }
                     bucket.push(seq);
                 }
                 None => {
                     if !discrete {
-                        seq_priorities.insert(
-                            (
-                                len,
-                                seq.images().is_some() && seq.is_prompt(),
-                                seq.token_offset(),
-                            ),
-                            seq.compute_priority(),
-                        );
+                        seq_priorities.insert(key, seq.compute_priority());
                     }
-                    seq_buckets.insert(
-                        (
-                            len,
-                            seq.images().is_some() && seq.is_prompt(),
-                            seq.token_offset(),
-                        ),
-                        vec![seq],
-                    );
+                    seq_buckets.insert(key, vec![seq]);
                 }
             }
         }
@@ -390,12 +391,10 @@ impl<Backer: FcfsBacker> BucketingManager<Backer> for FixedBucketingManager {
             // floor unset — or before it expires — the selection is the
             // pre-change one, key for key.
             if let Some(floor) = self.floor.filter(|_| !discrete) {
-                let is_prompt_bucket = |k: &BucketKey| {
-                    seq_buckets
-                        .get(k)
-                        .and_then(|v| v.first())
-                        .is_some_and(Sequence::is_prompt)
-                };
+                // Prompt-ness is a key component, so a bucket is homogeneous
+                // by construction and the key answers directly — no reading it
+                // off whichever sequence happens to sit first in the bucket.
+                let is_prompt_bucket = |k: &BucketKey| k.3;
                 if is_prompt_bucket(&len) {
                     self.steps_since_prompt = 0;
                 } else if self.steps_since_prompt >= floor {
@@ -405,7 +404,7 @@ impl<Backer: FcfsBacker> BucketingManager<Backer> for FixedBucketingManager {
                     if let Some(k) = seq_buckets
                         .keys()
                         .filter(|k| is_prompt_bucket(k))
-                        .min_by_key(|(l, _, _)| *l)
+                        .min_by_key(|(l, _, _, _)| *l)
                         .copied()
                     {
                         len = k;
@@ -899,7 +898,7 @@ mod tests {
 
     fn bucket_of(len: usize, n: usize, id_base: usize) -> (BucketKey, Vec<Sequence>) {
         let seqs = (0..n).map(|i| seq_of_len(id_base + i, len)).collect();
-        ((len, false, 0), seqs)
+        ((len, false, 0, false), seqs)
     }
 
     /// 🔑 The dense equivalent of the paged regression: eight sequences at
@@ -1019,6 +1018,69 @@ mod tests {
             on.contains(&8),
             "the newcomer must be in the running set, got {on:?}"
         );
+    }
+
+    /// 🔑 The pinned-bucket collision probe: with ragged decode published, a
+    /// decode sequence keys its bucket at the sentinel length 0 — and a
+    /// 1-token PROMPT's `cache_bucket_len()` is `len() - 1 == 0`, the same
+    /// number. Without prompt-ness in the bucket key the two share
+    /// `(0, false, 0)` and the prompt silently rides into the decode cohort:
+    /// scheduled in the same pass through the merged single bucket's
+    /// `seq_buckets.len() <= 1` fast path, which bypasses `select_running_bucket`,
+    /// the starvation floor's bookkeeping, and the one-bucket-per-step
+    /// invariant the `ArcSched: decode bucketing` log line reports on.
+    ///
+    /// Asserts the prompt is NOT folded in: the decode cohort runs whole and
+    /// alone, and the prompt waits its turn through ordinary selection (or the
+    /// floor).
+    ///
+    /// Mutation check (run 2026-08-21): drop `seq.is_prompt()` from the bucket
+    /// key (pin the fourth component to `false`) and this fails with
+    /// `prompt = [4]` scheduled alongside `completion = [0, 1, 2, 3]`.
+    #[test]
+    fn a_one_token_prompt_is_not_folded_into_the_pinned_decode_bucket() {
+        use crate::kv_cache::ragged_decode_test_override as flag;
+        let logger = IntervalLogger::new(Duration::from_secs(3600), None);
+
+        flag::with(true, || {
+            let mut sched: DefaultScheduler<VecDeque<Sequence>> = DefaultScheduler::new(
+                DefaultSchedulerMethod::Fixed(NonZeroUsize::new(128).unwrap()),
+            );
+            // A ragged decode cohort — under the flag they all key length 0.
+            for (i, l) in [60usize, 71, 82, 93].iter().enumerate() {
+                sched.add_seq(seq_of_len(i, *l));
+            }
+            // A 1-token prompt: `cache_bucket_len()` is `1 - 1 == 0`, the
+            // exact value of the ragged sentinel.
+            let p = seq_of_len(4, 1);
+            p.set_state(SequenceState::Waiting);
+            sched.add_seq(p);
+
+            let (completion, prompt) = {
+                let out = DefaultScheduler::schedule(&mut sched, &logger);
+                let mut completion: Vec<usize> =
+                    out.completion.iter().map(|s| *s.id()).collect();
+                completion.sort_unstable();
+                let prompt: Vec<usize> = out.prompt.iter().map(|s| *s.id()).collect();
+                (completion, prompt)
+            };
+
+            assert_eq!(
+                completion,
+                vec![0, 1, 2, 3],
+                "the decode cohort must run whole and alone"
+            );
+            assert!(
+                prompt.is_empty(),
+                "a 1-token prompt must not share the pinned decode bucket; it \
+                 must wait for selection (or the floor), got prompt = {prompt:?}"
+            );
+            assert_eq!(
+                Scheduler::waiting_len(&sched),
+                1,
+                "the prompt must be waitlisted, not lost"
+            );
+        });
     }
 
     /// A PROMPT batch keeps the exact-length key even with the flag on. Prefill
