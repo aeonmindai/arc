@@ -534,4 +534,28 @@ mod cohort_gate_tests {
             );
         }
     }
+
+    /// [`engaged_count`] is the instrument the A/B harness reads to tell "the
+    /// kernel ran" apart from "the benchmark got faster" — and until this
+    /// test, nothing in the tree read it, so it could have silently stopped
+    /// advancing and every claim built on it would still look green. The
+    /// counters are process-global and other tests may bump them
+    /// concurrently, so the assertion is on a lower bound of the delta, which
+    /// only this thread's calls can guarantee.
+    #[test]
+    fn engaged_count_advances_when_the_paths_are_taken() {
+        let (e0, d0) = engaged_count();
+        note_engaged(128, 64, 16, "bf16");
+        note_declined("test: exercising the decline counter");
+        let (e1, d1) = engaged_count();
+        assert!(
+            e1 >= e0 + 1,
+            "note_engaged did not advance the engaged counter ({e0} -> {e1}); \
+             an A/B reading engaged_count() would call a dead path live"
+        );
+        assert!(
+            d1 >= d0 + 1,
+            "note_declined did not advance the declined counter ({d0} -> {d1})"
+        );
+    }
 }

@@ -214,6 +214,30 @@ static REGISTRY: &[Capability] = &[
         },
         status: Status::Live,
     },
+    // Same shape as the entry above, same doctrine, one rung lower in the
+    // stack: the V4 rotary's RAGGED arm. Uniform cohorts already take one
+    // batched `rope_i` unconditionally (that dispatch is exact and shipped
+    // ON); this flag governs rows at genuinely different positions, which the
+    // per-sequence loop served at ~9 ops × 43 layers × B per step. The
+    // gathered rank-3 path is bit-identical to the loop
+    // (`deepseek_ragged_cohort_tests`) and default OFF until measured.
+    //
+    //   flag  ARC_ROPE_COHORT=1 (read by value via env_flag_is_set)
+    //   gate  layers.rs :: rope_cohort_enabled
+    //   test  one binary, ragged B>1 decode (ARC_MTP_PER_SEQ_KV on, or any
+    //         producer of unequal offsets), flag set vs unset
+    //   pass  outputs bit-identical AND the gathered arm faster;
+    //         rope_cohort_stats::counts() shows cohort > 0 on the flagged arm
+    //   then  the default flips in the same change that records the number
+    Capability {
+        name: "ragged-cohort RoPE: one gathered rope_i for unequal offsets, default OFF",
+        parent: "ArcInfer / ArcAttention",
+        check: Check::Symbol {
+            symbol: "rope_cohort_enabled",
+            defined_in: "mistralrs-core/src/layers.rs",
+        },
+        status: Status::Live,
+    },
     Capability {
         name: "prefill admission cap (--prefill-max-seqs)",
         parent: "ArcInfer / ArcSched",
