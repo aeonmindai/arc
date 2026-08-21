@@ -25,7 +25,7 @@
 # NOTE: this is the count the GLOB discovers, before cudaforge applies its
 # `exclude` patterns. It is therefore independent of compute capability. The
 # "Compiling N of M kernels" line in the build log shows the post-exclusion M
-# (this count minus the 5 `*_dummy.cu` / `dummy_*.cu` stubs on an SM >= 80
+# (this count minus the 6 `*_dummy.cu` / `dummy_*.cu` stubs on an SM >= 80
 # build), and that line is the engagement counter for a CUDA build: a CUDA
 # build that "succeeded" without it moving has not built what you think it did.
-41
+43

@@ -113,6 +113,46 @@ extern "C" {
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
+    // ---- Tensor-core blockwise-FP8 GEMM (kernels/blockwise_fp8/
+    // blockwise_fp8_gemm_wmma.cu). Signature-identical to
+    // `launch_fp8_matmul_*` above so the two are swappable behind one boolean.
+    //
+    // UNVERIFIED ON HARDWARE -- never run. See the kernel's header comment.
+    pub(crate) fn launch_fp8_matmul_wmma_f16(
+        input: *const f16,
+        weight: *const F8E4M3,
+        weight_scale: *const f32,
+        output: *mut f16,
+        m: i32,
+        n: i32,
+        k: i32,
+        scale_row_stride: i32,
+        block_size_y: i32,
+        block_size_x: i32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
+    pub(crate) fn launch_fp8_matmul_wmma_bf16(
+        input: *const bf16,
+        weight: *const F8E4M3,
+        weight_scale: *const f32,
+        output: *mut bf16,
+        m: i32,
+        n: i32,
+        k: i32,
+        scale_row_stride: i32,
+        block_size_y: i32,
+        block_size_x: i32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
+    /// Report the WMMA kernel's block tiling so the Rust eligibility test
+    /// cannot drift from the tiling the kernel was actually compiled with.
+    /// The dispatcher's preconditions (`block_size_y % n_blk == 0`,
+    /// `block_size_x % k_blk == 0`) are what make the block scale a single
+    /// scalar per tile, which is the kernel's whole premise.
+    pub(crate) fn fp8_matmul_wmma_tile_dims(m_blk: *mut i32, n_blk: *mut i32, k_blk: *mut i32);
+
     // FP8 GEMV kernels (dedicated decode path, M <= 4). Warp-per-row,
     // dequant-in-registers with per-block scales, f32 accumulate.
     pub(crate) fn launch_fp8_gemv_f16(
