@@ -133,6 +133,37 @@ pub fn sse_error_payload(kind: &str, message: impl Into<String>) -> SseErrorEnve
     }
 }
 
+/// What the client is told when the engine drops a request's responder without
+/// ever sending a terminal chunk.
+///
+/// This is a SECOND way to produce an HTTP 200 with zero tokens, distinct from
+/// the bare-string frame above and not fixed by it. Several engine paths make a
+/// sequence terminal without constructing any `Response` at all — a
+/// `FinishedIgnored` sequence whose KV allocation failed even after preemption
+/// (`paged_attention/scheduler.rs`), and a `Canceled` sequence dropped by
+/// `TERMINATE_ALL_NEXT_STEP`. The sender is then dropped, the receiver yields
+/// `None`, and a streamer that maps `None` to "stream over" ends the response
+/// cleanly: status 200, no error, and — because these paths fire before any
+/// chunk — frequently no content either.
+///
+/// The non-streaming handlers already turn a closed channel into a 500. Only
+/// the streaming paths were silent, and only because the status line is long
+/// gone by then, so the body is the sole remaining channel.
+pub const STREAM_TRUNCATED_MESSAGE: &str =
+    "the engine closed this request's response channel without completing it: no \
+     finish_reason was ever sent. The request did NOT finish normally — any content \
+     received before this frame is partial. This commonly means the sequence was \
+     dropped by the scheduler (KV cache exhaustion) or cancelled mid-flight.";
+
+/// Build the stream-terminating frame for an abnormally closed channel.
+///
+/// Callers must reach this only from [`DoneState::Running`]: once a terminal
+/// chunk has been seen the state machine has already moved to `SendingDone`,
+/// so a closed channel there is the normal end of a healthy stream.
+pub fn sse_stream_truncated_event() -> axum::response::sse::Event {
+    sse_error_event(sse_error_kind::INTERNAL, STREAM_TRUNCATED_MESSAGE)
+}
+
 pub fn sse_error_event(kind: &str, message: impl Into<String>) -> axum::response::sse::Event {
     let message = message.into();
     let envelope = sse_error_payload(kind, message.clone());
@@ -188,6 +219,43 @@ mod tests {
                 "error.{field} must be null here: {encoded}"
             );
         }
+    }
+
+    /// The truncated-stream frame must be decodable and must say the request
+    /// did not finish. A client that cannot tell this from a normal completion
+    /// is back to the original bug with extra steps.
+    #[test]
+    fn a_truncated_stream_frame_says_the_request_did_not_finish() {
+        let payload = sse_error_payload(sse_error_kind::INTERNAL, STREAM_TRUNCATED_MESSAGE);
+        let encoded = serde_json::to_string(&payload).expect("payload must serialize");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&encoded).expect("truncation frame must be valid JSON");
+        assert_eq!(parsed["error"]["type"], sse_error_kind::INTERNAL);
+
+        let message = parsed["error"]["message"]
+            .as_str()
+            .expect("message must be a string");
+        // The two facts a client needs: it did not finish, and what it has is partial.
+        assert!(
+            message.contains("did NOT finish"),
+            "the frame must state the request did not finish: {message}"
+        );
+        assert!(
+            message.contains("partial"),
+            "the frame must warn that received content is partial: {message}"
+        );
+    }
+
+    /// Non-vacuity control: an EMPTY message — what a client effectively got
+    /// when the stream simply ended — carries neither fact, so the assertions
+    /// above are load-bearing rather than trivially true.
+    #[test]
+    fn an_empty_message_would_fail_the_truncation_check() {
+        let silent = "";
+        assert!(
+            !silent.contains("did NOT finish") && !silent.contains("partial"),
+            "control broken: the silent frame must carry neither fact"
+        );
     }
 
     /// Non-vacuity control: the OLD frame — a bare string in `data:` — fails

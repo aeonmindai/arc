@@ -19,7 +19,7 @@ use crate::{
     openai::{CompletionRequest, Grammar},
     streaming::{
         base_create_streamer, get_keep_alive_interval, sse_error_event, sse_error_kind,
-        BaseStreamer, DoneState,
+        sse_stream_truncated_event, BaseStreamer, DoneState,
     },
     types::{ExtractedMistralRsState, OnChunkCallback, OnDoneCallback, SharedMistralRsState},
     util::{sanitize_error_message, validate_model_name},
@@ -161,7 +161,13 @@ impl futures::Stream for CompletionStreamer {
                 Response::Raw { .. } => unreachable!(),
                 Response::Embeddings { .. } => unreachable!(),
             },
-            Poll::Ready(None) => Poll::Ready(None),
+            // See `ChatCompletionStreamer`: a channel that closes while Running
+            // is an abnormal end, and returning `None` here reported it as a
+            // clean 200 with zero tokens.
+            Poll::Ready(None) => {
+                self.done_state = DoneState::SendingDone;
+                Poll::Ready(Some(Ok(sse_stream_truncated_event())))
+            }
             Poll::Pending => Poll::Pending,
         }
     }

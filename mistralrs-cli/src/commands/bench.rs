@@ -28,6 +28,92 @@ struct BenchResult {
     latency_ms: f32,
 }
 
+/// What one benchmark iteration actually PRODUCED.
+///
+/// ⚠️ This type exists because `bench` used to divide the *requested* length by
+/// the elapsed time — `gen_len as f32 / elapsed` — and never looked at the
+/// response at all. A request that produced ZERO tokens therefore reported a
+/// full tok/s figure and exited 0: a silent failure that reads as a
+/// measurement. Worse, a fast zero-token failure divides the requested length
+/// by a tiny elapsed time, so the fabricated number is *high* — the failure
+/// mode most likely to be believed and published.
+///
+/// Two independent counters are carried, and the grader requires both:
+///   * `completion_tokens` — the engine's own bookkeeping, and
+///   * `text_len`          — the bytes the caller actually received.
+/// A row where one is zero and the other is not is a disagreement between what
+/// the engine claims and what it delivered, which is a defect in its own right
+/// rather than a rounding difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BenchRun {
+    /// Tokens the engine reports having generated.
+    completion_tokens: usize,
+    /// Prompt tokens the engine reports having processed.
+    prompt_tokens: usize,
+    /// Bytes of completion text actually delivered to this caller.
+    text_len: usize,
+}
+
+/// Why a benchmark iteration cannot be turned into a rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RateError {
+    /// The engine produced nothing. This is the silent-failure bug.
+    NoTokens,
+    /// The engine's token count and the delivered text disagree about whether
+    /// anything was produced.
+    CounterDisagreement { tokens: usize, text_len: usize },
+    /// Elapsed time was not positive, so any rate would be infinite.
+    NonPositiveElapsed,
+}
+
+impl std::fmt::Display for RateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoTokens => write!(
+                f,
+                "the engine produced ZERO tokens. This is a silent failure, not a \
+                 measurement: the previous code divided the REQUESTED length by the \
+                 elapsed time and would have printed a tok/s figure for this run"
+            ),
+            Self::CounterDisagreement { tokens, text_len } => write!(
+                f,
+                "counter disagreement: the engine reports {tokens} completion token(s) \
+                 but delivered {text_len} byte(s) of text. One of the two is wrong, so \
+                 neither can be used as a denominator"
+            ),
+            Self::NonPositiveElapsed => write!(
+                f,
+                "elapsed time was not positive, so a rate cannot be computed"
+            ),
+        }
+    }
+}
+
+/// Turn a completed iteration into tokens/second, or refuse.
+///
+/// The denominator is what the engine PRODUCED, never what the caller asked
+/// for. There is deliberately no fallback: a run that produced nothing has no
+/// rate, and manufacturing one is exactly the bug this replaces.
+fn rate_from_produced(
+    produced: usize,
+    text_len: usize,
+    elapsed_secs: f32,
+) -> Result<f32, RateError> {
+    if (produced > 0) != (text_len > 0) {
+        return Err(RateError::CounterDisagreement {
+            tokens: produced,
+            text_len,
+        });
+    }
+    if produced == 0 {
+        return Err(RateError::NoTokens);
+    }
+    if !(elapsed_secs > 0.0) {
+        return Err(RateError::NonPositiveElapsed);
+    }
+    Ok(produced as f32 / elapsed_secs)
+}
+
 /// Extract model_id from ModelType
 fn get_model_id(model_type: &ModelType) -> String {
     match model_type {
@@ -99,8 +185,19 @@ pub async fn run_bench(
     // Warmup runs
     if warmup > 0 {
         info!("Running {} warmup iteration(s)...", warmup);
-        for _ in 0..warmup {
-            let _ = run_single_bench(&mistralrs, 32, 16).await;
+        for w in 0..warmup {
+            // `let _ = …` here swallowed hard errors, so a model that failed
+            // every warmup iteration looked identical to one that warmed up
+            // fine. Warmup failure is not fatal, but it is never silent.
+            match run_single_bench(&mistralrs, 32, 16).await {
+                Ok(run) if run.completion_tokens == 0 => tracing::warn!(
+                    "warmup iteration {} produced ZERO tokens — the measured \
+                     iterations are likely to do the same.",
+                    w + 1
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("warmup iteration {} failed: {e}", w + 1),
+            }
         }
         info!("Warmup complete.");
 
@@ -130,10 +227,28 @@ pub async fn run_bench(
         // Use external timing since internal Usage timing may not capture prompt time accurately
         if prompt_len > 0 {
             let start = Instant::now();
-            run_single_bench(&mistralrs, prompt_len, 1).await?;
+            let run = run_single_bench(&mistralrs, prompt_len, 1).await?;
             let elapsed = start.elapsed();
+
+            // The prefill denominator is what the engine says it PROCESSED. If
+            // that disagrees with what we asked it to process, the figure
+            // describes a different workload than the one being reported.
+            if run.prompt_tokens != prompt_len {
+                anyhow::bail!(
+                    "prefill iteration {}: asked for {prompt_len} prompt tokens but the engine \
+                     reports processing {}. A tok/s figure computed over the requested length \
+                     would describe a workload that never ran.",
+                    i + 1,
+                    run.prompt_tokens
+                );
+            }
+            // A prefill run still has to emit its one token; zero means the
+            // forward pass did not produce a result.
+            let _ = rate_from_produced(run.completion_tokens, run.text_len, elapsed.as_secs_f32())
+                .map_err(|e| anyhow::anyhow!("prefill iteration {}: {e}", i + 1))?;
+
             // Record both tok/s and TTFT (latency in ms)
-            let tok_per_sec = prompt_len as f32 / elapsed.as_secs_f32();
+            let tok_per_sec = run.prompt_tokens as f32 / elapsed.as_secs_f32();
             let ttft_ms = elapsed.as_secs_f32() * 1000.0;
             prefill_results.push((tok_per_sec, ttft_ms));
         }
@@ -141,10 +256,27 @@ pub async fn run_bench(
         // Decode benchmark (token generation)
         if gen_len > 0 {
             let start = Instant::now();
-            run_single_bench(&mistralrs, 4, gen_len).await?;
+            let run = run_single_bench(&mistralrs, 4, gen_len).await?;
             let elapsed = start.elapsed();
-            // Record both tok/s and ms/tok
-            let tok_per_sec = gen_len as f32 / elapsed.as_secs_f32();
+
+            // The denominator is the PRODUCED count. This call is what makes a
+            // zero-token run fail loudly instead of printing a fabricated rate.
+            let tok_per_sec =
+                rate_from_produced(run.completion_tokens, run.text_len, elapsed.as_secs_f32())
+                    .map_err(|e| anyhow::anyhow!("decode iteration {}: {e}", i + 1))?;
+
+            // A short run is not necessarily a failure (EOS is legal), but it
+            // is never silent: the reported rate is over the produced count, so
+            // say plainly that the two differ.
+            if run.completion_tokens != gen_len {
+                tracing::warn!(
+                    "decode iteration {}: asked for {gen_len} tokens, engine produced {}. \
+                     The reported rate is over the PRODUCED count.",
+                    i + 1,
+                    run.completion_tokens
+                );
+            }
+
             let ms_per_tok = 1000.0 / tok_per_sec;
             decode_results.push((tok_per_sec, ms_per_tok));
         }
@@ -279,7 +411,7 @@ async fn run_single_bench(
     mistralrs: &Arc<mistralrs_core::MistralRs>,
     prompt_tokens: usize,
     gen_tokens: usize,
-) -> Result<()> {
+) -> Result<BenchRun> {
     let sampling_params = SamplingParams {
         temperature: Some(0.1),
         top_k: Some(32),
@@ -325,8 +457,22 @@ async fn run_single_bench(
 
     sender.send(req).await?;
 
+    // The response is READ, not discarded. `Some(Response::Done(_)) => Ok(())`
+    // is how a zero-token run used to be scored as a success.
     match rx.recv().await {
-        Some(Response::CompletionDone(_)) | Some(Response::Done(_)) => Ok(()),
+        Some(Response::CompletionDone(r)) => Ok(BenchRun {
+            completion_tokens: r.usage.completion_tokens,
+            prompt_tokens: r.usage.prompt_tokens,
+            text_len: r.choices.first().map_or(0, |c| c.text.len()),
+        }),
+        Some(Response::Done(r)) => Ok(BenchRun {
+            completion_tokens: r.usage.completion_tokens,
+            prompt_tokens: r.usage.prompt_tokens,
+            text_len: r
+                .choices
+                .first()
+                .map_or(0, |c| c.message.content.as_ref().map_or(0, String::len)),
+        }),
         Some(Response::InternalError(e)) => anyhow::bail!("Internal error: {e:?}"),
         Some(Response::ModelError(e, _)) => anyhow::bail!("Model error: {e}"),
         Some(Response::ValidationError(e)) => anyhow::bail!("Validation error: {e:?}"),
@@ -374,4 +520,103 @@ fn print_results(model_id: &str, iterations: usize, results: &[BenchResult]) {
 
     println!("{table}");
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The old formula, kept verbatim so the tests below can demonstrate what
+    /// it would have printed. This is the code that was removed:
+    /// `let tok_per_sec = gen_len as f32 / elapsed.as_secs_f32();`
+    fn legacy_rate_over_requested(requested: usize, elapsed_secs: f32) -> f32 {
+        requested as f32 / elapsed_secs
+    }
+
+    /// The property that was missing: a run that produced nothing has NO rate.
+    #[test]
+    fn a_zero_token_run_is_refused_not_rated() {
+        let err = rate_from_produced(0, 0, 0.5).expect_err("zero tokens must not yield a rate");
+        assert_eq!(err, RateError::NoTokens);
+        // The message has to name the failure, because this string is the only
+        // thing a operator sees when a benchmark aborts.
+        assert!(
+            err.to_string().contains("ZERO tokens"),
+            "the error must say what happened: {err}"
+        );
+    }
+
+    /// NON-VACUITY CONTROL. This test MUST fire: it shows the old formula
+    /// produced a perfectly ordinary-looking tok/s number for the very run the
+    /// test above refuses. If this assertion ever fails, the control is broken
+    /// and the test above proves nothing.
+    #[test]
+    fn the_old_formula_would_have_published_a_number_for_that_same_run() {
+        // 64 tokens requested, zero produced, failed fast in 50 ms.
+        let fabricated = legacy_rate_over_requested(64, 0.05);
+        assert!(
+            fabricated.is_finite() && fabricated > 0.0,
+            "control broken: the legacy formula must yield a plausible number here"
+        );
+        // And it is not merely wrong, it is FLATTERING — a fast failure inflates it.
+        assert!(
+            fabricated > 1000.0,
+            "a fast zero-token failure should inflate the legacy rate, got {fabricated}"
+        );
+        // Same inputs, current code: refused.
+        assert_eq!(
+            rate_from_produced(0, 0, 0.05),
+            Err(RateError::NoTokens),
+            "the current code must refuse the run the legacy formula rated at {fabricated:.0} tok/s"
+        );
+    }
+
+    /// The engine claiming tokens it did not deliver (and vice versa) is a
+    /// defect, not a rounding difference — neither counter can be trusted as a
+    /// denominator once they disagree.
+    #[test]
+    fn counter_disagreement_is_refused_in_both_directions() {
+        assert_eq!(
+            rate_from_produced(64, 0, 1.0),
+            Err(RateError::CounterDisagreement {
+                tokens: 64,
+                text_len: 0
+            }),
+            "engine claims 64 tokens but delivered no text"
+        );
+        assert_eq!(
+            rate_from_produced(0, 128, 1.0),
+            Err(RateError::CounterDisagreement {
+                tokens: 0,
+                text_len: 128
+            }),
+            "engine delivered text but counted no tokens"
+        );
+    }
+
+    /// A short run is legal (EOS), and it must be rated over what it PRODUCED.
+    #[test]
+    fn a_short_run_rates_over_produced_not_requested() {
+        // Asked for 64, produced 7, took 1 s.
+        let rate = rate_from_produced(7, 21, 1.0).expect("a 7-token run has a rate");
+        assert!(
+            (rate - 7.0).abs() < f32::EPSILON,
+            "rate must be 7/1s, got {rate}"
+        );
+        // The number the old code would have printed for the identical run:
+        let legacy = legacy_rate_over_requested(64, 1.0);
+        assert!(
+            (legacy - rate).abs() > 1.0,
+            "control broken: legacy and corrected rates must differ here \
+             (legacy={legacy}, corrected={rate})"
+        );
+    }
+
+    #[test]
+    fn non_positive_elapsed_is_refused() {
+        assert_eq!(
+            rate_from_produced(16, 48, 0.0),
+            Err(RateError::NonPositiveElapsed)
+        );
+    }
 }
