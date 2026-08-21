@@ -7,7 +7,9 @@ use crate::{attention::SdpaParams, pipeline::text_models_inputs_processor::Flash
 /// Dispatches to:
 ///   CUDA  -> flash_attn_sinks / flash_attn_sinks_varlen
 ///   Metal -> flash_attn_sinks_metal / flash_attn_sinks_varlen_metal
-///   CPU   -> unfused matmul + softmax_with_sinks
+///   otherwise -> unfused matmul + softmax_with_sinks (device-agnostic candle
+///   ops — this is the fall-through for ANY device the fused kernels decline,
+///   not a CPU-only path; DeepSeek-V4's head_dim 512 takes it on CUDA too)
 ///
 /// Varlen is used when flash_params contains cu_seqlens_k for this device AND
 /// q has batch > 1 AND the caller supplied no explicit mask.
@@ -209,8 +211,16 @@ fn sinks_attn_regular(
         });
     }
 
+    // 🔴 SAME DEFECT, OTHER BACKEND. The gate above stops the CUDA arm from
+    // swallowing masked work; this arm had no such gate, so a masked call on
+    // Metal (GPT-OSS passes a mask it asserts is `Some`, and every fused head
+    // dim {64,80,96,128,256} is reachable there) went to
+    // `flash_attn_sinks_metal` — which takes no mask parameter at all — and the
+    // mask was dropped on the floor. Unlike the CUDA kernel, the Metal entry
+    // point cannot even refuse a mask at the interface (it has no argument to
+    // refuse with), so this dispatch gate is the only line of defence.
     #[cfg(feature = "metal")]
-    if q.device().is_metal() && flash_sinks_ok_metal {
+    if q.device().is_metal() && flash_sinks_ok_metal && mask.is_none() {
         crate::attention::arcflash::note(crate::attention::arcflash::Path::VendorSinks);
         return mistralrs_quant::flash_attn_sinks_metal(
             q,
@@ -220,6 +230,19 @@ fn sinks_attn_regular(
             sdpa_params.softmax_scale,
             window_size,
         );
+    }
+    #[cfg(feature = "metal")]
+    if q.device().is_metal() && flash_sinks_ok_metal && mask.is_some() {
+        // Loud once: correct-and-slower on purpose, exactly as on CUDA.
+        static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        WARNED.get_or_init(|| {
+            tracing::warn!(
+                target: "arcflash",
+                "fused head_dim={hd} Metal sinks kernel DECLINED: an explicit attention \
+                 mask is present and the kernel cannot honour one (it has no mask \
+                 parameter). Falling back to the unfused masked path."
+            );
+        });
     }
 
     // ArcFlash/Tile — the head_dim the vendor sinks kernel does not take.
@@ -299,7 +322,12 @@ fn sinks_attn_varlen(
         );
     }
 
-    // CPU fallback: per-sequence loop (to_vec1 is fine on CPU path)
+    // Unfused fallback: per-sequence loop. Device-agnostic, and reached on
+    // CUDA/Metal too whenever the fused varlen kernel declines the head_dim —
+    // where these `to_vec1` calls are device-to-host syncs, once per layer per
+    // step. Hoisting the host copy of cu_seqlens into `FlashParams` is the fix
+    // for that; it is plumbing shared with the eager path and out of scope
+    // here.
     let cu_q_vec: Vec<u32> = cu_seqlens_q.to_vec1()?;
     let cu_k_vec: Vec<u32> = cu_seqlens_k.to_vec1()?;
     sinks_attn_cpu_varlen(
@@ -350,6 +378,47 @@ fn varlen_causal_mask(
     Tensor::from_vec(data, (1, 1, q_len, kv_len), device)?.to_dtype(dtype)
 }
 
+/// Memoizing front end for [`varlen_causal_mask`].
+///
+/// The builder is a `Tensor::from_vec` — a host-to-device copy when the
+/// tensors live on a GPU (CLAUDE.md pitfall #5) — and `sinks_attn_cpu_varlen`
+/// calls it once per **sequence** per layer per step. The mask is a pure
+/// function of the integer key, and in a uniform-length batch every sequence
+/// of every layer shares one, so a single slot turns per-(sequence × layer)
+/// uploads into one per shape change. A ragged batch alternates keys and
+/// rebuilds per sequence — exactly the pre-memo cost, never worse.
+fn varlen_causal_mask_cached(
+    q_len: usize,
+    kv_len: usize,
+    window_size: usize,
+    dtype: candle_core::DType,
+    device: &candle_core::Device,
+) -> Result<Tensor> {
+    type Key = (
+        usize,
+        usize,
+        usize,
+        candle_core::DType,
+        candle_core::DeviceLocation,
+    );
+    thread_local! {
+        static MEMO: std::cell::RefCell<Option<(Key, Tensor)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let key = (q_len, kv_len, window_size, dtype, device.location());
+    MEMO.with(|c| -> Result<Tensor> {
+        let mut c = c.borrow_mut();
+        if let Some((k, t)) = c.as_ref() {
+            if *k == key {
+                return Ok(t.clone());
+            }
+        }
+        let t = varlen_causal_mask(q_len, kv_len, window_size, dtype, device)?;
+        *c = Some((key, t.clone()));
+        Ok(t)
+    })
+}
+
 /// Sinks attention on **ArcFlash/Tile** — the path every DeepSeek-V4 layer
 /// takes, because head_dim 512 is outside the fused sinks kernel's
 /// `{64,80,96,112,128,192,256}`.
@@ -376,7 +445,9 @@ fn sinks_attn_cpu(
     crate::attention::arcflash::union_attention(q, k, v, mask, Some(sinks), sdpa_params)
 }
 
-/// CPU fallback for varlen: per-sequence unfused loop.
+/// Unfused fallback for varlen: per-sequence loop. Despite the name this is
+/// device-agnostic candle math, not CPU-only — it is the fall-through on any
+/// device whose fused varlen kernel declines the head_dim.
 ///
 /// Each sequence is masked with `varlen_causal_mask`, matching the fused
 /// varlen kernels. Passing `None` here (the pre-fix behavior) made every
@@ -416,7 +487,7 @@ fn sinks_attn_cpu_varlen(
             .transpose(0, 1)?
             .unsqueeze(0)?;
 
-        let mask = varlen_causal_mask(q_len, kv_len, window_size, qi.dtype(), device)?;
+        let mask = varlen_causal_mask_cached(q_len, kv_len, window_size, qi.dtype(), device)?;
         let oi = sinks_attn_cpu(&qi, &ki, &vi, sinks, Some(&mask), sdpa_params)?;
 
         // Pad back to max_q
@@ -577,6 +648,90 @@ mod tests {
             0.0,
             "a masked call did not take the regular (mask-honoring) path"
         );
+        Ok(())
+    }
+
+    /// Additive causal mask whose last `pad` key columns are dead PADDING —
+    /// the exact class of information the fused kernels cannot re-derive:
+    /// they rebuild causality and windows internally, but nothing tells them
+    /// which trailing keys belong to a shorter neighbour's padding.
+    fn padding_mask(seq: usize, pad: usize, dev: &Device) -> Result<Tensor> {
+        let mut m = vec![0f32; seq * seq];
+        for i in 0..seq {
+            for j in 0..seq {
+                if j > i || j >= seq - pad {
+                    m[i * seq + j] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        Tensor::from_vec(m, (1, 1, seq, seq), dev)
+    }
+
+    /// A padding mask must survive the dispatch end to end, and dropping it
+    /// must CHANGE the output — so this test fails on any regression that
+    /// re-routes masked work to a maskless kernel, rather than passing by
+    /// luck because the mask happened to be redundant with plain causality.
+    #[test]
+    fn padding_mask_is_honored_and_dropping_it_changes_the_output() -> Result<()> {
+        let dev = Device::Cpu;
+        let (b, h, seq, d) = (2usize, 2usize, 6usize, 16usize);
+        let sinks = Tensor::from_vec(vec![0.25f32, 0.5], (1, h, 1, 1), &dev)?;
+        let sdpa = SdpaParams {
+            sinks: Some(sinks.clone()),
+            ..params(d, h, None)
+        };
+
+        let q = mk(&[b, h, seq, d], 0.05, &dev)?;
+        let k = mk(&[b, 1, seq, d], 0.13, &dev)?;
+        let v = mk(&[b, 1, seq, d], 0.23, &dev)?;
+        let mask = padding_mask(seq, 2, &dev)?;
+
+        // flash_params present and b > 1: the configuration where a dropped
+        // mask would additionally re-route the call onto the varlen path.
+        let flash = varlen_params(&[seq as u32; 2], &dev);
+        let got = sinks_attn(&q, &k, &v, &sinks, Some(&mask), Some(&flash), &sdpa)?;
+        let want = sinks_attn_cpu(&q, &k, &v, &sinks, Some(&mask), &sdpa)?;
+        assert_eq!(
+            max_abs_diff(&flat(&got), &flat(&want)),
+            0.0,
+            "the dispatch did not honor the padding mask"
+        );
+
+        // Teeth: with the mask dropped (the defect), the answer is different
+        // by a wide margin — the padding columns vote in the softmax.
+        let dropped = sinks_attn_cpu(&q, &k, &v, &sinks, None, &sdpa)?;
+        let signal = max_abs_diff(&flat(&want), &flat(&dropped));
+        assert!(
+            signal > 1e-2,
+            "masked and maskless attention are indistinguishable ({signal}); \
+             this test has no teeth"
+        );
+        Ok(())
+    }
+
+    /// The memoized varlen mask must be bit-identical to a fresh build across
+    /// key changes — same shape with a different window is exactly the
+    /// stale-serving hazard — and must actually HIT on a repeated key: a memo
+    /// that always misses passes every value check while doing nothing.
+    #[test]
+    fn varlen_mask_memo_hits_and_never_serves_stale() -> Result<()> {
+        let dev = Device::Cpu;
+        for &(q_len, kv_len, window) in &[(5usize, 8usize, 0usize), (5, 8, 3), (5, 8, 0), (4, 9, 2)]
+        {
+            let fresh = varlen_causal_mask(q_len, kv_len, window, DType::F32, &dev)?;
+            let cached = varlen_causal_mask_cached(q_len, kv_len, window, DType::F32, &dev)?;
+            assert_eq!(
+                flat(&fresh),
+                flat(&cached),
+                "memo served a wrong mask for ({q_len}, {kv_len}, {window})"
+            );
+        }
+        // Engagement: a repeated key returns the same tensor handle. Skipping
+        // the build leaves no trace in the values, so only the handle proves
+        // the cache did anything.
+        let a = varlen_causal_mask_cached(7, 7, 2, DType::F32, &dev)?;
+        let b = varlen_causal_mask_cached(7, 7, 2, DType::F32, &dev)?;
+        assert_eq!(a.id(), b.id(), "repeated key did not hit the memo");
         Ok(())
     }
 }
@@ -816,6 +971,184 @@ mod fused_sinks_mask_tests {
             d < 1e-3,
             "masked sinks attention does not match the masked reference \
              (max abs diff {d}, magnitude {scale}) -- the mask is being dropped again"
+        );
+        Ok(())
+    }
+}
+
+/// The Metal twin of `fused_sinks_mask_tests`. `flash_attn_sinks_metal` takes
+/// no mask parameter at all, so — unlike CUDA, where the kernel itself now
+/// refuses a mask — the dispatch gate is the ONLY line of defence for masked
+/// work on Metal. head_dim 128 sits inside Metal's fused set, so the fused arm
+/// is exactly the one that would engage.
+///
+///   cargo test -p mistralrs-core --features metal metal_sinks -- --nocapture
+#[cfg(all(test, feature = "metal"))]
+mod metal_sinks_mask_tests {
+    use super::*;
+    use candle_core::{DType, Device};
+
+    fn mk(dims: &[usize], seed: f32, dev: &Device) -> Result<Tensor> {
+        let n: usize = dims.iter().product();
+        let data: Vec<f32> = (0..n).map(|i| ((i as f32) * seed).sin()).collect();
+        Tensor::from_vec(data, dims, dev)
+    }
+
+    fn to_f32(t: &Tensor) -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    fn max_abs(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+    }
+
+    /// Additive 0 / -inf mask [1, 1, q, k]: causal, and only the first `keep`
+    /// keys are admissible — the padding-column class the kernel cannot
+    /// re-derive.
+    fn band_mask(q_len: usize, kv_len: usize, keep: usize, dev: &Device) -> Result<Tensor> {
+        let mut m = vec![0f32; q_len * kv_len];
+        for i in 0..q_len {
+            for j in 0..kv_len {
+                let causal_ok = j <= i + (kv_len - q_len);
+                if !causal_ok || j >= keep {
+                    m[i * kv_len + j] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        Tensor::from_vec(m, (1, 1, q_len, kv_len), dev)
+    }
+
+    const B: usize = 1;
+    const H: usize = 8;
+    const KVH: usize = 1;
+    const QL: usize = 16;
+    const KL: usize = 48;
+    const D: usize = 128; // inside Metal's fused set {64, 80, 96, 112, 128, 192, 256}
+
+    fn fixtures(dev: &Device) -> Result<(Tensor, Tensor, Tensor, Tensor, SdpaParams)> {
+        let q = mk(&[B, H, QL, D], 0.017, dev)?;
+        let k = mk(&[B, KVH, KL, D], 0.023, dev)?;
+        let v = mk(&[B, KVH, KL, D], 0.031, dev)?;
+        let sinks = mk(&[H], 0.041, dev)?;
+        let p = SdpaParams {
+            n_kv_groups: H / KVH,
+            softcap: None,
+            softmax_scale: 1.0 / (D as f32).sqrt(),
+            sliding_window: None,
+            sinks: None,
+        };
+        Ok((q, k, v, sinks, p))
+    }
+
+    /// THE BASELINE. The fused Metal kernel, called exactly as the dispatch
+    /// calls it, cannot depend on a mask it is never given: its output tracks
+    /// the causal-only reference and misses the masked one by the mask's whole
+    /// effect. This is the delta the dispatch gate exists to keep out of
+    /// serving — and the size of the wrong answer if the gate regresses.
+    #[test]
+    fn fused_metal_kernel_cannot_honour_a_mask() -> Result<()> {
+        let dev = Device::new_metal(0).expect("this test requires a Metal device");
+        let (q, k, v, sinks, p) = fixtures(&dev)?;
+
+        let mask_causal = band_mask(QL, KL, KL, &dev)?;
+        let mask_narrow = band_mask(QL, KL, 8, &dev)?;
+
+        let ref_causal = to_f32(&crate::attention::arcflash::union_attention(
+            &q,
+            &k,
+            &v,
+            Some(&mask_causal),
+            Some(&sinks),
+            &p,
+        )?);
+        let ref_narrow = to_f32(&crate::attention::arcflash::union_attention(
+            &q,
+            &k,
+            &v,
+            Some(&mask_narrow),
+            Some(&sinks),
+            &p,
+        )?);
+        let fused = to_f32(&mistralrs_quant::flash_attn_sinks_metal(
+            &q,
+            &k,
+            &v,
+            Some(&sinks),
+            p.softmax_scale,
+            0,
+        )?);
+
+        let d_causal = max_abs(&fused, &ref_causal);
+        let d_narrow = max_abs(&fused, &ref_narrow);
+        let d_masks = max_abs(&ref_causal, &ref_narrow);
+        eprintln!(
+            "max|fused - ref(causal only)| = {d_causal:.6}\n\
+             max|fused - ref(masked)|      = {d_narrow:.6}\n\
+             max|ref(causal) - ref(masked)| = {d_masks:.6}   <- the mask's own effect"
+        );
+        assert!(
+            d_masks > 1e-3,
+            "the two masks did not change the reference ({d_masks}); test would be vacuous"
+        );
+        assert!(
+            d_narrow > d_causal * 10.0,
+            "expected the maskless Metal kernel to track the causal-only reference \
+             (d_causal {d_causal}, d_narrow {d_narrow})"
+        );
+        Ok(())
+    }
+
+    /// THE GATE. A masked call through the dispatch must match the masked
+    /// unfused reference — i.e. it must NOT have gone to the fused kernel the
+    /// baseline above proves would drop the mask. Reverting the
+    /// `mask.is_none()` guard on the Metal arm fails this test by
+    /// approximately the `d_narrow` the baseline prints.
+    #[test]
+    fn masked_sinks_attention_on_metal_matches_the_masked_reference() -> Result<()> {
+        let dev = Device::new_metal(0).expect("this test requires a Metal device");
+        let (q, k, v, sinks, p) = fixtures(&dev)?;
+        let mask = band_mask(QL, KL, 8, &dev)?;
+
+        let got = to_f32(&sinks_attn(&q, &k, &v, &sinks, Some(&mask), None, &p)?);
+        let want = to_f32(&crate::attention::arcflash::union_attention(
+            &q,
+            &k,
+            &v,
+            Some(&mask),
+            Some(&sinks),
+            &p,
+        )?);
+
+        // Negative control on the OUTPUT: a shared-input perturbation would
+        // move both sides together and could never fire.
+        {
+            let mut probe = got.clone();
+            assert_eq!(max_abs(&probe, &got), 0.0);
+            probe[7] = f32::from_bits(probe[7].to_bits().wrapping_add(1));
+            assert!(max_abs(&probe, &got) > 0.0, "comparator is inert");
+        }
+
+        let d = max_abs(&got, &want);
+        eprintln!("masked Metal dispatch vs masked reference: max abs diff {d:.8}");
+        assert!(
+            d < 1e-3,
+            "masked sinks attention on Metal does not match the masked reference \
+             (max abs diff {d}) -- the Metal arm is dropping the mask again"
+        );
+
+        // ...and the maskless fused fast path still works.
+        assert!(
+            sinks_attn(&q, &k, &v, &sinks, None, None, &p).is_ok(),
+            "declining masks must not break the maskless fused path"
         );
         Ok(())
     }
