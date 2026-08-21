@@ -944,6 +944,44 @@ fn fp8_gemv_max_m() -> usize {
 /// Set `ARC_NO_FP8_WMMA=1` to get back exactly the behaviour of the commit
 /// before this one. That is the control arm; run it first.
 ///
+/// # ⚠️ THIS KERNEL IS UNREACHABLE IF `ARC_FP8_CUBLAS_MIN_M` IS LOWERED
+///
+/// `BlockwiseFP8Linear::forward` decides between *this whole file* and the
+/// dequantize + cuBLASLt fallback **before** it ever gets here:
+///
+/// ```text
+///   m_rows >= arc_fp8_cublas_min_m()  ->  dequantize_w() + cuBLASLt
+///   otherwise                         ->  the native FP8 path (this file)
+/// ```
+///
+/// On master that constant is 512, so B = 256 reaches this kernel. A separate
+/// change in flight (PR #201) lowers it to **5**, which routes everything
+/// above the GEMV domain into the dequantize path and leaves this kernel
+/// **dead code at every batch size that matters**. That is the exact
+/// "wired-but-dead" failure this repo already tracks, and it would be silent:
+/// the kernel compiles, the tests pass, and it never runs.
+///
+/// The two changes are not actually in conflict — they are answers to the
+/// *same* question asked before and after the premise changed. The reason
+/// cuBLASLt won the M = 8..128 sweep is that it had tensor cores and the
+/// native FP8 path did not. This kernel removes that asymmetry, and it does
+/// so while reading FP8 straight from HBM: no `dequantize_w()`, so none of
+/// the ~12.7 GB/step of dequantize traffic and none of the +8.48 GB of
+/// resident BF16 weights that the cuBLASLt arm pays for.
+///
+/// So whoever merges these two must **re-run the threshold sweep with this
+/// kernel present**, comparing three arms, not two:
+///
+/// ```text
+///   (a) dequantize_w() + cuBLASLt          <- what PR #201 measured
+///   (b) native FP8 tensor-core GEMM        <- this file, ARC_NO_FP8_WMMA unset
+///   (c) native scalar fp8_matmul_tiled     <- ARC_NO_FP8_WMMA=1
+/// ```
+///
+/// Derivation, NOT a measurement: (b) should beat (a) because it moves
+/// ~4.238 GB instead of ~12.7 GB and skips a full-model dequantize per step.
+/// Nobody has run it. Do not merge a threshold on the two-arm result.
+///
 /// # Why there is no M threshold here
 ///
 /// There is an obvious temptation to gate this on some minimum M, since a
