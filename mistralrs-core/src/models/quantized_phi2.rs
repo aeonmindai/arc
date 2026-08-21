@@ -38,7 +38,25 @@ struct Mlp {
 
 impl Module for Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        MatMul.qmethod_matmul(&MatMul.qmethod_matmul(xs, &*self.ffn_up)?, &*self.ffn_down)
+        // 🔴 The `.gelu()` between the two projections was deleted by
+        // `1269bd8ab` ("Implement GPTQ quantization", Aug 2024), which rewrote
+        //     xs.apply(&self.ffn_up)?.gelu()?.apply(&self.ffn_down)
+        // into a bare `qmethod_matmul` composition and dropped the activation on
+        // the way through. The sibling `quantized_phi3.rs`, rewritten in the
+        // same commit, kept its activation -- this was a transcription slip, not
+        // a decision.
+        //
+        // Without it the FFN is two stacked linear maps, which collapse to a
+        // single linear map: the block contributes no nonlinearity at all.
+        //
+        // Phi-2 uses GELU, not SiLU: `models/phi2.rs` (the unquantized path)
+        // applies `cfg.hidden_act`, which is `gelu_new` in
+        // microsoft/phi-2's config.json, and llama.cpp builds the phi2 graph
+        // with `LLM_FFN_GELU` (`src/models/phi2.cpp`). Candle's `Tensor::gelu`
+        // is the tanh approximation, which is what `gelu_new` names; `gelu_erf`
+        // is the exact form and would NOT match.
+        let up = MatMul.qmethod_matmul(xs, &*self.ffn_up)?.gelu()?;
+        MatMul.qmethod_matmul(&up, &*self.ffn_down)
     }
 }
 
@@ -184,19 +202,55 @@ struct PropsGGUF {
     max_seq_len: usize,
 }
 
+/// Phi-2's LayerNorm epsilon, under whichever key the writer used.
+///
+/// llama.cpp and `gguf-py` write `{arch}.attention.layer_norm_epsilon` for
+/// phi2 (it is a LayerNorm architecture). The RMS spelling is accepted as a
+/// fallback so a file produced by some other converter still loads, and an
+/// error names both keys rather than only the one that happened to be checked.
+fn layer_norm_eps(c: &ContentMetadata<'_>) -> std::result::Result<f64, anyhow::Error> {
+    if let Some(eps) = c.get_option_value::<f32>("attention.layer_norm_epsilon")? {
+        return Ok(eps as f64);
+    }
+    if let Some(eps) = c.get_option_value::<f32>("attention.layer_norm_rms_epsilon")? {
+        return Ok(eps as f64);
+    }
+    anyhow::bail!(
+        "phi2 GGUF is missing its LayerNorm epsilon: neither \
+         `phi2.attention.layer_norm_epsilon` nor \
+         `phi2.attention.layer_norm_rms_epsilon` is present"
+    )
+}
+
 impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
     type Error = anyhow::Error;
 
     fn try_from(c: ContentMetadata) -> std::result::Result<Self, Self::Error> {
         c.verify_arch("phi2")?;
 
+        // 🔴 `attention.layer_norm_rms_epsilon` used to be in this list, and it
+        // is a key phi2 GGUFs do not carry -- so `has_required_keys` failed on
+        // every real file and this loader was unreachable. That is what masked
+        // the missing FFN activation above.
+        //
+        // Phi-2 normalises with LayerNorm, not RMSNorm -- this very file builds
+        // a `candle_nn::LayerNorm` from `ln_eps`, complete with a bias. Writers
+        // agree: llama.cpp loads phi2's epsilon with
+        // `ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS, hparams.f_norm_eps)` and
+        // builds the graph with `LLM_NORM` (`src/models/phi2.cpp`), and
+        // `gguf-py` spells that key `{arch}.attention.layer_norm_epsilon`
+        // (`gguf/constants.py`). `quantized_starcoder2.rs`, the other
+        // LayerNorm-based GGUF loader here, already reads the non-RMS key.
+        //
+        // The epsilon is resolved below rather than listed here so that a file
+        // carrying either spelling loads, and a file carrying neither gets an
+        // error naming both.
         let required = [
             "attention.head_count",
             "attention.head_count_kv",
             "block_count",
             "embedding_length",
             "rope.dimension_count",
-            "attention.layer_norm_rms_epsilon",
             "context_length",
         ];
         c.has_required_keys(&required)?;
@@ -209,7 +263,7 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
             block_count: c.get_value::<u32>("block_count")? as usize,
             embedding_length: c.get_value::<u32>("embedding_length")? as usize,
             rope_dim: c.get_value::<u32>("rope.dimension_count")? as usize,
-            ln_eps: c.get_value::<f32>("attention.layer_norm_rms_epsilon")? as f64,
+            ln_eps: layer_norm_eps(&c)?,
             max_seq_len: c
                 .get_value::<u64>("context_length")
                 .ok()
@@ -387,5 +441,110 @@ impl ModelWeights {
         let xs = xs.to_device(&self.device)?;
         let xs = extract_logits(&xs.apply(&self.output_norm)?, context_lens)?;
         self.output.forward(&xs)
+    }
+}
+
+/// The two defects in the phi2 GGUF path, and the interaction between them.
+///
+/// `PropsGGUF` demanded `phi2.attention.layer_norm_rms_epsilon`, a key phi2
+/// GGUFs do not carry -- Phi-2 is a LayerNorm architecture, and llama.cpp reads
+/// `LLM_KV_ATTENTION_LAYERNORM_EPS` for it. So the loader rejected every real
+/// file, which is why nobody noticed that `Mlp::forward` had lost its GELU.
+#[cfg(test)]
+mod quantized_phi2_tests {
+    use super::*;
+    use candle_core::quantized::gguf_file::Value;
+
+    fn metadata(pairs: &[(&str, f32)]) -> std::collections::HashMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (format!("phi2.{k}"), Value::F32(*v)))
+            .collect()
+    }
+
+    /// The key llama.cpp actually writes must be accepted. Before the fix this
+    /// file was rejected outright.
+    #[test]
+    fn accepts_the_layer_norm_key_llama_cpp_writes() {
+        let md = metadata(&[("attention.layer_norm_epsilon", 1e-5)]);
+        let c = ContentMetadata {
+            path_prefix: "phi2",
+            metadata: &md,
+        };
+        assert_eq!(layer_norm_eps(&c).unwrap(), 1e-5f32 as f64);
+    }
+
+    /// A file carrying the RMS spelling still loads, so the fix cannot regress
+    /// anything that happened to work before.
+    #[test]
+    fn still_accepts_the_rms_spelling() {
+        let md = metadata(&[("attention.layer_norm_rms_epsilon", 1e-5)]);
+        let c = ContentMetadata {
+            path_prefix: "phi2",
+            metadata: &md,
+        };
+        assert_eq!(layer_norm_eps(&c).unwrap(), 1e-5f32 as f64);
+    }
+
+    /// Missing entirely is still an error, and the message names both keys
+    /// rather than only the one that used to be checked.
+    #[test]
+    fn missing_epsilon_names_both_keys() {
+        let md = metadata(&[("attention.head_count", 32.0)]);
+        let c = ContentMetadata {
+            path_prefix: "phi2",
+            metadata: &md,
+        };
+        let err = layer_norm_eps(&c).unwrap_err().to_string();
+        assert!(err.contains("layer_norm_epsilon"), "got: {err}");
+        assert!(err.contains("layer_norm_rms_epsilon"), "got: {err}");
+    }
+
+    /// The FFN must be nonlinear. Two stacked linear maps compose to a single
+    /// linear map, so `Mlp` without its activation is provably indistinguishable
+    /// from one matmul -- which is what the missing `.gelu()` made it.
+    ///
+    /// Checked here on the activation itself rather than through `Mlp`, whose
+    /// fields are `Arc<dyn QuantMethod>` and need a GGUF to build: GELU must
+    /// break additivity, `f(a + b) != f(a) + f(b)`.
+    #[test]
+    fn gelu_is_not_a_linear_map() {
+        let dev = Device::Cpu;
+        let a = Tensor::from_vec(vec![-2.0f32, -0.5, 0.5, 2.0], (1, 4), &dev).unwrap();
+        let b = Tensor::from_vec(vec![1.0f32, 0.25, -0.75, 3.0], (1, 4), &dev).unwrap();
+
+        let lhs = (&a + &b).unwrap().gelu().unwrap();
+        let rhs = (a.gelu().unwrap() + b.gelu().unwrap()).unwrap();
+        let gap = (lhs - rhs)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            gap > 1e-3,
+            "GELU behaved additively (gap {gap}) -- the FFN would collapse to one linear map"
+        );
+    }
+
+    /// Candle's `gelu` is the tanh approximation (`gelu_new`), which is what
+    /// Phi-2's `hidden_act` names and what llama.cpp's `LLM_FFN_GELU` uses.
+    /// `gelu_erf` is the exact form; picking it would be a different function.
+    /// This pins which one `Mlp::forward` must call.
+    #[test]
+    fn gelu_is_the_tanh_approximation_not_erf() {
+        let dev = Device::Cpu;
+        let x = Tensor::from_vec(vec![-3.0f32, -1.0, 0.5, 3.0], (1, 4), &dev).unwrap();
+        let tanh: Vec<f32> = x.gelu().unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let erf: Vec<f32> = x
+            .gelu_erf()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_ne!(tanh, erf, "the two GELU forms are indistinguishable here");
     }
 }
