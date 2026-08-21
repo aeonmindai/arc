@@ -20,6 +20,7 @@ sm_90 = H100/Hopper).
 | 1. `cuda_compile_check.yaml` | GitHub Actions | No | Free, automatic | nvcc errors, FFI drift, `cuda`-feature Rust compile errors in the **library** crates — for sm_80 **and** sm_90. Does **not** compile `flash-attn` or link the CLI binaries (see gate 1b). |
 | 1b. `flash_attn_compile_check.yaml` | GitHub Actions | No | Free, manual | The `flash-attn` feature (candle-flash-attn nvcc compile) the rental uses but gate 1 omits — for the chosen arch (default sm_90). See "flash-attn coverage" below. |
 | 1c. `qtip_beam_res_usage_check.sh` | Step *inside* gate 1 | No | Free, automatic | **Local-memory spills in the QTIP beam kernels** — `cuobjdump -res-usage` must report `LOCAL:0 STACK:0`. Both beam kernels demand this check by name in their own source and nothing ran it before. See "the spill gate" below. |
+| 1d. `qtip_pack_host_check.sh` | Step *inside* gate 1 | No | Free, automatic — **and needs no CUDA toolkit at all** | **The bytes the QTIP packer emits**, at K=4, K=8 and K=9. Compiles the real `qtip_geom.cuh` with the host compiler (CUDA attributes stubbed) and checks K=4 is byte-identical to the shipped nibble packer. See "the packer gate" below. |
 | 2. `colab_cuda_build_check.ipynb` | Google Colab | nvcc only | Free, manual | Same as gate 1, plus it *links the CLI binaries* (`cuda_compile_check.sh` step 4, `FEATURES=cuda`); also runtime tests **iff** Colab gives sm_80+ |
 | 3. `cuda_compile_check.sh` (GPU mode) + rental step 4b | Rental / sm_80+ box | Yes | Paid box | Kernel **runtime**: parity, the prefix-grouped Viterbi quantize kernel actually running, no hang |
 
@@ -62,6 +63,46 @@ This is also the check that arbitrates encode-cost claims. Hand-counting C++
 undercounts SASS by ~2.05x on this kernel family; a spilled `cand[]` is exactly
 what produced the retracted "~1,700 s/layer" K=8/V=4/L=12 encode estimate. A
 number you did not compile is an estimate.
+
+### The packer gate — the only free check of what a bake WRITES (gate 1d)
+Gates 1 and 1c prove the QTIP kernels compile and do not spill. Neither looks
+at a single byte of output. That was tolerable while the packed row was "8/K
+whole symbols per byte" at every rung; it stopped being tolerable at
+**K=9/V=4/L=12**, where a symbol straddles a byte boundary and the row became a
+bitstream — so "K=4/V=2/L=16 is still byte-identical" turned into a claim about
+a rewritten packer, guarding the artifact that actually ships.
+
+The instruments that could settle it, `cuda_beam_matches_cpu_beam_bit_for_bit`
+and `cuda_beam_unpruned_matches_cuda_exhaustive`, are `#[cfg(feature = "cuda")]`
+**and return early when `Device::new_cuda(0)` fails** — so on the Mac dev box
+and on every GPU-less runner they check nothing. They remain gate 3.
+
+The packer is integer arithmetic on a byte array, though, so:
+
+```bash
+arc-tools/qtip_pack_host_check.sh      # no nvcc, no GPU, ~1 s
+```
+
+stubs `__device__`/`__forceinline__`, `#include`s the **real**
+`kernels/qtip/qtip_geom.cuh`, and asserts at the real V4-Flash expert shapes
+that K=4 reproduces the shipped nibble packer byte for byte, and that K=4/8/9
+all match an independently written bitstream reference.
+
+Two things it does that a first attempt would not, and both were found by
+running the mutations rather than reasoning about them:
+* the row is an **exact-size heap allocation built with `-fsanitize=address`**,
+  because a packer that runs one byte past the end writes `|= 0` — the value is
+  unchanged, so no guard band of zeros or of any sentinel can see it. In the
+  kernel that overrun is a non-atomic read-modify-write on the *next row's*
+  first byte, concurrent with the block that owns that row;
+* it instantiates a geometry nobody bakes (`QtipGeom<6,3,12>`) purely to make
+  the packer's `used = off + K` guard fire at all — at K=9 and K=10 every
+  reachable offset needs exactly two bytes, so the guard is otherwise untested
+  code.
+
+It also records, in its own header, one mutation that does **not** go red
+(enlarging `MAX_BYTES_PER_SYMBOL`), because a gate that overstates its coverage
+is how a green check stops meaning anything.
 
 ### flash-attn coverage — now free, one-click (gate 1b)
 The rental's step-4 build is `cargo build -p arc-cli -p mistralrs-cli --features

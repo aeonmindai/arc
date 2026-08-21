@@ -300,8 +300,20 @@ jobs:
       # silent — `__launch_bounds__` spills rather than failing — and a spilled
       # `cand[]` is exactly the mis-scoping behind the discredited
       # "~1,700 s/layer" K=8/V=4/L=12 encode estimate. The script proves itself
-      # red on a negative control and asserts both geometries are present, so it
+      # red on a negative control and asserts every geometry is present, so it
       # cannot pass vacuously. nvcc + cuobjdump only; no GPU.
+      #
+      # The packer gate below runs FIRST because it is the cheaper failure: it
+      # compiles `qtip_geom.cuh` with the HOST compiler (the CUDA attributes
+      # stubbed) and checks the bytes the packed bitstream actually contains at
+      # K=4, K=8 and K=9. The K=9 rung straddles bytes, so "K=4/V=2/L=16 stays
+      # byte-identical" stopped being self-evident; the CUDA parity tests that
+      # would prove it (`cuda_beam_*_matches_cpu_*`) SKIP without a device, so
+      # on every GPU-less runner nothing checked it at all. No CUDA toolkit
+      # needed — it would run on the Mac dev box too.
+      - name: QTIP packed-bitstream gate (host compiler, no CUDA)
+        run: bash arc-tools/qtip_pack_host_check.sh
+
       - name: QTIP beam spill gate (LOCAL:0, all geometries)
         run: bash arc-tools/qtip_beam_res_usage_check.sh sm_${{ matrix.compute_cap }}
 

@@ -8,10 +8,17 @@
 //
 // GEOMETRY IS A TEMPLATE PARAMETER (see qtip_geom.cuh)
 // ---------------------------------------------------
-// Two rungs are compiled, both at 2 bits/weight:
+// Three rungs are compiled:
 //
-//     K=4 / V=2 / L=16   the shipped rung; 15.125 decode instructions/weight
-//     K=8 / V=4 / L=12   the same rate at  4.375 decode instructions/weight
+//     K=4 / V=2 / L=16   2.00 bpw, the shipped rung
+//     K=8 / V=4 / L=12   2.00 bpw, fewer decode instructions per weight
+//                        (the ABSOLUTE inst/weight figures are SUSPENDED —
+//                        see qtip_geom.cuh; the census's unroll-differential
+//                        method did not reproduce its own K=8 control)
+//     K=9 / V=4 / L=12   2.25 bpw — THE BAKE TARGET. K=8/V=4/L=12 is
+//                        quality-CLOSED and K=9 is not; the sweep, its six
+//                        codebook designs and the Dw_cos figures are recorded
+//                        once, in `qtip/trellis_v4l12.rs`'s module docs.
 //
 // The K=8 rung is NOT reachable by bumping the constants. Three things in this
 // kernel are shaped by `2^(L-K)` and `2^K`, and at K=8/L=12 all three invert:
@@ -30,17 +37,29 @@
 //
 //     K=4/L=16:  4096 groups >= 256 threads  ->  LANES = 1,  cand[16/1 ] = 16
 //     K=8/L=12:    16 groups                 ->  LANES = 16, cand[256/16] = 16
+//     K=9/L=12:     8 groups                 ->  LANES = 32, cand[512/32] = 16
 //
-// The block stays fully occupied at both geometries and the register array
-// stays 16 entries at both — the candidate count per timestep is `2^L`-
-// saturated (`ng * 2^K = 4096`) either way, so the SAME work is simply
+// The block stays fully occupied at all three geometries and the register array
+// stays 16 entries at all three — the candidate count per timestep is `2^L`-
+// saturated (`ng * 2^K = 4096`) every time, so the SAME work is simply
 // re-blocked. `LANES == 1` collapses every expression below to the shipped
 // code, which is why the K=4 rung stays byte-identical.
+//
+// 🔑 THAT INVARIANCE IS ALSO THE K=9 COST ARGUMENT. Going K=8 -> K=9 at fixed
+// V=4/L=12 changes NO per-timestep quantity in this kernel: same 4096
+// candidates, same cand[16], same ~3.87 radix passes over the same 32-bit cost
+// key, same V=4 branch metric, same `2^K * V * 4 B` of LUT per group over half
+// as many groups (65,536 B per timestep either way), same `beam_w` trace
+// words, and `num_symbols = in_features / V` is K-independent. The one term
+// that does move is the packer: one byte store per symbol at K=8 becomes two
+// byte read-modify-writes in thread 0's serial backtrace. So K=9 s/layer is
+// K=8 s/layer plus that term — see the encode-cost note below.
 //
 // The third is handled by sizing the shared scratch as
 // `max(2^(L-K) u64, STAGE_U64_MIN)`: at K=4 that is exactly the 4096-entry
 // group table that already staged the backtrace (no change at all), and at K=8
-// it is a 16 KiB stage over a 128 B table. That is not a smaller staging
+// (128 B table) and K=9 (64 B table) it is the same 16 KiB stage over a table
+// far too small to serve as one. That is not a smaller staging
 // budget in the terms that matter — the backtrace's dependent global loads are
 // `num_symbols / window`, and V=4 halves `num_symbols` exactly as the halved
 // window doubles it: 9472/32 == 4736/16 == 296 per row, unchanged.
@@ -85,6 +104,49 @@
 // The 512 KB cost ping-pong disappears entirely: the live state set is
 // `beam_w` entries, which fit in shared memory with room to spare. HBM traffic
 // per symbol position drops ~512x.
+//
+// WHAT A RUNG COSTS TO ENCODE — AND WHY `(n/V) * W * 2^K` IS NOT IT
+// -----------------------------------------------------------------
+// That formula predicts K=4 -> K=8 costs 8x MORE and produced the discredited
+// "~1,700 s/layer / 20 h / $30" figure. This kernel falsifies it in two lines
+// of its own source: the `& G::GROUP_MASK` in step 1a masks the predecessor to
+// `2^(L-K)`, so raising K SHRINKS the live group count by exactly the factor by
+// which it grows the alphabet, and `n_cand = ng * 2^K` at the end of step 2 is
+// therefore saturated at `2^L`. The candidate
+// count per timestep is 4096 at K=4/L=16 (256 groups x 16), at K=8/L=12
+// (16 x 256) and at K=9/L=12 (8 x 512) alike, and `cand[]` is 16 entries at all
+// three. `W` is not a factor either — measured, W=256 = 82.7 s/layer vs
+// W=32 = 83.6 s/layer, ~1% (FACTS.md:1320).
+//
+// What DOES move, per layer:
+//
+//   (a) timesteps.  `num_symbols = in_features / V`, so V=2 -> V=4 halves them.
+//   (b) candidates/timestep, cand[], radix passes, LUT bytes per ROW.  All
+//       invariant (see above; LUT is 2^K*V*4 B per group over 2^(L-K) groups,
+//       which is 65,536 B/timestep at both V=4 rungs against half as many
+//       timesteps as V=2's 32,768 B).
+//   (c) branch metric.  V=2 -> V=4 doubles the arithmetic per candidate, but a
+//       candidate's cost is dominated by its ~3.87 radix histogram passes and
+//       its compaction test, not by the metric — so this is a fraction of 2x.
+//   (d) K=8 -> K=9 at fixed V=4/L=12.  (a), (b) and (c) are ALL unchanged. Only
+//       the packer moves: one byte store per symbol becomes two byte
+//       read-modify-writes, in thread 0's serial backtrace, against an
+//       L1-resident row of <= 2 KiB.
+//
+// ⇒ From the measured anchor `qtip2` beam W=256 = 372.0 s/layer on an A100
+//   (FACTS.md:990; harness validated to 0.3% against the published V4 bake's
+//   370-376 s/layer, FACTS.md:993):
+//
+//       K=9/V=4/L=12  ~=  372.0 x 0.5 x [1.0 .. 1.4]  =  186-260 s/layer
+//
+//   i.e. the 2.25 bpw rung is CHEAPER to bake than the 2.00 bpw rung that
+//   ships, not 8x dearer. 43 layers ⇒ 2.2-3.1 h ⇒ $3.3-$4.6 at $1.49/hr, or
+//   1.1-1.6 h across two devices at the same total cost (`ARC_BAKE_DEVICES`,
+//   measured 1.97x on 2 GPUs, byte-identical — wave29-BD-rung-decision.md:431).
+//
+// ⚠ PROJECTED, NOT MEASURED. Nothing has run a V=4 bake. This is a division
+//   from a measured V=2 anchor by terms this file's own structure fixes; the
+//   only honest way to close it is to bake a layer and difference the markers.
 //
 // SHARED-MEMORY RESIDENCY (the claim wave13-AF was asked to test)
 // --------------------------------------------------------------
@@ -210,10 +272,11 @@ struct QbShape {
     static_assert(MAX_GROUPS <= GROUPS,
                   "every live group must have a lane team in the block");
     // `cand[]` MUST stay in registers; see the spill note on
-    // QB_MIN_BLOCKS_PER_SM. 16 is what both shipped geometries produce, and it
-    // is the number `cuobjdump -res-usage` has been checked at (LOCAL:0,
-    // REG<=62). A geometry that would push it higher must be measured before it
-    // is trusted, not reasoned about — hence the ceiling rather than a comment.
+    // QB_MIN_BLOCKS_PER_SM. 16 is what all three instantiated geometries
+    // produce (K=4: 16/1, K=8: 256/16, K=9: 512/32), and it is the number
+    // `cuobjdump -res-usage` has been checked at (LOCAL:0, REG<=62). A geometry
+    // that would push it higher must be measured before it is trusted, not
+    // reasoned about — hence the ceiling rather than a comment.
     static_assert(CAND >= 1 && CAND <= 16,
                   "cand[] must stay small enough to live in registers");
     // `keep_mask` is a 32-bit bitset over `cand[]`.
@@ -230,20 +293,45 @@ struct QbShape {
 // instead of the 24 that 3 blocks give (+33% occupancy, which for a
 // latency-bound kernel is a ~1.33x throughput term).
 //
-// MEASURED, `cuobjdump -res-usage`, sm_80, CUDA 12.4, build.rs's exact flags
-// (arc-tools/qtip_beam_res_usage_check.sh, which CI now runs on every PR):
+// MEASURED, `cuobjdump -res-usage`, CUDA 12.4, build.rs's exact flags
+// (arc-tools/qtip_beam_res_usage_check.sh, which CI runs on every PR — the
+// table below is from run 32265671233, both matrix arches):
 //
-//     K=8/V=4/L=12  LUT       REG:62 STACK:0 SHARED:19696 LOCAL:0
-//     K=8/V=4/L=12  computed  REG:59 STACK:0 SHARED:19696 LOCAL:0
-//     K=4/V=2/L=16  LUT       REG:60 STACK:0 SHARED:38000 LOCAL:0
-//     K=4/V=2/L=16  computed  REG:60 STACK:0 SHARED:38000 LOCAL:0
+//                              sm_80                        sm_90
+//     K=9/V=4/L=12  LUT       REG:64 SHARED:19632 LOCAL:0   REG:64 SHARED:20656 LOCAL:0
+//     K=9/V=4/L=12  computed  REG:61 SHARED:19632 LOCAL:0   REG:63 SHARED:20656 LOCAL:0
+//     K=8/V=4/L=12  LUT       REG:62 SHARED:19696 LOCAL:0   REG:63 SHARED:20720 LOCAL:0
+//     K=8/V=4/L=12  computed  REG:59 SHARED:19696 LOCAL:0   REG:62 SHARED:20720 LOCAL:0
+//     K=4/V=2/L=16  LUT       REG:60 SHARED:38000 LOCAL:0   REG:63 SHARED:39024 LOCAL:0
+//     K=4/V=2/L=16  computed  REG:60 SHARED:38000 LOCAL:0   REG:63 SHARED:39024 LOCAL:0
 //
-// All four are inside the 64-register budget with NO spill, so the occupancy
-// is real at both geometries. Both SHARED figures are exactly what the
-// declarations above sum to (37,996 -> 38,000 and 19,696), which is an
-// independent check that the K=4 layout did not move when the geometry became
-// a template parameter. Shared memory is not the constraint either way:
-// 4 x 38,000 B is 148 KiB of the 228 KiB an SM has.
+// STACK:0 on all twelve. Every one is inside the 64-register budget with NO
+// spill, so the occupancy is real at all three geometries — `cand[]` stayed in
+// registers at K=9, where a naive `cand[2^K]` would have been 512 entries.
+//
+// Two things this table settles that no argument could:
+//
+//   * THE K=4 AND K=8 sm_80 NUMBERS ARE UNCHANGED from before K=9 existed
+//     (REG:62/59 SHARED:19696 and REG:60/60 SHARED:38000, to the byte). The
+//     shipped rung's register allocation and shared-memory layout did not move
+//     when the packer became a bitstream — which is a compiled fact about
+//     codegen, not an inference from the `if constexpr` keeping its source
+//     identical.
+//   * K=9's SHARED is exactly 64 B BELOW K=8's at both arches (19,632 vs
+//     19,696; 20,656 vs 20,720). That is the group table falling from 16
+//     entries to 8 at 8 B each — the predicted number, arrived at
+//     independently by the compiler.
+//
+// ⚠ ZERO REGISTER HEADROOM AT K=9/LUT. It lands on REG:64 at both arches,
+// which is exactly the cap `__launch_bounds__(256, 4)` imposes
+// (65,536 / 4 / 256). It did NOT spill, so 4 blocks/SM holds — but it is the
+// tightest of the six and the next register added to its hot path is a spill,
+// not a warning. Anything touching the K=9 expansion, the radix loop or the
+// packer must re-run the gate and read the number, not assume the margin that
+// K=8 (REG:62/59) still has.
+//
+// Shared memory is not the constraint at any geometry: 4 x 38,000 B is 148 KiB
+// of the 228 KiB an SM has.
 //
 // (The older `REG:80 ... SHARED:38992` line this note used to quote was a
 // pre-wave16 measurement of a kernel that no longer exists — wave16/wave17
@@ -263,9 +351,12 @@ struct QbShape {
 // mis-scoping that produced the discredited "~1,700 s/layer / 20 h / $30"
 // K=8/L=12 encode estimate. `.github/workflows/cuda_compile_check.yaml` runs
 // this check on every PR so it cannot be skipped; if it ever fails, set
-// QB_MIN_BLOCKS_PER_SM back to 3 (which reproduces the measured allocation
-// exactly and is a no-op) rather than trading a real latency regression for a
-// nominal occupancy gain.
+// QB_MIN_BLOCKS_PER_SM back to 3 rather than trading a real latency regression
+// for a nominal occupancy gain — that raises the cap to 65,536/3/256 = 85
+// registers, which every geometry in the table above clears with room. (It is
+// NOT necessarily allocation-preserving: with a looser cap nvcc is free to
+// take more registers than the 59-64 measured at 4 blocks. Re-run the gate and
+// read the numbers; do not assume the table still applies.)
 //
 // Related landmine: `unsigned int cand[CAND]` must stay in registers, which
 // requires EVERY loop indexing it to be fully unrolled. Weakening any of those
@@ -760,6 +851,14 @@ int launch_qtip_quantize_rows_beam_geom_f32(
     }
     if (k_bits == 8 && v_dim == 4 && l_bits == 12) {
         return qb_launch<QtipGeomK8V4L12>(
+            d_weight, d_lut, d_row_scales, d_packed, d_trace,
+            n_rows, in_features, num_symbols, row_offset, beam_w, cb_mult, stream);
+    }
+    // 2.25 bpw. The caller must size `d_packed` as `ceil(num_symbols*9/8)` per
+    // row — `num_symbols / (8/K)` is a division by zero at this rung, which is
+    // why `qtip_packed_bytes_per_row` is no longer written that way.
+    if (k_bits == 9 && v_dim == 4 && l_bits == 12) {
+        return qb_launch<QtipGeomK9V4L12>(
             d_weight, d_lut, d_row_scales, d_packed, d_trace,
             n_rows, in_features, num_symbols, row_offset, beam_w, cb_mult, stream);
     }

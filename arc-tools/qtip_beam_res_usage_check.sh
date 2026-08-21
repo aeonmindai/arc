@@ -11,12 +11,13 @@
 # name in their source ("`LOCAL:` must remain 0") and, until now, nothing ran it.
 #
 # It is also the check that separates the two competing cost models for the
-# K=8/V=4/L=12 encode. A naive constant bump turns `cand[2^K]` into `cand[256]`,
-# which spills for certain — that spilled kernel is where the discredited
-# "~1,700 s/layer / 20 h / $30" figure came from. The lane-team re-blocking in
-# `qtip_beam.cu` keeps `cand[]` at 16 entries at BOTH geometries; this script is
-# what turns that claim into a compiled fact instead of a hand count. (Hand
-# counting C++ undercounts SASS by ~2.05x on this kernel family — do not.)
+# V=4/L=12 encode. A naive constant bump turns `cand[2^K]` into `cand[256]` at
+# K=8 and `cand[512]` at K=9, which spills for certain — that spilled kernel is
+# where the discredited "~1,700 s/layer / 20 h / $30" figure came from. The
+# lane-team re-blocking in `qtip_beam.cu` keeps `cand[]` at 16 entries at EVERY
+# instantiated geometry; this script is what turns that claim into a compiled
+# fact instead of a hand count. (Hand counting C++ undercounts SASS by ~2.05x
+# on this kernel family — do not.)
 #
 # THIS GATE IS PROVEN RED ON EVERY RUN
 # ------------------------------------
@@ -27,10 +28,13 @@
 #      dynamically-indexed 256-float local array is compiled and pushed through
 #      the SAME parser. If it is not reported as a spill, this script fails —
 #      the gate has lost its teeth and says so.
-#   2. A KERNEL-COUNT assertion per source. `qtip_beam.cu` must yield 4 beam
-#      kernels (2 geometries x 2 codebooks); if the K=8/V=4/L=12 instantiation
-#      were ever dropped, a "no spill" result would be about a kernel that no
-#      longer exists. `qtip2b_beam.cu` yields 1: that rung has no stored-LUT
+#   2. A KERNEL-COUNT assertion per source. `qtip_beam.cu` must yield 6 beam
+#      kernels (3 geometries — K=4/V=2/L=16, K=8/V=4/L=12, K=9/V=4/L=12 — x 2
+#      codebooks); if an instantiation were ever dropped, a "no spill" result
+#      would be about a kernel that no longer exists. That is not hypothetical:
+#      K=9 is the rung the bake targets and it is the one whose `cand[]` a naive
+#      parameterisation would blow up to 512. `qtip2b_beam.cu` yields 1: that
+#      rung has no stored-LUT
 #      path at all (the codebook is always computed from `mult`), so its kernel
 #      is not templated on the codebook the way the LUT rung's is.
 #
@@ -120,11 +124,12 @@ echo
 
 # ---------------------------------------------------------------------------
 # 1. The shipped beam kernels.
-#    qtip_beam.cu   : 2 geometries (K4/V2/L16, K8/V4/L12) x 2 codebooks = 4
+#    qtip_beam.cu   : 3 geometries (K4/V2/L16, K8/V4/L12, K9/V4/L12) x 2
+#                     codebooks = 6
 #    qtip2b_beam.cu : 1 kernel — computed codebook only, so no codebook template
 # ---------------------------------------------------------------------------
 SOURCES=(qtip_beam.cu qtip2b_beam.cu)
-EXPECT=(4 1)
+EXPECT=(6 1)
 
 fail=0
 for i in "${!SOURCES[@]}"; do
