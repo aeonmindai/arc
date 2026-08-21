@@ -913,15 +913,33 @@ impl Model {
 
         let mut hybrid_cache = self.kv_cache.hybrid();
         let state_indices = hybrid_cache.state_indices().cloned();
-        if self
+        let has_linear_layers = self
             .layer_types
             .iter()
-            .any(|lt| matches!(lt, LayerType::LinearAttention))
-            && state_indices.is_none()
-        {
+            .any(|lt| matches!(lt, LayerType::LinearAttention));
+        if has_linear_layers && state_indices.is_none() {
             candle_core::bail!(
                 "Hybrid recurrent state indices are required for linear-attention layers."
             );
+        }
+
+        // 🔴 `indices.to_vec1()` is a device->host copy, i.e. a full sync of the
+        // compute stream. It used to sit *inside* the layer loop, on a tensor
+        // bound once above and never written to -- so every linear-attention
+        // layer re-read the same bytes and stalled the pipeline again. Qwen3-Next
+        // has `full_attention_interval == 4`, so 36 of its 48 layers are linear:
+        // 36 syncs per forward where the data supports one.
+        //
+        // Hoisting is sound because `state_indices` is loop-invariant by
+        // construction: the loop passes `indices` to `pool.gather_*` /
+        // `pool.scatter_*`, which read it and mutate the *pool*, never the index
+        // tensor itself.
+        let state_indices_host: Option<Vec<u32>> = state_indices
+            .as_ref()
+            .map(|indices| indices.to_vec1::<u32>())
+            .transpose()?;
+        if has_linear_layers && state_indices_host.as_ref().is_some_and(|v| v.is_empty()) {
+            candle_core::bail!("Hybrid recurrent state indices are empty.");
         }
 
         let mask = CausalMasker.make_causal_mask_matrix(
@@ -968,10 +986,10 @@ impl Model {
                         let indices = state_indices.as_ref().expect(
                             "checked above: linear-attention layers require recurrent indices",
                         );
-                        let indices_vec: Vec<u32> = indices.to_vec1()?;
-                        if indices_vec.is_empty() {
-                            candle_core::bail!("Hybrid recurrent state indices are empty.");
-                        }
+                        // Read once before the loop -- see `state_indices_host`.
+                        let indices_vec = state_indices_host.as_ref().expect(
+                            "checked above: linear-attention layers require recurrent indices",
+                        );
 
                         let first_offset = pool.get_seqlen_offset(indices_vec[0] as usize);
                         if indices_vec
@@ -998,7 +1016,7 @@ impl Model {
                         pool.scatter_recurrent_state(indices, &gdn_cache.recurrent_state)?;
 
                         let delta = gdn_cache.seqlen_offset.saturating_sub(first_offset);
-                        for &idx in &indices_vec {
+                        for &idx in indices_vec {
                             let updated = pool.get_seqlen_offset(idx as usize) + delta;
                             pool.set_seqlen_offset(idx as usize, updated);
                         }
