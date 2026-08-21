@@ -545,6 +545,88 @@ pub(crate) fn host_copy_batched_result(
     raw.to_device(host)
 }
 
+/// Parent system: ArcInfer / ArcSample.
+///
+/// `ARC_SAMPLE_ON_DEVICE`: opt-in device-resident sampling for batched decode.
+/// Default OFF; parsed by value (`env_flag_is_set`, so `=0` is off), latched
+/// once per process.
+///
+/// WHY THIS FLAG EXISTS: at any `n_seqs > 1` the `DefaultInstructions` step
+/// arm copied the ENTIRE `[B, 1, vocab]` logits tensor to the host before
+/// sampling — at B=256 with V4's 129,280 vocab in BF16 that is 66.2 MB per
+/// decode step, serial, on the critical path — and `Sampler::sample`'s GPU
+/// fast path is gated on `!logits.device().is_cpu()`, so the copy itself then
+/// disqualified all 256 rows into the ~5.9 ms/token CPU pipeline the fast
+/// path exists to avoid. [`host_copy_batched_result`]'s own doc states the
+/// trap for a single sequence ("moving a B=1 batch to the host would silently
+/// disable it") and never followed the thought to B > 1: the GPU sampler was
+/// structurally unreachable at every batch above 1.
+///
+/// With the flag ON, [`split_batched_logits_for_sampling`] keeps
+/// fast-path-eligible rows on the device (token-sized D2H each) and gathers
+/// the rest into ONE batched D2H. OFF is bit-for-bit the shipped behaviour.
+pub(crate) fn sample_on_device_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| mistralrs_quant::env_flag_is_set("ARC_SAMPLE_ON_DEVICE"))
+}
+
+/// Split a batched `[B, 1, vocab]` logits tensor into per-row tensors for
+/// sampling: rows whose sampler terminates on the device
+/// ([`crate::sampler::Sampler::device_sampling_terminates`]) stay as device
+/// views; the rows that genuinely need the CPU pipeline are shipped with at
+/// most ONE batched D2H. `row_eligible` is in logits-row order (the
+/// `seq_indices` order of the step arm, not sequence order).
+///
+/// Copy discipline — the O(B²) trap, same as [`host_copy_batched_result`]: a
+/// per-row view still references the whole `B * vocab` storage, and both
+/// `Tensor::to_device` and `Tensor::to_vec1` copy the ENTIRE storage
+/// (`CudaStorage::to_cpu_storage`, candle `9586979`, `tensor.rs:1949/2379`).
+/// So CPU-bound rows must be gathered into fresh row-sized storage
+/// (`index_select` allocates exactly the selected rows) *before* the single
+/// `to_device`. The `Tensor::from_vec` for the gather indices is a
+/// once-per-step H2D of `n_cpu` u32s (pitfall #5 concerns per-token tensor
+/// creation in forward hot loops; this one replaces a 66 MB D2H and only runs
+/// for mixed batches).
+pub(crate) fn split_batched_logits_for_sampling(
+    logits: &Tensor,
+    row_eligible: &[bool],
+) -> candle_core::Result<Vec<Tensor>> {
+    let n = row_eligible.len();
+    let n_cpu = row_eligible.iter().filter(|e| !**e).count();
+    // Every row stays on device: pure views, no transfer at all.
+    if n_cpu == 0 {
+        return (0..n).map(|i| logits.i(i)).collect();
+    }
+    LOGITS_HOST_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Every row needs the CPU pipeline: one whole-tensor D2H — exactly the
+    // flag-off behaviour.
+    if n_cpu == n {
+        let host = logits.to_device(&Device::Cpu)?;
+        return (0..n).map(|i| host.i(i)).collect();
+    }
+    // Mixed batch: gather ONLY the CPU-bound rows into fresh contiguous
+    // device storage, then one D2H of that gather.
+    let cpu_rows: Vec<u32> = row_eligible
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !**e)
+        .map(|(i, _)| i as u32)
+        .collect();
+    let idx = Tensor::from_vec(cpu_rows, n_cpu, logits.device())?;
+    let host = logits.index_select(&idx, 0)?.to_device(&Device::Cpu)?;
+    let mut host_pos = 0usize;
+    let mut out = Vec::with_capacity(n);
+    for (i, eligible) in row_eligible.iter().enumerate() {
+        if *eligible {
+            out.push(logits.i(i)?);
+        } else {
+            out.push(host.i(host_pos)?);
+            host_pos += 1;
+        }
+    }
+    Ok(out)
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct FileListCache {
     files: Vec<String>,
@@ -1024,6 +1106,53 @@ pub trait Pipeline:
                     let end = Instant::now();
                     exec_duration += end.duration_since(start);
                     __np_t_fwd_us += end.duration_since(start).as_secs_f64() * 1e6;
+
+                    // Device-resident sampling (ARC_SAMPLE_ON_DEVICE, default
+                    // OFF): keep fast-path-eligible rows on the device instead
+                    // of hosting the whole batch — see
+                    // [`sample_on_device_enabled`] for why. Only the batched
+                    // CausalGeneration case changes; B=1 already stays on
+                    // device via `host_copy_batched_result`'s `n_seqs > 1`
+                    // condition, and RawLogits/Embeddings are host-consumed.
+                    let device_sampling = sample_on_device_enabled()
+                        && seq_indices.len() > 1
+                        && matches!(
+                            &raw_logits,
+                            ForwardInputsResult::CausalGeneration { logits }
+                                if !logits.device().is_cpu()
+                        );
+                    if device_sampling {
+                        let ForwardInputsResult::CausalGeneration { logits: batched } =
+                            &raw_logits
+                        else {
+                            unreachable!("device_sampling implies CausalGeneration")
+                        };
+                        let vocab = batched.dim(candle_core::D::Minus1)?;
+                        let is_cuda = batched.device().is_cuda();
+                        let row_eligible: Vec<bool> = seq_indices
+                            .iter()
+                            .map(|&seq_idx| {
+                                let return_logprobs = input_seqs[seq_idx].return_logprobs();
+                                input_seqs[seq_idx].sampler().device_sampling_terminates(
+                                    vocab,
+                                    is_cuda,
+                                    return_logprobs,
+                                )
+                            })
+                            .collect();
+                        // Still a `sync_span`: the batched-gather D2H (when any
+                        // row needs the CPU pipeline) is the same blocking
+                        // device wait the flag-off copy was.
+                        let rows = {
+                            let _s = arc_profiler::sync_span("logits_d2h");
+                            split_batched_logits_for_sampling(batched, &row_eligible)?
+                        };
+                        for (row, seq_idx) in rows.into_iter().zip(seq_indices) {
+                            logits[seq_idx] =
+                                Some(ForwardInputsResult::CausalGeneration { logits: row });
+                        }
+                        continue;
+                    }
 
                     // ONE host copy for the whole batch, *before* the
                     // per-sequence split. See `host_copy_batched_result`: the
