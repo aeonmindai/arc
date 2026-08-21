@@ -152,12 +152,12 @@ constexpr int WMMA_K_DIM = 16;
 // 8 warps: 4 along M, 2 along N; each warp owns two 16-wide N sub-tiles.
 constexpr int WARPS_M = 4;
 constexpr int WARPS_N = 2;
-constexpr int N_SUBTILES = 2;
+constexpr int N_SUB_TILES = 2;
 constexpr int WARPS_PER_BLOCK = WARPS_M * WARPS_N;  // 8
 constexpr int BLOCK_THREADS = WARPS_PER_BLOCK * 32; // 256
 
 constexpr int M_BLK = WARPS_M * WMMA_M_DIM;             // 64
-constexpr int N_BLK = WARPS_N * N_SUBTILES * WMMA_N_DIM; // 64
+constexpr int N_BLK = WARPS_N * N_SUB_TILES * WMMA_N_DIM; // 64
 
 // K_BLK is the scale-block length along K. The Rust dispatcher only selects
 // this kernel when `block_size_x % K_BLK == 0`, which is what makes the scale
@@ -169,28 +169,56 @@ constexpr int WMMA_K_STEPS = K_BLK / WMMA_K_DIM; // 8
 
 // Shared-memory row padding, in ELEMENTS of T.
 //
-// 8, and it must stay a multiple of 8. `wmma::load_matrix_sync` requires the
-// leading dimension to be a multiple of 16 bytes for 16-bit element types;
-// (128 + 8) * 2 B = 272 B = 17 * 16 B, which satisfies it. This is the
-// opposite of the right answer for the SCALAR kernel next door, where a +1
-// pad breaks a 4-way bank conflict -- there the loads are ordinary
-// per-element `LDS.32` with no alignment rule, here they are fragment loads
-// that have one. A +1 pad here would make the leading dimension 258 B, which
-// is not a multiple of 16 B, and the load would be undefined. Do not
-// "simplify" this to +1 to match the other kernel.
-constexpr int SMEM_PAD = 8;
-constexpr int A_LDM = K_BLK + SMEM_PAD; // 136 elements
-constexpr int B_LDM = K_BLK + SMEM_PAD; // 136 elements
+// 16, and it must stay a multiple of 16. READ THIS BEFORE CHANGING IT -- the
+// two NVIDIA documents that govern it disagree, and the laxer one is the one
+// people quote.
+//
+// The CUDA C++ Programming Guide 12.4 §7.24.1 says only:
+//
+//     "mptr must be a 256-bit aligned pointer ... and [ldm] must be a
+//      multiple of 8 for __half element type or multiple of 4 for float
+//      element type. (i.e., multiple of 16 bytes in both cases)."
+//
+// The PTX ISA 12.4 §9.7.13.3.2 is STRICTER, and it is the binding one:
+//
+//     "The starting address of each instance of the leading dimension (row
+//      or column) must be aligned with the size of the corresponding
+//      fragment in bytes."
+//
+// and works the example through for exactly our shape: for
+// `wmma.load.a.sync.aligned.row.m16n16k16.f16` the fragment is 32 B (eight
+// `.f16x2` elements), so "p is a multiple of 32" and "2*s is a multiple of
+// 32" -- i.e. ldm must be a multiple of SIXTEEN __half elements, double what
+// the C++ guide states. A +8 pad gives ldm = 136, and 136 * 2 B = 272 B is
+// NOT a multiple of 32 B: it satisfies the guide and violates the ISA, which
+// is the worst of both worlds because it compiles.
+//
+// +16 gives ldm = 144 elements = 288 B = 9 * 32 B, which satisfies both, for
+// f16 and bf16 alike. Every fragment base pointer this kernel forms is then
+// 32-B aligned as well (144 * 2 = 288 and 16 * 2 = 32 are both multiples of
+// 32, and B_sh starts 18,432 B into a 16-B-aligned block).
+//
+// This is also the OPPOSITE of the right answer for the scalar kernel next
+// door, where a +1 pad breaks a 4-way bank conflict. There the loads are
+// ordinary per-element `LDS.32` with no alignment rule; here they are
+// fragment loads that have one. Do not "harmonise" the two.
+constexpr int SMEM_PAD = 16;
+constexpr int A_LDM = K_BLK + SMEM_PAD; // 144 elements = 288 B = 9 * 32 B
+constexpr int B_LDM = K_BLK + SMEM_PAD; // 144 elements
+static_assert(A_LDM * 2 % 32 == 0,
+              "WMMA leading dimension must be a multiple of 32 bytes (PTX ISA "
+              "9.7.13.3.2), not merely of 16 as the C++ guide states");
+static_assert(B_LDM * 2 % 32 == 0, "see above");
 
 // One K-tile of A and of B, plus (aliased over A) the f32 output staging tile.
-constexpr int A_SMEM_ELEMS = M_BLK * A_LDM; // 8704
-constexpr int B_SMEM_ELEMS = N_BLK * B_LDM; // 8704
+constexpr int A_SMEM_ELEMS = M_BLK * A_LDM; // 64 * 144 = 9216
+constexpr int B_SMEM_ELEMS = N_BLK * B_LDM; // 64 * 144 = 9216
 constexpr int C_SMEM_ELEMS = M_BLK * N_BLK; // 4096 floats
 
 // Bytes, for a 16-bit T. Static shared memory, so we stay under the 48 KB
 // per-block limit that needs no `cudaFuncSetAttribute` opt-in:
-//   (8704 + 8704) * 2 = 34,816 B.
-// The f32 staging tile is 4096 * 4 = 16,384 B and ALIASES A_sh (17,408 B),
+//   (9216 + 9216) * 2 = 36,864 B.
+// The f32 staging tile is 4096 * 4 = 16,384 B and ALIASES A_sh (18,432 B),
 // which is only safe because it is written after the K loop has finished with
 // A. The __syncthreads() before that reuse is load-bearing.
 constexpr int AB_SMEM_BYTES = (A_SMEM_ELEMS + B_SMEM_ELEMS) * 2;
@@ -297,7 +325,13 @@ __launch_bounds__(BLOCK_THREADS) __global__ void fp8_matmul_wmma(
                 "16x16x16 f32 accumulator fragment is not 8 registers/lane; "
                 "the promotion loop below assumes it is");
 
-  __shared__ __align__(16) char smem_raw[AB_SMEM_BYTES];
+  // __align__(128), not 16. The PTX ISA rule quoted at SMEM_PAD requires the
+  // fragment base pointer itself to be a multiple of 32 B ("p is a multiple
+  // of 32"), and every pointer this kernel forms is `base + k*32`, so a
+  // 16-B-aligned base would put every one of them on a 16-B boundary and
+  // violate it. 128 covers that with room to spare and costs at most 127 B of
+  // a 36,864 B allocation.
+  __shared__ __align__(128) char smem_raw[AB_SMEM_BYTES];
   T *A_sh = reinterpret_cast<T *>(smem_raw);
   T *B_sh = reinterpret_cast<T *>(smem_raw) + A_SMEM_ELEMS;
 
@@ -317,10 +351,10 @@ __launch_bounds__(BLOCK_THREADS) __global__ void fp8_matmul_wmma(
   // Long-lived FP32 accumulators. `c_frag` accumulates ONE scale block and is
   // reset after every promotion; `acc` carries the scaled running total for
   // the whole K extent.
-  AccFrag c_frag[N_SUBTILES];
-  float acc[N_SUBTILES][ACC_REGS];
+  AccFrag c_frag[N_SUB_TILES];
+  float acc[N_SUB_TILES][ACC_REGS];
 #pragma unroll
-  for (int s = 0; s < N_SUBTILES; ++s) {
+  for (int s = 0; s < N_SUB_TILES; ++s) {
     fill_fragment(c_frag[s], 0.0f);
 #pragma unroll
     for (int i = 0; i < ACC_REGS; ++i)
@@ -419,14 +453,14 @@ __launch_bounds__(BLOCK_THREADS) __global__ void fp8_matmul_wmma(
                        A_LDM);
 
 #pragma unroll
-      for (int s = 0; s < N_SUBTILES; ++s) {
+      for (int s = 0; s < N_SUB_TILES; ++s) {
         // B_sh is [N][K]; as a K x N operand that is column-major with
         // leading dimension B_LDM.
         fragment<matrix_b, WMMA_M_DIM, WMMA_N_DIM, WMMA_K_DIM, T, col_major>
             b_frag;
         load_matrix_sync(b_frag,
                          B_sh +
-                             (warp_n_idx * N_SUBTILES + s) * WMMA_N_DIM * B_LDM +
+                             (warp_n_idx * N_SUB_TILES + s) * WMMA_N_DIM * B_LDM +
                              k_step * WMMA_K_DIM,
                          B_LDM);
         mma_sync(c_frag[s], a_frag, b_frag, c_frag[s]);
@@ -440,7 +474,7 @@ __launch_bounds__(BLOCK_THREADS) __global__ void fp8_matmul_wmma(
     {
       const float ws = __ldg(&weight_scale[scale_row_off + k_base / block_size_x]);
 #pragma unroll
-      for (int s = 0; s < N_SUBTILES; ++s) {
+      for (int s = 0; s < N_SUB_TILES; ++s) {
 #pragma unroll
         for (int i = 0; i < ACC_REGS; ++i)
           acc[s][i] += c_frag[s].x[i] * ws;
@@ -460,12 +494,12 @@ __launch_bounds__(BLOCK_THREADS) __global__ void fp8_matmul_wmma(
   // writes C over it.
   float *C_sh = reinterpret_cast<float *>(smem_raw);
 #pragma unroll
-  for (int s = 0; s < N_SUBTILES; ++s) {
+  for (int s = 0; s < N_SUB_TILES; ++s) {
 #pragma unroll
     for (int i = 0; i < ACC_REGS; ++i)
       c_frag[s].x[i] = acc[s][i];
     store_matrix_sync(C_sh + warp_m_idx * WMMA_M_DIM * N_BLK +
-                          (warp_n_idx * N_SUBTILES + s) * WMMA_N_DIM,
+                          (warp_n_idx * N_SUB_TILES + s) * WMMA_N_DIM,
                       c_frag[s], N_BLK, mem_row_major);
   }
   __syncthreads();
