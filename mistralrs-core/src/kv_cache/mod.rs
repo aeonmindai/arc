@@ -13,7 +13,7 @@ mod hybrid_cache;
 mod rotating_cache;
 mod single_cache;
 pub mod turboquant_cache;
-mod xs_rolling;
+pub(crate) mod xs_rolling;
 /// Thread-local `ARC_V4_XS_PER_SEQ` override, so a test outside this module can
 /// exercise both sides of the flag (the production read is a `OnceLock`).
 #[cfg(test)]
@@ -2874,6 +2874,35 @@ mod clone_in_cache_invariant_tests {
     use crate::sequence::{SeqStepType, SequenceGroup, SequenceRecognizer};
     use candle_core::Device;
 
+    /// Run `f` with the xs window pin OFF.
+    ///
+    /// Three tests below assert the geometry of the *unpinned* retained window
+    /// — exact tail widths, and that column 0 holds token `base`. Both are
+    /// properties of the resizing policy specifically: #121's pin holds the
+    /// buffer at `span_groups * ratio + margin` and leaves real tokens sitting
+    /// ahead of `base`, so column 0 is no longer `base` and the widths are the
+    /// pinned constants instead.
+    ///
+    /// The pin is opt-in (`ARC_V4_XS_PIN_WINDOW=1`), so as things stand these
+    /// three would pass without asking. They ask anyway, deliberately: the
+    /// default is expected to flip to ON once the pin is measured on this tree
+    /// (see `xs_rolling::xs_pin_window_enabled_from`'s FLIP CONDITION), and a
+    /// test that depends on a default it does not name is a test that breaks on
+    /// the day someone flips it. Naming the mode makes these three immune to
+    /// that, in either direction.
+    ///
+    /// They are not testing a dead path either way: the resizing window is a
+    /// supported serving mode and is one arm of the pin A/B. The pinned
+    /// geometry is covered separately by `xs_rolling`'s own tests and by
+    /// `deepseek4`'s pin A/B.
+    ///
+    /// Uses #121's `pin_test_override` — thread-local, not an env mutation,
+    /// because `cargo test` is multi-threaded and `xs_pin_window_enabled`
+    /// latches its env answer in a `OnceLock`.
+    fn unpinned<T>(f: impl FnOnce() -> T) -> T {
+        crate::kv_cache::xs_rolling::pin_test_override::with(false, f)
+    }
+
     /// A cache slot whose only interesting property is its `current_seq_len`.
     /// `all_data` stays `None` — `first_mismatched_cache_len` reads lengths,
     /// never tensors, which is exactly the point: `CACHE_GROW_SIZE = 512` means
@@ -3958,8 +3987,23 @@ mod clone_in_cache_invariant_tests {
     /// compressor history and cannot share one dense buffer. It must be
     /// refused, by name — never papered over, and never a panic on the engine
     /// task.
+    ///
+    /// ⚠️ Run with the window pin OFF, deliberately. The widths 18 and 22 are
+    /// what the *resizing* buffer produced, and they are the whole
+    /// discriminator: pinning the window makes both 144
+    /// (`span_groups * ratio + margin`), so the shape mismatch at :499 cannot
+    /// arise and this fixture would silently stop testing anything. The
+    /// historical defect is still worth pinning — the pin is a flag, and the
+    /// refusal is what has to hold when it is off.
+    /// `the_pin_removes_this_fixtures_discriminator` records the other side.
     #[test]
     fn ragged_xs_tail_is_refused_by_name_not_panicked() {
+        crate::kv_cache::xs_rolling::pin_test_override::with(false, || {
+            ragged_xs_tail_is_refused_by_name_not_panicked_inner();
+        });
+    }
+
+    fn ragged_xs_tail_is_refused_by_name_not_panicked_inner() {
         let mut short = xs_state(128, 1);
         feed_xs(&mut short, 274);
         let mut long = xs_state(128, 1);
@@ -4013,6 +4057,38 @@ mod clone_in_cache_invariant_tests {
             "the refusal must name BOTH lengths so the operator can see which \
              sequences diverged, got: {err}"
         );
+    }
+
+    /// The other side of the fixture above: with the window pinned, the two
+    /// sequences' tails are the SAME width, so wave51-CB's shape mismatch is
+    /// not merely refused — it cannot be constructed.
+    ///
+    /// That is a consequence of the pin worth recording, not a reason to stop
+    /// refusing: the two caches still hold different history, and the batch is
+    /// still refused, just one layer earlier and by the token-count invariant
+    /// (`ensure_uniform_batch_cache_lens`) rather than by a tensor shape. A
+    /// refusal that depends on two buffers happening to differ in size is a
+    /// weaker guarantee than one that reads the lengths, and this shows the
+    /// weaker one is not what is holding.
+    #[test]
+    fn the_pin_removes_this_fixtures_discriminator() {
+        crate::kv_cache::xs_rolling::pin_test_override::with(true, || {
+            let mut short = xs_state(128, 1);
+            feed_xs(&mut short, 274);
+            let mut long = xs_state(128, 1);
+            feed_xs(&mut long, 278);
+            let (sw, lw) = (
+                short.tail.as_ref().unwrap().dims()[1],
+                long.tail.as_ref().unwrap().dims()[1],
+            );
+            assert_eq!(
+                (sw, lw),
+                (144, 144),
+                "pinned HCA windows must both be span_groups*ratio+margin = 144"
+            );
+            // …and the lengths still disagree, which is what the refusal reads.
+            assert_ne!(short.current_seq_len(), long.current_seq_len());
+        });
     }
 
     /// The ragged-tail refusal must not depend on the K/V slots noticing
@@ -4073,6 +4149,10 @@ mod clone_in_cache_invariant_tests {
     /// `shape mismatch on dim 1, 4 <> 132`.
     #[test]
     fn xs_base_divergence_at_equal_lengths_is_reconciled_not_refused() {
+        unpinned(xs_base_divergence_at_equal_lengths_is_reconciled_not_refused_inner);
+    }
+
+    fn xs_base_divergence_at_equal_lengths_is_reconciled_not_refused_inner() {
         // Restored from a prefix-cache entry stored at 300 tokens, truncated to
         // 260 — `base` stays at canonical(300), which is past canonical(260).
         let mut restored = xs_state(128, 1);
@@ -4189,6 +4269,10 @@ mod clone_in_cache_invariant_tests {
     /// looks at shapes.
     #[test]
     fn per_row_xs_bases_survive_a_batch_round_trip_and_are_not_flattened() {
+        unpinned(per_row_xs_bases_survive_a_batch_round_trip_and_are_not_flattened_inner);
+    }
+
+    fn per_row_xs_bases_survive_a_batch_round_trip_and_are_not_flattened_inner() {
         xs_rolling::test_override::with(true, || {
             let mut restored = xs_state(128, 1);
             feed_xs(&mut restored, 300);
@@ -4356,6 +4440,10 @@ mod clone_in_cache_invariant_tests {
     /// (token `t` carries the value `t`) and reads the actual numbers back.
     #[test]
     fn trimming_the_retained_window_drops_the_oldest_rows_not_the_newest() {
+        unpinned(trimming_the_retained_window_drops_the_oldest_rows_not_the_newest_inner);
+    }
+
+    fn trimming_the_retained_window_drops_the_oldest_rows_not_the_newest_inner() {
         use candle_core::IndexOp;
         let dev = candle_core::Device::Cpu;
         let mut state = xs_state(128, 1);

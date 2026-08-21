@@ -1522,6 +1522,16 @@ impl AcceptanceTelemetry {
         for (b, per_b) in self.snapshot_by_batch() {
             tracing::info!(target: "mtp_speculative", "{}", per_b.marker(&format!("b={b}")));
         }
+        // 🔑 On the SAME fence, deliberately. `tok_per_step` and aggregate
+        // throughput are both read against how wide the steps actually were,
+        // and both schedulers run one cache-length bucket per step — so a batch
+        // can be serialised for reasons that have nothing to do with MTP. A
+        // harness that differences these counters across a wall-clock boundary
+        // gets the scheduler's window and MTP's window identical only if they
+        // are emitted together. See `scheduler::bucket_telemetry`.
+        if let Some(sched) = crate::scheduler::sched_bucket_marker() {
+            tracing::info!(target: "mtp_speculative", "{sched}");
+        }
         tracing::info!(target: "mtp_speculative", "{}", snap.report_line());
         // The per-position breakdown, in prose, right where the aggregate rate
         // is. This is the line the acceptance-gap diagnosis needs: the scalar

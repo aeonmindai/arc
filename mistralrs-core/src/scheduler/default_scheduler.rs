@@ -268,6 +268,13 @@ impl<Backer: FcfsBacker> BucketingManager<Backer> for FixedBucketingManager {
         discrete: bool,
     ) -> BucketedSeqs<Backer> {
         // Now, get the sequences with the smallest sequence lengths, and allow them to catch up.
+        //
+        // How wide the step the engine is about to run actually is. A batch
+        // that shatters into N buckets runs one of them and preempts the rest,
+        // so "B=128" in a harness can be 3-wide in the engine — and a
+        // throughput number is unreadable without knowing which. See
+        // [`super::bucket_telemetry`].
+        let offered = running.len();
         let mut seq_buckets: HashMap<BucketKey, Vec<Sequence>> = HashMap::new();
         let mut seq_priorities: HashMap<BucketKey, f64> = HashMap::new();
         let ragged_decode = crate::kv_cache::ragged_decode_supported();
@@ -355,6 +362,7 @@ impl<Backer: FcfsBacker> BucketingManager<Backer> for FixedBucketingManager {
                 );
             }
         }
+        let n_buckets = seq_buckets.len();
         let running = if seq_buckets.len() <= 1 {
             // Full steam ahead or have everything
             seq_buckets
@@ -430,6 +438,7 @@ impl<Backer: FcfsBacker> BucketingManager<Backer> for FixedBucketingManager {
             // Know min_seqs.len < running.len() <= max
             highest_priority_seqs
         };
+        super::bucket_telemetry::record_bucketing(n_buckets, offered, running.len());
         BucketedSeqs { running, waiting }
     }
 }
