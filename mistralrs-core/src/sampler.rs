@@ -505,6 +505,28 @@ impl Sampler {
             || self.dry_params.is_some()
     }
 
+    /// Would [`Sampler::sample`] take the pure-argmax path — no temperature and
+    /// nothing that has to touch the logits on the host?
+    ///
+    /// This is the exact precondition for ArcGraph's device decode loop to
+    /// substitute its on-device argmax for the host one
+    /// (`pipeline/sampling.rs`). It deliberately mirrors the conditions inside
+    /// `sample` rather than approximating them: `logits_bias` and `top_nsigma`
+    /// are applied *before* the `trivial` gate, so a sampler carrying either
+    /// still needs the host even though the gate itself ignores them.
+    ///
+    /// Greedy is also the only mode where device and host agree *exactly* — the
+    /// device sampler runs Splitmix64 per row against the host's Isaac64, so
+    /// any stochastic mode would draw a different, equally valid token and
+    /// silently break seeded reproducibility.
+    pub fn is_greedy_trivial(&self) -> bool {
+        self.temperature.is_none()
+            && self.logits_processors.is_empty()
+            && !self.has_penalties()
+            && self.logits_bias.is_none()
+            && self.top_nsigma.is_none()
+    }
+
     /// True when this sampler is exactly `argmax` over the model's **raw**
     /// logits — no temperature, no penalties, no custom logits processors.
     ///

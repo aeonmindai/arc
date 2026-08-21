@@ -179,6 +179,13 @@ extern "C" {
     pub fn cuStreamCreate(stream: *mut CUstream, flags: u32) -> u32;
     pub fn cuStreamDestroy_v2(stream: CUstream) -> u32;
     pub fn cudaStreamSynchronize(stream: CUstream) -> u32;
+    /// Non-blocking completion probe. Returns `cudaSuccess` when every
+    /// enqueued item has retired and `cudaErrorNotReady` (600) while work is
+    /// outstanding. NVIDIA's reference adds: *"Note that this function may
+    /// also return error codes from previous, asynchronous launches."* That
+    /// is what lets `device_loop` surface an async graph fault without ever
+    /// blocking the stream — see `device_loop::CudaDeviceOps::poll_stream`.
+    pub fn cudaStreamQuery(stream: CUstream) -> u32;
 
     // ========== Conditional nodes (CUDA 12.4+) ==========
     pub fn cudaGraphConditionalHandleCreate(
