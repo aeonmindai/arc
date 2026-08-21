@@ -51,8 +51,19 @@ __global__ void fp8_matmul_tiled(const T *__restrict__ input,
                                  T *__restrict__ output, int M, int N, int K,
                                  int scale_row_stride, int block_size_y,
                                  int block_size_x) {
-  __shared__ float s_input[BLOCK_M][BLOCK_K + 4];
-  __shared__ float s_weight[BLOCK_N][BLOCK_K + 4];
+  // Padding is +1, not +4. The inner product reads `s_weight[tx][k]` with `tx`
+  // varying fastest within a warp, so consecutive lanes are `BLOCK_K + pad`
+  // floats apart. At BLOCK_K=32 a +4 pad gives stride 36; 36 mod 32 = 4, so
+  // gcd(4,32)=4 and the warp lands on only 8 of the 32 shared-memory banks --
+  // a 4-way conflict on every FMA of the k loop. A +1 pad gives stride 33,
+  // which is coprime with 32, so all 32 banks are hit and the access is
+  // conflict-free.
+  //
+  // Bit-identical output: the k loop is bounded by `k < BLOCK_K`, so columns
+  // BLOCK_K..BLOCK_K+pad-1 are written by nobody and read by nobody. The pad
+  // exists only to change the row stride.
+  __shared__ float s_input[BLOCK_M][BLOCK_K + 1];
+  __shared__ float s_weight[BLOCK_N][BLOCK_K + 1];
 
   const int bx = blockIdx.x;
   const int by = blockIdx.y;
