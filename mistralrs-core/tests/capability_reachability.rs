@@ -281,6 +281,16 @@ static DEAD_SYMBOL_BASELINE: &[(&str, &str)] = &[
     // A fused SiLU·mul·down GEMV kernel that is compiled into
     // `libarccudagraph.a` on every CUDA build and launched by nothing. Declared
     // twice (`gemv_ffi.rs:32` and here) and called from neither.
+    //
+    // ⚠️ Only ONE of the two copies is listed, and that is a *third* blind spot
+    // in this scanner, distinct from the two fixed in this PR. The ratchet keys
+    // its baseline lookup on `sites[0]` — the first definition site of a name
+    // in scan order — so a second definition of the same name in another file
+    // can never demand its own entry. Before this PR the `gemv_ffi.rs` copy was
+    // invisible for a second reason too (it is `pub`, and `definition_symbol`
+    // discarded `pub`); that reason is now gone, but `sites[0]` remains. Fixing
+    // it means keying the baseline per (file, symbol) for every site, which
+    // surfaces a fresh batch of duplicate-name entries — a separate change.
     (
         "arc-cuda-graph/src/decode_forward.rs",
         "arc_launch_gemv_bf16_silu_mul_down",
@@ -308,6 +318,284 @@ static DEAD_SYMBOL_BASELINE: &[(&str, &str)] = &[
     (
         "mistralrs-core/src/pipeline/mtp_pipeline.rs",
         "run_target_forward",
+    ),
+    // =======================================================================
+    // Surfaced when `definition_symbol` stopped discarding `pub` items and
+    // `is_definition` learned about `impl` and `use`. These 47 were dark all
+    // along; the scanner could not see them. Each was read before it was
+    // written down — no filler reasons.
+    //
+    // Roughly three kinds, and the kind matters when you triage:
+    //   (a) deliberate test-only oracles — correct as they stand;
+    //   (b) unused twins of a live sibling — delete candidates;
+    //   (c) genuinely switched-off features — the ones that cost throughput.
+    // =======================================================================
+    //
+    // --- ArcInfer / ArcGraph: the GPU-autonomous decode path ----------------
+    // The whole runner is dark; REGISTRY already tracks it via the top_k/min_p
+    // ApiPromise entries. These four are its doors, and nobody opens them.
+    //
+    // Capture entry point for the autonomous runner. Nothing outside the module
+    // constructs the runner, so the door it opens is never used.
+    (
+        "arc-cuda-graph/src/autonomous.rs",
+        "capture_via_decode_forward",
+    ),
+    // Non-blocking reader of the autonomous ring buffer. Nothing drains the
+    // ring, because nothing runs the loop that would fill it.
+    ("arc-cuda-graph/src/autonomous.rs", "poll_tokens"),
+    // Stream sync for the autonomous runner — same dark path as `poll_tokens`.
+    ("arc-cuda-graph/src/autonomous.rs", "wait_complete"),
+    // Exposes the runner's `CUstream` so a caller can enqueue staging memcpys
+    // onto the captured stream. No such caller was ever written.
+    ("arc-cuda-graph/src/autonomous.rs", "stream_handle"),
+    //
+    // --- ArcInfer / ArcGraph: the dedicated runner -------------------------
+    // 🔴 The D2H-free twin of `run_step`. `pipeline/mod.rs:893` calls `run_step`
+    // with a CPU token slice, so the D2H+H2D round-trip that
+    // `run_step_gpu_tokens` exists to remove is still paid on every decode
+    // step. Category (c): built to delete a per-step host sync, switched off.
+    ("arc-cuda-graph/src/dedicated.rs", "run_step_gpu_tokens"),
+    // Staged `PagedAttentionState` builder; the dedicated path assembles its
+    // state inline instead, so this variant never runs.
+    ("arc-cuda-graph/src/dedicated.rs", "build_paged_attn_state"),
+    //
+    // --- ArcKernels: FFI declarations with no Rust caller -------------------
+    // CUDA driver enum for `cuGraphExecUpdate`. Arc re-captures rather than
+    // updating an exec graph, so nothing reads it; it already carries an
+    // explicit `#[allow(dead_code)]` at `ffi.rs:37`.
+    ("arc-cuda-graph/src/ffi.rs", "CUgraphExecUpdateResult"),
+    // FFI declaration for CUDA 12.4 conditional graph nodes — the GPU-side
+    // WHILE loop of the tier-3 autonomous plan. Declared ahead of the work.
+    ("arc-cuda-graph/src/ffi.rs", "cudaGraphSetConditional"),
+    // F16 twin of `launch_gather_rope_decode_bf16`, which IS dispatched
+    // (`decode_forward.rs:334`, `:807`). The F16 arm is compiled into every
+    // CUDA build and never selected.
+    ("arc-cuda-graph/src/ffi.rs", "launch_gather_rope_decode_f16"),
+    //
+    // --- ArcAttention: sparse-MLA agreement fixtures ------------------------
+    // (a) CPU oracle for the sparse-MLA indexer: 9 test call sites, zero
+    // production. Dark by design — it is the agreement fixture, not a path.
+    ("arc-cuda-graph/src/flashmlasparse.rs", "cpu_reference"),
+    // Its doc says "used only by the agreement test" — but the agreement test
+    // drives the BF16 entry point, and this FP32 variant has zero call sites,
+    // test or production. The doc comment is stale; the function is spare.
+    ("arc-cuda-graph/src/flashmlasparse.rs", "score_and_topk_f32"),
+    //
+    // --- ArcGraph: status accessor ------------------------------------------
+    // (b) Counts instantiated graphs. `status_line` (`graph.rs:249`) inlines
+    // `self.graphs.len()` rather than calling this, so it has no reader.
+    ("arc-cuda-graph/src/graph.rs", "graphs_captured"),
+    //
+    // --- ArcSample: the GPU sampler -----------------------------------------
+    // (a) Host simulator of `cuda/sampling_kernel.cu`: 6 test call sites, zero
+    // production. Deliberate — it is the no-GPU oracle for the kernel's math.
+    // (Re-exported at `lib.rs:42`, which is part of why it read as live.)
+    (
+        "arc-cuda-graph/src/sampling_cuda.rs",
+        "gpu_algorithm_simulate",
+    ),
+    //
+    // 🔴🔴 THE FINDING THIS FIX WAS WRITTEN FOR. A complete CUDA-resident fused
+    // sampler — per-batch Splitmix64 RNG state, FP32 softmax scratch,
+    // full-vocab keep-list buffers, a launched kernel — that **nothing ever
+    // constructs**. Its only production "references" are four lines that merely
+    // assert it exists: `pub use sampling_cuda::CudaSampler;` (`lib.rs:73`),
+    // `unsafe impl Send`/`Sync for CudaSampler` (`:257`, `:259`) and
+    // `impl CudaSampler {` (`:262`).
+    //
+    // Category (c), and on the critical path: BUDGET_V4_B1 records decode as
+    // 49% GPU-idle waiting on the host, and a GPU-resident sampler is one of
+    // the host round-trips that idle is made of. Compiled into every CUDA
+    // build; switched off.
+    //
+    // ⇒ Baselined, not deleted: the right move is to wire it and register it,
+    //   which needs a card. Whoever does owns deleting this entry and the two
+    //   below it.
+    ("arc-cuda-graph/src/sampling_cuda.rs", "CudaSampler"),
+    // Raw pointer accessor for embedding the sampler in a captured graph — dark
+    // because its owner `CudaSampler` is never constructed.
+    ("arc-cuda-graph/src/sampling_cuda.rs", "rng_state_ptr"),
+    // Same shape and same blocking condition as `rng_state_ptr`.
+    ("arc-cuda-graph/src/sampling_cuda.rs", "probs_scratch_ptr"),
+    //
+    // --- ArcLab: profiler ---------------------------------------------------
+    // (a) Span-recording predicate; 3 test references, no production reader.
+    // Its own doc says "Useful in tests", so this is honest as it stands.
+    ("arc-profiler/src/lib.rs", "is_active"),
+    // (a) Branch-scoped node lookup in the profiler report; 4 test references,
+    // no production reader. Assertion helper for the engagement tests.
+    ("arc-profiler/src/report.rs", "resolve_in"),
+    //
+    // --- ArcKV: the hybrid (attention + recurrent) cache --------------------
+    // (b) Delta twin of `set_seqlen_offset` (`:145`); the hybrid path sets
+    // offsets absolutely and never increments.
+    (
+        "mistralrs-core/src/kv_cache/hybrid_cache.rs",
+        "increment_seqlen_offset",
+    ),
+    // Free-slot count on the recurrent pool. No admission decision and no log
+    // line reads it, so pool pressure is currently unobservable.
+    (
+        "mistralrs-core/src/kv_cache/hybrid_cache.rs",
+        "num_free_slots",
+    ),
+    // Four downcast accessors on `HybridLayerCache`. Every user matches the
+    // enum variants directly (e.g. `:260`), so none of the four is called.
+    ("mistralrs-core/src/kv_cache/hybrid_cache.rs", "as_kv_cache"),
+    (
+        "mistralrs-core/src/kv_cache/hybrid_cache.rs",
+        "as_kv_cache_mut",
+    ),
+    (
+        "mistralrs-core/src/kv_cache/hybrid_cache.rs",
+        "as_recurrent_pool",
+    ),
+    (
+        "mistralrs-core/src/kv_cache/hybrid_cache.rs",
+        "as_recurrent_pool_mut",
+    ),
+    // Per-sequence recurrent-state reset. The manager frees slots wholesale
+    // (`:445`) and never resets one sequence in place, so a reused slot relies
+    // on the free/alloc path to clear it rather than on this.
+    ("mistralrs-core/src/kv_cache/hybrid_cache.rs", "reset_seq"),
+    //
+    // --- ArcQuant / TurboQuant: KV cache constructors -----------------------
+    // (b) Infallible constructor superseded by `try_new_turboquant` (`:95`),
+    // which is what the live sites call (`:570`, `:629`). Delete candidate once
+    // an SDK consumer is ruled out.
+    ("mistralrs-core/src/kv_cache/mod.rs", "new_turboquant"),
+    // (b) Variant predicate; callers match `Self::Rotating { .. }` directly.
+    ("mistralrs-core/src/kv_cache/mod.rs", "is_rotating"),
+    // (b) Equal-K/V convenience wrapper over `set_turboquant_kv_head_dims`
+    // (`:415`). The live callers (`:422`, `:523`) use the two-argument form
+    // because V4 needs unequal K and V widths — so the wrapper is a leftover
+    // from before the widths could differ.
+    (
+        "mistralrs-core/src/kv_cache/mod.rs",
+        "set_turboquant_head_dim",
+    ),
+    //
+    // --- ArcKV / Share: content-addressed prefix sharing --------------------
+    // Digest accessor on the content index; 2 test references, no production
+    // reader. Part of the content-addressing work that is not yet wired into
+    // the prefix cacher.
+    ("mistralrs-core/src/kv_sharing/content.rs", "digest_of"),
+    // Distinct-offset lookup for verified-identical content; 1 test reference,
+    // no production reader. Same unwired feature as `digest_of`.
+    ("mistralrs-core/src/kv_sharing/content.rs", "offsets_of"),
+    // The baseline LRU eviction scorer, with a citation to SGLang's
+    // `LRUStrategy`. Production evicts through `evict_to_capacity` (`:287`),
+    // which uses the configured `self.scorer`; LRU is reached only from tests
+    // (5 references) and the `pub use` at `mod.rs:50`. It is the control arm of
+    // an A/B that production never runs.
+    ("mistralrs-core/src/kv_sharing/evict.rs", "LruScorer"),
+    // KV-layout capacity ratio. Its own doc says it exists "to explain capacity
+    // changes in logs and stats" — and no log or stat calls it (2 test refs).
+    (
+        "mistralrs-core/src/kv_sharing/layout.rs",
+        "capacity_ratio_vs",
+    ),
+    // 🔴 The headline prefix-sharing stat: tokens served that would otherwise
+    // have been recomputed. Three tests assert it; nothing in production reads
+    // it. The number the feature exists to produce is never surfaced, so a
+    // regression to zero sharing would be silent — the exact shape D18 names.
+    (
+        "mistralrs-core/src/kv_sharing/mod.rs",
+        "tokens_not_recomputed",
+    ),
+    // Explicit-scorer eviction. Its doc says it is "used by the workload suite
+    // to run the same traffic under LRU and under the value-aware scorer" —
+    // there is no such suite in-tree; the function has zero call sites.
+    (
+        "mistralrs-core/src/kv_sharing/mod.rs",
+        "evict_to_capacity_with",
+    ),
+    // (b) Mutable twin of `elements` (`:341`); nothing iterates pool entries
+    // mutably.
+    ("mistralrs-core/src/kv_sharing/mod.rs", "elements_mut"),
+    // Node symbol-depth accessor on the radix tree; no reader in or out of
+    // tests. Spare part of the radix implementation.
+    ("mistralrs-core/src/kv_sharing/radix.rs", "depth_of"),
+    //
+    // --- ArcMoE: expert parallelism (wired-but-dead per TAXONOMY) -----------
+    // Leading-dimension shard hint for expert-stacked weights under EP; 3 test
+    // references, and no loader reads it, so EP placement never reaches the
+    // weight loader.
+    ("mistralrs-core/src/moe/expert_parallel.rs", "expert_shard"),
+    // Distinct-expert balancedness — the weight-byte term. 3 test references,
+    // no production reporter, so the imbalance it measures is never logged.
+    (
+        "mistralrs-core/src/moe/expert_parallel.rs",
+        "distinct_experts",
+    ),
+    // Accessor for this rank's `ExpertParallelPlan`. Nothing calls it. It read
+    // as live only because the *module* path `expert_parallel::` appears in the
+    // `mod`/`use` lines of `moe/mod.rs` and `moe/experts.rs` — a name collision
+    // between a module and a method that this name-based scanner cannot split.
+    ("mistralrs-core/src/moe/experts.rs", "expert_parallel"),
+    //
+    // --- Upstream mistral.rs, inside a ratchet root -------------------------
+    // Neither of these is Arc's. `RATCHET_ROOTS` scans
+    // `mistralrs-core/src/pipeline` wholesale, and that directory holds
+    // upstream loaders, so dropping the `pub` exemption pulled upstream dead
+    // code in with ours. Fork policy (see `RATCHET_ROOTS`) says upstream dead
+    // code is not ours to churn — so they are recorded, not deleted.
+    //
+    // Present verbatim in `upstream/master`; dead there too.
+    (
+        "mistralrs-core/src/pipeline/loaders/mod.rs",
+        "is_quantized_and",
+    ),
+    // Upstream Gemma 3n loader; already carries `#[allow(dead_code)]` upstream.
+    (
+        "mistralrs-core/src/pipeline/loaders/vision_loaders.rs",
+        "Gemma3nPrefixer",
+    ),
+    //
+    // --- ArcSpec: MTP speculative decoding ----------------------------------
+    // (b) Tier-B predicate on `MtpDecodeKit`; every user tests
+    // `self.block.is_some()` / `.as_ref()` inline (`:426`, `:471`, `:568`).
+    (
+        "mistralrs-core/src/pipeline/mtp_pipeline.rs",
+        "has_full_block",
+    ),
+    // 🔴 Builds `MtpAcceptance` from a `VerifyResult`. Its own doc explains why
+    // it exists: deriving the committed-token count here rather than at the
+    // call site, because "a drift between what we counted and what we emitted
+    // is precisely how a speculative decoder comes to report a multiplier it
+    // never delivered". Nothing calls it — so the drift it was written to
+    // prevent is currently unguarded, and MTP's acceptance numbers come from
+    // the hand-rolled path this was meant to replace.
+    ("mistralrs-core/src/pipeline/mtp_pipeline.rs", "from_verify"),
+    // Accounting constructor for a decode step that drafted nothing; 2 test
+    // references, no production caller — real skipped steps go unrecorded, so
+    // the acceptance denominator omits them.
+    (
+        "mistralrs-core/src/pipeline/mtp_pipeline.rs",
+        "skipped_step",
+    ),
+    // (b) `(accepted, proposed)` convenience twin of `acceptance()` (`:1881`);
+    // no reader.
+    (
+        "mistralrs-core/src/pipeline/mtp_pipeline.rs",
+        "acceptance_counters",
+    ),
+    // Counter reset — nothing ever resets MTP acceptance stats, so a long run's
+    // rate is cumulative-only and cannot be windowed.
+    (
+        "mistralrs-core/src/pipeline/mtp_pipeline.rs",
+        "reset_acceptance_counters",
+    ),
+    // One-off acceptance report. Its doc defers the periodic case to
+    // `record_acceptance` — and **`record_acceptance` does not exist in this
+    // tree**: the name occurs only in three comments (`:967`, `:1900`, `:4992`)
+    // and has no definition. So neither the periodic path nor the one-off path
+    // logs acceptance, and `ARC_MTP_LOG_ACCEPTANCE=1` documents a switch that
+    // reaches nothing. Found while writing this entry; tracked here, not fixed.
+    (
+        "mistralrs-core/src/pipeline/mtp_pipeline.rs",
+        "log_acceptance_rate",
     ),
 ];
 
@@ -768,8 +1056,68 @@ fn reads_field(line: &str, field: &str) -> bool {
     false
 }
 
+/// Strip a leading visibility modifier — `pub`, `pub(crate)`, `pub(super)`,
+/// `pub(in some::path)` — and return the rest, left-trimmed.
+///
+/// Written as one helper because both [`is_definition`] and
+/// [`definition_symbol`] need it and they got it subtly wrong in different
+/// ways. In particular `"pub(crate) fn f"` does **not** start with `"pub "`:
+/// byte 3 is `(`, not a space.
+fn strip_visibility(t: &str) -> &str {
+    let Some(rest) = t.strip_prefix("pub") else {
+        return t;
+    };
+    if let Some(after) = rest.strip_prefix('(') {
+        // `pub(crate)`, `pub(super)`, `pub(in crate::x)`
+        return match after.find(')') {
+            Some(i) => after[i + 1..].trim_start(),
+            None => t,
+        };
+    }
+    if rest.starts_with(char::is_whitespace) {
+        return rest.trim_start();
+    }
+    // `pub` was merely the prefix of a longer identifier (`public_api`).
+    t
+}
+
 /// Is this line the *definition* of `symbol` rather than a use of it?
+///
+/// ## Why `impl` and `use` count as definitions
+///
+/// Neither an impl header nor an import *calls* anything — they name a symbol
+/// while adding exactly zero reachability. Omitting them made the guard blind
+/// to a whole shape of dark room: a type whose only production "references" are
+/// its own `impl` blocks plus a `pub use` re-export.
+///
+/// `CudaSampler` (`arc-cuda-graph/src/sampling_cuda.rs:237`) is that shape. A
+/// complete CUDA-resident fused sampler read as *live* on the strength of four
+/// self-referential lines — `pub use sampling_cuda::CudaSampler;`,
+/// `unsafe impl Send for CudaSampler {}`, `unsafe impl Sync for CudaSampler {}`
+/// and `impl CudaSampler {`. Nothing constructs it. Four lines that state the
+/// symbol exists were the entire evidence that it was switched on.
 fn is_definition(line: &str, symbol: &str) -> bool {
+    let t = line.trim_start();
+
+    // `impl Foo`, `impl<T> Foo<T>`, `impl Trait for Foo`, `unsafe impl Send for Foo`.
+    // Only the header, up to the opening brace — a one-line
+    // `impl Foo { fn f() { g(); } }` really does call `g`.
+    let no_unsafe = t.strip_prefix("unsafe ").unwrap_or(t).trim_start();
+    if let Some(rest) = no_unsafe.strip_prefix("impl") {
+        if rest.starts_with(' ') || rest.starts_with('<') {
+            let header = rest.split('{').next().unwrap_or(rest);
+            if references(header, symbol) {
+                return true;
+            }
+        }
+    }
+
+    // `use a::b::Sym;`, `pub use a::Sym;`, `use a::{Sym, Other};`. An import —
+    // a re-export especially — brings a name into scope; it does not use it.
+    if strip_visibility(t).starts_with("use ") && references(t, symbol) {
+        return true;
+    }
+
     for kw in [
         "fn ", "struct ", "enum ", "const ", "static ", "trait ", "type ", "union ", "mod ",
     ] {
@@ -1086,20 +1434,30 @@ static RATCHET_ROOTS: &[&str] = &[
     "arc-profiler/src",
 ];
 
-/// A definition the ratchet considers. Only items rustc's own `dead_code` lint
-/// would consider — i.e. **not** crate-public API, which is legitimately
-/// unused inside its own crate.
+/// A definition the ratchet considers.
+///
+/// ## Visibility is not a reason to skip
+///
+/// This function used to `return None` for anything starting with `"pub "`, on
+/// the reasoning that "crate-public API is exported; no internal caller is not
+/// a defect". That reasoning is rustc's, and it is correct **for rustc**: the
+/// `dead_code` lint cannot see past the crate boundary, so it must assume a
+/// `pub` item has an outside caller.
+///
+/// This scan is not rustc. It reads every crate in the workspace at once
+/// ([`SCAN_ROOTS`]), so it *can* see the outside — and a `pub` item with no
+/// reference anywhere in the workspace is exactly as dark as a private one.
+/// Importing rustc's exemption discarded **720 of 1,234 definitions in the
+/// ratchet roots — 58% of them, measured on this tree** — and `pub` is the
+/// default in `arc-cuda-graph` and `arc-profiler`, which are Arc-internal
+/// crates with no external consumers at all.
+///
+/// The old guard also carried two clauses that could never fire:
+/// `!t.starts_with("pub(crate)") && !t.starts_with("pub(super)")`. Both are
+/// unreachable when `t.starts_with("pub ")` holds, because byte 3 cannot be
+/// both a space and a `(`. They read as care and did nothing.
 fn definition_symbol(line: &str) -> Option<String> {
-    let t = line.trim_start();
-    // Crate-public API is exported; "no internal caller" is not a defect.
-    if t.starts_with("pub ") && !t.starts_with("pub(crate)") && !t.starts_with("pub(super)") {
-        return None;
-    }
-    let after_vis = t
-        .strip_prefix("pub(crate)")
-        .or_else(|| t.strip_prefix("pub(super)"))
-        .unwrap_or(t)
-        .trim_start();
+    let after_vis = strip_visibility(line.trim_start());
     // Skip declarations that are not definitions of a callable/nameable item.
     for kw in ["fn ", "struct ", "enum ", "trait ", "const ", "static "] {
         let body = after_vis
@@ -1401,6 +1759,105 @@ fn a_definition_is_not_a_caller() {
         "    if xs_per_sequence_enabled() {",
         "xs_per_sequence_enabled"
     ));
+}
+
+/// **Proves an `impl` header and an import are not callers.**
+///
+/// Pins the `CudaSampler` bug: a struct whose only production references were
+/// its own two `unsafe impl` lines, its inherent `impl` block, and a `pub use`
+/// re-export read as reachable. Four lines that say "this symbol exists" were
+/// mistaken for four lines that use it.
+#[test]
+fn an_impl_header_or_an_import_is_not_a_caller() {
+    for line in [
+        "impl CudaSampler {",
+        "unsafe impl Send for CudaSampler {}",
+        "unsafe impl Sync for CudaSampler {}",
+        "impl<T: Clone> Sampler<T> for CudaSampler {",
+        "pub use sampling_cuda::CudaSampler;",
+        "use crate::sampling_cuda::CudaSampler;",
+        "use crate::sampling_cuda::{CudaSampler, SamplingParams};",
+        "pub(crate) use sampling_cuda::CudaSampler as S;",
+    ] {
+        assert!(
+            is_definition(line, "CudaSampler"),
+            "`{line}` must not count as a caller of CudaSampler"
+        );
+    }
+    // …and real uses still are uses.
+    for line in [
+        "        let mut sampler = CudaSampler::new(device, batch, vocab, dtype, seed)?;",
+        "    fn take(s: CudaSampler) {}",
+        "        self.sampler = Some(CudaSampler::new(&dev, 1, v, dt, 0)?);",
+    ] {
+        assert!(
+            !is_definition(line, "CudaSampler"),
+            "`{line}` IS a use of CudaSampler and must count"
+        );
+    }
+    // Only the impl *header* is exempt — a one-line impl body still calls out.
+    assert!(!is_definition(
+        "impl Foo { fn n() -> Self { Self(compute_widget()) } }",
+        "compute_widget"
+    ));
+}
+
+/// **Proves the ratchet can see `pub` items at all.**
+///
+/// `definition_symbol` used to return `None` for every line starting with
+/// `"pub "`, discarding 720 of 1,234 definitions in the ratchet roots — 58% of
+/// them — and `pub` is the default visibility in `arc-cuda-graph`. If this test
+/// fails, the ratchet has gone blind again in exactly the same way.
+#[test]
+fn the_ratchet_sees_public_definitions() {
+    assert_eq!(
+        definition_symbol("pub struct CudaSampler {").as_deref(),
+        Some("CudaSampler")
+    );
+    assert_eq!(
+        definition_symbol("    pub fn arc_launch_gemv_bf16_silu_mul_down(").as_deref(),
+        Some("arc_launch_gemv_bf16_silu_mul_down")
+    );
+    assert_eq!(
+        definition_symbol("pub(crate) fn prefill_chunk_is_intermediate() -> bool {").as_deref(),
+        Some("prefill_chunk_is_intermediate")
+    );
+    assert_eq!(
+        definition_symbol("pub(super) enum RoutingMode {").as_deref(),
+        Some("RoutingMode")
+    );
+    assert_eq!(
+        definition_symbol("pub(in crate::moe) fn expert_shard_of() {").as_deref(),
+        Some("expert_shard_of")
+    );
+    assert_eq!(
+        definition_symbol("    pub async unsafe fn launch_widget_kernel(").as_deref(),
+        Some("launch_widget_kernel")
+    );
+    // Short names still carry no signal, and non-items are still not items.
+    assert_eq!(definition_symbol("pub fn new() -> Self {"), None);
+    assert_eq!(definition_symbol("    let publisher = make();"), None);
+}
+
+/// **Proves `strip_visibility` does not eat identifiers that merely start with
+/// `pub`.** Without the guard, `public_widget_count` would be shredded into
+/// `lic_widget_count` and the scanner would silently stop matching it.
+#[test]
+fn visibility_stripping_is_not_prefix_matching() {
+    assert_eq!(strip_visibility("pub fn f()"), "fn f()");
+    assert_eq!(strip_visibility("pub(crate) fn f()"), "fn f()");
+    assert_eq!(strip_visibility("pub(super) fn f()"), "fn f()");
+    assert_eq!(strip_visibility("pub(in crate::a::b) fn f()"), "fn f()");
+    assert_eq!(strip_visibility("fn f()"), "fn f()");
+    // `pub` as a prefix of a longer identifier is left alone.
+    assert_eq!(
+        strip_visibility("public_widget_count += 1;"),
+        "public_widget_count += 1;"
+    );
+    assert_eq!(
+        definition_symbol("fn public_widget_count() {}").as_deref(),
+        Some("public_widget_count")
+    );
 }
 
 /// **Proves a declared-but-never-read field is not counted as honoured.**
