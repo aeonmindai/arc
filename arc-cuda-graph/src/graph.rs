@@ -744,6 +744,14 @@ output_trusted={} verify_remaining={} verify_failed={}",
     /// `CapturedGraph` — which is exactly why sampling it in place is sound.
     /// The clone is an `Arc` bump and does **not** extend that lifetime past
     /// the runner's; callers must not hold it after dropping the runner.
+    ///
+    /// 🔴 The same BOOBY TRAP `replay` documents applies here verbatim: this
+    /// output aliases storage the next launch overwrites, so it is not a
+    /// snapshot. `device_loop` is safe against it for a specific reason —
+    /// every access is enqueued on this same stream, in order, and none of
+    /// them is a host read — and `normal.rs` enforces at runtime the invariant
+    /// that lets the aliasing tensor be handed back at all. Anything else
+    /// taking these handles must copy.
     pub fn replay_handles(&self, batch_size: usize) -> Option<(CUgraphExec, Tensor)> {
         let captured = self.graphs.get(&batch_size)?;
         let out = captured.output.clone()?;

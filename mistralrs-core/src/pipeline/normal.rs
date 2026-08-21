@@ -2149,6 +2149,16 @@ fn device_decode_burst(
 ) -> Option<Tensor> {
     use arc_cuda_graph as acg;
 
+    // Stand aside for the replay-verification lane (PR #205). This branch sits
+    // EARLIER in the chain than the `runner.replay(bs)` arm, so without this it
+    // would take every step and `ARC_GRAPH_VERIFY_ALWAYS=1` would silently
+    // verify nothing — the operator would get a clean diagnostic that never
+    // ran. A verification switch that is quietly bypassed is worse than one
+    // that is off.
+    if std::env::var("ARC_GRAPH_VERIFY_ALWAYS").as_deref() == Ok("1") {
+        return None;
+    }
+
     let (_exec, out) = runner.replay_handles(bs)?;
 
     // A burst already produced this step's token: no launch, no sync, no
