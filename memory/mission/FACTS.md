@@ -39,12 +39,12 @@
 # (Sessions: s1=08-12 H200, s2=08-13 H200, s3=08-13/14 H200, s4=08-14 H200.)
 
 ## 🔴🔴🔴 2026-08-21 — SESSION-9. **V4 OOM'd AFTER 22–30 TOKENS BECAUSE TCFRAG
-## RETAINED ~63 GB. EVERY SINGLE-USER V4 tok/s FIGURE IN THIS FILE WAS
-## MEASURED INSIDE A CRASHING RUN.**
+## RETAINED ~63 GB. EVERY SINGLE-USER V4 tok/s FIGURE IN THIS FILE IS A
+## ≤30-TOKEN FRAGMENT — see §2 for what that does and does NOT void.**
 
 **Full record: `memory/mission/wave66-CS-session9-the-22-token-wall.md`.**
 Serving measured at **`cc5487ad3`** on an H200; every source claim verified at
-master **`f709872ab`**.
+master **`fdf0b6c19`**.
 
 ### 0. THE CAUSE, AND THE FIX IS ALREADY MERGED
 
@@ -56,7 +56,8 @@ master **`f709872ab`**.
 **The TCFRAG repack retains ~63 GB against a ~79.5 GB model.** That is what put
 decode at **844 MiB free**, and it is why a per-token leak that PR #182's leg
 survived for **2,600 tokens** killed this one in **~20**. #182's leg predates
-TCFRAG entirely (it landed as #203 on 08-20). **Same per-token rate, ~60 GB less
+TCFRAG entirely (it landed as #203, `cc5487ad3`, on **2026-08-21** — the same
+day, not 08-20; `git log -1 --date=short cc5487ad3` is the check). **Same per-token rate, ~60 GB less
 headroom.**
 
 **Two independent single-variable rescues, each sufficient alone:**

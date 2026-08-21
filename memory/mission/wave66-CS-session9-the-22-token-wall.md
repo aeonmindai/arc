@@ -116,8 +116,8 @@ whose width tracks KV length is `compressed_kv_from_rows`
 every step. wave65-CQ derived that at **~22 MB/token of pure re-RoPE traffic**
 at 2,048 ctx, from tensor shapes. **That derivation and this measurement are
 the same shape and the same order of magnitude, but they are not the same
-number and must not be quoted as confirming each other** — 11 MiB/token is what
-the card retained, ~22 MB/token is what was moved.
+number and must not be quoted as confirming each other** — ~11.8 MiB/token is
+what the card RETAINED, ~22 MB/token is what was MOVED.
 
 Two mechanisms make retention permanent rather than transient:
 
@@ -200,7 +200,7 @@ gap was ~60 GB. It was written up here as a concurrency-budget hypothesis.
 
 | | PR #182's leg | tonight, `cc5487ad3` |
 |---|---|---|
-| TCFRAG present? | **no — it landed as #203 on 08-20, after that leg** | **yes, and default-ON** |
+| TCFRAG present? | **no — it landed as #203 on 2026-08-21, after that leg** | **yes, and default-ON** |
 | free VRAM at decode start | **≥ 15.7 GB** | **844 MiB** |
 | per-token retention | 6.04 MiB/token | ~11.8 MiB/token (table above); the box separately reports **~12.8 MiB/step** |
 | tokens survived | **2,600** | **22–30** |
@@ -741,7 +741,7 @@ Those two are `drain_alloc_cache_and_free` (`graph.rs:56`) and
 
 | # | question | how it was settled |
 |---|---|---|
-| **1** | Why does decode start at 142,927 MiB here but ≥15.7 GB free in #182's leg? | ✅ **MEASURED.** `ARC_QTIP_TCFRAG=0` frees **64,262 MiB** vs 262 MiB with it on — the repack retains **~63 GB**. #182's leg predates TCFRAG (#203, 08-20). Same per-token rate, ~60 GB less headroom. **The concurrency-budget hypothesis is withdrawn.** |
+| **1** | Why does decode start at 142,927 MiB here but ≥15.7 GB free in #182's leg? | ✅ **MEASURED.** `ARC_QTIP_TCFRAG=0` frees **64,262 MiB** vs 262 MiB with it on — the repack retains **~63 GB**. #182's leg predates TCFRAG (#203, `cc5487ad3`, 2026-08-21). Same per-token rate, ~60 GB less headroom. **The concurrency-budget hypothesis is withdrawn.** |
 | **1a** | Is #213 the OOM fix? | ✅ **No — #209 is.** Two independent single-variable rescues: `ARC_QTIP_TCFRAG=0` → **256/256 tokens, 5 runs**, cache still on; `ARC_CANDLE_ALLOC_CACHE=0` → **1,000 tokens**, TCFRAG still on. **#209 restored the headroom; #213 is defence in depth on the rate.** |
 
 ## Open, with the probe named
