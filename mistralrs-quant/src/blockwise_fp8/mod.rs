@@ -551,22 +551,115 @@ pub fn blockwise_fp8_linear_b(
 /// Parent system: ArcKernels.
 ///
 /// Row threshold at or above which a blockwise-FP8 linear prefers the
-/// dequantize + cuBLASLt path over the scalar `fp8_matmul_tiled` kernel.
+/// dequantize + cuBLASLt path over the native FP8 kernels in
+/// `blockwise_fp8/ops.rs`.
 ///
 /// Measured on an H200 against DeepSeek-V4-Flash at 512 prompt tokens: the
 /// cuBLASLt path is 27x faster on the MLA `q_proj`/`o_proj` projections
 /// (706.1 -> 26.2 ms/step) and 21x on the shared expert (253.2 -> 11.9), for
-/// 1.513x on prefill TTFT end to end. The default is set to that measured
-/// point rather than to an interpolated crossover.
+/// 1.513x on prefill TTFT end to end.
 ///
-/// The decode regime is untouched: it has its own dedicated `fp8_gemv_warp`
-/// kernel for M <= 4 and never reaches this threshold.
+/// # 🔴 512 IS 512 BECAUSE 512 WAS THE ONLY POINT EVER MEASURED
+///
+/// The previous revision of this doc said so outright — *"the default is set to
+/// that measured point rather than to an interpolated crossover"* — and 512
+/// then became a wall. `fp8_gemv_warp` owns `M <= 4`, so `M = 5..511` fell
+/// through to **`fp8_matmul_tiled`**, the kernel whose own comment says there
+/// is *"no tensor-core instruction anywhere in it"*. A profile of the shipped
+/// default caught it running **7,525 times for 17.6% of GPU time** in one
+/// decode window. (That was the dispatch before #200; see below for what M =
+/// 5..511 selects now.)
+///
+/// Swept on an H200, V4-Flash, one binary and one env toggle, aggregate tok/s,
+/// **clean rows only** (>=95% achieved concurrency, <15% derived-vs-measured
+/// spread):
+///
+/// ```text
+///   M=1     34.92  vs  25.27   cuBLASLt 0.72x  -- the GEMV floor is REAL
+///   M=8     49.25  vs  64.95   cuBLASLt 1.32x
+///   M=16    45.61  vs  52.55   cuBLASLt 1.15x
+///   M=128  114.21  vs 130.76   cuBLASLt 1.14x
+/// ```
+///
+/// **Keep the floor.** At M=1 cuBLASLt is *worse* (0.72x): the dedicated
+/// `fp8_gemv_warp` kernel exists for a reason and forcing the library path over
+/// it costs 28% of b=1 decode. That row is why any lowered value is >= 5, never
+/// 1.
+///
+/// **Mechanism, not just a number.** The tiled kernel is scalar, so its cost is
+/// instruction-bound and grows with M while the memory controller idles. The
+/// cuBLASLt path dequantizes once and hands a tensor-core GEMM the whole tile.
+/// The signature is visible in the counter: memory-controller utilisation went
+/// **2-3% -> 6-19%** across the sweep, the first intervention this session to
+/// move it at all. A scalar kernel that keeps the card 100% busy and the memory
+/// controller at 2% is not doing the work; it is doing arithmetic *about* the
+/// work.
+///
+/// # A recurring failure in this codebase: one measured point frozen as a gate
+///
+/// This is the **second** gate found this way. `qtip::gather_policy`'s tile-fill
+/// predicate required `6n/256 >= 16`, i.e. n >= 683, and so kept the amortizing
+/// grouped GEMM unreachable in every decode step; removing it was worth 1.45x
+/// at B=128. Both gates were derived from a single working point and neither
+/// was ever swept. **If you are about to set a dispatch threshold from one
+/// measurement, sweep it first and write down which rows were clean** — a
+/// threshold is a claim about every value it excludes, not just the one you
+/// tried.
+///
+/// # 🔴 AND IT IS STILL 512: THE SWEEP NO LONGER MEASURES THE ARM THAT RUNS
+///
+/// That sweep was taken at 01:47 on 2026-08-21. At 07:04 the same day, #200
+/// (`9ee459191`) merged a **tensor-core** blockwise-FP8 GEMM, and
+/// `fp8_blockwise_matmul_impl` now selects it by default for everything
+/// `fp8_gemv_warp` does not own — see `use_wmma` in `blockwise_fp8/ops.rs`. Our
+/// shipped `weight_block_size` is `[128, 128]` and the kernel's tiling is
+/// `N_BLK = 64`, `K_BLK = 128`, so `128 % 64 == 0` and `128 % 128 == 0`:
+/// `fp8_wmma_eligible` passes. **At M = 5..511 the native arm is no longer
+/// `fp8_matmul_tiled`.**
+///
+/// The rows above therefore compare arm (a) against an arm that is now only
+/// reachable with `ARC_NO_FP8_WMMA=1`. Lowering this constant to 5 today would
+/// route every M >= 5 into the dequantize path and leave #200's kernel
+/// **unreachable at every batch size that matters** — the wired-but-dead
+/// failure this repo already tracks, and silent, because it compiles and the
+/// tests pass. The instruction is written into that kernel's own docs: sweep
+/// three arms, not two, and *"do not merge a threshold on the two-arm result"*.
+///
+/// ```text
+///   (a) dequantize_w() + cuBLASLt        <- what the sweep above measured
+///   (b) native FP8 tensor-core GEMM      <- #200, ARC_NO_FP8_WMMA unset
+///   (c) native scalar fp8_matmul_tiled   <- ARC_NO_FP8_WMMA=1
+/// ```
+///
+/// Two further reasons the sweep cannot be cashed as-is:
+///
+/// * It ran **before** the rank-3 flatten in `forward` above. Arm (a) was
+///   dispatching `batch_matmul` with `stride_b = 0` — a B-way batched GEMV with
+///   m=1 — so those rows understate cuBLASLt and must be retaken regardless.
+/// * Arm (a) pays a full-model `dequantize_w()` on **every** forward (~12.7
+///   GB/step, +8.48 GB resident BF16) that arms (b) and (c) do not. Cache that
+///   and (a)'s crossover moves down; leave it uncached and (a) pays at every M.
+///   Nothing here caches it.
+///
+/// **The measurement that settles this constant:** re-run the M sweep with the
+/// flatten fix present, three arms, on one binary —
+/// `ARC_FP8_CUBLAS_MIN_M`/`ARC_NO_FP8_WMMA` toggle all three with no rebuild —
+/// and set the default to the first M at which (a) beats `min((b), (c))`. Until
+/// then the default stays where it is, because moving it would be a *second*
+/// constant with no measurement behind it, which is the exact defect this doc
+/// exists to record.
+///
+/// `fp8_gemv_warp` still owns `M <= 4` and is not affected by this constant.
 ///
 /// `ARC_FP8_CUBLAS_MIN_M` overrides; a value above any real batch restores
 /// the previous always-native dispatch.
 #[cfg(feature = "cuda")]
 fn arc_fp8_cublas_min_m() -> usize {
     use std::sync::OnceLock;
+    // Still 512. NOT because 512 is right -- the doc above shows it is a single
+    // prefill point -- but because the only sweep in hand measured the scalar
+    // kernel that #200 displaced, and lowering this to 5 on that evidence would
+    // make the tensor-core GEMM dead code at every M >= 5. Re-sweep three arms.
     const DEFAULT_MIN_M: usize = 512;
     static CACHE: OnceLock<usize> = OnceLock::new();
     *CACHE.get_or_init(|| {
