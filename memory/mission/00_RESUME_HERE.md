@@ -12,9 +12,108 @@ metadata:
 
 **Compaction-proof entry point.** Fresh session, compacted, or lost: read THIS
 top-to-bottom. Everything needed to continue is here or named here.
-**Last rewritten: 2026-08-18, session 8. Session-8 CLOSE block added 2026-08-19.**
+**Last rewritten: 2026-08-18, session 8. Session-8 CLOSE 2026-08-19.
+🔴 SESSION-9 BLOCKER prepended 2026-08-21 — it supersedes the throughput framing
+of everything below it.**
 If STATUS.md's top entry is newer than this file, that entry wins — reconcile and
 update this file.
+
+---
+
+# 🔴 SESSION 9 (2026-08-21): **V4 COULD NOT SERVE PAST ~22 TOKENS. CAUSE: TCFRAG HELD 63 GB. FIXED BY #209.**
+
+**At `cc5487ad3` on an H200, batch=1 decode died with
+`CUDA_ERROR_OUT_OF_MEMORY` after 22–30 generated tokens, 3/3 runs, two
+independent arms** — card genuinely full at **143,151 of 143,771 MiB**.
+
+**The cause was not the leak. It was the headroom.**
+
+| probe | frees |
+|---|---|
+| **`ARC_QTIP_TCFRAG=0`** | **64,262 MiB** |
+| TCFRAG on (the shipped default at `cc5487ad3`) | **262 MiB** |
+
+`tcfrag_words` (`bitshift.rs:1334`) is a per-weight `OnceLock` caching a second,
+differently-packed copy of every weight for the process lifetime — **~63 GB
+against a ~79.5 GB model**. That left decode **844 MiB free**, so a ~12 MiB/token
+leak that PR #182's leg survived for **2,600 tokens** killed this one in ~20.
+
+**Two independent single-variable rescues, each sufficient alone:**
+`ARC_QTIP_TCFRAG=0` → **256/256 tokens, five runs, `finish=length`** (cache still
+on); `ARC_CANDLE_ALLOC_CACHE=0` → **1,000 tokens** (TCFRAG still on).
+
+> 🔑 **PR #209 (merged) is the fix that restored serving. PR #213 is defence in
+> depth on the leak RATE — do not record it as "the OOM fix".**
+
+> ## ⛔ THE tok/s CONSEQUENCE — **two claims, and only one is universal**
+>
+> **A (universal):** every V4 single-user tok/s figure is a **≤30-token
+> short-window measurement** — the b=1 trio **15.11 / 15.39 / 15.51** says
+> *"24 tokens"* in its own row, as do **9.3 / 13.31 / 14.84 / 10.99 / 11.94 /
+> 17.85 / 18.27**. **Warm-up dominated; no steady state shown. None is a
+> sustained rate.**
+>
+> **B (NOT universal):** *"measured inside a crashing run"* holds **only at or
+> after `cc5487ad3` (#203, 2026-08-21)**. The b=1 trio is from **2026-08-17**,
+> before TCFRAG existed — **its 24 was a harness choice, not a truncation.**
+> Saying otherwise is a fabrication, and an earlier revision of this block did.
+>
+> ⚠️ The capture lane's **33.4 → 34.2** is a third case: its source
+> `CAPTURE_LANE.md` **does not exist in this repo, on any branch** — it is
+> **unsourced**, like the 27.2% TAIL and #210's 16.0%.
+>
+> Per-step quantities (ms/step, the 57.27 ms sync'd forward, the 88% forward
+> share) are unaffected. Model scope: V4 eager KV only — not Qwen2.5-0.5B, not
+> the 55 tok/s TurboQuant B200 result.
+
+✅ **A real steady-state single-user number is now obtainable for the first
+time — 256/256 tokens runs clean. Nobody has taken it yet.** That is the
+cheapest high-value measurement on the board.
+
+**Full record, with all seven session-9 findings and every citation verified at
+master `f709872ab`:
+`memory/mission/wave66-CS-session9-the-22-token-wall.md`.** Measured numbers and
+seven new retractions → `FACTS.md` §2026-08-21.
+
+### The other six, in one line each
+
+1. ✅ **TCFRAG was default-ON and its own header says "UNVERIFIED ON HARDWARE —
+   NEVER RUN"** (`qtip2b_tcfrag.cu:7`). **Fixed, PR #209, merged.** It does not
+   panic — `OnceLock::get_or_init` caches `None` permanently
+   (`tcfrag_words`, `bitshift.rs:1334`). **#203 costed instructions and never
+   costed the 63 GB the repack retains.**
+2. 🔴 **Two host round-trips per decode step, not one** —
+   `cudaStreamSynchronize` (`graph.rs:362`) **and** a greedy `argmax`
+   (`sampler.rs:1479`). **This RETRACTS "op count is retired as a lever"**: the
+   1,137× launch cut that bought ~8% **kept both round-trips in the captured
+   arm**, so the CPU never left the loop and the test could not price removing
+   it. *(It does not show the syncs ARE the limiter — only that the experiment
+   could not see them.)* Zero-sync arm exists, unmeasured:
+   `arcgraph/device-decode-loop` @ `1b6949244`.
+3. 🔴 **The dedicated/autonomous decode tier cannot accept V4 architecturally.**
+   `LayerWeights` (`weights.rs:430`) has seven non-optional projection slots
+   (`DENSE_PROJS_PER_LAYER`, `weights.rs:44`) — **no MLA slot, no expert slot**.
+   Accepting V4 trades a named refusal for a wrong-tensor read.
+4. 🔴 **The b=1 FP8 GEMV is instruction-bound, not latency-bound** — a runtime
+   signed idiv by a kernel argument (`blockwise_fp8_gemm.cu:199`), once per four
+   weight bytes. **This retracts the "4% memory-controller ⇒ latency-bound"
+   story.** Ceiling **1.5–3.0 TB/s** vs a 4.8 TB/s roof — quote the range, not
+   the 2.97 (that used the FP32 warp rate; the INT32 pipe gives 1.49).
+   ⚠️ **PR #210 merged (`f709872ab`) with a projected win multiplied out of an
+   unsourced 16.0% share** — default OFF and `UNVERIFIED ON HARDWARE`, so the
+   kernel is safe, but **do not quote "34.2 → ~35.8 tok/s" as expected.**
+5. 🔴 **The consequence of a session-8 finding, never drawn.** That
+   `mark_unreachable` is itself dark was already recorded below (§TAXONOMY
+   corrections). What was not: it is inert unless `ARC_PROFILE` is exactly
+   `"1"` (`arc-profiler/src/lib.rs:467`), so **its six sites in `normal.rs` —
+   `:1589`, `:1668`, `:1954`, `:2690`, `:2760`, `:2888` — have been dark in
+   every ordinary run, and we have been reading their silence as evidence.**
+   Separately and newly: `ci_cuda.yaml` is `workflow_dispatch`-only
+   (`ci_cuda.yaml:3`) on a self-hosted ARM64 GPU runner — **it gates nothing**;
+   the real lane is `cuda-typecheck` (`cuda_compile_check.yaml:337`).
+6. 🔴 **21 env flags are presence-tested, so `=0` turns them ON** — **any past
+   A/B that used `=0` as its "off" leg was never a comparison.** Sweep is
+   PR #212, open.
 
 ---
 
@@ -86,6 +185,13 @@ every table re-run from scratch.**
   **B=32 @ 8k: 11.57 GB → 0.38 GB.** Compaction copies 1.12 rows per row stored.
 - **Launch reductions shipped:** 9,131 → **8,650/token** (−430 dead mHC casts,
   −43 router weight, −8/seq/token sampler). Casts **1,571 → 1,141**.
+  ⛔ **2026-08-21: the 1,571 BASELINE IS RETRACTED AS STALE** — it was profiled
+  at `05af600e7`, and the three commits that retired it (`9f110905b`,
+  `1f6ef9da9`, `179e405ac`) are ancestors of HEAD but not of that ref. MHC's
+  whole remaining b=1 cast budget is **86 launches/token**
+  (`dsv4_mhc.rs:279`). **The 1,571 → 1,141 delta is scored against a number
+  that no longer existed; do not quote it as a saving.** (PR #206, FACTS
+  §2026-08-21.)
 - **Frozen Gumbel:** flat 64-token distribution, 512 draws ⇒
   **1 distinct token before, 64 after.**
 
@@ -712,21 +818,28 @@ The ones that keep costing money:
 
 ## 9. READ ORDER (bounded — do not read everything)
 
-1. **This file** — the SESSION-8 CLOSE block at the top is not optional.
-2. **`CENSUS_SESSION8.md`** — the complete Arc/SGLang/vLLM census (zero GPU
+1. **This file** — the SESSION-9 BLOCKER block and the SESSION-8 CLOSE block at
+   the top are not optional.
+2. 🔴 **`wave66-CS-session9-the-22-token-wall.md`** — **before quoting any
+   single-user throughput number, and before proposing any decode
+   optimisation.** V4 does not serve past ~22 tokens; the seven session-9
+   findings; six retractions; and eight corrections to how they were first
+   reported.
+3. **`CENSUS_SESSION8.md`** — the complete Arc/SGLang/vLLM census (zero GPU
    hours) — and **`LADDER_POST_CENSUS.md`**, the GPU ladder reordered by it.
    **Read both before proposing any GPU spend.** *(Branch `docs/census-session8`
    until it merges.)*
-3. `STATUS.md` — **top entry only** (reverse-chron; the file is 70 KB).
-4. `FACTS.md` — only to look up a specific number. **Never reason from a number not in it.**
-   Start at **§2026-08-19**, which carries the compiled trellis ladder and the retraction table.
-5. `KERNEL_RULES.md` — when about to measure, build a kernel, or write a guard.
+4. `STATUS.md` — **top entry only** (reverse-chron; the file is 70 KB).
+5. `FACTS.md` — only to look up a specific number. **Never reason from a number not in it.**
+   Start at **§2026-08-21** (the blocker + six retractions), then **§2026-08-19**
+   for the compiled trellis ladder.
+6. `KERNEL_RULES.md` — when about to measure, build a kernel, or write a guard.
    **The top block is the session-8 close: seven rules, each paid for.**
-6. `TAXONOMY.md` — when naming anything or asking "what am I working on".
-7. `CEILINGS.json` — **before quoting any speed number or saying "not achievable"**.
+7. `TAXONOMY.md` — when naming anything or asking "what am I working on".
+8. `CEILINGS.json` — **before quoting any speed number or saying "not achievable"**.
    Separates PHYSICS bounds from IMPLEMENTATION gaps + the anti-pessimism protocol.
    ⚠️ **Its 16,600 at B=256 is a BANDWIDTH ceiling and assumes the format is free
    to decode.** It is a physics bound, not a target this build approaches — and it
    is **not** the capacity claim. See the headline block at the top of this file.
-8. `BACKLOG.md` — surfaced-not-shipped debt.
-9. `wave*-*.md` — per-agent deep logs, on demand only.
+9. `BACKLOG.md` — surfaced-not-shipped debt.
+10. `wave*-*.md` — per-agent deep logs, on demand only.
