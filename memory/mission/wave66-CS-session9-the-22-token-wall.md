@@ -423,7 +423,7 @@ b=1 reaches it because `use_gemv` is `m <= fp8_gemv_max_m()` (default **4**,
 `mistralrs-quant/src/blockwise_fp8/ops.rs:914`) and
 `mistralrs-quant/src/blockwise_fp8/ops.rs:1140` selects it.
 
-### Two precision corrections to how this was first stated
+### Three precision corrections to how this was first stated
 
 * **It is NOT loop-invariant.** `k = k_base + lane*4` and `k_base` advances by
   128 per trip, so the quotient changes every iteration. Nothing is hoistable.
@@ -562,9 +562,12 @@ Representative sites, each with its flag on the cited line:
 `ARC_SYNC_ISQ` (`isq.rs:34`) · `ARC_COLLAPSE` (`deepseek4.rs:2219`).
 
 > ⇒ **Any past A/B that used `FLAG=0` as its "off" leg was never a
-> comparison — both arms ran with the feature on.** This is not hypothetical:
-> `normal.rs:216` records exactly that happening to `ARC_NO_DEDICATED_DECODE`,
-> where two harnesses passed `=0` as their control.
+> comparison.** For the 13 `.is_some()` flags both arms ran with the feature
+> **on**; for the 5 `.is_none()` ones `=0` counts as *set*, so `=0` **suppresses**
+> and the legs are inverted rather than identical. Either way the control leg
+> was not the control. This is not hypothetical: `normal.rs:216` records exactly
+> that happening to `ARC_NO_DEDICATED_DECODE`, where two harnesses passed `=0`
+> as their control.
 
 **The canonical fix already exists in-tree and these 18 do not use it**:
 `env_flag_is_set` (`normal.rs:232`) over `env_flag_value` (`normal.rs:252`),
