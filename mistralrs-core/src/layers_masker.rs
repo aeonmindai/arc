@@ -100,6 +100,63 @@ impl PastKvLenCache for Vec<Option<(Tensor, Tensor)>> {
     }
 }
 
+/// The two invariants both left-padded-mask builders require, factored so the
+/// device build and its host oracle cannot drift on what they refuse.
+fn validate_ragged_live(b_sz: usize, past_kv_len: usize, live: &[usize]) -> Result<()> {
+    if live.len() != b_sz {
+        candle_core::bail!(
+            "ragged mask: {} live lengths for a batch of {b_sz}",
+            live.len()
+        );
+    }
+    for &l in live {
+        if l > past_kv_len {
+            candle_core::bail!(
+                "ragged mask: live length {l} exceeds the padded width {past_kv_len}"
+            );
+        }
+    }
+    Ok(())
+}
+
+thread_local! {
+    /// Per-device cache of an `arange(0, N)` F32 tensor, grown geometrically
+    /// and narrowed per call.
+    ///
+    /// This is what keeps [`CausalMasker::make_left_padded_causal_mask`] off
+    /// CLAUDE.md pitfall #5: a fresh `Tensor::arange` per decode step is a
+    /// host-side build plus an H2D sync in the hot loop, and the index rows it
+    /// needs only ever grow by one column per step. Thread-local because the
+    /// engine drives every forward from one thread, and a `cargo test` binary
+    /// runs each test on its own thread — a process-global here would be a
+    /// lock on the hot path for no aliasing that actually occurs.
+    static ARANGE_CACHE: std::cell::RefCell<Vec<(candle_core::DeviceLocation, Tensor)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `[0.0, 1.0, ..., n-1.0]` on `device`, served from [`ARANGE_CACHE`].
+///
+/// Allocates only when `n` first exceeds the cached capacity for that device,
+/// growing to the next power of two (>= 1024) so a cohort whose context climbs
+/// token by token re-allocates O(log n) times over its whole life.
+fn cached_arange_f32(n: usize, device: &Device) -> Result<Tensor> {
+    ARANGE_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        let loc = device.location();
+        if let Some((_, t)) = c.iter().find(|(l, _)| *l == loc) {
+            if t.dim(0)? >= n {
+                return t.narrow(0, 0, n);
+            }
+        }
+        let cap = n.next_power_of_two().max(1024);
+        let grown = Tensor::arange(0f32, cap as f32, device)?;
+        let out = grown.narrow(0, 0, n)?;
+        c.retain(|(l, _)| *l != loc);
+        c.push((loc, grown));
+        Ok(out)
+    })
+}
+
 impl CausalMasker {
     fn make_mask(&self, tgt_len: usize, past_kv_len: usize, device: &Device) -> Result<Tensor> {
         let offset = tgt_len + past_kv_len;
@@ -218,6 +275,24 @@ impl CausalMasker {
     /// `[past - live[b], past + i]`. Everything outside that is killed. Note
     /// the row is never fully masked — column `past + i` is the query's own
     /// position — so softmax cannot produce a NaN row.
+    ///
+    /// # Built on the DEVICE, not the host
+    ///
+    /// This runs on **every decode step** while a cohort is ragged (the
+    /// `ragged_lead_pad` channel stays set until batch membership changes), and
+    /// the first implementation was a scalar triple loop over
+    /// `B * t_q * (past + t_q)` host `f32`s followed by a `Tensor::from_vec`
+    /// H2D copy — 4.2 MB/token at B=256, ctx-4096, i.e. CLAUDE.md pitfall #5
+    /// landing on the hot path the moment ragged decode opens. Measured as the
+    /// thing that would make enabling ragged read as a regression.
+    ///
+    /// Now the only per-step H2D is the `[B]` lead vector; the row/column index
+    /// tensors come from a per-device cache ([`cached_arange_f32`]) and the
+    /// mask itself is a handful of broadcast comparisons on the device.
+    ///
+    /// [`Self::make_left_padded_causal_mask_host`] keeps the loop verbatim as
+    /// the test oracle; `the_device_mask_matches_the_host_oracle_element_for_element`
+    /// pins the two together.
     pub fn make_left_padded_causal_mask(
         &self,
         b_sz: usize,
@@ -228,29 +303,70 @@ impl CausalMasker {
         dtype: DType,
         device: &Device,
     ) -> Result<Tensor> {
-        if live.len() != b_sz {
-            candle_core::bail!(
-                "ragged mask: {} live lengths for a batch of {b_sz}",
-                live.len()
-            );
-        }
+        validate_ragged_live(b_sz, past_kv_len, live)?;
+        let k_len = past_kv_len + tgt_len;
+
+        // [1, 1, 1, k]: key column index j. [1, 1, t, 1]: query row index i.
+        // Cached per device — no `arange` allocation in the hot loop.
+        let js = cached_arange_f32(k_len, device)?.reshape((1, 1, 1, k_len))?;
+        let is_ = cached_arange_f32(tgt_len, device)?.reshape((1, 1, tgt_len, 1))?;
+
+        // [B, 1, 1, 1]: each row's dead prefix. The one per-step H2D copy, of
+        // exactly B elements. (f32 is exact for integers up to 2^24, far past
+        // any context length this engine serves.)
+        let lead: Vec<f32> = live
+            .iter()
+            .map(|l| (past_kv_len - l) as f32)
+            .collect::<Vec<_>>();
+        let lead = Tensor::from_vec(lead, (b_sz, 1, 1, 1), device)?;
+
+        // last[i] = past + i — the query's own column, the causal upper edge.
+        let last = is_.affine(1.0, past_kv_len as f64)?;
+
+        // A sliding window is expressed in ABSOLUTE positions, and this buffer
+        // is shifted by `lead`, so the window's low edge has to be shifted with
+        // it: the window admits `j > last - w`, applied on top of the dead
+        // prefix, never instead of it. (The host oracle's `saturating_sub` is
+        // subsumed by the `max` with `lead >= 0`.)
+        let start = match sliding_window {
+            Some(w) => lead.broadcast_maximum(&last.affine(1.0, 1.0 - w as f64)?)?,
+            None => lead,
+        };
+
+        // ok[b, 0, i, j] = (j >= start[b, i]) && (j <= last[i]).
+        let ok = js
+            .broadcast_ge(&start)?
+            .broadcast_mul(&js.broadcast_le(&last)?)?
+            .broadcast_as((b_sz, 1, tgt_len, k_len))?;
+        let zero = Tensor::zeros((b_sz, 1, tgt_len, k_len), DType::F32, device)?;
+        let neg_inf = Tensor::full(f32::NEG_INFINITY, (b_sz, 1, tgt_len, k_len), device)?;
+        ok.where_cond(&zero, &neg_inf)?.to_dtype(dtype)
+    }
+
+    /// The host-loop reference implementation of
+    /// [`Self::make_left_padded_causal_mask`], kept **verbatim** as the test
+    /// oracle: three scalar loops whose every branch is legible, against which
+    /// the device build is pinned element-for-element.
+    ///
+    /// Not for the hot path — this is the `O(B * t_q * k)` host build plus a
+    /// full-mask H2D copy per call that the device build exists to remove.
+    pub fn make_left_padded_causal_mask_host(
+        &self,
+        b_sz: usize,
+        tgt_len: usize,
+        past_kv_len: usize,
+        live: &[usize],
+        sliding_window: Option<usize>,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Tensor> {
+        validate_ragged_live(b_sz, past_kv_len, live)?;
         let k_len = past_kv_len + tgt_len;
         let mut data: Vec<f32> = Vec::with_capacity(b_sz * tgt_len * k_len);
         for &l in live {
-            if l > past_kv_len {
-                candle_core::bail!(
-                    "ragged mask: live length {l} exceeds the padded width {past_kv_len}"
-                );
-            }
             let lead = past_kv_len - l;
             for i in 0..tgt_len {
                 let last = past_kv_len + i;
-                // A sliding window is expressed in ABSOLUTE positions, and this
-                // buffer is shifted by `lead`, so the window's low edge has to
-                // be shifted with it: key `j` sits at absolute position
-                // `j - lead`, the query at `l + i`, so the window admits
-                // `j > last - w`. Applied on top of the dead prefix, never
-                // instead of it.
                 let start = match sliding_window {
                     Some(w) => lead.max((last + 1).saturating_sub(w)),
                     None => lead,
@@ -788,6 +904,102 @@ mod ragged_mask_tests {
         }
 
         crate::kv_cache::set_ragged_lead_pad(None);
+    }
+
+    /// 🔑 The device-built mask IS the host triple loop, element for element.
+    ///
+    /// The host loop ([`CausalMasker::make_left_padded_causal_mask_host`]) is
+    /// kept verbatim as the oracle: every branch of it is legible scalar code.
+    /// The production build replaces it with broadcast comparisons and one
+    /// `[B]` H2D copy, and this test is the only thing standing between that
+    /// rewrite and a silently wrong mask — a wrong element here is not an
+    /// error anywhere downstream, it is softmax weight on a key the row must
+    /// not see.
+    ///
+    /// Cases cover: mixed lengths with lead 0 and live 0 in one batch,
+    /// multi-row queries, no window, a window tighter than the live run, a
+    /// window wider than everything, and the degenerate past=0.
+    ///
+    /// Mutation check (run 2026-08-21): drop the `lead` term from the device
+    /// build (use `0.0`) and this fails on case 0 with 4 mismatching elements
+    /// (the dead prefix of the `live=2` row reads `0.0` where the oracle says
+    /// `-inf`).
+    #[test]
+    fn the_device_mask_matches_the_host_oracle_element_for_element() {
+        let device = Device::Cpu;
+        let cases: &[(usize, usize, &[usize], Option<usize>)] = &[
+            (1, 6, &[6, 2], None),
+            (2, 6, &[6, 2, 0], None),
+            (3, 4, &[4, 1], None),
+            (1, 5, &[5, 1], Some(2)),
+            (2, 6, &[6, 3], Some(4)),
+            (1, 5, &[3, 5], Some(32768)),
+            (1, 0, &[0], None),
+            (4, 0, &[0, 0], None),
+        ];
+        for (case, &(tgt, past, live, window)) in cases.iter().enumerate() {
+            let host = CausalMasker
+                .make_left_padded_causal_mask_host(
+                    live.len(),
+                    tgt,
+                    past,
+                    live,
+                    window,
+                    DType::F32,
+                    &device,
+                )
+                .unwrap();
+            let dev = CausalMasker
+                .make_left_padded_causal_mask(
+                    live.len(),
+                    tgt,
+                    past,
+                    live,
+                    window,
+                    DType::F32,
+                    &device,
+                )
+                .unwrap();
+            assert_eq!(host.dims(), dev.dims(), "case {case}: shape");
+            let h = host.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let d = dev.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let mismatches: Vec<usize> = h
+                .iter()
+                .zip(&d)
+                .enumerate()
+                .filter(|(_, (a, b))| a != b)
+                .map(|(i, _)| i)
+                .collect();
+            assert!(
+                mismatches.is_empty(),
+                "case {case} (tgt={tgt}, past={past}, live={live:?}, window={window:?}): \
+                 {} of {} elements differ, first at flat index {} (host {}, device {})",
+                mismatches.len(),
+                h.len(),
+                mismatches[0],
+                h[mismatches[0]],
+                d[mismatches[0]],
+            );
+            // Neither builder may emit a NaN — 0 * -inf is the classic way to.
+            assert!(d.iter().all(|x| !x.is_nan()), "case {case}: device NaN");
+        }
+    }
+
+    /// Both builders refuse the same malformed inputs — a live length past the
+    /// padded width, and a live vector of the wrong batch size. The validator
+    /// is shared, but shared code can be un-shared by a refactor; this pins the
+    /// contract itself.
+    #[test]
+    fn the_device_mask_and_the_oracle_refuse_the_same_inputs() {
+        let device = Device::Cpu;
+        for (b, live) in [(2usize, &[7usize, 2][..]), (3, &[1, 1][..])] {
+            assert!(CausalMasker
+                .make_left_padded_causal_mask(b, 1, 6, live, None, DType::F32, &device)
+                .is_err());
+            assert!(CausalMasker
+                .make_left_padded_causal_mask_host(b, 1, 6, live, None, DType::F32, &device)
+                .is_err());
+        }
     }
 
     /// `make_causal_mask_matrix` routes to the ragged builder BEFORE both of

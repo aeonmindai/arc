@@ -201,9 +201,18 @@ fn select_running_bucket(
     }
 }
 
+/// The default prompt-starvation floor, in decode steps: a prompt bucket is
+/// forced to run after this many consecutive pass-overs.
+///
+/// `4` was picked against this file's own fixture (see
+/// `the_floor_gives_prompts_a_turn_without_giving_them_every_turn`): behind a
+/// 47-sequence decode cohort a fresh prompt wins 0 of 24 steps with no floor,
+/// and 1 in every 5 with floor=4 — a turn without taking every turn.
+const DEFAULT_PREFILL_FLOOR_STEPS: usize = 4;
+
 /// How many consecutive iterations prompt buckets may be passed over before one
-/// is forced to run. `None` (the default) is the historical behaviour: prompts
-/// win a step only by out-scoring every decode bucket on priority.
+/// is forced to run. `None` means the historical behaviour: prompts win a step
+/// only by out-scoring every decode bucket on priority.
 ///
 /// # Why a floor is needed as well as a cap
 ///
@@ -223,16 +232,25 @@ fn select_running_bucket(
 /// waiting` and **stops**, with 48 sequences admitted and never prefilled.
 /// Capping admission cannot lift it; only guaranteeing prompts a turn can.
 ///
-/// Read once from `ARC_PREFILL_FLOOR_STEPS`; unset or `0` reproduces the
-/// previous selection exactly.
+/// Read once from `ARC_PREFILL_FLOOR_STEPS`, **by value**:
+/// * unset (or unparseable) → [`DEFAULT_PREFILL_FLOOR_STEPS`] — the floor is
+///   ON by default, because the starvation it lifts is the default behaviour;
+/// * `0` → `None`, the kill-switch: reproduces the pre-floor selection
+///   exactly, key for key;
+/// * any other `n` → `Some(n)`.
 fn prefill_starvation_floor() -> Option<usize> {
     static FLOOR: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *FLOOR.get_or_init(|| {
-        std::env::var("ARC_PREFILL_FLOOR_STEPS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|n| *n > 0)
-    })
+    *FLOOR.get_or_init(|| floor_from(std::env::var("ARC_PREFILL_FLOOR_STEPS").ok().as_deref()))
+}
+
+/// The decision itself, separated from the process-global `OnceLock` and the
+/// environment so both sides of the default can be pinned by a test.
+fn floor_from(raw: Option<&str>) -> Option<usize> {
+    match raw.map(str::parse::<usize>) {
+        Some(Ok(0)) => None,
+        Some(Ok(n)) => Some(n),
+        Some(Err(_)) | None => Some(DEFAULT_PREFILL_FLOOR_STEPS),
+    }
 }
 
 #[derive(Default)]
@@ -769,7 +787,6 @@ mod tests {
         seq
     }
 
-
     /// A sequence the scheduler has admitted but not yet prefilled.
     fn prompt_of_len(id: usize, n_toks: usize) -> Sequence {
         let seq = seq_of_len(id, n_toks);
@@ -835,11 +852,35 @@ mod tests {
         );
     }
 
-    /// The knob off is the previous selection, key for key — asserted against
-    /// the same fixture rather than argued.
+    /// The kill-switch (`ARC_PREFILL_FLOOR_STEPS=0` → `floor: None`) is the
+    /// previous selection, key for key — asserted against the same fixture
+    /// rather than argued. Note "unset" no longer means this: unset is the
+    /// default floor of 4 (see `floor_from`); `0` is how today's behaviour is
+    /// restored.
     #[test]
-    fn the_floor_unset_reproduces_the_previous_selection() {
+    fn the_floor_disabled_reproduces_the_previous_selection() {
         assert_eq!(prompt_steps_won(None, 12), 0);
+    }
+
+    /// The env mapping behind the default, both sides pinned:
+    /// unset → the default floor (ON), `0` → the kill-switch (OFF, historical
+    /// selection), a number → itself, garbage → the default rather than a
+    /// silent disable.
+    ///
+    /// Mutation check (run 2026-08-21): revert `floor_from`'s `None` arm to the
+    /// pre-change `.filter(|n| *n > 0)` shape (unset → `None`) and this fails
+    /// on the first assertion with `left: None, right: Some(4)`.
+    #[test]
+    fn the_floor_defaults_on_and_zero_is_the_kill_switch() {
+        assert_eq!(floor_from(None), Some(DEFAULT_PREFILL_FLOOR_STEPS));
+        assert_eq!(floor_from(Some("0")), None, "0 must cleanly disable");
+        assert_eq!(floor_from(Some("7")), Some(7));
+        assert_eq!(
+            floor_from(Some("not-a-number")),
+            Some(DEFAULT_PREFILL_FLOOR_STEPS),
+            "garbage must fall back to the default, not silently disable the floor"
+        );
+        assert_eq!(DEFAULT_PREFILL_FLOOR_STEPS, 4);
     }
 
     /// Advance a scheduled sequence by one decoded token, as the engine would.
@@ -910,6 +951,73 @@ mod tests {
         assert_eq!(
             on_width, N,
             "a ragged decode cohort must run whole; got {on_width}/{N}"
+        );
+    }
+
+    /// 🔑 The cohort-can-only-shrink defect, and its fix, in one fixture: a
+    /// formed decode cohort at length 500 plus ONE newcomer at length 100.
+    ///
+    /// With exact-length bucketing the newcomer can never join: coalescing is
+    /// refused (`(9-1)*400 = 3200 > 1*256`), greedy priority keeps the cohort
+    /// (`8*log2(500) >> 1*log2(100)`), and running the cohort *grows* the gap
+    /// by one every step — so the newcomer idles forever and cohorts only
+    /// shrink. Every published B=256 number under this regime came from a
+    /// synthetic uniform burst, because a real arrival process can never refill
+    /// a cohort.
+    ///
+    /// With ragged decode on, every decode sequence keys to one bucket and the
+    /// newcomer is admitted into the running set the same step.
+    ///
+    /// Mutation check (run 2026-08-21): pin `len` to `seq.cache_bucket_len()`
+    /// (reverting the `ragged_decode` arm at the top of
+    /// `bucket_and_waitlist_seqs_waiting`) and the ON arm fails with
+    /// `on: 8/9` — the newcomer is waitlisted again. The OFF arm is asserted
+    /// in the same run, so a fixture that stopped being ragged also fails.
+    #[test]
+    fn a_formed_cohort_admits_a_newcomer_when_ragged_decode_is_on() {
+        use crate::kv_cache::ragged_decode_test_override as flag;
+        let logger = IntervalLogger::new(Duration::from_secs(3600), None);
+
+        let running_ids_with = |on: bool| -> Vec<usize> {
+            flag::with(on, || {
+                let mut sched: DefaultScheduler<VecDeque<Sequence>> = DefaultScheduler::new(
+                    DefaultSchedulerMethod::Fixed(NonZeroUsize::new(128).unwrap()),
+                );
+                // The formed cohort: eight decoding sequences at length 500.
+                for i in 0..8 {
+                    sched.add_seq(seq_of_len(i, 500));
+                }
+                // The newcomer: decoding at length 100 (freshly prefilled and
+                // far behind the cohort — the shape coalescing refuses).
+                sched.add_seq(seq_of_len(8, 100));
+                // A waiting request, so selection runs the non-discrete
+                // arrival path (the discrete no-waiting path is min-length
+                // catch-up, a different regime with its own test).
+                let waiter = seq_of_len(9, 300);
+                waiter.set_state(SequenceState::Waiting);
+                sched.add_seq(waiter);
+                let out = DefaultScheduler::schedule(&mut sched, &logger);
+                out.completion.into_vec().iter().map(|s| *s.id()).collect()
+            })
+        };
+
+        let off = running_ids_with(false);
+        assert!(
+            !off.contains(&8) && off.len() == 8,
+            "fixture guard: with exact-length bucketing the newcomer must be \
+             waitlisted behind the cohort, got {off:?} — otherwise the ON arm \
+             proves nothing"
+        );
+
+        let on = running_ids_with(true);
+        assert_eq!(
+            on.len(),
+            9,
+            "ragged decode must run the cohort AND the newcomer together, got {on:?}"
+        );
+        assert!(
+            on.contains(&8),
+            "the newcomer must be in the running set, got {on:?}"
         );
     }
 
