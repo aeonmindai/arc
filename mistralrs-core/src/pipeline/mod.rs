@@ -508,6 +508,12 @@ impl ForwardInputsResult {
 pub(crate) static LOGITS_HOST_COPIES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Serialises tests that assert on [`LOGITS_HOST_COPIES`] deltas: the counter
+/// is process-global and `cargo test` runs tests concurrently, so two
+/// counter-delta tests interleaving would read each other's increments.
+#[cfg(test)]
+pub(crate) static LOGITS_HOST_COPIES_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Move a batched forward result to `host` with a **single** transfer, before
 /// it is split into per-sequence views.
 ///
@@ -1964,6 +1970,9 @@ mod host_copy_tests {
 
     #[test]
     fn batched_host_copy_is_o1_in_batch_while_the_old_order_was_o_b_squared() {
+        let _serial = LOGITS_HOST_COPIES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // 7 is equal to none of the batch sizes used below and coprime with
         // all of them, so no assertion can pass by `b * v` aliasing `v`, `b`,
         // or `v * b` (DOCTRINE D12: the fixture must discriminate).
@@ -2086,6 +2095,241 @@ mod host_copy_tests {
                 "raw logits / embeddings always return to the host"
             );
         }
+    }
+}
+
+/// `ARC_SAMPLE_ON_DEVICE`'s partitioned split: copy discipline and seeded
+/// token parity, on CPU-checkable fixtures.
+///
+/// On a CPU fixture every "device-resident" row re-enters the same CPU
+/// sampling code, so what these tests prove is exactly the CPU-checkable
+/// half: the partition itself — row routing, ordering, and the one-batched-
+/// copy discipline — cannot change a sampled token or move more bytes than
+/// the rows it ships. GPU-side fast-path behaviour is the `Sampler`'s
+/// existing contract, not established here (D14).
+#[cfg(test)]
+mod device_sampling_split_tests {
+    use super::*;
+    use crate::sampler::Sampler;
+    use candle_core::{CpuStorage, Storage};
+    use rand::SeedableRng;
+    use rand_isaac::Isaac64Rng;
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+
+    /// Elements candle would move across a device boundary for `t`: the whole
+    /// backing storage, not `t.elem_count()` (see `host_copy_tests`).
+    fn storage_elems(t: &Tensor) -> usize {
+        let (storage, _layout) = t.storage_and_layout();
+        match &*storage {
+            Storage::Cpu(CpuStorage::F32(v)) => v.len(),
+            _ => panic!("fixture must be a CPU F32 tensor"),
+        }
+    }
+
+    /// `[b, 1, v]` ramp `0..b*v`: every row identifies itself, so any
+    /// host-position mapping error in the gather produces a visible wrong
+    /// slice rather than a coincidentally-equal one.
+    fn batch(b: usize, v: usize) -> Tensor {
+        let vals: Vec<f32> = (0..b * v).map(|x| x as f32).collect();
+        Tensor::from_vec(vals, (b, 1, v), &Device::Cpu).unwrap()
+    }
+
+    fn row_values(t: &Tensor) -> Vec<f32> {
+        t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    #[test]
+    fn mixed_batch_gathers_only_the_cpu_rows_in_one_copy() {
+        let _serial = LOGITS_HOST_COPIES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        const B: usize = 6;
+        const V: usize = 7;
+        let logits = batch(B, V);
+        let eligible = [true, false, true, false, false, true];
+        let n_cpu = 3usize;
+
+        let before = LOGITS_HOST_COPIES.load(Ordering::Relaxed);
+        let rows = split_batched_logits_for_sampling(&logits, &eligible).unwrap();
+        assert_eq!(
+            LOGITS_HOST_COPIES.load(Ordering::Relaxed) - before,
+            1,
+            "a mixed batch is ONE batched copy, not one per CPU row"
+        );
+
+        assert_eq!(rows.len(), B);
+        for (k, row) in rows.iter().enumerate() {
+            assert_eq!(row.dims(), &[1, V], "row {k} shape");
+            let expect: Vec<f32> = (k * V..(k + 1) * V).map(|x| x as f32).collect();
+            assert_eq!(row_values(row), expect, "row {k} carries the wrong data");
+            if eligible[k] {
+                // Device-resident rows are views over the original storage:
+                // zero bytes moved for them.
+                assert_eq!(
+                    storage_elems(row),
+                    B * V,
+                    "row {k}: an eligible row must stay a view of the batch"
+                );
+            } else {
+                // CPU-bound rows share the gathered storage: exactly the
+                // selected rows crossed, not the batch (and not O(B²)).
+                assert_eq!(
+                    storage_elems(row),
+                    n_cpu * V,
+                    "row {k}: the gather must materialise ONLY the CPU rows"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_eligible_moves_nothing_and_none_eligible_matches_flag_off() {
+        let _serial = LOGITS_HOST_COPIES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        const B: usize = 4;
+        const V: usize = 5;
+        let logits = batch(B, V);
+
+        // All rows terminate on device: no host copy at all.
+        let before = LOGITS_HOST_COPIES.load(Ordering::Relaxed);
+        let rows = split_batched_logits_for_sampling(&logits, &[true; B]).unwrap();
+        assert_eq!(
+            LOGITS_HOST_COPIES.load(Ordering::Relaxed) - before,
+            0,
+            "an all-eligible batch must not touch the host"
+        );
+        for (k, row) in rows.iter().enumerate() {
+            assert_eq!(storage_elems(row), B * V, "row {k} must be a view");
+        }
+
+        // No row terminates on device: one whole-batch copy — the flag-off
+        // behaviour exactly (same counter delta as host_copy_batched_result).
+        let before = LOGITS_HOST_COPIES.load(Ordering::Relaxed);
+        let rows = split_batched_logits_for_sampling(&logits, &[false; B]).unwrap();
+        assert_eq!(
+            LOGITS_HOST_COPIES.load(Ordering::Relaxed) - before,
+            1,
+            "an all-CPU batch is one batched copy, exactly like flag-off"
+        );
+        for (k, row) in rows.iter().enumerate() {
+            let expect: Vec<f32> = (k * V..(k + 1) * V).map(|x| x as f32).collect();
+            assert_eq!(row_values(row), expect, "row {k} after whole-batch copy");
+        }
+    }
+
+    /// Seeded sampling through the partition must produce IDENTICAL tokens to
+    /// the flag-off path (batched host copy + `index_bs` split), row for row,
+    /// for any eligibility mask. Rows sample in row order on a shared seeded
+    /// rng in both paths, so any reordering, extra draw, or wrong-row routing
+    /// shifts the stream and fails.
+    #[test]
+    fn seeded_tokens_identical_to_the_flag_off_split() {
+        // Not asserting on counter deltas, but this test INCREMENTS the
+        // global counter (both split paths), so it must still serialise with
+        // the tests that do assert.
+        let _serial = LOGITS_HOST_COPIES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        const B: usize = 4;
+        const V: usize = 64;
+
+        // Deterministic spread-out logits (LCG as in sampler parity tests).
+        let mut state: u64 = 0xA5A5 ^ 0xDEAD_BEEF_CAFE_F00D;
+        let vals: Vec<f32> = (0..B * V)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 32) as u32 as f32 / u32::MAX as f32) * 12.0 - 6.0
+            })
+            .collect();
+        let logits = Tensor::from_vec(vals, (B, 1, V), &Device::Cpu).unwrap();
+
+        // One sampler shape per row: greedy, top-k, server defaults, top-p.
+        let mk = |temperature: Option<f64>, top_k: i64, top_p: f64| {
+            Sampler::new(
+                temperature,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                top_k,
+                top_p,
+                0.0,
+                None,
+                vec![],
+                None,
+            )
+            .unwrap()
+        };
+        let samplers = [
+            mk(None, -1, 1.0),
+            mk(Some(0.7), 8, 1.0),
+            mk(Some(1.0), -1, 1.0),
+            mk(Some(0.7), -1, 0.9),
+        ];
+
+        // Mirrors `sample_sequence`'s per-row prologue.
+        let sample_rows = |rows: &[Tensor]| -> Vec<u32> {
+            let rng = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(42)));
+            rows.iter()
+                .zip(samplers.iter())
+                .map(|(row, sampler)| {
+                    let row = row
+                        .squeeze(0)
+                        .unwrap()
+                        .to_dtype(DType::F32)
+                        .unwrap();
+                    sampler
+                        .sample(row, &[1u32, 2, 3], false, rng.clone(), false, true)
+                        .unwrap()
+                        .token
+                })
+                .collect()
+        };
+
+        // Flag-off: batched host copy, then the per-sequence split.
+        let flag_off_rows: Vec<Tensor> = {
+            let host = host_copy_batched_result(
+                ForwardInputsResult::CausalGeneration {
+                    logits: logits.clone(),
+                },
+                B,
+                &Device::Cpu,
+            )
+            .unwrap();
+            (0..B)
+                .map(|k| match host.index_bs(k).unwrap() {
+                    ForwardInputsResult::CausalGeneration { logits } => logits,
+                    _ => unreachable!(),
+                })
+                .collect()
+        };
+        let expected = sample_rows(&flag_off_rows);
+
+        // Flag-on, under every mask shape the partition can take.
+        for mask in [
+            [true, true, true, true],
+            [false, false, false, false],
+            [true, false, true, false],
+            [false, true, false, true],
+        ] {
+            let rows = split_batched_logits_for_sampling(&logits, &mask).unwrap();
+            assert_eq!(
+                sample_rows(&rows),
+                expected,
+                "mask {mask:?}: partitioned rows must sample the same tokens"
+            );
+        }
+
+        // Pin the expected tokens: if the sampler's rng consumption ever
+        // changes shape, this fails here rather than passing vacuously as
+        // both-sides-moved parity.
+        assert_eq!(expected, vec![23, 42, 31, 22], "seeded fixture drifted");
     }
 }
 
