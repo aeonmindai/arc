@@ -1600,7 +1600,10 @@ pub(crate) fn tcfrag2b_layout_for(dev: &candle_core::CudaDevice) -> Option<Tcfra
     if !ffi::HAVE_QTIP_KERNELS || !tcfrag2b_enabled() {
         return None;
     }
-    let ctx = dev.cuda_stream().context();
+    // Bind the stream: `dev.cuda_stream()` returns a temporary whose context
+    // borrow would not outlive the statement.
+    let stream = dev.cuda_stream();
+    let ctx = stream.context();
     let major = ctx
         .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
         .ok()?;
