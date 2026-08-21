@@ -142,6 +142,34 @@ impl QuantMethod for BlockwiseFP8Linear {
             weight,
             self.bias.clone(),
         )))?;
+
+        // 🔴 FLATTEN TO 2-D FIRST — the native branch above already does this at
+        // the top of `forward`, and this branch did not.
+        //
+        // V4's activation is rank-3 `[B, T, hidden]`. Passed through untouched,
+        // `UnquantLinear::forward` takes `w.broadcast_left(B)` and, because bias
+        // is `None` on every V4 linear, dispatches `cublaslt.batch_matmul` with
+        // `stride_b = 0`. At decode T=1, so that is a **B-way batched GEMM with
+        // m=1** — a batched GEMV wearing a GEMM's name, which is the one shape
+        // cuBLASLt has no advantage in. The documented 27x was measured at
+        // prefill, where `[1, 512, hidden]` collapses to batch=1 and the call is
+        // a genuine `[512, hidden] x [hidden, N]` GEMM.
+        //
+        // Without this, lowering `ARC_FP8_CUBLAS_MIN_M` measures the batched-GEMV
+        // path and concludes "cuBLASLt loses at decode" — a wrong conclusion
+        // drawn from a shape the threshold change was never meant to select.
+        // Flattening makes the two branches comparable, which is the whole
+        // premise of the A/B.
+        let orig_dims = x.dims().to_vec();
+        if orig_dims.len() > 2 {
+            let features = orig_dims[orig_dims.len() - 1];
+            let rows: usize = orig_dims[..orig_dims.len() - 1].iter().product();
+            let out = unquant.forward(&x.reshape((rows, features))?)?;
+            let out_features = out.dim(out.rank() - 1)?;
+            let mut new_dims = orig_dims[..orig_dims.len() - 1].to_vec();
+            new_dims.push(out_features);
+            return out.reshape(new_dims);
+        }
         unquant.forward(x)
     }
 
