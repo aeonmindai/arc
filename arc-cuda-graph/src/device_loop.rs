@@ -1224,13 +1224,24 @@ pub fn device_loop_eligible() -> bool {
 /// back — a token left here would be handed to the *next* sequence as if it
 /// were its own. That is the "+1-step divergence" failure mode with a different
 /// name, so it gets an explicit call rather than a lifetime.
+///
+/// The sequence-completion half of that contract is enforced at ONE funnel:
+/// `mistralrs-core`'s `Sequence::set_state` calls [`stand_down`] on every
+/// transition out of the running set (`Done`, `Error`, `FinishedAborted`,
+/// `FinishedIgnored`, `Waiting`, `Swapped`), which is why this crate's
+/// dependency in `mistralrs-core` is deliberately not optional — the funnel
+/// and its leak test compile and run on hosts without CUDA. The tests here
+/// cover only this function's own behaviour; the call-site wiring is covered
+/// by `pipeline/sampling.rs`'s `device_loop_cross_sequence_leak_tests`.
 pub fn clear_pending_tokens() {
     PENDING_TOKENS.with(|q| q.borrow_mut().clear())
 }
 
 /// Stand down completely: forget parked tokens and mark the current sequence
 /// ineligible. Call on fall-back, on sequence completion, and on any error, so
-/// the next sequence starts from a clean slate.
+/// the next sequence starts from a clean slate. Sequence completion — every
+/// transition out of the running set — calls this from the
+/// `Sequence::set_state` funnel; see [`clear_pending_tokens`].
 pub fn stand_down() {
     clear_pending_tokens();
     set_device_loop_eligible(false);

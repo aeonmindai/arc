@@ -548,7 +548,12 @@ pub async fn sample_and_add_toks(
 /// refuses.
 // `&mut` only because `Sequence::sampler()` takes `&mut self` (`sequence.rs:885`)
 // to hand back a clone of an `Arc`. Nothing here mutates the sequence.
-#[cfg(feature = "cuda")]
+//
+// Deliberately NOT `cfg(feature = "cuda")`: only the CUDA plumbing can *park*
+// tokens, but the take/stand-down half is plain host code, and gating it made
+// the cross-request leak untestable on every machine that reviewed it. On a
+// non-CUDA build nothing ever parks, `take_pending_token` is always `None`,
+// and this is one thread-local read per sample.
 fn device_loop_pre_sampled_token(
     seq: &mut Sequence,
     return_logprobs: bool,
@@ -571,16 +576,6 @@ fn device_loop_pre_sampled_token(
         bytes: None,
         top_logprobs: None,
     })
-}
-
-/// Without CUDA there is no device loop, so nothing is ever pre-sampled.
-#[cfg(not(feature = "cuda"))]
-fn device_loop_pre_sampled_token(
-    _seq: &mut Sequence,
-    _return_logprobs: bool,
-    _sample_speculative: bool,
-) -> Option<Logprobs> {
-    None
 }
 
 /// Async sample optionally adding to trie.
@@ -991,5 +986,225 @@ mod speculative_verification_tests {
              distribution — it is returning an argmax, not a sample",
             seen.len()
         );
+    }
+}
+
+/// ArcInfer/ArcGraph: a device-loop burst that outlives its sequence must
+/// never reach the next sequence.
+///
+/// The burst runs with `eos_token_id = -1` (`device_decode_burst` passes -1,
+/// so no on-device EOS truncation ever fires) and parks its full length; the
+/// engine drains one token per step. A sequence that stops mid-burst — stop
+/// string, `max_tokens`, cancel, error — leaves the tail parked, and
+/// `device_loop_pre_sampled_token` hands parked tokens to whichever eligible
+/// sequence samples next, **including the next request's first sample after
+/// its prefill**. That is one user's tokens inside another user's response.
+///
+/// The fix under test is the funnel: `Sequence::set_state` stands the device
+/// loop down on every transition out of the running set. These tests drive the
+/// REAL `sample_sequence` path, so they fail loudly if that call is removed —
+/// unlike the arc-cuda-graph unit tests, which only ever exercised
+/// `clear_pending_tokens` itself, not that anything calls it.
+#[cfg(test)]
+mod device_loop_cross_sequence_leak_tests {
+    use super::*;
+    use crate::sampler::Sampler;
+    use crate::sequence::{SeqStepType, SequenceGroup, SequenceState, StopReason};
+    use candle_core::Device;
+    use rand::SeedableRng;
+    use std::cell::RefCell;
+
+    const VOCAB: usize = 32;
+    /// Argmax of every logits tensor handed to sequence A.
+    const PEAK_A: u32 = 7;
+    /// Argmax of every logits tensor handed to sequence B. Distinct from
+    /// `PEAK_A` and from the burst, so the origin of B's token is unambiguous.
+    const PEAK_B: u32 = 9;
+    /// The burst sequence A's device loop parked. A drains the first token,
+    /// then stops mid-burst, leaving `[22, 23, 24]`.
+    const BURST: [i32; 4] = [21, 22, 23, 24];
+
+    thread_local! {
+        /// Keeps each fixture sequence's `Receiver` alive; a dropped receiver
+        /// models a disconnected client and would silently change behaviour.
+        static LIVE_CLIENTS: RefCell<Vec<tokio::sync::mpsc::Receiver<crate::response::Response>>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    /// A greedy-trivial sequence: no temperature, penalties, bias, processors
+    /// or recognizer — exactly the shape `device_loop_pre_sampled_token`
+    /// accepts, so the pending queue is live for it.
+    fn greedy_seq() -> Sequence {
+        let (dummy_sender, rx) = tokio::sync::mpsc::channel(1);
+        LIVE_CLIENTS.with(|k| k.borrow_mut().push(rx));
+        let group = Arc::new(std::sync::Mutex::new(SequenceGroup::new(
+            1, false, false, None,
+        )));
+        let sampler = Sampler::new(
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            -1,
+            1.0,
+            0.0,
+            None,
+            vec![],
+            None,
+        )
+        .unwrap();
+        Sequence::new_waiting(
+            vec![1u32; 4],
+            String::new(),
+            0,
+            0,
+            1,
+            dummy_sender,
+            sampler,
+            vec![],
+            vec![],
+            None,
+            false,
+            false,
+            group,
+            0,
+            0,
+            SequenceRecognizer::None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            SeqStepType::PromptAndDecode,
+            None,
+            None,
+            None,
+            false,
+            vec![],
+        )
+    }
+
+    /// `(1, 1, VOCAB)` logits peaking hard at `peak` — the shape
+    /// `sample_sequence` receives for one decode step of one sequence.
+    fn peaked_logits(peak: u32) -> Tensor {
+        let mut raw = vec![0f32; VOCAB];
+        raw[peak as usize] = 20.0;
+        Tensor::from_vec(raw, (1, 1, VOCAB), &Device::Cpu).unwrap()
+    }
+
+    async fn sample(seq: &mut Sequence, peak: u32, rng: &Arc<std::sync::Mutex<Isaac64Rng>>) -> u32 {
+        sample_sequence(
+            peaked_logits(peak),
+            seq,
+            false,
+            rng.clone(),
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap()
+        .token
+    }
+
+    /// THE leak test: A parks a burst, stops mid-burst on a non-fallback path
+    /// (`max_tokens` → `StopReason::Length`, the transition
+    /// `finish_or_add_toks_to_seq` performs at `sampling.rs:267`/`:277`), and
+    /// B's first sample must consume nothing of A's.
+    ///
+    /// Mutation check (run both ways before shipping): with the
+    /// `stand_down` arm removed from `Sequence::set_state`, this fails at the
+    /// queue assertion with 3 parked tokens, and B's first token comes back
+    /// `22` — A's first undrained parked id — instead of `PEAK_B`.
+    #[tokio::test]
+    async fn a_sequence_stopping_mid_burst_leaks_nothing_into_the_next_sequence() {
+        // This thread's queue, not shared with other tests (thread-local).
+        arc_cuda_graph::stand_down();
+        let rng = Arc::new(std::sync::Mutex::new(Isaac64Rng::seed_from_u64(0)));
+
+        // ── Sequence A, decode step N: queue empty, host argmax, and the
+        // pre-hook publishes A's eligibility — the same order the engine
+        // runs (sample N publishes, forward N+1 bursts).
+        let mut seq_a = greedy_seq();
+        assert_eq!(sample(&mut seq_a, PEAK_A, &rng).await, PEAK_A);
+
+        // ── Forward N+1: the burst parks its FULL length (eos -1).
+        arc_cuda_graph::push_pending_tokens(&BURST);
+
+        // ── Step N+1's sample drains one parked token. This is the control
+        // that proves the pending-token path is LIVE in this build: if the
+        // pre-hook were compiled out or inert, this would return `PEAK_A`
+        // and the leak below could never manifest — a test that cannot fail.
+        assert_eq!(
+            sample(&mut seq_a, PEAK_A, &rng).await,
+            BURST[0] as u32,
+            "the device-loop take path is not live in this build; the leak assertions below \
+             would be vacuous"
+        );
+
+        // ── A stops MID-BURST via a non-fallback path: max_tokens.
+        seq_a.set_state(SequenceState::Done(StopReason::Length(2)));
+
+        // ── The claim, part 1: nothing of A's survives its completion.
+        assert_eq!(
+            arc_cuda_graph::pending_token_count(),
+            0,
+            "sequence A finished mid-burst but its parked tokens survived; the next \
+             sequence's first sample will consume them"
+        );
+
+        // ── Sequence B's FIRST sample (the one right after its prefill).
+        let mut seq_b = greedy_seq();
+        let b_first = sample(&mut seq_b, PEAK_B, &rng).await;
+
+        // ── The claim, part 2: B's token comes from B's own logits and is
+        // none of A's parked ids.
+        assert!(
+            !BURST.contains(&(b_first as i32)),
+            "cross-request token leak: sequence B's first sampled token is {b_first}, one of \
+             sequence A's parked burst tokens"
+        );
+        assert_eq!(
+            b_first, PEAK_B,
+            "sequence B's first token must be the argmax of B's own logits"
+        );
+    }
+
+    /// Every transition out of the running set clears the queue — not just
+    /// `Done(Length)`. This pins the whole funnel map: client cancel,
+    /// forward-error/panic recovery (`Error`), PagedAttention eviction
+    /// (`FinishedAborted`/`FinishedIgnored`), and preemption
+    /// (`Waiting`/`Swapped`), where consuming the stale burst after
+    /// re-prefill would duplicate output.
+    #[tokio::test]
+    async fn every_transition_out_of_the_running_set_clears_parked_tokens() {
+        for state in [
+            SequenceState::Done(StopReason::Canceled),
+            SequenceState::Done(StopReason::StopString {
+                stop_string_idx: 0,
+                completion_bytes_pos: 0,
+            }),
+            SequenceState::Error,
+            SequenceState::FinishedAborted,
+            SequenceState::FinishedIgnored,
+            SequenceState::Waiting,
+            SequenceState::Swapped,
+        ] {
+            arc_cuda_graph::stand_down();
+            arc_cuda_graph::push_pending_tokens(&BURST);
+            assert_eq!(arc_cuda_graph::pending_token_count(), BURST.len());
+            let seq = greedy_seq();
+            seq.set_state(state);
+            assert_eq!(
+                arc_cuda_graph::pending_token_count(),
+                0,
+                "transition to {state:?} left parked tokens for the next sequence"
+            );
+        }
     }
 }

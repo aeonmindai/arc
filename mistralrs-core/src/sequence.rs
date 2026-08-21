@@ -1085,6 +1085,41 @@ impl Sequence {
             let mut group = get_mut_group!(self);
             group.n_choices = group.n_choices.saturating_sub(1);
         }
+        // ArcInfer/ArcGraph: this is the one funnel every path that takes a
+        // sequence out of the running set passes through — EOS / stop-token /
+        // stop-string / length / tool-calls (`pipeline/sampling.rs`
+        // `finish_or_add_toks_to_seq`), the schedulers' disconnected-client
+        // sweeps and `TERMINATE_ALL_NEXT_STEP` (`Done(Canceled)`), the
+        // engine's forward-error and panic recovery (`SequenceState::Error`
+        // via `handle_pipeline_forward_error!` / `step_catching_panics`), and
+        // PagedAttention eviction (`FinishedAborted` / `FinishedIgnored` /
+        // `Waiting` / `Swapped`).
+        //
+        // A device decode loop burst runs with `eos_token_id = -1`, so it
+        // always parks its full burst; a sequence that stops mid-burst leaves
+        // tokens parked, and a parked token is handed to the NEXT sequence's
+        // first `sample_sequence` — including the one after its prefill — as
+        // if it were its own. That is one user's tokens in another user's
+        // response, which is why the stand-down happens HERE, on the
+        // transition itself, rather than on N scattered completion paths.
+        //
+        // The pending queue is thread-local to the engine thread that parked
+        // it (the same thread that samples at batch 1); on any other thread
+        // this clears an empty queue, which is a no-op. Clearing on
+        // preemption (`Waiting` / `Swapped`) is deliberate fail-closed: the
+        // sequence re-prefills on re-admission, so its parked tokens are
+        // stale and consuming them would duplicate output.
+        match state {
+            SequenceState::Done(_)
+            | SequenceState::Error
+            | SequenceState::Waiting
+            | SequenceState::FinishedAborted
+            | SequenceState::FinishedIgnored
+            | SequenceState::Swapped => arc_cuda_graph::stand_down(),
+            SequenceState::RunningPrompt
+            | SequenceState::RunningCompletion
+            | SequenceState::RunningPrefillPrompt => {}
+        }
         *self.state.write().unwrap() = state;
     }
 
