@@ -170,6 +170,74 @@ static REGISTRY: &[Capability] = &[
         },
         status: Status::Live,
     },
+    // ── SHIPPED OFF, WITH A NAMED EXPERIMENT ────────────────────────────────
+    //
+    // This entry is `Live` because the GATE is reached on every layer of every
+    // step — that is what this file checks, and it must not go dark. What is
+    // switched off is the gate's DEFAULT ANSWER at `batch > 1`, which no
+    // reachability check can see.
+    //
+    // Recorded here anyway, because "built, correct, tested, and switched off"
+    // is this repo's most expensive failure mode and this file is where someone
+    // goes looking for it. 26 pieces of finished work are parked that way right
+    // now, including a complete GPU sampler with zero callers; we shipped
+    // 34 tok/s of landed work while master served 17, for exactly this reason.
+    //
+    // The kernel is batch-correct by construction and the dispatch bug that
+    // kept it dead above batch 1 (`seqlen_offsets.len() != 1` — the LENGTH of
+    // the vector where the property needed is the DISTINCTNESS of its values)
+    // is fixed. It is off only because fixing that gate makes a CUDA kernel
+    // live on a path it has never run on, and this repo has paid for that twice
+    // in one week: TCFRAG (default-ON, "UNVERIFIED ON HARDWARE — NEVER RUN" in
+    // its own header, 63 GB held, a layer permanently broken, retired by #209)
+    // and the fused-512 attention path (four days silently dropping the
+    // attention mask at 12% agreement).
+    //
+    //   flag  ARC_QK_FUSED_COHORT=1
+    //   gate  cuda/qk_norm_rope.rs :: fused_cohort_enabled_from
+    //   test  one binary, B>1 decode, same prompt and seed, flag set vs unset;
+    //         ARC_QK_VERIFY=1 bit-compares fused against eager at every layer
+    //   pass  outputs bit-identical AND the fused arm faster; engagement
+    //         counter (`qk::engaged_count`) non-zero, since a silently
+    //         declining fast path reports a perfect no-op
+    //   was   never measured above batch 1 — the path was unreachable, so there
+    //         is no prior number to quote, honest or otherwise
+    //   then  the default flips to ON in the same change that records the
+    //         number. Leaving it off after a passing measurement is a failure
+    //         state, not the finish line.
+    Capability {
+        name: "fused qk_norm_rope at B>1: built and tested, default OFF pending one measurement",
+        parent: "ArcInfer / ArcAttention",
+        check: Check::Symbol {
+            symbol: "fused_cohort_enabled",
+            defined_in: "mistralrs-core/src/cuda/qk_norm_rope.rs",
+        },
+        status: Status::Live,
+    },
+    // Same shape as the entry above, same doctrine, one rung lower in the
+    // stack: the V4 rotary's RAGGED arm. Uniform cohorts already take one
+    // batched `rope_i` unconditionally (that dispatch is exact and shipped
+    // ON); this flag governs rows at genuinely different positions, which the
+    // per-sequence loop served at ~9 ops × 43 layers × B per step. The
+    // gathered rank-3 path is bit-identical to the loop
+    // (`deepseek_ragged_cohort_tests`) and default OFF until measured.
+    //
+    //   flag  ARC_ROPE_COHORT=1 (read by value via env_flag_is_set)
+    //   gate  layers.rs :: rope_cohort_enabled
+    //   test  one binary, ragged B>1 decode (ARC_MTP_PER_SEQ_KV on, or any
+    //         producer of unequal offsets), flag set vs unset
+    //   pass  outputs bit-identical AND the gathered arm faster;
+    //         rope_cohort_stats::counts() shows cohort > 0 on the flagged arm
+    //   then  the default flips in the same change that records the number
+    Capability {
+        name: "ragged-cohort RoPE: one gathered rope_i for unequal offsets, default OFF",
+        parent: "ArcInfer / ArcAttention",
+        check: Check::Symbol {
+            symbol: "rope_cohort_enabled",
+            defined_in: "mistralrs-core/src/layers.rs",
+        },
+        status: Status::Live,
+    },
     Capability {
         name: "prefill admission cap (--prefill-max-seqs)",
         parent: "ArcInfer / ArcSched",

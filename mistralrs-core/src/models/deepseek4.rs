@@ -1287,9 +1287,21 @@ impl Attention {
         if cos.dtype() != candle_core::DType::BF16 || sin.dtype() != candle_core::DType::BF16 {
             decline!("RoPE tables are not BF16");
         }
-        if seqlen_offsets.len() != 1 {
+        // The kernel needs ONE `pos_offset`, not a batch of one row. It reads
+        // the table at `pos_offset + t` where `t = blockIdx.y % seq_len`
+        // (`qk_norm_rope.cu`), a position that does not depend on `b`, and its
+        // grid is `(n_heads + 1, batch * seq_len)` with buffers sized
+        // `batch * ...` — so it is already correct at any batch size whose rows
+        // share an offset. This used to read `seqlen_offsets.len() != 1`, which
+        // tested the length of the vector rather than the distinctness of its
+        // values and therefore declined at EVERY batch size above one, leaving
+        // the fused path dead in exactly the serving regime it was written for.
+        // Rows that genuinely differ still decline, and still take the eager
+        // chain. Prove the swap with `ARC_QK_VERIFY=1`, which bit-compares
+        // against the eager output at every layer.
+        let Some(uniform_offset) = crate::layers::uniform_seqlen_offset(seqlen_offsets) else {
             decline!("per-sequence position offsets");
-        }
+        };
         if self.num_kv_heads != 1 {
             decline!("more than one KV head");
         }
@@ -1318,11 +1330,21 @@ impl Attention {
         if qh != self.num_attention_heads * head_dim {
             decline!("q_proj output width is not n_heads * head_dim");
         }
+        // The batched cohort is OPT-IN. Fixing the length-vs-values gate above
+        // makes this kernel live on a path it has never run on, and this repo
+        // has paid for exactly that twice this week (TCFRAG, and the fused-512
+        // attention path that dropped the mask for four days). `batch == 1` is
+        // untouched — already live, already exercised. See
+        // `qk::fused_cohort_enabled` for the doctrine and for how to turn the
+        // cohort path on once it has been measured on hardware.
+        if qb > 1 && !qk::fused_cohort_enabled() {
+            decline!("batched cohort is opt-in (set ARC_QK_FUSED_COHORT=1)");
+        }
         match kv_normed.dims3() {
             Ok((kb, kt, kh)) if kb == qb && kt == qt && kh == head_dim => {}
             _ => decline!("kv_norm output shape does not match [B, T, head_dim]"),
         }
-        let pos_offset = seqlen_offsets[0];
+        let pos_offset = uniform_offset;
         match cos.dims2() {
             Ok((rows, cols)) if cols == rope_dim / 2 && rows >= pos_offset + qt => {}
             _ => decline!("RoPE table does not cover [pos_offset, pos_offset + T)"),

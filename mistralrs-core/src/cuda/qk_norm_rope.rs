@@ -49,6 +49,60 @@ pub fn fused_enabled() -> bool {
     *ENABLED.get_or_init(|| !matches!(std::env::var("ARC_QK_FUSED").as_deref(), Ok("0")))
 }
 
+/// `ARC_QK_FUSED_COHORT=1` lets the fused kernel serve a **batched** cohort
+/// (`batch > 1`). **Default OFF**, so `batch > 1` declines and takes the eager
+/// chain exactly as it does today.
+///
+/// # Why this is opt-in and [`fused_enabled`] is not
+///
+/// The kernel is batch-correct by construction — `qk_norm_rope.cu` flattens
+/// `(b, t)` into `blockIdx.y`, recovers `b = bt / seq_len`, and reads the table
+/// at `pos_offset + t`, a position independent of `b` — and until #198 the
+/// dispatch gate tested `seqlen_offsets.len() != 1`, the LENGTH of the offset
+/// vector where the property needed is the DISTINCTNESS of its values. So the
+/// fused path was dead at every batch size above one. #198 fixes that gate.
+///
+/// Fixing the gate, though, makes a kernel **live on a path it has never run
+/// on**, and this repo has paid for that twice in one week:
+///
+/// * TCFRAG shipped default-ON with "UNVERIFIED ON HARDWARE — NEVER RUN" in its
+///   own header. It held 63 GB and permanently broke a layer through a poisoned
+///   `OnceLock`; #209 made it opt-in.
+/// * The fused-512 attention path ran for four days silently dropping the
+///   attention mask, at 12% agreement with the reference, because nobody ran
+///   the path it had quietly become live on.
+///
+/// So the doctrine is: **unverified means default-off, and "unverified" means
+/// unmeasured, not new.** `batch == 1` is unaffected — that path is already
+/// live and already exercised. When the cohort path has been measured correct
+/// and faster on hardware (`ARC_QK_VERIFY=1` bit-compares it against the eager
+/// chain at every layer), this default flips and this doc comment goes with it.
+///
+/// Read by VALUE, `== Some("1")`, not by presence: 23 `ARC_*` flags were
+/// converted this week (#212) precisely because `var_os(..).is_some()` made
+/// `ARC_FOO=0` mean ON.
+pub fn fused_cohort_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        fused_cohort_enabled_from(std::env::var("ARC_QK_FUSED_COHORT").ok().as_deref())
+    })
+}
+
+/// Pure half of [`fused_cohort_enabled`], so the polarity is testable without
+/// mutating the process environment.
+///
+/// Same reasoning as `mistralrs_quant::env_flag_value` and
+/// `qtip::tcfrag2b_enabled_from`: mutating the environment from a test is racy
+/// across `cargo test`'s threads and, since the 2024 edition, `unsafe` — and
+/// the caller latches its answer in a `OnceLock`, so such a test would prove
+/// only whatever the first reader in the process happened to see. Testing the
+/// pure function against every input is the only form of this test that means
+/// anything.
+pub fn fused_cohort_enabled_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
 /// `ARC_QK_VERIFY=1` runs the eager chain alongside the fused kernel at every
 /// layer and compares the raw output bytes.
 ///
@@ -442,4 +496,66 @@ static VERIFIED: AtomicU64 = AtomicU64::new(0);
 /// Elements proven bit-identical so far.
 pub fn verified_elements() -> u64 {
     VERIFIED.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod cohort_gate_tests {
+    use super::*;
+
+    /// The batched fused path must be OFF unless explicitly asked for.
+    ///
+    /// This is the assertion that stops a repeat of TCFRAG — default-ON with
+    /// "UNVERIFIED ON HARDWARE — NEVER RUN" in its own header, 63 GB held, a
+    /// layer permanently broken through a poisoned `OnceLock`, retired by #209
+    /// — and of the fused-512 attention path, which ran for four days silently
+    /// dropping the attention mask at 12% agreement with the reference. Both
+    /// were live on a path nobody had run.
+    ///
+    /// These run with no features and no GPU, on three operating systems, on
+    /// every PR, because the polarity is a pure function.
+    #[test]
+    fn the_batched_cohort_is_off_unless_explicitly_enabled() {
+        assert!(
+            !fused_cohort_enabled_from(None),
+            "unset must mean OFF — the cohort path has never run on hardware"
+        );
+        assert!(fused_cohort_enabled_from(Some("1")));
+    }
+
+    /// Read by VALUE, not presence. #212 converted 23 `ARC_*` flags because
+    /// `var_os(..).is_some()` made `ARC_FOO=0` mean ON — which also silently
+    /// cancels any A/B whose control arm sets the flag to zero.
+    #[test]
+    fn zero_means_off_and_so_does_every_other_value() {
+        for v in ["0", "", "false", "no", "off", "true", "yes", "on", "2", "1 "] {
+            assert!(
+                !fused_cohort_enabled_from(Some(v)),
+                "{v:?} must not enable the cohort path; only the exact string \"1\" does"
+            );
+        }
+    }
+
+    /// [`engaged_count`] is the instrument the A/B harness reads to tell "the
+    /// kernel ran" apart from "the benchmark got faster" — and until this
+    /// test, nothing in the tree read it, so it could have silently stopped
+    /// advancing and every claim built on it would still look green. The
+    /// counters are process-global and other tests may bump them
+    /// concurrently, so the assertion is on a lower bound of the delta, which
+    /// only this thread's calls can guarantee.
+    #[test]
+    fn engaged_count_advances_when_the_paths_are_taken() {
+        let (e0, d0) = engaged_count();
+        note_engaged(128, 64, 16, "bf16");
+        note_declined("test: exercising the decline counter");
+        let (e1, d1) = engaged_count();
+        assert!(
+            e1 >= e0 + 1,
+            "note_engaged did not advance the engaged counter ({e0} -> {e1}); \
+             an A/B reading engaged_count() would call a dead path live"
+        );
+        assert!(
+            d1 >= d0 + 1,
+            "note_declined did not advance the declined counter ({d0} -> {d1})"
+        );
+    }
 }
