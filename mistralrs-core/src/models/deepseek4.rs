@@ -1330,6 +1330,16 @@ impl Attention {
         if qh != self.num_attention_heads * head_dim {
             decline!("q_proj output width is not n_heads * head_dim");
         }
+        // The batched cohort is OPT-IN. Fixing the length-vs-values gate above
+        // makes this kernel live on a path it has never run on, and this repo
+        // has paid for exactly that twice this week (TCFRAG, and the fused-512
+        // attention path that dropped the mask for four days). `batch == 1` is
+        // untouched — already live, already exercised. See
+        // `qk::fused_cohort_enabled` for the doctrine and for how to turn the
+        // cohort path on once it has been measured on hardware.
+        if qb > 1 && !qk::fused_cohort_enabled() {
+            decline!("batched cohort is opt-in (set ARC_QK_FUSED_COHORT=1)");
+        }
         match kv_normed.dims3() {
             Ok((kb, kt, kh)) if kb == qb && kt == qt && kh == head_dim => {}
             _ => decline!("kv_norm output shape does not match [B, T, head_dim]"),
