@@ -576,6 +576,82 @@ pub(crate) fn graph_compressed_mask(
     Tensor::cat(&[&raw, &comp], 3)
 }
 
+/// Integer key naming everything the uniform-batch union mask depends on.
+///
+/// The additive `[1, 1, t_q, t_k + t_c]` mask [`dsv4_attention`] builds on the
+/// uniform-batch, non-graph path is a pure function of these fields — the
+/// aranges, casts, compares and the 0/-inf conversion take nothing else as
+/// input — so two calls with equal keys produce bit-identical tensors, and a
+/// cached one is an identity, not an approximation.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct UnionMaskKey {
+    q0: usize,
+    t_q: usize,
+    raw_base: usize,
+    t_k: usize,
+    t_c: usize,
+    ratio: usize,
+    window: usize,
+    dtype: DType,
+    dev: candle_core::DeviceLocation,
+}
+
+/// A handful of slots, FIFO. One step touches at most three distinct keys —
+/// the Standard / CSA / HCA layer classes agree on everything but `t_c` and
+/// `ratio` — so 4 covers a step with a spare, and earlier steps' entries
+/// (whose `q0` has advanced) age out on their own.
+const UNION_MASK_MEMO_SLOTS: usize = 4;
+thread_local! {
+    static UNION_MASK_MEMO: std::cell::RefCell<Vec<(UnionMaskKey, Tensor)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Memoized union-mask lookup: the cached additive mask for `key`, or `build`
+/// run once and cached.
+///
+/// WHY: the union mask was rebuilt from scratch once per LAYER per step. On
+/// the prefill path that is three `Tensor::arange` host-to-device uploads plus
+/// their casts, compares and the 0/-inf conversion (CLAUDE.md pitfall #5 —
+/// each upload is a CPU-to-GPU sync), all recomputing a pure function of
+/// `key`. Every layer of one compress-ratio class shares a key within a step,
+/// so this builds each distinct mask once per step instead of once per layer.
+///
+/// Thread-local, like `GRAPH_BLOCK_IDS` above: the engine drives all layers of
+/// a step from one thread, which is the reuse that matters.
+fn union_mask_memo(key: &UnionMaskKey, build: impl FnOnce() -> Result<Tensor>) -> Result<Tensor> {
+    UNION_MASK_MEMO.with(|c| -> Result<Tensor> {
+        {
+            let cache = c.borrow();
+            if let Some((_, t)) = cache.iter().find(|(k, _)| k == key) {
+                return Ok(t.clone());
+            }
+        }
+        let t = build()?;
+        let mut cache = c.borrow_mut();
+        if cache.len() >= UNION_MASK_MEMO_SLOTS {
+            cache.remove(0);
+        }
+        cache.push((key.clone(), t.clone()));
+        Ok(t)
+    })
+}
+
+/// Boolean `[t_q, n_keys]` validity → additive `[1, 1, t_q, n_keys]` mask
+/// (0 on valid, -inf on invalid) in the compute dtype.
+fn additive_union_mask(
+    valid: &Tensor,
+    t_q: usize,
+    n_keys: usize,
+    dtype: DType,
+    dev: &Device,
+) -> Result<Tensor> {
+    let zeros = Tensor::zeros((t_q, n_keys), dtype, dev)?;
+    let neg_inf = neg_inf_full((t_q, n_keys), dtype, dev)?;
+    valid
+        .where_cond(&zeros, &neg_inf)?
+        .reshape((1, 1, t_q, n_keys))
+}
+
 /// Per-call configuration for V4 hybrid attention.
 #[derive(Debug, Clone, Copy)]
 pub struct Dsv4AttentionConfig<'a> {
@@ -879,83 +955,100 @@ pub fn dsv4_attention(
     // `arange` copies from a HOST pointer, and host-pointer copies are the
     // class that makes a decode step expensive to capture as a CUDA graph.
     let decode_row = t_q == 1;
-    // `qp` outlives this block only to drive the compressed branch's threshold,
-    // and only on the paths that still evaluate that threshold in F32.
-    let qp = if decode_row {
-        None
-    } else {
-        Some(
-            Tensor::arange(q0 as u32, (q0 + t_q) as u32, dev)?
-                .to_dtype(DType::F32)?
-                .reshape((t_q, 1))?,
-        )
+    let ratio = cfg.compress_ratio.ratio();
+    let t_c = match compressed_kv {
+        Some(comp) => comp.dim(2)?,
+        None => 0,
     };
-    let raw_valid = if decode_row {
-        Tensor::ones((t_q, t_k), DType::U8, dev)?
-    } else {
-        let kp = Tensor::arange(raw_base as u32, (raw_base + t_k) as u32, dev)?
-            .to_dtype(DType::F32)?
-            .reshape((1, t_k))?;
-        let qp = qp
-            .as_ref()
-            .expect("qp is built on exactly the `t_q > 1` branch this arm is");
-        let causal = kp.broadcast_le(qp)?;
-        let lower = (qp - window as f64)?;
-        let in_window = kp.broadcast_gt(&lower)?;
-        (causal * in_window)? // [t_q, t_k] (u8)
+    let graph_mode = cfg.graph_positions.is_some();
+
+    // ---- Union validity [t_q, t_k + t_c] (U8), built LAZILY ---------------
+    // On the uniform-batch, non-graph path the additive mask derived from this
+    // is memoized across layers on its integer key (`union_mask_memo`), and a
+    // hit skips this entire build — the prefill path's `arange` uploads, their
+    // casts and every compare included. A miss runs it character-for-character
+    // as before.
+    let build_valid = || -> Result<Tensor> {
+        // `qp` drives the raw window and, on the paths that still evaluate the
+        // compressed branch's threshold in F32, that threshold too.
+        let qp = if decode_row {
+            None
+        } else {
+            Some(
+                Tensor::arange(q0 as u32, (q0 + t_q) as u32, dev)?
+                    .to_dtype(DType::F32)?
+                    .reshape((t_q, 1))?,
+            )
+        };
+        let raw_valid = if decode_row {
+            Tensor::ones((t_q, t_k), DType::U8, dev)?
+        } else {
+            let kp = Tensor::arange(raw_base as u32, (raw_base + t_k) as u32, dev)?
+                .to_dtype(DType::F32)?
+                .reshape((1, t_k))?;
+            let qp = qp
+                .as_ref()
+                .expect("qp is built on exactly the `t_q > 1` branch this arm is");
+            let causal = kp.broadcast_le(qp)?;
+            let lower = (qp - window as f64)?;
+            let in_window = kp.broadcast_gt(&lower)?;
+            (causal * in_window)? // [t_q, t_k] (u8)
+        };
+        if compressed_kv.is_none() {
+            return Ok(raw_valid);
+        }
+        // Compressed branch mask: query r attends compressed block b iff
+        // b < (q0+r+1)/ratio (causal over fully-completed ratio-blocks).
+        let comp_valid = if graph_mode {
+            // Fixed-capacity graph decode: `qp` is derived from the buffer
+            // *capacity*, so this threshold would freeze at a constant (see
+            // `Dsv4AttentionConfig::graph_positions`). Leave the local half
+            // permissive and let the device-derived mask folded in below
+            // carry the real pattern — a `0` here is the additive identity,
+            // so the two compose without double-counting.
+            Tensor::ones((t_q, t_c), DType::U8, dev)?
+        } else {
+            match &qp {
+                // Decode (`t_q == 1`). `q0` is a host value and
+                // `CompressRatio::ratio` is 1 / 4 / 128 — always a power of
+                // two — so `floor((q0 + 1) / ratio)` is exact integer
+                // arithmetic on the host and `bp` can stay in the U32 the
+                // `arange` already produced. Bit-identical to the F32 chain
+                // below: `q0 + 1`, the quotient and every block index are
+                // integers, a power-of-two divide is exact in binary
+                // floating point, and F32 represents every integer below
+                // 2^24 = 16 777 216 — against V4's 163 840-token position
+                // ceiling. Same predicate, same operands, four fewer
+                // launches (a cast, an add, a divide and a floor).
+                None => {
+                    let threshold =
+                        Tensor::new(&[((q0 + 1) / ratio) as u32], dev)?.reshape((1, 1))?;
+                    // The block indices come from the cached `(ratio,
+                    // device)` table at ratio 1, not `Tensor::arange`.
+                    // `compress_positions(t_c, 1, dev)` IS `[0, 1, …, t_c-1]`
+                    // in U32 — bit-identical to the `arange` it replaces —
+                    // but it is a zero-copy `narrow` view of a table built
+                    // once during warmup, so the per-layer host->device copy
+                    // goes away. See `layers::compress_positions`.
+                    crate::layers::compress_positions(t_c, 1, dev)?
+                        .reshape((1, t_c))?
+                        .broadcast_lt(&threshold)? // [1, t_c] (u8)
+                }
+                Some(qp) => {
+                    let bp = Tensor::arange(0u32, t_c as u32, dev)?
+                        .to_dtype(DType::F32)?
+                        .reshape((1, t_c))?;
+                    let threshold = ((qp + 1.0)? / ratio as f64)?.floor()?; // [t_q, 1]
+                    bp.broadcast_lt(&threshold)? // [t_q, t_c] (u8)
+                }
+            }
+        };
+        Tensor::cat(&[&raw_valid, &comp_valid], 1)
     };
 
-    // ---- Build the union key set + validity mask. -------------------------
-    let (k_cat, v_cat, valid) = match compressed_kv {
+    // ---- Build the union key set ------------------------------------------
+    let (k_cat, v_cat) = match compressed_kv {
         Some(comp) => {
-            let t_c = comp.dim(2)?;
-            // Compressed branch mask: query r attends compressed block b iff
-            // b < (q0+r+1)/ratio (causal over fully-completed ratio-blocks).
-            let ratio = cfg.compress_ratio.ratio();
-            let comp_valid = match cfg.graph_positions {
-                // Fixed-capacity graph decode: `qp` is derived from the buffer
-                // *capacity*, so this threshold would freeze at a constant (see
-                // `Dsv4AttentionConfig::graph_positions`). Leave the local half
-                // permissive and let the device-derived mask folded in below
-                // carry the real pattern — a `0` here is the additive identity,
-                // so the two compose without double-counting.
-                Some(_) => Tensor::ones((t_q, t_c), DType::U8, dev)?,
-                None => match &qp {
-                    // Decode (`t_q == 1`). `q0` is a host value and
-                    // `CompressRatio::ratio` is 1 / 4 / 128 — always a power of
-                    // two — so `floor((q0 + 1) / ratio)` is exact integer
-                    // arithmetic on the host and `bp` can stay in the U32 the
-                    // `arange` already produced. Bit-identical to the F32 chain
-                    // below: `q0 + 1`, the quotient and every block index are
-                    // integers, a power-of-two divide is exact in binary
-                    // floating point, and F32 represents every integer below
-                    // 2^24 = 16 777 216 — against V4's 163 840-token position
-                    // ceiling. Same predicate, same operands, four fewer
-                    // launches (a cast, an add, a divide and a floor).
-                    None => {
-                        let threshold =
-                            Tensor::new(&[((q0 + 1) / ratio) as u32], dev)?.reshape((1, 1))?;
-                        // The block indices come from the cached `(ratio,
-                        // device)` table at ratio 1, not `Tensor::arange`.
-                        // `compress_positions(t_c, 1, dev)` IS `[0, 1, …, t_c-1]`
-                        // in U32 — bit-identical to the `arange` it replaces —
-                        // but it is a zero-copy `narrow` view of a table built
-                        // once during warmup, so the per-layer host->device copy
-                        // goes away. See `layers::compress_positions`.
-                        crate::layers::compress_positions(t_c, 1, dev)?
-                            .reshape((1, t_c))?
-                            .broadcast_lt(&threshold)? // [1, t_c] (u8)
-                    }
-                    Some(qp) => {
-                        let bp = Tensor::arange(0u32, t_c as u32, dev)?
-                            .to_dtype(DType::F32)?
-                            .reshape((1, t_c))?;
-                        let threshold = ((qp + 1.0)? / ratio as f64)?.floor()?; // [t_q, 1]
-                        bp.broadcast_lt(&threshold)? // [t_q, t_c] (u8)
-                    }
-                },
-            };
-            let valid = Tensor::cat(&[&raw_valid, &comp_valid], 1)?;
             let k_cat = Tensor::cat(&[k, comp], 2)?.contiguous()?;
             // The second half of the same duplication -- see `v_aliases_k`
             // above. `v_cat` was an unconditional
@@ -969,33 +1062,51 @@ pub fn dsv4_attention(
                 fused_v_stats::record_materialized();
                 Tensor::cat(&[v, comp], 2)?.contiguous()?
             };
-            (k_cat, v_cat, valid)
+            (k_cat, v_cat)
         }
-        None => (k.clone(), v.clone(), raw_valid),
+        None => (k.clone(), v.clone()),
     };
     record_launch_shape("k_cat", k_cat.dims());
     record_launch_shape("v_cat", v_cat.dims());
 
     // Boolean validity → additive mask (0 / -inf), broadcast over batch+heads.
-    let n_keys = valid.dim(1)?;
+    let n_keys = t_k + t_c;
     let mask = match row_q0 {
-        // Uniform batch: verbatim the pre-change code.
-        None => {
-            let zeros = Tensor::zeros((t_q, n_keys), q.dtype(), dev)?;
-            let neg_inf = neg_inf_full((t_q, n_keys), q.dtype(), dev)?;
-            valid
-                .where_cond(&zeros, &neg_inf)?
-                .reshape((1, 1, t_q, n_keys))?
-        }
+        // Uniform batch, no graph positions: a pure function of the integer
+        // key, memoized across layers. The build a miss runs —
+        // `additive_union_mask(&build_valid()?, ..)` — is verbatim the
+        // pre-memo code.
+        None if !graph_mode => union_mask_memo(
+            &UnionMaskKey {
+                q0,
+                t_q,
+                raw_base,
+                t_k,
+                t_c,
+                ratio,
+                window,
+                dtype: q.dtype(),
+                dev: dev.location(),
+            },
+            || additive_union_mask(&build_valid()?, t_q, n_keys, q.dtype(), dev),
+        )?,
+        // Uniform batch under fixed-capacity graph decode: NOT memoized, on
+        // purpose. The constant capacity would make the key constant across
+        // steps, and these ops must be issued inside the capture region rather
+        // than hoisted into a warmup-owned tensor whose eviction would leave a
+        // recorded graph reading freed memory. The build is already
+        // arange-free here — both halves are fills.
+        None => additive_union_mask(&build_valid()?, t_q, n_keys, q.dtype(), dev)?,
         // Ragged cohort: `[b, 1, t_q, n_keys]`, because the compressed
-        // threshold and the dead prefix are both per-row.
+        // threshold and the dead prefix are both per-row. Not memoized: the
+        // per-row leads are part of the content but not of the integer key.
         Some(rows) => ragged_union_mask(
             rows,
             q0,
-            &valid,
+            &build_valid()?,
             raw_base,
             t_k,
-            cfg.compress_ratio.ratio(),
+            ratio,
             q.dtype(),
             dev,
         )?,
@@ -3716,6 +3827,143 @@ mod fused_v_alias_tests {
         let a: Vec<f32> = with_v.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
         let bb: Vec<f32> = with_k.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
         assert_ne!(a, bb, "a different V produced the same output as V == K");
+        Ok(())
+    }
+}
+
+/// The union-mask memo: the mask is a pure function of an integer key and was
+/// rebuilt once per layer per step (three `arange` uploads on the prefill
+/// path). These tests pin the two failure modes a memo can add: doing nothing
+/// (always missing) and serving a stale entry for a changed key.
+#[cfg(test)]
+#[allow(clippy::cast_precision_loss)] // usize -> f32 on test-sized fixtures, the file's test idiom
+mod union_mask_memo_tests {
+    use super::*;
+    use candle_core::{DType, Device, Result, Tensor};
+    use std::collections::HashMap;
+
+    /// The memo itself: a hit returns the cached handle WITHOUT running the
+    /// builder, and a changed key runs it. Handle identity is the only
+    /// observable — a memo that always misses returns correct values while
+    /// doing nothing.
+    #[test]
+    fn memo_hits_without_building_and_misses_on_a_changed_key() -> Result<()> {
+        let dev = Device::Cpu;
+        let key_a = UnionMaskKey {
+            q0: 34,
+            t_q: 1,
+            raw_base: 27,
+            t_k: 8,
+            t_c: 12,
+            ratio: 4,
+            window: 8,
+            dtype: DType::F32,
+            dev: dev.location(),
+        };
+        let key_b = UnionMaskKey {
+            q0: 35,
+            raw_base: 28,
+            ..key_a.clone()
+        };
+
+        let t1 = Tensor::zeros((1, 1, 1, 20), DType::F32, &dev)?;
+        let got = union_mask_memo(&key_a, || Ok(t1.clone()))?;
+        assert_eq!(got.id(), t1.id(), "miss must return the built tensor");
+
+        let hit = union_mask_memo(&key_a, || panic!("builder ran on a hit"))?;
+        assert_eq!(hit.id(), t1.id(), "hit must return the cached handle");
+
+        let t2 = Tensor::ones((1, 1, 1, 20), DType::F32, &dev)?;
+        let miss = union_mask_memo(&key_b, || Ok(t2.clone()))?;
+        assert_eq!(
+            miss.id(),
+            t2.id(),
+            "an advanced position was served the previous position's mask"
+        );
+        // ...and key A is still cached alongside.
+        let hit_a = union_mask_memo(&key_a, || panic!("builder ran on a hit"))?;
+        assert_eq!(hit_a.id(), t1.id());
+        Ok(())
+    }
+
+    fn mk(b: usize, h: usize, t: usize, d: usize, seed: f32, dev: &Device) -> Result<Tensor> {
+        let data: Vec<f32> = (0..(b * h * t * d))
+            .map(|i| ((i as f32) * seed).sin())
+            .collect();
+        Tensor::from_vec(data, (b, h, t, d), dev)
+    }
+
+    /// One deterministic decode step at absolute context `ctx`, returned as
+    /// output bits. `ctx` 35 vs 36 with ratio 4 and window 8 gives two calls
+    /// whose MASKS have the same shape but different content (the compressed
+    /// threshold `floor(ctx / 4)` crosses 8 → 9), which is exactly the
+    /// stale-serving hazard.
+    fn run(ctx: usize) -> Result<Vec<u32>> {
+        let dev = Device::Cpu;
+        let (h, d, t_c) = (2usize, 8usize, 12usize);
+        let q = mk(1, h, 1, d, 0.03, &dev)?;
+        let k = mk(1, 1, ctx, d, 0.11, &dev)?;
+        let comp = mk(1, 1, t_c, d, 0.05, &dev)?;
+        let sinks: Vec<f32> = (0..h).map(|i| 0.5 + 0.25 * i as f32).collect();
+        let sdpa = SdpaParams {
+            n_kv_groups: h,
+            softcap: None,
+            softmax_scale: 1.0 / (d as f32).sqrt(),
+            sliding_window: None,
+            sinks: Some(Tensor::from_vec(sinks, (1, h, 1, 1), &dev)?),
+        };
+        let flash = FlashParams {
+            max_q: 0,
+            max_k: 0,
+            cumulative_seqlens_q: HashMap::new(),
+            cumulative_seqlens_k: HashMap::new(),
+            causal: false,
+        };
+        let cfg = Dsv4AttentionConfig {
+            compress_ratio: CompressRatio::Csa,
+            sliding_window: 8,
+            raw_prefix: 0,
+            row_q0: None,
+            graph_positions: None,
+        };
+        let out = dsv4_attention(&q, &k, &k, Some(&comp), None, &flash, &sdpa, cfg)?;
+        Ok(out
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .iter()
+            .map(|x| x.to_bits())
+            .collect())
+    }
+
+    /// End to end, the memo must be invisible: sequential calls on ONE thread
+    /// (where the memo carries state between them) must be bit-identical to
+    /// the same calls on FRESH threads (where the thread-local memo is empty
+    /// and every mask is built from scratch). If the memo ever served ctx=35's
+    /// mask to ctx=36 — same shape, different admitted block set — the
+    /// sequential run would diverge from the fresh reference.
+    #[test]
+    fn memoized_masks_are_bit_identical_to_fresh_builds() -> Result<()> {
+        let fresh_35 = std::thread::spawn(|| run(35)).join().unwrap()?;
+        let fresh_36 = std::thread::spawn(|| run(36)).join().unwrap()?;
+
+        // Same thread: 35 (miss), 36 (miss, memo holds 35), 35 again (hit).
+        let seq_35 = run(35)?;
+        let seq_36 = run(36)?;
+        let seq_35_again = run(35)?;
+
+        assert_eq!(
+            seq_35, fresh_35,
+            "first build disagrees with a fresh thread"
+        );
+        assert_eq!(
+            seq_36, fresh_36,
+            "ctx=36 after ctx=35 disagrees with a fresh thread — the memo served a stale mask"
+        );
+        assert_eq!(
+            seq_35_again, fresh_35,
+            "a memo HIT changed the answer — the cached mask is not the built one"
+        );
         Ok(())
     }
 }
