@@ -813,7 +813,7 @@ impl Pipeline for GGUFPipeline {
                 flash_meta_full.as_ref().unwrap_or(&flash_meta),
             )?,
             Model::Phi3(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, paged_attn_meta)?
+                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
             }
             Model::XLoraPhi3(ref model) => model.forward(
                 &input_ids,
@@ -827,7 +827,7 @@ impl Pipeline for GGUFPipeline {
                 flash_meta_full.as_ref().unwrap_or(&flash_meta),
             )?,
             Model::Starcoder2(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, paged_attn_meta)?
+                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
             }
             Model::Qwen(ref model) => {
                 model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?

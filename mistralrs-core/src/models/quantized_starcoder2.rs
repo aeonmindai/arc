@@ -10,7 +10,7 @@ use crate::layers::{CausalMasker, MatMul, QLinear, RotaryEmbedding, Sdpa};
 use crate::layers_masker::PastKvLenCache;
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
-use crate::pipeline::{EitherCache, KvCache, NormalCache};
+use crate::pipeline::{extract_logits, EitherCache, KvCache, NormalCache};
 use crate::utils::gguf_metadata::ContentMetadata;
 use crate::utils::model_config as ModelConfig;
 use crate::utils::progress::{new_multi_progress, NiceProgressBar};
@@ -356,6 +356,7 @@ impl ModelWeights {
         &self,
         input_ids: &Tensor,
         seqlen_offsets: &[usize],
+        context_lens: Vec<(usize, usize)>,
         metadata: Option<(Vec<(Tensor, Tensor, Option<Tensor>, Option<Tensor>)>, &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
         let (_b_sz, seq_len) = input_ids.dims2()?;
@@ -398,10 +399,26 @@ impl ModelWeights {
             let ys = layer.mlp.forward(&ys)?;
             xs = (ys + residual)?
         }
-        let xs = xs
-            .apply(&self.output_norm)?
-            .i((.., seq_len - 1, ..))?
-            .contiguous()?;
-        MatMul.qmatmul(&xs, &self.output)
+        // 🔴 This used to be `.i((.., seq_len - 1, ..))`: the LAST row of the
+        // padded batch, taken for every sequence. `seq_len` is the batch
+        // maximum, so on a ragged batch every short row read its logits out of
+        // the right-hand PADDING -- and the same wrong row for all of them.
+        //
+        // The repo already documents this as banned, at
+        // `pipeline/inputs_processor.rs`: "`new_len`, NOT `padded.len()`.
+        // `padded.len()` is the batch max, so on a ragged batch every short row
+        // would read its logits out of the right-hand PADDING". `context_lens`
+        // carries the per-row `(start, len)` that says where each sequence
+        // actually ends, and `extract_logits` narrows row by row.
+        //
+        // `context_lens` was simply never plumbed into this `forward` --
+        // `pipeline/gguf.rs` passed it to every other GGUF architecture and
+        // skipped these two. Uniform batches are unaffected: there every row's
+        // `start + len` is `seq_len`, so this is the identity.
+        //
+        // Extracting BEFORE the output projection is deliberate and preserved:
+        // only the kept rows go through the vocab matmul.
+        let xs = extract_logits(&xs.apply(&self.output_norm)?, context_lens)?;
+        MatMul.qmatmul(&xs.contiguous()?, &self.output)
     }
 }

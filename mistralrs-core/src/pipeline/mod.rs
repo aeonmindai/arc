@@ -1924,3 +1924,79 @@ mod host_copy_tests {
         }
     }
 }
+
+/// `extract_logits` vs the `.i((.., seq_len - 1, ..))` it replaced in the phi3
+/// and starcoder2 GGUF models.
+///
+/// `seq_len` is the batch MAXIMUM. On a ragged batch, indexing it takes the
+/// last row of the padding for every short sequence -- and the same row for all
+/// of them. `pipeline/inputs_processor.rs` already documents this as banned;
+/// those two models simply never had `context_lens` plumbed into their
+/// `forward`, so they could not honour it.
+#[cfg(test)]
+mod extract_logits_tests {
+    use super::extract_logits;
+    use candle_core::{Device, IndexOp, Tensor};
+
+    /// `[batch, seq, hidden]` where element `(b, t, 0)` encodes `b * 100 + t`,
+    /// so a wrong row is identifiable rather than merely unequal.
+    fn hidden(batch: usize, seq: usize, hidden: usize) -> Tensor {
+        let mut v = Vec::with_capacity(batch * seq * hidden);
+        for b in 0..batch {
+            for t in 0..seq {
+                for h in 0..hidden {
+                    v.push((b * 100 + t) as f32 + h as f32 / 1000.0);
+                }
+            }
+        }
+        Tensor::from_vec(v, (batch, seq, hidden), &Device::Cpu).unwrap()
+    }
+
+    /// Three sequences of true lengths 4, 2 and 3 padded to 4.
+    fn ragged_context_lens() -> Vec<(usize, usize)> {
+        vec![(3, 1), (1, 1), (2, 1)]
+    }
+
+    #[test]
+    fn ragged_batch_reads_each_sequences_own_last_row() {
+        let xs = hidden(3, 4, 2);
+        let got = extract_logits(&xs, ragged_context_lens()).unwrap();
+        assert_eq!(got.dims(), &[3, 1, 2]);
+
+        // Row b must be the token at that sequence's real end: 3, 1, 2.
+        let markers: Vec<f32> = got.i((.., 0, 0)).unwrap().to_vec1().unwrap();
+        assert_eq!(markers, vec![3.0, 101.0, 202.0]);
+    }
+
+    /// The bug, stated as a disagreement: `seq_len - 1` takes token 3 from every
+    /// row, which is padding for sequences 1 and 2.
+    #[test]
+    fn last_row_indexing_reads_padding_on_a_ragged_batch() {
+        let xs = hidden(3, 4, 2);
+        let seq_len = 4;
+
+        let padded: Vec<f32> = xs.i((.., seq_len - 1, 0)).unwrap().to_vec1().unwrap();
+        assert_eq!(padded, vec![3.0, 103.0, 203.0]);
+
+        let correct = extract_logits(&xs, ragged_context_lens()).unwrap();
+        let correct: Vec<f32> = correct.i((.., 0, 0)).unwrap().to_vec1().unwrap();
+        assert_ne!(
+            padded, correct,
+            "input is degenerate -- it cannot distinguish the bug from the fix"
+        );
+        // Only sequence 0 actually ends at the batch maximum, so only it agrees.
+        assert_eq!(padded[0], correct[0]);
+        assert_ne!(padded[1], correct[1]);
+        assert_ne!(padded[2], correct[2]);
+    }
+
+    /// Uniform batches must be untouched -- this is where the old code was
+    /// accidentally right, and where the fix must be the identity.
+    #[test]
+    fn uniform_batch_is_unchanged() {
+        let xs = hidden(3, 4, 2);
+        let got = extract_logits(&xs, vec![(3, 1); 3]).unwrap();
+        let markers: Vec<f32> = got.i((.., 0, 0)).unwrap().to_vec1().unwrap();
+        assert_eq!(markers, vec![3.0, 103.0, 203.0]);
+    }
+}
