@@ -33,6 +33,11 @@ extend-ignore-re = [
     "mxfp4_get_max_smem_optin",
     "alog",
     "ba",
+    # A grep pattern quoted verbatim in BUDGET_V4_B1.md's evidence for "the
+    # GPU sampler is referenced nowhere": `sampl` is the search string, not a
+    # misspelling of "sample". Backticks included so this waives the quoted
+    # pattern and nothing else.
+    '`sampl`',
 ]
 
 [default.extend-words]
