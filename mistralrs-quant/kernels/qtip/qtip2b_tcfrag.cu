@@ -204,7 +204,8 @@ __device__ __forceinline__ void tcf_mma_m16n8k16(
 //
 // Range: fp16 overflows at 65504 where bf16 does not. This conversion is
 // deliberately NOT clamped — a clamp would trade a visible infinity for an
-// invisible wrong answer. The remedy is the ARC_QTIP_TCFRAG=0 kill switch.
+// invisible wrong answer. The remedy is that ARC_QTIP_TCFRAG is opt-in and
+// defaults OFF, so this path is not reached unless it is asked for.
 // See the range note in src/qtip/tcfrag2b.rs. UNMEASURED on the real model.
 __device__ __forceinline__ uint32_t tcf_b_slot(__nv_bfloat16 v) {
     const unsigned short h = __half_as_ushort(__float2half_rn(__bfloat162float(v)));
