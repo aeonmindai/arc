@@ -183,23 +183,229 @@ pub(crate) fn alloc_cache_killed() -> bool {
     std::env::var("ARC_CANDLE_ALLOC_CACHE").is_ok_and(|v| v == "0")
 }
 
+/// The bound this policy will not exceed even on an empty card: candle's own
+/// default (`DEFAULT_CAPACITY_BYTES`, `candle-core/src/cuda_backend/device.rs`),
+/// restated here so a plan can never be *looser* than what candle would have
+/// applied on its own.
+pub(crate) const ALLOC_CACHE_DEFAULT_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Share of the card's *currently free* VRAM the cache may retain: one eighth.
+///
+/// Two properties decide the number.
+///
+/// * **It must leave the forward far more room than the run that died
+///   consumed.** That run grew 224 MiB before failing on an 844 MiB headroom;
+///   an eighth is 105 MiB, so eviction plateaus retention at less than half of
+///   what proved fatal and hands ~739 MiB back to the forward.
+/// * **It must be a no-op on a card that is not tight.** Combined with the
+///   [`ALLOC_CACHE_DEFAULT_BYTES`] ceiling, an eighth only lowers the cap below
+///   candle's own default when free VRAM is under 8 GiB. Above that the plan is
+///   byte-identical to the previous behaviour, so nothing that was working
+///   changes.
+///
+/// What the fraction removes is the *dead* retention — the per-token-unique
+/// byte sizes nothing ever asks for twice — not the hits. The working set the
+/// cache exists to absorb (the ~11 k same-shape allocations a decode step
+/// makes) is tens of MiB.
+pub(crate) const ALLOC_CACHE_FREE_DIVISOR: usize = 8;
+
+/// Never plan a cap below this. Under it the cache stops absorbing the
+/// same-shape traffic it exists for and the 7.80 ms/token it buys is lost; a
+/// card that tight wants diagnosing, not silent de-tuning.
+///
+/// The floor is itself capped by [`ALLOC_CACHE_MAX_FREE_SHARE_DIVISOR`], so on
+/// a card too small to spare 64 MiB the floor cannot eat the card. Without that
+/// clamp the floor would be the *loosest* term in the plan on exactly the
+/// hardware the plan exists to protect.
+pub(crate) const ALLOC_CACHE_FLOOR_BYTES: usize = 64 * 1024 * 1024;
+
+/// Hard ceiling on the planned cap as a share of free VRAM: never more than a
+/// half, whatever [`ALLOC_CACHE_FLOOR_BYTES`] says.
+///
+/// This exists because the floor and the fraction pull in opposite directions
+/// and the floor wins on a tight card. Measured 2026-08-21: the OOM leg had
+/// **262 MiB free** at decode start, where `free/8` is 32.75 MiB — under the
+/// 64 MiB floor, so the floor would set the cap at 24% of everything the card
+/// had left. Clamping to `free/2` bounds that at a stated worst case instead of
+/// leaving it to whatever the floor happens to be.
+pub(crate) const ALLOC_CACHE_MAX_FREE_SHARE_DIVISOR: usize = 2;
+
+/// Decode steps between two re-arms of the cap.
+///
+/// Free VRAM **shrinks** during a generation — the KV cache grows — so a cap
+/// planned once when decode started goes stale in the unsafe direction. One
+/// `cuMemGetInfo` (a few µs) every 64 steps keeps it honest against a step
+/// measured at tens of ms.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) const ALLOC_CACHE_REARM_STEPS: u64 = 64;
+
 /// Retention cap for the caching allocator, in bytes, or `None` to leave
 /// candle's own default (1 GiB) in force.
 ///
 /// `ARC_ALLOC_CACHE_MAX_MB=0` means unbounded — the pre-bounding behaviour, kept
 /// reachable so the leak it causes can be A/B'd rather than argued about.
-/// Measured unbounded on V4: **+6.04 MiB per decoded token with no plateau**,
-/// against +0.057 MiB/token with the cache off entirely.
+///
+/// # The rate recorded here was 6.04 MiB/token — reconciled, with a caveat
+///
+/// This line used to read "**+6.04 MiB per decoded token with no plateau**,
+/// against +0.057 MiB/token with the cache off entirely", from PR #182's V4 leg
+/// (2 600 tokens, `memory.used` at 2 Hz). An H200 leg on 2026-08-21 measured
+/// ~12.8 MiB/step on V4 at the default 1 GiB cap and died at **19 tokens**. The
+/// obvious reading — that a run surviving 2 600 tokens and a run dying at 19
+/// cannot be the same defect — is wrong, and the arithmetic says why.
+///
+/// 6.04 MiB/token × 2 600 tokens is **15.3 GiB retained**. #182's leg therefore
+/// had *at least* that much free at decode start. Tonight's box had **844 MiB**
+/// (262 MiB on the TCFRAG leg). What changed in between is
+/// `ARC_QTIP_TCFRAG`, which landed as #203 on 08-20 — *after* #182's
+/// measurement — and whose repack **retains ~63 GB** against a ~79.5 GB model
+/// (measured: `ARC_QTIP_TCFRAG=0` frees 64 262 MiB vs 262 MiB). So it is the
+/// same per-token retention in both runs, against two orders of magnitude
+/// difference in headroom. #209 made TCFRAG opt-in and restored the headroom.
+///
+/// The caveat: 6.04 against ~12.8 is still a 2× gap in the *rate*, and that is
+/// not explained. It is no longer load-bearing — what needed explaining was the
+/// survival difference, and headroom covers it — but do not quote either number
+/// as "the V4 rate" without its configuration. The likeliest candidate is
+/// TCFRAG itself (tonight's leg had it on; #182's predates it), which is
+/// directly testable: the `base256` arm already runs `ARC_QTIP_TCFRAG=0` with
+/// the cache on, so its `held`/step is the discriminator.
+///
+/// The control that is not in dispute, same night, same box: **0.19 MiB/token
+/// with `ARC_CANDLE_ALLOC_CACHE=0`, running to `ntok=1000, finish=length` on
+/// the same 262 MiB that OOM'd at 19 tokens with the cache on** — ~60×, and the
+/// direct evidence that retention is the mechanism.
+///
+/// `free_bytes` is what the card reports free *right now*
+/// (`MemoryUsage::get_memory_available`), or `None` when the device cannot say.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-pub(crate) fn alloc_cache_capacity_bytes() -> Option<usize> {
-    parse_alloc_cache_capacity(std::env::var("ARC_ALLOC_CACHE_MAX_MB").ok().as_deref())
+pub(crate) fn alloc_cache_capacity_bytes(free_bytes: Option<usize>) -> Option<usize> {
+    plan_alloc_cache_capacity(
+        std::env::var("ARC_ALLOC_CACHE_MAX_MB").ok().as_deref(),
+        free_bytes,
+    )
 }
 
-/// Pure half of [`alloc_cache_capacity_bytes`], so the parse is testable.
+/// Pure half of [`alloc_cache_capacity_bytes`], so the policy is testable
+/// without a GPU.
 ///
-/// `None` (unset, or unparsable) leaves candle's own default in force rather
-/// than silently picking a different one — a typo in an ops script must not
-/// quietly hand back the unbounded allocator this change exists to remove.
+/// # The defect this closes
+///
+/// The cap used to be an absolute constant — candle's 1 GiB unless
+/// `ARC_ALLOC_CACHE_MAX_MB` said otherwise — picked to be "far larger than a
+/// decode step's working set and far smaller than any card this runs on". The
+/// second half of that is **false for the configuration Arc ships**:
+/// DeepSeek-V4 on one H200 loads to 142 927 MiB of 143 771, leaving **~844 MiB
+/// free when decode starts**. A 1 024 MiB cap therefore cannot engage before
+/// the card is exhausted, the LRU eviction that bounds retention never runs
+/// once, and the cache grows until an allocation fails. Measured on an H200,
+/// V4, `kv-cache=eager, prefix-cache=on, max-seqs=32`: 142 927 → 143 151 MiB
+/// over 20 generated tokens (~11 MiB/token in ~32 MiB granules), ending in
+/// `CUDA_ERROR_OUT_OF_MEMORY` inside an unrelated allocation. The bound was
+/// present and simply out of reach.
+///
+/// So the cap is planned against the headroom that exists, not the headroom a
+/// 143 GB card looks like it ought to have.
+///
+/// # Contract
+///
+/// * `raw` — `ARC_ALLOC_CACHE_MAX_MB`, if set. An explicit operator override
+///   wins outright, `0` (unbounded, for A/B) included. A typo does **not** fall
+///   back to unbounded.
+/// * `free_bytes` — free VRAM now, or `None` when the device cannot report it
+///   (CPU/Metal, or a failed `cuMemGetInfo`). `None` leaves candle's own
+///   default in force — i.e. exactly the previous behaviour — rather than
+///   guessing at a number.
+///
+/// # 🔴 What this un-masks, deliberately
+///
+/// A cap that is *reachable* means LRU eviction actually runs, and eviction
+/// cannot express "this address is baked into an instantiated `CUgraphExec`"
+/// (PR #211). Today that hazard is masked by the very defect fixed here: a
+/// process that dies at token 22–30 never keeps a graph alive long enough for
+/// its baked buffers to age to the front of the queue, so any probe of it
+/// returns a green the instrument never had a chance to fail. Making the cap
+/// reachable — and this plan makes it *more* reachable than the constant did,
+/// which is the point — makes that use-after-free reachable for the first time.
+///
+/// It is not reachable in the shipping configuration: capture is behind
+/// `ARC_V4_CAPTURE_PROBE`, which is unset by default (`normal.rs`, the `probe`
+/// binding in `forward_inputs`), and `arc-cuda-graph` drains the cache before
+/// every `cuMemPoolDestroy`. The sequencing is the point of writing it down:
+/// this lands first, PR #211 second, and #211 must be in before capture is
+/// defaulted on.
+///
+/// # 🔑 This is a BOUND on the growth, not a FIX for it — and it did not fix the crash
+///
+/// **#209 is the crash fix.** It made `ARC_QTIP_TCFRAG` opt-in and gave the
+/// card back ~63 GB; the V4 OOM was a headroom failure that this retention rate
+/// merely rode on top of. Measured 2026-08-21, and both rescue the run
+/// *independently*, which is the honest way to state it:
+///
+/// * `ARC_QTIP_TCFRAG=0`, alloc cache still **on** — 256/256 tokens,
+///   `finish=length`, across five runs.
+/// * `ARC_CANDLE_ALLOC_CACHE=0`, TCFRAG still **on** — 1 000 tokens,
+///   `finish=length`, at **0.19 MiB/token** against ~12.8 MiB/step and an OOM at
+///   19 tokens with the cache on. `held 0.0 MiB / sizes 0` on every step
+///   confirms the cache was genuinely out of circuit rather than merely quiet.
+///
+/// So retention is confirmed as *a* mechanism and the owner is `AllocCache.free`
+/// rather than a leaked `Tensor` — but this change is **defence in depth on the
+/// rate**, not the thing that stopped the crash.
+///
+/// But the same instrumentation shows why capping is symptomatic. Over the
+/// failing run, `sizes` (distinct retained size classes) climbed **~10 per
+/// step** and `free/step` was **0.0 on every step after step 3**. The growing
+/// buffers have a reuse rate of **zero by construction**: each decode step's
+/// KV-shaped tensors are one token longer than the last, so every step files a
+/// byte size that will never be requested again. A cache entry that can never
+/// be hit is not caching anything — it is a deferred free.
+///
+/// So this change makes the deferred frees bounded and prompt. **The fix is to
+/// stop filing a new size every step**: preallocate the KV buffers to the
+/// sequence's maximum length once and write each step in place, which removes
+/// the per-step allocation rather than recycling it. That is a larger change
+/// than this one and is the named follow-up.
+///
+/// Two mechanisms proposed for the growth were killed by arithmetic rather than
+/// by argument, and are recorded so they are not re-proposed:
+///
+/// * **`repeat_kv`'s 64× MQA expansion — unreachable.** V4 decode returns
+///   through `absorbed_mqa_decode` (`models/dsv4_attention.rs`, gated on
+///   `t_q == 1 && k_cat.dim(1) == 1 && sinks.is_some()`), which folds the heads
+///   into the GEMM M-dimension. Counterfactually it would allocate ~1.6 GiB per
+///   decode step at a 2 k context — it would fail on token 1, not token 22.
+/// * **KV-length-dependent size churn (the `t_c`-sized cats, wave65-CQ) — off
+///   by ~20×.** That rate is proportional to `t_c`, hence to prompt length. The
+///   failing run's prompt was a single message under 100 tokens (TTFT 0.207 s
+///   corroborates), where the arithmetic gives ~0.55 MiB/token against the
+///   ~12.8 measured.
+///
+/// The growing term is therefore **per generated token, not per-context**,
+/// which is what `sizes += ~10/step` at a short prompt says directly.
+pub(crate) fn plan_alloc_cache_capacity(
+    raw: Option<&str>,
+    free_bytes: Option<usize>,
+) -> Option<usize> {
+    if let Some(explicit) = parse_alloc_cache_capacity(raw) {
+        return Some(explicit);
+    }
+    let free = free_bytes?;
+    Some(
+        (free / ALLOC_CACHE_FREE_DIVISOR)
+            .max(ALLOC_CACHE_FLOOR_BYTES)
+            // The floor must not become the loosest term on a card too small to
+            // spare it. See `ALLOC_CACHE_MAX_FREE_SHARE_DIVISOR`.
+            .min(free / ALLOC_CACHE_MAX_FREE_SHARE_DIVISOR)
+            .min(ALLOC_CACHE_DEFAULT_BYTES),
+    )
+}
+
+/// Parse `ARC_ALLOC_CACHE_MAX_MB`.
+///
+/// `None` (unset, or unparsable) leaves the headroom-derived plan in force
+/// rather than silently picking a different one — a typo in an ops script must
+/// not quietly hand back the unbounded allocator this change exists to remove.
 pub(crate) fn parse_alloc_cache_capacity(raw: Option<&str>) -> Option<usize> {
     let mb: usize = raw?.trim().parse().ok()?;
     Some(if mb == 0 {
@@ -207,6 +413,38 @@ pub(crate) fn parse_alloc_cache_capacity(raw: Option<&str>) -> Option<usize> {
     } else {
         mb.saturating_mul(1024 * 1024)
     })
+}
+
+/// Plan the allocator's retention cap against the card's *measured* free VRAM
+/// and apply it.
+///
+/// `set_alloc_cache_capacity` evicts down to the new low-water mark before it
+/// returns, so this both bounds future retention and hands back whatever is
+/// already held above the new bound.
+///
+/// A failed `cuMemGetInfo` yields `None`, which
+/// [`plan_alloc_cache_capacity`] turns into "leave candle's default alone" —
+/// the pre-change behaviour. Losing the reading must not silently lift the
+/// bound *or* clamp it to the floor.
+#[cfg(feature = "cuda")]
+fn arm_alloc_cache_capacity(cd: &candle_core::CudaDevice, device: &Device) {
+    let free = crate::utils::memory_usage::MemoryUsage
+        .get_memory_available(device)
+        .ok();
+    if let Some(cap) = alloc_cache_capacity_bytes(free) {
+        cd.set_alloc_cache_capacity(cap);
+    }
+}
+
+/// Has another [`ALLOC_CACHE_REARM_STEPS`] decode steps gone by?
+///
+/// Counted here rather than derived from the sequence's own position because
+/// the cap is a property of the *device*, shared by every sequence in flight.
+#[cfg(feature = "cuda")]
+fn due_to_rearm() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static STEPS: AtomicU64 = AtomicU64::new(0);
+    STEPS.fetch_add(1, Ordering::Relaxed) % ALLOC_CACHE_REARM_STEPS == 0
 }
 
 /// Is `name` set to a value that means **yes**?
@@ -1936,7 +2174,8 @@ impl Pipeline for NormalPipeline {
                     // one. It is now on for decode by default and drained on
                     // prefill; see `alloc_cache_action` for why prefill must
                     // drain rather than coast.
-                    if let candle_core::Device::Cuda(cd) = self.device() {
+                    let alloc_cache_device = self.device();
+                    if let candle_core::Device::Cuda(cd) = &alloc_cache_device {
                         match alloc_cache_action(
                             seq_len,
                             cd.alloc_cache_enabled(),
@@ -1944,16 +2183,23 @@ impl Pipeline for NormalPipeline {
                         ) {
                             AllocCacheAction::Enable => {
                                 cd.set_alloc_cache_enabled(true);
-                                if let Some(cap) = alloc_cache_capacity_bytes() {
-                                    cd.set_alloc_cache_capacity(cap);
-                                }
+                                arm_alloc_cache_capacity(cd, &alloc_cache_device);
                             }
                             AllocCacheAction::DrainAndDisable => {
                                 cd.set_alloc_cache_enabled(false)
                             }
-                            AllocCacheAction::Leave => {}
+                            // Steady-state decode. The cap has to be re-armed
+                            // here and not only on the Enable edge: free VRAM
+                            // shrinks token by token as the KV cache grows, so
+                            // a plan made when decode started is stale in the
+                            // unsafe direction by the time it matters.
+                            AllocCacheAction::Leave => {
+                                if seq_len == 1 && cd.alloc_cache_enabled() && due_to_rearm() {
+                                    arm_alloc_cache_capacity(cd, &alloc_cache_device);
+                                }
+                            }
                         }
-                        report_alloc_cache_step(&cd, seq_len);
+                        report_alloc_cache_step(cd, seq_len);
                     }
                     if probe && seq_len == 1 {
                         // RUN-161 step 2b. Set the graph-mode device position:
@@ -2950,6 +3196,257 @@ mod alloc_cache_capacity_tests {
             Some(usize::MAX),
             "saturates instead of wrapping to a tiny cap"
         );
+    }
+}
+
+/// The retention cap against the headroom the card **actually has**.
+///
+/// # What these pin
+///
+/// The bound exists; the defect is that it was set from a constant. Retention
+/// is only bounded in practice if the cap is reachable *before* the card runs
+/// out — an unreachable cap is arithmetically identical to no cap, because the
+/// LRU eviction that hands memory back is only ever triggered by crossing it.
+///
+/// The numbers below are the H200 / DeepSeek-V4 measurement this fixes:
+/// 143 771 MiB card, 142 927 MiB resident after load, so 844 MiB free when
+/// decode starts; growth of ~11 MiB per generated token in ~32 MiB granules;
+/// `CUDA_ERROR_OUT_OF_MEMORY` at 143 151 MiB used after 20 tokens.
+///
+/// [`old_policy_constant_cap`] is the pre-change policy, executable rather than
+/// described, so the mutation check runs instead of being asserted in prose.
+#[cfg(test)]
+mod alloc_cache_headroom_tests {
+    use super::{
+        plan_alloc_cache_capacity, ALLOC_CACHE_DEFAULT_BYTES, ALLOC_CACHE_FLOOR_BYTES,
+        ALLOC_CACHE_FREE_DIVISOR, ALLOC_CACHE_MAX_FREE_SHARE_DIVISOR,
+    };
+
+    const MIB: usize = 1024 * 1024;
+    /// Free VRAM on the H200 once DeepSeek-V4 is resident: 143 771 - 142 927.
+    const V4_FREE_AT_DECODE_START: usize = 844 * MIB;
+    /// Free VRAM at the token the run died on: 143 771 - 143 151.
+    const V4_FREE_AT_OOM: usize = 620 * MIB;
+    /// Measured VRAM growth per generated token, cache unbounded-in-practice.
+    const LEAK_PER_TOKEN: usize = 11 * MIB;
+
+    /// The policy this change replaces: a constant, blind to the card.
+    fn old_policy_constant_cap(raw: Option<&str>) -> Option<usize> {
+        match raw {
+            // `parse_alloc_cache_capacity` semantics, then candle's own default.
+            Some(_) => super::parse_alloc_cache_capacity(raw),
+            None => Some(ALLOC_CACHE_DEFAULT_BYTES),
+        }
+    }
+
+    /// THE DEFECT, as arithmetic. A cap the card cannot reach never evicts.
+    ///
+    /// Mutation: swap `plan_alloc_cache_capacity` for `old_policy_constant_cap`
+    /// below and this fails with
+    /// `cap 1073741824 B exceeds the 884998144 B this card has free` — 1 024 MiB
+    /// against 844 MiB. That is the shipped configuration, and it is why the
+    /// bound that #182 added never engaged on V4.
+    #[test]
+    fn the_cap_must_be_reachable_before_the_card_is_exhausted() {
+        let free = V4_FREE_AT_DECODE_START;
+        let cap = plan_alloc_cache_capacity(None, Some(free))
+            .expect("a card that can report its free memory must get a plan");
+        assert!(
+            cap <= free,
+            "cap {cap} B exceeds the {free} B this card has free — it can never be \
+             crossed, so the LRU eviction behind it never runs and retention is \
+             unbounded in practice"
+        );
+        // Reachable is necessary but not sufficient: crossing it must still
+        // leave the forward far more room than the run that died consumed.
+        assert_eq!(cap, free / ALLOC_CACHE_FREE_DIVISOR);
+        let leaked_before_the_oom = V4_FREE_AT_DECODE_START - V4_FREE_AT_OOM;
+        assert!(
+            free - cap >= 2 * leaked_before_the_oom,
+            "plan leaves only {} B free against the {leaked_before_the_oom} B the \
+             failing run consumed — too thin a margin to call this fixed",
+            free - cap
+        );
+        // And the old policy is the thing this test exists to reject.
+        assert!(
+            old_policy_constant_cap(None).is_some_and(|old| old > free),
+            "fixture is toothless: the old policy must be the one that overshoots"
+        );
+    }
+
+    /// The fraction must not touch a card that is not tight. Above 8 GiB free
+    /// the [`ALLOC_CACHE_DEFAULT_BYTES`] ceiling binds instead, so every model
+    /// that was working keeps byte-identical allocator behaviour and only the
+    /// configuration that OOMs is re-tuned.
+    #[test]
+    fn a_card_with_room_gets_exactly_the_old_plan() {
+        let threshold = ALLOC_CACHE_DEFAULT_BYTES * ALLOC_CACHE_FREE_DIVISOR; // 8 GiB
+        assert_eq!(
+            plan_alloc_cache_capacity(None, Some(threshold)),
+            old_policy_constant_cap(None),
+            "at exactly the crossover the two policies must agree"
+        );
+        assert_eq!(
+            plan_alloc_cache_capacity(None, Some(threshold * 4)),
+            old_policy_constant_cap(None)
+        );
+        assert!(
+            plan_alloc_cache_capacity(None, Some(threshold - MIB)).unwrap()
+                < old_policy_constant_cap(None).unwrap(),
+            "and below it the new plan must be strictly tighter"
+        );
+    }
+
+    /// The run that died: 20 tokens at ~11 MiB each is 220 MiB of retention.
+    /// Under the old cap that is 220 of a 1 024 MiB budget — nothing is ever
+    /// evicted, and the 620 MiB still showing free is what the allocation that
+    /// failed was competing for. Under the new cap the 105 MiB bound is crossed
+    /// inside the first ten tokens, so eviction runs and retention plateaus
+    /// there instead of climbing into the card.
+    #[test]
+    fn twenty_tokens_of_the_measured_leak_crosses_the_new_cap_and_not_the_old() {
+        let retained_at_oom = 20 * LEAK_PER_TOKEN;
+        let new_cap = plan_alloc_cache_capacity(None, Some(V4_FREE_AT_DECODE_START)).unwrap();
+        let old_cap = old_policy_constant_cap(None).unwrap();
+        assert!(
+            retained_at_oom > new_cap,
+            "retained {retained_at_oom} B never reaches the new cap {new_cap} B, so \
+             this fixture does not exercise eviction at all"
+        );
+        assert!(
+            retained_at_oom < old_cap,
+            "retained {retained_at_oom} B vs old cap {old_cap} B: the old bound was \
+             never crossed, which is why nothing was ever handed back"
+        );
+        // Sanity on the measurement itself: the card really was that close.
+        assert!(V4_FREE_AT_OOM < V4_FREE_AT_DECODE_START);
+        assert_eq!(V4_FREE_AT_DECODE_START - V4_FREE_AT_OOM, 224 * MIB);
+    }
+
+    /// Re-arming is the second half of the fix: free VRAM shrinks as the KV
+    /// cache grows, so the plan has to shrink with it rather than stay at
+    /// whatever the card looked like when decode started.
+    #[test]
+    fn the_plan_tracks_the_headroom_down() {
+        let start = plan_alloc_cache_capacity(None, Some(V4_FREE_AT_DECODE_START)).unwrap();
+        let at_oom = plan_alloc_cache_capacity(None, Some(V4_FREE_AT_OOM)).unwrap();
+        assert!(
+            at_oom < start,
+            "plan did not tighten as headroom fell: {start} B -> {at_oom} B"
+        );
+        assert!(at_oom <= V4_FREE_AT_OOM);
+    }
+
+    /// An empty card must not get a *looser* bound than candle would have
+    /// applied on its own — the fraction is a ceiling-lowering rule, never a
+    /// licence to retain more.
+    #[test]
+    fn a_roomy_card_is_still_bounded_by_candles_default() {
+        let free = 100 * 1024 * MIB; // 100 GiB free
+        assert_eq!(
+            plan_alloc_cache_capacity(None, Some(free)),
+            Some(ALLOC_CACHE_DEFAULT_BYTES)
+        );
+    }
+
+    /// Below the floor the cache stops absorbing the same-shape traffic it
+    /// exists for, and de-tuning silently would trade a 7.80 ms/token
+    /// regression for a memory saving nobody asked for. The floor holds as
+    /// long as the card can spare it.
+    #[test]
+    fn a_desperate_card_stops_at_the_floor() {
+        // 256 MiB free: `free/8` = 32 MiB is under the floor, and the card can
+        // spare 64 MiB (`free/2` = 128 MiB), so the floor is what binds.
+        assert_eq!(
+            plan_alloc_cache_capacity(None, Some(256 * MIB)),
+            Some(ALLOC_CACHE_FLOOR_BYTES)
+        );
+    }
+
+    /// 🔑 THE FLOOR MUST NOT EAT THE CARD.
+    ///
+    /// The floor and the fraction pull opposite ways, and on a tight card the
+    /// floor wins — which is precisely the hardware this policy exists to
+    /// protect. `ALLOC_CACHE_MAX_FREE_SHARE_DIVISOR` bounds it at half the free
+    /// VRAM so the worst case is stated rather than emergent.
+    ///
+    /// Mutation: drop the `.min(free / ALLOC_CACHE_MAX_FREE_SHARE_DIVISOR)`
+    /// term and the 16 MiB case plans a 64 MiB cap on a card with 16 MiB free —
+    /// a cap 4× larger than everything left, i.e. exactly the unreachable-cap
+    /// defect this PR fixes, reintroduced by the floor.
+    #[test]
+    fn the_floor_never_exceeds_half_of_what_is_free() {
+        for free in [0usize, 1, 8 * MIB, 16 * MIB, 64 * MIB, 127 * MIB] {
+            let cap = plan_alloc_cache_capacity(None, Some(free)).unwrap();
+            assert!(
+                cap <= free / ALLOC_CACHE_MAX_FREE_SHARE_DIVISOR,
+                "planned {cap} B against {free} B free — the floor became the \
+                 loosest term on the tightest card"
+            );
+        }
+        // And a card that genuinely has nothing gets a cap of nothing, not a
+        // 64 MiB promise it cannot keep.
+        assert_eq!(plan_alloc_cache_capacity(None, Some(0)), Some(0));
+    }
+
+    /// The leg that actually OOM'd, with the allocator counters attached:
+    /// **262 MiB free at decode start, died at `held 236.9 MiB / cap
+    /// 1024 MiB`.** A 1 GiB cap against 262 MiB of headroom is inert — the
+    /// cache reached 90% of everything the card had left and the bound was
+    /// never consulted.
+    ///
+    /// Mutation: `old_policy_constant_cap` here asserts 1024 MiB > 262 MiB
+    /// free, i.e. the shipped configuration.
+    #[test]
+    fn the_measured_oom_leg_is_bounded_below_what_it_actually_held() {
+        const FREE_AT_OOM_LEG: usize = 262 * MIB;
+        const HELD_AT_DEATH: usize = 236 * MIB + 920 * 1024; // 236.9 MiB
+
+        let cap = plan_alloc_cache_capacity(None, Some(FREE_AT_OOM_LEG)).unwrap();
+        assert!(
+            cap < HELD_AT_DEATH,
+            "planned cap {cap} B is not below the {HELD_AT_DEATH} B the failing \
+             run actually held — eviction would still never have run"
+        );
+        // The floor binds here (free/8 = 32.75 MiB < 64 MiB), and the card can
+        // spare it (free/2 = 131 MiB).
+        assert_eq!(cap, ALLOC_CACHE_FLOOR_BYTES);
+        assert!(
+            FREE_AT_OOM_LEG - cap > HELD_AT_DEATH - cap,
+            "the plan must hand back more than it keeps on this card"
+        );
+        // The old policy is the one that could not bind.
+        let old = old_policy_constant_cap(None).unwrap();
+        assert!(
+            old > FREE_AT_OOM_LEG && old > HELD_AT_DEATH,
+            "fixture is toothless: the old cap must exceed both the card's free \
+             VRAM ({FREE_AT_OOM_LEG} B) and what the run held ({HELD_AT_DEATH} B)"
+        );
+    }
+
+    /// An explicit operator cap wins over the headroom plan, `0` (unbounded,
+    /// for A/B) included — otherwise the escape hatch back to the measured leak
+    /// would be silently overridden by this policy and the A/B could not be run.
+    #[test]
+    fn an_explicit_override_wins_including_unbounded() {
+        assert_eq!(
+            plan_alloc_cache_capacity(Some("128"), Some(V4_FREE_AT_DECODE_START)),
+            Some(128 * MIB)
+        );
+        assert_eq!(
+            plan_alloc_cache_capacity(Some("0"), Some(V4_FREE_AT_DECODE_START)),
+            Some(usize::MAX)
+        );
+    }
+
+    /// A device that cannot report free memory (CPU, Metal, or a failed
+    /// `cuMemGetInfo`) keeps the previous behaviour exactly. Losing the reading
+    /// must not silently lift the bound, and must not silently clamp it to the
+    /// floor either.
+    #[test]
+    fn no_reading_means_no_change() {
+        assert_eq!(plan_alloc_cache_capacity(None, None), None);
+        assert_eq!(plan_alloc_cache_capacity(Some("nonsense"), None), None);
     }
 }
 
