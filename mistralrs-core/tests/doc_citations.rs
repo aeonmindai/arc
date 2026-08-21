@@ -1363,6 +1363,112 @@ static BASELINE: &[Waiver] = &[
         why: "the QTIP reference is an upstream reference checkout, not \
               vendored here",
     },
+    // -- Citations carried in by the six mission docs that were cited from
+    //    Rust comments but had never been committed (they existed on one
+    //    laptop). Same class as everything above: pointers into sglang, CUDA
+    //    headers and DeepSeek's configs, which Arc reads and does not vendor.
+    Waiver {
+        doc: "memory/mission/BUDGET_V4_B1.md",
+        cite: "cuda.h",
+        kind: Kind::Unresolved,
+        why: "cited from an upstream reference tree, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/BUDGET_V4_B1.md",
+        cite: "cuda_device_runtime_api.h",
+        kind: Kind::Unresolved,
+        why: "cited from an upstream reference tree, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/EXTERNAL_FINDINGS.md",
+        cite: "indexer.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave13-AH-config.md",
+        cite: "configs/deepseek_v4.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave13-AH-config.md",
+        cite: "deepseek_v2.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave13-AH-config.md",
+        cite: "deepseek_v4_rope.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave45-BW-mtp-batched.md",
+        cite: "allocator.py",
+        kind: Kind::Unresolved,
+        why: "cited from an upstream reference tree, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave45-BW-mtp-batched.md",
+        cite: "deepseek_v2.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave45-BW-mtp-batched.md",
+        cite: "docs/advanced_features/adaptive_speculative_decoding.md",
+        kind: Kind::Unresolved,
+        why: "cited from an upstream reference tree, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave45-BW-mtp-batched.md",
+        cite: "eagle_info.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave45-BW-mtp-batched.md",
+        cite: "eagle_utils.cu",
+        kind: Kind::Unresolved,
+        why: "cited from an upstream reference tree, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave45-BW-mtp-batched.md",
+        cite: "eagle_worker.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave45-BW-mtp-batched.md",
+        cite: "llama_eagle3.py",
+        kind: Kind::Unresolved,
+        why: "cited from an upstream reference tree, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave45-BW-mtp-batched.md",
+        cite: "server_args.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave45-BW-mtp-batched.md",
+        cite: "test/manual/dsv4/test_dsv4_pro_mtp.py",
+        kind: Kind::Unresolved,
+        why: "cited from an upstream reference tree, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave45-BW-mtp-batched.md",
+        cite: "test_deepseek_v3_mtp.py",
+        kind: Kind::Unresolved,
+        why: "cited from an upstream reference tree, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave45-BW-mtp-batched.md",
+        cite: "test_dsv4_pro_mtp.py",
+        kind: Kind::Unresolved,
+        why: "cited from an upstream reference tree, not vendored here",
+    },
 ];
 
 // ---------------------------------------------------------------------------
