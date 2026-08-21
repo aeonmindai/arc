@@ -539,6 +539,23 @@ pub struct Qtip2bLayer {
     /// beam. The objective bit stays false by construction: this rung has no
     /// Hessian-weighted branch metric.
     search_detail: QtipSearchDetail,
+    /// The TCFRAG-2B tensor-core copy of [`Self::blocks`], built on first GPU
+    /// GEMV and kept for the layer's life.
+    ///
+    /// 🔴 **D22: a LOAD-TIME permutation, never a baked one.** `blocks` — and
+    /// therefore the on-disk artifact — is untouched. The fragment order is
+    /// `mma.m16n8k16`-specific and Blackwell's MMA shapes differ, so baking it
+    /// would mean one artifact per GPU generation and would fragment the
+    /// byte-format moat (D17). Doing it here costs one bandwidth-bound pass:
+    /// ~74 GB read + 74 GB write, ~0.03 s against a ~65 s model load.
+    ///
+    /// `None` inside the cell is the refusal state — no CUDA device, no
+    /// fragment order for this compute capability, kill switch off, or a shape
+    /// the format does not cover. All four keep the shipped kernel.
+    ///
+    /// ⚠️ The kernel this feeds is UNVERIFIED ON HARDWARE — never run.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    tcfrag: std::sync::OnceLock<Option<Tensor>>,
 }
 
 impl Qtip2bLayer {
@@ -830,6 +847,7 @@ impl Qtip2bLayer {
             // earned rather than assumed: this rung has no weighted branch
             // metric at all.
             search_detail: QtipSearchDetail::for_bake(mode, search, false),
+            tcfrag: std::sync::OnceLock::new(),
         })
     }
 
@@ -908,6 +926,7 @@ impl Qtip2bLayer {
             // earned rather than assumed: this rung has no weighted branch
             // metric at all.
             search_detail: QtipSearchDetail::for_bake(mode, search, false),
+            tcfrag: std::sync::OnceLock::new(),
         }))
     }
 
@@ -1054,6 +1073,7 @@ impl Qtip2bLayer {
             // earned rather than assumed: this rung has no weighted branch
             // metric at all.
             search_detail: QtipSearchDetail::for_bake(mode, search, false),
+            tcfrag: std::sync::OnceLock::new(),
         }))
     }
 
@@ -1295,6 +1315,58 @@ impl Qtip2bLayer {
         Ok(result)
     }
 
+    /// The TCFRAG-2B tensor-core weight copy, built exactly once.
+    ///
+    /// 🔴 **D22 lives here.** This is the load-time permutation: `self.blocks`
+    /// and the on-disk artifact are untouched, and the fragment order is
+    /// chosen from the device's compute capability
+    /// (`cuda_ops::tcfrag2b_layout_for`), never from `#if __CUDA_ARCH__`. A
+    /// device with no entry gets `None` and keeps the shipped kernel.
+    ///
+    /// A failure here is announced and then *ignored*: the shipped kernel is
+    /// correct, so a repack that cannot run must degrade, not abort. It must
+    /// not be silent either — a fleet quietly serving from the slow path with
+    /// nothing in the log is how "we shipped the fast kernel" becomes a claim
+    /// nobody can check.
+    ///
+    /// ⚠️ UNVERIFIED ON HARDWARE — never run.
+    #[cfg(feature = "cuda")]
+    fn tcfrag_words(&self) -> Option<&Tensor> {
+        self.tcfrag
+            .get_or_init(|| {
+                let dev = match self.blocks.device() {
+                    Device::Cuda(d) => d.clone(),
+                    _ => return None,
+                };
+                let frag_layout = cuda_ops::tcfrag2b_layout_for(&dev)?;
+                let dims = self.blocks.dims();
+                let (num_experts, n_rows, packed_per_row) = match (self.num_experts, dims) {
+                    (None, [r, p]) => (1usize, *r, *p),
+                    (Some(e), [_, r, p]) => (e, *r, *p),
+                    _ => return None,
+                };
+                match cuda_ops::tcfrag2b_repack_cuda(
+                    &self.blocks,
+                    num_experts,
+                    n_rows,
+                    packed_per_row,
+                    self.in_features,
+                    frag_layout,
+                ) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        tracing::warn!(
+                            "qtip2b TCFRAG repack declined for [{num_experts}, {n_rows}, \
+                             {packed_per_row}] (k_in={}): {e}. Keeping the shipped GEMV.",
+                            self.in_features
+                        );
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
     /// GPU forward. Single-token decode uses the fused in-register-decode
     /// GEMV (the whole point of this format); multi-token uses
     /// dequantize+matmul (GEMM amortizes decode across tokens).
@@ -1354,6 +1426,7 @@ impl Qtip2bLayer {
                 self.mcg_mult,
                 &x_rotated,
                 k_in,
+                self.tcfrag_words(),
             )?;
             if y.dtype() != out_dtype {
                 return y.to_dtype(out_dtype);
@@ -1636,6 +1709,7 @@ impl Qtip2bLayer {
             &a_rotated,
             &idx_flat,
             self.in_features,
+            self.tcfrag_words(),
         )?;
 
         let mut out = y.reshape((n_tokens, n_experts_per_tok, rows))?;
@@ -1744,6 +1818,7 @@ impl Qtip2bLayer {
             expert_bpw,
             search: self.search,
             search_detail: self.search_detail,
+            tcfrag: std::sync::OnceLock::new(),
         })
     }
 }
@@ -1782,6 +1857,7 @@ impl QuantMethod for Qtip2bLayer {
                     // we did not run the search, so we do not claim it (D4).
                     search: QtipSearchStamp::Unstamped,
                     search_detail: QtipSearchDetail::Unknown,
+                    tcfrag: std::sync::OnceLock::new(),
                 })
             }
             _ => candle_core::bail!("Qtip2bLayer requires QuantMethodConfig::Qtip2b"),
@@ -2086,6 +2162,7 @@ impl Qtip2bLayer {
                 // mixed-bpw payload would arrive with the 4-bit rung's
                 // serde revision.
                 expert_bpw: num_experts.map(ExpertBpwTable::uniform_2bit),
+                tcfrag: std::sync::OnceLock::new(),
             },
             ext_bias,
         ))
@@ -3166,6 +3243,7 @@ mod tests {
             expert_bpw: None,
             search: layer.search,
             search_detail: layer.search_detail,
+            tcfrag: std::sync::OnceLock::new(),
         };
         let cuda_dq: Vec<f32> = layer_cuda
             .dequantize_weights()?
@@ -3218,6 +3296,7 @@ mod tests {
             expert_bpw: None,
             search: layer_cpu.search,
             search_detail: layer_cpu.search_detail,
+            tcfrag: std::sync::OnceLock::new(),
         };
 
         let xdata = gaussian_fixture(k_in, 31337, 1.0);
@@ -3468,6 +3547,7 @@ mod tests {
             expert_bpw: None,
             search: fused_cpu.search,
             search_detail: fused_cpu.search_detail,
+            tcfrag: std::sync::OnceLock::new(),
         };
         let x = Tensor::from_vec(gaussian_fixture(k_in, 31337, 1.0), (1, k_in), &cpu)?
             .to_device(&cuda)?
@@ -3530,6 +3610,7 @@ mod tests {
             expert_bpw: None,
             search: wide_cpu.search,
             search_detail: wide_cpu.search_detail,
+            tcfrag: std::sync::OnceLock::new(),
         };
         let xw = Tensor::from_vec(gaussian_fixture(wk, 24680, 1.0), (1, wk), &cpu)?
             .to_device(&cuda)?
@@ -3566,6 +3647,7 @@ mod tests {
             expert_bpw: None,
             search: fb_cpu.search,
             search_detail: fb_cpu.search_detail,
+            tcfrag: std::sync::OnceLock::new(),
         };
         let xf = Tensor::from_vec(gaussian_fixture(fk, 999, 1.0), (1, fk), &cpu)?
             .to_device(&cuda)?

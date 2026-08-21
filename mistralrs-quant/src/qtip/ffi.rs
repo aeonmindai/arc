@@ -311,7 +311,7 @@ extern "C" {
     // offsets into the 3-D stacked-expert `d_packed`/`d_row_scales`, and writes
     // `d_y[pair, row] = sum_k W_expert[row,k] * x[pair,k]`. `d_x_rotated` must
     // already be in the QTIP-rotated frame. n_pairs = n_tokens * top_k.
-    pub(crate) fn launch_qtip_gather_gemv_v2_k4_l16_bf16(
+    pub(crate) fn launch_qtip_gather_gemv_v3_k4_l16_bf16(
         d_packed: *const u8,
         d_row_scales: *const f32,
         d_lut: *const f32,
@@ -327,7 +327,7 @@ extern "C" {
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
-    pub(crate) fn launch_qtip_gather_gemv_v2_k4_l16_f16(
+    pub(crate) fn launch_qtip_gather_gemv_v3_k4_l16_f16(
         d_packed: *const u8,
         d_row_scales: *const f32,
         d_lut: *const f32,
@@ -343,7 +343,7 @@ extern "C" {
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
-    pub(crate) fn launch_qtip_gather_gemv_v2_k4_l16_f32(
+    pub(crate) fn launch_qtip_gather_gemv_v3_k4_l16_f32(
         d_packed: *const u8,
         d_row_scales: *const f32,
         d_lut: *const f32,
@@ -527,6 +527,83 @@ extern "C" {
         n_pairs: i32,
         num_experts: i32,
         mult: u32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    ) -> i32;
+
+    // ----- TCFRAG-2B: the tensor-core trellis GEMV -------------------------
+    //
+    // ⚠️ UNVERIFIED ON HARDWARE — never run. See kernels/qtip/qtip2b_tcfrag.cu
+    // and src/qtip/tcfrag2b.rs.
+    //
+    // All symbols here are NEW, so a stale object file is a LINK error rather
+    // than a silently-old kernel. `layout_id` is the D22 permutation selector:
+    // DATA the host derived from the device's compute capability, refused when
+    // unknown. Every entry point returns 0 on launch and -1 when it declines
+    // (bad shape, unknown layout) — the caller then keeps the shipped kernel.
+
+    /// Words one expert occupies in the tiled TCFRAG-2B form; -1 on a shape
+    /// the format does not cover. The Rust buffer is sized from THIS so the
+    /// two sides cannot drift.
+    pub(crate) fn qtip2b_tcfrag_words_per_expert(n_rows: i32, num_symbols: i32) -> i64;
+
+    /// The load-time permutation (D22). Reads the shipped LSB-first bytes and
+    /// writes TCFRAG-2B words; the on-disk artifact is untouched.
+    pub(crate) fn launch_qtip2b_tcfrag_repack(
+        d_packed: *const u8,
+        d_words: *mut u32,
+        n_experts: i32,
+        n_rows: i32,
+        packed_per_row: i32,
+        num_symbols: i32,
+        layout_id: i32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    ) -> i32;
+
+    pub(crate) fn launch_qtip2b_tcfrag_gemv_bf16(
+        d_words: *const u32,
+        d_row_scales: *const f32,
+        d_x_rotated: *const bf16,
+        d_indices: *const u32,
+        d_y: *mut bf16,
+        n_rows: i32,
+        packed_per_row: i32,
+        num_symbols: i32,
+        n_pairs: i32,
+        num_experts: i32,
+        mult: u32,
+        layout_id: i32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    ) -> i32;
+
+    pub(crate) fn launch_qtip2b_tcfrag_gemv_f16(
+        d_words: *const u32,
+        d_row_scales: *const f32,
+        d_x_rotated: *const f16,
+        d_indices: *const u32,
+        d_y: *mut f16,
+        n_rows: i32,
+        packed_per_row: i32,
+        num_symbols: i32,
+        n_pairs: i32,
+        num_experts: i32,
+        mult: u32,
+        layout_id: i32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    ) -> i32;
+
+    pub(crate) fn launch_qtip2b_tcfrag_gemv_f32(
+        d_words: *const u32,
+        d_row_scales: *const f32,
+        d_x_rotated: *const f32,
+        d_indices: *const u32,
+        d_y: *mut f32,
+        n_rows: i32,
+        packed_per_row: i32,
+        num_symbols: i32,
+        n_pairs: i32,
+        num_experts: i32,
+        mult: u32,
+        layout_id: i32,
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     ) -> i32;
 
