@@ -784,6 +784,49 @@ output_trusted={} verify_remaining={} verify_failed={}",
         }
     }
 
+    /// The handles the device decode loop needs to replay this graph **without
+    /// the synchronize above**: the exec to launch and the graph-owned output
+    /// tensor to sample from, in place, on device.
+    ///
+    /// Handing these out is the whole difference between `replay()` and
+    /// `device_loop`. `replay()` launches, blocks on `cudaStreamSynchronize`
+    /// (line 362) and returns the output for the *host* to sample — which
+    /// copies logits down and serialises the step. `device_loop` takes the same
+    /// two handles, launches, samples on device and scatters the token back
+    /// into the pinned input buffer, so the next launch needs no host at all.
+    ///
+    /// The returned `Tensor`'s storage was allocated from the graph's private
+    /// pool during capture, so its address is stable for the life of the
+    /// `CapturedGraph` — which is exactly why sampling it in place is sound.
+    /// The clone is an `Arc` bump and does **not** extend that lifetime past
+    /// the runner's; callers must not hold it after dropping the runner.
+    ///
+    /// 🔴 The same BOOBY TRAP `replay` documents applies here verbatim: this
+    /// output aliases storage the next launch overwrites, so it is not a
+    /// snapshot. `device_loop` is safe against it for a specific reason —
+    /// every access is enqueued on this same stream, in order, and none of
+    /// them is a host read — and `normal.rs` enforces at runtime the invariant
+    /// that lets the aliasing tensor be handed back at all. Anything else
+    /// taking these handles must copy.
+    pub fn replay_handles(&self, batch_size: usize) -> Option<(CUgraphExec, Tensor)> {
+        let captured = self.graphs.get(&batch_size)?;
+        let out = captured.output.clone()?;
+        Some((captured.exec, out))
+    }
+
+    /// The stream capture and replay run on. `device_loop` launches its commit
+    /// kernel here so it is ordered behind the graph without an event.
+    pub fn stream(&self) -> CUstream {
+        self.stream
+    }
+
+    /// Count a decode step driven by the device loop rather than by
+    /// [`replay`](Self::replay), so `status_line` stays honest about how much
+    /// work this runner actually did.
+    pub fn record_device_loop_steps(&mut self, steps: u64) {
+        self.replays += steps;
+    }
+
     pub fn disable(&mut self) {
         self.enabled = false;
     }

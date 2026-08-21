@@ -527,6 +527,62 @@ pub async fn sample_and_add_toks(
     Ok(())
 }
 
+/// Is this sequence one the ArcGraph device decode loop may drive, and does it
+/// already have a token waiting?
+///
+/// Two jobs, deliberately in one place. It **publishes** eligibility, because
+/// `Pipeline::forward_inputs` decides whether to run a burst but is handed only
+/// `inputs` and `return_raw_logits` — it never sees a `Sequence`, so it cannot
+/// ask whether sampling is greedy. And it **takes** the token a burst already
+/// produced.
+///
+/// Greedy only. The device sampler runs Splitmix64 per row against the host's
+/// Isaac64, so under any stochastic configuration the two draw different —
+/// individually valid — tokens, which would silently break seeded
+/// reproducibility. Under greedy they agree exactly, which is also what makes
+/// the path verifiable against the eager one.
+///
+/// The returned `Logprobs` is not a lossy stand-in: `logprob: 0.0` is exactly
+/// what the greedy host path returns (`sampler.rs:1490`), and `bytes` /
+/// `top_logprobs` are read only when `return_logprobs` is set, which this
+/// refuses.
+// `&mut` only because `Sequence::sampler()` takes `&mut self` (`sequence.rs:885`)
+// to hand back a clone of an `Arc`. Nothing here mutates the sequence.
+#[cfg(feature = "cuda")]
+fn device_loop_pre_sampled_token(
+    seq: &mut Sequence,
+    return_logprobs: bool,
+    sample_speculative: bool,
+) -> Option<Logprobs> {
+    let eligible = !return_logprobs
+        && !sample_speculative
+        && seq.sampler().is_greedy_trivial()
+        && matches!(seq.recognizer, SequenceRecognizer::None);
+    arc_cuda_graph::set_device_loop_eligible(eligible);
+    if !eligible {
+        // Stand down rather than merely decline: a token parked by an earlier,
+        // eligible sequence must never be handed to this one.
+        arc_cuda_graph::stand_down();
+        return None;
+    }
+    arc_cuda_graph::take_pending_token().map(|token| Logprobs {
+        token,
+        logprob: 0.0,
+        bytes: None,
+        top_logprobs: None,
+    })
+}
+
+/// Without CUDA there is no device loop, so nothing is ever pre-sampled.
+#[cfg(not(feature = "cuda"))]
+fn device_loop_pre_sampled_token(
+    _seq: &mut Sequence,
+    _return_logprobs: bool,
+    _sample_speculative: bool,
+) -> Option<Logprobs> {
+    None
+}
+
 /// Async sample optionally adding to trie.
 #[allow(clippy::too_many_arguments)]
 pub async fn sample_sequence(
@@ -538,6 +594,17 @@ pub async fn sample_sequence(
     sample_speculative: bool,
     multiple_sequences: bool,
 ) -> Result<Logprobs> {
+    // ── ArcInfer/ArcGraph device decode loop ────────────────────────────────
+    // If a burst already sampled this token ON DEVICE, take it and skip the
+    // host argmax entirely. That D2H (`sampler.rs:1479`) is the last
+    // synchronization in the decode step, so this is the half of the change
+    // that makes removing `replay()`'s `cudaStreamSynchronize` worth anything.
+    if let Some(pre_sampled) =
+        device_loop_pre_sampled_token(seq, return_logprobs, sample_speculative)
+    {
+        return Ok(pre_sampled);
+    }
+
     // Both of these open and close inside a single poll, before the first
     // `.await`, so they nest correctly under `sample.join_all` even when B
     // futures are being polled in turn on this thread.
