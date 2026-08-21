@@ -96,6 +96,13 @@ pub struct NormalPipeline {
     /// load time; graph capture is deferred until first decode call.
     #[cfg(feature = "cuda")]
     autonomous_runner: Option<arc_cuda_graph::AutonomousDecodeRunner>,
+    /// ArcInfer/ArcGraph device decode loop — replays the captured graph,
+    /// samples and scatters the token on device, and never synchronizes. Built
+    /// lazily on the first admitted decode step and then kept, because every
+    /// buffer it points at must stay at the address the graph baked.
+    /// Opt-in via `ARC_GRAPH_DEVICE_LOOP`; `None` until then.
+    #[cfg(feature = "cuda")]
+    device_decode_loop: Option<arc_cuda_graph::DeviceDecodeLoop>,
 }
 
 /// What a forward pass should do with candle's caching allocator before it
@@ -1677,6 +1684,10 @@ impl Loader for NormalLoader {
             // lazy init (and graph capture) once a real decode batch arrives.
             #[cfg(feature = "cuda")]
             autonomous_runner: None,
+            // Needs the captured graph's exec handle and output tensor, so it
+            // cannot exist before capture. Built on the first admitted step.
+            #[cfg(feature = "cuda")]
+            device_decode_loop: None,
         })))
     }
 
@@ -1796,6 +1807,171 @@ impl MetadataMixin for NormalPipeline {
     }
     fn device_mapper(&self) -> Option<&dyn DeviceMapper> {
         Some(&*self.mapper)
+    }
+}
+
+#[cfg(feature = "cuda")]
+/// Drive one burst of the ArcInfer/ArcGraph device decode loop.
+///
+/// Returns `Some(logits)` when the step is covered — either because a burst
+/// just ran or because a previous burst already produced this step's token
+/// — and `None` to fall back.
+///
+/// The tokens go to `arc_cuda_graph`'s pending queue and are drained one at
+/// a time by `pipeline/sampling.rs`, so the engine's per-token `Sequence`
+/// bookkeeping (stop strings, streaming, EOS) is unchanged.
+///
+/// ⚠️ On the `pending > 0` path this returns the captured graph's output
+/// tensor **without launching anything**, so those logits are the last
+/// burst's, not this step's. That is sound only because the sampling hook
+/// short-circuits before reading them and, at batch 1,
+/// `pipeline/mod.rs:538` does no host copy. It is not a general-purpose
+/// return value, which is why this whole path refuses anything that would
+/// actually read the logits (`return_logprobs`, logits processors,
+/// penalties, grammars).
+fn device_decode_burst(
+    device: &Device,
+    runner: &mut arc_cuda_graph::CudaGraphRunner,
+    loop_slot: &mut Option<arc_cuda_graph::DeviceDecodeLoop>,
+    bs: usize,
+    seq_len: usize,
+    current_position: u32,
+    input_ids_pinned: &Tensor,
+) -> Option<Tensor> {
+    use arc_cuda_graph as acg;
+
+    let (_exec, out) = runner.replay_handles(bs)?;
+
+    // A burst already produced this step's token: no launch, no sync, no
+    // GPU work at all. This is where the amortisation actually shows up —
+    // `burst - 1` of every `burst` engine iterations do nothing but host
+    // bookkeeping.
+    if acg::pending_token_count() > 0 {
+        return Some(out);
+    }
+
+    // The fixed-capacity KV window width. Read from the graph-mode mask's
+    // last dimension rather than guessed: `models/deepseek4.rs` builds that
+    // mask as `[B, 1, 1, cfg_full.sliding_window]`, and `cfg_full` is a
+    // model fact the pipeline cannot otherwise reach.
+    let capacity = match crate::layers::graph_mode_mask() {
+        Some(m) => *m.dims().last().unwrap_or(&0),
+        None => {
+            // The mask is what keeps the decode arm from reading unwritten
+            // KV slots; without it we cannot bound the burst.
+            acg::stand_down();
+            return None;
+        }
+    };
+    let vocab = *out.dims().last().unwrap_or(&0);
+    if capacity == 0 || vocab == 0 {
+        acg::stand_down();
+        return None;
+    }
+
+    let cfg = acg::DeviceLoopConfig {
+        position_limit: capacity as u32,
+        ..acg::DeviceLoopConfig::new(vocab, -1, capacity as u32)
+    };
+
+    let facts = acg::AdmissionFacts {
+        batch_size: bs,
+        seq_len,
+        graph_ready: runner.replay_output_trusted(),
+        // Established by `sampling.rs` from the Sequence on the previous
+        // step; false until one has confirmed it.
+        greedy: acg::device_loop_eligible(),
+        return_logprobs: false,
+        host_side_logits_work: false,
+        current_position,
+    };
+    let steps = match acg::admit(&facts, &cfg, acg::device_loop_enabled()) {
+        Ok(s) => s,
+        Err(reason) => {
+            tracing::debug!("ArcGraph device loop declined this step: {reason}");
+            acg::stand_down();
+            return None;
+        }
+    };
+
+    if loop_slot.is_none() {
+        let positions = crate::layers::graph_mode_positions();
+        match acg::DeviceDecodeLoop::new(
+            device,
+            _exec,
+            runner.stream(),
+            &out,
+            input_ids_pinned,
+            positions.as_ref(),
+            cfg,
+        ) {
+            Ok(l) => {
+                tracing::info!(
+                    "ArcGraph device decode loop ENGAGED: burst={} vocab={vocab} \
+                     kv_window={capacity}. {}",
+                    cfg.burst,
+                    l.status_line()
+                );
+                *loop_slot = Some(l);
+            }
+            Err(e) => {
+                acg::kill_device_loop(&format!("could not build the device loop: {e}"));
+                return None;
+            }
+        }
+    }
+    let dl = loop_slot.as_mut()?;
+
+    match dl.run(steps) {
+        Ok(outcome) => {
+            // `first()` rather than `[0]`: a burst that returned no rows would
+            // be a bug, but it must not panic the engine thread mid-request.
+            let row = match outcome.tokens.first() {
+                Some(r) => r,
+                None => {
+                    acg::kill_device_loop("burst returned no token rows");
+                    *loop_slot = None;
+                    return None;
+                }
+            };
+            acg::push_pending_tokens(row);
+            // ── ALIASING CONTRACT, ENFORCED ─────────────────────────────
+            // The tensor we are about to return aliases the graph-owned
+            // storage that the NEXT `cuGraphLaunch` overwrites. It is only
+            // safe to hand back because the sampling hook short-circuits
+            // before anything reads it — and that hook fires if and only if a
+            // token is pending. So the invariant is not "we reasoned it
+            // through", it is checked here: no pending token, no aliasing
+            // tensor. `push_pending_tokens` drops negative ids, so a row that
+            // was entirely garbage lands here rather than silently arriving at
+            // a `sample_sequence` that would then read clobbered logits and
+            // return a plausible wrong token.
+            if acg::pending_token_count() == 0 {
+                acg::kill_device_loop(
+                    "burst produced no usable token, so the aliasing logits tensor must not be \
+                     returned",
+                );
+                *loop_slot = None;
+                return None;
+            }
+            runner.record_device_loop_steps(outcome.steps_launched as u64);
+            if outcome.hit_eos {
+                tracing::debug!(
+                    "ArcGraph device loop: EOS at token {} of a {}-step burst; the remaining \
+                     steps were already enqueued and are discarded",
+                    row.len(),
+                    outcome.steps_launched
+                );
+            }
+            Some(out)
+        }
+        Err(e) => {
+            // A burst failure means the graph input buffer may hold an
+            // uncommitted or stale id, so this cannot be retried.
+            acg::kill_device_loop(&format!("burst failed: {e}"));
+            *loop_slot = None;
+            None
+        }
     }
 }
 
@@ -1939,6 +2115,11 @@ impl Pipeline for NormalPipeline {
                             }
                         }
                     }
+                    // Bound before the chain: `self.device()` returns by value,
+                    // and taking a reference to it inside an expression that
+                    // also takes `&mut self.device_decode_loop` would borrow
+                    // `self` both ways at once.
+                    let dev_for_loop = self.device();
                     let captured: Option<Tensor> = if probe
                         && seq_len == 1
                         && self.cuda_graph_runner.is_some()
@@ -2108,6 +2289,32 @@ impl Pipeline for NormalPipeline {
                                 cd.set_capture_mode(false);
                             }
                             cap_result
+                        } else if runner.has_graph(bs)
+                            && arc_cuda_graph::device_loop_enabled()
+                            && !arc_cuda_graph::device_loop_killed()
+                            && device_decode_burst(
+                                &dev_for_loop,
+                                &mut runner,
+                                &mut self.device_decode_loop,
+                                bs,
+                                seq_len,
+                                seqlen_offsets.first().copied().unwrap_or(0) as u32,
+                                &input_ids,
+                            )
+                            .is_some()
+                        {
+                            // ArcInfer/ArcGraph device decode loop: the burst
+                            // already ran (or a previous one covered this step),
+                            // the token was sampled and scattered on device, and
+                            // `pipeline/sampling.rs` will take it from the ring.
+                            // No sync, no host sample, no D2H.
+                            //
+                            // The logits handed back are the captured graph's
+                            // output tensor. They are NOT read: the sampling
+                            // hook short-circuits first, and at batch 1
+                            // `pipeline/mod.rs:538` does no host copy. Admission
+                            // refuses everything that would read them.
+                            runner.replay_handles(bs).map(|(_, out)| out)
                         } else if runner.has_graph(bs) {
                             let t = std::time::Instant::now();
                             let replayed = runner.replay(bs);

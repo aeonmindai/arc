@@ -12,6 +12,11 @@ pub mod autonomous;
 pub mod buffers;
 pub mod decode_forward;
 pub mod dedicated;
+/// Device-resident decode loop: N steps, N `cuGraphLaunch` calls, zero stream
+/// synchronizations. Opt-in via `ARC_GRAPH_DEVICE_LOOP`. The driver and its
+/// policy compile without CUDA so they are unit-tested on any host; only the
+/// pointer plumbing is gated.
+pub mod device_loop;
 pub mod ffi;
 pub mod gemv_ffi;
 pub mod graph;
@@ -80,6 +85,14 @@ pub use buffers::{DecodeInputBuffers, DecodeState};
 pub use decode_forward::{decode_forward, DecodeBuffers, LayerKvCache, PagedAttentionState};
 #[cfg(feature = "cuda")]
 pub use dedicated::DedicatedDecodePath;
+pub use device_loop::{
+    admit, clear_pending_tokens, device_loop_eligible, device_loop_enabled, device_loop_killed,
+    kill_device_loop, pending_token_count, push_pending_tokens, set_device_loop_eligible,
+    stand_down, take_pending_token, AdmissionFacts, BurstDriver, BurstOutcome, DeviceLoopConfig,
+    DeviceLoopError, DeviceOps, Refusal, StreamState,
+};
+#[cfg(feature = "cuda")]
+pub use device_loop::{CudaDeviceOps, DeviceDecodeLoop};
 #[cfg(feature = "cuda")]
 pub use graph::CudaGraphRunner;
 #[cfg(feature = "cuda")]
