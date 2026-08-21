@@ -185,22 +185,6 @@ selected on a model that declines PagedAttention.
 ⇒ **The narrowed row stands; the original claim stays retracted.** Do not
 re-broaden it.
 
-### Owner
-
-**PR #213** (`fix/arckv-decode-vram-leak`) is open with a plan: the retention
-cap is `min(1 GiB, max(64 MiB, free/8))` planned from reported headroom and
-re-armed during decode. Its own reasoning is that the existing 1 GiB constant is
-**unreachable** — V4 loads to 142,927 MiB of 143,771, so decode starts with
-**~844 MiB free** and a 1,024 MiB cap can never be crossed. **Retention was
-bounded on paper and unbounded in practice.**
-
-⚠️ **#213 is UNVERIFIED on hardware.** Its own falsification criterion is
-written down and should be honoured: `ARC_ALLOC_CACHE_STATS=32` must show `held`
-plateauing at ~105 MiB **and** `free/step` going non-zero within the first few
-tokens **and** a generation passing 30 tokens. If `held` plateaus and it still
-OOMs, the victim allocation is larger than the headroom and the divisor must not
-be re-tuned to hide it.
-
 ### ✅ RESOLVED ON THE BOX — the missing ~60 GB is TCFRAG, and it reconciles both runs exactly
 
 This started as an unexplained contradiction: **PR #182's H200 leg ran 2,600
@@ -241,6 +225,21 @@ the original brief's instinct was right for a better reason than it gave:
 **#213 must not land as "the OOM fix"** — **PR #209, already merged, is the fix
 that restored the headroom**, and #213 bounds the rate that consumes it. Both
 are worth having; only one of them is what unblocked serving.
+
+### The rate half — PR #213, and it is still worth landing
+
+**PR #213** (`fix/arckv-decode-vram-leak`, open) plans the retention cap as
+`min(1 GiB, max(64 MiB, free/8))` from reported headroom and re-arms it during
+decode. Its diagnosis of the *cap* is exactly right — the 1 GiB constant was
+**unreachable** at 844 MiB free, so **retention was bounded on paper and
+unbounded in practice** — and that stays true at any headroom small enough to
+matter. What it is not is the reason serving was broken.
+
+⚠️ **#213 is UNVERIFIED on hardware**, and its falsification criterion should be
+honoured rather than softened: `ARC_ALLOC_CACHE_STATS=32` must show `held`
+plateauing **and** `free/step` non-zero. **The right run for it is now a
+256-token one**, which #209 made possible — testing it against a 22-token crash
+would have measured nothing.
 
 ⚠️ **Still open (do not read this as closing it): the F8E4M3 dtype in the
 backtrace.** TCFRAG's retained bytes are repacked trellis words, not E4M3, so
