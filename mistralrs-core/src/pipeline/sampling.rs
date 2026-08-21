@@ -558,24 +558,73 @@ fn device_loop_pre_sampled_token(
     seq: &mut Sequence,
     return_logprobs: bool,
     sample_speculative: bool,
-) -> Option<Logprobs> {
+) -> Result<Option<Logprobs>> {
+    let seq_id = *seq.id();
     let eligible = !return_logprobs
         && !sample_speculative
         && seq.sampler().is_greedy_trivial()
         && matches!(seq.recognizer, SequenceRecognizer::None);
-    arc_cuda_graph::set_device_loop_eligible(eligible);
+    arc_cuda_graph::set_device_loop_eligible(seq_id, eligible);
+    // Did the forward serve this step from the pending queue WITHOUT
+    // launching? Then the logits this sample holds alias graph-owned storage
+    // from an earlier step — sound only if a parked token is taken below.
+    // Consumed here, once, whatever the outcome.
+    let aliased_logits = arc_cuda_graph::take_aliased_logits_marker();
     if !eligible {
         // Stand down rather than merely decline: a token parked by an earlier,
         // eligible sequence must never be handed to this one.
         arc_cuda_graph::stand_down();
-        return None;
+        if aliased_logits {
+            candle_core::bail!(
+                "ArcGraph: this step's logits were served from the device loop's pending queue \
+                 for another sequence and alias graph-owned storage; this sequence (id {seq_id}) \
+                 is not device-loop eligible and cannot consume them. Failing the step rather \
+                 than sampling stale logits."
+            );
+        }
+        return Ok(None);
     }
-    arc_cuda_graph::take_pending_token().map(|token| Logprobs {
-        token,
-        logprob: 0.0,
-        bytes: None,
-        top_logprobs: None,
-    })
+    match arc_cuda_graph::take_pending_token(seq_id) {
+        arc_cuda_graph::PendingTake::Taken(token) => Ok(Some(Logprobs {
+            token,
+            logprob: 0.0,
+            bytes: None,
+            top_logprobs: None,
+        })),
+        // Nothing parked: the forward really ran for this step (the pending
+        // short-circuit only fires with a non-empty queue), so the logits are
+        // real and the host samples them. `aliased_logits` cannot be set here
+        // in a consistent engine: it implies the queue was non-empty when the
+        // forward ran and empty now, on the same thread with no take between.
+        arc_cuda_graph::PendingTake::Empty => {
+            if aliased_logits {
+                candle_core::bail!(
+                    "ArcGraph: the forward served this step from the pending queue but the queue \
+                     is empty at sampling time — the aliased logits cannot be sampled. Failing \
+                     the step."
+                );
+            }
+            Ok(None)
+        }
+        // The queue belonged to another sequence and was dropped whole (and
+        // logged: "ArcGraph: dropped N foreign parked tokens"). If the
+        // forward ALSO short-circuited on that foreign queue, these logits
+        // are a stale alias and sampling them would hand this sequence a
+        // plausible token from the other sequence's distribution — fail the
+        // step loudly instead. Without the marker the forward genuinely ran
+        // (e.g. a batched eager step), the logits are this sequence's own,
+        // and sampling proceeds normally.
+        arc_cuda_graph::PendingTake::Foreign { dropped } => {
+            if aliased_logits {
+                candle_core::bail!(
+                    "ArcGraph: this step's logits alias graph storage served against {dropped} \
+                     parked token(s) belonging to another sequence; sampling them would leak \
+                     another user's distribution into sequence {seq_id}. Failing the step."
+                );
+            }
+            Ok(None)
+        }
+    }
 }
 
 /// Async sample optionally adding to trie.
@@ -595,7 +644,7 @@ pub async fn sample_sequence(
     // synchronization in the decode step, so this is the half of the change
     // that makes removing `replay()`'s `cudaStreamSynchronize` worth anything.
     if let Some(pre_sampled) =
-        device_loop_pre_sampled_token(seq, return_logprobs, sample_speculative)
+        device_loop_pre_sampled_token(seq, return_logprobs, sample_speculative)?
     {
         return Ok(pre_sampled);
     }
@@ -1033,8 +1082,10 @@ mod device_loop_cross_sequence_leak_tests {
 
     /// A greedy-trivial sequence: no temperature, penalties, bias, processors
     /// or recognizer — exactly the shape `device_loop_pre_sampled_token`
-    /// accepts, so the pending queue is live for it.
-    fn greedy_seq() -> Sequence {
+    /// accepts, so the pending queue is live for it. `id` matters: the
+    /// pending queue is owner-tagged by sequence id, so every test sequence
+    /// must carry a distinct one, as real requests do.
+    fn greedy_seq(id: usize) -> Sequence {
         let (dummy_sender, rx) = tokio::sync::mpsc::channel(1);
         LIVE_CLIENTS.with(|k| k.borrow_mut().push(rx));
         let group = Arc::new(std::sync::Mutex::new(SequenceGroup::new(
@@ -1059,7 +1110,7 @@ mod device_loop_cross_sequence_leak_tests {
         Sequence::new_waiting(
             vec![1u32; 4],
             String::new(),
-            0,
+            id,
             0,
             1,
             dummy_sender,
@@ -1130,7 +1181,7 @@ mod device_loop_cross_sequence_leak_tests {
         // ── Sequence A, decode step N: queue empty, host argmax, and the
         // pre-hook publishes A's eligibility — the same order the engine
         // runs (sample N publishes, forward N+1 bursts).
-        let mut seq_a = greedy_seq();
+        let mut seq_a = greedy_seq(1);
         assert_eq!(sample(&mut seq_a, PEAK_A, &rng).await, PEAK_A);
 
         // ── Forward N+1: the burst parks its FULL length (eos -1).
@@ -1159,7 +1210,7 @@ mod device_loop_cross_sequence_leak_tests {
         );
 
         // ── Sequence B's FIRST sample (the one right after its prefill).
-        let mut seq_b = greedy_seq();
+        let mut seq_b = greedy_seq(2);
         let b_first = sample(&mut seq_b, PEAK_B, &rng).await;
 
         // ── The claim, part 2: B's token comes from B's own logits and is
@@ -1198,7 +1249,7 @@ mod device_loop_cross_sequence_leak_tests {
             arc_cuda_graph::stand_down();
             arc_cuda_graph::push_pending_tokens(&BURST);
             assert_eq!(arc_cuda_graph::pending_token_count(), BURST.len());
-            let seq = greedy_seq();
+            let seq = greedy_seq(3);
             seq.set_state(state);
             assert_eq!(
                 arc_cuda_graph::pending_token_count(),
@@ -1206,5 +1257,103 @@ mod device_loop_cross_sequence_leak_tests {
                 "transition to {state:?} left parked tokens for the next sequence"
             );
         }
+    }
+
+    /// The interleave the completion funnel CANNOT see: the DefaultScheduler
+    /// bucketing waitlist moves a running sequence aside **without a state
+    /// modification** (`default_scheduler.rs`, `bucket_and_waitlist_seqs_waiting`
+    /// says so in its doc), so no `set_state` ever fires for A. The owner tag
+    /// is the structural defence: B's first sample must consume nothing of
+    /// A's — the foreign queue is dropped whole (logged as
+    /// "ArcGraph: dropped N foreign parked tokens") rather than served, to A
+    /// included, whose device-side burst state is stale by then.
+    ///
+    /// Mutation check (run both ways before shipping): with the owner
+    /// comparison in `take_pending_token` forced to `true`, B's first token
+    /// comes back `22` — A's parked id — instead of `PEAK_B`.
+    #[tokio::test]
+    async fn a_waitlisted_sequence_with_no_state_change_cannot_leak_into_the_next() {
+        arc_cuda_graph::stand_down();
+        let rng = Arc::new(std::sync::Mutex::new(Isaac64Rng::seed_from_u64(0)));
+
+        // ── A (id 31) decodes at batch 1; its burst parks; it drains one
+        // (the control proving the take path is live in this build).
+        let mut seq_a = greedy_seq(31);
+        assert_eq!(sample(&mut seq_a, PEAK_A, &rng).await, PEAK_A);
+        arc_cuda_graph::push_pending_tokens(&BURST);
+        assert_eq!(sample(&mut seq_a, PEAK_A, &rng).await, BURST[0] as u32);
+
+        // ── A is WAITLISTED: no set_state, no funnel, nothing runs. Its
+        // undrained tail [22, 23, 24] is still parked when B is scheduled.
+
+        // ── B (id 32) runs; its forward really ran, so its logits are real.
+        let mut seq_b = greedy_seq(32);
+        let b_first = sample(&mut seq_b, PEAK_B, &rng).await;
+        assert!(
+            !BURST.contains(&(b_first as i32)),
+            "cross-request token leak through the waitlist interleave: B's first sampled token \
+             is {b_first}, one of A's parked burst tokens"
+        );
+        assert_eq!(b_first, PEAK_B, "B must sample its own logits");
+
+        // ── A's foreign-tagged tail was dropped whole, not left to resurface.
+        assert_eq!(
+            arc_cuda_graph::pending_token_count(),
+            0,
+            "the foreign queue must be dropped at B's take, not survive it"
+        );
+
+        // ── A resumes: nothing stale to consume, so it host-samples its own
+        // logits. (Its dropped tokens were computed against device state that
+        // no longer matches; replaying them would corrupt A's output.)
+        assert_eq!(sample(&mut seq_a, PEAK_A, &rng).await, PEAK_A);
+    }
+
+    /// The double fault: the forward served a step from the pending queue
+    /// (returning the ALIASED stale logits tensor, launching nothing) and the
+    /// scheduler then swapped sequences before the sample ran. The taker is
+    /// foreign, so there is no parked token to return — and the logits in
+    /// hand are another sequence's stale graph output. Sampling them would
+    /// leak A's distribution into B; the step must fail loudly instead.
+    #[tokio::test]
+    async fn an_aliased_step_served_for_another_sequence_fails_instead_of_sampling_stale_logits() {
+        arc_cuda_graph::stand_down();
+        let rng = Arc::new(std::sync::Mutex::new(Isaac64Rng::seed_from_u64(0)));
+
+        // A (id 41) parks a burst; the forward short-circuits on it.
+        let mut seq_a = greedy_seq(41);
+        assert_eq!(sample(&mut seq_a, PEAK_A, &rng).await, PEAK_A);
+        arc_cuda_graph::push_pending_tokens(&BURST);
+        arc_cuda_graph::note_aliased_logits_served();
+
+        // B (id 42) is what actually samples that step.
+        let mut seq_b = greedy_seq(42);
+        let res = sample_sequence(
+            peaked_logits(PEAK_B),
+            &mut seq_b,
+            false,
+            rng.clone(),
+            false,
+            false,
+            false,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "a stale aliased-logits step served against a foreign queue must fail the step, \
+             not return a plausible token"
+        );
+
+        // Control: the marker is harmless when the owner itself samples — the
+        // parked token is taken and the aliased tensor is never read.
+        let mut seq_c = greedy_seq(43);
+        assert_eq!(sample(&mut seq_c, PEAK_A, &rng).await, PEAK_A);
+        arc_cuda_graph::push_pending_tokens(&[25]);
+        arc_cuda_graph::note_aliased_logits_served();
+        assert_eq!(
+            sample(&mut seq_c, PEAK_A, &rng).await,
+            25,
+            "the owner's own aliased-served step must take its parked token normally"
+        );
     }
 }

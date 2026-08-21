@@ -167,11 +167,7 @@ pub(crate) enum AllocCacheAction {
 /// Pure, so the policy is testable without a GPU — which matters, because the
 /// allocator itself has no tests at all in either repo.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-pub(crate) fn alloc_cache_action(
-    seq_len: usize,
-    enabled: bool,
-    killed: bool,
-) -> AllocCacheAction {
+pub(crate) fn alloc_cache_action(seq_len: usize, enabled: bool, killed: bool) -> AllocCacheAction {
     let want = !killed && seq_len == 1;
     match (want, enabled) {
         (true, false) => AllocCacheAction::Enable,
@@ -2165,8 +2161,32 @@ fn device_decode_burst(
     // GPU work at all. This is where the amortisation actually shows up —
     // `burst - 1` of every `burst` engine iterations do nothing but host
     // bookkeeping.
+    //
+    // Guarded twice, because returning `out` here hands back an ALIASING
+    // tensor from an earlier launch and skips this step's forward entirely —
+    // sound only when the very next sample takes a parked token:
+    // * `seq_len == 1` — parked tokens present at a PREFILL step belong to a
+    //   sequence that left the running set without a state change (the
+    //   bucketing waitlist); serving the new request's prefill from them
+    //   would skip the prefill and leak the old sequence's tokens.
+    // * `pending_owned_by_current()` — the queue must belong to the sequence
+    //   whose sample published eligibility last, i.e. the one this decode
+    //   step is for at batch 1.
+    // Either violation drops the parked tokens (loudly) and falls through to
+    // the real forward.
     if acg::pending_token_count() > 0 {
-        return Some(out);
+        if seq_len == 1 && acg::pending_owned_by_current() {
+            acg::note_aliased_logits_served();
+            return Some(out);
+        }
+        tracing::warn!(
+            "ArcGraph: dropped {} foreign parked tokens — parked queue found at a step it does \
+             not belong to (seq_len={}, owned_by_current={}); running the real forward instead",
+            acg::pending_token_count(),
+            seq_len,
+            acg::pending_owned_by_current(),
+        );
+        acg::stand_down();
     }
 
     // The fixed-capacity KV window width. Read from the graph-mode mask's
@@ -2388,9 +2408,7 @@ impl Pipeline for NormalPipeline {
                                 cd.set_alloc_cache_enabled(true);
                                 arm_alloc_cache_capacity(cd, &alloc_cache_device);
                             }
-                            AllocCacheAction::DrainAndDisable => {
-                                cd.set_alloc_cache_enabled(false)
-                            }
+                            AllocCacheAction::DrainAndDisable => cd.set_alloc_cache_enabled(false),
                             // Steady-state decode. The cap has to be re-armed
                             // here and not only on the Enable edge: free VRAM
                             // shrinks token by token as the KV cache grows, so
@@ -2743,7 +2761,8 @@ impl Pipeline for NormalPipeline {
                                                     );
                                                         if arc_layer_bisect() {
                                                             let bufs =
-                                                                crate::layers::arc_layer_trace_take();
+                                                                crate::layers::arc_layer_trace_take(
+                                                                );
                                                             tracing::error!(
                                                                 "ARC BISECT: holding {} captured layer buffers",
                                                                 bufs.as_ref()
@@ -3779,10 +3798,7 @@ mod alloc_cache_policy_tests {
     /// enabling the cache.
     #[test]
     fn degenerate_zero_length_forward_does_not_enable() {
-        assert_eq!(
-            alloc_cache_action(0, false, false),
-            AllocCacheAction::Leave
-        );
+        assert_eq!(alloc_cache_action(0, false, false), AllocCacheAction::Leave);
         assert_eq!(
             alloc_cache_action(0, true, false),
             AllocCacheAction::DrainAndDisable

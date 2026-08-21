@@ -257,6 +257,20 @@ static REGISTRY: &[Capability] = &[
                      blocking condition as the top_k entry above.",
         },
     },
+    Capability {
+        name: "ArcGraph device decode loop opt-in gate (ARC_GRAPH_DEVICE_LOOP)",
+        parent: "ArcInfer / ArcGraph",
+        check: Check::Symbol {
+            symbol: "device_loop_enabled",
+            defined_in: "arc-cuda-graph/src/device_loop.rs",
+        },
+        // The gate is opt-in default-off, but the CALL PATH must be live:
+        // `normal.rs::forward_inputs` consults `device_loop_enabled()` before
+        // `device_decode_burst`. If this reference disappears, the env var
+        // parses forever and engages nothing — the switched-off class this
+        // file exists to catch.
+        status: Status::Live,
+    },
 ];
 
 /// Symbols that are defined in Arc-owned source and have **no production
