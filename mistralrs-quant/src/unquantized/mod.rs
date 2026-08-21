@@ -65,10 +65,60 @@ impl QuantMethod for UnquantLinear {
         // Batch matrix multiplication
         maybe_init_cublas_lt_wrapper(a.device().clone());
 
-        // Try custom GEMV for single-token decode (batch_size=1)
+        // Try custom GEMV for single-token decode (batch_size=1).
+        //
+        // Deliberately tested on the *original* shape, before the flatten
+        // below: `should_use_gemv` reads `product(dims[..rank-1])` against
+        // `MAX_GEMV_BATCH_SIZE`, so flattening first would not change which
+        // side of that threshold a tensor lands on, but keeping the order
+        // makes that a fact rather than a coincidence.
         #[cfg(feature = "cuda")]
         if crate::gemv::should_use_gemv(a, &self.w) {
             return crate::gemv::gemv(a, &self.w, self.b.as_ref());
+        }
+
+        // 🔴 A rank-3 activation must be flattened to 2-D, or the weight is
+        // re-read from HBM once per batch row.
+        //
+        // Every activation in this engine is rank-3 `[B, T, hidden]`. Left
+        // that way, the `match` below took `broadcast_left(B)` — a stride-0
+        // view of the weight — and both dispatch arms then treated `B` as a
+        // GEMM batch dimension with `stride_b = 0`. At decode `T = 1`, so that
+        // is **B independent `m = 1` GEMVs over the same weight**: a batched
+        // GEMV wearing a GEMM's name.
+        //
+        // The cost is not subtle. V4's `lm_head` is `[256, 1, 4096] x
+        // [4096, 129280]` BF16, whose bound is
+        // `max(271 GFLOP / 989 TFLOP/s, 1.06 GB / 4.8 TB/s) = 0.27 ms`.
+        // Measured on an H200 it is **67 ms/step, 8.41% of a 794 ms B=256
+        // decode step** — 244x over, and `244 ~= B = 256` is the whole
+        // explanation. Back-solving, 256 x 1.06 GB = 271 GB of weight traffic
+        // per step at 4.05 TB/s: the kernel is running at 84% of peak
+        // bandwidth while doing 256x the necessary reads. The 1.06 GB weight
+        // does not fit in L2, so nothing is reused across rows.
+        //
+        // Flattened, the same work is one `[256, 4096] x [4096, 129280]` GEMM:
+        // the weight is streamed once and the tensor cores see `m = 256`
+        // instead of `m = 1`.
+        //
+        // The identical defect was fixed one level up in `BlockwiseFP8Linear`
+        // (445b92063) by flattening before delegating here. That fix only
+        // covers activations routed through blockwise FP8 — `lm_head` is not,
+        // because DeepSeek ships `lm_head.weight` in BF16 with no
+        // `weight_scale_inv` and `blockwise_fp8::linear_no_bias` short-circuits
+        // straight to `UnquantLinear`. Fixing it here is the general case and
+        // subsumes the caller-side workaround.
+        //
+        // UNVERIFIED ON HARDWARE: derived from shapes and H200 peaks, not
+        // measured. The arithmetic above is the claim; the speedup is not.
+        if a.rank() > 2 {
+            let batch_dims = a.dims()[..a.rank() - 1].to_vec();
+            let rows: usize = batch_dims.iter().product();
+            let features = a.dim(D::Minus1)?;
+            let out = self.forward(&a.reshape((rows, features))?)?;
+            let mut out_dims = batch_dims;
+            out_dims.push(out.dim(D::Minus1)?);
+            return out.reshape(out_dims);
         }
 
         let w = match *a.dims() {
@@ -91,21 +141,34 @@ impl QuantMethod for UnquantLinear {
 
             match a.device().location() {
                 DeviceLocation::Cuda { .. } => {
-                    // Try to use cublaslt, otherwise fallback to gemm
+                    // Try to use cublaslt, otherwise fallback to gemm.
+                    //
+                    // The `rank() >= 3` guard mirrors the no-bias arm below and
+                    // is now load-bearing: `batch_matmul` calls `dims3()` on
+                    // both operands (`cublaslt/api.rs`), so a 2-D activation
+                    // errors out rather than falling back. Before the flatten
+                    // above that was unreachable-by-accident — every caller
+                    // passed rank 3 — which is exactly the kind of latent arm
+                    // a shape change turns into a crash.
                     if let (Device::Cuda(_), Some(cublaslt)) =
                         (a.device(), CUBLASLT_CONTROLLER.get_for_device(a.device()))
                     {
-                        cublaslt
-                            .batch_matmul(
-                                a,
-                                &w,
-                                Some(&b.t()?.contiguous()?),
-                                None,
-                                Some(1.0),
-                                None,
-                                None,
-                            )?
-                            .t()
+                        if a.rank() >= 3 && w.rank() >= 3 {
+                            cublaslt
+                                .batch_matmul(
+                                    a,
+                                    &w,
+                                    Some(&b.t()?.contiguous()?),
+                                    None,
+                                    Some(1.0),
+                                    None,
+                                    None,
+                                )?
+                                .t()
+                        } else {
+                            let matmul_result = MatMul.matmul(a, &w.t()?)?;
+                            matmul_result.broadcast_add(&b)
+                        }
                     } else {
                         let matmul_result = a.matmul(&w.t()?)?;
                         matmul_result.broadcast_add(&b)
@@ -662,5 +725,101 @@ impl QuantizedSerde for UnquantLinear {
             }),
             b,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lin(out: usize, inp: usize, bias: bool) -> Result<UnquantLinear> {
+        let dev = Device::Cpu;
+        // Deterministic, non-symmetric weights: a constant or symmetric matrix
+        // would make a transposed or broadcast result compare equal by luck.
+        let w: Vec<f32> = (0..out * inp)
+            .map(|i| ((i % 17) as f32 - 8.0) / 16.0)
+            .collect();
+        let w = Tensor::from_vec(w, (out, inp), &dev)?;
+        let b = if bias {
+            let v: Vec<f32> = (0..out).map(|i| (i % 5) as f32 - 2.0).collect();
+            Some(Tensor::from_vec(v, out, &dev)?)
+        } else {
+            None
+        };
+        UnquantLinear::new(QuantMethodConfig::Unquantized(Linear::new(w, b)))
+    }
+
+    fn act(rows: usize, inp: usize) -> Result<Tensor> {
+        let v: Vec<f32> = (0..rows * inp)
+            .map(|i| ((i % 23) as f32 - 11.0) / 32.0)
+            .collect();
+        Tensor::from_vec(v, (rows, inp), &Device::Cpu)
+    }
+
+    /// **The flatten must not change the answer.**
+    ///
+    /// `forward` now reshapes any rank-3 activation to `[B*T, hidden]` so the
+    /// weight is streamed once instead of once per batch row. That is a
+    /// dispatch change on the hottest path in the engine, so what it owes is
+    /// exact agreement with the 2-D result it is derived from — element for
+    /// element, not "close".
+    #[test]
+    fn rank3_forward_matches_the_flattened_2d_result() -> Result<()> {
+        for bias in [false, true] {
+            let l = lin(7, 5, bias)?;
+            let flat = act(6, 5)?;
+            let want = l.forward(&flat)?;
+
+            for shape in [(6usize, 1usize), (3, 2), (2, 3), (1, 6)] {
+                let a = flat.reshape((shape.0, shape.1, 5))?;
+                let got = l.forward(&a)?;
+                assert_eq!(
+                    got.dims(),
+                    &[shape.0, shape.1, 7],
+                    "batch dims must survive the round trip (bias={bias})"
+                );
+                let diff = (got.reshape((6, 7))? - &want)?.abs()?.max_all()?;
+                assert_eq!(
+                    diff.to_scalar::<f32>()?,
+                    0.0,
+                    "rank-3 {shape:?} disagreed with the 2-D result (bias={bias})"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Rank 4 is the `[b1, b2, T, hidden]` shape the old `match` had its own
+    /// arm for; it flattens to the same three leading dims.
+    #[test]
+    fn rank4_forward_keeps_its_leading_dims() -> Result<()> {
+        let l = lin(3, 4, false)?;
+        let a = act(8, 4)?.reshape((2, 2, 2, 4))?;
+        let got = l.forward(&a)?;
+        assert_eq!(got.dims(), &[2, 2, 2, 3]);
+        let want = l.forward(&act(8, 4)?)?;
+        let diff = (got.reshape((8, 3))? - &want)?.abs()?.max_all()?;
+        assert_eq!(diff.to_scalar::<f32>()?, 0.0);
+        Ok(())
+    }
+
+    /// A non-contiguous activation reaches `reshape`, which candle services
+    /// with a strided copy rather than an error. Pinning it here because the
+    /// flatten is the only thing standing between a transposed view and
+    /// `matmul`.
+    #[test]
+    fn non_contiguous_rank3_input_still_agrees() -> Result<()> {
+        let l = lin(3, 4, false)?;
+        // [2, 4, 3] -> transpose to [2, 3, 4]: last dim is no longer the
+        // fastest-varying axis.
+        let base = act(8, 3)?.reshape((2, 4, 3))?;
+        let a = base.transpose(1, 2)?;
+        assert!(!a.is_contiguous());
+        let got = l.forward(&a)?;
+        assert_eq!(got.dims(), &[2, 3, 3]);
+        let want = l.forward(&a.contiguous()?.reshape((6, 4))?)?;
+        let diff = (got.reshape((6, 3))? - &want)?.abs()?.max_all()?;
+        assert_eq!(diff.to_scalar::<f32>()?, 0.0);
+        Ok(())
     }
 }
