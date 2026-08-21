@@ -35,10 +35,12 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-// The `sum2` computed codebook. RUN-161 already deleted the LUT *load* from
-// this kernel by evaluating the Gaussian in registers — but that costs a
-// logf + sqrtf + sincosf per weight on the SFU. The sum2 code replaces all
-// three transcendentals with IMAD/LOP3/cvt/FADD.
+// The codebook accessor shared by every kernel on this rung: `cb_mult == 0`
+// gathers the stored Gaussian table, nonzero evaluates the computed `sum2`
+// MCG code in registers. RUN-161 had this kernel re-derive the Gaussian
+// locally instead of reading the table it was handed; that recomputation
+// disagreed with the host on 89.2% of the 65,536 codewords and is gone. See
+// the note above `qtip_gather_gemv_warp_kernel`.
 #include "qtip_codebook.cuh"
 
 namespace {
@@ -88,55 +90,37 @@ __device__ __forceinline__ float2 gg_load2(const __nv_bfloat16* p) {
 }
 
 // ---------------------------------------------------------------------------
-// RUN-161: COMPUTED QTIP CODEBOOK (the "trellis is not instruction-bound" fix).
+// FIXED (this change): `cb_mult == 0` now GATHERS THE TABLE, like every other
+// kernel on this rung.
 //
-// Each 16-bit trellis state decodes to V=2 Gaussian reproduction values. The
-// host bakes these with gaussian_lut() (mod.rs:174): splitmix64(state) -> two
-// uniforms -> Box-Muller. That is a PURE FUNCTION of `state`, so we evaluate it
-// inline in registers instead of gathering from the 512 KB global LUT.
+// What was here: a local `qtip_decode_state()` that re-evaluated the Gaussian
+// (splitmix64 -> two uniforms -> Box-Muller) in registers, plus `(void)lut;`
+// at the top of the kernel — the 512 KiB table the caller handed it was
+// DISCARDED. The claim was that the recomputation "mirrors the host math
+// exactly". It does not:
 //
-// Why this is THE lever: at L=16 the LUT is 2^16 * V * 4 = 512 KB, which does
-// NOT fit in 48 KB shared memory, so the prior "stage LUT to shared" path was
-// dead and every per-symbol weight lookup was a dependent, data-scattered
-// GLOBAL load. ncu attributed the kernel's stall to long_scoreboard (global
-// LOAD latency on exactly this gather). Computing the code in-register removes
-// that load entirely: ~a dozen integer/FP ops (cache- and bandwidth-free) per
-// weight, which is the QTIP-paper computed-code decode that reaches a large
-// fraction of HBM peak at M=1.
+//     measured on hardware: 10.80% of 65,536 values agree,
+//                           max ULP difference 841,442,594
 //
-// Bit-faithfulness: mirrors the host math exactly (same constants, same
-// operation order). Transcendentals (logf/sincosf) differ from the host libm
-// by <~1e-4 ULP-scale, far below quantization error — decode stays numerically
-// equivalent to the baked LUT it replaces.
-__device__ __forceinline__ float2 qtip_decode_state(uint32_t state) {
-    unsigned long long z = (unsigned long long)state * 0x9E3779B97F4A7C15ULL;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-    z ^= z >> 31;
-    const uint32_t hi = (uint32_t)(z >> 32);
-    const uint32_t lo = (uint32_t)(z & 0xFFFFFFFFu);
-    // Host denom = (u32::MAX as f32 + 2.0) == 2^32 exactly in f32.
-    const float denom = 4294967296.0f;
-    const float u1 = ((float)hi + 1.0f) / denom;
-    const float u2 = ((float)lo + 1.0f) / denom;
-    const float r = sqrtf(-2.0f * logf(u1));
-    const float theta = (2.0f * 3.14159265358979323846f) * u2;
-    float s, c;
-    sincosf(theta, &s, &c);
-    return make_float2(r * c, r * s);  // (g0, g1) == (lut[2*state], lut[2*state+1])
-}
-
-// Codebook dispatch for the decode loop. `COMPUTED_CB == false` keeps the
-// RUN-161 Gaussian-in-registers behaviour byte-for-byte; `true` is the sum2
-// code. `mult` is unused in the Gaussian arm (the Gaussian codebook has no
-// tunable constant — it is a pure function of the state).
-template <bool COMPUTED_CB>
-__device__ __forceinline__ float2 gg_codeword(uint32_t state, unsigned int mult) {
-    if (COMPUTED_CB) {
-        return qtip_cb_sum2(state, mult);
-    }
-    return qtip_decode_state(state);
-}
+// That is a codeword error, not a rounding difference, and it is concentrated
+// on small-magnitude weights — exactly where a Gaussian weight distribution
+// has most of its mass. The host bakes `gaussian_lut()` in f64 and stores it;
+// this kernel recomputed it in f32 with `logf`/`sincosf`. The divergence is
+// structural, and it was DEFAULT-ON and UNCONDITIONAL: every b=1..8 request
+// took this path.
+//
+// The five other kernels on this rung (qtip_gemv, qtip_dequantize,
+// qtip_quantize x2, qtip_beam) all honour the `cb_mult == 0` sentinel as
+// "gather from the stored table" via `qtip_cb_value*` in qtip_codebook.cuh.
+// This kernel now does too — one shared accessor, no local re-derivation, so
+// there is no second copy left to drift.
+//
+// The other half of the fix is on the Rust side: `QtipCodebook::DEFAULT` moves
+// to the computed MCG code, which has ZERO host/device disagreement by
+// construction (`qtip_cb_fold` uses exact fp16->f32 conversions and
+// `__fadd_rn`, which `--use_fast_math` cannot contract). That governs NEW
+// bakes only, which is why this kernel still has to be right: existing
+// Gaussian-tagged artifacts keep coming through here.
 
 // ---------------------------------------------------------------------------
 // OPTIMISED warp kernel (trellis chain). Bit-identical to the baseline: it
@@ -229,7 +213,6 @@ qtip_gather_gemv_warp_kernel(
 ) {
     constexpr int ROWS_PER_BLOCK = WARPS_PER_BLOCK * ROWS_PER_WARP;
     extern __shared__ float s_mem[];
-    (void)lut;
 
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -320,7 +303,7 @@ qtip_gather_gemv_warp_kernel(
                     const int t = (int)QTIP_WARMUP_SYMS + j;   // nibble index in the window
                     const uint32_t sym = (h[t >> 2] >> (4 * (t & 3))) & 0x0Fu;
                     state = ((state << QTIP_K) | sym) & QTIP_STATE_MASK;
-                    const float2 w = gg_codeword<COMPUTED_CB>(state, cb_mult);
+                    const float2 w = qtip_cb_value_ldg<COMPUTED_CB>(lut, state, cb_mult);
                     a = fmaf(w.x * scale, xg[j].x, a);
                     a = fmaf(w.y * scale, xg[j].y, a);
                 }
@@ -340,7 +323,7 @@ qtip_gather_gemv_warp_kernel(
                     const uint8_t b = row_packed[s >> 1];
                     const uint32_t sym = (s & 1) ? ((b >> 4) & 0x0F) : (b & 0x0F);
                     state = ((state << QTIP_K) | sym) & QTIP_STATE_MASK;
-                    const float2 w = gg_codeword<COMPUTED_CB>(state, cb_mult);
+                    const float2 w = qtip_cb_value_ldg<COMPUTED_CB>(lut, state, cb_mult);
                     a = fmaf(w.x * scale, xg[j].x, a);
                     a = fmaf(w.y * scale, xg[j].y, a);
                 }
@@ -416,9 +399,11 @@ extern "C" {
         }                                                                             \
     }
 
-QTIP_GATHER_GEMV_LAUNCHER(launch_qtip_gather_gemv_v2_k4_l16_bf16, __nv_bfloat16)
-QTIP_GATHER_GEMV_LAUNCHER(launch_qtip_gather_gemv_v2_k4_l16_f16,  __half)
-QTIP_GATHER_GEMV_LAUNCHER(launch_qtip_gather_gemv_v2_k4_l16_f32,  float)
+// Renamed v2 -> v3 with the `(void)lut;` fix: a stale object file compiled
+// before it is now a LINK error rather than a silently-wrong codebook.
+QTIP_GATHER_GEMV_LAUNCHER(launch_qtip_gather_gemv_v3_k4_l16_bf16, __nv_bfloat16)
+QTIP_GATHER_GEMV_LAUNCHER(launch_qtip_gather_gemv_v3_k4_l16_f16,  __half)
+QTIP_GATHER_GEMV_LAUNCHER(launch_qtip_gather_gemv_v3_k4_l16_f32,  float)
 
 #undef QTIP_GATHER_GEMV_LAUNCHER
 

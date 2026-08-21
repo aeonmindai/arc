@@ -99,6 +99,11 @@ pub use mxfp4::MXFP4Layer;
 pub use nvfp4::NVFP4Layer;
 pub use pending_layer::PendingIsqLayer;
 pub use pertensor_fp8::PerTensorFP8Linear;
+/// TCFRAG-2B — the tensor-core fragment byte order for the K=2/V=1/L=16 rung,
+/// and the D22 compute-capability-keyed layout table that selects it.
+///
+/// ⚠️ The kernel this format feeds is UNVERIFIED ON HARDWARE — never run.
+pub use qtip::tcfrag2b;
 /// The V=4 / L=12 decode family: a 32,768 B bf16 reproduction table with K as
 /// a parameter over symbol extraction. K=8 is the byte-aligned control at
 /// 2.00 bpw; K=9 (2.25 bpw) is the quality winner. See the module docs.

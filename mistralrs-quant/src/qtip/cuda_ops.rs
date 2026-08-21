@@ -28,6 +28,7 @@ use crate::utils::slice_ptr;
 
 use super::device_guard::ensure_same_cuda_device;
 use super::ffi;
+use super::tcfrag2b::Tcfrag2bLayout;
 use super::trellis_v4l12::{RowScaleHoist, Rung};
 use super::QtipCodebook;
 
@@ -739,7 +740,7 @@ pub(crate) fn gather_gemv_cuda(
             let out_buf = crate::arc_outbuf::alloc_out_fully_written::<bf16>(&dev, n_out)?;
             let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
             unsafe {
-                ffi::launch_qtip_gather_gemv_v2_k4_l16_bf16(
+                ffi::launch_qtip_gather_gemv_v3_k4_l16_bf16(
                     blocks_ptr as *const _,
                     scales_ptr as *const _,
                     lut_ptr as *const _,
@@ -764,7 +765,7 @@ pub(crate) fn gather_gemv_cuda(
             let out_buf = crate::arc_outbuf::alloc_out_fully_written::<f16>(&dev, n_out)?;
             let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
             unsafe {
-                ffi::launch_qtip_gather_gemv_v2_k4_l16_f16(
+                ffi::launch_qtip_gather_gemv_v3_k4_l16_f16(
                     blocks_ptr as *const _,
                     scales_ptr as *const _,
                     lut_ptr as *const _,
@@ -789,7 +790,7 @@ pub(crate) fn gather_gemv_cuda(
             let out_buf = crate::arc_outbuf::alloc_out_fully_written::<f32>(&dev, n_out)?;
             let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
             unsafe {
-                ffi::launch_qtip_gather_gemv_v2_k4_l16_f32(
+                ffi::launch_qtip_gather_gemv_v3_k4_l16_f32(
                     blocks_ptr as *const _,
                     scales_ptr as *const _,
                     lut_ptr as *const _,
@@ -1567,14 +1568,141 @@ pub(crate) fn dequantize_2b_cuda(
     Ok(Tensor::from((Storage::Cuda(res), out_shape)))
 }
 
+// ===========================================================================
+// TCFRAG-2B — the tensor-core trellis GEMV.
+//
+// ⚠️ UNVERIFIED ON HARDWARE — never run. See `super::tcfrag2b` for the format
+// and `kernels/qtip/qtip2b_tcfrag.cu` for the kernel.
+// ===========================================================================
+
+/// The kill switch. TCFRAG-2B is the **fast-path default**; `ARC_QTIP_TCFRAG=0`
+/// (or `off`/`false`/`no`) reverts every qtip2b GEMV to the shipped kernel in
+/// the same binary, so the first box can A/B without a rebuild.
+///
+/// Anything else — including an unparsable value — leaves the fast path on,
+/// deliberately: a typo in an env var must not silently change which kernel
+/// serves production. A user who means to revert can see it in the logs.
+pub(crate) fn tcfrag2b_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("ARC_QTIP_TCFRAG").as_deref() {
+        Ok("0") | Ok("off") | Ok("false") | Ok("no") => false,
+        _ => true,
+    })
+}
+
+/// D22: the permutation this device's MMA shape needs, as **data selected by
+/// compute capability**. `None` means "this build has no fragment order for
+/// this device" and the caller keeps the shipped kernel — it never guesses,
+/// and it never asks `#if __CUDA_ARCH__`.
+pub(crate) fn tcfrag2b_layout_for(dev: &candle_core::CudaDevice) -> Option<Tcfrag2bLayout> {
+    use candle_core::cuda::cudarc::driver::sys::CUdevice_attribute;
+    if !ffi::HAVE_QTIP_KERNELS || !tcfrag2b_enabled() {
+        return None;
+    }
+    let ctx = dev.cuda_stream().context();
+    let major = ctx
+        .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+        .ok()?;
+    let minor = ctx
+        .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+        .ok()?;
+    if major < 0 || minor < 0 {
+        return None;
+    }
+    Tcfrag2bLayout::for_compute_cap(major as u32, minor as u32)
+}
+
+/// Apply the TCFRAG-2B permutation to a whole packed blob, on device.
+///
+/// 🔴 D22: this runs at **load time**, not at bake time. The on-disk artifact
+/// keeps the shipped LSB-first byte order; only this in-memory copy is
+/// permuted, so the published artifact is identical across GPU generations and
+/// a device whose MMA shape is not covered simply never calls this.
+///
+/// Returns a flat `[num_experts * words_per_expert]` U32 tensor.
+pub(crate) fn tcfrag2b_repack_cuda(
+    blocks: &Tensor,
+    num_experts: usize,
+    n_rows: usize,
+    packed_per_row: usize,
+    num_symbols: usize,
+    frag_layout: Tcfrag2bLayout,
+) -> Result<Tensor> {
+    if blocks.dtype() != DType::U8 {
+        candle_core::bail!("qtip2b tcfrag repack: blocks dtype must be U8");
+    }
+    if !blocks.layout().is_contiguous() {
+        candle_core::bail!("qtip2b tcfrag repack: blocks must be contiguous");
+    }
+    let dev = match blocks.device() {
+        candle_core::Device::Cuda(d) => d.clone(),
+        _ => candle_core::bail!("qtip2b tcfrag repack: blocks must live on CUDA"),
+    };
+
+    // Size the buffer from the KERNEL, not from a restatement of its formula,
+    // so the two sides cannot drift.
+    let per_expert =
+        unsafe { ffi::qtip2b_tcfrag_words_per_expert(n_rows as i32, num_symbols as i32) };
+    if per_expert <= 0 {
+        candle_core::bail!(
+            "qtip2b tcfrag repack: kernel refused shape n_rows={n_rows} num_symbols={num_symbols}"
+        );
+    }
+    let total = per_expert as usize * num_experts;
+
+    let (blocks_storage, blocks_layout) = blocks.storage_and_layout();
+    let blocks_storage = match &*blocks_storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("qtip2b tcfrag repack: blocks storage must be CUDA"),
+    };
+    let (blocks_ptr, _blocks_guard) = slice_ptr(
+        blocks_storage.as_cuda_slice::<u8>()?,
+        blocks_layout.start_offset(),
+    );
+
+    let buf = dev.alloc_zeros::<u32>(total)?;
+    let (words_ptr, words_guard) = slice_ptr(&buf, 0);
+    let rc = unsafe {
+        ffi::launch_qtip2b_tcfrag_repack(
+            blocks_ptr as *const _,
+            words_ptr as *mut _,
+            num_experts as i32,
+            n_rows as i32,
+            packed_per_row as i32,
+            num_symbols as i32,
+            frag_layout.abi_id(),
+            dev.cuda_stream().cu_stream(),
+        )
+    };
+    drop(words_guard);
+    if rc != 0 {
+        candle_core::bail!(
+            "qtip2b tcfrag repack: launcher declined (rc={rc}) for n_rows={n_rows} \
+             packed_per_row={packed_per_row} num_symbols={num_symbols} layout={frag_layout:?}"
+        );
+    }
+    let storage = CudaStorage::wrap_cuda_slice(buf, dev);
+    Ok(Tensor::from((
+        Storage::Cuda(storage),
+        candle_core::Shape::from_dims(&[total]),
+    )))
+}
+
 /// Single-token fused decode + GEMV for a 2-D qtip2b layer. `x_rotated` must
 /// already be rotated. Returns `[1, n_rows]`.
+///
+/// `tcfrag` is the load-time-permuted weight copy (D22). When present and the
+/// device has a fragment order, the tensor-core kernel runs; a `-1` from its
+/// launcher, or `None`, falls back to the shipped autotuned kernel — whose
+/// correctness contract is unchanged by anything here.
 pub(crate) fn fused_gemv_2b_cuda(
     blocks: &Tensor,
     row_scales: &Tensor,
     mcg_mult: u32,
     x_rotated: &Tensor,
     in_features: usize,
+    tcfrag: Option<&Tensor>,
 ) -> Result<Tensor> {
     let n_rows = row_scales.dim(0)?;
     let packed_per_row = blocks.dim(1)?;
@@ -1647,18 +1775,32 @@ pub(crate) fn fused_gemv_2b_cuda(
     let tune_variant = super::tune::gemv_variant_for_shape(n_rows, in_features)
         .filter(|&v| v != super::tune::QTIP2B_GEMV_VARIANT_LEGACY);
 
+    // TCFRAG-2B (fast-path default; `ARC_QTIP_TCFRAG=0` reverts). The guard
+    // must outlive the launch, so it is bound at function scope like every
+    // other pointer here.
+    let tcfrag_layout = tcfrag.and(tcfrag2b_layout_for(&dev));
+    let tcfrag_sl = tcfrag.map(|t| t.storage_and_layout());
+    let tcfrag_bound = match (&tcfrag_sl, tcfrag_layout) {
+        (Some((st, lo)), Some(fl)) => match &**st {
+            Storage::Cuda(cs) => {
+                Some((slice_ptr(cs.as_cuda_slice::<u32>()?, lo.start_offset()), fl))
+            }
+            _ => candle_core::bail!("qtip2b fused gemv CUDA: tcfrag storage must be CUDA"),
+        },
+        _ => None,
+    };
+
     macro_rules! gemv_dtype {
-        ($T:ty, $launch:expr, $launch_tuned:expr) => {{
+        ($T:ty, $launch:expr, $launch_tuned:expr, $launch_tcfrag:expr) => {{
             let (x_ptr, _x_guard) =
                 slice_ptr(x_storage.as_cuda_slice::<$T>()?, x_layout.start_offset());
             let out_buf = dev.alloc_zeros::<$T>(n_rows)?;
             let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
             let mut launched = false;
-            if let Some(v) = tune_variant {
+            if let Some(((words_ptr, _words_guard), fl)) = &tcfrag_bound {
                 let rc = unsafe {
-                    $launch_tuned(
-                        v as i32,
-                        blocks_ptr as *const _,
+                    $launch_tcfrag(
+                        *words_ptr as *const _,
                         scales_ptr as *const _,
                         x_ptr as *const _,
                         std::ptr::null::<u32>(), // 2-D path: no gather indices
@@ -1669,10 +1811,33 @@ pub(crate) fn fused_gemv_2b_cuda(
                         1i32, // n_pairs
                         1i32, // num_experts
                         mcg_mult,
+                        fl.abi_id(),
                         dev.cuda_stream().cu_stream(),
                     )
                 };
                 launched = rc == 0;
+            }
+            if !launched {
+                if let Some(v) = tune_variant {
+                    let rc = unsafe {
+                        $launch_tuned(
+                            v as i32,
+                            blocks_ptr as *const _,
+                            scales_ptr as *const _,
+                            x_ptr as *const _,
+                            std::ptr::null::<u32>(), // 2-D path: no gather indices
+                            out_ptr as *mut _,
+                            n_rows as i32,
+                            packed_per_row as i32,
+                            num_symbols as i32,
+                            1i32, // n_pairs
+                            1i32, // num_experts
+                            mcg_mult,
+                            dev.cuda_stream().cu_stream(),
+                        )
+                    };
+                    launched = rc == 0;
+                }
             }
             if !launched {
                 unsafe {
@@ -1701,17 +1866,20 @@ pub(crate) fn fused_gemv_2b_cuda(
         DType::BF16 => gemv_dtype!(
             bf16,
             ffi::launch_qtip2b_gemv_bf16,
-            ffi::launch_qtip2b_gemv_tuned_bf16
+            ffi::launch_qtip2b_gemv_tuned_bf16,
+            ffi::launch_qtip2b_tcfrag_gemv_bf16
         ),
         DType::F16 => gemv_dtype!(
             f16,
             ffi::launch_qtip2b_gemv_f16,
-            ffi::launch_qtip2b_gemv_tuned_f16
+            ffi::launch_qtip2b_gemv_tuned_f16,
+            ffi::launch_qtip2b_tcfrag_gemv_f16
         ),
         DType::F32 => gemv_dtype!(
             f32,
             ffi::launch_qtip2b_gemv_f32,
-            ffi::launch_qtip2b_gemv_tuned_f32
+            ffi::launch_qtip2b_gemv_tuned_f32,
+            ffi::launch_qtip2b_tcfrag_gemv_f32
         ),
         other => candle_core::bail!("qtip2b fused gemv CUDA: unsupported x dtype {other:?}"),
     };
@@ -1728,6 +1896,7 @@ pub(crate) fn gather_gemv_2b_cuda(
     x_rotated: &Tensor,
     indices: &Tensor,
     in_features: usize,
+    tcfrag: Option<&Tensor>,
 ) -> Result<Tensor> {
     let num_experts = blocks.dim(0)?;
     let n_rows = row_scales.dim(1)?;
@@ -1820,18 +1989,30 @@ pub(crate) fn gather_gemv_2b_cuda(
     let tune_variant = super::tune::gemv_variant_for_shape(n_rows, in_features)
         .filter(|&v| v != super::tune::QTIP2B_GEMV_VARIANT_LEGACY);
 
+    // TCFRAG-2B (fast-path default; `ARC_QTIP_TCFRAG=0` reverts).
+    let tcfrag_layout = tcfrag.and(tcfrag2b_layout_for(&dev));
+    let tcfrag_sl = tcfrag.map(|t| t.storage_and_layout());
+    let tcfrag_bound = match (&tcfrag_sl, tcfrag_layout) {
+        (Some((st, lo)), Some(fl)) => match &**st {
+            Storage::Cuda(cs) => {
+                Some((slice_ptr(cs.as_cuda_slice::<u32>()?, lo.start_offset()), fl))
+            }
+            _ => candle_core::bail!("qtip2b gather gemv CUDA: tcfrag storage must be CUDA"),
+        },
+        _ => None,
+    };
+
     macro_rules! gather_dtype {
-        ($T:ty, $launch:expr, $launch_tuned:expr) => {{
+        ($T:ty, $launch:expr, $launch_tuned:expr, $launch_tcfrag:expr) => {{
             let (x_ptr, _x_guard) =
                 slice_ptr(x_storage.as_cuda_slice::<$T>()?, x_layout.start_offset());
             let out_buf = dev.alloc_zeros::<$T>(n_out)?;
             let (out_ptr, out_guard) = slice_ptr(&out_buf, 0);
             let mut launched = false;
-            if let Some(v) = tune_variant {
+            if let Some(((words_ptr, _words_guard), fl)) = &tcfrag_bound {
                 let rc = unsafe {
-                    $launch_tuned(
-                        v as i32,
-                        blocks_ptr as *const _,
+                    $launch_tcfrag(
+                        *words_ptr as *const _,
                         scales_ptr as *const _,
                         x_ptr as *const _,
                         idx_ptr as *const _,
@@ -1842,10 +2023,33 @@ pub(crate) fn gather_gemv_2b_cuda(
                         n_pairs as i32,
                         num_experts as i32,
                         mcg_mult,
+                        fl.abi_id(),
                         dev.cuda_stream().cu_stream(),
                     )
                 };
                 launched = rc == 0;
+            }
+            if !launched {
+                if let Some(v) = tune_variant {
+                    let rc = unsafe {
+                        $launch_tuned(
+                            v as i32,
+                            blocks_ptr as *const _,
+                            scales_ptr as *const _,
+                            x_ptr as *const _,
+                            idx_ptr as *const _,
+                            out_ptr as *mut _,
+                            n_rows as i32,
+                            packed_per_row as i32,
+                            num_symbols as i32,
+                            n_pairs as i32,
+                            num_experts as i32,
+                            mcg_mult,
+                            dev.cuda_stream().cu_stream(),
+                        )
+                    };
+                    launched = rc == 0;
+                }
             }
             if !launched {
                 unsafe {
@@ -1874,17 +2078,20 @@ pub(crate) fn gather_gemv_2b_cuda(
         DType::BF16 => gather_dtype!(
             bf16,
             ffi::launch_qtip2b_gemv_bf16,
-            ffi::launch_qtip2b_gemv_tuned_bf16
+            ffi::launch_qtip2b_gemv_tuned_bf16,
+            ffi::launch_qtip2b_tcfrag_gemv_bf16
         ),
         DType::F16 => gather_dtype!(
             f16,
             ffi::launch_qtip2b_gemv_f16,
-            ffi::launch_qtip2b_gemv_tuned_f16
+            ffi::launch_qtip2b_gemv_tuned_f16,
+            ffi::launch_qtip2b_tcfrag_gemv_f16
         ),
         DType::F32 => gather_dtype!(
             f32,
             ffi::launch_qtip2b_gemv_f32,
-            ffi::launch_qtip2b_gemv_tuned_f32
+            ffi::launch_qtip2b_gemv_tuned_f32,
+            ffi::launch_qtip2b_tcfrag_gemv_f32
         ),
         other => candle_core::bail!("qtip2b gather gemv CUDA: unsupported x dtype {other:?}"),
     };

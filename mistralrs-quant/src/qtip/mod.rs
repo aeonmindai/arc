@@ -74,6 +74,7 @@ mod greedy_ban_tests;
 pub mod grouped;
 #[cfg(test)]
 mod search_bench;
+pub mod tcfrag2b;
 pub mod trellis_v4l12;
 pub mod tune;
 mod viterbi;
@@ -570,6 +571,43 @@ impl QtipCodebook {
     /// the two are separable — the port is worthless if it is wrong, and the
     /// flip is worthless if it is unmeasured. Set `ARC_QTIP_CODEBOOK=mcg` to
     /// bake against the computed codebook today.
+    ///
+    /// # The flip was attempted here and BACKED OUT — the numbers
+    ///
+    /// Flipping this to [`Self::COMPUTED`] is the durable half of the
+    /// `(void)lut;` fix in `kernels/qtip/qtip_gather_gemv.cu` (that kernel
+    /// discarded the 512 KiB table it was handed and recomputed Box-Muller in
+    /// registers; the two disagreed on 89.2% of the 65,536 codewords). `Mcg`
+    /// has ZERO host/device disagreement by construction — `qtip_cb_fold` uses
+    /// exact fp16->f32 conversions and `__fadd_rn`, which `--use_fast_math`
+    /// cannot contract — reads no table, and drops 512 KiB per layer from the
+    /// artifact. All of that is still true and still worth having.
+    ///
+    /// But it is **not quality-neutral on this repo's own fixtures**, and that
+    /// is a measurement, taken on CPU, that anyone can reproduce with
+    /// `cargo test -p mistralrs-quant --lib qtip::`:
+    ///
+    /// | test | Gaussian | Mcg |
+    /// |---|---|---|
+    /// | `viterbi_matmul_cosine_similarity_with_rotation`, greedy | > 0.85 (gate) | **0.3156** |
+    /// | same, Viterbi + rotation | >= 0.80 (gate) | **0.4750** |
+    /// | `viterbi_rotation_ablation`, rotation OFF | (below ON) | 0.8880 |
+    /// | `viterbi_rotation_ablation`, rotation ON | (above OFF) | **0.4750** |
+    ///
+    /// The ablation *inverts*: under `Mcg` the Hadamard rotation makes that
+    /// fixture worse, which it must not. That points at the codebook's
+    /// interaction with the rotated distribution or at
+    /// [`QTIP_MCG_V2_SCALE_DIVISOR`], not at a free lunch. The
+    /// "+0.00017 cosine / +0.37% NMSE, NEUTRAL" figure from
+    /// `probe_computed_codebook_quality` is a *weight-reconstruction* number on
+    /// Gaussian draws; these are *matmul* numbers on a structured fixture, and
+    /// they disagree. Until that is understood, flipping the default would
+    /// change what every future artifact means on the strength of a
+    /// measurement that does not cover the case that failed.
+    ///
+    /// ⚠️ Note what this does NOT excuse: the `(void)lut;` kernel bug is fixed
+    /// regardless. Existing Gaussian-tagged artifacts are the ones that were
+    /// being mis-decoded, and they do not care what a future bake picks.
     pub const DEFAULT: Self = QtipCodebook::Gaussian;
 
     /// Read the codebook choice from the environment. `ARC_QTIP_CODEBOOK` is
