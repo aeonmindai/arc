@@ -513,6 +513,39 @@ const GRAPH_REPLAY_TOLERANCE: f32 = 1e-4;
 /// Costs one device→host sync of a single scalar, and only runs on the handful
 /// of verification steps, never on the trusted path.
 #[cfg(feature = "cuda")]
+thread_local! {
+    /// The EAGER logits of the step the CUDA graph was captured on, kept so a
+    /// later replay can be measured against them as well as against its own
+    /// step. A replay that reproduces these is a graph frozen at capture — its
+    /// static input buffers are not being read. One that matches neither them
+    /// nor the current step is partially advancing, which names a subset of
+    /// stale inputs rather than the whole set. (RUN-161)
+    static ARC_CAPTURE_STEP_EAGER: std::cell::RefCell<Option<Tensor>> =
+        const { std::cell::RefCell::new(None) };
+    /// How many replays past the capture step we are, for the same probe.
+    static ARC_REPLAY_DISTANCE: std::cell::RefCell<u64> = const { std::cell::RefCell::new(0) };
+    /// Handles to the per-layer outputs the CAPTURED forward produced. The
+    /// recorded kernels write to these same addresses on every replay, so
+    /// after a replay these hold the replay's per-layer values and can be
+    /// bisected against an eager forward's. See `layers::arc_layer_trace_*`.
+    static ARC_GRAPH_LAYER_BUFS: std::cell::RefCell<Option<Vec<Tensor>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Is the per-layer graph-vs-eager bisect enabled?
+///
+/// CUDA-only: every caller lives inside the `#[cfg(feature = "cuda")]` capture
+/// block, so on a CPU/Metal build this would be genuinely dead code. Gated
+/// rather than `#[allow(dead_code)]`'d so the dead-symbol detector keeps its
+/// teeth on a CUDA build, where these must stay reachable.
+#[cfg(feature = "cuda")]
+fn arc_layer_bisect() -> bool {
+    std::env::var("ARC_GRAPH_LAYER_BISECT").as_deref() == Ok("1")
+}
+
+/// Max elementwise |a - b| at F32. CUDA-only for the same reason as
+/// [`arc_layer_bisect`].
+#[cfg(feature = "cuda")]
 fn max_abs_diff(a: &Tensor, b: &Tensor) -> candle_core::Result<f32> {
     if a.dims() != b.dims() {
         candle_core::bail!(
@@ -2024,7 +2057,24 @@ impl Pipeline for NormalPipeline {
                                 paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
                                 &flash_meta,
                             );
-                            let _ = self.device().synchronize();
+                            // Do NOT discard this. `let _ =` here swallowed the
+                            // only place an ASYNCHRONOUS device fault in a warm
+                            // pass could ever be reported: the forward itself
+                            // returns Ok (kernels are launched, not awaited),
+                            // and the sync is what collects the fault. A
+                            // swallowed fault leaves a sticky context error, and
+                            // the next CUDA call to report it is the first
+                            // cuGraphLaunch — which is then blamed for a fault
+                            // it inherited.
+                            if let Err(e) = self.device().synchronize() {
+                                tracing::error!(
+                                    "ARC capture: warm-pass forward FAULTED at sync ({e}). The \
+                                     CUDA context is now sticky-errored and every later call, \
+                                     including the graph launch, will fail with it. Capture is \
+                                     disabled for this run."
+                                );
+                                runner.disable();
+                            }
                             tracing::info!(
                                 "ARC capture: EAGER forward (sync'd) = {:?}",
                                 t_eager.elapsed()
@@ -2105,6 +2155,13 @@ impl Pipeline for NormalPipeline {
                             }
                             let cl = context_lens.clone();
                             let pid = position_ids.clone();
+                            // Open the per-layer trace BEFORE capture begins so
+                            // the recorded forward's own layer outputs are the
+                            // handles we keep. Costs 43 Arc bumps, no device
+                            // work, so it is safe inside the capture region.
+                            if arc_layer_bisect() {
+                                crate::layers::arc_layer_trace_begin();
+                            }
                             let cap_result = match runner.begin_capture(bs) {
                                 Ok((gp, op)) => {
                                     match self.model.forward(
@@ -2124,6 +2181,112 @@ impl Pipeline for NormalPipeline {
                                                     tracing::info!(
                                                         "ARC capture: graph CAPTURED + launched OK"
                                                     );
+                                                    if arc_layer_bisect() {
+                                                        let bufs =
+                                                            crate::layers::arc_layer_trace_take();
+                                                        tracing::error!(
+                                                            "ARC BISECT: holding {} captured layer buffers",
+                                                            bufs.as_ref()
+                                                                .map(|b| b.len())
+                                                                .unwrap_or(0)
+                                                        );
+                                                        ARC_GRAPH_LAYER_BUFS
+                                                            .with(|c| *c.borrow_mut() = bufs);
+                                                    }
+                                                    // ── SAME-STEP PROBE ─────────────
+                                                    // Separates the two ways a graph can
+                                                    // be wrong, which the replay-step
+                                                    // comparison cannot tell apart.
+                                                    //
+                                                    // Here the position buffer, the token
+                                                    // ids and the KV ring are EXACTLY what
+                                                    // capture recorded against — nothing
+                                                    // has advanced. So:
+                                                    //   Δ ≈ 0  ⇒ the graph is wired right
+                                                    //            and the replay-step Δ is
+                                                    //            stale per-step state.
+                                                    //   Δ large ⇒ a plain wiring fault
+                                                    //            (wrong buffer / wrong
+                                                    //            node); position state is
+                                                    //            innocent.
+                                                    // `error!` on purpose: this is the
+                                                    // measurement the run exists for and
+                                                    // must never be filtered out.
+                                                    if std::env::var("ARC_GRAPH_SAMESTEP")
+                                                        .as_deref()
+                                                        == Ok("1")
+                                                    {
+                                                        if let candle_core::Device::Cuda(cd) =
+                                                            self.device()
+                                                        {
+                                                            cd.set_capture_mode(false);
+                                                        }
+                                                        match self.model.forward(
+                                                            &input_ids,
+                                                            &seqlen_offsets,
+                                                            context_lens.clone(),
+                                                            position_ids.clone(),
+                                                            paged_attn_meta
+                                                                .as_ref()
+                                                                .map(|(a, b)| (a.clone(), b)),
+                                                            &flash_meta,
+                                                        ) {
+                                                            Ok(eager_same) => {
+                                                                match max_abs_diff(
+                                                                    &out,
+                                                                    &eager_same,
+                                                                ) {
+                                                                    Ok(d) => tracing::error!(
+                                                                        "ARC SAMESTEP: first-launch vs eager, SAME step: max|Δ|={d:.3e}"
+                                                                    ),
+                                                                    Err(e) => tracing::error!(
+                                                                        "ARC SAMESTEP: first-launch compare failed: {e}"
+                                                                    ),
+                                                                }
+                                                                // Keep this step's eager
+                                                                // logits: every later replay
+                                                                // is measured against them
+                                                                // too, which is what tells
+                                                                // "frozen" from "partially
+                                                                // advancing".
+                                                                ARC_CAPTURE_STEP_EAGER.with(
+                                                                    |c| {
+                                                                        *c.borrow_mut() =
+                                                                            Some(
+                                                                                eager_same
+                                                                                    .clone(),
+                                                                            );
+                                                                    },
+                                                                );
+                                                                // Second launch of the same
+                                                                // graph, still same step.
+                                                                // Distinguishes "the graph
+                                                                // is wrong" from "re-launch
+                                                                // specifically is wrong".
+                                                                match runner.replay(bs) {
+                                                                    Ok(again) => {
+                                                                        match max_abs_diff(
+                                                                            &again,
+                                                                            &eager_same,
+                                                                        ) {
+                                                                            Ok(d) => tracing::error!(
+                                                                                "ARC SAMESTEP: re-launch vs eager, SAME step: max|Δ|={d:.3e}"
+                                                                            ),
+                                                                            Err(e) => tracing::error!(
+                                                                                "ARC SAMESTEP: re-launch compare failed: {e}"
+                                                                            ),
+                                                                        }
+                                                                    }
+                                                                    Err(e) => tracing::error!(
+                                                                        "ARC SAMESTEP: second launch failed: {e}"
+                                                                    ),
+                                                                }
+                                                            }
+                                                            Err(e) => tracing::error!(
+                                                                "ARC SAMESTEP: eager forward failed: {e}"
+                                                            ),
+                                                        }
+                                                    }
                                                     Some(out)
                                                 }
                                                 Err(e) => {
@@ -2168,7 +2331,10 @@ impl Pipeline for NormalPipeline {
                             match replayed {
                                 Ok(out) => {
                                     let dt = t.elapsed();
-                                    if runner.needs_verification() {
+                                    if runner.needs_verification()
+                                        || std::env::var("ARC_GRAPH_VERIFY_ALWAYS").as_deref()
+                                            == Ok("1")
+                                    {
                                         // RUN-161 step 3. Turning replay
                                         // output on is the one change here
                                         // that can corrupt tokens SILENTLY:
@@ -2179,6 +2345,16 @@ impl Pipeline for NormalPipeline {
                                         // eager result this step either way
                                         // — it is already computed and it is
                                         // the one we know is right.
+                                        // `out` above came from the replay, so
+                                        // the held capture-time layer handles
+                                        // now hold the REPLAY's per-layer
+                                        // values. Trace the eager forward and
+                                        // compare layer by layer: the first
+                                        // index that differs is the first layer
+                                        // reading a stale per-step input.
+                                        if arc_layer_bisect() {
+                                            crate::layers::arc_layer_trace_begin();
+                                        }
                                         let eager = self.model.forward(
                                             &input_ids,
                                             &seqlen_offsets,
@@ -2187,7 +2363,117 @@ impl Pipeline for NormalPipeline {
                                             paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
                                             &flash_meta,
                                         )?;
-                                        match max_abs_diff(&out, &eager) {
+                                        if arc_layer_bisect() {
+                                            let eager_layers =
+                                                crate::layers::arc_layer_trace_take();
+                                            ARC_GRAPH_LAYER_BUFS.with(|c| {
+                                                if let (Some(g), Some(e)) =
+                                                    (c.borrow().as_ref(), eager_layers.as_ref())
+                                                {
+                                                    let n = g.len().min(e.len());
+                                                    let mut first = None;
+                                                    let mut line = String::new();
+                                                    for i in 0..n {
+                                                        let d = max_abs_diff(&g[i], &e[i])
+                                                            .unwrap_or(f32::NAN);
+                                                        if i < 12 || first.map_or(false, |f| i <= f + 2)
+                                                        {
+                                                            line.push_str(&format!(
+                                                                " L{i}={d:.2e}"
+                                                            ));
+                                                        }
+                                                        if first.is_none()
+                                                            && !(d <= GRAPH_REPLAY_TOLERANCE)
+                                                        {
+                                                            first = Some(i);
+                                                            line.push_str("<<FIRST");
+                                                        }
+                                                    }
+                                                    // Slot map: 0=graph length
+                                                    // mask, 1=embedding,
+                                                    // 2=mHC lift, 3+=layer
+                                                    // (slot-3).
+                                                    tracing::error!(
+                                                        "ARC BISECT: slots={n} first_diverging={:?} [0=mask 1=embed 2=lift then per graph-arm layer: k, k_full, attn, layer_out]{line}",
+                                                        first
+                                                    );
+                                                }
+                                            });
+                                        }
+                                        // ── DISTANCE-FROM-CAPTURE PROBE ──
+                                        // The same-step probe already proved
+                                        // the graph is wired right (Δ=0 at the
+                                        // capture step), so whatever diverges
+                                        // here is per-step state that must
+                                        // advance and does not. This says WHICH
+                                        // kind of stale:
+                                        //   Δ vs capture-step eager ≈ 0 ⇒ the
+                                        //     graph is FROZEN — its static
+                                        //     inputs are not being read at all.
+                                        //   Δ nonzero against BOTH ⇒ partially
+                                        //     advancing: some inputs update
+                                        //     (positions) and some are stale.
+                                        // Also tracks how Δ moves with distance
+                                        // from the capture step, which a frozen
+                                        // input and a drifting one separate on.
+                                        ARC_CAPTURE_STEP_EAGER.with(|c| {
+                                            if let Some(cap_eager) = c.borrow().as_ref() {
+                                                let n = ARC_REPLAY_DISTANCE
+                                                    .with(|d| {
+                                                        let mut d = d.borrow_mut();
+                                                        *d += 1;
+                                                        *d
+                                                    });
+                                                let d_cap = max_abs_diff(&out, cap_eager);
+                                                let d_cap_eager = max_abs_diff(&eager, cap_eager);
+                                                tracing::error!(
+                                                    "ARC DISTANCE +{n}: replay-vs-CAPTURE-eager={:?} \
+                                                     eager-vs-CAPTURE-eager={:?}",
+                                                    d_cap.map(|v| format!("{v:.3e}")),
+                                                    d_cap_eager.map(|v| format!("{v:.3e}")),
+                                                );
+                                            }
+                                        });
+                                        // ── ORDER PROBE ──────────────────
+                                        // `out` above was produced BEFORE this
+                                        // step's eager forward ran. Launch the
+                                        // same graph again now, AFTER it. The
+                                        // two answers separate the only two
+                                        // remaining causes:
+                                        //   still diverges ⇒ the graph reads an
+                                        //     input that is genuinely stale.
+                                        //   now matches ⇒ the graph is not
+                                        //     stale at all; it depends on
+                                        //     per-step work done by HOST code
+                                        //     inside the eager forward, which a
+                                        //     replay never executes. That is a
+                                        //     missing-recorded-work bug, and a
+                                        //     completely different fix.
+                                        // Gated: it costs one extra launch and
+                                        // inflates the replay counter.
+                                        //
+                                        // 🔴 `replay` hands back a CLONE of the
+                                        // captured output tensor, so a second
+                                        // launch overwrites `out`'s storage.
+                                        // The verdict must therefore be taken
+                                        // from `out` BEFORE the extra launch,
+                                        // or the gate silently grades the wrong
+                                        // tensor.
+                                        let verdict = max_abs_diff(&out, &eager);
+                                        if std::env::var("ARC_GRAPH_SAMESTEP").as_deref() == Ok("1")
+                                        {
+                                            let before =
+                                                verdict.as_ref().map(|v| format!("{v:.3e}"));
+                                            let after = runner
+                                                .replay(bs)
+                                                .and_then(|again| max_abs_diff(&again, &eager))
+                                                .map(|v| format!("{v:.3e}"));
+                                            tracing::error!(
+                                                "ARC ORDER: replay-before-eager={before:?} \
+                                                 replay-after-eager={after:?}"
+                                            );
+                                        }
+                                        match verdict {
                                                 Ok(d) if d <= GRAPH_REPLAY_TOLERANCE => {
                                                     tracing::info!(
                                                         "ARC capture: replay matched eager \

@@ -367,11 +367,32 @@ output_trusted={} verify_remaining={} verify_failed={}",
                  batch_size={batch_size}): cudaError {sync}"
             );
         }
+        // 🔴 BOOBY TRAP — this is a CLONE OF THE CAPTURED OUTPUT TENSOR, i.e. a
+        // handle to storage the graph OVERWRITES on its next launch. It is not
+        // a snapshot. Two consequences the caller owns:
+        //
+        //  * every value this has ever returned aliases every other one, so
+        //    holding an "old" result and comparing it to a "new" one compares a
+        //    tensor with itself;
+        //  * a verification path that launches the graph again — even for a
+        //    diagnostic — silently rewrites the bytes it was about to grade.
+        //    `normal.rs` therefore takes its verdict from the tensor BEFORE any
+        //    extra launch. This nearly voided the probe that found it.
+        //
+        // Copy it if you need it to outlive the next launch.
         let out = captured
             .output
             .clone()
             .ok_or_else(|| candle_core::Error::Msg("captured graph has no output".into()))?;
         self.replays += 1;
+        // D18/D3: the replay count is the ONE number that separates a graph
+        // that serves from a graph that only records, and until now nothing
+        // printed it after capture — so every report of "replays served" was an
+        // inference. Emit it on a geometric-ish schedule: the first replay, the
+        // first ten, then every 100. Cost is a handful of lines per run.
+        if self.replays <= 10 || self.replays % 100 == 0 {
+            tracing::info!("ARCGRAPH REPLAY #{} — {}", self.replays, self.status_line());
+        }
         Ok(out)
     }
 
@@ -542,22 +563,68 @@ output_trusted={} verify_remaining={} verify_failed={}",
             candle_core::bail!("cuStreamEndCapture failed: {s}");
         }
 
+        // Step markers. This sequence is five driver calls with no logging
+        // between them, and it has aborted the PROCESS inside that window
+        // (`malloc_consolidate(): invalid chunk size`) on a capture that
+        // recorded with zero allocator misses. A glibc abort leaves no CUDA
+        // error to read, so without a marker per call the only thing the log
+        // establishes is "somewhere in here" — which is not a located blocker.
+        // These are `info!` on purpose: they cost one line per captured graph,
+        // and there is at most one capture per process.
+        tracing::info!("ARC capture: [1/5] cuStreamEndCapture OK, graph recorded");
+
+        // Is the context ALREADY in error before the graph has ever run?
+        //
+        // `cuGraphLaunch` returned 700 SYNCHRONOUSLY on a capture with zero
+        // allocator misses. A synchronous illegal-address from a launch call is
+        // characteristic of a STICKY context error raised by earlier work, not
+        // of the launch itself — CUDA reports a real graph fault asynchronously,
+        // at the following sync. Nothing executes between begin_capture and
+        // here (capture records, it does not run), so a non-zero result on this
+        // line places the fault BEFORE capture — in the warmup forwards — and a
+        // zero places it in the graph. Without this the two are indistinguishable
+        // and the 700 gets blamed on whichever one is being worked on.
+        let pre = unsafe { cudaStreamSynchronize(self.stream) };
+        if pre == CUDA_SUCCESS {
+            tracing::info!("ARC capture: [1b] context CLEAN before instantiate");
+        } else {
+            tracing::error!(
+                "ARC capture: [1b] context ALREADY IN ERROR before instantiate (cudaError \
+                 {pre}). The fault happened during warmup, not in the graph; every later \
+                 CUDA call inherits it."
+            );
+        }
+
         // Instantiate (private pool still installed). RUN-161 2b:
         // AUTO_FREE_ON_LAUNCH (=1) so a graph with memory-alloc nodes can be
         // RE-launched (replayed) -- otherwise the 2nd launch fails with
-        // INVALID_VALUE. Harmless if the graph has no alloc nodes.
+        // INVALID_VALUE.
+        //
+        // It is NOT unconditionally harmless when the graph has no alloc nodes,
+        // which is now the normal case: the capture-miss gate refuses to reach
+        // this function unless every allocation was a cache hit, so a clean
+        // capture records no memory nodes at all and the flag governs nothing
+        // that exists. `ARC_GRAPH_AUTO_FREE=0` drops it so that can be
+        // ablated against the abort above rather than assumed innocent.
         const CU_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH: u64 = 1;
-        let mut exec: CUgraphExec = std::ptr::null_mut();
-        let s = unsafe {
-            cuGraphInstantiateWithFlags(
-                &mut exec,
-                graph,
-                CU_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
-            )
+        let auto_free = !matches!(
+            std::env::var("ARC_GRAPH_AUTO_FREE").as_deref(),
+            Ok("0") | Ok("false")
+        );
+        let flags = if auto_free {
+            CU_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH
+        } else {
+            0
         };
+        let mut exec: CUgraphExec = std::ptr::null_mut();
+        let s = unsafe { cuGraphInstantiateWithFlags(&mut exec, graph, flags) };
+        tracing::info!(
+            "ARC capture: [2/5] cuGraphInstantiateWithFlags(flags={flags}) returned {s}"
+        );
         unsafe {
             cuGraphDestroy(graph);
         }
+        tracing::info!("ARC capture: [3/5] cuGraphDestroy OK");
         if s != CUDA_SUCCESS {
             self.drain_alloc_cache();
             unsafe {
@@ -571,6 +638,7 @@ output_trusted={} verify_remaining={} verify_failed={}",
         // First launch (private pool still installed -> graph memory is
         // allocated/backed here at the capture-time addresses).
         let s = unsafe { cuGraphLaunch(exec, self.stream) };
+        tracing::info!("ARC capture: [4/5] first cuGraphLaunch returned {s}");
         if s != CUDA_SUCCESS {
             self.drain_alloc_cache();
             unsafe {
@@ -586,6 +654,7 @@ output_trusted={} verify_remaining={} verify_failed={}",
         // the CUDA context and the process dies later with no diagnostic.
         // cudaError: 700 = illegalAddress, 719 = launchFailure, 1 = invalidValue.
         let sync = unsafe { cudaStreamSynchronize(self.stream) };
+        tracing::info!("ARC capture: [5/5] first-launch cudaStreamSynchronize returned {sync}");
         // RUN-161 diagnostic: measure the TRUE clean graph replay latency here,
         // while the captured input tensors are still alive (no stale-input
         // fault). 10 back-to-back launch+sync, report the best. Compare to the
@@ -667,6 +736,12 @@ output_trusted={} verify_remaining={} verify_failed={}",
 #[cfg(feature = "cuda")]
 impl Drop for CudaGraphRunner {
     fn drop(&mut self) {
-        // CapturedGraph handles cleanup via its own Drop
+        // CapturedGraph handles cleanup via its own Drop.
+        //
+        // The final tally goes to stderr directly, NOT through `tracing`: a
+        // subscriber may already be torn down by the time the pipeline drops,
+        // and a status line that silently vanishes at exit is exactly the
+        // silent-success failure this line exists to prevent (D18).
+        eprintln!("ARCGRAPH FINAL {}", self.status_line());
     }
 }

@@ -1412,11 +1412,18 @@ impl Attention {
         let t_c = comp.dim(2)?;
         // Compressed entry j sits at absolute position j*ratio. Apply the
         // layer's (compress-θ) RoPE to the last qk_rope_head_dim dims there.
-        // NOTE: builds a small arange each call (a host/device sync); fine on
-        // the correctness-first dense path — the long-context sparse-gather
-        // kernel is the place to precompute this.
+        //
+        // This used to build the positions with `Tensor::arange` on every call.
+        // That is a host round trip on the hot path AND — decisively — the
+        // reason CUDA-graph capture of the V4 decode forward SIGSEGV'd on its
+        // first launch: `arange` uploads a transient host `Vec`, and a captured
+        // `cuMemcpyHtoDAsync` records the host POINTER, not the bytes, so the
+        // graph re-read a freed `Vec` and handed garbage indices straight to
+        // the `index_select` on the next line. `compress_positions` serves a
+        // zero-copy view of a table built once, outside capture; see its doc
+        // comment for the full mechanism.
         let dev = comp.device();
-        let positions = compressed_row_positions(t_c, ratio, dev)?;
+        let positions = crate::layers::compress_positions(t_c, ratio, dev)?;
         self.rotary_emb
             .forward_at_positions(&comp, self.cfg.qk_rope_head_dim, &positions)
     }
@@ -1515,10 +1522,52 @@ impl Attention {
                         .then(|| graph_comp_rows(self.compress_ratio.ratio()));
                         if let Some(rows) = graph_rows {
                             state.pin_comp_capacity(rows)?;
+                            // The compressed axis is not the only width that
+                            // moves with position: the retained RAW tail is
+                            // rebuilt per step at a width that cycles with
+                            // `tokens % ratio`, and a capture-time allocation
+                            // miss on one of those widths is an unstable graph
+                            // memory node — an illegal address on the first
+                            // launch, not a slow graph. Pin it too.
+                            state.pin_tail_width();
                         }
                         // Always advanced, including under the window-only
                         // ablation below: skipping it would drop the raw tail
                         // and leave a hole the next group cannot be built from.
+                        //
+                        // 🔴 ARCHITECTURAL LIMIT OF CAPTURE (RUN-161, measured).
+                        // This call cannot be served by a replayed graph, for
+                        // two independent reasons — neither of which more
+                        // warmup, a bigger alloc cache, or pinning a width can
+                        // reach:
+                        //
+                        //  1. `cuGraphLaunch` executes ONLY the recorded
+                        //     kernels. No host code runs. `advance` carries the
+                        //     compressor history in host-owned Rust state
+                        //     (`XsRollingCache::tail`, reassigned to a FRESH
+                        //     `Tensor` every step), so under replay the history
+                        //     simply stops advancing and the distant-context
+                        //     branch freezes at the capture step's content. The
+                        //     raw KV half does not have this problem because it
+                        //     writes through `write_kv_inplace` into one
+                        //     fixed-address buffer at a device-derived slot —
+                        //     a recorded kernel mutating stable memory.
+                        //  2. The compressor fires only on the 1-in-`ratio`
+                        //     steps that complete a block, so consecutive
+                        //     decode steps do not even execute the same set of
+                        //     kernels. With `compress_ratios` {4, 128} that is
+                        //     every 4th step. A graph is a fixed DAG and cannot
+                        //     express that branch.
+                        //
+                        // The fix is (1)'s pattern applied here: `tail` has to
+                        // become a fixed-capacity DEVICE ring advanced by a
+                        // recorded kernel, exactly like `SingleCache::
+                        // append_graph`, and (2) then needs either a
+                        // conditional graph node or one graph per phase.
+                        // Until then the compressed branch is correct under
+                        // capture only where it contributes nothing —
+                        // `ARC_V4_WINDOW_ONLY=1`, or a context shorter than one
+                        // `ratio` block.
                         let advanced =
                             state.advance(&xs3, |window| compressor.forward_from_xs(window))?;
                         match graph_rows {
@@ -1856,7 +1905,18 @@ impl Attention {
                     .ok_or_else(|| candle_core::Error::Msg("graph positions unset".into()))?
                     .to_dtype(candle_core::DType::U32)?;
                 let cap = self.sliding_window.max(1);
+                // Bisect slots, in execution order, per graph-arm layer:
+                //   k       — the new post-RoPE key, BEFORE it is written.
+                //             Diverges ⇒ the key itself is computed wrong
+                //             (RoPE / projections), upstream of the cache.
+                //   k_full  — the fixed window read back AFTER the write.
+                //             Clean `k` + dirty `k_full` ⇒ the write landed in
+                //             the wrong slot, or the wrong window is read.
+                //   attn    — clean `k`/`k_full` + dirty `attn` ⇒ the mask or
+                //             the compressed branch, not the KV ring.
+                crate::layers::arc_layer_trace_push(&k);
                 let k_full = append_graph_kv_mqa(kv_cache, &k, &position, cap)?;
+                crate::layers::arc_layer_trace_push(&k_full);
                 // Use ONLY the fixed-width graph mask (matches the C-wide K).
                 // The eager `attention_mask` is kv_len-wide (growing) and would
                 // both mismatch the fixed window and break shape-constancy.
@@ -1882,7 +1942,7 @@ impl Attention {
                             .into(),
                     )
                 })?;
-                super::dsv4_attention::dsv4_attention(
+                let graph_attn = super::dsv4_attention::dsv4_attention(
                     &q,
                     &k_full,
                     &k_full,
@@ -1902,7 +1962,9 @@ impl Attention {
                         graph_positions: Some(&position),
                         ..dsv4_cfg
                     },
-                )?
+                )?;
+                crate::layers::arc_layer_trace_push(&graph_attn);
+                graph_attn
             }
             None => {
                 // FP8 code storage is opt-in (`ARC_V4_FP8_KV=1`); unset stores
@@ -2995,46 +3057,25 @@ fn append_kv_mqa(
     }
 }
 
-// Cached `[t_c]` U32 absolute positions of the compressed rows, keyed by row
-// count and ratio. Compressed row `j` sits at absolute position `j * ratio`,
-// which depends on nothing but `j` — so for a given (width, ratio) this vector
-// is a constant and rebuilding it per layer per step was pure waste.
+// The compressed-row positions used to live here as a SINGLE-slot thread-local
+// keyed on `(t_c, ratio, device)`. That slot is now `layers::compress_positions`
+// (a per-`(ratio, device)` table, chunk-rounded and served as a `narrow` view),
+// because a single slot THRASHES on V4: the model interleaves CSA (ratio 4) and
+// HCA (ratio 128) layers, so consecutive layers of the same step evicted each
+// other and the `arange_step` was paid again on every layer — including inside
+// the capture region, where it is a SIGSEGV and not merely a cost.
 //
-// It is also a correctness precondition for capture, not just a saving:
-// `Tensor::arange` on a GPU device is an H2D copy from pageable host memory,
-// which cannot be recorded into a CUDA graph at all. Under fixed capacity the
-// width stops moving, so this hits from the second decode step onward and the
-// copy leaves the capture region for good.
-thread_local! {
-    static COMPRESSED_ROW_POSITIONS: std::cell::RefCell<Option<(usize, usize, Tensor)>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-fn compressed_row_positions(t_c: usize, ratio: usize, dev: &Device) -> Result<Tensor> {
-    COMPRESSED_ROW_POSITIONS.with(|c| -> Result<Tensor> {
-        let mut c = c.borrow_mut();
-        if let Some((w, r, t)) = c.as_ref() {
-            if *w == t_c && *r == ratio && t.device().same_device(dev) {
-                return Ok(t.clone());
-            }
-        }
-        // `j * ratio` is integer arithmetic. It used to be laundered through
-        // float — `arange(u32) -> cast_u32_f32 -> affine(*ratio) ->
-        // cast_f32_u32` — three kernel launches to compute a strided range
-        // that `arange_step` produces directly. The thread-local above makes
-        // that free on a hit, but a miss (first token, or a window/device
-        // change) still paid it. The values are identical: the old chain's
-        // `fmaf(j, ratio, 0.0)` is exact for every `j * ratio` a sequence can
-        // reach (both operands and the product are integers well inside f32's
-        // exact range), and `to_dtype(U32)` truncated it back. `ratio` is
-        // 1 / 4 / 128 (`CompressRatio::ratio`), never 0, so `arange_step`'s
-        // zero-step bail is unreachable. Multiplied in usize so the product
-        // cannot wrap before the u32 narrowing.
-        let t = Tensor::arange_step(0u32, (t_c * ratio) as u32, ratio as u32, dev)?;
-        *c = Some((t_c, ratio, t.clone()));
-        Ok(t)
-    })
-}
+// The arithmetic argument that licensed `arange_step` in the first place is kept
+// here, because it is what makes the two spellings interchangeable: `j * ratio`
+// is integer arithmetic that used to be laundered through float — `arange(u32)
+// -> cast_u32_f32 -> affine(*ratio) -> cast_f32_u32`, three kernel launches to
+// compute a strided range `arange_step` produces directly. The values are
+// identical: the old chain's `fmaf(j, ratio, 0.0)` is exact for every `j * ratio`
+// a sequence can reach (both operands and the product are integers well inside
+// f32's exact range), and `to_dtype(U32)` truncated it back. `ratio` is 1 / 4 /
+// 128 (`CompressRatio::ratio`), never 0, so `arange_step`'s zero-step bail is
+// unreachable. Multiplied in usize so the product cannot wrap before the u32
+// narrowing.
 
 /// The FIXED number of compressed rows the CUDA-graph decode arm reads back.
 ///
@@ -4710,6 +4751,11 @@ impl DeepSeekV4 {
                 Some(pos) => {
                     let cap = self.cfg_full.sliding_window.max(1);
                     let mask = crate::layers::graph_mode_length_mask(&pos, cap, xs_embed.dtype())?;
+                    // Trace slot 0: does a REPLAY rebuild the right length mask
+                    // from the device position buffer, or is the mask the one
+                    // capture baked? Pushed before the layers so the bisect
+                    // reads mask → embed → lift → L0.. in execution order.
+                    crate::layers::arc_layer_trace_push(&mask);
                     crate::layers::set_graph_mode_mask(Some(mask));
                 }
                 None => crate::layers::set_graph_mode_mask(None),
@@ -4775,6 +4821,12 @@ impl DeepSeekV4 {
             };
             v4_nan_dbg(&xs_4d, "lift_3d_to_4d");
             v4_stat_dbg(&xs_4d, "lift_3d_to_4d");
+            // Trace slots 1 and 2: the embedding (i.e. did the token id reach
+            // the graph) and the mHC lift, both BEFORE any attention. A
+            // divergence that starts here is an input; one that starts at L0
+            // is inside the layer.
+            crate::layers::arc_layer_trace_push(&xs_embed);
+            crate::layers::arc_layer_trace_push(&xs_4d);
             let _prof_layers = arc_profiler::span("layers");
             for (i, layer) in self.layers.iter().enumerate() {
                 // Aggregated across all layers by default (calls = n_layers,
@@ -4798,6 +4850,7 @@ impl DeepSeekV4 {
                     Some(input_ids),
                 )?;
                 v4_stat_dbg(&xs_4d, &format!("L{i}"));
+                crate::layers::arc_layer_trace_push(&xs_4d);
             }
             drop(_prof_layers);
             let xs_4d = xs_4d.to_device(&self.device)?;
@@ -4826,6 +4879,7 @@ impl DeepSeekV4 {
                     flash_params,
                     Some(input_ids),
                 )?;
+                crate::layers::arc_layer_trace_push(&xs);
             }
             xs.to_device(&self.device)?
         };
