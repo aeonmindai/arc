@@ -12,9 +12,89 @@ metadata:
 
 **Compaction-proof entry point.** Fresh session, compacted, or lost: read THIS
 top-to-bottom. Everything needed to continue is here or named here.
-**Last rewritten: 2026-08-18, session 8. Session-8 CLOSE block added 2026-08-19.**
+**Last rewritten: 2026-08-18, session 8. Session-8 CLOSE 2026-08-19.
+🔴 SESSION-9 BLOCKER prepended 2026-08-21 — it supersedes the throughput framing
+of everything below it.**
 If STATUS.md's top entry is newer than this file, that entry wins — reconcile and
 update this file.
+
+---
+
+# 🔴🔴🔴 STOP. **V4 DOES NOT SERVE PAST ~22 TOKENS.** (session 9, 2026-08-21)
+
+**Measured at `cc5487ad3` on an H200: batch=1 decode dies with
+`CUDA_ERROR_OUT_OF_MEMORY` after 22–30 generated tokens, 3/3 runs, two
+independent arms.** The card is genuinely full — **143,151 of 143,771 MiB**.
+Growth is **≈11 MiB/token** and is **never released across requests**: one run
+ended at 142,959 MiB used and the next *started* there.
+
+> ## ⛔ THEREFORE: **EVERY SINGLE-USER V4 THROUGHPUT NUMBER THIS PROJECT HAS EVER RECORDED WAS MEASURED OVER ≤30 TOKENS BEFORE A CRASH.**
+>
+> That includes the three-way b=1 agreement (**15.11 / 15.39 / 15.51 tok/s**) —
+> whose own FACTS row says **"24 tokens"** — the capture lane's **33.4 → 34.2**,
+> and **9.3 / 13.31 / 14.84 / 10.99 / 11.94 / 17.85 / 18.27**. **They are
+> fragments, not rates. Do not quote any of them as a sustained single-user
+> throughput.** Per-step quantities (ms/step, the 57.27 ms sync'd forward, the
+> 88% forward share) are unaffected.
+>
+> Scope: **V4 on the eager KV path.** Not the Qwen2.5-0.5B rows, not the 55
+> tok/s TurboQuant B200 Qwen3-32B result.
+
+**It is a leak, not an overrun** — the death token moves with headroom (30 with
+room, 25 without, **0 on a process poisoned by the TCFRAG defect below**), and
+the backtrace names a growing allocation: `CudaSlice<float8::F8E4M3>` →
+`alloc_uninit` → `cat_contiguous` (candle). Arc-side caller is
+`compressed_kv_from_rows` (`deepseek4.rs:1409`) → `forward_at_positions`
+(`layers.rs:1826`); pool-held bytes read as used
+(`trim_cuda_memory_pools`, `memory_usage.rs:6-16`) and the trim runs once,
+post-ISQ (`normal.rs:1432`), never between requests.
+
+Owner: **PR #213**, open, **UNVERIFIED on hardware**.
+
+⚠️ **DO NOT let #213 land as "the OOM fix" yet.** PR #182's H200 leg ran
+**2,600 tokens with no OOM** at 6.04 MiB/token, which needs **≥15.7 GB free** at
+decode start against tonight's **844 MiB** — a **~60 GB gap that nobody has
+explained.** If that gap is the serve config (`max-seqs=32` + prefix cache ON),
+this is a **concurrency-budget defect as much as a per-token leak** and the
+allocator cap treats a symptom. **Probe: re-run at `--max-seqs 1`, prefix cache
+off, read `memory.used` at token 1.**
+
+**Full record, with all seven session-9 findings and every citation verified at
+master `9c127a2b1`:
+`memory/mission/wave66-CS-session9-the-22-token-wall.md`.** Measured numbers and
+six new retractions → `FACTS.md` §2026-08-21.
+
+### The other six, in one line each
+
+1. ✅ **TCFRAG was default-ON and its own header says "UNVERIFIED ON HARDWARE —
+   NEVER RUN"** (`qtip2b_tcfrag.cu:7`). **Fixed, PR #209, merged.** It does not
+   panic — `OnceLock::get_or_init` caches `None` permanently
+   (`tcfrag_words`, `bitshift.rs:1334`).
+2. 🔴 **Two host round-trips per decode step, not one** —
+   `cudaStreamSynchronize` (`graph.rs:362`) **and** a greedy `argmax`
+   (`sampler.rs:1479`). **This RETRACTS "op count is retired as a lever"**: the
+   1,137× launch cut that bought ~8% left both syncs in both arms. Zero-sync arm
+   exists, unmeasured: `arcgraph/device-decode-loop` @ `1b6949244`.
+3. 🔴 **The dedicated/autonomous decode tier cannot accept V4 architecturally.**
+   `LayerWeights` (`weights.rs:430`) has seven non-optional projection slots
+   (`DENSE_PROJS_PER_LAYER`, `weights.rs:44`) — **no MLA slot, no expert slot**.
+   Accepting V4 trades a named refusal for a wrong-tensor read.
+4. 🔴 **The b=1 FP8 GEMV is instruction-bound, not latency-bound** — a runtime
+   signed idiv by a kernel argument (`blockwise_fp8_gemm.cu:199`), once per four
+   weight bytes. **This retracts the "4% memory-controller ⇒ latency-bound"
+   story.** Ceiling **1.5–3.0 TB/s** vs a 4.8 TB/s roof — quote the range.
+5. 🔴 **The consequence of a session-8 finding, never drawn.** That
+   `mark_unreachable` is itself dark was already recorded below (§TAXONOMY
+   corrections). What was not: it is inert unless `ARC_PROFILE` is exactly
+   `"1"` (`arc-profiler/src/lib.rs:467`), so **its six sites in `normal.rs` —
+   `:1556`, `:1635`, `:1921`, `:2404`, `:2474`, `:2602` — have been dark in
+   every ordinary run, and we have been reading their silence as evidence.**
+   Separately and newly: `ci_cuda.yaml` is `workflow_dispatch`-only
+   (`ci_cuda.yaml:3`) on a self-hosted ARM64 GPU runner — **it gates nothing**;
+   the real lane is `cuda-typecheck` (`cuda_compile_check.yaml:337`).
+6. 🔴 **21 env flags are presence-tested, so `=0` turns them ON** — **any past
+   A/B that used `=0` as its "off" leg was never a comparison.** Sweep is
+   PR #212, open.
 
 ---
 
@@ -86,6 +166,13 @@ every table re-run from scratch.**
   **B=32 @ 8k: 11.57 GB → 0.38 GB.** Compaction copies 1.12 rows per row stored.
 - **Launch reductions shipped:** 9,131 → **8,650/token** (−430 dead mHC casts,
   −43 router weight, −8/seq/token sampler). Casts **1,571 → 1,141**.
+  ⛔ **2026-08-21: the 1,571 BASELINE IS RETRACTED AS STALE** — it was profiled
+  at `05af600e7`, and the three commits that retired it (`9f110905b`,
+  `1f6ef9da9`, `179e405ac`) are ancestors of HEAD but not of that ref. MHC's
+  whole remaining b=1 cast budget is **86 launches/token**
+  (`dsv4_mhc.rs:279`). **The 1,571 → 1,141 delta is scored against a number
+  that no longer existed; do not quote it as a saving.** (PR #206, FACTS
+  §2026-08-21.)
 - **Frozen Gumbel:** flat 64-token distribution, 512 draws ⇒
   **1 distinct token before, 64 after.**
 

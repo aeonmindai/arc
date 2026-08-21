@@ -38,6 +38,126 @@
 # anything not on this list. Every row: value + how/when measured.
 # (Sessions: s1=08-12 H200, s2=08-13 H200, s3=08-13/14 H200, s4=08-14 H200.)
 
+## 🔴🔴🔴 2026-08-21 — SESSION-9. **V4 OOMs AFTER 22–30 TOKENS, SO EVERY
+## SINGLE-USER V4 tok/s FIGURE IN THIS FILE WAS MEASURED INSIDE A CRASHING RUN.**
+
+**Full record: `memory/mission/wave66-CS-session9-the-22-token-wall.md`.**
+Serving measured at **`cc5487ad3`** on an H200; every source claim verified at
+master **`9c127a2b1`**.
+
+### 1. THE BLOCKER — `CUDA_ERROR_OUT_OF_MEMORY` at token 22–30, 3/3 runs
+
+Two independent arms. Card genuinely full at failure: **143,151 of 143,771 MiB**.
+Per-token `memory.used`: tok 1 = **142,927** · tok 3 = **142,959** ·
+tok 11 = **143,023** · tok 15 = **143,087** · tok 20 = **143,151** → OOM.
+⇒ **≈11 MiB/token, in ~32 MiB granules.**
+
+**It is a leak, not a fixed-size overrun**, on three counts: the death token
+moves with headroom (**30 with room, 25 without, 0 on a process poisoned by
+TCFRAG**); **memory is never released across requests** (one run ended at
+142,959 MiB used and the next *started* there); and the backtrace names an
+allocation whose width tracks context —
+`CudaSlice<float8::F8E4M3>` → `alloc_uninit` → `cat_contiguous` (candle
+`tensor_cat.rs`, no line number: not vendored here). Arc-side caller is
+`compressed_kv_from_rows` (`deepseek4.rs:1409`) →
+`forward_at_positions` (`layers.rs:1826`). Pool-held bytes read as used
+(`trim_cuda_memory_pools`, `memory_usage.rs:6-16`) and the trim runs once,
+post-ISQ (`normal.rs:1432`), never between requests.
+
+Serve config: **`kv-cache=eager` (PagedAttention OFF), `prefix-cache=ON`,
+`max-seqs=32`.**
+
+**Best clean fragment tonight: 37.35 tok/s over 20 tokens, `finish=length`,
+coherent output. That is a 20-token FRAGMENT, not a steady-state rate.**
+
+⚠️ **UNRESOLVED, and it may change the fix.** PR #182's H200 leg ran **2,600
+tokens with no OOM** at **6.04 MiB/token** (+15,700 MiB unbounded), which
+requires **≥15.7 GB free** at decode start against tonight's **844 MiB** — a
+~60 GB gap. Likeliest cause is the serve config (`max-seqs=32` + prefix cache
+vs #182's `--max-seq-len 4096`), which would make this a **concurrency-budget
+defect as much as a per-token leak**. **That is a hypothesis. Probe: re-run at
+`--max-seqs 1`, prefix cache off, read `memory.used` at token 1.**
+
+### 2. ⛔ EVERY HISTORICAL SINGLE-USER V4 tok/s FIGURE INHERITS THIS
+
+The three-way b=1 agreement recorded below — **15.11 / 15.39 / 15.51 tok/s** —
+was taken over **24 tokens** (its own row says so). 24 is inside the 22–30
+crash window. The same applies to **33.4 → 34.2** (`CAPTURE_LANE.md`),
+**9.3 / 13.31 / 14.84**, **10.99 / 11.94**, **15.36 / 16.92**, **17.85**, and
+**18.27**. None of them is a steady-state single-user rate; each is a rate
+measured while the allocator was filling, over a window that ended before the
+part that would drag it down.
+
+**Scope, stated exactly:** this covers **V4 on the eager KV path**. It does
+**not** touch the Qwen2.5-0.5B rows, nor the **55 tok/s TurboQuant B200
+Qwen3-32B** result — different models, different KV footprints, no evidence
+either way. Do not extend it to them, and do not narrow it to exclude V4 rows
+merely because they predate `cc5487ad3`: the mechanism (a `cat` whose width
+tracks context, plus no eviction at all before PR #182) predates the bound.
+
+### 3. THE b=1 FP8 GEMV IS **INSTRUCTION-BOUND** — derived, not measured
+
+`fp8_gemv_warp` (`blockwise_fp8_gemm.cu:144`) divides by `block_size_x`, a
+kernel parameter — plain signed `int` (`blockwise_fp8_gemm.cu:150`) — at
+`blockwise_fp8_gemm.cu:199`, once per four weight bytes
+(`blockwise_fp8_gemm.cu:171`), plus a second copy in the remainder loop at
+`blockwise_fp8_gemm.cu:215`. It is **not loop-invariant** (`k_base` advances
+128/trip) and is warp-uniform **only at the shipped 128-wide block size** — the
+dispatcher enforces just `block_size_x % 4 == 0`
+(`mistralrs-quant/src/blockwise_fp8/ops.rs:1139`).
+
+| roof used | issue rate | ceiling at ~45 inst / 4 B |
+|---|---|---|
+| FP32 warp-issue (132 × 4 × 32 × 1.98 GHz) | 3.345e13 | **2.97 TB/s** |
+| **INT32 lanes (132 × 64 × 1.98 GHz)** — the right pipe for an emulated signed idiv | **1.673e13** | **1.49 TB/s** |
+
+**Quote the RANGE, 1.5–3.0 TB/s, against a 4.8 TB/s nameplate and a ~4.0 TB/s
+achievable roof.** Both ends are under the roof, so the verdict holds *a
+fortiori*; quoting 2.97 alone used the FP32 rate and invites the objection.
+⚠️ **"45 inst / 4 B" is DERIVED from PR #210's own prose (15–20 inst, ~40% of
+the loop body), not measured. Probe: `cuobjdump -sass` on the inner loop.**
+Replacement is **PR #210**, `ARC_FP8_GEMV_WIDE=1`, **default OFF, uncompiled,
+not bit-identical**; its ~1.6× is a projection.
+
+### 4. TWO HOST ROUND-TRIPS PER DECODE STEP, NOT ONE
+
+`cudaStreamSynchronize` (`graph.rs:362`) after every `cuGraphLaunch`, **and** a
+greedy `argmax` + 4-byte D2H (`sampler.rs:1479`). Both on master.
+Zero-sync arm exists and is **unmeasured**: branch
+`arcgraph/device-decode-loop` @ `1b6949244`.
+
+### 5. INSTRUMENT FAILURES ADDED TO THE TALLY
+
+- **`mark_unreachable` (`arc-profiler/src/lib.rs:467`) is a no-op unless
+  `ARC_PROFILE` is exactly `"1"`** (`arc-profiler/src/lib.rs:124`, latched once
+  per process). **Its 6 sites in `normal.rs` — `:1556`, `:1635`, `:1921`,
+  `:2404`, `:2474`, `:2602` — have been dark in ordinary runs, and their
+  silence has been read as evidence.**
+- **`ci_cuda.yaml` gates nothing**: its whole `on:` block is
+  `workflow_dispatch` (`ci_cuda.yaml:3`) on a self-hosted ARM64 GPU runner
+  (`ci_cuda.yaml:18`). The real lane is `cuda-typecheck`
+  (`cuda_compile_check.yaml:337`), triggered on PRs at
+  `cuda_compile_check.yaml:109`.
+- **21 env flags are read presence-only, so `=0` turns them ON** — 18 of the 21
+  are `ARC_*` via `var_os`, 22 counting `.is_ok()/.is_err()`, 16 in shipping
+  `src/`. **Any past A/B that used `FLAG=0` as its "off" leg was never a
+  comparison.** Precedent is on the record: `normal.rs:216`. Fix exists and is
+  unused by these — `env_flag_is_set` (`normal.rs:232`), pinned by
+  `zero_and_its_spellings_are_off_not_merely_present` (`normal.rs:2977`).
+  Sweep is **PR #212**, open.
+
+### 🔴 RETRACTED 2026-08-21 — do not quote any of these
+
+| claim | status |
+|---|---|
+| **"~5,300 casts/copies per token, 1,571 of them bf16↔f32 round trips originating in MHC"** | **RETRACTED — STALE.** Profiled at `05af600e7`; the three commits that retired it (`9f110905b`, `1f6ef9da9`, `179e405ac`) are ancestors of HEAD but **not** of that ref. MHC's whole remaining b=1 cast budget is **86 launches/token** (`dsv4_mhc.rs:279`). Source: PR #206. **The 08-19 row "Casts: 1,571 → 1,141" is scored against the stale baseline and must not be quoted as a delta.** |
+| **`DecodeKvGeometry`** | **NEVER EXISTED IN RUST.** One occurrence in the whole tree, in a *proposed* fix inside `BUDGET_V4_B1.md:293`. There is no such type. |
+| **"tail (sinkhorn + fast_sum + bmul + ucopy) = 27.2%"** (and the **`fp8_gemv_warp` 16.0%** beside it) | **RETRACTED AS UNSOURCED ON MASTER.** Sole source is `docs/engineering/OPENROUTER_READY.md`, which **does not exist on master** — it lives only on branches `agent/tail-sinkhorn-warp-v2` and `agent/decode-share-probe`. PR #210 multiplies the 16.0% to project its win; that projection inherits the same provenance. |
+| **"b=1 is latency-bound — memory controller only 4% utilised"** | **RETRACTED.** The 4% is a whole-step average across thousands of tiny elementwise kernels and is **not evidence about any one kernel**. The b=1 FP8 GEMV is **instruction-bound** (§3). No measurement of that kernel's own memory utilisation exists. |
+| **"op count is retired as a lever"** (`CAPTURE_LANE.md`) | **RETRACTED.** The 1,137× launch-API cut that bought ~8% left **two host syncs per step** in both arms (§4), so it compared "few ops + 2 round-trips" with "many ops + 2 round-trips". The measurement stands; the inference does not. |
+| **"TCFRAG-2B is the fast-path default and that is fine"** | **FIXED, PR #209.** `qtip2b_tcfrag.cu:7` reads *"⚠️ UNVERIFIED ON HARDWARE — NEVER RUN"* and it was **default-ON opt-out** from `cc5487ad3`. Now `value == Some("1")` (`tcfrag2b.rs:272`). ⚠️ It does **not** panic — `OnceLock::get_or_init` caches `None` permanently (`tcfrag_words`, `bitshift.rs:1334`). |
+| **"the default config silently disables prefix caching"** | **STAYS NARROWED (08-19), now CONFIRMED by observation** — prefix caching was **ON** in tonight's V4 run. V4 declines PagedAttention (`normal_loaders.rs:3269`) and TurboQuant is a *paged* cache type (`TurboQuant`, `cache_engine.rs:31`), so the paged-only predicate is unreachable on the flagship. **Do not re-broaden it.** |
+
 ## 🟢 2026-08-19 — SESSION-8 CLOSE. **FOUR MEASUREMENTS, ZERO GPU HOURS.**
 
 **Provenance for the whole block:** compiler and source instruments only — no
@@ -447,6 +567,15 @@ server and stay cold" as the safe recipe and don't build on the mechanism.
 ## 🟢 THE b=1 FORWARD/HOST SPLIT — V4's first, and it CORRECTS a claim this
 ## file has been used to support (arcgraph chain, 2026-08-17, arc-prefill-curve,
 ## H200 SXM5 143 GB, qtip2b UQFF, `--max-seqs 1 --paged-attn off --prefix-cache-n 0`)
+##
+## ⛔ **2026-08-21: THE tok/s ROWS BELOW ARE 24-TOKEN FRAGMENTS, NOT RATES.**
+## V4 OOMs at token 22–30 (see the session-9 block at the top of this file), and
+## **this table's own first row says "24 tokens"** — the window ends inside the
+## crash band. The **ms/step**, the **57.27 ms sync'd forward** and the **88%
+## forward share** are per-step quantities and are unaffected; the **tok/s** and
+## anything derived from it as a sustained rate are not. Same for the 15.11 /
+## 15.51 corroborations. Quote them as "b=1 decode over 24 tokens", never as
+## "V4 does 15.4 tok/s".
 | quantity | measured |
 |---|---|
 | b=1 decode, 24 tokens, temp 0 | **15.39 tok/s** ⇒ **65.0 ms/step** |
