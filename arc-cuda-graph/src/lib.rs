@@ -88,10 +88,11 @@ pub use decode_forward::{decode_forward, DecodeBuffers, LayerKvCache, PagedAtten
 #[cfg(feature = "cuda")]
 pub use dedicated::DedicatedDecodePath;
 pub use device_loop::{
-    admit, clear_pending_tokens, device_loop_eligible, device_loop_enabled, device_loop_killed,
-    kill_device_loop, pending_token_count, push_pending_tokens, set_device_loop_eligible,
-    stand_down, take_pending_token, AdmissionFacts, BurstDriver, BurstOutcome, DeviceLoopConfig,
-    DeviceLoopError, DeviceOps, Refusal, StreamState,
+    admit, clear_pending_tokens, device_loop_eligible, device_loop_enabled, device_loop_generation,
+    device_loop_killed, kill_device_loop, note_aliased_logits_served, pending_owned_by_current,
+    pending_token_count, push_pending_tokens, set_device_loop_eligible, stand_down,
+    take_aliased_logits_marker, take_pending_token, AdmissionFacts, BurstDriver, BurstOutcome,
+    DeviceLoopConfig, DeviceLoopError, DeviceOps, PendingTake, Refusal, StreamState,
 };
 #[cfg(feature = "cuda")]
 pub use device_loop::{CudaDeviceOps, DeviceDecodeLoop};

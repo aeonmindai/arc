@@ -933,6 +933,15 @@ mod cuda_impl {
     pub struct DeviceDecodeLoop {
         ops: CudaDeviceOps,
         driver: BurstDriver,
+        /// The [`super::device_loop_generation`] this loop's ring, cursors and
+        /// fault word are valid for. Every `stand_down` — including the one
+        /// the `Sequence::set_state` completion funnel issues — bumps the
+        /// generation, and [`Self::run`] resets the per-sequence device state
+        /// before running a burst from a newer generation. Reset happens HERE,
+        /// at engagement, not at completion: the funnel cannot reach this
+        /// object (it lives in the pipeline), and between bursts is the only
+        /// point where no device write to the ring can still be in flight.
+        generation: u64,
     }
 
     // Same reasoning as `CudaGraphRunner` (`graph.rs:114`): the raw pointers are
@@ -976,13 +985,26 @@ mod cuda_impl {
                 cfg,
             )?;
             let driver = BurstDriver::new(cfg, batch)?;
-            Ok(Self { ops, driver })
+            Ok(Self {
+                ops,
+                driver,
+                generation: super::device_loop_generation(),
+            })
         }
 
         /// Enqueue `steps` decode steps and return their tokens.
         ///
         /// Exactly `steps` `cuGraphLaunch` calls, zero `cudaStreamSynchronize`.
         pub fn run(&mut self, steps: usize) -> candle_core::Result<BurstOutcome> {
+            // A stand-down happened since the last burst — sequence completed,
+            // errored, or was preempted — so the ring head, read cursors and
+            // fault word describe a sequence that no longer exists. Zero them
+            // before this burst rather than carrying them across sequences.
+            let current = super::device_loop_generation();
+            if self.generation != current {
+                self.reset();
+                self.generation = current;
+            }
             let out = self.driver.run_burst(&mut self.ops, steps)?;
             // D18: a subsystem that only announces itself at startup cannot be
             // told apart from one that started and then did nothing. Emit the
@@ -1156,14 +1178,37 @@ pub fn admit(
 std::thread_local! {
     static PENDING_TOKENS: std::cell::RefCell<std::collections::VecDeque<u32>> =
         const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    /// The sequence the parked tokens belong to, stamped at park time from
+    /// [`CURRENT_SEQ`]. The completion funnel (`Sequence::set_state`) is the
+    /// primary defence against a parked token outliving its sequence; this tag
+    /// is the structural one — it covers the paths NO funnel can see, such as
+    /// the DefaultScheduler bucketing waitlist, which moves a running sequence
+    /// aside *without a state modification* (`default_scheduler.rs`, the
+    /// `bucket_and_waitlist_seqs_waiting` doc says so explicitly).
+    static PENDING_OWNER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// The sequence id the last `sample_sequence` published alongside
+    /// eligibility. At batch 1 — the only shape the loop admits — this is
+    /// exactly the sequence the next forward's burst decodes for.
+    static CURRENT_SEQ: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Set by the forward when it served this step from the pending queue and
+    /// handed back the ALIASING graph logits tensor without launching anything
+    /// (`normal.rs::device_decode_burst`, the `pending > 0` arm). Consumed by
+    /// the very next sample. If that sample cannot take a parked token, the
+    /// logits it holds are a stale alias of graph-owned storage and sampling
+    /// them would return a plausible token from the WRONG sequence's
+    /// distribution — so the sample must fail loudly instead.
+    static ALIASED_LOGITS_SERVED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Park a burst's tokens for the engine to drain.
+/// Park a burst's tokens for the engine to drain. The queue is stamped with
+/// the current decoding sequence ([`set_device_loop_eligible`]) as its owner;
+/// [`take_pending_token`] refuses to hand them to anyone else.
 ///
 /// Negative ids are dropped rather than cast: the commit kernel range-checks
 /// before it writes, so a negative here would mean the ring was read wrong, and
 /// wrapping it into a huge `u32` would index the tokenizer out of bounds.
 pub fn push_pending_tokens(tokens: &[i32]) {
+    PENDING_OWNER.with(|o| o.set(CURRENT_SEQ.with(|c| c.get())));
     PENDING_TOKENS.with(|q| {
         let mut q = q.borrow_mut();
         for &t in tokens {
@@ -1180,14 +1225,81 @@ pub fn push_pending_tokens(tokens: &[i32]) {
     })
 }
 
-/// Take the next token the burst already produced, if any.
-pub fn take_pending_token() -> Option<u32> {
-    PENDING_TOKENS.with(|q| q.borrow_mut().pop_front())
+/// What [`take_pending_token`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingTake {
+    /// A token parked by a burst for THIS sequence.
+    Taken(u32),
+    /// Nothing parked.
+    Empty,
+    /// The queue held another sequence's tokens. They were dropped — handing
+    /// even one across would put one user's tokens in another user's response
+    /// — and `dropped` says how many. Logged as
+    /// `"ArcGraph: dropped N foreign parked tokens"`; on a box that line is
+    /// the violation instrument, so keep it grep-able.
+    Foreign { dropped: usize },
+}
+
+/// Take the next parked token, if it belongs to `seq_id`.
+///
+/// A queue owned by a different sequence is dropped whole, fail-closed: the
+/// owner has left the running set (or been waitlisted with no state change),
+/// its device-side burst state is stale, and replaying its tokens into any
+/// sequence — including the owner after a re-prefill — would corrupt output.
+pub fn take_pending_token(seq_id: usize) -> PendingTake {
+    let owner = PENDING_OWNER.with(|o| o.get());
+    PENDING_TOKENS.with(|q| {
+        let mut q = q.borrow_mut();
+        if q.is_empty() {
+            return PendingTake::Empty;
+        }
+        if owner == Some(seq_id) {
+            match q.pop_front() {
+                Some(t) => PendingTake::Taken(t),
+                None => PendingTake::Empty,
+            }
+        } else {
+            let dropped = q.len();
+            q.clear();
+            PENDING_OWNER.with(|o| o.set(None));
+            tracing::warn!(
+                "ArcGraph: dropped {dropped} foreign parked tokens (parked for sequence \
+                 {owner:?}, sampler is sequence {seq_id}) — cross-sequence leak prevented. \
+                 Expected once when the scheduler moves a sequence aside mid-burst; frequent \
+                 occurrences mean the device loop is engaging under scheduler churn it cannot \
+                 amortise"
+            );
+            PendingTake::Foreign { dropped }
+        }
+    })
 }
 
 /// Tokens still parked.
 pub fn pending_token_count() -> usize {
     PENDING_TOKENS.with(|q| q.borrow().len())
+}
+
+/// Does the pending queue belong to the sequence whose sample last published
+/// eligibility? The forward's `pending > 0` short-circuit must not fire for
+/// anyone else: it returns stale aliasing logits and launches nothing, which
+/// is only sound when the very next sample will take a parked token.
+pub fn pending_owned_by_current() -> bool {
+    let owner = PENDING_OWNER.with(|o| o.get());
+    owner.is_some() && owner == CURRENT_SEQ.with(|c| c.get())
+}
+
+/// The forward served this step from the pending queue: no launch, and the
+/// returned logits tensor aliases graph-owned storage. The next sample MUST
+/// take a parked token; [`take_aliased_logits_marker`] is how it checks.
+pub fn note_aliased_logits_served() {
+    ALIASED_LOGITS_SERVED.with(|c| c.set(true));
+}
+
+/// Consume the aliased-logits marker for this step. `true` means the logits
+/// the current sample holds were NOT produced by a launch for this step and
+/// must not be host-sampled.
+pub fn take_aliased_logits_marker() -> bool {
+    ALIASED_LOGITS_SERVED.with(|c| c.replace(false))
 }
 
 // Whether the sequence currently being decoded is one the device loop may
@@ -1208,8 +1320,12 @@ std::thread_local! {
     static DEVICE_LOOP_ELIGIBLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Publish whether the sequence being sampled may be driven by the device loop.
-pub fn set_device_loop_eligible(eligible: bool) {
+/// Publish whether the sequence being sampled may be driven by the device
+/// loop, and WHICH sequence that is. The id becomes the owner stamped onto
+/// anything the next burst parks, which is what makes a parked token
+/// unconsumable by any other sequence.
+pub fn set_device_loop_eligible(seq_id: usize, eligible: bool) {
+    CURRENT_SEQ.with(|c| c.set(Some(seq_id)));
     DEVICE_LOOP_ELIGIBLE.with(|c| c.set(eligible))
 }
 
@@ -1224,16 +1340,53 @@ pub fn device_loop_eligible() -> bool {
 /// back — a token left here would be handed to the *next* sequence as if it
 /// were its own. That is the "+1-step divergence" failure mode with a different
 /// name, so it gets an explicit call rather than a lifetime.
+///
+/// The sequence-completion half of that contract is enforced at ONE funnel:
+/// `mistralrs-core`'s `Sequence::set_state` calls [`stand_down`] on every
+/// transition out of the running set (`Done`, `Error`, `FinishedAborted`,
+/// `FinishedIgnored`, `Waiting`, `Swapped`), which is why this crate's
+/// dependency in `mistralrs-core` is deliberately not optional — the funnel
+/// and its leak test compile and run on hosts without CUDA. The tests here
+/// cover only this function's own behaviour; the call-site wiring is covered
+/// by `pipeline/sampling.rs`'s `device_loop_cross_sequence_leak_tests`.
 pub fn clear_pending_tokens() {
+    PENDING_OWNER.with(|o| o.set(None));
     PENDING_TOKENS.with(|q| q.borrow_mut().clear())
 }
 
-/// Stand down completely: forget parked tokens and mark the current sequence
-/// ineligible. Call on fall-back, on sequence completion, and on any error, so
-/// the next sequence starts from a clean slate.
+/// Stand down completely: forget parked tokens (and their owner), drop the
+/// aliased-logits marker, mark the current sequence ineligible, and bump the
+/// device-state generation so a kept-alive [`DeviceDecodeLoop`] resets its
+/// ring and cursors before it next runs. Call on fall-back, on sequence
+/// completion, and on any error, so the next sequence starts from a clean
+/// slate. Sequence completion — every transition out of the running set —
+/// calls this from the `Sequence::set_state` funnel; see
+/// [`clear_pending_tokens`].
 pub fn stand_down() {
     clear_pending_tokens();
-    set_device_loop_eligible(false);
+    ALIASED_LOGITS_SERVED.with(|c| c.set(false));
+    DEVICE_LOOP_ELIGIBLE.with(|c| c.set(false));
+    DEVICE_LOOP_GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
+}
+
+// The device-state generation. `DeviceDecodeLoop` holds ring cursors, the
+// pinned ring head and the device-side position — all per-sequence state —
+// but it is deliberately kept alive across sequences because every buffer it
+// points at must stay at the address the captured graph baked
+// (`DeviceDecodeLoop` docs). So instead of the funnel destroying it (it
+// cannot even reach it: the loop lives in the pipeline, the funnel in
+// `Sequence`), every `stand_down` bumps this generation and the loop compares
+// on its next `run`, resetting itself first if the world moved on. Reset at
+// engagement time is also the only SAFE time: between bursts nothing is in
+// flight on the stream, whereas a reset at completion time could race a
+// still-draining burst's device writes.
+std::thread_local! {
+    static DEVICE_LOOP_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The current device-state generation. Bumped by every [`stand_down`].
+pub fn device_loop_generation() -> u64 {
+    DEVICE_LOOP_GENERATION.with(|g| g.get())
 }
 
 /// Process-wide latch. Once the device loop has failed, it stays off.
@@ -1717,18 +1870,20 @@ mod tests {
         assert_eq!(admit(&f, &c, true), Err(Refusal::NoPositionRoom));
     }
 
-    /// The parked tokens are handed out in generation order, exactly once.
-    /// A queue that re-served a token, or served them reversed, would produce
-    /// fluent-but-wrong text — invisible without this.
+    /// The parked tokens are handed out in generation order, exactly once, to
+    /// the sequence that owns them. A queue that re-served a token, or served
+    /// them reversed, would produce fluent-but-wrong text — invisible without
+    /// this.
     #[test]
     fn pending_tokens_drain_in_order_exactly_once() {
-        clear_pending_tokens();
+        stand_down();
+        set_device_loop_eligible(11, true);
         push_pending_tokens(&[7, 8, 9]);
         assert_eq!(pending_token_count(), 3);
-        assert_eq!(take_pending_token(), Some(7));
-        assert_eq!(take_pending_token(), Some(8));
-        assert_eq!(take_pending_token(), Some(9));
-        assert_eq!(take_pending_token(), None);
+        assert_eq!(take_pending_token(11), PendingTake::Taken(7));
+        assert_eq!(take_pending_token(11), PendingTake::Taken(8));
+        assert_eq!(take_pending_token(11), PendingTake::Taken(9));
+        assert_eq!(take_pending_token(11), PendingTake::Empty);
         assert_eq!(pending_token_count(), 0);
     }
 
@@ -1737,21 +1892,93 @@ mod tests {
     /// another's output.
     #[test]
     fn clearing_pending_tokens_prevents_leaking_them_into_the_next_sequence() {
-        clear_pending_tokens();
+        stand_down();
+        set_device_loop_eligible(11, true);
         push_pending_tokens(&[7, 8, 9]);
         clear_pending_tokens();
-        assert_eq!(take_pending_token(), None);
+        assert_eq!(take_pending_token(11), PendingTake::Empty);
+    }
+
+    /// THE structural guarantee: tokens parked while sequence 11 was current
+    /// cannot be taken by sequence 12 — they are dropped whole, and the drop
+    /// is reported. This is the defence the completion funnel cannot provide:
+    /// the DefaultScheduler bucketing waitlist moves a running sequence aside
+    /// *without a state modification*, so no funnel ever fires.
+    #[test]
+    fn foreign_parked_tokens_are_dropped_not_served() {
+        stand_down();
+        set_device_loop_eligible(11, true);
+        push_pending_tokens(&[7, 8, 9]);
+
+        // Sequence 12 samples next (11 was waitlisted, no state change).
+        set_device_loop_eligible(12, true);
+        assert_eq!(
+            take_pending_token(12),
+            PendingTake::Foreign { dropped: 3 },
+            "another sequence's parked tokens must be dropped, not served"
+        );
+        assert_eq!(pending_token_count(), 0, "the foreign queue is gone whole");
+        // And they are gone for the original owner too: its device-side burst
+        // state is stale, so replaying them after a re-prefill would corrupt.
+        assert_eq!(take_pending_token(11), PendingTake::Empty);
+    }
+
+    /// The forward-side guard: the `pending > 0` short-circuit may only fire
+    /// for the sequence that owns the queue.
+    #[test]
+    fn pending_ownership_tracks_the_published_sequence() {
+        stand_down();
+        assert!(
+            !pending_owned_by_current(),
+            "empty queue is owned by nobody"
+        );
+        set_device_loop_eligible(11, true);
+        push_pending_tokens(&[7]);
+        assert!(pending_owned_by_current());
+        set_device_loop_eligible(12, true);
+        assert!(
+            !pending_owned_by_current(),
+            "the moment another sequence publishes, the queue is foreign"
+        );
+    }
+
+    /// The aliased-logits marker is consumed exactly once, and stand_down
+    /// drops it: a marker surviving a stand-down would poison the next
+    /// sequence's first REAL sample.
+    #[test]
+    fn aliased_logits_marker_is_one_shot_and_cleared_by_stand_down() {
+        stand_down();
+        assert!(!take_aliased_logits_marker());
+        note_aliased_logits_served();
+        assert!(take_aliased_logits_marker());
+        assert!(!take_aliased_logits_marker(), "consumed exactly once");
+        note_aliased_logits_served();
+        stand_down();
+        assert!(!take_aliased_logits_marker(), "stand_down must drop it");
+    }
+
+    /// Every stand_down bumps the device-state generation; that is what makes
+    /// a kept-alive `DeviceDecodeLoop` reset its ring and cursors before the
+    /// next sequence's first burst instead of carrying them across.
+    #[test]
+    fn stand_down_bumps_the_device_state_generation() {
+        let g0 = device_loop_generation();
+        stand_down();
+        assert_eq!(device_loop_generation(), g0.wrapping_add(1));
+        stand_down();
+        assert_eq!(device_loop_generation(), g0.wrapping_add(2));
     }
 
     /// A negative id in the ring means the ring was misread. Casting it would
     /// index the tokenizer at ~4 billion; it must be dropped and logged.
     #[test]
     fn negative_ring_ids_are_dropped_not_wrapped_into_huge_u32() {
-        clear_pending_tokens();
+        stand_down();
+        set_device_loop_eligible(11, true);
         push_pending_tokens(&[5, -1, 6]);
-        assert_eq!(take_pending_token(), Some(5));
-        assert_eq!(take_pending_token(), Some(6));
-        assert_eq!(take_pending_token(), None);
+        assert_eq!(take_pending_token(11), PendingTake::Taken(5));
+        assert_eq!(take_pending_token(11), PendingTake::Taken(6));
+        assert_eq!(take_pending_token(11), PendingTake::Empty);
     }
 
     /// The eligibility flag must start `false`, so the first decode step of a
@@ -1759,17 +1986,20 @@ mod tests {
     /// has checked yet.
     #[test]
     fn eligibility_starts_false_and_stand_down_resets_everything() {
-        set_device_loop_eligible(false);
-        clear_pending_tokens();
+        stand_down();
         assert!(!device_loop_eligible());
 
-        set_device_loop_eligible(true);
+        set_device_loop_eligible(11, true);
         push_pending_tokens(&[1, 2]);
         assert!(device_loop_eligible());
 
         stand_down();
         assert!(!device_loop_eligible(), "stand_down must clear eligibility");
-        assert_eq!(take_pending_token(), None, "stand_down must clear tokens");
+        assert_eq!(
+            take_pending_token(11),
+            PendingTake::Empty,
+            "stand_down must clear tokens"
+        );
     }
 
     /// Default-off, and explicitly pinnable off.
