@@ -308,15 +308,22 @@ Site 2 is a second one, in the sampler, on the same step.
 decode step) that bought **~8%** (33.4 → 34.2 tok/s), and the conclusion drawn
 was that **op count is retired as a lever**.
 
-> 🔴 **That conclusion is RETRACTED.** With two host syncs per step surviving
-> the capture, the experiment did not test "few ops vs many ops" — it tested
-> "few ops with two round-trips vs many ops with two round-trips." **The
-> round-trips, not the op count, were the invariant.** An 8% result from that
-> comparison is not evidence about op count either way.
+> 🔴 **That conclusion is RETRACTED, and the reason is precise: the captured
+> arm never got the host out of the loop.** Collapsing 3,961 launch *APIs* into
+> one `cuGraphLaunch` still leaves the replay's own
+> `cudaStreamSynchronize` (`graph.rs:362`) **and** the sampler's 4-byte D2H
+> (`sampler.rs:1479`) — **two full host round-trips per decode step, in the arm
+> that was supposed to have removed host involvement.** So the ~8% is what
+> "3,961 launches + 2 round-trips" costs over "1 launch + 2 round-trips". It
+> **cannot** be read as the value of getting the CPU out of the loop, because
+> the CPU never left it.
 
 What survives from CAPTURE_LANE is the *measurement* (3,961 → 3.8; 33.4 → 34.2)
 and the finding that kernel **duration** is a large share. What does not survive
-is the inference that launch reduction is exhausted.
+is the inference that launch reduction — or, more importantly, host removal — is
+exhausted. ⚠️ **Be careful not to over-claim in the other direction either:
+nothing here shows the two syncs *are* the limiter. It shows the experiment
+could not have seen them.** The number that would settle it has not been taken.
 
 ### The falsifying arm exists
 

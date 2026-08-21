@@ -73,8 +73,11 @@ six new retractions → `FACTS.md` §2026-08-21.
 2. 🔴 **Two host round-trips per decode step, not one** —
    `cudaStreamSynchronize` (`graph.rs:362`) **and** a greedy `argmax`
    (`sampler.rs:1479`). **This RETRACTS "op count is retired as a lever"**: the
-   1,137× launch cut that bought ~8% left both syncs in both arms. Zero-sync arm
-   exists, unmeasured: `arcgraph/device-decode-loop` @ `1b6949244`.
+   1,137× launch cut that bought ~8% **kept both round-trips in the captured
+   arm**, so the CPU never left the loop and the test could not price removing
+   it. *(It does not show the syncs ARE the limiter — only that the experiment
+   could not see them.)* Zero-sync arm exists, unmeasured:
+   `arcgraph/device-decode-loop` @ `1b6949244`.
 3. 🔴 **The dedicated/autonomous decode tier cannot accept V4 architecturally.**
    `LayerWeights` (`weights.rs:430`) has seven non-optional projection slots
    (`DENSE_PROJS_PER_LAYER`, `weights.rs:44`) — **no MLA slot, no expert slot**.
