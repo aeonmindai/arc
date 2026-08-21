@@ -71,10 +71,40 @@ jobs:
   # exist. Worse, it is green on code whose parent has not itself been proven —
   # the stack inherits its base's unreviewed state and reports success anyway.
   #
-  # So: refuse. A PR that does not target `master` is red until it is rebased.
-  # This is deliberately a HARD failure and not a warning — the whole class of
-  # defect being fixed is "an absence that reads as a pass", and a warning is
-  # another absence.
+  # So: refuse. A PR that does not target a LANDING BRANCH is red until it is
+  # rebased. This is deliberately a HARD failure and not a warning — the whole
+  # class of defect being fixed is "an absence that reads as a pass", and a
+  # warning is another absence.
+  #
+  # THE ONE EXCEPTION: `release/openrouter-ready`
+  # ---------------------------------------------
+  # `master` is not the only branch that satisfies the property this lane
+  # actually cares about. The property is not "the base is literally master" —
+  # it is "the base is a stable branch that will itself land on master through a
+  # PR that this same lane has gated". Exactly one other branch has that
+  # property, by construction:
+  #
+  #   * `release/openrouter-ready` is the single integration branch. Agents
+  #     branch off it and PR back into it, so the queue is one merge target
+  #     instead of twenty-two, and a stack's bottom PR is no longer a moving
+  #     base for the ones above it.
+  #   * It reaches master through exactly ONE pull request (#194), and #194's
+  #     base IS `master`, so it hits the `!= master` arm of this very check and
+  #     must be green on a tree whose parent is proven master. Nothing enters
+  #     master without a full run whose base is master. Master's protection is
+  #     therefore UNCHANGED by this widening.
+  #
+  # This is why the exception does not reopen the incident. The original defect
+  # was PRs based on *another PR's transient branch*: a base that can be rebased,
+  # force-pushed or abandoned under them, so their green described a tree that
+  # might never exist. An integration branch is the opposite — it is long-lived,
+  # it is the tree that will exist, and its own contents are re-proven against
+  # master by #194 before any of it ships.
+  #
+  # KEEP THIS LIST AT TWO ENTRIES. Every additional name is another base whose
+  # own state is not proven by anything, which is precisely the hole this lane
+  # was built to close. If a second integration branch is ever wanted, the
+  # honest change is to retire the first one, not to append to this list.
   #
   # It is a lane of `ci.yml` rather than its own workflow on purpose: `CI
   # complete` is the single required status check in branch protection, and it
@@ -84,7 +114,7 @@ jobs:
     name: Base branch
     runs-on: ubuntu-latest
     steps:
-      - name: Refuse a pull request that does not target master
+      - name: Refuse a pull request that does not target a landing branch
         # `push`, `schedule` and `workflow_dispatch` have an empty `base_ref`.
         # The step is skipped for them, but the JOB still succeeds, so
         # `ci-complete`'s lane count is the same number on every event type.
@@ -99,11 +129,17 @@ jobs:
           set -euo pipefail
           echo "head: ${HEAD_REF}"
           echo "base: ${BASE_REF}"
-          if [ "${BASE_REF}" != "master" ]; then
-            echo "::error::This PR targets '${BASE_REF}', not 'master'. Its lanes compile the head merged into another PR's branch, which is not the tree that will land. Rebase onto master and retarget the PR. (Stacked PRs used to run ZERO lanes and display only 'comment' — an absence that read as a pass. This lane exists so that state is red instead of blank.)"
-            exit 1
-          fi
-          echo "Base is master."
+          # Exact-match allowlist, not a prefix or glob: `release/*` would let
+          # any newly pushed `release/anything` become a self-declared landing
+          # branch, which is the same unproven-base hole under a new name.
+          case "${BASE_REF}" in
+            master|release/openrouter-ready) ;;
+            *)
+              echo "::error::This PR targets '${BASE_REF}', which is neither 'master' nor the integration branch 'release/openrouter-ready'. Its lanes compile the head merged into another PR's branch, which is not the tree that will land. Retarget it at 'release/openrouter-ready' (the single integration branch — it reaches master through PR #194, whose own base is master and which is gated by this same lane), or rebase onto master. (Stacked PRs used to run ZERO lanes and display only 'comment' — an absence that read as a pass. This lane exists so that state is red instead of blank.)"
+              exit 1
+              ;;
+          esac
+          echo "Base is '${BASE_REF}' — a landing branch."
 
   check:
     name: Check
