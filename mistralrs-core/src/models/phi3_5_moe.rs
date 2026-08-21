@@ -344,6 +344,44 @@ struct MoeMlp {
     num_experts: usize,
 }
 
+/// HF PhiMoE's `sparsemixer` routing mask:
+///
+/// ```text
+/// factor = scores.abs().clamp(min=mask_logits_threshold)
+/// mask   = ((mask_logits_threshold - scores) / factor) > (2 * jitter_eps)
+/// ```
+///
+/// 🔴 Both call sites used to spell `clamp(min=…)` as `broadcast_minimum`.
+/// `torch.clamp(min=x)` is a **lower bound** -- it is `max(input, x)`,
+/// elementwise -- so `broadcast_minimum` computes the exact opposite:
+/// `min(|s|, threshold)` where HF computes `max(|s|, threshold)`. The
+/// denominator was therefore too small on every element where
+/// `|s| < threshold`, which for the top-1 threshold is *every non-argmax
+/// element*, so the ratio was inflated, the `> 2ε` mask over-fired, and extra
+/// experts were masked to `-inf` before the softmax. That changes the gate
+/// multiplier on every token of every forward -- silently, since the model
+/// still produces plausible text.
+///
+/// Signs matter for the direction of the error but not for its existence:
+/// `factor` is only ever compared as a divisor, and the numerator
+/// `threshold - scores` is non-negative for the top-1 case, so an
+/// under-estimated `factor` can only push the ratio *up*, never down.
+///
+/// Source, verified against
+/// `transformers/src/transformers/models/phimoe/modeling_phimoe.py`
+/// (both the top-1 and top-2 blocks, which are identical in this respect).
+fn sparsemixer_jitter_mask(
+    scores: &Tensor,
+    mask_logits_threshold: &Tensor,
+    jitter_eps: f64,
+) -> Result<Tensor> {
+    let factor = scores.abs()?.broadcast_maximum(mask_logits_threshold)?;
+    mask_logits_threshold
+        .broadcast_sub(scores)?
+        .broadcast_div(&factor)?
+        .gt(2. * jitter_eps)
+}
+
 impl MoeMlp {
     fn new(
         cfg: &Config,
@@ -376,11 +414,8 @@ impl MoeMlp {
         // Compute mask for sparsity
         let selected_experts = scores.argmax_keepdim(D::Minus1)?;
         let mask_logits_threshold = scores.gather(&selected_experts, D::Minus1)?;
-        let factor = scores.abs()?.broadcast_minimum(&mask_logits_threshold)?;
-        let mask_logits_threshold = mask_logits_threshold
-            .broadcast_sub(scores)?
-            .broadcast_div(&factor)?
-            .gt(2. * jitter_eps)?;
+        let mask_logits_threshold =
+            sparsemixer_jitter_mask(scores, &mask_logits_threshold, jitter_eps)?;
 
         // Apply mask
         let masked_gates = masked_fill(scores, &mask_logits_threshold, f64::NEG_INFINITY)?;
@@ -401,11 +436,11 @@ impl MoeMlp {
         // Compute mask for sparsity
         let selected_experts_top2 = masked_scores.argmax_keepdim(D::Minus1)?;
         let mask_logits_threshold = masked_scores.gather(&selected_experts_top2, D::Minus1)?;
-        let factor = scores.abs()?.broadcast_minimum(&mask_logits_threshold)?;
-        let mask_logits_threshold = mask_logits_threshold
-            .broadcast_sub(scores)?
-            .broadcast_div(&factor)?
-            .gt(2. * jitter_eps)?;
+        // NB: the numerator threshold comes from `masked_scores` but both the
+        // subtrahend and the `abs()` are taken from the *unmasked* `scores` --
+        // that asymmetry is HF's, verbatim, not a typo here.
+        let mask_logits_threshold =
+            sparsemixer_jitter_mask(scores, &mask_logits_threshold, jitter_eps)?;
 
         // Apply mask
         let masked_gates_top2 =
@@ -888,3 +923,127 @@ impl NormalModel for Model {
 }
 
 impl AnyMoeBaseModelMixin for Model {}
+
+/// `sparsemixer`'s routing mask against a hand-evaluated reference.
+///
+/// The bug pinned here: `scores.abs().clamp(min=t)` is `max(|s|, t)`, and the
+/// port used `broadcast_minimum` -- `min(|s|, t)`. The reference below is
+/// written out in scalar Rust straight from the HF formula, so it cannot drift
+/// with the implementation it is checking.
+#[cfg(test)]
+mod sparsemixer_jitter_tests {
+    use super::*;
+    use candle_core::{Device, Tensor};
+
+    const JITTER_EPS: f64 = 0.01;
+
+    /// HF: `((t - s) / max(|s|, t)) > 2 * jitter_eps`, evaluated elementwise.
+    fn reference(scores: &[f32], threshold: f32, jitter_eps: f64) -> Vec<u8> {
+        scores
+            .iter()
+            .map(|&s| {
+                let factor = s.abs().max(threshold);
+                let ratio = (threshold - s) / factor;
+                u8::from(ratio > (2.0 * jitter_eps) as f32)
+            })
+            .collect()
+    }
+
+    /// The `broadcast_minimum` the fix replaced, so the test can show the two
+    /// formulas genuinely disagree on this input rather than merely agreeing
+    /// with itself.
+    fn reference_with_minimum(scores: &[f32], threshold: f32, jitter_eps: f64) -> Vec<u8> {
+        scores
+            .iter()
+            .map(|&s| {
+                let factor = s.abs().min(threshold);
+                let ratio = (threshold - s) / factor;
+                u8::from(ratio > (2.0 * jitter_eps) as f32)
+            })
+            .collect()
+    }
+
+    fn run(scores: &[f32], threshold: f32) -> Vec<u8> {
+        let dev = Device::Cpu;
+        let n = scores.len();
+        let s = Tensor::from_vec(scores.to_vec(), (1, n), &dev).unwrap();
+        let t = Tensor::from_vec(vec![threshold], (1, 1), &dev).unwrap();
+        sparsemixer_jitter_mask(&s, &t, JITTER_EPS)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<u8>()
+            .unwrap()
+    }
+
+    /// Router logits with the top-1 threshold taken from the max, which is the
+    /// shape `sparsemixer` actually calls this with.
+    ///
+    /// `0.9802` is deliberate. `min` and `max` always disagree on the *value*
+    /// of `factor`, but the mask only notices inside the band where the two
+    /// ratios straddle `2 * jitter_eps`. For `t = 1` and `2ε = 0.02` that band
+    /// is `s ∈ [0.98, 1/1.02)`: below it both ratios clear the threshold, above
+    /// it neither does. A score of `0.98` alone would pass under either
+    /// formula, which is exactly the trap the vacuity test below guards.
+    #[test]
+    fn matches_hf_clamp_min_semantics() {
+        let scores = [1.0f32, 0.9802, 0.5, 0.05, -0.3, -2.0];
+        let threshold = 1.0f32; // = max(scores), as `argmax`/`gather` produce.
+        assert_eq!(
+            run(&scores, threshold),
+            reference(&scores, threshold, JITTER_EPS)
+        );
+    }
+
+    /// A green result must prove work happened: if `minimum` and `maximum`
+    /// agreed on this input the test above would pass either way.
+    #[test]
+    fn minimum_and_maximum_actually_disagree_here() {
+        let scores = [1.0f32, 0.9802, 0.5, 0.05, -0.3, -2.0];
+        let threshold = 1.0f32;
+
+        // The denominators differ on every element where |s| != t. This part
+        // holds for any input and is the structural claim.
+        let differing_factors = scores
+            .iter()
+            .filter(|&&s| s.abs().max(threshold) != s.abs().min(threshold))
+            .count();
+        assert!(
+            differing_factors > 0,
+            "no element distinguishes max(|s|,t) from min(|s|,t)"
+        );
+
+        // And the difference reaches the mask, which is what the model consumes.
+        let with_max = reference(&scores, threshold, JITTER_EPS);
+        let with_min = reference_with_minimum(&scores, threshold, JITTER_EPS);
+        assert_ne!(
+            with_max, with_min,
+            "input is degenerate -- it cannot distinguish the bug from the fix"
+        );
+        // The live implementation is on the `maximum` side of that split.
+        assert_eq!(run(&scores, threshold), with_max);
+        assert_ne!(run(&scores, threshold), with_min);
+    }
+
+    /// `clamp(min=t)` with `t > 0` makes the denominator at least `t`, so a
+    /// score of exactly zero divides by `t`, not by zero. Under `minimum` the
+    /// denominator was `min(0, t) == 0`, producing `inf` and an unconditional
+    /// mask. This is the structural difference, not just a numeric one.
+    #[test]
+    fn zero_score_does_not_divide_by_zero() {
+        let scores = [1.5f32, 0.0, -0.75];
+        let threshold = 1.5f32;
+        let got = run(&scores, threshold);
+        assert_eq!(got, reference(&scores, threshold, JITTER_EPS));
+
+        let dev = Device::Cpu;
+        let s = Tensor::from_vec(scores.to_vec(), (1, 3), &dev).unwrap();
+        let t = Tensor::from_vec(vec![threshold], (1, 1), &dev).unwrap();
+        let factor = s.abs().unwrap().broadcast_maximum(&t).unwrap();
+        let factor: Vec<f32> = factor.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(
+            factor.iter().all(|f| f.is_finite() && *f >= threshold),
+            "clamp(min=t) must floor the denominator at t, got {factor:?}"
+        );
+    }
+}
