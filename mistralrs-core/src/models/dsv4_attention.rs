@@ -644,6 +644,52 @@ pub struct Dsv4AttentionConfig<'a> {
     pub graph_positions: Option<&'a Tensor>,
 }
 
+/// Engagement counters for the aliased-V fast path in [`dsv4_attention`].
+///
+/// House rule: "a green result must prove work happened". Skipping a `cat`
+/// leaves no trace in the output -- the results are bit-identical either way --
+/// so a harness that sees `aliased == 0` on a V4 decode must treat that as an
+/// environment failure rather than a result.
+pub mod fused_v_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static ALIASED: AtomicU64 = AtomicU64::new(0);
+    static MATERIALIZED: AtomicU64 = AtomicU64::new(0);
+
+    /// `(aliased, materialized)` — union-key concatenations skipped because
+    /// V is K, vs genuinely built.
+    pub fn counts() -> (u64, u64) {
+        (
+            ALIASED.load(Ordering::Relaxed),
+            MATERIALIZED.load(Ordering::Relaxed),
+        )
+    }
+
+    #[inline]
+    pub(super) fn record_aliased() {
+        ALIASED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(super) fn record_materialized() {
+        MATERIALIZED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Whether `v` is literally the same tensor as `k`, so every materialisation of
+/// V duplicates one already performed for K.
+///
+/// This is a HANDLE test, not a value test. Candle's `Tensor` is a reference-
+/// counted handle carrying a unique `TensorId` that survives `clone`, so
+/// `k.id() == v.id()` holds exactly when the two arguments name one tensor with
+/// one layout -- the only condition under which duplicated work is guaranteed
+/// bit-identical. Two distinct tensors that happen to hold equal values return
+/// `false` and keep the copying path, so this can only be conservative.
+#[inline]
+pub(crate) fn v_aliases_k(k: &Tensor, v: &Tensor) -> bool {
+    k.id() == v.id()
+}
+
 /// V4 hybrid attention dispatch — a single softmax over the union of the raw
 /// sliding-window KV and the compressed KV, with the per-head `attn_sink`
 /// (carried in `sdpa_params.sinks`) as an extra softmax-denominator column.
@@ -738,13 +784,42 @@ pub fn dsv4_attention(
             cfg.raw_prefix
         ))
     })?;
+    // 🔴 Under V4's fused MQA, V *is* K: three of `deepseek4.rs`'s four call
+    // sites pass the same binding twice (`&k, &k`; `&k_full, &k_full`;
+    // `&k_cached, &k_cached`), because the compressor stores one tensor and the
+    // attention reads it as both. The two full-cache materialisations below --
+    // this `narrow(..).contiguous()` and the `Tensor::cat` further down -- each
+    // built a byte-identical duplicate of it, once per layer per step. The
+    // comment above already names the cost ("copies the whole raw cache, twice,
+    // once for K and once for V") without noticing that the second copy is the
+    // same bytes as the first.
+    //
+    // Identity is tested with `Tensor::id`, not by comparing values: candle's
+    // `Tensor` is a handle whose id survives `clone`, so `k.id() == v.id()`
+    // means the two arguments are literally the same tensor with the same
+    // layout -- the only condition under which the duplicated work is
+    // guaranteed to agree bit for bit. Distinct tensors that merely happen to
+    // hold equal values take the old path, so this can only be conservative,
+    // never wrong. `deepseek4.rs:1821` passes genuinely distinct
+    // `&k_full, &v_full` and still gets both copies.
+    //
+    // The flag is computed HERE, before the narrowing, and threaded down --
+    // re-deriving it after this point would always say "not aliased", because
+    // two independent `narrow(..).contiguous()` calls produce two distinct
+    // handles even when their input was one tensor.
+    let v_aliases_k = v_aliases_k(k, v);
     let (k_owned, v_owned) = if rel_base == 0 && keep == t_k_given {
         (None, None)
     } else {
-        (
-            Some(k.narrow(2, rel_base, keep)?.contiguous()?),
-            Some(v.narrow(2, rel_base, keep)?.contiguous()?),
-        )
+        let k_narrowed = k.narrow(2, rel_base, keep)?.contiguous()?;
+        let v_narrowed = if v_aliases_k {
+            fused_v_stats::record_aliased();
+            k_narrowed.clone()
+        } else {
+            fused_v_stats::record_materialized();
+            v.narrow(2, rel_base, keep)?.contiguous()?
+        };
+        (Some(k_narrowed), Some(v_narrowed))
     };
     let k = k_owned.as_ref().unwrap_or(k);
     let v = v_owned.as_ref().unwrap_or(v);
@@ -792,7 +867,18 @@ pub fn dsv4_attention(
             };
             let valid = Tensor::cat(&[&raw_valid, &comp_valid], 1)?;
             let k_cat = Tensor::cat(&[k, comp], 2)?.contiguous()?;
-            let v_cat = Tensor::cat(&[v, comp], 2)?.contiguous()?;
+            // The second half of the same duplication -- see `v_aliases_k`
+            // above. `v_cat` was an unconditional
+            // `Tensor::cat(&[v, comp], 2)?.contiguous()?`, allocating and
+            // copying a byte-identical duplicate of the entire union key
+            // tensor whenever V aliased K.
+            let v_cat = if v_aliases_k {
+                fused_v_stats::record_aliased();
+                k_cat.clone()
+            } else {
+                fused_v_stats::record_materialized();
+                Tensor::cat(&[v, comp], 2)?.contiguous()?
+            };
             (k_cat, v_cat, valid)
         }
         None => (k.clone(), v.clone(), raw_valid),
@@ -3124,6 +3210,168 @@ mod tests {
             "the compressed mask did not change between position 3 and position 23 — it is \
              not reading the device position, which is the entire defect"
         );
+        Ok(())
+    }
+}
+
+/// The aliased-V fast path: under V4's fused MQA the caller passes the same
+/// tensor as K and as V, and the second `Tensor::cat` that built `v_cat` was a
+/// byte-identical duplicate of `k_cat`.
+///
+/// Because the two paths agree exactly, skipping the cat is invisible in the
+/// output -- which is why these tests assert on the `fused_v_stats` counters as
+/// well as on the values. A test that only compared outputs would pass whether
+/// or not the fast path ever engaged.
+#[cfg(test)]
+mod fused_v_alias_tests {
+    use super::*;
+    use candle_core::{DType, Device, Result, Tensor};
+    use std::collections::HashMap;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// The engagement counters are process-global and `cargo test` runs these
+    /// in parallel, so every test that drives a forward takes this lock and the
+    /// deltas it observes are its own.
+    fn guard() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn mk(b: usize, h: usize, t: usize, d: usize, seed: f32, dev: &Device) -> Result<Tensor> {
+        let data: Vec<f32> = (0..(b * h * t * d))
+            .map(|i| ((i as f32) * seed).sin())
+            .collect();
+        Tensor::from_vec(data, (b, h, t, d), dev)
+    }
+
+    fn flash() -> FlashParams {
+        FlashParams {
+            max_q: 0,
+            max_k: 0,
+            cumulative_seqlens_q: HashMap::new(),
+            cumulative_seqlens_k: HashMap::new(),
+            causal: false,
+        }
+    }
+
+    fn cfg<'a>() -> Dsv4AttentionConfig<'a> {
+        Dsv4AttentionConfig {
+            compress_ratio: CompressRatio::Csa,
+            sliding_window: 128,
+            raw_prefix: 0,
+            row_q0: None,
+            graph_positions: None,
+        }
+    }
+
+    fn sdpa(h: usize, d: usize, dev: &Device) -> Result<SdpaParams> {
+        let sinks: Vec<f32> = (0..h).map(|i| 0.5 + 0.25 * i as f32).collect();
+        Ok(SdpaParams {
+            n_kv_groups: h,
+            softcap: None,
+            softmax_scale: 1.0 / (d as f32).sqrt(),
+            sliding_window: None,
+            sinks: Some(Tensor::from_vec(sinks, (1, h, 1, 1), dev)?),
+        })
+    }
+
+    /// Passing K twice (what `deepseek4.rs` does at three of its four call
+    /// sites) must produce exactly what passing two equal-valued but distinct
+    /// tensors produces -- and must take the fast path while doing it.
+    #[test]
+    fn aliased_v_is_bit_identical_and_engages() -> Result<()> {
+        let _g = guard();
+        let dev = Device::Cpu;
+        let (b, h, d, t_k) = (1usize, 2usize, 8usize, 256usize);
+        let t_c = t_k / 4;
+
+        let q = mk(b, h, 1, d, 0.03, &dev)?;
+        let k = mk(b, 1, t_k, d, 0.11, &dev)?;
+        let comp = mk(b, 1, t_c, d, 0.05, &dev)?;
+        let sdpa = sdpa(h, d, &dev)?;
+
+        // A distinct tensor holding the same values: this is the slow path.
+        let v_copy = k.copy()?;
+        assert_ne!(k.id(), v_copy.id(), "copy() must yield a distinct handle");
+
+        let before = fused_v_stats::counts();
+        let aliased = dsv4_attention(&q, &k, &k, Some(&comp), None, &flash(), &sdpa, cfg())?;
+        let mid = fused_v_stats::counts();
+        let separate = dsv4_attention(&q, &k, &v_copy, Some(&comp), None, &flash(), &sdpa, cfg())?;
+        let after = fused_v_stats::counts();
+
+        // Two duplications are avoided per call, not one: the raw
+        // `narrow(..).contiguous()` and the union `cat`. The counters are
+        // process-global and the rest of this file's tests drive
+        // `dsv4_attention` too, so these are lower bounds -- the exact-delta
+        // claim is made by `alias_predicate_is_handle_identity` below, which
+        // has no shared state.
+        assert!(
+            mid.0 >= before.0 + 2,
+            "aliased call did not take both fast paths ({before:?} -> {mid:?})"
+        );
+        assert!(
+            after.1 >= mid.1 + 2,
+            "distinct-tensor call must still materialize both copies of V"
+        );
+
+        let a: Vec<f32> = aliased.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let s: Vec<f32> = separate.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        assert_eq!(
+            a.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            s.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "skipping the duplicate cat changed the result"
+        );
+        Ok(())
+    }
+
+    /// The decision itself, with no shared state: handle identity, not value
+    /// equality. This is the assertion the counter deltas cannot make, because
+    /// `dsv4_attention`'s counters are process-global and every other test in
+    /// this file drives them concurrently.
+    #[test]
+    fn alias_predicate_is_handle_identity() -> Result<()> {
+        let dev = Device::Cpu;
+        let k = mk(1, 1, 8, 4, 0.11, &dev)?;
+
+        // What `deepseek4.rs` passes: one binding, twice.
+        assert!(v_aliases_k(&k, &k));
+        // A clone is the same handle -- this is what the fix relies on when it
+        // threads `k_narrowed.clone()` through as V.
+        assert!(v_aliases_k(&k, &k.clone()));
+        // Equal values, different handle: must decline and keep copying.
+        let same_values = k.copy()?;
+        assert!(!v_aliases_k(&k, &same_values));
+        // Different values: must decline.
+        let other = mk(1, 1, 8, 4, 0.17, &dev)?;
+        assert!(!v_aliases_k(&k, &other));
+        Ok(())
+    }
+
+    /// A genuinely different V must NOT be aliased onto K. Guards against
+    /// "always reuse k_cat", which would silently compute self-attention over
+    /// keys.
+    #[test]
+    fn distinct_v_is_not_aliased() -> Result<()> {
+        let _g = guard();
+        let dev = Device::Cpu;
+        let (b, h, d, t_k) = (1usize, 2usize, 8usize, 256usize);
+        let t_c = t_k / 4;
+
+        let q = mk(b, h, 1, d, 0.03, &dev)?;
+        let k = mk(b, 1, t_k, d, 0.11, &dev)?;
+        let v = mk(b, 1, t_k, d, 0.17, &dev)?;
+        let comp = mk(b, 1, t_c, d, 0.05, &dev)?;
+        let sdpa = sdpa(h, d, &dev)?;
+
+        let with_v = dsv4_attention(&q, &k, &v, Some(&comp), None, &flash(), &sdpa, cfg())?;
+        let with_k = dsv4_attention(&q, &k, &k, Some(&comp), None, &flash(), &sdpa, cfg())?;
+
+        let a: Vec<f32> = with_v.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let bb: Vec<f32> = with_k.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        assert_ne!(a, bb, "a different V produced the same output as V == K");
         Ok(())
     }
 }

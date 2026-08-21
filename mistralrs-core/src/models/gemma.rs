@@ -456,7 +456,19 @@ impl Model {
                 cfg.num_hidden_layers,
                 cfg.max_position_embeddings,
             )),
-            max_seq_len: default_max_position_embeddings(),
+            // 🔴 This read `default_max_position_embeddings()` -- the literal
+            // 4096 serde fallback -- while the two lines that bracket it read
+            // `cfg.max_position_embeddings` correctly. `default_*` is the value
+            // to use when the config file is SILENT, never the value to use when
+            // it has spoken; every Gemma checkpoint ships an explicit
+            // `max_position_embeddings` (8192 for gemma-2b/7b, 8192 for
+            // codegemma), so this silently halved the usable context of every
+            // Gemma. `NormalModel::max_seq_len` is what the engine consults for
+            // prompt rejection, truncation, `is_done`, CUDA-graph block sizing
+            // and the context length reported to API clients -- all five were
+            // being told 4096. Every sibling model in `models/` reads
+            // `cfg.max_position_embeddings` here; gemma was the only exception.
+            max_seq_len: cfg.max_position_embeddings,
             cfg: ModelConfigMetadata {
                 max_seq_len: cfg.max_position_embeddings,
                 num_layers: cfg.num_hidden_layers,

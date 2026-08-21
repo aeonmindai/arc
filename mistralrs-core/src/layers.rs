@@ -350,6 +350,118 @@ impl QRmsNorm {
     }
 }
 
+/// The offset shared by every row of a decode cohort, or `None` when the rows
+/// genuinely differ.
+///
+/// # Why this is a *value* test and not a length test
+///
+/// Every rotary implementation in this file gated its batched path on
+/// `seqlen_offsets.len() == 1` -- the **length of the vector**, where the
+/// property it needs is the **distinctness of the values**. `len()` is the
+/// batch size, so the batched path was unreachable at every batch size above
+/// one, while the values were uniform anyway: `crate::scheduler` admits a
+/// forward pass only when the participating cache lengths are equal. The
+/// per-sequence loop was therefore performing B **bit-identical**
+/// recomputations of the same `cos`/`sin` rotation and concatenating them back
+/// together.
+///
+/// Returning `Some` is exact rather than approximate. `candle_nn`'s rope
+/// kernels take a 2-D `[T, D/2]` cos/sin whose batch stride is 0, so every
+/// batch row already reads the same table row, and each output element is an
+/// independent two-multiply-one-add of its own inputs. Batching changes which
+/// launch computes an element, never the arithmetic that produces it. That is
+/// asserted bit-for-bit, not within a tolerance, in `rope_cohort_tests`.
+///
+/// `None` keeps the old loop verbatim, so ragged cohorts behave exactly as they
+/// do today. This is a dispatch fix, not a new ragged path.
+///
+/// # Relationship to `DeepSeekV2RotaryEmbedding::uniform_offset`
+///
+/// The V4 rotary got this same correction separately (PR #198, still unmerged
+/// at the time of writing) as a private associated function with an identical
+/// body. When these two lines of work meet, collapse that one onto this one --
+/// there must not be two spellings of the same predicate.
+#[inline]
+pub(crate) fn uniform_seqlen_offset(seqlen_offsets: &[usize]) -> Option<usize> {
+    match seqlen_offsets {
+        [] => None,
+        [first, rest @ ..] => rest.iter().all(|o| o == first).then_some(*first),
+    }
+}
+
+/// Engagement counters for the uniform-offset cohort path -- see
+/// [`uniform_seqlen_offset`].
+///
+/// House rule: "a green result must prove work happened". A fast path that
+/// silently never engages produces a perfectly green no-op, so the batched
+/// branch counts itself and the per-sequence branch counts itself, and a
+/// harness that sees `cohort == 0` must treat that as an environment failure
+/// rather than a result.
+pub mod rope_cohort_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(super) static COHORT: AtomicU64 = AtomicU64::new(0);
+    pub(super) static PER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    /// `(cohort, per_sequence)` -- batched RoPE calls vs per-sequence loops.
+    ///
+    /// Tests assert on *deltas* around a call rather than absolute values, so
+    /// no reset hook is needed and the counters stay monotonic for a serving
+    /// harness reading them at the end of a run.
+    pub fn counts() -> (u64, u64) {
+        (
+            COHORT.load(Ordering::Relaxed),
+            PER_SEQUENCE.load(Ordering::Relaxed),
+        )
+    }
+
+    #[inline]
+    pub(super) fn record_cohort() {
+        COHORT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(super) fn record_per_sequence() {
+        PER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Tile a `[max_seq_len, rot_dim]` rotary table into the `[b * seq_len, rot_dim]`
+/// layout `mistralrs_quant::rotary::apply_rotary_inplace` requires.
+///
+/// The CUDA kernel indexes `cos_cache + token_idx * rot_dim` with one block per
+/// token of the *flattened* `[b * seq_len, h, d]` tensor, and
+/// `mistralrs_quant::rotary` hard-bails unless the cache is exactly
+/// `(num_tokens, rot_dim)`. So -- unlike the `candle_nn` paths -- a uniform
+/// cohort cannot simply narrow to `[seq_len, rot_dim]`; the rows must actually
+/// be repeated, b-major, to match `q.transpose(1, 2)?.flatten(0, 1)?`.
+///
+/// Uniform cohorts get one broadcast + one copy instead of `b` narrows and a
+/// `b`-way `cat`; ragged cohorts keep the `cat`, which is the only thing that
+/// can express them.
+fn cohort_rotary_table(table: &Tensor, seqlen_offsets: &[usize], seq_len: usize) -> Result<Tensor> {
+    match uniform_seqlen_offset(seqlen_offsets) {
+        Some(offset) => {
+            let rows = table.narrow(0, offset, seq_len)?;
+            if seqlen_offsets.len() == 1 {
+                return rows.contiguous();
+            }
+            let rot_dim = rows.dim(D::Minus1)?;
+            rows.unsqueeze(0)?
+                .broadcast_as((seqlen_offsets.len(), seq_len, rot_dim))?
+                .contiguous()?
+                .reshape((seqlen_offsets.len() * seq_len, rot_dim))
+        }
+        None => {
+            let mut rows = Vec::with_capacity(seqlen_offsets.len());
+            for offset in seqlen_offsets {
+                rows.push(table.narrow(0, *offset, seq_len)?);
+            }
+            Tensor::cat(&rows, 0)
+        }
+    }
+}
+
 /// RoPE supporting LongRope
 #[derive(Debug, Clone)]
 pub struct PhiRotaryEmbedding {
@@ -656,13 +768,17 @@ impl PhiRotaryEmbedding {
             let k_rot = k.narrow(D::Minus1, 0, rot_dim)?;
             let k_pass = k.narrow(D::Minus1, rot_dim, k.dim(D::Minus1)? - rot_dim)?;
 
-            let (q_rot, k_rot) = if seqlen_offsets.len() == 1 {
-                let cos = cos.narrow(0, seqlen_offsets[0], seq_len)?;
-                let sin = sin.narrow(0, seqlen_offsets[0], seq_len)?;
+            // Batched whenever every row shares an offset -- see
+            // `uniform_seqlen_offset`. This used to require `len() == 1`.
+            let (q_rot, k_rot) = if let Some(offset) = uniform_seqlen_offset(seqlen_offsets) {
+                rope_cohort_stats::record_cohort();
+                let cos = cos.narrow(0, offset, seq_len)?;
+                let sin = sin.narrow(0, offset, seq_len)?;
                 let q_embed = candle_nn::rotary_emb::rope(&q_rot.contiguous()?, &cos, &sin)?;
                 let k_embed = candle_nn::rotary_emb::rope(&k_rot.contiguous()?, &cos, &sin)?;
                 (q_embed, k_embed)
             } else {
+                rope_cohort_stats::record_per_sequence();
                 let mut q_embeds = Vec::new();
                 let mut k_embeds = Vec::new();
                 for (i, offset) in seqlen_offsets.iter().enumerate() {
@@ -690,13 +806,15 @@ impl PhiRotaryEmbedding {
                 Tensor::cat(&[q_rot, q_pass], D::Minus1)?.contiguous()?,
                 Tensor::cat(&[k_rot, k_pass], D::Minus1)?.contiguous()?,
             ))
-        } else if seqlen_offsets.len() == 1 {
-            let cos = cos.narrow(0, seqlen_offsets[0], seq_len)?;
-            let sin = sin.narrow(0, seqlen_offsets[0], seq_len)?;
+        } else if let Some(offset) = uniform_seqlen_offset(seqlen_offsets) {
+            rope_cohort_stats::record_cohort();
+            let cos = cos.narrow(0, offset, seq_len)?;
+            let sin = sin.narrow(0, offset, seq_len)?;
             let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
             let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
             Ok((q_embed, k_embed))
         } else {
+            rope_cohort_stats::record_per_sequence();
             let mut q_embeds = Vec::new();
             let mut k_embeds = Vec::new();
             for (i, offset) in seqlen_offsets.iter().enumerate() {
@@ -1884,13 +2002,17 @@ impl Phi4MMRotaryEmbedding {
         let k_rot = k.narrow(D::Minus1, 0, rot_dim)?;
         let k_pass = k.narrow(D::Minus1, rot_dim, k.dim(D::Minus1)? - rot_dim)?;
 
-        let (q_rot, k_rot) = if seqlen_offsets.len() == 1 {
-            let cos = cos.narrow(0, seqlen_offsets[0], seq_len)?;
-            let sin = sin.narrow(0, seqlen_offsets[0], seq_len)?;
+        // Batched whenever every row shares an offset -- see
+        // `uniform_seqlen_offset`. This used to require `len() == 1`.
+        let (q_rot, k_rot) = if let Some(offset) = uniform_seqlen_offset(seqlen_offsets) {
+            rope_cohort_stats::record_cohort();
+            let cos = cos.narrow(0, offset, seq_len)?;
+            let sin = sin.narrow(0, offset, seq_len)?;
             let q_embed = candle_nn::rotary_emb::rope(&q_rot.contiguous()?, &cos, &sin)?;
             let k_embed = candle_nn::rotary_emb::rope(&k_rot.contiguous()?, &cos, &sin)?;
             (q_embed, k_embed)
         } else {
+            rope_cohort_stats::record_per_sequence();
             let mut q_embeds = Vec::new();
             let mut k_embeds = Vec::new();
             for (i, offset) in seqlen_offsets.iter().enumerate() {
@@ -2652,21 +2774,28 @@ impl RotaryEmbedding {
             }
         }
 
-        if cfg!(feature = "cuda") && qh == kh {
-            let (cos, sin) = if seqlen_offsets.len() == 1 {
-                (
-                    self.cos.narrow(0, seqlen_offsets[0], seq_len)?,
-                    self.sin.narrow(0, seqlen_offsets[0], seq_len)?,
-                )
-            } else {
-                let mut cos_s = Vec::new();
-                let mut sin_s = Vec::new();
-                for offset in seqlen_offsets {
-                    cos_s.push(self.cos.narrow(0, *offset, seq_len)?);
-                    sin_s.push(self.sin.narrow(0, *offset, seq_len)?);
-                }
-                (Tensor::cat(&cos_s, 0)?, Tensor::cat(&sin_s, 0)?)
-            };
+        // 🔴 This used to read `cfg!(feature = "cuda") && qh == kh`, which
+        // switched the fused kernel off for **every GQA model** -- qwen2, qwen3,
+        // mistral, gemma2, phi3 and the rest all have `qh != kh` by definition,
+        // so they fell through to the `candle_nn` path below.
+        //
+        // The head-count equality was never a kernel requirement.
+        // `mistralrs_quant::rotary::apply_rotary_inplace` takes `num_heads` and
+        // `num_kv_heads` as separate arguments and the kernel walks them as two
+        // independent loops (`nq = num_heads * rot_dim`, `nk = num_kv_heads *
+        // rot_dim`, `kernels/rotary/rotary.cu`); the only shape it insists on is
+        // `(num_tokens, head_size)` matching between q and k, which GQA
+        // preserves. UNVERIFIED ON HARDWARE -- read from the kernel source, not
+        // measured.
+        //
+        // The `is_cuda()` term is new as well: the old condition tested only the
+        // compile-time feature, so a cuda-enabled binary running a model on CPU
+        // or Metal walked into `apply_rotary_inplace` and hit its
+        // "expects a cuda tensor" bail. That was reachable before only for MHA
+        // models; widening the head-count gate would have widened that too.
+        if cfg!(feature = "cuda") && q.device().is_cuda() {
+            let cos = cohort_rotary_table(&self.cos, seqlen_offsets, seq_len)?;
+            let sin = cohort_rotary_table(&self.sin, seqlen_offsets, seq_len)?;
 
             let q_embed = q.transpose(1, 2)?.flatten(0, 1)?;
             let k_embed = k.transpose(1, 2)?.flatten(0, 1)?;
@@ -2688,13 +2817,15 @@ impl RotaryEmbedding {
                 k = k.contiguous()?;
             }
             Ok((q, k))
-        } else if seqlen_offsets.len() == 1 {
-            let cos = self.cos.narrow(0, seqlen_offsets[0], seq_len)?;
-            let sin = self.sin.narrow(0, seqlen_offsets[0], seq_len)?;
+        } else if let Some(offset) = uniform_seqlen_offset(seqlen_offsets) {
+            rope_cohort_stats::record_cohort();
+            let cos = self.cos.narrow(0, offset, seq_len)?;
+            let sin = self.sin.narrow(0, offset, seq_len)?;
             let q_embed = rope(&q.contiguous()?, &cos, &sin)?;
             let k_embed = rope(&k.contiguous()?, &cos, &sin)?;
             Ok((q_embed, k_embed))
         } else {
+            rope_cohort_stats::record_per_sequence();
             let mut q_embeds = Vec::new();
             let mut k_embeds = Vec::new();
             for (i, offset) in seqlen_offsets.iter().enumerate() {
@@ -2830,24 +2961,18 @@ impl GptOssRotaryEmbedding {
         #[allow(unused_variables)]
         let (_b_sz, kh, _seq_len, _n_embd) = k.dims4()?;
 
-        // Use CUDA optimized kernel when available and q/k have same number of heads
-        // The CUDA kernel uses is_neox=true for chunked/GPT-NeoX style rotary
+        // Use the CUDA kernel when available. The kernel uses is_neox=true for
+        // chunked/GPT-NeoX style rotary.
+        //
+        // 🔴 This used to also require `qh == k.dim(1)?`, i.e. MHA. GPT-OSS is
+        // GQA (64 query heads, 8 KV heads), so that condition is false for the
+        // only architecture that reaches this code and the kernel was dead.
+        // `apply_rotary_inplace` takes `num_kv_heads` separately -- see the
+        // longer note on `RotaryEmbedding::forward`. UNVERIFIED ON HARDWARE.
         #[cfg(feature = "cuda")]
-        if q.device().is_cuda() && qh == k.dim(1)? {
-            let (cos, sin) = if seqlen_offsets.len() == 1 {
-                (
-                    self.cos.narrow(0, seqlen_offsets[0], seq_len)?,
-                    self.sin.narrow(0, seqlen_offsets[0], seq_len)?,
-                )
-            } else {
-                let mut cos_s = Vec::new();
-                let mut sin_s = Vec::new();
-                for offset in seqlen_offsets {
-                    cos_s.push(self.cos.narrow(0, *offset, seq_len)?);
-                    sin_s.push(self.sin.narrow(0, *offset, seq_len)?);
-                }
-                (Tensor::cat(&cos_s, 0)?, Tensor::cat(&sin_s, 0)?)
-            };
+        if q.device().is_cuda() {
+            let cos = cohort_rotary_table(&self.cos, seqlen_offsets, seq_len)?;
+            let sin = cohort_rotary_table(&self.sin, seqlen_offsets, seq_len)?;
 
             // Reshape for CUDA kernel: [b, h, seq, dim] -> [b*seq, h, dim]
             let q_embed = q.transpose(1, 2)?.flatten(0, 1)?;
@@ -2871,14 +2996,18 @@ impl GptOssRotaryEmbedding {
             return Ok((q, k));
         }
 
-        // CPU fallback using candle_nn's rope (GPT-NeoX/chunked style)
-        if seqlen_offsets.len() == 1 {
-            let cos = self.cos.narrow(0, seqlen_offsets[0], seq_len)?;
-            let sin = self.sin.narrow(0, seqlen_offsets[0], seq_len)?;
+        // CPU fallback using candle_nn's rope (GPT-NeoX/chunked style).
+        // Batched whenever every row shares an offset -- see
+        // `uniform_seqlen_offset`. This used to require `len() == 1`.
+        if let Some(offset) = uniform_seqlen_offset(seqlen_offsets) {
+            rope_cohort_stats::record_cohort();
+            let cos = self.cos.narrow(0, offset, seq_len)?;
+            let sin = self.sin.narrow(0, offset, seq_len)?;
             let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
             let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
             Ok((q_embed, k_embed))
         } else {
+            rope_cohort_stats::record_per_sequence();
             let mut q_embeds = Vec::new();
             let mut k_embeds = Vec::new();
             for (i, offset) in seqlen_offsets.iter().enumerate() {
@@ -3618,5 +3747,246 @@ mod graph_mode_mask_tests {
         let dev = Device::Cpu;
         let positions = Tensor::from_vec(vec![0u32], (1,), &dev).unwrap();
         assert!(graph_mode_length_mask(&positions, 0, DType::F32).is_err());
+    }
+}
+
+/// Bit-exactness and engagement tests for the uniform-offset RoPE cohort path.
+///
+/// The change under test replaced `seqlen_offsets.len() == 1` -- a test of the
+/// *length* of the offset vector -- with [`uniform_seqlen_offset`], a test of
+/// the *distinctness of its values*, at every rotary implementation in this
+/// file. At B=256 the length is 256, so the batched path was unreachable at
+/// every batch size above one, while the values were uniform anyway; the
+/// per-sequence loop was therefore performing B bit-identical recomputations
+/// and concatenating them back together.
+///
+/// Each test holds the old loop as a verbatim oracle and asserts the new
+/// dispatch reproduces it **bit for bit**, not within a tolerance -- a
+/// tolerance-based assertion would be vacuous, since the claim is that no
+/// arithmetic changed at all.
+#[cfg(test)]
+mod rope_cohort_tests {
+    use super::*;
+    use candle_core::{DType, Device};
+
+    const B: usize = 4;
+    const H: usize = 2;
+    const T: usize = 3;
+    const D_HEAD: usize = 8;
+    const MAX_POS: usize = 64;
+
+    fn xs(dims: &[usize], seed: f32) -> Tensor {
+        let n: usize = dims.iter().product();
+        let v: Vec<f32> = (0..n)
+            .map(|i| ((i as f32) * seed).sin() * 1.7 + 0.11)
+            .collect();
+        Tensor::from_vec(v, dims, &Device::Cpu).unwrap()
+    }
+
+    /// Raw IEEE-754 bit patterns. Float equality would accept `-0.0 == 0.0` and
+    /// silently pass a sign error; bit patterns do not.
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    fn rope() -> RotaryEmbedding {
+        RotaryEmbedding::new(10000.0, D_HEAD, MAX_POS, &Device::Cpu, true, DType::F32).unwrap()
+    }
+
+    /// The pre-fix per-sequence loop, verbatim, as the oracle. Always loops,
+    /// whatever the offsets are.
+    fn reference(
+        re: &RotaryEmbedding,
+        q: &Tensor,
+        k: &Tensor,
+        offsets: &[usize],
+    ) -> (Tensor, Tensor) {
+        let seq_len = q.dim(2).unwrap();
+        let mut q_embeds = Vec::new();
+        let mut k_embeds = Vec::new();
+        for (i, offset) in offsets.iter().enumerate() {
+            let cos = re.cos.narrow(0, *offset, seq_len).unwrap();
+            let sin = re.sin.narrow(0, *offset, seq_len).unwrap();
+            q_embeds.push(
+                candle_nn::rotary_emb::rope(
+                    &q.i(i).unwrap().unsqueeze(0).unwrap().contiguous().unwrap(),
+                    &cos,
+                    &sin,
+                )
+                .unwrap(),
+            );
+            k_embeds.push(
+                candle_nn::rotary_emb::rope(
+                    &k.i(i).unwrap().unsqueeze(0).unwrap().contiguous().unwrap(),
+                    &cos,
+                    &sin,
+                )
+                .unwrap(),
+            );
+        }
+        (
+            Tensor::cat(&q_embeds, 0).unwrap(),
+            Tensor::cat(&k_embeds, 0).unwrap(),
+        )
+    }
+
+    /// The regression this whole change is about: a B-long vector of one
+    /// repeated value IS uniform, and `len() == 1` said it was not.
+    #[test]
+    fn uniform_offset_tests_values_not_length() {
+        assert_eq!(uniform_seqlen_offset(&[7; 256]), Some(7));
+        assert_eq!(uniform_seqlen_offset(&[7]), Some(7));
+        assert_eq!(uniform_seqlen_offset(&[0, 0, 0]), Some(0));
+        // Genuinely ragged rows must still decline, so the loop is preserved.
+        assert_eq!(uniform_seqlen_offset(&[7, 7, 8]), None);
+        assert_eq!(uniform_seqlen_offset(&[8, 7, 7]), None);
+        assert_eq!(uniform_seqlen_offset(&[]), None);
+    }
+
+    /// Batching a uniform cohort must be bit-identical to the loop it replaces.
+    #[test]
+    fn uniform_cohort_is_bit_identical_to_the_loop() {
+        let re = rope();
+        let q = xs(&[B, H, T, D_HEAD], 0.013);
+        let k = xs(&[B, H, T, D_HEAD], 0.019);
+        let offsets = vec![5usize; B];
+
+        let before = rope_cohort_stats::counts();
+        let (qb, kb) = re.forward(&q, &k, &offsets).unwrap();
+        let after = rope_cohort_stats::counts();
+
+        // A green result must prove work happened: the batched arm has to have
+        // been the one that ran.
+        assert!(
+            after.0 > before.0,
+            "cohort path did not engage -- test would pass vacuously"
+        );
+
+        let (qref, kref) = reference(&re, &q, &k, &offsets);
+        assert_eq!(
+            bits(&qb),
+            bits(&qref),
+            "batched q differs from per-sequence"
+        );
+        assert_eq!(
+            bits(&kb),
+            bits(&kref),
+            "batched k differs from per-sequence"
+        );
+    }
+
+    /// Ragged offsets must still take the per-sequence loop and still be right.
+    /// A uniform rotation applied to a ragged cohort would be silently wrong.
+    #[test]
+    fn ragged_cohort_keeps_the_loop_and_stays_per_row() {
+        let re = rope();
+        let q = xs(&[3, H, T, D_HEAD], 0.013);
+        let k = xs(&[3, H, T, D_HEAD], 0.019);
+        let offsets = vec![0usize, 4, 9];
+
+        let before = rope_cohort_stats::counts();
+        let (qb, kb) = re.forward(&q, &k, &offsets).unwrap();
+        let after = rope_cohort_stats::counts();
+        assert!(
+            after.1 > before.1,
+            "ragged cohort must NOT take the batched path"
+        );
+
+        let (qref, kref) = reference(&re, &q, &k, &offsets);
+        assert_eq!(bits(&qb), bits(&qref));
+        assert_eq!(bits(&kb), bits(&kref));
+
+        // And the rotation must genuinely differ between rows, or the test is
+        // vacuous -- it would pass even if every row got offset 0.
+        let d01 = (qb.i(0).unwrap() - qb.i(1).unwrap())
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(d01 > 0.0, "rows at different offsets rotated identically");
+    }
+
+    /// GPT-J style (`is_gpt_neox == false`, i.e. `rope_i`) takes the same
+    /// dispatch, so it gets the same guarantee.
+    #[test]
+    fn uniform_cohort_is_bit_identical_for_gpt_j_style() {
+        let re = RotaryEmbedding::new(10000.0, D_HEAD, MAX_POS, &Device::Cpu, false, DType::F32)
+            .unwrap();
+        let q = xs(&[B, H, T, D_HEAD], 0.023);
+        let k = xs(&[B, H, T, D_HEAD], 0.029);
+        let offsets = vec![11usize; B];
+
+        let (qb, kb) = re.forward(&q, &k, &offsets).unwrap();
+
+        let seq_len = T;
+        let mut q_embeds = Vec::new();
+        let mut k_embeds = Vec::new();
+        for (i, offset) in offsets.iter().enumerate() {
+            let cos = re.cos.narrow(0, *offset, seq_len).unwrap();
+            let sin = re.sin.narrow(0, *offset, seq_len).unwrap();
+            q_embeds.push(
+                candle_nn::rotary_emb::rope_i(
+                    &q.i(i).unwrap().unsqueeze(0).unwrap().contiguous().unwrap(),
+                    &cos,
+                    &sin,
+                )
+                .unwrap(),
+            );
+            k_embeds.push(
+                candle_nn::rotary_emb::rope_i(
+                    &k.i(i).unwrap().unsqueeze(0).unwrap().contiguous().unwrap(),
+                    &cos,
+                    &sin,
+                )
+                .unwrap(),
+            );
+        }
+        assert_eq!(bits(&qb), bits(&Tensor::cat(&q_embeds, 0).unwrap()));
+        assert_eq!(bits(&kb), bits(&Tensor::cat(&k_embeds, 0).unwrap()));
+    }
+
+    /// `cohort_rotary_table` feeds the CUDA kernel, which indexes
+    /// `cos_cache + token_idx * rot_dim` over the b-major flattened token axis
+    /// and hard-bails unless the cache is exactly `(b * seq_len, rot_dim)`.
+    /// The uniform fast path must therefore *tile*, not narrow -- this is the
+    /// assertion that would catch a shape or ordering mistake on a path CPU
+    /// tests cannot otherwise reach.
+    #[test]
+    fn cohort_rotary_table_matches_the_cat_it_replaces() {
+        let table = xs(&[MAX_POS, D_HEAD / 2], 0.031);
+
+        for offsets in [
+            vec![5usize; B],       // uniform, B > 1 -> must tile
+            vec![5usize],          // single row
+            vec![0usize, 4, 9],    // ragged -> must keep the cat
+            vec![3usize, 3, 3, 7], // trailing mismatch -> ragged
+        ] {
+            let mut rows = Vec::new();
+            for offset in &offsets {
+                rows.push(table.narrow(0, *offset, T).unwrap());
+            }
+            let expected = Tensor::cat(&rows, 0).unwrap();
+
+            let got = cohort_rotary_table(&table, &offsets, T).unwrap();
+            assert_eq!(
+                got.dims(),
+                &[offsets.len() * T, D_HEAD / 2],
+                "wrong shape for offsets {offsets:?} -- the kernel bails on this"
+            );
+            assert_eq!(
+                bits(&got),
+                bits(&expected),
+                "tiled table differs from the per-offset cat for offsets {offsets:?}"
+            );
+        }
     }
 }
