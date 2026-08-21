@@ -1,30 +1,45 @@
-# wave66-CS — V4 cannot serve past ~22 tokens, and every single-user throughput number this project has ever recorded was taken inside a crashing run
+# wave66-CS — V4 could not serve past ~22 tokens, because TCFRAG was holding 63 GB; every single-user throughput number this project has ever recorded was taken inside a crashing run
 
-Parent system: **ArcInfer / ArcKV** (the blocker), with findings in ArcQuant,
-ArcGraph, ArcKernels and ArcGate.
+Parent system: **ArcQuant** (the cause) / **ArcInfer / ArcKV** (where it bit),
+with findings in ArcGraph, ArcKernels and ArcGate. Originally filed under
+ArcInfer / ArcKV — the measurement moved the parent, which is itself worth
+noting: the symptom and the cause were in different systems.
 
-Status: **the blocker is open.** One of the seven items below was fixed and
-merged tonight (§2, PR #209). The rest are surfaced with owners and probes.
+Status: **the blocker is CLOSED, and not by the PR everyone expected.** §1's OOM
+is caused by TCFRAG retaining ~63 GB, so **PR #209 — already merged — is the
+fix**; #213 is defence in depth on the leak rate. Six further findings below are
+open, each with an owner and a probe.
 
 ---
 
 ## Provenance — read this before quoting anything here
 
-**Every line number in this file was verified against master `9c127a2b1`**, not
-against the ref the work was done on. Master moved four times tonight:
+**Every line number in this file was verified against master `f709872ab`**, not
+against the ref the work was done on. Master moved seven times over this
+session:
 
 ```
 cc5487ad3  TCFRAG-2B on the tensor cores                        (#203)   <- the serving run ran HERE
 02edd31cc  decode raw-window mask is all-ones, -424 launches    (#206)
 56c9a99ba  dense-layer inventory: fluent garbage, no fault      (#208)
 bb30559a5  register the V4 compressed-KV re-RoPE recompute      (#207)
-9c127a2b1  ARC_QTIP_TCFRAG opt-in                               (#209)   <- master now
+9c127a2b1  ARC_QTIP_TCFRAG opt-in                               (#209)   <- THE FIX for §1
+b91e9b6a7  wave65-CR: eviction cannot see baked addresses       (#211)
+f709872ab  fp8_gemv_wide                                        (#210)   <- master now
 ```
 
 The **serving measurements in §1 were taken at `cc5487ad3`**, on an H200. The
-**source claims in §2–§7 are read at `9c127a2b1`**. Where the two disagree —
-and for TCFRAG they do, because #209 landed between them — both states are
-written out. Nothing in this file was measured tonight on a GPU except §1.
+**source claims in §2–§7 are read at `f709872ab`**. Where the two disagree — and
+for TCFRAG they do, because #209 landed between them — both states are written
+out.
+
+⚠️ **Two citations rotted when #210 merged and are corrected here**, which is
+the whole reason this file re-verifies rather than trusts:
+`blockwise_fp8/ops.rs:1139 → :1179` and `:1140 → :1180`. The kernel's own lines
+survived only because #210 **appended** its 294 lines rather than inserting
+them — a fact worth knowing before assuming a green gate means correct
+citations. *(The gate checks that a line is **in range**, not that it is the
+**right** line.)*
 
 Citations into **candle** carry a file and a symbol and **no line number** on
 purpose: candle is not vendored here, so a bare `device.rs` plus a line number
@@ -35,7 +50,7 @@ against this very sentence before it was reworded. Do not add them back.
 
 ---
 
-# 1. 🔴🔴🔴 THE BLOCKER — V4 CANNOT SERVE. It dies of OOM after 22–30 generated tokens.
+# 1. 🔴🔴🔴 THE BLOCKER — V4 could not serve. OOM after 22–30 generated tokens. **Cause found: TCFRAG holds ~63 GB. Fixed by #209.**
 
 **Measured at `cc5487ad3`, H200, batch = 1 decode, 3/3 runs, two independent
 arms.** The failure is `CUDA_ERROR_OUT_OF_MEMORY`, and the card is genuinely
@@ -98,20 +113,37 @@ Two mechanisms make retention permanent rather than transient:
   post-ISQ (`normal.rs:1432`), and **never between requests**. That is why run
   N+1 starts at run N's high-water mark.
 
-### ⛔ THE CONSEQUENCE, IN THE STRONGEST TERMS THE EVIDENCE SUPPORTS
+### ⛔ THE CONSEQUENCE — and it is TWO claims, which the first draft conflated
 
-> **Every single-user throughput number this project has ever recorded was
-> measured over ≤30 tokens before a crash.** Not "on an old build" — on a build
-> that could not reach token 31.
+The brief this file was written from said *"every single-user throughput number
+this project has ever recorded was measured over ≤30 tokens before a crash."*
+**The §1 resolution forces that apart, and the second half of it is not
+universally true.** Keeping them separate:
+
+**Claim A — universal, and it stands.** *Every* V4 single-user tok/s figure is a
+**short-window measurement, ≤30 tokens**. The three-way b=1 agreement —
+**15.11 / 15.39 / 15.51** — has *"24 tokens"* in its own FACTS row; so do
+**9.3 / 13.31 / 14.84**, **10.99 / 11.94**, **15.36 / 16.92**, **17.85**,
+**18.27**. **A 24-token window is warm-up dominated and shows no steady state
+whatever the memory situation.** That alone disqualifies every one of them as a
+sustained rate — which is the claim that actually matters for the mission.
+
+**Claim B — NOT universal.** *"Measured inside a crashing run"* applies **only
+at or after `cc5487ad3` (#203, 2026-08-21)**, because **TCFRAG is what removed
+the headroom**. Before it, #182's leg reached **2,600 tokens**. The b=1 trio was
+measured **2026-08-17** — four days earlier. **Its 24-token window was a harness
+choice, not a truncation, and saying otherwise would be a fabrication.**
+
+⚠️ **And the 33.4 → 34.2 pair has a different defect again: its cited source
+`CAPTURE_LANE.md` does not exist in this repository — not on master, not on any
+branch** (`git log --all --diff-filter=A` finds no such file). It is
+**unsourced**, the same class as the 27.2% TAIL and #210's 16.0% share. **Three
+load-bearing numbers, three sources that are not on master.**
 
 The best clean fragment measured tonight was **37.35 tok/s over 20 tokens,
-`finish=length`, coherent output**. That is a **20-token fragment, not a
-steady-state rate**, and it must never be quoted as one. A rate measured over a
-window that ends in an OOM is a rate measured while the allocator is filling —
-the tail that would drag it down is exactly the part that never ran.
-
-**Anything in `FACTS.md` or `00_RESUME_HERE.md` of the form "V4 b=1 = N tok/s"
-inherits this.** See the FACTS retraction block dated 2026-08-21.
+`finish=length`, coherent output** — a fragment, not a rate. And per §1 the
+`ARC_QTIP_TCFRAG=0` arm now reaches **256/256 tokens**, so **a real steady-state
+single-user number is obtainable for the first time. Nobody has taken it yet.**
 
 ### Serve config when measured — and it corrects our own record
 
@@ -151,38 +183,53 @@ tokens **and** a generation passing 30 tokens. If `held` plateaus and it still
 OOMs, the victim allocation is larger than the headroom and the divisor must not
 be re-tuned to hide it.
 
-### 🔴 UNRESOLVED — this measurement and PR #182's do not reconcile, and the gap is ~60 GB
+### ✅ RESOLVED ON THE BOX — the missing ~60 GB is TCFRAG, and it reconciles both runs exactly
 
-**Both are H200 measurements of the same allocator, and they disagree by two
-orders of magnitude on how long a generation survives:**
+This started as an unexplained contradiction: **PR #182's H200 leg ran 2,600
+tokens with no OOM** at 6.04 MiB/token, which needs **≥15.7 GB free** at decode
+start against tonight's **844 MiB**. A run cannot grow by 15,700 MiB on a card
+with 844 MiB free, so the two runs did not start from the same residency and the
+gap was ~60 GB. It was written up here as a concurrency-budget hypothesis.
+
+**The box then measured it, and the hypothesis was not needed:**
+
+> **`ARC_QTIP_TCFRAG=0` frees 64,262 MiB. With TCFRAG on, the same probe frees
+> 262 MiB.** The TCFRAG repack retains **~63 GB** against a ~79.5 GB model.
 
 | | PR #182's leg | tonight, `cc5487ad3` |
 |---|---|---|
-| tokens generated | **2,600** | **22–30** |
-| outcome | **no OOM, in every leg** | **`CUDA_ERROR_OUT_OF_MEMORY`, 3/3** |
-| growth rate | **6.04 MiB/token** (+15,700 MiB unbounded) | **~11 MiB/token** |
-| free VRAM implied at decode start | **≥ 15.7 GB** | **844 MiB** |
-| config named in the artefact | `--max-seq-len 4096` | `max-seqs=32`, prefix-cache ON |
+| TCFRAG present? | **no — it landed as #203 on 08-20, after that leg** | **yes, and default-ON** |
+| free VRAM at decode start | **≥ 15.7 GB** | **844 MiB** |
+| per-token retention | 6.04 MiB/token | ~11.8 MiB/token (table above); the box separately reports **~12.8 MiB/step** |
+| tokens survived | **2,600** | **22–30** |
 
-A run cannot grow by 15,700 MiB on a card with 844 MiB free. **So the two runs
-did not start from the same residency, and the difference is ~60 GB.** The
-likeliest explanation is the serve configuration — `max-seqs=32` and an active
-prefix cache against #182's leg, which names neither — but **that is a
-hypothesis, not a finding.**
+⇒ **Same per-token retention, two orders of magnitude less headroom.** The
+per-token leak was never the thing that changed; **the headroom was.** The
+concurrency-budget hypothesis is **withdrawn** — it was a reasonable reading of
+the evidence available at the time, and a measurement removed the need for it.
 
-> ⚠️ **This matters because it may change the fix.** If the 142,927 MiB starting
-> residency is driven by a batch-32 KV budget and a prefix cache holding
-> `n_on_device` entries, then the OOM is a **concurrency-budget defect** at
-> least as much as a per-token leak, and re-tuning the allocator cap (PR #213)
-> treats a symptom. **Do not let #213 land as "the OOM fix" without this
-> settled.**
+### 🔑 THEREFORE: #209 IS THE HEADROOM FIX; #213 IS DEFENCE IN DEPTH ON THE RATE
 
-**The probe is cheap and needs no new instrument:** re-run tonight's arm at
-`--max-seqs 1` with the prefix cache off, and read `memory.used` at token 1. If
-it starts near 80 GB rather than 143 GB, the config is the cause. Also
-establish what model and flags #182's leg used — the PR body does not name the
-model, and while its 17–19.8 tok/s and its *"auto-device-map plans 140 GB of a
-143 GB card"* both point at V4, **that is inference, not a record.**
+**Either one rescues the run independently**, which is what makes the
+attribution safe rather than a story:
+
+* `base256` arm with **`ARC_QTIP_TCFRAG=0`** (the caching allocator still **on**):
+  **256/256 tokens, five runs, `finish=length`.**
+* leg 3 with **`ARC_CANDLE_ALLOC_CACHE=0`** (TCFRAG still **on**): **1,000
+  tokens.**
+
+Two independent single-variable interventions, each sufficient on its own. So
+the original brief's instinct was right for a better reason than it gave:
+**#213 must not land as "the OOM fix"** — **PR #209, already merged, is the fix
+that restored the headroom**, and #213 bounds the rate that consumes it. Both
+are worth having; only one of them is what unblocked serving.
+
+⚠️ **Still open (do not read this as closing it): the F8E4M3 dtype in the
+backtrace.** TCFRAG's retained bytes are repacked trellis words, not E4M3, so
+the ~63 GB and the per-token `cat` are **two different allocations** — TCFRAG
+ate the headroom, the `cat` ate ~12 MiB/token, and death at ~20 tokens is the
+product. Whether that `cat` is on a path we believe is off is still the question
+in the table at the end of this file.
 
 ### Two smaller retentions named, not fixed
 
@@ -258,27 +305,39 @@ on-device gather decode (`gather_gemv_2b_cuda`, `bitshift.rs:1712`). After #209
 the default is OFF, so at `9c127a2b1` it carries **zero production traffic**.
 Phrase it as "was the default b=1 trellis path at `cc5487ad3`; now opt-in."
 
-🔴 **And do not repeat the mis-quote #209 shipped.** Its merged doc comment
-argues that *"by that same header it owns 'the whole of the b=1 decode path'"* —
-but read the header: the phrase at `qtip2b_tcfrag.cu:19` is about
-**`qtip2b_gemv_tuned_kernel`**, the *shipped* kernel TCFRAG was written to
-replace, not about TCFRAG. The conclusion (that TCFRAG served b=1 by default at
-`cc5487ad3`) is right, and the dispatch sites above establish it independently —
-but **the quoted sentence does not say what it was cited as saying, and it is
-now on master saying it.** Worth a one-line follow-up on `cuda_ops.rs`.
+✅ **A mis-quote #209 shipped to master is FIXED IN THIS CHANGE.** Its merged doc
+comment argued *"by that same header it owns 'the whole of the b=1 decode
+path'"* — but read the header: the phrase at `qtip2b_tcfrag.cu:19` is the header
+describing **`qtip2b_gemv_tuned_kernel`**, the *shipped* kernel TCFRAG was
+written to replace, not TCFRAG. The conclusion (that TCFRAG served b=1 by
+default at `cc5487ad3`) is right and the dispatch sites above establish it
+independently, so the fix is to **rest the sentence on the dispatch sites and
+drop the quotation** — done at `tcfrag2b_enabled` (`cuda_ops.rs:1601`), with a
+note left in place so the quote is not reinstated. **It is the only non-`memory/`
+edit in this change.**
 
-### The decline evidence, and its limits
+### 🔴 THE COST THAT WAS NOT IN ANY ESTIMATE: the repack retains ~63 GB
 
-**Reported from the box: TCFRAG declined 4 of 4 loads and never once
-succeeded.** The log line that would say so is the only `warn!` on that path:
+**Measured on the box:** `ARC_QTIP_TCFRAG=0` frees **64,262 MiB**; with TCFRAG
+on the same probe frees **262 MiB**. Against a ~79.5 GB model the repack is
+holding **~63 GB** — comparable to the weights themselves.
 
-> `"qtip2b TCFRAG repack declined for [{num_experts}, {n_rows}, {packed_per_row}] (k_in={}): {e}. Keeping the shipped GEMV."`
+The mechanism is structural, not a bug in the repack: `tcfrag_words`
+(`bitshift.rs:1334`) is a **per-weight `OnceLock` that caches its repacked
+tensor for the life of the process**. Every weight that succeeds keeps a second,
+differently-packed copy resident. **Nothing in #203 costed that**, and the `.cu`
+header's own performance section costs only instructions.
 
-at `bitshift.rs:1358`. ⚠️ **That warn emits no count and aggregates nothing, and
-the string "4 of 4" appears nowhere in this repo — `memory/` contains no mention
-of TCFRAG at all before this file.** So "4 of 4" is a **run observation held
-outside the tree**, not something a later reader can re-derive from source. If
-it is going to be load-bearing, the run log belongs in `arc-tools/`.
+⇒ **This, not the per-token `cat`, is what put decode at 844 MiB free** and
+turned a leak that #182's leg survived for 2,600 tokens into one that kills at
+~20. **It is also why the failure looked like an allocator problem when the
+allocator was working as designed.**
+
+*(An earlier draft carried a claim that TCFRAG "declined 4 of 4 loads and never
+once succeeded". It is **removed as unsourced** — no such count exists in the
+tree, the only warn on that path (`bitshift.rs:1358`) aggregates nothing, and
+the 63 GB measurement points the other way: a repack that declined every time
+would retain nothing.)*
 
 ### The second reason, which was itself the bug
 
@@ -429,7 +488,7 @@ second identical divide in the scalar remainder loop at
 
 b=1 reaches it because `use_gemv` is `m <= fp8_gemv_max_m()` (default **4**,
 `mistralrs-quant/src/blockwise_fp8/ops.rs:914`) and
-`mistralrs-quant/src/blockwise_fp8/ops.rs:1140` selects it.
+`mistralrs-quant/src/blockwise_fp8/ops.rs:1180` selects it.
 
 ### Three precision corrections to how this was first stated
 
@@ -440,7 +499,7 @@ b=1 reaches it because `use_gemv` is `m <= fp8_gemv_max_m()` (default **4**,
   construction.** At `block_size_x == 128` all 32 lanes span
   `k_base..k_base+124` and compute the identical quotient. The only precondition
   the dispatcher enforces is `block_size_x % 4 == 0`
-  (`mistralrs-quant/src/blockwise_fp8/ops.rs:1139`), and at 64 the warp
+  (`mistralrs-quant/src/blockwise_fp8/ops.rs:1179`), and at 64 the warp
   diverges. Say "warp-uniform at the 128-wide block size this path actually
   runs."
 * **Loads are already `__ldg` and already 32-bit** (`blockwise_fp8_gemm.cu:171`),
@@ -474,23 +533,42 @@ confirm the instructions actually move → THEN predict."* **The probe that clos
 this is a `cuobjdump -sass` count of the `fp8_gemv_warp` inner loop**, with
 precedent tooling on branch `perf/qtip-sass-census`.
 
+### 🔴 THE SHARE THAT PROJECTION MULTIPLIES IS UNSOURCED ON MASTER
+
+PR #210 sizes its win as *"`fp8_gemv` is 16.0% of kernel time, so 16.0% × (1 −
+1/1.6) = 6.0% of kernel time … **~1.3 ms/token, 34.2 → ~35.8 tok/s**"*.
+
+**That 16.0% has no home on master.** Its only occurrence anywhere is one line
+of `docs/engineering/OPENROUTER_READY.md`, a file that **does not exist on
+master** — it lives on branches `agent/tail-sinkhorn-warp-v2` and
+`agent/decode-share-probe` — **on the same line as the 27.2% TAIL figure**
+retracted in `FACTS.md` §2026-08-21. It appears nowhere in the merged `.cu`,
+`ops.rs` or `gemv_wide.rs`.
+
+> ⇒ **#210 merged at `f709872ab` with a projected win multiplied out of an
+> unsourced share.** The kernel work stands on its own arithmetic; **the
+> ~1.3 ms/token and the 34.2 → ~35.8 tok/s do not, and must not be quoted as
+> expected values.** Two numbers, one unmerged source, and one of them is now
+> load-bearing in a merged PR body.
+
 ### The replacement
 
-**PR #210** (`perf/fp8-gemv-wide-b1` @ `4b3f35a24`), open. Adds `fp8_gemv_wide`
-behind `ARC_FP8_GEMV_WIDE=1`, **default OFF**: `uint4` loads, `k >> scale_shift`
-with the host passing `log2(block_size_x)` and refusing non-powers-of-two, a
-2-deep explicit software pipeline, four accumulators. Its own body says
-**UNVERIFIED ON HARDWARE**, the `.cu` is uncompiled, and it is **not
-bit-identical** (f32 re-association). Its projected ~1.6× on the kernel /
-~1.3 ms/token is a **projection**. Do not let it be quoted as a measurement.
+**PR #210 is MERGED**, at `f709872ab`. It adds `fp8_gemv_wide` — `uint4` loads,
+`k >> scale_shift` with the host passing `log2(block_size_x)` and refusing
+non-powers-of-two, a 2-deep explicit software pipeline, four accumulators.
 
-⚠️ **And the 16.0% "share of kernel time" that projection multiplies is itself
-unsourced on master.** Its only home is `docs/engineering/OPENROUTER_READY.md`,
-which **does not exist on master** — it lives on branches
-`agent/tail-sinkhorn-warp-v2` and `agent/decode-share-probe` — on the same line
-as the 27.2% TAIL figure retracted in `FACTS.md` §2026-08-21. **Two numbers, one
-unmerged source, and one of them is already being multiplied into a projected
-win.**
+✅ **It landed with the right polarity: default OFF, opt-in on the literal
+`"1"`** — `wide_enabled_from` (`gemv_wide.rs:73`), documented at
+`gemv_wide.rs:35-36` as *"`ARC_FP8_GEMV_WIDE=0`, `=off`, `=true` and unset all
+leave it OFF"*, and marked `🔴 UNVERIFIED ON HARDWARE — never run` at
+`ffi.rs:194`. **That is the polarity #203 got backwards and #209 had to fix
+(§2), applied correctly the first time by the same crate.** Worth naming as the
+pattern working.
+
+⚠️ **It is still `UNVERIFIED ON HARDWARE` and not bit-identical** (f32
+re-association). **Nothing about it has run on a GPU**, so its ~1.6× is a
+projection — and per the block above, the share it is multiplied against is
+unsourced.
 
 ---
 
@@ -613,44 +691,58 @@ unbounded vs +2,004 MiB capped, for 0.15 ms/token.**
 > monotonically from the moment capture ends, while eager verify-replays keep
 > stamping every *other* size.
 
-### 🔴 The masking, and why it is the most misquotable thing in this file
+### 🔴 The masking — and it has just been LIFTED
 
-**That hazard is currently masked by the OOM in §1.** A process that dies at
-token 22 never keeps a `CUgraphExec` alive long enough for its baked buffers to
-age to the front of the LRU queue.
+**The hazard was masked by the OOM in §1.** A process that dies at token 22
+never keeps a `CUgraphExec` alive long enough for its baked buffers to age to
+the front of the LRU queue, so `alloc_cache_stats().evicted_at_demand_size == 0`
+— the probe `9586979d` adds for exactly this — read zero **for the wrong
+reason**: a green from an instrument that never had the chance to go red.
 
-> ⇒ **Any probe of hazard 1 today returns a green the instrument never had a
-> chance to fail.** `alloc_cache_stats().evicted_at_demand_size == 0` is the
-> probe `9586979d` adds for exactly this, and it will read zero for the wrong
-> reason until §1 is fixed.
->
-> **Fixing the OOM UN-MASKS it. #211's pin must land before capture is defaulted
-> on.**
+> ⇒ **`ARC_QTIP_TCFRAG=0` runs now reach 256/256 tokens (five runs) and 1,000
+> tokens (§1). THE MASK IS OFF.** A process that lives that long is, for the
+> first time, one whose graph buffers can age to the front of the queue while
+> eager forwards keep stamping every other size. **Any earlier green on this
+> probe is void, and the probe is only now worth running.**
 
-Not reachable in the shipping configuration today for two independent reasons:
-capture is behind `ARC_V4_CAPTURE_PROBE`, unset by default; and `arc-cuda-graph`
-drains the cache before every `cuMemPoolDestroy`
-(`drain_alloc_cache_and_free`, `graph.rs:56`; `drain_alloc_cache`,
-`graph.rs:214`). Neither survives capture being defaulted on.
+**PR #211 (wave65-CR) is MERGED**, at `b91e9b6a7` — it registers the hazard but
+**does not fix it**; the pin the allocator would need to express is still
+unwritten. So the sequencing statement stands and is now urgent rather than
+theoretical: **the pin must land before capture is defaulted on.**
+
+Two things still keep it off the shipping path — capture is behind
+`ARC_V4_CAPTURE_PROBE`, unset by default, and `arc-cuda-graph` drains the cache
+before every `cuMemPoolDestroy`. **Neither survives capture being defaulted on**,
+which is what PR #205 proposes.
+
+Those two are `drain_alloc_cache_and_free` (`graph.rs:56`) and
+`drain_alloc_cache` (`graph.rs:214`).
 
 ---
+
+## Closed tonight
+
+| # | question | how it was settled |
+|---|---|---|
+| **1** | Why does decode start at 142,927 MiB here but ≥15.7 GB free in #182's leg? | ✅ **MEASURED.** `ARC_QTIP_TCFRAG=0` frees **64,262 MiB** vs 262 MiB with it on — the repack retains **~63 GB**. #182's leg predates TCFRAG (#203, 08-20). Same per-token rate, ~60 GB less headroom. **The concurrency-budget hypothesis is withdrawn.** |
+| **1a** | Is #213 the OOM fix? | ✅ **No — #209 is.** Two independent single-variable rescues: `ARC_QTIP_TCFRAG=0` → **256/256 tokens, 5 runs**, cache still on; `ARC_CANDLE_ALLOC_CACHE=0` → **1,000 tokens**, TCFRAG still on. **#209 restored the headroom; #213 is defence in depth on the rate.** |
 
 ## Open, with the probe named
 
 | # | question | the probe that settles it | owner |
 |---|---|---|---|
-| **1** | **🔴 Why does decode start at 142,927 MiB here and ≥15.7 GB free in #182's leg?** Blocks calling #213 "the OOM fix". | re-run at `--max-seqs 1`, prefix cache off; read `memory.used` at token 1. Separately: name #182's model and flags | **UNOWNED** |
-| 1 | Does #213's re-armed cap let a generation pass 30 tokens? | `ARC_ALLOC_CACHE_STATS=32`: `held` plateaus ~105 MiB **and** `free/step` non-zero **and** run passes 30 tok | PR #213 |
-| 1b | Was `ARC_V4_FP8_KV=1` set on the failing run, or is an F8E4M3 `cat` reachable with it off? | re-run with the variable explicitly unset; read the backtrace dtype | UNOWNED |
+| 1b | Is the F8E4M3 `cat` on a path we believe is off? TCFRAG's ~63 GB is repacked trellis words, **not** E4M3, so this is a *separate* allocation and is **not** closed by the above. | re-run with `ARC_V4_FP8_KV` explicitly unset; read the backtrace dtype | UNOWNED |
+| 1c | Does #213's re-armed cap hold now that headroom is back? | `ARC_ALLOC_CACHE_STATS=32`: `held` plateaus **and** `free/step` non-zero, on a run that already passes 256 tokens | PR #213 |
 | 3 | Are the two host syncs the real limiter, not op count? | measure `arcgraph/device-decode-loop` @ `1b6949244` against master, same binary | UNOWNED |
-| 5 | Is `fp8_gemv_warp` really ~45 inst / 4 B? | `cuobjdump -sass` on the inner loop; tooling on `perf/qtip-sass-census` | PR #210 |
-| 5b | Does `fp8_gemv_wide` compile, and what does it measure? | first CUDA CI run is the syntax gate; then an A/B | PR #210 |
-| 7 | Does eviction reach a live graph's baked buffers? | `evicted_at_demand_size == 0` — **only meaningful after §1 is fixed** | PR #211 |
+| 5 | Is `fp8_gemv_warp` really ~45 inst / 4 B? | `cuobjdump -sass` on the inner loop; tooling on `perf/qtip-sass-census` | merged #210 |
+| 5b | What is `fp8_gemv_warp`'s **real** share of kernel time? The 16.0% #210 multiplies is unsourced on master. | a profile on master, written into `FACTS.md` — **not** a number carried from an unmerged branch doc | merged #210 |
+| 5c | Does `fp8_gemv_wide` produce correct output on a GPU? It is merged, default OFF, `UNVERIFIED ON HARDWARE`. | `ARC_FP8_GEMV_WIDE=1` A/B against the shipped kernel | merged #210 |
+| **7** | Does eviction reach a live graph's baked buffers? **🔴 The mask is OFF as of §1 — this is now runnable and any earlier green is void.** | `evicted_at_demand_size == 0` over the life of a graph, on a run that reaches 256+ tokens | merged #211 (registers it; the pin is unwritten) |
 
 ## Related
 
-* **§1** → PR #213, and wave65-CQ (`wave65-CQ-v4-compressed-rope-recompute.md`)
-  for the `cat` that sets the rate.
+* **§1** → **PR #209 (the headroom fix, merged)**, PR #213 (the rate, open), and
+  wave65-CQ (`wave65-CQ-v4-compressed-rope-recompute.md`) for the `cat`.
 * **§2** → PR #203 (introduced), PR #209 (fixed, merged).
 * **§3** → `CAPTURE_LANE.md` (the retracted conclusion), branch
   `arcgraph/device-decode-loop`.

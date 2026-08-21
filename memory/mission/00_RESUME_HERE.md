@@ -20,56 +20,68 @@ update this file.
 
 ---
 
-# 🔴🔴🔴 STOP. **V4 DOES NOT SERVE PAST ~22 TOKENS.** (session 9, 2026-08-21)
+# 🔴 SESSION 9 (2026-08-21): **V4 COULD NOT SERVE PAST ~22 TOKENS. CAUSE: TCFRAG HELD 63 GB. FIXED BY #209.**
 
-**Measured at `cc5487ad3` on an H200: batch=1 decode dies with
+**At `cc5487ad3` on an H200, batch=1 decode died with
 `CUDA_ERROR_OUT_OF_MEMORY` after 22–30 generated tokens, 3/3 runs, two
-independent arms.** The card is genuinely full — **143,151 of 143,771 MiB**.
-Growth is **≈11 MiB/token** and is **never released across requests**: one run
-ended at 142,959 MiB used and the next *started* there.
+independent arms** — card genuinely full at **143,151 of 143,771 MiB**.
 
-> ## ⛔ THEREFORE: **EVERY SINGLE-USER V4 THROUGHPUT NUMBER THIS PROJECT HAS EVER RECORDED WAS MEASURED OVER ≤30 TOKENS BEFORE A CRASH.**
+**The cause was not the leak. It was the headroom.**
+
+| probe | frees |
+|---|---|
+| **`ARC_QTIP_TCFRAG=0`** | **64,262 MiB** |
+| TCFRAG on (the shipped default at `cc5487ad3`) | **262 MiB** |
+
+`tcfrag_words` (`bitshift.rs:1334`) is a per-weight `OnceLock` caching a second,
+differently-packed copy of every weight for the process lifetime — **~63 GB
+against a ~79.5 GB model**. That left decode **844 MiB free**, so a ~12 MiB/token
+leak that PR #182's leg survived for **2,600 tokens** killed this one in ~20.
+
+**Two independent single-variable rescues, each sufficient alone:**
+`ARC_QTIP_TCFRAG=0` → **256/256 tokens, five runs, `finish=length`** (cache still
+on); `ARC_CANDLE_ALLOC_CACHE=0` → **1,000 tokens** (TCFRAG still on).
+
+> 🔑 **PR #209 (merged) is the fix that restored serving. PR #213 is defence in
+> depth on the leak RATE — do not record it as "the OOM fix".**
+
+> ## ⛔ THE tok/s CONSEQUENCE — **two claims, and only one is universal**
 >
-> That includes the three-way b=1 agreement (**15.11 / 15.39 / 15.51 tok/s**) —
-> whose own FACTS row says **"24 tokens"** — the capture lane's **33.4 → 34.2**,
-> and **9.3 / 13.31 / 14.84 / 10.99 / 11.94 / 17.85 / 18.27**. **They are
-> fragments, not rates. Do not quote any of them as a sustained single-user
-> throughput.** Per-step quantities (ms/step, the 57.27 ms sync'd forward, the
-> 88% forward share) are unaffected.
+> **A (universal):** every V4 single-user tok/s figure is a **≤30-token
+> short-window measurement** — the b=1 trio **15.11 / 15.39 / 15.51** says
+> *"24 tokens"* in its own row, as do **9.3 / 13.31 / 14.84 / 10.99 / 11.94 /
+> 17.85 / 18.27**. **Warm-up dominated; no steady state shown. None is a
+> sustained rate.**
 >
-> Scope: **V4 on the eager KV path.** Not the Qwen2.5-0.5B rows, not the 55
-> tok/s TurboQuant B200 Qwen3-32B result.
+> **B (NOT universal):** *"measured inside a crashing run"* holds **only at or
+> after `cc5487ad3` (#203, 2026-08-21)**. The b=1 trio is from **2026-08-17**,
+> before TCFRAG existed — **its 24 was a harness choice, not a truncation.**
+> Saying otherwise is a fabrication, and an earlier revision of this block did.
+>
+> ⚠️ The capture lane's **33.4 → 34.2** is a third case: its source
+> `CAPTURE_LANE.md` **does not exist in this repo, on any branch** — it is
+> **unsourced**, like the 27.2% TAIL and #210's 16.0%.
+>
+> Per-step quantities (ms/step, the 57.27 ms sync'd forward, the 88% forward
+> share) are unaffected. Model scope: V4 eager KV only — not Qwen2.5-0.5B, not
+> the 55 tok/s TurboQuant B200 result.
 
-**It is a leak, not an overrun** — the death token moves with headroom (30 with
-room, 25 without, **0 on a process poisoned by the TCFRAG defect below**), and
-the backtrace names a growing allocation: `CudaSlice<float8::F8E4M3>` →
-`alloc_uninit` → `cat_contiguous` (candle). Arc-side caller is
-`compressed_kv_from_rows` (`deepseek4.rs:1409`) → `forward_at_positions`
-(`layers.rs:1826`); pool-held bytes read as used
-(`trim_cuda_memory_pools`, `memory_usage.rs:6-16`) and the trim runs once,
-post-ISQ (`normal.rs:1432`), never between requests.
-
-Owner: **PR #213**, open, **UNVERIFIED on hardware**.
-
-⚠️ **DO NOT let #213 land as "the OOM fix" yet.** PR #182's H200 leg ran
-**2,600 tokens with no OOM** at 6.04 MiB/token, which needs **≥15.7 GB free** at
-decode start against tonight's **844 MiB** — a **~60 GB gap that nobody has
-explained.** If that gap is the serve config (`max-seqs=32` + prefix cache ON),
-this is a **concurrency-budget defect as much as a per-token leak** and the
-allocator cap treats a symptom. **Probe: re-run at `--max-seqs 1`, prefix cache
-off, read `memory.used` at token 1.**
+✅ **A real steady-state single-user number is now obtainable for the first
+time — 256/256 tokens runs clean. Nobody has taken it yet.** That is the
+cheapest high-value measurement on the board.
 
 **Full record, with all seven session-9 findings and every citation verified at
-master `9c127a2b1`:
+master `f709872ab`:
 `memory/mission/wave66-CS-session9-the-22-token-wall.md`.** Measured numbers and
-six new retractions → `FACTS.md` §2026-08-21.
+seven new retractions → `FACTS.md` §2026-08-21.
 
 ### The other six, in one line each
 
 1. ✅ **TCFRAG was default-ON and its own header says "UNVERIFIED ON HARDWARE —
    NEVER RUN"** (`qtip2b_tcfrag.cu:7`). **Fixed, PR #209, merged.** It does not
    panic — `OnceLock::get_or_init` caches `None` permanently
-   (`tcfrag_words`, `bitshift.rs:1334`).
+   (`tcfrag_words`, `bitshift.rs:1334`). **#203 costed instructions and never
+   costed the 63 GB the repack retains.**
 2. 🔴 **Two host round-trips per decode step, not one** —
    `cudaStreamSynchronize` (`graph.rs:362`) **and** a greedy `argmax`
    (`sampler.rs:1479`). **This RETRACTS "op count is retired as a lever"**: the
@@ -85,7 +97,11 @@ six new retractions → `FACTS.md` §2026-08-21.
 4. 🔴 **The b=1 FP8 GEMV is instruction-bound, not latency-bound** — a runtime
    signed idiv by a kernel argument (`blockwise_fp8_gemm.cu:199`), once per four
    weight bytes. **This retracts the "4% memory-controller ⇒ latency-bound"
-   story.** Ceiling **1.5–3.0 TB/s** vs a 4.8 TB/s roof — quote the range.
+   story.** Ceiling **1.5–3.0 TB/s** vs a 4.8 TB/s roof — quote the range, not
+   the 2.97 (that used the FP32 warp rate; the INT32 pipe gives 1.49).
+   ⚠️ **PR #210 merged (`f709872ab`) with a projected win multiplied out of an
+   unsourced 16.0% share** — default OFF and `UNVERIFIED ON HARDWARE`, so the
+   kernel is safe, but **do not quote "34.2 → ~35.8 tok/s" as expected.**
 5. 🔴 **The consequence of a session-8 finding, never drawn.** That
    `mark_unreachable` is itself dark was already recorded below (§TAXONOMY
    corrections). What was not: it is inert unless `ARC_PROFILE` is exactly

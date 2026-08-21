@@ -38,12 +38,37 @@
 # anything not on this list. Every row: value + how/when measured.
 # (Sessions: s1=08-12 H200, s2=08-13 H200, s3=08-13/14 H200, s4=08-14 H200.)
 
-## 🔴🔴🔴 2026-08-21 — SESSION-9. **V4 OOMs AFTER 22–30 TOKENS, SO EVERY
-## SINGLE-USER V4 tok/s FIGURE IN THIS FILE WAS MEASURED INSIDE A CRASHING RUN.**
+## 🔴🔴🔴 2026-08-21 — SESSION-9. **V4 OOM'd AFTER 22–30 TOKENS BECAUSE TCFRAG
+## RETAINED ~63 GB. EVERY SINGLE-USER V4 tok/s FIGURE IN THIS FILE WAS
+## MEASURED INSIDE A CRASHING RUN.**
 
 **Full record: `memory/mission/wave66-CS-session9-the-22-token-wall.md`.**
 Serving measured at **`cc5487ad3`** on an H200; every source claim verified at
-master **`9c127a2b1`**.
+master **`f709872ab`**.
+
+### 0. THE CAUSE, AND THE FIX IS ALREADY MERGED
+
+| probe | frees |
+|---|---|
+| **`ARC_QTIP_TCFRAG=0`** | **64,262 MiB** |
+| TCFRAG on (shipped default at `cc5487ad3`) | **262 MiB** |
+
+**The TCFRAG repack retains ~63 GB against a ~79.5 GB model.** That is what put
+decode at **844 MiB free**, and it is why a per-token leak that PR #182's leg
+survived for **2,600 tokens** killed this one in **~20**. #182's leg predates
+TCFRAG entirely (it landed as #203 on 08-20). **Same per-token rate, ~60 GB less
+headroom.**
+
+**Two independent single-variable rescues, each sufficient alone:**
+- **`ARC_QTIP_TCFRAG=0`** → **256/256 tokens, five runs, `finish=length`**, with
+  the caching allocator still **on**.
+- **`ARC_CANDLE_ALLOC_CACHE=0`** → **1,000 tokens**, with TCFRAG still **on**.
+
+⇒ 🔑 **PR #209 (merged, `9c127a2b1`) is the fix that restored serving. PR #213
+is defence in depth on the leak RATE, and must not be recorded as "the OOM
+fix".** An earlier revision of this block proposed a concurrency-budget cause
+(`max-seqs=32` + prefix cache); **that hypothesis is WITHDRAWN** — the
+measurement removed the need for it.
 
 ### 1. THE BLOCKER — `CUDA_ERROR_OUT_OF_MEMORY` at token 22–30, 3/3 runs
 
@@ -53,8 +78,9 @@ tok 11 = **143,023** · tok 15 = **143,087** · tok 20 = **143,151** → OOM.
 ⇒ **≈11 MiB/token, in ~32 MiB granules.**
 
 **It is a leak, not a fixed-size overrun**, on three counts: the death token
-moves with headroom (**30 with room, 25 without, 0 on a process poisoned by
-TCFRAG**); **memory is never released across requests** (one run ended at
+moves with headroom (**30 with room, 25 without, 0 on a process whose TCFRAG
+`OnceLock` had already latched `None`**); **memory is never released across
+requests** (one run ended at
 142,959 MiB used and the next *started* there); and the backtrace names an
 allocation whose width tracks context —
 `CudaSlice<float8::F8E4M3>` → `alloc_uninit` → `cat_contiguous` (candle
@@ -70,30 +96,48 @@ Serve config: **`kv-cache=eager` (PagedAttention OFF), `prefix-cache=ON`,
 **Best clean fragment tonight: 37.35 tok/s over 20 tokens, `finish=length`,
 coherent output. That is a 20-token FRAGMENT, not a steady-state rate.**
 
-⚠️ **UNRESOLVED, and it may change the fix.** PR #182's H200 leg ran **2,600
-tokens with no OOM** at **6.04 MiB/token** (+15,700 MiB unbounded), which
-requires **≥15.7 GB free** at decode start against tonight's **844 MiB** — a
-~60 GB gap. Likeliest cause is the serve config (`max-seqs=32` + prefix cache
-vs #182's `--max-seq-len 4096`), which would make this a **concurrency-budget
-defect as much as a per-token leak**. **That is a hypothesis. Probe: re-run at
-`--max-seqs 1`, prefix cache off, read `memory.used` at token 1.**
+✅ **The ~60 GB gap against PR #182's 2,600-token leg is RESOLVED — see §0.** It
+is TCFRAG's retained ~63 GB, not the serve config. The per-token rate here
+(**≈11.8 MiB/token** from the table above; the box separately reports **~12.8
+MiB/step**) is the same order as #182's 6.04 MiB/token; only the headroom
+changed.
 
-### 2. ⛔ EVERY HISTORICAL SINGLE-USER V4 tok/s FIGURE INHERITS THIS
+⚠️ **Still open: the F8E4M3 dtype.** TCFRAG's retained bytes are repacked
+trellis words, **not** E4M3, so §0 does **not** explain the backtrace's dtype —
+these are two different allocations. Whether that `cat` is reachable with
+`ARC_V4_FP8_KV` unset is **unestablished**. Probe: re-run with it explicitly
+unset and read the backtrace dtype.
 
-The three-way b=1 agreement recorded below — **15.11 / 15.39 / 15.51 tok/s** —
-was taken over **24 tokens** (its own row says so). 24 is inside the 22–30
-crash window. The same applies to **33.4 → 34.2** (`CAPTURE_LANE.md`),
-**9.3 / 13.31 / 14.84**, **10.99 / 11.94**, **15.36 / 16.92**, **17.85**, and
-**18.27**. None of them is a steady-state single-user rate; each is a rate
-measured while the allocator was filling, over a window that ended before the
-part that would drag it down.
+### 2. ⛔ WHAT THIS DOES AND DOES NOT VOID IN THE HISTORICAL tok/s ROWS
 
-**Scope, stated exactly:** this covers **V4 on the eager KV path**. It does
-**not** touch the Qwen2.5-0.5B rows, nor the **55 tok/s TurboQuant B200
-Qwen3-32B** result — different models, different KV footprints, no evidence
-either way. Do not extend it to them, and do not narrow it to exclude V4 rows
-merely because they predate `cc5487ad3`: the mechanism (a `cat` whose width
-tracks context, plus no eviction at all before PR #182) predates the bound.
+🔴 **THIS IS TWO CLAIMS, AND AN EARLIER REVISION OF THIS BLOCK CONFLATED THEM.
+The TCFRAG result in §0 forces them apart. Quote whichever one applies; do not
+quote the merged version, which over-claimed.**
+
+**Claim A — universal, and it stands.** *Every* V4 single-user tok/s figure in
+this file is a **short-window measurement, ≤30 tokens.** The three-way b=1
+agreement — **15.11 / 15.39 / 15.51** — has *"24 tokens"* written in its own
+row; likewise **9.3 / 13.31 / 14.84**, **10.99 / 11.94**, **15.36 / 16.92**,
+**17.85**, **18.27**. A 24-token window is warm-up dominated and **shows no
+steady state whatever the memory situation.** That alone disqualifies all of
+them as sustained rates.
+
+**Claim B — NOT universal.** *"Measured inside a crashing run"* applies **only
+to figures taken at or after `cc5487ad3` (#203, 2026-08-21)**, because TCFRAG is
+what removed the headroom. Before it, PR #182's leg demonstrably reached **2,600
+tokens**. The b=1 trio was measured **2026-08-17**, four days earlier — its
+24-token window was a **harness choice, not a truncation.** Attributing those to
+a crash would be a fabrication, and the first draft of this block did exactly
+that.
+
+⚠️ **The 33.4 → 34.2 pair is a separate problem: its cited source
+`CAPTURE_LANE.md` does not exist in this repository — not on master, not on any
+branch.** Treat the pair as **unsourced** (same class as the 27.2% and 16.0%
+rows below) rather than as crash-truncated.
+
+**Model scope:** V4 on the eager KV path only. **Not** the Qwen2.5-0.5B rows,
+**not** the **55 tok/s TurboQuant B200 Qwen3-32B** result — different models,
+different KV footprints, no evidence either way.
 
 ### 3. THE b=1 FP8 GEMV IS **INSTRUCTION-BOUND** — derived, not measured
 
@@ -152,7 +196,8 @@ Zero-sync arm exists and is **unmeasured**: branch
 |---|---|
 | **"~5,300 casts/copies per token, 1,571 of them bf16↔f32 round trips originating in MHC"** | **RETRACTED — STALE.** Profiled at `05af600e7`; the three commits that retired it (`9f110905b`, `1f6ef9da9`, `179e405ac`) are ancestors of HEAD but **not** of that ref. MHC's whole remaining b=1 cast budget is **86 launches/token** (`dsv4_mhc.rs:279`). Source: PR #206. **The 08-19 row "Casts: 1,571 → 1,141" is scored against the stale baseline and must not be quoted as a delta.** |
 | **`DecodeKvGeometry`** | **NEVER EXISTED IN RUST.** One occurrence in the whole tree, in a *proposed* fix inside `BUDGET_V4_B1.md:293`. There is no such type. |
-| **"tail (sinkhorn + fast_sum + bmul + ucopy) = 27.2%"** (and the **`fp8_gemv_warp` 16.0%** beside it) | **RETRACTED AS UNSOURCED ON MASTER.** Sole source is `docs/engineering/OPENROUTER_READY.md`, which **does not exist on master** — it lives only on branches `agent/tail-sinkhorn-warp-v2` and `agent/decode-share-probe`. PR #210 multiplies the 16.0% to project its win; that projection inherits the same provenance. |
+| **"tail (sinkhorn + fast_sum + bmul + ucopy) = 27.2%"** (and the **`fp8_gemv_warp` 16.0%** beside it) | **RETRACTED AS UNSOURCED ON MASTER.** Sole source is `docs/engineering/OPENROUTER_READY.md`, which **does not exist on master** — it lives only on branches `agent/tail-sinkhorn-warp-v2` and `agent/decode-share-probe`. 🔴 **PR #210 has now MERGED (`f709872ab`) with the 16.0% multiplied into a projected "~1.3 ms/token, 34.2 → ~35.8 tok/s". That projection inherits the retraction and must not be quoted as an expected value.** The kernel work stands on its own arithmetic; the sizing does not. |
+| **"TCFRAG is a pure win / costs only instructions"** | **RETRACTED — IT RETAINS ~63 GB.** `tcfrag_words` (`bitshift.rs:1334`) is a per-weight `OnceLock` caching a second, differently-packed copy of every weight for the life of the process. `ARC_QTIP_TCFRAG=0` frees **64,262 MiB**; on, the same probe frees **262 MiB**. **#203 costed instructions and not memory**, and the `.cu`'s own performance section still only costs instructions. |
 | **"b=1 is latency-bound — memory controller only 4% utilised"** | **RETRACTED.** The 4% is a whole-step average across thousands of tiny elementwise kernels and is **not evidence about any one kernel**. The b=1 FP8 GEMV is **instruction-bound** (§3). No measurement of that kernel's own memory utilisation exists. |
 | **"op count is retired as a lever"** (`CAPTURE_LANE.md`) | **RETRACTED.** Collapsing 3,961 launch APIs into one `cuGraphLaunch` still leaves the replay's own `cudaStreamSynchronize` (`graph.rs:362`) **and** the sampler's 4-byte D2H (`sampler.rs:1479`) — **two host round-trips per step in the arm that was supposed to have removed host involvement.** The ~8% therefore prices "3,961 launches + 2 round-trips" against "1 launch + 2 round-trips"; **the CPU never left the loop, so the experiment could not measure what removing it is worth.** The measurement stands; the inference does not. ⚠️ This does **not** establish that the two syncs *are* the limiter — only that the test could not see them. |
 | **"TCFRAG-2B is the fast-path default and that is fine"** | **FIXED, PR #209.** `qtip2b_tcfrag.cu:7` reads *"⚠️ UNVERIFIED ON HARDWARE — NEVER RUN"* and it was **default-ON opt-out** from `cc5487ad3`. Now `value == Some("1")` (`tcfrag2b.rs:272`). ⚠️ It does **not** panic — `OnceLock::get_or_init` caches `None` permanently (`tcfrag_words`, `bitshift.rs:1334`). |
@@ -569,13 +614,17 @@ server and stay cold" as the safe recipe and don't build on the mechanism.
 ## H200 SXM5 143 GB, qtip2b UQFF, `--max-seqs 1 --paged-attn off --prefix-cache-n 0`)
 ##
 ## ⛔ **2026-08-21: THE tok/s ROWS BELOW ARE 24-TOKEN FRAGMENTS, NOT RATES.**
-## V4 OOMs at token 22–30 (see the session-9 block at the top of this file), and
-## **this table's own first row says "24 tokens"** — the window ends inside the
-## crash band. The **ms/step**, the **57.27 ms sync'd forward** and the **88%
-## forward share** are per-step quantities and are unaffected; the **tok/s** and
-## anything derived from it as a sustained rate are not. Same for the 15.11 /
-## 15.51 corroborations. Quote them as "b=1 decode over 24 tokens", never as
-## "V4 does 15.4 tok/s".
+## This table's own first row says **"24 tokens"** — warm-up dominated, no
+## steady state shown. The **ms/step**, the **57.27 ms sync'd forward** and the
+## **88% forward share** are per-step quantities and are unaffected; the
+## **tok/s** and anything derived from it as a sustained rate are not. Quote
+## them as "b=1 decode over 24 tokens", never as "V4 does 15.4 tok/s".
+##
+## ✅ **But these were NOT truncated by the OOM.** They were taken 2026-08-17,
+## four days before TCFRAG (`cc5487ad3`, #203) removed the headroom, and PR
+## #182's leg reached 2,600 tokens in that era. **The 24 was a harness choice.**
+## An earlier revision of this note said otherwise; see §2 at the top of the
+## file for the two claims kept apart.
 | quantity | measured |
 |---|---|
 | b=1 decode, 24 tokens, temp 0 | **15.39 tok/s** ⇒ **65.0 ms/step** |

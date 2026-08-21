@@ -1598,17 +1598,32 @@ pub(crate) fn dequantize_2b_cuda(
 /// sm_80 + sm_90, the repo's free no-GPU CI gate) and nothing more.
 /// ```
 ///
-/// and by that same header it owns *"the whole of the b=1 decode path"* —
-/// which `tcfrag2b_layout_for` below confirms, since it is consulted on every
-/// qtip2b GEMV. So the shipped default was: a never-executed kernel serves
-/// single-user production, and only an exactly-spelled env value can get back
-/// to the kernel that has actually run. A typo landed on the unverified side.
+/// and it takes over the b=1 decode path, which `tcfrag2b_layout_for` below
+/// confirms, since it is consulted on every qtip2b GEMV. So the shipped default
+/// was: a never-executed kernel serves single-user production, and only an
+/// exactly-spelled env value can get back to the kernel that has actually run.
+/// A typo landed on the unverified side.
 ///
 /// Opt-in inverts exactly that. The verified kernel is what you get unless you
 /// deliberately ask for the other one, which is the polarity this crate
 /// applies everywhere else a `🔴 UNVERIFIED` kernel is gated (see
 /// `blockwise_fp8::gemv_wide`). Flip the default back only once TCFRAG-2B has
 /// produced coherent output on a GPU and that run is written down.
+///
+/// ⚠️ An earlier revision of this comment supported the paragraph above by
+/// quoting the header as saying TCFRAG "owns the whole of the b=1 decode
+/// path". It does not: that phrase is the header describing
+/// `qtip2b_gemv_tuned_kernel`, the shipped kernel TCFRAG was written to
+/// replace. The conclusion is unchanged — it rests on the dispatch sites,
+/// which is where it should have rested to begin with. See
+/// `memory/mission/wave66-CS-session9-the-22-token-wall.md` §2.
+///
+/// ⚠️ And the cost that no estimate in #203 carried: `tcfrag_words` caches a
+/// repacked copy of every weight in a per-weight `OnceLock` for the life of the
+/// process. Measured on an H200: `ARC_QTIP_TCFRAG=0` frees **64,262 MiB**
+/// against 262 MiB with it on — **~63 GB retained** against a ~79.5 GB model.
+/// That, not the per-token KV growth, is what put V4 decode at 844 MiB free and
+/// made it OOM at token 22. This gate being opt-in is what fixed it.
 pub(crate) fn tcfrag2b_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
