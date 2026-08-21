@@ -326,6 +326,21 @@ static REGISTRY: &[Capability] = &[
         // D2H that also disqualifies all rows from the GPU sampler fast path.
         status: Status::Live,
     },
+    Capability {
+        name: "FP8 dispatch engagement log (ARC_LOG_FP8_DISPATCH)",
+        parent: "ArcLab",
+        check: Check::Symbol {
+            symbol: "log_fp8_dispatch",
+            defined_in: "mistralrs-quant/src/blockwise_fp8/ops.rs",
+        },
+        // The engagement line the FP8 threshold sweep
+        // (`arc-tools/fp8_threshold_sweep.sh`) greps per leg to prove WHICH
+        // kernel actually served it. Value-read (`env_flag_is_set`), latched
+        // once per process, one line per path per process. Referenced from
+        // both native dispatch arms in `ops.rs` and from the
+        // dequantize+cuBLASLt divert in `blockwise_fp8/mod.rs`.
+        status: Status::Live,
+    },
     // -- the ApiPromise class ------------------------------------------------
     Capability {
         name: "sampling: logit_bias reaches the sampler",

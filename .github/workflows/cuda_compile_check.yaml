@@ -305,6 +305,16 @@ jobs:
       - name: QTIP beam spill gate (LOCAL:0, all geometries)
         run: bash arc-tools/qtip_beam_res_usage_check.sh sm_${{ matrix.compute_cap }}
 
+      # Same free-instrument class as the QTIP gate above, for the blockwise-
+      # FP8 dense-GEMM lane: asserts all 4 fp8_matmul_tiled instantiations
+      # exist (2 dtypes x 2 POW2_SCALE scale-index arms), prints the LDS width
+      # census that decides whether the bank-conflict cost model describes the
+      # compiled kernel, and HARD-FAILS if the never-executed WMMA GEMM
+      # contains no tensor-core (HMMA/HGMMA) instructions. nvcc + cuobjdump
+      # only; no GPU.
+      - name: FP8 GEMM SASS probe (LDS census + WMMA HMMA presence)
+        run: bash arc-tools/fp8_gemm_sass_check.sh sm_${{ matrix.compute_cap }}
+
       - name: Compile QTIP CUDA kernels (mistralrs-quant)
         run: cargo build -p mistralrs-quant --lib --features cuda
 
